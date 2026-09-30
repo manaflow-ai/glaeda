@@ -48,6 +48,9 @@ What --apply installs (templated for the current user):
     ~/Library/LaunchAgents/com.teamleaderleo.glaeda.{disk-pressure,disk-dedupe,worktree-reclaim,fleet-cas-prune,seed-prefetch,lan-fetch,
                                   idle-warm,idle-fuzz,mini-health,local-guard,update,gh-watch}.plist
     build-host directories and three git defaults, each set only when unset
+    .metadata_never_index markers in the user-owned CI build roots (DerivedData and the
+    glaeda native cache, plus any existing glaeda runner _work roots). These markers keep
+    Spotlight out of build output without changing the system-wide index policy.
     python@3.13 from Homebrew, only when no Python 3.13+ exists and this user owns Homebrew
 
 glaeda-mini-enroll needs Python 3.13+ (accept-local uses os.waitid). Setup looks for it the way
@@ -869,6 +872,36 @@ def directories(ctx: Context) -> list[tuple[Path, int]]:
     return [d for d in dirs if not (ctx.hygiene_only and d[0] == ctx.cache_root)]
 
 
+NO_INDEX_MARKER = ".metadata_never_index"
+
+
+def scan_exclusion_markers(ctx: Context) -> list[Path]:
+    """User-owned Spotlight exclusion markers for build output.
+
+    macOS has no per-folder fseventsd opt-out.  A ``.metadata_never_index`` file is
+    nevertheless a safe, supported way to stop Spotlight from walking the large build
+    trees.  Keep this list narrow: the shared fleet cache is root-owned and is handled by
+    a separate fleet operator step, while a personal/hygiene install must not alter CI paths.
+    """
+    if ctx.platform != "macos" or ctx.hygiene_only:
+        return []
+    roots = [root for root in (ctx.derived_data, ctx.cache_root)
+             if not root.is_symlink()]
+    # Runner directories are created by glaeda-cmux-runner.  On a re-run, cover every
+    # existing runner work tree without guessing at a custom --runner-dir path.
+    try:
+        for runner in ctx.home.glob("actions-runner-glaeda*"):
+            # Never follow an operator-created runner symlink into an unrelated tree.
+            if not runner.is_dir() or runner.is_symlink():
+                continue
+            work = runner / "_work"
+            if work.is_dir() and not work.is_symlink():
+                roots.append(work)
+    except OSError:
+        pass
+    return sorted({root / NO_INDEX_MARKER for root in roots})
+
+
 def reclaim_source(ctx: Context) -> tuple[str, Path | None, str]:
     """Where glaeda-worktree-reclaim comes from: (mode, path, note)."""
     if ctx.reclaim_binary is not None:
@@ -968,7 +1001,7 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
     reclaim_act = actions[-1]
     prior_receipt = load_receipt(ctx) or {}
     owned_files = {a.get("path"): a.get("ownedSha256") or a.get("sha256") for a in prior_receipt.get("actions", [])
-                   if a.get("kind") in {"tool", "agent"} and a.get("owned")}
+                   if a.get("kind") in {"tool", "agent", "marker"} and a.get("owned")}
     for label in agent_names(ctx):
         dest = agent_path(ctx, label)
         act = file_action(ctx, "agent", dest, agent_bytes(ctx, label), 0o644)
@@ -991,6 +1024,19 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
         act[scheduler] = "skipped (sandbox HOME)" if ctx.sandbox else ("skipped" if ctx.skip_launchctl else "managed")
         actions.append(act)
 
+    # Keep Spotlight off the two canonical build roots. Markers are ordinary user-owned
+    # files, so this remains idempotent and never changes the host-wide indexing policy.
+    for marker in scan_exclusion_markers(ctx):
+        act = file_action(ctx, "marker", marker, b"", 0o644,
+                          "Spotlight exclusion for CI build output")
+        # Any existing marker already excludes the tree. Preserve its bytes (and any
+        # operator ownership) rather than replacing it with our empty marker.
+        if marker.is_symlink():
+            act["state"], act["note"] = "blocked", "marker is a symlink; refusing to follow it"
+        elif marker.is_file():
+            act["state"], act["sha256"] = "unchanged", act["previousSha256"]
+        actions.append(act)
+
     actions.append(update_config_action(ctx))
 
     # owned: this command wrote the file (now or on an earlier run) and it is still those bytes.
@@ -998,7 +1044,7 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
     # Ownership follows the bytes on disk, not this run's outcome: a blocked or failed step
     # (missing cargo, missing --reclaim-binary) must not orphan a file an earlier run installed.
     for act in actions:
-        if act["kind"] in {"tool", "agent"}:
+        if act["kind"] in {"tool", "agent", "marker"}:
             recorded = owned_files.get(act["path"])
             act["owned"] = recorded is not None and recorded == act.get("previousSha256")
             act["ownedSha256"] = recorded if act["owned"] else None
@@ -1054,7 +1100,7 @@ def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
     receipt = load_receipt(ctx)
     # Only files this command wrote (create or update, carried forward as "owned") are removable.
     installed = {a["path"]: a.get("ownedSha256") or a.get("sha256") for a in (receipt or {}).get("actions", [])
-                 if a.get("kind") in {"tool", "agent"} and a.get("owned")}
+                 if a.get("kind") in {"tool", "agent", "marker"} and a.get("owned")}
     git_set = {a["key"]: a["value"] for a in (receipt or {}).get("actions", [])
                if a.get("kind") == "git" and a.get("owned")}
     actions: list[dict[str, Any]] = []
@@ -1070,6 +1116,8 @@ def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
                  "glaeda-update", "glaeda-gh"):
         actions.append({"kind": "tool", "path": os.fspath(ctx.bin / name)})
     actions.append({"kind": "tool", "path": os.fspath(skill_path(ctx))})
+    for marker in scan_exclusion_markers(ctx):
+        actions.append({"kind": "marker", "path": os.fspath(marker)})
     for act in actions:
         if act["kind"] == "note":
             continue
@@ -1162,12 +1210,14 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]]) -> None:
             fresh = file_action(ctx, "tool", Path(act["path"]), source.read_bytes(), 0o755, act["note"])
             act.update({k: fresh[k] for k in ("state", "sha256", "previousSha256")})
             state = act["state"]
-        if kind in {"tool", "agent"} and state in {"create", "update"}:
+        if kind in {"tool", "agent", "marker"} and state in {"create", "update"}:
             dest = Path(act["path"])
             if kind == "tool":
                 data = Path(act["source"]).read_bytes()
-            else:
+            elif kind == "agent":
                 data = agent_bytes(ctx, act["label"])
+            else:
+                data = b""
             if state == "update":
                 act["backup"] = backup(ctx, dest)
             dest.parent.mkdir(parents=True, exist_ok=True)  # the skill's directory may not exist yet
@@ -1290,10 +1340,10 @@ def apply_uninstall(ctx: Context, actions: list[dict[str, Any]]) -> None:
             if act["state"] == "remove":
                 Path(act["path"]).unlink()
                 act["applied"] = True
-        elif act["kind"] == "tool" and act["state"] == "remove":
+        elif act["kind"] in {"tool", "marker"} and act["state"] == "remove":
             Path(act["path"]).unlink()
             act["applied"] = True
-            if Path(act["path"]) == skill_path(ctx):
+            if act["kind"] == "tool" and Path(act["path"]) == skill_path(ctx):
                 with contextlib.suppress(OSError):  # only when empty
                     skill_path(ctx).parent.rmdir()
         elif act["kind"] == "git" and act["state"] == "remove":
