@@ -4902,6 +4902,8 @@ time.sleep(60)
         # cmux-tui's macOS relay lane only runs chatmux-relay Rust tests in the workspace: no root or GUI token.
         self.assertEqual(hook.job_class("macos-relay", home, home, "cmux-tui.yml"), ("isolated", False))
         self.assertEqual(hook.job_class("build", home, home, "reload-build.yml"), ("isolated", False))
+        self.assertEqual(hook.job_class("build-mac", home, home, "ios-e2e.yml"), ("isolated", False))
+        self.assertEqual(hook.job_class("build-mac", home, home, "other.yml"), ("compile", True))
         # cmux-next's side-lane jobs build in their workspace or $RUNNER_TEMP: no root, no kept DerivedData
         self.assertEqual(hook.job_class("swift-test", home, home, "cmux-next.yml"), ("isolated", False))
         self.assertEqual(hook.job_class("release-compile", home, home, "cmux-next.yml"), ("isolated", False))
