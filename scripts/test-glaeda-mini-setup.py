@@ -338,6 +338,18 @@ class MiniSetupTest(unittest.TestCase):
         self.invoke("--uninstall", "--apply")
         self.assertTrue(all((root / ".metadata_never_index").exists() for root in roots))
 
+    def test_owned_marker_replaced_by_symlink_is_kept_on_uninstall(self) -> None:
+        self.invoke("--apply")
+        marker = self.home / "Library/Developer/Xcode/DerivedData/.metadata_never_index"
+        target = Path(self.tmp.name) / "marker-target"
+        target.write_bytes(b"")
+        marker.unlink()
+        marker.symlink_to(target)
+        receipt = self.invoke("--uninstall")
+        action = next(a for a in receipt["actions"] if a.get("path") == os.fspath(marker))
+        self.assertEqual(action["state"], "absent")
+        self.assertTrue(marker.is_symlink())
+
     def test_update_keeps_a_backup(self) -> None:
         (self.home / ".local/bin").mkdir(parents=True)
         old = self.home / ".local/bin/glaeda-disk"

@@ -161,6 +161,10 @@ def sha256_bytes(data: bytes) -> str:
 
 def sha256_file(path: Path) -> str | None:
     try:
+        # Hash only the named regular file. Following a symlink here could make an
+        # operator-owned replacement appear to be our marker and let uninstall unlink it.
+        if path.is_symlink() or not path.is_file():
+            return None
         return sha256_bytes(path.read_bytes())
     except OSError:
         return None
@@ -875,6 +879,32 @@ def directories(ctx: Context) -> list[tuple[Path, int]]:
 NO_INDEX_MARKER = ".metadata_never_index"
 
 
+def marker_root_is_owned(ctx: Context, root: Path) -> bool:
+    """Accept only existing path components owned by this setup user and no symlinks."""
+    anchor = ctx.home
+    try:
+        root.relative_to(anchor)
+    except ValueError:
+        return False
+    current = root
+    while True:
+        try:
+            observed = current.lstat()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return False
+        else:
+            if stat.S_ISLNK(observed.st_mode) or observed.st_uid != ctx.uid:
+                return False
+        if current == anchor:
+            return True
+        parent = current.parent
+        if parent == current:
+            return False
+        current = parent
+
+
 def scan_exclusion_markers(ctx: Context) -> list[Path]:
     """User-owned Spotlight exclusion markers for build output.
 
@@ -886,16 +916,16 @@ def scan_exclusion_markers(ctx: Context) -> list[Path]:
     if ctx.platform != "macos" or ctx.hygiene_only:
         return []
     roots = [root for root in (ctx.derived_data, ctx.cache_root)
-             if not root.is_symlink()]
+             if marker_root_is_owned(ctx, root)]
     # Runner directories are created by glaeda-cmux-runner.  On a re-run, cover every
     # existing runner work tree without guessing at a custom --runner-dir path.
     try:
         for runner in ctx.home.glob("actions-runner-glaeda*"):
             # Never follow an operator-created runner symlink into an unrelated tree.
-            if not runner.is_dir() or runner.is_symlink():
+            if not runner.is_dir() or not marker_root_is_owned(ctx, runner):
                 continue
             work = runner / "_work"
-            if work.is_dir() and not work.is_symlink():
+            if work.is_dir() and marker_root_is_owned(ctx, work):
                 roots.append(work)
     except OSError:
         pass
