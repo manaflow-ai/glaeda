@@ -1,7 +1,8 @@
 # cx-mini-scan-exclude report
 
-Date: 2026-09-30. Source head before this report: `62dbba34b99d98951e98fc88fff634738123c766`.
-The setup change is isolated in worktree branch `fleet/scan-exclude`.
+Date: 2026-09-30. Merged source head: `fcfa79c71770520887be22d034cb3fa0fc759d9c`.
+The setup change was developed in worktree branch `fleet/scan-exclude` and independently
+accepted at exact head `6a9f1977f05f3968fee7b7682687ce6f6f25b245`.
 
 ## Evidence recomputation
 
@@ -77,3 +78,14 @@ would weaken malware scanning without a measured job benefit. Leave AmbientDispl
 No runtime mitigation is supported by the current canary. Keep the media/photo rollback commands
 in the probe document for a future dedicated CI account where the launchd behavior can be verified
 before/after. Do not disable the services on the shared user fleet-wide.
+
+## Rollout receipt
+
+PR [#1377](https://github.com/teamleaderleo/glaeda/pull/1377) merged as
+`fcfa79c71770520887be22d034cb3fa0fc759d9c`; its Verify and advisory checks were green. The release
+workflow `36771939043` and fleet-candidate workflow `36772862535` both completed successfully for
+that exact main head. `glaeda-mini-fleet upgrade --candidate-run 36772862535 --yes` then failed
+closed without changing hosts: active host locks skipped busy minis, and the remaining minis
+reported `needs a person: disk` during preflight. No cache directory was moved and no build was
+interrupted. Re-run the same candidate upgrade after the disk/person blockers are cleared; the
+candidate expires 2026-10-30T20:30:42Z.
