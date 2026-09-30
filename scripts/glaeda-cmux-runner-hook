@@ -3454,9 +3454,46 @@ def ps_rows() -> list[tuple[int, int, float, str, str]]:
     return rows
 
 
+def telemetry_test_app_owners(table: dict[int, tuple[int, str]]) -> dict[int, int]:
+    """Observe reparented CI XCTest apps whose exact temp tree is used by a live runner job.
+
+    Paths and arguments are evidence only and never enter telemetry. A runner-prefix match alone would
+    adopt a stale app from an earlier job, so require a process under that same Worker to name this tree.
+    This observation does not grant process cleanup or signal authority.
+    """
+    workers = {pid: command.split("/bin/Runner.Worker", 1)[0]
+               for pid, (_, command) in table.items()
+               if re.search(r"^/.*?/actions-runner[^/]+/bin/Runner\.Worker(?:\s|$)", command)}
+
+    def owner(pid: int) -> int | None:
+        for _ in range(256):
+            if pid in workers:
+                return pid
+            if pid <= 1 or pid not in table:
+                return None
+            pid = table[pid][0]
+        return None
+
+    result: dict[int, int] = {}
+    for pid, (_, command) in table.items():
+        app = LEAKED_TEST_APP.search(command)
+        temp = LEAKED_TEST_TEMP.match(app.group(1)) if app else None
+        if temp is None:
+            continue
+        tree = temp.group(1)
+        runner = tree.split("/_work/", 1)[0]
+        candidates = {owner(other) for other, (_, cmd) in table.items()
+                      if other != pid and tree + "/" in cmd and not LEAKED_TEST_APP.search(cmd)}
+        candidates = {worker for worker in candidates if worker is not None and workers[worker] == runner}
+        if len(candidates) == 1:
+            result[pid] = candidates.pop()
+    return result
+
+
 def classify(rows: list[tuple[int, int, float, str, str]], job_root: int,
-             skip: set[int]) -> tuple[float, float, float, dict[str, float], dict[str, float]]:
-    """Cores used right now by this job's tree, other runner jobs, and everything else, plus the outside
+             skip: set[int], test_app_owners: dict[int, int] | None = None
+             ) -> tuple[float, float, float, dict[str, float], dict[str, float]]:
+    """Cores used right now by this job's tree, its reparented CI test app tree, other jobs, and everything else, plus the outside
     cores by "basename (user)" and the other jobs' cores by runner directory."""
     parent = {pid: ppid for pid, ppid, _, _, _ in rows}
     workers = {pid: (m.group(1) if (m := RUNNER_DIR_RE.search(comm)) else "runner")
@@ -3468,6 +3505,8 @@ def classify(rows: list[tuple[int, int, float, str, str]], job_root: int,
         while pid > 1 and seen < 256:
             if pid in workers:
                 return pid
+            if test_app_owners and test_app_owners.get(pid) in workers:
+                return test_app_owners[pid]
             pid = parent.get(pid, 0)
             seen += 1
         return None
@@ -3881,7 +3920,11 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
                 skip = {os.getpid()} | {pid for pid, ppid, _, _, _ in rows if ppid == os.getpid()}
                 queue = run_queue()
                 disk_busy = host_io()
-                split = classify(rows, watch_pid, skip)
+                # XCTest's app is launched by testmanagerd/launchd rather than Runner.Worker. Only read
+                # full process arguments when a test app is present, and keep that evidence off the log.
+                test_apps = (telemetry_test_app_owners(processes())
+                             if any(os.path.basename(row[4]) == "cmux DEV" for row in rows) else {})
+                split = classify(rows, watch_pid, skip, test_apps)
                 samples.add(load_average(), split, interval, queue, *disk_busy)
                 if dynamic_units > 1 and dynamic_total > 1:
                     now = time.monotonic()
