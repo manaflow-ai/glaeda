@@ -627,7 +627,7 @@ in at the producer's root. So one root job per root per mini:
   `glaeda-side-<class>-xcode-<version>` instead. cmux's light side-lane jobs run on it
   (`vars.CI_SIDE_LANE_RUNNER`, cmux#14391), so they never hold a root runner. A class whose
   `canonicalRoots` equals `runners` has no side runner, so do not point that variable at it.
-- `guiRunners` (0 or 1, default 0) makes the last instance (`runners - 1`) the mini's gui runner. It carries
+- `guiRunners` (0 or 1, default 0) makes the last instance (`runners - 1`) the mini's host gui runner. It carries
   the gui pool label `glaeda-gui-<class>-xcode-<version>` and neither the pool, root, side nor
   `glaeda-ios-sim` label, and its job-started hook passes `--gui-runner`. cmux's GUI jobs (app-host shards,
   tests-build-and-lag) run on it, so GitHub hands each mini at most the one GUI job its gui token allows,
@@ -637,6 +637,11 @@ in at the producer's root. So one root job per root per mini:
   `canonicalRoots + guiRunners` is at most `runners`. Admission is unchanged: a GUI job takes 1 unit, the
   gui token (an app-host shard in the step before its restore instead), and the producer's root in its
   restore step.
+- A desktop VM runner is a future, disabled design. It may use the GUI label and a distinct `gui-vm`
+  accounting token, but the guest must not receive read-write access to the host capacity ledger. A
+  host-side broker, immutable VM ownership receipt, and atomic runner drain are required before any
+  enrollment or lifecycle mutation. The VM runner carries no root, side, iOS, or compile label. See
+  [`MACOS_DESKTOP_VM.md`](MACOS_DESKTOP_VM.md).
 - `compileSlots` may not exceed `canonicalRoots`: every compile holds a root.
 - `declared_pools` and glaeda-route count only the pool labels; the root and side labels split each mini's
   runners between them.

@@ -255,7 +255,8 @@ class Context:
         self.org = args.org
         self.repo = None if args.org else (args.repo or DEFAULT_REPO)
         self.instance = args.instance or 0
-        self.gui_runner = False  # the member's gui runner (glaeda_fleet_labels.gui_label); set from --manifest
+        self.gui_runner = bool(args.gui_runner)  # the member's gui runner (or an explicitly managed guest runner)
+        self.gui_token = args.gui_token
         # Instance 0 keeps the original paths; instance K adds -K (dirs, logs, name) or .K (launchd label).
         self.suffix = f"-{self.instance}" if self.instance else ""
         self.label = f"{LABEL}.{self.instance}" if self.instance else LABEL
@@ -268,6 +269,9 @@ class Context:
         self.member: dict[str, Any] | None = None
         self.min_free_gib: float = args.min_free_gib or 0
         self.capacity_units: int = args.capacity_units or 0
+        configured_capacity = args.capacity_dir or os.environ.get("GLAEDA_FLEET_CAPACITY_DIR")
+        self.capacity_dir = Path(configured_capacity).expanduser().absolute() if configured_capacity else \
+            Path(os.environ.get("GLAEDA_FLEET_DIR") or "/Users/Shared/cmux-build-fleet") / "capacity"
         self.group = args.group
         self.replace = args.replace
         self.version = args.runner_version
@@ -447,6 +451,13 @@ def find_runner(ctx: Context) -> dict[str, Any] | None:
 def hook_wrappers(ctx: Context) -> dict[str, bytes]:
     python = shlex.quote(ctx.python or "/usr/bin/python3")
     hook = shlex.quote(os.fspath(ctx.hook_dir / "glaeda-cmux-runner-hook"))
+    gui_token = getattr(ctx, "gui_token", "gui")
+    if not isinstance(gui_token, str):
+        gui_token = "gui"
+    capacity_dir = getattr(ctx, "capacity_dir", Path(os.environ.get("GLAEDA_FLEET_DIR") or
+                                                       "/Users/Shared/cmux-build-fleet") / "capacity")
+    if not isinstance(capacity_dir, (str, bytes, os.PathLike)):
+        capacity_dir = Path(os.environ.get("GLAEDA_FLEET_DIR") or "/Users/Shared/cmux-build-fleet") / "capacity"
     scope = f"--allowed-owner {shlex.quote(ctx.org)}" if ctx.org else f"--allowed-repo {shlex.quote(ctx.repo or '')}"
     recycle = ""
     if ctx.min_free_gib:
@@ -476,6 +487,7 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         scope += f" --instance {ctx.instance}"
         if getattr(ctx, "gui_runner", False):  # the listener gate holds it while the gui token or every root is taken
             scope += " --gui-runner"
+            scope += f" --gui-token {shlex.quote(gui_token)}"
     started = (
         "#!/bin/bash\n"
         "# glaeda-cmux-runner job-started hook (generated, receipt-owned). A non-zero exit fails the job\n"
@@ -533,7 +545,7 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
     )
     # Explicit dirs, so a restore step that changes HOME or FLEET_DIR still finds this runner's roots record.
     roots_n = int((ctx.member or {}).get("canonicalRoots") or 1)
-    capacity = shlex.quote(os.fspath(Path(os.environ.get("GLAEDA_FLEET_DIR") or "/Users/Shared/cmux-build-fleet") / "capacity"))
+    capacity = shlex.quote(os.fspath(capacity_dir))
     home = ctx.home if isinstance(getattr(ctx, "home", None), Path) else Path.home()
     state = shlex.quote(os.fspath(home / ".local/state/glaeda/cmux-runner"))
     dirs = f" --capacity-dir {capacity} --state-dir {state}"
@@ -547,8 +559,8 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         " | take-gui [--wait SECONDS]' >&2; exit 2; }\n"
         "case \"${1:-}\" in\n"
         "take) [ -n \"${2:-}\" ] || usage; root=$2; shift 2\n"
-        f"    exec {python} {hook} take-root --root \"$root\" --canonical-roots {roots_n}{dirs} \"$@\" ;;\n"
-        f"take-gui) shift; exec {python} {hook} take-gui{dirs}{recycle} \"$@\" ;;\n"
+        f"    exec {python} {hook} take-root --root \"$root\" --canonical-roots {roots_n}{dirs} --gui-token {shlex.quote(gui_token)} \"$@\" ;;\n"
+        f"take-gui) shift; exec {python} {hook} take-gui{dirs} --gui-token {shlex.quote(gui_token)}{recycle} \"$@\" ;;\n"
         "*) usage ;;\n"
         "esac\n"
     )
@@ -1578,9 +1590,14 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--instance", type=int, default=0,
                    help="which of this mini's runners (0 keeps the original paths; K > 0 gets its own "
                         "~/actions-runner-glaeda-K, LaunchAgent, receipt and name <member>-glaeda-K)")
+    p.add_argument("--gui-runner", action="store_true",
+                   help="mark this explicitly managed runner as a GUI desktop session")
+    p.add_argument("--gui-token", default="gui",
+                   help="capacity ledger token for this runner's desktop session (default: gui)")
     p.add_argument("--capacity-units", type=int,
                    help="weighted capacity the job-started hook shares across this mini's runners "
                         "(default: the manifest class's capacityUnits with --manifest, else one job at a time)")
+    p.add_argument("--capacity-dir", help="shared capacity ledger path (default: $GLAEDA_FLEET_CAPACITY_DIR or the fleet path)")
     p.add_argument("--replace", action="store_true", help="replace an existing runner with the same name")
     p.add_argument("--runner-dir", type=Path, help="install directory (default ~/actions-runner-glaeda)")
     p.add_argument("--runner-version", help="pin a runner version such as 2.328.0 (default latest)")
@@ -1624,6 +1641,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if args.instance < 0 or args.instance > 63:
         print("glaeda-cmux-runner: --instance must be 0 to 63", file=sys.stderr)
+        return 2
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", args.gui_token):
+        print("glaeda-cmux-runner: --gui-token must be a simple capacity token name", file=sys.stderr)
         return 2
     if args.org and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*", args.org):
         print("glaeda-cmux-runner: --org must be an organization login", file=sys.stderr)

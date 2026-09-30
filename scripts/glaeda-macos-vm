@@ -1,0 +1,302 @@
+#!/usr/bin/env python3
+"""Plan and reconcile one elastic macOS desktop-test VM on an Apple mini.
+
+The adapter deliberately owns only read-only host-side lifecycle planning.  Lume is
+the selected Virtualization.framework backend because it supports unattended
+macOS guests, native display sessions, SSH, and sparse disks without making
+Tart a product dependency.  The guest runner and its GUI permissions are
+prepared in the image; this command never copies a checkout or resets a job.
+
+Planning is read-only.  Mutation is disabled until immutable provider ownership,
+an admission drain barrier, serialized reconciliation, and isolated guest
+accounting are implemented and verified.
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import dataclasses
+import json
+import math
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from typing import Any, Sequence
+
+SCHEMA = "glaeda-macos-desktop-vm/v1"
+DEFAULT_VM = "glaeda-desktop"
+DEFAULT_CAPACITY_DIR = "/Users/Shared/cmux-build-fleet/capacity"
+DEFAULT_MIN_FREE_GIB = 120.0
+CPU_PAUSE_PCT = 85.0
+CPU_RESUME_PCT = 70.0
+MEMORY_PRESSURE_HOLD = 2
+
+
+class VmError(Exception):
+    pass
+
+
+@dataclasses.dataclass(frozen=True)
+class VmPolicy:
+    vm_name: str = DEFAULT_VM
+    provider: str = "lume"
+    provider_path: str | None = None
+    provider_id: str | None = None
+    storage: str | None = None
+    min_free_gib: float = DEFAULT_MIN_FREE_GIB
+    gui_token: str = "gui-vm"
+    capacity_dir: str = DEFAULT_CAPACITY_DIR
+    guest_runner: str = "glaeda-desktop-vm"
+    cpus: int = 8
+    memory_gib: int = 16
+    disk_gib: int = 80
+
+
+@dataclasses.dataclass(frozen=True)
+class Observation:
+    vm_state: str
+    vm_location: str
+    host_free_bytes: int | None
+    host_cpu_busy_pct: float | None
+    memory_pressure: int | None
+    job_activity: str
+    gui_queue_depth: int
+    observed_at: float
+
+
+def _finite_number(value: Any) -> bool:
+    return type(value) in (int, float) and math.isfinite(value)
+
+
+def _run(argv: Sequence[str], *, home: str, timeout: float = 15.0) -> subprocess.CompletedProcess[str]:
+    if not argv or not os.path.isabs(argv[0]):
+        raise VmError("child executable must be an absolute path")
+    env = {"HOME": home, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"}
+    return subprocess.run(list(argv), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, text=True, env=env, timeout=timeout, check=False)
+
+
+def provider_path(policy: VmPolicy) -> str:
+    if policy.provider != "lume":
+        raise VmError(f"unsupported provider {policy.provider!r}; expected 'lume'")
+    if policy.provider_path:
+        path = os.path.abspath(os.path.expanduser(policy.provider_path))
+        if not os.path.isfile(path) or not os.access(path, os.X_OK):
+            raise VmError("configured Lume executable is unavailable")
+        return path
+    for candidate in ("/opt/homebrew/bin/lume", "/usr/local/bin/lume", os.path.expanduser("~/.local/bin/lume")):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    found = shutil.which("lume")
+    if found and os.path.isabs(found):
+        return found
+    raise VmError("Lume is unavailable; install the reviewed Lume release before applying")
+
+
+def _parse_df(text: str) -> int:
+    rows = [line.split() for line in text.splitlines() if line.strip()]
+    if len(rows) < 2 or len(rows[-1]) < 6 or not rows[-1][5].startswith("/"):
+        raise VmError("df returned incomplete disk evidence")
+    try:
+        free_kib = int(rows[-1][3])
+    except ValueError as error:
+        raise VmError("df returned invalid free-space evidence") from error
+    if free_kib < 0:
+        raise VmError("df returned negative free space")
+    return free_kib * 1024
+
+
+def _parse_cpu(text: str) -> float:
+    match = re.search(r"CPU usage:\s*([0-9]+(?:\.[0-9]+)?)%\s*user,\s*([0-9]+(?:\.[0-9]+)?)%\s*sys,\s*([0-9]+(?:\.[0-9]+)?)%\s*idle", text)
+    if not match:
+        raise VmError("top returned no CPU usage sample")
+    user, system, idle = (float(part) for part in match.groups())
+    busy = user + system
+    if not all(math.isfinite(value) for value in (user, system, idle)) or busy < 0 or busy > 100.0 or idle < 0 or idle > 100.0:
+        raise VmError("top returned invalid CPU usage")
+    return busy
+
+
+def _parse_pressure(text: str) -> int:
+    try:
+        level = int(text.strip())
+    except ValueError as error:
+        raise VmError("memory pressure is invalid") from error
+    if level not in (1, 2, 4):
+        raise VmError("memory pressure is not one of 1, 2, or 4")
+    return level
+
+
+def _parse_lume_state(text: str, policy: VmPolicy) -> tuple[str, str]:
+    try:
+        raw = json.loads(text)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise VmError("Lume returned invalid VM inventory") from error
+    rows = raw if isinstance(raw, list) else raw.get("vms") if isinstance(raw, dict) else None
+    if not isinstance(rows, list):
+        raise VmError("Lume inventory has no VM list")
+    matches = [row for row in rows if isinstance(row, dict) and row.get("name") == policy.vm_name]
+    if len(matches) != 1:
+        raise VmError("Lume inventory does not prove one exact VM identity")
+    state = matches[0].get("state") or matches[0].get("status")
+    if state not in ("running", "stopped", "provisioning"):
+        raise VmError("Lume returned an unknown VM state")
+    row = matches[0]
+    provider_id = row.get("id") or row.get("uuid") or row.get("vmId")
+    if not policy.provider_id or not isinstance(provider_id, str) or provider_id != policy.provider_id:
+        raise VmError("Lume VM immutable provider identity is not pinned")
+    if row.get("os") not in ("macOS", "macos") or row.get("locationName") in (None, ""):
+        raise VmError("Lume VM identity is incomplete")
+    if row.get("cpuCount") != policy.cpus or row.get("memorySize") != policy.memory_gib * (1024 ** 3):
+        raise VmError("Lume VM resources do not match the reviewed desktop profile")
+    disk = row.get("diskSize") if isinstance(row.get("diskSize"), dict) else {}
+    if disk.get("total") != policy.disk_gib * (1024 ** 3):
+        raise VmError("Lume VM disk does not match the reviewed desktop profile")
+    return state, str(row["locationName"])
+
+
+def observe(policy: VmPolicy, *, home: str, gui_queue_depth: int, run=_run) -> Observation:
+    provider = provider_path(policy)
+    df = run(["/bin/df", "-Pk", "/Users/Shared"], home=home, timeout=8)
+    top = run(["/usr/bin/top", "-l", "1", "-n", "0"], home=home, timeout=8)
+    pressure = run(["/usr/sbin/sysctl", "-n", "kern.memorystatus_vm_pressure_level"], home=home, timeout=8)
+    inventory = [provider, "ls", "--format", "json"]
+    if policy.storage:
+        inventory += ["--storage", policy.storage]
+    lume = run(inventory, home=home, timeout=15)
+    results = (df, top, pressure, lume)
+    if any(result.returncode != 0 for result in results):
+        raise VmError("one or more host or VM observations failed")
+    depth = int(gui_queue_depth)
+    if depth < 0:
+        raise VmError("GUI queue depth cannot be negative")
+    state, location = _parse_lume_state(lume.stdout, policy)
+    if state != "running":
+        activity = "unknown"
+    else:
+        result = run([provider, "ssh", policy.vm_name, "/usr/bin/pgrep", "-f", "Runner.Worker"], home=home, timeout=8)
+        activity = "idle" if result.returncode == 1 else "active" if result.returncode == 0 and result.stdout.strip() else "unknown"
+    return Observation(state, location, _parse_df(df.stdout),
+                       _parse_cpu(top.stdout), _parse_pressure(pressure.stdout), activity, depth, time.time())
+
+
+def saturated(observation: Observation) -> bool:
+    return ((observation.host_cpu_busy_pct is not None and observation.host_cpu_busy_pct >= CPU_PAUSE_PCT)
+            or (observation.memory_pressure is not None and observation.memory_pressure >= MEMORY_PRESSURE_HOLD))
+
+
+def has_headroom(observation: Observation) -> bool:
+    return (observation.host_cpu_busy_pct is not None
+            and observation.host_cpu_busy_pct <= CPU_RESUME_PCT
+            and observation.memory_pressure == 1)
+
+
+def _free_enough(observation: Observation, policy: VmPolicy) -> bool:
+    return observation.host_free_bytes is not None and observation.host_free_bytes >= policy.min_free_gib * (1024 ** 3)
+
+
+def plan(policy: VmPolicy, observation: Observation) -> dict[str, Any]:
+    actions: list[str] = []
+    blockers: list[str] = []
+    if not _free_enough(observation, policy):
+        blockers.append(f"host free space is below {policy.min_free_gib:g} GiB")
+    if observation.vm_state == "provisioning":
+        blockers.append("VM provisioning is in progress")
+    if observation.vm_state == "running" and observation.job_activity == "unknown":
+        blockers.append("running VM job activity is unknown")
+    if saturated(observation):
+        if observation.vm_state == "running":
+            if observation.job_activity == "idle":
+                actions.append("stop")
+            else:
+                blockers.append("host pressure is high but a VM job is active")
+    elif observation.vm_state == "stopped" and observation.gui_queue_depth > 0:
+        if not has_headroom(observation):
+            blockers.append(f"host has not returned below {CPU_RESUME_PCT:g}% CPU busy with normal memory pressure")
+        elif not blockers:
+            actions.append("start")
+    disposition = "blocked" if blockers else "ready" if actions else "no_change"
+    return {"schema": SCHEMA, "vm": policy.vm_name, "provider": policy.provider,
+            "disposition": disposition, "actions": actions, "blockers": blockers,
+            "observation": dataclasses.asdict(observation),
+            "policy": {"min_free_gib": policy.min_free_gib, "gui_token": policy.gui_token,
+                       "capacity_dir": policy.capacity_dir}}
+
+
+def _write_state(path: pathlib.Path, document: dict[str, Any]) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, temp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(document, stream, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temp)
+
+
+def apply_plan(policy: VmPolicy, document: dict[str, Any], *, home: str, state_path: pathlib.Path, run=_run) -> dict[str, Any]:
+    del policy, document, home, state_path, run
+    raise VmError("apply is disabled: VM ownership, admission drain, serialized lifecycle, and guest ledger isolation are not proven")
+
+
+def _policy(args: argparse.Namespace) -> VmPolicy:
+    return VmPolicy(vm_name=args.vm, provider_path=args.lume, provider_id=args.provider_id, storage=args.storage,
+                    min_free_gib=args.min_free_gib, gui_token=args.gui_token,
+                    capacity_dir=args.capacity_dir)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="glaeda-macos-vm")
+    parser.add_argument("command", choices=("observe", "plan", "apply"))
+    parser.add_argument("--vm", default=DEFAULT_VM)
+    parser.add_argument("--lume")
+    parser.add_argument("--provider-id", help="pinned immutable Lume VM id from the image receipt")
+    parser.add_argument("--storage")
+    parser.add_argument("--home", default=str(pathlib.Path.home()))
+    parser.add_argument("--state", type=pathlib.Path, default=pathlib.Path("~/.local/state/glaeda/macos-vm/state.json").expanduser())
+    parser.add_argument("--min-free-gib", type=float, default=DEFAULT_MIN_FREE_GIB)
+    parser.add_argument("--gui-token", default="gui-vm")
+    parser.add_argument("--capacity-dir", default=DEFAULT_CAPACITY_DIR)
+    parser.add_argument("--gui-queue-depth", type=int, default=0)
+    parser.add_argument("--output", choices=("human", "json"), default="human")
+    parser.add_argument("--apply", action="store_true", help=argparse.SUPPRESS)
+    args = parser.parse_args(argv)
+    if args.min_free_gib <= 0 or not _finite_number(args.min_free_gib):
+        parser.error("--min-free-gib must be finite and positive")
+    try:
+        policy = _policy(args)
+        if args.command == "observe":
+            result: Any = dataclasses.asdict(observe(policy, home=args.home, gui_queue_depth=args.gui_queue_depth))
+        else:
+            document = plan(policy, observe(policy, home=args.home, gui_queue_depth=args.gui_queue_depth))
+            result = apply_plan(policy, document, home=args.home, state_path=args.state) if args.command == "apply" else document
+        print(json.dumps(result, sort_keys=True) if args.output == "json" else _human(result))
+        return 0 if result.get("disposition", "ready") != "blocked" else 1
+    except (VmError, OSError, subprocess.TimeoutExpired) as error:
+        print(f"glaeda-macos-vm: refused: {error}", file=sys.stderr)
+        return 2
+
+
+def _human(document: dict[str, Any]) -> str:
+    if "disposition" not in document:
+        return "glaeda-macos-vm: observed " + " ".join(f"{k}={v}" for k, v in sorted(document.items()))
+    lines = [f"glaeda-macos-vm: {document['disposition']} vm={document['vm']} provider={document['provider']}"]
+    for action in document.get("actions", []):
+        lines.append(f"action: {action}")
+    for blocker in document.get("blockers", []):
+        lines.append(f"blocked: {blocker}")
+    return "\n".join(lines)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
