@@ -5464,6 +5464,32 @@ class JobTelemetryTest(unittest.TestCase):
         self.assertIsNone(decide(200, 120, 2, 5, 0.8, 55, 1, 1, False))
         self.assertIsNone(decide(200, 120, 2, 5, 0.8, 55, 0, 2, False))
 
+    def test_reparented_test_app_cpu_belongs_to_exact_live_job(self) -> None:
+        first = "/Users/cmux/actions-runner-glaeda"
+        second = "/Users/cmux/actions-runner-glaeda-2"
+        temp = first + "/_work/_temp/cmux-derived-data-tests-123-1-shard-2"
+        stale = first + "/_work/_temp/cmux-derived-data-tests-122-1-shard-2"
+        app = "/Build/Products/Debug/cmux DEV.app/Contents/MacOS/cmux DEV"
+        table = {
+            100: (1, first + "/bin/Runner.Worker spawnclient"),
+            101: (100, "/usr/bin/xcodebuild -derivedDataPath " + temp + "/Build test-without-building"),
+            200: (1, second + "/bin/Runner.Worker spawnclient"),
+            201: (200, "/bin/bash " + stale + "/run.sh"),
+            300: (1, temp + app),
+            301: (300, "/usr/bin/helper"),
+            400: (1, stale + app),
+            500: (1, "/Applications/cmux.app/Contents/MacOS/cmux"),
+        }
+        owners = self.hook.telemetry_test_app_owners(table)
+        self.assertEqual(owners, {300: 100})
+        rows = [(pid, parent, 100.0, "cmux", command if pid in (100, 200) else "cmux DEV")
+                for pid, (parent, command) in table.items()]
+        own = self.hook.classify(rows, 100, set(), owners)
+        peer = self.hook.classify(rows, 200, set(), owners)
+        self.assertEqual(own[:3], (4.0, 2.0, 2.0))
+        self.assertEqual(peer[:3], (2.0, 4.0, 2.0))
+        self.assertEqual(own[3], {"cmux DEV (cmux)": 2.0})
+
     def test_summary_flags_outside_cpu_not_its_own_load(self) -> None:
         samples = self.hook.JobSamples({"job": "macos-compile-admission"}, 14, 1000.0)
         for _ in range(6):
