@@ -53,7 +53,9 @@ refuses. After a warmup, a sustained low-CPU job may release surplus capacity un
 through its holder; each release is logged as a "capacity_release" line. The existing load gate remains the
 safety brake. glaeda-fleet-status reads the completed lines (source "jobs").
 
-job-completed stops the sampler (it writes the record), runs the same disk pressure pass and always exits 0.
+job-completed stops the sampler (it writes the record), runs the same disk pressure pass and always exits 0. A
+cmux compile admission may leave a bounded `glaeda-compile-telemetry.json` in `RUNNER_TEMP`; the completed
+record embeds its cache and phase counters after validating the run identity.
 
     glaeda-cmux-runner-hook admit   --class C --job-key K --watch-pid PID --capacity-units N
     glaeda-cmux-runner-hook release --job-key K
@@ -3391,6 +3393,9 @@ JOB_LOG = Path.home() / "Library/Logs/glaeda-cmux-jobs.jsonl"
 JOB_LOG_MAX_BYTES = 16 * 1024 * 1024  # past this the log keeps its newest half (weeks of started/completed lines)
 JOB_SCHEMA = "glaeda-cmux-job/v1"
 SAMPLER_FILE = "job-sampler"
+COMPILE_TELEMETRY_SCHEMA = "cmux-compile-telemetry/v1"
+COMPILE_TELEMETRY_FILE = "glaeda-compile-telemetry.json"
+COMPILE_TELEMETRY_MAX_BYTES = 16 * 1024
 SAMPLE_S = 10.0
 THERMAL_EVERY = 6  # pmset -g therm every Nth sample
 DYNAMIC_WARMUP_S = float(os.environ.get("GLAEDA_DYNAMIC_WARMUP_S") or 120.0)
@@ -3759,6 +3764,64 @@ def job_meta(repo: str | None, home_repo: str) -> dict[str, Any]:
             "head_ref": env("GITHUB_HEAD_REF", 160), "sha": env("GITHUB_SHA", 40)}
 
 
+def compile_telemetry(meta: dict[str, Any]) -> dict[str, Any] | None:
+    """Read the bounded CI compiler receipt left in RUNNER_TEMP, if it is this job's.
+
+    The workflow owns the file and writes it only after the compile. The hook
+    treats it as optional observation: malformed, stale or oversized data is
+    ignored and never changes admission or job completion.
+    """
+    temp = os.environ.get("RUNNER_TEMP", "")
+    if not temp:
+        return None
+    path = Path(temp) / COMPILE_TELEMETRY_FILE
+    try:
+        if path.stat().st_size > COMPILE_TELEMETRY_MAX_BYTES:
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    finally:
+        with contextlib.suppress(OSError):
+            path.unlink()
+    if not isinstance(payload, dict) or payload.get("schema") != COMPILE_TELEMETRY_SCHEMA:
+        return None
+    for key in ("run_id", "run_attempt"):
+        expected = meta.get(key)
+        if expected and payload.get(key) != expected:
+            return None
+    result: dict[str, Any] = {"schema": COMPILE_TELEMETRY_SCHEMA}
+    integer_fields = ("cacheable_tasks", "hits", "misses", "seed_distance")
+    number_fields = ("hit_rate", "compile_seconds", "fetch_seconds", "link_seconds")
+    for key in integer_fields:
+        value = payload.get(key)
+        if value is None and key == "seed_distance":
+            result[key] = None
+        elif isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 10_000_000:
+            result[key] = value
+        else:
+            return None
+    for key in number_fields:
+        value = payload.get(key)
+        if value is None and key in ("hit_rate", "fetch_seconds"):
+            result[key] = None
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            # Check the JSON number's range before converting an arbitrarily
+            # large integer to float; float conversion can raise OverflowError.
+            if isinstance(value, float) and not math.isfinite(value):
+                return None
+            if not 0 <= value <= 10_000_000:
+                return None
+            result[key] = round(float(value), 6)
+        else:
+            return None
+    if (result["hits"] + result["misses"] != result["cacheable_tasks"]
+            or result["hits"] > result["cacheable_tasks"]
+            or result["misses"] > result["cacheable_tasks"]):
+        return None
+    return result
+
+
 def held_roots(state_dir: Path) -> list[str]:
     """The canonical roots (root-k) the runner's .roots file names now; take-root --switch rewrites it mid-job."""
     try:
@@ -3884,6 +3947,9 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
             record["roots_admitted"] = record.get("roots", [])
         record["roots"] = final
         record["gui"] = bool(record.get("gui")) or gui
+        metrics = compile_telemetry(record)
+        if metrics is not None:
+            record["compile"] = metrics
         append_job_record(record, log)
     except Exception:  # noqa: BLE001
         pass

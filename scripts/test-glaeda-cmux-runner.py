@@ -5625,6 +5625,67 @@ class JobTelemetryTest(unittest.TestCase):
         self.assertIn(records[0]["verdict"], ("clear", "contended"))
         self.assertFalse(self.hook.sampler_file(state).exists())
 
+    def test_completed_record_embeds_bounded_compile_telemetry(self) -> None:
+        telemetry = self.dir / self.hook.COMPILE_TELEMETRY_FILE
+        telemetry.write_text(json.dumps({
+            "schema": self.hook.COMPILE_TELEMETRY_SCHEMA,
+            "run_id": "42",
+            "run_attempt": "1",
+            "cacheable_tasks": 100,
+            "hits": 80,
+            "misses": 20,
+            "hit_rate": 0.8,
+            "seed_distance": 3,
+            "compile_seconds": 12.5,
+            "fetch_seconds": 4.0,
+            "link_seconds": 1.5,
+        }))
+        with mock.patch.dict(self.hook.os.environ, {"RUNNER_TEMP": str(self.dir)}, clear=False):
+            result = self.hook.compile_telemetry({"run_id": "42", "run_attempt": "1"})
+        self.assertEqual(result["cacheable_tasks"], 100)
+        self.assertEqual(result["hits"], 80)
+        self.assertEqual(result["seed_distance"], 3)
+        self.assertFalse(telemetry.exists())
+
+    def test_completed_record_rejects_inconsistent_compile_telemetry(self) -> None:
+        telemetry = self.dir / self.hook.COMPILE_TELEMETRY_FILE
+        telemetry.write_text(json.dumps({
+            "schema": self.hook.COMPILE_TELEMETRY_SCHEMA,
+            "run_id": "123",
+            "run_attempt": "1",
+            "cacheable_tasks": 10,
+            "hits": 7,
+            "misses": 0,
+            "hit_rate": 0.7,
+            "seed_distance": None,
+            "compile_seconds": 12.0,
+            "fetch_seconds": None,
+            "link_seconds": 2.0,
+        }))
+        meta = {"run_id": "123", "run_attempt": "1"}
+        with mock.patch.dict(self.hook.os.environ, {"RUNNER_TEMP": str(self.dir)}, clear=False):
+            self.assertIsNone(self.hook.compile_telemetry(meta))
+        self.assertFalse(telemetry.exists())
+
+    def test_completed_record_rejects_oversized_numeric_without_raising(self) -> None:
+        telemetry = self.dir / self.hook.COMPILE_TELEMETRY_FILE
+        telemetry.write_text(json.dumps({
+            "schema": self.hook.COMPILE_TELEMETRY_SCHEMA,
+            "run_id": "123",
+            "run_attempt": "1",
+            "cacheable_tasks": 1,
+            "hits": 1,
+            "misses": 0,
+            "hit_rate": 1,
+            "seed_distance": None,
+            "compile_seconds": 10 ** 400,
+            "fetch_seconds": None,
+            "link_seconds": 1,
+        }))
+        with mock.patch.dict(self.hook.os.environ, {"RUNNER_TEMP": str(self.dir)}, clear=False):
+            self.assertIsNone(self.hook.compile_telemetry({"run_id": "123", "run_attempt": "1"}))
+        self.assertFalse(telemetry.exists())
+
     def test_sampler_records_when_the_job_dies_first(self) -> None:
         watched = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(1)"])
         state = self.dir / "state"

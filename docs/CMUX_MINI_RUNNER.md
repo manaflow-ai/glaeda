@@ -184,6 +184,10 @@ What `--apply` does:
      re-read from the runner's `.roots` file during the job, and `roots_admitted` names the
      admission set when take-root `--switch` changed it. With telemetry off
      (`--no-telemetry`, `GLAEDA_RUNNER_TELEMETRY=0`) no lines are written.
+     A cmux compile admission may also write `RUNNER_TEMP/glaeda-compile-telemetry.json`.
+     When its schema and run identity match, the completed line embeds a bounded `compile`
+     object with cacheable tasks, hits, misses, hit rate, seed distance, compile, fetch and
+     link seconds. Malformed or stale sidecars are ignored and removed by the job.
    - job-completed stops the sampler (it writes the job's line), releases the host lock
      (or the capacity share), kills orphaned `cmux DEV.app` processes whose executable was
      under a finished runner `_work/_temp/cmux-derived-data-tests-*` directory, runs the same
