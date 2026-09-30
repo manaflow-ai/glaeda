@@ -1011,9 +1011,11 @@ def du_bytes(path: Path) -> int:
 BULK_SIZE_MIN = 64  # unsized candidates in a bulk_sizes family before one walk beats per-item du
 
 
-def du_children(root: Path) -> dict[str, int]:
-    """Sizes of every directory directly below root from a single walk, keyed like candidates."""
-    out = subprocess.run(["du", "-xk", "-d", "1", str(root)], capture_output=True, text=True)
+def du_children(root: Path, timeout: float | None = None) -> dict[str, int]:
+    """Sizes of every directory directly below root from a single walk, keyed like candidates.
+
+    With timeout, a walk that has not finished is killed and yields nothing (TimeoutExpired propagates)."""
+    out = subprocess.run(["du", "-xk", "-d", "1", str(root)], capture_output=True, text=True, timeout=timeout)
     sizes: dict[str, int] = {}
     for line in out.stdout.splitlines():
         fields = line.split(None, 1)
@@ -2539,6 +2541,12 @@ def gib(n: int) -> str:
 
 
 ACCOUNTING_MAX_AGE_S = 6 * 3600
+# The top-level volume walk is a diagnostic. On a busy 460 GiB mini a LowPriorityIO `du -x /` ran for
+# more than four hours (cmux7s, cmux11s, cmux15 on 2026-09-30) while the pass held EVICT_LOCK, so every
+# runner hook eviction printed "another eviction running; skipped" and jobs were refused under the floor.
+# A walk gets this long; one that does not finish is recorded as attempted and retried after
+# ACCOUNTING_MAX_AGE_S, never on the next pass.
+ACCOUNTING_WALK_TIMEOUT_S = 300
 _ACCOUNTING_MEM: dict[tuple[int, str], list[dict[str, Any]]] = {}
 
 
@@ -2550,12 +2558,13 @@ def _accounting_cache() -> dict[str, Any]:
         return {}
 
 
-def filesystem_accounting(fss: list[Fs], items: list[Item]) -> list[dict[str, Any]]:
+def filesystem_accounting(fss: list[Fs], items: list[Item], walk: bool = True) -> list[dict[str, Any]]:
     """Show df-used minus catalogued bytes and bounded top-level volume usage.
 
-    The top-level walk is cached for six hours. Item sizes stay the authoritative measured catalog;
-    this report deliberately calls out anything the catalog does not own so a zero reclaimable result
-    cannot hide a full volume.
+    The top-level walk is cached for six hours and bounded by ACCOUNTING_WALK_TIMEOUT_S. Item sizes stay
+    the authoritative measured catalog; this report deliberately calls out anything the catalog does not
+    own so a zero reclaimable result cannot hide a full volume. walk=False never starts a walk: it reuses
+    the cached top level, however old, so an eviction pass never waits on this diagnostic.
     """
     cached = _accounting_cache()
     now = time.time()
@@ -2572,11 +2581,17 @@ def filesystem_accounting(fss: list[Fs], items: list[Item]) -> list[dict[str, An
             # Linux test and development hosts do not need a / walk for the macOS mini report.
             top = []
             top_at = now
-        elif hit and now - float(hit.get("at", 0)) < ACCOUNTING_MAX_AGE_S and hit.get("mount") == fs.mount:
+        elif hit and hit.get("mount") == fs.mount and (
+                not walk or now - float(hit.get("at", 0)) < ACCOUNTING_MAX_AGE_S):
             top = hit.get("top_level") if isinstance(hit.get("top_level"), list) else []
             top_at = float(hit.get("at", 0))
+        elif not walk:
+            top, top_at = [], 0.0
         else:
-            top_map = du_children(Path(fs.mount))
+            try:
+                top_map = du_children(Path(fs.mount), timeout=ACCOUNTING_WALK_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                top_map = {}  # attempted now: the next walk waits ACCOUNTING_MAX_AGE_S like a finished one
             top = [{"path": p, "bytes": n} for p, n in sorted(top_map.items(), key=lambda kv: -kv[1])[:32]]
             top_at = now
         _ACCOUNTING_MEM[(fs.dev, fs.mount)] = top
@@ -3124,8 +3139,10 @@ def main(argv: list[str] | None = None) -> int:
               f"{' (refreshing in background)' if age_min > a.max_age and not a.apply else ''};"
               " verdicts are live\n")
     shown = [fs for fs in fss.values() if not a.pressure or fs.under]
-    accounting = filesystem_accounting(shown, items)
-    write_health_summary(shown, items, accounting)
+    # An --apply pass holds EVICT_LOCK and has not deleted anything yet: it must not walk the volume here.
+    accounting = filesystem_accounting(shown, items, walk=not a.apply)
+    if not a.apply:
+        write_health_summary(shown, items, accounting)
     # Xcode copies are sized by a walk, so only a report shows them (the agent runs with --top 0)
     tooling = (simulator_runtimes() + (xcode_items() if a.top or a.json else [])) if sweep and DARWIN else []
     if a.json:
@@ -3153,6 +3170,12 @@ def main(argv: list[str] | None = None) -> int:
             apply_runtimes(tooling, a.receipt, host_busy)
             IDLE_STAMP.parent.mkdir(parents=True, exist_ok=True)
             IDLE_STAMP.touch()
+        # Deletions are done: let a runner hook's eviction in before the diagnostic walk. Only the hourly
+        # idle sweep refreshes it; a pressure pass (the agent under pressure, every runner hook) never walks.
+        evict_lock.close()
+        if sweep:
+            accounting = filesystem_accounting(shown, items, walk=True)
+        write_health_summary(shown, items, accounting)
     return 0
 
 

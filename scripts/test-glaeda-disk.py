@@ -634,6 +634,79 @@ class GlaedaDiskTest(unittest.TestCase):
         second = json.loads(gd.ACCOUNTING.read_text())[str(fs.dev)]["at"]
         self.assertEqual(second, first)
 
+    def test_accounting_without_walk_never_runs_du(self) -> None:
+        path = self.root / "known"
+        path.write_bytes(b"x")
+        fs = gd.Fs(path.stat().st_dev, "/volume", 2 * gd.GIB, 10 * gd.GIB, 3 * gd.GIB, 4 * gd.GIB)
+        saved = (gd.DARWIN, gd.ACCOUNTING)
+        gd.DARWIN, gd.ACCOUNTING = True, self.root / "accounting-nowalk.json"
+        gd._ACCOUNTING_MEM.clear()
+        self.addCleanup(lambda: (setattr(gd, "DARWIN", saved[0]), setattr(gd, "ACCOUNTING", saved[1]),
+                                  gd._ACCOUNTING_MEM.clear()))
+        with mock.patch.object(gd, "du_children", side_effect=AssertionError("an eviction pass must not walk")):
+            got = gd.filesystem_accounting([fs], [], walk=False)
+        self.assertEqual(got[0]["top_level"], [])
+        # A stale cached walk is still shown rather than refreshed.
+        gd._ACCOUNTING_MEM.clear()
+        gd.ACCOUNTING.write_text(json.dumps({str(fs.dev): {"mount": "/volume", "at": 1.0,
+                                                           "top_level": [{"path": "/volume/ci", "bytes": 5}]}}))
+        with mock.patch.object(gd, "du_children", side_effect=AssertionError("an eviction pass must not walk")):
+            got = gd.filesystem_accounting([fs], [], walk=False)
+        self.assertEqual(got[0]["top_level"], [{"path": "/volume/ci", "bytes": 5}])
+
+    def test_accounting_walk_that_times_out_is_not_retried_every_pass(self) -> None:
+        path = self.root / "known"
+        path.write_bytes(b"x")
+        fs = gd.Fs(path.stat().st_dev, "/volume", 2 * gd.GIB, 10 * gd.GIB, 3 * gd.GIB, 4 * gd.GIB)
+        saved = (gd.DARWIN, gd.ACCOUNTING)
+        gd.DARWIN, gd.ACCOUNTING = True, self.root / "accounting-timeout.json"
+        gd._ACCOUNTING_MEM.clear()
+        self.addCleanup(lambda: (setattr(gd, "DARWIN", saved[0]), setattr(gd, "ACCOUNTING", saved[1]),
+                                  gd._ACCOUNTING_MEM.clear()))
+        timeouts: list[float | None] = []
+
+        def slow(root: Path, timeout: float | None = None) -> dict[str, int]:
+            timeouts.append(timeout)
+            raise subprocess.TimeoutExpired(["du"], timeout or 0)
+
+        with mock.patch.object(gd, "du_children", side_effect=slow):
+            got = gd.filesystem_accounting([fs], [])
+        self.assertEqual(timeouts, [gd.ACCOUNTING_WALK_TIMEOUT_S], "the volume walk is bounded")
+        self.assertEqual(got[0]["top_level"], [])
+        gd._ACCOUNTING_MEM.clear()
+        with mock.patch.object(gd, "du_children", side_effect=AssertionError("retried within the cache age")):
+            gd.filesystem_accounting([fs], [])
+
+    def test_apply_deletes_before_the_volume_walk_and_outside_the_evict_lock(self) -> None:
+        lock = self.root / "evict.lock"
+        receipt = ["--receipt", os.fspath(self.receipt())]
+        events: list[tuple[str, object]] = []
+
+        def accounting(shown: object, items: object, walk: bool = True) -> list:
+            if walk:
+                with lock.open("a") as probe:  # a runner hook's eviction can take the lock now
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(probe, fcntl.LOCK_UN)
+            events.append(("accounting", walk))
+            return []
+
+        with mock.patch.object(gd, "EVICT_LOCK", lock), mock.patch.object(gd, "filesystems", return_value={}), \
+                mock.patch.object(gd, "survey", return_value=[]), \
+                mock.patch.object(gd, "apply", side_effect=lambda *a, **k: events.append(("apply", None))), \
+                mock.patch.object(gd, "apply_runtimes"), mock.patch.object(gd, "simulator_runtimes", return_value=[]), \
+                mock.patch.object(gd, "host_busy", return_value=""), mock.patch.object(gd, "idle_due", return_value=True), \
+                mock.patch.object(gd, "IDLE_STAMP", self.root / "idle-sweep.last"), \
+                mock.patch.object(gd, "write_health_summary", side_effect=lambda *a: events.append(("summary", None))), \
+                mock.patch.object(gd, "filesystem_accounting", side_effect=accounting), \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd.main(["--apply", "--no-snapshot", "--top", "0", *receipt])
+            self.assertEqual(events, [("accounting", False), ("apply", None), ("summary", None)],
+                             "a pressure-style apply never walks the volume")
+            events.clear()
+            gd.main(["--idle", "--apply", "--no-snapshot", "--top", "0", *receipt])
+            self.assertEqual(events, [("accounting", False), ("apply", None), ("accounting", True), ("summary", None)],
+                             "the idle sweep walks only after deleting and releasing the evict lock")
+
     def test_retired_owner_family_is_reclaimable_when_unloaded(self) -> None:
         make(self.root / "old")
         fam = gd.Family("retired", self.root, True, "rebuild", retired_only=True,
