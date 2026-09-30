@@ -5471,9 +5471,9 @@ class JobTelemetryTest(unittest.TestCase):
         stale = first + "/_work/_temp/cmux-derived-data-tests-122-1-shard-2"
         app = "/Build/Products/Debug/cmux DEV.app/Contents/MacOS/cmux DEV"
         table = {
-            100: (1, first + "/bin/Runner.Worker spawnclient"),
+            100: (1, first + "/bin/Runner.Worker"),
             101: (100, "/usr/bin/xcodebuild -derivedDataPath " + temp + "/Build test-without-building"),
-            200: (1, second + "/bin/Runner.Worker spawnclient"),
+            200: (1, second + "/bin/Runner.Worker"),
             201: (200, "/bin/bash " + stale + "/run.sh"),
             300: (1, temp + app),
             301: (300, "/usr/bin/helper"),
