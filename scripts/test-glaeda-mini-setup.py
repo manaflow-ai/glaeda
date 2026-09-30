@@ -262,6 +262,13 @@ class MiniSetupTest(unittest.TestCase):
         self.assertEqual(dedupe["WatchPaths"], [os.fspath(self.home / "Library/Developer/Xcode/DerivedData")])
         self.assertTrue((self.home / "Library/Developer/Xcode/DerivedData").is_dir())
         self.assertEqual((self.home / ".cache/glaeda/cmux-native-cache").stat().st_mode & 0o777, 0o700)
+        for marker in (
+                self.home / "Library/Developer/Xcode/DerivedData/.metadata_never_index",
+                self.home / ".cache/glaeda/cmux-native-cache/.metadata_never_index"):
+            self.assertTrue(marker.is_file(), marker)
+            self.assertEqual(marker.read_bytes(), b"")
+        marker_actions = [a for a in first["actions"] if a["kind"] == "marker"]
+        self.assertEqual({a["state"] for a in marker_actions}, {"create"})
         receipt_path = self.home / ".local/state/glaeda/mini-setup/receipt.json"
         self.assertEqual(receipt_path.stat().st_mode & 0o777, 0o600)
         self.assertEqual(json.loads(receipt_path.read_text())["schema"], "glaeda-mini-setup/v1")
@@ -282,6 +289,66 @@ class MiniSetupTest(unittest.TestCase):
         receipt = self.invoke()
         state = {a.get("label"): a["state"] for a in receipt["actions"] if a["kind"] == "agent"}
         self.assertEqual(state["com.teamleaderleo.glaeda.disk-pressure"], "unchanged")
+
+    def test_runner_work_marker_is_idempotent_owned_and_uninstallable(self) -> None:
+        work = self.home / "actions-runner-glaeda-1/_work"
+        work.mkdir(parents=True)
+        first = self.invoke("--apply")
+        marker = work / ".metadata_never_index"
+        self.assertTrue(marker.is_file())
+        first_marker = next(a for a in first["actions"] if a.get("path") == os.fspath(marker))
+        self.assertEqual(first_marker["state"], "create")
+        second = self.invoke("--apply")
+        second_marker = next(a for a in second["actions"] if a.get("path") == os.fspath(marker))
+        self.assertEqual((second_marker["state"], second_marker["owned"]), ("unchanged", True))
+        self.invoke("--uninstall", "--apply")
+        self.assertFalse(marker.exists())
+
+    def test_runner_symlink_is_not_followed_for_scan_marker(self) -> None:
+        target = Path(self.tmp.name) / "outside-runner/_work"
+        target.mkdir(parents=True)
+        (self.home / "actions-runner-glaeda-link").symlink_to(target.parent, target_is_directory=True)
+        receipt = self.invoke()
+        self.assertFalse(any(a.get("path", "").startswith(os.fspath(target))
+                             for a in receipt["actions"] if a["kind"] == "marker"))
+
+    def test_canonical_root_symlink_is_not_followed_for_scan_marker(self) -> None:
+        outside = Path(self.tmp.name) / "outside-derived-data"
+        outside.mkdir()
+        derived = self.home / "Library/Developer/Xcode/DerivedData"
+        derived.parent.mkdir(parents=True)
+        derived.symlink_to(outside, target_is_directory=True)
+        receipt = self.invoke()
+        self.assertFalse(any(a.get("path", "").startswith(os.fspath(outside))
+                             for a in receipt["actions"] if a["kind"] == "marker"))
+        self.assertFalse((outside / ".metadata_never_index").exists())
+
+    def test_preexisting_markers_are_never_overwritten_or_removed(self) -> None:
+        roots = (self.home / "Library/Developer/Xcode/DerivedData",
+                 self.home / ".cache/glaeda/cmux-native-cache")
+        for root in roots:
+            root.mkdir(parents=True)
+            (root / ".metadata_never_index").write_bytes(b"operator marker\n")
+        receipt = self.invoke("--apply")
+        markers = [a for a in receipt["actions"] if a["kind"] == "marker"]
+        self.assertEqual({a["state"] for a in markers}, {"unchanged"})
+        self.assertEqual({a["owned"] for a in markers}, {False})
+        self.assertTrue(all((root / ".metadata_never_index").read_bytes() == b"operator marker\n"
+                            for root in roots))
+        self.invoke("--uninstall", "--apply")
+        self.assertTrue(all((root / ".metadata_never_index").exists() for root in roots))
+
+    def test_owned_marker_replaced_by_symlink_is_kept_on_uninstall(self) -> None:
+        self.invoke("--apply")
+        marker = self.home / "Library/Developer/Xcode/DerivedData/.metadata_never_index"
+        target = Path(self.tmp.name) / "marker-target"
+        target.write_bytes(b"")
+        marker.unlink()
+        marker.symlink_to(target)
+        receipt = self.invoke("--uninstall")
+        action = next(a for a in receipt["actions"] if a.get("path") == os.fspath(marker))
+        self.assertEqual(action["state"], "absent")
+        self.assertTrue(marker.is_symlink())
 
     def test_update_keeps_a_backup(self) -> None:
         (self.home / ".local/bin").mkdir(parents=True)
