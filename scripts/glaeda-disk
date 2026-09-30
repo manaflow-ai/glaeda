@@ -54,7 +54,7 @@ uses it, it is not its platform's newest, it went unused for RUNTIME_IDLE_DAYS a
 booted (simctl runtime delete restarts CoreSimulatorService). Xcode copies are never deleted.
 
 On an owned cmux mini, cmux CI's warm state under /Users/Shared/cmux-build-fleet/ci is a local hot
-tier, evicted LRU under pressure: parked pull request builds unused for 30 minutes, seeds other than each
+tier, evicted LRU under pressure: parked pull request builds past the measured host-job reuse distance, seeds other than each
 root's newest one under pressure (two during idle sweeps), and a root's kept build once the root has been idle two days. On the
 trusted seeder, a seed its serve log shows streamed whole to the seed archive (cmux-lawrence's SSD) is
 reclaimable at once instead of after the idle window: the PR minis restore it from there over the LAN.
