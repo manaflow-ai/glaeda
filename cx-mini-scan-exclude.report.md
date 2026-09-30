@@ -45,9 +45,22 @@ The scoped canary on `cmux14` (macOS 26.5.1, CI uid 501) disabled only
 `gui/501/com.apple.mediaanalysisd` and `gui/501/com.apple.photoanalysisd`, then terminated their
 current per-user processes. SIP blocked `launchctl bootout` (operation 150), but
 `launchctl print-disabled gui/501` recorded both services disabled. No cache, runner, job, or
-security-policy files were moved or changed. An hour-long sampler is running from
-2026-09-30T19:07Z; it records daemon CPU, total CPU, and active xcodebuild count every 10 s.
-This report will be amended with the completed post-canary aggregate before publication.
+security-policy files were moved or changed. After one hour of real jobs (19:07:03--20:07:03
+UTC), the state was restored with `launchctl enable` for both labels.
+
+The canary did not prove a useful CPU or latency reduction. The sampler's daemon columns were
+discarded because macOS `ps comm` returned full paths on this host; job records provide the
+validated bounded comparison:
+
+| window | completed jobs | fseventsd top-outside CPU | XProtect top-outside CPU | all-job wall seconds | app-host p50 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| preceding hour | 25 | 1,629 core-s | 769 core-s | 11,004.3 s | 606.3 s (n=7) |
+| canary hour | 31 | 377 core-s | 1,347 core-s | 9,673.0 s | 680.2 s (n=5) |
+
+The windows contain different job mixes, and `mediaanalysisd` was running again at the end even
+though both labels were disabled; `photoanalysisd` remained stopped. The result is therefore
+inconclusive for mediaanalysisd and shows no job-time benefit. Both labels were re-enabled, and
+this mitigation is not rolled out. The earlier sampler's zero columns are not used as evidence.
 
 ## Decision
 
@@ -61,6 +74,6 @@ experiment needs a drained mini, exact volume identity, remount, and rollback; X
 unsigned executables and broad temp artifacts even without quarantine xattrs, so a path exemption
 would weaken malware scanning without a measured job benefit. Leave AmbientDisplayAgent alone.
 
-The only scoped runtime mitigation supported by the current evidence is disabling media/photo
-analysis for a dedicated CI user, subject to the completed one-hour before/after sampler and the
-rollback commands in `cx-mini-scan-exclude-probes.md`.
+No runtime mitigation is supported by the current canary. Keep the media/photo rollback commands
+in the probe document for a future dedicated CI account where the launchd behavior can be verified
+before/after. Do not disable the services on the shared user fleet-wide.
