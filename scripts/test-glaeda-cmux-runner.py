@@ -2103,6 +2103,11 @@ time.sleep(60)
         self.assertEqual(hook.job_class("swift-test", home, home, "cmux-next.yml"), ("isolated", False))
         self.assertEqual(hook.job_class("release-compile", home, home, "cmux-next.yml"), ("isolated", False))
         self.assertEqual(hook.job_class("cmux-scheme-compile", home, home, "cmux-next.yml"), ("isolated", False))
+        # cmux-next's nightly frame-pacing bench: reload-build's `build`, called from it (GITHUB_WORKFLOW_REF names
+        # the caller), builds in its workspace; `bench` takes the gui token itself (take-gui) and draws in the console
+        self.assertEqual(hook.job_class("build", home, home, "cmux-next-frame-pacing.yml"), ("isolated", False))
+        self.assertEqual(hook.job_class("bench", home, home, "cmux-next-frame-pacing.yml"), ("gui-step", False))
+        self.assertEqual(hook.job_class("bench", home, home, "other.yml"), ("compile", True))
         self.assertEqual(hook.job_class("release-compile", home, home, "other.yml"), ("compile", True))
         self.assertEqual(hook.job_class("build", home, home, "nightly.yml"), ("compile", True))
         self.assertEqual(hook.job_class("rerun", home, home, "other.yml"), ("compile", True))

@@ -177,6 +177,11 @@ JOB_CLASSES = {"macos-compile-admission": "compile", "app-host-unit-tests": "gui
 # xcodebuild of the cmux app scheme into a DerivedData kept per runner under
 # ~/Library/Caches/cmux-next-ci/cmux-scheme/<runner> (cmux "cmux-next CI: compile the cmux app scheme"). No GUI
 # session, keychain, fixed port or canonical root, and none touches compile admission's kept DerivedData.
+# cmux-next-frame-pacing.yml (cmux#16511, nightly, side lane, owned minis only) calls reload-build.yml, so its
+# `build` is reload-build's isolated Debug build under the caller's name. Its `bench` unpacks that app into
+# $RUNNER_TEMP and flings the agent pane in the console session on a 120 Hz virtual display: it takes the gui
+# token itself (glaeda-canonical-root take-gui --wait 900, the test-e2e `test` pattern) before the console
+# steps, so it is gui-step. It restores no product into a canonical root.
 WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "test"): "isolated",
                         ("cmux-tui.yml", "build"): "isolated", ("cmux-tui.yml", "cdp-browser-smoke"): "isolated",
                         ("reload-build.yml", "build"): "isolated", ("app-host-test-rerun.yml", "rerun"): "gui",
@@ -184,7 +189,9 @@ WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "
                         ("seed-derived-data.yml", "seed"): "seed",
                         ("nightly.yml", "build-nightly-app"): "isolated",
                         ("cmux-next.yml", "swift-test"): "isolated", ("cmux-next.yml", "release-compile"): "isolated",
-                        ("cmux-next.yml", "cmux-scheme-compile"): "isolated"}
+                        ("cmux-next.yml", "cmux-scheme-compile"): "isolated",
+                        ("cmux-next-frame-pacing.yml", "build"): "isolated",
+                        ("cmux-next-frame-pacing.yml", "bench"): "gui-step"}
 # root: the canonical root (/private/tmp/cmux-ci) that compiles build in and that app-host test consumers
 # restore a product into with rm -rf of its src, so one root job per root per mini (cmux#14338 adds a second).
 # product (cli-product-tests) runs its XCTest bundle through the same user testmanagerd as the gui jobs, so it
