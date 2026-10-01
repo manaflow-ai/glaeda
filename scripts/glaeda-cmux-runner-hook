@@ -3831,7 +3831,7 @@ def compile_telemetry(meta: dict[str, Any]) -> dict[str, Any] | None:
             return None
     result: dict[str, Any] = {"schema": COMPILE_TELEMETRY_SCHEMA}
     integer_fields = ("cacheable_tasks", "hits", "misses", "seed_distance")
-    number_fields = ("hit_rate", "compile_seconds", "fetch_seconds", "link_seconds")
+    number_fields = ("hit_rate", "compile_seconds", "compile_wall_seconds", "fetch_seconds", "link_seconds")
     for key in integer_fields:
         value = payload.get(key)
         if value is None and key == "seed_distance":
@@ -3842,7 +3842,7 @@ def compile_telemetry(meta: dict[str, Any]) -> dict[str, Any] | None:
             return None
     for key in number_fields:
         value = payload.get(key)
-        if value is None and key in ("hit_rate", "fetch_seconds"):
+        if value is None and key in ("hit_rate", "compile_wall_seconds", "fetch_seconds"):
             result[key] = None
         elif isinstance(value, (int, float)) and not isinstance(value, bool):
             # Check the JSON number's range before converting an arbitrarily
@@ -3854,6 +3854,11 @@ def compile_telemetry(meta: dict[str, Any]) -> dict[str, Any] | None:
             result[key] = round(float(value), 6)
         else:
             return None
+    backend = payload.get("cache_backend")
+    if backend is not None:
+        if backend not in ("local", "fleet"):
+            return None
+        result["cache_backend"] = backend
     if (result["hits"] + result["misses"] != result["cacheable_tasks"]
             or result["hits"] > result["cacheable_tasks"]
             or result["misses"] > result["cacheable_tasks"]):
