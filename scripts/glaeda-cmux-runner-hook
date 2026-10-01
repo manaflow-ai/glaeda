@@ -170,12 +170,18 @@ JOB_CLASSES = {"macos-compile-admission": "compile", "app-host-unit-tests": "gui
 # console session or canonical root. reload-build's `build` is a Debug build of the dev app (or the iOS app)
 # into the workspace's .ci-reload-derived-data, after git clean -ffdx: no GUI, keychain or canonical root.
 # Both reach the minis as side lanes (vars.CI_SIDE_LANE_RUNNER, cmux docs/ci-runners.md "Side lanes").
+# cmux-next.yml (cmux's feat-cmux-next branch only) is a side lane too: `swift-test` builds and runs the
+# CmuxNext package's Swift Testing suites in the workspace .build (after checkout's git clean), and
+# `release-compile` is an xcodebuild Release compile into $RUNNER_TEMP plus, on a mini, the CEF shim build
+# into ~/Library/Caches/cmux/cef (content-addressed, rename-into-place). No GUI session, keychain, fixed port
+# or canonical root, and neither touches compile admission's kept DerivedData.
 WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "test"): "isolated",
                         ("cmux-tui.yml", "build"): "isolated", ("cmux-tui.yml", "cdp-browser-smoke"): "isolated",
                         ("reload-build.yml", "build"): "isolated", ("app-host-test-rerun.yml", "rerun"): "gui",
                         ("test-e2e.yml", "build"): "compile-gui", ("test-e2e.yml", "test"): "gui-step",
                         ("seed-derived-data.yml", "seed"): "seed",
-                        ("nightly.yml", "build-nightly-app"): "isolated"}
+                        ("nightly.yml", "build-nightly-app"): "isolated",
+                        ("cmux-next.yml", "swift-test"): "isolated", ("cmux-next.yml", "release-compile"): "isolated"}
 # root: the canonical root (/private/tmp/cmux-ci) that compiles build in and that app-host test consumers
 # restore a product into with rm -rf of its src, so one root job per root per mini (cmux#14338 adds a second).
 # product (cli-product-tests) runs its XCTest bundle through the same user testmanagerd as the gui jobs, so it
