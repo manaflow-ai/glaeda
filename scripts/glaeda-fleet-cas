@@ -226,17 +226,34 @@ write_service() {  # role, args...
 }
 
 install_binaries() {
-  say "build $proto (cargo build --release --locked)"
+  local prebuilt=${GLAEDA_FLEET_CAS_PREBUILT:-} f src
+  if [ -n "$prebuilt" ]; then
+    say "install prebuilt fleet-cas bundle $prebuilt (Cargo skipped)"
+    [ -f "$prebuilt/SHA256SUMS" ] && [ ! -L "$prebuilt/SHA256SUMS" ] || { echo "missing prebuilt SHA256SUMS: $prebuilt/SHA256SUMS" >&2; exit 1; }
+    (cd "$prebuilt" && shasum -a 256 -c SHA256SUMS) || { echo "prebuilt bundle checksum failed" >&2; exit 1; }
+    for f in fleet-cas fleet-cas-run fleet-cas-settings.sh fleet-cas-marker.sh fleet-cas-warm.sh fleet-cas-prewarm.sh fleet-cas-writer-build.sh; do
+      src=$prebuilt/$f
+      [ -f "$src" ] && [ ! -L "$src" ] && [ -x "$src" ] || { echo "missing regular prebuilt executable: $src" >&2; exit 1; }
+    done
+  else
+    say "build $proto (cargo build --release --locked)"
+    if [ -n "$apply" ]; then
+      check_owner
+      # No host lock: queuing for it exclusively takes a runner host's PR runners offline while
+      # it waits (glaeda#1206's gate), and an up-to-date build is a no-op anyway. A real rebuild
+      # runs at low priority beside whatever is building.
+      (cd "$proto" && nice -n 15 cargo build --release --locked -q)
+    fi
+  fi
   if [ -n "$apply" ]; then
     check_owner
-    # No host lock: queuing for it exclusively takes a runner host's PR runners offline while
-    # it waits (glaeda#1206's gate), and an up-to-date build is a no-op anyway. A real rebuild
-    # runs at low priority beside whatever is building.
-    (cd "$proto" && nice -n 15 cargo build --release --locked -q)
     mkdir -p "$BIN"
-    local f src
     for f in fleet-cas fleet-cas-run fleet-cas-settings.sh fleet-cas-marker.sh fleet-cas-warm.sh fleet-cas-prewarm.sh fleet-cas-writer-build.sh; do
-      src=$proto/target/release/$f; [ "$f" = fleet-cas ] || src=$proto/scripts/$f
+      if [ -n "$prebuilt" ]; then
+        src=$prebuilt/$f
+      else
+        src=$proto/target/release/$f; [ "$f" = fleet-cas ] || src=$proto/scripts/$f
+      fi
       if ! cmp -s "$src" "$BIN/$f"; then
         install -m 0755 "$src" "$BIN/$f.new" && mv "$BIN/$f.new" "$BIN/$f"
         [ "$f" = fleet-cas ] && bin_changed=1

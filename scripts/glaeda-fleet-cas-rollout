@@ -2,7 +2,7 @@
 # glaeda-fleet-cas-rollout: deploy the fleet compilation cache from an operator Mac.
 #
 #   glaeda-fleet-cas-rollout --store HOST [--trusted-keys HEX] [--writer HOST --sign-key PATH]
-#                            [--prewarm REPO] NODE_HOST... [--apply]
+#                            [--prewarm REPO] [--prebuilt-dir DIR] NODE_HOST... [--apply]
 #
 # Plans by default; --apply deploys. HOST names are ssh aliases (User cmux). The store
 # listens on the store host's tailnet address port 7450; every NODE_HOST gets a read-only
@@ -16,11 +16,12 @@
 # ~/.cache/glaeda-fleet-cas (also when planning) and runs `glaeda-fleet-cas` there
 # (docs/CMUX_BUILD_SLOT_MODES.md). With --prewarm REPO (cmux@catchup-v1), every node also gets
 # the prewarm agent (fleet-cas-prewarm.sh), which keeps it warm with the writer's newest fill.
-# Every host needs the tailnet grant for the store port.
+# With --prebuilt-dir, the supplied fleet-cas binary and helper scripts are copied to each
+# host and the installer skips Cargo. Every host needs the tailnet grant for the store port.
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 PORT=7450
-store= apply= trusted= writer= sign_key= prewarm= nodes=()
+store= apply= trusted= writer= sign_key= prewarm= prebuilt_dir= nodes=()
 while [ $# -gt 0 ]; do
   case $1 in
     --store) store=${2:?}; shift ;;
@@ -28,6 +29,7 @@ while [ $# -gt 0 ]; do
     --writer) writer=${2:?}; shift ;;
     --sign-key) sign_key=${2:?}; shift ;;
     --prewarm) prewarm=${2:?}; shift ;;
+    --prebuilt-dir) prebuilt_dir=${2:?}; shift ;;
     --apply) apply=--apply ;;
     -*) echo "unknown option: $1" >&2; exit 2 ;;
     *) nodes+=("$1") ;;
@@ -35,6 +37,13 @@ while [ $# -gt 0 ]; do
   shift
 done
 [ -n "$store" ] || { sed -n '2,6p' "$0" >&2; exit 2; }
+if [ -n "$prebuilt_dir" ]; then
+  [ -f "$prebuilt_dir/SHA256SUMS" ] && [ ! -L "$prebuilt_dir/SHA256SUMS" ] || { echo "prebuilt bundle missing regular SHA256SUMS" >&2; exit 2; }
+  (cd "$prebuilt_dir" && shasum -a 256 -c SHA256SUMS) || { echo "prebuilt bundle checksum failed" >&2; exit 2; }
+  for f in fleet-cas fleet-cas-run fleet-cas-settings.sh fleet-cas-marker.sh fleet-cas-warm.sh fleet-cas-prewarm.sh fleet-cas-writer-build.sh; do
+    [ -f "$prebuilt_dir/$f" ] && [ ! -L "$prebuilt_dir/$f" ] && [ -x "$prebuilt_dir/$f" ] || { echo "prebuilt bundle missing regular executable $prebuilt_dir/$f" >&2; exit 2; }
+  done
+fi
 if [ -n "$writer" ]; then
   [ -n "$sign_key" ] && [ -n "$trusted" ] || { echo "--writer needs --sign-key PATH and --trusted-keys HEX" >&2; exit 2; }
 elif [ -n "$sign_key" ]; then
@@ -52,13 +61,19 @@ ship() {  # host
   ssh -o BatchMode=yes "$1" 'mkdir -p ~/.cache/glaeda-fleet-cas/glaeda/scripts ~/.cache/glaeda-fleet-cas/glaeda/tools'
   rsync -a -e 'ssh -o BatchMode=yes' "$here/scripts/glaeda-fleet-cas" "$1:.cache/glaeda-fleet-cas/glaeda/scripts/"
   rsync -a -e 'ssh -o BatchMode=yes' --delete --exclude target "$here/tools/fleet-cas-prototype" "$1:.cache/glaeda-fleet-cas/glaeda/tools/"
+  if [ -n "$prebuilt_dir" ]; then
+    ssh -o BatchMode=yes "$1" 'mkdir -p ~/.cache/glaeda-fleet-cas/prebuilt'
+    rsync -a --delete -e 'ssh -o BatchMode=yes' "$prebuilt_dir/" "$1:.cache/glaeda-fleet-cas/prebuilt/"
+  fi
 }
 run() {  # host, args...
   local h=$1; shift
   echo "== $h"
   ship "$h"
   # Quote each argument for the remote shell.
-  ssh -o BatchMode=yes "$h" "PATH=\$HOME/.cargo/bin:\$PATH ~/.cache/glaeda-fleet-cas/glaeda/scripts/glaeda-fleet-cas $(printf '%q ' "$@")"
+  local env_prefix=
+  [ -z "$prebuilt_dir" ] || env_prefix='GLAEDA_FLEET_CAS_PREBUILT=$HOME/.cache/glaeda-fleet-cas/prebuilt '
+  ssh -o BatchMode=yes "$h" "PATH=\$HOME/.cargo/bin:\$PATH $env_prefix~/.cache/glaeda-fleet-cas/glaeda/scripts/glaeda-fleet-cas $(printf '%q ' "$@")"
 }
 
 # The store's tailnet address: launchd-started third-party binaries on these minis cannot
