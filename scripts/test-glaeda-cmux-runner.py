@@ -2102,6 +2102,7 @@ time.sleep(60)
         # cmux-next's side-lane jobs build in their workspace or $RUNNER_TEMP: no root, no kept DerivedData
         self.assertEqual(hook.job_class("swift-test", home, home, "cmux-next.yml"), ("isolated", False))
         self.assertEqual(hook.job_class("release-compile", home, home, "cmux-next.yml"), ("isolated", False))
+        self.assertEqual(hook.job_class("cmux-scheme-compile", home, home, "cmux-next.yml"), ("isolated", False))
         self.assertEqual(hook.job_class("release-compile", home, home, "other.yml"), ("compile", True))
         self.assertEqual(hook.job_class("build", home, home, "nightly.yml"), ("compile", True))
         self.assertEqual(hook.job_class("rerun", home, home, "other.yml"), ("compile", True))
