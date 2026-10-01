@@ -254,7 +254,10 @@ What `--apply` does:
      logged in. The same check refuses at job-started any job on the gui runner or of a
      `gui` class (`refused: console: ...`, before any capacity is taken), so cmux's
      rescue re-runs it elsewhere, and makes `take-gui` give way (exit 3), so test-e2e's
-     build leaves its tests to the `test` job. An unreadable state changes nothing;
+     build leaves its tests to the `test` job. A job with no other runner whose own
+     `take-gui` step skips its console steps (`CONSOLE_SKIPPERS`: the cmux-next
+     frame-pacing `bench`) is admitted as `light` instead of refused, so its `take-gui`
+     gives way and the nightly skips rather than fails. An unreadable state changes nothing;
      `GLAEDA_RUNNER_CONSOLE_GATE=0` in the runner LaunchAgent turns it off.
    - **When free disk is under the floor** (every runner). The gate reads the
      `--min-free-gib` of the runner's own job-started hook and `statvfs` on every poll,

@@ -918,6 +918,34 @@ class HookTest(unittest.TestCase):
                 self.finish(runner)
         self.assertTrue(self.lock_free())
 
+    def test_a_locked_console_leaves_the_frame_pacing_bench_to_skip_itself(self) -> None:
+        # The bench runs on the side-lane mini or nowhere (no rescue), and its take-gui step skips its console steps
+        # when take-gui gives way. So a locked console admits it without the console (light, no gui token) and
+        # take-gui gives way, where a refusal would only fail the nightly.
+        self.fleet()
+        state = self.dir / "state"
+        bench = {"GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/cmux-next-frame-pacing.yml@refs/heads/main"}
+        locked = {**self.fake_ioreg(True), **bench}
+        try:
+            admitted = self.job("bench", "b0", 8, None, env=locked)
+            self.assertEqual(admitted.returncode, 0, admitted.stdout)
+            self.assertIn("for bench (light", admitted.stdout)
+            self.assertIn("console: the console session (cmux) is screen-locked", admitted.stdout)
+            self.assertFalse((state / "host-lock-holder-b0.gui").exists(), "no gui token taken")
+            gave = self.step(["take-gui", "--wait", "5"], "b0", env=locked)
+            self.assertEqual(gave.returncode, hook.TAKE_GUI_GAVE_WAY, gave.stderr)
+            self.assertIn("take-gui: console: the console session (cmux) is screen-locked", gave.stderr)
+            self.finish("b0")
+            refused = self.job("app-host-unit-tests", "g0", 8, None, env=locked)
+            self.assertEqual(refused.returncode, 1, "other console jobs are still refused for a rescue elsewhere")
+            unlocked = self.job("bench", "b1", 8, None, env={**self.fake_ioreg(False), **bench})
+            self.assertEqual(unlocked.returncode, 0, unlocked.stdout)
+            self.assertIn("for bench (gui-step", unlocked.stdout)
+        finally:
+            for runner in ("b0", "g0", "b1"):
+                self.finish(runner)
+        self.assertTrue(self.lock_free())
+
     def fake_ioreg(self, locked: bool | None) -> dict[str, str]:
         """GLAEDA_RUNNER_IOREG pointing at a script that prints a console session: locked, unlocked, or (None) at
         the login window with no user."""

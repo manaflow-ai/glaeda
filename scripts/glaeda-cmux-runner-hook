@@ -30,6 +30,7 @@ re-runs it elsewhere) when:
     (evict; skipped with --no-disk)
   * the job needs the console session (a gui class job, or any job on the --gui-runner) and the console
     session is screen-locked or no user is logged in at the console (console_refusal, cmuxterm-hq#757)
+    (a CONSOLE_SKIPPERS job is admitted as light instead: its take-gui step gives way and it skips)
   * another build holds the fleet host lock (/Users/Shared/cmux-build-fleet/host.lock, the flock that
     with-host-lock and the build worker take)
   * with --require-eligible (every fleet member): the local Glaeda node is not eligible, or its toolchain
@@ -710,6 +711,10 @@ THERMAL_PRESSURE_KEY = "com.apple.system.thermalpressurelevel"
 IOREG = os.environ.get("GLAEDA_RUNNER_IOREG") or "/usr/sbin/ioreg"
 CONSOLE_GATE = os.environ.get("GLAEDA_RUNNER_CONSOLE_GATE", "1") != "0"
 CONSOLE_CLASSES = ("gui", "gui-step")  # job classes whose tests need the console session
+# Console jobs that skip their console steps themselves when take-gui gives way, and run nowhere else: a refusal
+# would only fail them (the frame-pacing bench, cmux#16511, runs on the side-lane mini or not at all, with no
+# rescue). On a locked console they are admitted as light, with no gui token, and their take-gui gives way.
+CONSOLE_SKIPPERS = {("cmux-next-frame-pacing.yml", "bench")}
 GATE_CONSOLE_EVERY_S = 30.0
 
 
@@ -4318,10 +4323,14 @@ def main(argv: list[str] | None = None) -> int:
         if why:
             return refused(why)
         # before any capacity is taken: a job that needs the console session fails on a locked one
+        admit_class = None
         if args.gui_runner or job_class(os.environ.get("GITHUB_JOB", ""), repo, args.home_repo,
                                         job_workflow())[0] in CONSOLE_CLASSES:
             why = console_refusal()
-            if why:
+            if why and (job_workflow(), os.environ.get("GITHUB_JOB", "")) in CONSOLE_SKIPPERS:
+                print(f"{PREFIX}: {why}; admitted as light, its take-gui step skips the console steps", flush=True)
+                admit_class = "light"
+            elif why:
                 return refused(why)
         # The wrapper execs this script, so the parent is the job's Runner.Worker.
         admit_start = time.monotonic()
@@ -4345,7 +4354,7 @@ def main(argv: list[str] | None = None) -> int:
                                                workflow=job_workflow(),
                                                warm_keys=job_warm_keys(event), taken_out=taken,
                                                warm_target=job_warm_target(event), since=since,
-                                               gui_token=args.gui_token)
+                                               gui_token=args.gui_token, klass=admit_class)
                     if held or not note.startswith("capacity:"):
                         break
                     waited = time.monotonic() - start
