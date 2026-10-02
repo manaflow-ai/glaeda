@@ -8,6 +8,8 @@
                                                     install on members that do not pass the gate yet, left stopped
     glaeda-cmux-runner-fleet --apply --org manaflow-ai --group glaeda-minis --migrate-from-repo manaflow-ai/cmux
                                                     move every member from repo to org scope, one member at a time
+    glaeda-cmux-runner-fleet --apply --hosts a --allow-downgrade "roll back #1384"
+                                                    deploy although the guard below refuses, with the reason recorded
 
 Org scope (--org, --group) lets every repository the runner group allows use the pools; the hook then admits
 any repository of that org and costs other repositories as guests (glaeda-cmux-runner-hook job_class). A member
@@ -32,6 +34,20 @@ per instance here and pipes it over SSH (never an argv or a file), and applies -
 The gate checks the manifest's first Xcode for the member; if that app is missing there, the member reads as
 not eligible even when a later one would do (safe side). A member that SSH cannot reach is "unreachable", which
 fails an --apply run. Nothing here routes a job: pool variables stay with whoever owns routing.
+
+Downgrade guard. Before anything is staged, the run compares this checkout's HEAD with origin's main as origin
+reports it now (git ls-remote: nothing is fetched or written here, and an old checkout's own stale origin/main
+ref cannot vouch for it), and reads every target member's .glaeda-source.json over SSH. --apply refuses,
+changing nothing on any member, when HEAD is not origin's main (or either cannot be read), or when a member's
+stamped commit is not an ancestor of HEAD: a downgrade, or a deploy from a branch HEAD does not contain. It also
+refuses when the staged files have uncommitted changes. A member with no stamp, or one that cannot be read, is
+not a downgrade; the output says so. A member whose stamp records allowDowngrade was deployed off main on
+purpose (a canary of a PR that then squash-merged), so a run from origin's main rolls it forward instead of
+refusing. --allow-downgrade REASON overrides every refusal; the reason is printed and recorded in each staged
+stamp (allowDowngrade). The stamp names the HEAD the guard checked. A copy outside a git checkout (an OTA
+release) has no HEAD to check, so it needs --allow-downgrade. A shallow checkout fails closed: an older stamp
+beyond its history reads as not an ancestor; fetch the full history. A plan reports the same findings and does
+not fail.
 """
 
 from __future__ import annotations
@@ -48,6 +64,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +80,9 @@ SSH_OPTIONS = ["-o", "ConnectTimeout=10", "-o", "BatchMode=yes"]
 CHECK_TIMEOUT_S = 90
 APPLY_TIMEOUT_S = 2700  # above the remote worst case (download, unpack, config.sh), so a slow install is never raced by a re-run
 TOKEN_RE = re.compile(r"[A-Za-z0-9_.\-]+")
+SHA_RE = re.compile(r"[0-9a-f]{7,40}")
+STAMP_READ = f"head -c 4096 ~/{REMOTE_DIR}/scripts/{SOURCE_STAMP} 2>/dev/null || echo @no-stamp"  # read-only
+MAX_REASON = 200
 HOST_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
@@ -195,12 +215,151 @@ def source_stamp() -> dict[str, Any] | None:
     return None
 
 
-def stage(member: str, manifest: dict[str, Any], scratch: Path) -> str | None:
-    """Copy the scripts, their source stamp and the member's trimmed manifest. Returns why it failed, or None."""
+def git(*args: str, timeout: float = 30) -> tuple[int, str, str]:
+    return run(["git", "-C", os.fspath(SCRIPT_DIR.parent), *args], timeout)
+
+
+def checkout_source() -> dict[str, Any]:
+    """{head, originMain, refusal}: this checkout's HEAD and origin's main as origin reports it now. ls-remote
+    fetches nothing and writes nothing here, and a stale local origin/main ref cannot vouch for a stale checkout.
+    refusal is why --apply must not deploy from here, or None."""
+    code, out, _ = git("rev-parse", "--verify", "HEAD^{commit}")
+    head = out.strip() if code == 0 and re.fullmatch(r"[0-9a-f]{40}", out.strip()) else None
+    if head is None:
+        return {"head": None, "originMain": None,
+                "refusal": "this is not a git checkout, so what it would deploy is unknown"}
+    code, out, _ = git("ls-remote", "--exit-code", "origin", "refs/heads/main", timeout=60)
+    found = re.match(r"([0-9a-f]{40})\trefs/heads/main\Z", out.strip()) if code == 0 else None
+    main = found.group(1) if found else None
+    if main is None:  # git's stderr may name the remote URL: keep it out
+        refusal = f"cannot read origin's main (git ls-remote exit {code}), so HEAD {head} cannot be checked"
+    elif main != head:
+        refusal = f"HEAD {head} is not origin/main {main}; roll out from a worktree at origin/main"
+    else:
+        refusal = None
+    return {"head": head, "originMain": main, "refusal": refusal}
+
+
+def clean_reason(text: object) -> str:
+    """One line, no control or format characters, at most MAX_REASON characters."""
+    words = " ".join(str(text or "").split())
+    return " ".join("".join(ch for ch in words if unicodedata.category(ch)[0] != "C").split())[:MAX_REASON]
+
+
+def dirty_staged() -> list[str] | None:
+    """The staged files (and this tool) with uncommitted changes, by repository path; None when git cannot tell."""
+    paths = [f"scripts/{name}" for name in (*STAGED, "glaeda-cmux-runner-fleet")]
+    code, out, _ = git("status", "--porcelain", "--", *paths)
+    if code != 0:
+        return None
+    return sorted({line[3:].strip() for line in out.splitlines() if len(line) > 3})
+
+
+def head_stamp(head: str) -> dict[str, Any] | None:
+    """The stamp for the commit the guard checked: its UTC commit day, like source_stamp's git branch."""
+    code, out, _ = run(["env", "TZ=UTC", "git", "-C", os.fspath(SCRIPT_DIR.parent), "log", "-1", "--format=%cd",
+                        "--date=format-local:%Y-%m-%d", head], 30)
+    day = out.strip()
+    return {"by": "glaeda-cmux-runner-fleet", "date": day, "source": head} if code == 0 and re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}", day) else None
+
+
+def host_source(member: str, head: str | None, on_main: bool = False) -> dict[str, Any]:
+    """What the member's stamp says it runs, against HEAD. state: none, unreadable, current, behind, downgrade
+    (not an ancestor of HEAD), rolling_forward (not an ancestor, but deployed off main on purpose with
+    --allow-downgrade, and HEAD is origin's main) or unchecked (no HEAD). Read-only: one head -c over SSH."""
+    code, out, _ = run(["ssh", *SSH_OPTIONS, member, STAMP_READ], CHECK_TIMEOUT_S)
+    text = out.strip()
+    if code != 0:
+        return {"state": "unreadable", "note": f"cannot read the stamp (ssh exit {code})"}
+    if text == "@no-stamp":
+        return {"state": "none", "note": "no stamp"}
+    try:
+        stamp = json.loads(text)
+    except ValueError:
+        stamp = None
+    source = str(stamp.get("source") or "") if isinstance(stamp, dict) else ""
+    if not SHA_RE.fullmatch(source):
+        return {"state": "unreadable",
+                "note": "stamp names no commit" if isinstance(stamp, dict) else "stamp is not a JSON object"}
+    row: dict[str, Any] = {"source": source, "date": str(stamp.get("date") or "")[:10] or None,
+                           "by": str(stamp.get("by") or "")[:40] or None}
+    if head is None:
+        return {**row, "state": "unchecked", "note": "HEAD unknown"}
+    code, _, _ = git("merge-base", "--is-ancestor", source, head)
+    if code != 0:  # 1: not an ancestor; anything else: a commit this checkout does not have, so not one either
+        override = stamp.get("allowDowngrade")
+        reason = clean_reason(override.get("reason")) if isinstance(override, dict) else ""
+        if on_main and reason:  # a squash-merged canary is never an ancestor of main: roll it forward
+            return {**row, "state": "rolling_forward", "reason": reason,
+                    "note": f"rolling forward from a deliberate off-main deploy (reason: {reason})"}
+        unknown = "" if code == 1 else " (a commit this checkout does not have)"
+        return {**row, "state": "downgrade",
+                "note": f"stamped {source} is not an ancestor of HEAD {head}{unknown}: a downgrade or a diverged deploy"}
+    code, out, _ = git("rev-list", "--count", f"{source}..{head}")
+    behind = int(out.strip()) if code == 0 and out.strip().isdigit() else None
+    return {**row, "state": "current" if behind == 0 else "behind", "behind": behind}
+
+
+def source_guard(chosen: list[str], jobs: int) -> dict[str, Any]:
+    """The checkout and every target member's stamp, and the refusals they add up to (each {member, text})."""
+    guard = checkout_source()
+    on_main = guard["head"] is not None and guard["head"] == guard["originMain"]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
+        hosts = dict(zip(chosen, pool.map(lambda m: host_source(m, guard["head"], on_main), chosen)))
+    guard["hosts"] = hosts
+    refusal = guard.pop("refusal")
+    checkout = [refusal] if refusal else []
+    if guard["head"] is not None:
+        dirty = dirty_staged()
+        if dirty is None:
+            checkout.append("cannot tell whether the staged files have uncommitted changes (git status failed)")
+        elif dirty:
+            checkout.append(f"uncommitted changes to staged files: {', '.join(dirty)}; the stamp would name HEAD "
+                            f"{guard['head']} for files that differ from it")
+    guard["refusals"] = [{"member": None, "text": text} for text in checkout] + [
+        {"member": m, "text": f"{m}: {row['note']}"} for m, row in sorted(hosts.items()) if row["state"] == "downgrade"]
+    return guard
+
+
+def guard_lines(guard: dict[str, Any], applied: bool) -> list[str]:
+    head, main = (guard.get("head") or "unknown")[:12], (guard.get("originMain") or "unknown")[:12]
+    lines = [f"source: HEAD {head}, origin/main {main}"]
+    for member, row in sorted(guard["hosts"].items()):
+        if row["state"] in ("none", "unreadable"):
+            what = "no stamp" if row["state"] == "none" else f"unreadable stamp ({row['note']})"
+            lines.append(f"  {member}: {what}; not counted as a downgrade")
+        elif row["state"] in ("current", "behind"):
+            behind = "?" if row.get("behind") is None else row["behind"]
+            lines.append(f"  {member}: stamped {row['source'][:12]}, {behind} behind HEAD")
+        elif row["state"] == "rolling_forward":
+            lines.append(f"  {member}: {row['note']}")
+        elif row["state"] == "unchecked":
+            lines.append(f"  {member}: stamped {row['source'][:12]}, not checked ({row['note']})")
+    return lines + refusal_lines(guard, applied)
+
+
+def refusal_lines(guard: dict[str, Any], applied: bool) -> list[str]:
+    if not guard["refusals"]:
+        return []
+    if guard.get("allowDowngrade"):
+        head = f"--allow-downgrade ({guard['allowDowngrade']}) overrides:"
+    else:
+        head = "refused --apply, nothing changed:" if applied else "would refuse --apply:"
+    return [head, *(f"  {r['text']}" for r in guard["refusals"])]
+
+
+def stage(member: str, manifest: dict[str, Any], scratch: Path,
+          override: dict[str, Any] | None = None, head: str | None = None) -> str | None:
+    """Copy the scripts, their source stamp and the member's trimmed manifest. Returns why it failed, or None.
+    override: the --allow-downgrade reason and the refusals it overrode, recorded in the stamp. head: the commit
+    the guard checked, which the stamp then names (else source_stamp's guess: a stamp or release beside us)."""
     local = scratch / f"{member}.manifest.json"
     local.write_text(json.dumps(trimmed(manifest, member), indent=1) + "\n")
     files = [os.fspath(SCRIPT_DIR / f) for f in STAGED]
-    stamp = source_stamp()
+    stamp = (head_stamp(head) if head else None) or source_stamp()
+    if stamp is not None and override is not None:
+        stamp = {**stamp, "allowDowngrade": override}
     if stamp is not None:
         (scratch / member).mkdir(exist_ok=True)
         (scratch / member / SOURCE_STAMP).write_text(json.dumps(stamp, sort_keys=True) + "\n")
@@ -322,7 +481,11 @@ def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, m
     if not (eligible or args.include_ineligible):
         row["action"] = "skipped (not eligible)"
         return row
-    failed = stage(member, manifest, scratch)
+    override = None
+    if args.allow_downgrade is not None:
+        override = {"reason": args.allow_downgrade,
+                    "refusals": [r["text"] for r in args.guard["refusals"] if r["member"] in (None, member)]}
+    failed = stage(member, manifest, scratch, override, args.guard.get("head"))
     if failed:
         row["action"] = f"stage failed: {failed}"
         return row
@@ -336,8 +499,9 @@ def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, m
     return row
 
 
-def render(rows: list[dict[str, Any]], skipped: dict[str, str], applied: bool) -> str:
+def render(rows: list[dict[str, Any]], skipped: dict[str, str], applied: bool, guard: dict[str, Any]) -> str:
     lines = [f"glaeda-cmux-runner-fleet: {'APPLY' if applied else 'PLAN (nothing changed; add --apply to act)'}"]
+    lines.extend(guard_lines(guard, applied))
     for row in rows:
         units = f"{row['runners']} runners/{row['capacityUnits']} units"
         lines.append(f"  {row['member']:<22} {row['class']:<5} {units:<20} {row['action']:<24} {row['gate']}")
@@ -368,6 +532,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--include-ineligible", action="store_true",
                    help="also apply to members that do not pass the gate (pair with --skip-launchctl)")
     p.add_argument("--skip-launchctl", action="store_true", help="install or update without starting the runners")
+    p.add_argument("--allow-downgrade", metavar="REASON",
+                   help="deploy although HEAD is not origin/main or a member's stamp is not an ancestor of HEAD; "
+                        "the reason is printed and recorded in the stamp")
     p.add_argument("--jobs", type=int, default=16, help="members at once")
     p.add_argument("--output", choices=("human", "json"), default="human")
     args = p.parse_args(argv)
@@ -397,28 +564,46 @@ def main(argv: list[str] | None = None) -> int:
         print("glaeda-cmux-runner-fleet: --migrate-from-repo needs --group (the Default group admits every repo)",
               file=sys.stderr)
         return 2
+    if args.allow_downgrade is not None:
+        reason = " ".join(args.allow_downgrade.split())
+        args.allow_downgrade = clean_reason(reason)
+        if not args.allow_downgrade or len(reason) > MAX_REASON:
+            print(f"glaeda-cmux-runner-fleet: --allow-downgrade needs a reason, at most {MAX_REASON} characters",
+                  file=sys.stderr)
+            return 2
     if args.migrate_from_repo:
         args.jobs = 1  # one member at a time, so the rest keep serving the old scope
-    if args.org and args.group and args.apply:
-        why = group_refusal(args.org, args.group, args.migrate_from_repo)
-        if why:
-            print(f"glaeda-cmux-runner-fleet: {why}; nothing changed", file=sys.stderr)
-            return 2
     only = [h for h in (args.hosts or "").split(",") if h] or None
     unknown = [h for h in only or [] if h not in (manifest.get("hosts") or {})]
     if unknown:
         print(f"glaeda-cmux-runner-fleet: not in the manifest: {', '.join(unknown)}", file=sys.stderr)
         return 2
     chosen, skipped = members(manifest, load_labels(), only, [h for h in args.exclude.split(",") if h])
+    args.guard = guard = source_guard(sorted(chosen), args.jobs if not args.migrate_from_repo else 16)
+    if args.allow_downgrade is not None:
+        guard["allowDowngrade"] = args.allow_downgrade
+    if args.apply and guard["refusals"]:
+        for line in refusal_lines(guard, True):
+            print(f"glaeda-cmux-runner-fleet: {line.strip()}", file=sys.stderr)
+        if args.allow_downgrade is None:
+            print("glaeda-cmux-runner-fleet: nothing changed; pass --allow-downgrade REASON to deploy anyway",
+                  file=sys.stderr)
+            return 2
+    if args.org and args.group and args.apply:
+        why = group_refusal(args.org, args.group, args.migrate_from_repo)
+        if why:
+            print(f"glaeda-cmux-runner-fleet: {why}; nothing changed", file=sys.stderr)
+            return 2
     with tempfile.TemporaryDirectory(prefix="glaeda-runner-fleet-") as tmp, \
             concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
         futures = {pool.submit(one_member, m, s, args, manifest, Path(tmp)): m for m, s in chosen.items()}
         rows = [f.result() for f in concurrent.futures.as_completed(futures)]
     rows.sort(key=lambda r: r["member"])
     if args.output == "json":
-        print(json.dumps({"applied": args.apply, "members": rows, "skipped": skipped}, indent=2, sort_keys=True))
+        print(json.dumps({"applied": args.apply, "members": rows, "skipped": skipped, "source": guard}, indent=2,
+                         sort_keys=True))
     else:
-        print(render(rows, skipped, args.apply))
+        print(render(rows, skipped, args.apply, guard))
     failed = any(r.get("action") == "failed" or str(r.get("action", "")).startswith("stage failed")
                  or (args.apply and r.get("action") == "unreachable") for r in rows)
     return 1 if failed else 0

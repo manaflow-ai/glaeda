@@ -33,6 +33,7 @@ Every source except the manifest is optional. Without a flag the source shows as
 | lima | `limactl list --json` per member, never on `never_touch` hosts | on; `--no-lima` |
 | disk | one read-only SSH probe per member, never on `never_touch` hosts (below) | on; `--no-disk` |
 | jobs | the tail of each member's `~/Library/Logs/glaeda-cmux-jobs.jsonl` (below) | on; `--no-jobs` |
+| tooling | each member's `~/glaeda-runner/scripts/.glaeda-source.json` against the local `origin/main` (below) | on; `--no-tooling` |
 
 Split collection from building to reuse or replay a view:
 
@@ -178,6 +179,26 @@ The text output adds one `jobs (24 h):` line per member and the page a column
 
 ```text
 cmux13s-mac-mini  41 jobs, 1 contended; latest macos-compile-admission: outside processes averaged 5.1 cores (top: zig (cmux))
+```
+
+## Runner tooling
+
+`glaeda-cmux-runner-fleet` (or `glaeda-update`) writes `.glaeda-source.json` beside the staged
+runner scripts, naming the commit they came from. The `tooling` probe reads that stamp (at most
+4 KiB, read-only) and compares the commit with this checkout's `refs/remotes/origin/main` as the
+last `git fetch` left it; the status tool never fetches. Fetch first for an up-to-date answer.
+
+| Code | When | Action |
+| --- | --- | --- |
+| `behind` (warn) | the stamp is an ancestor of origin/main, N commits behind | `scripts/glaeda-cmux-runner-fleet --apply --org manaflow-ai --group glaeda-minis --hosts MEMBER` from a worktree at origin/main (not safe: it deploys) |
+| `not_ancestor` (warn) | origin/main does not contain the stamped commit: a branch deploy, or a commit newer than the last fetch | a person decides; `glaeda-cmux-runner-fleet --apply` refuses this member without `--allow-downgrade REASON` |
+| `no_stamp`, `unreadable`, `unjudged` (info) | no stamp, no commit in it, or no local origin/main | none; the next fleet apply writes a stamp |
+| `probe_failed` (info) | the probe failed | a refresh |
+
+The text output adds one `runner tooling:` line per member:
+
+```text
+cmux13s-mac-mini  5e1f0c2a9b3d, 3 behind origin/main 63b5493c1d2e
 ```
 
 ## Bounds and privacy

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -14,6 +15,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOL = ROOT / "scripts" / "glaeda-cmux-runner-fleet"
+# What the tool needs beside itself: the staged files and the labels module. Each test runs a copy from its own
+# git checkout with a local bare origin, so HEAD and origin's main are whatever the test makes them.
+CHECKOUT_FILES = ("glaeda-cmux-runner-fleet", "glaeda-cmux-runner", "glaeda-cmux-runner-hook",
+                  "glaeda_fleet_labels.py", "glaeda_reservation.py")
 TOKEN = "AAAREGTOKEN123"
 MANIFEST = {
     "defaults": {"xcode": {"apps": [{"path": "/Applications/Xcode_26.6.app", "version": "26.6", "build": "17F113"}]},
@@ -39,6 +44,9 @@ data = sys.stdin.read()
 open(log, "a").write(json.dumps({{"tool": "ssh", "host": host, "remote": remote, "stdin": data[:40]}}) + "\\n")
 if host in os.environ.get("FAKE_DOWN", "").split(","):
     sys.stderr.write("ssh: connect to host " + host + " port 22: Connection refused\\n"); sys.exit(255)
+if remote.startswith("head -c") and ".glaeda-source.json" in remote:
+    stamps = json.loads(os.environ.get("FAKE_STAMPS", "{{}}"))
+    print(stamps[host] if host in stamps else "@no-stamp"); sys.exit(0)
 if " check " in remote:
     if host in os.environ.get("FAKE_ELIGIBLE", "").split(","):
         print("glaeda-cmux-runner-hook: eligible"); sys.exit(0)
@@ -111,12 +119,43 @@ class FleetTest(unittest.TestCase):
         self.log = self.dir / "calls.jsonl"
         self.env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "HOME": os.fspath(self.dir), "FAKE_LOG": os.fspath(self.log),
                     "FAKE_ELIGIBLE": "mini-a,mini-b"}
+        self.origin = self.dir / "origin.git"
+        self.repo = self.dir / "glaeda"
+        (self.repo / "scripts").mkdir(parents=True)
+        for name in CHECKOUT_FILES:
+            shutil.copy2(ROOT / "scripts" / name, self.repo / "scripts" / name)
+        self.git("init", "-q", "--bare", "-b", "main", os.fspath(self.origin), cwd=self.dir)
+        self.git("init", "-q", "-b", "main")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "one")
+        self.old = self.git("rev-parse", "HEAD")
+        self.head = self.commit("two")
+        self.git("remote", "add", "origin", os.fspath(self.origin))
+        self.git("push", "-q", "origin", "main")
+        self.tool = self.repo / "scripts" / "glaeda-cmux-runner-fleet"
+
+    def git(self, *args: str, cwd: Path | None = None) -> str:
+        return subprocess.run(["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid",
+                               "-c", "commit.gpgsign=false", "-C", os.fspath(cwd or self.repo), *args],
+                              capture_output=True, text=True, check=True, timeout=60,
+                              env={"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GIT_CONFIG_NOSYSTEM": "1"},
+                              ).stdout.strip()
+
+    def commit(self, name: str) -> str:
+        (self.repo / f"{name}.txt").write_text(name + "\n")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", name)
+        return self.git("rev-parse", "HEAD")
+
+    @staticmethod
+    def stamp(source: str) -> str:
+        return json.dumps({"by": "glaeda-cmux-runner-fleet", "date": "2026-09-30", "source": source})
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
     def fleet(self, *args: str, **env: str) -> subprocess.CompletedProcess:
-        return subprocess.run([sys.executable, os.fspath(TOOL), "--manifest", os.fspath(self.manifest),
+        return subprocess.run([sys.executable, os.fspath(self.tool), "--manifest", os.fspath(self.manifest),
                                "--output", "json", *args], capture_output=True, text=True, timeout=120,
                               env={**self.env, **env}, check=False)
 
@@ -162,7 +201,7 @@ class FleetTest(unittest.TestCase):
                          "no other hosts, keys or people; ios_simulator gates glaeda-ios-sim on the mini")
         # the staged copy says which commit it is, so glaeda-cmux-runner and glaeda-update can tell it from a stale one
         stamp = json.loads((self.dir / "calls.jsonl.mini-a.stamp").read_text())
-        head = subprocess.run(["env", "TZ=UTC", "git", "-C", os.fspath(TOOL.parents[1]), "log", "-1",
+        head = subprocess.run(["env", "TZ=UTC", "git", "-C", os.fspath(self.repo), "log", "-1",
                                "--format=%H %cd", "--date=format-local:%Y-%m-%d"],
                               capture_output=True, text=True, check=True).stdout.split()
         self.assertEqual((stamp["by"], stamp["source"], stamp["date"]), ("glaeda-cmux-runner-fleet", *head))
@@ -262,6 +301,170 @@ class FleetTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         states = [i["state"] for i in json.loads(result.stdout)["members"][0]["instances"]]
         self.assertTrue(states and all("launchctl: bootstrap: Input/output error" in s for s in states), states)
+
+    # ---- the downgrade guard: what the checkout would deploy against origin's main and every host's stamp
+
+    def assert_nothing_changed(self) -> None:
+        calls = self.calls()
+        self.assertFalse(any(c["tool"] == "scp" for c in calls), "nothing staged")
+        self.assertFalse(any(c["tool"] == "ssh" and ("--apply" in c["remote"] or "mkdir" in c["remote"])
+                             for c in calls), "nothing applied")
+        self.assertFalse(any(c["tool"] == "gh" for c in calls), "no token minted")
+
+    def test_apply_from_a_checkout_that_is_not_origin_main_refuses_and_changes_nothing(self) -> None:
+        newer = self.commit("three")
+        self.git("push", "-q", "origin", "main")
+        self.git("checkout", "-q", "--detach", self.head)  # an old checkout: origin's main moved on
+        result = self.fleet("--apply", "--org", "manaflow-ai", "--group", "glaeda-minis", FAKE_GROUPS=GROUP)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn(f"HEAD {self.head} is not origin/main {newer}", result.stderr)
+        self.assertIn("--allow-downgrade REASON", result.stderr)
+        self.assertIn("nothing changed", result.stderr)
+        self.assert_nothing_changed()
+
+    def test_apply_refuses_a_host_whose_stamp_is_not_an_ancestor_of_head(self) -> None:
+        self.git("checkout", "-q", "-b", "side", self.old)
+        side = self.commit("side")  # a diverged deploy: a commit HEAD does not contain
+        self.git("checkout", "-q", "main")
+        newer = "f" * 40  # a commit this checkout has never seen: a newer main, so a downgrade
+        result = self.fleet("--apply", FAKE_STAMPS=json.dumps({"mini-a": self.stamp(side), "mini-b": self.stamp(newer),
+                                                              "mini-light": self.stamp(self.old)}))
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn(f"mini-a: stamped {side} is not an ancestor of HEAD {self.head}", result.stderr)
+        self.assertIn(f"mini-b: stamped {newer} is not an ancestor of HEAD {self.head}", result.stderr)
+        self.assertNotIn("mini-light:", result.stderr, "an older stamp is an upgrade, not a refusal")
+        self.assert_nothing_changed()
+
+    def test_plan_reports_the_same_findings_and_does_not_fail(self) -> None:
+        self.commit("local only")  # HEAD ahead of origin's main: not origin/main either
+        result = self.fleet(FAKE_STAMPS=json.dumps({"mini-b": self.stamp("f" * 40)}))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        guard = json.loads(result.stdout)["source"]
+        self.assertEqual(guard["originMain"], self.head)
+        texts = [r["text"] for r in guard["refusals"]]
+        self.assertTrue(any("is not origin/main" in t for t in texts), texts)
+        self.assertTrue(any(t.startswith("mini-b: stamped " + "f" * 40) for t in texts), texts)
+        self.assertEqual(guard["hosts"]["mini-b"]["state"], "downgrade")
+        human = self.fleet("--output", "human", FAKE_STAMPS=json.dumps({"mini-b": self.stamp("f" * 40)}))
+        self.assertEqual(human.returncode, 0, human.stderr)
+        self.assertIn("would refuse --apply", human.stdout)
+        self.assertIn("mini-b: stamped " + "f" * 40, human.stdout)
+
+    def test_older_missing_and_unreadable_stamps_are_not_downgrades_but_say_so(self) -> None:
+        stamps = json.dumps({"mini-a": self.stamp(self.old), "mini-b": "{not json"})
+        result = self.fleet("--apply", FAKE_STAMPS=stamps)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        hosts = json.loads(result.stdout)["source"]["hosts"]
+        self.assertEqual((hosts["mini-a"]["state"], hosts["mini-a"]["behind"]), ("behind", 1))
+        self.assertEqual(hosts["mini-b"]["state"], "unreadable")
+        self.assertEqual(hosts["mini-light"]["state"], "none")
+        human = self.fleet("--output", "human", FAKE_STAMPS=stamps)
+        self.assertIn("mini-light: no stamp; not counted as a downgrade", human.stdout)
+        self.assertIn("mini-b: unreadable stamp", human.stdout)
+        self.assertIn(f"mini-a: stamped {self.old[:12]}, 1 behind HEAD", human.stdout)
+
+    def test_allow_downgrade_needs_a_reason_and_records_it_in_the_stamp(self) -> None:
+        newer = "f" * 40
+        stamps = json.dumps({"mini-a": self.stamp(newer)})
+        blank = self.fleet("--apply", "--hosts", "mini-a", "--allow-downgrade", "  ", FAKE_STAMPS=stamps)
+        self.assertEqual(blank.returncode, 2)
+        self.assertIn("--allow-downgrade needs a reason", blank.stderr)
+        self.assert_nothing_changed()
+        result = self.fleet("--apply", "--hosts", "mini-a", "--allow-downgrade", "roll back the #1384 hook",
+                            FAKE_STAMPS=stamps)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("--allow-downgrade (roll back the #1384 hook) overrides", result.stderr)
+        self.assertIn(f"mini-a: stamped {newer} is not an ancestor of HEAD {self.head}", result.stderr)
+        stamp = json.loads((self.dir / "calls.jsonl.mini-a.stamp").read_text())
+        self.assertEqual(stamp["source"], self.head)
+        self.assertEqual(stamp["allowDowngrade"]["reason"], "roll back the #1384 hook")
+        self.assertEqual(len(stamp["allowDowngrade"]["refusals"]), 1)
+
+    def test_a_squash_merged_canary_rolls_forward_from_main(self) -> None:
+        # canary from a PR branch: not origin/main, so it needs --allow-downgrade, which the stamp records
+        self.git("checkout", "-q", "-b", "pr", self.head)
+        branch = self.commit("pr change")
+        canary = self.fleet("--apply", "--hosts", "mini-a", "--allow-downgrade", "canary of the PR branch")
+        self.assertEqual(canary.returncode, 0, canary.stdout + canary.stderr)
+        stamp = (self.dir / "calls.jsonl.mini-a.stamp").read_text()
+        self.assertEqual(json.loads(stamp)["source"], branch)
+        # the PR squash-merges: main gets a new commit, and the branch commit is never an ancestor of it
+        self.git("checkout", "-q", "main")
+        self.commit("pr change squashed")
+        self.git("push", "-q", "origin", "main")
+        stamps = json.dumps({"mini-a": stamp, "mini-b": self.stamp(self.old)})
+        for where in ("present locally", "absent locally"):
+            if where == "absent locally":
+                self.git("branch", "-q", "-D", "pr")
+                self.git("reflog", "expire", "--expire=now", "--all")
+                self.git("gc", "-q", "--prune=now")
+                missing = subprocess.run(["git", "-C", os.fspath(self.repo), "cat-file", "-e", branch + "^{commit}"],
+                                         capture_output=True, check=False)
+                self.assertNotEqual(missing.returncode, 0, "the branch commit is gone from this checkout")
+            self.log.unlink(missing_ok=True)
+            result = self.fleet("--apply", FAKE_STAMPS=stamps)
+            self.assertEqual(result.returncode, 0, f"{where}: {result.stdout}{result.stderr}")
+            hosts = json.loads(result.stdout)["source"]
+            self.assertEqual(hosts["refusals"], [], where)
+            self.assertEqual(hosts["hosts"]["mini-a"]["state"], "rolling_forward", where)
+            human = self.fleet("--output", "human", FAKE_STAMPS=stamps)
+            self.assertIn("mini-a: rolling forward from a deliberate off-main deploy (reason: canary of the PR branch)",
+                          human.stdout, where)
+        # a non-ancestor stamp without allowDowngrade still refuses the whole fleet, staging nothing
+        self.log.unlink(missing_ok=True)
+        refused = self.fleet("--apply", FAKE_STAMPS=json.dumps({"mini-a": stamp, "mini-b": self.stamp(branch)}))
+        self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+        self.assertIn(f"mini-b: stamped {branch} is not an ancestor", refused.stderr)
+        self.assert_nothing_changed()
+
+    def test_a_deliberate_off_main_stamp_still_refuses_a_checkout_off_main(self) -> None:
+        stamp = json.dumps({"by": "glaeda-cmux-runner-fleet", "date": "2026-09-30", "source": "e" * 40,
+                            "allowDowngrade": {"reason": "canary", "refusals": []}})
+        self.commit("local only")  # HEAD is not origin's main
+        result = self.fleet("--apply", FAKE_STAMPS=json.dumps({"mini-a": stamp}))
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("mini-a: stamped " + "e" * 40, result.stderr)
+        self.assert_nothing_changed()
+
+    def test_uncommitted_changes_to_staged_files_refuse_apply(self) -> None:
+        hook = self.repo / "scripts" / "glaeda-cmux-runner-hook"
+        hook.write_text(hook.read_text() + "\n# hand edit\n")
+        result = self.fleet("--apply")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("uncommitted changes to staged files: scripts/glaeda-cmux-runner-hook", result.stderr)
+        self.assert_nothing_changed()
+        plan = self.fleet()
+        self.assertEqual(plan.returncode, 0, plan.stderr)
+        self.assertTrue(any("uncommitted" in r["text"] for r in json.loads(plan.stdout)["source"]["refusals"]))
+        forced = self.fleet("--apply", "--hosts", "mini-a", "--allow-downgrade", "testing a hook edit on mini-a")
+        self.assertEqual(forced.returncode, 0, forced.stdout + forced.stderr)
+
+    def test_the_stamp_records_the_head_the_guard_checked(self) -> None:
+        # an untracked stamp beside the scripts used to win over HEAD
+        (self.repo / "scripts" / ".glaeda-source.json").write_text(
+            json.dumps({"by": "someone", "date": "2026-01-01", "source": "a" * 40}))
+        result = self.fleet("--apply", "--hosts", "mini-a")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        stamp = json.loads((self.dir / "calls.jsonl.mini-a.stamp").read_text())
+        self.assertEqual((stamp["source"], stamp["by"]), (self.head, "glaeda-cmux-runner-fleet"))
+
+    def test_the_reason_loses_control_characters(self) -> None:
+        result = self.fleet("--apply", "--hosts", "mini-a", "--allow-downgrade", "roll\x1b[31m back\x07 #1384\x7f",
+                            FAKE_STAMPS=json.dumps({"mini-a": self.stamp("f" * 40)}))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        reason = json.loads((self.dir / "calls.jsonl.mini-a.stamp").read_text())["allowDowngrade"]["reason"]
+        self.assertEqual(reason, "roll[31m back #1384")
+        self.assertFalse(any(ord(ch) < 32 or ord(ch) == 127 for ch in result.stderr.replace("\n", "")))
+        blank = self.fleet("--apply", "--allow-downgrade", "\x1b\x07")
+        self.assertEqual(blank.returncode, 2)
+        self.assertIn("--allow-downgrade needs a reason", blank.stderr)
+
+    def test_apply_refuses_when_origin_main_cannot_be_read(self) -> None:
+        self.git("remote", "set-url", "origin", os.fspath(self.dir / "gone.git"))
+        result = self.fleet("--apply")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("cannot read origin's main", result.stderr)
+        self.assert_nothing_changed()
 
 
 if __name__ == "__main__":

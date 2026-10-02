@@ -60,6 +60,21 @@ scripts/glaeda-cmux-runner-fleet --apply --org manaflow-ai --group glaeda-minis 
 The runners are org-scoped. An apply without `--org` refuses every instance ("already has a runner install")
 and changes nothing. Run it from a worktree at `origin/main`, not the shared base checkout.
 
+The downgrade guard enforces that: `--apply` refuses, changing nothing on any member, when HEAD is not origin's
+`main` (read live with `git ls-remote`; a stale local `origin/main` cannot vouch for it) or when a member's
+`~/glaeda-runner/scripts/.glaeda-source.json` names a commit that is not an ancestor of HEAD (a downgrade, or a
+branch deployed by hand), or when the staged files have uncommitted changes. The refusal names the member, its
+stamped commit and HEAD; the plan lists the same findings. A member with no stamp, or an unreadable one, is not a
+downgrade and the output says so. To deploy anyway (a deliberate rollback, a branch canary), pass
+`--allow-downgrade "REASON"`: the reason is printed and recorded in each staged stamp as `allowDowngrade`. Never
+pass it to get past a refusal you have not read. A canary stamped that way and then squash-merged is never an
+ancestor of main, so the next run from origin's `main` rolls it forward ("rolling forward from a deliberate
+off-main deploy") instead of refusing. The stamp names the HEAD the guard checked. Running from an OTA release
+copy (no git checkout) needs `--allow-downgrade`. A shallow checkout fails closed (an older stamp reads as not an
+ancestor): `git fetch --unshallow` first.
+`glaeda-fleet-status` reports members whose stamp is behind or off origin/main (`tooling.behind`,
+`tooling.not_ancestor`). Automatic rollout on merge is proposed in #1385.
+
 job-started.sh runs the hook file fresh for every job, so a staged hook takes effect for the next job without a
 restart. After the canary, run a job there and check the new behavior on the host (for telemetry:
 `ssh MEMBER 'tail -n 1 ~/Library/Logs/glaeda-cmux-jobs.jsonl'`), then `scripts/glaeda-fleet-status --host MEMBER`.

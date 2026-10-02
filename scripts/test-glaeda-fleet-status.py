@@ -845,5 +845,110 @@ class JobsTests(unittest.TestCase):
             self.assertNotIn(word, fs.JOBS_SCRIPT.replace("2>/dev/null", ""))
 
 
+def git(repo, *args):
+    return subprocess.run(["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid",
+                           "-c", "commit.gpgsign=false", "-C", str(repo), *args], capture_output=True, text=True,
+                          check=True, timeout=60, env={"PATH": "/usr/bin:/bin", "HOME": str(repo),
+                                                       "GIT_CONFIG_NOSYSTEM": "1"}).stdout.strip()
+
+
+def stamp_text(source, date="2026-09-30"):
+    return json.dumps({"by": "glaeda-cmux-runner-fleet", "date": date, "source": source})
+
+
+class ToolingTests(unittest.TestCase):
+    """Each member's runner tooling stamp (~/glaeda-runner/scripts/.glaeda-source.json) against origin/main."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name) / "glaeda"
+        self.repo.mkdir()
+        git(self.repo, "init", "-q", "-b", "main")
+        self.commits = []
+        for name in ("one", "two", "three"):
+            (self.repo / name).write_text(name)
+            git(self.repo, "add", "-A")
+            git(self.repo, "commit", "-q", "-m", name)
+            self.commits.append(git(self.repo, "rev-parse", "HEAD"))
+        # what a fetch leaves: the remote-tracking ref, read locally, never fetched by the status tool
+        git(self.repo, "update-ref", "refs/remotes/origin/main", self.commits[-1])
+        git(self.repo, "checkout", "-q", "-b", "side", self.commits[0])
+        (self.repo / "side").write_text("side")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", "side")
+        self.side = git(self.repo, "rev-parse", "HEAD")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def judge(self, stdout):
+        main = fs.origin_main(self.repo)
+        self.assertEqual(main, self.commits[-1])
+        return fs.judge_stamp(stdout, main, self.repo, AT)
+
+    def test_judges_behind_current_diverged_unknown_missing_and_unreadable(self):
+        behind = self.judge(stamp_text(self.commits[0]))
+        self.assertEqual((behind["state"], behind["behind"], behind["source"]), ("behind", 2, self.commits[0]))
+        self.assertEqual(self.judge(stamp_text(self.commits[-1]))["state"], "current")
+        self.assertEqual(self.judge(stamp_text(self.side))["state"], "not_ancestor")
+        unknown = self.judge(stamp_text("f" * 40))
+        self.assertEqual(unknown["state"], "not_ancestor")
+        self.assertIn("not in this checkout", unknown["note"])
+        self.assertEqual(self.judge("@no-stamp\n")["state"], "none")
+        self.assertEqual(self.judge("{not json")["state"], "unreadable")
+        self.assertEqual(self.judge(json.dumps({"by": "x", "date": "2026-09-30"}))["state"], "unreadable")
+        self.assertEqual(fs.judge_stamp(stamp_text(self.side), None, self.repo, AT)["state"], "unjudged")
+
+    def test_behind_and_diverged_stamps_are_warnings_with_the_count(self):
+        rows = {"mini-a": self.judge(stamp_text(self.commits[0])), "mini-b": self.judge(stamp_text(self.side))}
+        doc = build(tooling=src({"origin_main": self.commits[-1], "hosts": rows}))
+        [behind] = by_id(doc, "tooling.behind@mini-a")
+        self.assertEqual(behind["severity"], "warn")
+        self.assertIn("2 commits behind origin/main", behind["summary"])
+        self.assertIn(self.commits[0][:12], behind["summary"])
+        self.assertIn("glaeda-cmux-runner-fleet --apply", behind["action"]["command"])
+        self.assertIn("--hosts mini-a", behind["action"]["command"])
+        self.assertFalse(behind["action"]["safe_to_apply"])
+        [diverged] = by_id(doc, "tooling.not_ancestor@mini-b")
+        self.assertEqual((diverged["severity"], diverged["action"]["who"]), ("warn", "person"))
+        self.assertIn("not an ancestor of origin/main", diverged["summary"])
+        self.assertIn("--allow-downgrade", diverged["action"]["note"])
+        member = next(m for m in doc["members"] if m["name"] == "mini-a")
+        self.assertEqual(member["tooling"]["behind"], 2)
+        text = fs.render_text(doc)
+        self.assertIn("runner tooling:", text)
+        self.assertIn("2 behind origin/main", text)
+        self.assertIn("NOT an ancestor of origin/main", text)
+
+    def test_current_is_quiet_and_missing_stamps_are_info(self):
+        rows = {"mini-a": self.judge(stamp_text(self.commits[-1])), "mini-b": self.judge("@no-stamp")}
+        doc = build(tooling=src({"origin_main": self.commits[-1], "hosts": rows}))
+        self.assertFalse(by_id(doc, "tooling.behind"))
+        self.assertFalse(by_id(doc, "tooling.not_ancestor"))
+        [none] = by_id(doc, "tooling.no_stamp@mini-b")
+        self.assertEqual(none["severity"], "info")
+
+    def test_stamp_script_reads_a_fake_home_and_is_read_only(self):
+        with tempfile.TemporaryDirectory() as home:
+            missing = subprocess.run(["/bin/sh", "-c", fs.TOOLING_SCRIPT], env={"HOME": home, "PATH": "/usr/bin:/bin"},
+                                     capture_output=True, text=True, timeout=30).stdout
+            scripts = Path(home) / "glaeda-runner" / "scripts"
+            scripts.mkdir(parents=True)
+            (scripts / ".glaeda-source.json").write_text(stamp_text(self.commits[0]))
+            found = subprocess.run(["/bin/sh", "-c", fs.TOOLING_SCRIPT], env={"HOME": home, "PATH": "/usr/bin:/bin"},
+                                   capture_output=True, text=True, timeout=30).stdout
+        self.assertEqual(missing.strip(), "@no-stamp")
+        self.assertEqual(json.loads(found)["source"], self.commits[0])
+        for word in (" rm ", "unlink", "delete", ">", "--apply"):
+            self.assertNotIn(word, fs.TOOLING_SCRIPT.replace("2>/dev/null", ""))
+        seen = []
+        with mock.patch.object(fs, "tooling_host", side_effect=lambda h, u, m, r: seen.append(h) or {"reachable": True}):
+            got = fs.collect_tooling({"ssh_user": "builder", "never_touch": ["coordinator"]}, ["mini-a", "coordinator"],
+                                     self.repo)
+        self.assertEqual(seen, ["mini-a"])
+        self.assertEqual(got["data"]["origin_main"], self.commits[-1])
+        self.assertTrue(fs.parser().parse_args(["--no-tooling"]).no_tooling)
+
+
 if __name__ == "__main__":
     unittest.main()

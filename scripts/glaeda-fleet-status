@@ -19,6 +19,9 @@ Collection joins what exists today, each source optional and read-only:
                              the last fleet-cas-prune and gc lines, bytes reclaimed in 24 h (--no-disk to skip)
   (default on)               runner jobs per member over 24 h: how many ran contended (the runner hook's
                              ~/Library/Logs/glaeda-cmux-jobs.jsonl), and what used the CPU (--no-jobs to skip)
+  (default on)               runner tooling per member: the commit its ~/glaeda-runner/scripts/.glaeda-source.json
+                             stamp names, against this checkout's local origin/main ref (never fetched here):
+                             how far behind, or not an ancestor at all (--no-tooling to skip)
 
 Every finding carries a typed action {id, who: agent|password|person, safe_to_apply, command, note}:
 `command` runs from the operator machine, `safe_to_apply` is true only for read-only commands, and
@@ -54,7 +57,8 @@ SSH = "/usr/bin/ssh"
 
 WHO = ("agent", "password", "person")
 SEVERITIES = ("error", "warn", "info")
-SOURCE_NAMES = ("manifest", "check", "preflight", "controller", "runners", "queue", "cache", "lima", "disk", "jobs")
+SOURCE_NAMES = ("manifest", "check", "preflight", "controller", "runners", "queue", "cache", "lima", "disk", "jobs",
+                "tooling")
 # A source older than this at build time is itself a finding.
 DEFAULT_MAX_AGE = 900
 MAX_MEMBERS = 128
@@ -77,6 +81,10 @@ CACHE_TIMEOUT = 5
 DISK_TIMEOUT = 90
 JOBS_TIMEOUT = 30
 JOBS_WINDOW_S = 24 * 3600
+TOOLING_TIMEOUT = 30
+GIT_TIMEOUT = 30
+SHA_RE = re.compile(r"[0-9a-f]{7,40}")
+TOOLING_STATES = ("current", "behind", "not_ancestor", "none", "unreadable", "unjudged")
 MAX_CONTENDED_JOBS = 5  # per member, newest first
 CONSOLE_STATES = ("unlocked", "locked", "no_user")
 # A retired owner's family above this is worth a person's decision.
@@ -590,6 +598,73 @@ def collect_jobs(manifest: dict[str, Any], hosts: list[str]) -> dict[str, Any]:
     return source({"hosts": results})
 
 
+# Read-only: the stamp glaeda-cmux-runner-fleet (or glaeda-update) wrote beside the staged runner scripts.
+TOOLING_SCRIPT = "head -c 4096 ~/glaeda-runner/scripts/.glaeda-source.json 2>/dev/null || echo @no-stamp"
+
+
+def git(repo: Path, *args: str) -> tuple[int, str]:
+    binary = shutil.which("git", path=os.environ.get("PATH")) or "/usr/bin/git"
+    try:
+        proc = subprocess.run([binary, "-C", os.fspath(repo), *args], capture_output=True, text=True,
+                              timeout=GIT_TIMEOUT, env=child_env(), check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return 124, ""
+    return proc.returncode, proc.stdout.strip()
+
+
+def origin_main(repo: Path) -> str | None:
+    """This checkout's refs/remotes/origin/main, as the last fetch left it; None outside a checkout."""
+    code, out = git(repo, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/main^{commit}")
+    return out if code == 0 and re.fullmatch(r"[0-9a-f]{40}", out) else None
+
+
+def judge_stamp(stdout: str, main: str | None, repo: Path, at: int) -> dict[str, Any]:
+    """One member's stamp against origin/main: state (TOOLING_STATES), the stamped commit, how far behind."""
+    row: dict[str, Any] = {"reachable": True, "observed_at": at, "origin_main": main, "source": None,
+                           "date": None, "by": None, "behind": None, "note": ""}
+    text = stdout.strip()
+    if text == "@no-stamp":
+        return {**row, "state": "none", "note": "no stamp"}
+    try:
+        stamp = json.loads(text)
+    except ValueError:
+        stamp = None
+    source = str(stamp.get("source") or "") if isinstance(stamp, dict) else ""
+    if not SHA_RE.fullmatch(source):
+        return {**row, "state": "unreadable",
+                "note": "stamp names no commit" if isinstance(stamp, dict) else "stamp is not a JSON object"}
+    row.update(source=source, date=clean(stamp.get("date"), 10) or None, by=clean(stamp.get("by"), 40) or None)
+    if main is None:
+        return {**row, "state": "unjudged", "note": "no local origin/main ref to compare with"}
+    code, _ = git(repo, "merge-base", "--is-ancestor", source, main)
+    if code != 0:
+        note = "" if code == 1 else "not in this checkout: a branch, or newer than its last fetch"
+        return {**row, "state": "not_ancestor", "note": note}
+    code, out = git(repo, "rev-list", "--count", f"{source}..{main}")
+    behind = int(out) if code == 0 and out.isdigit() else None
+    return {**row, "state": "current" if behind == 0 else "behind", "behind": behind}
+
+
+def tooling_host(host: str, user: str, main: str | None, repo: Path) -> dict[str, Any]:
+    try:
+        proc = subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", user, host, TOOLING_SCRIPT],
+                              capture_output=True, text=True, timeout=TOOLING_TIMEOUT, env=child_env(), check=False)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return {"reachable": False, "error": type(error).__name__, "observed_at": now()}
+    if proc.returncode != 0:
+        return {"reachable": False, "error": clean(proc.stderr, 160) or f"exit {proc.returncode}", "observed_at": now()}
+    return judge_stamp(proc.stdout, main, repo, now())
+
+
+def collect_tooling(manifest: dict[str, Any], hosts: list[str], repo: Path = SCRIPT_DIR.parent) -> dict[str, Any]:
+    never = set(manifest.get("never_touch") or [])
+    targets = [h for h in hosts if h not in never]
+    main = origin_main(repo)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+        results = dict(zip(targets, pool.map(lambda h: tooling_host(h, manifest["ssh_user"], main, repo), targets)))
+    return source({"origin_main": main, "hosts": results})
+
+
 def collect(args: argparse.Namespace) -> dict[str, Any]:
     fleet = mini_fleet()
     try:
@@ -613,6 +688,8 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         sources["disk"] = collect_disk(manifest, hosts)
     if not args.no_jobs:
         sources["jobs"] = collect_jobs(manifest, hosts)
+    if not args.no_tooling:
+        sources["tooling"] = collect_tooling(manifest, hosts)
     return {"schema": SOURCES_SCHEMA, "collected_at": now(), "sources": sources}
 
 
@@ -1157,6 +1234,58 @@ class Builder:
                                          note="each line names this job's cores, the other runner jobs' and the "
                                               "top processes outside them"))
 
+    def fold_tooling(self) -> None:
+        """Runner tooling behind origin/main is a rollout not done yet; off origin/main is a downgrade waiting."""
+        data = self.data("tooling")
+        if not data:
+            return
+        main = data.get("origin_main") if isinstance(data.get("origin_main"), str) else None
+        main = main[:12] if main and SHA_RE.fullmatch(main) else "?"
+        for host, row in sorted((data.get("hosts") or {}).items()):
+            member = self.member_of(host)
+            if member is None or not isinstance(row, dict):
+                continue
+            at = stamp_of(row.get("observed_at"))
+            m = self.members[member]
+            m["observed"]["tooling"] = at
+            if not row.get("reachable"):
+                m["tooling"] = {"reachable": False}
+                self.finding("tooling", "probe_failed", "info", f"tooling probe failed: {clean(row.get('error'), 160)}",
+                             member, at, self.action(member, "retry_probe", "agent", "glaeda-fleet-status",
+                                                     safe=True, on_member=False))
+                continue
+            state = row.get("state") if row.get("state") in TOOLING_STATES else "unreadable"
+            commit = str(row.get("source") or "")
+            commit = commit if SHA_RE.fullmatch(commit) else None
+            behind = stamp_of(row.get("behind"))
+            m["tooling"] = {"reachable": True, "state": state, "source": commit, "date": clean(row.get("date"), 10) or None,
+                            "by": clean(row.get("by"), 40) or None, "behind": behind, "origin_main": main,
+                            "note": clean(row.get("note"), 120)}
+            short = (commit or "?")[:12]
+            dated = f" ({m['tooling']['date']})" if m["tooling"]["date"] else ""
+            if state == "behind":
+                count = f"{behind} commits" if behind is not None else "some commits"
+                self.finding("tooling", "behind", "warn",
+                             f"runner tooling at {short}{dated} is {count} behind origin/main {main}", member, at,
+                             self.action(member, "roll_out_tooling", "agent",
+                                         "scripts/glaeda-cmux-runner-fleet --apply --org manaflow-ai --group "
+                                         f"glaeda-minis --hosts {member}", on_member=False,
+                                         note="from a worktree at origin/main; plan first without --apply"))
+            elif state == "not_ancestor":
+                why = f" ({m['tooling']['note']})" if m["tooling"]["note"] else ""
+                self.finding("tooling", "not_ancestor", "warn",
+                             f"runner tooling at {short}{dated} is not an ancestor of origin/main {main}{why}",
+                             member, at,
+                             self.action(member, "decide_tooling_source", "person", None,
+                                         note="a diverged or newer deploy; glaeda-cmux-runner-fleet --apply refuses "
+                                              "this member until origin/main contains it, or --allow-downgrade "
+                                              "REASON"))
+            elif state in ("none", "unreadable", "unjudged"):
+                self.finding("tooling", {"none": "no_stamp"}.get(state, state), "info",
+                             f"runner tooling: {m['tooling']['note'] or state}; not judged", member, at,
+                             self.action(member, "none", "person", None,
+                                         note="glaeda-cmux-runner-fleet --apply writes the stamp"))
+
     def build(self) -> dict[str, Any]:
         self.state = self.freshness()
         self.fold_check()
@@ -1168,6 +1297,7 @@ class Builder:
         self.fold_lima()
         self.fold_disk()
         self.fold_jobs()
+        self.fold_tooling()
         findings = dedupe(self.findings)
         rank = {s: i for i, s in enumerate(SEVERITIES)}
         findings.sort(key=lambda f: (rank[f["severity"]], f["member"] or "", f["id"]))
@@ -1314,6 +1444,21 @@ def jobs_line(j: dict[str, Any] | None) -> str:
     return clean(line + console, MAX_TEXT)
 
 
+def tooling_line(t: dict[str, Any] | None) -> str:
+    if not t:
+        return ""
+    if not t.get("reachable"):
+        return "unreachable"
+    short, main = (t.get("source") or "?")[:12], t.get("origin_main") or "?"
+    if t.get("state") == "current":
+        return f"{short}, origin/main"
+    if t.get("state") == "behind":
+        return f"{short}, {t['behind'] if t.get('behind') is not None else '?'} behind origin/main {main}"
+    if t.get("state") == "not_ancestor":
+        return clean(f"{short}, NOT an ancestor of origin/main {main}", MAX_TEXT)
+    return clean(t.get("note") or t.get("state") or "?", MAX_TEXT)
+
+
 def when(stamp: Any, at: int) -> str:
     if stamp is None:
         return "never"
@@ -1340,6 +1485,11 @@ def render_text(doc: dict[str, Any]) -> str:
         lines.append("")
         lines.append("jobs (24 h):")
         lines.extend(f"  {name:<{width}}  {line}" for name, line in jobs)
+    tooling = [(m["name"], tooling_line(m.get("tooling"))) for m in doc["members"] if m.get("tooling")]
+    if tooling:
+        lines.append("")
+        lines.append("runner tooling:")
+        lines.extend(f"  {name:<{width}}  {line}" for name, line in tooling)
     stale = [f"{n} {s['state']}" for n, s in doc["sources"].items() if s["state"] in ("stale", "unavailable")]
     if stale:
         lines.append("")
@@ -1493,6 +1643,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--no-lima", action="store_true", help="skip the Lima instance listing")
     p.add_argument("--no-disk", action="store_true", help="skip the per-member disk and cache probe")
     p.add_argument("--no-jobs", action="store_true", help="skip the per-member runner job records")
+    p.add_argument("--no-tooling", action="store_true", help="skip the per-member runner tooling stamp")
     p.add_argument("--controller-status", type=Path, help="path to cmuxterm-hq build-fleet/status.py")
     p.add_argument("--controller-json", type=Path, help="a saved status.py --json output instead")
     p.add_argument("--github-runners", metavar="SCOPE", help="orgs/OWNER or repos/OWNER/REPO")
