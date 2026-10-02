@@ -40,7 +40,9 @@ reports it now (git ls-remote: nothing is fetched or written here, and an old ch
 ref cannot vouch for it), and reads every target member's .glaeda-source.json over SSH. --apply refuses,
 changing nothing on any member, when HEAD is not origin's main (or either cannot be read), or when a member's
 stamped commit is not an ancestor of HEAD: a downgrade, or a deploy from a branch HEAD does not contain. It also
-refuses when the staged files have uncommitted changes. A member with no stamp, or one that cannot be read, is
+refuses when the staged files or this tool have uncommitted changes, or are marked assume-unchanged or
+skip-worktree (edits git status cannot see). A run from origin's main replaces a member's still-active canary.
+A member with no stamp, or one that cannot be read, is
 not a downgrade; the output says so. A member whose stamp records allowDowngrade was deployed off main on
 purpose (a canary of a PR that then squash-merged), so a run from origin's main rolls it forward instead of
 refusing. --allow-downgrade REASON overrides every refusal; the reason is printed and recorded in each staged
@@ -246,13 +248,32 @@ def clean_reason(text: object) -> str:
     return " ".join("".join(ch for ch in words if unicodedata.category(ch)[0] != "C").split())[:MAX_REASON]
 
 
+GUARDED = tuple(f"scripts/{name}" for name in (*STAGED, "glaeda-cmux-runner-fleet"))
+
+
 def dirty_staged() -> list[str] | None:
     """The staged files (and this tool) with uncommitted changes, by repository path; None when git cannot tell."""
-    paths = [f"scripts/{name}" for name in (*STAGED, "glaeda-cmux-runner-fleet")]
-    code, out, _ = git("status", "--porcelain", "--", *paths)
+    code, out, _ = git("status", "--porcelain", "--", *GUARDED)
     if code != 0:
         return None
     return sorted({line[3:].strip() for line in out.splitlines() if len(line) > 3})
+
+
+def hidden_staged() -> list[str] | None:
+    """The staged files (and this tool) git status cannot vouch for: marked assume-unchanged (a lowercase tag in
+    ls-files -v) or skip-worktree (S). None when git cannot tell."""
+    code, out, _ = git("ls-files", "-v", "--", *GUARDED)
+    if code != 0:
+        return None
+    return sorted({line[2:].strip() for line in out.splitlines()
+                   if len(line) > 2 and (line[0].islower() or line[0] == "S")})
+
+
+def stamp_for(head: str | None) -> dict[str, Any] | None:
+    """The stamp to stage. A checked HEAD gets its own stamp or none: never source_stamp's guess (an untracked
+    stamp or release.json beside the scripts), which the guard did not check. Only with no git checkout at all
+    (an OTA release copy, which needs --allow-downgrade) does that copy's own record stand in."""
+    return head_stamp(head) if head else source_stamp()
 
 
 def head_stamp(head: str) -> dict[str, Any] | None:
@@ -317,6 +338,13 @@ def source_guard(chosen: list[str], jobs: int) -> dict[str, Any]:
         elif dirty:
             checkout.append(f"uncommitted changes to staged files: {', '.join(dirty)}; the stamp would name HEAD "
                             f"{guard['head']} for files that differ from it")
+        hidden = hidden_staged()
+        if hidden is None:
+            checkout.append("cannot tell whether git ignores edits to the staged files (git ls-files failed)")
+        elif hidden:
+            checkout.append(f"staged files marked assume-unchanged or skip-worktree: {', '.join(hidden)}; git status "
+                            "cannot vouch that they match HEAD (git update-index --no-assume-unchanged "
+                            "--no-skip-worktree clears it)")
     guard["refusals"] = [{"member": None, "text": text} for text in checkout] + [
         {"member": m, "text": f"{m}: {row['note']}"} for m, row in sorted(hosts.items()) if row["state"] == "downgrade"]
     return guard
@@ -357,7 +385,7 @@ def stage(member: str, manifest: dict[str, Any], scratch: Path,
     local = scratch / f"{member}.manifest.json"
     local.write_text(json.dumps(trimmed(manifest, member), indent=1) + "\n")
     files = [os.fspath(SCRIPT_DIR / f) for f in STAGED]
-    stamp = (head_stamp(head) if head else None) or source_stamp()
+    stamp = stamp_for(head)
     if stamp is not None and override is not None:
         stamp = {**stamp, "allowDowngrade": override}
     if stamp is not None:

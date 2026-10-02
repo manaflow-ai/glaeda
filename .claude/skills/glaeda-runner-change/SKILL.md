@@ -63,13 +63,15 @@ and changes nothing. Run it from a worktree at `origin/main`, not the shared bas
 The downgrade guard enforces that: `--apply` refuses, changing nothing on any member, when HEAD is not origin's
 `main` (read live with `git ls-remote`; a stale local `origin/main` cannot vouch for it) or when a member's
 `~/glaeda-runner/scripts/.glaeda-source.json` names a commit that is not an ancestor of HEAD (a downgrade, or a
-branch deployed by hand), or when the staged files have uncommitted changes. The refusal names the member, its
+branch deployed by hand), or when the staged files or the fleet tool itself have uncommitted changes or are
+marked `--assume-unchanged` or `--skip-worktree`. The refusal names the member, its
 stamped commit and HEAD; the plan lists the same findings. A member with no stamp, or an unreadable one, is not a
 downgrade and the output says so. To deploy anyway (a deliberate rollback, a branch canary), pass
 `--allow-downgrade "REASON"`: the reason is printed and recorded in each staged stamp as `allowDowngrade`. Never
 pass it to get past a refusal you have not read. A canary stamped that way and then squash-merged is never an
 ancestor of main, so the next run from origin's `main` rolls it forward ("rolling forward from a deliberate
-off-main deploy") instead of refusing. The stamp names the HEAD the guard checked. Running from an OTA release
+off-main deploy") instead of refusing. It does so even while that PR is still open: a run from main replaces an
+active, unmerged canary by design, so re-stage the canary afterwards if it should keep running. The stamp names the HEAD the guard checked. Running from an OTA release
 copy (no git checkout) needs `--allow-downgrade`. A shallow checkout fails closed (an older stamp reads as not an
 ancestor): `git fetch --unshallow` first.
 `glaeda-fleet-status` reports members whose stamp is behind or off origin/main (`tooling.behind`,

@@ -480,8 +480,9 @@ ref cannot vouch for it) and every target member's `~/glaeda-runner/scripts/.gla
 over SSH. `--apply` refuses, changing nothing on any member, when HEAD is not origin's `main`
 (or either cannot be read), or when a member's stamped commit is not an ancestor of HEAD: a
 downgrade from an old checkout, or a deploy from a branch HEAD does not contain. It also
-refuses when `git status` shows uncommitted changes to the staged files, since the stamp names
-HEAD. The refusal names the member, its stamped commit and HEAD. A member with no stamp, or one
+refuses when `git status` shows uncommitted changes to the staged files or to the fleet tool
+itself, or when any of them is marked `--assume-unchanged` or `--skip-worktree` (edits git
+status cannot see), since the stamp names HEAD. The refusal names the member, its stamped commit and HEAD. A member with no stamp, or one
 that cannot be read, is not a downgrade, and the output says so. The plan lists the same
 findings and exits 0. `--allow-downgrade "REASON"` overrides every refusal for a deliberate
 rollback or branch canary; control characters are dropped from the reason, which is printed and
@@ -489,8 +490,10 @@ recorded in every staged stamp as `allowDowngrade` (`reason`, and the refusals i
 that member). A PR canary deployed that way and then squash-merged is never an ancestor of main,
 and its commit may not exist locally; a stamp carrying `allowDowngrade` therefore does not refuse
 a run whose HEAD is origin's `main`, which reports "rolling forward from a deliberate off-main
-deploy (reason: ...)". The stamp names the HEAD the guard checked, never an untracked stamp or
-`release.json` beside the scripts. Running from an OTA release copy, which has no git checkout,
+deploy (reason: ...)". That is by design even while the canary's PR is still open and unmerged:
+a run from main replaces the canary, so re-stage it afterwards if it should keep running. The
+stamp names the HEAD the guard checked, never an untracked stamp or `release.json` beside the
+scripts; if the commit's stamp cannot be built, none is written. Running from an OTA release copy, which has no git checkout,
 needs `--allow-downgrade`. A shallow checkout fails closed: an older stamp beyond its history
 reads as not an ancestor, so fetch the full history (`git fetch --unshallow`). Automatic rollout
 on merge is proposed in #1385.

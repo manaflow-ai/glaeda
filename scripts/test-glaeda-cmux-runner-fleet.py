@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import importlib.machinery
+import importlib.util
 import json
 import os
 import shutil
@@ -12,6 +14,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOL = ROOT / "scripts" / "glaeda-cmux-runner-fleet"
@@ -458,6 +461,35 @@ class FleetTest(unittest.TestCase):
         blank = self.fleet("--apply", "--allow-downgrade", "\x1b\x07")
         self.assertEqual(blank.returncode, 2)
         self.assertIn("--allow-downgrade needs a reason", blank.stderr)
+
+    def test_files_git_is_told_to_ignore_refuse_apply(self) -> None:
+        for flag, name in (("--assume-unchanged", "glaeda-cmux-runner-hook"),
+                           ("--skip-worktree", "glaeda-cmux-runner-fleet")):
+            self.git("update-index", flag, f"scripts/{name}")
+            path = self.repo / "scripts" / name
+            path.write_text(path.read_text() + "\n# hand edit git status cannot see\n")
+            self.assertEqual(self.git("status", "--porcelain", "--", f"scripts/{name}"), "", "git status hides the edit")
+            self.log.unlink(missing_ok=True)
+            result = self.fleet("--apply")
+            self.assertEqual(result.returncode, 2, f"{flag}: {result.stdout}{result.stderr}")
+            self.assertIn(f"scripts/{name}", result.stderr)
+            self.assertIn("assume-unchanged or skip-worktree", result.stderr)
+            self.assert_nothing_changed()
+        forced = self.fleet("--apply", "--hosts", "mini-a", "--allow-downgrade", "testing hidden edits on mini-a")
+        self.assertEqual(forced.returncode, 0, forced.stdout + forced.stderr)
+
+    def test_a_failed_head_stamp_records_no_stamp_rather_than_one_the_guard_did_not_check(self) -> None:
+        (self.repo / "scripts" / ".glaeda-source.json").write_text(
+            json.dumps({"by": "someone", "date": "2026-01-01", "source": "a" * 40}))
+        loader = importlib.machinery.SourceFileLoader("fleet_under_test", os.fspath(self.tool))
+        spec = importlib.util.spec_from_loader("fleet_under_test", loader)
+        fleet = importlib.util.module_from_spec(spec)
+        loader.exec_module(fleet)
+        with mock.patch.object(fleet, "head_stamp", return_value=None):
+            self.assertIsNone(fleet.stamp_for(self.head), "a guarded run never falls back to a guess")
+        self.assertEqual(fleet.stamp_for(self.head)["source"], self.head)
+        # no git checkout (an OTA release copy, run with --allow-downgrade): the copy's own record is all there is
+        self.assertEqual(fleet.stamp_for(None)["source"], "a" * 40)
 
     def test_apply_refuses_when_origin_main_cannot_be_read(self) -> None:
         self.git("remote", "set-url", "origin", os.fspath(self.dir / "gone.git"))
