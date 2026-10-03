@@ -634,9 +634,15 @@ FUZZ_KEEP_BUILDS = 2
 FUZZ_KEEP_ENGINES = 2
 FUZZ_KEEP_QUIET_RUNS = 10  # runs without a finding
 FUZZ_KEEP_FINDING_RUNS = 30  # runs with one, until the collector files them; the oldest go first past this
-# Runs and staged builds add bytes (a catch-up rebuilds in place), so the fuzzer stays well above the runner's
-# 50 GiB admission floor: it must never be why a job is refused for disk.
-FUZZ_MIN_FREE_BYTES = 90 * 1024 ** 3
+# The fuzzer keeps a margin above this mini's runner disk floor, so it is never why a job is refused for disk. The
+# floor is the highest --min-free-gib of its job-started hooks (glaeda-cmux-runner writes the manifest's
+# defaults.disk.min_free_gib there), else the fleet default of 30 GiB (cmuxterm-hq build-fleet/mini-fleet.json).
+# It starts only at floor + FUZZ_START_HEADROOM_GIB, the manifest's defaults.disk.job_growth_gib (which the runners'
+# hooks do not carry), since a run grows: staged clones stop sharing blocks once a catch-up rebuilds, plus traces
+# and kept engines. watch() stops it below floor + FUZZ_STOP_HEADROOM_GIB. Until 2026-10-03 it needed a fixed 90 GiB.
+FUZZ_DEFAULT_MIN_FREE_GIB = 30
+FUZZ_START_HEADROOM_GIB = 20
+FUZZ_STOP_HEADROOM_GIB = 10
 # Beside a compile: the compile keeps the cores it wants. The manual runs of 2026-09-28 used nice 10 beside PR
 # compiles on eight minis and saw no stall or hang the app did not also show alone.
 FUZZ_NICE = 10
@@ -913,12 +919,22 @@ def free_bytes(path: Path) -> int | None:
     return stat.f_bavail * stat.f_frsize
 
 
-def watch(hook: Any, capacity: Path, ours: str, timeout_s: float) -> tuple[int | None, str]:
+def runner_floor_bytes(hook: Any) -> int:
+    """This mini's runner disk floor: the highest --min-free-gib among its runners, else FUZZ_DEFAULT_MIN_FREE_GIB."""
+    floors = [0.0]
+    for runner in runner_dirs():
+        with contextlib.suppress(Exception):
+            floors.append(float(hook.runner_scope(runner).min_free_gib))
+    return int((max(floors) or FUZZ_DEFAULT_MIN_FREE_GIB) * 1024 ** 3)
+
+
+def watch(hook: Any, capacity: Path, ours: str, timeout_s: float,
+          stop_below: int | None = None) -> tuple[int | None, str]:
     """Wait for the fuzzer (_child); (its exit code or None, why it was stopped or '').
 
     Stops at the first sign of a GUI job: a reservation or (every FUZZ_WATCH_S) an Xcode test, a take-gui or
     another cmux DEV app, or (every FUZZ_TOKEN_S) the gui token taken twice in a row (a listener gate's probe holds
-    it for an instant)."""
+    it for an instant). With stop_below, also once free disk drops under it (every FUZZ_WATCH_S, one statvfs)."""
     assert _child is not None
     deadline = time.monotonic() + timeout_s
     next_token = 0.0
@@ -934,6 +950,12 @@ def watch(hook: Any, capacity: Path, ours: str, timeout_s: float) -> tuple[int |
         why = reservation_refusal(hook, time.time())
         if why:
             return None, why
+        if stop_below is not None:
+            free = free_bytes(FLEET_DIR)
+            if free is not None and free < stop_below:
+                floor = stop_below - FUZZ_STOP_HEADROOM_GIB * 1024 ** 3
+                return None, (f"{free // 1024 ** 3} GiB free, under the runners' {floor / 1024 ** 3:g} GiB floor "
+                              f"+ {FUZZ_STOP_HEADROOM_GIB}")
         why = gui_process(ours)
         if why and why != "cannot list processes":
             return None, why
@@ -990,9 +1012,12 @@ def fuzz(apply: bool, state: Path, now: float | None = None) -> dict[str, Any]:
         return {**base, "state": "skip", "reason": "a trusted-only runner (a seeder) runs here: it only replays for "
                                                    "the collector, and no replay waits"}
     free = free_bytes(FLEET_DIR)
-    if not trusted and (free is None or free < FUZZ_MIN_FREE_BYTES):
+    floor = 0 if trusted else runner_floor_bytes(hook)
+    start = floor + FUZZ_START_HEADROOM_GIB * 1024 ** 3
+    if not trusted and (free is None or free < start):
         return {**base, "state": "skip", "reason": f"{(free or 0) // 1024 ** 3} GiB free, the fuzzer needs "
-                                                   f"{FUZZ_MIN_FREE_BYTES // 1024 ** 3}"}
+                                                   f"{start / 1024 ** 3:g} (the runners' {floor / 1024 ** 3:g} GiB "
+                                                   f"floor + {FUZZ_START_HEADROOM_GIB})"}
     roots = main_roots(hook, roots_n, state)
     kept = {path.name: path for path in staged_builds()}
     newest = roots[0] if roots else None
@@ -1055,7 +1080,8 @@ def fuzz(apply: bool, state: Path, now: float | None = None) -> dict[str, Any]:
                  "--max-findings", str(FUZZ_MAX_FINDINGS), "--seed", str(seed), "--out", os.fspath(out),
                  "--label", "main", "--sha", build.name],
                 cwd=engine, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
-        code, stopped = watch(hook, capacity, ours, FUZZ_TIMEOUT_S)
+        code, stopped = watch(hook, capacity, ours, FUZZ_TIMEOUT_S,
+                              stop_below=floor + FUZZ_STOP_HEADROOM_GIB * 1024 ** 3)
         _child = None
         kill_build()  # the app and anything else the fuzzer left in our group
         dismiss_crash_dialogs()

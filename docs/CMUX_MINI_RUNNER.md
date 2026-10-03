@@ -1058,8 +1058,13 @@ catch-ups, and holds no capacity unit, root or token, so no admission waits for 
 
 - **Starts** when this user owns an unlocked console, no job holds the gui token or asks for it (a take-gui
   step), no Xcode test and no other cmux DEV app runs, the host has no reservation (someone dogfooding there),
-  and 90 GiB are free. It clones the newest main build a root keeps into `fuzz/builds/<sha>` (APFS `cp -c`, no
-  root token: the copy counts only if the root's stamp is unchanged after it) and exports the fuzzer at that
+  and free disk is at least the runners' floor plus 20 GiB (the manifest's `defaults.disk.job_growth_gib`). The
+  floor is the highest `--min-free-gib` of this mini's job-started hooks, else 30 GiB, the fleet's
+  `defaults.disk.min_free_gib`, so the fuzzer starts at 50 GiB free on today's fleet. While it runs, it stops (as
+  for a gui job) once free disk drops below the floor plus 10 GiB, so it is never why a job is refused for disk.
+  It clones the newest main build a root keeps into
+  `fuzz/builds/<sha>` (APFS `cp -c`, no root token: the copy counts only if the root's stamp is unchanged after
+  it) and exports the fuzzer at that
   commit (`git archive` of `scripts/fuzz` and `dogfood/fuzz` from the catch-up checkout or the seed mirror) into
   `fuzz/engines/<sha>`, since a catch-up may check out a newer main meanwhile. It fuzzes for up to 10 minutes
   and minimizes up to two failures, 26 minutes at most; runs land in `/Users/Shared/cmux-build-fleet/fuzz/runs`.
