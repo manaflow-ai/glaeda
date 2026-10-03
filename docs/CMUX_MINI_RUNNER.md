@@ -194,7 +194,8 @@ What `--apply` does:
      disk pressure pass and always exits 0. The two-minute `glaeda-mini-health` agent repeats
      that ownership check when a post-job hook was skipped.
 4. Writes and loads `~/Library/LaunchAgents/com.teamleaderleo.glaeda.cmux-runner.plist`
-   (runs `glaeda-hooks/listen.sh`, restarts on crash, logs to
+   (runs `glaeda-hooks/listen.sh`, restarts after clean or failed listener exits,
+   with launchd's ten-second throttle, and logs to
    `~/Library/Logs/glaeda-cmux-runner.log`). `listen.sh` runs `run.sh` under the listener
    gate (`glaeda-cmux-runner-hook listen`).
    - **Why a gate.** Without it, an idle runner keeps listening while the fleet has the

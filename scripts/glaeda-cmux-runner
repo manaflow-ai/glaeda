@@ -579,7 +579,11 @@ def agent_plist(ctx: Context) -> dict[str, Any]:
         "ProgramArguments": [os.fspath(ctx.hook_dir / "listen.sh")],
         "WorkingDirectory": os.fspath(ctx.runner_dir),
         "RunAtLoad": True,
-        "KeepAlive": {"SuccessfulExit": False},
+        # A GitHub session cancellation is a clean Runner.Listener exit (status 0), but the
+        # runner must still reconnect.  Keep the LaunchAgent alive for both clean and failed
+        # exits; launchd's throttle prevents a broken install from spinning.
+        "KeepAlive": True,
+        "ThrottleInterval": 10,
         "ProcessType": "Interactive",
         "SessionCreate": True,
         "EnvironmentVariables": {

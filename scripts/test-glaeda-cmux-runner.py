@@ -4118,6 +4118,8 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(config["argv"][config["argv"].index("--url") + 1], "https://github.com/manaflow-ai/cmux")
         plist = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.cmux-runner.plist").read_bytes())
         self.assertEqual(plist["ProgramArguments"], [os.fspath(runner / "glaeda-hooks/listen.sh")])
+        self.assertIs(plist["KeepAlive"], True)
+        self.assertEqual(plist["ThrottleInterval"], 10)
         listen = runner / "glaeda-hooks/listen.sh"
         self.assertTrue(os.access(listen, os.X_OK))
         self.assertIn(f"listen --runner-dir {runner} --no-waiters &", listen.read_text())  # no capacity units
