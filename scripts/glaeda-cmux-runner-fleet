@@ -399,8 +399,63 @@ def stage(member: str, manifest: dict[str, Any], scratch: Path,
         run(["ssh", *SSH_OPTIONS, member, f"rm -f ~/{REMOTE_DIR}/scripts/{SOURCE_STAMP}"], 60)
     code, _, err = run(["scp", "-q", *SSH_OPTIONS, *files, f"{member}:{REMOTE_DIR}/scripts/"], 300)
     if code == 0:
+        # scp normally preserves executable bits, but an SSH implementation or a mounted
+        # home can discard them. The runner copy is ours, so repair the modes explicitly.
+        code, _, err = run(["ssh", *SSH_OPTIONS, member,
+                            f"chmod +x ~/{REMOTE_DIR}/scripts/glaeda-cmux-runner "
+                            f"~/{REMOTE_DIR}/scripts/glaeda-cmux-runner-hook "
+                            f"~/{REMOTE_DIR}/scripts/glaeda_fleet_labels.py "
+                            f"~/{REMOTE_DIR}/scripts/glaeda_reservation.py"], 60)
+    if code == 0:
         code, _, err = run(["scp", "-q", *SSH_OPTIONS, os.fspath(local), f"{member}:{REMOTE_DIR}/mini-fleet.json"], 60)
     return None if code == 0 else f"scp: {err.strip()[-200:]}"
+
+
+def prepare_headless(member: str, summary: dict[str, Any], manifest: dict[str, Any]) -> str | None:
+    """Converge the small operator fixes needed before a GUI-less AWS runner can start."""
+    host = (manifest.get("hosts") or {}).get(member) or {}
+    if host.get("gui") is not False or host.get("ssh_user") != "ec2-user":
+        return None
+    xcodes = summary.get("xcodeApps") or []
+    pinned = next((p for p in xcodes if str(p).startswith("/Applications/Xcode_") and str(p).endswith(".app")), None)
+    lines = [
+        "set -eu",
+        # These are global paths. Refuse a conflicting owner instead of replacing
+        # a real file or someone else's link; reruns are safe when our link is
+        # already present.
+        "if [ -x /opt/homebrew/bin/gh ]; then "
+        "if [ -L /usr/local/bin/gh ]; then "
+        "[ \"$(/usr/bin/readlink /usr/local/bin/gh)\" = /opt/homebrew/bin/gh ] || "
+        "{ echo 'refusing conflicting /usr/local/bin/gh' >&2; exit 1; }; "
+        "elif [ -e /usr/local/bin/gh ]; then "
+        "echo 'refusing non-symlink /usr/local/bin/gh' >&2; exit 1; "
+        "else sudo -n /usr/bin/install -d -m 755 /usr/local/bin && "
+        "sudo -n /bin/ln -s /opt/homebrew/bin/gh /usr/local/bin/gh; fi; fi",
+    ]
+    if pinned:
+        q = _quote(str(pinned))
+        lines.append(
+            # xcode-select is process-global. Refuse to change it while a
+            # runner job is active; the next apply can retry after the job
+            # drains, so an in-flight build never sees a moving toolchain.
+            f"if [ \"$(/usr/bin/xcode-select -p 2>/dev/null || true)\" != {q}/Contents/Developer ]; then "
+            "if /usr/bin/pgrep -f '/actions-runner[^ ]*/bin/Runner.Listener' >/dev/null 2>&1 || "
+            "/usr/bin/pgrep -f '/actions-runner[^ ]*/bin/Runner.Worker' >/dev/null 2>&1; then "
+            "echo 'refusing Xcode selection change while a runner is active' >&2; exit 1; fi; "
+            "fi; "
+            f"if [ -d {q} ]; then "
+            f"if [ -L /Applications/Xcode.app ]; then "
+            f"[ \"$(/usr/bin/readlink /Applications/Xcode.app)\" = {q} ] || "
+            "{ echo 'refusing conflicting /Applications/Xcode.app' >&2; exit 1; }; "
+            "elif [ -e /Applications/Xcode.app ]; then "
+            "echo 'refusing non-symlink /Applications/Xcode.app' >&2; exit 1; "
+            f"else sudo -n /bin/ln -s {q} /Applications/Xcode.app; fi; "
+            f"if [ \"$(/usr/bin/xcode-select -p 2>/dev/null || true)\" != {q}/Contents/Developer ]; then "
+            f"sudo -n /usr/bin/xcode-select -s {q}/Contents/Developer; fi; fi"
+        )
+    lines.append(f"chmod +x ~/{REMOTE_DIR}/scripts/* 2>/dev/null || true")
+    code, _, err = run(["ssh", *SSH_OPTIONS, member, "; ".join(lines)], 90)
+    return None if code == 0 else f"headless preparation failed: {err.strip()[-240:]}"
 
 
 def _uninstall_cmd(member: str, instance: int, apply: bool) -> str:
@@ -517,7 +572,13 @@ def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, m
     if failed:
         row["action"] = f"stage failed: {failed}"
         return row
-    extra = ["--skip-launchctl"] if args.skip_launchctl else []
+    prepared = prepare_headless(member, summary, manifest)
+    if prepared:
+        row["action"] = f"prepare failed: {prepared}"
+        return row
+    extra = ["--headless"] if ((manifest.get("hosts") or {}).get(member) or {}).get("gui") is False else []
+    if args.skip_launchctl:
+        extra.append("--skip-launchctl")
     with concurrent.futures.ThreadPoolExecutor(max_workers=row["runners"]) as pool:
         results = list(pool.map(lambda k: apply_instance(member, k, args.repo, extra, args.org, args.group,
                                                          args.migrate_from_repo), range(row["runners"])))

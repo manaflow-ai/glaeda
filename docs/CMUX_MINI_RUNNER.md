@@ -29,6 +29,10 @@ them back to Blacksmith.
 - Automatic login for the build user (`sysadminctl -autologin status`). The runner is
   a LaunchAgent in that user's GUI session, so it starts again after a reboot only
   when the user logs in automatically.
+- A GUI-less EC2 Mac uses the system domain instead: pass `--headless` (the fleet
+  command adds it automatically for manifest members with `gui: false`). The apply
+  path installs a root-owned supervisor and a `UserName` LaunchDaemon, so listeners
+  return after reboot without a GUI login. This requires passwordless sudo on the host.
 
 ## 2. One command
 
@@ -44,7 +48,8 @@ Useful flags: `--name NAME` (default `<short hostname>-glaeda`), `--labels a,b` 
 (extra labels), `--org ORG [--group GROUP]` instead of the default
 `--repo manaflow-ai/cmux`, `--runner-dir DIR` (default `~/actions-runner-glaeda`),
 `--runner-version V --runner-sha256 HEX` to pin, `--replace` to take over an existing
-registration with the same name, `--output json` for the receipt.
+registration with the same name, `--headless` for an EC2 system LaunchDaemon, or
+`--output json` for the receipt.
 
 What `--apply` does:
 
