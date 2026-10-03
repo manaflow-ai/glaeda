@@ -224,6 +224,8 @@ jobs:
               Path("scripts/test-glaeda-lan-fetch.py"),
               Path("scripts/glaeda-gh"),
               Path("scripts/test-glaeda-gh.py"),
+              Path("scripts/glaeda-wallpaper-rotate"),
+              Path("scripts/test-glaeda-wallpaper-rotate.py"),
               Path("scripts/test-verify.py"),
               Path("scripts/test-verify-changed-rustfmt.py"),
               Path("scripts/test-front-door.py"),
@@ -270,6 +272,7 @@ jobs:
           python3 scripts/test-glaeda-seed-lan.py
           python3 scripts/test-glaeda-lan-fetch.py
           python3 scripts/test-glaeda-gh.py
+          python3 scripts/test-glaeda-wallpaper-rotate.py
           python3 scripts/test-hot-pressure-shadow.py
           python3 scripts/test-hot-run.py
           python3 scripts/test-verify-focused.py

@@ -42,6 +42,7 @@ What --apply installs (templated for the current user):
                                                the runner user can, reports the rest for ci-dash; a no-op off a runner)
     ~/.local/bin/glaeda-update                 from scripts/glaeda-update (hourly over-the-air updates)
     ~/.local/bin/glaeda-gh                     from scripts/glaeda-gh (shared GitHub CI watcher, the one poller)
+    ~/.local/bin/glaeda-wallpaper-rotate       from scripts/glaeda-wallpaper-rotate (operator-supplied stills, every 30 minutes)
     ~/.claude/skills/github-ci-wait/SKILL.md    from skills/github-ci-wait: tells agent sessions to wait with glaeda-gh
     ~/.config/glaeda/update.json               its release ring and source, written once (--ota-ring canary|stable,
                                                --ota-source teamleaderleo/glaeda|manaflow-ai/glaeda)
@@ -680,6 +681,19 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-update.jsonl"),
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-update.err"),
         },
+        # Rotate operator-supplied stills without touching system wallpaper settings.  A headless
+        # host has no wallpaper store, so the tool exits successfully until a GUI user logs in.
+        LABEL_PREFIX + "wallpaper": {
+            "Label": LABEL_PREFIX + "wallpaper",
+            "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-wallpaper-rotate")],
+            "StartInterval": 1800,
+            "RunAtLoad": True,
+            "ProcessType": "Background",
+            "LowPriorityIO": True,
+            "Nice": 10,
+            "StandardOutPath": os.fspath(ctx.logs / "glaeda-wallpaper.log"),
+            "StandardErrorPath": os.fspath(ctx.logs / "glaeda-wallpaper.err"),
+        },
         # Keeps the fleet compilation-cache node store and local Xcode CAS within budget; it exits at
         # once on a host without fleet-cas and defers while any build runs or holds the host lock.
         LABEL_PREFIX + "fleet-cas-prune": {
@@ -998,7 +1012,7 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
                         "state": "unchanged" if path.is_dir() else "create", "mode": oct(mode)})
     for name in ("glaeda-disk", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune", "glaeda-seed-prefetch",
                  "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health",
-                 "glaeda-update", "glaeda-gh"):
+                 "glaeda-update", "glaeda-gh", "glaeda-wallpaper-rotate"):
         act = file_action(ctx, "tool", ctx.bin / name, (SCRIPT_DIR / name).read_bytes(), 0o755)
         act["source"] = os.fspath(SCRIPT_DIR / name)
         actions.append(act)
@@ -1143,7 +1157,7 @@ def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
                         "loaded": agent_loaded(ctx, label)})
     for name in ("glaeda-disk", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune",
                  "glaeda-seed-prefetch", "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health",
-                 "glaeda-update", "glaeda-gh"):
+                 "glaeda-update", "glaeda-gh", "glaeda-wallpaper-rotate"):
         actions.append({"kind": "tool", "path": os.fspath(ctx.bin / name)})
     actions.append({"kind": "tool", "path": os.fspath(skill_path(ctx))})
     for marker in scan_exclusion_markers(ctx):

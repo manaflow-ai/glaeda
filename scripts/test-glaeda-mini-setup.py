@@ -218,7 +218,7 @@ class MiniSetupTest(unittest.TestCase):
         first = self.invoke("--apply")
         self.assertTrue(first["applied"])
         bin_dir = self.home / ".local/bin"
-        for name in ("glaeda-disk", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all"):
+        for name in ("glaeda-disk", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all", "glaeda-wallpaper-rotate"):
             self.assertTrue(os.access(bin_dir / name, os.X_OK), name)
         self.assertEqual((bin_dir / "glaeda-disk").read_bytes(), (ROOT / "scripts/glaeda-disk").read_bytes())
         for label in ("disk-pressure", "disk-dedupe", "worktree-reclaim", "fleet-cas-prune", "seed-prefetch"):
@@ -245,6 +245,10 @@ class MiniSetupTest(unittest.TestCase):
         self.assertEqual(health["ProgramArguments"][1:], [os.fspath(bin_dir / "glaeda-mini-health"), "--apply"])
         self.assertEqual(health["StartInterval"], 120)
         self.assertEqual((bin_dir / "glaeda-mini-health").read_bytes(), (ROOT / "scripts/glaeda-mini-health").read_bytes())
+        wallpaper = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.wallpaper.plist").read_bytes())
+        self.assertEqual(wallpaper["ProgramArguments"][1:], [os.fspath(bin_dir / "glaeda-wallpaper-rotate")])
+        self.assertEqual((wallpaper["StartInterval"], wallpaper["RunAtLoad"]), (1800, True))
+        self.assertEqual(wallpaper["ProcessType"], "Background")
         guard = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.local-guard.plist").read_bytes())
         self.assertEqual(guard["ProgramArguments"][1:], [os.fspath(bin_dir / "glaeda-local-guard"), "--apply"])
         self.assertEqual(guard["StartInterval"], 30)
