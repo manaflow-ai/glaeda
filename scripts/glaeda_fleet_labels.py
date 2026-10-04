@@ -43,6 +43,8 @@ MAX_RUNNERS = 16
 # mini that holds a secret, such as the fleet-cas signing key.
 TRUSTED_REF_RE = r"refs/heads/[A-Za-z0-9._/-]+"
 REPO_RE = r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
+POOL_PREFIX_RE = r"[a-z0-9]+-"
+RESERVED_POOL_PREFIXES = {"root-", "side-", "gui-", "trusted-", "std-", "light-", "xl-"}
 
 
 def merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
@@ -53,30 +55,44 @@ def merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def pool_label(klass: str, version: str, trusted: bool = False) -> str:
+def pool_label(klass: str, version: str, trusted: bool = False, pool_prefix: str = "") -> str:
     """The single label a pool picker routes a whole run to: class plus verified Xcode, dedicated only."""
-    return f"glaeda-{'trusted-' if trusted else ''}{klass}-xcode-{version}"
+    return f"glaeda-{pool_prefix}{'trusted-' if trusted else ''}{klass}-xcode-{version}"
 
 
 def root_label(pool: str) -> str:
     """The label of a pool's root runners (instances below canonicalRoots): the jobs that build in or restore
     into the canonical root (compile, app-host shards, cli-product, lag) run on it, so GitHub queues them
     until a root runner is free instead of handing one to a runner whose mini has no free root."""
-    return pool.replace("glaeda-", "glaeda-root-", 1)
+    return _role_label(pool, "root")
 
 
 def side_label(pool: str) -> str:
     """The label of a pool's non-root runners (instances from canonicalRoots on). A light side lane (no
     canonical root, no persistent state, no GUI) runs on it, so it never takes a root runner that a compile
     or app-host job is waiting for. A mini whose every runner is a root runner has none."""
-    return pool.replace("glaeda-", "glaeda-side-", 1)
+    return _role_label(pool, "side")
 
 
 def gui_label(pool: str) -> str:
     """The label of a pool's gui runner (the last instance when guiRunners is 1). The GUI jobs (app-host shards,
     tests-build-and-lag, app-host-test-rerun) run on it: each needs the mini's one gui token (one console session),
     so one runner per mini carries the label, and its listener gate holds while the token or every root is taken."""
-    return pool.replace("glaeda-", "glaeda-gui-", 1)
+    return _role_label(pool, "gui")
+
+
+def _role_label(pool: str, role: str) -> str:
+    """Insert a runner role after an optional pool namespace and before class metadata."""
+    parts = pool.split("-")
+    try:
+        class_index = next(index for index, part in enumerate(parts) if part in RUNNER_CLASSES)
+    except StopIteration:
+        return pool.replace("glaeda-", f"glaeda-{role}-", 1)
+    # `trusted` is part of the role-free label; a namespace such as `aws` is
+    # part of the pool family and stays before the role.
+    insert_at = 1 if class_index > 1 and parts[1] == "trusted" else min(2, class_index)
+    parts.insert(insert_at, role)
+    return "-".join(parts)
 
 
 def xcode_apps(manifest: dict[str, Any], member: str) -> list[dict[str, Any]] | None:
@@ -122,12 +138,16 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
         return None, f"{member} runner.trustedRef must be a branch ref such as refs/heads/main"
     trusted_repo = runner.get("trustedRepo") if isinstance(runner, dict) else None
     if (trusted_ref is None) != (trusted_repo is None) or (
-            trusted_repo is not None and not (isinstance(trusted_repo, str) and re.fullmatch(REPO_RE, trusted_repo))):
+        trusted_repo is not None and not (isinstance(trusted_repo, str) and re.fullmatch(REPO_RE, trusted_repo))):
         return None, f"{member} runner.trustedRef and runner.trustedRepo (owner/name) go together"
+    pool_prefix = runner.get("poolPrefix", "") if isinstance(runner, dict) else ""
+    if not (isinstance(pool_prefix, str) and (pool_prefix == "" or (
+            re.fullmatch(POOL_PREFIX_RE, pool_prefix) and pool_prefix not in RESERVED_POOL_PREFIXES))):
+        return None, f"{member} runner.poolPrefix must be empty or a lowercase prefix such as aws-"
     ready = [a for a in apps if re.fullmatch(VERSION_RE, str(a.get("version") or "")) and xcode_ok(a)]
     versions = [str(a["version"]) for a in ready]
     # Opportunistic members never carry a pool label, so they never receive a required job.
-    pools = [pool_label(klass, v, bool(trusted_ref)) for v in versions] if availability == "dedicated" else []
+    pools = [pool_label(klass, v, bool(trusted_ref), pool_prefix) for v in versions] if availability == "dedicated" else []
     # Declared (the ios-simulators role) and, when the caller can look (the installer on the mini), a simulator
     # runtime actually present: an iOS job routed here must be able to boot one. Without a check (the fleet
     # plan) this is the declared view.
