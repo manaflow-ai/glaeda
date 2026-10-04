@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+"""Keep main the same in teamleaderleo/glaeda (upstream) and manaflow-ai/glaeda (mirror).
+
+Run by .github/workflows/sync-main.yml in the upstream repository (docs/GLAEDA_OTA.md, Fleet
+mirror). It fetches both mains into a scratch repository and then:
+
+- equal: does nothing;
+- one is an ancestor of the other: pushes the newer one to the side that is behind;
+- diverged and merging cleanly: makes one merge commit (upstream first parent, mirror second, a
+  fixed identity, dates taken from the parents, so the same inputs always make the same commit)
+  and pushes it to both sides;
+- diverged with conflicts: changes neither side, reports the conflicting paths and exits 2.
+
+Every push is a plain `git push <remote> <sha>:refs/heads/main`, which the server refuses unless
+it fast-forwards. No force form is ever built (assert_no_force checks each argv). When a push is
+refused because that side moved after the fetch, the run reports "raced" and the next run starts
+over from the new state. A push refused while the side has not moved is a failure.
+
+With --issue-repo, a conflict opens or updates one tracking issue there, and a later run that
+leaves both sides equal closes it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import Callable
+
+EXIT_OK = 0
+EXIT_FAILED = 1
+EXIT_CONFLICT = 2
+
+IDENTITY_NAME = "glaeda-sync"
+IDENTITY_EMAIL = "glaeda-sync@users.noreply.github.com"
+ISSUE_TITLE = "glaeda main sync: teamleaderleo/glaeda and manaflow-ai/glaeda conflict"
+REPAIR_POINTER = (
+    "Repair: https://github.com/manaflow-ai/cmuxterm-hq/blob/main/REPAIR.md "
+    "(row \"glaeda main sync conflict\")"
+)
+BRANCH = "refs/heads/main"
+
+FORCE_FLAGS = {"-f", "-d", "--mirror", "--delete", "--prune", "--all", "--tags"}
+
+Runner = Callable[..., subprocess.CompletedProcess]
+
+
+class SyncError(RuntimeError):
+    pass
+
+
+class ForcePushRefused(SyncError):
+    pass
+
+
+@dataclasses.dataclass
+class SyncResult:
+    outcome: str  # in-sync | fast-forward-mirror | fast-forward-upstream | merged | conflict | raced | failed
+    upstream: str
+    mirror: str
+    merge: str | None = None
+    conflicts: list[str] = dataclasses.field(default_factory=list)
+    pushes: list[dict] = dataclasses.field(default_factory=list)
+    detail: str = ""
+
+    @property
+    def exit_code(self) -> int:
+        if self.outcome == "conflict":
+            return EXIT_CONFLICT
+        if self.outcome == "failed":
+            return EXIT_FAILED
+        return EXIT_OK
+
+    def to_json(self) -> dict:
+        return {**dataclasses.asdict(self), "exit_code": self.exit_code}
+
+
+def assert_no_force(argv: list[str]) -> None:
+    """Refuse any push argv that could rewrite or delete a remote ref."""
+    for arg in argv[2:]:
+        if arg in FORCE_FLAGS or arg.startswith("--force") or arg.startswith("+") or arg.startswith(":"):
+            raise ForcePushRefused(f"refusing a force or delete push: {' '.join(argv)}")
+        if not arg.startswith("-") and ":" in arg and arg.split(":", 1)[0] == "":
+            raise ForcePushRefused(f"refusing a delete refspec: {' '.join(argv)}")
+
+
+class Git:
+    def __init__(self, work: Path, runner: Runner) -> None:
+        self.work = work
+        self.runner = runner
+
+    def run(self, *args: str, env: dict | None = None, check: bool = True) -> subprocess.CompletedProcess:
+        argv = ["git", *args]
+        if args[:1] == ("push",):
+            assert_no_force(argv)
+        done = self.runner(argv, cwd=self.work, env=env, capture_output=True, text=True)
+        if check and done.returncode != 0:
+            raise SyncError(f"git {args[0]} failed ({done.returncode}): {done.stderr.strip()[-400:]}")
+        return done
+
+    def out(self, *args: str) -> str:
+        return self.run(*args).stdout.strip()
+
+
+def fetch_main(git: Git, remote: str) -> str:
+    git.run("fetch", "--quiet", "--no-tags", "--no-write-fetch-head", remote, f"{BRANCH}:refs/sync/scratch")
+    sha = git.out("rev-parse", "--verify", "refs/sync/scratch^{commit}")
+    git.run("update-ref", "-d", "refs/sync/scratch")
+    return sha
+
+
+def remote_main(git: Git, remote: str) -> str:
+    out = git.out("ls-remote", remote, BRANCH)
+    return out.split()[0] if out else ""
+
+
+def is_ancestor(git: Git, a: str, b: str) -> bool:
+    done = git.run("merge-base", "--is-ancestor", a, b, check=False)
+    if done.returncode not in (0, 1):
+        raise SyncError(f"git merge-base failed: {done.stderr.strip()[-400:]}")
+    return done.returncode == 0
+
+
+def merge_tree(git: Git, up: str, mf: str) -> tuple[str | None, list[str]]:
+    """(tree, []) for a clean merge, (None, paths) for a conflicted one."""
+    done = git.run("merge-tree", "--write-tree", "--name-only", "--no-messages", "-z", up, mf, check=False)
+    if done.returncode not in (0, 1):
+        raise SyncError(f"git merge-tree failed: {done.stderr.strip()[-400:]}")
+    fields = [f for f in done.stdout.split("\0") if f]
+    if not fields:
+        raise SyncError("git merge-tree printed no tree")
+    if done.returncode == 0:
+        return fields[0], []
+    return None, sorted(set(fields[1:]))
+
+
+def make_merge(git: Git, tree: str, up: str, mf: str, upstream_name: str, mirror_name: str) -> str:
+    # The later parent's committer date makes the commit a function of its inputs alone.
+    stamp = max(int(git.out("show", "-s", "--format=%ct", sha)) for sha in (up, mf))
+    date = f"@{stamp} +0000"
+    message = (
+        f"Merge {mirror_name} main {mf[:12]} into {upstream_name} main {up[:12]}\n\n"
+        f"glaeda-sync-main joined the two mains, which had diverged.\n\n"
+        f"{upstream_name} main: {up}\n"
+        f"{mirror_name} main: {mf}\n"
+    )
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": IDENTITY_NAME,
+        "GIT_AUTHOR_EMAIL": IDENTITY_EMAIL,
+        "GIT_AUTHOR_DATE": date,
+        "GIT_COMMITTER_NAME": IDENTITY_NAME,
+        "GIT_COMMITTER_EMAIL": IDENTITY_EMAIL,
+        "GIT_COMMITTER_DATE": date,
+    }
+    return git.run("commit-tree", tree, "-p", up, "-p", mf, "-m", message, env=env).stdout.strip()
+
+
+def push(git: Git, side: str, remote: str, sha: str, old: str) -> dict:
+    """Fast-forward one side to sha. Never forces: the server refuses a non-fast-forward."""
+    done = git.run("push", "--porcelain", "--no-verify", remote, f"{sha}:{BRANCH}", check=False)
+    if done.returncode == 0:
+        return {"side": side, "sha": sha, "old": old, "status": "pushed"}
+    now = remote_main(git, remote)
+    if now != old:
+        return {"side": side, "sha": sha, "old": old, "now": now, "status": "raced"}
+    return {"side": side, "sha": sha, "old": old, "status": "failed", "error": done.stderr.strip()[-400:]}
+
+
+def finish(result: SyncResult) -> SyncResult:
+    statuses = {p["status"] for p in result.pushes}
+    if "failed" in statuses:
+        result.outcome, result.detail = "failed", "a push was refused while that side had not moved"
+    elif "raced" in statuses:
+        result.outcome, result.detail = "raced", "a side moved after the fetch; the next run starts over"
+    return result
+
+
+def sync(
+    upstream: str,
+    mirror: str,
+    work: Path,
+    *,
+    runner: Runner = subprocess.run,
+    dry_run: bool = False,
+    upstream_name: str = "teamleaderleo/glaeda",
+    mirror_name: str = "manaflow-ai/glaeda",
+) -> SyncResult:
+    work = Path(work)
+    work.mkdir(parents=True, exist_ok=True)
+    git = Git(work, runner)
+    if not (work / "HEAD").exists():
+        git.run("init", "--quiet", "--bare")
+    try:
+        up = fetch_main(git, upstream)
+        mf = fetch_main(git, mirror)
+    except SyncError as err:
+        return SyncResult("failed", "", "", detail=str(err))
+    result = SyncResult("in-sync", up, mf)
+    if up == mf:
+        return result
+    try:
+        if is_ancestor(git, mf, up):
+            result.outcome = "fast-forward-mirror"
+            if not dry_run:
+                result.pushes.append(push(git, "mirror", mirror, up, mf))
+            return finish(result)
+        if is_ancestor(git, up, mf):
+            result.outcome = "fast-forward-upstream"
+            if not dry_run:
+                result.pushes.append(push(git, "upstream", upstream, mf, up))
+            return finish(result)
+        tree, conflicts = merge_tree(git, up, mf)
+        if tree is None:
+            result.outcome, result.conflicts = "conflict", conflicts
+            result.detail = "main diverged and does not merge cleanly; neither side was changed"
+            return result
+        result.outcome = "merged"
+        result.merge = make_merge(git, tree, up, mf, upstream_name, mirror_name)
+        if not dry_run:
+            # Upstream first: its push starts release.yml. A race there still leaves the mirror push a
+            # fast-forward, and the next run joins whatever moved. A refusal while upstream has not
+            # moved stops here: the merge on the mirror alone would leave it ahead, and every later
+            # run would fail the same upstream push.
+            first = push(git, "upstream", upstream, result.merge, up)
+            result.pushes.append(first)
+            if first["status"] != "failed":
+                result.pushes.append(push(git, "mirror", mirror, result.merge, mf))
+        return finish(result)
+    except SyncError as err:
+        result.outcome, result.detail = "failed", str(err)
+        return result
+
+
+def issue_body(result: SyncResult, upstream_name: str, mirror_name: str, run_url: str = "") -> str:
+    paths = "\n".join(f"- `{p}`" for p in result.conflicts) or "- (none reported)"
+    lines = [
+        f"`main` of {upstream_name} and {mirror_name} diverged and do not merge cleanly, so the sync",
+        "changed neither side. Each side still ships its own merges; the other side stops receiving",
+        "them until this is fixed.",
+        "",
+        f"- {upstream_name} main: `{result.upstream}`",
+        f"- {mirror_name} main: `{result.mirror}`",
+        "",
+        "Conflicting paths:",
+        paths,
+        "",
+        "Fix: merge one main into the other in a pull request, resolving these paths, and merge it.",
+        "The next sync run fast-forwards the other side and closes this issue.",
+        "",
+        REPAIR_POINTER,
+    ]
+    if run_url:
+        lines += ["", f"Latest run: {run_url}"]
+    return "\n".join(lines) + "\n"
+
+
+GhRunner = Callable[..., str]
+
+
+def default_gh(args: list[str], stdin: str | None = None) -> str:
+    done = subprocess.run(["gh", *args], input=stdin, capture_output=True, text=True, check=False)
+    if done.returncode != 0:
+        raise SyncError(f"gh {' '.join(args[:2])} failed: {done.stderr.strip()[-400:]}")
+    return done.stdout
+
+
+def update_tracking_issue(
+    result: SyncResult,
+    *,
+    repo: str,
+    gh: GhRunner = default_gh,
+    upstream_name: str = "teamleaderleo/glaeda",
+    mirror_name: str = "manaflow-ai/glaeda",
+    run_url: str = "",
+) -> str:
+    """opened | updated | unchanged | closed | none."""
+    if result.outcome not in ("conflict", "in-sync", "fast-forward-mirror", "fast-forward-upstream", "merged"):
+        return "none"  # a race or failure says nothing about the conflict
+    listed = json.loads(gh(["issue", "list", "-R", repo, "--state", "open", "-L", "200", "--json", "number,title,body"]) or "[]")
+    open_issues = [i for i in listed if i.get("title") == ISSUE_TITLE]
+    if result.outcome != "conflict":
+        if not open_issues:
+            return "none"
+        for issue in open_issues:
+            gh(["issue", "comment", str(issue["number"]), "-R", repo, "--body-file", "-"],
+               stdin=f"Resolved: the sync run finished with `{result.outcome}`.\n")
+            gh(["issue", "close", str(issue["number"]), "-R", repo])
+        return "closed"
+    body = issue_body(result, upstream_name, mirror_name)
+    if not open_issues:
+        gh(["issue", "create", "-R", repo, "--title", ISSUE_TITLE, "--body-file", "-"],
+           stdin=body + (f"\nRun: {run_url}\n" if run_url else ""))
+        return "opened"
+    issue = open_issues[0]
+    # Compare without the run link, so a repeat of the same conflict does not edit every 15 minutes.
+    if (issue.get("body") or "").split("\nRun: ")[0] == body:
+        return "unchanged"
+    gh(["issue", "edit", str(issue["number"]), "-R", repo, "--body-file", "-"],
+       stdin=body + (f"\nRun: {run_url}\n" if run_url else ""))
+    return "updated"
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--upstream", required=True, help="fetch/push URL of upstream (teamleaderleo/glaeda)")
+    parser.add_argument("--mirror", required=True, help="fetch/push URL of the mirror (manaflow-ai/glaeda)")
+    parser.add_argument("--work", required=True, type=Path, help="scratch bare repository directory")
+    parser.add_argument("--upstream-name", default="teamleaderleo/glaeda")
+    parser.add_argument("--mirror-name", default="manaflow-ai/glaeda")
+    parser.add_argument("--dry-run", action="store_true", help="decide and build any merge, push nothing")
+    parser.add_argument("--report", type=Path, help="write the result as JSON here")
+    parser.add_argument("--issue-repo", help="open/update/close the conflict tracking issue in this repo (gh)")
+    parser.add_argument("--run-url", default="", help="link to this run, for the tracking issue")
+    args = parser.parse_args(argv)
+
+    result = sync(args.upstream, args.mirror, args.work, dry_run=args.dry_run,
+                  upstream_name=args.upstream_name, mirror_name=args.mirror_name)
+    names = {"upstream": args.upstream_name, "mirror": args.mirror_name}
+    print(f"{args.upstream_name} main {result.upstream[:12] or '?'}, {args.mirror_name} main {result.mirror[:12] or '?'}")
+    print(f"outcome: {result.outcome}{' (dry run)' if args.dry_run else ''}")
+    if result.merge:
+        print(f"merge: {result.merge}")
+    for p in result.pushes:
+        print(f"push {names[p['side']]} main {p['old'][:12]} -> {p['sha'][:12]}: {p['status']}")
+    if result.detail:
+        print(result.detail)
+    if result.conflicts:
+        print("conflicting paths:")
+        for path in result.conflicts:
+            print(f"  {path}")
+        print(REPAIR_POINTER)
+    if args.report:
+        args.report.write_text(json.dumps(result.to_json(), indent=2) + "\n")
+    code = result.exit_code
+    if args.issue_repo and not args.dry_run:
+        try:
+            action = update_tracking_issue(result, repo=args.issue_repo, upstream_name=args.upstream_name,
+                                           mirror_name=args.mirror_name, run_url=args.run_url)
+            print(f"tracking issue: {action}")
+        except SyncError as err:
+            print(f"tracking issue: {err}", file=sys.stderr)
+            code = code or EXIT_FAILED
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

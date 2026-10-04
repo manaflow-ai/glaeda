@@ -1,9 +1,11 @@
 name: Mirror
 
-# Runs only in manaflow-ai/glaeda, the read-only copy of this repository that the Manaflow minis
-# clone and update from (docs/GLAEDA_OTA.md, Fleet mirror). Every 15 minutes it copies main, the
-# releases and the ota-channels files from teamleaderleo/glaeda byte for byte, and keeps every other
-# workflow in the copy disabled: releases are built, attested and promoted only upstream.
+# Runs only in manaflow-ai/glaeda, the fork the Manaflow minis clone and update from
+# (docs/GLAEDA_OTA.md, Fleet mirror). Every 15 minutes it copies the release tags, the releases and
+# the ota-channels files from teamleaderleo/glaeda byte for byte, and keeps the fork's other
+# workflows disabled except ci.yml (pull request CI): releases are built, attested and promoted only
+# upstream. main is not copied here: sync-main.yml in teamleaderleo/glaeda keeps both mains equal in
+# both directions and never force-pushes.
 
 on:
   schedule:
@@ -12,7 +14,7 @@ on:
 
 permissions:
   contents: write  # releases
-  actions: write   # disable the copy's other workflows
+  actions: write   # disable the fork's other workflows
 
 concurrency:
   group: mirror
@@ -28,19 +30,20 @@ jobs:
       UPSTREAM: teamleaderleo/glaeda
       MIRROR: ${{ github.repository }}
     steps:
-      - name: Keep the copy's other workflows disabled
-        # before main moves, so a push from here does not start them (a deploy-key push does)
+      - name: Keep the fork's other workflows disabled
+        # A deploy-key push to main or a tag starts the fork's workflows. ci.yml stays enabled: in the
+        # fork it runs for pull requests only.
         run: |
           gh api "repos/$MIRROR/actions/workflows" --paginate \
             --jq '.workflows[] | select(.state == "active" and (.path | startswith(".github/workflows/"))
-                  and .path != ".github/workflows/mirror.yml") | "\(.id) \(.path)"' |
+                  and .path != ".github/workflows/mirror.yml" and .path != ".github/workflows/ci.yml")
+                  | "\(.id) \(.path)"' |
           while read -r id path; do
             gh api -X PUT "repos/$MIRROR/actions/workflows/$id/disable"
             echo "disabled $path" >> "$GITHUB_STEP_SUMMARY"
           done
       - name: Read upstream channels, then releases
-        # Before main, so every commit they name is in the main pushed below (main only grows). The
-        # releases to copy are the newest 30 plus whatever the rings name, however old.
+        # The releases to copy are the newest 30 plus whatever the rings name, however old.
         run: |
           mkdir -p work/channels work/upstream-channels
           gh release download ota-channels -R "$UPSTREAM" -p '*.json' -D work/upstream-channels
@@ -50,23 +53,19 @@ jobs:
               [ ! -f "$ring" ] || python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["tag"])' "$ring"
             done
           } | grep -E '^r-[0-9]{8}-[0-9a-f]{12}$' | sort -u > work/upstream.txt
-      - name: Mirror main and the release tags
+      - name: Mirror the release tags
         env:
           DEPLOY_KEY: ${{ secrets.MIRROR_DEPLOY_KEY }}
         run: |
-          up=$(git ls-remote "https://github.com/$UPSTREAM.git" refs/heads/main | cut -f1)
-          here=$(git ls-remote "https://github.com/$MIRROR.git" refs/heads/main | cut -f1)
-          echo "upstream main ${up:0:12}, mirror main ${here:0:12}" >> "$GITHUB_STEP_SUMMARY"
-          git init -q --bare work/main.git
-          git -C work/main.git fetch -q "https://github.com/$UPSTREAM.git" +refs/heads/main:refs/heads/main \
-            '+refs/tags/r-*:refs/tags/r-*'
+          # Tags only, never main, and never forced: a tag already here is left alone.
+          git init -q --bare work/tags.git
+          git -C work/tags.git fetch -q "https://github.com/$UPSTREAM.git" 'refs/tags/r-*:refs/tags/r-*'
           refs=()
-          [ "$up" = "$here" ] || refs+=(+refs/heads/main:refs/heads/main)
           git ls-remote --tags "https://github.com/$MIRROR.git" 'refs/tags/r-*' | cut -f2 > work/mirror-tags.txt
           while read -r tag; do
             grep -qx "refs/tags/$tag" work/mirror-tags.txt && continue
-            # a tag deleted upstream since the listing would fail the whole push, main included
-            if git -C work/main.git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            # a tag deleted upstream since the listing would fail the whole push
+            if git -C work/tags.git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
               refs+=("refs/tags/$tag:refs/tags/$tag")
             else
               echo "upstream has no tag $tag" >> "$GITHUB_STEP_SUMMARY"
@@ -81,7 +80,7 @@ jobs:
           chmod 600 ~/.ssh/mirror
           echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > ~/.ssh/known_hosts
           export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/mirror -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
-          git -C work/main.git push "git@github.com:$MIRROR.git" "${refs[@]}"
+          git -C work/tags.git push "git@github.com:$MIRROR.git" "${refs[@]}"
           rm -f ~/.ssh/mirror
       - name: Mirror control.json
         # the pause switch never waits on a release copy

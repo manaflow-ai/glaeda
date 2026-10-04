@@ -14,6 +14,11 @@ on:
 permissions:
   contents: read
 
+# manaflow-ai/glaeda, the fleet fork, runs this workflow for pull requests only. Its main is moved by
+# sync-main.yml in teamleaderleo/glaeda, and a push there must not run a second copy of every check:
+# the commit was verified as a pull request on one side and is verified on push here. The jobs that
+# need no other job carry the gate; the rest are skipped with them.
+
 concurrency:
   group: verify-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -25,6 +30,7 @@ jobs:
   # when src/, tests/ or the cli job names it (scripts/bootstrap, for one). Pushes to main run everything, and
   # scripts and runner-tests always run, since several script tests drive cargo.
   changes:
+    if: ${{ github.event_name == 'pull_request' || github.repository == 'teamleaderleo/glaeda' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
@@ -111,6 +117,7 @@ jobs:
 
   # Script syntax and every script test file but the runner's, which runner-tests shards.
   scripts:
+    if: ${{ github.event_name == 'pull_request' || github.repository == 'teamleaderleo/glaeda' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
 
@@ -225,6 +232,8 @@ jobs:
               Path("scripts/glaeda-gh"),
               Path("scripts/test-glaeda-gh.py"),
               Path("scripts/glaeda-wallpaper-rotate"),
+              Path("scripts/glaeda-sync-main"),
+              Path("scripts/test-glaeda-sync-main.py"),
               Path("scripts/test-glaeda-wallpaper-rotate.py"),
               Path("scripts/test-verify.py"),
               Path("scripts/test-verify-changed-rustfmt.py"),
@@ -273,6 +282,7 @@ jobs:
           python3 scripts/test-glaeda-lan-fetch.py
           python3 scripts/test-glaeda-gh.py
           python3 scripts/test-glaeda-wallpaper-rotate.py
+          python3 scripts/test-glaeda-sync-main.py
           python3 scripts/test-hot-pressure-shadow.py
           python3 scripts/test-hot-run.py
           python3 scripts/test-verify-focused.py
@@ -356,6 +366,7 @@ jobs:
 
   # scripts/test-glaeda-cmux-runner.py took about 300 s of the old single job; its shards run side by side.
   runner-tests:
+    if: ${{ github.event_name == 'pull_request' || github.repository == 'teamleaderleo/glaeda' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     strategy:
@@ -661,7 +672,7 @@ jobs:
 
   # One check that stands for the whole workflow, under the old single job's name.
   verify:
-    if: ${{ always() }}
+    if: ${{ always() && (github.event_name == 'pull_request' || github.repository == 'teamleaderleo/glaeda') }}
     needs: [changes, go, scripts, runner-tests, lint, test, cli]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
