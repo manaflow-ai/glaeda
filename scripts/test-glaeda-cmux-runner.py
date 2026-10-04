@@ -5356,6 +5356,12 @@ class ManifestLabelsTest(unittest.TestCase):
         self.assertIn("glaeda-aws-std-xcode-26.6", member["labels"])
         self.assertEqual(member["rootPools"], ["glaeda-aws-root-std-xcode-26.6"])
         self.assertEqual(member["sidePools"], ["glaeda-aws-side-std-xcode-26.6"])
+        for prefix in ("root-", "side-", "gui-", "trusted-"):
+            invalid = copy.deepcopy(MANIFEST)
+            invalid["hosts"]["mini-std"].setdefault("overrides", {})["runner"] = {"poolPrefix": prefix}
+            member, why = cr.member_labels(invalid, "mini-std")
+            self.assertIsNone(member)
+            self.assertIn("poolPrefix", why)
         for name, why in (("mini-no-role", "ci-runner"), ("laptop", "never runs"), ("borrowed", "never runs"),
                           ("old-shape", "m4pro-48"), ("bad-avail", "availability"), ("absent", "not a member"),
                           ("no-hardware", "no hardware class")):

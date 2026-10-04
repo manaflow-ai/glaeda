@@ -44,6 +44,7 @@ MAX_RUNNERS = 16
 TRUSTED_REF_RE = r"refs/heads/[A-Za-z0-9._/-]+"
 REPO_RE = r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
 POOL_PREFIX_RE = r"[a-z0-9]+-"
+RESERVED_POOL_PREFIXES = {"root-", "side-", "gui-", "trusted-"}
 
 
 def merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
@@ -140,7 +141,8 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
         trusted_repo is not None and not (isinstance(trusted_repo, str) and re.fullmatch(REPO_RE, trusted_repo))):
         return None, f"{member} runner.trustedRef and runner.trustedRepo (owner/name) go together"
     pool_prefix = runner.get("poolPrefix", "") if isinstance(runner, dict) else ""
-    if not (isinstance(pool_prefix, str) and (pool_prefix == "" or re.fullmatch(POOL_PREFIX_RE, pool_prefix))):
+    if not (isinstance(pool_prefix, str) and (pool_prefix == "" or (
+            re.fullmatch(POOL_PREFIX_RE, pool_prefix) and pool_prefix not in RESERVED_POOL_PREFIXES))):
         return None, f"{member} runner.poolPrefix must be empty or a lowercase prefix such as aws-"
     ready = [a for a in apps if re.fullmatch(VERSION_RE, str(a.get("version") or "")) and xcode_ok(a)]
     versions = [str(a["version"]) for a in ready]
