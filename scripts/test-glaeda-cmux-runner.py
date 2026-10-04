@@ -5356,7 +5356,7 @@ class ManifestLabelsTest(unittest.TestCase):
         self.assertIn("glaeda-aws-std-xcode-26.6", member["labels"])
         self.assertEqual(member["rootPools"], ["glaeda-aws-root-std-xcode-26.6"])
         self.assertEqual(member["sidePools"], ["glaeda-aws-side-std-xcode-26.6"])
-        for prefix in ("root-", "side-", "gui-", "trusted-"):
+        for prefix in ("root-", "side-", "gui-", "trusted-", "std-", "light-", "xl-"):
             invalid = copy.deepcopy(MANIFEST)
             invalid["hosts"]["mini-std"].setdefault("overrides", {})["runner"] = {"poolPrefix": prefix}
             member, why = cr.member_labels(invalid, "mini-std")

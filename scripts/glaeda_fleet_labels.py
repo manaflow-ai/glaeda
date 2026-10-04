@@ -44,7 +44,7 @@ MAX_RUNNERS = 16
 TRUSTED_REF_RE = r"refs/heads/[A-Za-z0-9._/-]+"
 REPO_RE = r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
 POOL_PREFIX_RE = r"[a-z0-9]+-"
-RESERVED_POOL_PREFIXES = {"root-", "side-", "gui-", "trusted-"}
+RESERVED_POOL_PREFIXES = {"root-", "side-", "gui-", "trusted-", "std-", "light-", "xl-"}
 
 
 def merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
