@@ -9,6 +9,7 @@ reaches an argv, a file, or the output.
 from __future__ import annotations
 
 import contextlib
+import copy
 import fcntl
 import hashlib
 import importlib.machinery
@@ -5347,6 +5348,14 @@ class ManifestLabelsTest(unittest.TestCase):
         with mock.patch.object(cr, "xcode_present", return_value=False):
             self.assertEqual(cr.member_labels(MANIFEST, "mini-std")[0]["labels"],
                              ["glaeda-mini", "glaeda-class-std", "glaeda-dedicated"])
+        aws = copy.deepcopy(MANIFEST)
+        aws["hosts"]["mini-std"].setdefault("overrides", {})["runner"] = {"poolPrefix": "aws-"}
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            member, why = cr.member_labels(aws, "mini-std")
+        self.assertIsNone(why)
+        self.assertIn("glaeda-aws-std-xcode-26.6", member["labels"])
+        self.assertEqual(member["rootPools"], ["glaeda-aws-root-std-xcode-26.6"])
+        self.assertEqual(member["sidePools"], ["glaeda-aws-side-std-xcode-26.6"])
         for name, why in (("mini-no-role", "ci-runner"), ("laptop", "never runs"), ("borrowed", "never runs"),
                           ("old-shape", "m4pro-48"), ("bad-avail", "availability"), ("absent", "not a member"),
                           ("no-hardware", "no hardware class")):
@@ -5392,6 +5401,10 @@ class FleetLabelsModuleTest(unittest.TestCase):
     def test_pool_label_string(self) -> None:
         self.assertEqual(fleet_labels.pool_label("std", "26.6"), "glaeda-std-xcode-26.6")
         self.assertEqual(fleet_labels.pool_label("light", "26.6"), "glaeda-light-xcode-26.6")
+        self.assertEqual(fleet_labels.pool_label("std", "26.3", pool_prefix="aws-"),
+                         "glaeda-aws-std-xcode-26.3")
+        self.assertEqual(fleet_labels.root_label("glaeda-aws-std-xcode-26.3"),
+                         "glaeda-aws-root-std-xcode-26.3")
 
     def test_runner_and_module_agree(self) -> None:
         with mock.patch.object(cr, "xcode_present", return_value=True):

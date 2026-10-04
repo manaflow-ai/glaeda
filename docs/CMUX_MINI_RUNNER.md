@@ -465,7 +465,12 @@ or pass `--name` with the existing name to relabel it in place.
 A manifest class carries a runner count and the capacity units they share
 (defaults: `std` 4 runners and 4 units, `light` 2 and 2, `xl` 8 and 8). Override
 them with `defaults.runner.classes.<class>` `{"runners": N, "capacityUnits": U,
-"compileSlots": C}`, or per host under `overrides.runner.classes.<class>`.
+"compileSlots": C}`, or per host under `overrides.runner.classes.<class>`. A
+dedicated pool can set `runner.poolPrefix` to a lowercase prefix such as
+`aws-`; its pool, root, side, and GUI labels then become
+`glaeda-aws-std-xcode-26.3`, `glaeda-aws-root-std-xcode-26.3`, and their
+corresponding role labels. Keep that namespace in the CI pool allowlist so
+ordinary `glaeda-std-*` jobs cannot select it accidentally.
 `compileSlots` (default 1, at most U/2) is how many compiles run at once, one
 `persistent-dd` token each (`persistent-dd.token`, `persistent-dd-1.token`, ...).
 Raise it only once cmux's compile admission keeps its canonical root and kept
