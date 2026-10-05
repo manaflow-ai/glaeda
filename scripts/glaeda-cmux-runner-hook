@@ -1618,6 +1618,32 @@ def pid_alive(pid: int) -> bool:
     return True
 
 
+def process_identity(pid: int) -> str | None:
+    """Return a process start token so a reused PID cannot keep a job holder alive."""
+    if pid <= 1:
+        return None
+    proc = Path(f"/proc/{pid}/stat")
+    try:
+        fields = proc.read_text(encoding="ascii").rsplit(")", 1)[1].split()
+        if len(fields) > 19:
+            return "proc:" + fields[19]
+    except (OSError, UnicodeDecodeError, IndexError):
+        pass
+    try:
+        result = subprocess.run(["/bin/ps", "-o", "lstart=", "-p", str(pid)],
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                timeout=2, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    token = result.stdout.strip()
+    return "ps:" + token if result.returncode == 0 and token else None
+
+
+def process_alive(pid: int, identity: str) -> bool:
+    """Require both liveness and the same process instance, not just the numeric PID."""
+    return pid_alive(pid) and process_identity(pid) == identity
+
+
 # Idle catch-up (glaeda-idle-warm): while a mini is idle and a root's kept build is far from main, it holds that
 # root's token, a persistent-dd token and a compile's units (flocks under the capacity dir, like a job) and builds
 # main's head into the root's kept state. Any job comes first. take_capacity stops it and waits for its locks to
@@ -2226,6 +2252,10 @@ def hold(fds: list[int], watch_pid: int, state_dir: Path, drop: tuple[int, ...] 
     Closes this process's copies either way. The holder closes `drop` (locks that must not outlive the
     admission). Succeeds only once the holder reports its own pid. pid_file defaults to the runner's
     holder file; take-root passes its own so a second holder for the same job lives beside it."""
+    watch_identity = process_identity(watch_pid)
+    if watch_identity is None:
+        close_all(fds)
+        return False, f"the watched process {watch_pid} has no stable identity"
     try:
         state_dir.mkdir(parents=True, exist_ok=True)
         pid_file = pid_file or holder_file(state_dir)
@@ -2260,7 +2290,7 @@ def hold(fds: list[int], watch_pid: int, state_dir: Path, drop: tuple[int, ...] 
             os.write(ready_w, me.encode())
             os.close(ready_w)
             deadline = time.monotonic() + HOLDER_MAX_S
-            while pid_alive(watch_pid) and time.monotonic() < deadline:
+            while process_alive(watch_pid, watch_identity) and time.monotonic() < deadline:
                 try:
                     if pid_file.read_text().strip() != me:
                         break  # job-completed released it

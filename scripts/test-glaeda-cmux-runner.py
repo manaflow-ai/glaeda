@@ -528,6 +528,11 @@ class HookTest(unittest.TestCase):
             time.sleep(0.2)
         self.assertTrue(self.lock_free())
 
+    def test_holder_does_not_follow_a_reused_watcher_pid(self) -> None:
+        with mock.patch.object(hook, "pid_alive", return_value=True), \
+                mock.patch.object(hook, "process_identity", return_value="ps:new"):
+            self.assertFalse(hook.process_alive(73305, "ps:old"))
+
     def test_stale_holder_file_is_not_success(self) -> None:
         self.fleet()
         state = self.dir / "state"

@@ -1081,6 +1081,7 @@ def preflight_text(user: str = "builder", brew_owner: str | None = "builder", zi
     if rust:
         tools.update({"cargo": ("/opt/homebrew/bin/cargo", "cargo 1.88.0 (abc 2025-06-23)"),
                       "rustc": ("/opt/homebrew/bin/rustc", "rustc 1.88.0 (abc 2025-06-23)"),
+                      "rustdoc": ("/opt/homebrew/bin/rustdoc", "rustdoc 1.88.0 (abc 2025-06-23)"),
                       "rustup": ("/opt/homebrew/bin/rustup", "rustup 1.29.1 (2026-08-13)")})
     for tool in mf.bootstrap.MACOS_WORKLOAD_TOOLS:
         path, version = tools.get(tool, ("", ""))
@@ -1143,6 +1144,14 @@ class PreflightTests(unittest.TestCase):
         self.assertTrue(result["ready"], result)
         self.assertEqual({k for k, v in result["checks"].items() if v["state"] not in {"ok", "info"}}, set())
         self.assertEqual(list(result["checks"]), list(mf.PREFLIGHT_CHECKS))
+
+    def test_missing_rustdoc_is_a_repairable_rust_toolchain_failure(self) -> None:
+        text = preflight_text().replace("pf_tool\trustdoc|/opt/homebrew/bin/rustdoc|rustdoc 1.88.0 (abc 2025-06-23)\n", "")
+        result = self.result(text)
+        self.assertFalse(result["ready"])
+        self.assertEqual(result["checks"]["rust"]["state"], "fail")
+        self.assertIn("rustdoc", result["checks"]["rust"]["detail"])
+        self.assertIn("rustdoc", result["checks"]["rust"]["fix"])
 
     def test_the_austin_mini_morning_is_found_in_one_pass(self) -> None:
         # 2026-09-24, cmux-austin-mini-1: every one of these showed up only after the previous fix.
@@ -1564,7 +1573,7 @@ class PreflightScriptTests(unittest.TestCase):
             runner.mkdir()
             (runner / ".runner").write_text('﻿{\n  "agentName": "mini-1",\n  "serverUrl": "https://secret.example/"\n}\n')
             header = (f"CMUX_ROOT='~/cmux'\nXCODE_PIN=''\nWORKLOAD_PATH={tools}\n"
-                      f"WORKLOAD_TOOLS='cargo git zig rustup'\nPYTHONS=''\nCANDIDATE_PIN={'ab' * 20}\n"
+                      f"WORKLOAD_TOOLS='cargo git rustdoc zig rustup'\nPYTHONS=''\nCANDIDATE_PIN={'ab' * 20}\n"
                       "ENROLL_FLAGS='--renew --class-receipt --fleet-class'\nPIN_FORMULAS='zig'\n")
             # The whole SSH payload, probe first, as observe_host sends it.
             script = mf.PROBE.read_text() + "\n" + header + mf.PREFLIGHT_PROBE.read_text()
@@ -1842,6 +1851,7 @@ class SudoPlanTests(unittest.TestCase):
                                            "xcodebuild -license accept", "xcodebuild -runFirstLaunch",
                                            "sudo pmset -c sleep 0", "sudo pmset -a autorestart 1",
                                            "sudo -H -u admin env HOMEBREW_NO_ASK=1 /opt/homebrew/bin/brew", "for f in rustup zig",
+                                           "for t in cargo rustc rustdoc rustup",
                                            'sudo -H -u admin ln -s "/opt/homebrew/opt/rustup/bin/$t"')]
         self.assertEqual(order, sorted(order))
         self.assertEqual(script.count("sudo -v\n"), 1)

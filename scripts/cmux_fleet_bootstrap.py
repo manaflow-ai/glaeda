@@ -25,11 +25,11 @@ CMUX_REPOSITORY = "manaflow-ai/cmux"
 # The fixed part of the PATH the CMUX profile runner hands its workload, from
 # `workload_environment` in the repository's scripts/ci/cmux_workload_profile.py.
 # The runner prepends a per-attempt Cargo home that it creates empty, so these
-# six directories are everything a build can actually reach.
+# these directories are everything a build can actually reach.
 CMUX_WORKLOAD_TOOL_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 # Tools the CMUX developer build itself invokes, as opposed to the ones this
 # script runs to describe the machine.
-MACOS_WORKLOAD_TOOLS = ("cargo", "git", "rustc", "rustup", "xcodebuild", "xcrun", "zig")
+MACOS_WORKLOAD_TOOLS = ("cargo", "git", "rustc", "rustdoc", "rustup", "xcodebuild", "xcrun", "zig")
 LINUX_WORKLOAD_TOOLS = ("git", "python3")
 # Free disk a macOS build host needs before admission: a base so a macOS update can download
 # and install, plus one cmux working set per concurrent build slot. A working set is at most
@@ -84,6 +84,7 @@ class BootstrapError(RuntimeError):
 TOOL_FIXES = {
     "cargo": "brew install rustup as the Homebrew owner, then link its cargo, rustc and rustup proxies into /opt/homebrew/bin",
     "rustc": "brew install rustup as the Homebrew owner, then link its cargo, rustc and rustup proxies into /opt/homebrew/bin",
+    "rustdoc": "brew install rustup as the Homebrew owner, then link its rustdoc proxy into /opt/homebrew/bin",
     "rustup": "brew install rustup as the Homebrew owner, then link its cargo, rustc and rustup proxies into /opt/homebrew/bin",
     "zig": "brew install zig as the Homebrew owner (Ghostty needs the version in ghostty/build.zig.zon)",
     "git": "xcode-select --install, or select an Xcode with sudo xcode-select -s",
@@ -108,7 +109,7 @@ BLOCKING_FIXES = {
     "profileRunnerInterpreter": "run the bootstrap with Python 3.13 or newer (os.waitid)",
     "workloadToolPath": "put every build tool in /opt/homebrew/bin or /usr/local/bin (see toolsMissingFromWorkloadPath)",
     "zig": "install the zig Ghostty needs: " + TOOL_FIXES["zig"],
-    "rust": "rustup, cargo and rustc must run in the cmux checkout: rustup toolchain install <channel in Native/DiffSidecar/rust-toolchain.toml>",
+    "rust": "rustup, cargo, rustc and rustdoc must run in the cmux checkout: rustup toolchain install <channel in Native/DiffSidecar/rust-toolchain.toml>",
     "metalToolchain": METAL_FIX,
     "glaedaExecutable": "install or stage the glaeda binary (glaeda-mini-enroll does this)",
     "diskAdmission": "free disk space (glaeda-disk shows where it went)",

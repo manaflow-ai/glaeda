@@ -1956,15 +1956,15 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
 
     # Build tools on the workload's fixed PATH, with versions.
     tools = pf.get("tools", {})
-    missing_rust = [t for t in ("rustup", "cargo", "rustc") if not (tools.get(t) or {}).get("path")]
-    broken_rust = [t for t in ("rustup", "cargo", "rustc") if t not in missing_rust
+    missing_rust = [t for t in ("rustup", "cargo", "rustc", "rustdoc") if not (tools.get(t) or {}).get("path")]
+    broken_rust = [t for t in ("rustup", "cargo", "rustc", "rustdoc") if t not in missing_rust
                    and not (tools[t]["version"] or "").startswith(f"{t} ")]
     channel = pf.get("rust_channel")
     default_wanted = declared.get("rustup_default")
     default_got = pf.get("rust_default")
     if missing_rust:
         put("rust", "fail", f"not on the workload PATH: {', '.join(missing_rust)}",
-            f"{as_owner}brew install rustup; link its cargo, rustc and rustup proxies into /opt/homebrew/bin", brew_group,
+            f"{as_owner}brew install rustup; link its cargo, rustc, rustdoc and rustup proxies into /opt/homebrew/bin", brew_group,
             brew("rustup"))
     elif default_wanted and default_got is not None and default_got != default_wanted and \
             not default_got.startswith((f"{default_wanted}-", f"{default_wanted} ")):
@@ -2358,7 +2358,7 @@ HOMEBREW_REPO = "https://github.com/Homebrew/brew"
 FIX_TIMEOUTS = {"cmux_clone": 1800, "submodules": 1800, "brew": 5400, "rust_channel": 1800, "glaeda": 1800,
                 "metal": 3600, "setup": 5400, "python": 1800, "candidate": 1800, "homebrew_fetch": 1800,
                 "glaeda_sync": 900}
-RUSTUP_PROXIES = ("cargo", "rustc", "rustup")
+RUSTUP_PROXIES = ("cargo", "rustc", "rustdoc", "rustup")
 BREW_STAGE = "Library/Caches/glaeda/share/homebrew/downloads"  # under the login user's home; see share brew
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or Path("~/.local/state").expanduser()) / "glaeda" / "mini-fleet"
 OPERATOR_CACHE = Path(os.environ.get("GLAEDA_MINI_FLEET_CACHE", "~/Library/Caches/glaeda/mini-fleet")).expanduser()
@@ -2425,7 +2425,7 @@ def describe(action: dict[str, Any]) -> str:
     if kind == "submodules":
         return f"initialize submodules in {action['root']}"
     if kind == "brew":
-        links = [what for formula, what in (("rustup", "the rustup proxies"), (BREW_PYTHON[0], "python3"))
+        links = [what for formula, what in (("rustup", "the cargo, rustc, rustdoc and rustup proxies"), (BREW_PYTHON[0], "python3"))
                  if formula in action["formulas"]]
         link = f", link {' and '.join(links)} into /opt/homebrew/bin" if links else ""
         pinned = [f for f in action["formulas"] if f in BREW_FORMULAS]
