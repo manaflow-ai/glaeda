@@ -59,8 +59,10 @@ root's newest one under pressure (two during idle sweeps), and a root's kept bui
 trusted seeder, a seed its serve log shows streamed whole to the seed archive (cmux-lawrence's SSD) is
 reclaimable at once instead of after the idle window: the PR minis restore it from there over the LAN.
 SwiftPM scratch (spm-scratch/<fingerprint>) that no job holds by its lock ages like any cache, and goes
-whatever its age once free space is below the emergency floor. The Chromium / cmux-browser trees and
-their caches are never deleted (NEVER_DELETE).
+whatever its age once free space is below the emergency floor. The Chromium source tree under
+cmux-browser-fleet/build and protected release-support caches are never deleted. Small top-level
+browser tour artifacts and fleet cache entries older than the 2026-09-17 migration cutoff are
+disposable; newer ones stay when a live reservation or lease names them.
 
 Free space is judged per filesystem. On Linux /tmp is often its own tmpfs, so pressure there
 reclaims only /tmp items, and pressure on the home filesystem never deletes from /tmp.
@@ -87,7 +89,9 @@ build output or copies. Nested or unverifiable checkouts stay protected.
 from __future__ import annotations
 
 import argparse
+import atexit
 import bisect
+import calendar
 import contextlib
 import fcntl
 import json
@@ -97,6 +101,7 @@ import pwd
 import math
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -112,6 +117,9 @@ MEASURE_LOCK = HOME / ".cache/glaeda-disk/measure.lock"
 ACCOUNTING = HOME / ".cache/glaeda-disk/accounting.json"
 HEALTH_SUMMARY = HOME / ".local/state/glaeda/disk/summary.json"
 EVICT_LOCK = HOME / ".cache/glaeda-disk/evict.lock"  # one --apply at a time (the runner hooks and the LaunchAgent)
+EVICT_OWNER = HOME / ".cache/glaeda-disk/evict.owner.json"
+EVICT_OWNER_STALE_S = 30 * 60
+RUNNER_HELD_DIR = ".local/state/glaeda/mini-fleet/runner-held"
 # Items a nested_git family kept for a git loss, so a dead session with unpushed work is not
 # re-walked every run. Only keep verdicts are cached: a stale entry can delay a deletion, never cause one.
 NESTED_KEEP = HOME / ".cache/glaeda-disk/nested-keep.json"
@@ -123,6 +131,21 @@ DEDUPE_SUBDIRS = ("SourcePackages", "ModuleCache.noindex", "SDKExplicitPrecompil
 DEDUPE_MIN_BYTES = 1024 * 1024
 GIB = 1024**3
 DARWIN = platform.system() == "Darwin"
+# A blocked filesystem walk must not hold evict.lock or pause a runner indefinitely.  A walk that
+# cannot finish in this window is left unsized and retried on a later report; it never becomes a
+# zero-byte reclaim candidate.
+DU_TIMEOUT_S = 30
+DU_KILL_GRACE_S = 1
+EVICTION_STUCK: list[dict[str, Any]] = []
+_EVICT_HANDLE = None
+
+# Never ask du to enumerate the data volume. These are the bounded roots that account for
+# runner work and rebuildable state on a mini. Cloud/FileProvider placeholders can block in
+# the kernel while opening a directory, so they are excluded before a walk starts.
+MEASURE_SKIP_COMPONENTS = frozenset({
+    "FileProvider", "CloudStorage", "Mobile Documents", ".DocumentRevisions-V100",
+    "com.apple.FileProvider", "com.apple.CloudDocs",
+})
 
 
 @dataclass(frozen=True)
@@ -157,6 +180,11 @@ class Family:
     # candidates are the build outputs inside the checkouts under root (checkout_builds), not root's children
     checkout_builds: bool = False
     retired_only: bool = False  # reclaim only with fresh evidence the declared service is unloaded
+    # Fleet artifacts use a fixed migration cutoff. Older cruft is eligible immediately; newer
+    # entries follow the normal idle window and are protected when a live lease names them.
+    stale_before: float | None = None
+    allow_stale_protected: bool = False  # permit an explicit family below NEVER_DELETE roots
+    reference_root: Path | None = None  # root containing lease/job markers for this family
 
 
 def idle_window(fam: Family, idle_hours: float) -> float:
@@ -170,6 +198,10 @@ def idle_window(fam: Family, idle_hours: float) -> float:
 # name matches NEVER_DELETE_NAMES, is dropped before it is judged.
 NEVER_DELETE = ("cmux-browser-fleet", "Library/Caches/cmux-release-support", "Library/Caches/siso")  # under HOME
 NEVER_DELETE_NAMES = re.compile(r"chromium|cmux-browser|siso|depot_tools|cmux-release-support|vpython|cipd", re.I)
+# Leo's fleet cleanup cutoff: artifacts predating this migration are known cruft. Keep this as
+# an epoch so the comparison is deterministic on hosts in any local timezone.
+ARTIFACT_CUTOFF = calendar.timegm((2026, 9, 17, 0, 0, 0))
+FLEET_ROOT = Path("/Users/Shared/cmux-build-fleet")
 
 
 def never_delete(path: Path) -> bool:
@@ -181,6 +213,55 @@ def never_delete(path: Path) -> bool:
         if p == k or p.startswith(k + "/") or k.startswith(p + "/"):
             return True
     return False
+
+
+_LIVE_REFERENCES: dict[str, frozenset[str]] = {}
+
+
+def live_artifact_references(root: Path = FLEET_ROOT) -> frozenset[str]:
+    """Return paths named by active fleet reservations or leases, using read-only evidence."""
+    key = os.fspath(root)
+    if key in _LIVE_REFERENCES:
+        return _LIVE_REFERENCES[key]
+    refs: set[str] = set()
+    now = time.time()
+    reservation = root / "reservation.json"
+    try:
+        doc = json.loads(reservation.read_text())
+        if doc.get("schema") == "glaeda-reservation/v1" and float(doc["until"]) > now:
+            refs.add(os.path.realpath(root))
+    except (OSError, ValueError, TypeError, KeyError):
+        pass
+    # Jobs and product leases are small JSON markers. Old history and empty lock files must not
+    # pin the whole cache forever.
+    for base in (root / "node-products/leases", root / "jobs", root / "job-volumes"):
+        if not base.is_dir():
+            continue
+        try:
+            paths = [p for p in base.rglob("*") if p.is_file() and p.stat().st_size <= 1 << 20]
+        except OSError:
+            continue
+        for marker in paths:
+            try:
+                text = marker.read_text(errors="replace")
+                doc = json.loads(text)
+                state = str(doc.get("state", "")).lower()
+                until = float(doc.get("until", 0) or 0)
+                active = until > now or state in {"active", "running", "leased", "reserved", "started"}
+            except (OSError, ValueError, TypeError, AttributeError):
+                continue
+            if not active:
+                continue
+            for match in re.findall(r"/(?:Users|private|tmp|var)/[^\s\"']+", text):
+                refs.add(os.path.realpath(match.rstrip(",]}")))
+    result = frozenset(refs)
+    _LIVE_REFERENCES[key] = result
+    return result
+
+
+def artifact_referenced(path: Path, references: frozenset[str]) -> bool:
+    p = os.path.realpath(path)
+    return any(p == ref or p.startswith(ref + os.sep) or ref.startswith(p + os.sep) for ref in references)
 
 
 # cmux CI's warm state on an owned mini (cmux scripts/ci/owned_build_state.py, seed_derived_data.py).
@@ -202,7 +283,8 @@ def fleet_stores(ci: Path | None = None) -> list[Path]:
                         if p.name[len("cmux-ci-"):].isdigit() and p.is_dir() and not p.is_symlink())]
 
 
-FLEET_FAMILY_IDS = ("cmux-pr-builds", "cmux-seeds", "cmux-kept-build", "ci-derived-data")
+FLEET_FAMILY_IDS = ("cmux-pr-builds", "cmux-seeds", "cmux-kept-build", "ci-derived-data",
+                    "ci-ios-derived-data")
 
 
 def fleet_families(ci: Path | None = None) -> list[Family]:
@@ -229,6 +311,15 @@ def fleet_families(ci: Path | None = None) -> list[Family]:
     if fams:  # root 1's store is the mini's, and the only one that holds SwiftPM scratch (cmux mini_store)
         fams.append(spm_scratch_family(fleet_stores(ci)[0]))
     return fams
+
+
+def ci_ios_family(root: Path | None = None) -> Family:
+    """DerivedData left by the iOS runner pool, one generation per runner."""
+    root = FLEET_ROOT / "ci-ios" if root is None else root
+    return Family("ci-ios-derived-data", root, True,
+                  "the next iOS job rebuilds its DerivedData", depth=2,
+                  match="derived-data", build_output=True,
+                  reference_root=FLEET_ROOT, owner="cmux iOS CI jobs", rebuild_minutes=8)
 
 
 # cmux CI's SwiftPM scratch (cmux scripts/ci/owned_spm_scratch.py): swift-package-tests links each package's .build
@@ -702,7 +793,11 @@ def xcode_items(apps: Path = Path("/Applications"), pins: dict[str, str] | None 
         pin = pins.get(os.path.realpath(app))
         why = [f"Xcode {version}, owned by {owner}",
                f"pinned by {pin}" if pin else "no pin names it: remove it by hand if no workflow uses it"]
-        items.append(Item("xcode-apps", str(app), du_bytes(app), 0.0, "report-only", why))
+        size = du_bytes(app)
+        if size is None:
+            size = 0
+            why.append("size walk timed out; size is unsized")
+        items.append(Item("xcode-apps", str(app), size, 0.0, "report-only", why))
     return items
 
 
@@ -871,7 +966,11 @@ def darwin_user_tmp() -> Path | None:
     It is not /private/tmp, so scratch that tools create with mktemp or tempfile lands here
     unseen: 14.5 GiB of throwaway cmux copies and build traces sat in it on Air Blue (2026-09-25).
     """
-    out = subprocess.run(["getconf", "DARWIN_USER_TEMP_DIR"], capture_output=True, text=True)
+    try:
+        out = subprocess.run(["getconf", "DARWIN_USER_TEMP_DIR"], capture_output=True, text=True,
+                             timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
     value = out.stdout.strip() if out.returncode == 0 else ""
     if not value:
         return None
@@ -913,11 +1012,12 @@ def default_families() -> list[Family]:
                rebuild_minutes=0.5),
         # cmux's cloud reload and CI jobs keep warm trees per unit (reload-cloud/{cmux-base,work},
         # reload-cloud-ios/{DerivedData,work}); a build mini grew 36 GiB here within hours. Depth 2
-        # so a unit's DerivedData can go (see derived_data) while the clones below cmux-base and work
-        # stay protected; hq's cleanup-host.sh ages those out.
+        # so a unit's DerivedData can go while the clones below cmux-base and work stay protected.
+        # Reload-cloud state must be at least a day old before this pass considers it; pressure
+        # runs therefore cannot erase a slot that was used earlier in the same day.
         Family("cmux-job-cache", HOME / ".cache/cmux-job", True,
                "next cmux reload or CI job rebuilds it (cold)", depth=2, git_disposable=True,
-               owner="cmuxterm-hq reload-cloud scripts", rebuild_minutes=30),
+               owner="cmuxterm-hq reload-cloud scripts", rebuild_minutes=30, min_idle_hours=24.0),
         # Caches are disposable by definition; an idle one goes under pressure, a live one (go-build
         # while a Go build runs) stays recent. Any git data inside keeps it, as everywhere else.
         Family("user-cache", HOME / ".cache", True, "the tool re-downloads or rebuilds it",
@@ -931,7 +1031,8 @@ def default_families() -> list[Family]:
                skip=("glaeda", "PassKit", "tidy-branches", "CloudKit", "GeoServices", "FamilyCircle",
                      "familycircled", "GameKit", "askpermissiond", "mbuseragent", "AMSDataMigratorTool",
                      "PHTPhenotype", "SharedImageCache", "Animoji", "SiriTTS", "GIPPseudonymousID"),
-               skip_prefixes=("com.apple.",), owner="apps", rebuild_minutes=5),
+               skip_prefixes=("com.apple.",), owner="apps", rebuild_minutes=5,
+               stale_before=ARTIFACT_CUTOFF, reference_root=FLEET_ROOT),
         # Sealed caches (cache_layout) anywhere else in the home directory: ~/.npm/_cacache,
         # ~/.bun/install/cache, ~/.cargo/registry, ~/go/pkg/mod, rustup toolchains. Found by content,
         # so a tool this list never heard of is covered once its cache has a recognized layout.
@@ -963,6 +1064,24 @@ def default_families() -> list[Family]:
     if DARWIN and bazel_user:
         fams.append(bazel_family(Path(f"/private/var/tmp/_bazel_{bazel_user}")))
     if DARWIN:  # the owned cmux minis
+        # These roots contain disposable build products outside the CI hot tier. Keep Chromium's
+        # source tree under cmux-browser-fleet/build, but allow old top-level tour artifacts and
+        # fleet cache entries to age out. A live reservation/lease still protects referenced paths.
+        fleet_cache = FLEET_ROOT / "cache"
+        if fleet_cache.is_dir():
+            fams.append(Family("fleet-artifacts", fleet_cache, True,
+                               "the fleet worker rebuilds or fetches the artifact", depth=1,
+                               files=True, allow_stale_protected=True, stale_before=ARTIFACT_CUTOFF,
+                               reference_root=FLEET_ROOT, owner="cmux fleet worker", rebuild_minutes=8))
+        ci_ios = FLEET_ROOT / "ci-ios"
+        if ci_ios.is_dir():
+            fams.append(ci_ios_family(ci_ios))
+        browser = HOME / "cmux-browser-fleet"
+        if browser.is_dir():
+            fams.append(Family("browser-artifacts", browser, True,
+                               "the browser tour rebuilds the artifact", depth=1, files=True,
+                               skip=("build",), allow_stale_protected=True, stale_before=ARTIFACT_CUTOFF,
+                               reference_root=FLEET_ROOT, owner="cmux browser fleet", rebuild_minutes=20))
         fams += fleet_families()
         for runner in HOME.glob("actions-runner*"):
             temp = runner / "_work/_temp"
@@ -1000,22 +1119,120 @@ class Item:
     jobs_since: int | None = None  # host CI jobs started since its last use (activity_due), when counted
 
 
-def du_bytes(path: Path) -> int:
-    out = subprocess.run(["du", "-xsk", str(path)], capture_output=True, text=True)
+def _record_eviction_stuck(argv: list[str]) -> None:
+    path = str(argv[-1]) if argv else "unknown"
+    EVICTION_STUCK.append({"id": "eviction_stuck", "severity": "error", "path": path,
+                           "evidence": f"du timed out after {DU_TIMEOUT_S}s",
+                           "auto_fix": "pending"})
+
+
+def _measurement_path_allowed(path: Path) -> bool:
+    """Reject the volume root and known privacy/FileProvider trees before invoking du."""
     try:
-        return int(out.stdout.split()[0]) * 1024
+        absolute = Path(os.path.abspath(path))
+    except (OSError, ValueError):
+        return False
+    if absolute == Path("/") or any(part in MEASURE_SKIP_COMPONENTS for part in absolute.parts):
+        return False
+    try:
+        st = absolute.stat()
+    except OSError:
+        return False
+    # Newer macOS exposes a dataless flag on some FileProvider placeholders.  Python's
+    # stat module does not define it on every SDK, so probe the platform value when present.
+    dataless = getattr(stat, "UF_DATALESS", 0)
+    return not bool(getattr(st, "st_flags", 0) & dataless)
+
+
+def fixed_measurement_roots() -> list[Path]:
+    """Return only bounded, rebuildable roots used for volume accounting.
+
+    This deliberately does not include ``/``: FileProvider and other privacy-protected
+    directories can block a recursive fts walk in the kernel for hours.
+    """
+    candidates: list[Path] = [
+        # Keep known-heavy fleet roots separate. A single du of the shared
+        # fleet tree can hold evict.lock long enough to starve admission.
+        FLEET_ROOT / "cache",
+        FLEET_ROOT / "ci",
+        FLEET_ROOT / "ci-ios",
+        FLEET_ROOT / "ci-ios-packages",
+        FLEET_ROOT / "job-volumes",
+        FLEET_ROOT / "logs",
+        HOME / "cmux-browser-fleet",
+        HOME / "Library/Caches",
+        HOME / "Library/Developer/Xcode/DerivedData",
+        HOME / "Library/Developer/CoreSimulator",
+        HOME / ".cache",
+    ]
+    candidates.extend(sorted(HOME.glob("actions-runner*/_work")))
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for path in candidates:
+        resolved = Path(os.path.abspath(path))
+        key = os.fspath(resolved)
+        if key in seen or resolved == Path("/") or any(part in MEASURE_SKIP_COMPONENTS for part in resolved.parts):
+            continue
+        seen.add(key)
+        # Keep configured roots in the list even before the directory is created; accounting
+        # will simply skip a missing root, and tests can substitute a bounded fake root.
+        roots.append(resolved)
+    return roots
+
+
+def _du_output(argv: list[str]) -> str | None:
+    """Run one du walk with a killable process group; None means the tree is unsized."""
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            out, _ = proc.communicate(timeout=DU_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            # du can be stuck in a kernel open() on a dead or remote filesystem.  Kill the group
+            # and do not wait indefinitely for a post-kill read: callers must remain fail-closed.
+            with contextlib.suppress(OSError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.communicate(timeout=DU_KILL_GRACE_S)
+            _record_eviction_stuck(argv)
+            return None
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+    return out
+
+
+def du_bytes(path: Path) -> int | None:
+    if not _measurement_path_allowed(path):
+        return None
+    out = _du_output(["du", "-xsk", str(path)])
+    if out is None:
+        return None
+    try:
+        return int(out.split()[0]) * 1024
     except (IndexError, ValueError):
-        return 0
+        return None
 
 
 BULK_SIZE_MIN = 64  # unsized candidates in a bulk_sizes family before one walk beats per-item du
 
 
-def du_children(root: Path) -> dict[str, int]:
+def du_children(root: Path) -> dict[str, int] | None:
     """Sizes of every directory directly below root from a single walk, keyed like candidates."""
-    out = subprocess.run(["du", "-xk", "-d", "1", str(root)], capture_output=True, text=True)
+    if not _measurement_path_allowed(root):
+        return None
+    out = _du_output(["du", "-xk", "-d", "1", str(root)])
+    if out is None:
+        return None
     sizes: dict[str, int] = {}
-    for line in out.stdout.splitlines():
+    for line in out.splitlines():
         fields = line.split(None, 1)
         if len(fields) == 2 and fields[1] != str(root) and fields[0].isdigit():
             sizes[str(root / Path(fields[1]).name)] = int(fields[0]) * 1024
@@ -1124,6 +1341,53 @@ def command_lines() -> str:
     except (OSError, subprocess.TimeoutExpired):
         return ""
     return command_text(ps.stdout) if ps.returncode == 0 else ""
+
+
+def cleanup_paused_runner_work(receipt: Path) -> int:
+    """Clear only disposable ``_work/cmux`` trees for explicitly held, idle runners.
+
+    A runner-held marker is the drain path's ownership signal.  We additionally require that
+    neither its Listener nor Worker is present and that process evidence cannot name the tree.
+    This keeps a service outage or an active job from turning a routine pressure pass into a
+    destructive cleanup.
+    """
+    held_root = HOME / RUNNER_HELD_DIR
+    if not held_root.is_dir():
+        return 0
+    try:
+        opened, commands = process_evidence()
+    except NoEvidence:
+        return 0
+    opened = open_index(opened)
+    released = 0
+    for runner in sorted(HOME.glob("actions-runner*")):
+        if not (runner / ".runner").is_file() or not (runner / "glaeda-hooks").is_dir():
+            continue
+        if not (held_root / runner.name).is_file():
+            continue
+        root = runner / "_work/cmux"
+        if not root.is_dir() or in_cwd(os.fspath(root), opened) or named_by(os.fspath(root), commands):
+            continue
+        if cmux_active(root):
+            continue
+        prefix = re.escape(os.fspath(runner))
+        if re.search(prefix + r"/bin/Runner\.(?:Listener|Worker)(?:\s|$)", commands):
+            continue
+        size = du_bytes(root)
+        if size is None:
+            continue
+        try:
+            remove(root)
+        except OSError:
+            continue
+        rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(),
+               "outcome": "reclaimed", "family": "paused-runner-work", "path": os.fspath(root),
+               "bytes": size, "verdict": "reclaimable", "reasons": ["runner-held", "listener-idle"]}
+        with receipt.open("a") as f:
+            f.write(json.dumps(rec) + "\n")
+        print(f"  reclaimed {gib(size).strip():>8s}  {root}")
+        released += size
+    return released
 
 
 def command_text(ps_output: str) -> str:
@@ -2242,7 +2506,7 @@ def candidates(fam: Family) -> list[Path]:
     uid = os.getuid()
     owned = []
     for p in level:
-        if never_delete(p):
+        if never_delete(p) and not fam.allow_stale_protected:
             continue
         try:
             if p.lstat().st_uid == uid:
@@ -2332,11 +2596,16 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False) 
     for fam in families:
         # a few new entries are cheaper to size one by one than by re-walking the whole root
         if fam.bulk_sizes and sum(str(p) not in known for f, p in work if f is fam) >= BULK_SIZE_MIN:
-            known.update({k: v for k, v in du_children(fam.root).items() if k not in known})
+            walked = du_children(fam.root)
+            if walked is not None:
+                known.update({k: v for k, v in walked.items() if k not in known})
     missing = [path for _, path in work if str(path) not in known]
     with ThreadPoolExecutor(max_workers=8) as pool:
         measured = dict(zip(map(str, missing), pool.map(du_bytes, missing)))
-    known.update(measured)
+    # A failed walk is unsized, never zero bytes.  Do not put it in the snapshot or judge it for
+    # reclaim; the next report will retry it without allowing a stale zero to hide the tree.
+    known.update({path: size for path, size in measured.items() if size is not None})
+    work = [(fam, path) for fam, path in work if str(path) in known]
     sizes = [known[str(path)] for _, path in work]
     floors = [min_bytes if fam.min_bytes is None else fam.min_bytes for fam, _ in work]
     idles = [(now - item_mtime(fam, path)) / 3600
@@ -2347,6 +2616,7 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False) 
     except NoEvidence as e:
         cwds, cmds, blind = [], "", f"no process evidence ({e})"
     opened = open_index(cwds)
+    references_by_root: dict[str, frozenset[str]] = {}
     archived = archived_seeds() if any(fam.id == "cmux-seeds" for fam, _ in work) else frozenset()
     for (fam, path), size, idle, floor in zip(work, sizes, idles, floors):
         if size < floor:
@@ -2361,6 +2631,12 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False) 
             reasons.append("named by a running command")
         if fam.id == "claude-scratchpad" and claude_session_active(path.name, idle_hours * 3600):
             reasons.append("claude session active")
+        references = frozenset()
+        if fam.reference_root is not None:
+            key = os.fspath(fam.reference_root)
+            references = references_by_root.setdefault(key, live_artifact_references(fam.reference_root))
+            if artifact_referenced(path, references):
+                reasons.append("live lease or running job")
         if fam.id == SPM_SCRATCH and spm_scratch_held(path):
             reasons.append("a job holds its lock (owned_spm_scratch.py)")
         # The tree walks below cost seconds each on a loaded host, and a recent item is kept anyway,
@@ -2368,6 +2644,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False) 
         window = item_window(fam, path, idle_hours, archived)
         keep = keep_verdict(fam, path)
         due, jobs = item_due(fam, idle, window)
+        if fam.stale_before is not None and item_mtime(fam, path) <= fam.stale_before:
+            due = True
         if jobs is not None:
             reasons_jobs = f"{jobs} host jobs since its last use"
         deletable_age = fam.reclaimable and due
@@ -2576,9 +2854,27 @@ def filesystem_accounting(fss: list[Fs], items: list[Item]) -> list[dict[str, An
             top = hit.get("top_level") if isinstance(hit.get("top_level"), list) else []
             top_at = float(hit.get("at", 0))
         else:
-            top_map = du_children(Path(fs.mount))
-            top = [{"path": p, "bytes": n} for p, n in sorted(top_map.items(), key=lambda kv: -kv[1])[:32]]
-            top_at = now
+            # Account only bounded, known-heavy roots.  In particular, never call du on the
+            # filesystem mount itself: ``du -d1 /`` can enter a FileProvider/TCC directory and
+            # block in the kernel while holding the eviction lock.
+            top_map: dict[str, int] = {}
+            for root in fixed_measurement_roots():
+                try:
+                    if root.stat().st_dev != fs.dev or not _measurement_path_allowed(root):
+                        continue
+                except OSError:
+                    continue
+                size = du_bytes(root)
+                if size is not None:
+                    top_map[str(root)] = size
+            if not top_map:
+                # Keep a prior complete reading, if any, but leave its timestamp old so a later
+                # report retries.  An unsized root must not erase accounting or look fresh.
+                top = hit.get("top_level") if hit and isinstance(hit.get("top_level"), list) else []
+                top_at = float(hit.get("at", 0)) if hit else 0.0
+            else:
+                top = [{"path": p, "bytes": n} for p, n in sorted(top_map.items(), key=lambda kv: -kv[1])[:32]]
+                top_at = now
         _ACCOUNTING_MEM[(fs.dev, fs.mount)] = top
         measured = 0
         catalogued: list[tuple[Path, int]] = []
@@ -2615,6 +2911,7 @@ def write_health_summary(fss: list[Fs], items: list[Item], accounting: list[dict
         HEALTH_SUMMARY.parent.mkdir(parents=True, exist_ok=True)
         payload = {"schema": "glaeda-disk/v1", "at": int(time.time()),
                    "reclaimable": sum(i.bytes for i in items if i.verdict == "reclaimable"),
+                   "findings": list(EVICTION_STUCK),
                    "accounting": [dict(x) for x in accounting],
                    "filesystems": [{"mount": x.mount, "free": x.free, "total": x.total,
                                     "under": x.under} for x in fss]}
@@ -2623,6 +2920,111 @@ def write_health_summary(fss: list[Fs], items: list[Item], accounting: list[dict
         os.replace(tmp, HEALTH_SUMMARY)
     except OSError:
         pass
+
+
+def _owner_command(pid: int) -> str:
+    try:
+        result = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True,
+                                text=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return result.stdout.strip()
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _take_over_stale_evict_owner() -> bool:
+    """Stop only an identified, stale glaeda-disk owner so a lost lock cannot wedge evictions."""
+    try:
+        owner = json.loads(EVICT_OWNER.read_text())
+        pid = int(owner.get("pid", 0))
+        started = float(owner.get("started_at", 0))
+    except (OSError, ValueError, TypeError):
+        return False
+    if pid == os.getpid() or not started or time.time() - started < EVICT_OWNER_STALE_S:
+        return False
+    if not _pid_alive(pid):
+        # A dead owner has already released flock; retrying the acquisition is sufficient.
+        return True
+    command = _owner_command(pid)
+    if "glaeda-disk" not in command:
+        return False
+    with contextlib.suppress(OSError):
+        os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and _pid_alive(pid):
+        time.sleep(0.05)
+    if _pid_alive(pid):
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
+    return True
+
+
+def _write_evict_owner() -> None:
+    EVICT_OWNER.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"schema": "glaeda-disk/evict-owner/v1", "pid": os.getpid(),
+               "started_at": time.time(), "command": " ".join(sys.argv)}
+    tmp = EVICT_OWNER.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(payload, separators=(",", ":")))
+    os.replace(tmp, EVICT_OWNER)
+
+
+def acquire_evict_lock():
+    """Acquire the eviction lock and publish an owner record for stale-lock recovery."""
+    global _EVICT_HANDLE
+    EVICT_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    handle = EVICT_LOCK.open("a")
+    with contextlib.suppress(OSError):
+        fcntl.fcntl(handle.fileno(), fcntl.F_SETFD,
+                    fcntl.fcntl(handle.fileno(), fcntl.F_GETFD) | fcntl.FD_CLOEXEC)
+    for attempt in range(2):
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _write_evict_owner()
+            _EVICT_HANDLE = handle
+            return handle
+        except BlockingIOError:
+            if attempt == 0 and _take_over_stale_evict_owner():
+                time.sleep(0.05)
+                continue
+            handle.close()
+            return None
+    handle.close()
+    return None
+
+
+def release_evict_lock(handle) -> None:
+    global _EVICT_HANDLE
+    if handle is None:
+        return
+    try:
+        try:
+            owner = json.loads(EVICT_OWNER.read_text())
+        except (OSError, ValueError, TypeError):
+            owner = {}
+        if int(owner.get("pid", -1)) == os.getpid():
+            EVICT_OWNER.unlink(missing_ok=True)
+        fcntl.flock(handle, fcntl.LOCK_UN)
+    finally:
+        handle.close()
+        if _EVICT_HANDLE is handle:
+            _EVICT_HANDLE = None
+
+
+def _release_evict_lock_at_exit() -> None:
+    if _EVICT_HANDLE is not None:
+        release_evict_lock(_EVICT_HANDLE)
+
+
+atexit.register(_release_evict_lock_at_exit)
 
 
 def report(items: list[Item], fss: list[Fs], limit: int, idle_hours: float,
@@ -2849,7 +3251,7 @@ def clone_over(canonical: str, target: str, expect: list[int],
         return False
     tmp = os.path.join(os.path.dirname(target), f".{os.path.basename(target)}.glaeda-clone-{os.getpid()}")
     try:
-        subprocess.run(["/bin/cp", "-c", canonical, tmp], check=True, capture_output=True)
+        subprocess.run(["/bin/cp", "-c", canonical, tmp], check=True, capture_output=True, timeout=60)
         os.chmod(tmp, stat.S_IMODE(st.st_mode))
         os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
         if _file_key(os.lstat(target)) != expect:
@@ -2924,7 +3326,7 @@ def dedupe(roots: list[Path], state_path: Path = DEDUPE_STATE,
                 if ok:
                     new_state[target] = {"key": _file_key(os.lstat(target)), "sha": sha,
                                          "cloned": True}
-            except (OSError, subprocess.CalledProcessError):
+            except (OSError, subprocess.SubprocessError):
                 ok = False
                 new_state.pop(target, None)  # vanished or unreadable; rehash next run
             if ok:
@@ -3060,12 +3462,10 @@ def main(argv: list[str] | None = None) -> int:
             print(why)
             return 0
     if a.apply:
-        # a second eviction would only race the first for the same items; its caller re-reads free space instead
-        EVICT_LOCK.parent.mkdir(parents=True, exist_ok=True)
-        evict_lock = EVICT_LOCK.open("a")  # held until this process exits
-        try:
-            fcntl.flock(evict_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+        # A second eviction would only race the first for the same items; its caller re-reads free
+        # space instead.  The owner record lets a later run recover from a daemon that died while
+        # its lock descriptor remained open.
+        if acquire_evict_lock() is None:
             print("another eviction running; skipped")
             return 0
     idle = a.idle_hours if a.idle_hours is not None else IDLE_SWEEP_HOURS if sweep else (6 if under else 24)
@@ -3148,11 +3548,15 @@ def main(argv: list[str] | None = None) -> int:
         halt = host_busy if sweep and POLICY["defer_during_ci"] else None
         apply(items, {f.id: f for f in fams}, a.receipt,
               {fs.dev: fs.target for fs in shown} if a.pressure else None, idle, halt)
+        # A drained runner is explicitly held by cmux_mini_fix; once its listener and worker
+        # are absent, its disposable checkout can be cleared under this same eviction lock.
+        cleanup_paused_runner_work(a.receipt)
         if sweep:
             # deleting a runtime restarts CoreSimulatorService: never while a job may be using simulators
             apply_runtimes(tooling, a.receipt, host_busy)
             IDLE_STAMP.parent.mkdir(parents=True, exist_ok=True)
             IDLE_STAMP.touch()
+        release_evict_lock(_EVICT_HANDLE)
     return 0
 
 

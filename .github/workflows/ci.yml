@@ -261,6 +261,7 @@ jobs:
           bash -n scripts/cmux-fleet-bootstrap-macos
           bash -n scripts/cmux-fleet-bootstrap-linux
           bash -n scripts/glaeda-worktree-reclaim-all
+          bash -n scripts/disk-pressure.sh
           bash -n scripts/cmux_mini_probe.sh
           bash -n scripts/cmux_mini_preflight.sh
           bash -n scripts/cmux_mini_fix.sh

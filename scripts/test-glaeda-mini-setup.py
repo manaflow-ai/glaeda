@@ -140,7 +140,8 @@ class MiniSetupTest(unittest.TestCase):
                 seed = plistlib.loads((agents / "com.teamleaderleo.glaeda.seed-prefetch.plist").read_bytes())
                 disk = plistlib.loads((agents / "com.teamleaderleo.glaeda.disk-pressure.plist").read_bytes())
                 self.assertEqual(seed["ProgramArguments"][0], wanted)
-                self.assertEqual(disk["ProgramArguments"][0], "/opt/x/python3")
+                self.assertEqual(disk["ProgramArguments"], [os.fspath(self.home / ".local/bin/disk-pressure.sh"), "--once"])
+                self.assertEqual(disk["EnvironmentVariables"]["GLAEDA_PYTHON"], "/opt/x/python3")
         self.assertIsNone(ms.apple_python("linux"))
 
     def test_the_lan_fetch_broker_runs_apples_python_and_asks_for_a_root_owned_copy(self) -> None:
@@ -218,17 +219,21 @@ class MiniSetupTest(unittest.TestCase):
         first = self.invoke("--apply")
         self.assertTrue(first["applied"])
         bin_dir = self.home / ".local/bin"
-        for name in ("glaeda-disk", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all", "glaeda-wallpaper-rotate"):
+        for name in ("glaeda-disk", "disk-pressure.sh", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all"):
             self.assertTrue(os.access(bin_dir / name, os.X_OK), name)
         self.assertEqual((bin_dir / "glaeda-disk").read_bytes(), (ROOT / "scripts/glaeda-disk").read_bytes())
+        self.assertEqual((bin_dir / "disk-pressure.sh").read_bytes(), (ROOT / "scripts/disk-pressure.sh").read_bytes())
         for label in ("disk-pressure", "disk-dedupe", "worktree-reclaim", "fleet-cas-prune", "seed-prefetch"):
             path = self.home / f"Library/LaunchAgents/com.teamleaderleo.glaeda.{label}.plist"
             raw = path.read_bytes()
-            self.assertNotIn(b"/Users/leoli", raw)
+            self.assertNotIn(os.fsencode(os.fspath(ROOT)), raw)
             doc = plistlib.loads(raw)
             self.assertEqual(doc["Label"], f"com.teamleaderleo.glaeda.{label}")
-            for arg in doc["ProgramArguments"][1:2]:
-                self.assertTrue(arg.startswith(os.fspath(bin_dir)), arg)
+            if label == "disk-pressure":
+                self.assertEqual(doc["ProgramArguments"], [os.fspath(bin_dir / "disk-pressure.sh"), "--once"])
+            else:
+                for arg in doc["ProgramArguments"][1:2]:
+                    self.assertTrue(arg.startswith(os.fspath(bin_dir)), arg)
             self.assertTrue(doc["StandardOutPath"].startswith(os.fspath(self.home / "Library/Logs")))
             # dedupe is never urgent; pressure must still free space while a build fills the disk
             self.assertEqual(doc.get("ProcessType"),
@@ -245,10 +250,6 @@ class MiniSetupTest(unittest.TestCase):
         self.assertEqual(health["ProgramArguments"][1:], [os.fspath(bin_dir / "glaeda-mini-health"), "--apply"])
         self.assertEqual(health["StartInterval"], 120)
         self.assertEqual((bin_dir / "glaeda-mini-health").read_bytes(), (ROOT / "scripts/glaeda-mini-health").read_bytes())
-        wallpaper = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.wallpaper.plist").read_bytes())
-        self.assertEqual(wallpaper["ProgramArguments"][1:], [os.fspath(bin_dir / "glaeda-wallpaper-rotate")])
-        self.assertEqual((wallpaper["StartInterval"], wallpaper["RunAtLoad"]), (1800, True))
-        self.assertEqual(wallpaper["ProcessType"], "Background")
         guard = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.local-guard.plist").read_bytes())
         self.assertEqual(guard["ProgramArguments"][1:], [os.fspath(bin_dir / "glaeda-local-guard"), "--apply"])
         self.assertEqual(guard["StartInterval"], 30)

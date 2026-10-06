@@ -54,6 +54,105 @@ class GlaedaDiskTest(unittest.TestCase):
         gd.NESTED_KEEP = self.gd_keep
         self.tmp.cleanup()
 
+    def test_du_walk_timeout_kills_child_and_returns_unsized(self) -> None:
+        class HungDu:
+            pid = 7319
+            returncode = None
+
+            def __init__(self, argv, **kwargs):
+                self.argv = argv
+                self.timeout = None
+                self.killed = False
+
+            def communicate(self, timeout=None):
+                self.timeout = timeout
+                raise subprocess.TimeoutExpired(self.argv, timeout)
+
+        with mock.patch.object(gd.subprocess, "Popen", HungDu), \
+                mock.patch.object(gd.os, "killpg") as killpg:
+            self.assertIsNone(gd.du_bytes(self.root))
+            self.assertIsNone(gd.du_children(self.root))
+        self.assertEqual(killpg.call_count, 2)
+        self.assertTrue(all(call.args[1] == gd.signal.SIGKILL for call in killpg.call_args_list))
+        self.assertEqual(gd.EVICTION_STUCK[-1]["id"], "eviction_stuck")
+        self.assertIn(str(self.root), gd.EVICTION_STUCK[-1]["path"])
+
+    def test_du_root_walk_refuses_filesystem_root(self) -> None:
+        with mock.patch.object(gd, "_du_output") as run:
+            self.assertIsNone(gd.du_children(Path("/")))
+        run.assert_not_called()
+
+    def test_fixed_measurement_roots_skip_fileprovider_and_root(self) -> None:
+        saved = (gd.HOME, gd.FLEET_ROOT, gd.DARWIN)
+        gd.HOME = self.root
+        gd.FLEET_ROOT = self.root / "shared"
+        gd.DARWIN = True
+        try:
+            roots = gd.fixed_measurement_roots()
+            self.assertTrue(roots)
+            self.assertNotIn(Path("/"), roots)
+            self.assertFalse(any("FileProvider" in p.parts for p in roots))
+            self.assertIn(gd.FLEET_ROOT / "cache", roots)
+            self.assertIn(gd.FLEET_ROOT / "ci-ios", roots)
+        finally:
+            gd.HOME, gd.FLEET_ROOT, gd.DARWIN = saved
+
+    def test_eviction_lock_owner_is_recorded_and_released(self) -> None:
+        lock_path, owner_path = gd.EVICT_LOCK, gd.EVICT_OWNER
+        gd.EVICT_LOCK = self.root / "evict.lock"
+        gd.EVICT_OWNER = self.root / "evict.owner.json"
+        try:
+            handle = gd.acquire_evict_lock()
+            self.assertIsNotNone(handle)
+            self.assertEqual(json.loads(gd.EVICT_OWNER.read_text())["pid"], os.getpid())
+            gd.release_evict_lock(handle)
+            self.assertFalse(gd.EVICT_OWNER.exists())
+            with gd.EVICT_LOCK.open("a") as other:
+                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            gd.EVICT_LOCK = lock_path
+            gd.EVICT_OWNER = owner_path
+            gd._LIVE_REFERENCES.clear()
+
+    def test_paused_runner_work_is_cleared_only_for_held_idle_runner(self) -> None:
+        saved_home = gd.HOME
+        gd.HOME = self.root
+        try:
+            runner = self.root / "actions-runner-glaeda-2"
+            work = runner / "_work/cmux"
+            work.mkdir(parents=True)
+            (work / "old-build").write_bytes(b"old")
+            (runner / ".runner").write_text("{}")
+            (runner / "glaeda-hooks").mkdir()
+            held = self.root / gd.RUNNER_HELD_DIR / runner.name
+            held.parent.mkdir(parents=True)
+            held.write_text("held")
+            receipt = self.root / "receipt.jsonl"
+            with mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                    mock.patch.object(gd, "du_bytes", return_value=1234):
+                self.assertEqual(gd.cleanup_paused_runner_work(receipt), 1234)
+            self.assertFalse(work.exists())
+            record = json.loads(receipt.read_text())
+            self.assertEqual(record["family"], "paused-runner-work")
+            # Without the explicit drain marker, the same idle-looking tree remains intact.
+            work.mkdir(parents=True)
+            (work / "new").write_bytes(b"new")
+            held.unlink()
+            with mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                    mock.patch.object(gd, "du_bytes", return_value=1234):
+                self.assertEqual(gd.cleanup_paused_runner_work(receipt), 0)
+            self.assertTrue(work.exists())
+        finally:
+            gd.HOME = saved_home
+
+    def test_timed_out_bulk_walk_does_not_cache_zero_sizes(self) -> None:
+        self.fam = gd.Family("user-tmp", self.root, True, "scratch", bulk_sizes=True)
+        make(self.root / "a", mib=2)
+        with mock.patch.object(gd, "du_children", return_value=None), \
+                mock.patch.object(gd, "du_bytes", return_value=None):
+            items = gd.survey([self.fam], 24, 1 << 20)
+        self.assertEqual(items, [])
+
     def verdicts(self, idle: float = 24) -> dict[str, str]:
         return {Path(i.path).name: i.verdict for i in gd.survey([self.fam], idle, 0)}
 
@@ -93,18 +192,18 @@ class GlaedaDiskTest(unittest.TestCase):
         saved_min, gd.BULK_SIZE_MIN = gd.BULK_SIZE_MIN, 2
         make(self.root / "com.apple.imtransferservices")
         calls: list[list[str]] = []
-        real_run = gd.subprocess.run
+        real_du_output = gd._du_output
 
-        def counting_run(args, *a, **k):
+        def counting_du_output(args):
             if args and args[0] == "du":
                 calls.append(list(args))
-            return real_run(args, *a, **k)
+            return real_du_output(args)
 
-        gd.subprocess.run = counting_run
+        gd._du_output = counting_du_output
         try:
             items = gd.survey([self.fam], 24, 1 << 20)
         finally:
-            gd.subprocess.run = real_run
+            gd._du_output = real_du_output
             gd.BULK_SIZE_MIN = saved_min
         self.assertEqual(sorted(Path(i.path).name for i in items), ["a", "b", "c"])
         self.assertTrue(all(i.bytes >= 2 << 20 and i.verdict == "reclaimable" for i in items))
@@ -587,18 +686,19 @@ class GlaedaDiskTest(unittest.TestCase):
     def test_accounting_reports_df_space_outside_measured_items(self) -> None:
         path = self.root / "known"
         path.write_bytes(b"x")
-        fs = gd.Fs(path.stat().st_dev, "/volume", 2 * gd.GIB, 10 * gd.GIB, 3 * gd.GIB, 4 * gd.GIB)
+        fs = gd.Fs(path.stat().st_dev, str(self.root), 2 * gd.GIB, 10 * gd.GIB, 3 * gd.GIB, 4 * gd.GIB)
         item = gd.Item("xcode-derived-data", str(path), 3 * gd.GIB, 2.0, "report-only")
         saved = (gd.DARWIN, gd.ACCOUNTING)
         gd.DARWIN, gd.ACCOUNTING = True, self.root / "accounting.json"
         gd._ACCOUNTING_MEM.clear()
         self.addCleanup(lambda: (setattr(gd, "DARWIN", saved[0]), setattr(gd, "ACCOUNTING", saved[1]),
                                   gd._ACCOUNTING_MEM.clear()))
-        with mock.patch.object(gd, "du_children", return_value={"/volume/ci": 8 * gd.GIB}):
+        with mock.patch.object(gd, "fixed_measurement_roots", return_value=[self.root]), \
+                mock.patch.object(gd, "du_bytes", return_value=8 * gd.GIB):
             got = gd.filesystem_accounting([fs], [item])
         self.assertEqual(got[0]["measured"], 3 * gd.GIB)
         self.assertEqual(got[0]["unmeasured"], 5 * gd.GIB)
-        self.assertEqual(got[0]["top_level"][0]["path"], "/volume/ci")
+        self.assertEqual(got[0]["top_level"][0]["path"], str(self.root))
 
     def test_accounting_does_not_double_count_nested_items(self) -> None:
         parent = self.root / "parent"
@@ -619,17 +719,18 @@ class GlaedaDiskTest(unittest.TestCase):
     def test_accounting_cache_keeps_walk_timestamp_until_walk_is_due(self) -> None:
         path = self.root / "known"
         path.write_bytes(b"x")
-        fs = gd.Fs(path.stat().st_dev, "/volume", 2 * gd.GIB, 10 * gd.GIB, 3 * gd.GIB, 4 * gd.GIB)
+        fs = gd.Fs(path.stat().st_dev, str(self.root), 2 * gd.GIB, 10 * gd.GIB, 3 * gd.GIB, 4 * gd.GIB)
         saved = (gd.DARWIN, gd.ACCOUNTING)
         gd.DARWIN, gd.ACCOUNTING = True, self.root / "accounting-cache.json"
         gd._ACCOUNTING_MEM.clear()
         self.addCleanup(lambda: (setattr(gd, "DARWIN", saved[0]), setattr(gd, "ACCOUNTING", saved[1]),
                                   gd._ACCOUNTING_MEM.clear()))
-        with mock.patch.object(gd, "du_children", return_value={"/volume/ci": 8 * gd.GIB}):
+        with mock.patch.object(gd, "fixed_measurement_roots", return_value=[self.root]), \
+                mock.patch.object(gd, "du_bytes", return_value=8 * gd.GIB):
             gd.filesystem_accounting([fs], [])
         first = json.loads(gd.ACCOUNTING.read_text())[str(fs.dev)]["at"]
         gd._ACCOUNTING_MEM.clear()
-        with mock.patch.object(gd, "du_children", side_effect=AssertionError("cache should be used")):
+        with mock.patch.object(gd, "fixed_measurement_roots", side_effect=AssertionError("cache should be used")):
             gd.filesystem_accounting([fs], [])
         second = json.loads(gd.ACCOUNTING.read_text())[str(fs.dev)]["at"]
         self.assertEqual(second, first)
@@ -756,6 +857,55 @@ class GlaedaDiskTest(unittest.TestCase):
             self.assertFalse(gd.never_delete(self.root / "Library/Caches/go-build"))
         finally:
             gd.HOME = saved
+
+    def test_fleet_artifacts_use_cutoff_and_live_lease_references(self) -> None:
+        fleet = self.root / "fleet"
+        cache = fleet / "cache"
+        cache.mkdir(parents=True)
+        old = make(cache / "old-artifact", age_hours=24)
+        fresh = make(cache / "fresh-artifact", age_hours=1)
+        gd.ARTIFACT_CUTOFF = time.time() - 12 * 3600
+        fam = gd.Family("fleet-artifacts", cache, True, "rebuild", stale_before=gd.ARTIFACT_CUTOFF,
+                        allow_stale_protected=True, reference_root=fleet)
+        try:
+            with mock.patch.object(gd, "live_artifact_references", return_value=frozenset()):
+                got = {Path(i.path).name: i.verdict for i in gd.survey([fam], 24, 0)}
+            self.assertEqual(got, {"old-artifact": "reclaimable", "fresh-artifact": "recent"})
+            with mock.patch.object(gd, "live_artifact_references", return_value=frozenset({str(fresh)})):
+                got = {Path(i.path).name: (i.verdict, i.reasons) for i in gd.survey([fam], 0, 0)}
+            self.assertEqual(got["fresh-artifact"][0], "in-use")
+            self.assertIn("live lease or running job", got["fresh-artifact"][1])
+        finally:
+            gd.ARTIFACT_CUTOFF = None
+
+    def test_default_families_cover_fleet_and_browser_artifacts(self) -> None:
+        saved = (gd.HOME, gd.FLEET_ROOT, gd.DARWIN)
+        gd.HOME = self.root
+        gd.FLEET_ROOT = self.root / "shared-fleet"
+        gd.DARWIN = True
+        try:
+            (gd.HOME / "cmux-browser-fleet").mkdir()
+            (gd.FLEET_ROOT / "cache").mkdir(parents=True)
+            (gd.FLEET_ROOT / "ci-ios" / "runner-a" / "derived-data").mkdir(parents=True)
+            fams = {f.id: f for f in gd.default_families()}
+            self.assertIn("fleet-artifacts", fams)
+            self.assertIn("ci-ios-derived-data", fams)
+            self.assertIn("browser-artifacts", fams)
+            self.assertTrue(fams["fleet-artifacts"].allow_stale_protected)
+            self.assertTrue(fams["browser-artifacts"].allow_stale_protected)
+        finally:
+            gd.HOME, gd.FLEET_ROOT, gd.DARWIN = saved
+
+    def test_ci_ios_derived_data_is_reclaimable_without_deleting_runner_root(self) -> None:
+        root = self.root / "ci-ios"
+        old = root / "runner-a" / "derived-data"
+        make(old, age_hours=48)
+        fam = gd.ci_ios_family(root)
+        with mock.patch.object(gd, "live_artifact_references", return_value=frozenset()):
+            got = gd.survey([fam], 24, 0)
+        self.assertEqual([Path(i.path) for i in got], [old])
+        self.assertEqual(got[0].verdict, "reclaimable")
+        self.assertTrue((root / "runner-a").is_dir())
 
     def test_fleet_ci_hot_tier(self) -> None:
         ci = self.root / "ci"
@@ -1722,6 +1872,7 @@ class LinuxLayoutTest(unittest.TestCase):
         gd.process_evidence = lambda: ([], "")
         try:
             fams = [f for f in gd.default_families() if f.id in ("cmux-job-cache", "user-cache")]
+            self.assertEqual(next(f for f in fams if f.id == "cmux-job-cache").min_idle_hours, 24.0)
             items = gd.survey(fams, 24, 0)
         finally:
             gd.process_evidence = saved

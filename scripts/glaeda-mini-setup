@@ -25,6 +25,7 @@ GitHub Actions runner and is documented in docs/CMUX_MINI_RUNNER.md.
 
 What --apply installs (templated for the current user):
     ~/.local/bin/glaeda-disk                   from scripts/glaeda-disk
+    ~/.local/bin/disk-pressure.sh              one-shot launcher used by every mini's LaunchAgent
     ~/.local/bin/glaeda-procs                  from scripts/glaeda-procs (why the Mac lags; --apply ends leaked fixtures)
     ~/.local/bin/glaeda-local-guard            from scripts/glaeda-local-guard (stops test and build runs orphaned by an
                                                agent session on a hygiene-only Mac, and on every Mac shell -c trees
@@ -630,11 +631,12 @@ def preflight_macos(ctx: Context) -> dict[str, Any]:
 def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
     """The LaunchAgents for this user: disk hygiene as hand-installed on Air Blue, plus the fleet-cas pruner."""
     disk = os.fspath(ctx.bin / "glaeda-disk")
+    pressure = os.fspath(ctx.bin / "disk-pressure.sh")
     python = ctx.python or "/usr/bin/python3"
     return {
         LABEL_PREFIX + "disk-pressure": {
             "Label": LABEL_PREFIX + "disk-pressure",
-            "ProgramArguments": [python, disk, "--pressure", "--idle", "--apply", "--top", "0"],
+            "ProgramArguments": [pressure, "--once"],
             "StartInterval": 900,
             "RunAtLoad": True,
             # Not ProcessType Background: under pressure this job must still finish its lsof and free
@@ -642,6 +644,7 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             # --idle: with no pressure, an hourly sweep of idle reproducible data while no job runs.
             "LowPriorityIO": True,
             "Nice": 10,
+            "EnvironmentVariables": {"GLAEDA_PYTHON": python, "GLAEDA_DISK": disk},
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-disk.log"),
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-disk.err"),
         },
@@ -1010,7 +1013,7 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
     for path, mode in directories(ctx):
         actions.append({"kind": "dir", "path": os.fspath(path),
                         "state": "unchanged" if path.is_dir() else "create", "mode": oct(mode)})
-    for name in ("glaeda-disk", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune", "glaeda-seed-prefetch",
+    for name in ("glaeda-disk", "disk-pressure.sh", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune", "glaeda-seed-prefetch",
                  "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health",
                  "glaeda-update", "glaeda-gh", "glaeda-wallpaper-rotate"):
         act = file_action(ctx, "tool", ctx.bin / name, (SCRIPT_DIR / name).read_bytes(), 0o755)

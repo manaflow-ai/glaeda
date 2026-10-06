@@ -164,6 +164,16 @@ class Detection(Base):
 
 
 class DiskAndLeaks(Base):
+    def test_stuck_eviction_is_reported_as_health_finding(self) -> None:
+        self.mini.disk = {"schema": "glaeda-disk/v1", "findings": [{
+            "id": "eviction_stuck", "severity": "error", "path": "/Users/Shared/cmux-build-fleet",
+            "evidence": "du timed out after 30s", "auto_fix": "pending"
+        }]}
+        report = self.run_once()
+        self.assertEqual(self.ids(report), ["eviction_stuck"])
+        self.assertEqual(report["findings"][0]["severity"], "error")
+        self.assertIn("du timed out", report["findings"][0]["evidence"])
+
     def test_unmeasured_space_is_a_health_finding(self) -> None:
         self.mini.disk = {"schema": "glaeda-disk/v1", "accounting": [{"unmeasured": 5 * 1024**3,
                                                                    "top_level": [{"path": "/Users/Shared", "bytes": 8 * 1024**3}]}]}
