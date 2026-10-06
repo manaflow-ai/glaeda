@@ -2873,6 +2873,27 @@ class GateTest(unittest.TestCase):
         proc.stdout.readline()
         return proc
 
+    def test_registered_fleet_waiter_is_seen_without_a_kernel_wait_channel(self) -> None:
+        waiters = Path(str(self.lock) + ".waiters")
+        waiters.mkdir()
+        (waiters / "4242-refresh-build-1").touch()
+        with mock.patch.object(hook, "_lock_processes", return_value=([], "")), \
+                mock.patch.object(hook, "pid_alive", return_value=True):
+            self.assertEqual(hook.lock_waiters(os.fspath(self.lock), set()), [4242])
+
+    def test_waiter_markers_ignore_dead_stale_own_and_symlink_entries(self) -> None:
+        waiters = Path(str(self.lock) + ".waiters")
+        waiters.mkdir()
+        for name in ("4242-refresh-build-1", "4243-blocked", "4244-refresh-stale-1", "4245-own"):
+            (waiters / name).touch()
+        old = time.time() - 60
+        os.utime(waiters / "4244-refresh-stale-1", (old, old))
+        os.utime(waiters / "4243-blocked", (old, old))
+        (waiters / "4246-symlink").symlink_to(waiters / "4243-blocked")
+        with mock.patch.object(hook, "_lock_processes", return_value=([], "")), \
+                mock.patch.object(hook, "pid_alive", side_effect=lambda pid: pid != 4242):
+            self.assertEqual(hook.lock_waiters(os.fspath(self.lock), {4245}), [4243])
+
     def test_lock_waiter_parser_counts_only_a_blocked_exclusive_lock(self) -> None:
         process_table = """\
 101  hrtimer_nanosleep worker-current

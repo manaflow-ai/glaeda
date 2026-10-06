@@ -1959,16 +1959,55 @@ def lock_open_pids(path: str, ours: set[int]) -> list[int]:
     return _lock_processes(path, ours)[0]
 
 
+def registered_lock_waiters(path: str, ours: set[int]) -> set[int]:
+    """The fleet's host.lock.waiters protocol, also used by with-host-lock.
+
+    Polling workers refresh their marker within 30 seconds. Blocking wrappers
+    keep an unrefreshed marker until their PID exits. Read only: the publisher
+    owns cleanup, and stale observations never authorize stopping a process.
+    """
+    directory = Path(path + ".waiters")
+    found: set[int] = set()
+    try:
+        if directory.is_symlink():
+            return found
+        now = time.time()
+        with os.scandir(directory) as entries:
+            for i, entry in enumerate(entries):
+                if i >= 1024:  # bound work in this shared directory
+                    break
+                match = re.fullmatch(r"([1-9][0-9]*)-[A-Za-z0-9._-]+", entry.name)
+                if not match:
+                    continue
+                pid = int(match.group(1))
+                if not 1 < pid <= 2147483647 or pid in ours:
+                    continue
+                try:
+                    info = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if not stat.S_ISREG(info.st_mode):
+                    continue
+                if "-refresh-" in entry.name and not 0 <= now - info.st_mtime < 30:
+                    continue
+                if pid_alive(pid):
+                    found.add(pid)
+    except OSError:
+        pass
+    return found
+
+
 def lock_waiters(path: str, ours: set[int]) -> list[int]:
-    """Processes actually blocked in LOCK_EX (the fleet build worker, a reload).
+    """Registered polling waiters and processes actually blocked in LOCK_EX.
 
     lsof lists any process with the host lock open, so it is only the candidate source. The ps
     wait channel is required to show a lock wait; an idle worker keeper such as /bin/cat and an
-    exclusive holder therefore do not count. Empty when either observation cannot be made.
+    exclusive holder therefore do not count without an explicit live marker.
+    Markers remain observable when Darwin's wait channel is unavailable.
     """
     pids, listing = _lock_processes(path, ours)
     blocked = _blocked_lock_pids(listing, set(pids))
-    return [pid for pid in pids if pid in blocked]
+    return sorted(blocked | registered_lock_waiters(path, ours))
 
 
 def holder_pids(state_dir: Path) -> set[int]:
