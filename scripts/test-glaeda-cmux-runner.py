@@ -2436,6 +2436,27 @@ time.sleep(60)
                 proc.wait()
             holder.stdout.close()
 
+    def test_capacity_fleet_drain_refuses_without_entering_admission_wait(self) -> None:
+        fleet = self.fleet()
+        markers = Path(str(fleet / "host.lock") + ".waiters")
+        markers.mkdir()
+        drain = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            # A reserved worker waits for Runner.Worker to exit. Waiting inside its
+            # job-started child would prevent that exit and deadlock both schedulers.
+            for job in ("swift-package-tests", "macos-compile-admission"):
+                with self.subTest(job=job):
+                    (markers / f"{drain.pid}-refresh-lend_drain-test").touch()
+                    result = self.job(job, "draining", 4, None, "--gui-wait", "2")
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertIn("a fleet build is waiting for the host", result.stdout)
+                    self.assertNotIn("waiting (", result.stdout)
+                    self.assertFalse(list((self.dir / "capacity").glob("admit.want-*")))
+                    self.assertTrue(self.lock_free())
+        finally:
+            drain.kill()
+            drain.wait()
+
     @unittest.skipUnless(os.path.exists(hook.LSOF), "needs lsof")
     def test_capacity_stops_admitting_while_a_fleet_build_waits(self) -> None:
         fleet = self.fleet()
@@ -2451,7 +2472,7 @@ time.sleep(60)
                 time.sleep(0.5)
                 result = self.job("swift-package-tests", "l1")
                 self.assertEqual(result.returncode, 1, result.stdout)
-                self.assertIn("refused: capacity: a fleet build is waiting for the host", result.stdout)
+                self.assertIn("refused: a fleet build is waiting for the host", result.stdout)
                 self.finish("l0")
                 self.assertEqual(waiter.wait(timeout=10), 0, "the build worker gets the host once our job ends")
             finally:

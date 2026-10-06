@@ -2192,7 +2192,9 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
             waiting = lock_waiters(host_lock, holder_pids(state_dir) | yielding_family(host_lock))
             # lsof sees only this user's processes, which is how the fleet worker runs today.
             if waiting:  # flock has no writer preference: stop admitting so the build worker gets in
-                return False, f"capacity: a fleet build is waiting for the host (pid {waiting[0]})"
+                # This must not be a retryable capacity refusal: a draining fleet
+                # worker waits for our parent Runner.Worker to exit before claiming.
+                return False, f"a fleet build is waiting for the host (pid {waiting[0]})"
         taken: list[str] = []
         named: dict[str, int] = {}
         warm_for = warm_note = ""
