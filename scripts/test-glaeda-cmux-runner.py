@@ -367,6 +367,31 @@ class HookTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertFalse(marker.exists())
 
+    def test_a_refused_job_skips_the_disk_pass_when_it_completes(self) -> None:
+        """A refusal fails the job in about a second; glaeda-disk in job-completed kept its runner 30 s more."""
+        marker = self.dir / "disk-ran"
+        disk = make_executable(self.dir / "glaeda-disk", f"import pathlib\npathlib.Path({os.fspath(marker)!r}).touch()\n")
+        state = os.fspath(self.dir / "state")
+        name, payload, _ = SAMPLE_EVENTS["fork-pr"]
+        result = self.run_hook("job-started", name, event(self.dir, "fork", payload), "--allowed-repo",
+                               "manaflow-ai/cmux", "--disk", os.fspath(disk), "--state-dir", state,
+                               "--watch-pid", "4242", repo="manaflow-ai/cmux")
+        self.assertEqual(result.returncode, 1)
+        other = self.run_hook("job-completed", None, None, "--disk", os.fspath(disk), "--state-dir", state,
+                              "--watch-pid", "4343")
+        self.assertEqual(other.returncode, 0)
+        self.assertTrue(marker.exists(), "another runner's job on the mini still runs its disk pass")
+        marker.unlink()
+        done = self.run_hook("job-completed", None, None, "--disk", os.fspath(disk), "--state-dir", state,
+                             "--watch-pid", "4242")
+        self.assertEqual(done.returncode, 0)
+        self.assertFalse(marker.exists(), done.stdout)
+        self.assertIn("refused in job-started; no disk pass", done.stdout)
+        again = self.run_hook("job-completed", None, None, "--disk", os.fspath(disk), "--state-dir", state,
+                              "--watch-pid", "4242")
+        self.assertEqual(again.returncode, 0)
+        self.assertTrue(marker.exists(), "the refusal's note is used once")
+
     # ------------------------------------------------------------ host lock, reservation, disk floor
 
     def fleet(self) -> Path:
@@ -3307,6 +3332,55 @@ class GateTest(unittest.TestCase):
             self.assertEqual(gate.watching, (), "above the floor a job is polled as usual")
             gate.step()
             self.assertEqual(stops, [], "and a runner above its floor keeps listening")
+
+    def test_a_fleet_waiter_seen_during_a_job_stops_the_listener_as_the_job_ends(self) -> None:
+        """cmux11s, 2026-10-06: a fleet build waited 13 minutes while three runners kept taking queued jobs and
+        refusing each one. The gate deferred while a job ran and the next job came before two idle polls."""
+        self.state.mkdir(parents=True, exist_ok=True)
+        hook.refused_note(self.state, 4242).touch()  # job-started refused the job
+        gate, stops = self.gate([None] * 3, busy=[True])
+        gate.worker_pids = lambda: [4242]
+        with mock.patch.object(hook, "host_waiters", return_value={77}):
+            gate.step()
+            self.assertEqual(stops, [], "a runner with a job is never stopped")
+            self.assertEqual(gate.watching, (4242,), "a refused job's worker is watched")
+            gate.step()  # the worker exited
+        self.assertEqual(stops, ["a fleet build is waiting for the host (pid 77)"], "at once, not two idle polls")
+
+        # Any other job is polled as usual, and its runner stops on the first idle poll.
+        gate, stops = self.gate([None] * 3, busy=[True, True])
+        gate.worker_pids = lambda: [4343]
+        with mock.patch.object(hook, "host_waiters", return_value={77}):
+            gate.step(); gate.step()
+            self.assertEqual((stops, gate.watching), ([], ()))
+            gate.step()  # the job ended
+        self.assertEqual(stops, ["a fleet build is waiting for the host (pid 77)"])
+
+    def test_a_waiter_gone_by_the_end_of_the_job_keeps_the_listener(self) -> None:
+        gate, stops = self.gate([None] * 3, busy=[True])
+        gate.worker_pids = lambda: [4242]
+        with mock.patch.object(hook, "host_waiters", side_effect=[{77}, set()]):
+            gate.step()
+            gate.step()
+        self.assertEqual(stops, [])
+
+    def test_a_busy_runner_asks_lsof_at_most_every_thirty_seconds(self) -> None:
+        gate, stops = self.gate([None] * 3, busy=[True, True, True])
+        gate.worker_pids = lambda: [4242]
+        with mock.patch.object(hook, "host_waiters", return_value=set()) as lsof:
+            gate.step(); gate.step()
+            self.assertEqual(lsof.call_count, 1)
+            gate.waiting_at -= hook.GATE_WAITER_EVERY_S
+            gate.step()
+            self.assertEqual(lsof.call_count, 2)
+        self.assertEqual((stops, gate.watching), ([], ()))
+        gate, stops = self.gate([None] * 3, busy=[True])
+        gate.waiters = False
+        gate.worker_pids = lambda: [4242]
+        with mock.patch.object(hook, "host_waiters", return_value={77}) as lsof:
+            gate.step(); gate.step()
+            lsof.assert_not_called()
+        self.assertEqual(stops, [])
 
     def test_a_job_under_the_disk_floor_wakes_the_gate_when_its_worker_exits(self) -> None:
         import threading

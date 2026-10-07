@@ -2978,6 +2978,7 @@ class Gate:
         self.held: str | None = None
         self.terminating = False
         self.waiting: set[int] = set()
+        self.job_waited = False  # a fleet build was waiting at the last poll of a job
         self.waiting_at = -GATE_WAITER_EVERY_S
         self.worker_noted = False
         self.defer_noted = False  # stop() said once that it kept a listener taking a job
@@ -3123,6 +3124,18 @@ class Gate:
             self.yield_to_fleet()
         return (why or self.shed(self.saturated()) or self.full(fresh=True) or self.shed(self.hot(fresh=True))
                 or self.locked(fresh=True) or self.low_disk())
+
+    def still_waiting(self) -> str | None:
+        """A fleet build seen waiting during the job that just ended, still waiting in a fresh reading."""
+        if not self.waiting:
+            return None
+        again = self.waiting & host_waiters(self.host_lock, self.state_dir)
+        self.waiting, self.waiting_at = again, time.monotonic()
+        if not again:
+            return None
+        self.load_since = None
+        self.yield_to_fleet()
+        return f"a fleet build is waiting for the host (pid {min(again)})"
 
     def low_disk(self) -> str | None:
         """Why job-started would refuse every job for free disk (disk_refusal against this runner's own
@@ -3332,15 +3345,23 @@ class Gate:
             if self.terminating:
                 self.stop("the runner agent is stopping")
                 return None
-            if self.watching and not self.busy():
-                self.watching = ()
+            if (self.watching or self.job_waited) and not self.busy():
+                self.watching, self.job_waited = (), False
                 self.fast_until = time.monotonic() + 5.0
-                if (why := self.low_disk()):
+                if (why := self.low_disk() or self.still_waiting()):
                     self.stop(why)
                     return None
             self.reload()
             if self.busy():
-                if (why := self.low_disk()) and (workers := self.worker_pids()):
+                # A fleet build seen waiting during a job stops the listener as the job ends: with a queue
+                # behind the label the next job comes before two idle polls, and each is refused. A job
+                # job-started refused ends in seconds, so its worker is watched; any other is seen on a poll.
+                if self.waiters and time.monotonic() - self.waiting_at >= GATE_WAITER_EVERY_S:
+                    self.waiting, self.waiting_at = host_waiters(self.host_lock, self.state_dir), time.monotonic()
+                self.job_waited = bool(self.waiting)
+                workers = self.worker_pids() if self.waiting or self.low_disk() else []
+                refused = self.waiting and any(refused_note(self.state_dir, pid).exists() for pid in workers)
+                if workers and (refused or self.low_disk()):
                     self.watching = tuple(workers)
                     self.fast_until = time.monotonic() + 5.0
                 self.streak = 0  # a claim must hold for two idle polls, not carry over from the job
@@ -3452,6 +3473,12 @@ def listen(runner_dir: Path, host_lock: str, reservation: str, state_dir: Path, 
         if code is not None:
             return code
         time.sleep(GATE_POLL_S if not gate.terminating else 0.5)
+
+
+def refused_note(state_dir: Path, worker: int) -> Path:
+    """job-started's note that it refused this Worker's job, which job-completed reads. The state dir is the
+    mini's, shared by its runners, so the note is the Worker's."""
+    return state_dir / f"refused-{worker}"
 
 
 def refuse(reason: str) -> int:
@@ -4362,7 +4389,11 @@ def main(argv: list[str] | None = None) -> int:
                                                                  if isinstance(event, dict) else None)
         admit_start: float | None = None
 
-        def refused(why: str) -> int:
+        def refused(why: str, disk: bool = False) -> int:
+            if not disk:  # a disk refusal's job-completed still runs its pass
+                with contextlib.suppress(OSError):
+                    args.state_dir.mkdir(parents=True, exist_ok=True)
+                    refused_note(args.state_dir, args.watch_pid or os.getppid()).touch()
             if telemetry:
                 with contextlib.suppress(Exception):  # observation never hides or changes a refusal
                     job_event("refused", job_meta(repo, args.home_repo), args.job_log, decision=why[:400],
@@ -4390,9 +4421,11 @@ def main(argv: list[str] | None = None) -> int:
         disk_path = os.path.dirname(args.host_lock)
         if not why and not args.no_disk and disk_refusal(disk_path, args.min_free_gib):
             print(f"{PREFIX}: {evict(disk_path, args.min_free_gib, args.disk)}", flush=True)
-        why = why or disk_refusal(disk_path, args.min_free_gib)
         if why:
             return refused(why)
+        why = disk_refusal(disk_path, args.min_free_gib)
+        if why:
+            return refused(why, disk=True)
         # before any capacity is taken: a job that needs the console session fails on a locked one
         admit_class = None
         if args.gui_runner or job_class(os.environ.get("GITHUB_JOB", ""), repo, args.home_repo,
@@ -4501,11 +4534,19 @@ def main(argv: list[str] | None = None) -> int:
         if telemetry:
             print(f"{PREFIX}: {finish_sampler(args.state_dir)}", flush=True)
         print(f"{PREFIX}: {release_host_lock(args.state_dir)}", flush=True)
+    skip_disk = False
     if args.phase == "job-completed":
         current_worker = runner_worker_pid()
         for note in cleanup_leaked_test_apps({current_worker} if current_worker else set()):
             print(f"{PREFIX}: {note}", flush=True)
-    if not args.no_disk:
+        worker = args.watch_pid or current_worker
+        if worker:
+            with contextlib.suppress(OSError):
+                refused_note(args.state_dir, worker).unlink()
+                skip_disk = True
+        if skip_disk:  # nothing ran, so nothing to free; the runner is back on the queue at once
+            print(f"{PREFIX}: refused in job-started; no disk pass", flush=True)
+    if not args.no_disk and not skip_disk:
         print(f"{PREFIX}: {disk_pressure(args.disk)}", flush=True)
     return 0
 
