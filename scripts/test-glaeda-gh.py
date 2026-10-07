@@ -211,6 +211,8 @@ class ControllerTest(Base):
     def setUp(self) -> None:
         super().setUp()
         self.ctl = FakeController()
+        feed_every, gg.CONTROLLER_FEED_EVERY = gg.CONTROLLER_FEED_EVERY, 0  # these tests read the feed each tick
+        self.addCleanup(setattr, gg, "CONTROLLER_FEED_EVERY", feed_every)
         self.daemon = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=self.ctl)
 
     def test_tracked_run_costs_no_quota(self) -> None:
@@ -455,6 +457,21 @@ class ControllerTest(Base):
         self.assertEqual(len(self.ctl.calls), 3)
         self.assertEqual(self.gh.rest_calls(), [])
         self.assertEqual(self.daemon.tick(NOW + 11 * gg.TICK)["controller"]["runs"], 3)
+
+    def test_feed_is_read_at_most_every_feed_interval(self) -> None:
+        gg.CONTROLLER_FEED_EVERY = 20  # one read per tick from 18 hosts overloaded the controller's whois (10-07)
+        self.ctl.runs[44] = ctl_run(44, "in_progress")
+        gg.register("run:o/r/44")
+        for t in range(20):
+            self.daemon.tick(NOW + t * gg.TICK)
+        self.assertEqual(len(self.ctl.feeds), 2)  # at 0 s and 20 s
+        self.assertEqual(self.ctl.calls, [44])
+        self.assertEqual(self.gh.rest_calls(), [])  # the run stays controller-filled between reads
+        self.ctl.runs[45] = ctl_run(45, "in_progress")
+        gg.register("run:o/r/45")
+        self.daemon.tick(NOW + 20 * gg.TICK)
+        self.assertEqual(self.ctl.calls, [44, 45])  # a new watch gets its baseline without waiting for the feed
+        self.assertEqual(self.gh.rest_calls(), [])
 
     def test_feed_reset_takes_a_new_baseline(self) -> None:
         self.ctl.runs[43] = ctl_run(43, "in_progress")

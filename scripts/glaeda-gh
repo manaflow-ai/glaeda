@@ -123,6 +123,8 @@ CONTROLLER_DEFAULT = "http://100.89.225.106:18765"  # cmux-lawrence since the 20
 CONTROLLER_CONFIG = Path.home() / ".local/share/cmux-fleet-client/client.json"
 CONTROLLER_TOKEN = Path.home() / ".config/cmux/build-fleet/controller.token"
 CONTROLLER_TIMEOUT = 3  # a tick must not stall on an unreachable controller
+CONTROLLER_FEED_EVERY = 20  # seconds between change-feed reads: each request costs the controller a tailnet
+# whois, and 18 hosts at one read per tick drove tailscaled into a kernel panic on cmux-lawrence (10-07)
 CONTROLLER_RETRY = 60  # after a failure, the controller is left alone this long, doubling up to CONTROLLER_ABSENT
 REST_SAFETY = 900  # a run the controller tracks is still read over REST this often (a lost delivery)
 CONTROLLER_ABSENT = 900  # a controller without the run-events receiver (404, 503) is asked again this rarely
@@ -517,6 +519,7 @@ class Daemon:
             Controller.from_env if controller == "env" else controller if callable(controller) else None)
         self.controller = self.controller_source() if self.controller_source else controller
         self.controller_down_until = 0.0
+        self.controller_feed_at = float("-inf")
         self.controller_failures = 0
         self.controller_filled: set[str] = set()  # watched runs the controller tracks, while its feed answers
         self.controller_cursor: int | None = None
@@ -915,18 +918,21 @@ class Daemon:
         self.controller_status = {"state": "off" if current is None else "starting"}
 
     def from_controller(self, entries: list[dict]) -> None:
-        """Follow the controller's change feed: free, one request a tick, plus one baseline read for
-        each run newly watched. Job lists still come from REST."""
+        """Follow the controller's change feed: free, one request every CONTROLLER_FEED_EVERY seconds,
+        plus one baseline read for each run newly watched. Job lists still come from REST."""
         self.controller_filled = set()
         self.follow_controller()
         if self.controller is None or self.now < self.controller_down_until:
             return
         deadline = time.monotonic() + TICK  # a slow controller must not stall the tick
-        try:
-            pages = self.read_feed()
-        except WatchError as error:
-            return self.controller_down(error)
-        self.controller_failures = 0
+        pages: list[dict] = []
+        if self.now - self.controller_feed_at >= CONTROLLER_FEED_EVERY:
+            self.controller_feed_at = self.now
+            try:
+                pages = self.read_feed()
+            except WatchError as error:
+                return self.controller_down(error)
+            self.controller_failures = 0
         runs = {e["key"]: e for e in entries if e["key"].startswith("run:") and not e["jobs"]}
         self.controller_seen = {k: v for k, v in self.controller_seen.items() if k in runs}
         for key, e in runs.items():
@@ -952,8 +958,9 @@ class Daemon:
             self.nudge(entries, page)
             self.merge_comments(entries, page)
         self.controller_filled = {k for k, known in self.controller_seen.items() if known}
-        self.controller_status = {"state": "ok", "lastDelivery": pages[-1].get("receiver_last_delivery"),
-                                  "token": bool(self.controller.token)}
+        if pages:
+            self.controller_status = {"state": "ok", "lastDelivery": pages[-1].get("receiver_last_delivery"),
+                                      "token": bool(self.controller.token)}
 
     def apply_run(self, e: dict, run: dict) -> None:
         prior = e["cache"] or {}
