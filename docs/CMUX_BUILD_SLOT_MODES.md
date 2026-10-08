@@ -208,9 +208,13 @@ its tailnet address the store's only allowed writer. The writer runs on an hq-on
 with no PR runners: any process on the writer host can reach the signing node's socket.
 `--trusted-keys` alone makes every node and the store use only signed entries. A
 LaunchAgent needs the build user's GUI session; the fleet minis log in automatically.
-`glaeda-fleet-cas uninstall --apply` removes the services and keeps the stores (a
-LaunchDaemon's plist needs root to remove; the command prints how). Deployed on cmux7s
-(store and writer) and cmux8s (node), 2026-09-24.
+`glaeda-fleet-cas uninstall [node|store|all] --apply` removes the selected services and
+keeps both node and fleet stores. The default scope is `all` for compatibility. Removing
+`store` leaves the reader node, its upstream environment and prewarm agent in place;
+removing `node` also removes the node environment and prewarm agent. A LaunchDaemon's
+plist needs root to remove; the command prints the exact role-scoped `launchctl bootout`
+and `rm` command without touching that plist. Deployed on cmux7s (store and writer) and
+cmux8s (node), 2026-09-24.
 
 ## When to switch
 

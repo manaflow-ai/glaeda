@@ -263,10 +263,11 @@ jobs:
           bash -n scripts/cmux-fleet-bootstrap-linux
           bash -n scripts/glaeda-worktree-reclaim-all
           bash -n scripts/disk-pressure.sh
+          bash -n scripts/glaeda-fleet-cas
+          bash -n scripts/test-glaeda-fleet-cas.sh
           bash -n scripts/cmux_mini_probe.sh
           bash -n scripts/cmux_mini_preflight.sh
           bash -n scripts/cmux_mini_fix.sh
-          bash -n scripts/glaeda-fleet-cas
           bash scripts/test-bootstrap.sh
           python3 scripts/test-benchmark-developer-loop.py
           python3 scripts/test-benchmark-hot-state-fanout.py
@@ -279,6 +280,7 @@ jobs:
           python3 scripts/test-glaeda-update.py
           python3 scripts/test-glaeda-fleet-cas-prune.py
           python3 scripts/test-glaeda-fleet-cas.py
+          bash scripts/test-glaeda-fleet-cas.sh
           python3 scripts/test-glaeda-seed-prefetch.py
           python3 scripts/test-glaeda-idle-warm.py
           python3 scripts/test-glaeda-mini-health.py

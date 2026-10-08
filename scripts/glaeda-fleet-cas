@@ -4,7 +4,8 @@
 #   glaeda-fleet-cas node --store HOST:PORT [--trusted-keys HEX] [--prewarm REPO] [--apply]
 #   glaeda-fleet-cas writer --store HOST:PORT --sign-key PATH --trusted-keys HEX [--apply]
 #   glaeda-fleet-cas store --listen IP:PORT [--writers IP,IP] [--trusted-keys HEX] [--apply]
-#   glaeda-fleet-cas uninstall [--apply]               remove the services, keep the stores
+#   glaeda-fleet-cas uninstall [node|store|all] [--apply]
+#                                                       remove selected services, keep stores
 #
 # Run from a glaeda checkout on the mini (scripts/glaeda-fleet-cas-rollout does that from
 # an operator Mac). Planning changes nothing on this host; --apply is idempotent and restarts
@@ -33,17 +34,24 @@
 # Design: docs/CMUX_BUILD_SLOT_MODES.md. Prototype: tools/fleet-cas-prototype.
 set -euo pipefail
 
-ROOT=/Users/Shared/cmux-build-fleet/xcode
+ROOT=${FLEET_CAS_ROOT:-/Users/Shared/cmux-build-fleet/xcode}
 BIN=$ROOT/bin
 SOCK=$ROOT/fleet-cas.sock
 NODE_STORE=$ROOT/node-store
 FLEET_STORE=$ROOT/fleet-store
 AGENTS=$HOME/Library/LaunchAgents
 LOGS=$HOME/Library/Logs
+LAUNCH_DAEMONS=${FLEET_CAS_LAUNCH_DAEMONS_DIR:-/Library/LaunchDaemons}
 here=$(cd "$(dirname "$0")/.." && pwd)
 proto=$here/tools/fleet-cas-prototype
 
 role=${1:-}; shift || true
+uninstall_scope=all
+if [ "$role" = uninstall ] && [ $# -gt 0 ]; then
+  case $1 in
+    node|store|all) uninstall_scope=$1; shift ;;
+  esac
+fi
 apply= store= listen= writers= trusted= sign_key= prewarm=
 while [ $# -gt 0 ]; do
   case $1 in
@@ -206,7 +214,7 @@ stale_binary() {  # role
 write_service() {  # role, args...
   local r=$1; shift
   local label; label=$(label_for "$r")
-  local agent=$AGENTS/$label.plist daemon=/Library/LaunchDaemons/$label.plist
+  local agent=$AGENTS/$label.plist daemon=$LAUNCH_DAEMONS/$label.plist
   say "run $label: $BIN/fleet-cas $*"
   [ -n "$apply" ] || return 0
   mkdir -p "$AGENTS" "$LOGS" "$ROOT/run" "$ROOT/launchd"
@@ -352,16 +360,25 @@ case $role in
     fi
     ;;
   uninstall)
-    write_prewarm ""
+    case $uninstall_scope in
+      node|store|all) ;;
+      *) echo "uninstall scope must be node, store, or all" >&2; exit 2 ;;
+    esac
+    if [ "$uninstall_scope" = node ] || [ "$uninstall_scope" = all ]; then
+      write_prewarm ""
+    fi
     for r in node store; do
+      [ "$uninstall_scope" = all ] || [ "$uninstall_scope" = "$r" ] || continue
       label=$(label_for "$r")
       say "stop and remove $label (stores kept)"
       [ -z "$apply" ] || { launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true; rm -f "$AGENTS/$label.plist" "$ROOT/run/$r.args"; }
-      if [ -e "/Library/LaunchDaemons/$label.plist" ]; then
-        echo "ROOT STEP NEEDED: sudo launchctl bootout system/$label; sudo rm /Library/LaunchDaemons/$label.plist"
+      if [ -e "$LAUNCH_DAEMONS/$label.plist" ]; then
+        echo "ROOT STEP NEEDED: sudo launchctl bootout system/$label; sudo rm $LAUNCH_DAEMONS/$label.plist"
       fi
     done
-    do_ rm -f "$ROOT/fleet-cas.env"
+    if [ "$uninstall_scope" = node ] || [ "$uninstall_scope" = all ]; then
+      do_ rm -f "$ROOT/fleet-cas.env"
+    fi
     ;;
   *) sed -n '2,10p' "$0" >&2; exit 2 ;;
 esac
