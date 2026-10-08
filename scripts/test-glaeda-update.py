@@ -34,6 +34,9 @@ SOURCES = ["a" * 40, "b" * 40, "c" * 40]
 FAKE_SETUP = """#!/usr/bin/env python3
 import os, sys
 from pathlib import Path
+if "--help" in sys.argv:
+    print("options: --hygiene-only --headless --reclaim-binary")
+    raise SystemExit(0)
 bin_dir = Path(os.environ["GLAEDA_TEST_BIN"])
 bin_dir.mkdir(parents=True, exist_ok=True)
 code = int(Path(__file__).with_name("health-code").read_text())
@@ -63,23 +66,28 @@ class Server:
         self.files: dict[str, bytes] = {}
         self.paused = False
         self.rings: dict[str, dict] = {}
+        self.sources: list[str] = []
         self.source = gu.REPOSITORY  # the repository publish() puts releases in
 
     def publish(self, source: str, health_code: int = 0, archive: bytes | None = None,
                 runner_files: dict[str, bytes] | None = None, ancestry: list[str] | None = None,
-                hook_history: dict[str, list[bytes]] | None = None) -> dict:
+                hook_history: dict[str, list[bytes]] | None = None,
+                support_headless: bool = True) -> dict:
         tag = gr.release_tag(source, dt.datetime(2026, 9, 25))
         runner = {f"glaeda/scripts/{name}": ((runner_files or {}).get(name, f"{name} at {source}".encode()),
                                              0o755 if "." not in name else 0o644)
                   for name in gu.RUNNER_FILES}
-        extra = {"ancestry.txt": ("".join(c + "\n" for c in ancestry).encode(), 0o644)} if ancestry else {}
+        if ancestry is None:
+            ancestry = [source, *reversed(self.sources)]
+        extra = {"ancestry.txt": ("".join(c + "\n" for c in ancestry).encode(), 0o644)}
         if runner_files:  # the release's own hook versions, plus the older ones the test names
             history = {name: sorted({gr.sha256(runner[f"glaeda/scripts/{name}"][0])}
                                     | {gr.sha256(v) for v in (hook_history or {}).get(name, [])})
                        for name in gr.HOOK_FILES}
             extra["hook-history.json"] = (gr.canonical(history), 0o644)
         archive = archive or tar_gz({
-            "glaeda/scripts/glaeda-mini-setup": (FAKE_SETUP.encode(), 0o755),
+            "glaeda/scripts/glaeda-mini-setup":
+                ((FAKE_SETUP if support_headless else FAKE_SETUP.replace(" --headless", "")).encode(), 0o755),
             "glaeda/scripts/health-code": (str(health_code).encode(), 0o644),
             "bin/glaeda-worktree-reclaim": (b"binary", 0o755),
             **runner,
@@ -92,6 +100,7 @@ class Server:
         entry = gr.channel_entry("canary", json.loads(release_raw), release_raw, "2026-09-25T00:00:00Z")
         self.rings["canary"] = entry
         self.rings["stable"] = {**entry, "ring": "stable"}
+        self.sources.append(source)
         return entry
 
     def channel(self, ring: str) -> tuple[bytes, bytes | None]:
@@ -139,6 +148,30 @@ class UpdateTest(unittest.TestCase):
         self.assertIn("--reclaim-binary", runs)
         self.assertEqual(runs[-1], "1")  # setup knows glaeda-update is running it
         self.assertEqual(self.run_update()["result"], "current")
+
+    def test_incompatible_setup_args_are_refused_before_install_or_rollback(self) -> None:
+        self.config["setupArgs"] = ["--hygiene-only", "--headless"]
+        good = self.server.publish(SOURCES[0], support_headless=True)
+        self.assertEqual(self.run_update()["result"], "updated")
+        bad = self.server.publish(SOURCES[1], support_headless=False)
+        result = self.run_update()
+        self.assertEqual((result["result"], result["detail"]),
+                         ("refused", "release setup does not support --headless"))
+        self.assertEqual(gu.load_state(self.state)["current"], good["tag"])
+        self.assertEqual((self.bin / "setup-runs").read_text().splitlines(),
+                         [f"{good['tag']} --apply --hygiene-only --headless --reclaim-binary "
+                          f"{self.state / 'generations' / good['tag'] / 'bin/glaeda-worktree-reclaim'} 1"])
+        self.assertIn(bad["tag"], gu.load_state(self.state)["quarantined"])
+
+    def test_older_target_is_refused_before_setup(self) -> None:
+        older = self.server.publish(SOURCES[0])
+        newer = self.server.publish(SOURCES[1])
+        self.assertEqual(self.run_update()["result"], "updated")
+        self.server.rings["canary"] = older
+        result = self.run_update()
+        self.assertEqual(result["result"], "refused")
+        self.assertIn("older than installed", result["detail"])
+        self.assertEqual(gu.load_state(self.state)["current"], newer["tag"])
 
     def test_a_stale_runner_copy_is_refreshed_and_an_operators_newer_copy_kept(self) -> None:
         copy = self.root / "glaeda-runner/scripts"
@@ -238,7 +271,7 @@ class UpdateTest(unittest.TestCase):
         self.assertEqual(self.run_update()["result"], "updated")
         self.assertIn("kept", gu.refresh_runner_scripts(self.state, staged))
         newer = self.server.publish(SOURCES[1], runner_files=self.runner_files("the next release"),
-                                    ancestry=[SOURCES[1], "d" * 40], hook_history=self.older())
+                                    ancestry=[SOURCES[1], SOURCES[0], "d" * 40], hook_history=self.older())
         self.assertEqual(self.run_update()["result"], "updated")
         self.assertEqual(gu.runner_steps(self.state, staged, home),
                          {"runnerScripts": f"refreshed to {newer['tag']}", "runnerHooks": f"{newer['tag']}: 1 updated"})

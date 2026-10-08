@@ -32,6 +32,9 @@ What one run does, and what it refuses:
    names a release canaries verified. Extraction refuses absolute paths, `..`, links and devices.
 3. Installs by running that release's own scripts/glaeda-mini-setup --apply with the configured
    arguments and its prebuilt reclaim binary. Setup is idempotent and owns every installed file.
+   Before applying, the target must descend from the installed release (a stale or unrelated
+   channel is refused), and its setup help must advertise every configured flag. These checks
+   keep a channel mismatch or an older setup from reaching --apply or rollback.
 4. Health: the installed glaeda-disk and glaeda-worktree-reclaim must run, and the installed
    glaeda-update must plan against the live channel. On failure the previous release's setup runs
    again, or on a first update the snapshot of the tools taken before it is restored, and the failed
@@ -432,6 +435,63 @@ def release_descends_from(gen: Path, commit: object) -> bool:
         return False
 
 
+def release_source(gen: Path) -> str:
+    """Return the source commit recorded by a complete release generation."""
+    try:
+        value = json.loads((gen / "release.json").read_text()).get("source")
+    except (OSError, ValueError, TypeError):
+        raise UpdateError(f"{gen.name} has no readable release source") from None
+    if not isinstance(value, str) or not SHA_RE.fullmatch(value):
+        raise UpdateError(f"{gen.name} has an invalid release source")
+    return value
+
+
+def release_order(state_dir: Path, current: str | None, target: Path) -> str:
+    """Classify a target against the installed release using release ancestry.
+
+    A channel may be briefly stale or point at an unrelated branch. Neither is
+    safe to install over a known release, so callers fail closed for both.
+    """
+    if current is None:
+        return "new"
+    installed = generation(state_dir, current)
+    if not (installed / ".complete").is_file() or not (target / ".complete").is_file():
+        raise UpdateError("cannot establish release ancestry")
+    installed_source = release_source(installed)
+    target_source = release_source(target)
+    if installed_source == target_source:
+        return "same-source"
+    installed_descends_target = release_descends_from(installed, target_source)
+    target_descends_installed = release_descends_from(target, installed_source)
+    if installed_descends_target and not target_descends_installed:
+        return "older"
+    if target_descends_installed and not installed_descends_target:
+        return "new"
+    return "unknown"
+
+
+def setup_args_supported(gen: Path, args: list[str]) -> tuple[bool, str]:
+    """Check a release's setup parser before invoking it with --apply.
+
+    ``--help`` exits before setup planning or installation, making this a
+    side-effect-free compatibility probe for flags persisted by an older host.
+    """
+    script = gen / "glaeda/scripts/glaeda-mini-setup"
+    try:
+        result = subprocess.run([sys.executable, str(script), "--help"], capture_output=True, text=True,
+                                timeout=120, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, f"setup compatibility probe failed: {e}"
+    if result.returncode != 0:
+        return False, f"setup compatibility probe exited {result.returncode}"
+    options = set(re.findall(r"--[A-Za-z0-9][A-Za-z0-9-]*", result.stdout + result.stderr))
+    requested = [arg.split("=", 1)[0] for arg in [*args, "--reclaim-binary"] if arg.startswith("--")]
+    missing = sorted(set(requested) - options)
+    if missing:
+        return False, "release setup does not support " + ", ".join(missing)
+    return True, "setup arguments supported"
+
+
 def refresh_runner_scripts(state_dir: Path = STATE_DIR, target: Path = RUNNER_SCRIPTS) -> str:
     """Step 6: bring the staged runner copy to the installed release when it is older. Returns what it did."""
     if not target.is_dir():
@@ -534,6 +594,22 @@ def update(apply: bool, config: dict, state_dir: Path = STATE_DIR,
         state["quarantined"] = sorted(set(state["quarantined"]) | {entry["tag"]})[-20:]
         save_state(state, state_dir)
         return {**out, "result": "refused", "detail": str(e), "status": report(config, entry, False, str(e))}
+    try:
+        order = release_order(state_dir, state["current"], gen)
+    except UpdateError as e:
+        state["quarantined"] = sorted(set(state["quarantined"]) | {entry["tag"]})[-20:]
+        save_state(state, state_dir)
+        return {**out, "result": "refused", "detail": str(e), "status": report(config, entry, False, str(e))}
+    if order != "new":
+        detail = (f"target {entry['tag']} is {order} than installed {state['current']}; refusing to replace it")
+        state["quarantined"] = sorted(set(state["quarantined"]) | {entry["tag"]})[-20:]
+        save_state(state, state_dir)
+        return {**out, "result": "refused", "detail": detail, "status": report(config, entry, False, detail)}
+    supported, detail = setup_args_supported(gen, config["setupArgs"])
+    if not supported:
+        state["quarantined"] = sorted(set(state["quarantined"]) | {entry["tag"]})[-20:]
+        save_state(state, state_dir)
+        return {**out, "result": "refused", "detail": detail, "status": report(config, entry, False, detail)}
     if state["current"] is None:
         snapshot(state_dir, bin_dir)
     ok, log = run_setup(gen, config["setupArgs"])
