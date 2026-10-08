@@ -91,7 +91,16 @@ if [ -d "$F" ]; then
   e fleet_last_job "$last"
   e fleet_recipe "$(ls "$F/recipe-releases" 2>/dev/null | tail -1 | cut -c1-12)"
   e fleet_worker_sha "$(shasum -a 256 "$F/bin/worker" 2>/dev/null | cut -c1-12)"
-  pgrep -f "$F/bin/worker" >/dev/null && e fleet_worker_proc running || e fleet_worker_proc absent
+  # The installed worker may run from the root-only release path while the
+  # operator-facing fleet root keeps the wrapper and receipts. Prefer the
+  # launchd service state so the probe does not call a healthy worker absent.
+  worker_state=$(launchctl print "system/ai.manaflow.cmux-build-worker" 2>/dev/null |
+    awk -F' = ' '/^[[:space:]]*state = /{print $2; exit}')
+  if [ "$worker_state" = running ] || pgrep -f "$F/bin/worker" >/dev/null 2>&1; then
+    e fleet_worker_proc running
+  else
+    e fleet_worker_proc absent
+  fi
   # 0 when the wrapper turns catch-up off on purpose (remote-hit catch-up was slower until bulk warm lands).
   e fleet_catch_up "$(grep -oE '^export CMUX_CI_CATCH_UP=[0-9]+' "$F/bin/worker" 2>/dev/null | tail -1 | cut -d= -f2)"
   # Fleet compile cache (glaeda-fleet-cas): the fixed paths catch-up builds key on, by kind only.
@@ -155,6 +164,59 @@ if [ -e "$L" ] || [ -L "$L" ]; then
     if (flock($f, LOCK_EX | LOCK_NB)) { flock($f, LOCK_UN); print "free" }
     else { print $!{EWOULDBLOCK} ? "held" : "unknown" }' "$L" </dev/null 2>/dev/null)
   e host_lock "${hl:-unknown}"
+  # A non-blocking flock tells us that the lock is held, but not who holds it.  When the
+  # kernel exposes the open descriptor, lsof gives us a bounded PID and executable name.
+  # This is advisory evidence only: a root-owned process or a fast hand-off may be invisible.
+  # Never print argv, which can contain private job paths or credentials.
+  if [ "$hl" = held ] && [ -x /usr/sbin/lsof ]; then
+    owner_pid=
+    owner_comm=
+    saw_worker=no
+    saw_job=no
+    owners=$(/usr/sbin/lsof -nP -a -w -Fpc -- "$L" 2>/dev/null)
+    while IFS= read -r field; do
+      case "$field" in
+        p[0-9]*)
+          if [ -n "$owner_pid" ]; then
+            owner_comm=${owner_comm:-unknown}
+            # lsof's command field is a process name, not an argv.  Keep the record
+            # printable and bounded before it crosses the probe protocol.
+            owner_comm=$(printf '%s' "$owner_comm" | tr '\t\r\n' '   ' | cut -c1-120)
+            e host_lock_owner "$owner_pid|$owner_comm"
+            case "$owner_comm" in
+              worker|worker-*|worker_*|*cmux-build-worker*) saw_worker=yes ;;
+              *) saw_job=yes ;;
+            esac
+          fi
+          owner_pid=${field#p}
+          owner_comm=
+          ;;
+        c*) owner_comm=${field#c} ;;
+      esac
+    done <<EOF
+$owners
+EOF
+    if [ -n "$owner_pid" ]; then
+      owner_comm=${owner_comm:-unknown}
+      owner_comm=$(printf '%s' "$owner_comm" | tr '\t\r\n' '   ' | cut -c1-120)
+      e host_lock_owner "$owner_pid|$owner_comm"
+      case "$owner_comm" in
+        worker|worker-*|worker_*|*cmux-build-worker*) saw_worker=yes ;;
+        *) saw_job=yes ;;
+      esac
+    fi
+    if [ "$saw_job" = yes ]; then
+      e host_lock_activity active-job
+    elif [ "$saw_worker" = yes ]; then
+      # Only the persistent worker is visible.  This is the useful signal for a
+      # possible orphan, but it is not permission to kill or restart anything.
+      e host_lock_activity worker-only
+    else
+      e host_lock_activity unknown
+    fi
+  elif [ "$hl" = held ]; then
+    e host_lock_activity unknown
+  fi
 else
   e host_lock missing
 fi

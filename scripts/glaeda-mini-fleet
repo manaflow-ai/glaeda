@@ -254,7 +254,7 @@ PROBE_TIMEOUT = 90
 PREFLIGHT_TIMEOUT = 180
 LIST_KEYS = {"xcode_app", "xcode_ready", "disk", "launchd", "fleet_mtime", "ak_file", "ak_key",
              "pf_tool", "pf_submodule", "pf_pmset", "pf_runner", "pf_brew_formula", "pf_secret",
-             "ios_runtime", "ios_device", "fleet_cas_path"}
+             "ios_runtime", "ios_device", "fleet_cas_path", "host_lock_owner"}
 # Same rule as scripts/cmux_fleet.py NODE_RE: an opaque cmux-* fleet node id.
 NODE_ID_RE = re.compile(r"cmux-[a-z0-9][a-z0-9-]{2,59}\Z")
 VERSION_RE = re.compile(r"\d+(\.\d+){0,2}\Z")
@@ -663,6 +663,12 @@ def parse_probe(text: str) -> dict[str, Any]:
         "enrolled_node_id": out.get("fleet_node_id"),
         "reservation": probe_reservation(out.get("reservation"), out.get("reservation_raw")),
         "host_lock": out.get("host_lock"),
+        "host_lock_owners": [owner for line in out["host_lock_owner"]
+                             if (owner := parse_host_lock_owner(line)) is not None],
+        # active-job means lsof saw a non-worker process with the lock open. worker-only
+        # means only the persistent build worker was visible and is the signal to inspect
+        # an orphan; neither state authorizes a mutation from this read-only path.
+        "host_lock_activity": out.get("host_lock_activity"),
         "runner_worker": out.get("runner_worker") or "unknown",
         "ios_runtimes": ios_runtimes(out["ios_runtime"]),
         "ios_devices": [dict(zip(("runtime", "name"), v.split("|", 1))) for v in out["ios_device"] if "|" in v],
@@ -809,6 +815,36 @@ def parse_key(value: str) -> dict[str, Any]:
         return {"file": file, "fingerprint": None, "comment": fp, "options": options}
     comment, _, kind = parts[2].rpartition(" (")
     return {"file": file, "fingerprint": parts[1], "comment": comment, "type": kind.rstrip(")"), "options": options}
+
+
+def parse_host_lock_owner(value: str) -> dict[str, Any] | None:
+    """One bounded ``host_lock_owner`` probe line: ``pid|command``.
+
+    The command is an executable name from lsof, never argv.  A process name is
+    still untrusted remote evidence, so malformed lines are dropped rather than
+    allowed to make observe/check fail.
+    """
+    pid, sep, command = value.partition("|")
+    if not sep or not pid.isdigit() or not command or int(pid) <= 1:
+        return None
+    command = printable(command).strip()
+    if not command or len(command) > 120:
+        return None
+    kind = "worker" if (command == "worker" or command.startswith(("worker-", "worker_"))
+                         or "cmux-build-worker" in command) else "job"
+    return {"pid": int(pid), "command": command, "kind": kind}
+
+
+def host_lock_note(obs: dict[str, Any]) -> str:
+    """Bounded preflight text for a held host lock; read-only and advisory."""
+    if obs.get("host_lock") != "held":
+        return ""
+    activity = printable(str(obs.get("host_lock_activity") or "unknown"))
+    owners = obs.get("host_lock_owners") or []
+    names = [f"pid {owner['pid']}|{owner['command']}" for owner in owners[:4]
+             if isinstance(owner, dict) and isinstance(owner.get("pid"), int) and owner.get("command")]
+    detail = ", ".join(names) if names else "owner unavailable"
+    return f"; host.lock {activity} ({detail})"
 
 
 def options_digest(options: str) -> str:
@@ -2186,11 +2222,14 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
     runners = pf.get("runners") or []
     held = [r for r in runners if r.get("held") == "yes"]
     down = [r for r in runners if r.get("loaded") == "yes" and r.get("listening") == "no"]
+    lock_note = host_lock_note(obs)
     if held:
-        put("runner", "todo", "stopped by glaeda-mini-fleet for a renewal: " + ", ".join(r["name"] or r["dir"] for r in held),
+        put("runner", "todo", "stopped by glaeda-mini-fleet for a renewal: "
+            + ", ".join(r["name"] or r["dir"] for r in held) + lock_note,
             f"glaeda-mini-fleet repair {name} --yes starts it once the node is eligible", "self")
     elif down:
-        put("runner", "todo", "loaded, listener not running: " + ", ".join(r["name"] or r["dir"] for r in down),
+        put("runner", "todo", "loaded, listener not running: "
+            + ", ".join(r["name"] or r["dir"] for r in down) + lock_note,
             f"glaeda-mini-fleet repair {name} --yes restarts it", "self")
     elif runners:
         put("runner", "ok", ", ".join(r["name"] or r["dir"] for r in runners))
