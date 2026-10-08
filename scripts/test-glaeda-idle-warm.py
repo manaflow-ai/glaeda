@@ -493,6 +493,38 @@ class FuzzTest(Base):
             self.fail(f"the fuzzer started no app: {proc.communicate(timeout=10)[0]}")
         return int(pid_files[0].read_text())
 
+    def test_stopping_a_fuzzer_gives_it_a_sigterm_before_escalating(self) -> None:
+        class Child:
+            def __init__(self, wedged: bool = False) -> None:
+                self.events: list[tuple[str, object]] = []
+                self.wedged = wedged
+
+            def send_signal(self, signum: signal.Signals) -> None:
+                self.events.append(("signal", signum))
+
+            def wait(self, timeout: float | None = None) -> None:
+                self.events.append(("wait", timeout))
+                if self.wedged and len([event for event in self.events if event[0] == "wait"]) == 1:
+                    raise subprocess.TimeoutExpired("fuzz", timeout)
+
+            def kill(self) -> None:
+                self.events.append(("kill", None))
+
+        previous = warm._child
+        try:
+            graceful = Child()
+            warm._child = graceful
+            warm.stop_fuzz_child()
+            self.assertEqual(graceful.events, [("signal", signal.SIGTERM), ("wait", warm.FUZZ_STOP_GRACE_S)])
+
+            wedged = Child(wedged=True)
+            warm._child = wedged
+            warm.stop_fuzz_child()
+            self.assertEqual(wedged.events, [("signal", signal.SIGTERM), ("wait", warm.FUZZ_STOP_GRACE_S),
+                                              ("kill", None), ("wait", 1)])
+        finally:
+            warm._child = previous
+
     @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
     def test_fuzzes_a_staged_copy_of_the_main_build_beside_a_compile_at_low_priority(self) -> None:
         self.fuzz_setup()
