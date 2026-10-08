@@ -1212,10 +1212,18 @@ def platform_label(fam: Family) -> str:
 
 
 def _record_eviction_stuck(argv: list[str]) -> None:
-    path = str(argv[-1]) if argv else "unknown"
+    raw_path = str(argv[-1]) if argv else "unknown"
+    try:
+        path = os.path.realpath(raw_path)
+    except OSError:
+        path = raw_path
+    for finding in EVICTION_STUCK:
+        if finding.get("id") == "eviction_stuck" and finding.get("path") == path:
+            finding["count"] = int(finding.get("count", 1)) + 1
+            return
     EVICTION_STUCK.append({"id": "eviction_stuck", "severity": "error", "path": path,
                            "evidence": f"du timed out after {DU_TIMEOUT_S}s",
-                           "auto_fix": "pending"})
+                           "auto_fix": "pending", "count": 1})
 
 
 def _measurement_path_allowed(path: Path) -> bool:

@@ -78,6 +78,17 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(gd.EVICTION_STUCK[-1]["id"], "eviction_stuck")
         self.assertIn(str(self.root), gd.EVICTION_STUCK[-1]["path"])
 
+    def test_eviction_timeout_findings_aggregate_by_path(self) -> None:
+        saved = list(gd.EVICTION_STUCK)
+        gd.EVICTION_STUCK.clear()
+        self.addCleanup(lambda: (gd.EVICTION_STUCK.clear(), gd.EVICTION_STUCK.extend(saved)))
+        argv = ["du", "-xsk", str(self.root)]
+        gd._record_eviction_stuck(argv)
+        gd._record_eviction_stuck(argv)
+        self.assertEqual(len(gd.EVICTION_STUCK), 1)
+        self.assertEqual(gd.EVICTION_STUCK[0]["count"], 2)
+        self.assertEqual(gd.EVICTION_STUCK[0]["path"], str(self.root))
+
     def test_du_root_walk_refuses_filesystem_root(self) -> None:
         with mock.patch.object(gd, "_du_output") as run:
             self.assertIsNone(gd.du_children(Path("/")))
