@@ -93,6 +93,14 @@ class ManifestTests(unittest.TestCase):
     def test_example_loads(self) -> None:
         self.assertEqual(set(self.manifest["hosts"]), {"build-mini-1", "build-mini-2", "small-mini"})
 
+    def test_host_jump_route_is_validated_and_emitted(self) -> None:
+        self.manifest["hosts"]["build-mini-1"]["ssh_jump_host"] = "cmux-lawrence"
+        self.assertEqual(mf.host_ssh_options(self.manifest, "build-mini-1"),
+                         ("-o", "ProxyJump=cmux-lawrence"))
+        self.manifest["hosts"]["build-mini-1"]["ssh_jump_host"] = "bad host"
+        with self.assertRaisesRegex(mf.Failure, "ssh_jump_host"):
+            mf.host_ssh_options(self.manifest, "build-mini-1")
+
     def test_never_touch_host_is_refused(self) -> None:
         with self.assertRaisesRegex(mf.Failure, "never_touch"):
             mf.select_hosts(self.manifest, ["coordinator-mini"])
