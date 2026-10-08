@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import errno
 import json
 import os
 import plistlib
@@ -120,6 +121,22 @@ class RunnerHygieneTest(unittest.TestCase):
         self.install.manifest.write_text(json.dumps(manifest))
         self.install.snapshot.write_bytes(self.source.read_bytes())
         self.assertEqual(json.loads(self.install.manifest.read_text())["sha256"], digest)
+
+    def test_atomic_write_uses_os_directory_fsync_on_python39(self) -> None:
+        target = self.base / "atomic" / "snapshot"
+        with mock.patch.object(rh.Path, "open", side_effect=IsADirectoryError), \
+                mock.patch.object(rh.os, "fsync", wraps=rh.os.fsync) as fsync:
+            rh._atomic_write(target, b"snapshot", 0o644, os.getuid(), os.getgid())
+        self.assertEqual(target.read_bytes(), b"snapshot")
+        self.assertGreaterEqual(fsync.call_count, 2)  # file, then parent directory
+
+    def test_directory_fsync_falls_back_when_directory_flag_is_rejected(self) -> None:
+        with mock.patch.object(rh.os, "open", side_effect=[OSError(errno.EINVAL, "directory"), 41]), \
+                mock.patch.object(rh.os, "fsync") as fsync, \
+                mock.patch.object(rh.os, "close") as close:
+            rh._fsync_directory(self.base)
+        self.assertEqual(fsync.call_args.args, (41,))
+        close.assert_called_once_with(41)
 
 
 if __name__ == "__main__":

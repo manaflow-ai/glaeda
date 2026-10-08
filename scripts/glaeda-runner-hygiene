@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import dataclasses
+import errno
 import grp
 import hashlib
 import json
@@ -403,10 +404,34 @@ def _atomic_write(path: Path, data: bytes, mode: int, uid: int = 0, gid: int | N
             os.chown(temp, uid, _root_gid() if gid is None else gid)
         os.chmod(temp, mode)
         os.replace(temp, path)
-        with path.parent.open("rb") as directory:
-            os.fsync(directory.fileno())
+        _fsync_directory(path.parent)
     finally:
         temp.unlink(missing_ok=True)
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Fsync a renamed file's parent without relying on Path.open(directory).
+
+    macOS Python 3.9 raises ``IsADirectoryError`` for ``Path.open('rb')`` on a
+    directory.  ``os.open`` is the portable descriptor API; some filesystems
+    reject directory fsync with EINVAL/ENOTSUP, in which case the atomic rename
+    remains valid and the platform has no stronger directory durability API.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        descriptor = os.open(os.fspath(directory), flags)
+    except OSError as exc:
+        if exc.errno not in (errno.EINVAL, errno.ENOTSUP, errno.EISDIR):
+            raise
+        descriptor = os.open(os.fspath(directory), os.O_RDONLY)
+    try:
+        try:
+            os.fsync(descriptor)
+        except OSError as exc:
+            if exc.errno not in (errno.EINVAL, errno.ENOTSUP, errno.EISDIR):
+                raise
+    finally:
+        os.close(descriptor)
 
 
 def _immutable(path: Path, enabled: bool) -> None:
