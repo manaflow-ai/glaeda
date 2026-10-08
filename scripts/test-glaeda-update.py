@@ -161,7 +161,8 @@ class UpdateTest(unittest.TestCase):
         self.assertEqual((self.bin / "setup-runs").read_text().splitlines(),
                          [f"{good['tag']} --apply --hygiene-only --headless --reclaim-binary "
                           f"{self.state / 'generations' / good['tag'] / 'bin/glaeda-worktree-reclaim'} 1"])
-        self.assertIn(bad["tag"], gu.load_state(self.state)["quarantined"])
+        self.assertNotIn(bad["tag"], gu.load_state(self.state)["quarantined"])
+        self.assertEqual(self.run_update()["result"], "refused")
 
     def test_older_target_is_refused_before_setup(self) -> None:
         older = self.server.publish(SOURCES[0])
@@ -172,6 +173,13 @@ class UpdateTest(unittest.TestCase):
         self.assertEqual(result["result"], "refused")
         self.assertIn("older than installed", result["detail"])
         self.assertEqual(gu.load_state(self.state)["current"], newer["tag"])
+        self.assertNotIn(older["tag"], gu.load_state(self.state)["quarantined"])
+        unknown = self.server.publish(SOURCES[2], ancestry=[SOURCES[2], "d" * 40])
+        self.server.rings["canary"] = unknown
+        result = self.run_update()
+        self.assertEqual(result["result"], "refused")
+        self.assertIn("unknown than installed", result["detail"])
+        self.assertNotIn(unknown["tag"], gu.load_state(self.state)["quarantined"])
 
     def test_a_stale_runner_copy_is_refreshed_and_an_operators_newer_copy_kept(self) -> None:
         copy = self.root / "glaeda-runner/scripts"

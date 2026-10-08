@@ -34,7 +34,9 @@ What one run does, and what it refuses:
    arguments and its prebuilt reclaim binary. Setup is idempotent and owns every installed file.
    Before applying, the target must descend from the installed release (a stale or unrelated
    channel is refused), and its setup help must advertise every configured flag. These checks
-   keep a channel mismatch or an older setup from reaching --apply or rollback.
+   keep a channel mismatch or an older setup from reaching --apply or rollback. Mismatches are
+   re-evaluated on the next run; only a failed release artifact or post-install health check is
+   quarantined.
 4. Health: the installed glaeda-disk and glaeda-worktree-reclaim must run, and the installed
    glaeda-update must plan against the live channel. On failure the previous release's setup runs
    again, or on a first update the snapshot of the tools taken before it is restored, and the failed
@@ -602,13 +604,13 @@ def update(apply: bool, config: dict, state_dir: Path = STATE_DIR,
         return {**out, "result": "refused", "detail": str(e), "status": report(config, entry, False, str(e))}
     if order != "new":
         detail = (f"target {entry['tag']} is {order} than installed {state['current']}; refusing to replace it")
-        state["quarantined"] = sorted(set(state["quarantined"]) | {entry["tag"]})[-20:]
-        save_state(state, state_dir)
+        # This is a channel or host-configuration mismatch, not a failed artifact.
+        # Re-evaluate it after the channel advances or setup flags change.
         return {**out, "result": "refused", "detail": detail, "status": report(config, entry, False, detail)}
     supported, detail = setup_args_supported(gen, config["setupArgs"])
     if not supported:
-        state["quarantined"] = sorted(set(state["quarantined"]) | {entry["tag"]})[-20:]
-        save_state(state, state_dir)
+        # An older release can be valid for another host profile. Do not turn a
+        # persisted setup flag mismatch into an operator-cleared release gate.
         return {**out, "result": "refused", "detail": detail, "status": report(config, entry, False, detail)}
     if state["current"] is None:
         snapshot(state_dir, bin_dir)

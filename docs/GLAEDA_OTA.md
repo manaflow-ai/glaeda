@@ -44,6 +44,11 @@ but still installs through `glaeda-mini-fleet upgrade` (below).
    quarantines the failed release on that host. The health check plans from the channel files
    the run already fetched, so a network blip cannot fail a good release.
 
+   A stale or unrelated channel target, or a target whose setup does not support this host's
+   persisted flags, is refused before `--apply` and is re-evaluated after the channel or host
+   configuration changes. It is not treated as a failed release artifact that needs operator
+   quarantine clearing.
+
    On a runner mini, each run (not only one that installs a release) then brings
    `~/glaeda-runner/scripts` to the installed release when it is older, and the runners'
    `glaeda-hooks/glaeda-cmux-runner-hook` and `glaeda_reservation.py` too when theirs are versions the
