@@ -107,7 +107,7 @@ import stat
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
@@ -140,8 +140,12 @@ DARWIN = platform.system() == "Darwin"
 # zero-byte reclaim candidate.
 DU_TIMEOUT_S = 30
 DU_KILL_GRACE_S = 1
+# A refresh is a background convenience, not a reason to keep a runner CPU-bound for hours.  The
+# snapshot keeps completed measurements, so a later refresh can finish the remaining candidates.
+REFRESH_BUDGET_S = 10 * 60
 EVICTION_STUCK: list[dict[str, Any]] = []
 _EVICT_HANDLE = None
+_MEASURE_BUDGET_REACHED = False
 
 # Never ask du to enumerate the data volume. These are the bounded roots that account for
 # runner work and rebuildable state on a mini. Cloud/FileProvider placeholders can block in
@@ -2814,7 +2818,8 @@ def launch_background_refresh() -> bool:
     fd = handle.fileno()
     try:
         subprocess.Popen([sys.executable, os.path.abspath(__file__), "--refresh", "--top", "0",
-                          "--min-mib", "0", "--refresh-lock-fd", str(fd)],
+                          "--min-mib", "0", "--refresh-budget-s", str(REFRESH_BUDGET_S),
+                          "--refresh-lock-fd", str(fd)],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          stdin=subprocess.DEVNULL, start_new_session=True, pass_fds=(fd,))
     except (OSError, subprocess.SubprocessError):
@@ -2826,8 +2831,60 @@ def launch_background_refresh() -> bool:
     return True
 
 
+def _measure_missing(paths: list[Path], deadline: float | None = None) -> dict[str, int]:
+    """Measure paths with a bounded number of workers, stopping new walks at ``deadline``.
+
+    ``du`` has its own timeout, but an unbounded list of candidates could still keep a refresh alive
+    indefinitely.  Keep only a small in-flight batch so a refresh can stop without first queuing tens
+    of thousands of subprocesses.  Running walks are already killable by ``_du_output`` and are
+    allowed to finish their bounded cleanup after the deadline.
+    """
+    if not paths:
+        return {}
+    measured: dict[str, int] = {}
+    pool = ThreadPoolExecutor(max_workers=8)
+    pending: dict[object, Path] = {}
+    next_path = 0
+
+    def fill() -> None:
+        nonlocal next_path
+        while next_path < len(paths) and len(pending) < 8:
+            if deadline is not None and time.monotonic() >= deadline:
+                return
+            path = paths[next_path]
+            next_path += 1
+            pending[pool.submit(du_bytes, path)] = path
+
+    try:
+        fill()
+        while pending:
+            timeout = None if deadline is None else max(0.0, deadline - time.monotonic())
+            if timeout == 0:
+                break
+            done, _ = wait(tuple(pending), timeout=timeout)
+            if not done:
+                break
+            for future in done:
+                path = pending.pop(future)
+                try:
+                    size = future.result()
+                except (OSError, subprocess.SubprocessError):
+                    size = None
+                if size is not None:
+                    measured[str(path)] = size
+            fill()
+    finally:
+        for future in pending:
+            future.cancel()
+        # Do not wait for a walk that is already in _du_output: its subprocess has the 30s bound,
+        # and waiting here would make the refresh budget meaningless.
+        pool.shutdown(wait=False, cancel_futures=True)
+    return measured
+
+
 def survey(families: list[Family], idle_hours: float, min_bytes: int,
-           known: dict[str, int] | None = None, defer_bulk: bool = False) -> list[Item]:
+           known: dict[str, int] | None = None, defer_bulk: bool = False,
+           deadline: float | None = None) -> list[Item]:
     """Judge every candidate live. Sizes come from `known` when present; the rest are measured.
 
     With defer_bulk, unsized candidates of bulk_sizes families are left out instead of measured,
@@ -2835,10 +2892,13 @@ def survey(families: list[Family], idle_hours: float, min_bytes: int,
     """
     with ThreadPoolExecutor(max_workers=1) as bg:
         evidence = bg.submit(process_evidence)  # lsof is the slowest single call; overlap it
-        return _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk)
+        return _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk, deadline)
 
 
-def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False) -> list[Item]:
+def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
+            deadline: float | None = None) -> list[Item]:
+    global _MEASURE_BUDGET_REACHED
+    _MEASURE_BUDGET_REACHED = False
     _NESTED_WALKS.clear()
     now = time.time()
     items: list[Item] = []
@@ -2849,20 +2909,41 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False) 
     for fam in families:
         # a few new entries are cheaper to size one by one than by re-walking the whole root
         if fam.bulk_sizes and sum(str(p) not in known for f, p in work if f is fam) >= BULK_SIZE_MIN:
+            if deadline is not None and time.monotonic() >= deadline:
+                _MEASURE_BUDGET_REACHED = True
+                break
             walked = du_children(fam.root)
             if walked is not None:
                 known.update({k: v for k, v in walked.items() if k not in known})
     missing = [path for _, path in work if str(path) not in known]
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        measured = dict(zip(map(str, missing), pool.map(du_bytes, missing)))
+    if deadline is not None and time.monotonic() >= deadline:
+        _MEASURE_BUDGET_REACHED = True
+        measured = {}
+    else:
+        measured = _measure_missing(missing, deadline)
+        if deadline is not None and time.monotonic() >= deadline:
+            _MEASURE_BUDGET_REACHED = True
     # A failed walk is unsized, never zero bytes.  Do not put it in the snapshot or judge it for
     # reclaim; the next report will retry it without allowing a stale zero to hide the tree.
     known.update({path: size for path, size in measured.items() if size is not None})
     work = [(fam, path) for fam, path in work if str(path) in known]
     sizes = [known[str(path)] for _, path in work]
     floors = [min_bytes if fam.min_bytes is None else fam.min_bytes for fam, _ in work]
-    idles = [(now - item_mtime(fam, path)) / 3600
-             if size >= floor else 0.0 for (fam, path), size, floor in zip(work, sizes, floors)]
+    idles = []
+    if deadline is None:
+        idles = [(now - item_mtime(fam, path)) / 3600
+                 if size >= floor else 0.0 for (fam, path), size, floor in zip(work, sizes, floors)]
+    else:
+        # A refresh deadline also covers the live verdict pass.  A large completed batch must not
+        # turn a bounded measurement into another unbounded walk of every candidate's metadata.
+        keep = 0
+        for (fam, path), size, floor in zip(work, sizes, floors):
+            if time.monotonic() >= deadline:
+                _MEASURE_BUDGET_REACHED = True
+                break
+            idles.append((now - item_mtime(fam, path)) / 3600 if size >= floor else 0.0)
+            keep += 1
+        work, sizes, floors = work[:keep], sizes[:keep], floors[:keep]
     try:
         cwds, cmds = evidence.result()
         blind = ""
@@ -3905,6 +3986,7 @@ def main(argv: list[str] | None = None) -> int:
                     help="with --dedupe: skip files changed this recently, wait and retry (up to 3 passes)")
     ap.add_argument("--refresh", action="store_true", help="re-measure all sizes now")
     ap.add_argument("--refresh-lock-fd", type=int, default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--refresh-budget-s", type=float, default=0, help=argparse.SUPPRESS)
     ap.add_argument("--max-age", type=float, default=15,
                     help="minutes before the size snapshot is refreshed in the background (default 15)")
     ap.add_argument("--no-snapshot", action="store_true", help=argparse.SUPPRESS)  # tests
@@ -4027,7 +4109,11 @@ def main(argv: list[str] | None = None) -> int:
             print("another measurement running; skipped")
             return 0
         measure_lock = None
-    items = survey(fams, idle, a.min_mib * 1024**2, known, defer_bulk=bool(at) and not a.apply)
+    refresh_deadline = None
+    if a.refresh and a.refresh_budget_s > 0:
+        refresh_deadline = time.monotonic() + a.refresh_budget_s
+    items = survey(fams, idle, a.min_mib * 1024**2, known,
+                   defer_bulk=bool(at) and not a.apply, deadline=refresh_deadline)
     # Release the measurement lock before starting a background refresh. The child must be able to
     # acquire it, otherwise every stale report spawns a refresh that immediately skips.
     if measure_lock is not None:
@@ -4051,6 +4137,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"sizes from {age_min:.0f} min ago"
               f"{' (refreshing in background)' if age_min > a.max_age and not a.apply else ''};"
               " verdicts are live\n")
+    if a.refresh and _MEASURE_BUDGET_REACHED and not a.json:
+        print(f"refresh budget reached after {a.refresh_budget_s:g}s; completed measurements were saved; "
+              "the next refresh will continue\n")
     shown = [fs for fs in fss.values() if not a.pressure or fs.under]
     accounting = filesystem_accounting(shown, items)
     write_health_summary(shown, items, accounting, a.receipt)

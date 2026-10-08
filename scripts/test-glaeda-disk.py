@@ -168,6 +168,15 @@ class GlaedaDiskTest(unittest.TestCase):
             items = gd.survey([self.fam], 24, 1 << 20)
         self.assertEqual(items, [])
 
+    def test_refresh_budget_does_not_start_walks_after_deadline(self) -> None:
+        make(self.root / "a", mib=2)
+        with mock.patch.object(gd, "du_bytes") as du:
+            items = gd.survey([self.fam], 24, 1 << 20,
+                              deadline=time.monotonic() - 1)
+        self.assertEqual(items, [])
+        du.assert_not_called()
+        self.assertTrue(gd._MEASURE_BUDGET_REACHED)
+
     def verdicts(self, idle: float = 24) -> dict[str, str]:
         return {Path(i.path).name: i.verdict for i in gd.survey([self.fam], idle, 0)}
 
@@ -756,6 +765,9 @@ class GlaedaDiskTest(unittest.TestCase):
             self.assertIn("--refresh-lock-fd", popen.call_args.args[0])
             self.assertEqual(kwargs["pass_fds"][0],
                              int(popen.call_args.args[0][popen.call_args.args[0].index("--refresh-lock-fd") + 1]))
+            self.assertIn("--refresh-budget-s", popen.call_args.args[0])
+            self.assertEqual(float(popen.call_args.args[0][popen.call_args.args[0].index("--refresh-budget-s") + 1]),
+                             gd.REFRESH_BUDGET_S)
             gd.refresh_lock_path().unlink(missing_ok=True)
         finally:
             gd.SNAPSHOT = saved_snapshot
