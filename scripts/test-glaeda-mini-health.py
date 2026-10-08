@@ -165,14 +165,34 @@ class Detection(Base):
 
 class DiskAndLeaks(Base):
     def test_stuck_eviction_is_reported_as_health_finding(self) -> None:
-        self.mini.disk = {"schema": "glaeda-disk/v1", "findings": [{
+        self.mini.disk = {"schema": "glaeda-disk/v1", "at": NOW, "findings": [{
             "id": "eviction_stuck", "severity": "error", "path": "/Users/Shared/cmux-build-fleet",
-            "evidence": "du timed out after 30s", "auto_fix": "pending"
+            "evidence": "du timed out after 30s", "auto_fix": "pending", "count": 1
         }]}
         report = self.run_once()
         self.assertEqual(self.ids(report), ["eviction_stuck"])
         self.assertEqual(report["findings"][0]["severity"], "error")
         self.assertIn("du timed out", report["findings"][0]["evidence"])
+        self.assertEqual(report["findings"][0]["observed_at"], NOW)
+
+    def test_stuck_evictions_are_one_bounded_aggregate(self) -> None:
+        self.mini.disk = {"schema": "glaeda-disk/v1", "at": NOW, "findings": [
+            {"id": "eviction_stuck", "severity": "error", "path": "/tmp/a", "count": 2,
+             "evidence": "du timed out after 45s"},
+            {"id": "eviction_stuck", "severity": "error", "path": "/tmp/b", "count": 3,
+             "evidence": "du timed out after 45s"},
+            {"id": "eviction_stuck", "severity": "error", "path": "/tmp/a", "count": 1,
+             "evidence": "du timed out after 45s"},
+        ]}
+        report = self.run_once()
+        self.assertEqual(self.ids(report), ["eviction_stuck"])
+        stuck = report["findings"][0]
+        self.assertEqual(stuck["timeout_count"], 6)
+        self.assertEqual(stuck["path_count"], 2)
+        self.assertEqual(stuck["paths"], ["/tmp/a", "/tmp/b"])
+        self.assertEqual(stuck["observed_at"], NOW)
+        self.assertIn("du timed out after 45s", stuck["evidence"])
+        self.assertIn("6 path(s)", stuck["evidence"])
 
     def test_unmeasured_space_is_a_health_finding(self) -> None:
         self.mini.disk = {"schema": "glaeda-disk/v1", "accounting": [{"unmeasured": 5 * 1024**3,

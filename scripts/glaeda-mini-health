@@ -358,12 +358,55 @@ def check_disk_accounting(mini: Mini) -> list[dict[str, Any]]:
     if summary.get("schema") != "glaeda-disk/v1":
         return []
     findings: list[dict[str, Any]] = []
+    eviction_paths: list[str] = []
+    eviction_path_seen: set[str] = set()
+    eviction_path_count = 0
+    eviction_count = 0
+    eviction_severity = "warn"
+    eviction_auto_fix = "pending"
+    eviction_evidence = "du measurement timed out"
     for entry in summary.get("findings") or []:
         if not isinstance(entry, dict) or not entry.get("id"):
+            continue
+        if entry.get("id") == "eviction_stuck":
+            if not eviction_evidence or eviction_evidence == "du measurement timed out":
+                evidence = entry.get("evidence")
+                if isinstance(evidence, str) and evidence:
+                    eviction_evidence = evidence
+            path = entry.get("path")
+            if isinstance(path, str) and path and path not in eviction_path_seen:
+                eviction_path_seen.add(path)
+                eviction_path_count += 1
+                if len(eviction_paths) < 32:
+                    eviction_paths.append(path)
+            count = entry.get("count", 1)
+            try:
+                count = max(1, int(count)) if not isinstance(count, bool) else 1
+            except (TypeError, ValueError, OverflowError):
+                count = 1
+            eviction_count += count
+            if entry.get("severity") == "error":
+                eviction_severity = "error"
+            if entry.get("auto_fix") == "impossible":
+                eviction_auto_fix = "impossible"
             continue
         evidence = str(entry.get("evidence") or entry.get("path") or "disk eviction finding")
         findings.append(finding(str(entry["id"]), str(entry.get("severity") or "warn"), evidence,
                                 str(entry.get("auto_fix") or "pending"), "glaeda-disk reported this finding"))
+    if eviction_count:
+        aggregate = finding("eviction_stuck", eviction_severity,
+                            f"{eviction_evidence} on {eviction_count} path(s) "
+                            f"({len(eviction_paths)} unique)", eviction_auto_fix,
+                            "glaeda-disk reported repeated measurement timeouts")
+        aggregate["timeout_count"] = eviction_count
+        aggregate["path_count"] = eviction_path_count
+        aggregate["paths"] = eviction_paths
+        if eviction_path_count > len(aggregate["paths"]):
+            aggregate["paths_truncated"] = eviction_path_count - len(aggregate["paths"])
+        observed_at = summary.get("at")
+        if isinstance(observed_at, (int, float)) and not isinstance(observed_at, bool):
+            aggregate["observed_at"] = observed_at
+        findings.append(aggregate)
     accounting = summary.get("accounting") or []
     missing = sum(float(x.get("unclassified", x.get("unmeasured"))) for x in accounting
                   if isinstance(x, dict) and isinstance(x.get("unclassified", x.get("unmeasured")), (int, float)))
