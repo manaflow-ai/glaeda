@@ -326,6 +326,13 @@ class BorrowTests(unittest.TestCase):
         self.assertEqual(doc["reservation_schema"], mf.RESERVATION_SCHEMA)
         self.assertIsNone(doc["release"])
 
+    def test_lease_document_uses_host_ssh_user(self) -> None:
+        self.manifest["hosts"]["build-mini-1"]["ssh_user"] = "ec2-user"
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = mf.cmd_borrow(self.manifest, ["build-mini-1"], self.obs(), "std", "interactive", 1,
+                                 None, "leo@air", False, True)
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out.getvalue())["connection"]["user"], "ec2-user")
     OWNER = "leo@air+0123456789ab"
 
     def borrow(self, observed_doc: dict, hosts: list[str] | None = None, json_output: bool = False) -> tuple[int, str]:
@@ -474,6 +481,14 @@ class BorrowTests(unittest.TestCase):
         doc = json.loads(out.getvalue())
         self.assertEqual(doc["state"], "unavailable")
         self.assertEqual(doc["selection"]["excluded"], {"build-mini-1": "host lock held"})
+class ObservationTests(unittest.TestCase):
+    def test_observe_uses_host_ssh_user(self) -> None:
+        manifest = mf.load_manifest(EXAMPLE)
+        manifest["hosts"]["build-mini-1"]["ssh_user"] = "ec2-user"
+        with mock.patch.object(mf, "observe_host", return_value={"host": "build-mini-1", "reachable": True}) as probe:
+            got = mf.observe(manifest, ["build-mini-1"])
+        self.assertTrue(got["hosts"]["build-mini-1"]["reachable"])
+        probe.assert_called_once_with("build-mini-1", "ec2-user")
 
 
 class CheckTests(unittest.TestCase):
