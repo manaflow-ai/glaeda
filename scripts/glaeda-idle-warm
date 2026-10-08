@@ -106,6 +106,7 @@ _child: subprocess.Popen | None = None
 _holder: Path | None = None
 _grouped = False  # we lead the process group the build runs in
 _fuzzing = False  # a fuzz run (and its app) is under way
+FUZZ_STOP_GRACE_S = 5.0
 
 
 def record(**fields: Any) -> dict[str, Any]:
@@ -495,6 +496,27 @@ def kill_build(passes: int = 3) -> None:
         time.sleep(0.05)
 
 
+def stop_fuzz_child() -> None:
+    """Give the fuzzer a chance to run its shutdown hook before removing its process group.
+
+    The fuzzer owns the app's PTY/session cleanup.  Killing it first skips that cleanup and can leave a
+    Ghostty shell behind after the idle lane has gone away.  A wedged fuzzer still gets escalated by the
+    process-group cleanup in stop().
+    """
+    child = _child
+    if child is None:
+        return
+    with contextlib.suppress(OSError):
+        child.send_signal(signal.SIGTERM)
+    try:
+        child.wait(timeout=FUZZ_STOP_GRACE_S)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(OSError):
+            child.kill()
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            child.wait(timeout=1)
+
+
 def forget_inode_override() -> None:
     """The adopt steps set a per-user Xcode default that the build step deletes after the compile; a kill
     in between leaves it set for the user's other builds. No job runs while a catch-up does, so none needs it."""
@@ -504,12 +526,16 @@ def forget_inode_override() -> None:
 
 
 def stop(signum: int, _frame: Any) -> None:
-    """A job's admission (or launchd) wants us gone: end the build, then ourselves with the rest of the group.
-    The kernel drops the locks with the last fd; the hook ignores a holder file whose pid is dead, and kills
-    whatever of the group is left once we are gone."""
+    """A job's admission (or launchd) wants us gone: stop the lane, then ourselves with the rest of the group.
+    The fuzz runner gets a bounded SIGTERM first so it can close its PTY/session; the process-group cleanup
+    below remains the final guard for the app or a wedged runner. The kernel drops the locks with the last fd,
+    and the hook ignores a holder file whose pid is dead."""
     if _child is not None:
-        with contextlib.suppress(OSError):
-            _child.kill()
+        if _fuzzing:
+            stop_fuzz_child()
+        else:
+            with contextlib.suppress(OSError):
+                _child.kill()
     if _grouped:
         kill_build(passes=1)  # within the hook's WARM_YIELD_S; the killpg below takes the rest
         if _fuzzing:
