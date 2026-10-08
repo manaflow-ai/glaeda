@@ -671,8 +671,10 @@ jobs:
             target
           key: verify-cargo-cli-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ hashFiles('Cargo.lock') }}
 
-  # One check that stands for the whole workflow, under the old single job's name.
-  verify:
+  # One exact-head check that stands for the whole workflow. Keep this name stable so merge tooling can
+  # require the aggregate without enumerating every conditional job above.
+  ci-status:
+    name: ci-status
     if: ${{ always() && (github.event_name == 'pull_request' || github.repository == 'teamleaderleo/glaeda') }}
     needs: [changes, go, scripts, runner-tests, lint, test, cli]
     runs-on: ubuntu-24.04
