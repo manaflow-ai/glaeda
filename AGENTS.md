@@ -111,9 +111,12 @@ changes.
   persistence/recovery, rollback, secrets, concurrency, and destructive changes
   use the independent review required by their owning contract.
 - Ordinary repository writes and merges follow repository authority and the
-  expected reviewed head. Credentials/access widening, material spend, operator
-  service/network changes, releases/signing, external contact, destructive
-  non-test data changes, and irreversible migrations require human approval.
+  expected reviewed head. An explicitly authorized task may perform a named,
+  host-scoped service, network, or cleanup mutation when it records the exact
+  scope, bounded command, receipt, and fresh post-state verification. That
+  authorization does not widen credentials or access, approve material spend,
+  broad fleet changes, releases/signing, external contact, destructive non-test
+  data changes, or irreversible migrations without a proven recovery path.
 
 ## Agent-facing writing
 

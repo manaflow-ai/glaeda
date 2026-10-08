@@ -407,6 +407,17 @@ def check_disk_accounting(mini: Mini) -> list[dict[str, Any]]:
         if isinstance(observed_at, (int, float)) and not isinstance(observed_at, bool):
             aggregate["observed_at"] = observed_at
         findings.append(aggregate)
+    contention = summary.get("eviction_contention")
+    if isinstance(contention, dict):
+        owner = contention.get("owner")
+        if not isinstance(owner, dict):
+            owner = {}
+        pid = owner.get("pid", "?")
+        account = owner.get("owner", "unknown")
+        state = owner.get("state", "unknown")
+        findings.append(finding("eviction_contention", "warn",
+                                f"eviction skipped while pid {pid} ({account}, {state}) held the lock",
+                                "impossible", "the next scheduled pass retries; live scans are never killed"))
     accounting = summary.get("accounting") or []
     missing = sum(float(x.get("unclassified", x.get("unmeasured"))) for x in accounting
                   if isinstance(x, dict) and isinstance(x.get("unclassified", x.get("unmeasured")), (int, float)))

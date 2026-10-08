@@ -2537,7 +2537,7 @@ def eviction_owner_text(status: dict[str, Any]) -> str:
 
 def write_eviction_status(receipt: Path, status: dict[str, Any]) -> None:
     """Record a skipped eviction so ci-dash can distinguish contention from a quiet run."""
-    record = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(),
+    record = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "at_epoch": time.time(), "host": platform.node(),
               "outcome": "skipped", "family": "eviction", "reason": "another eviction running",
               "owner": status}
     try:
@@ -3339,7 +3339,63 @@ def filesystem_accounting(fss: list[Fs], items: list[Item]) -> list[dict[str, An
     return out
 
 
-def write_health_summary(fss: list[Fs], items: list[Item], accounting: list[dict[str, Any]]) -> None:
+EVICTION_CONTENTION_MAX_AGE_S = 60 * 60
+
+
+def read_eviction_contention(receipt: Path) -> dict[str, Any] | None:
+    """Read the latest bounded contention receipt while it is still actionable."""
+    try:
+        with receipt.open("rb") as handle:
+            handle.seek(max(0, handle.seek(0, os.SEEK_END) - 128 * 1024))
+            lines = handle.read().splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            record = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(record, dict) or record.get("family") != "eviction" or record.get("outcome") != "skipped":
+            continue
+        at_epoch = record.get("at_epoch")
+        if not isinstance(at_epoch, (int, float)) or isinstance(at_epoch, bool):
+            return None
+        if time.time() - at_epoch > EVICTION_CONTENTION_MAX_AGE_S:
+            return None
+        owner = record.get("owner")
+        if not isinstance(owner, dict):
+            owner = {}
+        bounded_owner = {key: owner[key] for key in ("state", "pid", "owner", "started_at", "age_s")
+                         if key in owner}
+        return {"at": record.get("at"), "at_epoch": at_epoch, "owner": bounded_owner}
+    return None
+
+
+def write_eviction_contention_health(receipt: Path) -> None:
+    """Refresh only the contention field when a run cannot acquire the eviction lock."""
+    contention = read_eviction_contention(receipt)
+    try:
+        try:
+            payload = json.loads(HEALTH_SUMMARY.read_text())
+            if not isinstance(payload, dict):
+                payload = {}
+        except (OSError, ValueError):
+            payload = {}
+        payload.setdefault("schema", "glaeda-disk/v1")
+        if contention is None:
+            payload.pop("eviction_contention", None)
+        else:
+            payload["eviction_contention"] = contention
+        HEALTH_SUMMARY.parent.mkdir(parents=True, exist_ok=True)
+        tmp = HEALTH_SUMMARY.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(payload, separators=(",", ":")))
+        os.replace(tmp, HEALTH_SUMMARY)
+    except OSError:
+        pass
+
+
+def write_health_summary(fss: list[Fs], items: list[Item], accounting: list[dict[str, Any]],
+                         receipt: Path | None = None) -> None:
     """Write the bounded local summary consumed by mini-health and ci-dash's Health row."""
     try:
         HEALTH_SUMMARY.parent.mkdir(parents=True, exist_ok=True)
@@ -3349,6 +3405,10 @@ def write_health_summary(fss: list[Fs], items: list[Item], accounting: list[dict
                    "accounting": [dict(x) for x in accounting],
                    "filesystems": [{"mount": x.mount, "free": x.free, "total": x.total,
                                     "under": x.under} for x in fss]}
+        if receipt is not None:
+            contention = read_eviction_contention(receipt)
+            if contention is not None:
+                payload["eviction_contention"] = contention
         tmp = HEALTH_SUMMARY.with_suffix(f".{os.getpid()}.tmp")
         tmp.write_text(json.dumps(payload, separators=(",", ":")))
         os.replace(tmp, HEALTH_SUMMARY)
@@ -3930,6 +3990,7 @@ def main(argv: list[str] | None = None) -> int:
         if acquire_evict_lock() is None:
             owner = eviction_owner_status()
             write_eviction_status(a.receipt, owner)
+            write_eviction_contention_health(a.receipt)
             print(f"another eviction running; skipped ({eviction_owner_text(owner)})")
             return 0
     idle = a.idle_hours if a.idle_hours is not None else IDLE_SWEEP_HOURS if sweep else (6 if under else 24)
@@ -3983,7 +4044,7 @@ def main(argv: list[str] | None = None) -> int:
               " verdicts are live\n")
     shown = [fs for fs in fss.values() if not a.pressure or fs.under]
     accounting = filesystem_accounting(shown, items)
-    write_health_summary(shown, items, accounting)
+    write_health_summary(shown, items, accounting, a.receipt)
     # Xcode copies are sized by a walk, so only a report shows them (the agent runs with --top 0)
     tooling = (simulator_runtimes() + (xcode_items() if a.top or a.json else [])) if sweep and DARWIN else []
     if a.json:

@@ -1357,6 +1357,7 @@ class GlaedaDiskTest(unittest.TestCase):
         receipt = ["--receipt", os.fspath(self.receipt())]
         with mock.patch.object(gd, "EVICT_LOCK", lock), \
                 mock.patch.object(gd, "EVICT_OWNER", self.root / "evict.owner.json"), \
+                mock.patch.object(gd, "HEALTH_SUMMARY", self.root / "summary.json"), \
                 mock.patch.object(gd, "filesystems", return_value={}), \
                 mock.patch.object(gd, "survey", return_value=[]) as survey, \
                 mock.patch.object(gd, "apply", return_value=0):
@@ -1372,6 +1373,8 @@ class GlaedaDiskTest(unittest.TestCase):
                 skipped = json.loads(self.receipt().read_text().splitlines()[-1])
                 self.assertEqual((skipped["outcome"], skipped["reason"], skipped["owner"]["pid"]),
                                  ("skipped", "another eviction running", os.getpid()))
+                summary = json.loads(gd.HEALTH_SUMMARY.read_text())
+                self.assertEqual(summary["eviction_contention"]["owner"]["pid"], os.getpid())
                 survey.assert_not_called()
             with contextlib.redirect_stdout(io.StringIO()):
                 gd.main(["--apply", "--no-snapshot", "--top", "0", *receipt])

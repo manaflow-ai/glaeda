@@ -175,6 +175,17 @@ class DiskAndLeaks(Base):
         self.assertIn("du timed out", report["findings"][0]["evidence"])
         self.assertEqual(report["findings"][0]["observed_at"], NOW)
 
+    def test_eviction_contention_is_reported_without_a_heal(self) -> None:
+        self.mini.disk = {"schema": "glaeda-disk/v1", "at": NOW,
+                          "eviction_contention": {"at_epoch": NOW, "owner": {
+                              "pid": 42, "owner": "runner", "state": "live"}}}
+        report = self.run_once()
+        self.assertEqual(self.ids(report), ["eviction_contention"])
+        finding = report["findings"][0]
+        self.assertEqual(finding["auto_fix"], "impossible")
+        self.assertIn("pid 42", finding["evidence"])
+        self.assertEqual(self.mini.did, [])
+
     def test_stuck_evictions_are_one_bounded_aggregate(self) -> None:
         self.mini.disk = {"schema": "glaeda-disk/v1", "at": NOW, "findings": [
             {"id": "eviction_stuck", "severity": "error", "path": "/tmp/a", "count": 2,
