@@ -52,7 +52,7 @@ if [ "$role" = uninstall ] && [ $# -gt 0 ]; then
     node|store|all) uninstall_scope=$1; shift ;;
   esac
 fi
-apply= store= listen= writers= trusted= sign_key= prewarm=
+apply= store= listen= writers= trusted= sign_key= prewarm= custom_store_volume_uuid=
 while [ $# -gt 0 ]; do
   case $1 in
     --apply) apply=1 ;;
@@ -93,11 +93,17 @@ check_custom_store_root() {
   volume_info=$(diskutil info "$ROOT" 2>/dev/null || true)
   fs_type=$(printf '%s\n' "$volume_info" | awk -F': *' '/Type \(Bundle\)/ {print tolower($2); exit}')
   mount_point=$(printf '%s\n' "$volume_info" | awk -F': *' '/Mount Point/ {print $2; exit}')
+  custom_store_volume_uuid=$(printf '%s\n' "$volume_info" | awk -F': *' '/Volume UUID/ {print $2; exit}')
   [ "$fs_type" = apfs ] || { echo "custom fleet-CAS store root must be APFS: $ROOT" >&2; exit 1; }
   case "$mount_point" in
     /Volumes/*) ;;
     *) echo "custom fleet-CAS store root must be a separate mounted /Volumes APFS volume: $ROOT" >&2; exit 1 ;;
   esac
+  case "$ROOT" in
+    "$mount_point"|"$mount_point"/*) ;;
+    *) echo "custom fleet-CAS store root is outside its mounted volume: $ROOT" >&2; exit 1 ;;
+  esac
+  [ -n "$custom_store_volume_uuid" ] || { echo "custom fleet-CAS store volume has no UUID: $ROOT" >&2; exit 1; }
   check_owner
 }
 
@@ -171,6 +177,7 @@ plist_for() {  # role, label, daemon (1 or empty)
   if [ "$1" = store ] && [ -n "${FLEET_CAS_ROOT:-}" ]; then
     printf '%s\n' '    <key>EnvironmentVariables</key>' '    <dict>' \
       '        <key>FLEET_CAS_ROOT</key>' "        <string>$(xml "$FLEET_CAS_ROOT")</string>" \
+      '        <key>FLEET_CAS_VOLUME_UUID</key>' "        <string>$(xml "$custom_store_volume_uuid")</string>" \
       '    </dict>'
   fi
   printf '%s\n' '    <key>RunAtLoad</key>' '    <true/>' '    <key>KeepAlive</key>' '    <true/>'

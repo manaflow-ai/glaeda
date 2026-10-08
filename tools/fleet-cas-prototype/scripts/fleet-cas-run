@@ -33,6 +33,59 @@ if ! while IFS= read -r a; do args+=("$a"); done <"$args_file"; then
   exit 1
 fi
 
+# A custom store root is supplied only for a separately mounted APFS volume. The installer
+# records that volume's UUID in the LaunchDaemon environment. Re-check both the mount and UUID
+# every time launchd starts the service so an unmounted sparsebundle, stale /Volumes directory,
+# or replacement volume cannot make the CAS write onto the controller's boot disk.
+validate_custom_store_volume() {
+  local root=$1 fs_type=$2 mount_point=$3 volume_uuid=$4 expected_uuid=$5
+  [ "$fs_type" = apfs ] || {
+    echo "fleet-cas: custom store root must be APFS: $root" >&2
+    return 1
+  }
+  case "$mount_point" in
+    /Volumes/*) ;;
+    *) echo "fleet-cas: custom store root must be a mounted /Volumes APFS volume: $root" >&2; return 1 ;;
+  esac
+  case "$root" in
+    "$mount_point"|"$mount_point"/*) ;;
+    *) echo "fleet-cas: custom store root is outside its mounted volume: $root" >&2; return 1 ;;
+  esac
+  [ -n "$expected_uuid" ] || {
+    echo "fleet-cas: FLEET_CAS_VOLUME_UUID is missing for custom store root: $root" >&2
+    return 1
+  }
+  [ "$volume_uuid" = "$expected_uuid" ] || {
+    echo "fleet-cas: custom store volume UUID changed (expected $expected_uuid, found $volume_uuid)" >&2
+    return 1
+  }
+}
+
+check_custom_store_root() {
+  [ "$role" = store ] || return 0
+  [ -n "${FLEET_CAS_ROOT:-}" ] || return 0
+  local volume_info fs_type mount_point volume_uuid expected_uuid
+  [ -d "$ROOT" ] || { echo "fleet-cas: custom store root is not mounted: $ROOT" >&2; return 1; }
+  command -v diskutil >/dev/null 2>&1 || {
+    echo "fleet-cas: diskutil is required to validate custom store root: $ROOT" >&2
+    return 1
+  }
+  volume_info=$(diskutil info "$ROOT" 2>/dev/null) || {
+    echo "fleet-cas: unable to inspect custom store root: $ROOT" >&2
+    return 1
+  }
+  fs_type=$(printf '%s\n' "$volume_info" | awk -F': *' '/Type \(Bundle\)/ {print tolower($2); exit}')
+  mount_point=$(printf '%s\n' "$volume_info" | awk -F': *' '/Mount Point/ {print $2; exit}')
+  volume_uuid=$(printf '%s\n' "$volume_info" | awk -F': *' '/Volume UUID/ {print $2; exit}')
+  expected_uuid=${FLEET_CAS_VOLUME_UUID:-}
+  validate_custom_store_volume "$ROOT" "$fs_type" "$mount_point" "$volume_uuid" "$expected_uuid"
+}
+
+if ! check_custom_store_root; then
+  clear_wait_receipts
+  exit 78
+fi
+
 is_ipv4() {
   local value=$1 octet
   [[ "$value" =~ ^[0-9]+(\.[0-9]+){3}$ ]] || return 1

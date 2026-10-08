@@ -216,8 +216,11 @@ artifact-cache directory or its eviction policy. If its payload root is on an ex
 prepare and mount a separate APFS volume or sparsebundle first, then pass
 `--store-root /Volumes/<compiler-cas>/store`. The rollout only points the store role at that
 existing path. It does not create, format, mount, or delete volumes. The root must be writable
-by the service user and retain the CAS store's atomic publication semantics. The writer remains
-the only trusted publisher, regardless of which host serves the store.
+by the service user and retain the CAS store's atomic publication semantics. The installer records
+the APFS volume UUID in the store LaunchDaemon, and `fleet-cas-run` revalidates that mount and
+UUID before every startup. If the volume is absent or replaced, the service stays stopped until
+the original volume is restored and the rollout is applied again. The writer remains the only
+trusted publisher, regardless of which host serves the store.
 `glaeda-fleet-cas uninstall [node|store|all] --apply` removes the selected services and
 keeps both node and fleet stores. The default scope is `all` for compatibility. Removing
 `store` leaves the reader node, its upstream environment and prewarm agent in place;

@@ -103,6 +103,12 @@ grep -q 'custom fleet-CAS store root is not mounted' "$temporary_root/missing-ro
 # restarted repeatedly by launchd. The fake ifconfig exposes the address on its second call.
 run_root=$temporary_root/run-wrapper
 mkdir -p "$run_root/bin" "$run_root/run"
+wrapper=$run_root/fleet-cas-run
+# Keep this bind-wait test on an isolated temporary root without presenting it as a deployed
+# custom store. The custom-store mount guard is exercised separately through its pure validator.
+sed "s|^ROOT=.*|ROOT=$run_root|" \
+  "$repo_root/tools/fleet-cas-prototype/scripts/fleet-cas-run" >"$wrapper"
+chmod +x "$wrapper"
 cat >"$run_root/bin/fleet-cas" <<'EOF'
 #!/usr/bin/env bash
 printf 'started %s\n' "$*"
@@ -123,8 +129,8 @@ chmod +x "$stub_bin/ifconfig" "$stub_bin/sleep"
 printf 'tcp:100.89.140.13:7450\nstore\n' >"$run_root/run/store.args"
 printf 'old-pid\n' >"$run_root/run/store.pid"
 printf 'old-bin\n' >"$run_root/run/store.bin"
-env FLEET_CAS_ROOT="$run_root" FLEET_CAS_IFCONFIG_STATE="$temporary_root/ifconfig.calls" PATH="$stub_bin:$PATH" \
-  "$repo_root/tools/fleet-cas-prototype/scripts/fleet-cas-run" store >"$temporary_root/run-wrapper.out" 2>"$temporary_root/run-wrapper.err"
+env -u FLEET_CAS_ROOT FLEET_CAS_IFCONFIG_STATE="$temporary_root/ifconfig.calls" PATH="$stub_bin:$PATH" \
+  "$wrapper" store >"$temporary_root/run-wrapper.out" 2>"$temporary_root/run-wrapper.err"
 grep -q 'waiting for local bind address 100.89.140.13' "$temporary_root/run-wrapper.err"
 grep -q 'started tcp:100.89.140.13:7450 store' "$temporary_root/run-wrapper.out"
 test "$(cat "$run_root/run/store.pid")" != old-pid
@@ -138,8 +144,8 @@ exit 0
 EOF
 printf 'stale-pid\n' >"$run_root/run/store.pid"
 printf 'stale-bin\n' >"$run_root/run/store.bin"
-if env FLEET_CAS_ROOT="$run_root" PATH="$stub_bin:$PATH" \
-  "$repo_root/tools/fleet-cas-prototype/scripts/fleet-cas-run" store >"$temporary_root/timeout.out" 2>"$temporary_root/timeout.err"; then
+if env -u FLEET_CAS_ROOT PATH="$stub_bin:$PATH" \
+  "$wrapper" store >"$temporary_root/timeout.out" 2>"$temporary_root/timeout.err"; then
   exit 1
 fi
 grep -q 'timed out after 60s waiting for local bind address 100.89.140.13' "$temporary_root/timeout.err"
@@ -161,8 +167,8 @@ for role_endpoint in \
   'store|tcp:100.89.140.13:not-a-port'; do
   role=${role_endpoint%%|*}; endpoint=${role_endpoint#*|}
   printf '%s\n' "$endpoint" >"$run_root/run/$role.args"
-  env FLEET_CAS_ROOT="$run_root" FLEET_CAS_IFCONFIG_CALLS="$temporary_root/ifconfig.unexpected" PATH="$stub_bin:$PATH" \
-    "$repo_root/tools/fleet-cas-prototype/scripts/fleet-cas-run" "$role" >"$temporary_root/$role-${endpoint//[^A-Za-z0-9]/_}.out"
+  env -u FLEET_CAS_ROOT FLEET_CAS_IFCONFIG_CALLS="$temporary_root/ifconfig.unexpected" PATH="$stub_bin:$PATH" \
+    "$wrapper" "$role" >"$temporary_root/$role-${endpoint//[^A-Za-z0-9]/_}.out"
 done
 test ! -e "$temporary_root/ifconfig.unexpected"
 
@@ -210,8 +216,8 @@ wait "$waiting_pid" 2>/dev/null || true
 rm -f "$run_root/run/store.args"
 printf 'stale-pid\n' >"$run_root/run/store.pid"
 printf 'stale-bin\n' >"$run_root/run/store.bin"
-if env FLEET_CAS_ROOT="$run_root" PATH="$stub_bin:$PATH" \
-  "$repo_root/tools/fleet-cas-prototype/scripts/fleet-cas-run" store >"$temporary_root/missing.out" 2>"$temporary_root/missing.err"; then
+if env -u FLEET_CAS_ROOT PATH="$stub_bin:$PATH" \
+  "$wrapper" store >"$temporary_root/missing.out" 2>"$temporary_root/missing.err"; then
   exit 1
 fi
 test ! -e "$run_root/run/store.pid"

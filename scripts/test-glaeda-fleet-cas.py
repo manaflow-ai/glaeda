@@ -12,6 +12,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "scripts" / "glaeda-fleet-cas"
+RUNNER = ROOT / "tools" / "fleet-cas-prototype" / "scripts" / "fleet-cas-run"
 
 
 def preflight_body() -> str:
@@ -19,6 +20,14 @@ def preflight_body() -> str:
     text = INSTALLER.read_text(encoding="utf-8")
     start = text.index("check_upstream() {")
     end = text.index("\n}\n\n# The plist", start) + 2
+    return text[start:end]
+
+
+def volume_guard_body() -> str:
+    """Extract the pure custom-volume validator from the launchd wrapper."""
+    text = RUNNER.read_text(encoding="utf-8")
+    start = text.index("validate_custom_store_volume() {")
+    end = text.index("\n}\n\ncheck_custom_store_root", start) + 2
     return text[start:end]
 
 
@@ -58,6 +67,59 @@ class UpstreamPreflightTest(unittest.TestCase):
         result = self.run_check("100.89.140.13:7450:extra")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("want HOST:PORT", result.stderr)
+
+
+class CustomStoreVolumeTest(unittest.TestCase):
+    def run_check(
+        self,
+        root: str,
+        filesystem: str,
+        mount_point: str,
+        volume_uuid: str,
+        expected_uuid: str,
+    ) -> subprocess.CompletedProcess[str]:
+        command = f'{volume_guard_body()}\nvalidate_custom_store_volume "$@"'
+        return subprocess.run(
+            ["bash", "-c", command, "fleet-cas-test", root, filesystem, mount_point, volume_uuid, expected_uuid],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def test_accepts_expected_apfs_volume_and_child_root(self) -> None:
+        result = self.run_check(
+            "/Volumes/compiler-cas/store",
+            "apfs",
+            "/Volumes/compiler-cas",
+            "ABC-123",
+            "ABC-123",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rejects_non_apfs_volume(self) -> None:
+        result = self.run_check("/Volumes/compiler-cas", "exfat", "/Volumes/compiler-cas", "ABC", "ABC")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must be APFS", result.stderr)
+
+    def test_rejects_boot_volume_mount(self) -> None:
+        result = self.run_check("/Volumes/compiler-cas", "apfs", "/", "ABC", "ABC")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("mounted /Volumes", result.stderr)
+
+    def test_rejects_root_outside_reported_mount(self) -> None:
+        result = self.run_check("/Volumes/other/store", "apfs", "/Volumes/compiler-cas", "ABC", "ABC")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("outside its mounted volume", result.stderr)
+
+    def test_rejects_replacement_volume_uuid(self) -> None:
+        result = self.run_check("/Volumes/compiler-cas", "apfs", "/Volumes/compiler-cas", "NEW", "OLD")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("volume UUID changed", result.stderr)
+
+    def test_requires_recorded_volume_uuid(self) -> None:
+        result = self.run_check("/Volumes/compiler-cas", "apfs", "/Volumes/compiler-cas", "ABC", "")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("VOLUME_UUID is missing", result.stderr)
 
 
 if __name__ == "__main__":
