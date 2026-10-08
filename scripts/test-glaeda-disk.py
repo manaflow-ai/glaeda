@@ -116,7 +116,10 @@ class GlaedaDiskTest(unittest.TestCase):
         try:
             handle = gd.acquire_evict_lock()
             self.assertIsNotNone(handle)
-            self.assertEqual(json.loads(gd.EVICT_OWNER.read_text())["pid"], os.getpid())
+            owner = json.loads(gd.EVICT_OWNER.read_text())
+            self.assertEqual(owner["pid"], os.getpid())
+            self.assertEqual(owner["owner"], gd.pwd.getpwuid(os.getuid()).pw_name)
+            self.assertIn(f"pid={os.getpid()}", gd.eviction_owner_text(gd.eviction_owner_status()))
             gd.release_evict_lock(handle)
             self.assertFalse(gd.EVICT_OWNER.exists())
             with gd.EVICT_LOCK.open("a") as other:
@@ -1352,15 +1355,23 @@ class GlaedaDiskTest(unittest.TestCase):
     def test_one_eviction_at_a_time(self) -> None:
         lock = self.root / "evict.lock"
         receipt = ["--receipt", os.fspath(self.receipt())]
-        with mock.patch.object(gd, "EVICT_LOCK", lock), mock.patch.object(gd, "filesystems", return_value={}), \
+        with mock.patch.object(gd, "EVICT_LOCK", lock), \
+                mock.patch.object(gd, "EVICT_OWNER", self.root / "evict.owner.json"), \
+                mock.patch.object(gd, "filesystems", return_value={}), \
                 mock.patch.object(gd, "survey", return_value=[]) as survey, \
                 mock.patch.object(gd, "apply", return_value=0):
             with lock.open("a") as held:
                 fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                gd.EVICT_OWNER.write_text(json.dumps({"pid": os.getpid(), "owner": "test-owner",
+                                                       "started_at": time.time(), "command": "glaeda-disk --apply"}))
                 out = io.StringIO()
                 with contextlib.redirect_stdout(out):
                     self.assertEqual(gd.main(["--apply", "--no-snapshot", "--top", "0", *receipt]), 0)
                 self.assertIn("another eviction running", out.getvalue())
+                self.assertIn(f"pid={os.getpid()} owner=test-owner", out.getvalue())
+                skipped = json.loads(self.receipt().read_text().splitlines()[-1])
+                self.assertEqual((skipped["outcome"], skipped["reason"], skipped["owner"]["pid"]),
+                                 ("skipped", "another eviction running", os.getpid()))
                 survey.assert_not_called()
             with contextlib.redirect_stdout(io.StringIO()):
                 gd.main(["--apply", "--no-snapshot", "--top", "0", *receipt])

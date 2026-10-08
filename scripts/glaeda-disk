@@ -2502,6 +2502,52 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def eviction_owner_status() -> dict[str, Any]:
+    """Read the current eviction owner for bounded status and receipts."""
+    try:
+        owner = json.loads(EVICT_OWNER.read_text())
+        if not isinstance(owner, dict):
+            raise ValueError("owner is not an object")
+        pid = int(owner.get("pid", 0))
+        started = float(owner.get("started_at", 0))
+    except (OSError, ValueError, TypeError):
+        return {"state": "unavailable", "owner": "unknown"}
+    name = owner.get("owner")
+    if not isinstance(name, str) or not name:
+        name = "unknown"
+    command = owner.get("command")
+    if not isinstance(command, str) or not command:
+        command = _owner_command(pid)
+    return {"state": "live" if _pid_alive(pid) else "dead", "pid": pid, "owner": name,
+            "started_at": started, "age_s": max(0.0, time.time() - started) if started else None,
+            "command": command[:300]}
+
+
+def eviction_owner_text(status: dict[str, Any]) -> str:
+    """Render owner evidence without exposing an unbounded command line."""
+    if status.get("state") == "unavailable":
+        return "owner=unknown"
+    started = status.get("started_at")
+    when = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(started)) if isinstance(started, (int, float)) else "?"
+    age = status.get("age_s")
+    age_text = f"{age:.0f}s" if isinstance(age, (int, float)) else "?"
+    return (f"pid={status.get('pid', '?')} owner={status.get('owner', 'unknown')} "
+            f"started={when} age={age_text} state={status.get('state', 'unknown')}")
+
+
+def write_eviction_status(receipt: Path, status: dict[str, Any]) -> None:
+    """Record a skipped eviction so ci-dash can distinguish contention from a quiet run."""
+    record = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(),
+              "outcome": "skipped", "family": "eviction", "reason": "another eviction running",
+              "owner": status}
+    try:
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        with receipt.open("a") as handle:
+            handle.write(json.dumps(record) + "\n")
+    except OSError:
+        pass
+
+
 def cmux_active(path: Path, levels: int = 3, budget: int = 5000) -> bool:
     """cmuxterm-hq's reload-cloud marks a slot busy while a job runs: <slot>/.cmux-active/pid with a
     live pid, or work/<slot>/.lock (lib/cloud-slot-runtime.sh). Either, at or up to `levels` below path,
@@ -3358,8 +3404,12 @@ def _take_over_stale_evict_owner() -> bool:
 
 def _write_evict_owner() -> None:
     EVICT_OWNER.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        owner = pwd.getpwuid(os.getuid()).pw_name
+    except (KeyError, OSError):
+        owner = str(os.getuid())
     payload = {"schema": "glaeda-disk/evict-owner/v1", "pid": os.getpid(),
-               "started_at": time.time(), "command": " ".join(sys.argv)}
+               "started_at": time.time(), "owner": owner, "command": " ".join(sys.argv)}
     tmp = EVICT_OWNER.with_suffix(f".{os.getpid()}.tmp")
     tmp.write_text(json.dumps(payload, separators=(",", ":")))
     os.replace(tmp, EVICT_OWNER)
@@ -3878,7 +3928,9 @@ def main(argv: list[str] | None = None) -> int:
         # space instead.  The owner record lets a later run recover from a daemon that died while
         # its lock descriptor remained open.
         if acquire_evict_lock() is None:
-            print("another eviction running; skipped")
+            owner = eviction_owner_status()
+            write_eviction_status(a.receipt, owner)
+            print(f"another eviction running; skipped ({eviction_owner_text(owner)})")
             return 0
     idle = a.idle_hours if a.idle_hours is not None else IDLE_SWEEP_HOURS if sweep else (6 if under else 24)
     at, known, measured_at = (0.0, {}, {}) if a.refresh or a.no_snapshot else load_snapshot_meta()
