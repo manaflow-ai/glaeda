@@ -3434,14 +3434,17 @@ def filesystem_accounting(fss: list[Fs], items: list[Item]) -> list[dict[str, An
     this report deliberately calls out anything the catalog does not own so a zero reclaimable result
     cannot hide a full volume.
     """
-    cached = _accounting_cache()
+    # The runner-account profile has a deliberately different catalogue. Do not
+    # reuse the normal user's broad accounting snapshot or overwrite it with a
+    # profile-only lower bound.
+    cached = {} if RUNNER_CACHE_PROFILE else _accounting_cache()
     now = time.time()
     out: list[dict[str, Any]] = []
     cache_records: dict[str, dict[str, Any]] = {}
     for fs in fss:
         key = str(fs.dev)
         hit = cached.get(key) if isinstance(cached.get(key), dict) else None
-        mem = _ACCOUNTING_MEM.get((fs.dev, fs.mount))
+        mem = None if RUNNER_CACHE_PROFILE else _ACCOUNTING_MEM.get((fs.dev, fs.mount))
         if mem is not None:
             top = mem
             top_at = float(hit.get("at", 0)) if hit else 0.0
@@ -3503,7 +3506,7 @@ def filesystem_accounting(fss: list[Fs], items: list[Item]) -> list[dict[str, An
             reclaimable_selected.append(path)
             reclaimable += size
         used = max(0, fs.total - fs.free)
-        coverage_mem = _ACCOUNTING_COVERAGE_MEM.get((fs.dev, fs.mount))
+        coverage_mem = None if RUNNER_CACHE_PROFILE else _ACCOUNTING_COVERAGE_MEM.get((fs.dev, fs.mount))
         cached_coverage = _safe_cached_coverage(hit.get("coverage")) if hit else None
         cached_coverage_at = float(hit.get("coverage_at", 0)) if hit else 0.0
         if coverage_mem is not None and now - coverage_mem[0] < ACCOUNTING_MAX_AGE_S:
@@ -3525,11 +3528,12 @@ def filesystem_accounting(fss: list[Fs], items: list[Item]) -> list[dict[str, An
                  "coverage_note": "coverage rows overlap and incomplete rows are lower bounds"}
         out.append(entry)
         cache_records[str(fs.dev)] = {**entry, "at": top_at}
-    try:
-        ACCOUNTING.parent.mkdir(parents=True, exist_ok=True)
-        ACCOUNTING.write_text(json.dumps(cache_records))
-    except OSError:
-        pass
+    if not RUNNER_CACHE_PROFILE:
+        try:
+            ACCOUNTING.parent.mkdir(parents=True, exist_ok=True)
+            ACCOUNTING.write_text(json.dumps(cache_records))
+        except OSError:
+            pass
     return out
 
 
