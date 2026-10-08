@@ -198,6 +198,7 @@ import subprocess
 import sys
 import threading
 import time
+import selectors
 from pathlib import Path
 from typing import Any
 
@@ -550,8 +551,25 @@ def validate_onboarding(path: Path, data: dict[str, Any]) -> None:
 
 
 def toolchain(manifest: dict[str, Any], name: str) -> dict[str, Any]:
-    """The toolchain the manifest declares for one host, or {} when it declares none."""
-    return host_policy(manifest, name).get("toolchain") or {}
+    """The toolchain declared for one host, with a safe pin for legacy xcode.apps manifests."""
+    policy = host_policy(manifest, name)
+    declared = policy.get("toolchain") or {}
+    if declared:
+        return declared
+    # Older fleet manifests put the Xcode pin under xcode.apps. Preserve that
+    # configuration while class acceptance migrates to toolchain.xcode.
+    legacy = policy.get("xcode") or {}
+    apps = legacy.get("apps") if isinstance(legacy, dict) else None
+    if not isinstance(apps, list):
+        return {}
+    selected = legacy.get("select") if isinstance(legacy, dict) else None
+    selected_app = selected[:-len("/Contents/Developer")] if isinstance(selected, str) and \
+        selected.endswith("/Contents/Developer") else selected
+    entry = next((a for a in apps if isinstance(a, dict) and a.get("path") == selected_app), None)
+    entry = entry or next((a for a in apps if isinstance(a, dict)), None)
+    if not entry or not all(isinstance(entry.get(k), str) for k in ("path", "version", "build")):
+        return {}
+    return {"xcode": {"app": entry["path"], "version": entry["version"], "build": entry["build"]}}
 
 
 def cmux_checkout(manifest: dict[str, Any], name: str) -> dict[str, Any]:
@@ -870,17 +888,19 @@ def observe_host(name: str, user: str, script: bytes | None = None, timeout: int
     started = time.time()
     try:
         proc = subprocess.run(
-            [SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", user, name, "/bin/bash", "-s"],
+            [SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", user, name,
+             remote_command("/bin/bash -s")],
             input=script or PROBE.read_bytes(), capture_output=True, timeout=timeout, env={"PATH": "/usr/bin:/bin",
                                                                                        "HOME": os.environ["HOME"],
                                                                                        "SSH_AUTH_SOCK": os.environ.get("SSH_AUTH_SOCK", "")},
         )
     except subprocess.TimeoutExpired:
         return {"host": name, "reachable": False, "error": f"probe timed out after {timeout}s"}
-    if proc.returncode != 0:
+    code, output = remote_result(proc.stdout, proc.returncode)
+    if code != 0:
         err = proc.stderr.decode(errors="replace").strip().splitlines()
-        return {"host": name, "reachable": False, "error": (err[-1] if err else f"ssh exit {proc.returncode}")[:200]}
-    data = parse_probe(proc.stdout.decode(errors="replace"))
+        return {"host": name, "reachable": False, "error": (err[-1] if err else f"ssh exit {code}")[:200]}
+    data = parse_probe(output.decode(errors="replace"))
     return {"host": name, "reachable": True, "observed_at": int(started), **data}
 
 
@@ -1542,12 +1562,14 @@ def remote(name: str, user: str, script: str, args: list[str], stdin: str = "") 
     import shlex
     command = "/bin/bash -c " + shlex.quote(script) + " glaeda " + " ".join(shlex.quote(a) for a in args)
     try:
-        proc = subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", user, name, command],
+        proc = subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", user, name,
+                               remote_command(command)],
                               input=stdin.encode(), capture_output=True, timeout=600)
     except subprocess.TimeoutExpired:
         return 124, "timed out after 600s; outcome unknown, re-run check"
-    text = (proc.stdout + proc.stderr).decode(errors="replace").strip()
-    return proc.returncode, text[-400:]
+    code, output = remote_result(proc.stdout, proc.returncode)
+    text = (output + proc.stderr).decode(errors="replace").strip()
+    return code, text[-400:]
 
 
 def apply(manifest: dict[str, Any], hosts: list[str], yes: bool) -> int:
@@ -1659,11 +1681,13 @@ def reservation_ssh(name: str, user: str, script: str, args: list[str], stdin: s
     """Run one reservation script on a host: (exit code, raw stdout, stderr). Bounded and batch-mode."""
     command = "/bin/bash -c " + shlex.quote(script) + " glaeda " + " ".join(shlex.quote(a) for a in args)
     try:
-        proc = subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", user, name, command],
+        proc = subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", user, name,
+                               remote_command(command)],
                               input=stdin.encode(), capture_output=True, timeout=60)
     except subprocess.TimeoutExpired:
         return 124, b"", "timed out after 60s; outcome unknown, re-run check"
-    return proc.returncode, proc.stdout, proc.stderr.decode(errors="replace").strip()[-400:]
+    code, output = remote_result(proc.stdout, proc.returncode)
+    return code, output, proc.stderr.decode(errors="replace").strip()[-400:]
 
 
 def read_reservation(name: str, user: str) -> dict[str, Any]:
@@ -2523,11 +2547,98 @@ def run_logged(argv: list[str], log: Any, stdin: bytes = b"", timeout: float | N
     return proc.returncode
 
 
+REMOTE_STATUS_PREFIX = b"__GLAEDA_REMOTE_STATUS__:"
+REMOTE_STATUS_RE = re.compile(rb"(?:^|\n)" + re.escape(REMOTE_STATUS_PREFIX) + rb"(\d+)\n?$")
+
+
+def remote_command(command: str) -> str:
+    """Append a status receipt because Tailscale SSH can return zero for a failed remote command."""
+    # Run the payload in a subshell: several library functions use `exit` for their result, which
+    # would otherwise terminate the shell before the receipt is printed.
+    return (f"( {command}\n); _glaeda_remote_status=$?; "
+            f"printf '\\n__GLAEDA_REMOTE_STATUS__:%s\\n' \"$_glaeda_remote_status\"; exit 0")
+
+
+def remote_result(output: bytes, transport_code: int) -> tuple[int, bytes]:
+    """Recover the remote exit code and remove its receipt from captured stdout."""
+    match = REMOTE_STATUS_RE.search(output)
+    if not match:
+        return transport_code, output
+    return int(match.group(1)), output[:match.start()]
+
+
+def run_remote_logged(argv: list[str], log: Any, stdin: bytes = b"", timeout: float | None = None) -> int:
+    """Run SSH while streaming output and honoring the remote status receipt."""
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    except OSError as error:
+        note(log, f"cannot run {argv[0]}: {error}")
+        return 127
+
+    def feed() -> None:
+        try:
+            if stdin:
+                assert proc.stdin is not None
+                proc.stdin.write(stdin)
+                proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass
+        finally:
+            if proc.stdin is not None:
+                proc.stdin.close()
+
+    feeder = threading.Thread(target=feed, daemon=True)
+    feeder.start()
+    assert proc.stdout is not None
+    selector = selectors.DefaultSelector()
+    selector.register(proc.stdout, selectors.EVENT_READ)
+    tail = bytearray()
+    deadline = None if timeout is None else time.monotonic() + timeout
+    timed_out = False
+    try:
+        while True:
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            if remaining == 0.0:
+                timed_out = True
+                proc.kill()
+                break
+            events = selector.select(timeout=min(remaining, 0.5) if remaining is not None else 0.5)
+            if not events:
+                if proc.poll() is not None:
+                    # select will report EOF on the next pass; keep draining it before parsing the receipt.
+                    continue
+                continue
+            chunk = os.read(proc.stdout.fileno(), 65536)
+            if not chunk:
+                break
+            if log is not None:
+                log.write(chunk)
+                log.flush()
+            tail.extend(chunk)
+            if len(tail) > 512:
+                del tail[:-512]
+    finally:
+        selector.close()
+        proc.stdout.close()
+        if timed_out:
+            proc.kill()
+        proc.wait()
+        feeder.join(timeout=5)
+    if timed_out:
+        note(log, f"timed out after {timeout}s")
+        return 124
+    match = REMOTE_STATUS_RE.search(bytes(tail))
+    if match:
+        return int(match.group(1))
+    note(log, f"remote status receipt missing (ssh exit {proc.returncode})")
+    return proc.returncode
+
+
 def ssh_stream(name: str, user: str, command: str, log: Any, stdin: bytes = b"",
                timeout: float | None = None, options: tuple[str, ...] = ()) -> int:
     """One remote command, key authentication only, output to the log. stdin carries data such as a token."""
-    return run_logged([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=30",
-                       *options, "-l", user, name, command], log, stdin, timeout)
+    return run_remote_logged([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=30",
+                              *options, "-l", user, name, remote_command(command)], log, stdin, timeout)
 
 
 def library_command(func: str, args: list[str], keep_stdin: bool = False) -> str:
@@ -2558,16 +2669,18 @@ def host_check(manifest: dict[str, Any], name: str) -> str | None:
     Read-only on the host. A host whose state cannot be read counts as held: never change a host blind."""
     try:
         proc = subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", host_ssh_user(manifest, name), name,
-                               library_command("host_check", [])], capture_output=True, text=True, timeout=120,
+                               remote_command(library_command("host_check", []))], capture_output=True, text=True, timeout=120,
                               check=False)
     except subprocess.TimeoutExpired:
         return "could not read its host lock and reservation (timed out)"
-    if proc.returncode == 0:
+    code, output = remote_result(proc.stdout.encode(), proc.returncode)
+    stdout = output.decode(errors="replace")
+    if code == 0:
         return None
-    said = [line.split("held: ", 1)[1] for line in proc.stdout.splitlines() if "held: " in line]
-    if proc.returncode == HELD_EXIT and said:
+    said = [line.split("held: ", 1)[1] for line in stdout.splitlines() if "held: " in line]
+    if code == HELD_EXIT and said:
         return said[-1]
-    return f"could not read its host lock and reservation (ssh exit {proc.returncode})"
+    return f"could not read its host lock and reservation (ssh exit {code})"
 
 
 def gate_hosts(manifest: dict[str, Any], names: list[str], wait: bool = False,
@@ -2776,7 +2889,7 @@ def stage_candidate(name: str, user: str, action: dict[str, Any], log: Any) -> t
     if fix_call(name, user, "candidate_dir", [source12], log, 60):
         return False, "could not create the candidate directory"
     remote_path = f"Library/Caches/cmux-fleet/glaeda-candidate-{source12}/{archive_name}.partial"
-    if run_logged(["scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", os.fspath(archive),
+    if run_logged(["scp", "-q", "-O", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", os.fspath(archive),
                    f"{user}@{name}:{remote_path}"], log, timeout=FIX_TIMEOUTS["candidate"]):
         return False, "scp failed; rerun fix to resume"
     if fix_call(name, user, "candidate_place", [source12, archive_name, candidate["sha256"]], log, 120):
@@ -3235,8 +3348,10 @@ def lan_address(manifest: dict[str, Any], name: str, log: Any) -> tuple[str | No
     if not address:
         try:
             proc = subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", host_ssh_user(manifest, name), name,
-                                   "ipconfig getifaddr en0"], capture_output=True, text=True, timeout=30, check=False)
-            address = proc.stdout.strip()
+                                   remote_command("ipconfig getifaddr en0")], capture_output=True, text=True,
+                                  timeout=30, check=False)
+            code, output = remote_result(proc.stdout.encode(), proc.returncode)
+            address = output.decode(errors="replace").strip() if code == 0 else ""
         except subprocess.TimeoutExpired:
             address = ""
     subnet = lan_settings(manifest)["subnet"]
@@ -4236,15 +4351,16 @@ def export_class_receipt(manifest: dict[str, Any], name: str, result: dict[str, 
         note(log, f"== export ({command})")
         try:
             proc = subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", host_ssh_user(manifest, name),
-                                   name, command], capture_output=True, timeout=EXPORT_TIMEOUT, check=False)
+                                   name, remote_command(command)], capture_output=True, timeout=EXPORT_TIMEOUT, check=False)
         except subprocess.TimeoutExpired:
             raise Failure(f"export-class-acceptance on {name} timed out") from None
         log.write(proc.stderr)
-        note(log, f"== export exit {proc.returncode}, {len(proc.stdout)} bytes")
-    if proc.returncode:
-        raise Failure(f"export-class-acceptance on {name} exited {proc.returncode}: {last_line(log_path)}")
+        code, output = remote_result(proc.stdout, proc.returncode)
+        note(log, f"== export exit {code}, {len(output)} bytes")
+    if code:
+        raise Failure(f"export-class-acceptance on {name} exited {code}: {last_line(log_path)}")
     try:
-        doc = cmux_fleet.validate_class_acceptance(json.loads(proc.stdout))
+        doc = cmux_fleet.validate_class_acceptance(json.loads(output))
     except (ValueError, cmux_fleet.FleetError) as error:
         raise Failure(f"{name} exported an invalid class receipt: {error}") from None
     wrong = [what for what, ok in (("class", doc["fleetClass"] == klass),
@@ -4252,7 +4368,7 @@ def export_class_receipt(manifest: dict[str, Any], name: str, result: dict[str, 
                                    ("node", doc["acceptingNodeId"] == manifest["hosts"][name]["node_id"])) if not ok]
     if wrong:
         raise Failure(f"{name} exported a class receipt for another {', '.join(wrong)}")
-    return proc.stdout
+    return output
 
 
 def cmd_upgrade(manifest: dict[str, Any], manifest_path: Path, wanted: list[str] | None, run: str, repo: str,

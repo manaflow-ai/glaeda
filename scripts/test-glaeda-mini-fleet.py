@@ -1718,6 +1718,15 @@ class ToolchainTests(unittest.TestCase):
         self.assertEqual(checks["xcode"]["state"], "fail")
         self.assertIn("want 26.3 (17C999)", checks["xcode"]["detail"])
 
+    def test_legacy_xcode_apps_supply_the_class_acceptance_pin(self) -> None:
+        self.manifest["defaults"]["toolchain"] = {}
+        self.assertEqual(mf.toolchain(self.manifest, "build-mini-1")["xcode"], {
+            "app": "/Applications/Xcode.app", "version": "26.3", "build": "17C529"
+        })
+        self.manifest["defaults"]["xcode"]["select"] = "/Applications/Xcode_26.3.app/Contents/Developer"
+        self.assertEqual(mf.toolchain(self.manifest, "build-mini-1")["xcode"]["app"],
+                         "/Applications/Xcode_26.3.app")
+
     def test_selection_and_metal_can_be_declared_optional(self) -> None:
         self.manifest["defaults"]["toolchain"]["xcode"]["select"] = False
         self.manifest["defaults"]["toolchain"]["metal"] = False
@@ -3870,8 +3879,23 @@ class ReservationScriptShapeTests(unittest.TestCase):
             self.assertEqual(mf.read_reservation("build-mini-1", "cmux")["state"], "absent")
         argv = run.call_args.args[0]
         self.assertEqual(argv[:8], [mf.SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", "cmux", "build-mini-1"])
-        self.assertTrue(argv[8].startswith("/bin/bash -c "))
-        self.assertTrue(argv[8].endswith(" glaeda " + mf.FLEET_ROOT))
+        self.assertTrue(argv[8].startswith("( /bin/bash -c "))
+        self.assertIn(" glaeda " + mf.FLEET_ROOT, argv[8])
+        self.assertIn("__GLAEDA_REMOTE_STATUS__", argv[8])
+
+
+class RemoteStatusTests(unittest.TestCase):
+    def test_remote_status_overrides_a_transport_zero(self) -> None:
+        output = b"remote output\n__GLAEDA_REMOTE_STATUS__:7\n"
+        self.assertEqual(mf.remote_result(output, 0), (7, b"remote output"))
+
+    def test_ssh_stream_adds_a_remote_status_receipt(self) -> None:
+        with mock.patch.object(mf, "run_remote_logged", return_value=0) as run:
+            self.assertEqual(mf.ssh_stream("host", "user", "false", None), 0)
+        command = run.call_args.args[0][-1]
+        self.assertIn("( false", command)
+        self.assertIn("_glaeda_remote_status=$?", command)
+        self.assertTrue(command.endswith("; exit 0"))
 
 
 if __name__ == "__main__":
