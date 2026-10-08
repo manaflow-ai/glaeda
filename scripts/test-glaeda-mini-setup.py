@@ -12,6 +12,7 @@ import os
 import plistlib
 import pwd
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -857,6 +858,25 @@ class MiniSetupTest(unittest.TestCase):
             self.assertIn([ms.SUDO, "/bin/launchctl", "bootstrap", "system",
                            os.fspath(daemon_dir / "x.plist")], commands)
             self.assertIn([ms.SUDO, "/bin/launchctl", "bootout", "system/com.teamleaderleo.glaeda.update"], commands)
+
+    def test_headless_install_stages_and_installs_a_plist(self) -> None:
+        daemon_dir = self.home / "Library/LaunchDaemons"
+        with mock.patch.object(ms, "SYSTEM_DAEMON_DIR", daemon_dir):
+            ctx = ms.Context(self.home, True, "/usr/bin/python3", True, self.reclaim, None, None,
+                             ms.CMUX_XCODE_APP, 50, hygiene_only=True, headless=True)
+            ctx.sandbox = False
+            ctx.headless = True
+            destination = daemon_dir / "com.teamleaderleo.glaeda.test.plist"
+            destination.parent.mkdir(parents=True)
+
+            def fake_run(argv, *args, **kwargs):
+                self.assertEqual(argv[:7], [ms.SUDO, "/usr/bin/install", "-o", "root", "-g", "wheel", "-m"])
+                shutil.copy2(argv[-2], argv[-1])
+                return 0, ""
+
+            with mock.patch.object(ms, "run", fake_run):
+                ms.install_service_file(ctx, destination, b"headless plist\n", 0o644)
+            self.assertEqual(destination.read_bytes(), b"headless plist\n")
     def test_git_below_2_55_is_installed_with_our_brew_or_handed_to_the_operator(self) -> None:
         ctx = ms.Context(self.home, False, "/usr/bin/python3", True, self.reclaim, None, None,
                          ms.CMUX_XCODE_APP, 50, hygiene_only=True)
