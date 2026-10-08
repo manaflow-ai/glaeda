@@ -799,6 +799,15 @@ class MiniSetupTest(unittest.TestCase):
         config = json.loads(path.read_text())
         self.assertEqual((config["ring"], config["host"], config["reportStatus"]), ("canary", "renamed", True))
         self.assertNotIn("source", config)
+        # An explicitly requested default source is persisted for provenance,
+        # even when the existing config has no source field.
+        self.invoke("--hygiene-only", "--apply", "--ota-source", "teamleaderleo/glaeda")
+        config = json.loads(path.read_text())
+        self.assertEqual((config["source"], config["ring"], config["host"]),
+                         ("teamleaderleo/glaeda", "canary", "renamed"))
+        self.assertEqual(self.states(self.invoke("--hygiene-only", "--apply",
+                                                 "--ota-source", "teamleaderleo/glaeda")),
+                         {"unchanged"})
         # --ota-source moves the host to the fleet mirror and keeps the rest; naming it again changes nothing
         self.invoke("--hygiene-only", "--apply", "--ota-source", "manaflow-ai/glaeda")
         config = json.loads(path.read_text())

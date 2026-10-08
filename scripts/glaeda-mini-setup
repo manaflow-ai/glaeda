@@ -896,7 +896,10 @@ def update_config_action(ctx: Context) -> dict[str, Any]:
             value["setupArgs"] = [*args, "--headless"]
     if ctx.ota_ring and current.get("ring") != ctx.ota_ring:
         value.update(ring=ctx.ota_ring, reportStatus=ctx.ota_ring == "canary")
-    if ctx.ota_source and current.get("source", OTA_SOURCES[0]) != ctx.ota_source:
+    # Persist an explicitly requested source even when it is the default.
+    # The source is provenance for future OTA runs, so a missing field must not
+    # be treated as equivalent to the default when --ota-source was supplied.
+    if ctx.ota_source and current.get("source") != ctx.ota_source:
         value["source"] = ctx.ota_source
     if value != current:
         previous = {k: current.get(k) for k in ("ring", "source") if current.get(k) != value.get(k)}
