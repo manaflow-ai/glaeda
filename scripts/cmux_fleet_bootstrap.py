@@ -53,7 +53,10 @@ CMUX_GHOSTTYKIT_LOCATIONS = (
     "GhosttyKit.xcframework",
     "ghostty/macos/GhosttyKit.xcframework",
 )
-# The Xcode major the fleet is reviewed against (CMUX .xcode-version).
+# The minimum Xcode major the fleet is reviewed against (CMUX .xcode-version).
+# Newer majors are accepted when the manifest pins the exact app and SDK. This
+# lets a canary move to Xcode 27 without admitting an unpinned toolchain into
+# the Xcode 26 pool.
 REVIEWED_XCODE_MAJOR = 26
 CMUX_RESULT_CONTRACT = "cmux-workload-result/v1"
 CMUX_PROFILE_REGISTRY = "scripts/ci/cmux-workload-profiles.json"
@@ -98,7 +101,7 @@ FIRST_LAUNCH_FIX = "Xcode first launch not done (plugins fail to load); run sudo
 LICENSE_FIX = "Xcode licence not accepted; run sudo xcodebuild -license accept"
 # The fix for each check `evaluate` can list in blockingChecks, so a refusal says what to do.
 BLOCKING_FIXES = {
-    "supportedOs": "use macOS 15 or 26 (Linux: Ubuntu 24.04 or Debian 12 on kernel 6+)",
+    "supportedOs": "use macOS 15 or 26+ (Linux: Ubuntu 24.04 or Debian 12 on kernel 6+)",
     "hardwareCapability": "use a host that meets the hardware class minimum (8 CPUs, 16 GiB on macOS)",
     "cmuxCheckout": "clone manaflow-ai/cmux (git clone --depth 1) and pass it as --cmux-root",
     "canonicalCheckoutClean": "commit, stash or remove local changes in the cmux checkout (git status)",
@@ -379,7 +382,8 @@ def xcode_pin_ready(pin: str, xcode_version: str | None, sdk_version: str) -> bo
 
     CMUX pins a major version there: "26" since cmux#14050, "26.0" before it.
     The exact app and build are the CI Xcode variables' job, which the hosted
-    adopter revalidates; this check keeps a node on the reviewed major.
+    adopter revalidates; this check keeps a node on the reviewed major or newer
+    while requiring the selected Xcode and SDK to share the pinned major.
     """
     def major(version: str | None) -> int | None:
         match = re.fullmatch(r"(\d+)(?:\.\d+)*", version or "")
@@ -387,7 +391,8 @@ def xcode_pin_ready(pin: str, xcode_version: str | None, sdk_version: str) -> bo
 
     wanted = major(pin)
     return (
-        wanted == REVIEWED_XCODE_MAJOR
+        wanted is not None
+        and wanted >= REVIEWED_XCODE_MAJOR
         and major(xcode_version) == wanted
         and major(sdk_version) == wanted
     )
@@ -534,7 +539,7 @@ def collect_macos(
         "glaedaGeneration": digest_file(glaeda),
         "toolchainGeneration": digest_bytes(canonical(toolchain)),
         "checks": {
-            "supportedOs": major in {15, 26},
+            "supportedOs": major == 15 or major >= REVIEWED_XCODE_MAJOR,
             "hardwareCapability": hardware_class_ready(
                 "macos",
                 hardware_class,

@@ -118,7 +118,7 @@ import cmux_fleet_bootstrap as fleet  # noqa: E402  (read-only helpers; importin
 TARGET = {"machine": "Mac mini", "chip": "Apple M4 Pro", "cpus": 14, "memoryGiB": 48}
 CMUX_XCODE_APP = "/Applications/Xcode_26.6.app"  # vars.CMUX_CI_XCODE_APP_PR, which the persistent producer reads first
 MIN_FREE_GIB = fleet.default_min_free_gib("macos")  # one build slot, as the fleet bootstrap
-SUPPORTED_MACOS = {15, 26}
+SUPPORTED_MACOS = {15}  # macOS 26+ is accepted by the fleet bootstrap policy.
 LABEL_PREFIX = "com.teamleaderleo.glaeda."
 SUDO = "/usr/bin/sudo"
 SYSTEM_DAEMON_DIR = Path("/Library/LaunchDaemons")
@@ -578,8 +578,9 @@ def preflight_macos(ctx: Context) -> dict[str, Any]:
     checks: dict[str, dict[str, Any]] = {}
     version = platform.mac_ver()[0]
     major = int(version.split(".")[0]) if version else 0
-    checks["macos"] = check(major in SUPPORTED_MACOS, version or "unknown",
-                            "" if major in SUPPORTED_MACOS else "fleet bootstrap accepts macOS 15 or 26", True)
+    supported = major in SUPPORTED_MACOS or major >= fleet.REVIEWED_XCODE_MAJOR
+    checks["macos"] = check(supported, version or "unknown",
+                            "" if supported else "fleet bootstrap accepts macOS 15 or 26+", True)
     hw = hardware()
     checks["appleSilicon"] = check(hw["arch"] == "arm64", hw["arch"], "", True)
     is_mini = hw["machine"] == TARGET["machine"]

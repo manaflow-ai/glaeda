@@ -2148,8 +2148,8 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
 
     # The bootstrap's supportedOs and hardwareCapability (cmux-mac-build-large).
     major = int(re.match(r"\d*", obs.get("macos") or "").group() or 0)
-    if major not in {15, 26}:
-        put("os", "fail", f"macOS {obs.get('macos')}; the fleet bootstrap accepts 15 or 26", "install macOS 26", "person")
+    if not (major == 15 or major >= bootstrap.REVIEWED_XCODE_MAJOR):
+        put("os", "fail", f"macOS {obs.get('macos')}; the fleet bootstrap accepts 15 or 26+", "install macOS 26+", "person")
     elif not bootstrap.hardware_class_ready("macos", "cmux-mac-build-large", obs.get("cpus", 0), obs.get("memory_gib", 0)):
         put("os", "fail", f"{obs.get('cpus')} CPUs, {obs.get('memory_gib')} GiB; cmux-mac-build-large needs 8 and 16",
             "use a larger Mac", "person")
