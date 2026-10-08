@@ -2973,6 +2973,20 @@ class RepairTests(unittest.TestCase):
         self.assertEqual((code, calls), (0, []))
         self.assertIn("would: renew and adopt the class receipt", out)
 
+    def test_class_mode_relinks_a_current_node_before_adopting(self) -> None:
+        manifest = pinned_manifest(self.tmp.name)
+        code, out, calls = run_command(
+            {"build-mini-1": on_candidate(generation=NEW_GEN)}, "--yes", command="repair",
+            manifest=manifest, after={"build-mini-1": on_candidate(generation=NEW_GEN)},
+        )
+        self.assertEqual(code, 0, out)
+        relink = calls_to(calls, "transition-apply")
+        self.assertEqual(len(relink), 1)
+        self.assertIn("--to quarantined --reason stale_glaeda_generation", relink[0][1])
+        self.assertEqual(len(calls_to(calls, ENROLL)), 1)
+        self.assertIn("--renew --class-receipt - --class-receipt-sha256", calls_to(calls, ENROLL)[0][1])
+        self.assertIn("eligible", out)
+
     def test_dry_run_names_what_it_would_do_and_touches_nothing(self) -> None:
         code, out, calls = run_command({"build-mini-1": on_candidate(), "build-mini-2": on_candidate(
             state=None, generation=None, node_id=None)}, command="repair", manifest=self.manifest)

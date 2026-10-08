@@ -3819,7 +3819,8 @@ def held_or(code: int, log_path: Path | None, what: str) -> str:
 
 
 def renew_one(manifest: dict[str, Any], name: str, result: dict[str, Any], candidate: dict[str, str], glaeda_ref: str,
-              receipt: tuple[str, str, bytes] | None, log_path: Path, seed: str | None = None) -> tuple[bool, str, str]:
+              receipt: tuple[str, str, bytes] | None, log_path: Path, seed: str | None = None,
+              force_class_relink: bool = False) -> tuple[bool, str, str]:
     """Move one enrolled host onto the pinned candidate; (ok, step reached, detail).
 
     sync: ~/glaeda to glaeda_ref (glaeda-mini-enroll --renew and the staging verifier come from it).
@@ -3845,6 +3846,16 @@ def renew_one(manifest: dict[str, Any], name: str, result: dict[str, Any], candi
         code = routed_fix_call(name, user, "runner_hold", [str(RUNNER_DRAIN_SECONDS)], log, RUNNER_DRAIN_SECONDS + 600, route)
         if code:
             return False, "drain", held_or(code, log_path, "could not stop the runners")
+        if force_class_relink:
+            step("relink: quarantine the current enrollment before class adoption")
+            enrollment = "~/.config/glaeda/cmux-fleet/enrollment.json"
+            transition = " ".join(remote_word(value) for value in (
+                "~/glaeda/scripts/cmux_fleet.py", "transition-apply", enrollment,
+                "--to", "quarantined", "--reason", "stale_glaeda_generation"))
+            code = routed_ssh_stream(name, user, transition, log, timeout=120, options=route)
+            if code:
+                routed_fix_call(name, user, "runner_release", ["if-eligible"], log, 300, route)
+                return False, "relink", f"could not quarantine the current enrollment: {last_line(log_path)}"
         command = enroll_command(manifest, name, result, candidate, False, receipt[:2] if receipt else None, renew=True)
         code = routed_fix_call(name, user, "host_check", [], log, 120, route)  # the drain may have waited long; ask again
         if code:
@@ -3939,6 +3950,7 @@ def cmd_onboard(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, s
         if blockers(results[name], ("person",)):
             settle(name, "preflight", "needs a person: " + ", ".join(blockers(results[name], ("person",))))
     needs = {h: enrollment_need(results[h]) for h in live}
+    class_relinks: set[str] = set()
     if acceptance == "class":
         # preflight's accepted flag also covers a node-local receipt. Class-mode repair has a
         # stronger routing contract: the enrollment must name the recorded class receipt, or the
@@ -3946,6 +3958,7 @@ def cmd_onboard(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, s
         for name in live:
             if needs[name] == "ok" and missing_class_acceptance(manifest, name, results[name]):
                 needs[name] = "renew"
+                class_relinks.add(name)
     for name in list(live):
         if needs[name] == "enroll" and mode == "repair":
             settle(name, "enroll", f"not enrolled: glaeda-mini-fleet onboard {name} --yes")
@@ -4063,7 +4076,7 @@ def cmd_onboard(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, s
             return lambda: _enroll_one(manifest, name, results[name], candidate, acceptance == "class", logs[name],
                                        receipts.get(name))
         return lambda: renew_one(manifest, name, results[name], candidate, glaeda_ref, receipts.get(name),
-                                 logs[name], seed)
+                                 logs[name], seed, name in class_relinks)
 
     outcomes = run_with_heartbeat({h: enroll_task(h) for h in fresh + stale}, logs, "enroll", heartbeat) \
         if fresh or stale else {}
