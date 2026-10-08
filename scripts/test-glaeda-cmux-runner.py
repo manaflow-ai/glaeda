@@ -107,6 +107,8 @@ elif endpoint.endswith("/remove-token") and method == "POST":
         sys.exit(1)
     print(os.environ["FAKE_REMOVE_TOKEN"])
 elif "/actions/runners" in endpoint and method == "GET":
+    if os.path.exists(os.path.join(state, "fail-list")):
+        sys.exit(1)
     print(json.dumps(runners()))
 elif "/actions/runners/" in endpoint and method == "DELETE":
     if os.path.exists(os.path.join(state, "fail-delete")):
@@ -5022,7 +5024,7 @@ class RunnerTest(unittest.TestCase):
             plan = self.invoke("--manifest", self.manifest(), "--member", "mini-std", "--name", "mini-test-glaeda")
             self.assertEqual(self.by_kind(plan)["register"]["state"], "relabel")
             self.assertEqual(self.by_kind(plan)["register"]["previousLabels"],
-                             ["self-hosted", "macOS", "ARM64", "glaeda-mini", "ram48"])
+                             ["ARM64", "glaeda-mini", "macOS", "ram48", "self-hosted"])
             receipt = self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std",
                                   "--name", "mini-test-glaeda")
         reg = self.by_kind(receipt)["register"]
@@ -5091,6 +5093,41 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(again["drift"], [{"against": "github", "added": ["ram48"], "removed": []}])
         self.assertIn("registered labels differ", again["note"])
         self.assertTrue(all(e["argv"][:3] != ["api", "-X", "POST"] for e in self.log()[-6:] if e["tool"] == "gh"))
+
+    def test_manifest_relabels_when_github_labels_are_stale_despite_matching_receipt(self) -> None:
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std")
+            runners = json.loads((self.state / "runners.json").read_text())
+            runners["runners"][0]["labels"] = [{"name": "self-hosted"}, {"name": "macOS"},
+                                                   {"name": "ARM64"}, {"name": "glaeda-mini"},
+                                                   {"name": "glaeda-side-std-xcode-26.6"}]
+            (self.state / "runners.json").write_text(json.dumps(runners))
+            plan = self.invoke("--manifest", self.manifest(), "--member", "mini-std")
+        register = self.by_kind(plan)["register"]
+        self.assertEqual(register["state"], "relabel")
+        self.assertEqual(register["previousLabels"],
+                         ["ARM64", "glaeda-mini", "glaeda-side-std-xcode-26.6", "macOS", "self-hosted"])
+
+    def test_manifest_blocks_when_github_labels_cannot_be_read(self) -> None:
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std")
+            (self.state / "fail-list").touch()
+            plan = self.invoke("--manifest", self.manifest(), "--member", "mini-std")
+        register = self.by_kind(plan)["register"]
+        self.assertEqual(register["state"], "blocked")
+        self.assertIn("receipt labels are not authoritative", register["note"])
+
+    def test_manifest_apply_with_token_relabels_when_github_lookup_is_unavailable(self) -> None:
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std")
+            (self.state / "fail-list").touch()
+            receipt = self.invoke("--apply", "--token-stdin", "--manifest", self.manifest(),
+                                 "--member", "mini-std", stdin=REG_TOKEN, expect=1)
+        register = self.by_kind(receipt)["register"]
+        self.assertEqual(register["state"], "updated", register)
+        self.assertIn("--replace", self.config_argvs()[-1])
+        self.assertEqual(self.by_kind(receipt)["verify"]["state"], "failed")
+        self.assertFalse(receipt["ready"])
 
     def installed_release(self, labels: list[str], same_files: bool = False) -> Path:
         """An OTA release on this fake HOME whose plan registers `labels`; returns the log of its argv."""

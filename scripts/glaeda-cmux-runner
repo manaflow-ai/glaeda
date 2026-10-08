@@ -868,17 +868,38 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
            "ephemeral": False}
     registered = ((receipt or {}).get("registration") or {}) if ours else {}
     had = registered.get("labels")
+    github_listed = github_found = None
+    if ours and configured and ctx.gh is not None:
+        # A local receipt records what this copy last requested, not what GitHub currently
+        # holds.  Read the registration once and use that observation for reconciliation.
+        github_listed, github_found = lookup_runner(ctx)
     # This install registered that name before and lost its local .runner (an interrupted relabel):
     # registering again replaces its own server-side entry instead of colliding with it.
     own_name = bool(ours and not configured and registered.get("owned") and registered.get("name") == ctx.name)
-    if ours and configured and ctx.labels_requested and had is not None and sorted(had) != sorted(ctx.labels):
-        # GitHub fixes labels at registration, and the labels API needs an admin token the mini does
-        # not hold, so relabelling re-registers this same runner in place with --replace.
-        reg.update(state="relabel", previousLabels=had)
-        if ctx.gh is None and not ctx.token_stdin:
-            reg.update(state="blocked", note="labels changed; pipe a registration token to --token-stdin to re-register")
-        elif runner_busy(ctx):
-            reg.update(state="blocked", note="the runner is running a job; re-run when it is idle")
+    if ours and configured and ctx.labels_requested:
+        if github_listed and github_found is not None:
+            actual = github_found.get("labels") or []
+            if sorted(actual) != sorted(ctx.labels):
+                # GitHub fixes labels at registration, and the labels API needs an admin token the mini does
+                # not hold, so relabelling re-registers this same runner in place with --replace.
+                reg.update(state="relabel", previousLabels=actual)
+                if runner_busy(ctx):
+                    reg.update(state="blocked", note="the runner is running a job; re-run when it is idle")
+            else:
+                reg.update(state="unchanged")
+        elif github_listed and github_found is None:
+            reg.update(state="blocked", note=f"GitHub does not list runner {ctx.name}; refusing to replace an unknown registration")
+        elif ctx.apply and ctx.token_stdin:
+            # An operator supplied a fresh registration token for apply.  If the read-only
+            # lookup is unavailable, let the same-name --replace repair proceed, but never
+            # claim the receipt proves the current server-side labels.
+            reg.update(state="relabel", previousLabels=had or [],
+                       note="GitHub labels could not be read; re-registering with the supplied token")
+            if runner_busy(ctx):
+                reg.update(state="blocked", note="the runner is running a job; re-run when it is idle")
+        else:
+            reg.update(state="blocked", note="could not read GitHub labels; receipt labels are not authoritative; "
+                       "re-run with GitHub access or --apply --token-stdin")
     elif ours and configured:
         reg.update(state="unchanged")
     elif ctx.gh is None and not ctx.token_stdin:
@@ -904,10 +925,8 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
     drifts = []
     if ours and configured and had is not None:
         drifts.append(label_drift("receipt", had, ctx.labels))
-        if ctx.gh is not None:  # what GitHub holds, which a hand edit or a lost receipt can make differ
-            listed, found = lookup_runner(ctx)
-            if listed and found is not None:
-                drifts.append(label_drift("github", found.get("labels") or [], ctx.labels))
+        if github_listed and github_found is not None:  # what GitHub holds, which a hand edit or a lost receipt can make differ
+            drifts.append(label_drift("github", github_found.get("labels") or [], ctx.labels))
     if any(drifts):
         reg["drift"] = [d for d in drifts if d]
         if reg["state"] == "unchanged":
