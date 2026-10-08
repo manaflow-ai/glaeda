@@ -2961,6 +2961,18 @@ class RepairTests(unittest.TestCase):
             check = mf.preflight_host(manifest, "build-mini-1", observed(h=lock_text)["hosts"]["h"])["checks"]["runner"]
             self.assertIn("host.lock worker-only (pid 123|worker-current)", check["detail"])
 
+    def test_class_mode_repairs_a_current_node_missing_the_class_link(self) -> None:
+        manifest = pinned_manifest(self.tmp.name)
+        loaded = mf.load_manifest(manifest)
+        with mock.patch.object(mf, "PINNED_CANDIDATE", loaded["candidate"]):
+            result = mf.preflight_host(loaded, "build-mini-1",
+                                       observed(h=on_candidate(generation=NEW_GEN))["hosts"]["h"])
+            self.assertTrue(mf.missing_class_acceptance(loaded, "build-mini-1", result))
+            code, out, calls = run_command({"build-mini-1": on_candidate(generation=NEW_GEN)},
+                                           command="repair", manifest=manifest)
+        self.assertEqual((code, calls), (0, []))
+        self.assertIn("would: renew and adopt the class receipt", out)
+
     def test_dry_run_names_what_it_would_do_and_touches_nothing(self) -> None:
         code, out, calls = run_command({"build-mini-1": on_candidate(), "build-mini-2": on_candidate(
             state=None, generation=None, node_id=None)}, command="repair", manifest=self.manifest)
@@ -3018,9 +3030,13 @@ class RepairTests(unittest.TestCase):
         self.assertIn("transition-apply ENROLLMENT --to enrolling", result["checks"]["enroll"]["fix"])
 
     def test_runners_are_restarted_or_released_and_drains_are_left_alone(self) -> None:
-        texts = {"build-mini-1": on_candidate(generation=NEW_GEN, runners=("actions-runner-x|mini-1|yes|no|no",)),
-                 "build-mini-2": on_candidate(generation=NEW_GEN, runners=("actions-runner-x|mini-2|no|no|yes",),
-                                              node_id="cmux-mac-002")}
+        class_accepted = lambda text: text.replace("pf_acceptance\taccepted",
+                                                    "pf_acceptance\taccepted\npf_acceptance_class\tglaeda-class-acceptance/v1")
+        texts = {"build-mini-1": class_accepted(on_candidate(generation=NEW_GEN,
+                                                               runners=("actions-runner-x|mini-1|yes|no|no",))),
+                 "build-mini-2": class_accepted(on_candidate(generation=NEW_GEN,
+                                                               runners=("actions-runner-x|mini-2|no|no|yes",),
+                                                               node_id="cmux-mac-002"))}
         code, out, calls = run_command(texts, "--yes", command="repair", manifest=self.manifest, after=texts)
         self.assertEqual(code, 0, out)
         self.assertEqual([c[0] for c in calls_to(calls, "lock none; runner_kick")], ["build-mini-1"])

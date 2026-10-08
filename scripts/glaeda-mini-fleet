@@ -2398,6 +2398,7 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
     return {"host": name, "ready": not blocked, "checks": checks,
             "enrollment": {"state": state, "generation": pf.get("enroll_generation"), "stale": stale,
                            "accepted": accepted, "reason": pf.get("enroll_reason"),
+                           "acceptance_class": pf.get("acceptance_class"),
                            "local": pf.get("acceptance_class") not in {None, "glaeda-class-acceptance/v1"}},
             "runners": runners}
 
@@ -3755,6 +3756,22 @@ def enrollment_need(result: dict[str, Any]) -> str:
     return "ok"
 
 
+def missing_class_acceptance(manifest: dict[str, Any], name: str,
+                             result: dict[str, Any]) -> bool:
+    """Whether a class-mode repair must restore the class receipt on an otherwise current node.
+
+    A node-local acceptance makes the enrollment look healthy to preflight, but the runner hook
+    deliberately admits only an enrollment that names the class receipt. This is the recovery path
+    for nodes that were renewed with --acceptance node or lost the class link during an older renewal.
+    """
+    enrollment = result.get("enrollment") or {}
+    if (enrollment.get("state") != "eligible" or
+            enrollment.get("acceptance_class") == "glaeda-class-acceptance/v1"):
+        return False
+    recorded, _ = class_acceptance(manifest, name)
+    return bool(recorded and recorded.get("receipt"))
+
+
 def adoption_mismatch(log_path: Path) -> list[str]:
     """The fields a refused class adoption names (cmux_fleet.py's `Differs in:`), from the host's log."""
     try:
@@ -3922,6 +3939,13 @@ def cmd_onboard(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, s
         if blockers(results[name], ("person",)):
             settle(name, "preflight", "needs a person: " + ", ".join(blockers(results[name], ("person",))))
     needs = {h: enrollment_need(results[h]) for h in live}
+    if acceptance == "class":
+        # preflight's accepted flag also covers a node-local receipt. Class-mode repair has a
+        # stronger routing contract: the enrollment must name the recorded class receipt, or the
+        # runner hook refuses every job even though the node is otherwise current and eligible.
+        for name in live:
+            if needs[name] == "ok" and missing_class_acceptance(manifest, name, results[name]):
+                needs[name] = "renew"
     for name in list(live):
         if needs[name] == "enroll" and mode == "repair":
             settle(name, "enroll", f"not enrolled: glaeda-mini-fleet onboard {name} --yes")
