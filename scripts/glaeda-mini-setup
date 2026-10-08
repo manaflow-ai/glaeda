@@ -44,6 +44,7 @@ What --apply installs (templated for the current user):
     ~/.local/bin/glaeda-update                 from scripts/glaeda-update (hourly over-the-air updates)
     ~/.local/bin/glaeda-gh                     from scripts/glaeda-gh (shared GitHub CI watcher, the one poller)
     ~/.local/bin/glaeda-wallpaper-rotate       from scripts/glaeda-wallpaper-rotate (operator-supplied stills, every 30 minutes)
+    ~/.local/bin/glaeda-runner-hygiene         from scripts/glaeda-runner-hygiene (root-installed per-account cache policy)
     ~/.claude/skills/github-ci-wait/SKILL.md    from skills/github-ci-wait: tells agent sessions to wait with glaeda-gh
     ~/.config/glaeda/update.json               its release ring and source, written once (--ota-ring canary|stable,
                                                --ota-source teamleaderleo/glaeda|manaflow-ai/glaeda)
@@ -1054,7 +1055,7 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
     for path, mode in directories(ctx):
         actions.append({"kind": "dir", "path": os.fspath(path),
                         "state": "unchanged" if path.is_dir() else "create", "mode": oct(mode)})
-    for name in ("glaeda-disk", "disk-pressure.sh", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune", "glaeda-seed-prefetch",
+    for name in ("glaeda-disk", "glaeda-runner-hygiene", "disk-pressure.sh", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune", "glaeda-seed-prefetch",
                  "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health",
                  "glaeda-update", "glaeda-gh", "glaeda-wallpaper-rotate"):
         act = file_action(ctx, "tool", ctx.bin / name, (SCRIPT_DIR / name).read_bytes(), 0o755)
@@ -1199,7 +1200,7 @@ def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
         path = agent_path(ctx, label)
         actions.append({"kind": "agent", "label": label, "path": os.fspath(path),
                         "loaded": agent_loaded(ctx, label)})
-    for name in ("glaeda-disk", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune",
+    for name in ("glaeda-disk", "glaeda-runner-hygiene", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune",
                  "glaeda-seed-prefetch", "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health",
                  "glaeda-update", "glaeda-gh", "glaeda-wallpaper-rotate"):
         actions.append({"kind": "tool", "path": os.fspath(ctx.bin / name)})

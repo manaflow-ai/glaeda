@@ -10,6 +10,7 @@
     glaeda-disk --pressure --apply waits while a GitHub Actions job runs, unless below --emergency
     glaeda-disk --refresh           re-measure every size now instead of using the snapshot
     glaeda-disk --dedupe            store identical Xcode package/module files once (APFS clones)
+    glaeda-disk --runner-caches     use only the enrolled runner-account cache allowlist
 
 Parallel sessions each keep a full DerivedData, and its SourcePackages artifacts and module
 caches are byte-identical across them. --dedupe replaces each duplicate with a copy-on-write
@@ -42,6 +43,11 @@ checkouts, other filesystems, the Chromium trees and the macOS privacy-protected
 never searched (HOME_NEVER).
 Bazel's macOS output root (/private/var/tmp/_bazel_$USER) is its own family.
 Every deletion is appended to a JSONL receipt.
+
+The runner-account profile is intentionally narrower than the normal user profile:
+it covers only DerivedData, cmux reload/GhosttyKit caches, and CUA recordings/frame
+caches, with a seven-day minimum idle age. Git index refreshes are ignored for that
+age clock; process/open-file/command/socket/git-loss checks still veto deletion.
 
 The idle sweep (--idle) reclaims whatever the free space. A busy host sweeps too: deletes skip only what a
 job uses (open, named by a command, a root's current seed or checkout), not the whole pass. The old hold
@@ -165,6 +171,12 @@ DARWIN_ACCOUNTING_ROOTS = (
     ("data-users-shared", Path("/System/Volumes/Data/Users/Shared")),
 )
 PLATFORM_VALUES = frozenset({"macos", "linux", "shared", "unknown"})
+
+# A secondary account left behind by a runner install gets its own narrow profile.
+# Keep this separate from default_families(): that catalogue intentionally includes
+# developer caches and report-only home scopes which must never be traversed by the
+# account hygiene LaunchDaemon.
+RUNNER_CACHE_PROFILE = False
 
 
 def host_cache_platform() -> str:
@@ -1207,6 +1219,89 @@ def default_families() -> list[Family]:
     return [f for f in fams if f.root.is_dir()]
 
 
+def runner_cache_families() -> list[Family]:
+    """Return only rebuildable CI residue for an enrolled runner account.
+
+    This is deliberately an allowlist.  The account may have belonged to a person
+    before it became a runner, so generic XDG caches, Application Support, keys,
+    browser state, toolchains, and wallpapers are outside this profile.  Process,
+    open-file, command-line, socket, git and age gates are still applied by
+    ``survey`` and ``apply``.
+    """
+    if not DARWIN:
+        return []
+    roots = [
+        Family("xcode-derived-data", HOME / "Library/Developer/Xcode/DerivedData", True,
+               "next xcodebuild rebuilds it", owner="Xcode, per checkout", rebuild_minutes=15,
+               build_output=True, min_idle_hours=168.0, platform="macos"),
+        Family("cmux-job-cache", HOME / ".cache/cmux-job", True,
+               "next cmux reload or CI job rebuilds it", depth=2, git_disposable=True,
+               owner="cmux reload-cloud", rebuild_minutes=30, min_idle_hours=168.0,
+               platform="macos"),
+        Family("cmux-ghosttykit-cache", HOME / ".cache/cmux/ghosttykit", True,
+               "cmux rebuilds GhosttyKit", depth=1, files=True,
+               owner="cmux build tooling", rebuild_minutes=5, min_idle_hours=168.0,
+               platform="macos"),
+        Family("cua-recordings", HOME / "Library/Application Support/cua-ssh/recordings", True,
+               "the CUA recorder can capture it again", depth=1, files=True,
+               skip=("index.json", "manifest.json", "state.json", ".metadata_never_index", ".lock"),
+               owner="CUA recorder", rebuild_minutes=2, min_idle_hours=168.0, platform="macos"),
+        Family("cua-cache", HOME / "Library/Caches/cmux/cmux-cua", True,
+               "the CUA client rebuilds its frame cache", depth=1, files=True,
+               skip=("index.json", "manifest.json", "state.json", ".metadata_never_index", ".lock"),
+               owner="cmux CUA", rebuild_minutes=1, min_idle_hours=168.0, platform="macos"),
+    ]
+    return [f for f in roots if f.root.is_dir()]
+
+
+def runner_profile_roots_safe(fams: list[Family]) -> bool:
+    """Require profile roots to remain real directories on the account's home volume."""
+    try:
+        home = HOME.resolve(strict=True)
+        home_stat = home.stat()
+    except OSError:
+        return False
+    for fam in fams:
+        try:
+            root = fam.root
+            if not root.is_absolute() or root.is_symlink() or not root.is_dir():
+                return False
+            resolved = root.resolve(strict=True)
+            if resolved != root or not resolved.is_relative_to(home):
+                return False
+            if root.stat().st_dev != home_stat.st_dev:
+                return False
+            current = root
+            while current != home:
+                st = current.lstat()
+                if stat.S_ISLNK(st.st_mode) or st.st_dev != home_stat.st_dev:
+                    return False
+                current = current.parent
+            if current != home:
+                return False
+        except (OSError, ValueError):
+            return False
+    return True
+
+
+def runner_profile_path_safe(fam: Family, path: Path) -> bool:
+    """Reject a candidate whose parent chain escaped its profile root."""
+    try:
+        root = fam.root.resolve(strict=True)
+        observed = path.resolve(strict=True)
+        if not observed.is_relative_to(root):
+            return False
+        current = path
+        while current != fam.root:
+            st = current.lstat()
+            if stat.S_ISLNK(st.st_mode):
+                return False
+            current = current.parent
+        return current == fam.root
+    except (OSError, ValueError):
+        return False
+
+
 @dataclass
 class Item:
     family: str
@@ -1263,6 +1358,11 @@ def fixed_measurement_roots() -> list[Path]:
     This deliberately does not include ``/``: FileProvider and other privacy-protected
     directories can block a recursive fts walk in the kernel for hours.
     """
+    if RUNNER_CACHE_PROFILE:
+        # The per-account profile must not recursively inspect generic home caches
+        # merely to explain an accounting gap. Its selected family roots are already
+        # measured by survey().
+        return [f.root for f in runner_cache_families()]
     candidates: list[Path] = [
         # Keep known-heavy fleet roots separate. A single du of the shared
         # fleet tree can hold evict.lock long enough to starve admission.
@@ -1424,7 +1524,11 @@ def newest_mtime(path: Path, levels: int = 2, budget: int = 3000, access: bool =
 def item_mtime(fam: Family, path: Path) -> float:
     """An item's last use as survey and apply judge it: its newest mtime near the top, and for SwiftPM scratch
     also its lock, which owned_spm_scratch touches whenever a job links the directory."""
-    skip_names = frozenset(VCS_MARKERS) if fam.id == "tmp" else frozenset()
+    # Git's index refresh rewrites metadata without using the build output. In
+    # the enrolled-account profile that bookkeeping must not extend the cache's
+    # reuse window. Active jobs are still protected by process evidence and the
+    # git-loss check before deletion.
+    skip_names = frozenset(VCS_MARKERS) if (fam.id == "tmp" or RUNNER_CACHE_PROFILE) else frozenset()
     newest = newest_mtime(path, 2 if fam.reclaimable else 1, 3000 if fam.reclaimable else 300,
                           access=fam.discover, skip_names=skip_names)
     if fam.id == SPM_SCRATCH:
@@ -3223,7 +3327,7 @@ def accounting_coverage(dev: int, now: float) -> list[dict[str, Any]]:
     scope and completeness so the UI can show where the bytes live without pretending
     that their sum is a physical total.
     """
-    if not DARWIN:
+    if not DARWIN or RUNNER_CACHE_PROFILE:
         return []
     rows: list[dict[str, Any]] = []
     shared_children: dict[str, int] | None = None
@@ -3723,6 +3827,14 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         if i.verdict != "reclaimable":
             continue
         p = Path(i.path)
+        if RUNNER_CACHE_PROFILE and (not runner_profile_roots_safe(list(families.values()))
+                                     or not runner_profile_path_safe(families[i.family], p)):
+            outcome = "changed:profile-boundary"
+            rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(),
+                   "outcome": outcome, "rebuild": families[i.family].rebuild, **asdict(i)}
+            with receipt.open("a") as f:
+                f.write(json.dumps(rec) + "\n")
+            continue
         if targets is not None:
             try:
                 dev = p.parent.stat().st_dev
@@ -3977,6 +4089,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--idle-hours", type=float, default=None,
                     help="idle window (default 24h, or 6h under pressure)")
     ap.add_argument("--family", action="append", help="limit to these family ids")
+    ap.add_argument("--runner-caches", action="store_true",
+                    help="use the narrow enrolled-runner account profile (macOS only)")
     ap.add_argument("--top", type=int, default=25)
     ap.add_argument("--min-mib", type=int, default=50)
     ap.add_argument("--json", action="store_true")
@@ -4011,13 +4125,24 @@ def main(argv: list[str] | None = None) -> int:
         a.low = f"{a.need + POLICY['low_margin_gib']:g}"
         a.target = f"{a.need + POLICY['target_margin_gib']:g}"
 
-    fams = default_families()
+    global RUNNER_CACHE_PROFILE
+    RUNNER_CACHE_PROFILE = bool(a.runner_caches)
+    fams = runner_cache_families() if RUNNER_CACHE_PROFILE else default_families()
+    if RUNNER_CACHE_PROFILE and not DARWIN:
+        print("runner cache profile is macOS-only; skipped")
+        return 0
+    if RUNNER_CACHE_PROFILE and not runner_profile_roots_safe(fams):
+        print("runner cache profile roots are not safe; skipped")
+        return 0
     for ov in a.root_override:
         fid, _, p = ov.partition("=")
         fams = [replace(f, root=Path(p), files=False, min_bytes=None, git_disposable=False)
                 if f.id == fid else f for f in fams]
     if a.family:
         fams = [f for f in fams if f.id in a.family]
+    if RUNNER_CACHE_PROFILE and not runner_profile_roots_safe(fams):
+        print("runner cache profile roots are not safe; skipped")
+        return 0
     if a.dedupe:
         dd = next((f.root for f in fams if f.id == "xcode-derived-data"), None)
         if dd is None or not DARWIN:
@@ -4035,6 +4160,12 @@ def main(argv: list[str] | None = None) -> int:
             if not r["young"] or attempt == 2:
                 break
             time.sleep(a.settle_minutes * 60)
+        return 0
+    if RUNNER_CACHE_PROFILE and not fams:
+        # An account with no known CI roots has nothing to sweep. Do not fall back
+        # to a synthetic HOME family, which would turn this allowlist into a broad
+        # home traversal.
+        print("runner cache profile: no configured cache roots")
         return 0
     try:
         floor_gib = max(runner_floor_gib(), a.floor_gib if math.isfinite(a.floor_gib) else 0.0)
@@ -4075,6 +4206,10 @@ def main(argv: list[str] | None = None) -> int:
             print(why)
             return 0
     if a.apply:
+        if RUNNER_CACHE_PROFILE and not runner_profile_roots_safe(fams):
+            print("runner cache profile roots changed during observation; skipped")
+            release_evict_lock(_EVICT_HANDLE)
+            return 0
         # A second eviction would only race the first for the same items; its caller re-reads free
         # space instead.  The owner record lets a later run recover from a daemon that died while
         # its lock descriptor remained open.
@@ -4144,7 +4279,8 @@ def main(argv: list[str] | None = None) -> int:
     accounting = filesystem_accounting(shown, items)
     write_health_summary(shown, items, accounting, a.receipt)
     # Xcode copies are sized by a walk, so only a report shows them (the agent runs with --top 0)
-    tooling = (simulator_runtimes() + (xcode_items() if a.top or a.json else [])) if sweep and DARWIN else []
+    tooling = (simulator_runtimes() + (xcode_items() if a.top or a.json else [])) \
+        if sweep and DARWIN and not RUNNER_CACHE_PROFILE else []
     if a.json:
         print(json.dumps({"free": shown[0].free, "total": shown[0].total, "idle_hours": idle,
                           "tooling": [asdict(i) for i in tooling],
@@ -4167,10 +4303,12 @@ def main(argv: list[str] | None = None) -> int:
               {fs.dev: fs.target for fs in shown} if a.pressure else None, idle, halt)
         # A drained runner is explicitly held by cmux_mini_fix; once its listener and worker
         # are absent, its disposable checkout can be cleared under this same eviction lock.
-        cleanup_paused_runner_work(a.receipt)
+        if not RUNNER_CACHE_PROFILE:
+            cleanup_paused_runner_work(a.receipt)
         if sweep:
-            # deleting a runtime restarts CoreSimulatorService: never while a job may be using simulators
-            apply_runtimes(tooling, a.receipt, host_busy)
+            if not RUNNER_CACHE_PROFILE:
+                # deleting a runtime restarts CoreSimulatorService: never while a job may be using simulators
+                apply_runtimes(tooling, a.receipt, host_busy)
             IDLE_STAMP.parent.mkdir(parents=True, exist_ok=True)
             IDLE_STAMP.touch()
         release_evict_lock(_EVICT_HANDLE)

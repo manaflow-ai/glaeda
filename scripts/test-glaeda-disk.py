@@ -109,6 +109,54 @@ class GlaedaDiskTest(unittest.TestCase):
         finally:
             gd.HOME, gd.FLEET_ROOT, gd.DARWIN = saved
 
+    def test_runner_cache_profile_is_allowlisted_and_bounded(self) -> None:
+        saved = (gd.HOME, gd.DARWIN, gd.RUNNER_CACHE_PROFILE)
+        gd.HOME = self.root
+        gd.DARWIN = True
+        gd.RUNNER_CACHE_PROFILE = True
+        try:
+            for relative in (
+                "Library/Developer/Xcode/DerivedData",
+                ".cache/cmux-job",
+                ".cache/cmux/ghosttykit",
+                "Library/Application Support/cua-ssh/recordings",
+                "Library/Caches/cmux/cmux-cua",
+            ):
+                (self.root / relative).mkdir(parents=True)
+            families = gd.runner_cache_families()
+            self.assertEqual(
+                {family.id for family in families},
+                {"xcode-derived-data", "cmux-job-cache", "cmux-ghosttykit-cache",
+                 "cua-recordings", "cua-cache"},
+            )
+            self.assertTrue(all(family.min_idle_hours == 168.0 for family in families))
+            self.assertTrue(gd.runner_profile_roots_safe(families))
+            measured = gd.fixed_measurement_roots()
+            self.assertEqual(set(measured), {family.root for family in families})
+            self.assertNotIn(self.root / ".cache", measured)
+            self.assertNotIn(self.root / "Library/Caches", measured)
+        finally:
+            gd.HOME, gd.DARWIN, gd.RUNNER_CACHE_PROFILE = saved
+
+    def test_runner_cache_profile_keeps_git_index_refresh_out_of_age_clock(self) -> None:
+        saved = gd.RUNNER_CACHE_PROFILE
+        gd.RUNNER_CACHE_PROFILE = True
+        try:
+            family = gd.Family("cmux-job-cache", self.root, True, "rebuild", min_idle_hours=168)
+            git = self.root / ".git"
+            git.mkdir()
+            now = time.time()
+            old = now - 200 * 3600
+            os.utime(self.root, (old, old))
+            os.utime(git, (now, now))
+            self.assertLess(gd.item_mtime(family, self.root), now - 190 * 3600)
+            for mode in (None, "pressure", "sweep"):
+                with mock.patch.object(gd, "ACTIVITY_MODE", mode):
+                    self.assertFalse(gd.item_due(family, 167, 168)[0], mode)
+                    self.assertTrue(gd.item_due(family, 168, 168)[0], mode)
+        finally:
+            gd.RUNNER_CACHE_PROFILE = saved
+
     def test_eviction_lock_owner_is_recorded_and_released(self) -> None:
         lock_path, owner_path = gd.EVICT_LOCK, gd.EVICT_OWNER
         gd.EVICT_LOCK = self.root / "evict.lock"

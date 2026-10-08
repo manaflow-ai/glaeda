@@ -221,7 +221,7 @@ class MiniSetupTest(unittest.TestCase):
         first = self.invoke("--apply")
         self.assertTrue(first["applied"])
         bin_dir = self.home / ".local/bin"
-        for name in ("glaeda-disk", "disk-pressure.sh", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all"):
+        for name in ("glaeda-disk", "glaeda-runner-hygiene", "disk-pressure.sh", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all"):
             self.assertTrue(os.access(bin_dir / name, os.X_OK), name)
         self.assertEqual((bin_dir / "glaeda-disk").read_bytes(), (ROOT / "scripts/glaeda-disk").read_bytes())
         self.assertEqual((bin_dir / "disk-pressure.sh").read_bytes(), (ROOT / "scripts/disk-pressure.sh").read_bytes())
