@@ -7,6 +7,30 @@ role=${1:?usage: fleet-cas-run ROLE}
 ROOT=${FLEET_CAS_ROOT:-/Users/Shared/cmux-build-fleet/xcode}
 args=()
 while IFS= read -r a; do args+=("$a"); done <"$ROOT/run/$role.args" || exit 1
+# A store binds its explicit tailnet address. launchd can start it before Tailscale has
+# installed that address, which makes tonic return EADDRNOTAVAIL and sends launchd into a
+# restart loop. Keep the service alive and observable until the address exists; this preserves
+# the explicit non-wildcard bind and lets launchd start the listener exactly once.
+wait_for_store_address() {
+  local listen=${1#tcp:} host=${1#tcp:}
+  case "$listen" in
+    *:*) host=${listen%:*} ;;
+    *) return 0 ;;
+  esac
+  case "$host" in
+    ''|0.0.0.0|127.*|localhost|::|\[::\]) return 0 ;;
+  esac
+  local notice=0
+  while ! ifconfig 2>/dev/null | awk '$1 == "inet" {print $2}' | grep -Fqx "$host"; do
+    if [ "$notice" -eq 0 ] || [ $((notice % 60)) -eq 0 ]; then
+      echo "fleet-cas: waiting for local bind address $host" >&2
+    fi
+    notice=$((notice + 1))
+    sleep 1
+  done
+}
+[ "$role" = store ] && [ "${args[0]:-}" != "" ] && wait_for_store_address "${args[0]}"
+
 # Record the pid and the binary it runs, so the installer can restart a stale one.
 echo $$ >"$ROOT/run/$role.pid"
 shasum -a 256 "$ROOT/bin/fleet-cas" | cut -c1-64 >"$ROOT/run/$role.bin"

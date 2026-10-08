@@ -77,4 +77,31 @@ env "${common_env[@]}" "$script" uninstall store --apply >"$temporary_root/root-
 grep -q "ROOT STEP NEEDED: sudo launchctl bootout system/com.teamleaderleo.glaeda.fleet-cas-store" "$temporary_root/root-plan"
 test -e "$daemons/com.teamleaderleo.glaeda.fleet-cas-store.plist"
 
-echo "glaeda-fleet-cas role-scoped uninstall tests passed"
+# A store launched before its tailnet address exists waits instead of crashing and being
+# restarted repeatedly by launchd. The fake ifconfig exposes the address on its second call.
+run_root=$temporary_root/run-wrapper
+mkdir -p "$run_root/bin" "$run_root/run"
+cat >"$run_root/bin/fleet-cas" <<'EOF'
+#!/usr/bin/env bash
+printf 'started %s\n' "$*"
+EOF
+chmod +x "$run_root/bin/fleet-cas"
+cat >"$stub_bin/ifconfig" <<'EOF'
+#!/usr/bin/env bash
+state=${FLEET_CAS_IFCONFIG_STATE:?}
+n=$(cat "$state" 2>/dev/null || echo 0)
+n=$((n + 1)); printf '%s\n' "$n" >"$state"
+[ "$n" -ge 2 ] && echo '    inet 100.89.140.13'
+EOF
+cat >"$stub_bin/sleep" <<'EOF'
+#!/usr/bin/env bash
+:
+EOF
+chmod +x "$stub_bin/ifconfig" "$stub_bin/sleep"
+printf 'tcp:100.89.140.13:7450\nstore\n' >"$run_root/run/store.args"
+env FLEET_CAS_ROOT="$run_root" FLEET_CAS_IFCONFIG_STATE="$temporary_root/ifconfig.calls" PATH="$stub_bin:$PATH" \
+  "$repo_root/tools/fleet-cas-prototype/scripts/fleet-cas-run" store >"$temporary_root/run-wrapper.out" 2>"$temporary_root/run-wrapper.err"
+grep -q 'waiting for local bind address 100.89.140.13' "$temporary_root/run-wrapper.err"
+grep -q 'started tcp:100.89.140.13:7450 store' "$temporary_root/run-wrapper.out"
+
+echo "glaeda-fleet-cas role-scoped uninstall and bind-wait tests passed"
