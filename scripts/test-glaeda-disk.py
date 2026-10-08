@@ -10,6 +10,7 @@ import fcntl
 import io
 import json
 import os
+import plistlib
 import shutil
 import socket
 import subprocess
@@ -414,6 +415,7 @@ class GlaedaDiskTest(unittest.TestCase):
         # never candidates: secrets, source, a checkout's build output, the Chromium trees,
         # a project's node_modules, and a hex-sharded store (a backup repository looks the same)
         for keep in (".ssh/cache", ".config/gh/cache", "Documents/cache", "Projects/x/cache",
+                     "Pictures/Wallpapers/cache",
                      "code/repo/target", "cmux-browser-fleet/cache", "app/node_modules/.cache",
                      ".my-tokens/cache", ".tool/untagged-creator"):
             (home / keep).mkdir(parents=True)
@@ -707,7 +709,9 @@ class GlaedaDiskTest(unittest.TestCase):
         self.addCleanup(lambda: (setattr(gd, "DARWIN", saved[0]), setattr(gd, "ACCOUNTING", saved[1]),
                                   gd._ACCOUNTING_MEM.clear()))
         with mock.patch.object(gd, "fixed_measurement_roots", return_value=[self.root]), \
-                mock.patch.object(gd, "du_bytes", return_value=8 * gd.GIB):
+                mock.patch.object(gd, "du_bytes", return_value=8 * gd.GIB), \
+                mock.patch.object(gd, "accounting_coverage", return_value=[]), \
+                mock.patch.object(gd, "apfs_container_capacity", return_value=None):
             got = gd.filesystem_accounting([fs], [item])
         self.assertEqual(got[0]["measured"], 3 * gd.GIB)
         self.assertEqual(got[0]["unmeasured"], 5 * gd.GIB)
@@ -720,7 +724,7 @@ class GlaedaDiskTest(unittest.TestCase):
         child.mkdir()
         fs = gd.Fs(parent.stat().st_dev, str(self.root), 2 * gd.GIB, 10 * gd.GIB, 3 * gd.GIB, 4 * gd.GIB)
         items = [gd.Item("projects", str(parent), 7 * gd.GIB, 2.0, "report-only"),
-                 gd.Item("cargo-target", str(child), 3 * gd.GIB, 2.0, "report-only")]
+                 gd.Item("checkout-build", str(child), 3 * gd.GIB, 2.0, "reclaimable")]
         saved = (gd.DARWIN, gd.ACCOUNTING)
         gd.DARWIN, gd.ACCOUNTING = False, self.root / "accounting-overlap.json"
         gd._ACCOUNTING_MEM.clear()
@@ -728,6 +732,42 @@ class GlaedaDiskTest(unittest.TestCase):
                                   gd._ACCOUNTING_MEM.clear()))
         got = gd.filesystem_accounting([fs], items)
         self.assertEqual(got[0]["measured"], 7 * gd.GIB)
+        self.assertEqual(got[0]["reclaimable"], 3 * gd.GIB)
+
+    def test_apfs_container_capacity_is_separate_from_volume_free(self) -> None:
+        saved = gd.DARWIN
+        gd.DARWIN = True
+        gd._APFS_CONTAINER_MEM.clear()
+        self.addCleanup(lambda: (setattr(gd, "DARWIN", saved), gd._APFS_CONTAINER_MEM.clear()))
+        plist = plistlib.dumps({"APFSContainerSize": 494 * gd.GIB,
+                                "APFSContainerFree": 50 * gd.GIB})
+        with mock.patch.object(gd.subprocess, "run",
+                               return_value=subprocess.CompletedProcess([], 0, plist, b"")) as run:
+            got = gd.apfs_container_capacity("/System/Volumes/Data", now=100.0)
+            again = gd.apfs_container_capacity("/System/Volumes/Data", now=101.0)
+        self.assertEqual(got, {"status": "observed", "total": 494 * gd.GIB,
+                               "free": 50 * gd.GIB, "used": 444 * gd.GIB, "at": 100.0})
+        self.assertEqual(again, got)
+        run.assert_called_once()
+
+    def test_accounting_separates_reclaimable_from_unclassified_and_container(self) -> None:
+        path = self.root / "rebuildable"
+        path.write_bytes(b"x")
+        fs = gd.Fs(path.stat().st_dev, str(self.root), 3 * gd.GIB, 10 * gd.GIB, 4 * gd.GIB, 5 * gd.GIB)
+        item = gd.Item("xcode-derived-data", str(path), 2 * gd.GIB, 30.0, "reclaimable")
+        saved = (gd.DARWIN, gd.ACCOUNTING)
+        gd.DARWIN, gd.ACCOUNTING = False, self.root / "accounting-reclaimable.json"
+        gd._ACCOUNTING_MEM.clear()
+        gd._ACCOUNTING_COVERAGE_MEM.clear()
+        self.addCleanup(lambda: (setattr(gd, "DARWIN", saved[0]), setattr(gd, "ACCOUNTING", saved[1]),
+                                  gd._ACCOUNTING_MEM.clear(), gd._ACCOUNTING_COVERAGE_MEM.clear()))
+        with mock.patch.object(gd, "apfs_container_capacity", return_value={
+                "status": "observed", "total": 20 * gd.GIB, "free": 6 * gd.GIB,
+                "used": 14 * gd.GIB, "at": 100.0}):
+            got = gd.filesystem_accounting([fs], [item])[0]
+        self.assertEqual(got["reclaimable"], 2 * gd.GIB)
+        self.assertEqual(got["unclassified"], 5 * gd.GIB)
+        self.assertEqual(got["container"]["free"], 6 * gd.GIB)
 
     def test_accounting_cache_keeps_walk_timestamp_until_walk_is_due(self) -> None:
         path = self.root / "known"
@@ -736,10 +776,13 @@ class GlaedaDiskTest(unittest.TestCase):
         saved = (gd.DARWIN, gd.ACCOUNTING)
         gd.DARWIN, gd.ACCOUNTING = True, self.root / "accounting-cache.json"
         gd._ACCOUNTING_MEM.clear()
+        gd._ACCOUNTING_COVERAGE_MEM.clear()
         self.addCleanup(lambda: (setattr(gd, "DARWIN", saved[0]), setattr(gd, "ACCOUNTING", saved[1]),
-                                  gd._ACCOUNTING_MEM.clear()))
+                                  gd._ACCOUNTING_MEM.clear(), gd._ACCOUNTING_COVERAGE_MEM.clear()))
         with mock.patch.object(gd, "fixed_measurement_roots", return_value=[self.root]), \
-                mock.patch.object(gd, "du_bytes", return_value=8 * gd.GIB):
+                mock.patch.object(gd, "du_bytes", return_value=8 * gd.GIB), \
+                mock.patch.object(gd, "accounting_coverage", return_value=[]), \
+                mock.patch.object(gd, "apfs_container_capacity", return_value=None):
             gd.filesystem_accounting([fs], [])
         first = json.loads(gd.ACCOUNTING.read_text())[str(fs.dev)]["at"]
         gd._ACCOUNTING_MEM.clear()
@@ -747,6 +790,101 @@ class GlaedaDiskTest(unittest.TestCase):
             gd.filesystem_accounting([fs], [])
         second = json.loads(gd.ACCOUNTING.read_text())[str(fs.dev)]["at"]
         self.assertEqual(second, first)
+
+    def test_accounting_coverage_is_cached_and_private_names_are_not_emitted(self) -> None:
+        path = self.root / "known"
+        path.write_bytes(b"x")
+        fs = gd.Fs(path.stat().st_dev, str(self.root), 2 * gd.GIB, 10 * gd.GIB, 3 * gd.GIB, 4 * gd.GIB)
+        saved = (gd.DARWIN, gd.ACCOUNTING, gd.DARWIN_ACCOUNTING_ROOTS)
+        data = self.root / "Data"
+        users = data / "Users"
+        shared = users / "Shared"
+        shared.mkdir(parents=True)
+        gd.DARWIN, gd.ACCOUNTING = True, self.root / "accounting-coverage.json"
+        gd.DARWIN_ACCOUNTING_ROOTS = (("data-volume", data), ("data-users", users),
+                                      ("data-users-shared", shared))
+        gd._ACCOUNTING_MEM.clear()
+        gd._ACCOUNTING_COVERAGE_MEM.clear()
+        self.addCleanup(lambda: (setattr(gd, "DARWIN", saved[0]), setattr(gd, "ACCOUNTING", saved[1]),
+                                  setattr(gd, "DARWIN_ACCOUNTING_ROOTS", saved[2]),
+                                  gd._ACCOUNTING_MEM.clear(), gd._ACCOUNTING_COVERAGE_MEM.clear()))
+        coverage = [
+            ({str(data / "Users"): 100, str(data / "Applications"): 20}, False),
+            ({str(users / "leo"): 80, str(users / "Shared"): 30}, False),
+            ({str(shared / "cmux-build-fleet"): 30}, True),
+        ]
+        with mock.patch.object(gd, "fixed_measurement_roots", return_value=[self.root]), \
+                mock.patch.object(gd, "du_bytes", return_value=8 * gd.GIB), \
+                mock.patch.object(gd, "shared_fleet_roots", return_value=[]), \
+                mock.patch.object(gd, "du_children_with_status", side_effect=coverage) as covered:
+            got = gd.filesystem_accounting([fs], [])
+            gd._ACCOUNTING_MEM.clear()
+            again = gd.filesystem_accounting([fs], [])
+        self.assertEqual(covered.call_count, 3)
+        self.assertEqual(got[0]["coverage"], again[0]["coverage"])
+        encoded = json.dumps(got)
+        self.assertNotIn("leo", encoded)
+        users_row = next(x for x in got[0]["coverage"] if x["scope"] == "data-users")
+        self.assertEqual(users_row["children"], [
+            {"category": "private-user-data", "bytes": 80, "private": True,
+             "classification": "private"},
+            {"category": "shared-users-data", "bytes": 30, "private": False,
+             "classification": "shared-runner"},
+        ])
+
+    def test_partial_du_coverage_is_a_lower_bound(self) -> None:
+        with mock.patch.object(gd, "_du_output",
+                               return_value=f"5 {self.root / 'one'}\ndu: protected\n"):
+            self.assertEqual(gd.du_children_with_status(self.root),
+                             ({str(self.root / "one"): 5 * 1024}, False))
+
+    def test_runner_home_coverage_requires_runner_evidence_and_classifies_builds(self) -> None:
+        saved = (gd.HOME, gd.DARWIN, gd.DARWIN_ACCOUNTING_ROOTS)
+        gd.HOME, gd.DARWIN, gd.DARWIN_ACCOUNTING_ROOTS = self.root, True, ()
+        runner = self.root / "actions-runner-glaeda"
+        (runner / "glaeda-hooks").mkdir(parents=True)
+        (runner / ".runner").write_text("{}")
+        (self.root / "cmux-browser-fleet/build").mkdir(parents=True)
+        (self.root / "Library/Caches").mkdir(parents=True)
+        self.addCleanup(lambda: (setattr(gd, "HOME", saved[0]), setattr(gd, "DARWIN", saved[1]),
+                                  setattr(gd, "DARWIN_ACCOUNTING_ROOTS", saved[2])))
+        results = [({str(self.root / "cmux-browser-fleet"): 42}, True),
+                   ({str(self.root / "Library/Caches/cmux-next-ci"): 8}, True),
+                   ({str(self.root / "cmux-browser-fleet/build/obj"): 40}, True)]
+        with mock.patch.object(gd, "shared_fleet_roots", return_value=[]), \
+                mock.patch.object(gd, "du_children_with_status", side_effect=results):
+            rows = gd.accounting_coverage(self.root.stat().st_dev, 100.0)
+        self.assertEqual([r["scope"] for r in rows], ["runner-home", "runner-library-caches",
+                                                        "runner-browser-build"])
+        self.assertEqual(rows[0]["children"][0]["classification"], "build")
+        self.assertEqual(rows[1]["children"][0]["category"], "cache/cmux-next-ci")
+        self.assertNotIn("path", json.dumps(rows))
+
+    def test_shared_fleet_coverage_separates_cache_build_ci_and_products(self) -> None:
+        saved = (gd.DARWIN, gd.DARWIN_ACCOUNTING_ROOTS)
+        root = self.root / "shared-fleet"
+        for name in ("cache", "xcode", "ci", "node-products"):
+            (root / name).mkdir(parents=True)
+        gd.DARWIN, gd.DARWIN_ACCOUNTING_ROOTS = True, ()
+        self.addCleanup(lambda: (setattr(gd, "DARWIN", saved[0]),
+                                  setattr(gd, "DARWIN_ACCOUNTING_ROOTS", saved[1])))
+        roots = [("shared-fleet", root)] + [(f"shared-fleet/{name}", root / name)
+                                             for name in ("cache", "xcode", "ci", "node-products")]
+        covered = [
+            ({str(root / name): size for name, size in (("cache", 54), ("xcode", 53),
+                                                        ("ci", 37), ("node-products", 23))}, True),
+        ]
+        with mock.patch.object(gd, "shared_fleet_roots", return_value=roots), \
+                mock.patch.object(gd, "du_children_with_status", side_effect=covered) as measured:
+            rows = gd.accounting_coverage(root.stat().st_dev, 100.0)
+        self.assertEqual(measured.call_count, 1)
+        self.assertEqual([r["scope"] for r in rows], [x[0] for x in roots])
+        root_row = rows[0]
+        self.assertEqual({x["category"]: x["classification"] for x in root_row["children"]},
+                         {"cache": "shared-cache", "xcode": "macos-build", "ci": "macos-ci",
+                          "node-products": "shared-node-products"})
+        self.assertEqual(rows[1]["children"][0]["classification"], "shared-cache")
+        self.assertNotIn("path", json.dumps(rows))
 
     def test_retired_owner_family_is_reclaimable_when_unloaded(self) -> None:
         make(self.root / "old")
@@ -1640,7 +1778,7 @@ class GlaedaDiskTest(unittest.TestCase):
                                  "app/Packages/macOS/Core/.build", "wts/feature/.build",
                                  "wts/feature/Packages/macOS/Core/.build"])
 
-    def test_checkout_build_goes_after_a_day_and_the_checkout_stays(self) -> None:
+    def test_checkout_build_goes_after_half_a_day_and_the_checkout_stays(self) -> None:
         projects, fam = self._checkout_builds()
         self._age(projects / "wts/feature/.build", hours=12)
         gd.process_evidence = lambda: ([], f"swift-frontend {projects}/app/Packages/macOS/Core/.build/x.o\n")
@@ -1648,14 +1786,14 @@ class GlaedaDiskTest(unittest.TestCase):
         v = {str(Path(i.path).relative_to(projects)): i.verdict for i in items}
         self.assertEqual(v["app/.build"], "reclaimable")
         self.assertEqual(v["app/Packages/macOS/Core/.build"], "in-use")
-        self.assertEqual(v["wts/feature/.build"], "recent")  # 12 h: inside the day a session may return in
+        self.assertEqual(v["wts/feature/.build"], "reclaimable")  # 12 h retention for disposable output
         receipt = self.receipt()
         gd.apply(items, {fam.id: fam}, receipt, None, 6)
         self.assertFalse((projects / "app/.build").exists())
         self.assertFalse((projects / "app/.glaeda/apple-build/cache/k1").exists())
         self.assertTrue((projects / "app/.glaeda/apple-build/receipt.json").exists())
         self.assertTrue((projects / "app/Packages/macOS/Core/.build").exists())
-        self.assertTrue((projects / "wts/feature/.build").exists())
+        self.assertFalse((projects / "wts/feature/.build").exists())
         self.assertEqual(self._git("-C", str(projects / "app"), "status", "--porcelain", "-uno"), "")
 
     def test_apple_generation_stays_while_a_run_holds_the_lock(self) -> None:
@@ -1698,15 +1836,15 @@ class GlaedaDiskTest(unittest.TestCase):
         make(ci / "derived-data", age_hours=30)
         fams = gd.idle_families(gd.fleet_families(ci))
         got = {str(Path(i.path).relative_to(ci)): i.verdict for i in gd.survey(fams, gd.IDLE_SWEEP_HOURS, 0)}
-        self.assertEqual(got, {"seeds/p-a": "kept", "seeds/p-b": "kept", "seeds/p-c": "recent",
+        self.assertEqual(got, {"seeds/p-a": "kept", "seeds/p-b": "kept", "seeds/p-c": "reclaimable",
                                "seeds/p-d": "reclaimable", "pr-builds/pr-1": "recent",
-                               "pr-builds/pr-2": "recent", "derived-data": "recent"})
-        # DerivedData and caches wait the full window
+                               "pr-builds/pr-2": "recent", "derived-data": "reclaimable"})
+        # DerivedData and caches use the 12 h idle window for disposable output.
         make(self.root / "dd/old", age_hours=50)
         make(self.root / "dd/day", age_hours=30)
         fam = gd.Family("xcode-derived-data", self.root / "dd", True, "rebuild")
         got = {Path(i.path).name: i.verdict for i in gd.survey(gd.idle_families([fam]), gd.IDLE_SWEEP_HOURS, 0)}
-        self.assertEqual(got, {"old": "reclaimable", "day": "recent"})
+        self.assertEqual(got, {"old": "reclaimable", "day": "reclaimable"})
 
     def test_host_busy_sees_jobs_builds_locks_and_reservations(self) -> None:
         fleet = self.root / "fleet"
@@ -1777,7 +1915,7 @@ class GlaedaDiskTest(unittest.TestCase):
                     contextlib.redirect_stdout(io.StringIO()):
                 gd.main(args)
             self.assertFalse((self.root / "old").exists())
-            self.assertTrue((self.root / "day").exists())
+            self.assertFalse((self.root / "day").exists())
             self.assertTrue(stamp.exists())
             make(self.root / "old", age_hours=50)
             with mock.patch.object(gd, "host_busy", return_value=""), contextlib.redirect_stdout(io.StringIO()) as out:
@@ -1862,6 +2000,9 @@ class LinuxLayoutTest(unittest.TestCase):
                          ["botany-sim-worktrees", "glaeda-worktrees"])
         reclaimable = {f.id for f in fams if f.reclaimable}
         self.assertTrue(reclaimable <= {"tmp", "claude-scratchpad", "user-cache", "home-caches", "checkout-build"})
+        self.assertEqual(next(f for f in fams if f.id == "tmp").platform, "linux")
+        self.assertEqual(next(f for f in fams if f.id == "user-cache").platform, "linux")
+        self.assertEqual(next(f for f in fams if f.id == "home-caches").platform, "linux")
         projects = next(f for f in fams if f.id == "projects")
         self.assertIn("botany-sim-worktrees", projects.skip)
         tmp = next(f for f in fams if f.id == "tmp")
@@ -1890,7 +2031,7 @@ class LinuxLayoutTest(unittest.TestCase):
         gd.process_evidence = lambda: ([], "")
         try:
             fams = [f for f in gd.default_families() if f.id in ("cmux-job-cache", "user-cache")]
-            self.assertEqual(next(f for f in fams if f.id == "cmux-job-cache").min_idle_hours, 24.0)
+            self.assertEqual(next(f for f in fams if f.id == "cmux-job-cache").min_idle_hours, 12.0)
             items = gd.survey(fams, 24, 0)
         finally:
             gd.process_evidence = saved

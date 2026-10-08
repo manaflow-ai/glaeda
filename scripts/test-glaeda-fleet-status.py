@@ -585,9 +585,18 @@ class DiskTests(unittest.TestCase):
                   "filesystems": [{"dev": 1, "mount": "/", "free": 100 * GIB, "total": 460 * GIB, "low": 69 * GIB,
                                    "target": 115 * GIB, "tmpfs": False}],
                   "owners": {"hq": {"owner": "worker", "retired": True}, "empty": {"owner": "x", "retired": False}},
-                  "items": [{"family": "hq", "path": "/Users/cmux/secret/a", "bytes": 3 * GIB},
-                            {"family": "hq", "path": "/Users/cmux/secret/b", "bytes": 4 * GIB},
-                            {"family": "tmp", "path": "/private/tmp/x", "bytes": GIB}]}
+                  "items": [{"family": "hq", "path": "/Users/cmux/secret/a", "bytes": 3 * GIB,
+                             "platform": "macos"},
+                            {"family": "hq", "path": "/Users/cmux/secret/b", "bytes": 4 * GIB,
+                             "platform": "macos"},
+                            {"family": "tmp", "path": "/private/tmp/x", "bytes": GIB,
+                             "platform": "linux"}],
+                  "accounting": [{"used": 300 * GIB, "measured": 100 * GIB, "unmeasured": 200 * GIB,
+                                  "coverage": [{"scope": "data-users", "complete": False,
+                                                "path": "/System/Volumes/Data/Users",
+                                                "children": [{"category": "private-user-data",
+                                                              "bytes": 80 * GIB, "private": True,
+                                                              "classification": "private"}]}]}]}
         receipts = [{"at": "2027-01-15T08:00:00+0000", "outcome": "reclaimed", "bytes": 2 * GIB},
                     {"at": "2027-01-15T07:00:00+0000", "outcome": "changed:in-use", "bytes": 9 * GIB},
                     {"at": "2027-01-10T00:00:00+0000", "outcome": "reclaimed", "bytes": 9 * GIB}]
@@ -603,8 +612,12 @@ class DiskTests(unittest.TestCase):
         row = fs.parse_disk(stdout, now)
         self.assertNotIn("/Users/", json.dumps(row))
         self.assertEqual((row["free"], row["low"], row["fleet_cas"]), (100 * GIB, 69 * GIB, True))
-        self.assertEqual(row["families"][0], {"family": "hq", "bytes": 7 * GIB, "owner": "worker", "retired": True})
+        self.assertEqual(row["families"][0], {"family": "hq", "bytes": 7 * GIB, "owner": "worker",
+                                              "retired": True, "platform": "macos"})
         self.assertEqual([f["family"] for f in row["families"]], ["hq", "tmp", "empty"])
+        self.assertEqual(row["accounting"][0]["coverage"][0]["children"][0],
+                         {"category": "private-user-data", "bytes": 80 * GIB, "private": True,
+                          "classification": "private"})
         self.assertEqual(row["reclaimed_24h"], {"bytes": 2 * GIB, "count": 1})
         self.assertEqual((row["prune"]["result"], row["prune"]["node_store_bytes"]), ("ok", 5))
         self.assertEqual(row["prune"]["at"], now - 3600 + 100)  # moved onto this machine's clock

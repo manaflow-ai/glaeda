@@ -467,20 +467,57 @@ def parse_disk(stdout: str, at: int) -> dict[str, Any]:
         home = next((f for f in systems if f.get("free") == free and f.get("total") == total),
                     systems[0] if systems else {})
         sizes: dict[str, int] = {}
+        platforms: dict[str, set[str]] = {}
         for item in report.get("items") or []:
             if isinstance(item, dict) and num(item.get("bytes")) is not None:
                 fam = str(item.get("family") or "unknown")
                 sizes[fam] = sizes.get(fam, 0) + int(item["bytes"])
+                platform = str(item.get("platform") or "unknown")
+                if platform not in {"macos", "linux", "shared", "unknown"}:
+                    platform = "unknown"
+                platforms.setdefault(fam, set()).add(platform)
         owners = report.get("owners") if isinstance(report.get("owners"), dict) else {}
         families = []
         for fam in set(sizes) | set(owners):
             owner = owners.get(fam) if isinstance(owners.get(fam), dict) else {}
+            observed_platforms = platforms.get(fam, set()) - {"unknown"}
+            platform = next(iter(observed_platforms)) if len(observed_platforms) == 1 else (
+                "shared" if observed_platforms else "unknown")
             families.append({"family": clean(fam, 60), "bytes": sizes.get(fam, 0), "owner": clean(owner.get("owner"), 80),
-                             "retired": owner.get("retired") is True})
+                             "retired": owner.get("retired") is True, "platform": platform})
         families.sort(key=lambda f: (-f["bytes"], f["family"]))
         sizes_at = next((int(x) for x in sections.get("sizes_at", []) if x.strip().isdigit()), None)
+        accounting = []
+        for entry in report.get("accounting") or []:
+            if not isinstance(entry, dict):
+                continue
+            clean_entry = {"used": num(entry.get("used")), "measured": num(entry.get("measured")),
+                           "unmeasured": num(entry.get("unmeasured")),
+                           "unclassified": num(entry.get("unclassified", entry.get("unmeasured"))),
+                           "reclaimable": num(entry.get("reclaimable")),
+                           "coverage_note": clean(entry.get("coverage_note"), 160), "coverage": []}
+            container = entry.get("container") if isinstance(entry.get("container"), dict) else None
+            if container is not None:
+                clean_entry["container"] = {"status": clean(container.get("status"), 20) or "unknown",
+                                             "total": num(container.get("total")),
+                                             "free": num(container.get("free")),
+                                             "used": num(container.get("used"))}
+            for coverage in entry.get("coverage") or []:
+                if not isinstance(coverage, dict):
+                    continue
+                children = []
+                for child in coverage.get("children") or []:
+                    if isinstance(child, dict) and num(child.get("bytes")) is not None:
+                        children.append({"category": clean(child.get("category"), 80),
+                                         "bytes": int(child["bytes"]), "private": child.get("private") is True,
+                                         "classification": clean(child.get("classification"), 32) or "unknown"})
+                clean_entry["coverage"].append({"scope": clean(coverage.get("scope"), 40),
+                                                  "complete": coverage.get("complete") is True,
+                                                  "platform": clean(coverage.get("platform"), 20),
+                                                  "children": children[:32]})
+            accounting.append(clean_entry)
         row.update(free=free, total=total, low=num(home.get("low")), families=families[:MAX_DISK_FAMILIES],
-                   sizes_at=sizes_at + skew if sizes_at is not None else None)
+                   sizes_at=sizes_at + skew if sizes_at is not None else None, accounting=accounting)
     job_at = next((int(x) for x in sections.get("prune_job_at", []) if x.strip().isdigit()), None)
     row["prune_job_at"] = job_at + skew if job_at is not None else None
     prune_lines = json_lines(sections.get("prune", []))
@@ -1098,7 +1135,8 @@ class Builder:
             for f in (row.get("families") or [])[:MAX_DISK_FAMILIES]:
                 if isinstance(f, dict) and num(f.get("bytes")) is not None:
                     families.append({"family": clean(f.get("family"), 60), "bytes": int(f["bytes"]),
-                                     "owner": clean(f.get("owner"), 80), "retired": f.get("retired") is True})
+                                     "owner": clean(f.get("owner"), 80), "retired": f.get("retired") is True,
+                                     "platform": clean(f.get("platform"), 20) or "unknown"})
             free, total, low = num(row.get("free")), num(row.get("total")), num(row.get("low"))
             prune = row.get("prune") if isinstance(row.get("prune"), dict) else None
             gc = row.get("gc") if isinstance(row.get("gc"), dict) else None
@@ -1110,6 +1148,7 @@ class Builder:
                 "under_pressure": free is not None and low is not None and free < low,
                 "cache_bytes": sum(f["bytes"] for f in families if f["family"] not in DOUBLE_COUNTED),
                 "families": families,
+                "accounting": row.get("accounting") if isinstance(row.get("accounting"), list) else [],
                 "sizes_at": stamp_of(row.get("sizes_at")), "fleet_cas": row.get("fleet_cas") is True,
                 "prune_job_at": stamp_of(row.get("prune_job_at")),
                 "prune": None if prune is None else {
@@ -1413,6 +1452,26 @@ def disk_line(d: dict[str, Any] | None, at: int) -> str:
         top = ", ".join(f"{f['family']} {gib(f['bytes'])}" for f in (d.get("families") or [])[:3] if f["bytes"])
         parts.append(f"caches {gib(d.get('cache_bytes'))} GiB" + (f" [{top}]" if top else "")
                      + (f", RETIRED {gib(retired)} GiB" if retired else ""))
+        categories = []
+        for entry in d.get("accounting") or []:
+            for coverage in entry.get("coverage") or []:
+                for child in coverage.get("children") or []:
+                    if child.get("bytes"):
+                        label = str(child.get("category") or "unknown")
+                        categories.append(f"{label} {gib(child['bytes'])}")
+        if categories:
+            parts.append("accounted " + ", ".join(categories[:3]))
+        accounting_totals = []
+        for entry in d.get("accounting") or []:
+            if entry.get("reclaimable") is not None:
+                accounting_totals.append(f"reclaimable {gib(entry['reclaimable'])} GiB")
+            if entry.get("unclassified") is not None:
+                accounting_totals.append(f"unclassified {gib(entry['unclassified'])} GiB")
+            container = entry.get("container") or {}
+            if container.get("free") is not None:
+                accounting_totals.append(f"APFS container free {gib(container['free'])} GiB")
+        if accounting_totals:
+            parts.append("; ".join(accounting_totals[:3]))
     prune, gc = d.get("prune"), d.get("gc")
     if prune:
         result = str(prune.get("result") or "?").split(" (")[0]

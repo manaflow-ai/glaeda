@@ -365,8 +365,8 @@ def check_disk_accounting(mini: Mini) -> list[dict[str, Any]]:
         findings.append(finding(str(entry["id"]), str(entry.get("severity") or "warn"), evidence,
                                 str(entry.get("auto_fix") or "pending"), "glaeda-disk reported this finding"))
     accounting = summary.get("accounting") or []
-    missing = sum(float(x.get("unmeasured")) for x in accounting
-                  if isinstance(x, dict) and isinstance(x.get("unmeasured"), (int, float)))
+    missing = sum(float(x.get("unclassified", x.get("unmeasured"))) for x in accounting
+                  if isinstance(x, dict) and isinstance(x.get("unclassified", x.get("unmeasured")), (int, float)))
     if missing < 1 * 1024**3:
         return findings
     top: list[str] = []
@@ -375,7 +375,7 @@ def check_disk_accounting(mini: Mini) -> list[dict[str, Any]]:
             if isinstance(entry, dict) and entry.get("path") and isinstance(entry.get("bytes"), (int, float)):
                 top.append(f"{entry['path']} {entry['bytes'] / 1024**3:.1f} GiB")
     where = "; top level: " + ", ".join(top[:5]) if top else ""
-    findings.append(finding("disk_unmeasured", "warn", f"{missing / 1024**3:.1f} GiB used space is outside glaeda-disk's measured items{where}",
+    findings.append(finding("disk_unmeasured", "warn", f"{missing / 1024**3:.1f} GiB used space is unclassified outside glaeda-disk's measured items{where}",
                             "pending", "glaeda-disk reports bounded known-heavy roots and refreshes their accounting"))
     return findings
 
