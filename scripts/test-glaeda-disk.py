@@ -1114,6 +1114,24 @@ class GlaedaDiskTest(unittest.TestCase):
         finally:
             gd.HOME, gd.FLEET_ROOT, gd.DARWIN = saved
 
+    def test_default_families_delineate_cua_recordings_and_cache(self) -> None:
+        saved = (gd.HOME, gd.FLEET_ROOT, gd.DARWIN)
+        gd.HOME = self.root
+        gd.FLEET_ROOT = self.root / "shared-fleet"
+        gd.DARWIN = True
+        try:
+            (gd.HOME / "Library/Application Support/cua-ssh/recordings").mkdir(parents=True)
+            (gd.HOME / "Library/Caches/cmux/cmux-cua").mkdir(parents=True)
+            fams = {f.id: f for f in gd.default_families()}
+            self.assertEqual(fams["cua-recordings"].root,
+                             gd.HOME / "Library/Application Support/cua-ssh/recordings")
+            self.assertEqual(fams["cua-cache"].root, gd.HOME / "Library/Caches/cmux/cmux-cua")
+            self.assertTrue(fams["cua-recordings"].reclaimable)
+            self.assertEqual(fams["cua-recordings"].min_idle_hours, 24.0)
+            self.assertEqual(fams["cua-cache"].owner, "cmux CUA")
+        finally:
+            gd.HOME, gd.FLEET_ROOT, gd.DARWIN = saved
+
     def test_ci_ios_derived_data_is_reclaimable_without_deleting_runner_root(self) -> None:
         root = self.root / "ci-ios"
         old = root / "runner-a" / "derived-data"
