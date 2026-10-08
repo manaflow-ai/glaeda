@@ -168,7 +168,8 @@ JOB_CLASSES = {"macos-compile-admission": "compile", "app-host-unit-tests": "gui
 # start) and restores its own compile cache lineage: no canonical root, no kept DerivedData, no GUI. As an
 # unknown id it would take the compile class and hold the root a seed on the same mini waits for.
 # cmux-tui's `cdp-browser-smoke` drives a headless Playwright Chromium from cargo tests in the workspace: no
-# console session or canonical root. reload-build's `build` is a Debug build of the dev app (or the iOS app)
+# console session or canonical root. Its `macos-relay` job runs the chatmux-relay Rust tests in the workspace
+# and has the same no-root contract. reload-build's `build` is a Debug build of the dev app (or the iOS app)
 # into the workspace's .ci-reload-derived-data, after git clean -ffdx: no GUI, keychain or canonical root.
 # Both reach the minis as side lanes (vars.CI_SIDE_LANE_RUNNER, cmux docs/ci-runners.md "Side lanes").
 # cmux-next.yml (cmux's feat-cmux-next branch only) is a side lane too: `swift-test` builds and runs the
@@ -185,6 +186,7 @@ JOB_CLASSES = {"macos-compile-admission": "compile", "app-host-unit-tests": "gui
 # steps, so it is gui-step. It restores no product into a canonical root.
 WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "test"): "isolated",
                         ("cmux-tui.yml", "build"): "isolated", ("cmux-tui.yml", "cdp-browser-smoke"): "isolated",
+                        ("cmux-tui.yml", "macos-relay"): "isolated",
                         ("reload-build.yml", "build"): "isolated", ("app-host-test-rerun.yml", "rerun"): "gui",
                         ("test-e2e.yml", "build"): "compile-gui", ("test-e2e.yml", "test"): "gui-step",
                         ("seed-derived-data.yml", "seed"): "seed",
