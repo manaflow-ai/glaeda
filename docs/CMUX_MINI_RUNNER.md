@@ -33,6 +33,9 @@ them back to Blacksmith.
   command adds it automatically for manifest members with `gui: false`). The apply
   path installs a root-owned supervisor and a `UserName` LaunchDaemon, so listeners
   return after reboot without a GUI login. This requires passwordless sudo on the host.
+- Keep maintenance in the same domain: run `scripts/glaeda-mini-setup --hygiene-only
+  --headless --apply`. Without `--headless`, disk pressure, eviction, and OTA update
+  agents are only `gui/$uid` LaunchAgents and do not run on a GUI-less EC2 Mac.
 
 ## 2. One command
 

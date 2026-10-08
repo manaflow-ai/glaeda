@@ -67,6 +67,12 @@ so a nearly full laptop can still install the tool that frees it. After that, gl
 keeps every host on its release ring (docs/GLAEDA_OTA.md): each hour it runs this command from
 the newest release on the ring, then rolls back if the new tools do not run.
 
+On a GUI-less Mac (for example an AWS EC2 Mac), pass `--headless`. The same agents are
+installed as root-owned LaunchDaemons with `UserName` set to this account, so disk pressure,
+eviction, and OTA updates continue after reboot without a `gui/$uid` login domain. This mode
+requires passwordless sudo on the host, like `glaeda-cmux-runner --headless`; it never changes
+the runner registration or controller credentials.
+
 Linux (Big Red, owned Linux machines, Linux VMs on the fleet) gets the hygiene profile, the
 only one written for it so far, with or without the flag. It installs the same tools and
 the systemd user units in ops/systemd (glaeda-disk-pressure, glaeda-worktree-reclaim and
@@ -112,6 +118,8 @@ CMUX_XCODE_APP = "/Applications/Xcode_26.6.app"  # vars.CMUX_CI_XCODE_APP_PR, wh
 MIN_FREE_GIB = fleet.default_min_free_gib("macos")  # one build slot, as the fleet bootstrap
 SUPPORTED_MACOS = {15, 26}
 LABEL_PREFIX = "com.teamleaderleo.glaeda."
+SUDO = "/usr/bin/sudo"
+SYSTEM_DAEMON_DIR = Path("/Library/LaunchDaemons")
 GIT_DEFAULTS = (
     ("core.untrackedCache", "true"),  # faster status on large checkouts such as cmux
     ("fetch.parallel", "0"),  # parallel fetches, sized by git
@@ -199,7 +207,7 @@ class Context:
                  reclaim_binary: Path | None, cmux_root: Path | None, glaeda_bin: Path | None,
                  xcode_app: str, min_free_gib: int, hygiene_only: bool = False,
                  platform_name: str | None = None, ota_ring: str | None = None,
-                 ota_source: str | None = None) -> None:
+                 ota_source: str | None = None, headless: bool = False) -> None:
         self.home = home
         self.platform = platform_name or HOST_PLATFORM
         self.hygiene_only = hygiene_only
@@ -209,6 +217,9 @@ class Context:
         # A fake HOME (tests, rehearsals) must never reach the real launchd session.
         self.sandbox = os.path.realpath(home) != os.path.realpath(self.real_home)
         self.skip_launchctl = skip_launchctl or self.sandbox
+        # A fake HOME must never reach /Library/LaunchDaemons. This keeps tests and
+        # rehearsals side-effect free even when they exercise --headless.
+        self.headless = bool(headless) and self.platform == "macos" and not self.sandbox
         self.python = python or pick_python()
         self.reclaim_binary = reclaim_binary
         self.cmux_root = cmux_root
@@ -217,8 +228,10 @@ class Context:
         self.min_free_gib = min_free_gib
         self.bin = home / ".local/bin"
         linux = self.platform == "linux"
-        # LaunchAgents on macOS; systemd user units on Linux
-        self.agents = home / (".config/systemd/user" if linux else "Library/LaunchAgents")
+        # LaunchAgents on a logged-in macOS user; LaunchDaemons on a headless Mac;
+        # systemd user units on Linux.
+        self.agents = (home / ".config/systemd/user" if linux else
+                       (SYSTEM_DAEMON_DIR if self.headless else home / "Library/LaunchAgents"))
         # the reclaim unit appends to ~/.local/state/glaeda-worktree-reclaim.jsonl
         self.logs = home / (".local/state" if linux else "Library/Logs")
         self.derived_data = home / "Library/Developer/Xcode/DerivedData"
@@ -608,6 +621,11 @@ def preflight_macos(ctx: Context) -> dict[str, Any]:
     checks["homebrew"] = check(brew is not None, brew or "missing")
     checks["python"] = check(ctx.python is not None, ctx.python or "missing",
                              "" if ctx.python else "LaunchAgents need python3 (Homebrew or Command Line Tools)", True)
+    if ctx.headless and not ctx.skip_launchctl:
+        code, _ = run([SUDO, "-n", "true"])
+        checks["headlessSudo"] = check(
+            code == 0, "passwordless sudo" if code == 0 else "passwordless sudo unavailable",
+            "headless agents need sudo -n for /Library/LaunchDaemons and launchctl", True)
     missing = fleet.missing_workload_tools(fleet.MACOS_WORKLOAD_TOOLS)
     checks["workloadToolPath"] = check(not missing, "all present" if not missing else "missing: " + ",".join(missing),
                                        "" if not missing else "cmux ./scripts/setup.sh installs these")
@@ -633,7 +651,7 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
     disk = os.fspath(ctx.bin / "glaeda-disk")
     pressure = os.fspath(ctx.bin / "disk-pressure.sh")
     python = ctx.python or "/usr/bin/python3"
-    return {
+    agents = {
         LABEL_PREFIX + "disk-pressure": {
             "Label": LABEL_PREFIX + "disk-pressure",
             "ProgramArguments": [pressure, "--once"],
@@ -801,6 +819,14 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-gh.err"),
         },
     }
+    if ctx.headless:
+        # A system LaunchDaemon has no per-user GUI session. Run the same
+        # unprivileged tools as the setup user and keep only the plist itself
+        # root-owned. The tools write exclusively under this user's home.
+        username = pwd.getpwuid(ctx.uid).pw_name
+        for plist in agents.values():
+            plist["UserName"] = username
+    return agents
 
 
 def agent_names(ctx: Context) -> list[str]:
@@ -838,7 +864,7 @@ def update_config(ctx: Context) -> dict[str, Any]:
     """What glaeda-update reads: this host's ring and the setup flags it re-runs releases with."""
     config = {
         "ring": ctx.ota_ring or "stable",
-        "setupArgs": ["--hygiene-only"] if ctx.hygiene_only else [],
+        "setupArgs": (["--hygiene-only"] if ctx.hygiene_only else []) + (["--headless"] if ctx.headless else []),
         "host": platform.node().split(".")[0].lower(),
         "reportStatus": (ctx.ota_ring or "stable") == "canary",
     }
@@ -858,6 +884,15 @@ def update_config_action(ctx: Context) -> dict[str, Any]:
     if current is None:
         return {**act, "state": "create", "value": update_config(ctx)}
     value = dict(current)
+    # A headless migration must persist the service domain for the OTA updater.
+    # Without this, the first successful update silently reinstalls GUI agents
+    # and they disappear again after the next reboot.
+    if ctx.headless:
+        current_args = value.get("setupArgs", [])
+        args = [a for a in current_args if isinstance(a, str) and a != "--headless"] \
+            if isinstance(current_args, list) else []
+        if "--headless" not in args:
+            value["setupArgs"] = [*args, "--headless"]
     if ctx.ota_ring and current.get("ring") != ctx.ota_ring:
         value.update(ring=ctx.ota_ring, reportStatus=ctx.ota_ring == "canary")
     if ctx.ota_source and current.get("source", OTA_SOURCES[0]) != ctx.ota_source:
@@ -965,7 +1000,9 @@ def reclaim_source(ctx: Context) -> tuple[str, Path | None, str]:
 def launchctl_loaded(ctx: Context, label: str) -> bool | None:
     if ctx.skip_launchctl:
         return None
-    code, _ = run(["/bin/launchctl", "print", f"gui/{ctx.uid}/{label}"])
+    domain = f"system/{label}" if ctx.headless else f"gui/{ctx.uid}/{label}"
+    code, _ = run(([SUDO, "/bin/launchctl", "print", domain] if ctx.headless
+                   else ["/bin/launchctl", "print", domain]))
     return code == 0
 
 
@@ -1210,15 +1247,17 @@ def backup(ctx: Context, path: Path) -> str:
 
 
 def launchctl(ctx: Context, *args: str) -> tuple[int, str]:
-    return run(["/bin/launchctl", *args])
+    command = ["/bin/launchctl", *args]
+    return run(([SUDO, *command] if ctx.headless else command))
 
 
 def bootout(ctx: Context, label: str, wait_s: float = 5.0) -> bool:
     """Unload a job and wait (bounded) until launchd no longer lists it."""
-    launchctl(ctx, "bootout", f"gui/{ctx.uid}/{label}")
+    domain = f"system/{label}" if ctx.headless else f"gui/{ctx.uid}/{label}"
+    launchctl(ctx, "bootout", domain)
     deadline = time.monotonic() + wait_s
     while time.monotonic() < deadline:
-        if launchctl(ctx, "print", f"gui/{ctx.uid}/{label}")[0] != 0:
+        if launchctl(ctx, "print", domain)[0] != 0:
             return True
         time.sleep(0.25)
     return False
@@ -1226,11 +1265,30 @@ def bootout(ctx: Context, label: str, wait_s: float = 5.0) -> bool:
 
 def bootstrap(ctx: Context, plist: str) -> tuple[int, str]:
     """Load a job. launchd answers EIO (5) while a just-removed job is still settling; retry once."""
-    code, out = launchctl(ctx, "bootstrap", f"gui/{ctx.uid}", plist)
+    code, out = launchctl(ctx, "bootstrap", "system" if ctx.headless else f"gui/{ctx.uid}", plist)
     if code != 0 and ("Input/output error" in out or code == 5 or re.search(r"\b5:", out)):
         time.sleep(1.0)
-        code, out = launchctl(ctx, "bootstrap", f"gui/{ctx.uid}", plist)
+        code, out = launchctl(ctx, "bootstrap", "system" if ctx.headless else f"gui/{ctx.uid}", plist)
     return code, out
+
+
+def install_service_file(ctx: Context, path: Path, data: bytes, mode: int) -> None:
+    """Install a headless plist through sudo without exposing a partial file to launchd."""
+    if not ctx.headless:
+        write_atomic(path, data, mode)
+        return
+    with tempfile.NamedTemporaryFile(prefix="glaeda-mini-setup-", suffix=".plist", delete=False) as tmp:
+        tmp.write(data)
+        tmp.flush()
+        os.fchmod(tmp.fileno(), mode)
+        staged = Path(tmp.name)
+    try:
+        code, out = run([SUDO, "/usr/bin/install", "-o", "root", "-g", "wheel", "-m", oct(mode)[2:],
+                         os.fspath(staged), os.fspath(path)])
+        if code != 0:
+            raise OSError(out or f"sudo install exited {code}")
+    finally:
+        staged.unlink(missing_ok=True)
 
 
 def apply_install(ctx: Context, actions: list[dict[str, Any]]) -> None:
@@ -1267,19 +1325,23 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]]) -> None:
                 data = b""
             if state == "update":
                 act["backup"] = backup(ctx, dest)
-            dest.parent.mkdir(parents=True, exist_ok=True)  # the skill's directory may not exist yet
+            if not dest.parent.exists():
+                dest.parent.mkdir(parents=True, exist_ok=True)  # the skill's directory may not exist yet
             if kind == "agent" and act.get("loaded") and ctx.platform != "linux":
                 if is_update_agent(act["label"]) and os.environ.get(UPDATE_ENV):
                     # unloading would kill the glaeda-update that is running this setup; launchd
                     # reads the new plist at the next login, or when setup runs by hand
-                    write_atomic(Path(act["path"]), data, int(act["mode"], 8))
+                    install_service_file(ctx, Path(act["path"]), data, int(act["mode"], 8))
                     act["applied"] = act["owned"] = True
                     act["ownedSha256"] = act["sha256"]
                     act["note"] = "written; reload deferred while glaeda-update runs"
                     continue
                 bootout(ctx, act["label"])
                 act["loaded"] = False
-            write_atomic(dest, data, int(act["mode"], 8))
+            if kind == "agent":
+                install_service_file(ctx, dest, data, int(act["mode"], 8))
+            else:
+                write_atomic(dest, data, int(act["mode"], 8))
             act["applied"] = act["owned"] = True
             act["ownedSha256"] = act["sha256"]
         if (kind == "agent" and ctx.platform != "linux" and state in {"create", "update", "unchanged"}
@@ -1385,7 +1447,13 @@ def apply_uninstall(ctx: Context, actions: list[dict[str, Any]]) -> None:
             elif act.get("loaded") and act["state"] == "remove" and ctx.platform != "linux":
                 bootout(ctx, act["label"])
             if act["state"] == "remove":
-                Path(act["path"]).unlink()
+                if ctx.headless:
+                    code, out = run([SUDO, "/bin/rm", "-f", act["path"]])
+                    if code != 0:
+                        act["state"], act["note"] = "failed", f"sudo remove failed: {out[-300:]}"
+                        continue
+                else:
+                    Path(act["path"]).unlink()
                 act["applied"] = True
         elif act["kind"] in {"tool", "marker"} and act["state"] == "remove":
             Path(act["path"]).unlink()
@@ -1594,6 +1662,8 @@ def parser() -> argparse.ArgumentParser:
                         "minis use the mirror manaflow-ai/glaeda)")
     p.add_argument("--hygiene-only", action="store_true",
                    help="only the disk and worktree hygiene tools and agents, for any Mac or Linux host")
+    p.add_argument("--headless", action="store_true",
+                   help="install macOS agents as root-owned system LaunchDaemons for a GUI-less host (needs sudo)")
     return p
 
 
@@ -1625,12 +1695,13 @@ def main(argv: list[str] | None = None) -> int:
                   args.cmux_root.expanduser().resolve() if args.cmux_root else None,
                   args.glaeda.expanduser() if args.glaeda else None, args.xcode_app, min_free_gib,
                   args.hygiene_only or HOST_PLATFORM == "linux", ota_ring=args.ota_ring,
-                  ota_source=args.ota_source)
+                  ota_source=args.ota_source, headless=args.headless)
     pre = preflight(ctx)
     if ctx.hygiene_only:  # build-host checks are reported, not enforced
-        checks = {n: ({**c, "level": "warn"} if c["level"] == "block" and n not in HYGIENE_BLOCKING else c)
+        blocking_checks = HYGIENE_BLOCKING | ({"headlessSudo"} if args.headless else set())
+        checks = {n: ({**c, "level": "warn"} if c["level"] == "block" and n not in blocking_checks else c)
                   for n, c in pre["checks"].items()}
-        pre = {**pre, "checks": checks, "blocking": [n for n in pre["blocking"] if n in HYGIENE_BLOCKING]}
+        pre = {**pre, "checks": checks, "blocking": [n for n in pre["blocking"] if n in blocking_checks]}
     if args.uninstall:
         actions = plan_uninstall(ctx)
         if args.apply:

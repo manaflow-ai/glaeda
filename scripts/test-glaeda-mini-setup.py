@@ -10,6 +10,7 @@ import io
 import json
 import os
 import plistlib
+import pwd
 import re
 import subprocess
 import sys
@@ -825,6 +826,37 @@ class MiniSetupTest(unittest.TestCase):
         self.assertEqual(path.read_bytes(), ms.agent_bytes(ctx, label))
         self.assertIn("deferred", act["note"])
 
+    def test_headless_agents_use_system_domain_and_persist_for_ota(self) -> None:
+        daemon_dir = self.home / "Library/LaunchDaemons"
+        with mock.patch.object(ms, "SYSTEM_DAEMON_DIR", daemon_dir):
+            ctx = ms.Context(self.home, True, "/usr/bin/python3", True, self.reclaim, None, None,
+                             ms.CMUX_XCODE_APP, 50, hygiene_only=True, headless=True)
+            # This test has a sandbox HOME, so Context deliberately disables the real
+            # headless side effect. Model the post-preflight context without touching
+            # /Library/LaunchDaemons.
+            ctx.sandbox = False
+            ctx.headless = True
+            ctx.agents = daemon_dir
+            plist = ms.agent_plists(ctx)[ms.LABEL_PREFIX + "update"]
+            self.assertEqual(plist["UserName"], pwd.getpwuid(os.getuid()).pw_name)
+            self.assertEqual(ms.agent_path(ctx, ms.LABEL_PREFIX + "update"),
+                             daemon_dir / "com.teamleaderleo.glaeda.update.plist")
+            self.assertEqual(ms.update_config(ctx)["setupArgs"], ["--hygiene-only", "--headless"])
+
+            config = ctx.update_config
+            config.parent.mkdir(parents=True, exist_ok=True)
+            config.write_text(json.dumps({"ring": "stable", "setupArgs": ["--hygiene-only"]}))
+            act = ms.update_config_action(ctx)
+            self.assertEqual(act["state"], "update")
+            self.assertEqual(act["value"]["setupArgs"], ["--hygiene-only", "--headless"])
+
+            commands = []
+            with mock.patch.object(ms, "run", lambda argv, *a, **k: commands.append(argv) or (0, "")):
+                ms.bootstrap(ctx, os.fspath(daemon_dir / "x.plist"))
+                ms.bootout(ctx, "com.teamleaderleo.glaeda.update", wait_s=0)
+            self.assertIn([ms.SUDO, "/bin/launchctl", "bootstrap", "system",
+                           os.fspath(daemon_dir / "x.plist")], commands)
+            self.assertIn([ms.SUDO, "/bin/launchctl", "bootout", "system/com.teamleaderleo.glaeda.update"], commands)
     def test_git_below_2_55_is_installed_with_our_brew_or_handed_to_the_operator(self) -> None:
         ctx = ms.Context(self.home, False, "/usr/bin/python3", True, self.reclaim, None, None,
                          ms.CMUX_XCODE_APP, 50, hygiene_only=True)

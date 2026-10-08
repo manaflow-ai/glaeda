@@ -5,11 +5,15 @@
     glaeda-update --apply       download, verify, install, health-check; roll back on failure
     glaeda-update --status      this host's config and state
 
-A LaunchAgent (macOS) or systemd user timer (Linux) runs `--apply` hourly; glaeda-mini-setup installs
-it. Configuration is ~/.config/glaeda/update.json, written once by setup and never overwritten:
+A LaunchAgent (macOS), headless LaunchDaemon (GUI-less macOS), or systemd user timer (Linux)
+runs `--apply` hourly; glaeda-mini-setup installs it. Configuration is ~/.config/glaeda/update.json,
+written once by setup and never overwritten:
 
     {"ring": "canary" | "stable", "setupArgs": ["--hygiene-only"], "host": "air-blue",
      "reportStatus": true, "source": "teamleaderleo/glaeda"}
+
+For a GUI-less macOS host, setupArgs also contains `--headless`; this keeps OTA reinstalls in
+the system launchd domain instead of silently returning to a GUI-only agent.
 
 `source` is where releases and channel files are downloaded from: this repository, or its read-only
 mirror manaflow-ai/glaeda, which the Manaflow minis use (docs/GLAEDA_OTA.md, Fleet mirror). The mirror
