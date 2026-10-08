@@ -2106,10 +2106,12 @@ class FixLibraryTests(unittest.TestCase):
         self.assertEqual([line.strip() for line in body if "rm -r" in line],
                          ['case "$stage" in */.glaeda-share.partial) rm -rf "$stage" ;; esac',
                           'rm -rf "$stage"  # what is left are copies of toolchains this host already had'])
-        self.assertFalse([line for line in body if re.search(r"(^|[;&|(]\s*)sudo\b", line.strip())])
+        self.assertEqual([line for line in body if "sudo -n launchctl" in line],
+                         ['    /Library/LaunchDaemons/*) sudo -n launchctl "$@" ;;'])
         # The only removals are the step lock's own pid file and directory, and the runner held marks it writes.
         self.assertEqual([line.strip() for line in body if "rm " in line and "rm -r" not in line],
                          ["""trap 'rm -f "$HOME/.local/state/glaeda/mini-fleet/step.lock/pid"; rmdir "$HOME/.local/state/glaeda/mini-fleet/step.lock" 2>/dev/null || true' EXIT""",
+                          'rm -f "$(held_dir)/$(basename "$dir")"',
                           'rm -f "$(held_dir)/$(basename "$dir")"'])
 
     @unittest.skipUnless(shutil.which("shasum") or shutil.which("sha256sum"), "needs shasum")

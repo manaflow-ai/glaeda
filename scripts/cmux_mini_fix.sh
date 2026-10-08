@@ -259,8 +259,12 @@ runner_domain() {
 }
 
 runner_launchctl() {
+  local plist="$1"
   shift
-  launchctl "$@"
+  case "$plist" in
+    /Library/LaunchDaemons/*) sudo -n launchctl "$@" ;;
+    *) launchctl "$@" ;;
+  esac
 }
 
 runner_hold() {  # WAIT_SECONDS
@@ -280,8 +284,16 @@ runner_hold() {  # WAIT_SECONDS
       sleep 30
     done
     : > "$(held_dir)/$(basename "$dir")"
-    runner_launchctl "$plist" disable "$domain/$label"
+    if ! runner_launchctl "$plist" disable "$domain/$label"; then
+      case "$plist" in
+        /Library/LaunchDaemons/*) say "marked $label held; launchd disable was refused, the listener gate remains active"; continue ;;
+        *) refuse "could not disable $label" ;;
+      esac
+    fi
     runner_launchctl "$plist" bootout "$domain/$label" 2>/dev/null || true
+    case "$plist" in
+      /Library/LaunchDaemons/*) say "held $label; the headless listener gate remains active"; continue ;;
+    esac
     ! runner_launchctl "$plist" print "$domain/$label" >/dev/null 2>&1 || refuse "could not stop $label"
     say "stopped $label; it starts again once the node is eligible"
   done
@@ -300,7 +312,18 @@ runner_release() {  # [if-eligible]
     plist=$(runner_plist "$dir") || { say "$dir has no launchd agent; glaeda-cmux-runner --apply installs it"; continue; }
     label=$(basename "$plist" .plist)
     domain=$(runner_domain "$plist")
-    runner_launchctl "$plist" enable "$domain/$label"
+    if ! runner_launchctl "$plist" enable "$domain/$label"; then
+      case "$plist" in
+        /Library/LaunchDaemons/*)
+          if pgrep -f "$dir/bin/Runner.Listener" >/dev/null 2>&1; then
+            rm -f "$(held_dir)/$(basename "$dir")"
+            say "released $label; its headless listener was already running"
+            continue
+          fi
+          ;;
+      esac
+      refuse "could not enable $label"
+    fi
     runner_launchctl "$plist" print "$domain/$label" >/dev/null 2>&1 || runner_launchctl "$plist" bootstrap "$domain" "$plist" \
       || refuse "could not start $label; the runner runs in the GUI session, so log in on the mini (or enable auto-login)"
     rm -f "$(held_dir)/$(basename "$dir")"
