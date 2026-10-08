@@ -817,24 +817,34 @@ class CatchUpTests(unittest.TestCase):
         (issue,) = self.reader(fleet_cas_text(**{"bin_fleet_cas_settings_sh": "missing"}))
         self.assertIn("fleet-cas-settings.sh missing", issue["detail"])
 
-    def test_reader_reports_upstream_failures_even_when_socket_answers(self) -> None:
-        text = fleet_cas_text(store="100.89.140.13:7450", stats={"up_calls": 12, "up_errors": 2,
+    def test_reader_reports_stale_upstream_even_when_socket_answers(self) -> None:
+        self.manifest["cache_services"] = [{"kind": "compiler-cas", "endpoint": "100.89.140.13:7450"}]
+        text = fleet_cas_text(store="100.100.232.95:7450", stats={"up_calls": 12, "up_errors": 2,
                                                                   "up_skipped": 8})
         parsed = mf.parse_probe(probe_text(fleet_cas=text))["fleet_cas"]
-        self.assertEqual(parsed["store"], "100.89.140.13:7450")
+        self.assertEqual(parsed["store"], "100.100.232.95:7450")
         self.assertEqual(parsed["stats"]["up_errors"], 2)
         issues = self.reader(text)
-        (issue,) = [i for i in issues if "upstream errors" in i["detail"]]
+        (issue,) = [i for i in issues if "configured upstream" in i["detail"]]
         self.assertEqual(issue["area"], "fleet-cas")
         self.assertIn("100.89.140.13:7450", issue["detail"])
+        self.assertNotIn("upstream errors", issue["detail"])
 
-    def test_orphaned_reader_reports_upstream_failures(self) -> None:
+    def test_reader_lifetime_upstream_errors_do_not_claim_current_outage(self) -> None:
+        self.manifest["cache_services"] = [{"kind": "compiler-cas", "endpoint": "100.89.140.13:7450"}]
+        text = fleet_cas_text(store="100.89.140.13:7450", stats={"up_calls": 12, "up_errors": 2,
+                                                                  "up_skipped": 8})
+        self.assertEqual([i for i in self.reader(text) if "upstream" in i["detail"]], [])
+
+    def test_orphaned_reader_reports_stale_upstream(self) -> None:
+        self.manifest["cache_services"] = [{"kind": "compiler-cas", "endpoint": "100.89.140.13:7450"}]
         self.manifest["hosts"]["build-mini-1"]["roles"] = ["ci-runner"]
         text = fleet_cas_text(store="100.100.232.95:7450", stats={"up_errors": 238, "up_skipped": 40667})
         issues = mf.check(self.manifest, observed(**{"build-mini-1": probe_text(fleet_cas=text)}), ["build-mini-1"])
         (issue,) = [i for i in issues if "outside a catch-up role" in i["detail"]]
         self.assertEqual(issue["area"], "fleet-cas")
         self.assertIn("100.100.232.95:7450", issue["detail"])
+        self.assertNotIn("upstream errors", issue["detail"])
 
     def test_reader_recipe_without_build_mode_is_drift(self) -> None:
         (issue,) = self.reader(fleet_cas_text(build_mode="missing"))

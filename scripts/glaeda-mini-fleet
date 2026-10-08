@@ -1196,7 +1196,7 @@ def check_host(manifest: dict[str, Any], name: str, obs: dict[str, Any]) -> list
         for message, fix in ios_simulator_drift(ios, obs):
             drift("ios", message, fix)
 
-    for area, message, fix in catch_up_drift(host, policy, obs):
+    for area, message, fix in catch_up_drift(host, policy, obs, declared_compiler_cas_endpoint(manifest)):
         drift(area, message, fix)
 
     # The declared toolchain: Xcode from the plain probe, the rest from a preflight section when observed.
@@ -1231,25 +1231,40 @@ def catch_up_role(host: dict[str, Any]) -> str | None:
     return "reader" if set(roles) & set(CATCH_UP_READER_ROLES) else None
 
 
-def catch_up_drift(host: dict[str, Any], policy: dict[str, Any], obs: dict[str, Any]) -> list[tuple[str, str, str]]:
+def declared_compiler_cas_endpoint(manifest: dict[str, Any]) -> str | None:
+    """Return the single compiler-CAS endpoint declared by the fleet manifest.
+
+    A missing or ambiguous declaration must not make a node check invent a
+    destination.  The HQ manifest has one authoritative compiler-cas service;
+    returning ``None`` keeps older/example manifests compatible until they add
+    that declaration.
+    """
+    endpoints = {
+        str(service.get("endpoint", "")).strip()
+        for service in manifest.get("cache_services", [])
+        if isinstance(service, dict) and service.get("kind") == "compiler-cas"
+        and str(service.get("endpoint", "")).strip()
+    }
+    return next(iter(endpoints)) if len(endpoints) == 1 else None
+
+
+def catch_up_drift(host: dict[str, Any], policy: dict[str, Any], obs: dict[str, Any],
+                   expected_store: str | None = None) -> list[tuple[str, str, str]]:
     """Drift for the fleet compile-cache catch-up roles, as (area, detail, fix). Reports only."""
     role = catch_up_role(host)
     cas = obs.get("fleet_cas") or {}
     if role is None:
         # A host can retain an old reader daemon after its role leaves the
         # catch-up pool. Keep healthy, unused installations quiet, but surface
-        # a daemon that is actively failing its configured upstream so an
-        # orphaned deployment cannot masquerade as a healthy local socket.
-        stats = cas.get("stats") or {}
-        upstream_errors = stats.get("up_errors", 0)
-        upstream_skipped = stats.get("up_skipped", 0)
-        if upstream_errors or upstream_skipped:
-            store = cas.get("store") or "unknown store"
-            return [("fleet-cas", f"fleet-cas node outside a catch-up role has {upstream_errors} upstream errors "
-                    f"and {upstream_skipped} skipped calls for {store}; its local socket can answer while "
-                    "remote cache reads fall back to local CAS",
-                    f"inspect {FLEET_ROOT}/xcode/fleet-cas.env and node-store/stats.json; "
-                    "uninstall the orphaned node or rerun the approved fleet-cas rollout")]
+        # a daemon pointed at a retired store. A local socket and lifetime
+        # error counters cannot establish the current upstream identity.
+        configured_store = cas.get("store")
+        if expected_store and configured_store and configured_store != expected_store:
+            return [("fleet-cas", f"fleet-cas node outside a catch-up role has configured upstream {configured_store}, "
+                    f"manifest declares compiler-CAS store {expected_store}; its local socket can answer while remote reads "
+                    "use the retired endpoint",
+                    f"operator: remove the orphaned node or update {FLEET_ROOT}/xcode/fleet-cas.env "
+                    f"to FLEET_CAS_STORE={expected_store} through the reviewed fleet-cas rollout")]
         return []
     out: list[tuple[str, str, str]] = []
     keep = "never delete or re-clone it: the catch-up cache keys include this path"
@@ -1304,20 +1319,17 @@ def catch_up_drift(host: dict[str, Any], policy: dict[str, Any], obs: dict[str, 
     if cas.get("node") != "answers":
         out.append(("fleet-cas", "fleet-cas node does not answer on xcode/fleet-cas.sock (the fleet-cas-settings.sh "
                     "check); builds fall back to the local cache", rollout))
-    stats = cas.get("stats") or {}
-    upstream_errors = stats.get("up_errors", 0)
-    upstream_skipped = stats.get("up_skipped", 0)
-    # The trusted writer's build wrapper already compares these monotonic
-    # counters before publishing each marker. Lifetime writer errors therefore
-    # do not mean its current fill is unhealthy; readers have no equivalent
-    # per-build gate, so retain the diagnostic for them.
-    if (upstream_errors or upstream_skipped) and role != CATCH_UP_WRITER:
-        store = cas.get("store") or "unknown store"
-        out.append(("fleet-cas", f"fleet-cas node has {upstream_errors} upstream errors and "
-                    f"{upstream_skipped} skipped calls for {store}; its local socket can answer while "
-                    "remote cache reads fall back to local CAS",
-                    f"inspect {FLEET_ROOT}/xcode/fleet-cas.env and node-store/stats.json; "
-                    "rerun the approved fleet-cas rollout if the store endpoint is stale"))
+    configured_store = cas.get("store")
+    if expected_store and configured_store != expected_store:
+        got = configured_store or "missing"
+        out.append(("fleet-cas", f"configured upstream {got}, manifest declares compiler-CAS store {expected_store}; "
+                    "a healthy local socket does not prove this node reads the shared store",
+                    f"operator: update {FLEET_ROOT}/xcode/fleet-cas.env to FLEET_CAS_STORE={expected_store} "
+                    "and restart the node through the reviewed fleet-cas rollout; preserve trusted keys and local CAS"))
+    # up_errors and up_skipped are monotonic lifetime counters. They are useful
+    # evidence, but without a bounded per-check delta they cannot establish a
+    # current outage: a node may be healthy now after historical failures.
+    # Endpoint identity above is the actionable drift check.
     if role == "reader" and cas.get("catch_up") == "0":
         # On purpose: remote-hit catch-up measured 1631 s against 383 s, so the wrapper keeps it off until the
         # bulk `fleet-cas warm` lands (cmuxterm-hq makes catch-up opt-in by default). Informational, not drift.
