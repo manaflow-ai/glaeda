@@ -79,6 +79,28 @@ check_owner() {
   fi
 }
 
+# A custom store root is normally an APFS volume or an APFS sparsebundle mounted on an
+# external SSD. Refuse a missing path so a typo cannot silently create the CAS under /Volumes
+# on the controller's boot disk, and refuse filesystems without the hard-link and atomic
+# publication behavior the fleet store relies on. The default root keeps the historical
+# behavior for existing deployments.
+check_custom_store_root() {
+  [ "$role" = store ] || return 0
+  [ -n "${FLEET_CAS_ROOT:-}" ] || return 0
+  [ -n "$apply" ] || return 0
+  [ -d "$ROOT" ] || { echo "custom fleet-CAS store root is not mounted: $ROOT" >&2; exit 1; }
+  local volume_info fs_type mount_point
+  volume_info=$(diskutil info "$ROOT" 2>/dev/null || true)
+  fs_type=$(printf '%s\n' "$volume_info" | awk -F': *' '/Type \(Bundle\)/ {print tolower($2); exit}')
+  mount_point=$(printf '%s\n' "$volume_info" | awk -F': *' '/Mount Point/ {print $2; exit}')
+  [ "$fs_type" = apfs ] || { echo "custom fleet-CAS store root must be APFS: $ROOT" >&2; exit 1; }
+  case "$mount_point" in
+    /Volumes/*) ;;
+    *) echo "custom fleet-CAS store root must be a separate mounted /Volumes APFS volume: $ROOT" >&2; exit 1 ;;
+  esac
+  check_owner
+}
+
 bootstrap() {  # domain, label, plist: bootout then bootstrap, retrying the known teardown race
   launchctl bootout "$1/$2" 2>/dev/null || true
   local i
@@ -146,6 +168,11 @@ plist_for() {  # role, label, daemon (1 or empty)
   [ -z "${3:-}" ] || printf '%s\n' '    <key>UserName</key>' "    <string>$(xml "$(id -un)")</string>"
   printf '%s\n' '    <key>ProgramArguments</key>' '    <array>' \
     "        <string>$BIN/fleet-cas-run</string>" "        <string>$1</string>" '    </array>'
+  if [ "$1" = store ] && [ -n "${FLEET_CAS_ROOT:-}" ]; then
+    printf '%s\n' '    <key>EnvironmentVariables</key>' '    <dict>' \
+      '        <key>FLEET_CAS_ROOT</key>' "        <string>$(xml "$FLEET_CAS_ROOT")</string>" \
+      '    </dict>'
+  fi
   printf '%s\n' '    <key>RunAtLoad</key>' '    <true/>' '    <key>KeepAlive</key>' '    <true/>'
   printf '%s\n' '    <key>ThrottleInterval</key>' '    <integer>10</integer>' \
     '    <key>ProcessType</key>' '    <string>Interactive</string>'
@@ -352,6 +379,7 @@ case $role in
     case $listen in 0.0.0.0:* | \[::\]:*) echo "refusing a wildcard listen address" >&2; exit 2 ;; esac
     check_key_args
     [ -z "$sign_key" ] || { echo "--sign-key is for the writer role" >&2; exit 2; }
+    check_custom_store_root
     install_binaries
     do_ mkdir -p "$FLEET_STORE"
     write_service store "tcp:$listen" "$FLEET_STORE" --writers "$writers" ${trusted:+--trusted-keys "$trusted"}

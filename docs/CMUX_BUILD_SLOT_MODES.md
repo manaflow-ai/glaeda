@@ -208,6 +208,16 @@ its tailnet address the store's only allowed writer. The writer runs on an hq-on
 with no PR runners: any process on the writer host can reach the signing node's socket.
 `--trusted-keys` alone makes every node and the store use only signed entries. A
 LaunchAgent needs the build user's GUI session; the fleet minis log in automatically.
+
+The store may be colocated with the fleet controller when the controller owner approves that
+placement. Pass `--allow-coordinator` to make that production routing decision explicit. The
+compiler CAS remains a separate service on `:7450`; it must not reuse the controller's HTTP
+artifact-cache directory or its eviction policy. If its payload root is on an external SSD,
+prepare and mount a separate APFS volume or sparsebundle first, then pass
+`--store-root /Volumes/<compiler-cas>/store`. The rollout only points the store role at that
+existing path. It does not create, format, mount, or delete volumes. The root must be writable
+by the service user and retain the CAS store's atomic publication semantics. The writer remains
+the only trusted publisher, regardless of which host serves the store.
 `glaeda-fleet-cas uninstall [node|store|all] --apply` removes the selected services and
 keeps both node and fleet stores. The default scope is `all` for compatibility. Removing
 `store` leaves the reader node, its upstream environment and prewarm agent in place;

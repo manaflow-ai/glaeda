@@ -29,6 +29,14 @@ printf '%s\n' "$*" >>"${FLEET_CAS_TEST_LAUNCHCTL_LOG:?}"
 EOF
 chmod +x "$stub_bin/launchctl"
 
+cat >"$stub_bin/diskutil" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = info ]; then
+  printf 'Type (Bundle): apfs\nMount Point: /\n'
+fi
+EOF
+chmod +x "$stub_bin/diskutil"
+
 common_env=(
   FLEET_CAS_ROOT="$root"
   FLEET_CAS_LAUNCH_DAEMONS_DIR="$daemons"
@@ -76,6 +84,20 @@ grep -q 'bootout gui/.*/com.teamleaderleo.glaeda.fleet-cas-node' "$temporary_roo
 env "${common_env[@]}" "$script" uninstall store --apply >"$temporary_root/root-plan"
 grep -q "ROOT STEP NEEDED: sudo launchctl bootout system/com.teamleaderleo.glaeda.fleet-cas-store" "$temporary_root/root-plan"
 test -e "$daemons/com.teamleaderleo.glaeda.fleet-cas-store.plist"
+
+# A custom store root must already be mounted. This prevents a controller rollout from
+# silently creating the CAS on its boot volume when an APFS sparsebundle was not mounted.
+if env "${common_env[@]}" "$script" store --listen 100.89.225.106:7450 --apply \
+  >"$temporary_root/boot-root.out" 2>"$temporary_root/boot-root.err"; then
+  exit 1
+fi
+grep -q 'custom fleet-CAS store root must be a separate mounted /Volumes APFS volume' "$temporary_root/boot-root.err"
+
+if env "${common_env[@]}" FLEET_CAS_ROOT="$temporary_root/not-mounted" \
+  "$script" store --listen 100.89.225.106:7450 --apply >"$temporary_root/missing-root.out" 2>"$temporary_root/missing-root.err"; then
+  exit 1
+fi
+grep -q 'custom fleet-CAS store root is not mounted' "$temporary_root/missing-root.err"
 
 # A store launched before its tailnet address exists waits instead of crashing and being
 # restarted repeatedly by launchd. The fake ifconfig exposes the address on its second call.

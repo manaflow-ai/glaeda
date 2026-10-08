@@ -2,6 +2,7 @@
 # glaeda-fleet-cas-rollout: deploy the fleet compilation cache from an operator Mac.
 #
 #   glaeda-fleet-cas-rollout --store HOST [--trusted-keys HEX] [--writer HOST --sign-key PATH]
+#                            [--store-root PATH] [--allow-coordinator]
 #                            [--prewarm REPO] [--prebuilt-dir DIR] NODE_HOST... [--apply]
 #
 # Plans by default; --apply deploys. HOST names are ssh aliases (User cmux). The store
@@ -16,15 +17,21 @@
 # ~/.cache/glaeda-fleet-cas (also when planning) and runs `glaeda-fleet-cas` there
 # (docs/CMUX_BUILD_SLOT_MODES.md). With --prewarm REPO (cmux@catchup-v1), every node also gets
 # the prewarm agent (fleet-cas-prewarm.sh), which keeps it warm with the writer's newest fill.
-# With --prebuilt-dir, the supplied fleet-cas binary and helper scripts are copied to each
-# host and the installer skips Cargo. Every host needs the tailnet grant for the store port.
+# `--store-root` points only the store role at an already-mounted, owner-writable APFS root.
+# It never creates, formats, mounts, or deletes a volume. A coordinator host is refused
+# unless `--allow-coordinator` is supplied explicitly, keeping the production routing
+# decision visible at the command line. With --prebuilt-dir, the supplied fleet-cas binary
+# and helper scripts are copied to each host and the installer skips Cargo. Every host needs
+# the tailnet grant for the store port.
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 PORT=7450
-store= apply= trusted= writer= sign_key= prewarm= prebuilt_dir= nodes=()
+store= store_root= apply= allow_coordinator= trusted= writer= sign_key= prewarm= prebuilt_dir= nodes=()
 while [ $# -gt 0 ]; do
   case $1 in
     --store) store=${2:?}; shift ;;
+    --store-root) store_root=${2:?}; shift ;;
+    --allow-coordinator) allow_coordinator=1 ;;
     --trusted-keys) trusted=${2:?}; shift ;;
     --writer) writer=${2:?}; shift ;;
     --sign-key) sign_key=${2:?}; shift ;;
@@ -37,6 +44,11 @@ while [ $# -gt 0 ]; do
   shift
 done
 [ -n "$store" ] || { sed -n '2,6p' "$0" >&2; exit 2; }
+case $store_root in
+  '') ;;
+  /*) ;;
+  *) echo "--store-root must be an absolute path" >&2; exit 2 ;;
+esac
 if [ -n "$prebuilt_dir" ]; then
   [ -f "$prebuilt_dir/SHA256SUMS" ] && [ ! -L "$prebuilt_dir/SHA256SUMS" ] || { echo "prebuilt bundle missing regular SHA256SUMS" >&2; exit 2; }
   (cd "$prebuilt_dir" && shasum -a 256 -c SHA256SUMS) || { echo "prebuilt bundle checksum failed" >&2; exit 2; }
@@ -52,9 +64,30 @@ fi
 # The rollout is stateless: whatever it is given replaces the deployed configuration.
 [ -n "$trusted" ] || echo "warning: no --trusted-keys: the store keeps, and nodes use, unsigned index entries" >&2
 [ -n "$writer" ] || echo "warning: no --writer: the store will accept no writes" >&2
-for h in "$store" ${writer:+"$writer"} ${nodes[@]+"${nodes[@]}"}; do
+check_host() {  # host, role (store|writer|node)
+  local h=$1 role=$2 target coordinator=
   target=$(ssh -G "$h" | awk '/^hostname /{print $2}')
-  case "$h $target" in *lawrence*) echo "refusing $h ($target): cmux-lawrence is the fleet coordinator" >&2; exit 2 ;; esac
+  case "$h $target" in
+    *lawrence*|*100.89.225.106*|*172.20.21.158*) coordinator=1 ;;
+  esac
+  [ -z "$coordinator" ] && return 0
+  if [ "$role" != store ]; then
+    echo "refusing $h ($target): the coordinator may host only the separate fleet-CAS store, never its writer or a reader node" >&2
+    exit 2
+  fi
+  if [ -z "$allow_coordinator" ]; then
+    echo "refusing $h ($target): cmux-lawrence is the fleet coordinator; pass --allow-coordinator for an owner-approved colocated store" >&2
+    exit 2
+  fi
+  if [ -z "$store_root" ]; then
+    echo "refusing $h ($target): a colocated coordinator store requires --store-root for a separate mounted APFS volume" >&2
+    exit 2
+  fi
+}
+check_host "$store" store
+[ -z "$writer" ] || check_host "$writer" writer
+for n in ${nodes[@]+"${nodes[@]}"}; do
+  check_host "$n" node
 done
 
 ship() {  # host
@@ -72,7 +105,12 @@ run() {  # host, args...
   ship "$h"
   # Quote each argument for the remote shell.
   local env_prefix=
-  [ -z "$prebuilt_dir" ] || env_prefix='GLAEDA_FLEET_CAS_PREBUILT=$HOME/.cache/glaeda-fleet-cas/prebuilt '
+  if [ "$h" = "$store" ] && [ -n "$store_root" ]; then
+    env_prefix="FLEET_CAS_ROOT=$(printf '%q' "$store_root") "
+  fi
+  if [ -n "$prebuilt_dir" ]; then
+    env_prefix="${env_prefix}GLAEDA_FLEET_CAS_PREBUILT=\$HOME/.cache/glaeda-fleet-cas/prebuilt "
+  fi
   ssh -o BatchMode=yes "$h" "PATH=\$HOME/.cargo/bin:\$PATH $env_prefix~/.cache/glaeda-fleet-cas/glaeda/scripts/glaeda-fleet-cas $(printf '%q ' "$@")"
 }
 
