@@ -2421,7 +2421,10 @@ def job_busy(fam: Family, path: Path) -> bool:
     # budget busy, which would keep bun's install cache forever. Nor is cmux CI's warm state: a DerivedData
     # there holds thousands of module cache directories within three levels, so every seed read as busy and
     # none was ever evicted (cmux15, 2026-09-28). A job using one is seen by its command line and cwd.
-    if fam.id in FLEET_FAMILY_IDS:
+    # The generic tmp family also contains the canonical CI checkout. Its source tree is wider than
+    # cmux_active's bounded marker search, so treating budget exhaustion as busy would pin it forever;
+    # the runner's root token and process/socket evidence are the live-use checks there.
+    if fam.id in FLEET_FAMILY_IDS or fam.id == "tmp":
         return False
     if fam.id == SPM_SCRATCH:  # dozens of package builds within three levels; its lock is its in-use signal
         return False

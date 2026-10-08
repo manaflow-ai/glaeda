@@ -787,6 +787,11 @@ class GlaedaDiskTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             gd.space("lots", 1000)
 
+    def test_tmp_family_does_not_treat_marker_search_budget_as_job_use(self) -> None:
+        fam = gd.Family("tmp", self.root, True, "scratch")
+        with mock.patch.object(gd, "cmux_active", return_value=True):
+            self.assertFalse(gd.job_busy(fam, self.root))
+
     def test_cmux_active_marker_holds_a_slot(self) -> None:
         slot = self.root / "work/slot-1"
         (slot / ".cmux-active").mkdir(parents=True)
