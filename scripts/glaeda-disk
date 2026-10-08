@@ -121,6 +121,9 @@ EVICT_LOCK = HOME / ".cache/glaeda-disk/evict.lock"  # one --apply at a time (th
 EVICT_OWNER = HOME / ".cache/glaeda-disk/evict.owner.json"
 EVICT_OWNER_STALE_S = 30 * 60
 RUNNER_HELD_DIR = ".local/state/glaeda/mini-fleet/runner-held"
+# The marker is also a kernel lock.  Its name is useful in operator reports, while
+# flock keeps a long refresh from being mistaken for a stale one.
+_REFRESH_HANDLE = None
 # Items a nested_git family kept for a git loss, so a dead session with unpushed work is not
 # re-walked every run. Only keep verdicts are cached: a stale entry can delay a deletion, never cause one.
 NESTED_KEEP = HOME / ".cache/glaeda-disk/nested-keep.json"
@@ -741,6 +744,13 @@ def host_busy(fleet: Path | None = None, now: float | None = None) -> str:
     finally:
         os.close(fd)
     return ""
+
+
+def _fresh(path: Path, seconds: float) -> bool:
+    try:
+        return time.time() - path.stat().st_mtime < seconds
+    except OSError:
+        return False
 
 
 def idle_due(stamp: Path | None = None, every_s: float = IDLE_SWEEP_EVERY_S) -> bool:
@@ -2681,11 +2691,76 @@ def save_snapshot(sizes: dict[str, int], path: Path = SNAPSHOT, at: float | None
     os.replace(tmp, path)
 
 
-def _fresh(path: Path, seconds: float) -> bool:
+def refresh_lock_path() -> Path:
+    return SNAPSHOT.with_suffix(".refreshing")
+
+
+def acquire_refresh_lock():
+    """Take the background-refresh lock, recovering an unlocked stale marker."""
+    path = refresh_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+")
     try:
-        return time.time() - path.stat().st_mtime < seconds
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
+    return handle
+
+
+def _unlink_refresh_marker(handle) -> None:
+    """Remove only the marker inode held by handle, never a successor refresh marker."""
+    path = refresh_lock_path()
+    try:
+        marker, held = path.stat(), os.fstat(handle.fileno())
+        if (marker.st_dev, marker.st_ino) == (held.st_dev, held.st_ino):
+            path.unlink()
     except OSError:
+        pass
+
+
+def release_refresh_lock(handle) -> None:
+    global _REFRESH_HANDLE
+    if handle is None:
+        return
+    try:
+        # Unlink while the inode is still locked.  A later reporter can then
+        # create and lock a successor marker without this cleanup removing it.
+        _unlink_refresh_marker(handle)
+        with contextlib.suppress(OSError):
+            fcntl.flock(handle, fcntl.LOCK_UN)
+    finally:
+        handle.close()
+        if _REFRESH_HANDLE is handle:
+            _REFRESH_HANDLE = None
+
+
+def _release_refresh_lock_at_exit() -> None:
+    if _REFRESH_HANDLE is not None:
+        release_refresh_lock(_REFRESH_HANDLE)
+
+
+atexit.register(_release_refresh_lock_at_exit)
+
+
+def launch_background_refresh() -> bool:
+    """Launch one refresh while passing the lock ownership to the child."""
+    handle = acquire_refresh_lock()
+    if handle is None:
         return False
+    fd = handle.fileno()
+    try:
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), "--refresh", "--top", "0",
+                          "--min-mib", "0", "--refresh-lock-fd", str(fd)],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         stdin=subprocess.DEVNULL, start_new_session=True, pass_fds=(fd,))
+    except (OSError, subprocess.SubprocessError):
+        release_refresh_lock(handle)
+        return False
+    # The child has the same open file description and therefore keeps the
+    # flock after the parent closes its descriptor.
+    handle.close()
+    return True
 
 
 def survey(families: list[Family], idle_hours: float, min_bytes: int,
@@ -3702,6 +3777,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--settle-minutes", type=float, default=0,
                     help="with --dedupe: skip files changed this recently, wait and retry (up to 3 passes)")
     ap.add_argument("--refresh", action="store_true", help="re-measure all sizes now")
+    ap.add_argument("--refresh-lock-fd", type=int, default=None, help=argparse.SUPPRESS)
     ap.add_argument("--max-age", type=float, default=15,
                     help="minutes before the size snapshot is refreshed in the background (default 15)")
     ap.add_argument("--no-snapshot", action="store_true", help=argparse.SUPPRESS)  # tests
@@ -3710,6 +3786,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--root-override", action="append", default=[], metavar="ID=PATH",
                     help=argparse.SUPPRESS)  # tests
     a = ap.parse_args(argv)
+
+    global _REFRESH_HANDLE
+    if a.refresh_lock_fd is not None:
+        try:
+            _REFRESH_HANDLE = os.fdopen(a.refresh_lock_fd, "a+")
+        except (OSError, ValueError):
+            print("refresh lock unavailable; skipped")
+            return 0
 
     if a.need is not None:
         if not math.isfinite(a.need) or a.need <= 0:
@@ -3822,23 +3906,17 @@ def main(argv: list[str] | None = None) -> int:
     fresh_paths = dropped_for_measurement | (set(known) - known_before)
     age_min = (time.time() - at) / 60 if at else 0.0
     if not a.no_snapshot:
-        lock = SNAPSHOT.with_suffix(".refreshing")
         if a.refresh:
             old_at, old_sizes, old_times = load_snapshot_meta()
             merged = {**old_sizes, **known}
             save_snapshot(merged, measured_at={**old_times, **{k: time.time() for k in known}})
-            lock.unlink(missing_ok=True)
         elif not at or len(known) != before or a.apply or fresh_paths:
             # Keep the global stamp old until every item has been refreshed, while recording exact item times.
             updated_times = {k: v for k, v in measured_at.items() if k in known}
             updated_times.update({k: time.time() for k in fresh_paths})
             save_snapshot(known, at=at or None, measured_at=updated_times)
-        if at and age_min > a.max_age and not a.apply and not _fresh(lock, 600):
-            lock.touch()
-            subprocess.Popen([sys.executable, os.path.abspath(__file__), "--refresh", "--top", "0",
-                              "--min-mib", "0"],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                             stdin=subprocess.DEVNULL, start_new_session=True)
+        if at and age_min > a.max_age and not a.apply:
+            launch_background_refresh()
     if at and not a.json:
         print(f"sizes from {age_min:.0f} min ago"
               f"{' (refreshing in background)' if age_min > a.max_age and not a.apply else ''};"

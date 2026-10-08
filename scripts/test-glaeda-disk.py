@@ -698,6 +698,54 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(gd.load_snapshot_meta(snap), (1000.0, {"/old": 1, "/new": 2},
                                                         {"/old": 1000.0, "/new": 2000.0}))
 
+    def test_refresh_lock_recovers_marker_but_excludes_live_child(self) -> None:
+        saved_snapshot = gd.SNAPSHOT
+        gd.SNAPSHOT = self.root / "sizes.json"
+        child = None
+        first = second = third = None
+        try:
+            marker = gd.refresh_lock_path()
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.touch()  # an unlocked marker is recoverable after a killed child
+            first = gd.acquire_refresh_lock()
+            self.assertIsNotNone(first)
+            fd = first.fileno()
+            child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(.3)"],
+                                     pass_fds=(fd,))
+            first.close()  # the child now owns the same kernel lock
+            first = None
+            second = gd.acquire_refresh_lock()
+            self.assertIsNone(second)
+            child.wait(timeout=5)
+            third = gd.acquire_refresh_lock()
+            self.assertIsNotNone(third)
+        finally:
+            if child is not None and child.poll() is None:
+                child.kill()
+                child.wait()
+            if first is not None:
+                gd.release_refresh_lock(first)
+            if second is not None:
+                gd.release_refresh_lock(second)
+            if third is not None:
+                gd.release_refresh_lock(third)
+            gd.SNAPSHOT = saved_snapshot
+
+    def test_background_refresh_passes_lock_fd_to_child(self) -> None:
+        saved_snapshot = gd.SNAPSHOT
+        gd.SNAPSHOT = self.root / "sizes.json"
+        try:
+            with mock.patch.object(gd.subprocess, "Popen") as popen:
+                self.assertTrue(gd.launch_background_refresh())
+            kwargs = popen.call_args.kwargs
+            self.assertEqual(kwargs["pass_fds"], (kwargs["pass_fds"][0],))
+            self.assertIn("--refresh-lock-fd", popen.call_args.args[0])
+            self.assertEqual(kwargs["pass_fds"][0],
+                             int(popen.call_args.args[0][popen.call_args.args[0].index("--refresh-lock-fd") + 1]))
+            gd.refresh_lock_path().unlink(missing_ok=True)
+        finally:
+            gd.SNAPSHOT = saved_snapshot
+
     def test_accounting_reports_df_space_outside_measured_items(self) -> None:
         path = self.root / "known"
         path.write_bytes(b"x")
