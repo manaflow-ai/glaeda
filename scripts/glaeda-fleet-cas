@@ -196,9 +196,11 @@ write_prewarm() {  # repo, or empty to remove
 # Stop the role's process so launchd starts it again with the current args and binary. The
 # pid must still be this role's fleet-cas (its first argument), not a reused pid.
 restart_role() {  # role, first argument the running process was started with
-  local pid first=$2; pid=$(cat "$ROOT/run/$1.pid" 2>/dev/null) || return 0
-  case $(ps -o command= -p "$pid" 2>/dev/null) in
-    "$BIN/fleet-cas $first"*) ;;
+  local pid first=$2 command
+  pid=$(cat "$ROOT/run/$1.pid" 2>/dev/null) || return 0
+  command=$(ps -o command= -p "$pid" 2>/dev/null)
+  case "$command" in
+    "$BIN/fleet-cas $first"*|*"$BIN/fleet-cas-run $1"*) ;;
     *) return 0 ;;
   esac
   kill "$pid"

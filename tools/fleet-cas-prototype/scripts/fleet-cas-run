@@ -5,33 +5,89 @@
 set -u
 role=${1:?usage: fleet-cas-run ROLE}
 ROOT=${FLEET_CAS_ROOT:-/Users/Shared/cmux-build-fleet/xcode}
+
+# Keep the run receipts truthful while this wrapper waits for a tailnet address. A previous
+# process may have left a pid or binary hash behind; the wrapper is the only process that can
+# replace those receipts before it execs the daemon.
+pid_file="$ROOT/run/$role.pid"
+bin_file="$ROOT/run/$role.bin"
+clear_wait_receipts() {
+  rm -f "$pid_file" "$bin_file"
+}
+record_wait_pid() {
+  clear_wait_receipts
+  printf '%s\n' "$$" >"$pid_file" || { clear_wait_receipts; exit 1; }
+  rm -f "$bin_file"
+}
+record_wait_pid
+trap 'clear_wait_receipts; exit 143' HUP INT TERM
+
 args=()
-while IFS= read -r a; do args+=("$a"); done <"$ROOT/run/$role.args" || exit 1
+args_file="$ROOT/run/$role.args"
+if [ ! -r "$args_file" ]; then
+  clear_wait_receipts
+  exit 1
+fi
+if ! while IFS= read -r a; do args+=("$a"); done <"$args_file"; then
+  clear_wait_receipts
+  exit 1
+fi
+
+is_ipv4() {
+  local value=$1 octet
+  [[ "$value" =~ ^[0-9]+(\.[0-9]+){3}$ ]] || return 1
+  local old_ifs=$IFS
+  IFS=.
+  read -r -a octets <<<"$value"
+  IFS=$old_ifs
+  for octet in "${octets[@]}"; do
+    (( 10#$octet <= 255 )) || return 1
+  done
+}
+
+# Return a host only for a valid, non-wildcard IPv4 endpoint. IPv6 and malformed endpoints are
+# passed straight to fleet-cas, which owns their validation and error reporting.
+store_ipv4_host() {
+  local endpoint=${1#tcp:} host port
+  [ "$endpoint" != "$1" ] || return 1
+  case "$endpoint" in *:*) ;; *) return 1 ;; esac
+  host=${endpoint%:*}
+  port=${endpoint##*:}
+  is_ipv4 "$host" || return 1
+  case "$host" in 0.0.0.0|127.*) return 1 ;; esac
+  [[ "$port" =~ ^[0-9]+$ ]] || return 1
+  (( 10#$port >= 1 && 10#$port <= 65535 )) || return 1
+  printf '%s\n' "$host"
+}
+
 # A store binds its explicit tailnet address. launchd can start it before Tailscale has
 # installed that address, which makes tonic return EADDRNOTAVAIL and sends launchd into a
 # restart loop. Keep the service alive and observable until the address exists; this preserves
 # the explicit non-wildcard bind and lets launchd start the listener exactly once.
 wait_for_store_address() {
-  local listen=${1#tcp:} host=${1#tcp:}
-  case "$listen" in
-    *:*) host=${listen%:*} ;;
-    *) return 0 ;;
-  esac
-  case "$host" in
-    ''|0.0.0.0|127.*|localhost|::|\[::\]) return 0 ;;
-  esac
-  local notice=0
+  local host
+  host=$(store_ipv4_host "$1") || return 0
+  local waited=0
+  local max_wait=60
   while ! ifconfig 2>/dev/null | awk '$1 == "inet" {print $2}' | grep -Fqx "$host"; do
-    if [ "$notice" -eq 0 ] || [ $((notice % 60)) -eq 0 ]; then
+    if [ "$waited" -eq 0 ]; then
       echo "fleet-cas: waiting for local bind address $host" >&2
     fi
-    notice=$((notice + 1))
+    if [ "$waited" -ge "$max_wait" ]; then
+      echo "fleet-cas: timed out after ${max_wait}s waiting for local bind address $host" >&2
+      return 1
+    fi
     sleep 1
+    waited=$((waited + 1))
   done
 }
-[ "$role" = store ] && [ "${args[0]:-}" != "" ] && wait_for_store_address "${args[0]}"
+
+if [ "$role" = store ] && [ "${args[0]:-}" != "" ] && ! wait_for_store_address "${args[0]}"; then
+  clear_wait_receipts
+  exit 78
+fi
 
 # Record the pid and the binary it runs, so the installer can restart a stale one.
-echo $$ >"$ROOT/run/$role.pid"
-shasum -a 256 "$ROOT/bin/fleet-cas" | cut -c1-64 >"$ROOT/run/$role.bin"
+trap - HUP INT TERM
+shasum -a 256 "$ROOT/bin/fleet-cas" | cut -c1-64 >"$bin_file"
 exec "$ROOT/bin/fleet-cas" "${args[@]}"
