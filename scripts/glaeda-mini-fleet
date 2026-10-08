@@ -255,7 +255,7 @@ PROBE_TIMEOUT = 90
 PREFLIGHT_TIMEOUT = 180
 LIST_KEYS = {"xcode_app", "xcode_ready", "disk", "launchd", "fleet_mtime", "ak_file", "ak_key",
              "pf_tool", "pf_submodule", "pf_pmset", "pf_runner", "pf_brew_formula", "pf_secret",
-             "ios_runtime", "ios_device", "fleet_cas_path", "host_lock_owner"}
+             "ios_runtime", "ios_device", "fleet_cas_path", "fleet_cas_stat", "host_lock_owner"}
 # Same rule as scripts/cmux_fleet.py NODE_RE: an opaque cmux-* fleet node id.
 NODE_ID_RE = re.compile(r"cmux-[a-z0-9][a-z0-9-]{2,59}\Z")
 VERSION_RE = re.compile(r"\d+(\.\d+){0,2}\Z")
@@ -684,6 +684,10 @@ def parse_probe(text: str) -> dict[str, Any]:
             "node_mode": out.get("fleet_cas_node_mode"),
             "catch_up": out.get("fleet_catch_up") or None,  # "0" when bin/worker exports CMUX_CI_CATCH_UP=0
             "node": out.get("fleet_cas_node"),
+            "store": out.get("fleet_cas_store"),
+            "stats": {k: int(v) for k, v in (line.split("|", 1) for line in out["fleet_cas_stat"] if "|" in line)
+                      if v.isdigit()},
+            "stats_mtime": int(out["fleet_cas_stats_mtime"]) if out.get("fleet_cas_stats_mtime", "").isdigit() else None,
             "recipe": out.get("fleet_recipe_released"),
             "build_mode": out.get("fleet_recipe_build_mode"),
         },
@@ -1119,7 +1123,22 @@ def catch_up_role(host: dict[str, Any]) -> str | None:
 def catch_up_drift(host: dict[str, Any], policy: dict[str, Any], obs: dict[str, Any]) -> list[tuple[str, str, str]]:
     """Drift for the fleet compile-cache catch-up roles, as (area, detail, fix). Reports only."""
     role = catch_up_role(host)
+    cas = obs.get("fleet_cas") or {}
     if role is None:
+        # A host can retain an old reader daemon after its role leaves the
+        # catch-up pool. Keep healthy, unused installations quiet, but surface
+        # a daemon that is actively failing its configured upstream so an
+        # orphaned deployment cannot masquerade as a healthy local socket.
+        stats = cas.get("stats") or {}
+        upstream_errors = stats.get("up_errors", 0)
+        upstream_skipped = stats.get("up_skipped", 0)
+        if upstream_errors or upstream_skipped:
+            store = cas.get("store") or "unknown store"
+            return [("fleet-cas", f"fleet-cas node outside a catch-up role has {upstream_errors} upstream errors "
+                    f"and {upstream_skipped} skipped calls for {store}; its local socket can answer while "
+                    "remote cache reads fall back to local CAS",
+                    f"inspect {FLEET_ROOT}/xcode/fleet-cas.env and node-store/stats.json; "
+                    "uninstall the orphaned node or rerun the approved fleet-cas rollout")]
         return []
     out: list[tuple[str, str, str]] = []
     keep = "never delete or re-clone it: the catch-up cache keys include this path"
@@ -1141,7 +1160,6 @@ def catch_up_drift(host: dict[str, Any], policy: dict[str, Any], obs: dict[str, 
             out.append(("catch-up", f"the dev-build worker ({FLEET_ROOT}/bin/worker) runs on the {CATCH_UP_WRITER}; "
                         "team-submitted builds would run next to the signing key",
                         f"drain it: exclude the host in fleet.json and make its {HQ_WORKER_LABEL} wrapper idle"))
-    cas = obs.get("fleet_cas") or {}
     paths = cas.get("paths") or {}
     if not paths:
         out.append(("fleet-cas", f"no fleet-cas observation ({FLEET_ROOT} missing)", ""))
@@ -1175,6 +1193,20 @@ def catch_up_drift(host: dict[str, Any], policy: dict[str, Any], obs: dict[str, 
     if cas.get("node") != "answers":
         out.append(("fleet-cas", "fleet-cas node does not answer on xcode/fleet-cas.sock (the fleet-cas-settings.sh "
                     "check); builds fall back to the local cache", rollout))
+    stats = cas.get("stats") or {}
+    upstream_errors = stats.get("up_errors", 0)
+    upstream_skipped = stats.get("up_skipped", 0)
+    # The trusted writer's build wrapper already compares these monotonic
+    # counters before publishing each marker. Lifetime writer errors therefore
+    # do not mean its current fill is unhealthy; readers have no equivalent
+    # per-build gate, so retain the diagnostic for them.
+    if (upstream_errors or upstream_skipped) and role != CATCH_UP_WRITER:
+        store = cas.get("store") or "unknown store"
+        out.append(("fleet-cas", f"fleet-cas node has {upstream_errors} upstream errors and "
+                    f"{upstream_skipped} skipped calls for {store}; its local socket can answer while "
+                    "remote cache reads fall back to local CAS",
+                    f"inspect {FLEET_ROOT}/xcode/fleet-cas.env and node-store/stats.json; "
+                    "rerun the approved fleet-cas rollout if the store endpoint is stale"))
     if role == "reader" and cas.get("catch_up") == "0":
         # On purpose: remote-hit catch-up measured 1631 s against 383 s, so the wrapper keeps it off until the
         # bulk `fleet-cas warm` lands (cmuxterm-hq makes catch-up opt-in by default). Informational, not drift.

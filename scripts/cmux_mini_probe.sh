@@ -129,6 +129,22 @@ if [ -d "$F" ]; then
   else
     e fleet_cas_node down
   fi
+  # The Unix socket can answer while the node's configured fleet store is
+  # unreachable. Report the endpoint and monotonic upstream counters so the
+  # operator can distinguish that state from a healthy, idle reader. These
+  # values contain no credentials and are intentionally bounded to numeric
+  # counters from the node's atomic stats snapshot.
+  E="$F/xcode/fleet-cas.env"
+  store=$(sed -n 's/^FLEET_CAS_STORE=//p' "$E" 2>/dev/null | tail -1)
+  [ -n "$store" ] && e fleet_cas_store "$store"
+  S="$F/xcode/node-store/stats.json"
+  if [ -f "$S" ] && [ -r "$S" ]; then
+    for stat in up_calls up_errors up_skipped up_cas_fetch up_cas_fetch_miss up_cas_verify_fail up_prefetch_calls up_prefetched up_slow_calls instance; do
+      value=$(/usr/bin/perl -e '$k=shift; $f=shift; open my $fh, "<", $f or exit 1; local $/; $s=<$fh>; $s =~ /"\Q$k\E":([0-9]+)/ and print $1' "$stat" "$S" </dev/null 2>/dev/null)
+      [ -n "$value" ] && e fleet_cas_stat "$stat|$value"
+    done
+    e fleet_cas_stats_mtime "$(stat -f %m "$S" 2>/dev/null)"
+  fi
   # The released recipe is whatever recipes points at (recipe-releases/<sha>); ls order is not release order.
   if [ -e "$F/recipes" ]; then
     rel=$(readlink "$F/recipes" 2>/dev/null)
