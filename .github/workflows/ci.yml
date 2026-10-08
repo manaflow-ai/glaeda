@@ -218,6 +218,7 @@ jobs:
               Path("scripts/test-glaeda-update.py"),
               Path("scripts/glaeda-fleet-cas-prune"),
               Path("scripts/test-glaeda-fleet-cas-prune.py"),
+              Path("scripts/test-glaeda-fleet-cas.py"),
               Path("scripts/glaeda-seed-prefetch"),
               Path("scripts/test-glaeda-seed-prefetch.py"),
               Path("scripts/glaeda-idle-warm"),
@@ -265,6 +266,7 @@ jobs:
           bash -n scripts/cmux_mini_probe.sh
           bash -n scripts/cmux_mini_preflight.sh
           bash -n scripts/cmux_mini_fix.sh
+          bash -n scripts/glaeda-fleet-cas
           bash scripts/test-bootstrap.sh
           python3 scripts/test-benchmark-developer-loop.py
           python3 scripts/test-benchmark-hot-state-fanout.py
@@ -276,6 +278,7 @@ jobs:
           python3 scripts/test-glaeda-local-guard.py
           python3 scripts/test-glaeda-update.py
           python3 scripts/test-glaeda-fleet-cas-prune.py
+          python3 scripts/test-glaeda-fleet-cas.py
           python3 scripts/test-glaeda-seed-prefetch.py
           python3 scripts/test-glaeda-idle-warm.py
           python3 scripts/test-glaeda-mini-health.py

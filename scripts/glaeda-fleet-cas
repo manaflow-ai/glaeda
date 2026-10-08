@@ -87,6 +87,32 @@ health_failed() {  # role
   exit 1
 }
 
+# A local node socket can answer while its configured store is gone or stale.
+# Check the exact upstream endpoint before applying a node or writer config, so
+# a rollout cannot report a healthy local daemon that can never serve cache
+# entries. The endpoint is deliberately restricted to the HOST:PORT form that
+# the fleet-cas command passes to its HTTP client.
+check_upstream() {  # HOST:PORT
+  local endpoint=$1 host port value
+  case "$endpoint" in
+    *:*:* | :* | *:) echo "invalid fleet-cas store endpoint: $endpoint (want HOST:PORT)" >&2; return 1 ;;
+  esac
+  host=${endpoint%:*}
+  port=${endpoint##*:}
+  case "$host" in '' | *[!A-Za-z0-9._-]*) echo "invalid fleet-cas store host: $host" >&2; return 1 ;; esac
+  case "$port" in '' | *[!0-9]*) echo "invalid fleet-cas store port: $port" >&2; return 1 ;; esac
+  value=$((10#$port))
+  if (( value < 1 || value > 65535 )); then
+    echo "invalid fleet-cas store port: $port" >&2
+    return 1
+  fi
+  command -v nc >/dev/null 2>&1 || { echo "nc is required to verify fleet-cas store $endpoint" >&2; return 1; }
+  if ! nc -z -G 2 "$host" "$port" >/dev/null 2>&1; then
+    echo "fleet-cas store $endpoint is not reachable; refusing to apply" >&2
+    return 1
+  fi
+}
+
 # The plist for a role: launchd runs bin/fleet-cas-run ROLE, which execs fleet-cas with
 # run/ROLE.args. The plist never changes with the arguments or the binary, so upgrades need
 # no root: the installer rewrites the args file or binary and stops the process, and launchd
@@ -278,6 +304,9 @@ case $role in
   node | writer)
     [ -n "$store" ] || { echo "$role needs --store HOST:PORT" >&2; exit 2; }
     check_key_args
+    if [ -n "$apply" ]; then
+      check_upstream "$store" || exit 1
+    fi
     node_args=(--read-only-kv)
     if [ "$role" = writer ]; then
       [ -n "$sign_key" ] && [ -n "$trusted" ] || { echo "writer needs --sign-key PATH and --trusted-keys HEX" >&2; exit 2; }
