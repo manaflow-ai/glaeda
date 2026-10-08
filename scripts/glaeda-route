@@ -233,6 +233,9 @@ def build_state(pools_doc: Any, runners: Any, *, repo: str, now: float,
             "busy": len(busy),
             "idle": len(idle),
         }
+        resource = entry.get("resource")
+        if resource is not None:
+            pools[label]["resource"] = pool_resource(resource, label)
     return {
         "schema": STATE_SCHEMA,
         "repo": repo,
@@ -266,6 +269,32 @@ def overflow_section(jobs: Any, *, observed_at: float, complete: bool) -> dict[s
 
 
 COUNT_FIELDS = ("declared", "conforming", "reserved", "locked", "runners", "online", "busy", "idle")
+RESOURCE_FIELDS = ("cpuCores", "capacityUnits", "compileSlots", "canonicalRoots", "guiRunners", "simulatorHosts")
+
+
+def pool_resource(value: Any, label: str) -> dict[str, int]:
+    """Validate and copy the additive, manifest-derived resource summary.
+
+    The route document intentionally carries aggregate resource values only. Host identity and
+    placement remain in Glaeda's local observation/ledger, while malformed summaries fail closed
+    before they can be published.
+    """
+    if not isinstance(value, dict):
+        raise Failure(f"pools: {label}.resource is not an object")
+    missing = [field for field in RESOURCE_FIELDS if field not in value]
+    if missing:
+        raise Failure(f"pools: {label}.resource is missing {', '.join(missing)}")
+    resource: dict[str, int] = {}
+    for field in RESOURCE_FIELDS:
+        item = value[field]
+        if not isinstance(item, int) or isinstance(item, bool) or item < 0:
+            raise Failure(f"pools: {label}.resource.{field} is not a non-negative count")
+        resource[field] = item
+    if resource["compileSlots"] > resource["canonicalRoots"]:
+        raise Failure(f"pools: {label}.resource.compileSlots exceeds canonicalRoots")
+    if resource["compileSlots"] * 2 > resource["capacityUnits"]:
+        raise Failure(f"pools: {label}.resource.compileSlots exceeds capacityUnits")
+    return resource
 
 
 def validate_state(doc: Any, *, now: float, repo: str | None = None,
@@ -298,6 +327,11 @@ def validate_state(doc: Any, *, now: float, repo: str | None = None,
                 return False, f"pool state {label}.{field} is not a count"
         if entry["idle"] > entry["online"] or entry["busy"] > entry["online"]:
             return False, f"pool state {label} counts more idle or busy runners than online ones"
+        if "resource" in entry:
+            try:
+                pool_resource(entry["resource"], str(label))
+            except Failure as error:
+                return False, str(error)
     overflow = doc.get("overflow")
     if overflow is not None:
         if not isinstance(overflow, dict) or parse_utc(overflow.get("observed_at")) is None \

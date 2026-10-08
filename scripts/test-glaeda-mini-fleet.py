@@ -259,6 +259,19 @@ class ClassAndPoolTests(unittest.TestCase):
         self.assertEqual(result["glaeda-std-xcode-26.3"]["declared"], ["build-mini-1"])
         self.assertEqual(result["glaeda-std-xcode-26.3"]["conforming_count"], 1)
 
+    def test_pools_publish_manifest_resources_without_host_identity(self) -> None:
+        obs = observed(**{"build-mini-1": probe_text()})
+        resource = mf.pools(self.manifest, obs, ["build-mini-1"])["glaeda-std-xcode-26.3"]["resource"]
+        self.assertEqual(resource, {"cpuCores": 14, "capacityUnits": 4, "compileSlots": 1,
+                                    "canonicalRoots": 1, "guiRunners": 0, "simulatorHosts": 0})
+
+        data = copy.deepcopy(self.manifest)
+        data["defaults"]["ios_simulator"] = {"runtimes": ["23F77"], "exclusive": True,
+                                               "devices": ["iPhone 17 Pro Max"]}
+        data["hosts"]["build-mini-1"]["roles"] = ["ci-runner", "ios-simulators"]
+        resource = mf.pools(data, obs, ["build-mini-1"])["glaeda-std-xcode-26.3"]["resource"]
+        self.assertEqual(resource["simulatorHosts"], 1)
+
     def test_pools_need_an_exact_real_xcode_to_conform(self) -> None:
         for text in (probe_text().replace("|dir|26.3|17C529", "|symlink:/x|26.3|17C529"),
                      probe_text().replace("|dir|26.3|17C529", "|dir|26.3|17C528")):

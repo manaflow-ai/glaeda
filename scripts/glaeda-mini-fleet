@@ -1416,6 +1416,36 @@ def pools(manifest: dict[str, Any], observed: dict[str, Any] | None, hosts: list
     wanted = set(hosts)
     declared = labels.declared_pools(manifest)
     conforming = labels.declared_pools(manifest, xcode_ok)
+
+    def resources(members: list[str]) -> dict[str, int]:
+        """Manifest-derived resources for members declared in this pool.
+
+        The runner count in a pool is observed from GitHub separately. These values describe
+        the configured work budget of the pool; they intentionally do not shrink when one
+        member is offline or reserved. They contain no host identity and are therefore safe for
+        the route publisher to carry into its public aggregate state.
+        """
+        out = {"cpuCores": 0, "capacityUnits": 0, "compileSlots": 0,
+               "canonicalRoots": 0, "guiRunners": 0, "simulatorHosts": 0}
+        hardware = manifest.get("hardware") if isinstance(manifest.get("hardware"), dict) else {}
+        for member in members:
+            host = manifest.get("hosts", {}).get(member) or {}
+            shape = hardware.get(host.get("hardware")) if isinstance(host, dict) else None
+            if isinstance(shape, dict):
+                cpus = shape.get("cpus")
+                if isinstance(cpus, int) and not isinstance(cpus, bool) and cpus >= 0:
+                    out["cpuCores"] += cpus
+            summary, _ = labels.member_labels(manifest, member, lambda _app: True)
+            if not isinstance(summary, dict):
+                continue
+            for field in ("capacityUnits", "compileSlots", "canonicalRoots", "guiRunners"):
+                value = summary.get(field)
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    out[field] += value
+            if summary.get("iosSim") is True:
+                out["simulatorHosts"] += 1
+        return out
+
     out = {}
     for label, members in declared.items():
         mine = [m for m in members if m in wanted]
@@ -1426,7 +1456,8 @@ def pools(manifest: dict[str, Any], observed: dict[str, Any] | None, hosts: list
         ok = [m for m in conforming.get(label, []) if m in wanted and m not in held]
         out[label] = {"declared": mine, "conforming": ok, "reserved": held, "busy": running,
                       "declared_count": len(mine), "conforming_count": len(ok),
-                      "reserved_count": len(held), "busy_count": len(running)}
+                      "reserved_count": len(held), "busy_count": len(running),
+                      "resource": resources(mine)}
     return out
 
 
