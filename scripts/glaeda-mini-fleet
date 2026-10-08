@@ -188,6 +188,7 @@ import math
 import secrets
 import importlib.machinery
 import importlib.util
+import ipaddress
 import json
 import os
 import re
@@ -253,6 +254,13 @@ HQ_CHECK_OPT_OUT = "GLAEDA_MINI_FLEET_SKIP_HQ_CHECK"
 SSH = "/usr/bin/ssh"
 PROBE_TIMEOUT = 90
 PREFLIGHT_TIMEOUT = 180
+# AWS Mac minis are reached through the controller. The identity stays on that
+# controller, so the operator Mac never needs the AWS key.
+SSH_ROUTE_FIELDS = ("ssh_jump_host", "ssh_user", "ssh_identity", "tailnet_ip")
+SSH_RC_MARKER = "__GLAEDA_FLEET_RC="
+SSH_HOST_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+SSH_USER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,31}\Z")
+SSH_IDENTITY_RE = re.compile(r"(?:~|/)[A-Za-z0-9._+/@-]*\Z")
 LIST_KEYS = {"xcode_app", "xcode_ready", "disk", "launchd", "fleet_mtime", "ak_file", "ak_key",
              "pf_tool", "pf_submodule", "pf_pmset", "pf_runner", "pf_brew_formula", "pf_secret",
              "ios_runtime", "ios_device", "fleet_cas_path", "fleet_cas_stat", "host_lock_owner"}
@@ -635,6 +643,81 @@ def host_policy(manifest: dict[str, Any], name: str) -> dict[str, Any]:
     return merge(manifest["defaults"], host.get("overrides", {}))
 
 
+def _identity_expr(identity: str) -> str:
+    """Render a manifest identity for a shell running on the jump host."""
+    if not isinstance(identity, str) or not SSH_IDENTITY_RE.fullmatch(identity):
+        raise Failure(f"unsafe ssh_identity: {identity!r}")
+    if identity.startswith("~/"):
+        return '"$HOME/' + identity[2:] + '"'
+    return shlex.quote(identity)
+
+
+def _ssh_route(manifest: dict[str, Any], name: str) -> dict[str, Any] | None:
+    """Return a validated jump route, or None for an ordinary fleet host."""
+    host = manifest["hosts"].get(name) or {}
+    present = [field for field in SSH_ROUTE_FIELDS if field in host]
+    if not present:
+        return None
+    missing = [field for field in SSH_ROUTE_FIELDS if not host.get(field)]
+    if missing:
+        raise Failure(f"incomplete SSH route for {name}: missing {', '.join(missing)}")
+    jump, user, identity, address = (str(host[field]) for field in SSH_ROUTE_FIELDS)
+    if not SSH_HOST_RE.fullmatch(jump) or not SSH_USER_RE.fullmatch(user):
+        raise Failure(f"unsafe SSH route for {name}")
+    if host.get("ssh_jump_host_local") is not True:
+        raise Failure(f"SSH route for {name} must keep its identity on the jump host")
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        raise Failure(f"invalid tailnet_ip for {name}: {address!r}") from None
+    if ip.version != 4 or ip not in ipaddress.ip_network("100.64.0.0/10"):
+        raise Failure(f"tailnet_ip for {name} is outside Tailscale CGNAT space")
+    if not SSH_IDENTITY_RE.fullmatch(identity):
+        raise Failure(f"unsafe ssh_identity for {name}")
+    return {"jump": jump, "user": user, "identity": identity, "address": address}
+
+
+def _wrap_remote(command: str) -> str:
+    """Preserve the target command's exit status through Tailscale SSH."""
+    return ("( " + command + "\n); __glaeda_rc=$?; printf '\\n" + SSH_RC_MARKER
+            + "%s\\n' \"$__glaeda_rc\"; exit \"$__glaeda_rc\"")
+
+
+def ssh_command(manifest: dict[str, Any], name: str, user: str, command: str) -> list[str]:
+    """Build the manifest-defined SSH argv for a probe or status command."""
+    route = _ssh_route(manifest, name)
+    base = [SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes"]
+    if route is None:
+        return [*base, "-l", user, name, command]
+    nested = ("exec ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "
+              '-o UserKnownHostsFile="$HOME/.ssh/known_hosts" -i ' + _identity_expr(route["identity"])
+              + " -- " + shlex.quote(f"{route['user']}@{route['address']}") + " "
+              + shlex.quote(_wrap_remote(command)))
+    return [*base, "--", route["jump"], nested]
+
+
+def ssh_result(manifest: dict[str, Any], name: str, proc: subprocess.CompletedProcess) -> subprocess.CompletedProcess:
+    """Decode a routed command's exit marker and remove it from its output."""
+    if _ssh_route(manifest, name) is None:
+        return proc
+    text = proc.stdout.decode("utf-8", "replace") if isinstance(proc.stdout, bytes) else (proc.stdout or "")
+    marker = "\n" + SSH_RC_MARKER
+    at = text.rfind(marker)
+    tail = text[at + len(marker):] if at >= 0 else ""
+    digits = tail.strip()
+    if at < 0 or not digits.isdigit() or "\n" in digits or not tail.endswith("\n"):
+        note = "glaeda-mini-fleet: no remote status marker; treating routed SSH as failed\n"
+        if isinstance(proc.stderr, bytes):
+            proc.stderr = proc.stderr.decode("utf-8", "replace") + note
+        else:
+            proc.stderr = (proc.stderr or "") + note
+        proc.returncode = proc.returncode or 255
+        return proc
+    proc.stdout = text[:at]
+    proc.returncode = int(digits)
+    return proc
+
+
 def select_hosts(manifest: dict[str, Any], wanted: list[str] | None) -> list[str]:
     names = list(manifest["hosts"])
     if not wanted:
@@ -899,37 +982,44 @@ def key_line(key: dict[str, Any]) -> str:
     return f"{key['options']} {key['public_key']}" if key.get("options") else key["public_key"]
 
 
-def observe_host(name: str, user: str, script: bytes | None = None, timeout: int = PROBE_TIMEOUT,
-                 options: tuple[str, ...] = ()) -> dict[str, Any]:
+def observe_host(manifest: dict[str, Any], name: str, script: bytes | None = None,
+                 timeout: int = PROBE_TIMEOUT, options: tuple[str, ...] = ()) -> dict[str, Any]:
     started = time.time()
+    user = host_ssh_user(manifest, name)
+    routed = _ssh_route(manifest, name) is not None
+    if routed:
+        command = ssh_command(manifest, name, user, "/bin/bash -s")
+    else:
+        command = [SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", *options,
+                   "-l", user, name, remote_command("/bin/bash -s")]
     try:
         proc = subprocess.run(
-            [SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", *options, "-l", user, name,
-             remote_command("/bin/bash -s")],
+            command,
             input=script or PROBE.read_bytes(), capture_output=True, timeout=timeout, env={"PATH": "/usr/bin:/bin",
                                                                                        "HOME": os.environ["HOME"],
                                                                                        "SSH_AUTH_SOCK": os.environ.get("SSH_AUTH_SOCK", "")},
         )
     except subprocess.TimeoutExpired:
         return {"host": name, "reachable": False, "error": f"probe timed out after {timeout}s"}
-    code, output = remote_result(proc.stdout, proc.returncode)
+    if routed:
+        proc = ssh_result(manifest, name, proc)
+        code, output = proc.returncode, proc.stdout
+    else:
+        code, output = remote_result(proc.stdout, proc.returncode)
     if code != 0:
         err = proc.stderr.decode(errors="replace").strip().splitlines()
         return {"host": name, "reachable": False, "error": (err[-1] if err else f"ssh exit {code}")[:200]}
-    data = parse_probe(output.decode(errors="replace"))
+    text = output.decode(errors="replace") if isinstance(output, bytes) else (output or "")
+    data = parse_probe(text)
     return {"host": name, "reachable": True, "observed_at": int(started), **data}
 
 
 def observe(manifest: dict[str, Any], hosts: list[str], preflight: bool = False) -> dict[str, Any]:
     def one(name: str) -> dict[str, Any]:
-        if not preflight:
-            options = host_ssh_options(manifest, name)
-            return observe_host(name, host_ssh_user(manifest, name), options=options) if options else \
-                observe_host(name, host_ssh_user(manifest, name))
         options = host_ssh_options(manifest, name)
-        return observe_host(name, host_ssh_user(manifest, name), preflight_script(manifest, name), PREFLIGHT_TIMEOUT,
-                            options) if options else \
-            observe_host(name, host_ssh_user(manifest, name), preflight_script(manifest, name), PREFLIGHT_TIMEOUT)
+        if not preflight:
+            return observe_host(manifest, name, options=options)
+        return observe_host(manifest, name, preflight_script(manifest, name), PREFLIGHT_TIMEOUT, options)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
         results = list(pool.map(one, hosts))
@@ -1087,7 +1177,11 @@ def check_host(manifest: dict[str, Any], name: str, obs: dict[str, Any]) -> list
     # sudo is declared per host because fixes that need it go to an operator, not to this tool.
     if host.get("sudo") and obs.get("sudo") and obs["sudo"] != host["sudo"]:
         drift("sudo", f"sudo is {obs['sudo']}, manifest says {host['sudo']}")
-    token = policy.get("controller_token")
+    # The fleet-wide default describes hosts that run a controller worker.  PR
+    # runners and other deliberately excluded hosts inherit that default in
+    # the merged policy, but must not be made broken for lacking a token they
+    # are not allowed to use.  Worker/controller roles remain token-gated.
+    token = policy.get("controller_token") if host.get("controller") in ("worker", "controller") else None
     got_token = obs["fleet_worker"].get("controller_token")
     if token and got_token and got_token != token:
         drift("worker", f"controller token {got_token}, want {token}", "provision secrets/controller.token (operator)")

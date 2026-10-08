@@ -54,6 +54,7 @@ SCHEMA = "glaeda-fleet-status/v1"
 SOURCES_SCHEMA = SCHEMA + "/sources"
 SCRIPT_DIR = Path(__file__).resolve().parent
 SSH = "/usr/bin/ssh"
+SSH_ROUTE_FIELDS = ("ssh_jump_host", "ssh_user", "ssh_identity", "tailnet_ip")
 
 WHO = ("agent", "password", "person")
 SEVERITIES = ("error", "warn", "info")
@@ -217,6 +218,16 @@ def mini_fleet() -> Any:
     return _load("glaeda_mini_fleet", SCRIPT_DIR / "glaeda-mini-fleet")
 
 
+def host_process(manifest: dict[str, Any], host: str, user: str, command: str,
+                 timeout: int) -> subprocess.CompletedProcess:
+    """Run a bounded read-only command using the manifest's host route."""
+    fleet = mini_fleet()
+    argv = fleet.ssh_command(manifest, host, user, command)
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
+                          env=child_env(), check=False)
+    return fleet.ssh_result(manifest, host, proc)
+
+
 def runner_hook() -> Any:
     """The runner hook module, for its console parser: one definition of a locked console for both."""
     return sys.modules.get("glaeda_cmux_runner_hook") or _load("glaeda_cmux_runner_hook",
@@ -368,10 +379,11 @@ LIMA_SCRIPT = (
 )
 
 
-def lima_host(host: str, user: str) -> dict[str, Any]:
+def lima_host(host: str, user: str, manifest: dict[str, Any] | None = None) -> dict[str, Any]:
     try:
-        proc = subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", user, host, LIMA_SCRIPT],
-                              capture_output=True, text=True, timeout=LIMA_TIMEOUT, env=child_env(), check=False)
+        proc = (host_process(manifest, host, user, LIMA_SCRIPT, LIMA_TIMEOUT) if manifest is not None else
+                subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", user, host, LIMA_SCRIPT],
+                               capture_output=True, text=True, timeout=LIMA_TIMEOUT, env=child_env(), check=False))
     except (OSError, subprocess.TimeoutExpired) as error:
         return {"reachable": False, "error": type(error).__name__, "observed_at": now()}
     if proc.returncode != 0:
@@ -392,8 +404,12 @@ def lima_host(host: str, user: str) -> dict[str, Any]:
 def collect_lima(manifest: dict[str, Any], hosts: list[str]) -> dict[str, Any]:
     never = set(manifest.get("never_touch") or [])
     targets = [h for h in hosts if h not in never]
+    def probe(h: str) -> dict[str, Any]:
+        host = manifest.get("hosts", {}).get(h) or {}
+        return lima_host(h, manifest["ssh_user"], manifest) if any(k in host for k in SSH_ROUTE_FIELDS) \
+            else lima_host(h, manifest["ssh_user"])
     with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
-        results = dict(zip(targets, pool.map(lambda h: lima_host(h, manifest["ssh_user"]), targets)))
+        results = dict(zip(targets, pool.map(probe, targets)))
     return source({"hosts": results})
 
 
@@ -544,10 +560,11 @@ def parse_disk(stdout: str, at: int) -> dict[str, Any]:
     return row
 
 
-def disk_host(host: str, user: str) -> dict[str, Any]:
+def disk_host(host: str, user: str, manifest: dict[str, Any] | None = None) -> dict[str, Any]:
     try:
-        proc = subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", user, host, DISK_SCRIPT],
-                              capture_output=True, text=True, timeout=DISK_TIMEOUT, env=child_env(), check=False)
+        proc = (host_process(manifest, host, user, DISK_SCRIPT, DISK_TIMEOUT) if manifest is not None else
+                subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", user, host, DISK_SCRIPT],
+                               capture_output=True, text=True, timeout=DISK_TIMEOUT, env=child_env(), check=False))
     except (OSError, subprocess.TimeoutExpired) as error:
         return {"reachable": False, "error": type(error).__name__, "observed_at": now()}
     if proc.returncode != 0 and "@now" not in proc.stdout:
@@ -558,8 +575,12 @@ def disk_host(host: str, user: str) -> dict[str, Any]:
 def collect_disk(manifest: dict[str, Any], hosts: list[str]) -> dict[str, Any]:
     never = set(manifest.get("never_touch") or [])
     targets = [h for h in hosts if h not in never]
+    def probe(h: str) -> dict[str, Any]:
+        host = manifest.get("hosts", {}).get(h) or {}
+        return disk_host(h, manifest["ssh_user"], manifest) if any(k in host for k in SSH_ROUTE_FIELDS) \
+            else disk_host(h, manifest["ssh_user"])
     with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
-        results = dict(zip(targets, pool.map(lambda h: disk_host(h, manifest["ssh_user"]), targets)))
+        results = dict(zip(targets, pool.map(probe, targets)))
     return source({"hosts": results})
 
 
@@ -616,10 +637,11 @@ def parse_jobs(stdout: str, at: int) -> dict[str, Any]:
                      for r in newest]}
 
 
-def jobs_host(host: str, user: str) -> dict[str, Any]:
+def jobs_host(host: str, user: str, manifest: dict[str, Any] | None = None) -> dict[str, Any]:
     try:
-        proc = subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", user, host, JOBS_SCRIPT],
-                              capture_output=True, text=True, timeout=JOBS_TIMEOUT, env=child_env(), check=False)
+        proc = (host_process(manifest, host, user, JOBS_SCRIPT, JOBS_TIMEOUT) if manifest is not None else
+                subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", user, host, JOBS_SCRIPT],
+                               capture_output=True, text=True, timeout=JOBS_TIMEOUT, env=child_env(), check=False))
     except (OSError, subprocess.TimeoutExpired) as error:
         return {"reachable": False, "error": type(error).__name__, "observed_at": now()}
     if proc.returncode != 0 and "@now" not in proc.stdout:
@@ -630,8 +652,12 @@ def jobs_host(host: str, user: str) -> dict[str, Any]:
 def collect_jobs(manifest: dict[str, Any], hosts: list[str]) -> dict[str, Any]:
     never = set(manifest.get("never_touch") or [])
     targets = [h for h in hosts if h not in never]
+    def probe(h: str) -> dict[str, Any]:
+        host = manifest.get("hosts", {}).get(h) or {}
+        return jobs_host(h, manifest["ssh_user"], manifest) if any(k in host for k in SSH_ROUTE_FIELDS) \
+            else jobs_host(h, manifest["ssh_user"])
     with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
-        results = dict(zip(targets, pool.map(lambda h: jobs_host(h, manifest["ssh_user"]), targets)))
+        results = dict(zip(targets, pool.map(probe, targets)))
     return source({"hosts": results})
 
 
@@ -682,10 +708,12 @@ def judge_stamp(stdout: str, main: str | None, repo: Path, at: int) -> dict[str,
     return {**row, "state": "current" if behind == 0 else "behind", "behind": behind}
 
 
-def tooling_host(host: str, user: str, main: str | None, repo: Path) -> dict[str, Any]:
+def tooling_host(host: str, user: str, main: str | None, repo: Path,
+                 manifest: dict[str, Any] | None = None) -> dict[str, Any]:
     try:
-        proc = subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", user, host, TOOLING_SCRIPT],
-                              capture_output=True, text=True, timeout=TOOLING_TIMEOUT, env=child_env(), check=False)
+        proc = (host_process(manifest, host, user, TOOLING_SCRIPT, TOOLING_TIMEOUT) if manifest is not None else
+                subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", user, host, TOOLING_SCRIPT],
+                               capture_output=True, text=True, timeout=TOOLING_TIMEOUT, env=child_env(), check=False))
     except (OSError, subprocess.TimeoutExpired) as error:
         return {"reachable": False, "error": type(error).__name__, "observed_at": now()}
     if proc.returncode != 0:
@@ -697,8 +725,12 @@ def collect_tooling(manifest: dict[str, Any], hosts: list[str], repo: Path = SCR
     never = set(manifest.get("never_touch") or [])
     targets = [h for h in hosts if h not in never]
     main = origin_main(repo)
+    def probe(h: str) -> dict[str, Any]:
+        host = manifest.get("hosts", {}).get(h) or {}
+        return tooling_host(h, manifest["ssh_user"], main, repo, manifest) if any(k in host for k in SSH_ROUTE_FIELDS) \
+            else tooling_host(h, manifest["ssh_user"], main, repo)
     with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
-        results = dict(zip(targets, pool.map(lambda h: tooling_host(h, manifest["ssh_user"], main, repo), targets)))
+        results = dict(zip(targets, pool.map(probe, targets)))
     return source({"origin_main": main, "hosts": results})
 
 

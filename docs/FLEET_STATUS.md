@@ -1,5 +1,9 @@
 # Fleet status
 
+Start with [`FLEET_OPERATIONS.md`](FLEET_OPERATIONS.md) for the live operator
+command map. This document defines the status document that those commands
+collect and render.
+
 `scripts/glaeda-fleet-status` answers "what is wrong with the fleet, and who fixes
 it" in one typed, bounded JSON document. Humans read the page rendered from it;
 agents read the JSON. It is slice 9 of the fleet roadmap (cmuxterm-hq#573,

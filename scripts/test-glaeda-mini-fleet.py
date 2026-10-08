@@ -185,6 +185,32 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(self.manifest["defaults"]["disk"]["min_free_gib"], 30)
 
 
+class TransportTests(unittest.TestCase):
+    def route_manifest(self) -> dict:
+        return {"ssh_user": "cmux", "hosts": {"aws-m4pro-7": {
+            "ssh_jump_host": "cmux-lawrence", "ssh_user": "ec2-user",
+            "ssh_identity": "~/.ssh/cmux-mac-builder.pem", "ssh_jump_host_local": True,
+            "tailnet_ip": "100.68.123.70"}}}
+
+    def test_aws_status_uses_controller_jump_and_preserves_target_exit(self) -> None:
+        manifest = self.route_manifest()
+        argv = mf.ssh_command(manifest, "aws-m4pro-7", "cmux", "echo ready")
+        self.assertEqual(argv[-2], "cmux-lawrence")
+        self.assertIn("ec2-user@100.68.123.70", argv[-1])
+        self.assertIn("cmux-mac-builder.pem", argv[-1])
+        self.assertIn(mf.SSH_RC_MARKER, argv[-1])
+        proc = subprocess.CompletedProcess(argv, 0, "ready\n\n" + mf.SSH_RC_MARKER + "7\n", "")
+        result = mf.ssh_result(manifest, "aws-m4pro-7", proc)
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual(result.stdout, "ready\n")
+
+    def test_incomplete_route_fails_closed(self) -> None:
+        manifest = self.route_manifest()
+        del manifest["hosts"]["aws-m4pro-7"]["tailnet_ip"]
+        with self.assertRaisesRegex(mf.Failure, "incomplete SSH route"):
+            mf.ssh_command(manifest, "aws-m4pro-7", "cmux", "true")
+
+
 class ClassAndPoolTests(unittest.TestCase):
     def setUp(self) -> None:
         self.manifest = mf.load_manifest(EXAMPLE)
@@ -499,7 +525,7 @@ class ObservationTests(unittest.TestCase):
         with mock.patch.object(mf, "observe_host", return_value={"host": "build-mini-1", "reachable": True}) as probe:
             got = mf.observe(manifest, ["build-mini-1"])
         self.assertTrue(got["hosts"]["build-mini-1"]["reachable"])
-        probe.assert_called_once_with("build-mini-1", "ec2-user")
+        probe.assert_called_once_with(manifest, "build-mini-1", options=())
 
 
 class CheckTests(unittest.TestCase):
@@ -622,10 +648,16 @@ class CheckTests(unittest.TestCase):
 
     def test_sudo_and_token_drift(self) -> None:
         self.manifest["hosts"]["build-mini-1"]["sudo"] = "password"
+        self.manifest["hosts"]["build-mini-1"]["controller"] = "worker"
         self.manifest["defaults"]["controller_token"] = "present"
         text = probe_text() + "sudo\tnopasswd\ncontroller_token\tmissing\n"
         areas = {i["area"] for i in self.issues(text)}
         self.assertTrue({"sudo", "worker"} <= areas)
+
+    def test_excluded_controller_does_not_require_inherited_token(self) -> None:
+        self.manifest["hosts"]["build-mini-1"]["controller"] = "excluded"
+        text = probe_text() + "controller_token\tmissing\n"
+        self.assertFalse([i for i in self.issues(text) if i["area"] == "worker"])
 
     def test_versions_compare_padded(self) -> None:
         self.assertEqual(mf.version_tuple("26.3"), mf.version_tuple("26.3.0"))
