@@ -87,14 +87,15 @@ chmod 0555 "$mount_base"
 : >"$mount_calls"
 env "${mount_env[@]}" "$helper" "$mount_root" "$image" E36525CA-ED1B-4141-907E-59213CFC8FC6
 chmod 0755 "$mount_base"
-grep -q -- "attach -quiet -nobrowse -mountpoint $mount_root $image" "$mount_calls"
+grep -q -- "attach -quiet -nobrowse -owners on -mountpoint $mount_root $image" "$mount_calls"
 test "$(cat "$mount_created")" = "$mount_root"
 
-# An absent root attaches exactly the configured image, then validates it.
+# An absent root attaches exactly the configured image with ownership enforced,
+# then validates it. DiskImages defaults must not silently produce a noowners mount.
 rm -rf "$mount_root" "$mount_state"
 : >"$mount_calls"
 env "${mount_env[@]}" "$helper" "$mount_root" "$image" E36525CA-ED1B-4141-907E-59213CFC8FC6
-grep -q -- "attach -quiet -nobrowse -mountpoint $mount_root $image" "$mount_calls"
+grep -q -- "attach -quiet -nobrowse -owners on -mountpoint $mount_root $image" "$mount_calls"
 
 # A wrong UUID is detached and rejected.
 rm -rf "$mount_root" "$mount_state"
@@ -121,6 +122,6 @@ if env "${mount_env[@]}" FLEET_CAS_MOUNT_MODE=hang HDIUTIL_TIMEOUT_SECONDS=1 "$h
   "$mount_root" "$image" E36525CA-ED1B-4141-907E-59213CFC8FC6; then
   exit 1
 fi
-grep -q -- "attach -quiet -nobrowse -mountpoint $mount_root $image" "$mount_calls"
+grep -q -- "attach -quiet -nobrowse -owners on -mountpoint $mount_root $image" "$mount_calls"
 
 echo "glaeda-fleet-cas mount helper end-to-end tests passed"

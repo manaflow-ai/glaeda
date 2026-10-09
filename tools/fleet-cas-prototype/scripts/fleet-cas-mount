@@ -133,7 +133,7 @@ fi
 
 attached=0
 for attempt in 1 2 3; do
-  if run_hdiutil attach -quiet -nobrowse -mountpoint "$root" "$image"; then
+  if run_hdiutil attach -quiet -nobrowse -owners on -mountpoint "$root" "$image"; then
     attached=1
     if root_info=$(read_root_info) && validate_root "$root_info"; then
       exit 0

@@ -219,7 +219,8 @@ prepare a separate APFS volume or sparsebundle and pass its mounted root to
 `fleet-store`. For a sparsebundle that must recover across reboot, also pass
 `--store-image /Volumes/<ssd>/<compiler-cas>.sparsebundle`. The rollout records the image,
 keeps the launch wrapper and store argument receipts on the boot volume, and lets the wrapper
-attach only that exact image with `hdiutil` before reading the store arguments. Attachment is
+attach only that exact image with `hdiutil -owners on` before reading the store arguments,
+so fresh mounts honor the stored file ownership and permissions. Attachment is
 bounded to three attempts, then the service stops. APFS, the expected mount point, and the
 recorded volume UUID are checked after every start; a missing image, replacement volume, or
 non-empty stale mount point fails closed. The rollout never creates, formats, partitions, or
