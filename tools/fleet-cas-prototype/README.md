@@ -19,7 +19,10 @@ LLVM-exception, copied unmodified into `proto/`):
   Existing entries are never replaced (first writer wins).
 
 Storage is one file per object under the store directory. Counters go to
-`<store>/stats.json`.
+`<store>/stats.json`. `write_failed` retains the strict all-write-error
+semantics used by the trusted writer marker gate; `write_expected_refused`
+separately identifies the deliberate KV write response from a
+`--read-only-kv` reader node.
 
 One binary plays two roles:
 

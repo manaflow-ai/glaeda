@@ -61,6 +61,10 @@ struct Stats {
     /// Writes answered with an error, for any reason (refused, fleet store
     /// down or backing off, local failure). The writer's marker needs 0.
     write_failed: AtomicU64,
+    /// Writes rejected deliberately because this node is configured with
+    /// `--read-only-kv`. These are expected for reader nodes and remain part
+    /// of `write_failed` for the strict writer marker gate.
+    write_expected_refused: AtomicU64,
     /// Identifies this process, so a reader of stats.json can tell that the
     /// counters restarted from 0.
     instance: AtomicU64,
@@ -203,6 +207,7 @@ impl Stats {
             ("kv_sig_fail", &self.kv_sig_fail),
             ("write_refused", &self.write_refused),
             ("write_failed", &self.write_failed),
+            ("write_expected_refused", &self.write_expected_refused),
             ("instance", &self.instance),
             ("bytes_in", &self.bytes_in),
             ("bytes_out", &self.bytes_out),
@@ -1177,6 +1182,7 @@ impl Store {
         s.check_writer(&r)?;
         if s.read_only_kv {
             s.stats.kv_put_refused.fetch_add(1, Relaxed);
+            s.stats.write_expected_refused.fetch_add(1, Relaxed);
             return Ok(Response::new(kv::PutValueResponse {
                 error: Some(kv::ResponseError {
                     description: "read-only cache client".into(),
@@ -1761,5 +1767,43 @@ mod tests {
         assert!(first.contains("\"up_calls\":1"));
         assert!(first.contains("\"up_micros\":"));
         assert!(!first.contains("fleet store"));
+    }
+
+    #[tokio::test]
+    async fn read_only_kv_put_is_separately_attributed_from_write_failures() {
+        let store = Arc::new(Store {
+            root: PathBuf::new(),
+            read_only_kv: true,
+            writers: None,
+            allow_file_paths: false,
+            upstream: None,
+            sign_key: None,
+            trusted: None,
+            strip_signatures: true,
+            upstream_down_until: AtomicU64::new(0),
+            stats: Stats::default(),
+            key_log: None,
+        });
+        let response = <KvSvc as kv::key_value_db_server::KeyValueDb>::put_value(
+            &KvSvc(store.clone()),
+            Request::new(kv::PutValueRequest {
+                key: vec![1],
+                value: Some(kv::Value::default()),
+            }),
+        )
+        .await
+        .expect("read-only refusal is a successful protocol response")
+        .into_inner();
+
+        assert_eq!(
+            response.error.as_ref().map(|error| error.description.as_str()),
+            Some("read-only cache client")
+        );
+        assert_eq!(store.stats.kv_put_refused.load(Relaxed), 1);
+        assert_eq!(store.stats.write_expected_refused.load(Relaxed), 1);
+        // Keep the legacy strict writer accounting unchanged. A writer node
+        // must still reject a marker if any write receives an error response.
+        assert_eq!(store.stats.write_failed.load(Relaxed), 1);
+        assert!(store.stats.line().contains("\"write_expected_refused\":1"));
     }
 }

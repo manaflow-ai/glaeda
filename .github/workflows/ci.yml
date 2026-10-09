@@ -716,6 +716,7 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: |
+          cargo test --locked --manifest-path tools/fleet-cas-prototype/Cargo.toml
           mkdir -p "$RUNNER_TEMP/fleet-cas"
           python3 scripts/fleet_cas_bundle.py build \
             --source "$GITHUB_SHA" --target "$TARGET" \
