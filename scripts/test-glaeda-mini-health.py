@@ -213,6 +213,13 @@ class DiskAndLeaks(Base):
         self.assertIn("5.0 GiB", report["findings"][0]["evidence"])
         self.assertIn("/Users/Shared", report["findings"][0]["evidence"])
 
+    def test_runner_profile_unmeasured_remainder_is_not_a_volume_finding(self) -> None:
+        self.mini.disk = {"schema": "glaeda-disk/v1", "accounting": [{
+            "scope": "runner-cache-profile", "unclassified": 300 * 1024**3,
+            "measured": 2 * 1024**3, "reclaimable": 1 * 1024**3,
+        }]}
+        self.assertEqual(self.run_once()["findings"], [])
+
     def test_malformed_disk_accounting_is_ignored(self) -> None:
         self.mini.disk = {"schema": "glaeda-disk/v1", "accounting": [{"unmeasured": "unknown"},
                                                                        {"unmeasured": None}]}

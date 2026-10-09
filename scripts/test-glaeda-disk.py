@@ -308,8 +308,22 @@ class GlaedaDiskTest(unittest.TestCase):
             gd.DARWIN, gd.darwin_user_tmp = saved
         fam = fams["user-tmp"]
         self.assertEqual(fam.root, self.root)
-        self.assertTrue(fam.reclaimable and fam.git_disposable and fam.bulk_sizes)
+        self.assertTrue(fam.reclaimable and fam.git_disposable and not fam.bulk_sizes)
         self.assertIn("com.apple.", fam.skip_prefixes)
+
+    def test_default_user_tmp_sizes_children_without_bulk_root_walk(self) -> None:
+        saved = (gd.DARWIN, gd.darwin_user_tmp)
+        gd.DARWIN, gd.darwin_user_tmp = True, lambda: self.root
+        try:
+            fam = next(f for f in gd.default_families() if f.id == "user-tmp")
+        finally:
+            gd.DARWIN, gd.darwin_user_tmp = saved
+        for index in range(gd.BULK_SIZE_MIN + 1):
+            (self.root / f"scratch-{index}").mkdir()
+        with mock.patch.object(gd, "du_children", side_effect=AssertionError("bulk root walk")), \
+                mock.patch.object(gd, "du_bytes", return_value=2 * 1024 * 1024):
+            items = gd.survey([fam], 24, 1 << 20)
+        self.assertEqual(len(items), gd.BULK_SIZE_MIN + 1)
 
     def test_report_only_family_is_never_deleted(self) -> None:
         self.fam = gd.Family("user-cache", self.root, False, "report")
@@ -891,15 +905,39 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(got["unclassified"], 5 * gd.GIB)
         self.assertEqual(got["container"]["free"], 6 * gd.GIB)
 
+    def test_runner_profile_accounting_is_scoped_and_does_not_walk_roots_again(self) -> None:
+        path = self.root / "cua-cache" / "frame.bin"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"x")
+        fs = gd.Fs(path.stat().st_dev, str(self.root), 3 * gd.GIB, 10 * gd.GIB, 4 * gd.GIB, 5 * gd.GIB)
+        item = gd.Item("cua-cache", str(path), 2 * gd.GIB, 30.0, "reclaimable")
+        saved = (gd.DARWIN, gd.RUNNER_CACHE_PROFILE, gd.ACCOUNTING)
+        gd.DARWIN, gd.RUNNER_CACHE_PROFILE = True, True
+        gd.ACCOUNTING = self.root / "runner-accounting.json"
+        gd._ACCOUNTING_MEM.clear()
+        gd._ACCOUNTING_COVERAGE_MEM.clear()
+        self.addCleanup(lambda: (setattr(gd, "DARWIN", saved[0]),
+                                  setattr(gd, "RUNNER_CACHE_PROFILE", saved[1]),
+                                  setattr(gd, "ACCOUNTING", saved[2]),
+                                  gd._ACCOUNTING_MEM.clear(), gd._ACCOUNTING_COVERAGE_MEM.clear()))
+        with mock.patch.object(gd, "fixed_measurement_roots", side_effect=AssertionError("profile root walk")), \
+                mock.patch.object(gd, "accounting_coverage", side_effect=AssertionError("coverage walk")), \
+                mock.patch.object(gd, "apfs_container_capacity", return_value=None):
+            got = gd.filesystem_accounting([fs], [item])[0]
+        self.assertEqual(got["scope"], "runner-cache-profile")
+        self.assertEqual(got["top_level"], [{"path": str(path), "bytes": 2 * gd.GIB}])
+
     def test_accounting_cache_keeps_walk_timestamp_until_walk_is_due(self) -> None:
         path = self.root / "known"
         path.write_bytes(b"x")
         fs = gd.Fs(path.stat().st_dev, str(self.root), 2 * gd.GIB, 10 * gd.GIB, 3 * gd.GIB, 4 * gd.GIB)
-        saved = (gd.DARWIN, gd.ACCOUNTING)
+        saved = (gd.DARWIN, gd.ACCOUNTING, gd.DARWIN_ACCOUNTING_ROOTS)
         gd.DARWIN, gd.ACCOUNTING = True, self.root / "accounting-cache.json"
+        gd.DARWIN_ACCOUNTING_ROOTS = ()
         gd._ACCOUNTING_MEM.clear()
         gd._ACCOUNTING_COVERAGE_MEM.clear()
         self.addCleanup(lambda: (setattr(gd, "DARWIN", saved[0]), setattr(gd, "ACCOUNTING", saved[1]),
+                                  setattr(gd, "DARWIN_ACCOUNTING_ROOTS", saved[2]),
                                   gd._ACCOUNTING_MEM.clear(), gd._ACCOUNTING_COVERAGE_MEM.clear()))
         with mock.patch.object(gd, "fixed_measurement_roots", return_value=[self.root]), \
                 mock.patch.object(gd, "du_bytes", return_value=8 * gd.GIB), \
