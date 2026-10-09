@@ -20,7 +20,7 @@ fail() {
 }
 
 case "$root" in
-  /Volumes/*/*) ;;
+  /Volumes/*) [ "$root" != /Volumes ] || { fail "store root must name a volume below /Volumes" || exit 1; } ;;
   *) fail "store root must be below /Volumes: $root" || exit 1 ;;
 esac
 case "$image" in
@@ -53,7 +53,7 @@ info_value() {
 
 validate_root() {
   local info=$1 fs_type mount_point volume_uuid
-  fs_type=$(info_value "$info" 'Type (Bundle)')
+  fs_type=$(info_value "$info" 'Type (Bundle)' | tr '[:upper:]' '[:lower:]')
   mount_point=$(info_value "$info" 'Mount Point')
   volume_uuid=$(info_value "$info" 'Volume UUID')
   [ "$fs_type" = apfs ] || { fail "attached store volume is not APFS: $root" || return 1; }

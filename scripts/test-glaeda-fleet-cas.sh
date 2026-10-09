@@ -52,6 +52,32 @@ test -e "$root/run/node.args"
 test -e "$root/fleet-cas.env"
 grep -q 'fleet-cas-store' "$temporary_root/store-plan"
 ! grep -q 'fleet-cas-node' "$temporary_root/store-plan"
+
+# A validated prebuilt bundle owns the boot-volume helpers too. Poisoning the
+# source checkout must not change what an image-backed launch installs.
+prebuilt="$temporary_root/prebuilt"
+poison_proto="$temporary_root/proto/scripts"
+mkdir -p "$prebuilt" "$poison_proto"
+for f in fleet-cas fleet-cas-run fleet-cas-mount fleet-cas-settings.sh fleet-cas-marker.sh fleet-cas-warm.sh fleet-cas-prewarm.sh fleet-cas-writer-build.sh; do
+  printf 'prebuilt %s\n' "$f" >"$prebuilt/$f"
+  chmod +x "$prebuilt/$f"
+done
+(cd "$prebuilt" && for f in fleet-cas fleet-cas-run fleet-cas-mount fleet-cas-settings.sh fleet-cas-marker.sh fleet-cas-warm.sh fleet-cas-prewarm.sh fleet-cas-writer-build.sh; do shasum -a 256 "$f"; done) >"$prebuilt/SHA256SUMS"
+printf 'poison source runner\n' >"$poison_proto/fleet-cas-run"
+printf 'poison source mount\n' >"$poison_proto/fleet-cas-mount"
+install_root="$temporary_root/prebuilt-install"
+mkdir -p "$install_root"
+install_binaries_body=$(sed -n '/^install_binaries()/,/^write_env()/p' "$script" | sed '$d')
+eval "$install_binaries_body"
+say() { :; }
+check_owner() { :; }
+ROOT="$install_root" BIN="$install_root/bin" proto="$temporary_root/proto" apply=1 \
+  custom_store_image='/Volumes/T5 EVO/glaeda-fleet-cas.sparsebundle' launch_root="$install_root/launch" \
+  HOME="$temporary_root/home" GLAEDA_FLEET_CAS_PREBUILT="$prebuilt" install_binaries
+cmp "$prebuilt/fleet-cas-run" "$install_root/launch/fleet-cas-run"
+cmp "$prebuilt/fleet-cas-mount" "$install_root/launch/fleet-cas-mount"
+! grep -q poison "$install_root/launch/fleet-cas-run"
+! grep -q poison "$install_root/launch/fleet-cas-mount"
 env "${common_env[@]}" "$script" uninstall >"$temporary_root/all-plan"
 grep -q 'fleet-cas-node' "$temporary_root/all-plan"
 grep -q 'fleet-cas-store' "$temporary_root/all-plan"

@@ -382,8 +382,20 @@ install_binaries() {
     done
     if [ -n "$custom_store_image" ]; then
       mkdir -p "$launch_root"
-      install -m 0755 "$proto/scripts/fleet-cas-run" "$launch_root/fleet-cas-run.new"
-      install -m 0755 "$proto/scripts/fleet-cas-mount" "$launch_root/fleet-cas-mount.new"
+      launch_runner=$proto/scripts/fleet-cas-run
+      launch_mount=$proto/scripts/fleet-cas-mount
+      if [ -n "$prebuilt" ]; then
+        launch_runner=$prebuilt/fleet-cas-run
+        launch_mount=$prebuilt/fleet-cas-mount
+      fi
+      [ -f "$launch_runner" ] && [ ! -L "$launch_runner" ] && [ -x "$launch_runner" ] || {
+        echo "missing regular launch runner: $launch_runner" >&2; exit 1;
+      }
+      [ -f "$launch_mount" ] && [ ! -L "$launch_mount" ] && [ -x "$launch_mount" ] || {
+        echo "missing regular mount helper: $launch_mount" >&2; exit 1;
+      }
+      install -m 0755 "$launch_runner" "$launch_root/fleet-cas-run.new"
+      install -m 0755 "$launch_mount" "$launch_root/fleet-cas-mount.new"
       mv "$launch_root/fleet-cas-run.new" "$launch_root/fleet-cas-run"
       mv "$launch_root/fleet-cas-mount.new" "$launch_root/fleet-cas-mount"
     fi

@@ -158,7 +158,7 @@ class SparsebundleMountContractTest(unittest.TestCase):
         )
 
     def test_accepts_expected_attached_apfs_volume(self) -> None:
-        result = self.run_check("/Volumes/compiler-cas", "apfs", "/Volumes/compiler-cas", "ABC", "ABC")
+        result = self.run_check("/Volumes/compiler-cas", "APFS", "/Volumes/compiler-cas", "ABC", "ABC")
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_rejects_wrong_uuid(self) -> None:
