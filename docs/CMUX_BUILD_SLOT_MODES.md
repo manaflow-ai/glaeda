@@ -177,7 +177,12 @@ the old key is dropped.
 ## Deployment
 
 `scripts/glaeda-fleet-cas-rollout --store HOST NODE_HOST... [--apply]` from an operator Mac
-deploys both services (plan by default). On each host it runs `scripts/glaeda-fleet-cas`,
+deploys both services (plan by default). Planning validates local arguments and any prebuilt
+bundle, reads SSH host configuration and tailnet addresses, and prints staging destinations
+and the installer commands. It creates no remote directories, copies no files, and runs no
+remote installer. Host-local installer checks are deferred until `--apply`; a successful plan
+does not establish that installation will succeed. With `--apply`, each host receives the
+installer and prototype, then runs `scripts/glaeda-fleet-cas`,
 which builds the prototype and installs launchd services (a LaunchAgent, or a LaunchDaemon
 run as the build user where root has installed its plist from `xcode/launchd/`). Ordinary roles
 run `xcode/bin/fleet-cas-run ROLE` and read arguments from `xcode/run/ROLE.args`. A custom

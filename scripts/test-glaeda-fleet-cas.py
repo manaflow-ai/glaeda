@@ -3,8 +3,11 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "scripts" / "glaeda-fleet-cas"
 RUNNER = ROOT / "tools" / "fleet-cas-prototype" / "scripts" / "fleet-cas-run"
 MOUNT_HELPER = ROOT / "tools" / "fleet-cas-prototype" / "scripts" / "fleet-cas-mount"
+ROLLOUT = ROOT / "scripts" / "glaeda-fleet-cas-rollout"
 
 
 def preflight_body() -> str:
@@ -185,6 +189,152 @@ class SparsebundleMountContractTest(unittest.TestCase):
         self.assertIn("sparsebundle symlinks are refused", text)
         self.assertNotIn("hdiutil create", text)
         self.assertNotIn("hdiutil partition", text)
+
+
+class RolloutPlanTest(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+        self.calls = self.directory / "calls.jsonl"
+        self.effects = self.directory / "remote-effects"
+        stub_bin = self.directory / "bin"
+        stub_bin.mkdir()
+        stub = (
+            f"#!{sys.executable}\n"
+            "import json, os, sys\n"
+            "from pathlib import Path\n"
+            "tool, args = Path(sys.argv[0]).name, sys.argv[1:]\n"
+            "with open(os.environ['ROLLOUT_TEST_CALLS'], 'a') as stream:\n"
+            "    stream.write(json.dumps([tool, args]) + '\\n')\n"
+            "if tool == 'ssh' and args[0] == '-G':\n"
+            "    print('hostname ' + args[1])\n"
+            "elif tool == 'ssh' and args[-1].startswith('ifconfig | awk '):\n"
+            "    print('100.64.0.11' if args[-2] == 'writer' else '100.64.0.10')\n"
+            "else:\n"
+            "    Path(os.environ['ROLLOUT_TEST_EFFECTS']).touch()\n"
+        )
+        for name in ("ssh", "rsync"):
+            path = stub_bin / name
+            path.write_text(stub, encoding="utf-8")
+            path.chmod(0o755)
+        self.env = {
+            **os.environ,
+            "PATH": f"{stub_bin}:{os.environ['PATH']}",
+            "ROLLOUT_TEST_CALLS": str(self.calls),
+            "ROLLOUT_TEST_EFFECTS": str(self.effects),
+        }
+
+    def run_rollout(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", str(ROLLOUT), *args], env=self.env,
+            text=True, capture_output=True, timeout=20, check=False,
+        )
+
+    def recorded_calls(self) -> list:
+        if not self.calls.exists():
+            return []
+        return [json.loads(line) for line in self.calls.read_text().splitlines()]
+
+    def assert_read_only(self) -> None:
+        self.assertFalse(self.effects.exists(), self.recorded_calls())
+        for tool, args in self.recorded_calls():
+            self.assertEqual(tool, "ssh")
+            self.assertTrue(args[0] == "-G" or args[-1].startswith("ifconfig | awk "), args)
+
+    def make_prebuilt(self) -> Path:
+        bundle = self.directory / "prebuilt bundle"
+        bundle.mkdir()
+        names = (
+            "fleet-cas", "fleet-cas-run", "fleet-cas-mount", "fleet-cas-settings.sh",
+            "fleet-cas-marker.sh", "fleet-cas-warm.sh", "fleet-cas-prewarm.sh",
+            "fleet-cas-writer-build.sh",
+        )
+        checksums = []
+        for name in names:
+            data = b"#!/bin/sh\nexit 0\n"
+            path = bundle / name
+            path.write_bytes(data)
+            path.chmod(0o755)
+            checksums.append(f"{hashlib.sha256(data).hexdigest()}  {name}\n")
+        (bundle / "SHA256SUMS").write_text("".join(checksums))
+        return bundle
+
+    def test_default_plan_never_stages_or_executes_remote_installer(self) -> None:
+        result = self.run_rollout(
+            "--store", "store", "--writer", "writer", "--sign-key", "/keys/writer",
+            "--trusted-keys", "ab", "--prewarm", "cmux@catchup-v1", "node", "writer",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_read_only()
+        self.assertIn("store --listen 100.64.0.10:7450 --writers 100.64.0.11", result.stdout)
+        self.assertIn("writer --store 100.64.0.10:7450", result.stdout)
+        self.assertIn("node --store 100.64.0.10:7450", result.stdout)
+        self.assertIn("--prewarm cmux@catchup-v1", result.stdout)
+        self.assertEqual(result.stdout.count("== writer"), 1)
+        self.assertIn("remote installer checks are deferred", result.stdout)
+
+    def test_plan_with_prebuilt_and_custom_volume_is_read_only(self) -> None:
+        bundle = self.make_prebuilt()
+        result = self.run_rollout(
+            "--store", "store", "--store-root", "/Volumes/compiler cache",
+            "--store-image", "/Volumes/External Disk/cache.sparsebundle",
+            "--prebuilt-dir", str(bundle), "node",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_read_only()
+        self.assertIn("FLEET_CAS_ROOT=/Volumes/compiler\\ cache", result.stdout)
+        self.assertIn("FLEET_CAS_IMAGE=/Volumes/External\\ Disk/cache.sparsebundle", result.stdout)
+        self.assertIn("GLAEDA_FLEET_CAS_PREBUILT=$HOME/.cache/glaeda-fleet-cas/prebuilt", result.stdout)
+
+    def test_apply_preserves_staging_and_role_arguments(self) -> None:
+        bundle = self.make_prebuilt()
+        result = self.run_rollout(
+            "--store", "store", "--writer", "writer", "--sign-key", "/keys/writer",
+            "--trusted-keys", "ab", "--prewarm", "cmux@catchup-v1",
+            "--prebuilt-dir", str(bundle), "node", "writer", "--apply",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.effects.exists())
+        calls = self.recorded_calls()
+        copies = [args for tool, args in calls if tool == "rsync"]
+        self.assertEqual(len(copies), 9)
+        self.assertEqual(sum("--delete" in args for args in copies), 6)
+        installs = [args for tool, args in calls if tool == "ssh"
+                    and "scripts/glaeda-fleet-cas " in args[-1]]
+        self.assertEqual([args[-2] for args in installs], ["store", "writer", "node"])
+        for args in installs:
+            self.assertIn("--apply", args[-1])
+            self.assertIn("GLAEDA_FLEET_CAS_PREBUILT=$HOME/.cache/glaeda-fleet-cas/prebuilt", args[-1])
+        self.assertIn("--writers 100.64.0.11 --trusted-keys ab", installs[0][-1])
+        self.assertIn("--sign-key /keys/writer --trusted-keys ab", installs[1][-1])
+        self.assertIn("--trusted-keys ab --prewarm cmux@catchup-v1", installs[2][-1])
+
+    def test_corrupt_prebuilt_refuses_plan_and_apply_before_ssh(self) -> None:
+        bundle = self.make_prebuilt()
+        (bundle / "fleet-cas").write_text("changed")
+        for apply in ((), ("--apply",)):
+            with self.subTest(apply=apply):
+                result = self.run_rollout("--store", "store", "--prebuilt-dir", str(bundle), *apply)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("prebuilt bundle checksum failed", result.stderr)
+                self.assertEqual(self.recorded_calls(), [])
+
+    def test_nonexecutable_prebuilt_refuses_plan_and_apply_before_ssh(self) -> None:
+        bundle = self.make_prebuilt()
+        (bundle / "fleet-cas-mount").chmod(0o644)
+        for apply in ((), ("--apply",)):
+            with self.subTest(apply=apply):
+                result = self.run_rollout("--store", "store", "--prebuilt-dir", str(bundle), *apply)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("prebuilt bundle missing regular executable", result.stderr)
+                self.assertEqual(self.recorded_calls(), [])
+
+    def test_coordinator_guard_still_refuses_plan_before_remote_effects(self) -> None:
+        result = self.run_rollout("--store", "100.89.225.106")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--allow-coordinator", result.stderr)
+        self.assert_read_only()
 
 
 if __name__ == "__main__":

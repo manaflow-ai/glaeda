@@ -5,7 +5,10 @@
 #                            [--store-root PATH] [--store-image PATH] [--allow-coordinator]
 #                            [--prewarm REPO] [--prebuilt-dir DIR] NODE_HOST... [--apply]
 #
-# Plans by default; --apply deploys. HOST names are ssh aliases (User cmux). The store
+# Plans by default; --apply deploys. Planning checks local inputs and discovers tailnet
+# addresses over SSH, then prints staging destinations and installer commands. It never
+# copies files or runs a remote installer; remote installer checks are deferred to --apply.
+# HOST names are ssh aliases (User cmux). The store
 # listens on the store host's tailnet address port 7450; every NODE_HOST gets a read-only
 # node daemon pointed at it. With --trusted-keys, the store keeps and every node uses only
 # index entries signed by those keys. --writer makes that host the signing writer: its node
@@ -14,7 +17,7 @@
 # writer host must run no PR or other untrusted job: any process there can reach the signing
 # node's socket. Each host
 # receives scripts/glaeda-fleet-cas and tools/fleet-cas-prototype under
-# ~/.cache/glaeda-fleet-cas (also when planning) and runs `glaeda-fleet-cas` there
+# ~/.cache/glaeda-fleet-cas only with --apply and runs `glaeda-fleet-cas` there
 # (docs/CMUX_BUILD_SLOT_MODES.md). With --prewarm REPO (cmux@catchup-v1), every node also gets
 # the prewarm agent (fleet-cas-prewarm.sh), which keeps it warm with the writer's newest fill.
 # `--store-root` points only the store role at an owner-writable APFS root. With
@@ -113,9 +116,8 @@ ship() {  # host
 run() {  # host, args...
   local h=$1; shift
   echo "== $h"
-  ship "$h"
   # Quote each argument for the remote shell.
-  local env_prefix=
+  local env_prefix= remote_command
   if [ "$h" = "$store" ] && [ -n "$store_root" ]; then
     env_prefix="FLEET_CAS_ROOT=$(printf '%q' "$store_root") "
   fi
@@ -125,7 +127,18 @@ run() {  # host, args...
   if [ -n "$prebuilt_dir" ]; then
     env_prefix="${env_prefix}GLAEDA_FLEET_CAS_PREBUILT=\$HOME/.cache/glaeda-fleet-cas/prebuilt "
   fi
-  ssh -o BatchMode=yes "$h" "PATH=\$HOME/.cargo/bin:\$PATH $env_prefix~/.cache/glaeda-fleet-cas/glaeda/scripts/glaeda-fleet-cas $(printf '%q ' "$@")"
+  remote_command="PATH=\$HOME/.cargo/bin:\$PATH $env_prefix~/.cache/glaeda-fleet-cas/glaeda/scripts/glaeda-fleet-cas $(printf '%q ' "$@")"
+  if [ -z "$apply" ]; then
+    echo "plan: stage installer and prototype at $h:~/.cache/glaeda-fleet-cas/glaeda (prototype uses rsync --delete, excluding target)"
+    if [ -n "$prebuilt_dir" ]; then
+      echo "plan: stage verified bundle at $h:~/.cache/glaeda-fleet-cas/prebuilt (rsync --delete)"
+    fi
+    echo "plan: remote installer checks are deferred to --apply; no files copied or installer run"
+    printf 'plan: apply installer command on %s: %s--apply\n' "$h" "$remote_command"
+    return 0
+  fi
+  ship "$h"
+  ssh -o BatchMode=yes "$h" "$remote_command"
 }
 
 # The store's tailnet address: launchd-started third-party binaries on these minis cannot

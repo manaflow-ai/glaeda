@@ -13,13 +13,13 @@ if [ "${1:-}" = "-G" ]; then
   exit 0
 fi
 case "$*" in
-  *ifconfig*) printf '    inet 100.89.225.106\n' ;;
+  *ifconfig*) printf '100.89.225.106\n' ;;
   *) printf '%s\n' "$*" >>"${ROLLOUT_CALLS:?}" ;;
 esac
 EOF
 cat >"$temporary_root/rsync" <<'EOF'
 #!/usr/bin/env bash
-exit 0
+printf 'rsync %s\n' "$*" >>"${ROLLOUT_CALLS:?}"
 EOF
 chmod +x "$temporary_root/ssh" "$temporary_root/rsync"
 
@@ -47,8 +47,17 @@ PATH="$temporary_root:$PATH" ROLLOUT_CALLS="$temporary_root/calls" \
   "$script" --store cmux-lawrence --allow-coordinator \
   --store-root '/Volumes/Glaeda CAS' \
   --store-image '/Volumes/T5 EVO/glaeda-fleet-cas.sparsebundle' cmux8s >"$temporary_root/allow.out"
+test ! -s "$temporary_root/calls"
+grep -q 'FLEET_CAS_ROOT=/Volumes/Glaeda\\ CAS' "$temporary_root/allow.out"
+grep -q 'FLEET_CAS_IMAGE=/Volumes/T5\\ EVO/glaeda-fleet-cas.sparsebundle' "$temporary_root/allow.out"
+
+PATH="$temporary_root:$PATH" ROLLOUT_CALLS="$temporary_root/calls" \
+  "$script" --store cmux-lawrence --allow-coordinator \
+  --store-root '/Volumes/Glaeda CAS' \
+  --store-image '/Volumes/T5 EVO/glaeda-fleet-cas.sparsebundle' cmux8s --apply >"$temporary_root/apply.out"
 grep -q 'FLEET_CAS_ROOT=/Volumes/Glaeda\\ CAS' "$temporary_root/calls"
 grep -q 'FLEET_CAS_IMAGE=/Volumes/T5\\ EVO/glaeda-fleet-cas.sparsebundle' "$temporary_root/calls"
+grep -q -- '--apply' "$temporary_root/calls"
 
 if PATH="$temporary_root:$PATH" ROLLOUT_CALLS="$temporary_root/calls" \
   "$script" --store cmux-lawrence --allow-coordinator \
