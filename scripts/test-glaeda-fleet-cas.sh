@@ -14,7 +14,19 @@ mkdir -p "$root/run" "$root/node-store" "$root/fleet-store" \
   "$home/Library/LaunchAgents" "$daemons" "$stub_bin"
 printf 'node data\n' >"$root/node-store/keep"
 printf 'store data\n' >"$root/fleet-store/keep"
-printf 'store=100.89.140.13:7450\n' >"$root/fleet-cas.env"
+printf 'FLEET_CAS_STORE=100.89.140.13:7450\nFLEET_CAS_TRUSTED_KEYS=ab\n' >"$root/fleet-cas.env"
+cat >"$root/bin-fleet-cas" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${FLEET_CAS_TEST_CALLS:?}"
+EOF
+chmod +x "$root/bin-fleet-cas"
+mkdir -p "$root/bin"
+mv "$root/bin-fleet-cas" "$root/bin/fleet-cas"
+cat >"$stub_bin/xcodebuild" <<'EOF'
+#!/usr/bin/env bash
+printf 'Build version 17F113\n'
+EOF
+chmod +x "$stub_bin/xcodebuild"
 for role in node store; do
   label="com.teamleaderleo.glaeda.fleet-cas-$role"
   printf 'args\n' >"$root/run/$role.args"
@@ -44,6 +56,39 @@ common_env=(
   HOME="$home"
   PATH="$stub_bin:$PATH"
 )
+
+# A canary overrides only the read endpoint. Trusted keys stay on disk, local
+# materialization stays in node-store, and rejected values cannot reach the CAS.
+calls="$temporary_root/fleet-cas.calls"
+for name in fleet-cas-marker.sh fleet-cas-warm.sh; do
+  helper="$repo_root/tools/fleet-cas-prototype/scripts/$name"
+  test "$(env FLEET_CAS_ROOT=/nonexistent "$helper" --capabilities)" = fleet-cas-store-override/v1
+  : >"$calls"
+  env FLEET_CAS_ROOT="$root" FLEET_CAS_TEST_CALLS="$calls" \
+    FLEET_CAS_TRUSTED_KEYS=untrusted-ambient-key PATH="$stub_bin:$PATH" \
+    "$helper" cmux@catchup-v1 "$(printf 'a%.0s' {1..40})"
+  grep -q 'http://100.89.140.13:7450 ' "$calls"
+  grep -q -- '--trusted-keys ab' "$calls"
+  : >"$calls"
+  env FLEET_CAS_ROOT="$root" FLEET_CAS_TEST_CALLS="$calls" \
+    FLEET_CAS_STORE_OVERRIDE=192.0.2.10:17450 PATH="$stub_bin:$PATH" \
+    "$helper" cmux@catchup-v1 "$(printf 'a%.0s' {1..40})" 2>"$temporary_root/read-route"
+  grep -q 'http://192.0.2.10:17450 ' "$calls"
+  grep -q -- '--trusted-keys ab' "$calls"
+  grep -qx 'fleet-cas: read-store=192.0.2.10:17450' "$temporary_root/read-route"
+  if [ "$name" = fleet-cas-warm.sh ]; then grep -q -- "--store $root/node-store" "$calls"; fi
+  for endpoint in 'http://evil' ':17450' '-host:17450' 'host:0' 'host:65536' 'host:1234567890123456789' 'host:abc' 'host:80/path' 'user@host:80' 'host:80:90'; do
+    : >"$calls"
+    rc=0
+    env FLEET_CAS_ROOT="$root" FLEET_CAS_TEST_CALLS="$calls" \
+      FLEET_CAS_STORE_OVERRIDE="$endpoint" PATH="$stub_bin:$PATH" \
+      "$helper" cmux@catchup-v1 "$(printf 'a%.0s' {1..40})" \
+      >"$temporary_root/override.out" 2>"$temporary_root/override.err" || rc=$?
+    test "$rc" = 2
+    test ! -s "$calls"
+    grep -q 'invalid FLEET_CAS_STORE_OVERRIDE' "$temporary_root/override.err"
+  done
+ done
 
 # Planning is read-only, including the role selector.
 env "${common_env[@]}" "$script" uninstall store >"$temporary_root/store-plan"
