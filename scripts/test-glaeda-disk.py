@@ -853,6 +853,30 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(got[0]["unmeasured"], 5 * gd.GIB)
         self.assertEqual(got[0]["top_level"][0]["path"], str(self.root))
 
+    def test_accounting_reconciles_overlapping_shared_runner_coverage(self) -> None:
+        fs = gd.Fs(self.root.stat().st_dev, str(self.root), 2 * gd.GIB, 10 * gd.GIB, 3 * gd.GIB, 4 * gd.GIB)
+        saved = (gd.DARWIN, gd.ACCOUNTING)
+        gd.DARWIN, gd.ACCOUNTING = True, self.root / "accounting-coverage-gap.json"
+        gd._ACCOUNTING_MEM.clear()
+        gd._ACCOUNTING_COVERAGE_MEM.clear()
+        self.addCleanup(lambda: (setattr(gd, "DARWIN", saved[0]), setattr(gd, "ACCOUNTING", saved[1]),
+                                  gd._ACCOUNTING_MEM.clear(), gd._ACCOUNTING_COVERAGE_MEM.clear()))
+        coverage = [
+            {"scope": "data-users-shared", "complete": True,
+             "children": [{"category": "cmux-build-fleet", "bytes": 6 * gd.GIB}]},
+            {"scope": "shared-fleet", "complete": True,
+             "children": [{"category": "ci", "bytes": 6 * gd.GIB}]},
+            {"scope": "shared-fleet/ci", "complete": True,
+             "children": [{"category": "ci", "bytes": 6 * gd.GIB}]},
+        ]
+        with mock.patch.object(gd, "fixed_measurement_roots", return_value=[]), \
+                mock.patch.object(gd, "accounting_coverage", return_value=coverage), \
+                mock.patch.object(gd, "apfs_container_capacity", return_value=None):
+            got = gd.filesystem_accounting([fs], [])[0]
+        self.assertEqual(got["unclassified"], 8 * gd.GIB)
+        self.assertEqual(got["known_coverage"], 6 * gd.GIB)
+        self.assertEqual(got["accounting_gap"], 2 * gd.GIB)
+
     def test_accounting_does_not_double_count_nested_items(self) -> None:
         parent = self.root / "parent"
         child = parent / "child"

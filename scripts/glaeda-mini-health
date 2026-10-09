@@ -426,8 +426,8 @@ def check_disk_accounting(mini: Mini) -> list[dict[str, Any]]:
     if accounting and all(isinstance(x, dict) and x.get("scope") == "runner-cache-profile"
                           for x in accounting):
         return findings
-    missing = sum(float(x.get("unclassified", x.get("unmeasured"))) for x in accounting
-                  if isinstance(x, dict) and isinstance(x.get("unclassified", x.get("unmeasured")), (int, float)))
+    missing = sum(float(x.get("accounting_gap", x.get("unclassified", x.get("unmeasured")))) for x in accounting
+                  if isinstance(x, dict) and isinstance(x.get("accounting_gap", x.get("unclassified", x.get("unmeasured"))), (int, float)))
     if missing < 1 * 1024**3:
         return findings
     top: list[str] = []
@@ -436,7 +436,7 @@ def check_disk_accounting(mini: Mini) -> list[dict[str, Any]]:
             if isinstance(entry, dict) and entry.get("path") and isinstance(entry.get("bytes"), (int, float)):
                 top.append(f"{entry['path']} {entry['bytes'] / 1024**3:.1f} GiB")
     where = "; top level: " + ", ".join(top[:5]) if top else ""
-    findings.append(finding("disk_unmeasured", "warn", f"{missing / 1024**3:.1f} GiB used space is unclassified outside glaeda-disk's measured items{where}",
+    findings.append(finding("disk_unmeasured", "warn", f"{missing / 1024**3:.1f} GiB used space remains outside measured items and complete shared-runner coverage{where}",
                             "pending", "glaeda-disk reports bounded known-heavy roots and refreshes their accounting"))
     return findings
 
