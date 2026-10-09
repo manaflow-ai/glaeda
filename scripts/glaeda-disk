@@ -1156,8 +1156,12 @@ def default_families() -> list[Family]:
     user_tmp = darwin_user_tmp() if DARWIN else None
     if user_tmp is not None:
         # Apple daemons keep live state in com.apple.* entries without holding them open.
+        # Do not use the bulk root walk here. A user's temp directory can contain hundreds of
+        # independent scratch trees; ``du -d1`` still recursively walks all of them and can spend
+        # the full timeout in one kernel filesystem call. The per-child walks remain killable and
+        # fail closed, so one wedged tree cannot make the whole temp root look like one stuck item.
         fams.append(Family("user-tmp", user_tmp, True, "agent scratch under the per-user $TMPDIR",
-                           skip_prefixes=("com.apple.",), git_disposable=True, bulk_sizes=True,
+                           skip_prefixes=("com.apple.",), git_disposable=True,
                            owner="agents and tools", rebuild_minutes=0.5, platform="shared"))
     # The dev-build worker's shared cache (the cmuxterm-hq controller's worker, live only on the dev-build worker
     # host since cmuxterm-hq#661): visible with its owner, never deleted here. When the worker is unloaded the
@@ -3448,6 +3452,12 @@ def filesystem_accounting(fss: list[Fs], items: list[Item]) -> list[dict[str, An
         if mem is not None:
             top = mem
             top_at = float(hit.get("at", 0)) if hit else 0.0
+        elif RUNNER_CACHE_PROFILE:
+            # The enrolled-runner profile is intentionally an allowlist. Its roots are already
+            # represented by surveyed items; walking each root again for a volume-level top list
+            # defeats the profile's bounded contract and can re-trigger a recursive du timeout.
+            top = [{"path": i.path, "bytes": i.bytes} for i in items if i.bytes > 0][:32]
+            top_at = now
         elif not DARWIN:
             # Linux test and development hosts do not need a / walk for the macOS mini report.
             top = []
@@ -3509,7 +3519,10 @@ def filesystem_accounting(fss: list[Fs], items: list[Item]) -> list[dict[str, An
         coverage_mem = None if RUNNER_CACHE_PROFILE else _ACCOUNTING_COVERAGE_MEM.get((fs.dev, fs.mount))
         cached_coverage = _safe_cached_coverage(hit.get("coverage")) if hit else None
         cached_coverage_at = float(hit.get("coverage_at", 0)) if hit else 0.0
-        if coverage_mem is not None and now - coverage_mem[0] < ACCOUNTING_MAX_AGE_S:
+        if RUNNER_CACHE_PROFILE:
+            # The profile intentionally has no broad Data-volume coverage scopes.
+            coverage, coverage_at = [], 0.0
+        elif coverage_mem is not None and now - coverage_mem[0] < ACCOUNTING_MAX_AGE_S:
             coverage = coverage_mem[1]
             coverage_at = coverage_mem[0]
         elif cached_coverage is not None and now - cached_coverage_at < ACCOUNTING_MAX_AGE_S:
@@ -3523,6 +3536,7 @@ def filesystem_accounting(fss: list[Fs], items: list[Item]) -> list[dict[str, An
         entry = {"dev": fs.dev, "mount": fs.mount, "used": used, "measured": measured,
                  "unmeasured": unclassified, "unclassified": unclassified,
                  "reclaimable": reclaimable, "top_level": top,
+                 "scope": "runner-cache-profile" if RUNNER_CACHE_PROFILE else "volume",
                  "container": apfs_container_capacity(fs.mount, now),
                  "coverage": coverage, "coverage_at": coverage_at,
                  "coverage_note": "coverage rows overlap and incomplete rows are lower bounds"}

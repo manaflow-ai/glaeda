@@ -419,6 +419,13 @@ def check_disk_accounting(mini: Mini) -> list[dict[str, Any]]:
                                 f"eviction skipped while pid {pid} ({account}, {state}) held the lock",
                                 "impossible", "the next scheduled pass retries; live scans are never killed"))
     accounting = summary.get("accounting") or []
+    # The enrolled-runner profile deliberately measures only its rebuildable cache allowlist.
+    # Its df-used remainder includes unrelated system and account data, so comparing it with the
+    # whole APFS volume would produce a permanent false-positive warning. The profile still reports
+    # its measured and reclaimable bytes in the disk summary; only the volume-gap warning is scoped out.
+    if accounting and all(isinstance(x, dict) and x.get("scope") == "runner-cache-profile"
+                          for x in accounting):
+        return findings
     missing = sum(float(x.get("unclassified", x.get("unmeasured"))) for x in accounting
                   if isinstance(x, dict) and isinstance(x.get("unclassified", x.get("unmeasured")), (int, float)))
     if missing < 1 * 1024**3:
