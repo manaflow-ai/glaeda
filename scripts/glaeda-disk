@@ -3431,6 +3431,29 @@ def accounting_coverage(dev: int, now: float) -> list[dict[str, Any]]:
     return rows
 
 
+def reconciled_known_coverage(coverage: list[dict[str, Any]]) -> int:
+    """Return complete shared-runner bytes without summing overlapping coverage rows.
+
+    ``data-users-shared`` and ``shared-fleet`` describe the same tree at different
+    levels.  The child scopes below ``shared-fleet`` are useful for labels, but adding
+    them to either parent would inflate the physical total.  Keep the largest complete
+    shared-runner view and leave private or incomplete user-home rows outside this
+    reconciliation.  This is accounting only; it never changes an eviction verdict.
+    """
+    totals: list[int] = []
+    for row in coverage:
+        if not isinstance(row, dict) or not row.get("complete"):
+            continue
+        if row.get("scope") not in {"data-users-shared", "shared-fleet"}:
+            continue
+        total = sum(int(child.get("bytes", 0)) for child in row.get("children", [])
+                    if isinstance(child, dict) and isinstance(child.get("bytes"), (int, float))
+                    and child.get("bytes", 0) >= 0)
+        if total:
+            totals.append(total)
+    return max(totals, default=0)
+
+
 def filesystem_accounting(fss: list[Fs], items: list[Item]) -> list[dict[str, Any]]:
     """Show df-used minus catalogued bytes and bounded top-level volume usage.
 
@@ -3533,8 +3556,11 @@ def filesystem_accounting(fss: list[Fs], items: list[Item]) -> list[dict[str, An
             coverage_at = now if coverage else 0.0
         _ACCOUNTING_COVERAGE_MEM[(fs.dev, fs.mount)] = (coverage_at, coverage)
         unclassified = max(0, used - measured)
+        known_coverage = min(unclassified, reconciled_known_coverage(coverage))
         entry = {"dev": fs.dev, "mount": fs.mount, "used": used, "measured": measured,
                  "unmeasured": unclassified, "unclassified": unclassified,
+                 "known_coverage": known_coverage,
+                 "accounting_gap": max(0, unclassified - known_coverage),
                  "reclaimable": reclaimable, "top_level": top,
                  "scope": "runner-cache-profile" if RUNNER_CACHE_PROFILE else "volume",
                  "container": apfs_container_capacity(fs.mount, now),
