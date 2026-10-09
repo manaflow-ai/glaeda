@@ -1,0 +1,101 @@
+#!/bin/bash
+# Attach a configured compiler-CAS sparsebundle before the store service starts.
+#
+# This helper is intentionally narrow: it accepts one pre-existing image and one
+# expected APFS volume UUID. It never creates, formats, partitions, or searches
+# for another volume. A missing or mismatched volume fails closed.
+set -u
+
+root=${1:?usage: fleet-cas-mount ROOT IMAGE EXPECTED_UUID}
+image=${2:?usage: fleet-cas-mount ROOT IMAGE EXPECTED_UUID}
+expected_uuid=${3:?usage: fleet-cas-mount ROOT IMAGE EXPECTED_UUID}
+
+diskutil_bin=${DISKUTIL:-/usr/sbin/diskutil}
+hdiutil_bin=${HDIUTIL:-/usr/bin/hdiutil}
+sleep_bin=${SLEEP:-/bin/sleep}
+
+fail() {
+  echo "fleet-cas-mount: $*" >&2
+  return 1
+}
+
+case "$root" in
+  /Volumes/*/*) ;;
+  *) fail "store root must be below /Volumes: $root" || exit 1 ;;
+esac
+case "$image" in
+  /Volumes/*/*) ;;
+  *) fail "image must be below /Volumes: $image" || exit 1 ;;
+esac
+case "$image" in
+  "$root"|"$root"/*) fail "image must not be inside the store volume: $image" || exit 1 ;;
+esac
+[ -n "$expected_uuid" ] || { fail "expected APFS volume UUID is missing" || exit 1; }
+[ ! -L "$image" ] || { fail "sparsebundle symlinks are refused: $image" || exit 1; }
+[ -d "$image" ] || { fail "sparsebundle is missing: $image" || exit 1; }
+image_volume=${image%/*}
+image_info=$("$diskutil_bin" info "$image_volume" 2>/dev/null) || {
+  fail "image backing volume is not mounted: $image_volume" || exit 1
+}
+image_mount=$(printf '%s\n' "$image_info" | awk -F': *' '$1 == "Mount Point" {print $2; exit}')
+case "$image_mount" in
+  /Volumes/*) ;;
+  *) fail "image backing path is not a mounted /Volumes volume: $image_volume" || exit 1 ;;
+esac
+[ "$image_mount" = "$image_volume" ] || {
+  fail "image backing path is not a volume mount point: $image_volume" || exit 1
+}
+
+info_value() {
+  local info=$1 key=$2
+  printf '%s\n' "$info" | awk -F': *' -v key="$key" '$1 == key {print $2; exit}'
+}
+
+validate_root() {
+  local info=$1 fs_type mount_point volume_uuid
+  fs_type=$(info_value "$info" 'Type (Bundle)')
+  mount_point=$(info_value "$info" 'Mount Point')
+  volume_uuid=$(info_value "$info" 'Volume UUID')
+  [ "$fs_type" = apfs ] || { fail "attached store volume is not APFS: $root" || return 1; }
+  [ "$mount_point" = "$root" ] || {
+    fail "attached store volume mounted at ${mount_point:-unknown}, expected $root" || return 1
+  }
+  [ "$volume_uuid" = "$expected_uuid" ] || {
+    fail "attached store volume UUID changed (expected $expected_uuid, found ${volume_uuid:-unknown})" || return 1
+  }
+}
+
+read_root_info() {
+  "$diskutil_bin" info "$root" 2>/dev/null || return 1
+}
+
+# A mounted root is accepted only after the same APFS and UUID checks used for
+# an attachment. This protects an already-present replacement volume too.
+if root_info=$(read_root_info) && validate_root "$root_info"; then
+  exit 0
+fi
+
+[ -x "$hdiutil_bin" ] || { fail "hdiutil is unavailable: $hdiutil_bin" || exit 1; }
+mount_parent=${root%/*}
+[ "$mount_parent" = /Volumes ] || { fail "store root must mount directly below /Volumes: $root" || exit 1; }
+mkdir -p "$root" || { fail "cannot create mount point: $root" || exit 1; }
+[ -z "$(/bin/ls -A "$root" 2>/dev/null)" ] || {
+  fail "mount point is not empty: $root" || exit 1
+}
+
+attached=0
+for attempt in 1 2 3; do
+  if "$hdiutil_bin" attach -quiet -nobrowse -mountpoint "$root" "$image" >/dev/null 2>&1; then
+    attached=1
+    if root_info=$(read_root_info) && validate_root "$root_info"; then
+      exit 0
+    fi
+    break
+  fi
+  [ "$attempt" -eq 3 ] || "$sleep_bin" 2
+done
+
+if [ "$attached" -eq 1 ]; then
+  "$hdiutil_bin" detach "$root" >/dev/null 2>&1 || true
+fi
+fail "could not attach and validate $image at $root after 3 attempts" || exit 1

@@ -1,20 +1,22 @@
 #!/bin/bash
 # launchd entry point for a fleet-cas service: exec fleet-cas with the role's
-# arguments from $ROOT/run/ROLE.args (one per line, written by glaeda-fleet-cas),
-# recording the PID so the installer can restart it without root.
+# arguments from the configured state directory (one per line, written by
+# glaeda-fleet-cas), recording the PID so the installer can restart it without root.
 set -u
 role=${1:?usage: fleet-cas-run ROLE}
 ROOT=${FLEET_CAS_ROOT:-/Users/Shared/cmux-build-fleet/xcode}
+state_dir=${FLEET_CAS_STATE_DIR:-$ROOT/run}
 
 # Keep the run receipts truthful while this wrapper waits for a tailnet address. A previous
 # process may have left a pid or binary hash behind; the wrapper is the only process that can
 # replace those receipts before it execs the daemon.
-pid_file="$ROOT/run/$role.pid"
-bin_file="$ROOT/run/$role.bin"
+pid_file="$state_dir/$role.pid"
+bin_file="$state_dir/$role.bin"
 clear_wait_receipts() {
   rm -f "$pid_file" "$bin_file"
 }
 record_wait_pid() {
+  mkdir -p "$state_dir" 2>/dev/null || { clear_wait_receipts; exit 1; }
   clear_wait_receipts
   printf '%s\n' "$$" >"$pid_file" || { clear_wait_receipts; exit 1; }
   rm -f "$bin_file"
@@ -22,8 +24,28 @@ record_wait_pid() {
 record_wait_pid
 trap 'clear_wait_receipts; exit 143' HUP INT TERM
 
+# A custom store's launch wrapper must live on the boot volume: ROOT itself can
+# be an unmounted sparsebundle after reboot. Attach only the configured image,
+# and let the helper fail closed on a missing path, wrong mount, or UUID change.
+ensure_custom_store_mount() {
+  [ "$role" = store ] || return 0
+  [ -n "${FLEET_CAS_ROOT:-}" ] || return 0
+  [ -n "${FLEET_CAS_IMAGE:-}" ] || return 0
+  local helper=${FLEET_CAS_MOUNT_HELPER:-$ROOT/bin/fleet-cas-mount}
+  [ -x "$helper" ] || {
+    echo "fleet-cas: mount helper is missing: $helper" >&2
+    return 1
+  }
+  "$helper" "$ROOT" "$FLEET_CAS_IMAGE" "${FLEET_CAS_VOLUME_UUID:-}"
+}
+
+if ! ensure_custom_store_mount; then
+  clear_wait_receipts
+  exit 78
+fi
+
 args=()
-args_file="$ROOT/run/$role.args"
+args_file="$state_dir/$role.args"
 if [ ! -r "$args_file" ]; then
   clear_wait_receipts
   exit 1

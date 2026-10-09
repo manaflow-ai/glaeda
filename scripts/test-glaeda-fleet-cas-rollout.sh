@@ -45,7 +45,25 @@ grep -q 'never its writer or a reader node' "$temporary_root/node.err"
 : >"$temporary_root/calls"
 PATH="$temporary_root:$PATH" ROLLOUT_CALLS="$temporary_root/calls" \
   "$script" --store cmux-lawrence --allow-coordinator \
-  --store-root '/Volumes/Glaeda CAS/store' cmux8s >"$temporary_root/allow.out"
-grep -q 'FLEET_CAS_ROOT=/Volumes/Glaeda\\ CAS/store' "$temporary_root/calls"
+  --store-root '/Volumes/Glaeda CAS' \
+  --store-image '/Volumes/T5 EVO/glaeda-fleet-cas.sparsebundle' cmux8s >"$temporary_root/allow.out"
+grep -q 'FLEET_CAS_ROOT=/Volumes/Glaeda\\ CAS' "$temporary_root/calls"
+grep -q 'FLEET_CAS_IMAGE=/Volumes/T5\\ EVO/glaeda-fleet-cas.sparsebundle' "$temporary_root/calls"
+
+if PATH="$temporary_root:$PATH" ROLLOUT_CALLS="$temporary_root/calls" \
+  "$script" --store cmux-lawrence --allow-coordinator \
+  --store-root '/Volumes/Glaeda CAS' --store-image relative.sparsebundle cmux8s \
+  >"$temporary_root/relative.out" 2>"$temporary_root/relative.err"; then
+  exit 1
+fi
+grep -q -- '--store-image must be an absolute path' "$temporary_root/relative.err"
+
+if PATH="$temporary_root:$PATH" ROLLOUT_CALLS="$temporary_root/calls" \
+  "$script" --store cmux-lawrence --allow-coordinator \
+  --store-image '/Volumes/T5 EVO/glaeda-fleet-cas.sparsebundle' cmux8s \
+  >"$temporary_root/no-root.out" 2>"$temporary_root/no-root.err"; then
+  exit 1
+fi
+grep -q -- '--store-image requires --store-root' "$temporary_root/no-root.err"
 
 echo "glaeda-fleet-cas rollout guard tests passed"

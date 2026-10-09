@@ -179,10 +179,11 @@ the old key is dropped.
 `scripts/glaeda-fleet-cas-rollout --store HOST NODE_HOST... [--apply]` from an operator Mac
 deploys both services (plan by default). On each host it runs `scripts/glaeda-fleet-cas`,
 which builds the prototype and installs launchd services (a LaunchAgent, or a LaunchDaemon
-run as the build user where root has installed its plist from `xcode/launchd/`). Each runs
-`xcode/bin/fleet-cas-run ROLE`, which reads its arguments from `xcode/run/ROLE.args`, so an
-upgrade needs no root: the installer rewrites the arguments or binary and stops the process,
-and launchd starts it again.
+run as the build user where root has installed its plist from `xcode/launchd/`). Ordinary roles
+run `xcode/bin/fleet-cas-run ROLE` and read arguments from `xcode/run/ROLE.args`. A custom
+sparsebundle store uses a boot-volume copy of the wrapper and `store-run/ROLE.args`, so it can
+attach the volume before reading state. In both cases an upgrade needs no root: the installer
+rewrites the arguments or binary and stops the process, and launchd starts it again.
 
 - `com.teamleaderleo.glaeda.fleet-cas-store` on the store host: the fleet store on the host's
   tailnet address, port 7450, store under `xcode/fleet-store`. Only `--writers` addresses may
@@ -213,14 +214,18 @@ The store may be colocated with the fleet controller when the controller owner a
 placement. Pass `--allow-coordinator` to make that production routing decision explicit. The
 compiler CAS remains a separate service on `:7450`; it must not reuse the controller's HTTP
 artifact-cache directory or its eviction policy. If its payload root is on an external SSD,
-prepare and mount a separate APFS volume or sparsebundle first, then pass
-`--store-root /Volumes/<compiler-cas>/store`. The rollout only points the store role at that
-existing path. It does not create, format, mount, or delete volumes. The root must be writable
-by the service user and retain the CAS store's atomic publication semantics. The installer records
-the APFS volume UUID in the store LaunchDaemon, and `fleet-cas-run` revalidates that mount and
-UUID before every startup. If the volume is absent or replaced, the service stays stopped until
-the original volume is restored and the rollout is applied again. The writer remains the only
-trusted publisher, regardless of which host serves the store.
+prepare a separate APFS volume or sparsebundle and pass its mounted root to
+`--store-root /Volumes/<compiler-cas>`. The store data lives below that root at
+`fleet-store`. For a sparsebundle that must recover across reboot, also pass
+`--store-image /Volumes/<ssd>/<compiler-cas>.sparsebundle`. The rollout records the image,
+keeps the launch wrapper and store argument receipts on the boot volume, and lets the wrapper
+attach only that exact image with `hdiutil` before reading the store arguments. Attachment is
+bounded to three attempts, then the service stops. APFS, the expected mount point, and the
+recorded volume UUID are checked after every start; a missing image, replacement volume, or
+non-empty stale mount point fails closed. The rollout never creates, formats, partitions, or
+searches for another volume. The root must be writable by the service user and retain the CAS
+store's atomic publication semantics. The writer remains the only trusted publisher, regardless
+of which host serves the store.
 `glaeda-fleet-cas uninstall [node|store|all] --apply` removes the selected services and
 keeps both node and fleet stores. The default scope is `all` for compatibility. Removing
 `store` leaves the reader node, its upstream environment and prewarm agent in place;

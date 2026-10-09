@@ -13,6 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "scripts" / "glaeda-fleet-cas"
 RUNNER = ROOT / "tools" / "fleet-cas-prototype" / "scripts" / "fleet-cas-run"
+MOUNT_HELPER = ROOT / "tools" / "fleet-cas-prototype" / "scripts" / "fleet-cas-mount"
 
 
 def preflight_body() -> str:
@@ -28,6 +29,14 @@ def volume_guard_body() -> str:
     text = RUNNER.read_text(encoding="utf-8")
     start = text.index("validate_custom_store_volume() {")
     end = text.index("\n}\n\ncheck_custom_store_root", start) + 2
+    return text[start:end]
+
+
+def mount_validation_body() -> str:
+    """Extract the pure APFS/UUID validation from the sparsebundle helper."""
+    text = MOUNT_HELPER.read_text(encoding="utf-8")
+    start = text.index("info_value() {")
+    end = text.index("\nread_root_info()", start)
     return text[start:end]
 
 
@@ -120,6 +129,59 @@ class CustomStoreVolumeTest(unittest.TestCase):
         result = self.run_check("/Volumes/compiler-cas", "apfs", "/Volumes/compiler-cas", "ABC", "")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("VOLUME_UUID is missing", result.stderr)
+
+
+class SparsebundleMountContractTest(unittest.TestCase):
+    def run_check(
+        self,
+        root: str,
+        filesystem: str,
+        mount_point: str,
+        volume_uuid: str,
+        expected_uuid: str,
+    ) -> subprocess.CompletedProcess[str]:
+        info = (
+            f"Type (Bundle): {filesystem}\n"
+            f"Mount Point: {mount_point}\n"
+            f"Volume UUID: {volume_uuid}\n"
+        )
+        command = (
+            'fail() { echo "mount: $*" >&2; return 1; }\n'
+            f'root="$1"; expected_uuid="$3"; {mount_validation_body()}\n'
+            'validate_root "$2"'
+        )
+        return subprocess.run(
+            ["bash", "-c", command, "fleet-cas-test", root, info, expected_uuid],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def test_accepts_expected_attached_apfs_volume(self) -> None:
+        result = self.run_check("/Volumes/compiler-cas", "apfs", "/Volumes/compiler-cas", "ABC", "ABC")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rejects_wrong_uuid(self) -> None:
+        result = self.run_check("/Volumes/compiler-cas", "apfs", "/Volumes/compiler-cas", "NEW", "OLD")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("UUID changed", result.stderr)
+
+    def test_rejects_non_apfs_or_wrong_mount(self) -> None:
+        for filesystem, mount_point, expected in (
+            ("exfat", "/Volumes/compiler-cas", "ABC"),
+            ("apfs", "/Volumes/other", "ABC"),
+        ):
+            result = self.run_check("/Volumes/compiler-cas", filesystem, mount_point, "ABC", expected)
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_helper_is_bounded_and_never_formats_or_partitions(self) -> None:
+        text = MOUNT_HELPER.read_text(encoding="utf-8")
+        self.assertEqual(text.count('"$hdiutil_bin" attach'), 1)
+        self.assertIn("for attempt in 1 2 3", text)
+        self.assertIn('"$hdiutil_bin" detach "$root"', text)
+        self.assertIn("sparsebundle symlinks are refused", text)
+        self.assertNotIn("hdiutil create", text)
+        self.assertNotIn("hdiutil partition", text)
 
 
 if __name__ == "__main__":

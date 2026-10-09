@@ -2,7 +2,7 @@
 # glaeda-fleet-cas-rollout: deploy the fleet compilation cache from an operator Mac.
 #
 #   glaeda-fleet-cas-rollout --store HOST [--trusted-keys HEX] [--writer HOST --sign-key PATH]
-#                            [--store-root PATH] [--allow-coordinator]
+#                            [--store-root PATH] [--store-image PATH] [--allow-coordinator]
 #                            [--prewarm REPO] [--prebuilt-dir DIR] NODE_HOST... [--apply]
 #
 # Plans by default; --apply deploys. HOST names are ssh aliases (User cmux). The store
@@ -17,8 +17,10 @@
 # ~/.cache/glaeda-fleet-cas (also when planning) and runs `glaeda-fleet-cas` there
 # (docs/CMUX_BUILD_SLOT_MODES.md). With --prewarm REPO (cmux@catchup-v1), every node also gets
 # the prewarm agent (fleet-cas-prewarm.sh), which keeps it warm with the writer's newest fill.
-# `--store-root` points only the store role at an already-mounted, owner-writable APFS root.
-# It never creates, formats, mounts, or deletes a volume. A coordinator host is refused
+# `--store-root` points only the store role at an owner-writable APFS root. With
+# `--store-image`, the installed store wrapper attaches that exact pre-existing
+# sparsebundle before launchd starts the service. It never creates, formats,
+# partitions, or searches for another volume. A coordinator host is refused
 # unless `--allow-coordinator` is supplied explicitly, keeping the production routing
 # decision visible at the command line. With --prebuilt-dir, the supplied fleet-cas binary
 # and helper scripts are copied to each host and the installer skips Cargo. Every host needs
@@ -26,11 +28,12 @@
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 PORT=7450
-store= store_root= apply= allow_coordinator= trusted= writer= sign_key= prewarm= prebuilt_dir= nodes=()
+store= store_root= store_image= apply= allow_coordinator= trusted= writer= sign_key= prewarm= prebuilt_dir= nodes=()
 while [ $# -gt 0 ]; do
   case $1 in
     --store) store=${2:?}; shift ;;
     --store-root) store_root=${2:?}; shift ;;
+    --store-image) store_image=${2:?}; shift ;;
     --allow-coordinator) allow_coordinator=1 ;;
     --trusted-keys) trusted=${2:?}; shift ;;
     --writer) writer=${2:?}; shift ;;
@@ -49,10 +52,18 @@ case $store_root in
   /*) ;;
   *) echo "--store-root must be an absolute path" >&2; exit 2 ;;
 esac
+case $store_image in
+  '') ;;
+  /*) ;;
+  *) echo "--store-image must be an absolute path" >&2; exit 2 ;;
+esac
+if [ -n "$store_image" ] && [ -z "$store_root" ]; then
+  echo "--store-image requires --store-root" >&2; exit 2
+fi
 if [ -n "$prebuilt_dir" ]; then
   [ -f "$prebuilt_dir/SHA256SUMS" ] && [ ! -L "$prebuilt_dir/SHA256SUMS" ] || { echo "prebuilt bundle missing regular SHA256SUMS" >&2; exit 2; }
   (cd "$prebuilt_dir" && shasum -a 256 -c SHA256SUMS) || { echo "prebuilt bundle checksum failed" >&2; exit 2; }
-  for f in fleet-cas fleet-cas-run fleet-cas-settings.sh fleet-cas-marker.sh fleet-cas-warm.sh fleet-cas-prewarm.sh fleet-cas-writer-build.sh; do
+  for f in fleet-cas fleet-cas-run fleet-cas-mount fleet-cas-settings.sh fleet-cas-marker.sh fleet-cas-warm.sh fleet-cas-prewarm.sh fleet-cas-writer-build.sh; do
     [ -f "$prebuilt_dir/$f" ] && [ ! -L "$prebuilt_dir/$f" ] && [ -x "$prebuilt_dir/$f" ] || { echo "prebuilt bundle missing regular executable $prebuilt_dir/$f" >&2; exit 2; }
   done
 fi
@@ -107,6 +118,9 @@ run() {  # host, args...
   local env_prefix=
   if [ "$h" = "$store" ] && [ -n "$store_root" ]; then
     env_prefix="FLEET_CAS_ROOT=$(printf '%q' "$store_root") "
+  fi
+  if [ "$h" = "$store" ] && [ -n "$store_image" ]; then
+    env_prefix="${env_prefix}FLEET_CAS_IMAGE=$(printf '%q' "$store_image") "
   fi
   if [ -n "$prebuilt_dir" ]; then
     env_prefix="${env_prefix}GLAEDA_FLEET_CAS_PREBUILT=\$HOME/.cache/glaeda-fleet-cas/prebuilt "
