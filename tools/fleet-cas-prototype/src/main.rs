@@ -96,6 +96,94 @@ struct Stats {
     /// calls slower than 100 ms, to tell a slow store from serial round trips.
     up_prefetch_micros: AtomicU64,
     up_slow_calls: AtomicU64,
+    upstream_ops: [UpstreamOperationStats; UpstreamOperation::COUNT],
+}
+
+#[derive(Clone, Copy)]
+enum UpstreamOperation {
+    CasGet,
+    CasPut,
+    KvGet,
+    KvPut,
+    ClosureGet,
+}
+
+impl UpstreamOperation {
+    const COUNT: usize = 5;
+
+    const fn index(self) -> usize {
+        match self {
+            Self::CasGet => 0,
+            Self::CasPut => 1,
+            Self::KvGet => 2,
+            Self::KvPut => 3,
+            Self::ClosureGet => 4,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::CasGet => "cas_get",
+            Self::CasPut => "cas_put",
+            Self::KvGet => "kv_get",
+            Self::KvPut => "kv_put",
+            Self::ClosureGet => "closure_get",
+        }
+    }
+
+    const fn all() -> [Self; Self::COUNT] {
+        [
+            Self::CasGet,
+            Self::CasPut,
+            Self::KvGet,
+            Self::KvPut,
+            Self::ClosureGet,
+        ]
+    }
+}
+
+#[derive(Default)]
+struct UpstreamOperationStats {
+    calls: AtomicU64,
+    errors: AtomicU64,
+    skipped: AtomicU64,
+    micros: AtomicU64,
+    slow_calls: AtomicU64,
+    last_duration_micros: AtomicU64,
+    last_call_ms: AtomicU64,
+    last_success_ms: AtomicU64,
+    last_failure_ms: AtomicU64,
+    last_skip_ms: AtomicU64,
+    last_failure_code: AtomicU64,
+}
+
+#[repr(u64)]
+#[derive(Clone, Copy)]
+enum UpstreamFailureCode {
+    Timeout = 1,
+    Unavailable = 2,
+    Permission = 3,
+    Protocol = 4,
+    Backoff = 5,
+    Other = 6,
+}
+
+impl UpstreamFailureCode {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Unavailable => "unavailable",
+            Self::Permission => "permission",
+            Self::Protocol => "protocol",
+            Self::Backoff => "backoff",
+            Self::Other => "other",
+        }
+    }
+}
+
+enum PrefetchOutcome {
+    Complete,
+    StreamError(UpstreamFailureCode),
 }
 
 impl Stats {
@@ -136,28 +224,115 @@ impl Stats {
             ("up_prefetch_micros", &self.up_prefetch_micros),
             ("up_slow_calls", &self.up_slow_calls),
         ];
-        let body: Vec<String> = fields
+        let mut body: Vec<String> = fields
             .iter()
             .map(|(k, v)| format!("\"{k}\":{}", v.load(Relaxed)))
             .collect();
+        let operations = UpstreamOperation::all()
+            .into_iter()
+            .zip(self.upstream_ops.iter())
+            .map(|(operation, stats)| stats.json(operation))
+            .collect::<Vec<_>>()
+            .join(",");
+        body.push(format!("\"upstream_operations\":{{{operations}}}"));
         format!("{{{}}}", body.join(","))
     }
 
     /// Time one call to the fleet store.
-    async fn upstream<T>(&self, f: impl std::future::Future<Output = T>) -> T {
+    async fn upstream<T>(
+        &self,
+        operation: UpstreamOperation,
+        f: impl std::future::Future<Output = Result<T, Status>>,
+    ) -> Result<T, Status> {
+        self.upstream_with_success(operation, f, |_| true).await
+    }
+
+    async fn upstream_with_success<T>(
+        &self,
+        operation: UpstreamOperation,
+        f: impl std::future::Future<Output = Result<T, Status>>,
+        success: impl Fn(&T) -> bool,
+    ) -> Result<T, Status> {
         let t = Instant::now();
         let r = f.await;
-        self.record_call(t);
+        let successful = match &r {
+            Ok(value) => success(value),
+            Err(_) => false,
+        };
+        self.record_call(operation, t, successful);
         r
     }
 
-    fn record_call(&self, t: Instant) {
+    fn operation(&self, operation: UpstreamOperation) -> &UpstreamOperationStats {
+        &self.upstream_ops[operation.index()]
+    }
+
+    fn record_call(&self, operation: UpstreamOperation, t: Instant, success: bool) {
         let micros = t.elapsed().as_micros() as u64;
+        let stats = self.operation(operation);
+        stats.calls.fetch_add(1, Relaxed);
+        stats.micros.fetch_add(micros, Relaxed);
+        stats.last_duration_micros.store(micros, Relaxed);
+        stats.last_call_ms.store(now_ms(), Relaxed);
         self.up_calls.fetch_add(1, Relaxed);
         self.up_micros.fetch_add(micros, Relaxed);
         if micros > 100_000 {
+            stats.slow_calls.fetch_add(1, Relaxed);
             self.up_slow_calls.fetch_add(1, Relaxed);
         }
+        if success {
+            stats.last_success_ms.store(now_ms(), Relaxed);
+        }
+    }
+
+    fn record_failure(&self, operation: UpstreamOperation, code: UpstreamFailureCode) {
+        let stats = self.operation(operation);
+        stats.errors.fetch_add(1, Relaxed);
+        stats.last_failure_ms.store(now_ms(), Relaxed);
+        stats.last_failure_code.store(code as u64, Relaxed);
+    }
+
+    fn record_skip(&self, operation: UpstreamOperation) {
+        let stats = self.operation(operation);
+        stats.skipped.fetch_add(1, Relaxed);
+        stats.last_skip_ms.store(now_ms(), Relaxed);
+        stats
+            .last_failure_code
+            .store(UpstreamFailureCode::Backoff as u64, Relaxed);
+    }
+
+    fn record_prefetch_duration(&self, started: Instant) {
+        self.up_prefetch_micros
+            .fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+    }
+}
+
+impl UpstreamOperationStats {
+    fn json(&self, operation: UpstreamOperation) -> String {
+        let code = match self.last_failure_code.load(Relaxed) {
+            1 => UpstreamFailureCode::Timeout.name(),
+            2 => UpstreamFailureCode::Unavailable.name(),
+            3 => UpstreamFailureCode::Permission.name(),
+            4 => UpstreamFailureCode::Protocol.name(),
+            5 => UpstreamFailureCode::Backoff.name(),
+            6 => UpstreamFailureCode::Other.name(),
+            _ => "none",
+        };
+        format!(
+            "\"{}\":{{\"calls\":{},\"errors\":{},\"skipped\":{},\"micros\":{},\"slow_calls\":{},\"last_duration_micros\":{},\"last_call_ms\":{},\"last_success_ms\":{},\"last_failure_ms\":{},\"last_skip_ms\":{},\"last_failure_code\":\"{}\"}}",
+            operation.name(),
+            self.calls.load(Relaxed),
+            self.errors.load(Relaxed),
+            self.skipped.load(Relaxed),
+            self.micros.load(Relaxed),
+            self.slow_calls.load(Relaxed),
+            self.last_duration_micros.load(Relaxed),
+            self.last_call_ms.load(Relaxed),
+            self.last_success_ms.load(Relaxed),
+            self.last_failure_ms.load(Relaxed),
+            self.last_skip_ms.load(Relaxed),
+            code,
+        )
     }
 }
 
@@ -310,6 +485,22 @@ fn embedded_ids(value: &kv::Value) -> Vec<Vec<u8>> {
 
 fn upstream_err(e: Status) -> Status {
     Status::unavailable(format!("fleet store: {}", e.message()))
+}
+
+fn classify_failure(error: &Status) -> UpstreamFailureCode {
+    match error.code() {
+        tonic::Code::DeadlineExceeded => UpstreamFailureCode::Timeout,
+        tonic::Code::PermissionDenied | tonic::Code::Unauthenticated => {
+            UpstreamFailureCode::Permission
+        }
+        tonic::Code::Unavailable | tonic::Code::Cancelled => UpstreamFailureCode::Unavailable,
+        tonic::Code::InvalidArgument
+        | tonic::Code::FailedPrecondition
+        | tonic::Code::DataLoss
+        | tonic::Code::Internal => UpstreamFailureCode::Protocol,
+        _ if error.message().contains("Timeout expired") => UpstreamFailureCode::Timeout,
+        _ => UpstreamFailureCode::Other,
+    }
 }
 
 fn object_id(refs: &[cas::CasDataId], data: &[u8]) -> Vec<u8> {
@@ -479,25 +670,27 @@ impl Store {
 }
 
 impl Store {
-    fn upstream_backing_off(&self) -> bool {
+    fn upstream_backing_off(&self, operation: UpstreamOperation) -> bool {
         let skip = now_ms() < self.upstream_down_until.load(Relaxed);
         if skip {
             self.stats.up_skipped.fetch_add(1, Relaxed);
+            self.stats.record_skip(operation);
         }
         skip
     }
 
     /// The fleet store to read from, unless a recent call failed: then every
     /// lookup is a local miss for a while instead of a timeout each.
-    fn readable_upstream(&self) -> Option<&Upstream> {
+    fn readable_upstream(&self, operation: UpstreamOperation) -> Option<&Upstream> {
         let up = self.upstream.as_ref()?;
-        (!self.upstream_backing_off()).then_some(up)
+        (!self.upstream_backing_off(operation)).then_some(up)
     }
 
     /// A fleet-store call failed: count it, log it (the first few, then every
     /// hundredth, so an outage cannot flood the log), and back off.
-    fn upstream_failed(&self, what: &str) {
+    fn upstream_failed(&self, operation: UpstreamOperation, code: UpstreamFailureCode, what: &str) {
         let n = self.stats.up_errors.fetch_add(1, Relaxed);
+        self.stats.record_failure(operation, code);
         if n < 5 || n % 100 == 0 {
             eprintln!("fleet store call failed ({} so far): {what}", n + 1);
         }
@@ -507,7 +700,7 @@ impl Store {
 
     /// A forwarded write failed or was skipped: the build gets an error (and
     /// compiles on), and nothing is published half-way.
-    fn write_unavailable(&self, e: Option<Status>) -> Status {
+    fn write_unavailable(&self, operation: UpstreamOperation, e: Option<Status>) -> Status {
         if let Some(e) = e {
             // A store that refuses this node's writes is healthy: fail the
             // write, keep reading.
@@ -517,11 +710,15 @@ impl Store {
                 if self.stats.write_refused.fetch_add(1, Relaxed) == 0 {
                     eprintln!("fleet store refused a write: {}", e.message());
                 }
+                self.stats
+                    .record_failure(operation, UpstreamFailureCode::Permission);
                 return upstream_err(e);
             }
-            self.upstream_failed(&format!("write: {e}"));
+            self.upstream_failed(operation, classify_failure(&e), &format!("write: {e}"));
             return upstream_err(e);
         }
+        self.stats
+            .record_failure(operation, UpstreamFailureCode::Backoff);
         Status::unavailable("fleet store unavailable (backing off)")
     }
 
@@ -534,7 +731,7 @@ impl Store {
         if id.len() != 32 {
             return Ok(None);
         }
-        let Some(up) = self.readable_upstream() else {
+        let Some(up) = self.readable_upstream(UpstreamOperation::CasGet) else {
             return Ok(None);
         };
         let req = cas::CasGetRequest {
@@ -543,10 +740,18 @@ impl Store {
         };
         // An unreachable fleet store degrades to a local miss: the build
         // compiles instead of failing or waiting.
-        let resp = match self.stats.upstream(up.cas.clone().get(req)).await {
+        let resp = match self
+            .stats
+            .upstream(UpstreamOperation::CasGet, up.cas.clone().get(req))
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
-                self.upstream_failed(&format!("cas get: {e}"));
+                self.upstream_failed(
+                    UpstreamOperation::CasGet,
+                    classify_failure(&e),
+                    &format!("cas get: {e}"),
+                );
                 return Ok(None);
             }
         };
@@ -559,6 +764,8 @@ impl Store {
         let data = blob_data(&obj).to_vec();
         if object_id(&obj.references, &data) != id {
             self.stats.up_cas_verify_fail.fetch_add(1, Relaxed);
+            self.stats
+                .record_failure(UpstreamOperation::CasGet, UpstreamFailureCode::Protocol);
             return Ok(None);
         }
         self.stats.up_cas_fetch.fetch_add(1, Relaxed);
@@ -581,24 +788,30 @@ impl Store {
         };
         let id = self.put(refs, data)?;
         if let Some((up, obj)) = forward {
-            if self.upstream_backing_off() {
-                return Err(self.write_unavailable(None));
+            if self.upstream_backing_off(UpstreamOperation::CasPut) {
+                return Err(self.write_unavailable(UpstreamOperation::CasPut, None));
             }
             let req = cas::CasPutRequest { data: Some(obj) };
             let resp = self
                 .stats
-                .upstream(up.cas.clone().put(req))
+                .upstream(UpstreamOperation::CasPut, up.cas.clone().put(req))
                 .await
-                .map_err(|e| self.write_unavailable(Some(e)))?
+                .map_err(|e| self.write_unavailable(UpstreamOperation::CasPut, Some(e)))?
                 .into_inner();
             match resp.contents {
                 Some(cas::cas_put_response::Contents::CasId(c)) if c.id == id => {
                     self.stats.up_cas_push.fetch_add(1, Relaxed);
                 }
                 Some(cas::cas_put_response::Contents::Error(e)) => {
+                    self.stats
+                        .record_failure(UpstreamOperation::CasPut, UpstreamFailureCode::Protocol);
                     return Err(Status::unavailable(e.description));
                 }
-                _ => return Err(Status::internal("fleet store returned a different ID")),
+                _ => {
+                    self.stats
+                        .record_failure(UpstreamOperation::CasPut, UpstreamFailureCode::Protocol);
+                    return Err(Status::internal("fleet store returned a different ID"));
+                }
             }
         }
         Ok(id)
@@ -609,19 +822,6 @@ impl Store {
     /// instead of one fleet round trip each. Best effort: anything missed
     /// here is still fetched object by object.
     async fn prefetch(&self, value: &kv::Value) {
-        // The channel's per-call timeout covers only the response headers,
-        // not a streamed body: bound the whole prefetch, so a store that
-        // stalls mid-stream costs one timeout, then the backoff.
-        let limit = std::time::Duration::from_secs(30);
-        if tokio::time::timeout(limit, self.prefetch_inner(value))
-            .await
-            .is_err()
-        {
-            self.upstream_failed("prefetch: timed out");
-        }
-    }
-
-    async fn prefetch_inner(&self, value: &kv::Value) {
         let Some(up) = &self.upstream else { return };
         if !up.closure.load(Relaxed) {
             return;
@@ -633,13 +833,80 @@ impl Store {
         if roots.is_empty() {
             return;
         }
+        // The channel's per-call timeout covers only the response headers,
+        // not a streamed body: bound the whole prefetch, so a store that
+        // stalls mid-stream costs one timeout, then the backoff.
+        let limit = std::time::Duration::from_secs(30);
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            limit,
+            self.stats.upstream_with_success(
+                UpstreamOperation::ClosureGet,
+                self.prefetch_inner(up, roots),
+                |out| matches!(out, PrefetchOutcome::Complete),
+            ),
+        )
+        .await;
+        match result {
+            Ok(Ok(PrefetchOutcome::Complete)) => {}
+            // Preserve the existing best-effort stream fallback: a stream
+            // error stops this prefetch, but leaves object-by-object reads
+            // available without opening the global upstream backoff.
+            Ok(Ok(PrefetchOutcome::StreamError(code))) => {
+                self.stats
+                    .record_failure(UpstreamOperation::ClosureGet, code);
+            }
+            Ok(Err(e)) if e.code() == tonic::Code::Unimplemented => {
+                self.stats
+                    .record_failure(UpstreamOperation::ClosureGet, UpstreamFailureCode::Protocol);
+                self.stats.record_prefetch_duration(started);
+            }
+            Ok(Err(e))
+                if matches!(
+                    e.code(),
+                    tonic::Code::ResourceExhausted | tonic::Code::InvalidArgument
+                ) =>
+            {
+                self.stats
+                    .record_failure(UpstreamOperation::ClosureGet, classify_failure(&e));
+                self.stats.record_prefetch_duration(started);
+            }
+            Ok(Err(e)) => {
+                self.upstream_failed(
+                    UpstreamOperation::ClosureGet,
+                    classify_failure(&e),
+                    &format!("prefetch: {e}"),
+                );
+                self.stats.record_prefetch_duration(started);
+            }
+            Err(_) => {
+                // Cancellation happens before Stats::upstream can observe
+                // the result, so account for the timed-out call here. This
+                // also keeps the legacy up_calls/up_micros totals complete.
+                self.stats
+                    .record_call(UpstreamOperation::ClosureGet, started, false);
+                self.stats.record_prefetch_duration(started);
+                self.upstream_failed(
+                    UpstreamOperation::ClosureGet,
+                    UpstreamFailureCode::Timeout,
+                    "prefetch: timed out",
+                );
+            }
+        }
+    }
+
+    async fn prefetch_inner(
+        &self,
+        up: &Upstream,
+        roots: Vec<Vec<u8>>,
+    ) -> Result<PrefetchOutcome, Status> {
         let t = Instant::now();
         let mut client = up.fleet.clone();
         let mut stream = match client.get_closure(fleet::ClosureRequest { roots }).await {
             Ok(r) => r.into_inner(),
             Err(e) if e.code() == tonic::Code::Unimplemented => {
                 up.closure.store(false, Relaxed);
-                return;
+                return Err(e);
             }
             // A busy or refusing store: skip this prefetch only; the objects
             // still come one by one.
@@ -649,37 +916,51 @@ impl Store {
                     tonic::Code::ResourceExhausted | tonic::Code::InvalidArgument
                 ) =>
             {
-                return;
+                return Err(e);
             }
-            Err(e) => {
-                self.upstream_failed(&format!("prefetch: {e}"));
-                return;
-            }
+            Err(e) => return Err(e),
         };
         self.stats.up_prefetch_calls.fetch_add(1, Relaxed);
-        while let Ok(Some(m)) = stream.message().await {
-            let Ok(obj) = cas::CasObject::decode(m.object.as_slice()) else {
-                self.stats.up_cas_verify_fail.fetch_add(1, Relaxed);
-                continue;
-            };
-            let data = blob_data(&obj).to_vec();
-            if object_id(&obj.references, &data) != m.id {
-                self.stats.up_cas_verify_fail.fetch_add(1, Relaxed);
-                continue;
+        let stream_error = loop {
+            match stream.message().await {
+                Ok(Some(m)) => {
+                    let Ok(obj) = cas::CasObject::decode(m.object.as_slice()) else {
+                        self.stats.up_cas_verify_fail.fetch_add(1, Relaxed);
+                        self.stats.record_failure(
+                            UpstreamOperation::ClosureGet,
+                            UpstreamFailureCode::Protocol,
+                        );
+                        continue;
+                    };
+                    let data = blob_data(&obj).to_vec();
+                    if object_id(&obj.references, &data) != m.id {
+                        self.stats.up_cas_verify_fail.fetch_add(1, Relaxed);
+                        self.stats.record_failure(
+                            UpstreamOperation::ClosureGet,
+                            UpstreamFailureCode::Protocol,
+                        );
+                        continue;
+                    }
+                    if self.cas_path(&m.id).exists() {
+                        continue;
+                    }
+                    let len = data.len() as u64;
+                    if self.put(obj.references, data).is_ok() {
+                        self.stats.up_prefetched.fetch_add(1, Relaxed);
+                        self.stats.up_prefetch_bytes.fetch_add(len, Relaxed);
+                    }
+                }
+                Ok(None) => break None,
+                // Match the old `while let Ok(Some(...))` behavior: stop a
+                // failed stream and keep the per-object fallback available.
+                Err(e) => break Some(classify_failure(&e)),
             }
-            if self.cas_path(&m.id).exists() {
-                continue;
-            }
-            let len = data.len() as u64;
-            if self.put(obj.references, data).is_ok() {
-                self.stats.up_prefetched.fetch_add(1, Relaxed);
-                self.stats.up_prefetch_bytes.fetch_add(len, Relaxed);
-            }
-        }
-        self.stats.record_call(t);
-        self.stats
-            .up_prefetch_micros
-            .fetch_add(t.elapsed().as_micros() as u64, Relaxed);
+        };
+        self.stats.record_prefetch_duration(t);
+        Ok(match stream_error {
+            Some(code) => PrefetchOutcome::StreamError(code),
+            None => PrefetchOutcome::Complete,
+        })
     }
 
     /// Count entries that name absent objects (the M3 publication rule,
@@ -833,15 +1114,19 @@ impl kv::key_value_db_server::KeyValueDb for KvSvc {
             Err(e) => return Err(Status::internal(e.to_string())),
         }
         s.stats.kv_get_miss.fetch_add(1, Relaxed);
-        let Some(up) = s.readable_upstream() else {
+        let Some(up) = s.readable_upstream(UpstreamOperation::KvGet) else {
             return Ok(kv_response(None));
         };
         let mut client = up.kv.clone();
         let fetch = client.get_value(kv::GetValueRequest { key: key.clone() });
-        let resp = match s.stats.upstream(fetch).await {
+        let resp = match s.stats.upstream(UpstreamOperation::KvGet, fetch).await {
             Ok(r) => r,
             Err(e) => {
-                s.upstream_failed(&format!("kv get: {e}"));
+                s.upstream_failed(
+                    UpstreamOperation::KvGet,
+                    classify_failure(&e),
+                    &format!("kv get: {e}"),
+                );
                 return Ok(kv_response(None));
             }
         };
@@ -916,8 +1201,8 @@ impl Store {
         // it keeps its own and this node keeps the one it computed; both came
         // from real compiles.)
         if let Some(up) = &s.upstream {
-            if s.upstream_backing_off() {
-                return Err(s.write_unavailable(None));
+            if s.upstream_backing_off(UpstreamOperation::KvPut) {
+                return Err(s.write_unavailable(UpstreamOperation::KvPut, None));
             }
             let fwd = kv::PutValueRequest {
                 key: req.key.clone(),
@@ -925,11 +1210,13 @@ impl Store {
             };
             let resp = s
                 .stats
-                .upstream(up.kv.clone().put_value(fwd))
+                .upstream(UpstreamOperation::KvPut, up.kv.clone().put_value(fwd))
                 .await
-                .map_err(|e| s.write_unavailable(Some(e)))?
+                .map_err(|e| s.write_unavailable(UpstreamOperation::KvPut, Some(e)))?
                 .into_inner();
             if resp.error.is_some() {
+                s.stats
+                    .record_failure(UpstreamOperation::KvPut, UpstreamFailureCode::Protocol);
                 return Ok(Response::new(resp));
             }
             s.stats.up_kv_push.fetch_add(1, Relaxed);
@@ -1362,4 +1649,117 @@ async fn main() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
     }
     eprintln!("{}", final_store.stats.line());
     Ok(std::process::ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn upstream_call_is_attributed_without_changing_legacy_totals() {
+        let stats = Stats::default();
+        let result = stats
+            .upstream(UpstreamOperation::KvGet, async { Ok::<_, Status>(7_u8) })
+            .await;
+        assert_eq!(result.unwrap(), 7);
+
+        let operation = stats.operation(UpstreamOperation::KvGet);
+        assert_eq!(operation.calls.load(Relaxed), 1);
+        assert_eq!(operation.errors.load(Relaxed), 0);
+        assert_eq!(stats.up_calls.load(Relaxed), 1);
+        assert_eq!(
+            stats.up_micros.load(Relaxed),
+            operation.micros.load(Relaxed)
+        );
+        assert!(operation.last_call_ms.load(Relaxed) > 0);
+        assert!(operation.last_success_ms.load(Relaxed) > 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_call_can_publish_an_external_timeout_receipt() {
+        let stats = Stats::default();
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_millis(1),
+            stats.upstream(
+                UpstreamOperation::ClosureGet,
+                std::future::pending::<Result<(), Status>>(),
+            ),
+        )
+        .await;
+        assert!(result.is_err(), "pending call must be cancelled by timeout");
+        assert_eq!(stats.up_calls.load(Relaxed), 0);
+
+        stats.record_call(UpstreamOperation::ClosureGet, started, false);
+        stats.record_prefetch_duration(started);
+        let operation = stats.operation(UpstreamOperation::ClosureGet);
+        assert_eq!(stats.up_calls.load(Relaxed), 1);
+        assert_eq!(operation.calls.load(Relaxed), 1);
+        assert_eq!(operation.last_success_ms.load(Relaxed), 0);
+        assert!(stats.up_prefetch_micros.load(Relaxed) > 0);
+    }
+
+    #[tokio::test]
+    async fn stream_error_is_not_counted_as_a_success() {
+        let stats = Stats::default();
+        let result = stats
+            .upstream_with_success(
+                UpstreamOperation::ClosureGet,
+                async {
+                    Ok::<_, Status>(PrefetchOutcome::StreamError(
+                        UpstreamFailureCode::Unavailable,
+                    ))
+                },
+                |out| matches!(out, PrefetchOutcome::Complete),
+            )
+            .await;
+        assert!(matches!(result, Ok(PrefetchOutcome::StreamError(_))));
+
+        let operation = stats.operation(UpstreamOperation::ClosureGet);
+        assert_eq!(operation.calls.load(Relaxed), 1);
+        assert_eq!(operation.last_success_ms.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn failures_and_backoff_skips_have_fixed_safe_attribution() {
+        let stats = Stats::default();
+        stats.record_failure(UpstreamOperation::CasGet, UpstreamFailureCode::Timeout);
+        stats.record_skip(UpstreamOperation::CasGet);
+
+        let operation = stats.operation(UpstreamOperation::CasGet);
+        assert_eq!(operation.errors.load(Relaxed), 1);
+        assert_eq!(operation.skipped.load(Relaxed), 1);
+        assert!(operation.last_failure_ms.load(Relaxed) > 0);
+        assert!(operation.last_skip_ms.load(Relaxed) > 0);
+        assert_eq!(operation.last_failure_code.load(Relaxed), 5);
+
+        let line = stats.line();
+        assert!(line.contains("\"cas_get\":{"));
+        assert!(line.contains("\"skipped\":1"));
+        assert!(line.contains("\"last_failure_code\":\"backoff\""));
+        assert!(!line.contains("timeout"));
+    }
+
+    #[test]
+    fn operation_json_is_fixed_shape_and_idle_snapshots_are_stable() {
+        let stats = Stats::default();
+        stats.record_call(
+            UpstreamOperation::CasPut,
+            Instant::now() - Duration::from_millis(1),
+            false,
+        );
+        stats.record_failure(UpstreamOperation::CasPut, UpstreamFailureCode::Protocol);
+
+        let first = stats.line();
+        let second = stats.line();
+        assert_eq!(first, second);
+        for operation in UpstreamOperation::all() {
+            assert!(first.contains(&format!("\"{}\":{{", operation.name())));
+        }
+        assert!(first.contains("\"last_failure_code\":\"protocol\""));
+        assert!(first.contains("\"up_calls\":1"));
+        assert!(first.contains("\"up_micros\":"));
+        assert!(!first.contains("fleet store"));
+    }
 }

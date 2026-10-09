@@ -68,10 +68,11 @@ jobs:
           git diff --no-renames --name-only HEAD^1 HEAD > "$RUNNER_TEMP/changed"
           while IFS= read -r path; do
             case "$path" in
-              tools/fleet-cas-prototype/*|scripts/fleet_cas_bundle.py|scripts/test-fleet-cas-bundle.py|.github/workflows/release.yml|.github/workflows/ci.yml|tools/fleet-cas-prototype/README.md) fleet_cas=true ;;
+              tools/fleet-cas-prototype/*) fleet_cas=true; rust=true ;;
+              scripts/fleet_cas_bundle.py|scripts/test-fleet-cas-bundle.py|.github/workflows/release.yml|tools/fleet-cas-prototype/README.md) fleet_cas=true ;;
               docs/MODULE_INVENTORY.md) rust=true ;;
               docs/*|*.md) ;;
-              .github/workflows/ci.yml) rust=true; go=true ;;
+              .github/workflows/ci.yml) fleet_cas=true; rust=true; go=true ;;
               tools/scaleset-bridge/*) go=true ;;
               scripts/bootstrap|scripts/workspace_bootstrap/*) rust=true ;;
               .github/*|.claude/*|skills/*) ;;
