@@ -124,10 +124,12 @@ fi
 [ -x "$hdiutil_bin" ] || { fail "hdiutil is unavailable: $hdiutil_bin" || exit 1; }
 mount_parent=${root%/*}
 [ "$mount_parent" = "$volumes_root" ] || { fail "store root must mount directly below $volumes_root: $root" || exit 1; }
-mkdir -p "$root" || { fail "cannot create mount point: $root" || exit 1; }
-[ -z "$(/bin/ls -A "$root" 2>/dev/null)" ] || {
-  fail "mount point is not empty: $root" || exit 1
-}
+if [ -e "$root" ]; then
+  [ -d "$root" ] || { fail "mount point is not a directory: $root" || exit 1; }
+  [ -z "$(/bin/ls -A "$root" 2>/dev/null)" ] || {
+    fail "mount point is not empty: $root" || exit 1
+  }
+fi
 
 attached=0
 for attempt in 1 2 3; do
