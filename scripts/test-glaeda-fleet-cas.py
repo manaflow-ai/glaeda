@@ -36,8 +36,10 @@ def mount_validation_body() -> str:
     """Extract the pure APFS/UUID validation from the sparsebundle helper."""
     text = MOUNT_HELPER.read_text(encoding="utf-8")
     start = text.index("info_value() {")
-    end = text.index("\nread_root_info()", start)
-    return text[start:end]
+    info_end = text.index("\n}\n\nimage_volume", start) + 2
+    validate = text.index("validate_root() {", start)
+    end = text.index("\n}\n\nread_root_info", validate) + 2
+    return text[start:info_end] + "\n" + text[validate:end]
 
 
 class UpstreamPreflightTest(unittest.TestCase):
@@ -176,9 +178,10 @@ class SparsebundleMountContractTest(unittest.TestCase):
 
     def test_helper_is_bounded_and_never_formats_or_partitions(self) -> None:
         text = MOUNT_HELPER.read_text(encoding="utf-8")
-        self.assertEqual(text.count('"$hdiutil_bin" attach'), 1)
+        self.assertEqual(text.count('run_hdiutil attach'), 1)
+        self.assertIn("HDIUTIL_TIMEOUT_SECONDS", text)
         self.assertIn("for attempt in 1 2 3", text)
-        self.assertIn('"$hdiutil_bin" detach "$root"', text)
+        self.assertIn("run_hdiutil detach", text)
         self.assertIn("sparsebundle symlinks are refused", text)
         self.assertNotIn("hdiutil create", text)
         self.assertNotIn("hdiutil partition", text)

@@ -13,19 +13,47 @@ expected_uuid=${3:?usage: fleet-cas-mount ROOT IMAGE EXPECTED_UUID}
 diskutil_bin=${DISKUTIL:-/usr/sbin/diskutil}
 hdiutil_bin=${HDIUTIL:-/usr/bin/hdiutil}
 sleep_bin=${SLEEP:-/bin/sleep}
+volumes_root=${FLEET_CAS_VOLUMES_ROOT:-/Volumes}
+hdiutil_timeout=${HDIUTIL_TIMEOUT_SECONDS:-30}
 
 fail() {
   echo "fleet-cas-mount: $*" >&2
   return 1
 }
 
+case "$hdiutil_timeout" in
+  ''|*[!0-9]*|0) fail "HDIUTIL_TIMEOUT_SECONDS must be a positive integer" || exit 1 ;;
+esac
+
+run_hdiutil() {
+  local pid elapsed=0
+  "$hdiutil_bin" "$@" >/dev/null 2>&1 &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$elapsed" -ge "$hdiutil_timeout" ]; then
+      kill "$pid" 2>/dev/null || true
+      "$sleep_bin" 1
+      kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      return 124
+    fi
+    "$sleep_bin" 1
+    elapsed=$((elapsed + 1))
+  done
+  wait "$pid"
+}
+
+case "$volumes_root" in
+  /*) ;;
+  *) fail "volumes root must be absolute: $volumes_root" || exit 1 ;;
+esac
 case "$root" in
-  /Volumes/*) [ "$root" != /Volumes ] || { fail "store root must name a volume below /Volumes" || exit 1; } ;;
-  *) fail "store root must be below /Volumes: $root" || exit 1 ;;
+  "$volumes_root"/*) ;;
+  *) fail "store root must be below $volumes_root: $root" || exit 1 ;;
 esac
 case "$image" in
-  /Volumes/*/*) ;;
-  *) fail "image must be below /Volumes: $image" || exit 1 ;;
+  "$volumes_root"/*/*) ;;
+  *) fail "image must be below $volumes_root: $image" || exit 1 ;;
 esac
 case "$image" in
   "$root"|"$root"/*) fail "image must not be inside the store volume: $image" || exit 1 ;;
@@ -33,22 +61,40 @@ esac
 [ -n "$expected_uuid" ] || { fail "expected APFS volume UUID is missing" || exit 1; }
 [ ! -L "$image" ] || { fail "sparsebundle symlinks are refused: $image" || exit 1; }
 [ -d "$image" ] || { fail "sparsebundle is missing: $image" || exit 1; }
-image_volume=${image%/*}
-image_info=$("$diskutil_bin" info "$image_volume" 2>/dev/null) || {
-  fail "image backing volume is not mounted: $image_volume" || exit 1
-}
-image_mount=$(printf '%s\n' "$image_info" | awk -F': *' '$1 == "Mount Point" {print $2; exit}')
-case "$image_mount" in
-  /Volumes/*) ;;
-  *) fail "image backing path is not a mounted /Volumes volume: $image_volume" || exit 1 ;;
-esac
-[ "$image_mount" = "$image_volume" ] || {
-  fail "image backing path is not a volume mount point: $image_volume" || exit 1
-}
 
 info_value() {
   local info=$1 key=$2
-  printf '%s\n' "$info" | awk -F': *' -v key="$key" '$1 == key {print $2; exit}'
+  # `diskutil info` prefixes fields with whitespace on macOS.
+  printf '%s\n' "$info" | awk -v key="$key" '
+    {
+      line = $0
+      sub(/^[[:space:]]+/, "", line)
+      colon = index(line, ":")
+      if (!colon) next
+      field = substr(line, 1, colon - 1)
+      value = substr(line, colon + 1)
+      sub(/[[:space:]]+$/, "", field)
+      sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+$/, "", value)
+      if (field == key) { print value; exit }
+    }'
+}
+
+image_volume=${image%/*}
+case "$image_volume" in
+  "$volumes_root"/*) ;;
+  *) fail "image backing volume must be below $volumes_root: $image_volume" || exit 1 ;;
+esac
+image_info=$("$diskutil_bin" info "$image_volume" 2>/dev/null) || {
+  fail "image backing volume is not mounted: $image_volume" || exit 1
+}
+image_mount=$(info_value "$image_info" 'Mount Point')
+case "$image_mount" in
+  "$volumes_root"/*) ;;
+  *) fail "image backing path is not a mounted $volumes_root volume: $image_volume" || exit 1 ;;
+esac
+[ "$image_mount" = "$image_volume" ] || {
+  fail "image backing path is not a volume mount point: $image_volume" || exit 1
 }
 
 validate_root() {
@@ -77,7 +123,7 @@ fi
 
 [ -x "$hdiutil_bin" ] || { fail "hdiutil is unavailable: $hdiutil_bin" || exit 1; }
 mount_parent=${root%/*}
-[ "$mount_parent" = /Volumes ] || { fail "store root must mount directly below /Volumes: $root" || exit 1; }
+[ "$mount_parent" = "$volumes_root" ] || { fail "store root must mount directly below $volumes_root: $root" || exit 1; }
 mkdir -p "$root" || { fail "cannot create mount point: $root" || exit 1; }
 [ -z "$(/bin/ls -A "$root" 2>/dev/null)" ] || {
   fail "mount point is not empty: $root" || exit 1
@@ -85,7 +131,7 @@ mkdir -p "$root" || { fail "cannot create mount point: $root" || exit 1; }
 
 attached=0
 for attempt in 1 2 3; do
-  if "$hdiutil_bin" attach -quiet -nobrowse -mountpoint "$root" "$image" >/dev/null 2>&1; then
+  if run_hdiutil attach -quiet -nobrowse -mountpoint "$root" "$image"; then
     attached=1
     if root_info=$(read_root_info) && validate_root "$root_info"; then
       exit 0
@@ -96,6 +142,6 @@ for attempt in 1 2 3; do
 done
 
 if [ "$attached" -eq 1 ]; then
-  "$hdiutil_bin" detach "$root" >/dev/null 2>&1 || true
+  run_hdiutil detach "$root" || true
 fi
 fail "could not attach and validate $image at $root after 3 attempts" || exit 1

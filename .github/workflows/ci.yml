@@ -267,7 +267,9 @@ jobs:
           bash -n scripts/disk-pressure.sh
           bash -n scripts/glaeda-fleet-cas
           bash -n tools/fleet-cas-prototype/scripts/fleet-cas-run
+          bash -n tools/fleet-cas-prototype/scripts/fleet-cas-mount
           bash -n scripts/test-glaeda-fleet-cas.sh
+          bash -n scripts/test-glaeda-fleet-cas-mount.sh
           bash -n scripts/cmux_mini_probe.sh
           bash -n scripts/cmux_mini_preflight.sh
           bash -n scripts/cmux_mini_fix.sh
@@ -285,6 +287,7 @@ jobs:
           python3 scripts/test-glaeda-fleet-cas-prune.py
           python3 scripts/test-glaeda-fleet-cas.py
           bash scripts/test-glaeda-fleet-cas.sh
+          bash scripts/test-glaeda-fleet-cas-mount.sh
           python3 scripts/test-glaeda-seed-prefetch.py
           python3 scripts/test-glaeda-idle-warm.py
           python3 scripts/test-glaeda-mini-health.py
