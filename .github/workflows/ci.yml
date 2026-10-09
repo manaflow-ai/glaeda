@@ -36,6 +36,7 @@ jobs:
     outputs:
       rust: ${{ steps.scope.outputs.rust }}
       go: ${{ steps.scope.outputs.go }}
+      fleet_cas: ${{ steps.scope.outputs.fleet_cas }}
 
     steps:
       - name: Check out repository
@@ -52,11 +53,12 @@ jobs:
           EVENT: ${{ github.event_name }}
         run: |
           if test "$EVENT" != pull_request; then
-            printf 'rust=true\ngo=true\n' >> "$GITHUB_OUTPUT"
+            printf 'rust=true\ngo=true\nfleet_cas=false\n' >> "$GITHUB_OUTPUT"
             exit 0
           fi
           rust=false
           go=false
+          fleet_cas=false
           # Scripts that Rust tests run: the modules they load are Rust input too (fleet_bundle.py through
           # scripts/test-fleet-bundle.py, for one).
           rust_named=$(grep -rhoE 'scripts/[A-Za-z0-9_./-]+' src tests | sort -u | while read -r f; do
@@ -66,6 +68,7 @@ jobs:
           git diff --no-renames --name-only HEAD^1 HEAD > "$RUNNER_TEMP/changed"
           while IFS= read -r path; do
             case "$path" in
+              tools/fleet-cas-prototype/*|scripts/fleet_cas_bundle.py|scripts/test-fleet-cas-bundle.py|.github/workflows/release.yml|.github/workflows/ci.yml|tools/fleet-cas-prototype/README.md) fleet_cas=true ;;
               docs/MODULE_INVENTORY.md) rust=true ;;
               docs/*|*.md) ;;
               .github/workflows/ci.yml) rust=true; go=true ;;
@@ -83,7 +86,7 @@ jobs:
               *) rust=true ;;
             esac
           done < "$RUNNER_TEMP/changed"
-          printf 'rust=%s\ngo=%s\n' "$rust" "$go" | tee -a "$GITHUB_OUTPUT"
+          printf 'rust=%s\ngo=%s\nfleet_cas=%s\n' "$rust" "$go" "$fleet_cas" | tee -a "$GITHUB_OUTPUT"
 
   go:
     needs: changes
@@ -221,6 +224,8 @@ jobs:
               Path("scripts/glaeda-fleet-cas-prune"),
               Path("scripts/test-glaeda-fleet-cas-prune.py"),
               Path("scripts/test-glaeda-fleet-cas.py"),
+              Path("scripts/fleet_cas_bundle.py"),
+              Path("scripts/test-fleet-cas-bundle.py"),
               Path("scripts/glaeda-seed-prefetch"),
               Path("scripts/test-glaeda-seed-prefetch.py"),
               Path("scripts/glaeda-idle-warm"),
@@ -286,6 +291,7 @@ jobs:
           python3 scripts/test-glaeda-update.py
           python3 scripts/test-glaeda-fleet-cas-prune.py
           python3 scripts/test-glaeda-fleet-cas.py
+          python3 scripts/test-fleet-cas-bundle.py
           bash scripts/test-glaeda-fleet-cas.sh
           bash scripts/test-glaeda-fleet-cas-mount.sh
           python3 scripts/test-glaeda-seed-prefetch.py
@@ -682,13 +688,49 @@ jobs:
             ~/.cargo/git/db
             target
           key: verify-cargo-cli-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ hashFiles('Cargo.lock') }}
+  fleet-cas-build:
+    name: fleet-cas-build (${{ matrix.target }})
+    needs: changes
+    if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.fleet_cas == 'true' }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+          show-progress: false
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.97.1 --profile minimal --no-self-update
+      - name: Build and verify fleet-CAS candidate
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/fleet-cas"
+          python3 scripts/fleet_cas_bundle.py build \
+            --source "$GITHUB_SHA" --target "$TARGET" \
+            --output "$RUNNER_TEMP/fleet-cas"
+          archive=$(find "$RUNNER_TEMP/fleet-cas" -type f -name '*.tar.gz' -print -quit)
+          test -n "$archive"
+          sha256=$(shasum -a 256 "$archive" | awk '{print $1}')
+          python3 scripts/fleet_cas_bundle.py verify "$archive" \
+            --source "$GITHUB_SHA" --target "$TARGET" --sha256 "$sha256"
 
   # One exact-head check that stands for the whole workflow. Keep this name stable so merge tooling can
   # require the aggregate without enumerating every conditional job above.
   ci-status:
     name: ci-status
     if: ${{ always() && (github.event_name == 'pull_request' || github.repository == 'teamleaderleo/glaeda') }}
-    needs: [changes, go, scripts, runner-tests, lint, test, cli]
+    needs: [changes, go, scripts, runner-tests, lint, test, cli, fleet-cas-build]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
