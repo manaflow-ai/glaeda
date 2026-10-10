@@ -2,14 +2,15 @@ name: Verify
 
 on:
   pull_request:
-    paths-ignore:
-      - "docs/**"
-      - "**/*.md"
   push:
     branches: [main]
     paths-ignore:
       - "docs/**"
       - "**/*.md"
+
+# Keep pull requests active for documentation-only changes so the required
+# `ci-status` check is reported. Main pushes retain the path filter because
+# synchronization already verifies the changed executable surfaces.
 
 permissions:
   contents: read

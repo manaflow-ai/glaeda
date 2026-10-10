@@ -186,12 +186,19 @@ Release hash and `credential_rejected` are reported through agent receipts and
 `cmux_mini_probe.sh`, not controller heartbeats: a heartbeat rejected with `401` cannot carry
 them, and an old controller drops unknown fields.
 
-### 6. The coordinator is excluded
+### 6. The coordinator is excluded from worker enrollment
 
-cmux-lawrence is in `never_touch`. The agent is not installed there and refuses it by name (as
-`glaeda-fleet-cas-rollout` already does) and also by address, which that script does not check. Controller changes install only after its
-owner approves a specific hash. Until then the capability rules keep new workers useful against
-the old controller.
+cmux-lawrence remains in `never_touch` for Glaeda host enrollment, runner enrollment, and worker
+deployment. The agent is not installed there, and controller changes install only after its owner
+approves a specific hash. The fleet-CAS rollout has a separate, explicit coordinator-store path:
+an operator may pass `--allow-coordinator` only for the store role, with an owner-writable APFS
+`--store-root` mounted when `--apply` runs. For a sparsebundle store, its backing volume must
+already be mounted and the exact pre-existing `--store-image` must be supplied. The boot-volume
+wrapper then reattaches only that image after reboot and fails closed on a missing or mismatched
+image, mount point, or volume UUID. That path installs only the read-only-capable store service;
+it refuses a coordinator writer or reader node. This keeps the controller's worker safety
+boundary while allowing the approved Lawrence compiler-CAS placement described in
+`CMUX_BUILD_SLOT_MODES.md`.
 
 ### 7. Security
 
