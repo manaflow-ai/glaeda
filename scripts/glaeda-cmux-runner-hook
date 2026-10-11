@@ -4217,6 +4217,90 @@ def cleanup_leaked_test_apps(ignored_workers: set[int] | None = None) -> list[st
     return killed
 
 
+# A test can start a process that detaches from the job: cmux-tui's headless daemon calls setsid and is
+# reparented to launchd, and its terminal hosts stay its children. When the test process is killed before its
+# teardown (the hang watchdog, a step timeout, a cancel), nothing ends them. On 2026-10-11 the minis held ~60
+# such daemons from cmux-next's CmuxNext tests, 1-2 days old, each running
+# <runner>/_work/cmux/cmux/cmux-tui/target/hosted/tree/<sha>/cmux-tui. At job-completed this runner's job has
+# ended and no other job uses its _work, so a process whose command runs from there, and its descendants, are
+# leftovers. Another runner's _work is never touched: that runner may be mid-job.
+LEFTOVER_TERM_S = 3.0
+
+
+def job_work_dir() -> str | None:
+    """This runner's _work directory, from the job's RUNNER_TEMP (<runner>/_work/_temp)."""
+    temp = os.environ.get("RUNNER_TEMP", "").rstrip("/")
+    work = os.path.dirname(temp)
+    if not temp or os.path.basename(work) != "_work" or "/actions-runner" not in work:
+        return None
+    return work
+
+
+def work_leftover_pids(table: dict[int, tuple[int, str]], work: str, protected: set[int]) -> list[tuple[int, str]]:
+    """Processes whose command runs from `work`, and their descendants, minus `protected` (the hook and its
+    ancestors). Roots come before their descendants."""
+    prefix = work.rstrip("/") + "/"
+    roots = [pid for pid, (_ppid, cmd) in table.items()
+             if pid not in protected and cmd.lstrip("'\"").startswith(prefix)]
+    found: list[tuple[int, str]] = []
+    seen: set[int] = set()
+    for root in sorted(roots):
+        for pid in [root, *descendants(root, table)]:
+            if pid in seen or pid in protected:
+                continue
+            seen.add(pid)
+            found.append((pid, table[pid][1]))
+    return found
+
+
+def protected_pids(table: dict[int, tuple[int, str]]) -> set[int]:
+    """This hook and every ancestor up to launchd."""
+    keep: set[int] = set()
+    pid = os.getpid()
+    for _ in range(256):
+        if pid <= 1 or pid in keep:
+            break
+        keep.add(pid)
+        pid = table.get(pid, (1, ""))[0]
+    return keep
+
+
+def cleanup_job_leftovers(work: str | None = None) -> list[str]:
+    """job-completed: end processes left running from this runner's _work. Each pid is signalled only while
+    its command is unchanged, so a reused pid is never hit."""
+    work = work or job_work_dir()
+    if not work:
+        return []
+    try:
+        table = processes()
+    except (OSError, subprocess.SubprocessError):
+        return []
+    found = work_leftover_pids(table, work, protected_pids(table))
+    if not found:
+        return []
+    signalled: list[tuple[int, str]] = []
+    for pid, command in found:
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGTERM)
+            signalled.append((pid, command))
+    deadline = time.monotonic() + LEFTOVER_TERM_S
+    while any(pid_alive(pid) for pid, _ in signalled) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    try:
+        current = processes()
+    except (OSError, subprocess.SubprocessError):
+        current = {}
+    for pid, command in signalled:
+        if pid_alive(pid) and current.get(pid, (0, None))[1] == command:
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+    ended = [pid for pid, _ in signalled if not pid_alive(pid)]
+    if not ended:
+        return []
+    sample = "; ".join(cmd[:120] for pid, cmd in signalled if pid in ended)[:600]
+    return [f"ended {len(ended)} leftover process(es) from {work}: {sample}"]
+
+
 def find_disk(explicit: str | None) -> str | None:
     if explicit:
         return explicit if os.path.isfile(explicit) else None
@@ -4540,6 +4624,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.phase == "job-completed":
         current_worker = runner_worker_pid()
         for note in cleanup_leaked_test_apps({current_worker} if current_worker else set()):
+            print(f"{PREFIX}: {note}", flush=True)
+        for note in cleanup_job_leftovers():
             print(f"{PREFIX}: {note}", flush=True)
         worker = args.watch_pid or current_worker
         if worker:

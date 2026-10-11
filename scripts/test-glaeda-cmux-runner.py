@@ -2859,6 +2859,59 @@ class LeakedAppTest(unittest.TestCase):
         self.assertEqual(hook.leaked_test_app_pids(table), [])
 
 
+class JobLeftoverTest(unittest.TestCase):
+    WORK = "/Users/cmux/actions-runner-glaeda-3/_work"
+
+    def test_detached_daemon_and_its_hosts_from_this_runner_are_leftovers(self) -> None:
+        daemon = self.WORK + "/cmux/cmux/cmux-tui/target/hosted/tree/abc/cmux-tui --headless --session cnd-bd-1"
+        table = {
+            10: (1, daemon),
+            11: (10, "cmux-tui __terminal-host --bootstrap-stdio"),
+            12: (11, "/bin/zsh"),
+            20: (1, "/Users/cmux/actions-runner-glaeda-2/_work/cmux/cmux/cmux-tui/target/x/cmux-tui --headless"),
+            30: (1, "/Users/cmux/Applications/cmux.app/Contents/Resources/bin/cmux-tui --headless --session cmux-app"),
+            31: (30, "cmux-tui __terminal-host --bootstrap-stdio"),
+            40: (1, "'" + self.WORK + "/_temp/cmux-e2e-products-1/Build/Products/Debug/cmux DEV.app/Contents/MacOS/cmux DEV'"),
+        }
+        self.assertEqual([pid for pid, _ in hook.work_leftover_pids(table, self.WORK, set())], [10, 11, 12, 40])
+
+    def test_hook_and_its_ancestors_are_never_leftovers(self) -> None:
+        table = {
+            50: (1, "/Users/cmux/actions-runner-glaeda-3/bin/Runner.Worker spawnclient 1 2"),
+            51: (50, "/bin/bash " + self.WORK + "/_temp/hook.sh"),
+            52: (51, self.WORK + "/cmux/cmux/scripts/something"),
+        }
+        self.assertEqual(hook.work_leftover_pids(table, self.WORK, {50, 51, 52}), [])
+
+    def test_cleanup_ends_a_detached_process_running_from_work(self) -> None:
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        work = tmp / "actions-runner-t" / "_work"
+        # Detached like a leaked daemon (reparented to launchd, never this test's child), with its command
+        # naming a binary under _work. A copied /bin/sleep would not run, so argv0 carries the path.
+        out = subprocess.run(["/bin/bash", "-c", f"(exec -a '{work}/bin/daemon' /bin/sleep 60) >/dev/null 2>&1 & echo $!"],
+                             capture_output=True, text=True, check=True).stdout
+        pid = int(out.strip())
+        deadline = time.monotonic() + 5
+        while str(work) not in hook.processes().get(pid, (0, ""))[1] and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+        def kill_if_left() -> None:
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+        self.addCleanup(kill_if_left)
+        notes = hook.cleanup_job_leftovers(str(work))
+        self.assertFalse(hook.pid_alive(pid))
+        self.assertTrue(notes and "ended 1 leftover" in notes[0], notes)
+
+    def test_work_dir_comes_from_runner_temp_only(self) -> None:
+        with mock.patch.dict(os.environ, {"RUNNER_TEMP": self.WORK + "/_temp"}):
+            self.assertEqual(hook.job_work_dir(), self.WORK)
+        for temp in ("", "/tmp", "/Users/cmux/_work/_temp", self.WORK + "/_temp/x"):
+            with mock.patch.dict(os.environ, {"RUNNER_TEMP": temp}):
+                self.assertIsNone(hook.job_work_dir(), temp)
+
+
 class GateTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp())
