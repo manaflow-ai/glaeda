@@ -397,12 +397,20 @@ runner is named `<member>-glaeda` unless `--name` says otherwise:
 | `availability`: `dedicated` or `opportunistic` | `glaeda-<availability>` |
 | each `defaults.xcode.apps` entry (with host `overrides`) that is really installed | `xcode-<version>` |
 | the same, only for `dedicated` members | `glaeda-<class>-xcode-<version>` |
+| the host's macOS major version (`sw_vers -productVersion`, 27.0.1 is 27) | `glaeda-macos-<major>` |
 
 "Really installed" means the path is a real directory, not a symlink, and
 `xcodebuild -version` under it prints exactly that `Build version`. The combined
 `glaeda-<class>-xcode-<version>` label (for example `glaeda-std-xcode-26.6`) is the
 one a pool picker routes a whole run to. Opportunistic members never carry it, so
 they never receive a required job.
+
+`glaeda-macos-<major>` is observed on the mini, not declared, so a fleet that straddles an
+OS upgrade can route a job to one macOS (`runs-on: [glaeda-std-xcode-26.6, glaeda-macos-27]`).
+It is never the bare `macos-<N>`: that is GitHub-hosted vocabulary, and cmux's workflows check
+that a `macos-*` request landed on GitHub-hosted capacity. If `sw_vers` gives no usable answer,
+the runner keeps the OS label it registered with. An upgrade changes the label: re-register
+the runner with a `--manifest` apply, or `fleet runner relabel HOST --apply` from the operator Mac.
 
 The installer refuses a member whose roles lack `ci-runner`, and refuses class `dev`
 (takes no jobs) and `borrowed` (jobs only inside a VM, not through this tool).

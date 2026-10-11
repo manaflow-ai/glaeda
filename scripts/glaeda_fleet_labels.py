@@ -19,6 +19,11 @@ MINI_LABEL = "glaeda-mini"
 # declared, the member carries no label.
 IOS_SIM_LABEL = "glaeda-ios-sim"
 IOS_SIM_ROLE = "ios-simulators"
+# The macOS major version the runner's host really runs (sw_vers on the mini), so a job can ask for one OS when a
+# fleet straddles an upgrade: glaeda-macos-27. Never the bare macos-<N>, which is GitHub-hosted runner vocabulary
+# that cmux's workflows treat as "must be GitHub-hosted". The caller observes the version; without one, no label.
+MACOS_LABEL_PREFIX = "glaeda-macos-"
+MACOS_MAJOR_RE = r"[1-9][0-9]*"
 # dev machines take no jobs; borrowed machines run jobs only inside a VM, never as a host runner.
 RUNNER_CLASSES = ("xl", "std", "light")
 MEMBER_CLASSES = RUNNER_CLASSES + ("dev", "borrowed")
@@ -58,6 +63,11 @@ def merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
 def pool_label(klass: str, version: str, trusted: bool = False, pool_prefix: str = "") -> str:
     """The single label a pool picker routes a whole run to: class plus verified Xcode, dedicated only."""
     return f"glaeda-{pool_prefix}{'trusted-' if trusted else ''}{klass}-xcode-{version}"
+
+
+def macos_label(major: str) -> str:
+    """The OS label for a macOS major version: glaeda-macos-27."""
+    return f"{MACOS_LABEL_PREFIX}{major}"
 
 
 def root_label(pool: str) -> str:
@@ -107,9 +117,11 @@ def xcode_apps(manifest: dict[str, Any], member: str) -> list[dict[str, Any]] | 
 
 
 def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]], bool],
-                  ios_sim_ok: Callable[[list[dict[str, Any]], list[str]], bool] | None = None
-                  ) -> tuple[dict[str, Any] | None, str | None]:
-    """(member summary with labels, None) or (None, why this member cannot be a runner)."""
+                  ios_sim_ok: Callable[[list[dict[str, Any]], list[str]], bool] | None = None,
+                  macos_major: str | None = None) -> tuple[dict[str, Any] | None, str | None]:
+    """(member summary with labels, None) or (None, why this member cannot be a runner).
+    macos_major: the observed macOS major version of the host ("27"); it adds glaeda-macos-<major>. None (the
+    declared view, or a host that could not tell) adds no OS label."""
     if not isinstance(manifest, dict) or not isinstance(manifest.get("hosts"), dict):
         return None, "manifest has no hosts table"
     host = manifest["hosts"].get(member)
@@ -158,7 +170,9 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
                and (ios_sim_ok is None or ios_sim_ok(ready, builds)))
     labels = [MINI_LABEL, f"glaeda-class-{klass}", f"glaeda-{availability}",
               *(["glaeda-trusted"] if trusted_ref else []), *[f"xcode-{v}" for v in versions], *pools,
-              *([IOS_SIM_LABEL] if ios_sim else [])]
+              *([IOS_SIM_LABEL] if ios_sim else []),
+              *([macos_label(macos_major)] if isinstance(macos_major, str)
+                and re.fullmatch(MACOS_MAJOR_RE, macos_major) else [])]
     disk = merged.get("disk")
     floor = disk.get("min_free_gib") if isinstance(disk, dict) else None
     runners, units = CLASS_CAPACITY[klass]

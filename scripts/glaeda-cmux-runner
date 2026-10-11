@@ -358,6 +358,13 @@ def ios_sim_present(apps: list[dict[str, Any]], builds: list[str]) -> bool | Non
     return all(b in have for b in builds)
 
 
+def macos_major() -> str | None:
+    """This host's macOS major version from sw_vers (27.0.1 -> "27"); None when sw_vers gives no usable answer."""
+    code, out = run(["/usr/bin/sw_vers", "-productVersion"])
+    found = re.fullmatch(r"([1-9][0-9]*)(\.[0-9]+)*", out.strip()) if code == 0 else None
+    return found.group(1) if found else None
+
+
 def fleet_labels() -> Any:
     """The shared label rule, loaded from beside this script only when --manifest asks for it."""
     path = SCRIPT_DIR / LABELS_MODULE
@@ -371,8 +378,8 @@ def fleet_labels() -> Any:
 def member_labels(manifest: Any, member: str, prior_labels: list[str] | None = None
                   ) -> tuple[dict[str, Any] | None, str | None]:
     """(member summary with labels, None) or (None, why this member cannot be a runner). Reads only.
-    prior_labels: what this runner registered with, so a simctl hiccup keeps the iOS label instead of
-    re-registering the runner without it."""
+    prior_labels: what this runner registered with, so a simctl or sw_vers hiccup keeps the iOS or macOS label
+    instead of re-registering the runner without it."""
     try:
         rule = fleet_labels()
     except Exception as error:  # noqa: BLE001  (missing, broken or stale module: explain, never a traceback)
@@ -380,7 +387,13 @@ def member_labels(manifest: Any, member: str, prior_labels: list[str] | None = N
     def ios_sim_ok(apps: list[dict[str, Any]], builds: list[str]) -> bool:
         found = ios_sim_present(apps, builds)
         return found if found is not None else getattr(rule, "IOS_SIM_LABEL", "glaeda-ios-sim") in (prior_labels or [])
-    return rule.member_labels(manifest, member, lambda app: xcode_present(app), ios_sim_ok)
+    if not hasattr(rule, "macos_label"):  # an older label module beside this script: no OS label, no traceback
+        return rule.member_labels(manifest, member, lambda app: xcode_present(app), ios_sim_ok)
+    major = macos_major()
+    if major is None:
+        prefix = rule.MACOS_LABEL_PREFIX
+        major = next((label[len(prefix):] for label in prior_labels or [] if label.startswith(prefix)), None)
+    return rule.member_labels(manifest, member, lambda app: xcode_present(app), ios_sim_ok, macos_major=major)
 
 
 def load_receipt(ctx: Context) -> dict[str, Any] | None:

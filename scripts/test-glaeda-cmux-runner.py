@@ -52,6 +52,9 @@ def load(name: str, path: Path):
 cr = load("glaeda_cmux_runner", ROOT / "scripts" / "glaeda-cmux-runner")
 cr.DARWIN_REQUIRED = False
 cr.ONLINE_WAIT_S = 0
+# The test machine's own macOS never leaks into label assertions; tests that want an OS label patch it.
+REAL_MACOS_MAJOR = cr.macos_major
+cr.macos_major = lambda: None
 # The pressure gate reads this machine's real iostat/sysctl values. Pin CPU pressure out of reach here and in the
 # hooks the tests start; pressure tests patch the thresholds and samples themselves.
 os.environ["GLAEDA_RUNNER_GATE_LOAD_PAUSE"] = os.environ["GLAEDA_RUNNER_GATE_LOAD_RESUME"] = "1000000"
@@ -4784,7 +4787,8 @@ class RunnerTest(unittest.TestCase):
         path = self.state / "gui.json"
         path.write_text(json.dumps(manifest))
         with mock.patch.object(cr, "xcode_present", return_value=True), \
-                mock.patch.object(cr, "ios_sim_present", return_value=True):
+                mock.patch.object(cr, "ios_sim_present", return_value=True), \
+                mock.patch.object(cr, "macos_major", return_value="27"):
             for instance in ("0", "2", "4"):
                 self.invoke("--apply", "--manifest", os.fspath(path), "--member", "mini-std", "--instance", instance)
         labels = [argv[argv.index("--labels") + 1].split(",") for argv in self.config_argvs()]
@@ -4796,6 +4800,7 @@ class RunnerTest(unittest.TestCase):
                          "the gui runner carries neither the pool label nor a root or side one")
         self.assertIn("glaeda-ios-sim", labels[0])
         self.assertNotIn("glaeda-ios-sim", labels[2], "no iOS job ever takes the gui runner")
+        self.assertEqual([l.count("glaeda-macos-27") for l in labels], [1, 1, 1], "every runner, gui included, names its OS")
         self.assertFalse([x for x in labels[2] if x.startswith("glaeda-runner-")])
         started = (self.home / "actions-runner-glaeda-4/glaeda-hooks/job-started.sh").read_text()
         self.assertIn("--canonical-roots 2 --instance 4 --gui-runner --gui-token gui\n", started)
@@ -5585,6 +5590,27 @@ class FleetLabelsModuleTest(unittest.TestCase):
         conforming = fleet_labels.declared_pools(MANIFEST, lambda member, app: member != "mini-std")
         self.assertEqual(conforming, {"glaeda-std-xcode-26.3": ["override"]})
         self.assertEqual(fleet_labels.declared_pools({"hosts": []}), {})
+
+    def test_macos_label_comes_from_the_observed_major_version(self) -> None:
+        self.assertEqual(fleet_labels.macos_label("27"), "glaeda-macos-27")
+        summary, _ = fleet_labels.member_labels(MANIFEST, "mini-std", lambda app: True, macos_major="27")
+        self.assertIn("glaeda-macos-27", summary["labels"])
+        self.assertNotIn("glaeda-macos-27", summary["pools"], "the OS label is never a pool label")
+        for major in (None, "", "27.0", "macos-27", "0"):
+            summary, _ = fleet_labels.member_labels(MANIFEST, "mini-std", lambda app: True, macos_major=major)
+            self.assertFalse([x for x in summary["labels"] if "macos" in x], major)
+
+    def test_runner_reads_sw_vers_and_keeps_its_prior_label_when_sw_vers_fails(self) -> None:
+        for out, want in (((0, "27.0.1"), "27"), ((0, "26.5"), "26"), ((0, "15"), "15"),
+                          ((1, ""), None), ((127, ""), None), ((0, "garbage"), None)):
+            with self.subTest(out), mock.patch.object(cr, "run", return_value=out):
+                self.assertEqual(REAL_MACOS_MAJOR(), want)
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            with mock.patch.object(cr, "macos_major", return_value="27"):
+                self.assertIn("glaeda-macos-27", cr.member_labels(MANIFEST, "mini-std", ["glaeda-macos-26"])[0]["labels"])
+            labels = cr.member_labels(MANIFEST, "mini-std", ["glaeda-mini", "glaeda-macos-26"])[0]["labels"]
+            self.assertIn("glaeda-macos-26", labels, "a sw_vers hiccup keeps the registered OS label")
+            self.assertFalse([x for x in cr.member_labels(MANIFEST, "mini-std")[0]["labels"] if "macos" in x])
 
     def test_runner_without_the_module_explains(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(cr, "SCRIPT_DIR", Path(tmp)):
