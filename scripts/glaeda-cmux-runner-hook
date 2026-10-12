@@ -1291,6 +1291,43 @@ DIAGNOSTICS_QUEUES = (Path("/var/db/PanicReporter"), Path("/var/db/DiagnosticsRe
 DIAGNOSTIC_REPORTS = Path("/Library/Logs/DiagnosticReports")
 
 
+# An earlier job's sparse checkout (actions/checkout `sparse-checkout: scripts/ci`) leaves the reused workspace
+# sparse. The next full checkout runs `sparse-checkout disable`, which writes the whole tree back, then
+# `checkout --force`, which on cmuxs-mac-mini-6-glaeda-2 refused the files it had just written ("not
+# uptodate; will not remove from working tree") and left the job without its scripts (manaflow-ai/cmux runs
+# 38301254053 and 38308823659, 2026-10-12). Before the checkout, such a workspace keeps only its object store:
+# the index, the sparse settings and every working file go, so checkout's `reset --hard` writes the tree whole
+# with a fresh index. A workspace that is not sparse is never touched.
+SPARSE_SETTINGS = ("core.sparseCheckout", "core.sparseCheckoutCone", "index.sparse", "extensions.worktreeConfig")
+
+
+def unsparse_workspace(workspace: str | None) -> str:
+    if not workspace:
+        return ""
+    ws = Path(workspace)
+    git_dir = ws / ".git"
+    if "_work" not in ws.parts or git_dir.is_symlink() or not git_dir.is_dir():
+        return ""
+    sparse = subprocess.run(["git", "-C", os.fspath(ws), "config", "--bool", "--default", "false",
+                             "core.sparseCheckout"], capture_output=True, text=True, timeout=30, check=False)
+    if sparse.stdout.strip() != "true":
+        return ""
+    for child in ws.iterdir():
+        if child.name == ".git":
+            continue
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+    for setting in SPARSE_SETTINGS:
+        subprocess.run(["git", "-C", os.fspath(ws), "config", "--local", "--unset-all", setting],
+                       capture_output=True, timeout=30, check=False)
+    for leftover in (git_dir / "index", git_dir / "info" / "sparse-checkout", git_dir / "config.worktree"):
+        with contextlib.suppress(FileNotFoundError):
+            leftover.unlink()
+    return f"reset the sparse workspace {ws} an earlier job left (checkout rebuilds it whole)"
+
+
 def dequeue_diagnostics_reporter(queues: tuple[Path, ...] = DIAGNOSTICS_QUEUES,
                                  reports: Path = DIAGNOSTIC_REPORTS, uid: int | None = None) -> str:
     """Empty Diagnostics Reporter's queues, then close it, so no crash or panic dialog is left over a job's GUI.
@@ -4621,6 +4658,11 @@ def main(argv: list[str] | None = None) -> int:
                 return refused(testmanagerd)
             note += f"; {testmanagerd}"
         print(f"{PREFIX}: admitted: {reason}; {note}", flush=True)
+        unsparsed = ""
+        with contextlib.suppress(Exception):  # must not fail an admitted job
+            unsparsed = unsparse_workspace(os.environ.get("GITHUB_WORKSPACE"))
+        if unsparsed:
+            print(f"{PREFIX}: {unsparsed}", flush=True)
         if sys.platform == "darwin":
             dialogs = ""
             with contextlib.suppress(Exception):  # must not fail an admitted job

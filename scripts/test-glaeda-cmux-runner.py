@@ -279,6 +279,53 @@ class HookTest(unittest.TestCase):
                 self.assertEqual(result.returncode == 0, admitted, result.stdout + result.stderr)
                 self.assertIn("admitted" if admitted else "refused", result.stdout)
 
+    def test_a_sparse_workspace_is_reset_before_the_checkout(self) -> None:
+        """An earlier job's sparse checkout (sparse-checkout: scripts/ci) left the reused workspace sparse;
+        actions/checkout's `sparse-checkout disable` then `checkout --force` failed with "not uptodate; will
+        not remove from working tree" twice on cmuxs-mac-mini-6-glaeda-2 (manaflow-ai/cmux runs 38301254053,
+        38308823659). job-started resets such a workspace to its object store, so checkout rebuilds it whole.
+        A workspace that is not sparse is left alone."""
+        git_env = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GIT_AUTHOR_NAME": "t",
+                   "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"}
+
+        def git(ws: Path, *args: str) -> str:
+            return subprocess.run(["git", "-C", os.fspath(ws), *args], env=git_env, capture_output=True,
+                                  text=True, check=True).stdout.strip()
+
+        def workspace(name: str) -> Path:
+            ws = self.dir / name / "_work" / "cmux" / "cmux"
+            (ws / "scripts" / "ci").mkdir(parents=True)
+            (ws / "Packages").mkdir()
+            (ws / "scripts" / "ci" / "a.sh").write_text("a\n")
+            (ws / "Packages" / "B.swift").write_text("b\n")
+            git(ws, "init", "-q")
+            git(ws, "add", "-A")
+            git(ws, "commit", "-qm", "one")
+            return ws
+
+        path = event(self.dir, "push", {"repository": CMUX})
+        sparse = workspace("actions-runner-glaeda-2")
+        git(sparse, "sparse-checkout", "set", "scripts/ci")
+        self.assertFalse((sparse / "Packages" / "B.swift").exists())
+        (sparse / "scripts" / "ci" / "leftover.log").write_text("x\n")
+        result = self.run_hook("job-started", "push", path, "--allowed-repo", "manaflow-ai/cmux", "--no-disk",
+                               repo="manaflow-ai/cmux", env={"GITHUB_WORKSPACE": os.fspath(sparse)})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("sparse", result.stdout)
+        self.assertEqual(sorted(p.name for p in sparse.iterdir()), [".git"])
+        self.assertNotEqual(git(sparse, "config", "--bool", "--default", "false", "core.sparseCheckout"), "true")
+        git(sparse, "reset", "-q", "--hard", "HEAD")  # what actions/checkout runs next
+        self.assertEqual((sparse / "Packages" / "B.swift").read_text(), "b\n")
+        self.assertEqual(git(sparse, "status", "--porcelain"), "")
+
+        full = workspace("actions-runner-glaeda-3")
+        (full / ".build").mkdir()
+        result = self.run_hook("job-started", "push", path, "--allowed-repo", "manaflow-ai/cmux", "--no-disk",
+                               repo="manaflow-ai/cmux", env={"GITHUB_WORKSPACE": os.fspath(full)})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("sparse", result.stdout)
+        self.assertTrue((full / ".build").is_dir() and (full / "Packages" / "B.swift").is_file())
+
     def test_fails_closed_without_event(self) -> None:
         self.assertEqual(self.run_hook("job-started", None, None, "--no-disk").returncode, 1)
         self.assertEqual(self.run_hook("job-started", "push", self.dir / "missing.json", "--no-disk").returncode, 1)
