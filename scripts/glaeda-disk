@@ -267,6 +267,9 @@ class Family:
     stale_before: float | None = None
     allow_stale_protected: bool = False  # permit an explicit family below NEVER_DELETE roots
     reference_root: Path | None = None  # root containing lease/job markers for this family
+    # Past this idle age the checkouts inside an item are mirrors (a GitHub clone, a laptop's synced tree)
+    # and no git check keeps it; process, socket and job-marker checks still do.
+    mirror_idle_hours: float | None = None
     platform: str = "unknown"  # macos | linux | shared | unknown; reporting only, never deletion authority
 
 
@@ -1091,6 +1094,13 @@ def bazel_family(root: Path) -> Family:
 # launchd services of the hq build workers that read and write /Users/Shared/cmux-build-fleet/cache
 HQ_BUILD_WORKERS = ("system/ai.manaflow.cmux-build-worker", "system/ai.manaflow.cmux-lent-worker")
 
+# A reload-cloud unit's checkouts are mirrors: cmux-base is a clone of GitHub (sync-repo.sh checks out
+# origin/<branch> into it) and work/<slot> is that clone with the developer's tree rsynced over it from their
+# laptop, which keeps the edits. So once a unit sat idle a week, no git check keeps it. Before that, a clone
+# still has to lose nothing. Every git check kept them: 107 GiB idle since Sep 28-Oct 2 on eight minis read
+# "git-checkout (checkout below the top level)" while glaeda-disk reported 0.0 G reclaimable (2026-10-11).
+CMUX_JOB_MIRROR_HOURS = 168.0
+
 
 def default_families() -> list[Family]:
     tmp = Path("/private/tmp") if DARWIN else Path("/tmp")
@@ -1121,7 +1131,7 @@ def default_families() -> list[Family]:
         Family("cmux-job-cache", HOME / ".cache/cmux-job", True,
                "next cmux reload or CI job rebuilds it (cold)", depth=2, git_disposable=True,
                owner="cmuxterm-hq reload-cloud scripts", rebuild_minutes=30, min_idle_hours=12.0,
-               platform=host_cache_platform()),
+               mirror_idle_hours=CMUX_JOB_MIRROR_HOURS, platform=host_cache_platform()),
         # Caches are disposable by definition; an idle one goes under pressure, a live one (go-build
         # while a Go build runs) stays recent. Any git data inside keeps it, as everywhere else.
         Family("user-cache", HOME / ".cache", True, "the tool re-downloads or rebuilds it",
@@ -1248,7 +1258,7 @@ def runner_cache_families() -> list[Family]:
         Family("cmux-job-cache", HOME / ".cache/cmux-job", True,
                "next cmux reload or CI job rebuilds it", depth=2, git_disposable=True,
                owner="cmux reload-cloud", rebuild_minutes=30, min_idle_hours=168.0,
-               platform="macos"),
+               mirror_idle_hours=CMUX_JOB_MIRROR_HOURS, platform="macos"),
         Family("cmux-ghosttykit-cache", HOME / ".cache/cmux/ghosttykit", True,
                "cmux rebuilds GhosttyKit", depth=1, files=True,
                owner="cmux build tooling", rebuild_minutes=5, min_idle_hours=168.0,
@@ -1708,6 +1718,7 @@ def claude_session_active(session_id: str, idle_s: float) -> bool:
 
 
 DELETING_PREFIX = ".glaeda-disk-deleting-"  # remove() renames a tree to this before deleting it
+DELETING_RE = re.compile(re.escape(DELETING_PREFIX) + r".+-([0-9]+)")  # ...<name>-<pid of the deleter>
 
 
 def derived_data(fam: Family, path: Path) -> bool:
@@ -1715,8 +1726,87 @@ def derived_data(fam: Family, path: Path) -> bool:
     remove() had already renamed aside when it was interrupted, which is only ever reclaimed. Neither
     is searched for git. A tool's own cache is searched, but git_state does not enter its sealed parts."""
     return bool(fam.build_output
-            or re.fullmatch(re.escape(DELETING_PREFIX) + r".+-[0-9]+", path.name)
-            or (fam.id == "cmux-job-cache" and path.name == "DerivedData"))
+            or DELETING_RE.fullmatch(path.name)
+            or (fam.id == "cmux-job-cache" and (path.name == "DerivedData" or path.parent.name == "SourcePackages")))
+
+
+def git_exempt(fam: Family, path: Path, idle_hours: float) -> bool:
+    """No git check applies: build output (derived_data), or a mirror family's item idle past its mirror age."""
+    return derived_data(fam, path) or (fam.mirror_idle_hours is not None and idle_hours >= fam.mirror_idle_hours)
+
+
+# A deletion interrupted after remove()'s rename (the process killed, the host rebooted) leaves the tree under
+# DELETING_PREFIX<name>-<pid>. No family lists it (cmux-kept-build includes only its own names), so 9.3 GiB
+# on cmux8s and 7.8 GiB on cmuxs-mac-mini-3 sat there for days (2026-10-11). Once its pid is gone, the
+# interrupted-deletions family finishes it in place.
+INTERRUPTED = "interrupted-deletions"
+
+
+def deleting_pid(name: str) -> int | None:
+    m = DELETING_RE.fullmatch(name)
+    return int(m.group(1)) if m else None
+
+
+def deletion_owner_live(path: Path) -> str:
+    """Why an aside tree is still being deleted, or "": its pid runs glaeda-disk (or cannot be read).
+    A reused pid running anything else does not hold it."""
+    pid = deleting_pid(path.name)
+    if pid is None or pid <= 0:
+        return ""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return ""
+    except OSError:
+        pass  # another user's live process
+    command = _owner_command(pid)
+    if not command or "glaeda-disk" in command:
+        return f"glaeda-disk (pid {pid}) is still deleting it"
+    return ""
+
+
+def interrupted_families(fams: list[Family]) -> list[Family]:
+    """One family per directory that holds an aside tree a family's remove() left: the directories its
+    candidates sit in. Built only where such a tree exists, so the usual pass reads nothing more than one
+    listing per directory."""
+    parents: dict[str, Family] = {}
+    for fam in fams:
+        if not fam.reclaimable or fam.id == INTERRUPTED:
+            continue
+        dirs = {fam.root}
+        if fam.discover or fam.checkout_builds:
+            dirs.update(p.parent for p in candidates(fam))
+        else:  # a match family's candidates sit within depth levels too: an aside one left no candidate behind
+            level = [fam.root]
+            for _ in range(fam.depth - 1):
+                level = [Path(e.path) for p in level for e in _entries(p)
+                         if e.name not in fam.skip and not DELETING_RE.fullmatch(e.name)
+                         and e.is_dir(follow_symlinks=False)]
+                dirs.update(level)
+        for d in dirs:
+            if os.fspath(d) in parents:
+                continue
+            if any(DELETING_RE.fullmatch(e.name) for e in _entries(d)):
+                parents[os.fspath(d)] = Family(
+                    INTERRUPTED, d, True, "nothing: a deletion glaeda-disk started and did not finish",
+                    files=True, include=(DELETING_PREFIX,), build_output=True, min_bytes=0,
+                    max_idle_hours=0.0, owner="glaeda-disk remove()", rebuild_minutes=0.1,
+                    allow_stale_protected=fam.allow_stale_protected, platform=fam.platform)
+    return [parents[k] for k in sorted(parents)]
+
+
+def finish_deletion(path: Path) -> None:
+    """Delete an aside tree in place: it already has its deleting name, so a second rename adds nothing."""
+    if path.is_symlink():
+        raise OSError("refusing symlink")
+    if os.path.ismount(path) or path.lstat().st_dev != path.parent.stat().st_dev:
+        raise OSError("refusing a mount point")
+    if not DELETING_RE.fullmatch(path.name):
+        raise OSError("refusing a tree without the deleting name")
+    if path.is_dir():
+        shutil.rmtree(path, onerror=_chmod_retry)
+    else:
+        path.unlink()
 
 
 # Cache layouts, recognized by what a tool writes rather than by a directory's name. A tree that
@@ -2038,6 +2128,8 @@ def keep_verdict(fam: "Family", path: Path) -> str:
     """Why a candidate stays whatever its age, or ""."""
     if fam.id == "cmux-seeds":
         return seed_verdict(path)
+    if fam.id == INTERRUPTED:
+        return deletion_owner_live(path)
     if fam.discover and stat_layout(os.fspath(path)) == "rustup-toolchain":
         return rustup_verdict(path)
     if fam.checkout_builds and path.parent.name == "cache" and path.parent.parent.name == "apple-build":
@@ -2728,6 +2820,8 @@ def job_busy(fam: Family, path: Path) -> bool:
         return False
     if fam.id == SPM_SCRATCH:  # dozens of package builds within three levels; its lock is its in-use signal
         return False
+    if fam.id == INTERRUPTED:  # renamed away from every job's path; its deleter's pid is its in-use signal
+        return False
     return fam.reclaimable and not fam.discover and cmux_active(path)
 
 
@@ -2781,7 +2875,7 @@ def _search(fam: Family, budget: int = 20000) -> list[Path]:
                 budget -= 1
                 if budget < 0:
                     return found
-                if c.name in fam.skip or c.is_symlink() or not c.is_dir():
+                if c.name in fam.skip or c.is_symlink() or not c.is_dir() or DELETING_RE.fullmatch(c.name):
                     continue
                 if c.name == fam.match and (not fam.marker or (c / fam.marker).exists()):
                     found.append(c)
@@ -2813,10 +2907,16 @@ def candidates(fam: Family) -> list[Path]:
             level = [Path(e.path) for p in level for e in _entries(p)
                      if e.name not in fam.skip
                      and not (fam.skip_prefixes and e.name.startswith(fam.skip_prefixes))
+                     and not (p != fam.root and DELETING_RE.fullmatch(p.name))  # never list inside an aside tree
                      and (e.is_dir(follow_symlinks=False)
                           or (fam.files and e.is_file(follow_symlinks=False)))]
         if fam.include:
             level = [p for p in level if p.name.startswith(fam.include)]
+    # an aside tree (remove()'s rename) is the interrupted-deletions family's alone, whatever family's root holds it
+    if fam.id == INTERRUPTED:
+        level = [p for p in level if DELETING_RE.fullmatch(p.name)]
+    else:
+        level = [p for p in level if not DELETING_RE.fullmatch(p.name)]
     uid = os.getuid()
     owned = []
     for p in level:
@@ -3120,7 +3220,7 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             reasons.append(keep)
         elif reasons:
             verdict = "in-use"
-        elif (not derived_data(fam, path) and (g := family_git_state(fam, path)) != "none"
+        elif (not git_exempt(fam, path, idle) and (g := family_git_state(fam, path)) != "none"
               and not (g == "git" and fam.git_disposable and due
                        and not (loss := family_git_loss(fam, path)))):
             verdict = "git-checkout" if g == "git" else "unchecked"
@@ -3134,6 +3234,9 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             verdict = "reclaimable"
             if path.name in archived and fam.id == "cmux-seeds":
                 reasons.append("the seed archive holds it")
+            if (fam.mirror_idle_hours is not None and idle >= fam.mirror_idle_hours
+                    and not derived_data(fam, path)):
+                reasons.append(f"idle {fam.mirror_idle_hours:g}h+: its checkouts are mirrors")
         if jobs is not None and verdict in ("recent", "reclaimable"):
             reasons.append(reasons_jobs)
         items.append(Item(fam.id, sp, size, round(idle, 1), verdict, reasons, jobs,
@@ -3861,13 +3964,22 @@ APPLY_LSOF_ITEMS, APPLY_LSOF_S = 8, 20.0  # apply re-takes lsof for discovered i
 
 
 def apply(items: list[Item], families: dict[str, Family], receipt: Path,
-          targets: dict[int, int] | None, idle_hours: float, halt=None) -> int:
+          targets: dict[int, int] | None, idle_hours: float, halt=None,
+          all_families: list[Family] | None = None) -> int:
     """Delete reclaimable items, largest first. With `targets` (filesystem device -> free bytes
     to stop at), only items on those filesystems are touched, each until its own target. With `halt`
     (the idle sweep's host_busy), each deletion first asks it and the run stops once it names a reason."""
     receipt.parent.mkdir(parents=True, exist_ok=True)
     released = 0
     _NESTED_WALKS.clear()  # re-observe every checkout right before deleting
+    every = list(families.values()) if all_families is None else all_families
+
+    def family_of(item: Item) -> Family:
+        """The family that listed the item: ids repeat across roots (one interrupted-deletions family per
+        directory), so the deepest root holding the item wins."""
+        p = Path(item.path)
+        own = [f for f in every if f.id == item.family and p.parent.is_relative_to(f.root)]
+        return max(own, key=lambda f: len(f.root.parts)) if own else families[item.family]
     try:
         cwds, cmds = process_evidence()
     except NoEvidence as e:
@@ -3885,11 +3997,12 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         if i.verdict != "reclaimable":
             continue
         p = Path(i.path)
-        if RUNNER_CACHE_PROFILE and (not runner_profile_roots_safe(list(families.values()))
-                                     or not runner_profile_path_safe(families[i.family], p)):
+        fam = family_of(i)
+        if RUNNER_CACHE_PROFILE and (not runner_profile_roots_safe(every)
+                                     or not runner_profile_path_safe(fam, p)):
             outcome = "changed:profile-boundary"
             rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(),
-                   "outcome": outcome, "rebuild": families[i.family].rebuild, **asdict(i)}
+                   "outcome": outcome, "rebuild": fam.rebuild, **asdict(i)}
             with receipt.open("a") as f:
                 f.write(json.dumps(rec) + "\n")
             continue
@@ -3906,7 +4019,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         if halt is not None and (why := halt()):
             print(f"stopped: {why}")
             break
-        if families[i.family].id in FLEET_FAMILY_IDS:
+        if fam.id in FLEET_FAMILY_IDS:
             # Pressure eligibility is intentionally broad, so take fresh cwd/open-file evidence immediately
             # before each rename. A job may start using a candidate after the survey or during a long pass.
             try:
@@ -3915,10 +4028,10 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 print(f"refusing to delete the rest: {e}", file=sys.stderr)
                 break
             cwds = open_index(opened)
-        if families[i.family].build_output and families[i.family].root.is_relative_to(FLEET_CI):
+        if fam.build_output and fam.root.is_relative_to(FLEET_CI):
             cmds = command_lines() or cmds
         fresh_layout = ""
-        if families[i.family].discover:
+        if fam.discover:
             # a discovered cache is deleted only on its own layout, so both are re-read now: the layout,
             # and the open files (a build may have started using it since the survey's lsof)
             # (lsof costs seconds on a loaded mini, so it is re-taken every APPLY_LSOF_ITEMS items or
@@ -3938,35 +4051,37 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 if not cmds:
                     print("refusing to delete the rest: ps failed", file=sys.stderr)
                     break
-        if families[i.family].retired_only and not owner_retired(families[i.family]):
+        if fam.retired_only and not owner_retired(fam):
             outcome = "changed:owner-loaded"
-        elif families[i.family].discover and not fresh_layout:
+        elif fam.discover and not fresh_layout:
             outcome = "changed:layout"
-        elif (in_cwd(i.path, cwds) or named_by(i.path, cmds) or holds_socket(p) or job_busy(families[i.family], p)
+        elif (in_cwd(i.path, cwds) or named_by(i.path, cmds) or holds_socket(p) or job_busy(fam, p)
                 or (i.family == "claude-scratchpad" and claude_session_active(p.name, idle_hours * 3600))
                 or (i.family == SPM_SCRATCH and spm_scratch_held(p))):
             outcome = "changed:in-use"
-        elif not item_due(families[i.family],
-                          (time.time() - item_mtime(families[i.family], p)) / 3600,
-                          item_window(families[i.family], p, idle_hours, archived))[0]:
+        elif not item_due(fam, (idle_now := (time.time() - item_mtime(fam, p)) / 3600),
+                          item_window(fam, p, idle_hours, archived))[0]:
             outcome = "changed:modified"
-        elif keep_verdict(families[i.family], p):
+        elif keep_verdict(fam, p):
             outcome = "changed:kept"
-        elif not derived_data(families[i.family], p) and not families[i.family].git_disposable and family_git_state(families[i.family], p) != "none":
+        elif not git_exempt(fam, p, idle_now) and not fam.git_disposable and family_git_state(fam, p) != "none":
             outcome = "changed:git"  # a clone appeared at the top of the cache since the survey
-        elif (families[i.family].git_disposable and p.is_dir() and not derived_data(families[i.family], p)
-              and (g := family_git_state(families[i.family], p)) != "none"
-              and (g != "git" or family_git_loss(families[i.family], p))):
+        elif (fam.git_disposable and p.is_dir() and not git_exempt(fam, p, idle_now)
+              and (g := family_git_state(fam, p)) != "none"
+              and (g != "git" or family_git_loss(fam, p))):
             outcome = "changed:git"  # the checkout gained something to lose since the survey
         else:
             try:
-                common = git_common_dir(p) if families[i.family].git_disposable else ""
+                common = git_common_dir(p) if fam.git_disposable else ""
                 # rustup skips reinstalling a toolchain whose update hash still matches the channel
                 # the moment the toolchain is renamed away, so an interrupted delete cannot leave it behind
                 stale_hash = (p.parent.parent / "update-hashes" / p.name
                               if fresh_layout == "rustup-toolchain" else None)
                 if i.family == SPM_SCRATCH:
                     gone = remove_spm_scratch(p)  # only under its lock: a job may link it right now
+                elif i.family == INTERRUPTED:
+                    finish_deletion(p)  # already aside under its dead deleter's name
+                    gone = True
                 else:
                     remove(p, after_rename=None if stale_hash is None
                            else lambda h=stale_hash: h.unlink(missing_ok=True))
@@ -3979,7 +4094,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             except (OSError, subprocess.SubprocessError) as e:
                 outcome = f"incomplete:{e.__class__.__name__}"
         rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(),
-               "outcome": outcome, "rebuild": families[i.family].rebuild, **asdict(i),
+               "outcome": outcome, "rebuild": fam.rebuild, **asdict(i),
                **({"sweep": "idle"} if halt is not None else {})}
         with receipt.open("a") as f:
             f.write(json.dumps(rec) + "\n")
@@ -4206,6 +4321,7 @@ def main(argv: list[str] | None = None) -> int:
         fid, _, p = ov.partition("=")
         fams = [replace(f, root=Path(p), files=False, min_bytes=None, git_disposable=False)
                 if f.id == fid else f for f in fams]
+    every = fams
     if a.family:
         fams = [f for f in fams if f.id in a.family]
     if RUNNER_CACHE_PROFILE and not runner_profile_roots_safe(fams):
@@ -4274,6 +4390,10 @@ def main(argv: list[str] | None = None) -> int:
         if a.apply and POLICY["defer_during_ci"] and (why := ci_defer(fss, ci_jobs(), a.emergency, floor_gib)):
             print(why)
             return 0
+    # Aside trees a killed deletion left, in the directories of the families this run judges (so a pressure
+    # run looks only on the filesystems under pressure); `--family interrupted-deletions` alone looks in all.
+    if not a.family or INTERRUPTED in a.family:
+        fams = fams + interrupted_families(every if a.family and set(a.family) == {INTERRUPTED} else fams)
     if a.apply:
         if RUNNER_CACHE_PROFILE and not runner_profile_roots_safe(fams):
             print("runner cache profile roots changed during observation; skipped")
@@ -4369,7 +4489,7 @@ def main(argv: list[str] | None = None) -> int:
         print()
         halt = host_busy if sweep and POLICY["defer_during_ci"] else None
         apply(items, {f.id: f for f in fams}, a.receipt,
-              {fs.dev: fs.target for fs in shown} if a.pressure else None, idle, halt)
+              {fs.dev: fs.target for fs in shown} if a.pressure else None, idle, halt, all_families=fams)
         # A drained runner is explicitly held by cmux_mini_fix; once its listener and worker
         # are absent, its disposable checkout can be cleared under this same eviction lock.
         if not RUNNER_CACHE_PROFILE:

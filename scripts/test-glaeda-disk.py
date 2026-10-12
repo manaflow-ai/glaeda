@@ -2303,7 +2303,9 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertEqual([c.name for c in (job / "reload-cloud-ios").iterdir()], [])  # no half-deleted leftover
         self.assertTrue((base / ".git").is_dir())
         # a delete interrupted after its rename leaves a tree nothing else will ever clean up
-        left = job / "reload-cloud-ios/.glaeda-disk-deleting-DerivedData-123"
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        left = job / f"reload-cloud-ios/.glaeda-disk-deleting-DerivedData-{dead.pid}"
         (left / "slot-1/SourcePackages/checkouts/dep/.git").mkdir(parents=True)
         (left / "slot-1/x.o").write_bytes(b"\0" * 4096)
         for dirpath, dirnames, filenames in os.walk(left):
@@ -2313,10 +2315,112 @@ class LinuxLayoutTest(unittest.TestCase):
         saved = gd.process_evidence
         gd.process_evidence = lambda: ([], "")
         try:
-            again = {i.path: i.verdict for i in gd.survey(fams, 24, 0)}
+            again = {i.path: (i.family, i.verdict)
+                     for i in gd.survey(fams + gd.interrupted_families(fams), 24, 0)}
         finally:
             gd.process_evidence = saved
-        self.assertEqual(again[str(left)], "reclaimable")
+        self.assertEqual(again[str(left)], ("interrupted-deletions", "reclaimable"))
+
+    def test_idle_cmux_job_mirrors_go_after_a_week_unless_a_job_holds_them(self) -> None:
+        """2026-10-11: 107 GiB of reload-cloud trees idle since Sep 28-Oct 2 on eight minis, all kept as
+        "git-checkout (checkout below the top level)", so glaeda-disk reported 0.0 G reclaimable."""
+        job = self.home / ".cache/cmux-job"
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        units = {"reload-cloud/cmux-base": "slot-1", "reload-cloud/work": "slot-1", "slots": "host.1"}
+        for unit, slot in units.items():
+            repo = job / unit / slot
+            subprocess.run(["git", "init", "-q", str(repo)], check=True, env=env)
+            (repo / "f").write_text("x")
+            subprocess.run(["git", "-C", str(repo), "add", "f"], check=True, env=env)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "local only"], check=True, env=env)
+        # SwiftPM's clones: reproducible like DerivedData, so they go at the family's usual age
+        (job / "SourcePackages/host.1/checkouts/dep/.git").mkdir(parents=True)
+        (job / "reload-cloud-ios/work/slot-2").mkdir(parents=True)
+        (job / "reload-cloud-ios/work/slot-2/.lock").write_text("")  # hq's slot lock: a reload runs
+        (job / "reload-cloud-ios/cmux-base/slot-2/.git").mkdir(parents=True)
+
+        def age(rel: str, hours: float) -> None:
+            t = time.time() - hours * 3600
+            for dirpath, dirnames, filenames in os.walk(job / rel):
+                for n in dirnames + filenames:
+                    os.utime(os.path.join(dirpath, n), (t, t), follow_symlinks=False)
+            os.utime(job / rel, (t, t))
+
+        age("", 8 * 24)
+        age("slots", 3 * 24)  # idle, but not a week: its local commit still keeps it
+        fams = [f for f in gd.default_families() if f.id == "cmux-job-cache"]
+        self.assertEqual(fams[0].mirror_idle_hours, 168.0)
+        with mock.patch.object(gd, "process_evidence",
+                               return_value=([], f"rsync -a {job}/reload-cloud/work/slot-1/ x\n")):
+            items = {Path(i.path).relative_to(job).as_posix(): i for i in gd.survey(fams, 24, 0)}
+        verdicts = {k: i.verdict for k, i in items.items()}
+        self.assertEqual(verdicts, {
+            "reload-cloud/cmux-base": "reclaimable",
+            "reload-cloud/work": "in-use",  # a running command names a slot in it
+            "reload-cloud-ios/cmux-base": "in-use",  # its unit's work/<slot>/.lock
+            "reload-cloud-ios/work": "in-use",
+            "slots/host.1": "git-checkout",
+            "SourcePackages/host.1": "reclaimable"})
+        self.assertIn("idle 168h+: its checkouts are mirrors", items["reload-cloud/cmux-base"].reasons)
+        receipt = self.home / "receipt.jsonl"
+        with contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            gd.apply(list(items.values()), {f.id: f for f in fams}, receipt, None, 24)
+        self.assertFalse((job / "reload-cloud/cmux-base").exists())
+        self.assertFalse((job / "SourcePackages/host.1").exists())
+        self.assertTrue((job / "reload-cloud/work/slot-1/.git").is_dir())
+        self.assertTrue((job / "slots/host.1/.git").is_dir())
+        self.assertTrue((job / "reload-cloud-ios/cmux-base/slot-2/.git").is_dir())
+
+    def test_interrupted_deletions_finish_once_their_deleter_is_gone(self) -> None:
+        """cmux8s and cmuxs-mac-mini-3, 2026-10-11: 9.3 and 7.8 GiB renamed aside by a killed glaeda-disk sat
+        in the fleet CI store, where cmux-kept-build lists only its own names."""
+        store = self.home / "ci"
+        kept = gd.Family("cmux-kept-build", store, True, "x", include=("derived-data",), build_output=True)
+        make(store / "derived-data", age_hours=1)
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        stranger = subprocess.Popen(["sleep", "60"])  # a reused pid running something else
+        self.addCleanup(stranger.wait)
+        self.addCleanup(stranger.kill)
+        gone = make(store / f".glaeda-disk-deleting-derived-data-{dead.pid}", age_hours=0)
+        (gone / "SourcePackages/checkouts/dep/.git").mkdir(parents=True)
+        (gone / "ro").mkdir()
+        (gone / "ro/f").write_text("x")
+        os.chmod(gone / "ro", 0o500)
+        reused = make(store / f".glaeda-disk-deleting-derived-data-{stranger.pid}", age_hours=0)
+        live = make(store / f".glaeda-disk-deleting-derived-data-{os.getpid()}", age_hours=0)  # this test: glaeda-disk
+        self.assertEqual(gd.candidates(kept), [store / "derived-data"])
+        extra = gd.interrupted_families([kept])
+        self.assertEqual([(f.id, f.root) for f in extra], [("interrupted-deletions", store)])
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            items = gd.survey([kept, *extra], 24, 0)
+        got = {Path(i.path).name: (i.family, i.verdict) for i in items}
+        self.assertEqual(got, {
+            "derived-data": ("cmux-kept-build", "recent"),
+            gone.name: ("interrupted-deletions", "reclaimable"),
+            reused.name: ("interrupted-deletions", "reclaimable"),
+            live.name: ("interrupted-deletions", "kept")})
+        with contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            gd.apply(items, {f.id: f for f in (kept, *extra)}, self.home / "r.jsonl", None, 24,
+                     all_families=[kept, *extra])
+        self.assertEqual(sorted(p.name for p in store.iterdir()), sorted(["derived-data", live.name]))
+        # finished in place, not renamed a second time
+        self.assertFalse(any(".glaeda-disk-deleting-.glaeda-disk-deleting-" in p.name for p in store.iterdir()))
+        receipts = [json.loads(line) for line in (self.home / "r.jsonl").read_text().splitlines()]
+        self.assertEqual(sorted(r["outcome"] for r in receipts), ["reclaimed", "reclaimed"])
+        # a match family whose only candidate went aside, and a depth-2 family never lists inside an aside tree
+        ios = self.home / "ci-ios"
+        match = gd.Family("ci-ios-derived-data", ios, True, "x", depth=2, match="derived-data", build_output=True)
+        make(ios / "runner-1" / f".glaeda-disk-deleting-derived-data-{dead.pid}" / "derived-data")
+        self.assertEqual(gd.candidates(match), [])
+        self.assertEqual([f.root for f in gd.interrupted_families([match])], [ios / "runner-1"])
+        two = gd.Family("cmux-job-cache", self.home / "job", True, "x", depth=2)
+        make(self.home / "job" / f".glaeda-disk-deleting-reload-cloud-{dead.pid}" / "work")
+        make(self.home / "job/reload-cloud/work")
+        self.assertEqual(gd.candidates(two), [self.home / "job/reload-cloud/work"])
 
     def test_claude_session_seen_in_alternate_config_dir(self) -> None:
         t = self.home / ".claude-outlook/projects/-home-leo-Projects/abc-123.jsonl"
