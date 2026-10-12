@@ -30,6 +30,10 @@ Each run checks, as the runner user and without sudo:
                                      and a runner cmux_mini_fix.sh runner_hold stopped (HELD) is no finding.
   runner_unloaded:<agent>            a runner LaunchAgent plist is not loaded: reported only (an operator may have
                                      unloaded it; glaeda-cmux-runner-fleet --apply loads it).
+  node_ineligible                    the runner hook's node_refusal, for the fleet class its job-started hook requires
+                                     (--require-eligible --fleet-class), names a reason, so job-started refuses every
+                                     job here (a missing staged generation, a receipt that does not validate, a node
+                                     that is not eligible). Restaging or re-enrolling is an operator's: reported only.
 
 A heal is tried at most every HEAL_EVERY_S and HEAL_TRIES times a day per finding, counting heals that worked
 but did not last (a runner that exits again), so nothing loops. Each finding reads
@@ -52,6 +56,7 @@ import json
 import os
 import plistlib
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -312,6 +317,26 @@ class Mini:
                 killed.append(f"killed pid {pid} {path}")
         return killed
 
+    def node_refusal(self) -> str | None:
+        """The reason the runner hook refuses every job here as an ineligible node, or None when it is eligible,
+        its job-started hook does not require eligibility, or the hook cannot be read."""
+        dirs = self.runner_dirs()
+        try:
+            text = (dirs[0] / "glaeda-hooks" / "job-started.sh").read_text(encoding="utf-8")
+            argv = shlex.split(next(line for line in text.splitlines() if line.startswith("exec ")))
+        except (IndexError, StopIteration, OSError, ValueError):
+            return None
+        if "--require-eligible" not in argv or "--fleet-class" not in argv[:-1]:
+            return None
+        hook = self.hook()
+        refusal = getattr(hook, "node_refusal", None) if hook is not None else None
+        if refusal is None:
+            return None
+        try:
+            return refusal(argv[argv.index("--fleet-class") + 1])[0]
+        except Exception:  # noqa: BLE001  (a hook that cannot answer is no finding)
+            return None
+
     def disk_summary(self) -> dict[str, Any]:
         path = self.home / ".local/state/glaeda/disk/summary.json"
         return load_json(path)
@@ -497,6 +522,15 @@ def check_runners(mini: Mini) -> list[dict[str, Any]]:
     return out
 
 
+def check_node_eligibility(mini: Mini) -> list[dict[str, Any]]:
+    why = mini.node_refusal()
+    if not why:
+        return []
+    return [finding("node_ineligible", "error", why, "impossible",
+                    "job-started refuses every job here; restage the class receipt's generation or re-enroll "
+                    "(docs/CMUX_FLEET_ENROLLMENT.md)")]
+
+
 # ---------------------------------------------------------------- heals
 
 
@@ -586,7 +620,7 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
     previous = {f["id"]: f for f in (load_json(report_path).get("findings") or []) if isinstance(f, dict)}
 
     found = (check_console(mini) + check_power(mini) + check_tailscale(mini) + check_runners(mini)
-             + check_leaked_test_apps(mini) + check_disk_accounting(mini))
+             + check_node_eligibility(mini) + check_leaked_test_apps(mini) + check_disk_accounting(mini))
     tm = check_testmanagerd(mini, now)
     carried = tm is None and "testmanagerd_wedged" in previous  # a test runs, or the log was unreadable: no heal now
     found += [previous["testmanagerd_wedged"]] if carried else tm or []

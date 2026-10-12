@@ -1126,6 +1126,7 @@ runners) looks for what stopped runner minis on 2026-09-25 and 26 without anythi
 | `tailscale_probe_error`: the Tailscale CLI gave no BackendState (timeout, error, no JSON) | reported only: the check could not look, so the tunnel is not judged down |
 | `runner_stopped:<agent>`: a runner LaunchAgent loaded but not running, two runs in a row | `launchctl kickstart` (nothing runs in it, so no job is cut) |
 | `runner_unloaded:<agent>` (not one `cmux_mini_fix.sh` holds) | none: `glaeda-cmux-runner-fleet --apply` |
+| `node_ineligible`: the runner hook's eligibility check, for the fleet class its job-started hook requires, refuses (for example the class receipt's staged generation is gone) | none: restage the generation or re-enroll ([enrollment](CMUX_FLEET_ENROLLMENT.md)) |
 
 A heal runs at most every 10 minutes and 3 times a day per finding (a heal that worked but did not last counts),
 then the finding reads `impossible`. The report,
