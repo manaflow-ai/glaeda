@@ -2382,6 +2382,41 @@ class DedupeTest(unittest.TestCase):
         self.assertEqual((again["hashed_bytes"], again["cloned_bytes"]), (0, 0))
         self.assertEqual([p.name for p in self.root.rglob("*glaeda-clone*")], [])
 
+    def test_cmux_next_ci_runner_copies_are_deduped(self) -> None:
+        """cmux10s, 2026-10-11: --dedupe found 0 files while three runners each kept the same 3.9 GiB of
+        SourcePackages under ~/Library/Caches/cmux-next-ci/<scheme>/<runner>."""
+        data = os.urandom(2 * 1024 * 1024)
+        base = "Library/Caches/cmux-next-ci/cmux-scheme"
+        copies = [self.blob(f"{base}/host-glaeda-{n}/SourcePackages/artifacts/x.bin", data) for n in (2, 3, 4)]
+        module = self.blob(f"{base}/host-glaeda-2/ModuleCache.noindex/m.pcm", data)
+        build = self.blob(f"{base}/host-glaeda-3/Build/out.o", data)  # build products are not deduped
+        self.assertEqual(gd.cmux_next_ci_dirs(self.root), [self.root / base])
+        self.assertEqual(gd.cmux_next_ci_dirs(self.root / "nowhere"), [])
+        roots = gd.dedupe_roots(self.root / base)
+        self.assertEqual(sorted(r.relative_to(self.root / base).as_posix() for r in roots),
+                         ["host-glaeda-2/ModuleCache.noindex", "host-glaeda-2/SourcePackages",
+                          "host-glaeda-3/SourcePackages", "host-glaeda-4/SourcePackages"])
+        build_ino = build.stat().st_ino
+        r = gd.dedupe(roots, self.state)
+        self.assertEqual(r["cloned_bytes"], 3 * len(data))  # four identical files, one canonical
+        self.assertTrue(all(p.read_bytes() == data for p in (*copies, module)))
+        self.assertEqual(build.stat().st_ino, build_ino)
+
+    @unittest.skipUnless(sys.platform == "darwin", "APFS clones")
+    def test_dedupe_main_scans_cmux_next_ci(self) -> None:
+        data = os.urandom(2 * 1024 * 1024)
+        base = "Library/Caches/cmux-next-ci/cmux-scheme"
+        for n in (2, 3):
+            self.blob(f"{base}/host-glaeda-{n}/SourcePackages/x.bin", data)
+        out = io.StringIO()
+        with mock.patch.object(gd, "HOME", self.root), mock.patch.object(gd, "DEDUPE_STATE", self.state), \
+                mock.patch.object(gd, "default_families", return_value=[]), contextlib.redirect_stdout(out):
+            self.assertEqual(gd.main(["--dedupe"]), 0)
+        self.assertIn("dedupe: 2 files >= 1 MiB", out.getvalue())
+        self.assertIn("cloned 0.0G", out.getvalue())  # 2 MiB rounds to 0.0G; the state records the clone
+        state = json.loads(self.state.read_text())
+        self.assertTrue(all(v["cloned"] for v in state.values()))
+
     def test_target_changed_after_hash_is_refused(self) -> None:
         data = os.urandom(2 * 1024 * 1024)
         a = self.blob("a/x.bin", data)

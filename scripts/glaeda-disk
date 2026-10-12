@@ -9,7 +9,8 @@
     glaeda-disk --low 15% --target 25%  thresholds as GiB free or as a share of each filesystem
     glaeda-disk --pressure --apply waits while a GitHub Actions job runs, unless below --emergency
     glaeda-disk --refresh           re-measure every size now instead of using the snapshot
-    glaeda-disk --dedupe            store identical Xcode package/module files once (APFS clones)
+    glaeda-disk --dedupe            store identical Xcode package/module files once (APFS clones), in
+                                    Xcode's DerivedData and the cmux-next workflow's per-runner copies
     glaeda-disk --runner-caches     use only the enrolled runner-account cache allowlist
 
 Parallel sessions each keep a full DerivedData, and its SourcePackages artifacts and module
@@ -3987,6 +3988,16 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
     return released
 
 
+def cmux_next_ci_dirs(home: Path | None = None) -> list[Path]:
+    """The cmux-next workflow's DerivedData, one per runner: ~/Library/Caches/cmux-next-ci/<scheme>/<runner>.
+    Each runner keeps its own copy of the same SourcePackages and module caches (3.9 GiB, three times on
+    every mini, 2026-10-11), so each <scheme> directory is a dedupe base like Xcode's DerivedData."""
+    root = (HOME if home is None else home) / "Library/Caches/cmux-next-ci"
+    if not root.is_dir() or root.is_symlink():
+        return []
+    return [d for d in _children(root) if d.is_dir() and not d.is_symlink()]
+
+
 def dedupe_roots(derived_data: Path) -> list[Path]:
     roots = [derived_data / sub for sub in DEDUPE_SUBDIRS]
     for d in _children(derived_data):
@@ -4202,14 +4213,15 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if a.dedupe:
         dd = next((f.root for f in fams if f.id == "xcode-derived-data"), None)
-        if dd is None or not DARWIN:
+        bases = ([dd] if dd is not None else []) + (cmux_next_ci_dirs() if not RUNNER_CACHE_PROFILE else [])
+        if not bases or not DARWIN:
             print("nothing to dedupe (APFS clones of Xcode DerivedData are macOS only)")
             return 0
-        before, _ = free_bytes(dd)
+        before, _ = free_bytes(bases[0])
         started = time.time()
         for attempt in range(3):
-            r = dedupe(dedupe_roots(dd), settle_s=a.settle_minutes * 60)
-            after, _ = free_bytes(dd)
+            r = dedupe([r for b in bases for r in dedupe_roots(b)], DEDUPE_STATE, settle_s=a.settle_minutes * 60)
+            after, _ = free_bytes(bases[0])
             print(f"dedupe: {r['files']} files >= 1 MiB, hashed {gib(r['hashed_bytes']).strip()}, "
                   f"cloned {gib(r['cloned_bytes']).strip()}, refused {r['refused']}, "
                   f"still settling {r['young']}, free {gib(before).strip()} -> {gib(after).strip()} "
