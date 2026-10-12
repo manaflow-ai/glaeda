@@ -316,6 +316,14 @@ What `--apply` does:
        can still be acknowledged: milliseconds, where the old gap was seconds. The
        acknowledge line exists only while GitHub sets the runner's acknowledge flag.
        An agent stop still cancels a running job but waits out an acquisition.
+     - Nor is a listener in its first poll: for `GATE_FIRST_POLL_S` (30 s,
+       `GLAEDA_RUNNER_GATE_FIRST_POLL_S`) after the gate starts it, a hold waits. GitHub
+       can hand a queued job to a new session before the listener has seen it, so no diag
+       line shows it, and a stop that cancels that poll loses the job: GitHub retries the
+       gone session and fails the job 3 min later with "The job was not acquired by Runner
+       of type self-hosted even after multiple attempts" (cmux14's root runner, 2026-10-12:
+       session at 03:46:41, stopped at 03:46:44). A job that arrives on a full host is
+       refused at job-started in seconds and rescued instead.
      - A listener that hasn't exited after 60 s is killed, unless a job slipped in.
    - **Restarting and logs.** The gate starts `run.sh` again after two free polls. While
      it waits it logs `glaeda-cmux-runner-gate: holding the listener off: <why>`, and

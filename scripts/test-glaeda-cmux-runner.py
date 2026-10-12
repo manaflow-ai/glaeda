@@ -3077,6 +3077,22 @@ class GateTest(unittest.TestCase):
                                  setattr(gate, "held", why))
         return gate, stops
 
+    def test_a_listener_just_started_keeps_its_first_poll(self) -> None:
+        # 2026-10-12 03:46Z, cmux14: the root runner's listener created its broker session at 03:46:41 and the
+        # gate stopped it at 03:46:44 (another runner's job made it wait for root). Its first message poll was
+        # cancelled with no job seen, but GitHub had already given it the queued root job, which then failed at
+        # 03:49:28: "The job was not acquired by Runner of type self-hosted even after multiple attempts".
+        full = "all 5 capacity units on this mini are taken"
+        gate, stops = self.gate([full] * 8)
+        with mock.patch.object(hook.subprocess, "Popen", return_value=gate.child):
+            gate.start()
+        for _ in range(3):
+            gate.step()
+        self.assertEqual(stops, [], "a new listener's first poll may already carry a job: it is not stopped")
+        gate.listening_since -= getattr(hook, "GATE_FIRST_POLL_S", 30.0)
+        gate.step()
+        self.assertEqual(stops, ["held"], "once its first poll has had time to deliver, the hold stops it")
+
     def units(self, held: int) -> Path:
         """A capacity ledger an admission has used, with its first `held` units taken."""
         capacity = Path(tempfile.mkdtemp(dir=self.tmp))
@@ -3837,6 +3853,32 @@ class GateTest(unittest.TestCase):
         self.assertEqual(check.call_args[0][0][1:], [os.fspath(HOOK), "listen", "--no-waiters", "--adopt=4321",
                                                      "--parse-only"])
 
+    def test_a_reload_keeps_the_listeners_first_poll(self) -> None:
+        # An --apply that lands inside a listener's first poll must not hand the re-executed gate a listener it
+        # may stop at once (GATE_FIRST_POLL_S). The start goes in the environment, so argv stays one an older hook
+        # (a rollback) accepts.
+        gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+        gate.child = mock.Mock(pid=4321)
+        gate.source = (0, 0, 0)
+        gate.listening_since = time.monotonic() - 5.0
+        mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+        self.addCleanup(signal.pthread_sigmask, signal.SIG_SETMASK, mask)
+        self.addCleanup(os.environ.pop, hook.GATE_LISTENING_SINCE_ENV, None)
+        handed: list[str | None] = []
+        with mock.patch.object(hook.os, "execv",
+                               side_effect=lambda *_: handed.append(os.environ.get(hook.GATE_LISTENING_SINCE_ENV))), \
+                mock.patch.object(hook.sys, "argv", [os.fspath(HOOK), "listen"]):
+            gate.reload()
+        self.assertEqual(handed, [repr(gate.listening_since)])
+        seen: list[float | None] = []
+        def step(new: hook.Gate) -> int:
+            seen.append(new.listening_since)
+            return 0
+        with mock.patch.object(hook.Gate, "step", step), mock.patch.object(hook, "Adopted", return_value=mock.Mock()):
+            self.assertEqual(hook.listen(self.runner, os.fspath(self.lock), "", self.state, True, adopt=4321), 0)
+        self.assertEqual(seen, [gate.listening_since], "the adopted listener keeps its first poll")
+        self.assertNotIn(hook.GATE_LISTENING_SINCE_ENV, os.environ, "read once; run.sh's children never see it")
+
     def test_an_ios_sim_side_runner_listens_only_with_room_for_a_2_unit_job(self) -> None:
         self.assertNotIn("--fit-units", self.listen_sh(sys.executable).read_text())
         script = self.listen_sh(sys.executable, ["glaeda-mini", "glaeda-side-std-xcode-26.6", "glaeda-ios-sim"])
@@ -3874,7 +3916,9 @@ class GateTest(unittest.TestCase):
 
     def run_listen(self, *extra: str) -> tuple[subprocess.Popen, Path]:
         # The hook runs in its own process, so the setUp patch of the thermal level does not reach it.
-        env = {**os.environ, "GLAEDA_RUNNER_GATE_POLL_S": "0.1", "GLAEDA_RUNNER_THERMAL_HOLD": "0"}
+        # No first-poll hold (GATE_FIRST_POLL_S): these tests stop a listener the moment a claim confirms.
+        env = {**os.environ, "GLAEDA_RUNNER_GATE_POLL_S": "0.1", "GLAEDA_RUNNER_THERMAL_HOLD": "0",
+               "GLAEDA_RUNNER_GATE_FIRST_POLL_S": "0"}
         log = self.tmp / "runner.log"
         with log.open("wb") as out:
             proc = subprocess.Popen([*extra] if extra else
@@ -3898,7 +3942,10 @@ class GateTest(unittest.TestCase):
         return diag / name
 
     def started_gate(self) -> hook.Gate:
-        """A real gate over the fake listener, held for a full mini."""
+        """A real gate over the fake listener, held for a full mini, past its first poll (GATE_FIRST_POLL_S)."""
+        patcher = mock.patch.object(hook, "GATE_FIRST_POLL_S", 0.0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
         gate.reload = lambda: None  # type: ignore[method-assign]
         gate.claimed = lambda: "all 2 canonical roots on this mini are taken"  # type: ignore[method-assign]

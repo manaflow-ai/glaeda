@@ -687,6 +687,15 @@ SATURATED = "the mini is saturated"
 # load again once the load has fallen below the resume mark, so one stuck process cannot keep a mini dark.
 GATE_LOAD_MAX_HOLD_S = float(os.environ.get("GLAEDA_RUNNER_GATE_LOAD_MAX_HOLD_S") or 30 * 60)
 GATE_STOP_WAIT_S = 60.0  # a graceful listener exit, before it is killed
+# A listener's first message poll is kept this long before a hold may stop it. GitHub can hand a queued job to a
+# new session before the listener has seen it, and a stop that cancels that poll loses the job: GitHub retries the
+# gone session and fails the job 3 min later, "not acquired by Runner of type self-hosted even after multiple
+# attempts" (cmux14 root runner, 2026-10-12: session at 03:46:41, stopped at 03:46:44). A job that does arrive on a
+# full host is refused at job-started in seconds and rescued, which a lost one never is.
+GATE_FIRST_POLL_S = float(os.environ.get("GLAEDA_RUNNER_GATE_FIRST_POLL_S") or 30.0)
+# reload() hands the listener's start (time.monotonic, system-wide) to the re-executed gate here, not in argv, so a
+# rollback to a hook without it still accepts the exec.
+GATE_LISTENING_SINCE_ENV = "GLAEDA_RUNNER_GATE_LISTENING_SINCE"
 GATE_WATCH_S = 0.1  # while a job is below the disk floor, notice its Worker exit promptly
 GATE_WAITER_EVERY_S = 30.0
 GATE_MAX_FAILURES = 5  # consecutive failed polls before the gate hands the runner back
@@ -3002,6 +3011,8 @@ class Gate:
         self.evicting: tuple[subprocess.Popen[bytes], float, float | None] | None = None
         self.watching: tuple[int, ...] = ()
         self.fast_until = 0.0
+        self.listening_since: float | None = None  # when start() last started run.sh (GATE_FIRST_POLL_S)
+        self.first_poll_noted = False
 
     def reload(self) -> None:
         """An --apply replaced this hook: re-exec the new one in place, keeping run.sh as our child, so a gate
@@ -3033,9 +3044,12 @@ class Gate:
         if self.terminating:  # arrived just before the block
             signal.pthread_sigmask(signal.SIG_UNBLOCK, blocked)
             return
+        if self.listening_since is not None:
+            os.environ[GATE_LISTENING_SINCE_ENV] = repr(self.listening_since)
         try:
             os.execv(sys.executable, [sys.executable, *argv])
         except OSError:
+            os.environ.pop(GATE_LISTENING_SINCE_ENV, None)
             signal.pthread_sigmask(signal.SIG_UNBLOCK, blocked)
             gate_log("the reload failed; keeping this gate")
 
@@ -3272,6 +3286,17 @@ class Gate:
         self.child = subprocess.Popen([os.fspath(self.runner_dir / "run.sh")], cwd=self.runner_dir,
                                       stdin=subprocess.DEVNULL)
         self.streak = 0
+        self.listening_since, self.first_poll_noted = time.monotonic(), False
+
+    def first_poll(self, why: str) -> bool:
+        """The listener started less than GATE_FIRST_POLL_S ago: its first poll may already carry a job, so a hold
+        waits (keeping its streak) instead of stopping it."""
+        if self.listening_since is None or time.monotonic() - self.listening_since >= GATE_FIRST_POLL_S:
+            return False
+        if not self.first_poll_noted:
+            gate_log(f"keeping the new listener through its first poll ({GATE_FIRST_POLL_S:g} s): {why}")
+            self.first_poll_noted = True
+        return True
 
     def stop(self, why: str) -> bool:
         """SIGINT to the listener: its graceful exit ends its session, so GitHub stops routing here. With no
@@ -3371,7 +3396,7 @@ class Gate:
                 return None
             why = self.claimed()
             self.streak = self.streak + 1 if why else 0
-            if why and self.streak >= GATE_CONFIRM:
+            if why and self.streak >= GATE_CONFIRM and not self.first_poll(why):
                 why = self.confirmed()
                 if why and not self.busy():  # the fresh look and the busy check right before the signal
                     self.stop(why)
@@ -3457,6 +3482,9 @@ def listen(runner_dir: Path, host_lock: str, reservation: str, state_dir: Path, 
     gate = Gate(runner_dir, host_lock, reservation, state_dir, waiters, capacity_dir, fit_units)
     if adopt:
         gate.child = Adopted(adopt)  # type: ignore[assignment]
+        with contextlib.suppress(ValueError):  # the adopted listener keeps its first poll (GATE_FIRST_POLL_S)
+            gate.listening_since = float(os.environ.get(GATE_LISTENING_SINCE_ENV, ""))
+    os.environ.pop(GATE_LISTENING_SINCE_ENV, None)
     signal.signal(signal.SIGTERM, gate.terminate)
     signal.signal(signal.SIGINT, gate.terminate)
     # reload() blocks both before its exec, so a stop that arrives across it stays pending until here.
