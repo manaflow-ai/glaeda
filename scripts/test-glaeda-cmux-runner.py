@@ -326,6 +326,45 @@ class HookTest(unittest.TestCase):
         self.assertNotIn("sparse", result.stdout)
         self.assertTrue((full / ".build").is_dir() and (full / "Packages" / "B.swift").is_file())
 
+    def test_a_workspace_a_failed_checkout_left_is_reset_before_the_next(self) -> None:
+        """glaeda-2 kept failing cmux-tui checkouts after the sparse job had gone (op-restore-sqlite: three
+        runs on 2026-10-12, missing scripts/install-zig-ci.sh, "not uptodate"): a failed checkout leaves
+        skip-worktree entries with no sparse setting, or tracked files that differ from HEAD. job-started
+        resets those too."""
+        git_env = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GIT_AUTHOR_NAME": "t",
+                   "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"}
+
+        def git(ws: Path, *args: str) -> str:
+            return subprocess.run(["git", "-C", os.fspath(ws), *args], env=git_env, capture_output=True,
+                                  text=True, check=True).stdout.strip()
+
+        def workspace(name: str) -> Path:
+            ws = self.dir / name / "_work" / "cmux" / "cmux"
+            (ws / "scripts").mkdir(parents=True)
+            (ws / "scripts" / "install-zig-ci.sh").write_text("z\n")
+            (ws / "scripts" / "other.sh").write_text("o\n")
+            git(ws, "init", "-q")
+            git(ws, "add", "-A")
+            git(ws, "commit", "-qm", "one")
+            return ws
+
+        path = event(self.dir, "push", {"repository": CMUX})
+        skipped = workspace("actions-runner-glaeda-2")
+        git(skipped, "update-index", "--skip-worktree", "scripts/install-zig-ci.sh")
+        (skipped / "scripts" / "install-zig-ci.sh").unlink()
+        missing = workspace("actions-runner-glaeda-3")
+        (missing / "scripts" / "install-zig-ci.sh").unlink()
+        for ws in (skipped, missing):
+            with self.subTest(ws.parts[-4]):
+                result = self.run_hook("job-started", "push", path, "--allowed-repo", "manaflow-ai/cmux",
+                                       "--no-disk", repo="manaflow-ai/cmux", env={"GITHUB_WORKSPACE": os.fspath(ws)})
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("reset the", result.stdout)
+                self.assertEqual(sorted(p.name for p in ws.iterdir()), [".git"])
+                git(ws, "reset", "-q", "--hard", "HEAD")  # what actions/checkout runs next
+                self.assertEqual((ws / "scripts" / "install-zig-ci.sh").read_text(), "z\n")
+                self.assertEqual(git(ws, "ls-files", "-v", "scripts/install-zig-ci.sh"), "H scripts/install-zig-ci.sh")
+
     def test_fails_closed_without_event(self) -> None:
         self.assertEqual(self.run_hook("job-started", None, None, "--no-disk").returncode, 1)
         self.assertEqual(self.run_hook("job-started", "push", self.dir / "missing.json", "--no-disk").returncode, 1)

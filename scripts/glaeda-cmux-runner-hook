@@ -1297,7 +1297,8 @@ DIAGNOSTIC_REPORTS = Path("/Library/Logs/DiagnosticReports")
 # uptodate; will not remove from working tree") and left the job without its scripts (manaflow-ai/cmux runs
 # 38301254053 and 38308823659, 2026-10-12). Before the checkout, such a workspace keeps only its object store:
 # the index, the sparse settings and every working file go, so checkout's `reset --hard` writes the tree whole
-# with a fresh index. A workspace that is not sparse is never touched.
+# with a fresh index. A failed checkout's leftovers get the same reset (workspace_damage); a workspace whose
+# tracked files match HEAD is never touched.
 SPARSE_SETTINGS = ("core.sparseCheckout", "core.sparseCheckoutCone", "index.sparse", "extensions.worktreeConfig")
 
 
@@ -1308,9 +1309,8 @@ def unsparse_workspace(workspace: str | None) -> str:
     git_dir = ws / ".git"
     if "_work" not in ws.parts or git_dir.is_symlink() or not git_dir.is_dir():
         return ""
-    sparse = subprocess.run(["git", "-C", os.fspath(ws), "config", "--bool", "--default", "false",
-                             "core.sparseCheckout"], capture_output=True, text=True, timeout=30, check=False)
-    if sparse.stdout.strip() != "true":
+    why = workspace_damage(ws)
+    if not why:
         return ""
     for child in ws.iterdir():
         if child.name == ".git":
@@ -1325,7 +1325,26 @@ def unsparse_workspace(workspace: str | None) -> str:
     for leftover in (git_dir / "index", git_dir / "info" / "sparse-checkout", git_dir / "config.worktree"):
         with contextlib.suppress(FileNotFoundError):
             leftover.unlink()
-    return f"reset the sparse workspace {ws} an earlier job left (checkout rebuilds it whole)"
+    return f"reset the workspace {ws} an earlier job left {why} (checkout rebuilds it whole)"
+
+
+def workspace_damage(ws: Path) -> str:
+    """Why the reused workspace cannot take a plain checkout, or "". A failed checkout (glaeda-2, three
+    cmux-tui runs on 2026-10-12) leaves skip-worktree entries with no sparse setting, or tracked files that
+    differ from HEAD; checkout's clean and reset --hard did not recover it."""
+    def git(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", "-C", os.fspath(ws), *args], capture_output=True, text=True,
+                              timeout=60, check=False)
+
+    if git("config", "--bool", "--default", "false", "core.sparseCheckout").stdout.strip() == "true":
+        return "sparse"
+    listed = git("ls-files", "-v")
+    if listed.returncode != 0 or any(line.startswith("S ") for line in listed.stdout.splitlines()):
+        return "with skip-worktree entries"
+    status = git("status", "--porcelain", "--untracked-files=no", "--ignore-submodules=all")
+    if status.returncode != 0 or status.stdout.strip():
+        return "with tracked files that differ from HEAD"
+    return ""
 
 
 def dequeue_diagnostics_reporter(queues: tuple[Path, ...] = DIAGNOSTICS_QUEUES,
