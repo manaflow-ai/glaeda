@@ -245,7 +245,8 @@ class Family:
     git_disposable: bool = False  # a checkout that loses nothing when deleted is reclaimable
     nested_git: bool = False  # judge every checkout inside an item, not only one rooted at it
     owner: str = ""  # who writes it, so a cache nobody owns any more is visible
-    owner_job: str = ""  # launchd service of that owner (e.g. system/ai.x.worker); unloaded = retired
+    # launchd services of that owner (e.g. system/ai.x.worker), one or several; retired = none of them loaded
+    owner_job: str | tuple[str, ...] = ""
     rebuild_minutes: float = 10.0  # rough cost of losing it; cheaper items go first under pressure
     skip_prefixes: tuple[str, ...] = ()  # candidates whose name starts with one of these are skipped
     # size every missing candidate with one `du -d1` walk of root instead of one du per candidate:
@@ -1086,6 +1087,10 @@ def bazel_family(root: Path) -> Family:
                   rebuild_minutes=30, build_output=True, platform=host_cache_platform())
 
 
+# launchd services of the hq build workers that read and write /Users/Shared/cmux-build-fleet/cache
+HQ_BUILD_WORKERS = ("system/ai.manaflow.cmux-build-worker", "system/ai.manaflow.cmux-lent-worker")
+
+
 def default_families() -> list[Family]:
     tmp = Path("/private/tmp") if DARWIN else Path("/tmp")
     tmpfs = tmp.is_dir() and fs_type(tmp) == "tmpfs"
@@ -1163,13 +1168,14 @@ def default_families() -> list[Family]:
         fams.append(Family("user-tmp", user_tmp, True, "agent scratch under the per-user $TMPDIR",
                            skip_prefixes=("com.apple.",), git_disposable=True,
                            owner="agents and tools", rebuild_minutes=0.5, platform="shared"))
-    # The dev-build worker's shared cache (the cmuxterm-hq controller's worker, live only on the dev-build worker
-    # host since cmuxterm-hq#661): visible with its owner, never deleted here. When the worker is unloaded the
-    # report says so, since other tools may still read parts of it (2026-09-24).
+    # The hq build workers' shared cache: the dedicated dev-build worker (cmuxterm-hq#661) and the lent worker
+    # on borrowed minis (ai.manaflow.cmux-lent-worker, CMUX_CI_SHARED_CACHE_DIR) both build in it. It is
+    # retired, and reclaimable, only while neither service is loaded. Naming only the dev-build worker
+    # labelled the lent minis' live cmux-workspaces "RETIRED" (cmux12s, 2026-10-11).
     fams.append(Family("hq-build-fleet-cache", Path("/Users/Shared/cmux-build-fleet/cache"), True,
-                       "the retired dev-build worker rebuilds its cache", retired_only=True,
-                       owner="cmux dev-build worker (hq controller)",
-                       owner_job="system/ai.manaflow.cmux-build-worker", platform="macos"))
+                       "the hq build worker rebuilds its cache", retired_only=True,
+                       owner="cmux dev-build and lent build workers (hq controller)",
+                       owner_job=HQ_BUILD_WORKERS, platform="macos"))
     bazel_user = ""
     with contextlib.suppress(KeyError):
         bazel_user = pwd.getpwuid(uid).pw_name
@@ -2601,16 +2607,23 @@ def _children(path: Path) -> list[Path]:
         return []
 
 
+def owner_jobs(fam: Family) -> tuple[str, ...]:
+    return (fam.owner_job,) if isinstance(fam.owner_job, str) else tuple(fam.owner_job)
+
+
 def owner_retired(fam: Family) -> bool:
-    """True when the family names its owner's launchd service and that service is not loaded."""
-    if not fam.owner_job or not DARWIN:
+    """True when the family names its owner's launchd services and none of them is loaded."""
+    jobs = [j for j in owner_jobs(fam) if j]
+    if not jobs or not DARWIN:
         return False
-    try:
-        # 113 is launchctl's "could not find service"; any other failure is not evidence of retirement
-        return subprocess.run(["launchctl", "print", fam.owner_job], capture_output=True,
-                              timeout=10).returncode == 113
-    except (OSError, subprocess.SubprocessError):
-        return False  # unknown: say nothing rather than call a live owner retired
+    for job in jobs:
+        try:
+            # 113 is launchctl's "could not find service"; any other failure is not evidence of retirement
+            if subprocess.run(["launchctl", "print", job], capture_output=True, timeout=10).returncode != 113:
+                return False
+        except (OSError, subprocess.SubprocessError):
+            return False  # unknown: say nothing rather than call a live owner retired
+    return True
 
 
 def _pid_alive(pid: int) -> bool:

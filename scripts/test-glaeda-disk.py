@@ -1155,6 +1155,43 @@ class GlaedaDiskTest(unittest.TestCase):
         gone = gd.Family("x", self.root, False, "", owner="someone", owner_job="system/com.example.glaeda-none")
         self.assertTrue(gd.owner_retired(gone))
 
+    def test_a_shared_cache_is_retired_only_when_no_worker_using_it_is_loaded(self) -> None:
+        """cmux12s, 2026-10-11: the lent worker builds in the shared cache, which was labelled RETIRED
+        because only the dedicated dev-build worker's service was asked."""
+        fam = gd.Family("hq-build-fleet-cache", self.root, True, "x", retired_only=True,
+                        owner_job=gd.HQ_BUILD_WORKERS)
+        self.assertIn("system/ai.manaflow.cmux-lent-worker", gd.HQ_BUILD_WORKERS)
+        self.assertIn("system/ai.manaflow.cmux-build-worker", gd.HQ_BUILD_WORKERS)
+        loaded: set[str] = set()
+        asked: list[str] = []
+
+        def launchctl(argv, **_):
+            asked.append(argv[-1])
+            return subprocess.CompletedProcess(argv, 0 if argv[-1] in loaded else 113)
+
+        make(self.root / "cmux-workspaces")
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd.subprocess, "run", launchctl):
+            self.assertTrue(gd.owner_retired(fam))
+            self.assertEqual(asked, list(gd.HQ_BUILD_WORKERS))
+            loaded.add("system/ai.manaflow.cmux-lent-worker")  # a lent mini
+            self.assertFalse(gd.owner_retired(fam))
+            with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+                self.assertEqual(self.verdicts_for([fam])["cmux-workspaces"], "report-only")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                gd.report([], [], 0, 24, fams={fam.id: fam})
+                gd.report([gd.Item(fam.id, str(self.root / "cmux-workspaces"), 1, 48, "report-only")], [], 0,
+                          24, fams={fam.id: fam})
+            self.assertNotIn("RETIRED", out.getvalue())
+            loaded.clear()
+            loaded.add("system/ai.manaflow.cmux-build-worker")  # the dedicated dev-build worker
+            self.assertFalse(gd.owner_retired(fam))
+        # a single service name still works
+        one = gd.Family("x", self.root, False, "", owner_job="system/a")
+        with mock.patch.object(gd, "DARWIN", True), \
+                mock.patch.object(gd.subprocess, "run", lambda argv, **_: subprocess.CompletedProcess(argv, 113)):
+            self.assertTrue(gd.owner_retired(one))
+
     def test_pressure_waits_for_a_ci_job_until_the_emergency_floor(self) -> None:
         job = "/Users/cmux/actions-runner-glaeda-2/bin/Runner.Worker spawnclient 148 151"
         self.assertTrue(gd.CI_WORKER.search(job))
