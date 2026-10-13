@@ -179,6 +179,8 @@ JOB_CLASSES = {"macos-compile-admission": "compile", "app-host-unit-tests": "gui
 # xcodebuild of the cmux app scheme into a DerivedData kept per runner under
 # ~/Library/Caches/cmux-next-ci/cmux-scheme/<runner> (cmux "cmux-next CI: compile the cmux app scheme"). No GUI
 # session, keychain, fixed port or canonical root, and none touches compile admission's kept DerivedData.
+# `fast-tier` (cmux hq#1915) and `swift-canary` build SwiftPM packages and cargo tests in the workspace only,
+# so they are isolated too; as unknown jobs they waited for persistent-dd behind a compile.
 # cmux-next-frame-pacing.yml (cmux#16511, nightly, side lane, owned minis only) calls reload-build.yml, so its
 # `build` is reload-build's isolated Debug build under the caller's name. Its `bench` unpacks that app into
 # $RUNNER_TEMP and flings the agent pane in the console session on a 120 Hz virtual display: it takes the gui
@@ -193,6 +195,7 @@ WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "
                         ("nightly.yml", "build-nightly-app"): "isolated",
                         ("cmux-next.yml", "swift-test"): "isolated", ("cmux-next.yml", "release-compile"): "isolated",
                         ("cmux-next.yml", "cmux-scheme-compile"): "isolated",
+                        ("cmux-next.yml", "fast-tier"): "isolated", ("cmux-next.yml", "swift-canary"): "isolated",
                         ("cmux-next-frame-pacing.yml", "build"): "isolated",
                         ("cmux-next-frame-pacing.yml", "bench"): "gui-step"}
 # root: the canonical root (/private/tmp/cmux-ci) that compiles build in and that app-host test consumers

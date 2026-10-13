@@ -2234,6 +2234,11 @@ time.sleep(60)
         self.assertEqual(hook.job_class("test", home, home, "test-e2e.yml"), ("gui-step", False))
         self.assertEqual(hook.job_class("lint", home, home, "test-e2e.yml"), ("compile", True))
         self.assertEqual(hook.job_class("build", "someone/else", home, "test-e2e.yml"), ("isolated", False))
+        # cmux-next's fast tier and Swift canary build SwiftPM packages (and cargo tests) in the workspace only:
+        # no kept DerivedData or canonical root, so no persistent-dd wait behind a compile (hq#1915: the fast
+        # tier waited 11.4 min for the token for a 52 s run, cmux run 38352638705)
+        for job in ("fast-tier", "swift-canary"):
+            self.assertEqual(hook.job_class(job, home, home, "cmux-next.yml"), ("isolated", False))
         self.assertEqual(hook.CLASS_COST["compile-gui"], (2, ("root",)),
                          "no persistent-dd: the E2E build never writes compile admission's kept DerivedData")
         self.assertNotIn("compile-gui", hook.ROOT_CONSUMERS, "a producer takes a token-chosen root")
