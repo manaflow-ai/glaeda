@@ -73,7 +73,9 @@ the `Set up runner` step, and the repository's rescue (cmux: the owned-pool resc
 re-runs it, usually on Blacksmith. `wait` treats such a failure as pending for `--rescue-grace`
 seconds (default 360) and then decides on the next attempt; the summary says
 `held: ... refused ... at setup`. With no new attempt within the grace, the failure stands and
-the note says so. Any other failure in the same attempt decides at once.
+the note says so. Any other failure in the same attempt decides at once. A PR check cancelled
+before any step ran (the rescue cancels a job still queued for a runner, then re-runs it) is held
+the same way: `held: ... cancelled before any step ran`.
 `--rescue-grace 0` rules on each attempt as it finishes.
 
 ## Waiting for a comment

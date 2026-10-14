@@ -490,6 +490,12 @@ def slim_run(doc: dict) -> dict:
     return {k: doc.get(k) for k in keep}
 
 
+def wants_steps(c: dict) -> bool:
+    """A check whose steps the daemon reads once: a failure (which steps failed) or a cancellation
+    (did any step run: the owned-pool rescue cancels a job still queued for a runner, then re-runs it)."""
+    return bool(c.get("id")) and (c.get("conclusion") or "").upper() in STEP_FAILED | {"CANCELLED"}
+
+
 def failed_steps(steps: list | None) -> list[str]:
     return [str(s.get("name")) for s in steps or [] if isinstance(s, dict)
             and str(s.get("conclusion") or "").upper() in STEP_FAILED]
@@ -798,17 +804,17 @@ class Daemon:
         for e, _ in pairs:
             for c in (((e["cache"] or {}).get("data") or {}).get("checks") or []):
                 if c.get("id") and isinstance(c.get("failedSteps"), list):
-                    known[c["id"]] = c["failedSteps"]
+                    known[c["id"]] = [c["failedSteps"], c.get("stepCount")]
         want: dict[str, list[dict]] = {}
         for _, data in pairs:
             for c in data.get("checks") or []:
-                if not c.get("id") or (c.get("conclusion") or "").upper() not in STEP_FAILED:
+                if not wants_steps(c):
                     continue
                 if c["id"] in known:
-                    c["failedSteps"] = known[c["id"]]
+                    c["failedSteps"], c["stepCount"] = known[c["id"]]
                 else:
                     want.setdefault(c["id"], []).append(c)
-        ids = list(want)[:2 * STEPS_BATCH]  # the rest wait a cycle: a PR with 100 failures fails anyway
+        ids = list(want)[:2 * STEPS_BATCH]  # the rest wait a cycle (failed and cancelled checks; each is read once)
         for i in range(0, len(ids), STEPS_BATCH):
             if self.mode("graphql") == "stop":
                 return
@@ -818,9 +824,11 @@ class Daemon:
                 return
             for node in (doc.get("data") or {}).get("nodes") or []:
                 if isinstance(node, dict) and node.get("id") in want:
-                    names = failed_steps((node.get("steps") or {}).get("nodes"))
+                    steps = (node.get("steps") or {}).get("nodes")
+                    names = failed_steps(steps)
                     for c in want[node["id"]]:
-                        c["failedSteps"] = names
+                        # steps null (a partial error) is unknown, never "no step ran"
+                        c["failedSteps"], c["stepCount"] = names, len(steps) if isinstance(steps, list) else None
 
     def get(self, path: str, etag: str | None) -> tuple[str, Any, str | None]:
         """("fresh", doc, etag), ("same", None, etag) on 304, or ("error", message, None)."""
@@ -1179,6 +1187,12 @@ def failing(checks: list[dict]) -> list[dict]:
     return [c for c in checks if (c.get("conclusion") or "").upper() in FAILED]
 
 
+def cancelled_unstarted(c: dict) -> bool:
+    """A PR check cancelled before any step ran: the rescue cancels a job still queued for a runner and
+    re-runs it. Unknown steps (never read) count as started, so a real cancellation still fails."""
+    return (c.get("conclusion") or "").upper() == "CANCELLED" and c.get("stepCount") == 0
+
+
 def refused_check(c: dict) -> bool:
     """A PR check whose runner refused the job: its job-started hook step failed at job start."""
     return ((c.get("conclusion") or "").upper() == "FAILURE" and HOOK_STEP in (c.get("failedSteps") or [])
@@ -1196,17 +1210,24 @@ def refused_job(job: dict) -> bool:
 def classify(data: dict, now: float | None = None, grace: float = RESCUE_GRACE) -> dict[str, list[dict]]:
     """Split a PR's checks into passed, failed, pending and held. A failed check is held while a job
     of its workflow run was refused at runner setup less than `grace` seconds ago: the rescue re-runs
-    that run's failed jobs, dependents such as an aggregate status check included."""
+    that run's failed jobs, dependents such as an aggregate status check included. A check cancelled
+    before any step ran is held as long: the rescue cancelled it in the queue and re-runs it."""
     now = time.time() if now is None else now
     checks = data.get("checks") or []
-    held_runs = {c.get("runId") for c in checks if c.get("runId") and refused_check(c)
-                 and now - (iso_epoch(c.get("completedAt")) or 0) < grace}
+    def recent(c: dict) -> bool:
+        return now - (iso_epoch(c.get("completedAt")) or 0) < grace
+    held_runs = {c.get("runId") for c in checks if c.get("runId") and refused_check(c) and recent(c)}
+    # the rescue cancels the whole run: its jobs that were running come back cancelled with steps
+    queued_runs = {c.get("runId") for c in checks if c.get("runId") and cancelled_unstarted(c) and recent(c)}
     out: dict[str, list[dict]] = {"passed": [], "failed": [], "pending": [], "held": []}
     for c in checks:
+        cancelled = (c.get("conclusion") or "").upper() == "CANCELLED"
         if c.get("status") != "COMPLETED":
             out["pending"].append(c)
         elif (c.get("conclusion") or "").upper() in FAILED:
-            out["held" if c.get("runId") in held_runs else "failed"].append(c)
+            held = (c.get("runId") in held_runs or (cancelled_unstarted(c) and recent(c))
+                    or (cancelled and c.get("runId") in queued_runs))
+            out["held" if held else "failed"].append(c)
         else:
             out["passed"].append(c)
     return out
@@ -1359,7 +1380,11 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
         if len(bad) > 20:
             lines.append(f"  ... {len(bad) - 20} more failed")
         for c in groups["held"][:20]:
-            lines.append(f"  held: {label(c)}{steps_note(c)}: its run had a job refused at runner setup; "
+            refused = any(refused_check(o) and o.get("runId") == c.get("runId") for o in checks)
+            why = ("cancelled before any step ran" if cancelled_unstarted(c)
+                   else "its run had a job refused at runner setup" if refused
+                   else "its run was cancelled while a job was still queued")
+            lines.append(f"  held: {label(c)}{steps_note(c)}: {why}; "
                          f"pending up to {int(grace)}s for the re-run  {c.get('url') or ''}".rstrip())
         for c in (data.get("superseded") or [])[:10]:
             optional = " (not required)" if marked and not c.get("required") else ""
