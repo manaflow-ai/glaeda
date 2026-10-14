@@ -1271,6 +1271,36 @@ class ClientTest(Base):
         data["checks"][0]["failedSteps"] = ["Run selected tests"]
         self.assertEqual(gg.verdict("pr", data, "green"), 1)
 
+    def test_over_100_checks_a_held_check_still_waits_for_its_rescue(self) -> None:
+        """manaflow-ai/cmux#20733 (95 checks shown of more): the rescue cancelled a queued fast tier, and
+        the wait exited 1 on GitHub's FAILURE rollup while 13 checks still ran and the re-run was due."""
+        now = time.time()
+        queued = {**check_run("fast tier", conclusion="CANCELLED"), "id": "CR_q", "databaseId": 5,
+                  "startedAt": iso(now - 104), "completedAt": iso(now - 5),
+                  "checkSuite": {"conclusion": "CANCELLED", "workflowRun": {"databaseId": 9, "workflow": {"name": "cmux-next"}}}}
+        running = check_run("react-apps-check", status="IN_PROGRESS", conclusion=None)
+        data = gg.parse_pr(pr_node(1, rollup="FAILURE", checks=[queued, running, check_run("build")]))
+        data["checks"][0]["stepCount"] = 0
+        many = {**data, "checksTruncated": True, "checkState": "FAILURE"}
+        self.assertIsNone(gg.verdict("pr", many, "green"))
+        self.assertIsNone(gg.verdict("pr", many, "done"))
+        # the re-run never came: the rollup's FAILURE decides once the grace is over
+        settled = {**many, "checks": [c for c in many["checks"] if c.get("name") != "react-apps-check"]}
+        self.assertEqual(gg.verdict("pr", settled, "green", now=now + gg.RESCUE_GRACE + 1), 1)
+        # a real failure in the shown checks still fails at once; with none shown and none held, the
+        # rollup's FAILURE is a check past the first 100
+        broken = gg.parse_pr(pr_node(2, rollup="FAILURE", checks=[queued, check_run("lint", conclusion="FAILURE")]))
+        broken["checks"][0]["stepCount"] = 0
+        self.assertEqual(gg.verdict("pr", {**broken, "checksTruncated": True, "checkState": "FAILURE"}, "green"), 1)
+        # --until done waits for every shown check to finish, failure or not, as under 100 checks
+        busy = gg.parse_pr(pr_node(5, rollup="FAILURE", checks=[check_run("lint", conclusion="FAILURE"), running]))
+        self.assertIsNone(gg.verdict("pr", {**busy, "checksTruncated": True, "checkState": "FAILURE"}, "done"))
+        self.assertEqual(gg.verdict("pr", {**busy, "checksTruncated": True, "checkState": "FAILURE"}, "green"), 1)
+        hidden = gg.parse_pr(pr_node(3, rollup="FAILURE", checks=[check_run("build")]))
+        self.assertEqual(gg.verdict("pr", {**hidden, "checksTruncated": True, "checkState": "FAILURE"}, "green"), 1)
+        ok = gg.parse_pr(pr_node(4, rollup="SUCCESS", checks=[check_run("build")]))
+        self.assertEqual(gg.verdict("pr", {**ok, "checksTruncated": True, "checkState": "SUCCESS"}, "green"), 0)
+
     def test_a_check_cancelled_before_any_step_is_held_for_the_rescue(self) -> None:
         """manaflow-ai/cmux#20608: the owned-pool rescue cancelled a fast tier still queued for a
         runner (no step ran) and re-ran it; a wait that read the gap exited 1 before the re-run."""

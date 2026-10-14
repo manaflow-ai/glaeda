@@ -1236,10 +1236,22 @@ def classify(data: dict, now: float | None = None, grace: float = RESCUE_GRACE) 
 def check_verdict(data: dict, until: str = "green", now: float | None = None,
                   grace: float = RESCUE_GRACE) -> int | None:
     """The checks alone, whatever the PR's state or head: EXIT_OK, EXIT_FAIL, or None while pending."""
-    if data.get("checksTruncated"):  # more than 100 checks: GitHub's own rollup decides
-        state = data.get("checkState")
-        return EXIT_OK if state == "SUCCESS" else EXIT_FAIL if state in {"FAILURE", "ERROR"} else None
     checks = data.get("checks") or []
+    if data.get("checksTruncated"):
+        # More than 100 checks: only the first 100 are here, so GitHub's rollup decides, except that a
+        # check shown as held or still running defers its FAILURE (manaflow-ai/cmux#20733: a queued fast
+        # tier the rescue cancelled read as a failure while 13 checks still ran).
+        state = data.get("checkState")
+        if state == "SUCCESS":
+            return EXIT_OK
+        if state not in {"FAILURE", "ERROR"}:
+            return None
+        groups = classify(data, now, grace)
+        if until == "done" and (groups["pending"] or groups["held"]):
+            return None  # every shown check finishes first, as under 100 checks
+        if groups["failed"] and until != "required":
+            return EXIT_FAIL
+        return None if groups["held"] else EXIT_FAIL
     if not checks:
         return None  # nothing has reported yet
     marked = any(c.get("required") for c in checks)
