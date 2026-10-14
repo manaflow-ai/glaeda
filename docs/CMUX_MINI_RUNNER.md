@@ -254,6 +254,11 @@ What `--apply` does:
        canonical root is taken, or every unit is. Only it carries the gui pool label, so
        holding it keeps no compile off the mini, and GitHub hands the GUI job to another
        mini's gui runner instead.
+     - A fast runner (`--fast-runner`, below) looks only at the two fast tokens
+       (`capacity/fast-0.token`, `fast-1.token`): it stops while either is taken or a job
+       here waits for one, and listens with every shared unit taken. No other runner,
+       `fits` or `admit` counts the fast tokens. The host lock, reservation, drain,
+       saturation and disk holds apply to it as to every runner.
    - **When the console session cannot run GUI tests** (gui runner only). GUI jobs run
      in the console user's session, and a mini whose auto-login session is screen-locked
      (display sleep, then the lock) or sits at the login window fails every one
@@ -698,6 +703,15 @@ in at the producer's root. So one root job per root per mini:
   `canonicalRoots + guiRunners` is at most `runners`. Admission is unchanged: a GUI job takes 1 unit, the
   gui token (an app-host shard in the step before its restore instead), and the producer's root in its
   restore step.
+- `fastRunners` (0 or 1, default 0) makes the last instance (`runners - 1`) the mini's fast runner; with
+  `guiRunners` 1 too, the gui runner moves to `runners - 2`. It carries the fast pool label
+  `glaeda-fast-<class>-xcode-<version>` and neither the pool, root, side, gui nor `glaeda-ios-sim` label, and its
+  job-started hook passes `--fast-runner`. cmux-next's `fast-tier` job (`cmux-next.yml`) run there is admitted as
+  class `fast`: the two fast tokens and none of the shared capacity units, so it no longer queues behind the side
+  lane (median 38.5 min, p90 73 min before). The same job on a side runner keeps its `isolated` cost (2 shared
+  units), and any other job on the fast runner keeps its own cost and never takes a fast token.
+  `canonicalRoots + guiRunners + fastRunners` is at most `runners`. Turning it on or off changes instance
+  labels, so it needs `glaeda-cmux-runner-fleet --apply` (refused while jobs run), by an operator with org admin.
 - A desktop VM runner is a future, disabled design. It may use the GUI label and a distinct `gui-vm`
   accounting token, but the guest must not receive read-write access to the host capacity ledger. A
   host-side broker, immutable VM ownership receipt, and atomic runner drain are required before any

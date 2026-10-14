@@ -705,6 +705,74 @@ class HookTest(unittest.TestCase):
                 self.finish(runner)
         self.assertTrue(self.lock_free(), "every holder let go")
 
+    # ------------------------------------------------------------ the fast-tier runner
+
+    FAST_TIER = {"GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/cmux-next.yml@refs/heads/feat-cmux-next"}
+
+    def take_units(self, n: int) -> list[int]:
+        """Hold the first n general unit files, as n units of other jobs would."""
+        capacity = self.dir / "capacity"
+        capacity.mkdir(parents=True, exist_ok=True)
+        fds = [hook.lock_file(capacity / f"unit-{slot}", fcntl.LOCK_EX) for slot in range(n)]
+        self.assertNotIn(None, fds)
+        for fd in fds:
+            self.addCleanup(os.close, fd)
+        return fds
+
+    def test_a_fast_tier_job_on_the_fast_runner_runs_while_every_general_unit_is_taken(self) -> None:
+        """cmux-next's fast-tier queued a median 38.5 min (p90 73) behind the side lane for the 5 shared units.
+        On the fast runner (--fast-runner) it takes the two fast tokens instead, outside those units, and goes
+        ahead of a job that waits here for general units: it needs none."""
+        self.fleet()
+        self.take_units(5)
+        capacity = self.dir / "capacity"
+        (capacity / f"{hook.ADMIT_WANT}{os.getpid()}").write_text(
+            json.dumps({"since": time.time() - 30, "wants": ["units"], "who": "r9 swift-test (run 1)"}) + "\n")
+        try:
+            fast = self.job("fast-tier", "f0", 5, None, "--fast-runner", env=self.FAST_TIER)
+            self.assertEqual(fast.returncode, 0, fast.stdout + fast.stderr)
+            self.assertIn("holding 0/5 units+fast-0+fast-1 for fast-tier (fast", fast.stdout)
+            second = self.job("fast-tier", "f1", 5, None, "--fast-runner", env=self.FAST_TIER)
+            self.assertEqual(second.returncode, 1, second.stdout)
+            self.assertIn("refused: capacity: the fast-0 token is taken", second.stdout)
+        finally:
+            self.finish("f0")
+        self.assertTrue(hook.probe(capacity / "fast-0.token") and hook.probe(capacity / "fast-1.token"))
+
+    def test_a_fast_tier_job_on_a_side_runner_still_costs_two_general_units(self) -> None:
+        self.fleet()
+        try:
+            side = self.job("fast-tier", "s0", 5, None, env=self.FAST_TIER)
+            self.assertEqual(side.returncode, 0, side.stdout + side.stderr)
+            self.assertIn("holding 2/5 units for fast-tier (isolated", side.stdout)
+            self.assertTrue(hook.probe(self.dir / "capacity/fast-0.token"))
+        finally:
+            self.finish("s0")
+        self.take_units(4)
+        full = self.job("fast-tier", "s1", 5, None, env=self.FAST_TIER)
+        self.assertEqual(full.returncode, 1, full.stdout)
+        self.assertIn("refused: capacity: 1 of 5 units free, fast-tier (isolated) needs 2", full.stdout)
+
+    def test_the_fast_runner_refuses_every_other_job(self) -> None:
+        """The fast runner keeps listening on a full mini (it needs no general units), so another job that
+        reached it would wait there for units with no limit and idle the runner. It is refused instead, before
+        taking anything, and the fast tokens stay free."""
+        self.fleet()
+        capacity = self.dir / "capacity"
+        cases = (("swift-package-tests", {}),
+                 ("release-compile", self.FAST_TIER),
+                 ("fast-tier", {"GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/other.yml@refs/heads/main"}))
+        for index, (job, env) in enumerate(cases):
+            with self.subTest(job):
+                runner = f"n{index}"
+                try:
+                    started = self.job(job, runner, 5, None, "--fast-runner", env=env)
+                    self.assertEqual(started.returncode, 1, started.stdout + started.stderr)
+                    self.assertIn("refused: the fast runner takes only the fast tier", started.stdout)
+                    self.assertTrue(hook.probe(capacity / "fast-0.token") and hook.probe(capacity / "fast-1.token"))
+                finally:
+                    self.finish(runner)
+
     def test_job_log_records_started_refused_and_completed(self) -> None:
         self.fleet()
         log = self.dir / "Library/Logs/glaeda-cmux-jobs.jsonl"
@@ -3727,6 +3795,29 @@ class GateTest(unittest.TestCase):
         self.assertEqual(hook.mini_full(capacity, 5, one), "the canonical root is taken")
         os.close(held)
 
+    def test_the_fast_runner_listens_only_while_the_fast_tokens_are_free(self) -> None:
+        fast = hook.RunnerScope(5, 2, 2, False, False, fast=True)
+        self.assertIsNone(hook.mini_full(self.units(5), 5, fast), "the fast runner takes no general unit")
+        capacity = self.units(0)
+        for name in ("fast-0.token", "fast-1.token"):
+            held = hook.lock_file(capacity / name, fcntl.LOCK_EX)
+            self.assertEqual(hook.mini_full(capacity, 5, fast), f"the {name[:-6]} token is taken")
+            os.close(held)
+        self.assertIsNone(hook.mini_full(capacity, 5, fast))
+        (capacity / f"{hook.ADMIT_WANT}{os.getpid()}").write_text(
+            json.dumps({"since": time.time(), "wants": ["fast-0"], "who": "f1 fast-tier (run 2)"}) + "\n")
+        self.assertEqual(hook.mini_full(capacity, 5, fast), "f1 fast-tier (run 2) waits here for fast-0")
+        (capacity / f"{hook.ADMIT_WANT}{os.getpid()}").write_text(
+            json.dumps({"since": time.time(), "wants": ["units"], "who": "r9 swift-test (run 1)"}) + "\n")
+        self.assertIsNone(hook.mini_full(capacity, 5, fast), "a job waiting for general units is not its business")
+        # and no other runner counts the fast tokens
+        held = [hook.lock_file(capacity / name, fcntl.LOCK_EX) for name in ("fast-0.token", "fast-1.token")]
+        (capacity / f"{hook.ADMIT_WANT}{os.getpid()}").unlink()
+        for scope in (hook.RunnerScope(5, 2, 2, True), hook.RunnerScope(5, 2, 2), hook.RunnerScope(5, 2, 2, False, True)):
+            self.assertIsNone(hook.mini_full(capacity, 5, scope), scope)
+        for fd in held:
+            os.close(fd)
+
     def test_the_full_probe_never_competes_with_an_admission(self) -> None:
         capacity = self.units(1)
         admission = os.open(capacity / "admission.lock", os.O_RDONLY)
@@ -5044,6 +5135,52 @@ class RunnerTest(unittest.TestCase):
         self.assertNotIn("--gui-runner", (self.home / "actions-runner-glaeda-2/glaeda-hooks/job-started.sh").read_text())
         self.assertEqual(hook.runner_scope(self.home / "actions-runner-glaeda-4"), hook.RunnerScope(5, 2, 2, False, True))
 
+    def fast_labels(self, classes: dict, name: str) -> tuple[list[list[str]], list[str]]:
+        """Apply every instance of mini-std under these runner classes: (labels per instance, job-started.sh texts)."""
+        manifest = json.loads(json.dumps(MANIFEST))
+        manifest["defaults"]["runner"] = {"classes": {"std": classes}}
+        path = self.state / f"{name}.json"
+        path.write_text(json.dumps(manifest))
+        home = self.home.parent / f"operator-{name}"  # each fleet shape installs into a fresh home
+        home.mkdir()
+        labels: list[list[str]] = []
+        with mock.patch.dict(os.environ, {"HOME": os.fspath(home)}), \
+                mock.patch.object(cr, "xcode_present", return_value=True):
+            for instance in range(classes["runners"]):
+                receipt = self.invoke("--apply", "--manifest", os.fspath(path), "--member", "mini-std",
+                                      "--instance", str(instance), "--replace")
+                [register] = [a for a in receipt["actions"] if a.get("kind") == "register"]
+                labels.append(register["labels"])
+        hooks = [(home / f"actions-runner-glaeda{'-' + str(k) if k else ''}/glaeda-hooks/job-started.sh").read_text()
+                 .replace(os.fspath(home), "HOME") for k in range(classes["runners"])]
+        self.fast_home = home
+        return labels, hooks
+
+    def test_fast_runners_one_makes_the_last_instance_the_fast_runner(self) -> None:
+        base = {"runners": 5, "capacityUnits": 5, "compileSlots": 2, "canonicalRoots": 2}
+        today, today_hooks = self.fast_labels(base, "today")
+        roles = lambda l: [x for x in l if x.startswith(("glaeda-std", "glaeda-root", "glaeda-side", "glaeda-gui",
+                                                          "glaeda-fast"))]
+        self.assertEqual([roles(l) for l in today],
+                         [["glaeda-std-xcode-26.6", "glaeda-root-std-xcode-26.6"]] * 2
+                         + [["glaeda-std-xcode-26.6", "glaeda-side-std-xcode-26.6"]] * 3)
+        zero, zero_hooks = self.fast_labels({**base, "fastRunners": 0}, "zero")
+        self.assertEqual((zero, zero_hooks), (today, today_hooks), "fastRunners 0 is today's fleet exactly")
+        self.assertFalse([h for h in today_hooks if "--fast-runner" in h])
+        fast, fast_hooks = self.fast_labels({**base, "fastRunners": 1}, "fast")
+        self.assertEqual(fast[:4], today[:4], "every other runner keeps its labels")
+        self.assertEqual(fast_hooks[:4], today_hooks[:4])
+        self.assertEqual(roles(fast[4]), ["glaeda-fast-std-xcode-26.6"], "only the fast label, no pool or side one")
+        self.assertEqual([l.count("glaeda-fast-std-xcode-26.6") for l in fast], [0, 0, 0, 0, 1])
+        self.assertIn("--canonical-roots 2 --instance 4 --fast-runner\n", fast_hooks[4])
+        self.assertTrue(hook.runner_scope(self.fast_home / "actions-runner-glaeda-4").fast)
+        self.assertFalse(hook.runner_scope(self.fast_home / "actions-runner-glaeda-3").fast)
+        # with a gui runner too, the fast runner stays last and the gui runner is the one before it
+        both, both_hooks = self.fast_labels({**base, "guiRunners": 1, "fastRunners": 1}, "both")
+        self.assertEqual([roles(l) for l in both[3:]], [["glaeda-gui-std-xcode-26.6"], ["glaeda-fast-std-xcode-26.6"]])
+        self.assertIn("--gui-runner", both_hooks[3])
+        self.assertNotIn("--gui-runner", both_hooks[4])
+
     def test_test_keychain_is_created_unlocked_first_and_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
@@ -5813,6 +5950,28 @@ class FleetLabelsModuleTest(unittest.TestCase):
                          "glaeda-aws-std-xcode-26.3")
         self.assertEqual(fleet_labels.root_label("glaeda-aws-std-xcode-26.3"),
                          "glaeda-aws-root-std-xcode-26.3")
+
+    def test_fast_runners_field(self) -> None:
+        manifest = json.loads(json.dumps(MANIFEST))
+        std = {"runners": 5, "capacityUnits": 5, "canonicalRoots": 2}
+        manifest["defaults"]["runner"] = {"classes": {"std": std}}
+        today = fleet_labels.member_labels(manifest, "mini-std", lambda app: True)[0]
+        self.assertEqual((today["fastRunners"], today["fastPools"]), (0, []))
+        std["fastRunners"] = 0
+        self.assertEqual(fleet_labels.member_labels(manifest, "mini-std", lambda app: True)[0], today)
+        std["fastRunners"] = 1
+        fast = fleet_labels.member_labels(manifest, "mini-std", lambda app: True)[0]
+        self.assertEqual((fast["fastRunners"], fast["fastPools"]), (1, ["glaeda-fast-std-xcode-26.6"]))
+        self.assertEqual(fast["pools"], today["pools"], "the picker's pool count is unchanged")
+        self.assertEqual(fleet_labels.fast_label("glaeda-aws-std-xcode-26.3"), "glaeda-aws-fast-std-xcode-26.3")
+        for bad in (2, -1, True, "1"):
+            std["fastRunners"] = bad
+            self.assertIn("fastRunners must be 0 or 1", fleet_labels.member_labels(manifest, "mini-std", lambda a: True)[1])
+        std.update(fastRunners=1, guiRunners=1, canonicalRoots=4)
+        self.assertIn("fastRunners must be 0 or 1", fleet_labels.member_labels(manifest, "mini-std", lambda a: True)[1])
+        manifest["hosts"]["mini-std"]["overrides"] = {"runner": {"poolPrefix": "fast-"}}
+        std.update(canonicalRoots=2)
+        self.assertIn("poolPrefix", fleet_labels.member_labels(manifest, "mini-std", lambda a: True)[1])
 
     def test_runner_and_module_agree(self) -> None:
         with mock.patch.object(cr, "xcode_present", return_value=True):

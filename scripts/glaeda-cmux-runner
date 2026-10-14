@@ -268,6 +268,7 @@ class Context:
         self.instance = args.instance or 0
         self.gui_runner = bool(args.gui_runner)  # the member's gui runner (or an explicitly managed guest runner)
         self.gui_token = args.gui_token
+        self.fast_runner = False  # the member's fast runner (fastRunners 1: the last instance, the fast pool label)
         # Instance 0 keeps the original paths; instance K adds -K (dirs, logs, name) or .K (launchd label).
         self.suffix = f"-{self.instance}" if self.instance else ""
         self.label = f"{LABEL}.{self.instance}" if self.instance else LABEL
@@ -513,6 +514,8 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         if getattr(ctx, "gui_runner", False):  # the listener gate holds it while the gui token or every root is taken
             scope += " --gui-runner"
             scope += f" --gui-token {shlex.quote(gui_token)}"
+        if getattr(ctx, "fast_runner", False):  # fast-tier takes the fast tokens; the gate holds it while they are taken
+            scope += " --fast-runner"
     started = (
         "#!/bin/bash\n"
         "# glaeda-cmux-runner job-started hook (generated, receipt-owned). A non-zero exit fails the job\n"
@@ -1802,16 +1805,19 @@ def main(argv: list[str] | None = None) -> int:
         if not args.capacity_units:
             ctx.capacity_units = int(member.get("capacityUnits") or 0)
         runners_n = int(member.get("runners") or 1)
-        # the last instance is the gui runner when guiRunners is 1: only the gui pool label, no root or side one
-        ctx.gui_runner = ctx.instance >= runners_n - int(member.get("guiRunners") or 0)
-        is_root = ctx.instance < int(member.get("canonicalRoots") or 1) and not ctx.gui_runner
-        roots = (member.get("guiPools", []) if ctx.gui_runner
+        # the last instance is the fast runner when fastRunners is 1, and the gui runner (guiRunners 1) is the last
+        # one before it: each carries only its own pool label, no root or side one
+        fast_n = int(member.get("fastRunners") or 0)
+        ctx.fast_runner = ctx.instance >= runners_n - fast_n
+        ctx.gui_runner = not ctx.fast_runner and ctx.instance >= runners_n - fast_n - int(member.get("guiRunners") or 0)
+        is_root = ctx.instance < int(member.get("canonicalRoots") or 1) and not ctx.gui_runner and not ctx.fast_runner
+        roots = (member.get("fastPools", []) if ctx.fast_runner else member.get("guiPools", []) if ctx.gui_runner
                  else member.get("rootPools", []) if is_root else member.get("sidePools", []))
-        # The gui runner leaves out the pool and iOS simulator labels: a pool-label or iOS job must never take
-        # the one runner a mini's GUI jobs wait for, and the picker's live count of the pool's runners stays
-        # the root and side runners it can route to.
+        # The gui and fast runners leave out the pool and iOS simulator labels: a pool-label or iOS job must never
+        # take the one runner a mini's GUI (or fast-tier) jobs wait for, and the picker's live count of the pool's
+        # runners stays the root and side runners it can route to.
         own = ([label for label in member["labels"] if label not in member.get("pools", []) and label != IOS_SIM_JOB_LABEL]
-               if ctx.gui_runner else member["labels"])
+               if ctx.gui_runner or ctx.fast_runner else member["labels"])
         ctx.labels = list(dict.fromkeys([*BASE_LABELS, *own, *roots]))
         ctx.labels_requested = True
         if not args.name:

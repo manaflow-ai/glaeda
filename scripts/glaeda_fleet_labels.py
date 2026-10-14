@@ -40,6 +40,10 @@ VERSION_RE = r"[0-9][0-9.]*"
 # gui runner: it carries only the gui pool label (gui_label), so GitHub hands each mini at most one GUI job, the
 # one its single gui token allows, and a second GUI job waits in GitHub's queue for another mini's gui runner
 # instead of on a root runner here (cmuxterm-hq#661). It is neither a root nor a side runner.
+# fastRunners (0 or 1, default 0) makes the mini's last runner its fast runner: it carries only the fast pool
+# label (fast_label), and cmux-next's fast-tier job runs on it with the mini's two fast tokens instead of the
+# shared capacity units, so it never queues behind the side lane. With guiRunners 1 as well, the gui runner is
+# the instance before it. Neither a root, side nor gui runner.
 CLASS_CAPACITY = {"xl": (8, 8), "std": (4, 4), "light": (2, 2)}
 MAX_RUNNERS = 16
 # A host's overrides.runner {trustedRef: refs/heads/main, trustedRepo: owner/name} makes its runners trusted-only:
@@ -49,7 +53,7 @@ MAX_RUNNERS = 16
 TRUSTED_REF_RE = r"refs/heads/[A-Za-z0-9._/-]+"
 REPO_RE = r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
 POOL_PREFIX_RE = r"[a-z0-9]+-"
-RESERVED_POOL_PREFIXES = {"root-", "side-", "gui-", "trusted-", "std-", "light-", "xl-"}
+RESERVED_POOL_PREFIXES = {"root-", "side-", "gui-", "fast-", "trusted-", "std-", "light-", "xl-"}
 
 
 def merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
@@ -89,6 +93,13 @@ def gui_label(pool: str) -> str:
     tests-build-and-lag, app-host-test-rerun) run on it: each needs the mini's one gui token (one console session),
     so one runner per mini carries the label, and its listener gate holds while the token or every root is taken."""
     return _role_label(pool, "gui")
+
+
+def fast_label(pool: str) -> str:
+    """The label of a pool's fast runner (the last instance when fastRunners is 1): cmux-next's fast-tier job
+    runs on it, admitted against the mini's fast tokens rather than its shared units (glaeda-cmux-runner-hook's
+    fast class), so it never waits behind side-lane jobs for a unit."""
+    return _role_label(pool, "fast")
 
 
 def _role_label(pool: str, role: str) -> str:
@@ -185,8 +196,9 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
         compile_slots = declared.get("compileSlots", 1)
         roots = declared.get("canonicalRoots", 1)
         gui = declared.get("guiRunners", 0)
+        fast = declared.get("fastRunners", 0)
     else:
-        compile_slots, roots, gui = 1, 1, 0
+        compile_slots, roots, gui, fast = 1, 1, 0, 0
     if not (isinstance(runners, int) and not isinstance(runners, bool) and 1 <= runners <= MAX_RUNNERS):
         return None, f"runner.classes.{klass}.runners must be 1 to {MAX_RUNNERS}"
     if not (isinstance(units, int) and not isinstance(units, bool) and 2 <= units <= 4 * MAX_RUNNERS):
@@ -198,7 +210,10 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
         return None, f"runner.classes.{klass}.canonicalRoots must be 1 to {runners} (one root runner per root)"
     if not (isinstance(gui, int) and not isinstance(gui, bool) and 0 <= gui <= 1 and roots + gui <= runners):
         return None, (f"runner.classes.{klass}.guiRunners must be 0 or 1, and canonicalRoots plus guiRunners at most "
-                      f"runners ({runners}): the gui runner is the last instance, never a root runner")
+                      f"runners ({runners}): the gui runner is the last instance (one before the fast runner), never a root runner")
+    if not (isinstance(fast, int) and not isinstance(fast, bool) and 0 <= fast <= 1 and roots + gui + fast <= runners):
+        return None, (f"runner.classes.{klass}.fastRunners must be 0 or 1, and canonicalRoots plus guiRunners plus "
+                      f"fastRunners at most runners ({runners}): the fast runner is the last instance")
     if compile_slots > roots:
         return None, (f"runner.classes.{klass}.compileSlots {compile_slots} needs canonicalRoots {compile_slots} "
                       "(every compile holds a root)")
@@ -210,7 +225,8 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
             "trustedRef": trusted_ref, "trustedRepo": trusted_repo,
             "canonicalRoots": roots, "rootPools": [root_label(label) for label in dict.fromkeys(pools)],
             "sidePools": [side_label(label) for label in dict.fromkeys(pools)],
-            "guiRunners": gui, "guiPools": [gui_label(label) for label in dict.fromkeys(pools)] if gui else []}, None
+            "guiRunners": gui, "guiPools": [gui_label(label) for label in dict.fromkeys(pools)] if gui else [],
+            "fastRunners": fast, "fastPools": [fast_label(label) for label in dict.fromkeys(pools)] if fast else []}, None
 
 
 def declared_pools(manifest: Any, xcode_ok: Callable[[str, dict[str, Any]], bool] | None = None) -> dict[str, list[str]]:

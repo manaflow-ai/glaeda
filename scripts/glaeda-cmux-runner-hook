@@ -73,7 +73,8 @@ host lock, a reservation, or a fleet build waiting for the lock), every capacity
 taken, or the mini is saturated (sampled host CPU at least GATE_CPU_PAUSE or elevated memory pressure), it stops the idle
 runner's listener so GitHub routes the job to another runner instead of here to be refused or slowed
 down (Gate). A gui runner also stops listening while the console session is locked or nobody is logged in there
-(console_refusal). Every runner also stops listening while free disk is under its job-started hook's --min-free-gib,
+(console_refusal). A fast runner (--fast-runner) runs cmux-next's fast-tier on the fast tokens (FAST_TOKENS)
+instead of the shared units, and its gate looks at those tokens, never at the units. Every runner also stops listening while free disk is under its job-started hook's --min-free-gib,
 and starts the same eviction in the background, listening again once it made room (Gate.low_disk). Full means every
 unit this runner's own --capacity-units scans, read from its job-started hook; for a root runner it also means the
 mini cannot admit a compile or an app-host shard (mini_full).
@@ -221,10 +222,17 @@ WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "
 # mini. isolated stays 2: besides runner jobs it is the class guests default to and the one a co-resident dev
 # build admits under (cmuxterm-hq build-fleet/cmd/worker/coresident.go, about 7 cores and 15 GiB), and cmux-tui
 # `test` runs at p75 5.11 cores. The other costs match that telemetry (compile p75 4.44, light 2.15, gui 0.21).
+# fast: a FAST_JOBS job on the mini's fast runner (--fast-runner, the fast pool label; glaeda_fleet_labels
+# fastRunners). Its two units are the fast tokens, kept apart from the shared unit-N files, so it never waits
+# behind side-lane jobs for a unit and no other class, gate or ci-step ever counts them. The same job on any other
+# runner keeps its WORKFLOW_JOB_CLASSES cost.
+FAST_TOKENS = ("fast-0", "fast-1")
+FAST_JOBS = {("cmux-next.yml", "fast-tier")}
 CLASS_COST: dict[str, tuple[int, tuple[str, ...]]] = {
     "compile": (2, ("persistent-dd", "root")), "gui": (1, ("gui", "root")), "product": (1, ("gui", "root")),
     "compile-gui": (2, ("root",)), "gui-step": (1, ("gui", "root")),
-    "isolated": (2, ()), "simulator": (1, ("simulator",)), "light": (1, ()), "seed": (2, ())}
+    "isolated": (2, ()), "simulator": (1, ("simulator",)), "light": (1, ()), "seed": (2, ()),
+    "fast": (0, FAST_TOKENS)}
 # Guest repositories (any repo other than --home-repo, admitted by an org-scoped runner's --allowed-owner)
 # never touch cmux's canonical roots or persistent DerivedData, so they are costed by job-id suffix alone:
 # "-sim" or "simulator" uses the one CoreSimulator service, "-light" is small, anything else is isolated.
@@ -2154,7 +2162,7 @@ def token_holders(capacity_dir: Path, wants: list[str], compile_slots: int, root
             names += [f"root-{k}" for k in range(1, max(1, roots) + 1)]
         elif kind == "persistent-dd":
             names += ["persistent-dd"] + [f"persistent-dd-{c}" for c in range(1, max(1, compile_slots))]
-        elif kind in ("gui", "simulator"):
+        elif kind in ("gui", "simulator") or kind in FAST_TOKENS:
             names.append(kind)
     notes = []
     deadline = time.monotonic() + HOLDERS_BUDGET_S
@@ -2234,7 +2242,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
             return False, f"{job or 'this job'} is already admitted"
         if taken_out is not None:
             taken_out["wants"] = list(tokens)
-        behind = fair_turn(capacity_dir, {*tokens, "units"}, time.time() if since is None else since)
+        behind = fair_turn(capacity_dir, {*tokens, *(("units",) if units else ())},
+                           time.time() if since is None else since)
         if behind:
             return False, behind
         yielded = yield_idle_warm(capacity_dir)  # under admission.lock, so a catch-up cannot start meanwhile
@@ -2611,8 +2620,9 @@ def runner_units(runner_dir: Path) -> int:
 class RunnerScope(NamedTuple):
     """What this runner's job-started hook admits with: its --capacity-units, --compile-slots and
     --canonical-roots, whether it is a root runner (instance below canonical roots, glaeda-cmux-runner),
-    whether it is the mini's gui runner (--gui-runner, the gui pool label; never a root runner) and its
-    --min-free-gib disk floor (0: none)."""
+    whether it is the mini's gui runner (--gui-runner, the gui pool label; never a root runner), its
+    --min-free-gib disk floor (0: none), its gui token, and whether it is the mini's fast runner (--fast-runner,
+    the fast pool label; never a root or gui runner)."""
     units: int = 0
     compile_slots: int = 1
     roots: int = 1
@@ -2620,6 +2630,7 @@ class RunnerScope(NamedTuple):
     gui: bool = False
     min_free_gib: float = 0.0
     gui_token: str = "gui"
+    fast: bool = False
 
 
 def listen_fit_units(runner_dir: Path) -> int:
@@ -2648,11 +2659,12 @@ def runner_scope(runner_dir: Path) -> RunnerScope:
     suffix = re.search(r"-([0-9]+)$", runner_dir.name)
     instance = flag("instance", int(suffix.group(1)) if suffix else 0)
     roots = max(1, flag("canonical-roots", 1))
-    gui = re.search(r"\s--gui-runner(?:\s|$)", text) is not None
+    fast = re.search(r"\s--fast-runner(?:\s|$)", text) is not None
+    gui = re.search(r"\s--gui-runner(?:\s|$)", text) is not None and not fast
     gui_match = re.search(r"\s--gui-token\s+([A-Za-z0-9._-]+)(?:\s|$)", text)
     gui_token = gui_match.group(1) if gui_match else "gui"
-    return RunnerScope(flag("capacity-units", 0), max(1, flag("compile-slots", 1)), roots, instance < roots and not gui,
-                       gui, min_free_gib(text), gui_token)
+    return RunnerScope(flag("capacity-units", 0), max(1, flag("compile-slots", 1)), roots,
+                       instance < roots and not gui and not fast, gui, min_free_gib(text), gui_token, fast)
 
 
 def min_free_gib(text: str) -> float:
@@ -2706,7 +2718,11 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
     Full also means a job admitted to this mini is waiting (CAPACITY_WAIT, its admit.want marker) for units or
     for a token this runner's next job would take (a root runner: a canonical root or persistent-dd; a gui
     runner: the gui token or a root). That job goes first, so a job this runner took now would only queue
-    behind it here, while GitHub could hand it to a mini with room."""
+    behind it here, while GitHub could hand it to a mini with room.
+
+    With the scope of a fast runner (scope.fast, the fast pool label: cmux-next's fast-tier), full means only that a
+    fast token is taken or a job here waits for one: its job takes the fast tokens and none of the shared units,
+    so a mini whose units the side lane fills still takes it. Every other scope ignores the fast tokens."""
     if capacity_dir is None or total <= 0:
         return None
     try:
@@ -2724,6 +2740,15 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
         def open_to_jobs(name: str, path: Path) -> bool:
             return name in yielding or probe(path)
 
+        if scope is not None and scope.fast:
+            for waiter in admission_waiters(capacity_dir):
+                shared = set(FAST_TOKENS) & set(waiter["wants"])
+                if shared:
+                    return f"{waiter['who'] or 'a job'} waits here for {', '.join(sorted(shared))}"
+            for name in FAST_TOKENS:
+                if not probe(capacity_dir / f"{name}.token"):
+                    return f"the {name} token is taken"
+            return None
         root = scope is not None and scope.root
         # fit_units: a side runner whose label brings 2-unit jobs (listen --fit-units: glaeda-ios-sim's isolated builds)
         need = min(max(ROOT_FIT_UNITS if root else 1, fit_units), total)
@@ -4505,6 +4530,9 @@ def main(argv: list[str] | None = None) -> int:
                         "gui token, every canonical root or every unit is taken")
     p.add_argument("--gui-token", default="gui",
                    help="capacity ledger token for this runner's desktop session (default: gui)")
+    p.add_argument("--fast-runner", action="store_true",
+                   help="this is the mini's fast runner (the fast pool label): a FAST_JOBS job here takes the fast "
+                        "tokens instead of shared units, and the listener gate holds it while a fast token is taken")
     p.add_argument("--capacity-dir", type=Path, default=Path(FLEET_DIR) / "capacity", help=argparse.SUPPRESS)
     p.add_argument("--host-lock", default=HOST_LOCK, help=argparse.SUPPRESS)
     p.add_argument("--reservation", default=RESERVATION, help=argparse.SUPPRESS)
@@ -4616,6 +4644,13 @@ def main(argv: list[str] | None = None) -> int:
                 admit_class = "light"
             elif why:
                 return refused(why)
+        if (admit_class is None and args.fast_runner and not is_guest(repo, args.home_repo)
+                and (job_workflow(), os.environ.get("GITHUB_JOB", "")) in FAST_JOBS):
+            admit_class = "fast"  # its own tokens on its own runner; on any other runner it keeps its usual cost
+        if args.fast_runner and admit_class != "fast":
+            # It listens on a full mini (it needs no general units), so any other job would wait here for units
+            # with no limit and idle the runner; refused, it is rescued onto its own pool.
+            return refused("the fast runner takes only the fast tier")
         # The wrapper execs this script, so the parent is the job's Runner.Worker.
         admit_start = time.monotonic()
         taken: dict[str, Any] = {}
