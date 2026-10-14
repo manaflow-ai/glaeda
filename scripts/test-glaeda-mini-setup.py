@@ -77,6 +77,8 @@ class MiniSetupTest(unittest.TestCase):
             self.calls.append(list(argv))
             if argv[0] == "/bin/launchctl" or os.path.basename(argv[0]) == "systemctl":
                 raise AssertionError("launchctl and systemctl must never run with a sandbox HOME")
+            if os.path.basename(argv[0]) in {"defaults", "osascript", "system_profiler"}:
+                raise AssertionError("a test must never read or write the real user's preferences")
             return real_run(argv, *args, **kwargs)
 
         self.patches = [
@@ -282,7 +284,10 @@ class MiniSetupTest(unittest.TestCase):
 
         before = self.tree()
         second = self.invoke("--apply")
-        self.assertEqual(self.states(second), {"unchanged"})
+        # a sandbox HOME never touches the real user's alert-sound preferences
+        sounds = [a for a in second["actions"] if a["kind"] == "defaults"]
+        self.assertEqual([(a["key"], a["state"]) for a in sounds], [("alert-sounds", "skipped")])
+        self.assertEqual(self.states({"actions": [a for a in second["actions"] if a not in sounds]}), {"unchanged"})
         after = self.tree()
         after.pop(".local/state/glaeda/mini-setup/receipt.json")
         before.pop(".local/state/glaeda/mini-setup/receipt.json")
@@ -378,6 +383,108 @@ class MiniSetupTest(unittest.TestCase):
         self.assertIn("parallel = 4", text)
         self.assertNotIn("untrackedCache", text)
         self.assertNotIn("fetchJobs", text)
+
+    def alert_ctx(self, hygiene_only: bool = False, headless: bool = False) -> object:
+        ctx = ms.Context(self.home, True, "/usr/bin/python3", True, self.reclaim, None, None,
+                         ms.CMUX_XCODE_APP, 50, hygiene_only=hygiene_only)
+        ctx.sandbox = False  # a real HOME, as on a mini; every command goes to fake_prefs instead
+        ctx.headless = headless
+        return ctx
+
+    def fake_prefs(self, store: dict[str, str]):
+        """A stand-in `defaults -g` store and osascript; anything else answers as missing."""
+        commands: list[list[str]] = []
+
+        def fake_run(argv, *args, **kwargs):
+            commands.append(list(argv))
+            if argv[0] == ms.DEFAULTS:
+                verb, key = argv[1], argv[3]
+                if verb == "read":
+                    return (0, store[key]) if key in store else (1, "does not exist")
+                if verb == "write":
+                    store[key] = argv[5]
+                elif verb == "delete":
+                    store.pop(key)
+                return 0, ""
+            return (0, "") if argv[0] == ms.OSASCRIPT else (1, "")
+
+        return commands, fake_run
+
+    def prefs_commands(self, commands: list[list[str]]) -> list[list[str]]:
+        return [c for c in commands if c[0] in {ms.DEFAULTS, ms.OSASCRIPT}]
+
+    def test_alert_sounds_are_enforced_on_a_mac_mini(self) -> None:
+        store = {"com.apple.sound.beep.volume": "0.7", "com.apple.sound.uiaudio.enabled": "0"}
+        commands, fake_run = self.fake_prefs(store)
+        ctx = self.alert_ctx()
+        with mock.patch.object(ms, "run", fake_run), mock.patch.object(ms, "machine_name", lambda: "Mac mini"), \
+                mock.patch.object(ms, "console_owner_uid", lambda: os.getuid()):
+            plan = ms.plan_alert_sounds(ctx, {})
+            self.assertEqual({a["key"]: a["state"] for a in plan}, {
+                "com.apple.sound.beep.volume": "update", "com.apple.sound.uiaudio.enabled": "unchanged",
+                "com.apple.sound.beep.feedback": "create", "alert-volume": "create"})
+            self.assertTrue(all(c[1] == "read" for c in self.prefs_commands(commands)), "planning writes nothing")
+            ms.apply_install(ctx, plan)
+            self.assertEqual(store, dict.fromkeys(store, "0") | {"com.apple.sound.beep.feedback": "0"})
+            self.assertIn([ms.DEFAULTS, "write", "-g", "com.apple.sound.beep.volume", "-float", "0"], commands)
+            self.assertIn([ms.OSASCRIPT, "-e", "set volume alert volume 0"], commands)
+            # the next (hourly) run: nothing to do, ownership and the earlier value carried forward
+            commands.clear()
+            again = {a["key"]: a for a in ms.plan_alert_sounds(ctx, {"actions": plan})}
+            self.assertEqual({a["state"] for a in again.values()}, {"unchanged"})
+            self.assertNotIn("alert-volume", again)
+            self.assertEqual(again["com.apple.sound.beep.volume"]["previous"], "0.7")
+            self.assertTrue(again["com.apple.sound.beep.feedback"]["owned"])
+            self.assertFalse(again["com.apple.sound.uiaudio.enabled"]["owned"], "it was already 0")
+            ms.apply_install(ctx, list(again.values()))
+            self.assertTrue(all(c[1] == "read" for c in self.prefs_commands(commands)))
+
+    def test_alert_sounds_uninstall_restores_only_values_still_ours(self) -> None:
+        store = {"com.apple.sound.beep.volume": "0.7"}
+        commands, fake_run = self.fake_prefs(store)
+        ctx = self.alert_ctx()
+        with mock.patch.object(ms, "run", fake_run), mock.patch.object(ms, "machine_name", lambda: "Mac mini"), \
+                mock.patch.object(ms, "console_owner_uid", lambda: None):
+            plan = ms.plan_alert_sounds(ctx, {})
+            ms.apply_install(ctx, plan)
+            ctx.state.mkdir(parents=True)
+            ctx.receipt_path.write_text(json.dumps({"actions": plan}))
+            store["com.apple.sound.beep.feedback"] = "1"  # the user turned feedback back on
+            undo = {a["key"]: a for a in ms.plan_uninstall(ctx) if a["kind"] == "defaults"}
+            self.assertEqual({k: a["state"] for k, a in undo.items()}, {
+                "com.apple.sound.beep.volume": "restore", "com.apple.sound.uiaudio.enabled": "remove",
+                "com.apple.sound.beep.feedback": "kept"})
+            ms.apply_uninstall(ctx, list(undo.values()))
+        self.assertEqual(store, {"com.apple.sound.beep.volume": "0.7", "com.apple.sound.beep.feedback": "1"})
+        self.assertIn([ms.DEFAULTS, "write", "-g", "com.apple.sound.beep.volume", "-float", "0.7"], commands)
+        self.assertNotIn(ms.OSASCRIPT, [c[0] for c in commands], "nobody owns the console")
+
+    def test_alert_sounds_only_on_a_fleet_mac_mini(self) -> None:
+        commands, fake_run = self.fake_prefs({})
+        with mock.patch.object(ms, "run", fake_run), mock.patch.object(ms, "console_owner_uid", lambda: os.getuid()):
+            with mock.patch.object(ms, "machine_name", lambda: "Mac mini"):
+                self.assertEqual(ms.plan_alert_sounds(self.alert_ctx(hygiene_only=True), {}), [])  # a laptop
+                linux = self.alert_ctx()
+                linux.platform = "linux"
+                self.assertEqual(ms.plan_alert_sounds(linux, {}), [])
+                sandbox = self.alert_ctx()
+                sandbox.sandbox = True
+                self.assertEqual([a["state"] for a in ms.plan_alert_sounds(sandbox, {})], ["skipped"])
+                # headless: defaults are written, but no live osascript without a GUI session
+                headless = ms.plan_alert_sounds(self.alert_ctx(headless=True), {})
+                self.assertEqual(headless[-1]["state"], "skipped")
+                ms.apply_install(self.alert_ctx(headless=True), headless)
+            self.assertNotIn(ms.OSASCRIPT, [c[0] for c in commands])
+            commands.clear()
+            with mock.patch.object(ms, "machine_name", lambda: "MacBook Pro"):
+                act, = ms.plan_alert_sounds(self.alert_ctx(), {})
+            self.assertEqual((act["state"], act["note"]), ("skipped", "MacBook Pro is not a Mac mini; alert sounds left alone"))
+            self.assertEqual(commands, [])
+        with mock.patch.object(ms, "run", lambda argv, **kw: (0, json.dumps(
+                {"SPHardwareDataType": [{"machine_name": "Mac mini", "machine_model": "Mac16,11"}]}))):
+            self.assertEqual(ms.machine_name(), "Mac mini")
+        with mock.patch.object(ms, "run", lambda argv, **kw: (1, "")):
+            self.assertEqual(ms.machine_name(), "unknown")
 
     def test_uninstall_plan_then_apply_removes_only_unmodified_files(self) -> None:
         self.invoke("--apply")
@@ -542,6 +649,7 @@ class MiniSetupTest(unittest.TestCase):
         kinds = {a["kind"] for a in receipt["actions"]}
         self.assertNotIn("git", kinds)
         self.assertNotIn("python", kinds)
+        self.assertNotIn("defaults", kinds)  # a personal Mac never loses its alert sounds
         self.assertFalse((self.home / ".cache/glaeda/cmux-native-cache").exists())
         for name in ("glaeda-disk", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all"):
             self.assertTrue(os.access(self.home / ".local/bin" / name, os.X_OK), name)

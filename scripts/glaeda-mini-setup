@@ -51,6 +51,9 @@ What --apply installs (templated for the current user):
     ~/Library/LaunchAgents/com.teamleaderleo.glaeda.{disk-pressure,disk-dedupe,worktree-reclaim,fleet-cas-prune,seed-prefetch,lan-fetch,
                                   idle-warm,idle-fuzz,mini-health,local-guard,update,gh-watch}.plist
     build-host directories and three git defaults, each set only when unset
+    on a Mac mini only: alert sounds off (defaults -g com.apple.sound.beep.volume 0, uiaudio.enabled 0,
+    beep.feedback 0; osascript sets the alert volume live for the console user). Output volume is
+    untouched, and --uninstall restores the earlier values
     .metadata_never_index markers in the user-owned CI build roots (DerivedData and the
     glaeda native cache, plus any existing glaeda runner _work roots). These markers keep
     Spotlight out of build output without changing the system-wide index policy.
@@ -61,9 +64,9 @@ enroll does and is not ready without it, so a missing interpreter shows up here,
 into enrollment. When Homebrew belongs to another account, the fix is printed instead.
 
 --hygiene-only is for machines that are not fleet build hosts, such as personal MacBooks.
-It installs the tools and LaunchAgents above and nothing else: no build-host
-directories, no git defaults, no operator steps, no fleet bootstrap. Only a missing python3
-blocks it; build-host checks (free disk, Xcode pin, hardware) are reported, not enforced,
+It installs the tools and LaunchAgents above and nothing else: no build-host directories,
+no git defaults, no alert-sound defaults, no operator steps, no fleet bootstrap. Only a
+missing python3 blocks it; build-host checks (free disk, Xcode pin, hardware) are reported, not enforced,
 so a nearly full laptop can still install the tool that frees it. After that, glaeda-update
 keeps every host on its release ring (docs/GLAEDA_OTA.md): each hour it runs this command from
 the newest release on the ring, then rolls back if the new tools do not run.
@@ -127,6 +130,15 @@ GIT_DEFAULTS = (
     ("fetch.parallel", "0"),  # parallel fetches, sized by git
     ("submodule.fetchJobs", "0"),  # cmux has submodules; fetch them in parallel
 )
+# Alert sounds ("bonks") off on fleet Mac minis: (global-domain key, defaults type, value). Per user,
+# no sudo. Output volume is left alone: captures record audio.
+ALERT_DEFAULTS = (
+    ("com.apple.sound.beep.volume", "-float", "0"),
+    ("com.apple.sound.uiaudio.enabled", "-int", "0"),
+    ("com.apple.sound.beep.feedback", "-int", "0"),
+)
+DEFAULTS = "/usr/bin/defaults"
+OSASCRIPT = "/usr/bin/osascript"
 DARWIN_REQUIRED = True
 # The platform this run sets up. Linux supports the hygiene profile only.
 HOST_PLATFORM = "linux" if platform.system() == "Linux" else "macos"
@@ -1033,6 +1045,46 @@ def git_get(ctx: Context, key: str) -> str | None:
     return out if code == 0 else None
 
 
+def machine_name() -> str:
+    """The hardware Model Name ("Mac mini", "MacBook Pro"), or "unknown"."""
+    code, raw = run(["/usr/sbin/system_profiler", "SPHardwareDataType", "-json"], timeout=30)
+    try:
+        return (json.loads(raw)["SPHardwareDataType"][0].get("machine_name") or "unknown") if code == 0 else "unknown"
+    except (ValueError, KeyError, IndexError, AttributeError):
+        return "unknown"
+
+
+def console_owner_uid() -> int | None:
+    """Who owns the GUI console session (`stat -f %Su /dev/console`), or None."""
+    try:
+        return os.stat("/dev/console").st_uid
+    except OSError:
+        return None
+
+
+def defaults_get(key: str) -> str | None:
+    code, out = run([DEFAULTS, "read", "-g", key])
+    return out if code == 0 else None
+
+
+def same_default(current: str | None, value: str) -> bool:
+    """`defaults read` prints 0 for -float 0 and -int 0, 0.5 for a float: compare as numbers."""
+    if current is None:
+        return False
+    try:
+        return float(current) == float(value)
+    except ValueError:
+        return current == value
+
+
+def alert_sounds_skip(ctx: Context) -> str | None:
+    """Why alert sounds stay as they are on this host, or None on a fleet Mac mini."""
+    if ctx.sandbox:
+        return "not run with a sandbox HOME: defaults writes the real user's preferences"
+    machine = machine_name()
+    return None if machine == TARGET["machine"] else f"{machine} is not a Mac mini; alert sounds left alone"
+
+
 # ---------------------------------------------------------------- plan
 
 
@@ -1157,9 +1209,39 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
         # owned: this command set the key, on this run or an earlier one, so --uninstall may unset it.
         actions.append({"kind": "git", "key": key, "value": value, "state": state, "previous": current,
                         "note": note, "owned": state == "unchanged" and key in owned_before})
+    actions += plan_alert_sounds(ctx, prior)
     if not ctx.hygiene_only:
         actions.append(plan_enroll_python(ctx))
     actions.append(plan_git(ctx))
+    return actions
+
+
+def plan_alert_sounds(ctx: Context, prior: dict[str, Any]) -> list[dict[str, Any]]:
+    """ALERT_DEFAULTS, enforced on a fleet Mac mini; never on a hygiene-only host such as a laptop.
+
+    Unlike the git defaults these are set whatever the current value, and the value before this
+    command first set a key is kept as "previous", so --uninstall can put it back.
+    """
+    if ctx.platform != "macos" or ctx.hygiene_only:
+        return []
+    skip = alert_sounds_skip(ctx)
+    if skip:
+        return [{"kind": "defaults", "key": "alert-sounds", "state": "skipped", "note": skip}]
+    owned = {a.get("key"): a for a in prior.get("actions", []) if a.get("kind") == "defaults" and a.get("owned")}
+    actions: list[dict[str, Any]] = []
+    for key, kind, value in ALERT_DEFAULTS:
+        current = defaults_get(key)
+        state = "create" if current is None else ("unchanged" if same_default(current, value) else "update")
+        # still ours from an earlier run: keep its previous value, not our own 0
+        mine = owned.get(key) if state == "unchanged" else None
+        actions.append({"kind": "defaults", "key": key, "type": kind, "value": value, "state": state,
+                        "previous": mine.get("previous") if mine else current, "note": "", "owned": mine is not None})
+    if any(a["state"] != "unchanged" for a in actions):
+        # defaults reach the running session at the next login; osascript applies the alert volume now,
+        # but only from the user who owns the console session
+        live = not ctx.headless and console_owner_uid() == ctx.uid
+        actions.append({"kind": "osascript", "key": "alert-volume", "state": "create" if live else "skipped",
+                        "note": "" if live else "this user does not own the console session; applies at next login"})
     return actions
 
 
@@ -1229,6 +1311,21 @@ def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
         state = "remove" if ours and current == value else ("absent" if current is None else "kept")
         actions.append({"kind": "git", "key": key, "value": current, "state": state,
                         "note": "" if ours or current is None else "not set by this command"})
+    for prior in (receipt or {}).get("actions", []):
+        if prior.get("kind") != "defaults" or not prior.get("owned"):
+            continue
+        act = {k: prior.get(k) for k in ("key", "type", "value", "previous")}
+        if ctx.sandbox:
+            actions.append({"kind": "defaults", **act, "state": "skipped",
+                            "note": "not run with a sandbox HOME: defaults writes the real user's preferences"})
+            continue
+        current = defaults_get(act["key"])
+        # put back what was there only while the key still holds our value
+        if same_default(current, act["value"]):
+            state, note = ("remove" if act["previous"] is None else "restore"), ""
+        else:
+            state, note = ("absent", "") if current is None else ("kept", "changed since this command set it")
+        actions.append({"kind": "defaults", **act, "current": current, "state": state, "note": note})
     actions.append({"kind": "note", "state": "kept",
                     "note": "directories, logs, caches and any python@3.13 are left in place; remove them by hand if wanted"})
     return actions
@@ -1389,6 +1486,20 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]]) -> None:
             act["applied"] = act["owned"] = code == 0
             if code != 0:
                 act["state"], act["note"] = "failed", out[:400]
+        if kind == "defaults" and state in {"create", "update"}:
+            code, out = run([DEFAULTS, "write", "-g", act["key"], act["type"], act["value"]])
+            act["applied"] = act["owned"] = code == 0
+            if code != 0:
+                act["state"], act["note"] = "failed", out[:400]
+        if kind == "osascript" and state == "create":
+            # after the defaults writes above (osascript is planned after them); only if one of them landed
+            if not any(a["kind"] == "defaults" and a.get("applied") for a in actions):
+                act["state"], act["note"] = "skipped", "no alert-sound default was written"
+                continue
+            code, out = run([OSASCRIPT, "-e", "set volume alert volume 0"])
+            act["applied"] = code == 0
+            if code != 0:
+                act["state"], act["note"] = "failed", out[:400]
     if ctx.platform == "linux" and not ctx.skip_launchctl:
         activate_systemd(ctx, actions)
 
@@ -1470,6 +1581,12 @@ def apply_uninstall(ctx: Context, actions: list[dict[str, Any]]) -> None:
         elif act["kind"] == "git" and act["state"] == "remove":
             code, _ = run([which("git") or "git", "config", "--global", "--unset", act["key"]], env=ctx.git_env())
             act["applied"] = code == 0
+        elif act["kind"] == "defaults" and act["state"] in {"remove", "restore"}:
+            code, out = run([DEFAULTS, "delete", "-g", act["key"]] if act["state"] == "remove"
+                            else [DEFAULTS, "write", "-g", act["key"], act["type"], act["previous"]])
+            act["applied"] = code == 0
+            if code != 0:
+                act["state"], act["note"] = "failed", out[:400]
     if (ctx.platform == "linux" and not ctx.skip_launchctl
             and any(a["kind"] == "agent" and a.get("applied") for a in actions)):
         run([systemctl(), "--user", "daemon-reload"])
@@ -1718,8 +1835,9 @@ def main(argv: list[str] | None = None) -> int:
             apply_install(ctx, actions)
     fleet_result = None if args.uninstall or ctx.hygiene_only else run_fleet_bootstrap(ctx)
     # a failed git install is reported (receipt, operator step) but does not fail the run: glaeda-update
-    # rolls a release back when setup fails, and a transient brew error is not the release's fault
-    failed = [a for a in actions if a.get("state") == "failed" and a.get("kind") != "gitpkg"]
+    # rolls a release back when setup fails, and a transient brew error is not the release's fault.
+    # Alert sounds are a comfort setting, so a failed write is reported the same way.
+    failed = [a for a in actions if a.get("state") == "failed" and a.get("kind") not in {"gitpkg", "defaults", "osascript"}]
     receipt = {
         "schema": SCHEMA,
         "mode": "uninstall" if args.uninstall else "install",
