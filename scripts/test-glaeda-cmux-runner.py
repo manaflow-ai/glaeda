@@ -3523,6 +3523,52 @@ class GateTest(unittest.TestCase):
             gate.step()  # the job ended
         self.assertEqual(stops, ["a fleet build is waiting for the host (pid 77)"])
 
+    def reserve(self, gate) -> str:
+        """An active reservation of this host, as glaeda-mini-fleet reserve writes it; returns the gate's reason."""
+        marker = self.tmp / "reservation.json"
+        now = int(time.time())
+        marker.write_text(json.dumps({"schema": "glaeda-reservation/v1", "owner": "leo@big-red+soak-0123456789ab",
+                                      "purpose": "readiness soak", "since": now, "until": now + 3600}))
+        gate.reservation = os.fspath(marker)
+        return hook.host_held(os.fspath(self.lock), gate.reservation, time.time())
+
+    def test_a_reservation_made_during_a_job_stops_the_listener_as_the_job_ends(self) -> None:
+        """cmux10s, 2026-10-14: a soak reserved the mini at 06:01Z while three runners had jobs. Each took the next
+        queued job within 2 s of the last one ending, before two idle polls, and job-started refused it: 14 PR jobs
+        failed in two minutes. A reservation seen during a job now stops the listener as that job ends."""
+        self.state.mkdir(parents=True, exist_ok=True)
+        hook.refused_note(self.state, 4242).touch()  # job-started refused the job
+        gate, stops = self.gate([None] * 3, busy=[True])
+        reserved = self.reserve(gate)
+        self.assertTrue(reserved and reserved.startswith("host reserved by"), reserved)
+        gate.worker_pids = lambda: [4242]
+        with mock.patch.object(hook, "host_waiters", return_value=set()):
+            gate.step()
+            self.assertEqual(stops, [], "a runner with a job is never stopped")
+            self.assertEqual(gate.watching, (4242,), "a refused job's worker is watched")
+            gate.step()  # the worker exited
+        self.assertEqual(stops, [reserved], "at once, not two idle polls")
+
+        # A job the reservation did not refuse (it started first) ends the same way.
+        gate, stops = self.gate([None] * 3, busy=[True, True])
+        reserved = self.reserve(gate)
+        gate.worker_pids = lambda: [4343]
+        with mock.patch.object(hook, "host_waiters", return_value=set()):
+            gate.step(); gate.step()
+            self.assertEqual((stops, gate.watching), ([], ()))
+            gate.step()  # the job ended
+        self.assertEqual(stops, [reserved])
+
+    def test_a_reservation_released_before_the_job_ends_keeps_the_listener(self) -> None:
+        gate, stops = self.gate([None] * 3, busy=[True])
+        self.reserve(gate)
+        gate.worker_pids = lambda: [4242]
+        with mock.patch.object(hook, "host_waiters", return_value=set()):
+            gate.step()
+            Path(gate.reservation).unlink()
+            gate.step()
+        self.assertEqual(stops, [])
+
     def test_a_waiter_gone_by_the_end_of_the_job_keeps_the_listener(self) -> None:
         gate, stops = self.gate([None] * 3, busy=[True])
         gate.worker_pids = lambda: [4242]
