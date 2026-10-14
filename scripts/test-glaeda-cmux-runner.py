@@ -5181,6 +5181,21 @@ class RunnerTest(unittest.TestCase):
         self.assertIn("--gui-runner", both_hooks[3])
         self.assertNotIn("--gui-runner", both_hooks[4])
 
+    def test_a_plain_rerun_keeps_the_fast_and_gui_roles(self) -> None:
+        """A re-run without --manifest restores the member from the receipt; the fast runner's and the gui
+        runner's hooks must stay theirs, or fast-tier costs two shared units on the fast runner again."""
+        base = {"runners": 5, "capacityUnits": 5, "compileSlots": 2, "canonicalRoots": 2}
+        self.fast_labels({**base, "guiRunners": 1, "fastRunners": 1}, "rerun")
+        home = self.fast_home
+        with mock.patch.dict(os.environ, {"HOME": os.fspath(home)}), \
+                mock.patch.object(cr, "xcode_present", return_value=True):
+            for instance in ("4", "3"):
+                self.invoke("--apply", "--instance", instance)
+        hooks = {k: (home / f"actions-runner-glaeda-{k}/glaeda-hooks/job-started.sh").read_text() for k in (3, 4)}
+        self.assertIn("--instance 4 --fast-runner\n", hooks[4], "the fast runner keeps --fast-runner")
+        self.assertIn("--instance 3 --gui-runner", hooks[3], "the gui runner keeps --gui-runner")
+        self.assertTrue(hook.runner_scope(home / "actions-runner-glaeda-4").fast)
+
     def test_test_keychain_is_created_unlocked_first_and_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)

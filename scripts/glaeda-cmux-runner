@@ -1804,12 +1804,7 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         if not args.capacity_units:
             ctx.capacity_units = int(member.get("capacityUnits") or 0)
-        runners_n = int(member.get("runners") or 1)
-        # the last instance is the fast runner when fastRunners is 1, and the gui runner (guiRunners 1) is the last
-        # one before it: each carries only its own pool label, no root or side one
-        fast_n = int(member.get("fastRunners") or 0)
-        ctx.fast_runner = ctx.instance >= runners_n - fast_n
-        ctx.gui_runner = not ctx.fast_runner and ctx.instance >= runners_n - fast_n - int(member.get("guiRunners") or 0)
+        ctx.fast_runner, ctx.gui_runner = member_roles(member, ctx.instance)
         is_root = ctx.instance < int(member.get("canonicalRoots") or 1) and not ctx.gui_runner and not ctx.fast_runner
         roots = (member.get("fastPools", []) if ctx.fast_runner else member.get("guiPools", []) if ctx.gui_runner
                  else member.get("rootPools", []) if is_root else member.get("sidePools", []))
@@ -1838,6 +1833,16 @@ def main(argv: list[str] | None = None) -> int:
     # Every --apply and --uninstall holds the runner lock from its plan to its receipt (runner_lock).
     with runner_lock(ctx.home, wait=True) if args.apply else contextlib.nullcontext():
         return install_or_uninstall(ctx, args, raw_argv)
+
+
+def member_roles(member: dict[str, Any], instance: int) -> tuple[bool, bool]:
+    """(fast runner, gui runner) for this instance of a member. The last instance is the fast runner when
+    fastRunners is 1, and the gui runner (guiRunners 1) is the last one before it: each carries only its own pool
+    label, no root or side one."""
+    runners_n = int(member.get("runners") or 1)
+    fast_n, gui_n = int(member.get("fastRunners") or 0), int(member.get("guiRunners") or 0)
+    fast = fast_n > 0 and instance >= runners_n - fast_n
+    return fast, gui_n > 0 and not fast and instance >= runners_n - fast_n - gui_n
 
 
 def install_or_uninstall(ctx: Context, args: argparse.Namespace, raw_argv: list[str]) -> int:
@@ -1879,6 +1884,9 @@ def install_or_uninstall(ctx: Context, args: argparse.Namespace, raw_argv: list[
                 ctx.capacity_units = int(kept.get("capacityUnits") or 0)
             if not args.min_free_gib:
                 ctx.min_free_gib = float(kept.get("minFreeGib") or 0)
+            # and its role: the fast runner's and the gui runner's hooks stay theirs
+            fast, gui = member_roles(kept, ctx.instance)
+            ctx.fast_runner, ctx.gui_runner = fast, not fast and (ctx.gui_runner or gui)
         # a re-run that names nothing keeps what this install registered, not the hostname default
         if not ctx.labels_requested and isinstance(registered.get("labels"), list) and registered["labels"]:
             ctx.labels = registered["labels"]
