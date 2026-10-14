@@ -4,7 +4,7 @@
     glaeda-gh serve                                     the daemon (LaunchAgent or systemd user unit)
     glaeda-gh status pr OWNER/REPO#N [--json]           PR state, checks, mergeability, review
     glaeda-gh status run OWNER/REPO/RUN_ID [--jobs] [--json]
-    glaeda-gh wait pr OWNER/REPO#N [--until green|done|merged] [--timeout S] [--json]
+    glaeda-gh wait pr OWNER/REPO#N [--until green|done|required|merged] [--timeout S] [--json]
     glaeda-gh wait run OWNER/REPO/RUN_ID [--jobs] [--rescue-grace S] [--timeout S] [--json]
     glaeda-gh wait comment OWNER/REPO#N [--author LOGIN] [--match REGEX] [--since ID|URL|TIME|10m]
     glaeda-gh status comment OWNER/REPO#N               the latest comments on an issue or PR
@@ -43,12 +43,14 @@ the daemon is the only process that talks to GitHub, and clients only read its c
 Clients make no API calls. When the daemon is not running they say so and exit 3 rather than
 fall back to polling. `wait` exits 0 on success (or a matching comment), 1 on failure (a failed
 check, a failed run, a PR closed without being merged, an issue that does not exist), 2 on timeout,
-4 when the PR conflicts with its base. --until green (default) fails as soon as any check fails;
-done waits for every check to finish; merged waits for the merge.
+4 when the PR conflicts with its base. --until green (default) fails as soon as any completed check
+failed, required or not, and succeeds once every check finished with success, neutral or skipped;
+done waits for every check to finish; required lets only the checks GitHub requires decide (when
+any are marked); merged waits for the merge.
 
 A PR that conflicts with its base (mergeable CONFLICTING, merge state DIRTY), for example after the
 PR it was stacked on was squash-merged, runs no pull_request workflows until the next push. `wait
-pr --until green|done` therefore stops with exit 4 as soon as the daemon's cached data says so;
+pr --until green|done|required` therefore stops with exit 4 as soon as the daemon's cached data says so;
 --until merged keeps waiting. UNKNOWN mergeability (GitHub computes it lazily) counts as pending.
 
 A job a glaeda runner refused (its "Set up runner" step, the runner's job-started hook, failed
@@ -1177,12 +1179,6 @@ def failing(checks: list[dict]) -> list[dict]:
     return [c for c in checks if (c.get("conclusion") or "").upper() in FAILED]
 
 
-def judged(data: dict) -> list[dict]:
-    """The checks that decide: the required ones when GitHub marks any, else all of them."""
-    checks = data.get("checks") or []
-    return [c for c in checks if c.get("required")] or checks
-
-
 def refused_check(c: dict) -> bool:
     """A PR check whose runner refused the job: its job-started hook step failed at job start."""
     return ((c.get("conclusion") or "").upper() == "FAILURE" and HOOK_STEP in (c.get("failedSteps") or [])
@@ -1228,7 +1224,9 @@ def check_verdict(data: dict, until: str = "green", now: float | None = None,
     marked = any(c.get("required") for c in checks)
 
     def decides(c: dict) -> bool:
-        return bool(c.get("required")) or not marked
+        # Every check decides; only an explicit --until required ignores the ones GitHub does not require
+        # (manaflow-ai/subrouter#612 merged red on "success" over two failed optional checks).
+        return until != "required" or bool(c.get("required")) or not marked
 
     # GitHub's own merge state already counts a required check that never reported. A conflicted PR
     # (DIRTY) runs no pull_request workflows until the next push, and a merged one never will.
@@ -1236,8 +1234,8 @@ def check_verdict(data: dict, until: str = "green", now: float | None = None,
                and data.get("mergeStateStatus") not in {"CLEAN", "UNSTABLE", "HAS_HOOKS", "DIRTY"})
     groups = classify(data, now, grace)
     bad = [c for c in groups["failed"] if decides(c)]
-    unfinished = [c for c in groups["pending"] + groups["held"] if until != "green" or decides(c)]
-    if until == "green" and bad:
+    unfinished = [c for c in groups["pending"] + groups["held"] if decides(c)]
+    if until in {"green", "required"} and bad:
         return EXIT_FAIL
     if unfinished or waiting:
         return None
@@ -1691,9 +1689,10 @@ def parser() -> argparse.ArgumentParser:
         s.add_argument("--jobs", action="store_true", help="runs: also track the job list")
         s.add_argument("--json", action="store_true")
         if name == "wait":
-            s.add_argument("--until", choices=("green", "done", "merged"), default="green",
-                           help="PRs: green (fail fast), done (every check finished) or merged; green and "
-                                "done exit 4 once the PR conflicts with its base")
+            s.add_argument("--until", choices=("green", "done", "required", "merged"), default="green",
+                           help="PRs: green (every check passes; fail fast), done (every check finished), "
+                                "required (only the checks GitHub requires decide; fail fast) or merged; "
+                                "all but merged exit 4 once the PR conflicts with its base")
             s.add_argument("--timeout", type=float, default=3600, help="seconds (default 3600); exit 2 after")
             s.add_argument("--sha", help="the commit you pushed (git rev-parse HEAD): other heads count as pending")
             s.add_argument("--rescue-grace", type=float, default=RESCUE_GRACE, metavar="S",

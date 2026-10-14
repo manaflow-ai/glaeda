@@ -21,6 +21,7 @@ controller everything still works by polling, only slower; `glaeda-gh budget` sa
 ```bash
 glaeda-gh wait pr OWNER/REPO#N --sha "$(git rev-parse HEAD)"   # until green; 1 at the first failed check
 glaeda-gh wait pr OWNER/REPO#N --until done      # until every check finishes (0 green, 1 red, 4 conflict)
+glaeda-gh wait pr OWNER/REPO#N --until required  # only the checks GitHub requires decide (opt-in)
 glaeda-gh wait pr OWNER/REPO#N --until merged    # ignores conflicts; 1 if closed without merging
 glaeda-gh wait run OWNER/REPO/RUN_ID [--jobs]    # 0 success, 1 failure
 glaeda-gh wait comment OWNER/REPO#N --author 'github-actions[bot]' --match 'REGEX' --since COMMENT_URL
@@ -37,10 +38,12 @@ glaeda-gh budget                                 # REST and GraphQL left, the da
   looping over several: each then notifies you on its own when it exits, and you carry on meanwhile.
 - The summary names what failed and the failed step, e.g.
   `failed: CI / build (step: Run selected tests)`, so you rarely need a REST call to see why.
-  Only the checks GitHub marks required decide. The headline (`checks SUCCESS: ...`) is the
-  verdict `wait` used; when GitHub's own rollup differs, the line says so. Non-required failures
-  are marked `(not required)`, and attempts a newer attempt or run replaced are listed as
-  `superseded` and not counted.
+  Every check decides, required or not: a completed failure (`(not required)` ones too) exits 1,
+  neutral and skipped pass, and a pending check is never a success. A merged PR went red when
+  only required checks decided. `--until required` keeps that reading on request, for example
+  when an optional check never finishes. The headline (`checks SUCCESS: ...`) is the verdict
+  `wait` used; when GitHub's own rollup differs, the line says so. Attempts a newer attempt or
+  run replaced are listed as `superseded` and not counted.
 - `wait` only rules on data fetched after it started, so it answers within about a minute at the earliest.
 - Add `--json` for machine-readable output. URLs work too: `glaeda-gh wait pr https://github.com/o/r/pull/12`.
 
@@ -56,7 +59,7 @@ the run's commit is also an error: a run's commit never changes.
 
 A PR that conflicts with its base (mergeable `CONFLICTING`, merge state `DIRTY`) runs no
 pull_request workflows until the next push. This happens to a stacked PR when the PR below it is
-squash-merged and main moves under it. `wait pr --until green` and `--until done` stop with exit 4
+squash-merged and main moves under it. `wait pr --until green`, `done` and `required` stop with exit 4
 as soon as the daemon sees it, printing `result: conflict` and `note: PR conflicts with its base`.
 Rebase or merge the base, push, and wait again with the new `--sha`. The check uses the daemon's
 cached PR data, so it costs no extra API calls. `UNKNOWN` mergeability (GitHub computes it

@@ -1129,12 +1129,13 @@ class ClientTest(Base):
         code, _ = self.wait("pr", "o/r#6", fill=(None, {"error": "gh auth token exited 1; is gh signed in?"}), timeout=0.4)
         self.assertEqual(code, 2)
 
-    def test_only_required_checks_decide_when_marked(self) -> None:
+    def test_a_failed_optional_check_fails_unless_only_required_ones_count(self) -> None:
         req = {**check_run("build"), "isRequired": True}
         optional = {**check_run("lint", conclusion="FAILURE"), "isRequired": False}
         data = gg.parse_pr(pr_node(1, rollup="FAILURE", checks=[req, optional]))
-        self.assertEqual(gg.verdict("pr", data, "green"), 0)
-        self.assertEqual(gg.verdict("pr", data, "done"), 0)
+        self.assertEqual(gg.verdict("pr", data, "green"), 1)
+        self.assertEqual(gg.verdict("pr", data, "done"), 1)
+        self.assertEqual(gg.verdict("pr", data, "required"), 0)
         self.assertIn("lint (not required)", gg.summary("pr:o/r#1", {"data": data}))
         many = {**data, "checksTruncated": True, "checkState": "PENDING"}
         self.assertIsNone(gg.verdict("pr", many))  # over 100 checks: the rollup decides
@@ -1282,17 +1283,89 @@ class ClientTest(Base):
                                                      {**check_run("build"), "isRequired": True}, lint])
         node["mergeStateStatus"] = "CLEAN"
         data = gg.parse_pr(node)
-        self.assertEqual(gg.verdict("pr", data, "done"), 0)
-        text = gg.summary("pr:o/r#1", {"data": data}, "done")
+        self.assertEqual(gg.verdict("pr", data, "required"), 0)
+        text = gg.summary("pr:o/r#1", {"data": data}, "required")
         self.assertIn("checks SUCCESS: 2 passed, 1 failed, 0 pending (of 3, 2 required); GitHub's rollup says FAILURE", text)
         self.assertIn("cancelled: lint (not required)", text)
         self.assertIn("superseded: Web complexity / Web complexity cancelled, replaced by a newer attempt or run", text)
         self.assertNotIn("checks FAILURE", text)
-        # the headline follows the mode the wait used: green ignores optional checks still running
+        # the cancelled optional lint fails every other mode, and the headline says so
+        self.assertEqual(gg.verdict("pr", data, "done"), 1)
+        self.assertIn("checks FAILURE: 2 passed, 1 failed", gg.summary("pr:o/r#1", {"data": data}, "done"))
+        # the headline follows the mode the wait used: only `required` ignores optional checks still running
         running = gg.parse_pr(pr_node(2, rollup="PENDING", checks=[{**check_run("build"), "isRequired": True},
                                                                     {**check_run("slow", "IN_PROGRESS", None)}]))
-        self.assertIn("checks SUCCESS", gg.summary("pr:o/r#2", {"data": running}, "green"))
+        self.assertIn("checks SUCCESS", gg.summary("pr:o/r#2", {"data": running}, "required"))
+        self.assertIn("checks PENDING", gg.summary("pr:o/r#2", {"data": running}, "green"))
         self.assertIn("checks PENDING", gg.summary("pr:o/r#2", {"data": running}, "done"))
+        self.assertIsNone(gg.verdict("pr", running, "green"))
+
+    def test_subrouter_612_two_optional_reds_are_a_failure(self) -> None:
+        """manaflow-ai/subrouter#612 merged red: `wait pr` printed result: success over
+        "21 passed, 2 failed", because only the one required check (CLA Assistant v3) decided.
+        The rollup below is that PR's head commit's, as GitHub returned it."""
+        rows = [  # name, workflow, conclusion, required
+            ("Validate CLA trigger", "CLA policy workflow", "SKIPPED", False),
+            ("Detect changed paths", "CI", "SUCCESS", False),
+            ("Validate CLA trigger", "CLA policy workflow", "SUCCESS", False),
+            ("Validate CLA trigger", "CLA policy workflow", "SUCCESS", False),
+            ("Unit tests", "CI", "FAILURE", False),
+            ("Lock merged pull request", "CLA policy workflow", "SKIPPED", False),
+            ("Lock merged pull request", "CLA policy workflow", "SKIPPED", False),
+            ("Lock merged pull request", "CLA policy workflow", "SUCCESS", False),
+            ("CLA signer gate", "CLA policy workflow", "SKIPPED", False),
+            ("CLA signer gate", "CLA policy workflow", "SKIPPED", False),
+            ("CLA signer gate", "CLA policy workflow", "SKIPPED", False),
+            ("Deploy scripts", "CI", "SUCCESS", False),
+            ("CLA ledger writer", "CLA policy workflow", "SKIPPED", False),
+            ("Shadow rehearsal", "CI", "SUCCESS", False),
+            ("CLA ledger writer", "CLA policy workflow", "SUCCESS", False),
+            ("CLA ledger writer", "CLA policy workflow", "SUCCESS", False),
+            ("CLA Assistant v3", "CLA policy workflow", "SKIPPED", True),
+            ("Cross-compile release targets (darwin)", "CI", "SUCCESS", False),
+            ("CLA Assistant v3", "CLA policy workflow", "SUCCESS", True),
+            ("CLA Assistant v3", "CLA policy workflow", "SUCCESS", True),
+            ("Cross-compile release targets (linux)", "CI", "SUCCESS", False),
+            ("Cross-compile release targets (windows)", "CI", "SUCCESS", False),
+            ("Cross-compile release targets (freebsd)", "CI", "SUCCESS", False),
+            ("Cross-compile release targets (netbsd-openbsd)", "CI", "SUCCESS", False),
+            ("Rerun failed CLA check", "CLA policy workflow", "SKIPPED", False),
+            ("Rerun failed CLA check", "CLA policy workflow", "SKIPPED", False),
+            ("Rerun failed CLA check", "CLA policy workflow", "SKIPPED", False),
+            ("Linux client artifact (exact head)", "CI", "SUCCESS", False),
+            ("Docker local and team profiles", "CI", "SUCCESS", False),
+            ("macOS LaunchAgent transaction", "CI", "SUCCESS", False),
+            ("Build, vet, test", "CI", "FAILURE", False),
+            ("cubic · AI code reviewer", None, "NEUTRAL", False),
+            ("Socket Security: Project Report", None, "SUCCESS", False),
+            ("Socket Security: Pull Request Alerts", None, "SUCCESS", False),
+        ]
+        checks = []
+        for index, (name, workflow, conclusion, required) in enumerate(rows):
+            run = {"databaseId": 1000 + index, "workflow": {"name": workflow, "databaseId": 7}} if workflow else None
+            checks.append({**check_run(name, conclusion=conclusion), "databaseId": index, "isRequired": required,
+                           "checkSuite": {"conclusion": conclusion, "workflowRun": run}})
+        checks.append({"__typename": "StatusContext", "context": "CodeRabbit", "state": "SUCCESS",
+                       "targetUrl": "https://ci/coderabbit", "isRequired": False})
+        node = pr_node(612, rollup="FAILURE", checks=checks)
+        node["mergeStateStatus"] = "CLEAN"
+        data = gg.parse_pr(node)
+        for until in ("green", "done"):
+            self.assertEqual(gg.verdict("pr", data, until), 1, until)
+            text = gg.summary("pr:manaflow-ai/subrouter#612", {"data": data}, until)
+            self.assertIn("checks FAILURE: 21 passed, 2 failed, 0 pending (of 23, 1 required)", text)
+            self.assertIn("failed: CI / Unit tests (not required)", text)
+            self.assertIn("failed: CI / Build, vet, test (not required)", text)
+        # only an explicit --until required keeps the old reading
+        self.assertEqual(gg.verdict("pr", data, "required"), 0)
+        # neutral and skipped checks are not failures, and a pending one is not a success
+        quiet = [c for c in checks if c.get("conclusion") != "FAILURE"]
+        self.assertEqual(gg.verdict("pr", gg.parse_pr({**pr_node(1, rollup="SUCCESS", checks=quiet),
+                                                      "mergeStateStatus": "CLEAN"}), "green"), 0)
+        slow = quiet + [{**check_run("Unit tests", "IN_PROGRESS", None), "isRequired": False}]
+        self.assertIsNone(gg.verdict("pr", gg.parse_pr({**pr_node(1, rollup="PENDING", checks=slow),
+                                                       "mergeStateStatus": "CLEAN"}), "green"))
+
 
     # -- comments
 
