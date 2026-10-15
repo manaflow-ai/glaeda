@@ -28,8 +28,9 @@ jobs:
   # Most pull requests change only Python and shell under scripts/, which the Rust and Go jobs cannot judge: of 60
   # recent PRs, 48 touched nothing they read, and each still spent about 295 runner-seconds on lint, test, cli and go.
   # Those jobs now run for a pull request only when it changes something they read. A script counts as Rust input
-  # when src/, tests/ or the cli job names it (scripts/bootstrap, for one). Pushes to main run everything, and
-  # scripts and runner-tests always run, since several script tests drive cargo.
+  # when src/, tests/ or the cli job names it (scripts/bootstrap, for one). Pushes to main run everything.
+  # scripts and runner-tests run for any pull request that changes more than Markdown no script names, since several
+  # script tests drive cargo and some read docs (docs/CMUX_MINI_RUNNER.md, for one).
   changes:
     if: ${{ github.event_name == 'pull_request' || github.repository == 'teamleaderleo/glaeda' }}
     runs-on: ubuntu-24.04
@@ -38,6 +39,7 @@ jobs:
       rust: ${{ steps.scope.outputs.rust }}
       go: ${{ steps.scope.outputs.go }}
       fleet_cas: ${{ steps.scope.outputs.fleet_cas }}
+      code: ${{ steps.scope.outputs.code }}
 
     steps:
       - name: Check out repository
@@ -54,12 +56,13 @@ jobs:
           EVENT: ${{ github.event_name }}
         run: |
           if test "$EVENT" != pull_request; then
-            printf 'rust=true\ngo=true\nfleet_cas=false\n' >> "$GITHUB_OUTPUT"
+            printf 'rust=true\ngo=true\nfleet_cas=false\ncode=true\n' >> "$GITHUB_OUTPUT"
             exit 0
           fi
           rust=false
           go=false
           fleet_cas=false
+          code=false
           # Scripts that Rust tests run: the modules they load are Rust input too (fleet_bundle.py through
           # scripts/test-fleet-bundle.py, for one).
           rust_named=$(grep -rhoE 'scripts/[A-Za-z0-9_./-]+' src tests | sort -u | while read -r f; do
@@ -68,6 +71,16 @@ jobs:
           # --no-renames lists a rename's old path too; writing to a file first fails the job, not open, on error.
           git diff --no-renames --name-only HEAD^1 HEAD > "$RUNNER_TEMP/changed"
           while IFS= read -r path; do
+            # Markdown that no script names is the only change scripts and runner-tests cannot judge.
+            case "$path" in
+              *.md)
+                if grep -rqF -- "$path" scripts; then
+                  echo "A script names $path"
+                  code=true
+                fi
+                ;;
+              *) code=true ;;
+            esac
             case "$path" in
               tools/fleet-cas-prototype/*) fleet_cas=true; rust=true ;;
               scripts/fleet_cas_bundle.py|scripts/test-fleet-cas-bundle.py|.github/workflows/release.yml|tools/fleet-cas-prototype/README.md) fleet_cas=true ;;
@@ -88,7 +101,8 @@ jobs:
               *) rust=true ;;
             esac
           done < "$RUNNER_TEMP/changed"
-          printf 'rust=%s\ngo=%s\nfleet_cas=%s\n' "$rust" "$go" "$fleet_cas" | tee -a "$GITHUB_OUTPUT"
+          if test "$rust" = true; then code=true; fi
+          printf 'rust=%s\ngo=%s\nfleet_cas=%s\ncode=%s\n' "$rust" "$go" "$fleet_cas" "$code" | tee -a "$GITHUB_OUTPUT"
 
   go:
     needs: changes
@@ -122,7 +136,8 @@ jobs:
 
   # Script syntax and every script test file but the runner's, which runner-tests shards.
   scripts:
-    if: ${{ github.event_name == 'pull_request' || github.repository == 'teamleaderleo/glaeda' }}
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
 
@@ -387,7 +402,8 @@ jobs:
 
   # scripts/test-glaeda-cmux-runner.py took about 300 s of the old single job; its shards run side by side.
   runner-tests:
-    if: ${{ github.event_name == 'pull_request' || github.repository == 'teamleaderleo/glaeda' }}
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     strategy:

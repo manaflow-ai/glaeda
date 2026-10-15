@@ -12,6 +12,11 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same pull request supersedes its candidate build; dispatches never cancel each other.
+concurrency:
+  group: fleet-candidate-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   candidate:
     strategy:
