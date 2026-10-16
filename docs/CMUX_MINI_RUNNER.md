@@ -602,10 +602,27 @@ Its runners then:
 workflow_dispatch is refused: a dispatched workflow on main can check out any ref from its inputs (cmux's
 app-host-test-rerun takes `refs/pull/N/merge`). pull_request, merge_group and workflow_run are refused too.
 
+`runner.trustedNextNightly: true` is a separate, default-off trust decision for cmux's NEXT nightly.
+It requires a dedicated `manaflow-ai/cmux` trusted main runner with no `dev-builds` role, adds
+`--trusted-next-nightly` to its host hook, and adds the `glaeda-trusted-next-nightly` capability label.
+That label makes the owner relabel plan regenerate the wrapper; OTA hook refresh alone does not
+change wrapper arguments. NEXT routing must require that label as well as the trusted pool and exact
+runner labels. The only additional admission is a push whose environment
+and payload both name `refs/heads/nightly-next`, whose `GITHUB_WORKFLOW_REF` is exactly
+`manaflow-ai/cmux/.github/workflows/nightly.yml@refs/heads/nightly-next`, whose job is
+`build-nightly-app`, and whose run attempt is `1`. Repository and hostile-payload checks still apply.
+Schedules execute the default branch; NEXT promotion reaches this route through the nightly-next
+push. Other NEXT jobs, refs, workflows, dispatches and re-runs remain refused. This does not add a
+PR pool label, signing capability, or permission to restore PR-produced caches or publish shared
+seeds. Keep local NEXT DerivedData and cache lineage separate from main. The cmux workflow must
+retain its ephemeral overflow/rescue path until the merged hook and host eligibility are verified.
+
 What the gate cannot see, and the operator must keep true:
 
 - The trust boundary is whoever can push to main: main's ruleset must block direct pushes, with no
   bypass list, so every commit there is a reviewed merge.
+- Enabling `trustedNextNightly` additionally trusts whoever can update nightly-next and its promoted
+  source. Protect that promotion boundary before activation; the hook does not prove branch protection.
 - Trusted jobs must pin every action and reusable workflow by commit SHA, and must restore only caches
   that trusted runs wrote. A cache namespace that PR runs also write (build seeds, sccache, SwiftPM
   manifest caches) brings PR-produced bytes next to the secret.

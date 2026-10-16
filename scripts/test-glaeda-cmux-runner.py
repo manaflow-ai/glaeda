@@ -427,6 +427,41 @@ class HookTest(unittest.TestCase):
                                        "--no-disk", repo="manaflow-ai/cmux").returncode, 0,
                          "without --trusted-ref a same-repo PR is admitted as before")
 
+    def test_trusted_next_nightly_is_an_exact_opt_in(self) -> None:
+        ref = "refs/heads/nightly-next"
+        payload = {"ref": ref, "repository": {**CMUX, "default_branch": "main"}}
+        args = {"event_name": "push", "ref": ref, "repository": "manaflow-ai/cmux", "event": payload,
+                "trusted_ref": "refs/heads/main", "trusted_repo": "manaflow-ai/cmux",
+                "trusted_next_nightly": True, "workflow_ref": f"manaflow-ai/cmux/.github/workflows/nightly.yml@{ref}",
+                "job": "build-nightly-app", "run_attempt": "1"}
+        self.assertIsNone(hook.trusted_refusal(**args))
+        cases = [
+            {"trusted_next_nightly": False}, {"event_name": "schedule"}, {"event_name": "workflow_dispatch"},
+            {"ref": "refs/heads/feat-cmux-next"}, {"repository": "manaflow-ai/other"},
+            {"event": {**payload, "ref": "refs/heads/main"}},
+            {"event": {**payload, "repository": {"full_name": "manaflow-ai/other"}}},
+            {"workflow_ref": None}, {"workflow_ref": "manaflow-ai/cmux/.github/workflows/nightly.yml@refs/heads/main"},
+            {"workflow_ref": f"manaflow-ai/cmux/.github/workflows/seed-derived-data.yml@{ref}"},
+            {"workflow_ref": f"other/cmux/.github/workflows/nightly.yml@{ref}"},
+            {"job": "seed"}, {"job": None}, {"run_attempt": "2"}, {"run_attempt": None},
+            {"trusted_ref": "refs/heads/feat-cmux-next"}, {"trusted_repo": "manaflow-ai/other"},
+            *[{"event": {**payload, key: {}}} for key in ("pull_request", "workflow_run", "merge_group")],
+        ]
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                self.assertIn("untrusted:", hook.trusted_refusal(**{**args, **overrides}))
+        for event_name in ("push", "schedule"):
+            self.assertIsNone(hook.trusted_refusal(**{**args, "event_name": event_name,
+                "ref": "refs/heads/main", "event": {**payload, "ref": "refs/heads/main"}}))
+        path = event(self.dir, "next-nightly", payload)
+        environ = {"GITHUB_REF": ref, "GITHUB_WORKFLOW_REF": args["workflow_ref"],
+                   "GITHUB_JOB": args["job"], "GITHUB_RUN_ATTEMPT": "1"}
+        for trusted in (("--trusted-ref", "refs/heads/main", "--trusted-repo", "manaflow-ai/cmux"), ()):
+            result = self.run_hook("job-started", "push", path, "--allowed-owner", "manaflow-ai",
+                                   "--trusted-next-nightly", "--no-disk", *trusted,
+                                   repo="manaflow-ai/cmux", env=environ)
+            self.assertEqual(result.returncode == 0, bool(trusted), result.stdout + result.stderr)
+
     def test_disk_pressure_never_fails_and_is_bounded(self) -> None:
         marker = self.dir / "disk-ran"
         slow = make_executable(self.dir / "glaeda-disk-slow", "import time, pathlib, sys\n"
@@ -5097,11 +5132,13 @@ class RunnerTest(unittest.TestCase):
         self.assertIn("--test-keychain --recycle-testmanagerd", (hooks / "job-started.sh").read_text())
         self.assertIn("--recycle-testmanagerd \"$@\"", (hooks / "glaeda-canonical-root").read_text(), "take-gui too")
         manifest["hosts"]["mini-std"].setdefault("overrides", {})["runner"] = {
-            "trustedRef": "refs/heads/main", "trustedRepo": "manaflow-ai/cmux"}
+            "trustedRef": "refs/heads/main", "trustedRepo": "manaflow-ai/cmux", "trustedNextNightly": True}
+        manifest["hosts"]["mini-std"]["roles"].remove("dev-builds")
         path.write_text(json.dumps(manifest))
         with mock.patch.object(cr, "xcode_present", return_value=True):
             self.invoke("--apply", "--manifest", os.fspath(path), "--member", "mini-std")
         self.assertIn("--trusted-ref refs/heads/main --trusted-repo manaflow-ai/cmux", (hooks / "job-started.sh").read_text())
+        self.assertIn("--trusted-next-nightly", (hooks / "job-started.sh").read_text())
         self.assertNotIn("--test-keychain", (hooks / "job-started.sh").read_text(), "a secret-holding host keeps its keychains")
         self.assertNotIn("--recycle-testmanagerd", (hooks / "job-started.sh").read_text() +
                          (hooks / "glaeda-canonical-root").read_text(), "a trusted-ref host runs no PR XCTest")
@@ -5854,6 +5891,28 @@ class ManifestLabelsTest(unittest.TestCase):
                 with self.subTest(bad=bad):
                     manifest["hosts"]["mini-std"]["overrides"]["runner"] = bad
                     self.assertIn("trustedRef", cr.member_labels(manifest, "mini-std")[1])
+
+    def test_trusted_next_nightly_manifest_fails_closed(self) -> None:
+        trusted = {"trustedRef": "refs/heads/main", "trustedRepo": "manaflow-ai/cmux", "trustedNextNightly": True}
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            manifest = json.loads(json.dumps(MANIFEST))
+            host = manifest["hosts"]["mini-std"]
+            host["roles"].remove("dev-builds")
+            host["overrides"] = {"runner": trusted}
+            self.assertTrue(cr.member_labels(manifest, "mini-std")[0]["trustedNextNightly"])
+            self.assertIn("glaeda-trusted-next-nightly", cr.member_labels(manifest, "mini-std")[0]["labels"])
+            self.assertNotIn("glaeda-trusted-next-nightly", cr.member_labels(MANIFEST, "mini-std")[0]["labels"])
+            self.assertFalse(cr.member_labels(MANIFEST, "mini-std")[0]["trustedNextNightly"])
+            for bad in ({**trusted, "trustedNextNightly": "true"}, {**trusted, "trustedNextNightly": 1},
+                        {**trusted, "trustedNextNightly": None}, {"trustedNextNightly": True},
+                        {**trusted, "trustedRef": "refs/heads/feat-cmux-next"},
+                        {**trusted, "trustedRepo": "manaflow-ai/other"}):
+                with self.subTest(bad=bad):
+                    host["overrides"]["runner"] = bad
+                    self.assertIn("trustedNextNightly", cr.member_labels(manifest, "mini-std")[1])
+            host["overrides"]["runner"] = trusted
+            host["roles"].append("dev-builds")
+            self.assertIn("trustedNextNightly", cr.member_labels(manifest, "mini-std")[1])
 
     def test_ios_sim_label_needs_the_manifest_and_a_runtime(self) -> None:
         def rt(build: str, available: bool = True, platform: str = "iOS") -> dict:

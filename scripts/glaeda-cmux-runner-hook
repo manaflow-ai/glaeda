@@ -800,11 +800,15 @@ UNTRUSTED_PAYLOAD_KEYS = ("pull_request", "workflow_run", "merge_group")
 
 
 def trusted_refusal(event_name: str | None, ref: str | None, repository: str | None, event: Any,
-                    trusted_ref: str, trusted_repo: str) -> str | None:
+                    trusted_ref: str, trusted_repo: str, *, trusted_next_nightly: bool = False,
+                    workflow_ref: str | None = None, job: str | None = None,
+                    run_attempt: str | None = None) -> str | None:
     """Why a job is not merged code of trusted_repo on trusted_ref, or None. Pure. For a push or schedule the
     workflow file and the default checkout come from that ref, so PR code runs only if a merged workflow
     fetches it (docs/CMUX_MINI_RUNNER.md 2e)."""
     why = f"untrusted: this runner takes only {trusted_repo} {trusted_ref} push and schedule jobs"
+    if trusted_next_nightly and (trusted_ref != "refs/heads/main" or trusted_repo != "manaflow-ai/cmux"):
+        return "untrusted: NEXT nightly opt-in needs manaflow-ai/cmux trusted main admission"
     if event_name not in TRUSTED_EVENTS:
         return f"{why}, not {event_name}"
     if not isinstance(event, dict):
@@ -812,14 +816,22 @@ def trusted_refusal(event_name: str | None, ref: str | None, repository: str | N
     repos = {(repository or "").lower(), (_repo_name(event.get("repository")) or "").lower()}
     if repos != {trusted_repo.lower()}:
         return f"{why}, not {' / '.join(sorted(r or '(unknown)' for r in repos))}"
+    if any(key in event for key in UNTRUSTED_PAYLOAD_KEYS):
+        return f"{why}; the payload carries {', '.join(k for k in UNTRUSTED_PAYLOAD_KEYS if k in event)}"
+    if trusted_next_nightly and ref == "refs/heads/nightly-next":
+        # A fixed exception, never a general extra-ref list. Schedules run on the default branch;
+        # NEXT promotion reaches this runner only through the protected nightly-next push.
+        if (event_name == "push" and event.get("ref") == ref and run_attempt == "1"
+                and workflow_ref == "manaflow-ai/cmux/.github/workflows/nightly.yml@refs/heads/nightly-next"
+                and job == "build-nightly-app"):
+            return None
+        return "untrusted: NEXT nightly needs its exact nightly.yml build-nightly-app push on attempt 1"
     if ref != trusted_ref:
         return f"{why}, not ref {ref or '(unset)'}"
     if event_name == "push" and event.get("ref") != trusted_ref:
         return f"{why}; the push payload ref is {event.get('ref')!r}"
     if event_name == "schedule" and f"refs/heads/{(event.get('repository') or {}).get('default_branch')}" != trusted_ref:
         return f"{why}; a schedule runs on the default branch, which is not {trusted_ref}"
-    if any(key in event for key in UNTRUSTED_PAYLOAD_KEYS):
-        return f"{why}; the payload carries {', '.join(k for k in UNTRUSTED_PAYLOAD_KEYS if k in event)}"
     return None
 
 
@@ -4501,6 +4513,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="admit another event name (pull_request_target is always refused)")
     p.add_argument("--trusted-ref", help="admit only push and schedule jobs on this ref (needs --trusted-repo)")
     p.add_argument("--trusted-repo", help="the one repository --trusted-ref admits")
+    p.add_argument("--trusted-next-nightly", action="store_true",
+                   help="also admit only cmux nightly-next's exact nightly app push on attempt 1")
     p.add_argument("--disk", help="glaeda-disk path (default: PATH, then ~/.local/bin)")
     p.add_argument("--no-disk", action="store_true")
     p.add_argument("--no-telemetry", action="store_true", help="do not sample the host while the job runs")
@@ -4614,10 +4628,12 @@ def main(argv: list[str] | None = None) -> int:
                                tuple(args.allow_event))
         if not admit:
             return refused(reason)
-        if args.trusted_ref or args.trusted_repo:
+        if args.trusted_ref or args.trusted_repo or args.trusted_next_nightly:
             why = trusted_refusal(os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REF"),
                                   os.environ.get("GITHUB_REPOSITORY"), event, args.trusted_ref or "(unset)",
-                                  args.trusted_repo or "(unset)")
+                                  args.trusted_repo or "(unset)", trusted_next_nightly=args.trusted_next_nightly,
+                                  workflow_ref=os.environ.get("GITHUB_WORKFLOW_REF"), job=os.environ.get("GITHUB_JOB"),
+                                  run_attempt=os.environ.get("GITHUB_RUN_ATTEMPT"))
             if why:
                 return refused(why)
         want: dict[str, Any] = {}

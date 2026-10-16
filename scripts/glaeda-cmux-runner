@@ -495,6 +495,8 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         if ctx.member.get("trustedRef"):  # this mini holds a secret: only jobs on that branch, never PR code
             scope += (f" --trusted-ref {shlex.quote(ctx.member['trustedRef'])}"
                       f" --trusted-repo {shlex.quote(ctx.member['trustedRepo'])}")
+            if ctx.member.get("trustedNextNightly"):
+                scope += " --trusted-next-nightly"
         else:  # PR runners: an unlocked test keychain (the login keychain is locked in the runner session)
             scope += " --test-keychain"
             # and a fresh testmanagerd for each job that takes the gui token (a wedged one hangs every XCTest run)
