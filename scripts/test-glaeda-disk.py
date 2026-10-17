@@ -1407,6 +1407,17 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(got[0].verdict, "in-use")
         self.assertIn("unknown children", got[0].reasons[0])
 
+    def test_cmux_next_ci_preserves_compilation_cache_child(self) -> None:
+        root = self.root / "Library/Caches/cmux-next-ci"
+        state = root / "cmux-scheme/runner-a"
+        build = make(state / "Build", age_hours=96)
+        (state / "CompilationCache.noindex").mkdir(parents=True)
+        fam = gd.cmux_next_ci_family(root)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            got = gd.survey([fam], 24, 0)
+        self.assertEqual(got[0].path, str(build))
+        self.assertNotEqual(got[0].verdict, "in-use")
+
     def test_cmux_next_ci_keeps_recent_and_marked_state(self) -> None:
         root = self.root / "Library/Caches/cmux-next-ci"
         state = root / "cmux-scheme/runner-a"

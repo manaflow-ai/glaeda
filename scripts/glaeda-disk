@@ -494,7 +494,8 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
-    "SDKExplicitPrecompiledModules", "info.plist", ".metadata_never_index",
+    "SDKExplicitPrecompiledModules", "CompilationCache.noindex", "info.plist",
+    ".metadata_never_index",
 })
 CMUX_NEXT_CI_GENERATED_NAMES = frozenset({
     "Build", "Index.noindex", "Logs", "Products", "Intermediates.noindex",
