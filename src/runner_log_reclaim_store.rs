@@ -21,6 +21,15 @@ use serde::{Deserialize, Serialize};
 use crate::runner_log_reclaim::{
     FileIdentity, ItemDecision, LogItem, Policy, ProcessEvidence, RunnerEnrollmentReceipt,
 };
+#[cfg(target_os = "macos")]
+fn stat_nanos(value: i64) -> i64 {
+    value
+}
+#[cfg(not(target_os = "macos"))]
+fn stat_nanos(value: u64) -> i64 {
+    value as i64
+}
+
 fn stat_matches_materialization(stat: &rfs::Stat, identity: FileIdentity) -> bool {
     stat.st_dev as u64 == identity.device
         && stat.st_ino == identity.inode
@@ -28,9 +37,9 @@ fn stat_matches_materialization(stat: &rfs::Stat, identity: FileIdentity) -> boo
         && stat.st_size >= 0
         && stat.st_size as u64 == identity.size
         && stat.st_mtime == identity.modified_seconds
-        && stat.st_mtime_nsec as i64 == identity.modified_nanos
+        && stat_nanos(stat.st_mtime_nsec) == identity.modified_nanos
         && stat.st_ctime == identity.changed_seconds
-        && stat.st_ctime_nsec as i64 == identity.changed_nanos
+        && stat_nanos(stat.st_ctime_nsec) == identity.changed_nanos
 }
 
 // A successful rename updates ctime on Darwin.  The original ctime remains useful for
@@ -54,8 +63,8 @@ fn identity_from_stat(stat: &rfs::Stat) -> Option<FileIdentity> {
         size: stat.st_size as u64,
         modified_seconds: stat.st_mtime,
         changed_seconds: stat.st_ctime,
-        modified_nanos: stat.st_mtime_nsec as i64,
-        changed_nanos: stat.st_ctime_nsec as i64,
+        modified_nanos: stat_nanos(stat.st_mtime_nsec),
+        changed_nanos: stat_nanos(stat.st_ctime_nsec),
     })
 }
 
@@ -208,10 +217,10 @@ fn read_journal(
             return Err(StoreError::Io("journal_corrupt"));
         }
         let rank = phase_rank(&row.phase)?;
-        if let Some((previous, previous_row)) = seen.get(&row.tx_id) {
-            if rank < *previous || (rank == *previous && previous_row != &row) {
-                return Err(StoreError::Io("journal_phase_regression"));
-            }
+        if let Some((previous, previous_row)) = seen.get(&row.tx_id)
+            && (rank < *previous || (rank == *previous && previous_row != &row))
+        {
+            return Err(StoreError::Io("journal_phase_regression"));
         }
         seen.insert(row.tx_id.clone(), (rank, row.clone()));
         match row.phase.as_str() {
@@ -547,14 +556,14 @@ impl RunnerLogStore {
         };
         let Ok(held_marker) = rfs::statat(
             &self.root,
-            &CString::new(".glaeda-cmux-runner").unwrap(),
+            CString::new(".glaeda-cmux-runner").unwrap(),
             AtFlags::SYMLINK_NOFOLLOW,
         ) else {
             return false;
         };
         let marker_file = rfs::openat(
             &self.root,
-            &CString::new(".glaeda-cmux-runner").unwrap(),
+            CString::new(".glaeda-cmux-runner").unwrap(),
             READ_FILE_FLAGS,
             Mode::empty(),
         );
@@ -735,7 +744,7 @@ impl RunnerLogStore {
                 || !source_name.to_bytes().ends_with(b".log")
                 || !FileType::from_raw_mode(source.st_mode).is_file()
                 || source.st_nlink != 1
-                || source.st_uid != process.uid as u32
+                || source.st_uid != process.uid
                 || now_seconds()?.saturating_sub(item.identity.modified_seconds)
                     < policy.minimum_idle_seconds
                 || !stat_matches_materialization(&source, item.identity)
