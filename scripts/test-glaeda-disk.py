@@ -1696,9 +1696,35 @@ class GlaedaDiskTest(unittest.TestCase):
                 summary = json.loads(gd.HEALTH_SUMMARY.read_text())
                 self.assertEqual(summary["eviction_contention"]["owner"]["pid"], os.getpid())
                 survey.assert_not_called()
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(gd.main(["--apply", "--json", "--no-snapshot", *receipt]), 3)
+                report = json.loads(out.getvalue())
+                self.assertEqual((report["status"], report["reason"], report["complete"]),
+                                 ("deferred", "eviction_busy", False))
+                self.assertNotIn("items", report)
+                survey.assert_not_called()
             with contextlib.redirect_stdout(io.StringIO()):
                 gd.main(["--apply", "--no-snapshot", "--top", "0", *receipt])
             survey.assert_called_once()
+
+    def test_measurement_busy_json_is_not_a_completed_empty_report(self) -> None:
+        lock = self.root / "measurement.lock"
+        with mock.patch.object(gd, "MEASURE_LOCK", lock), \
+                mock.patch.object(gd, "default_families", return_value=[self.fam]), \
+                mock.patch.object(gd, "filesystems", return_value={}), \
+                mock.patch.object(gd, "survey") as survey:
+            with lock.open("a") as held:
+                fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    status = gd.main(["--json", "--refresh", "--no-snapshot"])
+                self.assertEqual(status, 3)
+                self.assertEqual(json.loads(out.getvalue()), {
+                    "status": "deferred", "complete": False, "reason": "measurement_busy",
+                    "message": "another measurement running; skipped",
+                })
+                survey.assert_not_called()
 
     def test_filesystems_group_roots_and_apply_thresholds(self) -> None:
         other = gd.Family("tmp", self.root, True, "scratch")

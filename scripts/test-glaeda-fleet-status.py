@@ -580,6 +580,14 @@ class DiskTests(unittest.TestCase):
         [f] = by_id(build(disk=disk(mini_a=row)), "disk.")
         self.assertEqual((f["code"], f["severity"]), ("unreadable", "info"))
 
+    def test_deferred_disk_report_is_unavailable_instead_of_empty_accounting(self):
+        row = fs.parse_disk('@disk\n{"status":"deferred","complete":false,'
+                            '"reason":"measurement_busy"}\n@now\n1800000000\n', AT)
+        self.assertEqual(row["measurement_status"], "deferred")
+        self.assertEqual(row["error"], "glaeda-disk deferred: measurement_busy")
+        self.assertNotIn("families", row)
+        self.assertNotIn("accounting", row)
+
     def test_parse_reduces_the_probe_to_numbers_without_paths(self):
         report = {"free": 100 * GIB, "total": 460 * GIB, "idle_hours": 24,
                   "filesystems": [{"dev": 1, "mount": "/", "free": 100 * GIB, "total": 460 * GIB, "low": 69 * GIB,

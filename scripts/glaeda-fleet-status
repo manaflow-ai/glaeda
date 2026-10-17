@@ -477,6 +477,9 @@ def parse_disk(stdout: str, at: int) -> dict[str, Any]:
         row["installed"] = False
     elif report.get("no_snapshot"):
         row["error"] = "glaeda-disk has no size snapshot yet"
+    elif report.get("status") == "deferred":
+        row["measurement_status"] = "deferred"
+        row["error"] = "glaeda-disk deferred: " + clean(report.get("reason"), 60)
     else:
         free, total = num(report.get("free")), num(report.get("total"))
         systems = [f for f in report.get("filesystems") or [] if isinstance(f, dict)]

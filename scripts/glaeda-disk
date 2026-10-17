@@ -4599,6 +4599,14 @@ def main(argv: list[str] | None = None) -> int:
                     help=argparse.SUPPRESS)  # tests
     a = ap.parse_args(argv)
 
+    def deferred(reason: str, message: str, **details) -> int:
+        if a.json:
+            print(json.dumps({"status": "deferred", "complete": False,
+                              "reason": reason, "message": message, **details}))
+            return 3
+        print(message)
+        return 0
+
     global _REFRESH_HANDLE
     if a.refresh_lock_fd is not None:
         try:
@@ -4733,8 +4741,9 @@ def main(argv: list[str] | None = None) -> int:
             owner = eviction_owner_status()
             write_eviction_status(a.receipt, owner)
             write_eviction_contention_health(a.receipt)
-            print(f"another eviction running; skipped ({eviction_owner_text(owner)})")
-            return 0
+            return deferred("eviction_busy",
+                            f"another eviction running; skipped ({eviction_owner_text(owner)})",
+                            owner=owner)
     idle = a.idle_hours if a.idle_hours is not None else IDLE_SWEEP_HOURS if sweep else (6 if under else 24)
     at, known, measured_at = (0.0, {}, {}) if a.refresh or a.no_snapshot else load_snapshot_meta()
     original_known = set(known)
@@ -4756,10 +4765,10 @@ def main(argv: list[str] | None = None) -> int:
         measure_lock = MEASURE_LOCK.open("a")
         fcntl.flock(measure_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        if a.pressure or a.refresh:
-            print("another measurement running; skipped")
-            return 0
+        measure_lock.close()
         measure_lock = None
+        if a.pressure or a.refresh:
+            return deferred("measurement_busy", "another measurement running; skipped")
     refresh_deadline = None
     if a.refresh and a.refresh_budget_s > 0:
         refresh_deadline = time.monotonic() + a.refresh_budget_s

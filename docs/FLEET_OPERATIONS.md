@@ -78,6 +78,11 @@ fleet --no-fetch disk-policy --all
 ssh HOST '~/.local/bin/glaeda-disk --pressure --idle --json'
 ```
 
+With `--json`, measurement or eviction lock contention emits a JSON report with
+`status: deferred`, `complete: false`, and exit code 3. Retry later; this is not
+a completed scan or evidence of zero reclaimable bytes. Text mode retains its
+successful skip behavior for existing maintenance hooks.
+
 The first two commands plan by default. Apply only the host-specific reclaim
 that the fresh receipt identifies as rebuildable:
 
