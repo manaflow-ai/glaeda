@@ -320,6 +320,8 @@ pub mod personal_worker_tick;
 pub mod personal_worker_verification_plan;
 pub mod plan;
 pub mod process;
+/// Report-only production recovery lifecycle with a synthetic apply projection.
+pub mod production_recovery_adapter;
 /// Pure, strict logical project catalog identities and alias resolution.
 pub mod project_catalog;
 /// Read-only, credentialless observation of one developer Git checkout on Unix hosts.
