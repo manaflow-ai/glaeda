@@ -14,6 +14,24 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Default)]
+struct VNodeFDInfo {
+    pfi: libproc::libproc::net_info::ProcFileInfo,
+    pvi: libproc::libproc::net_info::VInfoStat,
+    vi_type: i32,
+    vi_pad: i32,
+    vi_fsid: [i32; 2],
+}
+
+#[cfg(target_os = "macos")]
+impl libproc::libproc::file_info::PIDFDInfo for VNodeFDInfo {
+    fn flavor() -> libproc::libproc::file_info::PIDFDInfoFlavor {
+        libproc::libproc::file_info::PIDFDInfoFlavor::VNodeInfo
+    }
+}
+
 pub const RUNNER_LOG_RECLAIM_SCHEMA_VERSION: u8 = 1;
 pub const MAX_RUNNER_LOG_RECLAIM_BATCH: u32 = 64;
 pub const DEFAULT_RUNNER_LOG_RECLAIM_BATCH: u32 = 16;
@@ -295,23 +313,9 @@ fn reject_symlink_ancestors(path: &Path) -> Result<(), ReclaimError> {
 
 #[cfg(target_os = "macos")]
 fn observe_processes(root: &Path, uid: u32) -> Result<ProcessEvidence, ReclaimError> {
-    use libproc::libproc::file_info::{ListFDs, PIDFDInfo, PIDFDInfoFlavor, ProcFDType, pidfdinfo};
-    use libproc::libproc::proc_pid::listpidinfo;
-
-    #[repr(C)]
-    #[derive(Default)]
-    struct VNodeFDInfo {
-        pfi: libproc::libproc::net_info::ProcFileInfo,
-        pvi: libproc::libproc::net_info::VInfoStat,
-        vi_type: i32,
-        vi_pad: i32,
-        vi_fsid: [i32; 2],
-    }
-    impl PIDFDInfo for VNodeFDInfo {
-        fn flavor() -> PIDFDInfoFlavor {
-            PIDFDInfoFlavor::VNodeInfo
-        }
-    }
+    use libproc::libproc::bsd_info::BSDInfo;
+    use libproc::libproc::file_info::{ListFDs, ProcFDType, pidfdinfo};
+    use libproc::libproc::proc_pid::{listpidinfo, pidinfo};
 
     let pids = libproc::processes::pids_by_type(libproc::processes::ProcFilter::ByUID { uid })
         .map_err(|_| ReclaimError::Observation("process_table_unavailable"))?;
@@ -326,6 +330,13 @@ fn observe_processes(root: &Path, uid: u32) -> Result<ProcessEvidence, ReclaimEr
         unreadable = unreadable.saturating_add(1);
     }
     for pid in pids.iter().take(MAX_SCANNED_PIDS) {
+        let before = match pidinfo::<BSDInfo>(*pid as i32, 0) {
+            Ok(info) if info.pbi_uid == uid => (info.pbi_start_tvsec, info.pbi_start_tvusec),
+            Ok(_) | Err(_) => {
+                unreadable = unreadable.saturating_add(1);
+                continue;
+            }
+        };
         let worker_pid = match libproc::libproc::proc_pid::pidpath(*pid as i32) {
             Ok(path) if Path::new(&path) == root.join("bin/Runner.Worker") => true,
             Ok(_) => false,
@@ -364,6 +375,12 @@ fn observe_processes(root: &Path, uid: u32) -> Result<ProcessEvidence, ReclaimEr
             {
                 busy = busy.saturating_add(1);
             }
+        }
+        match pidinfo::<BSDInfo>(*pid as i32, 0) {
+            Ok(info)
+                if info.pbi_uid == uid
+                    && (info.pbi_start_tvsec, info.pbi_start_tvusec) == before => {}
+            Ok(_) | Err(_) => unreadable = unreadable.saturating_add(1),
         }
     }
     Ok(ProcessEvidence {
@@ -622,6 +639,25 @@ mod tests {
                 MAX_RUNNER_LOG_RECLAIM_BATCH + 1
             )
             .is_err()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn vnode_fd_info_layout_matches_public_libproc_components() {
+        use libproc::libproc::net_info::{ProcFileInfo, VInfoStat};
+        assert_eq!(std::mem::offset_of!(VNodeFDInfo, pfi), 0);
+        assert_eq!(
+            std::mem::offset_of!(VNodeFDInfo, pvi),
+            std::mem::size_of::<ProcFileInfo>()
+        );
+        assert_eq!(
+            std::mem::offset_of!(VNodeFDInfo, vi_type),
+            std::mem::size_of::<ProcFileInfo>() + std::mem::size_of::<VInfoStat>()
+        );
+        assert_eq!(
+            std::mem::size_of::<VNodeFDInfo>(),
+            std::mem::size_of::<ProcFileInfo>() + std::mem::size_of::<VInfoStat>() + 16
         );
     }
 
