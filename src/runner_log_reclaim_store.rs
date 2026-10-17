@@ -824,7 +824,7 @@ impl RunnerLogStore {
 mod tests {
     use super::*;
     use std::fs;
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     fn fixture() -> (PathBuf, RunnerEnrollmentReceipt, FileIdentity) {
         let root = std::env::temp_dir().join(format!(
@@ -847,6 +847,8 @@ mod tests {
         ));
         fs::create_dir_all(root.join("runner/_diag")).unwrap();
         fs::create_dir_all(root.join("state")).unwrap();
+        fs::set_permissions(root.join("runner"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(root.join("state"), fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(root.join("runner/.glaeda-cmux-runner"), "install\n").unwrap();
         let log = root.join("runner/_diag/old.log");
         fs::write(&log, b"old").unwrap();
