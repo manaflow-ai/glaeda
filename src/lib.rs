@@ -398,8 +398,10 @@ pub mod runner_account_observation;
 pub mod runner_account_plan;
 /// Bounded, authority-bound macOS runner diagnostics observation and reclaim.
 pub mod runner_log_reclaim;
-#[cfg(test)]
-mod runner_log_reclaim_store;
+// The descriptor-bound store is compiled in production so the typed admission adapter can
+// keep the mutation boundary available to the crate.  Its raw transaction methods remain
+// crate-private; callers must use `production_recovery_adapter`'s typed admission surface.
+pub mod runner_log_reclaim_store;
 #[cfg(target_os = "linux")]
 pub mod runner_user;
 #[cfg(target_os = "linux")]

@@ -407,6 +407,18 @@ fn now_seconds() -> Result<i64, StoreError> {
 }
 
 impl RunnerLogStore {
+    /// Opaque generation derived from the retained descriptor identities.  It is used only to
+    /// bind a fresh admission to the exact store opened under its lock.
+    pub(crate) fn store_generation(&self) -> u64 {
+        self.root_device
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            .wrapping_add(self.root_inode.rotate_left(13))
+            .wrapping_add(self.diag_device.rotate_left(29))
+            .wrapping_add(self.diag_inode.rotate_left(41))
+            .wrapping_add(self.marker_device.rotate_left(7))
+            .wrapping_add(self.marker_inode.rotate_left(17))
+    }
+
     fn journal_row(
         &self,
         tx_id: &str,
@@ -452,7 +464,7 @@ impl RunnerLogStore {
         Ok(())
     }
 
-    pub fn open(
+    pub(crate) fn open(
         root: &Path,
         receipt: &RunnerEnrollmentReceipt,
         state_root: &Path,
@@ -628,7 +640,7 @@ impl RunnerLogStore {
         Ok(process)
     }
 
-    pub fn recover<F>(
+    pub(crate) fn recover<F>(
         &mut self,
         policy: Policy,
         mut observe: F,
@@ -725,7 +737,7 @@ impl RunnerLogStore {
         Ok(receipt)
     }
 
-    pub fn apply_batch<F>(
+    pub(crate) fn apply_batch<F>(
         &mut self,
         candidates: &[LogItem],
         policy: Policy,
