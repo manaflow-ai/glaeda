@@ -5,10 +5,10 @@
 //! keep this crate free of project-local FFI.  Process evidence is scoped to the enrolled runner
 //! account; an unreadable in-scope enumeration is a veto, never evidence of absence.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
+use std::collections::BTreeSet;
+use std::fs;
 use std::io;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -611,6 +611,7 @@ pub fn reclaim(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
     use std::os::unix::fs::PermissionsExt;
 
     fn fixture() -> (PathBuf, RunnerEnrollmentReceipt) {
