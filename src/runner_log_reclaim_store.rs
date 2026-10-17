@@ -16,7 +16,6 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rustix::fs::{self as rfs, AtFlags, FileType, FlockOperation, Mode, OFlags, RenameFlags};
-use rustix::rand::{GetRandomFlags, getrandom};
 use serde::{Deserialize, Serialize};
 
 use crate::runner_log_reclaim::{
@@ -172,7 +171,7 @@ fn read_journal(
     if !file_is_safe(&stat, state_stat.st_uid) || stat.st_size < 0 {
         return Err(StoreError::Io("journal_unsafe"));
     }
-    let mut file = File::from(file);
+    let file = File::from(file);
     let mut bytes = Vec::new();
     file.take((MAX_JOURNAL_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
@@ -349,7 +348,7 @@ fn append_row(state: &OwnedFd, row: &JournalRow) -> Result<(), StoreError> {
     {
         return Err(StoreError::Io("journal_unsafe"));
     }
-    let file = File::from(file);
+    let mut file = File::from(file);
     file.write_all(&bytes)
         .map_err(|_| StoreError::Io("journal_write_failed"))?;
     file.sync_data()
@@ -359,7 +358,10 @@ fn append_row(state: &OwnedFd, row: &JournalRow) -> Result<(), StoreError> {
 
 fn transaction_id(install_id: &str, identity: FileIdentity) -> Result<String, StoreError> {
     let mut nonce = [0_u8; 16];
-    getrandom(&mut nonce, GetRandomFlags::empty())
+    let mut random =
+        File::open("/dev/urandom").map_err(|_| StoreError::Io("transaction_id_failed"))?;
+    random
+        .read_exact(&mut nonce)
         .map_err(|_| StoreError::Io("transaction_id_failed"))?;
     Ok(format!(
         "{install_id}-{:016x}-{:016x}-{}",
