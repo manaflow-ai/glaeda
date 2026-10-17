@@ -319,10 +319,12 @@ fn observe_processes(root: &Path, uid: u32) -> Result<ProcessEvidence, ReclaimEr
 
     let pids = libproc::processes::pids_by_type(libproc::processes::ProcFilter::ByUID { uid })
         .map_err(|_| ReclaimError::Observation("process_table_unavailable"))?;
-    const MAX_SCANNED_PIDS: usize = 512;
+    const MAX_SCANNED_PIDS: usize = 4_096;
     const MAX_FDS_PER_PID: usize = 4_096;
+    const MAX_SCANNED_FDS: usize = 1_000_000;
     let mut busy = 0_u64;
     let mut unreadable = 0_u64;
+    let mut scanned_fds = 0_usize;
     let root_stat = fs::symlink_metadata(root)
         .map_err(|_| ReclaimError::Observation("runner_root_unreadable"))?;
     let mut open_identities = BTreeSet::new();
@@ -352,6 +354,11 @@ fn observe_processes(root: &Path, uid: u32) -> Result<ProcessEvidence, ReclaimEr
                 continue;
             }
         };
+        scanned_fds = scanned_fds.saturating_add(fds.len());
+        if scanned_fds > MAX_SCANNED_FDS {
+            unreadable = unreadable.saturating_add(1);
+            break;
+        }
         if fds.len() == MAX_FDS_PER_PID {
             unreadable = unreadable.saturating_add(1);
         }
