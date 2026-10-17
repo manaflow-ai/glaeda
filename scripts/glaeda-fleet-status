@@ -14,6 +14,8 @@ Collection joins what exists today, each source optional and read-only:
   --github-runners SCOPE     runners of orgs/OWNER or repos/OWNER/REPO: online, busy, labels
   --queue-repo OWNER/REPO    queued jobs per label in that repository (repeatable)
   --cache NAME=URL           cache health endpoint, e.g. a /healthz URL (repeatable)
+  --live-builder-status PATH optional cmux-live status.json (requires explicit --live-builder-profile)
+  --live-builder-profile ID  policy profile attached to the live-builder status source
   (default on)               Lima instance counts and orphans per member (--no-lima to skip)
   (default on)               disk per member: free space, cache families and owners (glaeda-disk --json),
                              the last fleet-cas-prune and gc lines, bytes reclaimed in 24 h (--no-disk to skip)
@@ -28,6 +30,10 @@ Every finding carries a typed action {id, who: agent|password|person, safe_to_ap
 members in the manifest's never_touch list never get an agent action. Every source and finding
 carries observed_at so a stale view shows as stale. Nothing here changes any machine, except that
 glaeda-disk, like every report run of it, may rewrite its own size snapshot (~/.cache/glaeda-disk).
+
+The optional live-builder source consumes only `cmux-live-builder-status/v1` from the bounded local
+status file. The profile is explicit policy input; host names never imply CI enrollment. Unknown,
+blocked, stale, or missing observations remain warnings and never produce an automatic command.
 
 Exit status: 0 no error findings, 1 at least one error finding, 2 the tool itself failed.
 """
@@ -52,6 +58,7 @@ from typing import Any
 
 SCHEMA = "glaeda-fleet-status/v1"
 SOURCES_SCHEMA = SCHEMA + "/sources"
+LIVE_BUILDER_SCHEMA = "cmux-live-builder-status/v1"
 SCRIPT_DIR = Path(__file__).resolve().parent
 SSH = "/usr/bin/ssh"
 SSH_ROUTE_FIELDS = ("ssh_jump_host", "ssh_user", "ssh_identity", "tailnet_ip")
@@ -59,7 +66,7 @@ SSH_ROUTE_FIELDS = ("ssh_jump_host", "ssh_user", "ssh_identity", "tailnet_ip")
 WHO = ("agent", "password", "person")
 SEVERITIES = ("error", "warn", "info")
 SOURCE_NAMES = ("manifest", "check", "preflight", "controller", "runners", "queue", "cache", "lima", "disk", "jobs",
-                "tooling")
+                "tooling", "live_builder")
 # A source older than this at build time is itself a finding.
 DEFAULT_MAX_AGE = 900
 MAX_MEMBERS = 128
@@ -74,6 +81,7 @@ MAX_LIMA = 64
 MAX_DISK_FAMILIES = 24
 GIB = 1024**3
 MAX_DOCUMENT_BYTES = 512 * 1024
+MAX_LIVE_BUILDER_BYTES = 32 * 1024
 LIMA_TIMEOUT = 30
 GH_TIMEOUT = 30
 CONTROLLER_TIMEOUT = 60
@@ -86,6 +94,13 @@ TOOLING_TIMEOUT = 30
 GIT_TIMEOUT = 30
 SHA_RE = re.compile(r"[0-9a-f]{7,40}")
 TOOLING_STATES = ("current", "behind", "not_ancestor", "none", "unreadable", "unjudged")
+LIVE_BUILDER_HEALTH_FIELDS = ("preflight", "config", "identity", "xcode", "toolchain", "host_tools", "verifier",
+                              "cef_secrets", "publish_secrets", "disk")
+LIVE_BUILDER_HEALTH_STATES = frozenset(("pass", "blocked", "unknown"))
+LIVE_BUILDER_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9._:-]{0,63}\Z")
+LIVE_BUILDER_REASON_RE = re.compile(r"[a-z0-9][a-z0-9_.:-]{0,63}\Z")
+LIVE_BUILDER_BRANCH_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}\Z")
+LIVE_BUILDER_TAG_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
 MAX_CONTENDED_JOBS = 5  # per member, newest first
 CONSOLE_STATES = ("unlocked", "locked", "no_user")
 # A retired owner's family above this is worth a person's decision.
@@ -199,6 +214,27 @@ def stamp_of(value: Any) -> int | None:
     return int(value) if num(value) is not None else None
 
 
+def live_builder_stamp(value: Any) -> int | None:
+    """Accept the HQ contract's numeric or UTC ISO-8601 measurement time."""
+    stamp = stamp_of(value)
+    if stamp is not None:
+        return stamp
+    if not isinstance(value, str) or len(value) > 40:
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return int(parsed.timestamp())
+
+
+def live_builder_token(value: Any, pattern: re.Pattern[str]) -> str | None:
+    """Keep only bounded public identifiers from the live-builder receipt."""
+    return value if isinstance(value, str) and pattern.fullmatch(value) else None
+
+
 # ---------------------------------------------------------------- collection (read-only)
 
 
@@ -288,6 +324,57 @@ def collect_controller(status_py: Path | None, controller_json: Path | None) -> 
         return source(json.loads(proc.stdout))
     except json.JSONDecodeError:
         return source(error="status.py printed something other than JSON")
+
+
+def collect_live_builder(status_path: Path | None, profile: str | None) -> dict[str, Any] | None:
+    """Read the optional, local, secret-free cmux16 live-builder status contract.
+
+    The profile is supplied by fleet policy rather than inferred from a hostname or role.  The
+    status file is intentionally bounded and only a fixed public receipt subset is retained.
+    """
+    if status_path is None:
+        return None
+    if not isinstance(profile, str) or not LIVE_BUILDER_TOKEN_RE.fullmatch(profile):
+        return source(error="live-builder profile is required")
+    try:
+        if status_path.stat().st_size > MAX_LIVE_BUILDER_BYTES:
+            return source(error="live-builder status is too large")
+        raw = status_path.read_bytes()
+    except (OSError, ValueError):
+        return source(error="live-builder status is unreadable")
+    if len(raw) > MAX_LIVE_BUILDER_BYTES or b"\x00" in raw:
+        return source(error="live-builder status is too large")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return source(error="live-builder status is not JSON")
+    if not isinstance(payload, dict) or payload.get("schema") != LIVE_BUILDER_SCHEMA:
+        return source(error="live-builder status has an unsupported schema")
+    measured_at = live_builder_stamp(payload.get("measured_at"))
+    host_id = live_builder_token(payload.get("host_id"), LIVE_BUILDER_TOKEN_RE)
+    host_role = live_builder_token(payload.get("host_role"), LIVE_BUILDER_TOKEN_RE)
+    status_profile = live_builder_token(payload.get("profile"), LIVE_BUILDER_TOKEN_RE)
+    if measured_at is None or host_id is None or host_role is None or status_profile is None:
+        return source(error="live-builder status is missing identity or measured_at")
+    if status_profile != profile:
+        return source(error="live-builder status profile does not match policy")
+    health_payload = payload.get("health")
+    if not isinstance(health_payload, dict):
+        return source(error="live-builder status has no health object")
+    health = {name: state if state in LIVE_BUILDER_HEALTH_STATES else "unknown"
+              for name in LIVE_BUILDER_HEALTH_FIELDS
+              for state in [health_payload.get(name)]}
+    last_payload = payload.get("last")
+    last: dict[str, str] = {}
+    if isinstance(last_payload, dict):
+        for field, pattern in (("event", LIVE_BUILDER_REASON_RE), ("result", LIVE_BUILDER_REASON_RE),
+                               ("reason", LIVE_BUILDER_REASON_RE), ("branch", LIVE_BUILDER_BRANCH_RE),
+                               ("sha", SHA_RE), ("tag", LIVE_BUILDER_TAG_RE)):
+            value = live_builder_token(last_payload.get(field), pattern)
+            if value is not None:
+                last[field] = value
+    return source({"schema": LIVE_BUILDER_SCHEMA, "host_id": host_id, "host_role": host_role,
+                   "profile": profile, "health": health, "last": last}, observed_at=measured_at)
 
 
 def gh_json(gh: str, path: str) -> Any:
@@ -754,6 +841,9 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
                         ("cache", collect_cache(args.cache or []))):
         if value is not None:
             sources[name] = value
+    live_builder = collect_live_builder(args.live_builder_status, args.live_builder_profile)
+    if live_builder is not None:
+        sources["live_builder"] = live_builder
     if not args.no_lima:
         sources["lima"] = collect_lima(manifest, hosts)
     if not args.no_disk:
@@ -1004,6 +1094,40 @@ class Builder:
                 act = self.action(member, kind, who, None, note=note)
             self.finding("controller", state.replace(" ", "_"), severity,
                          f"controller: {state}; {clean(row.get('action'), 160)}", member, at, act)
+
+    def fold_live_builder(self) -> None:
+        """Join the optional live-builder health receipt without granting it fleet authority."""
+        data = self.data("live_builder")
+        if not data:
+            return
+        at = self.stamp("live_builder")
+        member = self.member_of(data.get("host_id"))
+        if member is None:
+            self.unmapped("live_builder", data.get("host_id"), at)
+            return
+        health_payload = data.get("health") if isinstance(data.get("health"), dict) else {}
+        health = {name: health_payload.get(name, "unknown")
+                  if health_payload.get(name) in LIVE_BUILDER_HEALTH_STATES else "unknown"
+                  for name in LIVE_BUILDER_HEALTH_FIELDS}
+        last_payload = data.get("last") if isinstance(data.get("last"), dict) else {}
+        last = {key: clean(last_payload.get(key), 128) for key in
+                ("event", "result", "reason", "branch", "sha", "tag") if last_payload.get(key)}
+        self.members[member]["live_builder"] = {
+            "host_id": clean(data.get("host_id"), 64),
+            "host_role": clean(data.get("host_role"), 64) or "unknown",
+            "profile": clean(data.get("profile"), 64) or "unknown",
+            "health": health,
+            "last": last,
+        }
+        self.members[member]["observed"]["live_builder"] = at
+        for check, state in health.items():
+            if state == "pass":
+                continue
+            self.finding("live_builder", check, "warn",
+                         f"live-builder {check}: {state} ({self.members[member]['live_builder']['profile']})",
+                         member, at,
+                         self.action(member, f"inspect_live_builder_{check}", "person", None,
+                                     note="refresh the bounded live-builder preflight receipt; no fleet action is automatic"))
 
     def fold_runners(self) -> list[tuple[str | None, dict[str, Any]]]:
         """Every runner in scope with its member (None for hosted or foreign runners)."""
@@ -1365,6 +1489,7 @@ class Builder:
         self.fold_check()
         self.fold_preflight()
         self.fold_controller()
+        self.fold_live_builder()
         runners = self.fold_runners()
         self.fold_queue(runners)
         cache = self.fold_cache()
@@ -1584,6 +1709,17 @@ def render_text(doc: dict[str, Any]) -> str:
         lines.append("")
         lines.append("runner tooling:")
         lines.extend(f"  {name:<{width}}  {line}" for name, line in tooling)
+    live_builders = []
+    for m in doc["members"]:
+        live = m.get("live_builder")
+        if not live:
+            continue
+        blocked = [name for name, state in live.get("health", {}).items() if state != "pass"]
+        live_builders.append((m["name"], live.get("profile") or "unknown", ",".join(blocked) or "ready"))
+    if live_builders:
+        lines.append("")
+        lines.append("live builders:")
+        lines.extend(f"  {name:<{width}}  {profile}: {state}" for name, profile, state in live_builders)
     stale = [f"{n} {s['state']}" for n, s in doc["sources"].items() if s["state"] in ("stale", "unavailable")]
     if stale:
         lines.append("")
@@ -1740,6 +1876,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--no-tooling", action="store_true", help="skip the per-member runner tooling stamp")
     p.add_argument("--controller-status", type=Path, help="path to cmuxterm-hq build-fleet/status.py")
     p.add_argument("--controller-json", type=Path, help="a saved status.py --json output instead")
+    p.add_argument("--live-builder-status", type=Path,
+                   help="local cmux-live state/status.json (requires --live-builder-profile)")
+    p.add_argument("--live-builder-profile", help="explicit fleet policy profile for the live-builder status")
     p.add_argument("--github-runners", metavar="SCOPE", help="orgs/OWNER or repos/OWNER/REPO")
     p.add_argument("--queue-repo", action="append", metavar="OWNER/REPO")
     p.add_argument("--cache", action="append", metavar="NAME=URL")

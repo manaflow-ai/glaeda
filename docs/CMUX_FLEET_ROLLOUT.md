@@ -40,6 +40,16 @@ files. It reaches one canary first, is promoted when the canary stays healthy, r
 it does not, and never touches a host that is building, reserved by someone else, pinned, or
 listed in `never_touch`.
 
+### Live-builder observation
+
+`glaeda-fleet-status` may consume a local, read-only cmux16 live-builder receipt with
+`--live-builder-status PATH --live-builder-profile PROFILE`. The file must be the
+versioned `cmux-live-builder-status/v1` contract emitted by cmuxterm-hq's live-builder;
+the parser keeps only bounded host identity, fixed health states, and public build
+identifiers. The profile is explicit policy input, so a hostname or `host_role` never
+enrolls a personal builder as CI. Until the HQ exporter writes this contract, the
+source remains unavailable and no rollout action is inferred.
+
 ## Design
 
 ### 1. Releases are built once, in CI

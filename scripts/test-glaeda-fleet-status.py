@@ -418,6 +418,58 @@ class SafetyTests(unittest.TestCase):
         self.assertTrue(all(len(f["summary"]) <= fs.MAX_TEXT for f in doc["findings"]))
         self.assertLessEqual(len(next(m for m in doc["members"] if m["name"] == "mini-a")["lima"]["orphans"]), 16)
 
+    def test_live_builder_valid_status_is_joined_to_explicit_profile(self):
+        doc = build(live_builder=src({
+            "schema": fs.LIVE_BUILDER_SCHEMA,
+            "host_id": "mini-a",
+            "host_role": "personal-live-builder",
+            "profile": "personal-dev-builder",
+            "health": {name: "pass" for name in fs.LIVE_BUILDER_HEALTH_FIELDS},
+            "last": {"event": "build_published", "result": "ok", "reason": "published",
+                     "branch": "feat-cmux-next", "sha": "a" * 40, "tag": "leo-live"},
+        }))
+        member = next(m for m in doc["members"] if m["name"] == "mini-a")
+        self.assertEqual(member["live_builder"]["profile"], "personal-dev-builder")
+        self.assertEqual(member["live_builder"]["health"]["verifier"], "pass")
+        self.assertFalse(by_id(doc, "live_builder."))
+
+    def test_live_builder_blocked_health_is_a_warning_without_a_command(self):
+        health = {name: "pass" for name in fs.LIVE_BUILDER_HEALTH_FIELDS}
+        health["publish_secrets"] = "blocked"
+        doc = build(live_builder=src({
+            "schema": fs.LIVE_BUILDER_SCHEMA, "host_id": "mini-a",
+            "host_role": "personal-live-builder", "profile": "personal-dev-builder",
+            "health": health,
+            "last": {"event": "preflight", "result": "blocked", "reason": "publish_secret_unavailable"},
+        }))
+        [finding] = by_id(doc, "live_builder.publish_secrets@mini-a")
+        self.assertEqual(finding["severity"], "warn")
+        self.assertEqual(finding["action"]["who"], "person")
+        self.assertIsNone(finding["action"]["command"])
+
+    def test_live_builder_missing_and_stale_sources_are_warnings(self):
+        missing = build(live_builder=src(None, error="status file unavailable"))
+        self.assertEqual(missing["sources"]["live_builder"]["state"], "unavailable")
+        self.assertTrue(by_id(missing, "live_builder.unavailable@fleet"))
+        stale = build(live_builder=src({"schema": fs.LIVE_BUILDER_SCHEMA}, at=AT - 5000))
+        self.assertEqual(stale["sources"]["live_builder"]["state"], "stale")
+        self.assertTrue(by_id(stale, "live_builder.stale@fleet"))
+
+    def test_live_builder_output_drops_unknown_private_fields(self):
+        health = {name: "pass" for name in fs.LIVE_BUILDER_HEALTH_FIELDS}
+        doc = build(live_builder=src({
+            "schema": fs.LIVE_BUILDER_SCHEMA, "host_id": "mini-a",
+            "host_role": "personal-live-builder", "profile": "personal-dev-builder",
+            "health": health,
+            "last": {"event": "pass", "result": "ok", "reason": "ready",
+                     "detail": "token=secret /Users/alice/private"},
+            "secret": "do-not-publish",
+        }))
+        text = json.dumps(doc)
+        self.assertNotIn("do-not-publish", text)
+        self.assertNotIn("alice", text)
+        self.assertNotIn("token=secret", text)
+
     def test_rejects_a_foreign_bundle(self):
         with self.assertRaises(fs.Failure):
             fs.build({"schema": "other"}, at=AT)
@@ -479,6 +531,26 @@ class CollectTests(unittest.TestCase):
     def test_cache_spec_must_be_name_equals_url(self):
         with self.assertRaises(fs.Failure):
             fs.collect_cache(["t5"])
+
+    def test_live_builder_reader_requires_explicit_profile_and_bounded_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "status.json"
+            path.write_text(json.dumps({"schema": fs.LIVE_BUILDER_SCHEMA}))
+            missing_profile = fs.collect_live_builder(path, None)
+            self.assertFalse(missing_profile["ok"])
+            self.assertEqual(missing_profile["error"], "live-builder profile is required")
+            path.write_text("x" * (fs.MAX_LIVE_BUILDER_BYTES + 1))
+            got = fs.collect_live_builder(path, "personal-dev-builder")
+            self.assertFalse(got["ok"])
+            self.assertEqual(got["error"], "live-builder status is too large")
+
+    def test_live_builder_reader_rejects_wrong_schema_and_preserves_no_private_text(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "status.json"
+            path.write_text(json.dumps({"schema": "other", "detail": "/Users/alice/private"}))
+            got = fs.collect_live_builder(path, "personal-dev-builder")
+            self.assertFalse(got["ok"])
+            self.assertEqual(got["error"], "live-builder status has an unsupported schema")
 
 
 GIB = 1024**3
