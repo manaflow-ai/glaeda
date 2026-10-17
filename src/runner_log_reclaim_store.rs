@@ -29,11 +29,27 @@ fn stat_nanos(value: i64) -> i64 {
 fn stat_nanos(value: u64) -> i64 {
     value as i64
 }
+#[cfg(target_os = "macos")]
+fn stat_device(value: i32) -> u64 {
+    value as u32 as u64
+}
+#[cfg(not(target_os = "macos"))]
+fn stat_device(value: u64) -> u64 {
+    value
+}
+#[cfg(target_os = "macos")]
+fn stat_links(value: u16) -> u64 {
+    value as u64
+}
+#[cfg(not(target_os = "macos"))]
+fn stat_links(value: u64) -> u64 {
+    value
+}
 
 fn stat_matches_materialization(stat: &rfs::Stat, identity: FileIdentity) -> bool {
-    stat.st_dev as u64 == identity.device
+    stat_device(stat.st_dev) == identity.device
         && stat.st_ino == identity.inode
-        && stat.st_nlink as u64 == identity.links
+        && stat_links(stat.st_nlink) == identity.links
         && stat.st_size >= 0
         && stat.st_size as u64 == identity.size
         && stat.st_mtime == identity.modified_seconds
@@ -53,13 +69,13 @@ fn identity_from_stat(stat: &rfs::Stat) -> Option<FileIdentity> {
         return None;
     }
     #[cfg(target_os = "macos")]
-    let device = stat.st_dev as u32 as u64;
+    let device = stat_device(stat.st_dev);
     #[cfg(not(target_os = "macos"))]
-    let device = stat.st_dev as u64;
+    let device = stat_device(stat.st_dev);
     Some(FileIdentity {
         device,
         inode: stat.st_ino,
-        links: stat.st_nlink as u64,
+        links: stat_links(stat.st_nlink),
         size: stat.st_size as u64,
         modified_seconds: stat.st_mtime,
         changed_seconds: stat.st_ctime,
@@ -278,7 +294,7 @@ fn directory_is_safe(stat: &rfs::Stat, owner: u32) -> bool {
 fn file_is_safe(stat: &rfs::Stat, owner: u32) -> bool {
     FileType::from_raw_mode(stat.st_mode).is_file()
         && stat.st_uid == owner
-        && stat.st_nlink as u64 == 1
+        && stat_links(stat.st_nlink) == 1
         && stat.st_mode & 0o022 == 0
 }
 
@@ -425,7 +441,7 @@ impl RunnerLogStore {
         policy: Policy,
     ) -> Result<(), StoreError> {
         if !FileType::from_raw_mode(stat.st_mode).is_file()
-            || stat.st_nlink as u64 != 1
+            || stat_links(stat.st_nlink) != 1
             || stat.st_uid != self.root_uid
             || stat.st_mode & 0o022 != 0
             || !stat_matches_staged(stat, identity)
@@ -524,13 +540,13 @@ impl RunnerLogStore {
             diag,
             state,
             _lock: lock,
-            root_device: root_stat.st_dev as u64,
+            root_device: stat_device(root_stat.st_dev),
             root_inode: root_stat.st_ino,
-            marker_device: marker_stat.st_dev as u64,
+            marker_device: stat_device(marker_stat.st_dev),
             marker_inode: marker_stat.st_ino,
             marker_path: root_path.join(".glaeda-cmux-runner"),
             root_uid: root_stat.st_uid,
-            diag_device: diag_stat.st_dev as u64,
+            diag_device: stat_device(diag_stat.st_dev),
             diag_inode: diag_stat.st_ino,
             root_path: root_path.clone(),
             diag_path: root_path.join("_diag"),

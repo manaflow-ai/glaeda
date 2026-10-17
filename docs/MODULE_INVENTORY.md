@@ -261,7 +261,7 @@ let the gate hold the line.
 | `rootless_podman_preflight` | `target_os="linux"` | binary | 13 |
 | `runner_account_observation` | `target_os="linux"` | binary | 7 |
 | `runner_account_plan` | `target_os="linux"` | binary | 17 |
-| `runner_log_reclaim` | `all` | binary | 2 |
+| `runner_log_reclaim` | `all` | binary | 3 |
 | `runner_user` | `target_os="linux"` | binary | 9 |
 | `runner_user_observation` | `target_os="linux"` | binary | 2 |
 | `rust_memory_diagnostic` | `all` | none | 0 |
