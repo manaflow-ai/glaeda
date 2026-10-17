@@ -707,6 +707,9 @@ impl RunnerLogStore {
     where
         F: FnMut() -> Result<ProcessEvidence, StoreError>,
     {
+        if candidates.len() > policy.batch_size as usize {
+            return Err(StoreError::Invalid("batch_size_out_of_range"));
+        }
         self.recover(policy, &mut observe)?;
         let process = self.fresh(&mut observe)?;
         if !self.process_is_safe(&process) {
