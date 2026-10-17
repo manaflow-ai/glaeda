@@ -797,6 +797,7 @@ mod tests {
             .expect("touch");
         assert!(touch.success());
         let held = File::open(&old).expect("open descriptor");
+        let policy = Policy::new(MIN_RUNNER_LOG_RECLAIM_IDLE_SECONDS, 4).expect("policy");
         let plan = reclaim(
             &root,
             &receipt,

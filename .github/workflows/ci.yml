@@ -668,7 +668,7 @@ jobs:
   # One check that stands for the whole workflow, under the old single job's name.
   verify:
     if: ${{ always() }}
-    needs: [changes, go, scripts, runner-tests, lint, test, cli]
+    needs: [changes, go, scripts, runner-tests, lint, lint-macos, test, cli]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
