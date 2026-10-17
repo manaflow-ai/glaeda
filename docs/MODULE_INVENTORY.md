@@ -35,8 +35,8 @@ being measured.
 
 ## Totals
 
-- Exported modules: **206**
-- Reach: **98 binary**, **63 library**, **11 tests**, **34 none**
+- Exported modules: **208**
+- Reach: **98 binary**, **64 library**, **12 tests**, **34 none**
 - Gate: at most 34 exports may have reach `none` (`UNREFERENCED_EXPORT_CEILING`)
 
 ## Exports with no consumer
@@ -91,7 +91,7 @@ let the gate hold the line.
 | `actions_runner_readiness` | `all` | library | 7 |
 | `adaptive_ci_routing` | `all` | none | 0 |
 | `adaptive_verification_compiler` | `all` | library | 2 |
-| `artifact` | `all` | binary | 162 |
+| `artifact` | `all` | binary | 164 |
 | `cache_inventory` | `all` | binary | 5 |
 | `cargo_target_holder_observation` | `target_os="linux"` | binary | 4 |
 | `cargo_target_observation` | `target_os="linux"` | binary | 7 |
@@ -253,6 +253,8 @@ let the gate hold the line.
 | `resource` | `all` | binary | 3 |
 | `reusable_state_hot_state_policy` | `all` | library | 2 |
 | `reusable_state_lifecycle` | `all` | library | 5 |
+| `rolling_tip_ledger` | `all` | library | 2 |
+| `rolling_tip_ledger_store` | `all` | tests | 1 |
 | `rootless_podman_config` | `target_os="linux"` | binary | 2 |
 | `rootless_podman_config_observation` | `target_os="linux"` | binary | 7 |
 | `rootless_podman_config_resolution` | `target_os="linux"` | binary | 11 |
