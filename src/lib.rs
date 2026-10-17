@@ -394,6 +394,8 @@ pub mod rootless_podman_preflight;
 pub mod runner_account_observation;
 #[cfg(target_os = "linux")]
 pub mod runner_account_plan;
+/// Bounded, authority-bound macOS runner diagnostics observation and reclaim.
+pub mod runner_log_reclaim;
 #[cfg(target_os = "linux")]
 pub mod runner_user;
 #[cfg(target_os = "linux")]

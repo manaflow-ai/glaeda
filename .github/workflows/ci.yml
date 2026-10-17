@@ -484,22 +484,6 @@ jobs:
       - name: Check ARM64 Linux build
         run: cargo check --locked --target aarch64-unknown-linux-gnu
 
-      # Keep the operator CLI buildable on its supported Apple Silicon host.
-      - name: Install Apple Silicon target
-        run: rustup target add aarch64-apple-darwin
-
-      # Glaeda is developed on Apple Silicon, so the repository's own `required` profile has to
-      # pass in the macOS `cfg` configuration, not only the Linux one this job runs natively.
-      # `cargo check` already compiled that configuration and already printed the `cfg` drift it
-      # sees -- code whose only consumers are `target_os = "linux"` -- but nothing promoted those
-      # warnings to errors, so `./scripts/verify required` could be broken on the author's machine
-      # while this job stayed green. Clippy with `-D warnings` subsumes the previous check and
-      # closes that gap without needing a macOS runner.
-      - name: Lint Apple Silicon build
-        run: >-
-          cargo clippy --locked --all-targets --all-features
-          --target aarch64-apple-darwin -- -D warnings
-
       - name: Run Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
@@ -513,6 +497,28 @@ jobs:
             ~/.cargo/git/db
             target
           key: verify-cargo-lint-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ hashFiles('Cargo.lock') }}
+
+  lint-macos:
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          show-progress: false
+      - name: Install pinned Rust toolchain
+        run: >-
+          rustup toolchain install 1.97.1
+          --profile minimal
+          --component clippy,rustfmt
+          --no-self-update
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint native macOS build
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
   test:
     needs: changes
@@ -752,7 +758,7 @@ jobs:
   ci-status:
     name: ci-status
     if: ${{ always() && (github.event_name == 'pull_request' || github.repository == 'teamleaderleo/glaeda') }}
-    needs: [changes, go, scripts, runner-tests, lint, test, cli, fleet-cas-build]
+    needs: [changes, go, scripts, runner-tests, lint, lint-macos, test, cli, fleet-cas-build]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
