@@ -435,6 +435,24 @@ fn observe_processes(root: &Path, uid: u32) -> Result<ProcessEvidence, ReclaimEr
                 errors.insert("pid_unreadable_or_exited");
             }
         }
+        // Bind the busy decision to the same PID birth identity as the final
+        // process check. A same-birth exec can otherwise change its executable
+        // after the first path read and evade the worker veto.
+        match libproc::libproc::proc_pid::pidpath(*pid as i32) {
+            Ok(path) if worker_path.as_path() == Path::new(&path) => {
+                busy.insert(*pid);
+            }
+            Ok(_) => {
+                if busy.remove(pid) {
+                    errors.insert("pid_path_changed");
+                }
+            }
+            Err(_) => {
+                busy.remove(pid);
+                failed.insert(*pid);
+                errors.insert("pid_path_unreadable");
+            }
+        }
     }
     Ok(ProcessEvidence {
         uid,
@@ -632,7 +650,9 @@ pub fn observe(
     let items_truncated = all_items.len() > MAX_REPORT_ITEMS;
     let items = all_items.iter().take(MAX_REPORT_ITEMS).cloned().collect();
     Ok(Observation {
-        runner_root: root.to_string_lossy().into_owned(),
+        // Public reports carry an authority class, never a private checkout
+        // path. The CLI still receives the exact path through its arguments.
+        runner_root: "<enrolled-runner>".into(),
         authority: AuthorityEvidence {
             kind: "enrolled_runner_uid",
             uid,
@@ -789,11 +809,11 @@ mod tests {
             document_type: "glaeda-runner-log-reclaim",
             schema_version: 1,
             operation: "plan",
-            runner_root: "/fixture/runner".into(),
+            runner_root: "<enrolled-runner>".into(),
             minimum_idle_seconds: 3_600,
             batch_size: 4,
             observation: Observation {
-                runner_root: "/fixture/runner".into(),
+                runner_root: "<enrolled-runner>".into(),
                 authority: AuthorityEvidence {
                     kind: "enrolled_runner_uid",
                     uid: 501,

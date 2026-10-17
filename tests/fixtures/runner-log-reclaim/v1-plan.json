@@ -2,11 +2,11 @@
   "document_type": "glaeda-runner-log-reclaim",
   "schema_version": 1,
   "operation": "plan",
-  "runner_root": "/fixture/runner",
+  "runner_root": "<enrolled-runner>",
   "minimum_idle_seconds": 3600,
   "batch_size": 4,
   "observation": {
-    "runner_root": "/fixture/runner",
+    "runner_root": "<enrolled-runner>",
     "authority": {"kind": "enrolled_runner_uid", "uid": 501, "scope_complete": true},
     "process": {
       "uid": 501,
