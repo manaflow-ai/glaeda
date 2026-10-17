@@ -49,6 +49,7 @@ class FakeMini(health.Mini):
         self.leaks: list[tuple[int, str]] = []
         self.disk: dict = {}
         self.refusal: str | None = None
+        self.toolchain_installs: list[str] = []
 
     def console(self):
         return self.console_state
@@ -109,6 +110,10 @@ class FakeMini(health.Mini):
 
     def node_refusal(self):
         return self.refusal
+
+    def install_rust_toolchain(self, toolchain):
+        self.toolchain_installs.append(toolchain)
+        return True, f"installed Rust toolchain {toolchain}"
 
 
 class NodeEligibility(unittest.TestCase):
@@ -180,6 +185,22 @@ class Detection(Base):
         f = report["findings"][0]
         self.assertEqual((f["severity"], f["auto_fix"]), ("error", "impossible"))
         self.assertIn("3809eed51fdd", f["evidence"])
+
+    def test_missing_exact_rust_toolchain_is_self_healed(self) -> None:
+        self.mini.refusal = "node not eligible (rust toolchain 1.98.1-aarch64-apple-darwin is not installed)"
+        report = self.run_once()
+        self.assertEqual(report["findings"], [])
+        self.assertEqual(self.mini.toolchain_installs, ["1.98.1-aarch64-apple-darwin"])
+        self.assertEqual(report["heals"][0]["id"], "node_toolchain_missing:1.98.1-aarch64-apple-darwin")
+
+    def test_missing_toolchain_refusal_is_pending_when_install_fails(self) -> None:
+        self.mini.refusal = "node not eligible (rust toolchain 1.98.1-aarch64-apple-darwin is not installed)"
+        self.mini.install_rust_toolchain = lambda toolchain: (False, "network unavailable")
+        report = self.run_once()
+        self.assertEqual(self.ids(report), ["node_toolchain_missing:1.98.1-aarch64-apple-darwin"])
+        f = report["findings"][0]
+        self.assertEqual((f["severity"], f["auto_fix"]), ("error", "pending"))
+        self.assertIn("network unavailable", f["note"])
 
     def test_locked_console_autologin_key_and_display_sleep_need_root(self) -> None:
         self.mini.console_state = ("locked", "cmux")
