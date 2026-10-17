@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Dev-box policy contracts: transcript archiving, pressure-only caches and build outputs."""
+"""Dev-box policy contracts: transcript retention, pressure-only caches and build outputs."""
 
 from __future__ import annotations
 
 import contextlib
-import gzip
 import importlib.machinery
 import importlib.util
 import io
@@ -38,26 +37,24 @@ class DevboxTest(unittest.TestCase):
         gd.HOME, gd.ROLE, gd.ACTIVITY_MODE = self.old_home, self.old_role, self.old_mode
         self.tmp.cleanup()
 
-    def test_old_transcript_archives_and_new_transcript_stays(self) -> None:
+    def test_transcript_history_is_report_only(self) -> None:
         old = self.home / ".codex/sessions/old.jsonl"
         old.parent.mkdir(parents=True)
         old.write_text('{"cwd":"/old"}\n')
         os.utime(old, (time.time() - 31 * 86400,) * 2)
         new = old.parent / "new.jsonl"
         new.write_text("live\n")
-        family = gd.Family("agent-transcripts", self.home / ".codex", True, "archive",
+        family = gd.Family("agent-transcripts", self.home / ".codex", False, "preserve history",
                            min_idle_hours=30 * 24, transcripts=True)
         items = gd.survey([family], 24, 0)
-        self.assertEqual({Path(i.path).name: i.verdict for i in items}, {"old.jsonl": "reclaimable", "new.jsonl": "recent"})
+        self.assertEqual({Path(i.path).name: i.verdict for i in items},
+                         {"old.jsonl": "report-only", "new.jsonl": "report-only"})
         receipt = self.home / "receipt.jsonl"
         with contextlib.redirect_stdout(io.StringIO()):
             gd.apply(items, {family.id: family}, receipt, None, 24)
         archive = self.home / ".codex/archive/sessions/old.jsonl.gz"
-        self.assertTrue(archive.is_file())
-        self.assertEqual(archive.stat().st_mode & 0o777, 0o600)
-        self.assertEqual((archive.parent.stat().st_mode & 0o777), 0o700)
-        self.assertEqual(gzip.open(archive, "rt").read().strip(), '{"cwd":"/old"}')
-        self.assertFalse(old.exists())
+        self.assertFalse(archive.exists())
+        self.assertTrue(old.exists())
         self.assertTrue(new.exists())
 
     def test_devbox_package_caches_wait_for_pressure(self) -> None:
@@ -74,7 +71,7 @@ class DevboxTest(unittest.TestCase):
         checkout = self.home / "repo"
         (checkout / "ghostty/.zig-cache").mkdir(parents=True)
         (checkout / "Packages/macOS/Core/.build").mkdir(parents=True)
-        self.assertEqual({p.relative_to(checkout).as_posix() for p in gd._checkout_build_dirs(checkout)},
+        self.assertEqual({p.relative_to(checkout.resolve()).as_posix() for p in gd._checkout_build_dirs(checkout)},
                          {"ghostty/.zig-cache", "Packages/macOS/Core/.build"})
 
     def test_devbox_checkout_family_only_scans_linked_worktrees(self) -> None:
@@ -84,6 +81,7 @@ class DevboxTest(unittest.TestCase):
         worktree.mkdir(parents=True)
         families = gd.default_families("devbox")
         family = next(f for f in families if f.id == "devbox-checkouts")
+        self.assertFalse(family.reclaimable)
         self.assertEqual(family.root, projects / "worktrees")
         self.assertEqual(gd.candidates(family), [worktree])
 

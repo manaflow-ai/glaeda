@@ -19,6 +19,11 @@ MINI_LABEL = "glaeda-mini"
 # declared, the member carries no label.
 IOS_SIM_LABEL = "glaeda-ios-sim"
 IOS_SIM_ROLE = "ios-simulators"
+# The macOS major version the runner's host really runs (sw_vers on the mini), so a job can ask for one OS when a
+# fleet straddles an upgrade: glaeda-macos-27. Never the bare macos-<N>, which is GitHub-hosted runner vocabulary
+# that cmux's workflows treat as "must be GitHub-hosted". The caller observes the version; without one, no label.
+MACOS_LABEL_PREFIX = "glaeda-macos-"
+MACOS_MAJOR_RE = r"[1-9][0-9]*"
 # dev machines take no jobs; borrowed machines run jobs only inside a VM, never as a host runner.
 RUNNER_CLASSES = ("xl", "std", "light")
 MEMBER_CLASSES = RUNNER_CLASSES + ("dev", "borrowed")
@@ -35,6 +40,10 @@ VERSION_RE = r"[0-9][0-9.]*"
 # gui runner: it carries only the gui pool label (gui_label), so GitHub hands each mini at most one GUI job, the
 # one its single gui token allows, and a second GUI job waits in GitHub's queue for another mini's gui runner
 # instead of on a root runner here (cmuxterm-hq#661). It is neither a root nor a side runner.
+# fastRunners (0 or 1, default 0) makes the mini's last runner its fast runner: it carries only the fast pool
+# label (fast_label), and cmux-next's fast-tier job runs on it with the mini's two fast tokens instead of the
+# shared capacity units, so it never queues behind the side lane. With guiRunners 1 as well, the gui runner is
+# the instance before it. Neither a root, side nor gui runner.
 CLASS_CAPACITY = {"xl": (8, 8), "std": (4, 4), "light": (2, 2)}
 MAX_RUNNERS = 16
 # A host's overrides.runner {trustedRef: refs/heads/main, trustedRepo: owner/name} makes its runners trusted-only:
@@ -43,6 +52,8 @@ MAX_RUNNERS = 16
 # mini that holds a secret, such as the fleet-cas signing key.
 TRUSTED_REF_RE = r"refs/heads/[A-Za-z0-9._/-]+"
 REPO_RE = r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
+POOL_PREFIX_RE = r"[a-z0-9]+-"
+RESERVED_POOL_PREFIXES = {"root-", "side-", "gui-", "fast-", "trusted-", "std-", "light-", "xl-"}
 
 
 def merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
@@ -53,30 +64,56 @@ def merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def pool_label(klass: str, version: str, trusted: bool = False) -> str:
+def pool_label(klass: str, version: str, trusted: bool = False, pool_prefix: str = "") -> str:
     """The single label a pool picker routes a whole run to: class plus verified Xcode, dedicated only."""
-    return f"glaeda-{'trusted-' if trusted else ''}{klass}-xcode-{version}"
+    return f"glaeda-{pool_prefix}{'trusted-' if trusted else ''}{klass}-xcode-{version}"
+
+
+def macos_label(major: str) -> str:
+    """The OS label for a macOS major version: glaeda-macos-27."""
+    return f"{MACOS_LABEL_PREFIX}{major}"
 
 
 def root_label(pool: str) -> str:
     """The label of a pool's root runners (instances below canonicalRoots): the jobs that build in or restore
     into the canonical root (compile, app-host shards, cli-product, lag) run on it, so GitHub queues them
     until a root runner is free instead of handing one to a runner whose mini has no free root."""
-    return pool.replace("glaeda-", "glaeda-root-", 1)
+    return _role_label(pool, "root")
 
 
 def side_label(pool: str) -> str:
     """The label of a pool's non-root runners (instances from canonicalRoots on). A light side lane (no
     canonical root, no persistent state, no GUI) runs on it, so it never takes a root runner that a compile
     or app-host job is waiting for. A mini whose every runner is a root runner has none."""
-    return pool.replace("glaeda-", "glaeda-side-", 1)
+    return _role_label(pool, "side")
 
 
 def gui_label(pool: str) -> str:
     """The label of a pool's gui runner (the last instance when guiRunners is 1). The GUI jobs (app-host shards,
     tests-build-and-lag, app-host-test-rerun) run on it: each needs the mini's one gui token (one console session),
     so one runner per mini carries the label, and its listener gate holds while the token or every root is taken."""
-    return pool.replace("glaeda-", "glaeda-gui-", 1)
+    return _role_label(pool, "gui")
+
+
+def fast_label(pool: str) -> str:
+    """The label of a pool's fast runner (the last instance when fastRunners is 1): cmux-next's fast-tier job
+    runs on it, admitted against the mini's fast tokens rather than its shared units (glaeda-cmux-runner-hook's
+    fast class), so it never waits behind side-lane jobs for a unit."""
+    return _role_label(pool, "fast")
+
+
+def _role_label(pool: str, role: str) -> str:
+    """Insert a runner role after an optional pool namespace and before class metadata."""
+    parts = pool.split("-")
+    try:
+        class_index = next(index for index, part in enumerate(parts) if part in RUNNER_CLASSES)
+    except StopIteration:
+        return pool.replace("glaeda-", f"glaeda-{role}-", 1)
+    # `trusted` is part of the role-free label; a namespace such as `aws` is
+    # part of the pool family and stays before the role.
+    insert_at = 1 if class_index > 1 and parts[1] == "trusted" else min(2, class_index)
+    parts.insert(insert_at, role)
+    return "-".join(parts)
 
 
 def xcode_apps(manifest: dict[str, Any], member: str) -> list[dict[str, Any]] | None:
@@ -91,9 +128,11 @@ def xcode_apps(manifest: dict[str, Any], member: str) -> list[dict[str, Any]] | 
 
 
 def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]], bool],
-                  ios_sim_ok: Callable[[list[dict[str, Any]], list[str]], bool] | None = None
-                  ) -> tuple[dict[str, Any] | None, str | None]:
-    """(member summary with labels, None) or (None, why this member cannot be a runner)."""
+                  ios_sim_ok: Callable[[list[dict[str, Any]], list[str]], bool] | None = None,
+                  macos_major: str | None = None) -> tuple[dict[str, Any] | None, str | None]:
+    """(member summary with labels, None) or (None, why this member cannot be a runner).
+    macos_major: the observed macOS major version of the host ("27"); it adds glaeda-macos-<major>. None (the
+    declared view, or a host that could not tell) adds no OS label."""
     if not isinstance(manifest, dict) or not isinstance(manifest.get("hosts"), dict):
         return None, "manifest has no hosts table"
     host = manifest["hosts"].get(member)
@@ -122,12 +161,22 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
         return None, f"{member} runner.trustedRef must be a branch ref such as refs/heads/main"
     trusted_repo = runner.get("trustedRepo") if isinstance(runner, dict) else None
     if (trusted_ref is None) != (trusted_repo is None) or (
-            trusted_repo is not None and not (isinstance(trusted_repo, str) and re.fullmatch(REPO_RE, trusted_repo))):
+        trusted_repo is not None and not (isinstance(trusted_repo, str) and re.fullmatch(REPO_RE, trusted_repo))):
         return None, f"{member} runner.trustedRef and runner.trustedRepo (owner/name) go together"
+    next_nightly = runner.get("trustedNextNightly", False) if isinstance(runner, dict) else False
+    if not isinstance(next_nightly, bool) or (next_nightly and (
+            trusted_ref != "refs/heads/main" or trusted_repo != "manaflow-ai/cmux"
+            or availability != "dedicated" or "dev-builds" in roles)):
+        return None, (f"{member} runner.trustedNextNightly must be boolean and true needs a dedicated "
+                      "manaflow-ai/cmux trusted main runner with no dev-builds")
+    pool_prefix = runner.get("poolPrefix", "") if isinstance(runner, dict) else ""
+    if not (isinstance(pool_prefix, str) and (pool_prefix == "" or (
+            re.fullmatch(POOL_PREFIX_RE, pool_prefix) and pool_prefix not in RESERVED_POOL_PREFIXES))):
+        return None, f"{member} runner.poolPrefix must be empty or a lowercase prefix such as aws-"
     ready = [a for a in apps if re.fullmatch(VERSION_RE, str(a.get("version") or "")) and xcode_ok(a)]
     versions = [str(a["version"]) for a in ready]
     # Opportunistic members never carry a pool label, so they never receive a required job.
-    pools = [pool_label(klass, v, bool(trusted_ref)) for v in versions] if availability == "dedicated" else []
+    pools = [pool_label(klass, v, bool(trusted_ref), pool_prefix) for v in versions] if availability == "dedicated" else []
     # Declared (the ios-simulators role) and, when the caller can look (the installer on the mini), a simulator
     # runtime actually present: an iOS job routed here must be able to boot one. Without a check (the fleet
     # plan) this is the declared view.
@@ -137,8 +186,12 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
     ios_sim = (IOS_SIM_ROLE in roles and bool(ready) and bool(builds)
                and (ios_sim_ok is None or ios_sim_ok(ready, builds)))
     labels = [MINI_LABEL, f"glaeda-class-{klass}", f"glaeda-{availability}",
-              *(["glaeda-trusted"] if trusted_ref else []), *[f"xcode-{v}" for v in versions], *pools,
-              *([IOS_SIM_LABEL] if ios_sim else [])]
+              *(["glaeda-trusted"] if trusted_ref else []),
+              *(["glaeda-trusted-next-nightly"] if next_nightly else []),
+              *[f"xcode-{v}" for v in versions], *pools,
+              *([IOS_SIM_LABEL] if ios_sim else []),
+              *([macos_label(macos_major)] if isinstance(macos_major, str)
+                and re.fullmatch(MACOS_MAJOR_RE, macos_major) else [])]
     disk = merged.get("disk")
     floor = disk.get("min_free_gib") if isinstance(disk, dict) else None
     runners, units = CLASS_CAPACITY[klass]
@@ -151,8 +204,9 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
         compile_slots = declared.get("compileSlots", 1)
         roots = declared.get("canonicalRoots", 1)
         gui = declared.get("guiRunners", 0)
+        fast = declared.get("fastRunners", 0)
     else:
-        compile_slots, roots, gui = 1, 1, 0
+        compile_slots, roots, gui, fast = 1, 1, 0, 0
     if not (isinstance(runners, int) and not isinstance(runners, bool) and 1 <= runners <= MAX_RUNNERS):
         return None, f"runner.classes.{klass}.runners must be 1 to {MAX_RUNNERS}"
     if not (isinstance(units, int) and not isinstance(units, bool) and 2 <= units <= 4 * MAX_RUNNERS):
@@ -164,7 +218,10 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
         return None, f"runner.classes.{klass}.canonicalRoots must be 1 to {runners} (one root runner per root)"
     if not (isinstance(gui, int) and not isinstance(gui, bool) and 0 <= gui <= 1 and roots + gui <= runners):
         return None, (f"runner.classes.{klass}.guiRunners must be 0 or 1, and canonicalRoots plus guiRunners at most "
-                      f"runners ({runners}): the gui runner is the last instance, never a root runner")
+                      f"runners ({runners}): the gui runner is the last instance (one before the fast runner), never a root runner")
+    if not (isinstance(fast, int) and not isinstance(fast, bool) and 0 <= fast <= 1 and roots + gui + fast <= runners):
+        return None, (f"runner.classes.{klass}.fastRunners must be 0 or 1, and canonicalRoots plus guiRunners plus "
+                      f"fastRunners at most runners ({runners}): the fast runner is the last instance")
     if compile_slots > roots:
         return None, (f"runner.classes.{klass}.compileSlots {compile_slots} needs canonicalRoots {compile_slots} "
                       "(every compile holds a root)")
@@ -173,10 +230,11 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
             "minFreeGib": floor if isinstance(floor, (int, float)) and floor > 0 else None,
             "hardware": hardware, "xcodeApps": [str(a.get("path")) for a in ready], "iosSim": ios_sim,
             "runners": runners, "capacityUnits": units, "compileSlots": compile_slots,
-            "trustedRef": trusted_ref, "trustedRepo": trusted_repo,
+            "trustedRef": trusted_ref, "trustedRepo": trusted_repo, "trustedNextNightly": next_nightly,
             "canonicalRoots": roots, "rootPools": [root_label(label) for label in dict.fromkeys(pools)],
             "sidePools": [side_label(label) for label in dict.fromkeys(pools)],
-            "guiRunners": gui, "guiPools": [gui_label(label) for label in dict.fromkeys(pools)] if gui else []}, None
+            "guiRunners": gui, "guiPools": [gui_label(label) for label in dict.fromkeys(pools)] if gui else [],
+            "fastRunners": fast, "fastPools": [fast_label(label) for label in dict.fromkeys(pools)] if fast else []}, None
 
 
 def declared_pools(manifest: Any, xcode_ok: Callable[[str, dict[str, Any]], bool] | None = None) -> dict[str, list[str]]:

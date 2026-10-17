@@ -14,8 +14,10 @@
     glaeda-mini-fleet upgrade   [HOST ...] --candidate-run RUN [--yes]         roll a new candidate over the fleet
     glaeda-mini-fleet pools    [HOST ...] [--observed FILE]                     runner capacity per pool label (JSON)
     glaeda-mini-fleet reserve  HOST ... --for TEXT (--hours N | --until EPOCH) [--owner O] [--force] [--yes]
+    glaeda-mini-fleet reserve  HOST ... --for TEXT --hours N --yes -- CMD ...         hold only while CMD runs here
     glaeda-mini-fleet borrow   [HOST ...] [--class std] --for TEXT (--hours N | --until EPOCH) [--owner O] [--yes]
     glaeda-mini-fleet release  HOST ... [--owner O] [--force] [--yes]           drop a reservation
+    glaeda-mini-fleet manifest-sync [--manifest M] [--yes]                      copy cmuxterm-hq main's manifest here
 
 The manifest names every host, its fleet node id (node_id, so every enrollment rerun asks for the
 same one), its hardware and scheduling class, the toolchain it must carry, the SSH keys that must, may, and must
@@ -159,6 +161,19 @@ ends with a fresh observation and check of the hosts it touched.
 A real fleet manifest names hosts, people, and keys. Keep it out of this public repository:
 the default path is ~/.config/glaeda/mini-fleet.json (override with --manifest or
 $GLAEDA_MINI_FLEET_MANIFEST). examples/mini-fleet/manifest.example.json shows the shape.
+
+The canonical manifest is cmuxterm-hq build-fleet/mini-fleet.json on main; the default path holds a copy. When an
+operator runs a command at a terminal (stderr is a TTY) on that default copy, it first compares the copy with main
+(gh api, else the origin/main of a local cmuxterm-hq checkout, ~/Projects/cmuxterm-hq or $GLAEDA_HQ_CHECKOUT, as
+of its last fetch; 10 s for both together) and, if they differ, warns on stderr with the copy's age, the first
+differing fields and the refresh command, then runs on the copy it has. A failed comparison (offline, no gh, no
+checkout) is a warning too. The verdict is cached for an hour per copy content in
+~/.local/state/glaeda/mini-fleet/hq-manifest-check.json. There is no comparison for --manifest or
+$GLAEDA_MINI_FLEET_MANIFEST, pools (glaeda-route runs it every 20 s), --json or --output json, a non-terminal
+stderr, or GLAEDA_MINI_FLEET_SKIP_HQ_CHECK=1. It never rewrites the copy by itself: an upgrade records receipts in
+it before they reach main. `manifest-sync` prints the diff against main and writes nothing; with --yes it backs the
+copy up to <name>.bak-<UTC time> and replaces it atomically with main's, which must load. It refuses a symlinked
+manifest path rather than replace the link with a regular file.
 """
 
 from __future__ import annotations
@@ -174,15 +189,19 @@ import math
 import secrets
 import importlib.machinery
 import importlib.util
+import ipaddress
 import json
 import os
 import re
 import shlex
+import shutil
+import signal
 import socket
 import subprocess
 import sys
 import threading
 import time
+import selectors
 from pathlib import Path
 from typing import Any
 
@@ -226,12 +245,27 @@ PROBE = SCRIPT_DIR / "cmux_mini_probe.sh"
 PREFLIGHT_PROBE = SCRIPT_DIR / "cmux_mini_preflight.sh"
 FIX_LIBRARY = SCRIPT_DIR / "cmux_mini_fix.sh"
 DEFAULT_MANIFEST = Path(os.environ.get("GLAEDA_MINI_FLEET_MANIFEST", "~/.config/glaeda/mini-fleet.json")).expanduser()
+# The canonical manifest: the default one above is a copy of this file on cmuxterm-hq main.
+HQ_REPO = "manaflow-ai/cmuxterm-hq"
+HQ_MANIFEST = "build-fleet/mini-fleet.json"
+HQ_CHECKOUT = "~/Projects/cmuxterm-hq"  # or $GLAEDA_HQ_CHECKOUT: the offline fallback reads its origin/main
+HQ_GH_TIMEOUT_S = 8  # gh's share of the budget; the checkout fallback gets the rest
+HQ_CHECK_BUDGET_S = 10  # the whole comparison, gh and the checkout together
+HQ_CHECK_CACHE_S = 3600  # one verdict per copy per hour, in STATE_DIR
+HQ_CHECK_OPT_OUT = "GLAEDA_MINI_FLEET_SKIP_HQ_CHECK"
 SSH = "/usr/bin/ssh"
 PROBE_TIMEOUT = 90
 PREFLIGHT_TIMEOUT = 180
+# AWS Mac minis are reached through the controller. The identity stays on that
+# controller, so the operator Mac never needs the AWS key.
+SSH_ROUTE_FIELDS = ("ssh_jump_host", "ssh_user", "ssh_identity", "tailnet_ip")
+SSH_RC_MARKER = "__GLAEDA_FLEET_RC="
+SSH_HOST_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+SSH_USER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,31}\Z")
+SSH_IDENTITY_RE = re.compile(r"(?:~|/)[A-Za-z0-9._+/@-]*\Z")
 LIST_KEYS = {"xcode_app", "xcode_ready", "disk", "launchd", "fleet_mtime", "ak_file", "ak_key",
              "pf_tool", "pf_submodule", "pf_pmset", "pf_runner", "pf_brew_formula", "pf_secret",
-             "ios_runtime", "ios_device", "fleet_cas_path"}
+             "ios_runtime", "ios_device", "fleet_cas_path", "fleet_cas_stat", "host_lock_owner"}
 # Same rule as scripts/cmux_fleet.py NODE_RE: an opaque cmux-* fleet node id.
 NODE_ID_RE = re.compile(r"cmux-[a-z0-9][a-z0-9-]{2,59}\Z")
 VERSION_RE = re.compile(r"\d+(\.\d+){0,2}\Z")
@@ -293,9 +327,10 @@ enroll = _load("glaeda_mini_enroll", SCRIPT_DIR / "glaeda-mini-enroll")
 # ---------------------------------------------------------------- manifest
 
 
-def load_manifest(path: Path) -> dict[str, Any]:
+def load_manifest(path: Path, text: str | None = None) -> dict[str, Any]:
+    """The validated manifest at path, or in text (named path in errors) when given."""
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text() if text is None else text)
     except FileNotFoundError:
         raise Failure(f"no manifest at {path}; pass --manifest or set GLAEDA_MINI_FLEET_MANIFEST") from None
     except json.JSONDecodeError as error:
@@ -526,8 +561,25 @@ def validate_onboarding(path: Path, data: dict[str, Any]) -> None:
 
 
 def toolchain(manifest: dict[str, Any], name: str) -> dict[str, Any]:
-    """The toolchain the manifest declares for one host, or {} when it declares none."""
-    return host_policy(manifest, name).get("toolchain") or {}
+    """The toolchain declared for one host, with a safe pin for legacy xcode.apps manifests."""
+    policy = host_policy(manifest, name)
+    declared = policy.get("toolchain") or {}
+    if declared:
+        return declared
+    # Older fleet manifests put the Xcode pin under xcode.apps. Preserve that
+    # configuration while class acceptance migrates to toolchain.xcode.
+    legacy = policy.get("xcode") or {}
+    apps = legacy.get("apps") if isinstance(legacy, dict) else None
+    if not isinstance(apps, list):
+        return {}
+    selected = legacy.get("select") if isinstance(legacy, dict) else None
+    selected_app = selected[:-len("/Contents/Developer")] if isinstance(selected, str) and \
+        selected.endswith("/Contents/Developer") else selected
+    entry = next((a for a in apps if isinstance(a, dict) and a.get("path") == selected_app), None)
+    entry = entry or next((a for a in apps if isinstance(a, dict)), None)
+    if not entry or not all(isinstance(entry.get(k), str) for k in ("path", "version", "build")):
+        return {}
+    return {"xcode": {"app": entry["path"], "version": entry["version"], "build": entry["build"]}}
 
 
 def cmux_checkout(manifest: dict[str, Any], name: str) -> dict[str, Any]:
@@ -561,6 +613,26 @@ def host_key(name: str) -> str:
     return name[: -len(".local")] if name.endswith(".local") else name
 
 
+def host_ssh_user(manifest: dict[str, Any], name: str) -> str:
+    """SSH login for one host, allowing non-office nodes such as AWS EC2 Macs to declare theirs."""
+    host = manifest["hosts"].get(name) or {}
+    user = host.get("ssh_user") or manifest["ssh_user"]
+    if not isinstance(user, str) or not re.fullmatch(r"[a-z_][a-z0-9_-]*", user):
+        raise Failure(f"{name}: ssh_user must be a lowercase Unix login, got {user!r}")
+    return user
+
+
+def host_ssh_options(manifest: dict[str, Any], name: str) -> tuple[str, ...]:
+    """SSH options for a host's declared route, including an office jump for AWS Macs."""
+    host = manifest["hosts"].get(name) or {}
+    jump = host.get("ssh_jump_host")
+    if jump is None:
+        return ()
+    if not isinstance(jump, str) or not re.fullmatch(r"[A-Za-z0-9_.@:-]+", jump):
+        raise Failure(f"{name}: ssh_jump_host must be a host alias, got {jump!r}")
+    return ("-o", f"ProxyJump={jump}")
+
+
 def merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
     out = dict(base)
     for key, value in over.items():
@@ -571,6 +643,81 @@ def merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
 def host_policy(manifest: dict[str, Any], name: str) -> dict[str, Any]:
     host = manifest["hosts"][name]
     return merge(manifest["defaults"], host.get("overrides", {}))
+
+
+def _identity_expr(identity: str) -> str:
+    """Render a manifest identity for a shell running on the jump host."""
+    if not isinstance(identity, str) or not SSH_IDENTITY_RE.fullmatch(identity):
+        raise Failure(f"unsafe ssh_identity: {identity!r}")
+    if identity.startswith("~/"):
+        return '"$HOME/' + identity[2:] + '"'
+    return shlex.quote(identity)
+
+
+def _ssh_route(manifest: dict[str, Any], name: str) -> dict[str, Any] | None:
+    """Return a validated jump route, or None for an ordinary fleet host."""
+    host = manifest["hosts"].get(name) or {}
+    present = [field for field in SSH_ROUTE_FIELDS if field in host]
+    if not present:
+        return None
+    missing = [field for field in SSH_ROUTE_FIELDS if not host.get(field)]
+    if missing:
+        raise Failure(f"incomplete SSH route for {name}: missing {', '.join(missing)}")
+    jump, user, identity, address = (str(host[field]) for field in SSH_ROUTE_FIELDS)
+    if not SSH_HOST_RE.fullmatch(jump) or not SSH_USER_RE.fullmatch(user):
+        raise Failure(f"unsafe SSH route for {name}")
+    if host.get("ssh_jump_host_local") is not True:
+        raise Failure(f"SSH route for {name} must keep its identity on the jump host")
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        raise Failure(f"invalid tailnet_ip for {name}: {address!r}") from None
+    if ip.version != 4 or ip not in ipaddress.ip_network("100.64.0.0/10"):
+        raise Failure(f"tailnet_ip for {name} is outside Tailscale CGNAT space")
+    if not SSH_IDENTITY_RE.fullmatch(identity):
+        raise Failure(f"unsafe ssh_identity for {name}")
+    return {"jump": jump, "user": user, "identity": identity, "address": address}
+
+
+def _wrap_remote(command: str) -> str:
+    """Preserve the target command's exit status through Tailscale SSH."""
+    return ("( " + command + "\n); __glaeda_rc=$?; printf '\\n" + SSH_RC_MARKER
+            + "%s\\n' \"$__glaeda_rc\"; exit \"$__glaeda_rc\"")
+
+
+def ssh_command(manifest: dict[str, Any], name: str, user: str, command: str) -> list[str]:
+    """Build the manifest-defined SSH argv for a probe or status command."""
+    route = _ssh_route(manifest, name)
+    base = [SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes"]
+    if route is None:
+        return [*base, "-l", user, name, command]
+    nested = ("exec ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "
+              '-o UserKnownHostsFile="$HOME/.ssh/known_hosts" -i ' + _identity_expr(route["identity"])
+              + " -- " + shlex.quote(f"{route['user']}@{route['address']}") + " "
+              + shlex.quote(_wrap_remote(command)))
+    return [*base, "--", route["jump"], nested]
+
+
+def ssh_result(manifest: dict[str, Any], name: str, proc: subprocess.CompletedProcess) -> subprocess.CompletedProcess:
+    """Decode a routed command's exit marker and remove it from its output."""
+    if _ssh_route(manifest, name) is None:
+        return proc
+    text = proc.stdout.decode("utf-8", "replace") if isinstance(proc.stdout, bytes) else (proc.stdout or "")
+    marker = "\n" + SSH_RC_MARKER
+    at = text.rfind(marker)
+    tail = text[at + len(marker):] if at >= 0 else ""
+    digits = tail.strip()
+    if at < 0 or not digits.isdigit() or "\n" in digits or not tail.endswith("\n"):
+        note = "glaeda-mini-fleet: no remote status marker; treating routed SSH as failed\n"
+        if isinstance(proc.stderr, bytes):
+            proc.stderr = proc.stderr.decode("utf-8", "replace") + note
+        else:
+            proc.stderr = (proc.stderr or "") + note
+        proc.returncode = proc.returncode or 255
+        return proc
+    proc.stdout = text[:at]
+    proc.returncode = int(digits)
+    return proc
 
 
 def select_hosts(manifest: dict[str, Any], wanted: list[str] | None) -> list[str]:
@@ -633,12 +780,22 @@ def parse_probe(text: str) -> dict[str, Any]:
             "node_mode": out.get("fleet_cas_node_mode"),
             "catch_up": out.get("fleet_catch_up") or None,  # "0" when bin/worker exports CMUX_CI_CATCH_UP=0
             "node": out.get("fleet_cas_node"),
+            "store": out.get("fleet_cas_store"),
+            "stats": {k: int(v) for k, v in (line.split("|", 1) for line in out["fleet_cas_stat"] if "|" in line)
+                      if v.isdigit()},
+            "stats_mtime": int(out["fleet_cas_stats_mtime"]) if out.get("fleet_cas_stats_mtime", "").isdigit() else None,
             "recipe": out.get("fleet_recipe_released"),
             "build_mode": out.get("fleet_recipe_build_mode"),
         },
         "enrolled_node_id": out.get("fleet_node_id"),
         "reservation": probe_reservation(out.get("reservation"), out.get("reservation_raw")),
         "host_lock": out.get("host_lock"),
+        "host_lock_owners": [owner for line in out["host_lock_owner"]
+                             if (owner := parse_host_lock_owner(line)) is not None],
+        # active-job means lsof saw a non-worker process with the lock open. worker-only
+        # means only the persistent build worker was visible and is the signal to inspect
+        # an orphan; neither state authorizes a mutation from this read-only path.
+        "host_lock_activity": out.get("host_lock_activity"),
         "runner_worker": out.get("runner_worker") or "unknown",
         "ios_runtimes": ios_runtimes(out["ios_runtime"]),
         "ios_devices": [dict(zip(("runtime", "name"), v.split("|", 1))) for v in out["ios_device"] if "|" in v],
@@ -787,6 +944,36 @@ def parse_key(value: str) -> dict[str, Any]:
     return {"file": file, "fingerprint": parts[1], "comment": comment, "type": kind.rstrip(")"), "options": options}
 
 
+def parse_host_lock_owner(value: str) -> dict[str, Any] | None:
+    """One bounded ``host_lock_owner`` probe line: ``pid|command``.
+
+    The command is an executable name from lsof, never argv.  A process name is
+    still untrusted remote evidence, so malformed lines are dropped rather than
+    allowed to make observe/check fail.
+    """
+    pid, sep, command = value.partition("|")
+    if not sep or not pid.isdigit() or not command or int(pid) <= 1:
+        return None
+    command = printable(command).strip()
+    if not command or len(command) > 120:
+        return None
+    kind = "worker" if (command == "worker" or command.startswith(("worker-", "worker_"))
+                         or "cmux-build-worker" in command) else "job"
+    return {"pid": int(pid), "command": command, "kind": kind}
+
+
+def host_lock_note(obs: dict[str, Any]) -> str:
+    """Bounded preflight text for a held host lock; read-only and advisory."""
+    if obs.get("host_lock") != "held":
+        return ""
+    activity = printable(str(obs.get("host_lock_activity") or "unknown"))
+    owners = obs.get("host_lock_owners") or []
+    names = [f"pid {owner['pid']}|{owner['command']}" for owner in owners[:4]
+             if isinstance(owner, dict) and isinstance(owner.get("pid"), int) and owner.get("command")]
+    detail = ", ".join(names) if names else "owner unavailable"
+    return f"; host.lock {activity} ({detail})"
+
+
 def options_digest(options: str) -> str:
     """How the probe reports a key's options: never their text, only this digest."""
     return "h:" + hashlib.sha256(options.encode()).hexdigest()[:16]
@@ -797,29 +984,44 @@ def key_line(key: dict[str, Any]) -> str:
     return f"{key['options']} {key['public_key']}" if key.get("options") else key["public_key"]
 
 
-def observe_host(name: str, user: str, script: bytes | None = None, timeout: int = PROBE_TIMEOUT) -> dict[str, Any]:
+def observe_host(manifest: dict[str, Any], name: str, script: bytes | None = None,
+                 timeout: int = PROBE_TIMEOUT, options: tuple[str, ...] = ()) -> dict[str, Any]:
     started = time.time()
+    user = host_ssh_user(manifest, name)
+    routed = _ssh_route(manifest, name) is not None
+    if routed:
+        command = ssh_command(manifest, name, user, "/bin/bash -s")
+    else:
+        command = [SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", *options,
+                   "-l", user, name, remote_command("/bin/bash -s")]
     try:
         proc = subprocess.run(
-            [SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", user, name, "/bin/bash", "-s"],
+            command,
             input=script or PROBE.read_bytes(), capture_output=True, timeout=timeout, env={"PATH": "/usr/bin:/bin",
                                                                                        "HOME": os.environ["HOME"],
                                                                                        "SSH_AUTH_SOCK": os.environ.get("SSH_AUTH_SOCK", "")},
         )
     except subprocess.TimeoutExpired:
         return {"host": name, "reachable": False, "error": f"probe timed out after {timeout}s"}
-    if proc.returncode != 0:
+    if routed:
+        proc = ssh_result(manifest, name, proc)
+        code, output = proc.returncode, proc.stdout
+    else:
+        code, output = remote_result(proc.stdout, proc.returncode)
+    if code != 0:
         err = proc.stderr.decode(errors="replace").strip().splitlines()
-        return {"host": name, "reachable": False, "error": (err[-1] if err else f"ssh exit {proc.returncode}")[:200]}
-    data = parse_probe(proc.stdout.decode(errors="replace"))
+        return {"host": name, "reachable": False, "error": (err[-1] if err else f"ssh exit {code}")[:200]}
+    text = output.decode(errors="replace") if isinstance(output, bytes) else (output or "")
+    data = parse_probe(text)
     return {"host": name, "reachable": True, "observed_at": int(started), **data}
 
 
 def observe(manifest: dict[str, Any], hosts: list[str], preflight: bool = False) -> dict[str, Any]:
     def one(name: str) -> dict[str, Any]:
+        options = host_ssh_options(manifest, name)
         if not preflight:
-            return observe_host(name, manifest["ssh_user"])
-        return observe_host(name, manifest["ssh_user"], preflight_script(manifest, name), PREFLIGHT_TIMEOUT)
+            return observe_host(manifest, name, options=options)
+        return observe_host(manifest, name, preflight_script(manifest, name), PREFLIGHT_TIMEOUT, options)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
         results = list(pool.map(one, hosts))
@@ -977,7 +1179,11 @@ def check_host(manifest: dict[str, Any], name: str, obs: dict[str, Any]) -> list
     # sudo is declared per host because fixes that need it go to an operator, not to this tool.
     if host.get("sudo") and obs.get("sudo") and obs["sudo"] != host["sudo"]:
         drift("sudo", f"sudo is {obs['sudo']}, manifest says {host['sudo']}")
-    token = policy.get("controller_token")
+    # The fleet-wide default describes hosts that run a controller worker.  PR
+    # runners and other deliberately excluded hosts inherit that default in
+    # the merged policy, but must not be made broken for lacking a token they
+    # are not allowed to use.  Worker/controller roles remain token-gated.
+    token = policy.get("controller_token") if host.get("controller") in ("worker", "controller") else None
     got_token = obs["fleet_worker"].get("controller_token")
     if token and got_token and got_token != token:
         drift("worker", f"controller token {got_token}, want {token}", "provision secrets/controller.token (operator)")
@@ -992,7 +1198,7 @@ def check_host(manifest: dict[str, Any], name: str, obs: dict[str, Any]) -> list
         for message, fix in ios_simulator_drift(ios, obs):
             drift("ios", message, fix)
 
-    for area, message, fix in catch_up_drift(host, policy, obs):
+    for area, message, fix in catch_up_drift(host, policy, obs, declared_compiler_cas_endpoint(manifest)):
         drift(area, message, fix)
 
     # The declared toolchain: Xcode from the plain probe, the rest from a preflight section when observed.
@@ -1027,10 +1233,40 @@ def catch_up_role(host: dict[str, Any]) -> str | None:
     return "reader" if set(roles) & set(CATCH_UP_READER_ROLES) else None
 
 
-def catch_up_drift(host: dict[str, Any], policy: dict[str, Any], obs: dict[str, Any]) -> list[tuple[str, str, str]]:
+def declared_compiler_cas_endpoint(manifest: dict[str, Any]) -> str | None:
+    """Return the single compiler-CAS endpoint declared by the fleet manifest.
+
+    A missing or ambiguous declaration must not make a node check invent a
+    destination.  The HQ manifest has one authoritative compiler-cas service;
+    returning ``None`` keeps older/example manifests compatible until they add
+    that declaration.
+    """
+    endpoints = {
+        str(service.get("endpoint", "")).strip()
+        for service in manifest.get("cache_services", [])
+        if isinstance(service, dict) and service.get("kind") == "compiler-cas"
+        and str(service.get("endpoint", "")).strip()
+    }
+    return next(iter(endpoints)) if len(endpoints) == 1 else None
+
+
+def catch_up_drift(host: dict[str, Any], policy: dict[str, Any], obs: dict[str, Any],
+                   expected_store: str | None = None) -> list[tuple[str, str, str]]:
     """Drift for the fleet compile-cache catch-up roles, as (area, detail, fix). Reports only."""
     role = catch_up_role(host)
+    cas = obs.get("fleet_cas") or {}
     if role is None:
+        # A host can retain an old reader daemon after its role leaves the
+        # catch-up pool. Keep healthy, unused installations quiet, but surface
+        # a daemon pointed at a retired store. A local socket and lifetime
+        # error counters cannot establish the current upstream identity.
+        configured_store = cas.get("store")
+        if expected_store and configured_store and configured_store != expected_store:
+            return [("fleet-cas", f"fleet-cas node outside a catch-up role has configured upstream {configured_store}, "
+                    f"manifest declares compiler-CAS store {expected_store}; its local socket can answer while remote reads "
+                    "use the retired endpoint",
+                    f"operator: remove the orphaned node or update {FLEET_ROOT}/xcode/fleet-cas.env "
+                    f"to FLEET_CAS_STORE={expected_store} through the reviewed fleet-cas rollout")]
         return []
     out: list[tuple[str, str, str]] = []
     keep = "never delete or re-clone it: the catch-up cache keys include this path"
@@ -1052,7 +1288,6 @@ def catch_up_drift(host: dict[str, Any], policy: dict[str, Any], obs: dict[str, 
             out.append(("catch-up", f"the dev-build worker ({FLEET_ROOT}/bin/worker) runs on the {CATCH_UP_WRITER}; "
                         "team-submitted builds would run next to the signing key",
                         f"drain it: exclude the host in fleet.json and make its {HQ_WORKER_LABEL} wrapper idle"))
-    cas = obs.get("fleet_cas") or {}
     paths = cas.get("paths") or {}
     if not paths:
         out.append(("fleet-cas", f"no fleet-cas observation ({FLEET_ROOT} missing)", ""))
@@ -1086,6 +1321,17 @@ def catch_up_drift(host: dict[str, Any], policy: dict[str, Any], obs: dict[str, 
     if cas.get("node") != "answers":
         out.append(("fleet-cas", "fleet-cas node does not answer on xcode/fleet-cas.sock (the fleet-cas-settings.sh "
                     "check); builds fall back to the local cache", rollout))
+    configured_store = cas.get("store")
+    if expected_store and configured_store != expected_store:
+        got = configured_store or "missing"
+        out.append(("fleet-cas", f"configured upstream {got}, manifest declares compiler-CAS store {expected_store}; "
+                    "a healthy local socket does not prove this node reads the shared store",
+                    f"operator: update {FLEET_ROOT}/xcode/fleet-cas.env to FLEET_CAS_STORE={expected_store} "
+                    "and restart the node through the reviewed fleet-cas rollout; preserve trusted keys and local CAS"))
+    # up_errors and up_skipped are monotonic lifetime counters. They are useful
+    # evidence, but without a bounded per-check delta they cannot establish a
+    # current outage: a node may be healthy now after historical failures.
+    # Endpoint identity above is the actionable drift check.
     if role == "reader" and cas.get("catch_up") == "0":
         # On purpose: remote-hit catch-up measured 1631 s against 383 s, so the wrapper keeps it off until the
         # bulk `fleet-cas warm` lands (cmuxterm-hq makes catch-up opt-in by default). Informational, not drift.
@@ -1172,6 +1418,36 @@ def pools(manifest: dict[str, Any], observed: dict[str, Any] | None, hosts: list
     wanted = set(hosts)
     declared = labels.declared_pools(manifest)
     conforming = labels.declared_pools(manifest, xcode_ok)
+
+    def resources(members: list[str]) -> dict[str, int]:
+        """Manifest-derived resources for members declared in this pool.
+
+        The runner count in a pool is observed from GitHub separately. These values describe
+        the configured work budget of the pool; they intentionally do not shrink when one
+        member is offline or reserved. They contain no host identity and are therefore safe for
+        the route publisher to carry into its public aggregate state.
+        """
+        out = {"cpuCores": 0, "capacityUnits": 0, "compileSlots": 0,
+               "canonicalRoots": 0, "guiRunners": 0, "simulatorHosts": 0}
+        hardware = manifest.get("hardware") if isinstance(manifest.get("hardware"), dict) else {}
+        for member in members:
+            host = manifest.get("hosts", {}).get(member) or {}
+            shape = hardware.get(host.get("hardware")) if isinstance(host, dict) else None
+            if isinstance(shape, dict):
+                cpus = shape.get("cpus")
+                if isinstance(cpus, int) and not isinstance(cpus, bool) and cpus >= 0:
+                    out["cpuCores"] += cpus
+            summary, _ = labels.member_labels(manifest, member, lambda _app: True)
+            if not isinstance(summary, dict):
+                continue
+            for field in ("capacityUnits", "compileSlots", "canonicalRoots", "guiRunners"):
+                value = summary.get(field)
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    out[field] += value
+            if summary.get("iosSim") is True:
+                out["simulatorHosts"] += 1
+        return out
+
     out = {}
     for label, members in declared.items():
         mine = [m for m in members if m in wanted]
@@ -1182,7 +1458,8 @@ def pools(manifest: dict[str, Any], observed: dict[str, Any] | None, hosts: list
         ok = [m for m in conforming.get(label, []) if m in wanted and m not in held]
         out[label] = {"declared": mine, "conforming": ok, "reserved": held, "busy": running,
                       "declared_count": len(mine), "conforming_count": len(ok),
-                      "reserved_count": len(held), "busy_count": len(running)}
+                      "reserved_count": len(held), "busy_count": len(running),
+                      "resource": resources(mine)}
     return out
 
 
@@ -1312,7 +1589,7 @@ def borrow_document(manifest: dict[str, Any], candidate: dict[str, Any], record:
         "since": record["since"],
         "until": record["until"],
         "reservation_schema": RESERVATION_SCHEMA,
-        "connection": {"kind": "ssh", "host": candidate["host"], "user": manifest["ssh_user"]},
+        "connection": {"kind": "ssh", "host": candidate["host"], "user": host_ssh_user(manifest, candidate["host"])},
         # A dry run's lease id is not the one --yes will create.
         "release": (["glaeda-mini-fleet", "release", candidate["host"], "--owner", record["owner"], "--yes"]
                     if state == "reserved" else None),
@@ -1381,9 +1658,9 @@ def cmd_borrow(manifest: dict[str, Any], hosts: list[str], observed: dict[str, A
     # absent or expired marker (never another borrow's hold) and its CAS picks one winner. The marker
     # prevents a new runner job after acquisition; the fresh Runner.Worker/host-lock check catches one
     # that started between selection and the CAS.
-    user = manifest["ssh_user"]
     for candidate in candidates:
         name = candidate["host"]
+        user = host_ssh_user(manifest, name)
         capture = io.StringIO()
         with contextlib.redirect_stdout(capture):
             code = cmd_reserve(manifest, [name], purpose, hours, until, owner, False, True)
@@ -1392,7 +1669,8 @@ def cmd_borrow(manifest: dict[str, Any], hosts: list[str], observed: dict[str, A
             # reserve also fails after its write landed (the read-back or ssh failed): drop our own hold.
             # Unless reserve could not even read the marker, in which case it wrote nothing.
             wrote = not detail.startswith(f"{name}: cannot read reservation")
-            after = read_reservation(name, user) if wrote else {"state": "absent"}
+            route = host_ssh_options(manifest, name)
+            after = read_reservation(name, user, route) if wrote else {"state": "absent"}
             if after["state"] == "error" or ((after.get("reservation") or {}).get("owner") == owner
                                              and release_own(manifest, name, owner)[0] != 0):
                 raise Failure(f"{name}: reserve failed ({detail}) and this borrow's hold may remain; "
@@ -1469,16 +1747,26 @@ echo "cloned: $src -> $dst ($v $b)"
 """
 
 
-def remote(name: str, user: str, script: str, args: list[str], stdin: str = "") -> tuple[int, str]:
+def remote(name: str, user: str, script: str, args: list[str], stdin: str = "",
+           options: tuple[str, ...] = ()) -> tuple[int, str]:
     import shlex
     command = "/bin/bash -c " + shlex.quote(script) + " glaeda " + " ".join(shlex.quote(a) for a in args)
     try:
-        proc = subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", user, name, command],
+        proc = subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", *options, "-l", user, name,
+                               remote_command(command)],
                               input=stdin.encode(), capture_output=True, timeout=600)
     except subprocess.TimeoutExpired:
         return 124, "timed out after 600s; outcome unknown, re-run check"
-    text = (proc.stdout + proc.stderr).decode(errors="replace").strip()
-    return proc.returncode, text[-400:]
+    code, output = remote_result(proc.stdout, proc.returncode)
+    text = (output + proc.stderr).decode(errors="replace").strip()
+    return code, text[-400:]
+
+
+def routed_remote(name: str, user: str, script: str, args: list[str], stdin: str = "",
+                  options: tuple[str, ...] = ()) -> tuple[int, str]:
+    if options:
+        return remote(name, user, script, args, stdin, options)
+    return remote(name, user, script, args, stdin)
 
 
 def apply(manifest: dict[str, Any], hosts: list[str], yes: bool) -> int:
@@ -1513,7 +1801,8 @@ def apply(manifest: dict[str, Any], hosts: list[str], yes: bool) -> int:
             if not yes:
                 print(f"{name}: would {label}")
                 continue
-            code, text = remote(name, manifest["ssh_user"], script, args, stdin)
+            code, text = routed_remote(name, host_ssh_user(manifest, name), script, args, stdin,
+                                       host_ssh_options(manifest, name))
             print(f"{name}: {text or label}")
             failed += code != 0
     if not yes:
@@ -1586,20 +1875,26 @@ echo "released"
 """
 
 
-def reservation_ssh(name: str, user: str, script: str, args: list[str], stdin: str = "") -> tuple[int, bytes, str]:
+def reservation_ssh(name: str, user: str, script: str, args: list[str], stdin: str = "",
+                    options: tuple[str, ...] = ()) -> tuple[int, bytes, str]:
     """Run one reservation script on a host: (exit code, raw stdout, stderr). Bounded and batch-mode."""
     command = "/bin/bash -c " + shlex.quote(script) + " glaeda " + " ".join(shlex.quote(a) for a in args)
     try:
-        proc = subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", user, name, command],
+        proc = subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", *options, "-l", user, name,
+                               remote_command(command)],
                               input=stdin.encode(), capture_output=True, timeout=60)
     except subprocess.TimeoutExpired:
         return 124, b"", "timed out after 60s; outcome unknown, re-run check"
-    return proc.returncode, proc.stdout, proc.stderr.decode(errors="replace").strip()[-400:]
+    code, output = remote_result(proc.stdout, proc.returncode)
+    return code, output, proc.stderr.decode(errors="replace").strip()[-400:]
 
 
-def read_reservation(name: str, user: str) -> dict[str, Any]:
+def read_reservation(name: str, user: str, options: tuple[str, ...] = ()) -> dict[str, Any]:
     """{"state": absent|invalid|active|expired|error, "token": CAS token, "reservation": parsed or None}."""
-    code, out, err = reservation_ssh(name, user, READ_RESERVATION, [FLEET_ROOT])
+    if options:
+        code, out, err = reservation_ssh(name, user, READ_RESERVATION, [FLEET_ROOT], options=options)
+    else:
+        code, out, err = reservation_ssh(name, user, READ_RESERVATION, [FLEET_ROOT])
     if code != 0:
         return {"state": "error", "error": (err.splitlines() or [f"ssh exit {code}"])[-1][:200]}
     head, _, body = out.partition(b"\n")
@@ -1652,10 +1947,11 @@ def cmd_reserve(manifest: dict[str, Any], hosts: list[str], purpose: str | None,
     owner = check_owner(owner or default_owner())
     now = int(time.time())
     end = reservation_until(hours, until, now)
-    user = manifest["ssh_user"]
     failed = 0
     for name in hosts:
-        current = read_reservation(name, user)
+        user = host_ssh_user(manifest, name)
+        route = host_ssh_options(manifest, name)
+        current = read_reservation(name, user, route)
         state, held = current["state"], current.get("reservation")
         since = now
         if state == "error":
@@ -1681,12 +1977,17 @@ def cmd_reserve(manifest: dict[str, Any], hosts: list[str], purpose: str | None,
         if not yes:
             print(f"{name}: would {verb}: {FLEET_ROOT}/{RESERVATION_FILE} = {text.strip()}")
             continue
-        code, out, err = reservation_ssh(name, user, WRITE_RESERVATION, [FLEET_ROOT, current["token"]], text)
+        if route:
+            code, out, err = reservation_ssh(name, user, WRITE_RESERVATION,
+                                             [FLEET_ROOT, current["token"]], text, route)
+        else:
+            code, out, err = reservation_ssh(name, user, WRITE_RESERVATION,
+                                             [FLEET_ROOT, current["token"]], text)
         if code != 0:
             print(f"{name}: {err or f'ssh exit {code}'}")
             failed += 1
             continue
-        after = read_reservation(name, user)
+        after = read_reservation(name, user, route)
         if after.get("reservation") != {"valid": True, **{k: record[k] for k in ("owner", "purpose", "since", "until")}}:
             print(f"{name}: wrote the marker but a fresh read shows {after['state']}; re-run check")
             failed += 1
@@ -1697,12 +1998,59 @@ def cmd_reserve(manifest: dict[str, Any], hosts: list[str], purpose: str | None,
     return 1 if failed else 0
 
 
+def cmd_reserve_for(manifest: dict[str, Any], hosts: list[str], command: list[str], purpose: str | None,
+                    hours: float | None, until: int | None, owner: str | None, force: bool, yes: bool) -> int:
+    """Hold HOSTS only while COMMAND runs here, then release them whatever its exit; --hours stays the bound
+    if this Mac dies first. A copy that reserved a CI host for hours held it long after the copy ended."""
+    if not yes:
+        code = cmd_reserve(manifest, hosts, purpose, hours, until, owner, force, False)
+        print("would run: " + shlex.join(command))
+        return code
+    owner = check_owner(owner or default_owner())
+
+    def release() -> int:
+        failed = 0
+        for name in hosts:
+            held = read_reservation(name, host_ssh_user(manifest, name), host_ssh_options(manifest, name))
+            if (held.get("reservation") or {}).get("owner") != owner:
+                continue  # never someone else's hold
+            code, text = release_own(manifest, name, owner)
+            print(text)
+            failed += code != 0
+        if failed:
+            print(f"release failed; release by hand: glaeda-mini-fleet release {' '.join(hosts)} --owner {owner} --yes")
+        return 1 if failed else 0
+
+    def interrupt(signum: int, _frame: Any) -> None:
+        raise KeyboardInterrupt(signal.Signals(signum).name)
+
+    previous = {sig: signal.signal(sig, interrupt) for sig in (signal.SIGTERM, signal.SIGHUP)}
+    try:
+        if cmd_reserve(manifest, hosts, purpose, hours, until, owner, force, True) != 0:
+            release()
+            return 1
+        print("running: " + shlex.join(command), flush=True)
+        try:
+            status = subprocess.run(command).returncode
+        except OSError as error:
+            print(f"cannot run {command[0]}: {error}")
+            status = 127
+        except KeyboardInterrupt:
+            status = 130
+        status = 128 - status if status < 0 else status
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+    return release() or status
+
+
 def cmd_release(manifest: dict[str, Any], hosts: list[str], owner: str | None, force: bool, yes: bool) -> int:
     owner = check_owner(owner or default_owner())
-    user = manifest["ssh_user"]
     failed = 0
     for name in hosts:
-        current = read_reservation(name, user)
+        user = host_ssh_user(manifest, name)
+        route = host_ssh_options(manifest, name)
+        current = read_reservation(name, user, route)
         state, held = current["state"], current.get("reservation")
         if state == "error":
             print(f"{name}: cannot read reservation: {current['error']}")
@@ -1724,12 +2072,17 @@ def cmd_release(manifest: dict[str, Any], hosts: list[str], owner: str | None, f
         if not yes:
             print(f"{name}: would release {what}")
             continue
-        code, out, err = reservation_ssh(name, user, REMOVE_RESERVATION, [FLEET_ROOT, current["token"]])
+        if route:
+            code, out, err = reservation_ssh(name, user, REMOVE_RESERVATION,
+                                             [FLEET_ROOT, current["token"]], options=route)
+        else:
+            code, out, err = reservation_ssh(name, user, REMOVE_RESERVATION,
+                                             [FLEET_ROOT, current["token"]])
         if code != 0:
             print(f"{name}: {err or f'ssh exit {code}'}")
             failed += 1
             continue
-        after = read_reservation(name, user)
+        after = read_reservation(name, user, route)
         if after["state"] != "absent":
             print(f"{name}: removed the marker but a fresh read shows {after['state']}; re-run check")
             failed += 1
@@ -1745,15 +2098,22 @@ def cmd_release(manifest: dict[str, Any], hosts: list[str], owner: str | None, f
 DEFAULT_CMUX_ROOT = "~/cmux"  # where fix clones cmux on a mini
 # Columns of the preflight table, in the order onboarding meets them.
 PREFLIGHT_CHECKS = ("os", "xcode", "select", "licence", "launch", "metal", "rust", "zig", "tools", "python", "python3",
-                    "gh", "cmux", "setup", "glaeda", "power", "disk", "update", "autoupdate", "candidate", "node", "enroll", "runner",
+                    "gh", "cmux", "setup", "glaeda", "headless_sudo", "power", "disk", "update", "autoupdate", "candidate", "node", "enroll", "runner",
                     "brew", "pins", "secrets")
 # An unknown here means the bootstrap would refuse or cannot be predicted, so it blocks like a failure.
-UNKNOWN_BLOCKS = frozenset({"xcode", "select", "licence", "launch", "metal", "zig", "power", "disk"})
+UNKNOWN_BLOCKS = frozenset({"xcode", "select", "licence", "launch", "metal", "zig", "headless_sudo", "power", "disk"})
 # Who can apply a fix: the SSH login user alone, the login user with an admin password, or a person.
 FIX_GROUPS = ("self", "password", "person")
 # Preflight checks `check` reports as toolchain drift; the checkout ones only on hosts with a node id.
 TOOLCHAIN_CHECKS = ("metal", "rust", "zig", "python", "cmux", "setup")
 GROUP_TITLES = {"self": "can do itself (no root)", "password": "needs a password", "person": "needs a person"}
+GLAEDA_LABEL_PREFIX = "com.teamleaderleo.glaeda."
+HEADLESS_GLAEDA_REQUIRED = frozenset({
+    GLAEDA_LABEL_PREFIX + "disk-pressure",
+    GLAEDA_LABEL_PREFIX + "disk-dedupe",
+    GLAEDA_LABEL_PREFIX + "worktree-reclaim",
+    GLAEDA_LABEL_PREFIX + "update",
+})
 
 
 def xcode_pin(manifest: dict[str, Any], name: str) -> str | None:
@@ -1837,14 +2197,20 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
     checkout = cmux_checkout(manifest, name)
     root = checkout["root"]
 
+    # Manifest members with no GUI (the AWS EC2 Macs) must keep their maintenance
+    # agents in the system LaunchDaemon domain.  A GUI LaunchAgent appears healthy
+    # while an operator session is logged in, then disappears after reboot, which
+    # strands disk pressure and OTA maintenance on a headless worker.
+    setup_headless = " --headless" if host.get("gui") is False else ""
+
     def brew(formula: str) -> dict[str, Any]:
         return {"kind": "brew", "formula": formula, "owner": owner or user,
                 **({"default": declared.get("rustup_default") or "stable"} if formula == "rustup" else {})}
 
     # The bootstrap's supportedOs and hardwareCapability (cmux-mac-build-large).
     major = int(re.match(r"\d*", obs.get("macos") or "").group() or 0)
-    if major not in {15, 26}:
-        put("os", "fail", f"macOS {obs.get('macos')}; the fleet bootstrap accepts 15 or 26", "install macOS 26", "person")
+    if not (major == 15 or major >= bootstrap.REVIEWED_XCODE_MAJOR):
+        put("os", "fail", f"macOS {obs.get('macos')}; the fleet bootstrap accepts 15 or 26+", "install macOS 26+", "person")
     elif not bootstrap.hardware_class_ready("macos", "cmux-mac-build-large", obs.get("cpus", 0), obs.get("memory_gib", 0)):
         put("os", "fail", f"{obs.get('cpus')} CPUs, {obs.get('memory_gib')} GiB; cmux-mac-build-large needs 8 and 16",
             "use a larger Mac", "person")
@@ -1932,15 +2298,15 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
 
     # Build tools on the workload's fixed PATH, with versions.
     tools = pf.get("tools", {})
-    missing_rust = [t for t in ("rustup", "cargo", "rustc") if not (tools.get(t) or {}).get("path")]
-    broken_rust = [t for t in ("rustup", "cargo", "rustc") if t not in missing_rust
+    missing_rust = [t for t in ("rustup", "cargo", "rustc", "rustdoc") if not (tools.get(t) or {}).get("path")]
+    broken_rust = [t for t in ("rustup", "cargo", "rustc", "rustdoc") if t not in missing_rust
                    and not (tools[t]["version"] or "").startswith(f"{t} ")]
     channel = pf.get("rust_channel")
     default_wanted = declared.get("rustup_default")
     default_got = pf.get("rust_default")
     if missing_rust:
         put("rust", "fail", f"not on the workload PATH: {', '.join(missing_rust)}",
-            f"{as_owner}brew install rustup; link its cargo, rustc and rustup proxies into /opt/homebrew/bin", brew_group,
+            f"{as_owner}brew install rustup; link its cargo, rustc, rustdoc and rustup proxies into /opt/homebrew/bin", brew_group,
             brew("rustup"))
     elif default_wanted and default_got is not None and default_got != default_wanted and \
             not default_got.startswith((f"{default_wanted}-", f"{default_wanted} ")):
@@ -2049,6 +2415,11 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
 
     glaeda_missing = [what for what, present in (("~/glaeda checkout", pf.get("glaeda_checkout")),
                                                   ("native cache root", pf.get("cache_root"))) if not present]
+    glaeda_jobs = [j for j in obs.get("launchd", []) if j.get("label", "").startswith(GLAEDA_LABEL_PREFIX)]
+    gui_glaeda_jobs = [j for j in glaeda_jobs if j.get("domain", "").endswith("/Library/LaunchAgents")]
+    system_glaeda_labels = {j["label"] for j in glaeda_jobs if j.get("domain") == "/Library/LaunchDaemons"}
+    headless_setup_drift = host.get("gui") is False and not glaeda_missing and (
+        gui_glaeda_jobs or not HEADLESS_GLAEDA_REQUIRED.issubset(system_glaeda_labels))
     lacking = pf.get("glaeda_lacking") or []
     head = pf.get("glaeda_head") or ""
     pinned_ref = GLAEDA_REF
@@ -2059,15 +2430,32 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
     if glaeda_missing:
         put("glaeda", "fail", f"missing: {', '.join(glaeda_missing)}",
             f"git clone https://github.com/{FLEET_SOURCE}.git ~/glaeda; "
-            f"~/glaeda/scripts/glaeda-mini-setup --apply --ota-source {FLEET_SOURCE}",
+            f"~/glaeda/scripts/glaeda-mini-setup --apply{setup_headless} --ota-source {FLEET_SOURCE}",
             "self", {"kind": "glaeda"})
     elif behind and pf.get("glaeda_dirty"):
         put("glaeda", "fail", f"~/glaeda is {behind} and has {pf['glaeda_dirty']} local changes",
             "commit or move aside the changes in ~/glaeda, then " + sync, "person")
     elif behind:
         put("glaeda", "fail", f"~/glaeda is {behind}", sync, "self", {"kind": "glaeda_sync"})
+    elif headless_setup_drift:
+        where = "GUI LaunchAgents are installed" if gui_glaeda_jobs else "system maintenance LaunchDaemons are missing"
+        put("glaeda", "fail", f"headless setup drift: {where}",
+            f"glaeda-mini-setup --apply{setup_headless} --ota-source {FLEET_SOURCE}",
+            "self", {"kind": "glaeda"})
     else:
         put("glaeda", "ok", head[:12])
+    headless_sudo_needed = host.get("gui") is False and bool(glaeda_missing or headless_setup_drift)
+    if headless_sudo_needed:
+        if obs.get("sudo") == "nopasswd":
+            put("headless_sudo", "ok", "passwordless sudo")
+        elif obs.get("sudo") == "password":
+            put("headless_sudo", "fail", "headless setup needs passwordless sudo",
+                "grant the SSH login user passwordless sudo for glaeda-mini-setup, then rerun preflight", "person")
+        else:
+            put("headless_sudo", "unknown", "the probe did not report sudo capability",
+                "rerun preflight with the current cmux_mini_probe.sh", "person")
+    else:
+        put("headless_sudo", "info", "not needed for this run")
     pmset = pf.get("pmset", "")
     # autorestart is not a bootstrap check, so it never blocks; a mini that stays off after a power cut idles the lane.
     autorestart_off = re.search(r"^\s*autorestart\s+0\b", pmset, re.MULTILINE) is not None
@@ -2162,11 +2550,14 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
     runners = pf.get("runners") or []
     held = [r for r in runners if r.get("held") == "yes"]
     down = [r for r in runners if r.get("loaded") == "yes" and r.get("listening") == "no"]
+    lock_note = host_lock_note(obs)
     if held:
-        put("runner", "todo", "stopped by glaeda-mini-fleet for a renewal: " + ", ".join(r["name"] or r["dir"] for r in held),
+        put("runner", "todo", "stopped by glaeda-mini-fleet for a renewal: "
+            + ", ".join(r["name"] or r["dir"] for r in held) + lock_note,
             f"glaeda-mini-fleet repair {name} --yes starts it once the node is eligible", "self")
     elif down:
-        put("runner", "todo", "loaded, listener not running: " + ", ".join(r["name"] or r["dir"] for r in down),
+        put("runner", "todo", "loaded, listener not running: "
+            + ", ".join(r["name"] or r["dir"] for r in down) + lock_note,
             f"glaeda-mini-fleet repair {name} --yes restarts it", "self")
     elif runners:
         put("runner", "ok", ", ".join(r["name"] or r["dir"] for r in runners))
@@ -2227,6 +2618,7 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
     return {"host": name, "ready": not blocked, "checks": checks,
             "enrollment": {"state": state, "generation": pf.get("enroll_generation"), "stale": stale,
                            "accepted": accepted, "reason": pf.get("enroll_reason"),
+                           "acceptance_class": pf.get("acceptance_class"),
                            "local": pf.get("acceptance_class") not in {None, "glaeda-class-acceptance/v1"}},
             "runners": runners}
 
@@ -2318,7 +2710,7 @@ FIX_ORDER = ("xcode_share", "xcode_clone", "python", "cmux_clone", "submodules",
 # What each repair needs to pass first (checks, or repairs made earlier in the same run).
 # glaeda-mini-setup builds glaeda-worktree-reclaim with cargo, under the Python enroll will use.
 FIX_NEEDS = {"metal": ("licence", "launch"), "setup": ("cmux", "licence", "launch", "metal", "zig"), "brew": ("brew",),
-             "python_link": ("brew",), "glaeda": ("python", "rust"),
+             "python_link": ("brew",), "glaeda": ("python", "rust", "headless_sudo"),
              # git runs through the /usr/bin shim, which needs a selected, licensed developer directory.
              "homebrew_fetch": ("select", "licence")}
 # Remote functions that only read; every other one takes the host's step lock.
@@ -2334,7 +2726,7 @@ HOMEBREW_REPO = "https://github.com/Homebrew/brew"
 FIX_TIMEOUTS = {"cmux_clone": 1800, "submodules": 1800, "brew": 5400, "rust_channel": 1800, "glaeda": 1800,
                 "metal": 3600, "setup": 5400, "python": 1800, "candidate": 1800, "homebrew_fetch": 1800,
                 "glaeda_sync": 900}
-RUSTUP_PROXIES = ("cargo", "rustc", "rustup")
+RUSTUP_PROXIES = ("cargo", "rustc", "rustdoc", "rustup")
 BREW_STAGE = "Library/Caches/glaeda/share/homebrew/downloads"  # under the login user's home; see share brew
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or Path("~/.local/state").expanduser()) / "glaeda" / "mini-fleet"
 OPERATOR_CACHE = Path(os.environ.get("GLAEDA_MINI_FLEET_CACHE", "~/Library/Caches/glaeda/mini-fleet")).expanduser()
@@ -2388,7 +2780,7 @@ def waiting_on(action: dict[str, Any], checks: dict[str, Any], fixed: set[str]) 
     return None
 
 
-def describe(action: dict[str, Any]) -> str:
+def describe(action: dict[str, Any], manifest: dict[str, Any] | None = None, name: str | None = None) -> str:
     kind = action["kind"]
     if kind == "xcode_clone":
         return f"APFS clone {action['source']} to {action['path']}"
@@ -2401,7 +2793,7 @@ def describe(action: dict[str, Any]) -> str:
     if kind == "submodules":
         return f"initialize submodules in {action['root']}"
     if kind == "brew":
-        links = [what for formula, what in (("rustup", "the rustup proxies"), (BREW_PYTHON[0], "python3"))
+        links = [what for formula, what in (("rustup", "the cargo, rustc, rustdoc and rustup proxies"), (BREW_PYTHON[0], "python3"))
                  if formula in action["formulas"]]
         link = f", link {' and '.join(links)} into /opt/homebrew/bin" if links else ""
         pinned = [f for f in action["formulas"] if f in BREW_FORMULAS]
@@ -2418,7 +2810,8 @@ def describe(action: dict[str, Any]) -> str:
     if kind == "rust_channel":
         return f"rustup toolchain install {action['channel']}"
     if kind == "glaeda":
-        return "clone Glaeda into ~/glaeda and run glaeda-mini-setup --apply"
+        headless = manifest is not None and name is not None and manifest["hosts"][name].get("gui") is False
+        return "clone Glaeda into ~/glaeda and run glaeda-mini-setup --apply" + (" --headless" if headless else "")
     if kind == "metal":
         return "xcodebuild -downloadComponent MetalToolchain (about 700 MB)"
     if kind == "setup":
@@ -2451,11 +2844,98 @@ def run_logged(argv: list[str], log: Any, stdin: bytes = b"", timeout: float | N
     return proc.returncode
 
 
+REMOTE_STATUS_PREFIX = b"__GLAEDA_REMOTE_STATUS__:"
+REMOTE_STATUS_RE = re.compile(rb"(?:^|\n)" + re.escape(REMOTE_STATUS_PREFIX) + rb"(\d+)\n?$")
+
+
+def remote_command(command: str) -> str:
+    """Append a status receipt because Tailscale SSH can return zero for a failed remote command."""
+    # Run the payload in a subshell: several library functions use `exit` for their result, which
+    # would otherwise terminate the shell before the receipt is printed.
+    return (f"( {command}\n); _glaeda_remote_status=$?; "
+            f"printf '\\n__GLAEDA_REMOTE_STATUS__:%s\\n' \"$_glaeda_remote_status\"; exit 0")
+
+
+def remote_result(output: bytes, transport_code: int) -> tuple[int, bytes]:
+    """Recover the remote exit code and remove its receipt from captured stdout."""
+    match = REMOTE_STATUS_RE.search(output)
+    if not match:
+        return transport_code, output
+    return int(match.group(1)), output[:match.start()]
+
+
+def run_remote_logged(argv: list[str], log: Any, stdin: bytes = b"", timeout: float | None = None) -> int:
+    """Run SSH while streaming output and honoring the remote status receipt."""
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    except OSError as error:
+        note(log, f"cannot run {argv[0]}: {error}")
+        return 127
+
+    def feed() -> None:
+        try:
+            if stdin:
+                assert proc.stdin is not None
+                proc.stdin.write(stdin)
+                proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass
+        finally:
+            if proc.stdin is not None:
+                proc.stdin.close()
+
+    feeder = threading.Thread(target=feed, daemon=True)
+    feeder.start()
+    assert proc.stdout is not None
+    selector = selectors.DefaultSelector()
+    selector.register(proc.stdout, selectors.EVENT_READ)
+    tail = bytearray()
+    deadline = None if timeout is None else time.monotonic() + timeout
+    timed_out = False
+    try:
+        while True:
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            if remaining == 0.0:
+                timed_out = True
+                proc.kill()
+                break
+            events = selector.select(timeout=min(remaining, 0.5) if remaining is not None else 0.5)
+            if not events:
+                if proc.poll() is not None:
+                    # select will report EOF on the next pass; keep draining it before parsing the receipt.
+                    continue
+                continue
+            chunk = os.read(proc.stdout.fileno(), 65536)
+            if not chunk:
+                break
+            if log is not None:
+                log.write(chunk)
+                log.flush()
+            tail.extend(chunk)
+            if len(tail) > 512:
+                del tail[:-512]
+    finally:
+        selector.close()
+        proc.stdout.close()
+        if timed_out:
+            proc.kill()
+        proc.wait()
+        feeder.join(timeout=5)
+    if timed_out:
+        note(log, f"timed out after {timeout}s")
+        return 124
+    match = REMOTE_STATUS_RE.search(bytes(tail))
+    if match:
+        return int(match.group(1))
+    note(log, f"remote status receipt missing (ssh exit {proc.returncode})")
+    return proc.returncode
+
+
 def ssh_stream(name: str, user: str, command: str, log: Any, stdin: bytes = b"",
                timeout: float | None = None, options: tuple[str, ...] = ()) -> int:
     """One remote command, key authentication only, output to the log. stdin carries data such as a token."""
-    return run_logged([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=30",
-                       *options, "-l", user, name, command], log, stdin, timeout)
+    return run_remote_logged([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=30",
+                              *options, "-l", user, name, remote_command(command)], log, stdin, timeout)
 
 
 def library_command(func: str, args: list[str], keep_stdin: bool = False) -> str:
@@ -2470,9 +2950,25 @@ def library_command(func: str, args: list[str], keep_stdin: bool = False) -> str
     return "/bin/bash -c " + shlex.quote(script)
 
 
-def fix_call(name: str, user: str, func: str, args: list[str], log: Any, timeout: float | None) -> int:
+def fix_call(name: str, user: str, func: str, args: list[str], log: Any, timeout: float | None,
+             options: tuple[str, ...] = ()) -> int:
     """Run one function of cmux_mini_fix.sh on the host."""
-    return ssh_stream(name, user, library_command(func, args), log, timeout=timeout)
+    return ssh_stream(name, user, library_command(func, args), log, timeout=timeout, options=options)
+
+
+def routed_fix_call(name: str, user: str, func: str, args: list[str], log: Any, timeout: float | None,
+                    options: tuple[str, ...] = ()) -> int:
+    """Keep the legacy call shape for ordinary hosts while routing declared jump hosts."""
+    if options:
+        return fix_call(name, user, func, args, log, timeout, options)
+    return fix_call(name, user, func, args, log, timeout)
+
+
+def routed_ssh_stream(name: str, user: str, command: str, log: Any, stdin: bytes = b"",
+                      timeout: float | None = None, options: tuple[str, ...] = ()) -> int:
+    if options:
+        return ssh_stream(name, user, command, log, stdin=stdin, timeout=timeout, options=options)
+    return ssh_stream(name, user, command, log, stdin=stdin, timeout=timeout)
 
 
 HELD_EXIT = 20  # cmux_mini_fix.sh: the host is held by the fleet host lock or a reservation
@@ -2485,17 +2981,20 @@ def host_check(manifest: dict[str, Any], name: str) -> str | None:
 
     Read-only on the host. A host whose state cannot be read counts as held: never change a host blind."""
     try:
-        proc = subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", manifest["ssh_user"], name,
-                               library_command("host_check", [])], capture_output=True, text=True, timeout=120,
+        proc = subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", *host_ssh_options(manifest, name),
+                               "-l", host_ssh_user(manifest, name), name,
+                               remote_command(library_command("host_check", []))], capture_output=True, text=True, timeout=120,
                               check=False)
     except subprocess.TimeoutExpired:
         return "could not read its host lock and reservation (timed out)"
-    if proc.returncode == 0:
+    code, output = remote_result(proc.stdout.encode(), proc.returncode)
+    stdout = output.decode(errors="replace")
+    if code == 0:
         return None
-    said = [line.split("held: ", 1)[1] for line in proc.stdout.splitlines() if "held: " in line]
-    if proc.returncode == HELD_EXIT and said:
+    said = [line.split("held: ", 1)[1] for line in stdout.splitlines() if "held: " in line]
+    if code == HELD_EXIT and said:
         return said[-1]
-    return f"could not read its host lock and reservation (ssh exit {proc.returncode})"
+    return f"could not read its host lock and reservation (ssh exit {code})"
 
 
 def gate_hosts(manifest: dict[str, Any], names: list[str], wait: bool = False,
@@ -2604,20 +3103,22 @@ def operator_python_dist(minimum: str) -> tuple[Path, str] | None:
     return best
 
 
-def ship_python(name: str, user: str, action: dict[str, Any], log: Any) -> tuple[bool, str]:
+def ship_python(name: str, user: str, action: dict[str, Any], log: Any,
+                options: tuple[str, ...] = ()) -> tuple[bool, str]:
     dist = operator_python_dist(action["min"])
     if dist is None:
         return False, (f"no relocatable CPython {action['min']}+ on this Mac; `uv python install 3.14` or set "
                        "GLAEDA_MINI_FLEET_PYTHON to a cpython-3.x-macos-aarch64-none directory")
     path, version = dist
     target = f"~/.local/python-{version}"
-    if fix_call(name, user, "python_prepare", [target], log, 60):
+    if routed_fix_call(name, user, "python_prepare", [target], log, 60, options):
         return False, f"could not create {target}"
     note(log, f"rsync {path}/ -> {name}:{target}/")
-    if run_logged(["rsync", "-a", "-e", f"{SSH} -o BatchMode=yes -o ConnectTimeout=10",
+    ssh_command = shlex.join([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", *options])
+    if run_logged(["rsync", "-a", "-e", ssh_command,
                    f"{path}/", f"{user}@{name}:.local/python-{version}/"], log, timeout=FIX_TIMEOUTS["python"]):
         return False, "rsync failed; rerun fix to resume"
-    if fix_call(name, user, "python_link", [target, action["min"]], log, 120):
+    if routed_fix_call(name, user, "python_link", [target, action["min"]], log, 120, options):
         return False, "the copied interpreter did not pass; see the log"
     return True, f"CPython {version} at {target}"
 
@@ -2684,7 +3185,8 @@ def fetch_candidate(candidate: dict[str, str], log: Any) -> Path:
         return archive
 
 
-def stage_candidate(name: str, user: str, action: dict[str, Any], log: Any) -> tuple[bool, str]:
+def stage_candidate(name: str, user: str, action: dict[str, Any], log: Any,
+                    options: tuple[str, ...] = ()) -> tuple[bool, str]:
     candidate = operator_candidate()
     source12 = action["source12"]
     if candidate.get("source", "")[:12] != source12:
@@ -2692,7 +3194,7 @@ def stage_candidate(name: str, user: str, action: dict[str, Any], log: Any) -> t
     if "sha256" not in candidate:
         return False, NO_CANDIDATE
     archive_name = candidate_archive_name(candidate)
-    code = fix_call(name, user, "candidate_check", [source12, archive_name, candidate["sha256"]], log, 120)
+    code = routed_fix_call(name, user, "candidate_check", [source12, archive_name, candidate["sha256"]], log, 120, options)
     if code == 0:
         return True, "already in place"
     if code != 10:
@@ -2701,13 +3203,13 @@ def stage_candidate(name: str, user: str, action: dict[str, Any], log: Any) -> t
         archive = fetch_candidate(candidate, log)
     except Failure as error:
         return False, str(error)
-    if fix_call(name, user, "candidate_dir", [source12], log, 60):
+    if routed_fix_call(name, user, "candidate_dir", [source12], log, 60, options):
         return False, "could not create the candidate directory"
     remote_path = f"Library/Caches/cmux-fleet/glaeda-candidate-{source12}/{archive_name}.partial"
-    if run_logged(["scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", os.fspath(archive),
+    if run_logged(["scp", "-q", "-O", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", *options, os.fspath(archive),
                    f"{user}@{name}:{remote_path}"], log, timeout=FIX_TIMEOUTS["candidate"]):
         return False, "scp failed; rerun fix to resume"
-    if fix_call(name, user, "candidate_place", [source12, archive_name, candidate["sha256"]], log, 120):
+    if routed_fix_call(name, user, "candidate_place", [source12, archive_name, candidate["sha256"]], log, 120, options):
         return False, "the copy did not verify; see the log"
     return True, f"{source12} staged for enrollment"
 
@@ -2718,7 +3220,8 @@ SEEDABLE = {"xcode_share": "xcode", "python": "python", "candidate": "candidate"
 
 def run_repair(manifest: dict[str, Any], name: str, action: dict[str, Any], log: Any,
                seed: str | None = None) -> tuple[bool, str]:
-    user = manifest["ssh_user"]
+    user = host_ssh_user(manifest, name)
+    route = host_ssh_options(manifest, name)
     kind = action["kind"]
     if seed and kind in SEEDABLE:
         thing = SEEDABLE[kind]
@@ -2730,22 +3233,25 @@ def run_repair(manifest: dict[str, Any], name: str, action: dict[str, Any], log:
         # Python, the candidate and Metal also have a path without a seed: this Mac, or the internet.
         note(log, f"{seed} cannot seed {thing} ({problem}); using the path without a seed")
     if kind in {"xcode_clone", "brew", "python_link"}:  # none goes through the fix library's lock(), so ask first
-        code = fix_call(name, user, "host_check", [], log, 120)
+        code = routed_fix_call(name, user, "host_check", [], log, 120, route)
         if code:
             return False, held_or(code, None, "could not check the host lock and reservation")
     if kind == "xcode_clone":
-        code, text = remote(name, user, CLONE_XCODE, [action["source"], action["path"], action["version"], action["build"]])
+        code, text = routed_remote(name, user, CLONE_XCODE,
+                                   [action["source"], action["path"], action["version"], action["build"]],
+                                   options=route)
         note(log, text)
         return code == 0, (text.splitlines() or [""])[-1]
     if kind == "python":
-        return ship_python(name, user, action, log)
+        return ship_python(name, user, action, log, route)
     if kind == "candidate":
-        return stage_candidate(name, user, action, log)
+        return stage_candidate(name, user, action, log, route)
     if kind in {"brew", "python_link"}:
         lines = brew_commands(action["owner"], action["formulas"], False) if kind == "brew" else \
             python_link_commands(action["owner"], False)
         script = "\n".join(["set -euo pipefail", "cd /", *lines])
-        code = ssh_stream(name, user, "/bin/bash -c " + shlex.quote(script), log, timeout=FIX_TIMEOUTS["brew"])
+        code = routed_ssh_stream(name, user, "/bin/bash -c " + shlex.quote(script), log,
+                                 timeout=FIX_TIMEOUTS["brew"], options=route)
         return code == 0, "" if code == 0 else f"exit {code}; see the log"
     if kind == "homebrew_fetch":
         return fetch_homebrew(manifest, name, log, seed)
@@ -2754,26 +3260,26 @@ def run_repair(manifest: dict[str, Any], name: str, action: dict[str, Any], log:
             ref = glaeda_target()
         except Failure as error:
             return False, str(error)
-        code = fix_call(name, user, "glaeda_sync", [ref, *ENROLL_FLAGS], log, FIX_TIMEOUTS["glaeda_sync"])
+        code = routed_fix_call(name, user, "glaeda_sync", [ref, *ENROLL_FLAGS], log, FIX_TIMEOUTS["glaeda_sync"], route)
         return code == 0, f"~/glaeda at {ref[:12]}" if code == 0 else held_or(code, None, "could not move ~/glaeda")
     calls = {
         "cmux_clone": ("cmux_clone", lambda a: [a["repo"], a["ref"], a["root"], str(a["depth"])]),
         "submodules": ("submodules", lambda a: [a["root"], str(a["depth"])]),
         "rust_default": ("rust_default", lambda a: [a["toolchain"]]),
         "rust_channel": ("rust_channel", lambda a: [a["root"], a["channel"]]),
-        "glaeda": ("glaeda", lambda a: [a["python"]]),
+        "glaeda": ("glaeda", lambda a: [a["python"], *(["--headless"] if manifest["hosts"][name].get("gui") is False else [])]),
         "metal": ("metal", lambda a: [a["developer"]]),
         "setup": ("cmux_setup", lambda a: [a["root"], a["developer"]]),
     }
     func, args = calls[kind]
-    code = fix_call(name, user, func, args(action), log, FIX_TIMEOUTS.get(kind, 600))
+    code = routed_fix_call(name, user, func, args(action), log, FIX_TIMEOUTS.get(kind, 600), route)
     return code == 0, "" if code == 0 else f"exit {code}; see the log"
 
 
 def fetch_homebrew(manifest: dict[str, Any], name: str, log: Any, seed: str | None) -> tuple[bool, str]:
     """Populate the host's empty /opt/homebrew with Homebrew/brew: from the seed's /opt/homebrew over the LAN
     when given (the host fetches with the operator's agent, or the manifest's LAN key), else from GitHub."""
-    user = manifest["ssh_user"]
+    user = host_ssh_user(manifest, name)
     args: list[str] = []
     options: tuple[str, ...] = ()
     if seed:
@@ -2784,8 +3290,9 @@ def fetch_homebrew(manifest: dict[str, Any], name: str, log: Any, seed: str | No
             lan = lan_settings(manifest)
             args = [f"ssh://{user}@{address}/opt/homebrew", *([lan["identity"]] if lan["identity"] else [])]
             options = ("-A",) if lan["agent"] else ()
-    code = ssh_stream(name, user, library_command("homebrew_fetch", [HOMEBREW_REPO, *args]), log,
-                      timeout=FIX_TIMEOUTS["homebrew_fetch"], options=options)
+    code = routed_ssh_stream(name, user, library_command("homebrew_fetch", [HOMEBREW_REPO, *args]), log,
+                             timeout=FIX_TIMEOUTS["homebrew_fetch"],
+                             options=(*host_ssh_options(manifest, name), *options))
     if code:
         return False, held_or(code, None, "could not fetch Homebrew")
     return True, f"Homebrew in /opt/homebrew (from {seed if args else 'GitHub'})"
@@ -2809,7 +3316,7 @@ def fix_host(manifest: dict[str, Any], name: str, result: dict[str, Any], yes: b
         log = open(out["log"], "ab")
     try:
         for action in mine:
-            label = f"{'/'.join(action['checks'])}: {describe(action)}"
+            label = f"{'/'.join(action['checks'])}: {describe(action, manifest, name)}"
             blocker = waiting_on(action, checks, fixed)
             if action["kind"] == "xcode_share" and not seed:
                 blocker = "--from HOST, a host that has it"
@@ -2913,7 +3420,7 @@ def sudoers_rule(manifest: dict[str, Any], name: str) -> str | None:
     It leaves out xcode-select and xcodebuild -runFirstLaunch on purpose: the pinned Xcode lives in
     /Applications, which the admin group (the login user) can rename entries in, so a path-based rule
     for either would give passwordless root to any process running as that user."""
-    user = manifest["ssh_user"]
+    user = host_ssh_user(manifest, name)
     if not re.fullmatch(r"[a-z_][a-z0-9_-]*", user):
         raise Failure(f"{name}: cannot write a sudoers rule for user {user!r}")
     # Timer jobs are left out: a kickstart -k would kill a fill mid-build, and launchd starts them anyway.
@@ -2934,7 +3441,7 @@ def sudo_plan_script(manifest: dict[str, Any], name: str, result: dict[str, Any]
     _, root = planned_actions(result)
     if not root and not sudoers:
         return None
-    user = manifest["ssh_user"]
+    user = host_ssh_user(manifest, name)
     if as_root and not SAFE_WORD_RE.fullmatch(user):
         raise Failure(f"refusing a root sudo-plan for login user {user!r}")
     node = manifest["hosts"][name].get("node_id") or "no node id"
@@ -3043,8 +3550,7 @@ def run_ask_once(manifest: dict[str, Any], plans: dict[str, str]) -> list[str]:
     """Read the password once, check it on every host before any plan runs, then run each plan as root.
 
     Returns the hosts whose plan failed; a rejected password stops everything (Failure) with nothing run."""
-    user = manifest["ssh_user"]
-    password = getpass.getpass(f"sudo password for {user} on {', '.join(plans)}: ")
+    password = getpass.getpass(f"sudo password for {manifest['ssh_user']} on {', '.join(plans)}: ")
     feed = (password + "\n").encode()
     broken = "\n" in password or "\r" in password
     del password
@@ -3052,7 +3558,8 @@ def run_ask_once(manifest: dict[str, Any], plans: dict[str, str]) -> list[str]:
         if broken:
             raise Failure("the password has a line break; sudo -S reads one line")
         for name in plans:
-            check = subprocess.run([SSH, "-T", "-o", "ConnectTimeout=10", "-l", user, name, sudo_stdin_command()],
+            check = subprocess.run([SSH, "-T", "-o", "ConnectTimeout=10", *host_ssh_options(manifest, name),
+                                    "-l", host_ssh_user(manifest, name), name, sudo_stdin_command()],
                                    input=feed, capture_output=True, check=False)
             if check.returncode:
                 raise Failure(f"{name}: sudo refused the password (or the host is unreachable, exit "
@@ -3060,7 +3567,8 @@ def run_ask_once(manifest: dict[str, Any], plans: dict[str, str]) -> list[str]:
         failed = []
         for name, script in plans.items():
             print(f"\n==== {name}: running as root with the password given once", flush=True)
-            code = subprocess.run([SSH, "-T", "-o", "ConnectTimeout=10", "-l", user, name, sudo_stdin_command(script)],
+            code = subprocess.run([SSH, "-T", "-o", "ConnectTimeout=10", *host_ssh_options(manifest, name),
+                                   "-l", host_ssh_user(manifest, name), name, sudo_stdin_command(script)],
                                   input=feed, check=False).returncode
             if code:
                 failed.append(name)
@@ -3107,7 +3615,8 @@ def cmd_sudo_plan(manifest: dict[str, Any], hosts: list[str], run: bool, sudoers
     failed = run_ask_once(manifest, plans) if ask_once else []
     for name, script in ({} if ask_once else plans).items():
         print(f"\n==== {name}: running over ssh -t; type the password for {manifest['ssh_user']}@{name}", flush=True)
-        code = subprocess.run([SSH, "-t", "-o", "ConnectTimeout=10", "-l", manifest["ssh_user"], name,
+        code = subprocess.run([SSH, "-t", "-o", "ConnectTimeout=10", *host_ssh_options(manifest, name),
+                               "-l", host_ssh_user(manifest, name), name,
                                "/bin/bash -c " + shlex.quote(script)], check=False).returncode
         if code:
             failed.append(name)
@@ -3162,9 +3671,12 @@ def lan_address(manifest: dict[str, Any], name: str, log: Any) -> tuple[str | No
     address = manifest["hosts"][name].get("lan_ip")
     if not address:
         try:
-            proc = subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", manifest["ssh_user"], name,
-                                   "ipconfig getifaddr en0"], capture_output=True, text=True, timeout=30, check=False)
-            address = proc.stdout.strip()
+            proc = subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", *host_ssh_options(manifest, name),
+                                   "-l", host_ssh_user(manifest, name), name, remote_command("ipconfig getifaddr en0")],
+                                  capture_output=True, text=True,
+                                  timeout=30, check=False)
+            code, output = remote_result(proc.stdout.encode(), proc.returncode)
+            address = output.decode(errors="replace").strip() if code == 0 else ""
         except subprocess.TimeoutExpired:
             address = ""
     subnet = lan_settings(manifest)["subnet"]
@@ -3179,8 +3691,11 @@ def lan_address(manifest: dict[str, Any], name: str, log: Any) -> tuple[str | No
 def share_one(manifest: dict[str, Any], thing: str, source: str, name: str, args: list[str], log: Any,
               yes: bool) -> tuple[bool, str]:
     """Copy THING from source to one peer straight over the LAN. Without yes, only say what would run."""
-    user = manifest["ssh_user"]
-    have = ssh_stream(name, user, library_command("share_have", [thing, *args]), log, timeout=120)
+    user = host_ssh_user(manifest, name)
+    target_route = host_ssh_options(manifest, name)
+    source_route = host_ssh_options(manifest, source)
+    have = routed_ssh_stream(name, user, library_command("share_have", [thing, *args]), log, timeout=120,
+                             options=target_route)
     if have == 0:
         return True, "already there"
     if have not in (1, 10):
@@ -3201,11 +3716,12 @@ def share_one(manifest: dict[str, Any], thing: str, source: str, name: str, args
     with SEED_STREAMS_LOCK:
         streams = SEED_STREAMS.setdefault(source, threading.Semaphore(SEED_STREAMS_PER_SOURCE))
     with streams:  # fix and onboard run many peers at once; one source serves a few at a time
-        code = ssh_stream(source, user, "/bin/bash -c " + shlex.quote(pipeline), log, timeout=SHARE_TIMEOUT,
-                          options=("-A",) if lan["agent"] else ())
+        code = routed_ssh_stream(source, user, "/bin/bash -c " + shlex.quote(pipeline), log, timeout=SHARE_TIMEOUT,
+                                 options=(*source_route, *( ("-A",) if lan["agent"] else () )))
     if code:
         return False, f"copy failed (exit {code}); rerun to resume, the staged part stays on the peer"
-    if ssh_stream(name, user, library_command("share_finish", [thing, *args]), log, timeout=3600):
+    if routed_ssh_stream(name, user, library_command("share_finish", [thing, *args]), log, timeout=3600,
+                         options=target_route):
         return False, "the copy did not finish or verify on the peer (see the log)"
     return True, f"copied over {route}"
 
@@ -3260,9 +3776,9 @@ def prepare_seed(manifest: dict[str, Any], source: str, thing: str, log: Any, ye
         key = (source, thing, yes)
         if key not in SEEDS_READY:
             func = "share_prepare" if yes else ("share_have" if thing == "metal" else "share_source")
-            code = ssh_stream(source, manifest["ssh_user"],
-                              library_command(func, [thing, *share_args(manifest, source, thing)]), log,
-                              timeout=SHARE_TIMEOUT)
+            code = routed_ssh_stream(source, host_ssh_user(manifest, source),
+                                     library_command(func, [thing, *share_args(manifest, source, thing)]), log,
+                                     timeout=SHARE_TIMEOUT, options=host_ssh_options(manifest, source))
             if code:
                 return f"{func} {thing} exit {code}"  # not cached: a later round may succeed
             SEEDS_READY[key] = None
@@ -3461,6 +3977,22 @@ def enrollment_need(result: dict[str, Any]) -> str:
     return "ok"
 
 
+def missing_class_acceptance(manifest: dict[str, Any], name: str,
+                             result: dict[str, Any]) -> bool:
+    """Whether a class-mode repair must restore the class receipt on an otherwise current node.
+
+    A node-local acceptance makes the enrollment look healthy to preflight, but the runner hook
+    deliberately admits only an enrollment that names the class receipt. This is the recovery path
+    for nodes that were renewed with --acceptance node or lost the class link during an older renewal.
+    """
+    enrollment = result.get("enrollment") or {}
+    if (enrollment.get("state") != "eligible" or
+            enrollment.get("acceptance_class") == "glaeda-class-acceptance/v1"):
+        return False
+    recorded, _ = class_acceptance(manifest, name)
+    return bool(recorded and recorded.get("receipt"))
+
+
 def adoption_mismatch(log_path: Path) -> list[str]:
     """The fields a refused class adoption names (cmux_fleet.py's `Differs in:`), from the host's log."""
     try:
@@ -3508,21 +4040,23 @@ def held_or(code: int, log_path: Path | None, what: str) -> str:
 
 
 def renew_one(manifest: dict[str, Any], name: str, result: dict[str, Any], candidate: dict[str, str], glaeda_ref: str,
-              receipt: tuple[str, str, bytes] | None, log_path: Path, seed: str | None = None) -> tuple[bool, str, str]:
+              receipt: tuple[str, str, bytes] | None, log_path: Path, seed: str | None = None,
+              force_class_relink: bool = False) -> tuple[bool, str, str]:
     """Move one enrolled host onto the pinned candidate; (ok, step reached, detail).
 
     sync: ~/glaeda to glaeda_ref (glaeda-mini-enroll --renew and the staging verifier come from it).
     stage: the candidate archive (from this Mac, or from `seed` over the LAN). drain: its runners stop once
     their current job ends. renew: glaeda-mini-enroll --renew, adopting `receipt` (class, sha256, bytes) or,
     without one, running accept-local. resume: the runners it stopped start again."""
-    user = manifest["ssh_user"]
+    user = host_ssh_user(manifest, name)
+    route = host_ssh_options(manifest, name)
     klass = manifest["hosts"][name]["hardware"]
     with open(log_path, "ab") as log:
         def step(label: str) -> None:
             note(log, f"== {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {label}")
 
         step(f"sync ~/glaeda to {glaeda_ref[:12]}")
-        code = fix_call(name, user, "glaeda_sync", [glaeda_ref, *ENROLL_FLAGS], log, FIX_TIMEOUTS["glaeda_sync"])
+        code = routed_fix_call(name, user, "glaeda_sync", [glaeda_ref, *ENROLL_FLAGS], log, FIX_TIMEOUTS["glaeda_sync"], route)
         if code:
             return False, "sync", held_or(code, log_path, "could not move ~/glaeda")
         step(f"stage candidate {candidate['source'][:12]}")
@@ -3530,20 +4064,31 @@ def renew_one(manifest: dict[str, Any], name: str, result: dict[str, Any], candi
         if not ok:
             return False, "stage", detail
         step("drain: stop the runners once their current job ends")
-        code = fix_call(name, user, "runner_hold", [str(RUNNER_DRAIN_SECONDS)], log, RUNNER_DRAIN_SECONDS + 600)
+        code = routed_fix_call(name, user, "runner_hold", [str(RUNNER_DRAIN_SECONDS)], log, RUNNER_DRAIN_SECONDS + 600, route)
         if code:
             return False, "drain", held_or(code, log_path, "could not stop the runners")
+        if force_class_relink:
+            step("relink: quarantine the current enrollment before class adoption")
+            enrollment = "~/.config/glaeda/cmux-fleet/enrollment.json"
+            transition = " ".join(remote_word(value) for value in (
+                "~/glaeda/scripts/cmux_fleet.py", "transition-apply", enrollment,
+                "--to", "quarantined", "--reason", "stale_glaeda_generation"))
+            code = routed_ssh_stream(name, user, transition, log, timeout=120, options=route)
+            if code:
+                routed_fix_call(name, user, "runner_release", ["if-eligible"], log, 300, route)
+                return False, "relink", f"could not quarantine the current enrollment: {last_line(log_path)}"
         command = enroll_command(manifest, name, result, candidate, False, receipt[:2] if receipt else None, renew=True)
-        code = fix_call(name, user, "host_check", [], log, 120)  # the drain may have waited long; ask again
+        code = routed_fix_call(name, user, "host_check", [], log, 120, route)  # the drain may have waited long; ask again
         if code:
-            fix_call(name, user, "runner_release", ["if-eligible"], log, 300)
+            routed_fix_call(name, user, "runner_release", ["if-eligible"], log, 300, route)
             return False, "renew", held_or(code, log_path, "could not check the host lock and reservation")
         step(f"renew ({command})")
-        code = ssh_stream(name, user, command, log, stdin=receipt[2] if receipt else b"", timeout=ENROLL_TIMEOUT)
+        code = routed_ssh_stream(name, user, command, log, stdin=receipt[2] if receipt else b"", timeout=ENROLL_TIMEOUT,
+                                 options=route)
     if code:
         with open(log_path, "ab") as log:
             note(log, "== the renewal failed; start the runners again if the node is still eligible")
-            fix_call(name, user, "runner_release", ["if-eligible"], log, 300)
+            routed_fix_call(name, user, "runner_release", ["if-eligible"], log, 300, route)
         differs = adoption_mismatch(log_path) if receipt else []
         if differs:
             return False, "renew", (f"quarantined: differs from class {klass} in {', '.join(differs)}. Fix: make those "
@@ -3552,7 +4097,7 @@ def renew_one(manifest: dict[str, Any], name: str, result: dict[str, Any], candi
         return False, "renew", f"exit {code}: {last_line(log_path)}"
     with open(log_path, "ab") as log:
         note(log, "== resume: start the runners the drain stopped")
-        if fix_call(name, user, "runner_release", [], log, 300):
+        if routed_fix_call(name, user, "runner_release", [], log, 300, route):
             return False, "resume", f"eligible, but its runner start failed: {last_line(log_path)}"
     return True, "resume", "eligible"
 
@@ -3563,12 +4108,14 @@ def _enroll_one(manifest: dict[str, Any], name: str, result: dict[str, Any], can
                              class_receipt[:2] if class_receipt else None)
     with open(log_path, "ab") as log:
         # glaeda-mini-enroll takes no step lock, so the host gate is asked right before it.
-        code = fix_call(name, manifest["ssh_user"], "host_check", [], log, 120)
+        route = host_ssh_options(manifest, name)
+        code = routed_fix_call(name, host_ssh_user(manifest, name), "host_check", [], log, 120, route)
         if code:
             return code
         note(log, f"== enroll ({command})")
-        return ssh_stream(name, manifest["ssh_user"], command, log, stdin=class_receipt[2] if class_receipt else b"",
-                          timeout=ENROLL_TIMEOUT)
+        return routed_ssh_stream(name, host_ssh_user(manifest, name), command, log,
+                                 stdin=class_receipt[2] if class_receipt else b"", timeout=ENROLL_TIMEOUT,
+                                 options=route)
 
 
 def runner_actions(result: dict[str, Any]) -> tuple[list[str], list[str]]:
@@ -3624,6 +4171,15 @@ def cmd_onboard(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, s
         if blockers(results[name], ("person",)):
             settle(name, "preflight", "needs a person: " + ", ".join(blockers(results[name], ("person",))))
     needs = {h: enrollment_need(results[h]) for h in live}
+    class_relinks: set[str] = set()
+    if acceptance == "class":
+        # preflight's accepted flag also covers a node-local receipt. Class-mode repair has a
+        # stronger routing contract: the enrollment must name the recorded class receipt, or the
+        # runner hook refuses every job even though the node is otherwise current and eligible.
+        for name in live:
+            if needs[name] == "ok" and missing_class_acceptance(manifest, name, results[name]):
+                needs[name] = "renew"
+                class_relinks.add(name)
     for name in list(live):
         if needs[name] == "enroll" and mode == "repair":
             settle(name, "enroll", f"not enrolled: glaeda-mini-fleet onboard {name} --yes")
@@ -3699,7 +4255,8 @@ def cmd_onboard(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, s
         if sudo == "run":
             for name, script in plans.items():
                 print(f"\n==== {name}: sudo-plan over ssh -t; type the password for {manifest['ssh_user']}@{name}", flush=True)
-                code = subprocess.run([SSH, "-t", "-o", "ConnectTimeout=10", "-l", manifest["ssh_user"], name,
+                code = subprocess.run([SSH, "-t", "-o", "ConnectTimeout=10", *host_ssh_options(manifest, name),
+                                       "-l", host_ssh_user(manifest, name), name,
                                        "/bin/bash -c " + shlex.quote(script)], check=False).returncode
                 if code:
                     settle(name, "sudo-plan", "held, skipped (see the plan's output)" if code == HELD_EXIT
@@ -3740,7 +4297,7 @@ def cmd_onboard(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, s
             return lambda: _enroll_one(manifest, name, results[name], candidate, acceptance == "class", logs[name],
                                        receipts.get(name))
         return lambda: renew_one(manifest, name, results[name], candidate, glaeda_ref, receipts.get(name),
-                                 logs[name], seed)
+                                 logs[name], seed, name in class_relinks)
 
     outcomes = run_with_heartbeat({h: enroll_task(h) for h in fresh + stale}, logs, "enroll", heartbeat) \
         if fresh or stale else {}
@@ -3781,13 +4338,15 @@ def cmd_onboard(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, s
         held, down = runner_actions(result)
         with open(logs.get(name) or directory / f"{name}.log", "ab") as log:
             if held and serving:
-                code = fix_call(name, manifest["ssh_user"], "runner_release", [], log, 300)
+                code = routed_fix_call(name, host_ssh_user(manifest, name), "runner_release", [], log, 300,
+                                host_ssh_options(manifest, name))
                 rows[name].update(step="runner", result=rows[name]["result"] + ("; runner started" if code == 0 else
                                                                                  "; runner start failed (see the log)"))
             elif held:
                 rows[name]["result"] += "; runner held until the node is eligible"
             if down:
-                code = fix_call(name, manifest["ssh_user"], "runner_kick", [], log, 120)
+                code = routed_fix_call(name, host_ssh_user(manifest, name), "runner_kick", [], log, 120,
+                                host_ssh_options(manifest, name))
                 rows[name].update(step="runner", result=rows[name]["result"] + ("; runner restarted" if code == 0 else
                                                                                  "; runner restart failed (see the log)"))
         if not result.get("runners") and eligible:
@@ -3824,7 +4383,9 @@ def register_runners(manifest: dict[str, Any], names: list[str], rows: dict[str,
             command = runner_register_command(manifest, name) or "false"
             with open(logs[name], "ab") as log:
                 note(log, f"== register ({command})")
-                return ssh_stream(name, manifest["ssh_user"], command, log, stdin=(token + "\n").encode(), timeout=1800)
+                return routed_ssh_stream(name, host_ssh_user(manifest, name), command, log,
+                                         stdin=(token + "\n").encode(), timeout=1800,
+                                         options=host_ssh_options(manifest, name))
         return run
 
     for name, code in run_with_heartbeat({h: register_task(h) for h in names}, logs, "register", heartbeat).items():
@@ -3960,6 +4521,170 @@ def rewrite_manifest(path: Path, change: Any, write: bool = True) -> str:
     return diff
 
 
+def fetch_hq_manifest() -> tuple[str, str]:
+    """(cmuxterm-hq main's manifest text, where it came from): gh api, else a local checkout's origin/main, all
+    within HQ_CHECK_BUDGET_S."""
+    deadline = time.monotonic() + HQ_CHECK_BUDGET_S
+    errors = []
+
+    def run(argv: list[str], cap: float = HQ_CHECK_BUDGET_S) -> subprocess.CompletedProcess:
+        left = min(cap, deadline - time.monotonic())
+        if left < 0.2:
+            raise subprocess.TimeoutExpired(argv, 0)
+        return subprocess.run(argv, capture_output=True, text=True, timeout=left)
+
+    gh = shutil.which("gh")
+    if gh:
+        try:
+            proc = run([gh, "api", "-H", "Accept: application/vnd.github.raw+json",
+                        f"repos/{HQ_REPO}/contents/{HQ_MANIFEST}?ref=main"], HQ_GH_TIMEOUT_S)
+            if proc.returncode == 0 and proc.stdout.strip():
+                return proc.stdout, f"{HQ_REPO} main"
+            errors.append(f"gh api: {(proc.stderr.strip().splitlines() or ['exit ' + str(proc.returncode)])[-1]}")
+        except subprocess.TimeoutExpired:
+            errors.append("gh api: timed out")
+        except (OSError, subprocess.SubprocessError) as error:
+            errors.append(f"gh api: {type(error).__name__}")
+    else:
+        errors.append("no gh")
+    checkout = Path(os.environ.get("GLAEDA_HQ_CHECKOUT") or HQ_CHECKOUT).expanduser()
+    if (checkout / ".git").exists():
+        git = ["git", "-C", os.fspath(checkout)]
+        try:
+            show = run([*git, "show", f"origin/main:{HQ_MANIFEST}"])
+            if show.returncode == 0 and show.stdout.strip():
+                with contextlib.suppress(subprocess.SubprocessError, OSError):
+                    head = run([*git, "log", "-1", "--format=%h %cs", "origin/main"]).stdout.strip()
+                    return show.stdout, f"{checkout} origin/main {head} (as of its last fetch)"
+                return show.stdout, f"{checkout} origin/main (as of its last fetch)"
+            errors.append(f"{checkout}: no {HQ_MANIFEST} on origin/main")
+        except subprocess.TimeoutExpired:
+            errors.append(f"{checkout}: out of the {HQ_CHECK_BUDGET_S} s budget")
+        except (OSError, subprocess.SubprocessError) as error:
+            errors.append(f"{checkout}: {type(error).__name__}")
+    else:
+        errors.append(f"no cmuxterm-hq checkout at {checkout}")
+    raise Failure("; ".join(errors))
+
+
+def stderr_is_tty() -> bool:
+    try:
+        return sys.stderr.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def json_differences(old: Any, new: Any, where: str = "") -> list[str]:
+    """Each differing field as `path: old -> new`, scalars shown (shortened), objects and lists by kind."""
+    def show(value: Any) -> str:
+        if isinstance(value, dict):
+            return "{...}"
+        if isinstance(value, list):
+            return f"[{len(value)} items]"
+        text = json.dumps(value)
+        return text if len(text) <= 40 else text[:37] + "..."
+    if isinstance(old, dict) and isinstance(new, dict):
+        out = []
+        for key in sorted(set(old) | set(new), key=lambda k: (k not in old, k not in new, k)):
+            path = f"{where}.{key}" if where else key
+            if key not in new:
+                out.append(f"{path}: only in the copy")
+            elif key not in old:
+                out.append(f"{path}: only on main")
+            else:
+                out += json_differences(old[key], new[key], path)
+        return out
+    return [] if old == new else [f"{where or '(top)'}: {show(old)} -> {show(new)}"]
+
+
+def manifest_staleness(path: Path, now: float | None = None) -> str | None:
+    """A warning when the manifest copy at path differs from cmuxterm-hq main's or cannot be compared, else None.
+    The verdict is cached in STATE_DIR for HQ_CHECK_CACHE_S, keyed by the copy's path and content."""
+    now = time.time() if now is None else now
+    try:
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        digest = ""
+    cache = STATE_DIR / "hq-manifest-check.json"
+    key = {"manifest": os.fspath(path), "sha256": digest}
+    with contextlib.suppress(OSError, ValueError, TypeError, AttributeError):
+        record = json.loads(cache.read_text())
+        if (all(record.get(k) == v for k, v in key.items()) and isinstance(record.get("checked_at"), (int, float))
+                and 0 <= now - record["checked_at"] < HQ_CHECK_CACHE_S):
+            return record.get("warning")
+    warning = _manifest_staleness(path, now)
+    with contextlib.suppress(OSError):
+        write_private(cache, (json.dumps({**key, "checked_at": now, "warning": warning}) + "\n").encode())
+    return warning
+
+
+def _manifest_staleness(path: Path, now: float) -> str | None:
+    refresh = f"glaeda-mini-fleet manifest-sync --yes (writes {path}, keeps a backup; drop --yes to see the diff)"
+    try:
+        text, source = fetch_hq_manifest()
+        main = json.loads(text)
+    except (Failure, ValueError) as error:
+        return (f"could not compare {path} with cmuxterm-hq main ({error}); using it as is. "
+                "`glaeda-mini-fleet manifest-sync` shows the diff once main is reachable.")
+    try:
+        copy = json.loads(path.read_text())
+        written = path.stat().st_mtime
+    except (OSError, ValueError):
+        return f"{path} is missing or not JSON; cmuxterm-hq main has the manifest. Refresh: {refresh}"
+    if copy == main:
+        return None
+    days = int((now - written) // 86400)
+    age = time.strftime("%Y-%m-%d", time.localtime(written)) + (f", {days} days ago" if days >= 1 else ", today")
+    changes = json_differences(copy, main)
+    shown = "\n".join(f"  {c}" for c in changes[:8]) + (f"\n  ... {len(changes) - 8} more" if len(changes) > 8 else "")
+    return (f"{path} differs from {source} (copy written {age}); results below use the copy:\n{shown}\n"
+            f"Refresh: {refresh}. If the copy holds edits main lacks (an upgrade's receipts), land them in "
+            f"cmuxterm-hq {HQ_MANIFEST} first.")
+
+
+def cmd_manifest_sync(path: Path, yes: bool) -> int:
+    """Show the diff from the copy at path to cmuxterm-hq main's manifest; with yes, back the copy up and replace it.
+    A dry run writes nothing; a symlinked path is refused rather than replaced by a regular file."""
+    import difflib
+    if path.is_symlink():
+        raise Failure(f"{path} is a symlink (to {os.path.realpath(path)}); pass --manifest with the real file "
+                      "or replace the link yourself")
+    text, source = fetch_hq_manifest()
+    try:
+        load_manifest(path, text)  # main's must load with this tool before it replaces a working copy
+    except Failure as error:
+        raise Failure(f"{source} does not load: {error}") from None
+    except Exception as error:  # noqa: BLE001 - any shape load_manifest does not expect
+        raise Failure(f"{source} does not load: {type(error).__name__}: {error}") from None
+    old = path.read_text() if path.exists() else ""
+    if old == text:
+        print(f"{path} already matches {source}")
+        return 0
+    print("".join(difflib.unified_diff(old.splitlines(True), text.splitlines(True), os.fspath(path), source)), end="")
+    if not yes:
+        print(f"dry run: rerun with --yes to write {path} (the copy is backed up first)")
+        return 0
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    mode = path.stat().st_mode & 0o777 if path.exists() else 0o600
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        with os.fdopen(fd, "w") as out:
+            out.write(text)
+        if old:
+            backup = path.with_name(f"{path.name}.bak-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}")
+            fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as out:
+                out.write(old)
+            print(f"backed up {path} to {backup}")
+        os.replace(tmp, path)
+        print(f"wrote {path} from {source}")
+        return 0
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+
+
 def candidate_pin(candidate: dict[str, str]) -> dict[str, str]:
     return {k: candidate[k] for k in ("source", "sha256", "run", "artifact", "repo", "expires") if k in candidate}
 
@@ -3999,16 +4724,18 @@ def export_class_receipt(manifest: dict[str, Any], name: str, result: dict[str, 
     with open(log_path, "ab") as log:
         note(log, f"== export ({command})")
         try:
-            proc = subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", manifest["ssh_user"],
-                                   name, command], capture_output=True, timeout=EXPORT_TIMEOUT, check=False)
+            proc = subprocess.run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", *host_ssh_options(manifest, name),
+                                   "-l", host_ssh_user(manifest, name), name, remote_command(command)],
+                                  capture_output=True, timeout=EXPORT_TIMEOUT, check=False)
         except subprocess.TimeoutExpired:
             raise Failure(f"export-class-acceptance on {name} timed out") from None
         log.write(proc.stderr)
-        note(log, f"== export exit {proc.returncode}, {len(proc.stdout)} bytes")
-    if proc.returncode:
-        raise Failure(f"export-class-acceptance on {name} exited {proc.returncode}: {last_line(log_path)}")
+        code, output = remote_result(proc.stdout, proc.returncode)
+        note(log, f"== export exit {code}, {len(output)} bytes")
+    if code:
+        raise Failure(f"export-class-acceptance on {name} exited {code}: {last_line(log_path)}")
     try:
-        doc = cmux_fleet.validate_class_acceptance(json.loads(proc.stdout))
+        doc = cmux_fleet.validate_class_acceptance(json.loads(output))
     except (ValueError, cmux_fleet.FleetError) as error:
         raise Failure(f"{name} exported an invalid class receipt: {error}") from None
     wrong = [what for what, ok in (("class", doc["fleetClass"] == klass),
@@ -4016,7 +4743,7 @@ def export_class_receipt(manifest: dict[str, Any], name: str, result: dict[str, 
                                    ("node", doc["acceptingNodeId"] == manifest["hosts"][name]["node_id"])) if not ok]
     if wrong:
         raise Failure(f"{name} exported a class receipt for another {', '.join(wrong)}")
-    return proc.stdout
+    return output
 
 
 def cmd_upgrade(manifest: dict[str, Any], manifest_path: Path, wanted: list[str] | None, run: str, repo: str,
@@ -4227,16 +4954,19 @@ def read_observed(path: Path) -> dict[str, Any]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("command", choices=("observe", "check", "plan", "apply", "preflight", "fix", "sudo-plan",
-                                            "share", "onboard", "repair", "upgrade", "pools", "reserve", "borrow", "release"))
+                                            "share", "onboard", "repair", "upgrade", "pools", "reserve", "borrow", "release",
+                                            "manifest-sync"))
     parser.add_argument("names", nargs="*", metavar="HOST", help="hosts to act on (same as --host)")
-    parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
+    parser.add_argument("--manifest", type=Path, help="the fleet manifest (default ~/.config/glaeda/mini-fleet.json "
+                        "or $GLAEDA_MINI_FLEET_MANIFEST, compared with cmuxterm-hq main's on every run)")
     parser.add_argument("--host", action="append", dest="hosts")
     parser.add_argument("--observed", type=Path, help="reuse an observe output instead of probing")
     parser.add_argument("--out", type=Path, help="observe: also write the JSON here")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--output", choices=("text", "json"), default="text", help="preflight: output format")
     parser.add_argument("--yes", action="store_true",
-                        help="apply, fix, share, onboard, repair, upgrade, reserve, borrow, release: make changes instead of printing them")
+                        help="apply, fix, share, onboard, repair, upgrade, reserve, borrow, release, manifest-sync: "
+                             "make changes instead of printing them")
     parser.add_argument("--run", action="store_true", help="sudo-plan: run each host's plan over ssh -t")
     parser.add_argument("--ask-once", action="store_true",
                         help="sudo-plan --run: read the password once here, check it on every host, then run each "
@@ -4273,6 +5003,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="preflight, fix, onboard, repair, upgrade: the Glaeda commit (40 hex) every host's ~/glaeda "
                              "must be at (default: ~/glaeda only needs the enroll options; fix and renewals move it "
                              "to the tip of main)")
+    # reserve HOST ... -- CMD: everything after the first -- is the command the reservation is held for.
+    argv = list(sys.argv[1:] if argv is None else argv)
+    held_command = argv[argv.index("--") + 1:] if "--" in argv else None
+    if held_command is not None:
+        argv = argv[:argv.index("--")]
     # Intermixed, so hosts may follow options: share xcode --from cmux15 cmux7s cmux8s
     args = parser.parse_intermixed_args(argv)
     thing = None
@@ -4283,7 +5018,24 @@ def main(argv: list[str] | None = None) -> int:
     if args.names:
         args.hosts = [*(args.hosts or []), *args.names]
     global PINNED_CANDIDATE, GLAEDA_REF
+    if args.command == "manifest-sync":
+        try:
+            return cmd_manifest_sync(args.manifest or DEFAULT_MANIFEST, args.yes)
+        except (Failure, OSError) as error:
+            print(f"glaeda-mini-fleet: manifest-sync: {error}", file=sys.stderr)
+            return 2
+    if args.manifest is None:
+        args.manifest = DEFAULT_MANIFEST
+        # Only for an operator at a terminal on the default copy: never for pools (glaeda-route runs it every
+        # 20 s), JSON output, an environment-named manifest or the opt-out.
+        if (args.command != "pools" and not args.json and args.output != "json" and stderr_is_tty()
+                and not os.environ.get("GLAEDA_MINI_FLEET_MANIFEST") and not os.environ.get(HQ_CHECK_OPT_OUT)):
+            warning = manifest_staleness(args.manifest)
+            if warning:
+                print(f"glaeda-mini-fleet: warning: {warning}", file=sys.stderr, flush=True)
     try:
+        if held_command is not None and (args.command != "reserve" or not held_command):
+            raise Failure("only reserve takes -- CMD, and it needs a command")
         if args.glaeda_ref is not None and not re.fullmatch(r"[0-9a-f]{40}", args.glaeda_ref):
             raise Failure("--glaeda-ref is a full commit id (40 lowercase hex)")
         GLAEDA_REF = args.glaeda_ref
@@ -4305,6 +5057,9 @@ def main(argv: list[str] | None = None) -> int:
             if not args.hosts:
                 raise Failure(f"{args.command} needs explicit hosts")
             if args.command == "reserve":
+                if held_command is not None:
+                    return cmd_reserve_for(manifest, hosts, held_command, args.purpose, args.hours, args.until,
+                                           args.owner, args.force, args.yes)
                 return cmd_reserve(manifest, hosts, args.purpose, args.hours, args.until, args.owner, args.force, args.yes)
             return cmd_release(manifest, hosts, args.owner, args.force, args.yes)
         if args.command in {"onboard", "repair"}:

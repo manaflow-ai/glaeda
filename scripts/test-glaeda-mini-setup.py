@@ -10,7 +10,9 @@ import io
 import json
 import os
 import plistlib
+import pwd
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -75,6 +77,8 @@ class MiniSetupTest(unittest.TestCase):
             self.calls.append(list(argv))
             if argv[0] == "/bin/launchctl" or os.path.basename(argv[0]) == "systemctl":
                 raise AssertionError("launchctl and systemctl must never run with a sandbox HOME")
+            if os.path.basename(argv[0]) in {"defaults", "osascript", "system_profiler"}:
+                raise AssertionError("a test must never read or write the real user's preferences")
             return real_run(argv, *args, **kwargs)
 
         self.patches = [
@@ -140,7 +144,8 @@ class MiniSetupTest(unittest.TestCase):
                 seed = plistlib.loads((agents / "com.teamleaderleo.glaeda.seed-prefetch.plist").read_bytes())
                 disk = plistlib.loads((agents / "com.teamleaderleo.glaeda.disk-pressure.plist").read_bytes())
                 self.assertEqual(seed["ProgramArguments"][0], wanted)
-                self.assertEqual(disk["ProgramArguments"][0], "/opt/x/python3")
+                self.assertEqual(disk["ProgramArguments"], [os.fspath(self.home / ".local/bin/disk-pressure.sh"), "--once"])
+                self.assertEqual(disk["EnvironmentVariables"]["GLAEDA_PYTHON"], "/opt/x/python3")
         self.assertIsNone(ms.apple_python("linux"))
 
     def test_the_lan_fetch_broker_runs_apples_python_and_asks_for_a_root_owned_copy(self) -> None:
@@ -218,17 +223,21 @@ class MiniSetupTest(unittest.TestCase):
         first = self.invoke("--apply")
         self.assertTrue(first["applied"])
         bin_dir = self.home / ".local/bin"
-        for name in ("glaeda-disk", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all"):
+        for name in ("glaeda-disk", "glaeda-runner-hygiene", "disk-pressure.sh", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all"):
             self.assertTrue(os.access(bin_dir / name, os.X_OK), name)
         self.assertEqual((bin_dir / "glaeda-disk").read_bytes(), (ROOT / "scripts/glaeda-disk").read_bytes())
+        self.assertEqual((bin_dir / "disk-pressure.sh").read_bytes(), (ROOT / "scripts/disk-pressure.sh").read_bytes())
         for label in ("disk-pressure", "disk-dedupe", "worktree-reclaim", "fleet-cas-prune", "seed-prefetch"):
             path = self.home / f"Library/LaunchAgents/com.teamleaderleo.glaeda.{label}.plist"
             raw = path.read_bytes()
-            self.assertNotIn(b"/Users/leoli", raw)
+            self.assertNotIn(os.fsencode(os.fspath(ROOT)), raw)
             doc = plistlib.loads(raw)
             self.assertEqual(doc["Label"], f"com.teamleaderleo.glaeda.{label}")
-            for arg in doc["ProgramArguments"][1:2]:
-                self.assertTrue(arg.startswith(os.fspath(bin_dir)), arg)
+            if label == "disk-pressure":
+                self.assertEqual(doc["ProgramArguments"], [os.fspath(bin_dir / "disk-pressure.sh"), "--once"])
+            else:
+                for arg in doc["ProgramArguments"][1:2]:
+                    self.assertTrue(arg.startswith(os.fspath(bin_dir)), arg)
             self.assertTrue(doc["StandardOutPath"].startswith(os.fspath(self.home / "Library/Logs")))
             # dedupe is never urgent; pressure must still free space while a build fills the disk
             self.assertEqual(doc.get("ProcessType"),
@@ -262,13 +271,23 @@ class MiniSetupTest(unittest.TestCase):
         self.assertEqual(dedupe["WatchPaths"], [os.fspath(self.home / "Library/Developer/Xcode/DerivedData")])
         self.assertTrue((self.home / "Library/Developer/Xcode/DerivedData").is_dir())
         self.assertEqual((self.home / ".cache/glaeda/cmux-native-cache").stat().st_mode & 0o777, 0o700)
+        for marker in (
+                self.home / "Library/Developer/Xcode/DerivedData/.metadata_never_index",
+                self.home / ".cache/glaeda/cmux-native-cache/.metadata_never_index"):
+            self.assertTrue(marker.is_file(), marker)
+            self.assertEqual(marker.read_bytes(), b"")
+        marker_actions = [a for a in first["actions"] if a["kind"] == "marker"]
+        self.assertEqual({a["state"] for a in marker_actions}, {"create"})
         receipt_path = self.home / ".local/state/glaeda/mini-setup/receipt.json"
         self.assertEqual(receipt_path.stat().st_mode & 0o777, 0o600)
         self.assertEqual(json.loads(receipt_path.read_text())["schema"], "glaeda-mini-setup/v1")
 
         before = self.tree()
         second = self.invoke("--apply")
-        self.assertEqual(self.states(second), {"unchanged"})
+        # a sandbox HOME never touches the real user's alert-sound preferences
+        sounds = [a for a in second["actions"] if a["kind"] == "defaults"]
+        self.assertEqual([(a["key"], a["state"]) for a in sounds], [("alert-sounds", "skipped")])
+        self.assertEqual(self.states({"actions": [a for a in second["actions"] if a not in sounds]}), {"unchanged"})
         after = self.tree()
         after.pop(".local/state/glaeda/mini-setup/receipt.json")
         before.pop(".local/state/glaeda/mini-setup/receipt.json")
@@ -282,6 +301,66 @@ class MiniSetupTest(unittest.TestCase):
         receipt = self.invoke()
         state = {a.get("label"): a["state"] for a in receipt["actions"] if a["kind"] == "agent"}
         self.assertEqual(state["com.teamleaderleo.glaeda.disk-pressure"], "unchanged")
+
+    def test_runner_work_marker_is_idempotent_owned_and_uninstallable(self) -> None:
+        work = self.home / "actions-runner-glaeda-1/_work"
+        work.mkdir(parents=True)
+        first = self.invoke("--apply")
+        marker = work / ".metadata_never_index"
+        self.assertTrue(marker.is_file())
+        first_marker = next(a for a in first["actions"] if a.get("path") == os.fspath(marker))
+        self.assertEqual(first_marker["state"], "create")
+        second = self.invoke("--apply")
+        second_marker = next(a for a in second["actions"] if a.get("path") == os.fspath(marker))
+        self.assertEqual((second_marker["state"], second_marker["owned"]), ("unchanged", True))
+        self.invoke("--uninstall", "--apply")
+        self.assertFalse(marker.exists())
+
+    def test_runner_symlink_is_not_followed_for_scan_marker(self) -> None:
+        target = Path(self.tmp.name) / "outside-runner/_work"
+        target.mkdir(parents=True)
+        (self.home / "actions-runner-glaeda-link").symlink_to(target.parent, target_is_directory=True)
+        receipt = self.invoke()
+        self.assertFalse(any(a.get("path", "").startswith(os.fspath(target))
+                             for a in receipt["actions"] if a["kind"] == "marker"))
+
+    def test_canonical_root_symlink_is_not_followed_for_scan_marker(self) -> None:
+        outside = Path(self.tmp.name) / "outside-derived-data"
+        outside.mkdir()
+        derived = self.home / "Library/Developer/Xcode/DerivedData"
+        derived.parent.mkdir(parents=True)
+        derived.symlink_to(outside, target_is_directory=True)
+        receipt = self.invoke()
+        self.assertFalse(any(a.get("path", "").startswith(os.fspath(outside))
+                             for a in receipt["actions"] if a["kind"] == "marker"))
+        self.assertFalse((outside / ".metadata_never_index").exists())
+
+    def test_preexisting_markers_are_never_overwritten_or_removed(self) -> None:
+        roots = (self.home / "Library/Developer/Xcode/DerivedData",
+                 self.home / ".cache/glaeda/cmux-native-cache")
+        for root in roots:
+            root.mkdir(parents=True)
+            (root / ".metadata_never_index").write_bytes(b"operator marker\n")
+        receipt = self.invoke("--apply")
+        markers = [a for a in receipt["actions"] if a["kind"] == "marker"]
+        self.assertEqual({a["state"] for a in markers}, {"unchanged"})
+        self.assertEqual({a["owned"] for a in markers}, {False})
+        self.assertTrue(all((root / ".metadata_never_index").read_bytes() == b"operator marker\n"
+                            for root in roots))
+        self.invoke("--uninstall", "--apply")
+        self.assertTrue(all((root / ".metadata_never_index").exists() for root in roots))
+
+    def test_owned_marker_replaced_by_symlink_is_kept_on_uninstall(self) -> None:
+        self.invoke("--apply")
+        marker = self.home / "Library/Developer/Xcode/DerivedData/.metadata_never_index"
+        target = Path(self.tmp.name) / "marker-target"
+        target.write_bytes(b"")
+        marker.unlink()
+        marker.symlink_to(target)
+        receipt = self.invoke("--uninstall")
+        action = next(a for a in receipt["actions"] if a.get("path") == os.fspath(marker))
+        self.assertEqual(action["state"], "absent")
+        self.assertTrue(marker.is_symlink())
 
     def test_update_keeps_a_backup(self) -> None:
         (self.home / ".local/bin").mkdir(parents=True)
@@ -304,6 +383,108 @@ class MiniSetupTest(unittest.TestCase):
         self.assertIn("parallel = 4", text)
         self.assertNotIn("untrackedCache", text)
         self.assertNotIn("fetchJobs", text)
+
+    def alert_ctx(self, hygiene_only: bool = False, headless: bool = False) -> object:
+        ctx = ms.Context(self.home, True, "/usr/bin/python3", True, self.reclaim, None, None,
+                         ms.CMUX_XCODE_APP, 50, hygiene_only=hygiene_only)
+        ctx.sandbox = False  # a real HOME, as on a mini; every command goes to fake_prefs instead
+        ctx.headless = headless
+        return ctx
+
+    def fake_prefs(self, store: dict[str, str]):
+        """A stand-in `defaults -g` store and osascript; anything else answers as missing."""
+        commands: list[list[str]] = []
+
+        def fake_run(argv, *args, **kwargs):
+            commands.append(list(argv))
+            if argv[0] == ms.DEFAULTS:
+                verb, key = argv[1], argv[3]
+                if verb == "read":
+                    return (0, store[key]) if key in store else (1, "does not exist")
+                if verb == "write":
+                    store[key] = argv[5]
+                elif verb == "delete":
+                    store.pop(key)
+                return 0, ""
+            return (0, "") if argv[0] == ms.OSASCRIPT else (1, "")
+
+        return commands, fake_run
+
+    def prefs_commands(self, commands: list[list[str]]) -> list[list[str]]:
+        return [c for c in commands if c[0] in {ms.DEFAULTS, ms.OSASCRIPT}]
+
+    def test_alert_sounds_are_enforced_on_a_mac_mini(self) -> None:
+        store = {"com.apple.sound.beep.volume": "0.7", "com.apple.sound.uiaudio.enabled": "0"}
+        commands, fake_run = self.fake_prefs(store)
+        ctx = self.alert_ctx()
+        with mock.patch.object(ms, "run", fake_run), mock.patch.object(ms, "machine_name", lambda: "Mac mini"), \
+                mock.patch.object(ms, "console_owner_uid", lambda: os.getuid()):
+            plan = ms.plan_alert_sounds(ctx, {})
+            self.assertEqual({a["key"]: a["state"] for a in plan}, {
+                "com.apple.sound.beep.volume": "update", "com.apple.sound.uiaudio.enabled": "unchanged",
+                "com.apple.sound.beep.feedback": "create", "alert-volume": "create"})
+            self.assertTrue(all(c[1] == "read" for c in self.prefs_commands(commands)), "planning writes nothing")
+            ms.apply_install(ctx, plan)
+            self.assertEqual(store, dict.fromkeys(store, "0") | {"com.apple.sound.beep.feedback": "0"})
+            self.assertIn([ms.DEFAULTS, "write", "-g", "com.apple.sound.beep.volume", "-float", "0"], commands)
+            self.assertIn([ms.OSASCRIPT, "-e", "set volume alert volume 0"], commands)
+            # the next (hourly) run: nothing to do, ownership and the earlier value carried forward
+            commands.clear()
+            again = {a["key"]: a for a in ms.plan_alert_sounds(ctx, {"actions": plan})}
+            self.assertEqual({a["state"] for a in again.values()}, {"unchanged"})
+            self.assertNotIn("alert-volume", again)
+            self.assertEqual(again["com.apple.sound.beep.volume"]["previous"], "0.7")
+            self.assertTrue(again["com.apple.sound.beep.feedback"]["owned"])
+            self.assertFalse(again["com.apple.sound.uiaudio.enabled"]["owned"], "it was already 0")
+            ms.apply_install(ctx, list(again.values()))
+            self.assertTrue(all(c[1] == "read" for c in self.prefs_commands(commands)))
+
+    def test_alert_sounds_uninstall_restores_only_values_still_ours(self) -> None:
+        store = {"com.apple.sound.beep.volume": "0.7"}
+        commands, fake_run = self.fake_prefs(store)
+        ctx = self.alert_ctx()
+        with mock.patch.object(ms, "run", fake_run), mock.patch.object(ms, "machine_name", lambda: "Mac mini"), \
+                mock.patch.object(ms, "console_owner_uid", lambda: None):
+            plan = ms.plan_alert_sounds(ctx, {})
+            ms.apply_install(ctx, plan)
+            ctx.state.mkdir(parents=True)
+            ctx.receipt_path.write_text(json.dumps({"actions": plan}))
+            store["com.apple.sound.beep.feedback"] = "1"  # the user turned feedback back on
+            undo = {a["key"]: a for a in ms.plan_uninstall(ctx) if a["kind"] == "defaults"}
+            self.assertEqual({k: a["state"] for k, a in undo.items()}, {
+                "com.apple.sound.beep.volume": "restore", "com.apple.sound.uiaudio.enabled": "remove",
+                "com.apple.sound.beep.feedback": "kept"})
+            ms.apply_uninstall(ctx, list(undo.values()))
+        self.assertEqual(store, {"com.apple.sound.beep.volume": "0.7", "com.apple.sound.beep.feedback": "1"})
+        self.assertIn([ms.DEFAULTS, "write", "-g", "com.apple.sound.beep.volume", "-float", "0.7"], commands)
+        self.assertNotIn(ms.OSASCRIPT, [c[0] for c in commands], "nobody owns the console")
+
+    def test_alert_sounds_only_on_a_fleet_mac_mini(self) -> None:
+        commands, fake_run = self.fake_prefs({})
+        with mock.patch.object(ms, "run", fake_run), mock.patch.object(ms, "console_owner_uid", lambda: os.getuid()):
+            with mock.patch.object(ms, "machine_name", lambda: "Mac mini"):
+                self.assertEqual(ms.plan_alert_sounds(self.alert_ctx(hygiene_only=True), {}), [])  # a laptop
+                linux = self.alert_ctx()
+                linux.platform = "linux"
+                self.assertEqual(ms.plan_alert_sounds(linux, {}), [])
+                sandbox = self.alert_ctx()
+                sandbox.sandbox = True
+                self.assertEqual([a["state"] for a in ms.plan_alert_sounds(sandbox, {})], ["skipped"])
+                # headless: defaults are written, but no live osascript without a GUI session
+                headless = ms.plan_alert_sounds(self.alert_ctx(headless=True), {})
+                self.assertEqual(headless[-1]["state"], "skipped")
+                ms.apply_install(self.alert_ctx(headless=True), headless)
+            self.assertNotIn(ms.OSASCRIPT, [c[0] for c in commands])
+            commands.clear()
+            with mock.patch.object(ms, "machine_name", lambda: "MacBook Pro"):
+                act, = ms.plan_alert_sounds(self.alert_ctx(), {})
+            self.assertEqual((act["state"], act["note"]), ("skipped", "MacBook Pro is not a Mac mini; alert sounds left alone"))
+            self.assertEqual(commands, [])
+        with mock.patch.object(ms, "run", lambda argv, **kw: (0, json.dumps(
+                {"SPHardwareDataType": [{"machine_name": "Mac mini", "machine_model": "Mac16,11"}]}))):
+            self.assertEqual(ms.machine_name(), "Mac mini")
+        with mock.patch.object(ms, "run", lambda argv, **kw: (1, "")):
+            self.assertEqual(ms.machine_name(), "unknown")
 
     def test_uninstall_plan_then_apply_removes_only_unmodified_files(self) -> None:
         self.invoke("--apply")
@@ -474,6 +655,7 @@ class MiniSetupTest(unittest.TestCase):
         kinds = {a["kind"] for a in receipt["actions"]}
         self.assertNotIn("git", kinds)
         self.assertNotIn("python", kinds)
+        self.assertNotIn("defaults", kinds)  # a personal Mac never loses its alert sounds
         self.assertFalse((self.home / ".cache/glaeda/cmux-native-cache").exists())
         for name in ("glaeda-disk", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all"):
             self.assertTrue(os.access(self.home / ".local/bin" / name, os.X_OK), name)
@@ -754,6 +936,15 @@ class MiniSetupTest(unittest.TestCase):
         config = json.loads(path.read_text())
         self.assertEqual((config["ring"], config["host"], config["reportStatus"]), ("canary", "renamed", True))
         self.assertNotIn("source", config)
+        # An explicitly requested default source is persisted for provenance,
+        # even when the existing config has no source field.
+        self.invoke("--hygiene-only", "--apply", "--ota-source", "teamleaderleo/glaeda")
+        config = json.loads(path.read_text())
+        self.assertEqual((config["source"], config["ring"], config["host"]),
+                         ("teamleaderleo/glaeda", "canary", "renamed"))
+        self.assertEqual(self.states(self.invoke("--hygiene-only", "--apply",
+                                                 "--ota-source", "teamleaderleo/glaeda")),
+                         {"unchanged"})
         # --ota-source moves the host to the fleet mirror and keeps the rest; naming it again changes nothing
         self.invoke("--hygiene-only", "--apply", "--ota-source", "manaflow-ai/glaeda")
         config = json.loads(path.read_text())
@@ -782,6 +973,56 @@ class MiniSetupTest(unittest.TestCase):
         self.assertEqual(path.read_bytes(), ms.agent_bytes(ctx, label))
         self.assertIn("deferred", act["note"])
 
+    def test_headless_agents_use_system_domain_and_persist_for_ota(self) -> None:
+        daemon_dir = self.home / "Library/LaunchDaemons"
+        with mock.patch.object(ms, "SYSTEM_DAEMON_DIR", daemon_dir):
+            ctx = ms.Context(self.home, True, "/usr/bin/python3", True, self.reclaim, None, None,
+                             ms.CMUX_XCODE_APP, 50, hygiene_only=True, headless=True)
+            # This test has a sandbox HOME, so Context deliberately disables the real
+            # headless side effect. Model the post-preflight context without touching
+            # /Library/LaunchDaemons.
+            ctx.sandbox = False
+            ctx.headless = True
+            ctx.agents = daemon_dir
+            plist = ms.agent_plists(ctx)[ms.LABEL_PREFIX + "update"]
+            self.assertEqual(plist["UserName"], pwd.getpwuid(os.getuid()).pw_name)
+            self.assertEqual(ms.agent_path(ctx, ms.LABEL_PREFIX + "update"),
+                             daemon_dir / "com.teamleaderleo.glaeda.update.plist")
+            self.assertEqual(ms.update_config(ctx)["setupArgs"], ["--hygiene-only", "--headless"])
+
+            config = ctx.update_config
+            config.parent.mkdir(parents=True, exist_ok=True)
+            config.write_text(json.dumps({"ring": "stable", "setupArgs": ["--hygiene-only"]}))
+            act = ms.update_config_action(ctx)
+            self.assertEqual(act["state"], "update")
+            self.assertEqual(act["value"]["setupArgs"], ["--hygiene-only", "--headless"])
+
+            commands = []
+            with mock.patch.object(ms, "run", lambda argv, *a, **k: commands.append(argv) or (0, "")):
+                ms.bootstrap(ctx, os.fspath(daemon_dir / "x.plist"))
+                ms.bootout(ctx, "com.teamleaderleo.glaeda.update", wait_s=0)
+            self.assertIn([ms.SUDO, "/bin/launchctl", "bootstrap", "system",
+                           os.fspath(daemon_dir / "x.plist")], commands)
+            self.assertIn([ms.SUDO, "/bin/launchctl", "bootout", "system/com.teamleaderleo.glaeda.update"], commands)
+
+    def test_headless_install_stages_and_installs_a_plist(self) -> None:
+        daemon_dir = self.home / "Library/LaunchDaemons"
+        with mock.patch.object(ms, "SYSTEM_DAEMON_DIR", daemon_dir):
+            ctx = ms.Context(self.home, True, "/usr/bin/python3", True, self.reclaim, None, None,
+                             ms.CMUX_XCODE_APP, 50, hygiene_only=True, headless=True)
+            ctx.sandbox = False
+            ctx.headless = True
+            destination = daemon_dir / "com.teamleaderleo.glaeda.test.plist"
+            destination.parent.mkdir(parents=True)
+
+            def fake_run(argv, *args, **kwargs):
+                self.assertEqual(argv[:7], [ms.SUDO, "/usr/bin/install", "-o", "root", "-g", "wheel", "-m"])
+                shutil.copy2(argv[-2], argv[-1])
+                return 0, ""
+
+            with mock.patch.object(ms, "run", fake_run):
+                ms.install_service_file(ctx, destination, b"headless plist\n", 0o644)
+            self.assertEqual(destination.read_bytes(), b"headless plist\n")
     def test_git_below_2_55_is_installed_with_our_brew_or_handed_to_the_operator(self) -> None:
         ctx = ms.Context(self.home, False, "/usr/bin/python3", True, self.reclaim, None, None,
                          ms.CMUX_XCODE_APP, 50, hygiene_only=True)

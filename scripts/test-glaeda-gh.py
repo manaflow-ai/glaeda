@@ -211,6 +211,8 @@ class ControllerTest(Base):
     def setUp(self) -> None:
         super().setUp()
         self.ctl = FakeController()
+        feed_every, gg.CONTROLLER_FEED_EVERY = gg.CONTROLLER_FEED_EVERY, 0  # these tests read the feed each tick
+        self.addCleanup(setattr, gg, "CONTROLLER_FEED_EVERY", feed_every)
         self.daemon = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=self.ctl)
 
     def test_tracked_run_costs_no_quota(self) -> None:
@@ -455,6 +457,21 @@ class ControllerTest(Base):
         self.assertEqual(len(self.ctl.calls), 3)
         self.assertEqual(self.gh.rest_calls(), [])
         self.assertEqual(self.daemon.tick(NOW + 11 * gg.TICK)["controller"]["runs"], 3)
+
+    def test_feed_is_read_at_most_every_feed_interval(self) -> None:
+        gg.CONTROLLER_FEED_EVERY = 20  # one read per tick from 18 hosts overloaded the controller's whois (10-07)
+        self.ctl.runs[44] = ctl_run(44, "in_progress")
+        gg.register("run:o/r/44")
+        for t in range(20):
+            self.daemon.tick(NOW + t * gg.TICK)
+        self.assertEqual(len(self.ctl.feeds), 2)  # at 0 s and 20 s
+        self.assertEqual(self.ctl.calls, [44])
+        self.assertEqual(self.gh.rest_calls(), [])  # the run stays controller-filled between reads
+        self.ctl.runs[45] = ctl_run(45, "in_progress")
+        gg.register("run:o/r/45")
+        self.daemon.tick(NOW + 20 * gg.TICK)
+        self.assertEqual(self.ctl.calls, [44, 45])  # a new watch gets its baseline without waiting for the feed
+        self.assertEqual(self.gh.rest_calls(), [])
 
     def test_feed_reset_takes_a_new_baseline(self) -> None:
         self.ctl.runs[43] = ctl_run(43, "in_progress")
@@ -1112,12 +1129,13 @@ class ClientTest(Base):
         code, _ = self.wait("pr", "o/r#6", fill=(None, {"error": "gh auth token exited 1; is gh signed in?"}), timeout=0.4)
         self.assertEqual(code, 2)
 
-    def test_only_required_checks_decide_when_marked(self) -> None:
+    def test_a_failed_optional_check_fails_unless_only_required_ones_count(self) -> None:
         req = {**check_run("build"), "isRequired": True}
         optional = {**check_run("lint", conclusion="FAILURE"), "isRequired": False}
         data = gg.parse_pr(pr_node(1, rollup="FAILURE", checks=[req, optional]))
-        self.assertEqual(gg.verdict("pr", data, "green"), 0)
-        self.assertEqual(gg.verdict("pr", data, "done"), 0)
+        self.assertEqual(gg.verdict("pr", data, "green"), 1)
+        self.assertEqual(gg.verdict("pr", data, "done"), 1)
+        self.assertEqual(gg.verdict("pr", data, "required"), 0)
         self.assertIn("lint (not required)", gg.summary("pr:o/r#1", {"data": data}))
         many = {**data, "checksTruncated": True, "checkState": "PENDING"}
         self.assertIsNone(gg.verdict("pr", many))  # over 100 checks: the rollup decides
@@ -1253,6 +1271,78 @@ class ClientTest(Base):
         data["checks"][0]["failedSteps"] = ["Run selected tests"]
         self.assertEqual(gg.verdict("pr", data, "green"), 1)
 
+    def test_over_100_checks_a_held_check_still_waits_for_its_rescue(self) -> None:
+        """manaflow-ai/cmux#20733 (95 checks shown of more): the rescue cancelled a queued fast tier, and
+        the wait exited 1 on GitHub's FAILURE rollup while 13 checks still ran and the re-run was due."""
+        now = time.time()
+        queued = {**check_run("fast tier", conclusion="CANCELLED"), "id": "CR_q", "databaseId": 5,
+                  "startedAt": iso(now - 104), "completedAt": iso(now - 5),
+                  "checkSuite": {"conclusion": "CANCELLED", "workflowRun": {"databaseId": 9, "workflow": {"name": "cmux-next"}}}}
+        running = check_run("react-apps-check", status="IN_PROGRESS", conclusion=None)
+        data = gg.parse_pr(pr_node(1, rollup="FAILURE", checks=[queued, running, check_run("build")]))
+        data["checks"][0]["stepCount"] = 0
+        many = {**data, "checksTruncated": True, "checkState": "FAILURE"}
+        self.assertIsNone(gg.verdict("pr", many, "green"))
+        self.assertIsNone(gg.verdict("pr", many, "done"))
+        # the re-run never came: the rollup's FAILURE decides once the grace is over
+        settled = {**many, "checks": [c for c in many["checks"] if c.get("name") != "react-apps-check"]}
+        self.assertEqual(gg.verdict("pr", settled, "green", now=now + gg.RESCUE_GRACE + 1), 1)
+        # a real failure in the shown checks still fails at once; with none shown and none held, the
+        # rollup's FAILURE is a check past the first 100
+        broken = gg.parse_pr(pr_node(2, rollup="FAILURE", checks=[queued, check_run("lint", conclusion="FAILURE")]))
+        broken["checks"][0]["stepCount"] = 0
+        self.assertEqual(gg.verdict("pr", {**broken, "checksTruncated": True, "checkState": "FAILURE"}, "green"), 1)
+        # --until done waits for every shown check to finish, failure or not, as under 100 checks
+        busy = gg.parse_pr(pr_node(5, rollup="FAILURE", checks=[check_run("lint", conclusion="FAILURE"), running]))
+        self.assertIsNone(gg.verdict("pr", {**busy, "checksTruncated": True, "checkState": "FAILURE"}, "done"))
+        self.assertEqual(gg.verdict("pr", {**busy, "checksTruncated": True, "checkState": "FAILURE"}, "green"), 1)
+        hidden = gg.parse_pr(pr_node(3, rollup="FAILURE", checks=[check_run("build")]))
+        self.assertEqual(gg.verdict("pr", {**hidden, "checksTruncated": True, "checkState": "FAILURE"}, "green"), 1)
+        ok = gg.parse_pr(pr_node(4, rollup="SUCCESS", checks=[check_run("build")]))
+        self.assertEqual(gg.verdict("pr", {**ok, "checksTruncated": True, "checkState": "SUCCESS"}, "green"), 0)
+
+    def test_a_check_cancelled_before_any_step_is_held_for_the_rescue(self) -> None:
+        """manaflow-ai/cmux#20608: the owned-pool rescue cancelled a fast tier still queued for a
+        runner (no step ran) and re-ran it; a wait that read the gap exited 1 before the re-run."""
+        now = time.time()
+        queued = {**check_run("fast tier", conclusion="CANCELLED"), "id": "CR_q", "databaseId": 5,
+                  "startedAt": iso(now - 104), "completedAt": iso(now - 5),
+                  "checkSuite": {"conclusion": "CANCELLED", "workflowRun": {"databaseId": 9, "workflow": {"name": "cmux-next"}}}}
+        data = gg.parse_pr(pr_node(1, rollup="FAILURE", checks=[queued, check_run("build")]))
+        data["checks"][0]["stepCount"] = 0
+        self.assertIsNone(gg.verdict("pr", data, "green"))
+        text = gg.summary("pr:o/r#1", {"data": data}, "green")
+        self.assertIn("held: cmux-next / fast tier: cancelled before any step ran", text)
+        self.assertEqual(gg.verdict("pr", data, "green", now=now + gg.RESCUE_GRACE + 1), 1)
+        self.assertEqual(gg.verdict("pr", data, "green", grace=0), 1)
+        # the rescue cancels the whole run: a sibling that was running is cancelled with steps, and held
+        # too; a real failure in that run still decides at once
+        running = {**check_run("daemon tests", conclusion="CANCELLED"), "id": "CR_r", "databaseId": 6,
+                   "startedAt": iso(now - 300), "completedAt": iso(now - 5),
+                   "checkSuite": {"conclusion": "CANCELLED", "workflowRun": {"databaseId": 9, "workflow": {"name": "cmux-next"}}}}
+        both = gg.parse_pr(pr_node(2, rollup="FAILURE", checks=[queued, running, check_run("build")]))
+        both["checks"][0]["stepCount"], both["checks"][1]["stepCount"] = 0, 7
+        self.assertIsNone(gg.verdict("pr", both, "green"))
+        self.assertIn("held: cmux-next / daemon tests: its run was cancelled while a job was still queued",
+                      gg.summary("pr:o/r#2", {"data": both}, "green"))
+        broken = {**check_run("lint", conclusion="FAILURE"), "id": "CR_l", "databaseId": 7,
+                  "checkSuite": {"conclusion": "FAILURE", "workflowRun": {"databaseId": 9, "workflow": {"name": "cmux-next"}}}}
+        mixed = gg.parse_pr(pr_node(3, rollup="FAILURE", checks=[queued, broken]))
+        mixed["checks"][0]["stepCount"] = 0
+        self.assertEqual(gg.verdict("pr", mixed, "green"), 1)
+        # a job that ran steps, or whose steps were never read, was cancelled for real
+        data["checks"][0]["stepCount"] = 3
+        self.assertEqual(gg.verdict("pr", data, "green"), 1)
+        del data["checks"][0]["stepCount"]
+        self.assertEqual(gg.verdict("pr", data, "green"), 1)
+
+    def test_steps_are_read_for_a_cancelled_check_too(self) -> None:
+        cancelled = {"id": "CR_c", "conclusion": "CANCELLED"}
+        self.assertTrue(gg.wants_steps(cancelled))
+        self.assertTrue(gg.wants_steps({"id": "CR_f", "conclusion": "FAILURE"}))
+        self.assertFalse(gg.wants_steps({"id": "CR_s", "conclusion": "SUCCESS"}))
+        self.assertFalse(gg.wants_steps({"conclusion": "CANCELLED"}))  # no node id to ask for
+
     def test_headline_agrees_with_the_verdict(self) -> None:
         """manaflow-ai/cmux#14667: GitHub's rollup was FAILURE for a Web complexity run cancelled
         between two passing ones, and the headline printed that next to result: success."""
@@ -1265,17 +1355,89 @@ class ClientTest(Base):
                                                      {**check_run("build"), "isRequired": True}, lint])
         node["mergeStateStatus"] = "CLEAN"
         data = gg.parse_pr(node)
-        self.assertEqual(gg.verdict("pr", data, "done"), 0)
-        text = gg.summary("pr:o/r#1", {"data": data}, "done")
+        self.assertEqual(gg.verdict("pr", data, "required"), 0)
+        text = gg.summary("pr:o/r#1", {"data": data}, "required")
         self.assertIn("checks SUCCESS: 2 passed, 1 failed, 0 pending (of 3, 2 required); GitHub's rollup says FAILURE", text)
         self.assertIn("cancelled: lint (not required)", text)
         self.assertIn("superseded: Web complexity / Web complexity cancelled, replaced by a newer attempt or run", text)
         self.assertNotIn("checks FAILURE", text)
-        # the headline follows the mode the wait used: green ignores optional checks still running
+        # the cancelled optional lint fails every other mode, and the headline says so
+        self.assertEqual(gg.verdict("pr", data, "done"), 1)
+        self.assertIn("checks FAILURE: 2 passed, 1 failed", gg.summary("pr:o/r#1", {"data": data}, "done"))
+        # the headline follows the mode the wait used: only `required` ignores optional checks still running
         running = gg.parse_pr(pr_node(2, rollup="PENDING", checks=[{**check_run("build"), "isRequired": True},
                                                                     {**check_run("slow", "IN_PROGRESS", None)}]))
-        self.assertIn("checks SUCCESS", gg.summary("pr:o/r#2", {"data": running}, "green"))
+        self.assertIn("checks SUCCESS", gg.summary("pr:o/r#2", {"data": running}, "required"))
+        self.assertIn("checks PENDING", gg.summary("pr:o/r#2", {"data": running}, "green"))
         self.assertIn("checks PENDING", gg.summary("pr:o/r#2", {"data": running}, "done"))
+        self.assertIsNone(gg.verdict("pr", running, "green"))
+
+    def test_subrouter_612_two_optional_reds_are_a_failure(self) -> None:
+        """manaflow-ai/subrouter#612 merged red: `wait pr` printed result: success over
+        "21 passed, 2 failed", because only the one required check (CLA Assistant v3) decided.
+        The rollup below is that PR's head commit's, as GitHub returned it."""
+        rows = [  # name, workflow, conclusion, required
+            ("Validate CLA trigger", "CLA policy workflow", "SKIPPED", False),
+            ("Detect changed paths", "CI", "SUCCESS", False),
+            ("Validate CLA trigger", "CLA policy workflow", "SUCCESS", False),
+            ("Validate CLA trigger", "CLA policy workflow", "SUCCESS", False),
+            ("Unit tests", "CI", "FAILURE", False),
+            ("Lock merged pull request", "CLA policy workflow", "SKIPPED", False),
+            ("Lock merged pull request", "CLA policy workflow", "SKIPPED", False),
+            ("Lock merged pull request", "CLA policy workflow", "SUCCESS", False),
+            ("CLA signer gate", "CLA policy workflow", "SKIPPED", False),
+            ("CLA signer gate", "CLA policy workflow", "SKIPPED", False),
+            ("CLA signer gate", "CLA policy workflow", "SKIPPED", False),
+            ("Deploy scripts", "CI", "SUCCESS", False),
+            ("CLA ledger writer", "CLA policy workflow", "SKIPPED", False),
+            ("Shadow rehearsal", "CI", "SUCCESS", False),
+            ("CLA ledger writer", "CLA policy workflow", "SUCCESS", False),
+            ("CLA ledger writer", "CLA policy workflow", "SUCCESS", False),
+            ("CLA Assistant v3", "CLA policy workflow", "SKIPPED", True),
+            ("Cross-compile release targets (darwin)", "CI", "SUCCESS", False),
+            ("CLA Assistant v3", "CLA policy workflow", "SUCCESS", True),
+            ("CLA Assistant v3", "CLA policy workflow", "SUCCESS", True),
+            ("Cross-compile release targets (linux)", "CI", "SUCCESS", False),
+            ("Cross-compile release targets (windows)", "CI", "SUCCESS", False),
+            ("Cross-compile release targets (freebsd)", "CI", "SUCCESS", False),
+            ("Cross-compile release targets (netbsd-openbsd)", "CI", "SUCCESS", False),
+            ("Rerun failed CLA check", "CLA policy workflow", "SKIPPED", False),
+            ("Rerun failed CLA check", "CLA policy workflow", "SKIPPED", False),
+            ("Rerun failed CLA check", "CLA policy workflow", "SKIPPED", False),
+            ("Linux client artifact (exact head)", "CI", "SUCCESS", False),
+            ("Docker local and team profiles", "CI", "SUCCESS", False),
+            ("macOS LaunchAgent transaction", "CI", "SUCCESS", False),
+            ("Build, vet, test", "CI", "FAILURE", False),
+            ("cubic · AI code reviewer", None, "NEUTRAL", False),
+            ("Socket Security: Project Report", None, "SUCCESS", False),
+            ("Socket Security: Pull Request Alerts", None, "SUCCESS", False),
+        ]
+        checks = []
+        for index, (name, workflow, conclusion, required) in enumerate(rows):
+            run = {"databaseId": 1000 + index, "workflow": {"name": workflow, "databaseId": 7}} if workflow else None
+            checks.append({**check_run(name, conclusion=conclusion), "databaseId": index, "isRequired": required,
+                           "checkSuite": {"conclusion": conclusion, "workflowRun": run}})
+        checks.append({"__typename": "StatusContext", "context": "CodeRabbit", "state": "SUCCESS",
+                       "targetUrl": "https://ci/coderabbit", "isRequired": False})
+        node = pr_node(612, rollup="FAILURE", checks=checks)
+        node["mergeStateStatus"] = "CLEAN"
+        data = gg.parse_pr(node)
+        for until in ("green", "done"):
+            self.assertEqual(gg.verdict("pr", data, until), 1, until)
+            text = gg.summary("pr:manaflow-ai/subrouter#612", {"data": data}, until)
+            self.assertIn("checks FAILURE: 21 passed, 2 failed, 0 pending (of 23, 1 required)", text)
+            self.assertIn("failed: CI / Unit tests (not required)", text)
+            self.assertIn("failed: CI / Build, vet, test (not required)", text)
+        # only an explicit --until required keeps the old reading
+        self.assertEqual(gg.verdict("pr", data, "required"), 0)
+        # neutral and skipped checks are not failures, and a pending one is not a success
+        quiet = [c for c in checks if c.get("conclusion") != "FAILURE"]
+        self.assertEqual(gg.verdict("pr", gg.parse_pr({**pr_node(1, rollup="SUCCESS", checks=quiet),
+                                                      "mergeStateStatus": "CLEAN"}), "green"), 0)
+        slow = quiet + [{**check_run("Unit tests", "IN_PROGRESS", None), "isRequired": False}]
+        self.assertIsNone(gg.verdict("pr", gg.parse_pr({**pr_node(1, rollup="PENDING", checks=slow),
+                                                       "mergeStateStatus": "CLEAN"}), "green"))
+
 
     # -- comments
 

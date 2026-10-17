@@ -145,7 +145,7 @@ rust_channel() {  # ROOT CHANNEL (the toolchain rust-toolchain.toml in the check
 }
 
 # Glaeda itself: the checkout glaeda-mini-enroll runs from, then its user-level setup.
-glaeda() {  # PYTHON
+glaeda() {  # PYTHON [--headless]
   local dir="$HOME/glaeda"
   if [ ! -f "$dir/scripts/cmux_fleet.py" ]; then
     [ ! -e "$dir" ] || refuse "$dir exists and is not a Glaeda checkout"
@@ -155,7 +155,9 @@ glaeda() {  # PYTHON
   # an older checkout's setup predates --ota-source; glaeda-mirror.sh in hq sets it on such hosts later
   local ota=()
   grep -q -- '--ota-source' "$dir/scripts/glaeda-mini-setup" && ota=(--ota-source manaflow-ai/glaeda)
-  "$(home "$1")" "$dir/scripts/glaeda-mini-setup" --apply ${ota[@]+"${ota[@]}"}
+  local headless=()
+  [ "${2:-}" = "--headless" ] && headless=(--headless)
+  "$(home "$1")" "$dir/scripts/glaeda-mini-setup" --apply ${headless[@]+"${headless[@]}"} ${ota[@]+"${ota[@]}"}
 }
 
 # ~/glaeda at one commit for the whole run (glaeda-mini-fleet passes --glaeda-ref, else the tip of main), so
@@ -234,7 +236,7 @@ homebrew_fetch() {  # UPSTREAM [PEER_URL [IDENTITY]]
 # marks are what repair reads.
 held_dir() { printf '%s' "$HOME/.local/state/glaeda/mini-fleet/runner-held"; }
 
-runner_plist() {  # DIR: the runner's LaunchAgent (svc.sh records it in .service; glaeda-cmux-runner's is fixed), or fail
+runner_plist() {  # DIR: the runner's LaunchAgent or headless LaunchDaemon, or fail
   local plist; plist=$(cat "$1/.service" 2>/dev/null || true)
   local base; base=$(basename "$1")
   if [ -z "$plist" ] && [ "$base" = actions-runner-glaeda ]; then
@@ -242,20 +244,41 @@ runner_plist() {  # DIR: the runner's LaunchAgent (svc.sh records it in .service
   elif [ -z "$plist" ] && [[ "$base" =~ ^actions-runner-glaeda-([0-9]+)$ ]]; then  # --instance K
     plist="$HOME/Library/LaunchAgents/com.teamleaderleo.glaeda.cmux-runner.${BASH_REMATCH[1]}.plist"
   fi
+  if { [ -z "$plist" ] || [ ! -f "$plist" ]; } && [ "$base" = actions-runner-glaeda ]; then
+    plist="/Library/LaunchDaemons/com.teamleaderleo.glaeda.cmux-runner.plist"
+  elif { [ -z "$plist" ] || [ ! -f "$plist" ]; } && [[ "$base" =~ ^actions-runner-glaeda-([0-9]+)$ ]]; then
+    plist="/Library/LaunchDaemons/com.teamleaderleo.glaeda.cmux-runner.${BASH_REMATCH[1]}.plist"
+  fi
   [ -n "$plist" ] && [ -f "$plist" ] || return 1
   printf '%s' "$plist"
 }
 
+runner_domain() {
+  case "$1" in
+    /Library/LaunchDaemons/*) printf 'system' ;;
+    *) printf 'gui/%s' "$(id -u)" ;;
+  esac
+}
+
+runner_launchctl() {
+  local plist="$1"
+  shift
+  case "$plist" in
+    /Library/LaunchDaemons/*) sudo -n launchctl "$@" ;;
+    *) launchctl "$@" ;;
+  esac
+}
+
 runner_hold() {  # WAIT_SECONDS
   local r dir plist label domain deadline
-  domain="gui/$(id -u)"
   mkdir -p "$(held_dir)"
   for r in "$HOME"/actions-runner*/.runner; do
     [ -f "$r" ] || continue
     dir=$(dirname "$r")
     plist=$(runner_plist "$dir") || { say "$dir has no launchd agent; nothing to stop"; continue; }
     label=$(basename "$plist" .plist)
-    if ! launchctl print "$domain/$label" >/dev/null 2>&1; then say "unchanged: $label is not loaded"; continue; fi
+    domain=$(runner_domain "$plist")
+    if ! runner_launchctl "$plist" print "$domain/$label" >/dev/null 2>&1; then say "unchanged: $label is not loaded"; continue; fi
     deadline=$(( $(date +%s) + $1 ))
     while pgrep -f "$dir/bin/Runner.Worker" >/dev/null 2>&1; do
       [ "$(date +%s)" -lt "$deadline" ] || refuse "$label is still running a job after $1 seconds; rerun once it ends"
@@ -263,16 +286,23 @@ runner_hold() {  # WAIT_SECONDS
       sleep 30
     done
     : > "$(held_dir)/$(basename "$dir")"
-    launchctl disable "$domain/$label"
-    launchctl bootout "$domain/$label" 2>/dev/null || true
-    ! launchctl print "$domain/$label" >/dev/null 2>&1 || refuse "could not stop $label"
+    if ! runner_launchctl "$plist" disable "$domain/$label"; then
+      case "$plist" in
+        /Library/LaunchDaemons/*) say "marked $label held; launchd disable was refused, the listener gate remains active"; continue ;;
+        *) refuse "could not disable $label" ;;
+      esac
+    fi
+    runner_launchctl "$plist" bootout "$domain/$label" 2>/dev/null || true
+    case "$plist" in
+      /Library/LaunchDaemons/*) say "held $label; the headless listener gate remains active"; continue ;;
+    esac
+    ! runner_launchctl "$plist" print "$domain/$label" >/dev/null 2>&1 || refuse "could not stop $label"
     say "stopped $label; it starts again once the node is eligible"
   done
 }
 
 runner_release() {  # [if-eligible]
   local r dir plist label domain state
-  domain="gui/$(id -u)"
   if [ "${1:-}" = if-eligible ]; then
     state=$(plutil -extract state raw "${XDG_CONFIG_HOME:-$HOME/.config}/glaeda/cmux-fleet/enrollment.json" 2>/dev/null || true)
     if [ "$state" != eligible ]; then say "runners stay held: the node is ${state:-not enrolled}"; return; fi
@@ -283,8 +313,20 @@ runner_release() {  # [if-eligible]
     [ -f "$(held_dir)/$(basename "$dir")" ] || continue
     plist=$(runner_plist "$dir") || { say "$dir has no launchd agent; glaeda-cmux-runner --apply installs it"; continue; }
     label=$(basename "$plist" .plist)
-    launchctl enable "$domain/$label"
-    launchctl print "$domain/$label" >/dev/null 2>&1 || launchctl bootstrap "$domain" "$plist" \
+    domain=$(runner_domain "$plist")
+    if ! runner_launchctl "$plist" enable "$domain/$label"; then
+      case "$plist" in
+        /Library/LaunchDaemons/*)
+          if pgrep -f "$dir/bin/Runner.Listener" >/dev/null 2>&1; then
+            rm -f "$(held_dir)/$(basename "$dir")"
+            say "released $label; its headless listener was already running"
+            continue
+          fi
+          ;;
+      esac
+      refuse "could not enable $label"
+    fi
+    runner_launchctl "$plist" print "$domain/$label" >/dev/null 2>&1 || runner_launchctl "$plist" bootstrap "$domain" "$plist" \
       || refuse "could not start $label; the runner runs in the GUI session, so log in on the mini (or enable auto-login)"
     rm -f "$(held_dir)/$(basename "$dir")"
     say "started $label"
@@ -293,15 +335,15 @@ runner_release() {  # [if-eligible]
 
 runner_kick() {
   local r dir plist label domain
-  domain="gui/$(id -u)"
   for r in "$HOME"/actions-runner*/.runner; do
     [ -f "$r" ] || continue
     dir=$(dirname "$r")
     plist=$(runner_plist "$dir") || continue
     label=$(basename "$plist" .plist)
-    launchctl print "$domain/$label" >/dev/null 2>&1 || continue
+    domain=$(runner_domain "$plist")
+    runner_launchctl "$plist" print "$domain/$label" >/dev/null 2>&1 || continue
     if ! pgrep -f "$dir/bin/Runner.Listener" >/dev/null 2>&1; then
-      launchctl kickstart -k "$domain/$label"
+      runner_launchctl "$plist" kickstart -k "$domain/$label"
       say "restarted $label"
     fi
   done

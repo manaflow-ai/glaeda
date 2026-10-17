@@ -25,11 +25,11 @@ CMUX_REPOSITORY = "manaflow-ai/cmux"
 # The fixed part of the PATH the CMUX profile runner hands its workload, from
 # `workload_environment` in the repository's scripts/ci/cmux_workload_profile.py.
 # The runner prepends a per-attempt Cargo home that it creates empty, so these
-# six directories are everything a build can actually reach.
+# these directories are everything a build can actually reach.
 CMUX_WORKLOAD_TOOL_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 # Tools the CMUX developer build itself invokes, as opposed to the ones this
 # script runs to describe the machine.
-MACOS_WORKLOAD_TOOLS = ("cargo", "git", "rustc", "rustup", "xcodebuild", "xcrun", "zig")
+MACOS_WORKLOAD_TOOLS = ("cargo", "git", "rustc", "rustdoc", "rustup", "xcodebuild", "xcrun", "zig")
 LINUX_WORKLOAD_TOOLS = ("git", "python3")
 # Free disk a macOS build host needs before admission: a base so a macOS update can download
 # and install, plus one cmux working set per concurrent build slot. A working set is at most
@@ -53,7 +53,10 @@ CMUX_GHOSTTYKIT_LOCATIONS = (
     "GhosttyKit.xcframework",
     "ghostty/macos/GhosttyKit.xcframework",
 )
-# The Xcode major the fleet is reviewed against (CMUX .xcode-version).
+# The minimum Xcode major the fleet is reviewed against (CMUX .xcode-version).
+# Newer majors are accepted when the manifest pins the exact app and SDK. This
+# lets a canary move to Xcode 27 without admitting an unpinned toolchain into
+# the Xcode 26 pool.
 REVIEWED_XCODE_MAJOR = 26
 CMUX_RESULT_CONTRACT = "cmux-workload-result/v1"
 CMUX_PROFILE_REGISTRY = "scripts/ci/cmux-workload-profiles.json"
@@ -84,6 +87,7 @@ class BootstrapError(RuntimeError):
 TOOL_FIXES = {
     "cargo": "brew install rustup as the Homebrew owner, then link its cargo, rustc and rustup proxies into /opt/homebrew/bin",
     "rustc": "brew install rustup as the Homebrew owner, then link its cargo, rustc and rustup proxies into /opt/homebrew/bin",
+    "rustdoc": "brew install rustup as the Homebrew owner, then link its rustdoc proxy into /opt/homebrew/bin",
     "rustup": "brew install rustup as the Homebrew owner, then link its cargo, rustc and rustup proxies into /opt/homebrew/bin",
     "zig": "brew install zig as the Homebrew owner (Ghostty needs the version in ghostty/build.zig.zon)",
     "git": "xcode-select --install, or select an Xcode with sudo xcode-select -s",
@@ -97,7 +101,7 @@ FIRST_LAUNCH_FIX = "Xcode first launch not done (plugins fail to load); run sudo
 LICENSE_FIX = "Xcode licence not accepted; run sudo xcodebuild -license accept"
 # The fix for each check `evaluate` can list in blockingChecks, so a refusal says what to do.
 BLOCKING_FIXES = {
-    "supportedOs": "use macOS 15 or 26 (Linux: Ubuntu 24.04 or Debian 12 on kernel 6+)",
+    "supportedOs": "use macOS 15 or 26+ (Linux: Ubuntu 24.04 or Debian 12 on kernel 6+)",
     "hardwareCapability": "use a host that meets the hardware class minimum (8 CPUs, 16 GiB on macOS)",
     "cmuxCheckout": "clone manaflow-ai/cmux (git clone --depth 1) and pass it as --cmux-root",
     "canonicalCheckoutClean": "commit, stash or remove local changes in the cmux checkout (git status)",
@@ -108,7 +112,7 @@ BLOCKING_FIXES = {
     "profileRunnerInterpreter": "run the bootstrap with Python 3.13 or newer (os.waitid)",
     "workloadToolPath": "put every build tool in /opt/homebrew/bin or /usr/local/bin (see toolsMissingFromWorkloadPath)",
     "zig": "install the zig Ghostty needs: " + TOOL_FIXES["zig"],
-    "rust": "rustup, cargo and rustc must run in the cmux checkout: rustup toolchain install <channel in Native/DiffSidecar/rust-toolchain.toml>",
+    "rust": "rustup, cargo, rustc and rustdoc must run in the cmux checkout: rustup toolchain install <channel in Native/DiffSidecar/rust-toolchain.toml>",
     "metalToolchain": METAL_FIX,
     "glaedaExecutable": "install or stage the glaeda binary (glaeda-mini-enroll does this)",
     "diskAdmission": "free disk space (glaeda-disk shows where it went)",
@@ -378,7 +382,8 @@ def xcode_pin_ready(pin: str, xcode_version: str | None, sdk_version: str) -> bo
 
     CMUX pins a major version there: "26" since cmux#14050, "26.0" before it.
     The exact app and build are the CI Xcode variables' job, which the hosted
-    adopter revalidates; this check keeps a node on the reviewed major.
+    adopter revalidates; this check keeps a node on the reviewed major or newer
+    while requiring the selected Xcode and SDK to share the pinned major.
     """
     def major(version: str | None) -> int | None:
         match = re.fullmatch(r"(\d+)(?:\.\d+)*", version or "")
@@ -386,7 +391,8 @@ def xcode_pin_ready(pin: str, xcode_version: str | None, sdk_version: str) -> bo
 
     wanted = major(pin)
     return (
-        wanted == REVIEWED_XCODE_MAJOR
+        wanted is not None
+        and wanted >= REVIEWED_XCODE_MAJOR
         and major(xcode_version) == wanted
         and major(sdk_version) == wanted
     )
@@ -533,7 +539,7 @@ def collect_macos(
         "glaedaGeneration": digest_file(glaeda),
         "toolchainGeneration": digest_bytes(canonical(toolchain)),
         "checks": {
-            "supportedOs": major in {15, 26},
+            "supportedOs": major == 15 or major >= REVIEWED_XCODE_MAJOR,
             "hardwareCapability": hardware_class_ready(
                 "macos",
                 hardware_class,

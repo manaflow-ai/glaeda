@@ -328,13 +328,21 @@ class Tests(unittest.TestCase):
             return str(64 * 1024**3)
         raise AssertionError(argv)
 
-    def _collect_macos(self, root, cache_root, visible):
+    def _collect_macos(self, root, cache_root, visible, macos_version="26.5", xcode_version="26.0", sdk_version="26.0"):
+        def command(argv, **kwargs):
+            name = Path(argv[0]).name
+            if name == "xcodebuild":
+                return f"Xcode {xcode_version}\nBuild version {xcode_version.split('.')[0]}A123"
+            if name == "xcrun" and "metal" not in argv[1:]:
+                return sdk_version
+            return self._macos_command(argv, **kwargs)
+
         with (
             mock.patch.object(b.platform, "system", return_value="Darwin"),
-            mock.patch.object(b.platform, "mac_ver", return_value=("26.5", ("", "", ""), "arm64")),
+            mock.patch.object(b.platform, "mac_ver", return_value=(macos_version, ("", "", ""), "arm64")),
             mock.patch.object(b.platform, "machine", return_value="arm64"),
             mock.patch.object(b, "executable", side_effect=lambda n: f"/usr/bin/{n}"),
-            mock.patch.object(b, "run", side_effect=self._macos_command),
+            mock.patch.object(b, "run", side_effect=command),
             mock.patch.object(
                 b.shutil, "which",
                 side_effect=lambda name, path=None: f"/usr/bin/{name}" if visible else None,
@@ -369,7 +377,9 @@ class Tests(unittest.TestCase):
         # cmux#14050 changed .xcode-version from "26.0" to "26".
         for pin in ("26", "26.0", "26\n".strip()):
             self.assertTrue(b.xcode_pin_ready(pin, "26.6", "26.5"), pin)
-        self.assertFalse(b.xcode_pin_ready("27", "27.0", "27.0"))
+        self.assertTrue(b.xcode_pin_ready("27", "27.0", "27.0"))
+        self.assertTrue(b.xcode_pin_ready("27", "27.1", "27.1"))
+        self.assertFalse(b.xcode_pin_ready("25", "25.4", "25.4"))
         self.assertFalse(b.xcode_pin_ready("26", "25.4", "26.5"))
         self.assertFalse(b.xcode_pin_ready("26", "260.1", "26.5"))
         self.assertFalse(b.xcode_pin_ready("26", "26.6", "15.5"))
@@ -387,6 +397,22 @@ class Tests(unittest.TestCase):
             cache_root = root / "cache"
             cache_root.mkdir()
             self.assertTrue(self._collect_macos(root, cache_root, visible=True)["checks"]["xcodePin"])
+
+    def test_macos_27_observation_is_supported_with_a_matching_xcode(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            self._macos_checkout(root)
+            (root / ".xcode-version").write_text("27\n", encoding="utf-8")
+            glaeda = root / "glaeda"
+            glaeda.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            glaeda.chmod(0o755)
+            cache_root = root / "cache"
+            cache_root.mkdir()
+            observed = self._collect_macos(
+                root, cache_root, visible=True, macos_version="27.0.1", xcode_version="27.0", sdk_version="27.0"
+            )
+        self.assertTrue(observed["checks"]["supportedOs"])
+        self.assertTrue(observed["checks"]["xcodePin"])
 
     def test_macos_observation_reports_class_identity(self):
         # cmux_fleet.py class acceptance binds these; the digest must be the

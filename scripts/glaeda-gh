@@ -4,7 +4,7 @@
     glaeda-gh serve                                     the daemon (LaunchAgent or systemd user unit)
     glaeda-gh status pr OWNER/REPO#N [--json]           PR state, checks, mergeability, review
     glaeda-gh status run OWNER/REPO/RUN_ID [--jobs] [--json]
-    glaeda-gh wait pr OWNER/REPO#N [--until green|done|merged] [--timeout S] [--json]
+    glaeda-gh wait pr OWNER/REPO#N [--until green|done|required|merged] [--timeout S] [--json]
     glaeda-gh wait run OWNER/REPO/RUN_ID [--jobs] [--rescue-grace S] [--timeout S] [--json]
     glaeda-gh wait comment OWNER/REPO#N [--author LOGIN] [--match REGEX] [--since ID|URL|TIME|10m]
     glaeda-gh status comment OWNER/REPO#N               the latest comments on an issue or PR
@@ -43,12 +43,14 @@ the daemon is the only process that talks to GitHub, and clients only read its c
 Clients make no API calls. When the daemon is not running they say so and exit 3 rather than
 fall back to polling. `wait` exits 0 on success (or a matching comment), 1 on failure (a failed
 check, a failed run, a PR closed without being merged, an issue that does not exist), 2 on timeout,
-4 when the PR conflicts with its base. --until green (default) fails as soon as any check fails;
-done waits for every check to finish; merged waits for the merge.
+4 when the PR conflicts with its base. --until green (default) fails as soon as any completed check
+failed, required or not, and succeeds once every check finished with success, neutral or skipped;
+done waits for every check to finish; required lets only the checks GitHub requires decide (when
+any are marked); merged waits for the merge.
 
 A PR that conflicts with its base (mergeable CONFLICTING, merge state DIRTY), for example after the
 PR it was stacked on was squash-merged, runs no pull_request workflows until the next push. `wait
-pr --until green|done` therefore stops with exit 4 as soon as the daemon's cached data says so;
+pr --until green|done|required` therefore stops with exit 4 as soon as the daemon's cached data says so;
 --until merged keeps waiting. UNKNOWN mergeability (GitHub computes it lazily) counts as pending.
 
 A job a glaeda runner refused (its "Set up runner" step, the runner's job-started hook, failed
@@ -123,6 +125,8 @@ CONTROLLER_DEFAULT = "http://100.89.225.106:18765"  # cmux-lawrence since the 20
 CONTROLLER_CONFIG = Path.home() / ".local/share/cmux-fleet-client/client.json"
 CONTROLLER_TOKEN = Path.home() / ".config/cmux/build-fleet/controller.token"
 CONTROLLER_TIMEOUT = 3  # a tick must not stall on an unreachable controller
+CONTROLLER_FEED_EVERY = 20  # seconds between change-feed reads: each request costs the controller a tailnet
+# whois, and 18 hosts at one read per tick drove tailscaled into a kernel panic on cmux-lawrence (10-07)
 CONTROLLER_RETRY = 60  # after a failure, the controller is left alone this long, doubling up to CONTROLLER_ABSENT
 REST_SAFETY = 900  # a run the controller tracks is still read over REST this often (a lost delivery)
 CONTROLLER_ABSENT = 900  # a controller without the run-events receiver (404, 503) is asked again this rarely
@@ -486,6 +490,12 @@ def slim_run(doc: dict) -> dict:
     return {k: doc.get(k) for k in keep}
 
 
+def wants_steps(c: dict) -> bool:
+    """A check whose steps the daemon reads once: a failure (which steps failed) or a cancellation
+    (did any step run: the owned-pool rescue cancels a job still queued for a runner, then re-runs it)."""
+    return bool(c.get("id")) and (c.get("conclusion") or "").upper() in STEP_FAILED | {"CANCELLED"}
+
+
 def failed_steps(steps: list | None) -> list[str]:
     return [str(s.get("name")) for s in steps or [] if isinstance(s, dict)
             and str(s.get("conclusion") or "").upper() in STEP_FAILED]
@@ -517,6 +527,7 @@ class Daemon:
             Controller.from_env if controller == "env" else controller if callable(controller) else None)
         self.controller = self.controller_source() if self.controller_source else controller
         self.controller_down_until = 0.0
+        self.controller_feed_at = float("-inf")
         self.controller_failures = 0
         self.controller_filled: set[str] = set()  # watched runs the controller tracks, while its feed answers
         self.controller_cursor: int | None = None
@@ -793,17 +804,17 @@ class Daemon:
         for e, _ in pairs:
             for c in (((e["cache"] or {}).get("data") or {}).get("checks") or []):
                 if c.get("id") and isinstance(c.get("failedSteps"), list):
-                    known[c["id"]] = c["failedSteps"]
+                    known[c["id"]] = [c["failedSteps"], c.get("stepCount")]
         want: dict[str, list[dict]] = {}
         for _, data in pairs:
             for c in data.get("checks") or []:
-                if not c.get("id") or (c.get("conclusion") or "").upper() not in STEP_FAILED:
+                if not wants_steps(c):
                     continue
                 if c["id"] in known:
-                    c["failedSteps"] = known[c["id"]]
+                    c["failedSteps"], c["stepCount"] = known[c["id"]]
                 else:
                     want.setdefault(c["id"], []).append(c)
-        ids = list(want)[:2 * STEPS_BATCH]  # the rest wait a cycle: a PR with 100 failures fails anyway
+        ids = list(want)[:2 * STEPS_BATCH]  # the rest wait a cycle (failed and cancelled checks; each is read once)
         for i in range(0, len(ids), STEPS_BATCH):
             if self.mode("graphql") == "stop":
                 return
@@ -813,9 +824,11 @@ class Daemon:
                 return
             for node in (doc.get("data") or {}).get("nodes") or []:
                 if isinstance(node, dict) and node.get("id") in want:
-                    names = failed_steps((node.get("steps") or {}).get("nodes"))
+                    steps = (node.get("steps") or {}).get("nodes")
+                    names = failed_steps(steps)
                     for c in want[node["id"]]:
-                        c["failedSteps"] = names
+                        # steps null (a partial error) is unknown, never "no step ran"
+                        c["failedSteps"], c["stepCount"] = names, len(steps) if isinstance(steps, list) else None
 
     def get(self, path: str, etag: str | None) -> tuple[str, Any, str | None]:
         """("fresh", doc, etag), ("same", None, etag) on 304, or ("error", message, None)."""
@@ -915,18 +928,21 @@ class Daemon:
         self.controller_status = {"state": "off" if current is None else "starting"}
 
     def from_controller(self, entries: list[dict]) -> None:
-        """Follow the controller's change feed: free, one request a tick, plus one baseline read for
-        each run newly watched. Job lists still come from REST."""
+        """Follow the controller's change feed: free, one request every CONTROLLER_FEED_EVERY seconds,
+        plus one baseline read for each run newly watched. Job lists still come from REST."""
         self.controller_filled = set()
         self.follow_controller()
         if self.controller is None or self.now < self.controller_down_until:
             return
         deadline = time.monotonic() + TICK  # a slow controller must not stall the tick
-        try:
-            pages = self.read_feed()
-        except WatchError as error:
-            return self.controller_down(error)
-        self.controller_failures = 0
+        pages: list[dict] = []
+        if self.now - self.controller_feed_at >= CONTROLLER_FEED_EVERY:
+            self.controller_feed_at = self.now
+            try:
+                pages = self.read_feed()
+            except WatchError as error:
+                return self.controller_down(error)
+            self.controller_failures = 0
         runs = {e["key"]: e for e in entries if e["key"].startswith("run:") and not e["jobs"]}
         self.controller_seen = {k: v for k, v in self.controller_seen.items() if k in runs}
         for key, e in runs.items():
@@ -952,8 +968,9 @@ class Daemon:
             self.nudge(entries, page)
             self.merge_comments(entries, page)
         self.controller_filled = {k for k, known in self.controller_seen.items() if known}
-        self.controller_status = {"state": "ok", "lastDelivery": pages[-1].get("receiver_last_delivery"),
-                                  "token": bool(self.controller.token)}
+        if pages:
+            self.controller_status = {"state": "ok", "lastDelivery": pages[-1].get("receiver_last_delivery"),
+                                      "token": bool(self.controller.token)}
 
     def apply_run(self, e: dict, run: dict) -> None:
         prior = e["cache"] or {}
@@ -1170,10 +1187,10 @@ def failing(checks: list[dict]) -> list[dict]:
     return [c for c in checks if (c.get("conclusion") or "").upper() in FAILED]
 
 
-def judged(data: dict) -> list[dict]:
-    """The checks that decide: the required ones when GitHub marks any, else all of them."""
-    checks = data.get("checks") or []
-    return [c for c in checks if c.get("required")] or checks
+def cancelled_unstarted(c: dict) -> bool:
+    """A PR check cancelled before any step ran: the rescue cancels a job still queued for a runner and
+    re-runs it. Unknown steps (never read) count as started, so a real cancellation still fails."""
+    return (c.get("conclusion") or "").upper() == "CANCELLED" and c.get("stepCount") == 0
 
 
 def refused_check(c: dict) -> bool:
@@ -1193,17 +1210,24 @@ def refused_job(job: dict) -> bool:
 def classify(data: dict, now: float | None = None, grace: float = RESCUE_GRACE) -> dict[str, list[dict]]:
     """Split a PR's checks into passed, failed, pending and held. A failed check is held while a job
     of its workflow run was refused at runner setup less than `grace` seconds ago: the rescue re-runs
-    that run's failed jobs, dependents such as an aggregate status check included."""
+    that run's failed jobs, dependents such as an aggregate status check included. A check cancelled
+    before any step ran is held as long: the rescue cancelled it in the queue and re-runs it."""
     now = time.time() if now is None else now
     checks = data.get("checks") or []
-    held_runs = {c.get("runId") for c in checks if c.get("runId") and refused_check(c)
-                 and now - (iso_epoch(c.get("completedAt")) or 0) < grace}
+    def recent(c: dict) -> bool:
+        return now - (iso_epoch(c.get("completedAt")) or 0) < grace
+    held_runs = {c.get("runId") for c in checks if c.get("runId") and refused_check(c) and recent(c)}
+    # the rescue cancels the whole run: its jobs that were running come back cancelled with steps
+    queued_runs = {c.get("runId") for c in checks if c.get("runId") and cancelled_unstarted(c) and recent(c)}
     out: dict[str, list[dict]] = {"passed": [], "failed": [], "pending": [], "held": []}
     for c in checks:
+        cancelled = (c.get("conclusion") or "").upper() == "CANCELLED"
         if c.get("status") != "COMPLETED":
             out["pending"].append(c)
         elif (c.get("conclusion") or "").upper() in FAILED:
-            out["held" if c.get("runId") in held_runs else "failed"].append(c)
+            held = (c.get("runId") in held_runs or (cancelled_unstarted(c) and recent(c))
+                    or (cancelled and c.get("runId") in queued_runs))
+            out["held" if held else "failed"].append(c)
         else:
             out["passed"].append(c)
     return out
@@ -1212,16 +1236,30 @@ def classify(data: dict, now: float | None = None, grace: float = RESCUE_GRACE) 
 def check_verdict(data: dict, until: str = "green", now: float | None = None,
                   grace: float = RESCUE_GRACE) -> int | None:
     """The checks alone, whatever the PR's state or head: EXIT_OK, EXIT_FAIL, or None while pending."""
-    if data.get("checksTruncated"):  # more than 100 checks: GitHub's own rollup decides
-        state = data.get("checkState")
-        return EXIT_OK if state == "SUCCESS" else EXIT_FAIL if state in {"FAILURE", "ERROR"} else None
     checks = data.get("checks") or []
+    if data.get("checksTruncated"):
+        # More than 100 checks: only the first 100 are here, so GitHub's rollup decides, except that a
+        # check shown as held or still running defers its FAILURE (manaflow-ai/cmux#20733: a queued fast
+        # tier the rescue cancelled read as a failure while 13 checks still ran).
+        state = data.get("checkState")
+        if state == "SUCCESS":
+            return EXIT_OK
+        if state not in {"FAILURE", "ERROR"}:
+            return None
+        groups = classify(data, now, grace)
+        if until == "done" and (groups["pending"] or groups["held"]):
+            return None  # every shown check finishes first, as under 100 checks
+        if groups["failed"] and until != "required":
+            return EXIT_FAIL
+        return None if groups["held"] else EXIT_FAIL
     if not checks:
         return None  # nothing has reported yet
     marked = any(c.get("required") for c in checks)
 
     def decides(c: dict) -> bool:
-        return bool(c.get("required")) or not marked
+        # Every check decides; only an explicit --until required ignores the ones GitHub does not require
+        # (manaflow-ai/subrouter#612 merged red on "success" over two failed optional checks).
+        return until != "required" or bool(c.get("required")) or not marked
 
     # GitHub's own merge state already counts a required check that never reported. A conflicted PR
     # (DIRTY) runs no pull_request workflows until the next push, and a merged one never will.
@@ -1229,8 +1267,8 @@ def check_verdict(data: dict, until: str = "green", now: float | None = None,
                and data.get("mergeStateStatus") not in {"CLEAN", "UNSTABLE", "HAS_HOOKS", "DIRTY"})
     groups = classify(data, now, grace)
     bad = [c for c in groups["failed"] if decides(c)]
-    unfinished = [c for c in groups["pending"] + groups["held"] if until != "green" or decides(c)]
-    if until == "green" and bad:
+    unfinished = [c for c in groups["pending"] + groups["held"] if decides(c)]
+    if until in {"green", "required"} and bad:
         return EXIT_FAIL
     if unfinished or waiting:
         return None
@@ -1354,7 +1392,11 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
         if len(bad) > 20:
             lines.append(f"  ... {len(bad) - 20} more failed")
         for c in groups["held"][:20]:
-            lines.append(f"  held: {label(c)}{steps_note(c)}: its run had a job refused at runner setup; "
+            refused = any(refused_check(o) and o.get("runId") == c.get("runId") for o in checks)
+            why = ("cancelled before any step ran" if cancelled_unstarted(c)
+                   else "its run had a job refused at runner setup" if refused
+                   else "its run was cancelled while a job was still queued")
+            lines.append(f"  held: {label(c)}{steps_note(c)}: {why}; "
                          f"pending up to {int(grace)}s for the re-run  {c.get('url') or ''}".rstrip())
         for c in (data.get("superseded") or [])[:10]:
             optional = " (not required)" if marked and not c.get("required") else ""
@@ -1684,9 +1726,10 @@ def parser() -> argparse.ArgumentParser:
         s.add_argument("--jobs", action="store_true", help="runs: also track the job list")
         s.add_argument("--json", action="store_true")
         if name == "wait":
-            s.add_argument("--until", choices=("green", "done", "merged"), default="green",
-                           help="PRs: green (fail fast), done (every check finished) or merged; green and "
-                                "done exit 4 once the PR conflicts with its base")
+            s.add_argument("--until", choices=("green", "done", "required", "merged"), default="green",
+                           help="PRs: green (every check passes; fail fast), done (every check finished), "
+                                "required (only the checks GitHub requires decide; fail fast) or merged; "
+                                "all but merged exit 4 once the PR conflicts with its base")
             s.add_argument("--timeout", type=float, default=3600, help="seconds (default 3600); exit 2 after")
             s.add_argument("--sha", help="the commit you pushed (git rev-parse HEAD): other heads count as pending")
             s.add_argument("--rescue-grace", type=float, default=RESCUE_GRACE, metavar="S",

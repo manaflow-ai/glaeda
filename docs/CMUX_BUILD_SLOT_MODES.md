@@ -177,12 +177,18 @@ the old key is dropped.
 ## Deployment
 
 `scripts/glaeda-fleet-cas-rollout --store HOST NODE_HOST... [--apply]` from an operator Mac
-deploys both services (plan by default). On each host it runs `scripts/glaeda-fleet-cas`,
+deploys both services (plan by default). Planning validates local arguments and any prebuilt
+bundle, reads SSH host configuration and tailnet addresses, and prints staging destinations
+and the installer commands. It creates no remote directories, copies no files, and runs no
+remote installer. Host-local installer checks are deferred until `--apply`; a successful plan
+does not establish that installation will succeed. With `--apply`, each host receives the
+installer and prototype, then runs `scripts/glaeda-fleet-cas`,
 which builds the prototype and installs launchd services (a LaunchAgent, or a LaunchDaemon
-run as the build user where root has installed its plist from `xcode/launchd/`). Each runs
-`xcode/bin/fleet-cas-run ROLE`, which reads its arguments from `xcode/run/ROLE.args`, so an
-upgrade needs no root: the installer rewrites the arguments or binary and stops the process,
-and launchd starts it again.
+run as the build user where root has installed its plist from `xcode/launchd/`). Ordinary roles
+run `xcode/bin/fleet-cas-run ROLE` and read arguments from `xcode/run/ROLE.args`. A custom
+sparsebundle store uses a boot-volume copy of the wrapper and `store-run/ROLE.args`, so it can
+attach the volume before reading state. In both cases an upgrade needs no root: the installer
+rewrites the arguments or binary and stops the process, and launchd starts it again.
 
 - `com.teamleaderleo.glaeda.fleet-cas-store` on the store host: the fleet store on the host's
   tailnet address, port 7450, store under `xcode/fleet-store`. Only `--writers` addresses may
@@ -208,9 +214,31 @@ its tailnet address the store's only allowed writer. The writer runs on an hq-on
 with no PR runners: any process on the writer host can reach the signing node's socket.
 `--trusted-keys` alone makes every node and the store use only signed entries. A
 LaunchAgent needs the build user's GUI session; the fleet minis log in automatically.
-`glaeda-fleet-cas uninstall --apply` removes the services and keeps the stores (a
-LaunchDaemon's plist needs root to remove; the command prints how). Deployed on cmux7s
-(store and writer) and cmux8s (node), 2026-09-24.
+
+The store may be colocated with the fleet controller when the controller owner approves that
+placement. Pass `--allow-coordinator` to make that production routing decision explicit. The
+compiler CAS remains a separate service on `:7450`; it must not reuse the controller's HTTP
+artifact-cache directory or its eviction policy. If its payload root is on an external SSD,
+prepare a separate APFS volume or sparsebundle and pass its mounted root to
+`--store-root /Volumes/<compiler-cas>`. The store data lives below that root at
+`fleet-store`. For a sparsebundle that must recover across reboot, also pass
+`--store-image /Volumes/<ssd>/<compiler-cas>.sparsebundle`. The rollout records the image,
+keeps the launch wrapper and store argument receipts on the boot volume, and lets the wrapper
+attach only that exact image with `hdiutil -owners on` before reading the store arguments,
+so fresh mounts honor the stored file ownership and permissions. Attachment is
+bounded to three attempts, then the service stops. APFS, the expected mount point, and the
+recorded volume UUID are checked after every start; a missing image, replacement volume, or
+non-empty stale mount point fails closed. The rollout never creates, formats, partitions, or
+searches for another volume. The root must be writable by the service user and retain the CAS
+store's atomic publication semantics. The writer remains the only trusted publisher, regardless
+of which host serves the store.
+`glaeda-fleet-cas uninstall [node|store|all] --apply` removes the selected services and
+keeps both node and fleet stores. The default scope is `all` for compatibility. Removing
+`store` leaves the reader node, its upstream environment and prewarm agent in place;
+removing `node` also removes the node environment and prewarm agent. A LaunchDaemon's
+plist needs root to remove; the command prints the exact role-scoped `launchctl bootout`
+and `rm` command without touching that plist. Deployed on cmux7s (store and writer) and
+cmux8s (node), 2026-09-24.
 
 ## When to switch
 

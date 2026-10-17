@@ -81,6 +81,10 @@ Resident state is acceleration and working state. It gains no independent source
 
 Hostile-work details live in [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md). Ownership, recovery, mutation, subprocess, and physical-experiment rules live in [`docs/AGENT_EXECUTION_SAFETY.md`](docs/AGENT_EXECUTION_SAFETY.md).
 
+For the CMUX Mac fleet, [`docs/FLEET_OPERATIONS.md`](docs/FLEET_OPERATIONS.md)
+is the operator front door. It maps the live cmuxterm-hq `fleet` commands to
+Glaeda's typed status, disk, runner, probe, and seed receipts.
+
 ## What Glaeda owns
 
 Glaeda owns the compute-side layer shared across workload families:
