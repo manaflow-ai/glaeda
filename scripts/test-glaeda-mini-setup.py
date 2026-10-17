@@ -681,6 +681,14 @@ class MiniSetupTest(unittest.TestCase):
                      "--reclaim-binary", os.fspath(self.reclaim), "--hygiene-only"])
         self.assertEqual(json.loads(out.getvalue())["blocking"], ["python"])
 
+    def test_existing_fleet_receipt_preserves_fleet_role_during_hygiene_upgrade(self) -> None:
+        receipt_path = self.home / ".local/state/glaeda/mini-setup/receipt.json"
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        receipt_path.write_text(json.dumps({"profile": "build-host", "role": "fleet-mini"}))
+        receipt = self.invoke("--hygiene-only", "--apply")
+        self.assertEqual(receipt["role"], "fleet-mini")
+        self.assertFalse((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.projects-tidy.plist").exists())
+
     def python_action(self, receipt: dict) -> dict:
         return next(a for a in receipt["actions"] if a["kind"] == "python")
 

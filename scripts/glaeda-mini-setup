@@ -1902,13 +1902,24 @@ def main(argv: list[str] | None = None) -> int:
         print("glaeda-mini-setup: macOS or Linux only", file=sys.stderr)
         return 2
     min_free_gib = args.min_free_gib if args.min_free_gib is not None else fleet.default_min_free_gib(HOST_PLATFORM)
-    role = args.role or ("devbox" if args.hygiene_only or HOST_PLATFORM == "linux" else "fleet-mini")
-    ctx = Context(Path(os.environ.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir), args.apply, args.python,
+    home = Path(os.environ.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir)
+    recorded_role = None
+    try:
+        prior = json.loads((home / ".local/state/glaeda/mini-setup/receipt.json").read_text())
+        if isinstance(prior, dict):
+            recorded_role = prior.get("role") if prior.get("role") in {"devbox", "fleet-mini"} else None
+            if recorded_role is None:
+                recorded_role = {"build-host": "fleet-mini", "hygiene": "devbox"}.get(prior.get("profile"))
+    except (OSError, ValueError, TypeError):
+        pass
+    role = args.role or recorded_role or ("devbox" if args.hygiene_only or HOST_PLATFORM == "linux" else "fleet-mini")
+    ctx = Context(home, args.apply, args.python,
                   args.skip_launchctl, args.reclaim_binary,
                   args.cmux_root.expanduser().resolve() if args.cmux_root else None,
                   args.glaeda.expanduser() if args.glaeda else None, args.xcode_app, min_free_gib,
                   args.hygiene_only or HOST_PLATFORM == "linux", ota_ring=args.ota_ring,
-                  ota_source=args.ota_source, role=role, role_explicit=args.role is not None,
+                  ota_source=args.ota_source, role=role,
+                  role_explicit=args.role is not None or recorded_role is not None,
                   headless=args.headless)
     pre = preflight(ctx)
     if ctx.hygiene_only:  # build-host checks are reported, not enforced
