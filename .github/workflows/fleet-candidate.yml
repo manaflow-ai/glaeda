@@ -8,6 +8,13 @@ on:
       - scripts/fleet_bundle.py
       - scripts/test-fleet-bundle.py
       - tests/fleet_bundle_contract.rs
+      - scripts/glaeda-disk
+      - scripts/test-glaeda-disk.py
+      - src/runner_log_reclaim.rs
+      - src/bin/glaeda-runner-log-reclaim.rs
+      - tests/runner_log_macos.rs
+      - Cargo.toml
+      - Cargo.lock
 
 permissions:
   contents: read
@@ -42,6 +49,17 @@ jobs:
             --output target/fleet-bundles > "$RUNNER_TEMP/fleet-candidate.json"
           cat "$RUNNER_TEMP/fleet-candidate.json" >> "$GITHUB_STEP_SUMMARY"
           cp "$RUNNER_TEMP/fleet-candidate.json" target/fleet-bundles/receipt.json
+      - name: Native runner-log integration (macOS)
+        if: matrix.target == 'aarch64-apple-darwin'
+        env:
+          CANDIDATE_TARGET: ${{ matrix.target }}
+        run: |
+          cargo build --locked --release --bin glaeda-runner-log-reclaim \
+            --target "$CANDIDATE_TARGET" --target-dir target/fleet-candidate-build
+          cargo test --locked --release --test runner_log_macos \
+            --target "$CANDIDATE_TARGET" --target-dir target/fleet-candidate-build -- --test-threads=1
+          cp "target/fleet-candidate-build/$CANDIDATE_TARGET/release/glaeda-runner-log-reclaim" \
+            target/fleet-bundles/glaeda-runner-log-reclaim
       - name: Upload candidate and receipt
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
