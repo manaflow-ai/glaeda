@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+"""Validate a report-only runner-log plan and its durable recovery handoff.
+
+The native observer and store intentionally have separate ownership boundaries.  This
+command joins their operator receipts without opening the store for recovery: it runs
+``glaeda-runner-log-reclaim`` in plan mode, then reads (never writes) the bounded journal
+under ``--state-root`` and reports the recovery disposition.  It never passes ``--apply``.
+
+Examples::
+
+    glaeda-runner-log-handoff \
+        --runner-root /path/to/actions-runner \
+        --enrollment-receipt /path/to/enrollment.json \
+        --state-root /path/to/state
+
+Use ``--observer`` in tests or when the reviewed binary is outside ``PATH``.  The default
+output is JSON; ``--output human`` emits a compact status line without private paths.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import shutil
+import stat
+import subprocess
+import sys
+from typing import Any
+
+
+SCHEMA_VERSION = 1
+MAX_RECEIPT_BYTES = 65_536
+MAX_JOURNAL_BYTES = 1 << 20
+MAX_ROW_BYTES = 16_384
+MAX_ROWS = 65_536
+PHASE_RANK = {"prepared": 1, "staged": 2, "delete_intent": 3, "projected": 4, "aborted": 4}
+PENDING_PHASES = {"prepared", "staged", "delete_intent"}
+
+
+class HandoffError(RuntimeError):
+    """A bounded report-only handoff check failed."""
+
+
+def _absolute_real(path: Path, label: str, *, must_exist: bool = True) -> Path:
+    if not path.is_absolute() or any(part in {".", ".."} for part in path.parts[1:]):
+        raise HandoffError(f"{label}_path_invalid")
+    if must_exist and not path.exists():
+        raise HandoffError(f"{label}_missing")
+    if path.is_symlink():
+        raise HandoffError(f"{label}_symlink")
+    if must_exist:
+        try:
+            if path.resolve(strict=True) != path:
+                raise HandoffError(f"{label}_not_canonical")
+        except OSError as exc:
+            raise HandoffError(f"{label}_unreadable") from exc
+    return path
+
+
+def _safe_executable(value: str) -> Path:
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        found = shutil.which(value)
+        if not found:
+            raise HandoffError("observer_not_found")
+        candidate = Path(found)
+    candidate = _absolute_real(candidate, "observer")
+    try:
+        metadata = candidate.stat()
+    except OSError as exc:
+        raise HandoffError("observer_unreadable") from exc
+    if not stat.S_ISREG(metadata.st_mode) or not os.access(candidate, os.X_OK):
+        raise HandoffError("observer_not_executable")
+    return candidate
+
+
+def _read_json(path: Path, limit: int, code: str) -> Any:
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise HandoffError(code) from exc
+    if len(data) > limit:
+        raise HandoffError(f"{code}_too_large")
+    try:
+        return json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HandoffError(f"{code}_invalid") from exc
+
+
+def _receipt(path: Path, runner_root: Path) -> dict[str, Any]:
+    value = _read_json(path, MAX_RECEIPT_BYTES, "enrollment_receipt")
+    if not isinstance(value, dict) or value.get("runnerDir") != os.fspath(runner_root):
+        raise HandoffError("enrollment_receipt_mismatch")
+    install_id = value.get("installId")
+    if not value.get("runnerDirOwned") or not isinstance(install_id, str) or not install_id:
+        raise HandoffError("enrollment_receipt_invalid")
+    return value
+
+
+def _device(metadata: os.stat_result) -> int:
+    # The Rust store narrows Darwin dev_t to u32; retaining that normalization keeps
+    # journal identity checks portable across macOS and Linux test fixtures.
+    return int(metadata.st_dev) & 0xFFFF_FFFF
+
+
+def _validate_state_root(path: Path, owner: int) -> bool:
+    if path.is_symlink():
+        raise HandoffError("state_root_symlink")
+    if not path.exists():
+        return False
+    _absolute_real(path, "state_root")
+    try:
+        metadata = path.stat()
+    except OSError as exc:
+        raise HandoffError("state_root_unreadable") from exc
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != owner or metadata.st_mode & 0o022:
+        raise HandoffError("state_root_unsafe")
+    return True
+
+
+def _validate_journal(path: Path, root: os.stat_result, install_id: str, owner: int) -> dict[str, Any]:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise HandoffError("journal_unreadable") from exc
+    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != owner or metadata.st_nlink != 1
+            or metadata.st_mode & 0o022 or metadata.st_size < 0 or metadata.st_size > MAX_JOURNAL_BYTES):
+        raise HandoffError("journal_unsafe")
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise HandoffError("journal_unreadable") from exc
+    try:
+        after = path.lstat()
+    except OSError as exc:
+        raise HandoffError("journal_unreadable") from exc
+    identity_before = (metadata.st_dev, metadata.st_ino, metadata.st_size,
+                       metadata.st_mtime_ns, metadata.st_ctime_ns)
+    identity_after = (after.st_dev, after.st_ino, after.st_size,
+                      after.st_mtime_ns, after.st_ctime_ns)
+    if identity_before != identity_after:
+        raise HandoffError("journal_changed")
+    if len(raw) > MAX_JOURNAL_BYTES:
+        raise HandoffError("journal_too_large")
+    pending: dict[str, tuple[int, dict[str, Any]]] = {}
+    seen: dict[str, tuple[int, dict[str, Any]]] = {}
+    journal_rows = 0
+    foreign_rows = 0
+    for line in raw.splitlines():
+        journal_rows += 1
+        if journal_rows > MAX_ROWS or len(line) > MAX_ROW_BYTES:
+            raise HandoffError("journal_too_large")
+        try:
+            row = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise HandoffError("journal_invalid") from exc
+        if not isinstance(row, dict):
+            raise HandoffError("journal_invalid")
+        tx_id = row.get("tx_id")
+        phase = row.get("phase")
+        if not isinstance(tx_id, str) or not tx_id or len(tx_id) > 1_024 or phase not in PHASE_RANK:
+            raise HandoffError("journal_invalid")
+        try:
+            row_root = (int(row["root_device"]), int(row["root_inode"]), int(row["root_uid"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise HandoffError("journal_invalid") from exc
+        if any(isinstance(row[key], bool) or not isinstance(row[key], int)
+               for key in ("root_device", "root_inode", "root_uid")):
+            raise HandoffError("journal_invalid")
+        if not isinstance(row.get("install_id"), str) or not row["install_id"] or len(row["install_id"]) > 128:
+            raise HandoffError("journal_invalid")
+        if row_root != (_device(root), int(root.st_ino), owner) or row.get("install_id") != install_id:
+            foreign_rows += 1
+            continue
+        relative = row.get("relative_path")
+        stage = row.get("stage_name")
+        identity = row.get("identity")
+        identity_fields = (
+            "device", "inode", "links", "size", "modified_seconds", "changed_seconds",
+            "modified_nanos", "changed_nanos",
+        )
+        if (not isinstance(relative, str) or not relative.startswith("_diag/")
+                or relative.count("/") != 1 or relative.endswith("/")
+                or relative.split("/", 1)[1] in {".", ".."} or "\x00" in relative
+                or not isinstance(stage, str) or not stage.startswith("_diag/.glaeda-reclaiming-")
+                or stage.count("/") != 1 or stage.split("/", 1)[1] in {".", ".."}
+                or "\x00" in stage or not isinstance(identity, dict)
+                or any(not isinstance(identity.get(key), int) or isinstance(identity.get(key), bool)
+                       for key in identity_fields)):
+            raise HandoffError("journal_invalid")
+        rank = PHASE_RANK[phase]
+        previous = seen.get(tx_id)
+        if previous is not None and (rank < previous[0] or (rank == previous[0] and row != previous[1])):
+            raise HandoffError("journal_phase_regression")
+        seen[tx_id] = (rank, row)
+        if phase in PENDING_PHASES:
+            pending[tx_id] = (rank, row)
+        else:
+            pending.pop(tx_id, None)
+    pending_phases = {row["phase"] for _, row in pending.values()}
+    if "prepared" in pending_phases:
+        disposition = "recovery_blocked_prepared"
+    elif pending:
+        disposition = "pending_recovery"
+    else:
+        disposition = "clean"
+    return {
+        "journal_present": True,
+        "journal_rows": journal_rows,
+        "foreign_rows": foreign_rows,
+        "pending_count": len(pending),
+        "pending_phases": sorted(pending_phases),
+        "recovery_disposition": disposition,
+    }
+
+
+def inspect_recovery(state_root: Path, runner_root: Path, receipt: dict[str, Any]) -> dict[str, Any]:
+    root = runner_root.lstat()
+    owner = int(root.st_uid)
+    present = _validate_state_root(state_root, owner)
+    if not present:
+        return {
+            "state_root_present": False,
+            "journal_present": False,
+            "journal_rows": 0,
+            "foreign_rows": 0,
+            "pending_count": 0,
+            "pending_phases": [],
+            "recovery_disposition": "clean",
+        }
+    journal = state_root / "journal.jsonl"
+    if journal.is_symlink():
+        raise HandoffError("journal_symlink")
+    if not journal.exists():
+        return {
+            "state_root_present": True,
+            "journal_present": False,
+            "journal_rows": 0,
+            "foreign_rows": 0,
+            "pending_count": 0,
+            "pending_phases": [],
+            "recovery_disposition": "clean",
+        }
+    result = _validate_journal(journal, root, str(receipt["installId"]), owner)
+    result["state_root_present"] = True
+    return result
+
+
+def _observer_report(args: argparse.Namespace, observer: Path) -> dict[str, Any]:
+    argv = [
+        os.fspath(observer),
+        "--runner-root", os.fspath(args.runner_root),
+        "--enrollment-receipt", os.fspath(args.enrollment_receipt),
+        "--minimum-idle-seconds", str(args.minimum_idle_seconds),
+        "--batch-size", str(args.batch_size),
+        "--output", "json",
+    ]
+    if args.state_root is not None:
+        argv.extend(["--state-root", os.fspath(args.state_root)])
+    try:
+        completed = subprocess.run(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise HandoffError("observer_unavailable") from exc
+    if len(completed.stdout) > MAX_JOURNAL_BYTES:
+        raise HandoffError("observer_output_too_large")
+    try:
+        report = json.loads(completed.stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HandoffError("observer_report_invalid") from exc
+    if not isinstance(report, dict) or report.get("operation") != "plan":
+        raise HandoffError("observer_not_report_only")
+    if completed.returncode != 0:
+        raise HandoffError("observer_failed")
+    observation = report.get("observation")
+    actions = report.get("actions")
+    if (not isinstance(observation, dict) or not isinstance(actions, list)
+            or len(actions) > 128
+            or not isinstance(observation.get("complete"), bool)
+            or (not isinstance(observation.get("eligible_count"), int)
+                or isinstance(observation.get("eligible_count"), bool))):
+        raise HandoffError("observer_report_invalid")
+    if report.get("errors"):
+        raise HandoffError("observer_report_errors")
+    for action in actions:
+        if (not isinstance(action, dict) or not isinstance(action.get("relative_path"), str)
+                or not isinstance(action.get("receipt_id"), str)
+                or not isinstance(action.get("decision"), str)):
+            raise HandoffError("observer_report_invalid")
+    return report
+
+
+def run(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
+    try:
+        runner_root = _absolute_real(args.runner_root, "runner_root")
+        receipt_path = _absolute_real(args.enrollment_receipt, "enrollment_receipt")
+        receipt = _receipt(receipt_path, runner_root)
+        observer = _safe_executable(args.observer)
+        report = _observer_report(args, observer)
+        recovery = inspect_recovery(args.state_root, runner_root, receipt) if args.state_root else {
+            "state_root_present": False,
+            "journal_present": False,
+            "journal_rows": 0,
+            "foreign_rows": 0,
+            "pending_count": 0,
+            "pending_phases": [],
+            "recovery_disposition": "state_root_not_requested",
+        }
+        result = {
+            "document_type": "glaeda-runner-log-handoff",
+            "schema_version": SCHEMA_VERSION,
+            "operation": "validate-plan",
+            "observation": {
+                "complete": report["observation"]["complete"],
+                "eligible_count": report["observation"]["eligible_count"],
+                "action_count": len(report["actions"]),
+                "observer_operation": report.get("operation"),
+            },
+            "actions": [
+                {
+                    "relative_path": action["relative_path"],
+                    "decision": action["decision"],
+                    "receipt_id": action["receipt_id"],
+                }
+                for action in report["actions"]
+            ],
+            "recovery": recovery,
+            "errors": [],
+        }
+        return 0, result
+    except HandoffError as exc:
+        return 1, {
+            "document_type": "glaeda-runner-log-handoff",
+            "schema_version": SCHEMA_VERSION,
+            "operation": "validate-plan",
+            "observation": {"complete": False, "eligible_count": 0, "action_count": 0},
+            "recovery": {"recovery_disposition": "unavailable"},
+            "errors": [str(exc)],
+        }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--runner-root", type=Path, required=True)
+    parser.add_argument("--enrollment-receipt", type=Path, required=True)
+    parser.add_argument("--state-root", type=Path)
+    parser.add_argument("--observer", default="glaeda-runner-log-reclaim")
+    parser.add_argument("--minimum-idle-seconds", type=int, default=3_600)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--output", choices=("json", "human"), default="json")
+    args = parser.parse_args()
+    code, result = run(args)
+    if args.output == "human":
+        recovery = result.get("recovery", {})
+        print(
+            "{} operation={} complete={} candidates={} pending={} disposition={} errors={}".format(
+                result["document_type"], result["operation"],
+                result["observation"].get("complete", False),
+                result["observation"].get("action_count", 0),
+                recovery.get("pending_count", 0),
+                recovery.get("recovery_disposition", "unavailable"),
+                len(result["errors"]),
+            )
+        )
+    else:
+        print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+    return code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
