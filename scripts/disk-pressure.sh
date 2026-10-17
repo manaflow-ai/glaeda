@@ -16,8 +16,7 @@ fi
 home="${HOME:?HOME is required}"
 python="${GLAEDA_PYTHON:-/opt/homebrew/bin/python3}"
 disk="${GLAEDA_DISK:-$home/.local/bin/glaeda-disk}"
-role_args=()
 if [[ -n "${GLAEDA_ROLE:-}" ]]; then
-  role_args=(--role "$GLAEDA_ROLE")
+  exec "$python" "$disk" --role "$GLAEDA_ROLE" --pressure --idle --apply --top 0
 fi
-exec "$python" "$disk" "${role_args[@]}" --pressure --idle --apply --top 0
+exec "$python" "$disk" --pressure --idle --apply --top 0
