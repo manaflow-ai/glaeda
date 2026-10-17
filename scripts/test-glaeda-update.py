@@ -40,7 +40,7 @@ if "--help" in sys.argv:
 bin_dir = Path(os.environ["GLAEDA_TEST_BIN"])
 bin_dir.mkdir(parents=True, exist_ok=True)
 code = int(Path(__file__).with_name("health-code").read_text())
-for name in ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-worktree-reclaim", "glaeda-update", "glaeda-gh"):
+for name in ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-worktree-reclaim", "glaeda-runner-log-reclaim", "glaeda-update", "glaeda-gh"):
     tool = bin_dir / name
     tool.write_text("#!/usr/bin/env python3\\nimport sys\\nprint('{\\\"result\\\": \\\"plan\\\"}')\\nsys.exit(%d)\\n" % code)
     tool.chmod(0o755)
@@ -112,6 +112,11 @@ class Server:
 
 
 class UpdateTest(unittest.TestCase):
+
+    def test_setup_command_passes_native_runner_log_binary(self) -> None:
+        argv = gu.setup_command(Path("/tmp/generation"), [])
+        self.assertEqual(argv[-2:], ["--runner-log-binary", "/tmp/generation/bin/glaeda-runner-log-reclaim"])
+
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
@@ -533,13 +538,16 @@ class ReleaseTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             reclaim = Path(tmp) / "reclaim"
             reclaim.write_bytes(b"\x7fELF")
-            raw = gr.hygiene_archive(ROOT, head, reclaim)
-            self.assertEqual(raw, gr.hygiene_archive(ROOT, head, reclaim))  # reproducible bytes
+            native = Path(tmp) / "native"
+            native.write_bytes(b"native-helper")
+            raw = gr.hygiene_archive(ROOT, head, reclaim, native)
+            self.assertEqual(raw, gr.hygiene_archive(ROOT, head, reclaim, native))  # reproducible bytes
             with tarfile.open(fileobj=io.BytesIO(raw)) as tar:
                 names = set(tar.getnames())
                 setup = tar.getmember("glaeda/scripts/glaeda-mini-setup")
                 self.assertTrue(setup.mode & 0o111)
                 self.assertEqual(tar.extractfile("bin/glaeda-worktree-reclaim").read(), b"\x7fELF")
+                self.assertEqual(tar.extractfile("bin/glaeda-runner-log-reclaim").read(), b"native-helper")
                 self.assertEqual(tar.extractfile(gr.ANCESTRY).read().decode().split()[0], head)
                 history = json.loads(tar.extractfile(gr.HOOK_HISTORY).read())
                 hook_now = gr.sha256((ROOT / "scripts/glaeda-cmux-runner-hook").read_bytes())
@@ -551,6 +559,9 @@ class ReleaseTest(unittest.TestCase):
             archive.write_bytes(raw)
             gu.safe_extract(archive, Path(tmp) / "out")
             self.assertTrue((Path(tmp) / "out/glaeda/scripts/glaeda_release.py").is_file())
+            extracted_native = Path(tmp) / "out/bin/glaeda-runner-log-reclaim"
+            self.assertEqual(extracted_native.read_bytes(), b"native-helper")
+            self.assertTrue(extracted_native.stat().st_mode & 0o111)
 
 
 if __name__ == "__main__":

@@ -65,6 +65,21 @@ jobs:
             --target "$CANDIDATE_TARGET" --target-dir target/fleet-candidate-build -- --test-threads=1
           cp "target/fleet-candidate-build/$CANDIDATE_TARGET/release/glaeda-runner-log-reclaim" \
             target/fleet-bundles/glaeda-runner-log-reclaim
+          binary_sha256=$(shasum -a 256 target/fleet-bundles/glaeda-runner-log-reclaim | awk '{print $1}')
+          cat > target/fleet-bundles/glaeda-runner-log-reclaim.receipt.json <<EOF
+          {
+            "document_type": "glaeda-runner-log-reclaim-build-receipt",
+            "schema_version": 1,
+            "requested_pr_head": "${{ github.event.pull_request.head.sha || github.sha }}",
+            "checked_out_commit": "$(git rev-parse HEAD)",
+            "checked_out_tree": "$(git rev-parse HEAD^{tree})",
+            "target": "$CANDIDATE_TARGET",
+            "toolchain": "rust-1.97.1",
+            "binary_sha256": "$binary_sha256",
+            "test_command": "cargo test --locked --release --test runner_log_macos --target $CANDIDATE_TARGET -- --test-threads=1",
+            "test_outcome": "success"
+          }
+          EOF
       - name: Upload candidate and receipt
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:

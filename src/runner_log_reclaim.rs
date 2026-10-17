@@ -116,7 +116,7 @@ impl ProcessEvidence {
     #[cfg(test)]
     pub(crate) fn test_complete() -> Self {
         Self {
-            uid: 501,
+            uid: rustix::process::geteuid().as_raw(),
             in_scope_pids_seen: 1,
             in_scope_pids_complete: true,
             unreadable_in_scope_pids: 0,

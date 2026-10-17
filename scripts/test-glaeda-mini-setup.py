@@ -529,6 +529,33 @@ class MiniSetupTest(unittest.TestCase):
         self.assertEqual(act["state"], "blocked")
         self.assertFalse(receipt["ready"])
 
+    def test_runner_log_prebuilt_is_installed_with_dedicated_agent(self) -> None:
+        native = Path(self.tmp.name) / "glaeda-runner-log-reclaim"
+        native.write_bytes(b"native fixture\n")
+        native.chmod(0o755)
+        receipt = self.invoke("--apply", "--runner-log-binary", os.fspath(native))
+        installed = self.home / ".local/bin/glaeda-runner-log-reclaim"
+        self.assertEqual(installed.read_bytes(), native.read_bytes())
+        action = next(a for a in receipt["actions"] if a.get("path") == os.fspath(installed))
+        self.assertEqual(action["state"], "create")
+        plist = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.runner-log-reclaim.plist").read_bytes())
+        self.assertEqual(plist["ProgramArguments"][1:3], [os.fspath(self.home / ".local/bin/glaeda-disk"), "runner-log-reclaim"])
+
+    def test_linux_does_not_install_native_runner_log_helper(self) -> None:
+        self.linux()
+        receipt = self.invoke("--apply")
+        self.assertFalse((self.home / ".local/bin/glaeda-runner-log-reclaim").exists())
+        self.assertFalse(any(a.get("path", "").endswith("glaeda-runner-log-reclaim") and a["state"] in {"create", "update"}
+                           for a in receipt["actions"]))
+
+    def test_missing_native_helper_keeps_runner_log_agent_disabled(self) -> None:
+        receipt = self.invoke("--apply")
+        self.assertFalse((self.home / ".local/bin/glaeda-runner-log-reclaim").exists())
+        self.assertFalse((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.runner-log-reclaim.plist").exists())
+        action = next(a for a in receipt["actions"]
+                      if a.get("label") == "com.teamleaderleo.glaeda.runner-log-reclaim")
+        self.assertEqual(action["state"], "unchanged")
+
     def test_uninstall_without_receipt_removes_nothing(self) -> None:
         self.invoke("--apply")
         (self.home / ".local/state/glaeda/mini-setup/receipt.json").unlink()
