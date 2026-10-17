@@ -438,18 +438,19 @@ fn observe_processes(root: &Path, uid: u32) -> Result<ProcessEvidence, ReclaimEr
         // Bind the busy decision to the same PID birth identity as the final
         // process check. A same-birth exec can otherwise change its executable
         // after the first path read and evade the worker veto.
-        if busy.contains(pid) {
-            match libproc::libproc::proc_pid::pidpath(*pid as i32) {
-                Ok(path) if worker_path.as_path() == Path::new(&path) => {}
-                Ok(_) => {
-                    busy.remove(pid);
+        match libproc::libproc::proc_pid::pidpath(*pid as i32) {
+            Ok(path) if worker_path.as_path() == Path::new(&path) => {
+                busy.insert(*pid);
+            }
+            Ok(_) => {
+                if busy.remove(pid) {
                     errors.insert("pid_path_changed");
                 }
-                Err(_) => {
-                    busy.remove(pid);
-                    failed.insert(*pid);
-                    errors.insert("pid_path_unreadable");
-                }
+            }
+            Err(_) => {
+                busy.remove(pid);
+                failed.insert(*pid);
+                errors.insert("pid_path_unreadable");
             }
         }
     }
