@@ -108,8 +108,10 @@ fn libproc_worker_busy_and_open_identity_are_independent() {
             "{independent:?}"
         );
     }
-    assert!(worker.0.try_wait().unwrap().is_none());
-    drop(worker); // kill + wait: subsequent open-file checks cannot pass through the busy guard.
+    // The managed runner may reap an ad hoc child between observations. The
+    // first plan already proved the live Worker veto; drop the guard before
+    // the independent held-FD checks so that they cannot be masked by it.
+    drop(worker);
 
     let held = File::open(&first_log).unwrap();
     let open = observe(&first, &first_receipt, policy).unwrap();
