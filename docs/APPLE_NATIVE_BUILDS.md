@@ -67,6 +67,26 @@ Package resolution, compilation, bundling, and signing inside a project helper
 are not yet separately instrumented. Use these measurements to establish whether
 the next improvement belongs in Glaeda admission or the native workflow.
 
+## Validate a fleet observer receipt
+
+The fleet candidate workflow writes `glaeda-runner-log-reclaim.receipt.json` beside
+the staged observer binary. Validate the receipt against the exact checkout and
+binary with one bounded, read-only command:
+
+```sh
+python3 scripts/validate-native-receipt.py \
+  target/fleet-bundles/glaeda-runner-log-reclaim.receipt.json \
+  --git-root . \
+  --binary target/fleet-bundles/glaeda-runner-log-reclaim
+```
+
+The command requires schema version 1, the complete observer test target list, a
+successful test outcome, and matching commit/tree and SHA-256 identities. Use
+`--requested-head <sha>` when checking that a pull-request head is the requested
+one, or `--allow-failed-tests` when inspecting a diagnostic artifact from a failed
+native test. It prints only a bounded identity summary and never grants build,
+store, or deployment authority.
+
 ## Submit work and wake a worker
 
 After a first managed run has initialized the project’s owned state:
