@@ -440,7 +440,7 @@ fn observe_processes(root: &Path, uid: u32) -> Result<ProcessEvidence, ReclaimEr
         // after the first path read and evade the worker veto.
         if busy.contains(pid) {
             match libproc::libproc::proc_pid::pidpath(*pid as i32) {
-                Ok(path) if worker_path.as_deref() == Some(Path::new(&path)) => {}
+                Ok(path) if worker_path.as_path() == Path::new(&path) => {}
                 Ok(_) => {
                     busy.remove(pid);
                     errors.insert("pid_path_changed");
