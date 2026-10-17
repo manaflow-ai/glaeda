@@ -416,6 +416,7 @@ impl RunnerLogStore {
         if !FileType::from_raw_mode(stat.st_mode).is_file()
             || stat.st_nlink as u64 != 1
             || stat.st_uid != self.root_uid
+            || stat.st_mode & 0o022 != 0
             || !stat_matches_staged(stat, identity)
             || now_seconds()?.saturating_sub(stat.st_mtime) < policy.minimum_idle_seconds
         {
@@ -1029,6 +1030,43 @@ mod tests {
             .unwrap();
         assert_eq!(closed.confirmed_deleted, 1);
         assert!(!staged.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_refuses_writable_staged_file() {
+        let (root, receipt, _identity) = fixture();
+        let staged = root.join("runner/_diag/.glaeda-reclaiming-mode");
+        fs::rename(root.join("runner/_diag/old.log"), &staged).unwrap();
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o664)).unwrap();
+        let staged_fd = rfs::open(&staged, READ_FILE_FLAGS, Mode::empty()).unwrap();
+        let staged_identity =
+            identity_from_stat(&rfs::fstat(&staged_fd).unwrap()).expect("staged identity");
+        let mut store =
+            RunnerLogStore::open(&root.join("runner"), &receipt, &root.join("state")).unwrap();
+        append_row(
+            &store.state,
+            &store.journal_row(
+                "mode",
+                "staged",
+                "_diag/old.log",
+                "_diag/.glaeda-reclaiming-mode",
+                staged_identity,
+            ),
+        )
+        .unwrap();
+        let result = store.recover(
+            Policy {
+                minimum_idle_seconds: MIN_IDLE_SECONDS,
+                batch_size: 1,
+            },
+            || Ok(ProcessEvidence::test_complete()),
+        );
+        assert!(matches!(
+            result,
+            Err(StoreError::Invalid("staged_identity_changed"))
+        ));
+        assert!(staged.exists());
         fs::remove_dir_all(root).unwrap();
     }
 
