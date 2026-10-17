@@ -9,6 +9,15 @@ use glaeda::runner_log_reclaim::{
     reclaim,
 };
 
+struct ChildGuard(std::process::Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 fn fixture(root: &Path, id: &str) -> RunnerEnrollmentReceipt {
     fs::create_dir_all(root.join("_diag")).expect("diag");
     fs::write(root.join(".glaeda-cmux-runner"), format!("{id}\n")).expect("marker");
@@ -58,12 +67,13 @@ fn libproc_open_identity_survives_same_volume_stage_and_second_runner_is_indepen
         .status()
         .expect("codesign worker");
     assert!(signed.success());
-    let mut worker = std::process::Command::new(&worker_path)
-        .arg("5")
+    let worker = std::process::Command::new(&worker_path)
+        .arg("300")
         .current_dir(&base)
         .spawn()
         .expect("runner worker");
-    assert!(worker.try_wait().expect("worker status").is_none());
+    let mut worker = ChildGuard(worker);
+    assert!(worker.0.try_wait().expect("worker status").is_none());
     let policy = Policy::new(MIN_RUNNER_LOG_RECLAIM_IDLE_SECONDS, 4).expect("policy");
     let first_plan = reclaim(&first, &first_receipt, policy, None, false).expect("first plan");
     assert_eq!(
@@ -81,9 +91,7 @@ fn libproc_open_identity_survives_same_volume_stage_and_second_runner_is_indepen
     let staged_plan = observe(&first, &first_receipt, policy).expect("staged observation");
     assert_eq!(staged_plan.items[0].decision, ItemDecision::OpenOrBusy);
     fs::rename(&staged, &first_log).expect("restore");
-    assert!(worker.try_wait().expect("worker status").is_none());
-    let _ = worker.kill();
-    let _ = worker.wait();
+    assert!(worker.0.try_wait().expect("worker status").is_none());
     drop(held);
     let second_apply = reclaim(&second, &second_receipt, policy, None, true).expect("apply report");
     assert!(

@@ -476,6 +476,8 @@ fn enumerate_diag(
         let id = identity(&metadata);
         let (decision, reason) = if preserved_path(path.strip_prefix(root).unwrap_or(&path)) {
             (ItemDecision::PreservedScope, "protected_scope")
+        } else if process.busy_processes_observed > 0 {
+            (ItemDecision::OpenOrBusy, "runner_process_busy")
         } else if process.open_identities.contains(&OpenIdentity {
             device: id.device,
             inode: id.inode,
