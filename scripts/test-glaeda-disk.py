@@ -2830,6 +2830,16 @@ class ProcEvidenceTest(unittest.TestCase):
         self.assertTrue(cmds.strip())
 
 
+@unittest.skipUnless(sys.platform == "darwin", "tests the macOS lsof path")
+class MacProcessEvidenceTest(unittest.TestCase):
+    def test_lsof_output_is_parsed_as_owned_query_text(self) -> None:
+        with mock.patch.object(gd, "_owned_query", side_effect=[(0, "p123\nn/Users/cmux/cache\n"),
+                                                                    (0, "launchd\n")]):
+            opened, commands = gd.process_evidence()
+        self.assertEqual(opened, ["/Users/cmux/cache"])
+        self.assertEqual(commands, "launchd\n")
+
+
 @unittest.skipUnless(sys.platform == "darwin", "APFS clones are macOS only")
 class DedupeTest(unittest.TestCase):
     def setUp(self) -> None:

@@ -1985,9 +1985,9 @@ def process_evidence() -> tuple[list[str], str]:
             raise NoEvidence(f"lsof: {e}") from e
         if code != 0:
             raise NoEvidence(f"lsof failed (exit {code})")
-        opened = [line[1:] for line in out.stdout.splitlines() if line.startswith("n/")]
+        opened = [line[1:] for line in out.splitlines() if line.startswith("n/")]
         if not opened:
-            raise NoEvidence(f"lsof returned nothing (exit {out.returncode})")
+            raise NoEvidence(f"lsof returned nothing (exit {code})")
     try:
         ps_code, ps_out = _owned_query(["ps", "-axww", "-o", "command="], 60)
     except (OSError, subprocess.TimeoutExpired) as e:
