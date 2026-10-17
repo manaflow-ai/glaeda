@@ -20,3 +20,13 @@ child. Apply re-collects process evidence immediately before each rename. The
 family never deletes a whole runner root or source checkout. Use the normal
 `glaeda-disk` report first; `--apply` writes the standard JSONL receipt and
 rechecks every candidate.
+
+The ordinary `--dedupe` pass visits only reusable package/module/SDK inputs. Build
+output is write-heavy, so it is excluded from the periodic WatchPaths agent. An
+operator may opt into the narrower `--dedupe --dedupe-builds` pass after the roots
+are inactive. It scans only each validated top-level `Products` directory; the
+write-heavy `Build` tree remains excluded. It waits at least 15 minutes after the
+last file mtime and re-collects process evidence before every APFS clone. A process,
+socket, lease/lock marker, unknown state child, or unavailable `lsof`/`ps` evidence
+refuses that clone. APFS copy-on-write keeps later compiler writes private to the
+path that performs them; the command never hardlinks build outputs.

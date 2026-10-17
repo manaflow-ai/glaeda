@@ -11,6 +11,8 @@
     glaeda-disk --refresh           re-measure every size now instead of using the snapshot
     glaeda-disk --dedupe            store identical Xcode package/module files once (APFS clones), in
                                     Xcode's DerivedData and the cmux-next workflow's per-runner copies
+    glaeda-disk --dedupe --dedupe-builds
+                                    additionally clone identical files in inactive cmux-next Products trees
     glaeda-disk --runner-caches     use only the enrolled runner-account cache allowlist
 
 Parallel sessions each keep a full DerivedData, and its SourcePackages artifacts and module
@@ -402,6 +404,14 @@ CMUX_NEXT_CI_GENERATED_NAMES = frozenset({
 CMUX_NEXT_CI_ACTIVITY_MARKERS = frozenset({
     ".cmux-active", ".build.active", ".lock", "lease.json", "reservation.json",
 })
+# Build output is write-heavy while a job is running.  It is therefore never part of
+# the ordinary cache dedupe pass (which runs from a WatchPaths LaunchAgent).  The
+# explicit --dedupe-builds pass below can include sealed Products directories after a state-root
+# idle/ownership check.  Keep a floor even when the caller asks for no settle delay: a
+# completed Xcode command can update a file just after its last write, and this pass is
+# deliberately best-effort rather than a build synchronisation primitive.
+CMUX_NEXT_CI_DEDUPE_SETTLE_MINUTES = 15.0
+CMUX_NEXT_CI_DEDUPE_DIR_NAMES = frozenset({"Products"})
 
 
 def fleet_families(ci: Path | None = None) -> list[Family]:
@@ -1206,7 +1216,7 @@ def default_families() -> list[Family]:
         Family("projects", projects, False, "checkouts (report only)",
                skip=tuple(r.name for r in wt_roots), platform="shared"),
     ]
-    cmux_next_ci = HOME / "Library/Caches/cmux-next-ci"
+    cmux_next_ci = HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT
     if DARWIN and cmux_next_ci.is_dir():
         fams.append(cmux_next_ci_family(cmux_next_ci))
     user_tmp = darwin_user_tmp() if DARWIN else None
@@ -1312,7 +1322,7 @@ def runner_cache_families() -> list[Family]:
                skip=("index.json", "manifest.json", "state.json", ".metadata_never_index", ".lock"),
                owner="cmux CUA", rebuild_minutes=1, min_idle_hours=168.0, platform="macos"),
     ]
-    if (HOME / "Library/Caches/cmux-next-ci").is_dir():
+    if (HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT).is_dir():
         roots.append(replace(cmux_next_ci_family(), min_idle_hours=168.0))
     return [f for f in roots if f.root.is_dir()]
 
@@ -4165,7 +4175,7 @@ def cmux_next_ci_dirs(home: Path | None = None) -> list[Path]:
     """The cmux-next workflow's DerivedData, one per runner: ~/Library/Caches/cmux-next-ci/<scheme>/<runner>.
     Each runner keeps its own copy of the same SourcePackages and module caches (3.9 GiB, three times on
     every mini, 2026-10-11), so each <scheme> directory is a dedupe base like Xcode's DerivedData."""
-    root = (HOME if home is None else home) / "Library/Caches/cmux-next-ci"
+    root = (HOME if home is None else home) / "Library/Caches" / CMUX_NEXT_CI_ROOT
     if not root.is_dir() or root.is_symlink():
         return []
     return [d for d in _children(root) if d.is_dir() and not d.is_symlink()]
@@ -4218,7 +4228,7 @@ def cmux_next_ci_generated_paths(root: Path) -> list[Path]:
 
 def cmux_next_ci_family(root: Path | None = None) -> Family:
     """Reclaim old generated cmux-next CI output while preserving reusable inputs."""
-    root = (HOME / "Library/Caches/cmux-next-ci") if root is None else root
+    root = (HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT) if root is None else root
     return Family(CMUX_NEXT_CI_FAMILY, root, True,
                   "the cmux-next workflow rebuilds generated DerivedData output",
                   checkout_builds=True, build_output=True,
@@ -4235,6 +4245,25 @@ def cmux_next_ci_state_for(path: Path, root: Path) -> Path | None:
                 return state
         except OSError:
             continue
+    return None
+
+
+def cmux_next_ci_state_for_path(path: Path, root: Path) -> Path | None:
+    """Return the validated state root containing any descendant of ``path``.
+
+    ``cmux_next_ci_state_for`` intentionally accepts only a generated child (the
+    retention family calls it immediately before deleting that child).  Dedupe walks
+    files below ``Products`` and needs the corresponding state root for each file, so it
+    uses this descendant form.  The same validated layout and symlink exclusions are
+    retained; an arbitrary path under the cache never becomes eligible.
+    """
+    path = Path(path)
+    for state in cmux_next_ci_state_roots(root):
+        try:
+            path.relative_to(state)
+        except ValueError:
+            continue
+        return state
     return None
 
 
@@ -4266,6 +4295,79 @@ def cmux_next_ci_busy(fam: Family, path: Path, opened: list[str] | frozenset[str
     if unknown:
         return "cmux-next state has unknown children: " + ", ".join(sorted(unknown)[:4])
     return ""
+
+
+def cmux_next_ci_dedupe_roots(root: Path) -> list[Path]:
+    """Return generated cmux-next trees eligible for the opt-in clone pass.
+
+    This is deliberately separate from :func:`dedupe_roots`: the normal pass is
+    allowed to run while Xcode is active and only visits reusable input caches.  Build
+    output is write-heavy and remains excluded; only sealed top-level ``Products``
+    output is included by ``--dedupe-builds`` after the guard below proves the
+    containing state root is idle and fully understood.
+    """
+    found: list[Path] = []
+    for state in cmux_next_ci_state_roots(root):
+        for child in _children(state):
+            if child.name not in CMUX_NEXT_CI_DEDUPE_DIR_NAMES or child.is_symlink():
+                continue
+            if child.is_dir():
+                found.append(child)
+    return found
+
+
+def cmux_next_ci_dedupe_guard(root: Path):
+    """Return a fresh, fail-closed guard for one cmux-next clone operation.
+
+    APFS clones are copy-on-write, so a later compiler write cannot corrupt another
+    path's bytes.  The unsafe part is replacing a path while a job is using its state
+    root, has a lock/socket there, or has introduced an unknown child.  Recollect
+    process evidence for each canonical/target pair instead of trusting the initial
+    walk.  If lsof/ps cannot provide evidence, the guard refuses the clone.
+    """
+    fam = cmux_next_ci_family(root)
+    # A duplicate pair gets one lsof/ps snapshot for both paths.  dedupe() calls
+    # the guard for canonical then target in that order; consuming the snapshot on
+    # the second call avoids paying for two full lsof walks per clone while still
+    # taking fresh evidence for every atomic swap.
+    pending_evidence = None
+    pending_path = None
+
+    def allowed(path: str | Path) -> bool:
+        nonlocal pending_evidence, pending_path
+        path = Path(path)
+        state = cmux_next_ci_state_for_path(path, root)
+        if state is None:
+            return False
+        # cmux_next_ci_busy expects the generated child, not a file several levels
+        # below it.  The first component below the state is deterministic because the
+        # roots came from cmux_next_ci_dedupe_roots above.
+        try:
+            child_name = path.relative_to(state).parts[0]
+        except (ValueError, IndexError):
+            return False
+        child = state / child_name
+        if child.name not in CMUX_NEXT_CI_DEDUPE_DIR_NAMES or not child.is_dir():
+            return False
+        if pending_evidence is None or pending_path is None:
+            try:
+                opened, commands = process_evidence()
+            except NoEvidence:
+                return False
+            pending_evidence = (open_index(opened), commands)
+            pending_path = path
+        else:
+            opened, commands = pending_evidence
+            pending_evidence = None
+            pending_path = None
+        # Lease/reservation paths are decision evidence, not a long-lived cache:
+        # invalidate the bounded read-only snapshot before this pair's check.
+        _LIVE_REFERENCES.pop(os.fspath(FLEET_ROOT), None)
+        if artifact_referenced(state, live_artifact_references(FLEET_ROOT)):
+            return False
+        return not cmux_next_ci_busy(fam, child, opened, commands)
+
+    return allowed
 
 
 def dedupe_roots(derived_data: Path) -> list[Path]:
@@ -4319,8 +4421,16 @@ def clone_over(canonical: str, target: str, expect: list[int],
 
 
 def dedupe(roots: list[Path], state_path: Path = DEDUPE_STATE,
-           min_bytes: int = DEDUPE_MIN_BYTES, settle_s: float = 0) -> dict[str, int]:
-    """Clone-dedupe identical files. Files modified within settle_s are left for a later run."""
+           min_bytes: int = DEDUPE_MIN_BYTES, settle_s: float = 0,
+           guard=None) -> dict[str, int]:
+    """Clone-dedupe identical files.
+
+    ``guard`` is an optional fresh safety check used for write-heavy trees.  It is
+    called immediately before hashing a target/canonical pair is replaced and must
+    return true for both paths.  A guard failure is a refusal, not a reason to fall
+    back to a weaker cache policy.  Files modified within ``settle_s`` are left for a
+    later run.
+    """
     try:
         state: dict[str, dict] = json.loads(state_path.read_text())
     except (OSError, ValueError):
@@ -4374,6 +4484,23 @@ def dedupe(roots: list[Path], state_path: Path = DEDUPE_STATE,
         for target in paths[1:]:
             if new_state[target]["cloned"]:
                 continue
+            # Recheck both sides immediately before the atomic swap.  The canonical
+            # file may itself have become busy since the hash walk, and a target may
+            # have been adopted by a newly-started job.  clone_over's inode/mtime
+            # checks remain the final content race protection.
+            if guard is not None:
+                try:
+                    # Evaluate both calls even when canonical is refused so a guard
+                    # that batches one process-evidence snapshot per pair can clear
+                    # its pending snapshot before the next pair.
+                    canonical_ok = guard(canonical)
+                    target_ok = guard(target)
+                    if not canonical_ok or not target_ok:
+                        refused += 1
+                        continue
+                except (OSError, ValueError):
+                    refused += 1
+                    continue
             try:
                 ok = clone_over(canonical, target, files[target], files[canonical])
                 if ok:
@@ -4434,6 +4561,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--dedupe", action="store_true",
                     help="clone-dedupe identical Xcode package and module-cache files, then exit")
+    ap.add_argument("--dedupe-builds", action="store_true",
+                    help="also clone-dedupe inactive cmux-next Products trees (APFS/macOS only)")
     ap.add_argument("--settle-minutes", type=float, default=0,
                     help="with --dedupe: skip files changed this recently, wait and retry (up to 3 passes)")
     ap.add_argument("--refresh", action="store_true", help="re-measure all sizes now")
@@ -4482,22 +4611,43 @@ def main(argv: list[str] | None = None) -> int:
     if RUNNER_CACHE_PROFILE and not runner_profile_roots_safe(fams):
         print("runner cache profile roots are not safe; skipped")
         return 0
-    if a.dedupe:
+    if a.dedupe or a.dedupe_builds:
         dd = next((f.root for f in fams if f.id == "xcode-derived-data"), None)
-        bases = ([dd] if dd is not None else []) + (cmux_next_ci_dirs() if not RUNNER_CACHE_PROFILE else [])
+        ci_root = HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT
+        ci_dirs = cmux_next_ci_dirs() if not RUNNER_CACHE_PROFILE else []
+        bases = ([dd] if dd is not None else []) + ci_dirs
         if not bases or not DARWIN:
             print("nothing to dedupe (APFS clones of Xcode DerivedData are macOS only)")
             return 0
+        input_roots = [r for b in bases for r in dedupe_roots(b)]
+        passes = [(input_roots, DEDUPE_STATE, a.settle_minutes * 60, None)]
+        if a.dedupe_builds:
+            # Sealed Products output is opt-in because the normal LaunchAgent can run
+            # while a job is compiling.  Top-level Build remains excluded.  Only
+            # validated Products trees are admitted, and the per-clone guard rechecks
+            # process/lease/lock/socket/unknown-child state.
+            build_roots = cmux_next_ci_dedupe_roots(ci_root)
+            if build_roots:
+                build_state = DEDUPE_STATE.with_name("dedupe-builds.json")
+                passes.append((build_roots, build_state,
+                               max(a.settle_minutes * 60,
+                                   CMUX_NEXT_CI_DEDUPE_SETTLE_MINUTES * 60),
+                               cmux_next_ci_dedupe_guard(ci_root)))
         before, _ = free_bytes(bases[0])
         started = time.time()
         for attempt in range(3):
-            r = dedupe([r for b in bases for r in dedupe_roots(b)], DEDUPE_STATE, settle_s=a.settle_minutes * 60)
+            totals = {"files": 0, "hashed_bytes": 0, "cloned_bytes": 0,
+                      "refused": 0, "young": 0}
+            for roots, state_path, settle_s, guard in passes:
+                r = dedupe(roots, state_path, settle_s=settle_s, guard=guard)
+                for key in totals:
+                    totals[key] += r[key]
             after, _ = free_bytes(bases[0])
-            print(f"dedupe: {r['files']} files >= 1 MiB, hashed {gib(r['hashed_bytes']).strip()}, "
-                  f"cloned {gib(r['cloned_bytes']).strip()}, refused {r['refused']}, "
-                  f"still settling {r['young']}, free {gib(before).strip()} -> {gib(after).strip()} "
+            print(f"dedupe: {totals['files']} files >= 1 MiB, hashed {gib(totals['hashed_bytes']).strip()}, "
+                  f"cloned {gib(totals['cloned_bytes']).strip()}, refused {totals['refused']}, "
+                  f"still settling {totals['young']}, free {gib(before).strip()} -> {gib(after).strip()} "
                   f"in {time.time() - started:.0f}s", flush=True)
-            if not r["young"] or attempt == 2:
+            if not totals["young"] or attempt == 2:
                 break
             time.sleep(a.settle_minutes * 60)
         return 0

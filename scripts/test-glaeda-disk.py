@@ -1376,6 +1376,16 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(got[recent].verdict, "in-use")
         self.assertIn("active or ambiguous marker", got[recent].reasons[0])
 
+    def test_cmux_next_ci_idle_floor_survives_pressure_mode(self) -> None:
+        root = self.root / "Library/Caches/cmux-next-ci"
+        build = make(root / "cmux-scheme/runner-a/Build", age_hours=48)
+        fam = gd.cmux_next_ci_family(root)
+        with mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            got = gd.survey([fam], 0, 0)
+        self.assertEqual(got[0].path, str(build))
+        self.assertEqual(got[0].verdict, "recent")
+
     def test_cmux_next_ci_apply_rechecks_process_and_marker(self) -> None:
         root = self.root / "Library/Caches/cmux-next-ci"
         state = root / "cmux-scheme/runner-a"
@@ -1391,6 +1401,31 @@ class GlaedaDiskTest(unittest.TestCase):
             gd.apply(items, {fam.id: fam}, receipt, None, 24)
         self.assertTrue(build.exists())
         self.assertIn("changed:in-use", receipt.read_text())
+
+    def test_cmux_next_ci_products_dedupe_guard_fails_closed_on_marker(self) -> None:
+        root = self.root / "Library/Caches/cmux-next-ci"
+        state = root / "cmux-scheme/runner-a"
+        products = make(state / "Products", age_hours=96)
+        guard = gd.cmux_next_ci_dedupe_guard(root)
+        self.assertTrue(guard(products / "blob"))
+        (state / ".lock").write_text("")
+        self.assertFalse(guard(products / "blob"))
+        (state / ".lock").unlink()
+        with mock.patch.object(gd, "live_artifact_references", return_value=frozenset({str(state)})):
+            self.assertFalse(guard(products / "blob"))
+        no_evidence_guard = gd.cmux_next_ci_dedupe_guard(root)
+        with mock.patch.object(gd, "process_evidence", side_effect=gd.NoEvidence("unavailable")):
+            self.assertFalse(no_evidence_guard(products / "blob"))
+
+    def test_cmux_next_ci_products_dedupe_roots_are_sealed_dirs_only(self) -> None:
+        root = self.root / "Library/Caches/cmux-next-ci"
+        state = root / "cmux-scheme/runner-a"
+        products = make(state / "Products", age_hours=96)
+        build = make(state / "Build", age_hours=96)
+        (state / "Logs").mkdir(parents=True)
+        (state / "SourcePackages").mkdir()
+        (state / "unknown").mkdir()
+        self.assertEqual(gd.cmux_next_ci_dedupe_roots(root), [products])
 
     def test_fleet_ci_hot_tier(self) -> None:
         ci = self.root / "ci"
@@ -2595,6 +2630,24 @@ class DedupeTest(unittest.TestCase):
         self.assertEqual(r["cloned_bytes"], 3 * len(data))  # four identical files, one canonical
         self.assertTrue(all(p.read_bytes() == data for p in (*copies, module)))
         self.assertEqual(build.stat().st_ino, build_ino)
+
+    def test_cmux_next_ci_products_are_deduped_only_with_opt_in_guard(self) -> None:
+        data = os.urandom(2 * 1024 * 1024)
+        root = self.root / "Library/Caches/cmux-next-ci"
+        first = self.blob("Library/Caches/cmux-next-ci/cmux-scheme/runner-a/Products/a.o", data)
+        second = self.blob("Library/Caches/cmux-next-ci/cmux-scheme/runner-b/Products/a.o", data)
+        before = second.stat().st_ino
+        # The ordinary input-only roots intentionally do not include Products.
+        self.assertEqual(gd.dedupe(gd.dedupe_roots(root / "cmux-scheme"), self.state)["cloned_bytes"], 0)
+        self.assertEqual(second.stat().st_ino, before)
+        # An explicit inactive-Products pass can clone it after its guard has rechecked
+        # the state roots.  This test uses a constant guard because APFS clone support
+        # is already the class-level Darwin requirement.
+        r = gd.dedupe(gd.cmux_next_ci_dedupe_roots(root), self.state, guard=lambda _: True)
+        self.assertEqual(r["cloned_bytes"], len(data))
+        self.assertEqual(second.read_bytes(), data)
+        self.assertNotEqual(second.stat().st_ino, before)
+        self.assertEqual(first.read_bytes(), data)
 
     @unittest.skipUnless(sys.platform == "darwin", "APFS clones")
     def test_dedupe_main_scans_cmux_next_ci(self) -> None:
