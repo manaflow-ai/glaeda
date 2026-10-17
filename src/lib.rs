@@ -396,6 +396,8 @@ pub mod runner_account_observation;
 pub mod runner_account_plan;
 /// Bounded, authority-bound macOS runner diagnostics observation and reclaim.
 pub mod runner_log_reclaim;
+#[cfg(test)]
+mod runner_log_reclaim_store;
 #[cfg(target_os = "linux")]
 pub mod runner_user;
 #[cfg(target_os = "linux")]
