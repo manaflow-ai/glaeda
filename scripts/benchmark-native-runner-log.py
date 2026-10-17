@@ -84,6 +84,43 @@ def native_receipt_summary(report: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def native_receipts_complete(report: dict[str, Any], *, expected_items: int) -> bool:
+    """Require every authority edge before a native row can be compared.
+
+    The observer's action list is not a production apply receipt.  A green
+    matrix row needs recovery evidence before staging, one bounded item receipt
+    per reclaimed file, and fresh post-action evidence after the transaction.
+    Keep this gate deliberately structural: the production adapter owns the
+    detailed receipt schemas, while the benchmark refuses to infer success from
+    an action count alone.
+    """
+    recovery = report.get("recovery_receipt")
+    items = report.get("item_receipts")
+    post_action = report.get("post_action_receipt")
+    if not isinstance(recovery, dict) or not isinstance(items, list):
+        return False
+    if not isinstance(post_action, dict):
+        return False
+    if type(recovery.get("pending_at_start")) is not int or recovery["pending_at_start"] < 0:
+        return False
+    if type(recovery.get("pending_after")) is not int or recovery["pending_after"] != 0:
+        return False
+    if recovery.get("outcome") not in {"clean", "recovered"}:
+        return False
+    if len(items) != expected_items:
+        return False
+    for item in items:
+        if not isinstance(item, dict):
+            return False
+        if not isinstance(item.get("receipt_id"), str) or not item["receipt_id"]:
+            return False
+        if item.get("outcome") != "reclaimed" or not isinstance(item.get("identity"), dict):
+            return False
+    if type(post_action.get("pending_count")) is not int or post_action["pending_count"] != 0:
+        return False
+    return post_action.get("observed") is True
+
+
 def classify_status(measurements: list[dict[str, Any]], *, source_matches_checkout: bool | None,
                     native_available: bool) -> tuple[str, list[str]]:
     """Return a conservative status and machine-readable blocking reasons."""
@@ -93,12 +130,18 @@ def classify_status(measurements: list[dict[str, Any]], *, source_matches_checko
     native_rows = [row for row in measurements if row.get("implementation") == "native"]
     if native_available and not native_rows:
         reasons.append("native_measurement_missing")
-    if source_matches_checkout is False:
+    if native_available and source_matches_checkout is not True:
         reasons.append("native_source_receipt_mismatch")
     if any("reclaim_not_ready" in row.get("native_errors", []) for row in native_rows):
         reasons.append("native_apply_not_admitted")
     if any(row.get("implementation") == "native" and not row.get("effect_valid") for row in native_rows):
         reasons.append("native_effect_not_verified")
+    if any(row.get("implementation") == "native" and not row.get("native_receipts_complete")
+           for row in measurements):
+        reasons.append("native_authority_receipts_incomplete")
+    if any(row.get("implementation") == "native" and not row.get("warm_state_preserved")
+           for row in measurements):
+        reasons.append("warm_state_not_preserved")
     if reasons:
         return ("blocked_native_effect_comparison", sorted(set(reasons)))
     if not measurements or not all(row.get("valid") for row in measurements):
@@ -219,7 +262,9 @@ def measure(args, implementation: str, trial: int) -> dict:
             worker_alive = fixture.worker.poll() is None
             metrics_present = all(all(run[key] is not None for key in
                                   ("user_seconds", "system_seconds", "max_rss_bytes")) for run in runs)
-            effects_match = worker_alive and outcomes["stale_deleted"] == args.stale_count and all(outcomes["survived"].values())
+            warm_state_preserved = outcomes["survived"].get("warm") is True
+            effects_match = (worker_alive and outcomes["stale_deleted"] == args.stale_count
+                             and all(outcomes["survived"].values()))
             # A busy-root refusal may return 1, but must contain a typed busy reason and no effects.
             exits_valid = runs[0]["exit"] == 0
             native_errors: list[str] = []
@@ -236,9 +281,18 @@ def measure(args, implementation: str, trial: int) -> dict:
                 # Apply must have been admitted and must have produced the
                 # expected effect. A plan or reclaim_not_ready is not a result.
                 idle_report = runs[0].get("report", {})
+                native_receipts_ok = all(
+                    native_receipts_complete(run.get("report", {}), expected_items=(
+                        args.stale_count if index == 0 else 0
+                    ))
+                    for index, run in enumerate(runs)
+                )
                 effect_valid = (effects_match and exits_valid and not native_errors
                                 and idle_report.get("operation") == "apply"
-                                and idle_report.get("reclaimed_count") == args.stale_count)
+                                and idle_report.get("reclaimed_count") == args.stale_count
+                                and native_receipts_ok)
+            else:
+                native_receipts_ok = None
             if implementation == "python":
                 receipts = python_receipt_summary(fixture.home)
             else:
@@ -250,6 +304,8 @@ def measure(args, implementation: str, trial: int) -> dict:
                     "system_seconds": sum(run["system_seconds"] or 0 for run in runs),
                     "peak_child_rss_bytes": max(run["max_rss_bytes"] or 0 for run in runs),
                     "metrics_present": metrics_present, "effect_valid": effect_valid,
+                    "native_receipts_complete": native_receipts_ok,
+                    "warm_state_preserved": warm_state_preserved,
                     "native_errors": sorted(set(native_errors)), "receipts": receipts,
                     # This row is eligible for comparison only after effect
                     # validation; callers must not infer speed from a blocked row.
@@ -267,8 +323,12 @@ def main() -> int:
                         help="hosted build receipt for --native-binary")
     parser.add_argument("--source-commit",
                         help="full source commit recorded by the hosted build receipt")
+    parser.add_argument("--source-tree",
+                        help="full source tree recorded by the hosted build receipt")
     parser.add_argument("--checkout-commit",
                         help="current benchmark checkout; mismatch blocks native comparison")
+    parser.add_argument("--checkout-tree",
+                        help="current benchmark tree; mismatch blocks native comparison")
     parser.add_argument("--python-source", type=Path, required=True)
     parser.add_argument("--python-source-sha256", required=True)
     parser.add_argument("--python-executable", type=Path, default=Path(sys.executable))
@@ -292,25 +352,38 @@ def main() -> int:
     source_matches_checkout: bool | None = None
     native_receipt: dict[str, Any] | None = None
     if native_available:
-        if not args.native_sha256 or not args.source_commit:
-            parser.error("--native-binary requires --native-sha256 and --source-commit")
+        if not args.native_sha256 or not args.source_commit or not args.source_tree:
+            parser.error("--native-binary requires --native-sha256, --source-commit, and --source-tree")
+        if not args.native_receipt:
+            parser.error("--native-binary requires --native-receipt")
+        if not args.checkout_commit or not args.checkout_tree:
+            parser.error("--native-binary requires --checkout-commit and --checkout-tree")
+        if not re.fullmatch(r"[a-f0-9]{40}", args.source_tree):
+            parser.error("source tree must be the full verified build receipt SHA")
+        if not re.fullmatch(r"[a-f0-9]{40}", args.checkout_commit) or not re.fullmatch(
+            r"[a-f0-9]{40}", args.checkout_tree
+        ):
+            parser.error("checkout commit/tree must be full Git object SHAs")
         if not args.native_binary.is_absolute() or not args.native_binary.is_file() or not os.access(args.native_binary, os.X_OK):
             parser.error("native binary must be an existing executable absolute path")
         if digest(args.native_binary) != args.native_sha256:
             parser.error("native binary hash mismatch")
         if not re.fullmatch(r"[a-f0-9]{40}", args.source_commit):
             parser.error("source commit must be the full verified build receipt SHA")
-        if args.native_receipt:
-            try:
-                native_receipt = json.loads(args.native_receipt.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as error:
-                parser.error(f"native receipt invalid: {error}")
-            if (native_receipt.get("binary_sha256") != args.native_sha256
-                    or native_receipt.get("checked_out_commit") != args.source_commit
-                    or native_receipt.get("test_outcome") != "success"):
-                parser.error("native receipt does not bind source, binary, and successful tests")
-        if args.checkout_commit:
-            source_matches_checkout = args.source_commit == args.checkout_commit
+        try:
+            native_receipt = json.loads(args.native_receipt.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            parser.error(f"native receipt invalid: {error}")
+        if (native_receipt.get("document_type") != "glaeda-runner-log-reclaim-build-receipt"
+                or native_receipt.get("schema_version") != 1
+                or native_receipt.get("binary_sha256") != args.native_sha256
+                or native_receipt.get("checked_out_commit") != args.source_commit
+                or native_receipt.get("checked_out_tree") != args.source_tree
+                or native_receipt.get("test_outcome") != "success"):
+            parser.error("native receipt does not bind exact source/tree, binary, and successful tests")
+        source_matches_checkout = (
+            args.source_commit == args.checkout_commit and args.source_tree == args.checkout_tree
+        )
     if digest(args.python_source) != args.python_source_sha256:
         parser.error("optimized Python source hash mismatch")
     measurements = []
@@ -330,7 +403,9 @@ def main() -> int:
               "native_sha256": args.native_sha256,
               "native_receipt": native_receipt,
               "source_commit": args.source_commit,
+              "source_tree": args.source_tree,
               "checkout_commit": args.checkout_commit,
+              "checkout_tree": args.checkout_tree,
               "python_source_sha256": args.python_source_sha256,
               "comparison_status": status,
               "blocking_reasons": blocking_reasons,
