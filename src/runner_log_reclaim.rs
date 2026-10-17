@@ -262,19 +262,6 @@ fn identity(metadata: &fs::Metadata) -> FileIdentity {
     }
 }
 
-#[cfg(target_os = "macos")]
-pub(crate) fn stat_matches_materialization(
-    stat: &rustix::fs::Stat,
-    expected: FileIdentity,
-) -> bool {
-    stat.st_dev == expected.device
-        && stat.st_ino == expected.inode
-        && stat.st_nlink == expected.links
-        && stat.st_size.max(0) as u64 == expected.size
-        && stat.st_mtime == expected.modified_seconds
-        && stat.st_mtime_nsec == expected.modified_nanos
-}
-
 fn now_seconds() -> Result<i64, ReclaimError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

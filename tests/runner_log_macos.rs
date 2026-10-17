@@ -49,7 +49,10 @@ fn libproc_open_identity_survives_same_volume_stage_and_second_runner_is_indepen
     let first_log = old_log(&first);
     let second_log = old_log(&second);
     let held = File::open(&first_log).expect("open first log");
-    let mut worker = std::process::Command::new("/bin/sleep")
+    fs::create_dir_all(first.join("bin")).expect("bin");
+    let worker_path = first.join("bin/Runner.Worker");
+    fs::copy("/bin/sleep", &worker_path).expect("worker binary");
+    let mut worker = std::process::Command::new(&worker_path)
         .arg("5")
         .current_dir(&first)
         .spawn()
