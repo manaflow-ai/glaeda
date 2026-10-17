@@ -14,6 +14,7 @@
     glaeda-mini-fleet upgrade   [HOST ...] --candidate-run RUN [--yes]         roll a new candidate over the fleet
     glaeda-mini-fleet pools    [HOST ...] [--observed FILE]                     runner capacity per pool label (JSON)
     glaeda-mini-fleet reserve  HOST ... --for TEXT (--hours N | --until EPOCH) [--owner O] [--force] [--yes]
+    glaeda-mini-fleet reserve  HOST ... --for TEXT --hours N --yes -- CMD ...         hold only while CMD runs here
     glaeda-mini-fleet borrow   [HOST ...] [--class std] --for TEXT (--hours N | --until EPOCH) [--owner O] [--yes]
     glaeda-mini-fleet release  HOST ... [--owner O] [--force] [--yes]           drop a reservation
     glaeda-mini-fleet manifest-sync [--manifest M] [--yes]                      copy cmuxterm-hq main's manifest here
@@ -194,6 +195,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -1994,6 +1996,52 @@ def cmd_reserve(manifest: dict[str, Any], hosts: list[str], purpose: str | None,
     if not yes:
         print("dry run; pass --yes to write")
     return 1 if failed else 0
+
+
+def cmd_reserve_for(manifest: dict[str, Any], hosts: list[str], command: list[str], purpose: str | None,
+                    hours: float | None, until: int | None, owner: str | None, force: bool, yes: bool) -> int:
+    """Hold HOSTS only while COMMAND runs here, then release them whatever its exit; --hours stays the bound
+    if this Mac dies first. A copy that reserved a CI host for hours held it long after the copy ended."""
+    if not yes:
+        code = cmd_reserve(manifest, hosts, purpose, hours, until, owner, force, False)
+        print("would run: " + shlex.join(command))
+        return code
+    owner = check_owner(owner or default_owner())
+
+    def release() -> int:
+        failed = 0
+        for name in hosts:
+            held = read_reservation(name, host_ssh_user(manifest, name), host_ssh_options(manifest, name))
+            if (held.get("reservation") or {}).get("owner") != owner:
+                continue  # never someone else's hold
+            code, text = release_own(manifest, name, owner)
+            print(text)
+            failed += code != 0
+        if failed:
+            print(f"release failed; release by hand: glaeda-mini-fleet release {' '.join(hosts)} --owner {owner} --yes")
+        return 1 if failed else 0
+
+    def interrupt(signum: int, _frame: Any) -> None:
+        raise KeyboardInterrupt(signal.Signals(signum).name)
+
+    previous = {sig: signal.signal(sig, interrupt) for sig in (signal.SIGTERM, signal.SIGHUP)}
+    try:
+        if cmd_reserve(manifest, hosts, purpose, hours, until, owner, force, True) != 0:
+            release()
+            return 1
+        print("running: " + shlex.join(command), flush=True)
+        try:
+            status = subprocess.run(command).returncode
+        except OSError as error:
+            print(f"cannot run {command[0]}: {error}")
+            status = 127
+        except KeyboardInterrupt:
+            status = 130
+        status = 128 - status if status < 0 else status
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+    return release() or status
 
 
 def cmd_release(manifest: dict[str, Any], hosts: list[str], owner: str | None, force: bool, yes: bool) -> int:
@@ -4955,6 +5003,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="preflight, fix, onboard, repair, upgrade: the Glaeda commit (40 hex) every host's ~/glaeda "
                              "must be at (default: ~/glaeda only needs the enroll options; fix and renewals move it "
                              "to the tip of main)")
+    # reserve HOST ... -- CMD: everything after the first -- is the command the reservation is held for.
+    argv = list(sys.argv[1:] if argv is None else argv)
+    held_command = argv[argv.index("--") + 1:] if "--" in argv else None
+    if held_command is not None:
+        argv = argv[:argv.index("--")]
     # Intermixed, so hosts may follow options: share xcode --from cmux15 cmux7s cmux8s
     args = parser.parse_intermixed_args(argv)
     thing = None
@@ -4981,6 +5034,8 @@ def main(argv: list[str] | None = None) -> int:
             if warning:
                 print(f"glaeda-mini-fleet: warning: {warning}", file=sys.stderr, flush=True)
     try:
+        if held_command is not None and (args.command != "reserve" or not held_command):
+            raise Failure("only reserve takes -- CMD, and it needs a command")
         if args.glaeda_ref is not None and not re.fullmatch(r"[0-9a-f]{40}", args.glaeda_ref):
             raise Failure("--glaeda-ref is a full commit id (40 lowercase hex)")
         GLAEDA_REF = args.glaeda_ref
@@ -5002,6 +5057,9 @@ def main(argv: list[str] | None = None) -> int:
             if not args.hosts:
                 raise Failure(f"{args.command} needs explicit hosts")
             if args.command == "reserve":
+                if held_command is not None:
+                    return cmd_reserve_for(manifest, hosts, held_command, args.purpose, args.hours, args.until,
+                                           args.owner, args.force, args.yes)
                 return cmd_reserve(manifest, hosts, args.purpose, args.hours, args.until, args.owner, args.force, args.yes)
             return cmd_release(manifest, hosts, args.owner, args.force, args.yes)
         if args.command in {"onboard", "repair"}:

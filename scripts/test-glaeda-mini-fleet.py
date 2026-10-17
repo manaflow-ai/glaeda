@@ -3607,7 +3607,8 @@ class ReserveReleaseTests(unittest.TestCase):
 
     def main(self, *argv: str) -> tuple[int, str]:
         with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
-            code = mf.main([*argv, "--manifest", os.fspath(EXAMPLE)])
+            cut = argv.index("--") if "--" in argv else len(argv)
+            code = mf.main([*argv[:cut], "--manifest", os.fspath(EXAMPLE), *argv[cut:]])
         return code, out.getvalue() + err.getvalue()
 
     def marker(self) -> dict | None:
@@ -3664,6 +3665,34 @@ class ReserveReleaseTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
         code, out = self.main("reserve", "build-mini-1", "--for", "x", "--until", str(now + 72 * 3600 - 5), "--yes")
         self.assertEqual(code, 0, out)
+
+    def test_a_reservation_for_a_command_ends_when_the_command_does(self) -> None:
+        # A copy that reserved a CI host for hours held it long after the copy ended: `-- CMD` holds the host
+        # only while CMD runs here, then releases it, whatever CMD's exit.
+        seen = self.root / "seen"
+        for status in (0, 3):
+            probe = f"test -f {self.root}/reservation.json && echo held >> {seen}; exit {status}"
+            code, out = self.main("reserve", "build-mini-1", "--for", "xcode copy", "--hours", "2", "--yes",
+                                  "--", "bash", "-c", probe)
+            self.assertEqual(code, status, out)
+            self.assertIsNone(self.marker(), out)
+            self.assertIn("released", out)
+        self.assertEqual(seen.read_text(), "held\nheld\n")
+
+    def test_a_command_never_runs_without_the_reservation(self) -> None:
+        ran = self.root / "ran"
+        code, out = self.main("reserve", "build-mini-1", "--for", "copy", "--hours", "1", "--", "touch", os.fspath(ran))
+        self.assertEqual(code, 0, out)  # dry run
+        self.assertIn("would run: touch", out)
+        self.assertFalse(ran.exists())
+        theirs = self.put("lawrence@studio", 3600)
+        code, out = self.main("reserve", "build-mini-1", "--for", "copy", "--hours", "1", "--yes", "--",
+                              "touch", os.fspath(ran))
+        self.assertEqual(code, 1, out)
+        self.assertFalse(ran.exists())
+        self.assertEqual(self.marker(), theirs)  # never released someone else's hold
+        self.assertEqual(self.main("release", "build-mini-1", "--yes", "--", "true")[0], 2)  # reserve only
+        self.assertEqual(self.main("reserve", "build-mini-1", "--for", "x", "--hours", "1", "--")[0], 2)  # no command
 
     def test_foreign_active_reservation_is_refused_and_printed(self) -> None:
         theirs = self.put("lawrence@studio", 3600)
