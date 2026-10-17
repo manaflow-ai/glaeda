@@ -1,4 +1,5 @@
-use std::fs;
+use std::fs::File;
+use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -32,8 +33,16 @@ struct Cli {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let receipt = match fs::read(&cli.enrollment_receipt)
+    let mut bytes = Vec::new();
+    let receipt = match File::open(&cli.enrollment_receipt)
         .ok()
+        .and_then(|mut file| {
+            file.take(65_537)
+                .read_to_end(&mut bytes)
+                .ok()
+                .map(|_| bytes)
+        })
+        .filter(|bytes| bytes.len() <= 65_536)
         .and_then(|bytes| serde_json::from_slice::<RunnerEnrollmentReceipt>(&bytes).ok())
     {
         Some(receipt) => receipt,

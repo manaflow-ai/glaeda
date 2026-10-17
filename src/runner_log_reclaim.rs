@@ -6,8 +6,8 @@
 //! account; an unreadable in-scope enumeration is a veto, never evidence of absence.
 
 use std::collections::BTreeSet;
-use std::fs;
-use std::io;
+use std::fs::{self, File};
+use std::io::{self, Read};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -276,6 +276,17 @@ fn relative_path(root: &Path, path: &Path) -> String {
         .into_owned()
 }
 
+fn read_bounded(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take((limit as u64).saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bounded_read"));
+    }
+    Ok(bytes)
+}
+
 fn preserved_path(path: &Path) -> bool {
     path.components().any(|component| {
         let name = component.as_os_str().to_string_lossy().to_ascii_lowercase();
@@ -283,19 +294,6 @@ fn preserved_path(path: &Path) -> bool {
             .iter()
             .any(|keep| name == *keep)
     })
-}
-
-fn reject_symlink_ancestors(path: &Path) -> Result<(), ReclaimError> {
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        current.push(component.as_os_str());
-        if let Ok(metadata) = fs::symlink_metadata(&current) {
-            if metadata.file_type().is_symlink() {
-                return Err(ReclaimError::InvalidPath("symlink_ancestor"));
-            }
-        }
-    }
-    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -314,8 +312,6 @@ fn observe_processes(root: &Path, uid: u32) -> Result<ProcessEvidence, ReclaimEr
     let mut unreadable = 0_u64;
     let mut scanned_fds = 0_usize;
     let scan_started = Instant::now();
-    let root_stat = fs::symlink_metadata(root)
-        .map_err(|_| ReclaimError::Observation("runner_root_unreadable"))?;
     let mut open_identities = BTreeSet::new();
     if pids.len() > MAX_SCANNED_PIDS {
         unreadable = unreadable.saturating_add(1);
@@ -371,10 +367,9 @@ fn observe_processes(root: &Path, uid: u32) -> Result<ProcessEvidence, ReclaimEr
                 inode: vnode.pvi.vst_ino,
             };
             open_identities.insert(identity);
-            if worker_pid && identity.device == root_stat.dev() && identity.inode == root_stat.ino()
-            {
-                busy = busy.saturating_add(1);
-            }
+        }
+        if worker_pid {
+            busy = busy.saturating_add(1);
         }
         match pidinfo::<BSDInfo>(*pid as i32, 0) {
             Ok(info)
@@ -420,9 +415,9 @@ fn validate_authority(
     if !marker_metadata.is_file() || marker_metadata.file_type().is_symlink() {
         return Err(ReclaimError::InvalidAuthority("runner_marker_invalid"));
     }
-    let marker_value = fs::read_to_string(&marker)
+    let marker_value = read_bounded(&marker, 4096)
         .map_err(|_| ReclaimError::InvalidAuthority("runner_marker_unreadable"))?;
-    if marker_value.trim() != receipt.install_id {
+    if String::from_utf8_lossy(&marker_value).trim() != receipt.install_id {
         return Err(ReclaimError::InvalidAuthority("runner_marker_mismatch"));
     }
     Ok((root.to_path_buf(), metadata.uid()))
@@ -443,72 +438,72 @@ fn enumerate_diag(
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Err(ReclaimError::Observation("diagnostics_unsafe_shape"));
     }
-    let mut stack = vec![diag];
     let mut items = Vec::new();
-    while let Some(dir) = stack.pop() {
-        let entries =
-            fs::read_dir(&dir).map_err(|_| ReclaimError::Observation("diagnostics_unreadable"))?;
-        for entry in entries.take(MAX_DIAG_ENTRIES.saturating_sub(items.len())) {
-            let entry = entry.map_err(|_| ReclaimError::Observation("diagnostics_unreadable"))?;
-            let path = entry.path();
-            let metadata = fs::symlink_metadata(&path)
-                .map_err(|_| ReclaimError::Observation("diagnostics_unreadable"))?;
-            if metadata.file_type().is_symlink() {
-                continue;
-            }
-            if metadata.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            if !metadata.is_file() || path.extension().and_then(|v| v.to_str()) != Some("log") {
-                continue;
-            }
-            let modified = metadata
-                .modified()
-                .ok()
-                .and_then(|v| v.duration_since(UNIX_EPOCH).ok())
-                .map(|v| v.as_secs() as i64)
-                .ok_or(ReclaimError::Observation(
-                    "diagnostics_timestamp_unavailable",
-                ))?;
-            let age = now
-                .checked_sub(modified)
-                .ok_or(ReclaimError::Observation("diagnostics_timestamp_overflow"))?;
-            let id = identity(&metadata);
-            let (decision, reason) = if preserved_path(path.strip_prefix(root).unwrap_or(&path)) {
-                (ItemDecision::PreservedScope, "protected_scope")
-            } else if process.open_identities.contains(&OpenIdentity {
-                device: id.device,
-                inode: id.inode,
-            }) {
-                (ItemDecision::OpenOrBusy, "open_descriptor")
-            } else if age < 0 || age < policy.minimum_idle_seconds {
-                (ItemDecision::Recent, "below_idle_window")
-            } else if metadata.uid() != process.uid {
-                (ItemDecision::Unknown, "foreign_owner")
-            } else if !process.in_scope_pids_complete {
-                (
-                    ItemDecision::Unknown,
-                    "in_scope_process_observation_incomplete",
-                )
-            } else {
-                (
-                    ItemDecision::ExpiredRunnerDiagnosticLog,
-                    "expired_retention",
-                )
-            };
-            items.push(LogItem {
-                relative_path: relative_path(root, &path),
-                identity: id,
-                bytes: metadata.len(),
-                modified_seconds: modified,
-                decision,
-                reason,
-            });
+    let entries =
+        fs::read_dir(&diag).map_err(|_| ReclaimError::Observation("diagnostics_unreadable"))?;
+    let mut entry_count = 0_usize;
+    for entry in entries {
+        entry_count = entry_count.saturating_add(1);
+        if entry_count > MAX_DIAG_ENTRIES {
+            return Err(ReclaimError::Observation(
+                "diagnostics_enumeration_truncated",
+            ));
         }
-        if items.len() >= MAX_DIAG_ENTRIES {
-            break;
+        let entry = entry.map_err(|_| ReclaimError::Observation("diagnostics_unreadable"))?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|_| ReclaimError::Observation("diagnostics_unreadable"))?;
+        if metadata.file_type().is_symlink() {
+            continue;
         }
+        if metadata.is_dir() {
+            continue;
+        }
+        if !metadata.is_file() || path.extension().and_then(|v| v.to_str()) != Some("log") {
+            continue;
+        }
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|v| v.duration_since(UNIX_EPOCH).ok())
+            .map(|v| v.as_secs() as i64)
+            .ok_or(ReclaimError::Observation(
+                "diagnostics_timestamp_unavailable",
+            ))?;
+        let age = now
+            .checked_sub(modified)
+            .ok_or(ReclaimError::Observation("diagnostics_timestamp_overflow"))?;
+        let id = identity(&metadata);
+        let (decision, reason) = if preserved_path(path.strip_prefix(root).unwrap_or(&path)) {
+            (ItemDecision::PreservedScope, "protected_scope")
+        } else if process.open_identities.contains(&OpenIdentity {
+            device: id.device,
+            inode: id.inode,
+        }) {
+            (ItemDecision::OpenOrBusy, "open_descriptor")
+        } else if age < 0 || age < policy.minimum_idle_seconds {
+            (ItemDecision::Recent, "below_idle_window")
+        } else if metadata.uid() != process.uid {
+            (ItemDecision::Unknown, "foreign_owner")
+        } else if !process.in_scope_pids_complete {
+            (
+                ItemDecision::Unknown,
+                "in_scope_process_observation_incomplete",
+            )
+        } else {
+            (
+                ItemDecision::ExpiredRunnerDiagnosticLog,
+                "expired_retention",
+            )
+        };
+        items.push(LogItem {
+            relative_path: relative_path(root, &path),
+            identity: id,
+            bytes: metadata.len(),
+            modified_seconds: modified,
+            decision,
+            reason,
+        });
     }
     Ok(items)
 }
@@ -522,7 +517,9 @@ pub fn observe(
         return Err(ReclaimError::InvalidPath("runner_root_must_be_absolute"));
     }
     let (root, uid) = validate_authority(root, receipt)?;
-    let mut process = observe_processes(&root, uid)?;
+    let process_root = fs::canonicalize(&root)
+        .map_err(|_| ReclaimError::InvalidPath("runner_root_canonicalize_failed"))?;
+    let mut process = observe_processes(&process_root, uid)?;
     let mut all_items = enumerate_diag(&root, &process, policy, now_seconds()?)?;
     let complete = process.in_scope_pids_complete;
     let item_count = all_items.len() as u64;
