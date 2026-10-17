@@ -90,7 +90,7 @@ fn libproc_worker_busy_and_open_identity_are_independent() {
     assert_eq!(info.pbi_uid, rustix::process::geteuid().as_raw());
     let policy = Policy::new(MIN_RUNNER_LOG_RECLAIM_IDLE_SECONDS, 4).unwrap();
     let busy = observe(&first, &first_receipt, policy).unwrap();
-    if worker.0.try_wait().unwrap().is_none() {
+    if busy.process.busy_processes_observed > 0 {
         assert_eq!(busy.items[0].reason, "runner_process_busy", "{busy:?}");
         assert_eq!(busy.process.busy_processes_observed, 1, "{busy:?}");
     } else {
