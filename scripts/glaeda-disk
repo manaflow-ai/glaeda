@@ -4607,6 +4607,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                     remove(p, after_rename=None if stale_hash is None
                            else lambda h=stale_hash: h.unlink(missing_ok=True))
                     gone = True
+                if not fam.transcripts:
                     outcome = "reclaimed" if gone else "changed:in-use"
                     released += i.bytes if gone else 0
                 if common:  # drop the deleted worktree's record from its repository

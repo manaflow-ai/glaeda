@@ -1570,7 +1570,8 @@ class GlaedaDiskTest(unittest.TestCase):
             # a job links "old" between the survey and the delete: apply re-checks the lock and keeps it
             late = open(scratch / "old.lock", "a")
             fcntl.flock(late, fcntl.LOCK_SH)
-            gd.apply(items, {f.id: f for f in fams}, self.root / "r.jsonl", None, 6)
+            with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+                gd.apply(items, {f.id: f for f in fams}, self.root / "r.jsonl", None, 6)
             late.close()
         self.assertFalse((scratch / "free").exists())
         self.assertFalse((scratch / "free.size").exists())
