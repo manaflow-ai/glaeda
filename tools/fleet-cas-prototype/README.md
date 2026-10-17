@@ -19,7 +19,10 @@ LLVM-exception, copied unmodified into `proto/`):
   Existing entries are never replaced (first writer wins).
 
 Storage is one file per object under the store directory. Counters go to
-`<store>/stats.json`.
+`<store>/stats.json`. `write_failed` retains the strict all-write-error
+semantics used by the trusted writer marker gate; `write_expected_refused`
+separately identifies the deliberate KV write response from a
+`--read-only-kv` reader node.
 
 One binary plays two roles:
 
@@ -60,6 +63,27 @@ the entry's whole object closure in one streamed call (`GetClosure` in
 A TCP store accepts writes only from `--writers IP,IP` (the peer address of each request);
 with no list it is read-only. Fleet deployment: `scripts/glaeda-fleet-cas-rollout` and
 `docs/CMUX_BUILD_SLOT_MODES.md`.
+
+The release workflow publishes an explicit `glaeda-fleet-cas-<source>-<target>.tar.gz`
+candidate. Obtain that asset's SHA-256 from the authenticated upstream `release.json` entry
+(and verify the release build-provenance attestation) before consuming it:
+
+```sh
+scripts/fleet_cas_bundle.py verify glaeda-fleet-cas-<source>-<target>.tar.gz \
+  --source <source> --target <target> --sha256 <release.json-assets-sha256>
+scripts/fleet_cas_bundle.py stage glaeda-fleet-cas-<source>-<target>.tar.gz \
+  --source <source> --target <target> --sha256 <release.json-assets-sha256> \
+  --destination /private/staging/fleet-cas --apply
+```
+
+Verification requires that external digest anchor; the archive's internal hashes alone do not
+establish release provenance. Staging refuses existing paths. This artifact does not perform an
+OTA install or change routing; an operator must separately validate it before invoking the
+existing rollout.
+
+`stage --apply` requires the destination's parent directory to already exist, resolve without
+symlinks, and be owned by the current user with mode `0700`; the command does not create or
+adopt a parent directory.
 
 Signed index entries (#1134 M3, `src/sign.rs`):
 

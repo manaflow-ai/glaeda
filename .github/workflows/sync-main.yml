@@ -1,0 +1,92 @@
+name: Sync main
+
+# Runs only in teamleaderleo/glaeda. Keeps main the same here and in manaflow-ai/glaeda, both ways
+# (docs/GLAEDA_OTA.md, Fleet mirror): a side that is behind is fast-forwarded, a clean divergence
+# becomes one merge commit pushed to both, and a conflict changes neither side and opens one
+# tracking issue here. scripts/glaeda-sync-main holds the logic and never force-pushes.
+#
+# Pushes go over SSH with a write deploy key of each repository, not the job token: a push made with
+# the job token does not start release.yml, and the token cannot push commits that change workflow
+# files.
+
+on:
+  schedule:
+    - cron: "11,26,41,56 * * * *"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write  # the conflict tracking issue
+
+concurrency:
+  group: sync-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'teamleaderleo/glaeda'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          show-progress: false
+
+      - name: Install the deploy keys
+        env:
+          UPSTREAM_KEY: ${{ secrets.SYNC_UPSTREAM_DEPLOY_KEY }}
+          MIRROR_KEY: ${{ secrets.SYNC_MIRROR_DEPLOY_KEY }}
+        run: |
+          test -n "$UPSTREAM_KEY" || { echo "::error::secret SYNC_UPSTREAM_DEPLOY_KEY is not set"; exit 1; }
+          test -n "$MIRROR_KEY" || { echo "::error::secret SYNC_MIRROR_DEPLOY_KEY is not set"; exit 1; }
+          install -m 700 -d ~/.ssh
+          # mode 600 from the first byte
+          (umask 077; printf '%s\n' "$UPSTREAM_KEY" > ~/.ssh/sync-upstream; printf '%s\n' "$MIRROR_KEY" > ~/.ssh/sync-mirror)
+          echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > ~/.ssh/known_hosts
+          # One host alias per key: a deploy key opens exactly one repository.
+          cat > ~/.ssh/config <<EOF
+          Host upstream.github.com
+            HostName github.com
+            HostKeyAlias github.com
+            IdentityFile $HOME/.ssh/sync-upstream
+            IdentitiesOnly yes
+            UserKnownHostsFile $HOME/.ssh/known_hosts
+            StrictHostKeyChecking yes
+          Host mirror.github.com
+            HostName github.com
+            HostKeyAlias github.com
+            IdentityFile $HOME/.ssh/sync-mirror
+            IdentitiesOnly yes
+            UserKnownHostsFile $HOME/.ssh/known_hosts
+            StrictHostKeyChecking yes
+          EOF
+          chmod 600 ~/.ssh/config
+
+      - name: Sync main
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set +e
+          python3 scripts/glaeda-sync-main \
+            --upstream git@upstream.github.com:teamleaderleo/glaeda.git \
+            --mirror git@mirror.github.com:manaflow-ai/glaeda.git \
+            --work "$RUNNER_TEMP/sync.git" \
+            --report "$RUNNER_TEMP/sync.json" \
+            --issue-repo "$GITHUB_REPOSITORY" \
+            --run-url "$RUN_URL" | tee "$RUNNER_TEMP/sync.txt"
+          code=${PIPESTATUS[0]}
+          { echo '```'; cat "$RUNNER_TEMP/sync.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$code" = 2 ]; then
+            echo "::error::main diverged with conflicts; see the tracking issue and cmuxterm-hq REPAIR.md (glaeda main sync conflict)"
+          fi
+          exit "$code"
+
+      - name: Remove the deploy keys
+        if: always()
+        run: rm -f ~/.ssh/sync-upstream ~/.ssh/sync-mirror ~/.ssh/config

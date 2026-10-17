@@ -37,7 +37,11 @@ jobs:
       - name: Fleet candidate bundle
         env:
           TARGET: ${{ matrix.target }}
-        run: python3 scripts/fleet_bundle.py build --source "$GITHUB_SHA" --target "$TARGET" --output release-assets
+        run: python3 scripts/fleet_bundle.py build --source "$GITHUB_SHA" --target "$TARGET" --output "$RUNNER_TEMP/glaeda-candidates"
+      - name: Fleet-CAS prebuilt candidate
+        env:
+          TARGET: ${{ matrix.target }}
+        run: python3 scripts/fleet_cas_bundle.py build --source "$GITHUB_SHA" --target "$TARGET" --output "$RUNNER_TEMP/glaeda-fleet-cas"
       - name: Hygiene tools archive
         env:
           TARGET: ${{ matrix.target }}
@@ -45,6 +49,10 @@ jobs:
           cargo build --locked --release --bin glaeda-worktree-reclaim --target "$TARGET"
           python3 scripts/glaeda_release.py hygiene --source "$GITHUB_SHA" --target "$TARGET" \
             --reclaim "target/$TARGET/release/glaeda-worktree-reclaim" --output release-assets
+      - name: Assemble release assets
+        run: |
+          mkdir -p release-assets
+          cp "$RUNNER_TEMP/glaeda-candidates"/* "$RUNNER_TEMP/glaeda-fleet-cas"/* release-assets/
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: release-${{ matrix.target }}

@@ -11,9 +11,9 @@ glaeda projects tidy --apply
 
 `fleet-mini` retains the existing cmux hot-tier policy. `devbox` adds safe cleanup for stale
 developer worktrees, `/tmp`, Xcode DerivedData, SwiftPM `.build`, Ghostty `.zig-cache`, and
-other per-checkout build outputs. Package caches are pressure-only. Codex transcripts older than
-30 days are gzip archived under `~/.codex/archive/`; the archive is retained for 180 days before
-Glaeda may remove it. Every candidate is rechecked for open files, a live cwd, command-line use,
+other per-checkout build outputs. Developer worktrees and source checkouts remain report-only;
+this policy does not remove user source or Git state. Package caches are pressure-only. Codex transcripts and their
+archives remain report-only so Codex task history is preserved. Every candidate is rechecked for open files, a live cwd, command-line use,
 socket markers, recent activity, Git state, and submodule state immediately before mutation.
 
 New checkouts go through `~/.local/bin/glaeda-worktree add`. `--no-build` creates the source

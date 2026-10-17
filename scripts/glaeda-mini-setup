@@ -27,6 +27,7 @@ What --apply installs (templated for the current user):
     ~/.local/bin/glaeda-disk                   from scripts/glaeda-disk
     ~/.local/bin/glaeda-worktree               canonical Projects/worktrees creator
     ~/.local/bin/glaeda-projects               dry-run/apply Projects tidy pass
+    ~/.local/bin/disk-pressure.sh              one-shot launcher used by every mini's LaunchAgent
     ~/.local/bin/glaeda-procs                  from scripts/glaeda-procs (why the Mac lags; --apply ends leaked fixtures)
     ~/.local/bin/glaeda-local-guard            from scripts/glaeda-local-guard (stops test and build runs orphaned by an
                                                agent session on a hygiene-only Mac, and on every Mac shell -c trees
@@ -44,12 +45,20 @@ What --apply installs (templated for the current user):
                                                the runner user can, reports the rest for ci-dash; a no-op off a runner)
     ~/.local/bin/glaeda-update                 from scripts/glaeda-update (hourly over-the-air updates)
     ~/.local/bin/glaeda-gh                     from scripts/glaeda-gh (shared GitHub CI watcher, the one poller)
+    ~/.local/bin/glaeda-wallpaper-rotate       from scripts/glaeda-wallpaper-rotate (operator-supplied stills, every 30 minutes)
+    ~/.local/bin/glaeda-runner-hygiene         from scripts/glaeda-runner-hygiene (root-installed per-account cache policy)
     ~/.claude/skills/github-ci-wait/SKILL.md    from skills/github-ci-wait: tells agent sessions to wait with glaeda-gh
     ~/.config/glaeda/update.json               its release ring and source, written once (--ota-ring canary|stable,
                                                --ota-source teamleaderleo/glaeda|manaflow-ai/glaeda)
     ~/Library/LaunchAgents/com.teamleaderleo.glaeda.{disk-pressure,disk-dedupe,worktree-reclaim,fleet-cas-prune,seed-prefetch,lan-fetch,
                                   idle-warm,idle-fuzz,mini-health,local-guard,update,gh-watch}.plist
     build-host directories and three git defaults, each set only when unset
+    on a Mac mini only: alert sounds off (defaults -g com.apple.sound.beep.volume 0, uiaudio.enabled 0,
+    beep.feedback 0; osascript sets the alert volume live for the console user). Output volume is
+    untouched, and --uninstall restores the earlier values
+    .metadata_never_index markers in the user-owned CI build roots (DerivedData and the
+    glaeda native cache, plus any existing glaeda runner _work roots). These markers keep
+    Spotlight out of build output without changing the system-wide index policy.
     python@3.13 from Homebrew, only when no Python 3.13+ exists and this user owns Homebrew
 
 glaeda-mini-enroll needs Python 3.13+ (accept-local uses os.waitid). Setup looks for it the way
@@ -57,12 +66,18 @@ enroll does and is not ready without it, so a missing interpreter shows up here,
 into enrollment. When Homebrew belongs to another account, the fix is printed instead.
 
 --hygiene-only is for machines that are not fleet build hosts, such as personal MacBooks.
-It installs the tools and LaunchAgents above and nothing else: no build-host
-directories, no git defaults, no operator steps, no fleet bootstrap. Only a missing python3
-blocks it; build-host checks (free disk, Xcode pin, hardware) are reported, not enforced,
+It installs the tools and LaunchAgents above and nothing else: no build-host directories,
+no git defaults, no alert-sound defaults, no operator steps, no fleet bootstrap. Only a
+missing python3 blocks it; build-host checks (free disk, Xcode pin, hardware) are reported, not enforced,
 so a nearly full laptop can still install the tool that frees it. After that, glaeda-update
 keeps every host on its release ring (docs/GLAEDA_OTA.md): each hour it runs this command from
 the newest release on the ring, then rolls back if the new tools do not run.
+
+On a GUI-less Mac (for example an AWS EC2 Mac), pass `--headless`. The same agents are
+installed as root-owned LaunchDaemons with `UserName` set to this account, so disk pressure,
+eviction, and OTA updates continue after reboot without a `gui/$uid` login domain. This mode
+requires passwordless sudo on the host, like `glaeda-cmux-runner --headless`; it never changes
+the runner registration or controller credentials.
 
 Linux (Big Red, owned Linux machines, Linux VMs on the fleet) gets the hygiene profile, the
 only one written for it so far, with or without the flag. It installs the same tools and
@@ -93,6 +108,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -107,13 +123,24 @@ import cmux_fleet_bootstrap as fleet  # noqa: E402  (read-only helpers; importin
 TARGET = {"machine": "Mac mini", "chip": "Apple M4 Pro", "cpus": 14, "memoryGiB": 48}
 CMUX_XCODE_APP = "/Applications/Xcode_26.6.app"  # vars.CMUX_CI_XCODE_APP_PR, which the persistent producer reads first
 MIN_FREE_GIB = fleet.default_min_free_gib("macos")  # one build slot, as the fleet bootstrap
-SUPPORTED_MACOS = {15, 26}
+SUPPORTED_MACOS = {15}  # macOS 26+ is accepted by the fleet bootstrap policy.
 LABEL_PREFIX = "com.teamleaderleo.glaeda."
+SUDO = "/usr/bin/sudo"
+SYSTEM_DAEMON_DIR = Path("/Library/LaunchDaemons")
 GIT_DEFAULTS = (
     ("core.untrackedCache", "true"),  # faster status on large checkouts such as cmux
     ("fetch.parallel", "0"),  # parallel fetches, sized by git
     ("submodule.fetchJobs", "0"),  # cmux has submodules; fetch them in parallel
 )
+# Alert sounds ("bonks") off on fleet Mac minis: (global-domain key, defaults type, value). Per user,
+# no sudo. Output volume is left alone: captures record audio.
+ALERT_DEFAULTS = (
+    ("com.apple.sound.beep.volume", "-float", "0"),
+    ("com.apple.sound.uiaudio.enabled", "-int", "0"),
+    ("com.apple.sound.beep.feedback", "-int", "0"),
+)
+DEFAULTS = "/usr/bin/defaults"
+OSASCRIPT = "/usr/bin/osascript"
 DARWIN_REQUIRED = True
 # The platform this run sets up. Linux supports the hygiene profile only.
 HOST_PLATFORM = "linux" if platform.system() == "Linux" else "macos"
@@ -163,6 +190,10 @@ def sha256_bytes(data: bytes) -> str:
 
 def sha256_file(path: Path) -> str | None:
     try:
+        # Hash only the named regular file. Following a symlink here could make an
+        # operator-owned replacement appear to be our marker and let uninstall unlink it.
+        if path.is_symlink() or not path.is_file():
+            return None
         return sha256_bytes(path.read_bytes())
     except OSError:
         return None
@@ -196,7 +227,7 @@ class Context:
                  xcode_app: str, min_free_gib: int, hygiene_only: bool = False,
                  platform_name: str | None = None, ota_ring: str | None = None,
                  ota_source: str | None = None, role: str = "devbox",
-                 role_explicit: bool = False) -> None:
+                 role_explicit: bool = False, headless: bool = False) -> None:
         self.home = home
         self.platform = platform_name or HOST_PLATFORM
         self.hygiene_only = hygiene_only
@@ -206,6 +237,9 @@ class Context:
         # A fake HOME (tests, rehearsals) must never reach the real launchd session.
         self.sandbox = os.path.realpath(home) != os.path.realpath(self.real_home)
         self.skip_launchctl = skip_launchctl or self.sandbox
+        # A fake HOME must never reach /Library/LaunchDaemons. This keeps tests and
+        # rehearsals side-effect free even when they exercise --headless.
+        self.headless = bool(headless) and self.platform == "macos" and not self.sandbox
         self.python = python or pick_python()
         self.reclaim_binary = reclaim_binary
         self.cmux_root = cmux_root
@@ -214,8 +248,10 @@ class Context:
         self.min_free_gib = min_free_gib
         self.bin = home / ".local/bin"
         linux = self.platform == "linux"
-        # LaunchAgents on macOS; systemd user units on Linux
-        self.agents = home / (".config/systemd/user" if linux else "Library/LaunchAgents")
+        # LaunchAgents on a logged-in macOS user; LaunchDaemons on a headless Mac;
+        # systemd user units on Linux.
+        self.agents = (home / ".config/systemd/user" if linux else
+                       (SYSTEM_DAEMON_DIR if self.headless else home / "Library/LaunchAgents"))
         # the reclaim unit appends to ~/.local/state/glaeda-worktree-reclaim.jsonl
         self.logs = home / (".local/state" if linux else "Library/Logs")
         self.derived_data = home / "Library/Developer/Xcode/DerivedData"
@@ -562,8 +598,9 @@ def preflight_macos(ctx: Context) -> dict[str, Any]:
     checks: dict[str, dict[str, Any]] = {}
     version = platform.mac_ver()[0]
     major = int(version.split(".")[0]) if version else 0
-    checks["macos"] = check(major in SUPPORTED_MACOS, version or "unknown",
-                            "" if major in SUPPORTED_MACOS else "fleet bootstrap accepts macOS 15 or 26", True)
+    supported = major in SUPPORTED_MACOS or major >= fleet.REVIEWED_XCODE_MAJOR
+    checks["macos"] = check(supported, version or "unknown",
+                            "" if supported else "fleet bootstrap accepts macOS 15 or 26+", True)
     hw = hardware()
     checks["appleSilicon"] = check(hw["arch"] == "arm64", hw["arch"], "", True)
     is_mini = hw["machine"] == TARGET["machine"]
@@ -607,6 +644,11 @@ def preflight_macos(ctx: Context) -> dict[str, Any]:
     checks["homebrew"] = check(brew is not None, brew or "missing")
     checks["python"] = check(ctx.python is not None, ctx.python or "missing",
                              "" if ctx.python else "LaunchAgents need python3 (Homebrew or Command Line Tools)", True)
+    if ctx.headless and not ctx.skip_launchctl:
+        code, _ = run([SUDO, "-n", "true"])
+        checks["headlessSudo"] = check(
+            code == 0, "passwordless sudo" if code == 0 else "passwordless sudo unavailable",
+            "headless agents need sudo -n for /Library/LaunchDaemons and launchctl", True)
     missing = fleet.missing_workload_tools(fleet.MACOS_WORKLOAD_TOOLS)
     checks["workloadToolPath"] = check(not missing, "all present" if not missing else "missing: " + ",".join(missing),
                                        "" if not missing else "cmux ./scripts/setup.sh installs these")
@@ -630,11 +672,12 @@ def preflight_macos(ctx: Context) -> dict[str, Any]:
 def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
     """The LaunchAgents for this user: disk hygiene as hand-installed on Air Blue, plus the fleet-cas pruner."""
     disk = os.fspath(ctx.bin / "glaeda-disk")
+    pressure = os.fspath(ctx.bin / "disk-pressure.sh")
     python = ctx.python or "/usr/bin/python3"
     agents = {
         LABEL_PREFIX + "disk-pressure": {
             "Label": LABEL_PREFIX + "disk-pressure",
-            "ProgramArguments": [python, disk, "--role", ctx.role, "--pressure", "--idle", "--apply", "--top", "0"],
+            "ProgramArguments": [pressure, "--once"],
             "StartInterval": 900,
             "RunAtLoad": True,
             # Not ProcessType Background: under pressure this job must still finish its lsof and free
@@ -642,6 +685,7 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             # --idle: with no pressure, an hourly sweep of idle reproducible data while no job runs.
             "LowPriorityIO": True,
             "Nice": 10,
+            "EnvironmentVariables": {"GLAEDA_PYTHON": python, "GLAEDA_DISK": disk, "GLAEDA_ROLE": ctx.role},
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-disk.log"),
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-disk.err"),
         },
@@ -680,6 +724,19 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             "Nice": 10,
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-update.jsonl"),
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-update.err"),
+        },
+        # Rotate operator-supplied stills without touching system wallpaper settings.  A headless
+        # host has no wallpaper store, so the tool exits successfully until a GUI user logs in.
+        LABEL_PREFIX + "wallpaper": {
+            "Label": LABEL_PREFIX + "wallpaper",
+            "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-wallpaper-rotate")],
+            "StartInterval": 1800,
+            "RunAtLoad": True,
+            "ProcessType": "Background",
+            "LowPriorityIO": True,
+            "Nice": 10,
+            "StandardOutPath": os.fspath(ctx.logs / "glaeda-wallpaper.log"),
+            "StandardErrorPath": os.fspath(ctx.logs / "glaeda-wallpaper.err"),
         },
         # Keeps the fleet compilation-cache node store and local Xcode CAS within budget; it exits at
         # once on a host without fleet-cas and defers while any build runs or holds the host lock.
@@ -795,6 +852,13 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-projects-tidy.jsonl"),
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-projects-tidy.err"),
         }
+    if ctx.headless:
+        # A system LaunchDaemon has no per-user GUI session. Run the same
+        # unprivileged tools as the setup user and keep only the plist itself
+        # root-owned. The tools write exclusively under this user's home.
+        username = pwd.getpwuid(ctx.uid).pw_name
+        for plist in agents.values():
+            plist["UserName"] = username
     return agents
 
 
@@ -856,7 +920,7 @@ def update_config(ctx: Context) -> dict[str, Any]:
         setup_args.append(f"--role={ctx.role}")
     config = {
         "ring": ctx.ota_ring or "stable",
-        "setupArgs": setup_args,
+        "setupArgs": setup_args + (["--headless"] if ctx.headless else []),
         "host": platform.node().split(".")[0].lower(),
         "reportStatus": (ctx.ota_ring or "stable") == "canary",
     }
@@ -876,9 +940,21 @@ def update_config_action(ctx: Context) -> dict[str, Any]:
     if current is None:
         return {**act, "state": "create", "value": update_config(ctx)}
     value = dict(current)
+    # A headless migration must persist the service domain for the OTA updater.
+    # Without this, the first successful update silently reinstalls GUI agents
+    # and they disappear again after the next reboot.
+    if ctx.headless:
+        current_args = value.get("setupArgs", [])
+        args = [a for a in current_args if isinstance(a, str) and a != "--headless"] \
+            if isinstance(current_args, list) else []
+        if "--headless" not in args:
+            value["setupArgs"] = [*args, "--headless"]
     if ctx.ota_ring and current.get("ring") != ctx.ota_ring:
         value.update(ring=ctx.ota_ring, reportStatus=ctx.ota_ring == "canary")
-    if ctx.ota_source and current.get("source", OTA_SOURCES[0]) != ctx.ota_source:
+    # Persist an explicitly requested source even when it is the default.
+    # The source is provenance for future OTA runs, so a missing field must not
+    # be treated as equivalent to the default when --ota-source was supplied.
+    if ctx.ota_source and current.get("source") != ctx.ota_source:
         value["source"] = ctx.ota_source
     if ctx.role_explicit:
         setup_args = current.get("setupArgs", ["--hygiene-only"])
@@ -925,6 +1001,62 @@ def directories(ctx: Context) -> list[tuple[Path, int]]:
     return [d for d in dirs if not (ctx.hygiene_only and d[0] == ctx.cache_root)]
 
 
+NO_INDEX_MARKER = ".metadata_never_index"
+
+
+def marker_root_is_owned(ctx: Context, root: Path) -> bool:
+    """Accept only existing path components owned by this setup user and no symlinks."""
+    anchor = ctx.home
+    try:
+        root.relative_to(anchor)
+    except ValueError:
+        return False
+    current = root
+    while True:
+        try:
+            observed = current.lstat()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return False
+        else:
+            if stat.S_ISLNK(observed.st_mode) or observed.st_uid != ctx.uid:
+                return False
+        if current == anchor:
+            return True
+        parent = current.parent
+        if parent == current:
+            return False
+        current = parent
+
+
+def scan_exclusion_markers(ctx: Context) -> list[Path]:
+    """User-owned Spotlight exclusion markers for build output.
+
+    macOS has no per-folder fseventsd opt-out.  A ``.metadata_never_index`` file is
+    nevertheless a safe, supported way to stop Spotlight from walking the large build
+    trees.  Keep this list narrow: the shared fleet cache is root-owned and is handled by
+    a separate fleet operator step, while a personal/hygiene install must not alter CI paths.
+    """
+    if ctx.platform != "macos" or ctx.hygiene_only:
+        return []
+    roots = [root for root in (ctx.derived_data, ctx.cache_root)
+             if marker_root_is_owned(ctx, root)]
+    # Runner directories are created by glaeda-cmux-runner.  On a re-run, cover every
+    # existing runner work tree without guessing at a custom --runner-dir path.
+    try:
+        for runner in ctx.home.glob("actions-runner-glaeda*"):
+            # Never follow an operator-created runner symlink into an unrelated tree.
+            if not runner.is_dir() or not marker_root_is_owned(ctx, runner):
+                continue
+            work = runner / "_work"
+            if work.is_dir() and marker_root_is_owned(ctx, work):
+                roots.append(work)
+    except OSError:
+        pass
+    return sorted({root / NO_INDEX_MARKER for root in roots})
+
+
 def reclaim_source(ctx: Context) -> tuple[str, Path | None, str]:
     """Where glaeda-worktree-reclaim comes from: (mode, path, note)."""
     if ctx.reclaim_binary is not None:
@@ -941,7 +1073,9 @@ def reclaim_source(ctx: Context) -> tuple[str, Path | None, str]:
 def launchctl_loaded(ctx: Context, label: str) -> bool | None:
     if ctx.skip_launchctl:
         return None
-    code, _ = run(["/bin/launchctl", "print", f"gui/{ctx.uid}/{label}"])
+    domain = f"system/{label}" if getattr(ctx, "headless", False) is True else f"gui/{ctx.uid}/{label}"
+    code, _ = run(([SUDO, "/bin/launchctl", "print", domain] if ctx.headless
+                   else ["/bin/launchctl", "print", domain]))
     return code == 0
 
 
@@ -964,6 +1098,46 @@ def git_get(ctx: Context, key: str) -> str | None:
         return None
     code, out = run([git, "config", "--global", "--get", key], env=ctx.git_env())
     return out if code == 0 else None
+
+
+def machine_name() -> str:
+    """The hardware Model Name ("Mac mini", "MacBook Pro"), or "unknown"."""
+    code, raw = run(["/usr/sbin/system_profiler", "SPHardwareDataType", "-json"], timeout=30)
+    try:
+        return (json.loads(raw)["SPHardwareDataType"][0].get("machine_name") or "unknown") if code == 0 else "unknown"
+    except (ValueError, KeyError, IndexError, AttributeError):
+        return "unknown"
+
+
+def console_owner_uid() -> int | None:
+    """Who owns the GUI console session (`stat -f %Su /dev/console`), or None."""
+    try:
+        return os.stat("/dev/console").st_uid
+    except OSError:
+        return None
+
+
+def defaults_get(key: str) -> str | None:
+    code, out = run([DEFAULTS, "read", "-g", key])
+    return out if code == 0 else None
+
+
+def same_default(current: str | None, value: str) -> bool:
+    """`defaults read` prints 0 for -float 0 and -int 0, 0.5 for a float: compare as numbers."""
+    if current is None:
+        return False
+    try:
+        return float(current) == float(value)
+    except ValueError:
+        return current == value
+
+
+def alert_sounds_skip(ctx: Context) -> str | None:
+    """Why alert sounds stay as they are on this host, or None on a fleet Mac mini."""
+    if ctx.sandbox:
+        return "not run with a sandbox HOME: defaults writes the real user's preferences"
+    machine = machine_name()
+    return None if machine == TARGET["machine"] else f"{machine} is not a Mac mini; alert sounds left alone"
 
 
 # ---------------------------------------------------------------- plan
@@ -989,9 +1163,9 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
     for path, mode in directories(ctx):
         actions.append({"kind": "dir", "path": os.fspath(path),
                         "state": "unchanged" if path.is_dir() else "create", "mode": oct(mode)})
-    for name in ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune", "glaeda-seed-prefetch",
+    for name in ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-runner-hygiene", "disk-pressure.sh", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune", "glaeda-seed-prefetch",
                  "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health",
-                 "glaeda-update", "glaeda-gh"):
+                 "glaeda-update", "glaeda-gh", "glaeda-wallpaper-rotate"):
         act = file_action(ctx, "tool", ctx.bin / name, (SCRIPT_DIR / name).read_bytes(), 0o755)
         act["source"] = os.fspath(SCRIPT_DIR / name)
         actions.append(act)
@@ -1024,7 +1198,7 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
     reclaim_act = actions[-1]
     prior_receipt = load_receipt(ctx) or {}
     owned_files = {a.get("path"): a.get("ownedSha256") or a.get("sha256") for a in prior_receipt.get("actions", [])
-                   if a.get("kind") in {"tool", "agent"} and a.get("owned")}
+                   if a.get("kind") in {"tool", "agent", "marker"} and a.get("owned")}
     for label in agent_names(ctx):
         dest = agent_path(ctx, label)
         act = file_action(ctx, "agent", dest, agent_bytes(ctx, label), 0o644)
@@ -1051,6 +1225,18 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
                        for a in prior_receipt.get("actions", [])
                        if a.get("kind") == "agent" and a.get("owned")}
     actions.extend(stale_agent_actions(ctx, set(agent_names(ctx)), previous_agents))
+    # Keep Spotlight off the two canonical build roots. Markers are ordinary user-owned
+    # files, so this remains idempotent and never changes the host-wide indexing policy.
+    for marker in scan_exclusion_markers(ctx):
+        act = file_action(ctx, "marker", marker, b"", 0o644,
+                          "Spotlight exclusion for CI build output")
+        # Any existing marker already excludes the tree. Preserve its bytes (and any
+        # operator ownership) rather than replacing it with our empty marker.
+        if marker.is_symlink():
+            act["state"], act["note"] = "blocked", "marker is a symlink; refusing to follow it"
+        elif marker.is_file():
+            act["state"], act["sha256"] = "unchanged", act["previousSha256"]
+        actions.append(act)
 
     actions.append(update_config_action(ctx))
 
@@ -1059,7 +1245,7 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
     # Ownership follows the bytes on disk, not this run's outcome: a blocked or failed step
     # (missing cargo, missing --reclaim-binary) must not orphan a file an earlier run installed.
     for act in actions:
-        if act["kind"] in {"tool", "agent"}:
+        if act["kind"] in {"tool", "agent", "marker"}:
             recorded = owned_files.get(act["path"])
             act["owned"] = recorded is not None and recorded == act.get("previousSha256")
             act["ownedSha256"] = recorded if act["owned"] else None
@@ -1082,9 +1268,39 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
         # owned: this command set the key, on this run or an earlier one, so --uninstall may unset it.
         actions.append({"kind": "git", "key": key, "value": value, "state": state, "previous": current,
                         "note": note, "owned": state == "unchanged" and key in owned_before})
+    actions += plan_alert_sounds(ctx, prior)
     if not ctx.hygiene_only:
         actions.append(plan_enroll_python(ctx))
     actions.append(plan_git(ctx))
+    return actions
+
+
+def plan_alert_sounds(ctx: Context, prior: dict[str, Any]) -> list[dict[str, Any]]:
+    """ALERT_DEFAULTS, enforced on a fleet Mac mini; never on a hygiene-only host such as a laptop.
+
+    Unlike the git defaults these are set whatever the current value, and the value before this
+    command first set a key is kept as "previous", so --uninstall can put it back.
+    """
+    if ctx.platform != "macos" or ctx.hygiene_only:
+        return []
+    skip = alert_sounds_skip(ctx)
+    if skip:
+        return [{"kind": "defaults", "key": "alert-sounds", "state": "skipped", "note": skip}]
+    owned = {a.get("key"): a for a in prior.get("actions", []) if a.get("kind") == "defaults" and a.get("owned")}
+    actions: list[dict[str, Any]] = []
+    for key, kind, value in ALERT_DEFAULTS:
+        current = defaults_get(key)
+        state = "create" if current is None else ("unchanged" if same_default(current, value) else "update")
+        # still ours from an earlier run: keep its previous value, not our own 0
+        mine = owned.get(key) if state == "unchanged" else None
+        actions.append({"kind": "defaults", "key": key, "type": kind, "value": value, "state": state,
+                        "previous": mine.get("previous") if mine else current, "note": "", "owned": mine is not None})
+    if any(a["state"] != "unchanged" for a in actions):
+        # defaults reach the running session at the next login; osascript applies the alert volume now,
+        # but only from the user who owns the console session
+        live = not ctx.headless and console_owner_uid() == ctx.uid
+        actions.append({"kind": "osascript", "key": "alert-volume", "state": "create" if live else "skipped",
+                        "note": "" if live else "this user does not own the console session; applies at next login"})
     return actions
 
 
@@ -1115,7 +1331,7 @@ def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
     receipt = load_receipt(ctx)
     # Only files this command wrote (create or update, carried forward as "owned") are removable.
     installed = {a["path"]: a.get("ownedSha256") or a.get("sha256") for a in (receipt or {}).get("actions", [])
-                 if a.get("kind") in {"tool", "agent"} and a.get("owned")}
+                 if a.get("kind") in {"tool", "agent", "marker"} and a.get("owned")}
     git_set = {a["key"]: a["value"] for a in (receipt or {}).get("actions", [])
                if a.get("kind") == "git" and a.get("owned")}
     actions: list[dict[str, Any]] = []
@@ -1136,11 +1352,13 @@ def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
         path = agent_path(ctx, label)
         actions.append({"kind": "agent", "label": label, "path": os.fspath(path),
                         "loaded": agent_loaded(ctx, label)})
-    for name in ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune",
+    for name in ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-runner-hygiene", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune",
                  "glaeda-seed-prefetch", "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health",
-                 "glaeda-update", "glaeda-gh"):
+                 "glaeda-update", "glaeda-gh", "glaeda-wallpaper-rotate"):
         actions.append({"kind": "tool", "path": os.fspath(ctx.bin / name)})
     actions.append({"kind": "tool", "path": os.fspath(skill_path(ctx))})
+    for marker in scan_exclusion_markers(ctx):
+        actions.append({"kind": "marker", "path": os.fspath(marker)})
     for act in actions:
         if act["kind"] == "note":
             continue
@@ -1162,6 +1380,21 @@ def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
         state = "remove" if ours and current == value else ("absent" if current is None else "kept")
         actions.append({"kind": "git", "key": key, "value": current, "state": state,
                         "note": "" if ours or current is None else "not set by this command"})
+    for prior in (receipt or {}).get("actions", []):
+        if prior.get("kind") != "defaults" or not prior.get("owned"):
+            continue
+        act = {k: prior.get(k) for k in ("key", "type", "value", "previous")}
+        if ctx.sandbox:
+            actions.append({"kind": "defaults", **act, "state": "skipped",
+                            "note": "not run with a sandbox HOME: defaults writes the real user's preferences"})
+            continue
+        current = defaults_get(act["key"])
+        # put back what was there only while the key still holds our value
+        if same_default(current, act["value"]):
+            state, note = ("remove" if act["previous"] is None else "restore"), ""
+        else:
+            state, note = ("absent", "") if current is None else ("kept", "changed since this command set it")
+        actions.append({"kind": "defaults", **act, "current": current, "state": state, "note": note})
     actions.append({"kind": "note", "state": "kept",
                     "note": "directories, logs, caches and any python@3.13 are left in place; remove them by hand if wanted"})
     return actions
@@ -1186,17 +1419,19 @@ def backup(ctx: Context, path: Path) -> str:
 
 
 def launchctl(ctx: Context, *args: str) -> tuple[int, str]:
-    return run(["/bin/launchctl", *args])
+    command = ["/bin/launchctl", *args]
+    return run(([SUDO, *command] if ctx.headless else command))
 
 
 def bootout(ctx: Context, label: str, wait_s: float = 5.0) -> bool:
     """Unload a job and wait (bounded) until launchd no longer lists it."""
-    code, output = launchctl(ctx, "bootout", f"gui/{ctx.uid}/{label}")
+    domain = f"system/{label}" if getattr(ctx, "headless", False) is True else f"gui/{ctx.uid}/{label}"
+    code, output = launchctl(ctx, "bootout", domain)
     if code != 0 and "could not find" not in output.lower() and "no such process" not in output.lower():
         return False
     deadline = time.monotonic() + wait_s
     while time.monotonic() < deadline:
-        print_code, print_output = launchctl(ctx, "print", f"gui/{ctx.uid}/{label}")
+        print_code, print_output = launchctl(ctx, "print", domain)
         if print_code != 0 and ("could not find" in print_output.lower()
                                 or "no such process" in print_output.lower()):
             return True
@@ -1206,11 +1441,30 @@ def bootout(ctx: Context, label: str, wait_s: float = 5.0) -> bool:
 
 def bootstrap(ctx: Context, plist: str) -> tuple[int, str]:
     """Load a job. launchd answers EIO (5) while a just-removed job is still settling; retry once."""
-    code, out = launchctl(ctx, "bootstrap", f"gui/{ctx.uid}", plist)
+    code, out = launchctl(ctx, "bootstrap", "system" if ctx.headless else f"gui/{ctx.uid}", plist)
     if code != 0 and ("Input/output error" in out or code == 5 or re.search(r"\b5:", out)):
         time.sleep(1.0)
-        code, out = launchctl(ctx, "bootstrap", f"gui/{ctx.uid}", plist)
+        code, out = launchctl(ctx, "bootstrap", "system" if ctx.headless else f"gui/{ctx.uid}", plist)
     return code, out
+
+
+def install_service_file(ctx: Context, path: Path, data: bytes, mode: int) -> None:
+    """Install a headless plist through sudo without exposing a partial file to launchd."""
+    if not ctx.headless:
+        write_atomic(path, data, mode)
+        return
+    with tempfile.NamedTemporaryFile(prefix="glaeda-mini-setup-", suffix=".plist", delete=False) as tmp:
+        tmp.write(data)
+        tmp.flush()
+        os.fchmod(tmp.fileno(), mode)
+        staged = Path(tmp.name)
+    try:
+        code, out = run([SUDO, "/usr/bin/install", "-o", "root", "-g", "wheel", "-m", oct(mode)[2:],
+                         os.fspath(staged), os.fspath(path)])
+        if code != 0:
+            raise OSError(out or f"sudo install exited {code}")
+    finally:
+        staged.unlink(missing_ok=True)
 
 
 def apply_install(ctx: Context, actions: list[dict[str, Any]]) -> None:
@@ -1251,27 +1505,33 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]]) -> None:
             fresh = file_action(ctx, "tool", Path(act["path"]), source.read_bytes(), 0o755, act["note"])
             act.update({k: fresh[k] for k in ("state", "sha256", "previousSha256")})
             state = act["state"]
-        if kind in {"tool", "agent"} and state in {"create", "update"}:
+        if kind in {"tool", "agent", "marker"} and state in {"create", "update"}:
             dest = Path(act["path"])
             if kind == "tool":
                 data = Path(act["source"]).read_bytes()
-            else:
+            elif kind == "agent":
                 data = agent_bytes(ctx, act["label"])
+            else:
+                data = b""
             if state == "update":
                 act["backup"] = backup(ctx, dest)
-            dest.parent.mkdir(parents=True, exist_ok=True)  # the skill's directory may not exist yet
+            if not dest.parent.exists():
+                dest.parent.mkdir(parents=True, exist_ok=True)  # the skill's directory may not exist yet
             if kind == "agent" and act.get("loaded") and ctx.platform != "linux":
                 if is_update_agent(act["label"]) and os.environ.get(UPDATE_ENV):
                     # unloading would kill the glaeda-update that is running this setup; launchd
                     # reads the new plist at the next login, or when setup runs by hand
-                    write_atomic(Path(act["path"]), data, int(act["mode"], 8))
+                    install_service_file(ctx, Path(act["path"]), data, int(act["mode"], 8))
                     act["applied"] = act["owned"] = True
                     act["ownedSha256"] = act["sha256"]
                     act["note"] = "written; reload deferred while glaeda-update runs"
                     continue
                 bootout(ctx, act["label"])
                 act["loaded"] = False
-            write_atomic(dest, data, int(act["mode"], 8))
+            if kind == "agent":
+                install_service_file(ctx, dest, data, int(act["mode"], 8))
+            else:
+                write_atomic(dest, data, int(act["mode"], 8))
             act["applied"] = act["owned"] = True
             act["ownedSha256"] = act["sha256"]
         if (kind == "agent" and ctx.platform != "linux" and state in {"create", "update", "unchanged"}
@@ -1311,6 +1571,20 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]]) -> None:
         if kind == "git" and state == "create":
             code, out = run([which("git") or "git", "config", "--global", act["key"], act["value"]], env=ctx.git_env())
             act["applied"] = act["owned"] = code == 0
+            if code != 0:
+                act["state"], act["note"] = "failed", out[:400]
+        if kind == "defaults" and state in {"create", "update"}:
+            code, out = run([DEFAULTS, "write", "-g", act["key"], act["type"], act["value"]])
+            act["applied"] = act["owned"] = code == 0
+            if code != 0:
+                act["state"], act["note"] = "failed", out[:400]
+        if kind == "osascript" and state == "create":
+            # after the defaults writes above (osascript is planned after them); only if one of them landed
+            if not any(a["kind"] == "defaults" and a.get("applied") for a in actions):
+                act["state"], act["note"] = "skipped", "no alert-sound default was written"
+                continue
+            code, out = run([OSASCRIPT, "-e", "set volume alert volume 0"])
+            act["applied"] = code == 0
             if code != 0:
                 act["state"], act["note"] = "failed", out[:400]
     if ctx.platform == "linux" and not ctx.skip_launchctl:
@@ -1377,17 +1651,29 @@ def apply_uninstall(ctx: Context, actions: list[dict[str, Any]]) -> None:
             elif act.get("loaded") and act["state"] == "remove" and ctx.platform != "linux":
                 bootout(ctx, act["label"])
             if act["state"] == "remove":
-                Path(act["path"]).unlink()
+                if ctx.headless:
+                    code, out = run([SUDO, "/bin/rm", "-f", act["path"]])
+                    if code != 0:
+                        act["state"], act["note"] = "failed", f"sudo remove failed: {out[-300:]}"
+                        continue
+                else:
+                    Path(act["path"]).unlink()
                 act["applied"] = True
-        elif act["kind"] == "tool" and act["state"] == "remove":
+        elif act["kind"] in {"tool", "marker"} and act["state"] == "remove":
             Path(act["path"]).unlink()
             act["applied"] = True
-            if Path(act["path"]) == skill_path(ctx):
+            if act["kind"] == "tool" and Path(act["path"]) == skill_path(ctx):
                 with contextlib.suppress(OSError):  # only when empty
                     skill_path(ctx).parent.rmdir()
         elif act["kind"] == "git" and act["state"] == "remove":
             code, _ = run([which("git") or "git", "config", "--global", "--unset", act["key"]], env=ctx.git_env())
             act["applied"] = code == 0
+        elif act["kind"] == "defaults" and act["state"] in {"remove", "restore"}:
+            code, out = run([DEFAULTS, "delete", "-g", act["key"]] if act["state"] == "remove"
+                            else [DEFAULTS, "write", "-g", act["key"], act["type"], act["previous"]])
+            act["applied"] = code == 0
+            if code != 0:
+                act["state"], act["note"] = "failed", out[:400]
     if (ctx.platform == "linux" and not ctx.skip_launchctl
             and any(a["kind"] == "agent" and a.get("applied") for a in actions)):
         run([systemctl(), "--user", "daemon-reload"])
@@ -1588,6 +1874,8 @@ def parser() -> argparse.ArgumentParser:
                    help="only the disk and worktree hygiene tools and agents, for any Mac or Linux host")
     p.add_argument("--role", choices=("fleet-mini", "devbox"),
                    help="disk and workspace policy role (default: devbox for hygiene/Linux, fleet-mini otherwise)")
+    p.add_argument("--headless", action="store_true",
+                   help="install macOS agents as root-owned system LaunchDaemons for a GUI-less host (needs sudo)")
     return p
 
 
@@ -1614,18 +1902,33 @@ def main(argv: list[str] | None = None) -> int:
         print("glaeda-mini-setup: macOS or Linux only", file=sys.stderr)
         return 2
     min_free_gib = args.min_free_gib if args.min_free_gib is not None else fleet.default_min_free_gib(HOST_PLATFORM)
-    role = args.role or ("devbox" if args.hygiene_only or HOST_PLATFORM == "linux" else "fleet-mini")
-    ctx = Context(Path(os.environ.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir), args.apply, args.python,
+    home = Path(os.environ.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir)
+    recorded_role = None
+    try:
+        prior = json.loads((home / ".local/state/glaeda/mini-setup/receipt.json").read_text())
+        if isinstance(prior, dict):
+            recorded_role = prior.get("role") if prior.get("role") in {"devbox", "fleet-mini"} else None
+            if recorded_role is None and prior.get("profile") in {"build-host", "hygiene"}:
+                # Before roles were recorded, both profiles used the fleet-style disk policy.
+                # Keep that policy on upgrade; opting into devbox requires --role devbox.
+                recorded_role = "fleet-mini"
+    except (OSError, ValueError, TypeError):
+        pass
+    role = args.role or recorded_role or ("devbox" if args.hygiene_only or HOST_PLATFORM == "linux" else "fleet-mini")
+    ctx = Context(home, args.apply, args.python,
                   args.skip_launchctl, args.reclaim_binary,
                   args.cmux_root.expanduser().resolve() if args.cmux_root else None,
                   args.glaeda.expanduser() if args.glaeda else None, args.xcode_app, min_free_gib,
                   args.hygiene_only or HOST_PLATFORM == "linux", ota_ring=args.ota_ring,
-                  ota_source=args.ota_source, role=role, role_explicit=args.role is not None)
+                  ota_source=args.ota_source, role=role,
+                  role_explicit=args.role is not None,
+                  headless=args.headless)
     pre = preflight(ctx)
     if ctx.hygiene_only:  # build-host checks are reported, not enforced
-        checks = {n: ({**c, "level": "warn"} if c["level"] == "block" and n not in HYGIENE_BLOCKING else c)
+        blocking_checks = HYGIENE_BLOCKING | ({"headlessSudo"} if args.headless else set())
+        checks = {n: ({**c, "level": "warn"} if c["level"] == "block" and n not in blocking_checks else c)
                   for n, c in pre["checks"].items()}
-        pre = {**pre, "checks": checks, "blocking": [n for n in pre["blocking"] if n in HYGIENE_BLOCKING]}
+        pre = {**pre, "checks": checks, "blocking": [n for n in pre["blocking"] if n in blocking_checks]}
     if args.uninstall:
         actions = plan_uninstall(ctx)
         if args.apply:
@@ -1636,8 +1939,9 @@ def main(argv: list[str] | None = None) -> int:
             apply_install(ctx, actions)
     fleet_result = None if args.uninstall or ctx.hygiene_only else run_fleet_bootstrap(ctx)
     # a failed git install is reported (receipt, operator step) but does not fail the run: glaeda-update
-    # rolls a release back when setup fails, and a transient brew error is not the release's fault
-    failed = [a for a in actions if a.get("state") == "failed" and a.get("kind") != "gitpkg"]
+    # rolls a release back when setup fails, and a transient brew error is not the release's fault.
+    # Alert sounds are a comfort setting, so a failed write is reported the same way.
+    failed = [a for a in actions if a.get("state") == "failed" and a.get("kind") not in {"gitpkg", "defaults", "osascript"}]
     receipt = {
         "schema": SCHEMA,
         "mode": "uninstall" if args.uninstall else "install",
