@@ -90,6 +90,13 @@ that the fresh receipt identifies as rebuildable:
 ssh HOST '~/.local/bin/glaeda-disk --pressure --idle --apply'
 ```
 
+The LaunchAgent's background `--refresh` pass is wall-clock bounded by its
+`--refresh-budget-s` value (normally ten minutes). If the process-evidence
+probe or a candidate walk overruns, the owned refresh exits cleanly, closes its
+measurement and refresh locks, and leaves measurements committed before the
+timeout in the atomic snapshot for the next pass. A foreground report or apply is never interrupted
+by this background-only deadline.
+
 Never remove active workspaces, current seeds, checkouts, user projects, or
 unclassified space by hand. A low free-space number is a reason to refresh the
 receipt, not permission to delete a directory.

@@ -12,6 +12,7 @@ import json
 import os
 import plistlib
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -1725,6 +1726,59 @@ class GlaedaDiskTest(unittest.TestCase):
                     "message": "another measurement running; skipped",
                 })
                 survey.assert_not_called()
+
+    def test_background_refresh_wall_clock_guard_restores_signal_state(self) -> None:
+        previous = signal.getsignal(signal.SIGALRM)
+        with mock.patch.object(gd, "survey", side_effect=gd.RefreshDeadlineExceeded):
+            self.assertEqual(gd.bounded_refresh_survey([self.fam], 24, 0, {}, False, 1), [])
+        self.assertIs(signal.getsignal(signal.SIGALRM), previous)
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
+        self.assertTrue(gd._MEASURE_BUDGET_REACHED)
+
+    def test_background_refresh_main_guard_catches_timeout_and_cleans_up(self) -> None:
+        previous = signal.getsignal(signal.SIGALRM)
+        with mock.patch.object(gd, "_main_impl", side_effect=gd.RefreshDeadlineExceeded):
+            self.assertEqual(
+                gd.main(["--refresh", "--refresh-lock-fd", "3", "--refresh-budget-s", "1"]),
+                0,
+            )
+        self.assertIs(signal.getsignal(signal.SIGALRM), previous)
+        self.assertFalse(gd._REFRESH_DEADLINE_ACTIVE)
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
+
+    def test_survey_captures_process_evidence_before_measurement_walks(self) -> None:
+        item = make(self.root / "measure-me", age_hours=48)
+        events = []
+        fam = gd.Family("tmp", self.root, True, "rebuild")
+        with mock.patch.object(gd, "candidates", return_value=[item]), \
+                mock.patch.object(gd, "process_evidence", side_effect=lambda: (events.append("evidence") or ([], ""))), \
+                mock.patch.object(gd, "du_bytes", side_effect=lambda _path: (events.append("du") or 1 << 20)):
+            gd.survey([fam], 24, 0, known={})
+        self.assertEqual(events[:2], ["evidence", "du"])
+
+    def test_survey_keeps_no_evidence_as_a_typed_blind_verdict(self) -> None:
+        item = make(self.root / "blind", age_hours=48)
+        fam = gd.Family("tmp", self.root, True, "rebuild")
+        with mock.patch.object(gd, "candidates", return_value=[item]), \
+                mock.patch.object(gd, "process_evidence", side_effect=gd.NoEvidence("ps failed")), \
+                mock.patch.object(gd, "du_bytes", return_value=1 << 20):
+            result = gd.survey([fam], 24, 0, known={})
+        self.assertEqual(result[0].verdict, "in-use")
+        self.assertTrue(any("no process evidence" in reason for reason in result[0].reasons))
+
+    def test_refresh_timeout_reaps_owned_du_processes(self) -> None:
+        class Proc:
+            pid = 1234
+
+            def communicate(self, timeout=None):
+                return "", ""
+
+        proc = Proc()
+        gd._ACTIVE_DU_PROCS[proc.pid] = proc
+        with mock.patch.object(gd.os, "killpg") as killpg:
+            gd._terminate_active_children()
+        killpg.assert_called_once_with(proc.pid, gd.signal.SIGKILL)
+        gd._ACTIVE_DU_PROCS.pop(proc.pid, None)  # worker owns the reap/removal path
 
     def test_filesystems_group_roots_and_apply_thresholds(self) -> None:
         other = gd.Family("tmp", self.root, True, "scratch")

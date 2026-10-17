@@ -165,6 +165,19 @@ REFRESH_BUDGET_S = 10 * 60
 EVICTION_STUCK: list[dict[str, Any]] = []
 _EVICT_HANDLE = None
 _MEASURE_BUDGET_REACHED = False
+_REFRESH_PROGRESS_KNOWN: dict[str, int] | None = None
+_REFRESH_DEADLINE_ACTIVE = False
+_ACTIVE_MEASURE_HANDLE = None
+_ACTIVE_DU_PROCS: dict[int, subprocess.Popen] = {}
+_ACTIVE_QUERY_PROCS: dict[int, subprocess.Popen] = {}
+
+
+class RefreshDeadlineExceeded(Exception):
+    """The owned background refresh exceeded its wall-clock budget."""
+
+
+def _refresh_alarm(_signum, _frame):
+    raise RefreshDeadlineExceeded()
 
 # Never ask du to enumerate the data volume. These are the bounded roots that account for
 # runner work and rebuildable state on a mini. Cloud/FileProvider placeholders can block in
@@ -1626,6 +1639,7 @@ def _du_output(argv: list[str], allow_nonzero: bool = False) -> str | None:
             text=True,
             start_new_session=True,
         )
+        _ACTIVE_DU_PROCS[proc.pid] = proc
         try:
             out, _ = proc.communicate(timeout=DU_TIMEOUT_S)
         except subprocess.TimeoutExpired:
@@ -1637,11 +1651,28 @@ def _du_output(argv: list[str], allow_nonzero: bool = False) -> str | None:
                 proc.communicate(timeout=DU_KILL_GRACE_S)
             _record_eviction_stuck(argv)
             return None
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+                proc.communicate(timeout=DU_KILL_GRACE_S)
+            raise
+        finally:
+            _ACTIVE_DU_PROCS.pop(proc.pid, None)
     except OSError:
         return None
     if proc.returncode != 0 and not allow_nonzero:
         return None
     return out
+
+
+def _terminate_active_children() -> None:
+    """Kill owned measurement/evidence children; each owner reaps its own Popen."""
+    for registry in (_ACTIVE_DU_PROCS, _ACTIVE_QUERY_PROCS):
+        for pid, proc in list(registry.items()):
+            with contextlib.suppress(OSError):
+                os.killpg(pid, signal.SIGKILL)
+            # The owning worker/main path performs communicate and removes the entry.
 
 
 def du_bytes(path: Path) -> int | None:
@@ -1763,6 +1794,24 @@ class NoEvidence(Exception):
     """Process evidence could not be collected; nothing may be deleted."""
 
 
+def _owned_query(argv: list[str], timeout: float) -> tuple[int, str]:
+    """Run a bounded evidence query whose child can be killed by refresh expiry."""
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, start_new_session=True)
+    _ACTIVE_QUERY_PROCS[proc.pid] = proc
+    try:
+        output, _ = proc.communicate(timeout=timeout)
+        return proc.returncode, output
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+            proc.communicate(timeout=DU_KILL_GRACE_S)
+        raise
+    finally:
+        _ACTIVE_QUERY_PROCS.pop(proc.pid, None)
+
+
 def process_evidence() -> tuple[list[str], str]:
     """Every path a process has open (cwd and files) plus all command lines.
 
@@ -1788,19 +1837,21 @@ def process_evidence() -> tuple[list[str], str]:
     else:
         lsof = shutil.which("lsof") or "/usr/sbin/lsof"
         try:
-            out = subprocess.run([lsof, "-n", "-P", "-Fn"], capture_output=True, text=True, timeout=120)
+            code, out = _owned_query([lsof, "-n", "-P", "-Fn"], 120)
         except (OSError, subprocess.TimeoutExpired) as e:
             raise NoEvidence(f"lsof: {e}") from e
+        if code != 0:
+            raise NoEvidence(f"lsof failed (exit {code})")
         opened = [line[1:] for line in out.stdout.splitlines() if line.startswith("n/")]
         if not opened:
             raise NoEvidence(f"lsof returned nothing (exit {out.returncode})")
     try:
-        ps = subprocess.run(["ps", "-axww", "-o", "command="], capture_output=True, text=True, timeout=60)
+        ps_code, ps_out = _owned_query(["ps", "-axww", "-o", "command="], 60)
     except (OSError, subprocess.TimeoutExpired) as e:
         raise NoEvidence(f"ps: {e}") from e
-    if ps.returncode != 0 or not ps.stdout.strip():
-        raise NoEvidence(f"ps failed (exit {ps.returncode})")
-    return opened, command_text(ps.stdout)
+    if ps_code != 0 or not ps_out.strip():
+        raise NoEvidence(f"ps failed (exit {ps_code})")
+    return opened, command_text(ps_out)
 
 
 def command_lines() -> str:
@@ -3314,9 +3365,43 @@ def survey(families: list[Family], idle_hours: float, min_bytes: int,
     With defer_bulk, unsized candidates of bulk_sizes families are left out instead of measured,
     so a report stays fast; the background refresh sizes them for the next one.
     """
-    with ThreadPoolExecutor(max_workers=1) as bg:
-        evidence = bg.submit(process_evidence)  # lsof is the slowest single call; overlap it
-        return _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk, deadline)
+    # Capture process evidence before any measurement helpers start. Otherwise a
+    # concurrent `du` command appears in ps/lsof and every generated tree is
+    # incorrectly classified as in-use.
+    try:
+        evidence = process_evidence()
+    except NoEvidence as error:
+        evidence = error
+    return _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk, deadline)
+
+
+def bounded_refresh_survey(families: list[Family], idle_hours: float, min_bytes: int,
+                           known: dict[str, int], defer_bulk: bool,
+                           budget_s: float) -> list[Item]:
+    """Run only the owned background refresh under a process-wide wall-clock guard."""
+    global _REFRESH_PROGRESS_KNOWN
+    _REFRESH_PROGRESS_KNOWN = dict(known)
+    if budget_s <= 0:
+        return survey(families, idle_hours, min_bytes, known, defer_bulk=defer_bulk)
+    own_timer = not _REFRESH_DEADLINE_ACTIVE
+    previous_handler = signal.getsignal(signal.SIGALRM) if own_timer else None
+    previous_timer = signal.getitimer(signal.ITIMER_REAL) if own_timer else (0.0, 0.0)
+    if own_timer:
+        signal.signal(signal.SIGALRM, _refresh_alarm)
+        signal.setitimer(signal.ITIMER_REAL, budget_s)
+    try:
+        return survey(families, idle_hours, min_bytes, known, defer_bulk=defer_bulk,
+                      deadline=time.monotonic() + budget_s)
+    except RefreshDeadlineExceeded:
+        global _MEASURE_BUDGET_REACHED
+        _MEASURE_BUDGET_REACHED = True
+        return []
+    finally:
+        if own_timer:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous_handler)
+            if previous_timer != (0.0, 0.0):
+                signal.setitimer(signal.ITIMER_REAL, *previous_timer)
 
 
 def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
@@ -3350,6 +3435,9 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
     # A failed walk is unsized, never zero bytes.  Do not put it in the snapshot or judge it for
     # reclaim; the next report will retry it without allowing a stale zero to hide the tree.
     known.update({path: size for path, size in measured.items() if size is not None})
+    global _REFRESH_PROGRESS_KNOWN
+    if _REFRESH_PROGRESS_KNOWN is not None:
+        _REFRESH_PROGRESS_KNOWN = dict(known)
     work = [(fam, path) for fam, path in work if str(path) in known]
     sizes = [known[str(path)] for _, path in work]
     floors = [min_bytes if fam.min_bytes is None else fam.min_bytes for fam, _ in work]
@@ -3368,11 +3456,14 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             idles.append((now - item_mtime(fam, path)) / 3600 if size >= floor else 0.0)
             keep += 1
         work, sizes, floors = work[:keep], sizes[:keep], floors[:keep]
-    try:
-        cwds, cmds = evidence.result()
-        blind = ""
-    except NoEvidence as e:
-        cwds, cmds, blind = [], "", f"no process evidence ({e})"
+    if isinstance(evidence, NoEvidence):
+        cwds, cmds, blind = [], "", f"no process evidence ({evidence})"
+    else:
+        try:
+            cwds, cmds = evidence if isinstance(evidence, tuple) else evidence.result()
+            blind = ""
+        except NoEvidence as e:
+            cwds, cmds, blind = [], "", f"no process evidence ({e})"
     opened = open_index(cwds)
     references_by_root: dict[str, frozenset[str]] = {}
     archived = archived_seeds() if any(fam.id == "cmux-seeds" for fam, _ in work) else frozenset()
@@ -4694,7 +4785,8 @@ def dedupe(roots: list[Path], state_path: Path = DEDUPE_STATE,
             "refused": refused, "young": young}
 
 
-def main(argv: list[str] | None = None) -> int:
+def _main_impl(argv: list[str] | None = None) -> int:
+    global _ACTIVE_MEASURE_HANDLE, _REFRESH_PROGRESS_KNOWN
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--apply", action="store_true", help="delete reclaimable items")
     ap.add_argument("--pressure", action="store_true",
@@ -4923,6 +5015,7 @@ def main(argv: list[str] | None = None) -> int:
     idle = a.idle_hours if a.idle_hours is not None else IDLE_SWEEP_HOURS if sweep else (6 if under else 24)
     at, known, measured_at = (0.0, {}, {}) if a.refresh or a.no_snapshot else load_snapshot_meta()
     original_known = set(known)
+    _REFRESH_PROGRESS_KNOWN = dict(known)
     if a.apply:
         # sizes decide what gets deleted under pressure, so never trust stale candidate sizes
         known = fresh_for_apply(known, fams)
@@ -4939,8 +5032,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         MEASURE_LOCK.parent.mkdir(parents=True, exist_ok=True)
         measure_lock = MEASURE_LOCK.open("a")
+        _ACTIVE_MEASURE_HANDLE = measure_lock
         fcntl.flock(measure_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
+        measure_lock.close()
+        measure_lock = None
+        _ACTIVE_MEASURE_HANDLE = None
         if a.pressure or a.refresh:
             if measure_lock is not None:
                 measure_lock.close()
@@ -4954,13 +5051,23 @@ def main(argv: list[str] | None = None) -> int:
     refresh_deadline = None
     if a.refresh and a.refresh_budget_s > 0:
         refresh_deadline = time.monotonic() + a.refresh_budget_s
-    items = survey(fams, idle, a.min_mib * 1024**2, known,
-                   defer_bulk=bool(at) and not a.apply, deadline=refresh_deadline)
+    background_refresh = a.refresh and not a.apply and a.refresh_lock_fd is not None
+    if background_refresh:
+        items = bounded_refresh_survey(
+            fams, idle, a.min_mib * 1024**2, known, defer_bulk=bool(at) and not a.apply,
+            budget_s=a.refresh_budget_s,
+        )
+        if _REFRESH_PROGRESS_KNOWN is not None:
+            known.update(_REFRESH_PROGRESS_KNOWN)
+    else:
+        items = survey(fams, idle, a.min_mib * 1024**2, known,
+                       defer_bulk=bool(at) and not a.apply, deadline=refresh_deadline)
     # Release the measurement lock before starting a background refresh. The child must be able to
     # acquire it, otherwise every stale report spawns a refresh that immediately skips.
     if measure_lock is not None:
         measure_lock.close()
         measure_lock = None
+        _ACTIVE_MEASURE_HANDLE = None
     fresh_paths = dropped_for_measurement | (set(known) - known_before)
     age_min = (time.time() - at) / 60 if at else 0.0
     if not a.no_snapshot:
@@ -5025,6 +5132,44 @@ def main(argv: list[str] | None = None) -> int:
             fcntl.flock(maintenance_handle, fcntl.LOCK_UN)
             maintenance_handle.close()
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the disk command, bounding only the owned background refresh process."""
+    args = list(sys.argv[1:] if argv is None else argv)
+    background = "--refresh" in args and "--refresh-lock-fd" in args and "--apply" not in args
+    if not background:
+        return _main_impl(args)
+    budget_s = REFRESH_BUDGET_S
+    with contextlib.suppress(ValueError, IndexError):
+        budget_s = max(1.0, float(args[args.index("--refresh-budget-s") + 1]))
+    global _REFRESH_DEADLINE_ACTIVE, _ACTIVE_MEASURE_HANDLE, _REFRESH_HANDLE, _MEASURE_BUDGET_REACHED
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    _REFRESH_DEADLINE_ACTIVE = True
+    signal.signal(signal.SIGALRM, _refresh_alarm)
+    signal.setitimer(signal.ITIMER_REAL, budget_s)
+    try:
+        return _main_impl(args)
+    except RefreshDeadlineExceeded:
+        _MEASURE_BUDGET_REACHED = True
+        if _REFRESH_PROGRESS_KNOWN is not None:
+            with contextlib.suppress(OSError):
+                save_snapshot(_REFRESH_PROGRESS_KNOWN)
+        return 0
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        if previous_timer != (0.0, 0.0):
+            signal.setitimer(signal.ITIMER_REAL, *previous_timer)
+        _REFRESH_DEADLINE_ACTIVE = False
+        _terminate_active_children()
+        if _ACTIVE_MEASURE_HANDLE is not None:
+            with contextlib.suppress(OSError):
+                _ACTIVE_MEASURE_HANDLE.close()
+            _ACTIVE_MEASURE_HANDLE = None
+        if _REFRESH_HANDLE is not None:
+            release_refresh_lock(_REFRESH_HANDLE)
 
 
 if __name__ == "__main__":
