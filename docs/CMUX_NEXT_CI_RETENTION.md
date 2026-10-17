@@ -36,3 +36,25 @@ and re-collects process evidence before every APFS clone. A process, socket, lea
 marker, unknown state child, or unavailable `lsof`/`ps` evidence refuses that clone.
 APFS copy-on-write keeps later compiler writes private to the path that performs them;
 the command never hardlinks build outputs.
+
+## Explicit drained maintenance
+
+The 72-hour floor remains the default. An operator may make an explicit
+pressure pass over younger generated output only with the enrolled-runner drain
+gate:
+
+```sh
+glaeda-disk --runner-caches --pressure --need 100 --family cmux-next-ci-generated \
+  --cmux-next-reservation-owner leo@fleet \
+  --cmux-next-drain --apply --json --receipt ~/Projects/recovery/cmux-next-drain.jsonl
+```
+
+The command requires a bounded active `glaeda-reservation/v1` marker, an
+installed `actions-runner*/glaeda-hooks/job-started.sh` wrapper that invokes
+`glaeda-cmux-runner-hook job-started`, and an exclusive nonblocking
+`/Users/Shared/cmux-build-fleet/host.lock`. The lock is held through the fresh
+process/open-file/marker checks and each rename. Any live `Runner.Worker`,
+`xcodebuild`, unreadable enrollment, lock contention, or unknown state keeps the
+candidate and returns a deferred result. The flag is restricted to
+`cmux-next-ci-generated` with `--pressure --need --apply`; it cannot widen ordinary cache,
+paused-runner, or idle cleanup.

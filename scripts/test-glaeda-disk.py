@@ -2302,6 +2302,132 @@ class GlaedaDiskTest(unittest.TestCase):
         with ps(""):
             self.assertIn("cannot list", gd.host_busy(fleet))
 
+    def test_cmux_next_drain_requires_enrollment_and_holds_host_lock(self) -> None:
+        fleet = self.root / "fleet"
+        fleet.mkdir()
+        (fleet / "host.lock").touch()
+        (fleet / "reservation.json").write_text(json.dumps({
+            "schema": "glaeda-reservation/v1", "owner": "test", "purpose": "drain",
+            "since": int(time.time()) - 1, "until": int(time.time()) + 60,
+        }))
+        runner = self.root / "actions-runner-glaeda"
+        (runner / "glaeda-hooks").mkdir(parents=True)
+        (runner / ".runner").write_text("{}")
+        (runner / "glaeda-hooks/job-started.sh").write_text(
+            "exec /usr/bin/python3 glaeda-cmux-runner-hook job-started --allowed-owner manaflow-ai\n"
+        )
+        (runner / "glaeda-hooks/glaeda-cmux-runner-hook").write_bytes(
+            (ROOT / "scripts/glaeda-cmux-runner-hook").read_bytes()
+        )
+        plist = self.root / "Library/LaunchAgents"
+        plist.mkdir(parents=True)
+        (plist / "runner.plist").write_bytes(plistlib.dumps({
+            "EnvironmentVariables": {"ACTIONS_RUNNER_HOOK_JOB_STARTED": os.fspath(runner / "glaeda-hooks/job-started.sh")}
+        }))
+        saved = (gd.HOME, gd.FLEET_DIR)
+        gd.HOME, gd.FLEET_DIR = self.root, fleet
+        try:
+            ps = mock.patch.object(
+                gd.subprocess, "run",
+                return_value=subprocess.CompletedProcess([], 0, "/sbin/launchd\n", ""),
+            )
+            with mock.patch.object(
+                gd.subprocess, "run",
+                return_value=subprocess.CompletedProcess([], 0, "/sbin/launchd\n", ""),
+            ):
+                handle, reason = gd.cmux_next_drain_preflight(expected_owner="test")
+            self.assertIsNotNone(handle, reason)
+            self.assertEqual(reason, "")
+            fcntl.flock(handle, fcntl.LOCK_UN)
+            handle.close()
+            with mock.patch.object(
+                gd.subprocess, "run",
+                return_value=subprocess.CompletedProcess([], 0, "/sbin/launchd\n", ""),
+            ):
+                handle, reason = gd.cmux_next_drain_preflight(expected_owner="another-owner")
+            self.assertIsNone(handle)
+            self.assertIn("owner", reason)
+            (runner / "glaeda-hooks/glaeda-cmux-runner-hook").write_text(
+                "# def take_host_lock(x): pass; def release_host_lock(x): pass\n"
+            )
+            with ps:
+                handle, reason = gd.cmux_next_drain_preflight(expected_owner="test")
+            self.assertIsNone(handle)
+            self.assertIn("enrollment", reason)
+        finally:
+            gd.HOME, gd.FLEET_DIR = saved
+
+    def test_cmux_next_drain_defers_when_host_lock_is_held(self) -> None:
+        fleet = self.root / "fleet"
+        fleet.mkdir()
+        lock = fleet / "host.lock"
+        lock.touch()
+        (fleet / "reservation.json").write_text(json.dumps({
+            "schema": "glaeda-reservation/v1", "owner": "test", "purpose": "drain",
+            "since": int(time.time()) - 1, "until": int(time.time()) + 60,
+        }))
+        runner = self.root / "actions-runner-glaeda"
+        (runner / "glaeda-hooks").mkdir(parents=True)
+        (runner / ".runner").write_text("{}")
+        (runner / "glaeda-hooks/job-started.sh").write_text("glaeda-cmux-runner-hook job-started\n")
+        (runner / "glaeda-hooks/glaeda-cmux-runner-hook").write_bytes(
+            (ROOT / "scripts/glaeda-cmux-runner-hook").read_bytes()
+        )
+        plist = self.root / "Library/LaunchAgents"
+        plist.mkdir(parents=True)
+        (plist / "runner.plist").write_bytes(plistlib.dumps({
+            "EnvironmentVariables": {"ACTIONS_RUNNER_HOOK_JOB_STARTED": os.fspath(runner / "glaeda-hooks/job-started.sh")}
+        }))
+        saved = (gd.HOME, gd.FLEET_DIR)
+        gd.HOME, gd.FLEET_DIR = self.root, fleet
+        with lock.open("a+") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            try:
+                with mock.patch.object(
+                    gd.subprocess, "run",
+                    return_value=subprocess.CompletedProcess([], 0, "/sbin/launchd\n", ""),
+                ):
+                    handle, reason = gd.cmux_next_drain_preflight(expected_owner="test")
+                self.assertIsNone(handle)
+                self.assertIn("host.lock", reason)
+            finally:
+                gd.HOME, gd.FLEET_DIR = saved
+
+    def test_cmux_next_drain_defers_for_a_live_runner_worker(self) -> None:
+        fleet = self.root / "fleet"
+        fleet.mkdir()
+        (fleet / "host.lock").touch()
+        (fleet / "reservation.json").write_text(json.dumps({
+            "schema": "glaeda-reservation/v1", "owner": "test", "purpose": "drain",
+            "since": int(time.time()) - 1, "until": int(time.time()) + 60,
+        }))
+        runner = self.root / "actions-runner-glaeda"
+        (runner / "glaeda-hooks").mkdir(parents=True)
+        (runner / ".runner").write_text("{}")
+        (runner / "glaeda-hooks/job-started.sh").write_text("glaeda-cmux-runner-hook job-started\n")
+        (runner / "glaeda-hooks/glaeda-cmux-runner-hook").write_bytes(
+            (ROOT / "scripts/glaeda-cmux-runner-hook").read_bytes()
+        )
+        plist = self.root / "Library/LaunchAgents"
+        plist.mkdir(parents=True)
+        (plist / "runner.plist").write_bytes(plistlib.dumps({
+            "EnvironmentVariables": {"ACTIONS_RUNNER_HOOK_JOB_STARTED": os.fspath(runner / "glaeda-hooks/job-started.sh")}
+        }))
+        saved = (gd.HOME, gd.FLEET_DIR)
+        gd.HOME, gd.FLEET_DIR = self.root, fleet
+        try:
+            with mock.patch.object(
+                gd.subprocess, "run",
+                return_value=subprocess.CompletedProcess(
+                    [], 0, "/Users/actions-runner-glaeda/bin/Runner.Worker --job\n", ""
+                ),
+            ):
+                handle, reason = gd.cmux_next_drain_preflight(expected_owner="test")
+            self.assertIsNone(handle)
+            self.assertIn("live job/build", reason)
+        finally:
+            gd.HOME, gd.FLEET_DIR = saved
+
     def test_idle_apply_stops_once_the_host_turns_busy(self) -> None:
         for name in ("a", "b", "c"):
             make(self.root / name)

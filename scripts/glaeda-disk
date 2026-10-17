@@ -106,11 +106,13 @@ build output or copies. Nested or unverifiable checkouts stay protected.
 from __future__ import annotations
 
 import argparse
+import ast
 import atexit
 import bisect
 import calendar
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import platform
@@ -393,6 +395,11 @@ FLEET_FAMILY_IDS = ("cmux-pr-builds", "cmux-seeds", "cmux-kept-build", "ci-deriv
 CMUX_NEXT_CI_FAMILY = "cmux-next-ci-generated"
 CMUX_NEXT_CI_ROOT = "cmux-next-ci"
 CMUX_NEXT_CI_MIN_IDLE_HOURS = 72.0
+CMUX_NEXT_CI_DRAIN = False
+CMUX_NEXT_CI_DRAIN_RESERVATION: dict | None = None
+CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
+    "7387d785e729cba8248c186e70904b11ab45a8c2f4e26844e4cccbfce6f9a66b",
+})
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
     "SDKExplicitPrecompiledModules", "info.plist", ".metadata_never_index",
@@ -579,6 +586,8 @@ def item_window(fam: Family, path: Path, idle_hours: float, archived: frozenset[
     (EMERGENCY_DEVS) may go at once (its lock keeps what a job holds). Everything else waits out its family's
     window."""
     if fam.id == "cmux-seeds" and path.name in archived:
+        return 0.0
+    if fam.id == CMUX_NEXT_CI_FAMILY and CMUX_NEXT_CI_DRAIN:
         return 0.0
     if fam.id == SPM_SCRATCH:
         if path.name.startswith(SPM_TRASH):
@@ -811,6 +820,146 @@ def host_busy(fleet: Path | None = None, now: float | None = None) -> str:
         return "a fleet build holds the host lock"
     finally:
         os.close(fd)
+    return ""
+
+
+def _valid_cmux_next_drain_reservation(marker: object, now: float | None = None) -> bool:
+    now = time.time() if now is None else now
+    return (isinstance(marker, dict) and marker.get("schema") == "glaeda-reservation/v1"
+            and isinstance(marker.get("owner"), str) and isinstance(marker.get("purpose"), str)
+            and isinstance(marker.get("since"), int) and not isinstance(marker.get("since"), bool)
+            and isinstance(marker.get("until"), int) and not isinstance(marker.get("until"), bool)
+            and 0 <= marker["since"] <= now and now < marker["until"] <= now + 24 * 3600
+            and marker["until"] - marker["since"] <= 24 * 3600)
+
+
+def _hook_proves_whole_job_host_lock(source: str) -> bool:
+    """Recognize the installed hook's call graph, ignoring comments/strings."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+    definitions = {node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
+    calls = {node.func.id for node in ast.walk(tree)
+             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+    return {"take_host_lock", "release_host_lock"} <= definitions and {"take_host_lock", "release_host_lock"} <= calls
+
+
+def cmux_next_drain_preflight(fleet: Path | None = None, expected_owner: str | None = None) -> tuple[object | None, str]:
+    """Acquire the enrolled runner's exclusive host lock for explicit drain mode.
+
+    This is intentionally stricter than ``host_busy``: a bounded active
+    reservation and installed job-started wrappers prove that new Glaeda jobs
+    are being admitted through the whole-job host lock.  The returned file
+    handle remains open until the caller has completed its fresh checks and
+    renames.
+    """
+    fleet = FLEET_DIR if fleet is None else fleet
+    if fleet.is_symlink() or not fleet.is_dir():
+        return None, "cmux-next drain requires a non-symlink fleet directory"
+    cursor = fleet
+    while cursor.parent != cursor:
+        if cursor.is_symlink():
+            return None, "cmux-next drain refuses symlinked fleet ancestors"
+        cursor = cursor.parent
+    reservation = fleet / "reservation.json"
+    try:
+        if reservation.is_symlink() or not reservation.is_file():
+            return None, "cmux-next drain requires a regular reservation file"
+        raw = reservation.read_text()
+        marker = json.loads(raw)
+        if not _valid_cmux_next_drain_reservation(marker):
+            return None, "cmux-next drain requires a fresh active Glaeda reservation"
+        if not expected_owner or marker.get("owner") != expected_owner:
+            return None, "cmux-next drain reservation owner does not match the requested owner"
+        global CMUX_NEXT_CI_DRAIN_RESERVATION
+        CMUX_NEXT_CI_DRAIN_RESERVATION = dict(marker)
+    except (OSError, ValueError, TypeError):
+        return None, "cmux-next drain requires a readable active Glaeda reservation"
+    runners = []
+    try:
+        for runner in HOME.glob("actions-runner*"):
+            hook_dir = runner / "glaeda-hooks"
+            registration = runner / ".runner"
+            started = hook_dir / "job-started.sh"
+            registered = registration.exists() or registration.is_symlink()
+            if not registered:
+                continue
+            if (runner.is_symlink() or registration.is_symlink() or not registration.is_file()
+                    or hook_dir.is_symlink() or not hook_dir.is_dir()
+                    or started.is_symlink() or not started.is_file()):
+                return None, f"runner enrollment state is unsafe for {runner.name}"
+            if runner.is_dir():
+                text = started.read_text()
+                implementation = (hook_dir / "glaeda-cmux-runner-hook")
+                if implementation.is_symlink() or not implementation.is_file():
+                    return None, f"runner hook implementation is unsafe for {runner.name}"
+                implementation_bytes = implementation.read_bytes()
+                implementation_text = implementation_bytes.decode()
+                implementation_sha = hashlib.sha256(implementation_bytes).hexdigest()
+                if ("glaeda-cmux-runner-hook" not in text or " job-started" not in text
+                        or implementation_sha not in CMUX_NEXT_DRAIN_HOOK_SHA256
+                        or not _hook_proves_whole_job_host_lock(implementation_text)):
+                    return None, f"runner hook enrollment is not proven for {runner.name}"
+                plist_paths = [*HOME.glob("Library/LaunchAgents/*.plist"),
+                               *Path("/Library/LaunchDaemons").glob("*.plist")]
+                enrolled = False
+                for plist in plist_paths:
+                    try:
+                        if plist.is_symlink() or not plist.is_file():
+                            continue
+                        doc = plistlib.loads(plist.read_bytes())
+                        env = doc.get("EnvironmentVariables", {}) if isinstance(doc, dict) else {}
+                        if env.get("ACTIONS_RUNNER_HOOK_JOB_STARTED") == os.fspath(started):
+                            enrolled = True
+                            break
+                    except (OSError, ValueError, plistlib.InvalidFileException):
+                        continue
+                if not enrolled:
+                    return None, f"launchd does not prove job-started enrollment for {runner.name}"
+                runners.append(runner)
+    except (OSError, UnicodeDecodeError):
+        return None, "runner hook enrollment could not be inspected"
+    if not runners:
+        return None, "cmux-next drain requires an enrolled Glaeda runner"
+    busy = cmux_next_drain_halt(fleet)
+    if busy:
+        return None, busy
+    lock = fleet / "host.lock"
+    try:
+        if lock.is_symlink() or not lock.exists() or not lock.is_file():
+            return None, "cmux-next drain requires the enrolled runner host.lock"
+        handle = lock.open("a+")
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, BlockingIOError):
+        with contextlib.suppress(UnboundLocalError, OSError):
+            handle.close()
+        return None, "cmux-next drain deferred: host.lock is held"
+    busy = cmux_next_drain_halt(fleet)
+    if busy:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        handle.close()
+        return None, f"cmux-next drain deferred after lock: {busy}"
+    return handle, ""
+
+
+def cmux_next_drain_halt(fleet: Path | None = None) -> str:
+    """Fresh per-candidate reservation/process gate while drain mode holds host.lock."""
+    fleet = FLEET_DIR if fleet is None else fleet
+    try:
+        marker = json.loads((fleet / "reservation.json").read_text())
+        if not _valid_cmux_next_drain_reservation(marker):
+            return "cmux-next drain reservation expired or changed"
+        if CMUX_NEXT_CI_DRAIN_RESERVATION is None or marker != CMUX_NEXT_CI_DRAIN_RESERVATION:
+            return "cmux-next drain reservation changed"
+        ps = subprocess.run(["ps", "-axww", "-o", "command="], capture_output=True, text=True, timeout=60)
+    except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+        return "cmux-next drain cannot recheck reservation/process state"
+    if ps.returncode != 0 or not ps.stdout.strip():
+        return "cmux-next drain cannot recheck process state"
+    for line in ps.stdout.splitlines():
+        if CI_WORKER.search(line) or BUILD_PROCESS.search(line):
+            return f"cmux-next drain deferred: live job/build ({line.strip()[:120]})"
     return ""
 
 
@@ -4032,7 +4181,7 @@ APPLY_LSOF_ITEMS, APPLY_LSOF_S = 8, 20.0  # apply re-takes lsof for discovered i
 
 def apply(items: list[Item], families: dict[str, Family], receipt: Path,
           targets: dict[int, int] | None, idle_hours: float, halt=None,
-          all_families: list[Family] | None = None) -> int:
+          all_families: list[Family] | None = None, receipt_sweep: bool | None = None) -> int:
     """Delete reclaimable items, largest first. With `targets` (filesystem device -> free bytes
     to stop at), only items on those filesystems are touched, each until its own target. With `halt`
     (the idle sweep's host_busy), each deletion first asks it and the run stops once it names a reason."""
@@ -4161,9 +4310,10 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                                    capture_output=True, timeout=60)
             except (OSError, subprocess.SubprocessError) as e:
                 outcome = f"incomplete:{e.__class__.__name__}"
+        is_sweep = halt is not None if receipt_sweep is None else receipt_sweep
         rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(),
                "outcome": outcome, "rebuild": fam.rebuild, **asdict(i),
-               **({"sweep": "idle"} if halt is not None else {})}
+               **({"sweep": "idle"} if is_sweep else {})}
         with receipt.open("a") as f:
             f.write(json.dumps(rec) + "\n")
         print(f"  {outcome:16s} {gib(i.bytes)}  {i.path.replace(str(HOME), '~')}")
@@ -4573,6 +4723,10 @@ def main(argv: list[str] | None = None) -> int:
                          "the runner hook passes its own --min-free-gib when it evicts before refusing a job")
     ap.add_argument("--need", type=float, default=None,
                     help="make room for this many GiB before a job; derives thresholds from the policy margins")
+    ap.add_argument("--cmux-next-drain", action="store_true",
+                    help="explicit enrolled-runner maintenance: drain cmux-next generated output under host.lock")
+    ap.add_argument("--cmux-next-reservation-owner",
+                    help="cmux-next drain: exact owner string in the active Glaeda reservation")
     ap.add_argument("--idle-hours", type=float, default=None,
                     help="idle window (default 24h, or 6h under pressure)")
     ap.add_argument("--family", action="append", help="limit to these family ids")
@@ -4606,6 +4760,16 @@ def main(argv: list[str] | None = None) -> int:
             return 3
         print(message)
         return 0
+
+    if a.cmux_next_drain:
+        if (not a.apply or not a.pressure or a.need is None or a.family != [CMUX_NEXT_CI_FAMILY]
+                or not a.cmux_next_reservation_owner
+                or not a.runner_caches or a.idle or a.dedupe or a.dedupe_builds):
+            print("cmux-next drain requires --runner-caches --pressure --need --family cmux-next-ci-generated "
+                  "--cmux-next-reservation-owner OWNER --apply")
+            return 3
+        global CMUX_NEXT_CI_DRAIN
+        CMUX_NEXT_CI_DRAIN = True
 
     global _REFRESH_HANDLE
     if a.refresh_lock_fd is not None:
@@ -4729,10 +4893,19 @@ def main(argv: list[str] | None = None) -> int:
     # run looks only on the filesystems under pressure); `--family interrupted-deletions` alone looks in all.
     if not a.family or INTERRUPTED in a.family:
         fams = fams + interrupted_families(every if a.family and set(a.family) == {INTERRUPTED} else fams)
+    maintenance_handle = None
     if a.apply:
+        if a.cmux_next_drain:
+            maintenance_handle, why = cmux_next_drain_preflight(expected_owner=a.cmux_next_reservation_owner)
+            if maintenance_handle is None:
+                print(why)
+                return 3
         if RUNNER_CACHE_PROFILE and not runner_profile_roots_safe(fams):
             print("runner cache profile roots changed during observation; skipped")
             release_evict_lock(_EVICT_HANDLE)
+            if maintenance_handle is not None:
+                fcntl.flock(maintenance_handle, fcntl.LOCK_UN)
+                maintenance_handle.close()
             return 0
         # A second eviction would only race the first for the same items; its caller re-reads free
         # space instead.  The owner record lets a later run recover from a daemon that died while
@@ -4741,9 +4914,12 @@ def main(argv: list[str] | None = None) -> int:
             owner = eviction_owner_status()
             write_eviction_status(a.receipt, owner)
             write_eviction_contention_health(a.receipt)
-            return deferred("eviction_busy",
-                            f"another eviction running; skipped ({eviction_owner_text(owner)})",
-                            owner=owner)
+            result = deferred("eviction_busy", f"another eviction running; skipped ({eviction_owner_text(owner)})",
+                              owner=owner)
+            if maintenance_handle is not None:
+                fcntl.flock(maintenance_handle, fcntl.LOCK_UN)
+                maintenance_handle.close()
+            return result
     idle = a.idle_hours if a.idle_hours is not None else IDLE_SWEEP_HOURS if sweep else (6 if under else 24)
     at, known, measured_at = (0.0, {}, {}) if a.refresh or a.no_snapshot else load_snapshot_meta()
     original_known = set(known)
@@ -4765,10 +4941,16 @@ def main(argv: list[str] | None = None) -> int:
         measure_lock = MEASURE_LOCK.open("a")
         fcntl.flock(measure_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        measure_lock.close()
-        measure_lock = None
         if a.pressure or a.refresh:
-            return deferred("measurement_busy", "another measurement running; skipped")
+            if measure_lock is not None:
+                measure_lock.close()
+                measure_lock = None
+            result = deferred("measurement_busy", "another measurement running; skipped")
+            if maintenance_handle is not None:
+                fcntl.flock(maintenance_handle, fcntl.LOCK_UN)
+                maintenance_handle.close()
+            return result
+        measure_lock = None
     refresh_deadline = None
     if a.refresh and a.refresh_budget_s > 0:
         refresh_deadline = time.monotonic() + a.refresh_budget_s
@@ -4823,9 +5005,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  {gib(t.bytes)}  {t.verdict:12s} {t.idle_hours:6.1f}h  {t.family} {t.path} ({', '.join(t.reasons)})")
     if a.apply:
         print()
-        halt = host_busy if sweep and POLICY["defer_during_ci"] else None
+        halt = (cmux_next_drain_halt if a.cmux_next_drain
+                else host_busy if sweep and POLICY["defer_during_ci"] else None)
         apply(items, {f.id: f for f in fams}, a.receipt,
-              {fs.dev: fs.target for fs in shown} if a.pressure else None, idle, halt, all_families=fams)
+              {fs.dev: fs.target for fs in shown} if a.pressure else None, idle, halt,
+              all_families=fams, receipt_sweep=sweep)
         # A drained runner is explicitly held by cmux_mini_fix; once its listener and worker
         # are absent, its disposable checkout can be cleared under this same eviction lock.
         if not RUNNER_CACHE_PROFILE:
@@ -4837,6 +5021,9 @@ def main(argv: list[str] | None = None) -> int:
             IDLE_STAMP.parent.mkdir(parents=True, exist_ok=True)
             IDLE_STAMP.touch()
         release_evict_lock(_EVICT_HANDLE)
+        if maintenance_handle is not None:
+            fcntl.flock(maintenance_handle, fcntl.LOCK_UN)
+            maintenance_handle.close()
     return 0
 
 
