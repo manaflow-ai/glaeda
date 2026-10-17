@@ -677,7 +677,7 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
     agents = {
         LABEL_PREFIX + "disk-pressure": {
             "Label": LABEL_PREFIX + "disk-pressure",
-            "ProgramArguments": [python, disk, "--role", ctx.role, "--pressure", "--idle", "--apply", "--top", "0"],
+            "ProgramArguments": [pressure, "--once"],
             "StartInterval": 900,
             "RunAtLoad": True,
             # Not ProcessType Background: under pressure this job must still finish its lsof and free
@@ -685,7 +685,7 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             # --idle: with no pressure, an hourly sweep of idle reproducible data while no job runs.
             "LowPriorityIO": True,
             "Nice": 10,
-            "EnvironmentVariables": {"GLAEDA_PYTHON": python, "GLAEDA_DISK": disk},
+            "EnvironmentVariables": {"GLAEDA_PYTHON": python, "GLAEDA_DISK": disk, "GLAEDA_ROLE": ctx.role},
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-disk.log"),
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-disk.err"),
         },
@@ -1073,7 +1073,7 @@ def reclaim_source(ctx: Context) -> tuple[str, Path | None, str]:
 def launchctl_loaded(ctx: Context, label: str) -> bool | None:
     if ctx.skip_launchctl:
         return None
-    domain = f"system/{label}" if ctx.headless else f"gui/{ctx.uid}/{label}"
+    domain = f"system/{label}" if getattr(ctx, "headless", False) is True else f"gui/{ctx.uid}/{label}"
     code, _ = run(([SUDO, "/bin/launchctl", "print", domain] if ctx.headless
                    else ["/bin/launchctl", "print", domain]))
     return code == 0
@@ -1425,7 +1425,7 @@ def launchctl(ctx: Context, *args: str) -> tuple[int, str]:
 
 def bootout(ctx: Context, label: str, wait_s: float = 5.0) -> bool:
     """Unload a job and wait (bounded) until launchd no longer lists it."""
-    domain = f"system/{label}" if ctx.headless else f"gui/{ctx.uid}/{label}"
+    domain = f"system/{label}" if getattr(ctx, "headless", False) is True else f"gui/{ctx.uid}/{label}"
     code, output = launchctl(ctx, "bootout", domain)
     if code != 0 and "could not find" not in output.lower() and "no such process" not in output.lower():
         return False
@@ -1921,7 +1921,7 @@ def main(argv: list[str] | None = None) -> int:
                   args.glaeda.expanduser() if args.glaeda else None, args.xcode_app, min_free_gib,
                   args.hygiene_only or HOST_PLATFORM == "linux", ota_ring=args.ota_ring,
                   ota_source=args.ota_source, role=role,
-                  role_explicit=args.role is not None or recorded_role is not None,
+                  role_explicit=args.role is not None,
                   headless=args.headless)
     pre = preflight(ctx)
     if ctx.hygiene_only:  # build-host checks are reported, not enforced
