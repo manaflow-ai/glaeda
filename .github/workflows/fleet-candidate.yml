@@ -7,6 +7,8 @@ on:
       - .github/workflows/fleet-candidate.yml
       - scripts/fleet_bundle.py
       - scripts/test-fleet-bundle.py
+      - scripts/fleet_candidate_receipt.py
+      - scripts/test-fleet-candidate-receipt.py
       - tests/fleet_bundle_contract.rs
       - scripts/glaeda-disk
       - scripts/test-glaeda-disk.py
@@ -43,9 +45,13 @@ jobs:
           show-progress: false
       - name: Install pinned Rust
         run: rustup toolchain install 1.97.1 --profile minimal --no-self-update
-      - name: Test bundle verification
-        run: python3 scripts/test-fleet-bundle.py
+      - name: Test bundle and receipt verification
+        id: bundle_test
+        run: |
+          python3 scripts/test-fleet-bundle.py
+          python3 scripts/test-fleet-candidate-receipt.py
       - name: Build exact-source candidate
+        id: candidate_build
         env:
           CANDIDATE_TARGET: ${{ matrix.target }}
         run: |
@@ -54,6 +60,13 @@ jobs:
             --output target/fleet-bundles > "$RUNNER_TEMP/fleet-candidate.json"
           cat "$RUNNER_TEMP/fleet-candidate.json" >> "$GITHUB_STEP_SUMMARY"
           cp "$RUNNER_TEMP/fleet-candidate.json" target/fleet-bundles/receipt.json
+      - name: Require exact candidate checkout
+        if: ${{ success() && steps.candidate_build.outcome == 'success' }}
+        run: |
+          python3 scripts/fleet_candidate_receipt.py \
+            --candidate-receipt target/fleet-bundles/receipt.json \
+            --output "$RUNNER_TEMP/exact-source-receipt.json" \
+            --require-exact-source
       - name: Build native runner-log observer (macOS)
         id: native_build
         if: matrix.target == 'aarch64-apple-darwin'
@@ -102,8 +115,29 @@ jobs:
           }
           binary.with_suffix(".receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
           PYTHON
+      - name: Record workflow evidence
+        if: always()
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+          REQUESTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          WORKFLOW_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          TARGET: ${{ matrix.target }}
+          JOB_STATUS: ${{ job.status }}
+          BUNDLE_TEST_OUTCOME: ${{ steps.bundle_test.outcome }}
+          CANDIDATE_BUILD_OUTCOME: ${{ steps.candidate_build.outcome }}
+          NATIVE_BUILD_OUTCOME: ${{ steps.native_build.outcome }}
+          NATIVE_TEST_OUTCOME: ${{ steps.native_test.outcome }}
+        run: |
+          mkdir -p target/fleet-bundles
+          python3 scripts/fleet_candidate_receipt.py \
+            --candidate-receipt target/fleet-bundles/receipt.json \
+            --output target/fleet-bundles/workflow-receipt.json
+          cat target/fleet-bundles/workflow-receipt.json >> "$GITHUB_STEP_SUMMARY"
       - name: Upload candidate and receipt
-        if: ${{ success() || (always() && steps.native_build.outcome == 'success') }}
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: glaeda-candidate-${{ matrix.target }}
