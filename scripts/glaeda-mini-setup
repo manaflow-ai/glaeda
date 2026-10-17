@@ -1908,8 +1908,10 @@ def main(argv: list[str] | None = None) -> int:
         prior = json.loads((home / ".local/state/glaeda/mini-setup/receipt.json").read_text())
         if isinstance(prior, dict):
             recorded_role = prior.get("role") if prior.get("role") in {"devbox", "fleet-mini"} else None
-            if recorded_role is None:
-                recorded_role = {"build-host": "fleet-mini", "hygiene": "devbox"}.get(prior.get("profile"))
+            if recorded_role is None and prior.get("profile") in {"build-host", "hygiene"}:
+                # Before roles were recorded, both profiles used the fleet-style disk policy.
+                # Keep that policy on upgrade; opting into devbox requires --role devbox.
+                recorded_role = "fleet-mini"
     except (OSError, ValueError, TypeError):
         pass
     role = args.role or recorded_role or ("devbox" if args.hygiene_only or HOST_PLATFORM == "linux" else "fleet-mini")
