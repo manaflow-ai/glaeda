@@ -52,11 +52,18 @@ fn libproc_open_identity_survives_same_volume_stage_and_second_runner_is_indepen
     fs::create_dir_all(first.join("bin")).expect("bin");
     let worker_path = first.join("bin/Runner.Worker");
     fs::copy("/bin/sleep", &worker_path).expect("worker binary");
+    let signed = std::process::Command::new("/usr/bin/codesign")
+        .args(["--force", "--sign", "-", "--timestamp=none"])
+        .arg(&worker_path)
+        .status()
+        .expect("codesign worker");
+    assert!(signed.success());
     let mut worker = std::process::Command::new(&worker_path)
         .arg("5")
-        .current_dir(&first)
+        .current_dir(&base)
         .spawn()
         .expect("runner worker");
+    assert!(worker.try_wait().expect("worker status").is_none());
     let policy = Policy::new(MIN_RUNNER_LOG_RECLAIM_IDLE_SECONDS, 4).expect("policy");
     let first_plan = reclaim(&first, &first_receipt, policy, None, false).expect("first plan");
     assert_eq!(
@@ -74,6 +81,7 @@ fn libproc_open_identity_survives_same_volume_stage_and_second_runner_is_indepen
     let staged_plan = observe(&first, &first_receipt, policy).expect("staged observation");
     assert_eq!(staged_plan.items[0].decision, ItemDecision::OpenOrBusy);
     fs::rename(&staged, &first_log).expect("restore");
+    assert!(worker.try_wait().expect("worker status").is_none());
     let _ = worker.kill();
     let _ = worker.wait();
     drop(held);
