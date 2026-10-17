@@ -1406,8 +1406,11 @@ class GlaedaDiskTest(unittest.TestCase):
         root = self.root / "Library/Caches/cmux-next-ci"
         state = root / "cmux-scheme/runner-a"
         products = make(state / "Products", age_hours=96)
+        nested_products = make(state / "Build/Products", age_hours=96)
         guard = gd.cmux_next_ci_dedupe_guard(root)
         self.assertTrue(guard(products / "blob"))
+        nested_guard = gd.cmux_next_ci_dedupe_guard(root)
+        self.assertTrue(nested_guard(nested_products / "blob"))
         (state / ".lock").write_text("")
         self.assertFalse(guard(products / "blob"))
         (state / ".lock").unlink()
@@ -1422,10 +1425,11 @@ class GlaedaDiskTest(unittest.TestCase):
         state = root / "cmux-scheme/runner-a"
         products = make(state / "Products", age_hours=96)
         build = make(state / "Build", age_hours=96)
+        nested_products = make(state / "Build/Products", age_hours=96)
         (state / "Logs").mkdir(parents=True)
         (state / "SourcePackages").mkdir()
         (state / "unknown").mkdir()
-        self.assertEqual(gd.cmux_next_ci_dedupe_roots(root), [products])
+        self.assertEqual(sorted(gd.cmux_next_ci_dedupe_roots(root)), sorted([products, nested_products]))
 
     def test_fleet_ci_hot_tier(self) -> None:
         ci = self.root / "ci"
@@ -2643,6 +2647,21 @@ class DedupeTest(unittest.TestCase):
         # An explicit inactive-Products pass can clone it after its guard has rechecked
         # the state roots.  This test uses a constant guard because APFS clone support
         # is already the class-level Darwin requirement.
+        r = gd.dedupe(gd.cmux_next_ci_dedupe_roots(root), self.state, guard=lambda _: True)
+        self.assertEqual(r["cloned_bytes"], len(data))
+        self.assertEqual(second.read_bytes(), data)
+        self.assertNotEqual(second.stat().st_ino, before)
+        self.assertEqual(first.read_bytes(), data)
+
+    def test_cmux_next_ci_nested_build_products_are_deduped(self) -> None:
+        data = os.urandom(2 * 1024 * 1024)
+        root = self.root / "Library/Caches/cmux-next-ci"
+        first = self.blob("Library/Caches/cmux-next-ci/cmux-scheme/runner-a/Build/Products/a.o", data)
+        second = self.blob("Library/Caches/cmux-next-ci/cmux-scheme/runner-b/Build/Products/a.o", data)
+        before = second.stat().st_ino
+        # The ordinary input-only roots still exclude the Build tree.
+        self.assertEqual(gd.dedupe(gd.dedupe_roots(root / "cmux-scheme"), self.state)["cloned_bytes"], 0)
+        self.assertEqual(second.stat().st_ino, before)
         r = gd.dedupe(gd.cmux_next_ci_dedupe_roots(root), self.state, guard=lambda _: True)
         self.assertEqual(r["cloned_bytes"], len(data))
         self.assertEqual(second.read_bytes(), data)

@@ -4309,11 +4309,18 @@ def cmux_next_ci_dedupe_roots(root: Path) -> list[Path]:
     found: list[Path] = []
     for state in cmux_next_ci_state_roots(root):
         for child in _children(state):
-            if child.name not in CMUX_NEXT_CI_DEDUPE_DIR_NAMES or child.is_symlink():
+            if child.is_symlink():
                 continue
-            if child.is_dir():
+            if child.name in CMUX_NEXT_CI_DEDUPE_DIR_NAMES and child.is_dir():
                 found.append(child)
-    return found
+                continue
+            # Current Xcode state roots nest the sealed products under the
+            # write-heavy Build tree. Admit only that Products leaf.
+            if child.name == "Build":
+                products = child / "Products"
+                if products.is_dir() and not products.is_symlink():
+                    found.append(products)
+    return sorted(found)
 
 
 def cmux_next_ci_dedupe_guard(root: Path):
@@ -4339,15 +4346,20 @@ def cmux_next_ci_dedupe_guard(root: Path):
         state = cmux_next_ci_state_for_path(path, root)
         if state is None:
             return False
-        # cmux_next_ci_busy expects the generated child, not a file several levels
-        # below it.  The first component below the state is deterministic because the
-        # roots came from cmux_next_ci_dedupe_roots above.
+        # Products may be a direct state child or the sealed Products leaf below Build.
         try:
-            child_name = path.relative_to(state).parts[0]
+            relative = path.relative_to(state).parts
         except (ValueError, IndexError):
             return False
-        child = state / child_name
-        if child.name not in CMUX_NEXT_CI_DEDUPE_DIR_NAMES or not child.is_dir():
+        if not relative:
+            return False
+        if relative[0] in CMUX_NEXT_CI_DEDUPE_DIR_NAMES:
+            child = state / relative[0]
+        elif relative[:2] == ("Build", "Products"):
+            child = state / "Build"
+        else:
+            return False
+        if not child.is_dir():
             return False
         if pending_evidence is None or pending_path is None:
             try:
