@@ -145,7 +145,7 @@ rust_channel() {  # ROOT CHANNEL (the toolchain rust-toolchain.toml in the check
 }
 
 # Glaeda itself: the checkout glaeda-mini-enroll runs from, then its user-level setup.
-glaeda() {  # PYTHON
+glaeda() {  # PYTHON [--headless]
   local dir="$HOME/glaeda"
   if [ ! -f "$dir/scripts/cmux_fleet.py" ]; then
     [ ! -e "$dir" ] || refuse "$dir exists and is not a Glaeda checkout"
@@ -155,7 +155,9 @@ glaeda() {  # PYTHON
   # an older checkout's setup predates --ota-source; glaeda-mirror.sh in hq sets it on such hosts later
   local ota=()
   grep -q -- '--ota-source' "$dir/scripts/glaeda-mini-setup" && ota=(--ota-source manaflow-ai/glaeda)
-  "$(home "$1")" "$dir/scripts/glaeda-mini-setup" --apply ${ota[@]+"${ota[@]}"}
+  local headless=()
+  [ "${2:-}" = "--headless" ] && headless=(--headless)
+  "$(home "$1")" "$dir/scripts/glaeda-mini-setup" --apply ${headless[@]+"${headless[@]}"} ${ota[@]+"${ota[@]}"}
 }
 
 # ~/glaeda at one commit for the whole run (glaeda-mini-fleet passes --glaeda-ref, else the tip of main), so

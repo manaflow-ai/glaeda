@@ -2050,15 +2050,22 @@ def cmd_release(manifest: dict[str, Any], hosts: list[str], owner: str | None, f
 DEFAULT_CMUX_ROOT = "~/cmux"  # where fix clones cmux on a mini
 # Columns of the preflight table, in the order onboarding meets them.
 PREFLIGHT_CHECKS = ("os", "xcode", "select", "licence", "launch", "metal", "rust", "zig", "tools", "python", "python3",
-                    "gh", "cmux", "setup", "glaeda", "power", "disk", "update", "autoupdate", "candidate", "node", "enroll", "runner",
+                    "gh", "cmux", "setup", "glaeda", "headless_sudo", "power", "disk", "update", "autoupdate", "candidate", "node", "enroll", "runner",
                     "brew", "pins", "secrets")
 # An unknown here means the bootstrap would refuse or cannot be predicted, so it blocks like a failure.
-UNKNOWN_BLOCKS = frozenset({"xcode", "select", "licence", "launch", "metal", "zig", "power", "disk"})
+UNKNOWN_BLOCKS = frozenset({"xcode", "select", "licence", "launch", "metal", "zig", "headless_sudo", "power", "disk"})
 # Who can apply a fix: the SSH login user alone, the login user with an admin password, or a person.
 FIX_GROUPS = ("self", "password", "person")
 # Preflight checks `check` reports as toolchain drift; the checkout ones only on hosts with a node id.
 TOOLCHAIN_CHECKS = ("metal", "rust", "zig", "python", "cmux", "setup")
 GROUP_TITLES = {"self": "can do itself (no root)", "password": "needs a password", "person": "needs a person"}
+GLAEDA_LABEL_PREFIX = "com.teamleaderleo.glaeda."
+HEADLESS_GLAEDA_REQUIRED = frozenset({
+    GLAEDA_LABEL_PREFIX + "disk-pressure",
+    GLAEDA_LABEL_PREFIX + "disk-dedupe",
+    GLAEDA_LABEL_PREFIX + "worktree-reclaim",
+    GLAEDA_LABEL_PREFIX + "update",
+})
 
 
 def xcode_pin(manifest: dict[str, Any], name: str) -> str | None:
@@ -2141,6 +2148,12 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
     brew_group = "self" if owner in (None, user) else "password"
     checkout = cmux_checkout(manifest, name)
     root = checkout["root"]
+
+    # Manifest members with no GUI (the AWS EC2 Macs) must keep their maintenance
+    # agents in the system LaunchDaemon domain.  A GUI LaunchAgent appears healthy
+    # while an operator session is logged in, then disappears after reboot, which
+    # strands disk pressure and OTA maintenance on a headless worker.
+    setup_headless = " --headless" if host.get("gui") is False else ""
 
     def brew(formula: str) -> dict[str, Any]:
         return {"kind": "brew", "formula": formula, "owner": owner or user,
@@ -2354,6 +2367,11 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
 
     glaeda_missing = [what for what, present in (("~/glaeda checkout", pf.get("glaeda_checkout")),
                                                   ("native cache root", pf.get("cache_root"))) if not present]
+    glaeda_jobs = [j for j in obs.get("launchd", []) if j.get("label", "").startswith(GLAEDA_LABEL_PREFIX)]
+    gui_glaeda_jobs = [j for j in glaeda_jobs if j.get("domain", "").endswith("/Library/LaunchAgents")]
+    system_glaeda_labels = {j["label"] for j in glaeda_jobs if j.get("domain") == "/Library/LaunchDaemons"}
+    headless_setup_drift = host.get("gui") is False and not glaeda_missing and (
+        gui_glaeda_jobs or not HEADLESS_GLAEDA_REQUIRED.issubset(system_glaeda_labels))
     lacking = pf.get("glaeda_lacking") or []
     head = pf.get("glaeda_head") or ""
     pinned_ref = GLAEDA_REF
@@ -2364,15 +2382,32 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
     if glaeda_missing:
         put("glaeda", "fail", f"missing: {', '.join(glaeda_missing)}",
             f"git clone https://github.com/{FLEET_SOURCE}.git ~/glaeda; "
-            f"~/glaeda/scripts/glaeda-mini-setup --apply --ota-source {FLEET_SOURCE}",
+            f"~/glaeda/scripts/glaeda-mini-setup --apply{setup_headless} --ota-source {FLEET_SOURCE}",
             "self", {"kind": "glaeda"})
     elif behind and pf.get("glaeda_dirty"):
         put("glaeda", "fail", f"~/glaeda is {behind} and has {pf['glaeda_dirty']} local changes",
             "commit or move aside the changes in ~/glaeda, then " + sync, "person")
     elif behind:
         put("glaeda", "fail", f"~/glaeda is {behind}", sync, "self", {"kind": "glaeda_sync"})
+    elif headless_setup_drift:
+        where = "GUI LaunchAgents are installed" if gui_glaeda_jobs else "system maintenance LaunchDaemons are missing"
+        put("glaeda", "fail", f"headless setup drift: {where}",
+            f"glaeda-mini-setup --apply{setup_headless} --ota-source {FLEET_SOURCE}",
+            "self", {"kind": "glaeda"})
     else:
         put("glaeda", "ok", head[:12])
+    headless_sudo_needed = host.get("gui") is False and bool(glaeda_missing or headless_setup_drift)
+    if headless_sudo_needed:
+        if obs.get("sudo") == "nopasswd":
+            put("headless_sudo", "ok", "passwordless sudo")
+        elif obs.get("sudo") == "password":
+            put("headless_sudo", "fail", "headless setup needs passwordless sudo",
+                "grant the SSH login user passwordless sudo for glaeda-mini-setup, then rerun preflight", "person")
+        else:
+            put("headless_sudo", "unknown", "the probe did not report sudo capability",
+                "rerun preflight with the current cmux_mini_probe.sh", "person")
+    else:
+        put("headless_sudo", "info", "not needed for this run")
     pmset = pf.get("pmset", "")
     # autorestart is not a bootstrap check, so it never blocks; a mini that stays off after a power cut idles the lane.
     autorestart_off = re.search(r"^\s*autorestart\s+0\b", pmset, re.MULTILINE) is not None
@@ -2627,7 +2662,7 @@ FIX_ORDER = ("xcode_share", "xcode_clone", "python", "cmux_clone", "submodules",
 # What each repair needs to pass first (checks, or repairs made earlier in the same run).
 # glaeda-mini-setup builds glaeda-worktree-reclaim with cargo, under the Python enroll will use.
 FIX_NEEDS = {"metal": ("licence", "launch"), "setup": ("cmux", "licence", "launch", "metal", "zig"), "brew": ("brew",),
-             "python_link": ("brew",), "glaeda": ("python", "rust"),
+             "python_link": ("brew",), "glaeda": ("python", "rust", "headless_sudo"),
              # git runs through the /usr/bin shim, which needs a selected, licensed developer directory.
              "homebrew_fetch": ("select", "licence")}
 # Remote functions that only read; every other one takes the host's step lock.
@@ -2697,7 +2732,7 @@ def waiting_on(action: dict[str, Any], checks: dict[str, Any], fixed: set[str]) 
     return None
 
 
-def describe(action: dict[str, Any]) -> str:
+def describe(action: dict[str, Any], manifest: dict[str, Any] | None = None, name: str | None = None) -> str:
     kind = action["kind"]
     if kind == "xcode_clone":
         return f"APFS clone {action['source']} to {action['path']}"
@@ -2727,7 +2762,8 @@ def describe(action: dict[str, Any]) -> str:
     if kind == "rust_channel":
         return f"rustup toolchain install {action['channel']}"
     if kind == "glaeda":
-        return "clone Glaeda into ~/glaeda and run glaeda-mini-setup --apply"
+        headless = manifest is not None and name is not None and manifest["hosts"][name].get("gui") is False
+        return "clone Glaeda into ~/glaeda and run glaeda-mini-setup --apply" + (" --headless" if headless else "")
     if kind == "metal":
         return "xcodebuild -downloadComponent MetalToolchain (about 700 MB)"
     if kind == "setup":
@@ -3183,7 +3219,7 @@ def run_repair(manifest: dict[str, Any], name: str, action: dict[str, Any], log:
         "submodules": ("submodules", lambda a: [a["root"], str(a["depth"])]),
         "rust_default": ("rust_default", lambda a: [a["toolchain"]]),
         "rust_channel": ("rust_channel", lambda a: [a["root"], a["channel"]]),
-        "glaeda": ("glaeda", lambda a: [a["python"]]),
+        "glaeda": ("glaeda", lambda a: [a["python"], *(["--headless"] if manifest["hosts"][name].get("gui") is False else [])]),
         "metal": ("metal", lambda a: [a["developer"]]),
         "setup": ("cmux_setup", lambda a: [a["root"], a["developer"]]),
     }
@@ -3232,7 +3268,7 @@ def fix_host(manifest: dict[str, Any], name: str, result: dict[str, Any], yes: b
         log = open(out["log"], "ab")
     try:
         for action in mine:
-            label = f"{'/'.join(action['checks'])}: {describe(action)}"
+            label = f"{'/'.join(action['checks'])}: {describe(action, manifest, name)}"
             blocker = waiting_on(action, checks, fixed)
             if action["kind"] == "xcode_share" and not seed:
                 blocker = "--from HOST, a host that has it"
