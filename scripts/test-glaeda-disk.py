@@ -1284,10 +1284,15 @@ class GlaedaDiskTest(unittest.TestCase):
             (gd.HOME / "cmux-browser-fleet").mkdir()
             (gd.FLEET_ROOT / "cache").mkdir(parents=True)
             (gd.FLEET_ROOT / "ci-ios" / "runner-a" / "derived-data").mkdir(parents=True)
+            (gd.HOME / "Library/Caches/cmux-next-ci").mkdir(parents=True)
             fams = {f.id: f for f in gd.default_families()}
             self.assertIn("fleet-artifacts", fams)
             self.assertIn("ci-ios-derived-data", fams)
             self.assertIn("browser-artifacts", fams)
+            self.assertIn(gd.CMUX_NEXT_CI_FAMILY, fams)
+            self.assertEqual(fams[gd.CMUX_NEXT_CI_FAMILY].min_idle_hours,
+                             gd.CMUX_NEXT_CI_MIN_IDLE_HOURS)
+            self.assertIn("cmux-next-ci", fams["library-caches"].skip)
             self.assertTrue(fams["fleet-artifacts"].allow_stale_protected)
             self.assertTrue(fams["browser-artifacts"].allow_stale_protected)
         finally:
@@ -1321,6 +1326,71 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual([Path(i.path) for i in got], [old])
         self.assertEqual(got[0].verdict, "reclaimable")
         self.assertTrue((root / "runner-a").is_dir())
+
+    def test_cmux_next_ci_only_lists_valid_generated_children(self) -> None:
+        root = self.root / "Library/Caches/cmux-next-ci"
+        runner = root / "cmux-scheme/runner-a"
+        daily = root / "dev-daily-release/abcdef0123456789/Release/26f113aa"
+        for state in (runner, daily):
+            state.mkdir(parents=True)
+            for name in ("Build", "Index.noindex", "Logs", "Products"):
+                make(state / name, age_hours=96)
+            for name in gd.CMUX_NEXT_CI_PRESERVED_NAMES:
+                (state / name).mkdir()
+        invalid = root / "dev-daily-release/not-a-fingerprint/Release/26f113aa"
+        (invalid / "Build").mkdir(parents=True)
+        fam = gd.cmux_next_ci_family(root)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            items = gd.survey([fam], 24, 0)
+        paths = {Path(i.path) for i in items}
+        expected = {
+            state / name for state in (runner, daily)
+            for name in ("Build", "Index.noindex", "Logs", "Products")
+        }
+        self.assertEqual(paths, expected)
+        self.assertTrue(all(i.verdict == "reclaimable" for i in items))
+
+    def test_cmux_next_ci_keeps_unknown_state_children(self) -> None:
+        root = self.root / "Library/Caches/cmux-next-ci"
+        state = root / "cmux-scheme/runner-a"
+        build = make(state / "Build", age_hours=96)
+        (state / "unknown-owner-state").mkdir(parents=True)
+        fam = gd.cmux_next_ci_family(root)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            got = gd.survey([fam], 24, 0)
+        self.assertEqual(got[0].path, str(build))
+        self.assertEqual(got[0].verdict, "in-use")
+        self.assertIn("unknown children", got[0].reasons[0])
+
+    def test_cmux_next_ci_keeps_recent_and_marked_state(self) -> None:
+        root = self.root / "Library/Caches/cmux-next-ci"
+        state = root / "cmux-scheme/runner-a"
+        build = make(state / "Build", age_hours=96)
+        recent = make(state / "Logs", age_hours=2)
+        (state / ".lock").write_text("")
+        fam = gd.cmux_next_ci_family(root)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            got = {Path(i.path): i for i in gd.survey([fam], 24, 0)}
+        self.assertEqual(got[build].verdict, "in-use")
+        self.assertIn("active or ambiguous marker", got[build].reasons[0])
+        self.assertEqual(got[recent].verdict, "in-use")
+        self.assertIn("active or ambiguous marker", got[recent].reasons[0])
+
+    def test_cmux_next_ci_apply_rechecks_process_and_marker(self) -> None:
+        root = self.root / "Library/Caches/cmux-next-ci"
+        state = root / "cmux-scheme/runner-a"
+        build = make(state / "Build", age_hours=96)
+        fam = gd.cmux_next_ci_family(root)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            items = gd.survey([fam], 24, 0)
+        self.assertEqual(items[0].verdict, "reclaimable")
+        (state / ".cmux-active").write_text("")
+        receipt = self.root / "receipt.jsonl"
+        with contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            gd.apply(items, {fam.id: fam}, receipt, None, 24)
+        self.assertTrue(build.exists())
+        self.assertIn("changed:in-use", receipt.read_text())
 
     def test_fleet_ci_hot_tier(self) -> None:
         ci = self.root / "ci"
@@ -2246,7 +2316,7 @@ class LinuxLayoutTest(unittest.TestCase):
             fam.root.mkdir(parents=True, exist_ok=True)
         keep = {"user-cache": ["glaeda", "glaeda-disk", "glaeda-fullapp", "glaeda-fleet-cas", "cmux-job",
                                "huggingface", "codex-runtimes"],
-                "library-caches": ["glaeda", "PassKit", "tidy-branches", "CloudKit", "com.apple.Safari"]}
+                "library-caches": ["glaeda", "cmux-next-ci", "PassKit", "tidy-branches", "CloudKit", "com.apple.Safari"]}
         for fid, names in keep.items():
             fam = fams.get(fid)
             if fam is None:

@@ -45,6 +45,14 @@ never searched (HOME_NEVER).
 Bazel's macOS output root (/private/var/tmp/_bazel_$USER) is its own family.
 Every deletion is appended to a JSONL receipt.
 
+The cmux-next workflow keeps per-runner state under
+~/Library/Caches/cmux-next-ci.  Its SourcePackages and module/SDK caches are
+reusable inputs, so the explicit cmux-next family below only considers the
+generated Build, Index, Logs and Products children beneath a validated runner
+or dev-daily Release root.  Those children require a conservative 72-hour idle
+window plus a fresh process/lock/lease check; unknown children and all preserved
+inputs remain visible to accounting but are never deleted by this family.
+
 The runner-account profile is intentionally narrower than the normal user profile:
 it covers only DerivedData, cmux reload/GhosttyKit caches, and CUA recordings/frame
 caches, with a seven-day minimum idle age. Git index refreshes are ignored for that
@@ -376,6 +384,24 @@ def fleet_stores(ci: Path | None = None) -> list[Path]:
 
 FLEET_FAMILY_IDS = ("cmux-pr-builds", "cmux-seeds", "cmux-kept-build", "ci-derived-data",
                     "ci-ios-derived-data")
+
+# cmux-next CI owns these paths in the workflow, but only the generated
+# children are disposable. SourcePackages and all compiler/module/SDK caches
+# are deliberately outside this allowlist.
+CMUX_NEXT_CI_FAMILY = "cmux-next-ci-generated"
+CMUX_NEXT_CI_ROOT = "cmux-next-ci"
+CMUX_NEXT_CI_MIN_IDLE_HOURS = 72.0
+CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
+    "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
+    "SDKExplicitPrecompiledModules", "info.plist", ".metadata_never_index",
+})
+CMUX_NEXT_CI_GENERATED_NAMES = frozenset({
+    "Build", "Index.noindex", "Logs", "Products", "Intermediates.noindex",
+    "DerivedSources", "XCBuildData",
+})
+CMUX_NEXT_CI_ACTIVITY_MARKERS = frozenset({
+    ".cmux-active", ".build.active", ".lock", "lease.json", "reservation.json",
+})
 
 
 def fleet_families(ci: Path | None = None) -> list[Family]:
@@ -1153,7 +1179,7 @@ def default_families() -> list[Family]:
         Family("library-caches", HOME / "Library/Caches", True, "the app re-downloads or rebuilds it",
                # glaeda: OTA candidates and LAN seed stages; PassKit: web service cookies; tidy-branches:
                # a deletion receipt; the rest are Apple daemons without the com.apple. prefix
-               skip=("glaeda", "PassKit", "tidy-branches", "CloudKit", "GeoServices", "FamilyCircle",
+               skip=("glaeda", "cmux-next-ci", "PassKit", "tidy-branches", "CloudKit", "GeoServices", "FamilyCircle",
                      "familycircled", "GameKit", "askpermissiond", "mbuseragent", "AMSDataMigratorTool",
                      "PHTPhenotype", "SharedImageCache", "Animoji", "SiriTTS", "GIPPseudonymousID"),
                skip_prefixes=("com.apple.",), owner="apps", rebuild_minutes=5,
@@ -1180,6 +1206,9 @@ def default_families() -> list[Family]:
         Family("projects", projects, False, "checkouts (report only)",
                skip=tuple(r.name for r in wt_roots), platform="shared"),
     ]
+    cmux_next_ci = HOME / "Library/Caches/cmux-next-ci"
+    if DARWIN and cmux_next_ci.is_dir():
+        fams.append(cmux_next_ci_family(cmux_next_ci))
     user_tmp = darwin_user_tmp() if DARWIN else None
     if user_tmp is not None:
         # Apple daemons keep live state in com.apple.* entries without holding them open.
@@ -1283,6 +1312,8 @@ def runner_cache_families() -> list[Family]:
                skip=("index.json", "manifest.json", "state.json", ".metadata_never_index", ".lock"),
                owner="cmux CUA", rebuild_minutes=1, min_idle_hours=168.0, platform="macos"),
     ]
+    if (HOME / "Library/Caches/cmux-next-ci").is_dir():
+        roots.append(replace(cmux_next_ci_family(), min_idle_hours=168.0))
     return [f for f in roots if f.root.is_dir()]
 
 
@@ -2908,7 +2939,8 @@ def candidates(fam: Family) -> list[Path]:
     elif fam.checkout_builds:
         key = "checkout-builds:" + os.fspath(fam.root)
         if key not in _DISCOVERED:
-            _DISCOVERED[key] = checkout_builds(fam.root)
+            _DISCOVERED[key] = (cmux_next_ci_generated_paths(fam.root)
+                                if fam.id == CMUX_NEXT_CI_FAMILY else checkout_builds(fam.root))
         level = list(_DISCOVERED[key])
     elif fam.match:
         level = _search(fam)
@@ -3192,6 +3224,9 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
         reasons = []
         if blind:
             reasons.append(blind)
+        if fam.id == CMUX_NEXT_CI_FAMILY and not blind:
+            if busy_reason := cmux_next_ci_busy(fam, path, opened, cmds):
+                reasons.append(busy_reason)
         if in_cwd(sp, opened):
             reasons.append("open by a process")
         if named_by(sp, cmds):
@@ -4041,7 +4076,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         if halt is not None and (why := halt()):
             print(f"stopped: {why}")
             break
-        if fam.id in FLEET_FAMILY_IDS:
+        if fam.id in FLEET_FAMILY_IDS or fam.id == CMUX_NEXT_CI_FAMILY:
             # Pressure eligibility is intentionally broad, so take fresh cwd/open-file evidence immediately
             # before each rename. A job may start using a candidate after the survey or during a long pass.
             try:
@@ -4077,7 +4112,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             outcome = "changed:owner-loaded"
         elif fam.discover and not fresh_layout:
             outcome = "changed:layout"
-        elif (in_cwd(i.path, cwds) or named_by(i.path, cmds) or holds_socket(p) or job_busy(fam, p)
+        elif (cmux_next_ci_busy(fam, p, cwds, cmds)
+                or in_cwd(i.path, cwds) or named_by(i.path, cmds) or holds_socket(p) or job_busy(fam, p)
                 or (i.family == "claude-scratchpad" and claude_session_active(p.name, idle_hours * 3600))
                 or (i.family == SPM_SCRATCH and spm_scratch_held(p))):
             outcome = "changed:in-use"
@@ -4133,6 +4169,103 @@ def cmux_next_ci_dirs(home: Path | None = None) -> list[Path]:
     if not root.is_dir() or root.is_symlink():
         return []
     return [d for d in _children(root) if d.is_dir() and not d.is_symlink()]
+
+
+def cmux_next_ci_state_roots(root: Path) -> list[Path]:
+    """Validated per-runner DerivedData roots owned by cmux-next CI.
+
+    The workflow's reusable scheme roots are ``cmux-scheme/<runner>``.  Older
+    dev-daily runs use ``dev-daily-release/<fingerprint>/Release/<xcode-hash>``.
+    Names outside these shapes are intentionally ignored so a generic cache
+    directory can never become a deletion candidate by accident.
+    """
+    if not root.is_dir() or root.is_symlink():
+        return []
+    roots: list[Path] = []
+    scheme = root / "cmux-scheme"
+    for runner in _children(scheme):
+        if runner.is_dir() and not runner.is_symlink():
+            roots.append(runner)
+    daily = root / "dev-daily-release"
+    for fingerprint in _children(daily):
+        if fingerprint.is_symlink() or not fingerprint.is_dir() \
+                or re.fullmatch(r"[0-9a-fA-F]{8,64}", fingerprint.name) is None:
+            continue
+        release = fingerprint / "Release"
+        for xcode_hash in _children(release):
+            if xcode_hash.is_dir() and not xcode_hash.is_symlink() \
+                    and re.fullmatch(r"[0-9a-fA-F]{8,64}", xcode_hash.name):
+                roots.append(xcode_hash)
+    return roots
+
+
+def cmux_next_ci_generated_paths(root: Path) -> list[Path]:
+    """Generated children eligible for the cmux-next retention family.
+
+    Inputs and unknown state are deliberately absent from this list. In
+    particular, SourcePackages, ModuleCache.noindex and SDK caches remain
+    available for future runs and are never treated as disposable output.
+    """
+    found: list[Path] = []
+    for state in cmux_next_ci_state_roots(root):
+        for child in _children(state):
+            if child.name in CMUX_NEXT_CI_PRESERVED_NAMES or child.is_symlink():
+                continue
+            if child.name in CMUX_NEXT_CI_GENERATED_NAMES and (child.is_dir() or child.is_file()):
+                found.append(child)
+    return found
+
+
+def cmux_next_ci_family(root: Path | None = None) -> Family:
+    """Reclaim old generated cmux-next CI output while preserving reusable inputs."""
+    root = (HOME / "Library/Caches/cmux-next-ci") if root is None else root
+    return Family(CMUX_NEXT_CI_FAMILY, root, True,
+                  "the cmux-next workflow rebuilds generated DerivedData output",
+                  checkout_builds=True, build_output=True,
+                  min_idle_hours=CMUX_NEXT_CI_MIN_IDLE_HOURS,
+                  owner="cmux-next.yml per-runner DerivedData", rebuild_minutes=15,
+                  platform="macos")
+
+
+def cmux_next_ci_state_for(path: Path, root: Path) -> Path | None:
+    """Return the validated state root containing a generated child, if any."""
+    for state in cmux_next_ci_state_roots(root):
+        try:
+            if path.parent == state and path.name in CMUX_NEXT_CI_GENERATED_NAMES:
+                return state
+        except OSError:
+            continue
+    return None
+
+
+def cmux_next_ci_busy(fam: Family, path: Path, opened: list[str] | frozenset[str],
+                      commands: str) -> str:
+    """Fresh process/lease/lock veto for one cmux-next generated child.
+
+    Marker presence is treated as active or ambiguous state. A stale marker is
+    therefore a safe keep until the owner repairs it; this family never guesses
+    that a lease or lock has expired.
+    """
+    if fam.id != CMUX_NEXT_CI_FAMILY:
+        return ""
+    state = cmux_next_ci_state_for(path, fam.root)
+    if state is None:
+        return "cmux-next state root is no longer validated"
+    state_text = os.fspath(state)
+    if in_cwd(state_text, opened) or named_by(state_text, commands):
+        return "cmux-next state is referenced by a process"
+    if holds_socket(state):
+        return "cmux-next state holds a socket"
+    for ancestor in (state, state.parent):
+        for entry in _children(ancestor):
+            if entry.name in CMUX_NEXT_CI_ACTIVITY_MARKERS:
+                return f"cmux-next active or ambiguous marker: {entry.name}"
+    unknown = [entry.name for entry in _children(state)
+               if entry.name not in CMUX_NEXT_CI_PRESERVED_NAMES
+               and entry.name not in CMUX_NEXT_CI_GENERATED_NAMES]
+    if unknown:
+        return "cmux-next state has unknown children: " + ", ".join(sorted(unknown)[:4])
+    return ""
 
 
 def dedupe_roots(derived_data: Path) -> list[Path]:
