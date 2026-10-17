@@ -913,12 +913,13 @@ mod tests {
         fs::write(&path, vec![b' '; 65_537]).unwrap();
         assert!(read_enrollment_receipt(&path).is_err());
         let fifo = temp.join("fifo");
-        rustix::fs::mkfifoat(
-            rustix::fs::CWD,
-            &fifo,
-            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
-        )
-        .unwrap();
+        assert!(
+            std::process::Command::new("/usr/bin/mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
         assert!(read_enrollment_receipt(&fifo).is_err());
         fs::remove_dir_all(temp).unwrap();
     }
