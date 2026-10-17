@@ -1,0 +1,11 @@
+[Unit]
+Description=Organize idle developer checkouts (glaeda projects tidy)
+
+[Service]
+Type=oneshot
+TimeoutStartSec=30min
+Nice=10
+IOSchedulingClass=idle
+ExecStart=%h/.local/bin/glaeda-projects tidy --apply
+StandardOutput=append:%h/.local/state/glaeda-projects-tidy.jsonl
+StandardError=append:%h/.local/state/glaeda-projects-tidy.err

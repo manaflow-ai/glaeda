@@ -612,7 +612,7 @@ class MiniSetupTest(unittest.TestCase):
 
     def test_bootout_waits_and_bootstrap_retries_eio(self) -> None:
         calls: list[tuple[str, ...]] = []
-        answers = {"print": [(0, ""), (0, ""), (113, "")], "bootstrap": [(5, "Bootstrap failed: 5: Input/output error"), (0, "")]}
+        answers = {"print": [(0, ""), (0, ""), (113, "Could not find service")], "bootstrap": [(5, "Bootstrap failed: 5: Input/output error"), (0, "")]}
 
         def fake(ctx, *args):
             calls.append(args)
@@ -624,6 +624,12 @@ class MiniSetupTest(unittest.TestCase):
             self.assertTrue(ms.bootout(ctx, "x"))
             self.assertEqual(ms.bootstrap(ctx, "/p.plist")[0], 0)
         self.assertEqual([c[0] for c in calls], ["bootout", "print", "print", "print", "bootstrap", "bootstrap"])
+
+    def test_bootout_fails_closed_when_unload_is_not_confirmed(self) -> None:
+        ctx = mock.Mock(uid=501)
+        with mock.patch.object(ms, "launchctl", return_value=(127, "")) as ctl:
+            self.assertFalse(ms.bootout(ctx, "x", wait_s=0))
+        ctl.assert_called_once_with(ctx, "bootout", "gui/501/x")
 
     def test_power_parser_reuses_fleet_rule(self) -> None:
         with mock.patch.object(ms, "run", lambda argv, **kw: (0, PMSET_SLEEPY)):
@@ -674,6 +680,30 @@ class MiniSetupTest(unittest.TestCase):
             ms.main(["--output", "json", "--python", "/usr/bin/python3",
                      "--reclaim-binary", os.fspath(self.reclaim), "--hygiene-only"])
         self.assertEqual(json.loads(out.getvalue())["blocking"], ["python"])
+
+    def test_legacy_build_host_receipt_preserves_fleet_role_during_hygiene_upgrade(self) -> None:
+        receipt_path = self.home / ".local/state/glaeda/mini-setup/receipt.json"
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        receipt_path.write_text(json.dumps({"profile": "build-host"}))
+        receipt = self.invoke("--hygiene-only", "--apply")
+        self.assertEqual(receipt["role"], "fleet-mini")
+        self.assertFalse((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.projects-tidy.plist").exists())
+
+    def test_legacy_hygiene_receipt_preserves_fleet_role(self) -> None:
+        receipt_path = self.home / ".local/state/glaeda/mini-setup/receipt.json"
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        receipt_path.write_text(json.dumps({"profile": "hygiene"}))
+        receipt = self.invoke("--hygiene-only", "--apply")
+        self.assertEqual(receipt["role"], "fleet-mini")
+        self.assertFalse((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.projects-tidy.plist").exists())
+
+    def test_explicit_devbox_overrides_legacy_fleet_receipt(self) -> None:
+        receipt_path = self.home / ".local/state/glaeda/mini-setup/receipt.json"
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        receipt_path.write_text(json.dumps({"profile": "hygiene"}))
+        receipt = self.invoke("--hygiene-only", "--role", "devbox", "--apply")
+        self.assertEqual(receipt["role"], "devbox")
+        self.assertTrue((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.projects-tidy.plist").exists())
 
     def python_action(self, receipt: dict) -> dict:
         return next(a for a in receipt["actions"] if a["kind"] == "python")
@@ -767,7 +797,7 @@ class MiniSetupTest(unittest.TestCase):
         platform_patch.start()
         self.patches.append(platform_patch)
 
-    def test_linux_installs_the_ops_systemd_units_verbatim_then_is_idempotent(self) -> None:
+    def test_linux_installs_the_ops_systemd_units_then_is_idempotent(self) -> None:
         self.linux()
         receipt = self.invoke("--apply")  # Linux gets the hygiene profile without the flag
         self.assertEqual((receipt["platform"], receipt["profile"]), ("linux", "hygiene"))
@@ -775,7 +805,8 @@ class MiniSetupTest(unittest.TestCase):
         units = self.home / ".config/systemd/user"
         self.assertEqual(sorted(p.name for p in units.iterdir()), sorted(ms.LINUX_UNITS))
         for name in ms.LINUX_UNITS:
-            self.assertEqual((units / name).read_bytes(), (ROOT / "ops/systemd" / name).read_bytes(), name)
+            expected = (ROOT / "ops/systemd" / name).read_bytes().replace(b"@GLAEDA_ROLE@", b"devbox")
+            self.assertEqual((units / name).read_bytes(), expected, name)
         for name in ("glaeda-disk", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all"):
             self.assertTrue(os.access(self.home / ".local/bin" / name, os.X_OK), name)
         self.assertTrue((self.home / ".local/state").is_dir())
@@ -787,6 +818,28 @@ class MiniSetupTest(unittest.TestCase):
         again = self.invoke("--apply")
         self.assertEqual(self.states(again), {"unchanged"})
         self.assertFalse(any("systemctl" in os.path.basename(c[0]) for c in self.calls))
+
+    def test_linux_fleet_role_does_not_install_devbox_tidy_units(self) -> None:
+        self.linux()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(ms.main(["--output", "json", "--python", "/usr/bin/python3",
+                                      "--reclaim-binary", os.fspath(self.reclaim), "--role", "fleet-mini",
+                                      "--apply"]), 0)
+        units = self.home / ".config/systemd/user"
+        self.assertFalse((units / "glaeda-projects-tidy.service").exists())
+        self.assertFalse((units / "glaeda-projects-tidy.timer").exists())
+
+    def test_fleet_role_update_config_uses_valid_single_argument(self) -> None:
+        ctx = self.ctx_for_steps()
+        ctx.role = "fleet-mini"
+        self.assertEqual(ms.update_config(ctx)["setupArgs"], ["--role=fleet-mini"])
+
+    def test_explicit_devbox_role_is_preserved_for_ota(self) -> None:
+        ctx = self.ctx_for_steps()
+        ctx.role = "devbox"
+        ctx.role_explicit = True
+        self.assertEqual(ms.update_config(ctx)["setupArgs"], ["--role=devbox"])
 
     def test_linux_uninstall_removes_only_our_units(self) -> None:
         self.linux()

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """glaeda-disk: say where the disk went, and reclaim what is safe to rebuild.
 
+    glaeda-disk report              report: biggest items, guards, reclaimable total
+    glaeda-disk keepup --apply      pressure/idle cleanup using the selected role
     glaeda-disk                     report: biggest items, verdicts, reclaimable total
     glaeda-disk --apply             delete every reclaimable item, largest first
     glaeda-disk --pressure --apply  act only under disk pressure, stop at the free target
@@ -112,6 +114,7 @@ import bisect
 import calendar
 import contextlib
 import fcntl
+import gzip
 import hashlib
 import json
 import os
@@ -287,6 +290,9 @@ class Family:
     # candidates are the build outputs inside the checkouts under root (checkout_builds), not root's children
     checkout_builds: bool = False
     retired_only: bool = False  # reclaim only with fresh evidence the declared service is unloaded
+    pressure_only: bool = False  # dev-box package caches are reclaimed only during pressure runs
+    transcripts: bool = False  # discover individual agent transcript files below root
+    transcript_archives: bool = False  # discover archived transcript files below root
     # Fleet artifacts use a fixed migration cutoff. Older cruft is eligible immediately; newer
     # entries follow the normal idle window and are protected when a live lease names them.
     stale_before: float | None = None
@@ -313,6 +319,79 @@ NEVER_DELETE_NAMES = re.compile(r"chromium|cmux-browser|siso|depot_tools|cmux-re
 # an epoch so the comparison is deterministic on hosts in any local timezone.
 ARTIFACT_CUTOFF = calendar.timegm((2026, 9, 17, 0, 0, 0))
 FLEET_ROOT = Path("/Users/Shared/cmux-build-fleet")
+
+
+def _reference_spellings(path: Path) -> tuple[str, ...]:
+    """Absolute and user-facing spellings that a configuration may use for a checkout."""
+    absolute = os.path.abspath(os.fspath(path))
+    real = os.path.realpath(absolute)
+    values = {absolute, real}
+    home = os.path.abspath(os.fspath(HOME))
+    for value in tuple(values):
+        if value == home or value.startswith(home + "/"):
+            values.add("~" + value[len(home):])
+        if value == "/private" or value.startswith("/private/"):
+            values.add(value.removeprefix("/private"))
+    return tuple(sorted(values, key=len, reverse=True))
+
+
+def _reference_mentions(text: str, path: Path) -> bool:
+    for spelling in _reference_spellings(path):
+        start = 0
+        while (index := text.find(spelling, start)) >= 0:
+            before = text[index - 1] if index else ""
+            after_at = index + len(spelling)
+            after = text[after_at] if after_at < len(text) else ""
+            if (not before or before in " \t\r\n'\"=:/,;([{<") and \
+                    (not after or after in " \t\r\n'\"=:/,;)]}>"):
+                return True
+            start = index + 1
+    return False
+
+
+def _reference_files() -> list[Path]:
+    """User-owned launch, shell, and agent configuration that can name a checkout."""
+    files = [HOME / ".codex/hooks.json", HOME / ".codex/config.toml",
+             HOME / ".claude/settings.json", HOME / ".profile",
+             HOME / ".bashrc", HOME / ".bash_profile", HOME / ".bash_login",
+             HOME / ".zshrc", HOME / ".zprofile", HOME / ".zlogin", HOME / ".zshenv",
+             HOME / ".kshrc", HOME / ".config/fish/config.fish",
+             *sorted((HOME / "Library/LaunchAgents").glob("*.plist")),
+             *sorted((HOME / ".config/systemd/user").glob("**/*"))]
+    return [path for path in dict.fromkeys(files) if path.is_file()]
+
+
+def referenced_main_checkout(path: Path, *, nested: bool = False) -> str:
+    """Return a guard reason when user configuration or a tool symlink names this main checkout."""
+    if path.is_symlink():
+        return ""
+    if (path / ".git").is_dir():
+        roots = [path]
+    elif nested:
+        roots = nested_checkouts(path)
+        if roots is None:
+            return "main checkout references unreadable"
+    else:
+        return ""
+    local_bin = HOME / ".local/bin"
+    for root in roots:
+        if not (root / ".git").is_dir():
+            continue
+        try:
+            for entry in local_bin.iterdir():
+                if entry.is_symlink() and Path(os.path.realpath(entry)).is_relative_to(root.resolve()):
+                    return "main checkout referenced by ~/.local/bin symlink"
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return "main checkout references unreadable"
+        for config in _reference_files():
+            try:
+                if _reference_mentions(config.read_text(errors="ignore"), root):
+                    return "main checkout referenced by user configuration"
+            except OSError:
+                return "main checkout references unreadable"
+    return ""
 
 
 def never_delete(path: Path) -> bool:
@@ -661,6 +740,9 @@ POLICY_DEFAULTS: dict[str, Any] = {
     "defer_during_ci": False,
 }
 ACTIVITY_MODE: str | None = None  # "pressure" or "sweep" while main acts; None keeps the wall-clock rule
+ROLE = "fleet-mini"
+DEVBOX_TRANSCRIPT_DAYS = 30
+DEVBOX_TRANSCRIPT_DELETE_DAYS = 180
 
 
 def disk_policy(path: Path | None = None) -> dict[str, Any]:
@@ -1198,6 +1280,21 @@ def project_checkouts(projects: Path) -> list[Path]:
     return [Path(w) for w in sorted(found)]
 
 
+def contained_directory(path: Path, root: Path) -> bool:
+    """A directory reached without symlinks and wholly inside its declared root."""
+    try:
+        if root.is_symlink() or not path.is_relative_to(root):
+            return False
+        for ancestor in (path, *path.parents):
+            if ancestor.is_symlink():
+                return False
+            if ancestor == root:
+                break
+        return path.is_dir() and path.resolve().is_relative_to(root.resolve())
+    except OSError:
+        return False
+
+
 def _checkout_build_dirs(checkout: Path) -> list[Path]:
     found = []
     tracked = _checkout_git(checkout, "ls-files", "-z", "--", "Package.swift", ":(glob)**/Package.swift")
@@ -1206,7 +1303,18 @@ def _checkout_build_dirs(checkout: Path) -> list[Path]:
         if not build.is_symlink() and _head(os.fspath(build / "CACHEDIR.TAG"), 64).startswith(CACHEDIR_TAG):
             found.append(build)
     found += [g for g in _children(checkout / ".glaeda/apple-build/cache") if g.is_dir() and not g.is_symlink()]
-    return found
+    # Zig and SwiftPM outputs are per-checkout working state. Ghostty's Zig cache is
+    # intentionally found by its stable location so a source tree is never walked blindly.
+    for candidate in (checkout / ".zig-cache", checkout / "ghostty/.zig-cache"):
+        if candidate.is_dir() and not candidate.is_symlink():
+            found.append(candidate)
+    for package_root in (checkout / "Packages", checkout / "vendor"):
+        if package_root.is_dir() and not package_root.is_symlink():
+            for pattern in ("*/.build", "*/*/.build"):
+                for candidate in package_root.glob(pattern):
+                    if candidate.is_dir() and not candidate.is_symlink():
+                        found.append(candidate)
+    return sorted({p.resolve() for p in found if contained_directory(p, checkout)})
 
 
 def checkout_builds(projects: Path) -> list[Path]:
@@ -1218,10 +1326,11 @@ def checkout_builds(projects: Path) -> list[Path]:
         return [b for bs in pool.map(_checkout_build_dirs, project_checkouts(projects)) for b in bs]
 
 
-def checkout_build_family(projects: Path) -> Family:
+def checkout_build_family(projects: Path, role: str = "fleet-mini") -> Family:
     return Family("checkout-build", projects, True,
                   "swift build or glaeda-apple warm rebuilds it; also counted in its checkout",
-                  checkout_builds=True, build_output=True, min_idle_hours=min(CHECKOUT_BUILD_IDLE_HOURS, 12.0),
+                  checkout_builds=True, build_output=True,
+                  min_idle_hours=min(CHECKOUT_BUILD_IDLE_HOURS, 12.0),
                   owner="SwiftPM and glaeda-apple, per checkout", rebuild_minutes=15,
                   platform="shared")
 
@@ -1311,7 +1420,26 @@ HQ_BUILD_WORKERS = ("system/ai.manaflow.cmux-build-worker", "system/ai.manaflow.
 CMUX_JOB_MIRROR_HOURS = 168.0
 
 
-def default_families() -> list[Family]:
+def transcript_candidates(root: Path, archives: bool = False) -> list[Path]:
+    """Return regular transcript files without treating the Codex tree as a cache."""
+    roots = [root / "archive"] if archives else [root / "sessions", root / "thread_history"]
+    found: list[Path] = []
+    for base in roots:
+        if not base.is_dir() or base.is_symlink():
+            continue
+        for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            for name in filenames:
+                path = Path(dirpath) / name
+                try:
+                    if path.is_file() and not path.is_symlink():
+                        found.append(path)
+                except OSError:
+                    continue
+    return found
+
+
+def default_families(role: str = "fleet-mini") -> list[Family]:
     tmp = Path("/private/tmp") if DARWIN else Path("/tmp")
     tmpfs = tmp.is_dir() and fs_type(tmp) == "tmpfs"
     uid = os.getuid()
@@ -1330,7 +1458,7 @@ def default_families() -> list[Family]:
         # idle sweep. Process, socket, root-token and git-loss checks still veto live or valuable work.
         Family("tmp", tmp, True, "agent scratch under the temp dir",
                skip=(f"claude-{uid}",), files=True, max_idle_hours=1.0,
-               min_bytes=1024**2 if tmpfs else None, git_disposable=True, owner="agents and tools",
+               min_bytes=1024**2 if tmpfs or role == "devbox" else None, git_disposable=True, owner="agents and tools",
                rebuild_minutes=0.5, platform=host_cache_platform()),
         # cmux's cloud reload and CI jobs keep warm trees per unit (reload-cloud/{cmux-base,work},
         # reload-cloud-ios/{DerivedData,work}); a build mini grew 36 GiB here within hours. Depth 2
@@ -1347,7 +1475,7 @@ def default_families() -> list[Family]:
                # glaeda* holds glaeda-gh daemon state, the minis' native cache root, fleet-cas deployments
                # and benchmark receipts; huggingface keeps its token; codex-runtimes is an install
                skip=("cmux-job", "huggingface", "codex-runtimes"), skip_prefixes=("glaeda",),
-               owner="tools (XDG cache)", rebuild_minutes=5, platform=host_cache_platform()),
+               owner="tools (XDG cache)", rebuild_minutes=5, pressure_only=role == "devbox", platform=host_cache_platform()),
         Family("library-caches", HOME / "Library/Caches", True, "the app re-downloads or rebuilds it",
                # glaeda: OTA candidates and LAN seed stages; PassKit: web service cookies; tidy-branches:
                # a deletion receipt; the rest are Apple daemons without the com.apple. prefix
@@ -1355,7 +1483,7 @@ def default_families() -> list[Family]:
                      "familycircled", "GameKit", "askpermissiond", "mbuseragent", "AMSDataMigratorTool",
                      "PHTPhenotype", "SharedImageCache", "Animoji", "SiriTTS", "GIPPseudonymousID"),
                skip_prefixes=("com.apple.",), owner="apps", rebuild_minutes=5,
-               stale_before=ARTIFACT_CUTOFF, reference_root=FLEET_ROOT, platform="macos"),
+               stale_before=ARTIFACT_CUTOFF, reference_root=FLEET_ROOT, pressure_only=role == "devbox", platform="macos"),
         # CUA recordings and frame caches are runner tooling residue, not private user data needed
         # by CI. Keep them separate from the generic Application Support/Cache totals so operators
         # can see their age and reclaim them after the normal process/open-file gate passes.
@@ -1371,8 +1499,7 @@ def default_families() -> list[Family]:
         # Twelve hours at least: Linux's relatime moves a file's access time once a day, so a cache read
         # every hour can show a day-old atime. The live process and command checks still protect use.
         Family("home-caches", HOME, True, "the tool re-downloads or rebuilds it", discover=True,
-               owner="tools (found by cache layout)", rebuild_minutes=5, min_idle_hours=12.0,
-               platform=host_cache_platform()),
+               owner="tools (found by cache layout)", rebuild_minutes=5, min_idle_hours=24.0, pressure_only=role == "devbox", platform=host_cache_platform()),
         Family("simulators", HOME / "Library/Developer/CoreSimulator", False,
                "use `xcrun simctl delete unavailable` (report only)", platform="macos"),
         Family("projects", projects, False, "checkouts (report only)",
@@ -1441,14 +1568,30 @@ def default_families() -> list[Family]:
                            "run glaeda-worktree-reclaim-all (report only)", platform="shared"))
     # SwiftPM and glaeda-apple build output inside the checkouts: every other family here keeps a checkout
     # whole, so under pressure nothing was left to evict while agent sessions compiled packages in hundreds
-    # of worktrees (Air Blue fell to 134 MiB free, 2026-09-28). Half a day idle leaves a return window
-    # while preventing old package output from filling a runner.
-    fams.append(checkout_build_family(projects))
+    # of worktrees (Air Blue fell to 134 MiB free, 2026-09-28). A day idle, since the session may come back.
+    fams.append(checkout_build_family(projects, role))
     # Cargo owns target validity and RFC #1137 owns Cargo reclaim, so this is visibility only.
     # Sizes here are also counted inside their checkout under projects or worktrees.
     fams.append(Family("cargo-target", projects, False,
                        "report only: cargo clean; also counted in its checkout",
                        depth=4, match="target", marker="CACHEDIR.TAG", platform="shared"))
+    if role == "devbox":
+        # Apply the same clean, pushed, live-process and age guards used for disposable
+        # scratch checkouts to developer workspaces. Fleet minis keep their owned hot tier.
+        if contained_directory(projects / "worktrees", projects):
+            fams.append(Family("devbox-checkouts", projects / "worktrees", False,
+                               "report only: preserve developer source and Git state", depth=2, git_disposable=True,
+                               nested_git=True, owner="developer workspaces", rebuild_minutes=8,
+                               platform="shared"))
+        codex = HOME / ".codex"
+        fams.append(Family("agent-transcripts", codex, False,
+                           "report only: preserve Codex task history",
+                           min_idle_hours=DEVBOX_TRANSCRIPT_DAYS * 24, transcripts=True,
+                           owner="Codex sessions", rebuild_minutes=0.1, platform="shared"))
+        fams.append(Family("agent-transcript-archives", codex, False,
+                           "report only: preserve Codex transcript history", min_idle_hours=DEVBOX_TRANSCRIPT_DELETE_DAYS * 24,
+                           transcript_archives=True, owner="Codex transcript archive", rebuild_minutes=0.1,
+                           platform="shared"))
     return [f for f in fams if f.root.is_dir()]
 
 
@@ -3141,7 +3284,9 @@ _DISCOVERED: dict[str, list[Path]] = {}
 
 
 def candidates(fam: Family) -> list[Path]:
-    if fam.discover:
+    if fam.transcripts or fam.transcript_archives:
+        level = transcript_candidates(fam.root, fam.transcript_archives)
+    elif fam.discover:
         key = os.fspath(fam.root)
         if key not in _DISCOVERED:  # one walk per run: main() and survey both ask
             _DISCOVERED[key] = discover_caches(fam.root)
@@ -3188,14 +3333,14 @@ def fresh_for_apply(known: dict[str, int], fams: list[Family]) -> dict[str, int]
     reclaimable candidate is re-measured. A discovering family's root is the whole home directory, so
     only its current candidates are dropped, not every size below it (that re-measured the report-only
     checkouts too and ran past the hooks' timeout on the minis)."""
-    drop = {os.fspath(p) for f in fams if f.reclaimable and (f.discover or f.checkout_builds)
+    drop = {os.fspath(p) for f in fams if f.reclaimable and (f.discover or f.checkout_builds or f.transcripts or f.transcript_archives)
             for p in candidates(f)}
 
     def candidate_of_selected(k: str) -> bool:
         if k in drop:
             return True
         for f in fams:
-            if not f.reclaimable or f.discover or f.checkout_builds:
+            if not f.reclaimable or f.discover or f.checkout_builds or f.transcripts or f.transcript_archives:
                 continue
             root = str(f.root) + "/"
             if k.startswith(root) and k[len(root):].split("/")[0] not in f.skip:
@@ -3491,6 +3636,15 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
                 reasons.append("live lease or running job")
         if fam.id == SPM_SCRATCH and spm_scratch_held(path):
             reasons.append("a job holds its lock (owned_spm_scratch.py)")
+        if fam.pressure_only and ACTIVITY_MODE != "pressure":
+            reasons.append("package cache: pressure-only policy")
+        if fam.git_disposable and (reference := referenced_main_checkout(path, nested=fam.nested_git)):
+            reasons.append(reference)
+        policy_note = ""
+        if ROLE == "devbox" and (fam.id == "xcode-derived-data" or
+                (fam.id in ("tmp", "user-tmp") and re.search(r"cmux|terminal-image|derived-data", path.name, re.I))):
+            # This is informational; stale build output remains reclaimable on a dev box.
+            policy_note = "policy violation: build output on a no-build dev box"
         # The tree walks below cost seconds each on a loaded host, and a recent item is kept anyway,
         # so only an item old enough to delete pays for them (apply re-checks before deleting).
         window = item_window(fam, path, idle_hours, archived)
@@ -3505,7 +3659,9 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             reasons.append("holds a socket")
         if deletable_age and job_busy(fam, path):
             reasons.append("a cmux reload job holds its unit (.cmux-active or .lock)")
-        if not fam.reclaimable:
+        if fam.pressure_only and ACTIVITY_MODE != "pressure":
+            verdict = "kept"
+        elif not fam.reclaimable:
             verdict = "report-only"
         elif reasons:
             verdict = "in-use"
@@ -3535,6 +3691,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
                 reasons.append(f"idle {fam.mirror_idle_hours:g}h+: its checkouts are mirrors")
         if jobs is not None and verdict in ("recent", "reclaimable"):
             reasons.append(reasons_jobs)
+        if policy_note:
+            reasons.append(policy_note)
         items.append(Item(fam.id, sp, size, round(idle, 1), verdict, reasons, jobs,
                           platform_label(fam)))
     items.sort(key=lambda i: i.bytes, reverse=True)
@@ -3879,12 +4037,15 @@ def top_level_catalogued(catalogued: list[tuple[Path, int, str]]) -> list[tuple[
     """
     selected: list[tuple[Path, int, str]] = []
     selected_paths: set[Path] = set()
+    selected_parts: set[tuple[str, ...]] = set()
     for row in catalogued:
         path = row[0]
-        if path in selected_paths or any(parent in selected_paths for parent in path.parents):
+        parts = path.parts
+        if path in selected_paths or any(parts[:depth] in selected_parts for depth in range(1, len(parts))):
             continue
         selected.append(row)
         selected_paths.add(path)
+        selected_parts.add(parts)
     return selected
 
 
@@ -4190,6 +4351,7 @@ atexit.register(_release_evict_lock_at_exit)
 def report(items: list[Item], fss: list[Fs], limit: int, idle_hours: float,
            notes: dict[str, str] | None = None, fams: dict[str, Family] | None = None,
            accounting: list[dict[str, Any]] | None = None) -> None:
+    print(f"role {ROLE}")
     for fs in fss:
         print(f"free {gib(fs.free).strip()} of {gib(fs.total).strip()} "
               f"({100 * fs.free / max(fs.total, 1):.0f}%) on {fs.mount}, pressure below "
@@ -4238,6 +4400,21 @@ def report(items: list[Item], fss: list[Fs], limit: int, idle_hours: float,
     print(f"\nreclaimable now: {gib(total_r).strip()}  ->  glaeda-disk --apply")
 
 
+def notify_disk(title: str, body: str) -> None:
+    """Best-effort cmux notification; a missing GUI must never change cleanup decisions."""
+    binary = next((path for path in ("/usr/local/bin/cmux", "/opt/homebrew/bin/cmux", "/usr/bin/cmux")
+                   if os.access(path, os.X_OK)), None)
+    if not binary:
+        return
+    try:
+        subprocess.run([binary, "notify", "--title", title[:128], "--body", body[:1024]],
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=5, check=False,
+                       env={"PATH": "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin", "LC_ALL": "C"})
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def remove(path: Path, after_rename=None) -> None:
     """Delete path. `after_rename` runs once the tree is out of the way, before the long delete."""
     if path.is_symlink():
@@ -4265,6 +4442,34 @@ def _chmod_retry(func, p, _exc):  # read-only files in SwiftPM/Xcode checkouts
     if not os.path.islink(p):  # never chmod through a symlink to something outside the tree
         os.chmod(p, rwx)
     func(p)
+
+
+def archive_transcript(path: Path) -> Path:
+    """Atomically detach and compress one old transcript into the Codex archive."""
+    relative = path.relative_to(HOME / ".codex")
+    destination = HOME / ".codex" / "archive" / relative
+    destination = destination.with_name(destination.name + ".gz")
+    destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(destination.parent, 0o700)
+    holding = path.with_name(f".{path.name}.glaeda-archive-{os.getpid()}")
+    temporary = destination.with_name(f".{destination.name}.glaeda-{os.getpid()}.tmp")
+    os.rename(path, holding)
+    try:
+        with holding.open("rb") as source, gzip.open(temporary, "wb", compresslevel=6) as target:
+            shutil.copyfileobj(source, target)
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, destination)
+        os.chmod(destination, 0o600)
+        holding.unlink()
+    except BaseException:
+        # A session may recreate the live pathname after the handoff. Never replace that new file;
+        # leave the detached copy for a later retry if restoration is no longer safe.
+        if not path.exists() and holding.exists():
+            os.rename(holding, path)
+        raise
+    finally:
+        temporary.unlink(missing_ok=True)
+    return destination
 
 
 APPLY_LSOF_ITEMS, APPLY_LSOF_S = 8, 20.0  # apply re-takes lsof for discovered items this often
@@ -4367,6 +4572,9 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 or (i.family == "claude-scratchpad" and claude_session_active(p.name, idle_hours * 3600))
                 or (i.family == SPM_SCRATCH and spm_scratch_held(p))):
             outcome = "changed:in-use"
+        elif (families[i.family].git_disposable
+              and referenced_main_checkout(p, nested=families[i.family].nested_git)):
+            outcome = "changed:referenced"
         elif not item_due(fam, (idle_now := (time.time() - item_mtime(fam, p)) / 3600),
                           item_window(fam, p, idle_hours, archived))[0]:
             outcome = "changed:modified"
@@ -4381,21 +4589,27 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         else:
             try:
                 common = git_common_dir(p) if fam.git_disposable else ""
-                # rustup skips reinstalling a toolchain whose update hash still matches the channel
-                # the moment the toolchain is renamed away, so an interrupted delete cannot leave it behind
-                stale_hash = (p.parent.parent / "update-hashes" / p.name
-                              if fresh_layout == "rustup-toolchain" else None)
-                if i.family == SPM_SCRATCH:
+                if fam.transcripts:
+                    original_bytes = p.stat().st_size
+                    destination = archive_transcript(p)
+                    outcome = "archived"
+                    released += max(0, original_bytes - destination.stat().st_size)
+                elif i.family == SPM_SCRATCH:
                     gone = remove_spm_scratch(p)  # only under its lock: a job may link it right now
                 elif i.family == INTERRUPTED:
-                    finish_deletion(p)  # already aside under its dead deleter's name
+                    finish_deletion(p)
                     gone = True
                 else:
+                    # rustup skips reinstalling a toolchain whose update hash still matches the channel
+                    # the moment the toolchain is renamed away, so an interrupted delete cannot leave it behind
+                    stale_hash = (p.parent.parent / "update-hashes" / p.name
+                                  if fresh_layout == "rustup-toolchain" else None)
                     remove(p, after_rename=None if stale_hash is None
                            else lambda h=stale_hash: h.unlink(missing_ok=True))
                     gone = True
-                outcome = "reclaimed" if gone else "changed:in-use"
-                released += i.bytes if gone else 0
+                if not fam.transcripts:
+                    outcome = "reclaimed" if gone else "changed:in-use"
+                    released += i.bytes if gone else 0
                 if common:  # drop the deleted worktree's record from its repository
                     subprocess.run(["git", "--git-dir", common, "worktree", "prune"],
                                    capture_output=True, timeout=60)
@@ -4788,7 +5002,12 @@ def dedupe(roots: list[Path], state_path: Path = DEDUPE_STATE,
 def _main_impl(argv: list[str] | None = None) -> int:
     global _ACTIVE_MEASURE_HANDLE, _REFRESH_PROGRESS_KNOWN
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("command", nargs="?", choices=("report", "keepup"),
+                    help="report is read-only; keepup enables the same policy surface explicitly")
     ap.add_argument("--apply", action="store_true", help="delete reclaimable items")
+    ap.add_argument("--role", choices=("fleet-mini", "devbox"), default=None,
+                    help="policy role (default: fleet-mini; hygiene installs default to devbox)")
+    ap.add_argument("--devbox", dest="role_devbox", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--pressure", action="store_true",
                     help="only act when free space is below --low; stop at --target")
     ap.add_argument("--idle", action="store_true",
@@ -4853,6 +5072,18 @@ def _main_impl(argv: list[str] | None = None) -> int:
         print(message)
         return 0
 
+    if a.command == "report":
+        a.apply = False
+        a.pressure = False
+        a.idle = False
+    elif a.command == "keepup":
+        # Keepup is intentionally report-first; callers must opt into mutation with --apply.
+        a.pressure = bool(a.apply)
+        a.idle = bool(a.apply)
+    role = "devbox" if a.role_devbox else (a.role or "fleet-mini")
+    global ROLE
+    ROLE = role
+
     if a.cmux_next_drain:
         if (not a.apply or not a.pressure or a.need is None or a.family != [CMUX_NEXT_CI_FAMILY]
                 or not a.cmux_next_reservation_owner
@@ -4880,7 +5111,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
 
     global RUNNER_CACHE_PROFILE
     RUNNER_CACHE_PROFILE = bool(a.runner_caches)
-    fams = runner_cache_families() if RUNNER_CACHE_PROFILE else default_families()
+    fams = runner_cache_families() if RUNNER_CACHE_PROFILE else default_families(role)
     if RUNNER_CACHE_PROFILE and not DARWIN:
         print("runner cache profile is macOS-only; skipped")
         return 0
@@ -5096,7 +5327,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
     tooling = (simulator_runtimes() + (xcode_items() if a.top or a.json else [])) \
         if sweep and DARWIN and not RUNNER_CACHE_PROFILE else []
     if a.json:
-        print(json.dumps({"free": shown[0].free, "total": shown[0].total, "idle_hours": idle,
+        print(json.dumps({"schema": "glaeda-disk/v2", "role": ROLE, "free": shown[0].free,
+                          "total": shown[0].total, "idle_hours": idle,
                           "tooling": [asdict(i) for i in tooling],
                           "filesystems": [asdict(fs) for fs in shown],
                           "accounting": accounting,
@@ -5114,13 +5346,28 @@ def _main_impl(argv: list[str] | None = None) -> int:
         print()
         halt = (cmux_next_drain_halt if a.cmux_next_drain
                 else host_busy if sweep and POLICY["defer_during_ci"] else None)
-        apply(items, {f.id: f for f in fams}, a.receipt,
-              {fs.dev: fs.target for fs in shown} if a.pressure else None, idle, halt,
-              all_families=fams, receipt_sweep=sweep)
+        released = apply(items, {f.id: f for f in fams}, a.receipt,
+                         {fs.dev: fs.target for fs in shown} if a.pressure else None, idle, halt,
+                         all_families=fams, receipt_sweep=sweep)
         # A drained runner is explicitly held by cmux_mini_fix; once its listener and worker
         # are absent, its disposable checkout can be cleared under this same eviction lock.
         if not RUNNER_CACHE_PROFILE:
             cleanup_paused_runner_work(a.receipt)
+        remaining = []
+        for fs in shown:
+            try:
+                free, _ = free_bytes(Path(fs.mount))
+            except OSError:
+                free = fs.free
+            if free < fs.low:
+                remaining.append(f"{gib(free).strip()} free on {fs.mount}")
+        if released:
+            notify_disk("glaeda disk keepup", f"{gib(released).strip()} reclaimed on {platform.node()}")
+        if remaining:
+            kept = [i for i in items if i.verdict != "reclaimable"][:3]
+            blocked = ", ".join(f"{gib(i.bytes).strip()} {Path(i.path).name} ({i.verdict})" for i in kept)
+            notify_disk("glaeda disk pressure", "still below floor: " + "; ".join(remaining)
+                        + (f"; biggest guarded items: {blocked}" if blocked else ""))
         if sweep:
             if not RUNNER_CACHE_PROFILE:
                 # deleting a runtime restarts CoreSimulatorService: never while a job may be using simulators

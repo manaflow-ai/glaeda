@@ -1,0 +1,634 @@
+#!/usr/bin/env python3
+"""Plan and apply the canonical ~/Projects layout.
+
+The default is a report.  Applying a plan only moves owned, idle state after a
+fresh status/submodule/live-process check.  The target layout is:
+Projects/<repo>, Projects/worktrees/<repo>/<name>, and Projects/scratch/<name>.
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+
+HOME = Path.home()
+PROJECTS = HOME / "Projects"
+WORKTREES = PROJECTS / "worktrees"
+SCRATCH = PROJECTS / "scratch"
+AGE_S = 24 * 3600
+SCRATCH_NAMES = re.compile(r"(?:-fixture$|-fixtures$|-receipts$|probe|BuildExperiments|^\.tmp-|^scratch[-_])", re.I)
+GROUP_NAMES = {"cmux-worktrees", "codex-review", "hq-worktrees", "worktrees"}
+GIT = next((path for path in ("/usr/bin/git", "/usr/local/bin/git", "/opt/homebrew/bin/git")
+            if os.access(path, os.X_OK)), "/usr/bin/git")
+
+
+def _path_spellings(path: Path) -> tuple[str, ...]:
+    """Absolute and user-facing spellings that a configuration may use for a checkout."""
+    absolute = os.path.abspath(os.fspath(path))
+    real = os.path.realpath(absolute)
+    values = {absolute, real}
+    home = os.path.abspath(os.fspath(HOME))
+    for value in tuple(values):
+        if value == home or value.startswith(home + "/"):
+            values.add("~" + value[len(home):])
+        if value == "/private" or value.startswith("/private/"):
+            values.add(value.removeprefix("/private"))
+    return tuple(sorted(values, key=len, reverse=True))
+
+
+def _mentions_path(text: str, path: Path) -> bool:
+    for spelling in _path_spellings(path):
+        start = 0
+        while (index := text.find(spelling, start)) >= 0:
+            before = text[index - 1] if index else ""
+            after_at = index + len(spelling)
+            after = text[after_at] if after_at < len(text) else ""
+            if (not before or before in " \t\r\n'\"=:/,;([{<") and \
+                    (not after or after in " \t\r\n'\"=:/,;)]}>"):
+                return True
+            start = index + 1
+    return False
+
+
+def _reference_files() -> list[Path]:
+    """User-owned launch, shell, and agent configuration that can name a checkout."""
+    files = [HOME / ".codex/hooks.json", HOME / ".codex/config.toml",
+             HOME / ".claude/settings.json", HOME / ".profile",
+             HOME / ".bashrc", HOME / ".bash_profile", HOME / ".bash_login",
+             HOME / ".zshrc", HOME / ".zprofile", HOME / ".zlogin", HOME / ".zshenv",
+             HOME / ".kshrc", HOME / ".config/fish/config.fish",
+             *sorted((HOME / "Library/LaunchAgents").glob("*.plist")),
+             *sorted((HOME / ".config/systemd/user").glob("**/*"))]
+    return [path for path in dict.fromkeys(files) if path.is_file()]
+
+
+def referenced_main_checkout(path: Path) -> str:
+    """Return a guard reason when user configuration or a tool symlink names this main checkout."""
+    if not (path / ".git").is_dir() or path.is_symlink():
+        return ""
+    local_bin = HOME / ".local/bin"
+    try:
+        for entry in local_bin.iterdir():
+            if entry.is_symlink() and Path(os.path.realpath(entry)).is_relative_to(path.resolve()):
+                return "main checkout referenced by ~/.local/bin symlink"
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return "main checkout references unreadable"
+    for config in _reference_files():
+        try:
+            if _mentions_path(config.read_text(errors="ignore"), path):
+                return "main checkout referenced by user configuration"
+        except OSError:
+            return "main checkout references unreadable"
+    return ""
+
+
+@dataclasses.dataclass
+class Action:
+    kind: str
+    source: str
+    destination: str
+    reason: str
+    status: str = "planned"
+    branch: str = ""
+
+
+def git(path: Path, *args: str, check: bool = False) -> subprocess.CompletedProcess[str]:
+    env = {"HOME": os.environ.get("HOME", str(HOME)),
+           "PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",
+           "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"}
+    if os.environ.get("GIT_ALLOW_PROTOCOL"):
+        env["GIT_ALLOW_PROTOCOL"] = os.environ["GIT_ALLOW_PROTOCOL"]
+    return subprocess.run([GIT, "-C", str(path), *args], stdin=subprocess.DEVNULL,
+                          capture_output=True, text=True, timeout=90, check=check,
+                          env=env)
+
+
+def canonical_repos() -> list[Path]:
+    return [p for p in sorted(PROJECTS.iterdir()) if p.is_dir() and not p.is_symlink()
+            and p.name not in {"worktrees", "scratch", "briefs", "scripts", "docs"}
+            and (p / ".git").is_dir()]
+
+
+def origin(path: Path) -> str:
+    result = git(path, "config", "--get", "remote.origin.url")
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def worktree_records(repo: Path, *, projects_only: bool = True) -> list[Path]:
+    result = git(repo, "worktree", "list", "--porcelain", "-z")
+    if result.returncode:
+        if not projects_only:
+            raise RuntimeError("linked worktree records unreadable")
+        return []
+    paths = []
+    for line in result.stdout.split("\0"):
+        if line.startswith("worktree "):
+            path = Path(line[9:]).resolve()
+            if path == repo.resolve():
+                continue
+            if projects_only and not path.is_relative_to(PROJECTS.resolve()):
+                continue
+            if not projects_only or path.is_dir():
+                paths.append(path)
+    return paths
+
+
+def git_worktree_root(path: Path) -> Path | None:
+    dotgit = path / ".git"
+    if not dotgit.is_file():
+        return None
+    result = git(path, "rev-parse", "--show-toplevel")
+    return Path(result.stdout.strip()).resolve() if result.returncode == 0 else None
+
+
+def branch(path: Path) -> str:
+    result = git(path, "symbolic-ref", "--quiet", "--short", "HEAD")
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def submodule_status(path: Path) -> str:
+    top = git(path, "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none")
+    if top.returncode != 0:
+        return "top-level status unreadable"
+    if top.stdout.strip():
+        return "top-level has uncommitted or untracked changes"
+    nested = git(path, "submodule", "foreach", "--recursive", "--quiet",
+                 "git status --porcelain --untracked-files=all; git rev-list --all --reflog --not --remotes")
+    if nested.returncode != 0:
+        return "submodule status unreadable"
+    if nested.stdout.strip():
+        return "submodule has uncommitted or unpushed changes"
+    return ""
+
+
+def clean_pushed(path: Path) -> str:
+    try:
+        linked = worktree_records(path, projects_only=False)
+    except RuntimeError:
+        return "linked worktree records unreadable"
+    if linked:
+        return "clone backs linked worktrees"
+    if (reason := submodule_status(path)):
+        return reason
+    ignored = git(path, "status", "--porcelain", "--ignored", "--untracked-files=all")
+    if ignored.returncode != 0:
+        return "status unreadable"
+    if ignored.stdout.strip():
+        return "ignored or untracked files present"
+    stash = git(path, "for-each-ref", "--count=1", "refs/stash")
+    if stash.returncode != 0:
+        return "stash unreadable"
+    if stash.stdout.strip():
+        return "stash entries present"
+    refs = git(path, "rev-list", "--all", "--reflog", "--not", "--remotes")
+    if refs.returncode != 0:
+        return "local history unreadable"
+    if refs.stdout.strip():
+        return "local refs or reflogs contain commits not confirmed by a remote"
+    return ""
+
+
+def initialized_submodules(path: Path) -> bool:
+    result = git(path, "submodule", "status", "--recursive")
+    if result.returncode != 0:
+        return True
+    for line in result.stdout.splitlines():
+        fields = line[1:].split()
+        if fields and (path / fields[-1] / ".git").exists():
+            return True
+    return False
+
+
+class EvidenceUnavailable(RuntimeError):
+    pass
+
+
+def process_evidence() -> tuple[list[Path], str]:
+    try:
+        ps = subprocess.run(["/bin/ps", "-axww", "-o", "command="], capture_output=True, text=True,
+                            timeout=30, check=False, env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
+    except (OSError, subprocess.SubprocessError):
+        raise EvidenceUnavailable("cannot list processes")
+    if ps.returncode != 0 or not ps.stdout.strip():
+        raise EvidenceUnavailable("cannot list processes")
+    cwd: list[Path] = []
+    proc = Path("/proc")
+    if proc.is_dir():
+        for entry in proc.iterdir():
+            if entry.name.isdigit():
+                try:
+                    cwd.append(Path(os.readlink(entry / "cwd")).resolve())
+                except FileNotFoundError:
+                    continue
+                except OSError as error:
+                    raise EvidenceUnavailable("cannot inspect process cwd") from error
+                # Include open regular files and directories. A build/editor process can have a
+                # checkout open while its cwd and command line point elsewhere.
+                try:
+                    for fd in (entry / "fd").iterdir():
+                        try:
+                            target = os.readlink(fd)
+                        except FileNotFoundError:
+                            continue
+                        if target.startswith("/"):
+                            cwd.append(Path(target).resolve())
+                except FileNotFoundError:
+                    continue
+                except OSError as error:
+                    raise EvidenceUnavailable("cannot inspect open files") from error
+    else:
+        lsof = next((path for path in ("/usr/sbin/lsof", "/usr/bin/lsof") if os.access(path, os.X_OK)), None)
+        if lsof is None:
+            raise EvidenceUnavailable("cannot inspect open files")
+        try:
+            opened = subprocess.run([lsof, "-nP", "-Fn"],
+                                    capture_output=True, text=True, timeout=30, check=False,
+                                    env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
+        except (OSError, subprocess.SubprocessError):
+            raise EvidenceUnavailable("cannot inspect open files")
+        if opened.returncode != 0 or not opened.stdout.strip() or opened.stderr.strip():
+            raise EvidenceUnavailable("cannot inspect open files")
+        cwd.extend(Path(line[1:]).resolve() for line in opened.stdout.splitlines()
+                   if line.startswith("n") and line[1:].startswith("/"))
+    return cwd, ps.stdout
+
+
+def live_in(path: Path, cwds: list[Path], commands: str) -> bool:
+    target = path.resolve()
+    if any(c == target or target in c.parents for c in cwds):
+        return True
+    return any(str(target) in line for line in commands.splitlines())
+
+
+def session_mentions(path: Path) -> bool:
+    """A recent transcript mentioning a cwd means --resume may still depend on that path."""
+    sessions = HOME / ".codex" / "sessions"
+    if not sessions.is_dir():
+        return False
+    cutoff = time.time() - AGE_S
+    for transcript in sessions.rglob("*.jsonl"):
+        try:
+            if transcript.stat().st_mtime < cutoff or transcript.stat().st_size > 8 * 1024 * 1024:
+                continue
+            if str(path) in transcript.read_text(errors="replace"):
+                return True
+        except OSError:
+            return True
+    return False
+
+
+def target_for(repo: str, name: str) -> Path:
+    return WORKTREES / repo / name
+
+
+def newest_touch(path: Path, budget: int = 50_000) -> float:
+    """Find recent working-tree edits without letting a huge .git walk dominate the plan."""
+    newest = 0.0
+    try:
+        newest = path.stat().st_mtime
+    except OSError:
+        return time.time()
+    for root, dirs, files in os.walk(path, followlinks=False):
+        dirs[:] = [d for d in dirs if d != ".git"]
+        for name in (*dirs, *files):
+            budget -= 1
+            if budget < 0:
+                return time.time()
+            try:
+                newest = max(newest, (Path(root) / name).stat().st_mtime)
+            except OSError:
+                continue
+    return newest
+
+
+def discover_worktrees(repos: list[Path]) -> dict[Path, Path]:
+    found: dict[Path, Path] = {}
+    for repo in repos:
+        for path in worktree_records(repo):
+            found[path] = repo
+    # Worktrees whose main checkout is currently hidden in a legacy folder still carry a .git file.
+    for root, dirs, _files in os.walk(PROJECTS):
+        root_path = Path(root)
+        if root_path == WORKTREES or WORKTREES in root_path.parents:
+            dirs[:] = []
+            continue
+        if len(root_path.relative_to(PROJECTS).parts) > 3:
+            dirs[:] = []
+            continue
+        if (root_path / ".git").is_file():
+            common = git(root_path, "rev-parse", "--git-common-dir")
+            if common.returncode == 0:
+                common_path = (root_path / common.stdout.strip()).resolve()
+                repo = next((r for r in repos if (r / ".git").resolve() == common_path), None)
+                if repo:
+                    found[root_path.resolve()] = repo
+            dirs[:] = []
+    return found
+
+
+def plan() -> list[Action]:
+    repos = canonical_repos()
+    found = discover_worktrees(repos)
+    actions: list[Action] = []
+    for source, repo in sorted(found.items()):
+        if source == repo or source.is_relative_to(WORKTREES):
+            continue
+        if source.is_relative_to(PROJECTS / "briefs") or source.is_relative_to(SCRATCH):
+            continue
+        name = source.name
+        destination = target_for(repo.name, name)
+        reason = "idle linked worktree"
+        if newest_touch(source) > time.time() - AGE_S:
+            actions.append(Action("skip", str(source), str(destination), "touched within 24h", "skipped"))
+        else:
+            actions.append(Action("worktree", str(source), str(destination), reason, branch=branch(source)))
+
+    # Convert redundant clean full clones to linked worktrees. Origin identity avoids
+    # guessing from a suffix such as cmux-link15325.
+    by_origin: dict[str, list[Path]] = {}
+    for repo in repos:
+        if (url := origin(repo)):
+            by_origin.setdefault(url, []).append(repo)
+    for group in by_origin.values():
+        canonical = next((r for r in group if r.name.lower() in origin(r).lower()), group[0])
+        for clone in group:
+            if clone == canonical or clone in repos and clone.name == canonical.name:
+                continue
+            if newest_touch(clone) > time.time() - AGE_S:
+                actions.append(Action("skip", str(clone), "", "full clone touched within 24h", "skipped"))
+                continue
+            reason = clean_pushed(clone)
+            if reason:
+                actions.append(Action("skip", str(clone), "", f"full clone kept: {reason}", "skipped"))
+                continue
+            if initialized_submodules(clone):
+                actions.append(Action("skip", str(clone), "", "full clone has initialized submodules; kept intact", "skipped"))
+                continue
+            if reference := referenced_main_checkout(clone):
+                actions.append(Action("skip", str(clone), "", reference, "skipped"))
+                continue
+            dst = target_for(canonical.name, clone.name)
+            actions.append(Action("clone", str(clone), str(dst), "clean pushed duplicate clone",
+                                  branch=branch(clone)))
+
+    for entry in sorted(PROJECTS.iterdir()):
+        if entry.is_symlink() or not entry.is_dir() or entry.name in {"worktrees", "scratch", "briefs", "scripts", "docs"}:
+            continue
+        if entry in repos or (entry / ".git").exists():
+            continue
+        if entry.name in GROUP_NAMES or entry.name.endswith("-worktrees"):
+            # The folder itself becomes a compatibility symlink after its owned children move.
+            continue
+        if SCRATCH_NAMES.search(entry.name):
+            dst = SCRATCH / entry.name
+            if newest_touch(entry) <= time.time() - AGE_S:
+                actions.append(Action("scratch", str(entry), str(dst), "scratch or fixture folder"))
+            else:
+                actions.append(Action("skip", str(entry), str(dst), "scratch touched within 24h", "skipped"))
+    planned_sources = {Path(a.source).resolve() for a in actions if a.kind == "worktree"}
+    repo_names = {r.name for r in repos}
+    for entry in sorted(PROJECTS.iterdir()):
+        if entry.is_symlink() or not entry.is_dir() or entry.name == "worktrees":
+            continue
+        if not (entry.name == "cmux-worktrees" or entry.name.endswith("-worktrees")):
+            continue
+        repo_name = entry.name.removesuffix("-worktrees")
+        if repo_name not in repo_names:
+            continue
+        children = [p.resolve() for p in entry.iterdir()]
+        if children and all(p in planned_sources for p in children):
+            actions.append(Action("compat", str(entry), str(WORKTREES / repo_name),
+                                  "compatibility symlink for legacy worktree path"))
+    return actions
+
+
+def print_plan(actions: list[Action]) -> None:
+    for action in actions:
+        arrow = f" -> {action.destination}" if action.destination else ""
+        print(f"{action.status:7s} {action.kind:10s} {action.source}{arrow} ({action.reason})")
+    print(f"\n{sum(a.status == 'planned' for a in actions)} planned, "
+          f"{sum(a.status == 'skipped' for a in actions)} skipped")
+
+
+def recreate_worktree(source: Path, destination: Path, repo: Path) -> None:
+    """Rename a linked worktree with initialized submodules and repair every path link."""
+    gitdir = Path(git(source, "rev-parse", "--absolute-git-dir", check=True).stdout.strip()).resolve()
+    common = (repo / git(repo, "rev-parse", "--git-common-dir", check=True).stdout.strip()).resolve()
+    if not gitdir.is_relative_to(common / "worktrees"):
+        raise RuntimeError("not a linked worktree of the expected canonical checkout")
+    links: list[tuple[Path, Path, bytes, bytes]] = []
+    for root, dirs, _files in os.walk(source):
+        dirs[:] = [d for d in dirs if d != ".git"]
+        root_path = Path(root)
+        if root_path == source:
+            continue
+        link = root_path / ".git"
+        if not link.exists():
+            continue
+        if not link.is_file() or link.is_symlink():
+            raise RuntimeError("unsupported submodule Git layout; source left intact")
+        text = link.read_text().strip()
+        if not text.startswith("gitdir:"):
+            raise RuntimeError("unsupported submodule Git layout; source left intact")
+        module_gitdir = (link.parent / text.split(":", 1)[1].strip()).resolve()
+        if not module_gitdir.is_relative_to(gitdir / "modules"):
+            raise RuntimeError("module metadata outside this worktree; source left intact")
+        config = module_gitdir / "config"
+        if not config.is_file():
+            raise RuntimeError("submodule metadata unreadable; source left intact")
+        links.append((root_path.relative_to(source), module_gitdir, link.read_bytes(), config.read_bytes()))
+    top_link = source / ".git"
+    top_link_bytes = top_link.read_bytes()
+    backref = gitdir / "gitdir"
+    previous_backref = backref.read_bytes()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    os.rename(source, destination)  # fail without mutation across filesystems
+    try:
+        top_link = destination / ".git"
+        top_link.write_text(f"gitdir: {gitdir}\n")
+        for relative, module_gitdir, _data, _config in links:
+            root = destination / relative
+            (root / ".git").write_text(f"gitdir: {os.path.relpath(module_gitdir, root)}\n")
+            git(repo, "config", "--file", str(module_gitdir / "config"),
+                "core.worktree", os.path.relpath(root, module_gitdir), check=True)
+        backref.write_text(f"{destination / '.git'}\n")
+        git(repo, "worktree", "repair", str(destination), check=True)
+        for relative, _module_gitdir, _data, _config in links:
+            git(destination / relative, "status", "--porcelain", check=True)
+    except Exception:
+        os.rename(destination, source)
+        (source / ".git").write_bytes(top_link_bytes)
+        for relative, _module_gitdir, data, config in links:
+            (source / relative / ".git").write_bytes(data)
+            # Restore the exact config bytes, including its previous core.worktree.
+            (_module_gitdir / "config").write_bytes(config)
+        backref.write_bytes(previous_backref)
+        raise
+
+
+def mutation_guard(source: Path, *, check_age: bool = True) -> str:
+    try:
+        opened, commands = process_evidence()
+    except EvidenceUnavailable as error:
+        return str(error)
+    if not source.exists() or source.is_symlink():
+        return "source disappeared or became a symlink"
+    try:
+        if source.stat().st_uid != os.getuid():
+            return "source is not owned by this user"
+        for root, dirs, files in os.walk(source, followlinks=False):
+            for name in (*dirs, *files):
+                entry = Path(root) / name
+                if entry.lstat().st_uid != os.getuid():
+                    return "source contains entries not owned by this user"
+    except OSError:
+        return "source ownership unreadable"
+    if live_in(source, opened, commands) or session_mentions(source):
+        return "live process or unfinished session uses checkout"
+    if reason := referenced_main_checkout(source):
+        return reason
+    if check_age and newest_touch(source) > time.time() - AGE_S:
+        return "touched within 24h"
+    return ""
+
+
+def apply(actions: list[Action]) -> None:
+    for index, action in enumerate(actions):
+        if action.status != "planned":
+            continue
+        try:
+            cwds, commands = process_evidence()
+        except EvidenceUnavailable as error:
+            for pending in actions[index:]:
+                if pending.status == "planned":
+                    pending.status = "skipped"
+                    pending.reason = str(error)
+            break
+        if commands in {"cannot list processes", "cannot inspect open files"}:
+            for pending in actions[index:]:
+                if pending.status == "planned":
+                    pending.status = "skipped"
+                    pending.reason = commands
+            break
+        source = Path(action.source)
+        destination = Path(action.destination)
+        if not source.exists() or live_in(source, cwds, commands) or session_mentions(source):
+            action.status = "skipped"
+            action.reason = "live process or unfinished session uses checkout"
+            continue
+        if action.kind != "compat" and (destination.exists() or destination.is_symlink()):
+            action.status = "skipped"
+            action.reason = "destination already exists"
+            continue
+        if action.kind == "scratch":
+            if reason := mutation_guard(source):
+                action.status, action.reason = "skipped", reason
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source), str(destination))
+        elif action.kind == "clone":
+            repo = next((r for r in canonical_repos() if r.name == destination.parts[-2]), None)
+            reason = "canonical checkout disappeared" if repo is None else clean_pushed(source)
+            if reason:
+                action.status = "skipped"
+                action.reason = reason
+                continue
+            revision = git(source, "rev-parse", "HEAD", check=True).stdout.strip()
+            source_identity = (source.stat().st_dev, source.stat().st_ino)
+            # Import the exact source commit. A stale canonical branch is not the source HEAD.
+            fetched = git(repo, "fetch", "--no-tags", str(source), revision)
+            if fetched.returncode:
+                action.status, action.reason = "skipped", "could not import source revision"
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            added = git(repo, "worktree", "add", "--detach", str(destination), revision)
+            if added.returncode:
+                action.status = "skipped"
+                action.reason = added.stderr.strip()[:240] or "could not create linked worktree"
+                continue
+            if git(destination, "rev-parse", "HEAD", check=True).stdout.strip() != revision:
+                raise RuntimeError("replacement revision mismatch; source left intact")
+            # Recheck after creation before deleting the clone.
+            if reason := clean_pushed(source):
+                action.status, action.reason = "skipped", reason
+                continue
+            if (source.stat().st_dev, source.stat().st_ino) != source_identity or git(
+                    source, "rev-parse", "HEAD", check=True).stdout.strip() != revision:
+                action.status, action.reason = "skipped", "source changed during conversion; both checkouts retained"
+                continue
+            if reason := mutation_guard(source):
+                action.status, action.reason = "skipped", reason + "; both checkouts retained"
+                continue
+            shutil.rmtree(source)
+        elif action.kind == "worktree":
+            repo = next((r for r in canonical_repos() if r.name == destination.parts[-2]), None)
+            if repo is None:
+                action.status = "skipped"
+                action.reason = "canonical checkout disappeared"
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            status_reason = submodule_status(source)
+            if status_reason and "unreadable" in status_reason:
+                action.status, action.reason = "skipped", status_reason
+                continue
+            if reason := mutation_guard(source):
+                action.status, action.reason = "skipped", reason
+                continue
+            if status_reason:
+                try:
+                    recreate_worktree(source, destination, repo)
+                except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                    action.status, action.reason = "skipped", f"submodule relocation failed; source left intact: {error}"[:240]
+                    continue
+            else:
+                moved = git(repo, "worktree", "move", str(source), str(destination))
+                if moved.returncode:
+                    # A clean initialized-submodule worktree needs the same path repair as a dirty one.
+                    try:
+                        recreate_worktree(source, destination, repo)
+                    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                        action.status, action.reason = "skipped", f"git refused move; source left intact: {error}"[:240]
+                        continue
+        elif action.kind == "compat":
+            if reason := mutation_guard(source):
+                action.status, action.reason = "skipped", reason
+                continue
+            if any(source.iterdir()):
+                action.status = "skipped"
+                action.reason = "legacy folder still contains unmoved entries"
+                continue
+            source.rmdir()
+            source.symlink_to(destination, target_is_directory=True)
+        action.status = "applied"
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="glaeda-projects", description=__doc__)
+    parser.add_argument("tidy", nargs="?", choices=("tidy",), default="tidy")
+    parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+    actions = plan()
+    if args.apply:
+        apply(actions)
+    if args.json:
+        import json
+        print(json.dumps([dataclasses.asdict(a) for a in actions], indent=2))
+    else:
+        print_plan(actions)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -93,7 +93,7 @@ SHA_RE = re.compile(r"[0-9a-f]{40}")
 HEX64 = re.compile(r"[0-9a-f]{64}")
 MAX_EXTRACTED = 1024 * 1024 * 1024
 # what setup installs and a first update snapshots, so it can roll back without a previous release
-TOOLS = ("glaeda-disk", "glaeda-runner-hygiene", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all",
+TOOLS = ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-runner-hygiene", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all",
          "glaeda-fleet-cas-prune", "glaeda-seed-prefetch", "glaeda-idle-warm", "glaeda-mini-health", "glaeda-update", "glaeda-gh")
 RELEASE_SCHEMA = "glaeda-release/v1"
 STATUS_PREFIX = "glaeda-ota/"
@@ -305,6 +305,8 @@ def health(bin_dir: Path, channel_dir: Path) -> tuple[bool, str]:
     run already fetched, so a network blip cannot fail (and quarantine) a good release."""
     checks = [
         [sys.executable, str(bin_dir / "glaeda-disk"), "--help"],
+        [sys.executable, str(bin_dir / "glaeda-worktree"), "--help"],
+        [sys.executable, str(bin_dir / "glaeda-projects"), "--help"],
         [str(bin_dir / "glaeda-worktree-reclaim"), "--help"],
         [sys.executable, str(bin_dir / "glaeda-gh"), "--help"],
         [sys.executable, str(bin_dir / "glaeda-update"), "--channel-dir", str(channel_dir)],
@@ -344,6 +346,12 @@ def restore(state_dir: Path, bin_dir: Path) -> bool:
     root = state_dir / "pre-ota"
     if not root.is_dir():
         return False
+    saved = {path.name for path in root.iterdir() if path.is_file()}
+    for name in TOOLS:
+        if name not in saved:
+            current = bin_dir / name
+            if current.exists() or current.is_symlink():
+                current.unlink()
     for path in root.iterdir():
         tmp = bin_dir / f".{path.name}.restore"
         tmp.write_bytes(path.read_bytes())

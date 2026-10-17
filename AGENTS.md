@@ -10,6 +10,11 @@ Use **Glaeda** for the project and **`glaeda`** for the binary/crate. Use
    Git state, and overlapping work before editing.
 3. Read only the contract for the surface you will change:
 
+When creating a developer checkout, use `~/.local/bin/glaeda-worktree add --no-build <repo> <name>`;
+use `--build` only on a build host. This keeps every worktree under `~/Projects/worktrees/<repo>/`
+and avoids initializing Ghostty on no-build machines. Run `~/.local/bin/glaeda-projects tidy` for a
+report before reorganizing older checkouts.
+
 | Work surface | Read next |
 | --- | --- |
 | Hostile/disposable execution | `docs/THREAT_MODEL.md` plus applicable `docs/DISPOSABLE_*.md` |

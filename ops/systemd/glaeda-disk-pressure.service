@@ -13,7 +13,7 @@ Type=oneshot
 # Thresholds are a share of each filesystem, judged separately: on Big Red that is the
 # 937G root (act below ~140G free, stop at ~234G) and the 16G /tmp tmpfs (below ~2.3G, stop at ~3.8G).
 # %% is systemd's escape for a literal percent sign.
-ExecStart=%h/.local/bin/glaeda-disk --pressure --apply --top 0 --low 15%% --target 25%%
+ExecStart=%h/.local/bin/glaeda-disk --role @GLAEDA_ROLE@ --pressure --apply --top 0 --low 15%% --target 25%%
 Environment=PYTHONUNBUFFERED=1
 Nice=19
 IOSchedulingClass=idle

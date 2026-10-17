@@ -4,14 +4,29 @@
 from __future__ import annotations
 
 import sys
+import importlib.machinery
+import importlib.util
 from pathlib import Path
 
 sys.dont_write_bytecode = True
 scripts = Path(__file__).resolve().parent / "scripts"
 sys.path.insert(0, str(scripts))
 
+
+def dispatch(name: str, argv: list[str]) -> int:
+    path = scripts / {"disk": "glaeda-disk", "projects": "glaeda-projects",
+                      "worktree": "glaeda-worktree"}[name]
+    loader = importlib.machinery.SourceFileLoader(f"glaeda_{name}", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module
+    loader.exec_module(module)
+    return int(module.main(argv))
+
 from workspace_bootstrap.journey import main
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] in {"disk", "projects", "worktree"}:
+        raise SystemExit(dispatch(sys.argv[1], sys.argv[2:]))
     raise SystemExit(main(sys.argv[1:]))

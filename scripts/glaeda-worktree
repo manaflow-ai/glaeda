@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""Create a Glaeda-managed worktree with an explicit build-host policy.
+
+    glaeda-worktree add [--no-build|--build] REPOSITORY NAME [REVISION]
+
+No-build hosts get source files without initializing submodules. Build hosts initialize
+Ghostty with the main checkout as an object reference, so every worktree shares the
+large module object store while retaining private working files and build caches.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+HOME = Path.home()
+PROJECTS = HOME / "Projects"
+GIT = next((path for path in ("/usr/bin/git", "/usr/local/bin/git", "/opt/homebrew/bin/git")
+            if os.access(path, os.X_OK)), "/usr/bin/git")
+
+
+def git_environment() -> dict[str, str]:
+    env = {"HOME": os.environ.get("HOME", str(HOME)),
+           "PATH": "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin",
+           "GIT_TERMINAL_PROMPT": "0"}
+    if os.environ.get("GIT_ALLOW_PROTOCOL"):
+        env["GIT_ALLOW_PROTOCOL"] = os.environ["GIT_ALLOW_PROTOCOL"]
+    return env
+
+
+def run(argv: list[str], *, cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
+    command = [GIT if argument == "git" and index == 0 else argument
+               for index, argument in enumerate(argv)]
+    return subprocess.run(command, cwd=cwd, stdin=subprocess.DEVNULL, text=True,
+                          capture_output=True, check=check, env=git_environment())
+
+
+def repository_root(value: str) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    result = run(["git", "-C", str(path), "rev-parse", "--show-toplevel"])
+    root = Path(result.stdout.strip()).resolve()
+    if root.parent != PROJECTS.resolve() or root.is_symlink():
+        raise SystemExit(f"repository must be a canonical checkout directly under {PROJECTS}: {root}")
+    return root
+
+
+def target_for(root: Path, name: str) -> Path:
+    if not name or name in {".", ".."} or Path(name).name != name:
+        raise SystemExit("NAME must be one path component")
+    target = PROJECTS / "worktrees" / root.name / name
+    if target.exists() or target.is_symlink():
+        raise SystemExit(f"worktree already exists: {target}")
+    return target
+
+
+def ghostty_reference(root: Path, target: Path) -> None:
+    source = root / "ghostty"
+    tracked = run(["git", "-C", str(root), "ls-files", "--stage", "--", "ghostty"])
+    if not tracked.stdout.startswith("160000 "):
+        return
+    if not source.is_dir() or not (source / ".git").exists():
+        raise SystemExit("Ghostty reference unavailable; initialize it in the canonical checkout first")
+    # Git 2.53 parses --reference as a repository-local option when it follows
+    # the pathspec, so keep all options before the submodule path.
+    result = run(["git", "-C", str(target), "submodule", "update", "--reference", str(source),
+                  "--init", "ghostty"], check=False)
+    if result.returncode:
+        raise SystemExit(f"Ghostty reference initialization failed: {result.stderr.strip()[:500]}")
+
+
+def add(root: Path, name: str, revision: str, build: bool) -> Path:
+    target = target_for(root, name)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # Explicitly disable recursive checkout so a no-build machine never downloads
+    # Ghostty or vendor modules merely because an agent created a worktree.
+    result = run(["git", "-C", str(root), "-c", "submodule.recurse=false",
+                  "worktree", "add", str(target), revision], check=False)
+    if result.returncode:
+        raise SystemExit(result.stderr.strip() or "git worktree add failed")
+    if build:
+        try:
+            ghostty_reference(root, target)
+        except (RuntimeError, SystemExit):
+            cleanup = run(["git", "-C", str(root), "worktree", "remove", "--force", str(target)], check=False)
+            if cleanup.returncode:
+                raise SystemExit(f"Ghostty initialization failed and worktree cleanup failed: {cleanup.stderr.strip()[:500]}")
+            raise
+    print(target)
+    return target
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="glaeda-worktree", description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+    add_parser = sub.add_parser("add", help="create a worktree in Projects/worktrees")
+    mode = add_parser.add_mutually_exclusive_group()
+    mode.add_argument("--no-build", action="store_true", help="do not initialize submodules")
+    mode.add_argument("--build", action="store_true", help="initialize Ghostty using --reference")
+    add_parser.add_argument("repository", help="canonical checkout or its name")
+    add_parser.add_argument("name")
+    add_parser.add_argument("revision", nargs="?", default="HEAD")
+    args = parser.parse_args(argv)
+    if args.command == "add":
+        root = repository_root(args.repository)
+        build = args.build or (not args.no_build and os.environ.get("GLAEDA_HOST_ROLE") == "build")
+        add(root, args.name, args.revision, build)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -25,6 +25,8 @@ GitHub Actions runner and is documented in docs/CMUX_MINI_RUNNER.md.
 
 What --apply installs (templated for the current user):
     ~/.local/bin/glaeda-disk                   from scripts/glaeda-disk
+    ~/.local/bin/glaeda-worktree               canonical Projects/worktrees creator
+    ~/.local/bin/glaeda-projects               dry-run/apply Projects tidy pass
     ~/.local/bin/disk-pressure.sh              one-shot launcher used by every mini's LaunchAgent
     ~/.local/bin/glaeda-procs                  from scripts/glaeda-procs (why the Mac lags; --apply ends leaked fixtures)
     ~/.local/bin/glaeda-local-guard            from scripts/glaeda-local-guard (stops test and build runs orphaned by an
@@ -147,12 +149,15 @@ SYSTEMD_UNITS_DIR = REPO / "ops/systemd"
 LINUX_UNITS = (
     "glaeda-disk-pressure.service",
     "glaeda-disk-pressure.timer",
+    "glaeda-projects-tidy.service",
+    "glaeda-projects-tidy.timer",
     "glaeda-worktree-reclaim.service",
     "glaeda-worktree-reclaim.timer",
     "glaeda-update.service",
     "glaeda-update.timer",
     "glaeda-gh.service",
 )
+DEVBOX_LINUX_UNITS = frozenset({"glaeda-projects-tidy.service", "glaeda-projects-tidy.timer"})
 # long-running Linux services with no timer: enabled and started themselves
 DAEMON_UNITS = frozenset({"glaeda-gh.service"})
 # the Claude Code skill installed beside the tools
@@ -221,7 +226,8 @@ class Context:
                  reclaim_binary: Path | None, cmux_root: Path | None, glaeda_bin: Path | None,
                  xcode_app: str, min_free_gib: int, hygiene_only: bool = False,
                  platform_name: str | None = None, ota_ring: str | None = None,
-                 ota_source: str | None = None, headless: bool = False) -> None:
+                 ota_source: str | None = None, role: str = "devbox",
+                 role_explicit: bool = False, headless: bool = False) -> None:
         self.home = home
         self.platform = platform_name or HOST_PLATFORM
         self.hygiene_only = hygiene_only
@@ -254,6 +260,8 @@ class Context:
         self.receipt_path = self.state / "receipt.json"
         self.ota_ring = ota_ring
         self.ota_source = ota_source
+        self.role = role
+        self.role_explicit = role_explicit
         self.update_config = home / ".config/glaeda/update.json"
 
     def show(self, path: Path | str) -> str:
@@ -677,7 +685,7 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             # --idle: with no pressure, an hourly sweep of idle reproducible data while no job runs.
             "LowPriorityIO": True,
             "Nice": 10,
-            "EnvironmentVariables": {"GLAEDA_PYTHON": python, "GLAEDA_DISK": disk},
+            "EnvironmentVariables": {"GLAEDA_PYTHON": python, "GLAEDA_DISK": disk, "GLAEDA_ROLE": ctx.role},
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-disk.log"),
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-disk.err"),
         },
@@ -834,6 +842,16 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-gh.err"),
         },
     }
+    if ctx.role == "devbox":
+        agents[LABEL_PREFIX + "projects-tidy"] = {
+            "Label": LABEL_PREFIX + "projects-tidy",
+            "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-projects"), "tidy", "--apply"],
+            "StartInterval": 86400,
+            "LowPriorityIO": True,
+            "Nice": 10,
+            "StandardOutPath": os.fspath(ctx.logs / "glaeda-projects-tidy.jsonl"),
+            "StandardErrorPath": os.fspath(ctx.logs / "glaeda-projects-tidy.err"),
+        }
     if ctx.headless:
         # A system LaunchDaemon has no per-user GUI session. Run the same
         # unprivileged tools as the setup user and keep only the plist itself
@@ -846,7 +864,27 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
 
 def agent_names(ctx: Context) -> list[str]:
     """LaunchAgent labels on macOS; systemd unit file names on Linux."""
-    return list(LINUX_UNITS) if ctx.platform == "linux" else list(agent_plists(ctx))
+    if ctx.platform != "linux":
+        return list(agent_plists(ctx))
+    return [name for name in LINUX_UNITS if ctx.role == "devbox" or name not in DEVBOX_LINUX_UNITS]
+
+
+def stale_agent_actions(ctx: Context, desired: set[str], owned: dict[str, str | None]) -> list[dict[str, Any]]:
+    """Remove role-specific agents installed by an earlier profile."""
+    actions = []
+    for label, digest in owned.items():
+        if not label or label in desired:
+            continue
+        path = agent_path(ctx, label)
+        current = sha256_file(path)
+        if current is None:
+            continue
+        state = "remove" if digest and current == digest else "kept"
+        actions.append({"kind": "agent", "label": label, "path": os.fspath(path),
+                        "state": state, "sha256": current, "owned": state == "remove",
+                        "ownedSha256": digest, "loaded": agent_loaded(ctx, label),
+                        "note": "stale agent from previous role" if state == "remove" else "changed since install"})
+    return actions
 
 
 def agent_path(ctx: Context, label: str) -> Path:
@@ -855,7 +893,7 @@ def agent_path(ctx: Context, label: str) -> Path:
 
 def agent_bytes(ctx: Context, label: str) -> bytes:
     if ctx.platform == "linux":
-        return (SYSTEMD_UNITS_DIR / label).read_bytes()
+        return (SYSTEMD_UNITS_DIR / label).read_bytes().replace(b"@GLAEDA_ROLE@", ctx.role.encode())
     return plistlib.dumps(agent_plists(ctx)[label], sort_keys=True)
 
 
@@ -877,9 +915,12 @@ def is_update_agent(label: str) -> bool:
 
 def update_config(ctx: Context) -> dict[str, Any]:
     """What glaeda-update reads: this host's ring and the setup flags it re-runs releases with."""
+    setup_args = ["--hygiene-only"] if ctx.hygiene_only else []
+    if ctx.role_explicit or ctx.role != "devbox":
+        setup_args.append(f"--role={ctx.role}")
     config = {
         "ring": ctx.ota_ring or "stable",
-        "setupArgs": (["--hygiene-only"] if ctx.hygiene_only else []) + (["--headless"] if ctx.headless else []),
+        "setupArgs": setup_args + (["--headless"] if ctx.headless else []),
         "host": platform.node().split(".")[0].lower(),
         "reportStatus": (ctx.ota_ring or "stable") == "canary",
     }
@@ -887,7 +928,7 @@ def update_config(ctx: Context) -> dict[str, Any]:
 
 
 def update_config_action(ctx: Context) -> dict[str, Any]:
-    """Written once. A later run changes it only when --ota-ring or --ota-source names a different value."""
+    """Preserve hand edits; explicit ring, source and role flags update their owned fields."""
     path = ctx.update_config
     act: dict[str, Any] = {"kind": "config", "path": os.fspath(path), "mode": "0o644"}
     try:
@@ -915,8 +956,22 @@ def update_config_action(ctx: Context) -> dict[str, Any]:
     # be treated as equivalent to the default when --ota-source was supplied.
     if ctx.ota_source and current.get("source") != ctx.ota_source:
         value["source"] = ctx.ota_source
+    if ctx.role_explicit:
+        setup_args = current.get("setupArgs", ["--hygiene-only"])
+        if not isinstance(setup_args, list) or not all(isinstance(arg, str) for arg in setup_args):
+            return {**act, "state": "blocked", "note": "invalid setupArgs; fix or remove it"}
+        retained = []
+        skip_value = False
+        for arg in setup_args:
+            if skip_value:
+                skip_value = False
+            elif arg == "--role":
+                skip_value = True
+            elif not arg.startswith("--role="):
+                retained.append(arg)
+        value["setupArgs"] = [*retained, f"--role={ctx.role}"]
     if value != current:
-        previous = {k: current.get(k) for k in ("ring", "source") if current.get(k) != value.get(k)}
+        previous = {k: current.get(k) for k in ("ring", "source", "setupArgs") if current.get(k) != value.get(k)}
         return {**act, "state": "update", "value": value, "previous": previous}
     return {**act, "state": "unchanged", "value": current}
 
@@ -1018,7 +1073,7 @@ def reclaim_source(ctx: Context) -> tuple[str, Path | None, str]:
 def launchctl_loaded(ctx: Context, label: str) -> bool | None:
     if ctx.skip_launchctl:
         return None
-    domain = f"system/{label}" if ctx.headless else f"gui/{ctx.uid}/{label}"
+    domain = f"system/{label}" if getattr(ctx, "headless", False) is True else f"gui/{ctx.uid}/{label}"
     code, _ = run(([SUDO, "/bin/launchctl", "print", domain] if ctx.headless
                    else ["/bin/launchctl", "print", domain]))
     return code == 0
@@ -1108,7 +1163,7 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
     for path, mode in directories(ctx):
         actions.append({"kind": "dir", "path": os.fspath(path),
                         "state": "unchanged" if path.is_dir() else "create", "mode": oct(mode)})
-    for name in ("glaeda-disk", "glaeda-runner-hygiene", "disk-pressure.sh", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune", "glaeda-seed-prefetch",
+    for name in ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-runner-hygiene", "disk-pressure.sh", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune", "glaeda-seed-prefetch",
                  "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health",
                  "glaeda-update", "glaeda-gh", "glaeda-wallpaper-rotate"):
         act = file_action(ctx, "tool", ctx.bin / name, (SCRIPT_DIR / name).read_bytes(), 0o755)
@@ -1166,6 +1221,10 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
         act[scheduler] = "skipped (sandbox HOME)" if ctx.sandbox else ("skipped" if ctx.skip_launchctl else "managed")
         actions.append(act)
 
+    previous_agents = {a.get("label"): a.get("ownedSha256") or a.get("sha256")
+                       for a in prior_receipt.get("actions", [])
+                       if a.get("kind") == "agent" and a.get("owned")}
+    actions.extend(stale_agent_actions(ctx, set(agent_names(ctx)), previous_agents))
     # Keep Spotlight off the two canonical build roots. Markers are ordinary user-owned
     # files, so this remains idempotent and never changes the host-wide indexing policy.
     for marker in scan_exclusion_markers(ctx):
@@ -1279,11 +1338,21 @@ def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
     if receipt is None:
         actions.append({"kind": "note", "state": "kept",
                         "note": f"no install receipt at {ctx.show(ctx.receipt_path)}; nothing is removed"})
-    for label in agent_names(ctx):
+    roles = {ctx.role}
+    recorded_role = (receipt or {}).get("role")
+    if recorded_role in {"devbox", "fleet-mini"}:
+        roles.add(recorded_role)
+    labels: set[str] = set()
+    original_role = ctx.role
+    for role in roles:
+        ctx.role = role
+        labels.update(agent_names(ctx))
+    ctx.role = original_role
+    for label in sorted(labels):
         path = agent_path(ctx, label)
         actions.append({"kind": "agent", "label": label, "path": os.fspath(path),
                         "loaded": agent_loaded(ctx, label)})
-    for name in ("glaeda-disk", "glaeda-runner-hygiene", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune",
+    for name in ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-runner-hygiene", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune",
                  "glaeda-seed-prefetch", "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health",
                  "glaeda-update", "glaeda-gh", "glaeda-wallpaper-rotate"):
         actions.append({"kind": "tool", "path": os.fspath(ctx.bin / name)})
@@ -1356,11 +1425,15 @@ def launchctl(ctx: Context, *args: str) -> tuple[int, str]:
 
 def bootout(ctx: Context, label: str, wait_s: float = 5.0) -> bool:
     """Unload a job and wait (bounded) until launchd no longer lists it."""
-    domain = f"system/{label}" if ctx.headless else f"gui/{ctx.uid}/{label}"
-    launchctl(ctx, "bootout", domain)
+    domain = f"system/{label}" if getattr(ctx, "headless", False) is True else f"gui/{ctx.uid}/{label}"
+    code, output = launchctl(ctx, "bootout", domain)
+    if code != 0 and "could not find" not in output.lower() and "no such process" not in output.lower():
+        return False
     deadline = time.monotonic() + wait_s
     while time.monotonic() < deadline:
-        if launchctl(ctx, "print", domain)[0] != 0:
+        print_code, print_output = launchctl(ctx, "print", domain)
+        if print_code != 0 and ("could not find" in print_output.lower()
+                                or "no such process" in print_output.lower()):
             return True
         time.sleep(0.25)
     return False
@@ -1404,6 +1477,20 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]]) -> None:
             if state == "create":
                 path.mkdir(parents=True, exist_ok=True, mode=int(act["mode"], 8))
                 act["applied"] = True
+            continue
+        if kind == "agent" and state == "remove":
+            unloaded = True
+            if ctx.platform == "linux" and not ctx.sandbox:
+                code, _ = run([systemctl(), "--user", "disable", "--now", act["label"]])
+                unloaded = code == 0
+            elif ctx.platform != "linux" and act.get("loaded"):
+                unloaded = bootout(ctx, act["label"])
+            if not unloaded:
+                act["state"], act["note"] = "blocked", "could not unload stale agent; file retained"
+                continue
+            with contextlib.suppress(FileNotFoundError):
+                Path(act["path"]).unlink()
+            act["applied"] = True
             continue
         if kind == "agent" and is_reclaim_agent(act["label"]) and reclaim_failed:
             act["state"], act["note"] = "blocked", "glaeda-worktree-reclaim could not be installed"
@@ -1785,6 +1872,8 @@ def parser() -> argparse.ArgumentParser:
                         "minis use the mirror manaflow-ai/glaeda)")
     p.add_argument("--hygiene-only", action="store_true",
                    help="only the disk and worktree hygiene tools and agents, for any Mac or Linux host")
+    p.add_argument("--role", choices=("fleet-mini", "devbox"),
+                   help="disk and workspace policy role (default: devbox for hygiene/Linux, fleet-mini otherwise)")
     p.add_argument("--headless", action="store_true",
                    help="install macOS agents as root-owned system LaunchDaemons for a GUI-less host (needs sudo)")
     return p
@@ -1813,12 +1902,27 @@ def main(argv: list[str] | None = None) -> int:
         print("glaeda-mini-setup: macOS or Linux only", file=sys.stderr)
         return 2
     min_free_gib = args.min_free_gib if args.min_free_gib is not None else fleet.default_min_free_gib(HOST_PLATFORM)
-    ctx = Context(Path(os.environ.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir), args.apply, args.python,
+    home = Path(os.environ.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir)
+    recorded_role = None
+    try:
+        prior = json.loads((home / ".local/state/glaeda/mini-setup/receipt.json").read_text())
+        if isinstance(prior, dict):
+            recorded_role = prior.get("role") if prior.get("role") in {"devbox", "fleet-mini"} else None
+            if recorded_role is None and prior.get("profile") in {"build-host", "hygiene"}:
+                # Before roles were recorded, both profiles used the fleet-style disk policy.
+                # Keep that policy on upgrade; opting into devbox requires --role devbox.
+                recorded_role = "fleet-mini"
+    except (OSError, ValueError, TypeError):
+        pass
+    role = args.role or recorded_role or ("devbox" if args.hygiene_only or HOST_PLATFORM == "linux" else "fleet-mini")
+    ctx = Context(home, args.apply, args.python,
                   args.skip_launchctl, args.reclaim_binary,
                   args.cmux_root.expanduser().resolve() if args.cmux_root else None,
                   args.glaeda.expanduser() if args.glaeda else None, args.xcode_app, min_free_gib,
                   args.hygiene_only or HOST_PLATFORM == "linux", ota_ring=args.ota_ring,
-                  ota_source=args.ota_source, headless=args.headless)
+                  ota_source=args.ota_source, role=role,
+                  role_explicit=args.role is not None,
+                  headless=args.headless)
     pre = preflight(ctx)
     if ctx.hygiene_only:  # build-host checks are reported, not enforced
         blocking_checks = HYGIENE_BLOCKING | ({"headlessSudo"} if args.headless else set())
@@ -1842,6 +1946,7 @@ def main(argv: list[str] | None = None) -> int:
         "schema": SCHEMA,
         "mode": "uninstall" if args.uninstall else "install",
         "profile": "hygiene" if ctx.hygiene_only else "build-host",
+        "role": ctx.role,
         "platform": ctx.platform,
         "applied": args.apply,
         "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
