@@ -33,6 +33,9 @@ seccompiler = { version = "0.5.0", default-features = false }
 libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# Safe maintained wrapper around Darwin libproc; UID-filtered path queries provide native process
+# authority for runner diagnostics without project-local FFI.
+libproc = "=0.14.11"
 # Read the controller GitHub App key directly from the macOS Keychain without a secret-bearing
 # subprocess, argv, environment, or public execution record.
 security-framework = { version = "3.7.0", default-features = false }

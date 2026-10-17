@@ -1,0 +1,43 @@
+{
+  "document_type": "glaeda-runner-log-reclaim",
+  "schema_version": 1,
+  "operation": "plan",
+  "runner_root": "/fixture/runner",
+  "minimum_idle_seconds": 3600,
+  "batch_size": 4,
+  "observation": {
+    "runner_root": "/fixture/runner",
+    "authority": {"kind": "enrolled_runner_uid", "uid": 501, "scope_complete": true},
+    "process": {
+      "uid": 501,
+      "in_scope_pids_seen": 1,
+      "in_scope_pids_complete": true,
+      "unreadable_in_scope_pids": 0,
+      "busy_processes_observed": 0,
+      "open_identity_count": 0
+    },
+    "items": [{
+      "relative_path": "_diag/old.log",
+      "identity": {"device": 1, "inode": 2, "links": 1, "size": 10, "modified_seconds": 1700000000, "changed_seconds": 1700000000, "modified_nanos": 0, "changed_nanos": 0},
+      "bytes": 10,
+      "modified_seconds": 1700000000,
+      "decision": "expired_runner_diagnostic_log",
+      "reason": "expired_retention"
+    }],
+    "item_count": 1,
+    "eligible_count": 1,
+    "enumeration_truncated": false,
+    "items_truncated": false,
+    "complete": true
+  },
+  "actions": [{
+    "relative_path": "_diag/old.log",
+    "identity": {"device": 1, "inode": 2, "links": 1, "size": 10, "modified_seconds": 1700000000, "changed_seconds": 1700000000, "modified_nanos": 0, "changed_nanos": 0},
+    "decision": "expired_runner_diagnostic_log",
+    "receipt_id": "0000000000000001-0000000000000002"
+  }],
+  "remaining_count": 0,
+  "reclaimed_count": 0,
+  "recovery": {"state_root": null, "pending_count": 0},
+  "errors": []
+}
