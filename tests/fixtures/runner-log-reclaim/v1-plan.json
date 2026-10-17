@@ -14,7 +14,8 @@
       "in_scope_pids_complete": true,
       "unreadable_in_scope_pids": 0,
       "busy_processes_observed": 0,
-      "open_identity_count": 0
+      "open_identity_count": 0,
+      "errors": []
     },
     "items": [{
       "relative_path": "_diag/old.log",

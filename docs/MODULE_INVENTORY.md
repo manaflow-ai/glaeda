@@ -35,8 +35,8 @@ being measured.
 
 ## Totals
 
-- Exported modules: **206**
-- Reach: **98 binary**, **63 library**, **11 tests**, **34 none**
+- Exported modules: **207**
+- Reach: **99 binary**, **63 library**, **11 tests**, **34 none**
 - Gate: at most 34 exports may have reach `none` (`UNREFERENCED_EXPORT_CEILING`)
 
 ## Exports with no consumer
@@ -259,6 +259,7 @@ let the gate hold the line.
 | `rootless_podman_preflight` | `target_os="linux"` | binary | 13 |
 | `runner_account_observation` | `target_os="linux"` | binary | 7 |
 | `runner_account_plan` | `target_os="linux"` | binary | 17 |
+| `runner_log_reclaim` | `all` | binary | 2 |
 | `runner_user` | `target_os="linux"` | binary | 9 |
 | `runner_user_observation` | `target_os="linux"` | binary | 2 |
 | `rust_memory_diagnostic` | `all` | none | 0 |

@@ -41,97 +41,85 @@ fn old_log(root: &Path) -> PathBuf {
 }
 
 #[test]
-fn libproc_open_identity_survives_same_volume_stage_and_second_runner_is_independent() {
+fn libproc_worker_busy_and_open_identity_are_independent() {
     let base = std::env::temp_dir().join(format!(
         "glaeda-runner-log-macos-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
+            .unwrap()
             .as_nanos()
     ));
-    fs::create_dir_all(&base).expect("temp root");
+    fs::create_dir_all(&base).unwrap();
+    let base = fs::canonicalize(base).unwrap();
     let first = base.join("runner-a");
     let second = base.join("runner-b");
     let first_receipt = fixture(&first, "a");
     let second_receipt = fixture(&second, "b");
     let first_log = old_log(&first);
     let second_log = old_log(&second);
-    let held = File::open(&first_log).expect("open first log");
-    fs::create_dir_all(first.join("bin")).expect("bin");
+    // No held log yet: a busy decision must come from executable identity alone.
+    fs::create_dir(first.join("bin")).unwrap();
     let worker_path = first.join("bin/Runner.Worker");
-    fs::copy("/bin/sleep", &worker_path).expect("worker binary");
-    let signed = std::process::Command::new("/usr/bin/codesign")
-        .args(["--force", "--sign", "-", "--timestamp=none"])
-        .arg(&worker_path)
-        .status()
-        .expect("codesign worker");
-    assert!(signed.success());
-    let worker = std::process::Command::new(&worker_path)
-        .arg("300")
-        .current_dir(&base)
-        .spawn()
-        .expect("runner worker");
-    let mut worker = ChildGuard(worker);
-    assert!(worker.0.try_wait().expect("worker status").is_none());
-    let policy = Policy::new(MIN_RUNNER_LOG_RECLAIM_IDLE_SECONDS, 4).expect("policy");
-    let first_plan = reclaim(&first, &first_receipt, policy, None, false).expect("first plan");
-    assert_eq!(
-        first_plan.observation.items[0].decision,
-        ItemDecision::OpenOrBusy
+    fs::copy("/bin/sleep", &worker_path).unwrap();
+    assert!(
+        std::process::Command::new("/usr/bin/codesign")
+            .args(["--force", "--sign", "-", "--timestamp=none"])
+            .arg(&worker_path)
+            .status()
+            .unwrap()
+            .success()
     );
-    assert!(first_plan.observation.process.busy_processes_observed > 0);
-    let second_plan = reclaim(&second, &second_receipt, policy, None, false).expect("second plan");
+    let mut worker = ChildGuard(
+        std::process::Command::new(&worker_path)
+            .arg("300")
+            .current_dir(&base)
+            .spawn()
+            .unwrap(),
+    );
+    assert!(worker.0.try_wait().unwrap().is_none());
+    let pid = worker.0.id() as i32;
+    let observed_path = libproc::libproc::proc_pid::pidpath(pid).unwrap();
     assert_eq!(
-        second_plan.observation.items[0].decision,
+        PathBuf::from(&observed_path),
+        worker_path,
+        "actual pidpath={observed_path:?}"
+    );
+    let info =
+        libproc::libproc::proc_pid::pidinfo::<libproc::libproc::bsd_info::BSDInfo>(pid, 0).unwrap();
+    assert_eq!(info.pbi_uid, rustix::process::geteuid().as_raw());
+    let policy = Policy::new(MIN_RUNNER_LOG_RECLAIM_IDLE_SECONDS, 4).unwrap();
+    let busy = observe(&first, &first_receipt, policy).unwrap();
+    assert_eq!(busy.items[0].reason, "runner_process_busy", "{busy:?}");
+    assert_eq!(busy.process.busy_processes_observed, 1, "{busy:?}");
+    let independent = observe(&second, &second_receipt, policy).unwrap();
+    assert!(independent.complete, "{independent:?}");
+    assert_eq!(
+        independent.items[0].decision,
         ItemDecision::ExpiredRunnerDiagnosticLog
     );
-    let staged = first.join("_diag/.glaeda-open-stage.log");
-    fs::rename(&first_log, &staged).expect("stage");
-    let staged_plan = observe(&first, &first_receipt, policy).expect("staged observation");
-    assert_eq!(staged_plan.items[0].decision, ItemDecision::OpenOrBusy);
-    fs::rename(&staged, &first_log).expect("restore");
-    assert!(worker.0.try_wait().expect("worker status").is_none());
-    drop(held);
-    let second_apply = reclaim(&second, &second_receipt, policy, None, true).expect("apply report");
-    assert!(
-        second_apply
-            .errors
-            .iter()
-            .any(|error| *error == "reclaim_not_ready")
-    );
-    assert!(second_log.exists() && first_log.exists());
-    let _ = fs::remove_dir_all(base);
-}
+    assert!(worker.0.try_wait().unwrap().is_none());
+    drop(worker); // kill + wait: subsequent open-file checks cannot pass through the busy guard.
 
-#[test]
-#[ignore = "enabled when descriptor-bound store lands"]
-fn apply_is_bounded_and_reports_remainder() {
-    let base = std::env::temp_dir().join(format!(
-        "glaeda-runner-log-batch-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos()
-    ));
-    let root = base.join("runner");
-    let receipt = fixture(&root, "batch");
-    for index in 0..70 {
-        let path = root.join(format!("_diag/{index:03}.log"));
-        fs::write(&path, b"expired").expect("log");
-        let status = std::process::Command::new("/usr/bin/touch")
-            .args(["-t", "202001010000", path.to_str().expect("utf8")])
-            .status()
-            .expect("touch");
-        assert!(status.success());
-    }
-    let policy = Policy::new(MIN_RUNNER_LOG_RECLAIM_IDLE_SECONDS, 64).expect("policy");
-    let first = reclaim(&root, &receipt, policy, None, true).expect("first apply");
-    assert_eq!(first.reclaimed_count, 64);
-    assert_eq!(first.remaining_count, 6);
-    let second = reclaim(&root, &receipt, policy, None, true).expect("second apply");
-    assert_eq!(second.reclaimed_count, 6);
-    assert_eq!(second.remaining_count, 0);
-    let _ = fs::remove_dir_all(base);
+    let held = File::open(&first_log).unwrap();
+    let open = observe(&first, &first_receipt, policy).unwrap();
+    assert_eq!(open.process.busy_processes_observed, 0, "{open:?}");
+    assert_eq!(open.items[0].reason, "open_descriptor", "{open:?}");
+    let staged = first.join("_diag/.glaeda-open-stage.log");
+    fs::rename(&first_log, &staged).unwrap();
+    let renamed = observe(&first, &first_receipt, policy).unwrap();
+    assert_eq!(renamed.items[0].reason, "open_descriptor", "{renamed:?}");
+    fs::rename(&staged, &first_log).unwrap();
+    drop(held);
+    let closed = observe(&first, &first_receipt, policy).unwrap();
+    assert!(closed.complete, "{closed:?}");
+    assert_eq!(
+        closed.items[0].decision,
+        ItemDecision::ExpiredRunnerDiagnosticLog
+    );
+    let absent_state = base.join("state-must-not-be-created");
+    let apply = reclaim(&second, &second_receipt, policy, Some(&absent_state), true).unwrap();
+    assert_eq!(apply.errors, vec!["reclaim_not_ready"]);
+    assert!(first_log.exists() && second_log.exists() && !absent_state.exists());
+    fs::remove_dir_all(base).unwrap();
 }

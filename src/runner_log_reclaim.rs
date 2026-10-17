@@ -1,9 +1,9 @@
 //! Safe, bounded macOS observation and reclaim of expired Actions runner diagnostics.
 //!
-//! The implementation deliberately uses fixed Apple tools (`ps` and `lsof`) through argv-only
-//! subprocesses.  They are the stable, supported macOS process/file-descriptor interfaces and
-//! keep this crate free of project-local FFI.  Process evidence is scoped to the enrolled runner
-//! account; an unreadable in-scope enumeration is a veto, never evidence of absence.
+//! Safe libproc bindings inspect the enrolled UID and vnode file descriptors without
+//! project-local FFI or subprocess probes. Budgets are cooperative deadlines between
+//! kernel calls; incomplete evidence never proves absence. This delivery observes only:
+//! apply explicitly refuses until the descriptor-bound store is independently accepted.
 
 use std::collections::BTreeSet;
 use std::fs::{self, File};
@@ -38,7 +38,6 @@ pub const DEFAULT_RUNNER_LOG_RECLAIM_BATCH: u32 = 16;
 pub const MIN_RUNNER_LOG_RECLAIM_IDLE_SECONDS: i64 = 3_600;
 const MAX_DIAG_ENTRIES: usize = 2_048;
 const MAX_REPORT_ITEMS: usize = 128;
-const MAX_JOURNAL_BYTES: u64 = 1 << 20;
 const MARKER: &str = ".glaeda-cmux-runner";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -101,8 +100,9 @@ pub struct ProcessEvidence {
     pub unreadable_in_scope_pids: u64,
     pub busy_processes_observed: u64,
     pub open_identity_count: u64,
+    pub errors: Vec<&'static str>,
     #[serde(skip_serializing)]
-    pub(crate) open_identities: BTreeSet<OpenIdentity>,
+    open_identities: BTreeSet<OpenIdentity>,
 }
 
 impl ProcessEvidence {
@@ -122,6 +122,7 @@ impl ProcessEvidence {
             unreadable_in_scope_pids: 0,
             busy_processes_observed: 0,
             open_identity_count: 0,
+            errors: Vec::new(),
             open_identities: BTreeSet::new(),
         }
     }
@@ -250,8 +251,13 @@ impl std::fmt::Display for ReclaimError {
 impl std::error::Error for ReclaimError {}
 
 fn identity(metadata: &fs::Metadata) -> FileIdentity {
+    // Darwin's vnode API exposes dev_t as unsigned 32 bits; std may sign-extend it.
+    #[cfg(target_os = "macos")]
+    let device = metadata.dev() as u32 as u64;
+    #[cfg(not(target_os = "macos"))]
+    let device = metadata.dev();
     FileIdentity {
-        device: metadata.dev(),
+        device,
         inode: metadata.ino(),
         links: metadata.nlink(),
         size: metadata.len(),
@@ -277,14 +283,42 @@ fn relative_path(root: &Path, path: &Path) -> String {
 }
 
 fn read_bounded(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
+    let fd = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::NONBLOCK
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "bounded_open"))?;
+    let stat = rustix::fs::fstat(&fd)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bounded_stat"))?;
+    if !rustix::fs::FileType::from_raw_mode(stat.st_mode).is_file()
+        || stat.st_nlink != 1
+        || stat.st_mode & 0o022 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsafe_bounded_read",
+        ));
+    }
     let mut bytes = Vec::new();
-    File::open(path)?
+    File::from(fd)
         .take((limit as u64).saturating_add(1))
         .read_to_end(&mut bytes)?;
     if bytes.len() > limit {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bounded_read"));
     }
     Ok(bytes)
+}
+
+/// Read an explicit enrollment receipt from a bounded, single-link regular file.
+pub fn read_enrollment_receipt(path: &Path) -> Result<RunnerEnrollmentReceipt, ReclaimError> {
+    let bytes = read_bounded(path, 65_536)
+        .map_err(|_| ReclaimError::InvalidAuthority("enrollment_receipt_invalid"))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|_| ReclaimError::InvalidAuthority("enrollment_receipt_invalid"))
 }
 
 fn preserved_path(path: &Path) -> bool {
@@ -302,90 +336,115 @@ fn observe_processes(root: &Path, uid: u32) -> Result<ProcessEvidence, ReclaimEr
     use libproc::libproc::file_info::{ListFDs, ProcFDType, pidfdinfo};
     use libproc::libproc::proc_pid::{listpidinfo, pidinfo};
 
+    const MAX_PIDS: usize = 4_096;
+    const MAX_FDS_PER_PID: usize = 4_096;
+    const MAX_FDS: usize = 1_000_000;
+    const MAX_TIME: Duration = Duration::from_secs(5);
+    let started = Instant::now();
     let pids = libproc::processes::pids_by_type(libproc::processes::ProcFilter::ByUID { uid })
         .map_err(|_| ReclaimError::Observation("process_table_unavailable"))?;
-    const MAX_SCANNED_PIDS: usize = 4_096;
-    const MAX_FDS_PER_PID: usize = 4_096;
-    const MAX_SCANNED_FDS: usize = 1_000_000;
-    const MAX_SCAN_TIME: Duration = Duration::from_secs(5);
-    let mut busy = 0_u64;
-    let mut unreadable = 0_u64;
+    let worker_path = root.join("bin/Runner.Worker");
+    let mut failed = BTreeSet::new();
+    let mut errors = BTreeSet::new();
+    let mut busy = BTreeSet::new();
+    let mut opened = BTreeSet::new();
     let mut scanned_fds = 0_usize;
-    let scan_started = Instant::now();
-    let mut open_identities = BTreeSet::new();
-    if pids.len() > MAX_SCANNED_PIDS {
-        unreadable = unreadable.saturating_add(1);
+    if started.elapsed() >= MAX_TIME {
+        errors.insert("process_scan_budget_exhausted");
     }
-    for pid in pids.iter().take(MAX_SCANNED_PIDS) {
-        if scan_started.elapsed() > MAX_SCAN_TIME {
-            unreadable = unreadable.saturating_add(1);
+    if pids.len() > MAX_PIDS {
+        failed.extend(pids.iter().skip(MAX_PIDS).copied());
+        errors.insert("pid_budget_exhausted");
+    }
+    for (index, pid) in pids.iter().take(MAX_PIDS).enumerate() {
+        if started.elapsed() >= MAX_TIME || scanned_fds >= MAX_FDS {
+            failed.extend(pids.iter().skip(index).copied());
+            errors.insert("process_scan_budget_exhausted");
             break;
         }
         let before = match pidinfo::<BSDInfo>(*pid as i32, 0) {
             Ok(info) if info.pbi_uid == uid => (info.pbi_start_tvsec, info.pbi_start_tvusec),
-            Ok(_) | Err(_) => {
-                unreadable = unreadable.saturating_add(1);
+            Ok(_) => {
+                failed.insert(*pid);
+                errors.insert("pid_uid_changed");
                 continue;
             }
-        };
-        let worker_pid = match libproc::libproc::proc_pid::pidpath(*pid as i32) {
-            Ok(path) if Path::new(&path) == root.join("bin/Runner.Worker") => true,
-            Ok(_) => false,
             Err(_) => {
-                unreadable = unreadable.saturating_add(1);
-                false
-            }
-        };
-        let fds = match listpidinfo::<ListFDs>(*pid as i32, MAX_FDS_PER_PID) {
-            Ok(fds) => fds,
-            Err(_) => {
-                unreadable = unreadable.saturating_add(1);
+                failed.insert(*pid);
+                errors.insert("pid_unreadable_or_exited");
                 continue;
             }
         };
-        scanned_fds = scanned_fds.saturating_add(fds.len());
-        if scanned_fds > MAX_SCANNED_FDS {
-            unreadable = unreadable.saturating_add(1);
-            break;
-        }
-        if fds.len() == MAX_FDS_PER_PID {
-            unreadable = unreadable.saturating_add(1);
-        }
-        for fd in fds {
-            if !matches!(ProcFDType::from(fd.proc_fdtype), ProcFDType::VNode) {
-                continue;
-            }
-            let vnode = match pidfdinfo::<VNodeFDInfo>(*pid as i32, fd.proc_fd) {
-                Ok(vnode) => vnode,
-                Err(_) => {
-                    unreadable = unreadable.saturating_add(1);
-                    continue;
+        match libproc::libproc::proc_pid::pidpath(*pid as i32) {
+            Ok(path) if !path.contains('\0') => {
+                // A known busy executable vetoes reclaim even if its FD list cannot be read.
+                if Path::new(&path) == worker_path {
+                    busy.insert(*pid);
                 }
-            };
-            let identity = OpenIdentity {
-                device: vnode.pvi.vst_dev as u64,
-                inode: vnode.pvi.vst_ino,
-            };
-            open_identities.insert(identity);
+            }
+            _ => {
+                failed.insert(*pid);
+                errors.insert("pid_path_unreadable");
+            }
         }
-        if worker_pid {
-            busy = busy.saturating_add(1);
+        match listpidinfo::<ListFDs>(*pid as i32, MAX_FDS_PER_PID) {
+            Ok(fds) => {
+                if fds.len() >= MAX_FDS_PER_PID {
+                    failed.insert(*pid);
+                    errors.insert("pid_fd_budget_exhausted");
+                }
+                for fd in fds {
+                    if started.elapsed() >= MAX_TIME || scanned_fds >= MAX_FDS {
+                        failed.insert(*pid);
+                        errors.insert("process_scan_budget_exhausted");
+                        break;
+                    }
+                    scanned_fds += 1;
+                    if !matches!(ProcFDType::from(fd.proc_fdtype), ProcFDType::VNode) {
+                        continue;
+                    }
+                    match pidfdinfo::<VNodeFDInfo>(*pid as i32, fd.proc_fd) {
+                        Ok(vnode) => {
+                            opened.insert(OpenIdentity {
+                                device: vnode.pvi.vst_dev as u64,
+                                inode: vnode.pvi.vst_ino,
+                            });
+                        }
+                        Err(_) => {
+                            failed.insert(*pid);
+                            errors.insert("pid_fd_unreadable");
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                failed.insert(*pid);
+                errors.insert("pid_fd_list_unreadable");
+            }
         }
         match pidinfo::<BSDInfo>(*pid as i32, 0) {
             Ok(info)
                 if info.pbi_uid == uid
                     && (info.pbi_start_tvsec, info.pbi_start_tvusec) == before => {}
-            Ok(_) | Err(_) => unreadable = unreadable.saturating_add(1),
+            Ok(_) => {
+                failed.insert(*pid);
+                errors.insert("pid_identity_changed");
+            }
+            Err(_) => {
+                failed.insert(*pid);
+                errors.insert("pid_unreadable_or_exited");
+            }
         }
     }
     Ok(ProcessEvidence {
         uid,
         in_scope_pids_seen: pids.len() as u64,
-        in_scope_pids_complete: unreadable == 0,
-        unreadable_in_scope_pids: unreadable,
-        busy_processes_observed: busy,
-        open_identity_count: open_identities.len() as u64,
-        open_identities,
+        in_scope_pids_complete: failed.is_empty() && errors.is_empty(),
+        unreadable_in_scope_pids: failed.len() as u64,
+        busy_processes_observed: busy.len() as u64,
+        open_identity_count: opened.len() as u64,
+        errors: errors.into_iter().collect(),
+        open_identities: opened,
     })
 }
 
@@ -398,21 +457,36 @@ fn validate_authority(
     root: &Path,
     receipt: &RunnerEnrollmentReceipt,
 ) -> Result<(PathBuf, u32), ReclaimError> {
+    if root
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+    {
+        return Err(ReclaimError::InvalidPath("runner_root_parent_component"));
+    }
     if !receipt.runner_dir_owned
         || receipt.runner_dir != root.to_string_lossy()
         || receipt.install_id.is_empty()
     {
         return Err(ReclaimError::InvalidAuthority("runner_enrollment_mismatch"));
     }
+    let canonical =
+        fs::canonicalize(root).map_err(|_| ReclaimError::InvalidPath("runner_root_unreadable"))?;
+    if canonical != root {
+        return Err(ReclaimError::InvalidPath("runner_root_not_canonical"));
+    }
     let metadata = fs::symlink_metadata(root)
         .map_err(|_| ReclaimError::InvalidPath("runner_root_unreadable"))?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+    if !metadata.is_dir() || metadata.file_type().is_symlink() || metadata.mode() & 0o022 != 0 {
         return Err(ReclaimError::InvalidPath("runner_root_not_directory"));
     }
     let marker = root.join(MARKER);
     let marker_metadata = fs::symlink_metadata(&marker)
         .map_err(|_| ReclaimError::InvalidAuthority("runner_marker_missing"))?;
-    if !marker_metadata.is_file() || marker_metadata.file_type().is_symlink() {
+    if !marker_metadata.is_file()
+        || marker_metadata.file_type().is_symlink()
+        || marker_metadata.uid() != metadata.uid()
+        || marker_metadata.mode() & 0o022 != 0
+    {
         return Err(ReclaimError::InvalidAuthority("runner_marker_invalid"));
     }
     let marker_value = read_bounded(&marker, 4096)
@@ -435,14 +509,23 @@ fn enumerate_diag(
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(_) => return Err(ReclaimError::Observation("diagnostics_unreadable")),
     };
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != process.uid
+        || metadata.mode() & 0o022 != 0
+    {
         return Err(ReclaimError::Observation("diagnostics_unsafe_shape"));
     }
+    let directory_before = identity(&metadata);
     let mut items = Vec::new();
     let entries =
         fs::read_dir(&diag).map_err(|_| ReclaimError::Observation("diagnostics_unreadable"))?;
     let mut entry_count = 0_usize;
+    let started = Instant::now();
     for entry in entries {
+        if started.elapsed() >= Duration::from_secs(5) {
+            return Err(ReclaimError::Observation("diagnostics_deadline_exhausted"));
+        }
         entry_count = entry_count.saturating_add(1);
         if entry_count > MAX_DIAG_ENTRIES {
             return Err(ReclaimError::Observation(
@@ -478,10 +561,9 @@ fn enumerate_diag(
             (ItemDecision::PreservedScope, "protected_scope")
         } else if process.busy_processes_observed > 0 {
             (ItemDecision::OpenOrBusy, "runner_process_busy")
-        } else if process.open_identities.contains(&OpenIdentity {
-            device: id.device,
-            inode: id.inode,
-        }) {
+        } else if metadata.nlink() != 1 {
+            (ItemDecision::PreservedScope, "hard_link")
+        } else if process.is_open(id) {
             (ItemDecision::OpenOrBusy, "open_descriptor")
         } else if age < 0 || age < policy.minimum_idle_seconds {
             (ItemDecision::Recent, "below_idle_window")
@@ -507,6 +589,11 @@ fn enumerate_diag(
             reason,
         });
     }
+    let directory_after = fs::symlink_metadata(&diag)
+        .map_err(|_| ReclaimError::Observation("diagnostics_changed"))?;
+    if directory_before != identity(&directory_after) {
+        return Err(ReclaimError::Observation("diagnostics_changed"));
+    }
     Ok(items)
 }
 
@@ -519,13 +606,25 @@ pub fn observe(
         return Err(ReclaimError::InvalidPath("runner_root_must_be_absolute"));
     }
     let (root, uid) = validate_authority(root, receipt)?;
+    let root_before = identity(
+        &fs::symlink_metadata(&root)
+            .map_err(|_| ReclaimError::Observation("runner_root_changed"))?,
+    );
     let process_root = fs::canonicalize(&root)
         .map_err(|_| ReclaimError::InvalidPath("runner_root_canonicalize_failed"))?;
-    let mut process = observe_processes(&process_root, uid)?;
-    let mut all_items = enumerate_diag(&root, &process, policy, now_seconds()?)?;
+    let process = observe_processes(&process_root, uid)?;
+    let all_items = enumerate_diag(&root, &process, policy, now_seconds()?)?;
+    validate_authority(&root, receipt)?;
+    let root_after = identity(
+        &fs::symlink_metadata(&root)
+            .map_err(|_| ReclaimError::Observation("runner_root_changed"))?,
+    );
+    if root_before != root_after {
+        return Err(ReclaimError::Observation("runner_root_changed"));
+    }
     let complete = process.in_scope_pids_complete;
     let item_count = all_items.len() as u64;
-    let enumeration_truncated = all_items.len() >= MAX_DIAG_ENTRIES;
+    let enumeration_truncated = false; // An incomplete catalog returns a typed error before planning.
     let eligible_count = all_items
         .iter()
         .filter(|item| item.decision == ItemDecision::ExpiredRunnerDiagnosticLog)
@@ -616,6 +715,7 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&temp).expect("temp root");
+        let temp = fs::canonicalize(temp).expect("canonical fixture");
         let root = temp.join("runner");
         fs::create_dir(&root).expect("runner");
         fs::create_dir(root.join("_diag")).expect("diag");
@@ -706,6 +806,7 @@ mod tests {
                     unreadable_in_scope_pids: 0,
                     busy_processes_observed: 0,
                     open_identity_count: 0,
+                    errors: Vec::new(),
                     open_identities: BTreeSet::new(),
                 },
                 items: vec![item.clone()],
@@ -750,94 +851,89 @@ mod tests {
         let _ = fs::remove_dir_all(temp);
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
-    fn preserves_non_diag_and_protected_names() {
-        let (temp, receipt) = fixture();
-        fs::create_dir(temp.join("runner/_diag/warm")).expect("warm");
-        fs::write(temp.join("runner/_diag/warm/old.log"), b"warm").expect("warm log");
-        fs::write(temp.join("runner/_diag/old.log"), b"old").expect("old log");
-        let report = reclaim(
-            &temp.join("runner"),
-            &receipt,
-            Policy::new(MIN_RUNNER_LOG_RECLAIM_IDLE_SECONDS, 4).unwrap(),
-            None,
-            false,
+    fn catalog_is_flat_and_busy_open_unknown_gates_are_independent() {
+        let (temp, _) = fixture();
+        let root = temp.join("runner");
+        fs::create_dir(root.join("_diag/warm")).unwrap();
+        fs::write(root.join("_diag/warm/old.log"), b"warm").unwrap();
+        let path = root.join("_diag/old.log");
+        fs::write(&path, b"old").unwrap();
+        let past = UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(past))
+            .unwrap();
+        let id = identity(&fs::metadata(&path).unwrap());
+        let policy = Policy::new(MIN_RUNNER_LOG_RECLAIM_IDLE_SECONDS, 4).unwrap();
+        for (process, expected) in [
+            (
+                ProcessEvidence::test_complete(),
+                ItemDecision::ExpiredRunnerDiagnosticLog,
+            ),
+            (ProcessEvidence::test_busy(), ItemDecision::OpenOrBusy),
+            (ProcessEvidence::test_open(id), ItemDecision::OpenOrBusy),
+            (ProcessEvidence::test_incomplete(), ItemDecision::Unknown),
+        ] {
+            let items = enumerate_diag(&root, &process, policy, 1_700_000_000).unwrap();
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].relative_path, "_diag/old.log");
+            assert_eq!(items[0].decision, expected);
+        }
+        fs::hard_link(&path, root.join("_diag/alias.log")).unwrap();
+        let items = enumerate_diag(
+            &root,
+            &ProcessEvidence::test_complete(),
+            policy,
+            1_700_000_000,
         )
         .unwrap();
         assert!(
-            report
-                .observation
-                .items
+            items
                 .iter()
-                .any(|item| item.relative_path == "_diag/old.log")
+                .all(|item| item.decision == ItemDecision::PreservedScope)
         );
-        assert!(
-            report
-                .observation
-                .items
-                .iter()
-                .any(|item| item.decision == ItemDecision::PreservedScope)
-        );
-        let _ = fs::remove_dir_all(temp);
+        fs::remove_dir_all(temp).unwrap();
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
-    #[ignore = "enabled when descriptor-bound store lands"]
-    fn native_open_descriptor_vetoes_then_apply_reclaims_after_close() {
+    fn bounded_input_rejects_links_nonregular_and_oversize() {
         let (temp, receipt) = fixture();
-        let root = temp.join("runner");
-        let old = root.join("_diag/old.log");
-        fs::write(&old, b"expired").expect("old log");
-        let touch = std::process::Command::new("/usr/bin/touch")
-            .args(["-t", "202001010000", old.to_str().expect("utf8")])
-            .status()
-            .expect("touch");
-        assert!(touch.success());
-        let held = File::open(&old).expect("open descriptor");
-        let policy = Policy::new(MIN_RUNNER_LOG_RECLAIM_IDLE_SECONDS, 4).expect("policy");
-        let plan = reclaim(
-            &root,
-            &receipt,
-            Policy::new(MIN_RUNNER_LOG_RECLAIM_IDLE_SECONDS, 4).expect("policy"),
-            None,
-            false,
+        let path = temp.join("receipt.json");
+        fs::write(&path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        assert_eq!(read_enrollment_receipt(&path).unwrap(), receipt);
+        std::os::unix::fs::symlink(&path, temp.join("link.json")).unwrap();
+        assert!(read_enrollment_receipt(&temp.join("link.json")).is_err());
+        assert!(read_enrollment_receipt(&temp.join("runner")).is_err());
+        fs::hard_link(&path, temp.join("hard.json")).unwrap();
+        assert!(read_enrollment_receipt(&path).is_err());
+        fs::remove_file(temp.join("hard.json")).unwrap();
+        fs::write(&path, vec![b' '; 65_537]).unwrap();
+        assert!(read_enrollment_receipt(&path).is_err());
+        let fifo = temp.join("fifo");
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
         )
-        .expect("plan");
-        assert!(plan.observation.process.open_identity_count > 0);
-        assert_eq!(plan.observation.items[0].decision, ItemDecision::OpenOrBusy);
-        let staged = root.join("_diag/.glaeda-test-stage.log");
-        fs::rename(&old, &staged).expect("stage while held");
-        let staged_plan = observe(&root, &receipt, policy).expect("staged observation");
-        assert_eq!(staged_plan.items[0].decision, ItemDecision::OpenOrBusy);
-        fs::rename(&staged, &old).expect("restore staged path");
-        let refused = reclaim(
-            &root,
-            &receipt,
-            Policy::new(MIN_RUNNER_LOG_RECLAIM_IDLE_SECONDS, 4).expect("policy"),
-            None,
-            true,
-        )
-        .expect("busy apply report");
-        assert_eq!(refused.reclaimed_count, 0);
-        assert!(
-            refused
-                .errors
-                .iter()
-                .any(|error| *error == "runner_process_busy")
-        );
-        drop(held);
-        let applied = reclaim(
-            &root,
-            &receipt,
-            Policy::new(MIN_RUNNER_LOG_RECLAIM_IDLE_SECONDS, 4).expect("policy"),
-            None,
-            true,
-        )
-        .expect("apply");
-        assert_eq!(applied.reclaimed_count, 1);
-        assert!(!old.exists());
-        let _ = fs::remove_dir_all(temp);
+        .unwrap();
+        assert!(read_enrollment_receipt(&fifo).is_err());
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn authority_rejects_ancestor_alias_and_parent_components() {
+        let (temp, receipt) = fixture();
+        let alias = temp.join("alias");
+        std::os::unix::fs::symlink(temp.join("runner"), &alias).unwrap();
+        let mut alias_receipt = receipt.clone();
+        alias_receipt.runner_dir = alias.to_string_lossy().into_owned();
+        assert!(validate_authority(&alias, &alias_receipt).is_err());
+        let parent = temp.join("runner/../runner");
+        alias_receipt.runner_dir = parent.to_string_lossy().into_owned();
+        assert!(validate_authority(&parent, &alias_receipt).is_err());
+        fs::remove_dir_all(temp).unwrap();
     }
 }

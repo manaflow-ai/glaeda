@@ -1,12 +1,10 @@
-use std::fs::File;
-use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
 use glaeda::runner_log_reclaim::{
     DEFAULT_RUNNER_LOG_RECLAIM_BATCH, MIN_RUNNER_LOG_RECLAIM_IDLE_SECONDS, Policy,
-    RunnerEnrollmentReceipt, reclaim,
+    read_enrollment_receipt, reclaim,
 };
 
 #[derive(Debug, Parser)]
@@ -33,21 +31,10 @@ struct Cli {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let mut bytes = Vec::new();
-    let receipt = match File::open(&cli.enrollment_receipt)
-        .ok()
-        .and_then(|mut file| {
-            file.take(65_537)
-                .read_to_end(&mut bytes)
-                .ok()
-                .map(|_| bytes)
-        })
-        .filter(|bytes| bytes.len() <= 65_536)
-        .and_then(|bytes| serde_json::from_slice::<RunnerEnrollmentReceipt>(&bytes).ok())
-    {
-        Some(receipt) => receipt,
-        None => {
-            eprintln!("glaeda-runner-log-reclaim: enrollment_receipt_invalid");
+    let receipt = match read_enrollment_receipt(&cli.enrollment_receipt) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            eprintln!("glaeda-runner-log-reclaim: {error}");
             return ExitCode::from(2);
         }
     };
@@ -81,7 +68,7 @@ fn main() -> ExitCode {
             report.observation.complete,
             report.errors.len()
         );
-    } else if let Err(_) = serde_json::to_writer(std::io::stdout(), &report) {
+    } else if serde_json::to_writer(std::io::stdout(), &report).is_err() {
         return ExitCode::from(1);
     } else {
         println!();

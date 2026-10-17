@@ -54,33 +54,56 @@ jobs:
             --output target/fleet-bundles > "$RUNNER_TEMP/fleet-candidate.json"
           cat "$RUNNER_TEMP/fleet-candidate.json" >> "$GITHUB_STEP_SUMMARY"
           cp "$RUNNER_TEMP/fleet-candidate.json" target/fleet-bundles/receipt.json
-      - name: Native runner-log integration (macOS)
+      - name: Build native runner-log observer (macOS)
+        id: native_build
         if: matrix.target == 'aarch64-apple-darwin'
         env:
           CANDIDATE_TARGET: ${{ matrix.target }}
         run: |
           cargo build --locked --release --bin glaeda-runner-log-reclaim \
             --target "$CANDIDATE_TARGET" --target-dir target/fleet-candidate-build
-          cargo test --locked --release --test runner_log_macos \
-            --target "$CANDIDATE_TARGET" --target-dir target/fleet-candidate-build -- --test-threads=1
           cp "target/fleet-candidate-build/$CANDIDATE_TARGET/release/glaeda-runner-log-reclaim" \
             target/fleet-bundles/glaeda-runner-log-reclaim
-          binary_sha256=$(shasum -a 256 target/fleet-bundles/glaeda-runner-log-reclaim | awk '{print $1}')
-          cat > target/fleet-bundles/glaeda-runner-log-reclaim.receipt.json <<EOF
-          {
-            "document_type": "glaeda-runner-log-reclaim-build-receipt",
-            "schema_version": 1,
-            "requested_pr_head": "${{ github.event.pull_request.head.sha || github.sha }}",
-            "checked_out_commit": "$(git rev-parse HEAD)",
-            "checked_out_tree": "$(git rev-parse HEAD^{tree})",
-            "target": "$CANDIDATE_TARGET",
-            "toolchain": "rust-1.97.1",
-            "binary_sha256": "$binary_sha256",
-            "test_command": "cargo test --locked --release --test runner_log_macos --target $CANDIDATE_TARGET -- --test-threads=1",
-            "test_outcome": "success"
+      - name: Test native runner-log observer (macOS)
+        id: native_test
+        if: matrix.target == 'aarch64-apple-darwin'
+        env:
+          CANDIDATE_TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          cargo test --locked --release --lib runner_log_reclaim:: \
+            --target "$CANDIDATE_TARGET" --target-dir target/fleet-candidate-build \
+            -- --test-threads=1 2>&1 | tee target/fleet-bundles/native-observer-tests.log
+          cargo test --locked --release --test runner_log_macos \
+            --target "$CANDIDATE_TARGET" --target-dir target/fleet-candidate-build \
+            -- --test-threads=1 --nocapture 2>&1 | tee -a target/fleet-bundles/native-observer-tests.log
+      - name: Record native observer build and test receipt
+        if: ${{ always() && steps.native_build.outcome == 'success' }}
+        env:
+          CANDIDATE_TARGET: ${{ matrix.target }}
+          REQUESTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          TEST_OUTCOME: ${{ steps.native_test.outcome }}
+        run: |
+          python3 - <<'PYTHON'
+          import hashlib, json, os, pathlib, subprocess
+          binary = pathlib.Path("target/fleet-bundles/glaeda-runner-log-reclaim")
+          git = lambda *args: subprocess.check_output(["git", *args], text=True).strip()
+          receipt = {
+              "document_type": "glaeda-runner-log-reclaim-build-receipt",
+              "schema_version": 1,
+              "requested_pr_head": os.environ["REQUESTED_HEAD"],
+              "checked_out_commit": git("rev-parse", "HEAD"),
+              "checked_out_tree": git("rev-parse", "HEAD^{tree}"),
+              "target": os.environ["CANDIDATE_TARGET"],
+              "toolchain": subprocess.check_output(["rustc", "--version"], text=True).strip(),
+              "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+              "test_outcome": os.environ["TEST_OUTCOME"],
+              "test_targets": ["--lib runner_log_reclaim::", "--test runner_log_macos"],
           }
-          EOF
+          binary.with_suffix(".receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
+          PYTHON
       - name: Upload candidate and receipt
+        if: ${{ success() || (always() && steps.native_build.outcome == 'success') }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: glaeda-candidate-${{ matrix.target }}

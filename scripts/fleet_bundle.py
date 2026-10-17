@@ -32,7 +32,6 @@ FILES = (
     "docs/CMUX_FLEET_ENROLLMENT.md",
 )
 PAYLOAD = {*FILES, "bin/glaeda", "THIRD_PARTY_NOTICES.txt"}
-OPTIONAL_PAYLOAD = "bin/glaeda-runner-log-reclaim"
 MAX_ARCHIVE = 100 * 1024 * 1024
 MAX_FILE = 100 * 1024 * 1024
 MAX_TOTAL = 200 * 1024 * 1024
@@ -125,7 +124,7 @@ def archive_bytes(payload: dict[str, bytes], manifest: dict) -> bytes:
             for name, raw in sorted({**payload, "manifest.json": canonical(manifest)}.items()):
                 entry = tarfile.TarInfo(name)
                 entry.size = len(raw)
-                entry.mode = 0o755 if name.startswith("bin/") else 0o644
+                entry.mode = 0o755 if name == "bin/glaeda" else 0o644
                 archive.addfile(entry, io.BytesIO(raw))
     return output.getvalue()
 
@@ -144,9 +143,9 @@ def verified_contents(raw: bytes, expected_sha256: str, source: str, target: str
             raise BundleError("candidate archive expands beyond size limit")
         with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:") as archive:
             for entry in archive:
-                if (entry.name not in PAYLOAD | {OPTIONAL_PAYLOAD, "manifest.json"}
+                if (entry.name not in PAYLOAD | {"manifest.json"}
                         or entry.name in contents or not entry.isfile()
-                        or entry.mode != (0o755 if entry.name.startswith("bin/") else 0o644)
+                        or entry.mode != (0o755 if entry.name == "bin/glaeda" else 0o644)
                         or entry.size < 0 or entry.size > MAX_FILE):
                     raise BundleError("candidate archive contains an unsafe or unexpected entry")
                 total += entry.size
@@ -156,7 +155,7 @@ def verified_contents(raw: bytes, expected_sha256: str, source: str, target: str
                 if stream is None:
                     raise BundleError("candidate archive entry is unreadable")
                 contents[entry.name] = stream.read(MAX_FILE + 1)
-        if set(contents) - {OPTIONAL_PAYLOAD} != PAYLOAD | {"manifest.json"}:
+        if set(contents) != PAYLOAD | {"manifest.json"}:
             raise BundleError("candidate archive is incomplete")
         manifest = json.loads(contents.pop("manifest.json"))
         if not isinstance(manifest, dict) or set(manifest) != {
@@ -167,7 +166,6 @@ def verified_contents(raw: bytes, expected_sha256: str, source: str, target: str
         if (manifest["schema"] != SCHEMA or manifest["channel"] != "candidate"
                 or manifest["automaticUpdateAuthorized"] is not False
                 or target not in TARGETS or manifest["target"] != target
-                or ((target == "aarch64-apple-darwin") != (OPTIONAL_PAYLOAD in contents))
                 or re.fullmatch(r"[0-9a-f]{40}", source) is None
                 or not isinstance(manifest["source"], dict)
                 or set(manifest["source"]) != {"repository", "commit", "tree"}
@@ -267,7 +265,7 @@ def stage(raw: bytes, digest: str, source: str, target: str, destination: Path, 
             with os.fdopen(fd, "w+b") as stream:
                 stream.write(data)
                 stream.flush()
-                os.fchmod(stream.fileno(), 0o700 if name.startswith("bin/") else 0o600)
+                os.fchmod(stream.fileno(), 0o700 if name == "bin/glaeda" else 0o600)
                 os.fsync(stream.fileno())
                 written[name] = os.fstat(stream.fileno())
                 stream.seek(0)
@@ -306,7 +304,7 @@ def stage(raw: bytes, digest: str, source: str, target: str, destination: Path, 
                 if ((fresh.st_dev, fresh.st_ino) != (original.st_dev, original.st_ino)
                         or not stat.S_ISREG(fresh.st_mode) or fresh.st_nlink != 1
                         or fresh.st_uid != os.geteuid() or fresh.st_size != len(data)
-                        or stat.S_IMODE(fresh.st_mode) != (0o700 if name.startswith("bin/") else 0o600)
+                        or stat.S_IMODE(fresh.st_mode) != (0o700 if name == "bin/glaeda" else 0o600)
                         or stream.read(len(data) + 1) != data):
                     raise BundleError("staged file identity or contents changed")
         result["state"] = "staged"
@@ -377,7 +375,7 @@ def inspect_generation(destination: Path, digest: str, source: str, target: str)
             parts = name.split("/")
             directory = directories[parts[0]] if len(parts) == 2 else generation
             observed, observations[name] = read_generation_file(
-                directory, parts[-1], len(data), 0o700 if name.startswith("bin/") else 0o600)
+                directory, parts[-1], len(data), 0o700 if name == "bin/glaeda" else 0o600)
             if observed != data:
                 raise BundleError("saved generation differs from the pinned candidate")
         # Enumerate only the four owned directories with an explicit entry cap.
@@ -432,10 +430,6 @@ def build(root: Path, expected_source: str, target: str, output: Path) -> dict:
     command(root, ["cargo", "build", "--locked", "--release", "--bin", "glaeda", "--target", target, "--target-dir", str(build_root)], capture=False)
     payload = {name: file_bytes(root / name) for name in FILES}
     payload["bin/glaeda"] = file_bytes(build_root / target / "release/glaeda")
-    if target == "aarch64-apple-darwin":
-        command(root, ["cargo", "build", "--locked", "--release", "--bin", "glaeda-runner-log-reclaim",
-                       "--target", target, "--target-dir", str(build_root)], capture=False)
-        payload[OPTIONAL_PAYLOAD] = file_bytes(build_root / target / "release/glaeda-runner-log-reclaim")
     payload["THIRD_PARTY_NOTICES.txt"] = notices(root, target)
     manifest = {
         "schema": SCHEMA, "source": source, "target": target,

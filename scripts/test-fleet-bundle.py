@@ -19,7 +19,7 @@ TARGET = "aarch64-apple-darwin"
 
 
 def fixture():
-    payload = {name: b"fixture\n" for name in b.PAYLOAD | {b.OPTIONAL_PAYLOAD}}
+    payload = {name: b"fixture\n" for name in b.PAYLOAD}
     manifest = {
         "schema": b.SCHEMA,
         "source": {"repository": "teamleaderleo/glaeda", "commit": SOURCE, "tree": "b" * 40},
