@@ -35,9 +35,9 @@ being measured.
 
 ## Totals
 
-- Exported modules: **209**
-- Reach: **99 binary**, **64 library**, **12 tests**, **34 none**
-- Gate: at most 34 exports may have reach `none` (`UNREFERENCED_EXPORT_CEILING`)
+- Exported modules: **210**
+- Reach: **99 binary**, **64 library**, **12 tests**, **35 none**
+- Gate: at most 35 exports may have reach `none` (`UNREFERENCED_EXPORT_CEILING`)
 
 ## Exports with no consumer
 
@@ -66,6 +66,7 @@ let the gate hold the line.
 | `local_install_launcher` | `unix` | 1 |  |
 | `operator_remediation` | `all` | 1 |  |
 | `personal_worker_verification_plan` | `target_os="linux"` | 1 | source read as text, not called, by `tests/personal_worker_verification_plan_contract.rs` |
+| `production_recovery_adapter` | `all` | 1 |  |
 | `project_discovery` | `unix` | 1 |  |
 | `project_disk_attachment_state` | `all` | 1 |  |
 | `project_filesystem_correlation_receipt` | `all` | 1 |  |
@@ -224,6 +225,7 @@ let the gate hold the line.
 | `personal_worker_verification_plan` | `target_os="linux"` | none | 0 |
 | `plan` | `all` | binary | 1 |
 | `process` | `all` | binary | 75 |
+| `production_recovery_adapter` | `all` | none | 0 |
 | `project_catalog` | `all` | binary | 35 |
 | `project_checkout_observation` | `unix` | binary | 14 |
 | `project_discovery` | `unix` | none | 0 |
@@ -261,7 +263,7 @@ let the gate hold the line.
 | `rootless_podman_preflight` | `target_os="linux"` | binary | 13 |
 | `runner_account_observation` | `target_os="linux"` | binary | 7 |
 | `runner_account_plan` | `target_os="linux"` | binary | 17 |
-| `runner_log_reclaim` | `all` | binary | 3 |
+| `runner_log_reclaim` | `all` | binary | 4 |
 | `runner_user` | `target_os="linux"` | binary | 9 |
 | `runner_user_observation` | `target_os="linux"` | binary | 2 |
 | `rust_memory_diagnostic` | `all` | none | 0 |

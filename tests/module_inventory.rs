@@ -58,7 +58,11 @@ const WRITE_ENVIRONMENT_VARIABLE: &str = "GLAEDA_WRITE_MODULE_INVENTORY";
 ///
 /// Raise it only when a reviewed product decision accepts a new uncomposed kernel, and say which
 /// module and which owning milestone in the same change.
-const UNREFERENCED_EXPORT_CEILING: usize = 34;
+///
+/// Milestone 5 (supervised unattended recovery) accepts `production_recovery_adapter` as a
+/// report-only/synthetic composition boundary while its production caller remains gated; lower the
+/// ceiling when that boundary is composed by the production recovery CLI.
+const UNREFERENCED_EXPORT_CEILING: usize = 35;
 
 /// Path roots scanned for consumers. `benches/` and `examples/` hold no Rust today; they are listed
 /// so the scan stays correct the day they do.
