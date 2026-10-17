@@ -29,9 +29,9 @@ fn stat_matches_materialization(stat: &rfs::Stat, identity: FileIdentity) -> boo
         && stat.st_size >= 0
         && stat.st_size as u64 == identity.size
         && stat.st_mtime == identity.modified_seconds
-        && stat.st_mtime_nsec == identity.modified_nanos
+        && stat.st_mtime_nsec as i64 == identity.modified_nanos
         && stat.st_ctime == identity.changed_seconds
-        && stat.st_ctime_nsec == identity.changed_nanos
+        && stat.st_ctime_nsec as i64 == identity.changed_nanos
 }
 
 // A successful rename updates ctime on Darwin.  The original ctime remains useful for
@@ -303,7 +303,7 @@ fn open_child(parent: &OwnedFd, child: &CString, flags: OFlags) -> Result<OwnedF
 }
 
 fn open_relative_dir(root: &OwnedFd, dirs: &[CString]) -> Result<OwnedFd, StoreError> {
-    let mut current = rfs::dup(root).map_err(|_| StoreError::Io("root_dup_failed"))?;
+    let mut current = rustix::io::dup(root).map_err(|_| StoreError::Io("root_dup_failed"))?;
     for child in dirs {
         current = open_child(&current, child, DIR_FLAGS)?;
     }
@@ -349,7 +349,7 @@ fn append_row(state: &OwnedFd, row: &JournalRow) -> Result<(), StoreError> {
     {
         return Err(StoreError::Io("journal_unsafe"));
     }
-    let mut file = File::from(file);
+    let file = File::from(file);
     file.write_all(&bytes)
         .map_err(|_| StoreError::Io("journal_write_failed"))?;
     file.sync_data()
@@ -456,7 +456,7 @@ impl RunnerLogStore {
         if !file_is_safe(&marker_stat, root_stat.st_uid) {
             return Err(StoreError::Invalid("marker_unsafe"));
         }
-        let mut marker_file = File::from(marker_file);
+        let marker_file = File::from(marker_file);
         let mut marker_value = String::new();
         marker_file
             .take((MAX_MARKER_BYTES + 1) as u64)
@@ -513,13 +513,13 @@ impl RunnerLogStore {
             diag,
             state,
             _lock: lock,
-            root_device: root_stat.st_dev,
+            root_device: root_stat.st_dev as u64,
             root_inode: root_stat.st_ino,
             marker_device: marker_stat.st_dev as u64,
             marker_inode: marker_stat.st_ino,
             marker_path: root_path.join(".glaeda-cmux-runner"),
             root_uid: root_stat.st_uid,
-            diag_device: diag_stat.st_dev,
+            diag_device: diag_stat.st_dev as u64,
             diag_inode: diag_stat.st_ino,
             root_path: root_path.clone(),
             diag_path: root_path.join("_diag"),
@@ -893,7 +893,7 @@ mod tests {
 
     #[test]
     fn incomplete_observation_refuses_before_mutation() {
-        let (root, receipt, _identity) = fixture();
+        let (root, receipt, identity) = fixture();
         let mut store =
             RunnerLogStore::open(&root.join("runner"), &receipt, &root.join("state")).unwrap();
         let item = LogItem {
