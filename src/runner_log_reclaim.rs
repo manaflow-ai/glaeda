@@ -10,7 +10,7 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -309,9 +309,11 @@ fn observe_processes(root: &Path, uid: u32) -> Result<ProcessEvidence, ReclaimEr
     const MAX_SCANNED_PIDS: usize = 4_096;
     const MAX_FDS_PER_PID: usize = 4_096;
     const MAX_SCANNED_FDS: usize = 1_000_000;
+    const MAX_SCAN_TIME: Duration = Duration::from_secs(5);
     let mut busy = 0_u64;
     let mut unreadable = 0_u64;
     let mut scanned_fds = 0_usize;
+    let scan_started = Instant::now();
     let root_stat = fs::symlink_metadata(root)
         .map_err(|_| ReclaimError::Observation("runner_root_unreadable"))?;
     let mut open_identities = BTreeSet::new();
@@ -319,6 +321,10 @@ fn observe_processes(root: &Path, uid: u32) -> Result<ProcessEvidence, ReclaimEr
         unreadable = unreadable.saturating_add(1);
     }
     for pid in pids.iter().take(MAX_SCANNED_PIDS) {
+        if scan_started.elapsed() > MAX_SCAN_TIME {
+            unreadable = unreadable.saturating_add(1);
+            break;
+        }
         let before = match pidinfo::<BSDInfo>(*pid as i32, 0) {
             Ok(info) if info.pbi_uid == uid => (info.pbi_start_tvsec, info.pbi_start_tvusec),
             Ok(_) | Err(_) => {
