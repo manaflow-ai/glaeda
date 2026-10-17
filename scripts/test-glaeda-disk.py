@@ -1331,7 +1331,9 @@ class GlaedaDiskTest(unittest.TestCase):
         root = self.root / "Library/Caches/cmux-next-ci"
         runner = root / "cmux-scheme/runner-a"
         daily = root / "dev-daily-release/abcdef0123456789/Release/26f113aa"
-        for state in (runner, daily):
+        xcode_daily = root / "dev-daily-release/1234567890abcdef/Release/xcode-2c2299e9015ce0c8"
+        release_compile = root / "release-compile/bcc51113400dc347/Release/xcode-2c2299e9015ce0c8"
+        for state in (runner, daily, xcode_daily, release_compile):
             state.mkdir(parents=True)
             for name in ("Build", "Index.noindex", "Logs", "Products"):
                 make(state / name, age_hours=96)
@@ -1339,12 +1341,24 @@ class GlaedaDiskTest(unittest.TestCase):
                 (state / name).mkdir()
         invalid = root / "dev-daily-release/not-a-fingerprint/Release/26f113aa"
         (invalid / "Build").mkdir(parents=True)
+        linked_release_target = self.root / "linked-release"
+        linked_release_target.mkdir(parents=True)
+        linked_release = root / "dev-daily-release/2222222222222222/Release"
+        linked_release.parent.mkdir(parents=True, exist_ok=True)
+        linked_release.symlink_to(linked_release_target, target_is_directory=True)
+        (linked_release_target / "xcode-2c2299e9015ce0c8/Build").mkdir(parents=True)
+        linked_daily_target = self.root / "linked-daily"
+        (linked_daily_target / "abcdef0123456789/Release/xcode-2c2299e9015ce0c8/Build").mkdir(parents=True)
+        linked_root = self.root / "symlink-cache"
+        linked_root.mkdir()
+        (linked_root / "dev-daily-release").symlink_to(linked_daily_target, target_is_directory=True)
+        self.assertEqual(gd.cmux_next_ci_state_roots(linked_root), [])
         fam = gd.cmux_next_ci_family(root)
         with mock.patch.object(gd, "process_evidence", return_value=([], "")):
             items = gd.survey([fam], 24, 0)
         paths = {Path(i.path) for i in items}
         expected = {
-            state / name for state in (runner, daily)
+            state / name for state in (runner, daily, xcode_daily, release_compile)
             for name in ("Build", "Index.noindex", "Logs", "Products")
         }
         self.assertEqual(paths, expected)

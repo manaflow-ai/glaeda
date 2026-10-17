@@ -4,7 +4,12 @@
 `~/Library/Caches/cmux-next-ci`:
 
 - `cmux-scheme/<runner>`;
-- `dev-daily-release/<hex fingerprint>/Release/<hex Xcode hash>`.
+- `dev-daily-release/<hex fingerprint>/Release/<hex Xcode hash>`;
+- `release-compile/<hex fingerprint>/Release/<hex Xcode hash>`.
+
+The Xcode state component may be the historical bare hash or the production
+`xcode-<hash>` form. The family rejects symlinked layout parents and state
+roots before traversing them.
 
 The retention family is an allowlist. It can reclaim generated children named
 `Build`, `Index.noindex`, `Logs`, `Products`, `Intermediates.noindex`,

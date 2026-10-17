@@ -4193,19 +4193,29 @@ def cmux_next_ci_state_roots(root: Path) -> list[Path]:
         return []
     roots: list[Path] = []
     scheme = root / "cmux-scheme"
-    for runner in _children(scheme):
+    for runner in _children(scheme) if scheme.is_dir() and not scheme.is_symlink() else []:
         if runner.is_dir() and not runner.is_symlink():
             roots.append(runner)
-    daily = root / "dev-daily-release"
-    for fingerprint in _children(daily):
-        if fingerprint.is_symlink() or not fingerprint.is_dir() \
-                or re.fullmatch(r"[0-9a-fA-F]{8,64}", fingerprint.name) is None:
+    # Both dev-daily and release-compile use a fingerprint/Release/xcode state
+    # root.  Real Xcode output names the final component ``xcode-<hash>``;
+    # older fixtures used the bare hash.  Keep the shape strict so arbitrary
+    # cache directories never become deletion candidates.
+    for daily_name in ("dev-daily-release", "release-compile"):
+        daily = root / daily_name
+        if daily.is_symlink() or not daily.is_dir():
             continue
-        release = fingerprint / "Release"
-        for xcode_hash in _children(release):
-            if xcode_hash.is_dir() and not xcode_hash.is_symlink() \
-                    and re.fullmatch(r"[0-9a-fA-F]{8,64}", xcode_hash.name):
-                roots.append(xcode_hash)
+        for fingerprint in _children(daily):
+            if fingerprint.is_symlink() or not fingerprint.is_dir() \
+                    or re.fullmatch(r"[0-9a-fA-F]{8,64}", fingerprint.name) is None:
+                continue
+            release = fingerprint / "Release"
+            if release.is_symlink() or not release.is_dir():
+                continue
+            for xcode_hash in _children(release):
+                if not xcode_hash.is_dir() or xcode_hash.is_symlink():
+                    continue
+                if re.fullmatch(r"(?:xcode-)?[0-9a-fA-F]{8,64}", xcode_hash.name):
+                    roots.append(xcode_hash)
     return roots
 
 
