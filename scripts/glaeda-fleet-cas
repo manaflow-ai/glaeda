@@ -4,7 +4,8 @@
 #   glaeda-fleet-cas node --store HOST:PORT [--trusted-keys HEX] [--prewarm REPO] [--apply]
 #   glaeda-fleet-cas writer --store HOST:PORT --sign-key PATH --trusted-keys HEX [--apply]
 #   glaeda-fleet-cas store --listen IP:PORT [--writers IP,IP] [--trusted-keys HEX] [--apply]
-#   glaeda-fleet-cas uninstall [--apply]               remove the services, keep the stores
+#   glaeda-fleet-cas uninstall [node|store|all] [--apply]
+#                                                       remove selected services, keep stores
 #
 # Run from a glaeda checkout on the mini (scripts/glaeda-fleet-cas-rollout does that from
 # an operator Mac). Planning changes nothing on this host; --apply is idempotent and restarts
@@ -33,18 +34,29 @@
 # Design: docs/CMUX_BUILD_SLOT_MODES.md. Prototype: tools/fleet-cas-prototype.
 set -euo pipefail
 
-ROOT=/Users/Shared/cmux-build-fleet/xcode
+ROOT=${FLEET_CAS_ROOT:-/Users/Shared/cmux-build-fleet/xcode}
 BIN=$ROOT/bin
 SOCK=$ROOT/fleet-cas.sock
 NODE_STORE=$ROOT/node-store
 FLEET_STORE=$ROOT/fleet-store
 AGENTS=$HOME/Library/LaunchAgents
 LOGS=$HOME/Library/Logs
+LAUNCH_DAEMONS=${FLEET_CAS_LAUNCH_DAEMONS_DIR:-/Library/LaunchDaemons}
+custom_store_image=${FLEET_CAS_IMAGE:-}
+# This path is deliberately fixed to the user's boot-volume cache. Do not make
+# the launch wrapper location another configurable path that could be on ROOT.
+launch_root=$HOME/.cache/glaeda-fleet-cas/launch
 here=$(cd "$(dirname "$0")/.." && pwd)
 proto=$here/tools/fleet-cas-prototype
 
 role=${1:-}; shift || true
-apply= store= listen= writers= trusted= sign_key= prewarm=
+uninstall_scope=all
+if [ "$role" = uninstall ] && [ $# -gt 0 ]; then
+  case $1 in
+    node|store|all) uninstall_scope=$1; shift ;;
+  esac
+fi
+apply= store= listen= writers= trusted= sign_key= prewarm= custom_store_volume_uuid=
 while [ $# -gt 0 ]; do
   case $1 in
     --apply) apply=1 ;;
@@ -65,10 +77,75 @@ do_() { say "$*"; [ -z "$apply" ] || "$@"; }
 label_for() { echo "com.teamleaderleo.glaeda.fleet-cas-$1"; }
 xml() { local v=${1//&/"&amp;"}; v=${v//</"&lt;"}; v=${v//>/"&gt;"}; printf '%s' "$v"; }
 
+# A custom store may be absent at boot. Keep the launch wrapper and its argument/
+# identity receipts on the boot volume so launchd can attach the image before it
+# needs to read anything from the store volume. Existing non-image deployments
+# retain their historical ROOT/run state.
+state_for() {
+  if [ "$1" = store ] && [ -n "${FLEET_CAS_ROOT:-}" ] && [ -n "${custom_store_image:-}" ]; then
+    printf '%s\n' "$HOME/.cache/glaeda-fleet-cas/store-run"
+  else
+    printf '%s\n' "$ROOT/run"
+  fi
+}
+runner_for() {
+  if [ "$1" = store ] && [ -n "${FLEET_CAS_ROOT:-}" ] && [ -n "${custom_store_image:-}" ]; then
+    printf '%s\n' "$launch_root/fleet-cas-run"
+  else
+    printf '%s\n' "$BIN/fleet-cas-run"
+  fi
+}
+
 check_owner() {
   if [ -e "$ROOT" ] && [ "$(stat -f %u "$ROOT")" != "$(id -u)" ]; then
     echo "$ROOT is not owned by $(id -un); refusing to install into it" >&2; exit 1
   fi
+}
+
+# A custom store root is normally an APFS volume or an APFS sparsebundle mounted on an
+# external SSD. Refuse a missing path so a typo cannot silently create the CAS under /Volumes
+# on the controller's boot disk, and refuse filesystems without the hard-link and atomic
+# publication behavior the fleet store relies on. The default root keeps the historical
+# behavior for existing deployments.
+check_custom_store_root() {
+  [ "$role" = store ] || return 0
+  [ -n "${FLEET_CAS_ROOT:-}" ] || return 0
+  [ -n "$apply" ] || return 0
+  [ -d "$ROOT" ] || { echo "custom fleet-CAS store root is not mounted: $ROOT" >&2; exit 1; }
+  local volume_info fs_type mount_point
+  volume_info=$(diskutil info "$ROOT" 2>/dev/null || true)
+  fs_type=$(printf '%s\n' "$volume_info" | awk -F': *' '/Type \(Bundle\)/ {print tolower($2); exit}')
+  mount_point=$(printf '%s\n' "$volume_info" | awk -F': *' '/Mount Point/ {print $2; exit}')
+  custom_store_volume_uuid=$(printf '%s\n' "$volume_info" | awk -F': *' '/Volume UUID/ {print $2; exit}')
+  [ "$fs_type" = apfs ] || { echo "custom fleet-CAS store root must be APFS: $ROOT" >&2; exit 1; }
+  case "$mount_point" in
+    /Volumes/*) ;;
+    *) echo "custom fleet-CAS store root must be a separate mounted /Volumes APFS volume: $ROOT" >&2; exit 1 ;;
+  esac
+  case "$ROOT" in
+    "$mount_point"|"$mount_point"/*) ;;
+    *) echo "custom fleet-CAS store root is outside its mounted volume: $ROOT" >&2; exit 1 ;;
+  esac
+  [ -n "$custom_store_volume_uuid" ] || { echo "custom fleet-CAS store volume has no UUID: $ROOT" >&2; exit 1; }
+  if [ -n "$custom_store_image" ]; then
+    case "$custom_store_image" in
+      /Volumes/*/*) ;;
+      *) echo "custom fleet-CAS image must be below /Volumes: $custom_store_image" >&2; exit 1 ;;
+    esac
+    case "$custom_store_image" in
+      "$ROOT"|"$ROOT"/*) echo "custom fleet-CAS image must not be inside the store volume: $custom_store_image" >&2; exit 1 ;;
+    esac
+    [ ! -L "$custom_store_image" ] || { echo "custom fleet-CAS image symlinks are refused: $custom_store_image" >&2; exit 1; }
+    [ -d "$custom_store_image" ] || { echo "custom fleet-CAS image is missing: $custom_store_image" >&2; exit 1; }
+    local image_volume image_info image_mount
+    image_volume=${custom_store_image%/*}
+    image_info=$(diskutil info "$image_volume" 2>/dev/null || true)
+    image_mount=$(printf '%s\n' "$image_info" | awk -F': *' '/Mount Point/ {print $2; exit}')
+    [ "$image_mount" = "$image_volume" ] || {
+      echo "custom fleet-CAS image backing volume is not mounted: $image_volume" >&2; exit 1;
+    }
+  fi
+  check_owner
 }
 
 bootstrap() {  # domain, label, plist: bootout then bootstrap, retrying the known teardown race
@@ -85,6 +162,32 @@ health_failed() {  # role
   echo "fleet-cas $1 is not healthy; last log lines:" >&2
   tail -5 "$LOGS/glaeda-fleet-cas-$1.log" >&2 2>/dev/null || true
   exit 1
+}
+
+# A local node socket can answer while its configured store is gone or stale.
+# Check the exact upstream endpoint before applying a node or writer config, so
+# a rollout cannot report a healthy local daemon that can never serve cache
+# entries. The endpoint is deliberately restricted to the HOST:PORT form that
+# the fleet-cas command passes to its HTTP client.
+check_upstream() {  # HOST:PORT
+  local endpoint=$1 host port value
+  case "$endpoint" in
+    *:*:* | :* | *:) echo "invalid fleet-cas store endpoint: $endpoint (want HOST:PORT)" >&2; return 1 ;;
+  esac
+  host=${endpoint%:*}
+  port=${endpoint##*:}
+  case "$host" in '' | *[!A-Za-z0-9._-]*) echo "invalid fleet-cas store host: $host" >&2; return 1 ;; esac
+  case "$port" in '' | *[!0-9]*) echo "invalid fleet-cas store port: $port" >&2; return 1 ;; esac
+  value=$((10#$port))
+  if (( value < 1 || value > 65535 )); then
+    echo "invalid fleet-cas store port: $port" >&2
+    return 1
+  fi
+  command -v nc >/dev/null 2>&1 || { echo "nc is required to verify fleet-cas store $endpoint" >&2; return 1; }
+  if ! nc -z -G 2 "$host" "$port" >/dev/null 2>&1; then
+    echo "fleet-cas store $endpoint is not reachable; refusing to apply" >&2
+    return 1
+  fi
 }
 
 # The plist for a role: launchd runs bin/fleet-cas-run ROLE, which execs fleet-cas with
@@ -104,14 +207,25 @@ health_failed() {  # role
 # timed out 187 store calls under compile load and published no marker. Standard gave
 # priority 20; Interactive matches a process started from a shell (31).
 plist_for() {  # role, label, daemon (1 or empty)
-  local log=$LOGS/glaeda-fleet-cas-$1.log
+  local log=$LOGS/glaeda-fleet-cas-$1.log runner state
+  runner=$(runner_for "$1")
+  state=$(state_for "$1")
   printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
     '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
     '<plist version="1.0">' '<dict>' \
     '    <key>Label</key>' "    <string>$2</string>"
   [ -z "${3:-}" ] || printf '%s\n' '    <key>UserName</key>' "    <string>$(xml "$(id -un)")</string>"
   printf '%s\n' '    <key>ProgramArguments</key>' '    <array>' \
-    "        <string>$BIN/fleet-cas-run</string>" "        <string>$1</string>" '    </array>'
+    "        <string>$(xml "$runner")</string>" "        <string>$1</string>" '    </array>'
+  if [ "$1" = store ] && [ -n "${FLEET_CAS_ROOT:-}" ]; then
+    printf '%s\n' '    <key>EnvironmentVariables</key>' '    <dict>' \
+      '        <key>FLEET_CAS_ROOT</key>' "        <string>$(xml "$FLEET_CAS_ROOT")</string>" \
+      '        <key>FLEET_CAS_VOLUME_UUID</key>' "        <string>$(xml "$custom_store_volume_uuid")</string>" \
+      '        <key>FLEET_CAS_IMAGE</key>' "        <string>$(xml "$custom_store_image")</string>" \
+      '        <key>FLEET_CAS_STATE_DIR</key>' "        <string>$(xml "$state")</string>" \
+      '        <key>FLEET_CAS_MOUNT_HELPER</key>' "        <string>$(xml "$launch_root/fleet-cas-mount")</string>" \
+      '    </dict>'
+  fi
   printf '%s\n' '    <key>RunAtLoad</key>' '    <true/>' '    <key>KeepAlive</key>' '    <true/>'
   printf '%s\n' '    <key>ThrottleInterval</key>' '    <integer>10</integer>' \
     '    <key>ProcessType</key>' '    <string>Interactive</string>'
@@ -162,9 +276,15 @@ write_prewarm() {  # repo, or empty to remove
 # Stop the role's process so launchd starts it again with the current args and binary. The
 # pid must still be this role's fleet-cas (its first argument), not a reused pid.
 restart_role() {  # role, first argument the running process was started with
-  local pid first=$2; pid=$(cat "$ROOT/run/$1.pid" 2>/dev/null) || return 0
-  case $(ps -o command= -p "$pid" 2>/dev/null) in
-    "$BIN/fleet-cas $first"*) ;;
+  local pid first=$2 command runner=$BIN/fleet-cas-run state=$ROOT/run
+  if [ "$1" = store ] && [ -n "${FLEET_CAS_ROOT:-}" ] && [ -n "${custom_store_image:-}" ]; then
+    state=$HOME/.cache/glaeda-fleet-cas/store-run
+    runner=$launch_root/fleet-cas-run
+  fi
+  pid=$(cat "$state/$1.pid" 2>/dev/null) || return 0
+  command=$(ps -o command= -p "$pid" 2>/dev/null)
+  case "$command" in
+    "$BIN/fleet-cas $first"*|*"$runner $1"*) ;;
     *) return 0 ;;
   esac
   kill "$pid"
@@ -174,25 +294,26 @@ restart_role() {  # role, first argument the running process was started with
 
 # The binary the role's process started with (fleet-cas-run records it) differs from bin/.
 stale_binary() {  # role
-  [ "$(cat "$ROOT/run/$1.bin" 2>/dev/null)" != "$(shasum -a 256 "$BIN/fleet-cas" | cut -c1-64)" ]
+  local state; state=$(state_for "$1")
+  [ "$(cat "$state/$1.bin" 2>/dev/null)" != "$(shasum -a 256 "$BIN/fleet-cas" | cut -c1-64)" ]
 }
 
 write_service() {  # role, args...
   local r=$1; shift
-  local label; label=$(label_for "$r")
-  local agent=$AGENTS/$label.plist daemon=/Library/LaunchDaemons/$label.plist
+  local label state; label=$(label_for "$r"); state=$(state_for "$r")
+  local agent=$AGENTS/$label.plist daemon=$LAUNCH_DAEMONS/$label.plist
   say "run $label: $BIN/fleet-cas $*"
   [ -n "$apply" ] || return 0
-  mkdir -p "$AGENTS" "$LOGS" "$ROOT/run" "$ROOT/launchd"
+  mkdir -p "$AGENTS" "$LOGS" "$state" "$ROOT/launchd"
   local changed= old_first
   stale_binary "$r" && changed=1
   # The running process was started with the old arguments (a new store address, say).
-  old_first=$(head -1 "$ROOT/run/$r.args" 2>/dev/null || true)
-  printf '%s\n' "$@" >"$ROOT/run/$r.args.tmp"
-  if ! cmp -s "$ROOT/run/$r.args.tmp" "$ROOT/run/$r.args"; then
-    mv "$ROOT/run/$r.args.tmp" "$ROOT/run/$r.args"; changed=1
+  old_first=$(head -1 "$state/$r.args" 2>/dev/null || true)
+  printf '%s\n' "$@" >"$state/$r.args.tmp"
+  if ! cmp -s "$state/$r.args.tmp" "$state/$r.args"; then
+    mv "$state/$r.args.tmp" "$state/$r.args"; changed=1
   else
-    rm -f "$ROOT/run/$r.args.tmp"
+    rm -f "$state/$r.args.tmp"
   fi
   plist_for "$r" "$label" 1 >"$ROOT/launchd/$label.plist"
   plutil -lint -s "$ROOT/launchd/$label.plist"
@@ -226,22 +347,58 @@ write_service() {  # role, args...
 }
 
 install_binaries() {
-  say "build $proto (cargo build --release --locked)"
+  local prebuilt=${GLAEDA_FLEET_CAS_PREBUILT:-} f src
+  if [ -n "$prebuilt" ]; then
+    say "install prebuilt fleet-cas bundle $prebuilt (Cargo skipped)"
+    [ -f "$prebuilt/SHA256SUMS" ] && [ ! -L "$prebuilt/SHA256SUMS" ] || { echo "missing prebuilt SHA256SUMS: $prebuilt/SHA256SUMS" >&2; exit 1; }
+    (cd "$prebuilt" && shasum -a 256 -c SHA256SUMS) || { echo "prebuilt bundle checksum failed" >&2; exit 1; }
+    for f in fleet-cas fleet-cas-run fleet-cas-mount fleet-cas-settings.sh fleet-cas-marker.sh fleet-cas-warm.sh fleet-cas-prewarm.sh fleet-cas-writer-build.sh; do
+      src=$prebuilt/$f
+      [ -f "$src" ] && [ ! -L "$src" ] && [ -x "$src" ] || { echo "missing regular prebuilt executable: $src" >&2; exit 1; }
+    done
+  else
+    say "build $proto (cargo build --release --locked)"
+    if [ -n "$apply" ]; then
+      check_owner
+      # No host lock: queuing for it exclusively takes a runner host's PR runners offline while
+      # it waits (glaeda#1206's gate), and an up-to-date build is a no-op anyway. A real rebuild
+      # runs at low priority beside whatever is building.
+      (cd "$proto" && nice -n 15 cargo build --release --locked -q)
+    fi
+  fi
   if [ -n "$apply" ]; then
     check_owner
-    # No host lock: queuing for it exclusively takes a runner host's PR runners offline while
-    # it waits (glaeda#1206's gate), and an up-to-date build is a no-op anyway. A real rebuild
-    # runs at low priority beside whatever is building.
-    (cd "$proto" && nice -n 15 cargo build --release --locked -q)
     mkdir -p "$BIN"
-    local f src
-    for f in fleet-cas fleet-cas-run fleet-cas-settings.sh fleet-cas-marker.sh fleet-cas-warm.sh fleet-cas-prewarm.sh fleet-cas-writer-build.sh; do
-      src=$proto/target/release/$f; [ "$f" = fleet-cas ] || src=$proto/scripts/$f
+    for f in fleet-cas fleet-cas-run fleet-cas-mount fleet-cas-settings.sh fleet-cas-marker.sh fleet-cas-warm.sh fleet-cas-prewarm.sh fleet-cas-writer-build.sh; do
+      if [ -n "$prebuilt" ]; then
+        src=$prebuilt/$f
+      else
+        src=$proto/target/release/$f; [ "$f" = fleet-cas ] || src=$proto/scripts/$f
+      fi
       if ! cmp -s "$src" "$BIN/$f"; then
         install -m 0755 "$src" "$BIN/$f.new" && mv "$BIN/$f.new" "$BIN/$f"
         [ "$f" = fleet-cas ] && bin_changed=1
       fi
     done
+    if [ -n "$custom_store_image" ]; then
+      mkdir -p "$launch_root"
+      launch_runner=$proto/scripts/fleet-cas-run
+      launch_mount=$proto/scripts/fleet-cas-mount
+      if [ -n "$prebuilt" ]; then
+        launch_runner=$prebuilt/fleet-cas-run
+        launch_mount=$prebuilt/fleet-cas-mount
+      fi
+      [ -f "$launch_runner" ] && [ ! -L "$launch_runner" ] && [ -x "$launch_runner" ] || {
+        echo "missing regular launch runner: $launch_runner" >&2; exit 1;
+      }
+      [ -f "$launch_mount" ] && [ ! -L "$launch_mount" ] && [ -x "$launch_mount" ] || {
+        echo "missing regular mount helper: $launch_mount" >&2; exit 1;
+      }
+      install -m 0755 "$launch_runner" "$launch_root/fleet-cas-run.new"
+      install -m 0755 "$launch_mount" "$launch_root/fleet-cas-mount.new"
+      mv "$launch_root/fleet-cas-run.new" "$launch_root/fleet-cas-run"
+      mv "$launch_root/fleet-cas-mount.new" "$launch_root/fleet-cas-mount"
+    fi
   fi
   say "install $BIN/fleet-cas and its scripts"
 }
@@ -261,6 +418,9 @@ case $role in
   node | writer)
     [ -n "$store" ] || { echo "$role needs --store HOST:PORT" >&2; exit 2; }
     check_key_args
+    if [ -n "$apply" ]; then
+      check_upstream "$store" || exit 1
+    fi
     node_args=(--read-only-kv)
     if [ "$role" = writer ]; then
       [ -n "$sign_key" ] && [ -n "$trusted" ] || { echo "writer needs --sign-key PATH and --trusted-keys HEX" >&2; exit 2; }
@@ -296,6 +456,7 @@ case $role in
     case $listen in 0.0.0.0:* | \[::\]:*) echo "refusing a wildcard listen address" >&2; exit 2 ;; esac
     check_key_args
     [ -z "$sign_key" ] || { echo "--sign-key is for the writer role" >&2; exit 2; }
+    check_custom_store_root
     install_binaries
     do_ mkdir -p "$FLEET_STORE"
     write_service store "tcp:$listen" "$FLEET_STORE" --writers "$writers" ${trusted:+--trusted-keys "$trusted"}
@@ -306,16 +467,26 @@ case $role in
     fi
     ;;
   uninstall)
-    write_prewarm ""
+    case $uninstall_scope in
+      node|store|all) ;;
+      *) echo "uninstall scope must be node, store, or all" >&2; exit 2 ;;
+    esac
+    if [ "$uninstall_scope" = node ] || [ "$uninstall_scope" = all ]; then
+      write_prewarm ""
+    fi
     for r in node store; do
+      [ "$uninstall_scope" = all ] || [ "$uninstall_scope" = "$r" ] || continue
       label=$(label_for "$r")
+      state=$(state_for "$r")
       say "stop and remove $label (stores kept)"
-      [ -z "$apply" ] || { launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true; rm -f "$AGENTS/$label.plist" "$ROOT/run/$r.args"; }
-      if [ -e "/Library/LaunchDaemons/$label.plist" ]; then
-        echo "ROOT STEP NEEDED: sudo launchctl bootout system/$label; sudo rm /Library/LaunchDaemons/$label.plist"
+      [ -z "$apply" ] || { launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true; rm -f "$AGENTS/$label.plist" "$state/$r.args"; }
+      if [ -e "$LAUNCH_DAEMONS/$label.plist" ]; then
+        echo "ROOT STEP NEEDED: sudo launchctl bootout system/$label; sudo rm $LAUNCH_DAEMONS/$label.plist"
       fi
     done
-    do_ rm -f "$ROOT/fleet-cas.env"
+    if [ "$uninstall_scope" = node ] || [ "$uninstall_scope" = all ]; then
+      do_ rm -f "$ROOT/fleet-cas.env"
+    fi
     ;;
   *) sed -n '2,10p' "$0" >&2; exit 2 ;;
 esac

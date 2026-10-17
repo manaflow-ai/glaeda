@@ -9,6 +9,13 @@ on:
   schedule:
     - cron: "17 * * * *"
   workflow_dispatch:
+    inputs:
+      soak_hours:
+        # An operator's early promotion of a narrow fix for live fleet breakage, after canary hosts
+        # reported success (glaeda#1461/#1462, 2026-10-13). Every other check still applies.
+        description: "Soak hours for this run (default 6)"
+        required: false
+        default: "6"
 
 permissions:
   contents: write
@@ -34,7 +41,7 @@ jobs:
           fetch-depth: 0  # stable only moves forward: the ancestry check needs history
       - name: Promote the newest healthy soaked release
         env:
-          SOAK_HOURS: "6"
+          SOAK_HOURS: ${{ inputs.soak_hours || '6' }}
         run: |
           mkdir -p channels
           stable=()

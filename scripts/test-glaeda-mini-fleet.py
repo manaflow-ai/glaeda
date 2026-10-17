@@ -39,11 +39,14 @@ STRAY = "SHA256:DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
 
 
 def fleet_cas_text(mode: str = "read-only", node: str = "answers", build_mode: str | None = "present",
-                   **kinds: str) -> str:
+                   store: str | None = None, stats: dict[str, int] | None = None, **kinds: str) -> str:
     """Probe lines for a conforming fleet-cas host; kinds overrides a path's kind (src_cmux="symlink")."""
     lines = [f"fleet_cas_path\t{rel}|{kinds.get(rel.replace('xcode/', '').replace('/', '_').replace('.', '_').replace('-', '_'), want)}"
              for rel, want in {**mf.FLEET_CAS_PATHS, **mf.FLEET_CAS_WRITER_PATHS}.items()]
     lines += [f"fleet_cas_node_mode\t{mode}", f"fleet_cas_node\t{node}"]
+    if store:
+        lines.append(f"fleet_cas_store\t{store}")
+    lines += [f"fleet_cas_stat\t{k}|{v}" for k, v in (stats or {}).items()]
     if build_mode is None:
         lines.append("fleet_recipe_released\tnone")
     else:
@@ -54,7 +57,9 @@ def fleet_cas_text(mode: str = "read-only", node: str = "answers", build_mode: s
 def probe_text(hostname: str = "build-mini-1", keys: tuple[str, ...] = ("coordinator", "operator"),
                extra_keys: tuple[str, ...] = (), clone: bool = True, license_: str = "26.3",
                worker: str = "running pid=10", node_id: str | None = "cmux-mac-001",
-               worker_proc: str = "running", fleet_cas: str | None = None) -> str:
+               worker_proc: str = "running", fleet_cas: str | None = None,
+               sudo: str | None = None,
+               glaeda_jobs: tuple[tuple[str, str, str], ...] = ()) -> str:
     lines = [
         "user\tbuilder", "uid\t501", "admin_group\tyes", f"hostname\t{hostname}", "computer_name\tMini",
         "model\tMac16,11", "chip\tApple M4 Pro", "cpus\t14", f"memory_bytes\t{48 * 2**30}",
@@ -70,6 +75,9 @@ def probe_text(hostname: str = "build-mini-1", keys: tuple[str, ...] = ("coordin
     ]
     if node_id is not None:
         lines.append(f"fleet_node_id\t{node_id}")
+    if sudo is not None:
+        lines.append(f"sudo\t{sudo}")
+    lines.extend(f"launchd\t{domain}|{label}|{state}" for domain, label, state in glaeda_jobs)
     if clone:
         lines.append("xcode_app\t/Applications/Xcode_26.3.app|dir|26.3|17C529")
     for key in keys:
@@ -89,6 +97,14 @@ class ManifestTests(unittest.TestCase):
 
     def test_example_loads(self) -> None:
         self.assertEqual(set(self.manifest["hosts"]), {"build-mini-1", "build-mini-2", "small-mini"})
+
+    def test_host_jump_route_is_validated_and_emitted(self) -> None:
+        self.manifest["hosts"]["build-mini-1"]["ssh_jump_host"] = "cmux-lawrence"
+        self.assertEqual(mf.host_ssh_options(self.manifest, "build-mini-1"),
+                         ("-o", "ProxyJump=cmux-lawrence"))
+        self.manifest["hosts"]["build-mini-1"]["ssh_jump_host"] = "bad host"
+        with self.assertRaisesRegex(mf.Failure, "ssh_jump_host"):
+            mf.host_ssh_options(self.manifest, "build-mini-1")
 
     def test_never_touch_host_is_refused(self) -> None:
         with self.assertRaisesRegex(mf.Failure, "never_touch"):
@@ -174,6 +190,32 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(self.manifest["defaults"]["disk"]["min_free_gib"], 30)
 
 
+class TransportTests(unittest.TestCase):
+    def route_manifest(self) -> dict:
+        return {"ssh_user": "cmux", "hosts": {"aws-m4pro-7": {
+            "ssh_jump_host": "cmux-lawrence", "ssh_user": "ec2-user",
+            "ssh_identity": "~/.ssh/cmux-mac-builder.pem", "ssh_jump_host_local": True,
+            "tailnet_ip": "100.68.123.70"}}}
+
+    def test_aws_status_uses_controller_jump_and_preserves_target_exit(self) -> None:
+        manifest = self.route_manifest()
+        argv = mf.ssh_command(manifest, "aws-m4pro-7", "cmux", "echo ready")
+        self.assertEqual(argv[-2], "cmux-lawrence")
+        self.assertIn("ec2-user@100.68.123.70", argv[-1])
+        self.assertIn("cmux-mac-builder.pem", argv[-1])
+        self.assertIn(mf.SSH_RC_MARKER, argv[-1])
+        proc = subprocess.CompletedProcess(argv, 0, "ready\n\n" + mf.SSH_RC_MARKER + "7\n", "")
+        result = mf.ssh_result(manifest, "aws-m4pro-7", proc)
+        self.assertEqual(result.returncode, 7)
+        self.assertEqual(result.stdout, "ready\n")
+
+    def test_incomplete_route_fails_closed(self) -> None:
+        manifest = self.route_manifest()
+        del manifest["hosts"]["aws-m4pro-7"]["tailnet_ip"]
+        with self.assertRaisesRegex(mf.Failure, "incomplete SSH route"):
+            mf.ssh_command(manifest, "aws-m4pro-7", "cmux", "true")
+
+
 class ClassAndPoolTests(unittest.TestCase):
     def setUp(self) -> None:
         self.manifest = mf.load_manifest(EXAMPLE)
@@ -221,6 +263,19 @@ class ClassAndPoolTests(unittest.TestCase):
         self.assertEqual(list(result), ["glaeda-std-xcode-26.3"])
         self.assertEqual(result["glaeda-std-xcode-26.3"]["declared"], ["build-mini-1"])
         self.assertEqual(result["glaeda-std-xcode-26.3"]["conforming_count"], 1)
+
+    def test_pools_publish_manifest_resources_without_host_identity(self) -> None:
+        obs = observed(**{"build-mini-1": probe_text()})
+        resource = mf.pools(self.manifest, obs, ["build-mini-1"])["glaeda-std-xcode-26.3"]["resource"]
+        self.assertEqual(resource, {"cpuCores": 14, "capacityUnits": 4, "compileSlots": 1,
+                                    "canonicalRoots": 1, "guiRunners": 0, "simulatorHosts": 0})
+
+        data = copy.deepcopy(self.manifest)
+        data["defaults"]["ios_simulator"] = {"runtimes": ["23F77"], "exclusive": True,
+                                               "devices": ["iPhone 17 Pro Max"]}
+        data["hosts"]["build-mini-1"]["roles"] = ["ci-runner", "ios-simulators"]
+        resource = mf.pools(data, obs, ["build-mini-1"])["glaeda-std-xcode-26.3"]["resource"]
+        self.assertEqual(resource["simulatorHosts"], 1)
 
     def test_pools_need_an_exact_real_xcode_to_conform(self) -> None:
         for text in (probe_text().replace("|dir|26.3|17C529", "|symlink:/x|26.3|17C529"),
@@ -326,6 +381,13 @@ class BorrowTests(unittest.TestCase):
         self.assertEqual(doc["reservation_schema"], mf.RESERVATION_SCHEMA)
         self.assertIsNone(doc["release"])
 
+    def test_lease_document_uses_host_ssh_user(self) -> None:
+        self.manifest["hosts"]["build-mini-1"]["ssh_user"] = "ec2-user"
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = mf.cmd_borrow(self.manifest, ["build-mini-1"], self.obs(), "std", "interactive", 1,
+                                 None, "leo@air", False, True)
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out.getvalue())["connection"]["user"], "ec2-user")
     OWNER = "leo@air+0123456789ab"
 
     def borrow(self, observed_doc: dict, hosts: list[str] | None = None, json_output: bool = False) -> tuple[int, str]:
@@ -474,6 +536,14 @@ class BorrowTests(unittest.TestCase):
         doc = json.loads(out.getvalue())
         self.assertEqual(doc["state"], "unavailable")
         self.assertEqual(doc["selection"]["excluded"], {"build-mini-1": "host lock held"})
+class ObservationTests(unittest.TestCase):
+    def test_observe_uses_host_ssh_user(self) -> None:
+        manifest = mf.load_manifest(EXAMPLE)
+        manifest["hosts"]["build-mini-1"]["ssh_user"] = "ec2-user"
+        with mock.patch.object(mf, "observe_host", return_value={"host": "build-mini-1", "reachable": True}) as probe:
+            got = mf.observe(manifest, ["build-mini-1"])
+        self.assertTrue(got["hosts"]["build-mini-1"]["reachable"])
+        probe.assert_called_once_with(manifest, "build-mini-1", options=())
 
 
 class CheckTests(unittest.TestCase):
@@ -596,10 +666,16 @@ class CheckTests(unittest.TestCase):
 
     def test_sudo_and_token_drift(self) -> None:
         self.manifest["hosts"]["build-mini-1"]["sudo"] = "password"
+        self.manifest["hosts"]["build-mini-1"]["controller"] = "worker"
         self.manifest["defaults"]["controller_token"] = "present"
         text = probe_text() + "sudo\tnopasswd\ncontroller_token\tmissing\n"
         areas = {i["area"] for i in self.issues(text)}
         self.assertTrue({"sudo", "worker"} <= areas)
+
+    def test_excluded_controller_does_not_require_inherited_token(self) -> None:
+        self.manifest["hosts"]["build-mini-1"]["controller"] = "excluded"
+        text = probe_text() + "controller_token\tmissing\n"
+        self.assertFalse([i for i in self.issues(text) if i["area"] == "worker"])
 
     def test_versions_compare_padded(self) -> None:
         self.assertEqual(mf.version_tuple("26.3"), mf.version_tuple("26.3.0"))
@@ -699,6 +775,10 @@ class CatchUpTests(unittest.TestCase):
         (issue,) = self.writer(fleet_cas=fleet_cas_text(mode="signing", build_mode="missing"))
         self.assertEqual(issue[0], "recipe")
 
+    def test_writer_lifetime_upstream_failures_are_gated_per_fill(self) -> None:
+        self.assertEqual(self.writer(fleet_cas=fleet_cas_text(mode="signing", store="100.89.140.13:7450",
+                                                              stats={"up_errors": 548179, "up_skipped": 2240091})), [])
+
     def test_failing_fill_is_pending_not_hidden(self) -> None:
         text = probe_text(hostname="Build-Mini-2", node_id="cmux-mac-002", worker_proc="absent",
                           fleet_cas=fleet_cas_text(mode="signing"))
@@ -755,6 +835,35 @@ class CatchUpTests(unittest.TestCase):
         (issue,) = self.reader(fleet_cas_text(**{"bin_fleet_cas_settings_sh": "missing"}))
         self.assertIn("fleet-cas-settings.sh missing", issue["detail"])
 
+    def test_reader_reports_stale_upstream_even_when_socket_answers(self) -> None:
+        self.manifest["cache_services"] = [{"kind": "compiler-cas", "endpoint": "100.89.140.13:7450"}]
+        text = fleet_cas_text(store="100.100.232.95:7450", stats={"up_calls": 12, "up_errors": 2,
+                                                                  "up_skipped": 8})
+        parsed = mf.parse_probe(probe_text(fleet_cas=text))["fleet_cas"]
+        self.assertEqual(parsed["store"], "100.100.232.95:7450")
+        self.assertEqual(parsed["stats"]["up_errors"], 2)
+        issues = self.reader(text)
+        (issue,) = [i for i in issues if "configured upstream" in i["detail"]]
+        self.assertEqual(issue["area"], "fleet-cas")
+        self.assertIn("100.89.140.13:7450", issue["detail"])
+        self.assertNotIn("upstream errors", issue["detail"])
+
+    def test_reader_lifetime_upstream_errors_do_not_claim_current_outage(self) -> None:
+        self.manifest["cache_services"] = [{"kind": "compiler-cas", "endpoint": "100.89.140.13:7450"}]
+        text = fleet_cas_text(store="100.89.140.13:7450", stats={"up_calls": 12, "up_errors": 2,
+                                                                  "up_skipped": 8})
+        self.assertEqual([i for i in self.reader(text) if "upstream" in i["detail"]], [])
+
+    def test_orphaned_reader_reports_stale_upstream(self) -> None:
+        self.manifest["cache_services"] = [{"kind": "compiler-cas", "endpoint": "100.89.140.13:7450"}]
+        self.manifest["hosts"]["build-mini-1"]["roles"] = ["ci-runner"]
+        text = fleet_cas_text(store="100.100.232.95:7450", stats={"up_errors": 238, "up_skipped": 40667})
+        issues = mf.check(self.manifest, observed(**{"build-mini-1": probe_text(fleet_cas=text)}), ["build-mini-1"])
+        (issue,) = [i for i in issues if "outside a catch-up role" in i["detail"]]
+        self.assertEqual(issue["area"], "fleet-cas")
+        self.assertIn("100.100.232.95:7450", issue["detail"])
+        self.assertNotIn("upstream errors", issue["detail"])
+
     def test_reader_recipe_without_build_mode_is_drift(self) -> None:
         (issue,) = self.reader(fleet_cas_text(build_mode="missing"))
         self.assertEqual((issue["area"], issue["detail"]),
@@ -808,6 +917,12 @@ class CatchUpTests(unittest.TestCase):
         parsed = mf.parse_probe(fleet_cas_text(src_cmux="symlink"))["fleet_cas"]
         self.assertEqual(parsed["paths"]["xcode/src/cmux"], "symlink")
         self.assertEqual((parsed["node_mode"], parsed["node"], parsed["build_mode"]), ("read-only", "answers", "present"))
+
+    def test_probe_uses_launchd_worker_state_when_release_path_differs(self) -> None:
+        text = mf.PROBE.read_text()
+        self.assertIn('launchctl print "system/ai.manaflow.cmux-build-worker"', text)
+        self.assertIn('worker_state=$(launchctl print', text)
+        self.assertIn('e fleet_worker_proc running', text)
 
 
 class IosSimulatorTests(unittest.TestCase):
@@ -1081,6 +1196,7 @@ def preflight_text(user: str = "builder", brew_owner: str | None = "builder", zi
     if rust:
         tools.update({"cargo": ("/opt/homebrew/bin/cargo", "cargo 1.88.0 (abc 2025-06-23)"),
                       "rustc": ("/opt/homebrew/bin/rustc", "rustc 1.88.0 (abc 2025-06-23)"),
+                      "rustdoc": ("/opt/homebrew/bin/rustdoc", "rustdoc 1.88.0 (abc 2025-06-23)"),
                       "rustup": ("/opt/homebrew/bin/rustup", "rustup 1.29.1 (2026-08-13)")})
     for tool in mf.bootstrap.MACOS_WORKLOAD_TOOLS:
         path, version = tools.get(tool, ("", ""))
@@ -1143,6 +1259,40 @@ class PreflightTests(unittest.TestCase):
         self.assertTrue(result["ready"], result)
         self.assertEqual({k for k, v in result["checks"].items() if v["state"] not in {"ok", "info"}}, set())
         self.assertEqual(list(result["checks"]), list(mf.PREFLIGHT_CHECKS))
+
+    def test_headless_host_plan_uses_system_maintenance_agents(self) -> None:
+        # AWS EC2 Macs have no GUI login.  A plain LaunchAgent would disappear after
+        # reboot, leaving disk pressure and OTA maintenance stopped until an operator
+        # creates a GUI session.
+        self.manifest["hosts"]["build-mini-1"]["gui"] = False
+        text = preflight_text().replace("pf_glaeda\tpresent", "pf_glaeda\tmissing")
+        check = self.result(text)["checks"]["glaeda"]
+        self.assertEqual(check["action"], {"kind": "glaeda"})
+        self.assertIn("glaeda-mini-setup --apply --headless --ota-source", check["fix"])
+
+    def test_existing_gui_agents_are_a_headless_setup_drift(self) -> None:
+        self.manifest["hosts"]["build-mini-1"]["gui"] = False
+        jobs = (("/Users/builder/Library/LaunchAgents", mf.GLAEDA_LABEL_PREFIX + "disk-pressure", "running"),)
+        check = self.result(preflight_text(sudo="nopasswd", glaeda_jobs=jobs))["checks"]["glaeda"]
+        self.assertEqual(check["action"], {"kind": "glaeda"})
+        self.assertEqual(check["state"], "fail")
+        self.assertIn("GUI LaunchAgents", check["detail"])
+        self.assertIn("--apply --headless --ota-source", check["fix"])
+
+    def test_headless_setup_requires_passwordless_sudo(self) -> None:
+        self.manifest["hosts"]["build-mini-1"]["gui"] = False
+        result = self.result(preflight_text(sudo="password"))
+        self.assertFalse(result["ready"])
+        self.assertEqual(result["checks"]["headless_sudo"]["state"], "fail")
+        self.assertEqual(result["checks"]["headless_sudo"]["group"], "person")
+
+    def test_missing_rustdoc_is_a_repairable_rust_toolchain_failure(self) -> None:
+        text = preflight_text().replace("pf_tool\trustdoc|/opt/homebrew/bin/rustdoc|rustdoc 1.88.0 (abc 2025-06-23)\n", "")
+        result = self.result(text)
+        self.assertFalse(result["ready"])
+        self.assertEqual(result["checks"]["rust"]["state"], "fail")
+        self.assertIn("rustdoc", result["checks"]["rust"]["detail"])
+        self.assertIn("rustdoc", result["checks"]["rust"]["fix"])
 
     def test_the_austin_mini_morning_is_found_in_one_pass(self) -> None:
         # 2026-09-24, cmux-austin-mini-1: every one of these showed up only after the previous fix.
@@ -1564,7 +1714,7 @@ class PreflightScriptTests(unittest.TestCase):
             runner.mkdir()
             (runner / ".runner").write_text('﻿{\n  "agentName": "mini-1",\n  "serverUrl": "https://secret.example/"\n}\n')
             header = (f"CMUX_ROOT='~/cmux'\nXCODE_PIN=''\nWORKLOAD_PATH={tools}\n"
-                      f"WORKLOAD_TOOLS='cargo git zig rustup'\nPYTHONS=''\nCANDIDATE_PIN={'ab' * 20}\n"
+                      f"WORKLOAD_TOOLS='cargo git rustdoc zig rustup'\nPYTHONS=''\nCANDIDATE_PIN={'ab' * 20}\n"
                       "ENROLL_FLAGS='--renew --class-receipt --fleet-class'\nPIN_FORMULAS='zig'\n")
             # The whole SSH payload, probe first, as observe_host sends it.
             script = mf.PROBE.read_text() + "\n" + header + mf.PREFLIGHT_PROBE.read_text()
@@ -1687,6 +1837,15 @@ class ToolchainTests(unittest.TestCase):
         checks = self.result(preflight_text())["checks"]
         self.assertEqual(checks["xcode"]["state"], "fail")
         self.assertIn("want 26.3 (17C999)", checks["xcode"]["detail"])
+
+    def test_legacy_xcode_apps_supply_the_class_acceptance_pin(self) -> None:
+        self.manifest["defaults"]["toolchain"] = {}
+        self.assertEqual(mf.toolchain(self.manifest, "build-mini-1")["xcode"], {
+            "app": "/Applications/Xcode.app", "version": "26.3", "build": "17C529"
+        })
+        self.manifest["defaults"]["xcode"]["select"] = "/Applications/Xcode_26.3.app/Contents/Developer"
+        self.assertEqual(mf.toolchain(self.manifest, "build-mini-1")["xcode"]["app"],
+                         "/Applications/Xcode_26.3.app")
 
     def test_selection_and_metal_can_be_declared_optional(self) -> None:
         self.manifest["defaults"]["toolchain"]["xcode"]["select"] = False
@@ -1812,6 +1971,36 @@ class FixPlanTests(unittest.TestCase):
             mf.fix_host(self.manifest, "build-mini-1", self.result, True, Path(tmp))
         self.assertEqual(seen["glaeda"]["python"], "~/.local/bin/python3")
 
+    def test_glaeda_repair_passes_headless_mode_for_gui_less_hosts(self) -> None:
+        self.manifest["hosts"]["build-mini-1"]["gui"] = False
+        action = {"kind": "glaeda", "python": "/opt/homebrew/bin/python3.13"}
+        with mock.patch.object(mf, "routed_fix_call", return_value=0) as call:
+            ok, _ = mf.run_repair(self.manifest, "build-mini-1", action, None)
+        self.assertTrue(ok)
+        self.assertEqual(call.call_args.args[2:4], ("glaeda", ["/opt/homebrew/bin/python3.13", "--headless"]))
+
+    def test_headless_fix_dry_run_describes_the_mode(self) -> None:
+        self.manifest["hosts"]["build-mini-1"]["gui"] = False
+        result = {"checks": {
+            "python": {"state": "ok", "detail": "python at /opt/homebrew/bin/python3.13", "fix": "", "group": ""},
+            "rust": {"state": "ok", "detail": "", "fix": "", "group": ""},
+            "glaeda": {"state": "fail", "detail": "", "fix": "", "group": "self",
+                        "action": {"kind": "glaeda"}},
+            "headless_sudo": {"state": "ok", "detail": "", "fix": "", "group": ""},
+        }}
+        out = mf.fix_host(self.manifest, "build-mini-1", result, False, None)
+        self.assertEqual(len(out["planned"]), 1)
+        self.assertIn("glaeda-mini-setup --apply --headless", out["planned"][0])
+
+    def test_headless_fix_waits_for_sudo_before_setup(self) -> None:
+        self.manifest["hosts"]["build-mini-1"]["gui"] = False
+        obs = observed(**{"build-mini-1": preflight_text(sudo="password")})["hosts"]["build-mini-1"]
+        result = mf.preflight_host(self.manifest, "build-mini-1", obs, "0.16.0")
+        with mock.patch.object(mf, "run_repair") as run:
+            out = mf.fix_host(self.manifest, "build-mini-1", result, True, None)
+        run.assert_not_called()
+        self.assertTrue(any("waits for headless_sudo (a person)" in item for item in out["waiting"]), out)
+
     def test_fix_command_skips_record_only_hosts_and_probes_once(self) -> None:
         obs = observed(**{"build-mini-1": morning_text()})
         with mock.patch.object(mf, "observe", return_value=obs) as probe, mock.patch.object(mf, "run_repair") as run, \
@@ -1842,6 +2031,7 @@ class SudoPlanTests(unittest.TestCase):
                                            "xcodebuild -license accept", "xcodebuild -runFirstLaunch",
                                            "sudo pmset -c sleep 0", "sudo pmset -a autorestart 1",
                                            "sudo -H -u admin env HOMEBREW_NO_ASK=1 /opt/homebrew/bin/brew", "for f in rustup zig",
+                                           "for t in cargo rustc rustdoc rustup",
                                            'sudo -H -u admin ln -s "/opt/homebrew/opt/rustup/bin/$t"')]
         self.assertEqual(order, sorted(order))
         self.assertEqual(script.count("sudo -v\n"), 1)
@@ -2040,11 +2230,26 @@ class FixLibraryTests(unittest.TestCase):
         self.assertEqual([line.strip() for line in body if "rm -r" in line],
                          ['case "$stage" in */.glaeda-share.partial) rm -rf "$stage" ;; esac',
                           'rm -rf "$stage"  # what is left are copies of toolchains this host already had'])
-        self.assertFalse([line for line in body if re.search(r"(^|[;&|(]\s*)sudo\b", line.strip())])
+        self.assertEqual([line for line in body if "sudo -n launchctl" in line],
+                         ['    /Library/LaunchDaemons/*) sudo -n launchctl "$@" ;;'])
         # The only removals are the step lock's own pid file and directory, and the runner held marks it writes.
         self.assertEqual([line.strip() for line in body if "rm " in line and "rm -r" not in line],
                          ["""trap 'rm -f "$HOME/.local/state/glaeda/mini-fleet/step.lock/pid"; rmdir "$HOME/.local/state/glaeda/mini-fleet/step.lock" 2>/dev/null || true' EXIT""",
+                          'rm -f "$(held_dir)/$(basename "$dir")"',
                           'rm -f "$(held_dir)/$(basename "$dir")"'])
+
+    def test_glaeda_setup_preserves_headless_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "glaeda/scripts").mkdir(parents=True)
+            (home / "glaeda/scripts/cmux_fleet.py").write_text("")
+            setup = home / "glaeda/scripts/glaeda-mini-setup"
+            setup.write_text("#!/bin/bash\n# --ota-source\nprintf '%s\\n' \"$@\" > \"$HOME/setup-args\"\n")
+            setup.chmod(0o755)
+            result = self.call(home, "glaeda", "/bin/bash", "--headless")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((home / "setup-args").read_text().splitlines(),
+                             ["--apply", "--headless", "--ota-source", "manaflow-ai/glaeda"])
 
     @unittest.skipUnless(shutil.which("shasum") or shutil.which("sha256sum"), "needs shasum")
     def test_candidate_is_placed_only_when_its_digest_matches(self) -> None:
@@ -2879,6 +3084,37 @@ class RepairTests(unittest.TestCase):
                 check = mf.preflight_host(manifest, "build-mini-1", observed(h=text)["hosts"]["h"])["checks"]["runner"]
                 self.assertEqual(check["state"], "todo")
                 self.assertIn(want, check["detail"])
+            lock_text = down + "host_lock\theld\n" \
+                + "host_lock_owner\t123|worker-current\n" \
+                + "host_lock_activity\tworker-only\n"
+            check = mf.preflight_host(manifest, "build-mini-1", observed(h=lock_text)["hosts"]["h"])["checks"]["runner"]
+            self.assertIn("host.lock worker-only (pid 123|worker-current)", check["detail"])
+
+    def test_class_mode_repairs_a_current_node_missing_the_class_link(self) -> None:
+        manifest = pinned_manifest(self.tmp.name)
+        loaded = mf.load_manifest(manifest)
+        with mock.patch.object(mf, "PINNED_CANDIDATE", loaded["candidate"]):
+            result = mf.preflight_host(loaded, "build-mini-1",
+                                       observed(h=on_candidate(generation=NEW_GEN))["hosts"]["h"])
+            self.assertTrue(mf.missing_class_acceptance(loaded, "build-mini-1", result))
+            code, out, calls = run_command({"build-mini-1": on_candidate(generation=NEW_GEN)},
+                                           command="repair", manifest=manifest)
+        self.assertEqual((code, calls), (0, []))
+        self.assertIn("would: renew and adopt the class receipt", out)
+
+    def test_class_mode_relinks_a_current_node_before_adopting(self) -> None:
+        manifest = pinned_manifest(self.tmp.name)
+        code, out, calls = run_command(
+            {"build-mini-1": on_candidate(generation=NEW_GEN)}, "--yes", command="repair",
+            manifest=manifest, after={"build-mini-1": on_candidate(generation=NEW_GEN)},
+        )
+        self.assertEqual(code, 0, out)
+        relink = calls_to(calls, "transition-apply")
+        self.assertEqual(len(relink), 1)
+        self.assertIn("--to quarantined --reason stale_glaeda_generation", relink[0][1])
+        self.assertEqual(len(calls_to(calls, ENROLL)), 1)
+        self.assertIn("--renew --class-receipt - --class-receipt-sha256", calls_to(calls, ENROLL)[0][1])
+        self.assertIn("eligible", out)
 
     def test_dry_run_names_what_it_would_do_and_touches_nothing(self) -> None:
         code, out, calls = run_command({"build-mini-1": on_candidate(), "build-mini-2": on_candidate(
@@ -2937,9 +3173,13 @@ class RepairTests(unittest.TestCase):
         self.assertIn("transition-apply ENROLLMENT --to enrolling", result["checks"]["enroll"]["fix"])
 
     def test_runners_are_restarted_or_released_and_drains_are_left_alone(self) -> None:
-        texts = {"build-mini-1": on_candidate(generation=NEW_GEN, runners=("actions-runner-x|mini-1|yes|no|no",)),
-                 "build-mini-2": on_candidate(generation=NEW_GEN, runners=("actions-runner-x|mini-2|no|no|yes",),
-                                              node_id="cmux-mac-002")}
+        class_accepted = lambda text: text.replace("pf_acceptance\taccepted",
+                                                    "pf_acceptance\taccepted\npf_acceptance_class\tglaeda-class-acceptance/v1")
+        texts = {"build-mini-1": class_accepted(on_candidate(generation=NEW_GEN,
+                                                               runners=("actions-runner-x|mini-1|yes|no|no",))),
+                 "build-mini-2": class_accepted(on_candidate(generation=NEW_GEN,
+                                                               runners=("actions-runner-x|mini-2|no|no|yes",),
+                                                               node_id="cmux-mac-002"))}
         code, out, calls = run_command(texts, "--yes", command="repair", manifest=self.manifest, after=texts)
         self.assertEqual(code, 0, out)
         self.assertEqual([c[0] for c in calls_to(calls, "lock none; runner_kick")], ["build-mini-1"])
@@ -3152,13 +3392,25 @@ def reservation_line(owner: str = "leo@air", purpose: str = "chromium campaign",
 
 class ReservationProbeParsingTests(unittest.TestCase):
     def test_parses_the_raw_marker_with_the_shared_rule(self) -> None:
-        got = mf.parse_probe(reservation_line(purpose="build a | b\tc", since=100, until=200) + "host_lock\theld\n")
+        got = mf.parse_probe(reservation_line(purpose="build a | b\tc", since=100, until=200)
+                             + "host_lock\theld\n"
+                             + "host_lock_owner\t123|worker-current\n"
+                             + "host_lock_activity\tworker-only\n")
         self.assertEqual(got["reservation"], {"valid": True, "owner": "leo@air", "purpose": "build a | b\tc",
                                               "since": 100, "until": 200})
         self.assertEqual(got["host_lock"], "held")
+        self.assertEqual(got["host_lock_owners"], [{"pid": 123, "command": "worker-current", "kind": "worker"}])
+        self.assertEqual(got["host_lock_activity"], "worker-only")
         self.assertEqual(mf.parse_probe("runner_worker\trunning\n")["runner_worker"], "running")
         self.assertEqual(mf.parse_probe("runner_worker\tabsent\n")["runner_worker"], "absent")
         self.assertIs(mf.reservation_rules, sys.modules["glaeda_reservation"])
+
+    def test_lock_owner_parser_drops_malformed_remote_evidence(self) -> None:
+        got = mf.parse_probe("host_lock_owner\tbad\n"
+                             "host_lock_owner\t1|worker\n"
+                             "host_lock_owner\t42|\n"
+                             "host_lock_owner\t43|Runner.Worker\n")
+        self.assertEqual(got["host_lock_owners"], [{"pid": 43, "command": "Runner.Worker", "kind": "job"}])
 
     def test_invalid_markers_say_why(self) -> None:
         good = {"schema": "glaeda-reservation/v1", "owner": "a", "purpose": "b", "since": 1, "until": 2}
@@ -3213,13 +3465,26 @@ class ReservationProbeScriptTests(unittest.TestCase):
             try:
                 self.assertEqual(holder.stdout.readline(), "locked\n")
                 started = time.monotonic()
-                self.assertEqual(self.run_probe(root)["host_lock"], "held")
+                locked = self.run_probe(root)
+                self.assertEqual(locked["host_lock"], "held")
+                # lsof is optional on the Linux runner that executes this contract test,
+                # and a restricted lsof can also see no owner.  Unknown is safe: it never
+                # authorizes a mutation.  When an owner is visible, the holder must be
+                # classified as an active job and identified precisely.
+                if locked["host_lock_owners"]:
+                    self.assertEqual(locked["host_lock_activity"], "active-job")
+                    self.assertIn({"pid": holder.pid, "command": "perl", "kind": "job"}, locked["host_lock_owners"])
+                else:
+                    self.assertEqual(locked["host_lock_activity"], "unknown")
                 self.assertLess(time.monotonic() - started, 20)  # never waits for the holder
             finally:
                 holder.kill()
                 holder.wait()
                 holder.stdout.close()
-            self.assertEqual(self.run_probe(root)["host_lock"], "free")
+            free = self.run_probe(root)
+            self.assertEqual(free["host_lock"], "free")
+            self.assertEqual(free["host_lock_owners"], [])
+            self.assertIsNone(free["host_lock_activity"])
             import fcntl
             shared = os.open(lock, os.O_RDONLY)
             try:  # a PR job's shared share of the host counts as held
@@ -3342,7 +3607,8 @@ class ReserveReleaseTests(unittest.TestCase):
 
     def main(self, *argv: str) -> tuple[int, str]:
         with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
-            code = mf.main([*argv, "--manifest", os.fspath(EXAMPLE)])
+            cut = argv.index("--") if "--" in argv else len(argv)
+            code = mf.main([*argv[:cut], "--manifest", os.fspath(EXAMPLE), *argv[cut:]])
         return code, out.getvalue() + err.getvalue()
 
     def marker(self) -> dict | None:
@@ -3399,6 +3665,34 @@ class ReserveReleaseTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
         code, out = self.main("reserve", "build-mini-1", "--for", "x", "--until", str(now + 72 * 3600 - 5), "--yes")
         self.assertEqual(code, 0, out)
+
+    def test_a_reservation_for_a_command_ends_when_the_command_does(self) -> None:
+        # A copy that reserved a CI host for hours held it long after the copy ended: `-- CMD` holds the host
+        # only while CMD runs here, then releases it, whatever CMD's exit.
+        seen = self.root / "seen"
+        for status in (0, 3):
+            probe = f"test -f {self.root}/reservation.json && echo held >> {seen}; exit {status}"
+            code, out = self.main("reserve", "build-mini-1", "--for", "xcode copy", "--hours", "2", "--yes",
+                                  "--", "bash", "-c", probe)
+            self.assertEqual(code, status, out)
+            self.assertIsNone(self.marker(), out)
+            self.assertIn("released", out)
+        self.assertEqual(seen.read_text(), "held\nheld\n")
+
+    def test_a_command_never_runs_without_the_reservation(self) -> None:
+        ran = self.root / "ran"
+        code, out = self.main("reserve", "build-mini-1", "--for", "copy", "--hours", "1", "--", "touch", os.fspath(ran))
+        self.assertEqual(code, 0, out)  # dry run
+        self.assertIn("would run: touch", out)
+        self.assertFalse(ran.exists())
+        theirs = self.put("lawrence@studio", 3600)
+        code, out = self.main("reserve", "build-mini-1", "--for", "copy", "--hours", "1", "--yes", "--",
+                              "touch", os.fspath(ran))
+        self.assertEqual(code, 1, out)
+        self.assertFalse(ran.exists())
+        self.assertEqual(self.marker(), theirs)  # never released someone else's hold
+        self.assertEqual(self.main("release", "build-mini-1", "--yes", "--", "true")[0], 2)  # reserve only
+        self.assertEqual(self.main("reserve", "build-mini-1", "--for", "x", "--hours", "1", "--")[0], 2)  # no command
 
     def test_foreign_active_reservation_is_refused_and_printed(self) -> None:
         theirs = self.put("lawrence@studio", 3600)
@@ -3543,6 +3837,262 @@ class ReserveReleaseTests(unittest.TestCase):
         self.assertEqual(target.read_text(), "keep")
 
 
+class ManifestFreshnessTests(unittest.TestCase):
+    """The default ~/.config/glaeda/mini-fleet.json is a copy of cmuxterm-hq build-fleet/mini-fleet.json on main;
+    a stale copy once made preflight report disk failures against a 100 GiB floor main had lowered to 30."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        self.local = self.dir / "mini-fleet.json"
+        self.main_text = EXAMPLE.read_text()
+        self.fetches = 0
+        self.tty = True
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("GLAEDA_MINI_FLEET_MANIFEST", "GLAEDA_MINI_FLEET_SKIP_HQ_CHECK")}
+        patches = [mock.patch.object(mf, "DEFAULT_MANIFEST", self.local),
+                   mock.patch.object(mf, "fetch_hq_manifest", self.fetch),
+                   mock.patch.object(mf, "STATE_DIR", self.dir / "state"),
+                   mock.patch.object(mf, "stderr_is_tty", lambda: self.tty),
+                   mock.patch.dict(os.environ, env, clear=True)]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.obs = self.dir / "obs.json"
+        self.obs.write_text(json.dumps(observed(**{"build-mini-1": probe_text()})))
+
+    def fetch(self, *args: object) -> tuple[str, str]:
+        self.fetches += 1
+        if isinstance(self.main_text, Exception):
+            raise self.main_text
+        return self.main_text, "manaflow-ai/cmuxterm-hq main"
+
+    def stale(self, floor: int = 100) -> str:
+        data = json.loads(EXAMPLE.read_text())
+        data["defaults"]["disk"]["min_free_gib"] = floor
+        text = json.dumps(data, indent=2) + "\n"
+        self.local.write_text(text)
+        old = time.time() - 8 * 86400
+        os.utime(self.local, (old, old))
+        return text
+
+    def run_main(self, *argv: str) -> tuple[int, str, str]:
+        with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()) as err:
+            code = mf.main(list(argv))
+        return code, out.getvalue(), err.getvalue()
+
+    def check(self) -> tuple[int, str, str]:
+        return self.run_main("check", "build-mini-1", "--observed", os.fspath(self.obs))
+
+    def test_a_stale_default_manifest_warns_with_the_difference_and_the_refresh_command(self) -> None:
+        self.stale()
+        _, out, err = self.check()
+        self.assertIn("hosts,", out, "the command still runs on the copy it has")
+        self.assertIn(f"{self.local} differs from manaflow-ai/cmuxterm-hq main", err)
+        self.assertIn("defaults.disk.min_free_gib: 100 -> 30", err)
+        self.assertIn("8 days ago", err)
+        self.assertIn("glaeda-mini-fleet manifest-sync --yes", err)
+        self.assertEqual(self.stale(), self.local.read_text(), "a warning never rewrites the copy")
+
+    def test_a_matching_default_manifest_is_silent(self) -> None:
+        self.local.write_text(self.main_text)
+        code, out, err = self.check()
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(err, "")
+        self.assertEqual(self.fetches, 1)
+
+    def test_formatting_alone_is_not_a_difference(self) -> None:
+        self.local.write_text(json.dumps(json.loads(self.main_text)))
+        self.assertEqual(self.check()[2], "")
+
+    def test_a_failed_fetch_degrades_to_a_warning(self) -> None:
+        self.local.write_text(self.main_text)
+        self.main_text = mf.Failure("gh api: could not resolve host; no cmuxterm-hq checkout")
+        code, out, err = self.check()
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("ok", out)
+        self.assertIn(f"could not compare {self.local} with cmuxterm-hq main", err)
+        self.assertIn("could not resolve host", err)
+
+    def test_an_explicit_manifest_is_never_compared(self) -> None:
+        self.local.write_text(self.stale())
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+            mf.main(["check", "build-mini-1", "--manifest", os.fspath(self.local), "--observed", os.fspath(self.obs)])
+        self.assertEqual((self.fetches, err.getvalue()), (0, ""))
+
+    def test_manifest_sync_dry_run_shows_the_diff_and_writes_nothing(self) -> None:
+        before = self.stale()
+        listing = sorted(p.name for p in self.dir.iterdir())
+        with mock.patch.object(mf.os, "open", side_effect=AssertionError("a dry run opens nothing for writing")), \
+                mock.patch.object(mf.os, "replace", side_effect=AssertionError("a dry run replaces nothing")):
+            code, out, _ = self.run_main("manifest-sync")
+        self.assertEqual(code, 0)
+        self.assertEqual(sorted(p.name for p in self.dir.iterdir()), listing)
+        self.assertIn('-      "min_free_gib": 100', out)
+        self.assertIn('+      "min_free_gib": 30', out)
+        self.assertIn("--yes", out)
+        self.assertEqual(self.local.read_text(), before)
+        self.assertEqual(list(self.dir.glob("mini-fleet.json.bak-*")), [])
+
+    def test_manifest_sync_writes_main_atomically_and_keeps_a_backup(self) -> None:
+        before = self.stale()
+        self.local.chmod(0o600)
+        code, out, err = self.run_main("manifest-sync", "--yes")
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(self.local.read_text(), self.main_text)
+        self.assertEqual(self.local.stat().st_mode & 0o777, 0o600)
+        backups = list(self.dir.glob("mini-fleet.json.bak-*"))
+        self.assertEqual([b.read_text() for b in backups], [before])
+        self.assertEqual([p.name for p in self.dir.iterdir() if p.name.startswith(".")], [], "no temp file left")
+        self.assertEqual(self.check()[2], "", "in sync afterwards")
+        code, out, _ = self.run_main("manifest-sync", "--yes")
+        self.assertEqual(code, 0)
+        self.assertIn("already matches", out)
+        self.assertEqual(len(list(self.dir.glob("mini-fleet.json.bak-*"))), 1, "no backup when nothing changes")
+
+    def test_manifest_sync_creates_a_missing_copy(self) -> None:
+        code, out, err = self.run_main("manifest-sync", "--yes")
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual(self.local.read_text(), self.main_text)
+
+    def test_manifest_sync_refuses_an_invalid_main_or_a_failed_fetch(self) -> None:
+        before = self.stale()
+        self.main_text = json.dumps({"schema": "something-else"})
+        code, _, err = self.run_main("manifest-sync", "--yes")
+        self.assertEqual(code, 2)
+        self.assertIn("schema", err)
+        self.main_text = mf.Failure("gh api: HTTP 404")
+        code, _, err = self.run_main("manifest-sync", "--yes")
+        self.assertEqual(code, 2)
+        self.assertIn("HTTP 404", err)
+        self.assertEqual(self.local.read_text(), before)
+        self.assertEqual(list(self.dir.glob("mini-fleet.json.bak-*")), [])
+
+
+    def test_only_an_operator_at_a_terminal_is_checked(self) -> None:
+        self.stale()
+        self.tty = False
+        self.assertEqual(self.check()[2], "", "a script reading stderr (glaeda-route's tick) is never slowed")
+        self.tty = True
+        for argv in (["pools", "build-mini-1", "--observed", os.fspath(self.obs)],
+                     ["check", "build-mini-1", "--observed", os.fspath(self.obs), "--json"],
+                     ["preflight", "build-mini-1", "--observed", os.fspath(self.obs), "--output", "json"]):
+            self.assertNotIn("differs from", self.run_main(*argv)[2], argv)
+        self.assertEqual(self.fetches, 0, "pools and JSON output never compare")
+
+    def test_the_opt_out_and_the_environment_manifest_skip_the_check(self) -> None:
+        self.stale()
+        with mock.patch.dict(os.environ, {"GLAEDA_MINI_FLEET_SKIP_HQ_CHECK": "1"}):
+            self.assertEqual(self.check()[2], "")
+        with mock.patch.dict(os.environ, {"GLAEDA_MINI_FLEET_MANIFEST": os.fspath(self.local)}):
+            self.assertEqual(self.check()[2], "", "the environment names the manifest explicitly")
+        self.assertEqual(self.fetches, 0)
+
+    def test_the_result_is_cached_for_an_hour_per_copy(self) -> None:
+        self.stale()
+        first = self.check()[2]
+        self.assertIn("differs from", first)
+        self.assertEqual(self.check()[2], first, "the cached verdict still warns")
+        self.assertEqual(self.fetches, 1)
+        cache = next((self.dir / "state").glob("hq-manifest-check*.json"))
+        record = json.loads(cache.read_text())
+        record["checked_at"] -= 3601
+        cache.write_text(json.dumps(record))
+        self.check()
+        self.assertEqual(self.fetches, 2, "an hour-old verdict is fetched again")
+        self.local.write_text(self.main_text)
+        self.assertEqual(self.check()[2], "", "a changed copy is compared again")
+        self.assertEqual(self.fetches, 3)
+
+    def test_a_failed_fetch_is_cached_too(self) -> None:
+        self.local.write_text(self.main_text)
+        self.main_text = mf.Failure("gh api: timed out")
+        self.assertIn("could not compare", self.check()[2])
+        self.assertIn("could not compare", self.check()[2])
+        self.assertEqual(self.fetches, 1, "offline, the budget is spent once an hour, not on every run")
+
+    def test_manifest_sync_refuses_a_symlinked_copy(self) -> None:
+        target = self.dir / "real.json"
+        target.write_text(self.stale())
+        self.local.unlink()
+        self.local.symlink_to(target)
+        before = target.read_text()
+        code, _, err = self.run_main("manifest-sync", "--yes")
+        self.assertEqual(code, 2)
+        self.assertIn("is a symlink", err)
+        self.assertIn(os.fspath(target), err)
+        self.assertTrue(self.local.is_symlink())
+        self.assertEqual(target.read_text(), before)
+
+    def test_manifest_sync_reports_any_load_error_without_a_traceback(self) -> None:
+        before = self.stale()
+        broken = json.loads(self.main_text)
+        broken["hosts"] = ["not", "a", "mapping"]
+        self.main_text = json.dumps(broken)
+        code, _, err = self.run_main("manifest-sync", "--yes")
+        self.assertEqual(code, 2)
+        self.assertIn("glaeda-mini-fleet: manifest-sync:", err)
+        self.assertEqual(self.local.read_text(), before)
+
+
+class HqManifestFetchTests(unittest.TestCase):
+    def test_gh_and_the_checkout_share_one_time_budget(self) -> None:
+        clock = [1000.0]
+        timeouts: list[float] = []
+
+        def slow(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+            timeouts.append(float(kwargs["timeout"]))
+            clock[0] += float(kwargs["timeout"])
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / ".git").mkdir()
+            with mock.patch.dict(os.environ, {"GLAEDA_HQ_CHECKOUT": tmp}), \
+                    mock.patch.object(mf.shutil, "which", return_value="/usr/bin/gh"), \
+                    mock.patch.object(mf.time, "monotonic", lambda: clock[0]), \
+                    mock.patch.object(mf.subprocess, "run", side_effect=slow):
+                with self.assertRaises(mf.Failure):
+                    mf.fetch_hq_manifest()
+        self.assertGreaterEqual(len(timeouts), 1)
+        self.assertLessEqual(sum(timeouts), mf.HQ_CHECK_BUDGET_S + 1e-6)
+        self.assertLessEqual(mf.HQ_CHECK_BUDGET_S, 10)
+
+
+    def test_falls_back_to_the_local_checkouts_origin_main_without_gh(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "cmuxterm-hq"
+            (repo / "build-fleet").mkdir(parents=True)
+            (repo / "build-fleet" / "mini-fleet.json").write_text('{"on": "main"}\n')
+            git = ["git", "-C", os.fspath(repo), "-c", "user.email=t@t", "-c", "user.name=t"]
+            subprocess.run([*git, "init", "-q"], check=True)
+            subprocess.run([*git, "add", "-A"], check=True)
+            subprocess.run([*git, "commit", "-qm", "main"], check=True)
+            subprocess.run([*git, "update-ref", "refs/remotes/origin/main", "HEAD"], check=True)
+            (repo / "build-fleet" / "mini-fleet.json").write_text('{"on": "a local edit"}\n')
+            with mock.patch.dict(os.environ, {"GLAEDA_HQ_CHECKOUT": os.fspath(repo)}), \
+                    mock.patch.object(mf.shutil, "which", return_value=None):
+                text, source = mf.fetch_hq_manifest()
+            self.assertEqual(text, '{"on": "main"}\n', "origin/main, not the working tree")
+            self.assertIn(f"{repo} origin/main", source)
+            with mock.patch.dict(os.environ, {"GLAEDA_HQ_CHECKOUT": os.fspath(Path(tmp) / "absent")}), \
+                    mock.patch.object(mf.shutil, "which", return_value=None):
+                with self.assertRaises(mf.Failure):
+                    mf.fetch_hq_manifest()
+
+    def test_asks_github_for_main_first(self) -> None:
+        done = subprocess.CompletedProcess([], 0, '{"from": "github"}\n', "")
+        with mock.patch.object(mf.shutil, "which", return_value="/usr/bin/gh"), \
+                mock.patch.object(mf.subprocess, "run", return_value=done) as run:
+            text, source = mf.fetch_hq_manifest()
+        self.assertEqual(text, '{"from": "github"}\n')
+        self.assertIn("manaflow-ai/cmuxterm-hq", source)
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[:2], ["/usr/bin/gh", "api"])
+        self.assertIn("repos/manaflow-ai/cmuxterm-hq/contents/build-fleet/mini-fleet.json?ref=main", argv)
+        self.assertTrue(run.call_args.kwargs.get("timeout"))
+
+
 class ReservationScriptShapeTests(unittest.TestCase):
     def test_scripts_parse_as_bash(self) -> None:
         for script in (mf.READ_RESERVATION, mf.WRITE_RESERVATION, mf.REMOVE_RESERVATION):
@@ -3553,8 +4103,23 @@ class ReservationScriptShapeTests(unittest.TestCase):
             self.assertEqual(mf.read_reservation("build-mini-1", "cmux")["state"], "absent")
         argv = run.call_args.args[0]
         self.assertEqual(argv[:8], [mf.SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", "cmux", "build-mini-1"])
-        self.assertTrue(argv[8].startswith("/bin/bash -c "))
-        self.assertTrue(argv[8].endswith(" glaeda " + mf.FLEET_ROOT))
+        self.assertTrue(argv[8].startswith("( /bin/bash -c "))
+        self.assertIn(" glaeda " + mf.FLEET_ROOT, argv[8])
+        self.assertIn("__GLAEDA_REMOTE_STATUS__", argv[8])
+
+
+class RemoteStatusTests(unittest.TestCase):
+    def test_remote_status_overrides_a_transport_zero(self) -> None:
+        output = b"remote output\n__GLAEDA_REMOTE_STATUS__:7\n"
+        self.assertEqual(mf.remote_result(output, 0), (7, b"remote output"))
+
+    def test_ssh_stream_adds_a_remote_status_receipt(self) -> None:
+        with mock.patch.object(mf, "run_remote_logged", return_value=0) as run:
+            self.assertEqual(mf.ssh_stream("host", "user", "false", None), 0)
+        command = run.call_args.args[0][-1]
+        self.assertIn("( false", command)
+        self.assertIn("_glaeda_remote_status=$?", command)
+        self.assertTrue(command.endswith("; exit 0"))
 
 
 if __name__ == "__main__":

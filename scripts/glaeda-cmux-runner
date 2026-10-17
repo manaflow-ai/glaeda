@@ -22,6 +22,11 @@ What --apply does, all under $HOME and owned by the current user (no sudo):
     4. writes and loads ~/Library/LaunchAgents/com.teamleaderleo.glaeda.cmux-runner.plist
     5. confirms the registration through the GitHub API
 
+Headless fleet members can pass --headless. That explicit mode installs a
+system LaunchDaemon as the current user through passwordless sudo, with
+UserName set to the runner account. It is intended for EC2 Macs where a
+per-user LaunchAgent has no GUI domain.
+
 The one-time registration token comes from `gh api -X POST .../registration-token` on stdout.
 It is never placed in any argv, written to disk, or printed. It reaches config.sh only through
 ACTIONS_RUNNER_INPUT_TOKEN in that one child's environment, which the runner reads and clears.
@@ -117,6 +122,9 @@ DARWIN_REQUIRED = True
 RUN_TIMEOUT = 60
 CURL = "/usr/bin/curl"
 LAUNCHCTL = "/bin/launchctl"
+SUDO = "/usr/bin/sudo"
+SYSTEM_DAEMON_DIR = Path("/Library/LaunchDaemons")
+SYSTEM_HELPER = Path("/usr/local/sbin/glaeda-headless-supervise")
 ONLINE_WAIT_S = 90
 WORKLOAD_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 PUBLIC_API = "https://api.github.com/"
@@ -251,12 +259,16 @@ class Context:
         # A fake HOME (tests, rehearsals) must never reach the real launchd session.
         self.sandbox = os.path.realpath(self.home) != os.path.realpath(real_home)
         self.skip_launchctl = args.skip_launchctl or self.sandbox
+        # Never let a fake HOME used by tests or rehearsals reach the real system
+        # LaunchDaemon path, even when --headless was passed.
+        self.headless = bool(args.headless) and not self.sandbox
         self.apply = args.apply
         self.org = args.org
         self.repo = None if args.org else (args.repo or DEFAULT_REPO)
         self.instance = args.instance or 0
         self.gui_runner = bool(args.gui_runner)  # the member's gui runner (or an explicitly managed guest runner)
         self.gui_token = args.gui_token
+        self.fast_runner = False  # the member's fast runner (fastRunners 1: the last instance, the fast pool label)
         # Instance 0 keeps the original paths; instance K adds -K (dirs, logs, name) or .K (launchd label).
         self.suffix = f"-{self.instance}" if self.instance else ""
         self.label = f"{LABEL}.{self.instance}" if self.instance else LABEL
@@ -290,6 +302,7 @@ class Context:
             self.state = self.state / f"instance-{self.instance}"
         self.receipt_path = self.state / "receipt.json"
         self.plist_path = self.agents / f"{self.label}.plist"
+        self.service_plist_path = (SYSTEM_DAEMON_DIR / f"{self.label}.plist") if self.headless else self.plist_path
         self.log_path = self.logs / f"glaeda-cmux-runner{self.suffix}.log"
         self.token_stdin = args.token_stdin
         self.stdin_token: str | None = None  # set by main() from stdin; used once, never stored
@@ -346,6 +359,13 @@ def ios_sim_present(apps: list[dict[str, Any]], builds: list[str]) -> bool | Non
     return all(b in have for b in builds)
 
 
+def macos_major() -> str | None:
+    """This host's macOS major version from sw_vers (27.0.1 -> "27"); None when sw_vers gives no usable answer."""
+    code, out = run(["/usr/bin/sw_vers", "-productVersion"])
+    found = re.fullmatch(r"([1-9][0-9]*)(\.[0-9]+)*", out.strip()) if code == 0 else None
+    return found.group(1) if found else None
+
+
 def fleet_labels() -> Any:
     """The shared label rule, loaded from beside this script only when --manifest asks for it."""
     path = SCRIPT_DIR / LABELS_MODULE
@@ -359,8 +379,8 @@ def fleet_labels() -> Any:
 def member_labels(manifest: Any, member: str, prior_labels: list[str] | None = None
                   ) -> tuple[dict[str, Any] | None, str | None]:
     """(member summary with labels, None) or (None, why this member cannot be a runner). Reads only.
-    prior_labels: what this runner registered with, so a simctl hiccup keeps the iOS label instead of
-    re-registering the runner without it."""
+    prior_labels: what this runner registered with, so a simctl or sw_vers hiccup keeps the iOS or macOS label
+    instead of re-registering the runner without it."""
     try:
         rule = fleet_labels()
     except Exception as error:  # noqa: BLE001  (missing, broken or stale module: explain, never a traceback)
@@ -368,7 +388,13 @@ def member_labels(manifest: Any, member: str, prior_labels: list[str] | None = N
     def ios_sim_ok(apps: list[dict[str, Any]], builds: list[str]) -> bool:
         found = ios_sim_present(apps, builds)
         return found if found is not None else getattr(rule, "IOS_SIM_LABEL", "glaeda-ios-sim") in (prior_labels or [])
-    return rule.member_labels(manifest, member, lambda app: xcode_present(app), ios_sim_ok)
+    if not hasattr(rule, "macos_label"):  # an older label module beside this script: no OS label, no traceback
+        return rule.member_labels(manifest, member, lambda app: xcode_present(app), ios_sim_ok)
+    major = macos_major()
+    if major is None:
+        prefix = rule.MACOS_LABEL_PREFIX
+        major = next((label[len(prefix):] for label in prior_labels or [] if label.startswith(prefix)), None)
+    return rule.member_labels(manifest, member, lambda app: xcode_present(app), ios_sim_ok, macos_major=major)
 
 
 def load_receipt(ctx: Context) -> dict[str, Any] | None:
@@ -469,6 +495,8 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         if ctx.member.get("trustedRef"):  # this mini holds a secret: only jobs on that branch, never PR code
             scope += (f" --trusted-ref {shlex.quote(ctx.member['trustedRef'])}"
                       f" --trusted-repo {shlex.quote(ctx.member['trustedRepo'])}")
+            if ctx.member.get("trustedNextNightly"):
+                scope += " --trusted-next-nightly"
         else:  # PR runners: an unlocked test keychain (the login keychain is locked in the runner session)
             scope += " --test-keychain"
             # and a fresh testmanagerd for each job that takes the gui token (a wedged one hangs every XCTest run)
@@ -488,6 +516,8 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         if getattr(ctx, "gui_runner", False):  # the listener gate holds it while the gui token or every root is taken
             scope += " --gui-runner"
             scope += f" --gui-token {shlex.quote(gui_token)}"
+        if getattr(ctx, "fast_runner", False):  # fast-tier takes the fast tokens; the gate holds it while they are taken
+            scope += " --fast-runner"
     started = (
         "#!/bin/bash\n"
         "# glaeda-cmux-runner job-started hook (generated, receipt-owned). A non-zero exit fails the job\n"
@@ -572,14 +602,24 @@ def agent_plist(ctx: Context) -> dict[str, Any]:
     # Exactly cmux's workload PATH (cmux_fleet_bootstrap CMUX_WORKLOAD_TOOL_PATH): a tool under the
     # user's home, such as an old ~/.local/bin/zig, must never shadow the one the class accepted.
     path = WORKLOAD_PATH
-    return {
+    if ctx.headless:
+        # A system daemon survives a reboot without a GUI login. The helper waits for a
+        # listener left by an in-flight apply, then hands the registration to listen.sh.
+        program = [os.fspath(SYSTEM_HELPER), os.fspath(ctx.runner_dir)]
+    else:
+        program = [os.fspath(ctx.hook_dir / "listen.sh")]
+    plist = {
         "Label": ctx.label,
         # run.sh under the hook's listener gate (listen.sh): an idle runner stops listening while a fleet
         # build holds or waits for the host, so GitHub routes its jobs elsewhere instead of here to be refused.
-        "ProgramArguments": [os.fspath(ctx.hook_dir / "listen.sh")],
+        "ProgramArguments": program,
         "WorkingDirectory": os.fspath(ctx.runner_dir),
         "RunAtLoad": True,
-        "KeepAlive": {"SuccessfulExit": False},
+        # A GitHub session cancellation is a clean Runner.Listener exit (status 0), but the
+        # runner must still reconnect.  Keep the LaunchAgent alive for both clean and failed
+        # exits; launchd's throttle prevents a broken install from spinning.
+        "KeepAlive": True,
+        "ThrottleInterval": 10,
         "ProcessType": "Interactive",
         "SessionCreate": True,
         "EnvironmentVariables": {
@@ -590,6 +630,9 @@ def agent_plist(ctx: Context) -> dict[str, Any]:
         "StandardOutPath": os.fspath(ctx.log_path),
         "StandardErrorPath": os.fspath(ctx.logs / f"glaeda-cmux-runner{ctx.suffix}.err"),
     }
+    if ctx.headless:
+        plist["UserName"] = pwd.getpwuid(ctx.uid).pw_name
+    return plist
 
 
 def hook_sources() -> dict[str, tuple[bytes, int]]:
@@ -603,7 +646,7 @@ def desired_files(ctx: Context) -> dict[Path, tuple[bytes, int]]:
     files = {ctx.hook_dir / name: source for name, source in hook_sources().items()}
     for name, data in hook_wrappers(ctx).items():
         files[ctx.hook_dir / name] = (data, 0o755)
-    files[ctx.plist_path] = (plistlib.dumps(agent_plist(ctx), sort_keys=True), 0o644)
+    files[ctx.service_plist_path] = (plistlib.dumps(agent_plist(ctx), sort_keys=True), 0o644)
     return files
 
 
@@ -624,7 +667,8 @@ def owned_dir(ctx: Context, receipt: dict[str, Any] | None) -> bool:
 def launchctl_loaded(ctx: Context) -> bool | None:
     if ctx.skip_launchctl:
         return None
-    return run([LAUNCHCTL, "print", f"gui/{ctx.uid}/{ctx.label}"])[0] == 0
+    domain = f"system/{ctx.label}" if ctx.headless else f"gui/{ctx.uid}/{ctx.label}"
+    return run([LAUNCHCTL, "print", domain])[0] == 0
 
 
 def held_marker(ctx: Context) -> Path:
@@ -636,7 +680,8 @@ def launchctl_disabled(ctx: Context) -> bool | None:
     """launchd's disabled override for this label (bootstrap refuses a disabled service with error 5)."""
     if ctx.skip_launchctl:
         return None
-    code, out = run([LAUNCHCTL, "print-disabled", f"gui/{ctx.uid}"])
+    domain = "system" if ctx.headless else f"gui/{ctx.uid}"
+    code, out = run([LAUNCHCTL, "print-disabled", domain])
     if code != 0:
         return None
     found = re.search(r'"' + re.escape(ctx.label) + r'"\s*=>\s*(\w+)', out)
@@ -649,14 +694,16 @@ def start_agent(ctx: Context, act: dict[str, Any], plist: str) -> str | None:
     Callers never start a runner that runner_hold marked held, so a disabled label here is one nothing
     means to keep stopped (a hand `launchctl disable`, or a hold whose mark is gone)."""
     ctx.log_offset = ctx.log_path.stat().st_size if ctx.log_path.is_file() else 0
+    domain = f"system/{ctx.label}" if ctx.headless else f"gui/{ctx.uid}/{ctx.label}"
+    launcher = [SUDO, LAUNCHCTL] if ctx.headless else [LAUNCHCTL]
     if launchctl_disabled(ctx):
-        code, out = run([LAUNCHCTL, "enable", f"gui/{ctx.uid}/{ctx.label}"])
+        code, out = run([*launcher, "enable", domain])
         act["wasDisabled"], act["enabled"] = True, code == 0
         ctx.enabled_label = code == 0  # the agent step records it too when a relabel started the runner
         if code != 0:
             act["bootstrapped"] = False
             return "launchctl enable failed: " + out
-    code, out = run([LAUNCHCTL, "bootstrap", f"gui/{ctx.uid}", plist])
+    code, out = run([*launcher, "bootstrap", "system" if ctx.headless else f"gui/{ctx.uid}", plist])
     act["bootstrapped"] = code == 0
     return None if code == 0 else "launchctl bootstrap failed: " + out
 
@@ -839,17 +886,38 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
            "ephemeral": False}
     registered = ((receipt or {}).get("registration") or {}) if ours else {}
     had = registered.get("labels")
+    github_listed = github_found = None
+    if ours and configured and ctx.gh is not None:
+        # A local receipt records what this copy last requested, not what GitHub currently
+        # holds.  Read the registration once and use that observation for reconciliation.
+        github_listed, github_found = lookup_runner(ctx)
     # This install registered that name before and lost its local .runner (an interrupted relabel):
     # registering again replaces its own server-side entry instead of colliding with it.
     own_name = bool(ours and not configured and registered.get("owned") and registered.get("name") == ctx.name)
-    if ours and configured and ctx.labels_requested and had is not None and sorted(had) != sorted(ctx.labels):
-        # GitHub fixes labels at registration, and the labels API needs an admin token the mini does
-        # not hold, so relabelling re-registers this same runner in place with --replace.
-        reg.update(state="relabel", previousLabels=had)
-        if ctx.gh is None and not ctx.token_stdin:
-            reg.update(state="blocked", note="labels changed; pipe a registration token to --token-stdin to re-register")
-        elif runner_busy(ctx):
-            reg.update(state="blocked", note="the runner is running a job; re-run when it is idle")
+    if ours and configured and ctx.labels_requested:
+        if github_listed and github_found is not None:
+            actual = github_found.get("labels") or []
+            if sorted(actual) != sorted(ctx.labels):
+                # GitHub fixes labels at registration, and the labels API needs an admin token the mini does
+                # not hold, so relabelling re-registers this same runner in place with --replace.
+                reg.update(state="relabel", previousLabels=actual)
+                if runner_busy(ctx):
+                    reg.update(state="blocked", note="the runner is running a job; re-run when it is idle")
+            else:
+                reg.update(state="unchanged")
+        elif github_listed and github_found is None:
+            reg.update(state="blocked", note=f"GitHub does not list runner {ctx.name}; refusing to replace an unknown registration")
+        elif ctx.apply and ctx.token_stdin:
+            # An operator supplied a fresh registration token for apply.  If the read-only
+            # lookup is unavailable, let the same-name --replace repair proceed, but never
+            # claim the receipt proves the current server-side labels.
+            reg.update(state="relabel", previousLabels=had or [],
+                       note="GitHub labels could not be read; re-registering with the supplied token")
+            if runner_busy(ctx):
+                reg.update(state="blocked", note="the runner is running a job; re-run when it is idle")
+        else:
+            reg.update(state="blocked", note="could not read GitHub labels; receipt labels are not authoritative; "
+                       "re-run with GitHub access or --apply --token-stdin")
     elif ours and configured:
         reg.update(state="unchanged")
     elif ctx.gh is None and not ctx.token_stdin:
@@ -875,10 +943,8 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
     drifts = []
     if ours and configured and had is not None:
         drifts.append(label_drift("receipt", had, ctx.labels))
-        if ctx.gh is not None:  # what GitHub holds, which a hand edit or a lost receipt can make differ
-            listed, found = lookup_runner(ctx)
-            if listed and found is not None:
-                drifts.append(label_drift("github", found.get("labels") or [], ctx.labels))
+        if github_listed and github_found is not None:  # what GitHub holds, which a hand edit or a lost receipt can make differ
+            drifts.append(label_drift("github", github_found.get("labels") or [], ctx.labels))
     if any(drifts):
         reg["drift"] = [d for d in drifts if d]
         if reg["state"] == "unchanged":
@@ -889,7 +955,7 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
     prior = {a.get("path"): a.get("ownedSha256") for a in (receipt or {}).get("actions", [])
              if a.get("kind") in {"hook", "agent"} and a.get("owned")}
     for path, (data, mode) in desired_files(ctx).items():
-        kind = "agent" if path == ctx.plist_path else "hook"
+        kind = "agent" if path == ctx.service_plist_path else "hook"
         current, want = sha256_file(path), sha256_bytes(data)
         if current is None:
             state = "create"
@@ -926,8 +992,8 @@ def plan_uninstall(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[st
                  "note": f"no install receipt at {ctx.show(ctx.receipt_path)}; nothing is removed"}]
     owned = {a.get("path"): a.get("ownedSha256") for a in receipt.get("actions", [])
              if a.get("kind") in {"hook", "agent"} and a.get("owned")}
-    plist = os.fspath(ctx.plist_path)
-    current = sha256_file(ctx.plist_path)
+    plist = os.fspath(ctx.service_plist_path)
+    current = sha256_file(ctx.service_plist_path)
     if current is None:
         state, note = "absent", ""
     elif owned.get(plist) == current:
@@ -1045,22 +1111,72 @@ def relabel(ctx: Context, act: dict[str, Any]) -> None:
                         "fresh token (it re-registers the same name with --replace)")
         return
     if not ctx.skip_launchctl and not held_marker(ctx).is_file():  # a held runner stays stopped
-        why = start_agent(ctx, act, os.fspath(ctx.plist_path))
+        why = start_agent(ctx, act, os.fspath(ctx.service_plist_path))
         ctx.agent_started = why is None  # the agent step must not bootstrap it a second time
         if why:
             act["state"], act["note"] = "failed", ("re-registered, but " + why)[:400]
 
 
 def bootout(ctx: Context, wait_s: float = 5.0) -> None:
-    run([LAUNCHCTL, "bootout", f"gui/{ctx.uid}/{ctx.label}"])
+    domain = f"system/{ctx.label}" if ctx.headless else f"gui/{ctx.uid}/{ctx.label}"
+    run([SUDO, LAUNCHCTL, "bootout", domain] if ctx.headless else [LAUNCHCTL, "bootout", domain])
     deadline = time.monotonic() + wait_s
-    while time.monotonic() < deadline and run([LAUNCHCTL, "print", f"gui/{ctx.uid}/{ctx.label}"])[0] == 0:
+    while time.monotonic() < deadline and run(([SUDO, LAUNCHCTL, "print", domain] if ctx.headless
+                                               else [LAUNCHCTL, "print", domain]))[0] == 0:
         time.sleep(0.25)
+
+
+def install_service_file(ctx: Context, path: Path, data: bytes, mode: int) -> None:
+    """Install a system plist atomically through the host's explicit sudo boundary."""
+    if not ctx.headless:
+        write_atomic(path, data, mode)
+        return
+    with tempfile.NamedTemporaryFile(prefix="glaeda-runner-", suffix=".plist", delete=False) as tmp:
+        tmp.write(data)
+        tmp.flush()
+        os.fchmod(tmp.fileno(), mode)
+        staged = Path(tmp.name)
+    try:
+        code, out = run([SUDO, "/usr/bin/install", "-o", "root", "-g", "wheel", "-m", oct(mode)[2:],
+                         os.fspath(staged), os.fspath(path)])
+        if code != 0:
+            raise OSError(out or f"sudo install exited {code}")
+    finally:
+        staged.unlink(missing_ok=True)
+
+
+def ensure_headless_helper(ctx: Context) -> None:
+    if not ctx.headless:
+        return
+    helper = b"#!/bin/sh\nset -eu\nrunner=\"$1\"\nwhile /usr/bin/pgrep -f \"$runner/bin/Runner.Listener\" >/dev/null 2>&1 || /usr/bin/pgrep -f \"$runner/glaeda-hooks/listen.sh\" >/dev/null 2>&1; do\n  /bin/sleep 15\ndone\nexec \"$runner/glaeda-hooks/listen.sh\"\n"
+    with tempfile.NamedTemporaryFile(prefix="glaeda-supervise-", delete=False) as tmp:
+        tmp.write(helper)
+        tmp.flush()
+        os.fchmod(tmp.fileno(), 0o755)
+        staged = Path(tmp.name)
+    try:
+        code, out = run([SUDO, "/bin/mkdir", "-p", os.fspath(SYSTEM_HELPER.parent)])
+        if code != 0:
+            raise OSError(out or f"sudo mkdir exited {code}")
+        code, out = run([SUDO, "/usr/bin/install", "-o", "root", "-g", "wheel", "-m", "755",
+                         os.fspath(staged), os.fspath(SYSTEM_HELPER)])
+        if code != 0:
+            raise OSError(out or f"sudo install exited {code}")
+    finally:
+        staged.unlink(missing_ok=True)
 
 
 def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict[str, Any]) -> None:
     # A plan with any blocked step applies nothing, so a half-installed runner never exists.
     failed = any(a["state"] == "blocked" for a in actions)
+    if ctx.headless and not failed and not ctx.skip_launchctl:
+        try:
+            ensure_headless_helper(ctx)
+        except OSError as error:
+            failed = True
+            for act in actions:
+                if act["kind"] == "agent" and act["state"] in {"create", "update", "unchanged"}:
+                    act["state"], act["note"] = "failed", f"headless supervisor install failed: {error}"[:400]
     for act in actions:
         act.setdefault("applied", False)
         if failed:
@@ -1102,7 +1218,10 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
             if kind == "agent" and (act.get("loaded") or getattr(ctx, "agent_started", False)):
                 bootout(ctx)  # loaded at plan time, or started since by a relabel
                 act["loaded"] = ctx.agent_started = False
-            write_atomic(Path(act["path"]), data, mode)
+            if kind == "agent":
+                install_service_file(ctx, Path(act["path"]), data, mode)
+            else:
+                write_atomic(Path(act["path"]), data, mode)
             act["applied"] = act["owned"] = True
             act["ownedSha256"] = act["sha256"]
         if kind == "agent" and hasattr(ctx, "agent_started") and not act.get("applied"):
@@ -1231,7 +1350,13 @@ def apply_uninstall(ctx: Context, actions: list[dict[str, Any]]) -> None:
         if act["kind"] == "agent":
             if not ctx.skip_launchctl:
                 bootout(ctx)
-            Path(act["path"]).unlink()
+            if ctx.headless:
+                code, out = run([SUDO, "/bin/rm", "-f", act["path"]])
+                if code != 0:
+                    act["state"], act["note"] = "failed", f"sudo remove failed: {out[-300:]}"
+                    continue
+            else:
+                Path(act["path"]).unlink()
             act["applied"] = True
             if held_marker(ctx).is_file():  # a later install of this directory must not start out held
                 held_marker(ctx).unlink()
@@ -1611,6 +1736,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--xcode-app", help="check the Xcode that routed jobs select (the value of the repo's "
                    "CMUX_CI_XCODE_APP_PR variable, such as /Applications/Xcode_26.6.app); a warning, never a block")
     p.add_argument("--skip-launchctl", action="store_true", help="write the plist but do not load or unload it")
+    p.add_argument("--headless", action="store_true",
+                   help="install a system LaunchDaemon as the runner user (for GUI-less hosts; requires passwordless sudo)")
     p.add_argument("--allow-stale", action="store_true",
                    help="apply from a copy older than the installed OTA release (default: that blocks)")
     p.add_argument("--refresh-hooks", action="store_true",
@@ -1679,17 +1806,15 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         if not args.capacity_units:
             ctx.capacity_units = int(member.get("capacityUnits") or 0)
-        runners_n = int(member.get("runners") or 1)
-        # the last instance is the gui runner when guiRunners is 1: only the gui pool label, no root or side one
-        ctx.gui_runner = ctx.instance >= runners_n - int(member.get("guiRunners") or 0)
-        is_root = ctx.instance < int(member.get("canonicalRoots") or 1) and not ctx.gui_runner
-        roots = (member.get("guiPools", []) if ctx.gui_runner
+        ctx.fast_runner, ctx.gui_runner = member_roles(member, ctx.instance)
+        is_root = ctx.instance < int(member.get("canonicalRoots") or 1) and not ctx.gui_runner and not ctx.fast_runner
+        roots = (member.get("fastPools", []) if ctx.fast_runner else member.get("guiPools", []) if ctx.gui_runner
                  else member.get("rootPools", []) if is_root else member.get("sidePools", []))
-        # The gui runner leaves out the pool and iOS simulator labels: a pool-label or iOS job must never take
-        # the one runner a mini's GUI jobs wait for, and the picker's live count of the pool's runners stays
-        # the root and side runners it can route to.
+        # The gui and fast runners leave out the pool and iOS simulator labels: a pool-label or iOS job must never
+        # take the one runner a mini's GUI (or fast-tier) jobs wait for, and the picker's live count of the pool's
+        # runners stays the root and side runners it can route to.
         own = ([label for label in member["labels"] if label not in member.get("pools", []) and label != IOS_SIM_JOB_LABEL]
-               if ctx.gui_runner else member["labels"])
+               if ctx.gui_runner or ctx.fast_runner else member["labels"])
         ctx.labels = list(dict.fromkeys([*BASE_LABELS, *own, *roots]))
         ctx.labels_requested = True
         if not args.name:
@@ -1712,8 +1837,23 @@ def main(argv: list[str] | None = None) -> int:
         return install_or_uninstall(ctx, args, raw_argv)
 
 
+def member_roles(member: dict[str, Any], instance: int) -> tuple[bool, bool]:
+    """(fast runner, gui runner) for this instance of a member. The last instance is the fast runner when
+    fastRunners is 1, and the gui runner (guiRunners 1) is the last one before it: each carries only its own pool
+    label, no root or side one."""
+    runners_n = int(member.get("runners") or 1)
+    fast_n, gui_n = int(member.get("fastRunners") or 0), int(member.get("guiRunners") or 0)
+    fast = fast_n > 0 and instance >= runners_n - fast_n
+    return fast, gui_n > 0 and not fast and instance >= runners_n - fast_n - gui_n
+
+
 def install_or_uninstall(ctx: Context, args: argparse.Namespace, raw_argv: list[str]) -> int:
     prior = load_receipt(ctx)
+    if isinstance(prior, dict) and prior.get("headless") and not ctx.sandbox:
+        # Uninstall and plain re-apply must address the same system service even
+        # when the operator omits --headless on the follow-up command.
+        ctx.headless = True
+        ctx.service_plist_path = SYSTEM_DAEMON_DIR / f"{ctx.label}.plist"
     if args.uninstall and prior:
         # Uninstall acts only on what the receipt recorded; flags cannot point it elsewhere.
         if prior.get("runnerDir"):
@@ -1734,6 +1874,8 @@ def install_or_uninstall(ctx: Context, args: argparse.Namespace, raw_argv: list[
                 ctx.org, ctx.repo = (None, f"{scope[1]}/{scope[2]}") if scope[2] else (scope[1], None)
             elif local:
                 ctx.unreadable_registration = True
+        if ctx.headless:
+            ctx.service_plist_path = SYSTEM_DAEMON_DIR / f"{ctx.label}.plist"
     if not args.uninstall and owned_dir(ctx, prior):
         registered = (prior or {}).get("registration") or {}
         kept = (prior or {}).get("member")
@@ -1744,6 +1886,9 @@ def install_or_uninstall(ctx: Context, args: argparse.Namespace, raw_argv: list[
                 ctx.capacity_units = int(kept.get("capacityUnits") or 0)
             if not args.min_free_gib:
                 ctx.min_free_gib = float(kept.get("minFreeGib") or 0)
+            # and its role: the fast runner's and the gui runner's hooks stay theirs
+            fast, gui = member_roles(kept, ctx.instance)
+            ctx.fast_runner, ctx.gui_runner = fast, not fast and (ctx.gui_runner or gui)
         # a re-run that names nothing keeps what this install registered, not the hostname default
         if not ctx.labels_requested and isinstance(registered.get("labels"), list) and registered["labels"]:
             ctx.labels = registered["labels"]
@@ -1763,6 +1908,7 @@ def install_or_uninstall(ctx: Context, args: argparse.Namespace, raw_argv: list[
         "applied": args.apply,
         "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
         "sandboxHome": ctx.sandbox,
+        "headless": ctx.headless,
         "runnerDir": os.fspath(ctx.runner_dir),
         "installId": (prior or {}).get("installId") if owned_dir(ctx, prior) else secrets.token_hex(16),
         "runnerDirOwned": owned_dir(ctx, prior),

@@ -106,6 +106,18 @@ class StateTests(unittest.TestCase):
         self.assertEqual(doc["pools"][LIGHT]["idle"], 2)
         self.assertEqual((std["class"], std["xcode"], std["rank"]), ("std", "26.6", 0))
 
+    def test_resource_summary_is_carried_without_host_identity(self):
+        resource = {"cpuCores": 42, "capacityUnits": 15, "compileSlots": 6,
+                    "canonicalRoots": 6, "guiRunners": 3, "simulatorHosts": 3}
+        pools = pools_doc(std={"declared": ["m1", "m2", "m3"], "conforming": ["m1", "m2", "m3"],
+                           "resource": resource})
+        doc = state(pools=pools)
+        self.assertEqual(doc["pools"][STD]["resource"], resource)
+        self.assertTrue(gr.validate_state(doc, now=NOW, repo=REPO)[0])
+        text = json.dumps(doc)
+        for name in ("m1", "m2", "m3"):
+            self.assertNotIn(f'"{name}', text)
+
     def test_no_host_names_leave_the_document(self):
         text = json.dumps(state())
         for name in ("m1", "m2", "l1", "tart"):
@@ -183,6 +195,13 @@ class ValidateTests(unittest.TestCase):
             if "order" in bad and isinstance(bad.get("pools"), dict) and "blacksmith-6vcpu-macos-26" in bad["pools"]:
                 bad["order"] = sorted(bad["pools"])
             self.assertFalse(self.check(bad)[0], bad)
+
+        bad = state(pools=pools_doc(std={"declared": ["m1"], "conforming": ["m1"],
+                                        "resource": {"cpuCores": 14, "capacityUnits": 4,
+                                                      "compileSlots": 1, "canonicalRoots": 1,
+                                                      "guiRunners": 0, "simulatorHosts": 0}}))
+        bad["pools"][STD]["resource"]["cpuCores"] = -1
+        self.assertFalse(self.check(bad)[0])
 
     def test_check_command_exit_codes(self):
         with tempfile.TemporaryDirectory() as tmp:

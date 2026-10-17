@@ -2,17 +2,23 @@ name: Verify
 
 on:
   pull_request:
-    paths-ignore:
-      - "docs/**"
-      - "**/*.md"
   push:
     branches: [main]
     paths-ignore:
       - "docs/**"
       - "**/*.md"
 
+# Keep pull requests active for documentation-only changes so the required
+# `ci-status` check is reported. Main pushes retain the path filter because
+# synchronization already verifies the changed executable surfaces.
+
 permissions:
   contents: read
+
+# manaflow-ai/glaeda, the fleet fork, runs this workflow for pull requests only. Its main is moved by
+# sync-main.yml in teamleaderleo/glaeda, and a push there must not run a second copy of every check:
+# the commit was verified as a pull request on one side and is verified on push here. The jobs that
+# need no other job carry the gate; the rest are skipped with them.
 
 concurrency:
   group: verify-${{ github.workflow }}-${{ github.ref }}
@@ -22,14 +28,18 @@ jobs:
   # Most pull requests change only Python and shell under scripts/, which the Rust and Go jobs cannot judge: of 60
   # recent PRs, 48 touched nothing they read, and each still spent about 295 runner-seconds on lint, test, cli and go.
   # Those jobs now run for a pull request only when it changes something they read. A script counts as Rust input
-  # when src/, tests/ or the cli job names it (scripts/bootstrap, for one). Pushes to main run everything, and
-  # scripts and runner-tests always run, since several script tests drive cargo.
+  # when src/, tests/ or the cli job names it (scripts/bootstrap, for one). Pushes to main run everything.
+  # scripts and runner-tests run for any pull request that changes more than Markdown no script names, since several
+  # script tests drive cargo and some read docs (docs/CMUX_MINI_RUNNER.md, for one).
   changes:
+    if: ${{ github.event_name == 'pull_request' || github.repository == 'teamleaderleo/glaeda' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       rust: ${{ steps.scope.outputs.rust }}
       go: ${{ steps.scope.outputs.go }}
+      fleet_cas: ${{ steps.scope.outputs.fleet_cas }}
+      code: ${{ steps.scope.outputs.code }}
 
     steps:
       - name: Check out repository
@@ -46,11 +56,13 @@ jobs:
           EVENT: ${{ github.event_name }}
         run: |
           if test "$EVENT" != pull_request; then
-            printf 'rust=true\ngo=true\n' >> "$GITHUB_OUTPUT"
+            printf 'rust=true\ngo=true\nfleet_cas=false\ncode=true\n' >> "$GITHUB_OUTPUT"
             exit 0
           fi
           rust=false
           go=false
+          fleet_cas=false
+          code=false
           # Scripts that Rust tests run: the modules they load are Rust input too (fleet_bundle.py through
           # scripts/test-fleet-bundle.py, for one).
           rust_named=$(grep -rhoE 'scripts/[A-Za-z0-9_./-]+' src tests | sort -u | while read -r f; do
@@ -59,10 +71,22 @@ jobs:
           # --no-renames lists a rename's old path too; writing to a file first fails the job, not open, on error.
           git diff --no-renames --name-only HEAD^1 HEAD > "$RUNNER_TEMP/changed"
           while IFS= read -r path; do
+            # Markdown that no script names is the only change scripts and runner-tests cannot judge.
             case "$path" in
+              *.md)
+                if grep -rqF -- "$path" scripts; then
+                  echo "A script names $path"
+                  code=true
+                fi
+                ;;
+              *) code=true ;;
+            esac
+            case "$path" in
+              tools/fleet-cas-prototype/*) fleet_cas=true; rust=true ;;
+              scripts/fleet_cas_bundle.py|scripts/test-fleet-cas-bundle.py|.github/workflows/release.yml|tools/fleet-cas-prototype/README.md) fleet_cas=true ;;
               docs/MODULE_INVENTORY.md) rust=true ;;
               docs/*|*.md) ;;
-              .github/workflows/ci.yml) rust=true; go=true ;;
+              .github/workflows/ci.yml) fleet_cas=true; rust=true; go=true ;;
               tools/scaleset-bridge/*) go=true ;;
               scripts/bootstrap|scripts/workspace_bootstrap/*) rust=true ;;
               .github/*|.claude/*|skills/*) ;;
@@ -77,7 +101,8 @@ jobs:
               *) rust=true ;;
             esac
           done < "$RUNNER_TEMP/changed"
-          printf 'rust=%s\ngo=%s\n' "$rust" "$go" | tee -a "$GITHUB_OUTPUT"
+          if test "$rust" = true; then code=true; fi
+          printf 'rust=%s\ngo=%s\nfleet_cas=%s\ncode=%s\n' "$rust" "$go" "$fleet_cas" "$code" | tee -a "$GITHUB_OUTPUT"
 
   go:
     needs: changes
@@ -111,6 +136,8 @@ jobs:
 
   # Script syntax and every script test file but the runner's, which runner-tests shards.
   scripts:
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
 
@@ -202,6 +229,8 @@ jobs:
               Path("scripts/test-hot-observe.py"),
               Path("scripts/glaeda-disk"),
               Path("scripts/test-glaeda-disk.py"),
+              Path("scripts/glaeda-runner-hygiene"),
+              Path("scripts/test-glaeda-runner-hygiene.py"),
               Path("scripts/glaeda-procs"),
               Path("scripts/test-glaeda-procs.py"),
               Path("scripts/glaeda-local-guard"),
@@ -211,6 +240,9 @@ jobs:
               Path("scripts/test-glaeda-update.py"),
               Path("scripts/glaeda-fleet-cas-prune"),
               Path("scripts/test-glaeda-fleet-cas-prune.py"),
+              Path("scripts/test-glaeda-fleet-cas.py"),
+              Path("scripts/fleet_cas_bundle.py"),
+              Path("scripts/test-fleet-cas-bundle.py"),
               Path("scripts/glaeda-seed-prefetch"),
               Path("scripts/test-glaeda-seed-prefetch.py"),
               Path("scripts/glaeda-idle-warm"),
@@ -224,6 +256,10 @@ jobs:
               Path("scripts/test-glaeda-lan-fetch.py"),
               Path("scripts/glaeda-gh"),
               Path("scripts/test-glaeda-gh.py"),
+              Path("scripts/glaeda-wallpaper-rotate"),
+              Path("scripts/glaeda-sync-main"),
+              Path("scripts/test-glaeda-sync-main.py"),
+              Path("scripts/test-glaeda-wallpaper-rotate.py"),
               Path("scripts/test-verify.py"),
               Path("scripts/test-verify-changed-rustfmt.py"),
               Path("scripts/test-front-door.py"),
@@ -250,6 +286,12 @@ jobs:
           bash -n scripts/cmux-fleet-bootstrap-macos
           bash -n scripts/cmux-fleet-bootstrap-linux
           bash -n scripts/glaeda-worktree-reclaim-all
+          bash -n scripts/disk-pressure.sh
+          bash -n scripts/glaeda-fleet-cas
+          bash -n tools/fleet-cas-prototype/scripts/fleet-cas-run
+          bash -n tools/fleet-cas-prototype/scripts/fleet-cas-mount
+          bash -n scripts/test-glaeda-fleet-cas.sh
+          bash -n scripts/test-glaeda-fleet-cas-mount.sh
           bash -n scripts/cmux_mini_probe.sh
           bash -n scripts/cmux_mini_preflight.sh
           bash -n scripts/cmux_mini_fix.sh
@@ -263,16 +305,23 @@ jobs:
           python3 scripts/test-glaeda-devbox.py
           python3 scripts/test-glaeda-projects.py
           python3 scripts/test-glaeda-worktree.py
+          python3 scripts/test-glaeda-runner-hygiene.py
           python3 scripts/test-glaeda-procs.py
           python3 scripts/test-glaeda-local-guard.py
           python3 scripts/test-glaeda-update.py
           python3 scripts/test-glaeda-fleet-cas-prune.py
+          python3 scripts/test-glaeda-fleet-cas.py
+          python3 scripts/test-fleet-cas-bundle.py
+          bash scripts/test-glaeda-fleet-cas.sh
+          bash scripts/test-glaeda-fleet-cas-mount.sh
           python3 scripts/test-glaeda-seed-prefetch.py
           python3 scripts/test-glaeda-idle-warm.py
           python3 scripts/test-glaeda-mini-health.py
           python3 scripts/test-glaeda-seed-lan.py
           python3 scripts/test-glaeda-lan-fetch.py
           python3 scripts/test-glaeda-gh.py
+          python3 scripts/test-glaeda-wallpaper-rotate.py
+          python3 scripts/test-glaeda-sync-main.py
           python3 scripts/test-hot-pressure-shadow.py
           python3 scripts/test-hot-run.py
           python3 scripts/test-verify-focused.py
@@ -356,6 +405,8 @@ jobs:
 
   # scripts/test-glaeda-cmux-runner.py took about 300 s of the old single job; its shards run side by side.
   runner-tests:
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     strategy:
@@ -664,11 +715,50 @@ jobs:
             ~/.cargo/git/db
             target
           key: verify-cargo-cli-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-${{ hashFiles('Cargo.lock') }}
+  fleet-cas-build:
+    name: fleet-cas-build (${{ matrix.target }})
+    needs: changes
+    if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.fleet_cas == 'true' }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+          show-progress: false
+      - name: Install pinned Rust
+        run: rustup toolchain install 1.97.1 --profile minimal --no-self-update
+      - name: Build and verify fleet-CAS candidate
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          cargo test --locked --manifest-path tools/fleet-cas-prototype/Cargo.toml
+          mkdir -p "$RUNNER_TEMP/fleet-cas"
+          python3 scripts/fleet_cas_bundle.py build \
+            --source "$GITHUB_SHA" --target "$TARGET" \
+            --output "$RUNNER_TEMP/fleet-cas"
+          archive=$(find "$RUNNER_TEMP/fleet-cas" -type f -name '*.tar.gz' -print -quit)
+          test -n "$archive"
+          sha256=$(shasum -a 256 "$archive" | awk '{print $1}')
+          python3 scripts/fleet_cas_bundle.py verify "$archive" \
+            --source "$GITHUB_SHA" --target "$TARGET" --sha256 "$sha256"
 
-  # One check that stands for the whole workflow, under the old single job's name.
-  verify:
-    if: ${{ always() }}
-    needs: [changes, go, scripts, runner-tests, lint, lint-macos, test, cli]
+  # One exact-head check that stands for the whole workflow. Keep this name stable so merge tooling can
+  # require the aggregate without enumerating every conditional job above.
+  ci-status:
+    name: ci-status
+    if: ${{ always() && (github.event_name == 'pull_request' || github.repository == 'teamleaderleo/glaeda') }}
+    needs: [changes, go, scripts, runner-tests, lint, lint-macos, test, cli, fleet-cas-build]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

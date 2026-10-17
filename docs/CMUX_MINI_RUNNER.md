@@ -29,6 +29,13 @@ them back to Blacksmith.
 - Automatic login for the build user (`sysadminctl -autologin status`). The runner is
   a LaunchAgent in that user's GUI session, so it starts again after a reboot only
   when the user logs in automatically.
+- A GUI-less EC2 Mac uses the system domain instead: pass `--headless` (the fleet
+  command adds it automatically for manifest members with `gui: false`). The apply
+  path installs a root-owned supervisor and a `UserName` LaunchDaemon, so listeners
+  return after reboot without a GUI login. This requires passwordless sudo on the host.
+- Keep maintenance in the same domain: run `scripts/glaeda-mini-setup --hygiene-only
+  --headless --apply`. Without `--headless`, disk pressure, eviction, and OTA update
+  agents are only `gui/$uid` LaunchAgents and do not run on a GUI-less EC2 Mac.
 
 ## 2. One command
 
@@ -44,7 +51,8 @@ Useful flags: `--name NAME` (default `<short hostname>-glaeda`), `--labels a,b` 
 (extra labels), `--org ORG [--group GROUP]` instead of the default
 `--repo manaflow-ai/cmux`, `--runner-dir DIR` (default `~/actions-runner-glaeda`),
 `--runner-version V --runner-sha256 HEX` to pin, `--replace` to take over an existing
-registration with the same name, `--output json` for the receipt.
+registration with the same name, `--headless` for an EC2 system LaunchDaemon, or
+`--output json` for the receipt.
 
 What `--apply` does:
 
@@ -184,13 +192,18 @@ What `--apply` does:
      re-read from the runner's `.roots` file during the job, and `roots_admitted` names the
      admission set when take-root `--switch` changed it. With telemetry off
      (`--no-telemetry`, `GLAEDA_RUNNER_TELEMETRY=0`) no lines are written.
+     A cmux compile admission may also write `RUNNER_TEMP/glaeda-compile-telemetry.json`.
+     When its schema and run identity match, the completed line embeds a bounded `compile`
+     object with cacheable tasks, hits, misses, hit rate, seed distance, compile, fetch and
+     link seconds. Malformed or stale sidecars are ignored and removed by the job.
    - job-completed stops the sampler (it writes the job's line), releases the host lock
      (or the capacity share), kills orphaned `cmux DEV.app` processes whose executable was
      under a finished runner `_work/_temp/cmux-derived-data-tests-*` directory, runs the same
      disk pressure pass and always exits 0. The two-minute `glaeda-mini-health` agent repeats
      that ownership check when a post-job hook was skipped.
 4. Writes and loads `~/Library/LaunchAgents/com.teamleaderleo.glaeda.cmux-runner.plist`
-   (runs `glaeda-hooks/listen.sh`, restarts on crash, logs to
+   (runs `glaeda-hooks/listen.sh`, restarts after clean or failed listener exits,
+   with launchd's ten-second throttle, and logs to
    `~/Library/Logs/glaeda-cmux-runner.log`). `listen.sh` runs `run.sh` under the listener
    gate (`glaeda-cmux-runner-hook listen`).
    - **Why a gate.** Without it, an idle runner keeps listening while the fleet has the
@@ -241,6 +254,11 @@ What `--apply` does:
        canonical root is taken, or every unit is. Only it carries the gui pool label, so
        holding it keeps no compile off the mini, and GitHub hands the GUI job to another
        mini's gui runner instead.
+     - A fast runner (`--fast-runner`, below) looks only at the two fast tokens
+       (`capacity/fast-0.token`, `fast-1.token`): it stops while either is taken or a job
+       here waits for one, and listens with every shared unit taken. No other runner,
+       `fits` or `admit` counts the fast tokens. The host lock, reservation, drain,
+       saturation and disk holds apply to it as to every runner.
    - **When the console session cannot run GUI tests** (gui runner only). GUI jobs run
      in the console user's session, and a mini whose auto-login session is screen-locked
      (display sleep, then the lock) or sits at the login window fails every one
@@ -250,7 +268,10 @@ What `--apply` does:
      logged in. The same check refuses at job-started any job on the gui runner or of a
      `gui` class (`refused: console: ...`, before any capacity is taken), so cmux's
      rescue re-runs it elsewhere, and makes `take-gui` give way (exit 3), so test-e2e's
-     build leaves its tests to the `test` job. An unreadable state changes nothing;
+     build leaves its tests to the `test` job. A job with no other runner whose own
+     `take-gui` step skips its console steps (`CONSOLE_SKIPPERS`: the cmux-next
+     frame-pacing `bench`) is admitted as `light` instead of refused, so its `take-gui`
+     gives way and the nightly skips rather than fails. An unreadable state changes nothing;
      `GLAEDA_RUNNER_CONSOLE_GATE=0` in the runner LaunchAgent turns it off.
    - **When free disk is under the floor** (every runner). The gate reads the
      `--min-free-gib` of the runner's own job-started hook and `statvfs` on every poll,
@@ -300,6 +321,14 @@ What `--apply` does:
        can still be acknowledged: milliseconds, where the old gap was seconds. The
        acknowledge line exists only while GitHub sets the runner's acknowledge flag.
        An agent stop still cancels a running job but waits out an acquisition.
+     - Nor is a listener in its first poll: for `GATE_FIRST_POLL_S` (30 s,
+       `GLAEDA_RUNNER_GATE_FIRST_POLL_S`) after the gate starts it, a hold waits. GitHub
+       can hand a queued job to a new session before the listener has seen it, so no diag
+       line shows it, and a stop that cancels that poll loses the job: GitHub retries the
+       gone session and fails the job 3 min later with "The job was not acquired by Runner
+       of type self-hosted even after multiple attempts" (cmux14's root runner, 2026-10-12:
+       session at 03:46:41, stopped at 03:46:44). A job that arrives on a full host is
+       refused at job-started in seconds and rescued instead.
      - A listener that hasn't exited after 60 s is killed, unless a job slipped in.
    - **Restarting and logs.** The gate starts `run.sh` again after two free polls. While
      it waits it logs `glaeda-cmux-runner-gate: holding the listener off: <why>`, and
@@ -381,12 +410,20 @@ runner is named `<member>-glaeda` unless `--name` says otherwise:
 | `availability`: `dedicated` or `opportunistic` | `glaeda-<availability>` |
 | each `defaults.xcode.apps` entry (with host `overrides`) that is really installed | `xcode-<version>` |
 | the same, only for `dedicated` members | `glaeda-<class>-xcode-<version>` |
+| the host's macOS major version (`sw_vers -productVersion`, 27.0.1 is 27) | `glaeda-macos-<major>` |
 
 "Really installed" means the path is a real directory, not a symlink, and
 `xcodebuild -version` under it prints exactly that `Build version`. The combined
 `glaeda-<class>-xcode-<version>` label (for example `glaeda-std-xcode-26.6`) is the
 one a pool picker routes a whole run to. Opportunistic members never carry it, so
 they never receive a required job.
+
+`glaeda-macos-<major>` is observed on the mini, not declared, so a fleet that straddles an
+OS upgrade can route a job to one macOS (`runs-on: [glaeda-std-xcode-26.6, glaeda-macos-27]`).
+It is never the bare `macos-<N>`: that is GitHub-hosted vocabulary, and cmux's workflows check
+that a `macos-*` request landed on GitHub-hosted capacity. If `sw_vers` gives no usable answer,
+the runner keeps the OS label it registered with. An upgrade changes the label: re-register
+the runner with a `--manifest` apply, or `fleet runner relabel HOST --apply` from the operator Mac.
 
 The installer refuses a member whose roles lack `ci-runner`, and refuses class `dev`
 (takes no jobs) and `borrowed` (jobs only inside a VM, not through this tool).
@@ -452,7 +489,12 @@ or pass `--name` with the existing name to relabel it in place.
 A manifest class carries a runner count and the capacity units they share
 (defaults: `std` 4 runners and 4 units, `light` 2 and 2, `xl` 8 and 8). Override
 them with `defaults.runner.classes.<class>` `{"runners": N, "capacityUnits": U,
-"compileSlots": C}`, or per host under `overrides.runner.classes.<class>`.
+"compileSlots": C}`, or per host under `overrides.runner.classes.<class>`. A
+dedicated pool can set `runner.poolPrefix` to a lowercase prefix such as
+`aws-`; its pool, root, side, and GUI labels then become
+`glaeda-aws-std-xcode-26.3`, `glaeda-aws-root-std-xcode-26.3`, and their
+corresponding role labels. Keep that namespace in the CI pool allowlist so
+ordinary `glaeda-std-*` jobs cannot select it accidentally.
 `compileSlots` (default 1, at most U/2) is how many compiles run at once, one
 `persistent-dd` token each (`persistent-dd.token`, `persistent-dd-1.token`, ...).
 Raise it only once cmux's compile admission keeps its canonical root and kept
@@ -466,6 +508,30 @@ at once:
     scripts/glaeda-cmux-runner-fleet                 # plan: the gate on every member, read-only
     scripts/glaeda-cmux-runner-fleet --apply --org manaflow-ai --group glaeda-minis --hosts cmux12s-mac-mini
     scripts/glaeda-cmux-runner-fleet --apply --org manaflow-ai --group glaeda-minis   # every instance
+
+Run it from a worktree at origin's `main`. Before anything is staged, the run reads origin's
+`main` with `git ls-remote` (nothing is fetched; an old checkout's own stale `origin/main`
+ref cannot vouch for it) and every target member's `~/glaeda-runner/scripts/.glaeda-source.json`
+over SSH. `--apply` refuses, changing nothing on any member, when HEAD is not origin's `main`
+(or either cannot be read), or when a member's stamped commit is not an ancestor of HEAD: a
+downgrade from an old checkout, or a deploy from a branch HEAD does not contain. It also
+refuses when `git status` shows uncommitted changes to the staged files or to the fleet tool
+itself, or when any of them is marked `--assume-unchanged` or `--skip-worktree` (edits git
+status cannot see), since the stamp names HEAD. The refusal names the member, its stamped commit and HEAD. A member with no stamp, or one
+that cannot be read, is not a downgrade, and the output says so. The plan lists the same
+findings and exits 0. `--allow-downgrade "REASON"` overrides every refusal for a deliberate
+rollback or branch canary; control characters are dropped from the reason, which is printed and
+recorded in every staged stamp as `allowDowngrade` (`reason`, and the refusals it overrode for
+that member). A PR canary deployed that way and then squash-merged is never an ancestor of main,
+and its commit may not exist locally; a stamp carrying `allowDowngrade` therefore does not refuse
+a run whose HEAD is origin's `main`, which reports "rolling forward from a deliberate off-main
+deploy (reason: ...)". That is by design even while the canary's PR is still open and unmerged:
+a run from main replaces the canary, so re-stage it afterwards if it should keep running. The
+stamp names the HEAD the guard checked, never an untracked stamp or `release.json` beside the
+scripts; if the commit's stamp cannot be built, none is written. Running from an OTA release copy, which has no git checkout,
+needs `--allow-downgrade`. A shallow checkout fails closed: an older stamp beyond its history
+reads as not an ancestor, so fetch the full history (`git fetch --unshallow`). Automatic rollout
+on merge is proposed in #1385.
 
 The fleet is registered at org scope (section 2e2), so an apply names that scope. Without
 `--org`, the apply asks for the repository scope, finds each runner's org-scope receipt, and refuses
@@ -536,10 +602,27 @@ Its runners then:
 workflow_dispatch is refused: a dispatched workflow on main can check out any ref from its inputs (cmux's
 app-host-test-rerun takes `refs/pull/N/merge`). pull_request, merge_group and workflow_run are refused too.
 
+`runner.trustedNextNightly: true` is a separate, default-off trust decision for cmux's NEXT nightly.
+It requires a dedicated `manaflow-ai/cmux` trusted main runner with no `dev-builds` role, adds
+`--trusted-next-nightly` to its host hook, and adds the `glaeda-trusted-next-nightly` capability label.
+That label makes the owner relabel plan regenerate the wrapper; OTA hook refresh alone does not
+change wrapper arguments. NEXT routing must require that label as well as the trusted pool and exact
+runner labels. The only additional admission is a push whose environment
+and payload both name `refs/heads/nightly-next`, whose `GITHUB_WORKFLOW_REF` is exactly
+`manaflow-ai/cmux/.github/workflows/nightly.yml@refs/heads/nightly-next`, whose job is
+`build-nightly-app`, and whose run attempt is `1`. Repository and hostile-payload checks still apply.
+Schedules execute the default branch; NEXT promotion reaches this route through the nightly-next
+push. Other NEXT jobs, refs, workflows, dispatches and re-runs remain refused. This does not add a
+PR pool label, signing capability, or permission to restore PR-produced caches or publish shared
+seeds. Keep local NEXT DerivedData and cache lineage separate from main. The cmux workflow must
+retain its ephemeral overflow/rescue path until the merged hook and host eligibility are verified.
+
 What the gate cannot see, and the operator must keep true:
 
 - The trust boundary is whoever can push to main: main's ruleset must block direct pushes, with no
   bypass list, so every commit there is a reviewed merge.
+- Enabling `trustedNextNightly` additionally trusts whoever can update nightly-next and its promoted
+  source. Protect that promotion boundary before activation; the hook does not prove branch protection.
 - Trusted jobs must pin every action and reusable workflow by commit SHA, and must restore only caches
   that trusted runs wrote. A cache namespace that PR runs also write (build seeds, sccache, SwiftPM
   manifest caches) brings PR-produced bytes next to the secret.
@@ -637,6 +720,15 @@ in at the producer's root. So one root job per root per mini:
   `canonicalRoots + guiRunners` is at most `runners`. Admission is unchanged: a GUI job takes 1 unit, the
   gui token (an app-host shard in the step before its restore instead), and the producer's root in its
   restore step.
+- `fastRunners` (0 or 1, default 0) makes the last instance (`runners - 1`) the mini's fast runner; with
+  `guiRunners` 1 too, the gui runner moves to `runners - 2`. It carries the fast pool label
+  `glaeda-fast-<class>-xcode-<version>` and neither the pool, root, side, gui nor `glaeda-ios-sim` label, and its
+  job-started hook passes `--fast-runner`. cmux-next's `fast-tier` job (`cmux-next.yml`) run there is admitted as
+  class `fast`: the two fast tokens and none of the shared capacity units, so it no longer queues behind the side
+  lane (median 38.5 min, p90 73 min before). The same job on a side runner keeps its `isolated` cost (2 shared
+  units), and any other job on the fast runner keeps its own cost and never takes a fast token.
+  `canonicalRoots + guiRunners + fastRunners` is at most `runners`. Turning it on or off changes instance
+  labels, so it needs `glaeda-cmux-runner-fleet --apply` (refused while jobs run), by an operator with org admin.
 - A desktop VM runner is a future, disabled design. It may use the GUI label and a distinct `gui-vm`
   accounting token, but the guest must not receive read-write access to the host capacity ledger. A
   host-side broker, immutable VM ownership receipt, and atomic runner drain are required before any
@@ -1021,8 +1113,13 @@ catch-ups, and holds no capacity unit, root or token, so no admission waits for 
 
 - **Starts** when this user owns an unlocked console, no job holds the gui token or asks for it (a take-gui
   step), no Xcode test and no other cmux DEV app runs, the host has no reservation (someone dogfooding there),
-  and 90 GiB are free. It clones the newest main build a root keeps into `fuzz/builds/<sha>` (APFS `cp -c`, no
-  root token: the copy counts only if the root's stamp is unchanged after it) and exports the fuzzer at that
+  and free disk is at least the runners' floor plus 20 GiB (the manifest's `defaults.disk.job_growth_gib`). The
+  floor is the highest `--min-free-gib` of this mini's job-started hooks, else 30 GiB, the fleet's
+  `defaults.disk.min_free_gib`, so the fuzzer starts at 50 GiB free on today's fleet. While it runs, it stops (as
+  for a gui job) once free disk drops below the floor plus 10 GiB, so it is never why a job is refused for disk.
+  It clones the newest main build a root keeps into
+  `fuzz/builds/<sha>` (APFS `cp -c`, no root token: the copy counts only if the root's stamp is unchanged after
+  it) and exports the fuzzer at that
   commit (`git archive` of `scripts/fuzz` and `dogfood/fuzz` from the catch-up checkout or the seed mirror) into
   `fuzz/engines/<sha>`, since a catch-up may check out a newer main meanwhile. It fuzzes for up to 10 minutes
   and minimizes up to two failures, 26 minutes at most; runs land in `/Users/Shared/cmux-build-fleet/fuzz/runs`.
@@ -1060,6 +1157,7 @@ runners) looks for what stopped runner minis on 2026-09-25 and 26 without anythi
 | `tailscale_probe_error`: the Tailscale CLI gave no BackendState (timeout, error, no JSON) | reported only: the check could not look, so the tunnel is not judged down |
 | `runner_stopped:<agent>`: a runner LaunchAgent loaded but not running, two runs in a row | `launchctl kickstart` (nothing runs in it, so no job is cut) |
 | `runner_unloaded:<agent>` (not one `cmux_mini_fix.sh` holds) | none: `glaeda-cmux-runner-fleet --apply` |
+| `node_ineligible`: the runner hook's eligibility check, for the fleet class its job-started hook requires, refuses (for example the class receipt's staged generation is gone) | none: restage the generation or re-enroll ([enrollment](CMUX_FLEET_ENROLLMENT.md)) |
 
 A heal runs at most every 10 minutes and 3 times a day per finding (a heal that worked but did not last counts),
 then the finding reads `impossible`. The report,

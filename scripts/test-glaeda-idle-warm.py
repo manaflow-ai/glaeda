@@ -493,6 +493,38 @@ class FuzzTest(Base):
             self.fail(f"the fuzzer started no app: {proc.communicate(timeout=10)[0]}")
         return int(pid_files[0].read_text())
 
+    def test_stopping_a_fuzzer_gives_it_a_sigterm_before_escalating(self) -> None:
+        class Child:
+            def __init__(self, wedged: bool = False) -> None:
+                self.events: list[tuple[str, object]] = []
+                self.wedged = wedged
+
+            def send_signal(self, signum: signal.Signals) -> None:
+                self.events.append(("signal", signum))
+
+            def wait(self, timeout: float | None = None) -> None:
+                self.events.append(("wait", timeout))
+                if self.wedged and len([event for event in self.events if event[0] == "wait"]) == 1:
+                    raise subprocess.TimeoutExpired("fuzz", timeout)
+
+            def kill(self) -> None:
+                self.events.append(("kill", None))
+
+        previous = warm._child
+        try:
+            graceful = Child()
+            warm._child = graceful
+            warm.stop_fuzz_child()
+            self.assertEqual(graceful.events, [("signal", signal.SIGTERM), ("wait", warm.FUZZ_STOP_GRACE_S)])
+
+            wedged = Child(wedged=True)
+            warm._child = wedged
+            warm.stop_fuzz_child()
+            self.assertEqual(wedged.events, [("signal", signal.SIGTERM), ("wait", warm.FUZZ_STOP_GRACE_S),
+                                              ("kill", None), ("wait", 1)])
+        finally:
+            warm._child = previous
+
     @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
     def test_fuzzes_a_staged_copy_of_the_main_build_beside_a_compile_at_low_priority(self) -> None:
         self.fuzz_setup()
@@ -595,6 +627,47 @@ class FuzzTest(Base):
         self.assertEqual((result["state"], result["reason"]), ("stopped", "a job holds the gui token"), result)
         self.assertFalse((request / ".done").exists(), "asked again next tick")
         self.assertEqual(warm.pending_replay(), request)
+
+    def test_the_runners_disk_floor_is_theirs_or_the_fleet_default(self) -> None:
+        # The fleet job floor (cmuxterm-hq build-fleet/mini-fleet.json defaults.disk.min_free_gib) is 30 GiB.
+        runners: list[Path] = []
+        self.saved["runner_dirs"] = warm.runner_dirs
+        warm.runner_dirs = lambda: list(runners)
+        self.assertEqual(warm.runner_floor_bytes(hook), 30 * 1024 ** 3, "no runner floor: the fleet default")
+        runners.append(self.runner("actions-runner-glaeda", "--capacity-units 4 --canonical-roots 2"))
+        self.assertEqual(warm.runner_floor_bytes(hook), 30 * 1024 ** 3, "a runner without --min-free-gib")
+        runners.append(self.runner("actions-runner-glaeda-1", "--min-free-gib 30 --capacity-units 4"))
+        self.assertEqual(warm.runner_floor_bytes(hook), 30 * 1024 ** 3)
+        runners.append(self.runner("actions-runner-glaeda-2", "--min-free-gib 45 --capacity-units 4"))
+        self.assertEqual(warm.runner_floor_bytes(hook), 45 * 1024 ** 3, "the highest floor of this mini's runners")
+
+    @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
+    def test_starts_one_job_growth_above_the_30_gib_floor(self) -> None:
+        # Floor + job_growth_gib (20): a fuzz run's clones, traces and engines never leave a job under the floor.
+        self.fuzz_setup()
+        warm.free_bytes = lambda path: 50 * 1024 ** 3
+        result = warm.fuzz(False, self.state)
+        self.assertEqual(result.get("would"), f"fuzz main {self.head[:12]}", result)
+        warm.free_bytes = lambda path: 49 * 1024 ** 3
+        self.assertEqual(warm.fuzz(False, self.state)["reason"],
+                         "49 GiB free, the fuzzer needs 50 (the runners' 30 GiB floor + 20)")
+
+    def test_watch_stops_the_run_when_free_disk_nears_the_floor(self) -> None:
+        free = [45 * 1024 ** 3]
+        warm.free_bytes = lambda path: free[0]
+        self.saved["gui_process"] = warm.gui_process
+        warm.gui_process = lambda ours="": ""
+        self.saved["_child"] = warm._child
+        warm._child = subprocess.Popen(["sleep", "30"])
+        self.addCleanup(warm._child.kill)
+        stub = types.SimpleNamespace(probe=lambda path: True, reservation_refusal=lambda path, now: None)
+        floor = 30 * 1024 ** 3
+        threading.Timer(1.5, lambda: free.__setitem__(0, 39 * 1024 ** 3)).start()
+        started = time.monotonic()
+        code, why = warm.watch(stub, self.capacity, "", 20, stop_below=floor + warm.FUZZ_STOP_HEADROOM_GIB * 1024 ** 3)
+        self.assertIsNone(code)
+        self.assertEqual(why, "39 GiB free, under the runners' 30 GiB floor + 10")
+        self.assertLess(time.monotonic() - started, 10)
 
     @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
     def test_never_beside_a_gui_job_a_reservation_or_without_a_main_build(self) -> None:

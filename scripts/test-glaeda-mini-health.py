@@ -48,6 +48,8 @@ class FakeMini(health.Mini):
         self.did: list[str] = []
         self.leaks: list[tuple[int, str]] = []
         self.disk: dict = {}
+        self.refusal: str | None = None
+        self.toolchain_installs: list[str] = []
 
     def console(self):
         return self.console_state
@@ -106,6 +108,51 @@ class FakeMini(health.Mini):
     def disk_summary(self):
         return self.disk
 
+    def node_refusal(self):
+        return self.refusal
+
+    def install_rust_toolchain(self, toolchain):
+        self.toolchain_installs.append(toolchain)
+        return True, f"installed Rust toolchain {toolchain}"
+
+
+class NodeEligibility(unittest.TestCase):
+    """A node the runner hook finds ineligible refuses every job, so health says so instead of the jobs."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def mini(self, started: str) -> tuple[health.Mini, list[str]]:
+        hooks = self.home / "actions-runner-glaeda" / "glaeda-hooks"
+        hooks.mkdir(parents=True)
+        (hooks / "job-started.sh").write_text("#!/bin/bash\n# generated\n" + started + "\n")
+        asked: list[str] = []
+
+        class Hook:
+            @staticmethod
+            def node_refusal(fleet_class):
+                asked.append(fleet_class)
+                return "node not eligible (no node status from generation 3809eed51fdd)", {}
+
+        mini = health.Mini(self.home)
+        mini._hook = Hook()
+        return mini, asked
+
+    def test_reads_the_fleet_class_the_job_started_hook_requires(self) -> None:
+        mini, asked = self.mini("exec /usr/bin/python3 hook job-started --allowed-owner manaflow-ai "
+                                "--require-eligible --fleet-class m4-16 --toolchain-xcode /Applications/Xcode.app")
+        self.assertEqual(mini.node_refusal(), "node not eligible (no node status from generation 3809eed51fdd)")
+        self.assertEqual(asked, ["m4-16"])
+
+    def test_a_runner_that_does_not_require_eligibility_is_not_checked(self) -> None:
+        mini, asked = self.mini("exec /usr/bin/python3 hook job-started --allowed-owner manaflow-ai")
+        self.assertIsNone(mini.node_refusal())
+        self.assertEqual(asked, [])
+
 
 class Base(unittest.TestCase):
     def setUp(self) -> None:
@@ -129,6 +176,31 @@ class Detection(Base):
         report = self.run_once()
         self.assertEqual(report["findings"], [])
         self.assertEqual(json.loads(self.report.read_text())["schema"], "glaeda-mini-health/v1")
+
+    def test_an_ineligible_node_is_an_error_this_user_cannot_heal(self) -> None:
+        # cmux-austin-mini-0/-1 refused every job for days on 10-08..12: their staged generation was gone.
+        self.mini.refusal = "node not eligible (no node status from generation 3809eed51fdd)"
+        report = self.run_once()
+        self.assertEqual(self.ids(report), ["node_ineligible"])
+        f = report["findings"][0]
+        self.assertEqual((f["severity"], f["auto_fix"]), ("error", "impossible"))
+        self.assertIn("3809eed51fdd", f["evidence"])
+
+    def test_missing_exact_rust_toolchain_is_self_healed(self) -> None:
+        self.mini.refusal = "node not eligible (rust toolchain 1.98.1-aarch64-apple-darwin is not installed)"
+        report = self.run_once()
+        self.assertEqual(report["findings"], [])
+        self.assertEqual(self.mini.toolchain_installs, ["1.98.1-aarch64-apple-darwin"])
+        self.assertEqual(report["heals"][0]["id"], "node_toolchain_missing:1.98.1-aarch64-apple-darwin")
+
+    def test_missing_toolchain_refusal_is_pending_when_install_fails(self) -> None:
+        self.mini.refusal = "node not eligible (rust toolchain 1.98.1-aarch64-apple-darwin is not installed)"
+        self.mini.install_rust_toolchain = lambda toolchain: (False, "network unavailable")
+        report = self.run_once()
+        self.assertEqual(self.ids(report), ["node_toolchain_missing:1.98.1-aarch64-apple-darwin"])
+        f = report["findings"][0]
+        self.assertEqual((f["severity"], f["auto_fix"]), ("error", "pending"))
+        self.assertIn("network unavailable", f["note"])
 
     def test_locked_console_autologin_key_and_display_sleep_need_root(self) -> None:
         self.mini.console_state = ("locked", "cmux")
@@ -164,6 +236,47 @@ class Detection(Base):
 
 
 class DiskAndLeaks(Base):
+    def test_stuck_eviction_is_reported_as_health_finding(self) -> None:
+        self.mini.disk = {"schema": "glaeda-disk/v1", "at": NOW, "findings": [{
+            "id": "eviction_stuck", "severity": "error", "path": "/Users/Shared/cmux-build-fleet",
+            "evidence": "du timed out after 30s", "auto_fix": "pending", "count": 1
+        }]}
+        report = self.run_once()
+        self.assertEqual(self.ids(report), ["eviction_stuck"])
+        self.assertEqual(report["findings"][0]["severity"], "error")
+        self.assertIn("du timed out", report["findings"][0]["evidence"])
+        self.assertEqual(report["findings"][0]["observed_at"], NOW)
+
+    def test_eviction_contention_is_reported_without_a_heal(self) -> None:
+        self.mini.disk = {"schema": "glaeda-disk/v1", "at": NOW,
+                          "eviction_contention": {"at_epoch": NOW, "owner": {
+                              "pid": 42, "owner": "runner", "state": "live"}}}
+        report = self.run_once()
+        self.assertEqual(self.ids(report), ["eviction_contention"])
+        finding = report["findings"][0]
+        self.assertEqual(finding["auto_fix"], "impossible")
+        self.assertIn("pid 42", finding["evidence"])
+        self.assertEqual(self.mini.did, [])
+
+    def test_stuck_evictions_are_one_bounded_aggregate(self) -> None:
+        self.mini.disk = {"schema": "glaeda-disk/v1", "at": NOW, "findings": [
+            {"id": "eviction_stuck", "severity": "error", "path": "/tmp/a", "count": 2,
+             "evidence": "du timed out after 45s"},
+            {"id": "eviction_stuck", "severity": "error", "path": "/tmp/b", "count": 3,
+             "evidence": "du timed out after 45s"},
+            {"id": "eviction_stuck", "severity": "error", "path": "/tmp/a", "count": 1,
+             "evidence": "du timed out after 45s"},
+        ]}
+        report = self.run_once()
+        self.assertEqual(self.ids(report), ["eviction_stuck"])
+        stuck = report["findings"][0]
+        self.assertEqual(stuck["timeout_count"], 6)
+        self.assertEqual(stuck["path_count"], 2)
+        self.assertEqual(stuck["paths"], ["/tmp/a", "/tmp/b"])
+        self.assertEqual(stuck["observed_at"], NOW)
+        self.assertIn("du timed out after 45s", stuck["evidence"])
+        self.assertIn("6 path(s)", stuck["evidence"])
+
     def test_unmeasured_space_is_a_health_finding(self) -> None:
         self.mini.disk = {"schema": "glaeda-disk/v1", "accounting": [{"unmeasured": 5 * 1024**3,
                                                                    "top_level": [{"path": "/Users/Shared", "bytes": 8 * 1024**3}]}]}
@@ -171,6 +284,13 @@ class DiskAndLeaks(Base):
         self.assertEqual(self.ids(report), ["disk_unmeasured"])
         self.assertIn("5.0 GiB", report["findings"][0]["evidence"])
         self.assertIn("/Users/Shared", report["findings"][0]["evidence"])
+
+    def test_runner_profile_unmeasured_remainder_is_not_a_volume_finding(self) -> None:
+        self.mini.disk = {"schema": "glaeda-disk/v1", "accounting": [{
+            "scope": "runner-cache-profile", "unclassified": 300 * 1024**3,
+            "measured": 2 * 1024**3, "reclaimable": 1 * 1024**3,
+        }]}
+        self.assertEqual(self.run_once()["findings"], [])
 
     def test_malformed_disk_accounting_is_ignored(self) -> None:
         self.mini.disk = {"schema": "glaeda-disk/v1", "accounting": [{"unmeasured": "unknown"},
