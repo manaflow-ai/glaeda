@@ -1331,7 +1331,6 @@ def checkout_build_family(projects: Path, role: str = "fleet-mini") -> Family:
                   "swift build or glaeda-apple warm rebuilds it; also counted in its checkout",
                   checkout_builds=True, build_output=True,
                   min_idle_hours=min(CHECKOUT_BUILD_IDLE_HOURS, 12.0),
-                  max_idle_hours=0.0 if role == "devbox" else None,
                   owner="SwiftPM and glaeda-apple, per checkout", rebuild_minutes=15,
                   platform="shared")
 
@@ -1449,7 +1448,7 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
     fams = [
         Family("xcode-derived-data", HOME / "Library/Developer/Xcode/DerivedData", True,
                "next xcodebuild rebuilds it", owner="Xcode, per checkout", rebuild_minutes=15,
-               build_output=True, max_idle_hours=0.0 if role == "devbox" else None, platform="macos"),
+               build_output=True, platform="macos"),
         Family("claude-scratchpad", tmp / f"claude-{uid}", True,
                "session scratch space; the session is idle", depth=2,
                skip=("bundled-skills", "bash-edit-diff"), owner="Claude sessions", rebuild_minutes=0.5,

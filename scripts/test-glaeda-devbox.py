@@ -8,6 +8,7 @@ import importlib.machinery
 import importlib.util
 import io
 import os
+import subprocess
 import tempfile
 import time
 import unittest
@@ -94,6 +95,26 @@ class DevboxTest(unittest.TestCase):
                            "rebuild", build_output=True, max_idle_hours=0.0)
         item = gd.survey([family], 24, 0)[0]
         self.assertEqual(item.verdict, "reclaimable")
+
+    def test_fresh_closed_build_outputs_stay_on_devbox(self) -> None:
+        derived = self.home / "Library/Developer/Xcode/DerivedData/fresh"
+        derived.mkdir(parents=True)
+        (derived / "build.bin").write_bytes(b"x")
+        derived_family = next(f for f in gd.default_families("devbox") if f.id == "xcode-derived-data")
+        self.assertEqual(gd.survey([derived_family], 24, 0)[0].verdict, "recent")
+
+        project = self.home / "Projects/app"
+        project.mkdir(parents=True)
+        (project / "Package.swift").write_text("// fixture\n")
+        subprocess.run(["git", "init", "-q", str(project)], check=True)
+        subprocess.run(["git", "-C", str(project), "add", "Package.swift"], check=True)
+        subprocess.run(["git", "-C", str(project), "-c", "user.name=Test", "-c",
+                        "user.email=test@example.invalid", "commit", "-qm", "fixture"], check=True)
+        build = project / ".build"
+        build.mkdir()
+        (build / "CACHEDIR.TAG").write_text("Signature: 8a477f597d28d172789f06886806bc55\n")
+        build_family = gd.checkout_build_family(self.home / "Projects", "devbox")
+        self.assertEqual(gd.survey([build_family], 24, 0)[0].verdict, "recent")
 
 
 if __name__ == "__main__":
