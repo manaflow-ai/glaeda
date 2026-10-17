@@ -2601,9 +2601,15 @@ class ActivityClockTest(unittest.TestCase):
         self.assertTrue(self.due("pressure", 2, self.starts(*[0.1] * 6)))  # past its window, min_jobs since
         self.assertTrue(self.due("pressure", 2, self.starts(0.1, 0.2)))
 
-    def test_no_job_log_keeps_parked_builds_until_a_reuse_observation(self) -> None:
+    def test_no_job_log_uses_bounded_idle_sweep_fallback(self) -> None:
         self.assertTrue(self.due("pressure", 2, None))
         self.assertTrue(self.due(None, 2, self.starts(0.1)))
+        # Pressure may evict disposable hot state once the emergency policy allows
+        # it, but an idle sweep needs a bounded wall-clock fallback when the host
+        # never produced a job log.  The seven-day window matches mirror retention.
+        self.assertFalse(self.due("sweep", gd.PARKED_NO_LOG_IDLE_HOURS - 1, None))
+        self.assertTrue(self.due("sweep", gd.PARKED_NO_LOG_IDLE_HOURS, None))
+        self.assertFalse(self.due(None, gd.PARKED_NO_LOG_IDLE_HOURS * 2, None))
         other = gd.Family("tmp", self.dir, True, "x")
         with mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "job_starts", return_value=[]):
             self.assertEqual(gd.item_due(other, 2, 1.0), (True, None))

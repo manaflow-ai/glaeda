@@ -359,6 +359,11 @@ SEED_SOURCE = "seed-source.json"
 SEED_KEEP = 2  # seed_derived_data.LOCAL_KEEP_LOW_DISK: newest seeds of the current prefix each root keeps
 KEPT_BUILD_IDLE_HOURS = 24.0
 PARKED_IDLE_HOURS = float("inf")  # parked builds age by host-job reuse distance, not wall clock
+# A missing job log cannot establish a reuse distance.  An idle sweep can still make
+# bounded progress after the same seven-day window used for mirror checkouts; the
+# sweep's host-busy gate plus the normal process, socket, lease and recheck guards
+# remain in force before any deletion.
+PARKED_NO_LOG_IDLE_HOURS = 168.0
 
 
 def fleet_stores(ci: Path | None = None) -> list[Path]:
@@ -704,7 +709,13 @@ def item_due(fam: "Family", idle_hours: float, window: float) -> tuple[bool, int
         # checks preserve that veto. Do not use the job's age as a blanket six-hour retention window.
         return idle_hours >= POLICY["pressure_idle_hours"], jobs
     if jobs is None and fam.id == "cmux-pr-builds":
-        return False, None
+        # A quiet fleet with no job log must not age parked builds merely because
+        # wall-clock time passed.  Once an idle sweep has observed a full mirror
+        # window, however, retaining them forever leaves the hot tier unbounded.
+        # `apply` still rechecks process/open-file evidence, and the idle sweep
+        # stops on a busy host before it mutates anything.
+        return (ACTIVITY_MODE == "sweep"
+                and idle_hours >= PARKED_NO_LOG_IDLE_HOURS), None
     if jobs is None or ACTIVITY_MODE is None:
         return idle_hours >= window, jobs
     if idle_hours <= running_job_hours():
