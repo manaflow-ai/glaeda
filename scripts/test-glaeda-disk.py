@@ -894,6 +894,26 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(got[0]["measured"], 7 * gd.GIB)
         self.assertEqual(got[0]["reclaimable"], 3 * gd.GIB)
 
+    def test_accounting_prefix_selection_preserves_independent_overlap_sets(self) -> None:
+        parent = self.root / "parent"
+        child = parent / "child"
+        sibling = self.root / "sibling"
+        rows = [(child, 3, "reclaimable"), (parent, 7, "report-only"),
+                (sibling, 5, "reclaimable"), (sibling, 1, "recent")]
+        selected = gd.top_level_catalogued(sorted(rows, key=lambda row: (len(row[0].parts), str(row[0]))))
+        self.assertEqual([(path, size, verdict) for path, size, verdict in selected],
+                         [(parent, 7, "report-only"), (sibling, 5, "reclaimable")])
+
+    def test_accounting_prefix_selection_scales_with_flat_catalog(self) -> None:
+        rows = [(self.root / f"item-{index:05d}", 1, "report-only") for index in range(12_000)]
+        started = time.monotonic()
+        selected = gd.top_level_catalogued(rows)
+        elapsed = time.monotonic() - started
+        self.assertEqual(len(selected), len(rows))
+        # A flat catalogue should remain bounded by path depth. This catches a
+        # regression to scanning every previously selected item.
+        self.assertLess(elapsed, 5.0)
+
     def test_apfs_container_capacity_is_separate_from_volume_free(self) -> None:
         saved = gd.DARWIN
         gd.DARWIN = True

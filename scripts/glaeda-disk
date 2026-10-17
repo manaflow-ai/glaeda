@@ -3582,6 +3582,27 @@ def reconciled_known_coverage(coverage: list[dict[str, Any]]) -> int:
     return max(totals, default=0)
 
 
+def top_level_catalogued(catalogued: list[tuple[Path, int, str]]) -> list[tuple[Path, int, str]]:
+    """Keep the highest-level item from each overlapping path set.
+
+    ``filesystem_accounting`` receives a flat catalogue that can contain a
+    report-only checkout and a reclaimable build below it.  The old scan asked
+    every candidate whether it was below every selected path, which made a
+    large refresh quadratic in the number of catalogue items.  The path depth
+    is bounded, so checking the candidate's own ancestors against a set keeps
+    the same lexical overlap semantics in O(items * path depth).
+    """
+    selected: list[tuple[Path, int, str]] = []
+    selected_paths: set[Path] = set()
+    for row in catalogued:
+        path = row[0]
+        if path in selected_paths or any(parent in selected_paths for parent in path.parents):
+            continue
+        selected.append(row)
+        selected_paths.add(path)
+    return selected
+
+
 def filesystem_accounting(fss: list[Fs], items: list[Item]) -> list[dict[str, Any]]:
     """Show df-used minus catalogued bytes and bounded top-level volume usage.
 
@@ -3649,23 +3670,13 @@ def filesystem_accounting(fss: list[Fs], items: list[Item]) -> list[dict[str, An
                 continue
         # A parent catalog item already includes every nested item. Count only the highest-level path
         # in each overlapping set so the unmeasured figure remains an accounting gap, not an overlap artifact.
-        selected: list[Path] = []
-        for path, size, _ in sorted(catalogued, key=lambda pair: (len(pair[0].parts), str(pair[0]))):
-            if any(path == parent or parent in path.parents for parent in selected):
-                continue
-            selected.append(path)
-            measured += size
+        ordered = sorted(catalogued, key=lambda pair: (len(pair[0].parts), str(pair[0])))
+        measured = sum(size for _, size, _ in top_level_catalogued(ordered))
         # A report-only checkout must not mask a reclaimable build directory nested inside it.
         # Deduplicate reclaimable candidates independently so this number is the bytes the next
         # apply can actually target, rather than every item carrying a reclaimable verdict.
-        reclaimable = 0
-        reclaimable_selected: list[Path] = []
-        for path, size, verdict in sorted(catalogued, key=lambda pair: (len(pair[0].parts), str(pair[0]))):
-            if verdict != "reclaimable" or any(path == parent or parent in path.parents
-                                               for parent in reclaimable_selected):
-                continue
-            reclaimable_selected.append(path)
-            reclaimable += size
+        reclaimable = sum(size for _, size, _ in top_level_catalogued(
+            [row for row in ordered if row[2] == "reclaimable"]))
         used = max(0, fs.total - fs.free)
         coverage_mem = None if RUNNER_CACHE_PROFILE else _ACCOUNTING_COVERAGE_MEM.get((fs.dev, fs.mount))
         cached_coverage = _safe_cached_coverage(hit.get("coverage")) if hit else None
