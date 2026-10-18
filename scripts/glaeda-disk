@@ -173,6 +173,12 @@ EVICTION_STUCK: list[dict[str, Any]] = []
 _EVICT_HANDLE = None
 _MEASURE_BUDGET_REACHED = False
 _REFRESH_PROGRESS_KNOWN: dict[str, int] | None = None
+# A timed-out walk is left unsized and protected.  Do not relaunch the same
+# pathological walk on every scheduled pass; the next pass after the cooldown
+# retries it with fresh evidence.
+TIMEOUT_COOLDOWN_S = 30 * 60
+TIMEOUT_STATE = HOME / ".cache/glaeda-disk/timeout-paths.json"
+_TIMED_OUT_PATHS: dict[str, float] = {}
 _REFRESH_DEADLINE_ACTIVE = False
 _ACTIVE_MEASURE_HANDLE = None
 _ACTIVE_DU_PROCS: dict[int, subprocess.Popen] = {}
@@ -1773,6 +1779,18 @@ def _record_eviction_stuck(argv: list[str]) -> None:
         path = os.path.realpath(raw_path)
     except OSError:
         path = raw_path
+    observed_at = time.time()
+    _TIMED_OUT_PATHS[path] = observed_at
+    with contextlib.suppress(OSError, TypeError, ValueError):
+        TIMEOUT_STATE.parent.mkdir(parents=True, exist_ok=True)
+        state = json.loads(TIMEOUT_STATE.read_text()) if TIMEOUT_STATE.exists() else {}
+        if not isinstance(state, dict):
+            state = {}
+        old = state.get(path) if isinstance(state.get(path), dict) else {}
+        state[path] = {"at": observed_at, "count": int(old.get("count", 0)) + 1}
+        tmp = TIMEOUT_STATE.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(state, separators=(",", ":")))
+        os.replace(tmp, TIMEOUT_STATE)
     activity = eviction_activity()
     state = "active" if activity is not None else "stale"
     severity = "warn" if activity is not None else "error"
@@ -1787,7 +1805,7 @@ def _record_eviction_stuck(argv: list[str]) -> None:
             finding["severity"] = severity
             finding["auto_fix"] = auto_fix
             finding["evidence"] = evidence
-            finding["observed_at"] = int(time.time())
+            finding["observed_at"] = int(observed_at)
             if activity is None:
                 finding.pop("activity", None)
             else:
@@ -1795,7 +1813,7 @@ def _record_eviction_stuck(argv: list[str]) -> None:
             return
     record = {"id": "eviction_stuck", "severity": severity, "path": path,
               "evidence": evidence, "auto_fix": auto_fix, "state": state,
-              "observed_at": int(time.time()), "count": 1}
+              "observed_at": int(observed_at), "count": 1}
     if activity is not None:
         record["activity"] = activity
     EVICTION_STUCK.append(record)
@@ -1817,6 +1835,25 @@ def _measurement_path_allowed(path: Path) -> bool:
     # stat module does not define it on every SDK, so probe the platform value when present.
     dataless = getattr(stat, "UF_DATALESS", 0)
     return not bool(getattr(st, "st_flags", 0) & dataless)
+
+
+def _measurement_on_timeout_cooldown(path: Path) -> bool:
+    """Return true when a prior timeout says to leave this path unsized for now."""
+    try:
+        key = os.path.realpath(os.fspath(path))
+    except OSError:
+        return False
+    at = _TIMED_OUT_PATHS.get(key)
+    if at is None:
+        try:
+            state = json.loads(TIMEOUT_STATE.read_text())
+            entry = state.get(key) if isinstance(state, dict) else None
+            at = float(entry.get("at")) if isinstance(entry, dict) else None
+        except (OSError, TypeError, ValueError):
+            at = None
+        if at is not None:
+            _TIMED_OUT_PATHS[key] = at
+    return at is not None and time.time() - at < TIMEOUT_COOLDOWN_S
 
 
 def fixed_measurement_roots() -> list[Path]:
@@ -1916,6 +1953,8 @@ def _terminate_active_children() -> None:
 
 def du_bytes(path: Path, *, record_timeout: bool = True) -> int | None:
     if not _measurement_path_allowed(path):
+        return None
+    if _measurement_on_timeout_cooldown(path):
         return None
     out = _du_output(["du", "-xsk", str(path)], record_timeout=record_timeout)
     if out is None:

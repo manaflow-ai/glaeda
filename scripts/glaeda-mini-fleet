@@ -1009,7 +1009,9 @@ def observe_host(manifest: dict[str, Any], name: str, script: bytes | None = Non
     else:
         code, output = remote_result(proc.stdout, proc.returncode)
     if code != 0:
-        err = proc.stderr.decode(errors="replace").strip().splitlines()
+        raw_err = proc.stderr
+        err = (raw_err.decode(errors="replace") if isinstance(raw_err, bytes) else (raw_err or "")) \
+            .strip().splitlines()
         return {"host": name, "reachable": False, "error": (err[-1] if err else f"ssh exit {code}")[:200]}
     text = output.decode(errors="replace") if isinstance(output, bytes) else (output or "")
     data = parse_probe(text)
@@ -1886,7 +1888,9 @@ def reservation_ssh(name: str, user: str, script: str, args: list[str], stdin: s
     except subprocess.TimeoutExpired:
         return 124, b"", "timed out after 60s; outcome unknown, re-run check"
     code, output = remote_result(proc.stdout, proc.returncode)
-    return code, output, proc.stderr.decode(errors="replace").strip()[-400:]
+    raw_err = proc.stderr
+    err = raw_err.decode(errors="replace") if isinstance(raw_err, bytes) else (raw_err or "")
+    return code, output, err.strip()[-400:]
 
 
 def read_reservation(name: str, user: str, options: tuple[str, ...] = ()) -> dict[str, Any]:
@@ -3050,7 +3054,11 @@ def brew_commands(owner: str, formulas: list[str], as_owner: bool, as_root: bool
              # A pinned formula stays as it is: upgrading it would change the toolchain its class receipt names.
              'pinned=" $({ brew_as list --pinned 2>/dev/null || true; } | tr "\\n" " ") "',
              f"for f in {' '.join(formulas)}; do",
-             '  if ! brew_as list --versions "$f" >/dev/null 2>&1; then brew_as install "$f"',
+             '  if ! brew_as list --versions "$f" >/dev/null 2>&1; then',
+             '    if ! brew_as install "$f"; then',
+             '      if [ "$f" = rustup ] && [ -x "/opt/homebrew/opt/rustup/bin/rustup" ]; then echo "rustup installed; ignoring obsolete Homebrew postinstall failure"',
+             '      else exit 1; fi',
+             '    fi',
              '  elif [[ "$pinned" == *" $f "* ]]; then echo "$f is pinned, left as it is; brew unpin $f to upgrade it"',
              '  else brew_as upgrade "$f"; fi',
              "done"]

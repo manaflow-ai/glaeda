@@ -112,6 +112,18 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(gd.EVICTION_STUCK[0]["count"], 2)
         self.assertEqual(gd.EVICTION_STUCK[0]["path"], str(self.root))
 
+    def test_timed_out_path_is_not_rewalked_during_cooldown(self) -> None:
+        saved_state = gd.TIMEOUT_STATE
+        saved_paths = dict(gd._TIMED_OUT_PATHS)
+        gd.TIMEOUT_STATE = self.root / "timeout-paths.json"
+        gd._TIMED_OUT_PATHS.clear()
+        self.addCleanup(lambda: (setattr(gd, "TIMEOUT_STATE", saved_state),
+                                  gd._TIMED_OUT_PATHS.clear(), gd._TIMED_OUT_PATHS.update(saved_paths)))
+        gd._record_eviction_stuck(["du", "-xsk", str(self.root)])
+        with mock.patch.object(gd, "_du_output") as du:
+            self.assertIsNone(gd.du_bytes(self.root))
+        du.assert_not_called()
+
     def test_eviction_timeout_marks_active_host_contention(self) -> None:
         saved = list(gd.EVICTION_STUCK)
         gd.EVICTION_STUCK.clear()
