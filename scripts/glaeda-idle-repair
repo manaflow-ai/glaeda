@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""Queue safe Glaeda repairs and run them on the first idle host tick.
+
+The LaunchAgent invokes this once per minute.  A busy host records a durable
+queued receipt and exits without touching its locks, workers, or console.  The
+next tick revalidates the host and runs the normal disk and mini-health tools
+only after the authoritative host gate is idle.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import importlib.machinery
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+from typing import Any
+
+
+HOME = Path(os.path.expanduser("~"))
+STATE_DIR = HOME / ".local/state/glaeda/idle-repair"
+STATE = STATE_DIR / "queue.json"
+RECEIPT = STATE_DIR / "receipts.jsonl"
+LOCK = STATE_DIR / "run.lock"
+SCHEMA = "glaeda-idle-repair/v1"
+QUEUED_EXIT = 75
+
+
+def load_disk_module() -> Any:
+    path = Path(os.environ.get("GLAEDA_DISK", str(HOME / ".local/bin/glaeda-disk")))
+    loader = importlib.machinery.SourceFileLoader("glaeda_disk_for_idle_repair", os.fspath(path))
+    module = loader.load_module()
+    return module
+
+
+def read_state() -> dict[str, Any]:
+    try:
+        value = json.loads(STATE.read_text())
+    except (OSError, ValueError, TypeError):
+        return {"schema": SCHEMA, "state": "unknown"}
+    return value if isinstance(value, dict) else {"schema": SCHEMA, "state": "unknown"}
+
+
+def write_state(value: dict[str, Any]) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STATE.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps({"schema": SCHEMA, **value}, separators=(",", ":")) + "\n")
+    os.replace(tmp, STATE)
+
+
+def append_receipt(value: dict[str, Any]) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with RECEIPT.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"schema": SCHEMA, **value}, separators=(",", ":")) + "\n")
+
+
+def run(argv: list[str], timeout: int) -> tuple[int, str, str]:
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
+                              stdin=subprocess.DEVNULL, check=False)
+    except subprocess.TimeoutExpired:
+        return 124, "", "timed out"
+    except OSError as error:
+        return 127, "", str(error)
+    return proc.returncode, proc.stdout[-4000:], proc.stderr[-1000:]
+
+
+def status() -> int:
+    print(json.dumps(read_state(), separators=(",", ":")))
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="glaeda-idle-repair")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--apply", action="store_true", help="run queued repairs when the host is idle")
+    mode.add_argument("--status", action="store_true", help="print the durable queue receipt")
+    args = parser.parse_args(argv)
+    if args.status or not args.apply:
+        return status()
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with LOCK.open("a+") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return QUEUED_EXIT
+
+        now = int(time.time())
+        previous = read_state()
+        disk = load_disk_module()
+        busy = disk.host_busy()
+        if busy:
+            value = {"state": "queued", "reason": busy, "queuedAt": previous.get("queuedAt", now),
+                     "lastAttemptAt": now, "nextAttemptAt": now + 60}
+            write_state(value)
+            append_receipt({"at": now, "outcome": "queued", "reason": busy})
+            print(json.dumps({"schema": SCHEMA, **value}, separators=(",", ":")))
+            return QUEUED_EXIT
+
+        next_attempt = previous.get("nextAttemptAt")
+        if isinstance(next_attempt, (int, float)) and next_attempt > now:
+            print(json.dumps({"schema": SCHEMA, **previous}, separators=(",", ":")))
+            return 0
+
+        python = os.environ.get("GLAEDA_PYTHON", sys.executable)
+        disk_path = os.environ.get("GLAEDA_DISK", str(HOME / ".local/bin/glaeda-disk"))
+        health_path = os.environ.get("GLAEDA_HEALTH", str(HOME / ".local/bin/glaeda-mini-health"))
+        actions: list[dict[str, Any]] = []
+        disk_command = [python, disk_path]
+        if role := os.environ.get("GLAEDA_ROLE"):
+            disk_command.extend(["--role", role])
+        disk_command.extend(["--refresh", "--pressure", "--idle", "--apply", "--top", "0"])
+        commands = [
+            (disk_command, 660),
+            ([python, health_path, "--apply"], 180),
+        ]
+        failed = False
+        for command, timeout in commands:
+            code, out, err = run(command, timeout)
+            action = {"argv": command, "exit": code, "stdoutTail": out, "stderrTail": err}
+            actions.append(action)
+            if code != 0:
+                failed = True
+                break
+        value = {"state": "retry" if failed else "idle", "lastAttemptAt": now,
+                 "nextAttemptAt": now + (60 if failed else 900), "actions": actions}
+        write_state(value)
+        append_receipt({"at": now, "outcome": "retry" if failed else "repaired", "actions": actions})
+        print(json.dumps({"schema": SCHEMA, **value}, separators=(",", ":")))
+        return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

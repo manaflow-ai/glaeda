@@ -1,0 +1,12 @@
+[Unit]
+Description=Run queued Glaeda repairs when the host is idle
+Documentation=https://github.com/teamleaderleo/glaeda/blob/main/scripts/glaeda-idle-repair
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/glaeda-idle-repair --apply
+Environment=PYTHONUNBUFFERED=1
+Environment=GLAEDA_ROLE=@GLAEDA_ROLE@
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=15min

@@ -101,6 +101,19 @@ Never remove active workspaces, current seeds, checkouts, user projects, or
 unclassified space by hand. A low free-space number is a reason to refresh the
 receipt, not permission to delete a directory.
 
+Idle repair is queued on each installed host by `glaeda-idle-repair`. Its
+LaunchAgent runs every minute, records a durable `queued` receipt while a job,
+worker, reservation, or host lock is active, and runs the normal disk and
+mini-health repair paths on the first idle tick. Inspect the queue with:
+
+```bash
+ssh HOST '~/.local/bin/glaeda-idle-repair --status'
+```
+
+The queue never kills a worker or clears a live lock. HQ's `fleet health
+refresh` includes the queue receipt so the operator view can distinguish queued,
+retrying, and idle repair state.
+
 ## Probe and dashboard rollout
 
 The probe and dashboard have separate rollout steps:

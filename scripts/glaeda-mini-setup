@@ -43,6 +43,8 @@ What --apply installs (templated for the current user):
                                                owned cmux mini is idle; a no-op anywhere else)
     ~/.local/bin/glaeda-mini-health            from scripts/glaeda-mini-health (finds what stops a runner mini, heals what
                                                the runner user can, reports the rest for ci-dash; a no-op off a runner)
+    ~/.local/bin/glaeda-idle-repair            durable repair queue: records busy hosts and runs disk/health repairs on
+                                               the first idle LaunchAgent tick
     ~/.local/bin/glaeda-update                 from scripts/glaeda-update (hourly over-the-air updates)
     ~/.local/bin/glaeda-gh                     from scripts/glaeda-gh (shared GitHub CI watcher, the one poller)
     ~/.local/bin/glaeda-wallpaper-rotate       from scripts/glaeda-wallpaper-rotate (operator-supplied stills, every 30 minutes)
@@ -50,7 +52,7 @@ What --apply installs (templated for the current user):
     ~/.claude/skills/github-ci-wait/SKILL.md    from skills/github-ci-wait: tells agent sessions to wait with glaeda-gh
     ~/.config/glaeda/update.json               its release ring and source, written once (--ota-ring canary|stable,
                                                --ota-source teamleaderleo/glaeda|manaflow-ai/glaeda)
-    ~/Library/LaunchAgents/com.teamleaderleo.glaeda.{disk-pressure,disk-dedupe,worktree-reclaim,fleet-cas-prune,seed-prefetch,lan-fetch,
+    ~/Library/LaunchAgents/com.teamleaderleo.glaeda.{disk-pressure,idle-repair,disk-dedupe,worktree-reclaim,fleet-cas-prune,seed-prefetch,lan-fetch,
                                   idle-warm,idle-fuzz,mini-health,local-guard,update,gh-watch}.plist
     build-host directories and three git defaults, each set only when unset
     on a Mac mini only: alert sounds off (defaults -g com.apple.sound.beep.volume 0, uiaudio.enabled 0,
@@ -149,6 +151,8 @@ SYSTEMD_UNITS_DIR = REPO / "ops/systemd"
 LINUX_UNITS = (
     "glaeda-disk-pressure.service",
     "glaeda-disk-pressure.timer",
+    "glaeda-idle-repair.service",
+    "glaeda-idle-repair.timer",
     "glaeda-projects-tidy.service",
     "glaeda-projects-tidy.timer",
     "glaeda-worktree-reclaim.service",
@@ -689,6 +693,20 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-disk.log"),
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-disk.err"),
         },
+        # Queue disk and mini-health repairs behind the authoritative host gate. A busy host
+        # records a durable queued receipt; the next minute retries automatically.
+        LABEL_PREFIX + "idle-repair": {
+            "Label": LABEL_PREFIX + "idle-repair",
+            "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-idle-repair"), "--apply"],
+            "StartInterval": 60,
+            "RunAtLoad": True,
+            "ProcessType": "Background",
+            "LowPriorityIO": True,
+            "Nice": 10,
+            "EnvironmentVariables": {"GLAEDA_PYTHON": python, "GLAEDA_DISK": disk, "GLAEDA_ROLE": ctx.role},
+            "StandardOutPath": os.fspath(ctx.logs / "glaeda-idle-repair.jsonl"),
+            "StandardErrorPath": os.fspath(ctx.logs / "glaeda-idle-repair.err"),
+        },
         LABEL_PREFIX + "disk-dedupe": {
             "Label": LABEL_PREFIX + "disk-dedupe",
             "ProgramArguments": [python, disk, "--dedupe", "--settle-minutes", "5"],
@@ -1164,7 +1182,7 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
         actions.append({"kind": "dir", "path": os.fspath(path),
                         "state": "unchanged" if path.is_dir() else "create", "mode": oct(mode)})
     for name in ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-runner-hygiene", "disk-pressure.sh", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune", "glaeda-seed-prefetch",
-                 "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health",
+                 "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health", "glaeda-idle-repair",
                  "glaeda-update", "glaeda-gh", "glaeda-wallpaper-rotate"):
         act = file_action(ctx, "tool", ctx.bin / name, (SCRIPT_DIR / name).read_bytes(), 0o755)
         act["source"] = os.fspath(SCRIPT_DIR / name)
@@ -1353,7 +1371,7 @@ def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
         actions.append({"kind": "agent", "label": label, "path": os.fspath(path),
                         "loaded": agent_loaded(ctx, label)})
     for name in ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-runner-hygiene", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune",
-                 "glaeda-seed-prefetch", "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health",
+                 "glaeda-seed-prefetch", "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health", "glaeda-idle-repair",
                  "glaeda-update", "glaeda-gh", "glaeda-wallpaper-rotate"):
         actions.append({"kind": "tool", "path": os.fspath(ctx.bin / name)})
     actions.append({"kind": "tool", "path": os.fspath(skill_path(ctx))})
