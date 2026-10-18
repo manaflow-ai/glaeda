@@ -472,6 +472,7 @@ impl ProductionRecoveryAdapter {
     /// Admit one exact report against the descriptor-bound store. Recovery is performed while
     /// the store's non-blocking lock is held, before the report can become new work. This method
     /// never invokes `apply_batch`; live deletion remains explicitly disabled at apply time.
+    #[allow(clippy::too_many_arguments)]
     pub fn admit_descriptor_store<O: FreshProcessObserver>(
         &mut self,
         identity: FreshIdentity,

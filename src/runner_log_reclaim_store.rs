@@ -59,6 +59,7 @@ fn stat_matches_staged(stat: &rfs::Stat, identity: FileIdentity) -> bool {
     stat_matches_materialization(stat, identity)
 }
 
+#[allow(dead_code)]
 fn identity_from_stat(stat: &rfs::Stat) -> Option<FileIdentity> {
     if stat.st_size < 0 {
         return None;
@@ -376,6 +377,7 @@ fn append_row(state: &OwnedFd, row: &JournalRow) -> Result<(), StoreError> {
     rfs::fsync(state).map_err(|_| StoreError::Io("journal_parent_sync_failed"))
 }
 
+#[allow(dead_code)]
 fn transaction_id(install_id: &str, identity: FileIdentity) -> Result<String, StoreError> {
     let mut nonce = [0_u8; 16];
     let mut random =
@@ -414,6 +416,7 @@ impl RunnerLogStore {
             .wrapping_add(self.marker_inode.rotate_left(17))
     }
 
+    #[allow(dead_code)]
     fn journal_row(
         &self,
         tx_id: &str,
@@ -732,6 +735,7 @@ impl RunnerLogStore {
         Ok(receipt)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn apply_batch<F>(
         &mut self,
         candidates: &[LogItem],
