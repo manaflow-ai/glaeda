@@ -1705,19 +1705,89 @@ def platform_label(fam: Family) -> str:
     return fam.platform if fam.platform in PLATFORM_VALUES else "unknown"
 
 
+def eviction_activity() -> dict[str, str] | None:
+    """Return bounded live activity evidence for a measurement timeout.
+
+    A timeout while a build owns the fleet host lock (or while a Runner.Worker/build
+    process is live) is expected contention, not a wedged eviction.  Keep the probe
+    read-only and short: stale marker files are accepted only when their PID is still
+    alive, and the lock/process probes have a five-second bound.
+    """
+    for marker in (FLEET_DIR / "evict-lock-v1", FLEET_DIR / "host-lock-holder",
+                   FLEET_DIR / "host.lock.yield"):
+        try:
+            text = marker.read_text(encoding="utf-8", errors="replace")[:256]
+            match = re.search(r"\b([1-9][0-9]{0,8})\b", text)
+            if match:
+                pid = int(match.group(1))
+                if _pid_alive(pid):
+                    command = _owner_command(pid)
+                    detail = f"{marker.name} pid {pid}"
+                    if command:
+                        detail += f" ({command[:160]})"
+                    return {"state": "active", "evidence": detail}
+        except (OSError, ValueError):
+            continue
+    lock = FLEET_DIR / "host.lock"
+    try:
+        fd = os.open(lock, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        fd = None
+    except OSError:
+        fd = None
+    if fd is not None:
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return {"state": "active", "evidence": "fleet host.lock is held"}
+        finally:
+            os.close(fd)
+    try:
+        result = subprocess.run(["ps", "-axww", "-o", "command="],
+                                capture_output=True, text=True, timeout=5, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode == 0:
+        for line in result.stdout.splitlines():
+            if CI_WORKER.search(line) or BUILD_PROCESS.search(line):
+                return {"state": "active", "evidence": f"active build process: {line.strip()[:220]}"}
+    return None
+
+
 def _record_eviction_stuck(argv: list[str]) -> None:
+    """Record a timeout and distinguish active host contention from stale work."""
     raw_path = str(argv[-1]) if argv else "unknown"
     try:
         path = os.path.realpath(raw_path)
     except OSError:
         path = raw_path
+    activity = eviction_activity()
+    state = "active" if activity is not None else "stale"
+    severity = "warn" if activity is not None else "error"
+    auto_fix = "deferred" if activity is not None else "pending"
+    evidence = f"du timed out after {DU_TIMEOUT_S}s"
+    if activity is not None:
+        evidence += f"; {activity['evidence']}"
     for finding in EVICTION_STUCK:
         if finding.get("id") == "eviction_stuck" and finding.get("path") == path:
             finding["count"] = int(finding.get("count", 1)) + 1
+            finding["state"] = state
+            finding["severity"] = severity
+            finding["auto_fix"] = auto_fix
+            finding["evidence"] = evidence
+            finding["observed_at"] = int(time.time())
+            if activity is None:
+                finding.pop("activity", None)
+            else:
+                finding["activity"] = activity
             return
-    EVICTION_STUCK.append({"id": "eviction_stuck", "severity": "error", "path": path,
-                           "evidence": f"du timed out after {DU_TIMEOUT_S}s",
-                           "auto_fix": "pending", "count": 1})
+    record = {"id": "eviction_stuck", "severity": severity, "path": path,
+              "evidence": evidence, "auto_fix": auto_fix, "state": state,
+              "observed_at": int(time.time()), "count": 1}
+    if activity is not None:
+        record["activity"] = activity
+    EVICTION_STUCK.append(record)
 
 
 def _measurement_path_allowed(path: Path) -> bool:

@@ -71,7 +71,8 @@ class GlaedaDiskTest(unittest.TestCase):
                 raise subprocess.TimeoutExpired(self.argv, timeout)
 
         with mock.patch.object(gd.subprocess, "Popen", HungDu), \
-                mock.patch.object(gd.os, "killpg") as killpg:
+                mock.patch.object(gd.os, "killpg") as killpg, \
+                mock.patch.object(gd, "eviction_activity", return_value=None):
             self.assertIsNone(gd.du_bytes(self.root))
             self.assertIsNone(gd.du_children(self.root))
         self.assertEqual(killpg.call_count, 2)
@@ -104,11 +105,54 @@ class GlaedaDiskTest(unittest.TestCase):
         gd.EVICTION_STUCK.clear()
         self.addCleanup(lambda: (gd.EVICTION_STUCK.clear(), gd.EVICTION_STUCK.extend(saved)))
         argv = ["du", "-xsk", str(self.root)]
-        gd._record_eviction_stuck(argv)
-        gd._record_eviction_stuck(argv)
+        with mock.patch.object(gd, "eviction_activity", return_value=None):
+            gd._record_eviction_stuck(argv)
+            gd._record_eviction_stuck(argv)
         self.assertEqual(len(gd.EVICTION_STUCK), 1)
         self.assertEqual(gd.EVICTION_STUCK[0]["count"], 2)
         self.assertEqual(gd.EVICTION_STUCK[0]["path"], str(self.root))
+
+    def test_eviction_timeout_marks_active_host_contention(self) -> None:
+        saved = list(gd.EVICTION_STUCK)
+        gd.EVICTION_STUCK.clear()
+        self.addCleanup(lambda: (gd.EVICTION_STUCK.clear(), gd.EVICTION_STUCK.extend(saved)))
+        argv = ["du", "-xsk", str(self.root)]
+        with mock.patch.object(gd, "eviction_activity", return_value={
+                "state": "active", "evidence": "host.lock pid 7319 (worker-current)"}), \
+                mock.patch.object(gd.time, "time", return_value=1_790_500_000):
+            gd._record_eviction_stuck(argv)
+        finding = gd.EVICTION_STUCK[0]
+        self.assertEqual((finding["state"], finding["severity"], finding["auto_fix"]),
+                         ("active", "warn", "deferred"))
+        self.assertEqual(finding["observed_at"], 1_790_500_000)
+        self.assertIn("worker-current", finding["evidence"])
+        self.assertEqual(finding["activity"]["state"], "active")
+
+    def test_eviction_activity_accepts_only_live_marker_pid(self) -> None:
+        fleet = self.root / "fleet"
+        fleet.mkdir()
+        (fleet / "evict-lock-v1").write_text("7319\n")
+        with mock.patch.object(gd, "FLEET_DIR", fleet), \
+                mock.patch.object(gd, "_pid_alive", return_value=True), \
+                mock.patch.object(gd, "_owner_command", return_value="worker-current"):
+            self.assertEqual(gd.eviction_activity(), {
+                "state": "active", "evidence": "evict-lock-v1 pid 7319 (worker-current)"})
+        with mock.patch.object(gd, "FLEET_DIR", fleet), \
+                mock.patch.object(gd, "_pid_alive", return_value=False), \
+                mock.patch.object(gd.subprocess, "run", return_value=mock.Mock(returncode=0, stdout="")):
+            self.assertIsNone(gd.eviction_activity())
+
+    def test_eviction_activity_reads_a_live_host_lock(self) -> None:
+        fleet = self.root / "fleet"
+        fleet.mkdir()
+        lock = fleet / "host.lock"
+        with lock.open("a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with mock.patch.object(gd, "FLEET_DIR", fleet), \
+                    mock.patch.object(gd.subprocess, "run") as run:
+                activity = gd.eviction_activity()
+            run.assert_not_called()
+        self.assertEqual(activity, {"state": "active", "evidence": "fleet host.lock is held"})
 
     def test_du_root_walk_refuses_filesystem_root(self) -> None:
         with mock.patch.object(gd, "_du_output") as run:
@@ -1839,6 +1883,28 @@ class GlaedaDiskTest(unittest.TestCase):
                     "message": "another measurement running; skipped",
                 })
                 survey.assert_not_called()
+
+    def test_report_only_refresh_replaces_stale_timeout_summary_without_apply(self) -> None:
+        receipt = self.receipt()
+        summary_path = self.root / "summary.json"
+        saved_findings = list(gd.EVICTION_STUCK)
+        gd.EVICTION_STUCK.clear()
+        self.addCleanup(lambda: (gd.EVICTION_STUCK.clear(), gd.EVICTION_STUCK.extend(saved_findings)))
+        summary_path.write_text(json.dumps({
+            "schema": "glaeda-disk/v1", "at": 1_790_500_000,
+            "findings": [{"id": "eviction_stuck", "state": "stale", "count": 1}],
+        }))
+        with mock.patch.object(gd, "HEALTH_SUMMARY", summary_path), \
+                mock.patch.object(gd, "default_families", return_value=[self.fam]), \
+                mock.patch.object(gd, "filesystems", return_value={1: gd.Fs(1, "/", 2, 3, 0, 0)}), \
+                mock.patch.object(gd, "survey", return_value=[]) as survey, \
+                mock.patch.object(gd, "apply") as apply, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gd.main(["--refresh", "--json", "--no-snapshot", "--top", "0",
+                                      "--receipt", os.fspath(receipt)]), 0)
+        self.assertEqual(json.loads(summary_path.read_text())["findings"], [])
+        survey.assert_called_once()
+        apply.assert_not_called()
 
     def test_background_refresh_wall_clock_guard_restores_signal_state(self) -> None:
         previous = signal.getsignal(signal.SIGALRM)
