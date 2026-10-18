@@ -495,6 +495,7 @@ CMUX_NEXT_CI_DRAIN = False
 CMUX_NEXT_CI_DRAIN_RESERVATION: dict | None = None
 CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "7387d785e729cba8248c186e70904b11ab45a8c2f4e26844e4cccbfce6f9a66b",
+    "1cc0a1b074027de286b5682863312e789ad8a06e5977d09630e2fab6d049966e",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",

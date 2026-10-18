@@ -1113,6 +1113,11 @@ TESTMANAGERD_STUCK = "testmanagerd: stuck"
 # Finished CI XCTest apps can outlive the Runner.Worker after their _temp tree is removed.
 # Only this exact derived-data app family is eligible; arbitrary user apps are never touched.
 LEAKED_TEST_APP = re.compile(r"^\s*'?(.*/actions-runner[^/]+/_work/_temp/cmux-derived-data-tests-[^/]+/Build/Products/Debug/cmux DEV\.app)(?:/Contents/MacOS/[^ ]+)?'?(?:\s|$)")
+# Media/E2E jobs use a stable macOS DerivedData family outside the runner's
+# _work tree. The app can detach and be reparented to launchd, so the normal
+# work-directory reaper cannot see it after the job ends. Keep this exact
+# generated app family narrow; arbitrary user apps are never eligible.
+LEAKED_MEDIA_APP = re.compile(r"^\s*'?(/Users/[^ ]+/Library/Developer/Xcode/DerivedData/cmux-ci-media-[^/]+/Build/Products/Debug/cmux DEV\.app)(?:/Contents/[^ ]+)?'?(?:\s|$)")
 LEAKED_TEST_TEMP = re.compile(r"^(.*/actions-runner[^/]+/_work/_temp/cmux-derived-data-tests-[^/]+)(?:/|$)")
 LEAKED_APP_TERM_S = 1.0
 # A process that may be talking to testmanagerd: an XCTest runner, or xcodebuild testing. A false match only
@@ -4348,6 +4353,69 @@ def cleanup_leaked_test_apps(ignored_workers: set[int] | None = None) -> list[st
     return killed
 
 
+def leaked_media_app_pids(table: dict[int, tuple[int, str]], ignored_workers: set[int] | None = None) -> list[tuple[int, str]]:
+    """Find detached cmux-ci-media apps only after every other runner job is gone."""
+    ignored_workers = ignored_workers or set()
+    workers = {pid for pid, (_ppid, command) in table.items()
+               if pid not in ignored_workers and re.search(r"(?:^|/)Runner\.Worker(?:\s|$)", command)}
+    if workers:
+        # A media DerivedData name can be shared by concurrent runners. The
+        # job-completed hook must never kill another runner's app by path.
+        return []
+    result: list[tuple[int, str]] = []
+    for pid, (ppid, command) in table.items():
+        match = LEAKED_MEDIA_APP.search(command)
+        if not match or pid == os.getpid():
+            continue
+        owner = pid
+        owned = False
+        for _ in range(256):
+            if owner <= 1 or owner not in table:
+                break
+            if owner not in ignored_workers and re.search(r"(?:^|/)Runner\.Worker(?:\s|$)", table[owner][1]):
+                owned = True
+                break
+            owner = table[owner][0]
+        if not owned:
+            result.append((pid, match.group(1)))
+    return result
+
+
+def cleanup_leaked_media_apps(ignored_workers: set[int] | None = None) -> list[str]:
+    """Kill detached cmux-ci-media apps after re-observing the exact command."""
+    try:
+        found = leaked_media_app_pids(processes(), ignored_workers)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    killed: list[str] = []
+    for pid, path in found:
+        try:
+            current = processes()
+            if (pid, path) not in leaked_media_app_pids(current, ignored_workers):
+                continue
+        except (OSError, subprocess.SubprocessError):
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            continue
+        deadline = time.monotonic() + LEAKED_APP_TERM_S
+        while pid_alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if pid_alive(pid):
+            try:
+                current = processes()
+                if (pid, path) not in leaked_media_app_pids(current, ignored_workers):
+                    continue
+            except (OSError, subprocess.SubprocessError):
+                continue
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+        if not pid_alive(pid):
+            killed.append(f"killed pid {pid} {path}")
+    return killed
+
+
 # A test can start a process that detaches from the job: cmux-tui's headless daemon calls setsid and is
 # reparented to launchd, and its terminal hosts stay its children. When the test process is killed before its
 # teardown (the hang watchdog, a step timeout, a cancel), nothing ends them. On 2026-10-11 the minis held ~60
@@ -4774,6 +4842,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.phase == "job-completed":
         current_worker = runner_worker_pid()
         for note in cleanup_leaked_test_apps({current_worker} if current_worker else set()):
+            print(f"{PREFIX}: {note}", flush=True)
+        for note in cleanup_leaked_media_apps({current_worker} if current_worker else set()):
             print(f"{PREFIX}: {note}", flush=True)
         for note in cleanup_job_leftovers():
             print(f"{PREFIX}: {note}", flush=True)

@@ -3052,6 +3052,34 @@ class LeakedAppTest(unittest.TestCase):
         }
         self.assertEqual(hook.leaked_test_app_pids(table), [])
 
+    def test_orphaned_media_app_is_selected_only_when_no_other_runner_is_live(self) -> None:
+        app = "/Users/cmux/Library/Developer/Xcode/DerivedData/cmux-ci-media-pr-20473-head/Build/Products/Debug/cmux DEV.app/Contents/Resources/bin/cmux-tui --headless --session cmux-chief"
+        table = {
+            10: (1, app),
+            30: (1, "/Users/cmux/actions-runner-glaeda-2/bin/Runner.Worker spawnclient"),
+        }
+        self.assertEqual(hook.leaked_media_app_pids(table), [])
+        self.assertEqual([pid for pid, _ in hook.leaked_media_app_pids(table, {30})], [10])
+
+    def test_media_app_with_live_runner_ancestor_is_protected(self) -> None:
+        app = "/Users/cmux/Library/Developer/Xcode/DerivedData/cmux-ci-media-feat-cmux-next-base/Build/Products/Debug/cmux DEV.app/Contents/Resources/bin/cmux-tui --headless"
+        table = {
+            10: (20, app),
+            20: (1, "/Users/cmux/actions-runner-glaeda/bin/Runner.Worker spawnclient"),
+        }
+        self.assertEqual(hook.leaked_media_app_pids(table), [])
+
+    def test_cleanup_ends_detached_media_app(self) -> None:
+        pid = 123
+        app = "/Users/cmux/Library/Developer/Xcode/DerivedData/cmux-ci-media-test/Build/Products/Debug/cmux DEV.app/Contents/Resources/bin/cmux-tui"
+        table = {pid: (1, app)}
+        with mock.patch.object(hook, "processes", side_effect=[table, table]), \
+             mock.patch.object(hook, "pid_alive", side_effect=[False, False, False]), \
+             mock.patch.object(hook.os, "kill") as kill:
+            notes = hook.cleanup_leaked_media_apps()
+        kill.assert_called_once_with(pid, signal.SIGTERM)
+        self.assertTrue(notes and "killed pid" in notes[0], notes)
+
 
 class JobLeftoverTest(unittest.TestCase):
     WORK = "/Users/cmux/actions-runner-glaeda-3/_work"
