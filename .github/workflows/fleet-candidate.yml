@@ -9,10 +9,17 @@ on:
       - scripts/test-fleet-bundle.py
       - scripts/fleet_candidate_receipt.py
       - scripts/test-fleet-candidate-receipt.py
+      - scripts/managed_mac_candidate_receipt.py
+      - scripts/test-managed-mac-candidate-receipt.py
+      - scripts/benchmark-native-runner-log.py
+      - scripts/test-benchmark-native-runner-log.py
+      - docs/NATIVE_RUNNER_LOG_BENCHMARK.md
       - tests/fleet_bundle_contract.rs
       - scripts/glaeda-disk
       - scripts/test-glaeda-disk.py
       - src/runner_log_reclaim.rs
+      - src/runner_log_reclaim_store.rs
+      - src/production_recovery_adapter.rs
       - src/bin/glaeda-runner-log-reclaim.rs
       - tests/runner_log_macos.rs
       - Cargo.toml
@@ -43,6 +50,8 @@ jobs:
         with:
           persist-credentials: false
           show-progress: false
+      - name: Initialize stable candidate artifact directory
+        run: mkdir -p target/fleet-bundles
       - name: Install pinned Rust
         run: rustup toolchain install 1.97.1 --profile minimal --no-self-update
       - name: Test bundle and receipt verification
@@ -50,6 +59,8 @@ jobs:
         run: |
           python3 scripts/test-fleet-bundle.py
           python3 scripts/test-fleet-candidate-receipt.py
+          python3 scripts/test-managed-mac-candidate-receipt.py
+          python3 scripts/test-benchmark-native-runner-log.py
       - name: Build exact-source candidate
         id: candidate_build
         env:
@@ -77,6 +88,47 @@ jobs:
             --target "$CANDIDATE_TARGET" --target-dir target/fleet-candidate-build
           cp "target/fleet-candidate-build/$CANDIDATE_TARGET/release/glaeda-runner-log-reclaim" \
             target/fleet-bundles/glaeda-runner-log-reclaim
+      - name: Build managed Mac admission adapter
+        id: admission_build
+        if: matrix.target == 'aarch64-apple-darwin'
+        env:
+          CANDIDATE_TARGET: ${{ matrix.target }}
+        run: |
+          cargo build --locked --release --lib \
+            --target "$CANDIDATE_TARGET" --target-dir target/fleet-candidate-build
+          adapter_artifact="$(find "target/fleet-candidate-build/$CANDIDATE_TARGET/release/deps" \
+            -type f -name 'libglaeda-*.rlib' -print -quit)"
+          test -n "$adapter_artifact"
+          cp "$adapter_artifact" target/fleet-bundles/glaeda-managed-admission.rlib
+      - name: Run full synthetic receipt-backed admission matrix
+        id: admission_matrix
+        if: matrix.target == 'aarch64-apple-darwin'
+        env:
+          CANDIDATE_TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          set +e
+          cargo test --locked --release --lib production_recovery_adapter:: \
+            --target "$CANDIDATE_TARGET" --target-dir target/fleet-candidate-build \
+            -- --test-threads=1 --nocapture 2>&1 | tee target/fleet-bundles/managed-admission-matrix.log
+          status=${PIPESTATUS[0]}
+          exit "$status"
+      - name: Record managed Mac admission receipt
+        if: always() && matrix.target == 'aarch64-apple-darwin'
+        env:
+          REPOSITORY: ${{ github.repository }}
+          REQUESTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          TARGET: ${{ matrix.target }}
+          ADMISSION_BUILD_OUTCOME: ${{ steps.admission_build.outcome }}
+          ADMISSION_MATRIX_OUTCOME: ${{ steps.admission_matrix.outcome }}
+          FAILURE_STAGE: managed_mac_admission
+          FAILURE_REASON: ${{ steps.admission_build.outcome != 'success' && 'adapter_artifact_missing' || steps.admission_matrix.outcome != 'success' && 'synthetic_matrix_failed' || '' }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          python3 scripts/managed_mac_candidate_receipt.py \
+            --artifact target/fleet-bundles/glaeda-managed-admission.rlib \
+            --output target/fleet-bundles/managed-admission-receipt.json
       - name: Test native runner-log observer (macOS)
         id: native_test
         if: matrix.target == 'aarch64-apple-darwin'
