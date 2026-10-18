@@ -8,7 +8,7 @@ Every push to main builds one release in CI (.github/workflows/release.yml):
                                      tree's own scripts/glaeda-mini-setup --reclaim-binary
     glaeda-<source>-<target>.tar.gz  the fleet candidate bundle (scripts/fleet_bundle.py), carried
                                      for the operator's glaeda-mini-fleet upgrade; not auto-applied
-    release.json                     source commit and the SHA-256 and size of every asset
+    release.json                     source commit, signed risk/soak policy, and the SHA-256 and size of every asset
 
 The release is tagged r-<UTC date>-<source[:12]> and each asset carries a build-provenance
 attestation from release.yml on main. One more release, tag `ota-channels`, holds the only mutable
@@ -34,6 +34,7 @@ import gzip
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import subprocess
@@ -46,9 +47,12 @@ CHANNELS_TAG = "ota-channels"
 CHANNEL_SCHEMA = "glaeda-ota-channel/v1"
 CONTROL_SCHEMA = "glaeda-ota-control/v1"
 RELEASE_SCHEMA = "glaeda-release/v1"
+POLICY_SCHEMA = "glaeda-release-policy/v1"
 TARGETS = ("aarch64-apple-darwin", "x86_64-unknown-linux-gnu")
 STATUS_PREFIX = "glaeda-ota/"
 SOAK_HOURS = 6
+RISK_SOAK_HOURS = {"low": 2, "normal": 6, "high": 12}
+CANARY_HOSTS = ("air-blue", "big-red")
 MAX_ASSET = 200 * 1024 * 1024
 TAG_RE = re.compile(r"r-\d{8}-[0-9a-f]{12}")
 SHA_RE = re.compile(r"[0-9a-f]{40}")
@@ -137,11 +141,61 @@ def hygiene_archive(root: Path, source: str, reclaim: Path) -> bytes:
     return out.getvalue()
 
 
-def release_manifest(source: str, tag: str, assets: dict[str, bytes]) -> dict:
-    return {
+def policy_for_paths(paths: list[str]) -> dict:
+    """Classify a release from its exact first-parent diff; unknown input is high risk."""
+    if not paths:
+        risk = "high"
+    else:
+        low = all(path.startswith(("docs/", "tests/", "scripts/test-")) or
+                  path in {"README.md", "CHANGELOG.md"} for path in paths)
+        high_markers = ("glaeda-update", "glaeda_release.py", "glaeda-mini-setup",
+                        "glaeda-cmux-runner", "glaeda-fleet", "fleet_", "Cargo.",
+                        "src/", ".github/workflows/", "auth", "attest", "rollback",
+                        "persist", "lease", "cleanup", "ownership", "recovery", "security")
+        risk = "low" if low else "high" if any(any(marker in path for marker in high_markers)
+                                                 for path in paths) else "normal"
+    return {"schema": POLICY_SCHEMA, "risk": risk, "soakHours": RISK_SOAK_HOURS[risk],
+            "requiredHosts": [] if risk == "low" else list(CANARY_HOSTS),
+            "paths": sorted(paths)}
+
+
+def release_policy(root: Path, source: str) -> dict:
+    parent = f"{source}^1"
+    result = subprocess.run(["git", "-C", str(root), "diff", "--name-only", parent, source],
+                            check=True, capture_output=True, text=True)
+    return policy_for_paths([path for path in result.stdout.splitlines() if path])
+
+
+def parse_policy(value: object, *, legacy: bool = False) -> dict:
+    if value is None and legacy:
+        return {"schema": POLICY_SCHEMA, "risk": "normal", "soakHours": SOAK_HOURS,
+                "requiredHosts": [], "paths": [], "legacy": True}
+    if isinstance(value, dict) and value.get("legacy") is True:
+        return parse_policy(None, legacy=True)
+    if not isinstance(value, dict) or value.get("schema") != POLICY_SCHEMA:
+        raise ReleaseError("release policy is missing or malformed")
+    risk = value.get("risk")
+    hours = value.get("soakHours")
+    hosts = value.get("requiredHosts")
+    paths = value.get("paths")
+    if risk not in RISK_SOAK_HOURS or hours != RISK_SOAK_HOURS[risk] or not isinstance(hosts, list) \
+            or not all(isinstance(host, str) and host in CANARY_HOSTS for host in hosts) \
+            or risk != "low" and sorted(hosts) != sorted(CANARY_HOSTS) \
+            or risk == "low" and hosts \
+            or not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
+        raise ReleaseError("release policy is malformed")
+    return {"schema": POLICY_SCHEMA, "risk": risk, "soakHours": hours,
+            "requiredHosts": sorted(hosts), "paths": sorted(paths)}
+
+
+def release_manifest(source: str, tag: str, assets: dict[str, bytes], policy: dict | None = None) -> dict:
+    out = {
         "schema": RELEASE_SCHEMA, "repository": REPOSITORY, "tag": tag, "source": source,
         "assets": {name: {"sha256": sha256(raw), "size": len(raw)} for name, raw in sorted(assets.items())},
     }
+    if policy is not None:
+        out["policy"] = policy
+    return out
 
 
 def parse_release(raw: bytes, expected_sha256: str) -> dict:
@@ -152,6 +206,7 @@ def parse_release(raw: bytes, expected_sha256: str) -> dict:
     if (doc.get("schema") != RELEASE_SCHEMA or doc.get("repository") != REPOSITORY
             or not TAG_RE.fullmatch(str(doc.get("tag"))) or not SHA_RE.fullmatch(str(doc.get("source")))):
         raise ReleaseError("release.json is malformed")
+    doc["policy"] = parse_policy(doc.get("policy"), legacy=doc.get("policy") is None)
     for name, meta in doc.get("assets", {}).items():
         if ("/" in name or not HEX64.fullmatch(str(meta.get("sha256")))
                 or not isinstance(meta.get("size"), int) or not 0 < meta["size"] <= MAX_ASSET):
@@ -161,7 +216,8 @@ def parse_release(raw: bytes, expected_sha256: str) -> dict:
 
 def channel_entry(ring: str, doc: dict, release_raw: bytes, published: str) -> dict:
     return {"schema": CHANNEL_SCHEMA, "ring": ring, "tag": doc["tag"], "source": doc["source"],
-            "releaseSha256": sha256(release_raw), "published": published}
+            "releaseSha256": sha256(release_raw), "published": published,
+            "policy": parse_policy(doc.get("policy"), legacy=doc.get("policy") is None)}
 
 
 def parse_channel(raw: bytes, ring: str) -> dict:
@@ -184,7 +240,7 @@ def parse_control(raw: bytes) -> dict:
     return doc
 
 
-def canary_verdict(statuses: list[dict]) -> tuple[int, int]:
+def canary_verdict(statuses: list[dict], required_hosts: tuple[str, ...] = ()) -> tuple[int, int, int]:
     """(successes, failures) among the newest status of each glaeda-ota/<host> context."""
     newest: dict[str, dict] = {}
     for status in statuses:
@@ -194,31 +250,44 @@ def canary_verdict(statuses: list[dict]) -> tuple[int, int]:
         seen = newest.get(context)
         if seen is None or str(status.get("updated_at", "")) > str(seen.get("updated_at", "")):
             newest[context] = status
-    states = [s.get("state") for s in newest.values()]
-    return states.count("success"), sum(state in ("failure", "error") for state in states)
+    states = ([newest.get(STATUS_PREFIX + host, {}).get("state") for host in required_hosts]
+              if required_hosts else [status.get("state") for status in newest.values()])
+    observed = [s for s in states if s]
+    successes = sum(state == "success" for state in observed)
+    failures = sum(state in ("failure", "error") for state in observed)
+    inconclusive = len(states) - successes - failures if required_hosts else sum(
+        status.get("state") not in ("success", "failure", "error") for status in newest.values())
+    return successes, failures, inconclusive
 
 
 def promotion(canary: dict | None, stable: dict | None, statuses: list[dict], now: dt.datetime,
-              soak_hours: float = SOAK_HOURS) -> tuple[bool, str]:
+              soak_hours: float | None = None) -> tuple[bool, str]:
     """Whether `canary` may become `stable` now, and why. Pausing stops hosts, not this."""
     if canary is None:
         return False, "no canary release"
     if stable is not None and stable["tag"] == canary["tag"]:
         return False, "stable is already the canary"
+    policy = parse_policy(canary.get("policy"), legacy=canary.get("policy") is None)
+    soak_hours = policy["soakHours"] if soak_hours is None else soak_hours
     published = dt.datetime.fromisoformat(canary["published"].replace("Z", "+00:00"))
     age = (now - published).total_seconds() / 3600
     if age < soak_hours:
         return False, f"canary soaking: {age:.1f} h of {soak_hours} h"
-    ok, failed = canary_verdict(statuses)
+    required = tuple(policy["requiredHosts"])
+    ok, failed, inconclusive = canary_verdict(statuses, required)
     if failed:
         return False, f"{failed} canary host(s) reported failure"
+    if inconclusive:
+        return False, f"{inconclusive} required canary host(s) are inconclusive"
+    if required and ok != len(required):
+        return False, f"{ok}/{len(required)} required canary hosts reported success"
     if not ok:
         return False, "no canary host reported success"
     return True, f"{ok} canary host(s) healthy after {age:.1f} h"
 
 
 def choose(candidates: list[dict], stable: dict | None, now: dt.datetime,
-           soak_hours: float = SOAK_HOURS) -> tuple[dict | None, str]:
+           soak_hours: float | None = None) -> tuple[dict | None, str]:
     """The newest candidate that may become stable, and why (or why none).
 
     Each candidate is {"entry": <canary-shaped entry>, "statuses": [...], "descendsFromStable": bool}.
@@ -230,7 +299,8 @@ def choose(candidates: list[dict], stable: dict | None, now: dt.datetime,
         if stable is not None and entry["tag"] == stable["tag"]:
             reasons.append(f"{entry['tag']}: already stable")
             break  # everything older is older than stable too
-        if canary_verdict(candidate["statuses"])[1]:
+        policy = parse_policy(candidate.get("policy"), legacy=candidate.get("policy") is None)
+        if canary_verdict(candidate["statuses"], tuple(policy["requiredHosts"]))[1]:
             # A release's own updater installs its successor, so a canary failure on a newer release can
             # be an older release's fault: nothing older is promoted until a newer one is healthy.
             reasons.append(f"{entry['tag']}: a canary reported failure; nothing older is promoted")
@@ -238,7 +308,8 @@ def choose(candidates: list[dict], stable: dict | None, now: dt.datetime,
         if stable is not None and not candidate.get("descendsFromStable"):
             reasons.append(f"{entry['tag']}: does not descend from stable")
             continue
-        ok, why = promotion(entry, stable, candidate["statuses"], now, soak_hours)
+        ok, why = promotion(entry, stable, candidate["statuses"], now,
+                            soak_hours if soak_hours is not None else policy["soakHours"])
         if ok:
             return entry, f"{entry['tag']}: {why}"
         reasons.append(f"{entry['tag']}: {why}")
@@ -277,11 +348,14 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("promote", help="print stable.json for the best candidate (exit 3 if none)")
     p.add_argument("--candidates", type=Path, required=True, help="JSON lines from `candidate`")
     p.add_argument("--stable", type=Path, help="current stable.json; absent means none yet")
-    p.add_argument("--soak-hours", type=float, default=SOAK_HOURS)
+    p.add_argument("--soak-hours", type=float, help="explicit operator override; otherwise use release policy")
     k = sub.add_parser("control", help="print control.json")
     k.add_argument("--paused", choices=("true", "false"), required=True)
     a = ap.parse_args(argv)
     try:
+        if a.command == "promote" and a.soak_hours is not None \
+                and (not math.isfinite(a.soak_hours) or a.soak_hours < 0):
+            raise ReleaseError("--soak-hours must be finite and non-negative")
         if a.command == "hygiene":
             raw = hygiene_archive(Path(__file__).resolve().parents[1], a.source, a.reclaim)
             a.output.mkdir(parents=True, exist_ok=True)
@@ -294,7 +368,9 @@ def main(argv: list[str] | None = None) -> int:
                       if p.is_file() and p.name != "release.json"}
             if not assets:
                 raise ReleaseError("no assets")
-            (a.assets / "release.json").write_bytes(canonical(release_manifest(a.source, a.tag, assets)))
+            root = Path(__file__).resolve().parents[1]
+            (a.assets / "release.json").write_bytes(canonical(
+                release_manifest(a.source, a.tag, assets, release_policy(root, a.source))))
         elif a.command == "canary":
             release_raw = a.release.read_bytes()
             doc = parse_release(release_raw, sha256(release_raw))
@@ -306,7 +382,9 @@ def main(argv: list[str] | None = None) -> int:
             if not isinstance(statuses, list):
                 raise ReleaseError("statuses must be the API's JSON list")
             entry = channel_entry("canary", doc, release_raw, a.published)
-            print(json.dumps({"entry": entry, "statuses": statuses, "descendsFromStable": a.descends == "true"},
+            policy = parse_policy(doc.get("policy"), legacy=doc.get("policy") is None)
+            print(json.dumps({"entry": entry, "policy": policy, "statuses": statuses,
+                              "descendsFromStable": a.descends == "true"},
                              sort_keys=True))
         elif a.command == "promote":
             stable = parse_channel(a.stable.read_bytes(), "stable") if a.stable else None

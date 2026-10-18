@@ -13,9 +13,8 @@ on:
       soak_hours:
         # An operator's early promotion of a narrow fix for live fleet breakage, after canary hosts
         # reported success (glaeda#1461/#1462, 2026-10-13). Every other check still applies.
-        description: "Soak hours for this run (default 6)"
+        description: "Optional explicit soak override; empty uses each release's signed policy"
         required: false
-        default: "6"
 
 permissions:
   contents: write
@@ -41,7 +40,7 @@ jobs:
           fetch-depth: 0  # stable only moves forward: the ancestry check needs history
       - name: Promote the newest healthy soaked release
         env:
-          SOAK_HOURS: ${{ inputs.soak_hours || '6' }}
+          SOAK_HOURS: ${{ inputs.soak_hours }}
         run: |
           mkdir -p channels
           stable=()
@@ -56,8 +55,8 @@ jobs:
           fi
           # releases newest first, down to stable; soaking ones count too, since their canary failures
           # block promoting anything older
-          gh release list --limit 40 --json tagName,createdAt \
-            --jq '.[] | select(.tagName | test("^r-[0-9]{8}-[0-9a-f]{12}$")) | "\(.tagName) \(.createdAt)"' \
+          gh release list --limit 40 --json tagName,publishedAt \
+            --jq '.[] | select(.tagName | test("^r-[0-9]{8}-[0-9a-f]{12}$")) | "\(.tagName) \(.publishedAt)"' \
             > channels/releases.txt
           : > channels/candidates.jsonl
           considered=0
@@ -80,8 +79,11 @@ jobs:
             if [ "$tag" = "$stable_tag" ] || [ "$considered" -ge 20 ]; then break; fi
           done < channels/releases.txt
           set +e
-          python3 scripts/glaeda_release.py promote --candidates channels/candidates.jsonl "${stable[@]}" \
-            --soak-hours "$SOAK_HOURS" > channels/next.json 2> channels/why.txt
+          promote_args=(--candidates channels/candidates.jsonl "${stable[@]}")
+          if [ -n "$SOAK_HOURS" ]; then
+            promote_args+=(--soak-hours "$SOAK_HOURS")
+          fi
+          python3 scripts/glaeda_release.py promote "${promote_args[@]}" > channels/next.json 2> channels/why.txt
           code=$?
           set -e
           cat channels/why.txt >> "$GITHUB_STEP_SUMMARY"

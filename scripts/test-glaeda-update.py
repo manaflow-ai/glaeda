@@ -15,7 +15,9 @@ import sys
 import tarfile
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -130,6 +132,70 @@ class UpdateTest(unittest.TestCase):
         if test_bin is None:
             os.environ.pop("GLAEDA_TEST_BIN", None)
         self.tmp.cleanup()
+
+    def test_status_post_timeout_is_inconclusive_not_an_exception(self) -> None:
+        config = {**self.config, "reportStatus": True}
+        entry = {"tag": "r-20260925-" + "a" * 12, "source": "a" * 40}
+        old_find_gh = gu.find_gh
+        gu.find_gh = lambda: "/usr/bin/gh"
+        try:
+            with mock.patch.object(gu.subprocess, "run",
+                                   side_effect=subprocess.TimeoutExpired("gh", 60)):
+                self.assertEqual(gu.report(config, entry, True, "installed"),
+                                 "not reported (TimeoutExpired)")
+        finally:
+            gu.find_gh = old_find_gh
+
+    def test_attestation_auth_timeout_is_unavailable(self) -> None:
+        old_find_gh = gu.find_gh
+        old_attestation = gu.attestation_ok
+        gu.find_gh = lambda: "/usr/bin/gh"
+        gu.attestation_ok = self.saved[1]
+        try:
+            with mock.patch.object(gu.subprocess, "run",
+                                   side_effect=subprocess.TimeoutExpired("gh", 60)):
+                self.assertIsNone(gu.attestation_ok(Path("/tmp/archive.tar.gz")))
+        finally:
+            gu.find_gh = old_find_gh
+            gu.attestation_ok = old_attestation
+
+    def test_attestation_api_failure_is_unavailable(self) -> None:
+        old_find_gh = gu.find_gh
+        old_attestation = gu.attestation_ok
+        gu.find_gh = lambda: "/usr/bin/gh"
+        gu.attestation_ok = self.saved[1]
+        try:
+            responses = [subprocess.CompletedProcess([], 0, "", ""),
+                         subprocess.CompletedProcess([], 1, "", "HTTP 403: API rate limit")]
+            with mock.patch.object(gu.subprocess, "run", side_effect=responses):
+                self.assertIsNone(gu.attestation_ok(Path("/tmp/archive.tar.gz")))
+        finally:
+            gu.find_gh = old_find_gh
+            gu.attestation_ok = old_attestation
+
+    def test_host_profile_mismatch_reports_pending(self) -> None:
+        config = {**self.config, "reportStatus": True}
+        entry = {"tag": "r-20260925-" + "a" * 12, "source": "a" * 40}
+        old_find_gh = gu.find_gh
+        gu.find_gh = lambda: "/usr/bin/gh"
+        try:
+            completed = subprocess.CompletedProcess([], 0, "", "")
+            with mock.patch.object(gu.subprocess, "run", return_value=completed) as run:
+                self.assertEqual(gu.report(config, entry, None, "host profile mismatch"), "reported")
+                self.assertIn("state=pending", run.call_args.args[0])
+        finally:
+            gu.find_gh = old_find_gh
+
+    def test_fetch_timeout_is_inconclusive_and_does_not_quarantine(self) -> None:
+        entry = self.server.publish(SOURCES[0])
+        old_fetch = gu.fetch
+        gu.fetch = mock.Mock(side_effect=urllib.error.URLError("offline"))
+        try:
+            result = self.run_update()
+        finally:
+            gu.fetch = old_fetch
+        self.assertEqual(result["result"], "inconclusive")
+        self.assertNotIn(entry["tag"], gu.load_state(self.state)["quarantined"])
 
     def run_update(self, apply: bool = True) -> dict:
         return gu.update(apply, self.config, self.state, self.server.channel(self.config["ring"]), self.bin)
@@ -348,7 +414,10 @@ class UpdateTest(unittest.TestCase):
         # a canary that cannot check refuses; stable, which only names canary-verified releases, installs
         self.server.publish(SOURCES[1])
         gu.attestation_ok = lambda path: None
-        self.assertIn("canary must verify", self.run_update()["detail"])
+        inconclusive = self.run_update()
+        self.assertEqual(inconclusive["result"], "inconclusive")
+        self.assertIn("canary must verify", inconclusive["detail"])
+        self.assertNotIn(self.server.rings["canary"]["tag"], gu.load_state(self.state)["quarantined"])
         self.assertFalse(self.bin.exists())
         self.config["ring"] = "stable"
         self.state = self.root / "stable-host-state"  # another host, which has quarantined nothing
@@ -473,6 +542,33 @@ class ReleaseTest(unittest.TestCase):
 
     def status(self, host: str, state: str, at: str) -> dict:
         return {"context": gr.STATUS_PREFIX + host, "state": state, "updated_at": at}
+
+    def test_policy_classifies_exact_paths_and_sets_coverage(self) -> None:
+        low = gr.policy_for_paths(["docs/GLAEDA_OTA.md", "tests/test_policy.md"])
+        self.assertEqual((low["risk"], low["soakHours"], low["requiredHosts"]), ("low", 2, []))
+        normal = gr.policy_for_paths(["scripts/telemetry.py"])
+        self.assertEqual((normal["risk"], normal["soakHours"], normal["requiredHosts"]),
+                         ("normal", 6, list(gr.CANARY_HOSTS)))
+        high = gr.policy_for_paths(["scripts/glaeda-update"])
+        self.assertEqual((high["risk"], high["soakHours"], high["requiredHosts"]),
+                         ("high", 12, list(gr.CANARY_HOSTS)))
+        self.assertEqual(gr.policy_for_paths([])["risk"], "high")
+
+    def test_policy_requires_each_registered_canary_for_operational_release(self) -> None:
+        candidate = {**self.canary(), "policy": gr.policy_for_paths(["scripts/telemetry.py"])}
+        one = [self.status("air-blue", "success", "2026-09-25T01:00:00Z")]
+        self.assertEqual(gr.promotion(candidate, None, one, self.NOW)[0], False)
+        both = one + [self.status("big-red", "success", "2026-09-25T02:00:00Z")]
+        self.assertTrue(gr.promotion(candidate, None, both, self.NOW)[0])
+        pending = one + [self.status("big-red", "pending", "2026-09-25T02:00:00Z")]
+        self.assertIn("inconclusive", gr.promotion(candidate, None, pending, self.NOW)[1])
+
+    def test_soak_override_rejects_non_finite_or_negative_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "candidates.jsonl"
+            path.write_text("")
+            for value in ("-1", "nan", "inf"):
+                self.assertEqual(gr.main(["promote", "--candidates", str(path), "--soak-hours", value]), 1)
 
     def test_promotion_needs_soak_success_and_no_failure(self) -> None:
         ok = [self.status("air-blue", "success", "2026-09-25T01:00:00Z")]

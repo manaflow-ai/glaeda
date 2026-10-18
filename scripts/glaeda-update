@@ -125,6 +125,10 @@ class UpdateError(RuntimeError):
     pass
 
 
+class UpdateInconclusive(UpdateError):
+    """A transient or host-observability condition that must not quarantine a release."""
+
+
 def local_target() -> str:
     system, machine = platform.system(), platform.machine().lower()
     if system == "Darwin" and machine in ("arm64", "aarch64"):
@@ -277,12 +281,23 @@ def attestation_ok(path: Path) -> bool | None:
     gh = find_gh()
     if not gh:
         return None
-    signed_in = subprocess.run([gh, "auth", "status"], capture_output=True, text=True, timeout=60)
+    try:
+        signed_in = subprocess.run([gh, "auth", "status"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
     if signed_in.returncode != 0:
         return None
-    result = subprocess.run([gh, "attestation", "verify", str(path), "--repo", REPOSITORY,
-                             "--signer-workflow", SIGNER_WORKFLOW, "--source-ref", "refs/heads/main"],
-                            capture_output=True, text=True, timeout=120)
+    try:
+        result = subprocess.run([gh, "attestation", "verify", str(path), "--repo", REPOSITORY,
+                                 "--signer-workflow", SIGNER_WORKFLOW, "--source-ref", "refs/heads/main"],
+                                capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    diagnostic = (result.stdout + result.stderr).lower()
+    if any(marker in diagnostic for marker in ("http 401", "http 403", "http 429", "api rate",
+                                                 "timeout", "timed out", "connection", "network",
+                                                 "temporarily unavailable", "permission denied")):
+        return None
     return result.returncode == 0
 
 
@@ -365,17 +380,21 @@ def restore(state_dir: Path, bin_dir: Path) -> bool:
     return True
 
 
-def report(config: dict, entry: dict, ok: bool, detail: str) -> str:
+def report(config: dict, entry: dict, ok: bool | None, detail: str) -> str:
     if config["ring"] != "canary" or not config["reportStatus"]:
         return "not reported (not a reporting canary)"
     gh = find_gh()
     if not gh:
         return "not reported (no gh)"
-    result = subprocess.run(
-        [gh, "api", "-X", "POST", f"repos/{REPOSITORY}/statuses/{entry['source']}",
-         "-f", f"state={'success' if ok else 'failure'}", "-f", f"context={STATUS_PREFIX}{config['host']}",
-         "-f", f"description={entry['tag']}: {detail}"[:140]],
-        capture_output=True, text=True, timeout=60)
+    state = "success" if ok is True else "failure" if ok is False else "pending"
+    try:
+        result = subprocess.run(
+            [gh, "api", "-X", "POST", f"repos/{REPOSITORY}/statuses/{entry['source']}",
+             "-f", f"state={state}", "-f", f"context={STATUS_PREFIX}{config['host']}",
+             "-f", f"description={entry['tag']}: {detail}"[:140]],
+            capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"not reported ({type(e).__name__})"
     return "reported" if result.returncode == 0 else f"not reported (gh exited {result.returncode})"
 
 
@@ -421,10 +440,12 @@ def download(state_dir: Path, entry: dict, target: str, ring: str, source: str =
     archive = partial / name
     archive.write_bytes(raw)
     attested = attestation_ok(archive)
-    if attested is False or (attested is None and ring == "canary"):
+    if attested is False:
         shutil.rmtree(partial, ignore_errors=True)
-        raise UpdateError("build-provenance attestation did not verify" if attested is False else
-                          "a canary must verify the attestation: install gh and sign in")
+        raise UpdateError("build-provenance attestation did not verify")
+    if attested is None and ring == "canary":
+        shutil.rmtree(partial, ignore_errors=True)
+        raise UpdateInconclusive("a canary must verify the attestation: install gh and sign in")
     safe_extract(archive, partial)
     archive.unlink()
     (partial / "release.json").write_bytes(release_raw)
@@ -669,6 +690,11 @@ def update(apply: bool, config: dict, state_dir: Path = STATE_DIR,
         return {**out, "result": "plan", "why": f"would install {entry['tag']}"}
     try:
         gen = download(state_dir, entry, local_target(), config["ring"], source)
+    except UpdateInconclusive as e:
+        return {**out, "result": "inconclusive", "detail": str(e), "status": report(config, entry, None, str(e))}
+    except (urllib.error.URLError, TimeoutError) as e:
+        detail = f"transient update fetch: {e}"
+        return {**out, "result": "inconclusive", "detail": detail, "status": report(config, entry, None, detail)}
     except UpdateError as e:
         # The release failed verification (digest, attestation, archive): that is the release's fault
         # or a real attack, never a blip, so it counts against it. Network errors are not UpdateError
@@ -686,12 +712,12 @@ def update(apply: bool, config: dict, state_dir: Path = STATE_DIR,
         detail = (f"target {entry['tag']} is {order} than installed {state['current']}; refusing to replace it")
         # This is a channel or host-configuration mismatch, not a failed artifact.
         # Re-evaluate it after the channel advances or setup flags change.
-        return {**out, "result": "refused", "detail": detail, "status": report(config, entry, False, detail)}
+        return {**out, "result": "refused", "detail": detail, "status": report(config, entry, None, detail)}
     supported, detail = setup_args_supported(gen, config["setupArgs"])
     if not supported:
         # An older release can be valid for another host profile. Do not turn a
         # persisted setup flag mismatch into an operator-cleared release gate.
-        return {**out, "result": "refused", "detail": detail, "status": report(config, entry, False, detail)}
+        return {**out, "result": "refused", "detail": detail, "status": report(config, entry, None, detail)}
     if state["current"] is None:
         snapshot(state_dir, bin_dir)
     ok, log = run_setup(gen, config["setupArgs"])

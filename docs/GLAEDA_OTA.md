@@ -17,7 +17,9 @@ but still installs through `glaeda-mini-fleet upgrade` (below).
    - `release.json`: the source commit and the SHA-256 and size of every asset.
 
    Every asset gets a build-provenance attestation. Releases are prereleases, so none is marked
-   "latest".
+   "latest". `release.json` also carries a hash-attested policy derived from the exact first-parent
+   diff: docs/tests are low risk, ordinary runtime changes are normal risk, and updater, installer,
+   runner, release, security, persistence, rollback, or ambiguous changes are high risk.
 2. **Canary.** The same workflow points `canary.json` at the new release, but only if the new
    commit descends from the current canary, so a slow build never moves canary backwards.
    The `ota-channels` release holds the only mutable files, each with one writer:
@@ -63,15 +65,24 @@ but still installs through `glaeda-mini-fleet upgrade` (below).
 5. **Stable.** `.github/workflows/promote.yml` runs hourly, and each canary run also dispatches it,
    since GitHub's cron can lag for hours. It moves `stable` to the newest release for which all of
    these hold:
-   - the release is at least 6 hours old;
-   - at least one canary host reported success;
-   - no canary host's newest status is a failure;
+   - the release's signed `policy` is valid and its publication timestamp is older than that policy's
+     soak floor: low-risk documentation/test-only changes are 2 hours, normal runtime changes are
+     6 hours, and high-risk updater, installer, runner, release, auth, persistence, rollback, or
+     ambiguous changes are 12 hours. Legacy manifests retain the original 6-hour behavior;
+   - low-risk releases have an explicit success from at least one canary; normal and high-risk
+     releases have explicit success from both registered canaries, Air Blue and Big Red;
+   - no required canary host's newest status is a failure, pending, or otherwise inconclusive;
    - it descends from the current stable;
    - no newer release has a canary failure. A release's own updater installs its successor, so a
      failure there can be the older release's fault; promotion waits until a newer one is healthy.
 
+   Host authentication, network, stale-channel, and unsupported-host-profile observations are
+   reported as `pending` or omitted, so they block promotion without quarantining the release as a
+   bad artifact. Only verification, setup, or health failures are reported as release failures.
+
    It looks past the current canary on purpose: with several merges a day the newest release is
-   never 6 hours old, and stable would never move.
+   never old enough, and stable would never move. Candidate age uses GitHub's `publishedAt`, the
+   same canonical publication time written into the channel receipt.
 
    Stable hosts pick it up within the hour.
 
