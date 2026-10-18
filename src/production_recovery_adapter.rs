@@ -160,7 +160,7 @@ pub struct RecoveryReceipt {
     pub pending_before: u64,
     pub repaired: u64,
     pub pending_after: u64,
-    pub disposition: &'static str,
+    pub disposition: String,
 }
 
 impl RecoveryReceipt {
@@ -174,9 +174,9 @@ impl RecoveryReceipt {
             repaired,
             pending_after: receipt.pending,
             disposition: if receipt.pending == 0 {
-                "clean_after_recovery"
+                "clean_after_recovery".into()
             } else {
-                "pending_recovery"
+                "pending_recovery".into()
             },
         }
     }
@@ -283,9 +283,9 @@ impl SyntheticStoreBackend {
             repaired: 0,
             pending_after: pending,
             disposition: if pending == 0 {
-                "clean_after_recovery"
+                "clean_after_recovery".into()
             } else {
-                "pending_recovery"
+                "pending_recovery".into()
             },
         }
     }
@@ -591,9 +591,10 @@ impl ProductionRecoveryAdapter {
                 receipt.already_projected += 1;
                 continue;
             }
+            let receipt_id = action.receipt_id.clone();
             self.append(Event::Projected {
                 identity,
-                receipt_id: action.receipt_id,
+                receipt_id,
             })?;
             receipt.projected += 1;
             receipt.items.push(ItemReceipt {
