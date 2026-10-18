@@ -9,12 +9,18 @@ wall, user, system, and peak child RSS, action counts, bytes, and each side's
 receipt identities.
 
 The native side must be a verified hosted artifact. Pass its binary hash, build
-receipt, and exact source commit/tree. `--checkout-commit` and
+receipt, the managed Mac adapter receipt, and exact source commit/tree. The
+managed receipt must report a successful synthetic matrix and
+`live_deletion_enabled=false`; the benchmark rejects a receipt that is not bound
+to the same source/tree. `--checkout-commit` and
 `--checkout-tree` bind that receipt to the checkout being benchmarked. The
-current observer intentionally returns
+ordinary observer intentionally returns
 `reclaim_not_ready` for `--apply`; the harness records that as
-`blocked_native_effect_comparison` and does not permit a speedup claim. A
-missing binary likewise runs the Python baseline and emits a blocked receipt.
+`blocked_native_effect_comparison` and does not permit a speedup claim. The
+isolated fixture lane passes the explicit `--synthetic-fixture` flag; that
+enrollment-gated path can delete only the private temporary fixture and does
+not enable live runner deletion. A missing binary likewise runs the Python
+baseline and emits a blocked receipt.
 
 Example using the existing optimized Python baseline:
 
@@ -25,6 +31,7 @@ python3 scripts/benchmark-native-runner-log.py \
   --native-binary /absolute/path/to/glaeda-runner-log-reclaim \
   --native-sha256 VERIFIED_BINARY_SHA256 \
   --native-receipt /absolute/path/to/glaeda-runner-log-reclaim.receipt.json \
+  --managed-adapter-receipt /absolute/path/to/managed-admission-receipt.json \
   --source-commit VERIFIED_HOSTED_SOURCE_SHA \
   --source-tree VERIFIED_HOSTED_SOURCE_TREE \
   --checkout-commit VERIFIED_BENCHMARK_HEAD \

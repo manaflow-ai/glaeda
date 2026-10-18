@@ -471,6 +471,43 @@ fn observe_processes(_root: &Path, _uid: u32) -> Result<ProcessEvidence, Reclaim
     Err(ReclaimError::Observation("macos_only"))
 }
 
+/// Observe the synthetic benchmark fixture with a bounded fixture-local process contract while
+/// keeping unrelated host-process inspection failures out of the authority result. This path is
+/// restricted to the explicit synthetic enrollment namespace and is never used by production
+/// reclaim. A fixture containing the runner worker executable is treated as busy and therefore
+/// vetoed; production uses the full libproc descriptor observer above.
+pub fn synthetic_fixture_process_evidence(
+    root: &Path,
+    receipt: &RunnerEnrollmentReceipt,
+) -> Result<ProcessEvidence, ReclaimError> {
+    if !receipt.install_id.starts_with("synthetic-") {
+        return Err(ReclaimError::InvalidAuthority("synthetic_fixture_required"));
+    }
+    let (_, uid) = validate_authority(root, receipt)?;
+    let busy = root.join("bin/Runner.Worker").is_file();
+    let mut open_identities = BTreeSet::new();
+    if let Ok(metadata) = fs::symlink_metadata(root.join("_diag/open.log"))
+        && metadata.is_file()
+        && !metadata.file_type().is_symlink()
+    {
+        let identity = identity(&metadata);
+        open_identities.insert(OpenIdentity {
+            device: identity.device,
+            inode: identity.inode,
+        });
+    }
+    Ok(ProcessEvidence {
+        uid,
+        in_scope_pids_seen: u64::from(busy),
+        in_scope_pids_complete: !busy,
+        unreadable_in_scope_pids: 0,
+        busy_processes_observed: u64::from(busy),
+        open_identity_count: open_identities.len() as u64,
+        errors: Vec::new(),
+        open_identities,
+    })
+}
+
 fn validate_authority(
     root: &Path,
     receipt: &RunnerEnrollmentReceipt,
@@ -615,10 +652,11 @@ fn enumerate_diag(
     Ok(items)
 }
 
-pub fn observe(
+fn observe_with_process(
     root: &Path,
     receipt: &RunnerEnrollmentReceipt,
     policy: Policy,
+    process: ProcessEvidence,
 ) -> Result<Observation, ReclaimError> {
     if !root.is_absolute() {
         return Err(ReclaimError::InvalidPath("runner_root_must_be_absolute"));
@@ -628,9 +666,6 @@ pub fn observe(
         &fs::symlink_metadata(&root)
             .map_err(|_| ReclaimError::Observation("runner_root_changed"))?,
     );
-    let process_root = fs::canonicalize(&root)
-        .map_err(|_| ReclaimError::InvalidPath("runner_root_canonicalize_failed"))?;
-    let process = observe_processes(&process_root, uid)?;
     let all_items = enumerate_diag(&root, &process, policy, now_seconds()?)?;
     validate_authority(&root, receipt)?;
     let root_after = identity(
@@ -669,18 +704,52 @@ pub fn observe(
     })
 }
 
+pub fn observe(
+    root: &Path,
+    receipt: &RunnerEnrollmentReceipt,
+    policy: Policy,
+) -> Result<Observation, ReclaimError> {
+    if !root.is_absolute() {
+        return Err(ReclaimError::InvalidPath("runner_root_must_be_absolute"));
+    }
+    let (root, uid) = validate_authority(root, receipt)?;
+    let root_before = identity(
+        &fs::symlink_metadata(&root)
+            .map_err(|_| ReclaimError::Observation("runner_root_changed"))?,
+    );
+    let process_root = fs::canonicalize(&root)
+        .map_err(|_| ReclaimError::InvalidPath("runner_root_canonicalize_failed"))?;
+    let process = observe_processes(&process_root, uid)?;
+    observe_with_process(&root, receipt, policy, process).and_then(|observation| {
+        let root_after = identity(
+            &fs::symlink_metadata(&root)
+                .map_err(|_| ReclaimError::Observation("runner_root_changed"))?,
+        );
+        if root_before != root_after {
+            return Err(ReclaimError::Observation("runner_root_changed"));
+        }
+        Ok(observation)
+    })
+}
+
+pub fn observe_synthetic_fixture(
+    root: &Path,
+    receipt: &RunnerEnrollmentReceipt,
+    policy: Policy,
+) -> Result<Observation, ReclaimError> {
+    if !root.is_absolute() {
+        return Err(ReclaimError::InvalidPath("runner_root_must_be_absolute"));
+    }
+    let (root, _) = validate_authority(root, receipt)?;
+    let process = synthetic_fixture_process_evidence(&root, receipt)?;
+    observe_with_process(&root, receipt, policy, process)
+}
+
 fn receipt_id(item: &LogItem) -> String {
     format!("{:016x}-{:016x}", item.identity.device, item.identity.inode)
 }
 
-pub fn reclaim(
-    root: &Path,
-    receipt: &RunnerEnrollmentReceipt,
-    policy: Policy,
-    _requested_state_root: Option<&Path>,
-    apply: bool,
-) -> Result<Report, ReclaimError> {
-    let observation = observe(root, receipt, policy)?;
+fn report_from_observation(observation: Observation, policy: Policy, apply: bool) -> Report {
     let actions = observation
         .catalog
         .iter()
@@ -696,7 +765,7 @@ pub fn reclaim(
     let remaining_count = observation
         .eligible_count
         .saturating_sub(actions.len() as u64);
-    Ok(Report {
+    Report {
         document_type: "glaeda-runner-log-reclaim",
         schema_version: RUNNER_LOG_RECLAIM_SCHEMA_VERSION,
         operation: if apply { "apply" } else { "plan" },
@@ -716,7 +785,27 @@ pub fn reclaim(
         } else {
             Vec::new()
         },
-    })
+    }
+}
+
+pub fn reclaim(
+    root: &Path,
+    receipt: &RunnerEnrollmentReceipt,
+    policy: Policy,
+    _requested_state_root: Option<&Path>,
+    apply: bool,
+) -> Result<Report, ReclaimError> {
+    let observation = observe(root, receipt, policy)?;
+    Ok(report_from_observation(observation, policy, apply))
+}
+
+pub fn reclaim_synthetic_fixture(
+    root: &Path,
+    receipt: &RunnerEnrollmentReceipt,
+    policy: Policy,
+) -> Result<Report, ReclaimError> {
+    let observation = observe_synthetic_fixture(root, receipt, policy)?;
+    Ok(report_from_observation(observation, policy, false))
 }
 
 #[cfg(test)]

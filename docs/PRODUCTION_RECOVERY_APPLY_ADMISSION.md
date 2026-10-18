@@ -2,8 +2,9 @@
 
 This is the review contract for turning the merged native runner-log observer,
 descriptor-bound store, and report-only handoff into a production adapter. It is
-design guidance only. This branch does not enable live deletion and does not
-change the observer or store implementation.
+design guidance only. The current primary review and synthetic-matrix status is
+in [`NATIVE_RUNNER_LOG_PRODUCTION_STATUS.md`](NATIVE_RUNNER_LOG_PRODUCTION_STATUS.md).
+This branch does not enable live deletion.
 
 ## Current boundary and blockers
 

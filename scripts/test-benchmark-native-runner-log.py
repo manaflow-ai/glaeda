@@ -79,6 +79,34 @@ class BenchmarkAccountingTest(unittest.TestCase):
         self.assertEqual(status, "blocked_native_effect_comparison")
         self.assertIn("native_source_receipt_mismatch", reasons)
 
+    def test_managed_adapter_receipt_must_bind_exact_source_and_disable_live_apply(self) -> None:
+        receipt = {
+            "document_type": "glaeda-managed-mac-admission-build-receipt",
+            "schema_version": 1,
+            "source_commit": "a" * 40,
+            "source_tree": "b" * 40,
+            "checked_out_commit": "a" * 40,
+            "checked_out_tree": "b" * 40,
+            "build_outcome": "success",
+            "synthetic_matrix_outcome": "success",
+            "binary_sha256": "c" * 64,
+            "synthetic_fixture": {
+                "mode": "synthetic_fixture",
+                "live_deletion_enabled": False,
+                "runner_root": None,
+            },
+        }
+        MODULE.validate_managed_adapter_receipt(
+            receipt, source_commit="a" * 40, source_tree="b" * 40
+        )
+        for field, value in (("source_tree", "d" * 40), ("synthetic_matrix_outcome", "failure")):
+            invalid = dict(receipt)
+            invalid[field] = value
+            with self.assertRaises(ValueError):
+                MODULE.validate_managed_adapter_receipt(
+                    invalid, source_commit="a" * 40, source_tree="b" * 40
+                )
+
     def test_reclaim_not_ready_blocks_comparison(self) -> None:
         status, reasons = MODULE.classify_status(
             [{"implementation": "native", "native_errors": ["reclaim_not_ready"],

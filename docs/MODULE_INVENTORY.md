@@ -36,7 +36,7 @@ being measured.
 ## Totals
 
 - Exported modules: **211**
-- Reach: **99 binary**, **65 library**, **12 tests**, **35 none**
+- Reach: **100 binary**, **64 library**, **12 tests**, **35 none**
 - Gate: at most 35 exports may have reach `none` (`UNREFERENCED_EXPORT_CEILING`)
 
 ## Exports with no consumer
@@ -264,7 +264,7 @@ let the gate hold the line.
 | `runner_account_observation` | `target_os="linux"` | binary | 7 |
 | `runner_account_plan` | `target_os="linux"` | binary | 17 |
 | `runner_log_reclaim` | `all` | binary | 4 |
-| `runner_log_reclaim_store` | `all` | library | 1 |
+| `runner_log_reclaim_store` | `all` | binary | 2 |
 | `runner_user` | `target_os="linux"` | binary | 9 |
 | `runner_user_observation` | `target_os="linux"` | binary | 2 |
 | `rust_memory_diagnostic` | `all` | none | 0 |
