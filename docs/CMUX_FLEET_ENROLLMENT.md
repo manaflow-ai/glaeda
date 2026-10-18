@@ -114,6 +114,13 @@ linked worktree is removed. It forwards them to `glaeda-worktree-reclaim --branc
 checked-out, protected, recent, or unfinished branches and only deletes finished idle branches.
 Discovery alone never deletes a branch or discards dirty files. Remote branches remain untouched.
 
+For a local-branch sweep without worktree scans, use `glaeda-worktree-reclaim --repository <main-checkout>
+--branches-only` (plan), then add `--apply` after reviewing its receipt. This mode implies `--branches`
+and skips process and worktree-content observation; checked-out/rebasing/bisecting branches remain
+protected by the existing branch planner. JSON reports the linked registrations as `summary.skipped`
+and leaves `worktrees` empty rather than claiming they passed inspection. The hourly wrapper keeps
+its usual combined worktree-and-branch sweep.
+
 ## Keep a fleet in line with its manifest
 
 `scripts/glaeda-mini-fleet` holds a whole fleet of build minis to one declarative manifest: each host's hardware class, macOS floor, the Xcode apps and selection it must carry, the SSH keys its login user must, may, and must not accept, the launchd jobs that must be running, and a free-disk floor.

@@ -100,6 +100,11 @@ struct Cli {
     #[arg(long)]
     branches: bool,
 
+    /// Inspect/delete local branches only; skip worktree and process scans. Implies --branches.
+    /// Checked-out, rebasing, bisecting, protected, recent and unfinished branches stay protected.
+    #[arg(long)]
+    branches_only: bool,
+
     /// `gh` used to ask GitHub whether a branch's pull request merged (squash merges that main
     /// has since changed further look unfinished to Git alone). Found automatically if omitted.
     #[arg(long)]
@@ -167,6 +172,8 @@ struct Summary {
     prunable: usize,
     unobservable: usize,
     reclaimed: usize,
+    /// Linked registrations deliberately not scanned in --branches-only mode.
+    skipped: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -260,6 +267,7 @@ fn main() -> ExitCode {
     };
     let executor = ProcessExecutor;
 
+    let branches_requested = cli.branches || cli.branches_only;
     let mut remaining_budget = cli.max_reclaims;
     let mut remaining_branch_budget = cli.max_branch_deletions;
     let github = (!cli.no_github)
@@ -305,27 +313,36 @@ fn main() -> ExitCode {
             }
         };
         let available_bytes_before = cli.apply.then(|| available_bytes(repository)).flatten();
-        let evidence = match ProcessUseEvidence::collect(&executor) {
-            Ok(evidence) => evidence,
-            Err(error) => {
-                repositories.push(RepositoryReport {
-                    ordinal: index + 1,
-                    available_bytes_before: None,
-                    available_bytes_after: None,
-                    result: RepositoryResult::Unlisted { code: error.code() },
-                    branches: None,
-                });
-                continue;
+        let observations = if cli.branches_only {
+            Vec::new()
+        } else {
+            let evidence = match ProcessUseEvidence::collect(&executor) {
+                Ok(evidence) => evidence,
+                Err(error) => {
+                    repositories.push(RepositoryReport {
+                        ordinal: index + 1,
+                        available_bytes_before: None,
+                        available_bytes_after: None,
+                        result: RepositoryResult::Unlisted { code: error.code() },
+                        branches: None,
+                    });
+                    continue;
+                }
+            };
+            if let Some(github) = github.as_ref() {
+                inventory.record_landed_tips(landed_worktree_tips(
+                    &observer, &inventory, github, &executor,
+                ));
             }
+            observe_linked_worktrees(&observer, &inventory, &evidence, &executor)
         };
-        if let Some(github) = github.as_ref() {
-            inventory.record_landed_tips(landed_worktree_tips(
-                &observer, &inventory, github, &executor,
-            ));
-        }
-        let observations = observe_linked_worktrees(&observer, &inventory, &evidence, &executor);
         let mut summary = Summary {
             linked: inventory.linked().len(),
+            skipped: if cli.branches_only {
+                inventory.linked().len()
+            } else {
+                0
+            },
             ..Summary::default()
         };
         let mut worktrees = Vec::with_capacity(inventory.linked().len());
@@ -394,8 +411,8 @@ fn main() -> ExitCode {
                 result,
             });
         }
-        let branches = (cli.branches && !circuit_breaker_tripped).then(|| {
-            match reclaim_local_branches(
+        let branches =
+            (branches_requested && !circuit_breaker_tripped).then(|| match reclaim_local_branches(
                 &observer,
                 &inventory,
                 policy.finished_idle_seconds(),
@@ -434,8 +451,7 @@ fn main() -> ExitCode {
                     }
                 }
                 Err(error) => BranchSection::Unlisted { code: error.code() },
-            }
-        });
+            });
         repositories.push(RepositoryReport {
             ordinal: index + 1,
             available_bytes_before,
@@ -454,11 +470,11 @@ fn main() -> ExitCode {
         schema_version: REPORT_SCHEMA_VERSION,
         mutation_performed,
         compensation: COMPENSATION,
-        branch_compensation: cli.branches.then_some(BRANCH_COMPENSATION),
+        branch_compensation: branches_requested.then_some(BRANCH_COMPENSATION),
         minimum_idle_seconds: policy.minimum_idle_seconds(),
         finished_idle_seconds: policy.finished_idle_seconds(),
         max_reclaims: cli.max_reclaims,
-        max_branch_deletions: cli.branches.then_some(cli.max_branch_deletions),
+        max_branch_deletions: branches_requested.then_some(cli.max_branch_deletions),
         budget_exhausted: budget_exhausted || branch_budget_exhausted,
         circuit_breaker_tripped,
         repositories,
@@ -505,7 +521,7 @@ fn render_human(report: &Report, apply: bool, all: bool) {
             RepositoryResult::Listed { summary, worktrees } => {
                 eligible_total += summary.eligible;
                 println!(
-                    "repository {}: {} linked worktrees: {} eligible ({} need a HEAD pin), {} refused, {} prunable, {} unobservable{}",
+                    "repository {}: {} linked worktrees: {} eligible ({} need a HEAD pin), {} refused, {} prunable, {} unobservable, {} skipped{}",
                     repository.ordinal,
                     summary.linked,
                     summary.eligible,
@@ -513,6 +529,7 @@ fn render_human(report: &Report, apply: bool, all: bool) {
                     summary.refused,
                     summary.prunable,
                     summary.unobservable,
+                    summary.skipped,
                     if apply {
                         format!(", {} reclaimed", summary.reclaimed)
                     } else {
@@ -577,7 +594,9 @@ fn render_human(report: &Report, apply: bool, all: bool) {
             );
         }
     } else if eligible_total > 0 {
-        println!("nothing was changed; run again with --apply to reclaim the eligible worktrees");
+        println!(
+            "nothing was changed; run again with --apply to reclaim eligible worktrees or local branches"
+        );
     } else {
         println!("nothing was changed");
     }
