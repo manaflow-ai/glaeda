@@ -4,46 +4,37 @@ This is the review contract for turning the merged native runner-log observer,
 descriptor-bound store, and report-only handoff into a production adapter. It is
 design guidance only. The current primary review and synthetic-matrix status is
 in [`NATIVE_RUNNER_LOG_PRODUCTION_STATUS.md`](NATIVE_RUNNER_LOG_PRODUCTION_STATUS.md).
+The next typed cancellation/replay contract is in
+[`LIVE_APPLY_ADMISSION_DESIGN.md`](LIVE_APPLY_ADMISSION_DESIGN.md).
 This branch does not enable live deletion.
 
 ## Current boundary and blockers
 
-The observer and the store have deliberately different authority:
+The current code has distinct observation, recovery, synthetic mutation, and
+production-apply boundaries:
 
-* `runner_log_reclaim::observe` validates the enrolled root, observes the
-  process scope, enumerates `_diag`, and returns a bounded catalog. It takes a
-  root snapshot before and after enumeration and fails on root drift
-  ([`src/runner_log_reclaim.rs:618`](../src/runner_log_reclaim.rs#L618)). Public
-  output redacts the absolute root to `<enrolled-runner>`
-  ([`src/runner_log_reclaim.rs:652`](../src/runner_log_reclaim.rs#L652)).
-* `runner_log_reclaim::reclaim` is still a planner. Even when `apply=true`, it
-  only sets `operation` to `apply`, returns `reclaimed_count: 0`, and emits
-  `reclaim_not_ready`; it ignores the requested state root
-  ([`src/runner_log_reclaim.rs:676`](../src/runner_log_reclaim.rs#L676)).
-* `RunnerLogStore` is currently compiled as a test-only private module
-  (`#[cfg(test)] mod runner_log_reclaim_store` in [`src/lib.rs:400`](../src/lib.rs#L400)).
-  Its `open`, `recover`, and `apply_batch` methods therefore cannot be called
-  by a production binary. Making the module public by itself would be an
-  unsafe API expansion: `apply_batch` accepts caller-built `LogItem` values and
-  a caller-supplied observation closure, with no proof that those values came
-  from one exact plan.
-* `apply_batch` currently discards the `RecoveryReceipt` returned by
-  `recover` ([`src/runner_log_reclaim_store.rs:728-745`](../src/runner_log_reclaim_store.rs#L728)).
-  A staged row whose file is still open is left pending by `recover`
-  ([`src/runner_log_reclaim_store.rs:696-699`](../src/runner_log_reclaim_store.rs#L696)),
-  but the same `apply_batch` call can then continue to stage new candidates.
-  A production adapter must treat any non-zero `pending` result as a hard
-  admission veto and return the recovery receipt before considering a new
-  candidate.
-* The handoff script is intentionally report-only. It invokes the observer in
-  plan mode and reads, but never opens or repairs, `journal.jsonl`
-  ([`docs/RUNNER_LOG_HANDOFF.md:14-21`](RUNNER_LOG_HANDOFF.md#L14)). A missing
-  state root is reported as clean by this inspection path; production apply
-  must distinguish “no journal exists” from “recovery was performed”.
+* `runner_log_reclaim::observe` validates enrollment, observes the process
+  scope and returns a bounded diagnostic catalog. Ordinary `reclaim(...,
+  apply=true)` still emits `reclaim_not_ready` and ignores requested state.
+* `RunnerLogStore` is production-compiled; raw `open`, `recover` and
+  `apply_batch` operations remain crate-private. The public synthetic fixture
+  helper is confined to the benchmark layout and synthetic enrollment.
+* `admit_descriptor_store` performs recovery under the lock, vetoes pending
+  recovery and checks report/action binding. The lock is dropped on return;
+  this is not yet a consuming live-apply capability. `apply_admitted` rejects
+  this backend and `apply_live` returns `live_apply_disabled`.
+* The raw `apply_batch` calls recovery but discards its pending result. A
+  future production entry point must not bypass the adapter's pending-debt
+  veto or use recovery to resume deletion after cancellation.
+* The handoff script is report-only. Its inspected clean journal is not
+  evidence that descriptor-bound recovery ran. The synthetic lifecycle adapter
+  serializes checkpoints but does not itself persist/fsync them.
 
-These are admission blockers, not reasons to bypass the boundary. Until the
-adapter below exists, the only safe production operation is plan plus handoff
-validation.
+The proposed durable live path and cancellation/replay rules are specified in
+[`LIVE_APPLY_ADMISSION_DESIGN.md`](LIVE_APPLY_ADMISSION_DESIGN.md). They remain
+unimplemented and take precedence over historical design sketches below where
+cancellation or durability details differ. No green synthetic row admits live
+filesystem mutation.
 
 ## Safest API boundary
 
@@ -121,8 +112,10 @@ Cancellation must stop admission before the next `prepared` journal row. A
 request observed after a row is `prepared` cannot delete the source or silently
 drop the row: the adapter records cancellation, exits without further staging,
 and leaves recovery to the journal. A staged or delete-intent row is recovery
-debt; it may be deleted only by the same fresh identity/open-process checks used
-by recovery. Cancellation must not be reported as completion until a post-action
+debt; it remains preserved while cancellation is active. Fresh identity/open-process
+checks alone do not authorize deleting a cancelled stage; use the separately
+reviewed compensation/recovery policy in the live-apply design. Cancellation
+must not be reported as completion until a post-action
 receipt says there are no pending rows for that admission.
 
 ### Restart and crash recovery
@@ -168,7 +161,7 @@ Live deletion remains blocked until all of the following are true:
 * a production-visible store API accepts only a typed admission token, not
   arbitrary candidates and an arbitrary observation closure;
 * the adapter refuses to start a new batch when recovery returns any pending
-  row, including an open staged row (the current test-only `apply_batch` does
+  row, including an open staged row (the current crate-private `apply_batch` does
   not enforce this on its own);
 * the adapter can prove that the plan receipt and store-open identities refer to
   the same install/root/diagnostics generation;
