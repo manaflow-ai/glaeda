@@ -33,15 +33,30 @@ syncs the complete event before exposing the resulting state, and reconstructs
 the derived indexes with strict schema, stream, sequence, event-id, and state
 validation on reopen. An unterminated final line is treated as a crash tail
 and truncated; malformed complete lines fail closed. The store exposes a
-receipt query for the latest observed tip, latest artifact, event sequence, and
-promotion pointer so Glaeda can forward one idempotent stream to fleet
-intelligence without adding scheduler behavior to this module.
+receipt query for the latest observed tip, latest artifact, event sequence,
+promotion pointer, and active lease identities so Glaeda can forward one
+idempotent stream to fleet intelligence without adding scheduler behavior to
+this module.
 
 The store's transaction boundary clones the kernel, applies one operation,
 syncs only its new envelopes, then swaps the clone into memory. A failed write
 therefore cannot publish an in-memory state that is absent from the journal.
-Lease ownership remains intentionally descriptive: this kernel does not infer
-ownership from a lease label or accept an unverified replay.
+Lease events (schema version 2; v1 non-lease journals remain replayable) are
+fenced by the current build attempt, lease ID, host ID, monotonic fencing
+token, and expiry. One build has at most one active lease; replay reconstructs
+that index and retains the last token for each attempt so a released or stale
+worker cannot reacquire with an old fence. Acquisition is accepted only from
+`leased` or `running` execution state. Release requires the exact active
+evidence and is rejected after the recorded expiry. A controller can reclaim
+an expired lease with a typed `lease_reclaimed` event; a terminal build must
+release or be reclaimed before a later attempt can be queued.
+
+Lease ownership remains evidence rather than authority: this kernel does not
+infer ownership from a lease label or accept an unverified replay. Completion
+and artifact events remain observations for now; the controller must fence
+those side effects with the active lease before forwarding them. Cross-store
+writer locking, global event identity, and lease renewal remain adapter
+responsibilities.
 
 The first consumer should ingest the existing CI receipts for the
 `feat-cmux-next` stream. Scheduler changes, host selection, cancellation, and

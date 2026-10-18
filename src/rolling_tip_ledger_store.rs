@@ -15,7 +15,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::rolling_tip_ledger::{
-    ArtifactProvenance, BuildAdmission, BuildExecutionState, BuildKey, EventEnvelope,
+    ActiveLease, ArtifactProvenance, BuildAdmission, BuildExecutionState, BuildKey, EventEnvelope,
     PromotionDecision, PromotionPointer, ReceiptOutcome, RollingTipLedger, RollingTipLedgerError,
     TipStream,
 };
@@ -74,6 +74,8 @@ pub struct RollingTipLedgerReceipt {
     pub latest_tip: Option<BuildKey>,
     pub latest_artifact: Option<ArtifactProvenance>,
     pub promotion: Option<PromotionPointer>,
+    #[serde(default)]
+    pub active_leases: Vec<ActiveLease>,
 }
 
 /// One durable event stream for one rolling-tip branch.
@@ -165,6 +167,80 @@ impl RollingTipLedgerStore {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn acquire_lease(
+        &mut self,
+        build: BuildKey,
+        attempt: u32,
+        lease_id: &str,
+        host_id: &str,
+        fencing_token: u64,
+        expires_at_millis: u64,
+        occurred_at_millis: u64,
+    ) -> Result<(), RollingTipLedgerStoreError> {
+        self.transact(|ledger| {
+            ledger.acquire_lease(
+                build,
+                attempt,
+                lease_id,
+                host_id,
+                fencing_token,
+                expires_at_millis,
+                occurred_at_millis,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn release_lease(
+        &mut self,
+        build: BuildKey,
+        attempt: u32,
+        lease_id: &str,
+        host_id: &str,
+        fencing_token: u64,
+        expires_at_millis: u64,
+        occurred_at_millis: u64,
+    ) -> Result<(), RollingTipLedgerStoreError> {
+        self.transact(|ledger| {
+            ledger.release_lease(
+                build,
+                attempt,
+                lease_id,
+                host_id,
+                fencing_token,
+                expires_at_millis,
+                occurred_at_millis,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn reclaim_expired_lease(
+        &mut self,
+        build: BuildKey,
+        attempt: u32,
+        lease_id: &str,
+        host_id: &str,
+        fencing_token: u64,
+        expires_at_millis: u64,
+        reclaimed_by: &str,
+        occurred_at_millis: u64,
+    ) -> Result<(), RollingTipLedgerStoreError> {
+        self.transact(|ledger| {
+            ledger.reclaim_expired_lease(
+                build,
+                attempt,
+                lease_id,
+                host_id,
+                fencing_token,
+                expires_at_millis,
+                reclaimed_by,
+                occurred_at_millis,
+            )
+        })
+    }
+
     pub fn publish_artifact(
         &mut self,
         artifact: ArtifactProvenance,
@@ -243,6 +319,7 @@ impl RollingTipLedgerStore {
             latest_tip,
             latest_artifact,
             promotion: self.ledger.promotion().cloned(),
+            active_leases: self.ledger.active_leases().cloned().collect(),
         }
     }
 

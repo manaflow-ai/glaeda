@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::artifact::{CommitId, GitTreeId, RepositoryRef, Sha256Digest};
 
-pub const ROLLING_TIP_LEDGER_SCHEMA_VERSION: u8 = 1;
+pub const ROLLING_TIP_LEDGER_SCHEMA_VERSION: u8 = 2;
+const ROLLING_TIP_LEDGER_MIN_SUPPORTED_SCHEMA_VERSION: u8 = 1;
 
 /// A bounded repository/branch stream identity. Mutable branch names are scoped to a repository.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -196,13 +197,37 @@ pub enum RollingTipEvent {
     },
     LeaseAcquired {
         build: BuildKey,
+        #[serde(default)]
+        attempt: u32,
         lease_id: String,
         host_id: String,
+        #[serde(default)]
+        fencing_token: u64,
+        #[serde(default)]
+        expires_at_millis: u64,
     },
     LeaseReleased {
         build: BuildKey,
+        #[serde(default)]
+        attempt: u32,
         lease_id: String,
         host_id: String,
+        #[serde(default)]
+        fencing_token: u64,
+        #[serde(default)]
+        expires_at_millis: u64,
+    },
+    LeaseReclaimed {
+        build: BuildKey,
+        #[serde(default)]
+        attempt: u32,
+        lease_id: String,
+        host_id: String,
+        #[serde(default)]
+        fencing_token: u64,
+        #[serde(default)]
+        expires_at_millis: u64,
+        reclaimed_by: String,
     },
     ArtifactPublished {
         artifact: ArtifactProvenance,
@@ -251,6 +276,20 @@ pub struct PromotionPointer {
     pub decision: PromotionDecision,
 }
 
+/// The one active worker lease for a build attempt.
+///
+/// A lease is descriptive evidence, not ownership by itself. The build attempt,
+/// host, fencing token, and expiry must all match before a release is accepted.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ActiveLease {
+    pub build: BuildKey,
+    pub attempt: u32,
+    pub lease_id: String,
+    pub host_id: String,
+    pub fencing_token: u64,
+    pub expires_at_millis: u64,
+}
+
 // The artifact is deliberately returned inline so exact-key reuse carries its
 // immutable provenance without a second lookup. Keep the public result shape;
 // callers already treat this as a short-lived admission decision.
@@ -275,6 +314,18 @@ pub enum RollingTipLedgerError {
     ConflictingArtifact,
     StaleBuildAttempt { expected: u32, actual: u32 },
     StaleBuildState,
+    LeaseAlreadyActive,
+    LeaseNotActive,
+    LeaseAttemptMismatch { expected: u32, actual: u32 },
+    LeaseIdMismatch,
+    LeaseHostMismatch,
+    LeaseFencingMismatch,
+    LeaseExpiryMismatch,
+    LeaseExpired,
+    LeaseNotExpired,
+    InvalidLeaseState,
+    InvalidFencingToken,
+    InvalidLeaseExpiry,
     PromotionNotRequested,
     PromotionArtifactUnavailable,
     ArtifactExecutionMismatch,
@@ -307,6 +358,31 @@ impl fmt::Display for RollingTipLedgerError {
                 )
             }
             Self::StaleBuildState => formatter.write_str("stale build state transition"),
+            Self::LeaseAlreadyActive => formatter.write_str("build already has an active lease"),
+            Self::LeaseNotActive => formatter.write_str("build has no active lease"),
+            Self::LeaseAttemptMismatch { expected, actual } => {
+                write!(
+                    formatter,
+                    "lease attempt mismatch: expected {expected}, actual {actual}"
+                )
+            }
+            Self::LeaseIdMismatch => formatter.write_str("lease id does not match active lease"),
+            Self::LeaseHostMismatch => {
+                formatter.write_str("lease host does not match active lease")
+            }
+            Self::LeaseFencingMismatch => {
+                formatter.write_str("lease fencing token does not match active lease")
+            }
+            Self::LeaseExpiryMismatch => {
+                formatter.write_str("lease expiry does not match active lease")
+            }
+            Self::LeaseExpired => formatter.write_str("lease expired before release"),
+            Self::LeaseNotExpired => formatter.write_str("lease has not expired for reclaim"),
+            Self::InvalidLeaseState => formatter.write_str("build state cannot hold a lease"),
+            Self::InvalidFencingToken => formatter.write_str("fencing token must advance"),
+            Self::InvalidLeaseExpiry => {
+                formatter.write_str("lease expiry must be after its acquisition timestamp")
+            }
             Self::PromotionNotRequested => formatter.write_str("promotion was not requested"),
             Self::PromotionArtifactUnavailable => {
                 formatter.write_str("promotion requires a published successful artifact")
@@ -335,6 +411,8 @@ pub struct RollingTipLedger {
     artifacts: BTreeMap<BuildKey, ArtifactProvenance>,
     in_flight: BTreeSet<BuildKey>,
     states: BTreeMap<BuildKey, ExecutionRecord>,
+    active_leases: BTreeMap<BuildKey, ActiveLease>,
+    last_fencing_tokens: BTreeMap<(BuildKey, u32), u64>,
     promotion_requests: BTreeSet<BuildKey>,
     promotion: Option<PromotionPointer>,
 }
@@ -355,6 +433,8 @@ impl RollingTipLedger {
             artifacts: BTreeMap::new(),
             in_flight: BTreeSet::new(),
             states: BTreeMap::new(),
+            active_leases: BTreeMap::new(),
+            last_fencing_tokens: BTreeMap::new(),
             promotion_requests: BTreeSet::new(),
             promotion: None,
         }
@@ -388,7 +468,9 @@ impl RollingTipLedger {
     ) -> Result<Self, RollingTipLedgerError> {
         let mut ledger = Self::new(stream);
         for envelope in events {
-            if envelope.schema_version != ROLLING_TIP_LEDGER_SCHEMA_VERSION
+            if !(ROLLING_TIP_LEDGER_MIN_SUPPORTED_SCHEMA_VERSION
+                ..=ROLLING_TIP_LEDGER_SCHEMA_VERSION)
+                .contains(&envelope.schema_version)
                 || envelope.stream != ledger.stream
                 || envelope.sequence != ledger.next_sequence
                 || envelope.occurred_at_millis == 0
@@ -423,19 +505,54 @@ impl RollingTipLedger {
             } => self.replay_state(build, *state, *attempt, timestamp),
             RollingTipEvent::LeaseAcquired {
                 build,
+                attempt,
                 lease_id,
                 host_id,
-            }
-            | RollingTipEvent::LeaseReleased {
+                fencing_token,
+                expires_at_millis,
+            } => self.replay_lease_acquired(
                 build,
+                *attempt,
                 lease_id,
                 host_id,
-            } => {
-                self.require_stream(build)?;
-                self.require_timestamp(timestamp)?;
-                validate_token("lease_id", lease_id)?;
-                validate_token("host_id", host_id)
-            }
+                *fencing_token,
+                *expires_at_millis,
+                timestamp,
+            ),
+            RollingTipEvent::LeaseReleased {
+                build,
+                attempt,
+                lease_id,
+                host_id,
+                fencing_token,
+                expires_at_millis,
+            } => self.replay_lease_released(
+                build,
+                *attempt,
+                lease_id,
+                host_id,
+                *fencing_token,
+                *expires_at_millis,
+                timestamp,
+            ),
+            RollingTipEvent::LeaseReclaimed {
+                build,
+                attempt,
+                lease_id,
+                host_id,
+                fencing_token,
+                expires_at_millis,
+                reclaimed_by,
+            } => self.replay_lease_reclaimed(
+                build,
+                *attempt,
+                lease_id,
+                host_id,
+                *fencing_token,
+                *expires_at_millis,
+                reclaimed_by,
+                timestamp,
+            ),
             RollingTipEvent::ArtifactPublished { artifact } => {
                 self.require_stream(&artifact.build)?;
                 self.require_timestamp(timestamp)?;
@@ -600,6 +717,9 @@ impl RollingTipLedger {
                     actual: attempt,
                 });
             }
+            if self.active_leases.contains_key(build) {
+                return Err(RollingTipLedgerError::LeaseAlreadyActive);
+            }
         } else if state_rank(state) < state_rank(current.state)
             || (is_terminal(state) && is_terminal(current.state) && state != current.state)
         {
@@ -613,6 +733,134 @@ impl RollingTipLedger {
         if is_terminal(state) {
             self.in_flight.remove(build);
         }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn replay_lease_acquired(
+        &mut self,
+        build: &BuildKey,
+        attempt: u32,
+        lease_id: &str,
+        host_id: &str,
+        fencing_token: u64,
+        expires_at_millis: u64,
+        occurred_at_millis: u64,
+    ) -> Result<(), RollingTipLedgerError> {
+        self.require_stream(build)?;
+        self.require_timestamp(occurred_at_millis)?;
+        validate_lease_evidence(
+            attempt,
+            lease_id,
+            host_id,
+            fencing_token,
+            expires_at_millis,
+            occurred_at_millis,
+        )?;
+        let Some(execution) = self.states.get(build).copied() else {
+            return Err(RollingTipLedgerError::UnknownBuild);
+        };
+        if execution.attempt != attempt {
+            return Err(RollingTipLedgerError::LeaseAttemptMismatch {
+                expected: execution.attempt,
+                actual: attempt,
+            });
+        }
+        if !matches!(
+            execution.state,
+            BuildExecutionState::Leased | BuildExecutionState::Running
+        ) {
+            return Err(RollingTipLedgerError::InvalidLeaseState);
+        }
+        if self.active_leases.contains_key(build) {
+            return Err(RollingTipLedgerError::LeaseAlreadyActive);
+        }
+        if self
+            .last_fencing_tokens
+            .get(&(build.clone(), attempt))
+            .is_some_and(|last| fencing_token <= *last)
+        {
+            return Err(RollingTipLedgerError::InvalidFencingToken);
+        }
+        let lease = ActiveLease {
+            build: build.clone(),
+            attempt,
+            lease_id: lease_id.to_owned(),
+            host_id: host_id.to_owned(),
+            fencing_token,
+            expires_at_millis,
+        };
+        self.last_fencing_tokens
+            .insert((build.clone(), attempt), fencing_token);
+        self.active_leases.insert(build.clone(), lease);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn replay_lease_released(
+        &mut self,
+        build: &BuildKey,
+        attempt: u32,
+        lease_id: &str,
+        host_id: &str,
+        fencing_token: u64,
+        expires_at_millis: u64,
+        occurred_at_millis: u64,
+    ) -> Result<(), RollingTipLedgerError> {
+        self.require_stream(build)?;
+        self.require_timestamp(occurred_at_millis)?;
+        if attempt == 0 {
+            return Err(RollingTipLedgerError::InvalidAttempt);
+        }
+        validate_token("lease_id", lease_id)?;
+        validate_token("host_id", host_id)?;
+        if fencing_token == 0 || expires_at_millis == 0 {
+            return Err(RollingTipLedgerError::InvalidFencingToken);
+        }
+        let Some(active) = self.active_leases.get(build).cloned() else {
+            return Err(RollingTipLedgerError::LeaseNotActive);
+        };
+        validate_release(
+            &active,
+            attempt,
+            lease_id,
+            host_id,
+            fencing_token,
+            expires_at_millis,
+            occurred_at_millis,
+        )?;
+        self.active_leases.remove(build);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn replay_lease_reclaimed(
+        &mut self,
+        build: &BuildKey,
+        attempt: u32,
+        lease_id: &str,
+        host_id: &str,
+        fencing_token: u64,
+        expires_at_millis: u64,
+        reclaimed_by: &str,
+        occurred_at_millis: u64,
+    ) -> Result<(), RollingTipLedgerError> {
+        self.require_stream(build)?;
+        self.require_timestamp(occurred_at_millis)?;
+        validate_token("reclaimed_by", reclaimed_by)?;
+        let Some(active) = self.active_leases.get(build).cloned() else {
+            return Err(RollingTipLedgerError::LeaseNotActive);
+        };
+        validate_reclaim(
+            &active,
+            attempt,
+            lease_id,
+            host_id,
+            fencing_token,
+            expires_at_millis,
+            occurred_at_millis,
+        )?;
+        self.active_leases.remove(build);
         Ok(())
     }
 
@@ -735,6 +983,9 @@ impl RollingTipLedger {
                     actual: attempt,
                 });
             }
+            if self.active_leases.contains_key(&build) {
+                return Err(RollingTipLedgerError::LeaseAlreadyActive);
+            }
         } else if state_rank(state) < state_rank(current.state)
             || (is_terminal(state) && is_terminal(current.state) && state != current.state)
         {
@@ -764,6 +1015,135 @@ impl RollingTipLedger {
         Ok(())
     }
 
+    /// Acquire the sole active lease for the current build attempt.
+    #[allow(clippy::too_many_arguments)]
+    pub fn acquire_lease(
+        &mut self,
+        build: BuildKey,
+        attempt: u32,
+        lease_id: &str,
+        host_id: &str,
+        fencing_token: u64,
+        expires_at_millis: u64,
+        occurred_at_millis: u64,
+    ) -> Result<(), RollingTipLedgerError> {
+        let mut candidate = self.clone();
+        candidate.replay_lease_acquired(
+            &build,
+            attempt,
+            lease_id,
+            host_id,
+            fencing_token,
+            expires_at_millis,
+            occurred_at_millis,
+        )?;
+        self.ensure_capacity(1)?;
+        self.append(
+            occurred_at_millis,
+            RollingTipEvent::LeaseAcquired {
+                build: build.clone(),
+                attempt,
+                lease_id: lease_id.to_owned(),
+                host_id: host_id.to_owned(),
+                fencing_token,
+                expires_at_millis,
+            },
+        )?;
+        self.active_leases = candidate.active_leases;
+        self.last_fencing_tokens = candidate.last_fencing_tokens;
+        Ok(())
+    }
+
+    /// Release an active lease only with the exact attempt, owner and fence evidence.
+    #[allow(clippy::too_many_arguments)]
+    pub fn release_lease(
+        &mut self,
+        build: BuildKey,
+        attempt: u32,
+        lease_id: &str,
+        host_id: &str,
+        fencing_token: u64,
+        expires_at_millis: u64,
+        occurred_at_millis: u64,
+    ) -> Result<(), RollingTipLedgerError> {
+        self.require_stream(&build)?;
+        self.require_timestamp(occurred_at_millis)?;
+        let Some(active) = self.active_leases.get(&build).cloned() else {
+            return Err(RollingTipLedgerError::LeaseNotActive);
+        };
+        validate_release(
+            &active,
+            attempt,
+            lease_id,
+            host_id,
+            fencing_token,
+            expires_at_millis,
+            occurred_at_millis,
+        )?;
+        self.ensure_capacity(1)?;
+        self.append(
+            occurred_at_millis,
+            RollingTipEvent::LeaseReleased {
+                build: build.clone(),
+                attempt,
+                lease_id: lease_id.to_owned(),
+                host_id: host_id.to_owned(),
+                fencing_token,
+                expires_at_millis,
+            },
+        )?;
+        self.active_leases.remove(&build);
+        Ok(())
+    }
+
+    /// Reclaim a lease only after its recorded expiry. This is the recovery path for a crashed
+    /// worker; a late holder's ordinary release remains fenced and is rejected.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reclaim_expired_lease(
+        &mut self,
+        build: BuildKey,
+        attempt: u32,
+        lease_id: &str,
+        host_id: &str,
+        fencing_token: u64,
+        expires_at_millis: u64,
+        reclaimed_by: &str,
+        occurred_at_millis: u64,
+    ) -> Result<(), RollingTipLedgerError> {
+        self.require_stream(&build)?;
+        self.require_timestamp(occurred_at_millis)?;
+        validate_token("reclaimed_by", reclaimed_by)?;
+        let Some(active) = self.active_leases.get(&build).cloned() else {
+            return Err(RollingTipLedgerError::LeaseNotActive);
+        };
+        validate_reclaim(
+            &active,
+            attempt,
+            lease_id,
+            host_id,
+            fencing_token,
+            expires_at_millis,
+            occurred_at_millis,
+        )?;
+        self.ensure_capacity(1)?;
+        self.append(
+            occurred_at_millis,
+            RollingTipEvent::LeaseReclaimed {
+                build: build.clone(),
+                attempt,
+                lease_id: lease_id.to_owned(),
+                host_id: host_id.to_owned(),
+                fencing_token,
+                expires_at_millis,
+                reclaimed_by: reclaimed_by.to_owned(),
+            },
+        )?;
+        self.active_leases.remove(&build);
+        Ok(())
+    }
+
+    /// Compatibility helper for descriptive callers. New integrations should use the explicit
+    /// fencing-aware acquire/release methods above.
     pub fn record_lease(
         &mut self,
         build: BuildKey,
@@ -772,24 +1152,51 @@ impl RollingTipLedger {
         acquired: bool,
         occurred_at_millis: u64,
     ) -> Result<(), RollingTipLedgerError> {
-        self.require_stream(&build)?;
-        self.require_timestamp(occurred_at_millis)?;
-        validate_token("lease_id", lease_id)?;
-        validate_token("host_id", host_id)?;
-        let event = if acquired {
-            RollingTipEvent::LeaseAcquired {
+        let attempt = self
+            .states
+            .get(&build)
+            .map_or(Err(RollingTipLedgerError::UnknownBuild), |record| {
+                Ok(record.attempt)
+            })?;
+        if acquired {
+            let fencing_token = self
+                .last_fencing_tokens
+                .get(&(build.clone(), attempt))
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(1);
+            self.acquire_lease(
                 build,
-                lease_id: lease_id.to_owned(),
-                host_id: host_id.to_owned(),
-            }
+                attempt,
+                lease_id,
+                host_id,
+                fencing_token,
+                occurred_at_millis.saturating_add(1),
+                occurred_at_millis,
+            )
         } else {
-            RollingTipEvent::LeaseReleased {
+            let Some(active) = self.active_leases.get(&build).cloned() else {
+                return Err(RollingTipLedgerError::LeaseNotActive);
+            };
+            self.release_lease(
                 build,
-                lease_id: lease_id.to_owned(),
-                host_id: host_id.to_owned(),
-            }
-        };
-        self.append(occurred_at_millis, event)
+                active.attempt,
+                lease_id,
+                host_id,
+                active.fencing_token,
+                active.expires_at_millis,
+                occurred_at_millis,
+            )
+        }
+    }
+
+    #[must_use]
+    pub fn active_lease(&self, build: &BuildKey) -> Option<&ActiveLease> {
+        self.active_leases.get(build)
+    }
+
+    pub fn active_leases(&self) -> impl Iterator<Item = &ActiveLease> {
+        self.active_leases.values()
     }
 
     pub fn publish_artifact(
@@ -1011,6 +1418,94 @@ const fn is_terminal(state: BuildExecutionState) -> bool {
             | BuildExecutionState::Failed
             | BuildExecutionState::Cancelled
     )
+}
+
+fn validate_lease_evidence(
+    attempt: u32,
+    lease_id: &str,
+    host_id: &str,
+    fencing_token: u64,
+    expires_at_millis: u64,
+    occurred_at_millis: u64,
+) -> Result<(), RollingTipLedgerError> {
+    if attempt == 0 {
+        return Err(RollingTipLedgerError::InvalidAttempt);
+    }
+    validate_token("lease_id", lease_id)?;
+    validate_token("host_id", host_id)?;
+    if fencing_token == 0 {
+        return Err(RollingTipLedgerError::InvalidFencingToken);
+    }
+    if expires_at_millis <= occurred_at_millis {
+        return Err(RollingTipLedgerError::InvalidLeaseExpiry);
+    }
+    Ok(())
+}
+
+fn validate_release(
+    active: &ActiveLease,
+    attempt: u32,
+    lease_id: &str,
+    host_id: &str,
+    fencing_token: u64,
+    expires_at_millis: u64,
+    occurred_at_millis: u64,
+) -> Result<(), RollingTipLedgerError> {
+    if attempt != active.attempt {
+        return Err(RollingTipLedgerError::LeaseAttemptMismatch {
+            expected: active.attempt,
+            actual: attempt,
+        });
+    }
+    if lease_id != active.lease_id {
+        return Err(RollingTipLedgerError::LeaseIdMismatch);
+    }
+    if host_id != active.host_id {
+        return Err(RollingTipLedgerError::LeaseHostMismatch);
+    }
+    if fencing_token != active.fencing_token {
+        return Err(RollingTipLedgerError::LeaseFencingMismatch);
+    }
+    if expires_at_millis != active.expires_at_millis {
+        return Err(RollingTipLedgerError::LeaseExpiryMismatch);
+    }
+    if occurred_at_millis > active.expires_at_millis {
+        return Err(RollingTipLedgerError::LeaseExpired);
+    }
+    Ok(())
+}
+
+fn validate_reclaim(
+    active: &ActiveLease,
+    attempt: u32,
+    lease_id: &str,
+    host_id: &str,
+    fencing_token: u64,
+    expires_at_millis: u64,
+    occurred_at_millis: u64,
+) -> Result<(), RollingTipLedgerError> {
+    if attempt != active.attempt {
+        return Err(RollingTipLedgerError::LeaseAttemptMismatch {
+            expected: active.attempt,
+            actual: attempt,
+        });
+    }
+    if lease_id != active.lease_id {
+        return Err(RollingTipLedgerError::LeaseIdMismatch);
+    }
+    if host_id != active.host_id {
+        return Err(RollingTipLedgerError::LeaseHostMismatch);
+    }
+    if fencing_token != active.fencing_token {
+        return Err(RollingTipLedgerError::LeaseFencingMismatch);
+    }
+    if expires_at_millis != active.expires_at_millis {
+        return Err(RollingTipLedgerError::LeaseExpiryMismatch);
+    }
+    if occurred_at_millis <= active.expires_at_millis {
+        return Err(RollingTipLedgerError::LeaseNotExpired);
+    }
+    Ok(())
 }
 
 fn validate_token(field: &'static str, value: &str) -> Result<(), RollingTipLedgerError> {
