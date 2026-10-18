@@ -741,6 +741,11 @@ POLICY_DEFAULTS: dict[str, Any] = {
     "min_jobs": 6,
     "sweep_jobs": 190,
     "soft_idle_hours": 24.0,
+    # Build markers are aged by observed host activity, not a fixed wall-clock
+    # guess.  The cap is only a recovery bound when the job log is unavailable.
+    "stale_marker_min_age_hours": 0.5,
+    "stale_marker_jobs": 3,
+    "stale_marker_max_hours": 48.0,
     # A busy host cleans too: deletes skip only what a job uses (open, named by a command, its root's
     # current seed or checkout), never the whole pass. true restores the old defer-while-CI-runs rule.
     "defer_during_ci": False,
@@ -5012,6 +5017,109 @@ def cmux_next_ci_busy(fam: Family, path: Path, opened: list[str] | frozenset[str
     return ""
 
 
+STALE_BUILD_MARKER_NAMES = frozenset({".build.active"})
+
+
+def _stale_marker_candidates(root: Path) -> list[tuple[Path, Path]]:
+    """Return build markers only from validated fleet/cmux-next state layouts."""
+    if root.is_symlink() or not root.is_dir():
+        return []
+    found: list[tuple[Path, Path]] = []
+    workspaces = root / "cmux-workspaces"
+    if not workspaces.is_symlink() and workspaces.is_dir():
+        for state in _children(workspaces):
+            if state.is_symlink() or not state.is_dir():
+                continue
+            marker = state / ".build.active"
+            if marker.is_file() and not marker.is_symlink():
+                found.append((marker, state))
+    if root.name == CMUX_NEXT_CI_ROOT:
+        for state in cmux_next_ci_state_roots(root):
+            marker = state / ".build.active"
+            if marker.is_file() and not marker.is_symlink():
+                found.append((marker, state))
+    return found
+
+
+def _marker_activity(marker: Path, now: float) -> tuple[float, int | None]:
+    """Return marker age and host jobs started after it, when the log is readable."""
+    age_hours = max(0.0, (now - marker.stat().st_mtime) / 3600)
+    starts = job_starts()
+    jobs = None if starts is None else max(0, len(starts) - bisect.bisect_right(starts, marker.stat().st_mtime))
+    return age_hours, jobs
+
+
+def _marker_due(marker: Path, now: float) -> tuple[bool, float, int | None, str]:
+    age_hours, jobs = _marker_activity(marker, now)
+    min_age = float(POLICY["stale_marker_min_age_hours"])
+    required_jobs = int(POLICY["stale_marker_jobs"])
+    max_age = float(POLICY["stale_marker_max_hours"])
+    if age_hours < min_age:
+        return False, age_hours, jobs, "marker-too-new"
+    if jobs is not None and jobs >= required_jobs:
+        return True, age_hours, jobs, "host-activity"
+    if age_hours >= max_age:
+        return True, age_hours, jobs, "safety-cap"
+    return False, age_hours, jobs, "waiting-for-activity"
+
+
+def clear_stale_build_markers(receipt: Path, roots: list[Path] | None = None,
+                              now: float | None = None) -> int:
+    """Clear dead build markers after activity evidence or a bounded safety cap."""
+    roots = ([FLEET_ROOT / "cache", HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT]
+             if roots is None else roots)
+    now = time.time() if now is None else now
+    try:
+        opened, commands = process_evidence()
+    except NoEvidence:
+        return 0
+    opened_indexed = open_index(opened)
+    if any(Path(r).resolve() == (FLEET_ROOT / "cache").resolve() for r in roots) and host_busy():
+        return 0
+    released = 0
+    seen: set[str] = set()
+    for root in roots:
+        for marker, state in _stale_marker_candidates(Path(root)):
+            key = os.fspath(marker)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                due, age_hours, jobs, reason = _marker_due(marker, now)
+            except OSError:
+                continue
+            if not due:
+                continue
+            state_text = os.fspath(state)
+            if in_cwd(state_text, opened_indexed) or named_by(state_text, commands) or holds_socket(state):
+                continue
+            siblings = {entry.name for entry in _children(state)}
+            if siblings & (CMUX_NEXT_CI_ACTIVITY_MARKERS - STALE_BUILD_MARKER_NAMES):
+                continue
+            try:
+                if artifact_referenced(state, live_artifact_references(FLEET_ROOT)):
+                    continue
+                before = marker.lstat()
+                marker.unlink()
+            except OSError:
+                continue
+            released += before.st_size
+            record = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "at_epoch": now,
+                      "host": platform.node(), "outcome": "stale-marker-cleared",
+                      "family": "build-marker", "path": key, "bytes": before.st_size,
+                      "verdict": "reclaimable", "reasons": [reason, {"age_hours": round(age_hours, 1),
+                      "jobs_since_marker": jobs, "required_jobs": int(POLICY["stale_marker_jobs"]),
+                      "max_age_hours": float(POLICY["stale_marker_max_hours"])}]}
+            try:
+                receipt.parent.mkdir(parents=True, exist_ok=True)
+                with receipt.open("a") as handle:
+                    handle.write(json.dumps(record) + "\n")
+            except OSError:
+                pass
+            print(f"  stale-marker-cleared {key} ({reason}, {age_hours:.1f}h, jobs={jobs})")
+    return released
+
+
 def cmux_next_ci_dedupe_roots(root: Path) -> list[Path]:
     """Return generated cmux-next trees eligible for the opt-in clone pass.
 
@@ -5467,6 +5575,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
     if not a.family or INTERRUPTED in a.family:
         fams = fams + interrupted_families(every if a.family and set(a.family) == {INTERRUPTED} else fams)
     maintenance_handle = None
+    stale_marker_released = 0
     if a.apply:
         if a.cmux_next_drain:
             maintenance_handle, why = cmux_next_drain_preflight(expected_owner=a.cmux_next_reservation_owner)
@@ -5493,6 +5602,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
                 fcntl.flock(maintenance_handle, fcntl.LOCK_UN)
                 maintenance_handle.close()
             return result
+        stale_marker_released = clear_stale_build_markers(a.receipt)
     idle = a.idle_hours if a.idle_hours is not None else IDLE_SWEEP_HOURS if sweep else (6 if under else 24)
     at, known, measured_at = (0.0, {}, {}) if a.refresh or a.no_snapshot else load_snapshot_meta()
     original_known = set(known)
@@ -5602,7 +5712,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
         print()
         halt = (cmux_next_drain_halt if a.cmux_next_drain
                 else host_busy if sweep and POLICY["defer_during_ci"] else None)
-        logical_released = apply(items, {f.id: f for f in fams}, a.receipt,
+        logical_released = stale_marker_released + apply(items, {f.id: f for f in fams}, a.receipt,
                                  {fs.dev: fs.target for fs in shown} if a.pressure else None, idle, halt,
                                  all_families=fams, receipt_sweep=sweep)
         # A drained runner is explicitly held by cmux_mini_fix; once its listener and worker

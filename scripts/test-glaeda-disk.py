@@ -1565,6 +1565,61 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertTrue(build.exists())
         self.assertIn("changed:in-use", receipt.read_text())
 
+    def test_stale_marker_uses_host_activity_before_wall_clock_cap(self) -> None:
+        root = self.root / "Library/Caches/cmux-next-ci"
+        state = root / "cmux-scheme/runner-a"
+        state.mkdir(parents=True)
+        marker = state / ".build.active"
+        marker.write_text("pid=gone\n")
+        now = time.time()
+        old = now - 1.0 * 3600
+        os.utime(marker, (old, old))
+        receipt = self.root / "receipt.jsonl"
+        policy = dict(gd.POLICY)
+        policy.update(stale_marker_min_age_hours=0.5, stale_marker_jobs=3, stale_marker_max_hours=48.0)
+        starts = [old + 600, old + 1200, old + 1800]
+        with mock.patch.object(gd, "POLICY", policy), \
+                mock.patch.object(gd, "job_starts", return_value=starts), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "host_busy", return_value=""), \
+                mock.patch.object(gd, "live_artifact_references", return_value=frozenset()), \
+                mock.patch.object(gd, "holds_socket", return_value=False):
+            self.assertEqual(gd.clear_stale_build_markers(receipt, [root], now=now), len(b"pid=gone\n"))
+        self.assertFalse(marker.exists())
+        record = json.loads(receipt.read_text())
+        self.assertEqual(record["reasons"][0], "host-activity")
+        self.assertEqual(record["reasons"][1]["jobs_since_marker"], 3)
+
+    def test_stale_marker_waits_for_activity_then_uses_long_safety_cap(self) -> None:
+        root = self.root / "Library/Caches/cmux-next-ci"
+        state = root / "cmux-scheme/runner-a"
+        state.mkdir(parents=True)
+        marker = state / ".build.active"
+        marker.write_text("pid=gone\n")
+        now = time.time()
+        old = now - 2.0 * 3600
+        os.utime(marker, (old, old))
+        receipt = self.root / "receipt.jsonl"
+        policy = dict(gd.POLICY)
+        policy.update(stale_marker_min_age_hours=0.5, stale_marker_jobs=3, stale_marker_max_hours=48.0)
+        with mock.patch.object(gd, "POLICY", policy), \
+                mock.patch.object(gd, "job_starts", return_value=[old + 600]), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "host_busy", return_value=""), \
+                mock.patch.object(gd, "live_artifact_references", return_value=frozenset()), \
+                mock.patch.object(gd, "holds_socket", return_value=False):
+            self.assertEqual(gd.clear_stale_build_markers(receipt, [root], now=now), 0)
+        self.assertTrue(marker.exists())
+        cap_now = old + 49.0 * 3600
+        with mock.patch.object(gd, "POLICY", policy), \
+                mock.patch.object(gd, "job_starts", return_value=None), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "host_busy", return_value=""), \
+                mock.patch.object(gd, "live_artifact_references", return_value=frozenset()), \
+                mock.patch.object(gd, "holds_socket", return_value=False):
+            self.assertEqual(gd.clear_stale_build_markers(receipt, [root], now=cap_now), len(b"pid=gone\n"))
+        self.assertFalse(marker.exists())
+
     def test_cmux_next_ci_products_dedupe_guard_fails_closed_on_marker(self) -> None:
         root = self.root / "Library/Caches/cmux-next-ci"
         state = root / "cmux-scheme/runner-a"
