@@ -3069,16 +3069,48 @@ class LeakedAppTest(unittest.TestCase):
         }
         self.assertEqual(hook.leaked_media_app_pids(table), [])
 
+    MEDIA = ("/Users/cmux/Library/Developer/Xcode/DerivedData/cmux-ci-media-pr-20473-head/"
+             "Build/Products/Debug/cmux DEV ci-media-pr-20473-head.app/Contents/Resources/bin/cmux-tui "
+             "--headless --session cmux-chief-1234")
+
+    def test_actual_tagged_media_and_screen_detection_are_selected(self) -> None:
+        detector = self.MEDIA.split("/Contents/", 1)[0] + "/Contents/Resources/bin/cmux-agent-screen-detection"
+        table = {10: (1, self.MEDIA), 11: (10, detector)}
+        self.assertEqual([pid for pid, _ in hook.leaked_media_app_pids(table)], [10, 11])
+        bad = self.MEDIA.replace("cmux DEV ci-media-pr-20473-head.app", "cmux DEV ci-media-other.app")
+        self.assertEqual(hook.leaked_media_app_pids({10: (1, bad)}), [])
+
     def test_cleanup_ends_detached_media_app(self) -> None:
-        pid = 123
-        app = "/Users/cmux/Library/Developer/Xcode/DerivedData/cmux-ci-media-test/Build/Products/Debug/cmux DEV.app/Contents/Resources/bin/cmux-tui"
-        table = {pid: (1, app)}
+        pid, table = 123, {123: (1, self.MEDIA)}
         with mock.patch.object(hook, "processes", side_effect=[table, table]), \
-             mock.patch.object(hook, "pid_alive", side_effect=[False, False, False]), \
+             mock.patch.object(hook, "process_identity", return_value="ps:start"), \
+             mock.patch.object(hook, "process_alive", return_value=False), \
              mock.patch.object(hook.os, "kill") as kill:
-            notes = hook.cleanup_leaked_media_apps()
+            notes = hook._cleanup_leaked_media_apps_locked()
         kill.assert_called_once_with(pid, signal.SIGTERM)
-        self.assertTrue(notes and "killed pid" in notes[0], notes)
+        self.assertTrue(notes and "media cleanup: ended pid" in notes[0], notes)
+
+    def test_media_cleanup_preserves_reused_pid_or_changed_command(self) -> None:
+        for changed_command, identity in ((self.MEDIA, "ps:new"), (self.MEDIA + " --new", "ps:old")):
+            with self.subTest(command=changed_command, identity=identity), \
+                 mock.patch.object(hook, "processes", side_effect=[{123: (1, self.MEDIA)}, {123: (1, changed_command)}]), \
+                 mock.patch.object(hook, "process_identity", side_effect=["ps:old", identity]), \
+                 mock.patch.object(hook.os, "kill") as kill:
+                self.assertEqual(hook._cleanup_leaked_media_apps_locked(), [])
+            kill.assert_not_called()
+
+    def test_media_cleanup_obeys_host_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "host.lock"
+            path.touch()
+            with path.open("r+") as held, mock.patch.object(hook, "HOST_LOCK", str(path)), \
+                 mock.patch.object(hook, "_cleanup_leaked_media_apps_locked") as clean:
+                fcntl.flock(held, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                self.assertEqual(hook.cleanup_leaked_media_apps(), [])
+                clean.assert_not_called()
+                fcntl.flock(held, fcntl.LOCK_UN)
+                clean.return_value = ["receipt"]
+                self.assertEqual(hook.cleanup_leaked_media_apps(), ["receipt"])
 
 
 class JobLeftoverTest(unittest.TestCase):

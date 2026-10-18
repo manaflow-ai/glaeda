@@ -1117,7 +1117,10 @@ LEAKED_TEST_APP = re.compile(r"^\s*'?(.*/actions-runner[^/]+/_work/_temp/cmux-de
 # _work tree. The app can detach and be reparented to launchd, so the normal
 # work-directory reaper cannot see it after the job ends. Keep this exact
 # generated app family narrow; arbitrary user apps are never eligible.
-LEAKED_MEDIA_APP = re.compile(r"^\s*'?(/Users/[^ ]+/Library/Developer/Xcode/DerivedData/cmux-ci-media-[^/]+/Build/Products/Debug/cmux DEV\.app)(?:/Contents/[^ ]+)?'?(?:\s|$)")
+LEAKED_MEDIA_APP = re.compile(
+    r"^\s*'?(/Users/[^/\s]+/Library/Developer/Xcode/DerivedData/cmux-(?P<tag>ci-media-[A-Za-z0-9._-]+)/"
+    r"Build/Products/Debug/cmux DEV(?: (?P=tag))?\.app)/Contents/Resources/bin/"
+    r"(?:cmux-tui|cmux-agent-screen-detection)(?:'?(?:\s|$))")
 LEAKED_TEST_TEMP = re.compile(r"^(.*/actions-runner[^/]+/_work/_temp/cmux-derived-data-tests-[^/]+)(?:/|$)")
 LEAKED_APP_TERM_S = 1.0
 # A process that may be talking to testmanagerd: an XCTest runner, or xcodebuild testing. A false match only
@@ -4381,38 +4384,66 @@ def leaked_media_app_pids(table: dict[int, tuple[int, str]], ignored_workers: se
     return result
 
 
-def cleanup_leaked_media_apps(ignored_workers: set[int] | None = None) -> list[str]:
-    """Kill detached cmux-ci-media apps after re-observing the exact command."""
+def cleanup_leaked_media_apps(ignored_workers: set[int] | None = None, host_lock: str | None = None) -> list[str]:
+    """Reap generated media helpers under admission, with process-instance checks.
+
+    The host lock excludes new runner and fleet admissions between observation
+    and signal. Run as the build user; a path never grants authority to root.
+    At most sixteen candidates are handled per completed job.
+    """
+    if os.geteuid() == 0:
+        return []  # job-owned cleanup runs as the build user, never as root
+    host_lock = host_lock or HOST_LOCK
     try:
-        found = leaked_media_app_pids(processes(), ignored_workers)
+        fd = os.open(host_lock, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return []
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return []
+        return _cleanup_leaked_media_apps_locked(ignored_workers)
+    finally:
+        os.close(fd)
+
+
+def _cleanup_leaked_media_apps_locked(ignored_workers: set[int] | None = None) -> list[str]:
+    try:
+        table = processes()
+        found = leaked_media_app_pids(table, ignored_workers)[:16]
     except (OSError, subprocess.SubprocessError):
         return []
     killed: list[str] = []
     for pid, path in found:
-        try:
-            current = processes()
-            if (pid, path) not in leaked_media_app_pids(current, ignored_workers):
-                continue
-        except (OSError, subprocess.SubprocessError):
+        command = table[pid][1]
+        identity = process_identity(pid)
+        if identity is None:
+            continue
+
+        def still_orphan() -> bool:
+            try:
+                current = processes()
+                return (current.get(pid, (0, None))[1] == command
+                        and (pid, path) in leaked_media_app_pids(current, ignored_workers)
+                        and process_identity(pid) == identity)
+            except (OSError, subprocess.SubprocessError):
+                return False
+
+        if not still_orphan():
             continue
         try:
             os.kill(pid, signal.SIGTERM)
-        except (ProcessLookupError, OSError):
+        except OSError:
             continue
         deadline = time.monotonic() + LEAKED_APP_TERM_S
-        while pid_alive(pid) and time.monotonic() < deadline:
+        while process_alive(pid, identity) and time.monotonic() < deadline:
             time.sleep(0.05)
-        if pid_alive(pid):
-            try:
-                current = processes()
-                if (pid, path) not in leaked_media_app_pids(current, ignored_workers):
-                    continue
-            except (OSError, subprocess.SubprocessError):
-                continue
+        if process_alive(pid, identity) and still_orphan():
             with contextlib.suppress(OSError):
                 os.kill(pid, signal.SIGKILL)
-        if not pid_alive(pid):
-            killed.append(f"killed pid {pid} {path}")
+        if not process_alive(pid, identity):
+            killed.append(f"media cleanup: ended pid {pid} {path}")
     return killed
 
 
@@ -4843,7 +4874,7 @@ def main(argv: list[str] | None = None) -> int:
         current_worker = runner_worker_pid()
         for note in cleanup_leaked_test_apps({current_worker} if current_worker else set()):
             print(f"{PREFIX}: {note}", flush=True)
-        for note in cleanup_leaked_media_apps({current_worker} if current_worker else set()):
+        for note in cleanup_leaked_media_apps({current_worker} if current_worker else set(), args.host_lock):
             print(f"{PREFIX}: {note}", flush=True)
         for note in cleanup_job_leftovers():
             print(f"{PREFIX}: {note}", flush=True)

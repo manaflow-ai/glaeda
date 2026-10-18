@@ -460,6 +460,13 @@ writes the stamp when it stages; `glaeda-update` refreshes an older staged copy 
 installed release every hour, and keeps a copy an operator staged on the release's day
 or later unless the release descends from the stamp's commit.
 
+Job completion also considers detached `cmux-ci-media-*` TUI and screen-detection
+helpers in Xcode DerivedData. The generated app tag must match its DerivedData
+tag. Cleanup holds the exclusive host lock, defers while another Runner.Worker
+is live, and rechecks the complete command and process start identity before
+each signal. It runs as the build user and handles at most 16 processes per
+completed job; a busy host defers cleanup to a later completion.
+
 **Hook fixes roll out without `--apply`.** Every hour `glaeda-update` also runs the
 installed release's `glaeda-cmux-runner --refresh-hooks --apply`. In each runner directory
 a receipt owns, it writes `glaeda-hooks/glaeda-cmux-runner-hook` and
