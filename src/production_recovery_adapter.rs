@@ -590,6 +590,13 @@ impl ProductionRecoveryAdapter {
         for action in self.actions.clone() {
             if self.projected.contains(&action.receipt_id) {
                 receipt.already_projected += 1;
+                receipt.items.push(ItemReceipt {
+                    admission_id: self.plan_digest.clone(),
+                    receipt_id: action.receipt_id,
+                    relative_path: action.relative_path,
+                    identity: action.identity,
+                    outcome: "already_projected",
+                });
                 continue;
             }
             let receipt_id = action.receipt_id.clone();
