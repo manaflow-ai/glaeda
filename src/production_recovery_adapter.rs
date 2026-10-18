@@ -827,6 +827,8 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
+        fs::create_dir_all(&root).unwrap();
+        let root = fs::canonicalize(&root).unwrap();
         let runner = root.join("runner");
         let state = root.join("state");
         fs::create_dir_all(runner.join("_diag")).unwrap();

@@ -42,7 +42,7 @@ fn stat_links(value: u16) -> u64 {
     value as u64
 }
 #[cfg(not(target_os = "macos"))]
-fn stat_links(value: u64) -> u64 {
+fn stat_links(value: u32) -> u64 {
     value
 }
 
