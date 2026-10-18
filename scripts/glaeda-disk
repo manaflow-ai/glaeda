@@ -4318,6 +4318,32 @@ def filesystem_accounting(fss: list[Fs], items: list[Item]) -> list[dict[str, An
 EVICTION_CONTENTION_MAX_AGE_S = 60 * 60
 
 
+def eviction_lock_is_held() -> bool | None:
+    """Probe the eviction lock without waiting or changing its ownership.
+
+    ``eviction_contention`` is a receipt from an earlier skipped run, so the
+    receipt's PID alone is insufficient evidence: the PID can be reused after
+    the owner released the lock.  Return ``None`` when the lock cannot be
+    inspected so callers can retain the warning conservatively.
+    """
+    try:
+        fd = os.open(EVICT_LOCK, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return None
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        except OSError:
+            return None
+        return False
+    finally:
+        os.close(fd)
+
+
 def read_eviction_contention(receipt: Path) -> dict[str, Any] | None:
     """Read the latest bounded contention receipt while it is still actionable."""
     try:
@@ -4342,11 +4368,15 @@ def read_eviction_contention(receipt: Path) -> dict[str, Any] | None:
         if not isinstance(owner, dict):
             owner = {}
         owner_pid = owner.get("pid")
-        if isinstance(owner_pid, int) and not isinstance(owner_pid, bool) and owner_pid > 0 and not _pid_alive(owner_pid):
-            # A completed or crashed sweep can leave its last skip receipt behind.  A dead
-            # owner is no longer contention; retaining it makes mini-health report a live
-            # blocker until the age timeout even though the lock is free.
-            return None
+        if isinstance(owner_pid, int) and not isinstance(owner_pid, bool) and owner_pid > 0:
+            # A completed or crashed sweep can leave its last skip receipt behind.  The PID
+            # may also have been reused by an unrelated process, so a live PID is not enough:
+            # the owner must still have the eviction lock.  If this process acquired the lock
+            # after the skipped run, the old contention is likewise no longer actionable.
+            if not _pid_alive(owner_pid):
+                return None
+            if _EVICT_HANDLE is not None or eviction_lock_is_held() is False:
+                return None
         bounded_owner = {key: owner[key] for key in ("state", "pid", "owner", "started_at", "age_s")
                          if key in owner}
         return {"at": record.get("at"), "at_epoch": at_epoch, "owner": bounded_owner}
