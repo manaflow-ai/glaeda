@@ -2912,11 +2912,22 @@ class ProcEvidenceTest(unittest.TestCase):
         self.assertTrue(cmds.strip())
 
 
-@unittest.skipUnless(sys.platform == "darwin", "tests the macOS lsof path")
-class MacProcessEvidenceTest(unittest.TestCase):
-    def test_lsof_output_is_parsed_as_owned_query_text(self) -> None:
-        with mock.patch.object(gd, "_owned_query", side_effect=[(0, "p123\nn/Users/cmux/cache\n"),
-                                                                    (0, "launchd\n")]):
+@unittest.skipUnless(sys.platform == "darwin", "reads macOS process evidence")
+class DarwinEvidenceTest(unittest.TestCase):
+    def test_owned_query_returns_text_and_status(self) -> None:
+        with mock.patch.object(gd, "_owned_query", side_effect=[
+            (0, "p123\nn/Users/cmux/work\n"),
+            (0, "launchd\n"),
+        ]):
+            opened, commands = gd.process_evidence()
+        self.assertEqual(opened, ["/Users/cmux/work"])
+        self.assertEqual(commands, "launchd\n")
+
+    def test_owned_query_parses_cache_path(self) -> None:
+        with mock.patch.object(gd, "_owned_query", side_effect=[
+            (0, "p123\nn/Users/cmux/cache\n"),
+            (0, "launchd\n"),
+        ]):
             opened, commands = gd.process_evidence()
         self.assertEqual(opened, ["/Users/cmux/cache"])
         self.assertEqual(commands, "launchd\n")
