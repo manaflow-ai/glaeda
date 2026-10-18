@@ -1139,7 +1139,11 @@ def start_runner_parent_watchdog(worker_pid: int | None) -> None:
     enabled only when that ancestry was observed, uses a start token to reject PID
     reuse, and waits until the hook has no direct child process before terminating.
     """
-    if worker_pid is None:
+    # The generated wrapper uses exec, so the immediate parent is normally the
+    # Runner.Worker itself. If ancestry probing races a short-lived wrapper,
+    # anchor to that observed parent instead of disabling orphan protection.
+    worker_pid = worker_pid or os.getppid()
+    if worker_pid <= 1:
         return
     identity = process_identity(worker_pid)
     if identity is None:
@@ -4724,7 +4728,7 @@ def main(argv: list[str] | None = None) -> int:
         # Capture the real Runner.Worker ancestry before admission. If that
         # process dies while this hook is waiting or cleaning up, the watcher
         # releases the host/capacity flocks instead of stranding the lender.
-        start_runner_parent_watchdog(runner_worker_pid())
+        start_runner_parent_watchdog(runner_worker_pid() or os.getppid())
 
     if args.phase in ("admit", "release"):
         if not args.job_key or not STEP_KEY.fullmatch(args.job_key):
