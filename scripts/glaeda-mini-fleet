@@ -768,6 +768,7 @@ def parse_probe(text: str) -> dict[str, Any]:
         "launchd": [dict(zip(("domain", "label", "state"), v.split("|", 2))) for v in out["launchd"]],
         "fleet_worker": {
             "root": out.get("fleet_root") == "present",
+            "host_lock_tool": out.get("fleet_host_lock_tool"),
             "process": out.get("fleet_worker_proc"),
             "labels": out.get("fleet_labels"),
             "last_job": out.get("fleet_last_job"),
@@ -1069,6 +1070,10 @@ def check_host(manifest: dict[str, Any], name: str, obs: dict[str, Any]) -> list
     if obs.get("host_lock") == "unknown":
         drift("host-lock", f"{FLEET_ROOT}/host.lock exists but its state is unknown to {obs.get('user')}",
               "make host.lock a regular file readable by the SSH user (660 cmux:staff)")
+    if obs["fleet_worker"].get("root") and obs["fleet_worker"].get("host_lock_tool") == "missing":
+        drift("host-lock-tool",
+              f"{FLEET_ROOT}/bin/with-host-lock is missing; controller admission can pause with host_lock",
+              "repair through cmux-lawrence's controller route, then re-observe the worker")
 
     if host.get("hostname") and obs["hostname"] != host["hostname"]:
         drift("identity", f"hostname {obs['hostname']!r}, manifest says {host['hostname']!r}")

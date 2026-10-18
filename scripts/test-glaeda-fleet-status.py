@@ -118,6 +118,37 @@ class JoinTests(unittest.TestCase):
         self.assertEqual((f["severity"], f["action"]["who"]), ("error", "person"))
         self.assertEqual(next(m for m in doc["members"] if m["name"] == "mini-a")["status"], "broken")
 
+    def test_live_controller_reports_missing_host_lock_with_lawrence_repair_route(self):
+        doc = build(controller=src({"workers": {
+            "mini-a": {
+                "healthy": True,
+                "online": True,
+                "claim_paused": "host_lock",
+                "host_bin": {"current": ["disk-pressure.sh"],
+                             "refused": {"with-host-lock": "absent"}},
+            },
+        }}))
+        [finding] = by_id(doc, "controller.host_lock_tool_missing@mini-a")
+        self.assertEqual(finding["severity"], "error")
+        self.assertEqual(finding["action"]["id"], "repair_host_lock_tool")
+        self.assertIn("cmux-lawrence", finding["summary"])
+        self.assertIn("Tailscale", finding["summary"])
+
+    def test_live_controller_runner_job_is_not_misreported_as_host_failure(self):
+        doc = build(controller=src({"workers": {
+            "mini-a": {
+                "healthy": True,
+                "online": True,
+                "claim_paused": "runner_job",
+                "running": [],
+            },
+        }}))
+        [finding] = by_id(doc, "controller.runner_job@mini-a")
+        self.assertEqual(finding["severity"], "warn")
+        self.assertIn("Runner.Worker", finding["summary"])
+        self.assertEqual(next(m for m in doc["members"] if m["name"] == "mini-a")["controller"]["controller_route"],
+                         "cmux-lawrence")
+
     def test_runner_suffix_names_map_to_members_and_offline_is_an_error(self):
         doc = build(runners=src({"runners": [
             {"name": "mini-a-ci2", "status": "offline", "busy": False, "labels": ["self-hosted", "macOS"]},

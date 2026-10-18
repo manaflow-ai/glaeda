@@ -143,6 +143,42 @@ CONTROLLER_FINDINGS = {
     "below CMUX start floor": ("warn", "free_disk", "agent", "free space is below the CMUX start floor"),
     "excluded": ("info", "none", "person", "fleet.json withdraws this worker from the managed pool"),
 }
+
+
+def controller_worker_rows(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Normalize both HQ status.py rows and the live controller API shape.
+
+    The controller's ``/v1/status`` and ``/v1/workers`` endpoints return a
+    mapping keyed by worker name, while the older HQ status projection returns
+    ``[{host, state, ...}]``.  Keeping the normalization here prevents the
+    operator report from silently dropping the richer live fields that explain
+    a pause (for example a missing ``with-host-lock`` executable).
+    """
+    raw = data.get("workers") or []
+    if isinstance(raw, list):
+        return [row for row in raw if isinstance(row, dict)]
+    if not isinstance(raw, dict):
+        return []
+    rows: list[dict[str, Any]] = []
+    for name, value in raw.items():
+        if not isinstance(value, dict):
+            continue
+        row = dict(value)
+        row.setdefault("host", name)
+        row.setdefault("name", name)
+        claim = clean(row.get("claim_paused") or "", 40)
+        if claim:
+            row.setdefault("state", claim)
+        elif row.get("healthy") is False:
+            row.setdefault("state", "unhealthy")
+        elif row.get("online") is False:
+            row.setdefault("state", "stale")
+        elif row.get("running"):
+            row.setdefault("state", "busy")
+        else:
+            row.setdefault("state", "ready")
+        rows.append(row)
+    return rows
 # glaeda-mini-fleet check areas that block builds outright.
 CHECK_ERRORS = frozenset({"reach", "identity", "enrollment", "worker"})
 PREFLIGHT_UNKNOWN_BLOCKS = frozenset({"xcode", "select", "licence", "launch", "metal", "zig", "power", "disk"})
@@ -1068,18 +1104,58 @@ class Builder:
         if not data:
             return
         at = self.stamp("controller")
-        for row in data.get("workers") or []:
-            if not isinstance(row, dict):
-                continue
-            member = self.member_of(row.get("host"))
+        for row in controller_worker_rows(data):
+            host = row.get("host") or row.get("name")
+            member = self.member_of(host)
             if member is None:
-                self.unmapped("controller", row.get("host"), at)
+                self.unmapped("controller", host, at)
                 continue
             state = clean(row.get("state") or "unknown", 40)
+            host_bin = row.get("host_bin") if isinstance(row.get("host_bin"), dict) else {}
+            running = row.get("running") if isinstance(row.get("running"), list) else []
             self.members[member]["controller"] = {
                 "state": state, "busy": row.get("busy") is True, "free_gib": num(row.get("free_gib")),
-                "sample_age_seconds": num(row.get("sample_age_seconds")), "active_jobs": num(row.get("active_jobs"))}
+                "sample_age_seconds": num(row.get("sample_age_seconds")), "active_jobs": num(row.get("active_jobs")),
+                "controller_route": "cmux-lawrence" if isinstance(data.get("workers"), dict) else None,
+                "claim_paused": clean(row.get("claim_paused"), 40) if row.get("claim_paused") else None,
+                "host_bin": host_bin,
+                "running": running[:4],
+            }
             self.members[member]["observed"]["controller"] = at
+
+            # Live controller status carries the reason the worker is paused,
+            # but the old report used to collapse it into an opaque warning.
+            # Make the repair boundary explicit so nobody sends a stale
+            # Tailscale auth link or treats an active runner job as a dead host.
+            claim = clean(row.get("claim_paused") or "", 40)
+            current_bins = host_bin.get("current") if isinstance(host_bin.get("current"), list) else []
+            refused_bins = host_bin.get("refused") if isinstance(host_bin.get("refused"), dict) else {}
+            lock_missing = (
+                claim == "host_lock"
+                and ("with-host-lock" in refused_bins or "with-host-lock" not in current_bins)
+            )
+            if lock_missing:
+                self.finding(
+                    "controller", "host_lock_tool_missing", "error",
+                    f"controller: {host} admission paused (host_lock); "
+                    "with-host-lock is missing. Repair through cmux-lawrence's controller route; "
+                    "do not send a Tailscale login link.",
+                    member, at,
+                    self.action(member, "repair_host_lock_tool", "person", None,
+                                note="use the cmux-lawrence controller mini to reach the runner, "
+                                     "copy the peer-verified tool, and re-observe the worker"),
+                )
+                continue
+            if claim == "runner_job":
+                detail = (
+                    f"controller: {host} is paused for a runner-owned job; "
+                    "inspect Runner.Worker/process evidence before treating it as stale"
+                )
+                severity = "info" if running else "warn"
+                self.finding("controller", "runner_job", severity, detail, member, at,
+                             self.action(member, "inspect_runner_job", "person", None,
+                                         note="a runner-owned job is not necessarily visible in the controller job list"))
+                continue
             known = CONTROLLER_FINDINGS.get(state)
             if known is None and state in ("ready", "busy"):
                 continue

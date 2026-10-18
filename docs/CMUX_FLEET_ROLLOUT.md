@@ -33,6 +33,28 @@ Underneath:
   already flags a missing `controller_token`, but nothing compares a present, rejected token or
   the running binary against what the host should run.
 
+## Recovery route for a paused runner
+
+`cmux-lawrence` is the controller mini and the supported recovery entrypoint
+for the AWS Mac fleet. A controller row with `claim_paused: host_lock` is not
+a Tailscale-login problem. Inspect the live worker row and its `host_bin`
+fields: if `with-host-lock` is absent or refused, the worker is healthy but
+cannot admit new work until that executable is restored and the controller
+observes it again.
+
+Use the controller mini's existing fleet SSH route to reach the runner, copy a
+peer-verified `with-host-lock` payload, preserve its mode and ownership, and
+wait for a fresh heartbeat. Do not send an interactive Tailscale
+reauthentication link to an operator as the repair procedure. The post-repair
+receipt must include the source peer and SHA-256, the runner name, the
+controller observation time, `claim_paused` cleared, and queue/active-job
+counts.
+
+`claim_paused: runner_job` is a different state: the native Actions runner may
+be executing a job that is not represented in the controller's own job list.
+Inspect `Runner.Worker` and the build process before calling it stale or
+restarting the service. The fleet status report labels this state explicitly.
+
 ## Goal
 
 A merged, reviewed build-fleet change reaches every eligible worker without a human copying

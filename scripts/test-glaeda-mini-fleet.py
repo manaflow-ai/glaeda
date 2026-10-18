@@ -69,7 +69,7 @@ def probe_text(hostname: str = "build-mini-1", keys: tuple[str, ...] = ("coordin
         f"xcode_license_accepted\t{license_}",
         "disk\t/System/Volumes/Data|460|220",
         f"launchd\t/Library/LaunchDaemons|com.example.build-worker|{worker}",
-        "fleet_root\tpresent", f"fleet_worker_proc\t{worker_proc}",
+        "fleet_root\tpresent", "fleet_host_lock_tool\tpresent", f"fleet_worker_proc\t{worker_proc}",
         "runner_worker\tabsent", "host_lock\tfree",
         "ak_file\tauthorized_keys|600",
     ]
@@ -3574,6 +3574,12 @@ class ReservationCheckAndPoolTests(unittest.TestCase):
     def test_unknown_host_lock_is_drift(self) -> None:
         self.assertIn("host-lock", [i["area"] for i in self.issues("host_lock\tunknown\n")])
         self.assertNotIn("host-lock", [i["area"] for i in self.issues("host_lock\tfree\n")])
+
+    def test_missing_host_lock_tool_names_controller_repair(self) -> None:
+        issues = self.issues("fleet_host_lock_tool\tmissing\n")
+        [issue] = [i for i in issues if i["area"] == "host-lock-tool"]
+        self.assertIn("with-host-lock", issue["detail"])
+        self.assertIn("cmux-lawrence", issue["fix"])
 
     def test_cli_exit_and_summary_ignore_reserved(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

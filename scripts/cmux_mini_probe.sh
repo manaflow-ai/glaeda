@@ -81,6 +81,7 @@ enrollment="${XDG_CONFIG_HOME:-$HOME/.config}/glaeda/cmux-fleet/enrollment.json"
 F=/Users/Shared/cmux-build-fleet
 if [ -d "$F" ]; then
   e fleet_root present
+  [ -x "$F/bin/with-host-lock" ] && e fleet_host_lock_tool present || e fleet_host_lock_tool missing
   # Existence only; the token is never read.
   [ -f "$F/secrets/controller.token" ] && e controller_token present || e controller_token missing
   e fleet_labels "$(plutil -extract EnvironmentVariables.CMUX_CI_LABELS raw /Library/LaunchDaemons/ai.manaflow.cmux-build-worker.plist 2>/dev/null)"
