@@ -4784,6 +4784,7 @@ def cmd_upgrade(manifest: dict[str, Any], manifest_path: Path, wanted: list[str]
         if targets else {}
     ready: list[str] = []  # enrolled, reachable, ready hosts that need the new candidate or already run it
     needs: dict[str, str] = {}
+    class_relinks: set[str] = set()
     for name in targets:
         rows[name] = new_row(manifest, name, step="preflight")
         result = results[name]
@@ -4807,6 +4808,14 @@ def cmd_upgrade(manifest: dict[str, Any], manifest_path: Path, wanted: list[str]
         elif failing:
             rows[name]["result"] = f"not ready: {', '.join(failing)}; glaeda-mini-fleet repair {name}"
         else:
+            # A node-local acceptance leaves the enrollment eligible, but the runner hook admits
+            # only an enrollment that names the class receipt. Treat that stale link as a renewal
+            # even when the candidate generation is already current, or health will keep reporting
+            # node_ineligible and every job-started hook will refuse work.
+            if need == "ok" and missing_class_acceptance(manifest, name, result):
+                need = "renew"
+                needs[name] = need
+                class_relinks.add(name)
             ready.append(name)
 
     # Per class: the recorded acceptance when it already covers this candidate (a resumed run), else a seed.
@@ -4880,7 +4889,8 @@ def cmd_upgrade(manifest: dict[str, Any], manifest_path: Path, wanted: list[str]
         def run() -> tuple[bool, str, str]:
             log_path = directory / f"{name}.log"
             if needs[name] != "ok":
-                ok, step, detail = renew_one(manifest, name, results[name], candidate, glaeda_ref, None, log_path, share_from)
+                ok, step, detail = renew_one(manifest, name, results[name], candidate, glaeda_ref, None, log_path,
+                                              share_from, force_class_relink=name in class_relinks)
                 if not ok:
                     return ok, step, detail
             try:
@@ -4923,7 +4933,8 @@ def cmd_upgrade(manifest: dict[str, Any], manifest_path: Path, wanted: list[str]
     if peers:
         logs = {h: directory / f"{h}.log" for h in peers}
         tasks = {h: (lambda h=h: renew_one(manifest, h, results[h], candidate, glaeda_ref,
-                                           receipts[manifest["hosts"][h]["hardware"]], logs[h], share_from))
+                                           receipts[manifest["hosts"][h]["hardware"]], logs[h], share_from,
+                                           force_class_relink=h in class_relinks))
                  for h in peers}
         for name, (ok, step, detail) in run_with_heartbeat(tasks, logs, "adopt", heartbeat).items():
             rows[name].update(step=step, result=detail if ok or detail.startswith("held:") else f"failed: {detail}")

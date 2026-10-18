@@ -3231,8 +3231,10 @@ class UpgradeTests(unittest.TestCase):
         self.assertNotIn("—", out)
 
     def test_the_seed_accepts_records_the_class_and_the_rest_adopt_it(self) -> None:
-        after = {"build-mini-1": on_candidate(generation=NEW_GEN),
-                 "build-mini-2": on_candidate(generation=NEW_GEN, node_id="cmux-mac-002")}
+        class_accepted = lambda text: text.replace("pf_acceptance\taccepted",
+                                                   "pf_acceptance\taccepted\npf_acceptance_class\tglaeda-class-acceptance/v1")
+        after = {"build-mini-1": class_accepted(on_candidate(generation=NEW_GEN)),
+                 "build-mini-2": class_accepted(on_candidate(generation=NEW_GEN, node_id="cmux-mac-002"))}
         code, out, calls, export = self.upgrade(self.fleet(), "--yes", after=after)
         self.assertEqual(code, 0, out)
         enrolls = calls_to(calls, ENROLL)
@@ -3257,6 +3259,23 @@ class UpgradeTests(unittest.TestCase):
         self.assertEqual((code, export.call_count), (0, 0), out)
         self.assertEqual(calls_to(calls, ENROLL), [])
         self.assertIn("ok: already on 3809eed51fdd", out)
+
+    def test_upgrade_relinks_a_current_node_missing_the_class_link(self) -> None:
+        # A prior local acceptance can leave the enrollment eligible while the class receipt
+        # link required by every runner hook is absent. Upgrade must repair that link instead
+        # of treating the current candidate as already done.
+        self.manifest = pinned_manifest(self.tmp.name)
+        current = on_candidate(generation=NEW_GEN)
+        code, out, calls, _ = self.upgrade({"build-mini-1": current}, "--yes", after={"build-mini-1": current})
+        self.assertEqual(code, 0, out)
+        relink = calls_to(calls, "transition-apply")
+        self.assertEqual(len(relink), 1)
+        self.assertIn("--to quarantined --reason stale_glaeda_generation", relink[0][1])
+        enroll = calls_to(calls, ENROLL)
+        self.assertEqual(len(enroll), 1)
+        self.assertIn("--class-receipt - --class-receipt-sha256", enroll[0][1])
+        self.assertIn("--fleet-class m4pro-48", enroll[0][1])
+        self.assertIn("eligible", out)
 
     def test_an_old_glaeda_checkout_is_synced_by_the_renewal_not_refused(self) -> None:
         lacking = "--class-receipt --class-receipt-sha256 --fleet-class"

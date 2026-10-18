@@ -48,6 +48,10 @@ checkouts, other filesystems, the Chromium trees and the macOS privacy-protected
 never searched (HOME_NEVER).
 Bazel's macOS output root (/private/var/tmp/_bazel_$USER) is its own family.
 Every deletion is appended to a JSONL receipt.
+An apply also appends one bounded eviction summary with before/after ``df`` free
+blocks, logical catalogue bytes, blocked/unchecked bytes, and the accounting gap;
+those quantities are intentionally kept separate because APFS clones and concurrent
+jobs make logical deletion sizes an unreliable physical-space measurement.
 
 The cmux-next workflow keeps per-runner state under
 ~/Library/Caches/cmux-next-ci.  Its SourcePackages and module/SDK caches are
@@ -3715,6 +3719,57 @@ def free_bytes(path: Path) -> tuple[int, int]:
     return u.free, u.total
 
 
+def filesystem_receipt_state(fss: list[Fs] | dict[int, Fs]) -> list[dict[str, Any]]:
+    """Capture the bounded filesystem state used by an eviction receipt.
+
+    The ``Fs`` values collected before a sweep are the authoritative starting
+    observation. A post-sweep observation is taken separately; callers must not
+    infer physical reclamation from the logical sizes of deleted catalogue items.
+    """
+    values = list(fss.values()) if isinstance(fss, dict) else list(fss)
+    return [{"dev": fs.dev, "mount": fs.mount, "free": fs.free, "total": fs.total,
+             "low": fs.low, "target": fs.target, "under": fs.under, "observed": True}
+            for fs in values]
+
+
+def reobserve_filesystems(fss: list[Fs] | dict[int, Fs]) -> tuple[list[Fs], list[dict[str, Any]]]:
+    """Re-read free space after an apply and retain an explicit failure marker."""
+    values = list(fss.values()) if isinstance(fss, dict) else list(fss)
+    updated: list[Fs] = []
+    state: list[dict[str, Any]] = []
+    for fs in values:
+        try:
+            free, total = free_bytes(Path(fs.mount))
+        except (OSError, ValueError) as exc:
+            updated.append(fs)
+            state.append({"dev": fs.dev, "mount": fs.mount, "free": None, "total": None,
+                          "low": fs.low, "target": fs.target, "under": None,
+                          "observed": False, "error": exc.__class__.__name__})
+            continue
+        current = replace(fs, free=free, total=total)
+        updated.append(current)
+        state.append({"dev": current.dev, "mount": current.mount, "free": current.free,
+                      "total": current.total, "low": current.low, "target": current.target,
+                      "under": current.under, "observed": True})
+    return updated, state
+
+
+def physical_df_delta(before: list[dict[str, Any]], after: list[dict[str, Any]]) -> dict[str, Any]:
+    """Compare before/after free blocks without guessing when either side is missing."""
+    old = {str(row.get("dev")): row for row in before if isinstance(row, dict)}
+    new = {str(row.get("dev")): row for row in after if isinstance(row, dict)}
+    by_dev: dict[str, int | None] = {}
+    for dev in sorted(set(old) | set(new)):
+        a, b = old.get(dev, {}), new.get(dev, {})
+        afree, bfree = a.get("free"), b.get("free")
+        by_dev[dev] = bfree - afree if isinstance(afree, int) and isinstance(bfree, int) else None
+    known = [delta for delta in by_dev.values() if isinstance(delta, int)]
+    complete = len(known) == len(by_dev)
+    total = sum(known) if complete else None
+    return {"by_dev": by_dev, "bytes": total, "complete": complete,
+            "reclaimed_bytes": max(0, total) if isinstance(total, int) else None}
+
+
 def space(spec: str, total: int) -> int:
     """A threshold as bytes: "60" is 60 GiB, "15%" is 15% of this filesystem's size, and
     "15%:40-150" is that share held between 40 and 150 GiB. LO never lifts it past twice the
@@ -4132,6 +4187,17 @@ def filesystem_accounting(fss: list[Fs], items: list[Item]) -> list[dict[str, An
         # A parent catalog item already includes every nested item. Count only the highest-level path
         # in each overlapping set so the unmeasured figure remains an accounting gap, not an overlap artifact.
         ordered = sorted(catalogued, key=lambda pair: (len(pair[0].parts), str(pair[0])))
+        selected: list[Path] = []
+        blocked_by_verdict: dict[str, int] = {}
+        for path, size, verdict in sorted(catalogued, key=lambda pair: (len(pair[0].parts), str(pair[0]))):
+            if any(path == parent or parent in path.parents for parent in selected):
+                continue
+            selected.append(path)
+            measured += size
+            if verdict != "reclaimable":
+                blocked_by_verdict[verdict] = blocked_by_verdict.get(verdict, 0) + size
+        blocked = sum(blocked_by_verdict.values())
+        unchecked = blocked_by_verdict.get("unchecked", 0)
         measured = sum(size for _, size, _ in top_level_catalogued(ordered))
         # A report-only checkout must not mask a reclaimable build directory nested inside it.
         # Deduplicate reclaimable candidates independently so this number is the bytes the next
@@ -4161,7 +4227,8 @@ def filesystem_accounting(fss: list[Fs], items: list[Item]) -> list[dict[str, An
                  "unmeasured": unclassified, "unclassified": unclassified,
                  "known_coverage": known_coverage,
                  "accounting_gap": max(0, unclassified - known_coverage),
-                 "reclaimable": reclaimable, "top_level": top,
+                 "reclaimable": reclaimable, "blocked": blocked, "unchecked": unchecked,
+                 "blocked_by_verdict": blocked_by_verdict, "top_level": top,
                  "scope": "runner-cache-profile" if RUNNER_CACHE_PROFILE else "volume",
                  "container": apfs_container_capacity(fs.mount, now),
                  "coverage": coverage, "coverage_at": coverage_at,
@@ -4203,6 +4270,12 @@ def read_eviction_contention(receipt: Path) -> dict[str, Any] | None:
         owner = record.get("owner")
         if not isinstance(owner, dict):
             owner = {}
+        owner_pid = owner.get("pid")
+        if isinstance(owner_pid, int) and not isinstance(owner_pid, bool) and owner_pid > 0 and not _pid_alive(owner_pid):
+            # A completed or crashed sweep can leave its last skip receipt behind.  A dead
+            # owner is no longer contention; retaining it makes mini-health report a live
+            # blocker until the age timeout even though the lock is free.
+            return None
         bounded_owner = {key: owner[key] for key in ("state", "pid", "owner", "started_at", "age_s")
                          if key in owner}
         return {"at": record.get("at"), "at_epoch": at_epoch, "owner": bounded_owner}
@@ -4237,8 +4310,22 @@ def write_health_summary(fss: list[Fs], items: list[Item], accounting: list[dict
     """Write the bounded local summary consumed by mini-health and ci-dash's Health row."""
     try:
         HEALTH_SUMMARY.parent.mkdir(parents=True, exist_ok=True)
+        if accounting:
+            reclaimable = sum(int(row.get("reclaimable", 0)) for row in accounting)
+            blocked = sum(int(row.get("blocked", 0)) for row in accounting)
+            unchecked = sum(int(row.get("unchecked", 0)) for row in accounting)
+            accounting_gap = sum(int(row.get("accounting_gap", 0)) for row in accounting)
+        else:
+            # A vanished item must not keep the health row stale after apply. This fallback is
+            # mainly for profile-less test hosts where no filesystem accounting row exists.
+            live = [i for i in items if os.path.lexists(i.path)]
+            reclaimable = sum(i.bytes for i in live if i.verdict == "reclaimable")
+            blocked = sum(i.bytes for i in live if i.verdict != "reclaimable")
+            unchecked = sum(i.bytes for i in live if i.verdict == "unchecked")
+            accounting_gap = 0
         payload = {"schema": "glaeda-disk/v1", "at": int(time.time()),
-                   "reclaimable": sum(i.bytes for i in items if i.verdict == "reclaimable"),
+                   "reclaimable": reclaimable, "blocked": blocked, "unchecked": unchecked,
+                   "accounting_gap": accounting_gap,
                    "findings": list(EVICTION_STUCK),
                    "accounting": [dict(x) for x in accounting],
                    "filesystems": [{"mount": x.mount, "free": x.free, "total": x.total,
@@ -4375,6 +4462,8 @@ def report(items: list[Item], fss: list[Fs], limit: int, idle_hours: float,
     print(f"idle window {idle_hours:g}h\n")
     for a in accounting or []:
         print(f"accounting on {a['mount']}: reclaimable {gib(a.get('reclaimable', 0)).strip()}, "
+              f"blocked {gib(a.get('blocked', 0)).strip()} "
+              f"(unchecked {gib(a.get('unchecked', 0)).strip()}), "
               f"unclassified {gib(a.get('unclassified', a.get('unmeasured', 0))).strip()} "
               f"(df used {gib(a['used']).strip()}, measured {gib(a['measured']).strip()})")
         container = a.get("container") or {}
@@ -4428,6 +4517,43 @@ def notify_disk(title: str, body: str) -> None:
                        env={"PATH": "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin", "LC_ALL": "C"})
     except (OSError, subprocess.SubprocessError):
         pass
+
+def write_eviction_summary(receipt: Path, operation: str, logical_released: int,
+                            before_fs: list[dict[str, Any]], after_fs: list[dict[str, Any]],
+                            before_accounting: list[dict[str, Any]],
+                            after_accounting: list[dict[str, Any]]) -> dict[str, Any]:
+    """Append a before/after receipt for an apply, with physical and logical bytes separate."""
+    physical = physical_df_delta(before_fs, after_fs)
+    blocked = sum(int(row.get("blocked", 0)) for row in after_accounting)
+    unchecked = sum(int(row.get("unchecked", 0)) for row in after_accounting)
+    gap = sum(int(row.get("accounting_gap", 0)) for row in after_accounting)
+    record = {
+        "schema": "glaeda-disk/eviction-summary/v1",
+        "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "at_epoch": time.time(),
+        "host": platform.node(),
+        "family": "eviction",
+        "outcome": "completed",
+        "operation": operation,
+        "logical_released_bytes": logical_released,
+        "physical_df_delta_bytes": physical["bytes"],
+        "physical_df_reclaimed_bytes": physical["reclaimed_bytes"],
+        "physical_observation": physical,
+        "blocked_bytes": blocked,
+        "unchecked_bytes": unchecked,
+        "accounting_gap_bytes": gap,
+        "before": {"filesystems": before_fs, "accounting": before_accounting},
+        "after": {"filesystems": after_fs, "accounting": after_accounting},
+        "findings": list(EVICTION_STUCK),
+    }
+    try:
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        with receipt.open("a") as handle:
+            handle.write(json.dumps(record) + "\n")
+    except OSError:
+        # The stdout receipt remains useful even when its requested path is unavailable.
+        pass
+    return record
 
 
 def remove(path: Path, after_rename=None) -> None:
@@ -4528,6 +4654,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         if RUNNER_CACHE_PROFILE and (not runner_profile_roots_safe(every)
                                      or not runner_profile_path_safe(fam, p)):
             outcome = "changed:profile-boundary"
+            i.verdict = "blocked"
+            i.reasons.append(outcome)
             rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(),
                    "outcome": outcome, "rebuild": fam.rebuild, **asdict(i)}
             with receipt.open("a") as f:
@@ -4631,13 +4759,19 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             except (OSError, subprocess.SubprocessError) as e:
                 outcome = f"incomplete:{e.__class__.__name__}"
         is_sweep = halt is not None if receipt_sweep is None else receipt_sweep
+        if outcome != "reclaimed" and (outcome.startswith("changed:") or outcome.startswith("incomplete:")):
+            # Keep the post-apply health/accounting view honest when a candidate became
+            # busy or otherwise failed the final recheck after the survey.
+            i.verdict = "blocked"
+            i.reasons.append(outcome)
         rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(),
                "outcome": outcome, "rebuild": fam.rebuild, **asdict(i),
                **({"sweep": "idle"} if is_sweep else {})}
         with receipt.open("a") as f:
             f.write(json.dumps(rec) + "\n")
         print(f"  {outcome:16s} {gib(i.bytes)}  {i.path.replace(str(HOME), '~')}")
-    print(f"released {gib(released).strip()}; receipt {receipt}")
+    print(f"logical released {released} bytes ({gib(released).strip()}); physical df delta is measured in the run summary; "
+          f"receipt {receipt}")
     return released
 
 
@@ -5337,6 +5471,12 @@ def _main_impl(argv: list[str] | None = None) -> int:
               "the next refresh will continue\n")
     shown = [fs for fs in fss.values() if not a.pressure or fs.under]
     accounting = filesystem_accounting(shown, items)
+    # A before/after receipt must compare the same filesystem set even when a pressure
+    # report only displays volumes currently below the threshold.
+    receipt_accounting_before = (accounting if len(shown) == len(fss)
+                                 else filesystem_accounting(list(fss.values()), items))
+    before_fs_receipt = filesystem_receipt_state(fss)
+    operation = "idle" if sweep else "pressure" if a.pressure else "apply"
     write_health_summary(shown, items, accounting, a.receipt)
     # Xcode copies are sized by a walk, so only a report shows them (the agent runs with --top 0)
     tooling = (simulator_runtimes() + (xcode_items() if a.top or a.json else [])) \
@@ -5361,13 +5501,13 @@ def _main_impl(argv: list[str] | None = None) -> int:
         print()
         halt = (cmux_next_drain_halt if a.cmux_next_drain
                 else host_busy if sweep and POLICY["defer_during_ci"] else None)
-        released = apply(items, {f.id: f for f in fams}, a.receipt,
-                         {fs.dev: fs.target for fs in shown} if a.pressure else None, idle, halt,
-                         all_families=fams, receipt_sweep=sweep)
+        logical_released = apply(items, {f.id: f for f in fams}, a.receipt,
+                                 {fs.dev: fs.target for fs in shown} if a.pressure else None, idle, halt,
+                                 all_families=fams, receipt_sweep=sweep)
         # A drained runner is explicitly held by cmux_mini_fix; once its listener and worker
         # are absent, its disposable checkout can be cleared under this same eviction lock.
         if not RUNNER_CACHE_PROFILE:
-            cleanup_paused_runner_work(a.receipt)
+            logical_released += cleanup_paused_runner_work(a.receipt)
         remaining = []
         for fs in shown:
             try:
@@ -5376,8 +5516,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
                 free = fs.free
             if free < fs.low:
                 remaining.append(f"{gib(free).strip()} free on {fs.mount}")
-        if released:
-            notify_disk("glaeda disk keepup", f"{gib(released).strip()} reclaimed on {platform.node()}")
+        if logical_released:
+            notify_disk("glaeda disk keepup", f"{gib(logical_released).strip()} reclaimed on {platform.node()}")
         if remaining:
             kept = [i for i in items if i.verdict != "reclaimable"][:3]
             blocked = ", ".join(f"{gib(i.bytes).strip()} {Path(i.path).name} ({i.verdict})" for i in kept)
@@ -5386,9 +5526,25 @@ def _main_impl(argv: list[str] | None = None) -> int:
         if sweep:
             if not RUNNER_CACHE_PROFILE:
                 # deleting a runtime restarts CoreSimulatorService: never while a job may be using simulators
-                apply_runtimes(tooling, a.receipt, host_busy)
+                logical_released += apply_runtimes(tooling, a.receipt, host_busy)
             IDLE_STAMP.parent.mkdir(parents=True, exist_ok=True)
             IDLE_STAMP.touch()
+        # Re-observe after every destructive operation. The accounting and df delta are
+        # deliberately separate: logical catalogue bytes can differ from physical free
+        # blocks because of APFS clones, snapshots, concurrent jobs, or failed measurements.
+        after_fss, after_fs_receipt = reobserve_filesystems(fss)
+        after_accounting = filesystem_accounting(after_fss, items)
+        write_health_summary(after_fss, items, after_accounting, a.receipt)
+        summary = write_eviction_summary(a.receipt, operation, logical_released,
+                                         before_fs_receipt, after_fs_receipt,
+                                         receipt_accounting_before, after_accounting)
+        physical = summary["physical_df_delta_bytes"]
+        physical_text = (f"{physical} bytes ({physical / GIB:+.1f}G)" if isinstance(physical, int)
+                         else "unknown (post-sweep observation incomplete)")
+        print(f"eviction summary: logical released {logical_released} bytes ({gib(logical_released).strip()}); "
+              f"physical df delta {physical_text}; blocked {gib(summary['blocked_bytes']).strip()} "
+              f"(unchecked {gib(summary['unchecked_bytes']).strip()}); "
+              f"accounting gap {gib(summary['accounting_gap_bytes']).strip()}; receipt {a.receipt}")
         release_evict_lock(_EVICT_HANDLE)
         if maintenance_handle is not None:
             fcntl.flock(maintenance_handle, fcntl.LOCK_UN)

@@ -405,6 +405,7 @@ class GlaedaDiskTest(unittest.TestCase):
         try:
             gd.apply(items, {self.fam.id: self.fam}, receipt, None, 24)
             self.assertTrue(d.exists())
+            self.assertEqual(items[0].verdict, "blocked")
             self.assertIn("changed:modified", receipt.read_text())
         finally:
             receipt.unlink(missing_ok=True)
@@ -1000,6 +1001,45 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(got["reclaimable"], 2 * gd.GIB)
         self.assertEqual(got["unclassified"], 5 * gd.GIB)
         self.assertEqual(got["container"]["free"], 6 * gd.GIB)
+
+    def test_accounting_surfaces_blocked_and_unchecked_bytes(self) -> None:
+        blocked = self.root / "blocked"
+        unchecked = self.root / "unchecked"
+        reclaimable = self.root / "reclaimable"
+        for path in (blocked, unchecked, reclaimable):
+            path.mkdir()
+        fs = gd.Fs(self.root.stat().st_dev, str(self.root), 3 * gd.GIB, 10 * gd.GIB,
+                   4 * gd.GIB, 5 * gd.GIB)
+        items = [gd.Item("xcode-derived-data", str(blocked), 4 * gd.GIB, 30.0, "in-use"),
+                 gd.Item("xcode-derived-data", str(unchecked), 3 * gd.GIB, 30.0, "unchecked"),
+                 gd.Item("xcode-derived-data", str(reclaimable), 2 * gd.GIB, 30.0, "reclaimable")]
+        saved = (gd.DARWIN, gd.ACCOUNTING)
+        gd.DARWIN, gd.ACCOUNTING = False, self.root / "accounting-blocked.json"
+        gd._ACCOUNTING_MEM.clear()
+        gd._ACCOUNTING_COVERAGE_MEM.clear()
+        self.addCleanup(lambda: (setattr(gd, "DARWIN", saved[0]), setattr(gd, "ACCOUNTING", saved[1]),
+                                  gd._ACCOUNTING_MEM.clear(), gd._ACCOUNTING_COVERAGE_MEM.clear()))
+        got = gd.filesystem_accounting([fs], items)[0]
+        self.assertEqual(got["blocked"], 7 * gd.GIB)
+        self.assertEqual(got["unchecked"], 3 * gd.GIB)
+        self.assertEqual(got["blocked_by_verdict"], {"in-use": 4 * gd.GIB, "unchecked": 3 * gd.GIB})
+
+    def test_eviction_summary_separates_logical_and_physical_bytes(self) -> None:
+        receipt = self.root / "eviction.jsonl"
+        before = [{"dev": 1, "mount": "/data", "free": 10, "total": 20,
+                   "low": 12, "target": 15, "under": True, "observed": True}]
+        after = [{"dev": 1, "mount": "/data", "free": 25, "total": 20,
+                  "low": 12, "target": 15, "under": False, "observed": True}]
+        accounting = [{"mount": "/data", "blocked": 7, "unchecked": 3, "accounting_gap": 4,
+                       "reclaimable": 2}]
+        summary = gd.write_eviction_summary(receipt, "pressure", 12,
+                                            before, after, accounting, accounting)
+        self.assertEqual(summary["logical_released_bytes"], 12)
+        self.assertEqual(summary["physical_df_delta_bytes"], 15)
+        self.assertEqual(summary["physical_df_reclaimed_bytes"], 15)
+        self.assertEqual(summary["blocked_bytes"], 7)
+        self.assertEqual(summary["unchecked_bytes"], 3)
+        self.assertEqual(json.loads(receipt.read_text())["before"]["filesystems"][0]["free"], 10)
 
     def test_runner_profile_accounting_is_scoped_and_does_not_walk_roots_again(self) -> None:
         path = self.root / "cua-cache" / "frame.bin"
@@ -1773,6 +1813,14 @@ class GlaedaDiskTest(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 gd.main(["--apply", "--no-snapshot", "--top", "0", *receipt])
             survey.assert_called_once()
+
+    def test_dead_eviction_owner_does_not_keep_contention_health_stale(self) -> None:
+        receipt = self.receipt()
+        receipt.write_text(json.dumps({"at": "now", "at_epoch": time.time(), "family": "eviction",
+                                       "outcome": "skipped", "reason": "another eviction running",
+                                       "owner": {"pid": 12345, "owner": "cmux", "state": "live"}}) + "\n")
+        with mock.patch.object(gd, "_pid_alive", return_value=False):
+            self.assertIsNone(gd.read_eviction_contention(receipt))
 
     def test_measurement_busy_json_is_not_a_completed_empty_report(self) -> None:
         lock = self.root / "measurement.lock"
