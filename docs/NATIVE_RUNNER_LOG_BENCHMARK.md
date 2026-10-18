@@ -9,8 +9,9 @@ wall, user, system, and peak child RSS, action counts, bytes, and each side's
 receipt identities.
 
 The native side must be a verified hosted artifact. Pass its binary hash, build
-receipt, and source commit. `--checkout-commit` binds that receipt to the
-checkout being benchmarked. The current observer intentionally returns
+receipt, and exact source commit/tree. `--checkout-commit` and
+`--checkout-tree` bind that receipt to the checkout being benchmarked. The
+current observer intentionally returns
 `reclaim_not_ready` for `--apply`; the harness records that as
 `blocked_native_effect_comparison` and does not permit a speedup claim. A
 missing binary likewise runs the Python baseline and emits a blocked receipt.
@@ -25,13 +26,19 @@ python3 scripts/benchmark-native-runner-log.py \
   --native-sha256 VERIFIED_BINARY_SHA256 \
   --native-receipt /absolute/path/to/glaeda-runner-log-reclaim.receipt.json \
   --source-commit VERIFIED_HOSTED_SOURCE_SHA \
+  --source-tree VERIFIED_HOSTED_SOURCE_TREE \
   --checkout-commit VERIFIED_BENCHMARK_HEAD \
+  --checkout-tree VERIFIED_BENCHMARK_TREE \
   --output /absolute/path/to/native-runner-log-benchmark.json
 ```
 
 The JSON receipt is the authoritative result. `speedup_claim_allowed` is true
-only for `matched_fixture_effects`, when native apply has no errors and the
-expected stale files are actually gone while all protected files survive.
+only for `matched_fixture_effects`, when the native build receipt binds the
+exact source commit and tree to the benchmark checkout, and every matrix row
+has successful recovery, per-item, and post-action receipts. Native apply must
+have no errors, the expected stale files must be gone, and every protected
+file—including the aged warm marker—must survive. A row with only an action
+count, a binary hash, or a plan result remains blocked.
 Python batch IDs and native device/inode receipt IDs are intentionally reported
 with different `identity_kind` values; they are not identity parity. These
 isolated fixtures do not measure fleet throughput or authorize production

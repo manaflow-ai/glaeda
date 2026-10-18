@@ -19,6 +19,66 @@ SPEC.loader.exec_module(MODULE)
 
 
 class BenchmarkAccountingTest(unittest.TestCase):
+    def _complete_native_report(self) -> dict:
+        return {
+            "recovery_receipt": {
+                "pending_at_start": 0,
+                "pending_after": 0,
+                "outcome": "clean",
+            },
+            "item_receipts": [{
+                "receipt_id": "item-1",
+                "identity": {"device": 1, "inode": 2, "size": 7},
+                "outcome": "reclaimed",
+            }],
+            "post_action_receipt": {"pending_count": 0, "observed": True},
+        }
+
+    def test_native_matrix_requires_recovery_item_and_post_action_receipts(self) -> None:
+        report = self._complete_native_report()
+        self.assertTrue(MODULE.native_receipts_complete(report, expected_items=1))
+        for field in ("recovery_receipt", "item_receipts", "post_action_receipt"):
+            incomplete = dict(report)
+            incomplete.pop(field)
+            self.assertFalse(
+                MODULE.native_receipts_complete(incomplete, expected_items=1), field
+            )
+
+    def test_native_matrix_rejects_pending_recovery_or_unobserved_post_action(self) -> None:
+        report = self._complete_native_report()
+        report["recovery_receipt"]["pending_after"] = 1
+        self.assertFalse(MODULE.native_receipts_complete(report, expected_items=1))
+        report = self._complete_native_report()
+        report["recovery_receipt"]["pending_at_start"] = -1
+        self.assertFalse(MODULE.native_receipts_complete(report, expected_items=1))
+        report = self._complete_native_report()
+        report["post_action_receipt"]["pending_count"] = False
+        self.assertFalse(MODULE.native_receipts_complete(report, expected_items=1))
+        report = self._complete_native_report()
+        report["post_action_receipt"]["observed"] = False
+        self.assertFalse(MODULE.native_receipts_complete(report, expected_items=1))
+
+    def test_matrix_status_blocks_missing_receipts_or_warm_state(self) -> None:
+        status, reasons = MODULE.classify_status(
+            [{"implementation": "native", "native_errors": [], "effect_valid": True,
+              "native_receipts_complete": False, "warm_state_preserved": False}],
+            source_matches_checkout=True,
+            native_available=True,
+        )
+        self.assertEqual(status, "blocked_native_effect_comparison")
+        self.assertIn("native_authority_receipts_incomplete", reasons)
+        self.assertIn("warm_state_not_preserved", reasons)
+
+    def test_matrix_status_requires_exact_source_tree_match(self) -> None:
+        status, reasons = MODULE.classify_status(
+            [{"implementation": "native", "native_errors": [], "effect_valid": True,
+              "native_receipts_complete": True, "warm_state_preserved": True}],
+            source_matches_checkout=False,
+            native_available=True,
+        )
+        self.assertEqual(status, "blocked_native_effect_comparison")
+        self.assertIn("native_source_receipt_mismatch", reasons)
+
     def test_reclaim_not_ready_blocks_comparison(self) -> None:
         status, reasons = MODULE.classify_status(
             [{"implementation": "native", "native_errors": ["reclaim_not_ready"],
