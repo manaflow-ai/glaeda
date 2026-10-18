@@ -545,13 +545,13 @@ class ReleaseTest(unittest.TestCase):
 
     def test_policy_classifies_exact_paths_and_sets_coverage(self) -> None:
         low = gr.policy_for_paths(["docs/GLAEDA_OTA.md", "tests/test_policy.md"])
-        self.assertEqual((low["risk"], low["soakHours"], low["requiredHosts"]), ("low", 2, []))
+        self.assertEqual((low["risk"], low["soakHours"], low["requiredHosts"]), ("low", 0.25, []))
         normal = gr.policy_for_paths(["scripts/telemetry.py"])
         self.assertEqual((normal["risk"], normal["soakHours"], normal["requiredHosts"]),
-                         ("normal", 6, list(gr.CANARY_HOSTS)))
+                         ("normal", 0.25, list(gr.CANARY_HOSTS)))
         high = gr.policy_for_paths(["scripts/glaeda-update"])
         self.assertEqual((high["risk"], high["soakHours"], high["requiredHosts"]),
-                         ("high", 12, list(gr.CANARY_HOSTS)))
+                         ("high", 0.25, list(gr.CANARY_HOSTS)))
         self.assertEqual(gr.policy_for_paths([])["risk"], "high")
 
     def test_policy_requires_each_registered_canary_for_operational_release(self) -> None:
@@ -562,6 +562,14 @@ class ReleaseTest(unittest.TestCase):
         self.assertTrue(gr.promotion(candidate, None, both, self.NOW)[0])
         pending = one + [self.status("big-red", "pending", "2026-09-25T02:00:00Z")]
         self.assertIn("inconclusive", gr.promotion(candidate, None, pending, self.NOW)[1])
+
+    def test_historical_signed_policy_remains_promotable_alongside_new_policy(self) -> None:
+        historical = {**self.canary(), "policy": {**gr.policy_for_paths(["scripts/glaeda-update"]),
+                                                    "soakHours": 12}}
+        parsed = gr.parse_policy(historical["policy"])
+        self.assertEqual(parsed["soakHours"], 12)
+        current = gr.policy_for_paths(["scripts/glaeda-update"])
+        self.assertEqual(current["soakHours"], 0.25)
 
     def test_soak_override_rejects_non_finite_or_negative_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -51,7 +51,10 @@ POLICY_SCHEMA = "glaeda-release-policy/v1"
 TARGETS = ("aarch64-apple-darwin", "x86_64-unknown-linux-gnu")
 STATUS_PREFIX = "glaeda-ota/"
 SOAK_HOURS = 6
-RISK_SOAK_HOURS = {"low": 2, "normal": 6, "high": 12}
+# A short window catches immediate install/health regressions. Risk still controls
+# canary coverage, while legacy manifests retain the original six-hour behavior.
+RISK_SOAK_HOURS = {"low": 0.25, "normal": 0.25, "high": 0.25}
+HISTORICAL_RISK_SOAK_HOURS = {"low": 2, "normal": 6, "high": 12}
 CANARY_HOSTS = ("air-blue", "big-red")
 MAX_ASSET = 200 * 1024 * 1024
 TAG_RE = re.compile(r"r-\d{8}-[0-9a-f]{12}")
@@ -178,7 +181,8 @@ def parse_policy(value: object, *, legacy: bool = False) -> dict:
     hours = value.get("soakHours")
     hosts = value.get("requiredHosts")
     paths = value.get("paths")
-    if risk not in RISK_SOAK_HOURS or hours != RISK_SOAK_HOURS[risk] or not isinstance(hosts, list) \
+    valid_hours = {RISK_SOAK_HOURS[risk], HISTORICAL_RISK_SOAK_HOURS[risk]} if risk in RISK_SOAK_HOURS else set()
+    if risk not in RISK_SOAK_HOURS or hours not in valid_hours or not isinstance(hosts, list) \
             or not all(isinstance(host, str) and host in CANARY_HOSTS for host in hosts) \
             or risk != "low" and sorted(hosts) != sorted(CANARY_HOSTS) \
             or risk == "low" and hosts \

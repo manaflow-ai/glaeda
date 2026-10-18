@@ -59,16 +59,18 @@ but still installs through `glaeda-mini-fleet upgrade` (below).
    archive carries `ancestry.txt` (the source's ancestors: a copy an operator staged from one is
    refreshed, a newer one kept) and `hook-history.json` (the SHA-256 of every version of those two
    files, so a newer hook is never downgraded). The canary hosts run no runners, so a hook change is
-   gated by CI, the six-hour soak and these checks, not by a canary status.
+   gated by CI, the signed policy soak and these checks, not by a canary status.
 4. **Canary health.** A canary host with an authenticated `gh` posts the commit status
    `glaeda-ota/<host>` (success or failure) on the release commit.
 5. **Stable.** `.github/workflows/promote.yml` runs hourly, and each canary run also dispatches it,
    since GitHub's cron can lag for hours. It moves `stable` to the newest release for which all of
    these hold:
    - the release's signed `policy` is valid and its publication timestamp is older than that policy's
-     soak floor: low-risk documentation/test-only changes are 2 hours, normal runtime changes are
-     6 hours, and high-risk updater, installer, runner, release, auth, persistence, rollback, or
-     ambiguous changes are 12 hours. Legacy manifests retain the original 6-hour behavior;
+     soak floor: new releases use a 15-minute window. Risk still controls canary coverage: low-risk
+     documentation/test-only changes need one canary, while normal, high-risk, and ambiguous changes
+     need explicit success from both Air Blue and Big Red. Historical signed 2/6/12-hour policies
+     remain readable during the transition; manifests without a policy retain the original 6-hour
+     fallback;
    - low-risk releases have an explicit success from at least one canary; normal and high-risk
      releases have explicit success from both registered canaries, Air Blue and Big Red;
    - no required canary host's newest status is a failure, pending, or otherwise inconclusive;
@@ -86,8 +88,8 @@ but still installs through `glaeda-mini-fleet upgrade` (below).
 
    Stable hosts pick it up within the hour.
 
-End to end, a merged change reaches canary hosts in about an hour and the whole fleet in about
-eight.
+End to end, a merged change reaches canary hosts in about an hour and stable hosts after the
+15-minute healthy-canary window.
 
 ## Rings
 
@@ -95,7 +97,7 @@ eight.
 | --- | --- | --- |
 | Air Blue | canary | Leo's Mac; `gh` is authenticated, so it reports health |
 | Big Red | canary | always on; reports health when the Mac is asleep |
-| manaflow minis | stable | build hosts: take only what a canary has run for 6 hours; download from the fleet mirror |
+| manaflow minis | stable | build hosts: take only what both canaries have run for 15 minutes; download from the fleet mirror |
 
 Set a host's ring once with `glaeda-mini-setup --apply --ota-ring canary` (or `stable`). The
 first setup writes the config with `stable`, and later runs leave it alone unless `--ota-ring`
@@ -113,8 +115,8 @@ directions. Releases, attestations and promotions still happen only in this repo
 
 **Anything merged to either `main` ships to the fleet.** A merge in the fork reaches this
 repository's `main` within about 15 minutes, and every push to this `main` is released as above:
-canary hosts install it within about an hour, and the minis (stable) after the six-hour canary soak,
-about eight hours in all. There is no separate approval step after the merge. To hold a release
+canary hosts install it within about an hour, and the minis (stable) after the 15-minute canary
+window once both required host statuses are healthy. There is no separate approval step after the merge. To hold a release
 back, pause the rollout (`control.yml`, below).
 
 - **Sync of `main`.** `.github/workflows/sync-main.yml` runs only in this repository, every 15
