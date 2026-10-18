@@ -11,9 +11,18 @@ operator machine, never in this repository.
 
 ## 1. Find where the job ran and which step was slow
 
+Use the shared `glaeda-gh` watcher for the run state and exact head first; it
+uses the Lawrence controller feed when available and refuses to become a
+second polling loop:
+
 ```bash
-gh api repos/OWNER/REPO/actions/jobs/JOB_ID --jq '.runner_name, (.steps[] | "\(.started_at) \(.completed_at) \(.name)")'
+glaeda-gh status run OWNER/REPO/RUN_ID --jobs --json
+glaeda-gh wait run OWNER/REPO/RUN_ID --jobs --timeout 300 --json
 ```
+
+Use one bounded GitHub job-log read only when the cached receipt names a
+specific job whose step timing is needed. Do not turn `gh api`, browser reads,
+or repeated job-log fetches into a status loop.
 
 - `runner_name` is `<member>-glaeda[-K]`: member host plus runner slot K (directory `~/actions-runner-glaeda[-K]`).
 - Get the job log with `gh api repos/OWNER/REPO/actions/jobs/JOB_ID/logs`
@@ -25,9 +34,19 @@ The runner hook writes a `started` line at admission, a `refused` line when job-
 `completed` line (the host record) when the job ends; `event` says which, and a line without it is `completed`.
 `decision`, `wait_s`, `units`, `roots` and `gui` say what admission decided and held:
 
+For a fleet mini, obtain the host's manifest-defined route first. AWS Macs are
+reached through `cmux-lawrence` with the identity kept on the jump host; do not
+paste a direct tailnet SSH command or send a Tailscale reauthentication link.
+Use `glaeda-mini-fleet`/`glaeda-fleet-status` for the normal observation path.
+If a raw host record is required, use the exact `ProxyJump` route emitted by
+the manifest-aware helper and retain the host, route, and observation receipt:
+
 ```bash
-ssh MEMBER 'tail -n 50 ~/Library/Logs/glaeda-cmux-jobs.jsonl' | grep '"run_id":"RUN_ID"'
+glaeda-fleet-status --host MEMBER --output json
 ```
+
+The host record is authoritative only when it is bound to the same runner name
+and job/run identifier returned by the watcher.
 
 Fields (`glaeda-cmux-job/v1`): `cores.job` / `cores.other_runner_jobs` / `cores.outside` (mean cores),
 `load.mean` / `load.max`, `cpu_busy_pct` (iostat, host-wide), `disk_mb_s.mean` / `.max`,
@@ -69,11 +88,10 @@ From the job log's `Build Timing Summary` per xcodebuild pass:
 
 ## 4. What else was on the mini
 
-```bash
-ssh MEMBER 'for d in ~/actions-runner-glaeda*; do for f in $(ls -t $d/_diag/Worker_*.log | head -5); do echo "$(basename $d) $(head -1 $f | cut -c2-20) -> $(tail -1 $f | cut -c2-20) $(grep -m1 -o "\"jobDisplayName\": *\"[^\"]*\"" $f | cut -d\" -f4)"; done; done | sort -k2'
-ssh MEMBER 'ls /Users/Shared/cmux-build-fleet/capacity; cat /Users/Shared/cmux-build-fleet/reservation.json 2>/dev/null'
-ssh MEMBER 'uptime; ps -Ao pid,etime,pcpu,user,comm -r | head -15'
-```
+Use the manifest-aware fleet observer for runner, capacity, reservation, and
+host-lock state. Only after it identifies a native `Runner.Worker` job should a
+person use the Lawrence route for bounded host-process evidence; preserve the
+exact command and timestamp in the receipt.
 
 - Worker logs give each slot's job windows, so overlaps are visible after the fact.
 - `capacity/` holds the unit and token files of running jobs (`glaeda-cmux-runner-hook` CLASS_COST: a compile
@@ -87,3 +105,6 @@ ssh MEMBER 'uptime; ps -Ao pid,etime,pcpu,user,comm -r | head -15'
 - Report the host evidence you found (record, overlaps, per-file cost) with the numbers, then the cause, then
   the fix. If the evidence is gone (the sampler did not run), say so rather than guess.
 - Changing the hook, runner or status tooling: use the `glaeda-runner-change` skill.
+- The controller mini is part of the recovery contract: `claim_paused:
+  host_lock` plus missing/refused `with-host-lock` is a Lawrence-mediated repair;
+  `claim_paused: runner_job` requires native process evidence before restart.
