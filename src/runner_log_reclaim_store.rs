@@ -37,13 +37,8 @@ fn stat_device(value: i32) -> u64 {
 fn stat_device(value: u64) -> u64 {
     value
 }
-#[cfg(target_os = "macos")]
-fn stat_links(value: u16) -> u64 {
-    value as u64
-}
-#[cfg(not(target_os = "macos"))]
-fn stat_links(value: u64) -> u64 {
-    value
+fn stat_links<T: Into<u64>>(value: T) -> u64 {
+    value.into()
 }
 
 fn stat_matches_materialization(stat: &rfs::Stat, identity: FileIdentity) -> bool {
@@ -64,6 +59,7 @@ fn stat_matches_staged(stat: &rfs::Stat, identity: FileIdentity) -> bool {
     stat_matches_materialization(stat, identity)
 }
 
+#[allow(dead_code)]
 fn identity_from_stat(stat: &rfs::Stat) -> Option<FileIdentity> {
     if stat.st_size < 0 {
         return None;
@@ -381,6 +377,7 @@ fn append_row(state: &OwnedFd, row: &JournalRow) -> Result<(), StoreError> {
     rfs::fsync(state).map_err(|_| StoreError::Io("journal_parent_sync_failed"))
 }
 
+#[allow(dead_code)]
 fn transaction_id(install_id: &str, identity: FileIdentity) -> Result<String, StoreError> {
     let mut nonce = [0_u8; 16];
     let mut random =
@@ -407,6 +404,19 @@ fn now_seconds() -> Result<i64, StoreError> {
 }
 
 impl RunnerLogStore {
+    /// Opaque generation derived from the retained descriptor identities.  It is used only to
+    /// bind a fresh admission to the exact store opened under its lock.
+    pub(crate) fn store_generation(&self) -> u64 {
+        self.root_device
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            .wrapping_add(self.root_inode.rotate_left(13))
+            .wrapping_add(self.diag_device.rotate_left(29))
+            .wrapping_add(self.diag_inode.rotate_left(41))
+            .wrapping_add(self.marker_device.rotate_left(7))
+            .wrapping_add(self.marker_inode.rotate_left(17))
+    }
+
+    #[allow(dead_code)]
     fn journal_row(
         &self,
         tx_id: &str,
@@ -452,7 +462,7 @@ impl RunnerLogStore {
         Ok(())
     }
 
-    pub fn open(
+    pub(crate) fn open(
         root: &Path,
         receipt: &RunnerEnrollmentReceipt,
         state_root: &Path,
@@ -628,7 +638,7 @@ impl RunnerLogStore {
         Ok(process)
     }
 
-    pub fn recover<F>(
+    pub(crate) fn recover<F>(
         &mut self,
         policy: Policy,
         mut observe: F,
@@ -725,7 +735,8 @@ impl RunnerLogStore {
         Ok(receipt)
     }
 
-    pub fn apply_batch<F>(
+    #[allow(dead_code)]
+    pub(crate) fn apply_batch<F>(
         &mut self,
         candidates: &[LogItem],
         policy: Policy,
