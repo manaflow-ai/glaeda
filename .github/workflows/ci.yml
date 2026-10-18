@@ -305,6 +305,7 @@ jobs:
           python3 scripts/test-glaeda-devbox.py
           python3 scripts/test-glaeda-projects.py
           python3 scripts/test-glaeda-worktree.py
+          python3 scripts/test-glaeda-worktree-reclaim-all.py
           python3 scripts/test-glaeda-runner-hygiene.py
           python3 scripts/test-glaeda-procs.py
           python3 scripts/test-glaeda-local-guard.py

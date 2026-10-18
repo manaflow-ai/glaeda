@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Run glaeda-worktree-reclaim over every main Git checkout directly under the projects root
-# (default ~/Projects, override with GLAEDA_PROJECTS_ROOT) that has linked worktrees.
+# (default ~/Projects, override with GLAEDA_PROJECTS_ROOT) that has linked worktrees
+# or local task branches, including after the last linked worktree was removed.
 # Also deletes local branches whose work has landed and that no worktree has checked out
 # (--branches), since removing a worktree leaves its branch behind.
 # Extra arguments (for example --apply or --output json) pass through.
@@ -14,7 +15,22 @@ for directory in "$projects"/*/; do
   directory="${directory%/}"
   [[ -d "$directory/.git" ]] || continue
   linked=$(/usr/bin/git -C "$directory" worktree list --porcelain 2>/dev/null | grep -c '^worktree ' || true)
-  (( linked > 1 )) || continue
+  if (( linked <= 1 )); then
+    # At most two names (main/master) can be skipped here. A third ref must be a
+    # candidate. This is discovery only: the reclaimer still decides protection,
+    # checked-out state, merge evidence, idle windows and compare-and-swap deletion.
+    # Do not consume the repository budget for main/master-only checkouts.
+    branches=$(/usr/bin/git -C "$directory" for-each-ref --count=3 \
+      --format='%(refname)' refs/heads/)
+    candidate=0
+    while IFS= read -r branch; do
+      case "$branch" in
+        ''|refs/heads/main|refs/heads/master) ;;
+        *) candidate=1 ;;
+      esac
+    done <<< "$branches"
+    (( candidate )) || continue
+  fi
   repositories+=(--repository "$(cd "$directory" && pwd -P)")
   (( ${#repositories[@]} < 64 )) || break  # the command accepts at most 32 repositories
 done

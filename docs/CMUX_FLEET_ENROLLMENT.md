@@ -109,6 +109,11 @@ Preflight reports macOS, hardware against the M4 Pro 14-core 48 GB target, Xcode
 
 This command does not replace the bootstrap below: it imports its read-only helpers and runs it unchanged, so fleet-contract generations and acceptance receipts are unaffected.
 
+The hourly worktree sweep also considers repositories with local task branches after their last
+linked worktree is removed. It forwards them to `glaeda-worktree-reclaim --branches`, which retains
+checked-out, protected, recent, or unfinished branches and only deletes finished idle branches.
+Discovery alone never deletes a branch or discards dirty files. Remote branches remain untouched.
+
 ## Keep a fleet in line with its manifest
 
 `scripts/glaeda-mini-fleet` holds a whole fleet of build minis to one declarative manifest: each host's hardware class, macOS floor, the Xcode apps and selection it must carry, the SSH keys its login user must, may, and must not accept, the launchd jobs that must be running, and a free-disk floor.
