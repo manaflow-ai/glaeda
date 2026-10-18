@@ -79,6 +79,26 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(gd.EVICTION_STUCK[-1]["id"], "eviction_stuck")
         self.assertIn(str(self.root), gd.EVICTION_STUCK[-1]["path"])
 
+    def test_report_only_du_timeout_stays_out_of_eviction_findings(self) -> None:
+        class HungDu:
+            pid = 7320
+            returncode = None
+
+            def __init__(self, argv, **kwargs):
+                self.argv = argv
+
+            def communicate(self, timeout=None):
+                raise subprocess.TimeoutExpired(self.argv, timeout)
+
+        saved = list(gd.EVICTION_STUCK)
+        gd.EVICTION_STUCK.clear()
+        self.addCleanup(lambda: (gd.EVICTION_STUCK.clear(), gd.EVICTION_STUCK.extend(saved)))
+        with mock.patch.object(gd.subprocess, "Popen", HungDu), \
+                mock.patch.object(gd.os, "killpg"):
+            self.assertIsNone(gd.du_bytes(self.root, record_timeout=False))
+            self.assertIsNone(gd.du_children_with_status(self.root, record_timeout=False))
+        self.assertEqual(gd.EVICTION_STUCK, [])
+
     def test_eviction_timeout_findings_aggregate_by_path(self) -> None:
         saved = list(gd.EVICTION_STUCK)
         gd.EVICTION_STUCK.clear()
@@ -310,10 +330,10 @@ class GlaedaDiskTest(unittest.TestCase):
         calls: list[list[str]] = []
         real_du_output = gd._du_output
 
-        def counting_du_output(args):
+        def counting_du_output(args, **kwargs):
             if args and args[0] == "du":
                 calls.append(list(args))
-            return real_du_output(args)
+            return real_du_output(args, **kwargs)
 
         gd._du_output = counting_du_output
         try:
@@ -876,10 +896,11 @@ class GlaedaDiskTest(unittest.TestCase):
         self.addCleanup(lambda: (setattr(gd, "DARWIN", saved[0]), setattr(gd, "ACCOUNTING", saved[1]),
                                   gd._ACCOUNTING_MEM.clear()))
         with mock.patch.object(gd, "fixed_measurement_roots", return_value=[self.root]), \
-                mock.patch.object(gd, "du_bytes", return_value=8 * gd.GIB), \
+                mock.patch.object(gd, "du_bytes", return_value=8 * gd.GIB) as du, \
                 mock.patch.object(gd, "accounting_coverage", return_value=[]), \
                 mock.patch.object(gd, "apfs_container_capacity", return_value=None):
             got = gd.filesystem_accounting([fs], [item])
+        du.assert_called_once_with(self.root, record_timeout=False)
         self.assertEqual(got[0]["measured"], 3 * gd.GIB)
         self.assertEqual(got[0]["unmeasured"], 5 * gd.GIB)
         self.assertEqual(got[0]["top_level"][0]["path"], str(self.root))
@@ -1056,6 +1077,8 @@ class GlaedaDiskTest(unittest.TestCase):
             gd._ACCOUNTING_MEM.clear()
             again = gd.filesystem_accounting([fs], [])
         self.assertEqual(covered.call_count, 3)
+        self.assertTrue(all(call.kwargs == {"record_timeout": False}
+                            for call in covered.call_args_list))
         self.assertEqual(got[0]["coverage"], again[0]["coverage"])
         encoded = json.dumps(got)
         self.assertNotIn("leo", encoded)

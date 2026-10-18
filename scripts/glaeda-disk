@@ -1184,7 +1184,9 @@ def xcode_items(apps: Path = Path("/Applications"), pins: dict[str, str] | None 
         pin = pins.get(os.path.realpath(app))
         why = [f"Xcode {version}, owned by {owner}",
                f"pinned by {pin}" if pin else "no pin names it: remove it by hand if no workflow uses it"]
-        size = du_bytes(app)
+        # Xcode app sizing is tooling/accounting only; a slow walk must not be reported as an
+        # eviction failure because this path can never be deleted by glaeda-disk.
+        size = du_bytes(app, record_timeout=False)
         if size is None:
             size = 0
             why.append("size walk timed out; size is unsized")
@@ -1772,8 +1774,14 @@ def fixed_measurement_roots() -> list[Path]:
     return roots
 
 
-def _du_output(argv: list[str], allow_nonzero: bool = False) -> str | None:
-    """Run one du walk with a killable process group; None means the tree is unsized."""
+def _du_output(argv: list[str], allow_nonzero: bool = False,
+               record_timeout: bool = True) -> str | None:
+    """Run one du walk with a killable process group; None means the tree is unsized.
+
+    Report-only accounting and tooling probes use the same bounded walker, but a timeout there
+    is an accounting gap rather than an eviction failure.  Keep the distinction at this boundary
+    so only measurements that can participate in an eviction decision publish ``eviction_stuck``.
+    """
     try:
         proc = subprocess.Popen(
             argv,
@@ -1793,7 +1801,8 @@ def _du_output(argv: list[str], allow_nonzero: bool = False) -> str | None:
                 os.killpg(proc.pid, signal.SIGKILL)
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.communicate(timeout=DU_KILL_GRACE_S)
-            _record_eviction_stuck(argv)
+            if record_timeout:
+                _record_eviction_stuck(argv)
             return None
         except BaseException:
             with contextlib.suppress(OSError):
@@ -1819,10 +1828,10 @@ def _terminate_active_children() -> None:
             # The owning worker/main path performs communicate and removes the entry.
 
 
-def du_bytes(path: Path) -> int | None:
+def du_bytes(path: Path, *, record_timeout: bool = True) -> int | None:
     if not _measurement_path_allowed(path):
         return None
-    out = _du_output(["du", "-xsk", str(path)])
+    out = _du_output(["du", "-xsk", str(path)], record_timeout=record_timeout)
     if out is None:
         return None
     try:
@@ -1834,11 +1843,11 @@ def du_bytes(path: Path) -> int | None:
 BULK_SIZE_MIN = 64  # unsized candidates in a bulk_sizes family before one walk beats per-item du
 
 
-def du_children(root: Path) -> dict[str, int] | None:
+def du_children(root: Path, *, record_timeout: bool = True) -> dict[str, int] | None:
     """Sizes of every directory directly below root from a single walk, keyed like candidates."""
     if not _measurement_path_allowed(root):
         return None
-    out = _du_output(["du", "-xk", "-d", "1", str(root)])
+    out = _du_output(["du", "-xk", "-d", "1", str(root)], record_timeout=record_timeout)
     if out is None:
         return None
     sizes: dict[str, int] = {}
@@ -1849,7 +1858,7 @@ def du_children(root: Path) -> dict[str, int] | None:
     return sizes
 
 
-def du_children_with_status(root: Path) -> tuple[dict[str, int], bool] | None:
+def du_children_with_status(root: Path, *, record_timeout: bool = True) -> tuple[dict[str, int], bool] | None:
     """Return a bounded one-level walk plus whether every entry was readable.
 
     macOS `du` exits nonzero when an unprivileged health agent meets a protected
@@ -1858,7 +1867,8 @@ def du_children_with_status(root: Path) -> tuple[dict[str, int], bool] | None:
     """
     if not _measurement_path_allowed(root):
         return None
-    out = _du_output(["du", "-xk", "-d", "1", str(root)], allow_nonzero=True)
+    out = _du_output(["du", "-xk", "-d", "1", str(root)], allow_nonzero=True,
+                     record_timeout=record_timeout)
     if out is None:
         return None
     sizes: dict[str, int] = {}
@@ -3922,7 +3932,9 @@ def accounting_coverage(dev: int, now: float) -> list[dict[str, Any]]:
                        if Path(path).name == name)
             children, complete = ({str(root): size}, shared_complete) if size else ({}, shared_complete)
         else:
-            result = du_children_with_status(root)
+            # This is a report-only lower-bound walk.  An unreadable or slow accounting root is
+            # already surfaced through the coverage gap; it cannot block or veto an eviction.
+            result = du_children_with_status(root, record_timeout=False)
             if result is None:
                 continue
             children, complete = result
@@ -4095,7 +4107,9 @@ def filesystem_accounting(fss: list[Fs], items: list[Item]) -> list[dict[str, An
                         continue
                 except OSError:
                     continue
-                size = du_bytes(root)
+                # Top-level accounting is explanatory only.  Keep an incomplete root out of the
+                # eviction-timeout finding; the accounting gap remains visible in the summary.
+                size = du_bytes(root, record_timeout=False)
                 if size is not None:
                     top_map[str(root)] = size
             if not top_map:
