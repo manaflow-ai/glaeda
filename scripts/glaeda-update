@@ -3,7 +3,7 @@
 
     glaeda-update               plan: which release this host's ring points at, and what would change
     glaeda-update --apply       download, verify, install, health-check; roll back on failure
-    glaeda-update --status      this host's config and state
+    glaeda-update --status      this host's config, state, and installed source
 
 A LaunchAgent (macOS), headless LaunchDaemon (GUI-less macOS), or systemd user timer (Linux)
 runs `--apply` hourly; glaeda-mini-setup installs it. Configuration is ~/.config/glaeda/update.json,
@@ -60,7 +60,12 @@ What one run does, and what it refuses:
    downgraded. A runner with a job is done on a later run. Each listener gate sees its hook change and
    re-execs it, keeping its runner.
 
-It never runs two at a time (a lock under the state directory), never touches anything but what
+    Read-only stable plans also include the canary's public tag/source/publication metadata and a
+    bounded source-drift classification. A transient canary fetch failure never blocks the stable
+    plan. Status reports the installed generation's source from local state without contacting the
+    channel.
+
+    It never runs two at a time (a lock under the state directory), never touches anything but what
 setup installs (and the runner copy and hooks in steps 6 and 7), and keeps the current and previous
 release under ~/.local/state/glaeda/update.
 """
@@ -456,6 +461,51 @@ def release_source(gen: Path) -> str:
     return value
 
 
+def installed_source(state_dir: Path, tag: str | None) -> str | None:
+    """Return the installed generation's source for read-only diagnostics.
+
+    A status or plan must remain useful while an older/partial generation is being
+    repaired.  Treat a missing or malformed generation as unknown instead of
+    turning an informational drift check into an update failure.
+    """
+    if tag is None:
+        return None
+    try:
+        return release_source(generation(state_dir, tag))
+    except (OSError, UpdateError):
+        return None
+
+
+def channel_summary(entry: dict | None) -> dict | None:
+    """Keep channel drift evidence bounded to public release metadata."""
+    if entry is None:
+        return None
+    return {key: entry[key] for key in ("tag", "source", "published", "promoted") if key in entry}
+
+
+def source_drift(current: str | None, target: dict | None, candidate: dict | None) -> str:
+    """Classify source drift without claiming ancestry that was not observed.
+
+    Channel entries carry release publication times but not the target's ancestry.
+    We therefore report a difference (and its observed age ordering) rather than
+    pretending that a different commit is necessarily an ancestor/descendant.
+    """
+    if current is None:
+        return "unknown"
+    if candidate is not None and candidate.get("source") != current:
+        candidate_published = str(candidate.get("published") or "")
+        target_published = str((target or {}).get("published") or "")
+        if candidate_published and target_published:
+            if candidate_published > target_published:
+                return "candidate_newer"
+            if candidate_published < target_published:
+                return "candidate_older"
+        return "candidate_differs"
+    if target is not None and target.get("source") != current:
+        return "target_differs"
+    return "current"
+
+
 def release_order(state_dir: Path, current: str | None, target: Path) -> str:
     """Classify a target against the installed release using release ancestry.
 
@@ -580,15 +630,37 @@ def runner_steps(state_dir: Path = STATE_DIR, target: Path = RUNNER_SCRIPTS, hom
 
 
 def update(apply: bool, config: dict, state_dir: Path = STATE_DIR,
-           channel: tuple[bytes, bytes | None] | None = None, bin_dir: Path = BIN) -> dict:
+           channel: tuple[bytes, bytes | None] | None = None, bin_dir: Path = BIN,
+           candidate_channel: tuple[bytes, bytes | None] | None = None) -> dict:
     state = load_state(state_dir)
     source = config.get("source", REPOSITORY)
     control_raw, ring_raw = channel if channel is not None else fetch_channel(config["ring"], source)
     entry = resolve(control_raw, ring_raw, config["ring"])
-    out = {"ring": config["ring"], "source": source, "current": state["current"]}
+    current_source = installed_source(state_dir, state["current"])
+    out = {"ring": config["ring"], "source": source, "current": state["current"],
+           "currentSource": current_source}
     if entry is None:
         return {**out, "result": "idle", "why": "paused or nothing on this ring"}
     out["target"] = entry["tag"]
+    target_summary = channel_summary(entry)
+    if target_summary is not None:
+        out["targetSource"] = target_summary.get("source")
+        out["targetPublished"] = target_summary.get("published")
+        if "promoted" in target_summary:
+            out["targetPromoted"] = target_summary["promoted"]
+    candidate_entry = None
+    if candidate_channel is not None:
+        try:
+            candidate_entry = resolve(*candidate_channel, "canary")
+        except UpdateError as error:
+            # A candidate channel is advisory for stable hosts.  Preserve the
+            # stable plan while making an invalid candidate visible to callers.
+            out["candidateError"] = str(error)
+    candidate_summary = channel_summary(candidate_entry)
+    if candidate_summary is not None:
+        out["candidate"] = candidate_summary
+    if config["ring"] == "stable" or candidate_summary is not None:
+        out["sourceDrift"] = source_drift(current_source, target_summary, candidate_summary)
     if entry["tag"] == state["current"]:
         return {**out, "result": "current"}
     if entry["tag"] in state["quarantined"]:
@@ -659,15 +731,31 @@ def main(argv: list[str] | None = None) -> int:
     try:
         config = load_config()
         if a.status:
-            print(json.dumps({"config": config, "state": load_state()}, indent=1, sort_keys=True))
+            state = load_state()
+            print(json.dumps(
+                {"config": config, "state": state,
+                 "release": {"tag": state["current"],
+                             "source": installed_source(STATE_DIR, state["current"])}},
+                indent=1, sort_keys=True))
             return 0
         if not a.apply:  # planning reads only, so it needs no lock (health checks plan mid-update)
             channel = None
+            candidate_channel = None
             if a.channel_dir:
                 ring_file = a.channel_dir / f"{config['ring']}.json"
                 ring_raw = ring_file.read_bytes() or None
                 channel = ((a.channel_dir / "control.json").read_bytes(), ring_raw)
-            result = update(False, config, channel=channel)
+            else:
+                channel = fetch_channel(config["ring"], config.get("source", REPOSITORY))
+                if config["ring"] == "stable":
+                    # The canary is an informational comparison for a stable
+                    # host.  A transient candidate fetch failure must not hide
+                    # the stable plan itself.
+                    try:
+                        candidate_channel = fetch_channel("canary", config.get("source", REPOSITORY))
+                    except (OSError, urllib.error.URLError):
+                        candidate_channel = None
+            result = update(False, config, channel=channel, candidate_channel=candidate_channel)
         else:
             STATE_DIR.mkdir(parents=True, exist_ok=True)
             with open(STATE_DIR / "lock", "w") as lock:

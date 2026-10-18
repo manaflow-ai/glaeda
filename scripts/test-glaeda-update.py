@@ -149,6 +149,27 @@ class UpdateTest(unittest.TestCase):
         self.assertEqual(runs[-1], "1")  # setup knows glaeda-update is running it
         self.assertEqual(self.run_update()["result"], "current")
 
+    def test_stable_plan_exposes_installed_and_candidate_source_drift(self) -> None:
+        self.config["ring"] = "stable"
+        stable = self.server.publish(SOURCES[0])
+        self.assertEqual(self.run_update()["result"], "updated")
+
+        candidate = self.server.publish(SOURCES[1])
+        # The fixture publishes at one fixed time; make the observed candidate
+        # age explicit so the diagnostic can report its ordering too.
+        self.server.rings["stable"] = {**stable, "ring": "stable"}
+        self.server.rings["canary"] = {**candidate, "published": "2026-09-26T00:00:00Z"}
+        plan = gu.update(False, self.config, self.state, self.server.channel("stable"), self.bin,
+                         candidate_channel=self.server.channel("canary"))
+
+        self.assertEqual(plan["result"], "current")
+        self.assertEqual(plan["currentSource"], SOURCES[0])
+        self.assertEqual(plan["targetSource"], SOURCES[0])
+        self.assertEqual(plan["targetPublished"], stable["published"])
+        self.assertEqual(plan["candidate"], {"tag": candidate["tag"], "source": SOURCES[1],
+                                               "published": "2026-09-26T00:00:00Z"})
+        self.assertEqual(plan["sourceDrift"], "candidate_newer")
+
     def test_incompatible_setup_args_are_refused_before_install_or_rollback(self) -> None:
         self.config["setupArgs"] = ["--hygiene-only", "--headless"]
         good = self.server.publish(SOURCES[0], support_headless=True)
