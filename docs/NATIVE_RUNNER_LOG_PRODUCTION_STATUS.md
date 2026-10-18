@@ -1,7 +1,8 @@
 # Native runner-log production status
 
-This status records the primary review of PR #1507's green synthetic matrix. It
-does not authorize a merge, promotion, or live fleet deletion.
+This status records the primary review of PR #1507's green synthetic matrix.
+PR #1507 merged at `282d2925bc6bfa62dfa378bbc7a7999a56b82975`; this document
+still does not authorize a production promotion or live fleet deletion.
 
 ## Primary review verdict
 
@@ -67,6 +68,6 @@ fleet host, or reusable warm state was mutated by this matrix.
 
 ## Gate
 
-PR #1507 remains open. The synthetic matrix is accepted as evidence for the
+PR #1507 is merged. The synthetic matrix is accepted as evidence for the
 benchmark and adapter boundary only. It is not evidence that live apply is
-safe, and it does not authorize merge or promotion by itself.
+safe, and it does not authorize production promotion by itself.
