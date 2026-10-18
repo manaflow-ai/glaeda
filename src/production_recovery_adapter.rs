@@ -165,10 +165,11 @@ pub struct RecoveryReceipt {
 
 impl RecoveryReceipt {
     fn from_store(receipt: crate::runner_log_reclaim_store::RecoveryReceipt) -> Self {
-        let repaired = receipt.confirmed_deleted
-            + receipt.absent_after_delete_intent
-            + receipt.aborted_prepared
-            + receipt.aborted_staged;
+        let repaired = receipt
+            .confirmed_deleted
+            .saturating_add(receipt.absent_after_delete_intent)
+            .saturating_add(receipt.aborted_prepared)
+            .saturating_add(receipt.aborted_staged);
         Self {
             pending_before: receipt.pending + repaired,
             repaired,
