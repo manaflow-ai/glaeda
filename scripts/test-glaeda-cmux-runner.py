@@ -3032,6 +3032,29 @@ ACQUIRE_FAILED = ("[2026-09-28 13:53:13Z ERR  Runner] Caught exception from acqu
 
 
 class LeakedAppTest(unittest.TestCase):
+    def test_direct_child_scan_ignores_its_ps_probe(self) -> None:
+        result = mock.Mock(stdout="101 42 ps\n102 42 Python\n", returncode=0)
+        with mock.patch.object(hook.subprocess, "run", return_value=result):
+            self.assertEqual(hook.direct_child_pids(42), {102})
+
+    def test_orphan_hook_requires_dead_runner_and_no_children(self) -> None:
+        with mock.patch.object(hook, "pid_alive", return_value=False):
+            self.assertTrue(hook.orphan_hook_should_exit(42, "ps:start", set()))
+            self.assertFalse(hook.orphan_hook_should_exit(42, "ps:start", {99}))
+            self.assertTrue(hook.orphan_hook_should_exit(42, "ps:start", set(), parent_pid=1))
+        with mock.patch.object(hook, "pid_alive", return_value=True), \
+                mock.patch.object(hook, "process_identity", return_value=None):
+            self.assertFalse(hook.orphan_hook_should_exit(42, "ps:start", set()))
+        with mock.patch.object(hook, "pid_alive", return_value=True), \
+                mock.patch.object(hook, "process_identity", return_value="ps:new"):
+            self.assertTrue(hook.orphan_hook_should_exit(42, "ps:start", set(), parent_pid=99))
+        with mock.patch.object(hook, "pid_alive", return_value=True), \
+                mock.patch.object(hook, "process_identity", return_value="ps:new"):
+            self.assertTrue(hook.orphan_hook_should_exit(42, "ps:start", set()))
+        with mock.patch.object(hook, "pid_alive", return_value=True), \
+                mock.patch.object(hook, "process_identity", return_value="ps:start"):
+            self.assertFalse(hook.orphan_hook_should_exit(42, "ps:start", set()))
+
     def test_orphaned_test_app_is_selected_but_live_job_app_is_protected(self) -> None:
         app = "/Users/cmux/actions-runner-glaeda/_work/_temp/cmux-derived-data-tests-123-1-shard-2/Build/Products/Debug/cmux DEV.app/Contents/MacOS/cmux DEV"
         table = {

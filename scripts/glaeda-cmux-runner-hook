@@ -99,6 +99,7 @@ import signal
 import stat
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -113,6 +114,7 @@ HOLDER_FILE = "host-lock-holder"
 HOLDER_POLL_S = 2.0
 RELEASING = ".releasing"  # a released holder's pid file until it exits, so no admission mistakes it for a waiter
 HOLDER_MAX_S = 5 * 24 * 3600  # GitHub's limit for a self-hosted job; the job's own exit releases it sooner
+ORPHAN_HOOK_POLL_S = 2.0
 # Weighted capacity (--capacity-units > 0, several runners per mini). Each job's class, from GITHUB_JOB
 # (the job id in cmux's ci-macos.yml; matrix shards share it), costs units plus exclusive tokens.
 # Compile admission's persistent DerivedData (/Users/Shared/cmux-build-fleet/ci, owned_build_state.py)
@@ -1094,6 +1096,64 @@ def runner_worker_pid() -> int | None:
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return None
     return None
+
+
+def direct_child_pids(pid: int) -> set[int]:
+    """Return direct children without trusting the job's PATH or following a process tree."""
+    try:
+        out = subprocess.run(["/bin/ps", "-axo", "pid=,ppid=,comm="], stdin=subprocess.DEVNULL,
+                             capture_output=True, text=True, timeout=5, check=True).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {pid}  # fail closed: an unreadable process table is not proof of an orphan
+    children: set[int] = set()
+    for line in out.splitlines():
+        fields = line.split()
+        if (len(fields) >= 3 and fields[0].isdigit() and fields[1].isdigit()
+                and os.path.basename(fields[2]) != "ps" and int(fields[1]) == pid):
+            children.add(int(fields[0]))
+    return children
+
+
+def orphan_hook_should_exit(worker_pid: int, worker_identity: str, children: set[int], parent_pid: int | None = None) -> bool:
+    """Only reap a hook after its original Runner.Worker is gone and it has no child work."""
+    if children:
+        return False
+    # Runner.Worker execs the hook wrapper, so a crashed runner reparents the
+    # hook directly to launchd. This avoids macOS `ps lstart`'s one-second
+    # resolution and cannot confuse a same-second PID reuse for our parent.
+    if parent_pid == 1:
+        return True
+    if pid_alive(worker_pid):
+        # A live PID with an unreadable start token is unknown, not orphaned.
+        # This avoids killing a real job during a transient /bin/ps failure.
+        current = process_identity(worker_pid)
+        return current is not None and current != worker_identity
+    return True
+
+
+def start_runner_parent_watchdog(worker_pid: int | None) -> None:
+    """Stop an admitted hook stranded by a dead Runner.Worker, releasing its flocks.
+
+    Hooks are normally descendants of Runner.Worker. A runner crash can reparent a
+    still-blocked hook to launchd, leaving host.lock held forever. The watcher is
+    enabled only when that ancestry was observed, uses a start token to reject PID
+    reuse, and waits until the hook has no direct child process before terminating.
+    """
+    if worker_pid is None:
+        return
+    identity = process_identity(worker_pid)
+    if identity is None:
+        return
+
+    def watch() -> None:
+        while True:
+            time.sleep(ORPHAN_HOOK_POLL_S)
+            if orphan_hook_should_exit(worker_pid, identity, direct_child_pids(os.getpid()), os.getppid()):
+                print(f"{PREFIX}: orphaned job-started hook; Runner.Worker {worker_pid} is gone, releasing admission", flush=True)
+                os.kill(os.getpid(), signal.SIGTERM)
+                return
+
+    threading.Thread(target=watch, name="glaeda-orphan-hook-watch", daemon=True).start()
 
 
 ROOT_SHIM = "glaeda-canonical-root"
@@ -4659,6 +4719,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     # the runner LaunchAgent's environment can switch sampling off fleet-wide without a reinstall
     telemetry = not args.no_telemetry and os.environ.get("GLAEDA_RUNNER_TELEMETRY", "1") != "0"
+
+    if args.phase == "job-started":
+        # Capture the real Runner.Worker ancestry before admission. If that
+        # process dies while this hook is waiting or cleaning up, the watcher
+        # releases the host/capacity flocks instead of stranding the lender.
+        start_runner_parent_watchdog(runner_worker_pid())
 
     if args.phase in ("admit", "release"):
         if not args.job_key or not STEP_KEY.fullmatch(args.job_key):
