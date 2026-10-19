@@ -175,7 +175,12 @@ class ArchiveTest(unittest.TestCase):
 
     def test_the_launch_agent_runs_apples_python(self):
         plist = archive.plist(Path("/Users/x/.local/libexec/glaeda-seed-archive"))
-        self.assertEqual(plist["ProgramArguments"][:2], ["/usr/bin/python3", "-I"])
+        self.assertEqual(plist["ProgramArguments"][:len(archive.LAN_PARENT) + 2],
+                         [*archive.LAN_PARENT, "/usr/bin/python3", "-I"])
+        self.assertEqual(plist["ProgramArguments"][0], "/bin/sh")
+        # The archive installs itself without glaeda-mini-setup, so it keeps its own copy of the wrapper.
+        setup = load("glaeda_mini_setup_for_archive", ROOT / "scripts/glaeda-mini-setup")
+        self.assertEqual(archive.LAN_PARENT, setup.LAN_PARENT)
         self.assertEqual(plist["StartInterval"], 15)
         self.assertEqual(plist["StandardOutPath"], "/dev/null")
 

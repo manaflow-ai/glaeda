@@ -349,6 +349,26 @@ def apple_python(platform_name: str = HOST_PLATFORM) -> str | None:
     return None
 
 
+# Local Network Privacy on macOS 27 also refuses Xcode's python3 (what /usr/bin/python3 runs once
+# xcode-select points at an Xcode, signed by Apple's developer team but not a platform binary) and every
+# child it starts: from 2026-10-09 every PR mini's seed prefetch got "No route to host" from cmux-lawrence
+# and fell back to R2. A /bin/sh parent that stays alive keeps the job's process an Apple platform binary,
+# and its children, the python3 and that python's /usr/bin/ssh, then reach the LAN (launchctl submit probe
+# on cmux14, macOS 27.0.1, 2026-10-19). No `exec`: the shell must stay the job's process. `launchctl kill`
+# signals only the shell, so it forwards TERM/HUP/INT to the python3 and waits for it, then exits with its
+# status; launchd keeps tracking the job until the python3 is gone (and keeps its SIGKILL backstop).
+# A group signal (bootout) therefore reaches the python3 twice, so its TERM handlers must be idempotent.
+# As an `&` job of a non-interactive shell it starts with SIGINT and SIGQUIT ignored; INT is forwarded as TERM.
+LAN_PARENT = ["/bin/sh", "-c",
+              '"$@" & p=$!; trap "kill -TERM $p 2>/dev/null" TERM HUP INT; s=0; wait $p || s=$?; '
+              'while kill -0 $p 2>/dev/null; do wait $p; s=$?; done; exit $s', "glaeda-lan"]
+
+
+def lan_program(*argv: str) -> list[str]:
+    """ProgramArguments for an agent whose children must reach LAN peers (see LAN_PARENT)."""
+    return [*LAN_PARENT, *argv]
+
+
 _ENROLL: Any = None
 
 
@@ -769,12 +789,12 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-fleet-cas-prune.err"),
         },
         # Fetches main's newest DerivedData seed into each canonical root's local seed cache while an owned
-        # cmux runner is idle (cmuxterm-hq#658); it exits at once where no owned job has run. Apple's python3,
-        # so it may reach the trusted seeder on the LAN (apple_python).
+        # cmux runner is idle (cmuxterm-hq#658); it exits at once where no owned job has run. Apple's python3
+        # under a /bin/sh parent, so it may reach the seed source on the LAN (apple_python, LAN_PARENT).
         LABEL_PREFIX + "seed-prefetch": {
             "Label": LABEL_PREFIX + "seed-prefetch",
-            "ProgramArguments": [apple_python(ctx.platform) or python, os.fspath(ctx.bin / "glaeda-seed-prefetch"),
-                                 "--apply"],
+            "ProgramArguments": lan_program(apple_python(ctx.platform) or python,
+                                            os.fspath(ctx.bin / "glaeda-seed-prefetch"), "--apply"),
             "StartInterval": 300,
             "ProcessType": "Background",
             "LowPriorityIO": True,
@@ -833,11 +853,12 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
         },
         # The compiled-product LAN broker (scripts/glaeda-lan-fetch serve-local): CI steps descend from
         # non-Apple processes (Runner.Listener), so Local Network Privacy keeps them off the LAN; they ask this
-        # agent over a private Unix socket instead. Apple's python3 is what lets its ssh reach the peers.
+        # agent over a private Unix socket instead. Apple's python3 under a /bin/sh parent is what lets its ssh
+        # reach the peers (LAN_PARENT).
         LABEL_PREFIX + "lan-fetch": {
             "Label": LABEL_PREFIX + "lan-fetch",
-            "ProgramArguments": [apple_python(ctx.platform) or python, "-I", os.fspath(ctx.bin / "glaeda-lan-fetch"),
-                                 "serve-local"],
+            "ProgramArguments": lan_program(apple_python(ctx.platform) or python, "-I",
+                                            os.fspath(ctx.bin / "glaeda-lan-fetch"), "serve-local"),
             "RunAtLoad": True,
             "KeepAlive": True,
             "ThrottleInterval": 30,

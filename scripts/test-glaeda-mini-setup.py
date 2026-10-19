@@ -13,6 +13,7 @@ import plistlib
 import pwd
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -143,17 +144,60 @@ class MiniSetupTest(unittest.TestCase):
                 self.invoke("--apply", "--python", "/opt/x/python3")
                 seed = plistlib.loads((agents / "com.teamleaderleo.glaeda.seed-prefetch.plist").read_bytes())
                 disk = plistlib.loads((agents / "com.teamleaderleo.glaeda.disk-pressure.plist").read_bytes())
-                self.assertEqual(seed["ProgramArguments"][0], wanted)
+                self.assertEqual(seed["ProgramArguments"],
+                                 [*ms.LAN_PARENT, wanted, os.fspath(self.home / ".local/bin/glaeda-seed-prefetch"), "--apply"])
                 self.assertEqual(disk["ProgramArguments"], [os.fspath(self.home / ".local/bin/disk-pressure.sh"), "--once"])
                 self.assertEqual(disk["EnvironmentVariables"]["GLAEDA_PYTHON"], "/opt/x/python3")
         self.assertIsNone(ms.apple_python("linux"))
+
+    def test_the_lan_parent_stays_the_jobs_process_and_passes_argv_and_status(self) -> None:
+        # Local Network Privacy judges the job's own process, so the shell must outlive the python3 it starts
+        # (no exec), hand it every argument unchanged and return its exit status to launchd.
+        child = self.home / "child.py"
+        child.write_text("import os, subprocess, sys\n"
+                         "parent = subprocess.run(['ps', '-o', 'comm=', '-p', str(os.getppid())],\n"
+                         "                        capture_output=True, text=True).stdout.strip()\n"
+                         "print(repr(sys.argv[1:]), os.path.basename(parent))\n"
+                         "sys.exit(7)\n")
+        argv = ms.lan_program(sys.executable, "-I", os.fspath(child), "a b", "$HOME", "--apply")
+        self.assertEqual(argv[0], "/bin/sh")
+        run = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        self.assertEqual(run.returncode, 7, run.stderr)
+        self.assertEqual(run.stdout.rsplit(" ", 1)[-1].strip(), "sh")
+        self.assertIn("['a b', '$HOME', '--apply']", run.stdout)
+
+    def test_the_lan_parent_forwards_term_and_waits_for_the_python(self) -> None:
+        # `launchctl kill SIGTERM` reaches only the shell: the python3 must still get TERM, finish its handler,
+        # and the shell must outlive it and report its status, or launchd loses track of a live agent.
+        child = self.home / "child.py"
+        done = self.home / "handled"
+        child.write_text("import signal, sys, time\n"
+                         "def term(*_):\n"
+                         "    time.sleep(0.5)\n"
+                         f"    open({os.fspath(done)!r}, 'w').write('TERM')\n"
+                         "    sys.exit(3)\n"
+                         "signal.signal(signal.SIGTERM, term)\n"
+                         "print('ready', flush=True)\n"
+                         "time.sleep(60)\n")
+        shell = subprocess.Popen(ms.lan_program(sys.executable, "-I", os.fspath(child)), stdout=subprocess.PIPE,
+                                 text=True)
+        try:
+            self.assertEqual(shell.stdout.readline().strip(), "ready")
+            shell.send_signal(signal.SIGTERM)
+            self.assertEqual(shell.wait(timeout=30), 3)
+        finally:
+            if shell.poll() is None:
+                shell.kill()
+            shell.stdout.close()
+        self.assertEqual(done.read_text(), "TERM")
 
     def test_the_lan_fetch_broker_runs_apples_python_and_asks_for_a_root_owned_copy(self) -> None:
         with mock.patch.object(ms, "apple_python", return_value="/usr/bin/python3"):
             self.invoke("--apply")
         agent = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.lan-fetch.plist").read_bytes())
         self.assertEqual(agent["ProgramArguments"],
-                         ["/usr/bin/python3", "-I", os.fspath(self.home / ".local/bin/glaeda-lan-fetch"), "serve-local"])
+                         [*ms.LAN_PARENT, "/usr/bin/python3", "-I", os.fspath(self.home / ".local/bin/glaeda-lan-fetch"),
+                          "serve-local"])
         self.assertTrue(agent["KeepAlive"])
         self.assertEqual((self.home / ".local/bin/glaeda-lan-fetch").read_bytes(),
                          (ROOT / "scripts/glaeda-lan-fetch").read_bytes())
@@ -237,7 +281,10 @@ class MiniSetupTest(unittest.TestCase):
             if label == "disk-pressure":
                 self.assertEqual(doc["ProgramArguments"], [os.fspath(bin_dir / "disk-pressure.sh"), "--once"])
             else:
-                for arg in doc["ProgramArguments"][1:2]:
+                program = doc["ProgramArguments"]
+                if program[:len(ms.LAN_PARENT)] == ms.LAN_PARENT:
+                    program = program[len(ms.LAN_PARENT):]
+                for arg in program[1:2]:
                     self.assertTrue(arg.startswith(os.fspath(bin_dir)), arg)
             self.assertTrue(doc["StandardOutPath"].startswith(os.fspath(self.home / "Library/Logs")))
             # dedupe is never urgent; pressure must still free space while a build fills the disk

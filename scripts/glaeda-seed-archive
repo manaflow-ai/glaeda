@@ -37,8 +37,10 @@ Prune: oldest mtime first (glaeda-seed-serve touches a seed it serves) while the
 BUDGET bytes or HOST_VOLUME has less than MIN_FREE free (the disk is Lawrence's). The newest KEEP_NEWEST and
 anything touched in the last GRACE seconds stay.
 
-Local Network Privacy: the LaunchAgent's program is /usr/bin/python3 and its children are /usr/bin/ssh and
-Homebrew zstd (which only reads a pipe), so the LAN connection is allowed (glaeda-seed-prefetch's notes).
+Local Network Privacy: the LaunchAgent's program is /bin/sh (an Apple platform binary that stays the job's
+process) running /usr/bin/python3, whose children are /usr/bin/ssh and Homebrew zstd (which only reads a
+pipe), so the LAN connection is allowed. On macOS 27 a /usr/bin/python3 program alone is refused: it runs
+Xcode's python3 (glaeda-mini-setup LAN_PARENT).
 Prints one JSON line, also appended to LOG.
 """
 
@@ -358,11 +360,18 @@ def append_log(record: dict) -> None:
         pass
 
 
+# Keep in step with glaeda-mini-setup LAN_PARENT (this script installs itself without setup).
+LAN_PARENT = ["/bin/sh", "-c",
+              '"$@" & p=$!; trap "kill -TERM $p 2>/dev/null" TERM HUP INT; s=0; wait $p || s=$?; '
+              'while kill -0 $p 2>/dev/null; do wait $p; s=$?; done; exit $s', "glaeda-lan"]
+
+
 def plist(program: Path) -> dict:
     return {
         "Label": LABEL,
-        # /usr/bin/python3 as the program: Local Network Privacy lets its /usr/bin/ssh reach the LAN.
-        "ProgramArguments": ["/usr/bin/python3", "-I", os.fspath(program), "--apply"],
+        # /bin/sh as the job's process, /usr/bin/python3 under it: Local Network Privacy then lets its
+        # /usr/bin/ssh reach the LAN on macOS 27 too (glaeda-mini-setup LAN_PARENT, the same wrapper).
+        "ProgramArguments": [*LAN_PARENT, "/usr/bin/python3", "-I", os.fspath(program), "--apply"],
         "StartInterval": INTERVAL,
         "RunAtLoad": True,
         "EnvironmentVariables": {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": os.fspath(HOME)},

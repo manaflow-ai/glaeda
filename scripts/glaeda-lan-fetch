@@ -30,8 +30,9 @@ ancestor in its launchd job (2026-09-25, launchctl submit probes on cmux12s: /bi
 python3 -> /usr/bin/nc was refused; /bin/bash -> /usr/bin/python3 and /bin/bash -> /usr/bin/nc
 connected). A runner job descends from the listener gate (~/.local/bin/python3) and Runner.Listener,
 so a CI step cannot reach a peer itself. `product` therefore asks the broker over a Unix socket in a
-private directory; the broker is its own LaunchAgent whose program is /usr/bin/python3, so its ssh
-reaches the LAN. Without a broker, `product` fetches directly (that works from an SSH shell).
+private directory; the broker is its own LaunchAgent whose program is /bin/sh running /usr/bin/python3
+(on macOS 27 /usr/bin/python3 alone is refused: it runs Xcode's python3; glaeda-mini-setup LAN_PARENT),
+so its ssh reaches the LAN. Without a broker, `product` fetches directly (that works from an SSH shell).
 
 Build mesh (cmuxterm-hq#661). The broker also keeps INDEX, the fleet index: every peer's inventory-v1
 (glaeda-seed-serve --role product), which lists the kept compile-admission states per canonical root with

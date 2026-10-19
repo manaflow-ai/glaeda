@@ -959,7 +959,13 @@ takes 190 to 280 s.
   a `/usr/bin/python3` agent connected (2026-09-25, `launchctl submit` probe on cmux12s). So
   glaeda-mini-setup runs the seed-prefetch agent with `/usr/bin/python3`, and the client uses
   `/usr/bin/ssh` and `/usr/bin/tar` (plus Homebrew zstd to decompress a pipe). The tailnet address of
-  cmux15 was not reachable from the PR minis, so the config lists LAN addresses.
+  cmux15 was not reachable from the PR minis, so the config lists LAN addresses. On macOS 27 a
+  `/usr/bin/python3` job program is refused too: with `xcode-select` on an Xcode the shim runs Xcode's
+  python3, which is not a platform binary, and from 2026-10-09 every PR mini fell back to R2. A `/bin/sh`
+  parent that stays the job's process fixes it (`launchctl submit` probes on cmux14, macOS 27.0.1,
+  2026-10-19: `/usr/bin/python3` -> `/usr/bin/ssh` "No route to host"; `/bin/sh` -> `/usr/bin/python3` ->
+  `/usr/bin/ssh` answered). So the agent's program is `LAN_PARENT` in glaeda-mini-setup: `/bin/sh`, which
+  forwards TERM to the python3 and waits for it.
 
 Set up, from a checkout at `origin/main` on the operator Mac (plan first, then `--apply`):
 
@@ -978,8 +984,8 @@ launchctl kickstart -k gui/$(id -u)/com.teamleaderleo.glaeda.seed-prefetch
 tail -n 1 ~/Library/Logs/glaeda-seed-prefetch.jsonl   # results.<root>.lan: fetched true, or its reason
 ```
 
-A `lan.reason` with "No route to host" means the agent is not running `/usr/bin/python3` yet (glaeda-update
-rewrites the plist within the hour). On the seeder, `~/.local/state/glaeda/seed-serve/serve.jsonl` records
+A `lan.reason` with "No route to host" means the agent is not yet running `/usr/bin/python3` under the
+`/bin/sh` parent (glaeda-update rewrites the plist within the hour). On the seeder, `~/.local/state/glaeda/seed-serve/serve.jsonl` records
 each request. Roll back with `scripts/glaeda-seed-lan remove --seeder cmux15 [HOST...] --apply`: without a
 config a mini skips the LAN step.
 
@@ -991,8 +997,8 @@ seed from R2. That took 108-158 s idle and up to 760 s paced beside a job, one d
 
 cmux-lawrence runs no jobs and has TBs of SSD. It keeps every seed cmux15 keeps, and the PR minis read from it:
 
-- **Fill.** The `glaeda-seed-archive` LaunchAgent runs every 15 seconds with `/usr/bin/python3`, so Local
-  Network Privacy lets its `/usr/bin/ssh` through. Lawrence is a seed-lan client of cmux15. Each run asks for
+- **Fill.** The `glaeda-seed-archive` LaunchAgent runs every 15 seconds as `/bin/sh` running `/usr/bin/python3`
+  (`LAN_PARENT`), so Local Network Privacy lets its `/usr/bin/ssh` through. Lawrence is a seed-lan client of cmux15. Each run asks for
   `seed-list-v1` and streams every seed the archive lacks, newest first, so a seed is here about a minute
   after cmux15 keeps it. At every 5 minutes, PR minis that prefetched in between missed here and fell back
   to R2. Runs that fetch and prune nothing are not logged.
@@ -1048,7 +1054,8 @@ over the LAN, including sha256 on arrival, in 5.9 s (~110 MB/s).
   ancestor in its launchd job is refused (probes 2026-09-25: `/bin/bash` -> Homebrew python3 ->
   `/usr/bin/nc` got "No route to host"; `/bin/bash` -> `/usr/bin/python3` connected), and a runner job
   descends from the listener gate's `~/.local/bin/python3` and `Runner.Listener`. So `glaeda-lan-fetch
-  product` hands the request to the `lan-fetch` LaunchAgent (program `/usr/bin/python3 -I`) over a Unix
+  product` hands the request to the `lan-fetch` LaunchAgent (program `/bin/sh` running `/usr/bin/python3 -I`;
+  see Local Network Privacy under the seed LAN path for macOS 27) over a Unix
   socket in `~/.local/state/glaeda/lan-fetch/` (0700). The broker makes the ssh connections.
 - **Helper.** cmux calls `/Library/Application Support/glaeda/bin/glaeda-lan-fetch` only when the file and
   every directory above it are root-owned and not group- or other-writable, so a PR job can neither rewrite

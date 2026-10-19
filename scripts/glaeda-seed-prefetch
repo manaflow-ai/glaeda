@@ -442,7 +442,7 @@ def lan_download(run: Pipeline, config: dict, address: str, request: str, keys: 
             ssh_err.seek(0)
             detail = ssh_err.read().decode(errors="replace").strip()[-160:]
             if "No route to host" in detail:
-                detail += " (Local Network Privacy: the agent must run /usr/bin/python3)"
+                detail += " (Local Network Privacy: the agent must run /usr/bin/python3 under a /bin/sh parent; rerun glaeda-mini-setup)"
             run.unreachable = f"{address}: {'timed out' if run.timed_out else detail or 'no answer'}"
             return None
         words = header[len(SERVE_HEADER):].decode(errors="replace").split()
