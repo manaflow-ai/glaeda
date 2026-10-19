@@ -17,7 +17,11 @@ the daemon is the only process that talks to GitHub, and clients only read its c
 - Clients register interest by writing a small file in the watch directory; its mtime is the
   last-interest time. An entry nobody has read for 15 minutes is dropped, and a merged, closed or
   completed one 2 minutes after its last reader.
-- Every watched PR is read in one batched GraphQL query per cycle (60 s), including the rate limit.
+- Every watched PR is read in batched GraphQL queries each cycle (60 s), including the rate limit.
+  GitHub answers 504 to a query that runs past ~10 s, so a batch starts at 10 PRs, halves on a 504
+  or timeout and retries the halves at once, and grows back by one after 5 clean queries. A PR
+  that times out alone is read alone until it answers. `budget` shows the batch size and the
+  oldest data of an open watch.
   A check that failed gets its failed steps from one more small query, once: a completed check
   does not change.
 - Runs use REST with If-None-Match, so an unchanged run answers 304, which GitHub does not count
@@ -27,7 +31,7 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   richer for the time it has left: what remains above its reserve divided by the seconds until
   its own reset (600 left with 2 minutes to go is rich; 600 left with 50 is poor). A kind moves
   only when the other bucket is SWITCH_MARGIN richer, so it does not flap, and both buckets drain
-  about evenly. Runs over GraphQL are one aliased `resource(url:)` query per 25 runs (job lists
+  about evenly. Runs over GraphQL are one aliased `resource(url:)` query per batch of runs (job lists
   stay on REST: only REST names the runner, which tells a refusal from a failure). PRs over REST
   read the pull, its head's check runs, statuses and workflow runs, the workflow names, and the
   base branch's required checks, every one with If-None-Match; REST has no review decision, so the last one
@@ -108,7 +112,18 @@ TERMINAL_REFRESH = 600  # a terminal entry still watched is re-read this rarely 
 CACHE_KEEP = 3600  # unwatched cache files are removed after this long
 LEAN_FACTOR = 4  # below the floor, poll this many times less often
 FLOORS = {"rest": (500, 100), "graphql": (500, 100)}  # (floor, reserve) per quota
-GQL_BATCH = 25  # PRs per GraphQL query
+GQL_BATCH = 15  # most PRs (or runs, or comment watches) per GraphQL query
+# GitHub answers 504 when a query runs past ~10 s. Measured 2026-10-19 on cosmic-gray: 25 PRs per
+# query took 10-11 s (half answered 504), 10 took 4-6 s, 5 took 2-3 s; each cost 1 point. So each
+# kind's batch starts at GQL_BATCH_START, halves on a 504 or timeout, and grows by one after
+# GQL_GROW_AFTER clean queries in a row.
+GQL_BATCH_START = 10
+GQL_GROW_AFTER = 5
+GQL_SPLITS = 8  # queries a kind may add per tick by splitting timed-out batches
+GQL_BATCH_MIN = 2  # each query costs a point however small, so the batch never drops below this
+SLOW = re.compile(r"HTTP 504|[Tt]imeout|timed out")  # the query took too long: shrink and split
+FLAKY = re.compile(r"HTTP 50[23]")  # GitHub hiccuped: split and retry, but the size was not the cause
+HEAVY_AFTER = 3  # lone timeouts in a row after which a heavy entry is read only every LEAN_FACTOR cycles
 MAX_BODY = 8 * 1024 * 1024
 WAIT_POLL = 3  # clients re-read the cache this often
 TOUCH_EVERY = 30  # clients refresh their interest this often
@@ -698,6 +713,11 @@ class Daemon:
         self.sent: list[tuple[float, str]] = []  # (time, rest|rest304|graphql) for the last hour's counts
         self.paths: dict[str, str] = dict(BUCKETS)  # the bucket each kind reads over now
         self.reads: list[tuple[float, str, str]] = []  # (time, kind, bucket) per entry read, for the last hour
+        self.batch: dict[str, int] = {kind: GQL_BATCH_START for kind in CYCLES}  # entries per GraphQL query
+        self.clean: dict[str, int] = {kind: 0 for kind in CYCLES}  # clean GraphQL queries in a row
+        # key -> {"at": last lone read, "fails": lone timeouts in a row, "oks": lone answers in a row}
+        self.heavy: dict[str, dict] = {}
+        self.since: dict[str, float] = {}  # key -> when the daemon first saw it watched, for oldestData
         self.beat = float("-inf")
         self.status: dict[str, Any] = {}  # the last good tick's daemon.json
         self.failing: dict[str, Any] | None = None  # set while ticks raise: the latest error and since when
@@ -869,15 +889,9 @@ class Daemon:
         prs, runs, comments = self.due("pr", entries), self.due("run", entries), self.due("comment", entries)
         over = {kind: self.paths[kind] for kind in BALANCED}  # due() routed each kind
         gql_prs, gql_runs = (prs if over["pr"] == "graphql" else []), (runs if over["run"] == "graphql" else [])
-        for batch, fetch in ((gql_prs, self.fetch_prs), (comments, self.fetch_comments),
-                             (gql_runs, self.fetch_runs_graphql)):
-            for i in range(0, len(batch), GQL_BATCH):
-                if self.mode("graphql") == "stop":
-                    break
-                try:
-                    fetch(batch[i:i + GQL_BATCH])
-                except Exception as error:  # noqa: BLE001  one bad batch must not stop the rest
-                    self.errors.append(f"graphql: {describe(error)}")
+        for kind, batch, fetch in (("pr", gql_prs, self.fetch_prs), ("comment", comments, self.fetch_comments),
+                                   ("run", gql_runs, self.fetch_runs_graphql)):
+            self.batched(kind, batch, fetch)
         for e in (prs if over["pr"] == "rest" else []) + (runs if over["run"] == "rest" else []):
             if self.mode("rest") == "stop":
                 break
@@ -886,6 +900,7 @@ class Daemon:
             except Exception as error:  # noqa: BLE001
                 self.errors.append(f"{e['key']}: {describe(error)}")
         self.attempted = {k: t for k, t in self.attempted.items() if self.now - t < 2 * IDLE_EXPIRY}
+        oldest = self.oldest_data(entries, {e["key"] for e in prs + runs + comments})
         self.prune({e["key"] for e in entries})
         if self.budget != self.saved_budget:
             write_json(BASE / "budget.json", self.budget)
@@ -900,7 +915,8 @@ class Daemon:
                   "controller": {**self.controller_status, "runs": len(self.controller_filled)},
                   "modes": {b: self.mode(b) for b in ("rest", "graphql")}, "errors": self.errors[:10],
                   "lastHour": hour, "heartbeat": HEARTBEAT_EVERY, "paths": dict(self.paths), "reads": reads,
-                  "perMinute": {b: round(self.richness(b) * 60, 1) for b in ("rest", "graphql")}}
+                  "perMinute": {b: round(self.richness(b) * 60, 1) for b in ("rest", "graphql")},
+                  "batch": dict(self.batch), "oldestData": oldest}
         # the heartbeat lets clients tell a hung daemon (lock held, nothing written) from an idle one
         recovered, self.failing = self.failing is not None, None
         if recovered or prs or runs or comments or self.errors or self.now - self.beat >= HEARTBEAT_EVERY:
@@ -908,6 +924,81 @@ class Daemon:
             self.beat = self.now
         self.status = status
         return status
+
+    def batched(self, kind: str, entries: list[dict], fetch: Callable[[list[dict]], str | None]) -> None:
+        """Read `entries` over GraphQL in queries of self.batch[kind]. A query that times out (504)
+        halves the batch (once per tick, never below GQL_BATCH_MIN) and is retried at once as two
+        halves, so one heavy entry cannot keep the rest stale: it ends up alone, is remembered as
+        heavy and read alone from then on (every LEAN_FACTOR cycles once it keeps timing out), and
+        the batch grows back. A 502 or 503 is split and retried without shrinking. GQL_SPLITS bounds
+        the extra queries a tick spends on splitting; what is left waits for the next cycle."""
+        self.heavy = {k: h for k, h in self.heavy.items() if self.now - h["at"] < IDLE_EXPIRY}
+        size = self.batch[kind]
+        alone, rest = [], []
+        for e in entries:
+            h = self.heavy.get(e["key"])
+            if h is None:
+                rest.append(e)
+            elif h["fails"] < HEAVY_AFTER or self.now - h["at"] >= LEAN_FACTOR * CYCLES[kind]:
+                alone.append([e])
+        queue = alone + [rest[i:i + size] for i in range(0, len(rest), size)]
+        splits, shrunk = 0, False
+        while queue:
+            chunk = queue.pop(0)
+            if self.mode("graphql") == "stop":
+                return
+            try:
+                error = fetch(chunk)
+            except Exception as failure:  # noqa: BLE001  one bad batch must not stop the rest
+                self.errors.append(f"graphql: {describe(failure)}")
+                continue
+            if len(chunk) == 1 and chunk[0]["key"] in self.heavy or (len(chunk) == 1 and error and SLOW.search(error)):
+                # a lone read says nothing about the batch size; it only judges this entry
+                h = self.heavy.setdefault(chunk[0]["key"], {"at": self.now, "fails": 0, "oks": 0})
+                h["at"] = self.now
+                if error is None:
+                    h["fails"], h["oks"] = 0, h["oks"] + 1
+                    if h["oks"] >= 2:
+                        self.heavy.pop(chunk[0]["key"])  # answered twice alone: back into the batches
+                elif SLOW.search(error):
+                    h["fails"], h["oks"] = h["fails"] + 1, 0
+                continue
+            if error is None:
+                self.clean[kind] += 1
+                if self.clean[kind] >= GQL_GROW_AFTER and len(chunk) >= self.batch[kind] < GQL_BATCH:
+                    self.batch[kind] += 1
+                    self.clean[kind] = 0
+                continue
+            slow = bool(SLOW.search(error))
+            if not slow and not FLAKY.search(error) or len(chunk) < 2:
+                continue
+            self.clean[kind] = 0
+            if slow and not shrunk and self.batch[kind] > GQL_BATCH_MIN:
+                shrunk = True
+                self.batch[kind] = max(GQL_BATCH_MIN, self.batch[kind] // 2)
+                log({"event": "batch", "kind": kind, "size": self.batch[kind], "after": error})
+            if splits + 2 <= GQL_SPLITS:
+                splits += 2
+                half = (len(chunk) + 1) // 2
+                left = [e for c in queue for e in c]
+                size = self.batch[kind]
+                queue = [chunk[:half], chunk[half:]] + [left[i:i + size] for i in range(0, len(left), size)]
+
+    def oldest_data(self, entries: list[dict], fetched: set[str]) -> dict[str, float | None]:
+        """Per kind, how old the oldest data of an open (not finished) watch is. A finished one is
+        re-read only every TERMINAL_REFRESH by design, so it does not count."""
+        oldest: dict[str, float | None] = {kind: None for kind in CYCLES}
+        self.since = {e["key"]: self.since.get(e["key"], self.now) for e in entries}
+        for e in entries:
+            kind = split_key(e["key"])[0]
+            cached = read_cache(e["key"]) if e["key"] in fetched else e["cache"]
+            if cached and terminal(kind, cached.get("data")):
+                continue
+            # never read yet (a heavy PR timing out since it was registered): as old as its watch here
+            seen = (cached or {}).get("dataAt") or self.since[e["key"]]
+            age_s = max(0.0, self.now - seen)
+            oldest[kind] = max(oldest[kind] or 0.0, age_s)
+        return oldest
 
     def tick_failed(self, error: str, site: str, now: float | None = None) -> None:
         """A tick raised. The daemon is alive but refreshes nothing, so keep the heartbeat and say
@@ -949,13 +1040,19 @@ class Daemon:
             self.note_budget("graphql", rate.get("limit"), rate.get("remaining"), iso_epoch(rate.get("resetAt")))
         return doc, None
 
-    def fetch_aliased(self, entries: list[dict], kind: str) -> None:
+    def fetch_aliased(self, entries: list[dict], kind: str) -> str | None:
+        """None, or the error when the whole query failed (batched() halves on a timeout)."""
         query, variables = pr_query([e["key"] for e in entries], kind)
         self.reads += [(self.now, kind, "graphql")] * len(entries)
         doc, error = self.graphql(query, variables)
         if doc is None:
-            return self.fail(entries, error or "graphql: no response")
+            self.fail(entries, error or "graphql: no response")
+            return error or "graphql: no response"
         data = doc.get("data") or {}
+        if not data and doc.get("errors"):  # GitHub reports a timeout as 200 with data null
+            message = "graphql: " + str((doc["errors"][0] or {}).get("message"))[:200]
+            self.fail(entries, message)
+            return message
         problems: dict[str, dict] = {}
         for err in doc.get("errors") or []:
             path = err.get("path") or [""]
@@ -980,11 +1077,11 @@ class Daemon:
             self.store(e["key"], e["cache"], error=str(err.get("message") or f"no data for this {what}")[:200],
                        missing=err.get("type") == "NOT_FOUND")
 
-    def fetch_prs(self, entries: list[dict]) -> None:
-        self.fetch_aliased(entries, "pr")
+    def fetch_prs(self, entries: list[dict]) -> str | None:
+        return self.fetch_aliased(entries, "pr")
 
-    def fetch_comments(self, entries: list[dict]) -> None:
-        self.fetch_aliased(entries, "comment")
+    def fetch_comments(self, entries: list[dict]) -> str | None:
+        return self.fetch_aliased(entries, "comment")
 
     def fill_steps(self, pairs: list[tuple[dict, dict]]) -> None:
         """Name the failed steps of each failed check run. A completed check does not change, so a
@@ -1048,18 +1145,21 @@ class Daemon:
                 fields["source"] = "rest"
         self.read_jobs(e, fields, state == "fresh")
 
-    def fetch_runs_graphql(self, entries: list[dict]) -> None:
+    def fetch_runs_graphql(self, entries: list[dict]) -> str | None:
         """Runs over GraphQL, for when REST is the poorer bucket: one aliased query by run URL. A run
         GraphQL cannot resolve is an error, as REST's 404 is, not a missing entry."""
         query, variables = run_query([e["key"] for e in entries])
         self.reads += [(self.now, "run", "graphql")] * len(entries)
         doc, error = self.graphql(query, variables)
         if doc is None:
-            return self.fail(entries, error or "graphql: no response")
+            self.fail(entries, error or "graphql: no response")
+            return error or "graphql: no response"
         data = doc.get("data") or {}
         problems = {str((err.get("path") or [""])[0]): err for err in doc.get("errors") or [] if isinstance(err, dict)}
         if not data and problems:  # the whole query failed (a schema change, say): say what GitHub said
-            return self.fail(entries, "graphql: " + str(next(iter(problems.values())).get("message"))[:200])
+            message = "graphql: " + str(next(iter(problems.values())).get("message"))[:200]
+            self.fail(entries, message)
+            return message
         for i, e in enumerate(entries):
             node = data.get(f"w{i}")
             if not isinstance(node, dict) or node.get("__typename") != "WorkflowRun":
@@ -2008,6 +2108,15 @@ def cmd_budget(as_json: bool) -> int:
                 print("reads in the last hour: " + "; ".join(
                     f"{label} {(reads.get(kind) or {}).get('graphql', 0)} GraphQL / {(reads.get(kind) or {}).get('rest', 0)} REST"
                     for kind, label in (("pr", "PRs"), ("run", "runs"), ("comment", "comments"))))
+        oldest = status.get("oldestData")
+        if isinstance(oldest, dict):
+            def span(v: Any) -> str:
+                return "-" if not isinstance(v, (int, float)) else f"{int(v)}s" if v < 120 else f"{int(v // 60)}m"
+            batch = status.get("batch") or {}
+            print("oldest data of an open watch: " + ", ".join(
+                f"{label} {span(oldest.get(kind))}" for kind, label in (("pr", "PRs"), ("run", "runs"), ("comment", "comments")))
+                  + f" (GraphQL batch: {batch.get('pr', '?')} PRs, {batch.get('run', '?')} runs, "
+                    f"{batch.get('comment', '?')} comment watches per query)")
         ctl = status.get("controller")
         if isinstance(ctl, dict):
             print(controller_line(ctl))
