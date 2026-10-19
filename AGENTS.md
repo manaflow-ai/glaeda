@@ -13,7 +13,8 @@ Use **Glaeda** for the project and **`glaeda`** for the binary/crate. Use
 When creating a developer checkout, use `~/.local/bin/glaeda-worktree add --no-build <repo> <name>`;
 use `--build` only on a build host. This keeps every worktree under `~/Projects/worktrees/<repo>/`
 and avoids initializing Ghostty on no-build machines. Run `~/.local/bin/glaeda-projects tidy` for a
-report before reorganizing older checkouts.
+report before reorganizing older checkouts. In zsh, `"$var:refs/..."` applies the `:r` modifier;
+write `"${var}:refs/..."` in scripts and one-liners.
 
 | Work surface | Read next |
 | --- | --- |
@@ -108,7 +109,8 @@ changes.
 ## Finish
 
 - Complete work in the active session or leave one exact durable blocked
-  continuation. Avoid polling loops.
+  continuation. Never poll: run one background `glaeda-gh wait pr OWNER/REPO#N
+  --sha <full 40-hex>` per PR or run (`skills/github-ci-wait`).
 - Review the full diff and exact head. Record relevant checks, authority, and
   provider evidence for the surface changed.
 - Claim only evidence observed for the exact tested head and physical effect.

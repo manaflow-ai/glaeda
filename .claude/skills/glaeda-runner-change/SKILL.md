@@ -12,8 +12,10 @@ mini. Keep changes small, observable and reversible.
 
 - Read `AGENTS.md` and the contract doc for the surface: `docs/CMUX_MINI_RUNNER.md` (hook, runner, capacity,
   telemetry), `docs/FLEET_STATUS.md` (status sources and findings), `docs/CMUX_FLEET_ROLLOUT.md` (deploys).
-- Work in your own worktree from `origin/main` (`git worktree add ~/Projects/glaeda-worktrees/NAME -b BRANCH
-  origin/main`). The main checkout may be in use by fleet jobs.
+- Work in your own worktree from `origin/main` (`~/.local/bin/glaeda-worktree add --no-build <glaeda checkout> NAME origin/main`,
+  then `git switch -c BRANCH`). The main checkout may be in use by fleet jobs.
+- Never cap GUI capture concurrency with a fixed runner or unit count; gate it on measured CPU and memory
+  load (Leo, 2026-10-19). Webview captures belong on Linux (cmux's gallery advisory run), not a mini.
 
 ## Rules the tests enforce
 
@@ -30,13 +32,14 @@ mini. Keep changes small, observable and reversible.
 
 ## Test
 
+Run only the cases you changed; the Verify workflow runs the full suites in shards.
+
 ```bash
-python3 scripts/test-glaeda-cmux-runner.py          # hook, gate, runner (about 6 min)
-python3 scripts/test-glaeda-cmux-runner.py JobTelemetryTest -v
-python3 scripts/test-glaeda-fleet-status.py
-python3 scripts/test-glaeda-cmux-runner-fleet.py
-python3 scripts/test-glaeda-mini-fleet.py
-./scripts/verify fast                                # Rust, when src/ changes
+python3 scripts/test-glaeda-cmux-runner.py JobTelemetryTest -v   # one class, or -k NAME
+python3 scripts/test-glaeda-fleet-status.py -k NAME
+python3 scripts/test-glaeda-cmux-runner-fleet.py -k NAME
+python3 scripts/test-glaeda-mini-fleet.py -k NAME
+./scripts/verify focused                                         # Rust, when src/ changes
 ```
 
 The hook test harness sets `GLAEDA_RUNNER_TELEMETRY=0`; tests that need the sampler enable it explicitly.

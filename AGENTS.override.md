@@ -38,11 +38,8 @@ Use **Glaeda** / `glaeda`; keep **SmolRunner** only in truthful historical or v1
   route: current priorities, hot-state policy, exact verification, implementation rules, physical
   experiments, coordination, or merge/review policy.
 - Bootstrap read-only capability evidence with `./scripts/bootstrap --output json`.
-- Fast feedback: `./scripts/verify fast`. Before publishing code: `./scripts/verify required`.
-  Compact output is the default: it preserves the exact phase argv, emits one decision-focused line
-  per phase, and shows a bounded tail on failure. Use `--output-mode stream` only when live child
-  output is itself needed. Documentation-only changes may use the existing docs-only policy. Never
-  upgrade a failed or blocked result into a pass.
+- Locally run `./scripts/verify focused` and single `-k` selections; the Verify workflow runs the
+  full suites (AGENTS.md, "Verify"). Never upgrade a failed or blocked result into a pass.
 - Measure complete comparable agent loops. Record baseline/candidate identity, fixed work,
   semantic validation, latency, resource/storage effects, and reset/fallback. Physical experiments
   need explicit boundaries and cleanup/rebuild evidence.

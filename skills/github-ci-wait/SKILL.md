@@ -36,6 +36,8 @@ glaeda-gh budget                                 # REST and GraphQL left, the da
   PR conflicts with its base, 64 on bad arguments.
 - Run one background `wait` per PR, run or comment (Bash `run_in_background`), not one wait
   looping over several: each then notifies you on its own when it exits, and you carry on meanwhile.
+- Exit 1 is a red, not a merge verdict. Where the repo's merge bar excuses base reds (cmux
+  `feat-cmux-next`), compare the failed check with the base before holding the PR.
 - The summary names what failed and the failed step, e.g.
   `failed: CI / build (step: Run selected tests)`, so you rarely need a REST call to see why.
   Every check decides, required or not: a completed failure (`(not required)` ones too) exits 1,
