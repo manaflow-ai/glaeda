@@ -36,14 +36,16 @@ VERSION_RE = r"[0-9][0-9.]*"
 # compiles run at once: more than one needs cmux's compile admission to keep its state per runner.
 # canonicalRoots (default 1) is how many canonical roots (/private/tmp/cmux-ci, -2, ...) the mini has: that
 # many runners (instances 0 to canonicalRoots - 1) also carry the root pool label (root_label), and the rest
-# carry the side pool label (side_label) instead. guiRunners (0 or 1, default 0) makes the mini's last runner its
-# gui runner: it carries only the gui pool label (gui_label), so GitHub hands each mini at most one GUI job, the
-# one its single gui token allows, and a second GUI job waits in GitHub's queue for another mini's gui runner
-# instead of on a root runner here (cmuxterm-hq#661). It is neither a root nor a side runner.
+# carry the side pool label (side_label) instead. guiRunners (0 to runners - canonicalRoots, default 0) makes the
+# mini's last runners its gui-role runners. The last of them is the console gui runner: it carries the gui pool
+# label (gui_label), so GitHub hands each mini at most one GUI job, the one its single gui token allows, and a
+# second GUI job waits in GitHub's queue for another mini's gui runner instead of on a root runner here
+# (cmuxterm-hq#661). Every gui-role runner carries the session pool label (session_label), for jobs that need a
+# logged-in session but not the console token, and the others carry only that one. None is a root or side runner.
 # fastRunners (0 or 1, default 0) makes the mini's last runner its fast runner: it carries only the fast pool
 # label (fast_label), and cmux-next's fast-tier job runs on it with the mini's two fast tokens instead of the
-# shared capacity units, so it never queues behind the side lane. With guiRunners 1 as well, the gui runner is
-# the instance before it. Neither a root, side nor gui runner.
+# shared capacity units, so it never queues behind the side lane. With guiRunners as well, the gui-role runners
+# are the instances before it. Neither a root, side nor gui runner.
 CLASS_CAPACITY = {"xl": (8, 8), "std": (4, 4), "light": (2, 2)}
 MAX_RUNNERS = 16
 # A host's overrides.runner {trustedRef: refs/heads/main, trustedRepo: owner/name} makes its runners trusted-only:
@@ -89,10 +91,18 @@ def side_label(pool: str) -> str:
 
 
 def gui_label(pool: str) -> str:
-    """The label of a pool's gui runner (the last instance when guiRunners is 1). The GUI jobs (app-host shards,
+    """The label of a pool's console gui runner (the last gui-role instance). The GUI jobs (app-host shards,
     tests-build-and-lag, app-host-test-rerun) run on it: each needs the mini's one gui token (one console session),
     so one runner per mini carries the label, and its listener gate holds while the token or every root is taken."""
     return _role_label(pool, "gui")
+
+
+def session_label(pool: str) -> str:
+    """The label of a pool's gui-role runners (guiRunners of them, the console gui runner included). Jobs that need
+    the mini's logged-in session but not its console token (cmux-next daemon tests, generated files, action
+    exports, the pr-media tour) run on it, so on a mini with two gui runners they run beside a console job. The
+    gate of a session-only runner holds only for units (glaeda-cmux-runner-hook --session-runner)."""
+    return _role_label(pool, "session")
 
 
 def fast_label(pool: str) -> str:
@@ -216,9 +226,10 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
         return None, f"runner.classes.{klass}.compileSlots must be 1 to {max(1, units // 2)} (a compile is 2 units)"
     if not (isinstance(roots, int) and not isinstance(roots, bool) and 1 <= roots <= runners):
         return None, f"runner.classes.{klass}.canonicalRoots must be 1 to {runners} (one root runner per root)"
-    if not (isinstance(gui, int) and not isinstance(gui, bool) and 0 <= gui <= 1 and roots + gui <= runners):
-        return None, (f"runner.classes.{klass}.guiRunners must be 0 or 1, and canonicalRoots plus guiRunners at most "
-                      f"runners ({runners}): the gui runner is the last instance (one before the fast runner), never a root runner")
+    if not (isinstance(gui, int) and not isinstance(gui, bool) and 0 <= gui <= runners - roots):
+        return None, (f"runner.classes.{klass}.guiRunners must be 0 to {max(0, runners - roots)}, runners ({runners}) "
+                      f"less canonicalRoots ({roots}): the gui runners are the last instances (before the fast "
+                      "runner), never a root runner")
     if not (isinstance(fast, int) and not isinstance(fast, bool) and 0 <= fast <= 1 and roots + gui + fast <= runners):
         return None, (f"runner.classes.{klass}.fastRunners must be 0 or 1, and canonicalRoots plus guiRunners plus "
                       f"fastRunners at most runners ({runners}): the fast runner is the last instance")
@@ -234,6 +245,7 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
             "canonicalRoots": roots, "rootPools": [root_label(label) for label in dict.fromkeys(pools)],
             "sidePools": [side_label(label) for label in dict.fromkeys(pools)],
             "guiRunners": gui, "guiPools": [gui_label(label) for label in dict.fromkeys(pools)] if gui else [],
+            "sessionPools": [session_label(label) for label in dict.fromkeys(pools)] if gui else [],
             "fastRunners": fast, "fastPools": [fast_label(label) for label in dict.fromkeys(pools)] if fast else []}, None
 
 

@@ -1450,7 +1450,8 @@ def pools(manifest: dict[str, Any], observed: dict[str, Any] | None, hosts: list
             for field in ("capacityUnits", "compileSlots", "canonicalRoots", "guiRunners"):
                 value = summary.get(field)
                 if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-                    out[field] += value
+                    # guiRunners counts consoles (gui tokens): one per mini however many session runners it has
+                    out[field] += min(value, 1) if field == "guiRunners" else value
             if summary.get("iosSim") is True:
                 out["simulatorHosts"] += 1
         return out

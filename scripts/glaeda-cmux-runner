@@ -269,6 +269,7 @@ class Context:
         self.gui_runner = bool(args.gui_runner)  # the member's gui runner (or an explicitly managed guest runner)
         self.gui_token = args.gui_token
         self.fast_runner = False  # the member's fast runner (fastRunners 1: the last instance, the fast pool label)
+        self.session_runner = False  # a gui-role instance other than the console one (guiRunners above 1)
         # Instance 0 keeps the original paths; instance K adds -K (dirs, logs, name) or .K (launchd label).
         self.suffix = f"-{self.instance}" if self.instance else ""
         self.label = f"{LABEL}.{self.instance}" if self.instance else LABEL
@@ -516,6 +517,8 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         if getattr(ctx, "gui_runner", False):  # the listener gate holds it while the gui token or every root is taken
             scope += " --gui-runner"
             scope += f" --gui-token {shlex.quote(gui_token)}"
+        if getattr(ctx, "session_runner", False):  # session-only jobs: the gate holds it only for units (and a tour)
+            scope += " --session-runner"
         if getattr(ctx, "fast_runner", False):  # fast-tier takes the fast tokens; the gate holds it while they are taken
             scope += " --fast-runner"
     started = (
@@ -532,9 +535,10 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
     )
     gate = (f"{python} {hook} listen --runner-dir {shlex.quote(os.fspath(ctx.runner_dir))}"
             + ("" if ctx.capacity_units else " --no-waiters"))
-    if ctx.capacity_units and IOS_SIM_JOB_LABEL in ctx.labels:
+    if ctx.capacity_units and (IOS_SIM_JOB_LABEL in ctx.labels or getattr(ctx, "session_runner", False) is True):
         # the iOS picker sends 2-unit isolated builds (mobile-core-package, ios-simulator-build) to this label: listening with one
-        # free unit only takes one to refuse it (cmuxterm-hq#661 Workstream 7)
+        # free unit only takes one to refuse it (cmuxterm-hq#661 Workstream 7). A session runner's jobs (isolated, tour)
+        # cost 2 units as well, and one taken with a single unit free would wait and hold every runner here.
         gate += " --fit-units 2"
     listen = (
         "#!/bin/bash\n"
@@ -1806,15 +1810,19 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         if not args.capacity_units:
             ctx.capacity_units = int(member.get("capacityUnits") or 0)
-        ctx.fast_runner, ctx.gui_runner = member_roles(member, ctx.instance)
-        is_root = ctx.instance < int(member.get("canonicalRoots") or 1) and not ctx.gui_runner and not ctx.fast_runner
-        roots = (member.get("fastPools", []) if ctx.fast_runner else member.get("guiPools", []) if ctx.gui_runner
+        ctx.fast_runner, ctx.gui_runner, ctx.session_runner = member_roles(member, ctx.instance)
+        is_root = (ctx.instance < int(member.get("canonicalRoots") or 1) and not ctx.gui_runner and not ctx.fast_runner
+                   and not ctx.session_runner)
+        # the console gui runner also carries the session label, so session-only jobs have every gui-role runner
+        roots = (member.get("fastPools", []) if ctx.fast_runner
+                 else [*member.get("guiPools", []), *member.get("sessionPools", [])] if ctx.gui_runner
+                 else member.get("sessionPools", []) if ctx.session_runner
                  else member.get("rootPools", []) if is_root else member.get("sidePools", []))
         # The gui and fast runners leave out the pool and iOS simulator labels: a pool-label or iOS job must never
         # take the one runner a mini's GUI (or fast-tier) jobs wait for, and the picker's live count of the pool's
         # runners stays the root and side runners it can route to.
         own = ([label for label in member["labels"] if label not in member.get("pools", []) and label != IOS_SIM_JOB_LABEL]
-               if ctx.gui_runner or ctx.fast_runner else member["labels"])
+               if ctx.gui_runner or ctx.session_runner or ctx.fast_runner else member["labels"])
         ctx.labels = list(dict.fromkeys([*BASE_LABELS, *own, *roots]))
         ctx.labels_requested = True
         if not args.name:
@@ -1837,14 +1845,17 @@ def main(argv: list[str] | None = None) -> int:
         return install_or_uninstall(ctx, args, raw_argv)
 
 
-def member_roles(member: dict[str, Any], instance: int) -> tuple[bool, bool]:
-    """(fast runner, gui runner) for this instance of a member. The last instance is the fast runner when
-    fastRunners is 1, and the gui runner (guiRunners 1) is the last one before it: each carries only its own pool
-    label, no root or side one."""
+def member_roles(member: dict[str, Any], instance: int) -> tuple[bool, bool, bool]:
+    """(fast runner, gui runner, session runner) for this instance of a member. The last instance is the fast
+    runner when fastRunners is 1, and the guiRunners instances before it are gui-role runners: the last of them is
+    the console gui runner (the gui and session pool labels), and any others are session runners (only the session
+    pool label). None carries a root or side label."""
     runners_n = int(member.get("runners") or 1)
     fast_n, gui_n = int(member.get("fastRunners") or 0), int(member.get("guiRunners") or 0)
     fast = fast_n > 0 and instance >= runners_n - fast_n
-    return fast, gui_n > 0 and not fast and instance >= runners_n - fast_n - gui_n
+    gui_role = gui_n > 0 and not fast and instance >= runners_n - fast_n - gui_n
+    console = gui_role and instance == runners_n - fast_n - 1
+    return fast, console, gui_role and not console
 
 
 def install_or_uninstall(ctx: Context, args: argparse.Namespace, raw_argv: list[str]) -> int:
@@ -1887,8 +1898,9 @@ def install_or_uninstall(ctx: Context, args: argparse.Namespace, raw_argv: list[
             if not args.min_free_gib:
                 ctx.min_free_gib = float(kept.get("minFreeGib") or 0)
             # and its role: the fast runner's and the gui runner's hooks stay theirs
-            fast, gui = member_roles(kept, ctx.instance)
-            ctx.fast_runner, ctx.gui_runner = fast, not fast and (ctx.gui_runner or gui)
+            fast, gui, session = member_roles(kept, ctx.instance)
+            ctx.fast_runner, ctx.session_runner = fast, session
+            ctx.gui_runner = not fast and not session and (ctx.gui_runner or gui)
         # a re-run that names nothing keeps what this install registered, not the hostname default
         if not ctx.labels_requested and isinstance(registered.get("labels"), list) and registered["labels"]:
             ctx.labels = registered["labels"]

@@ -198,7 +198,7 @@ def running() -> str:
 
 # Job classes (glaeda-cmux-runner-hook) whose start or end restarts the quiet window: the compiles and the
 # simulator builds, which a catch-up would slow most. Light, product and gui test jobs no longer do.
-QUIET_CLASSES = ("compile", "compile-gui", "simulator", "isolated")
+QUIET_CLASSES = ("compile", "compile-gui", "simulator", "isolated", "tour")
 
 
 def compile_state(path: Path = JOB_LOG, now: float | None = None) -> tuple[float | None, str]:

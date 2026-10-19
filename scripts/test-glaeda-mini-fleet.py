@@ -276,6 +276,10 @@ class ClassAndPoolTests(unittest.TestCase):
         data["hosts"]["build-mini-1"]["roles"] = ["ci-runner", "ios-simulators"]
         resource = mf.pools(data, obs, ["build-mini-1"])["glaeda-std-xcode-26.3"]["resource"]
         self.assertEqual(resource["simulatorHosts"], 1)
+        # guiRunners counts consoles: a mini with a session runner beside its gui runner still has one gui token
+        data["defaults"]["runner"] = {"classes": {"std": {"runners": 4, "capacityUnits": 4, "guiRunners": 2}}}
+        resource = mf.pools(data, obs, ["build-mini-1"])["glaeda-std-xcode-26.3"]["resource"]
+        self.assertEqual(resource["guiRunners"], 1)
 
     def test_pools_need_an_exact_real_xcode_to_conform(self) -> None:
         for text in (probe_text().replace("|dir|26.3|17C529", "|symlink:/x|26.3|17C529"),

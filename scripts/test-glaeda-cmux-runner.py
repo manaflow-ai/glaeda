@@ -1197,6 +1197,9 @@ class HookTest(unittest.TestCase):
             # the gui runner's label brings only console jobs, whatever their id
             side = self.job("swift-package-tests", "g0", 8, None, "--gui-runner", env=locked)
             self.assertIn("refused: console:", side.stdout)
+            # and a session runner's only session-only ones, which need the logged-in session too
+            session = self.job("daemon-test", "s0", 8, None, "--session-runner", env=locked)
+            self.assertIn("refused: console:", session.stdout)
             off = self.job("tests-build-and-lag", "g1", 8, None, env={**locked, "GLAEDA_RUNNER_CONSOLE_GATE": "0"})
             self.assertEqual(off.returncode, 0, "the kill switch turns the check off")
             self.finish("g1")
@@ -1251,6 +1254,28 @@ class HookTest(unittest.TestCase):
             for runner in ("c0", "g0", "c1"):
                 self.finish(runner)
         self.assertFalse(list((self.dir / "capacity").glob("*.want-*")))
+        self.assertTrue(self.lock_free())
+
+    def test_capacity_runs_one_tour_per_mini(self) -> None:
+        """Two tours on one mini (a second gui runner) would build into the same tagged DerivedData: the second
+        waits for the tour token, and no root, persistent-dd or gui token is taken."""
+        self.fleet()
+        tour = {"GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/cmux-next-media.yml@refs/heads/main"}
+        two = ("--canonical-roots", "2", "--compile-slots", "2")
+        try:
+            first = self.job("tour", "t0", 8, None, *two, env=tour)
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            self.assertIn("holding 2/8 units+tour for tour (tour", first.stdout)
+            second = self.job("tour", "t1", 8, None, *two, "--gui-wait", "0", env=tour)
+            self.assertEqual(second.returncode, 1)
+            self.assertIn("refused: capacity: the tour token is taken", second.stdout)
+            self.assertEqual(self.job("macos-compile-admission", "c0", 8, None, *two).returncode, 0,
+                             "a compile beside a tour is fine")
+            self.finish("t0")
+            self.assertEqual(self.job("tour", "t2", 8, None, *two, env=tour).returncode, 0)
+        finally:
+            for runner in ("t0", "t1", "c0", "t2"):
+                self.finish(runner)
         self.assertTrue(self.lock_free())
 
     def test_take_root_refuses_bad_roots_and_non_jobs(self) -> None:
@@ -2368,9 +2393,17 @@ time.sleep(60)
         self.assertEqual(hook.job_class("build", home, home, "cmux-next-frame-pacing.yml"), ("isolated", False))
         self.assertEqual(hook.job_class("bench", home, home, "cmux-next-frame-pacing.yml"), ("gui-step", False))
         self.assertEqual(hook.job_class("bench", home, home, "other.yml"), ("compile", True))
-        # cmux-next media's tour builds its two tagged apps into their own DerivedData and captures through the
-        # app's own window snapshot: as an unknown job it held persistent-dd and a root for its whole ~17 min
-        self.assertEqual(hook.job_class("tour", home, home, "cmux-next-media.yml"), ("isolated", False))
+        # cmux-next's session-only jobs on the gui runner build SwiftPM in the workspace (owned_spm_scratch keeps
+        # .build per workspace path) and run swift test in the logged-in session: no root, kept DerivedData or token
+        for workflow, job in (("cmux-next.yml", "daemon-test"), ("cmux-next.yml", "generated-files"),
+                              ("cmux-next-pr-autofix.yml", "action-exports"),
+                              ("cmux-next-base-autofix.yml", "action-exports")):
+            self.assertEqual(hook.job_class(job, home, home, workflow), ("isolated", False), (workflow, job))
+            self.assertEqual(hook.job_class(job, home, home, "other.yml"), ("compile", True), job)
+        # cmux-next media's tour builds its tagged apps into fixed per-tag DerivedData (cmux-ci-media-pr-N-base/head,
+        # one shared by every merge tour): no root, but one tour per mini, since two would race on a tag directory
+        self.assertEqual(hook.job_class("tour", home, home, "cmux-next-media.yml"), ("tour", False))
+        self.assertEqual(hook.CLASS_COST["tour"], (2, ("tour",)))
         self.assertEqual(hook.job_class("tour", home, home, "other.yml"), ("compile", True))
         self.assertEqual(hook.job_class("release-compile", home, home, "other.yml"), ("compile", True))
         self.assertEqual(hook.job_class("build", home, home, "nightly.yml"), ("compile", True))
@@ -3589,6 +3622,10 @@ class GateTest(unittest.TestCase):
         with mock.patch.object(hook, "console_refusal", return_value=None):
             self.assertEqual(gate.claimed(), why, "the cached reading holds until the next read")
             self.assertIsNone(gate.confirmed())
+        script.write_text("exec python3 /hook job-started --capacity-units 5 --instance 3 --session-runner\n")
+        with mock.patch.object(hook, "console_refusal", return_value=why):
+            self.assertEqual(hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"),
+                                       self.state).locked(fresh=True), why, "a session runner's jobs need the session")
         script.write_text("exec python3 /hook job-started --capacity-units 5 --instance 0\n")
         with mock.patch.object(hook, "console_refusal", return_value=why) as read:
             self.assertIsNone(hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"),
@@ -3917,6 +3954,42 @@ class GateTest(unittest.TestCase):
         self.assertEqual(hook.mini_full(capacity, 5, one), "the canonical root is taken")
         os.close(held)
 
+    def test_a_session_runner_holds_only_for_units(self) -> None:
+        """A session runner (guiRunners 2: the gui-role runner beside the console one) takes only session-only jobs
+        (daemon tests, generated files, action exports, the tour): no gui token or root, so a console job holding
+        them is no reason to idle it. The console gui runner keeps its gate."""
+        session = hook.RunnerScope(5, 2, 2, False, False, session=True)
+        console = hook.RunnerScope(5, 2, 2, False, True)
+        capacity = self.units(0)
+        held = hook.lock_file(capacity / "gui.token", fcntl.LOCK_EX)
+        roots = [hook.lock_file(capacity / name, fcntl.LOCK_EX) for name in ("root-1.token", "root-2.token")]
+        self.assertIsNone(hook.mini_full(capacity, 5, session), "neither the token nor the roots hold it")
+        self.assertEqual(hook.mini_full(capacity, 5, console), "the gui token is taken")
+        (capacity / f"{hook.ADMIT_WANT}{os.getpid()}").write_text(
+            json.dumps({"since": time.time(), "wants": ["gui"], "who": "g1 app-host-unit-tests (run 3)"}) + "\n")
+        self.assertIsNone(hook.mini_full(capacity, 5, session), "a console job waiting is the console runner's business")
+        (capacity / f"{hook.ADMIT_WANT}{os.getpid()}").write_text(
+            json.dumps({"since": time.time(), "wants": ["tour"], "who": "t1 tour (run 4)"}) + "\n")
+        # a second tour waiting for the tour token idles neither: their next job is rarely a tour
+        self.assertIsNone(hook.mini_full(capacity, 5, session))
+        self.assertEqual(hook.mini_full(capacity, 5, console), "the gui token is taken", "only its own gate")
+        self.assertIsNone(hook.mini_full(capacity, 5, hook.RunnerScope(5, 2, 2)), "side runners take no tour")
+        (capacity / f"{hook.ADMIT_WANT}{os.getpid()}").unlink()
+        for fd in [held, *roots]:
+            os.close(fd)
+        self.assertEqual(hook.mini_full(self.units(5), 5, session), "all 5 capacity units on this mini are taken")
+
+    def test_runner_scope_reads_the_session_runner_flag(self) -> None:
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("exec python3 /hook job-started --capacity-units 5 --canonical-roots 2 --instance 0 "
+                          "--session-runner\n")
+        self.assertEqual(hook.runner_scope(self.runner), hook.RunnerScope(5, 1, 2, False, False, session=True),
+                         "a session runner is never a root runner, whatever its instance")
+        script.write_text("exec python3 /hook job-started --capacity-units 5 --instance 4 --session-runner "
+                          "--fast-runner\n")
+        self.assertEqual((hook.runner_scope(self.runner).session, hook.runner_scope(self.runner).fast), (False, True))
+
     def test_the_fast_runner_listens_only_while_the_fast_tokens_are_free(self) -> None:
         fast = hook.RunnerScope(5, 2, 2, False, False, fast=True)
         self.assertIsNone(hook.mini_full(self.units(5), 5, fast), "the fast runner takes no general unit")
@@ -4233,6 +4306,10 @@ class GateTest(unittest.TestCase):
         self.assertNotIn("--fit-units", self.listen_sh(sys.executable).read_text())
         script = self.listen_sh(sys.executable, ["glaeda-mini", "glaeda-side-std-xcode-26.6", "glaeda-ios-sim"])
         self.assertIn(f"listen --runner-dir {self.runner} --fit-units 2 &", script.read_text())
+        # a session runner's jobs (isolated, tour) all cost 2 units too
+        script = self.listen_sh(sys.executable, ["glaeda-mini", "glaeda-session-std-xcode-26.6"], session=True)
+        self.assertIn(f"listen --runner-dir {self.runner} --fit-units 2 &", script.read_text())
+        self.assertEqual(hook.CLASS_COST["isolated"][0], hook.CLASS_COST["tour"][0])
         self.assertEqual(max(hook.CLASS_COST[hook.JOB_CLASSES[job]][0] for job in
                              ("mobile-core-package", "ios-simulator-build", "ios-simulator", "screenshots")), 2,
                          "--fit-units 2 is the costliest class glaeda-ios-sim brings")
@@ -4420,9 +4497,10 @@ class GateTest(unittest.TestCase):
             gate.step(); gate.step()
             stop.assert_called_once_with("a fleet build holds the host lock")
 
-    def listen_sh(self, python: str, labels: list[str] | None = None) -> Path:
+    def listen_sh(self, python: str, labels: list[str] | None = None, session: bool = False) -> Path:
         ctx = mock.Mock(python=python, hook_dir=HOOK.parent, runner_dir=self.runner, org=None, repo="manaflow-ai/cmux",
-                        min_free_gib=0, member=None, capacity_units=4, labels=labels or ["glaeda-mini"])
+                        min_free_gib=0, member=None, capacity_units=4, labels=labels or ["glaeda-mini"],
+                        session_runner=session)
         script = self.tmp / "listen.sh"
         script.write_bytes(cr.hook_wrappers(ctx)["listen.sh"])
         script.chmod(0o755)
@@ -5244,12 +5322,12 @@ class RunnerTest(unittest.TestCase):
             for instance in ("0", "2", "4"):
                 self.invoke("--apply", "--manifest", os.fspath(path), "--member", "mini-std", "--instance", instance)
         labels = [argv[argv.index("--labels") + 1].split(",") for argv in self.config_argvs()]
-        self.assertEqual([[x for x in l if x.startswith(("glaeda-std", "glaeda-root", "glaeda-side", "glaeda-gui"))]
-                          for l in labels],
+        prefixes = ("glaeda-std", "glaeda-root", "glaeda-side", "glaeda-gui", "glaeda-session")
+        self.assertEqual([[x for x in l if x.startswith(prefixes)] for l in labels],
                          [["glaeda-std-xcode-26.6", "glaeda-root-std-xcode-26.6"],
                           ["glaeda-std-xcode-26.6", "glaeda-side-std-xcode-26.6"],
-                          ["glaeda-gui-std-xcode-26.6"]],
-                         "the gui runner carries neither the pool label nor a root or side one")
+                          ["glaeda-gui-std-xcode-26.6", "glaeda-session-std-xcode-26.6"]],
+                         "the gui runner carries neither the pool label nor a root or side one, and the session label")
         self.assertIn("glaeda-ios-sim", labels[0])
         self.assertNotIn("glaeda-ios-sim", labels[2], "no iOS job ever takes the gui runner")
         self.assertEqual([l.count("glaeda-macos-27") for l in labels], [1, 1, 1], "every runner, gui included, names its OS")
@@ -5258,6 +5336,30 @@ class RunnerTest(unittest.TestCase):
         self.assertIn("--canonical-roots 2 --instance 4 --gui-runner --gui-token gui\n", started)
         self.assertNotIn("--gui-runner", (self.home / "actions-runner-glaeda-2/glaeda-hooks/job-started.sh").read_text())
         self.assertEqual(hook.runner_scope(self.home / "actions-runner-glaeda-4"), hook.RunnerScope(5, 2, 2, False, True))
+
+    def test_gui_runners_two_adds_a_session_runner_beside_the_console_one(self) -> None:
+        base = {"runners": 6, "capacityUnits": 5, "compileSlots": 2, "canonicalRoots": 2}
+        labels, hooks = self.fast_labels({**base, "guiRunners": 2}, "gui2")
+        roles = lambda l: [x for x in l if x.startswith(("glaeda-std", "glaeda-root", "glaeda-side", "glaeda-gui",
+                                                          "glaeda-session"))]
+        self.assertEqual([roles(l) for l in labels],
+                         [["glaeda-std-xcode-26.6", "glaeda-root-std-xcode-26.6"]] * 2
+                         + [["glaeda-std-xcode-26.6", "glaeda-side-std-xcode-26.6"]] * 2
+                         + [["glaeda-session-std-xcode-26.6"],
+                            ["glaeda-gui-std-xcode-26.6", "glaeda-session-std-xcode-26.6"]],
+                         "only the last carries the gui label, so no console job lands where its token is held")
+        self.assertEqual(["--gui-runner" in h for h in hooks], [False] * 5 + [True])
+        self.assertEqual(["--session-runner" in h for h in hooks], [False] * 4 + [True, False])
+        self.assertFalse([l for l in labels[4] if l == "glaeda-ios-sim" or l.startswith("glaeda-runner-")])
+        scopes = [hook.runner_scope(self.fast_home / f"actions-runner-glaeda-{k}") for k in (4, 5)]
+        self.assertEqual([(s.gui, s.session, s.root) for s in scopes], [(False, True, False), (True, False, False)])
+        # a plain re-run keeps each role
+        with mock.patch.dict(os.environ, {"HOME": os.fspath(self.fast_home)}), \
+                mock.patch.object(cr, "xcode_present", return_value=True):
+            for instance in ("4", "5"):
+                self.invoke("--apply", "--instance", instance)
+        again = [hook.runner_scope(self.fast_home / f"actions-runner-glaeda-{k}") for k in (4, 5)]
+        self.assertEqual(again, scopes)
 
     def fast_labels(self, classes: dict, name: str) -> tuple[list[list[str]], list[str]]:
         """Apply every instance of mini-std under these runner classes: (labels per instance, job-started.sh texts)."""
@@ -5939,13 +6041,22 @@ class ManifestLabelsTest(unittest.TestCase):
             self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["compileSlots"], 2)
             self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["canonicalRoots"], 2)
             self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["guiPools"], [], "no gui runner by default")
+            self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["sessionPools"], [])
             manifest["defaults"]["runner"]["classes"]["std"]["guiRunners"] = 1
             self.assertEqual(cr.member_labels(manifest, "mini-std")[0]["guiPools"], ["glaeda-gui-std-xcode-26.6"])
             manifest["defaults"]["runner"]["classes"]["std"]["canonicalRoots"] = 3  # 3 runners, all roots
-            self.assertIn("guiRunners must be 0 or 1", cr.member_labels(manifest, "mini-std")[1])
+            self.assertIn("guiRunners must be 0 to 0", cr.member_labels(manifest, "mini-std")[1])
+            # a second gui runner per mini: session-only jobs need a logged-in session, not the one gui token
+            manifest["defaults"]["runner"]["classes"]["std"].update(runners=6, canonicalRoots=2, guiRunners=2)
+            two = cr.member_labels(manifest, "mini-std")[0]
+            self.assertEqual((two["guiRunners"], two["guiPools"], two["sessionPools"]),
+                             (2, ["glaeda-gui-std-xcode-26.6"], ["glaeda-session-std-xcode-26.6"]))
+            self.assertIn("guiRunners must be 0 to 4", cr.member_labels(
+                json.loads(json.dumps(manifest).replace('"guiRunners": 2', '"guiRunners": 5')), "mini-std")[1])
+            manifest["defaults"]["runner"]["classes"]["std"]["runners"] = 3
             for bad in (2, -1, True, "1"):
                 manifest["defaults"]["runner"]["classes"]["std"].update(canonicalRoots=2, guiRunners=bad)
-                self.assertIn("guiRunners must be 0 or 1", cr.member_labels(manifest, "mini-std")[1], bad)
+                self.assertIn("guiRunners must be 0 to 1", cr.member_labels(manifest, "mini-std")[1], bad)
             del manifest["defaults"]["runner"]["classes"]["std"]["guiRunners"]
             manifest["defaults"]["runner"]["classes"]["std"]["canonicalRoots"] = 4  # 3 runners
             self.assertIn("canonicalRoots must be 1 to 3", cr.member_labels(manifest, "mini-std")[1])

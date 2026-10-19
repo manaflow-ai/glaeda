@@ -254,6 +254,16 @@ What `--apply` does:
        canonical root is taken, or every unit is. Only it carries the gui pool label, so
        holding it keeps no compile off the mini, and GitHub hands the GUI job to another
        mini's gui runner instead.
+     - A session runner (`--session-runner`, `guiRunners` above 1) carries only the session
+       pool label and stops only while fewer than 2 units are free (`--fit-units 2`: each of
+       its jobs costs 2), a job here waits for units, or the console is locked. Its jobs (cmux-next daemon tests, generated files, action exports,
+       the pr-media tour) need the logged-in session but neither the gui token nor a root, so
+       a console job holding them is no reason to idle it. It never gets a console job: the
+       gui label is the console gui runner's alone. The tour (class `tour`) builds into fixed
+       per-tag DerivedData, so it also takes the mini's one `tour` token: a second tour on the
+       same mini waits for it rather than racing on a tag directory. A waiting second tour holds
+       no runner's gate. With `guiRunners` 2 it can still park on the console gui runner, which
+       carries the session label too, so the console runner is busy for that wait.
      - A fast runner (`--fast-runner`, below) looks only at the two fast tokens
        (`capacity/fast-0.token`, `fast-1.token`): it stops while either is taken or a job
        here waits for one, and listens with every shared unit taken. No other runner,
@@ -717,7 +727,8 @@ in at the producer's root. So one root job per root per mini:
   `glaeda-side-<class>-xcode-<version>` instead. cmux's light side-lane jobs run on it
   (`vars.CI_SIDE_LANE_RUNNER`, cmux#14391), so they never hold a root runner. A class whose
   `canonicalRoots` equals `runners` has no side runner, so do not point that variable at it.
-- `guiRunners` (0 or 1, default 0) makes the last instance (`runners - 1`) the mini's host gui runner. It carries
+- `guiRunners` (0 to `runners - canonicalRoots - fastRunners`, default 0) makes the last instances (`runners - 1` down) the
+  mini's gui-role runners. The last of them is the console gui runner. It carries
   the gui pool label `glaeda-gui-<class>-xcode-<version>` and neither the pool, root, side nor
   `glaeda-ios-sim` label, and its job-started hook passes `--gui-runner`. cmux's GUI jobs (app-host shards,
   tests-build-and-lag) run on it, so GitHub hands each mini at most the one GUI job its gui token allows,
@@ -726,9 +737,16 @@ in at the producer's root. So one root job per root per mini:
   refused (10 of 17 refusals in the hour to 2026-09-26 03:40Z). It is never a root runner, so
   `canonicalRoots + guiRunners` is at most `runners`. Admission is unchanged: a GUI job takes 1 unit, the
   gui token (an app-host shard in the step before its restore instead), and the producer's root in its
-  restore step.
+  restore step. Every gui-role runner also carries the session pool label `glaeda-session-<class>-xcode-<version>`,
+  and the others (session runners, `--session-runner`) carry only that one. Session-only jobs, which need a
+  logged-in session but not the console token, target the session label: with `guiRunners` 2 (std: `runners`
+  6, `capacityUnits` 5) two of them run at once, or one beside a console job, while console jobs (classes
+  `gui`, `gui-step`, `product`) still reach only the console gui runner, one at a time. Rolling it out is a
+  cmux change pointing those jobs at the session label, an hq `build-fleet/mini-fleet.json` change, and
+  `glaeda-cmux-runner-fleet --apply` per mini. `resource.guiRunners` in the route document still counts one
+  per mini (gui tokens).
 - `fastRunners` (0 or 1, default 0) makes the last instance (`runners - 1`) the mini's fast runner; with
-  `guiRunners` 1 too, the gui runner moves to `runners - 2`. It carries the fast pool label
+  `guiRunners` set too, the gui runners move down one. It carries the fast pool label
   `glaeda-fast-<class>-xcode-<version>` and neither the pool, root, side, gui nor `glaeda-ios-sim` label, and its
   job-started hook passes `--fast-runner`. cmux-next's `fast-tier` job (`cmux-next.yml`) run there is admitted as
   class `fast`: the two fast tokens and none of the shared capacity units, so it no longer queues behind the side

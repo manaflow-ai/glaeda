@@ -28,8 +28,8 @@ re-runs it elsewhere) when:
     one is ignored (parsed by glaeda_reservation.py, installed next to this hook)
   * free disk is below --min-free-gib even after one bounded glaeda-disk --pressure run evicted idle caches
     (evict; skipped with --no-disk)
-  * the job needs the console session (a gui class job, or any job on the --gui-runner) and the console
-    session is screen-locked or no user is logged in at the console (console_refusal, cmuxterm-hq#757)
+  * the job needs the console session (a gui class job, or any job on a --gui-runner or --session-runner) and the
+    console session is screen-locked or no user is logged in at the console (console_refusal, cmuxterm-hq#757)
     (a CONSOLE_SKIPPERS job is admitted as light instead: its take-gui step gives way and it skips)
   * another build holds the fleet host lock (/Users/Shared/cmux-build-fleet/host.lock, the flock that
     with-host-lock and the build worker take)
@@ -189,11 +189,20 @@ JOB_CLASSES = {"macos-compile-admission": "compile", "app-host-unit-tests": "gui
 # $RUNNER_TEMP and flings the agent pane in the console session on a 120 Hz virtual display: it takes the gui
 # token itself (glaeda-canonical-root take-gui --wait 900, the test-e2e `test` pattern) before the console
 # steps, so it is gui-step. It restores no product into a canonical root.
+# cmux-next.yml's `daemon-test` and `generated-files`, and the autofix workflows' `action-exports`
+# (cmux-next-pr-autofix.yml, cmux-next-base-autofix.yml), run on the mini's gui runner for its logged-in session,
+# not the console token: each builds the CmuxNext package with swift build --build-tests into the workspace .build
+# (daemon-test and generated-files link it to owned_spm_scratch.py's per-workspace store) and runs swift test
+# there. No canonical root, no kept DerivedData, no XCTest, so they are isolated like `swift-test`. As unknown jobs
+# they were pinned compile on root 1 (daemon tests 17.8 h a day, generated files and exports 15.9, hq#2546), so two
+# could never run on one mini however many gui runners it had.
 # cmux-next-media.yml's `tour` (cmux pr-media, on the mini's gui runner) builds the merge base and head as tagged
-# dev apps, each into its own ~/Library/Developer/Xcode/DerivedData/cmux-<tag>, and captures them through the
-# app's own window snapshot driven by the bundled CLI: no canonical root, no kept DerivedData, no XCTest. As an
-# unknown job it was pinned compile: one persistent-dd copy and root 1 for its whole run (p50 17 min, 34 a day,
-# ci-dash 2026-10-15..17), so its mini had one compile slot left. It takes no gui token today either.
+# dev apps into fixed per-tag DerivedData (~/Library/Developer/Xcode/DerivedData/cmux-ci-media-pr-<N>-{base,head},
+# and one shared by every merge tour) and captures them through the app's own window snapshot driven by the bundled
+# CLI: no canonical root, no kept DerivedData, no XCTest, no gui token. It is `tour`: an isolated job's 2 units
+# plus the mini's one tour token, because on a mini with session runners a push tour and a merge tour could
+# otherwise build into the same tag directory at once ("ghostty.h has been modified since the module file was
+# built", cmux#21686).
 WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "test"): "isolated",
                         ("cmux-tui.yml", "build"): "isolated", ("cmux-tui.yml", "cdp-browser-smoke"): "isolated",
                         ("cmux-tui.yml", "macos-relay"): "isolated",
@@ -206,7 +215,10 @@ WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "
                         ("cmux-next.yml", "fast-tier"): "isolated", ("cmux-next.yml", "swift-canary"): "isolated",
                         ("cmux-next-frame-pacing.yml", "build"): "isolated",
                         ("cmux-next-frame-pacing.yml", "bench"): "gui-step",
-                        ("cmux-next-media.yml", "tour"): "isolated"}
+                        ("cmux-next.yml", "daemon-test"): "isolated", ("cmux-next.yml", "generated-files"): "isolated",
+                        ("cmux-next-pr-autofix.yml", "action-exports"): "isolated",
+                        ("cmux-next-base-autofix.yml", "action-exports"): "isolated",
+                        ("cmux-next-media.yml", "tour"): "tour"}
 # root: the canonical root (/private/tmp/cmux-ci) that compiles build in and that app-host test consumers
 # restore a product into with rm -rf of its src, so one root job per root per mini (cmux#14338 adds a second).
 # product (cli-product-tests) runs its XCTest bundle through the same user testmanagerd as the gui jobs, so it
@@ -240,6 +252,7 @@ CLASS_COST: dict[str, tuple[int, tuple[str, ...]]] = {
     "compile": (2, ("persistent-dd", "root")), "gui": (1, ("gui", "root")), "product": (1, ("gui", "root")),
     "compile-gui": (2, ("root",)), "gui-step": (1, ("gui", "root")),
     "isolated": (2, ()), "simulator": (1, ("simulator",)), "light": (1, ()), "seed": (2, ()),
+    "tour": (2, ("tour",)),
     "fast": (0, FAST_TOKENS)}
 # Guest repositories (any repo other than --home-repo, admitted by an org-scoped runner's --allowed-owner)
 # never touch cmux's canonical roots or persistent DerivedData, so they are costed by job-id suffix alone:
@@ -2252,7 +2265,7 @@ def token_holders(capacity_dir: Path, wants: list[str], compile_slots: int, root
             names += [f"root-{k}" for k in range(1, max(1, roots) + 1)]
         elif kind == "persistent-dd":
             names += ["persistent-dd"] + [f"persistent-dd-{c}" for c in range(1, max(1, compile_slots))]
-        elif kind in ("gui", "simulator") or kind in FAST_TOKENS:
+        elif kind in ("gui", "simulator", "tour") or kind in FAST_TOKENS:
             names.append(kind)
     notes = []
     deadline = time.monotonic() + HOLDERS_BUDGET_S
@@ -2711,8 +2724,9 @@ class RunnerScope(NamedTuple):
     """What this runner's job-started hook admits with: its --capacity-units, --compile-slots and
     --canonical-roots, whether it is a root runner (instance below canonical roots, glaeda-cmux-runner),
     whether it is the mini's gui runner (--gui-runner, the gui pool label; never a root runner), its
-    --min-free-gib disk floor (0: none), its gui token, and whether it is the mini's fast runner (--fast-runner,
-    the fast pool label; never a root or gui runner)."""
+    --min-free-gib disk floor (0: none), its gui token, whether it is the mini's fast runner (--fast-runner,
+    the fast pool label; never a root or gui runner), and whether it is one of the mini's session runners
+    (--session-runner, only the session pool label; never a root, gui or fast runner)."""
     units: int = 0
     compile_slots: int = 1
     roots: int = 1
@@ -2721,6 +2735,7 @@ class RunnerScope(NamedTuple):
     min_free_gib: float = 0.0
     gui_token: str = "gui"
     fast: bool = False
+    session: bool = False
 
 
 def listen_fit_units(runner_dir: Path) -> int:
@@ -2750,11 +2765,13 @@ def runner_scope(runner_dir: Path) -> RunnerScope:
     instance = flag("instance", int(suffix.group(1)) if suffix else 0)
     roots = max(1, flag("canonical-roots", 1))
     fast = re.search(r"\s--fast-runner(?:\s|$)", text) is not None
-    gui = re.search(r"\s--gui-runner(?:\s|$)", text) is not None and not fast
+    session = re.search(r"\s--session-runner(?:\s|$)", text) is not None and not fast
+    gui = re.search(r"\s--gui-runner(?:\s|$)", text) is not None and not fast and not session
     gui_match = re.search(r"\s--gui-token\s+([A-Za-z0-9._-]+)(?:\s|$)", text)
     gui_token = gui_match.group(1) if gui_match else "gui"
     return RunnerScope(flag("capacity-units", 0), max(1, flag("compile-slots", 1)), roots,
-                       instance < roots and not gui and not fast, gui, min_free_gib(text), gui_token, fast)
+                       instance < roots and not gui and not fast and not session, gui, min_free_gib(text), gui_token,
+                       fast, session)
 
 
 def min_free_gib(text: str) -> float:
@@ -2805,10 +2822,17 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
     wait there holding the gui token. Held off, GitHub hands the job to another mini's gui runner. Only this
     runner carries the label, so holding it never keeps a compile off the mini.
 
+    With the scope of a session runner (scope.session, guiRunners above 1: the gui runners other than the console
+    one carry only the session pool label), full means only that units are taken or a job here waits for units
+    (Gate.locked also holds it while the console is locked). Its jobs (cmux-next daemon tests, generated files,
+    action exports, the tour) need a logged-in session but neither the gui token nor a canonical root, so a console
+    job's token is no reason to hold it, and no console job reaches it: the gui label it lacks is the console
+    runner's alone. It listens only with 2 units free (--fit-units 2): every job it takes costs 2.
+
     Full also means a job admitted to this mini is waiting (CAPACITY_WAIT, its admit.want marker) for units or
     for a token this runner's next job would take (a root runner: a canonical root or persistent-dd; a gui
-    runner: the gui token or a root). That job goes first, so a job this runner took now would only queue
-    behind it here, while GitHub could hand it to a mini with room.
+    runner: the gui token or a root). A second tour waiting for the tour token holds no runner. That job goes first, so a
+    job this runner took now would only queue behind it here, while GitHub could hand it to a mini with room.
 
     With the scope of a fast runner (scope.fast, the fast pool label: cmux-next's fast-tier), full means only that a
     fast token is taken or a job here waits for one: its job takes the fast tokens and none of the shared units,
@@ -2855,12 +2879,15 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
             return (f"only {free} of {total} capacity units on this mini are free; "
                     f"{'a compile' if root else 'its next job'} needs {need}")
         # a job already here waits for what this runner's next job would take (CAPACITY_WAIT): it goes first
+        # A tour waiting for the tour token holds no runner: their next job is rarely a second tour.
         compete = {"units"} | ({"root", "persistent-dd"} if root else set()) | (
             {scope.gui_token, "root"} if scope is not None and scope.gui else set())
         for waiter in admission_waiters(capacity_dir):
             shared = compete & set(waiter["wants"])
             if shared:
                 return f"{waiter['who'] or 'a job'} waits here for {', '.join(sorted(shared))}"
+        if scope is not None and scope.session:
+            return None
         if scope is not None and scope.gui:
             if not probe(capacity_dir / f"{scope.gui_token}.token"):
                 return "the gui token is taken"
@@ -3405,10 +3432,11 @@ class Gate:
         gate_log(evicted(path, floor, ran, before))
 
     def locked(self, fresh: bool = False) -> str | None:
-        """For the gui runner only: why its console session cannot run a GUI job (console_refusal), read at most
-        every GATE_CONSOLE_EVERY_S. Every job its label brings needs the console, so it waits here instead of
-        being refused; a root runner's compiles do not, so it keeps listening."""
-        if not CONSOLE_GATE or not runner_scope(self.runner_dir).gui:
+        """For the gui and session runners only: why their console session cannot run a GUI job (console_refusal),
+        read at most every GATE_CONSOLE_EVERY_S. Every job their labels bring needs the logged-in session, so they
+        wait here instead of being refused; a root runner's compiles do not, so it keeps listening."""
+        scope = runner_scope(self.runner_dir)
+        if not CONSOLE_GATE or not (scope.gui or scope.session):
             return None
         if fresh or time.monotonic() - self.console_at >= GATE_CONSOLE_EVERY_S:
             self.console_why, self.console_at = console_refusal(), time.monotonic()
@@ -4713,6 +4741,10 @@ def main(argv: list[str] | None = None) -> int:
                         "gui token, every canonical root or every unit is taken")
     p.add_argument("--gui-token", default="gui",
                    help="capacity ledger token for this runner's desktop session (default: gui)")
+    p.add_argument("--session-runner", action="store_true",
+                   help="this is one of the mini's session runners (only the session pool label, guiRunners above "
+                        "1): its jobs need the logged-in session but no gui token or root, so the listener gate "
+                        "holds it only while units are short, a job here waits for units, or the console is locked")
     p.add_argument("--fast-runner", action="store_true",
                    help="this is the mini's fast runner (the fast pool label): a FAST_JOBS job here takes the fast "
                         "tokens instead of shared units, and the listener gate holds it while a fast token is taken")
@@ -4827,8 +4859,8 @@ def main(argv: list[str] | None = None) -> int:
             return refused(why, disk=True)
         # before any capacity is taken: a job that needs the console session fails on a locked one
         admit_class = None
-        if args.gui_runner or job_class(os.environ.get("GITHUB_JOB", ""), repo, args.home_repo,
-                                        job_workflow())[0] in CONSOLE_CLASSES:
+        if args.gui_runner or args.session_runner or job_class(
+                os.environ.get("GITHUB_JOB", ""), repo, args.home_repo, job_workflow())[0] in CONSOLE_CLASSES:
             why = console_refusal()
             if why and (job_workflow(), os.environ.get("GITHUB_JOB", "")) in CONSOLE_SKIPPERS:
                 print(f"{PREFIX}: {why}; admitted as light, its take-gui step skips the console steps", flush=True)
