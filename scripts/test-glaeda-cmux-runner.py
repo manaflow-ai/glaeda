@@ -2368,6 +2368,10 @@ time.sleep(60)
         self.assertEqual(hook.job_class("build", home, home, "cmux-next-frame-pacing.yml"), ("isolated", False))
         self.assertEqual(hook.job_class("bench", home, home, "cmux-next-frame-pacing.yml"), ("gui-step", False))
         self.assertEqual(hook.job_class("bench", home, home, "other.yml"), ("compile", True))
+        # cmux-next media's tour builds its two tagged apps into their own DerivedData and captures through the
+        # app's own window snapshot: as an unknown job it held persistent-dd and a root for its whole ~17 min
+        self.assertEqual(hook.job_class("tour", home, home, "cmux-next-media.yml"), ("isolated", False))
+        self.assertEqual(hook.job_class("tour", home, home, "other.yml"), ("compile", True))
         self.assertEqual(hook.job_class("release-compile", home, home, "other.yml"), ("compile", True))
         self.assertEqual(hook.job_class("build", home, home, "nightly.yml"), ("compile", True))
         self.assertEqual(hook.job_class("rerun", home, home, "other.yml"), ("compile", True))

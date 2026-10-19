@@ -189,6 +189,11 @@ JOB_CLASSES = {"macos-compile-admission": "compile", "app-host-unit-tests": "gui
 # $RUNNER_TEMP and flings the agent pane in the console session on a 120 Hz virtual display: it takes the gui
 # token itself (glaeda-canonical-root take-gui --wait 900, the test-e2e `test` pattern) before the console
 # steps, so it is gui-step. It restores no product into a canonical root.
+# cmux-next-media.yml's `tour` (cmux pr-media, on the mini's gui runner) builds the merge base and head as tagged
+# dev apps, each into its own ~/Library/Developer/Xcode/DerivedData/cmux-<tag>, and captures them through the
+# app's own window snapshot driven by the bundled CLI: no canonical root, no kept DerivedData, no XCTest. As an
+# unknown job it was pinned compile: one persistent-dd copy and root 1 for its whole run (p50 17 min, 34 a day,
+# ci-dash 2026-10-15..17), so its mini had one compile slot left. It takes no gui token today either.
 WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "test"): "isolated",
                         ("cmux-tui.yml", "build"): "isolated", ("cmux-tui.yml", "cdp-browser-smoke"): "isolated",
                         ("cmux-tui.yml", "macos-relay"): "isolated",
@@ -200,7 +205,8 @@ WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "
                         ("cmux-next.yml", "cmux-scheme-compile"): "isolated",
                         ("cmux-next.yml", "fast-tier"): "isolated", ("cmux-next.yml", "swift-canary"): "isolated",
                         ("cmux-next-frame-pacing.yml", "build"): "isolated",
-                        ("cmux-next-frame-pacing.yml", "bench"): "gui-step"}
+                        ("cmux-next-frame-pacing.yml", "bench"): "gui-step",
+                        ("cmux-next-media.yml", "tour"): "isolated"}
 # root: the canonical root (/private/tmp/cmux-ci) that compiles build in and that app-host test consumers
 # restore a product into with rm -rf of its src, so one root job per root per mini (cmux#14338 adds a second).
 # product (cli-product-tests) runs its XCTest bundle through the same user testmanagerd as the gui jobs, so it
