@@ -19,6 +19,7 @@ import socket
 import unittest
 from unittest import mock
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 loader = importlib.machinery.SourceFileLoader("glaeda_gh", os.fspath(ROOT / "scripts" / "glaeda-gh"))
@@ -88,6 +89,10 @@ class FakeGitHub:
         self.step_queries: list[list[str]] = []
         self.rest_remaining = 4000
         self.graphql_remaining = 4000
+        self.rules: list[dict] = []  # GET .../rules/branches/B
+        self.protected: list[str] = []  # the classic protection's required contexts
+        self.job_steps: dict[int, list] = {}  # job (check run) database id -> steps, for GET .../actions/jobs/ID
+        self.base_gone = False  # the base branch was deleted: its rules and protection answer 404
 
     def rate(self, resource: str, remaining: int) -> dict:
         return {"x-ratelimit-limit": "5000", "x-ratelimit-remaining": str(remaining),
@@ -105,6 +110,19 @@ class FakeGitHub:
                 self.step_queries.append(list(v["ids"]))
                 data["nodes"] = [{"id": i, "steps": {"nodes": self.steps[i]}} if i in self.steps else None
                                  for i in v["ids"]]
+            i = 0
+            while f"u{i}" in v:  # runs by URL
+                run = self.runs.get(int(v[f"u{i}"].rsplit("/", 1)[1]))
+                data[f"w{i}"] = None if run is None else {
+                    "__typename": "WorkflowRun", "databaseId": run["id"], "runAttempt": run.get("run_attempt"),
+                    "event": run.get("event"), "createdAt": run.get("created_at"), "updatedAt": run.get("updated_at"),
+                    "url": run.get("html_url"), "displayTitle": run.get("display_title"),
+                    "workflow": {"name": run.get("name")},
+                    "checkSuite": {"status": (run.get("status") or "").upper() or None,
+                                   "conclusion": (run.get("conclusion") or "").upper() or None,
+                                   "commit": {"oid": run.get("head_sha")},
+                                   "branch": {"name": run["head_branch"]} if run.get("head_branch") else None}}
+                i += 1
             comments = "issueOrPullRequest" in doc["query"]
             alias, field, table = ("c", "issueOrPullRequest", self.issues) if comments else ("p", "pullRequest", self.prs)
             i = 0
@@ -118,13 +136,72 @@ class FakeGitHub:
             return 200, self.rate("graphql", self.graphql_remaining), json.dumps(out).encode()
         path = url.split("api.github.com", 1)[1]
         parts = path.split("?")[0].split("/")
-        run_id = int(parts[6])
-        payload = {"jobs": self.jobs.get(run_id, [])} if parts[-1] == "jobs" else self.runs[run_id]
+        if parts[4] == "actions" and parts[5] == "jobs":
+            steps = self.job_steps.get(int(parts[6]))
+            payload = None if steps is None else {"id": int(parts[6]), "steps": steps}
+            if payload is None:
+                self.rest_remaining -= 1
+                return 404, self.rate("core", self.rest_remaining), b'{"message": "Not Found"}'
+        elif parts[4] == "actions" and len(parts) > 6:
+            run_id = int(parts[6])
+            payload = {"jobs": self.jobs.get(run_id, [])} if parts[-1] == "jobs" else self.runs[run_id]
+        else:
+            payload = self.rest_pr(parts, path)
+            if payload is None:
+                self.rest_remaining -= 1
+                return 404, self.rate("core", self.rest_remaining), b'{"message": "Not Found"}'
         etag = '"' + str(abs(hash(json.dumps(payload, sort_keys=True)))) + '"'
         if headers.get("If-None-Match") == etag:
             return 304, self.rate("core", self.rest_remaining), b""
         self.rest_remaining -= 1
         return 200, {**self.rate("core", self.rest_remaining), "etag": etag}, json.dumps(payload).encode()
+
+    def rest_pr(self, parts: list[str], path: str) -> Any:
+        """The REST view of the GraphQL PR nodes in self.prs: pulls, check runs, statuses, a head's
+        workflow runs, and the base branch's rules and protection."""
+        owner, repo, what = parts[2], parts[3], parts[4]
+        if what == "pulls":
+            node = self.prs.get((owner, repo, int(parts[5])))
+            if node is None:
+                return None
+            state = "open" if node["state"] == "OPEN" else "closed"
+            return {"number": node["number"], "html_url": node["url"], "title": node["title"], "state": state,
+                    "draft": node["isDraft"], "merged": node["merged"], "merged_at": node["mergedAt"],
+                    "mergeable": {"MERGEABLE": True, "CONFLICTING": False}.get(node["mergeable"]),
+                    "mergeable_state": node["mergeStateStatus"].lower(), "updated_at": node["updatedAt"],
+                    "head": {"sha": node["headRefOid"], "ref": node.get("headRefName")}, "base": {"ref": "main"}}
+        if what in {"rules", "branches"} and self.base_gone:
+            return None
+        if what == "rules":
+            return self.rules
+        if what == "actions" and parts[5] == "workflows":
+            return {"workflows": [{"id": 77, "name": "CI"}, {"id": 78, "name": "Lint"}]}
+        if what == "branches":
+            return {"name": parts[5], "protection": {"required_status_checks": {"contexts": self.protected}}}
+        sha = parts[5] if what == "commits" else path.split("head_sha=", 1)[1].split("&")[0]
+        contexts = []
+        for node in self.prs.values():
+            if node["headRefOid"] == sha:
+                contexts = ((node["commits"]["nodes"][0]["commit"]["statusCheckRollup"] or {}).get("contexts") or {}).get("nodes") or []
+        runs = {c["checkSuite"]["workflowRun"]["databaseId"]: c for c in contexts
+                if ((c.get("checkSuite") or {}).get("workflowRun") or {}).get("databaseId")}
+        if what == "actions":
+            return {"workflow_runs": [{"id": rid, "name": "run-name " + str(rid),  # REST: the run-name
+                                       "workflow_id": {"CI": 77, "Lint": 78}.get(c["checkSuite"]["workflowRun"]["workflow"]["name"]),
+                                       "check_suite_id": rid, "conclusion": (c["checkSuite"].get("conclusion") or "").lower() or None}
+                                      for rid, c in runs.items()]}
+        if parts[-1] == "status":
+            return {"statuses": [{"context": c["context"], "state": c["state"].lower(), "target_url": c.get("targetUrl"),
+                                  "created_at": c.get("createdAt")} for c in contexts if c["__typename"] == "StatusContext"]}
+        checks = [c for c in contexts if c["__typename"] == "CheckRun"]
+        page = int(path.split("page=")[-1]) if "&page=" in path else 1
+        checks_page = checks[100 * (page - 1):100 * page]
+        return {"total_count": len(checks), "check_runs": [
+            {"id": c.get("databaseId"), "node_id": c.get("id"), "name": c["name"], "status": c["status"].lower(),
+             "conclusion": (c.get("conclusion") or "").lower() or None, "details_url": c.get("detailsUrl"),
+             "started_at": c.get("startedAt"), "completed_at": c.get("completedAt"),
+             "check_suite": {"id": ((c.get("checkSuite") or {}).get("workflowRun") or {}).get("databaseId")}}
+            for c in checks_page]}
 
     def rest_calls(self) -> list:
         return [c for c in self.calls if not c[1].endswith("/graphql")]
@@ -693,6 +770,8 @@ class DaemonTest(Base):
         key = "run:o/r/9"
         gg.register(key, jobs=True)
         self.gh.rest_remaining = gg.FLOORS["rest"][0]  # the run fetch leaves it just under the floor
+        # GraphQL is stopped too, so the runs stay on REST: this is the guard when both buckets are poor
+        self.daemon.budget["graphql"] = {"limit": 5000, "remaining": 50, "reset": NOW + 3000}
         self.daemon.tick(NOW)  # first fill still happens, but without the job list
         self.assertEqual(len(self.gh.rest_calls()), 1)
         self.assertEqual(self.daemon.mode("rest"), "lean")
@@ -714,9 +793,12 @@ class DaemonTest(Base):
 
     def test_graphql_reserve_and_rate_limit_backoff(self) -> None:
         self.daemon.budget["graphql"] = {"limit": 5000, "remaining": 10, "reset": NOW + 600}
+        self.daemon.budget["rest"] = {"limit": 5000, "remaining": 10, "reset": NOW + 600}
         gg.register("pr:o/r#1")
-        self.daemon.tick(NOW)
+        self.daemon.tick(NOW)  # both buckets below their reserve: nothing is read
         self.assertEqual(self.gh.calls, [])
+        self.daemon.budget.pop("rest")
+        (gg.watch_dir() / gg.file_name("pr:o/r#1")).unlink()  # else it, too, would now go over REST
 
         def limited(method, url, headers, body):
             return 403, {"retry-after": "120", "x-ratelimit-remaining": "0", "x-ratelimit-resource": "core",
@@ -925,6 +1007,224 @@ class DaemonTest(Base):
         self.assertIsNone(gg.daemon_failing())
         gg.clear_failing()  # nothing to clear: a no-op
         self.assertEqual(gg.read_json(gg.BASE / "daemon.json"), doc)
+
+
+def workflow_check(name: str, run_id: int, workflow: str = "CI", conclusion: str | None = "SUCCESS",
+                   suite: str | None = None, node_id: str | None = None) -> dict:
+    return {**check_run(name, "COMPLETED" if conclusion else "IN_PROGRESS", conclusion), "id": node_id,
+            "databaseId": run_id * 10, "startedAt": iso(NOW - 60),
+            "checkSuite": {"conclusion": suite if suite is not None else conclusion,
+                           "workflowRun": {"databaseId": run_id, "workflow": {"name": workflow, "databaseId": {"CI": 77, "Lint": 78}[workflow]}}}}
+
+
+class BalanceTest(Base):
+    """REST and GraphQL as one pool: each read goes to the bucket that is richer for its time left."""
+
+    def budgets(self, rest: tuple[int, float], graphql: tuple[int, float]) -> None:
+        self.daemon.now = NOW
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": rest[0], "reset": NOW + rest[1]},
+                              "graphql": {"limit": 5000, "remaining": graphql[0], "reset": NOW + graphql[1]}}
+
+    def test_richness_is_what_is_left_over_the_time_to_reset(self) -> None:
+        self.budgets(rest=(600, 120), graphql=(600, 3000))  # same count: 2 minutes to go is rich
+        self.assertGreater(self.daemon.richness("rest"), 10 * self.daemon.richness("graphql"))
+        self.assertEqual(self.daemon.route("pr"), "rest")
+        self.assertEqual(self.daemon.route("run"), "rest")
+        self.assertEqual(self.daemon.route("comment"), "graphql")  # comment watches never move
+        self.budgets(rest=(600, 3000), graphql=(600, 120))
+        self.assertEqual(self.daemon.route("pr"), "graphql")
+        self.assertEqual(self.daemon.route("run"), "graphql")
+        # a bucket below its reserve is stopped whatever its time left; the other takes every read
+        self.budgets(rest=(gg.FLOORS["rest"][1] - 1, 30), graphql=(150, 3500))
+        self.assertEqual(self.daemon.richness("rest"), -1)
+        self.assertEqual(self.daemon.route("run"), "graphql")
+
+    def test_a_kind_moves_only_when_the_other_bucket_is_clearly_richer(self) -> None:
+        self.budgets(rest=(2200, 1800), graphql=(2000, 1800))  # rest 10% richer: below the margin
+        self.assertEqual(self.daemon.route("pr"), "graphql")
+        self.budgets(rest=(3000, 1800), graphql=(2000, 1800))
+        self.assertEqual(self.daemon.route("pr"), "rest")
+        self.budgets(rest=(2200, 1800), graphql=(2000, 1800))  # and it stays there until GraphQL leads
+        self.assertEqual(self.daemon.route("pr"), "rest")
+
+    def test_the_cheaper_path_flips_as_buckets_drain(self) -> None:
+        """Both buckets drain about evenly: reads follow whichever has more to spend per second."""
+        self.budgets(rest=(4500, 1800), graphql=(1000, 1800))
+        self.assertEqual(self.daemon.route("pr"), "rest")
+        self.budgets(rest=(900, 1800), graphql=(1000, 600))  # REST drained; GraphQL's reset is near
+        self.assertEqual(self.daemon.route("pr"), "graphql")
+        self.assertEqual(self.daemon.route("run"), "graphql")
+        self.budgets(rest=(3000, 1800), graphql=(1000, 1800))  # REST's reset refilled it
+        self.assertEqual(self.daemon.route("run"), "rest")
+
+    def test_runs_over_graphql_when_rest_is_poorer(self) -> None:
+        self.gh.runs[7] = {"id": 7, "name": "CI", "display_title": "fix", "status": "completed", "conclusion": "failure",
+                           "html_url": "https://github.com/o/r/actions/runs/7", "head_sha": "b" * 40, "head_branch": "x",
+                           "event": "push", "run_attempt": 2, "created_at": iso(NOW - 99), "updated_at": iso(NOW - 9)}
+        self.gh.jobs[7] = [job("build", run_attempt=2)]
+        self.budgets(rest=(300, 3000), graphql=(4000, 1800))
+        key = gg.parse_key("run", "o/r/7")
+        gg.register(key)
+        self.daemon.tick(NOW)
+        self.assertEqual(self.gh.run_calls(), [])
+        self.assertEqual(len(self.gh.gql_calls()), 1)
+        self.assertIn("resource(url: $u0)", json.loads(self.gh.gql_calls()[0][3])["query"])
+        entry = gg.read_cache(key)
+        self.assertEqual(entry["data"], gg.slim_run(self.gh.runs[7]))  # the same answer REST gives
+        self.assertEqual(entry["source"], "graphql")
+        # the failed attempt's job list still comes from REST, once: only REST names the runner
+        self.assertEqual(len(self.gh.job_calls()), 1)
+        self.assertEqual(entry["jobs"][0]["runner_name"], "cmuxs-mac-mini-3-glaeda-1")
+        self.daemon.tick(NOW + gg.TERMINAL_REFRESH)
+        self.assertEqual(len(self.gh.job_calls()), 1)
+        gg.register("run:o/r/404")
+        self.daemon.tick(NOW + gg.TERMINAL_REFRESH + gg.CYCLE)
+        missing = gg.read_cache("run:o/r/404")
+        self.assertIn("no workflow run", missing["error"])
+        self.assertFalse(missing.get("missing"))  # as REST's 404: an error, not a verdict
+
+    def test_prs_over_rest_when_graphql_is_poorer_read_the_same(self) -> None:
+        checks = [workflow_check("build", 11), workflow_check("test", 11, conclusion="FAILURE"),
+                  workflow_check("lint", 12, workflow="Lint", conclusion=None, suite=None),
+                  # the cancelled run a newer run of the same workflow replaced
+                  workflow_check("test", 10, conclusion="CANCELLED"),
+                  {"__typename": "StatusContext", "context": "ci/legacy", "state": "PENDING", "targetUrl": "t",
+                   "createdAt": iso(NOW - 30)}]
+        self.gh.prs[("o", "r", 1)] = {**pr_node(1, checks=checks), "reviewDecision": "APPROVED", "headRefName": "feat"}
+        self.gh.prs[("o", "r", 1)]["baseRef"] = {"branchProtectionRule": {"requiredStatusCheckContexts": ["ci-status"]},
+                                                 "rules": {"nodes": []}}
+        self.gh.protected = ["ci-status"]
+        key = gg.parse_key("pr", "o/r#1")
+        gg.register(key)
+        self.daemon.tick(NOW)  # equal buckets: GraphQL, as before
+        over_graphql = gg.read_cache(key)["data"]
+        self.assertEqual(self.gh.rest_calls(), [])
+        self.daemon.budget["graphql"] = {"limit": 5000, "remaining": 400, "reset": NOW + 3000}
+        self.daemon.tick(NOW + gg.CYCLE)
+        paths = [c[1].split("/o/r/", 1)[1] for c in self.gh.rest_calls()]
+        self.assertEqual(paths, ["pulls/1", f"commits/{'a' * 40}/check-runs?filter=all&per_page=100",
+                                 f"commits/{'a' * 40}/status?per_page=100", f"actions/runs?head_sha={'a' * 40}&per_page=100",
+                                 "actions/workflows?per_page=100", "rules/branches/main?per_page=100", "branches/main"])
+        over_rest = gg.read_cache(key)["data"]
+        self.assertEqual(over_rest["checkState"], "FAILURE")  # computed: a failed check outranks pending ones
+        for field in ("state", "mergeable", "mergeStateStatus", "headRefOid", "headRefName",
+                      "requiredMissing", "superseded", "reviewDecision"):
+            self.assertEqual(over_rest[field], over_graphql[field], field)
+        strip = lambda cs: sorted((c["name"], c["workflow"], c["status"], c["conclusion"], c["required"]) for c in cs)
+        self.assertEqual(strip(over_rest["checks"]), strip(over_graphql["checks"]))
+        self.assertEqual(gg.verdict("pr", over_rest), gg.verdict("pr", over_graphql))
+        # nothing changed: every conditional read answers 304, which costs no quota
+        before = self.gh.rest_remaining
+        self.daemon.tick(NOW + 2 * gg.CYCLE)
+        self.assertEqual(len(self.gh.rest_calls()), 14)  # 7 reads, all 304 the second time
+        self.assertEqual(self.gh.rest_remaining, before)
+        self.assertEqual(gg.read_cache(key)["data"]["checks"], over_rest["checks"])
+
+    def test_over_100_checks_rest_pages_and_a_truncated_list_is_never_green(self) -> None:
+        checks = [workflow_check(f"job-{i}", 5) for i in range(150)]
+        self.gh.prs[("o", "r", 3)] = pr_node(3, checks=checks)
+        self.budgets(rest=(4000, 1800), graphql=(300, 3000))
+        gg.register("pr:o/r#3")
+        self.daemon.tick(NOW)
+        data = gg.read_cache("pr:o/r#3")["data"]
+        self.assertEqual(len(data["checks"]), 150)  # two pages
+        self.assertFalse(data["checksTruncated"])
+        self.assertEqual(gg.verdict("pr", data), 0)
+        # more checks than the pages it reads: every check read passed, but it is not called green
+        with mock.patch.object(gg, "REST_CHECK_PAGES", 1):
+            self.daemon.tick(NOW + gg.CYCLE)
+        data = gg.read_cache("pr:o/r#3")["data"]
+        self.assertTrue(data["checksTruncated"])
+        self.assertEqual(data["checkState"], "PENDING")
+        self.assertIsNone(gg.verdict("pr", data))
+
+    def test_steps_come_from_rest_so_a_refused_check_is_still_held(self) -> None:
+        """PRs move to REST when GraphQL is stopped; the failed steps must not need GraphQL."""
+        now = time.time()
+        build = {**workflow_check("build", 5, conclusion="FAILURE", node_id="CR_build"),
+                 "startedAt": iso(now - 7), "completedAt": iso(now)}
+        self.gh.prs[("o", "r", 4)] = pr_node(4, rollup="FAILURE", checks=[build])
+        self.gh.job_steps[50] = [{"name": "Set up job", "conclusion": "success"},
+                                 {"name": "Set up runner", "conclusion": "failure"}]
+        self.budgets(rest=(4000, 1800), graphql=(50, 3000))  # GraphQL below its reserve
+        gg.register("pr:o/r#4")
+        self.daemon.tick(NOW)
+        self.assertEqual(self.gh.gql_calls(), [])
+        data = gg.read_cache("pr:o/r#4")["data"]
+        self.assertEqual(data["checks"][0]["failedSteps"], ["Set up runner"])
+        self.assertIsNone(gg.verdict("pr", data, "green"))  # held for the rescue, not red
+        jobs = [c for c in self.gh.rest_calls() if "/actions/jobs/" in c[1]]
+        self.assertEqual(len(jobs), 1)
+        self.daemon.tick(NOW + gg.CYCLE)  # a completed job's steps are read once
+        self.assertEqual(len([c for c in self.gh.rest_calls() if "/actions/jobs/" in c[1]]), 1)
+        self.assertEqual(gg.read_cache("pr:o/r#4")["data"]["checks"][0]["failedSteps"], ["Set up runner"])
+
+    def test_a_deleted_base_branch_keeps_the_last_requirements(self) -> None:
+        self.gh.prs[("o", "r", 5)] = pr_node(5, checks=[workflow_check("build", 5)])
+        self.gh.protected = ["ci-status"]
+        self.budgets(rest=(4000, 1800), graphql=(300, 3000))
+        gg.register("pr:o/r#5")
+        self.daemon.tick(NOW)
+        self.assertEqual(gg.read_cache("pr:o/r#5")["data"]["requiredMissing"], ["ci-status"])
+        self.gh.base_gone = True
+        self.daemon.tick(NOW + gg.CYCLE)
+        entry = gg.read_cache("pr:o/r#5")
+        self.assertIsNone(entry["error"])
+        self.assertEqual(entry["data"]["requiredMissing"], ["ci-status"])
+
+    def test_a_graphql_read_drops_the_kept_rest_answers(self) -> None:
+        self.gh.prs[("o", "r", 6)] = pr_node(6, checks=[workflow_check("build", 5)])
+        self.budgets(rest=(4000, 1800), graphql=(300, 3000))
+        gg.register("pr:o/r#6")
+        self.daemon.tick(NOW)
+        self.assertTrue(gg.read_cache("pr:o/r#6")["restParts"])
+        self.budgets(rest=(300, 3000), graphql=(4000, 1800))
+        self.daemon.tick(NOW + gg.CYCLE)
+        self.assertIsNone(gg.read_cache("pr:o/r#6")["restParts"])
+
+    def test_a_failed_run_query_says_what_github_said(self) -> None:
+        def broken(method, url, headers, body):
+            return 200, {}, json.dumps({"errors": [{"message": "Field 'runAttempt' doesn't exist on type 'WorkflowRun'"}]}).encode()
+        self.daemon.transport = broken
+        self.budgets(rest=(300, 3000), graphql=(4000, 1800))
+        gg.register("run:o/r/7")
+        self.daemon.tick(NOW)
+        self.assertIn("runAttempt", gg.read_cache("run:o/r/7")["error"])
+
+    def test_rulesets_name_required_checks_over_rest(self) -> None:
+        self.gh.prs[("o", "r", 2)] = pr_node(2, checks=[workflow_check("build", 5)])
+        self.gh.rules = [{"type": "pull_request"}, {"type": "required_status_checks", "parameters": {
+            "required_status_checks": [{"context": "ci-status"}, {"context": "build"}]}}]
+        self.budgets(rest=(4000, 1800), graphql=(300, 3000))
+        gg.register("pr:o/r#2")
+        self.daemon.tick(NOW)
+        data = gg.read_cache("pr:o/r#2")["data"]
+        self.assertEqual(data["requiredMissing"], ["ci-status"])  # pending until it reports, as over GraphQL
+        self.assertTrue(data["checks"][0]["required"])
+        self.assertIsNone(gg.verdict("pr", data))
+
+    def test_a_missing_pr_over_rest_is_missing(self) -> None:
+        self.budgets(rest=(4000, 1800), graphql=(300, 3000))
+        gg.register("pr:o/r#404")
+        self.daemon.tick(NOW)
+        entry = gg.read_cache("pr:o/r#404")
+        self.assertTrue(entry["missing"])
+        self.assertIn("HTTP 404", entry["error"])
+        self.assertEqual(len(self.gh.rest_calls()), 1)
+
+    def test_token_never_written_on_either_path(self) -> None:
+        self.gh.prs[("o", "r", 1)] = pr_node(1, checks=[workflow_check("build", 5)])
+        self.gh.runs[7] = {"id": 7, "status": "queued", "html_url": "u"}
+        self.budgets(rest=(4000, 1800), graphql=(300, 3000))  # PRs over REST
+        gg.register("pr:o/r#1")
+        self.daemon.tick(NOW)
+        self.budgets(rest=(300, 3000), graphql=(4000, 1800))  # runs over GraphQL
+        gg.register("run:o/r/7")
+        self.daemon.tick(NOW + gg.CYCLE)
+        self.assertTrue(self.gh.rest_calls() and self.gh.gql_calls())
+        for path in gg.BASE.rglob("*"):
+            if path.is_file():
+                self.assertNotIn(TOKEN, path.read_text(), path)
 
 
 class ClientTest(Base):
@@ -1525,6 +1825,42 @@ class ClientTest(Base):
             self.assertEqual(gg.main(["wait", "pr", "o/r#1", "--author", "x"]), 64)
             self.assertEqual(gg.main(["wait", "run", "o/r/1", "--rescue-grace", "-1"]), 64)
         self.assertIn("--sha must be a commit id", err.getvalue())
+
+
+class BudgetOutputTest(Base):
+    def test_budget_shows_both_buckets_the_paths_and_the_split(self) -> None:
+        self.gh.prs[("o", "r", 1)] = pr_node(1)
+        self.gh.runs[7] = {"id": 7, "status": "queued", "html_url": "u"}
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 300, "reset": NOW + 3000},
+                              "graphql": {"limit": 5000, "remaining": 4000, "reset": NOW + 1800}}
+        gg.register("pr:o/r#1")
+        gg.register("run:o/r/7")
+        self.daemon.tick(NOW)
+        status = gg.read_json(gg.BASE / "daemon.json")
+        self.assertEqual(status["paths"], {"pr": "graphql", "run": "graphql", "comment": "graphql"})
+        self.assertEqual(status["reads"]["run"], {"graphql": 1, "rest": 0})
+        self.assertEqual(status["reads"]["pr"], {"graphql": 1, "rest": 0})
+        lock = open(gg.BASE / "daemon.lock", "a+")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()), \
+                    mock.patch.object(gg, "daemon_stale", return_value=None):
+                gg.cmd_budget(False)
+            text = out.getvalue()
+            self.assertRegex(text, r"rest +\d+/5000 left, resets \S+, [\d.]+/min to spend until then")
+            self.assertRegex(text, r"graphql +\d+/5000 left")
+            self.assertIn("reading: PRs over GraphQL, runs over GraphQL, comments over GraphQL", text)
+            self.assertIn("reads in the last hour: PRs 1 GraphQL / 0 REST; runs 1 GraphQL / 0 REST", text)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()), \
+                    mock.patch.object(gg, "daemon_stale", return_value=None):
+                gg.cmd_budget(True)
+            last = json.loads(out.getvalue())["last"]
+            self.assertEqual(last["paths"]["run"], "graphql")
+            self.assertIn("perMinute", last)
+        finally:
+            lock.close()
 
 
 if __name__ == "__main__":
