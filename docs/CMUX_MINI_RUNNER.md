@@ -56,9 +56,15 @@ registration with the same name, `--headless` for an EC2 system LaunchDaemon, or
 
 What `--apply` does:
 
-1. Downloads the latest official `actions/runner` `osx-arm64` tarball, verifies its
-   SHA-256 against the release notes and the GitHub asset digest (both must agree),
-   and unpacks it into `~/actions-runner-glaeda`.
+1. Picks an official `actions/runner` `osx-arm64` release without spending the minis'
+   shared unauthenticated API quota: `--runner-version`, else the version another
+   instance on the mini already runs, else a tarball already in the mini's cache, else
+   the latest the fleet operator read once per apply (`--latest-runner-version`), else
+   one API read (gh, or `GH_TOKEN`/`GITHUB_TOKEN`), else the pinned fallback in the
+   script. It verifies the tarball's SHA-256 (release notes and asset digest must agree,
+   or the pin), keeps it in `~/Library/Caches/glaeda/actions-runner/<version>/` with a
+   `release.json` marker so a mini downloads each version once, and unpacks it into
+   `~/actions-runner-glaeda`.
 2. Gets a one-time registration token with `gh api -X POST .../registration-token`
    and runs `config.sh --unattended` (persistent, not ephemeral, so `_work` keeps hot
    state). The token is read from gh's stdout into memory and passed to `config.sh`

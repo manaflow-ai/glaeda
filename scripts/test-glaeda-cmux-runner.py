@@ -102,6 +102,8 @@ if "-X" in argv:
 else:
     method, endpoint = "GET", argv[1]
 if endpoint.startswith("repos/actions/runner/releases"):
+    if os.path.exists(os.path.join(state, "fail-release")):
+        sys.exit(1)
     sys.stdout.write(open(os.path.join(state, "release.json")).read())
 elif endpoint.endswith("/registration-token") and method == "POST":
     print(os.environ["FAKE_REG_TOKEN"])
@@ -126,6 +128,10 @@ FAKE_CURL = FAKE_LOG_HEADER + r'''
 argv = sys.argv[1:]
 log("curl", argv)
 if "-o" not in argv:  # the gh-free path reads the public release API
+    if "--config" in argv:  # an authenticated read: note whether stdin carried the header
+        open(os.path.join(state, "curl-config"), "w").write(sys.stdin.read())
+    if os.path.exists(os.path.join(state, "fail-release")):
+        sys.exit(22)
     sys.stdout.write(open(os.path.join(state, "release.json")).read()); sys.exit(0)
 dest = argv[argv.index("-o") + 1]
 open(dest, "wb").write(open(os.path.join(state, "runner.tar.gz"), "rb").read())
@@ -5986,6 +5992,127 @@ print(json.dumps({{"actions": [{{"kind": "register", "labels": {labels!r}}}]}}))
         linked = self.invoke("--xcode-app", os.fspath(self.home / "Link.app"))
         self.assertIn("symlink", linked["preflight"]["checks"]["xcodeApp"]["value"])
         self.assertNotIn("xcodeApp", self.invoke()["preflight"]["checks"])
+
+    # ------------------------------------------------------------ which runner release a new install unpacks
+
+    def release_reads(self, since: int = 0) -> list[dict]:
+        """API reads of actions/runner releases (gh, or curl without -o) since log entry `since`."""
+        return [e for e in self.log()[since:] if (e["tool"] == "gh" and any("actions/runner/releases" in a for a in e["argv"]))
+                or (e["tool"] == "curl" and "-o" not in e["argv"])]
+
+    def downloads(self, since: int = 0) -> list[dict]:
+        return [e for e in self.log()[since:] if e["tool"] == "curl" and "-o" in e["argv"]]
+
+    def download_act(self, *args: str, **kw) -> dict:
+        return self.by_kind(self.invoke(*args, **kw))["download"]
+
+    def test_release_resolution_reuses_installed_then_cache_then_operator_then_api_then_pin(self) -> None:
+        sha = hashlib.sha256((self.state / "runner.tar.gz").read_bytes()).hexdigest()
+        # nothing on this mini and no operator answer: one API read of "latest"
+        fresh = self.download_act()
+        self.assertEqual((fresh["version"], fresh["resolvedBy"]), (VERSION, "api-latest"))
+        self.assertEqual(len(self.release_reads()), 1)
+        # the operator's answer (the fleet resolves it once per apply) beats the API
+        calls = len(self.log())
+        told = self.download_act("--latest-runner-version", "2.401.0", "--latest-runner-sha256", "a" * 64)
+        self.assertEqual((told["version"], told["resolvedBy"], told["sha256"]), ("2.401.0", "operator", "a" * 64))
+        self.assertIn("/v2.401.0/actions-runner-osx-arm64-2.401.0.tar.gz", told["url"])
+        self.assertEqual(self.release_reads(calls), [])
+
+        # instance 0 installs: one download, into the cache, and the receipt records the SHA-256
+        self.invoke("--apply")
+        self.assertEqual(len(self.downloads()), 1)
+        cache = self.home / cr.RUNNER_CACHE / VERSION
+        marker = json.loads((cache / cr.RUNNER_CACHE_MARKER).read_text())
+        self.assertEqual((marker["version"], marker["sha256"]), (VERSION, sha))
+        self.assertTrue((cache / f"actions-runner-osx-arm64-{VERSION}.tar.gz").is_file())
+        receipt = json.loads((self.home / ".local/state/glaeda/cmux-runner/receipt.json").read_text())
+        self.assertEqual((receipt["runnerVersion"], receipt["runnerSha256"]), (VERSION, sha))
+
+        # instance 1 reuses what instance 0 runs, from the cache, even when the operator names a newer one:
+        # no API read and no second download
+        calls = len(self.log())
+        reused = self.download_act("--instance", "1", "--latest-runner-version", "2.401.0",
+                                   "--latest-runner-sha256", "a" * 64)
+        self.assertEqual((reused["version"], reused["resolvedBy"], reused.get("reused")), (VERSION, "cache", "installed"))
+        done = self.invoke("--apply", "--instance", "1")
+        self.assertEqual(self.by_kind(done)["download"]["tarball"], "cache")
+        self.assertEqual(self.release_reads(calls), [])
+        self.assertEqual(self.downloads(calls), [])
+        self.assertTrue((self.home / "actions-runner-glaeda-1" / "config.sh").is_file())
+
+        # a runner that self-updated to a version with no local SHA-256: the newest cached tarball, still no API
+        bin_dir = self.home / "actions-runner-glaeda" / "bin.2.400.0"
+        bin_dir.mkdir()
+        (self.home / "actions-runner-glaeda" / "bin").symlink_to(bin_dir)
+        (self.home / "actions-runner-glaeda-1").rename(self.home / "moved-away")  # only instance 0 counts now
+        calls = len(self.log())
+        newer = self.download_act("--instance", "2")
+        self.assertEqual((newer["version"], newer["resolvedBy"]), (VERSION, "cache"))
+        # ... unless the operator's answer is that very version: then it is reused with the operator's SHA-256
+        same = self.download_act("--instance", "2", "--latest-runner-version", "2.400.0",
+                                 "--latest-runner-sha256", "b" * 64)
+        self.assertEqual((same["version"], same["resolvedBy"], same.get("reused")), ("2.400.0", "operator", "installed"))
+        self.assertEqual(self.release_reads(calls), [])
+
+        # a folder others can write to vouches for nothing
+        ctx = cr.Context(cr.parser().parse_args([]))
+        self.assertIsNotNone(cr.cached_release(ctx, VERSION))
+        cache.chmod(0o777)
+        self.assertIsNone(cr.cached_release(ctx, VERSION))
+        cache.chmod(0o755)
+        # a cached tarball that no longer hashes to its marker is a miss, never trusted
+        (cache / f"actions-runner-osx-arm64-{VERSION}.tar.gz").write_bytes(b"truncated")
+        self.assertIsNone(cr.cached_release(cr.Context(cr.parser().parse_args([])), VERSION))
+
+    def test_release_falls_back_to_the_pin_when_the_api_fails(self) -> None:
+        (self.state / "fail-release").touch()
+        act = self.download_act()
+        self.assertEqual((act["state"], act["version"], act["resolvedBy"]),
+                         ("create", cr.PINNED_RUNNER_VERSION, "pinned"))
+        self.assertEqual(act["sha256"], cr.PINNED_RUNNER_SHA256)
+        self.assertIn("pinned version", act["note"])
+        self.assertEqual(len(self.release_reads()), 1, "the API is read once, then the pin")
+        # an explicit --runner-version with its SHA-256 needs no API at all
+        calls = len(self.log())
+        pinned = self.download_act("--runner-version", "v2.330.0", "--runner-sha256", "c" * 64)
+        self.assertEqual((pinned["version"], pinned["resolvedBy"], pinned["sha256"]), ("2.330.0", "flag", "c" * 64))
+        self.assertEqual(self.release_reads(calls), [])
+
+    def test_release_read_without_gh_sends_a_token_on_curl_stdin_only(self) -> None:
+        secret = "ghp_" + "Z" * 36
+        real_which = cr.which
+        with mock.patch.object(cr, "which", lambda name, extra=(): None if name == "gh" else real_which(name, extra)), \
+                mock.patch.dict(os.environ, {"GH_TOKEN": secret}):
+            act = self.download_act(gh=False)
+        self.assertEqual((act["version"], act["resolvedBy"]), (VERSION, "api-latest"))
+        reads = self.release_reads()
+        self.assertEqual(len(reads), 1)
+        self.assertIn("--config", reads[0]["argv"])
+        self.assertNotIn(secret, json.dumps(self.log()))
+        self.assertEqual((self.state / "curl-config").read_text(), f'header = "Authorization: Bearer {secret}"\n')
+        self.assertNotIn(secret, self.last_output)
+
+    def test_release_flags_are_validated(self) -> None:
+        for args in (("--latest-runner-version", "2.1.0"), ("--latest-runner-sha256", "a" * 64),
+                     ("--latest-runner-version", "2.1.0; rm -rf /", "--latest-runner-sha256", "a" * 64),
+                     ("--runner-version", "latest"), ("--runner-sha256", "nothex")):
+            with self.subTest(args=args), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(cr.main(["--gh", os.fspath(self.gh), *args]), 2)
+        self.assertEqual(self.tree(), {})
+
+    def test_runner_cache_keeps_the_newest_versions(self) -> None:
+        ctx = cr.Context(cr.parser().parse_args([]))
+        for version in ("2.300.0", "2.310.0", "2.320.0"):
+            folder = ctx.runner_cache / version
+            folder.mkdir(parents=True)
+            (folder / cr.RUNNER_CACHE_MARKER).write_text("{}")
+            (folder / cr.runner_asset(version)).write_bytes(b"x")
+        (ctx.runner_cache / "2.300.0" / "someone-elses").write_text("keep")
+        cr.prune_runner_cache(ctx, "2.399.0")
+        self.assertEqual(sorted(p.name for p in ctx.runner_cache.iterdir()), ["2.300.0", "2.320.0"])
+        self.assertEqual(sorted(p.name for p in (ctx.runner_cache / "2.300.0").iterdir()), ["someone-elses"],
+                         "only the cache's own files are removed")
 
     def test_token_stdin_apply_needs_a_token(self) -> None:
         for args, stdin in ((("--apply", "--token-stdin"), ""),

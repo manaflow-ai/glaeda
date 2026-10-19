@@ -12,9 +12,12 @@ A fleet member passes --manifest M --member NAME instead of --labels: its class,
 verified Xcodes become the labels, and a later change re-registers it in place (docs/CMUX_MINI_RUNNER.md 2c).
 
 What --apply does, all under $HOME and owned by the current user (no sudo):
-    1. downloads the official actions/runner osx-arm64 release (latest, or --runner-version),
-       verifies its SHA-256 against the release notes (and the asset digest when GitHub has one),
-       and unpacks it into ~/actions-runner-glaeda (or --runner-dir)
+    1. picks an official actions/runner osx-arm64 release: --runner-version, else the version another
+       instance on this mini runs, else one already cached here, else the latest the fleet operator resolved,
+       else the API (once; authenticated when it can be), else a pinned fallback (resolve_release). It
+       verifies the tarball's SHA-256 (release notes, asset digest, or pin), keeps it in a per-mini cache
+       (~/Library/Caches/glaeda/actions-runner/<version>, with a release.json marker) so the mini downloads
+       a version once, and unpacks it into ~/actions-runner-glaeda (or --runner-dir)
     2. registers it with labels self-hosted,macOS,ARM64,glaeda-mini (+ --labels), persistent
        (not ephemeral) so the _work tree keeps hot state between jobs
     3. writes job hooks: job-started refuses fork pull requests and pull_request_target and
@@ -37,7 +40,8 @@ on the operator's own machine, so no GitHub credential ever lands on the mini:
     gh api -X POST repos/OWNER/REPO/actions/runners/registration-token --jq .token \
       | ssh MINI glaeda-cmux-runner --apply --repo OWNER/REPO --token-stdin
 
-Without gh the release is read from the public API with curl, a name collision is left to
+Without gh the release, when step 1 needs the API at all, is read with curl (with GH_TOKEN or
+GITHUB_TOKEN from the environment when set, sent on curl's stdin), a name collision is left to
 config.sh (which refuses one), and step 5 is confirmed locally from the runner log instead.
 
 Routing is never automated. A --labels runner's plan prints the `gh variable set` commands that
@@ -115,6 +119,23 @@ LABELS_MODULE = "glaeda_fleet_labels.py"
 ROUTE_VARIABLES = ("MACOS_RUNNER_15", "MACOS_RUNNER_26", "MACOS_RUNNER_PR", "MACOS_RUNNER_DUAL_XCODE")
 RUNNER_RELEASE_API = "repos/actions/runner/releases"
 PLATFORM_ASSET = "osx-arm64"
+# The release a new install falls back to when nothing on this mini names one and no "latest" can be read (the
+# minis share one public IP, so unauthenticated API reads run out). The SHA-256 is GitHub's own digest of the
+# osx-arm64 asset, matching the release notes. The runner self-updates once registered, so an older pin costs
+# one update, never a failed install. Bump both together.
+PINNED_RUNNER_VERSION = "2.338.0"
+PINNED_RUNNER_SHA256 = "df4cebda25c86a886ed204e49fee63f5c2e7cec5f447b5c98440a826bbdf9df2"
+RUNNER_DOWNLOAD_URL = "https://github.com/actions/runner/releases/download/v{version}/{asset}"
+RUNNER_VERSION_RE = r"[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}"
+SHA256_RE = r"[0-9a-f]{64}"
+# One tarball per version, verified, shared by every instance this user installs on the mini:
+# <cache>/<version>/<asset> and its marker <cache>/<version>/release.json (written after the tarball).
+RUNNER_CACHE = "Library/Caches/glaeda/actions-runner"  # under HOME; GLAEDA_RUNNER_CACHE_DIR overrides
+RUNNER_CACHE_ENV = "GLAEDA_RUNNER_CACHE_DIR"
+RUNNER_CACHE_SCHEMA = "glaeda-cmux-runner/tarball-cache/v1"
+RUNNER_CACHE_MARKER = "release.json"
+RUNNER_CACHE_KEEP = 2  # versions kept after a download; older ones are removed (a rebuildable cache)
+API_TOKEN_ENV = ("GH_TOKEN", "GITHUB_TOKEN")  # the gh-free path's optional API auth, sent on curl's stdin
 MARKER = ".glaeda-cmux-runner"
 HOOK_DIR = "glaeda-hooks"
 HELD_DIR = ".local/state/glaeda/mini-fleet/runner-held"  # cmux_mini_fix.sh held_dir
@@ -156,12 +177,25 @@ def sha256_file(path: Path) -> str | None:
         return None
 
 
+def stream_sha256(path: Path) -> str | None:
+    """sha256_file for a large file (a runner tarball): hashed in chunks, never read whole."""
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as file:
+            for chunk in iter(lambda: file.read(1 << 20), b""):
+                digest.update(chunk)
+    except OSError:
+        return None
+    return "sha256:" + digest.hexdigest()
+
+
 def run(argv: list[str], timeout: int = RUN_TIMEOUT, env: dict[str, str] | None = None,
-        cwd: Path | None = None) -> tuple[int, str]:
-    """Run a command. Never raises; a missing tool is (127, "")."""
+        cwd: Path | None = None, stdin_text: str | None = None) -> tuple[int, str]:
+    """Run a command. Never raises; a missing tool is (127, ""). stdin_text, when given, is the child's stdin."""
     try:
         result = subprocess.run(
-            argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            argv, input=stdin_text, stdin=None if stdin_text is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, timeout=timeout, env=env, cwd=cwd, check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
@@ -289,6 +323,11 @@ class Context:
         self.replace = args.replace
         self.version = args.runner_version
         self.pinned_sha = args.runner_sha256
+        # What the operator resolved as the latest release, once per fleet apply (glaeda-cmux-runner-fleet).
+        self.latest_version = args.latest_runner_version
+        self.latest_sha = (args.latest_runner_sha256 or "").lower().removeprefix("sha256:") or None
+        cache = os.environ.get(RUNNER_CACHE_ENV)
+        self.runner_cache = Path(cache).expanduser().absolute() if cache else self.home / RUNNER_CACHE
         self.route_repo = args.route_repo
         self.runner_dir = (args.runner_dir or self.home / f"actions-runner-glaeda{self.suffix}").expanduser().absolute()
         self.hook_dir = self.runner_dir / HOOK_DIR
@@ -409,10 +448,24 @@ def load_receipt(ctx: Context) -> dict[str, Any] | None:
 # ---------------------------------------------------------------- GitHub reads
 
 
+def api_token() -> str | None:
+    """A GitHub token from the environment for the gh-free path, or None (then the read is unauthenticated)."""
+    for name in API_TOKEN_ENV:
+        value = os.environ.get(name, "").strip()
+        if value and re.fullmatch(TOKEN_RE, value):
+            return value
+    return None
+
+
 def gh_json(ctx: Context, endpoint: str, public: bool = False) -> Any:
     if ctx.gh is None and public:
-        code, out = run([CURL, "-fsSL", "--retry", "3", "-H", "Accept: application/vnd.github+json",
-                         PUBLIC_API + endpoint])
+        argv = [CURL, "-fsSL", "--retry", "3", "-H", "Accept: application/vnd.github+json"]
+        token = api_token()
+        if token:  # on curl's stdin as a config line, never in argv or a file
+            code, out = run([*argv, "--config", "-", PUBLIC_API + endpoint],
+                            stdin_text=f'header = "Authorization: Bearer {token}"\n')
+        else:
+            code, out = run([*argv, PUBLIC_API + endpoint])
     elif ctx.gh is None:
         return None
     else:
@@ -425,15 +478,32 @@ def gh_json(ctx: Context, endpoint: str, public: bool = False) -> Any:
         return None
 
 
-def resolve_release(ctx: Context) -> dict[str, Any]:
-    """Latest (or pinned) osx-arm64 runner: version, url, expected sha256. Read-only."""
-    endpoint = f"{RUNNER_RELEASE_API}/tags/v{ctx.version}" if ctx.version else f"{RUNNER_RELEASE_API}/latest"
-    release = gh_json(ctx, endpoint, public=True)
+def runner_asset(version: str) -> str:
+    return f"actions-runner-{PLATFORM_ASSET}-{version}.tar.gz"
+
+
+def version_key(version: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in version.split("."))
+
+
+def known_release(version: str, sha: str, sources: list[str], via: str) -> dict[str, Any]:
+    """A release this mini can install without asking the API: the download URL follows from the version."""
+    asset = runner_asset(version)
+    return {"state": "ok", "version": version, "asset": asset,
+            "url": RUNNER_DOWNLOAD_URL.format(version=version, asset=asset), "sha256": sha,
+            "shaSources": sources, "resolvedBy": via}
+
+
+def release_from_doc(release: Any, pinned_sha: str | None = None) -> dict[str, Any]:
+    """Version, url and expected sha256 of a GitHub release document's osx-arm64 asset. Pure: the fleet's one
+    "latest" read uses it too."""
     if not isinstance(release, dict):
-        return {"state": "blocked", "note": f"could not read {endpoint}"}
+        return {"state": "blocked", "note": "not a release document"}
     version = str(release.get("tag_name") or "").lstrip("v")
-    asset_name = f"actions-runner-{PLATFORM_ASSET}-{version}.tar.gz"
-    asset = next((a for a in release.get("assets") or [] if a.get("name") == asset_name), None)
+    if not re.fullmatch(RUNNER_VERSION_RE, version):
+        return {"state": "blocked", "note": f"release tag {version[:40]!r} is not a runner version"}
+    asset_name = runner_asset(version)
+    asset = next((a for a in release.get("assets") or [] if isinstance(a, dict) and a.get("name") == asset_name), None)
     if asset is None:
         return {"state": "blocked", "note": f"release v{version} has no {asset_name}"}
     body = str(release.get("body") or "")
@@ -441,8 +511,8 @@ def resolve_release(ctx: Context) -> dict[str, Any]:
     notes_sha = match.group(1) if match else None
     digest = str(asset.get("digest") or "")
     digest_sha = digest.split(":", 1)[1] if digest.startswith("sha256:") else None
-    if ctx.pinned_sha:
-        expected = ctx.pinned_sha.lower().removeprefix("sha256:")
+    if pinned_sha:
+        expected = pinned_sha.lower().removeprefix("sha256:")
     else:
         expected = notes_sha or digest_sha
     if expected is None:
@@ -452,7 +522,147 @@ def resolve_release(ctx: Context) -> dict[str, Any]:
             return {"state": "blocked", "note": f"SHA-256 sources disagree for v{version}; refusing"}
     return {"state": "ok", "version": version, "asset": asset_name,
             "url": asset.get("browser_download_url"), "sha256": expected,
-            "shaSources": [n for n, v in (("releaseNotes", notes_sha), ("assetDigest", digest_sha), ("pinned", ctx.pinned_sha)) if v]}
+            "shaSources": [n for n, v in (("releaseNotes", notes_sha), ("assetDigest", digest_sha), ("pinned", pinned_sha)) if v]}
+
+
+def cached_release(ctx: Context, version: str) -> dict[str, Any] | None:
+    """The cached tarball of this version when its marker names it and its bytes still hash to the marker's
+    SHA-256 (re-hashed now: a truncated or replaced file is a miss, never trusted). Reads only."""
+    if not re.fullmatch(RUNNER_VERSION_RE, version):
+        return None
+    folder = ctx.runner_cache / version
+    try:  # only this user's own folder and marker vouch for a tarball (GLAEDA_RUNNER_CACHE_DIR may be shared)
+        folder_info, marker_info = folder.lstat(), (folder / RUNNER_CACHE_MARKER).lstat()
+        if not stat.S_ISDIR(folder_info.st_mode) or not stat.S_ISREG(marker_info.st_mode) or \
+                folder_info.st_uid != ctx.uid or marker_info.st_uid != ctx.uid or folder_info.st_mode & 0o022:
+            return None
+        marker = json.loads((folder / RUNNER_CACHE_MARKER).read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(marker, dict) or marker.get("schema") != RUNNER_CACHE_SCHEMA or marker.get("version") != version:
+        return None
+    sha, asset = str(marker.get("sha256") or ""), runner_asset(version)
+    tarball = folder / asset
+    try:
+        info = tarball.lstat()
+    except OSError:
+        return None
+    if not re.fullmatch(SHA256_RE, sha) or not stat.S_ISREG(info.st_mode) or info.st_uid != ctx.uid:
+        return None
+    if stream_sha256(tarball) != "sha256:" + sha:
+        return None
+    sources = [s for s in marker.get("shaSources") or [] if isinstance(s, str)][:4]
+    return {**known_release(version, sha, sources, "cache"), "cached": os.fspath(tarball)}
+
+
+def cached_versions(ctx: Context) -> list[str]:
+    """Versions with a folder in the runner cache, newest first (each still needs cached_release). Reads only."""
+    try:
+        names = [p.name for p in ctx.runner_cache.iterdir() if p.is_dir() and not p.is_symlink()]
+    except OSError:
+        return []
+    return sorted((n for n in names if re.fullmatch(RUNNER_VERSION_RE, n)), key=version_key, reverse=True)
+
+
+def installed_versions(ctx: Context) -> list[tuple[str, str | None]]:
+    """(version, its SHA-256 when an install recorded it) for every runner this user installed on the mini,
+    newest first. A self-updated runner's bin symlink (bin -> bin.2.339.0) wins over its receipt's version,
+    which names only what was unpacked. Reads only."""
+    base = ctx.home / ".local/state/glaeda/cmux-runner"
+    found: dict[str, str | None] = {}
+    for path in [base / "receipt.json", *sorted(base.glob("instance-*/receipt.json"))]:
+        try:
+            doc = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(doc, dict) or not doc.get("runnerDirOwned") or not doc.get("runnerDir"):
+            continue
+        runner_dir = Path(str(doc["runnerDir"]))
+        if not (runner_dir / "config.sh").is_file():
+            continue
+        recorded = str(doc.get("runnerVersion") or "")
+        sha = str(doc.get("runnerSha256") or "")
+        live = None
+        with contextlib.suppress(OSError):
+            target = os.readlink(runner_dir / "bin")
+            hit = re.fullmatch(rf"(?:.*/)?bin\.({RUNNER_VERSION_RE})/?", target)
+            live = hit.group(1) if hit else None
+        version = live or recorded
+        if not re.fullmatch(RUNNER_VERSION_RE, version):
+            continue
+        known = sha if version == recorded and re.fullmatch(SHA256_RE, sha) else None
+        found[version] = found.get(version) or known
+    return sorted(found.items(), key=lambda item: version_key(item[0]), reverse=True)
+
+
+def local_release(ctx: Context, version: str, recorded_sha: str | None = None) -> dict[str, Any] | None:
+    """This version's release when its SHA-256 is known on this mini without the API: the cache, an install's
+    receipt, the operator's resolved latest, or the pinned fallback. Reads only."""
+    cached = cached_release(ctx, version)
+    if cached:
+        return cached
+    if recorded_sha:
+        return known_release(version, recorded_sha, ["receipt"], "receipt")
+    if ctx.latest_version == version and ctx.latest_sha:
+        return known_release(version, ctx.latest_sha, ["operator"], "operator")
+    if version == PINNED_RUNNER_VERSION:
+        return known_release(version, PINNED_RUNNER_SHA256, ["pinned"], "pinned")
+    return None
+
+
+def api_release(ctx: Context, endpoint: str, via: str) -> dict[str, Any]:
+    release = release_from_doc(gh_json(ctx, endpoint, public=True), ctx.pinned_sha)
+    if release["state"] == "ok":
+        release["resolvedBy"] = via
+    elif release.get("note") == "not a release document":
+        release["note"] = f"could not read {endpoint}"
+    return release
+
+
+def resolve_release(ctx: Context) -> dict[str, Any]:
+    """Which osx-arm64 runner a new install unpacks: version, url, expected sha256 and resolvedBy. Reads only
+    (a plan calls it); download_and_unpack fills the cache. The fleet minis share one public IP, so the order
+    keeps a fleet apply off GitHub's unauthenticated API (60 reads an hour per IP):
+      1. --runner-version: that release; its SHA-256 from --runner-sha256 or the cache, else its tag on the API
+      2. the newest version an existing instance on this mini runs, when its SHA-256 is known here (the cache,
+         that install's receipt, the operator's --latest-runner-*, or the pinned fallback)
+      3. the newest verified tarball in this mini's runner cache
+      4. the operator's --latest-runner-version/--latest-runner-sha256 (glaeda-cmux-runner-fleet reads
+         "latest" once per apply, authenticated, and passes it to every instance)
+      5. the API, read once: an existing instance's version by its tag, else "latest"; through gh when it is
+         logged in, else curl with GH_TOKEN or GITHUB_TOKEN when set
+      6. PINNED_RUNNER_VERSION, when the API gives no usable answer
+    The runner self-updates after it registers, so an older version than "latest" is never wrong, only one
+    update behind."""
+    if ctx.version:
+        if ctx.pinned_sha:
+            return known_release(ctx.version, ctx.pinned_sha.lower().removeprefix("sha256:"), ["pinned"], "flag")
+        cached = cached_release(ctx, ctx.version)
+        return cached or api_release(ctx, f"{RUNNER_RELEASE_API}/tags/v{ctx.version}", "api-tag")
+    if ctx.pinned_sha:  # a SHA-256 pinned without a version vouches only for what "latest" names, as before
+        return api_release(ctx, f"{RUNNER_RELEASE_API}/latest", "api-latest")
+    installed = installed_versions(ctx)
+    for version, sha in installed:
+        found = local_release(ctx, version, sha)
+        if found:
+            return {**found, "reused": "installed"}
+    for version in cached_versions(ctx):
+        found = cached_release(ctx, version)
+        if found:
+            return found
+    if ctx.latest_version and ctx.latest_sha:
+        return known_release(ctx.latest_version, ctx.latest_sha, ["operator"], "operator")
+    if installed:
+        version = installed[0][0]
+        found = api_release(ctx, f"{RUNNER_RELEASE_API}/tags/v{version}", "api-tag")
+        if found["state"] == "ok" and found["version"] == version:
+            return {**found, "reused": "installed"}
+    else:
+        found = api_release(ctx, f"{RUNNER_RELEASE_API}/latest", "api-latest")
+        if found["state"] == "ok":
+            return found
+    return {**known_release(PINNED_RUNNER_VERSION, PINNED_RUNNER_SHA256, ["pinned"], "pinned"),
+            "note": f"fell back to the pinned version ({found.get('note') or 'the API gave no usable release'})"}
 
 
 def lookup_runner(ctx: Context) -> tuple[bool, dict[str, Any] | None]:
@@ -1036,25 +1246,66 @@ def plan_uninstall(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[st
 # ---------------------------------------------------------------- apply
 
 
-def download_and_unpack(ctx: Context, act: dict[str, Any], install_id: str) -> None:
-    ctx.state.mkdir(parents=True, exist_ok=True, mode=0o700)
-    stage = ctx.state / f".{act['asset']}.part"
+def prune_runner_cache(ctx: Context, keep: str) -> None:
+    """Keep the RUNNER_CACHE_KEEP newest versions (always keep). Removes only the files this cache writes, so a
+    folder holding anything else stays."""
+    stale = [v for v in cached_versions(ctx) if v != keep]
+    for version in stale[max(0, RUNNER_CACHE_KEEP - 1):]:
+        folder = ctx.runner_cache / version
+        for name in (RUNNER_CACHE_MARKER, runner_asset(version)):
+            with contextlib.suppress(OSError):
+                (folder / name).unlink()
+        with contextlib.suppress(OSError):
+            folder.rmdir()
+
+
+def cache_tarball(ctx: Context, act: dict[str, Any]) -> tuple[Path | None, str]:
+    """(the verified tarball in this mini's runner cache, how it got there) or (None, why). A hit downloads
+    nothing; a miss downloads once, verifies, and publishes the tarball before its marker."""
+    hit = cached_release(ctx, act["version"])
+    if hit and hit["sha256"] == act["sha256"]:
+        return Path(hit["cached"]), "cache"
+    folder = ctx.runner_cache / act["version"]
+    try:
+        folder.mkdir(parents=True, exist_ok=True, mode=0o755)
+    except OSError as error:
+        return None, f"runner cache: {type(error).__name__}"
+    if folder.is_symlink() or folder.stat().st_uid != ctx.uid:
+        return None, f"runner cache folder {ctx.show(folder)} is not this user's directory"
+    stage = folder / f".{act['asset']}.{os.getpid()}.part"
     stage.unlink(missing_ok=True)
     code, out = run([CURL, "-fsSL", "--retry", "3", "-o", os.fspath(stage), act["url"]], timeout=900)
     if code != 0:
-        act["state"], act["note"] = "failed", f"download failed: {out[-300:]}"
-        return
-    got = sha256_file(stage)
+        stage.unlink(missing_ok=True)
+        return None, f"download failed: {out[-300:]}"
+    got = stream_sha256(stage)
     if got != "sha256:" + act["sha256"]:
         stage.unlink(missing_ok=True)
-        act["state"], act["note"] = "failed", f"SHA-256 mismatch: got {got}, want sha256:{act['sha256']}"
+        return None, f"SHA-256 mismatch: got {got}, want sha256:{act['sha256']}"
+    tarball = folder / act["asset"]
+    with contextlib.suppress(OSError):  # a stale marker never vouches for the new bytes, even for a moment
+        (folder / RUNNER_CACHE_MARKER).unlink()
+    os.replace(stage, tarball)
+    marker = {"schema": RUNNER_CACHE_SCHEMA, "version": act["version"], "asset": act["asset"],
+              "sha256": act["sha256"], "shaSources": act.get("shaSources") or [], "url": act["url"],
+              "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")}
+    write_atomic(folder / RUNNER_CACHE_MARKER, (json.dumps(marker, indent=2, sort_keys=True) + "\n").encode(), 0o644)
+    prune_runner_cache(ctx, act["version"])
+    return tarball, "downloaded"
+
+
+def download_and_unpack(ctx: Context, act: dict[str, Any], install_id: str) -> None:
+    ctx.state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tarball, how = cache_tarball(ctx, act)
+    if tarball is None:
+        act["state"], act["note"] = "failed", how
         return
+    act["tarball"] = how
     ctx.runner_dir.mkdir(parents=True, exist_ok=True, mode=0o755)  # a rerun after a failed unpack
     # The marker lands first, so a failed unpack still leaves a directory this command owns.
     (ctx.runner_dir / MARKER).write_text(install_id + "\n")
     tar = which("tar", ("/usr/bin/tar",)) or "tar"
-    code, out = run([tar, "-xzf", os.fspath(stage), "-C", os.fspath(ctx.runner_dir)], timeout=600)
-    stage.unlink(missing_ok=True)
+    code, out = run([tar, "-xzf", os.fspath(tarball), "-C", os.fspath(ctx.runner_dir)], timeout=600)
     if code != 0 or not (ctx.runner_dir / "config.sh").is_file():
         act["state"], act["note"] = "failed", f"unpack failed: {out[-300:]}"
         return
@@ -1197,6 +1448,7 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
             download_and_unpack(ctx, act, receipt_doc["installId"])
             if act["state"] != "failed":
                 receipt_doc["runnerVersion"] = act["version"]
+                receipt_doc["runnerSha256"] = act["sha256"]
         elif kind == "register" and state == "create":
             register(ctx, act)
             if act["state"] != "failed":
@@ -1729,8 +1981,12 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--capacity-dir", help="shared capacity ledger path (default: $GLAEDA_FLEET_CAPACITY_DIR or the fleet path)")
     p.add_argument("--replace", action="store_true", help="replace an existing runner with the same name")
     p.add_argument("--runner-dir", type=Path, help="install directory (default ~/actions-runner-glaeda)")
-    p.add_argument("--runner-version", help="pin a runner version such as 2.328.0 (default latest)")
+    p.add_argument("--runner-version", help="pin a runner version such as 2.328.0 (default: one this mini already "
+                   "runs or has cached, else the latest; see resolve_release)")
     p.add_argument("--runner-sha256", help="pin the expected SHA-256 of the tarball")
+    p.add_argument("--latest-runner-version", help="the latest release as the operator resolved it (the fleet "
+                   "passes it once per apply); used only when this mini has no version to reuse")
+    p.add_argument("--latest-runner-sha256", help="the osx-arm64 SHA-256 of --latest-runner-version")
     p.add_argument("--route-repo", default=DEFAULT_REPO, help="repository whose variables the printed routing commands set")
     p.add_argument("--gh", help="gh binary (default: PATH)")
     p.add_argument("--token-stdin", action="store_true",
@@ -1781,6 +2037,18 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if args.repo and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+", args.repo):
         print("glaeda-cmux-runner: --repo must be OWNER/REPO", file=sys.stderr)
+        return 2
+    if args.runner_version is not None:
+        args.runner_version = args.runner_version.removeprefix("v")
+    for flag, value, pattern in (("--runner-version", args.runner_version, RUNNER_VERSION_RE),
+                                 ("--latest-runner-version", args.latest_runner_version, RUNNER_VERSION_RE),
+                                 ("--runner-sha256", args.runner_sha256, f"(sha256:)?{SHA256_RE}"),
+                                 ("--latest-runner-sha256", args.latest_runner_sha256, f"(sha256:)?{SHA256_RE}")):
+        if value is not None and not re.fullmatch(pattern, value.lower() if "sha" in flag else value):
+            print(f"glaeda-cmux-runner: {flag} is not a usable value", file=sys.stderr)
+            return 2
+    if bool(args.latest_runner_version) != bool(args.latest_runner_sha256):
+        print("glaeda-cmux-runner: --latest-runner-version and --latest-runner-sha256 go together", file=sys.stderr)
         return 2
     if args.manifest and args.labels:
         print("glaeda-cmux-runner: --labels and --manifest are exclusive; labels come from one source", file=sys.stderr)
@@ -1925,6 +2193,7 @@ def install_or_uninstall(ctx: Context, args: argparse.Namespace, raw_argv: list[
         "installId": (prior or {}).get("installId") if owned_dir(ctx, prior) else secrets.token_hex(16),
         "runnerDirOwned": owned_dir(ctx, prior),
         "runnerVersion": (prior or {}).get("runnerVersion") if owned_dir(ctx, prior) else None,
+        "runnerSha256": (prior or {}).get("runnerSha256") if owned_dir(ctx, prior) else None,
         "registration": (prior or {}).get("registration") if owned_dir(ctx, prior) else None,
         "preflight": pre,
         "member": ctx.member or ((prior or {}).get("member") if owned_dir(ctx, prior) else None),

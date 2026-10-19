@@ -95,6 +95,12 @@ path = next((a for a in sys.argv[2:] if "/" in a and not a.startswith("-")), "")
 if path.startswith("orgs/") and path.endswith("runner-groups?per_page=100"):
     groups = json.loads(os.environ.get("FAKE_GROUPS", "[]"))
     print(json.dumps({{"runner_groups": groups}}))
+elif path == "repos/actions/runner/releases/latest":
+    if os.environ.get("FAKE_NO_RELEASE"):
+        sys.exit(1)
+    print(json.dumps({{"tag_name": "v2.401.0", "body": "<!-- BEGIN SHA osx-arm64 -->" + "d" * 64 + "<!-- END SHA -->",
+                      "assets": [{{"name": "actions-runner-osx-arm64-2.401.0.tar.gz", "digest": "sha256:" + "d" * 64,
+                                  "browser_download_url": "https://example.invalid/x"}}]}}))
 elif "/repositories" in path:
     print(os.environ.get("FAKE_GROUP_REPOS", "manaflow-ai/cmux").replace(",", "\\n"))
 elif path.startswith("repos/") and path.count("/") == 2:
@@ -105,6 +111,14 @@ else:
     print("{token}")
 """
 GROUP = json.dumps([{"id": 7, "name": "glaeda-minis", "visibility": "selected", "allows_public_repositories": True}])
+
+
+def load_runner_module():
+    loader = importlib.machinery.SourceFileLoader("glaeda_cmux_runner_pins", os.fspath(ROOT / "scripts" / "glaeda-cmux-runner"))
+    spec = importlib.util.spec_from_loader("glaeda_cmux_runner_pins", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
 
 
 class FleetTest(unittest.TestCase):
@@ -197,7 +211,16 @@ class FleetTest(unittest.TestCase):
         applies = [c for c in calls if c["tool"] == "ssh" and "--apply" in c["remote"]]
         self.assertEqual(len(applies), 8)
         self.assertTrue(all(c["stdin"].strip() == TOKEN for c in applies))
-        self.assertEqual(sum(1 for c in calls if c["tool"] == "gh"), 8, "one token per instance")
+        tokens = [c for c in calls if c["tool"] == "gh" and "registration-token" in " ".join(c["argv"])]
+        self.assertEqual(len(tokens), 8, "one token per instance")
+        # "latest" is read once for the whole apply, through the operator's gh, and every instance is told it
+        releases = [c for c in calls if c["tool"] == "gh" and "repos/actions/runner/releases/latest" in c["argv"]]
+        self.assertEqual(len(releases), 1)
+        self.assertEqual(sum(1 for c in calls if c["tool"] == "gh"), 9, "eight tokens and one release read")
+        self.assertTrue(all(f"--latest-runner-version 2.401.0 --latest-runner-sha256 {'d' * 64}" in c["remote"]
+                            for c in applies))
+        self.assertEqual(json.loads(result.stdout)["runnerRelease"],
+                         {"version": "2.401.0", "sha256": "d" * 64, "from": "latest"})
         staged = json.loads((self.dir / "calls.jsonl.mini-a.manifest").read_text())
         self.assertEqual(set(staged["hosts"]), {"mini-a"})
         self.assertEqual(set(staged["defaults"]), {"xcode", "disk", "ios_simulator"},
@@ -298,6 +321,16 @@ class FleetTest(unittest.TestCase):
         self.assertTrue(all("no registration token" in s for s in states))
         self.assertFalse(any(c["tool"] == "ssh" and "--apply" in c["remote"] for c in self.calls()))
 
+
+    def test_an_unreadable_latest_release_tells_every_instance_the_pin(self) -> None:
+        result = self.fleet("--apply", "--hosts", "mini-a", FAKE_NO_RELEASE="1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        runner = load_runner_module()
+        applies = [c for c in self.calls() if c["tool"] == "ssh" and "--apply" in c["remote"]]
+        self.assertEqual(len(applies), 4)
+        self.assertTrue(all(f"--latest-runner-version {runner.PINNED_RUNNER_VERSION} "
+                            f"--latest-runner-sha256 {runner.PINNED_RUNNER_SHA256}" in c["remote"] for c in applies))
+        self.assertEqual(json.loads(result.stdout)["runnerRelease"]["from"], "pinned")
 
     def test_a_failure_before_register_names_the_step(self) -> None:
         result = self.fleet("--apply", "--hosts", "mini-a", FAKE_LAUNCHCTL_FAILS="mini-a")

@@ -35,6 +35,12 @@ The gate checks the manifest's first Xcode for the member; if that app is missin
 not eligible even when a later one would do (safe side). A member that SSH cannot reach is "unreachable", which
 fails an --apply run. Nothing here routes a job: pool variables stay with whoever owns routing.
 
+Runner release. The minis share one public IP, so they must not each ask GitHub's unauthenticated API for the
+latest actions/runner. The first instance that applies reads "latest" here, once per run, through this
+machine's gh, and every instance gets it as --latest-runner-version/--latest-runner-sha256 (the pinned
+fallback in glaeda-cmux-runner when the read fails). A mini uses it only when it has no version to reuse: one an
+instance there already runs, or a tarball in its runner cache (glaeda-cmux-runner resolve_release).
+
 Downgrade guard. Before anything is staged, the run compares this checkout's HEAD with origin's main as origin
 reports it now (git ls-remote: nothing is fetched or written here, and an old checkout's own stale origin/main
 ref cannot vouch for it), and reads every target member's .glaeda-source.json over SSH. --apply refuses,
@@ -65,6 +71,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unicodedata
 from pathlib import Path
@@ -92,6 +99,17 @@ def load_labels() -> Any:
     path = SCRIPT_DIR / "glaeda_fleet_labels.py"
     loader = importlib.machinery.SourceFileLoader("glaeda_fleet_labels", os.fspath(path))
     spec = importlib.util.spec_from_loader("glaeda_fleet_labels", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+@functools.cache
+def load_runner() -> Any:
+    """glaeda-cmux-runner beside this script, as a module: its release parsing and pinned fallback."""
+    path = SCRIPT_DIR / "glaeda-cmux-runner"
+    loader = importlib.machinery.SourceFileLoader("glaeda_cmux_runner_for_fleet", os.fspath(path))
+    spec = importlib.util.spec_from_loader("glaeda_cmux_runner_for_fleet", loader)
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
     return module
@@ -154,6 +172,30 @@ def _quote(text: str) -> str:
 
 def scope_api(repo: str | None, org: str | None) -> str:
     return f"orgs/{org}" if org else f"repos/{repo}"
+
+
+_RELEASE_LOCK = threading.Lock()
+_RELEASE: list[tuple[str, str, str]] = []
+
+
+def latest_release() -> tuple[str, str, str]:
+    """(version, osx-arm64 SHA-256, where from): the actions/runner release a mini installs when it has no
+    version of its own to reuse. Read at most once per run, through this operator's logged-in gh (the minis
+    share one public IP, and 60 unauthenticated reads an hour run out across a fleet apply); the pinned
+    fallback in glaeda-cmux-runner when that read fails. Every instance gets the answer on its command line."""
+    with _RELEASE_LOCK:
+        if not _RELEASE:
+            runner = load_runner()  # main() loaded it once already, so this cannot fail here
+            code, out, _ = run(["gh", "api", f"{runner.RUNNER_RELEASE_API}/latest"], 60)
+            try:
+                found = runner.release_from_doc(json.loads(out)) if code == 0 else {"state": "blocked"}
+            except ValueError:
+                found = {"state": "blocked"}
+            if found.get("state") == "ok":
+                _RELEASE.append((found["version"], found["sha256"], "latest"))
+            else:
+                _RELEASE.append((runner.PINNED_RUNNER_VERSION, runner.PINNED_RUNNER_SHA256, "pinned"))
+        return _RELEASE[0]
 
 
 def mint(scope: str, kind: str = "registration-token") -> str | None:
@@ -522,8 +564,10 @@ def apply_instance(member: str, instance: int, repo: str | None, extra: list[str
             return {"instance": instance, "exit": None,
                     "state": f"registered to {scope}, not {migrate_from} or {org}; nothing changed"}
     scope = f"--org {_quote(org)}" + (f" --group {_quote(group)}" if group else "") if org else f"--repo {_quote(repo)}"
+    version, sha, _ = latest_release()
     remote = (f"~/{REMOTE_DIR}/scripts/glaeda-cmux-runner --apply --token-stdin {scope} "
               f"--manifest ~/{REMOTE_DIR}/mini-fleet.json --member {_quote(member)} --instance {instance} "
+              f"--latest-runner-version {_quote(version)} --latest-runner-sha256 {_quote(sha)} "
               "--output json " + " ".join(_quote(a) for a in extra))
     code, out, err = run(["ssh", *SSH_OPTIONS, member, remote], APPLY_TIMEOUT_S, stdin=token + "\n")
     del token
@@ -660,6 +704,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"glaeda-cmux-runner-fleet: --allow-downgrade needs a reason, at most {MAX_REASON} characters",
                   file=sys.stderr)
             return 2
+    try:  # its release parsing and pin: a broken copy fails here, before any token is minted
+        load_runner()
+    except Exception as error:  # noqa: BLE001
+        print(f"glaeda-cmux-runner-fleet: cannot load glaeda-cmux-runner beside this script "
+              f"({type(error).__name__})", file=sys.stderr)
+        return 2
     if args.migrate_from_repo:
         args.jobs = 1  # one member at a time, so the rest keep serving the old scope
     only = [h for h in (args.hosts or "").split(",") if h] or None
@@ -689,8 +739,9 @@ def main(argv: list[str] | None = None) -> int:
         rows = [f.result() for f in concurrent.futures.as_completed(futures)]
     rows.sort(key=lambda r: r["member"])
     if args.output == "json":
-        print(json.dumps({"applied": args.apply, "members": rows, "skipped": skipped, "source": guard}, indent=2,
-                         sort_keys=True))
+        release = dict(zip(("version", "sha256", "from"), _RELEASE[0])) if _RELEASE else None
+        print(json.dumps({"applied": args.apply, "members": rows, "skipped": skipped, "source": guard,
+                          "runnerRelease": release}, indent=2, sort_keys=True))
     else:
         print(render(rows, skipped, args.apply, guard))
     failed = any(r.get("action") == "failed" or str(r.get("action", "")).startswith("stage failed")
