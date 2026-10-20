@@ -54,7 +54,8 @@ refuses. After a warmup, a sustained low-CPU job may release surplus capacity un
 through its holder; each release is logged as a "capacity_release" line. The existing load gate remains the
 safety brake. glaeda-fleet-status reads the completed lines (source "jobs").
 
-job-completed stops the sampler (it writes the record), runs the same disk pressure pass and always exits 0. A
+job-completed stops the sampler (it writes the record), starts the same disk pressure pass detached (bounded
+by the same timeout, so the runner takes its next job at once) and always exits 0. A
 cmux compile admission may leave a bounded `glaeda-compile-telemetry.json` in `RUNNER_TEMP`; the completed
 record embeds its cache and phase counters after validating the run identity.
 
@@ -1127,9 +1128,52 @@ def evict(path: str, min_free_gib: float, explicit: str | None) -> str:
     EVICT_TIMEOUT_S. Under the floor, free space is below glaeda-disk's emergency mark (20 GiB above the floor), so
     it deletes even while CI jobs run on this mini; it frees idle caches up to its runner target. glaeda-disk
     never deletes the Chromium trees (NEVER_DELETE) or anything a running job has open, names or marks busy.
+    When a pass already holds glaeda-disk's evict.lock (job-completed starts one detached), it waits for that one
+    within the same budget, then runs its own only if still under the floor.
     Returns a one-line note with the space freed; never raises."""
     before = free_or_none(path)
-    return evicted(path, min_free_gib, disk_pressure(explicit, min_free_gib, EVICT_TIMEOUT_S), before)
+    start = time.monotonic()
+    deadline = start + EVICT_TIMEOUT_S
+    if not wait_for_running_pass(deadline):
+        return evicted(path, min_free_gib, disk_pressure(explicit, min_free_gib, EVICT_TIMEOUT_S), before)
+    # job-completed's detached pass (or the gate's, or the LaunchAgent's) held glaeda-disk's evict.lock: a pass of
+    # our own would have skipped as busy and refused this job while space was being freed
+    waited = f"waited {time.monotonic() - start:.0f} s for a running glaeda-disk pass"
+    if not disk_refusal(path, min_free_gib):
+        return evicted(path, min_free_gib, waited, before)
+    ran = disk_pressure(explicit, min_free_gib, max(1.0, deadline - time.monotonic()))
+    return evicted(path, min_free_gib, f"{waited}; {ran}", before)
+
+
+def evict_lock_path() -> Path:
+    """glaeda-disk's EVICT_LOCK: one --apply at a time across the runner hooks, the gate and the LaunchAgent."""
+    return Path.home() / ".cache" / "glaeda-disk" / "evict.lock"
+
+
+def wait_for_running_pass(deadline: float) -> bool:
+    """Wait until no glaeda-disk --apply holds its evict.lock, at most until deadline (monotonic). True when one held
+    it. Probes with a shared non-blocking flock, as glaeda-disk's eviction_lock_is_held does, and never keeps it."""
+    try:
+        fd = os.open(evict_lock_path(), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return False  # no lock file: no pass has ever run
+    held = False
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                held = True
+                if time.monotonic() >= deadline:
+                    return held
+                time.sleep(0.25)
+                continue
+            except OSError:
+                return held
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return held
+    finally:
+        os.close(fd)
 
 
 def root_number(spec: str, roots: int = 99) -> int | None:
@@ -4733,6 +4777,60 @@ def disk_pressure(explicit: str | None, floor_gib: float = 0.0, timeout: float =
         return f"glaeda-disk skipped: {type(error).__name__}"
 
 
+DISK_BOUND = """import subprocess, sys
+try:
+    subprocess.run(sys.argv[2:], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                   timeout=float(sys.argv[1]), check=False)
+except (OSError, subprocess.TimeoutExpired):
+    pass
+"""
+
+
+def disk_pressure_detached(explicit: str | None, timeout: float = DISK_TIMEOUT_S) -> str:
+    """job-completed's pass: the same glaeda-disk run, bounded by the same timeout, in a detached process, so the
+    runner takes its next job at once ("Complete runner" took 121-124 s on main's macOS jobs while job-completed
+    waited on it, and dependent jobs waited for those outputs). glaeda-disk's evict.lock keeps one --apply at a time,
+    so the LaunchAgent's pass meanwhile skips rather than racing it, and job-started's floor eviction
+    waits for it (wait_for_running_pass). The child leaves the runner's
+    session and execs with RUNNER_TRACKING_ID dropped, so the runner's orphan cleanup does not kill it, and closes every
+    inherited fd, so it holds no lock of this job's. Best effort: returns a note, never raises."""
+    try:
+        argv = disk_argv(explicit)
+        if argv is None:
+            return "glaeda-disk not installed; skipped"
+        timeout = float(os.environ.get("GLAEDA_RUNNER_DISK_TIMEOUT") or timeout)
+        env = {key: value for key, value in os.environ.items() if key != "RUNNER_TRACKING_ID"}
+        child = os.fork()
+    except Exception as error:  # noqa: BLE001  (never fail the job on housekeeping)
+        return f"glaeda-disk skipped: {type(error).__name__}"
+    if child == 0:  # detach twice so the runner never waits on the pass
+        try:
+            os.setsid()
+            # the middle process exits only once the pass has exec'd (the close-on-exec end reads EOF), so when the
+            # hook returns no process of this job's environment, RUNNER_TRACKING_ID included, is left to clean up
+            execd, execing = os.pipe()  # both close-on-exec
+            if os.fork():
+                os.close(execing)
+                with contextlib.suppress(OSError):
+                    select.select([execd], [], [], 10)
+                os._exit(0)
+            os.close(execd)
+            null = os.open(os.devnull, os.O_RDWR)
+            for std in (0, 1, 2):  # the runner reads the hook's output until EOF
+                os.dup2(null, std)
+            limit = os.sysconf("SC_OPEN_MAX")
+            limit = limit if limit > 0 else 65536
+            os.closerange(3, execing)
+            os.closerange(execing + 1, limit)
+            # exec, so the bounding process's own environment is clean too, not only glaeda-disk's
+            os.execve(sys.executable, [sys.executable, "-c", DISK_BOUND, f"{timeout:g}", *argv], env)
+        finally:
+            os._exit(0)
+    with contextlib.suppress(OSError):
+        os.waitpid(child, 0)
+    return f"glaeda-disk started in the background (bounded by {timeout:g} s)"
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog=PREFIX)
     p.add_argument("phase", choices=("job-started", "job-completed", "check", "listen", "take-root", "take-gui",
@@ -5049,7 +5147,8 @@ def main(argv: list[str] | None = None) -> int:
         if skip_disk:  # nothing ran, so nothing to free; the runner is back on the queue at once
             print(f"{PREFIX}: refused in job-started; no disk pass", flush=True)
     if not args.no_disk and not skip_disk:
-        print(f"{PREFIX}: {disk_pressure(args.disk)}", flush=True)
+        note = disk_pressure_detached(args.disk) if args.phase == "job-completed" else disk_pressure(args.disk)
+        print(f"{PREFIX}: {note}", flush=True)
     return 0
 
 

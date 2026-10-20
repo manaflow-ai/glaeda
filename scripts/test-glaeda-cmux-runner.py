@@ -208,6 +208,14 @@ def make_executable(path: Path, text: str) -> Path:
     return path
 
 
+def wait_for_path(path: Path, seconds: float = 10) -> bool:
+    """job-completed starts glaeda-disk detached: what the pass writes appears after the hook returns."""
+    deadline = time.monotonic() + seconds
+    while not path.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    return path.exists()
+
+
 def event(tmp: Path, name: str, payload: dict) -> Path:
     path = tmp / f"{name}.json"
     path.write_text(json.dumps(payload))
@@ -512,7 +520,7 @@ class HookTest(unittest.TestCase):
         other = self.run_hook("job-completed", None, None, "--disk", os.fspath(disk), "--state-dir", state,
                               "--watch-pid", "4343")
         self.assertEqual(other.returncode, 0)
-        self.assertTrue(marker.exists(), "another runner's job on the mini still runs its disk pass")
+        self.assertTrue(wait_for_path(marker), "another runner's job on the mini still runs its disk pass")
         marker.unlink()
         done = self.run_hook("job-completed", None, None, "--disk", os.fspath(disk), "--state-dir", state,
                              "--watch-pid", "4242")
@@ -522,7 +530,42 @@ class HookTest(unittest.TestCase):
         again = self.run_hook("job-completed", None, None, "--disk", os.fspath(disk), "--state-dir", state,
                               "--watch-pid", "4242")
         self.assertEqual(again.returncode, 0)
-        self.assertTrue(marker.exists(), "the refusal's note is used once")
+        self.assertTrue(wait_for_path(marker), "the refusal's note is used once")
+
+    def test_job_completed_disk_pass_runs_detached_and_bounded(self) -> None:
+        """job-completed held its runner up to DISK_TIMEOUT_S (120 s) on glaeda-disk: "Complete runner" took 121-124 s
+        on main's macOS jobs, and dependent jobs waited for it. The pass now runs detached, still bounded."""
+        marker = self.dir / "disk-pass"
+        slow = make_executable(self.dir / "glaeda-disk-slow", "import os, pathlib, sys, time\n"
+                               f"pathlib.Path({os.fspath(marker)!r}).write_text(' '.join([str(os.getpid()), "
+                               "str(os.getppid()), str(os.getsid(0)), os.environ.get('RUNNER_TRACKING_ID', '-'), "
+                               "*sys.argv[1:]]))\n"
+                               "time.sleep(60)\n")
+        start = time.monotonic()
+        result = self.run_hook("job-completed", None, None, "--disk", os.fspath(slow),
+                               "--state-dir", os.fspath(self.dir / "state"),
+                               env={"GLAEDA_RUNNER_DISK_TIMEOUT": "20", "RUNNER_TRACKING_ID": "github_job"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertLess(time.monotonic() - start, 15, "job-completed waited on glaeda-disk")
+        self.assertIn("glaeda-disk started in the background", result.stdout)
+        self.assertTrue(wait_for_path(marker), "the detached pass never ran")
+        pid, bound, sid, tracking, *argv = marker.read_text().split()
+        environ = Path(f"/proc/{bound}/environ")  # the bounding process's own environment block
+        if environ.exists():
+            self.assertNotIn(b"RUNNER_TRACKING_ID=", environ.read_bytes())
+        elif sys.platform == "darwin":  # what the runner's orphan cleanup reads on a mini
+            shown = subprocess.run(["ps", "-E", "-ww", "-o", "command=", "-p", bound], capture_output=True,
+                                   text=True, check=False).stdout
+            self.assertIn("python", shown.lower())
+            self.assertNotIn("RUNNER_TRACKING_ID=", shown)
+        self.assertEqual(argv, ["--pressure", "--apply", "--top", "0"])
+        self.assertEqual(tracking, "-", "the runner's orphan cleanup would kill a pass carrying RUNNER_TRACKING_ID")
+        self.assertNotEqual(int(sid), os.getsid(0), "the pass must leave the runner's session")
+        self.assertTrue(hook.pid_alive(int(pid)), "the pass outlives job-completed")
+        deadline = time.monotonic() + 40  # bounded: killed at GLAEDA_RUNNER_DISK_TIMEOUT, not left for 60 s
+        while hook.pid_alive(int(pid)) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        self.assertFalse(hook.pid_alive(int(pid)), "the detached pass ran past its timeout")
 
     # ------------------------------------------------------------ host lock, reservation, disk floor
 
@@ -630,6 +673,58 @@ class HookTest(unittest.TestCase):
                                os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()), repo="manaflow-ai/cmux")
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertEqual(marker.read_text(), "--pressure --apply --top 0")
+
+    def hold_evict_lock(self, seconds: float) -> subprocess.Popen:
+        """A glaeda-disk --apply as job-completed's detached pass leaves it: holding evict.lock under this HOME."""
+        lock = self.dir / ".cache" / "glaeda-disk" / "evict.lock"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        holder = subprocess.Popen([sys.executable, "-c", "import fcntl, sys, time\n"
+                                   f"handle = open({os.fspath(lock)!r}, 'a')\n"
+                                   "fcntl.flock(handle, fcntl.LOCK_EX)\nprint('held', flush=True)\n"
+                                   f"time.sleep({seconds})\n"], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: (holder.kill(), holder.wait(), holder.stdout.close()))
+        self.assertEqual(holder.stdout.readline().strip(), "held")
+        return holder
+
+    def test_floor_eviction_waits_for_a_running_pass_then_runs_its_own(self) -> None:
+        """job-completed's pass now runs detached, so the runner's next job-started can find it still holding
+        evict.lock; a pass of its own would skip as busy and the job be refused while space is being freed."""
+        self.fleet()
+        marker = self.dir / "disk-ran"
+        disk = make_executable(self.dir / "glaeda-disk-fake", "import pathlib, sys, time\n"
+                               f"pathlib.Path({os.fspath(marker)!r}).write_text(str(time.time()))\n")
+        self.hold_evict_lock(3)
+        released = time.time() + 2  # the holder sleeps 3 s after it printed; allow a second of slack
+        push = event(self.dir, "push", {"repository": CMUX})
+        result = self.run_hook("job-started", "push", push, "--allowed-repo", "manaflow-ai/cmux", "--disk",
+                               os.fspath(disk), "--min-free-gib", "999999999", "--state-dir",
+                               os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()), repo="manaflow-ai/cmux")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertRegex(result.stdout, r"disk floor: waited [0-9]+ s for a running glaeda-disk pass; "
+                                        r"glaeda-disk exited 0, freed")
+        self.assertGreater(float(marker.read_text()), released, "its own pass ran only once the lock was free")
+        self.assertIn("GiB required", result.stdout)
+
+    def test_floor_eviction_skips_its_own_pass_when_the_running_one_freed_enough(self) -> None:
+        self.hold_evict_lock(1)
+        with mock.patch.dict(os.environ, {"HOME": os.fspath(self.dir)}), \
+                mock.patch.object(hook, "disk_refusal", return_value=None) as refusal, \
+                mock.patch.object(hook, "disk_pressure") as pressure:
+            note = hook.evict(os.fspath(self.dir), 100, None)
+        pressure.assert_not_called()
+        refusal.assert_called_once_with(os.fspath(self.dir), 100)
+        self.assertRegex(note, r"under the 100 GiB disk floor: waited [0-9]+ s for a running glaeda-disk pass, freed")
+
+    def test_floor_eviction_waits_for_a_running_pass_at_most_its_budget(self) -> None:
+        self.hold_evict_lock(60)
+        start = time.monotonic()
+        with mock.patch.dict(os.environ, {"HOME": os.fspath(self.dir)}), \
+                mock.patch.object(hook, "EVICT_TIMEOUT_S", 1), \
+                mock.patch.object(hook, "disk_pressure", return_value="glaeda-disk exited 0") as pressure:
+            note = hook.evict(os.fspath(self.dir), 999999999, None)
+        self.assertLess(time.monotonic() - start, 10)
+        self.assertRegex(note, r"waited [0-9]+ s for a running glaeda-disk pass; glaeda-disk exited 0")
+        self.assertLessEqual(pressure.call_args.args[2], 1.0)
 
     def test_job_started_eviction_is_bounded_by_its_own_timeout(self) -> None:
         with mock.patch.object(hook, "disk_argv", return_value=["glaeda-disk"]), \
