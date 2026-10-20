@@ -225,15 +225,16 @@ class Base(unittest.TestCase):
         global NOW
         NOW = float(int(time.time()))
         self.tmp = tempfile.TemporaryDirectory()
-        self.saved = (gg.BASE, gg.WAIT_POLL, gg.DOWN_GRACE)
+        self.saved = (gg.BASE, gg.WAIT_POLL, gg.DOWN_GRACE, gg.DOWN_PATIENCE)
         gg.BASE = Path(self.tmp.name) / "gh"
         gg.WAIT_POLL = 0.05
         gg.DOWN_GRACE = 0.3
+        gg.DOWN_PATIENCE = 0.6
         self.gh = FakeGitHub()
         self.daemon = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=None)
 
     def tearDown(self) -> None:
-        gg.BASE, gg.WAIT_POLL, gg.DOWN_GRACE = self.saved
+        gg.BASE, gg.WAIT_POLL, gg.DOWN_GRACE, gg.DOWN_PATIENCE = self.saved
         self.tmp.cleanup()
 
     def age_watch(self, key: str, seconds: float) -> None:
@@ -1005,10 +1006,32 @@ class DaemonTest(Base):
             gg.serve()
         doc = gg.read_json(gg.BASE / "daemon.json")
         self.assertNotIn("failing", doc)
-        self.assertEqual((doc["at"], doc["lastHour"]), (now, {"rest": 3}))  # the rest is left alone
+        self.assertEqual(doc["lastHour"], {"rest": 3})  # the rest is left alone
+        self.assertGreaterEqual(doc["at"], now)  # and the new process's first heartbeat is written at once
         self.assertIsNone(gg.daemon_failing())
         gg.clear_failing()  # nothing to clear: a no-op
         self.assertEqual(gg.read_json(gg.BASE / "daemon.json"), doc)
+
+    def test_restarted_daemon_does_not_look_hung_before_its_first_tick(self) -> None:
+        """10-20: daemon.json kept the hung process's heartbeat until the new one finished a tick,
+        so every session read "looks hung" again and kickstarted it, killing it in that first tick."""
+        gg.BASE.mkdir(parents=True, exist_ok=True)
+        gg.write_json(gg.BASE / "daemon.json", {"pid": 1, "at": time.time() - gg.STALE_HEARTBEAT - 400,
+                                                 "heartbeat": 30, "watching": 27})
+        self.assertIsNotNone(gg.daemon_stale())
+
+        class Stop(Exception):
+            pass
+
+        def stop(*args, **kwargs):
+            self.assertIsNone(gg.daemon_stale())  # before the first tick, not after it
+            raise Stop
+
+        with mock.patch.object(gg, "Daemon", stop), self.assertRaises(Stop):
+            gg.serve()
+        doc = gg.read_json(gg.BASE / "daemon.json")
+        self.assertEqual((doc["pid"], doc["watching"]), (os.getpid(), 27))
+        self.assertEqual(doc["startedAt"], doc["at"])
 
 
 def workflow_check(name: str, run_id: int, workflow: str = "CI", conclusion: str | None = "SUCCESS",
@@ -1476,6 +1499,35 @@ class ClientTest(Base):
         self.assertIn("daemon is not running", err.getvalue())
         self.assertIn("Start it: ", err.getvalue())
         self.assertFalse(gg.watch_dir().exists())  # no interest registered, nothing polled
+
+    def test_wait_rides_out_a_restart(self) -> None:
+        """A wait that finds the daemon down keeps waiting for it (launchd can hold a respawn back for
+        30 s) instead of exiting 3 and having its session kickstart it again."""
+        self.lock.close()
+        gg.DOWN_PATIENCE = 30
+        holder = open(gg.BASE / "daemon.lock", "a+")
+        back = threading.Timer(0.8, lambda: fcntl.flock(holder, fcntl.LOCK_EX))
+        back.start()
+        try:
+            code, text = self.wait("pr", "o/r#1", timeout=1.6, fill=(gg.parse_pr(pr_node(1, rollup="SUCCESS",
+                                                                     checks=[check_run("a")])), {}))
+        finally:
+            back.join()
+            holder.close()
+        self.assertEqual(code, 0, text)
+        self.assertEqual(text.count("waiting up to 30s"), 1)
+        self.assertNotIn("not running, so nothing", text)
+
+    def test_down_after_a_restart_says_wait(self) -> None:
+        self.lock.close()
+        gg.write_json(gg.BASE / "restart.json", {"at": time.time() - 20, "by": 1, "how": "launchctl kickstart"})
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gg.cmd_budget(False), 3)
+        self.assertIn("restarted it 20s ago", err.getvalue())
+        self.assertIn("Do not restart it again", err.getvalue())
+        gg.write_json(gg.BASE / "restart.json", {"at": time.time() - gg.RESTART_COOLDOWN - 1})
+        self.assertEqual(gg.down_message(), gg.DOWN)
 
     def test_hung_daemon_is_reported(self) -> None:
         gg.write_json(gg.BASE / "daemon.json", {"at": time.time() - gg.STALE_HEARTBEAT - 60, "heartbeat": 30})
@@ -2452,6 +2504,193 @@ class ServeGuardTest(unittest.TestCase):
                 mock.patch.object(gg, "under_service", return_value=False):
             self.assertEqual(gg.main(["serve"]), 0)
         serve.assert_called_once_with(False)
+
+
+class RestartTest(Base):
+    """`glaeda-gh restart`: however many sessions run it, the service is restarted once."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        gg.BASE.mkdir(parents=True)
+        self.calls: list[bool] = []
+        patcher = mock.patch.object(gg, "restart_service", side_effect=self.fake_restart)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.lock: Any = None
+        self.addCleanup(lambda: self.lock and self.lock.close())
+
+    def fake_restart(self, hung: bool) -> tuple[bool, str]:
+        self.calls.append(hung)
+        if self.lock is not None:
+            self.lock.close()  # the old daemon is gone
+        self.lock = open(gg.BASE / "daemon.lock", "a+")
+        fcntl.flock(self.lock, fcntl.LOCK_EX)  # the new daemon takes its lock
+        gg.first_heartbeat()  # and writes its heartbeat at once
+        return True, "launchctl kickstart"
+
+    def run_restart(self, force: bool = False) -> tuple[int, str]:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            code = gg.cmd_restart(force)
+        return code, out.getvalue()
+
+    def hold(self, stale: bool) -> None:
+        self.lock = open(gg.BASE / "daemon.lock", "a+")
+        fcntl.flock(self.lock, fcntl.LOCK_EX)
+        lag = gg.STALE_HEARTBEAT + 60 if stale else 5
+        gg.write_json(gg.BASE / "daemon.json", {"pid": 1, "at": time.time() - lag, "heartbeat": 30})
+
+    def test_down_daemon_is_started_once(self) -> None:
+        code, text = self.run_restart()
+        self.assertEqual((code, self.calls), (0, [False]), text)
+        self.assertIn("restarted the daemon", text)
+        self.lock.close()  # down again at once: the next session is told to wait, not to restart
+        self.lock = None
+        code, text = self.run_restart()
+        self.assertEqual((code, self.calls), (0, [False]), text)
+        self.assertIn("Do not restart it again", text)
+
+    def test_hung_daemon_is_restarted(self) -> None:
+        self.hold(stale=True)
+        with mock.patch.object(gg, "lock_holder", return_value=None):
+            code, text = self.run_restart()
+        self.assertEqual((code, self.calls), (0, [True]), text)
+        self.assertEqual(gg.restart_record()["how"], "launchctl kickstart")
+
+    def test_hung_holder_is_stopped_and_not_killed_twice(self) -> None:
+        self.hold(stale=True)
+        with mock.patch.object(gg, "lock_holder", return_value={"pid": 4321, "silent": gg.STALE_HEARTBEAT + 60}), \
+                mock.patch.object(gg, "is_serve", return_value=True), \
+                mock.patch.object(gg, "stop_process", return_value=True) as stop:
+            code, text = self.run_restart()
+        stop.assert_called_once_with(4321)
+        self.assertEqual((code, self.calls), (0, [False]), text)  # launchd respawns it: no kickstart -k on top
+        self.assertIn("pid 4321", gg.restart_record()["how"])
+
+    def test_a_surviving_hung_holder_is_not_success(self) -> None:
+        """A lock still held by the hung daemon proves nothing: success is a new heartbeat."""
+        self.hold(stale=True)
+        gg.RESTART_SETTLE, saved = 0.3, gg.RESTART_SETTLE
+        self.addCleanup(setattr, gg, "RESTART_SETTLE", saved)
+        with mock.patch.object(gg, "restart_service", return_value=(True, "launchctl kickstart")), \
+                mock.patch.object(gg, "lock_holder", return_value=None):
+            code, text = self.run_restart()
+        self.assertEqual(code, 3, text)
+        self.assertIn("Tell the user", text)
+        self.assertFalse(gg.restart_record()["ok"])
+        self.assertIsNone(gg.recent_restart())  # a failed restart starts no cooldown
+        self.assertEqual(gg.down_message(), gg.DOWN)
+
+    def test_stop_process_escalates_to_sigkill(self) -> None:
+        child = subprocess.Popen([sys.executable, "-c",
+                                  "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); print(1, flush=True); time.sleep(60)"],
+                                 stdout=subprocess.PIPE)
+        child.stdout.readline()  # SIGTERM is ignored from here on
+        saved = gg.TAKEOVER_GRACE
+        gg.TAKEOVER_GRACE = 0.5
+        reaper = threading.Thread(target=child.wait)
+        reaper.start()
+        try:
+            self.assertTrue(gg.stop_process(child.pid))
+        finally:
+            gg.TAKEOVER_GRACE = saved
+            child.kill()
+            reaper.join()
+            child.stdout.close()
+        self.assertEqual(child.returncode, -signal.SIGKILL)
+
+    def test_healthy_daemon_is_left_alone(self) -> None:
+        self.hold(stale=False)
+        code, text = self.run_restart()
+        self.assertEqual((code, self.calls), (0, []), text)
+        self.assertIn("nothing to restart", text)
+
+    def test_concurrent_restarts_restart_once(self) -> None:
+        guard = open(gg.BASE / "restart.lock", "a+")
+        fcntl.flock(guard, fcntl.LOCK_EX)  # another session is in the middle of a restart
+        try:
+            code, text = self.run_restart()
+        finally:
+            guard.close()
+        self.assertEqual((code, self.calls), (0, []), text)
+        self.assertIn("another session is restarting", text)
+
+    def test_many_sessions_at_once(self) -> None:
+        self.hold(stale=True)
+        results: list[int] = []
+        with mock.patch.object(gg, "lock_holder", return_value=None):
+            threads = [threading.Thread(target=lambda: results.append(gg.cmd_restart())) for _ in range(10)]
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
+        self.assertEqual(self.calls, [True])
+        self.assertEqual(results, [0] * 10)
+
+    def test_failing_daemon_is_not_restarted(self) -> None:
+        self.hold(stale=False)
+        now = time.time()
+        gg.write_json(gg.BASE / "daemon.json", {"pid": 1, "at": now, "heartbeat": 30, "failing": {
+            "error": "KeyError", "site": "x", "since": now - gg.FAILING_AFTER - 1, "count": 9}})
+        code, text = self.run_restart()
+        self.assertEqual((code, self.calls), (3, []), text)
+        self.assertIn("Restarting it will not fix this", text)
+
+
+class LaunchdRestartTest(unittest.TestCase):
+    def run_with(self, answers: dict[str, int], state: str | None = None, hung: bool = True) -> tuple[tuple, list]:
+        seen: list[list[str]] = []
+
+        def fake(argv: list[str], timeout: float | None = None) -> subprocess.CompletedProcess:
+            seen.append(argv)
+            return subprocess.CompletedProcess(argv, answers.get(argv[1], 0), "", "")
+
+        with mock.patch.object(gg.sys, "platform", "darwin"), mock.patch.object(gg, "run_bounded", fake), \
+                mock.patch.object(gg, "launchd_state", return_value=state):
+            return gg.restart_service(hung), seen
+
+    def test_kickstart(self) -> None:
+        (ok, how), seen = self.run_with({})
+        self.assertTrue(ok)
+        self.assertEqual([a[:3] for a in seen], [["launchctl", "kickstart", "-k"]])
+
+    def test_bootstrap_is_retried_while_bootout_settles(self) -> None:
+        calls = {"n": 0}
+
+        def fake(argv: list[str], timeout: float | None = None) -> subprocess.CompletedProcess:
+            if argv[1] == "bootstrap":
+                calls["n"] += 1
+                return subprocess.CompletedProcess(argv, 5 if calls["n"] < 3 else 0, "", "")
+            return subprocess.CompletedProcess(argv, 5 if argv[1] == "kickstart" else 0, "", "")
+
+        with mock.patch.object(gg.sys, "platform", "darwin"), mock.patch.object(gg, "run_bounded", fake), \
+                mock.patch.object(gg, "launchd_state", return_value=None), mock.patch.object(gg.time, "sleep"):
+            ok, how = gg.restart_service(True)
+        self.assertTrue(ok)
+        self.assertEqual(calls["n"], 3)
+
+    def test_linux_resets_a_start_limit_first(self) -> None:
+        seen: list[list[str]] = []
+
+        def fake(argv: list[str], timeout: float | None = None) -> subprocess.CompletedProcess:
+            seen.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with mock.patch.object(gg.sys, "platform", "linux"), mock.patch.object(gg, "run_bounded", fake):
+            self.assertTrue(gg.restart_service(True)[0])
+        self.assertEqual([a[2] for a in seen], ["reset-failed", "restart"])
+
+    def test_error_5_reloads_once(self) -> None:
+        (ok, how), seen = self.run_with({"kickstart": 5})
+        self.assertTrue(ok)
+        self.assertEqual([a[1] for a in seen], ["kickstart", "bootout", "bootstrap"])
+        self.assertIn("exit 5", how)
+
+    def test_scheduled_respawn_is_left_to_launchd(self) -> None:
+        (ok, how), seen = self.run_with({}, state="spawn scheduled", hung=False)
+        self.assertTrue(ok)
+        self.assertEqual(seen, [])
 
 
 class RestartHintTest(unittest.TestCase):

@@ -9,6 +9,7 @@
     glaeda-gh wait comment OWNER/REPO#N [--author LOGIN] [--match REGEX] [--since ID|URL|TIME|10m]
     glaeda-gh status comment OWNER/REPO#N               the latest comments on an issue or PR
     glaeda-gh budget [--json]                           REST and GraphQL quota as last seen
+    glaeda-gh restart [--force]                         restart a down or hung daemon, once for every session
 
 Many sessions share one GitHub account and so one REST quota (5000 requests an hour). Each
 session polling its own PRs and runs used it up while the separate GraphQL quota sat idle. Here
@@ -138,6 +139,13 @@ MAX_BODY = 8 * 1024 * 1024
 WAIT_POLL = 3  # clients re-read the cache this often
 TOUCH_EVERY = 30  # clients refresh their interest this often
 DOWN_GRACE = 5.0  # clients look this long for the daemon before calling it down (it re-executes on update)
+# A wait that finds the daemon down keeps waiting this long before it gives up: launchd holds a
+# respawn back for up to ThrottleInterval (30 s) after a short run, and on 10-20 every wait that
+# exited in that window had its session kickstart the daemon again, killing the one just started.
+DOWN_PATIENCE = 90
+RESTART_COOLDOWN = 180  # `glaeda-gh restart` within this long of the last one waits instead of restarting again
+RESTART_SETTLE = 45  # how long `restart` waits for a new daemon's heartbeat
+BOOTSTRAP_RETRY = 10  # launchctl bootstrap is retried this long after bootout
 HEARTBEAT_EVERY = 30  # the daemon rewrites daemon.json at least this often
 # A request's socket timeout bounds each read, not the request: a server that trickles bytes, or a tick
 # of many slow reads, kept one 10-20 daemon silent for 20 minutes. So every request also has a hard
@@ -1587,6 +1595,19 @@ def clear_failing() -> None:
         write_json(BASE / "daemon.json", status)
 
 
+def first_heartbeat(now: float | None = None) -> None:
+    """Write a heartbeat as soon as the lock is ours, before the first tick (which can take
+    TICK_BUDGET and more). Until then daemon.json held the previous process's last heartbeat, so a
+    restarted daemon still looked hung, and on 10-20 each session that read that restarted it again,
+    killing the new daemon inside its first tick."""
+    now = time.time() if now is None else now
+    status = read_json(BASE / "daemon.json")
+    status = status if isinstance(status, dict) else {}
+    status.pop("failing", None)
+    write_json(BASE / "daemon.json", {**status, "pid": os.getpid(), "at": now, "startedAt": now,
+                                      "heartbeat": HEARTBEAT_EVERY})
+
+
 class Watchdog:
     """Exits the process (EXIT_WATCHDOG) once the serve loop has not come round for `limit` seconds,
     so launchd (KeepAlive) or systemd (Restart=always) starts a fresh daemon. A thread, so it fires
@@ -1724,7 +1745,7 @@ def serve(foreground_ok: bool = False) -> int:
     BASE.mkdir(parents=True, exist_ok=True, mode=0o700)
     lock = open(BASE / "daemon.lock", "a+")
     acquire_lock(lock)
-    clear_failing()
+    first_heartbeat()
     me = Path(__file__).resolve()
     stamp = me.stat().st_mtime
     daemon = Daemon()
@@ -1794,7 +1815,7 @@ def serve_refusal() -> str:
     return (f"serve: refusing to start: {where}, and it runs the daemon. A serve started from a shell only "
             "waits for its lock, or takes it and stops every session's waits when it hangs or its shell goes "
             "away (10-20). Do not run serve yourself. If the daemon is down or hung: "
-            f"{start_hint(restart=True)}. To run one in the foreground anyway (debugging): "
+            f"{RESTART_ADVICE}. To run one in the foreground anyway (debugging): "
             "glaeda-gh serve --foreground-ok")
 
 
@@ -1851,8 +1872,58 @@ def start_hint(restart: bool = False) -> str:
     return "systemctl --user start glaeda-gh (systemctl --user status glaeda-gh says why it stopped)"
 
 
+# Every client message names this one command, never launchctl or systemctl: on 10-20 about ten
+# sessions each ran `launchctl kickstart -k` on the same advice, every kickstart killed the daemon the
+# last one had just started, and launchd throttled the respawns ("spawn scheduled", "spawn failed").
+# `restart` is single-flight: one session restarts the daemon, the others are told to wait.
+RESTART_ADVICE = ("glaeda-gh restart (safe to run from many sessions at once: one of them restarts it and the "
+                  "others are told to wait; do not run launchctl or systemctl yourself)")
+
 DOWN = ("glaeda-gh: the daemon is not running, so nothing is polling GitHub; do not poll GitHub yourself "
-        "instead. Start it: " + start_hint() + ". If it was never installed: glaeda-mini-setup --hygiene-only --apply.")
+        "instead. Start it: " + RESTART_ADVICE + ". If it was never installed: glaeda-mini-setup --hygiene-only --apply.")
+
+
+class DownWait:
+    """A wait that finds the daemon down: say so once, keep waiting DOWN_PATIENCE (or to the wait's
+    own timeout), then print down_message and give up."""
+
+    def __init__(self) -> None:
+        self.said = False
+
+    def patient(self, down_since: float, start: float, timeout: float) -> bool:
+        now = time.monotonic()
+        if now - down_since >= DOWN_PATIENCE or now - start >= timeout:
+            print(down_message(), file=sys.stderr)
+            return False
+        if not self.said:
+            print(f"glaeda-gh: the daemon is not running; waiting up to {DOWN_PATIENCE}s for it to come back "
+                  "(a restart can take that long). Do not restart it from here.", file=sys.stderr)
+            self.said = True
+        return True
+
+
+def restart_record() -> dict | None:
+    record = read_json(BASE / "restart.json")
+    return record if isinstance(record, dict) and isinstance(record.get("at"), (int, float)) else None
+
+
+def recent_restart(now: float | None = None) -> float | None:
+    """Seconds since the last `glaeda-gh restart`, while that is under RESTART_COOLDOWN. A restart that
+    failed does not count: sessions must not be told to wait on a restart that did not happen."""
+    record = restart_record()
+    if record is None or record.get("ok") is False:
+        return None
+    ago = (time.time() if now is None else now) - record["at"]
+    return ago if 0 <= ago < RESTART_COOLDOWN else None
+
+
+def down_message() -> str:
+    ago = recent_restart()
+    if ago is None:
+        return DOWN
+    return (f"glaeda-gh: the daemon is not running yet; a session restarted it {int(ago)}s ago and launchd can "
+            "hold a respawn back for 30s. Do not restart it again and do not poll GitHub yourself: re-run your "
+            f"command in a minute. If it is still down {RESTART_COOLDOWN}s after that restart: {RESTART_ADVICE}.")
 
 
 def daemon_stale() -> float | None:
@@ -1898,7 +1969,7 @@ def stale_message(lag: float) -> str:
         who = (f" The lock holder is pid {holder['pid']}; the service's waiting daemon stops it once it has been "
                f"silent for {STALE_HEARTBEAT}s, or stop it now: kill {holder['pid']}.")
     return (f"glaeda-gh: the daemon holds its lock but has not written a heartbeat for {int(lag)}s, so it "
-            f"looks hung and nothing is being refreshed.{who} Restart it: {start_hint(restart=True)}")
+            f"looks hung and nothing is being refreshed.{who} Restart it: {RESTART_ADVICE}")
 
 
 def failing(checks: list[dict]) -> list[dict]:
@@ -2167,7 +2238,7 @@ def emit(key: str, entry: dict | None, as_json: bool, extra: dict | None = None,
 def cmd_status(kind: str, target: str, jobs: bool, as_json: bool, first_wait: float = CYCLE + 10) -> int:
     key = parse_key(kind, target)
     if not daemon_running(grace=DOWN_GRACE):
-        print(DOWN, file=sys.stderr)
+        print(down_message(), file=sys.stderr)
         return EXIT_DOWN
     broken = daemon_failing()
     if broken is not None:
@@ -2218,10 +2289,15 @@ def cmd_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_
     began, start = time.time(), time.monotonic()
     touched = -TOUCH_EVERY
     warned = False
+    down, down_since = DownWait(), None
     while True:
         if not daemon_running(grace=DOWN_GRACE):
-            print(DOWN, file=sys.stderr)
-            return EXIT_DOWN
+            down_since = time.monotonic() if down_since is None else down_since
+            if not down.patient(down_since, start, timeout):
+                return EXIT_DOWN
+            time.sleep(WAIT_POLL)
+            continue
+        down_since = None
         broken = daemon_failing()
         if broken is not None:
             print(failing_message(broken), file=sys.stderr)
@@ -2327,12 +2403,17 @@ def cmd_wait_comment(target: str, timeout: float, as_json: bool, author: str | N
     since_id, since_time = parse_since(since, began)
     touched = -TOUCH_EVERY
     warned = False
+    down, down_since = DownWait(), None
     _, owner, repo, number = split_key(key)
     name = f"{owner}/{repo}#{number}"
     while True:
         if not daemon_running(grace=DOWN_GRACE):
-            print(DOWN, file=sys.stderr)
-            return EXIT_DOWN
+            down_since = time.monotonic() if down_since is None else down_since
+            if not down.patient(down_since, start, timeout):
+                return EXIT_DOWN
+            time.sleep(WAIT_POLL)
+            continue
+        down_since = None
         broken = daemon_failing()
         if broken is not None:
             print(failing_message(broken), file=sys.stderr)
@@ -2442,7 +2523,7 @@ def cmd_budget(as_json: bool) -> int:
         if status.get("errors"):
             print("last errors: " + "; ".join(status["errors"][:3]))
     if not running:
-        print(DOWN, file=sys.stderr)
+        print(down_message(), file=sys.stderr)
         return EXIT_DOWN
     if broken is not None:
         print(failing_message(broken), file=sys.stderr)
@@ -2451,6 +2532,137 @@ def cmd_budget(as_json: bool) -> int:
         print(stale_message(lag), file=sys.stderr)
         return EXIT_DOWN
     return EXIT_OK
+
+
+def launchd_state() -> str | None:
+    """The LaunchAgent's `state = ...` line (running, spawn scheduled, not running), or None."""
+    try:
+        result = run_bounded(["launchctl", "print", f"gui/{os.getuid()}/{LAUNCH_LABEL}"], 10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    found = re.search(r"^\s*state = (.+)$", result.stdout, re.M)
+    return found.group(1).strip() if found else None
+
+
+def restart_service(hung: bool) -> tuple[bool, str]:
+    """Restart (hung) or start the service once. (started, what was run)."""
+    if sys.platform != "darwin":
+        # a unit that hit its start limit refuses start and restart until this
+        run_bounded(["systemctl", "--user", "reset-failed", SYSTEMD_UNIT], SUBPROCESS_DEADLINE)
+        argv = ["systemctl", "--user", "restart" if hung else "start", SYSTEMD_UNIT]
+        result = run_bounded(argv, SUBPROCESS_DEADLINE)
+        return result.returncode == 0, " ".join(argv)
+    target = f"gui/{os.getuid()}/{LAUNCH_LABEL}"
+    if not hung and launchd_state() == "spawn scheduled":
+        return True, "nothing: launchd has already scheduled the respawn"
+    argv = ["launchctl", "kickstart"] + (["-k"] if hung else []) + [target]
+    result = run_bounded(argv, SUBPROCESS_DEADLINE)
+    if result.returncode == 0:
+        return True, " ".join(argv)
+    # 5 (launchd reported "spawn failed") or 113 (not loaded): unload and load it, once, here
+    plist = os.fspath(Path.home() / "Library/LaunchAgents" / f"{LAUNCH_LABEL}.plist")
+    run_bounded(["launchctl", "bootout", target], SUBPROCESS_DEADLINE)
+    # bootout can return before the job is torn down, and bootstrap answers 5 while it is still loaded
+    deadline = time.monotonic() + BOOTSTRAP_RETRY
+    while True:
+        loaded = run_bounded(["launchctl", "bootstrap", f"gui/{os.getuid()}", plist], SUBPROCESS_DEADLINE)
+        if loaded.returncode == 0 or time.monotonic() >= deadline:
+            break
+        time.sleep(1)
+    how = f"{' '.join(argv)} (exit {result.returncode}), then launchctl bootout and bootstrap"
+    return loaded.returncode == 0, how + ("" if loaded.returncode == 0 else f" (bootstrap exit {loaded.returncode})")
+
+
+def cmd_restart(force: bool = False) -> int:
+    """Restart the daemon at most once across every session: single-flight under restart.lock, and
+    a no-op within RESTART_COOLDOWN of the last restart or while the daemon is healthy."""
+    BASE.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with open(BASE / "restart.lock", "a+") as guard:
+        if not try_lock(guard):
+            print("glaeda-gh: another session is restarting the daemon right now. Do not restart it too: "
+                  "re-run your wait in a minute.")
+            return EXIT_OK
+        running = daemon_running(grace=DOWN_GRACE)
+        broken = daemon_failing() if running else None
+        if broken is not None:
+            print(failing_message(broken), file=sys.stderr)
+            return EXIT_DOWN
+        lag = daemon_stale() if running else None
+        if running and lag is None and not force:
+            print("glaeda-gh: the daemon is running and its heartbeat is fresh; nothing to restart. "
+                  "If a wait printed an older warning, re-run it.")
+            return EXIT_OK
+        ago = recent_restart()
+        if ago is not None and not force:
+            record = restart_record() or {}
+            print(f"glaeda-gh: the daemon was restarted {int(ago)}s ago (pid {record.get('by', '?')}: "
+                  f"{record.get('how', '?')}). Do not restart it again: a new daemon writes a heartbeat as soon "
+                  f"as it holds its lock. Re-run your wait; after {RESTART_COOLDOWN}s a restart is allowed again.")
+            return EXIT_OK
+        hung = running  # running but silent: restart; not running: start
+        holder = lock_holder() if hung else None
+        killed = None
+        began = time.time()
+        write_json(BASE / "restart.json", {"at": began, "by": os.getpid(), "how": "starting"})
+        if holder is not None and holder["silent"] > STALE_HEARTBEAT and is_serve(holder["pid"]):
+            # Stop the hung holder itself: when it is a serve outside the service, kickstart cannot
+            # reach it and the service's daemon waits behind it. When it is the service's own, launchd
+            # respawns it (KeepAlive), so the start below must not kill that respawn again (no -k).
+            if stop_process(holder["pid"]):
+                killed = holder["pid"]
+        try:
+            started, how = restart_service(hung and killed is None)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            started, how = False, f"failed: {type(error).__name__}"
+        if killed is not None:
+            how = f"SIGTERM to the hung lock holder pid {killed}, then {how}"
+        # Success is a heartbeat written after the restart began (a new daemon writes one as soon as
+        # it holds the lock), not merely a held lock: a hung holder that survived holds it too.
+        ok = started and new_heartbeat(began, RESTART_SETTLE)
+        write_json(BASE / "restart.json", {"at": began, "by": os.getpid(), "how": how, "ok": ok})
+        if ok:
+            print(f"glaeda-gh: restarted the daemon ({how}); a new daemon holds its lock and wrote its heartbeat. "
+                  "Re-run your wait.")
+            return EXIT_OK
+        print(f"glaeda-gh: tried to {'restart' if hung else 'start'} the daemon ({how}), but no new daemon wrote a "
+              f"heartbeat within {RESTART_SETTLE}s. Tell the user. By hand: {start_hint(restart=hung)}", file=sys.stderr)
+        return EXIT_DOWN
+
+
+def stop_process(pid: int) -> bool:
+    """SIGTERM, then SIGKILL after TAKEOVER_GRACE (as take_over does). True once `pid` is gone."""
+    for sig, grace in ((signal.SIGTERM, TAKEOVER_GRACE), (signal.SIGKILL, 5)):
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            return False
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return True
+            except OSError:
+                return False
+            time.sleep(0.2)
+    return False
+
+
+def new_heartbeat(since: float, grace: float) -> bool:
+    """Whether, within `grace` seconds, the lock is held and daemon.json has a heartbeat newer than `since`."""
+    deadline = time.monotonic() + grace
+    while True:
+        status = read_json(BASE / "daemon.json")
+        at = status.get("at") if isinstance(status, dict) else None
+        if isinstance(at, (int, float)) and at >= since and lock_held():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.25)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -2481,6 +2693,8 @@ def parser() -> argparse.ArgumentParser:
                                            "(10m); default the moment the wait began")
     b = sub.add_parser("budget", help="REST and GraphQL quota as the daemon last saw it")
     b.add_argument("--json", action="store_true")
+    r = sub.add_parser("restart", help="restart a down or hung daemon once, however many sessions ask at the same time")
+    r.add_argument("--force", action="store_true", help="restart even if it looks healthy or was just restarted")
     return p
 
 
@@ -2493,6 +2707,8 @@ def main(argv: list[str] | None = None) -> int:
             return serve(args.foreground_ok)
         if args.command == "budget":
             return cmd_budget(args.json)
+        if args.command == "restart":
+            return cmd_restart(args.force)
         if args.command == "status":
             return cmd_status(args.kind, args.target, args.jobs, args.json)
         if args.rescue_grace < 0:

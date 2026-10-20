@@ -101,25 +101,21 @@ glaeda-gh wait comment teamleaderleo/stensibly#454 --author 'github-actions[bot]
 
 ## When the daemon is down or hung
 
-`glaeda-gh` exits 3 and prints how to start the daemon. Start it yourself, then wait again. Do not
-fall back to polling GitHub yourself.
+`glaeda-gh` exits 3 when the daemon is down or hung. Run `glaeda-gh restart` once, then wait
+again. Do not fall back to polling GitHub yourself, and do not run `launchctl kickstart`,
+`bootout`/`bootstrap` or `systemctl` yourself: on 10-20 about ten sessions kickstarted it at once,
+each kickstart killed the daemon the previous one had just started, and launchd throttled the
+respawns ("spawn scheduled", "spawn failed") for most of an hour.
 
-- macOS: `launchctl kickstart gui/$(id -u)/com.teamleaderleo.glaeda.gh-watch`. If launchctl
-  cannot find the service, load it:
-  `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.teamleaderleo.glaeda.gh-watch.plist`.
-- Linux: `systemctl --user start glaeda-gh`.
-- Not installed: `glaeda-mini-setup --hygiene-only --apply` from the glaeda checkout.
+`glaeda-gh restart` is safe from many sessions at the same time. One of them restarts the daemon;
+the others are told that a restart is under way or happened in the last 3 minutes, and should just
+re-run their wait. It does nothing when the daemon is healthy, and refuses when every cycle fails
+(a restart cannot fix a bug). It stops a hung lock holder, kickstarts the LaunchAgent (or restarts
+the systemd unit), and reloads the LaunchAgent once if kickstart fails with `5: Input/output
+error`. A `wait` that finds the daemon down keeps waiting up to 90 s for it to come back before it
+exits 3, and a restarted daemon writes its heartbeat as soon as it holds its lock.
 
-If it prints `looks hung` (it holds its lock but has not written a heartbeat for 10 minutes),
-restart it: `launchctl kickstart -k gui/$(id -u)/com.teamleaderleo.glaeda.gh-watch` or
-`systemctl --user restart glaeda-gh`. If it names a lock holder pid, that process is outside the
-service and a restart cannot reach it: `kill` that pid (the service's waiting daemon also stops it
-by itself after 10 minutes). The daemon exits on its own (and is restarted) when its loop stalls
-for 5 minutes.
-
-`launchctl bootstrap` failing with `5: Input/output error` means the service is already loaded:
-use kickstart. If `kickstart` fails with 5, reload it:
-`launchctl bootout gui/$(id -u)/com.teamleaderleo.glaeda.gh-watch; launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.teamleaderleo.glaeda.gh-watch.plist`.
+If it was never installed: `glaeda-mini-setup --hygiene-only --apply` from the glaeda checkout.
 
 Never run `glaeda-gh serve` yourself, not even under `timeout`: it refuses while the service is
 loaded, and a hand-started serve that took the lock froze every session's waits on 10-20.
