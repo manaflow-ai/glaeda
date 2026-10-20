@@ -120,15 +120,15 @@ class UpdateTest(unittest.TestCase):
         self.bin = self.root / "bin"
         self.state = self.root / "state"
         self.server = Server()
-        self.saved = (gu.fetch, gu.attestation_ok, gu.local_target, os.environ.get("GLAEDA_TEST_BIN"))
+        self.saved = (gu.fetch, gu.attestation, gu.local_target, os.environ.get("GLAEDA_TEST_BIN"))
         gu.fetch = self.server.fetch
-        gu.attestation_ok = lambda path: True
+        gu.attestation = lambda path: (True, "verified")
         gu.local_target = lambda: TARGET
         os.environ["GLAEDA_TEST_BIN"] = str(self.bin)
         self.config = {"ring": "canary", "setupArgs": ["--hygiene-only"], "host": "test", "reportStatus": False}
 
     def tearDown(self) -> None:
-        gu.fetch, gu.attestation_ok, gu.local_target, test_bin = self.saved
+        gu.fetch, gu.attestation, gu.local_target, test_bin = self.saved
         if test_bin is None:
             os.environ.pop("GLAEDA_TEST_BIN", None)
         self.tmp.cleanup()
@@ -139,39 +139,19 @@ class UpdateTest(unittest.TestCase):
         old_find_gh = gu.find_gh
         gu.find_gh = lambda: "/usr/bin/gh"
         try:
-            with mock.patch.object(gu.subprocess, "run",
-                                   side_effect=subprocess.TimeoutExpired("gh", 60)):
-                self.assertEqual(gu.report(config, entry, True, "installed"),
-                                 "not reported (TimeoutExpired)")
+            with mock.patch.object(gu.subprocess, "run", side_effect=subprocess.TimeoutExpired("gh", 60)), \
+                    mock.patch.object(gu.time, "sleep"):
+                self.assertTrue(gu.report(config, entry, True, "installed")
+                                .startswith("not reported (transient: TimeoutExpired"))
         finally:
             gu.find_gh = old_find_gh
 
     def test_attestation_auth_timeout_is_unavailable(self) -> None:
-        old_find_gh = gu.find_gh
-        old_attestation = gu.attestation_ok
-        gu.find_gh = lambda: "/usr/bin/gh"
-        gu.attestation_ok = self.saved[1]
-        try:
-            with mock.patch.object(gu.subprocess, "run",
-                                   side_effect=subprocess.TimeoutExpired("gh", 60)):
-                self.assertIsNone(gu.attestation_ok(Path("/tmp/archive.tar.gz")))
-        finally:
-            gu.find_gh = old_find_gh
-            gu.attestation_ok = old_attestation
-
-    def test_attestation_api_failure_is_unavailable(self) -> None:
-        old_find_gh = gu.find_gh
-        old_attestation = gu.attestation_ok
-        gu.find_gh = lambda: "/usr/bin/gh"
-        gu.attestation_ok = self.saved[1]
-        try:
-            responses = [subprocess.CompletedProcess([], 0, "", ""),
-                         subprocess.CompletedProcess([], 1, "", "HTTP 403: API rate limit")]
-            with mock.patch.object(gu.subprocess, "run", side_effect=responses):
-                self.assertIsNone(gu.attestation_ok(Path("/tmp/archive.tar.gz")))
-        finally:
-            gu.find_gh = old_find_gh
-            gu.attestation_ok = old_attestation
+        with mock.patch.object(gu, "find_gh", return_value="/usr/bin/gh"), \
+                mock.patch.object(gu.subprocess, "run", side_effect=subprocess.TimeoutExpired("gh", 60)):
+            verdict, why = self.saved[1](Path("/tmp/archive.tar.gz"))
+        self.assertIsNone(verdict)
+        self.assertIn("not signed in", why)
 
     def test_host_profile_mismatch_reports_pending(self) -> None:
         config = {**self.config, "reportStatus": True}
@@ -196,6 +176,197 @@ class UpdateTest(unittest.TestCase):
             gu.fetch = old_fetch
         self.assertEqual(result["result"], "inconclusive")
         self.assertNotIn(entry["tag"], gu.load_state(self.state)["quarantined"])
+
+    # 2026-10-19: air-blue's canary runs at 21:32Z and 22:32Z ended "inconclusive" ("a canary must verify
+    # the attestation: install gh and sign in", "not reported (gh exited 1)") while gh was installed and
+    # signed in: the shared REST quota was spent, so `gh auth status` and the status POST failed, and the
+    # next try was an hour away. Stable waited two hours for a healthy release.
+
+    def gh(self, *results: tuple[int, str]) -> mock.Mock:
+        """subprocess.run answering each gh call with (exit code, stderr) in order."""
+        return mock.Mock(side_effect=[subprocess.CompletedProcess([], code, "", err) for code, err in results])
+
+    def test_rate_limited_attestation_retries_with_backoff_in_the_same_run(self) -> None:
+        run = self.gh((0, ""), (1, "HTTP 403: API rate limit exceeded for user ID 1."), (0, ""))
+        with mock.patch.object(gu, "find_gh", return_value="/usr/bin/gh"), \
+                mock.patch.object(gu, "rate_limit_reset", return_value=None), \
+                mock.patch.object(gu.subprocess, "run", run), mock.patch.object(gu.time, "sleep") as sleep:
+            self.assertEqual(self.saved[1](Path("/tmp/a.tar.gz")), (True, "verified"))
+        argvs = [call.args[0] for call in run.call_args_list]
+        # signed-in is a local token check, never `gh auth status`, which spends quota and fails with it
+        self.assertEqual(argvs[0][1:], ["auth", "token"])
+        self.assertNotIn("status", [arg for argv in argvs for arg in argv[1:3]])
+        self.assertEqual([argv[1:3] for argv in argvs[1:]], [["attestation", "verify"]] * 2)
+        self.assertEqual(sleep.call_count, 1)
+
+    def test_spent_quota_is_named_with_its_reset_and_costs_no_verify(self) -> None:
+        run = self.gh((0, ""))
+        reset = gu.time.time() + 40 * 60
+        with mock.patch.object(gu, "find_gh", return_value="/usr/bin/gh"), \
+                mock.patch.object(gu, "rate_limit_reset", return_value=reset), \
+                mock.patch.object(gu.subprocess, "run", run), mock.patch.object(gu.time, "sleep") as sleep:
+            verdict, why = self.saved[1](Path("/tmp/a.tar.gz"))
+        self.assertIsNone(verdict)
+        self.assertIn("rate-limited until " + gu.time.strftime("%H:%MZ", gu.time.gmtime(reset)), why)
+        self.assertEqual(run.call_count, 1)  # only the local token check
+        sleep.assert_not_called()
+
+    def test_a_reset_within_minutes_is_waited_for_in_the_run(self) -> None:
+        run = self.gh((0, ""), (0, ""))
+        resets = iter([gu.time.time() + 90, None])
+        with mock.patch.object(gu, "find_gh", return_value="/usr/bin/gh"), \
+                mock.patch.object(gu, "rate_limit_reset", side_effect=lambda gh: next(resets)), \
+                mock.patch.object(gu.subprocess, "run", run), mock.patch.object(gu.time, "sleep") as sleep:
+            self.assertEqual(self.saved[1](Path("/tmp/a.tar.gz"))[0], True)
+        self.assertGreater(sleep.call_args.args[0], 60)
+
+    def test_signed_out_gh_is_inconclusive_with_its_own_words(self) -> None:
+        run = self.gh((1, "no oauth token found for github.com"))
+        with mock.patch.object(gu, "find_gh", return_value="/usr/bin/gh"), mock.patch.object(gu.subprocess, "run", run):
+            verdict, why = self.saved[1](Path("/tmp/a.tar.gz"))
+        self.assertIsNone(verdict)
+        self.assertIn("not signed in", why)
+        self.assertIn("no oauth token", why)
+
+    def test_a_real_verification_failure_is_false_and_not_retried(self) -> None:
+        run = self.gh((0, ""), (1, "Error: verifying with issuer: no matching attestations found"))
+        with mock.patch.object(gu, "find_gh", return_value="/usr/bin/gh"), \
+                mock.patch.object(gu, "rate_limit_reset", return_value=None), \
+                mock.patch.object(gu.subprocess, "run", run), mock.patch.object(gu.time, "sleep") as sleep:
+            verdict, why = self.saved[1](Path("/tmp/a.tar.gz"))
+        self.assertIs(verdict, False)
+        self.assertIn("no matching attestations", why)
+        sleep.assert_not_called()
+
+    def test_persistent_rate_limit_stays_inconclusive_after_bounded_backoff(self) -> None:
+        limited = (1, "HTTP 403: API rate limit exceeded")
+        run = self.gh((0, ""), *[limited] * (len(gu.GH_BACKOFF) + 1))
+        with mock.patch.object(gu, "find_gh", return_value="/usr/bin/gh"), \
+                mock.patch.object(gu, "rate_limit_reset", return_value=None), \
+                mock.patch.object(gu.subprocess, "run", run), mock.patch.object(gu.time, "sleep") as sleep:
+            verdict, why = self.saved[1](Path("/tmp/a.tar.gz"))
+        self.assertIsNone(verdict)
+        self.assertTrue(why.startswith("rate-limited: "), why)
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], list(gu.GH_BACKOFF))
+        self.assertLessEqual(sum(gu.GH_BACKOFF), 10 * 60)  # one hourly run stays well inside its hour
+
+    def test_status_post_names_why_it_failed(self) -> None:
+        config = {**self.config, "reportStatus": True}
+        entry = {"tag": "r-20260925-" + "a" * 12, "source": "a" * 40}
+        run = self.gh(*[(1, "HTTP 403: API rate limit exceeded for user")] * (len(gu.GH_BACKOFF) + 1))
+        with mock.patch.object(gu, "find_gh", return_value="/usr/bin/gh"), \
+                mock.patch.object(gu, "rate_limit_reset", return_value=None), \
+                mock.patch.object(gu.subprocess, "run", run), mock.patch.object(gu.time, "sleep"):
+            status = gu.report(config, entry, True, "installed")
+        self.assertTrue(status.startswith("not reported (rate-limited: HTTP 403: API rate limit"), status)
+        run = self.gh((1, "HTTP 502: Bad Gateway"), (0, ""))
+        with mock.patch.object(gu, "find_gh", return_value="/usr/bin/gh"), \
+                mock.patch.object(gu, "rate_limit_reset", return_value=None), \
+                mock.patch.object(gu.subprocess, "run", run), mock.patch.object(gu.time, "sleep"):
+            self.assertEqual(gu.report(config, entry, True, "installed"), "reported")
+
+    def test_an_undelivered_status_is_posted_again_by_the_next_run(self) -> None:
+        self.config = {**self.config, "reportStatus": True}
+        entry = self.server.publish(SOURCES[0])
+        with mock.patch.object(gu, "report", return_value="not reported (rate-limited: HTTP 403)"):
+            first = self.run_update()
+        self.assertEqual(first["result"], "updated")
+        self.assertEqual([o["tag"] for o in gu.load_state(self.state)["unreported"]], [entry["tag"]])
+        # still rate-limited an hour later: kept, not dropped
+        with mock.patch.object(gu, "report", return_value="not reported (rate-limited until 23:10Z)"):
+            self.assertEqual(self.run_update()["redelivered"], {entry["tag"]: "not reported (rate-limited until 23:10Z)"})
+        self.assertEqual(len(gu.load_state(self.state)["unreported"]), 1)
+        with mock.patch.object(gu, "report", return_value="reported") as report:
+            second = self.run_update()
+        self.assertEqual(second["result"], "current")
+        self.assertEqual(second["redelivered"], {entry["tag"]: "reported"})
+        posted_entry, ok, detail = report.call_args.args[1:]
+        self.assertEqual((posted_entry["tag"], posted_entry["source"], ok, detail), (entry["tag"], entry["source"], True, "tools run"))
+        self.assertNotIn("unreported", gu.load_state(self.state))
+        with mock.patch.object(gu, "report") as report:
+            self.assertNotIn("redelivered", self.run_update())
+        report.assert_not_called()
+
+    def test_rate_limit_reset_reads_the_core_quota(self) -> None:
+        def answer(code: int, out: str):
+            return mock.patch.object(gu.subprocess, "run", return_value=subprocess.CompletedProcess([], code, out, ""))
+        with answer(0, "0\t1792463616\n"):
+            self.assertEqual(gu.rate_limit_reset("gh"), 1792463616.0)
+        for code, out in ((0, "3086\t1792463616\n"), (1, "0\t1792463616\n"), (0, ""), (0, "x y")):
+            with answer(code, out):
+                self.assertIsNone(gu.rate_limit_reset("gh"), (code, out))
+
+    def test_a_forbidden_attestation_read_is_unavailable_not_failed(self) -> None:
+        run = self.gh((0, ""), (1, "HTTP 403: Resource not accessible by integration"))
+        with mock.patch.object(gu, "find_gh", return_value="/usr/bin/gh"), \
+                mock.patch.object(gu, "rate_limit_reset", return_value=None), \
+                mock.patch.object(gu.subprocess, "run", run), mock.patch.object(gu.time, "sleep") as sleep:
+            verdict, why = self.saved[1](Path("/tmp/a.tar.gz"))
+        self.assertIsNone(verdict)
+        self.assertIn("cannot read attestations", why)
+        sleep.assert_not_called()
+
+    def test_a_failure_waits_out_a_spent_quota_a_success_does_not(self) -> None:
+        # a failure that is not posted lets another canary's success promote the release 15 minutes later
+        config = {**self.config, "reportStatus": True}
+        entry = {"tag": "r-20260925-" + "a" * 12, "source": "a" * 40}
+        for ok, waited in ((False, True), (True, False)):
+            reset = gu.time.time() + 40 * 60
+            resets = iter([reset, None])
+            run = self.gh((0, ""))
+            with mock.patch.object(gu, "find_gh", return_value="/usr/bin/gh"), \
+                    mock.patch.object(gu, "rate_limit_reset", side_effect=lambda gh: next(resets)), \
+                    mock.patch.object(gu.subprocess, "run", run), mock.patch.object(gu.time, "sleep") as sleep:
+                status = gu.report(config, entry, ok, "x")
+            self.assertEqual(status == "reported", waited, status)
+            self.assertEqual(sleep.called, waited)
+            if waited:
+                self.assertLessEqual(sleep.call_args.args[0], gu.FAILURE_WAIT_MAX + 5)
+
+    def test_redelivery_stops_at_the_first_report_that_fails_and_drops_debts_of_a_former_canary(self) -> None:
+        config = {**self.config, "reportStatus": True}
+        owed = [{"tag": "r-20260925-" + c * 12, "source": c * 40, "ok": True, "detail": "x"} for c in "ab"]
+        state = {"unreported": list(owed)}
+        with mock.patch.object(gu, "report", return_value="not reported (transient: x)") as report:
+            self.assertEqual(list(gu.redeliver(state, config)), [owed[0]["tag"]])
+        self.assertEqual(report.call_count, 1)
+        self.assertEqual(state["unreported"], owed)
+        with mock.patch.object(gu, "report", return_value="not reported (not a reporting canary)"):
+            gu.redeliver(state, {**config, "ring": "stable"})
+        self.assertNotIn("unreported", state)
+
+    def test_a_report_is_owed_before_it_is_posted(self) -> None:
+        # a run killed during the retries must not lose the verdict
+        self.config = {**self.config, "reportStatus": True}
+        entry = self.server.publish(SOURCES[0])
+        seen = []
+        def report(config, e, ok, detail):
+            seen.append([o["tag"] for o in gu.load_state(self.state).get("unreported", [])])
+            return "reported"
+        with mock.patch.object(gu, "report", side_effect=report):
+            self.run_update()
+        self.assertEqual(seen, [[entry["tag"]]])
+        self.assertNotIn("unreported", gu.load_state(self.state))
+
+    def test_only_a_verdict_is_owed_and_a_stable_host_owes_nothing(self) -> None:
+        config = {**self.config, "reportStatus": True}
+        entry = {"tag": "r-20260925-" + "a" * 12, "source": "a" * 40}
+        state: dict = {}
+        self.assertFalse(gu.owe_report(state, config, entry, None, "inconclusive"))
+        self.assertFalse(gu.owe_report(state, {**config, "ring": "stable"}, entry, True, "installed"))
+        self.assertEqual(state, {})
+        self.assertTrue(gu.owe_report(state, config, entry, False, "setup failed"))
+        self.assertTrue(gu.owe_report(state, config, entry, True, "installed"))
+        self.assertEqual(state["unreported"], [{"tag": entry["tag"], "source": entry["source"], "ok": True,
+                                                "detail": "installed"}])  # one per tag, the newest
+        (self.state).mkdir(parents=True, exist_ok=True)
+        (self.state / "state.json").write_text(json.dumps({"current": None, "previous": None, "quarantined": [],
+                                                            "unreported": [{"tag": 1}]}))
+        self.assertNotIn("unreported", gu.load_state(self.state))
+        bad_source = {"tag": entry["tag"], "source": "../../x", "ok": True, "detail": "x"}
+        (self.state / "state.json").write_text(json.dumps({"current": None, "previous": None, "quarantined": [],
+                                                            "unreported": [bad_source]}))
+        self.assertNotIn("unreported", gu.load_state(self.state))  # a malformed debt never blocks an update
 
     def run_update(self, apply: bool = True) -> dict:
         return gu.update(apply, self.config, self.state, self.server.channel(self.config["ring"]), self.bin)
@@ -409,11 +580,11 @@ class UpdateTest(unittest.TestCase):
 
     def test_failed_attestation_is_refused(self) -> None:
         self.server.publish(SOURCES[0])
-        gu.attestation_ok = lambda path: False
+        gu.attestation = lambda path: (False, "no attestation from release.yml")
         self.assertIn("did not verify", self.run_update()["detail"])
         # a canary that cannot check refuses; stable, which only names canary-verified releases, installs
         self.server.publish(SOURCES[1])
-        gu.attestation_ok = lambda path: None
+        gu.attestation = lambda path: (None, "no gh on this host")
         inconclusive = self.run_update()
         self.assertEqual(inconclusive["result"], "inconclusive")
         self.assertIn("canary must verify", inconclusive["detail"])
@@ -547,29 +718,10 @@ class ReleaseTest(unittest.TestCase):
         low = gr.policy_for_paths(["docs/GLAEDA_OTA.md", "tests/test_policy.md"])
         self.assertEqual((low["risk"], low["soakHours"], low["requiredHosts"]), ("low", 0.25, []))
         normal = gr.policy_for_paths(["scripts/telemetry.py"])
-        self.assertEqual((normal["risk"], normal["soakHours"], normal["requiredHosts"]),
-                         ("normal", 0.25, list(gr.CANARY_HOSTS)))
+        self.assertEqual((normal["risk"], normal["soakHours"], normal["requiredHosts"]), ("normal", 0.25, []))
         high = gr.policy_for_paths(["scripts/glaeda-update"])
-        self.assertEqual((high["risk"], high["soakHours"], high["requiredHosts"]),
-                         ("high", 0.25, list(gr.CANARY_HOSTS)))
+        self.assertEqual((high["risk"], high["soakHours"], high["requiredHosts"]), ("high", 0.25, []))
         self.assertEqual(gr.policy_for_paths([])["risk"], "high")
-
-    def test_policy_requires_each_registered_canary_for_operational_release(self) -> None:
-        candidate = {**self.canary(), "policy": gr.policy_for_paths(["scripts/telemetry.py"])}
-        one = [self.status("air-blue", "success", "2026-09-25T01:00:00Z")]
-        self.assertEqual(gr.promotion(candidate, None, one, self.NOW)[0], False)
-        both = one + [self.status("big-red", "success", "2026-09-25T02:00:00Z")]
-        self.assertTrue(gr.promotion(candidate, None, both, self.NOW)[0])
-        pending = one + [self.status("big-red", "pending", "2026-09-25T02:00:00Z")]
-        self.assertIn("inconclusive", gr.promotion(candidate, None, pending, self.NOW)[1])
-
-    def test_historical_signed_policy_remains_promotable_alongside_new_policy(self) -> None:
-        historical = {**self.canary(), "policy": {**gr.policy_for_paths(["scripts/glaeda-update"]),
-                                                    "soakHours": 12}}
-        parsed = gr.parse_policy(historical["policy"])
-        self.assertEqual(parsed["soakHours"], 12)
-        current = gr.policy_for_paths(["scripts/glaeda-update"])
-        self.assertEqual(current["soakHours"], 0.25)
 
     def test_soak_override_rejects_non_finite_or_negative_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -593,6 +745,61 @@ class ReleaseTest(unittest.TestCase):
         self.assertTrue(gr.promotion(self.canary(), None, noise, self.NOW)[0])
         self.assertFalse(gr.promotion(self.canary(), {**self.canary(), "ring": "stable"}, ok, self.NOW)[0])
         self.assertEqual(gr.promotion(None, None, ok, self.NOW), (False, "no canary release"))
+
+
+    def test_one_canary_success_promotes_and_any_failure_blocks(self) -> None:
+        # Leo, 2026-10-19: "why does it need literally everybody to report success". No host is required.
+        at = "2026-09-25T01:00:00Z"
+        for paths in (["scripts/telemetry.py"], ["scripts/glaeda-update"], ["docs/x.md"]):
+            candidate = {**self.canary(), "policy": gr.policy_for_paths(paths)}
+            for host in ("air-blue", "big-red", "cosmic-gray"):
+                self.assertTrue(gr.promotion(candidate, None, [self.status(host, "success", at)], self.NOW)[0], (paths, host))
+            # a silent or pending canary holds nothing past the soak
+            pending = [self.status("big-red", "success", at), self.status("air-blue", "pending", at)]
+            self.assertTrue(gr.promotion(candidate, None, pending, self.NOW)[0])
+            failed = [self.status("big-red", "success", at), self.status("cosmic-gray", "failure", at)]
+            self.assertFalse(gr.promotion(candidate, None, failed, self.NOW)[0])
+            self.assertEqual(gr.promotion(candidate, None, [self.status("air-blue", "pending", at)], self.NOW),
+                             (False, "no canary host reported success"))
+
+    def test_policies_signed_with_required_hosts_parse_and_are_not_enforced(self) -> None:
+        legacy = {"schema": gr.POLICY_SCHEMA, "risk": "high", "soakHours": 0.25,
+                  "requiredHosts": ["air-blue", "big-red"], "paths": ["scripts/glaeda-update"]}
+        self.assertEqual(gr.parse_policy(legacy)["requiredHosts"], ["air-blue", "big-red"])
+        candidate = {**self.canary(), "policy": legacy}
+        self.assertTrue(gr.promotion(candidate, None, [self.status("big-red", "success", "2026-09-25T01:00:00Z")],
+                                     self.NOW)[0])
+        for bad in ({**legacy, "requiredHosts": ["air-blue"]}, {**legacy, "requiredHosts": ["nobody"]},
+                    {**legacy, "risk": "low", "soakHours": 0.25}):
+            with self.assertRaises(gr.ReleaseError):
+                gr.parse_policy(bad)
+
+    def test_the_15_hour_stall_promotes_on_big_reds_success_alone(self) -> None:
+        # 2026-10-19: r-20261019-a3a8519563ef, signed with requiredHosts [air-blue, big-red], had big-red's
+        # success and air-blue's pending (the quota was spent) and was not promoted; stable stayed on 07:31Z.
+        legacy = {"schema": gr.POLICY_SCHEMA, "risk": "high", "soakHours": 0.25,
+                  "requiredHosts": ["air-blue", "big-red"], "paths": ["scripts/glaeda-update"]}
+        held = {"entry": {**self.entry("b", "2026-09-25T04:00:00Z"), "policy": legacy}, "policy": legacy,
+                "statuses": [self.status("big-red", "success", "2026-09-25T04:30:00Z"),
+                             self.status("air-blue", "pending", "2026-09-25T04:50:00Z")],
+                "descendsFromStable": True}
+        stable = {**self.entry("a", "2026-09-25T01:00:00Z"), "ring": "stable"}
+        chosen, why = gr.choose([held], stable, self.NOW)
+        self.assertEqual(chosen["tag"], held["entry"]["tag"], why)
+        # a newer release nobody has reported on yet holds nothing either, once it has soaked
+        silent = {"entry": self.entry("c", "2026-09-25T10:00:00Z"), "statuses": [], "descendsFromStable": True}
+        self.assertEqual(gr.choose([silent, held], stable, self.NOW)[0]["tag"], held["entry"]["tag"])
+        # but cosmic-gray's failure, from any canary, still blocks it
+        failed = {**held, "statuses": held["statuses"] + [self.status("cosmic-gray", "failure", "2026-09-25T05:00:00Z")]}
+        self.assertIsNone(gr.choose([failed], stable, self.NOW)[0])
+
+    def test_historical_signed_policy_remains_promotable_alongside_new_policy(self) -> None:
+        historical = {**self.canary(), "policy": {**gr.policy_for_paths(["scripts/glaeda-update"]),
+                                                    "soakHours": 12}}
+        parsed = gr.parse_policy(historical["policy"])
+        self.assertEqual(parsed["soakHours"], 12)
+        current = gr.policy_for_paths(["scripts/glaeda-update"])
+        self.assertEqual(current["soakHours"], 0.25)
 
     def entry(self, letter: str, published: str) -> dict:
         return {**self.canary(published), "tag": "r-20260925-" + letter * 12, "source": letter * 40}

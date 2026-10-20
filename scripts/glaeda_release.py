@@ -23,8 +23,10 @@ Hosts read them anonymously (the repository is public) and trust nothing by name
 must match `releaseSha256`, and every asset must match release.json. Canary only moves forward
 (release.yml checks ancestry). Stable moves to the newest release that has soaked (`SOAK_HOURS`),
 that canary hosts reported success on and none failure (commit statuses `glaeda-ota/<host>`), and
-that descends from the current stable. Not only the current canary: with several merges a day
-the newest release never finishes soaking, and stable would starve.
+that descends from the current stable. One canary's success is enough and no host is required, so
+a canary that never reports cannot hold stable, while any canary's failure blocks it (2026-10-19).
+Not only the current canary: with several merges a day the newest release never finishes soaking,
+and stable would starve.
 """
 from __future__ import annotations
 
@@ -55,7 +57,10 @@ SOAK_HOURS = 6
 # canary coverage, while legacy manifests retain the original six-hour behavior.
 RISK_SOAK_HOURS = {"low": 0.25, "normal": 0.25, "high": 0.25}
 HISTORICAL_RISK_SOAK_HOURS = {"low": 2, "normal": 6, "high": 12}
-CANARY_HOSTS = ("air-blue", "big-red")
+# No canary host is required: promotion takes one success and no failure. Policies signed before
+# 2026-10-19 list these two as required; they still parse, and that list is no longer enforced
+# (a spent REST quota kept air-blue from reporting and held stable on one build for 15 hours).
+LEGACY_REQUIRED_HOSTS = ("air-blue", "big-red")
 MAX_ASSET = 200 * 1024 * 1024
 TAG_RE = re.compile(r"r-\d{8}-[0-9a-f]{12}")
 SHA_RE = re.compile(r"[0-9a-f]{40}")
@@ -158,8 +163,7 @@ def policy_for_paths(paths: list[str]) -> dict:
         risk = "low" if low else "high" if any(any(marker in path for marker in high_markers)
                                                  for path in paths) else "normal"
     return {"schema": POLICY_SCHEMA, "risk": risk, "soakHours": RISK_SOAK_HOURS[risk],
-            "requiredHosts": [] if risk == "low" else list(CANARY_HOSTS),
-            "paths": sorted(paths)}
+            "requiredHosts": [], "paths": sorted(paths)}
 
 
 def release_policy(root: Path, source: str) -> dict:
@@ -183,9 +187,8 @@ def parse_policy(value: object, *, legacy: bool = False) -> dict:
     paths = value.get("paths")
     valid_hours = {RISK_SOAK_HOURS[risk], HISTORICAL_RISK_SOAK_HOURS[risk]} if risk in RISK_SOAK_HOURS else set()
     if risk not in RISK_SOAK_HOURS or hours not in valid_hours or not isinstance(hosts, list) \
-            or not all(isinstance(host, str) and host in CANARY_HOSTS for host in hosts) \
-            or risk != "low" and sorted(hosts) != sorted(CANARY_HOSTS) \
-            or risk == "low" and hosts \
+            or hosts and (risk == "low" or not all(isinstance(host, str) for host in hosts)
+                          or sorted(hosts) != sorted(LEGACY_REQUIRED_HOSTS)) \
             or not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
         raise ReleaseError("release policy is malformed")
     return {"schema": POLICY_SCHEMA, "risk": risk, "soakHours": hours,
@@ -244,8 +247,8 @@ def parse_control(raw: bytes) -> dict:
     return doc
 
 
-def canary_verdict(statuses: list[dict], required_hosts: tuple[str, ...] = ()) -> tuple[int, int, int]:
-    """(successes, failures) among the newest status of each glaeda-ota/<host> context."""
+def canary_verdict(statuses: list[dict]) -> tuple[int, int, int]:
+    """(successes, failures, other) among the newest status of each glaeda-ota/<host> context."""
     newest: dict[str, dict] = {}
     for status in statuses:
         context = str(status.get("context", ""))
@@ -254,14 +257,10 @@ def canary_verdict(statuses: list[dict], required_hosts: tuple[str, ...] = ()) -
         seen = newest.get(context)
         if seen is None or str(status.get("updated_at", "")) > str(seen.get("updated_at", "")):
             newest[context] = status
-    states = ([newest.get(STATUS_PREFIX + host, {}).get("state") for host in required_hosts]
-              if required_hosts else [status.get("state") for status in newest.values()])
-    observed = [s for s in states if s]
-    successes = sum(state == "success" for state in observed)
-    failures = sum(state in ("failure", "error") for state in observed)
-    inconclusive = len(states) - successes - failures if required_hosts else sum(
-        status.get("state") not in ("success", "failure", "error") for status in newest.values())
-    return successes, failures, inconclusive
+    states = [status.get("state") for status in newest.values()]
+    successes = sum(state == "success" for state in states)
+    failures = sum(state in ("failure", "error") for state in states)
+    return successes, failures, len(states) - successes - failures
 
 
 def promotion(canary: dict | None, stable: dict | None, statuses: list[dict], now: dt.datetime,
@@ -277,14 +276,10 @@ def promotion(canary: dict | None, stable: dict | None, statuses: list[dict], no
     age = (now - published).total_seconds() / 3600
     if age < soak_hours:
         return False, f"canary soaking: {age:.1f} h of {soak_hours} h"
-    required = tuple(policy["requiredHosts"])
-    ok, failed, inconclusive = canary_verdict(statuses, required)
+    # One success and no failure. A canary that is silent or pending holds nothing past the soak.
+    ok, failed, _ = canary_verdict(statuses)
     if failed:
         return False, f"{failed} canary host(s) reported failure"
-    if inconclusive:
-        return False, f"{inconclusive} required canary host(s) are inconclusive"
-    if required and ok != len(required):
-        return False, f"{ok}/{len(required)} required canary hosts reported success"
     if not ok:
         return False, "no canary host reported success"
     return True, f"{ok} canary host(s) healthy after {age:.1f} h"
@@ -304,7 +299,7 @@ def choose(candidates: list[dict], stable: dict | None, now: dt.datetime,
             reasons.append(f"{entry['tag']}: already stable")
             break  # everything older is older than stable too
         policy = parse_policy(candidate.get("policy"), legacy=candidate.get("policy") is None)
-        if canary_verdict(candidate["statuses"], tuple(policy["requiredHosts"]))[1]:
+        if canary_verdict(candidate["statuses"])[1]:
             # A release's own updater installs its successor, so a canary failure on a newer release can
             # be an older release's fault: nothing older is promoted until a newer one is healthy.
             reasons.append(f"{entry['tag']}: a canary reported failure; nothing older is promoted")

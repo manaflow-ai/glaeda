@@ -61,26 +61,30 @@ but still installs through `glaeda-mini-fleet upgrade` (below).
    files, so a newer hook is never downgraded). The canary hosts run no runners, so a hook change is
    gated by CI, the signed policy soak and these checks, not by a canary status.
 4. **Canary health.** A canary host with an authenticated `gh` posts the commit status
-   `glaeda-ota/<host>` (success or failure) on the release commit.
+   `glaeda-ota/<host>` (success or failure) on the release commit. Its gh calls ride out a spent
+   REST quota: a reset within five minutes is waited for, rate limits and transient errors are
+   retried with backoff, a failure waits out the reset (up to an hour) so it lands before another
+   canary's success can promote, and a success or failure that still is not delivered is kept in the host's
+   state.json and posted again by the next run (commit statuses have no GraphQL mutation to fall
+   back to). "Signed in" is the local `gh auth token`, not `gh auth status`, which spends quota.
 5. **Stable.** `.github/workflows/promote.yml` runs hourly, and each canary run also dispatches it,
    since GitHub's cron can lag for hours. It moves `stable` to the newest release for which all of
    these hold:
    - the release's signed `policy` is valid and its publication timestamp is older than that policy's
-     soak floor: new releases use a 15-minute window. Risk still controls canary coverage: low-risk
-     documentation/test-only changes need one canary, while normal, high-risk, and ambiguous changes
-     need explicit success from both Air Blue and Big Red. Historical signed 2/6/12-hour policies
-     remain readable during the transition; manifests without a policy retain the original 6-hour
-     fallback;
-   - low-risk releases have an explicit success from at least one canary; normal and high-risk
-     releases have explicit success from both registered canaries, Air Blue and Big Red;
-   - no required canary host's newest status is a failure, pending, or otherwise inconclusive;
+     soak floor: new releases use a 15-minute window. Historical signed 2/6/12-hour policies remain
+     readable during the transition; manifests without a policy retain the original 6-hour fallback;
+   - at least one canary host's newest status is success, and no canary host's newest status is a
+     failure. No host is required, whatever the risk: a canary that is silent or pending holds
+     nothing once the soak is over. Policies above low risk signed before 2026-10-19 list Air Blue and
+     Big Red in `requiredHosts`; they still parse, and the list is not enforced. (On 2026-10-19 a spent quota
+     kept Air Blue from reporting, and requiring it held stable on one build for 15 hours.);
    - it descends from the current stable;
    - no newer release has a canary failure. A release's own updater installs its successor, so a
      failure there can be the older release's fault; promotion waits until a newer one is healthy.
 
    Host authentication, network, stale-channel, and unsupported-host-profile observations are
-   reported as `pending` or omitted, so they block promotion without quarantining the release as a
-   bad artifact. Only verification, setup, or health failures are reported as release failures.
+   reported as `pending` or omitted, so they neither count toward promotion nor quarantine the
+   release as a bad artifact. Only verification, setup, or health failures are reported as release failures.
 
    It looks past the current canary on purpose: with several merges a day the newest release is
    never old enough, and stable would never move. Candidate age uses GitHub's `publishedAt`, the
@@ -97,7 +101,8 @@ End to end, a merged change reaches canary hosts in about an hour and stable hos
 | --- | --- | --- |
 | Air Blue | canary | Leo's Mac; `gh` is authenticated, so it reports health |
 | Big Red | canary | always on; reports health when the Mac is asleep |
-| manaflow minis | stable | build hosts: take only what both canaries have run for 15 minutes; download from the fleet mirror |
+| Cosmic Gray | canary | a second Mac; one more chance that some canary reports |
+| manaflow minis | stable | build hosts: take only what a canary has run healthy for 15 minutes and none failed; download from the fleet mirror |
 
 Set a host's ring once with `glaeda-mini-setup --apply --ota-ring canary` (or `stable`). The
 first setup writes the config with `stable`, and later runs leave it alone unless `--ota-ring`
