@@ -95,6 +95,7 @@ class FakeGitHub:
         self.protected: list[str] = []  # the classic protection's required contexts
         self.job_steps: dict[int, list] = {}  # job (check run) database id -> steps, for GET .../actions/jobs/ID
         self.base_gone = False  # the base branch was deleted: its rules and protection answer 404
+        self.heads: dict[tuple[str, str, str], list] = {}  # (owner, repo, sha) -> that commit's check contexts
 
     def rate(self, resource: str, remaining: int) -> dict:
         return {"x-ratelimit-limit": "5000", "x-ratelimit-remaining": str(remaining),
@@ -125,6 +126,19 @@ class FakeGitHub:
                                    "commit": {"oid": run.get("head_sha")},
                                    "branch": {"name": run["head_branch"]} if run.get("head_branch") else None}}
                 i += 1
+            if "object(oid:" in doc["query"]:
+                for m in re.finditer(r'(?:h(\d+): )?repository\(owner:"([^"]+)",name:"([^"]+)"\)\{object\(oid:"([0-9a-f]+)"\)'
+                                     r'\{\.\.\. on Commit\{statusCheckRollup\{contexts\(first:100(?:, after:"(\d+)")?\)', doc["query"]):
+                    alias, owner, repo, sha, after = m.groups()
+                    nodes = self.heads.get((owner, repo, sha))
+                    start = int(after or 0)
+                    node = None if nodes is None else {"statusCheckRollup": {"contexts": {
+                        "pageInfo": {"hasNextPage": start + 100 < len(nodes), "endCursor": str(start + 100)},
+                        "nodes": nodes[start:start + 100]}}}
+                    data["repository" if alias is None else f"h{alias}"] = {"object": node} if alias is not None else {
+                        "object": node}
+                out = {"data": data}
+                return 200, self.rate("graphql", self.graphql_remaining), json.dumps(out).encode()
             comments = "issueOrPullRequest" in doc["query"]
             alias, field, table = ("c", "issueOrPullRequest", self.issues) if comments else ("p", "pullRequest", self.prs)
             i = 0
@@ -2049,7 +2063,7 @@ class BudgetOutputTest(Base):
         gg.register("run:o/r/7")
         self.daemon.tick(NOW)
         status = gg.read_json(gg.BASE / "daemon.json")
-        self.assertEqual(status["paths"], {"pr": "graphql", "run": "graphql", "comment": "graphql"})
+        self.assertEqual(status["paths"], {"pr": "graphql", "run": "graphql", "comment": "graphql", "head": "graphql"})
         self.assertEqual(status["reads"]["run"], {"graphql": 1, "rest": 0})
         self.assertEqual(status["reads"]["pr"], {"graphql": 1, "rest": 0})
         lock = open(gg.BASE / "daemon.lock", "a+")
@@ -2710,6 +2724,248 @@ class RestartHintTest(unittest.TestCase):
         self.assertIn("kill 4321", message)
         with mock.patch.object(gg, "lock_holder", return_value=None):
             self.assertNotIn("kill", gg.stale_message(1235))
+
+
+SHA_A, SHA_B, SHA_C = "a" * 40, "b" * 40, "c" * 40
+
+
+class HeadChecksTest(Base):
+    """`glaeda-gh checks`: the daemon reads each head once for every session, within each consumer's budget."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.saved_config = gg.CONSUMERS_CONFIG
+        gg.CONSUMERS_CONFIG = Path(self.tmp.name) / "consumers.json"
+        self.addCleanup(setattr, gg, "CONSUMERS_CONFIG", self.saved_config)
+        for sha in (SHA_A, SHA_B, SHA_C):
+            self.gh.heads[("o", "r", sha)] = [check_run("CI / build"), check_run("CI / test", "COMPLETED", "FAILURE")]
+
+    def key(self, sha: str) -> str:
+        return gg.parse_key("head", f"o/r@{sha}")
+
+    def policy(self, **doc) -> None:
+        gg.write_json(gg.CONSUMERS_CONFIG, doc)
+
+    def test_one_batched_read_serves_every_consumer(self) -> None:
+        for consumer in ("session-1", "session-2"):
+            for sha in (SHA_A, SHA_B):
+                gg.register(self.key(sha), consumer=consumer)
+        self.daemon.tick(NOW)
+        self.assertEqual(len(self.gh.gql_calls()), 1)  # two heads, two consumers: one query
+        entry = gg.read_cache(self.key(SHA_A))
+        self.assertEqual(entry["data"]["found"], {"check / CI / build": ["completed", "success"],
+                                                  "check / CI / test": ["completed", "failure"]})
+        self.assertTrue(entry["data"]["settled"])
+        self.daemon.tick(NOW + gg.CYCLE)  # settled data is not read again within its TTL
+        self.assertEqual(len(self.gh.gql_calls()), 1)
+        ttl, gg.HEAD_SETTLED_TTL = gg.HEAD_SETTLED_TTL, 70  # a rerun can change a settled head: read after the TTL
+        self.addCleanup(setattr, gg, "HEAD_SETTLED_TTL", ttl)
+        self.daemon.tick(NOW + gg.HEAD_SETTLED_TTL + gg.TICK)
+        self.assertEqual(len(self.gh.gql_calls()), 2)
+
+    def test_pending_head_is_read_again_and_an_empty_one_is_not_settled(self) -> None:
+        self.gh.heads[("o", "r", SHA_A)] = [check_run("CI / build", "IN_PROGRESS", None)]
+        self.gh.heads[("o", "r", SHA_B)] = []
+        for sha in (SHA_A, SHA_B):
+            gg.register(self.key(sha), consumer="autoland")
+        self.daemon.tick(NOW)
+        self.assertFalse(gg.read_cache(self.key(SHA_A))["data"]["settled"])
+        self.assertFalse(gg.read_cache(self.key(SHA_B))["data"]["settled"])  # no checks yet is not "all finished"
+        self.gh.heads[("o", "r", SHA_A)] = [check_run("CI / build")]
+        self.daemon.tick(NOW + gg.HEAD_PENDING_TTL + gg.TICK)
+        self.assertTrue(gg.read_cache(self.key(SHA_A))["data"]["settled"])
+
+    def test_a_reserved_consumer_is_served_when_the_others_have_spent_their_budget(self) -> None:
+        self.policy(reserved={"autoland": 5}, limit=1, pool=1)
+        gg.register(self.key(SHA_A), consumer="session-1")
+        gg.register(self.key(SHA_B), consumer="session-1")
+        self.daemon.tick(NOW)
+        read = [sha for sha in (SHA_A, SHA_B) if gg.read_cache(self.key(sha))]
+        self.assertEqual(len(read), 1)  # limit 1: the second head waits for the cache
+        ledger = gg.read_json(gg.BASE / gg.CONSUMERS_FILE)["consumers"]
+        self.assertEqual((ledger["session-1"]["spent"], ledger["session-1"]["limit"]), (1, 1))
+        self.assertIsNotNone(ledger["session-1"]["deniedAt"])
+        gg.register(self.key(SHA_C), consumer="autoland")
+        for sha in (SHA_A, SHA_B):
+            gg.register(self.key(sha), consumer="autoland")
+        self.daemon.tick(NOW + gg.TICK)
+        self.assertTrue(all(gg.read_cache(self.key(sha)) for sha in (SHA_A, SHA_B, SHA_C)))
+        ledger = gg.read_json(gg.BASE / gg.CONSUMERS_FILE)["consumers"]
+        self.assertEqual(ledger["autoland"]["spent"], 2)  # the head session-1 read is shared, not read twice
+        self.assertTrue(ledger["autoland"]["reserved"])
+
+    def test_the_shared_pool_caps_all_unreserved_consumers_together(self) -> None:
+        self.policy(reserved={"autoland": 5}, limit=5, pool=2)
+        for consumer, sha in (("s1", SHA_A), ("s2", SHA_B), ("s3", SHA_C)):
+            gg.register(self.key(sha), consumer=consumer)
+        self.daemon.tick(NOW)
+        self.assertEqual(sum(1 for sha in (SHA_A, SHA_B, SHA_C) if gg.read_cache(self.key(sha))), 2)
+
+    def test_a_lean_quota_serves_only_reserved_consumers(self) -> None:
+        self.daemon.note_budget("graphql", 5000, gg.FLOORS["graphql"][0] - 50, NOW + 1800)
+        gg.register(self.key(SHA_A), consumer="session-1")
+        gg.register(self.key(SHA_B), consumer="autoland")
+        self.daemon.tick(NOW)
+        self.assertIsNone(gg.read_cache(self.key(SHA_A)))
+        self.assertIsNotNone(gg.read_cache(self.key(SHA_B)))
+
+    def test_spend_survives_a_daemon_restart(self) -> None:
+        self.policy(reserved={}, limit=1, pool=5)
+        gg.register(self.key(SHA_A), consumer="session-1")
+        self.daemon.tick(NOW)
+        again = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=None)
+        gg.register(self.key(SHA_B), consumer="session-1")
+        again.tick(NOW + gg.TICK)
+        self.assertIsNone(gg.read_cache(self.key(SHA_B)))
+
+    def test_more_than_a_hundred_checks_are_followed_page_by_page(self) -> None:
+        self.gh.heads[("o", "r", SHA_A)] = [check_run(f"CI / job {i}") for i in range(130)]
+        gg.register(self.key(SHA_A), consumer="autoland")
+        self.daemon.tick(NOW)
+        self.assertEqual(len(gg.read_cache(self.key(SHA_A))["data"]["found"]), 130)
+        self.assertEqual(len(self.gh.gql_calls()), 2)
+
+    def test_reads_that_fail_or_find_nothing_are_not_charged(self) -> None:
+        self.policy(reserved={"autoland": 5}, limit=5, pool=5)
+        gg.register(self.key("d" * 40), consumer="session-1")  # no such commit
+        self.daemon.tick(NOW)
+        self.assertEqual(len(self.daemon.head_spend.get("session-1", [])), 0)
+        gg.register(self.key(SHA_A), consumer="session-1")
+        self.gh.heads[("o", "r", SHA_A)] = [check_run("CI / build")] * 1
+        self.daemon.transport = lambda *a: (502, {}, b"{}")
+        self.daemon.tick(NOW + 5)
+        self.assertEqual(len(self.daemon.head_spend.get("session-1", [])), 0)
+        self.daemon.transport = self.gh
+        self.daemon.tick(NOW + 5 + 2 * gg.CYCLE)
+        self.assertEqual(len(self.daemon.head_spend["session-1"]), 1)
+
+    def test_a_missing_commit_is_asked_about_rarely(self) -> None:
+        gg.register(self.key("d" * 40), consumer="autoland")
+        self.daemon.tick(NOW)
+        before = len(self.gh.gql_calls())
+        self.daemon.tick(NOW + 3 * gg.CYCLE)
+        self.assertEqual(len(self.gh.gql_calls()), before)
+
+    def test_a_rerun_in_progress_is_not_settled(self) -> None:
+        failed = check_run("CI / test", "COMPLETED", "FAILURE")
+        rerun = {**check_run("CI / test", "IN_PROGRESS", None), "databaseId": 9}
+        failed["databaseId"] = 1
+        self.gh.heads[("o", "r", SHA_A)] = [failed, rerun]
+        gg.register(self.key(SHA_A), consumer="autoland")
+        self.daemon.tick(NOW)
+        self.assertFalse(gg.read_cache(self.key(SHA_A))["data"]["settled"])
+
+    def test_a_cut_off_head_is_an_error_not_a_green_verdict(self) -> None:
+        self.gh.heads[("o", "r", SHA_A)] = [check_run(f"CI / job {i}") for i in range(130)]
+        orig = gg.HEAD_BATCH_MAX_CONTEXTS_PAGES
+        gg.HEAD_BATCH_MAX_CONTEXTS_PAGES = 1
+        self.addCleanup(setattr, gg, "HEAD_BATCH_MAX_CONTEXTS_PAGES", orig)
+        gg.register(self.key(SHA_A), consumer="autoland")
+        self.daemon.tick(NOW)
+        entry = gg.read_cache(self.key(SHA_A))
+        self.assertIsNone(entry["data"])
+        self.assertIn("more than", entry["error"])
+
+    def test_an_unknown_commit_is_missing_not_pending(self) -> None:
+        gg.register(self.key("d" * 40), consumer="autoland")
+        self.daemon.tick(NOW)
+        entry = gg.read_cache(self.key("d" * 40))
+        self.assertTrue(entry["missing"])
+
+    def test_checks_command_serves_cache_and_reports_what_it_could_not_read(self) -> None:
+        gg.BASE.mkdir(parents=True, exist_ok=True)
+        lock = open(gg.BASE / "daemon.lock", "a+")
+        fcntl.flock(lock, fcntl.LOCK_EX)  # stands in for a running daemon
+        self.addCleanup(lock.close)
+        now = time.time()
+        found = {"check / CI / build": ["completed", "success"]}
+        gg.write_json(gg.cache_dir() / gg.file_name(self.key(SHA_A)), {
+            "key": self.key(SHA_A), "dataAt": now, "fetchedAt": now,
+            "data": {"sha": SHA_A, "found": found, "ids": {}, "settled": True}})
+        gg.write_json(gg.BASE / gg.CONSUMERS_FILE, {"consumers": {"session-1": {"spent": 3, "limit": 3, "deniedAt": now + 5}}})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = gg.cmd_checks("o/r", [SHA_A, SHA_B], "session-1", 120, 0.3, True)
+        doc = json.loads(out.getvalue())
+        self.assertEqual(code, gg.EXIT_PARTIAL)
+        self.assertEqual(doc["heads"][SHA_A]["found"], found)
+        self.assertFalse(doc["heads"][SHA_A]["stale"])
+        self.assertEqual(doc["unread"], {SHA_B: "budget spent"})
+        # asking registered the consumer's interest for the daemon to pick up
+        asked = gg.read_json(gg.watch_dir() / gg.file_name(self.key(SHA_B)))["consumers"]
+        self.assertIn("session-1", asked)
+        # settled data is served; fully served means exit 0
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gg.cmd_checks("o/r", [SHA_A], "autoland", 120, 0, True), gg.EXIT_OK)
+
+
+class FileAndPidWaitTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        poll = gg.WAIT_FILE_POLL
+        gg.WAIT_FILE_POLL = 0.02
+        self.addCleanup(setattr, gg, "WAIT_FILE_POLL", poll)
+
+    def wait_file(self, name: str, timeout: float = 0.3, mode: str = "nonempty", contains: str | None = None):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = gg.cmd_wait_file(str(self.dir / name), timeout, True, mode, contains)
+        return code, json.loads(out.getvalue())
+
+    def later(self, delay: float, action) -> threading.Timer:
+        timer = threading.Timer(delay, action)
+        timer.start()
+        self.addCleanup(timer.cancel)
+        return timer
+
+    def test_waits_for_a_nonempty_file(self) -> None:
+        target = self.dir / "never1.txt"
+        target.write_text("")
+        self.later(0.1, lambda: target.write_text("x"))
+        code, doc = self.wait_file("never1.txt", 2)
+        self.assertEqual((code, doc["result"]), (0, "success"))
+
+    def test_an_empty_file_times_out_unless_exists_is_enough(self) -> None:
+        (self.dir / "empty").write_text("")
+        self.assertEqual(self.wait_file("empty")[0], gg.EXIT_TIMEOUT)
+        self.assertEqual(self.wait_file("empty", mode="exists")[0], 0)
+
+    def test_gone_and_contains_and_glob(self) -> None:
+        target = self.dir / "flag"
+        target.write_text("x")
+        self.later(0.1, target.unlink)
+        self.assertEqual(self.wait_file("flag", 2, mode="gone")[0], 0)
+        (self.dir / "log").write_text("building\n")
+        self.assertEqual(self.wait_file("log", contains="finished")[0], gg.EXIT_TIMEOUT)
+        self.later(0.1, lambda: (self.dir / "log").write_text("building\nfinished ok\n"))
+        self.assertEqual(self.wait_file("log", 2, contains="finished")[0], 0)
+        self.later(0.1, lambda: (self.dir / "never7.txt").write_text("y"))
+        code, doc = self.wait_file("never*.txt", 2)
+        self.assertEqual((code, doc["path"]), (0, str(self.dir / "never7.txt")))
+
+    def test_waits_for_a_process_to_exit(self) -> None:
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.3)"])
+        self.addCleanup(proc.wait)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = gg.cmd_wait_pid(str(proc.pid), 0.05, True)
+        self.assertEqual(code, gg.EXIT_TIMEOUT)
+        threading.Thread(target=proc.wait, daemon=True).start()  # reap it, as a shell would
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(gg.cmd_wait_pid(str(proc.pid), 5, True), 0)
+        with self.assertRaises(gg.WatchError):
+            gg.cmd_wait_pid("abc", 1, False)
+
+    def test_cli_parses_the_new_forms(self) -> None:
+        target = self.dir / "ready"
+        target.write_text("1")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(gg.main(["wait", "file", str(target), "--timeout", "2"]), 0)
+            self.assertEqual(gg.main(["wait", "file", str(target), "--gone", "--timeout", "0.1"]), gg.EXIT_TIMEOUT)
+
 
 
 if __name__ == "__main__":

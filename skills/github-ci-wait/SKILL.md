@@ -49,6 +49,32 @@ glaeda-gh budget                                 # REST and GraphQL left, the da
 - `wait` only rules on data fetched after it started, so it answers within about a minute at the earliest.
 - Add `--json` for machine-readable output. URLs work too: `glaeda-gh wait pr https://github.com/o/r/pull/12`.
 
+## Waiting on a file or a process: no sleep loops
+
+```bash
+glaeda-gh wait file PATH --timeout 600           # exists and not empty ([ -s PATH ]); PATH may be a glob
+glaeda-gh wait file PATH --exists | --gone | --contains 'REGEX'
+glaeda-gh wait pid 12345                         # until the process exits
+```
+
+Exit 0 when ready, 2 on timeout. Run it with `run_in_background`. The polling hook refuses
+`until [ -s FILE ]; do sleep N; done`-style loops (on 2026-10-20 Huge Blue had nine of them keeping
+sessions alive); these commands replace them.
+
+## Reading many heads' checks: glaeda-gh checks
+
+```bash
+glaeda-gh checks OWNER/REPO SHA [SHA ...] --consumer NAME --json
+```
+
+The daemon reads each commit's checks once for every session and keeps them (a finished head 10
+minutes, a running one 90 s), so ten sessions asking about one head cost one read. `--consumer` is
+who you are (`autoland` for next-autoland, otherwise your session's name): each consumer has an
+hourly budget of head reads. `autoland` is reserved, so its reads are served whatever the others
+use; other consumers share a pool and, once it is spent or the quota is lean, get the cached answer
+(`stale: true`) or `unread`. Exit 0 all fresh, 5 some stale or unread. `glaeda-gh budget` shows each
+consumer's spend. Prefer it over `gh pr checks` or `gh api .../check-runs` for more than a look.
+
 ## After a push: --sha
 
 Pass the commit you pushed: `--sha "$(git rev-parse HEAD)"`. Checks of an older head then count

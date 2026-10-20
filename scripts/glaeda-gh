@@ -8,6 +8,10 @@
     glaeda-gh wait run OWNER/REPO/RUN_ID [--jobs] [--rescue-grace S] [--timeout S] [--json]
     glaeda-gh wait comment OWNER/REPO#N [--author LOGIN] [--match REGEX] [--since ID|URL|TIME|10m]
     glaeda-gh status comment OWNER/REPO#N               the latest comments on an issue or PR
+    glaeda-gh wait file PATH [--exists|--gone] [--contains REGEX] [--timeout S]   a file, instead of a sleep loop
+    glaeda-gh wait pid PID [--timeout S]                a process to exit, instead of a `kill -0` loop
+    glaeda-gh checks OWNER/REPO SHA... --consumer NAME [--max-age S] [--wait S] [--json]
+                                                        every check of those commits, read once for all sessions
     glaeda-gh budget [--json]                           REST and GraphQL quota as last seen
     glaeda-gh restart [--force]                         restart a down or hung daemon, once for every session
 
@@ -54,6 +58,20 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   controller token. Controller: $CMUX_CI_CONTROLLER, else the cmux-ci client config, else the
   fleet default; token: $CMUX_CI_TOKEN_FILE, else ~/.config/cmux/build-fleet/controller.token.
 
+- `checks` is the shared check read. A client names itself (--consumer autoland, or a session's name)
+  and lists commits; the daemon reads each commit once, in batched GraphQL queries, for every consumer
+  that asked, and keeps the answer: a commit whose checks all finished for HEAD_SETTLED_TTL (10 min),
+  one with checks running for HEAD_PENDING_TTL (90 s), and only while someone asked in the last 10
+  minutes. Each consumer has an hourly budget of head reads (the read is charged to the first consumer
+  that may pay, reserved ones first, and shared by the rest). A reserved consumer (autoland, 1500 an
+  hour) is served even when the GraphQL quota is lean, whatever the others used; the others share a
+  pool (600 an hour, 240 each) and see the cache alone once it is spent or the quota is lean. Tune
+  with ~/.config/glaeda/gh-consumers.json: {"reserved": {"autoland": 1500}, "limit": 240, "pool": 600}.
+  A head the daemon may not read is served stale when it has an older answer, else listed as unread
+  ("budget spent" or "not read yet"); `checks` exits 5 then. `budget` shows each consumer's spend.
+- `wait file` and `wait pid` poll the local disk or process table once a second in one process. They
+  exist so no session writes a sleep loop (the polling hook refuses those).
+
 Clients make no API calls. When the daemon is not running they say so and exit 3 rather than
 fall back to polling. `wait` exits 0 on success (or a matching comment), 1 on failure (a failed
 check, a failed run, a PR closed without being merged, an issue that does not exist), 2 on timeout,
@@ -94,6 +112,7 @@ import contextlib
 import datetime as dt
 import faulthandler
 import fcntl
+import glob
 import hashlib
 from http.client import HTTPException  # the http() helper below shadows the `http` package
 import json
@@ -194,14 +213,32 @@ REST_SAFETY = 900  # a run the controller tracks is still read over REST this of
 CONTROLLER_ABSENT = 900  # a controller without the run-events receiver (404, 503) is asked again this rarely
 FEED_PAGES = 5  # feed pages read per tick at most; a longer backlog continues on the next tick
 NUDGE_MIN = 20  # a PR a check event nudged is re-read at most this often (GraphQL points)
+# Head check reads (`glaeda-gh checks`): every session that wants a commit's checks asks the daemon, which
+# reads each head once for all of them, in batched GraphQL queries, and keeps the answer. Each asker names
+# a consumer; a consumer has an hourly budget of head reads. A reserved consumer (next-autoland) is always
+# served up to its reservation, whatever the others have used; the rest share a pool, each capped, and are
+# served from the cache alone once spent or when the GraphQL quota is lean.
+HEAD_SETTLED_TTL = 600  # a head whose checks all finished is re-read this rarely (a rerun can change it)
+HEAD_PENDING_TTL = 90  # a head with checks still running is re-read this often while someone wants it
+HEAD_INTEREST = 600  # a consumer that asked this recently still wants the head read
+HEAD_BATCH_MAX_CONTEXTS_PAGES = 20  # pages of 100 checks one head is followed through; more is an error, not a verdict
+HEAD_MISSING_RETRY = 600  # a commit GitHub does not know is asked about this rarely
+CONSUMER_WINDOW = 3600
+CONSUMER_DEFAULTS = {"reserved": {"autoland": 1500}, "limit": 240, "pool": 600}  # head reads an hour
+CONSUMERS_CONFIG = Path.home() / ".config/glaeda/gh-consumers.json"  # same keys as CONSUMER_DEFAULTS
+CONSUMERS_FILE = "consumers.json"  # the daemon's spend, denials and limits, for clients and `budget`
+WAIT_FILE_POLL = 1.0  # `wait file` and `wait pid` look this often (local stat calls only, no GitHub)
+EXIT_PARTIAL = 5  # `checks`: some heads were served stale or not at all
+VERDICTS = {"success", "neutral", "failure", "timed_out", "action_required", "startup_failure"}
 
 NAME = r"[A-Za-z0-9_.-]+"
 PR_RE = re.compile(rf"(?:https://github\.com/)?({NAME})/({NAME})(?:#|/pull/)(\d+)(?:[/?#].*)?")
 RUN_RE = re.compile(rf"(?:https://github\.com/)?({NAME})/({NAME})/(?:actions/runs/)?(\d+)(?:[/?#].*)?")
 ISSUE_RE = re.compile(rf"(?:https://github\.com/)?({NAME})/({NAME})(?:#|/pull/|/issues/)(\d+)(?:[/?#].*)?")
-KEY_RES = {"pr": PR_RE, "run": RUN_RE, "comment": ISSUE_RE}
-CYCLES = {"pr": CYCLE, "run": CYCLE, "comment": COMMENT_CYCLE}
-BUCKETS = {"pr": "graphql", "run": "rest", "comment": "graphql"}  # each kind's usual bucket
+HEAD_RE = re.compile(rf"(?:https://github\.com/)?({NAME})/({NAME})(?:@|/commit/)([0-9a-fA-F]{{40}})")
+KEY_RES = {"pr": PR_RE, "run": RUN_RE, "comment": ISSUE_RE, "head": HEAD_RE}
+CYCLES = {"pr": CYCLE, "run": CYCLE, "comment": COMMENT_CYCLE, "head": CYCLE}
+BUCKETS = {"pr": "graphql", "run": "rest", "comment": "graphql", "head": "graphql"}  # each kind's usual bucket
 OTHER = {"rest": "graphql", "graphql": "rest"}
 BALANCED = ("pr", "run")  # kinds either bucket can read; comment watches stay on GraphQL
 RICH_WINDOW_MIN = 60  # seconds: a bucket about to reset is rich, but not infinitely so
@@ -246,15 +283,18 @@ def parse_key(kind: str, text: str) -> str:
                 "comment": "OWNER/REPO#N or an issue or pull request URL"}.get(kind, "pr, run or comment")
         raise WatchError(f"{kind} must be {form}, not {text!r}")
     owner, repo, number = match.groups()
+    if kind == "head":
+        return f"head:{owner.lower()}/{repo.lower()}@{number.lower()}"
     sep = "/" if kind == "run" else "#"
     return f"{kind}:{owner.lower()}/{repo.lower()}{sep}{int(number)}"
 
 
-def split_key(key: str) -> tuple[str, str, str, int]:
+def split_key(key: str) -> tuple[str, str, str, Any]:
+    """(kind, owner, repo, number); a head's last part is its 40-hex commit id."""
     kind, rest = key.split(":", 1)
     owner, rest = rest.split("/", 1)
-    repo, number = re.split(r"[#/]", rest, maxsplit=1)
-    return kind, owner, repo, int(number)
+    repo, number = re.split(r"[#/@]", rest, maxsplit=1)
+    return kind, owner, repo, number.lower() if kind == "head" else int(number)
 
 
 def watch_dir() -> Path:
@@ -288,17 +328,34 @@ def read_cache(key: str) -> dict | None:
     return doc if isinstance(doc, dict) and doc.get("key") == key else None
 
 
-def register(key: str, jobs: bool = False) -> None:
-    """Record interest in `key`. Wanting jobs is sticky while any reader wants them."""
+def register(key: str, jobs: bool = False, consumer: str | None = None) -> None:
+    """Record interest in `key`. Wanting jobs is sticky while any reader wants them. A head's readers
+    are named consumers, each with the time it last asked."""
     path = watch_dir() / file_name(key)
+    watch_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
+    with open(watch_dir() / ".register.lock", "a+") as lock:  # read-modify-write: two sessions must not lose each other
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        _register_locked(path, key, jobs, consumer)
+
+
+def _register_locked(path: Path, key: str, jobs: bool, consumer: str | None) -> None:
     prior = read_json(path) or {}
-    write_json(path, {"key": key, "jobs": bool(jobs or prior.get("jobs"))})
+    doc: dict[str, Any] = {"key": key, "jobs": bool(jobs or prior.get("jobs"))}
+    if consumer:
+        asked = prior.get("consumers") if isinstance(prior.get("consumers"), dict) else {}
+        now = time.time()
+        doc["consumers"] = {**{k: v for k, v in asked.items() if now - float(v or 0) < HEAD_INTEREST}, consumer: now}
+    elif isinstance(prior.get("consumers"), dict):
+        doc["consumers"] = prior["consumers"]
+    write_json(path, doc)
 
 
 def terminal(kind: str, data: dict | None) -> bool:
     """Merged or closed PRs and completed runs; a comment watch never is (a reply can always come)."""
     if not data or kind == "comment":
         return False
+    if kind == "head":
+        return bool(data.get("settled"))
     return data.get("state") in {"MERGED", "CLOSED"} if kind == "pr" else data.get("status") == "completed"
 
 
@@ -776,6 +833,71 @@ def jobs_attempt(jobs: list[dict] | None) -> int:
 # ---------------------------------------------------------------- daemon
 
 
+def newest_verdict(found: list[tuple[int, str, str]]) -> tuple[str, str]:
+    """(status, conclusion) of a check from its runs (id, status, conclusion): the newest run with a verdict,
+    so a later skipped, cancelled or still-running run never hides an earlier failure; the newest run when
+    none has a verdict yet."""
+    found = sorted(found)
+    verdicts = [r for r in found if r[1] == "completed" and r[2] in VERDICTS]
+    _, status, conclusion = verdicts[-1] if verdicts else found[-1]
+    return status, conclusion
+
+
+HEAD_CONTEXTS = """statusCheckRollup{contexts(first:100%s){pageInfo{hasNextPage endCursor} nodes{__typename
+... on CheckRun{databaseId name status conclusion checkSuite{app{slug} workflowRun{workflow{name}}}}
+... on StatusContext{context state}}}}"""
+
+
+def head_query(owner: str, repo: str, sha: str, cursor: str | None = None) -> str:
+    after = f', after:"{cursor}"' if cursor else ""
+    return (f'repository(owner:"{owner}",name:"{repo}"){{object(oid:"{sha}"){{... on Commit{{'
+            + HEAD_CONTEXTS % after + "}}}")
+
+
+def fold_contexts(nodes: list, runs: dict, statuses: dict, ids: dict) -> None:
+    """Add one page of a head's contexts to runs (`workflow / job` -> [(id, status, conclusion)]), statuses
+    (`status / context` -> (status, conclusion)) and ids (failed Actions jobs)."""
+    for item in nodes or []:
+        if not item:
+            continue
+        if item.get("__typename") == "StatusContext":
+            state = (item.get("state") or "").lower()
+            statuses[f"status / {item['context']}"] = (
+                "in_progress" if state in ("pending", "expected") else "completed",
+                "failure" if state == "error" else state)
+            continue
+        suite = item.get("checkSuite") or {}
+        slug = (suite.get("app") or {}).get("slug")
+        owner = (((suite.get("workflowRun") or {}).get("workflow") or {}).get("name") or slug or "check")
+        key = f"{owner} / {item['name']}"
+        conclusion = (item.get("conclusion") or "").lower()
+        runs.setdefault(key, []).append((item.get("databaseId") or 0, (item.get("status") or "").lower(), conclusion))
+        if slug == "github-actions" and conclusion == "failure" and item.get("databaseId"):
+            ids.setdefault(key, []).append(item["databaseId"])
+
+
+def head_data(sha: str, runs: dict, statuses: dict, ids: dict) -> dict:
+    found = {key: list(newest_verdict(rs)) for key, rs in runs.items()}
+    found.update({key: list(value) for key, value in statuses.items()})
+    # no check yet is not "all finished": a push's checks appear a few seconds later
+    running = any(st != "completed" for rs in runs.values() for _, st, _ in rs)
+    settled = bool(found) and not running and all(status == "completed" for status, _ in found.values())
+    return {"sha": sha, "found": found, "ids": ids, "settled": settled}
+
+
+def consumer_policy() -> dict:
+    """CONSUMER_DEFAULTS with the keys of ~/.config/glaeda/gh-consumers.json laid over them."""
+    policy = {**CONSUMER_DEFAULTS, "reserved": dict(CONSUMER_DEFAULTS["reserved"])}
+    doc = read_json(CONSUMERS_CONFIG)
+    if isinstance(doc, dict):
+        if isinstance(doc.get("reserved"), dict):
+            policy["reserved"] = {str(k): int(v) for k, v in doc["reserved"].items() if isinstance(v, (int, float))}
+        for k in ("limit", "pool"):
+            if isinstance(doc.get(k), (int, float)):
+                policy[k] = int(doc[k])
+    return policy
+
+
 class Daemon:
     def __init__(self, transport: Callable = http, token: Callable[[], str] = gh_token,
                  controller: Any = "env") -> None:
@@ -816,6 +938,15 @@ class Daemon:
         self.failing: dict[str, Any] | None = None  # set while ticks raise: the latest error and since when
         self.tick_deadline = float("inf")  # time.monotonic() after which this tick starts no request
         self.deferred: set[str] = set()  # keys a tick ran out of time for: read first on the next tick
+        saved = read_json(BASE / CONSUMERS_FILE)
+        spends = saved.get("spends") if isinstance(saved, dict) else None
+        # consumer -> times of the head reads charged to it in the last hour
+        self.head_spend: dict[str, list[float]] = {
+            str(k): [float(t) for t in v if isinstance(t, (int, float))]
+            for k, v in (spends or {}).items() if isinstance(v, list)}
+        self.payer: dict[str, tuple[str, float]] = {}  # head key -> (consumer, time) charged for a read in flight
+        self.denied: dict[str, float] = {}  # consumer -> when a head read it needed was refused for budget
+        self.saved_consumers: str = ""
 
     # -- budget
 
@@ -921,11 +1052,13 @@ class Daemon:
             cached = read_cache(key)
             kind = split_key(key)[0]
             # a comment watch only serves a wait that is running: it touches the file every 30 s
-            done = kind == "comment" or (cached is not None and terminal(kind, cached.get("data")))
+            done = kind == "comment" or (kind != "head" and cached is not None and terminal(kind, cached.get("data")))
             if age > IDLE_EXPIRY or (done and age > TERMINAL_GRACE):
                 path.unlink(missing_ok=True)
                 continue
-            out.append({"key": key, "jobs": bool(doc.get("jobs")), "cache": cached, "touched": self.now - age})
+            asked = doc.get("consumers") if isinstance(doc.get("consumers"), dict) else {}
+            out.append({"key": key, "jobs": bool(doc.get("jobs")), "cache": cached, "touched": self.now - age,
+                        "consumers": {str(k): float(v) for k, v in asked.items() if isinstance(v, (int, float))}})
         return out
 
     def due(self, kind: str, entries: list[dict]) -> list[dict]:
@@ -933,6 +1066,8 @@ class Daemon:
         mode = self.mode(self.route(kind))
         if mode == "stop":
             return []
+        if kind == "head":
+            return self.due_heads(mine, mode)
         interval = CYCLES[kind] * (LEAN_FACTOR if mode == "lean" else 1)
         full = self.now - self.last_cycle[kind] >= interval
         if full:
@@ -977,8 +1112,77 @@ class Daemon:
             self.attempted[e["key"]] = self.now
         return out
 
+    def head_allowed(self, name: str, mode: str, policy: dict) -> bool:
+        """Whether this consumer may be charged one more head read now. A reserved consumer has its own
+        hourly reservation and is served even when the quota is lean; anyone else draws on the shared
+        pool (and a per-consumer cap) and waits for the cache when the quota is lean."""
+        spent = len(self.head_spend.get(name, []))
+        if name in policy["reserved"]:
+            return spent < policy["reserved"][name]
+        if mode != "normal":
+            return False
+        pool = sum(len(v) for k, v in self.head_spend.items() if k not in policy["reserved"])
+        return spent < policy["limit"] and pool < policy["pool"]
+
+    def refund(self, key: str) -> None:
+        """A head read that deferred or failed costs its consumer nothing."""
+        paid = self.payer.pop(key, None)
+        if paid and paid[1] in self.head_spend.get(paid[0], []):
+            self.head_spend[paid[0]].remove(paid[1])
+
+    def due_heads(self, mine: list[dict], mode: str) -> list[dict]:
+        """Heads somebody asked for recently whose answer is missing or older than its TTL. One read serves
+        every consumer of the head; it is charged to the first consumer (reserved ones first) that may pay.
+        A head nobody may pay for is left to the cache, and the refused consumers are marked denied."""
+        policy = consumer_policy()
+        self.head_spend = {k: [t for t in v if self.now - t < CONSUMER_WINDOW] for k, v in self.head_spend.items()}
+        for key, (_, at) in list(self.payer.items()):
+            if self.now - at > 2 * CYCLE:  # a read that raised never reported back
+                self.refund(key)
+        out = []
+        for e in mine:
+            asked = {n: t for n, t in e["consumers"].items() if self.now - t < HEAD_INTEREST}
+            c = e["cache"] or {}
+            if not asked:
+                continue
+            if c.get("data"):
+                ttl = HEAD_SETTLED_TTL if c["data"].get("settled") else HEAD_PENDING_TTL
+                if self.now - (c.get("dataAt") or 0) < ttl:
+                    continue
+            retry = HEAD_MISSING_RETRY if c.get("missing") else CYCLES["head"]
+            if e["key"] in self.deferred:
+                self.deferred.discard(e["key"])  # the last tick ran out of time for it: no cycle to wait
+            elif self.now - self.attempted.get(e["key"], float("-inf")) < retry:
+                continue  # a read that failed, found nothing or is still running waits a cycle
+            payer = next((n for n in sorted(asked, key=lambda n: (n not in policy["reserved"], n))
+                          if self.head_allowed(n, mode, policy)), None)
+            if payer is None:
+                for n in asked:
+                    self.denied[n] = self.now
+                continue
+            self.head_spend.setdefault(payer, []).append(self.now)
+            self.payer[e["key"]] = (payer, self.now)
+            self.attempted[e["key"]] = self.now
+            out.append(e)
+        return out
+
+    def write_consumers(self) -> None:
+        policy = consumer_policy()
+        names = sorted(set(self.head_spend) | set(self.denied) | set(policy["reserved"]))
+        doc = {"policy": policy, "consumers": {
+            n: {"reserved": n in policy["reserved"], "spent": len(self.head_spend.get(n, [])),
+                "limit": policy["reserved"].get(n, policy["limit"]), "deniedAt": self.denied.get(n)}
+            for n in names}, "spends": {n: [round(t) for t in v] for n, v in self.head_spend.items() if v}}
+        text = json.dumps(doc, sort_keys=True)
+        # rewritten when a spend or denial changes (the ticks' own `at` would make every tick a write)
+        if text != self.saved_consumers:
+            write_json(BASE / CONSUMERS_FILE, {**doc, "at": self.now})
+            self.saved_consumers = text
+
     def defer(self, entries: list[dict]) -> None:
         self.deferred.update(e["key"] for e in entries)
+        for e in entries:
+            self.refund(e["key"])
 
     def tick(self, now: float | None = None) -> dict:
         self.now = time.time() if now is None else now
@@ -992,10 +1196,11 @@ class Daemon:
             # says what failed; anything else is a bug, so it carries its code site.
             self.controller_down(error, None if isinstance(error, WatchError) else error_site(error))
         prs, runs, comments = self.due("pr", entries), self.due("run", entries), self.due("comment", entries)
+        heads = self.due("head", entries)
         over = {kind: self.paths[kind] for kind in BALANCED}  # due() routed each kind
         gql_prs, gql_runs = (prs if over["pr"] == "graphql" else []), (runs if over["run"] == "graphql" else [])
         for kind, batch, fetch in (("pr", gql_prs, self.fetch_prs), ("comment", comments, self.fetch_comments),
-                                   ("run", gql_runs, self.fetch_runs_graphql)):
+                                   ("run", gql_runs, self.fetch_runs_graphql), ("head", heads, self.fetch_heads)):
             self.batched(kind, batch, fetch)
         over_rest = (prs if over["pr"] == "rest" else []) + (runs if over["run"] == "rest" else [])
         for i, e in enumerate(over_rest):
@@ -1011,18 +1216,19 @@ class Daemon:
         self.tick_deadline = float("inf")
         self.deferred &= {e["key"] for e in entries}
         self.attempted = {k: t for k, t in self.attempted.items() if self.now - t < 2 * IDLE_EXPIRY}
-        oldest = self.oldest_data(entries, {e["key"] for e in prs + runs + comments})
+        oldest = self.oldest_data(entries, {e["key"] for e in prs + runs + comments + heads})
         self.prune({e["key"] for e in entries})
         if self.budget != self.saved_budget:
             write_json(BASE / "budget.json", self.budget)
             self.saved_budget = json.loads(json.dumps(self.budget))
+        self.write_consumers()
         self.sent = [(t, what) for t, what in self.sent if self.now - t < 3600]
         hour = {what: sum(1 for _, w in self.sent if w == what) for what in ("rest", "rest304", "graphql")}
         self.reads = [r for r in self.reads if self.now - r[0] < 3600]
         reads = {kind: {b: sum(1 for _, k, w in self.reads if k == kind and w == b) for b in ("graphql", "rest")}
                  for kind in CYCLES}
         status = {"pid": os.getpid(), "at": self.now, "watching": len(entries),
-                  "fetched": {"pr": len(prs), "run": len(runs), "comment": len(comments)},
+                  "fetched": {"pr": len(prs), "run": len(runs), "comment": len(comments), "head": len(heads)},
                   "controller": {**self.controller_status, "runs": len(self.controller_filled)},
                   "modes": {b: self.mode(b) for b in ("rest", "graphql")}, "errors": self.errors[:10],
                   "lastHour": hour, "heartbeat": HEARTBEAT_EVERY, "paths": dict(self.paths), "reads": reads,
@@ -1030,7 +1236,7 @@ class Daemon:
                   "batch": dict(self.batch), "oldestData": oldest, "deferred": len(self.deferred)}
         # the heartbeat lets clients tell a hung daemon (lock held, nothing written) from an idle one
         recovered, self.failing = self.failing is not None, None
-        if recovered or prs or runs or comments or self.errors or self.now - self.beat >= HEARTBEAT_EVERY:
+        if recovered or prs or runs or comments or heads or self.errors or self.now - self.beat >= HEARTBEAT_EVERY:
             write_json(BASE / "daemon.json", status)
             self.beat = self.now
         self.status = status
@@ -1196,6 +1402,62 @@ class Daemon:
 
     def fetch_comments(self, entries: list[dict]) -> str | None:
         return self.fetch_aliased(entries, "comment")
+
+    def fetch_heads(self, entries: list[dict]) -> str | None:
+        """Every check on each head commit, one aliased query for the batch (a head with more than 100
+        contexts is followed page by page). None, or the error when the whole query failed."""
+        parts = []
+        for i, e in enumerate(entries):
+            _, owner, repo, sha = split_key(e["key"])
+            parts.append(f"h{i}: " + head_query(owner, repo, sha))
+        self.reads += [(self.now, "head", "graphql")] * len(entries)
+        doc, error = self.graphql("query{rateLimit{limit remaining resetAt cost}\n" + "\n".join(parts) + "}", {})
+        if doc is None:
+            self.fail(entries, error or "graphql: no response")
+            for e in entries:
+                self.refund(e["key"])
+            return error or "graphql: no response"
+        data = doc.get("data") or {}
+        if not data and doc.get("errors"):
+            message = "graphql: " + str((doc["errors"][0] or {}).get("message"))[:200]
+            self.fail(entries, message)
+            for e in entries:
+                self.refund(e["key"])
+            return message
+        for i, e in enumerate(entries):
+            _, owner, repo, sha = split_key(e["key"])
+            node = ((data.get(f"h{i}") or {}).get("object") or {}).get("statusCheckRollup")
+            if not (data.get(f"h{i}") or {}).get("object"):
+                self.store(e["key"], e["cache"], error="no such commit", missing=True)
+                self.refund(e["key"])
+                continue
+            result = self.head_pages(owner, repo, sha, (node or {}).get("contexts") or {})
+            if isinstance(result, str):
+                self.store(e["key"], e["cache"], error=result)
+                self.refund(e["key"])
+            else:
+                self.store(e["key"], e["cache"], error=None, dataAt=self.now, data=result)
+                self.payer.pop(e["key"], None)  # answered: the charge stands
+
+    def head_pages(self, owner: str, repo: str, sha: str, contexts: dict) -> dict | str:
+        """A head's data from its first page of contexts, following the rest page by page; an error message
+        when a later page cannot be read (the head keeps its older answer)."""
+        runs: dict = {}
+        statuses: dict = {}
+        ids: dict = {}
+        for _ in range(HEAD_BATCH_MAX_CONTEXTS_PAGES):
+            fold_contexts(contexts.get("nodes"), runs, statuses, ids)
+            page = contexts.get("pageInfo") or {}
+            if not page.get("hasNextPage"):
+                return head_data(sha, runs, statuses, ids)
+            more, error = self.graphql("query{" + head_query(owner, repo, sha, page.get("endCursor")) + "}", {})
+            if more is None:
+                return error or "graphql: no response"
+            rollup = ((((more.get("data") or {}).get("repository") or {}).get("object") or {}).get("statusCheckRollup"))
+            if more.get("errors") or not rollup:  # a partial page would read as a smaller, greener head
+                return "graphql: " + str(((more.get("errors") or [{}])[0] or {}).get("message") or "no further page")[:200]
+            contexts = rollup.get("contexts") or {}
+        return f"more than {HEAD_BATCH_MAX_CONTEXTS_PAGES * 100} checks on one commit"
 
     def fill_steps(self, pairs: list[tuple[dict, dict]]) -> None:
         """Name the failed steps of each failed check run. A completed check does not change, so a
@@ -2355,6 +2617,163 @@ def cmd_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_
         time.sleep(min(WAIT_POLL, max(0.1, timeout - (now - start))))
 
 
+def file_ready(pattern: str, mode: str, contains: re.Pattern | None) -> str | None:
+    """The first path matching the glob `pattern` that satisfies `mode` (nonempty, exists, gone), else None."""
+    path = os.path.expanduser(pattern)
+    matches = glob.glob(path) if glob.has_magic(path) else ([path] if os.path.lexists(path) else [])
+    if mode == "gone":
+        return pattern if not matches else None
+    for found in sorted(matches):
+        if mode == "exists" and contains is None:
+            return found  # even a dangling symlink exists
+        try:
+            size = os.stat(found).st_size
+            if mode == "nonempty" and size == 0 and not os.path.isdir(found):
+                continue
+            if contains is not None and not contains.search(Path(found).read_text(errors="replace")):
+                continue
+        except OSError:
+            continue
+        return found
+    return None
+
+
+def cmd_wait_file(target: str, timeout: float, as_json: bool, mode: str = "nonempty",
+                  contains: str | None = None) -> int:
+    """Block until a file exists and is not empty (`[ -s FILE ]`), exists (--exists), or is gone (--gone),
+    optionally with a line matching --contains. PATH may be a glob. Local stat calls only; no GitHub."""
+    try:
+        pattern = re.compile(contains, re.M) if contains else None
+    except re.error as error:
+        raise WatchError(f"--contains {contains!r} is not a regular expression: {error}")
+    if contains and mode == "gone":
+        raise WatchError("--contains does not apply to --gone")
+    start = time.monotonic()
+    while True:
+        found = file_ready(target, mode, pattern)
+        waited = int(time.monotonic() - start)
+        if found is not None:
+            print(json.dumps({"result": "success", "path": found, "waited_s": waited}) if as_json
+                  else f"glaeda-gh: {found} {'is gone' if mode == 'gone' else 'is ready'} after {waited}s")
+            return EXIT_OK
+        if time.monotonic() - start >= timeout:
+            print(json.dumps({"result": "timeout", "path": target, "waited_s": waited}) if as_json
+                  else f"glaeda-gh: {target} not ready after {waited}s (timeout)")
+            return EXIT_TIMEOUT
+        time.sleep(min(WAIT_FILE_POLL, max(0.05, timeout - (time.monotonic() - start))))
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:  # a zombie has exited; its parent just has not reaped it
+        state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, timeout=5).stdout
+        return not state.strip().startswith("Z") and bool(state.strip())
+    except (OSError, subprocess.SubprocessError):
+        return True
+
+
+def cmd_wait_pid(target: str, timeout: float, as_json: bool) -> int:
+    """Block until the process exits (the `while kill -0 PID` loop). Exit 0 when it is gone, 2 on timeout."""
+    if not target.isdigit() or not 0 < int(target) < 2 ** 31:
+        raise WatchError(f"wait pid takes a process id, not {target!r}")
+    pid, start = int(target), time.monotonic()
+    while pid_alive(pid):
+        waited = int(time.monotonic() - start)
+        if time.monotonic() - start >= timeout:
+            print(json.dumps({"result": "timeout", "pid": pid, "waited_s": waited}) if as_json
+                  else f"glaeda-gh: process {pid} still running after {waited}s (timeout)")
+            return EXIT_TIMEOUT
+        time.sleep(min(WAIT_FILE_POLL, max(0.05, timeout - (time.monotonic() - start))))
+    waited = int(time.monotonic() - start)
+    print(json.dumps({"result": "success", "pid": pid, "waited_s": waited}) if as_json
+          else f"glaeda-gh: process {pid} exited after {waited}s")
+    return EXIT_OK
+
+
+def head_served(entry: dict | None, now: float, max_age: float) -> tuple[dict | None, bool]:
+    """(data, fresh): a head's data, and whether it is recent enough. Settled data is good for
+    HEAD_SETTLED_TTL * 2, pending data for max_age."""
+    data = (entry or {}).get("data")
+    if not data:
+        return None, False
+    age = now - ((entry or {}).get("dataAt") or 0)
+    return data, age < (HEAD_SETTLED_TTL + 2 * CYCLE if data.get("settled") else max_age)
+
+
+def cmd_checks(repo: str, shas: list[str], consumer: str, max_age: float, wait: float, as_json: bool) -> int:
+    """Every check of each commit, from the daemon's cache. The daemon reads each head once for all
+    sessions, within the consumer's hourly budget; a head it may not read is served stale or reported
+    unread, and this command never reads GitHub itself."""
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,40}", consumer or ""):
+        raise WatchError("--consumer must be a short name (letters, digits, . _ -), e.g. autoland")
+    keys = {}
+    for sha in shas:
+        keys[sha.lower()] = parse_key("head", f"{repo}@{sha}")
+    began, start = time.time(), time.monotonic()
+    touched = -TOUCH_EVERY
+    down, down_since = DownWait(), None
+    while True:
+        if not daemon_running(grace=DOWN_GRACE):
+            down_since = time.monotonic() if down_since is None else down_since
+            if not down.patient(down_since, start, wait):
+                return EXIT_DOWN
+            time.sleep(WAIT_POLL)
+            continue
+        down_since = None
+        broken = daemon_failing()
+        if broken is not None:
+            print(failing_message(broken), file=sys.stderr)
+            return EXIT_DOWN
+        now = time.monotonic()
+        if now - touched >= TOUCH_EVERY:
+            for key in keys.values():
+                register(key, consumer=consumer)
+            touched = now
+        served, missing = {}, []
+        for sha, key in keys.items():
+            entry = read_cache(key)
+            data, fresh = head_served(entry, time.time(), max_age)
+            if entry and entry.get("missing") and not data:
+                missing.append(sha)
+            elif data is not None:
+                served[sha] = (data, fresh, entry.get("dataAt"))
+        ledger = (read_json(BASE / CONSUMERS_FILE) or {}).get("consumers", {}).get(consumer) or {}
+        spent = (ledger.get("deniedAt") or 0) >= began - 1
+        settled_for_now = all(sha in served and served[sha][1] or sha in missing for sha in keys)
+        if settled_for_now or time.monotonic() - start >= wait or (spent and all(
+                sha in served or sha in missing or spent for sha in keys)):
+            break
+        time.sleep(min(WAIT_FILE_POLL, max(0.1, wait - (time.monotonic() - start))))
+    heads, unread = {}, {}
+    for sha in keys:
+        if sha in served:
+            data, fresh, at = served[sha]
+            heads[sha] = {"found": data.get("found", {}), "ids": data.get("ids", {}), "settled": bool(data.get("settled")),
+                          "at": at, "stale": not fresh}
+        elif sha in missing:
+            unread[sha] = "no such commit"
+        else:
+            unread[sha] = "budget spent" if spent else "not read yet"
+    partial = bool(unread) or any(h["stale"] for h in heads.values())
+    out = {"consumer": consumer, "heads": heads, "unread": unread,
+           "budget": {"spent": ledger.get("spent"), "limit": ledger.get("limit"), "denied": spent}}
+    if as_json:
+        print(json.dumps(out, sort_keys=True))
+    else:
+        for sha, h in heads.items():
+            red = sorted(k for k, (st, co) in h["found"].items() if st == "completed" and co not in ("success", "neutral", "skipped"))
+            note = ("stale, " if h["stale"] else "") + ("settled" if h["settled"] else "checks running") + f", {age(h['at'])}"
+            print(f"{sha[:12]}: {len(h['found'])} checks, {note}" + (f"; not green: {', '.join(red[:6])}" if red else ""))
+        for sha, why in unread.items():
+            print(f"{sha[:12]}: unread ({why})")
+    return EXIT_PARTIAL if partial else EXIT_OK
+
+
 def parse_since(text: str | None, began: float) -> tuple[int | None, float | None]:
     """(comment id, epoch): a comment id or URL, an ISO time, or a duration back from now (10m)."""
     if not text:
@@ -2503,7 +2922,8 @@ def cmd_budget(as_json: bool) -> int:
             if isinstance(reads, dict):
                 print("reads in the last hour: " + "; ".join(
                     f"{label} {(reads.get(kind) or {}).get('graphql', 0)} GraphQL / {(reads.get(kind) or {}).get('rest', 0)} REST"
-                    for kind, label in (("pr", "PRs"), ("run", "runs"), ("comment", "comments"))))
+                    for kind, label in (("pr", "PRs"), ("run", "runs"), ("comment", "comments"), ("head", "heads"))
+                    if kind in reads))
         oldest = status.get("oldestData")
         if isinstance(oldest, dict):
             def span(v: Any) -> str:
@@ -2513,6 +2933,12 @@ def cmd_budget(as_json: bool) -> int:
                 f"{label} {span(oldest.get(kind))}" for kind, label in (("pr", "PRs"), ("run", "runs"), ("comment", "comments")))
                   + f" (GraphQL batch: {batch.get('pr', '?')} PRs, {batch.get('run', '?')} runs, "
                     f"{batch.get('comment', '?')} comment watches per query)")
+        ledger = read_json(BASE / CONSUMERS_FILE)
+        if isinstance(ledger, dict) and ledger.get("consumers"):
+            print("head-read budget per hour (glaeda-gh checks --consumer NAME): " + "; ".join(
+                f"{name} {c.get('spent', 0)}/{c.get('limit', '?')}{' reserved' if c.get('reserved') else ''}"
+                + (f", refused {age(c['deniedAt'])}" if c.get("deniedAt") else "")
+                for name, c in sorted(ledger["consumers"].items())))
         ctl = status.get("controller")
         if isinstance(ctl, dict):
             print(controller_line(ctl))
@@ -2673,7 +3099,7 @@ def parser() -> argparse.ArgumentParser:
                     help="start even though the LaunchAgent or systemd unit is loaded (debugging only)")
     for name in ("status", "wait"):
         s = sub.add_parser(name)
-        s.add_argument("kind", choices=("pr", "run", "comment"))
+        s.add_argument("kind", choices=("pr", "run", "comment") + (("file", "pid") if name == "wait" else ()))
         s.add_argument("target", help="OWNER/REPO#N, OWNER/REPO/RUN_ID, or a GitHub URL")
         s.add_argument("--jobs", action="store_true", help="runs: also track the job list")
         s.add_argument("--json", action="store_true")
@@ -2691,6 +3117,21 @@ def parser() -> argparse.ArgumentParser:
             s.add_argument("--match", help="comments: a regular expression the body must contain")
             s.add_argument("--since", help="comments: after this comment id or URL, ISO time, or duration "
                                            "(10m); default the moment the wait began")
+            s.add_argument("--exists", action="store_true", help="file: ready once it exists, even when empty")
+            s.add_argument("--gone", action="store_true", help="file: ready once it does not exist")
+            s.add_argument("--contains", help="file: ready once its text matches this regular expression")
+    c = sub.add_parser("checks", help="every check of one or more commits, read once by the daemon for all sessions "
+                                      "within each consumer's budget")
+    c.add_argument("repo", help="OWNER/REPO")
+    c.add_argument("shas", nargs="+", metavar="SHA", help="full 40-hex commit ids")
+    c.add_argument("--consumer", required=True, help="who is asking (autoland, a session's name): the unit of the "
+                   "hourly head-read budget")
+    c.add_argument("--max-age", type=float, default=HEAD_PENDING_TTL * 2, metavar="S",
+                   help=f"checks still running are served from the cache if read this recently (default {HEAD_PENDING_TTL * 2}s); "
+                        "finished heads are good for 12 minutes")
+    c.add_argument("--wait", type=float, default=30, metavar="S",
+                   help="seconds to wait for the daemon's read (default 30; 0 serves the cache as it is)")
+    c.add_argument("--json", action="store_true")
     b = sub.add_parser("budget", help="REST and GraphQL quota as the daemon last saw it")
     b.add_argument("--json", action="store_true")
     r = sub.add_parser("restart", help="restart a down or hung daemon once, however many sessions ask at the same time")
@@ -2709,10 +3150,26 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_budget(args.json)
         if args.command == "restart":
             return cmd_restart(args.force)
+        if args.command == "checks":
+            if args.wait < 0:
+                raise WatchError("--wait must be 0 or more seconds")
+            bad = [x for x in args.shas if not re.fullmatch(r"[0-9a-fA-F]{40}", x)]
+            if bad or not re.fullmatch(rf"{NAME}/{NAME}", args.repo):
+                raise WatchError("checks takes OWNER/REPO and full 40-hex commit ids (git rev-parse HEAD)")
+            return cmd_checks(args.repo, args.shas, args.consumer, args.max_age, args.wait, args.json)
         if args.command == "status":
             return cmd_status(args.kind, args.target, args.jobs, args.json)
         if args.rescue_grace < 0:
             raise WatchError("--rescue-grace must be 0 or more seconds")
+        if args.kind == "file":
+            if args.exists and args.gone:
+                raise WatchError("wait file takes one of --exists and --gone")
+            return cmd_wait_file(args.target, args.timeout, args.json,
+                                 "gone" if args.gone else "exists" if args.exists else "nonempty", args.contains)
+        if args.kind == "pid":
+            return cmd_wait_pid(args.target, args.timeout, args.json)
+        if args.exists or args.gone or args.contains:
+            raise WatchError("--exists, --gone and --contains are for wait file")
         if args.kind == "comment":
             if args.sha or args.jobs or args.until != "green":
                 raise WatchError("wait comment takes --author, --match and --since, not --sha, --jobs or --until")
