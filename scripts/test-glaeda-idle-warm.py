@@ -217,12 +217,13 @@ class AttemptTest(Base):
 
 class LedgerTest(Base):
     def test_take_holds_a_compile_worth_of_locks_and_names_them(self) -> None:
-        scope = {"units": 4, "roots": 2, "compile_slots": 2, "xcode": ""}
+        scope = {"units": 14, "roots": 2, "compile_slots": 2, "xcode": ""}
         (self.dir / "fleet" / "host.lock").touch()
         taken = warm.take(hook, self.capacity, scope, 2)
         self.assertIsInstance(taken, tuple, taken)
         fds, held = taken
-        self.assertEqual(held, ["root-2", "persistent-dd", "unit-0", "unit-1"])
+        self.assertEqual(held, ["root-2", "persistent-dd", *[f"unit-{n}" for n in range(hook.CLASS_COST["compile"][0])]],
+                         "a compile's cores: 5 of the mini's 14")
         holder = json.loads((self.capacity / "idle-warm.json").read_text())
         self.assertEqual(holder, {"pid": os.getpid(), "held": held, "root": 2})
         # the flocks are real: another taker (a job's admission) finds them taken

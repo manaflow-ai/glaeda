@@ -165,7 +165,7 @@ JOB_CLASSES = {"macos-compile-admission": "compile", "app-host-unit-tests": "gui
 # matrix names (the root is part of the seed key), so no token may pick it: the job holds that root itself
 # with glaeda-canonical-root take (cmux "seed far main pushes in their own lane") before it clears it. It
 # never touches compile admission's kept DerivedData, so no persistent-dd either. Two seed jobs then fit
-# on one trusted mini with two runners, four units and two canonical roots.
+# on one trusted mini with two runners, ten units (cores) and two canonical roots.
 # nightly.yml's `build-nightly-app` (trusted runners only, cmux "build the nightly app on the trusted owned
 # minis first") compiles the universal Release app into its own workspace (build-universal, cleared at job
 # start) and restores its own compile cache lineage: no canonical root, no kept DerivedData, no GUI. As an
@@ -237,12 +237,23 @@ WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "
 # revision without the take-gui step would run its tests without the token, so this class ships after that
 # step (cmux#15012). test-e2e's `test` job is gui-step too (cmux#15037): it runs only when the build's take-gui
 # could not get the token, so taking it again at job start would wait for it a second time.
-# Units are cores: a std mini's 5 units share its 14 cores, 2.8 cores a unit. Job telemetry on 14 minis,
-# 2026-09-25 21:43Z to 09-29 10:07Z (glaeda-cmux-jobs.jsonl, cores.job): simulator jobs (ios-simulator,
-# screenshots) use p75 0.15 cores, p99 0.38, so they cost 1 unit; the simulator token, not units, keeps one per
-# mini. isolated stays 2: besides runner jobs it is the class guests default to and the one a co-resident dev
-# build admits under (cmuxterm-hq build-fleet/cmd/worker/coresident.go, about 7 cores and 15 GiB), and cmux-tui
-# `test` runs at p75 5.11 cores. The other costs match that telemetry (compile p75 4.44, light 2.15, gui 0.21).
+# Units are cores: a mini's --capacity-units is its core count (cmuxterm-hq build-fleet/mini-fleet.json
+# capacityUnits: 14 on an M4 Pro std mini) and a job's cost is the cores it uses, so a mini admits jobs until their
+# estimated cores fill its cores. Costs are the p75 of cores.job (the job's own processes, mean cores over the job)
+# in glaeda-cmux-jobs.jsonl, rounded up, from 14,421 jobs on the 11 std PR minis, 2026-10-12 20:24Z to 10-19 20:24Z,
+# each job re-classed by these tables. By class (n, p50/p75/p90 cores): compile (3611) 3.96/4.53/5.20: 5;
+# isolated (8597) 2.45/3.85/4.68: 4; compile-gui (415) 0.52/3.50/4.12: 4; light (304) 0.69/2.58/3.75, but
+# every light job on a std mini has its own JOB_CORES cost, and the side-lane jobs left to the class run on the
+# light minis (glaeda-side-*, p75 1.33 there): 2;
+# gui-step (852) 0.45/0.58/0.69, simulator (378) 0.18/0.28/0.42, product (195) 0.17/0.28/0.35 and gui (69)
+# 0.23/0.32/0.60: 1. seed has no PR-mini telemetry (trusted minis only) and compiles a whole DerivedData: a
+# compile's 5. The simulator and gui tokens, not units, keep those jobs one per mini. isolated is also the class
+# guests default to and the one a co-resident dev build admits under (cmuxterm-hq
+# build-fleet/cmd/worker/coresident.go, about 7 cores): that build checks the mini's measured headroom for its own
+# footprint first, so the ledger's 4 is a floor for it, not its estimate. JOB_CORES gives a job its own cost where
+# its p75 rounds to another number than its class's (20 runs or more in the window). The listener gate's CPU marks
+# (GATE_CPU_PAUSE, GATE_CPU_RESUME) catch what a p75 estimate misses: a job above its p75, and processes outside
+# any job (about 1 core on a std mini).
 # fast: a FAST_JOBS job on the mini's fast runner (--fast-runner, the fast pool label; glaeda_fleet_labels
 # fastRunners). Its two units are the fast tokens, kept apart from the shared unit-N files, so it never waits
 # behind side-lane jobs for a unit and no other class, gate or ci-step ever counts them. The same job on any other
@@ -250,10 +261,36 @@ WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "
 FAST_TOKENS = ("fast-0", "fast-1")
 FAST_JOBS = {("cmux-next.yml", "fast-tier")}
 CLASS_COST: dict[str, tuple[int, tuple[str, ...]]] = {
-    "compile": (2, ("persistent-dd", "root")), "gui": (1, ("gui", "root")), "product": (1, ("gui", "root")),
-    "compile-gui": (2, ("root",)), "gui-step": (1, ("gui", "root")),
-    "isolated": (2, ()), "simulator": (1, ("simulator",)), "light": (1, ()), "seed": (2, ()),
+    "compile": (5, ("persistent-dd", "root")), "gui": (1, ("gui", "root")), "product": (1, ("gui", "root")),
+    "compile-gui": (4, ("root",)), "gui-step": (1, ("gui", "root")),
+    "isolated": (4, ()), "simulator": (1, ("simulator",)), "light": (2, ()), "seed": (5, ()),
     "fast": (0, FAST_TOKENS)}
+# A job's own cost in cores, where it is far enough from its class's: keyed by (workflow file, job id) for the home
+# repository, (repository, workflow file, job id) for a guest. Only units change: the job keeps its class's tokens
+# (cli-regressions is a compile at 0.16 cores and still holds persistent-dd and a root). Same window as CLASS_COST;
+# the comment is the job's n and p50/p75/p90 cores.
+JOB_CORES: dict[tuple[str, ...], int] = {
+    ("cmux-next.yml", "fast-tier"): 5,  # isolated off the fast runner: 1834, 3.84/4.40/4.85
+    ("cmux-next.yml", "daemon-test"): 5,  # isolated: 914, 3.50/4.26/4.84
+    ("cmux-next.yml", "generated-files"): 6,  # isolated: 345, 4.30/5.04/5.51
+    ("cmux-next-pr-autofix.yml", "action-exports"): 6,  # isolated: 373, 4.74/5.43/5.95
+    ("cmux-next-base-autofix.yml", "action-exports"): 6,  # isolated: 254, 3.74/5.14/5.81
+    ("cmux-next.yml", "cmux-scheme-compile"): 3,  # isolated: 619, 2.28/2.60/2.93
+    ("cmux-next-media.yml", "tour"): 2,  # isolated: 618, 1.06/1.73/2.36
+    ("cmux-tui.yml", "macos"): 6,  # compile (an unknown job): 692, 4.91/5.53/6.11
+    ("cmux-tui.yml", "build"): 2,  # isolated: 475, 1.36/1.46/1.53
+    ("cmux-tui.yml", "macos-relay"): 3,  # isolated: 125, 1.75/2.07/2.60
+    ("cmux-tui.yml", "lint"): 3,  # isolated: 56, 1.90/2.31/2.66
+    ("test-ios.yml", "ios-simulator-build"): 3,  # isolated: 447, 1.67/2.19/2.58
+    ("test-ios.yml", "mobile-core-package"): 3,  # isolated: 371, 1.90/2.28/2.65
+    ("ci.yml", "cli-regressions"): 1,  # compile (an unknown job): 526, 0.11/0.16/0.27
+    ("ci.yml", "swift-package-tests"): 4,  # light: 204, 2.14/3.20/3.99
+    ("ci.yml", "remote-daemon-macos-tests"): 1,  # light: 52, 0.36/0.55/0.67
+    ("ci.yml", "claude-wrapper"): 1,  # light: 48, 0.11/0.32/0.37
+    ("ci.yml", "release-build"): 3,  # isolated: 28, 1.92/2.04/2.08
+    ("manaflow-ai/cmuxterm-hq", "build-fleet-go.yml", "test"): 1,  # guest isolated: 919, 0.24/0.42/0.52
+}
+
 # Guest repositories (any repo other than --home-repo, admitted by an org-scoped runner's --allowed-owner)
 # never touch cmux's canonical roots or persistent DerivedData, so they are costed by job-id suffix alone:
 # "-sim" or "simulator" uses the one CoreSimulator service, "-light" is small, anything else is isolated.
@@ -313,6 +350,12 @@ def job_class(job: str, repo: str | None, home_repo: str = DEFAULT_HOME_REPO,
     if (workflow, job) in WORKFLOW_JOB_CLASSES:
         return WORKFLOW_JOB_CLASSES[(workflow, job)], False
     return JOB_CLASSES.get(job, "compile"), job not in JOB_CLASSES
+
+
+def job_units(klass: str, job: str, repo: str | None, home_repo: str = DEFAULT_HOME_REPO, workflow: str = "") -> int:
+    """The cores this job is estimated to use: its JOB_CORES entry, else its class's CLASS_COST units."""
+    key = (workflow, job) if not is_guest(repo, home_repo) else ((repo or "").lower(), workflow, job)
+    return JOB_CORES.get(key, CLASS_COST[klass][0])
 
 
 CANONICAL_ROOT_ENV = "CMUX_CI_CANONICAL_ROOT"
@@ -706,8 +749,11 @@ GATE_CONFIRM = 2  # consecutive idle polls, so a hook's or a probe's momentary h
 # 09-28 while median host CPU was only 34-59%. Gate on sampled iostat CPU busy instead, with hysteresis, and hold
 # for elevated/critical Darwin VM pressure even when CPU is quiet. An unreadable sample fails open; job admission's
 # unit locks and the existing load-independent safety checks remain in force.
-GATE_CPU_PAUSE = float(os.environ.get("GLAEDA_RUNNER_GATE_CPU_PAUSE") or 80.0)
-GATE_CPU_RESUME = float(os.environ.get("GLAEDA_RUNNER_GATE_CPU_RESUME") or 70.0)
+# With units that are cores (CLASS_COST), admission already stops near the core count, so the gate is the margin
+# for jobs above their p75: it pauses at 85% and resumes below 80% (it was 80/70 while units were 2.8 cores and the
+# gate was the only real limit; 10-12 to 10-19 the std minis' CPU busy at job end was p50 52-68%, p90 79-93%).
+GATE_CPU_PAUSE = float(os.environ.get("GLAEDA_RUNNER_GATE_CPU_PAUSE") or 85.0)
+GATE_CPU_RESUME = float(os.environ.get("GLAEDA_RUNNER_GATE_CPU_RESUME") or 80.0)
 GATE_CPU_EVERY_S = float(os.environ.get("GLAEDA_RUNNER_GATE_CPU_EVERY_S") or 10.0)
 GATE_MEMORY_PRESSURE_HOLD = 2
 # Kept for the pure mini_saturated helper and old operator tooling; the listener gate no longer uses load average.
@@ -2312,8 +2358,11 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
     One detached holder keeps, for the whole job: a shared lock on the fleet host lock (with-host-lock
     takes it exclusively, so the build worker and our jobs exclude each other), `units` unit files and
     the job class's tokens. Everything is a flock, so a holder that dies releases all of it."""
-    klass, pinned = (klass, False) if klass else job_class(job, repo, home_repo, workflow)
-    units, tokens = CLASS_COST[klass]
+    if klass:  # a class given outright (a ci-step, the fast tier, a console skipper admitted as light) costs its own
+        pinned, (units, tokens) = False, CLASS_COST[klass]
+    else:
+        klass, pinned = job_class(job, repo, home_repo, workflow)
+        units, tokens = job_units(klass, job, repo, home_repo, workflow), CLASS_COST[klass][1]
     uses_gui = "gui" in tokens
     if uses_gui:
         tokens = tuple(gui_token if token == "gui" else token for token in tokens)
@@ -2827,7 +2876,8 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
     (Gate.locked also holds it while the console is locked). Its jobs (cmux-next daemon tests, generated files,
     action exports, the tour) need a logged-in session but neither the gui token nor a canonical root, so a console
     job's token is no reason to hold it, and no console job reaches it: the gui label it lacks is the console
-    runner's alone. It listens only with 2 units free (--fit-units 2): every job it takes costs 2.
+    runner's alone. It listens only with room for the costliest of them (--fit-units, SESSION_FIT_UNITS in
+    glaeda-cmux-runner), so a job it takes never waits here for units while another mini has room.
 
     Full also means a job admitted to this mini is waiting (CAPACITY_WAIT, its admit.want marker) for units or
     for a token this runner's next job would take (a root runner: a canonical root or persistent-dd; a gui
@@ -2864,7 +2914,8 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
                     return f"the {name} token is taken"
             return None
         root = scope is not None and scope.root
-        # fit_units: a side runner whose label brings 2-unit jobs (listen --fit-units: glaeda-ios-sim's isolated builds)
+        # fit_units: a side runner whose label brings costlier jobs (listen --fit-units: glaeda-ios-sim's isolated
+        # builds, a session runner's jobs)
         need = min(max(ROOT_FIT_UNITS if root else 1, fit_units), total)
         free = 0
         for slot in range(total):
@@ -3970,9 +4021,13 @@ def memory_pressure_level() -> int | None:
 
 def dynamic_release_decision(elapsed: float, low_since: float | None, units: int, total: int,
                              job_cores: float | None, host_busy: float | None, blocked: int,
-                             memory: int | None, thermal: bool | None) -> tuple[int, str] | None:
-    """Pure safety decision: release one unit only after warmup and sustained low, safe headroom."""
-    if units <= 1 or total <= 1 or elapsed < DYNAMIC_WARMUP_S or low_since is None:
+                             memory: int | None, thermal: bool | None,
+                             admitted: int | None = None) -> tuple[int, str] | None:
+    """Pure safety decision: release one unit only after warmup and sustained low, safe headroom. A job keeps at
+    least half the units it was admitted with (rounded up): units are its estimated cores, and a 6-core job quiet
+    through a slow checkout or cache fetch must not drop to one core and then compile on cores others were given."""
+    floor = max(1, math.ceil(admitted / 2)) if admitted else 1
+    if units <= floor or total <= 1 or elapsed < DYNAMIC_WARMUP_S or low_since is None:
         return None
     if elapsed - low_since < DYNAMIC_LOW_S or job_cores is None:
         return None
@@ -4268,7 +4323,7 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
         samples = JobSamples(meta, os.cpu_count() or 1, started, interval)
         deadline = time.monotonic() + HOLDER_MAX_S
         tick = 0
-        dynamic_units = int(meta.get("units") or 0)
+        dynamic_units = admitted_units = int(meta.get("units") or 0)
         dynamic_total = int(meta.get("units_total") or dynamic_units)
         dynamic_warmup = DYNAMIC_WARMUP_S + (300.0 if meta.get("class") == "compile-gui" else 0.0)
         low_since: float | None = None
@@ -4301,7 +4356,8 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
                              and blocked == 0 and (memory is None or memory < 2) and not thermal)
                     low_since = now if quiet and low_since is None else (low_since if quiet else None)
                     decision = dynamic_release_decision(now - started_mono, low_since, dynamic_units, dynamic_total,
-                                                        job_cores, host_busy, blocked, memory, thermal)
+                                                        job_cores, host_busy, blocked, memory, thermal,
+                                                        admitted=admitted_units)
                     if decision:
                         keep, release_reason = decision
                         request_dynamic_release(state_dir, keep, {"reason": release_reason,

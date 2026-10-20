@@ -267,7 +267,7 @@ class ClassAndPoolTests(unittest.TestCase):
     def test_pools_publish_manifest_resources_without_host_identity(self) -> None:
         obs = observed(**{"build-mini-1": probe_text()})
         resource = mf.pools(self.manifest, obs, ["build-mini-1"])["glaeda-std-xcode-26.3"]["resource"]
-        self.assertEqual(resource, {"cpuCores": 14, "capacityUnits": 4, "compileSlots": 1,
+        self.assertEqual(resource, {"cpuCores": 14, "capacityUnits": 14, "compileSlots": 1,
                                     "canonicalRoots": 1, "guiRunners": 0, "simulatorHosts": 0})
 
         data = copy.deepcopy(self.manifest)
@@ -277,7 +277,7 @@ class ClassAndPoolTests(unittest.TestCase):
         resource = mf.pools(data, obs, ["build-mini-1"])["glaeda-std-xcode-26.3"]["resource"]
         self.assertEqual(resource["simulatorHosts"], 1)
         # guiRunners counts consoles: a mini with a session runner beside its gui runner still has one gui token
-        data["defaults"]["runner"] = {"classes": {"std": {"runners": 4, "capacityUnits": 4, "guiRunners": 2}}}
+        data["defaults"]["runner"] = {"classes": {"std": {"runners": 4, "capacityUnits": 6, "guiRunners": 2}}}
         resource = mf.pools(data, obs, ["build-mini-1"])["glaeda-std-xcode-26.3"]["resource"]
         self.assertEqual(resource["guiRunners"], 1)
 

@@ -30,23 +30,29 @@ MEMBER_CLASSES = RUNNER_CLASSES + ("dev", "borrowed")
 AVAILABILITY = ("dedicated", "opportunistic")
 RUNNER_ROLE = "ci-runner"
 VERSION_RE = r"[0-9][0-9.]*"
-# Runners per member and the weighted capacity units they share (glaeda-cmux-runner-hook): a compile is
-# 2 units, a light or GUI job 1. The manifest's defaults.runner.classes.<class> {runners, capacityUnits}
-# overrides these, and a host's overrides.runner.classes likewise. compileSlots (default 1) is how many
-# compiles run at once: more than one needs cmux's compile admission to keep its state per runner.
+# Runners per member and the weighted capacity units they share (glaeda-cmux-runner-hook): units are cores, so
+# capacityUnits is the member's core count and a job costs the cores it is estimated to use (a compile 5, an
+# isolated job 4, a GUI job 1: the hook's CLASS_COST). The manifest's defaults.runner.classes.<class>
+# {runners, capacityUnits} overrides these, and a host's overrides.runner.classes likewise. compileSlots
+# (default 1) is how many compiles run at once: more than one needs cmux's compile admission to keep its state
+# per runner.
 # canonicalRoots (default 1) is how many canonical roots (/private/tmp/cmux-ci, -2, ...) the mini has: that
 # many runners (instances 0 to canonicalRoots - 1) also carry the root pool label (root_label), and the rest
 # carry the side pool label (side_label) instead. guiRunners (0 to runners - canonicalRoots, default 0) makes the
 # mini's last runners its gui-role runners. The last of them is the console gui runner: it carries the gui pool
 # label (gui_label), so GitHub hands each mini at most one GUI job, the one its single gui token allows, and a
 # second GUI job waits in GitHub's queue for another mini's gui runner instead of on a root runner here
-# (cmuxterm-hq#661). Every gui-role runner carries the session pool label (session_label), for jobs that need a
-# logged-in session but not the console token, and the others carry only that one. None is a root or side runner.
+# (cmuxterm-hq#661). The other gui-role runners (session runners) carry only the session pool label (session_label),
+# for jobs that need a logged-in session but not the console token; the console runner carries it too only with
+# guiRunners 1, when it has no session runner beside it. None is a root or side runner.
 # fastRunners (0 or 1, default 0) makes the mini's last runner its fast runner: it carries only the fast pool
 # label (fast_label), and cmux-next's fast-tier job runs on it with the mini's two fast tokens instead of the
 # shared capacity units, so it never queues behind the side lane. With guiRunners as well, the gui-role runners
 # are the instances before it. Neither a root, side nor gui runner.
-CLASS_CAPACITY = {"xl": (8, 8), "std": (4, 4), "light": (2, 2)}
+# Defaults for a class the manifest does not size: std is an M4 Pro mini (14 cores), light an M4 mini (10); xl kept
+# its old 8 units at the old 2.8 cores a unit.
+CLASS_CAPACITY = {"xl": (8, 22), "std": (4, 14), "light": (2, 10)}
+COMPILE_CORES = 5  # the hook's CLASS_COST["compile"] units (a test keeps them equal)
 MAX_RUNNERS = 16
 # A host's overrides.runner {trustedRef: refs/heads/main, trustedRepo: owner/name} makes its runners trusted-only:
 # the hook admits only push and schedule jobs of that one repository on that ref, and the pool label is
@@ -219,11 +225,14 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
         compile_slots, roots, gui, fast = 1, 1, 0, 0
     if not (isinstance(runners, int) and not isinstance(runners, bool) and 1 <= runners <= MAX_RUNNERS):
         return None, f"runner.classes.{klass}.runners must be 1 to {MAX_RUNNERS}"
-    if not (isinstance(units, int) and not isinstance(units, bool) and 2 <= units <= 4 * MAX_RUNNERS):
-        return None, f"runner.classes.{klass}.capacityUnits must be 2 to {4 * MAX_RUNNERS} (a compile is 2)"
+    # every mini holds at least one compile slot, so it needs a compile's cores; glaeda-route checks the same
+    if not (isinstance(units, int) and not isinstance(units, bool) and COMPILE_CORES <= units <= 4 * MAX_RUNNERS):
+        return None, (f"runner.classes.{klass}.capacityUnits must be {COMPILE_CORES} to {4 * MAX_RUNNERS} (cores; "
+                      f"a compile is {COMPILE_CORES})")
     if not (isinstance(compile_slots, int) and not isinstance(compile_slots, bool)
-            and 1 <= compile_slots <= max(1, units // 2)):
-        return None, f"runner.classes.{klass}.compileSlots must be 1 to {max(1, units // 2)} (a compile is 2 units)"
+            and 1 <= compile_slots <= max(1, units // COMPILE_CORES)):
+        return None, (f"runner.classes.{klass}.compileSlots must be 1 to {max(1, units // COMPILE_CORES)} "
+                      f"(a compile is {COMPILE_CORES} units)")
     if not (isinstance(roots, int) and not isinstance(roots, bool) and 1 <= roots <= runners):
         return None, f"runner.classes.{klass}.canonicalRoots must be 1 to {runners} (one root runner per root)"
     if not (isinstance(gui, int) and not isinstance(gui, bool) and 0 <= gui <= runners - roots):

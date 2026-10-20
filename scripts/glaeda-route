@@ -292,8 +292,9 @@ def pool_resource(value: Any, label: str) -> dict[str, int]:
         resource[field] = item
     if resource["compileSlots"] > resource["canonicalRoots"]:
         raise Failure(f"pools: {label}.resource.compileSlots exceeds canonicalRoots")
-    if resource["compileSlots"] * 2 > resource["capacityUnits"]:
-        raise Failure(f"pools: {label}.resource.compileSlots exceeds capacityUnits")
+    # units are cores and a compile costs 5 (glaeda_fleet_labels.COMPILE_CORES, the hook's CLASS_COST)
+    if resource["compileSlots"] * 5 > resource["capacityUnits"]:
+        raise Failure(f"pools: {label}.resource.compileSlots exceeds capacityUnits (a compile is 5 units)")
     return resource
 
 

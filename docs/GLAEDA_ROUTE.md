@@ -84,7 +84,7 @@ never sees the document and must never route to an owned pool anyway.
       "class": "std", "xcode": "26.6", "rank": 0,
       "declared": 11, "conforming": 10, "reserved": 1, "locked": 0,
       "runners": 11, "online": 11, "busy": 2, "idle": 8,
-      "resource": {"cpuCores": 196, "capacityUnits": 69,
+      "resource": {"cpuCores": 196, "capacityUnits": 140,
                     "compileSlots": 17, "canonicalRoots": 18,
                     "guiRunners": 9, "simulatorHosts": 9}
     }
@@ -106,7 +106,7 @@ never sees the document and must never route to an owned pool anyway.
 | `idle` | Runners that are online, not busy, and belong to a conforming member (`<member>-glaeda`). The routable capacity at `observed_at`. |
 | `resource` | Optional manifest-derived aggregate for the pool's declared members. It contains no host names and is descriptive capacity, not a live free-capacity claim. |
 | `resource.cpuCores` | Sum of the physical CPU cores declared by each member's hardware class. |
-| `resource.capacityUnits` | Sum of the members' weighted Glaeda capacity units (a compile costs two units; light and GUI work costs one). |
+| `resource.capacityUnits` | Sum of the members' weighted Glaeda capacity units (units are cores: a compile costs 5, an isolated job 4, a GUI or simulator job 1). |
 | `resource.compileSlots`, `resource.canonicalRoots`, `resource.guiRunners` | Sum of the configured compile, canonical-root and GUI token counts. |
 | `resource.simulatorHosts` | Number of declared pool members with the iOS simulator role and runtime policy. |
 
@@ -125,7 +125,7 @@ job keeps its Blacksmith route. `glaeda-route check --state FILE` applies the sa
 4. `order` and `pools` name the same labels, every label is `glaeda-<std|light>-xcode-<version>`,
    and every count is a non-negative integer, with `idle` and `busy` at most `online`. If
    `resource` is present, all of its fields are non-negative integers, `compileSlots` does not
-   exceed `canonicalRoots`, and two units are available for each compile slot.
+   exceed `canonicalRoots`, and five units are available for each compile slot.
 5. The run is trusted: a same-repository pull request, or a push, merge group, schedule or
    dispatch on the repository itself, and attempt 1. Fork runs never read the document.
 

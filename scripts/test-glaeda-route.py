@@ -107,7 +107,7 @@ class StateTests(unittest.TestCase):
         self.assertEqual((std["class"], std["xcode"], std["rank"]), ("std", "26.6", 0))
 
     def test_resource_summary_is_carried_without_host_identity(self):
-        resource = {"cpuCores": 42, "capacityUnits": 15, "compileSlots": 6,
+        resource = {"cpuCores": 42, "capacityUnits": 42, "compileSlots": 6,
                     "canonicalRoots": 6, "guiRunners": 3, "simulatorHosts": 3}
         pools = pools_doc(std={"declared": ["m1", "m2", "m3"], "conforming": ["m1", "m2", "m3"],
                            "resource": resource})
@@ -197,7 +197,7 @@ class ValidateTests(unittest.TestCase):
             self.assertFalse(self.check(bad)[0], bad)
 
         bad = state(pools=pools_doc(std={"declared": ["m1"], "conforming": ["m1"],
-                                        "resource": {"cpuCores": 14, "capacityUnits": 4,
+                                        "resource": {"cpuCores": 14, "capacityUnits": 14,
                                                       "compileSlots": 1, "canonicalRoots": 1,
                                                       "guiRunners": 0, "simulatorHosts": 0}}))
         bad["pools"][STD]["resource"]["cpuCores"] = -1
