@@ -292,6 +292,8 @@ class Family:
     # a macOS $TMPDIR holds tens of thousands of small leaked directories (25,730 on Air Blue)
     bulk_sizes: bool = False
     build_output: bool = False  # DerivedData-like: SwiftPM clones inside do not make it a checkout
+    # candidates are per-launch app bundle copies (code_sign_clone.*): keep_live_app_clones keeps the live ones
+    app_clones: bool = False
     include: tuple[str, ...] = ()  # when set, only candidates whose name starts with one of these
     min_idle_hours: float = 0.0  # an item must also be idle this long, whatever the idle window
     max_idle_hours: float | None = None  # a hot-tier item goes once idle this long, whatever the idle window
@@ -1426,6 +1428,61 @@ def darwin_user_tmp() -> Path | None:
     return path if path.is_dir() and path != Path("/private/tmp") else None
 
 
+def darwin_code_sign_clones() -> Path | None:
+    """The per-user code-signing clone dir beside $TMPDIR (/var/folders/../X), resolved.
+
+    Chromium-based apps (Chrome, Edge, cmux with CEF) copy their bundle into
+    X/<bundle id>.code_sign_clone/code_sign_clone.<random> at launch, so the running app's signature
+    stays valid if the bundle is replaced, and remove it on a clean exit. A killed or crashed launch
+    leaks the copy. Every media or perf launch of a fresh cmux DEV build leaked one of ~1 GiB that no
+    family measured: 90 GiB (du) of them filled cmux14 to 0 GiB free, and 25 to 60 GiB sat on most GUI
+    minis (2026-10-20). Most copies share blocks with the installed app, so du overstates what goes.
+    """
+    user_tmp = darwin_user_tmp()
+    if user_tmp is None:
+        return None
+    path = user_tmp.parent / "X"
+    return path if path.is_dir() and not path.is_symlink() else None
+
+
+def keep_live_app_clones(level: list[Path], commands: str | None = None) -> list[Path]:
+    """Drop the copies a running app may use from code_sign_clone candidates.
+
+    A running app neither holds its copy open (its executable there is a hard link, so lsof names the
+    installed path) nor names it on a command line, and the copy's mtime is its launch time, so neither
+    the open-file nor the idle check protects it. Kept instead: the newest copy of every bundle id, and
+    every copy of an app whose `<Name>.app/Contents/MacOS/` appears in a running command line. Without
+    a process list nothing is a candidate.
+    """
+    if commands is None:
+        try:
+            ps = subprocess.run(["ps", "-axww", "-o", "command="], capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            return []
+        if ps.returncode != 0 or not ps.stdout.strip():
+            return []
+        commands = ps.stdout
+    newest: dict[Path, tuple[float, Path]] = {}
+    for p in level:
+        with contextlib.suppress(OSError):
+            m = p.lstat().st_mtime
+            if p.parent not in newest or m > newest[p.parent][0]:
+                newest[p.parent] = (m, p)
+    keep = {p for _, p in newest.values()}
+    out = []
+    for p in level:
+        if p in keep:
+            continue
+        try:
+            apps = [e.name[:-len(".bundle")] for e in os.scandir(p) if e.name.endswith(".app.bundle")]
+        except OSError:
+            continue  # unreadable: keep
+        if any(f"{app}/Contents/MacOS/" in commands for app in apps):
+            continue
+        out.append(p)
+    return out
+
+
 def bazel_family(root: Path) -> Family:
     # Bazel's output root on macOS (Linux keeps it under ~/.cache/bazel, a bazel-output-root layout). One output
     # base per workspace (an md5 name) and the unpacked install/: all rebuilt by bazel, and external/
@@ -1548,6 +1605,16 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
         fams.append(Family("user-tmp", user_tmp, True, "agent scratch under the per-user $TMPDIR",
                            skip_prefixes=("com.apple.",), git_disposable=True,
                            owner="agents and tools", rebuild_minutes=0.5, platform="shared"))
+    clones = darwin_code_sign_clones() if DARWIN else None
+    if clones is not None:
+        # One copy per launch, below a directory per bundle id. keep_live_app_clones keeps each bundle's
+        # newest copy and any copy of a running app; two idle hours cover a launch in progress. An app
+        # bundle is too deep for the git search to finish and holds no checkout, so it is build output.
+        fams.append(Family("code-sign-clones", clones, True, "the app copies its bundle again at its next launch",
+                           depth=2, include=("code_sign_clone.",), skip_prefixes=("com.apple.",),
+                           app_clones=True, build_output=True, min_idle_hours=2.0,
+                           owner="Chromium-based apps, one bundle copy per launch",
+                           rebuild_minutes=0.5, platform="macos"))
     # The hq build workers' shared cache: the dedicated dev-build worker (cmuxterm-hq#661) and the lent worker
     # on borrowed minis (ai.manaflow.cmux-lent-worker, CMUX_CI_SHARED_CACHE_DIR) both build in it. It is
     # retired, and reclaimable, only while neither service is loaded. Naming only the dev-build worker
@@ -3451,6 +3518,8 @@ def candidates(fam: Family) -> list[Path]:
                           or (fam.files and e.is_file(follow_symlinks=False)))]
         if fam.include:
             level = [p for p in level if p.name.startswith(fam.include)]
+        if fam.app_clones:
+            level = keep_live_app_clones(level)
     # an aside tree (remove()'s rename) is the interrupted-deletions family's alone, whatever family's root holds it
     if fam.id == INTERRUPTED:
         level = [p for p in level if DELETING_RE.fullmatch(p.name)]

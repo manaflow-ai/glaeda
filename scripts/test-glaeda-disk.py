@@ -418,6 +418,74 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertTrue(fam.reclaimable and fam.git_disposable and not fam.bulk_sizes)
         self.assertIn("com.apple.", fam.skip_prefixes)
 
+    def _clone_tree(self) -> tuple[Path, Path]:
+        user_tmp, clones = self.root / "T", self.root / "X"
+        user_tmp.mkdir()
+        bundle = clones / "com.cmuxterm.app.debug.ci.media.pr.1.head.code_sign_clone"
+        for name, age_h in (("code_sign_clone.Old1", 30), ("code_sign_clone.Old2", 20), ("code_sign_clone.New", 10)):
+            deep = bundle / name / "cmux DEV.app.bundle/Contents/Frameworks/X.framework/Versions/A/Resources/r"
+            deep.mkdir(parents=True)
+            (deep / "blob").write_bytes(b"x" * (2 << 20))
+            stamp = time.time() - age_h * 3600
+            for d, dirs, files in os.walk(bundle / name):
+                for f in files:
+                    os.utime(Path(d) / f, (stamp, stamp))
+            for d, dirs, files in list(os.walk(bundle / name))[::-1]:
+                os.utime(d, (stamp, stamp))
+        (bundle / "stray").mkdir()
+        (clones / "com.apple.Safari.code_sign_clone" / "code_sign_clone.Q1").mkdir(parents=True)
+        return user_tmp, clones
+
+    def _clone_family(self, user_tmp: Path) -> "gd.Family":
+        saved = (gd.DARWIN, gd.darwin_user_tmp)
+        gd.DARWIN, gd.darwin_user_tmp = True, lambda: user_tmp
+        try:
+            return next(f for f in gd.default_families() if f.id == "code-sign-clones")
+        finally:
+            gd.DARWIN, gd.darwin_user_tmp = saved
+
+    def test_code_sign_clones_family(self) -> None:
+        user_tmp, clones = self._clone_tree()
+        fam = self._clone_family(user_tmp)
+        self.assertEqual(fam.root, clones)
+        self.assertTrue(fam.reclaimable and fam.app_clones and fam.build_output)
+        self.assertGreaterEqual(fam.min_idle_hours, 2.0)
+        with mock.patch.object(gd.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "/bin/zsh\n", "")):
+            names = sorted(p.name for p in gd.candidates(fam))
+        # the newest copy of the bundle stays; Apple bundles and stray names are never candidates
+        self.assertEqual(names, ["code_sign_clone.Old1", "code_sign_clone.Old2"])
+
+    def test_code_sign_clones_of_a_running_app_are_kept(self) -> None:
+        user_tmp, _ = self._clone_tree()
+        fam = self._clone_family(user_tmp)
+        level = [p for p in (fam.root / "com.cmuxterm.app.debug.ci.media.pr.1.head.code_sign_clone").iterdir()
+                 if p.name.startswith("code_sign_clone.")]
+        running = "/Users/cmux/Apps/cmux DEV.app/Contents/MacOS/cmux --flag\n"
+        self.assertEqual(gd.keep_live_app_clones(level, running), [])
+        self.assertEqual(len(gd.keep_live_app_clones(level, "/bin/zsh\n")), 2)
+        with mock.patch.object(gd.subprocess, "run", side_effect=OSError("no ps")):
+            self.assertEqual(gd.keep_live_app_clones(level), [])  # no process list: keep everything
+
+    def test_code_sign_clones_deep_bundle_is_reclaimable(self) -> None:
+        user_tmp, _ = self._clone_tree()
+        fam = self._clone_family(user_tmp)
+        with mock.patch.object(gd, "keep_live_app_clones", side_effect=lambda level, commands=None: level):
+            items = gd.survey([fam], 6, 0)
+        verdicts = {Path(i.path).name: i.verdict for i in items}
+        self.assertEqual(verdicts["code_sign_clone.Old1"], "reclaimable", verdicts)
+        self.assertEqual(verdicts["code_sign_clone.Old2"], "reclaimable", verdicts)
+
+    def test_no_code_sign_clones_family_without_the_directory(self) -> None:
+        user_tmp = self.root / "T"
+        user_tmp.mkdir()
+        saved = (gd.DARWIN, gd.darwin_user_tmp)
+        gd.DARWIN, gd.darwin_user_tmp = True, lambda: user_tmp
+        try:
+            ids = {f.id for f in gd.default_families()}
+        finally:
+            gd.DARWIN, gd.darwin_user_tmp = saved
+        self.assertNotIn("code-sign-clones", ids)
+
     def test_default_user_tmp_sizes_children_without_bulk_root_walk(self) -> None:
         saved = (gd.DARWIN, gd.darwin_user_tmp)
         gd.DARWIN, gd.darwin_user_tmp = True, lambda: self.root
