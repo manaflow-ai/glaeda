@@ -11,6 +11,8 @@ import io
 import json
 import os
 import re
+import signal
+import subprocess
 import sys
 import tempfile
 import threading
@@ -2019,6 +2021,456 @@ class BudgetOutputTest(Base):
             self.assertIn("perMinute", last)
         finally:
             lock.close()
+
+
+# ---------------------------------------------------------------- hangs (10-20: one daemon silent for 20 minutes)
+
+
+class Trickle:
+    """A local HTTP server that answers 200 and then sends its body one byte every `every` seconds:
+    each read returns well within any socket timeout, so only a whole-request deadline ends it."""
+
+    def __init__(self, every: float = 0.1) -> None:
+        self.server = socket.socket()
+        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server.bind(("127.0.0.1", 0))
+        self.server.listen(4)
+        self.port = self.server.getsockname()[1]
+        self.every, self.stop = every, threading.Event()
+        threading.Thread(target=self.serve, daemon=True).start()
+
+    def serve(self) -> None:
+        while not self.stop.is_set():
+            try:
+                conn, _ = self.server.accept()
+            except OSError:
+                return
+            threading.Thread(target=self.drip, args=(conn,), daemon=True).start()
+
+    def drip(self, conn: socket.socket) -> None:
+        with conn:
+            try:
+                conn.recv(65536)
+                conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100000\r\n\r\n")
+                while not self.stop.is_set():
+                    conn.sendall(b" ")
+                    time.sleep(self.every)
+            except OSError:
+                return
+
+    def close(self) -> None:
+        self.stop.set()
+        self.server.close()
+
+
+class HardDeadlineTest(unittest.TestCase):
+    """urllib's timeout bounds each socket read, not the request: a server that keeps sending a
+    byte now and then holds a request (and the daemon's whole tick) for as long as it likes."""
+
+    def setUp(self) -> None:
+        self.server = Trickle()
+        self.addCleanup(self.server.close)
+
+    def test_github_request_ends_at_its_deadline_while_bytes_still_trickle(self) -> None:
+        api = f"http://127.0.0.1:{self.server.port}"
+        began = time.monotonic()
+        with mock.patch.object(gg, "API", api), mock.patch.object(gg, "HTTP_DEADLINE", 1.0), \
+                mock.patch.object(gg, "SOCKET_TIMEOUT", 5), self.assertRaises(gg.WatchError) as caught:
+            gg.http("GET", api + "/rate_limit", {})
+        took = time.monotonic() - began
+        self.assertIn("DeadlineTimeout", str(caught.exception))
+        self.assertGreaterEqual(took, 0.9)
+        self.assertLess(took, 3.0)
+        self.assertIsNotNone(gg.SLOW.search(str(caught.exception)), "a deadline counts as a slow answer")
+
+    def test_controller_request_ends_at_its_deadline(self) -> None:
+        ctl = gg.Controller(f"http://127.0.0.1:{self.server.port}", None)
+        began = time.monotonic()
+        with mock.patch.object(gg, "CONTROLLER_DEADLINE", 1.0), self.assertRaises(gg.WatchError):
+            ctl.events(None)
+        self.assertLess(time.monotonic() - began, 3.0)
+
+    def test_the_deadline_leaves_no_alarm_behind(self) -> None:
+        with gg.hard_deadline(0.2):
+            pass
+        time.sleep(0.4)  # an armed alarm would raise DeadlineTimeout here
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
+
+
+class BoundedSubprocessTest(unittest.TestCase):
+    """subprocess.run(timeout=) kills the child, then waits for its pipes: a grandchild that
+    inherited them (a credential helper, a pager) keeps run() blocked for as long as it lives."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def hanging_tool(self, name: str) -> str:
+        path = Path(self.tmp.name) / name
+        path.write_text("#!/bin/sh\nsleep 60 &\nsleep 60\n")  # the background sleep holds stdout
+        path.chmod(0o755)
+        return os.fspath(path)
+
+    def test_a_grandchild_holding_the_pipes_does_not_outlive_the_deadline(self) -> None:
+        began = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            gg.run_bounded([self.hanging_tool("tool")], 0.5)
+        self.assertLess(time.monotonic() - began, 5.0)
+
+    def test_gh_auth_token_is_bounded(self) -> None:
+        gh = self.hanging_tool("gh")
+        began = time.monotonic()
+        with mock.patch.object(gg, "find_gh", return_value=gh), mock.patch.object(gg, "SUBPROCESS_DEADLINE", 0.5), \
+                self.assertRaises(gg.WatchError) as caught:
+            gg.gh_token()
+        self.assertIn("TimeoutExpired", str(caught.exception))
+        self.assertLess(time.monotonic() - began, 5.0)
+
+    def test_an_answer_within_the_deadline_is_returned(self) -> None:
+        result = gg.run_bounded(["sh", "-c", "echo out; echo err >&2; exit 3"], 10)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (3, "out\n", "err\n"))
+
+
+class TickBudgetTest(Base):
+    """A tick reads every due entry one request after another. With dozens of PRs over REST (each
+    several requests) and slow answers, one tick ran for many minutes without a heartbeat. Past
+    TICK_BUDGET a tick starts no request; what it did not reach goes first on the next tick."""
+
+    def spend_budget_after(self, calls: int) -> None:
+        inner = self.daemon.transport
+        count = [0]
+
+        def transport(method, url, headers, body):
+            count[0] += 1
+            if count[0] == calls:
+                self.daemon.tick_deadline = float("-inf")  # the budget is spent once this answer is in
+            return inner(method, url, headers, body)
+        self.daemon.transport = transport
+
+    def test_runs_left_over_go_first_next_tick_without_an_error(self) -> None:
+        keys = []
+        for run_id in range(1, 6):
+            self.gh.runs[run_id] = {"id": run_id, "name": "CI", "status": "in_progress", "conclusion": None, "html_url": "u"}
+            keys.append(gg.parse_key("run", f"o/r/{run_id}"))
+            gg.register(keys[-1])
+        self.spend_budget_after(2)
+        status = self.daemon.tick(NOW)
+        read = [k for k in keys if gg.read_cache(k)]
+        self.assertEqual(len(read), 2, "two runs read before the budget ran out")
+        self.assertEqual(status["deferred"], 3)
+        self.assertEqual(self.daemon.tick_deadline, float("inf"), "the budget ends with the tick")
+        self.assertTrue((gg.BASE / "daemon.json").exists(), "the heartbeat is written all the same")
+        self.daemon.transport = self.gh
+        status = self.daemon.tick(NOW + gg.TICK)  # not a full cycle: only the deferred runs are due
+        self.assertEqual(status["fetched"]["run"], 3)
+        self.assertEqual(status["deferred"], 0)
+        for k in keys:
+            self.assertIsNone(gg.read_cache(k)["error"], k)
+
+    def test_pr_batches_left_over_go_first_next_tick(self) -> None:
+        keys = []
+        for n in range(1, 31):
+            self.gh.prs[("o", "r", n)] = pr_node(n)
+            keys.append(f"pr:o/r#{n}")
+            gg.register(keys[-1])
+        self.spend_budget_after(1)  # one GraphQL query of 10 PRs, then the budget is spent
+        status = self.daemon.tick(NOW)
+        self.assertEqual(sum(1 for k in keys if gg.read_cache(k)), 10)
+        self.assertEqual(status["deferred"], 20)
+        self.assertEqual(len(self.gh.gql_calls()), 1)
+        self.daemon.transport = self.gh
+        status = self.daemon.tick(NOW + gg.TICK)
+        self.assertEqual(status["fetched"]["pr"], 20)
+        self.assertTrue(all(gg.read_cache(k)["data"] for k in keys))
+
+    def test_failed_steps_left_unread_put_their_pr_first_next_tick(self) -> None:
+        failed = {**check_run("build", conclusion="FAILURE"), "id": "CR_1"}
+        self.gh.prs[("o", "r", 1)] = pr_node(1, rollup="FAILURE", checks=[failed])
+        self.gh.prs[("o", "r", 2)] = pr_node(2)
+        self.gh.steps["CR_1"] = [{"name": "Run selected tests", "conclusion": "FAILURE"}]
+        gg.register("pr:o/r#1")
+        gg.register("pr:o/r#2")
+        self.spend_budget_after(1)  # the PR query answers; the steps query is never started
+        status = self.daemon.tick(NOW)
+        self.assertEqual(self.gh.step_queries, [])
+        self.assertNotIn("failedSteps", gg.read_cache("pr:o/r#1")["data"]["checks"][0])
+        self.assertEqual(status["deferred"], 1, "only the PR whose steps went unread")
+        self.daemon.transport = self.gh
+        self.daemon.tick(NOW + gg.TICK)  # not a full cycle: the deferred PR is read again, with its steps
+        self.assertEqual(self.gh.step_queries, [["CR_1"]])
+        self.assertEqual(gg.read_cache("pr:o/r#1")["data"]["checks"][0]["failedSteps"], ["Run selected tests"])
+
+
+CHILD_PRELUDE = """
+import importlib.machinery, importlib.util, json, os, signal, sys, time
+from pathlib import Path
+loader = importlib.machinery.SourceFileLoader("glaeda_gh", sys.argv[1])
+spec = importlib.util.spec_from_loader("glaeda_gh", loader)
+gg = importlib.util.module_from_spec(spec)
+sys.modules["glaeda_gh"] = gg
+loader.exec_module(gg)
+gg.BASE = Path(sys.argv[3])
+"""
+
+
+class WatchdogTest(unittest.TestCase):
+    def test_check_exits_only_once_the_loop_is_overdue(self) -> None:
+        clock, exits = [100.0], []
+        dog = gg.Watchdog(300, clock=lambda: clock[0], exit=exits.append)
+        clock[0] += 299
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertFalse(dog.check())
+            dog.beat()
+            clock[0] += 300
+            self.assertFalse(dog.check())
+            clock[0] += 1.5
+            self.assertTrue(dog.check())
+        self.assertEqual(exits, [gg.EXIT_WATCHDOG])
+
+    def test_the_watchdog_thread_never_takes_the_deadline_signal(self) -> None:
+        """SIGALRM must reach the main thread's blocking read; the watchdog thread blocks it."""
+        seen: list[set] = []
+
+        class Probe(gg.Watchdog):
+            def check(self) -> bool:
+                seen.append(signal.pthread_sigmask(signal.SIG_BLOCK, []))
+                return True
+        Probe(300).start().join(5)
+        self.assertEqual(len(seen), 1)
+        self.assertIn(signal.SIGALRM, seen[0])
+        self.assertNotIn(signal.SIGALRM, signal.pthread_sigmask(signal.SIG_BLOCK, []))
+
+    def test_a_loop_stuck_holding_stdout_still_ends(self) -> None:
+        """End to end: the tick blocks inside a write to a pipe nobody reads, so it holds the stdout
+        lock the watchdog's own log line needs. The faulthandler backstop ends the process anyway."""
+        with tempfile.TemporaryDirectory() as tmp:
+            code = CHILD_PRELUDE + """
+gg.WATCHDOG_AFTER = 1.0
+gg.WATCHDOG_BACKSTOP = 1.0
+class Stuck:
+    def tick(self):
+        while True:
+            print("x" * 65536, flush=True)  # blocks once the pipe is full, holding the stream lock
+gg.Daemon = Stuck
+gg.serve(foreground_ok=True)
+"""
+            began = time.monotonic()
+            with subprocess.Popen([sys.executable, "-c", code, os.fspath(ROOT / "scripts" / "glaeda-gh"), "serve", tmp],
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as child:
+                try:
+                    code_ = child.wait(timeout=30)
+                finally:
+                    child.kill()
+            self.assertLess(time.monotonic() - began, 20)
+            self.assertEqual(code_, 1, "faulthandler's exit, not a hang")
+
+    def test_a_hung_tick_ends_the_process_and_frees_the_lock(self) -> None:
+        """End to end: serve() with a tick stuck in a blocking call exits EXIT_WATCHDOG on its own,
+        names where it was stuck, and releases the lock for the restarted daemon."""
+        with tempfile.TemporaryDirectory() as tmp:
+            code = CHILD_PRELUDE + """
+gg.WATCHDOG_AFTER = 1.0
+class Stuck:
+    def tick(self):
+        time.sleep(120)  # a read no deadline reaches
+gg.Daemon = Stuck
+gg.serve(foreground_ok=True)
+"""
+            began = time.monotonic()
+            child = subprocess.run([sys.executable, "-c", code, os.fspath(ROOT / "scripts" / "glaeda-gh"), "serve", tmp],
+                                   capture_output=True, text=True, timeout=60)
+            self.assertLess(time.monotonic() - began, 30)
+            self.assertEqual(child.returncode, gg.EXIT_WATCHDOG, child.stderr)
+            self.assertIn("watchdog", child.stderr)
+            self.assertIn("in tick", child.stderr, "the stack dump names the stuck function")
+            events = [json.loads(line)["event"] for line in child.stdout.splitlines() if line.startswith("{")]
+            self.assertEqual(events[0], "start")
+            self.assertIn("watchdog", events)
+            saved = gg.BASE
+            try:
+                gg.BASE = Path(tmp)
+                self.assertFalse(gg.lock_held())
+            finally:
+                gg.BASE = saved
+
+
+class TakeoverTest(unittest.TestCase):
+    """A daemon waiting for the lock stops a holder whose heartbeat went stale, after checking that
+    the holder is a live glaeda-gh serve."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.saved = gg.BASE
+        gg.BASE = Path(self.tmp.name)
+        self.addCleanup(setattr, gg, "BASE", self.saved)
+        self.children: list[subprocess.Popen] = []
+        self.addCleanup(self.reap)
+
+    def reap(self) -> None:
+        for child in self.children:
+            if child.poll() is None:
+                child.kill()
+            child.wait()
+            child.stdout.close()
+
+    def holder(self, heartbeat_age: float, ignore_term: bool = False) -> subprocess.Popen:
+        """A glaeda-gh serve that took the lock and then hung (it never writes another heartbeat)."""
+        code = CHILD_PRELUDE + f"""
+if {ignore_term!r}:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+lock = open(gg.BASE / "daemon.lock", "a+")
+assert gg.try_lock(lock)
+gg.record_holder(lock)
+lock.seek(0)
+lock.truncate()
+lock.write(json.dumps({{"pid": os.getpid(), "since": time.time() - {heartbeat_age} - 60}}))  # took it long ago
+lock.flush()
+gg.write_json(gg.BASE / "daemon.json", {{"pid": os.getpid(), "at": time.time() - {heartbeat_age}, "heartbeat": 30}})
+print("ready", flush=True)
+time.sleep(120)
+"""
+        child = subprocess.Popen([sys.executable, "-c", code, os.fspath(ROOT / "scripts" / "glaeda-gh"), "serve",
+                                  self.tmp.name], stdout=subprocess.PIPE, text=True)
+        self.children.append(child)
+        self.assertEqual(child.stdout.readline().strip(), "ready")
+        return child
+
+    def lock(self):
+        lock = open(gg.BASE / "daemon.lock", "a+")
+        self.addCleanup(lock.close)
+        return lock
+
+    def test_a_stale_holder_is_stopped_and_the_lock_taken(self) -> None:
+        child = self.holder(gg.STALE_HEARTBEAT + 60)
+        lock = self.lock()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            gg.acquire_lock(lock, sleep=lambda s: self.fail("took over without waiting a retry"))
+        self.assertEqual(child.wait(timeout=10), -signal.SIGTERM)
+        self.assertEqual(gg.lock_holder()["pid"], os.getpid())
+        self.assertIn('"takeover"', out.getvalue())
+
+    def test_a_holder_ignoring_sigterm_is_killed(self) -> None:
+        child = self.holder(gg.STALE_HEARTBEAT + 60, ignore_term=True)
+        lock = self.lock()
+        with mock.patch.object(gg, "TAKEOVER_GRACE", 0.5), contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(gg.take_over(lock))
+        self.assertEqual(child.wait(timeout=10), -signal.SIGKILL)
+
+    def test_a_holder_with_a_fresh_heartbeat_is_left_alone(self) -> None:
+        child = self.holder(5)
+        lock = self.lock()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(gg.take_over(lock))
+        time.sleep(0.3)
+        self.assertIsNone(child.poll())
+        self.assertFalse(gg.try_lock(lock))
+
+    def test_a_recorded_pid_that_is_not_a_serve_is_left_alone(self) -> None:
+        other = subprocess.Popen(["sleep", "60"], stdout=subprocess.PIPE)
+        self.children.append(other)
+        gg.write_json(gg.BASE / "daemon.lock", {"pid": other.pid, "since": time.time() - 10 * gg.STALE_HEARTBEAT})
+        self.assertFalse(gg.is_serve(other.pid))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(gg.take_over(self.lock()))
+        self.assertIsNone(other.poll())
+
+    def test_a_dead_or_unrecorded_holder_is_not_taken_over(self) -> None:
+        gg.write_json(gg.BASE / "daemon.lock", {"pid": 2 ** 22 + 12345, "since": 0})
+        self.assertFalse(gg.is_serve(2 ** 22 + 12345))
+        (gg.BASE / "daemon.lock").write_text("")  # an older holder writes no record
+        self.assertIsNone(gg.lock_holder())
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(gg.take_over(self.lock()))
+
+    def test_silence_counts_from_the_holders_own_heartbeat(self) -> None:
+        now = time.time()
+        gg.write_json(gg.BASE / "daemon.lock", {"pid": 4242, "since": now - 5000})
+        gg.write_json(gg.BASE / "daemon.json", {"pid": 4242, "at": now - 20})
+        self.assertAlmostEqual(gg.lock_holder(now)["silent"], 20)
+        gg.write_json(gg.BASE / "daemon.json", {"pid": 999, "at": now - 20})  # another process's heartbeat
+        self.assertAlmostEqual(gg.lock_holder(now)["silent"], 5000)
+
+
+class ServeGuardTest(unittest.TestCase):
+    """Sessions ran `timeout 25 glaeda-gh serve` themselves; one took the lock and hung (10-20)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def fake_service_tools(self, rc: int) -> dict:
+        bin_dir = Path(self.tmp.name) / f"bin{rc}"
+        bin_dir.mkdir()
+        for tool in ("launchctl", "systemctl"):
+            (bin_dir / tool).write_text(f"#!/bin/sh\nexit {rc}\n")
+            (bin_dir / tool).chmod(0o755)
+        env = {k: v for k, v in os.environ.items() if k != "XPC_SERVICE_NAME"}
+        env["PATH"] = os.fspath(bin_dir) + os.pathsep + env.get("PATH", "")
+        env["GLAEDA_GH_DIR"] = os.fspath(Path(self.tmp.name) / "gh")
+        return env
+
+    def test_service_loaded_reads_the_service_manager(self) -> None:
+        for rc, loaded in ((0, True), (113, False)):
+            env = self.fake_service_tools(rc)
+            with mock.patch.dict(os.environ, {"PATH": env["PATH"]}):
+                self.assertEqual(gg.service_loaded(), loaded, rc)
+
+    def test_a_headless_launch_daemon_counts_as_loaded(self) -> None:
+        bin_dir = Path(self.tmp.name) / "headless"
+        bin_dir.mkdir()
+        (bin_dir / "launchctl").write_text('#!/bin/sh\ncase "$2" in system/*) exit 0;; esac\nexit 113\n')
+        (bin_dir / "launchctl").chmod(0o755)
+        with mock.patch.dict(os.environ, {"PATH": os.fspath(bin_dir) + os.pathsep + os.environ["PATH"]}), \
+                mock.patch.object(gg.sys, "platform", "darwin"):
+            self.assertTrue(gg.service_loaded())
+
+    def test_serve_from_a_shell_is_refused_while_the_service_is_loaded(self) -> None:
+        """End to end: the real script, a loaded service, a plain shell."""
+        child = subprocess.run([sys.executable, os.fspath(ROOT / "scripts" / "glaeda-gh"), "serve"],
+                               env=self.fake_service_tools(0), capture_output=True, text=True, timeout=30)
+        self.assertEqual(child.returncode, 64, child.stderr)
+        self.assertIn("refusing to start", child.stderr)
+        self.assertIn("--foreground-ok", child.stderr)
+        self.assertFalse((Path(self.tmp.name) / "gh" / "daemon.lock").exists(), "it never touched the lock")
+
+    def test_the_service_itself_and_foreground_ok_start(self) -> None:
+        with mock.patch.object(gg, "serve", return_value=0) as serve, \
+                mock.patch.object(gg, "service_loaded", return_value=True):
+            with mock.patch.dict(os.environ, {"XPC_SERVICE_NAME": gg.LAUNCH_LABEL}):
+                self.assertEqual(gg.main(["serve"]), 0)
+            with mock.patch.dict(os.environ, {"XPC_SERVICE_NAME": "application.com.mitchellh.ghostty"}):
+                self.assertEqual(gg.main(["serve", "--foreground-ok"]), 0)
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(gg.main(["serve"]), 64)
+        self.assertEqual(serve.call_args_list, [mock.call(False), mock.call(True)])
+
+    def test_no_service_loaded_starts(self) -> None:
+        with mock.patch.object(gg, "serve", return_value=0) as serve, \
+                mock.patch.object(gg, "service_loaded", return_value=False), \
+                mock.patch.object(gg, "under_service", return_value=False):
+            self.assertEqual(gg.main(["serve"]), 0)
+        serve.assert_called_once_with(False)
+
+
+class RestartHintTest(unittest.TestCase):
+    def test_darwin_hints_explain_launchctl_error_5(self) -> None:
+        with mock.patch.object(gg.sys, "platform", "darwin"):
+            for hint in (gg.start_hint(), gg.start_hint(restart=True)):
+                self.assertIn("5: Input/output error", hint)
+                self.assertIn("already loaded", hint)
+                self.assertIn(f"launchctl bootout gui/$(id -u)/{gg.LAUNCH_LABEL}", hint)
+                self.assertIn("Never run glaeda-gh serve yourself", hint)
+
+    def test_stale_message_names_a_hung_holder(self) -> None:
+        with mock.patch.object(gg, "lock_holder", return_value={"pid": 4321, "silent": 1235}), \
+                mock.patch.object(gg, "is_serve", return_value=True):
+            message = gg.stale_message(1235)
+        self.assertIn("1235s", message)
+        self.assertIn("kill 4321", message)
+        with mock.patch.object(gg, "lock_holder", return_value=None):
+            self.assertNotIn("kill", gg.stale_message(1235))
 
 
 if __name__ == "__main__":

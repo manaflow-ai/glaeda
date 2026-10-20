@@ -112,7 +112,17 @@ fall back to polling GitHub yourself.
 
 If it prints `looks hung` (it holds its lock but has not written a heartbeat for 10 minutes),
 restart it: `launchctl kickstart -k gui/$(id -u)/com.teamleaderleo.glaeda.gh-watch` or
-`systemctl --user restart glaeda-gh`.
+`systemctl --user restart glaeda-gh`. If it names a lock holder pid, that process is outside the
+service and a restart cannot reach it: `kill` that pid (the service's waiting daemon also stops it
+by itself after 10 minutes). The daemon exits on its own (and is restarted) when its loop stalls
+for 5 minutes.
+
+`launchctl bootstrap` failing with `5: Input/output error` means the service is already loaded:
+use kickstart. If `kickstart` fails with 5, reload it:
+`launchctl bootout gui/$(id -u)/com.teamleaderleo.glaeda.gh-watch; launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.teamleaderleo.glaeda.gh-watch.plist`.
+
+Never run `glaeda-gh serve` yourself, not even under `timeout`: it refuses while the service is
+loaded, and a hand-started serve that took the lock froze every session's waits on 10-20.
 
 If it prints `every cycle since ... has failed with ERROR at SITE`, the daemon runs but a bug makes
 each cycle raise, so a restart will not help. Tell the user (the message names the code site), and
