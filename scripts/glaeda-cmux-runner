@@ -727,7 +727,7 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         if getattr(ctx, "gui_runner", False):  # the listener gate holds it while the gui token or every root is taken
             scope += " --gui-runner"
             scope += f" --gui-token {shlex.quote(gui_token)}"
-        if getattr(ctx, "session_runner", False):  # session-only jobs: the gate holds it only for units (and a tour)
+        if getattr(ctx, "session_runner", False):  # session-only jobs: the gate holds it only for units
             scope += " --session-runner"
         if getattr(ctx, "fast_runner", False):  # fast-tier takes the fast tokens; the gate holds it while they are taken
             scope += " --fast-runner"
@@ -747,7 +747,7 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
             + ("" if ctx.capacity_units else " --no-waiters"))
     if ctx.capacity_units and (IOS_SIM_JOB_LABEL in ctx.labels or getattr(ctx, "session_runner", False) is True):
         # the iOS picker sends 2-unit isolated builds (mobile-core-package, ios-simulator-build) to this label: listening with one
-        # free unit only takes one to refuse it (cmuxterm-hq#661 Workstream 7). A session runner's jobs (isolated, tour)
+        # free unit only takes one to refuse it (cmuxterm-hq#661 Workstream 7). A session runner's jobs (isolated)
         # cost 2 units as well, and one taken with a single unit free would wait and hold every runner here.
         gate += " --fit-units 2"
     listen = (

@@ -265,11 +265,10 @@ What `--apply` does:
        its jobs costs 2), a job here waits for units, or the console is locked. Its jobs (cmux-next daemon tests, generated files, action exports,
        the pr-media tour) need the logged-in session but neither the gui token nor a root, so
        a console job holding them is no reason to idle it. It never gets a console job: the
-       gui label is the console gui runner's alone. The tour (class `tour`) builds into fixed
-       per-tag DerivedData, so it also takes the mini's one `tour` token: a second tour on the
-       same mini waits for it rather than racing on a tag directory. A waiting second tour holds
-       no runner's gate. With `guiRunners` 2 it can still park on the console gui runner, which
-       carries the session label too, so the console runner is busy for that wait.
+       gui label is the console gui runner's alone. Tours are `isolated` like the rest: each
+       captures only its own app's window and never activates it, and the workflow holds the
+       tour's tag for the job (cmux `scripts/ci/media_tag_lock.py`), so tours of different pull
+       requests run side by side, as many as the mini's units allow.
      - A fast runner (`--fast-runner`, below) looks only at the two fast tokens
        (`capacity/fast-0.token`, `fast-1.token`): it stops while either is taken or a job
        here waits for one, and listens with every shared unit taken. No other runner,

@@ -1262,25 +1262,23 @@ class HookTest(unittest.TestCase):
         self.assertFalse(list((self.dir / "capacity").glob("*.want-*")))
         self.assertTrue(self.lock_free())
 
-    def test_capacity_runs_one_tour_per_mini(self) -> None:
-        """Two tours on one mini (a second gui runner) would build into the same tagged DerivedData: the second
-        waits for the tour token, and no root, persistent-dd or gui token is taken."""
+    def test_capacity_runs_tours_side_by_side(self) -> None:
+        """Tours on one mini (its session runners) each hold their own tag (cmux's media_tag_lock.py) and capture
+        only their own app's window, so they run side by side as isolated jobs: units only, no tour, root,
+        persistent-dd or gui token."""
         self.fleet()
         tour = {"GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/cmux-next-media.yml@refs/heads/main"}
         two = ("--canonical-roots", "2", "--compile-slots", "2")
         try:
-            first = self.job("tour", "t0", 8, None, *two, env=tour)
-            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
-            self.assertIn("holding 2/8 units+tour for tour (tour", first.stdout)
-            second = self.job("tour", "t1", 8, None, *two, "--gui-wait", "0", env=tour)
-            self.assertEqual(second.returncode, 1)
-            self.assertIn("refused: capacity: the tour token is taken", second.stdout)
-            self.assertEqual(self.job("macos-compile-admission", "c0", 8, None, *two).returncode, 0,
-                             "a compile beside a tour is fine")
-            self.finish("t0")
-            self.assertEqual(self.job("tour", "t2", 8, None, *two, env=tour).returncode, 0)
+            for runner in ("t0", "t1", "t2", "t3"):
+                done = self.job("tour", runner, 8, None, *two, "--gui-wait", "0", env=tour)
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                self.assertNotIn("tour token", done.stdout)
+            self.assertFalse((self.dir / "capacity/tour.token").exists())
+            self.assertEqual(self.job("macos-compile-admission", "c0", 8, None, *two, "--gui-wait", "0").returncode, 1,
+                             "four tours take all 8 units, so a compile waits for units")
         finally:
-            for runner in ("t0", "t1", "c0", "t2"):
+            for runner in ("t0", "t1", "t2", "t3", "c0"):
                 self.finish(runner)
         self.assertTrue(self.lock_free())
 
@@ -2406,10 +2404,10 @@ time.sleep(60)
                               ("cmux-next-base-autofix.yml", "action-exports")):
             self.assertEqual(hook.job_class(job, home, home, workflow), ("isolated", False), (workflow, job))
             self.assertEqual(hook.job_class(job, home, home, "other.yml"), ("compile", True), job)
-        # cmux-next media's tour builds its tagged apps into fixed per-tag DerivedData (cmux-ci-media-pr-N-base/head,
-        # one shared by every merge tour): no root, but one tour per mini, since two would race on a tag directory
-        self.assertEqual(hook.job_class("tour", home, home, "cmux-next-media.yml"), ("tour", False))
-        self.assertEqual(hook.CLASS_COST["tour"], (2, ("tour",)))
+        # cmux-next media's tour holds its own tag in the workflow and captures only its app's window: isolated,
+        # as many per mini as units allow
+        self.assertEqual(hook.job_class("tour", home, home, "cmux-next-media.yml"), ("isolated", False))
+        self.assertNotIn("tour", hook.CLASS_COST)
         self.assertEqual(hook.job_class("tour", home, home, "other.yml"), ("compile", True))
         self.assertEqual(hook.job_class("release-compile", home, home, "other.yml"), ("compile", True))
         self.assertEqual(hook.job_class("build", home, home, "nightly.yml"), ("compile", True))
@@ -3974,13 +3972,8 @@ class GateTest(unittest.TestCase):
         (capacity / f"{hook.ADMIT_WANT}{os.getpid()}").write_text(
             json.dumps({"since": time.time(), "wants": ["gui"], "who": "g1 app-host-unit-tests (run 3)"}) + "\n")
         self.assertIsNone(hook.mini_full(capacity, 5, session), "a console job waiting is the console runner's business")
-        (capacity / f"{hook.ADMIT_WANT}{os.getpid()}").write_text(
-            json.dumps({"since": time.time(), "wants": ["tour"], "who": "t1 tour (run 4)"}) + "\n")
-        # a second tour waiting for the tour token idles neither: their next job is rarely a tour
-        self.assertIsNone(hook.mini_full(capacity, 5, session))
-        self.assertEqual(hook.mini_full(capacity, 5, console), "the gui token is taken", "only its own gate")
-        self.assertIsNone(hook.mini_full(capacity, 5, hook.RunnerScope(5, 2, 2)), "side runners take no tour")
         (capacity / f"{hook.ADMIT_WANT}{os.getpid()}").unlink()
+        self.assertEqual(hook.mini_full(capacity, 5, console), "the gui token is taken", "only its own gate")
         for fd in [held, *roots]:
             os.close(fd)
         self.assertEqual(hook.mini_full(self.units(5), 5, session), "all 5 capacity units on this mini are taken")
@@ -4312,10 +4305,10 @@ class GateTest(unittest.TestCase):
         self.assertNotIn("--fit-units", self.listen_sh(sys.executable).read_text())
         script = self.listen_sh(sys.executable, ["glaeda-mini", "glaeda-side-std-xcode-26.6", "glaeda-ios-sim"])
         self.assertIn(f"listen --runner-dir {self.runner} --fit-units 2 &", script.read_text())
-        # a session runner's jobs (isolated, tour) all cost 2 units too
+        # a session runner's jobs (all isolated) cost 2 units too
         script = self.listen_sh(sys.executable, ["glaeda-mini", "glaeda-session-std-xcode-26.6"], session=True)
         self.assertIn(f"listen --runner-dir {self.runner} --fit-units 2 &", script.read_text())
-        self.assertEqual(hook.CLASS_COST["isolated"][0], hook.CLASS_COST["tour"][0])
+        self.assertEqual(hook.CLASS_COST["isolated"][0], 2)
         self.assertEqual(max(hook.CLASS_COST[hook.JOB_CLASSES[job]][0] for job in
                              ("mobile-core-package", "ios-simulator-build", "ios-simulator", "screenshots")), 2,
                          "--fit-units 2 is the costliest class glaeda-ios-sim brings")

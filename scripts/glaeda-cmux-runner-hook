@@ -196,13 +196,14 @@ JOB_CLASSES = {"macos-compile-admission": "compile", "app-host-unit-tests": "gui
 # there. No canonical root, no kept DerivedData, no XCTest, so they are isolated like `swift-test`. As unknown jobs
 # they were pinned compile on root 1 (daemon tests 17.8 h a day, generated files and exports 15.9, hq#2546), so two
 # could never run on one mini however many gui runners it had.
-# cmux-next-media.yml's `tour` (cmux pr-media, on the mini's gui runner) builds the merge base and head as tagged
-# dev apps into fixed per-tag DerivedData (~/Library/Developer/Xcode/DerivedData/cmux-ci-media-pr-<N>-{base,head},
-# and one shared by every merge tour) and captures them through the app's own window snapshot driven by the bundled
-# CLI: no canonical root, no kept DerivedData, no XCTest, no gui token. It is `tour`: an isolated job's 2 units
-# plus the mini's one tour token, because on a mini with session runners a push tour and a merge tour could
-# otherwise build into the same tag directory at once ("ghostty.h has been modified since the module file was
-# built", cmux#21686).
+# cmux-next-media.yml's `tour` (cmux pr-media, on a session runner) builds the merge base and head as tagged dev
+# apps into per-tag DerivedData (~/Library/Developer/Xcode/DerivedData/cmux-ci-media-pr-<N>-{base,head}, one pair
+# for merge tours) and captures each app's own window (its window snapshot, else `screencapture -l` by window id),
+# driven through its socket and never activated: no canonical root, no kept DerivedData, no XCTest, no gui token,
+# and nothing another tour's window can cover. The workflow holds the tour's tag for the job (cmux
+# scripts/ci/media_tag_lock.py), so two tours never build into one tag directory ("ghostty.h has been modified
+# since the module file was built", cmux#21686) and the hook needs no tour token: tours are isolated, as many on
+# a mini as its units allow.
 WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "test"): "isolated",
                         ("cmux-tui.yml", "build"): "isolated", ("cmux-tui.yml", "cdp-browser-smoke"): "isolated",
                         ("cmux-tui.yml", "macos-relay"): "isolated",
@@ -218,7 +219,7 @@ WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "
                         ("cmux-next.yml", "daemon-test"): "isolated", ("cmux-next.yml", "generated-files"): "isolated",
                         ("cmux-next-pr-autofix.yml", "action-exports"): "isolated",
                         ("cmux-next-base-autofix.yml", "action-exports"): "isolated",
-                        ("cmux-next-media.yml", "tour"): "tour"}
+                        ("cmux-next-media.yml", "tour"): "isolated"}
 # root: the canonical root (/private/tmp/cmux-ci) that compiles build in and that app-host test consumers
 # restore a product into with rm -rf of its src, so one root job per root per mini (cmux#14338 adds a second).
 # product (cli-product-tests) runs its XCTest bundle through the same user testmanagerd as the gui jobs, so it
@@ -252,7 +253,6 @@ CLASS_COST: dict[str, tuple[int, tuple[str, ...]]] = {
     "compile": (2, ("persistent-dd", "root")), "gui": (1, ("gui", "root")), "product": (1, ("gui", "root")),
     "compile-gui": (2, ("root",)), "gui-step": (1, ("gui", "root")),
     "isolated": (2, ()), "simulator": (1, ("simulator",)), "light": (1, ()), "seed": (2, ()),
-    "tour": (2, ("tour",)),
     "fast": (0, FAST_TOKENS)}
 # Guest repositories (any repo other than --home-repo, admitted by an org-scoped runner's --allowed-owner)
 # never touch cmux's canonical roots or persistent DerivedData, so they are costed by job-id suffix alone:
@@ -2265,7 +2265,7 @@ def token_holders(capacity_dir: Path, wants: list[str], compile_slots: int, root
             names += [f"root-{k}" for k in range(1, max(1, roots) + 1)]
         elif kind == "persistent-dd":
             names += ["persistent-dd"] + [f"persistent-dd-{c}" for c in range(1, max(1, compile_slots))]
-        elif kind in ("gui", "simulator", "tour") or kind in FAST_TOKENS:
+        elif kind in ("gui", "simulator") or kind in FAST_TOKENS:
             names.append(kind)
     notes = []
     deadline = time.monotonic() + HOLDERS_BUDGET_S
@@ -2831,8 +2831,8 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
 
     Full also means a job admitted to this mini is waiting (CAPACITY_WAIT, its admit.want marker) for units or
     for a token this runner's next job would take (a root runner: a canonical root or persistent-dd; a gui
-    runner: the gui token or a root). A second tour waiting for the tour token holds no runner. That job goes first, so a
-    job this runner took now would only queue behind it here, while GitHub could hand it to a mini with room.
+    runner: the gui token or a root). That job goes first, so a job this runner took now would only queue behind
+    it here, while GitHub could hand it to a mini with room.
 
     With the scope of a fast runner (scope.fast, the fast pool label: cmux-next's fast-tier), full means only that a
     fast token is taken or a job here waits for one: its job takes the fast tokens and none of the shared units,
@@ -2879,7 +2879,6 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
             return (f"only {free} of {total} capacity units on this mini are free; "
                     f"{'a compile' if root else 'its next job'} needs {need}")
         # a job already here waits for what this runner's next job would take (CAPACITY_WAIT): it goes first
-        # A tour waiting for the tour token holds no runner: their next job is rarely a second tour.
         compete = {"units"} | ({"root", "persistent-dd"} if root else set()) | (
             {scope.gui_token, "root"} if scope is not None and scope.gui else set())
         for waiter in admission_waiters(capacity_dir):
