@@ -208,6 +208,14 @@ def make_executable(path: Path, text: str) -> Path:
     return path
 
 
+def wait_for_path(path: Path, seconds: float = 10) -> bool:
+    """job-completed starts glaeda-disk detached: what the pass writes appears after the hook returns."""
+    deadline = time.monotonic() + seconds
+    while not path.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    return path.exists()
+
+
 def event(tmp: Path, name: str, payload: dict) -> Path:
     path = tmp / f"{name}.json"
     path.write_text(json.dumps(payload))
@@ -512,7 +520,7 @@ class HookTest(unittest.TestCase):
         other = self.run_hook("job-completed", None, None, "--disk", os.fspath(disk), "--state-dir", state,
                               "--watch-pid", "4343")
         self.assertEqual(other.returncode, 0)
-        self.assertTrue(marker.exists(), "another runner's job on the mini still runs its disk pass")
+        self.assertTrue(wait_for_path(marker), "another runner's job on the mini still runs its disk pass")
         marker.unlink()
         done = self.run_hook("job-completed", None, None, "--disk", os.fspath(disk), "--state-dir", state,
                              "--watch-pid", "4242")
@@ -522,7 +530,7 @@ class HookTest(unittest.TestCase):
         again = self.run_hook("job-completed", None, None, "--disk", os.fspath(disk), "--state-dir", state,
                               "--watch-pid", "4242")
         self.assertEqual(again.returncode, 0)
-        self.assertTrue(marker.exists(), "the refusal's note is used once")
+        self.assertTrue(wait_for_path(marker), "the refusal's note is used once")
 
     def test_job_completed_disk_pass_runs_detached_and_bounded(self) -> None:
         """job-completed held its runner up to DISK_TIMEOUT_S (120 s) on glaeda-disk: "Complete runner" took 121-124 s
@@ -530,7 +538,8 @@ class HookTest(unittest.TestCase):
         marker = self.dir / "disk-pass"
         slow = make_executable(self.dir / "glaeda-disk-slow", "import os, pathlib, sys, time\n"
                                f"pathlib.Path({os.fspath(marker)!r}).write_text(' '.join([str(os.getpid()), "
-                               "str(os.getsid(0)), os.environ.get('RUNNER_TRACKING_ID', '-'), *sys.argv[1:]]))\n"
+                               "str(os.getppid()), str(os.getsid(0)), os.environ.get('RUNNER_TRACKING_ID', '-'), "
+                               "*sys.argv[1:]]))\n"
                                "time.sleep(60)\n")
         start = time.monotonic()
         result = self.run_hook("job-completed", None, None, "--disk", os.fspath(slow),
@@ -539,10 +548,11 @@ class HookTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertLess(time.monotonic() - start, 5, "job-completed waited on glaeda-disk")
         self.assertIn("glaeda-disk started in the background", result.stdout)
-        deadline = time.monotonic() + 5
-        while not marker.exists() and time.monotonic() < deadline:
-            time.sleep(0.05)
-        pid, sid, tracking, *argv = marker.read_text().split()
+        self.assertTrue(wait_for_path(marker), "the detached pass never ran")
+        pid, bound, sid, tracking, *argv = marker.read_text().split()
+        environ = Path(f"/proc/{bound}/environ")  # Linux: the bounding process's own environment block
+        if environ.exists():
+            self.assertNotIn(b"RUNNER_TRACKING_ID=", environ.read_bytes())
         self.assertEqual(argv, ["--pressure", "--apply", "--top", "0"])
         self.assertEqual(tracking, "-", "the runner's orphan cleanup would kill a pass carrying RUNNER_TRACKING_ID")
         self.assertNotEqual(int(sid), os.getsid(0), "the pass must leave the runner's session")

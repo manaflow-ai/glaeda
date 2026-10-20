@@ -54,7 +54,8 @@ refuses. After a warmup, a sustained low-CPU job may release surplus capacity un
 through its holder; each release is logged as a "capacity_release" line. The existing load gate remains the
 safety brake. glaeda-fleet-status reads the completed lines (source "jobs").
 
-job-completed stops the sampler (it writes the record), runs the same disk pressure pass and always exits 0. A
+job-completed stops the sampler (it writes the record), starts the same disk pressure pass detached (bounded
+by the same timeout, so the runner takes its next job at once) and always exits 0. A
 cmux compile admission may leave a bounded `glaeda-compile-telemetry.json` in `RUNNER_TEMP`; the completed
 record embeds its cache and phase counters after validating the run identity.
 
@@ -4733,6 +4734,49 @@ def disk_pressure(explicit: str | None, floor_gib: float = 0.0, timeout: float =
         return f"glaeda-disk skipped: {type(error).__name__}"
 
 
+DISK_BOUND = """import subprocess, sys
+try:
+    subprocess.run(sys.argv[2:], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                   timeout=float(sys.argv[1]), check=False)
+except (OSError, subprocess.TimeoutExpired):
+    pass
+"""
+
+
+def disk_pressure_detached(explicit: str | None, timeout: float = DISK_TIMEOUT_S) -> str:
+    """job-completed's pass: the same glaeda-disk run, bounded by the same timeout, in a detached process, so the
+    runner takes its next job at once ("Complete runner" took 121-124 s on main's macOS jobs while job-completed
+    waited on it, and dependent jobs waited for those outputs). glaeda-disk's evict.lock keeps one --apply at a time,
+    so a job-started pass or the LaunchAgent's meanwhile skips rather than racing it. The child leaves the runner's
+    session and execs with RUNNER_TRACKING_ID dropped, so the runner's orphan cleanup does not kill it, and closes every
+    inherited fd, so it holds no lock of this job's. Best effort: returns a note, never raises."""
+    try:
+        argv = disk_argv(explicit)
+        if argv is None:
+            return "glaeda-disk not installed; skipped"
+        timeout = float(os.environ.get("GLAEDA_RUNNER_DISK_TIMEOUT") or timeout)
+        env = {key: value for key, value in os.environ.items() if key != "RUNNER_TRACKING_ID"}
+        child = os.fork()
+    except Exception as error:  # noqa: BLE001  (never fail the job on housekeeping)
+        return f"glaeda-disk skipped: {type(error).__name__}"
+    if child == 0:  # detach twice so the runner never waits on the pass
+        try:
+            os.setsid()
+            if os.fork():
+                os._exit(0)
+            null = os.open(os.devnull, os.O_RDWR)
+            for std in (0, 1, 2):  # the runner reads the hook's output until EOF
+                os.dup2(null, std)
+            os.closerange(3, max(256, os.sysconf("SC_OPEN_MAX")))
+            # exec, so the bounding process's own environment is clean too, not only glaeda-disk's
+            os.execve(sys.executable, [sys.executable, "-c", DISK_BOUND, f"{timeout:g}", *argv], env)
+        finally:
+            os._exit(0)
+    with contextlib.suppress(OSError):
+        os.waitpid(child, 0)
+    return f"glaeda-disk started in the background (bounded by {timeout:g} s)"
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog=PREFIX)
     p.add_argument("phase", choices=("job-started", "job-completed", "check", "listen", "take-root", "take-gui",
@@ -5049,7 +5093,8 @@ def main(argv: list[str] | None = None) -> int:
         if skip_disk:  # nothing ran, so nothing to free; the runner is back on the queue at once
             print(f"{PREFIX}: refused in job-started; no disk pass", flush=True)
     if not args.no_disk and not skip_disk:
-        print(f"{PREFIX}: {disk_pressure(args.disk)}", flush=True)
+        note = disk_pressure_detached(args.disk) if args.phase == "job-completed" else disk_pressure(args.disk)
+        print(f"{PREFIX}: {note}", flush=True)
     return 0
 
 
