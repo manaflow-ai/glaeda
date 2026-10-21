@@ -15,7 +15,9 @@ written once by setup and never overwritten:
      "reportStatus": true, "source": "teamleaderleo/glaeda"}
 
 For a GUI-less macOS host, setupArgs also contains `--headless`; this keeps OTA reinstalls in
-the system launchd domain instead of silently returning to a GUI-only agent.
+the system launchd domain instead of silently returning to a GUI-only agent. A lane host with no glaeda
+hygiene has `["--gh-only"]`: setup installs only glaeda-gh and this updater, and the health check runs only
+those two.
 
 `source` is where releases and channel files are downloaded from: this repository, or its read-only
 mirror manaflow-ai/glaeda, which the Manaflow minis use (docs/GLAEDA_OTA.md, Fleet mirror). The mirror
@@ -120,6 +122,8 @@ MAX_EXTRACTED = 1024 * 1024 * 1024
 # what setup installs and a first update snapshots, so it can roll back without a previous release
 TOOLS = ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-runner-hygiene", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all",
          "glaeda-fleet-cas-prune", "glaeda-seed-prefetch", "glaeda-idle-warm", "glaeda-mini-health", "glaeda-update", "glaeda-gh")
+# what a --gh-only host installs (glaeda-mini-setup GH_ONLY_TOOLS): its health and drift checks cover only these
+GH_ONLY_TOOLS = ("glaeda-update", "glaeda-gh")
 RELEASE_SCHEMA = "glaeda-release/v1"
 STATUS_PREFIX = "glaeda-ota/"
 MAX_ASSET = 200 * 1024 * 1024
@@ -429,14 +433,22 @@ def run_setup(gen: Path, args: list[str]) -> tuple[bool, str]:
     return result.returncode == 0, (result.stdout + result.stderr)[-2000:]
 
 
-def health(bin_dir: Path, channel_dir: Path) -> tuple[bool, str]:
+def gh_only(config: dict) -> bool:
+    """This host runs setup's --gh-only profile."""
+    return "--gh-only" in config["setupArgs"]
+
+
+def health(bin_dir: Path, channel_dir: Path, gh_only: bool = False) -> tuple[bool, str]:
     """The installed tools run, and the installed glaeda-update plans from the channel files this
-    run already fetched, so a network blip cannot fail (and quarantine) a good release."""
-    checks = [
+    run already fetched, so a network blip cannot fail (and quarantine) a good release. A --gh-only
+    host installs only glaeda-gh and glaeda-update, so only those are checked there."""
+    hygiene = [] if gh_only else [
         [sys.executable, str(bin_dir / "glaeda-disk"), "--help"],
         [sys.executable, str(bin_dir / "glaeda-worktree"), "--help"],
         [sys.executable, str(bin_dir / "glaeda-projects"), "--help"],
         [str(bin_dir / "glaeda-worktree-reclaim"), "--help"],
+    ]
+    checks = hygiene + [
         [sys.executable, str(bin_dir / "glaeda-gh"), "--help"],
         [sys.executable, str(bin_dir / "glaeda-update"), "--channel-dir", str(channel_dir)],
     ]
@@ -820,11 +832,13 @@ def file_sha256(path: Path) -> str | None:
         return None
 
 
-def tool_drift(gen: Path, bin_dir: Path) -> tuple[int, list[str]]:
+def tool_drift(gen: Path, bin_dir: Path, gh_only: bool = False) -> tuple[int, list[str]]:
     """(tools compared, tools whose installed bytes are not the release's). Only a tool both installed and
-    in the release is compared: a host profile need not install every tool, and setup owns which."""
+    in the release is compared: a host profile need not install every tool, and setup owns which. A
+    --gh-only host compares only its two: hygiene tools left from an earlier profile are no longer setup's,
+    and a "repair" that reran setup for them would fail on every run."""
     checked, drift = 0, []
-    for name in TOOLS:
+    for name in GH_ONLY_TOOLS if gh_only else TOOLS:
         want = gen / "bin" / name if name == "glaeda-worktree-reclaim" else gen / "glaeda/scripts" / name
         have = bin_dir / name
         want_sha, have_sha = file_sha256(want), file_sha256(have)
@@ -857,7 +871,7 @@ def runner_hook_dirs(home: Path) -> list[tuple[str, Path | None]]:
 
 
 def observe(state_dir: Path = STATE_DIR, bin_dir: Path = BIN, home: Path = HOME,
-            staged: Path = RUNNER_SCRIPTS) -> dict:
+            staged: Path = RUNNER_SCRIPTS, gh_only: bool = False) -> dict:
     """Step 8: what this host actually runs, by content: the installed release, its tools and each runner's
     installed hook files, each compared with the release's bytes. Reads local files only."""
     state = load_state(state_dir)
@@ -867,7 +881,7 @@ def observe(state_dir: Path = STATE_DIR, bin_dir: Path = BIN, home: Path = HOME,
     gen = generation(state_dir, tag) if tag else None
     if gen is None or not (gen / ".complete").is_file():
         return out
-    checked, drift = tool_drift(gen, bin_dir)
+    checked, drift = tool_drift(gen, bin_dir, gh_only)
     out["tools"] = {"checked": checked, "drift": drift}
     scripts = gen / "glaeda/scripts"
     want = {name: file_sha256(scripts / name) for name in HOOK_RELEASE_FILES}
@@ -1030,12 +1044,12 @@ def update(apply: bool, config: dict, state_dir: Path = STATE_DIR,
     if entry["tag"] == state["current"]:
         gen = generation(state_dir, entry["tag"])
         if apply and (gen / ".complete").is_file():
-            _, drift = tool_drift(gen, bin_dir)
+            _, drift = tool_drift(gen, bin_dir, gh_only(config))
             if drift:
                 # Step 8: the installed tools are not this release's bytes (a partial or hand install):
                 # its own idempotent setup puts them back. Never a quarantine: the release was healthy here.
                 ok, log = run_setup(gen, config["setupArgs"])
-                _, left = tool_drift(gen, bin_dir)
+                _, left = tool_drift(gen, bin_dir, gh_only(config))
                 out["repair"] = (f"reinstalled {', '.join(drift)}" if ok and not left
                                  else f"failed: setup {'exited' if not ok else 'left ' + ', '.join(left)}: {log[-200:]}")[:400]
         return {**out, "result": "current"}
@@ -1082,7 +1096,7 @@ def update(apply: bool, config: dict, state_dir: Path = STATE_DIR,
         channel_dir.mkdir(parents=True, exist_ok=True)
         (channel_dir / "control.json").write_bytes(control_raw)
         (channel_dir / f"{config['ring']}.json").write_bytes(ring_raw or b"")
-        ok, detail = health(bin_dir, channel_dir)
+        ok, detail = health(bin_dir, channel_dir, gh_only=gh_only(config))
     if ok:
         state.update(previous=state["current"], current=entry["tag"])
         save_state(state, state_dir)
@@ -1228,10 +1242,10 @@ def apply_once(config: dict, state_dir: Path = STATE_DIR, bin_dir: Path = BIN, h
             result.update(runner_steps(state_dir, staged, home, hook_states))
     except Exception as e:  # noqa: BLE001  (recorded below, then re-raised for the one JSON line)
         result = {"result": "error", "why": f"{type(e).__name__}: {e}"[:500]}
-        record_convergence(config, result, wants, previous, now, observe(state_dir, bin_dir, home, staged),
+        record_convergence(config, result, wants, previous, now, observe(state_dir, bin_dir, home, staged, gh_only(config)),
                            hook_states, converge_path)
         raise
-    doc = record_convergence(config, result, wants, previous, now, observe(state_dir, bin_dir, home, staged),
+    doc = record_convergence(config, result, wants, previous, now, observe(state_dir, bin_dir, home, staged, gh_only(config)),
                              hook_states, converge_path)
     result["converge"] = {k: doc[k] for k in ("converged", "why", "blocking", "since", "attempts")}
     return result
@@ -1252,7 +1266,7 @@ def main(argv: list[str] | None = None) -> int:
                  "release": {"tag": state["current"],
                              "source": installed_source(STATE_DIR, state["current"])},
                  # what the last run recorded (wants, why), and what the host runs now, by content
-                 "converge": load_converge(), "running": observe()},
+                 "converge": load_converge(), "running": observe(gh_only=gh_only(config))},
                 indent=1, sort_keys=True))
             return 0
         if not a.apply:  # planning reads only, so it needs no lock (health checks plan mid-update)

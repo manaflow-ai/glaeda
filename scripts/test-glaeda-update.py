@@ -637,6 +637,21 @@ class UpdateTest(unittest.TestCase):
                          self.server.rings["canary"]["tag"])
         self.assertFalse((self.state / "pre-ota").exists())  # snapshot dropped after the first success
 
+    def test_a_gh_only_host_checks_only_the_tools_it_installs(self) -> None:
+        ran = []
+
+        def fake_run(argv, **kw):
+            ran.append(Path(argv[1] if argv[0] == sys.executable else argv[0]).name)
+            return subprocess.CompletedProcess(argv, 0, '{"result": "current"}\n', "")
+
+        with mock.patch.object(gu.subprocess, "run", fake_run):
+            self.assertEqual(gu.health(self.bin, self.root, gh_only=True), (True, "tools run"))
+            self.assertEqual(ran, ["glaeda-gh", "glaeda-update"])
+            ran.clear()
+            gu.health(self.bin, self.root)
+        self.assertEqual(ran, ["glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-worktree-reclaim",
+                               "glaeda-gh", "glaeda-update"])
+
     def test_real_updater_plans_from_a_channel_dir_without_network(self) -> None:
         entry = self.server.publish(SOURCES[0])
         channel_dir = self.root / "channel"
@@ -826,6 +841,17 @@ class UpdateTest(unittest.TestCase):
         self.assertEqual((result["result"], result["repair"]), ("current", "reinstalled glaeda-worktree-reclaim"))
         self.assertTrue(self.converge()["converged"])
         self.assertEqual(self.converge()["running"]["tools"]["drift"], [])
+
+    def test_a_gh_only_host_does_not_repair_tools_it_no_longer_installs(self) -> None:
+        self.server.publish(SOURCES[0])
+        now = 1_800_000_000.0
+        self.assertEqual(self.apply(now)["result"], "updated")
+        (self.bin / "glaeda-worktree-reclaim").write_text("#!/bin/sh\n# left from the hygiene profile\nexit 0\n")
+        self.config = {**self.config, "setupArgs": ["--gh-only"]}
+        self.assertEqual(gu.observe(self.state, self.bin, self.root, self.root / "x", gh_only=True)["tools"]["drift"], [])
+        result = self.apply(now + 1)
+        self.assertEqual(result["result"], "current", result)
+        self.assertNotIn("repair", result)
 
     def test_a_run_that_dies_still_records_why(self) -> None:
         self.server.publish(SOURCES[0])
