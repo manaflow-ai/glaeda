@@ -297,66 +297,86 @@ jobs:
           bash -n scripts/cmux_mini_probe.sh
           bash -n scripts/cmux_mini_preflight.sh
           bash -n scripts/cmux_mini_fix.sh
-          bash scripts/test-bootstrap.sh
-          python3 scripts/test-benchmark-developer-loop.py
-          python3 scripts/test-benchmark-hot-state-fanout.py
-          python3 scripts/test-benchmark-pnpm-task-dependencies.py
-          python3 scripts/test-benchmark-linker-throughput.py
-          python3 scripts/test-hot-observe.py
-          python3 scripts/test-glaeda-disk.py
-          python3 scripts/test-glaeda-devbox.py
-          python3 scripts/test-glaeda-projects.py
-          python3 scripts/test-glaeda-worktree.py
-          python3 scripts/test-glaeda-worktree-reclaim-all.py
-          python3 scripts/test-glaeda-runner-hygiene.py
-          python3 scripts/test-glaeda-procs.py
-          python3 scripts/test-glaeda-local-guard.py
-          python3 scripts/test-glaeda-update.py
-          python3 scripts/test-glaeda-fleet-cas-prune.py
-          python3 scripts/test-glaeda-fleet-cas.py
-          python3 scripts/test-fleet-cas-bundle.py
-          bash scripts/test-glaeda-fleet-cas.sh
-          bash scripts/test-glaeda-fleet-cas-mount.sh
-          python3 scripts/test-glaeda-seed-prefetch.py
-          python3 scripts/test-glaeda-idle-warm.py
-          python3 scripts/test-glaeda-mini-health.py
-          python3 scripts/test-glaeda-daemon-heal.py
-          python3 scripts/test-glaeda-seed-lan.py
-          python3 scripts/test-glaeda-lan-fetch.py
-          python3 scripts/test-glaeda-gh.py
-          python3 scripts/test-glaeda-wallpaper-rotate.py
-          python3 scripts/test-glaeda-sync-main.py
-          python3 scripts/test-hot-pressure-shadow.py
-          python3 scripts/test-hot-run.py
-          python3 scripts/test-verify-focused.py
-          python3 scripts/test-owned-linux-admission.py
-          python3 scripts/test-owned-linux-jit-task.py
-          python3 scripts/test-repository-agent-work.py
-          python3 scripts/test-external-execution-request.py
-          python3 scripts/test-trusted-agent-dispatch.py
-          python3 scripts/test-provider-neutral-request.py
-          python3 scripts/test-owner-local-dispatch.py
-          python3 scripts/test-cmux-fleet.py
-          python3 scripts/test-cmux-fleet-operator-summary.py
-          python3 scripts/test-cmux-fleet-bootstrap.py
-          python3 scripts/test-glaeda-mini-setup.py
-          python3 scripts/test-glaeda-mini-enroll.py
-          python3 scripts/test-glaeda-cmux-runner-fleet.py
-          python3 scripts/test-glaeda-mini-fleet.py
-          python3 scripts/test-glaeda-fleet-status.py
-          python3 scripts/test-glaeda-route.py
-          python3 scripts/test-cmux-execution-roles.py
-          python3 scripts/test-cmux-workload-request.py
-          python3 scripts/test-owned-fleet-benchmark.py
-          python3 scripts/test-verify.py
-          python3 scripts/test-verify-changed-rustfmt.py
-          python3 scripts/test-front-door.py
-          python3 scripts/test-quarry-sweep.py
-          python3 scripts/test-quarry-parallel.py
-          python3 scripts/test-status-page.py
-          python3 scripts/test-unittest-shard.py
+          # Every suite runs and reports on its own: one red suite no longer skips the rest (glaeda#1562's
+          # tests never ran while test-glaeda-disk was red). Each failure is an annotation and a summary row.
+          # Add a new test suite as `suite python3 scripts/test-x.py`: a bare line stops the step at its failure.
+          failed=()
+          suite() {
+            echo "::group::$*"
+            if "$@"; then echo "::endgroup::"; else
+              rc=$?
+              echo "::endgroup::"
+              echo "::error title=Suite failed (exit $rc)::$*"
+              failed+=("$*")
+            fi
+          }
+          suite bash scripts/test-bootstrap.sh
+          suite python3 scripts/test-benchmark-developer-loop.py
+          suite python3 scripts/test-benchmark-hot-state-fanout.py
+          suite python3 scripts/test-benchmark-pnpm-task-dependencies.py
+          suite python3 scripts/test-benchmark-linker-throughput.py
+          suite python3 scripts/test-hot-observe.py
+          suite python3 scripts/test-glaeda-disk.py
+          suite python3 scripts/test-glaeda-devbox.py
+          suite python3 scripts/test-glaeda-projects.py
+          suite python3 scripts/test-glaeda-worktree.py
+          suite python3 scripts/test-glaeda-worktree-reclaim-all.py
+          suite python3 scripts/test-glaeda-runner-hygiene.py
+          suite python3 scripts/test-glaeda-procs.py
+          suite python3 scripts/test-glaeda-local-guard.py
+          suite python3 scripts/test-glaeda-update.py
+          suite python3 scripts/test-glaeda-fleet-cas-prune.py
+          suite python3 scripts/test-glaeda-fleet-cas.py
+          suite python3 scripts/test-fleet-cas-bundle.py
+          suite bash scripts/test-glaeda-fleet-cas.sh
+          suite bash scripts/test-glaeda-fleet-cas-mount.sh
+          suite python3 scripts/test-glaeda-seed-prefetch.py
+          suite python3 scripts/test-glaeda-idle-warm.py
+          suite python3 scripts/test-glaeda-mini-health.py
+          suite python3 scripts/test-glaeda-daemon-heal.py
+          suite python3 scripts/test-glaeda-seed-lan.py
+          suite python3 scripts/test-glaeda-lan-fetch.py
+          suite python3 scripts/test-glaeda-gh.py
+          suite python3 scripts/test-glaeda-wallpaper-rotate.py
+          suite python3 scripts/test-glaeda-sync-main.py
+          suite python3 scripts/test-hot-pressure-shadow.py
+          suite python3 scripts/test-hot-run.py
+          suite python3 scripts/test-verify-focused.py
+          suite python3 scripts/test-owned-linux-admission.py
+          suite python3 scripts/test-owned-linux-jit-task.py
+          suite python3 scripts/test-repository-agent-work.py
+          suite python3 scripts/test-external-execution-request.py
+          suite python3 scripts/test-trusted-agent-dispatch.py
+          suite python3 scripts/test-provider-neutral-request.py
+          suite python3 scripts/test-owner-local-dispatch.py
+          suite python3 scripts/test-cmux-fleet.py
+          suite python3 scripts/test-cmux-fleet-operator-summary.py
+          suite python3 scripts/test-cmux-fleet-bootstrap.py
+          suite python3 scripts/test-glaeda-mini-setup.py
+          suite python3 scripts/test-glaeda-mini-enroll.py
+          suite python3 scripts/test-glaeda-cmux-runner-fleet.py
+          suite python3 scripts/test-glaeda-mini-fleet.py
+          suite python3 scripts/test-glaeda-fleet-status.py
+          suite python3 scripts/test-glaeda-route.py
+          suite python3 scripts/test-cmux-execution-roles.py
+          suite python3 scripts/test-cmux-workload-request.py
+          suite python3 scripts/test-owned-fleet-benchmark.py
+          suite python3 scripts/test-verify.py
+          suite python3 scripts/test-verify-changed-rustfmt.py
+          suite python3 scripts/test-front-door.py
+          suite python3 scripts/test-quarry-sweep.py
+          suite python3 scripts/test-quarry-parallel.py
+          suite python3 scripts/test-status-page.py
+          suite python3 scripts/test-unittest-shard.py
           # a test that leaves files in the checkout fails, as it did before the split
-          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          dirty=$(git status --porcelain=v1 --untracked-files=all)
+          dirty=${dirty//%/%25}
+          if [ -n "$dirty" ]; then echo "::error title=A suite left files in the checkout::${dirty//$'\n'/%0A}"; failed+=("clean checkout"); fi
+          {
+            echo "### Script suites: ${#failed[@]} failed"
+            for f in "${failed[@]}"; do echo "- \`$f\`"; done
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ "${#failed[@]}" -eq 0 ]
 
       - name: Validate Mac helper scripts
         run: |
