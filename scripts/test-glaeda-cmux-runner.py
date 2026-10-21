@@ -3504,9 +3504,95 @@ class JobLeftoverTest(unittest.TestCase):
             with contextlib.suppress(OSError):
                 os.kill(pid, signal.SIGKILL)
         self.addCleanup(kill_if_left)
-        notes = hook.cleanup_job_leftovers(str(work))
+        with mock.patch.object(hook, "process_cwds", return_value=None), \
+             mock.patch.object(hook, "git_repair_protected", return_value=set()):
+            notes = hook.cleanup_job_leftovers(str(work))
         self.assertFalse(hook.pid_alive(pid))
         self.assertTrue(notes and "ended 1 leftover" in notes[0], notes)
+        self.assertTrue(notes[0].endswith(": daemon"), notes)  # the executable's name, never its arguments
+
+    def test_orphan_working_in_work_from_a_copied_binary_is_a_leftover(self) -> None:
+        # cmuxs-mac-mini-6, 2026-10-21: copies of cmux-tui outside _work, cwd still in this runner's checkout
+        table = {
+            60: (1, "/var/folders/hq/x/T/cnd-bin-59647/cmux-tui --headless --session cnd-crash-1"),
+            61: (60, "cmux-tui __terminal-host --bootstrap-stdio"),
+            62: (1, "/bin/sh /tmp/slr-ABD/cmux-tui remote connect ssh://drill --headless"),
+            63: (62, "sleep 5"),
+            64: (700, "/bin/sh /tmp/slr-X/cmux-tui remote connect"),  # still has a parent: not an orphan
+            65: (1, "/tmp/other/cmux-tui --headless"),  # another runner's checkout
+        }
+        cwds = {60: self.WORK + "/cmux/cmux/Packages/macOS/CmuxNext", 62: self.WORK + "/cmux", 64: self.WORK,
+                65: "/Users/cmux/actions-runner-glaeda-33/_work/cmux", 61: "/"}
+        found = hook.work_leftover_pids(table, self.WORK, set(), cwds)
+        self.assertEqual([pid for pid, _ in found], [60, 61, 62, 63])
+
+    def test_runner_glaeda_and_git_maintenance_processes_are_spared(self) -> None:
+        table = {
+            70: (1, "/Users/cmux/actions-runner-glaeda-3/bin/Runner.Listener run"),
+            71: (1, "/bin/bash /Users/cmux/actions-runner-glaeda-3/glaeda-hooks/listen.sh"),
+            72: (1, "/usr/bin/python3 /Users/cmux/actions-runner-glaeda-3/glaeda-hooks/glaeda-cmux-runner-hook listen"),
+            73: (1, "/usr/bin/git -C . fetch --refetch origin"),
+            74: (1, "/Library/Developer/CommandLineTools/usr/libexec/git-core/git-pack-objects --revs"),
+            75: (1, "/usr/bin/git status"),
+        }
+        cwds = {pid: self.WORK + "/cmux" for pid in table}
+        self.assertEqual([pid for pid, _ in hook.work_leftover_pids(table, self.WORK, set(), cwds)], [75])
+        self.assertTrue(hook.leftover_spared(""))
+
+    def test_orphans_only_drops_command_roots_that_still_have_a_parent(self) -> None:
+        table = {80: (1, self.WORK + "/cmux/a"), 81: (90, self.WORK + "/cmux/b"), 90: (1, "/sbin/launchd-ish")}
+        self.assertEqual([pid for pid, _ in hook.work_leftover_pids(table, self.WORK, set(), orphans_only=True)], [80])
+        self.assertEqual([pid for pid, _ in hook.work_leftover_pids(table, self.WORK, set())], [80, 81])
+
+    def test_git_repair_protected_lists_pids_and_descendants(self) -> None:
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        listed = tmp / "protected"
+        listed.write_text("90\tmachine-hygiene repack, and every child\nnot-a-pid\n999\tgone\n")
+        table = {90: (1, "/bin/sh repack.sh"), 91: (90, "git repack -a"), 92: (1, "other")}
+        self.assertEqual(hook.git_repair_protected(table, listed), {90, 91})
+        self.assertEqual(hook.git_repair_protected(table, tmp / "missing"), set())
+        self.assertIsNone(hook.git_repair_protected(table, tmp))  # a directory: unreadable, protects everything
+        cwds = {90: self.WORK + "/cmux", 91: self.WORK + "/cmux"}
+        self.assertEqual(hook.work_leftover_pids(table, self.WORK, {90, 91}, cwds), [])
+
+    def test_job_leftovers_end_nothing_when_the_protected_list_is_unreadable(self) -> None:
+        table = {10: (1, self.WORK + "/cmux/daemon")}
+        with mock.patch.object(hook, "processes", return_value=table), \
+             mock.patch.object(hook, "git_repair_protected", return_value=None), \
+             mock.patch.object(hook.os, "kill") as kill:
+            self.assertEqual(hook.cleanup_job_leftovers(self.WORK), [])
+        kill.assert_not_called()
+
+
+    def test_sessions_with_a_terminal_and_spared_trees_are_never_leftovers(self) -> None:
+        table = {
+            100: (1, "tmux new -s agent"), 101: (100, "/bin/zsh"), 102: (101, "/usr/bin/python3 x.py"),
+            110: (1, "/usr/local/bin/claude --resume"), 111: (110, "node helper.js"),
+            120: (1, "/var/folders/x/T/cnd-bin-1/cmux-tui --headless"),  # has a terminal: someone's session
+            130: (1, "/var/folders/x/T/cnd-bin-2/cmux-tui --headless"), 131: (130, "tmux -L inner"),
+            132: (131, "/bin/zsh"), 133: (130, "/bin/zsh -l"), 134: (133, "vim notes"), 135: (130, "cat"),
+        }
+        cwds = {pid: self.WORK + "/cmux" for pid in (100, 110, 120, 130)}
+        found = hook.work_leftover_pids(table, self.WORK, set(), cwds, ttys={120, 133})
+        self.assertEqual([pid for pid, _ in found], [130, 135])  # 131's tmux, 133's terminal and all under them stay
+
+    def test_glaedas_detached_disk_bound_is_spared(self) -> None:
+        bound = f"{sys.executable} -c {hook.DISK_BOUND} 120 {sys.executable} /Users/cmux/.local/bin/glaeda-disk --pressure"
+        self.assertTrue(hook.leftover_spared(bound))
+        self.assertTrue(hook.leftover_spared("/usr/bin/python3 /Users/cmux/.local/bin/glaeda-disk --pressure --apply"))
+        self.assertFalse(hook.leftover_spared("/Users/cmux/actions-runner-glaeda-3/_work/cmux/x/cmux-tui --headless"))
+
+    def test_cwd_rule_matches_the_resolved_work_path(self) -> None:
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        (tmp / "real" / "_work").mkdir(parents=True)
+        (tmp / "link").symlink_to(tmp / "real")
+        work = os.fspath(tmp / "link" / "_work")
+        resolved = os.path.realpath(work)
+        table = {140: (1, "/tmp/x/cmux-tui --headless")}
+        self.assertEqual([pid for pid, _ in hook.work_leftover_pids(table, work, set(), {140: resolved + "/cmux"})],
+                         [140])
 
     def test_work_dir_comes_from_runner_temp_only(self) -> None:
         with mock.patch.dict(os.environ, {"RUNNER_TEMP": self.WORK + "/_temp"}):
@@ -3516,8 +3602,122 @@ class JobLeftoverTest(unittest.TestCase):
                 self.assertIsNone(hook.job_work_dir(), temp)
 
 
+class IdleLeftoverSweepTest(unittest.TestCase):
+    RUNNER = Path("/Users/cmux/actions-runner-glaeda-11")
+    WORK = "/Users/cmux/actions-runner-glaeda-11/_work"
+    ORPHAN = "/var/folders/hq/x/T/cnd-bin-1/cmux-tui --headless --session cnd-crash-1"
+
+    def setUp(self) -> None:
+        self.alive: set[int] = set()
+
+        def kill(pid: int, sig: int) -> None:
+            if sig in (signal.SIGTERM, signal.SIGKILL):
+                self.alive.discard(pid)
+        for patcher in (mock.patch.object(hook.os, "kill", side_effect=kill),
+                        mock.patch.object(hook, "pid_alive", side_effect=lambda pid: pid in self.alive),
+                        mock.patch.object(hook.os, "geteuid", return_value=501),
+                        mock.patch.object(hook, "git_repair_protected", return_value=set()),
+                        mock.patch.object(hook, "tty_pids", return_value=set()),
+                        mock.patch.object(hook, "LEFTOVER_TERM_S", 0.0)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def table(self, worker_of: str | None = None) -> dict[int, tuple[int, str]]:
+        table = {60: (1, self.ORPHAN), 61: (60, "cmux-tui __terminal-host"),
+                 62: (1, "/tmp/x/daemon"), 99: (1, "/usr/bin/python3 glaeda-cmux-runner-hook listen")}
+        if worker_of:
+            table[50] = (40, f"/Users/cmux/{worker_of}/bin/Runner.Worker spawnclient 1 2")
+        return table
+
+    def cwds(self) -> dict[int, str]:
+        return {60: self.WORK + "/cmux/cmux/Packages/macOS/CmuxNext", 61: "/",
+                62: "/Users/cmux/actions-runner-glaeda-2/_work/cmux"}
+
+    def test_ends_this_runners_orphans_only(self) -> None:
+        self.alive = {60, 61, 62}
+        with mock.patch.object(hook, "processes", side_effect=lambda: self.table("actions-runner-glaeda-2")), \
+             mock.patch.object(hook, "process_cwds", return_value=self.cwds()):
+            notes = hook.sweep_idle_leftovers(self.RUNNER)
+        self.assertEqual(self.alive, {62})  # another runner's orphan, mid-job or not, is never this sweep's
+        self.assertEqual(len(notes), 2, notes)
+        self.assertIn("pid 60 (cmux-tui, cwd _work/cmux/cmux/Packages/macOS/CmuxNext)", notes[0])
+        self.assertNotIn("--session", " ".join(notes))  # never arguments
+
+    def test_a_live_worker_of_this_runner_vetoes_the_sweep(self) -> None:
+        self.alive = {60, 61}
+        with mock.patch.object(hook, "processes", side_effect=lambda: self.table("actions-runner-glaeda-11")), \
+             mock.patch.object(hook, "process_cwds", return_value=self.cwds()):
+            self.assertEqual(hook.sweep_idle_leftovers(self.RUNNER), [])
+        self.assertEqual(self.alive, {60, 61})
+
+    def test_a_worker_appearing_before_the_signal_vetoes_it(self) -> None:
+        self.alive = {60, 61}
+        tables = iter([self.table(), self.table("actions-runner-glaeda-11")])
+        with mock.patch.object(hook, "processes", side_effect=lambda: next(tables, self.table("actions-runner-glaeda-11"))), \
+             mock.patch.object(hook, "process_cwds", return_value=self.cwds()):
+            self.assertEqual(hook.sweep_idle_leftovers(self.RUNNER), [])
+        self.assertEqual(self.alive, {60, 61})
+
+    def test_missing_evidence_fails_closed(self) -> None:
+        self.alive = {60, 61}
+        with mock.patch.object(hook, "processes", side_effect=lambda: self.table()), \
+             mock.patch.object(hook, "process_cwds", return_value=None):
+            self.assertEqual(hook.sweep_idle_leftovers(self.RUNNER), [])
+        with mock.patch.object(hook, "processes", side_effect=lambda: self.table()), \
+             mock.patch.object(hook, "process_cwds", return_value=self.cwds()), \
+             mock.patch.object(hook, "git_repair_protected", return_value=None):
+            self.assertEqual(hook.sweep_idle_leftovers(self.RUNNER), [])
+        with mock.patch.object(hook, "processes", side_effect=subprocess.TimeoutExpired("ps", 30)):
+            with self.assertRaises(subprocess.TimeoutExpired):  # Gate.sweep logs it and tries later
+                hook.sweep_idle_leftovers(self.RUNNER)
+        self.assertEqual(self.alive, {60, 61})
+
+    def test_no_terminal_evidence_or_a_terminal_ends_nothing(self) -> None:
+        self.alive = {60, 61}
+        for ttys in (None, {60}):
+            with mock.patch.object(hook, "processes", side_effect=lambda: self.table()), \
+                 mock.patch.object(hook, "process_cwds", return_value=self.cwds()), \
+                 mock.patch.object(hook, "tty_pids", return_value=ttys):
+                self.assertEqual(hook.sweep_idle_leftovers(self.RUNNER), [])
+        self.assertEqual(self.alive, {60, 61})
+
+    def test_root_never_sweeps(self) -> None:
+        self.alive = {60, 61}
+        with mock.patch.object(hook.os, "geteuid", return_value=0), \
+             mock.patch.object(hook, "processes", side_effect=lambda: self.table()), \
+             mock.patch.object(hook, "process_cwds", return_value=self.cwds()):
+            self.assertEqual(hook.sweep_idle_leftovers(self.RUNNER), [])
+        self.assertEqual(self.alive, {60, 61})
+
+    def test_gate_sweeps_only_idle_and_at_most_every_sweep_interval(self) -> None:
+        gate = object.__new__(hook.Gate)
+        gate.runner_dir = self.RUNNER
+        gate.swept_at = time.monotonic() - hook.GATE_SWEEP_S - 1
+        with mock.patch.object(hook.Gate, "busy", return_value=True), \
+             mock.patch.object(hook, "sweep_idle_leftovers") as sweep:
+            gate.sweep()
+        sweep.assert_not_called()
+        gate.swept_at = time.monotonic() - hook.GATE_SWEEP_S - 1
+        with mock.patch.object(hook.Gate, "busy", return_value=False), \
+             mock.patch.object(hook, "sweep_idle_leftovers", return_value=["ended leftover pid 60"]) as sweep, \
+             mock.patch.object(hook, "gate_log") as log:
+            gate.sweep()
+            gate.sweep()  # within the interval: no second sweep
+        sweep.assert_called_once_with(self.RUNNER)
+        log.assert_called_once_with("ended leftover pid 60")
+        gate.swept_at = time.monotonic() - hook.GATE_SWEEP_S - 1
+        with mock.patch.object(hook.Gate, "busy", return_value=False), \
+             mock.patch.object(hook, "sweep_idle_leftovers", side_effect=OSError("boom")), \
+             mock.patch.object(hook, "gate_log") as log:
+            gate.sweep()  # never raises
+        self.assertIn("leftover sweep failed", log.call_args[0][0])
+
+
 class GateTest(unittest.TestCase):
     def setUp(self) -> None:
+        sweep = mock.patch.object(hook, "sweep_idle_leftovers", return_value=[])  # IdleLeftoverSweepTest covers it
+        sweep.start()
+        self.addCleanup(sweep.stop)
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.lock = self.tmp / "host.lock"
