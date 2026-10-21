@@ -657,6 +657,32 @@ class HookTest(unittest.TestCase):
         self.assertNotIn("disk floor", result.stdout, "--no-disk: no eviction either")
         self.assertTrue(self.lock_free())
 
+    def test_the_gui_and_session_runners_refuse_under_the_floor_a_cmux_next_tour_needs(self) -> None:
+        """job-started holds the runners that take cmux-next tours to cmux's tour-requirements.json floor (vendored
+        as CMUX_TOUR_REQUIREMENTS), above a lower --min-free-gib, and leaves the other runners on theirs."""
+        self.fleet()
+        tour = hook.CMUX_TOUR_REQUIREMENTS["min_free_gib"]
+        push = event(self.dir, "push", {"repository": CMUX})
+        env = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0",
+               "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"),
+               "GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": os.fspath(push), "GITHUB_REPOSITORY": "manaflow-ai/cmux"}
+        for role, floor in (([], tour - 10), (["--gui-runner"], tour), (["--session-runner"], tour)):
+            with self.subTest(role=role):
+                floors: list[float] = []
+                with mock.patch.dict(os.environ, env, clear=True), \
+                        mock.patch.object(hook, "job_owner", return_value=None), \
+                        mock.patch.object(hook, "start_runner_parent_watchdog"), \
+                        mock.patch.object(hook, "disk_refusal",
+                                          side_effect=lambda _path, gib: floors.append(gib) or "1.0 GiB free"), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    code = hook.main(["job-started", "--allowed-repo", "manaflow-ai/cmux", "--no-disk",
+                                      "--reservation", os.fspath(self.dir / "fleet" / "reservation.json"),
+                                      "--host-lock", os.fspath(self.dir / "fleet" / "host.lock"),
+                                      "--min-free-gib", f"{tour - 10:g}", "--state-dir", os.fspath(self.dir / "state"),
+                                      "--watch-pid", str(os.getpid()), "--gui-wait", "0", *role])
+                self.assertEqual(code, 1)
+                self.assertEqual(floors, [floor])
+
     def test_disk_floor_evicts_before_refusing(self) -> None:
         self.fleet()
         marker = self.dir / "disk-ran"
@@ -4269,6 +4295,32 @@ class GateTest(unittest.TestCase):
         with mock.patch.dict(sys.modules, {"glaeda_disk_re": module}):  # its dataclasses look the module up
             disk.exec_module(module)
         self.assertEqual(module.MIN_FREE_GIB_RE, hook.MIN_FREE_GIB_RE, "glaeda-disk reads the floor the same way")
+
+    def test_the_gui_and_session_runners_hold_the_floor_a_cmux_next_tour_needs(self) -> None:
+        """2026-10-21: a gui runner took a "Tour the app" job at 27 GiB free, over the fleet's 30 GiB floor, and
+        reload.sh refused it under cmux's scripts/cmux-next/tour-requirements.json floor (40). The hook holds the
+        runners that take tours to that floor (CMUX_TOUR_REQUIREMENTS, vendored) itself, so glaeda-update's hook
+        refresh rolls it out to every mini without re-applying a runner or changing its wrappers."""
+        tour = hook.CMUX_TOUR_REQUIREMENTS["min_free_gib"]
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(parents=True, exist_ok=True)
+        base = f"exec python3 /hook job-started --min-free-gib {tour - 10:g} --capacity-units 10 --instance 4"
+        for role, floor in (("", tour - 10), (" --gui-runner", tour), (" --session-runner", tour),
+                            (" --fast-runner", tour - 10)):
+            with self.subTest(role=role):
+                script.write_text(base + role + "\n")
+                self.assertEqual(hook.runner_scope(self.runner).min_free_gib, floor)
+        script.write_text(f"exec python3 /hook job-started --min-free-gib {tour + 10:g} --gui-runner\n")
+        self.assertEqual(hook.runner_scope(self.runner).min_free_gib, tour + 10, "a higher fleet floor stays")
+        script.write_text("exec python3 /hook job-started --gui-runner\n")
+        self.assertEqual(hook.runner_scope(self.runner).min_free_gib, 0, "a runner with no floor keeps none")
+        script.write_text(base + " --session-runner\n")
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        usage = lambda _path: mock.Mock(free=int((tour - 5) * 1024**3))  # noqa: E731
+        with mock.patch.object(hook.shutil, "disk_usage", side_effect=usage), \
+                mock.patch.object(gate, "evict_in_background"):
+            self.assertEqual(gate.low_disk(), f"disk: {tour - 5:.1f} GiB free, {tour:g} GiB required",
+                             "between the fleet floor and the tour's, the session runner is held")
 
     def test_a_disk_hold_resumes_above_the_floor_and_logs_a_long_hold_once(self) -> None:
         script = self.runner / hook.RUNNER_HOOK_SCRIPT

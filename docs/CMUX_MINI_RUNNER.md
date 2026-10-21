@@ -88,7 +88,10 @@ What `--apply` does:
      `until`, active while now is before `until`, whoever owns it; an unreadable or
      invalid marker also refuses, an expired one is ignored; parsed by
      `glaeda_reservation.py`, which the installer puts next to the hook), when free disk is below `--min-free-gib` (from the manifest's
-     `disk.min_free_gib` with `--manifest`), or when another build holds `host.lock`, the
+     `disk.min_free_gib` with `--manifest`; the gui and session runners, which take cmux-next
+     tours, use at least cmux's `scripts/cmux-next/tour-requirements.json` floor, vendored in
+     the hook and checked against cmux by `glaeda-cmux-tour-floor-check` in CI),
+     or when another build holds `host.lock`, the
      `flock` that `with-host-lock` and the build worker take. Otherwise the job takes that
      lock: a small detached holder keeps it until job-completed releases it or the job's
      `Runner.Worker` exits, so fleet builds wait for the PR job and a crash cannot leave

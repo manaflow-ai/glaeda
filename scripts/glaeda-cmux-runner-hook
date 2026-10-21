@@ -2931,7 +2931,8 @@ def runner_scope(runner_dir: Path) -> RunnerScope:
     gui_match = re.search(r"\s--gui-token\s+([A-Za-z0-9._-]+)(?:\s|$)", text)
     gui_token = gui_match.group(1) if gui_match else "gui"
     return RunnerScope(flag("capacity-units", 0), max(1, flag("compile-slots", 1)), roots,
-                       instance < roots and not gui and not fast and not session, gui, min_free_gib(text), gui_token,
+                       instance < roots and not gui and not fast and not session, gui,
+                       runner_floor_gib(min_free_gib(text), gui or session), gui_token,
                        fast, session)
 
 
@@ -2965,6 +2966,14 @@ def eligibility_refusal(fleet_class: str, xcode_app: str | None) -> str | None:
     return why
 
 
+def runner_floor_gib(min_free_gib: float, takes_tours: bool) -> float:
+    """A runner's disk floor: its --min-free-gib, raised to a cmux-next tour's floor on a gui or session runner. A
+    runner with no floor (0) keeps none: only the fleet's wrappers pass one, and a fleet runner is the one tours reach."""
+    if takes_tours and min_free_gib > 0:
+        return max(min_free_gib, float(CMUX_TOUR_REQUIREMENTS["min_free_gib"]))
+    return min_free_gib
+
+
 def min_free_gib(text: str) -> float:
     """The last unquoted --min-free-gib in a job-started hook script, as glaeda-cmux-runner writes it (:g, so 1e+03
     is a valid form), or 0 without one or when it is not a finite number. glaeda-disk's runner_floor_gib reads the
@@ -2978,6 +2987,14 @@ def min_free_gib(text: str) -> float:
 
 
 MIN_FREE_GIB_RE = r"\s--min-free-gib[\s=]+([0-9.eE+-]+)(?=\s|$)"
+# The free space a cmux-next tour needs: manaflow-ai/cmux scripts/cmux-next/tour-requirements.json, vendored as is at
+# CMUX_TOUR_REQUIREMENTS_PIN (reload.sh reads its floor from that file). The gui and session runners take tours, so
+# the hook holds them to at least this whatever --min-free-gib their wrapper passes: with the fleet floor alone, a
+# runner took tours reload.sh then refused, and since the hook applies it, glaeda-update's hook refresh rolls it out
+# without re-applying a runner. CI's glaeda-cmux-tour-floor-check fails when cmux's file says otherwise: vendor it and
+# move the pin to the cmux commit that changed it.
+CMUX_TOUR_REQUIREMENTS = {"min_free_gib": 40}
+CMUX_TOUR_REQUIREMENTS_PIN = "becb28033f69367e00aec1a1bd23737a1cd74968"
 
 
 # A root runner's jobs (compile admission, app-host shards, cli-product, lag) cost up to this many units, and
@@ -5248,6 +5265,7 @@ def main(argv: list[str] | None = None) -> int:
         p.error("--gui-token must be a simple capacity token name")
     if args.parse_only:
         return 0
+    args.min_free_gib = runner_floor_gib(args.min_free_gib, args.gui_runner or args.session_runner)
     # the runner LaunchAgent's environment can switch sampling off fleet-wide without a reinstall
     telemetry = not args.no_telemetry and os.environ.get("GLAEDA_RUNNER_TELEMETRY", "1") != "0"
 

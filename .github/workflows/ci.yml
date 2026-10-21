@@ -155,6 +155,13 @@ jobs:
           --component clippy,rustfmt
           --no-self-update
 
+      # The gui and session runners hold cmux's tour floor, vendored in glaeda-cmux-runner-hook at a pinned cmux
+      # commit: a different file at the pin or on feat-cmux-next fails here, and a failed read is a warning.
+      - name: Check the vendored cmux tour floor against cmux
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/glaeda-cmux-tour-floor-check
+
       - name: Validate and test scripts
         run: |
           python3 - <<'PY'
@@ -172,6 +179,8 @@ jobs:
               Path("scripts/hot_run_impl.py"),
               Path("scripts/verify"),
               Path("scripts/glaeda_hook_pin.py"),
+              Path("scripts/glaeda-cmux-tour-floor-check"),
+              Path("scripts/test-glaeda-cmux-tour-floor-check.py"),
               Path("scripts/verify-focused"),
               Path("scripts/verify-required"),
               Path("scripts/verify_focused_impl.py"),
@@ -321,6 +330,7 @@ jobs:
           suite python3 scripts/test-hot-observe.py
           suite python3 scripts/test-glaeda-disk.py
           suite python3 scripts/test-glaeda-hook-pin.py
+          suite python3 scripts/test-glaeda-cmux-tour-floor-check.py
           suite python3 scripts/test-glaeda-devbox.py
           suite python3 scripts/test-glaeda-projects.py
           suite python3 scripts/test-glaeda-worktree.py

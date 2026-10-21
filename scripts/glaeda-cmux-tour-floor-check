@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+"""Check glaeda's vendored cmux tour floor against manaflow-ai/cmux.
+
+    scripts/glaeda-cmux-tour-floor-check
+
+glaeda-cmux-runner-hook's CMUX_TOUR_REQUIREMENTS is a copy of cmux's scripts/cmux-next/tour-requirements.json at
+CMUX_TOUR_REQUIREMENTS_PIN, and the hook holds the gui and session runners to that floor. This reads the file
+through gh (CI passes the workflow's GITHUB_TOKEN as GH_TOKEN; cmux is public) at the pin and at feat-cmux-next:
+
+  - a file that differs from the vendored copy, or does not parse, is an ::error:: and exit 1: re-vendor it and
+    move the pin to the cmux commit that changed it;
+  - a read that fails (no gh, a network or API error) is a ::warning:: and exit 0, so a GitHub outage never
+    fails the build and never passes it silently either.
+"""
+
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+REPO = "manaflow-ai/cmux"
+PATH = "scripts/cmux-next/tour-requirements.json"
+BRANCH = "feat-cmux-next"
+
+
+def vendored() -> tuple[dict, str]:
+    path = Path(__file__).resolve().parent / "glaeda-cmux-runner-hook"
+    loader = importlib.machinery.SourceFileLoader("glaeda_cmux_runner_hook", os.fspath(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = module  # its dataclasses look the module up
+    loader.exec_module(module)
+    return module.CMUX_TOUR_REQUIREMENTS, module.CMUX_TOUR_REQUIREMENTS_PIN
+
+
+def fetch(ref: str) -> tuple[str | None, str]:
+    """(file text, "") or (None, why it could not be read)."""
+    gh = shutil.which("gh")
+    if gh is None:
+        return None, "gh is not installed"
+    try:
+        proc = subprocess.run([gh, "api", "-H", "Accept: application/vnd.github.raw",
+                               f"repos/{REPO}/contents/{PATH}?ref={ref}"],
+                              capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return None, type(error).__name__
+    if proc.returncode != 0:
+        return None, (proc.stderr.strip() or f"gh exited {proc.returncode}")[-300:]
+    return proc.stdout, ""
+
+
+def main() -> int:
+    want, pin = vendored()
+    failed = False
+    for ref in (pin, BRANCH):
+        text, why = fetch(ref)
+        if text is None:
+            print(f"::warning::could not read {REPO} {PATH} at {ref} to check glaeda's vendored tour floor: {why}")
+            continue
+        try:
+            got = json.loads(text)
+        except ValueError as error:
+            got, failed = None, True
+            print(f"::error::{REPO} {PATH} at {ref} does not parse ({error}); glaeda vendors {json.dumps(want)}")
+            continue
+        if got != want:
+            failed = True
+            print(f"::error::{REPO} {PATH} at {ref} is {json.dumps(got)}, but the hook's CMUX_TOUR_REQUIREMENTS "
+                  f"is {json.dumps(want)} (pinned at {pin}): vendor cmux's file and move CMUX_TOUR_REQUIREMENTS_PIN "
+                  "to the cmux commit that changed it")
+        else:
+            print(f"{REPO} {PATH} at {ref}: {json.dumps(got)}, as vendored")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
