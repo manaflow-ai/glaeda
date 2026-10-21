@@ -3162,6 +3162,64 @@ class GlaedaDiskTest(unittest.TestCase):
                 mock.patch.object(gd, "HOME_CLONE_GC_FAILED", self.root / "gc-failed.json"):
             yield
 
+    def _runner_checkout_packs(self, packs: int = 3) -> tuple[Path, Path, Path]:
+        """A fake runner home whose actions-runner-glaeda-2 has _work/cmux/cmux with packs packs."""
+        home = self.root / "home"
+        runner = home / "actions-runner-glaeda-2"
+        (runner / "glaeda-hooks").mkdir(parents=True)
+        (runner / ".runner").write_text("{}")
+        tree = runner / "_work/cmux/cmux"
+        tree.mkdir(parents=True)
+        self._git("init", "-q", "-b", "main", os.fspath(tree))
+        self._git("-C", os.fspath(tree), "config", "gc.auto", "0")  # as cmux's nightly.yml leaves it
+        for n in range(packs):
+            (tree / f"f{n}").write_text(str(n) * 100)
+            self._git("-C", os.fspath(tree), "add", f"f{n}")
+            self._git("-C", os.fspath(tree), "commit", "-q", "-m", f"c{n}")
+            self._git("-C", os.fspath(tree), "repack", "-q")
+        self._age(home, hours=5)
+        self.assertEqual(gd.git_pack_count(tree / ".git"), packs)
+        return home, runner, tree
+
+    def test_runner_checkout_repack_folds_a_checkout_with_many_packs_and_loses_nothing(self) -> None:
+        # 2026-10-21: gc.auto=0 from nightly.yml left 3935 packs in one runner's checkout; no pass repacked it
+        home, _, tree = self._runner_checkout_packs(3)
+        heads = self._git("-C", os.fspath(tree), "rev-list", "--all").split()
+        # a fetch's objects are unreachable until it moves its refs: a packed object no ref names must stay
+        (self.root / "in-flight").write_text("in flight\n")
+        loose = self._git("-C", os.fspath(tree), "hash-object", "-w", os.fspath(self.root / "in-flight")).strip()
+        subprocess.run(["git", "-C", os.fspath(tree), "pack-objects", "-q", ".git/objects/pack/pack"],
+                       input=loose + "\n", text=True, check=True, capture_output=True)
+        (tree / ".git/objects" / loose[:2] / loose[2:]).unlink()  # only in that pack now, as a fetch leaves it
+        self._age(home, hours=5)
+        receipt = self.receipt()
+        gd.process_evidence = lambda: ([], "")
+        with mock.patch.object(gd, "RUNNER_CHECKOUT_REPACK_PACKS", 4), self._gc_log(), \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd.repack_runner_checkouts(receipt, home)
+        self.assertEqual(gd.git_pack_count(tree / ".git"), 1)
+        rec = json.loads(receipt.read_text())
+        self.assertEqual((rec["family"], rec["outcome"], rec["packs"], rec["packs_after"]),
+                         (gd.RUNNER_CHECKOUT_REPACK_FAMILY, "reclaimed", 4, 1))
+        self.assertEqual(self._git("-C", os.fspath(tree), "cat-file", "-t", loose).strip(), "blob")
+        self.assertEqual(self._git("-C", os.fspath(tree), "rev-list", "--all").split(), heads)
+        self._git("-C", os.fspath(tree), "fsck", "--no-progress")
+
+    def test_runner_checkout_repack_waits_for_the_runners_job_and_the_threshold(self) -> None:
+        home, runner, tree = self._runner_checkout_packs(3)
+        receipt = self.receipt()
+        gd.process_evidence = lambda: ([], f"{runner}/bin/Runner.Worker spawnclient 107 110\n")
+        with mock.patch.object(gd, "RUNNER_CHECKOUT_REPACK_PACKS", 3), self._gc_log():
+            self.assertEqual(gd.repack_runner_checkouts(receipt, home), 0)
+        self.assertEqual(gd.git_pack_count(tree / ".git"), 3)
+        self.assertIn("is running a job", json.loads(receipt.read_text())["reasons"][0])
+        receipt.unlink()
+        gd.process_evidence = lambda: ([], "")
+        with mock.patch.object(gd, "RUNNER_CHECKOUT_REPACK_PACKS", 4), self._gc_log():
+            self.assertEqual(gd.repack_runner_checkouts(receipt, home), 0)
+        self.assertEqual(gd.git_pack_count(tree / ".git"), 3)
+        self.assertFalse(receipt.exists())
+
     def test_home_clones_are_clones_directly_under_home(self) -> None:
         home, clone, wt = self._home_clone(1)
         (home / "plain").mkdir()
@@ -3321,13 +3379,16 @@ class GlaedaDiskTest(unittest.TestCase):
                 mock.patch.object(gd, "notify_disk"), \
                 mock.patch.object(gd, "release_evict_lock", side_effect=release), \
                 mock.patch.object(gd, "gc_home_clones", side_effect=lambda *a, **k: order.append("gc") or 0) as gc, \
+                mock.patch.object(gd, "repack_runner_checkouts", return_value=0) as repack, \
                 contextlib.redirect_stdout(io.StringIO()):
             gd.main(["--no-snapshot", "--top", "0", *receipt])  # a report
             gd.main(["--apply", "--no-snapshot", "--top", "0", *receipt])  # neither a sweep nor pressure
             gd.main(["--pressure", "--apply", "--role", "devbox", "--no-snapshot", "--top", "0", *receipt])
             gc.assert_not_called()
+            repack.assert_not_called()
             gd.main(["--pressure", "--apply", "--no-snapshot", "--top", "0", *receipt])
             gc.assert_called_once()
+            repack.assert_called_once()
         self.assertEqual(order[-2:], ["release", "gc"])  # a long gc never holds the eviction lock
 
     def test_idle_sweep_windows_follow_reuse(self) -> None:
