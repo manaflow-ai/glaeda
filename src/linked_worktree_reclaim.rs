@@ -2154,23 +2154,16 @@ pub fn reclaim_linked_worktree(
 
     // Fresh post-effect observation decides the outcome, whatever the command reported.
     let directory_gone = matches!(entry_present(&entry.path), Ok(false));
-    let still_registered = match git_bounded(
-        observer,
-        &inventory.repository,
-        &["worktree", "list", "--porcelain", "-z"],
-        MAX_CAPTURED_STREAM_BYTES,
-        executor,
-    )
-    .and_then(|record| parse_worktree_list(&record.stdout))
-    {
-        Ok(entries) => entries.iter().any(|listed| listed.path == entry.path),
-        Err(error) => {
-            return LinkedWorktreeReclaimOutcome::Incomplete {
-                code: error.code(),
-                target: Some(target),
-            };
-        }
-    };
+    let still_registered =
+        match registered_after_removal(observer, &inventory.repository, &entry.path, executor) {
+            Ok(registered) => registered,
+            Err(error) => {
+                return LinkedWorktreeReclaimOutcome::Incomplete {
+                    code: error.code(),
+                    target: Some(target),
+                };
+            }
+        };
     let observed_intact = exit == RemovalExit::ExitedNonZero
         && !directory_gone
         && still_registered
@@ -2187,6 +2180,31 @@ pub fn reclaim_linked_worktree(
             target: Some(target),
         },
     }
+}
+
+/// Whether `checkout` is still registered, read right after its `git worktree remove`.
+///
+/// This read decides the outcome, and a failure stops the whole batch, so it gets the removal's
+/// deadline rather than the 60 s read deadline: on a nearly full disk, or beside a running
+/// repack, `worktree list` right after a large removal can take longer than a minute, and a slow
+/// answer is not evidence of a broken end state.
+fn registered_after_removal(
+    observer: &ProjectCheckoutObserver,
+    repository: &Path,
+    checkout: &Path,
+    executor: &impl TimedCommandExecutor,
+) -> Result<bool, LinkedWorktreeReclaimError> {
+    let record = observer
+        .git_with_limits(
+            repository,
+            &["worktree", "list", "--porcelain", "-z"],
+            MAX_CAPTURED_STREAM_BYTES,
+            LINKED_WORKTREE_REMOVE_TIMEOUT,
+            executor,
+        )
+        .map_err(|error| git_failure(&error))?;
+    let entries = parse_worktree_list(&require_success(record)?.stdout)?;
+    Ok(entries.iter().any(|listed| listed.path == checkout))
 }
 
 /// Pin one exact commit under a create-only ref and confirm it resolves.
@@ -2770,6 +2788,59 @@ worktree /wt/b\0HEAD 3333333333333333333333333333333333333333\0branch refs/heads
         assert_eq!(entries[0].path(), Path::new("/repo"));
         assert!(entries[1].locked() && !entries[1].prunable());
         assert!(!entries[2].locked() && entries[2].prunable());
+    }
+
+    /// Answers `worktree list` only when given the removal's deadline, as a slow Git would.
+    struct SlowListExecutor;
+
+    impl crate::process::CommandExecutor for SlowListExecutor {
+        fn execute(&self, _spec: &crate::process::CommandSpec) -> std::io::Result<ExecutionRecord> {
+            panic!("the reclaim must use the timed executor")
+        }
+    }
+
+    impl TimedCommandExecutor for SlowListExecutor {
+        fn execute_with_timeout(
+            &self,
+            spec: &crate::process::CommandSpec,
+            timeout: Duration,
+        ) -> std::io::Result<ExecutionRecord> {
+            if timeout < LINKED_WORKTREE_REMOVE_TIMEOUT {
+                return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+            }
+            Ok(ExecutionRecord {
+                argv: spec.displayed_argv(),
+                environment_keys: spec.environment.keys().cloned().collect(),
+                status: Some(0),
+                success: true,
+                stdout: "worktree /repo\0HEAD 1111111111111111111111111111111111111111\0branch refs/heads/main\0\0"
+                    .to_owned(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn a_slow_list_after_removal_still_decides_the_outcome() {
+        let observer = ProjectCheckoutObserver::new("/usr/bin/git")
+            .expect("observer")
+            .with_command_timeout(LINKED_WORKTREE_GIT_TIMEOUT);
+        let registered = registered_after_removal(
+            &observer,
+            Path::new("/repo"),
+            Path::new("/wt/gone"),
+            &SlowListExecutor,
+        );
+        assert_eq!(registered, Ok(false));
+        assert_eq!(
+            registered_after_removal(
+                &observer,
+                Path::new("/repo"),
+                Path::new("/repo"),
+                &SlowListExecutor
+            ),
+            Ok(true)
+        );
     }
 
     #[test]
