@@ -25,8 +25,10 @@ Each run checks, as the runner user and without sudo:
                                      `route -n get 100.100.100.100` (Tailscale's own address) leaves by a
                                      non-utun interface (en0 to the LAN gateway), so no tailnet host reaches
                                      ssh here while `tailscale ping --tsmp` still answers (cmuxs-mac-mini-5,
-                                     2026-10-21: 100.64/10 gone from the routing table). Reported only: the
-                                     fix is a stop and start of the Tailscale VPN service, which its owner does.
+                                     2026-10-21: 100.64/10 gone from the routing table). Reported after two
+                                     runs in a row (one when run by hand), never healed: the fix is a stop and
+                                     start of the Tailscale VPN service (a kickstart of a standalone tailscaled),
+                                     which its owner does.
   tailscale_probe_error              the Tailscale CLI gave no BackendState (it timed out, failed or printed no JSON;
                                      a loaded mini can time out with the tunnel up). The check could not look, so the
                                      tunnel is not judged down: reported only, never healed.
@@ -599,9 +601,11 @@ def check_tailscale(mini: Mini) -> list[dict[str, Any]]:
         via = mini.tailnet_route()
         if via is None or via.startswith("utun"):
             return []
-        return [finding("tailscale_no_route", "error", f"Tailscale BackendState Running, but the OS routes "
-                        f"{TAILNET_PROBE_IP} out of {via}, not the tunnel: no tailnet host reaches ssh here",
-                        "impossible", "stop and start the Tailscale VPN service (scutil --nc); its owner does that")]
+        fix = ("root: sudo launchctl kickstart -k system/com.tailscale.tailscaled" if got[0] == "standalone"
+               else "stop and start the Tailscale VPN service (scutil --nc)")
+        return [finding("tailscale_no_route", "error", f"Tailscale ({got[0]}) BackendState Running, but the OS "
+                        f"routes {TAILNET_PROBE_IP} out of {via}, not the tunnel: no tailnet host reaches ssh here",
+                        "impossible", f"{fix}; its owner does that")]
     flavor, state, said = got
     if state is None:  # the check could not look: never a tailscale_down, a heal or an unstick on a guess
         return [finding("tailscale_probe_error", "warn", said, "impossible",
@@ -798,6 +802,10 @@ def heal_daemon_heal(mini: Mini, f: dict[str, Any]) -> tuple[bool, str]:
     return bool(status and status.get("current") and status.get("loaded") is not False), what
 
 
+# code -> runs in a row seen before --apply reports it (default 1): a route gap during a Tailscale reconnect
+# lasts seconds, so one sighting is no finding.
+REPORT_AFTER = {"tailscale_no_route": 2}
+
 # code -> (heal, runs in a row seen before healing)
 HEALS: dict[str, tuple[Callable[[Mini, dict[str, Any]], tuple[bool, str]], int]] = {
     "daemon_heal_stale": (heal_daemon_heal, 1),
@@ -853,6 +861,8 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
         s = seen.get(f["id"]) or {"since": now, "runs": 0}
         s["runs"] = s.get("runs", 0) + 1
         seen[f["id"]] = s
+        if apply and s["runs"] < REPORT_AFTER.get(f["code"], 1):
+            continue  # seen, not yet reported
         f["since"] = iso(s["since"])
         heal = HEALS.get(f["code"])
         t = tries.get(f["id"]) or {"n": 0, "at": 0}
@@ -880,7 +890,7 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
                 f["note"] = f"healing is off ({KILL_SWITCH})"
         findings.append(f)
     ids = {f["id"] for f in findings}
-    seen = {k: v for k, v in seen.items() if k in ids}
+    seen = {k: v for k, v in seen.items() if k in ids | {f["id"] for f in found}}
     tries = {k: v for k, v in tries.items() if k in ids}
     report = {"schema": SCHEMA, "at": iso(now), "findings": findings,
               "healed": sorted(healed + getattr(mini, "daemon_healed", []), key=lambda h: h.get("t") or 0)[-HEALED_MAX:],

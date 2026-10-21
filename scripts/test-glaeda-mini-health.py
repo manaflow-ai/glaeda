@@ -428,14 +428,36 @@ class Tailscale(Base):
         self.run_once(NOW + 120)
         self.assertEqual(self.mini.did, ["vpn C7E1635B-DD04-49D8-A16F-FB4E34804764"])
 
-    def test_running_without_a_tunnel_route_is_reported_never_healed(self) -> None:
+    def test_running_without_a_tunnel_route_is_reported_on_the_second_run_never_healed(self) -> None:
         # cmuxs-mac-mini-5, 2026-10-21: Running, but 100.64/10 gone, so tailnet ssh timed out all afternoon.
         self.mini.route = "en0"
         first = self.run_once()
-        self.assertEqual(self.ids(first), ["tailscale_no_route"])
-        self.assertIn("out of en0", first["findings"][0]["evidence"])
-        self.run_once(NOW + 120)
+        self.assertEqual(first["findings"], [], "one sighting can be a reconnect's gap")
+        second = self.run_once(NOW + 120)
+        self.assertEqual(self.ids(second), ["tailscale_no_route"])
+        self.assertIn("(app)", second["findings"][0]["evidence"])
+        self.assertIn("out of en0", second["findings"][0]["evidence"])
+        self.assertIn("scutil --nc", second["findings"][0]["note"])
+        self.run_once(NOW + 240)
         self.assertEqual(self.mini.did, [], "a Tailscale restart is its owner's, not this check's")
+
+    def test_a_route_gap_that_heals_by_the_next_run_is_never_reported(self) -> None:
+        self.mini.route = "en0"
+        self.assertEqual(self.run_once()["findings"], [])
+        self.mini.route = "utun4"
+        self.assertEqual(self.run_once(NOW + 120)["findings"], [])
+        self.mini.route = "en0"
+        self.assertEqual(self.run_once(NOW + 240)["findings"], [], "the count starts again")
+
+    def test_a_standalone_tailscaled_without_a_route_names_its_own_fix(self) -> None:
+        self.mini.ts, self.mini.route = ("standalone", "Running", ""), "en0"
+        self.run_once()
+        note = self.run_once(NOW + 120)["findings"][0]["note"]
+        self.assertIn("kickstart -k system/com.tailscale.tailscaled", note)
+
+    def test_by_hand_it_reports_at_once(self) -> None:
+        self.mini.route = "en0"
+        self.assertEqual(self.ids(self.run_once(apply=False)), ["tailscale_no_route"])
 
     def test_a_route_it_cannot_read_is_no_finding(self) -> None:
         self.mini.route = None

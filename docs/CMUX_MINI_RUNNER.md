@@ -1243,6 +1243,7 @@ runners) looks for what stopped runner minis on 2026-09-25 and 26 without anythi
 | `autologin_locks` (loginwindow `autoLoginUserScreenLocked`), `display_sleep` | none: root |
 | `testmanagerd_wedged`: the newest session line of this user's testmanagerd is `XCIDESession is responsible for cleaning up its socket`, 90 s old, nothing after it | the hook's `recycle_testmanagerd` (#1281) while no test runs; a hook without it gets the finding only |
 | `tailscale_down`: a BackendState other than `Running`, two runs in a row | `tailscale up` when Stopped, else `scutil --nc stop/start` of the Tailscale VPN service; a standalone tailscaled or a logged-out node is reported only |
+| `tailscale_no_route`: BackendState `Running`, but `route -n get 100.100.100.100` leaves by a non-utun interface (the tailnet route is gone), two runs in a row | reported only: a stop and start of the Tailscale VPN service (a `launchctl kickstart` of a standalone tailscaled) is its owner's |
 | `tailscale_probe_error`: the Tailscale CLI gave no BackendState (timeout, error, no JSON) | reported only: the check could not look, so the tunnel is not judged down |
 | `runner_stopped:<agent>`: a runner LaunchAgent loaded but not running, two runs in a row | `launchctl kickstart` (nothing runs in it, so no job is cut) |
 | `runner_unloaded:<agent>` (not one `cmux_mini_fix.sh` holds) | none: `glaeda-cmux-runner-fleet --apply` |
