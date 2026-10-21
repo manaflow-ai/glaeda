@@ -21,6 +21,12 @@ Each run checks, as the runner user and without sudo:
                                      Stopped, else a stop and start of the Tailscale VPN service (scutil --nc), as
                                      mini-ops tailscale-unstick.sh does by hand. A standalone tailscaled (root daemon)
                                      or a logged-out node is reported only.
+  tailscale_no_route                 BackendState is Running but the OS sends tailnet traffic elsewhere:
+                                     `route -n get 100.100.100.100` (Tailscale's own address) leaves by a
+                                     non-utun interface (en0 to the LAN gateway), so no tailnet host reaches
+                                     ssh here while `tailscale ping --tsmp` still answers (cmuxs-mac-mini-5,
+                                     2026-10-21: 100.64/10 gone from the routing table). Reported only: the
+                                     fix is a stop and start of the Tailscale VPN service, which its owner does.
   tailscale_probe_error              the Tailscale CLI gave no BackendState (it timed out, failed or printed no JSON;
                                      a loaded mini can time out with the tunnel up). The check could not look, so the
                                      tunnel is not judged down: reported only, never healed.
@@ -96,6 +102,8 @@ HELD = HOME / ".local/state/glaeda/mini-fleet/runner-held"  # cmux_mini_fix.sh r
 RUNNER_AGENT = re.compile(r"com\.teamleaderleo\.glaeda\.cmux-runner(?:\.\d+)?")
 LOGINWINDOW = Path("/Library/Preferences/com.apple.loginwindow.plist")
 TAILSCALE_APP = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+# Tailscale's own address: on a healthy node the OS sends it into the tunnel (a utun interface).
+TAILNET_PROBE_IP = "100.100.100.100"
 TAILSCALE_STANDALONE = "/usr/local/bin/tailscale"
 # The app's binary is its CLI only when it sees a terminal or this; from a LaunchAgent it otherwise starts as the GUI
 # and prints "The Tailscale GUI failed to start" instead of the status.
@@ -277,6 +285,12 @@ class Mini:
             return flavor, state, ""
         said = " ".join((p.stderr + " " + p.stdout).split())[:160] or "no output"
         return flavor, None, f"{cli} status --json exited {p.returncode} without a BackendState: {said}"
+
+    def tailnet_route(self) -> str | None:
+        """The interface the OS sends Tailscale's own address (100.100.100.100) out of, or None if it cannot tell."""
+        code, out = sh(["/sbin/route", "-n", "get", TAILNET_PROBE_IP], timeout=10)
+        m = re.search(r"^\s*interface:\s*(\S+)", out, re.M) if code == 0 else None
+        return m.group(1) if m else None
 
     def vpn_service(self) -> str | None:
         m = re.search(r"([0-9A-F-]{36}).*io\.tailscale\.", sh(["/usr/sbin/scutil", "--nc", "list"])[1])
@@ -579,8 +593,15 @@ def check_testmanagerd(mini: Mini, now: float) -> list[dict[str, Any]] | None:
 
 def check_tailscale(mini: Mini) -> list[dict[str, Any]]:
     got = mini.tailscale()
-    if got is None or got[1] == "Running":
+    if got is None:
         return []
+    if got[1] == "Running":
+        via = mini.tailnet_route()
+        if via is None or via.startswith("utun"):
+            return []
+        return [finding("tailscale_no_route", "error", f"Tailscale BackendState Running, but the OS routes "
+                        f"{TAILNET_PROBE_IP} out of {via}, not the tunnel: no tailnet host reaches ssh here",
+                        "impossible", "stop and start the Tailscale VPN service (scutil --nc); its owner does that")]
     flavor, state, said = got
     if state is None:  # the check could not look: never a tailscale_down, a heal or an unstick on a guess
         return [finding("tailscale_probe_error", "warn", said, "impossible",

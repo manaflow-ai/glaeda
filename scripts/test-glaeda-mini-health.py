@@ -41,6 +41,7 @@ class FakeMini(health.Mini):
         self.procs = [(10, 501, "S", TM)]
         self.lines = [(NOW - 600, "Created session with socket 3"), (NOW - 590, "Tearing down <XCIDESession>")]
         self.ts: tuple[str, str | None, str] | None = ("app", "Running", "")
+        self.route: str | None = "utun4"
         self.ts_after: list[str] = []
         self.agents = [("com.teamleaderleo.glaeda.cmux-runner", True, True, "(never exited)"),
                        ("com.teamleaderleo.glaeda.cmux-runner.1", True, True, "(never exited)")]
@@ -73,6 +74,9 @@ class FakeMini(health.Mini):
         if self.ts_after and self.did and self.did[-1].startswith(("up", "vpn")):
             self.ts = (self.ts[0], self.ts_after.pop(0), "")
         return self.ts
+
+    def tailnet_route(self):
+        return self.route
 
     def vpn_service(self):
         return "C7E1635B-DD04-49D8-A16F-FB4E34804764"
@@ -423,6 +427,19 @@ class Tailscale(Base):
         self.run_once()
         self.run_once(NOW + 120)
         self.assertEqual(self.mini.did, ["vpn C7E1635B-DD04-49D8-A16F-FB4E34804764"])
+
+    def test_running_without_a_tunnel_route_is_reported_never_healed(self) -> None:
+        # cmuxs-mac-mini-5, 2026-10-21: Running, but 100.64/10 gone, so tailnet ssh timed out all afternoon.
+        self.mini.route = "en0"
+        first = self.run_once()
+        self.assertEqual(self.ids(first), ["tailscale_no_route"])
+        self.assertIn("out of en0", first["findings"][0]["evidence"])
+        self.run_once(NOW + 120)
+        self.assertEqual(self.mini.did, [], "a Tailscale restart is its owner's, not this check's")
+
+    def test_a_route_it_cannot_read_is_no_finding(self) -> None:
+        self.mini.route = None
+        self.assertEqual(self.run_once()["findings"], [])
 
     def test_no_backend_state_is_a_probe_error_never_a_heal(self) -> None:
         self.mini.ts = ("app", None, "Tailscale status --json exited 0 without a BackendState: The Tailscale GUI "
