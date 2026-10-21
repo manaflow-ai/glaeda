@@ -73,7 +73,11 @@ runs under the runner LaunchAgent's listen.sh: it runs DIR/run.sh, and while the
 host lock, a reservation, or a fleet build waiting for the lock), every capacity unit on the mini is
 taken, or the mini is saturated (sampled host CPU at least GATE_CPU_PAUSE or elevated memory pressure), it stops the idle
 runner's listener so GitHub routes the job to another runner instead of here to be refused or slowed
-down (Gate). A gui runner also stops listening while the console session is locked or nobody is logged in there
+down (Gate). A --require-eligible runner also stops listening while job-started would refuse every job for
+eligibility (Gate.ineligible: the node status or the class receipt's toolchain, looked at in a thread at most
+every GATE_ELIGIBLE_EVERY_S; a new refusal holds once a recheck agrees, and a held answer survives a hook reload),
+so its label's jobs go to an eligible runner, or wait in GitHub's queue when none is, instead of failing in "Set up
+job". A gui runner also stops listening while the console session is locked or nobody is logged in there
 (console_refusal). A fast runner (--fast-runner) runs cmux-next's fast-tier on the fast tokens (FAST_TOKENS)
 instead of the shared units, and its gate looks at those tokens, never at the units. Every runner also stops listening while free disk is under its job-started hook's --min-free-gib,
 and starts the same eviction in the background, listening again once it made room (Gate.low_disk). Full means every
@@ -95,6 +99,7 @@ import os
 import plistlib
 import re
 import select
+import shlex
 import shutil
 import signal
 import stat
@@ -806,6 +811,18 @@ CONSOLE_CLASSES = ("gui", "gui-step")  # job classes whose tests need the consol
 # rescue). On a locked console they are admitted as light, with no gui token, and their take-gui gives way.
 CONSOLE_SKIPPERS = {("cmux-next-frame-pacing.yml", "bench")}
 GATE_CONSOLE_EVERY_S = 30.0
+# A --require-eligible runner's listener is held off while its node would be refused (node_refusal, then
+# toolchain_refusal without align): a listening runner took every job its label brought and failed it in "Set up
+# job" (cmux21-glaeda-1 refused cmux's fleet-compile-check, run 39576639849, with rust 1.99.1 not installed). Held
+# off, GitHub hands the job to an eligible runner on the same label. The look runs in a thread (its probes take up
+# to 2 x ELIGIBILITY_BUDGET_S) at most every GATE_ELIGIBLE_EVERY_S, and the gate uses the last answer.
+GATE_ELIGIBLE_EVERY_S = float(os.environ.get("GLAEDA_RUNNER_GATE_ELIGIBLE_EVERY_S") or 300.0)
+# A new refusal is looked at once more this soon, and holds only when that look agrees: a probe that timed out on a
+# busy mini reads as a refusal (an empty xcodebuild or node status) and must not hold a good runner for 300 s.
+GATE_ELIGIBLE_RECHECK_S = 30.0
+# The held answer across a reload's exec (as GATE_LISTENING_SINCE_ENV), so a hook --apply does not start every
+# held runner listening while the new gate's first look runs.
+GATE_INELIGIBLE_ENV = "GLAEDA_RUNNER_GATE_INELIGIBLE"
 
 
 def _repo_name(repo: Any) -> str | None:
@@ -2907,6 +2924,36 @@ def runner_scope(runner_dir: Path) -> RunnerScope:
                        fast, session)
 
 
+def eligibility_scope(runner_dir: Path) -> tuple[str, str | None] | None:
+    """(--fleet-class, --toolchain-xcode or None) when this runner's job-started hook runs with --require-eligible,
+    else None (its jobs are not refused for eligibility, so the gate never holds it for that)."""
+    try:
+        text = (runner_dir / RUNNER_HOOK_SCRIPT).read_text()
+    except (OSError, UnicodeDecodeError):
+        return None
+    line = next((ln for ln in text.splitlines() if ln.startswith("exec ")), "")
+    try:
+        words = shlex.split(line)  # the wrapper shlex.quotes its paths
+    except ValueError:
+        return None
+
+    def value(flag: str) -> str | None:
+        return words[words.index(flag) + 1] if flag in words[:-1] else None
+
+    klass = value("--fleet-class")
+    if "--require-eligible" not in words or not klass:
+        return None
+    return klass, value("--toolchain-xcode")
+
+
+def eligibility_refusal(fleet_class: str, xcode_app: str | None) -> str | None:
+    """What job-started would refuse every job with for eligibility (the read-only `check`), or None."""
+    why, want = node_refusal(fleet_class)
+    if not why:
+        why, _ = toolchain_refusal(fleet_class, want, xcode_app, align=False)
+    return why
+
+
 def min_free_gib(text: str) -> float:
     """The last unquoted --min-free-gib in a job-started hook script, as glaeda-cmux-runner writes it (:g, so 1e+03
     is a valid form), or 0 without one or when it is not a finite number. glaeda-disk's runner_floor_gib reads the
@@ -3339,6 +3386,10 @@ class Gate:
         self.memory_at = -GATE_CPU_EVERY_S
         self.console_why: str | None = None  # the last console_refusal, read at most every GATE_CONSOLE_EVERY_S
         self.console_at = -GATE_CONSOLE_EVERY_S
+        self.eligible_why: str | None = os.environ.pop(GATE_INELIGIBLE_ENV, None) or None  # the held answer
+        self.eligible_new: str | None = None  # a first refusal, held only once a recheck agrees
+        self.eligible_at = -GATE_ELIGIBLE_EVERY_S
+        self.eligible_look: threading.Thread | None = None
         self.disk_since: float | None = None  # when the current disk hold began
         self.disk_noted = False  # the hold ran past GATE_DISK_NOTE_S and said so once
         self.disk_evicted_at = -GATE_DISK_EVICT_EVERY_S  # when the last eviction under the floor started
@@ -3356,6 +3407,8 @@ class Gate:
         now = source_identity()
         if now is None or now == self.source:
             return
+        if self.eligible_look is not None and self.eligible_look.is_alive():
+            return  # the next poll: the look thread does not block SIGTERM, and its probes would be orphaned
         self.source = now
         argv = [a for a in sys.argv if not a.startswith("--adopt=")]
         if self.child is not None:
@@ -3382,10 +3435,13 @@ class Gate:
             return
         if self.listening_since is not None:
             os.environ[GATE_LISTENING_SINCE_ENV] = repr(self.listening_since)
+        if self.eligible_why:
+            os.environ[GATE_INELIGIBLE_ENV] = self.eligible_why
         try:
             os.execv(sys.executable, [sys.executable, *argv])
         except OSError:
             os.environ.pop(GATE_LISTENING_SINCE_ENV, None)
+            os.environ.pop(GATE_INELIGIBLE_ENV, None)
             signal.pthread_sigmask(signal.SIG_UNBLOCK, blocked)
             gate_log("the reload failed; keeping this gate")
 
@@ -3399,7 +3455,7 @@ class Gate:
             self.load_since = None  # the fleet's claim, not load, is holding this gate
             self.yield_to_fleet()
         return (why or self.shed(self.saturated()) or self.full() or self.shed(self.hot()) or self.locked()
-                or self.low_disk())
+                or self.low_disk() or self.ineligible())
 
     def yield_to_fleet(self) -> None:
         """A fleet build waiting for the host lock waits for every holder, the idle catch-up's shared hold
@@ -3475,7 +3531,7 @@ class Gate:
             self.load_since = None
             self.yield_to_fleet()
         return (why or self.shed(self.saturated()) or self.full(fresh=True) or self.shed(self.hot(fresh=True))
-                or self.locked(fresh=True) or self.low_disk())
+                or self.locked(fresh=True) or self.low_disk() or self.ineligible())
 
     def still_waiting(self) -> str | None:
         """A fleet build seen waiting during the job that just ended, still waiting in a fresh reading."""
@@ -3576,6 +3632,39 @@ class Gate:
         if fresh or time.monotonic() - self.console_at >= GATE_CONSOLE_EVERY_S:
             self.console_why, self.console_at = console_refusal(), time.monotonic()
         return self.console_why
+
+    def ineligible(self) -> str | None:
+        """For a --require-eligible runner: why job-started would refuse every job for eligibility (GATE_ELIGIBLE_EVERY_S),
+        from the last look. A look starts in a thread when the last one is older than GATE_ELIGIBLE_EVERY_S and none
+        is running, so no poll waits on its probes. A look that crashes counts as eligible: job-started still checks
+        every job itself, so a wrong "eligible" only costs the refusal this hold avoids."""
+        scope = eligibility_scope(self.runner_dir)
+        if scope is None:
+            self.eligible_why = None
+            return None
+        running = self.eligible_look is not None and self.eligible_look.is_alive()
+        if not running and time.monotonic() - self.eligible_at >= GATE_ELIGIBLE_EVERY_S:
+            self.eligible_at = time.monotonic()
+
+            def look() -> None:
+                try:
+                    why = eligibility_refusal(*scope)
+                except Exception as error:  # noqa: BLE001 - a broken look must never stop the gate
+                    why = None
+                    gate_log(f"the eligibility look failed ({type(error).__name__}); not holding for it")
+                if why and not self.eligible_why and not self.eligible_new:
+                    self.eligible_new = why  # look again soon; hold only if that look refuses too
+                    self.eligible_at = time.monotonic() - GATE_ELIGIBLE_EVERY_S + GATE_ELIGIBLE_RECHECK_S
+                    return
+                self.eligible_new = None
+                if why != self.eligible_why:
+                    gate_log(f"eligibility: {why}; held off so another runner takes the job" if why
+                             else "eligible again")
+                self.eligible_why = why
+
+            self.eligible_look = threading.Thread(target=look, name="eligibility", daemon=True)
+            self.eligible_look.start()
+        return f"ineligible: {self.eligible_why}" if self.eligible_why else None
 
     def full(self, fresh: bool = False) -> str | None:
         """Every unit this runner's jobs could take is held. A look an admission blocked keeps the previous
