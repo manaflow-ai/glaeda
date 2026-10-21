@@ -1240,7 +1240,7 @@ def orphan_hook_should_exit(worker_pid: int, worker_identity: str, children: set
     return True
 
 
-def start_runner_parent_watchdog(worker_pid: int | None) -> None:
+def start_runner_parent_watchdog(owner: JobOwner | None) -> None:
     """Stop an admitted hook stranded by a dead Runner.Worker, releasing its flocks.
 
     Hooks are normally descendants of Runner.Worker. A runner crash can reparent a
@@ -1248,15 +1248,10 @@ def start_runner_parent_watchdog(worker_pid: int | None) -> None:
     enabled only when that ancestry was observed, uses a start token to reject PID
     reuse, and waits until the hook has no direct child process before terminating.
     """
-    # The generated wrapper uses exec, so the immediate parent is normally the
-    # Runner.Worker itself. If ancestry probing races a short-lived wrapper,
-    # anchor to that observed parent instead of disabling orphan protection.
-    worker_pid = worker_pid or os.getppid()
-    if worker_pid <= 1:
+    # The owner is pinned once (job_owner): the Runner.Worker, else the observed parent, never launchd.
+    if owner is None:
         return
-    identity = process_identity(worker_pid)
-    if identity is None:
-        return
+    worker_pid, identity = owner
 
     def watch() -> None:
         while True:
@@ -1915,6 +1910,46 @@ def process_alive(pid: int, identity: str) -> bool:
     return pid_alive(pid) and process_identity(pid) == identity
 
 
+OWNER_GONE = "the job's Runner.Worker is gone"
+
+
+class JobOwner(NamedTuple):
+    """The process a job's holds belong to, pinned once by pid and start token.
+
+    job-started pins its Runner.Worker when it starts and every hold, sampler and watchdog of that job watches
+    this one handle. Asking os.getppid() again later is wrong: once the Worker exits (a cancelled job, a runner
+    crash) the hook is reparented to launchd, and PID 1 is never a job. A hold for an owner that is gone is not a
+    refusal of a live job: there is nothing to admit, so the hook lets go of what it waited for and exits."""
+    pid: int
+    identity: str
+
+    @classmethod
+    def of(cls, pid: int) -> JobOwner | None:
+        """The owner for a live pid, or None for PID 0/1 (launchd: never a job) or a pid with no start token."""
+        identity = process_identity(pid) if pid > 1 else None
+        return cls(pid, identity) if identity else None
+
+    def alive(self) -> bool:
+        return process_alive(self.pid, self.identity)
+
+    def gone(self) -> bool:
+        """Proven gone: the pid is free, or it now names another process. An unreadable start token (a /bin/ps
+        timeout) is unknown, not gone, so a live job is never given up on a transient probe failure."""
+        if not pid_alive(self.pid):
+            return True
+        current = process_identity(self.pid)
+        return current is not None and current != self.identity
+
+
+def job_owner(explicit: int = 0) -> JobOwner | None:
+    """Pin this hook's job owner: the --watch-pid it was given, else the parent it starts under (the wrapper execs
+    the hook, so that is the job's Runner.Worker), else the Runner.Worker above it. None once the parent is
+    launchd and no Worker is left above it."""
+    if explicit:
+        return JobOwner.of(explicit)
+    return JobOwner.of(os.getppid()) or JobOwner.of(runner_worker_pid() or 0)
+
+
 # Idle catch-up (glaeda-idle-warm): while a mini is idle and a root's kept build is far from main, it holds that
 # root's token, a persistent-dd token and a compile's units (flocks under the capacity dir, like a job) and builds
 # main's head into the root's kept state. Any job comes first. take_capacity stops it and waits for its locks to
@@ -2137,7 +2172,7 @@ def close_all(fds: list[int]) -> None:
             os.close(fd)
 
 
-def take_host_lock(path: str, watch_pid: int, state_dir: Path) -> tuple[bool, str]:
+def take_host_lock(path: str, watch_pid: int | JobOwner, state_dir: Path) -> tuple[bool, str]:
     """Take the fleet host lock without waiting and leave it with a detached holder for this job.
     Admitted only once the holder itself reports its pid, so a holder that died never counts."""
     if not os.path.exists(path):
@@ -2384,7 +2419,7 @@ def token_holders(capacity_dir: Path, wants: list[str], compile_slots: int, root
     return "; ".join(notes)
 
 
-def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watch_pid: int,
+def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watch_pid: int | JobOwner,
                   state_dir: Path, compile_slots: int = 1, roots: int = 1,
                   repo: str | None = DEFAULT_HOME_REPO, home_repo: str = DEFAULT_HOME_REPO,
                   instance: int = 0, workflow: str = "", warm_keys: tuple[str, ...] = (),
@@ -2562,16 +2597,21 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         os.close(admission)
 
 
-def hold(fds: list[int], watch_pid: int, state_dir: Path, drop: tuple[int, ...] = (),
+def hold(fds: list[int], watch: int | JobOwner, state_dir: Path, drop: tuple[int, ...] = (),
          pid_file: Path | None = None, release_fds: list[int] | None = None) -> tuple[bool, str]:
-    """Hand the locked fds to a detached holder that keeps them until job-completed or watch_pid exits.
+    """Hand the locked fds to a detached holder that keeps them until job-completed or the job's owner exits.
+    watch is the owner job-started pinned (JobOwner), or a pid a step resolved just now (take-root, take-gui).
     Closes this process's copies either way. The holder closes `drop` (locks that must not outlive the
     admission). Succeeds only once the holder reports its own pid. pid_file defaults to the runner's
     holder file; take-root passes its own so a second holder for the same job lives beside it."""
-    watch_identity = process_identity(watch_pid)
-    if watch_identity is None:
+    owner = watch if isinstance(watch, JobOwner) else JobOwner.of(watch)
+    if owner is None:
         close_all(fds)
-        return False, f"the watched process {watch_pid} has no stable identity"
+        return False, f"the watched process {watch} has no stable identity"
+    if owner.gone():  # nothing to hold for: the locks go back now, never to a holder watching nobody
+        close_all(fds)
+        return False, f"{OWNER_GONE} (pid {owner.pid})"
+    watch_pid, watch_identity = owner.pid, owner.identity
     try:
         state_dir.mkdir(parents=True, exist_ok=True)
         pid_file = pid_file or holder_file(state_dir)
@@ -4915,11 +4955,13 @@ def main(argv: list[str] | None = None) -> int:
     # the runner LaunchAgent's environment can switch sampling off fleet-wide without a reinstall
     telemetry = not args.no_telemetry and os.environ.get("GLAEDA_RUNNER_TELEMETRY", "1") != "0"
 
+    owner: JobOwner | None = None
     if args.phase == "job-started":
-        # Capture the real Runner.Worker ancestry before admission. If that
-        # process dies while this hook is waiting or cleaning up, the watcher
-        # releases the host/capacity flocks instead of stranding the lender.
-        start_runner_parent_watchdog(runner_worker_pid() or os.getppid())
+        # Pin the job's Runner.Worker (pid + start token) once, before admission: every hold, the sampler and the
+        # watchdog watch this handle, never a later os.getppid() (launchd once the Worker is gone). If the Worker
+        # dies while this hook waits or cleans up, the wait ends and the watcher releases the host/capacity flocks.
+        owner = job_owner(args.watch_pid)
+        start_runner_parent_watchdog(owner)
 
     if args.phase in ("admit", "release"):
         if not args.job_key or not STEP_KEY.fullmatch(args.job_key):
@@ -4972,16 +5014,30 @@ def main(argv: list[str] | None = None) -> int:
         admit_start: float | None = None
 
         def refused(why: str, disk: bool = False) -> int:
-            if not disk:  # a disk refusal's job-completed still runs its pass
+            if owner is not None and owner.gone():
+                return abandoned()  # nobody reads a refusal of a job whose Worker is gone
+            worker = owner.pid if owner is not None else args.watch_pid or os.getppid()
+            if not disk and worker > 1:  # a disk refusal's job-completed still runs its pass; launchd is no job
                 with contextlib.suppress(OSError):
                     args.state_dir.mkdir(parents=True, exist_ok=True)
-                    refused_note(args.state_dir, args.watch_pid or os.getppid()).touch()
+                    refused_note(args.state_dir, worker).touch()
             if telemetry:
                 with contextlib.suppress(Exception):  # observation never hides or changes a refusal
                     job_event("refused", job_meta(repo, args.home_repo), args.job_log, decision=why[:400],
                               wait_s=None if admit_start is None else round(time.monotonic() - admit_start, 1),
                               units=0, roots=[], gui=False, instance=args.instance)
             return refuse(why)
+
+        def abandoned() -> int:
+            """The owner is gone (a cancelled or crashed job): give up the wait, hold nothing, refuse nobody."""
+            why = f"{OWNER_GONE} (pid {owner.pid if owner else 'unknown'}); nothing admitted, nothing held"
+            print(f"{PREFIX}: {why}", flush=True)
+            if telemetry:
+                with contextlib.suppress(Exception):
+                    job_event("abandoned", job_meta(repo, args.home_repo), args.job_log, decision=why[:400],
+                              wait_s=None if admit_start is None else round(time.monotonic() - admit_start, 1),
+                              units=0, roots=[], gui=False, instance=args.instance)
+            return 1
 
         admit, reason = decide(os.environ.get("GITHUB_EVENT_NAME"), event,
                                os.environ.get("GITHUB_REPOSITORY"), args.allowed_repo, args.allowed_owner,
@@ -5027,7 +5083,8 @@ def main(argv: list[str] | None = None) -> int:
             # It listens on a full mini (it needs no general units), so any other job would wait here for units
             # with no limit and idle the runner; refused, it is rescued onto its own pool.
             return refused("the fast runner takes only the fast tier")
-        # The wrapper execs this script, so the parent is the job's Runner.Worker.
+        if owner is None:  # fail closed: with no pinned owner no holder could watch the job
+            return refused(f"cannot pin this job's Runner.Worker (pid {args.watch_pid or os.getppid()})")
         admit_start = time.monotonic()
         taken: dict[str, Any] = {}
         if args.capacity_units > 0:
@@ -5042,8 +5099,10 @@ def main(argv: list[str] | None = None) -> int:
             shown, shown_at = "", 0.0
             try:
                 while True:
+                    if owner.gone():  # a cancelled job's hook must not keep queuing for units
+                        return abandoned()
                     held, note = take_capacity(args.host_lock, args.capacity_dir, args.capacity_units,
-                                               os.environ.get("GITHUB_JOB", ""), args.watch_pid or os.getppid(),
+                                               os.environ.get("GITHUB_JOB", ""), owner,
                                                args.state_dir, args.compile_slots, args.canonical_roots,
                                                repo, args.home_repo, instance=args.instance,
                                                workflow=job_workflow(),
@@ -5074,7 +5133,7 @@ def main(argv: list[str] | None = None) -> int:
             with contextlib.suppress(OSError):  # a crashed job's record must not show in this job's log lines
                 roots_file(args.state_dir).unlink(missing_ok=True)
                 gui_file(args.state_dir).unlink(missing_ok=True)
-            held, note = take_host_lock(args.host_lock, args.watch_pid or os.getppid(), args.state_dir)
+            held, note = take_host_lock(args.host_lock, owner, args.state_dir)
         if not held:
             return refused(note)
         if args.require_eligible:
@@ -5124,7 +5183,7 @@ def main(argv: list[str] | None = None) -> int:
                 job_event("started", meta, args.job_log)
             except Exception:  # noqa: BLE001
                 pass
-            note = start_sampler(args.watch_pid or os.getppid(), args.state_dir, meta, args.job_log)
+            note = start_sampler(owner.pid, args.state_dir, meta, args.job_log)
             print(f"{PREFIX}: {note}", flush=True)
     else:
         if telemetry:
