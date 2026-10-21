@@ -66,7 +66,11 @@ runner-checkout-build is SwiftPM's Packages/*/.build and Packages/*/*/.build plu
 directories (cmux-tui/target), plus DerivedData a workflow keeps in $RUNNER_WORKSPACE/.glaeda-state
 (_work/<repo>/.glaeda-state/*derived-data*); it goes only under pressure, only while that runner has no Runner.Worker,
 an hour idle, least recently modified first. runner-git-garbage is git's tmp_pack_*/tmp_obj_* temp files an
-interrupted fetch left; one an hour old goes whenever nothing holds it open. The checkout itself stays.
+interrupted fetch left; one an hour old goes whenever nothing holds it open. The checkout itself stays,
+except as the last resort of a pressure run still under the runner gate's disk floor after everything else
+(runner-idle-checkout): then the whole checkout of a runner with no Runner.Worker, unused for an hour and
+held open by nothing, goes, least recently used first, until free space reaches the floor plus
+target_margin_gib. The runner's next job clones it again.
 
 The runner-account profile is intentionally narrower than the normal user profile:
 it covers only DerivedData, cmux reload/GhosttyKit caches, and CUA recordings/frame
@@ -1492,6 +1496,112 @@ def runner_checkout_families(home: Path | None = None) -> list[Family]:
                            owner="git fetch in this runner's checkout", rebuild_minutes=0.1,
                            platform="macos"))
     return fams
+
+
+# The last resort for the runner gate's disk hold. With 10-12 runners on a mini, each runner's own checkout
+# (_work/<repo>/<repo>: a 7.5 GiB .git plus sources and what build output survives) adds up to 70-170 GiB,
+# and build-output eviction alone left cmuxs-mac-mini-3, -6 and cmux11s under the 32 GiB floor with every
+# listener held (2026-10-21; removing idle runners' checkouts by hand freed 116 GiB on three minis and the
+# gate reopened). So a pressure run that is still under the gate's floor after every other family removes
+# whole checkouts of runners with no job, least recently used first, until free space reaches the floor
+# plus target_margin_gib. The next job on that runner clones again (actions/checkout). Never _work/_tool,
+# _actions, _temp or the workspace's .glaeda-state.
+RUNNER_IDLE_CHECKOUT_FAMILY = "runner-idle-checkout"
+RUNNER_IDLE_CHECKOUT_HOURS = 1.0
+
+
+def runner_checkout_last_use(runner: Path, checkout: Path) -> float:
+    """When the runner last used a checkout: its git bookkeeping (a job's checkout step rewrites the index,
+    HEAD and FETCH_HEAD) or the runner's Worker logs, which a job writes from start to end."""
+    times = [0.0]
+    for p in (checkout, checkout / ".git", *(checkout / ".git" / n for n in ("index", "HEAD", "FETCH_HEAD", "logs/HEAD"))):
+        with contextlib.suppress(OSError):
+            times.append(p.lstat().st_mtime)
+    with contextlib.suppress(OSError), os.scandir(runner / "_diag") as logs:
+        for e in logs:
+            if e.name.startswith("Worker_"):
+                with contextlib.suppress(OSError):  # a log rotated away mid-scan drops only itself
+                    times.append(e.stat(follow_symlinks=False).st_mtime)
+    return max(times)
+
+
+def idle_runner_checkout_veto(runner: Path, checkout: Path, opened: frozenset[str], cmds: str) -> str:
+    """Why an idle runner's checkout must stay, or "" when it may go."""
+    path = os.fspath(checkout)
+    if (checkout.is_symlink() or checkout.name != checkout.parent.name
+            or not contained_directory(checkout, runner / "_work")):
+        return "not actions/checkout's _work/<repo>/<repo> inside the runner's _work"
+    if why := runner_job_live(runner, cmds):
+        return why
+    resolved = os.fspath(checkout.resolve())
+    if in_cwd(path, opened) or in_cwd(resolved, opened):
+        return "open or a working directory of a process"
+    if named_by(path, cmds) or named_by(resolved, cmds):
+        return "named by a running command"
+    if (time.time() - runner_checkout_last_use(runner, checkout)) / 3600 < RUNNER_IDLE_CHECKOUT_HOURS:
+        return f"used within {RUNNER_IDLE_CHECKOUT_HOURS:g}h"
+    return ""
+
+
+def evict_idle_runner_checkouts(receipt: Path, floor_gib: float, home: Path | None = None) -> int:
+    """Under the runner gate's disk floor only: remove idle runners' whole checkouts, least recently used
+    first, each after fresh process evidence, until free space is back at the floor plus target_margin_gib."""
+    home = HOME if home is None else home
+    if floor_gib <= 0:
+        return 0
+    try:
+        free, total = free_bytes(home)
+    except OSError:
+        return 0
+    if free >= floor_gib * GIB:  # the gate is not holding for disk: whole checkouts stay
+        return 0
+    target = min(int((floor_gib + POLICY["target_margin_gib"]) * GIB), total // 2)  # as filesystems() sets it
+    now = time.time()
+    found = []
+    for runner in enrolled_runners(home):
+        work = runner / "_work"
+        if work.is_symlink() or not work.is_dir():
+            continue
+        for checkout in runner_checkouts(work):
+            if checkout.name != checkout.parent.name:  # only actions/checkout's default _work/<repo>/<repo>
+                continue
+            used = runner_checkout_last_use(runner, checkout)
+            if (now - used) / 3600 >= RUNNER_IDLE_CHECKOUT_HOURS:
+                found.append((used, runner, checkout))
+    released = 0
+    for used, runner, checkout in sorted(found, key=lambda t: t[0]):
+        try:
+            if free_bytes(home)[0] >= target:
+                break
+            opened, cmds = process_evidence()  # a job may have started since the last deletion
+        except OSError:
+            break
+        except NoEvidence as e:
+            print(f"refusing to delete idle runner checkouts: {e}", file=sys.stderr)
+            break
+        why = idle_runner_checkout_veto(runner, checkout, open_index(opened), cmds)
+        size = 0
+        if why:
+            outcome = "changed:modified" if why.startswith("used within") else "changed:in-use"
+        else:
+            try:
+                before = free_bytes(home)[0]
+                remove(checkout)
+                outcome = "reclaimed"
+                size = max(0, free_bytes(home)[0] - before)  # what the free space shows, without a du walk
+                released += size
+            except OSError as e:
+                outcome = f"incomplete:{e.__class__.__name__}"
+        rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(), "outcome": outcome,
+               "family": RUNNER_IDLE_CHECKOUT_FAMILY, "path": os.fspath(checkout), "bytes": size,
+               "verdict": "reclaimable" if not why else "blocked",
+               "reasons": [why] if why else ["under the runner disk floor", "runner has no job"],
+               "idle_hours": round((now - used) / 3600, 2)}
+        with contextlib.suppress(OSError), receipt.open("a") as f:  # a lost receipt line must not stop the pass
+            f.write(json.dumps(rec) + "\n")
+        if outcome == "reclaimed":
+            print(f"  reclaimed {gib(size).strip():>8s}  {checkout} (idle runner checkout, under the disk floor)")
+    return released
 
 
 def apple_build_verdict(path: Path) -> str:
@@ -5982,6 +6092,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
         # are absent, its disposable checkout can be cleared under this same eviction lock.
         if not RUNNER_CACHE_PROFILE:
             logical_released += cleanup_paused_runner_work(a.receipt)
+        # still under the runner gate's floor after every family: idle runners' whole checkouts, last
+        if a.pressure and not RUNNER_CACHE_PROFILE and not a.cmux_next_drain \
+                and (not a.family or RUNNER_IDLE_CHECKOUT_FAMILY in a.family):
+            logical_released += evict_idle_runner_checkouts(a.receipt, floor_gib)
         remaining = []
         for fs in shown:
             try:

@@ -2785,6 +2785,172 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertIn("running a job", gd.runner_job_live(runner, f"{runner}/bin/Runner.Worker spawnclient 1 2\n"))
         self.assertEqual(gd.runner_job_live(runner, f"{runner}-2/bin/Runner.Worker spawnclient 1 2\n"), "")
 
+    def _floor_disk(self, free_gib: float, freed_gib: float = 10.0):
+        """A fake HOME volume at free_gib; each removal frees freed_gib. Returns (patches, removed paths)."""
+        state = {"free": int(free_gib * gd.GIB)}
+        removed: list[str] = []
+        real_remove = gd.remove
+
+        def remove(path, after_rename=None):
+            real_remove(path, after_rename)
+            removed.append(str(path))
+            state["free"] += int(freed_gib * gd.GIB)
+        return (mock.patch.object(gd, "free_bytes", side_effect=lambda _p: (state["free"], 460 * gd.GIB)),
+                mock.patch.object(gd, "remove", side_effect=remove)), removed
+
+    def _idle_checkouts(self, hours: dict[str, float]) -> tuple[Path, dict[str, Path]]:
+        home, _ = self._runner_checkouts()
+        cos = {}
+        for name, age in hours.items():
+            runner = home / name
+            if not runner.exists():
+                (runner / "glaeda-hooks").mkdir(parents=True)
+                (runner / ".runner").write_text("{}")
+                (runner / "_work/cmux/cmux/.git").mkdir(parents=True)
+            (runner / "_diag").mkdir(exist_ok=True)
+            (runner / "_diag/Worker_20261021-000000-utc.log").write_text("job")
+            self._age(runner, hours=age)
+            cos[name] = runner / "_work/cmux/cmux"
+        return home, cos
+
+    def test_idle_runner_checkouts_stay_while_above_the_floor(self) -> None:
+        home, cos = self._idle_checkouts({"actions-runner-glaeda": 5, "actions-runner-glaeda-2": 5})
+        patches, removed = self._floor_disk(31.0)
+        with patches[0], patches[1]:
+            self.assertEqual(gd.evict_idle_runner_checkouts(self.receipt(), 30.0, home), 0)
+            self.assertEqual(gd.evict_idle_runner_checkouts(self.receipt(), 0.0, home), 0)  # no runner floor
+        self.assertEqual(removed, [])
+        self.assertTrue(all(c.is_dir() for c in cos.values()))
+
+    def test_idle_runner_checkouts_go_least_recently_used_first_until_the_target(self) -> None:
+        home, cos = self._idle_checkouts({"actions-runner-glaeda": 3, "actions-runner-glaeda-2": 9,
+                                          "actions-runner-glaeda-3": 6})
+        patches, removed = self._floor_disk(25.0, freed_gib=15.0)  # floor 30 + target_margin_gib 20 = 50
+        receipt = self.receipt()
+        with patches[0], patches[1], contextlib.redirect_stdout(io.StringIO()):
+            released = gd.evict_idle_runner_checkouts(receipt, 30.0, home)
+        # 25 -> 40 -> 55: two checkouts, oldest use first; the most recently used one stays
+        self.assertEqual(removed, [str(cos["actions-runner-glaeda-2"]), str(cos["actions-runner-glaeda-3"])])
+        self.assertEqual(released, 30 * gd.GIB)
+        self.assertTrue(cos["actions-runner-glaeda"].is_dir())
+        recs = [json.loads(line) for line in receipt.read_text().splitlines()]
+        self.assertEqual({(r["family"], r["outcome"]) for r in recs}, {(gd.RUNNER_IDLE_CHECKOUT_FAMILY, "reclaimed")})
+        # only the checkout goes: the workspace's .glaeda-state caches and the runner's _tool/_temp stay
+        work = home / "actions-runner-glaeda-2/_work"
+        self.assertTrue((work / "cmux/.glaeda-state/SourcePackages").is_dir())
+        self.assertTrue((work / "_temp/cmux-derived-data-tests-1").is_dir())
+
+    def test_idle_runner_checkout_vetoes(self) -> None:
+        home, cos = self._idle_checkouts({"actions-runner-glaeda": 5, "actions-runner-glaeda-2": 5,
+                                          "actions-runner-glaeda-3": 5, "actions-runner-glaeda-4": 0.2})
+        live = home / "actions-runner-glaeda"
+        opened = cos["actions-runner-glaeda-2"] / "Sources/x.swift"
+        named = cos["actions-runner-glaeda-3"]
+        cmds = (f"{live.resolve()}/bin/Runner.Worker spawnclient 1 2\n"  # a job, by the resolved spelling
+                f"/usr/bin/xcodebuild -project {named}/cmux.xcodeproj\n")
+        gd.process_evidence = lambda: ([str(opened)], cmds)
+        patches, removed = self._floor_disk(10.0)
+        receipt = self.receipt()
+        with patches[0], patches[1]:
+            self.assertEqual(gd.evict_idle_runner_checkouts(receipt, 30.0, home), 0)
+        self.assertEqual(removed, [])  # the used-within-the-hour runner is not even a candidate
+        why = {Path(r["path"]).parts[-4]: r["reasons"][0] for r in map(json.loads, receipt.read_text().splitlines())}
+        self.assertIn("running a job", why["actions-runner-glaeda"])
+        self.assertIn("open or a working directory", why["actions-runner-glaeda-2"])
+        self.assertIn("named by a running command", why["actions-runner-glaeda-3"])
+        self.assertNotIn("actions-runner-glaeda-4", why)
+        self.assertTrue(all(c.is_dir() for c in cos.values()))
+
+    def test_idle_runner_checkout_rechecks_before_each_delete_and_refuses_without_evidence(self) -> None:
+        home, cos = self._idle_checkouts({"actions-runner-glaeda": 5, "actions-runner-glaeda-2": 4})
+        calls = []
+
+        def evidence():
+            calls.append(1)
+            if len(calls) == 1:
+                return [], ""
+            # a job started on runner 2 after the first deletion
+            return [], f"{home}/actions-runner-glaeda-2/bin/Runner.Worker spawnclient 1 2\n"
+        gd.process_evidence = evidence
+        patches, removed = self._floor_disk(10.0, freed_gib=5.0)
+        with patches[0], patches[1], contextlib.redirect_stdout(io.StringIO()):
+            gd.evict_idle_runner_checkouts(self.receipt(), 30.0, home)
+        self.assertEqual(removed, [str(cos["actions-runner-glaeda"])])
+        self.assertTrue(cos["actions-runner-glaeda-2"].is_dir())
+
+        def no_evidence():
+            raise gd.NoEvidence("lsof failed")
+        gd.process_evidence = no_evidence
+        patches, removed = self._floor_disk(10.0)
+        with patches[0], patches[1], contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(gd.evict_idle_runner_checkouts(self.receipt(), 30.0, home), 0)
+        self.assertEqual(removed, [])
+
+    def test_idle_runner_checkout_never_follows_symlinks_or_leaves_the_checkout(self) -> None:
+        home, cos = self._idle_checkouts({"actions-runner-glaeda": 5, "actions-runner-glaeda-2": 5,
+                                          "actions-runner-glaeda-3": 5})
+        outside = self.root / "main-clone"
+        (outside / ".git").mkdir(parents=True)
+        linked = cos["actions-runner-glaeda-2"]
+        shutil.rmtree(linked)
+        linked.symlink_to(outside)  # a checkout that is a symlink to a clone outside _work
+        work3 = home / "actions-runner-glaeda-3/_work"
+        shutil.rmtree(work3)
+        work3.symlink_to(self.root / "main-clone")  # a symlinked _work
+        other = home / "actions-runner-glaeda/_work/cmux/other"  # a checkout outside the default layout
+        (other / ".git").mkdir(parents=True)
+        for keep in ("_tool/node", "_actions/actions/checkout"):
+            make(home / "actions-runner-glaeda/_work" / keep)
+        self._age(home / "actions-runner-glaeda", hours=5)
+        patches, removed = self._floor_disk(10.0)
+        with patches[0], patches[1], contextlib.redirect_stdout(io.StringIO()):
+            gd.evict_idle_runner_checkouts(self.receipt(), 30.0, home)
+        self.assertEqual(removed, [str(cos["actions-runner-glaeda"])])
+        self.assertTrue((outside / ".git").is_dir())
+        self.assertTrue(other.is_dir())
+        self.assertTrue((home / "actions-runner-glaeda/_work/_tool/node").is_dir())
+        self.assertTrue((home / "actions-runner-glaeda/_work/_actions/actions/checkout").is_dir())
+
+    def test_idle_runner_checkout_used_since_the_survey_stays(self) -> None:
+        home, cos = self._idle_checkouts({"actions-runner-glaeda": 5, "actions-runner-glaeda-2": 5})
+
+        def evidence():  # a job's checkout step rewrites the index between the survey and the delete
+            for co in cos.values():
+                os.utime(co / ".git")
+            return [], ""
+        gd.process_evidence = evidence
+        patches, removed = self._floor_disk(10.0)
+        receipt = self.receipt()
+        with patches[0], patches[1]:
+            gd.evict_idle_runner_checkouts(receipt, 30.0, home)
+        self.assertEqual(removed, [])
+        self.assertEqual({json.loads(line)["outcome"] for line in receipt.read_text().splitlines()},
+                         {"changed:modified"})
+
+    def test_idle_runner_checkout_pass_runs_only_in_a_pressure_apply(self) -> None:
+        dev = gd.HOME.stat().st_dev
+        under = {dev: gd.Fs(dev, "/", 10 * gd.GIB, 460 * gd.GIB, 34 * gd.GIB, 50 * gd.GIB)}
+        receipt = ["--receipt", os.fspath(self.receipt())]
+        with mock.patch.object(gd, "EVICT_LOCK", self.root / "evict.lock"), \
+                mock.patch.object(gd, "EVICT_OWNER", self.root / "evict.owner.json"), \
+                mock.patch.object(gd, "HEALTH_SUMMARY", self.root / "summary.json"), \
+                mock.patch.object(gd, "default_families", return_value=[]), \
+                mock.patch.object(gd, "runner_floor_gib", return_value=30.0), \
+                mock.patch.object(gd, "filesystems", return_value=under), \
+                mock.patch.object(gd, "survey", return_value=[]), \
+                mock.patch.object(gd, "apply", return_value=0), \
+                mock.patch.object(gd, "cleanup_paused_runner_work", return_value=0), \
+                mock.patch.object(gd, "notify_disk"), \
+                mock.patch.object(gd, "evict_idle_runner_checkouts", return_value=0) as last, \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd.main(["--apply", "--no-snapshot", "--top", "0", *receipt])
+            last.assert_not_called()
+            gd.main(["--pressure", "--no-snapshot", "--top", "0", *receipt])  # a report
+            last.assert_not_called()
+            gd.main(["--pressure", "--apply", "--no-snapshot", "--top", "0", *receipt])
+            last.assert_called_once()
+            self.assertEqual(last.call_args.args[1], 30.0)
+
     def test_job_busy_ignores_wide_runner_build_trees(self) -> None:
         home, fams = self._runner_checkouts()
         target = home / "actions-runner-glaeda/_work/cmux/cmux/cmux-tui/target"
