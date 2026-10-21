@@ -318,6 +318,18 @@ class UpdateTest(unittest.TestCase):
         self.assertIn("cannot read attestations", why)
         sleep.assert_not_called()
 
+    def test_a_gh_without_the_attestation_command_is_unavailable_not_failed(self) -> None:
+        # huge-blue, 2026-10-21: apt's gh 2.45 quarantined a good stable release
+        for said in ('unknown command "attestation" for "gh"\n\nUsage:  gh <command> <subcommand> [flags]',
+                     "unknown flag: --source-ref\n\nUsage:  gh attestation verify"):
+            run = self.gh((0, ""), (1, said))
+            with mock.patch.object(gu, "find_gh", return_value="/usr/bin/gh"), \
+                    mock.patch.object(gu, "rate_limit_reset", return_value=None), \
+                    mock.patch.object(gu.subprocess, "run", run), mock.patch.object(gu.time, "sleep"):
+                verdict, why = self.saved[1](Path("/tmp/a.tar.gz"))
+            self.assertIsNone(verdict, said)
+            self.assertIn("too old", why)
+
     def test_a_failure_waits_out_a_spent_quota_a_success_does_not(self) -> None:
         # a failure that is not posted lets another canary's success promote the release 15 minutes later
         config = {**self.config, "reportStatus": True}
