@@ -463,6 +463,21 @@ class Tailscale(Base):
         self.mini.route = None
         self.assertEqual(self.run_once()["findings"], [])
 
+    def test_a_runner_host_without_any_tailscale_cli_is_a_warning_not_healthy(self) -> None:
+        self.mini.ts = None  # neither /usr/local/bin/tailscale nor the app bundle's CLI
+        report = self.run_once()
+        self.assertEqual(self.ids(report), ["tailscale_cli_missing"])
+        f = report["findings"][0]
+        self.assertEqual((f["severity"], f["auto_fix"]), ("warn", "impossible"))
+        self.assertIn(health.TAILSCALE_STANDALONE, f["evidence"])
+        self.assertIn(health.TAILSCALE_APP, f["evidence"])
+        self.run_once(NOW + 120)
+        self.assertEqual(self.mini.did, [])
+
+    def test_a_host_without_runners_or_tailscale_reports_nothing(self) -> None:
+        self.mini.ts, self.mini.agents = None, []
+        self.assertEqual(self.run_once()["findings"], [])
+
     def test_no_backend_state_is_a_probe_error_never_a_heal(self) -> None:
         self.mini.ts = ("app", None, "Tailscale status --json exited 0 without a BackendState: The Tailscale GUI "
                         "failed to start")

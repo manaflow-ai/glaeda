@@ -29,6 +29,9 @@ Each run checks, as the runner user and without sudo:
                                      runs in a row (one when run by hand), never healed: the fix is a stop and
                                      start of the Tailscale VPN service (a kickstart of a standalone tailscaled),
                                      which its owner does.
+  tailscale_cli_missing              a host with runner LaunchAgents has no Tailscale CLI at all (neither the
+                                     standalone /usr/local/bin/tailscale nor the app bundle's): the tunnel is not
+                                     checked, which is no answer, not a healthy tunnel. Reported only.
   tailscale_probe_error              the Tailscale CLI gave no BackendState (it timed out, failed or printed no JSON;
                                      a loaded mini can time out with the tunnel up). The check could not look, so the
                                      tunnel is not judged down: reported only, never healed.
@@ -595,8 +598,12 @@ def check_testmanagerd(mini: Mini, now: float) -> list[dict[str, Any]] | None:
 
 def check_tailscale(mini: Mini) -> list[dict[str, Any]]:
     got = mini.tailscale()
-    if got is None:
-        return []
+    if got is None:  # a runner host is on the tailnet: no CLI to ask is no answer, not a healthy tunnel
+        if not mini.runner_agents():
+            return []
+        return [finding("tailscale_cli_missing", "warn", f"no Tailscale CLI at {TAILSCALE_STANDALONE} (standalone) "
+                        f"or {TAILSCALE_APP} (app) on a runner host: the tunnel is not checked", "impossible",
+                        "install Tailscale (the standalone tailscaled or the app) as the mini's setup does")]
     if got[1] == "Running":
         via = mini.tailnet_route()
         if via is None or via.startswith("utun"):
