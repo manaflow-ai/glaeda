@@ -214,6 +214,25 @@ class Reconcile(Base):
         self.assertEqual(self.run_for(0.5), [])
 
 
+class Guards(Base):
+    def test_never_signals_launchd_or_the_kernel(self) -> None:
+        ok, what = heal.restart(self.host, self.policy, FSEV, 1)
+        self.assertFalse(ok)
+        self.assertIn("refusing", what)
+        self.assertEqual(self.host.signals, [])
+
+    def test_install_refuses_bytes_that_are_not_the_release(self) -> None:
+        with self.assertRaisesRegex(heal.HealError, "script sha256 .* is not the expected"):
+            heal.install(POLICY_PATH, True, expect_sha256="0" * 64)
+        with self.assertRaisesRegex(heal.HealError, "policy sha256 .* is not the expected"):
+            heal.install(POLICY_PATH, True, expect_policy_sha256="0" * 64)
+        good = heal.sha256((ROOT / "scripts" / "glaeda-daemon-heal").read_bytes())
+        with self.assertRaisesRegex(heal.HealError, "not 64 hex digits"):
+            heal.install(POLICY_PATH, True, expect_sha256="nothex")
+        with self.assertRaisesRegex(heal.HealError, "policy sha256"):  # shasum's "<hash>  -" is accepted for the script
+            heal.install(POLICY_PATH, True, expect_sha256=good + "  -", expect_policy_sha256="0" * 64)
+
+
 class Install(unittest.TestCase):
     def test_launchdaemon_runs_the_root_snapshot_with_system_python_at_the_policy_interval(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -235,6 +254,10 @@ class Install(unittest.TestCase):
             plist.write_bytes(want["plist"])
             status = heal.install_status(POLICY_PATH, d, plist)
             self.assertTrue(status["installed"] and status["current"], status)
+            self.assertFalse(status["reportFresh"], "no report yet: the daemon has not run a pass")
+            (want["state_dir"]).mkdir()
+            (want["state_dir"] / "report.json").write_text("{}")
+            self.assertTrue(heal.install_status(POLICY_PATH, d, plist)["reportFresh"])
             (d / "macos-daemons.json").write_text("{}")
             self.assertEqual(heal.install_status(POLICY_PATH, d, plist)["stale"], [os.fspath(d / "macos-daemons.json")])
 

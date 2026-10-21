@@ -129,7 +129,8 @@ class FakeMini(health.Mini):
 
     def install_daemon_heal(self):
         self.did.append("install daemon-heal")
-        self.heal_status = {**(self.heal_status or {}), "installed": True, "current": True}
+        self.heal_status = {**(self.heal_status or {}), "installed": True, "current": True, "loaded": True,
+                            "reportFresh": True}
         return True, "sudo -n glaeda-daemon-heal --install --apply: applied"
 
 
@@ -541,13 +542,66 @@ class DaemonHeal(Base):
                                              "hot_for_s": 5400, "waiting": "restarts at 2 h"}],
                                     "healed": [{"name": "audiomxd", "t": NOW - 60, "at": "a", "since": "s",
                                                 "cores": 1.1, "action": "audiomxd pid 5 stopped (SIGTERM)"}]}))
-        self.mini.heal_status = {"installed": True, "current": True, "report": os.fspath(root)}
+        self.mini.heal_status = {"installed": True, "current": True, "loaded": True, "reportFresh": True,
+                                 "report": os.fspath(root)}
         r = self.run_once()
         f = r["findings"]
         self.assertEqual([x["id"] for x in f], ["daemon_hot:fseventsd"])
         self.assertEqual([(h["id"], h["auto_fix"]) for h in r["healed"]], [("daemon_hot:audiomxd", "done")])
         self.assertIn("1.5 h", f[0]["evidence"])
         self.assertIn("restarts at 2 h", f[0]["note"])
+
+
+class DaemonHealLiveness(Base):
+    """An installed copy that is unloaded, or whose passes stopped, is no healthy healer."""
+
+    def status(self, **kw) -> dict:
+        return {"installed": True, "current": True, "loaded": True, "reportFresh": True, "report": "/none", **kw}
+
+    def test_unloaded_healer_is_stale(self) -> None:
+        self.mini.heal_status = self.status(loaded=False)
+        f = self.run_once()["findings"][0]
+        self.assertEqual(f["id"], "daemon_heal_stale")
+        self.assertIn("not loaded", f["evidence"])
+
+    def test_old_report_means_passes_stopped(self) -> None:
+        self.mini.heal_status = self.status(reportFresh=False, reportAgeS=900)
+        self.assertIn("900 s old", self.run_once()["findings"][0]["evidence"])
+
+    def test_healthy_healer_is_no_finding(self) -> None:
+        self.mini.heal_status = self.status()
+        self.assertEqual(self.ids(self.run_once()), [])
+
+    def test_operator_command_pins_release_hashes(self) -> None:
+        self.mini.heal_status = self.status(loaded=False)
+        self.assertIn("--expect-sha256", self.run_once()["findings"][0]["note"])
+
+
+class PersonalMac(unittest.TestCase):
+    def status_with(self, update: dict | None) -> object:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            if update is not None:
+                (home / ".config/glaeda").mkdir(parents=True)
+                (home / ".config/glaeda/update.json").write_text(json.dumps(update))
+            mini = health.Mini(home)
+            mini.daemon_policy = lambda: health.SCRIPT_DIR.parent / "config/macos-daemons.json"
+            calls = []
+            orig = health.sh
+            health.sh = lambda argv, **kw: (calls.append(argv), (1, ""))[1]
+            try:
+                mini.daemon_heal_status()
+            finally:
+                health.sh = orig
+            return calls
+
+    def test_missing_update_config_or_setup_args_is_hygiene_only_like_glaeda_update(self) -> None:
+        if sys.platform != "darwin":
+            self.skipTest("the daemon healer is macOS-only")
+        self.assertEqual(self.status_with(None), [])
+        self.assertEqual(self.status_with({"ring": "stable"}), [])
+        self.assertEqual(self.status_with({"setupArgs": ["--hygiene-only"]}), [])
+        self.assertEqual(len(self.status_with({"setupArgs": []})), 1, "a fleet host asks the healer")
 
 
 class Parsing(unittest.TestCase):

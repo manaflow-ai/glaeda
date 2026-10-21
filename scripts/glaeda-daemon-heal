@@ -53,7 +53,8 @@ SYSTEM_PREFIXES = ("/System/", "/usr/libexec/", "/usr/sbin/", "/usr/bin/", "/sbi
 SYSTEM_UID_MAX = 499
 DAY_S = 86400
 POLICY_KEYS = {"every_s": int, "hot_cores": (int, float), "hot_hours": (int, float), "busy_hot_hours": (int, float),
-               "max_restarts_per_day": int, "stop_wait_s": (int, float), "busy": list, "daemons": list}
+               "max_restarts_per_day": int, "stop_wait_s": (int, float), "report_stale_passes": int, "busy": list,
+               "daemons": list}
 
 
 class HealError(RuntimeError):
@@ -159,6 +160,8 @@ def restart(host: Host, policy: dict[str, Any], daemon: dict[str, Any], pid: int
     def alive() -> bool:
         return any(p == pid and exe == daemon["path"] for p, _u, _c, exe in host.processes())
 
+    if pid <= 1:
+        return False, f"{daemon['name']} pid {pid}: refusing to signal launchd or the kernel"
     if not alive():
         return True, f"{daemon['name']} pid {pid} had already exited"
     host.signal(pid, signal.SIGTERM)
@@ -320,9 +323,27 @@ def install_status(policy_path: Path, install_dir: Path = INSTALL_DIR, plist_pat
     if read_bytes(plist_path) != want["plist"]:
         stale.append(os.fspath(plist_path))
     installed = (install_dir / SCRIPT_NAME).exists() and plist_path.exists()
+    report_path = want["state_dir"] / "report.json"
+    policy = validate_policy(json.loads(policy_path.read_bytes()))
+    try:
+        report_age = time.time() - report_path.stat().st_mtime
+    except OSError:
+        report_age = None
+    # The daemon writes its report every pass: older than report_stale_passes passes means it is not running.
+    fresh = report_age is not None and report_age <= policy["report_stale_passes"] * policy["every_s"]
     return {"schema": SCHEMA, "installed": installed, "current": not stale, "stale": stale,
+            "loaded": loaded(), "reportFresh": fresh,
+            "reportAgeS": None if report_age is None else round(report_age),
             "sha256": sha256(Path(__file__).read_bytes()), "policySha256": sha256(policy_path.read_bytes()),
-            "report": os.fspath(want["state_dir"] / "report.json")}
+            "report": os.fspath(report_path)}
+
+
+def loaded() -> bool | None:
+    """launchctl print system/LABEL (readable without root); None when launchctl could not answer."""
+    code, said = launchctl("print", f"system/{LABEL}")
+    if code == 0:
+        return True
+    return False if code in (36, 113) or "could not find service" in said.lower() else None
 
 
 def launchctl(*args: str) -> tuple[int, str]:
@@ -330,15 +351,31 @@ def launchctl(*args: str) -> tuple[int, str]:
     return code, (err or out).strip()[-200:]
 
 
-def install(policy_path: Path, apply: bool) -> dict[str, Any]:
+def install(policy_path: Path, apply: bool, expect_sha256: str | None = None,
+            expect_policy_sha256: str | None = None) -> dict[str, Any]:
+    want = desired_install(policy_path)
+    # These bytes become root's: check exactly them against the hashes the operator took from the release
+    # (first, so a wrong pin says so even when nothing would change).
+    script_bytes = want["files"][INSTALL_DIR / SCRIPT_NAME][0]
+    policy_bytes = want["files"][INSTALL_DIR / POLICY_NAME][0]
+    for what, data, expected in (("script", script_bytes, expect_sha256), ("policy", policy_bytes, expect_policy_sha256)):
+        if expected is None:
+            continue
+        pin = (expected.split() or [""])[0].lower()  # `shasum -a 256` prints "<hash>  -"
+        if not re.fullmatch(r"[0-9a-f]{64}", pin):
+            raise HealError(f"--expect-{what if what == 'policy' else 'script'} sha256 {expected!r} is not 64 hex digits")
+        if sha256(data) != pin:
+            raise HealError(f"{what} sha256 {sha256(data)} is not the expected {pin}; refusing to install")
     status = install_status(policy_path)
-    if not apply or status["current"] and launchctl("print", f"system/{LABEL}")[0] == 0:
+    if not apply or status["current"] and status["loaded"] and status["reportFresh"]:
         return {**status, "state": "unchanged" if status["current"] else "planned"}
     if os.geteuid() != 0:
         raise HealError("--install --apply needs root: the snapshot and the LaunchDaemon are root-owned")
-    want = desired_install(policy_path)
     for d in (INSTALL_DIR, want["state_dir"]):
         d.mkdir(mode=0o755, parents=True, exist_ok=True)
+        check_root_dir(d.parent)  # before chown/chmod: never follow a planted link with root's chown
+        if os.path.islink(d):
+            raise HealError(f"{d} is a symlink")
         os.chown(d, 0, 0)
         os.chmod(d, 0o755)
     check_root_dir(want["state_dir"])
@@ -350,7 +387,8 @@ def install(policy_path: Path, apply: bool) -> dict[str, Any]:
     if changed:
         launchctl("bootout", f"system/{LABEL}")
         atomic_write(PLIST, want["plist"], 0o644, root=True)
-    if changed or launchctl("print", f"system/{LABEL}")[0] != 0:
+    if changed or not status["loaded"] or not status["reportFresh"]:
+        launchctl("bootout", f"system/{LABEL}")  # loaded but not running its passes: load it afresh
         code, said = launchctl("bootstrap", "system", os.fspath(PLIST))
         if code != 0:
             raise HealError(f"launchctl bootstrap system {PLIST} failed: {said}")
@@ -380,12 +418,14 @@ def main(argv: list[str] | None = None) -> int:
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--install", action="store_true", help="install or update the root LaunchDaemon")
     mode.add_argument("--status", action="store_true", help="is the installed copy this one")
+    p.add_argument("--expect-sha256", help="--install: refuse unless this script's sha256 is this (from the release)")
+    p.add_argument("--expect-policy-sha256", help="--install: the same for the policy file")
     args = p.parse_args(argv)
     try:
         if args.status:
             out = install_status(args.policy)
         elif args.install:
-            out = install(args.policy, args.apply)
+            out = install(args.policy, args.apply, args.expect_sha256, args.expect_policy_sha256)
         else:
             out = run_pass(args.policy, args.state_dir, args.apply)
             if args.apply:

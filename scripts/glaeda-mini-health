@@ -81,6 +81,7 @@ HOME = Path.home()
 STATE_DIR = HOME / ".local/state/glaeda/mini-health"
 REPORT = STATE_DIR / "health.json"
 STATE = STATE_DIR / "state.json"
+NO_RUNNER_HEAL = STATE_DIR / "daemon-heal-attempt.json"  # the last daemon-heal reinstall on a host with no runner
 KILL_SWITCH = HOME / ".config/glaeda/mini-health.disabled"
 AGENTS = HOME / "Library/LaunchAgents"
 HELD = HOME / ".local/state/glaeda/mini-fleet/runner-held"  # cmux_mini_fix.sh runner_hold's marks
@@ -384,7 +385,8 @@ class Mini:
         if sys.platform != "darwin" or policy is None or not DAEMON_HEAL.is_file():
             return None
         # A personal Mac (mini-setup --hygiene-only) is no fleet host: its daemons are its owner's.
-        if "--hygiene-only" in (load_json(self.home / ".config/glaeda/update.json").get("setupArgs") or []):
+        # glaeda-update's own default: no setupArgs (or no update.json) means --hygiene-only.
+        if "--hygiene-only" in load_json(self.home / ".config/glaeda/update.json").get("setupArgs", ["--hygiene-only"]):
             return None
         code, out = sh([sys.executable, "-I", os.fspath(DAEMON_HEAL), "--status", "--policy", os.fspath(policy)])
         try:
@@ -609,9 +611,11 @@ def check_node_eligibility(mini: Mini) -> list[dict[str, Any]]:
 
 
 def daemon_heal_command(mini: Mini) -> str:
+    """The operator's root step. The hashes come from the release, not this host: the runner user can edit these files."""
     policy = mini.daemon_policy()
     return (f"sudo {SYSTEM_PYTHON} -I {DAEMON_HEAL} --install --policy {policy} --apply "
-            "(cmuxterm-hq: fleet sudo with that line)")
+            "--expect-sha256 $(git show <release commit this host runs>:scripts/glaeda-daemon-heal | shasum -a 256) "
+            "--expect-policy-sha256 $(git show <that commit>:config/macos-daemons.json | shasum -a 256)")
 
 
 def check_daemon_heal(mini: Mini) -> list[dict[str, Any]]:
@@ -619,12 +623,19 @@ def check_daemon_heal(mini: Mini) -> list[dict[str, Any]]:
     if status is None:
         return []
     out = []
-    if not status.get("current"):
-        missing = not status.get("installed")
-        out.append(finding("daemon_heal_stale", "warn",
-                           ("the root daemon-heal LaunchDaemon is not installed" if missing else
-                            "the root daemon-heal LaunchDaemon is not this release's copy: "
-                            + ", ".join(status.get("stale") or [])),
+    why = None
+    if not status.get("installed"):
+        why = "the root daemon-heal LaunchDaemon is not installed"
+    elif not status.get("current"):
+        why = "the root daemon-heal LaunchDaemon is not this release's copy: " + ", ".join(status.get("stale") or [])
+    elif status.get("loaded") is False:
+        why = "the root daemon-heal LaunchDaemon is installed but not loaded"
+    elif not status.get("reportFresh"):  # loaded, or launchctl could not say: an old report alone means no passes
+        age = status.get("reportAgeS")
+        why = ("the root daemon-heal LaunchDaemon is loaded but its report is "
+               + ("missing" if age is None else f"{age} s old") + ": its passes are not running")
+    if why:
+        out.append(finding("daemon_heal_stale", "warn", why,
                            "pending" if mini.sudo_ok() else "impossible",
                            "reinstalled with sudo -n" if mini.sudo_ok() else
                            "no passwordless sudo here; root: " + daemon_heal_command(mini)))
@@ -702,7 +713,7 @@ def heal_node_toolchain(mini: Mini, f: dict[str, Any]) -> tuple[bool, str]:
 def heal_daemon_heal(mini: Mini, f: dict[str, Any]) -> tuple[bool, str]:
     ok, what = mini.install_daemon_heal()
     status = mini.daemon_heal_status() if ok else None
-    return bool(status and status.get("current")), what
+    return bool(status and status.get("current") and status.get("loaded") is not False), what
 
 
 # code -> (heal, runs in a row seen before healing)
@@ -807,8 +818,12 @@ def main(argv: list[str] | None = None) -> int:
     if not mini.runner_dirs():
         # No runner report here, but the daemon healer serves every macOS host (the AWS dev-build hosts too).
         stale = [f for f in check_daemon_heal(mini) if f["code"] == "daemon_heal_stale"]
-        healed = heal_daemon_heal(mini, stale[0]) if (args.apply and stale and stale[0]["auto_fix"] == "pending"
-                                                       and not KILL_SWITCH.exists()) else None
+        last = load_json(NO_RUNNER_HEAL).get("at") or 0
+        due = time.time() - last >= HEAL_EVERY_S  # the same pace as a runner host's heals
+        healed = None
+        if args.apply and stale and stale[0]["auto_fix"] == "pending" and due and not KILL_SWITCH.exists():
+            healed = heal_daemon_heal(mini, stale[0])
+            write_json(NO_RUNNER_HEAL, {"at": time.time(), "ok": healed[0], "action": healed[1]})
         if not args.apply:
             print(json.dumps({"schema": SCHEMA, "skipped": "no glaeda runner on this host",
                               "findings": [f["id"] for f in stale]}))
