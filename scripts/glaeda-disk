@@ -550,6 +550,10 @@ CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
     "SDKExplicitPrecompiledModules", "CompilationCache.noindex", "info.plist",
     ".metadata_never_index",
+    # cmux scripts/ci/swiftpm-binary-module-guard.sh's header digest, which cmux's own
+    # clear-stale-scheme-build-state.sh keeps beside SourcePackages: unknown, it vetoed every state root as
+    # in use on every pass (cmux11s and cmux9s, 2026-10-21: 19-21 GiB of Build never reclaimable)
+    ".cmux-binary-module-inputs",
 })
 CMUX_NEXT_CI_GENERATED_NAMES = frozenset({
     "Build", "Index.noindex", "Logs", "Products", "Intermediates.noindex",
@@ -679,6 +683,29 @@ def remove_spm_scratch(path: Path) -> bool:
 # the SwiftPM scratch no job holds goes whatever its age: it rebuilds in minutes, and the runner floor is near.
 EMERGENCY_DEVS: frozenset[int] = frozenset()
 
+# Filesystems (device -> free bytes to stop at) where the runner gate holds runners for disk in this pressure
+# run: free is under the hooks' --min-free-gib plus GATE_DISK_RESUME_GIB (a held runner resumes only above that).
+# Idle runners' build output need not wait out RUNNER_BUILD_IDLE_HOURS there: it goes at once, after everything
+# else apply would take, and only up to the floor plus target_margin_gib, so the rest keep warm builds. What
+# keeps a job's output is the fresh ps before each delete (a Runner.Worker exists before the job's checkout),
+# not the gate: a runner that was never held can still take a job between the floor and the resume mark. cmux11s and cmux9s sat at 8-25 GiB under a 30 GiB floor with 25-40 GiB of it
+# "recent" while the gate held every runner idle (2026-10-21).
+FLOOR_HOLD: dict[int, int] = {}
+GATE_DISK_RESUME_GIB = 2.0  # glaeda-cmux-runner-hook's: a disk hold ends only this far above the floor
+
+
+def floor_hold(fss: "dict[int, Fs]", floor_gib: float, home: Path | None = None) -> dict[int, int]:
+    if floor_gib <= 0:
+        return {}
+    try:
+        dev = (HOME if home is None else home).stat().st_dev
+    except OSError:
+        return {}
+    fs = fss.get(dev)
+    if fs is None or fs.tmpfs or fs.free >= (floor_gib + GATE_DISK_RESUME_GIB) * GIB:
+        return {}
+    return {dev: min(int((floor_gib + POLICY["target_margin_gib"]) * GIB), fs.total // 2)}
+
 
 def emergency_devs(fss: "dict[int, Fs]", emergency: str, floor_gib: float = 0.0) -> frozenset[int]:
     return frozenset(fs.dev for fs in fss.values() if fs.free < emergency_bytes(fs, emergency, floor_gib))
@@ -730,8 +757,8 @@ def archived_seeds(log: Path | None = None) -> frozenset[str]:
 def item_window(fam: Family, path: Path, idle_hours: float, archived: frozenset[str] = frozenset()) -> float:
     """The idle window for one candidate: a seed the archive already holds may go at once (the newest of each
     root still stay, by keep_verdict), and SwiftPM scratch left in the trash or under the emergency floor
-    (EMERGENCY_DEVS) may go at once (its lock keeps what a job holds). Everything else waits out its family's
-    window."""
+    (EMERGENCY_DEVS) may go at once (its lock keeps what a job holds), and so may an idle runner's build output
+    while the runner gate holds for disk (FLOOR_HOLD). Everything else waits out its family's window."""
     if fam.id == "cmux-seeds" and path.name in archived:
         return 0.0
     if fam.id == CMUX_NEXT_CI_FAMILY and CMUX_NEXT_CI_DRAIN:
@@ -741,6 +768,10 @@ def item_window(fam: Family, path: Path, idle_hours: float, archived: frozenset[
             return 0.0
         with contextlib.suppress(OSError):
             if fam.root.stat().st_dev in EMERGENCY_DEVS:
+                return 0.0
+    if fam.id == RUNNER_BUILD_FAMILY:
+        with contextlib.suppress(OSError):
+            if fam.root.stat().st_dev in FLOOR_HOLD:
                 return 0.0
     return idle_window(fam, idle_hours)
 
@@ -1570,7 +1601,7 @@ def evict_idle_runner_checkouts(receipt: Path, floor_gib: float, home: Path | No
         free, total = free_bytes(home)
     except OSError:
         return 0
-    if free >= floor_gib * GIB:  # the gate is not holding for disk: whole checkouts stay
+    if free >= (floor_gib + GATE_DISK_RESUME_GIB) * GIB:  # the gate is not holding for disk: whole checkouts stay
         return 0
     target = min(int((floor_gib + POLICY["target_margin_gib"]) * GIB), total // 2)  # as filesystems() sets it
     now = time.time()
@@ -5575,6 +5606,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
     archived = archived_seeds() if any(i.family == "cmux-seeds" for i in items) else frozenset()
     # Among pressure hot-tier items, evict greatest reuse distance, then oldest use.
     def order(i):
+        if i.family == RUNNER_BUILD_FAMILY and i.idle_hours < idle_window(family_of(i), idle_hours):
+            return (-1, 0, i.idle_hours, i.bytes)  # reclaimable only by FLOOR_HOLD: warm builds go last
         if i.family == RUNNER_GIT_GARBAGE_FAMILY:  # garbage nothing reads goes before anything that costs a rebuild
             return (2, 0, i.idle_hours, i.bytes)
         if ACTIVITY_MODE == "pressure" and (i.family in FLEET_FAMILY_IDS or i.family == RUNNER_BUILD_FAMILY):
@@ -5601,6 +5634,14 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             except OSError:
                 continue
             if dev not in targets or free_bytes(p.parent)[0] >= targets[dev]:
+                continue
+        if fam.id == RUNNER_BUILD_FAMILY and i.idle_hours < idle_window(fam, idle_hours):
+            # reclaimable only by the floor hold: it stops at the floor plus target_margin_gib
+            try:
+                stop = FLOOR_HOLD.get(p.parent.stat().st_dev)
+                if stop is None or free_bytes(p.parent)[0] >= stop:
+                    continue
+            except OSError:
                 continue
         # fresh re-observation right before the destructive step. cmux jobs clone their warm state with
         # `cp -cR SOURCE ...` at any moment and a clone leaves the source's times alone, so those families
@@ -6387,10 +6428,11 @@ def _main_impl(argv: list[str] | None = None) -> int:
         if not idle_due():
             print(f"idle sweep: the last one ran within {IDLE_SWEEP_EVERY_S // 60} min")
             return 0
-    global ACTIVITY_MODE, EMERGENCY_DEVS
+    global ACTIVITY_MODE, EMERGENCY_DEVS, FLOOR_HOLD
     ACTIVITY_MODE = "sweep" if sweep else "pressure" if a.pressure else None
     # the idle sweep judges by reuse windows alone; a pressure run or a report sees the emergency floor
     EMERGENCY_DEVS = frozenset() if sweep else emergency_devs(fss, a.emergency, floor_gib)
+    FLOOR_HOLD = floor_hold(fss, floor_gib) if ACTIVITY_MODE == "pressure" else {}
     busy = host_busy() if sweep else ""
     if sweep:
         print(f"idle sweep: {'host busy, ' + busy if busy else 'host idle'}")

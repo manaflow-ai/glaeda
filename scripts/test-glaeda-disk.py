@@ -66,6 +66,7 @@ class GlaedaDiskTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         gd.process_evidence = self.gd_evidence
+        gd.FLOOR_HOLD = {}  # a main() pressure run in a test sets it
         gd.NESTED_KEEP.unlink(missing_ok=True)
         gd.NESTED_KEEP = self.gd_keep
         self.tmp.cleanup()
@@ -1608,6 +1609,18 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(got[0].verdict, "in-use")
         self.assertIn("unknown children", got[0].reasons[0])
 
+    def test_cmux_next_ci_preserves_the_binary_module_guard_digest(self) -> None:
+        # cmux's swiftpm-binary-module-guard.sh writes it beside SourcePackages; it is not an unknown owner
+        root = self.root / "Library/Caches/cmux-next-ci"
+        state = root / "cmux-scheme/runner-a"
+        build = make(state / "Build", age_hours=96)
+        (state / ".cmux-binary-module-inputs").write_text("0" * 64 + "\n")
+        fam = gd.cmux_next_ci_family(root)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            got = gd.survey([fam], 24, 0)
+        self.assertEqual(got[0].path, str(build))
+        self.assertNotEqual(got[0].verdict, "in-use")
+
     def test_cmux_next_ci_preserves_compilation_cache_child(self) -> None:
         root = self.root / "Library/Caches/cmux-next-ci"
         state = root / "cmux-scheme/runner-a"
@@ -2727,6 +2740,48 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(v[idle + "cmux-tui/target"], ("kept", ["runner build output: pressure-only policy"]))
         self.assertEqual(v[idle + ".git/objects/pack/tmp_pack_Ab12Cd"][0], "reclaimable")
 
+    def test_runner_build_output_goes_at_once_under_the_runner_floor(self) -> None:
+        home, fams = self._runner_checkouts()
+        fams = [f for f in fams if f.id == gd.RUNNER_BUILD_FAMILY]
+        for name in ("actions-runner-glaeda", "actions-runner-glaeda-2"):
+            self._age(home / name / "_work", hours=0.2)  # built minutes ago, then the disk went under the floor
+        worker = f"{home}/actions-runner-glaeda-2/bin/Runner.Worker spawnclient 1 2\n"
+        gd.process_evidence = lambda: ([], worker)
+        dev = home.stat().st_dev
+        idle = "actions-runner-glaeda/_work/cmux/"
+        live = "actions-runner-glaeda-2/_work/cmux/cmux/"
+
+        def verdicts(hold):
+            with mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "FLOOR_HOLD", hold):
+                return {str(Path(i.path).relative_to(home)): i.verdict for i in gd.survey(fams, 6, 0)}
+        self.assertEqual(verdicts({})[idle + "cmux/cmux-tui/target"], "recent")  # above the floor: the hour stands
+        v = verdicts({dev: 50 * gd.GIB})
+        for rel in ("cmux/Packages/macOS/CmuxNext/.build", "cmux/Packages/Shared/.build", "cmux/cmux-tui/target",
+                    ".glaeda-state/ios-e2e-mac-derived-data"):
+            self.assertEqual(v[idle + rel], "reclaimable", rel)
+        self.assertEqual(v[live + "cmux-tui/target"], "in-use")  # a runner with a job keeps its output
+        # apply stops at the floor plus target_margin_gib (50 GiB here): 25 -> 35 -> 45 -> 55, one item stays
+        patches, removed = self._floor_disk(25.0)
+        with patches[0], patches[1], mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), \
+                mock.patch.object(gd, "FLOOR_HOLD", {dev: 50 * gd.GIB}), \
+                mock.patch.object(gd, "command_lines", return_value=worker), \
+                contextlib.redirect_stdout(io.StringIO()):
+            items = gd.survey(fams, 6, 0)
+            gd.apply(items, {f.id: f for f in fams}, self.receipt(), None, 6, all_families=fams)
+        self.assertEqual(len(removed), 3)
+        self.assertTrue(all(r.startswith(str(home / idle)) for r in removed))
+        self.assertTrue((home / live / "cmux-tui/target").exists())
+
+    def test_floor_hold_only_below_the_gates_resume_mark(self) -> None:
+        dev = self.root.stat().st_dev
+
+        def fss(free_gib, tmpfs=False):
+            return {dev: gd.Fs(dev, "/", int(free_gib * gd.GIB), 460 * gd.GIB, 0, 0, tmpfs)}
+        self.assertEqual(gd.floor_hold(fss(31.9), 30.0, self.root), {dev: 50 * gd.GIB})  # floor 30 + margin 20
+        self.assertEqual(gd.floor_hold(fss(32.0), 30.0, self.root), {})  # the gate has let go
+        self.assertEqual(gd.floor_hold(fss(10.0), 0.0, self.root), {})  # no runner floor
+        self.assertEqual(gd.floor_hold(fss(10.0, tmpfs=True), 30.0, self.root), {})
+
     def test_runner_git_garbage_younger_than_an_hour_or_open_stays(self) -> None:
         home, fams = self._runner_checkouts()
         co = home / "actions-runner-glaeda/_work/cmux/cmux"
@@ -2829,12 +2884,20 @@ class GlaedaDiskTest(unittest.TestCase):
 
     def test_idle_runner_checkouts_stay_while_above_the_floor(self) -> None:
         home, cos = self._idle_checkouts({"actions-runner-glaeda": 5, "actions-runner-glaeda-2": 5})
-        patches, removed = self._floor_disk(31.0)
+        patches, removed = self._floor_disk(32.5)  # over the gate's resume mark (floor + GATE_DISK_RESUME_GIB)
         with patches[0], patches[1]:
             self.assertEqual(gd.evict_idle_runner_checkouts(self.receipt(), 30.0, home), 0)
             self.assertEqual(gd.evict_idle_runner_checkouts(self.receipt(), 0.0, home), 0)  # no runner floor
         self.assertEqual(removed, [])
         self.assertTrue(all(c.is_dir() for c in cos.values()))
+
+    def test_idle_runner_checkouts_go_between_the_floor_and_the_gates_resume_mark(self) -> None:
+        # the gate holds until floor + 2 GiB; at 31 GiB it still holds, so the last resort still acts
+        home, cos = self._idle_checkouts({"actions-runner-glaeda": 5, "actions-runner-glaeda-2": 5})
+        patches, removed = self._floor_disk(31.0)
+        with patches[0], patches[1], contextlib.redirect_stdout(io.StringIO()):
+            self.assertGreater(gd.evict_idle_runner_checkouts(self.receipt(), 30.0, home), 0)
+        self.assertTrue(removed)
 
     def test_idle_runner_checkouts_go_least_recently_used_first_until_the_target(self) -> None:
         home, cos = self._idle_checkouts({"actions-runner-glaeda": 3, "actions-runner-glaeda-2": 9,
