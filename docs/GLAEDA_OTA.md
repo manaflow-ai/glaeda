@@ -57,8 +57,9 @@ but still installs through `glaeda-mini-fleet upgrade` (below).
    On a runner mini, each run (not only one that installs a release) then brings
    `~/glaeda-runner/scripts` to the installed release when it is older, and the runners'
    `glaeda-hooks/glaeda-cmux-runner-hook` and `glaeda_reservation.py` too when theirs are versions the
-   release descends from (`glaeda-cmux-runner --refresh-hooks`, docs/CMUX_MINI_RUNNER.md 2c). Runners
-   with a job wait for the next run; the listener gates re-exec the new hook themselves. The hygiene
+   release descends from (`glaeda-cmux-runner --refresh-hooks`, docs/CMUX_MINI_RUNNER.md 2c). A runner
+   with a job is swapped in its next gap between jobs (watched up to 4 minutes; after that its
+   job-completed installs the staged new hook); the listener gates re-exec the new hook themselves. The hygiene
    archive carries `ancestry.txt` (the source's ancestors: a copy an operator staged from one is
    refreshed, a newer one kept) and `hook-history.json` (the SHA-256 of every version of those two
    files, so a newer hook is never downgraded). The canary hosts run no runners, so a hook change is

@@ -65,7 +65,8 @@ What one run does, and what it refuses:
    release's bytes, atomically, and nothing else (registration, labels, wrappers, LaunchAgents and
    receipts stay). Only a hook whose bytes are a version the release descends from (its
    hook-history.json) is replaced, so a hook an operator installed from a newer main is never
-   downgraded. A runner with a job is done on a later run. Each listener gate sees its hook change and
+   downgraded. A runner with a job is watched up to 4 minutes for a gap between jobs; after that the new hook
+   is staged for that job's job-completed to install. Each listener gate sees its hook change and
    re-execs it, keeping its runner.
 
 8. Convergence (converge.json beside state.json, glaeda-ota-converge/v1): after every --apply run

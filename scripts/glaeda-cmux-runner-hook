@@ -745,6 +745,10 @@ ADMITTED_EVENTS = ("push", "pull_request", "merge_group", "workflow_dispatch", "
 # The only fork trusted to run on the PR minis. Keep this a single narrow allowlist; add team accounts deliberately.
 ALLOWED_FORK_REPOS = frozenset({"teamleaderleo/cmux"})
 PREFIX = "glaeda-cmux-runner-hook"
+# glaeda-cmux-runner --refresh-hooks stages a new hook beside this one while the runner has a job (its NEXT_SUFFIX and
+# NEXT_RECORD; a test keeps the names equal), and job-completed installs it (install_staged_hook).
+NEXT_SUFFIX = ".next"
+NEXT_RECORD = ".hook-next.json"
 # listen: the runner LaunchAgent runs run.sh under this gate. While the fleet holds or wants the host
 # (an exclusive host lock, a process waiting for it, or a reservation), an idle runner stops listening,
 # so GitHub hands its jobs to another runner instead of here, where job-started would refuse them.
@@ -5500,7 +5504,56 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_disk and not skip_disk:
         note = disk_pressure_detached(args.disk) if args.phase == "job-completed" else disk_pressure(args.disk)
         print(f"{PREFIX}: {note}", flush=True)
+    if args.phase == "job-completed":  # last: between this job and the next
+        note = install_staged_hook(Path(__file__).resolve().parent)
+        if note:
+            print(f"{PREFIX}: {note}", flush=True)
     return 0
+
+
+def install_staged_hook(hook_dir: Path) -> str | None:
+    """job-completed: install the hook (and module) --refresh-hooks staged while this runner had a job, or None when
+    nothing is staged. The job is over, so the next job-started runs the new file whole, and the listener gate sees
+    the change and reloads. A stage whose bytes are not the ones recorded, or that would replace another hook than the
+    one it was checked against (an --apply wrote a newer one since), is dropped."""
+    hook, module = hook_dir / PREFIX, hook_dir / "glaeda_reservation.py"
+    staged, staged_module, record_path = (hook_dir / f".{hook.name}{NEXT_SUFFIX}",
+                                          hook_dir / f".{module.name}{NEXT_SUFFIX}", hook_dir / NEXT_RECORD)
+    if not staged.exists() and not record_path.exists():
+        return None
+
+    def drop(why: str) -> str:
+        for path in (staged, staged_module, record_path):
+            with contextlib.suppress(OSError):
+                path.unlink()
+        return f"dropped the hook --refresh-hooks staged: {why}"
+
+    try:
+        record = json.loads(record_path.read_text())
+        st = os.lstat(staged)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+            return drop("not a regular file owned by this user")
+        if not isinstance(record, dict) or hashlib.sha256(staged.read_bytes()).hexdigest() != record.get("hook"):
+            return drop("it is not the file the refresh checked")
+        if hashlib.sha256(hook.read_bytes()).hexdigest() != record.get("replaces"):
+            return drop("the installed hook changed since it was staged")
+        if record.get("module"):
+            st = os.lstat(staged_module)
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() \
+                    or hashlib.sha256(staged_module.read_bytes()).hexdigest() != record["module"]:
+                return drop("the staged module is not the file the refresh wrote")
+            os.replace(staged_module, module)  # the module first: the hook lands only beside the module it reads
+        os.replace(staged, hook)
+        record_path.unlink()
+    except (OSError, ValueError) as error:
+        return drop(f"{type(error).__name__}: {error}"[:200])
+    with contextlib.suppress(OSError):
+        fd = os.open(hook_dir, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    return "installed the hook --refresh-hooks staged while this runner had a job; the gate reloads it"
 
 
 if __name__ == "__main__":

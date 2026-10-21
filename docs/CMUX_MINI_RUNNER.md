@@ -493,7 +493,7 @@ older) fails the `scriptCopy` preflight: the plan is not ready, `--apply` is ref
 note names the release's own copy to run, and the release's plan labels are shown as
 `label drift (release ...)`. `--allow-stale` overrides. `glaeda-cmux-runner-fleet`
 writes the stamp when it stages; `glaeda-update` refreshes an older staged copy from the
-installed release every hour, and keeps a copy an operator staged on the release's day
+installed release on every run (every 10 minutes), and keeps a copy an operator staged on the release's day
 or later unless the release descends from the stamp's commit.
 
 Job completion also considers detached `cmux-ci-media-*` TUI and screen-detection
@@ -503,20 +503,28 @@ is live, and rechecks the complete command and process start identity before
 each signal. It runs as the build user and handles at most 16 processes per
 completed job; a busy host defers cleanup to a later completion.
 
-**Hook fixes roll out without `--apply`.** Every hour `glaeda-update` also runs the
-installed release's `glaeda-cmux-runner --refresh-hooks --apply`. In each runner directory
+**Hook fixes roll out without `--apply`.** Every `glaeda-update` run that installs or finds its
+release current (every 10 minutes, its `APPLY_EVERY_S`) also runs the installed release's `glaeda-cmux-runner --refresh-hooks --apply`. In each runner directory
 a receipt owns, it writes `glaeda-hooks/glaeda-cmux-runner-hook` and
 `glaeda_reservation.py` atomically and synced (0755 and 0644, the module first) and nothing
 else, so no registration token or org-admin access is needed. It replaces only a file whose
 bytes are a version the release descends from (the release's `hook-history.json`); a hook
 installed from a newer main, or edited, is `kept`. A runner with a `Runner.Worker` (or
-where pgrep cannot tell) is `deferred` to the next run, checked again right before the
-swap. The new hook is staged in `glaeda-hooks/` and must `--parse-only` every hook call in
+where pgrep cannot tell) is watched for up to 4 minutes (`REFRESH_GAP_WAIT_S`) and swapped
+in the first gap between two jobs, checked again right before the swap. One still busy after
+that is `deferred`, and the checked new files are staged beside the old ones
+(`.glaeda-cmux-runner-hook.next`, `.glaeda_reservation.py.next` and `.hook-next.json`, which
+names the hook they replace): that job's own job-completed installs them as its last step, so
+the next job-started runs the new file whole and the gate reloads it. A stage that would replace
+another hook (an `--apply` wrote one since) is dropped. (One look per run left runners that ran
+jobs back to back on a hook two releases old for hours, and such a runner's old gate still runs
+in the gaps between its jobs.) While it waits, the refresh holds the runner lock, so an
+`--apply` can wait up to 4 minutes. The new hook is staged in `glaeda-hooks/` and must `--parse-only` every hook call in
 the installed wrappers (job-started, job-completed, listen, take-root, take-gui) under the
 wrapper's own interpreter, or the runner is `blocked`, since a rejected job-started would
 fail every job. `--apply`, `--uninstall` and `--refresh-hooks` share one lock
 (`~/.local/state/glaeda/cmux-runner/runner.lock`); a refresh that finds it held waits for
-the next hour. The listener
+the next run. The listener
 gate notices the new file and re-execs it, adopting its running `run.sh` ("the hook
 changed; reloading the gate"). Wrapper, label or LaunchAgent changes still need
 `--apply`. From an operator Mac, cmuxterm-hq's `fleet runner relabel HOST` stages glaeda's
