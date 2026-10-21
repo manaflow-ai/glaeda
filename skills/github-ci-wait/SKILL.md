@@ -111,7 +111,7 @@ the same way: `held: ... cancelled before any step ran`.
 For a bot's reply, such as the callsign receipt on teamleaderleo/stensibly#454:
 
 ```bash
-url=$(gh issue comment 454 --repo teamleaderleo/stensibly --body "/callsign reserve ...")
+url=$(glaeda-gh post comment teamleaderleo/stensibly#454 --body "/callsign reserve ..." --wait 300)
 glaeda-gh wait comment teamleaderleo/stensibly#454 --author 'github-actions[bot]' \
   --match "${url##*#}\b" --since "$url" --timeout 300
 ```
@@ -124,6 +124,26 @@ glaeda-gh wait comment teamleaderleo/stensibly#454 --author 'github-actions[bot]
 - It prints the first matching comment (URL and body) and exits 0. A reply on a repo the
   controller receives webhooks for (teamleaderleo/stensibly among them) arrives within seconds;
   otherwise the daemon reads the latest 50 comments every 15 s while someone waits.
+
+## Posting comments, PRs and reviews: glaeda-gh post
+
+GitHub limits content creation account-wide ("was submitted too quickly"). When every session
+posts and retries on its own, they keep tripping the limit for each other. Queue the write instead:
+
+```bash
+glaeda-gh post comment OWNER/REPO#N --body-file - <<'EOF'      # prints "queued as ID; ..." and returns
+...
+EOF
+glaeda-gh post pr OWNER/REPO --head BRANCH --base main --title "..." --body-file body.md [--reviewer LOGIN]
+glaeda-gh post review OWNER/REPO#N --event approve|comment|request-changes --body-file -
+glaeda-gh post status ID [--wait 300]        # the URL once posted (0), failed (1), still queued (2)
+```
+
+The daemon sends one write every few seconds, oldest first. When GitHub says to slow down, it
+waits out Retry-After for every queued write. The write stays queued after your session ends.
+Add `--wait S` when you need the URL right away (a PR number to claim, a comment URL for
+`wait comment --since`). Do not retry a `gh` write that failed with "submitted too quickly":
+queue it with `post`.
 
 ## When the daemon is down or hung
 
@@ -159,7 +179,7 @@ meanwhile use single `gh` reads, never a polling loop.
 
 ## Fine to do directly
 
-- Single reads, merges, comments, reviews, labels, and dispatches with `gh`.
+- Single reads, merges, labels, and dispatches with `gh`. Comments, PRs and reviews: `glaeda-gh post`.
 - Logs: `gh run view RUN_ID --log-failed` once a run has failed.
 - One-off reads across many PRs: a single batched GraphQL query with aliases
   (`p0: repository(owner:, name:) { pullRequest(number:) { ... } } p1: ...`) through `gh api graphql`.
