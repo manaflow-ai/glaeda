@@ -61,6 +61,13 @@ or dev-daily Release root.  Those children require a conservative 72-hour idle
 window plus a fresh process/lock/lease check; unknown children and all preserved
 inputs remain visible to accounting but are never deleted by this family.
 
+Each enrolled GitHub runner's checkout (~/actions-runner*/_work/<repo>/<repo>) has two families.
+runner-checkout-build is SwiftPM's Packages/*/.build and Packages/*/*/.build plus cargo-tagged target
+directories (cmux-tui/target), plus DerivedData a workflow keeps in $RUNNER_WORKSPACE/.glaeda-state
+(_work/<repo>/.glaeda-state/*derived-data*); it goes only under pressure, only while that runner has no Runner.Worker,
+an hour idle, least recently modified first. runner-git-garbage is git's tmp_pack_*/tmp_obj_* temp files an
+interrupted fetch left; one an hour old goes whenever nothing holds it open. The checkout itself stays.
+
 The runner-account profile is intentionally narrower than the normal user profile:
 it covers only DerivedData, cmux reload/GhosttyKit caches, and CUA recordings/frame
 caches, with a seven-day minimum idle age. Git index refreshes are ignored for that
@@ -1369,6 +1376,124 @@ def checkout_build_family(projects: Path, role: str = "fleet-mini") -> Family:
                   platform="shared")
 
 
+# A GitHub runner's checkout (~/actions-runner*/_work/<repo>/<repo>) keeps build output between jobs: SwiftPM's
+# Packages/<platform>/<package>/.build (~9 GiB per runner) and cmux-tui's cargo target (~20 GiB), plus git's temp
+# packs from fetches a cancelled job interrupted (up to 5 GiB). With 10-12 runners per mini that was 134-338 GiB
+# no family counted ("accounting gap") while glaeda-disk found 0.0G reclaimable under the 30 GiB runner floor
+# (cmux CI minis, 2026-10-20). Build output goes only under pressure and only while that runner has no
+# Runner.Worker (no job), least recently modified first; the next job on that runner rebuilds it. A temp pack an
+# hour old is garbage whatever the runner does: git writes it continuously and renames it when the fetch ends,
+# and a fetch still holding one open keeps it (open by a process).
+RUNNER_BUILD_FAMILY = "runner-checkout-build"
+RUNNER_GIT_GARBAGE_FAMILY = "runner-git-garbage"
+RUNNER_CHECKOUT_FAMILIES = frozenset({RUNNER_BUILD_FAMILY, RUNNER_GIT_GARBAGE_FAMILY})
+RUNNER_BUILD_IDLE_HOURS = 1.0
+GIT_GARBAGE_IDLE_HOURS = 1.0
+# odb_mkstemp's names (tmp_pack_, tmp_idx_, tmp_rev_, tmp_obj_, tmp_bitmap_, tmp_mtimes_) and repack's .tmp-<pid>-pack-*
+GIT_GARBAGE_NAME = re.compile(r"tmp_[a-z]+_[A-Za-z0-9]{6,}|\.tmp-[0-9]+-pack-.+")
+CARGO_TAG = re.compile(rb"^# This file is a cache directory tag created by cargo\.?\s*$", re.M)
+# Workflows keep DerivedData, SourcePackages and compilation caches in $RUNNER_WORKSPACE/.glaeda-state
+# (hq NEW-REPO-CI.md); only the DerivedData is build output (ios-e2e-mac-derived-data: 9.5 GiB on one runner).
+RUNNER_STATE_DERIVED_DATA = re.compile(r"(?i)derived-?data")
+
+
+def enrolled_runners(home: Path | None = None) -> list[Path]:
+    """The runner directories glaeda-cmux-runner installed: a .runner config and the glaeda hooks beside it."""
+    home = HOME if home is None else home
+    try:
+        found = sorted(home.glob("actions-runner*"))
+    except OSError:
+        return []
+    return [r for r in found if not r.is_symlink() and (r / ".runner").is_file() and (r / "glaeda-hooks").is_dir()]
+
+
+def runner_checkouts(work: Path) -> list[Path]:
+    """Each repository checkout in a runner's _work (_work/<repo>/<repo>); the runner's own _temp, _actions,
+    _tool and friends start with an underscore and are never checkouts."""
+    out = []
+    for repo in _children(work):
+        if repo.name.startswith("_") or repo.is_symlink() or not repo.is_dir():
+            continue
+        for checkout in _children(repo):
+            git = checkout / ".git"
+            if (not checkout.name.startswith("_") and not checkout.is_symlink() and not git.is_symlink()
+                    and git.is_dir() and contained_directory(checkout, work)):
+                out.append(checkout)
+    return sorted(out)
+
+
+def runner_checkout_builds(work: Path) -> list[Path]:
+    """SwiftPM .build directories below Packages/ and cargo target directories (tagged by cargo) at the top
+    of each checkout or one level down (cmux-tui/target), and DerivedData directories in each runner
+    workspace's .glaeda-state (never its SourcePackages or compilation cache). Fixed places, so no source
+    tree is walked."""
+    found: list[Path] = []
+    for workspace in _children(work):
+        state = workspace / ".glaeda-state"
+        if (workspace.name.startswith("_") or workspace.is_symlink() or not workspace.is_dir()
+                or state.is_symlink() or not state.is_dir()):
+            continue
+        found += [d for d in _children(state)
+                  if RUNNER_STATE_DERIVED_DATA.search(d.name) and d.is_dir() and not d.is_symlink()]
+    for checkout in runner_checkouts(work):
+        packages = checkout / "Packages"
+        if packages.is_dir() and not packages.is_symlink():
+            for pattern in ("*/.build", "*/*/.build"):
+                found += [b for b in packages.glob(pattern) if b.is_dir() and not b.is_symlink()]
+        for parent in [checkout, *(c for c in _children(checkout) if not c.name.startswith(".") and c.is_dir())]:
+            target = parent / "target"
+            if target.is_dir() and not target.is_symlink() and CARGO_TAG.search(_head(os.fspath(target / "CACHEDIR.TAG"), 256)):
+                found.append(target)
+    return sorted({p for p in found if contained_directory(p, work)})
+
+
+def runner_git_garbage(work: Path) -> list[Path]:
+    """Temp files git leaves in a checkout's object store when a fetch or repack dies: objects/pack/tmp_pack_*
+    and friends, and tmp_obj_* loose-object temp files in objects/ or one fan-out directory down."""
+    found: list[Path] = []
+    for checkout in runner_checkouts(work):
+        objects = checkout / ".git/objects"
+        if objects.is_symlink() or not objects.is_dir():
+            continue
+        dirs = [objects, objects / "pack", *(d for d in _children(objects) if len(d.name) == 2)]
+        for d in dirs:
+            if d.is_symlink() or not contained_directory(d, work):  # a git object store outside this runner's _work
+                continue
+            for e in _entries(d):
+                if GIT_GARBAGE_NAME.fullmatch(e.name) and e.is_file(follow_symlinks=False):
+                    found.append(Path(e.path))
+    return sorted(found)
+
+
+def runner_job_live(runner: Path, cmds: str) -> str:
+    """Why a runner's checkout is in use, or "": its Runner.Worker runs only while it has a job."""
+    # either spelling of the runner's path (a symlinked home, /private) counts, so a mismatch never reads as idle
+    names = {os.fspath(runner), os.fspath(runner.resolve())}
+    pattern = "(?:" + "|".join(map(re.escape, sorted(names))) + r")/bin(?:\.[0-9.]+)?/Runner\.Worker(?:\s|$)"
+    return f"{runner.name} is running a job (Runner.Worker)" if re.search(pattern, cmds, re.M) else ""
+
+
+def runner_checkout_families(home: Path | None = None) -> list[Family]:
+    fams = []
+    for runner in enrolled_runners(home):
+        work = runner / "_work"
+        if not work.is_dir() or work.is_symlink():
+            continue
+        fams.append(Family(RUNNER_BUILD_FAMILY, work, True,
+                           "the runner's next job rebuilds it (SwiftPM .build, cargo target)",
+                           checkout_builds=True, build_output=True, pressure_only=True,
+                           max_idle_hours=RUNNER_BUILD_IDLE_HOURS,
+                           owner="GitHub Actions jobs in this runner's checkout", rebuild_minutes=10,
+                           platform="macos"))
+        fams.append(Family(RUNNER_GIT_GARBAGE_FAMILY, work, True,
+                           "garbage: an interrupted fetch's temp pack, never read again",
+                           checkout_builds=True, build_output=True, min_bytes=1024**2,
+                           min_idle_hours=GIT_GARBAGE_IDLE_HOURS, max_idle_hours=GIT_GARBAGE_IDLE_HOURS,
+                           owner="git fetch in this runner's checkout", rebuild_minutes=0.1,
+                           platform="macos"))
+    return fams
+
+
 def apple_build_verdict(path: Path) -> str:
     """Why a glaeda-apple cache generation stays whatever its age, or "": a run is in flight or holds the
     build lock. Xcode writes deeper than the idle check looks, so the lock is what shows a build."""
@@ -1652,6 +1777,7 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
                                reference_root=FLEET_ROOT, owner="cmux browser fleet", rebuild_minutes=20,
                                platform="macos"))
         fams += fleet_families()
+        fams += runner_checkout_families()
         for runner in HOME.glob("actions-runner*"):
             temp = runner / "_work/_temp"
             if (runner / ".runner").is_file() and (runner / "glaeda-hooks").is_dir() and temp.is_dir():
@@ -3423,6 +3549,8 @@ def job_busy(fam: Family, path: Path) -> bool:
     # the runner's root token and process/socket evidence are the live-use checks there.
     if fam.id in FLEET_FAMILY_IDS or fam.id == "tmp":
         return False
+    if fam.id in RUNNER_CHECKOUT_FAMILIES:  # a cargo target is wider than the budget; Runner.Worker is its signal
+        return False
     if fam.id == SPM_SCRATCH:  # dozens of package builds within three levels; its lock is its in-use signal
         return False
     if fam.id == INTERRUPTED:  # renamed away from every job's path; its deleter's pid is its in-use signal
@@ -3502,10 +3630,12 @@ def candidates(fam: Family) -> list[Path]:
             _DISCOVERED[key] = discover_caches(fam.root)
         level = list(_DISCOVERED[key])
     elif fam.checkout_builds:
-        key = "checkout-builds:" + os.fspath(fam.root)
+        key = f"checkout-builds:{fam.id}:" + os.fspath(fam.root)
         if key not in _DISCOVERED:
-            _DISCOVERED[key] = (cmux_next_ci_generated_paths(fam.root)
-                                if fam.id == CMUX_NEXT_CI_FAMILY else checkout_builds(fam.root))
+            _DISCOVERED[key] = (cmux_next_ci_generated_paths(fam.root) if fam.id == CMUX_NEXT_CI_FAMILY
+                                else runner_checkout_builds(fam.root) if fam.id == RUNNER_BUILD_FAMILY
+                                else runner_git_garbage(fam.root) if fam.id == RUNNER_GIT_GARBAGE_FAMILY
+                                else checkout_builds(fam.root))
         level = list(_DISCOVERED[key])
     elif fam.match:
         level = _search(fam)
@@ -3834,6 +3964,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
         if fam.id == CMUX_NEXT_CI_FAMILY and not blind:
             if busy_reason := cmux_next_ci_busy(fam, path, opened, cmds):
                 reasons.append(busy_reason)
+        if fam.id == RUNNER_BUILD_FAMILY and not blind and (why := runner_job_live(fam.root.parent, cmds)):
+            reasons.append(why)
         if in_cwd(sp, opened):
             reasons.append("open by a process")
         if named_by(sp, cmds):
@@ -3849,7 +3981,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
         if fam.id == SPM_SCRATCH and spm_scratch_held(path):
             reasons.append("a job holds its lock (owned_spm_scratch.py)")
         if fam.pressure_only and ACTIVITY_MODE != "pressure":
-            reasons.append("package cache: pressure-only policy")
+            reasons.append(("runner build output" if fam.id == RUNNER_BUILD_FAMILY else "package cache")
+                           + ": pressure-only policy")
         if fam.git_disposable and (reference := referenced_main_checkout(path, nested=fam.nested_git)):
             reasons.append(reference)
         policy_note = ""
@@ -4870,7 +5003,9 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
     archived = archived_seeds() if any(i.family == "cmux-seeds" for i in items) else frozenset()
     # Among pressure hot-tier items, evict greatest reuse distance, then oldest use.
     def order(i):
-        if ACTIVITY_MODE == "pressure" and i.family in FLEET_FAMILY_IDS:
+        if i.family == RUNNER_GIT_GARBAGE_FAMILY:  # garbage nothing reads goes before anything that costs a rebuild
+            return (2, 0, i.idle_hours, i.bytes)
+        if ACTIVITY_MODE == "pressure" and (i.family in FLEET_FAMILY_IDS or i.family == RUNNER_BUILD_FAMILY):
             return (1, i.jobs_since if i.jobs_since is not None else -1, i.idle_hours, i.bytes)
         return (0, value(i, families[i.family]), 0, 0)
     for i in sorted(items, key=order, reverse=True):
@@ -4912,6 +5047,12 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             cwds = open_index(opened)
         if fam.build_output and fam.root.is_relative_to(FLEET_CI):
             cmds = command_lines() or cmds
+        if fam.id == RUNNER_BUILD_FAMILY:
+            # the runner may have taken a job since the survey: its Runner.Worker shows in a fresh ps
+            cmds = command_lines()
+            if not cmds:
+                print("refusing to delete the rest: ps failed", file=sys.stderr)
+                break
         fresh_layout = ""
         if fam.discover:
             # a discovered cache is deleted only on its own layout, so both are re-read now: the layout,
@@ -4938,6 +5079,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         elif fam.discover and not fresh_layout:
             outcome = "changed:layout"
         elif (cmux_next_ci_busy(fam, p, cwds, cmds)
+                or (fam.id == RUNNER_BUILD_FAMILY and runner_job_live(fam.root.parent, cmds))
                 or in_cwd(i.path, cwds) or named_by(i.path, cmds) or holds_socket(p) or job_busy(fam, p)
                 or (i.family == "claude-scratchpad" and claude_session_active(p.name, idle_hours * 3600))
                 or (i.family == SPM_SCRATCH and spm_scratch_held(p))):
