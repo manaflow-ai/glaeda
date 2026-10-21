@@ -19,6 +19,7 @@ import sys
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from unittest import mock
 from pathlib import Path
 
@@ -1932,6 +1933,51 @@ class GlaedaDiskTest(unittest.TestCase):
             self.assertFalse(gd.canonical_root_held(two / "src"))
         self.assertTrue(gd.canonical_root_held(tmp / "cmux-ci-next" / "derived-data-x"))
         self.assertFalse(gd.remove_canonical_admission(tmp / "cmux-ci-next" / "derived-data-x"))
+
+    def test_the_tmp_family_deletes_a_whole_canonical_root_only_under_its_root_token(self) -> None:
+        """The tmp family judges /private/tmp/cmux-ci and cmux-ci-<k> as one item each and may delete a whole one
+        after an hour idle. A compile job holds its root's token (glaeda-cmux-runner-hook take-root) for the whole
+        job, and a job's tree can sit an hour unwritten (a long test phase), so only the token tells a root in use:
+        it is in use while held, re-checked at apply, and the delete takes it exclusive as cmux-ci-admission does."""
+        tmp, capacity = self.root / "tmp", self.root / "capacity"
+        capacity.mkdir()
+        for k in (1, 2):
+            (capacity / f"root-{k}.token").touch()
+        one, two = make(tmp / "cmux-ci", 8, age_hours=50), make(tmp / "cmux-ci-2", 8, age_hours=50)
+        other = make(tmp / "cmux-ci-next", 8, age_hours=50)  # not a canonical root: the tmp family's as before
+        fam = replace(next(f for f in gd.default_families() if f.id == "tmp"), root=tmp, skip=(), min_bytes=None)
+        job = open(capacity / "root-1.token")
+        self.addCleanup(job.close)
+        fcntl.flock(job, fcntl.LOCK_EX)  # a job holds root 1 for its whole run
+        with mock.patch.object(gd, "CANONICAL_CAPACITY", capacity):
+            items = gd.survey([fam], 6, 0)
+            self.assertEqual({os.path.relpath(i.path, tmp): i.verdict for i in items},
+                             {"cmux-ci": "in-use", "cmux-ci-2": "reclaimable", "cmux-ci-next": "reclaimable"})
+            self.assertIn("a job holds this canonical root (root token)",
+                          next(i for i in items if i.path == os.fspath(one)).reasons)
+            reclaim = [i for i in items if i.verdict == "reclaimable"]
+            # a job takes root 2 between the survey and the delete: apply re-checks the token and keeps the root
+            late = open(capacity / "root-2.token")
+            fcntl.flock(late, fcntl.LOCK_EX)
+            gd.apply(reclaim, {fam.id: fam}, self.root / "r1.jsonl", None, 6)
+            late.close()
+            self.assertTrue(two.exists())
+            self.assertFalse(other.exists())
+            outcomes = {Path(r["path"]).name: r["outcome"]
+                        for r in map(json.loads, (self.root / "r1.jsonl").read_text().splitlines())}
+            self.assertEqual(outcomes, {"cmux-ci-2": "changed:in-use", "cmux-ci-next": "reclaimed"})
+            # the delete itself takes the token: a job that arrives after every re-check still keeps its root
+            late = open(capacity / "root-2.token")
+            fcntl.flock(late, fcntl.LOCK_SH)
+            self.assertFalse(gd.remove_canonical_root(two))
+            late.close()
+            self.assertTrue(two.exists())
+            reclaim = [i for i in gd.survey([fam], 6, 0) if i.verdict == "reclaimable"]
+            self.assertEqual([Path(i.path).name for i in reclaim], ["cmux-ci-2"])
+            gd.apply(reclaim, {fam.id: fam}, self.root / "r2.jsonl", None, 6)
+        self.assertFalse(two.exists())
+        self.assertTrue(one.exists())
+        self.assertEqual(sorted(p.name for p in tmp.iterdir()), ["cmux-ci"], "nothing renamed aside is left behind")
 
     def test_the_emergency_floor_names_its_filesystems(self) -> None:
         total = 460 * gd.GIB  # emergency 10%:30-60 is 46 GiB; a 30 GiB runner floor lifts it to 50 on HOME's volume

@@ -647,16 +647,24 @@ def canonical_admission_families(tmp: Path | None = None) -> list[Family]:
             if canonical_root_number(root) is not None and root.is_dir() and not root.is_symlink()]
 
 
-def canonical_root_token(path: Path) -> Path | None:
-    k = canonical_root_number(path.parent)
+def canonical_root_token(path: Path, whole_root: bool = False) -> Path | None:
+    """The token of the canonical root path sits in (an admission item), or with whole_root of path itself."""
+    k = canonical_root_number(path if whole_root else path.parent)
     return None if k is None else CANONICAL_CAPACITY / f"root-{k}.token"
 
 
-def canonical_root_held(path: Path) -> bool:
-    """Whether a job holds the canonical root an admission item sits in. Probed shared and released at once,
-    as the runner hook's own probes do: a job's take retries past it. No token means no job ever took the root;
-    an unreadable one, or a path outside a canonical root, counts as held."""
-    token = canonical_root_token(path)
+# The tmp family judges each canonical root as one item and may delete a whole one after an hour idle. A job's
+# tree can sit an hour unwritten (a long test phase) while the job still holds the root, so the root's token
+# decides there too: in use while held, and the delete takes it exclusive (remove_canonical_root).
+def tmp_canonical_root(fam: "Family", path: Path) -> bool:
+    return fam.id == "tmp" and path.parent == fam.root and canonical_root_number(path) is not None
+
+
+def canonical_root_held(path: Path, whole_root: bool = False) -> bool:
+    """Whether a job holds the canonical root an admission item sits in (with whole_root: the root path). Probed
+    shared and released at once, as the runner hook's own probes do: a job's take retries past it. No token
+    means no job ever took the root; an unreadable one, or a path outside a canonical root, counts as held."""
+    token = canonical_root_token(path, whole_root)
     if token is None:
         return True
     try:
@@ -674,10 +682,15 @@ def canonical_root_held(path: Path) -> bool:
     return False
 
 
-def remove_canonical_admission(path: Path) -> bool:
-    """Rename an admission item aside under its root's token, held exclusive as a job holds it, and delete it
-    outside the lock. False, touching nothing, while a job holds the root."""
-    token = canonical_root_token(path)
+def remove_canonical_root(root: Path) -> bool:
+    """remove_canonical_admission for a whole canonical root (the tmp family's item)."""
+    return remove_canonical_admission(root, whole_root=True)
+
+
+def remove_canonical_admission(path: Path, whole_root: bool = False) -> bool:
+    """Rename an admission item (with whole_root: the root itself) aside under its root's token, held exclusive
+    as a job holds it, and delete it outside the lock. False, touching nothing, while a job holds the root."""
+    token = canonical_root_token(path, whole_root)
     if token is None:
         return False
     if not token.parent.is_dir():  # no capacity dir: not a fleet mini, so no job can take the root
@@ -4242,7 +4255,7 @@ def job_busy(fam: Family, path: Path) -> bool:
     # none was ever evicted (cmux15, 2026-09-28). A job using one is seen by its command line and cwd.
     # The generic tmp family also contains the canonical CI checkout. Its source tree is wider than
     # cmux_active's bounded marker search, so treating budget exhaustion as busy would pin it forever;
-    # the runner's root token and process/socket evidence are the live-use checks there.
+    # the runner's root token (tmp_canonical_root) and process/socket evidence are the live-use checks there.
     if fam.id in FLEET_FAMILY_IDS or fam.id == "tmp":
         return False
     if fam.id in RUNNER_CHECKOUT_FAMILIES:  # a cargo target is wider than the budget; Runner.Worker is its signal
@@ -4680,6 +4693,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             reasons.append("a job holds its lock (owned_spm_scratch.py)")
         if fam.id == CANONICAL_ADMISSION and canonical_root_held(path):
             reasons.append("a job holds its canonical root (root token)")
+        if tmp_canonical_root(fam, path) and canonical_root_held(path, whole_root=True):
+            reasons.append("a job holds this canonical root (root token)")
         if fam.pressure_only and ACTIVITY_MODE != "pressure":
             reasons.append(("runner build output" if fam.id == RUNNER_BUILD_FAMILY else "package cache")
                            + ": pressure-only policy")
@@ -5793,7 +5808,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 or in_cwd(i.path, cwds) or named_by(i.path, cmds) or holds_socket(p) or job_busy(fam, p)
                 or (i.family == "claude-scratchpad" and claude_session_active(p.name, idle_hours * 3600))
                 or (i.family == SPM_SCRATCH and spm_scratch_held(p))
-                or (i.family == CANONICAL_ADMISSION and canonical_root_held(p))):
+                or (i.family == CANONICAL_ADMISSION and canonical_root_held(p))
+                or (tmp_canonical_root(fam, p) and canonical_root_held(p, whole_root=True))):
             outcome = "changed:in-use"
         elif (families[i.family].git_disposable
               and referenced_main_checkout(p, nested=families[i.family].nested_git)):
@@ -5821,6 +5837,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                     gone = remove_spm_scratch(p)  # only under its lock: a job may link it right now
                 elif i.family == CANONICAL_ADMISSION:
                     gone = remove_canonical_admission(p)  # only under its root's token: a job may take it now
+                elif tmp_canonical_root(fam, p):
+                    gone = remove_canonical_root(p)  # the whole root, likewise only under its token
                 elif i.family == INTERRUPTED:
                     finish_deletion(p)
                     gone = True
