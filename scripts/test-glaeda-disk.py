@@ -2069,6 +2069,50 @@ class GlaedaDiskTest(unittest.TestCase):
                 })
                 survey.assert_not_called()
 
+    def test_a_pressure_apply_below_the_emergency_floor_does_not_wait_for_a_measurement(self) -> None:
+        lock = self.root / "measurement.lock"
+        dev = gd.HOME.stat().st_dev
+        total = 460 * gd.GIB
+        # main() sets these module globals for the run; later tests read them.
+        for name in ("EMERGENCY_DEVS", "ACTIVITY_MODE", "FLOOR_HOLD", "ROLE", "RUNNER_CACHE_PROFILE",
+                     "_REFRESH_DEADLINE_ACTIVE", "_MEASURE_BUDGET_REACHED"):
+            self.addCleanup(setattr, gd, name, getattr(gd, name))
+
+        def run(free_gib: float) -> tuple[int, str, mock.MagicMock]:
+            fss = {dev: gd.Fs(dev, "/", int(free_gib * gd.GIB), total, 128 * gd.GIB, 170 * gd.GIB)}
+            out = io.StringIO()
+            with mock.patch.object(gd, "MEASURE_LOCK", lock), \
+                    mock.patch.object(gd, "EVICT_LOCK", self.root / "evict.lock"), \
+                    mock.patch.object(gd, "EVICT_OWNER", self.root / "evict.owner.json"), \
+                    mock.patch.object(gd, "HEALTH_SUMMARY", self.root / "summary.json"), \
+                    mock.patch.object(gd, "default_families", return_value=[]), \
+                    mock.patch.object(gd, "runner_floor_gib", return_value=0.0), \
+                    mock.patch.object(gd, "filesystems", return_value=fss), \
+                    mock.patch.object(gd, "ci_jobs", return_value=[]), \
+                    mock.patch.object(gd, "survey", return_value=[]) as survey, \
+                    mock.patch.object(gd, "apply", return_value=0), \
+                    mock.patch.object(gd, "cleanup_paused_runner_work", return_value=0), \
+                    mock.patch.object(gd, "evict_idle_runner_checkouts", return_value=0), \
+                    mock.patch.object(gd, "notify_disk"), \
+                    contextlib.redirect_stdout(out):
+                with lock.open("a") as held:
+                    fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    status = gd.main(["--json", "--pressure", "--apply", "--no-snapshot", "--top", "0",
+                                      "--receipt", os.fspath(self.receipt())])
+            return status, out.getvalue(), survey
+
+        # Under pressure but above the emergency floor (10% of 460 GiB): it still defers.
+        status, out, survey = run(100)
+        self.assertEqual(status, 3)
+        self.assertIn("measurement_busy", out)
+        survey.assert_not_called()
+        # A deferred run lets go of the eviction lock it took, not only at exit.
+        self.assertIsNone(gd._EVICT_HANDLE)
+        # Nearly empty: it goes on.
+        status, out, survey = run(0.9)
+        self.assertNotIn("measurement_busy", out)
+        survey.assert_called()
+
     def test_report_only_refresh_replaces_stale_timeout_summary_without_apply(self) -> None:
         receipt = self.receipt()
         summary_path = self.root / "summary.json"

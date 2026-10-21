@@ -6506,11 +6506,16 @@ def _main_impl(argv: list[str] | None = None) -> int:
         measure_lock.close()
         measure_lock = None
         _ACTIVE_MEASURE_HANDLE = None
-        if a.pressure or a.refresh:
+        # Below the emergency floor a pressure apply goes on without the lock, as a report does: it
+        # re-measures its candidates itself (fresh_for_apply), and a background refresh can take up to
+        # its 600 s budget (cmux9s, 2026-10-21: every pressure run skipped at 0.9 GiB free while a
+        # refresh held the lock, with 32 GiB of finished steps' spm-scratch reclaimable).
+        if (a.pressure and not (a.apply and EMERGENCY_DEVS)) or a.refresh:
             if measure_lock is not None:
                 measure_lock.close()
                 measure_lock = None
             result = deferred("measurement_busy", "another measurement running; skipped")
+            release_evict_lock(_EVICT_HANDLE)
             if maintenance_handle is not None:
                 fcntl.flock(maintenance_handle, fcntl.LOCK_UN)
                 maintenance_handle.close()
