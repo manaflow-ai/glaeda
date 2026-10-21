@@ -68,7 +68,7 @@ directories (cmux-tui/target), plus DerivedData a workflow keeps in $RUNNER_WORK
 an hour idle, least recently modified first. runner-git-garbage is git's tmp_pack_*/tmp_obj_* temp files an
 interrupted fetch left; one an hour old goes whenever nothing holds it open. The checkout itself stays,
 except as the last resort of a pressure run still under the runner gate's disk floor after everything else
-(runner-idle-checkout): then the whole checkout of a runner with no Runner.Worker, unused for an hour and
+(runner-idle-checkout): then the whole checkout of a runner with no Runner.Worker, unused for 10 minutes and
 held open by nothing, goes, least recently used first, until free space reaches the floor plus
 target_margin_gib. The runner's next job clones it again. Before that, on every pressure or sweep pass of a
 fleet mini, runner-checkout-repack folds a checkout's packs with `git repack -a -d -k -l` (keeps every object) once
@@ -1659,8 +1659,12 @@ def runner_checkout_families(home: Path | None = None) -> list[Family]:
 # whole checkouts of runners with no job, least recently used first, until free space reaches the floor
 # plus target_margin_gib. The next job on that runner clones again (actions/checkout). Never _work/_tool,
 # _actions, _temp or the workspace's .glaeda-state.
+# The quiet window is runner-checkout-repack's 10 minutes, not an hour: the gate holds only the jobs that need
+# the floor, so light jobs keep every runner busy at least hourly and an hour-quiet checkout never appears
+# (cmuxs-mac-mini-6, 2026-10-21: 0.3 GiB free, three runners with no job holding 6.5 GiB .git each, last
+# used 23-32 minutes before, and the pass freed nothing). No Runner.Worker is what keeps a job's checkout.
 RUNNER_IDLE_CHECKOUT_FAMILY = "runner-idle-checkout"
-RUNNER_IDLE_CHECKOUT_HOURS = 1.0
+RUNNER_IDLE_CHECKOUT_HOURS = 10 / 60
 
 
 def runner_checkout_last_use(runner: Path, checkout: Path) -> float:
@@ -1692,7 +1696,7 @@ def idle_runner_checkout_veto(runner: Path, checkout: Path, opened: frozenset[st
     if named_by(path, cmds) or named_by(resolved, cmds):
         return "named by a running command"
     if (time.time() - runner_checkout_last_use(runner, checkout)) / 3600 < RUNNER_IDLE_CHECKOUT_HOURS:
-        return f"used within {RUNNER_IDLE_CHECKOUT_HOURS:g}h"
+        return f"used within {RUNNER_IDLE_CHECKOUT_HOURS * 60:g} minutes"
     return ""
 
 

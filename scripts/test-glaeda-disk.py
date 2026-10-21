@@ -3068,9 +3068,22 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertTrue((work / "cmux/.glaeda-state/SourcePackages").is_dir())
         self.assertTrue((work / "_temp/cmux-derived-data-tests-1").is_dir())
 
+    def test_idle_runner_checkouts_of_busy_runners_go_between_jobs(self) -> None:
+        """cmuxs-mac-mini-6, 2026-10-21: light jobs kept every runner busy at least hourly, so under the floor
+        no checkout was ever an hour quiet; runners with no job, last used 23-32 minutes before, held 20 GiB."""
+        home, cos = self._idle_checkouts({"actions-runner-glaeda": 0.54, "actions-runner-glaeda-2": 0.39,
+                                          "actions-runner-glaeda-3": 0.06})
+        gd.process_evidence = lambda: ([], "")
+        patches, removed = self._floor_disk(10.0, freed_gib=6.5)
+        receipt = self.receipt()
+        with patches[0], patches[1], contextlib.redirect_stdout(io.StringIO()):
+            self.assertGreater(gd.evict_idle_runner_checkouts(receipt, 30.0, home), 0)
+        self.assertEqual(removed, [str(cos["actions-runner-glaeda"]), str(cos["actions-runner-glaeda-2"])])
+        self.assertTrue(cos["actions-runner-glaeda-3"].is_dir(), "used minutes ago: its job may be finishing")
+
     def test_idle_runner_checkout_vetoes(self) -> None:
         home, cos = self._idle_checkouts({"actions-runner-glaeda": 5, "actions-runner-glaeda-2": 5,
-                                          "actions-runner-glaeda-3": 5, "actions-runner-glaeda-4": 0.2})
+                                          "actions-runner-glaeda-3": 5, "actions-runner-glaeda-4": 0.1})
         live = home / "actions-runner-glaeda"
         opened = cos["actions-runner-glaeda-2"] / "Sources/x.swift"
         named = cos["actions-runner-glaeda-3"]
@@ -3081,7 +3094,7 @@ class GlaedaDiskTest(unittest.TestCase):
         receipt = self.receipt()
         with patches[0], patches[1]:
             self.assertEqual(gd.evict_idle_runner_checkouts(receipt, 30.0, home), 0)
-        self.assertEqual(removed, [])  # the used-within-the-hour runner is not even a candidate
+        self.assertEqual(removed, [])  # the runner used within the quiet window is not even a candidate
         why = {Path(r["path"]).parts[-4]: r["reasons"][0] for r in map(json.loads, receipt.read_text().splitlines())}
         self.assertIn("running a job", why["actions-runner-glaeda"])
         self.assertIn("open or a working directory", why["actions-runner-glaeda-2"])
