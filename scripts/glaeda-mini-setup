@@ -1580,12 +1580,12 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]]) -> None:
                 dest.parent.mkdir(parents=True, exist_ok=True)  # the skill's directory may not exist yet
             if kind == "agent" and act.get("loaded") and ctx.platform != "linux":
                 if is_update_agent(act["label"]) and os.environ.get(UPDATE_ENV):
-                    # unloading would kill the glaeda-update that is running this setup; launchd
-                    # reads the new plist at the next login, or when setup runs by hand
+                    # unloading would kill the glaeda-update that is running this setup; it reloads
+                    # the agent from a detached helper once it exits (glaeda-update schedule_reload)
                     install_service_file(ctx, Path(act["path"]), data, int(act["mode"], 8))
                     act["applied"] = act["owned"] = True
                     act["ownedSha256"] = act["sha256"]
-                    act["note"] = "written; reload deferred while glaeda-update runs"
+                    act["note"] = "written; glaeda-update reloads it after this run"
                     continue
                 bootout(ctx, act["label"])
                 act["loaded"] = False

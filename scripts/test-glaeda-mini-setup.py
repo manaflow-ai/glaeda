@@ -1047,7 +1047,7 @@ class MiniSetupTest(unittest.TestCase):
                 mock.patch.dict(os.environ, {ms.UPDATE_ENV: "1"}):
             ms.apply_install(ctx, [act])
         self.assertEqual(path.read_bytes(), ms.agent_bytes(ctx, label))
-        self.assertIn("deferred", act["note"])
+        self.assertIn("glaeda-update reloads it after this run", act["note"])
 
     def test_headless_agents_use_system_domain_and_persist_for_ota(self) -> None:
         daemon_dir = self.home / "Library/LaunchDaemons"

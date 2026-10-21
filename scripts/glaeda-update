@@ -96,6 +96,7 @@ import hashlib
 import json
 import os
 import platform
+import plistlib
 import re
 import shutil
 import subprocess
@@ -145,6 +146,8 @@ CONVERGE = STATE_DIR / "converge.json"
 CONVERGE_SCHEMA = "glaeda-ota-converge/v1"
 APPLY_EVERY_S = 600  # the agent's StartInterval (glaeda-mini-setup) and the first retry's wait
 BACKOFF_MAX_S = 3600  # an unconverged host still retries at least hourly, as the agent used to run
+LABEL = "com.teamleaderleo.glaeda.update"  # this agent (glaeda-mini-setup LABEL_PREFIX + "update")
+LAUNCHCTL = "/bin/launchctl"
 # converge.json carries the times glaeda-mini-health alerts at, so the reader holds no thresholds of its own:
 # unconverged past two backed-off retries, or no finished run for three.
 ALERT_AFTER_S = 2 * BACKOFF_MAX_S
@@ -1100,6 +1103,102 @@ def update(apply: bool, config: dict, state_dir: Path = STATE_DIR,
             "status": post(False, detail)}
 
 
+def launchd_job(config: dict, home: Path = HOME) -> tuple[Path, str, list[str]]:
+    """This updater's plist, its launchd service target, and the prefix launchctl runs under (sudo -n for the
+    system domain of a headless Mac, whose daemon runs as this user)."""
+    if "--headless" in (config.get("setupArgs") or []):
+        return Path("/Library/LaunchDaemons") / f"{LABEL}.plist", f"system/{LABEL}", ["/usr/bin/sudo", "-n"]
+    return home / "Library/LaunchAgents" / f"{LABEL}.plist", f"gui/{os.getuid()}/{LABEL}", []
+
+
+# The detached reload (schedule_reload). It runs with only the argv it is given, so a release installed or rolled back
+# by this run cannot change what it does halfway. It waits for the run to exit, takes the updater's lock (a new run
+# that starts meanwhile finds it busy and is not booted out under itself), refuses a plist that does not lint, boots
+# the job out, waits until launchd has let go of it, bootstraps it again with backoff until `print` shows the new
+# interval, and appends one JSON line saying how it went to reload.log beside state.json.
+RELOAD_HELPER = r"""
+import fcntl, json, os, re, subprocess, sys, time
+pid, lock_path, log_path, prefix, launchctl, target, domain, plist, want = json.loads(sys.argv[1])
+def ctl(*args):
+    try:
+        done = subprocess.run([*prefix, launchctl, *args], capture_output=True, text=True, timeout=60)
+        return done.returncode, (done.stdout + done.stderr).strip()
+    except (OSError, subprocess.SubprocessError) as e:
+        return -1, str(e)
+def interval(shown):
+    have = re.search(r"^\s*run interval = (\d+) seconds", shown, re.M)
+    return int(have.group(1)) if have else None
+def finish(result, **detail):
+    with open(log_path, "a") as log:
+        log.write(json.dumps({"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "result": result,
+                              "target": target, "want": want, **detail}, sort_keys=True) + "\n")
+    sys.exit(0 if result == "reloaded" else 1)
+deadline = time.time() + 3600
+while time.time() < deadline:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        break
+    except PermissionError:
+        pass
+    time.sleep(1)
+else:
+    finish("gave-up", why="the run that scheduled this did not exit within an hour")
+with open(lock_path, "a") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    if interval(ctl("print", target)[1]) == want:
+        finish("reloaded", why="already at the plist's interval (an earlier reload did it)")
+    if subprocess.run(["/usr/bin/plutil", "-lint", plist], capture_output=True).returncode != 0:
+        finish("refused", why="plist does not lint; the loaded job is left running")
+    ctl("bootout", target)
+    for _ in range(40):
+        if ctl("print", target)[0] != 0:
+            break
+        time.sleep(0.25)
+    tries = []
+    for wait in (0, 1, 2, 4, 8, 15, 30):
+        time.sleep(wait)
+        code, out = ctl("bootstrap", domain, plist)
+        tries.append(code)
+        if interval(ctl("print", target)[1]) == want:
+            finish("reloaded", bootstrap=tries)
+    finish("failed", bootstrap=tries, out=out[-300:])
+"""
+
+
+def schedule_reload(config: dict, home: Path = HOME, pid: int | None = None, state_dir: Path = STATE_DIR) -> str | None:
+    """Reload this agent when launchd runs it on an older schedule than its plist says.
+
+    glaeda-mini-setup cannot reload the agent of the glaeda-update that runs it (unloading would kill this run),
+    so it writes the plist and defers the reload "to the next login". Minis and Macs that never log out kept the
+    old StartInterval: APPLY_EVERY_S went from 3600 to 600, and cosmic-gray, air-blue and cmux16 still ran hourly
+    (launchctl print: run interval = 3600 seconds) on 2026-10-21. Here a detached helper (RELOAD_HELPER), outside
+    this job's process group so launchd does not end it with this run, reloads it once this process exits.
+    Returns what it did, or None when nothing differs. The outcome of the last reload is in reload.log; a failed
+    one is tried again by the next run that launchd starts (at login, if the job is gone)."""
+    if sys.platform != "darwin":
+        return None
+    plist, target, prefix = launchd_job(config, home)
+    try:
+        want = plistlib.loads(plist.read_bytes()).get("StartInterval")
+        shown = subprocess.run([*prefix, LAUNCHCTL, "print", target], capture_output=True, text=True,
+                               timeout=TIMEOUT, env={"PATH": CHILD_PATH}).stdout
+    except (OSError, ValueError, plistlib.InvalidFileException, subprocess.SubprocessError):
+        return None
+    have = re.search(r"^\s*run interval = (\d+) seconds", shown, re.M)
+    if not isinstance(want, int) or not have or int(have.group(1)) == want:
+        return None
+    args = [pid or os.getpid(), os.fspath(state_dir / "lock"), os.fspath(state_dir / "reload.log"), prefix, LAUNCHCTL,
+            target, target.rsplit("/", 1)[0], os.fspath(plist), want]
+    try:
+        subprocess.Popen([sys.executable, "-I", "-c", RELOAD_HELPER, json.dumps(args)], start_new_session=True,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         env={"PATH": CHILD_PATH}, cwd="/")
+    except OSError as e:
+        return f"reload not started ({e}): launchd runs every {have.group(1)}s, the plist says {want}s"
+    return f"reload scheduled: launchd runs every {have.group(1)}s, the plist says {want}s"
+
+
 def apply_once(config: dict, state_dir: Path = STATE_DIR, bin_dir: Path = BIN, home: Path = HOME,
                staged: Path = RUNNER_SCRIPTS, now: float | None = None,
                channel: tuple[bytes, bytes | None] | None = None) -> dict:
@@ -1183,6 +1282,9 @@ def main(argv: list[str] | None = None) -> int:
                     print(json.dumps({"result": "busy", "why": "another glaeda-update is running"}))
                     return 0
                 result = apply_once(config)
+                schedule = schedule_reload(config)
+                if schedule:
+                    result["schedule"] = schedule
         result["at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         print(json.dumps(result, sort_keys=True))
         return 1 if result["result"] in ("rolled-back", "refused") else 0

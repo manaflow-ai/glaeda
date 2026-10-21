@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 import urllib.error
 from pathlib import Path
@@ -891,6 +892,142 @@ class UpdateTest(unittest.TestCase):
         # a failing canary's report (waited out up to FAILURE_WAIT_MAX, then retried after a backoff) lands
         # before the CI smoke may promote a release no canary reported on
         self.assertGreater(gr.CANARY_SILENT_HOURS * 3600, gu.FAILURE_WAIT_MAX + gu.BACKOFF_MAX_S)
+
+
+class ScheduleReloadTest(unittest.TestCase):
+    """setup writes the agent's new StartInterval but cannot reload the agent of the run that called it, so Macs that
+    never log out kept running hourly after APPLY_EVERY_S became 600 (cosmic-gray, air-blue, cmux16, 2026-10-21)."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name)
+        self.state = self.home / "state"
+        self.state.mkdir()
+        agents = self.home / "Library/LaunchAgents"
+        agents.mkdir(parents=True)
+        self.plist = agents / f"{gu.LABEL}.plist"
+        self.plist.write_bytes(gu.plistlib.dumps({"Label": gu.LABEL, "StartInterval": 600}))
+
+    def run_it(self, shown: str, config: dict | None = None, platform: str = "darwin", popen=None):
+        calls, spawned = [], []
+
+        def fake_run(argv, **kw):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, shown, "")
+
+        with mock.patch.object(gu.sys, "platform", platform), mock.patch.object(gu.subprocess, "run", fake_run), \
+                mock.patch.object(gu.subprocess, "Popen", popen or (lambda argv, **kw: spawned.append((argv, kw)))):
+            note = gu.schedule_reload(config or {"setupArgs": ["--hygiene-only"]}, home=self.home, pid=4242,
+                                      state_dir=self.state)
+        return note, calls, spawned
+
+    def test_an_old_interval_is_reloaded_after_this_run(self) -> None:
+        note, calls, spawned = self.run_it("\tstate = running\n\trun interval = 3600 seconds\n")
+        self.assertEqual(note, "reload scheduled: launchd runs every 3600s, the plist says 600s")
+        self.assertEqual(calls, [["/bin/launchctl", "print", f"gui/{os.getuid()}/{gu.LABEL}"]])
+        (argv, kw), = spawned
+        self.assertTrue(kw["start_new_session"])  # outside the job's process group: survives this run's end
+        self.assertEqual(argv[:4], [sys.executable, "-I", "-c", gu.RELOAD_HELPER])
+        self.assertEqual(json.loads(argv[4]), [4242, f"{self.state}/lock", f"{self.state}/reload.log", [],
+                                               "/bin/launchctl", f"gui/{os.getuid()}/{gu.LABEL}",
+                                               f"gui/{os.getuid()}", os.fspath(self.plist), 600])
+
+    def test_nothing_to_do(self) -> None:
+        for shown in ("\trun interval = 600 seconds\n", "Could not find service\n"):
+            with self.subTest(shown=shown):
+                note, _, spawned = self.run_it(shown)
+                self.assertIsNone(note)
+                self.assertEqual(spawned, [])
+        note, calls, _ = self.run_it("\trun interval = 3600 seconds\n", platform="linux")
+        self.assertEqual((note, calls), (None, []))  # systemd re-reads its timer on daemon-reload
+
+    def test_a_helper_that_cannot_start_is_reported_not_raised(self) -> None:
+        def fail(argv, **kw):
+            raise OSError("fork failed")
+        note, _, _ = self.run_it("\trun interval = 3600 seconds\n", popen=fail)
+        self.assertEqual(note, "reload not started (fork failed): launchd runs every 3600s, the plist says 600s")
+
+    def test_a_headless_mac_reloads_its_system_daemon_through_sudo(self) -> None:
+        plist, target, prefix = gu.launchd_job({"setupArgs": ["--hygiene-only", "--headless"]}, self.home)
+        self.assertEqual((plist, target, prefix), (Path(f"/Library/LaunchDaemons/{gu.LABEL}.plist"),
+                                                   f"system/{gu.LABEL}", ["/usr/bin/sudo", "-n"]))
+
+
+@unittest.skipUnless(sys.platform == "darwin", "the helper lints the plist with /usr/bin/plutil")
+class ReloadHelperTest(unittest.TestCase):
+    """RELOAD_HELPER itself, against a fake launchctl that keeps the job's state in a file."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        self.plist = self.dir / "job.plist"
+        self.plist.write_bytes(gu.plistlib.dumps({"Label": gu.LABEL, "StartInterval": 600}))
+        self.job, self.calls = self.dir / "job", self.dir / "calls"
+        self.job.write_text("3600")
+        self.ctl = self.dir / "launchctl"
+        # print: shows the loaded interval or fails; bootout: unloads; bootstrap: fails while FAILS has lines left
+        self.ctl.write_text(f"""#!/bin/sh
+echo "$*" >> {self.calls}
+case "$1" in
+print) [ -s {self.job} ] || {{ echo "Could not find service"; exit 113; }}; echo "	run interval = $(cat {self.job}) seconds";;
+bootout) : > {self.job};;
+bootstrap) if [ -s {self.dir}/fails ]; then sed -i '' 1d {self.dir}/fails; echo "5: Input/output error"; exit 5; fi
+  /usr/bin/plutil -extract StartInterval raw "$3" > {self.job};;
+esac
+""")
+        self.ctl.chmod(0o755)
+
+    def helper(self, pid: int | None = None, timeout: float = 30) -> dict:
+        if pid is None:
+            run = subprocess.Popen(["/usr/bin/true"])
+            run.wait()
+            pid = run.pid  # the run that scheduled the reload has exited
+        args = [pid, os.fspath(self.dir / "lock"), os.fspath(self.dir / "reload.log"), [], os.fspath(self.ctl),
+                "gui/501/x", "gui/501", os.fspath(self.plist), 600]
+        subprocess.run([sys.executable, "-I", "-c", gu.RELOAD_HELPER, json.dumps(args)], timeout=timeout, check=False)
+        *_, last = (self.dir / "reload.log").read_text().splitlines()
+        return json.loads(last)
+
+    def test_reloads_and_confirms_the_new_interval(self) -> None:
+        out = self.helper()
+        self.assertEqual((out["result"], out["bootstrap"]), ("reloaded", [0]))
+        self.assertEqual(self.job.read_text().strip(), "600")
+        calls = self.calls.read_text().splitlines()
+        self.assertEqual(calls[1:3], ["bootout gui/501/x", "print gui/501/x"])  # waited for launchd to let go
+        self.assertIn(f"bootstrap gui/501 {self.plist}", calls)
+
+    def test_a_refused_bootstrap_is_retried(self) -> None:
+        (self.dir / "fails").write_text("1\n2\n")
+        out = self.helper()
+        self.assertEqual((out["result"], out["bootstrap"]), ("reloaded", [5, 5, 0]))
+
+    def test_a_plist_that_does_not_lint_leaves_the_job_loaded(self) -> None:
+        self.plist.write_text("not a plist")
+        out = self.helper()
+        self.assertEqual(out["result"], "refused")
+        self.assertEqual(self.job.read_text(), "3600")
+        self.assertNotIn("bootout", self.calls.read_text())
+
+    def test_waits_for_the_run_and_its_lock(self) -> None:
+        import fcntl
+        run = subprocess.Popen(["/bin/sleep", "1"])
+        with open(self.dir / "lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            helper = subprocess.Popen([sys.executable, "-I", "-c", gu.RELOAD_HELPER, json.dumps(
+                [run.pid, os.fspath(self.dir / "lock"), os.fspath(self.dir / "reload.log"), [], os.fspath(self.ctl),
+                 "gui/501/x", "gui/501", os.fspath(self.plist), 600])])
+            run.wait()
+            time.sleep(1.5)  # the run is gone but this lock is held: a newer run is working, so nothing is touched
+            self.assertFalse(self.calls.exists())
+        helper.wait(timeout=30)
+        self.assertEqual(json.loads((self.dir / "reload.log").read_text())["result"], "reloaded")
+
+    def test_an_interval_already_right_is_left_alone(self) -> None:
+        self.job.write_text("600")
+        self.assertEqual(self.helper()["result"], "reloaded")
+        self.assertEqual(self.calls.read_text().splitlines(), ["print gui/501/x"])
 
 
 class ReleaseTest(unittest.TestCase):
