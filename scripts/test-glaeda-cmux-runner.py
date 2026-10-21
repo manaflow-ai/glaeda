@@ -259,6 +259,16 @@ SAMPLE_EVENTS = {
 }
 
 
+class DrainPinTest(unittest.TestCase):
+    def test_the_hook_is_pinned_for_glaeda_disk_drain(self) -> None:
+        """A change to the hook must append its sha256 to glaeda-disk's CMUX_NEXT_DRAIN_HOOK_SHA256, or drain
+        refuses every runner that installs it (#1550, #1561). Running this suite on a checkout pins it; under CI
+        a missing pin fails here, next to the hook's own tests, with the command to run."""
+        sys.path.insert(0, os.fspath(ROOT / "scripts"))
+        import glaeda_hook_pin
+        self.assertIsNone(glaeda_hook_pin.ensure(check=glaeda_hook_pin.under_ci()))
+
+
 class HookTest(unittest.TestCase):
     """Runs the hook script itself, as the runner would, against sample event files."""
 

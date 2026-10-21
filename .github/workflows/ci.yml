@@ -171,6 +171,7 @@ jobs:
               Path("scripts/hot-run-python"),
               Path("scripts/hot_run_impl.py"),
               Path("scripts/verify"),
+              Path("scripts/glaeda_hook_pin.py"),
               Path("scripts/verify-focused"),
               Path("scripts/verify-required"),
               Path("scripts/verify_focused_impl.py"),
@@ -317,6 +318,7 @@ jobs:
           suite python3 scripts/test-benchmark-linker-throughput.py
           suite python3 scripts/test-hot-observe.py
           suite python3 scripts/test-glaeda-disk.py
+          suite python3 scripts/test-glaeda-hook-pin.py
           suite python3 scripts/test-glaeda-devbox.py
           suite python3 scripts/test-glaeda-projects.py
           suite python3 scripts/test-glaeda-worktree.py
