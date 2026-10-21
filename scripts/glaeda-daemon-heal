@@ -1,0 +1,403 @@
+#!/usr/bin/env python3
+"""glaeda-daemon-heal: keep macOS system daemons from holding a core for hours on a glaeda host.
+
+    glaeda-daemon-heal --policy P               plan: what a pass would do now (changes nothing)
+    glaeda-daemon-heal --policy P --apply       one reconcile pass (the root LaunchDaemon, every policy every_s)
+    glaeda-daemon-heal --install --policy P     plan the root install
+    sudo glaeda-daemon-heal --install --policy P --apply   install or update it (idempotent)
+    glaeda-daemon-heal --status --policy P      is the installed copy this one (any user; JSON)
+
+Desired state (config/macos-daemons.json, the one source of every number here): no daemon in `daemons` uses
+`hot_cores` or more for `hot_hours`. Each pass samples each daemon's CPU time with ps; a streak starts at the first
+interval at or above hot_cores and ends at the first below it, or when the pid changes. A daemon past hot_hours is
+restarted: SIGTERM, then SIGKILL after stop_wait_s, and launchd (KeepAlive or on demand) starts a fresh one. That is
+what clears fseventsd's wedged notify thread (cmux9 10-20: 100% CPU and 27 GiB RSS with no disk I/O, 1.5% and 4 MiB
+after one restart). A `wait_idle` daemon (fseventsd: a restart drops live FSEvents streams) waits while a process
+named in `busy` runs, up to busy_hot_hours. At most max_restarts_per_day per daemon, so nothing loops.
+
+Only processes whose executable is exactly a policy path run as a system account (uid < 500) are touched, and a
+policy path must lie under a SIP-protected system directory. The installed copy and its policy are root-owned
+snapshots under INSTALL_DIR run by /usr/bin/python3 -I, so nothing the runner user (or a PR job) can write runs as
+root. glaeda-mini-health compares the snapshot with the user's installed release (--status) and reinstalls it where
+`sudo -n` works (headless AWS hosts); elsewhere it reports daemon_heal_stale with the one root command.
+Stdlib only; runs on macOS /usr/bin/python3 (3.9).
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import datetime
+import hashlib
+import json
+import os
+import plistlib
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+
+SCHEMA = "glaeda-daemon-heal/v1"
+POLICY_SCHEMA = "glaeda-macos-daemons/v1"
+LABEL = "com.teamleaderleo.glaeda.daemon-heal"
+INSTALL_DIR = Path("/Library/Application Support/glaeda/daemon-heal")
+PLIST = Path("/Library/LaunchDaemons") / f"{LABEL}.plist"
+SYSTEM_PYTHON = "/usr/bin/python3"  # SIP-protected; a Homebrew python is writable by the runner user
+SCRIPT_NAME = "glaeda-daemon-heal"
+POLICY_NAME = "macos-daemons.json"
+SYSTEM_PREFIXES = ("/System/", "/usr/libexec/", "/usr/sbin/", "/usr/bin/", "/sbin/")
+SYSTEM_UID_MAX = 499
+DAY_S = 86400
+POLICY_KEYS = {"every_s": int, "hot_cores": (int, float), "hot_hours": (int, float), "busy_hot_hours": (int, float),
+               "max_restarts_per_day": int, "stop_wait_s": (int, float), "busy": list, "daemons": list}
+
+
+class HealError(RuntimeError):
+    pass
+
+
+# ---------------------------------------------------------------- policy
+
+
+def load_policy(path: Path) -> dict[str, Any]:
+    try:
+        doc = json.loads(path.read_text())
+    except (OSError, ValueError) as e:
+        raise HealError(f"cannot read policy {path}: {e}") from e
+    return validate_policy(doc)
+
+
+def validate_policy(doc: Any) -> dict[str, Any]:
+    if not isinstance(doc, dict) or doc.get("schema") != POLICY_SCHEMA:
+        raise HealError(f"policy schema is not {POLICY_SCHEMA}")
+    for key, kind in POLICY_KEYS.items():
+        value = doc.get(key)
+        if isinstance(value, bool) or not isinstance(value, kind):
+            raise HealError(f"policy {key} is missing or not {kind}")
+        if kind is not list and value <= 0:
+            raise HealError(f"policy {key} must be positive")
+    if doc["busy_hot_hours"] < doc["hot_hours"]:
+        raise HealError("policy busy_hot_hours must be at least hot_hours")
+    if not all(isinstance(b, str) and b and "/" not in b for b in doc["busy"]):
+        raise HealError("policy busy holds process names")
+    names = set()
+    for d in doc["daemons"]:
+        if not isinstance(d, dict) or not isinstance(d.get("name"), str) or not isinstance(d.get("path"), str) \
+                or not isinstance(d.get("wait_idle"), bool):
+            raise HealError("each policy daemon needs name, path and wait_idle")
+        path = d["path"]
+        if not path.startswith(SYSTEM_PREFIXES) or ".." in path.split("/") or os.path.basename(path) != d["name"]:
+            raise HealError(f"policy daemon {d['name']}: path must be its own executable under {SYSTEM_PREFIXES}")
+        if d["name"] in names:
+            raise HealError(f"policy daemon {d['name']} is listed twice")
+        names.add(d["name"])
+    return doc
+
+
+# ---------------------------------------------------------------- the host
+
+
+def sh(argv: list[str], timeout: float = 15) -> tuple[int, str, str]:
+    try:
+        p = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
+                           timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError) as e:
+        return 127, "", str(e)
+    return p.returncode, p.stdout, p.stderr
+
+
+def cpu_seconds(text: str) -> float | None:
+    """ps `time` ([dd-][hh:]mm:ss[.ss]; macOS prints minutes past 59, as 1891:53.94) in seconds."""
+    m = re.fullmatch(r"(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+(?:\.\d+)?)", text.strip())
+    if not m:
+        return None
+    d, h, mi, s = m.groups()
+    return ((int(d or 0) * 24 + int(h or 0)) * 60 + int(mi)) * 60 + float(s)
+
+
+class Host:
+    """What a pass reads and does. Tests replace these methods."""
+
+    def processes(self) -> list[tuple[int, int, float, str]]:
+        """(pid, uid, cpu seconds, executable) for every process."""
+        rows = []
+        for line in sh(["/bin/ps", "-axww", "-o", "pid=,uid=,time=,comm="])[1].splitlines():
+            parts = line.split(None, 3)
+            if len(parts) == 4 and parts[0].isdigit() and parts[1].isdigit():
+                cpu = cpu_seconds(parts[2])
+                if cpu is not None:
+                    rows.append((int(parts[0]), int(parts[1]), cpu, parts[3].strip()))
+        return rows
+
+    def signal(self, pid: int, sig: int) -> bool:
+        try:
+            os.kill(pid, sig)
+            return True
+        except OSError:
+            return False
+
+    def sleep(self, seconds: float) -> None:
+        time.sleep(seconds)
+
+    def now(self) -> float:
+        return time.time()
+
+
+# ---------------------------------------------------------------- one pass
+
+
+def iso(t: float) -> str:
+    return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def restart(host: Host, policy: dict[str, Any], daemon: dict[str, Any], pid: int) -> tuple[bool, str]:
+    """Stop pid only while it is still this daemon; launchd starts the next one."""
+    def alive() -> bool:
+        return any(p == pid and exe == daemon["path"] for p, _u, _c, exe in host.processes())
+
+    if not alive():
+        return True, f"{daemon['name']} pid {pid} had already exited"
+    host.signal(pid, signal.SIGTERM)
+    waited = 0.0
+    while alive() and waited < policy["stop_wait_s"]:
+        host.sleep(0.5)
+        waited += 0.5
+    how = "SIGTERM"
+    if alive():
+        host.signal(pid, signal.SIGKILL)
+        host.sleep(0.5)
+        how = "SIGKILL after SIGTERM"
+    if alive():
+        return False, f"{daemon['name']} pid {pid} survived {how}"
+    fresh = [p for p, _u, _c, exe in host.processes() if exe == daemon["path"]]
+    return True, f"{daemon['name']} pid {pid} stopped ({how}); " + (
+        f"launchd started pid {fresh[0]}" if fresh else "launchd starts it on demand")
+
+
+def reconcile(host: Host, policy: dict[str, Any], state: dict[str, Any], apply: bool) -> tuple[dict, dict]:
+    """One pass: (new state, report). State: {"samples": {name: {pid, t, cpu, since}}, "restarts": {name: [t]}}."""
+    now = host.now()
+    rows = host.processes()
+    busy_names = set(policy["busy"])
+    busy = sorted({os.path.basename(exe) for _p, _u, _c, exe in rows if os.path.basename(exe) in busy_names})
+    samples: dict[str, Any] = dict(state.get("samples") or {})
+    restarts = {k: [t for t in v if isinstance(t, (int, float)) and now - t < DAY_S]
+                for k, v in (state.get("restarts") or {}).items() if isinstance(v, list)}
+    healed = [h for h in state.get("healed") or [] if isinstance(h, dict) and now - h.get("t", 0) < DAY_S]
+    hot_s, busy_hot_s = policy["hot_hours"] * 3600, policy["busy_hot_hours"] * 3600
+    hot, actions = [], []
+    for daemon in policy["daemons"]:
+        name = daemon["name"]
+        mine = [(p, c) for p, u, c, exe in rows if exe == daemon["path"] and u <= SYSTEM_UID_MAX]
+        if len(mine) != 1:  # not running, or more than one: nothing to judge
+            samples.pop(name, None)
+            continue
+        pid, cpu = mine[0]
+        prev = samples.get(name)
+        since = None
+        cores = None
+        if isinstance(prev, dict) and prev.get("pid") == pid and now > prev.get("t", now) and cpu >= prev.get("cpu", cpu):
+            cores = (cpu - prev["cpu"]) / (now - prev["t"])
+            if cores >= policy["hot_cores"]:
+                since = prev.get("since") or prev["t"]
+        samples[name] = {"pid": pid, "t": now, "cpu": cpu, "since": since}
+        if since is None:
+            continue
+        hot_for = now - since
+        entry = {"name": name, "pid": pid, "cores": round(cores or 0, 2), "since": iso(since),
+                 "hot_for_s": round(hot_for)}
+        due = hot_for >= hot_s
+        if due and daemon["wait_idle"] and busy and hot_for < busy_hot_s:
+            entry["waiting"] = f"host busy ({', '.join(busy)}); restarts anyway at {policy['busy_hot_hours']} h"
+            due = False
+        if due and len(restarts.get(name, [])) >= policy["max_restarts_per_day"]:
+            entry["waiting"] = f"{policy['max_restarts_per_day']} restarts in the last day; no more until one ages out"
+            due = False
+        if not due:
+            entry.setdefault("waiting", f"restarts at {policy['hot_hours']} h")
+            hot.append(entry)
+            continue
+        if not apply:
+            entry["waiting"] = "would restart now (plan)"
+            hot.append(entry)
+            continue
+        ok, what = restart(host, policy, daemon, pid)
+        restarts.setdefault(name, []).append(now)
+        actions.append({"name": name, "ok": ok, "action": what})
+        if ok:
+            samples.pop(name, None)
+            healed.append({"name": name, "t": now, "at": iso(now), "since": iso(since), "cores": entry["cores"],
+                           "action": what})
+        else:
+            entry["waiting"] = what
+            hot.append(entry)
+    new_state = {"samples": samples, "restarts": restarts, "healed": healed}
+    report = {"schema": SCHEMA, "at": iso(now), "busy": busy, "hot": hot, "healed": healed, "actions": actions}
+    return new_state, report
+
+
+# ---------------------------------------------------------------- files
+
+
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def read_bytes(path: Path) -> bytes | None:
+    try:
+        return path.read_bytes()
+    except OSError:
+        return None
+
+
+def atomic_write(path: Path, data: bytes, mode: int, root: bool) -> None:
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=os.fspath(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        if root:
+            os.chown(tmp, 0, 0)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+
+
+def load_json(path: Path) -> dict[str, Any]:
+    try:
+        doc = json.loads(path.read_text())
+        return doc if isinstance(doc, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def check_root_dir(path: Path) -> None:
+    """Every component from / down is a real directory owned by root and not writable by others."""
+    current = Path("/")
+    for part in path.parts[1:]:
+        current = current / part
+        st = os.lstat(current)
+        if not os.path.isdir(current) or os.path.islink(current) or st.st_uid != 0 or st.st_mode & 0o022:
+            raise HealError(f"{current} is not a root-owned directory closed to other users")
+
+
+# ---------------------------------------------------------------- install
+
+
+def desired_install(policy_path: Path, install_dir: Path = INSTALL_DIR) -> dict[str, Any]:
+    """The files the root LaunchDaemon needs, from this copy of the script and a validated policy."""
+    policy_bytes = policy_path.read_bytes()
+    policy = validate_policy(json.loads(policy_bytes))
+    script = install_dir / SCRIPT_NAME
+    state_dir = install_dir / "state"
+    plist = {
+        "Label": LABEL,
+        "ProgramArguments": [SYSTEM_PYTHON, "-I", os.fspath(script), "--apply",
+                             "--policy", os.fspath(install_dir / POLICY_NAME), "--state-dir", os.fspath(state_dir)],
+        "StartInterval": policy["every_s"],
+        "RunAtLoad": True,
+        "ProcessType": "Background",
+        "LowPriorityIO": True,
+        "Nice": 10,
+        "StandardOutPath": os.fspath(state_dir / "heal.log"),
+        "StandardErrorPath": os.fspath(state_dir / "heal.err"),
+    }
+    return {"files": {script: (Path(__file__).read_bytes(), 0o555),
+                      install_dir / POLICY_NAME: (policy_bytes, 0o444)},
+            "plist": plistlib.dumps(plist, sort_keys=True), "state_dir": state_dir}
+
+
+def install_status(policy_path: Path, install_dir: Path = INSTALL_DIR, plist_path: Path = PLIST) -> dict[str, Any]:
+    want = desired_install(policy_path, install_dir)
+    stale = [os.fspath(p) for p, (data, _m) in want["files"].items() if read_bytes(p) != data]
+    if read_bytes(plist_path) != want["plist"]:
+        stale.append(os.fspath(plist_path))
+    installed = (install_dir / SCRIPT_NAME).exists() and plist_path.exists()
+    return {"schema": SCHEMA, "installed": installed, "current": not stale, "stale": stale,
+            "sha256": sha256(Path(__file__).read_bytes()), "policySha256": sha256(policy_path.read_bytes()),
+            "report": os.fspath(want["state_dir"] / "report.json")}
+
+
+def launchctl(*args: str) -> tuple[int, str]:
+    code, out, err = sh(["/bin/launchctl", *args], timeout=20)
+    return code, (err or out).strip()[-200:]
+
+
+def install(policy_path: Path, apply: bool) -> dict[str, Any]:
+    status = install_status(policy_path)
+    if not apply or status["current"] and launchctl("print", f"system/{LABEL}")[0] == 0:
+        return {**status, "state": "unchanged" if status["current"] else "planned"}
+    if os.geteuid() != 0:
+        raise HealError("--install --apply needs root: the snapshot and the LaunchDaemon are root-owned")
+    want = desired_install(policy_path)
+    for d in (INSTALL_DIR, want["state_dir"]):
+        d.mkdir(mode=0o755, parents=True, exist_ok=True)
+        os.chown(d, 0, 0)
+        os.chmod(d, 0o755)
+    check_root_dir(want["state_dir"])
+    check_root_dir(PLIST.parent)
+    for path, (data, mode) in want["files"].items():
+        if read_bytes(path) != data or (path.stat().st_mode & 0o777) != mode:
+            atomic_write(path, data, mode, root=True)
+    changed = read_bytes(PLIST) != want["plist"]
+    if changed:
+        launchctl("bootout", f"system/{LABEL}")
+        atomic_write(PLIST, want["plist"], 0o644, root=True)
+    if changed or launchctl("print", f"system/{LABEL}")[0] != 0:
+        code, said = launchctl("bootstrap", "system", os.fspath(PLIST))
+        if code != 0:
+            raise HealError(f"launchctl bootstrap system {PLIST} failed: {said}")
+    return {**install_status(policy_path), "state": "applied"}
+
+
+# ---------------------------------------------------------------- main
+
+
+def run_pass(policy_path: Path, state_dir: Path, apply: bool, host: Host | None = None) -> dict[str, Any]:
+    policy = load_policy(policy_path)
+    state = load_json(state_dir / "state.json")
+    new_state, report = reconcile(host or Host(), policy, state, apply)
+    if apply:
+        state_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+        root = os.geteuid() == 0
+        atomic_write(state_dir / "state.json", json.dumps(new_state, sort_keys=True).encode() + b"\n", 0o644, root)
+        atomic_write(state_dir / "report.json", json.dumps(report, sort_keys=True).encode() + b"\n", 0o644, root)
+    return report
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    p.add_argument("--policy", type=Path, required=True, help="config/macos-daemons.json")
+    p.add_argument("--state-dir", type=Path, default=INSTALL_DIR / "state")
+    p.add_argument("--apply", action="store_true")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--install", action="store_true", help="install or update the root LaunchDaemon")
+    mode.add_argument("--status", action="store_true", help="is the installed copy this one")
+    args = p.parse_args(argv)
+    try:
+        if args.status:
+            out = install_status(args.policy)
+        elif args.install:
+            out = install(args.policy, args.apply)
+        else:
+            out = run_pass(args.policy, args.state_dir, args.apply)
+            if args.apply:
+                if out["actions"]:
+                    print(json.dumps({"at": out["at"], "actions": out["actions"]}, separators=(",", ":")), flush=True)
+                return 0
+    except (HealError, OSError, ValueError) as e:
+        print(json.dumps({"schema": SCHEMA, "error": str(e)}), file=sys.stderr)
+        return 1
+    print(json.dumps(out, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

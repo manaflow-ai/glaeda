@@ -41,6 +41,9 @@ What --apply installs (templated for the current user):
                                                LAN_FETCH_ROOT_COPY, which needs sudo: an operator step
     ~/.local/bin/glaeda-idle-warm              from scripts/glaeda-idle-warm (builds main into a far kept root while an
                                                owned cmux mini is idle; a no-op anywhere else)
+    ~/.local/bin/glaeda-daemon-heal            from scripts/glaeda-daemon-heal (restarts a macOS daemon that holds a core for
+                                               hours; glaeda-mini-health installs its root LaunchDaemon where sudo -n works)
+    ~/.local/share/glaeda/macos-daemons.json   from config/macos-daemons.json (that desired state and its limits)
     ~/.local/bin/glaeda-mini-health            from scripts/glaeda-mini-health (finds what stops a runner mini, heals what
                                                the runner user can, reports the rest for ci-dash; a no-op off a runner)
     ~/.local/bin/glaeda-idle-repair            durable repair queue: records busy hosts and runs disk/health repairs on
@@ -166,6 +169,7 @@ DEVBOX_LINUX_UNITS = frozenset({"glaeda-projects-tidy.service", "glaeda-projects
 DAEMON_UNITS = frozenset({"glaeda-gh.service"})
 # the Claude Code skill installed beside the tools
 SKILL_SOURCE = REPO / "skills/github-ci-wait/SKILL.md"
+DAEMON_POLICY_SOURCE = REPO / "config/macos-daemons.json"  # desired state of macOS system daemons
 # glaeda-update runs this command from a release; it sets this so setup never unloads the job running it
 UPDATE_ENV = "GLAEDA_UPDATE_RUNNING"
 OTA_RINGS = ("canary", "stable")
@@ -948,6 +952,11 @@ def skill_path(ctx: Context) -> Path:
     return ctx.home / ".claude/skills/github-ci-wait/SKILL.md"
 
 
+def daemon_policy_path(ctx: Context) -> Path:
+    """config/macos-daemons.json, where glaeda-mini-health and glaeda-daemon-heal read it."""
+    return ctx.home / ".local/share/glaeda/macos-daemons.json"
+
+
 def is_update_agent(label: str) -> bool:
     return label == LABEL_PREFIX + "update" or label.startswith("glaeda-update.")
 
@@ -1204,13 +1213,16 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
                         "state": "unchanged" if path.is_dir() else "create", "mode": oct(mode)})
     for name in ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-runner-hygiene", "disk-pressure.sh", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune", "glaeda-seed-prefetch",
                  "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health", "glaeda-idle-repair",
-                 "glaeda-update", "glaeda-gh", "glaeda-wallpaper-rotate"):
+                 "glaeda-update", "glaeda-gh", "glaeda-wallpaper-rotate", "glaeda-daemon-heal"):
         act = file_action(ctx, "tool", ctx.bin / name, (SCRIPT_DIR / name).read_bytes(), 0o755)
         act["source"] = os.fspath(SCRIPT_DIR / name)
         actions.append(act)
     # a copy, not a link: the release tree it came from is replaced by the next update
     act = file_action(ctx, "tool", skill_path(ctx), SKILL_SOURCE.read_bytes(), 0o644)
     act["source"] = os.fspath(SKILL_SOURCE)
+    actions.append(act)
+    act = file_action(ctx, "tool", daemon_policy_path(ctx), DAEMON_POLICY_SOURCE.read_bytes(), 0o644)
+    act["source"] = os.fspath(DAEMON_POLICY_SOURCE)
     actions.append(act)
     mode, source, note = reclaim_source(ctx)
     dest = ctx.bin / "glaeda-worktree-reclaim"
@@ -1393,9 +1405,10 @@ def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
                         "loaded": agent_loaded(ctx, label)})
     for name in ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-runner-hygiene", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune",
                  "glaeda-seed-prefetch", "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health", "glaeda-idle-repair",
-                 "glaeda-update", "glaeda-gh", "glaeda-wallpaper-rotate"):
+                 "glaeda-update", "glaeda-gh", "glaeda-wallpaper-rotate", "glaeda-daemon-heal"):
         actions.append({"kind": "tool", "path": os.fspath(ctx.bin / name)})
     actions.append({"kind": "tool", "path": os.fspath(skill_path(ctx))})
+    actions.append({"kind": "tool", "path": os.fspath(daemon_policy_path(ctx))})
     for marker in scan_exclusion_markers(ctx):
         actions.append({"kind": "marker", "path": os.fspath(marker)})
     for act in actions:

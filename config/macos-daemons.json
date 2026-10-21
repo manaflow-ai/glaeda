@@ -1,0 +1,20 @@
+{
+  "schema": "glaeda-macos-daemons/v1",
+  "note": "Desired state for macOS system daemons on every glaeda macOS host: none of these holds hot_cores for longer than hot_hours. scripts/glaeda-daemon-heal (a root LaunchDaemon) converges to it by restarting the daemon (launchd starts a fresh one); glaeda-mini-health keeps that LaunchDaemon installed and reports what it sees. A daemon with wait_idle waits for an idle host (no process named in busy) until busy_hot_hours. Seen 10-20: fseventsd at 1.0-1.7 cores for days with 13-30 GiB RSS on cmux 3/7/9/11/12/13/14 (a restart on idle cmux9 took it from 100% / 27 GiB to 1.5% / 4 MiB); audiomxd and WirelessRadioManagerd at 1.0-1.1 cores on headless aws-m4pro-5..9.",
+  "every_s": 120,
+  "hot_cores": 0.9,
+  "hot_hours": 2,
+  "busy_hot_hours": 8,
+  "max_restarts_per_day": 4,
+  "stop_wait_s": 10,
+  "busy": ["Runner.Worker", "xcodebuild", "xctest", "swift-build", "swift-test"],
+  "daemons": [
+    {
+      "name": "fseventsd",
+      "path": "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/FSEvents.framework/Versions/A/Support/fseventsd",
+      "wait_idle": true
+    },
+    {"name": "audiomxd", "path": "/usr/libexec/audiomxd", "wait_idle": false},
+    {"name": "WirelessRadioManagerd", "path": "/usr/sbin/WirelessRadioManagerd", "wait_idle": false}
+  ]
+}

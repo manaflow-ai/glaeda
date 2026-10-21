@@ -39,6 +39,15 @@ Each run checks, as the runner user and without sudo:
                                      job here (a missing staged generation, a receipt that does not validate, a node
                                      that is not eligible). Restaging or re-enrolling is an operator's: reported only.
 
+  daemon_heal_stale                  the root LaunchDaemon from scripts/glaeda-daemon-heal is missing or is not this
+                                     release's copy (script or config/macos-daemons.json). Healed where `sudo -n` works
+                                     (headless AWS hosts) by reinstalling it; elsewhere the root command is the note.
+                                     Also run on a host without glaeda runners.
+  daemon_hot:<name>                  a macOS daemon from config/macos-daemons.json has held hot_cores (fseventsd,
+                                     audiomxd, WirelessRadioManagerd), from glaeda-daemon-heal's root report: that
+                                     daemon restarts it at hot_hours (wait_idle daemons when the host is idle, or at
+                                     busy_hot_hours). Reported here so ci-dash sees the wait; the heal is root's.
+
 A heal is tried at most every HEAL_EVERY_S and HEAL_TRIES times a day per finding, counting heals that worked
 but did not last (a runner that exits again), so nothing loops. Each finding reads
 {id, code, severity, since, evidence, auto_fix, note}: auto_fix is "pending" while a heal will be tried,
@@ -84,6 +93,9 @@ TAILSCALE_STANDALONE = "/usr/local/bin/tailscale"
 TAILSCALE_CLI_ENV = {"TAILSCALE_BE_CLI": "1"}
 TESTMANAGERD = "/usr/libexec/testmanagerd"
 SCHEMA = "glaeda-mini-health/v1"
+SCRIPT_DIR = Path(__file__).resolve().parent
+DAEMON_HEAL = SCRIPT_DIR / "glaeda-daemon-heal"  # beside this file in the repo, a release and ~/.local/bin
+SYSTEM_PYTHON = "/usr/bin/python3"  # what the root LaunchDaemon runs; never a user-writable interpreter
 
 HEAL_EVERY_S = 600
 HEAL_TRIES = 3
@@ -357,6 +369,46 @@ class Mini:
             return False, f"rustup installed {toolchain} but it is not listed afterward"
         return True, f"installed Rust toolchain {toolchain}"
 
+    def daemon_policy(self) -> Path | None:
+        """config/macos-daemons.json: the repo's or release's beside this script, else the copy mini-setup installs."""
+        env = os.environ.get("GLAEDA_DAEMON_POLICY")
+        for path in ([Path(env)] if env else []) + [SCRIPT_DIR.parent / "config/macos-daemons.json",
+                                                     self.home / ".local/share/glaeda/macos-daemons.json"]:
+            if path.is_file():
+                return path
+        return None
+
+    def daemon_heal_status(self) -> dict[str, Any] | None:
+        """glaeda-daemon-heal --status: is the root LaunchDaemon this release's copy; None off macOS or without it."""
+        policy = self.daemon_policy()
+        if sys.platform != "darwin" or policy is None or not DAEMON_HEAL.is_file():
+            return None
+        # A personal Mac (mini-setup --hygiene-only) is no fleet host: its daemons are its owner's.
+        if "--hygiene-only" in (load_json(self.home / ".config/glaeda/update.json").get("setupArgs") or []):
+            return None
+        code, out = sh([sys.executable, "-I", os.fspath(DAEMON_HEAL), "--status", "--policy", os.fspath(policy)])
+        try:
+            doc = json.loads(out) if code == 0 else None
+        except ValueError:
+            doc = None
+        return doc if isinstance(doc, dict) else None
+
+    def sudo_ok(self) -> bool:
+        return sh(["/usr/bin/sudo", "-n", "/usr/bin/true"])[0] == 0
+
+    def install_daemon_heal(self) -> tuple[bool, str]:
+        policy = self.daemon_policy()
+        if policy is None:
+            return False, "no config/macos-daemons.json"
+        code, out = sh(["/usr/bin/sudo", "-n", SYSTEM_PYTHON, "-I", os.fspath(DAEMON_HEAL), "--install",
+                        "--policy", os.fspath(policy), "--apply"], timeout=60)
+        try:
+            state = json.loads(out).get("state")
+        except (ValueError, AttributeError):
+            state = None
+        ok = code == 0 and state in {"applied", "unchanged"}
+        return ok, f"sudo -n glaeda-daemon-heal --install --apply: {state or f'exit {code}'}"
+
     def disk_summary(self) -> dict[str, Any]:
         path = self.home / ".local/state/glaeda/disk/summary.json"
         return load_json(path)
@@ -556,6 +608,44 @@ def check_node_eligibility(mini: Mini) -> list[dict[str, Any]]:
                     "(docs/CMUX_FLEET_ENROLLMENT.md)")]
 
 
+def daemon_heal_command(mini: Mini) -> str:
+    policy = mini.daemon_policy()
+    return (f"sudo {SYSTEM_PYTHON} -I {DAEMON_HEAL} --install --policy {policy} --apply "
+            "(cmuxterm-hq: fleet sudo with that line)")
+
+
+def check_daemon_heal(mini: Mini) -> list[dict[str, Any]]:
+    status = mini.daemon_heal_status()
+    if status is None:
+        return []
+    out = []
+    if not status.get("current"):
+        missing = not status.get("installed")
+        out.append(finding("daemon_heal_stale", "warn",
+                           ("the root daemon-heal LaunchDaemon is not installed" if missing else
+                            "the root daemon-heal LaunchDaemon is not this release's copy: "
+                            + ", ".join(status.get("stale") or [])),
+                           "pending" if mini.sudo_ok() else "impossible",
+                           "reinstalled with sudo -n" if mini.sudo_ok() else
+                           "no passwordless sudo here; root: " + daemon_heal_command(mini)))
+    if status.get("installed"):
+        report = load_json(Path(str(status.get("report") or "")))
+        mini.daemon_healed = [  # the root daemon's restarts, in this report's healed list for ci-dash
+            {"id": f"daemon_hot:{h['name']}", "code": "daemon_hot", "t": h.get("t") or 0, "at": h.get("at"),
+             "since": h.get("since"), "evidence": f"{h['name']} at {h.get('cores')} cores",
+             "action": str(h.get("action") or "")[:200], "auto_fix": "done"}
+            for h in report.get("healed") or [] if isinstance(h, dict) and h.get("name")]
+        for h in report.get("hot") or []:
+            if not isinstance(h, dict) or not h.get("name"):
+                continue
+            hours = (h.get("hot_for_s") or 0) / 3600
+            out.append(finding(f"daemon_hot:{h['name']}", "warn",
+                               f"{h['name']} (macOS, pid {h.get('pid')}) has used {h.get('cores')} cores for "
+                               f"{hours:.1f} h, since {h.get('since')}", "pending",
+                               f"the root glaeda-daemon-heal restarts it: {h.get('waiting') or 'next pass'}"))
+    return out
+
+
 # ---------------------------------------------------------------- heals
 
 
@@ -609,8 +699,15 @@ def heal_node_toolchain(mini: Mini, f: dict[str, Any]) -> tuple[bool, str]:
     return mini.install_rust_toolchain(toolchain)
 
 
+def heal_daemon_heal(mini: Mini, f: dict[str, Any]) -> tuple[bool, str]:
+    ok, what = mini.install_daemon_heal()
+    status = mini.daemon_heal_status() if ok else None
+    return bool(status and status.get("current")), what
+
+
 # code -> (heal, runs in a row seen before healing)
 HEALS: dict[str, tuple[Callable[[Mini, dict[str, Any]], tuple[bool, str]], int]] = {
+    "daemon_heal_stale": (heal_daemon_heal, 1),
     "testmanagerd_wedged": (heal_testmanagerd, 1),
     "tailscale_down": (heal_tailscale, 2),
     "runner_stopped": (heal_runner, 2),
@@ -651,7 +748,8 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
     previous = {f["id"]: f for f in (load_json(report_path).get("findings") or []) if isinstance(f, dict)}
 
     found = (check_console(mini) + check_power(mini) + check_tailscale(mini) + check_runners(mini)
-             + check_node_eligibility(mini) + check_leaked_test_apps(mini) + check_disk_accounting(mini))
+             + check_node_eligibility(mini) + check_leaked_test_apps(mini) + check_disk_accounting(mini)
+             + check_daemon_heal(mini))
     tm = check_testmanagerd(mini, now)
     carried = tm is None and "testmanagerd_wedged" in previous  # a test runs, or the log was unreadable: no heal now
     found += [previous["testmanagerd_wedged"]] if carried else tm or []
@@ -691,7 +789,8 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
     ids = {f["id"] for f in findings}
     seen = {k: v for k, v in seen.items() if k in ids}
     tries = {k: v for k, v in tries.items() if k in ids}
-    report = {"schema": SCHEMA, "at": iso(now), "findings": findings, "healed": healed[-HEALED_MAX:]}
+    report = {"schema": SCHEMA, "at": iso(now), "findings": findings,
+              "healed": sorted(healed + getattr(mini, "daemon_healed", []), key=lambda h: h.get("t") or 0)[-HEALED_MAX:]}
     if apply:
         write_json(state_path, {"seen": seen, "tries": tries, "healed": healed[-HEALED_MAX:]})
         write_json(report_path, report)
@@ -706,8 +805,16 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
     mini = Mini()
     if not mini.runner_dirs():
+        # No runner report here, but the daemon healer serves every macOS host (the AWS dev-build hosts too).
+        stale = [f for f in check_daemon_heal(mini) if f["code"] == "daemon_heal_stale"]
+        healed = heal_daemon_heal(mini, stale[0]) if (args.apply and stale and stale[0]["auto_fix"] == "pending"
+                                                       and not KILL_SWITCH.exists()) else None
         if not args.apply:
-            print(json.dumps({"schema": SCHEMA, "skipped": "no glaeda runner on this host"}))
+            print(json.dumps({"schema": SCHEMA, "skipped": "no glaeda runner on this host",
+                              "findings": [f["id"] for f in stale]}))
+        elif healed:
+            print(json.dumps({"heals": [{"id": "daemon_heal_stale", "ok": healed[0], "action": healed[1]}]},
+                             separators=(",", ":")), flush=True)
         return 0
     report = run(mini, args.apply, heal_ok=not KILL_SWITCH.exists())
     if not args.apply:

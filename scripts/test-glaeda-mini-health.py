@@ -115,6 +115,23 @@ class FakeMini(health.Mini):
         self.toolchain_installs.append(toolchain)
         return True, f"installed Rust toolchain {toolchain}"
 
+    heal_status: dict | None = None
+    sudo = False
+
+    def daemon_heal_status(self):
+        return self.heal_status
+
+    def daemon_policy(self):
+        return Path("/p/macos-daemons.json")
+
+    def sudo_ok(self):
+        return self.sudo
+
+    def install_daemon_heal(self):
+        self.did.append("install daemon-heal")
+        self.heal_status = {**(self.heal_status or {}), "installed": True, "current": True}
+        return True, "sudo -n glaeda-daemon-heal --install --apply: applied"
+
 
 class NodeEligibility(unittest.TestCase):
     """A node the runner hook finds ineligible refuses every job, so health says so instead of the jobs."""
@@ -493,6 +510,44 @@ class Runners(Base):
         self.assertEqual(self.ids(report), ["runner_unloaded:0"])
         self.assertEqual(report["findings"][0]["auto_fix"], "impossible")
         self.assertEqual(self.mini.did, [])
+
+
+class DaemonHeal(Base):
+    """The root daemon-heal LaunchDaemon is kept installed; its hot daemons show up in the report."""
+
+    def test_no_healer_on_this_host_is_no_finding(self) -> None:
+        self.mini.heal_status = None
+        self.assertEqual(self.ids(self.run_once()), [])
+
+    def test_stale_healer_is_reinstalled_where_sudo_n_works(self) -> None:
+        self.mini.sudo = True
+        self.mini.heal_status = {"installed": False, "current": False, "stale": ["/x"], "report": "/none"}
+        r = self.run_once()
+        self.assertEqual(self.mini.did, ["install daemon-heal"])
+        self.assertEqual(self.ids(r), [])
+        self.assertEqual([h["id"] for h in r["healed"]], ["daemon_heal_stale"])
+
+    def test_stale_healer_without_sudo_names_the_root_command(self) -> None:
+        self.mini.heal_status = {"installed": True, "current": False, "stale": ["/x"], "report": "/none"}
+        r = self.run_once()
+        f = r["findings"][0]
+        self.assertEqual((f["id"], f["auto_fix"]), ("daemon_heal_stale", "impossible"))
+        self.assertIn("--install --policy /p/macos-daemons.json --apply", f["note"])
+        self.assertEqual(self.mini.did, [])
+
+    def test_hot_daemons_from_the_root_report(self) -> None:
+        root = self.dir / "report.json"
+        root.write_text(json.dumps({"hot": [{"name": "fseventsd", "pid": 421, "cores": 1.02, "since": "x",
+                                             "hot_for_s": 5400, "waiting": "restarts at 2 h"}],
+                                    "healed": [{"name": "audiomxd", "t": NOW - 60, "at": "a", "since": "s",
+                                                "cores": 1.1, "action": "audiomxd pid 5 stopped (SIGTERM)"}]}))
+        self.mini.heal_status = {"installed": True, "current": True, "report": os.fspath(root)}
+        r = self.run_once()
+        f = r["findings"]
+        self.assertEqual([x["id"] for x in f], ["daemon_hot:fseventsd"])
+        self.assertEqual([(h["id"], h["auto_fix"]) for h in r["healed"]], [("daemon_hot:audiomxd", "done")])
+        self.assertIn("1.5 h", f[0]["evidence"])
+        self.assertIn("restarts at 2 h", f[0]["note"])
 
 
 class Parsing(unittest.TestCase):
