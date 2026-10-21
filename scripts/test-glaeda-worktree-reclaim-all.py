@@ -27,6 +27,8 @@ class ReclaimDiscoveryTest(unittest.TestCase):
             "GLAEDA_PROJECTS_ROOT": str(self.projects),
             "GLAEDA_WORKTREE_RECLAIM": str(self.reclaim),
             "CAPTURE": str(self.capture),
+            # The real disk's fullness must not change the argv the tests compare.
+            "GLAEDA_RECLAIM_PRESSURE_PERCENT": "101",
         }
 
     def git(self, repo, *args):
@@ -87,6 +89,33 @@ class ReclaimDiscoveryTest(unittest.TestCase):
         self.git(repo, "branch", "master")
         self.git(repo, "branch", "zzz-finished")
         self.assertIn(str(repo), self.sweep("--apply"))
+
+
+    def test_a_checkout_one_folder_down_is_discovered(self):
+        nested = self.projects / "personal-build"
+        nested.mkdir()
+        repo = nested / "repo"
+        repo.mkdir()
+        self.git(repo, "init", "-q", "-b", "main")
+        self.git(repo, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                 "commit", "-qm", "initial", "--allow-empty")
+        self.git(repo, "worktree", "add", "-qb", "lane", str(nested / "lane"))
+        (self.projects / "alias").symlink_to(nested)
+        argv = self.sweep()
+        self.assertEqual(argv.count(str(repo)), 1)
+        self.assertNotIn(str(nested / "lane"), argv)
+
+    def test_disk_pressure_shortens_the_unfinished_window(self):
+        repo = self.repository()
+        self.git(repo, "worktree", "add", "-qb", "lane", str(self.root / "lane"))
+        self.env["GLAEDA_RECLAIM_PRESSURE_PERCENT"] = "0"
+        argv = self.sweep()
+        self.assertEqual(argv[argv.index("--minimum-idle-seconds") + 1], "43200")
+        # A window the caller passed wins; no pressure, no change.
+        argv = self.sweep("--minimum-idle-seconds", "7200")
+        self.assertEqual(argv.count("--minimum-idle-seconds"), 1)
+        self.env["GLAEDA_RECLAIM_PRESSURE_PERCENT"] = "101"
+        self.assertNotIn("--minimum-idle-seconds", self.sweep())
 
 
 if __name__ == "__main__":
