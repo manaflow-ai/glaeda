@@ -612,6 +612,96 @@ def ci_ios_family(root: Path | None = None) -> Family:
                   platform="macos")
 
 
+# cmux CI's canonical build roots (cmux scripts/ci/canonical-build-root.sh): /private/tmp/cmux-ci is root 1,
+# /private/tmp/cmux-ci-<k> root k. A compile job holds root k's capacity token for the whole job
+# (glaeda-cmux-runner-hook take-root: an exclusive flock on capacity/root-<k>.token) and clears the root's
+# admission DerivedData and compilation CAS before it builds; a rerun replaces them from the artifact. What a
+# finished job leaves there only its own run's consumers read, so a day later it is dead weight. The tmp family
+# judges the whole root as one item, and src/ (the root's checkout, with untracked build inputs) kept all of
+# it: 8-9 GiB per idle root on cmux7s, cmux12s and cmux13s while the controller paused their claims for disk
+# (2026-10-21). Only these names one level below the root, so src/ stays the tmp family's and git's to judge.
+CANONICAL_ADMISSION = "cmux-ci-admission"
+CANONICAL_ADMISSION_NAMES = ("derived-data-", "compile-admission-cas")
+CANONICAL_ADMISSION_IDLE_HOURS = 24.0
+CANONICAL_CAPACITY = FLEET_ROOT / "capacity"
+
+
+def canonical_root_number(root: Path) -> int | None:
+    if root.name == "cmux-ci":
+        return 1
+    # the runner hook's own root spec: roots 2-99, ASCII digits only (/private/tmp is world-writable)
+    m = re.fullmatch(r"cmux-ci-([2-9]|[1-9][0-9])", root.name)
+    return int(m.group(1)) if m else None
+
+
+def canonical_admission_families(tmp: Path | None = None) -> list[Family]:
+    tmp = (Path("/private/tmp") if DARWIN else Path("/tmp")) if tmp is None else tmp
+    roots = [tmp / "cmux-ci", *sorted(tmp.glob("cmux-ci-*"))]
+    return [Family(CANONICAL_ADMISSION, root, True, "the next compile on this root clears and re-seeds it",
+                   include=CANONICAL_ADMISSION_NAMES, build_output=True,
+                   min_idle_hours=CANONICAL_ADMISSION_IDLE_HOURS,
+                   owner="cmux ci-macos.yml compile admission (canonical build root)", rebuild_minutes=10,
+                   platform="macos")
+            for root in roots
+            if canonical_root_number(root) is not None and root.is_dir() and not root.is_symlink()]
+
+
+def canonical_root_token(path: Path) -> Path | None:
+    k = canonical_root_number(path.parent)
+    return None if k is None else CANONICAL_CAPACITY / f"root-{k}.token"
+
+
+def canonical_root_held(path: Path) -> bool:
+    """Whether a job holds the canonical root an admission item sits in. Probed shared and released at once,
+    as the runner hook's own probes do: a job's take retries past it. No token means no job ever took the root;
+    an unreadable one, or a path outside a canonical root, counts as held."""
+    token = canonical_root_token(path)
+    if token is None:
+        return True
+    try:
+        fd = os.open(token, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+    return False
+
+
+def remove_canonical_admission(path: Path) -> bool:
+    """Rename an admission item aside under its root's token, held exclusive as a job holds it, and delete it
+    outside the lock. False, touching nothing, while a job holds the root."""
+    token = canonical_root_token(path)
+    if token is None:
+        return False
+    if not token.parent.is_dir():  # no capacity dir: not a fleet mini, so no job can take the root
+        remove(path)
+        return True
+    # created if missing, as the runner hook's lock_file creates it, so a job arriving now waits on this lock
+    fd = os.open(token, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return False
+    held = [fd]
+
+    def release() -> None:
+        if held:
+            os.close(held.pop())
+
+    try:
+        remove(path, after_rename=release)
+    finally:
+        release()
+    return True
+
+
 # cmux CI's SwiftPM scratch (cmux scripts/ci/owned_spm_scratch.py): swift-package-tests links each package's .build
 # to STORE/spm-scratch/<fingerprint>/<package> so a job rebuilds only what its change touched. A job holds
 # <fingerprint>.lock shared (a holder process) until the runner ends it; `link` touches the lock, so its time is the
@@ -2076,6 +2166,7 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
                                reference_root=FLEET_ROOT, owner="cmux browser fleet", rebuild_minutes=20,
                                platform="macos"))
         fams += fleet_families()
+        fams += canonical_admission_families()
         fams += runner_checkout_families()
         for runner in HOME.glob("actions-runner*"):
             temp = runner / "_work/_temp"
@@ -4157,6 +4248,8 @@ def job_busy(fam: Family, path: Path) -> bool:
         return False
     if fam.id == SPM_SCRATCH:  # dozens of package builds within three levels; its lock is its in-use signal
         return False
+    if fam.id == CANONICAL_ADMISSION:  # a DerivedData; the root's token is its in-use signal
+        return False
     if fam.id == INTERRUPTED:  # renamed away from every job's path; its deleter's pid is its in-use signal
         return False
     return fam.reclaimable and not fam.discover and cmux_active(path)
@@ -4584,6 +4677,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
                 reasons.append("live lease or running job")
         if fam.id == SPM_SCRATCH and spm_scratch_held(path):
             reasons.append("a job holds its lock (owned_spm_scratch.py)")
+        if fam.id == CANONICAL_ADMISSION and canonical_root_held(path):
+            reasons.append("a job holds its canonical root (root token)")
         if fam.pressure_only and ACTIVITY_MODE != "pressure":
             reasons.append(("runner build output" if fam.id == RUNNER_BUILD_FAMILY else "package cache")
                            + ": pressure-only policy")
@@ -5696,7 +5791,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 or (fam.id == RUNNER_BUILD_FAMILY and runner_job_live(fam.root.parent, cmds))
                 or in_cwd(i.path, cwds) or named_by(i.path, cmds) or holds_socket(p) or job_busy(fam, p)
                 or (i.family == "claude-scratchpad" and claude_session_active(p.name, idle_hours * 3600))
-                or (i.family == SPM_SCRATCH and spm_scratch_held(p))):
+                or (i.family == SPM_SCRATCH and spm_scratch_held(p))
+                or (i.family == CANONICAL_ADMISSION and canonical_root_held(p))):
             outcome = "changed:in-use"
         elif (families[i.family].git_disposable
               and referenced_main_checkout(p, nested=families[i.family].nested_git)):
@@ -5722,6 +5818,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                     released += max(0, original_bytes - destination.stat().st_size)
                 elif i.family == SPM_SCRATCH:
                     gone = remove_spm_scratch(p)  # only under its lock: a job may link it right now
+                elif i.family == CANONICAL_ADMISSION:
+                    gone = remove_canonical_admission(p)  # only under its root's token: a job may take it now
                 elif i.family == INTERRUPTED:
                     finish_deletion(p)
                     gone = True

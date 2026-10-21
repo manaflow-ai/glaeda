@@ -1872,6 +1872,67 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertTrue(gd.remove_spm_scratch(scratch / "raced"))
         self.assertFalse((scratch / "raced").exists())
 
+    def test_canonical_root_admission_goes_under_its_root_token(self) -> None:
+        """cmux7s, cmux12s, cmux13s, 2026-10-21: 8-9 GiB of admission DerivedData per idle canonical root stayed,
+        because the tmp family judged the whole root and its src/ checkout holds untracked build inputs."""
+        tmp, capacity = self.root / "tmp", self.root / "capacity"
+        capacity.mkdir()
+        for k in (1, 2):
+            (capacity / f"root-{k}.token").touch()
+        one, two = tmp / "cmux-ci", tmp / "cmux-ci-2"
+        make(one / "derived-data-compile-admission", age_hours=50)  # root 1: a job holds it
+        make(two / "derived-data-compile-admission", age_hours=50)
+        make(two / "compile-admission-cas", age_hours=50)
+        make(two / "derived-data-rerun-resolve", age_hours=2)
+        make(two / "src", age_hours=50)  # the root's checkout stays the tmp family's to judge
+        make(tmp / "cmux-ci-next" / "derived-data-x", age_hours=50)  # not a canonical root
+        for odd in ("cmux-ci-\u00b2", "cmux-ci-0", "cmux-ci-02", "cmux-ci-100"):  # not roots the runner hook takes
+            make(tmp / odd / "derived-data-x", age_hours=50)
+        job = open(capacity / "root-1.token")
+        self.addCleanup(job.close)
+        fcntl.flock(job, fcntl.LOCK_EX)  # glaeda-cmux-runner-hook take-root holds it for the whole job
+        with mock.patch.object(gd, "CANONICAL_CAPACITY", capacity):
+            fams = gd.canonical_admission_families(tmp)
+            self.assertEqual([f.root for f in fams], [one, two])
+            self.assertFalse(gd.job_busy(fams[1], two / "derived-data-compile-admission"),
+                             "the root's token, not a slot marker search, decides")
+            items = gd.survey(fams, 6, 0)
+            self.assertEqual({os.path.relpath(i.path, tmp): i.verdict for i in items},
+                             {"cmux-ci/derived-data-compile-admission": "in-use",
+                              "cmux-ci-2/derived-data-compile-admission": "reclaimable",
+                              "cmux-ci-2/compile-admission-cas": "reclaimable",
+                              "cmux-ci-2/derived-data-rerun-resolve": "recent"})
+            reclaim = [i for i in items if i.verdict == "reclaimable"]
+            families = {f.id: f for f in fams}
+            # a job takes root 2 between the survey and the delete: apply re-checks the token and keeps it all
+            late = open(capacity / "root-2.token")
+            fcntl.flock(late, fcntl.LOCK_EX)
+            gd.apply(reclaim, families, self.root / "r1.jsonl", None, 6)
+            late.close()
+            self.assertTrue((two / "derived-data-compile-admission").exists())
+            # apply marks what it refused blocked, so the next pass starts from a fresh survey
+            reclaim = [i for i in gd.survey(fams, 6, 0) if i.verdict == "reclaimable"]
+            self.assertEqual(len(reclaim), 2)
+            gd.apply(reclaim, families, self.root / "r2.jsonl", None, 6)
+            # the delete itself takes the token: a job that arrives after every re-check still keeps its root
+            make(two / "derived-data-raced", age_hours=50)
+            late = open(capacity / "root-2.token")
+            fcntl.flock(late, fcntl.LOCK_SH)
+            self.assertFalse(gd.remove_canonical_admission(two / "derived-data-raced"))
+            late.close()
+            self.assertTrue(gd.remove_canonical_admission(two / "derived-data-raced"))
+        self.assertEqual(sorted(p.name for p in two.iterdir()), ["derived-data-rerun-resolve", "src"],
+                         "nothing renamed aside is left behind")
+        self.assertTrue((one / "derived-data-compile-admission").exists())
+        for receipt, want in (("r1.jsonl", "changed:in-use"), ("r2.jsonl", "reclaimed")):
+            outcomes = {r["outcome"] for r in map(json.loads, (self.root / receipt).read_text().splitlines())}
+            self.assertEqual(outcomes, {want}, receipt)
+        # no token yet: no job ever took the root; a path outside a canonical root is never this family's to delete
+        with mock.patch.object(gd, "CANONICAL_CAPACITY", self.root / "none"):
+            self.assertFalse(gd.canonical_root_held(two / "src"))
+        self.assertTrue(gd.canonical_root_held(tmp / "cmux-ci-next" / "derived-data-x"))
+        self.assertFalse(gd.remove_canonical_admission(tmp / "cmux-ci-next" / "derived-data-x"))
+
     def test_the_emergency_floor_names_its_filesystems(self) -> None:
         total = 460 * gd.GIB  # emergency 10%:30-60 is 46 GiB; a 30 GiB runner floor lifts it to 50 on HOME's volume
         home = gd.HOME.stat().st_dev
