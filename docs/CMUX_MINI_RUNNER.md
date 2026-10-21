@@ -742,6 +742,10 @@ in at the producer's root. So one root job per root per mini:
   `glaeda-side-<class>-xcode-<version>` instead. cmux's light side-lane jobs run on it
   (`vars.CI_SIDE_LANE_RUNNER`, cmux#14391), so they never hold a root runner. A class whose
   `canonicalRoots` equals `runners` has no side runner, so do not point that variable at it.
+  A side runner also carries every narrower class's side label (glaeda_fleet_labels.side_classes(): a
+  std side runner carries `glaeda-side-light-xcode-<version>` too), so GitHub hands a light side-lane job
+  to an idle std side runner when the light minis are busy; a std job never lands on a light mini. cmux's
+  runner-label-reconcile.yml sets already-registered runners' labels to widened_labels() on a schedule.
 - `guiRunners` (0 to `runners - canonicalRoots - fastRunners`, default 0) makes the last instances (`runners - 1` down) the
   mini's gui-role runners. The last of them is the console gui runner. It carries
   the gui pool label `glaeda-gui-<class>-xcode-<version>` and neither the pool, root, side nor

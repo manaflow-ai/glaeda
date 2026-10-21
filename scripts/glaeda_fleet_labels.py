@@ -96,6 +96,48 @@ def side_label(pool: str) -> str:
     return _role_label(pool, "side")
 
 
+def side_classes(klass: str) -> tuple[str, ...]:
+    """The classes whose side label a `klass` runner carries: its own, then every narrower class.
+
+    RUNNER_CLASSES is widest first, and a wider mini runs whatever a narrower one runs (a std M4 Pro, 48 GB, runs a
+    light M4's side-lane job; never the reverse). So a std side runner also carries glaeda-side-light-xcode-<v>, and
+    GitHub's own queue hands a job asking for the light side label to whichever of those runners is idle: a starved
+    light pool spills onto idle std side runners for every workflow, picker or not. On 2026-10-20 at 22:22Z the light
+    side label had 133 jobs queued on 3 online runners while 51 std side runners sat idle. Only side labels widen:
+    root, gui, session and fast labels keep their own class (canonical roots, the gui token and the fast tokens are
+    per class), and the pool namespace and trust stay the member's own (pool_label's arguments).
+    """
+    return RUNNER_CLASSES[RUNNER_CLASSES.index(klass):] if klass in RUNNER_CLASSES else ()
+
+
+def widened_labels(labels: list[str]) -> list[str]:
+    """`labels` plus every side label side_classes() adds to the side labels among them, in order, each once.
+
+    The registered labels of a runner installed before side_classes() lack the narrower classes' side labels.
+    A reconciler with the organization's runner-label permission (GitHub fixes labels at registration, and a
+    mini holds no admin token) sets a runner's custom labels to this, so a manifest change reaches every
+    registered runner without a relabel by hand. Pure and idempotent: widened_labels(widened_labels(x)) ==
+    widened_labels(x), and it only adds a label member_labels() would itself issue for that runner.
+    """
+    out = list(dict.fromkeys(labels))
+    for label in list(out):
+        parts = label.split("-")
+        index = next((i for i, part in enumerate(parts) if part in RUNNER_CLASSES), None)
+        if (index is None or parts[0] != "glaeda" or "side" not in parts[1:index]
+                or parts[index + 1:index + 2] != ["xcode"] or not re.fullmatch(VERSION_RE, "-".join(parts[index + 2:]))):
+            continue
+        pool = "-".join(part for i, part in enumerate(parts) if not (part == "side" and 0 < i < index))
+        if side_label(pool) != label:
+            continue
+        for klass in side_classes(parts[index])[1:]:
+            narrower = pool.split("-")
+            narrower[narrower.index(parts[index])] = klass
+            wanted = side_label("-".join(narrower))
+            if wanted not in out:
+                out.append(wanted)
+    return out
+
+
 def gui_label(pool: str) -> str:
     """The label of a pool's console gui runner (the last gui-role instance). The GUI jobs (app-host shards,
     tests-build-and-lag, app-host-test-rerun) run on it: each needs the mini's one gui token (one console session),
@@ -252,7 +294,8 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
             "runners": runners, "capacityUnits": units, "compileSlots": compile_slots,
             "trustedRef": trusted_ref, "trustedRepo": trusted_repo, "trustedNextNightly": next_nightly,
             "canonicalRoots": roots, "rootPools": [root_label(label) for label in dict.fromkeys(pools)],
-            "sidePools": [side_label(label) for label in dict.fromkeys(pools)],
+            "sidePools": list(dict.fromkeys(side_label(pool_label(k, v, bool(trusted_ref), pool_prefix))
+                                            for v in (versions if pools else []) for k in side_classes(klass))),
             "guiRunners": gui, "guiPools": [gui_label(label) for label in dict.fromkeys(pools)] if gui else [],
             "sessionPools": [session_label(label) for label in dict.fromkeys(pools)] if gui else [],
             "fastRunners": fast, "fastPools": [fast_label(label) for label in dict.fromkeys(pools)] if fast else []}, None

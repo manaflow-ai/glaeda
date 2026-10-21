@@ -244,8 +244,8 @@ WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "
 # in glaeda-cmux-jobs.jsonl, rounded up, from 14,421 jobs on the 11 std PR minis, 2026-10-12 20:24Z to 10-19 20:24Z,
 # each job re-classed by these tables. By class (n, p50/p75/p90 cores): compile (3611) 3.96/4.53/5.20: 5;
 # isolated (8597) 2.45/3.85/4.68: 4; compile-gui (415) 0.52/3.50/4.12: 4; light (304) 0.69/2.58/3.75, but
-# every light job on a std mini has its own JOB_CORES cost, and the side-lane jobs left to the class run on the
-# light minis (glaeda-side-*, p75 1.33 there): 2;
+# every light job on a std mini has its own JOB_CORES cost, and the side-lane jobs left to the class measured on the
+# light minis (glaeda-side-*, p75 1.33 there; std side runners take them too since side_classes()): 2;
 # gui-step (852) 0.45/0.58/0.69, simulator (378) 0.18/0.28/0.42, product (195) 0.17/0.28/0.35 and gui (69)
 # 0.23/0.32/0.60: 1. seed has no PR-mini telemetry (trusted minis only) and compiles a whole DerivedData: a
 # compile's 5. The simulator and gui tokens, not units, keep those jobs one per mini. isolated is also the class
