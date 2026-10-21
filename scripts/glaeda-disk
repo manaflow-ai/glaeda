@@ -112,6 +112,20 @@ cmux-browser-fleet/build and protected release-support caches are never deleted.
 browser tour artifacts and fleet cache entries older than the 2026-09-17 migration cutoff are
 disposable; newer ones stay when a live reservation or lease names them.
 
+Under the runner gate's disk floor (FLOOR_HOLD) the windows that only keep things warm give way, least
+recently used first and only down to the floor plus target_margin_gib: an idle runner's checkout build
+output, its cmux-next scheme state's generated output (cmux-scheme/<runner name>, only while that runner
+has no Runner.Worker), and code-sign clones other than each bundle's newest copy and any running app's.
+cmux7s sat at 21 GiB under a 30 GiB floor with 40 GiB of media CI's cmux DEV clones and 20 GiB of
+per-runner cmux-next Build "recent" (2026-10-21).
+
+Kill switch: while ~/.config/glaeda/disk-off exists, or disk-policy.json has "enabled": false, an
+--apply (or --dedupe) run deletes nothing; it says so and exits 0. Every --apply run, whatever it
+did, appends exactly one JSON line to the run log (macOS ~/Library/Logs/glaeda-disk-runs.jsonl, Linux
+~/.local/state/glaeda/disk-runs.jsonl): free space before and after, target, floor, reclaimed, whether
+the target was reached, the biggest blocked families, and why a run skipped (off, no pressure, a
+lock held, a deferral).
+
 Free space is judged per filesystem. On Linux /tmp is often its own tmpfs, so pressure there
 reclaims only /tmp items, and pressure on the home filesystem never deletes from /tmp.
 Thresholds scale with the disk: "15%:40-150" is 15% of it, at least 40 and at most 150 GiB,
@@ -875,11 +889,25 @@ def item_window(fam: Family, path: Path, idle_hours: float, archived: frozenset[
         with contextlib.suppress(OSError):
             if fam.root.stat().st_dev in EMERGENCY_DEVS:
                 return 0.0
-    if fam.id == RUNNER_BUILD_FAMILY:
+    if floor_hold_family(fam, path):
         with contextlib.suppress(OSError):
             if fam.root.stat().st_dev in FLOOR_HOLD:
                 return 0.0
     return idle_window(fam, idle_hours)
+
+
+def floor_hold_family(fam: Family, path: Path) -> bool:
+    """Whether the runner gate's floor hold lets PATH go before its family's window: an idle runner's checkout
+    build output, an enrolled runner's cmux-next scheme output (its Runner.Worker vetoes it in
+    cmux_next_ci_busy), and code-sign clones (keep_live_app_clones and app_clone_running keep the live ones)."""
+    if fam.id == RUNNER_BUILD_FAMILY or fam.app_clones:
+        return True
+    return fam.id == CMUX_NEXT_CI_FAMILY and not CMUX_NEXT_CI_DRAIN and cmux_next_ci_runner(path, fam.root) is not None
+
+
+def floor_hold_only(fam: Family, item: "Item", idle_hours: float) -> bool:
+    """Reclaimable only because of the floor hold: younger than its family's own window."""
+    return floor_hold_family(fam, Path(item.path)) and item.idle_hours < idle_window(fam, idle_hours)
 
 
 # The idle sweep (--idle): windows from how often each family is read again, not from free space.
@@ -916,7 +944,14 @@ def idle_families(fams: list[Family]) -> list[Family]:
 # soft_idle_hours with pressure_jobs since: the soft 24 h rule, never an age cap on a quiet fleet. A host
 # without a job log keeps the wall-clock windows. Every threshold is a key of DISK_POLICY.
 DISK_POLICY = HOME / ".config/glaeda/disk-policy.json"
+# The kill switch (or "enabled": false in DISK_POLICY): an --apply run deletes nothing.
+DISK_OFF = HOME / ".config/glaeda/disk-off"
+# One JSON line per --apply run (write_run_line), next to the verbose log the agents keep.
+RUN_LOG = HOME / ("Library/Logs/glaeda-disk-runs.jsonl" if sys.platform == "darwin"
+                  else ".local/state/glaeda/disk-runs.jsonl")
+RUN: dict[str, Any] = {}  # what this run did, for its run line; _main_impl fills it
 POLICY_DEFAULTS: dict[str, Any] = {
+    "enabled": True,
     "low": "25%:60-200",
     "target": "35%:100-350",
     "emergency": "10%:30-60",
@@ -2016,6 +2051,16 @@ def keep_live_app_clones(level: list[Path], commands: str | None = None) -> list
             continue
         out.append(p)
     return out
+
+
+def app_clone_running(clone: Path, commands: str) -> bool:
+    """Whether an app in this code_sign_clone copy runs (keep_live_app_clones' test, for one copy right before
+    its delete); unreadable counts as running."""
+    try:
+        apps = [e.name[:-len(".bundle")] for e in os.scandir(clone) if e.name.endswith(".app.bundle")]
+    except OSError:
+        return True
+    return any(f"{app}/Contents/MacOS/" in commands for app in apps)
 
 
 def bazel_family(root: Path) -> Family:
@@ -5723,7 +5768,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
     archived = archived_seeds() if any(i.family == "cmux-seeds" for i in items) else frozenset()
     # Among pressure hot-tier items, evict greatest reuse distance, then oldest use.
     def order(i):
-        if i.family == RUNNER_BUILD_FAMILY and i.idle_hours < idle_window(family_of(i), idle_hours):
+        if floor_hold_only(family_of(i), i, idle_hours):
             return (-1, 0, i.idle_hours, i.bytes)  # reclaimable only by FLOOR_HOLD: warm builds go last
         if i.family == RUNNER_GIT_GARBAGE_FAMILY:  # garbage nothing reads goes before anything that costs a rebuild
             return (2, 0, i.idle_hours, i.bytes)
@@ -5752,7 +5797,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 continue
             if dev not in targets or free_bytes(p.parent)[0] >= targets[dev]:
                 continue
-        if fam.id == RUNNER_BUILD_FAMILY and i.idle_hours < idle_window(fam, idle_hours):
+        if floor_hold_only(fam, i, idle_hours):
             # reclaimable only by the floor hold: it stops at the floor plus target_margin_gib
             try:
                 stop = FLOOR_HOLD.get(p.parent.stat().st_dev)
@@ -5777,8 +5822,9 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             cwds = open_index(opened)
         if fam.build_output and fam.root.is_relative_to(FLEET_CI):
             cmds = command_lines() or cmds
-        if fam.id == RUNNER_BUILD_FAMILY:
-            # the runner may have taken a job since the survey: its Runner.Worker shows in a fresh ps
+        if fam.id == RUNNER_BUILD_FAMILY or fam.app_clones:
+            # the runner may have taken a job since the survey (its Runner.Worker shows in a fresh ps), or an
+            # app may have started from a clone: a running app names only its installed path, so ps it is
             cmds = command_lines()
             if not cmds:
                 print("refusing to delete the rest: ps failed", file=sys.stderr)
@@ -5810,6 +5856,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             outcome = "changed:layout"
         elif (cmux_next_ci_busy(fam, p, cwds, cmds)
                 or (fam.id == RUNNER_BUILD_FAMILY and runner_job_live(fam.root.parent, cmds))
+                or (fam.app_clones and app_clone_running(p, cmds))
                 or in_cwd(i.path, cwds) or named_by(i.path, cmds) or holds_socket(p) or job_busy(fam, p)
                 or (i.family == "claude-scratchpad" and claude_session_active(p.name, idle_hours * 3600))
                 or (i.family == SPM_SCRATCH and spm_scratch_held(p))
@@ -5928,6 +5975,22 @@ def cmux_next_ci_state_roots(root: Path) -> list[Path]:
     return roots
 
 
+def cmux_next_ci_runner(path: Path, root: Path) -> Path | None:
+    """The enrolled runner whose cmux-scheme/<agentName> state holds generated child PATH, or None (a dev-daily
+    or release state, or a runner no longer enrolled here). cmux-next.yml names the state after the runner."""
+    state = cmux_next_ci_state_for(path, root)
+    if state is None or state.parent != root / "cmux-scheme":
+        return None
+    for runner in enrolled_runners():
+        try:
+            name = json.loads((runner / ".runner").read_text(encoding="utf-8-sig")).get("agentName")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if name == state.name:
+            return runner
+    return None
+
+
 def cmux_next_ci_generated_paths(root: Path) -> list[Path]:
     """Generated children eligible for the cmux-next retention family.
 
@@ -5999,6 +6062,8 @@ def cmux_next_ci_busy(fam: Family, path: Path, opened: list[str] | frozenset[str
     state = cmux_next_ci_state_for(path, fam.root)
     if state is None:
         return "cmux-next state root is no longer validated"
+    if (runner := cmux_next_ci_runner(path, fam.root)) is not None and (why := runner_job_live(runner, commands)):
+        return why
     state_text = os.fspath(state)
     if in_cwd(state_text, opened) or named_by(state_text, commands):
         return "cmux-next state is referenced by a process"
@@ -6422,6 +6487,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
 
     def deferred(reason: str, message: str, **details) -> int:
+        RUN["skipped"] = reason
         if a.json:
             print(json.dumps({"status": "deferred", "complete": False,
                               "reason": reason, "message": message, **details}))
@@ -6437,6 +6503,12 @@ def _main_impl(argv: list[str] | None = None) -> int:
         # Keepup is intentionally report-first; callers must opt into mutation with --apply.
         a.pressure = bool(a.apply)
         a.idle = bool(a.apply)
+    RUN.update(apply=a.apply, mode="keepup" if a.command == "keepup" else "pressure" if a.pressure
+               else "idle" if a.idle else "apply")
+    if (a.apply or a.dedupe or a.dedupe_builds) and (why := disk_off()):
+        print(f"glaeda-disk is off ({why}): nothing deleted")
+        RUN.update(off=True, skipped="off")
+        return 0
     role = "devbox" if a.role_devbox else (a.role or "fleet-mini")
     global ROLE
     ROLE = role
@@ -6543,13 +6615,19 @@ def _main_impl(argv: list[str] | None = None) -> int:
     # pressure runs, which then touch nothing but that filesystem's families
     under = any(fs.under for fs in fss.values() if a.pressure or not fs.tmpfs)
     sweep = a.idle and not (a.pressure and under)
+    RUN["floor_gib"] = round(floor_gib, 1)
+    with contextlib.suppress(OSError):
+        if (home_fs := fss.get(HOME.stat().st_dev)) is not None:
+            RUN.update(target_gib=round(home_fs.target / GIB, 1), target_bytes=home_fs.target)
     if a.pressure and not under:
         for fs in fss.values():
             print(f"no pressure: {gib(fs.free).strip()} free >= {gib(fs.low).strip()} on {fs.mount}")
         if not a.idle:
+            RUN["skipped"] = "no pressure"
             return 0
         if not idle_due():
             print(f"idle sweep: the last one ran within {IDLE_SWEEP_EVERY_S // 60} min")
+            RUN["skipped"] = "no pressure; idle sweep ran within the hour"
             return 0
     global ACTIVITY_MODE, EMERGENCY_DEVS, FLOOR_HOLD
     ACTIVITY_MODE = "sweep" if sweep else "pressure" if a.pressure else None
@@ -6569,6 +6647,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
         fams = [f for f in fams if fss[f.root.stat().st_dev].under]
         if a.apply and POLICY["defer_during_ci"] and (why := ci_defer(fss, ci_jobs(), a.emergency, floor_gib)):
             print(why)
+            RUN["skipped"] = "defer_during_ci"
             return 0
     # Aside trees a killed deletion left, in the directories of the families this run judges (so a pressure
     # run looks only on the filesystems under pressure); `--family interrupted-deletions` alone looks in all.
@@ -6693,6 +6772,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
                                  else filesystem_accounting(list(fss.values()), items))
     before_fs_receipt = filesystem_receipt_state(fss)
     operation = "idle" if sweep else "pressure" if a.pressure else "apply"
+    RUN["mode"] = operation
     write_health_summary(shown, items, accounting, a.receipt)
     # Xcode copies are sized by a walk, so only a report shows them (the agent runs with --top 0)
     tooling = (simulator_runtimes() + (xcode_items() if a.top or a.json else [])) \
@@ -6747,6 +6827,12 @@ def _main_impl(argv: list[str] | None = None) -> int:
                 free = fs.free
             if free < fs.low:
                 remaining.append(f"{gib(free).strip()} free on {fs.mount}")
+        RUN["released"] = logical_released
+        blocked: dict[str, int] = {}
+        for i in items:
+            if i.verdict != "reclaimable":
+                blocked[i.family] = blocked.get(i.family, 0) + i.bytes
+        RUN["blocked"] = {f: round(b / GIB, 1) for f, b in sorted(blocked.items(), key=lambda x: -x[1])[:3]}
         if logical_released:
             notify_disk("glaeda disk keepup", f"{gib(logical_released).strip()} reclaimed on {platform.node()}")
         if remaining:
@@ -6787,12 +6873,62 @@ def _main_impl(argv: list[str] | None = None) -> int:
     return 0
 
 
+def disk_off() -> str:
+    """Why the kill switch is on, or "": DISK_OFF exists, or the policy says "enabled": false."""
+    if os.path.lexists(DISK_OFF):
+        return f"{DISK_OFF} exists"
+    if not POLICY["enabled"]:
+        return f'{DISK_POLICY} has "enabled": false'
+    return ""
+
+
+def _home_free() -> int | None:
+    try:
+        return free_bytes(HOME)[0]
+    except OSError:
+        return None
+
+
+def write_run_line(started: float, free_before: int | None) -> None:
+    """The run's one line in RUN_LOG; a log that cannot be written never fails the run."""
+    after = _home_free()
+    target = RUN.get("target_bytes")
+
+    def g(b):
+        return None if b is None else round(b / GIB, 1)
+    row = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(), "mode": RUN.get("mode"),
+           "off": bool(RUN.get("off")), "free_gib_before": g(free_before), "free_gib_after": g(after),
+           "target_gib": RUN.get("target_gib"), "floor_gib": RUN.get("floor_gib"),
+           "reclaimed_gib": round(RUN.get("released", 0) / GIB, 1),
+           "reached": None if target is None or after is None else after >= target,
+           "blocked": RUN.get("blocked", {}), "duration_s": round(time.time() - started, 1),
+           "skipped": RUN.get("skipped")}
+    with contextlib.suppress(OSError):
+        RUN_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with RUN_LOG.open("a") as f:
+            f.write(json.dumps(row) + "\n")
+
+
+def _logged_main(args: list[str]) -> int:
+    """_main_impl, then one run line when it was an --apply run (whatever it did, or why it skipped)."""
+    RUN.clear()
+    started, before = time.time(), _home_free()
+    try:
+        return _main_impl(args)
+    except BaseException as e:
+        RUN.setdefault("skipped", f"error: {type(e).__name__}")
+        raise
+    finally:
+        if RUN.get("apply"):
+            write_run_line(started, before)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the disk command, bounding only the owned background refresh process."""
     args = list(sys.argv[1:] if argv is None else argv)
     background = "--refresh" in args and "--refresh-lock-fd" in args and "--apply" not in args
     if not background:
-        return _main_impl(args)
+        return _logged_main(args)
     budget_s = REFRESH_BUDGET_S
     with contextlib.suppress(ValueError, IndexError):
         budget_s = max(1.0, float(args[args.index("--refresh-budget-s") + 1]))
