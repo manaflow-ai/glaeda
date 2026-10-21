@@ -72,6 +72,11 @@ except as the last resort of a pressure run still under the runner gate's disk f
 held open by nothing, goes, least recently used first, until free space reaches the floor plus
 target_margin_gib. The runner's next job clones it again.
 
+Tests leave one small scratch entry per case in the runner user's $TMPDIR (cmux-cli-socket-<uuid>,
+git-pr-<uuid>, TemporaryDirectory.<rand>, ...): tens of thousands, each under the 50 MiB item floor, so no
+family reclaims them. user-tmp-test-residue removes entries named by TMP_TEST_RESIDUE on every apply (not only
+under pressure) once nothing in the whole entry changed for 48 hours and no process holds or names it.
+
 The runner-account profile is intentionally narrower than the normal user profile:
 it covers only DerivedData, cmux reload/GhosttyKit caches, and CUA recordings/frame
 caches, with a seven-day minimum idle age. Git index refreshes are ignored for that
@@ -127,6 +132,7 @@ import ast
 import atexit
 import bisect
 import calendar
+import collections
 import contextlib
 import fcntl
 import gzip
@@ -1601,6 +1607,146 @@ def evict_idle_runner_checkouts(receipt: Path, floor_gib: float, home: Path | No
             f.write(json.dumps(rec) + "\n")
         if outcome == "reclaimed":
             print(f"  reclaimed {gib(size).strip():>8s}  {checkout} (idle runner checkout, under the disk floor)")
+    return released
+
+
+
+# Test runs leave one small scratch entry per test case in the runner user's $TMPDIR and never remove it:
+# 88k entries and 22.6 GiB on cmux14, 36k and 11.9 GiB on cmuxs-mac-mini-6 (2026-10-21), almost all of
+# them under the 50 MiB item floor, so the user-tmp family never sized or reclaimed one. Named here by the
+# prefixes those tests use, each followed by its random suffix; anything else in $TMPDIR stays with
+# user-tmp. Measured on the minis: cmux-cli-socket-<uuid> (a ~48 MiB copy of the DEV app per CLI socket
+# test), cnd-bin-<n>, git-{pr,pr-merge,stage,hunk}-<uuid>, Foundation's TemporaryDirectory.<rand>.
+TMP_TEST_RESIDUE_FAMILY = "user-tmp-test-residue"
+TMP_TEST_RESIDUE = re.compile(
+    r"(?:cmux-cli-socket|cnd-bin|git-pr-merge|git-pr|git-stage|git-hunk|cmux-home-attach-tests|cmux-file-pages"
+    r"|floating-chat|header-pr|picker-listing|swift-package-test\.XXXXXX|TemporaryDirectory|cmux-claude-hooks"
+    r"|swift-crash-reproducer|cmux-shortcut-routing|cmux-agent-journal-test|cmux-git-active-pwd"
+    r"|cmux-ssh-pty-replay)[-.][0-9A-Za-z]")
+TMP_TEST_RESIDUE_IDLE_HOURS = 48.0  # nothing in the entry changed for two days: no test run still uses it
+TMP_TEST_RESIDUE_WALK_BUDGET = 20_000  # entries walked per candidate; a bigger tree is not proven idle
+TMP_TEST_RESIDUE_EVIDENCE_S = 60.0  # process evidence is re-read at least this often during a pass
+TMP_TEST_RESIDUE_BUDGET_S = 600.0  # one pass stops here and holds the eviction lock no longer; the next continues
+
+
+def tree_newest(path: Path, budget: int | None = None, deadline: float | None = None) -> tuple[float, int] | None:
+    """Newest mtime of path and of everything below it, and the bytes allocated to it, without following
+    symlinks. None when the walk would visit more than budget entries, passes deadline (time.time()), meets
+    a directory it cannot read or another filesystem mounted below path: such a tree is not proven idle."""
+    budget = TMP_TEST_RESIDUE_WALK_BUDGET if budget is None else budget
+    try:
+        st = path.lstat()
+    except OSError:
+        return None
+    newest, used, dev = st.st_mtime, st.st_blocks * 512, st.st_dev
+    stack = [os.fspath(path)] if stat.S_ISDIR(st.st_mode) else []
+    while stack:
+        try:
+            with os.scandir(stack.pop()) as it:
+                for e in it:
+                    budget -= 1
+                    if budget < 0 or (deadline is not None and time.time() > deadline):
+                        return None
+                    try:
+                        est = e.stat(follow_symlinks=False)
+                    except OSError:
+                        return None
+                    if est.st_dev != dev:  # rmtree would descend into a mount below the entry
+                        return None
+                    newest = max(newest, est.st_mtime)
+                    used += est.st_blocks * 512
+                    if stat.S_ISDIR(est.st_mode):
+                        stack.append(e.path)
+        except OSError:
+            return None
+    return newest, used
+
+
+def tmp_test_residue_veto(entry: Path, opened: frozenset[str], cmds: str, now: float,
+                          deadline: float | None = None) -> tuple[str, int]:
+    """Why a test-scratch entry in $TMPDIR must stay ("" when it may go), and its allocated bytes."""
+    if entry.is_symlink():
+        return "a symlink", 0
+    seen = tree_newest(entry, deadline=deadline)
+    if seen is None:
+        return (f"not proven idle (unreadable, a mount below it, over {TMP_TEST_RESIDUE_WALK_BUDGET} entries"
+                " or past the pass budget)"), 0
+    newest, used = seen
+    if (now - newest) / 3600 < TMP_TEST_RESIDUE_IDLE_HOURS:
+        return f"changed within {TMP_TEST_RESIDUE_IDLE_HOURS:g}h", used
+    path, resolved = os.fspath(entry), os.fspath(entry.resolve())
+    if in_cwd(path, opened) or in_cwd(resolved, opened):
+        return "open or a working directory of a process", used
+    if named_by(path, cmds) or named_by(resolved, cmds):
+        return "named by a running command", used
+    return "", used
+
+
+def reap_tmpdir_test_residue(receipt: Path, tmp: Path | None = None, halt=None) -> int:
+    """Remove test scratch the runner user's tests left in $TMPDIR: entries named by TMP_TEST_RESIDUE, whole
+    trees unchanged for TMP_TEST_RESIDUE_IDLE_HOURS, held open and named by no process. Every candidate is
+    walked and judged right before its own deletion; process evidence is never older than
+    TMP_TEST_RESIDUE_EVIDENCE_S, and missing evidence stops the pass. One summary receipt line per pass."""
+    tmp = (darwin_user_tmp() if DARWIN else None) if tmp is None else tmp
+    if tmp is None or tmp.is_symlink() or not tmp.is_dir():
+        return 0
+    start = now = time.time()
+    names = []
+    try:
+        with os.scandir(tmp) as it:
+            for e in it:
+                if not TMP_TEST_RESIDUE.match(e.name):
+                    continue
+                with contextlib.suppress(OSError):  # an entry a test removed mid-scan drops only itself
+                    # an entry whose own mtime is recent cannot be idle; skip it without walking it
+                    if (now - e.stat(follow_symlinks=False).st_mtime) / 3600 >= TMP_TEST_RESIDUE_IDLE_HOURS:
+                        names.append(e.name)
+    except OSError:
+        return 0
+    names.sort()
+    released, removed, kept, stopped = 0, collections.Counter(), collections.Counter(), ""
+    evidence: tuple[frozenset[str], str] | None = None
+    read_at = 0.0
+    for name in names:
+        now = time.time()
+        if now - start > TMP_TEST_RESIDUE_BUDGET_S:
+            stopped = f"pass budget {TMP_TEST_RESIDUE_BUDGET_S:g}s reached"
+            break
+        if evidence is None or now - read_at > TMP_TEST_RESIDUE_EVIDENCE_S:
+            if halt is not None and (why := halt()):
+                stopped = f"halted: {why}"
+                break
+            try:
+                opened, cmds = process_evidence()
+            except NoEvidence as e:
+                stopped = f"no process evidence: {e}"
+                print(f"refusing to reap $TMPDIR test scratch: {e}", file=sys.stderr)
+                break
+            evidence, read_at = (open_index(opened), cmds), time.time()
+        entry = tmp / name
+        why, used = tmp_test_residue_veto(entry, evidence[0], evidence[1], time.time(),
+                                          deadline=start + TMP_TEST_RESIDUE_BUDGET_S)
+        prefix = TMP_TEST_RESIDUE.match(name).group(0)[:-2]
+        if why:
+            kept[why.split(" (")[0]] += 1
+            continue
+        try:
+            remove(entry)
+        except OSError as e:
+            kept[f"incomplete:{e.__class__.__name__}"] += 1
+            continue
+        removed[prefix] += 1
+        released += used
+    rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(),
+           "outcome": "reclaimed" if removed else "none", "family": TMP_TEST_RESIDUE_FAMILY,
+           "path": os.fspath(tmp), "bytes": released, "items": sum(removed.values()),
+           "by_prefix": dict(removed), "kept": dict(kept), "candidates": len(names),
+           **({"stopped": stopped} if stopped else {})}
+    if names:
+        with contextlib.suppress(OSError), receipt.open("a") as f:  # a lost receipt line must not stop the pass
+            f.write(json.dumps(rec) + "\n")
+    if removed:
+        print(f"  reclaimed {gib(released).strip():>8s}  {sum(removed.values())} test scratch entries in {tmp}")
     return released
 
 
@@ -6092,6 +6238,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
         # are absent, its disposable checkout can be cleared under this same eviction lock.
         if not RUNNER_CACHE_PROFILE:
             logical_released += cleanup_paused_runner_work(a.receipt)
+        # test scratch left in $TMPDIR, two days untouched: too small per entry for any family's size floor
+        if not RUNNER_CACHE_PROFILE and not a.cmux_next_drain \
+                and (not a.family or TMP_TEST_RESIDUE_FAMILY in a.family):
+            logical_released += reap_tmpdir_test_residue(a.receipt, halt=halt)
         # still under the runner gate's floor after every family: idle runners' whole checkouts, last
         if a.pressure and not RUNNER_CACHE_PROFILE and not a.cmux_next_drain \
                 and (not a.family or RUNNER_IDLE_CHECKOUT_FAMILY in a.family):

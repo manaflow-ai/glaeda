@@ -28,6 +28,11 @@ spec = importlib.util.spec_from_loader("glaeda_disk", loader)
 gd = importlib.util.module_from_spec(spec)
 sys.modules["glaeda_disk"] = gd
 loader.exec_module(gd)
+# An --apply in a test must never reap the real $TMPDIR of the host running the suite: without a tmp of
+# the test's own, the TMPDIR reaper does nothing.
+_reap_tmpdir_test_residue = gd.reap_tmpdir_test_residue
+gd.reap_tmpdir_test_residue = (lambda receipt, tmp=None, halt=None:
+                               0 if tmp is None else _reap_tmpdir_test_residue(receipt, tmp, halt))
 
 
 def make(path: Path, mib: int = 1, age_hours: float = 48) -> Path:
@@ -2950,6 +2955,175 @@ class GlaedaDiskTest(unittest.TestCase):
             gd.main(["--pressure", "--apply", "--no-snapshot", "--top", "0", *receipt])
             last.assert_called_once()
             self.assertEqual(last.call_args.args[1], 30.0)
+
+    def _tmp_residue(self) -> tuple[Path, dict[str, Path]]:
+        """A fake $TMPDIR: named test scratch, old and new, beside entries the reaper must never take."""
+        tmp = self.root / "T"
+        e: dict[str, Path] = {}
+        e["socket"] = tmp / "cmux-cli-socket-00D670AE-52D1-4CCE-88A3-08D9A0C1851D"
+        (e["socket"] / "cmux DEV.app/Contents/MacOS").mkdir(parents=True)
+        (e["socket"] / "cmux DEV.app/Contents/MacOS/cmux").write_bytes(b"\0" * 4096)
+        e["git"] = tmp / "git-pr-003CE1E9-4204-4B78-8FB7-87EFC23D81A3"
+        (e["git"] / "repo/.git").mkdir(parents=True)
+        e["foundation"] = tmp / "TemporaryDirectory.000X0T"
+        e["foundation"].mkdir()
+        (e["foundation"] / ".keep-directory").write_text("")
+        e["file"] = tmp / "cmux-shortcut-routing-0008E778-433F-46C4-89E2-78F8075D2C08.json"
+        e["file"].write_text("{}")
+        e["recent"] = tmp / "cmux-cli-socket-0171FEFD-85E4-43A4-B516-55787B935041"
+        e["recent"].mkdir()
+        e["inner-recent"] = tmp / "git-stage-00560C4B-4E10-4993-BE64-00845DEB616F"
+        (e["inner-recent"] / "a/b").mkdir(parents=True)
+        e["unknown"] = tmp / "notes-from-an-agent"
+        e["unknown"].mkdir()
+        e["apple"] = tmp / "com.apple.WebKit.Networking"
+        e["apple"].mkdir()
+        e["dash"] = tmp / "--git-pr-0358FC19-C6D4-4553"
+        e["dash"].mkdir()
+        outside = self.root / "outside-clone"
+        (outside / ".git").mkdir(parents=True)
+        e["link"] = tmp / "git-hunk-04049B5D-F71E-44B9-B596-0356BB38F98B"
+        e["link"].symlink_to(outside)
+        for name, path in e.items():
+            if name != "recent":
+                self._age(path if not path.is_symlink() else outside, hours=72)
+        (e["inner-recent"] / "a/b/fresh").write_text("still in use")  # an old top with a fresh file inside
+        os.utime(e["inner-recent"], (time.time() - 72 * 3600,) * 2)
+        os.utime(e["recent"], None)
+        os.utime(e["link"], (time.time() - 72 * 3600,) * 2, follow_symlinks=False)
+        return tmp, e
+
+    def test_tmpdir_test_residue_reaps_only_old_named_test_scratch(self) -> None:
+        tmp, e = self._tmp_residue()
+        receipt = self.receipt()
+        with contextlib.redirect_stdout(io.StringIO()):
+            released = gd.reap_tmpdir_test_residue(receipt, tmp)
+        gone = {n for n, p in e.items() if not os.path.lexists(p)}
+        self.assertEqual(gone, {"socket", "git", "foundation", "file"})
+        self.assertGreater(released, 0)
+        self.assertTrue((self.root / "outside-clone/.git").is_dir())  # a symlinked entry is never followed
+        self.assertTrue(tmp.is_dir())
+        self.assertEqual(sorted(p.name for p in tmp.iterdir() if p.name.startswith(gd.DELETING_PREFIX)), [])
+        rec = json.loads(receipt.read_text())
+        self.assertEqual((rec["family"], rec["outcome"], rec["items"]), (gd.TMP_TEST_RESIDUE_FAMILY, "reclaimed", 4))
+        self.assertEqual(rec["by_prefix"], {"cmux-cli-socket": 1, "git-pr": 1, "TemporaryDirectory": 1,
+                                            "cmux-shortcut-routing": 1})
+        self.assertEqual(rec["kept"], {"a symlink": 1, "changed within 48h": 1})  # recent tops are never walked
+
+    def test_tmpdir_test_residue_vetoes_open_and_named_entries(self) -> None:
+        tmp, e = self._tmp_residue()
+        opened = e["socket"] / "cmux DEV.app/Contents/MacOS/cmux"
+        gd.process_evidence = lambda: ([str(opened)], f"/usr/bin/git -C {e['git']}/repo status\n")
+        receipt = self.receipt()
+        with contextlib.redirect_stdout(io.StringIO()):
+            gd.reap_tmpdir_test_residue(receipt, tmp)
+        self.assertTrue(e["socket"].is_dir())
+        self.assertTrue(e["git"].is_dir())
+        self.assertFalse(e["foundation"].exists())
+        kept = json.loads(receipt.read_text())["kept"]
+        self.assertEqual(kept["open or a working directory of a process"], 1)
+        self.assertEqual(kept["named by a running command"], 1)
+
+    def test_tmpdir_test_residue_fails_closed(self) -> None:
+        tmp, e = self._tmp_residue()
+
+        def no_evidence():
+            raise gd.NoEvidence("lsof failed (exit 1)")
+        gd.process_evidence = no_evidence
+        receipt = self.receipt()
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(gd.reap_tmpdir_test_residue(receipt, tmp), 0)
+        self.assertTrue(all(os.path.lexists(p) for p in e.values()))
+        self.assertIn("no process evidence", json.loads(receipt.read_text())["stopped"])
+        # a tree too big to walk within the budget is not proven idle
+        gd.process_evidence = lambda: ([], "")
+        with mock.patch.object(gd, "TMP_TEST_RESIDUE_WALK_BUDGET", 1), contextlib.redirect_stdout(io.StringIO()):
+            self.assertIsNone(gd.tree_newest(e["socket"], 1))
+            gd.reap_tmpdir_test_residue(self.receipt(), tmp)
+        self.assertTrue(e["socket"].is_dir())  # 4 entries below it, budget 1
+        self.assertFalse(e["file"].exists())  # a plain file needs no walk
+        # a busy host halts the sweep before anything goes
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gd.reap_tmpdir_test_residue(self.receipt(), tmp, halt=lambda: "a CI job runs"), 0)
+        self.assertTrue(e["socket"].is_dir())
+
+    def test_tmpdir_test_residue_rereads_evidence_during_a_pass(self) -> None:
+        tmp, e = self._tmp_residue()
+        calls = []
+
+        def evidence():
+            calls.append(1)  # after the first deletion, a test starts in the git scratch
+            return ([], "") if len(calls) == 1 else ([str(e["git"] / "repo")], "")
+        gd.process_evidence = evidence
+        with mock.patch.object(gd, "TMP_TEST_RESIDUE_EVIDENCE_S", -1.0), contextlib.redirect_stdout(io.StringIO()):
+            gd.reap_tmpdir_test_residue(self.receipt(), tmp)
+        self.assertGreater(len(calls), 1)
+        self.assertTrue(e["git"].is_dir())
+        self.assertFalse(e["socket"].exists())  # sorted first: TemporaryDirectory, cmux-cli-socket, ...
+
+    def test_tmpdir_test_residue_runs_on_every_apply_but_not_a_report(self) -> None:
+        dev = gd.HOME.stat().st_dev
+        fss = {dev: gd.Fs(dev, "/", 300 * gd.GIB, 460 * gd.GIB, 34 * gd.GIB, 50 * gd.GIB)}
+        receipt = ["--receipt", os.fspath(self.receipt())]
+        with mock.patch.object(gd, "EVICT_LOCK", self.root / "evict.lock"), \
+                mock.patch.object(gd, "EVICT_OWNER", self.root / "evict.owner.json"), \
+                mock.patch.object(gd, "HEALTH_SUMMARY", self.root / "summary.json"), \
+                mock.patch.object(gd, "default_families", return_value=[]), \
+                mock.patch.object(gd, "filesystems", return_value=fss), \
+                mock.patch.object(gd, "survey", return_value=[]), \
+                mock.patch.object(gd, "apply", return_value=0), \
+                mock.patch.object(gd, "cleanup_paused_runner_work", return_value=0), \
+                mock.patch.object(gd, "notify_disk"), \
+                mock.patch.object(gd, "reap_tmpdir_test_residue", return_value=0) as reap, \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd.main(["--no-snapshot", "--top", "0", *receipt])  # a report
+            reap.assert_not_called()
+            gd.main(["--apply", "--no-snapshot", "--top", "0", "--family", "user-tmp", *receipt])
+            reap.assert_not_called()
+            gd.main(["--apply", "--no-snapshot", "--top", "0", *receipt])  # not under pressure: still runs
+            reap.assert_called_once()
+
+    def test_tmpdir_test_residue_walk_stops_at_the_deadline_and_at_mounts(self) -> None:
+        tmp, e = self._tmp_residue()
+        self.assertIsNotNone(gd.tree_newest(e["socket"]))
+        self.assertIsNone(gd.tree_newest(e["socket"], deadline=time.time() - 1))
+        real_scandir = os.scandir
+
+        class Other:  # an entry below the scratch that reports another device
+            def __init__(self, entry):
+                self.entry, self.name, self.path = entry, entry.name, entry.path
+
+            def stat(self, follow_symlinks=True):
+                st = self.entry.stat(follow_symlinks=follow_symlinks)
+                return os.stat_result((st.st_mode, st.st_ino, st.st_dev + 1, *tuple(st)[3:]))
+
+        @contextlib.contextmanager
+        def scandir(path):
+            with real_scandir(path) as it:
+                yield [Other(x) for x in it]
+        with mock.patch.object(gd.os, "scandir", scandir):
+            self.assertIsNone(gd.tree_newest(e["socket"]))
+
+    def test_tmpdir_test_residue_main_apply_reaps_the_user_tmp(self) -> None:
+        tmp, e = self._tmp_residue()
+        dev = gd.HOME.stat().st_dev
+        fss = {dev: gd.Fs(dev, "/", 300 * gd.GIB, 460 * gd.GIB, 34 * gd.GIB, 50 * gd.GIB)}
+        with mock.patch.object(gd, "EVICT_LOCK", self.root / "evict.lock"), \
+                mock.patch.object(gd, "EVICT_OWNER", self.root / "evict.owner.json"), \
+                mock.patch.object(gd, "HEALTH_SUMMARY", self.root / "summary.json"), \
+                mock.patch.object(gd, "default_families", return_value=[]), \
+                mock.patch.object(gd, "filesystems", return_value=fss), \
+                mock.patch.object(gd, "survey", return_value=[]), \
+                mock.patch.object(gd, "apply", return_value=0), \
+                mock.patch.object(gd, "cleanup_paused_runner_work", return_value=0), \
+                mock.patch.object(gd, "notify_disk"), \
+                mock.patch.object(gd, "DARWIN", True), \
+                mock.patch.object(gd, "darwin_user_tmp", return_value=tmp), \
+                mock.patch.object(gd, "reap_tmpdir_test_residue", _reap_tmpdir_test_residue), \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd.main(["--apply", "--no-snapshot", "--top", "0", "--receipt", os.fspath(self.receipt())])
+        self.assertFalse(e["socket"].exists())
+        self.assertTrue(e["recent"].is_dir())
 
     def test_job_busy_ignores_wide_runner_build_trees(self) -> None:
         home, fams = self._runner_checkouts()
