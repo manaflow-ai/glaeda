@@ -351,16 +351,22 @@ What `--apply` does:
        can still be acknowledged: milliseconds, where the old gap was seconds. The
        acknowledge line exists only while GitHub sets the runner's acknowledge flag.
        An agent stop still cancels a running job but waits out an acquisition.
-     - Nor is a listener in its first poll: for `GATE_FIRST_POLL_S` (30 s,
-       `GLAEDA_RUNNER_GATE_FIRST_POLL_S`) after the gate starts it, a hold waits. GitHub
+     - Nor is a listener in its first poll: for `GATE_FIRST_POLL_S` (60 s, the broker's
+       50 s message poll plus margin; `GLAEDA_RUNNER_GATE_FIRST_POLL_S`) after the gate
+       starts it, a hold waits. GitHub
        can hand a queued job to a new session before the listener has seen it, so no diag
        line shows it, and a stop that cancels that poll loses the job: GitHub retries the
        gone session and fails the job 3 min later with "The job was not acquired by Runner
        of type self-hosted even after multiple attempts" (cmux14's root runner, 2026-10-12:
-       session at 03:46:41, stopped at 03:46:44). A job that arrives on a full host is
-       refused at job-started in seconds and rescued instead.
+       session at 03:46:41, stopped at 03:46:44). The job can come any time in that poll:
+       on cmux7s's roots (2026-10-21) one queued 25 s in was lost to a stop at 30 s. A job
+       that arrives on a full host is refused at job-started in seconds and rescued instead.
      - A listener that hasn't exited after 60 s is killed, unless a job slipped in.
-   - **Restarting and logs.** The gate starts `run.sh` again after two free polls. While
+   - **Restarting and logs.** The gate starts `run.sh` again after two free polls and,
+     once it has stopped a listener, a whole free `GATE_RESTART_FREE_S` (60 s,
+     `GLAEDA_RUNNER_GATE_RESTART_FREE_S`; a hold restarts the count): each stop can lose a
+     job just handed to the session, and a hold back within seconds made a start and a
+     stop 30 s later (cmux7s roots, 2026-10-21, three times in an hour). While
      it waits it logs `glaeda-cmux-runner-gate: holding the listener off: <why>`, and
      `--apply`'s verify accepts that line with or without gh.
    - **Failure is safe.**

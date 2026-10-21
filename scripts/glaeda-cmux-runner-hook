@@ -775,8 +775,15 @@ GATE_STOP_WAIT_S = 60.0  # a graceful listener exit, before it is killed
 # new session before the listener has seen it, and a stop that cancels that poll loses the job: GitHub retries the
 # gone session and fails the job 3 min later, "not acquired by Runner of type self-hosted even after multiple
 # attempts" (cmux14 root runner, 2026-10-12: session at 03:46:41, stopped at 03:46:44). A job that does arrive on a
-# full host is refused at job-started in seconds and rescued, which a lost one never is.
-GATE_FIRST_POLL_S = float(os.environ.get("GLAEDA_RUNNER_GATE_FIRST_POLL_S") or 30.0)
+# full host is refused at job-started in seconds and rescued, which a lost one never is. The broker holds a message
+# poll open up to BROKER_POLL_S, and a job can be handed to the session at any point in it, so the hold covers the
+# whole first poll (cmux7s roots, 2026-10-21: a job queued 25 s into the first poll was lost to a stop at 30 s).
+BROKER_POLL_S = 50.0
+GATE_FIRST_POLL_S = float(os.environ.get("GLAEDA_RUNNER_GATE_FIRST_POLL_S") or BROKER_POLL_S + 10.0)
+# After the gate stops a listener, the host must stay free this long before it starts one again: every stop can lose
+# a job GitHub just handed the session, and a hold that comes back within seconds turned two free polls into a
+# start and a stop 30 s later (cmux7s roots, 2026-10-21: at 14:10, 14:50 and 14:59).
+GATE_RESTART_FREE_S = float(os.environ.get("GLAEDA_RUNNER_GATE_RESTART_FREE_S") or BROKER_POLL_S + 10.0)
 # reload() hands the listener's start (time.monotonic, system-wide) to the re-executed gate here, not in argv, so a
 # rollback to a hook without it still accepts the exec.
 GATE_LISTENING_SINCE_ENV = "GLAEDA_RUNNER_GATE_LISTENING_SINCE"
@@ -3369,6 +3376,8 @@ class Gate:
         self.stop_deadline: float | None = None  # set while a stop the gate asked for is under way
         self.streak = 0
         self.held: str | None = None
+        self.free_since: float | None = None  # the first free poll of the current free span
+        self.stopped_one = False  # the gate stopped a listener and has not started one since (GATE_RESTART_FREE_S)
         self.terminating = False
         self.waiting: set[int] = set()
         self.job_waited = False  # a fleet build was waiting, or the host was reserved, at the last poll of a job
@@ -3729,7 +3738,7 @@ class Gate:
         gate_log("starting the listener")
         self.child = subprocess.Popen([os.fspath(self.runner_dir / "run.sh")], cwd=self.runner_dir,
                                       stdin=subprocess.DEVNULL)
-        self.streak = 0
+        self.streak, self.stopped_one = 0, False
         self.listening_since, self.first_poll_noted = time.monotonic(), False
 
     def first_poll(self, why: str) -> bool:
@@ -3800,7 +3809,7 @@ class Gate:
                 self.child = None
                 if self.stop_deadline is None or self.terminating:
                     return code  # the runner exited on its own: launchd's KeepAlive decides, as before
-                self.stop_deadline = None
+                self.stop_deadline, self.stopped_one = None, True
                 gate_log(f"holding the listener off: {self.held}")
                 return None
             if self.stop_deadline is not None:
@@ -3855,14 +3864,20 @@ class Gate:
         if why:
             if why != self.held:
                 gate_log(f"holding the listener off: {why}")
-            self.held, self.streak = why, 0
+            self.held, self.streak, self.free_since = why, 0, None
             return None
         if self.held is not None:
             self.streak += 1
+            if self.free_since is None:
+                self.free_since = time.monotonic()
             if self.streak < GATE_CONFIRM:
                 return None
+            if self.stopped_one and time.monotonic() - self.free_since < GATE_RESTART_FREE_S:
+                if self.streak == GATE_CONFIRM:
+                    gate_log(f"the host is free; listening again after {GATE_RESTART_FREE_S:g} s free, since a stop")
+                return None
             gate_log("the host is free again")
-            self.held = None
+            self.held, self.free_since = None, None
         if self.terminating:  # SIGTERM during the look above
             return 0
         self.start()
