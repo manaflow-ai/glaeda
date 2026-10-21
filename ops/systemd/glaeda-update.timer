@@ -1,11 +1,12 @@
 [Unit]
-Description=Hourly glaeda-update
+Description=glaeda-update every 10 minutes
 
 [Timer]
-OnCalendar=hourly
+# scripts/glaeda-update APPLY_EVERY_S (test-glaeda-update.py checks they agree)
+OnCalendar=*:0/10
 Persistent=true
 # spread hosts so a new release is not fetched by the whole fleet in the same second
-RandomizedDelaySec=15m
+RandomizedDelaySec=3m
 
 [Install]
 WantedBy=timers.target

@@ -195,6 +195,24 @@ class Detection(Base):
         self.assertEqual(report["findings"], [])
         self.assertEqual(json.loads(self.report.read_text())["schema"], "glaeda-mini-health/v1")
 
+    def test_the_report_carries_what_the_updater_says_this_host_runs(self) -> None:
+        doc = {"schema": "glaeda-ota-converge/v1", "at": "2026-09-25T00:00:00Z", "converged": False,
+               "staleAfter": "2099-01-01T00:00:00Z", "alertAfter": "2000-01-01T00:00:00Z", "blocking": False,
+               "since": "2026-09-24T00:00:00Z", "attempts": 4, "why": ["inconclusive: offline"],
+               "running": {"tag": "r-20260924-aaaaaaaaaaaa", "tools": {"drift": []},
+                           "hooks": [{"runnerDir": "/x/actions-runner-glaeda-1", "glaeda-cmux-runner-hook": "ab",
+                                      "current": True}]},
+               "wants": {"tag": "r-20260925-bbbbbbbbbbbb"}}
+        self.mini.ota_converge = lambda: doc
+        report = self.run_once()
+        self.assertEqual(self.ids(report), ["ota_not_converging"])
+        self.assertEqual(report["findings"][0]["evidence"], "running r-20260924-aaaaaaaaaaaa, wants "
+                         "r-20260925-bbbbbbbbbbbb, because inconclusive: offline")
+        self.assertEqual(report["ota"]["hooks"], [{"runner": "actions-runner-glaeda-1", "sha256": "ab", "current": True}])
+        self.assertEqual(json.loads(self.report.read_text())["ota"]["wants"], "r-20260925-bbbbbbbbbbbb")
+        doc["converged"] = True
+        self.assertEqual(self.run_once()["findings"], [])
+
     def test_an_ineligible_node_is_an_error_this_user_cannot_heal(self) -> None:
         # cmux-austin-mini-0/-1 refused every job for days on 10-08..12: their staged generation was gone.
         self.mini.refusal = "node not eligible (no node status from generation 3809eed51fdd)"

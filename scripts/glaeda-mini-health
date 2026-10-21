@@ -38,6 +38,14 @@ Each run checks, as the runner user and without sudo:
                                      (--require-eligible --fleet-class), names a reason, so job-started refuses every
                                      job here (a missing staged generation, a receipt that does not validate, a node
                                      that is not eligible). Restaging or re-enrolling is an operator's: reported only.
+  ota_not_converging                 glaeda-update's converge.json (its step 8) says this host does not run the release
+                                     its ring wants, by installed tool and runner hook digests, past the alertAfter
+                                     time it wrote: "running X, wants Y, because Z". glaeda-update keeps retrying with
+                                     backoff, so it is pending (warn), or an error when converge.json marks the reason
+                                     blocking (a quarantined or refused release, a hook --refresh-hooks will not
+                                     replace). The heal is glaeda-update's own; this only reports.
+  ota_stale                          no glaeda-update run has finished since converge.json's staleAfter: its agent is
+                                     not running, or every run dies. Reported only.
 
   daemon_heal_stale                  the root LaunchDaemon from scripts/glaeda-daemon-heal is missing or is not this
                                      release's copy (script or config/macos-daemons.json). Healed where `sudo -n` works
@@ -114,6 +122,7 @@ SESSION_LINES = (WEDGE_SIGNATURE, "Closing session", "Tearing down", "Created se
 XCTEST_RUNNING = re.compile(r"(?:^|/)xctest(?:\s|$)|(?:^|/)xcodebuild\s(?:.*\s)?(?:test|test-without-building)(?:\s|$)")
 LEAKED_TEST_APP = re.compile(r"^\s*'?(.*/actions-runner[^/]+/_work/_temp/cmux-derived-data-tests-[^/]+/Build/Products/Debug/cmux DEV\.app)(?:/Contents/MacOS/[^ ]+)?'?(?:\s|$)")
 LEAKED_APP_TERM_S = 1.0
+OTA_CONVERGE = ".local/state/glaeda/update/converge.json"  # glaeda-update's CONVERGE, under this home
 
 
 def sh(argv: list[str], timeout: float = 15, env: dict[str, str] | None = None) -> tuple[int, str]:
@@ -179,6 +188,11 @@ class Mini:
         return self._hook or None
 
     # ---- reads
+
+    def ota_converge(self) -> dict[str, Any]:
+        """glaeda-update's converge.json, or {} before an updater that writes one."""
+        doc = load_json(self.home / OTA_CONVERGE)
+        return doc if doc.get("schema") == "glaeda-ota-converge/v1" else {}
 
     def console(self) -> tuple[str, str | None] | None:
         hook = self.hook()
@@ -610,6 +624,53 @@ def check_node_eligibility(mini: Mini) -> list[dict[str, Any]]:
                     "(docs/CMUX_FLEET_ENROLLMENT.md)")]
 
 
+def utc(stamp: Any) -> float | None:
+    try:
+        return datetime.datetime.strptime(str(stamp), "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=datetime.timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def ota_summary(doc: dict[str, Any]) -> dict[str, Any] | None:
+    """The report's `ota`: what the host runs, what its ring wants, and why they differ (converge.json)."""
+    if not doc:
+        return None
+    running = doc.get("running") or {}
+    return {"at": doc.get("at"), "running": running.get("tag"), "wants": (doc.get("wants") or {}).get("tag"),
+            "converged": doc.get("converged"), "why": (doc.get("why") or [])[:5], "since": doc.get("since"),
+            "blocking": doc.get("blocking"), "toolDrift": (running.get("tools") or {}).get("drift") or [],
+            "hooks": [{"runner": Path(str(h.get("runnerDir") or h.get("receipt") or "?")).name,
+                       "sha256": h.get("glaeda-cmux-runner-hook"), "current": h.get("current")}
+                      for h in running.get("hooks") or []]}
+
+
+def check_ota(mini: Mini, now: float) -> list[dict[str, Any]]:
+    doc = mini.ota_converge()
+    if not doc:
+        return []
+    out = []
+    stale = utc(doc.get("staleAfter"))
+    if stale is None or now >= stale:
+        out.append(finding("ota_stale", "warn", f"no glaeda-update run has finished since {doc.get('at') or '?'}",
+                           "impossible", "glaeda-update --status says why; its agent should run every 10 min"))
+    alert = utc(doc.get("alertAfter"))
+    if doc.get("converged") is not False or alert is None or now < alert:
+        return out
+    running = (doc.get("running") or {}).get("tag") or "no release"
+    wants = (doc.get("wants") or {}).get("tag") or "nothing"
+    evidence = f"running {running}, wants {wants}, because " + "; ".join(str(w) for w in doc.get("why") or ["?"])
+    if doc.get("blocking"):
+        out.append(finding("ota_not_converging", "error", evidence, "impossible",
+                           "retrying the same release cannot fix this: a newer release, or glaeda-cmux-runner "
+                           "--apply for a hook it will not replace"))
+    else:
+        out.append(finding("ota_not_converging", "warn", evidence, "pending",
+                           f"glaeda-update retries with backoff ({doc.get('attempts')} tries since "
+                           f"{doc.get('since')}; next {doc.get('nextAttempt')})"))
+    return out
+
+
 def daemon_heal_command(mini: Mini) -> str:
     """The operator's root step. The hashes come from the release, not this host: the runner user can edit these files."""
     policy = mini.daemon_policy()
@@ -760,7 +821,7 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
 
     found = (check_console(mini) + check_power(mini) + check_tailscale(mini) + check_runners(mini)
              + check_node_eligibility(mini) + check_leaked_test_apps(mini) + check_disk_accounting(mini)
-             + check_daemon_heal(mini))
+             + check_daemon_heal(mini) + check_ota(mini, now))
     tm = check_testmanagerd(mini, now)
     carried = tm is None and "testmanagerd_wedged" in previous  # a test runs, or the log was unreadable: no heal now
     found += [previous["testmanagerd_wedged"]] if carried else tm or []
@@ -801,7 +862,8 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
     seen = {k: v for k, v in seen.items() if k in ids}
     tries = {k: v for k, v in tries.items() if k in ids}
     report = {"schema": SCHEMA, "at": iso(now), "findings": findings,
-              "healed": sorted(healed + getattr(mini, "daemon_healed", []), key=lambda h: h.get("t") or 0)[-HEALED_MAX:]}
+              "healed": sorted(healed + getattr(mini, "daemon_healed", []), key=lambda h: h.get("t") or 0)[-HEALED_MAX:],
+              "ota": ota_summary(mini.ota_converge())}
     if apply:
         write_json(state_path, {"seen": seen, "tries": tries, "healed": healed[-HEALED_MAX:]})
         write_json(report_path, report)

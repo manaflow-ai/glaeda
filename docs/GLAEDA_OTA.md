@@ -28,9 +28,12 @@ but still installs through `glaeda-mini-fleet upgrade` (below).
    - `control.json` (`paused`), written by `control.yml`.
 
    Only runs on `main` publish or write anything.
-3. **Hosts pull.** `glaeda-update` runs hourly on every host: a LaunchAgent
+3. **Hosts pull.** `glaeda-update` runs every 10 minutes on every host (its `APPLY_EVERY_S`, which
+   setup's LaunchAgent reads and a test holds the Linux timer to): a LaunchAgent
    `com.teamleaderleo.glaeda.update` on macOS, the systemd user timer `glaeda-update.timer` on
-   Linux, with up to 15 minutes of random delay. It reads its ring from
+   Linux, with up to 3 minutes of random delay. Channel files and assets come from
+   `github.com/<source>/releases/download`, anonymously, never through the GitHub API, so a spent
+   API quota never stops a host from converging (a canary's attestation check is the one API call). It reads its ring from
    `~/.config/glaeda/update.json`, then:
    - downloads by hash;
    - checks the build-provenance attestation, which must come from `release.yml` on `main`. A
@@ -60,6 +63,18 @@ but still installs through `glaeda-mini-fleet upgrade` (below).
    refreshed, a newer one kept) and `hook-history.json` (the SHA-256 of every version of those two
    files, so a newer hook is never downgraded). The canary hosts run no runners, so a hook change is
    gated by CI, the signed policy soak and these checks, not by a canary status.
+   **Convergence.** Each run then records `~/.local/state/glaeda/update/converge.json`: what the
+   host actually runs, by content (the SHA-256 of each installed tool and of each runner's installed
+   hook files, each against the installed release's bytes), the tag its ring wants, whether they
+   agree, and why not. Tools whose bytes drifted are reinstalled by the installed release's own
+   setup. While a host stays unconverged on the same wanted release it backs off from 10 minutes to
+   an hour; a new release on the ring is tried at once, and an installed release's hooks are retried
+   every run, so a runner busy with a job gets them between jobs. `glaeda-update --status` shows the
+   record and a live reading. `glaeda-mini-health` reads it and reports `ota_not_converging`
+   ("running X, wants Y, because Z") only past the `alertAfter` time glaeda-update wrote (two
+   backed-off hours), as an error when the reason is one retrying cannot clear (a quarantined or
+   refused release, a hook `--refresh-hooks` keeps), and `ota_stale` when no run has finished for
+   three hours. ci-dash shows both in Health, from the report the probe forwards.
 4. **Canary health.** A canary host with an authenticated `gh` posts the commit status
    `glaeda-ota/<host>` (success or failure) on the release commit. Its gh calls ride out a spent
    REST quota: a reset within five minutes is waited for, rate limits and transient errors are
@@ -78,6 +93,11 @@ but still installs through `glaeda-mini-fleet upgrade` (below).
      nothing once the soak is over. Policies above low risk signed before 2026-10-19 list Air Blue and
      Big Red in `requiredHosts`; they still parse, and the list is not enforced. (On 2026-10-19 a spent quota
      kept Air Blue from reporting, and requiring it held stable on one build for 15 hours.);
+   - or, when no canary host reported anything (success or failure) for `CANARY_SILENT_HOURS`
+     (2.5 h) past the soak, every target's `smoke-<target>.json` is an asset of the release: the
+     build extracted that target's hygiene archive on a fresh runner and ran the checks
+     `glaeda-update` runs after an install. That bounds what a spent shared quota can do to stable;
+     a canary's failure, which is waited out for up to an hour, still blocks it;
    - it descends from the current stable;
    - no newer release has a canary failure. A release's own updater installs its successor, so a
      failure there can be the older release's fault; promotion waits until a newer one is healthy.
@@ -90,7 +110,7 @@ but still installs through `glaeda-mini-fleet upgrade` (below).
    never old enough, and stable would never move. Candidate age uses GitHub's `publishedAt`, the
    same canonical publication time written into the channel receipt.
 
-   Stable hosts pick it up within the hour.
+   Stable hosts pick it up within 10 minutes.
 
 End to end, a merged change reaches canary hosts in about an hour and stable hosts after the
 15-minute healthy-canary window.

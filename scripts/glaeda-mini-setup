@@ -48,7 +48,7 @@ What --apply installs (templated for the current user):
                                                the runner user can, reports the rest for ci-dash; a no-op off a runner)
     ~/.local/bin/glaeda-idle-repair            durable repair queue: records busy hosts and runs disk/health repairs on
                                                the first idle LaunchAgent tick
-    ~/.local/bin/glaeda-update                 from scripts/glaeda-update (hourly over-the-air updates)
+    ~/.local/bin/glaeda-update                 from scripts/glaeda-update (over-the-air updates every 10 min)
     ~/.local/bin/glaeda-gh                     from scripts/glaeda-gh (shared GitHub CI watcher, the one poller)
     ~/.local/bin/glaeda-wallpaper-rotate       from scripts/glaeda-wallpaper-rotate (operator-supplied stills, every 30 minutes)
     ~/.local/bin/glaeda-runner-hygiene         from scripts/glaeda-runner-hygiene (root-installed per-account cache policy)
@@ -151,6 +151,15 @@ DARWIN_REQUIRED = True
 HOST_PLATFORM = "linux" if platform.system() == "Linux" else "macos"
 # Linux: the systemd user units installed verbatim from ops/systemd, which stay their one definition.
 SYSTEMD_UNITS_DIR = REPO / "ops/systemd"
+
+
+def update_every_s() -> int:
+    """glaeda-update's APPLY_EVERY_S, its one definition: the agent runs it that often and its backoff starts
+    there. Read from the source beside this script, so a release's setup schedules that release's updater."""
+    match = re.search(r"^APPLY_EVERY_S = (\d+)\b", (SCRIPT_DIR / "glaeda-update").read_text(), re.M)
+    if not match:
+        raise RuntimeError("scripts/glaeda-update defines no APPLY_EVERY_S")
+    return int(match.group(1))
 LINUX_UNITS = (
     "glaeda-disk-pressure.service",
     "glaeda-disk-pressure.timer",
@@ -755,12 +764,12 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-worktree-reclaim.jsonl"),
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-worktree-reclaim.err"),
         },
-        # Over-the-air updates (scripts/glaeda-update): hourly, installs this host's release ring and
-        # rolls back when the new tools do not run.
+        # Over-the-air updates (scripts/glaeda-update): every APPLY_EVERY_S, converges this host on its
+        # release ring (backing off while it cannot) and rolls back when the new tools do not run.
         LABEL_PREFIX + "update": {
             "Label": LABEL_PREFIX + "update",
             "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-update"), "--apply"],
-            "StartInterval": 3600,
+            "StartInterval": update_every_s(),
             "ProcessType": "Background",
             "LowPriorityIO": True,
             "Nice": 10,

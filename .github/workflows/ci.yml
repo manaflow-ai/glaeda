@@ -406,6 +406,16 @@ jobs:
       - name: Test the LAN fetch broker on the minis' Python
         run: '"${{ steps.mini-python.outputs.python-path }}" scripts/test-glaeda-lan-fetch.py'
 
+      # glaeda-update and glaeda-mini-health run from LaunchAgents under the same /usr/bin/python3.
+      - name: Test the updater and mini health on the minis' Python
+        env:
+          PY: ${{ steps.mini-python.outputs.python-path }}
+        run: |
+          "$PY" -c 'import ast, sys; [ast.parse(open(p).read(), p, feature_version=(3, 9)) for p in sys.argv[1:]]' \
+            scripts/glaeda-update scripts/glaeda-mini-health scripts/glaeda-mini-setup
+          "$PY" scripts/test-glaeda-mini-health.py
+          "$PY" scripts/test-glaeda-update.py
+
 
   # scripts/test-glaeda-cmux-runner.py took about 300 s of the old single job; its shards run side by side.
   runner-tests:

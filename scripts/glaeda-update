@@ -6,7 +6,9 @@
     glaeda-update --status      this host's config, state, and installed source
 
 A LaunchAgent (macOS), headless LaunchDaemon (GUI-less macOS), or systemd user timer (Linux)
-runs `--apply` hourly; glaeda-mini-setup installs it. Configuration is ~/.config/glaeda/update.json,
+runs `--apply` every ten minutes (APPLY_EVERY_S); glaeda-mini-setup installs it. A run whose host
+already holds its ring's release costs two anonymous downloads of small channel files from
+github.com/<source>/releases/download, never the GitHub API, so it does not spend the shared quota. Configuration is ~/.config/glaeda/update.json,
 written once by setup and never overwritten:
 
     {"ring": "canary" | "stable", "setupArgs": ["--hygiene-only"], "host": "air-blue",
@@ -64,6 +66,18 @@ What one run does, and what it refuses:
    downgraded. A runner with a job is done on a later run. Each listener gate sees its hook change and
    re-execs it, keeping its runner.
 
+8. Convergence (converge.json beside state.json, glaeda-ota-converge/v1): after every --apply run
+   the host records what it actually runs, not just the tag in state.json: the SHA-256 of each
+   installed tool against the installed release's bytes, and of each owned runner's installed
+   glaeda-cmux-runner-hook and glaeda_reservation.py against the release's, beside the tag the ring
+   wants and why the two differ. A tool whose bytes drifted from the installed release (a partial
+   or hand install) is repaired by running that release's setup again. A run that ends unconverged
+   on the same wanted release backs off (APPLY_EVERY_S doubling to BACKOFF_MAX_S); a new release on
+   the ring is tried at once. glaeda-mini-health reads converge.json and reports `ota_not_converging`
+   (running X, wants Y, because Z) only when a host stays unconverged past its grace, as an error
+   when the reason is one this updater cannot clear by retrying (`blocking`), and `ota_stale` when
+   no run has finished for hours.
+
     Read-only stable plans also include the canary's public tag/source/publication metadata and a
     bounded source-drift classification. A transient canary fetch failure never blocks the stable
     plan. Status reports the installed generation's source from local state without contacting the
@@ -76,6 +90,7 @@ release under ~/.local/state/glaeda/update.
 from __future__ import annotations
 
 import argparse
+import calendar
 import fcntl
 import hashlib
 import json
@@ -123,6 +138,22 @@ STAMP_BY = "glaeda-update"
 ANCESTRY = "ancestry.txt"  # glaeda_release.ANCESTRY: the release's commit and its ancestors
 HOOKS_TIMEOUT = 1800  # the refresh checks the new hook against each runner's wrappers, a few seconds each
 CHILD_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+# Step 8. converge.json is what this host actually runs against what its ring wants; glaeda-mini-health
+# reads it (2026-10-20: a mini's runners showed an 80/70 CPU gate a day after the 85/80 hook shipped,
+# and nothing on the host could say which hook bytes it ran without an ssh).
+CONVERGE = STATE_DIR / "converge.json"
+CONVERGE_SCHEMA = "glaeda-ota-converge/v1"
+APPLY_EVERY_S = 600  # the agent's StartInterval (glaeda-mini-setup) and the first retry's wait
+BACKOFF_MAX_S = 3600  # an unconverged host still retries at least hourly, as the agent used to run
+# converge.json carries the times glaeda-mini-health alerts at, so the reader holds no thresholds of its own:
+# unconverged past two backed-off retries, or no finished run for three.
+ALERT_AFTER_S = 2 * BACKOFF_MAX_S
+STALE_AFTER_S = 3 * BACKOFF_MAX_S
+HOOK_RELEASE_FILES = ("glaeda-cmux-runner-hook", "glaeda_reservation.py")  # what --refresh-hooks installs
+# Results that retrying the same release cannot change: the host needs a new release or an operator.
+BLOCKING_RESULTS = ("quarantined", "refused", "rolled-back")
+# Hook refresh states that wait for an operator (--apply), not for a job to finish.
+BLOCKING_HOOK_STATES = ("blocked", "kept", "skipped")
 
 
 # gh retries (2026-10-19): the fleet's shared REST quota ran out, air-blue's canary check and status POST
@@ -507,6 +538,21 @@ def redeliver(state: dict, config: dict) -> dict[str, str]:
     return statuses
 
 
+def nudge_due(result: dict, entry: dict | None, nudged: str | None, now: float) -> bool:
+    """Dispatch promote.yml after an install, and once more per release when its soak has passed (`nudged`
+    names the release that post-soak nudge was sent for; the install's nudge, mid-soak, never sets it). Runs every
+    ten minutes would otherwise spend one call of the shared API quota each just to say "still current"."""
+    if result.get("result") == "updated":
+        return True
+    if result.get("result") != "current" or entry is None or nudged == entry.get("tag"):
+        return False
+    try:
+        soak = float((entry.get("policy") or {}).get("soakHours") or 0)
+        return now >= parse_utc(str(entry.get("published"))) + soak * 3600
+    except (TypeError, ValueError):
+        return False
+
+
 def nudge_promotion(config: dict) -> str:
     """Ask promote.yml to check now. Its hourly cron can lag for hours, and without a run nothing
     ever reaches stable; the workflow itself decides, so an extra dispatch is harmless."""
@@ -716,8 +762,9 @@ def refresh_runner_scripts(state_dir: Path = STATE_DIR, target: Path = RUNNER_SC
     return f"refreshed to {tag}"
 
 
-def refresh_runner_hooks(state_dir: Path = STATE_DIR, home: Path = HOME) -> str:
-    """Step 7: the runners' installed hook files, from the installed release by its own glaeda-cmux-runner."""
+def refresh_runner_hooks(state_dir: Path = STATE_DIR, home: Path = HOME, detail: list | None = None) -> str:
+    """Step 7: the runners' installed hook files, from the installed release by its own glaeda-cmux-runner.
+    With `detail`, each runner's {runnerDir, state, note} is appended to it (step 8 names the blocked ones)."""
     tag = load_state(state_dir)["current"]
     if tag is None:
         return "no installed release"
@@ -738,6 +785,9 @@ def refresh_runner_hooks(state_dir: Path = STATE_DIR, home: Path = HOME) -> str:
     counts: dict[str, int] = {}
     for runner in runners:
         counts[str(runner.get("state"))] = counts.get(str(runner.get("state")), 0) + 1
+        if detail is not None and isinstance(runner, dict):
+            detail.append({"runnerDir": str(runner.get("runnerDir") or runner.get("receipt") or "?")[:300],
+                           "state": str(runner.get("state")), "note": str(runner.get("note") or "")[:200]})
     if doc.get("error"):
         return f"not refreshed ({str(doc['error'])[:300]})"
     if not counts:
@@ -747,16 +797,186 @@ def refresh_runner_hooks(state_dir: Path = STATE_DIR, home: Path = HOME) -> str:
         ("" if not notes else " (" + "; ".join(notes)[:400] + ")")
 
 
-def runner_steps(state_dir: Path = STATE_DIR, target: Path = RUNNER_SCRIPTS, home: Path = HOME) -> dict:
+def runner_steps(state_dir: Path = STATE_DIR, target: Path = RUNNER_SCRIPTS, home: Path = HOME,
+                 detail: list | None = None) -> dict:
     """Steps 6 and 7, after a run that installed a release or found it current. Neither fails the update."""
     out = {}
     for key, step in (("runnerScripts", lambda: refresh_runner_scripts(state_dir, target)),
-                      ("runnerHooks", lambda: refresh_runner_hooks(state_dir, home))):
+                      ("runnerHooks", lambda: refresh_runner_hooks(state_dir, home, detail))):
         try:
             out[key] = step()
         except (OSError, ValueError, UpdateError) as e:
             out[key] = f"not refreshed ({type(e).__name__}: {e})"[:300]
     return out
+
+
+def file_sha256(path: Path) -> str | None:
+    try:
+        return sha256(path.read_bytes()) if path.is_file() else None
+    except OSError:
+        return None
+
+
+def tool_drift(gen: Path, bin_dir: Path) -> tuple[int, list[str]]:
+    """(tools compared, tools whose installed bytes are not the release's). Only a tool both installed and
+    in the release is compared: a host profile need not install every tool, and setup owns which."""
+    checked, drift = 0, []
+    for name in TOOLS:
+        want = gen / "bin" / name if name == "glaeda-worktree-reclaim" else gen / "glaeda/scripts" / name
+        have = bin_dir / name
+        want_sha, have_sha = file_sha256(want), file_sha256(have)
+        if want_sha is None or have_sha is None:
+            continue
+        checked += 1
+        if want_sha != have_sha:
+            drift.append(name)
+    return checked, drift
+
+
+def runner_hook_dirs(home: Path) -> list[tuple[str, Path | None]]:
+    """(receipt, runner directory or None when the receipt is unreadable) for every glaeda-cmux-runner install:
+    the receipts --refresh-hooks reads, the first install's and each --instance K's."""
+    state = home / ".local/state/glaeda/cmux-runner"
+    out = []
+    for path in [state / "receipt.json", *sorted(state.glob("instance-*/receipt.json"))]:
+        try:
+            receipt = json.loads(path.read_text())
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError):
+            out.append((os.fspath(path), None))
+            continue
+        if not isinstance(receipt, dict) or not receipt.get("runnerDirOwned"):
+            continue  # a runner directory glaeda-cmux-runner does not own: --refresh-hooks never touches it
+        runner = receipt.get("runnerDir")
+        out.append((os.fspath(path), Path(runner) if isinstance(runner, str) and runner else None))
+    return out
+
+
+def observe(state_dir: Path = STATE_DIR, bin_dir: Path = BIN, home: Path = HOME,
+            staged: Path = RUNNER_SCRIPTS) -> dict:
+    """Step 8: what this host actually runs, by content: the installed release, its tools and each runner's
+    installed hook files, each compared with the release's bytes. Reads local files only."""
+    state = load_state(state_dir)
+    tag = state["current"]
+    out: dict = {"tag": tag, "source": installed_source(state_dir, tag), "tools": {"checked": 0, "drift": []},
+                 "hooks": [], "runnerScripts": "absent" if not staged.is_dir() else "unknown"}
+    gen = generation(state_dir, tag) if tag else None
+    if gen is None or not (gen / ".complete").is_file():
+        return out
+    checked, drift = tool_drift(gen, bin_dir)
+    out["tools"] = {"checked": checked, "drift": drift}
+    scripts = gen / "glaeda/scripts"
+    want = {name: file_sha256(scripts / name) for name in HOOK_RELEASE_FILES}
+    out["releaseHookSha256"] = want["glaeda-cmux-runner-hook"]
+    for receipt, runner in runner_hook_dirs(home):
+        if runner is None:
+            out["hooks"].append({"receipt": receipt, "current": False, "note": "unreadable receipt"})
+            continue
+        hook_dir = runner / "glaeda-hooks"
+        if not hook_dir.is_dir():
+            continue  # no hooks installed: no job runs them (--apply installs them)
+        row: dict = {"runnerDir": os.fspath(runner)}
+        for name in HOOK_RELEASE_FILES:
+            row[name] = file_sha256(hook_dir / name)
+        row["current"] = all(want[name] is None or row[name] == want[name] for name in HOOK_RELEASE_FILES)
+        out["hooks"].append(row)
+    if staged.is_dir():
+        out["runnerScripts"] = "current" if all(
+            file_sha256(staged / name) == file_sha256(scripts / name) for name in RUNNER_FILES) else "differs"
+    return out
+
+
+def convergence(result: dict, running: dict, wants: dict | None, hook_states: list[dict]) -> tuple[bool, list[str], bool]:
+    """(converged, why not, blocking): blocking when retrying the same release cannot clear it."""
+    why: list[str] = []
+    blocking = False
+    if wants is None:
+        if result.get("result") == "idle":  # paused, or nothing on the ring: nothing is wanted
+            return True, ([str(result.get("why"))] if result.get("why") else []), False
+        # the channel was never read (a first run that cannot fetch): unknown is not converged
+        return False, [f"{result.get('result')}: {result.get('why') or result.get('detail') or 'no channel read yet'}"[:300]], False
+    if running.get("tag") != wants.get("tag"):
+        kind = str(result.get("result"))
+        detail = str(result.get("detail") or result.get("why") or "")
+        why.append(f"{kind}: {detail}"[:300] if detail else kind)
+        blocking = kind in BLOCKING_RESULTS
+    tools = running.get("tools") or {}
+    if tools.get("drift"):
+        why.append(f"installed tools differ from {running.get('tag')}: {', '.join(tools['drift'])}"
+                   + (f" ({result['repair']})" if result.get("repair") else ""))
+        blocking = blocking or str(result.get("repair", "")).startswith("failed")
+    states = {h.get("runnerDir"): h for h in hook_states}
+    for hook in running.get("hooks") or []:
+        if hook.get("current"):
+            continue
+        where = hook.get("runnerDir") or hook.get("receipt")
+        refresh = states.get(where) or {}
+        installed = str(hook.get("glaeda-cmux-runner-hook") or hook.get("note") or "none")[:12]
+        why.append(f"runner {Path(str(where)).name}: hook {installed} is not {running.get('tag')}'s "
+                   f"{str(running.get('releaseHookSha256') or '?')[:12]}"
+                   + (f" ({refresh.get('state')}: {refresh.get('note')})" if refresh.get("state") else ""))
+        blocking = blocking or refresh.get("state") in BLOCKING_HOOK_STATES or "note" in hook
+    return not why, why, blocking
+
+
+def load_converge(path: Path = CONVERGE) -> dict:
+    try:
+        doc = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return doc if isinstance(doc, dict) and doc.get("schema") == CONVERGE_SCHEMA else {}
+
+
+def backoff_s(attempts: int) -> int:
+    return min(APPLY_EVERY_S * 2 ** max(attempts - 1, 0), BACKOFF_MAX_S)
+
+
+def record_convergence(config: dict, result: dict, wants: dict | None, previous: dict, now: float,
+                       running: dict, hook_states: list[dict], path: Path = CONVERGE) -> dict:
+    """Write converge.json for this run and return it."""
+    converged, why, blocking = convergence(result, running, wants, hook_states)
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+    doc = {"schema": CONVERGE_SCHEMA, "host": config["host"], "ring": config["ring"], "at": stamp,
+           "result": str(result.get("result")), "running": running,
+           "wants": wants, "converged": converged, "why": why, "blocking": blocking and not converged}
+    for key in ("nudged",):
+        if key in previous:
+            doc[key] = previous[key]
+    doc["staleAfter"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + STALE_AFTER_S))
+    if converged:
+        doc.update(since=None, attempts=0, nextAttempt=None, alertAfter=None)
+    else:
+        same = (not previous.get("converged") and previous.get("since")
+                and (previous.get("wants") or {}).get("tag") == (wants or {}).get("tag"))
+        attempts = int(previous.get("attempts") or 0) + 1 if same else 1
+        since = previous["since"] if same else stamp
+        doc.update(since=since, attempts=attempts,
+                   nextAttempt=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + backoff_s(attempts))),
+                   alertAfter=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(parse_utc(since) + ALERT_AFTER_S)))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}")
+    tmp.write_text(json.dumps(doc, indent=1, sort_keys=True) + "\n")
+    os.replace(tmp, path)
+    return doc
+
+
+def parse_utc(stamp: str) -> float:
+    return float(calendar.timegm(time.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ")))
+
+
+def backing_off(previous: dict, wants: dict | None, now: float) -> bool:
+    """An unconverged host waits out its backoff while the ring still wants the same release."""
+    if not previous or previous.get("converged") or not previous.get("nextAttempt"):
+        return False
+    if (previous.get("wants") or {}).get("tag") != (wants or {}).get("tag"):
+        return False  # a new release (or a pause) is acted on at once
+    if (previous.get("running") or {}).get("tag") == (wants or {}).get("tag"):
+        return False  # the release is installed: refreshing tools and hooks between jobs is local and cheap
+    try:
+        return now < parse_utc(previous["nextAttempt"])
+    except (TypeError, ValueError):
+        return False
 
 
 def update(apply: bool, config: dict, state_dir: Path = STATE_DIR,
@@ -805,6 +1025,16 @@ def update(apply: bool, config: dict, state_dir: Path = STATE_DIR,
     if config["ring"] == "stable" or candidate_summary is not None:
         out["sourceDrift"] = source_drift(current_source, target_summary, candidate_summary)
     if entry["tag"] == state["current"]:
+        gen = generation(state_dir, entry["tag"])
+        if apply and (gen / ".complete").is_file():
+            _, drift = tool_drift(gen, bin_dir)
+            if drift:
+                # Step 8: the installed tools are not this release's bytes (a partial or hand install):
+                # its own idempotent setup puts them back. Never a quarantine: the release was healthy here.
+                ok, log = run_setup(gen, config["setupArgs"])
+                _, left = tool_drift(gen, bin_dir)
+                out["repair"] = (f"reinstalled {', '.join(drift)}" if ok and not left
+                                 else f"failed: setup {'exited' if not ok else 'left ' + ', '.join(left)}: {log[-200:]}")[:400]
         return {**out, "result": "current"}
     if entry["tag"] in state["quarantined"]:
         return {**out, "result": "quarantined", "why": "this release failed here before"}
@@ -870,6 +1100,44 @@ def update(apply: bool, config: dict, state_dir: Path = STATE_DIR,
             "status": post(False, detail)}
 
 
+def apply_once(config: dict, state_dir: Path = STATE_DIR, bin_dir: Path = BIN, home: Path = HOME,
+               staged: Path = RUNNER_SCRIPTS, now: float | None = None,
+               channel: tuple[bytes, bytes | None] | None = None) -> dict:
+    """One --apply run under the lock: steps 1-7, then step 8's record. Whatever fails, converge.json says so."""
+    now = time.time() if now is None else now
+    converge_path = state_dir / CONVERGE.name
+    previous = load_converge(converge_path)
+    wants = previous.get("wants")
+    hook_states: list[dict] = []
+    entry = None
+    try:
+        if channel is None:
+            channel = fetch_channel(config["ring"], config.get("source", REPOSITORY))
+        entry = resolve(*channel, config["ring"])
+        wants = {k: entry[k] for k in ("tag", "source")} if entry else None
+        if backing_off(previous, wants, now):
+            result = {"result": "backoff", "target": (wants or {}).get("tag"),
+                      "why": f"unconverged since {previous.get('since')}; next try {previous.get('nextAttempt')}"}
+            result["converge"] = {k: previous.get(k) for k in ("converged", "why", "blocking", "since", "attempts")}
+            return result
+        result = update(True, config, state_dir, channel, bin_dir)
+        if nudge_due(result, entry, previous.get("nudged"), now):
+            result["promotion"] = nudge_promotion(config)
+            if entry is not None and result.get("result") == "current":
+                previous["nudged"] = entry["tag"]  # the post-soak nudge; the install's own does not count
+        if result["result"] in ("updated", "current"):
+            result.update(runner_steps(state_dir, staged, home, hook_states))
+    except Exception as e:  # noqa: BLE001  (recorded below, then re-raised for the one JSON line)
+        result = {"result": "error", "why": f"{type(e).__name__}: {e}"[:500]}
+        record_convergence(config, result, wants, previous, now, observe(state_dir, bin_dir, home, staged),
+                           hook_states, converge_path)
+        raise
+    doc = record_convergence(config, result, wants, previous, now, observe(state_dir, bin_dir, home, staged),
+                             hook_states, converge_path)
+    result["converge"] = {k: doc[k] for k in ("converged", "why", "blocking", "since", "attempts")}
+    return result
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--apply", action="store_true", help="install the ring's release if it is new")
@@ -883,7 +1151,9 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(
                 {"config": config, "state": state,
                  "release": {"tag": state["current"],
-                             "source": installed_source(STATE_DIR, state["current"])}},
+                             "source": installed_source(STATE_DIR, state["current"])},
+                 # what the last run recorded (wants, why), and what the host runs now, by content
+                 "converge": load_converge(), "running": observe()},
                 indent=1, sort_keys=True))
             return 0
         if not a.apply:  # planning reads only, so it needs no lock (health checks plan mid-update)
@@ -912,11 +1182,7 @@ def main(argv: list[str] | None = None) -> int:
                 except BlockingIOError:
                     print(json.dumps({"result": "busy", "why": "another glaeda-update is running"}))
                     return 0
-                result = update(True, config)
-                if result["result"] in ("updated", "current", "idle"):
-                    result["promotion"] = nudge_promotion(config)
-                if result["result"] in ("updated", "current"):
-                    result.update(runner_steps())
+                result = apply_once(config)
         result["at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         print(json.dumps(result, sort_keys=True))
         return 1 if result["result"] in ("rolled-back", "refused") else 0

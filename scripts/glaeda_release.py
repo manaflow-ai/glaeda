@@ -27,6 +27,14 @@ that descends from the current stable. One canary's success is enough and no hos
 a canary that never reports cannot hold stable, while any canary's failure blocks it (2026-10-19).
 Not only the current canary: with several merges a day the newest release never finishes soaking,
 and stable would starve.
+
+Promotion never waits on the shared GitHub quota (2026-10-20). Canary hosts post their statuses with the
+fleet's one REST quota; when it is spent for hours, no host can say "healthy". Every release also carries
+smoke-<target>.json for each target: release.yml's build extracted that target's hygiene archive on a
+fresh runner and ran the same health checks glaeda-update runs after an install (smoke). A release
+whose every target smoked, that no canary reported failure on, and that no canary reported at all for
+CANARY_SILENT_HOURS past its soak, is promoted on that evidence alone. A canary's failure still blocks
+it: glaeda-update waits up to an hour to post one, well inside that window.
 """
 from __future__ import annotations
 
@@ -62,6 +70,11 @@ HISTORICAL_RISK_SOAK_HOURS = {"low": 2, "normal": 6, "high": 12}
 # (a spent REST quota kept air-blue from reporting and held stable on one build for 15 hours).
 LEGACY_REQUIRED_HOSTS = ("air-blue", "big-red")
 MAX_ASSET = 200 * 1024 * 1024
+# How long past its soak a release waits for any canary host's report before its CI smoke alone promotes
+# it. Longer than glaeda-update's FAILURE_WAIT_MAX plus BACKOFF_MAX_S (test-glaeda-update.py checks), so a
+# failing canary has posted its failure by then even through a spent quota.
+CANARY_SILENT_HOURS = 2.5
+SMOKE_SCHEMA = "glaeda-release-smoke/v1"
 TAG_RE = re.compile(r"r-\d{8}-[0-9a-f]{12}")
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 HEX64 = re.compile(r"[0-9a-f]{64}")
@@ -109,6 +122,56 @@ def hook_history(root: Path, source: str) -> bytes:
 
 def hygiene_asset(target: str) -> str:
     return f"glaeda-hygiene-{target}.tar.gz"
+
+
+def smoke_asset(target: str) -> str:
+    return f"smoke-{target}.json"
+
+
+def smoke(archive: Path, target: str, source: str, python: str = sys.executable) -> dict:
+    """Extract a hygiene archive into a scratch home and run what glaeda-update's health() runs after an
+    install: the tools answer --help and the release's glaeda-update plans from a channel offline."""
+    import shutil
+    import tempfile
+    checks = []
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        with tarfile.open(archive, "r:gz") as tar:
+            if hasattr(tarfile, "data_filter"):  # 3.12 (and backports); older Pythons have no filter argument
+                tar.extractall(root / "gen", filter="data")
+            else:
+                tar.extractall(root / "gen")  # our own just-built archive
+        scripts, home, channel = root / "gen/glaeda/scripts", root / "home", root / "channel"
+        home.mkdir()
+        channel.mkdir()
+        (channel / "control.json").write_bytes(canonical(control(False)))
+        (channel / "stable.json").write_bytes(b"")
+        env = {"HOME": str(home), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"}
+        runs = [[python, str(scripts / name), "--help"]
+                for name in ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-gh", "glaeda-mini-health")]
+        runs += [[str(root / "gen/bin/glaeda-worktree-reclaim"), "--help"],
+                 [python, str(scripts / "glaeda-update"), "--channel-dir", str(channel)]]
+        for argv in runs:
+            name = Path(argv[1] if argv[0] == python else argv[0]).name
+            result = subprocess.run(argv, capture_output=True, text=True, timeout=120, env=env,
+                                    stdin=subprocess.DEVNULL)
+            if result.returncode != 0:
+                raise ReleaseError(f"smoke: {name} exited {result.returncode}: {(result.stderr or result.stdout)[-300:]}")
+            if name == "glaeda-update":
+                planned = json.loads(result.stdout.strip().splitlines()[-1]).get("result")
+                if planned not in ("plan", "current", "idle"):
+                    raise ReleaseError(f"smoke: glaeda-update planned {planned}")
+            checks.append(name)
+        shutil.rmtree(root / "gen", ignore_errors=True)
+    version = subprocess.run([python, "-c", "import platform; print(platform.python_version())"],
+                             capture_output=True, text=True, timeout=60).stdout.strip()
+    return {"schema": SMOKE_SCHEMA, "target": target, "source": source, "checks": checks, "python": version}
+
+
+def smoked(doc: dict) -> bool:
+    """Every target's smoke receipt is an asset of this release.json (and so hash-pinned and attested)."""
+    assets = doc.get("assets") or {}
+    return all(smoke_asset(target) in assets for target in TARGETS)
 
 
 def release_tag(source: str, when: dt.datetime) -> str:
@@ -264,7 +327,7 @@ def canary_verdict(statuses: list[dict]) -> tuple[int, int, int]:
 
 
 def promotion(canary: dict | None, stable: dict | None, statuses: list[dict], now: dt.datetime,
-              soak_hours: float | None = None) -> tuple[bool, str]:
+              soak_hours: float | None = None, smoke_passed: bool = False) -> tuple[bool, str]:
     """Whether `canary` may become `stable` now, and why. Pausing stops hosts, not this."""
     if canary is None:
         return False, "no canary release"
@@ -281,7 +344,11 @@ def promotion(canary: dict | None, stable: dict | None, statuses: list[dict], no
     if failed:
         return False, f"{failed} canary host(s) reported failure"
     if not ok:
-        return False, "no canary host reported success"
+        if smoke_passed and age >= soak_hours + CANARY_SILENT_HOURS:
+            # No host could report (the shared quota): the release's own CI smoke is the evidence.
+            return True, f"no canary host reported in {age:.1f} h; CI smoke passed on {', '.join(TARGETS)}"
+        return False, "no canary host reported success" + (
+            f"; CI smoke promotes it at {soak_hours + CANARY_SILENT_HOURS:g} h if none reports" if smoke_passed else "")
     return True, f"{ok} canary host(s) healthy after {age:.1f} h"
 
 
@@ -308,7 +375,8 @@ def choose(candidates: list[dict], stable: dict | None, now: dt.datetime,
             reasons.append(f"{entry['tag']}: does not descend from stable")
             continue
         ok, why = promotion(entry, stable, candidate["statuses"], now,
-                            soak_hours if soak_hours is not None else policy["soakHours"])
+                            soak_hours if soak_hours is not None else policy["soakHours"],
+                            smoke_passed=candidate.get("smoked") is True)
         if ok:
             return entry, f"{entry['tag']}: {why}"
         reasons.append(f"{entry['tag']}: {why}")
@@ -331,6 +399,11 @@ def main(argv: list[str] | None = None) -> int:
     h.add_argument("--target", required=True, choices=TARGETS)
     h.add_argument("--reclaim", type=Path, required=True)
     h.add_argument("--output", type=Path, required=True)
+    sm = sub.add_parser("smoke", help="smoke a hygiene archive; write smoke-<target>.json beside it")
+    sm.add_argument("--source", required=True)
+    sm.add_argument("--target", required=True, choices=TARGETS)
+    sm.add_argument("--output", type=Path, required=True, help="the directory holding the archive")
+    sm.add_argument("--python", default=sys.executable, help="the interpreter hosts run the tools with")
     t = sub.add_parser("tag", help="print the release tag for a source commit")
     t.add_argument("--source", required=True)
     m = sub.add_parser("manifest", help="write release.json over the assets in a directory")
@@ -360,6 +433,10 @@ def main(argv: list[str] | None = None) -> int:
             a.output.mkdir(parents=True, exist_ok=True)
             (a.output / hygiene_asset(a.target)).write_bytes(raw)
             print(json.dumps({"asset": hygiene_asset(a.target), "sha256": sha256(raw), "size": len(raw)}))
+        elif a.command == "smoke":
+            receipt = smoke(a.output / hygiene_asset(a.target), a.target, a.source, a.python)
+            (a.output / smoke_asset(a.target)).write_bytes(canonical(receipt))
+            print(json.dumps(receipt))
         elif a.command == "tag":
             print(release_tag(a.source, now_utc()))
         elif a.command == "manifest":
@@ -383,7 +460,7 @@ def main(argv: list[str] | None = None) -> int:
             entry = channel_entry("canary", doc, release_raw, a.published)
             policy = parse_policy(doc.get("policy"), legacy=doc.get("policy") is None)
             print(json.dumps({"entry": entry, "policy": policy, "statuses": statuses,
-                              "descendsFromStable": a.descends == "true"},
+                              "descendsFromStable": a.descends == "true", "smoked": smoked(doc)},
                              sort_keys=True))
         elif a.command == "promote":
             stable = parse_channel(a.stable.read_bytes(), "stable") if a.stable else None

@@ -27,6 +27,9 @@ loader = importlib.machinery.SourceFileLoader("glaeda_update", os.fspath(ROOT / 
 spec = importlib.util.spec_from_loader("glaeda_update", loader)
 gu = importlib.util.module_from_spec(spec)
 loader.exec_module(gu)
+health_loader = importlib.machinery.SourceFileLoader("glaeda_mini_health", os.fspath(ROOT / "scripts" / "glaeda-mini-health"))
+mh = importlib.util.module_from_spec(importlib.util.spec_from_loader("glaeda_mini_health", health_loader))
+health_loader.exec_module(mh)
 
 TARGET = "aarch64-apple-darwin"
 SOURCES = ["a" * 40, "b" * 40, "c" * 40]
@@ -42,10 +45,14 @@ if "--help" in sys.argv:
 bin_dir = Path(os.environ["GLAEDA_TEST_BIN"])
 bin_dir.mkdir(parents=True, exist_ok=True)
 code = int(Path(__file__).with_name("health-code").read_text())
-for name in ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-worktree-reclaim", "glaeda-update", "glaeda-gh"):
+for name in ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-update", "glaeda-gh"):
     tool = bin_dir / name
     tool.write_text("#!/usr/bin/env python3\\nimport sys\\nprint('{\\\"result\\\": \\\"plan\\\"}')\\nsys.exit(%d)\\n" % code)
     tool.chmod(0o755)
+# as the real setup does: the release's prebuilt reclaim binary, byte for byte
+reclaim = bin_dir / "glaeda-worktree-reclaim"
+reclaim.write_bytes(Path(sys.argv[sys.argv.index("--reclaim-binary") + 1]).read_bytes())
+reclaim.chmod(0o755)
 with open(bin_dir / "setup-runs", "a") as log:
     log.write(Path(__file__).parents[2].name + " " + " ".join(sys.argv[1:]) + " " + os.environ.get("GLAEDA_UPDATE_RUNNING", "") + "\\n")
 """
@@ -91,7 +98,7 @@ class Server:
             "glaeda/scripts/glaeda-mini-setup":
                 ((FAKE_SETUP if support_headless else FAKE_SETUP.replace(" --headless", "")).encode(), 0o755),
             "glaeda/scripts/health-code": (str(health_code).encode(), 0o644),
-            "bin/glaeda-worktree-reclaim": (b"binary", 0o755),
+            "bin/glaeda-worktree-reclaim": (f"#!/bin/sh\nexit {health_code}\n".encode(), 0o755),
             **runner,
             **extra,
         })
@@ -111,6 +118,10 @@ class Server:
 
     def fetch(self, url: str, limit: int) -> bytes:
         return self.files[url]
+
+
+def time_stamp(t: float) -> str:
+    return dt.datetime.fromtimestamp(t, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class UpdateTest(unittest.TestCase):
@@ -704,6 +715,184 @@ class UpdateTest(unittest.TestCase):
                 gu.load_config(path)
 
 
+    # ---- step 8: convergence (2026-10-20: aws-m4pro-9's runners showed the 80/70 CPU gate a day after
+    # #1535's 85/80 hook shipped, and nothing on the host said which hook bytes it ran)
+
+    def apply(self, now: float, home: Path | None = None, staged: Path | None = None) -> dict:
+        home = home or self.root / "nohome"
+        return gu.apply_once(self.config, self.state, self.bin, home, staged or home / "glaeda-runner/scripts",
+                             now=now, channel=self.server.channel(self.config["ring"]))
+
+    def converge(self) -> dict:
+        return gu.load_converge(self.state / gu.CONVERGE.name)
+
+    def health_findings(self, now: float) -> list[dict]:
+        mini = mh.Mini(self.root)
+        mini.ota_converge = self.converge  # the file glaeda-update just wrote
+        return mh.check_ota(mini, now)
+
+    def test_stale_hook_digest_is_detected_reported_and_alerted_only_past_its_grace(self) -> None:
+        home, staged, hook = self.runner_mini()
+        stale = hook.read_bytes()
+        # the installed hook is no version this release descends from: --refresh-hooks keeps it
+        entry = self.server.publish(SOURCES[0], runner_files=self.runner_files("the 85/80 release"))
+        now = 1_800_000_000.0
+        result = self.apply(now, home, staged)
+        self.assertEqual(result["result"], "updated", result)
+        self.assertEqual(hook.read_bytes(), stale)
+        doc = self.converge()
+        self.assertEqual(doc["running"]["tag"], entry["tag"])
+        self.assertEqual(doc["wants"]["tag"], entry["tag"])  # the tag matches; the bytes do not
+        self.assertFalse(doc["converged"])
+        self.assertTrue(doc["blocking"])
+        [row] = doc["running"]["hooks"]
+        self.assertEqual(row["glaeda-cmux-runner-hook"], gr.sha256(stale))
+        self.assertFalse(row["current"])
+        self.assertIn(f"hook {gr.sha256(stale)[:12]} is not {entry['tag']}'s", doc["why"][0])
+        self.assertIn("kept", doc["why"][0])
+        # health says nothing inside the grace, then an error naming running, wants and why
+        self.assertEqual(self.health_findings(now + 60), [])
+        [f] = self.health_findings(now + gu.ALERT_AFTER_S + 1)
+        self.assertEqual((f["id"], f["severity"], f["auto_fix"]), ("ota_not_converging", "error", "impossible"))
+        self.assertTrue(f["evidence"].startswith(f"running {entry['tag']}, wants {entry['tag']}, because runner"))
+        self.assertIn(gr.sha256(stale)[:12], f["evidence"])
+        # status reads the same by content, offline
+        self.assertFalse(gu.observe(self.state, self.bin, home, staged)["hooks"][0]["current"])
+
+    def test_a_hook_the_release_descends_from_converges_and_clears_the_record(self) -> None:
+        home, staged, hook = self.runner_mini()
+        entry = self.server.publish(SOURCES[0], runner_files=self.runner_files("the 85/80 release"),
+                                    hook_history=self.older())
+        self.apply(1_800_000_000.0, home, staged)
+        doc = self.converge()
+        self.assertTrue(doc["converged"], doc["why"])
+        self.assertEqual(doc["running"]["hooks"][0]["glaeda-cmux-runner-hook"],
+                         gr.sha256(self.runner_files("the 85/80 release")["glaeda-cmux-runner-hook"]))
+        self.assertEqual((doc["since"], doc["alertAfter"], doc["attempts"]), (None, None, 0))
+        self.assertEqual(self.health_findings(1_800_000_000.0 + 10 * gu.ALERT_AFTER_S)[1:], [])
+        self.assertEqual(entry["tag"], doc["running"]["tag"])
+
+    def test_a_deferred_hook_converges_on_a_later_run_between_jobs(self) -> None:
+        home, staged, hook = self.runner_mini()
+        self.server.publish(SOURCES[0], runner_files=self.runner_files("new"), hook_history=self.older())
+        busy = mock.patch.object(gu, "refresh_runner_hooks",
+                                 side_effect=lambda s, h, d: d.append({"runnerDir": str(hook.parent.parent),
+                                                                       "state": "deferred", "note": "a job"}) or "x")
+        with busy:
+            self.apply(1_800_000_000.0, home, staged)
+        doc = self.converge()
+        self.assertFalse(doc["converged"])
+        self.assertFalse(doc["blocking"])  # a job holds the runner: retrying is the fix
+        # the release is installed, so the next run is not backed off: it refreshes between jobs
+        result = self.apply(1_800_000_000.0 + 60, home, staged)
+        self.assertNotEqual(result["result"], "backoff")
+        self.assertTrue(self.converge()["converged"], self.converge()["why"])
+
+    def test_an_unconverged_host_backs_off_and_a_new_release_is_tried_at_once(self) -> None:
+        first = self.server.publish(SOURCES[0])
+        now = 1_800_000_000.0
+        with mock.patch.object(gu, "download", side_effect=urllib.error.URLError("offline")):
+            self.assertEqual(self.apply(now)["result"], "inconclusive")
+            doc = self.converge()
+            self.assertEqual((doc["converged"], doc["blocking"], doc["attempts"]), (False, False, 1))
+            self.assertEqual(doc["wants"]["tag"], first["tag"])
+            self.assertIsNone(doc["running"]["tag"])
+            self.assertEqual(self.apply(now + gu.APPLY_EVERY_S - 1)["result"], "backoff")
+            self.assertEqual(self.apply(now + gu.APPLY_EVERY_S)["result"], "inconclusive")
+            self.assertEqual(self.converge()["attempts"], 2)
+            self.assertEqual(self.apply(now + gu.APPLY_EVERY_S + 2 * gu.APPLY_EVERY_S - 1)["result"], "backoff")
+            # the backoff never exceeds the old hourly run, and the first sighting is kept for the alert
+            self.assertEqual(gu.backoff_s(30), gu.BACKOFF_MAX_S)
+            self.assertEqual(self.converge()["since"], time_stamp(now))
+            [f] = self.health_findings(now + gu.ALERT_AFTER_S)
+            self.assertEqual((f["severity"], f["auto_fix"]), ("warn", "pending"))
+            self.assertIn(f"running no release, wants {first['tag']}, because inconclusive", f["evidence"])
+        second = self.server.publish(SOURCES[1])
+        result = self.apply(now + gu.APPLY_EVERY_S + 1)  # inside the old backoff: a new release goes at once
+        self.assertEqual(result["result"], "updated", result)
+        self.assertTrue(self.converge()["converged"])
+        self.assertEqual(self.converge()["running"]["tag"], second["tag"])
+
+    def test_tools_that_drift_from_the_installed_release_are_reinstalled(self) -> None:
+        self.server.publish(SOURCES[0])
+        now = 1_800_000_000.0
+        self.assertEqual(self.apply(now)["result"], "updated")
+        reclaim = self.bin / "glaeda-worktree-reclaim"
+        reclaim.write_text("#!/bin/sh\n# a hand install from another checkout\nexit 0\n")
+        self.assertEqual(gu.observe(self.state, self.bin, self.root, self.root / "x")["tools"]["drift"],
+                         ["glaeda-worktree-reclaim"])
+        result = self.apply(now + 1)
+        self.assertEqual((result["result"], result["repair"]), ("current", "reinstalled glaeda-worktree-reclaim"))
+        self.assertTrue(self.converge()["converged"])
+        self.assertEqual(self.converge()["running"]["tools"]["drift"], [])
+
+    def test_a_run_that_dies_still_records_why(self) -> None:
+        self.server.publish(SOURCES[0])
+        with mock.patch.object(gu, "update", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                self.apply(1_800_000_000.0)
+        doc = self.converge()
+        self.assertEqual((doc["result"], doc["converged"]), ("error", False))
+        self.assertIn("RuntimeError: boom", doc["why"][0])
+
+    def test_a_host_whose_updater_stopped_is_reported_stale(self) -> None:
+        self.server.publish(SOURCES[0])
+        now = 1_800_000_000.0
+        self.apply(now)
+        self.assertEqual(self.health_findings(now + gu.STALE_AFTER_S - 1), [])
+        [f] = self.health_findings(now + gu.STALE_AFTER_S)
+        self.assertEqual(f["id"], "ota_stale")
+
+    def test_the_canary_that_installed_a_release_still_nudges_after_its_soak(self) -> None:
+        entry = self.server.publish(SOURCES[0])
+        published = gu.parse_utc(entry["published"])
+        soak = float(entry["policy"]["soakHours"]) * 3600
+        self.assertGreater(soak, 120)
+        with mock.patch.object(gu, "nudge_promotion", return_value="dispatched") as nudge:
+            self.assertEqual(self.apply(published + 60)["promotion"], "dispatched")  # the install's nudge
+            self.assertNotIn("nudged", self.converge())
+            self.assertNotIn("promotion", self.apply(published + 120))  # current, still soaking
+            self.assertEqual(self.apply(published + soak + 3600)["promotion"], "dispatched")  # after the soak
+            self.assertEqual(self.converge()["nudged"], entry["tag"])
+            self.assertNotIn("promotion", self.apply(published + soak + 7200))  # once per release
+        self.assertEqual(nudge.call_count, 2)
+
+    def test_a_first_run_that_never_read_the_channel_is_not_converged(self) -> None:
+        with mock.patch.object(gu, "fetch_channel", side_effect=urllib.error.URLError("offline")):
+            with self.assertRaises(urllib.error.URLError):
+                gu.apply_once(self.config, self.state, self.bin, self.root, self.root / "x", now=1_800_000_000.0)
+        doc = self.converge()
+        self.assertFalse(doc["converged"])
+        self.assertIsNone(doc["wants"])
+        self.paused_is_converged()
+
+    def paused_is_converged(self) -> None:
+        self.server.publish(SOURCES[0])
+        self.server.paused = True
+        self.assertEqual(self.apply(1_800_000_100.0)["result"], "idle")
+        self.assertTrue(self.converge()["converged"])
+
+    def test_a_current_canary_nudges_promotion_once_per_release_after_its_soak(self) -> None:
+        entry = {"tag": "r-20260925-" + "a" * 12, "published": "2026-09-25T00:00:00Z", "policy": {"soakHours": 0.25}}
+        soaked = gu.parse_utc("2026-09-25T00:15:00Z")
+        self.assertTrue(gu.nudge_due({"result": "updated"}, entry, entry["tag"], 0))
+        self.assertFalse(gu.nudge_due({"result": "current"}, entry, None, soaked - 1))
+        self.assertTrue(gu.nudge_due({"result": "current"}, entry, None, soaked))
+        self.assertFalse(gu.nudge_due({"result": "current"}, entry, entry["tag"], soaked + 3600))
+        self.assertFalse(gu.nudge_due({"result": "inconclusive"}, entry, None, soaked))
+
+    def test_the_schedule_and_the_promotion_window_derive_from_the_updater(self) -> None:
+        setup = importlib.machinery.SourceFileLoader("glaeda_mini_setup_for_update", os.fspath(ROOT / "scripts/glaeda-mini-setup"))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader(setup.name, setup))
+        setup.exec_module(module)
+        self.assertEqual(module.update_every_s(), gu.APPLY_EVERY_S)
+        timer = (ROOT / "ops/systemd/glaeda-update.timer").read_text()
+        self.assertIn(f"OnCalendar=*:0/{gu.APPLY_EVERY_S // 60}\n", timer)
+        # a failing canary's report (waited out up to FAILURE_WAIT_MAX, then retried after a backoff) lands
+        # before the CI smoke may promote a release no canary reported on
+        self.assertGreater(gr.CANARY_SILENT_HOURS * 3600, gu.FAILURE_WAIT_MAX + gu.BACKOFF_MAX_S)
+
+
 class ReleaseTest(unittest.TestCase):
     NOW = dt.datetime(2026, 9, 25, 12, tzinfo=dt.timezone.utc)
 
@@ -729,6 +918,41 @@ class ReleaseTest(unittest.TestCase):
             path.write_text("")
             for value in ("-1", "nan", "inf"):
                 self.assertEqual(gr.main(["promote", "--candidates", str(path), "--soak-hours", value]), 1)
+
+    def test_a_smoked_release_no_canary_could_report_on_is_promoted_after_the_silent_window(self) -> None:
+        # 2026-10-19: the fleet's REST quota was spent for hours, no canary could post, stable sat 15 h.
+        canary = self.canary("2026-09-25T00:00:00Z")  # legacy policy: 6 h soak
+        late = dt.datetime(2026, 9, 25, 8, 30, tzinfo=dt.timezone.utc)
+        self.assertTrue(gr.promotion(canary, None, [], late, smoke_passed=True)[0])
+        early = dt.datetime(2026, 9, 25, 8, 29, tzinfo=dt.timezone.utc)
+        ok, why = gr.promotion(canary, None, [], early, smoke_passed=True)
+        self.assertFalse(ok)
+        self.assertIn("CI smoke promotes it at 8.5 h", why)
+        self.assertFalse(gr.promotion(canary, None, [], late)[0])  # unsmoked (older) releases need a host
+        failed = [self.status("big-red", "failure", "2026-09-25T07:00:00Z")]
+        self.assertFalse(gr.promotion(canary, None, failed, late, smoke_passed=True)[0])
+        candidate = {"entry": canary, "statuses": [], "descendsFromStable": True, "smoked": True}
+        self.assertEqual(gr.choose([candidate], None, late)[0]["tag"], canary["tag"])
+        self.assertIsNone(gr.choose([{**candidate, "smoked": False}], None, late)[0])
+
+    def test_smoke_runs_the_release_tools_and_its_receipt_marks_the_release_smoked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            files = {f"glaeda/scripts/{name}": ((ROOT / "scripts" / name).read_bytes(), 0o755)
+                     for name in ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-gh", "glaeda-mini-health",
+                                 "glaeda-update")}
+            files["bin/glaeda-worktree-reclaim"] = (b"#!/bin/sh\nexit 0\n", 0o755)
+            (out / gr.hygiene_asset(TARGET)).write_bytes(tar_gz(files))
+            self.assertEqual(gr.main(["smoke", "--source", "a" * 40, "--target", TARGET, "--output", str(out)]), 0)
+            receipt = json.loads((out / gr.smoke_asset(TARGET)).read_text())
+            self.assertEqual((receipt["schema"], receipt["target"]), (gr.SMOKE_SCHEMA, TARGET))
+            self.assertIn("glaeda-update", receipt["checks"])
+            files["bin/glaeda-worktree-reclaim"] = (b"#!/bin/sh\nexit 3\n", 0o755)
+            (out / gr.hygiene_asset(TARGET)).write_bytes(tar_gz(files))
+            self.assertEqual(gr.main(["smoke", "--source", "a" * 40, "--target", TARGET, "--output", str(out)]), 1)
+        assets = {gr.smoke_asset(t): {} for t in gr.TARGETS}
+        self.assertTrue(gr.smoked({"assets": assets}))
+        self.assertFalse(gr.smoked({"assets": {gr.smoke_asset(TARGET): {}}}))
 
     def test_promotion_needs_soak_success_and_no_failure(self) -> None:
         ok = [self.status("air-blue", "success", "2026-09-25T01:00:00Z")]
