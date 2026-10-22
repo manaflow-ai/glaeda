@@ -44,7 +44,10 @@ What one run does, and what it refuses:
 4. Health: the installed glaeda-disk and glaeda-worktree-reclaim must run, and the installed
    glaeda-update must plan against the live channel. On failure the previous release's setup runs
    again, or on a first update the snapshot of the tools taken before it is restored, and the failed
-   tag is quarantined on this host, so it is never retried; a newer release is.
+   tag is quarantined on this host, so it is never retried; a newer release is. A check that times
+   out (a host too busy to start Python) rolls back the same way but quarantines nothing and posts
+   pending; the run backs off and tries again, and the HEALTH_TIMEOUTS-th timeout in a row for one
+   tag counts as a failure.
 5. On a canary host with reportStatus and an authenticated `gh`, the outcome is posted as the commit
    status `glaeda-ota/<host>` on the release's source commit. Promotion to stable needs one canary's
    success and no canary's failure. gh calls survive a spent REST quota: a reset within five minutes
@@ -175,6 +178,7 @@ RATE_MARKERS = ("api rate limit", "rate limit exceeded", "secondary rate limit",
 TRANSIENT_MARKERS = ("http 500", "http 502", "http 503", "http 504", "timeout", "timed out", "connection",
                      "network", "temporarily unavailable", "eof")
 MAX_UNREPORTED = 5
+HEALTH_TIMEOUTS = 5  # consecutive timed-out health checks of one tag that fail it: t0, +10, +30, +70, +130 min with backoff
 
 
 class UpdateError(RuntimeError):
@@ -246,6 +250,10 @@ def load_state(state_dir: Path = STATE_DIR) -> dict:
             and isinstance(o.get("source"), str) and SHA_RE.fullmatch(o["source"])
             and isinstance(o.get("ok"), bool) and isinstance(o.get("detail"), str) for o in owed)):
         doc.pop("unreported")  # only a report owed to GitHub: never worth refusing to update over
+    timeouts = doc.get("healthTimeouts")
+    if timeouts is not None and not (isinstance(timeouts, dict) and isinstance(timeouts.get("tag"), str)
+                                     and type(timeouts.get("n")) is int):
+        doc.pop("healthTimeouts")  # only a count of slow checks: restart it rather than refuse to update
     return doc
 
 
@@ -443,10 +451,12 @@ def gh_only(config: dict) -> bool:
     return "--gh-only" in config["setupArgs"]
 
 
-def health(bin_dir: Path, channel_dir: Path, gh_only: bool = False) -> tuple[bool, str]:
+def health(bin_dir: Path, channel_dir: Path, gh_only: bool = False) -> tuple[bool | None, str]:
     """The installed tools run, and the installed glaeda-update plans from the channel files this
     run already fetched, so a network blip cannot fail (and quarantine) a good release. A --gh-only
-    host installs only glaeda-gh and glaeda-update, so only those are checked there."""
+    host installs only glaeda-gh and glaeda-update, so only those are checked there. (None, why) when a
+    check timed out: a host too busy to start Python in 120 s says nothing about the release (cosmic-gray
+    at load 200 quarantined r-20261022-e5ce794d9efd on `glaeda-disk --help`, 2026-10-22)."""
     hygiene = [] if gh_only else [
         [sys.executable, str(bin_dir / "glaeda-disk"), "--help"],
         [sys.executable, str(bin_dir / "glaeda-worktree"), "--help"],
@@ -461,7 +471,9 @@ def health(bin_dir: Path, channel_dir: Path, gh_only: bool = False) -> tuple[boo
         name = Path(argv[1] if argv[0] == sys.executable else argv[0]).name
         try:
             result = subprocess.run(argv, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
-        except (OSError, subprocess.TimeoutExpired) as e:
+        except subprocess.TimeoutExpired as e:
+            return None, f"{name}: {e}"
+        except OSError as e:
             return False, f"{name}: {e}"
         if result.returncode != 0:
             return False, f"{name} exited {result.returncode}"
@@ -1102,22 +1114,37 @@ def update(apply: bool, config: dict, state_dir: Path = STATE_DIR,
         (channel_dir / "control.json").write_bytes(control_raw)
         (channel_dir / f"{config['ring']}.json").write_bytes(ring_raw or b"")
         ok, detail = health(bin_dir, channel_dir, gh_only=gh_only(config))
+    timeouts = state.pop("healthTimeouts", None)
+    if ok is None:
+        n = (timeouts or {}).get("n", 0) + 1 if (timeouts or {}).get("tag") == entry["tag"] else 1
+        if n >= HEALTH_TIMEOUTS:
+            ok, detail = False, f"{detail} ({n} timed-out health checks in a row)"
+        else:
+            state["healthTimeouts"] = {"tag": entry["tag"], "n": n}
     if ok:
         state.update(previous=state["current"], current=entry["tag"])
         save_state(state, state_dir)
         shutil.rmtree(state_dir / "pre-ota", ignore_errors=True)
         prune(state_dir, {t for t in (state["current"], state["previous"]) if t})
         return {**out, "result": "updated", "detail": detail, "status": post(True, detail)}
-    state["quarantined"] = sorted(set(state["quarantined"]) | {entry["tag"]})[-20:]
+    if ok is False:
+        state["quarantined"] = sorted(set(state["quarantined"]) | {entry["tag"]})[-20:]
     previous = state["current"]
     if previous and (generation(state_dir, previous) / ".complete").is_file():
         back, _ = run_setup(generation(state_dir, previous), config["setupArgs"])
         rolled = f"restored {previous}" if back else f"restoring {previous} failed too"
     elif restore(state_dir, bin_dir):
-        rolled = "restored the tools installed before the first update"
+        back, rolled = True, "restored the tools installed before the first update"
     else:
-        rolled = "nothing to restore"
+        back, rolled = True, "nothing to restore"
     save_state(state, state_dir)
+    if ok is None and back:
+        # Unproven, not failed: back to what ran, no quarantine and no failure posted; the next run tries again.
+        return {**out, "result": "inconclusive", "detail": f"health check timed out: {detail}", "rollback": rolled,
+                "log": log[-600:], "status": post(None, detail)}
+    if ok is None:  # the tools on disk are neither release: blocking, but still not the release's fault
+        return {**out, "result": "rolled-back", "detail": f"health check timed out: {detail}", "rollback": rolled,
+                "log": log[-600:], "status": post(None, detail)}
     return {**out, "result": "rolled-back", "detail": detail, "rollback": rolled, "log": log[-600:],
             "status": post(False, detail)}
 

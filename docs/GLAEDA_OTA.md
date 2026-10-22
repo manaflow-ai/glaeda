@@ -47,7 +47,11 @@ but still installs through `glaeda-mini-fleet upgrade` (below).
    If that fails, it re-runs the previous release's setup, or on a host's first update restores
    the tools it replaced (tools only; agents and config stay as the failed setup left them), and
    quarantines the failed release on that host. The health check plans from the channel files
-   the run already fetched, so a network blip cannot fail a good release.
+   the run already fetched, so a network blip cannot fail a good release. A check that times out
+   says the host is too busy, not that the release is bad: the run rolls back the same way but
+   quarantines nothing and posts `pending`, and the next run (with backoff) tries the release
+   again. The fifth timed-out check in a row for one release (over about two hours of backoff)
+   counts as a failure. A rollback that itself fails is reported as blocking `rolled-back`.
 
    A stale or unrelated channel target, or a target whose setup does not support this host's
    persisted flags, is refused before `--apply` and is re-evaluated after the channel or host
