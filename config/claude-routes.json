@@ -1,0 +1,10 @@
+{
+  "schema": "glaeda-claude-routes/v1",
+  "note": "Where Claude Code on a fleet mini sends its requests: ~/.claude/settings.json env.ANTHROPIC_BASE_URL is one of routes, with a placeholder ANTHROPIC_AUTH_TOKEN (the gateway ignores it and injects a pooled account). A provisioned mini never holds a personal login or CLAUDE_CODE_OAUTH_TOKEN: it expires, and it bills one person (cmuxterm-hq knowledge/setup-mac-mini Step 8). glaeda-mini-health checks the route with a real `claude -p` every probe_every_s, reroutes to the first route that answers when it fails, and reports a claude_route finding while none does; cmuxterm-hq build-fleet/capture-host admits no capture lease on a mini with that finding. Seen 2026-10-21: cmux-mac-mini's personal login had expired, and the subrouter pool on :31415 hung every request from cmux11s and cmux7s, while sr2-gateway answered.",
+  "routes": [
+    "http://sr2-gateway.tail137216.ts.net:4016",
+    "http://100.89.225.106:31415"
+  ],
+  "placeholder": "subrouter",
+  "probe_every_s": 1800
+}

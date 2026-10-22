@@ -713,6 +713,9 @@ class MiniSetupTest(unittest.TestCase):
             self.assertTrue(os.access(self.home / ".local/bin" / name, os.X_OK), name)
         for label in ("disk-pressure", "disk-dedupe", "worktree-reclaim"):
             self.assertTrue((self.home / f"Library/LaunchAgents/com.teamleaderleo.glaeda.{label}.plist").is_file())
+        for name in ("macos-daemons.json", "claude-routes.json"):  # what glaeda-mini-health reads off the repo
+            self.assertEqual((self.home / ".local/share/glaeda" / name).read_bytes(),
+                             (ROOT / "config" / name).read_bytes(), name)
         # the build-host profile still blocks on the same machine
         out = io.StringIO()
         with contextlib.redirect_stdout(out):

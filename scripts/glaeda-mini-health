@@ -66,6 +66,15 @@ Each run checks, as the runner user and without sudo:
                                      audiomxd, WirelessRadioManagerd), from glaeda-daemon-heal's root report: that
                                      daemon restarts it at hot_hours (wait_idle daemons when the host is idle, or at
                                      busy_hot_hours). Reported here so ci-dash sees the wait; the heal is root's.
+  claude_route                       Claude Code (~/.local/bin/claude, the capture jobs' agent) does not go through a
+                                     fleet route from config/claude-routes.json that answers: ~/.claude/settings.json
+                                     names no route (a personal login, which expires: cmux-mac-mini, 2026-10-21), a
+                                     route outside the list, or a personal token; or a real `claude -p` through it
+                                     failed (checked once per probe_every_s; a dead route hangs until killed).
+                                     Healed at once by routing to the first listed route that answers (the failed
+                                     one last), keeping a backup of settings.json. cmuxterm-hq build-fleet/capture-host
+                                     admits no capture lease on a host whose report has it. Also run on a host
+                                     without glaeda runners (a capture-only mini).
 
 A heal is tried at most every HEAL_EVERY_S and HEAL_TRIES times a day per finding, counting heals that worked
 but did not last (a runner that exits again), so nothing loops. Each finding reads
@@ -73,7 +82,7 @@ but did not last (a runner that exits again), so nothing loops. Each finding rea
 "impossible" when this user cannot fix it or the tries ran out. A fixed finding leaves the report and its heal is
 kept under "healed" for a day (auto_fix "done"). The report is REPORT (ci-dash's probe reads it; cmuxterm-hq
 build-fleet/ci-dash turns each code into the operator command that fixes it); the state beside it keeps each
-finding's first sighting and the heal tries. It exits at once on a host with no glaeda runner. With KILL_SWITCH
+finding's first sighting and the heal tries. On a host with no glaeda runner it checks only claude_route (and the daemon healer). With KILL_SWITCH
 present it still reports but never heals. Prints one JSON line when it healed something or the findings changed.
 """
 
@@ -89,9 +98,11 @@ import os
 import plistlib
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -136,13 +147,18 @@ XCTEST_RUNNING = re.compile(r"(?:^|/)xctest(?:\s|$)|(?:^|/)xcodebuild\s(?:.*\s)?
 LEAKED_TEST_APP = re.compile(r"^\s*'?(.*/actions-runner[^/]+/_work/_temp/cmux-derived-data-tests-[^/]+/Build/Products/Debug/cmux DEV\.app)(?:/Contents/MacOS/[^ ]+)?'?(?:\s|$)")
 LEAKED_APP_TERM_S = 1.0
 OTA_CONVERGE = ".local/state/glaeda/update/converge.json"  # glaeda-update's CONVERGE, under this home
+CLAUDE_ROUTES = "claude-routes.json"  # config/, beside this script or as mini-setup installs it
+CLAUDE_PROBE_S = 60  # a route that does not answer hangs `claude -p` in its retries until it is killed
+CLAUDE_PROMPT = "Reply with exactly PONG"
+CLAUDE_PERSONAL = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")  # a person's login: it overrides the route
 
 
-def sh(argv: list[str], timeout: float = 15, env: dict[str, str] | None = None) -> tuple[int, str]:
+def sh(argv: list[str], timeout: float = 15, env: dict[str, str] | None = None,
+       cwd: str | None = None) -> tuple[int, str]:
     """(exit code, stdout); 127 when it could not run or timed out."""
     try:
         p = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
-                           timeout=timeout, check=False, env=env)
+                           timeout=timeout, check=False, env=env, cwd=cwd)
     except (OSError, subprocess.SubprocessError):
         return 127, ""
     return p.returncode, p.stdout
@@ -412,14 +428,76 @@ class Mini:
                 return path
         return None
 
+    def fleet_host(self) -> bool:
+        """A fleet mini, not a personal Mac (mini-setup --hygiene-only). glaeda-update's own default: no setupArgs
+        (or no update.json) means --hygiene-only."""
+        return "--hygiene-only" not in load_json(self.home / ".config/glaeda/update.json").get(
+            "setupArgs", ["--hygiene-only"])
+
+    def claude_bin(self) -> Path | None:
+        """The runner user's Claude Code (the capture jobs' agent), or None where it is not installed."""
+        path = self.home / ".local/bin/claude"
+        return path if os.access(path, os.X_OK) else None
+
+    def claude_routes(self) -> dict[str, Any]:
+        """config/claude-routes.json: the repo's or release's beside this script, else the copy mini-setup installs."""
+        for path in (SCRIPT_DIR.parent / "config" / CLAUDE_ROUTES, self.home / ".local/share/glaeda" / CLAUDE_ROUTES):
+            if path.is_file():
+                return load_json(path)
+        return {}
+
+    def claude_settings(self) -> dict[str, Any]:
+        return load_json(self.home / ".claude/settings.json")
+
+    def claude_probe(self, url: str, token: str) -> tuple[bool, str]:
+        """One `claude -p` through URL (--settings outranks ~/.claude/settings.json), without a personal token."""
+        claude = self.claude_bin()
+        if claude is None:
+            return False, "no ~/.local/bin/claude"
+        settings = json.dumps({"env": {"ANTHROPIC_BASE_URL": url, "ANTHROPIC_AUTH_TOKEN": token}})
+        env = {k: v for k, v in os.environ.items() if k not in CLAUDE_PERSONAL}
+        code, out = sh([os.fspath(claude), "-p", "--settings", settings, CLAUDE_PROMPT],
+                       timeout=CLAUDE_PROBE_S, env=env, cwd=tempfile.gettempdir())
+        if code == 0 and "PONG" in out:
+            return True, "PONG"
+        if code == 127:
+            return False, f"no answer in {CLAUDE_PROBE_S} s"
+        return False, f"exit {code}: {' '.join(out.split())[-160:]}"
+
+    def set_claude_route(self, url: str, token: str) -> str:
+        """Point ~/.claude/settings.json at URL, keeping every other setting and a backup of the file."""
+        path = self.home / ".claude/settings.json"
+        doc = load_json(path)
+        backup = None
+        if path.exists():
+            backup = path.with_name(f"settings.json.bak-mini-health-{int(time.time())}")
+            shutil.copy2(path, backup)
+            os.chmod(backup, 0o600)
+        env = doc.get("env") if isinstance(doc.get("env"), dict) else {}
+        env = {k: v for k, v in env.items() if k not in CLAUDE_PERSONAL}
+        env.update(ANTHROPIC_BASE_URL=url, ANTHROPIC_AUTH_TOKEN=token)
+        doc["env"] = env
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(doc, indent=2) + "\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+        return f"~/.claude/settings.json routes Claude to {url}" + (f" (was kept in {backup.name})" if backup else "")
+
+    def claude_probe_last(self) -> dict[str, Any]:
+        return load_json(self.home / ".local/state/glaeda/mini-health/claude-probe.json")
+
+    def save_claude_probe(self, doc: dict[str, Any]) -> None:
+        write_json(self.home / ".local/state/glaeda/mini-health/claude-probe.json", doc)
+
     def daemon_heal_status(self) -> dict[str, Any] | None:
         """glaeda-daemon-heal --status: is the root LaunchDaemon this release's copy; None off macOS or without it."""
         policy = self.daemon_policy()
         if sys.platform != "darwin" or policy is None or not DAEMON_HEAL.is_file():
             return None
-        # A personal Mac (mini-setup --hygiene-only) is no fleet host: its daemons are its owner's.
-        # glaeda-update's own default: no setupArgs (or no update.json) means --hygiene-only.
-        if "--hygiene-only" in load_json(self.home / ".config/glaeda/update.json").get("setupArgs", ["--hygiene-only"]):
+        if not self.fleet_host():  # a personal Mac's daemons are its owner's
             return None
         code, out = sh([sys.executable, "-I", os.fspath(DAEMON_HEAL), "--status", "--policy", os.fspath(policy)])
         try:
@@ -750,7 +828,75 @@ def check_daemon_heal(mini: Mini) -> list[dict[str, Any]]:
     return out
 
 
+def claude_route_settings(mini: Mini) -> tuple[list[str], dict[str, Any]]:
+    """(the fleet routes, the env of ~/.claude/settings.json)."""
+    routes = [r for r in mini.claude_routes().get("routes") or [] if isinstance(r, str) and r]
+    env = mini.claude_settings().get("env")
+    return routes, env if isinstance(env, dict) else {}
+
+
+def check_claude_route(mini: Mini, now: float, remember: bool = True) -> list[dict[str, Any]]:
+    """Claude Code goes through a fleet route that answers a real `claude -p`, checked once per probe_every_s
+    (remember=False, a check-only run: the probe's answer is not kept)."""
+    if mini.claude_bin() is None or not mini.fleet_host():  # a personal Mac's Claude login is its owner's
+        return []
+    routes, env = claude_route_settings(mini)
+    if not routes:
+        return []
+    url, token = env.get("ANTHROPIC_BASE_URL"), env.get("ANTHROPIC_AUTH_TOKEN")
+    note = "rerouted to the first fleet route in config/claude-routes.json that answers; until then capture-host " \
+           "admits no capture lease here"
+    personal = [k for k in CLAUDE_PERSONAL if env.get(k)]
+    if personal:
+        why = f"~/.claude/settings.json sets {', '.join(personal)}, a personal login that overrides the fleet route"
+    elif not url:
+        why = "~/.claude/settings.json sets no ANTHROPIC_BASE_URL, so Claude uses a personal login, which expires"
+    elif url not in routes:
+        why = f"~/.claude/settings.json routes Claude to {url}, not a fleet route ({', '.join(routes)})"
+    elif not token:
+        why = f"~/.claude/settings.json routes Claude to {url} with no ANTHROPIC_AUTH_TOKEN placeholder"
+    else:
+        why = None
+    if why:
+        return [finding("claude_route", "error", why, "pending", note)]
+    last = mini.claude_probe_last()
+    every = mini.claude_routes().get("probe_every_s") or 1800
+    if last.get("route") == url and 0 <= now - (last.get("at") or 0) < every:
+        ok, detail = bool(last.get("ok")), str(last.get("detail") or "")
+    else:
+        ok, detail = mini.claude_probe(url, token)
+        if remember:
+            mini.save_claude_probe({"at": now, "at_iso": iso(now), "route": url, "ok": ok, "detail": detail})
+    if ok:
+        return []
+    return [finding("claude_route", "error", f"`claude -p` through {url}: {detail}", "pending", note)]
+
+
 # ---------------------------------------------------------------- heals
+
+
+def heal_claude_route(mini: Mini, f: dict[str, Any]) -> tuple[bool, str]:
+    """Route Claude to the first fleet route that answers, in the config's order; a route whose probe just failed
+    is tried last. The token is the config's placeholder unless Claude already went to a fleet route with one (a
+    token meant for another URL never goes to a gateway)."""
+    routes, env = claude_route_settings(mini)
+    current = env.get("ANTHROPIC_BASE_URL")
+    token = (env.get("ANTHROPIC_AUTH_TOKEN") if current in routes else None) or mini.claude_routes().get("placeholder")
+    if not token:
+        return False, "config/claude-routes.json has no placeholder token"
+    failed_route = current if f.get("evidence", "").startswith("`claude -p` through ") else None
+    order = [r for r in routes if r != failed_route] + [r for r in routes if r == failed_route]
+    failed = []
+    for url in order:
+        ok, detail = mini.claude_probe(url, token)
+        if ok:
+            what = mini.set_claude_route(url, token)
+            at = time.time()
+            mini.save_claude_probe({"at": at, "at_iso": iso(at), "route": url, "ok": True, "detail": detail})
+            return True, what
+        failed.append(f"{url}: {detail}")
+    return False, "no fleet route answered: " + "; ".join(failed)
+
 
 
 def heal_testmanagerd(mini: Mini, f: dict[str, Any]) -> tuple[bool, str]:
@@ -821,6 +967,7 @@ HEALS: dict[str, tuple[Callable[[Mini, dict[str, Any]], tuple[bool, str]], int]]
     "runner_stopped": (heal_runner, 2),
     "leaked_test_apps": (lambda mini, _f: heal_leaked_test_apps(mini), 1),
     "node_toolchain_missing": (heal_node_toolchain, 1),
+    "claude_route": (heal_claude_route, 1),
 }
 
 
@@ -847,7 +994,8 @@ def iso(t: float) -> str:
 
 
 def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = STATE,
-        report_path: Path = REPORT, heal_ok: bool = True) -> dict[str, Any]:
+        report_path: Path = REPORT, heal_ok: bool = True, runner: bool = True) -> dict[str, Any]:
+    """One pass. runner=False is a host with no glaeda runner (a capture-only mini): only its Claude route."""
     now = time.time() if now is None else now
     state = load_json(state_path) if apply else {}
     seen: dict[str, Any] = state.get("seen") or {}
@@ -855,12 +1003,16 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
     healed = [h for h in state.get("healed") or [] if isinstance(h, dict) and now - (h.get("t") or 0) < HEALED_KEEP_S]
     previous = {f["id"]: f for f in (load_json(report_path).get("findings") or []) if isinstance(f, dict)}
 
-    found = (check_console(mini) + check_power(mini) + check_tailscale(mini) + check_runners(mini)
-             + check_node_eligibility(mini) + check_leaked_test_apps(mini) + check_disk_accounting(mini)
-             + check_daemon_heal(mini) + check_ota(mini, now))
-    tm = check_testmanagerd(mini, now)
-    carried = tm is None and "testmanagerd_wedged" in previous  # a test runs, or the log was unreadable: no heal now
-    found += [previous["testmanagerd_wedged"]] if carried else tm or []
+    carried = False
+    if runner:
+        found = (check_console(mini) + check_power(mini) + check_tailscale(mini) + check_runners(mini)
+                 + check_node_eligibility(mini) + check_leaked_test_apps(mini) + check_disk_accounting(mini)
+                 + check_daemon_heal(mini) + check_ota(mini, now) + check_claude_route(mini, now, apply))
+        tm = check_testmanagerd(mini, now)
+        carried = tm is None and "testmanagerd_wedged" in previous  # a test runs, or the log was unreadable: no heal
+        found += [previous["testmanagerd_wedged"]] if carried else tm or []
+    else:
+        found = check_claude_route(mini, now, apply)
 
     findings, heals = [], []
     for f in found:
@@ -924,11 +1076,17 @@ def main(argv: list[str] | None = None) -> int:
         if args.apply and stale and stale[0]["auto_fix"] == "pending" and due and not KILL_SWITCH.exists():
             healed = heal_daemon_heal(mini, stale[0])
             write_json(NO_RUNNER_HEAL, {"at": time.time(), "ok": healed[0], "action": healed[1]})
+        # A capture-only mini still runs Claude for its captures: its route is checked and healed, and the
+        # report is written where capture-host reads it.
+        claude = (run(mini, args.apply, state_path=STATE, report_path=REPORT, heal_ok=not KILL_SWITCH.exists(),
+                      runner=False) if mini.claude_bin() else None)
+        heals = ([{"id": "daemon_heal_stale", "ok": healed[0], "action": healed[1]}] if healed else []) \
+            + (claude["heals"] if claude else [])
         if not args.apply:
             print(json.dumps({"schema": SCHEMA, "skipped": "no glaeda runner on this host",
-                              "findings": [f["id"] for f in stale]}))
-        elif healed:
-            print(json.dumps({"heals": [{"id": "daemon_heal_stale", "ok": healed[0], "action": healed[1]}]},
+                              "findings": [f["id"] for f in stale] + [f["id"] for f in (claude or {}).get("findings", [])]}))
+        elif heals or (claude and claude["changed"]):
+            print(json.dumps({"findings": [f["id"] for f in (claude or {}).get("findings", [])], "heals": heals},
                              separators=(",", ":")), flush=True)
         return 0
     report = run(mini, args.apply, heal_ok=not KILL_SWITCH.exists())

@@ -26,6 +26,8 @@ def load(name: str, path: Path):
 health = load("glaeda_mini_health", ROOT / "scripts" / "glaeda-mini-health")
 NOW = 1_790_500_000.0
 TM = health.TESTMANAGERD
+ROUTES = json.loads((ROOT / "config" / "claude-routes.json").read_text())
+SR2, POOL = ROUTES["routes"]
 
 
 class FakeMini(health.Mini):
@@ -51,6 +53,11 @@ class FakeMini(health.Mini):
         self.disk: dict = {}
         self.refusal: str | None = None
         self.toolchain_installs: list[str] = []
+        self.claude: str | None = None  # no Claude Code here: no route to check
+        self.claude_env: dict = {}
+        self.answers: dict[str, bool] = {}  # route -> whether `claude -p` through it answers
+        self.probe_memory: dict = {}
+        self.fleet = True  # a fleet mini, not a personal Mac (--hygiene-only)
 
     def console(self):
         return self.console_state
@@ -130,6 +137,35 @@ class FakeMini(health.Mini):
 
     def sudo_ok(self):
         return self.sudo
+
+    def fleet_host(self):
+        return self.fleet
+
+    def claude_bin(self):
+        return Path(self.claude) if self.claude else None
+
+    def claude_routes(self):
+        return ROUTES
+
+    def claude_settings(self):
+        return {"env": dict(self.claude_env)}
+
+    def claude_probe(self, url, token):
+        self.did.append("probe " + url)
+        ok = self.answers.get(url, False)
+        return ok, "PONG" if ok else "no answer in 60 s"
+
+    def set_claude_route(self, url, token):
+        self.did.append("route " + url)
+        self.claude_env = {k: v for k, v in self.claude_env.items() if k != "CLAUDE_CODE_OAUTH_TOKEN"}
+        self.claude_env.update(ANTHROPIC_BASE_URL=url, ANTHROPIC_AUTH_TOKEN=token)
+        return f"~/.claude/settings.json routes Claude to {url}"
+
+    def claude_probe_last(self):
+        return self.probe_memory
+
+    def save_claude_probe(self, doc):
+        self.probe_memory = dict(doc)
 
     def install_daemon_heal(self):
         self.did.append("install daemon-heal")
@@ -647,6 +683,226 @@ class DaemonHealLiveness(Base):
     def test_operator_command_pins_release_hashes(self) -> None:
         self.mini.heal_status = self.status(loaded=False)
         self.assertIn("--expect-sha256", self.run_once()["findings"][0]["note"])
+
+
+class ClaudeRoute(Base):
+    """Claude Code on a fleet mini goes through a fleet route that answers, or capture-host admits no lease here."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.mini.claude = "/Users/cmux/.local/bin/claude"
+        self.mini.claude_env = {"ANTHROPIC_BASE_URL": SR2, "ANTHROPIC_AUTH_TOKEN": "subrouter"}
+        self.mini.answers = {SR2: True, POOL: True}
+
+    def claude(self, report: dict) -> list[dict]:
+        return [f for f in report["findings"] if f["code"] == "claude_route"]
+
+    def test_the_config_names_routes_and_a_placeholder(self) -> None:
+        self.assertEqual(ROUTES["schema"], "glaeda-claude-routes/v1")
+        self.assertTrue(all(r.startswith("http://") for r in ROUTES["routes"]))
+        self.assertTrue(ROUTES["placeholder"])
+        self.assertGreaterEqual(ROUTES["probe_every_s"], 600)
+
+    def test_a_mini_without_claude_is_not_checked(self) -> None:
+        self.mini.claude = None
+        self.mini.claude_env = {}
+        self.assertEqual(self.claude(self.run_once()), [])
+        self.assertEqual(self.mini.did, [])
+
+    def test_a_route_that_answers_is_probed_once_per_window(self) -> None:
+        every = ROUTES["probe_every_s"]
+        self.assertEqual(self.claude(self.run_once()), [])
+        self.assertEqual(self.claude(self.run_once(at=NOW + 120)), [])
+        self.assertEqual(self.mini.did, ["probe " + SR2])
+        self.assertEqual(self.claude(self.run_once(at=NOW + every + 1)), [])
+        self.assertEqual(self.mini.did, ["probe " + SR2] * 2)
+
+    def test_a_personal_login_is_rerouted_on_the_first_run(self) -> None:
+        self.mini.claude_env = {}  # ~/.claude/.credentials.json only: it expires (cmux-mac-mini, 2026-10-21)
+        report = self.run_once()
+        self.assertEqual(self.claude(report), [])
+        self.assertEqual(self.mini.did, ["probe " + SR2, "route " + SR2])
+        self.assertEqual(self.mini.claude_env, {"ANTHROPIC_BASE_URL": SR2, "ANTHROPIC_AUTH_TOKEN": "subrouter"})
+        self.assertEqual([h["code"] for h in report["healed"]], ["claude_route"])
+
+    def test_check_only_reports_a_personal_login_and_changes_nothing(self) -> None:
+        self.mini.claude_env = {}
+        found = self.claude(self.run_once(apply=False))
+        self.assertEqual([(f["severity"], f["auto_fix"]) for f in found], [("error", "pending")])
+        self.assertIn("personal login", found[0]["evidence"])
+        self.assertEqual(self.mini.did, [])
+
+    def test_check_only_probes_but_keeps_nothing(self) -> None:
+        self.assertEqual(self.claude(self.run_once(apply=False)), [])
+        self.assertEqual(self.mini.did, ["probe " + SR2])
+        self.assertEqual(self.mini.probe_memory, {})
+
+    def test_a_route_that_hangs_fails_over_to_one_that_answers(self) -> None:
+        self.mini.claude_env = {"ANTHROPIC_BASE_URL": POOL, "ANTHROPIC_AUTH_TOKEN": "subrouter"}
+        self.mini.answers = {SR2: True, POOL: False}  # :31415 hung cmux11s and cmux7s, 2026-10-21
+        self.assertEqual(self.claude(self.run_once()), [])
+        self.assertEqual(self.mini.did, ["probe " + POOL, "probe " + SR2, "route " + SR2])
+        self.assertEqual((self.mini.probe_memory["route"], self.mini.probe_memory["ok"]), (SR2, True),
+                         "the heal's own probe stands for the window")
+        self.assertEqual(self.claude(self.run_once(at=NOW + 120)), [])
+
+    def test_a_route_that_answers_again_during_the_heal_is_kept(self) -> None:
+        self.mini.answers = {SR2: False, POOL: False}
+        self.run_once(heal_ok=False)
+        self.mini.answers = {SR2: True, POOL: False}  # a hiccup: the route in use answers again
+        self.assertEqual(self.claude(self.run_once(at=NOW + health.HEAL_EVERY_S)), [])
+        self.assertEqual(self.mini.did[-3:], ["probe " + POOL, "probe " + SR2, "route " + SR2])
+        self.assertEqual((self.mini.probe_memory["route"], self.mini.probe_memory["ok"]), (SR2, True),
+                         "the old failure no longer stands for the window")
+
+    def test_the_other_routes_are_tried_before_the_one_that_just_failed(self) -> None:
+        self.mini.answers = {SR2: False, POOL: True}
+        self.assertEqual(self.claude(self.run_once()), [])
+        self.assertEqual(self.mini.did, ["probe " + SR2, "probe " + POOL, "route " + POOL])
+
+    def test_a_personal_mac_is_never_checked_or_rerouted(self) -> None:
+        self.mini.fleet = False  # mini-setup --hygiene-only: Leo's Macs, a teammate's laptop
+        self.mini.claude_env = {}
+        self.assertEqual(self.claude(self.run_once()), [])
+        self.assertEqual(self.mini.did, [])
+        self.assertEqual(self.mini.claude_env, {})
+
+    def test_the_token_is_kept_on_a_fleet_route_and_else_the_placeholder(self) -> None:
+        self.mini.answers = {SR2: False, POOL: True}
+        self.mini.claude_env = {"ANTHROPIC_BASE_URL": SR2, "ANTHROPIC_AUTH_TOKEN": "fleet-token"}
+        self.run_once()
+        self.assertEqual(self.mini.claude_env, {"ANTHROPIC_BASE_URL": POOL, "ANTHROPIC_AUTH_TOKEN": "fleet-token"})
+        for n, env in enumerate(({"ANTHROPIC_BASE_URL": "http://elsewhere:1", "ANTHROPIC_AUTH_TOKEN": "meant-for-elsewhere"},
+                                 {"ANTHROPIC_BASE_URL": "http://elsewhere:1"}), 1):
+            with self.subTest(env=env):
+                self.mini.claude_env = dict(env)
+                self.run_once(at=NOW + 3600 * n)
+                self.assertEqual(self.mini.claude_env["ANTHROPIC_AUTH_TOKEN"], ROUTES["placeholder"])
+
+    def test_a_settings_finding_reroutes_in_the_config_order(self) -> None:
+        self.mini.claude_env = {"ANTHROPIC_BASE_URL": SR2}  # no placeholder: the route itself did not fail
+        self.run_once()
+        self.assertEqual(self.mini.did, ["probe " + SR2, "route " + SR2], "never drifts to a later route")
+
+    def test_a_route_outside_the_config_or_a_personal_token_is_a_finding(self) -> None:
+        for env, why in (({"ANTHROPIC_BASE_URL": "http://elsewhere:1", "ANTHROPIC_AUTH_TOKEN": "x"}, "elsewhere"),
+                         ({"ANTHROPIC_BASE_URL": SR2}, "no ANTHROPIC_AUTH_TOKEN"),
+                         ({"ANTHROPIC_BASE_URL": SR2, "ANTHROPIC_AUTH_TOKEN": "x",
+                           "CLAUDE_CODE_OAUTH_TOKEN": "sk-personal-value"}, "CLAUDE_CODE_OAUTH_TOKEN")):
+            with self.subTest(why=why):
+                self.mini.claude_env = env
+                found = self.claude(self.run_once(apply=False))
+                self.assertEqual(len(found), 1)
+                self.assertIn(why, found[0]["evidence"])
+                self.assertNotIn("sk-personal-value", json.dumps(found), "a token value is never reported")
+
+    def test_when_no_route_answers_the_finding_stays_and_the_heals_stop(self) -> None:
+        self.mini.answers = {SR2: False, POOL: False}
+        at = NOW
+        for n in range(1, 4):
+            found = self.claude(self.run_once(at=at))
+            self.assertEqual(len(found), 1)
+            self.assertEqual(found[0]["severity"], "error")
+            at += health.HEAL_EVERY_S
+        self.assertEqual(found[0]["auto_fix"], "pending")
+        self.assertIn("no fleet route answered", found[0]["note"])
+        found = self.claude(self.run_once(at=at))
+        self.assertEqual(found[0]["auto_fix"], "impossible")
+        on_disk = [f for f in json.loads(self.report.read_text())["findings"] if f["code"] == "claude_route"]
+        self.assertEqual(len(on_disk), 1, "capture-host reads health.json")
+
+    def test_a_failed_probe_is_remembered_within_the_window(self) -> None:
+        self.mini.answers = {SR2: False, POOL: False}
+        self.run_once(heal_ok=False)
+        self.run_once(at=NOW + 120, heal_ok=False)
+        self.assertEqual(self.mini.did, ["probe " + SR2], "a dead route costs one hung probe per window, not per run")
+        self.mini.answers = {SR2: True}
+        self.assertEqual(self.claude(self.run_once(at=NOW + ROUTES["probe_every_s"] + 1, heal_ok=False)), [])
+
+    def test_a_host_without_runners_checks_only_claude(self) -> None:
+        self.mini.console_state = ("locked", "cmux")  # a runner finding: not this host's
+        self.mini.claude_env = {}
+        self.mini.answers = {SR2: False, POOL: False}
+        report = health.run(self.mini, True, now=NOW, state_path=self.state, report_path=self.report, runner=False)
+        self.assertEqual([f["code"] for f in report["findings"]], ["claude_route"])
+
+
+class ClaudeRouteOnDisk(unittest.TestCase):
+    """The real reads and writes: settings.json keeps everything else, the probe never sees a personal token."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        self.mini = health.Mini(self.home)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_set_route_keeps_the_rest_of_the_settings_and_a_backup(self) -> None:
+        settings = self.home / ".claude/settings.json"
+        settings.parent.mkdir()
+        before = {"hooks": {"Stop": []}, "env": {"FOO": "1", "CLAUDE_CODE_OAUTH_TOKEN": "personal"}}
+        settings.write_text(json.dumps(before))
+        what = self.mini.set_claude_route(SR2, "subrouter")
+        after = json.loads(settings.read_text())
+        self.assertEqual(after["hooks"], {"Stop": []})
+        self.assertEqual(after["env"], {"FOO": "1", "ANTHROPIC_BASE_URL": SR2, "ANTHROPIC_AUTH_TOKEN": "subrouter"})
+        self.assertEqual(settings.stat().st_mode & 0o777, 0o600)
+        backups = list(settings.parent.glob("settings.json.bak-mini-health-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].stat().st_mode & 0o777, 0o600, "the backup can hold a token")
+        self.assertEqual(json.loads(backups[0].read_text()), before)
+        self.assertIn(SR2, what)
+        self.assertNotIn("personal", what)
+
+    def test_only_a_fleet_mini_counts_as_one(self) -> None:
+        conf = self.home / ".config/glaeda/update.json"
+        self.assertFalse(self.mini.fleet_host(), "no update.json: glaeda-update's default is --hygiene-only")
+        conf.parent.mkdir(parents=True)
+        for args, fleet in ((["--hygiene-only"], False), ([], True), (["--role=builder"], True)):
+            conf.write_text(json.dumps({"setupArgs": args}))
+            self.assertEqual(self.mini.fleet_host(), fleet, args)
+
+    def test_set_route_writes_settings_where_there_were_none(self) -> None:
+        self.mini.set_claude_route(SR2, "subrouter")
+        self.assertEqual(json.loads((self.home / ".claude/settings.json").read_text())["env"]["ANTHROPIC_BASE_URL"], SR2)
+
+    def fake_claude(self, body: str) -> Path:
+        path = self.home / ".local/bin/claude"
+        path.parent.mkdir(parents=True)
+        path.write_text("#!/bin/sh\n" + body)
+        path.chmod(0o755)
+        return path
+
+    def test_the_probe_routes_through_settings_and_drops_a_personal_token(self) -> None:
+        seen = self.home / "seen"
+        self.fake_claude(f'printf "%s\\n" "$@" > {seen}; env >> {seen}; echo PONG\n')
+        os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = "personal"
+        try:
+            ok, detail = self.mini.claude_probe(SR2, "subrouter")
+        finally:
+            del os.environ["CLAUDE_CODE_OAUTH_TOKEN"]
+        self.assertEqual((ok, detail), (True, "PONG"))
+        text = seen.read_text()
+        self.assertIn(json.dumps({"env": {"ANTHROPIC_BASE_URL": SR2, "ANTHROPIC_AUTH_TOKEN": "subrouter"}}), text)
+        self.assertNotIn("personal", text)
+
+    def test_a_probe_that_hangs_or_fails_is_a_failure(self) -> None:
+        self.fake_claude("sleep 30\n")
+        orig = health.CLAUDE_PROBE_S
+        health.CLAUDE_PROBE_S = 1
+        try:
+            self.assertEqual(self.mini.claude_probe(SR2, "subrouter"), (False, "no answer in 1 s"))
+        finally:
+            health.CLAUDE_PROBE_S = orig
+        (self.home / ".local/bin/claude").write_text("#!/bin/sh\necho 'API Error: 401 OAuth session expired'\nexit 1\n")
+        ok, detail = self.mini.claude_probe(SR2, "subrouter")
+        self.assertFalse(ok)
+        self.assertIn("exit 1", detail)
+        self.assertIn("401", detail)
+
+    def test_no_claude_binary_means_no_check(self) -> None:
+        self.assertIsNone(self.mini.claude_bin())
 
 
 class PersonalMac(unittest.TestCase):
