@@ -3607,7 +3607,7 @@ def cmd_budget(as_json: bool) -> int:
 # one 5000/h REST pool and one 5000/h GraphQL pool, and `gh` itself has no cache and no idea what
 # the other sessions are doing: measured over 96,102 logged calls on one host, 22% of them re-read
 # something another session had read within the previous 90 seconds and 7.5% read repository source
-# through the API. The broker does three things and nothing else:
+# through the API. The broker does four things and nothing else:
 #
 #   serve   `pr view --json` and `run view --json` from the daemon's cache when it is fresh enough
 #           and covers every field asked for. The daemon already reads those in one batched query
@@ -3616,6 +3616,9 @@ def cmd_budget(as_json: bool) -> int:
 #           that repository is checked out on this host. `git show` answers for nothing.
 #   pass    everything else, unchanged: mutations, logs, anything unrecognised, and any read the
 #           cache cannot cover completely.
+#   route   a `pr view`/`run view` miss whose own bucket (GraphQL for pr view, REST for run view) is
+#           spent while the other is not: registered with the daemon, which reads it over the
+#           other bucket, and served from that read if it lands within BROKER_SPENT_WAIT.
 #
 # Serving is deliberately timid, because a wrong answer is far worse than a spent request. A call
 # is served only when every flag on it is one of a short per-subcommand list: an unknown flag means
@@ -3636,6 +3639,13 @@ def cmd_budget(as_json: bool) -> int:
 BROKER_MAX_AGE = 90.0  # cache entries older than this are not served (the daemon's cycle is 60 s)
 BROKER_LEAN_AGE = 600.0  # below the floor, stale data beats spending the last of the quota
 BROKER_REPEAT = 600.0  # a target read twice this far apart is worth watching
+# The API gh itself spends on each brokered read: `pr view` is GraphQL, `run view` is REST. When
+# that bucket is spent, a cache miss passed to gh is a 403, while the daemon can still read the same
+# target over the other bucket (it reads each kind from whichever is richer). So the miss is handed
+# to the daemon instead, and the call waits up to BROKER_SPENT_WAIT for its first read: a new watch
+# is filled within one TICK.
+BROKER_GH_BUCKET = {"pr": "graphql", "run": "rest"}
+BROKER_SPENT_WAIT = 15.0
 BROKER_SEEN_KEEP = 2000  # targets remembered for repeat detection
 BROKER_LOG_MAX = 8 * 1024 * 1024  # the decision log is rotated once past this
 # The call log is rotated too, and far later: it is the audit's whole input, and the audit reads
@@ -4489,6 +4499,41 @@ def broker_max_age(fields: list[str]) -> float:
     return BROKER_MAX_AGE
 
 
+def broker_bucket_spent(key: str, now: float) -> bool:
+    """True when the bucket gh would spend on `key` is below its reserve until a reset that has not
+    come yet, and the other bucket is not: then the daemon can read what gh cannot."""
+    budget = read_json(BASE / "budget.json")
+    if not isinstance(budget, dict):
+        return False
+
+    def spent(bucket: str) -> bool:
+        seen = budget.get(bucket)
+        if not isinstance(seen, dict) or (seen.get("reset") or 0) <= now:
+            return False
+        remaining = seen.get("remaining")
+        return isinstance(remaining, int) and remaining < FLOORS[bucket][1]
+
+    mine = BROKER_GH_BUCKET.get(key.split(":", 1)[0])
+    return mine is not None and spent(mine) and not spent(OTHER[mine])
+
+
+def broker_await(args: list[str], key: str) -> str | None:
+    """Register `key` and wait up to BROKER_SPENT_WAIT for the daemon to read it; the `--json` line
+    once the cache answers every field asked for, else None (the call then goes to gh as before)."""
+    register(key)
+    started = time.monotonic()
+    try:
+        while True:
+            route, line, _key = broker_plan(args, time.time())
+            if route == "serve":
+                return line
+            if time.monotonic() - started >= BROKER_SPENT_WAIT:
+                return None
+            time.sleep(0.5)
+    finally:
+        extend_lock_budget(time.monotonic() - started)  # a deliberate wait, as broker_hold's is
+
+
 def broker_value(stored: Any, kind: str) -> Any:
     """What gh prints for a stored value. gh unmarshals into Go structs, so a null string field
     comes out "" (an unreviewed PR's reviewDecision, a running job's conclusion) while a null time
@@ -4867,6 +4912,13 @@ def cmd_gh(args: list[str]) -> int:
                 broker_note({"route": "serve", "key": key})
                 print(payload)
                 return EXIT_OK
+            if key is not None and not sys.stdout.isatty() and broker_bucket_spent(key, now) \
+                    and daemon_running():
+                line = broker_await(args, key)
+                if line is not None:
+                    broker_note({"route": "serve", "key": key, "spent": True})
+                    print(line)
+                    return EXIT_OK
             broker_hold(broker_repeat_wait(args, words, method, seen, now))
             # No grace here, unlike every other caller. DOWN_GRACE exists so a client waiting on
             # the daemon rides out a re-exec; this answer only decides whether to register a watch,

@@ -3832,6 +3832,80 @@ class BrokerBudgetTest(BrokerBase):
             self.assertEqual(gg.broker_max_age(["title"]), 3600)
 
 
+class BrokerSpentBucketTest(BrokerBase):
+    """Leo, 2026-10-21: "just use rest gh then?" A `pr view` gh would answer over a spent GraphQL
+    bucket is read by the daemon over REST instead, and served from that read."""
+
+    ARGS = ["pr", "view", "7", "-R", "o/r", "--json", "title"]
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.running = mock.patch.object(gg, "daemon_running", lambda grace=0.0: True)
+        self.running.start()
+        self.addCleanup(self.running.stop)
+        self.wait = mock.patch.object(gg, "BROKER_SPENT_WAIT", 0.2)
+        self.wait.start()
+        self.addCleanup(self.wait.stop)
+
+    def budget(self, graphql: int, rest: int, reset: float = 600.0) -> None:
+        at = time.time()
+        gg.write_json(gg.BASE / "budget.json", {
+            "graphql": {"limit": 5000, "remaining": graphql, "reset": at + reset, "seenAt": at},
+            "rest": {"limit": 5000, "remaining": rest, "reset": at + reset, "seenAt": at}})
+
+    def watched(self) -> list[str]:
+        return sorted((gg.read_json(p) or {}).get("key") for p in gg.watch_dir().glob("*.json"))
+
+    def test_a_miss_over_spent_graphql_is_served_from_the_daemons_read(self) -> None:
+        self.budget(graphql=0, rest=4000)
+        real_register = gg.register
+
+        def register(key: str, *a, **kw) -> None:  # the daemon's REST read, landing a tick later
+            real_register(key, *a, **kw)
+            self.cache_pr(7, {"title": "a fix"})
+
+        with mock.patch.object(gg, "register", register):
+            code, out, _err, passed = self.run_gh(self.ARGS)
+        self.assertEqual((code, out, passed), (0, '{"title":"a fix"}\n', None))
+        noted = [json.loads(line) for line in gg.broker_log().read_text().splitlines()]
+        self.assertEqual({k: noted[-1].get(k) for k in ("route", "key", "spent")},
+                         {"route": "serve", "key": "pr:o/r#7", "spent": True})
+
+    def test_no_answer_in_time_still_runs_gh(self) -> None:
+        self.budget(graphql=0, rest=4000)
+        _code, out, _err, passed = self.run_gh(self.ARGS)
+        self.assertEqual((out, passed), ("", self.ARGS))
+        self.assertEqual(self.watched(), ["pr:o/r#7"], "the daemon was asked even so")
+
+    def test_a_healthy_bucket_does_not_wait_or_watch(self) -> None:
+        self.budget(graphql=4000, rest=4000)
+        with mock.patch.object(gg, "broker_await", side_effect=AssertionError("waited")):
+            _code, _out, _err, passed = self.run_gh(self.ARGS)
+        self.assertEqual(passed, self.ARGS)
+        self.assertEqual(self.watched(), [])
+
+    def test_both_buckets_spent_goes_straight_to_gh(self) -> None:
+        self.budget(graphql=0, rest=0)
+        self.assertFalse(gg.broker_bucket_spent("pr:o/r#7", time.time()))
+
+    def test_a_reset_that_has_passed_is_not_spent(self) -> None:
+        self.budget(graphql=0, rest=4000, reset=-1)
+        self.assertFalse(gg.broker_bucket_spent("pr:o/r#7", time.time()))
+
+    def test_each_read_is_judged_by_the_bucket_gh_spends_on_it(self) -> None:
+        self.budget(graphql=4000, rest=0)
+        now = time.time()
+        self.assertFalse(gg.broker_bucket_spent("pr:o/r#7", now), "gh pr view is GraphQL")
+        self.assertTrue(gg.broker_bucket_spent("run:o/r/9", now), "gh run view is REST")
+
+    def test_without_the_daemon_nothing_waits(self) -> None:
+        self.budget(graphql=0, rest=4000)
+        with mock.patch.object(gg, "daemon_running", lambda grace=0.0: False), \
+                mock.patch.object(gg, "broker_await", side_effect=AssertionError("waited")):
+            _code, _out, _err, passed = self.run_gh(self.ARGS)
+        self.assertEqual(passed, self.ARGS)
+
+
 class BrokerFailOpenTest(BrokerBase):
     def test_an_error_anywhere_in_the_broker_still_runs_the_real_gh(self) -> None:
         with mock.patch.object(gg, "broker_plan", side_effect=RuntimeError("boom")):
