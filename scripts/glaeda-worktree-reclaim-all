@@ -12,6 +12,9 @@
 # instead of the command's 72 h: cmux16 sat at 98% with nothing reclaimed. Every other veto
 # (changes, untracked files, unpushed commits, a process inside) still holds. Depth-1 checkouts
 # come first; a clone nested in a checkout is a checkout too.
+# A checkout Git cannot read (cosmic-gray, 2026-10-22: a clone whose commit-graph chain was gone)
+# is skipped and named on stderr, here or by the command (--skip-unlisted), so it no longer makes
+# every run exit 2; the receipt still lists it with its error.
 # Installed into ~/.local/bin by scripts/glaeda-mini-setup.
 set -euo pipefail
 reclaim="${GLAEDA_WORKTREE_RECLAIM:-$HOME/.local/bin/glaeda-worktree-reclaim}"
@@ -27,8 +30,14 @@ for directory in "$projects"/*/ "$projects"/*/*/; do
     # candidate. This is discovery only: the reclaimer still decides protection,
     # checked-out state, merge evidence, idle windows and compare-and-swap deletion.
     # Do not consume the repository budget for main/master-only checkouts.
-    branches=$(/usr/bin/git -C "$directory" for-each-ref --count=3 \
-      --format='%(refname)' refs/heads/)
+    if ! branches=$(/usr/bin/git -C "$directory" for-each-ref --count=3 \
+      --format='%(refname)' refs/heads/ 2>/dev/null); then
+      # One unreadable checkout must not stop the sweep of the others: name it and its error, go on.
+      problem=$(/usr/bin/git -C "$directory" for-each-ref --count=1 refs/heads/ 2>&1 >/dev/null || true)
+      problem=${problem//$'\n'/ }
+      printf 'glaeda-worktree-reclaim-all: skipped %s: %s\n' "$directory" "${problem:0:300}" >&2
+      continue
+    fi
     candidate=0
     while IFS= read -r branch; do
       case "$branch" in
@@ -72,4 +81,9 @@ case " $* " in
     fi
     ;;
 esac
-exec "$reclaim" --branches ${window[@]+"${window[@]}"} ${workers[@]+"${workers[@]}"} "$@" "${repositories[@]}"
+# A command older than --skip-unlisted (a host whose build of it failed) would refuse the flag and
+# sweep nothing; it gets the old argv and still exits 2 on an unreadable checkout.
+skip=()
+help=$("$reclaim" --help 2>/dev/null || true)
+[[ "$help" == *--skip-unlisted* ]] && skip=(--skip-unlisted)
+exec "$reclaim" --branches ${skip[@]+"${skip[@]}"} ${window[@]+"${window[@]}"} ${workers[@]+"${workers[@]}"} "$@" "${repositories[@]}"

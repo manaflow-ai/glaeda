@@ -493,6 +493,87 @@ fn a_linked_worktree_is_not_accepted_as_the_repository() {
     assert_eq!(document["repositories"][0]["code"], "not_main_worktree");
 }
 
+/// The hourly sweep passes every checkout it found, and one broken checkout (cosmic-gray,
+/// 2026-10-22: a clone whose alternate's commit-graph chain was gone, so every Git command warned)
+/// made each run exit 2. With --skip-unlisted that checkout is named with its error on stderr and in
+/// the report, the others are still swept, and the run exits 0.
+#[test]
+fn skip_unlisted_names_a_broken_checkout_and_sweeps_the_rest() {
+    let fixture = Fixture::new();
+    fixture.add("linked");
+    let broken = fixture.root.join("broken");
+    fs::create_dir_all(&broken).expect("create broken checkout");
+    git(&broken, &["init", "-b", "main"]);
+    commit(&broken, "fixture");
+    git(&broken, &["branch", "lane"]);
+    let graphs = broken.join(".git/objects/info/commit-graphs");
+    fs::create_dir_all(&graphs).expect("create commit-graph folder");
+    fs::write(
+        graphs.join("commit-graph-chain"),
+        "0123456789abcdef0123456789abcdef01234567\n",
+    )
+    .expect("write a chain naming a missing graph");
+    let missing = fixture.root.join("missing");
+    let arguments = |extra: &[&str]| {
+        let mut command = Command::new(BINARY);
+        for repository in [&broken, &fixture.main, &missing] {
+            command.arg("--repository").arg(repository);
+        }
+        command
+            .args(["--branches", "--output", "json"])
+            .args(extra)
+            .output()
+            .expect("run worktree reclaim")
+    };
+
+    let strict = arguments(&[]);
+    assert_eq!(
+        strict.status.code(),
+        Some(2),
+        "without --skip-unlisted an unlisted repository still fails the run"
+    );
+
+    let output = arguments(&["--skip-unlisted"]);
+    let document = document(&output);
+    let repositories = document["repositories"].as_array().expect("repositories");
+    assert_eq!(repositories.len(), 3);
+    assert_eq!(
+        repositories[1]["result"], "listed",
+        "the good checkout is swept"
+    );
+    assert_eq!(
+        repositories[1]["path"],
+        fixture.main.to_str().expect("UTF-8")
+    );
+    assert_eq!(repositories[1]["summary"]["linked"], 1);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Git reads the commit-graph only where it reads commits, so the broken checkout may fail at
+    // its listing or at its branches; either way it is named, with its error.
+    for (index, path) in [(0, &broken), (2, &missing)] {
+        let entry = &repositories[index];
+        let path = path.to_str().expect("UTF-8 fixture path");
+        assert_eq!(entry["path"], path);
+        let failed = if entry["result"] == "unlisted" {
+            entry
+        } else {
+            &entry["branches"]
+        };
+        assert_eq!(failed["result"], "unlisted", "{path}: {entry}");
+        assert!(failed["code"].as_str().is_some_and(|code| !code.is_empty()));
+        assert!(
+            failed["problem"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty())
+        );
+        assert!(
+            stderr
+                .lines()
+                .any(|line| line.contains("skipped") && line.contains(&format!(" {path}: "))),
+            "stderr names {path}: {stderr}"
+        );
+    }
+}
+
 fn git_as_user(checkout: &Path, arguments: &[&str]) {
     let mut full = vec![
         "-c",

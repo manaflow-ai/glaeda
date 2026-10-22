@@ -137,6 +137,12 @@ struct Cli {
         value_parser = clap::value_parser!(u8).range(1..=8).map(usize::from),
     )]
     git_workers: usize,
+
+    /// Skip a repository that cannot be listed (a broken or unreadable checkout): name it and its
+    /// error on stderr and in the report, sweep the rest, and do not fail the run for it. For a
+    /// caller that discovers checkouts itself; a mistyped --repository still exits 2 without it.
+    #[arg(long)]
+    skip_unlisted: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -195,6 +201,7 @@ enum RepositoryResult {
     },
     Unlisted {
         code: &'static str,
+        problem: &'static str,
     },
 }
 
@@ -202,6 +209,8 @@ enum RepositoryResult {
 struct RepositoryReport {
     /// Position of the repository among the `--repository` arguments, starting at 1.
     ordinal: usize,
+    /// The `--repository` argument, so a skipped checkout is named in the receipt.
+    path: PathBuf,
     /// Free bytes on the repository's filesystem around this repository's removals.
     #[serde(skip_serializing_if = "Option::is_none")]
     available_bytes_before: Option<u64>,
@@ -223,6 +232,7 @@ enum BranchSection {
     },
     Unlisted {
         code: &'static str,
+        problem: &'static str,
     },
 }
 
@@ -307,6 +317,8 @@ fn main() -> ExitCode {
     let mut budget_exhausted = false;
     let mut circuit_breaker_tripped = false;
     let mut mutation_performed = false;
+    // The process listing is the host's, not one checkout's: --skip-unlisted never hides it.
+    let mut host_evidence_failed = false;
     let mut repositories = Vec::with_capacity(cli.repositories.len());
 
     for (index, repository) in cli.repositories.iter().enumerate() {
@@ -315,9 +327,13 @@ fn main() -> ExitCode {
             Err(error) => {
                 repositories.push(RepositoryReport {
                     ordinal: index + 1,
+                    path: repository.clone(),
                     available_bytes_before: None,
                     available_bytes_after: None,
-                    result: RepositoryResult::Unlisted { code: error.code() },
+                    result: RepositoryResult::Unlisted {
+                        code: error.code(),
+                        problem: error.problem(),
+                    },
                     branches: None,
                 });
                 continue;
@@ -330,11 +346,16 @@ fn main() -> ExitCode {
             let evidence = match ProcessUseEvidence::collect(&executor) {
                 Ok(evidence) => evidence,
                 Err(error) => {
+                    host_evidence_failed = true;
                     repositories.push(RepositoryReport {
                         ordinal: index + 1,
+                        path: repository.clone(),
                         available_bytes_before: None,
                         available_bytes_after: None,
-                        result: RepositoryResult::Unlisted { code: error.code() },
+                        result: RepositoryResult::Unlisted {
+                            code: error.code(),
+                            problem: error.problem(),
+                        },
                         branches: None,
                     });
                     continue;
@@ -461,10 +482,14 @@ fn main() -> ExitCode {
                         branches,
                     }
                 }
-                Err(error) => BranchSection::Unlisted { code: error.code() },
+                Err(error) => BranchSection::Unlisted {
+                    code: error.code(),
+                    problem: error.problem(),
+                },
             });
         repositories.push(RepositoryReport {
             ordinal: index + 1,
+            path: repository.clone(),
             available_bytes_before,
             available_bytes_after: cli.apply.then(|| available_bytes(repository)).flatten(),
             result: RepositoryResult::Listed { summary, worktrees },
@@ -504,13 +529,30 @@ fn main() -> ExitCode {
         },
         OutputFormat::Human => render_human(&report, cli.apply, cli.all),
     }
-    let any_unlisted = report.repositories.iter().any(|repository| {
-        matches!(repository.result, RepositoryResult::Unlisted { .. })
-            || matches!(repository.branches, Some(BranchSection::Unlisted { .. }))
-    });
+    let mut any_unlisted = false;
+    for repository in &report.repositories {
+        let unlisted = match (&repository.result, &repository.branches) {
+            (RepositoryResult::Unlisted { code, problem }, _) => {
+                Some(("repository", code, problem))
+            }
+            (_, Some(BranchSection::Unlisted { code, problem })) => {
+                Some(("branches of", code, problem))
+            }
+            _ => None,
+        };
+        if let Some((what, code, problem)) = unlisted {
+            any_unlisted = true;
+            if cli.skip_unlisted {
+                eprintln!(
+                    "glaeda-worktree-reclaim: skipped {what} {}: {code}: {problem}",
+                    repository.path.display()
+                );
+            }
+        }
+    }
     if circuit_breaker_tripped {
         ExitCode::from(3)
-    } else if any_unlisted {
+    } else if host_evidence_failed || (any_unlisted && !cli.skip_unlisted) {
         // A mistyped or invalid repository must not pass silently in an unattended run.
         ExitCode::from(2)
     } else {
@@ -527,8 +569,12 @@ fn render_human(report: &Report, apply: bool, all: bool) {
     let mut eligible_total = 0;
     for repository in &report.repositories {
         match &repository.result {
-            RepositoryResult::Unlisted { code } => {
-                println!("repository {}: not listed: {code}", repository.ordinal);
+            RepositoryResult::Unlisted { code, .. } => {
+                println!(
+                    "repository {} ({}): not listed: {code}",
+                    repository.ordinal,
+                    repository.path.display()
+                );
             }
             RepositoryResult::Listed { summary, worktrees } => {
                 eligible_total += summary.eligible;
@@ -559,7 +605,7 @@ fn render_human(report: &Report, apply: bool, all: bool) {
                 }
                 match &repository.branches {
                     None => {}
-                    Some(BranchSection::Unlisted { code }) => {
+                    Some(BranchSection::Unlisted { code, .. }) => {
                         println!("  branches: not listed: {code}");
                     }
                     Some(BranchSection::Listed {

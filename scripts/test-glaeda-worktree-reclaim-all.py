@@ -19,7 +19,9 @@ class ReclaimDiscoveryTest(unittest.TestCase):
         self.projects.mkdir()
         self.capture = self.root / "argv"
         self.reclaim = self.root / "reclaim"
-        self.reclaim.write_text('#!/bin/bash\nprintf "%s\\0" "$@" > "$CAPTURE"\n')
+        self.reclaim.write_text(
+            '#!/bin/bash\n[ "$1" = --help ] && { echo "  --skip-unlisted"; exit 0; }\n'
+            'printf "%s\\0" "$@" > "$CAPTURE"\n')
         self.reclaim.chmod(0o755)
         self.env = {
             "HOME": str(self.root), "PATH": "/usr/bin:/bin",
@@ -61,7 +63,7 @@ class ReclaimDiscoveryTest(unittest.TestCase):
         self.git(repo, "worktree", "remove", str(checkout))
         before = self.git(repo, "show-ref")
         self.assertEqual(self.sweep("--output", "json"),
-                         ["--branches", "--output", "json", "--repository", str(repo)])
+                         ["--branches", "--skip-unlisted", "--output", "json", "--repository", str(repo)])
         self.assertEqual(self.git(repo, "show-ref"), before)
         self.assertFalse(checkout.exists())
 
@@ -77,7 +79,7 @@ class ReclaimDiscoveryTest(unittest.TestCase):
     def test_linked_worktree_still_selects_repository(self):
         repo = self.repository()
         self.git(repo, "worktree", "add", "--detach", str(self.root / "linked"))
-        self.assertEqual(self.sweep(), ["--branches", "--repository", str(repo)])
+        self.assertEqual(self.sweep(), ["--branches", "--skip-unlisted", "--repository", str(repo)])
 
     def test_main_and_master_only_do_not_consume_repository_budget(self):
         repo = self.repository()
@@ -134,6 +136,30 @@ class ReclaimDiscoveryTest(unittest.TestCase):
         for bad in ("0", "9", "two", "-1"):
             self.env["GLAEDA_RECLAIM_GIT_WORKERS"] = bad
             self.assertNotIn("--git-workers", self.sweep(), bad)
+
+    def test_an_older_command_without_the_flag_gets_the_old_argv(self):
+        repo = self.repository()
+        self.git(repo, "branch", "lane")
+        self.reclaim.write_text('#!/bin/bash\n[ "$1" = --help ] && exit 0\nprintf "%s\\0" "$@" > "$CAPTURE"\n')
+        self.assertEqual(self.sweep(), ["--branches", "--repository", str(repo)])
+
+    def test_an_unreadable_checkout_is_skipped_and_named(self):
+        # One broken checkout must not stop the sweep of the others (cosmic-gray, 2026-10-22).
+        good = self.repository("good")
+        self.git(good, "branch", "lane")
+        broken = self.repository("broken")
+        self.git(broken, "branch", "lane")
+        (broken / ".git" / "HEAD").write_text("garbage\n")
+        result = subprocess.run(
+            ["/bin/bash", str(SCRIPT)], env=self.env,
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        argv = self.capture.read_bytes().decode().rstrip("\0").split("\0")
+        self.assertIn(str(good), argv)
+        self.assertNotIn(str(broken), argv)
+        self.assertIn(f"skipped {broken}: ", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
