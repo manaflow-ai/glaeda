@@ -1096,6 +1096,21 @@ def item_due(fam: "Family", idle_hours: float, window: float) -> tuple[bool, int
             or (idle_hours >= POLICY["soft_idle_hours"] and jobs >= POLICY["pressure_jobs"])), jobs
 
 
+# host_busy's reasons that are no answer (it could not read), not a busy host: a caller that waits for idle (the
+# Tailscale restart in glaeda-mini-health) tells them apart with host_busy_unreadable instead of matching text.
+HOST_PS_UNREADABLE = "cannot list processes"
+HOST_JOBS_UNREADABLE = "cannot read {jobs}"
+HOST_RESERVATION_UNREADABLE = "the host reservation is unreadable"
+HOST_LOCK_UNREADABLE = "the host lock is unreadable"
+
+
+def host_busy_unreadable(reason: str) -> bool:
+    """Whether a host_busy reason is one it gives when it could not read the host, not one for a busy host."""
+    prefix, suffix = HOST_JOBS_UNREADABLE.split("{jobs}")
+    return reason in {HOST_PS_UNREADABLE, HOST_RESERVATION_UNREADABLE, HOST_LOCK_UNREADABLE} or (
+        reason.startswith(prefix) and reason.endswith("/jobs") and len(reason) > len(prefix) + len(suffix))
+
+
 def host_busy(fleet: Path | None = None, now: float | None = None) -> str:
     """Why this host is not idle, or "": a CI job or build process, a dev-build worker job, an active or
     unreadable reservation, or the fleet host lock held (PR jobs hold it shared, fleet builds exclusive).
@@ -1105,9 +1120,9 @@ def host_busy(fleet: Path | None = None, now: float | None = None) -> str:
     try:
         ps = subprocess.run(["ps", "-axww", "-o", "command="], capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.SubprocessError):
-        return "cannot list processes"
+        return HOST_PS_UNREADABLE
     if ps.returncode != 0 or not ps.stdout.strip():
-        return "cannot list processes"
+        return HOST_PS_UNREADABLE
     for line in ps.stdout.splitlines():
         if CI_WORKER.search(line):
             return f"a CI job is running ({line.strip()[:120]})"
@@ -1120,13 +1135,13 @@ def host_busy(fleet: Path | None = None, now: float | None = None) -> str:
     except FileNotFoundError:
         pass
     except OSError:
-        return f"cannot read {fleet / 'jobs'}"
+        return HOST_JOBS_UNREADABLE.format(jobs=fleet / "jobs")
     try:
         doc = json.loads((fleet / "reservation.json").read_text())
     except FileNotFoundError:
         pass
     except (OSError, ValueError):
-        return "the host reservation is unreadable"
+        return HOST_RESERVATION_UNREADABLE
     else:
         # glaeda_reservation's rule: another schema or a non-integer time is invalid, and invalid is active
         until = doc.get("until") if isinstance(doc, dict) else None
@@ -1138,7 +1153,7 @@ def host_busy(fleet: Path | None = None, now: float | None = None) -> str:
     except FileNotFoundError:
         return ""
     except OSError:
-        return "the host lock is unreadable"
+        return HOST_LOCK_UNREADABLE
     try:
         # shared, as the runner hook's host_held probes: an exclusive probe could make a PR job's own
         # one-shot exclusive take fail. PR jobs (shared holders) are caught by Runner.Worker above.

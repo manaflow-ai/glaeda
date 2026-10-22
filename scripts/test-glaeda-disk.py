@@ -3842,6 +3842,44 @@ class GlaedaDiskTest(unittest.TestCase):
         with ps(""):
             self.assertIn("cannot list", gd.host_busy(fleet))
 
+    def test_host_busy_marks_its_no_answer_reasons(self) -> None:
+        """glaeda-mini-health tells host_busy's could-not-read reasons (no restart is coming) from a busy host (a short
+        wait) by host_busy_unreadable, not by matching text of its own."""
+        fleet = self.root / "fleet"
+        fleet.mkdir()
+        ps = lambda out: mock.patch.object(gd.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, out, ""))
+        unreadable, busy = [], []
+        with ps(""):
+            unreadable.append(gd.host_busy(fleet))
+        with ps("/Users/cmux/actions-runner-glaeda/bin/Runner.Worker spawnclient 1 2\n"):
+            busy.append(gd.host_busy(fleet))
+        with ps("/sbin/launchd\n"):
+            (fleet / "jobs").write_text("")  # not a directory: scandir fails
+            unreadable.append(gd.host_busy(fleet))
+            (fleet / "jobs").unlink()
+            (fleet / "jobs").mkdir()
+            (fleet / "jobs/abc").mkdir()
+            busy.append(gd.host_busy(fleet))
+            (fleet / "jobs/abc").rmdir()
+            (fleet / "reservation.json").write_text("{")
+            unreadable.append(gd.host_busy(fleet))
+            (fleet / "reservation.json").write_text(json.dumps({"until": 1}))
+            busy.append(gd.host_busy(fleet))
+            (fleet / "reservation.json").unlink()
+            os.symlink(fleet / "elsewhere", fleet / "host.lock")  # O_NOFOLLOW refuses it
+            unreadable.append(gd.host_busy(fleet))
+            (fleet / "host.lock").unlink()
+            (fleet / "host.lock").touch()
+            with (fleet / "host.lock").open() as held:
+                fcntl.flock(held, fcntl.LOCK_EX)
+                busy.append(gd.host_busy(fleet))
+        self.assertEqual(len(set(unreadable)), 4, unreadable)
+        for reason in unreadable:
+            self.assertTrue(reason and gd.host_busy_unreadable(reason), reason)
+        for reason in busy:
+            self.assertTrue(reason and not gd.host_busy_unreadable(reason), reason)
+        self.assertFalse(gd.host_busy_unreadable(""))
+
     def test_the_repo_runner_hook_is_allowlisted_for_drain(self) -> None:
         """Every change to scripts/glaeda-cmux-runner-hook must pin its sha256 in CMUX_NEXT_DRAIN_HOOK_SHA256, or
         drain refuses every runner that installed it ("runner hook enrollment is not proven"). #1561 missed it
