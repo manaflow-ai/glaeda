@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import contextlib
+import collections
 import fcntl
 import hashlib
 import io
@@ -15,6 +16,7 @@ import plistlib
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -4745,6 +4747,333 @@ class DedupeTest(unittest.TestCase):
         self.blob("b/small", b"x" * 10)
         r = gd.dedupe([self.root / "a", self.root / "b"], self.state)
         self.assertEqual((r["files"], r["cloned_bytes"]), (0, 0))
+
+
+class _Stat:
+    """An lstat result with some fields replaced (st_dev, st_uid), for paths a test pretends are elsewhere."""
+
+    def __init__(self, st: os.stat_result, **over: int) -> None:
+        self._st, self._over = st, over
+
+    def __getattr__(self, name: str):
+        return self._over[name] if name in self._over else getattr(self._st, name)
+
+
+apfs = unittest.skipUnless(sys.platform == "darwin", "APFS clones are macOS only")
+
+
+class CaptureDedupeTest(unittest.TestCase):
+    """cmux-mac-mini, 2026-10-18..21: every pressure pass freed 0 GiB while ~/messageslab-26 held 11.2 GiB of
+    byte-identical PNG frames (deputy-2 cloned them by hand at a 16 KiB floor). Dedupe looked only at Xcode's
+    folders with a 1 MiB floor. Capture and evidence trees are now policy roots with their own smaller floor."""
+
+    KIB = 1024
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(dir=os.path.expanduser("~"))
+        self.root = Path(self.tmp.name)
+        self.state = self.root / "state.json"
+        self.policy = dict(gd.POLICY_DEFAULTS)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def blob(self, rel: str, data: bytes, mode: int = 0o644, mtime: float = 1_000_000) -> Path:
+        p = self.root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+        os.chmod(p, mode)
+        os.utime(p, (mtime, mtime))
+        return p
+
+    def dedupe(self, roots: list[Path], **kw):
+        kw.setdefault("min_bytes", 16 * self.KIB)
+        kw.setdefault("strict", True)
+        return gd.dedupe(roots, self.state, **kw)
+
+    def files(self) -> set[str]:
+        return {p.relative_to(self.root).as_posix() for p in self.root.rglob("*")
+                if p.is_file() and p != self.state and not p.name.startswith("dedupe")}
+
+    def run_main(self, policy: dict | None = None, writers: frozenset = frozenset()) -> str:
+        dd = self.root / "Library/Developer/Xcode/DerivedData"
+        dd.mkdir(parents=True, exist_ok=True)
+        out = io.StringIO()
+        with mock.patch.object(gd, "HOME", self.root), \
+                mock.patch.object(gd, "DEDUPE_STATE", self.root / ".cache/glaeda-disk/dedupe.json"), \
+                mock.patch.object(gd, "POLICY", policy or self.policy), \
+                mock.patch.object(gd, "default_families",
+                                  return_value=[gd.Family("xcode-derived-data", dd, True, "x")]), \
+                mock.patch.object(gd, "open_for_writing", return_value=writers), \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(gd.main(["--dedupe"]), 0)
+        return out.getvalue()
+
+    # -- the policy declares the roots and the floor --------------------------------------------------
+
+    def test_policy_declares_capture_roots_and_a_16_kib_floor(self) -> None:
+        roots = gd.POLICY_DEFAULTS["dedupe_capture_roots"]
+        for want in ("~/messageslab-*", "~/Projects/captures", "~/Applications/cx-ui-captures",
+                     "/Users/Shared/cmux-capture", "/Users/Shared/cmux-captures"):
+            self.assertIn(want, roots)
+        self.assertEqual(gd.POLICY_DEFAULTS["dedupe_capture_min_kib"], 16)
+        self.assertGreater(gd.POLICY_DEFAULTS["dedupe_capture_settle_minutes"], 0)
+        self.assertGreater(gd.POLICY_DEFAULTS["dedupe_capture_budget_minutes"], 0)
+        self.assertEqual(gd.DEDUPE_MIN_BYTES, 1024 * 1024)  # Xcode's folders keep their 1 MiB floor
+
+    def test_a_host_policy_file_replaces_the_roots_and_bad_values_keep_the_default(self) -> None:
+        path = self.root / "disk-policy.json"
+        path.write_text(json.dumps({"dedupe_capture_roots": ["~/evidence", "/data/caps-*"],
+                                    "dedupe_capture_min_kib": 64}))
+        got = gd.disk_policy(path)
+        self.assertEqual(got["dedupe_capture_roots"], ["~/evidence", "/data/caps-*"])
+        self.assertEqual(got["dedupe_capture_min_kib"], 64)
+        for bad in ("~/evidence", ["~/ok", 3], [""]):
+            path.write_text(json.dumps({"dedupe_capture_roots": bad}))
+            self.assertEqual(gd.disk_policy(path)["dedupe_capture_roots"],
+                             gd.POLICY_DEFAULTS["dedupe_capture_roots"])
+        path.write_text(json.dumps({"dedupe_capture_roots": []}))  # an empty list turns the pass off
+        self.assertEqual(gd.disk_policy(path)["dedupe_capture_roots"], [])
+
+    def test_roots_expand_home_and_globs_and_skip_missing_files_and_symlinks(self) -> None:
+        for d in ("messageslab-26", "messageslab-27", "Projects/captures"):
+            (self.root / d).mkdir(parents=True)
+        (self.root / "messageslab-notes").write_text("a file, not a tree")
+        (self.root / "messageslab-link").symlink_to(self.root / "Projects")
+        got = gd.capture_dedupe_roots(["~/messageslab-*", "~/Projects/captures", "~/missing",
+                                       os.fspath(self.root / "Projects/captures")], home=self.root)
+        self.assertEqual(got, [self.root / "messageslab-26", self.root / "messageslab-27",
+                               self.root / "Projects/captures"])
+
+    # -- the pass itself ----------------------------------------------------------------------------
+
+    @apfs
+    def test_main_dedupe_clones_capture_frames_down_to_16_kib_and_deletes_nothing(self) -> None:
+        frame = os.urandom(32 * self.KIB)
+        a = self.blob("messageslab-26/sendw/take1/frames/0001.png", frame)
+        b = self.blob("messageslab-26/sendw/take2/frames/0001.png", frame)
+        c = self.blob("Projects/captures/run/0001.png", frame)
+        tiny = os.urandom(8 * self.KIB)
+        t1 = self.blob("messageslab-26/a/tiny.png", tiny)
+        t2 = self.blob("messageslab-26/b/tiny.png", tiny)
+        # Xcode's folders keep their 1 MiB floor: a 64 KiB duplicate there stays as it is.
+        pkg = os.urandom(64 * self.KIB)
+        x1 = self.blob("Library/Developer/Xcode/DerivedData/p1/SourcePackages/x.bin", pkg)
+        x2 = self.blob("Library/Developer/Xcode/DerivedData/p2/SourcePackages/x.bin", pkg)
+        self.policy["dedupe_capture_roots"] = ["~/messageslab-*", "~/Projects/captures"]
+        inodes = {p: p.stat().st_ino for p in (a, b, c, t1, t2, x1, x2)}
+        before = self.files()
+        out = self.run_main()
+        self.assertIn("dedupe captures: 3 files >= 16 KiB in 2 roots", out)
+        self.assertEqual(self.files(), before)  # never deletes
+        self.assertTrue(all(p.read_bytes() == frame for p in (a, b, c)))
+        self.assertEqual(sum(p.stat().st_ino != inodes[p] for p in (a, b, c)), 2)
+        for p in (t1, t2, x1, x2):
+            self.assertEqual(p.stat().st_ino, inodes[p])
+        state = json.loads((self.root / ".cache/glaeda-disk/dedupe-captures.json").read_text())
+        self.assertTrue(all(state[os.fspath(p)]["cloned"] for p in (a, b, c)))
+
+    @apfs
+    def test_no_capture_roots_means_no_capture_pass(self) -> None:
+        self.policy["dedupe_capture_roots"] = []
+        self.assertNotIn("dedupe captures", self.run_main())
+
+    @apfs
+    def test_young_capture_files_wait_for_a_later_pass(self) -> None:
+        frame = os.urandom(32 * self.KIB)
+        a = self.blob("messageslab-26/a.png", frame)
+        b = self.blob("messageslab-26/b.png", frame, mtime=time.time() - 60)
+        self.policy["dedupe_capture_roots"] = ["~/messageslab-*"]
+        ino = b.stat().st_ino
+        out = self.run_main()
+        self.assertIn("still settling 1", out)
+        self.assertEqual(b.stat().st_ino, ino)
+        self.assertEqual(a.read_bytes(), frame)
+
+    @apfs
+    def test_files_open_for_writing_are_left_alone(self) -> None:
+        frame = os.urandom(32 * self.KIB)
+        self.blob("caps/a.png", frame)
+        b = self.blob("caps/b.png", frame)
+        ino = b.stat().st_ino
+        with open(b, "r+b") as held:  # a recorder still has it open for writing (real lsof)
+            r = self.dedupe([self.root / "caps"], guard=gd.capture_dedupe_guard())
+            self.assertEqual((r["cloned_bytes"], r["refused"]), (0, 1))
+            self.assertEqual(b.stat().st_ino, ino)
+            held.seek(0)
+        r = self.dedupe([self.root / "caps"], guard=gd.capture_dedupe_guard())
+        self.assertEqual(r["cloned_bytes"], len(frame))
+        self.assertEqual(b.read_bytes(), frame)
+
+    def test_writers_are_read_from_lsof_access_modes(self) -> None:
+        out = ("p10\nfcwd\na \nn/Users/x\nf3\nar\nn/caps/read.png\nf4\naw\nn/caps/write.png\n"
+               "p11\nf5\nau\nn/caps/rw.png\nf6\na \nn/caps/none.png\n")
+        self.assertEqual(gd.lsof_writers(out), frozenset({"/caps/write.png", "/caps/rw.png"}))
+
+    @apfs
+    def test_without_lsof_evidence_the_capture_pass_is_skipped(self) -> None:
+        frame = os.urandom(32 * self.KIB)
+        self.blob("messageslab-26/a.png", frame)
+        b = self.blob("messageslab-26/b.png", frame)
+        self.policy["dedupe_capture_roots"] = ["~/messageslab-*"]
+        ino = b.stat().st_ino
+        with mock.patch.object(gd, "open_for_writing", side_effect=gd.NoEvidence("lsof: boom")):
+            out = io.StringIO()
+            with mock.patch.object(gd, "HOME", self.root), mock.patch.object(gd, "POLICY", self.policy), \
+                    mock.patch.object(gd, "DEDUPE_STATE", self.root / ".cache/dedupe.json"), \
+                    mock.patch.object(gd, "default_families", return_value=[]), contextlib.redirect_stdout(out):
+                self.assertEqual(gd.main(["--dedupe"]), 0)
+        self.assertIn("dedupe captures: skipped (lsof: boom)", out.getvalue())
+        self.assertEqual(b.stat().st_ino, ino)
+
+    @apfs
+    def test_files_on_different_volumes_are_never_paired(self) -> None:
+        frame = os.urandom(32 * self.KIB)
+        a = self.blob("caps/a.png", frame)
+        b = self.blob("caps/b.png", frame)
+        real = os.lstat
+
+        def lstat(p, *args, **kw):
+            st = real(p, *args, **kw)
+            return _Stat(st, st_dev=st.st_dev + 1) if os.fspath(p) == os.fspath(b) else st
+
+        ino = b.stat().st_ino
+        with mock.patch.object(gd.os, "lstat", side_effect=lstat):
+            r = self.dedupe([self.root / "caps"])
+            self.assertEqual((r["cloned_bytes"], r["hashed_bytes"]), (0, 0))
+            key = gd._file_key(os.lstat(b))
+            self.assertFalse(gd.clone_over(str(a), str(b), key, gd._file_key(os.lstat(a))))
+        self.assertEqual(b.stat().st_ino, ino)
+
+    # -- safety of each swap ------------------------------------------------------------------------
+
+    @apfs
+    def test_a_strict_clone_keeps_mode_times_birthtime_xattrs_and_group(self) -> None:
+        frame = os.urandom(32 * self.KIB)
+        a = self.blob("caps/a.png", frame)
+        b = self.blob("caps/b.png", frame, mode=0o600)
+        os.utime(b, (500_000, 500_000))  # moves b's birthtime back to 500000 (APFS keeps birth <= mtime)
+        os.utime(b, (2_000_000, 2_000_000))
+        for p in (a, b):
+            subprocess.run(["xattr", "-w", "com.example.take", "send-typed", os.fspath(p)], check=True)
+        before = os.lstat(b)
+        r = self.dedupe([self.root / "caps"])
+        self.assertEqual(r["cloned_bytes"], len(frame))
+        after = os.lstat(b)
+        self.assertNotEqual(after.st_ino, before.st_ino)
+        self.assertEqual(b.read_bytes(), frame)
+        self.assertEqual((oct(after.st_mode), after.st_uid, after.st_gid, after.st_mtime_ns, after.st_flags),
+                         (oct(before.st_mode), before.st_uid, before.st_gid, before.st_mtime_ns, before.st_flags))
+        self.assertEqual(int(after.st_birthtime), 500_000)
+        self.assertEqual(gd.file_xattrs(os.fspath(b)), {"com.example.take": b"send-typed"})
+        self.assertEqual([p.name for p in self.root.rglob("*glaeda-clone*")], [])
+
+    @apfs
+    def test_a_strict_clone_refuses_differing_xattrs_acls_or_flags(self) -> None:
+        frame = os.urandom(32 * self.KIB)
+
+        def pair(name: str) -> Path:
+            self.blob(f"{name}/a.png", frame)
+            return self.blob(f"{name}/b.png", frame)
+
+        xattr_b, acl_b, flag_b = pair("xattr"), pair("acl"), pair("flag")
+        subprocess.run(["xattr", "-w", "com.apple.quarantine", "0081;x;y;", os.fspath(xattr_b)], check=True)
+        subprocess.run(["chmod", "+a", "everyone deny delete", os.fspath(acl_b)], check=True)
+        os.chflags(flag_b, stat.UF_HIDDEN)
+        inodes = {p: p.stat().st_ino for p in (xattr_b, acl_b, flag_b)}
+        for p in (xattr_b, acl_b, flag_b):
+            r = gd.dedupe([p.parent], self.root / f"{p.parent.name}.json", min_bytes=16 * self.KIB, strict=True)
+            self.assertEqual((r["cloned_bytes"], r["refused"]), (0, 1), p.parent.name)
+            self.assertEqual(p.stat().st_ino, inodes[p], p.parent.name)
+        os.chflags(flag_b, 0)
+        subprocess.run(["chmod", "-N", os.fspath(acl_b)], check=True)
+
+    @apfs
+    def test_a_strict_clone_refuses_a_file_someone_else_owns(self) -> None:
+        frame = os.urandom(32 * self.KIB)
+        a = self.blob("caps/a.png", frame)
+        b = self.blob("caps/b.png", frame)
+        real = os.lstat
+
+        def lstat(p, *args, **kw):
+            st = real(p, *args, **kw)
+            return _Stat(st, st_uid=st.st_uid + 1) if os.fspath(p) == os.fspath(b) else st
+
+        key, akey = gd._file_key(os.lstat(b)), gd._file_key(os.lstat(a))
+        ino = b.stat().st_ino
+        with mock.patch.object(gd.os, "lstat", side_effect=lstat):
+            self.assertFalse(gd.clone_over(str(a), str(b), key, akey, strict=True))
+        self.assertEqual(b.stat().st_ino, ino)
+
+    @apfs
+    def test_bytes_are_compared_so_a_hash_collision_is_never_cloned(self) -> None:
+        a = self.blob("caps/a.png", os.urandom(32 * self.KIB))
+        b = self.blob("caps/b.png", os.urandom(32 * self.KIB))
+        want = b.read_bytes()
+        with mock.patch.object(gd, "_sha256", return_value="same"):
+            r = self.dedupe([self.root / "caps"])
+        self.assertEqual((r["cloned_bytes"], r["refused"]), (0, 1))
+        self.assertEqual(b.read_bytes(), want)
+        self.assertNotEqual(a.read_bytes(), want)
+
+    @apfs
+    def test_files_already_sharing_a_clone_are_left_as_they_are(self) -> None:
+        frame = os.urandom(32 * self.KIB)
+        a = self.blob("caps/a.png", frame)
+        b = self.root / "caps/b.png"
+        subprocess.run(["/bin/cp", "-c", os.fspath(a), os.fspath(b)], check=True)  # deputy-2's hand dedupe
+        os.utime(b, (1_000_000, 1_000_000))
+        ino = b.stat().st_ino
+        r = self.dedupe([self.root / "caps"])
+        self.assertEqual((r["cloned_bytes"], r["shared"], r["refused"]), (0, 1, 0))
+        self.assertEqual(b.stat().st_ino, ino)
+
+    @apfs
+    def test_git_dirs_inside_a_capture_root_are_not_walked(self) -> None:
+        data = os.urandom(32 * self.KIB)
+        self.blob("caps/.git/objects/pack/a.pack", data)
+        self.blob("caps/.git/objects/pack/b.pack", data)
+        self.assertEqual(self.dedupe([self.root / "caps"])["files"], 0)
+
+    # -- a bounded pass -----------------------------------------------------------------------------
+
+    @apfs
+    def test_a_zero_budget_does_nothing_and_says_it_is_incomplete(self) -> None:
+        frame = os.urandom(32 * self.KIB)
+        self.blob("caps/a.png", frame)
+        b = self.blob("caps/b.png", frame)
+        ino = b.stat().st_ino
+        r = self.dedupe([self.root / "caps"], budget_s=0)
+        self.assertEqual((r["complete"], r["cloned_bytes"]), (False, 0))
+        self.assertEqual(b.stat().st_ino, ino)
+
+    @apfs
+    def test_bounded_passes_each_stop_on_time_and_together_finish_every_root(self) -> None:
+        """A pass stops at its budget (each clock read is one tick here) and says it is incomplete; later passes
+        resume from the hashes it saved and start at the root it stopped in, so roots bigger than one pass
+        cannot starve the ones after them."""
+        roots, frames = [], {}
+        for name in ("r1", "r2", "r3", "r4"):
+            data = os.urandom(32 * self.KIB)
+            for n in range(3):
+                frames[self.blob(f"{name}/f{n}.png", data)] = data
+            roots.append(self.root / name)
+        inodes = {p: p.stat().st_ino for p in frames}
+        ticks = iter(range(10**6))
+
+        def changed() -> collections.Counter:
+            return collections.Counter(p.parent.name for p in frames if p.stat().st_ino != inodes[p])
+
+        passes = 0
+        while sum(changed().values()) < 8:
+            passes += 1
+            self.assertLess(passes, 40)
+            r = self.dedupe(roots, budget_s=10, clock=lambda: float(next(ticks)))
+            self.assertFalse(r["complete"])  # 12 files never fit one 10-tick pass
+            self.assertGreater(r["hashed_bytes"] + r["cloned_bytes"], 0)  # yet every pass gets somewhere
+        self.assertGreater(passes, 2)
+        self.assertEqual(changed(), {"r1": 2, "r2": 2, "r3": 2, "r4": 2})
+        self.assertTrue(all(p.read_bytes() == d for p, d in frames.items()))
 
 
 class ActivityClockTest(unittest.TestCase):

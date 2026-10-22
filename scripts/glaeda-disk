@@ -13,6 +13,8 @@
     glaeda-disk --refresh           re-measure every size now instead of using the snapshot
     glaeda-disk --dedupe            store identical Xcode package/module files once (APFS clones), in
                                     Xcode's DerivedData and the cmux-next workflow's per-runner copies
+                                    and, at a 16 KiB floor, the capture and evidence trees that
+                                    disk-policy.json's dedupe_capture_roots names
     glaeda-disk --dedupe --dedupe-builds
                                     additionally clone identical files in inactive cmux-next Products trees
     glaeda-disk --runner-caches     use only the enrolled runner-account cache allowlist
@@ -164,7 +166,9 @@ import bisect
 import calendar
 import collections
 import contextlib
+import ctypes
 import fcntl
+import glob
 import gzip
 import hashlib
 import json
@@ -177,6 +181,7 @@ import re
 import shutil
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import time
@@ -1005,6 +1010,20 @@ POLICY_DEFAULTS: dict[str, Any] = {
     # Over the cap, a cmux-next state no enrolled runner owns goes whole (inputs too) only once idle this long:
     # GitHub's default job timeout (timeout-minutes 360), so no job can still be using it.
     "cmux_next_ci_unowned_idle_hours": 6.0,
+    # --dedupe also clones identical files in capture and evidence trees (screen-capture frames, UI evidence),
+    # with its own floor: one PNG frame is 16-200 KiB, so Xcode's 1 MiB floor saw 2.7 of the 11.2 GiB of
+    # identical frames in cmux-mac-mini's ~/messageslab-26. "~" is the account's home; globs are allowed; a
+    # missing root is skipped; [] turns the capture pass off.
+    "dedupe_capture_roots": [
+        "~/messageslab-*", "~/Projects/captures", "~/Projects/*-evidence", "~/Projects/*-validation",
+        "~/Applications/cx-ui-captures", "~/cmux-showcase-runs",
+        "/Users/Shared/cmux-capture", "/Users/Shared/cmux-captures", "/Users/Shared/cmux-cua-artifacts",
+    ],
+    "dedupe_capture_min_kib": 16,
+    # a file written this recently may still be recording; it waits for a later pass
+    "dedupe_capture_settle_minutes": 30.0,
+    # one pass stops here (walking, hashing and cloning); its hashes are kept, and the next pass resumes
+    "dedupe_capture_budget_minutes": 20.0,
 }
 ACTIVITY_MODE: str | None = None  # "pressure" or "sweep" while main acts; None keeps the wall-clock rule
 ROLE = "fleet-mini"
@@ -1025,6 +1044,9 @@ def disk_policy(path: Path | None = None) -> dict[str, Any]:
             if isinstance(default, bool):
                 if isinstance(value, bool):
                     policy[key] = value
+            elif isinstance(default, list):
+                if isinstance(value, list) and all(isinstance(v, str) and v for v in value):
+                    policy[key] = list(value)
             elif isinstance(default, str):
                 if isinstance(value, str) and value:
                     policy[key] = value
@@ -6444,6 +6466,225 @@ def cmux_next_ci_dedupe_guard(root: Path):
     return allowed
 
 
+# -- capture and evidence trees (dedupe_capture_roots in disk-policy.json) ------------------------------
+# Screen-capture rigs write the same PNG frame over and over across takes. Those trees are nobody's cache, so
+# nothing may be deleted there: the capture pass only clones byte-identical files onto one copy, and holds
+# every swap to stricter rules than the Xcode pass (clone_over strict=True): bytes compared, not just hashed;
+# same volume; never a file a process has open for writing or that changed within the settle window; owner,
+# group, mode, times, birth time, flags, xattrs and ACL all kept or the swap is refused; a bounded pass.
+DEDUPE_META = ""  # the state file's key for the pass's own bookkeeping (no real path is "")
+DEDUPE_SKIP_DIRS = frozenset({".git"})  # a checkout's object store inside a capture tree is never walked
+CAPTURE_WRITERS_REFRESH_S = 60.0
+
+
+def capture_dedupe_roots(patterns: list[str], home: Path | None = None) -> list[Path]:
+    """The capture roots disk-policy names, "~" as this account's home and globs expanded, in order: real
+    directories only (no symlink, no file, nothing missing), each once."""
+    home = HOME if home is None else home
+    out: list[Path] = []
+    for pattern in patterns:
+        if pattern == "~" or pattern.startswith("~/"):
+            pattern = os.fspath(home) + pattern[1:]
+        for match in sorted(glob.glob(pattern)) if glob.has_magic(pattern) else [pattern]:
+            p = Path(match)
+            if p.is_dir() and not p.is_symlink() and p not in out:
+                out.append(p)
+    return out
+
+
+def lsof_writers(text: str) -> frozenset[str]:
+    """Paths `lsof -F an` lists as open for writing (access w or u)."""
+    out: set[str] = set()
+    access = ""
+    for line in text.splitlines():
+        tag, value = line[:1], line[1:]
+        if tag in ("p", "f"):
+            access = ""
+        elif tag == "a":
+            access = value
+        elif tag == "n" and access in ("w", "u") and value.startswith("/"):
+            out.add(value)
+    return frozenset(out)
+
+
+def open_for_writing() -> frozenset[str]:
+    """Every path some process has open for writing now. Raises NoEvidence when lsof cannot tell."""
+    lsof = shutil.which("lsof") or "/usr/sbin/lsof"
+    try:
+        code, out = _owned_query([lsof, "-n", "-P", "-w", "-F", "an"], 120)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise NoEvidence(f"lsof: {e}") from e
+    # lsof exits 1 when some processes could not be read (other users'); no output at all is no evidence
+    if code not in (0, 1) or "\nn/" not in out:
+        raise NoEvidence(f"lsof gave no open files (exit {code})")
+    return lsof_writers(out)
+
+
+def capture_dedupe_guard(refresh_s: float = CAPTURE_WRITERS_REFRESH_S, clock=time.monotonic):
+    """A dedupe guard that refuses any path a process has open for writing. The writer list is read when the
+    guard is made (NoEvidence propagates, so the caller skips the pass) and again once it is refresh_s old;
+    a refresh that fails refuses every swap until one succeeds."""
+    seen = {"writers": open_for_writing(), "at": clock()}
+
+    def allowed(path: str | Path) -> bool:
+        if clock() - seen["at"] >= refresh_s:
+            try:
+                seen["writers"] = open_for_writing()
+            except NoEvidence:
+                seen["writers"] = None
+            seen["at"] = clock()
+        writers = seen["writers"]
+        if writers is None:
+            return False
+        path = os.fspath(path)
+        return path not in writers and os.path.realpath(path) not in writers
+
+    return allowed
+
+
+class _AttrList(ctypes.Structure):
+    _fields_ = [("bitmapcount", ctypes.c_ushort), ("reserved", ctypes.c_uint16),
+                ("commonattr", ctypes.c_uint32), ("volattr", ctypes.c_uint32), ("dirattr", ctypes.c_uint32),
+                ("fileattr", ctypes.c_uint32), ("forkattr", ctypes.c_uint32)]
+
+
+class _Timespec(ctypes.Structure):
+    _fields_ = [("tv_sec", ctypes.c_long), ("tv_nsec", ctypes.c_long)]
+
+
+_LIBC = None
+_XATTR_NOFOLLOW = 0x0001
+_FSOPT_NOFOLLOW = 0x0001
+_FSOPT_ATTR_CMN_EXTENDED = 0x0020
+_ATTR_CMN_CRTIME = 0x00000200
+_ATTR_CMNEXT_CLONEID = 0x00000100
+_ACL_TYPE_EXTENDED = 0x00000100
+
+
+def _libc():
+    """libc with the macOS metadata calls typed, or None off macOS."""
+    global _LIBC
+    if _LIBC is None and DARWIN:
+        lib = ctypes.CDLL(None, use_errno=True)
+        lib.listxattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_int]
+        lib.listxattr.restype = ctypes.c_ssize_t
+        lib.getxattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t,
+                                 ctypes.c_uint32, ctypes.c_int]
+        lib.getxattr.restype = ctypes.c_ssize_t
+        lib.getattrlist.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+                                    ctypes.c_uint]
+        lib.setattrlist.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+                                    ctypes.c_uint]
+        lib.acl_get_link_np.argtypes = [ctypes.c_char_p, ctypes.c_int]
+        lib.acl_get_link_np.restype = ctypes.c_void_p
+        lib.acl_to_text.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        lib.acl_to_text.restype = ctypes.c_void_p
+        lib.acl_free.argtypes = [ctypes.c_void_p]
+        _LIBC = lib
+    return _LIBC
+
+
+def file_xattrs(path: str) -> dict[str, bytes] | None:
+    """A file's extended attributes (not following a symlink), or None when they cannot be read."""
+    lib, raw = _libc(), os.fsencode(path)
+    if lib is None:
+        return None
+    size = lib.listxattr(raw, None, 0, _XATTR_NOFOLLOW)
+    if size < 0:
+        return None
+    names = ctypes.create_string_buffer(size or 1)
+    size = lib.listxattr(raw, names, size, _XATTR_NOFOLLOW)
+    if size < 0:
+        return None
+    out: dict[str, bytes] = {}
+    for name in names.raw[:size].split(b"\0"):
+        if not name:
+            continue
+        n = lib.getxattr(raw, name, None, 0, 0, _XATTR_NOFOLLOW)
+        if n < 0:
+            return None
+        value = ctypes.create_string_buffer(n or 1)
+        if lib.getxattr(raw, name, value, n, 0, _XATTR_NOFOLLOW) != n:
+            return None
+        out[name.decode("utf-8", "surrogateescape")] = value.raw[:n]
+    return out
+
+
+def file_acl(path: str) -> str | None:
+    """A file's extended ACL as text, "" when it has none, or None when it cannot be read."""
+    lib = _libc()
+    if lib is None:
+        return None
+    acl = lib.acl_get_link_np(os.fsencode(path), _ACL_TYPE_EXTENDED)
+    if not acl:
+        return "" if ctypes.get_errno() == 2 else None  # ENOENT: no ACL
+    try:
+        text = lib.acl_to_text(acl, None)
+        if not text:
+            return None
+        try:
+            return ctypes.string_at(text).decode("utf-8", "replace")
+        finally:
+            lib.acl_free(text)
+    finally:
+        lib.acl_free(acl)
+
+
+def _attr_list(common: int = 0, fork: int = 0) -> _AttrList:
+    return _AttrList(5, 0, common, 0, 0, 0, fork)
+
+
+def file_birthtime(path: str) -> tuple[int, int] | None:
+    """A file's birth (creation) time as (seconds, nanoseconds), or None."""
+    lib = _libc()
+    if lib is None:
+        return None
+    al, buf = _attr_list(common=_ATTR_CMN_CRTIME), ctypes.create_string_buffer(64)
+    if lib.getattrlist(os.fsencode(path), ctypes.byref(al), buf, 64, _FSOPT_NOFOLLOW) != 0:
+        return None
+    _, sec, nsec = struct.unpack_from("<Iqq", buf.raw)
+    return sec, nsec
+
+
+def set_file_birthtime(path: str, when: tuple[int, int]) -> bool:
+    lib = _libc()
+    if lib is None:
+        return False
+    al, ts = _attr_list(common=_ATTR_CMN_CRTIME), _Timespec(*when)
+    return lib.setattrlist(os.fsencode(path), ctypes.byref(al), ctypes.byref(ts), ctypes.sizeof(ts),
+                           _FSOPT_NOFOLLOW) == 0
+
+
+def file_clone_id(path: str) -> int | None:
+    """APFS's id for a file's data stream: two files that share it are already clones of each other."""
+    lib = _libc()
+    if lib is None:
+        return None
+    al, buf = _attr_list(fork=_ATTR_CMNEXT_CLONEID), ctypes.create_string_buffer(64)
+    if lib.getattrlist(os.fsencode(path), ctypes.byref(al), buf, 64,
+                       _FSOPT_NOFOLLOW | _FSOPT_ATTR_CMN_EXTENDED) != 0:
+        return None
+    clone_id = struct.unpack_from("<IQ", buf.raw)[1]
+    return clone_id or None
+
+
+def same_bytes(a: str, b: str) -> bool:
+    """Whether two files hold the same bytes, read in full (a hash match alone never clones a capture file)."""
+    with open(a, "rb") as fa, open(b, "rb") as fb:
+        while True:
+            ca, cb = fa.read(1 << 20), fb.read(1 << 20)
+            if ca != cb:
+                return False
+            if not ca:
+                return True
+
+
+def _metadata(path: str) -> tuple | None:
+    """What a strict swap must keep that the clone might not: xattrs and ACL (None when unreadable)."""
+    xattrs, acl = file_xattrs(path), file_acl(path)
+    return None if xattrs is None or acl is None else (xattrs, acl)
+
+
 def dedupe_roots(derived_data: Path) -> list[Path]:
     roots = [derived_data / sub for sub in DEDUPE_SUBDIRS]
     for d in _children(derived_data):
@@ -6466,23 +6707,53 @@ def _sha256(path: str) -> str:
 
 
 def clone_over(canonical: str, target: str, expect: list[int],
-               canonical_expect: list[int] | None = None) -> bool:
+               canonical_expect: list[int] | None = None, strict: bool = False) -> bool:
     """Replace target with an APFS clone of canonical, keeping target's mode and times.
 
     Refuses when target or canonical changed since they were hashed, checked before and
     after the copy, so a file rewritten mid-run can never be cloned over a verified one. A process that has target open keeps
-    reading the old inode; the rename only swaps the directory entry.
+    reading the old inode; the rename only swaps the directory entry. Refuses two files on different
+    volumes (a copy there saves nothing). strict (capture trees) also refuses when the bytes differ, when
+    this account does not own target, when either file carries flags (other than APFS compression), or
+    when their xattrs or ACLs differ; it keeps target's group and birth time and checks the clone's
+    metadata matches target's before the swap.
     """
     st = os.lstat(target)
     if _file_key(st) != expect or not stat.S_ISREG(st.st_mode):
         return False
-    if canonical_expect is not None and _file_key(os.lstat(canonical)) != canonical_expect:
+    cst = os.lstat(canonical)
+    if cst.st_dev != st.st_dev or not stat.S_ISREG(cst.st_mode):
         return False
+    if canonical_expect is not None and _file_key(cst) != canonical_expect:
+        return False
+    if strict:
+        compressed = getattr(stat, "UF_COMPRESSED", 0x20)
+        if st.st_uid != os.geteuid() or (st.st_flags | cst.st_flags) & ~compressed:
+            return False
+        meta = _metadata(target)
+        if meta is None or meta != _metadata(canonical):
+            return False
+        born = file_birthtime(target)
+        if born is None or not same_bytes(canonical, target):
+            return False
     tmp = os.path.join(os.path.dirname(target), f".{os.path.basename(target)}.glaeda-clone-{os.getpid()}")
     try:
         subprocess.run(["/bin/cp", "-c", canonical, tmp], check=True, capture_output=True, timeout=60)
         os.chmod(tmp, stat.S_IMODE(st.st_mode))
-        os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
+        if strict:
+            tst = os.lstat(tmp)
+            if tst.st_gid != st.st_gid:
+                os.chown(tmp, -1, st.st_gid)
+            os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
+            if not set_file_birthtime(tmp, born):
+                return False
+            tst = os.lstat(tmp)
+            kept = (tst.st_uid, tst.st_gid, tst.st_mode, tst.st_mtime_ns, tst.st_dev)
+            if (kept != (st.st_uid, st.st_gid, st.st_mode, st.st_mtime_ns, st.st_dev)
+                    or file_birthtime(tmp) != born or _metadata(tmp) != meta):
+                return False
+        else:
+            os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
         if _file_key(os.lstat(target)) != expect:
             return False
         if canonical_expect is not None and _file_key(os.lstat(canonical)) != canonical_expect:
@@ -6496,29 +6767,59 @@ def clone_over(canonical: str, target: str, expect: list[int],
 
 def dedupe(roots: list[Path], state_path: Path = DEDUPE_STATE,
            min_bytes: int = DEDUPE_MIN_BYTES, settle_s: float = 0,
-           guard=None) -> dict[str, int]:
+           guard=None, strict: bool = False, budget_s: float | None = None,
+           clock=time.monotonic) -> dict[str, Any]:
     """Clone-dedupe identical files.
 
     ``guard`` is an optional fresh safety check used for write-heavy trees.  It is
     called immediately before hashing a target/canonical pair is replaced and must
     return true for both paths.  A guard failure is a refusal, not a reason to fall
     back to a weaker cache policy.  Files modified within ``settle_s`` are left for a
-    later run.
+    later run. Only files on the same volume are paired. ``strict`` is clone_over's (capture trees), and also
+    leaves files that already share an APFS clone as they are ("shared").
+
+    ``budget_s`` bounds the pass: the walk stops at half of it, hashing and cloning at all of it, and the
+    result says "complete": False. The hashes made so far are kept in the state, and the next pass starts its
+    walk at the root this one stopped in (or the one after, when that root already went first and still did
+    not fit), so a tree bigger than one pass cannot keep the others from ever being walked.
     """
     try:
         state: dict[str, dict] = json.loads(state_path.read_text())
+        if not isinstance(state, dict):
+            state = {}
     except (OSError, ValueError):
         state = {}
+    meta = state.pop(DEDUPE_META, None)
+    meta = meta if isinstance(meta, dict) else {}
+    started = clock()
+    deadline = None if budget_s is None else started + budget_s
+    walk_deadline = None if budget_s is None else started + budget_s / 2
+
+    def over(limit: float | None) -> bool:
+        return limit is not None and clock() >= limit
+
+    complete = True
     files: dict[str, list[int]] = {}
+    devs: dict[str, int] = {}
+    walked: set[str] = set()
     young = 0
     cutoff = time.time() - settle_s
-    for root in roots:
-        for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames if not os.path.islink(os.path.join(dirpath, d))]
-            for name in filenames:
+    first = int(meta.get("next_root", 0)) % len(roots) if roots else 0
+    order = list(range(first, len(roots))) + list(range(first))
+    next_root = first
+    for n, i in enumerate(order):
+        stopped = False
+        for dirpath, dirnames, filenames in os.walk(roots[i]):
+            dirnames[:] = sorted(d for d in dirnames if d not in DEDUPE_SKIP_DIRS
+                                 and not os.path.islink(os.path.join(dirpath, d)))
+            for name in sorted(filenames):
+                if over(walk_deadline):
+                    stopped = True
+                    break
                 if ".glaeda-clone-" in name:
                     continue
                 path = os.path.join(dirpath, name)
+                walked.add(path)
                 try:
                     st = os.lstat(path)
                 except OSError:
@@ -6528,13 +6829,23 @@ def dedupe(roots: list[Path], state_path: Path = DEDUPE_STATE,
                         young += 1  # still being downloaded or written
                         continue
                     files[path] = _file_key(st)
-    by_size: dict[int, list[str]] = {}
+                    devs[path] = st.st_dev
+            if stopped:
+                break
+        if stopped:
+            complete = False
+            # the root it stopped in goes first next time, unless it already went first and did not fit
+            next_root = (i + 1) % len(roots) if n == 0 else i
+            break
+    by_size: dict[tuple[int, int], list[str]] = {}
     for path, key in files.items():
-        by_size.setdefault(key[0], []).append(path)
-    new_state: dict[str, dict] = {}
-    groups: dict[str, list[str]] = {}
+        by_size.setdefault((devs[path], key[0]), []).append(path)
+    # an incomplete pass keeps what it knew about the files it did not reach this time
+    new_state: dict[str, dict] = ({} if complete else
+                                  {p: v for p, v in state.items() if p not in walked and isinstance(v, dict)})
+    groups: dict[tuple[int, str], list[str]] = {}
     hashed = 0
-    for paths in by_size.values():
+    for (dev, _), paths in sorted(by_size.items()):
         if len(paths) < 2:
             continue
         for path in paths:
@@ -6542,22 +6853,33 @@ def dedupe(roots: list[Path], state_path: Path = DEDUPE_STATE,
             if old and old.get("key") == files[path]:
                 sha, cloned = old["sha"], old.get("cloned", False)
             else:
+                if over(deadline):
+                    complete = False
+                    continue
                 try:
                     sha = _sha256(path)
                 except OSError:
                     continue
                 cloned, hashed = False, hashed + files[path][0]
             new_state[path] = {"key": files[path], "sha": sha, "cloned": cloned}
-            groups.setdefault(sha, []).append(path)
-    cloned_bytes = refused = 0
-    for sha, paths in groups.items():
+            groups.setdefault((dev, sha), []).append(path)
+    cloned_bytes = refused = shared = 0
+    for (_, sha), paths in groups.items():
         if len(paths) < 2:
             continue
         paths.sort(key=lambda p: (not new_state[p]["cloned"], p))
         canonical = paths[0]
+        canonical_id = file_clone_id(canonical) if strict else None
         for target in paths[1:]:
             if new_state[target]["cloned"]:
                 continue
+            if canonical_id is not None and file_clone_id(target) == canonical_id:
+                new_state[target]["cloned"] = True  # already one copy on disk (an earlier clone, by hand or not)
+                shared += 1
+                continue
+            if over(deadline):
+                complete = False
+                break
             # Recheck both sides immediately before the atomic swap.  The canonical
             # file may itself have become busy since the hash walk, and a target may
             # have been adopted by a newly-started job.  clone_over's inode/mtime
@@ -6576,7 +6898,7 @@ def dedupe(roots: list[Path], state_path: Path = DEDUPE_STATE,
                     refused += 1
                     continue
             try:
-                ok = clone_over(canonical, target, files[target], files[canonical])
+                ok = clone_over(canonical, target, files[target], files[canonical], strict=strict)
                 if ok:
                     new_state[target] = {"key": _file_key(os.lstat(target)), "sha": sha,
                                          "cloned": True}
@@ -6588,12 +6910,72 @@ def dedupe(roots: list[Path], state_path: Path = DEDUPE_STATE,
             else:
                 refused += 1
         new_state[canonical]["cloned"] = True
+    if budget_s is not None:
+        new_state[DEDUPE_META] = {"next_root": next_root}
     state_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = state_path.with_suffix(f".{os.getpid()}.tmp")
     tmp.write_text(json.dumps(new_state))
     os.replace(tmp, state_path)
     return {"files": len(files), "hashed_bytes": hashed, "cloned_bytes": cloned_bytes,
-            "refused": refused, "young": young}
+            "refused": refused, "young": young, "shared": shared, "complete": complete}
+
+
+def dedupe_xcode(a: argparse.Namespace, bases: list[Path], ci_root: Path) -> None:
+    """The Xcode pass: DerivedData's and cmux-next's package and module caches (and, with --dedupe-builds,
+    sealed cmux-next Products), files of 1 MiB and up, retried while files are still settling."""
+    input_roots = [r for b in bases for r in dedupe_roots(b)]
+    passes = [(input_roots, DEDUPE_STATE, a.settle_minutes * 60, None)]
+    if a.dedupe_builds:
+        # Sealed Products output is opt-in because the normal LaunchAgent can run
+        # while a job is compiling.  Top-level Build remains excluded.  Only
+        # validated Products trees are admitted, and the per-clone guard rechecks
+        # process/lease/lock/socket/unknown-child state.
+        build_roots = cmux_next_ci_dedupe_roots(ci_root)
+        if build_roots:
+            build_state = DEDUPE_STATE.with_name("dedupe-builds.json")
+            passes.append((build_roots, build_state,
+                           max(a.settle_minutes * 60,
+                               CMUX_NEXT_CI_DEDUPE_SETTLE_MINUTES * 60),
+                           cmux_next_ci_dedupe_guard(ci_root)))
+    before, _ = free_bytes(bases[0])
+    started = time.time()
+    for attempt in range(3):
+        totals = {"files": 0, "hashed_bytes": 0, "cloned_bytes": 0,
+                  "refused": 0, "young": 0}
+        for roots, state_path, settle_s, guard in passes:
+            r = dedupe(roots, state_path, settle_s=settle_s, guard=guard)
+            for key in totals:
+                totals[key] += r[key]
+        after, _ = free_bytes(bases[0])
+        print(f"dedupe: {totals['files']} files >= 1 MiB, hashed {gib(totals['hashed_bytes']).strip()}, "
+              f"cloned {gib(totals['cloned_bytes']).strip()}, refused {totals['refused']}, "
+              f"still settling {totals['young']}, free {gib(before).strip()} -> {gib(after).strip()} "
+              f"in {time.time() - started:.0f}s", flush=True)
+        if not totals["young"] or attempt == 2:
+            break
+        time.sleep(a.settle_minutes * 60)
+
+
+def dedupe_captures(roots: list[Path]) -> None:
+    """The capture pass: dedupe_capture_roots at their own floor, strict swaps, no file open for writing,
+    one bounded pass (dedupe_capture_budget_minutes) that the next one resumes."""
+    floor_kib = POLICY["dedupe_capture_min_kib"]
+    try:
+        guard = capture_dedupe_guard()
+    except NoEvidence as e:
+        print(f"dedupe captures: skipped ({e})", flush=True)
+        return
+    before, _ = free_bytes(roots[0])
+    started = time.time()
+    r = dedupe(roots, DEDUPE_STATE.with_name("dedupe-captures.json"), min_bytes=int(floor_kib * 1024),
+               settle_s=POLICY["dedupe_capture_settle_minutes"] * 60, guard=guard, strict=True,
+               budget_s=POLICY["dedupe_capture_budget_minutes"] * 60)
+    after, _ = free_bytes(roots[0])
+    print(f"dedupe captures: {r['files']} files >= {floor_kib:g} KiB in {len(roots)} roots, "
+          f"hashed {gib(r['hashed_bytes']).strip()}, cloned {gib(r['cloned_bytes']).strip()}, "
+          f"already shared {r['shared']}, refused {r['refused']}, still settling {r['young']}, "
+          f"{'complete' if r['complete'] else 'stopped at its budget (the next pass resumes)'}, "
+          f"free {gib(before).strip()} -> {gib(after).strip()} in {time.time() - started:.0f}s", flush=True)
 
 
 def _main_impl(argv: list[str] | None = None) -> int:
@@ -6648,7 +7030,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
     ap.add_argument("--min-mib", type=int, default=50)
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--dedupe", action="store_true",
-                    help="clone-dedupe identical Xcode package and module-cache files, then exit")
+                    help="clone-dedupe identical Xcode package and module-cache files, and files of "
+                         "dedupe_capture_min_kib and up in disk-policy's dedupe_capture_roots, then exit")
     ap.add_argument("--dedupe-builds", action="store_true",
                     help="also clone-dedupe inactive cmux-next Products trees (APFS/macOS only)")
     ap.add_argument("--settle-minutes", type=float, default=0,
@@ -6743,40 +7126,16 @@ def _main_impl(argv: list[str] | None = None) -> int:
         ci_root = HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT
         ci_dirs = cmux_next_ci_dirs() if not RUNNER_CACHE_PROFILE else []
         bases = ([dd] if dd is not None else []) + ci_dirs
-        if not bases or not DARWIN:
+        # the narrow runner-account profile never walks beyond its cache allowlist
+        captures = ([] if RUNNER_CACHE_PROFILE or not DARWIN
+                    else capture_dedupe_roots(POLICY["dedupe_capture_roots"]))
+        if not (bases or captures) or not DARWIN:
             print("nothing to dedupe (APFS clones of Xcode DerivedData are macOS only)")
             return 0
-        input_roots = [r for b in bases for r in dedupe_roots(b)]
-        passes = [(input_roots, DEDUPE_STATE, a.settle_minutes * 60, None)]
-        if a.dedupe_builds:
-            # Sealed Products output is opt-in because the normal LaunchAgent can run
-            # while a job is compiling.  Top-level Build remains excluded.  Only
-            # validated Products trees are admitted, and the per-clone guard rechecks
-            # process/lease/lock/socket/unknown-child state.
-            build_roots = cmux_next_ci_dedupe_roots(ci_root)
-            if build_roots:
-                build_state = DEDUPE_STATE.with_name("dedupe-builds.json")
-                passes.append((build_roots, build_state,
-                               max(a.settle_minutes * 60,
-                                   CMUX_NEXT_CI_DEDUPE_SETTLE_MINUTES * 60),
-                               cmux_next_ci_dedupe_guard(ci_root)))
-        before, _ = free_bytes(bases[0])
-        started = time.time()
-        for attempt in range(3):
-            totals = {"files": 0, "hashed_bytes": 0, "cloned_bytes": 0,
-                      "refused": 0, "young": 0}
-            for roots, state_path, settle_s, guard in passes:
-                r = dedupe(roots, state_path, settle_s=settle_s, guard=guard)
-                for key in totals:
-                    totals[key] += r[key]
-            after, _ = free_bytes(bases[0])
-            print(f"dedupe: {totals['files']} files >= 1 MiB, hashed {gib(totals['hashed_bytes']).strip()}, "
-                  f"cloned {gib(totals['cloned_bytes']).strip()}, refused {totals['refused']}, "
-                  f"still settling {totals['young']}, free {gib(before).strip()} -> {gib(after).strip()} "
-                  f"in {time.time() - started:.0f}s", flush=True)
-            if not totals["young"] or attempt == 2:
-                break
-            time.sleep(a.settle_minutes * 60)
+        if bases:
+            dedupe_xcode(a, bases, ci_root)
+        if captures:
+            dedupe_captures(captures)
         return 0
     if RUNNER_CACHE_PROFILE and not fams:
         # An account with no known CI roots has nothing to sweep. Do not fall back
