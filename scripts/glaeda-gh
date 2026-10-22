@@ -4631,10 +4631,33 @@ def broker_caller() -> str:
 # drained the pool three times in a day, not a toll on reading.
 BROKER_THROTTLED = {("pr", "view"), ("pr", "checks"), ("pr", "list"),
                     ("run", "view"), ("run", "list"), ("issue", "list")}
+
+
+def endpoint_re(name: str) -> "re.Pattern[str]":
+    """One top-level API endpoint, however `gh api` was given it: bare, rooted, or an absolute URL.
+
+    Any host, not `api.github.com` alone: this file handles GHE remotes deliberately. Pinning the
+    one host meant `https://ghe.example/api/graphql` read as an ordinary path -- undercounting the
+    audit's category, and (through `BROKER_FREE_RE`) holding a GHE host's free `rate_limit` read
+    behind the repeat delay. One function, so widening one endpoint's spellings cannot leave the
+    other behind again.
+
+    Both of a GHE host's bases, because they are not the same one and an earlier version of this
+    said they were: GraphQL is at `/api/graphql` and REST is under `/api/v3/`, so
+    `https://ghe.example/api/v3/rate_limit` is the spelling a GHE host actually serves for the free
+    call -- and with `/api/` alone it was still filed as an ordinary path and still held 30 s, which
+    is the defect this helper claimed to have removed (measured by a review: 0.0 s then 29.9 s).
+    `/api/rate_limit` stays matched too; it 404s on GHE, so matching it costs nothing.
+
+    `re.escape`, because this reads as the general helper and a name with a `.` or a `+` in it
+    would quietly widen the pattern."""
+    return re.compile(rf"^(?:https?://[^/]+/(?:api/(?:v3/)?)?)?/?{re.escape(name)}/?$")
+
+
 # `GET /rate_limit` is documented as costing neither pool, and this file already treats it as free
 # (`request(free=True)`, audit_category's "rate_limit (free)"). Holding it punishes the session
 # doing the right thing: checking the budget around a batch of calls. `--web` opens a browser.
-BROKER_FREE_RE = re.compile(r"^(?:https?://api\.github\.com/)?/?rate_limit/?$")
+BROKER_FREE_RE = endpoint_re("rate_limit")
 
 
 def broker_repeat_wait(args: list[str], words: list[str], method: str, seen: set[str],
@@ -4997,6 +5020,11 @@ AUDIT_READS = {("pr", "view"), ("pr", "checks"), ("pr", "list"), ("pr", "diff"),
 # could not be resolved) is counted, but never as a repeat: `pr view 7` in two repositories is two
 # different reads, and treating them as one would overstate what a cache can do.
 AUDIT_BARE = re.compile(r"^(?:pr|run|issue|search|label) [\w-]+(?: \d+)?$")
+# The GraphQL endpoint, however it was typed -- four spellings: `graphql`, `/graphql`, and an
+# absolute URL on either kind of host. See `endpoint_re`, which `BROKER_FREE_RE` shares: pinning
+# api.github.com put a GHE host's `https://ghe.example/api/graphql` in a category of its own, so
+# the count undercounted and the sentence below it could go missing altogether.
+AUDIT_GRAPHQL_RE = endpoint_re("graphql")
 # A logged line of the shape the broker and today's guard write: subcommand words, then an
 # identifier (a cache key, an api path, or a number), then the guard's `-R owner/repo`. Anything
 # else is counted but never printed back (see cmd_audit).
@@ -5005,18 +5033,30 @@ AUDIT_SAFE = re.compile(r"[a-z][a-z0-9-]{0,30}(?: [a-z][a-z0-9-]{0,30})?"
                         r"(?: [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?")
 
 
+AUDIT_ENDPOINT_RE = re.compile(r"/?[A-Za-z0-9_.~-]+(?:/[A-Za-z0-9_.~:@-]+)*/?")
+AUDIT_TOKEN_RE = re.compile(r"gh[pousr]_|github_pat_", re.IGNORECASE)
+
+
 def audit_category(words: list[str]) -> tuple[str, bool]:
     """(category, whether repeating it would be a cache hit) for one logged call."""
     first, second = (words + ["", ""])[:2]
     if first == "api":
         if re.search(r"/(contents|git/blobs|git/trees|git/commits|git/refs)", " ".join(words)):
             return "source read through the API", False
-        if second == "graphql":
+        # One endpoint, four spellings, and the log keeps whichever the caller typed. Counted as
+        # one category each, because a category split four ways is four small rows that no
+        # summary line covers -- and `api /graphql` is a shape this file's own brake test pins as
+        # one a script would write. `BROKER_FREE_RE` is the same pattern for rate_limit.
+        if AUDIT_GRAPHQL_RE.match(second):
             return "raw gh api graphql", False
-        if second == "rate_limit":
+        if BROKER_FREE_RE.match(second):
             return "rate_limit (free)", False
         if re.search(r"/actions/runs/\d+/jobs", " ".join(words)):
             return "api .../actions/runs/N/jobs", True
+        # A category is printed back, so only an endpoint of a path's shape is. A log written before
+        # the guard cut query strings and flag values can hold anything in this word, a token included.
+        if second and not (AUDIT_ENDPOINT_RE.fullmatch(second) and not AUDIT_TOKEN_RE.search(second)):
+            return "api (endpoint not shown)", False
         return f"api {second}".rstrip(), False
     if (first, second) in AUDIT_READS:
         return f"{first} {second}", True
@@ -5069,7 +5109,11 @@ def cmd_audit(path: Path, last: int, as_json: bool) -> int:
         if AUDIT_BARE.fullmatch(text):
             continue  # no repository in the line: cannot tell one repo's PR 7 from another's
         hot[text] = hot.get(text, 0) + 1
-        if at - seen.get(text, float("-inf")) <= AUDIT_WINDOW:
+        # Not below zero: concurrent writers can append out of order, and a line stamped before the
+        # one it follows is not a re-read of it. With that, every line counted here has an earlier
+        # read of the same target within the window, so it is a repeat in time order too, and the
+        # figure stays a floor whatever order the log was written in.
+        if 0 <= at - seen.get(text, float("-inf")) <= AUDIT_WINDOW:
             repeats += 1
             bucket[1] += 1
         seen[text] = at
@@ -5087,10 +5131,16 @@ def cmd_audit(path: Path, last: int, as_json: bool) -> int:
             continue
         for line in text.splitlines():
             try:
-                route = (json.loads(line) or {}).get("route")
+                record = json.loads(line)
             except ValueError:
                 continue  # a torn last line at a rotation boundary is one record, not the file
+            route = record.get("route") if isinstance(record, dict) else None
+            if not isinstance(route, str):
+                continue  # a record of some other shape is not a decision
             served[route] = served.get(route, 0) + 1
+    # Not a second JSON field: this is `categories["raw gh api graphql"]` by construction, and a
+    # count under two names is a count that can disagree with itself.
+    batched = counts.get("raw gh api graphql", 0)
     if as_json:
         print(json.dumps({"calls": total, "categories": counts, "cacheableReads": reads,
                           "repeatsWithin": {"seconds": AUDIT_WINDOW, "calls": repeats},
@@ -5117,6 +5167,66 @@ def cmd_audit(path: Path, last: int, as_json: bool) -> int:
                                               sorted(hot.items(), key=lambda kv: -kv[1])[:5]))
     if served:
         print("\nbroker decisions so far: " + ", ".join(f"{k} {v}" for k, v in sorted(served.items())))
+    if batched:
+        # Coverage, not cost. An earlier version of this line said a batching caller "looks
+        # cheaper here than its GraphQL points are", which was backwards: GitHub prices a GraphQL
+        # call at the requests needed for its connections divided by 100, rounded, minimum 1, so
+        # one aliased query over forty PRs is about 1 point against about 40 for the loop --
+        # skills/github-ci-wait/SKILL.md says so, and this contradicted it. Per-call shares are
+        # the right unit for GraphQL points. What a `graphql` line really hides is *reads*: the
+        # category is not cacheable, so none of the objects inside it reaches `cacheableReads`,
+        # `repeatsWithin` or `perRead`, and the repeat *count* is a floor rather than an estimate.
+        # The count and not the shares beside it. A hidden read written out can land on either
+        # side of a share, so a share can go up, down or stay put -- all three are in
+        # AuditGraphqlTest, which is what finally made the sentence checkable rather than
+        # reviewable. Four earlier drafts each inferred a direction instead: "both *fall*" from the
+        # denominator alone, "either direction" said of the two counts rather than the share,
+        # "grows the numerator and the denominator" -- which reads as both always growing, and a
+        # review measured 33.3% -> 25.0% where only the denominator did -- and then "can grow the
+        # numerator and does grow the denominator", where a review measured 33.3% -> 33.3% by
+        # writing the hidden read out in place of the batched call it was carried by. Say what is
+        # measured, nothing about mechanism, and let a test hold it.
+        # "The calls are counted above" because the total line counts them, and the repeat
+        # percentage's denominator is that total. Not "in their own category row": the category
+        # table is the top 20 by count, so on a host with more than twenty distinct categories
+        # this row is not in it -- measured, 21 distinct `api` paths and the graphql row gone, with
+        # the sentence still true. An earlier draft said "None of them is counted above", which the
+        # total contradicts. What is not counted is the *objects* inside them, and what follows
+        # from that is only that no graphql call is a cacheable read or a repeat.
+        # "however many ... asked for" covers zero, which is the only thing needed: the log keeps
+        # the path and never the document, so a batched read of forty and a call that reads nothing
+        # are the same line here, and a floor needs the hidden reads to be >= 0. Earlier drafts
+        # named the mutation and the one-object probe as carrying nothing, and both were claims
+        # about GitHub's API that this log cannot see -- a mutation selects its payload, and a probe
+        # of an object read nearby hides a repeat. "each carrying", not "each one request": with
+        # `--paginate` one command line is several HTTP requests, and the log keeps neither the
+        # flags (broker_logged_target drops them) nor the request count.
+        # "the same-target re-reads a cache could have been asked for", not "what a cache could
+        # have answered": this broker's cache keys on the target, and the repeat count is
+        # flag-blind in the other direction -- `pr view X --json state` and `pr view X --json
+        # files` log the same target and score as one repeat, while the broker would have to fetch
+        # the second field set. So the figure is a floor against hidden GraphQL reads and can
+        # overcount against the cache's own hit rate; naming same-target re-reads is the part that
+        # holds both ways.
+        # The floor is over the calls in *this report*. With `--last N` the window is the last N
+        # lines, so writing hidden reads out as separate lines pushes older ones out and the
+        # comparison runs over two different sets of calls -- measured, and pinned as a known limit
+        # by test_the_floor_is_over_one_set_of_calls: 1 repeat becomes 0 under `--last 3`. Held to
+        # one set it cannot fall, because at most one repeat is counted per line per target, so the
+        # figure can never exceed the true same-target re-read count; two reviews found no
+        # counterexample, in 4000 and in 1800 random insertions, for repeats, reads and calls alike.
+        # No pricing claim here on purpose -- this file is read as durable output, and a price is
+        # the part that goes stale.
+        # "was" for one call: N=1 is the common case on a host that batches rarely, and it is what
+        # the crowded-table fixture prints.
+        print(f"\n{batched} of those calls {'was' if batched == 1 else 'were'} `gh api graphql`, "
+              f"each carrying however many objects "
+              f"the caller asked for, which this cannot see. The calls are counted above; none of "
+              f"the objects inside them is, so none of them is counted as a cacheable read or as a "
+              f"repeat. That makes the repeat count a floor on the same-target re-reads a cache "
+              f"could have been asked for in this report, not an estimate. The shares beside it "
+              f"are not floors: a hidden read written out can land on either side of a share, so "
+              f"a share can go up, down or stay where it is.")
     return EXIT_OK
 
 
