@@ -1542,6 +1542,10 @@ class Daemon:
         self.clock_real = now is None
         self.tick_deadline = time.monotonic() + TICK_BUDGET
         self.errors = []
+        if self.failing is None:
+            # and again in serve_waits: a long read phase must not look like a dead daemon; ticks that
+            # keep raising stop marking, so their blockers hand the wait back (resume_wait says why)
+            mark_waits_served()
         try:
             self.post_tick()  # first, so a long read phase never delays a write
         except Exception as error:  # noqa: BLE001  a bad queue entry must not stop the reads
@@ -1576,6 +1580,11 @@ class Daemon:
         # headers have already brought the view up to date, and only an idle one goes stale.
         self.refresh_budget()
         self.tick_deadline = float("inf")
+        try:
+            waiting = self.serve_waits()
+        except Exception as error:  # noqa: BLE001  the waits are the clients' business; the reads go on
+            waiting = None
+            self.errors.append(f"waits: {describe(error)} at {error_site(error)}")
         self.deferred &= {e["key"] for e in entries}
         self.attempted = {k: t for k, t in self.attempted.items() if self.now - t < 2 * IDLE_EXPIRY}
         oldest = self.oldest_data(entries, {e["key"] for e in prs + runs + comments + heads})
@@ -1591,7 +1600,8 @@ class Daemon:
         self.reads = [r for r in self.reads if self.now - r[0] < 3600]
         reads = {kind: {b: sum(1 for _, k, w in self.reads if k == kind and w == b) for b in ("graphql", "rest")}
                  for kind in CYCLES}
-        status = {"pid": os.getpid(), "at": self.now, "watching": len(entries),
+        status = {"pid": os.getpid(), "at": self.now, "watching": len(entries), "waits": WAITS_CONTRACT,
+                  "waiting": waiting,
                   "fetched": {"pr": len(prs), "run": len(runs), "comment": len(comments), "head": len(heads)},
                   "controller": {**self.controller_status, "runs": len(self.controller_filled)},
                   "modes": {b: self.mode(b) for b in ("rest", "graphql")}, "errors": self.errors[:10],
@@ -1607,6 +1617,76 @@ class Daemon:
             self.beat = self.now
         self.status = status
         return status
+
+    def serve_waits(self) -> int:
+        """Rule on the `wait pr|run` requests clients left in waits/ (subscribe_wait): keep their interest
+        registered, and when one is decided or out of time write what it prints and its exit code, then
+        wake its blocker with the code. waits/.served tells the blockers waits are being ruled on. A
+        request whose blocker is gone, or that cannot be read, is dropped. Returns how many are pending."""
+        d = waits_dir()
+        if not d.is_dir():
+            return 0
+        mark_waits_served()
+        now = time.time()  # requests carry wall-clock times, whatever clock a tick was given
+        pending, touch = 0, {}
+        for path in sorted(d.glob("*.json")):
+            rid = path.stem
+            try:
+                req = read_json(path)
+                decided = self.serve_wait(d, rid, req, now, touch)
+            except OSError:  # a full disk, say: the request stays, and the next tick tries again
+                pending += 1
+                continue
+            except Exception:  # noqa: BLE001  a request that cannot be ruled on must not stop the others
+                drop_wait(rid)  # its blocker sees the FIFO gone and hands the wait back (BLOCKER)
+                continue
+            if decided is None:
+                pending += 1
+        # One registration per key, all under one bound: a wedged holder of .register.lock costs a tick
+        # LOCK_WAIT, not LOCK_WAIT per waiter.
+        with lock_budget(LOCK_WAIT):
+            for key, jobs in touch.items():
+                register(key, jobs)
+        # What a blocker killed after its wake, or a wait handed back to Python, left behind.
+        for left in d.glob("*.*"):
+            rid = left.name.split(".", 1)[0]
+            pid = rid.split("-", 1)[0]
+            if rid and not (d / f"{rid}.json").exists() and not (pid.isdigit() and waiter_alive(int(pid))):
+                drop_wait(rid)
+        return pending
+
+    def serve_wait(self, d: Path, rid: str, req: Any, now: float, touch: dict[str, bool]) -> bool | None:
+        """One request: None while pending, else whether its blocker was woken. Raises on a bad one."""
+        if (not isinstance(req, dict) or not waiter_alive(req.get("pid")) or not (d / f"{rid}.fifo").exists()
+                or now > float(req["began"]) + float(req["timeout"]) + WAITS_LEFTOVER):
+            drop_wait(rid)
+            return False
+        if req.get("code") is None:
+            before = dict(req)
+            if now - float(req.get("touched") or 0) >= TOUCH_EVERY:
+                touch[req["key"]] = touch.get(req["key"], False) or bool(req.get("jobs"))
+                req["touched"] = now
+            try:
+                done, err = wait_step(req, now), ""
+            except WatchError as error:
+                done, err = (64, ""), f"glaeda-gh: {error}\n"
+            except Exception as error:  # noqa: BLE001  said to the waiter, not raised into the tick
+                done, err = (64, ""), f"glaeda-gh: the daemon could not rule on this wait: {describe(error)}\n"
+            if done is not None:
+                if err:
+                    (d / f"{rid}.out.err").write_text(err)
+                (d / f"{rid}.out").write_text(done[1])
+                (d / f"{rid}.out.rc").write_text(f"{done[0]}\n")
+                req["code"] = done[0]
+            if req != before:
+                write_json(d / f"{rid}.json", req)
+            if req.get("code") is None:
+                return None
+        if wake_waiter(d / f"{rid}.fifo", int(req["code"])):
+            with contextlib.suppress(OSError):
+                (d / f"{rid}.json").unlink()  # the blocker prints .out and removes the rest
+            return True
+        return False
 
     def batched(self, kind: str, entries: list[dict], fetch: Callable[[list[dict]], str | None]) -> None:
         """Read `entries` over GraphQL in queries of self.batch[kind]. A query that times out (504)
@@ -2853,14 +2933,17 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
     return "\n".join(lines)
 
 
+def render(key: str, entry: dict | None, as_json: bool, extra: dict | None = None, until: str = "done",
+           grace: float = RESCUE_GRACE) -> str:
+    if as_json:
+        return json.dumps({"key": key, **(entry or {}), **(extra or {})}, sort_keys=True) + "\n"
+    return "".join(f"{line}\n" for line in [summary(key, entry, until, grace)]
+                   + [f"{k}: {v}" for k, v in (extra or {}).items()])
+
+
 def emit(key: str, entry: dict | None, as_json: bool, extra: dict | None = None, until: str = "done",
          grace: float = RESCUE_GRACE) -> None:
-    if as_json:
-        print(json.dumps({"key": key, **(entry or {}), **(extra or {})}, sort_keys=True))
-    else:
-        print(summary(key, entry, until, grace))
-        for k, v in (extra or {}).items():
-            print(f"{k}: {v}")
+    sys.stdout.write(render(key, entry, as_json, extra, until, grace))
 
 
 def cmd_status(kind: str, target: str, jobs: bool, as_json: bool, first_wait: float = CYCLE + 10) -> int:
@@ -2907,14 +2990,80 @@ def resolve_sha(sha: str) -> tuple[str, bool]:
     return (full, True) if full else (sha, False)
 
 
+def wait_request(kind: str, target: str, until: str, timeout: float, jobs: bool, as_json: bool,
+                 sha: str | None, exact: bool, grace: float) -> dict:
+    """What a `wait pr|run` is ruled on: the same fields whether the client polls (cmd_wait) or the
+    daemon rules on it (subscribe_wait). `began` is wall-clock time: only data fetched after it counts."""
+    return {"key": parse_key(kind, target), "kind": kind, "target": target, "until": until, "timeout": timeout,
+            "jobs": jobs, "json": as_json, "sha": sha, "exact": exact, "grace": grace, "began": time.time()}
+
+
+def wait_step(req: dict, now: float) -> tuple[int, str] | None:
+    """One look at a `wait pr|run` (wait_request): (exit code, what it prints) once it is decided or out
+    of time, else None. Rules only on data the daemon fetched after the wait began, never on an older
+    cache. A short --sha that GitHub's head resolves is written back into REQ. Raises WatchError."""
+    key, kind, until, grace, began = req["key"], req["kind"], req["until"], req["grace"], req["began"]
+    sha, exact, as_json = req.get("sha"), req.get("exact", True), req.get("json", False)
+    entry = read_cache(key)
+    fresh = entry is not None and (entry.get("fetchedAt") or 0) >= began
+    waited = int(max(0.0, now - began))
+    if fresh and not entry.get("data") and entry.get("missing"):
+        # GitHub says NOT_FOUND; transport errors and 5xx stay pending
+        return EXIT_FAIL, render(key, entry, as_json, {"result": "failure", "waited_s": waited}, until, grace)
+    data = (entry or {}).get("data")
+    # only a merge is final; a completed run can be rerun and a closed PR reopened
+    final = kind == "pr" and data and data.get("state") == "MERGED"
+    usable = data and ((entry.get("dataAt") or 0) >= began or final)
+    if usable and sha:
+        head = str(data.get("headRefOid" if kind == "pr" else "head_sha") or "").lower()
+        if head and not head.startswith(sha):
+            if kind == "run":
+                raise WatchError(f"run {req['target']} is for commit {head[:12]}, not {sha[:12]}; a run's commit never changes")
+            if not exact:
+                raise WatchError(f"--sha {sha} is not a commit in this checkout and is not the head GitHub shows "
+                                 f"({head[:12]}); pass the full id (git rev-parse HEAD) to wait for a push "
+                                 "GitHub has not seen yet")
+        elif head and not exact:
+            # resolved: a later push now counts as pending, as for a full id
+            req["sha"], req["exact"] = sha, exact = head, True
+    result = verdict(kind, data, until, sha, (entry or {}).get("jobs"), time.time(), grace) if usable else None
+    if result is not None:
+        outcome_name = {EXIT_OK: "success", EXIT_CONFLICT: "conflict"}.get(result, "failure")
+        extra: dict[str, Any] = {"result": outcome_name, "waited_s": waited}
+        if kind == "pr" and result == EXIT_CONFLICT:
+            extra["note"] = ("PR conflicts with its base (mergeable CONFLICTING): no checks run until you "
+                             "merge or rebase onto the base and push")
+        elif kind == "pr" and data.get("state") == "CLOSED":
+            extra["note"] = "PR was closed without being merged"
+        if kind == "run" and result == EXIT_FAIL and grace > 0 and run_hold(data, entry.get("jobs"), time.time(), float("inf")):
+            extra["note"] = f"a glaeda runner refused this attempt at setup and no rescue attempt followed within {int(grace)}s"
+        return result, render(key, entry, as_json, extra, until, grace)
+    if now - began >= req["timeout"]:
+        extra = {"result": "timeout", "waited_s": waited}
+        if sha and entry and entry.get("data"):
+            head = entry["data"].get("headRefOid") or entry["data"].get("head_sha") or ""
+            if not str(head).startswith(sha):
+                extra["note"] = f"GitHub still shows head {str(head)[:10]}, not {sha[:10]}"
+        return EXIT_TIMEOUT, render(key, entry, as_json, extra, until, grace)
+    return None
+
+
 def cmd_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_json: bool,
              sha: str | None = None, grace: float = RESCUE_GRACE) -> int:
-    """Rules only on data the daemon fetched after this wait began, never on an older cache."""
-    key = parse_key(kind, target)
+    """The polling wait: this process re-reads the cache until wait_step decides. `wait pr|run` uses it
+    only when the daemon cannot rule on the wait itself (subscribe_wait)."""
+    parse_key(kind, target)  # a bad target is the first thing said
     exact = True
     if sha:
         sha, exact = resolve_sha(sha)
-    began, start = time.time(), time.monotonic()
+    return poll_wait(wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace))
+
+
+def poll_wait(req: dict) -> int:
+    """Re-read the cache until wait_step decides REQ, saying what a down, failing or stale daemon means.
+    A wait the daemon stopped ruling on (resume_wait) carries on here, from when it began."""
+    timeout, jobs = req["timeout"], req["jobs"]
+    start = time.monotonic() - max(0.0, time.time() - req["began"])
     touched = -TOUCH_EVERY
     warned = False
     down, down_since = DownWait(), None
@@ -2936,51 +3085,176 @@ def cmd_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_
             warned = True
         now = time.monotonic()
         if now - touched >= TOUCH_EVERY:
-            register(key, jobs)
+            register(req["key"], jobs)
             touched = now
-        entry = read_cache(key)
-        fresh = entry is not None and (entry.get("fetchedAt") or 0) >= began
-        waited = int(now - start)
-        if fresh and not entry.get("data") and entry.get("missing"):
-            emit(key, entry, as_json, {"result": "failure", "waited_s": waited}, until, grace)
-            return EXIT_FAIL  # GitHub says NOT_FOUND; transport errors and 5xx stay pending
-        data = (entry or {}).get("data")
-        # only a merge is final; a completed run can be rerun and a closed PR reopened
-        final = kind == "pr" and data and data.get("state") == "MERGED"
-        usable = data and ((entry.get("dataAt") or 0) >= began or final)
-        if usable and sha:
-            head = str(data.get("headRefOid" if kind == "pr" else "head_sha") or "").lower()
-            if head and not head.startswith(sha):
-                if kind == "run":
-                    raise WatchError(f"run {target} is for commit {head[:12]}, not {sha[:12]}; a run's commit never changes")
-                if not exact:
-                    raise WatchError(f"--sha {sha} is not a commit in this checkout and is not the head GitHub shows "
-                                     f"({head[:12]}); pass the full id (git rev-parse HEAD) to wait for a push "
-                                     "GitHub has not seen yet")
-            elif head and not exact:
-                sha, exact = head, True  # resolved: a later push now counts as pending, as for a full id
-        result = verdict(kind, data, until, sha, (entry or {}).get("jobs"), time.time(), grace) if usable else None
-        if result is not None:
-            outcome_name = {EXIT_OK: "success", EXIT_CONFLICT: "conflict"}.get(result, "failure")
-            extra: dict[str, Any] = {"result": outcome_name, "waited_s": waited}
-            if kind == "pr" and result == EXIT_CONFLICT:
-                extra["note"] = ("PR conflicts with its base (mergeable CONFLICTING): no checks run until you "
-                                 "merge or rebase onto the base and push")
-            elif kind == "pr" and data.get("state") == "CLOSED":
-                extra["note"] = "PR was closed without being merged"
-            if kind == "run" and result == EXIT_FAIL and grace > 0 and run_hold(data, entry.get("jobs"), time.time(), float("inf")):
-                extra["note"] = f"a glaeda runner refused this attempt at setup and no rescue attempt followed within {int(grace)}s"
-            emit(key, entry, as_json, extra, until, grace)
-            return result
-        if now - start >= timeout:
-            extra = {"result": "timeout", "waited_s": waited}
-            if sha and entry and entry.get("data"):
-                head = entry["data"].get("headRefOid") or entry["data"].get("head_sha") or ""
-                if not str(head).startswith(sha):
-                    extra["note"] = f"GitHub still shows head {str(head)[:10]}, not {sha[:10]}"
-            emit(key, entry, as_json, extra, until, grace)
-            return EXIT_TIMEOUT
-        time.sleep(min(WAIT_POLL, max(0.1, timeout - (now - start))))
+        done = wait_step(req, time.time())
+        if done is not None:
+            sys.stdout.write(done[1])
+            return done[0]
+        time.sleep(min(WAIT_POLL, max(0.1, req["began"] + timeout - time.time())))
+
+
+WAITS_CONTRACT = 1  # daemon.json "waits": this daemon rules on `wait pr|run` requests (Daemon.serve_waits)
+WAITS_CHECK = 60  # a blocker hands its wait back to Python when no tick has ruled on waits for this long
+WAITS_LEFTOVER = 600  # a request this far past its deadline has no blocker left (a reused pid): dropped
+WAITS_MAX_TIMEOUT = 1e8  # longer (or inf) waits poll, as before: bash keeps time in whole seconds
+BASH = "/bin/bash"
+# The whole waiter once the request is written: bash blocked reading the FIFO until the daemon writes
+# the exit code (Daemon.serve_waits), then what the wait prints. `3<>` opens without waiting for a
+# writer. Every WAITS_CHECK it looks at waits/.served, which each tick touches; at the wait's deadline,
+# once no tick has served waits since its last look (the daemon is down, failing, hung, or an older
+# one), or once its FIFO is gone (the daemon dropped the request), it execs "$@": `glaeda-gh
+# wait-resume ID` (resume_wait). That argument list is a contract with every live blocker: keep it.
+BLOCKER = r"""fifo=$1 out=$2 limit=$3 served=$4 check=$5
+shift 5
+mark=$out.mark
+exec 3<>"$fifo" || exec "$@"
+: > "$mark"
+end=$((SECONDS + limit))
+rc=
+while :; do
+  left=$((end - SECONDS))
+  [ "$left" -gt 0 ] || break
+  [ "$left" -gt "$check" ] && left=$check
+  IFS= read -r -t "$left" rc <&3 && break
+  rc=
+  [ -p "$fifo" ] && [ "$served" -nt "$mark" ] || break
+  : > "$mark"
+done
+exec 3<&-
+rm -f "$mark"
+case "$rc" in ''|*[!0-9]*) exec "$@" ;; esac
+[ -f "$out.err" ] && cat "$out.err" >&2
+[ -f "$out" ] && cat "$out"
+rm -f "$fifo" "$out" "$out.err" "$out.rc"
+exit "$rc"
+"""
+WAIT_FILES = (".json", ".fifo", ".out", ".out.err", ".out.rc", ".out.mark")
+
+
+def mark_waits_served() -> None:
+    """Tell the blockers a daemon that rules on waits is ticking (BLOCKER reads waits/.served)."""
+    with contextlib.suppress(OSError):
+        if waits_dir().is_dir():
+            (waits_dir() / ".served").touch()
+
+
+def waits_dir() -> Path:
+    return BASE / "waits"  # `wait pr|run` requests the daemon rules on: <id>.json, .fifo, .out, .out.rc, ...
+
+
+def write_wait_request(kind: str, target: str, until: str, timeout: float, jobs: bool, as_json: bool,
+                       sha: str | None, exact: bool, grace: float, pid: int) -> str:
+    """Leave a wait for the daemon: its FIFO first, then the request, so the daemon never sees a request
+    without one. Interest is registered at once, as a polling wait does. Returns the request's id."""
+    req = wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace)
+    rid = f"{pid}-{os.urandom(4).hex()}"
+    waits_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.mkfifo(waits_dir() / f"{rid}.fifo", 0o600)
+    register(req["key"], jobs)
+    write_json(waits_dir() / f"{rid}.json", {**req, "pid": pid, "touched": req["began"]})
+    return rid
+
+
+def serving_waits() -> bool:
+    """Whether the daemon runs, rules on waits (WAITS_CONTRACT), and is neither failing nor hung."""
+    status = read_json(BASE / "daemon.json") or {}
+    return (isinstance(status.get("waits"), int) and status["waits"] >= WAITS_CONTRACT and lock_held()
+            and daemon_failing() is None and daemon_stale() is None)
+
+
+def subscribe_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_json: bool,
+                   sha: str | None = None, grace: float = RESCUE_GRACE) -> int:
+    """`wait pr|run` as a request the daemon rules on: this process writes it and becomes BLOCKER, a bash
+    asleep on a FIFO, instead of a Python interpreter re-reading the cache every WAIT_POLL (89 of those
+    held 1.6 GB on cosmic-gray, 2026-10-21). Same arguments, output and exit codes as cmd_wait, which it
+    falls back to when the daemon is not serving waits (down, failing, hung or older than WAITS_CONTRACT),
+    there is no bash, or the timeout is not a finite number of seconds bash can count."""
+    if not (0 <= timeout <= WAITS_MAX_TIMEOUT) or not os.access(BASH, os.X_OK) or not serving_waits():
+        return cmd_wait(kind, target, until, timeout, jobs, as_json, sha, grace)
+    parse_key(kind, target)
+    exact = True
+    if sha:
+        sha, exact = resolve_sha(sha)
+    try:
+        rid = write_wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace, os.getpid())
+    except OSError:
+        return cmd_wait(kind, target, until, timeout, jobs, as_json, sha, grace)
+    block(rid, timeout)
+    return EXIT_DOWN  # not reached
+
+
+def block(rid: str, left: float) -> None:
+    """Become BLOCKER for request RID, with LEFT seconds to its deadline. The same pid carries on: the
+    daemon tells a gone waiter by it."""
+    d = waits_dir()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execv(BASH, [BASH, "-c", BLOCKER, "glaeda-gh-wait", os.fspath(d / f"{rid}.fifo"), os.fspath(d / f"{rid}.out"),
+                    str(max(1, int(left + 0.999))), os.fspath(d / ".served"), str(WAITS_CHECK),
+                    sys.executable, os.path.abspath(__file__), "wait-resume", rid])
+
+
+def resume_wait(rid: str) -> int:
+    """Where BLOCKER hands a wait back: at its deadline, or once no tick has ruled on waits for WAITS_CHECK.
+    The daemon's answer if it left one; else back to sleep while the daemon serves waits and time is left;
+    else on as the polling wait (poll_wait), which says what a down, failing or stale daemon means and
+    rules on the timeout itself."""
+    d = waits_dir()
+    with contextlib.suppress(OSError, ValueError):
+        code = int((d / f"{rid}.out.rc").read_text())
+        with contextlib.suppress(OSError):
+            sys.stderr.write((d / f"{rid}.out.err").read_text())
+        with contextlib.suppress(OSError):
+            sys.stdout.write((d / f"{rid}.out").read_text())
+        drop_wait(rid)
+        return code
+    req = read_json(d / f"{rid}.json")
+    if not isinstance(req, dict) or not all(k in req for k in ("key", "kind", "began", "timeout", "until", "grace")):
+        drop_wait(rid)
+        print("glaeda-gh: this wait's request is gone; run the wait again", file=sys.stderr)
+        return EXIT_DOWN
+    left = float(req["began"]) + float(req["timeout"]) - time.time()
+    if left > 0 and serving_waits():
+        register(req["key"], bool(req.get("jobs")))
+        block(rid, left)
+    drop_wait(rid)
+    return poll_wait(req)
+
+
+def waiter_alive(pid: Any) -> bool:
+    """Whether a wait's blocker still runs: one signal-0 per request, no `ps` (a tick may hold many)."""
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def wake_waiter(fifo: Path, code: int) -> bool:
+    """Write the exit code to a blocker's FIFO. False while no blocker has it open (not started yet, or
+    handing the wait back to Python), or if it went away mid-write."""
+    try:
+        fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+    except OSError:
+        return False
+    try:
+        os.write(fd, f"{code}\n".encode())
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def drop_wait(rid: str) -> None:
+    for suffix in WAIT_FILES:
+        with contextlib.suppress(OSError):
+            (waits_dir() / f"{rid}{suffix}").unlink()
 
 
 def file_ready(pattern: str, mode: str, contains: re.Pattern | None) -> str | None:
@@ -5144,6 +5418,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"broker {BROKER_CONTRACT}")
             return EXIT_OK
         return cmd_gh(raw[1:])
+    if raw[:1] == ["wait-resume"] and len(raw) == 2:
+        # Not a command anyone types: BLOCKER hands a `wait pr|run` back here (resume_wait).
+        try:
+            return resume_wait(raw[1])
+        except WatchError as error:
+            print(f"glaeda-gh: {error}", file=sys.stderr)
+            return 64
+        except KeyboardInterrupt:
+            return 130
     args = parser().parse_args(argv)
     try:
         if args.command == "serve":
@@ -5192,8 +5475,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_wait_comment(args.target, args.timeout, args.json, args.author, args.match, args.since)
         if args.author or args.match or args.since:
             raise WatchError("--author, --match and --since are for wait comment")
-        return cmd_wait(args.kind, args.target, args.until, args.timeout, args.jobs, args.json, args.sha,
-                        args.rescue_grace)
+        return subscribe_wait(args.kind, args.target, args.until, args.timeout, args.jobs, args.json, args.sha,
+                              args.rescue_grace)
     except WatchError as error:
         print(f"glaeda-gh: {error}", file=sys.stderr)
         return 64
