@@ -178,6 +178,11 @@ class FakeMini(health.Mini):
     def node_refusal(self):
         return self.refusal
 
+    toolchain: str | None = None
+
+    def toolchain_mismatch(self):
+        return self.toolchain
+
     def install_rust_toolchain(self, toolchain):
         self.toolchain_installs.append(toolchain)
         return True, f"installed Rust toolchain {toolchain}"
@@ -262,6 +267,30 @@ class NodeEligibility(unittest.TestCase):
         self.assertEqual(mini.node_refusal(), "node not eligible (no node status from generation 3809eed51fdd)")
         self.assertEqual(asked, ["m4-16"])
 
+    def test_the_toolchain_is_checked_against_the_job_started_hooks_xcode_in_a_clean_env(self) -> None:
+        mini, _ = self.mini("exec /usr/bin/python3 hook job-started --allowed-owner manaflow-ai "
+                            "--require-eligible --fleet-class m4-16 --toolchain-xcode /Applications/Xcode_26.6.app")
+        probed: list[tuple[str, dict]] = []
+        why = ("toolchain: xcrun resolves /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk outside Xcode_26.6; "
+               "xcrun swiftc is Swift 6.4, Xcode_26.6's is 6.3.3")
+
+        def xcode_refusal(xcode_app, env):
+            probed.append((xcode_app, env))
+            return why
+
+        mini._hook.xcode_refusal = xcode_refusal
+        mini._hook.listener_env = lambda environ, xcode: {"DEVELOPER_DIR": xcode + "/Contents/Developer"}
+        self.assertEqual(mini.toolchain_mismatch(), why)
+        self.assertEqual(probed, [("/Applications/Xcode_26.6.app",
+                                   {"DEVELOPER_DIR": "/Applications/Xcode_26.6.app/Contents/Developer"})])
+        mini._hook.xcode_refusal = lambda xcode_app, env: 1 / 0
+        self.assertIsNone(mini.toolchain_mismatch(), "a hook that cannot answer is no finding")
+
+    def test_a_runner_without_a_pool_xcode_has_no_toolchain_to_check(self) -> None:
+        mini, _ = self.mini("exec /usr/bin/python3 hook job-started --allowed-owner manaflow-ai")
+        mini._hook.xcode_refusal = lambda xcode_app, env: "toolchain: x"
+        self.assertIsNone(mini.toolchain_mismatch())
+
     def test_a_runner_that_does_not_require_eligibility_is_not_checked(self) -> None:
         mini, asked = self.mini("exec /usr/bin/python3 hook job-started --allowed-owner manaflow-ai")
         self.assertIsNone(mini.node_refusal())
@@ -318,6 +347,19 @@ class Detection(Base):
         f = report["findings"][0]
         self.assertEqual((f["severity"], f["auto_fix"]), ("error", "impossible"))
         self.assertIn("3809eed51fdd", f["evidence"])
+
+    def test_a_toolchain_outside_the_pool_xcode_is_an_error_this_user_cannot_heal(self) -> None:
+        # cmux21, 2026-10-21: Command Line Tools 27 made xcrun resolve their SDK and Swift 6.4 past Xcode_26.6
+        self.mini.toolchain = ("toolchain: xcrun resolves /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk "
+                               "outside Xcode_26.6; xcrun swiftc is Swift 6.4, Xcode_26.6's is 6.3.3")
+        report = self.run_once()
+        self.assertEqual(self.ids(report), ["toolchain_mismatch"])
+        f = report["findings"][0]
+        self.assertEqual((f["severity"], f["auto_fix"]), ("error", "impossible"))
+        self.assertIn("CommandLineTools", f["evidence"])
+        self.assertIn("CommandLineTools", f["note"])
+        self.mini.toolchain = None
+        self.assertEqual(self.run_once()["findings"], [])
 
     def test_missing_exact_rust_toolchain_is_self_healed(self) -> None:
         self.mini.refusal = "node not eligible (rust toolchain 1.98.1-aarch64-apple-darwin is not installed)"

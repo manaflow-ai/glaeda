@@ -38,6 +38,13 @@ re-runs it elsewhere) when:
     staged generation's cmux_fleet.py (state eligible, routingCandidateEligible true), and the enrollment
     must reference ~/.config/glaeda/cmux-fleet/class-acceptance/<class>.json. The toolchain check runs
     rustc, cargo, zig, xcodebuild and xcrun and compares them with that receipt's strings, exactly.
+  * with --toolchain-xcode APP (the pool Xcode): the runner's environment sets TOOLCHAINS or an SDKROOT outside APP
+    (leaked_toolchain_env; the xcrun shim's own SDKROOT does not count), or, with --require-eligible, xcrun in the
+    job's clean env resolves an SDK outside APP, a swiftc of another Swift than APP's toolchain, or an SDK of a newer
+    major than APP's, cannot `xcrun --find` a tool cmux uses (CMUX_TOOLS), or the PATH's python3 or the
+    /usr/bin/python3 xcrun shim does not start (xcode_refusal, one probe batch: "toolchain: xcrun resolves ...
+    outside Xcode_26.6"). Only a definite mismatch refuses; a probe that times out or prints nothing is no answer. An admitted job's later steps get
+    DEVELOPER_DIR=APP/Contents/Developer through $GITHUB_ENV when the runner's env does not already set it.
 Otherwise it takes that lock for the job: a small detached holder keeps it until job-completed releases
 it or the job's Runner.Worker exits, so fleet builds wait for the PR job and a crash cannot strand it.
 With --capacity-units N (several runners on one mini, docs/CMUX_MINI_RUNNER.md 2d) it takes a weighted
@@ -77,7 +84,11 @@ down (Gate). A --require-eligible runner also stops listening while job-started 
 eligibility (Gate.ineligible: the node status or the class receipt's toolchain, looked at in a thread at most
 every GATE_ELIGIBLE_EVERY_S; a new refusal holds once a recheck agrees, and a held answer survives a hook reload),
 so its label's jobs go to an eligible runner, or wait in GitHub's queue when none is, instead of failing in "Set up
-job". A gui runner also stops listening while the console session is locked or nobody is logged in there
+job"; that look includes the pool Xcode's toolchain (xcode_refusal), so a host whose xcrun resolves past its Xcode
+leaves admission. The gate starts run.sh with listener_env (no SDKROOT or TOOLCHAINS, DEVELOPER_DIR on the job-started
+hook's --toolchain-xcode) and scrubs its own environment the same way; a listener it adopted on a reload whose env
+was not that (adopted_env_stale) is stopped once idle and started clean.
+A gui runner also stops listening while the console session is locked or nobody is logged in there
 (console_refusal). A gui runner is never held for CPU saturation, only memory pressure (Gate.saturated), and while it
 is idle its gate holds the gui runner's reserve (GUI_RESERVE: capacity/<gui token>.reserve): every other job on the
 mini, and every other runner's gate, leaves one unit free for its next job, so the side and root lanes cannot fill
@@ -108,6 +119,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -872,6 +884,8 @@ GATE_ELIGIBLE_RECHECK_S = 30.0
 # The held answer across a reload's exec (as GATE_LISTENING_SINCE_ENV), so a hook --apply does not start every
 # held runner listening while the new gate's first look runs.
 GATE_INELIGIBLE_ENV = "GLAEDA_RUNNER_GATE_INELIGIBLE"
+# Across a reload: "clean" when this gate started its listener with listener_env, else why its env is stale.
+GATE_LISTENER_ENV = "GLAEDA_RUNNER_GATE_LISTENER_ENV"
 
 
 def _repo_name(repo: Any) -> str | None:
@@ -1156,9 +1170,275 @@ def toolchain_refusal(fleet_class: str | None, want: dict[str, Any], xcode_app: 
         fields.append("diffRustcVersion")
     drift = [f"{field} {have[field]!r} != {str(want[field])!r}" for field in fields
              if have.get(field) != str(want[field])]
+    if xcode_app:
+        # after the receipt probes and on its own budget, so slow Xcode probes never starve them into a '' drift;
+        # its refusal is the clearer reason for what drift may also see
+        why = xcode_refusal(xcode_app, env, deadline=time.monotonic() + XCODE_PROBE_BUDGET_S)
+        if why:
+            return why, note
     if drift:
         return f"node not eligible (toolchain drifted from the {fleet_class} class receipt: {'; '.join(drift)})", note
     return None, note
+
+
+# ---------------------------------------------------------------- the pool Xcode's toolchain
+# A runner's pool Xcode is its job-started hook's --toolchain-xcode (glaeda-cmux-runner: the member's first verified
+# Xcode, the one its xcode-26.6 label names). cmux21 (macOS 27, 2026-10-21): Command Line Tools 27 in
+# /Library/Developer/CommandLineTools made xcrun resolve their MacOSX27 SDK and Swift 6.4 even with xcode-select and
+# DEVELOPER_DIR on Xcode_26.6, and the /usr/bin/python3 xcrun shim the gate ran under exported that SDKROOT into the
+# listener's environment, so every job built against an SDK its compiler rejects ("this SDK is not supported by the
+# compiler"). So the listener starts with SDKROOT and TOOLCHAINS removed and DEVELOPER_DIR on the pool Xcode
+# (listener_env), and a host whose xcrun still resolves outside that Xcode, or cannot find or start what cmux jobs
+# run (CMUX_TOOLS, both python3s), is refused (xcode_refusal): job-started
+# refuses its jobs, the gate holds its listener off (Gate.ineligible, through toolchain_refusal) and
+# glaeda-mini-health reports toolchain_mismatch. Only a definite mismatch refuses: a probe that times out or prints
+# nothing is no answer, and the exact-string drift check after it still compares xcrun's SDK version.
+TOOLCHAIN_ENV = ("SDKROOT", "TOOLCHAINS")  # each points xcrun past DEVELOPER_DIR
+XCODE_PROBE_BUDGET_S = 15.0
+# A pass is reused this long (a probe runs xcrun twice and swiftc once); a refusal is never cached, so a fixed host
+# is admitted at the next look and a broken one is refused on fresh evidence each time.
+XCODE_PROBE_TTL_S = float(os.environ.get("GLAEDA_RUNNER_XCODE_PROBE_TTL_S") or 600.0)
+XCODE_PROBE_CACHE = "xcode-probe.json"  # under the runner state dir
+SWIFT_VERSION = re.compile(r"\bSwift version (\d+(?:\.\d+)+)")
+# The tools cmux's macOS jobs run through xcrun or the developer dir: each must resolve (`xcrun --find`). And both
+# python3s must start: the job PATH's, and the xcrun shim, which cmux scripts reach as /usr/bin/python3 and which
+# fails outright (exit 72, "xcode-select: Failed to locate 'python3'") under an SDKROOT whose SDK is gone (cmux21,
+# 2026-10-21: app-compile, fast-tier and web-bundles failed as infra).
+CMUX_TOOLS = ("swift", "swiftc", "clang", "git", "make", "ld", "xcodebuild", "python3")
+SHIM_PYTHON = os.environ.get("GLAEDA_RUNNER_SHIM_PYTHON") or "/usr/bin/python3"
+# By absolute path: a PATH without xcrun would exit 127 for every probe and refuse a healthy host.
+XCRUN = os.environ.get("GLAEDA_RUNNER_XCRUN") or "/usr/bin/xcrun"
+BATCH_REAP_S = 2.0  # after the deadline's SIGKILL, how long the batch's pipe may take to close
+MACOS_PLATFORM = "Platforms/MacOSX.platform"
+
+
+def listener_env(environ: Any, xcode_app: str | None) -> dict[str, str]:
+    """A copy of environ for the runner (and every job it runs): no SDKROOT or TOOLCHAINS, and DEVELOPER_DIR on the
+    pool Xcode when the runner has one."""
+    env = {key: value for key, value in environ.items() if key not in TOOLCHAIN_ENV}
+    if xcode_app:
+        env["DEVELOPER_DIR"] = os.fspath(Path(xcode_app) / "Contents" / "Developer")
+    return env
+
+
+def _xcode_name(xcode_app: str | None) -> str:
+    return Path(xcode_app).name.removesuffix(".app") if xcode_app else "the pool Xcode"
+
+
+def _under(path: str, parent: Path) -> bool:
+    """path is inside parent, as written or once both are resolved."""
+    return any(os.path.normpath(p).startswith(os.path.normpath(d) + os.sep)
+               for p, d in ((path, os.fspath(parent)), (os.path.realpath(path), os.path.realpath(parent))))
+
+
+def leaked_toolchain_env(environ: Any, xcode_app: str | None) -> str | None:
+    """Why this environment points xcrun outside the pool Xcode (an SDKROOT path outside it, any TOOLCHAINS), or None.
+    Under the /usr/bin/python3 shim SDKROOT is the shim's own (under_xcrun_shim): the caller leaves it out."""
+    leaked = []
+    sdkroot = environ.get("SDKROOT")  # a name (macosx) resolves through DEVELOPER_DIR; only a path is a leak
+    if sdkroot and os.path.isabs(sdkroot) and not (xcode_app and _under(sdkroot, Path(xcode_app) / "Contents" /
+                                                                        "Developer")):
+        leaked.append(f"SDKROOT={sdkroot}")
+    if environ.get("TOOLCHAINS"):
+        leaked.append(f"TOOLCHAINS={environ['TOOLCHAINS']}")
+    if not leaked:
+        return None
+    return f"toolchain: the runner's environment sets {', '.join(leaked)}, outside {_xcode_name(xcode_app)}"
+
+
+def under_xcrun_shim(executable: str) -> bool:
+    """This interpreter is a developer directory's python, which /usr/bin/python3 (the xcrun shim) runs with SDKROOT
+    set to what xcrun resolved for it: that SDKROOT is the shim's, not the environment the hook was given."""
+    real = os.path.realpath(executable)
+    return "/Contents/Developer/" in real or real.startswith("/Library/Developer/CommandLineTools/")
+
+
+def swift_version(text: str) -> str | None:
+    """'6.3.3' from `swiftc --version` ("Apple Swift version 6.3.3 (swiftlang-...)"), or None."""
+    match = SWIFT_VERSION.search(text or "")
+    return match.group(1) if match else None
+
+
+def _sdk_version(sdk: str | os.PathLike[str]) -> str | None:
+    """SDKSettings' Version of an SDK directory (json, else the plist), or None."""
+    doc = _json_file(Path(sdk) / "SDKSettings.json")
+    if not isinstance(doc, dict):
+        try:
+            doc = plistlib.loads((Path(sdk) / "SDKSettings.plist").read_bytes())
+        except (OSError, ValueError, plistlib.InvalidFileException):
+            return None
+    version = str(doc.get("Version") or "") if isinstance(doc, dict) else ""
+    return version if re.fullmatch(r"\d+(?:\.\d+)*", version) else None
+
+
+def xcode_mismatch(xcode_app: str, facts: dict[str, Any]) -> str | None:
+    """Pure: why a host whose xcrun reports facts (xcode_facts) does not build with the pool Xcode, or None. Only
+    what was seen counts: an empty sdkPath or a missing version is no answer (a probe that timed out), never a
+    mismatch. Refused: an SDK outside the Xcode's macOS platform, an xcrun swiftc of another Swift than the Xcode's
+    own toolchain, an SDK of a newer major than the Xcode's (its compiler rejects it), and every probe that ran and
+    failed (broken: a CMUX_TOOLS tool xcrun cannot find, a python3 that does not start)."""
+    name = _xcode_name(xcode_app)
+    why = []
+    sdk = str(facts.get("sdkPath") or "")
+    if os.path.isabs(sdk) and not _under(sdk, Path(xcode_app) / "Contents" / "Developer" / MACOS_PLATFORM):
+        why.append(f"xcrun resolves {sdk} outside {name}")
+    swift, xcode_swift = facts.get("swift"), facts.get("xcodeSwift")
+    if swift and xcode_swift and swift != xcode_swift:
+        why.append(f"xcrun swiftc is Swift {swift}, {name}'s is {xcode_swift}")
+    sdk_version, xcode_sdk = str(facts.get("sdkVersion") or ""), str(facts.get("xcodeSdkVersion") or "")
+    if sdk_version and xcode_sdk and int(sdk_version.split(".")[0]) > int(xcode_sdk.split(".")[0]):
+        why.append(f"SDK {sdk_version} is newer than {name}'s SDK {xcode_sdk}")
+    why += [str(b) for b in facts.get("broken") or []]
+    return f"toolchain: {'; '.join(why)}" if why else None
+
+
+# One shell batch runs every probe (xcode_facts): probe KEY CMD... prints "KEY<tab>EXIT<tab>STDOUT<tab>STDERR" once
+# CMD ends, each field on one line. Last the probes most likely to hang (xcrun resolving the SDK), so a batch killed
+# at its deadline has already said what it saw. $1 is the stderr scratch file _batch made (and removes).
+XCODE_PROBE_SCRIPT = r"""err=$1
+probe() {
+    key=$1; shift
+    out=$("$@" 2>"$err" </dev/null); code=$?
+    printf '%s\t%s\t%s\t%s\n' "$key" "$code" "$(printf '%s' "$out" | tr '\t\n' '  ' | cut -c1-400)" \
+        "$(tr '\t\n' '  ' <"$err" | cut -c1-200)"
+}
+"""
+
+
+def _batch(script: str, env: dict[str, str], cwd: Path, deadline: float) -> dict[str, tuple[int, str, str]]:
+    """{key: (exit, stdout, stderr)} for each probe the batch finished before deadline. The batch runs in its own
+    process group, killed whole at the deadline, so a hung xcrun never outlives it; its finished lines still count.
+    Its stderr scratch file is made and removed here, so a killed batch leaves nothing behind."""
+    try:
+        fd, err = tempfile.mkstemp(prefix="glaeda-xcode-probe-")
+        os.close(fd)
+    except OSError:
+        return {}
+    try:
+        try:
+            proc = subprocess.Popen(["/bin/sh", "-c", script, "glaeda-xcode-probe", err], stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, cwd=cwd,
+                                    start_new_session=True)
+        except OSError:
+            return {}
+        try:
+            out, _ = proc.communicate(timeout=max(0.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired as timeout:
+            with contextlib.suppress(OSError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            try:
+                out, _ = proc.communicate(timeout=BATCH_REAP_S)
+            except subprocess.TimeoutExpired:  # something outside the group holds the pipe: keep what was read
+                out = timeout.stdout or b""
+                proc.kill()
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(err)
+    seen = {}
+    for line in out.decode("utf-8", "replace").splitlines():
+        fields = line.split("\t")
+        if len(fields) == 4 and fields[1].isdigit():
+            seen[fields[0]] = (int(fields[1]), fields[2].strip(), fields[3].strip())
+    return seen
+
+
+def xcode_facts(xcode_app: str, environ: Any, deadline: float) -> dict[str, Any]:
+    """What xcrun resolves in the runner's clean env (listener_env) and what the pool Xcode itself ships, from one
+    probe batch bounded by deadline. A probe that did not finish leaves its fact empty; broken lists the probes that
+    finished and failed."""
+    env = listener_env(environ, xcode_app)
+    developer = Path(xcode_app) / "Contents" / "Developer"
+    own = developer / "Toolchains" / "XcodeDefault.xctoolchain" / "usr" / "bin" / "swiftc"
+    pythons = ("python3", SHIM_PYTHON)
+    q = shlex.quote
+    script = XCODE_PROBE_SCRIPT + "".join(
+        [f"probe xcodeSwift {q(os.fspath(own))} --version\n"]
+        + [f"probe python:{q(python)} {q(python)} -c 'import sys'\n" for python in pythons]
+        + [f"probe find:{tool} {q(XCRUN)} --find {tool}\n" for tool in CMUX_TOOLS]
+        + [f"probe swift {q(XCRUN)} swiftc --version\n", f"probe sdk {q(XCRUN)} --show-sdk-path\n"])
+    seen = _batch(script, env, Path.home(), deadline)
+
+    def ok(key: str) -> str:
+        code, out, _ = seen.get(key, (1, "", ""))
+        return out if code == 0 else ""
+
+    broken = []
+    for python in dict.fromkeys(pythons):
+        if f"python:{python}" in seen and seen[f"python:{python}"][0] != 0:
+            code, out, err = seen[f"python:{python}"]
+            broken.append(f"{python} does not run (exit {code}: {(err or out or 'no output')[:160]})")
+    for tool in CMUX_TOOLS:
+        if f"find:{tool}" in seen and seen[f"find:{tool}"][0] != 0:
+            code, out, err = seen[f"find:{tool}"]
+            broken.append(f"xcrun --find {tool} fails (exit {code}: {(err or out or 'no output')[:160]})")
+    sdk = ok("sdk")
+    return {"sdkPath": sdk, "swift": swift_version(ok("swift")), "xcodeSwift": swift_version(ok("xcodeSwift")),
+            "sdkVersion": _sdk_version(sdk) if os.path.isabs(sdk) else None,
+            "xcodeSdkVersion": _sdk_version(developer / MACOS_PLATFORM / "Developer" / "SDKs" / "MacOSX.sdk"),
+            "broken": broken}
+
+
+def xcode_refusal(xcode_app: str, environ: Any, cache: Path | None = None, ttl: float | None = None,
+                  deadline: float | None = None) -> str | None:
+    """xcode_mismatch for this host, probed (xcode_facts) unless a pass for the same Xcode is younger than ttl
+    (XCODE_PROBE_TTL_S) in cache (XCODE_PROBE_CACHE in the runner state dir, shared by the mini's runners). Only a
+    pass that saw the SDK path and both Swift versions is written: no answer is never cached."""
+    cache = cache if cache is not None else Path.home() / ".local/state/glaeda/cmux-runner" / XCODE_PROBE_CACHE
+    ttl = XCODE_PROBE_TTL_S if ttl is None else ttl
+    seen = _json_file(cache)
+    if (isinstance(seen, dict) and seen.get("xcode") == xcode_app and isinstance(seen.get("at"), (int, float))
+            and 0 <= time.time() - seen["at"] < ttl):
+        return None
+    facts = xcode_facts(xcode_app, environ, deadline if deadline is not None
+                        else time.monotonic() + XCODE_PROBE_BUDGET_S)
+    why = xcode_mismatch(xcode_app, facts)
+    if why is None and facts.get("sdkPath") and facts.get("swift") and facts.get("xcodeSwift"):
+        with contextlib.suppress(OSError):
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            stage = cache.with_name(f".{cache.name}.{os.getpid()}")
+            stage.write_text(json.dumps({"xcode": xcode_app, "at": time.time()}))
+            os.replace(stage, cache)
+    return why
+
+
+def export_developer_dir(xcode_app: str) -> str:
+    """Pin the job's later steps to the pool Xcode through $GITHUB_ENV when the runner's env does not already
+    (a listener started before listener_env). Returns a note, or ''."""
+    developer = os.fspath(Path(xcode_app) / "Contents" / "Developer")
+    target = os.environ.get("GITHUB_ENV")
+    if not target or os.environ.get("DEVELOPER_DIR") == developer:
+        return ""
+    with contextlib.suppress(OSError):
+        with open(target, "a", encoding="utf-8") as env_file:
+            env_file.write(f"DEVELOPER_DIR={developer}\n")
+        return f"DEVELOPER_DIR={developer} for the job"
+    return ""
+
+
+def runner_xcode(runner_dir: Path) -> str | None:
+    """The pool Xcode: the --toolchain-xcode this runner's job-started hook passes, or None."""
+    try:
+        line = next((ln for ln in (runner_dir / RUNNER_HOOK_SCRIPT).read_text().splitlines()
+                     if ln.startswith("exec ")), "")
+        words = shlex.split(line)
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    return words[words.index("--toolchain-xcode") + 1] if "--toolchain-xcode" in words[:-1] else None
+
+
+def adopted_env_stale(marker: str | None, environ: Any, xcode_app: str | None) -> str | None:
+    """Why a listener this gate adopted (a reload) runs with an environment listener_env would not give it, or None.
+    A gate that started it says so across the reload (GATE_LISTENER_ENV: "clean", or why not); a gate from before
+    listener_env started it with its own environment, which is environ."""
+    if marker:
+        return None if marker == "clean" else marker
+    leaked = leaked_toolchain_env(environ, xcode_app)
+    if leaked:
+        return leaked
+    developer = os.fspath(Path(xcode_app) / "Contents" / "Developer") if xcode_app else None
+    if developer and environ.get("DEVELOPER_DIR") != developer:
+        return f"the listener started before the gate set DEVELOPER_DIR={developer}"
+    return None
 
 
 def free_gib(path: str) -> float:
@@ -3493,6 +3773,7 @@ class Gate:
         self.eligible_new: str | None = None  # a first refusal, held only once a recheck agrees
         self.eligible_at = -GATE_ELIGIBLE_EVERY_S
         self.eligible_look: threading.Thread | None = None
+        self.stale_env: str | None = None  # why an adopted listener's env is not listener_env's (listen())
         self.disk_since: float | None = None  # when the current disk hold began
         self.disk_noted = False  # the hold ran past GATE_DISK_NOTE_S and said so once
         self.disk_evicted_at = -GATE_DISK_EVICT_EVERY_S  # when the last eviction under the floor started
@@ -3541,11 +3822,14 @@ class Gate:
             os.environ[GATE_LISTENING_SINCE_ENV] = repr(self.listening_since)
         if self.eligible_why:
             os.environ[GATE_INELIGIBLE_ENV] = self.eligible_why
+        if self.child is not None:
+            os.environ[GATE_LISTENER_ENV] = self.stale_env or "clean"
         try:
             os.execv(sys.executable, [sys.executable, *argv])
         except OSError:
             os.environ.pop(GATE_LISTENING_SINCE_ENV, None)
             os.environ.pop(GATE_INELIGIBLE_ENV, None)
+            os.environ.pop(GATE_LISTENER_ENV, None)
             signal.pthread_sigmask(signal.SIG_UNBLOCK, blocked)
             gate_log("the reload failed; keeping this gate")
 
@@ -3750,7 +4034,12 @@ class Gate:
         """For a --require-eligible runner: why job-started would refuse every job for eligibility (GATE_ELIGIBLE_EVERY_S),
         from the last look. A look starts in a thread when the last one is older than GATE_ELIGIBLE_EVERY_S and none
         is running, so no poll waits on its probes. A look that crashes counts as eligible: job-started still checks
-        every job itself, so a wrong "eligible" only costs the refusal this hold avoids."""
+        every job itself, so a wrong "eligible" only costs the refusal this hold avoids. An adopted listener whose env
+        is stale (adopted_env_stale) is held the same way, for any runner: stopped once idle, it starts clean."""
+        if self.child is None:
+            self.stale_env = None  # the next start() gives it listener_env
+        elif self.stale_env:
+            return f"listener env: {self.stale_env}; restarting it on the pool Xcode's env"
         scope = eligibility_scope(self.runner_dir)
         if scope is None:
             self.eligible_why = None
@@ -3879,7 +4168,8 @@ class Gate:
     def start(self) -> None:
         gate_log("starting the listener")
         self.child = subprocess.Popen([os.fspath(self.runner_dir / "run.sh")], cwd=self.runner_dir,
-                                      stdin=subprocess.DEVNULL)
+                                      stdin=subprocess.DEVNULL, env=listener_env(os.environ, runner_xcode(self.runner_dir)))
+        self.stale_env = None
         self.streak, self.stopped_one = 0, False
         self.listening_since, self.first_poll_noted = time.monotonic(), False
 
@@ -4088,11 +4378,20 @@ class Gate:
 def listen(runner_dir: Path, host_lock: str, reservation: str, state_dir: Path, waiters: bool,
            adopt: int = 0, capacity_dir: Path | None = None, fit_units: int = 1) -> int:
     gate = Gate(runner_dir, host_lock, reservation, state_dir, waiters, capacity_dir, fit_units)
+    marker = os.environ.pop(GATE_LISTENER_ENV, None)
+    xcode = runner_xcode(runner_dir)
     if adopt:
         gate.child = Adopted(adopt)  # type: ignore[assignment]
         with contextlib.suppress(ValueError):  # the adopted listener keeps its first poll (GATE_FIRST_POLL_S)
             gate.listening_since = float(os.environ.get(GATE_LISTENING_SINCE_ENV, ""))
+        gate.stale_env = adopted_env_stale(marker, os.environ, xcode)
+        if gate.stale_env:
+            gate_log(f"the adopted listener's env is stale ({gate.stale_env}); restarting it once it is idle")
     os.environ.pop(GATE_LISTENING_SINCE_ENV, None)
+    # The gate's own env too (the /usr/bin/python3 shim exports SDKROOT): its eligibility probes see the job's env.
+    clean = listener_env(os.environ, xcode)
+    os.environ.clear()
+    os.environ.update(clean)
     signal.signal(signal.SIGTERM, gate.terminate)
     signal.signal(signal.SIGINT, gate.terminate)
     # reload() blocks both before its exec, so a stop that arrives across it stays pending until here.
@@ -5496,6 +5795,11 @@ def main(argv: list[str] | None = None) -> int:
             why, want = node_refusal(args.fleet_class)
             if why:
                 return refused(why)
+        if args.toolchain_xcode:  # the listener's env, which every step inherits (listener_env)
+            given = {k: v for k, v in os.environ.items() if k != "SDKROOT" or not under_xcrun_shim(sys.executable)}
+            why = leaked_toolchain_env(given, args.toolchain_xcode)
+            if why:
+                return refused(why)
         why = reservation_refusal(args.reservation, time.time())
         disk_path = os.path.dirname(args.host_lock)
         if not why and not args.no_disk and disk_refusal(disk_path, args.min_free_gib):
@@ -5585,6 +5889,8 @@ def main(argv: list[str] | None = None) -> int:
                 return refused(why)
             if aligned:
                 note += f"; {aligned}"
+        if args.toolchain_xcode and (pinned := export_developer_dir(args.toolchain_xcode)):
+            note += f"; {pinned}"
         for root in held_roots(args.state_dir):
             settled = settle_root(int(root.rsplit("-", 1)[1]))
             if settled:

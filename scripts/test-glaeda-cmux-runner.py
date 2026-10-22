@@ -282,7 +282,11 @@ class HookTest(unittest.TestCase):
     def run_hook(self, phase: str, event_name: str | None, event_path: Path | None,
                  *extra: str, repo: str | None = None, env: dict | None = None) -> subprocess.CompletedProcess:
         environ = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0",
-                   "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet")}
+                   "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"),
+                   # the xcrun shim the toolchain check runs: the fake node's python3, never this host's real one
+                   "GLAEDA_RUNNER_SHIM_PYTHON": "python3",
+                   # and the fake node's xcrun for the Xcode probe, which runs xcrun by absolute path
+                   "GLAEDA_RUNNER_XCRUN": os.fspath(self.dir / "jobpath" / "xcrun")}
         if event_name is not None:
             environ["GITHUB_EVENT_NAME"] = event_name
         if event_path is not None:
@@ -3208,8 +3212,10 @@ time.sleep(60)
              valid: bool = True, role: str = "cmux_macos_native_build", receipt_toolchain: dict | None = None,
              hang: str | None = None, default: str = "1.98.1-aarch64-apple-darwin",
              installed: tuple = ("1.88.0-aarch64-apple-darwin", "1.98.1-aarch64-apple-darwin"),
-             python: str = "3.13", gh: bool = True) -> None:
-        """A fake Glaeda node under HOME (self.dir): enrollment, class receipt, staged CLI, toolchain."""
+             python: str = "3.13", gh: bool = True, sdk_path: str | None = None,
+             swiftc: str | None = None, python_runs: bool = True, unfound: tuple = ()) -> None:
+        """A fake Glaeda node under HOME (self.dir): enrollment, class receipt, staged CLI, toolchain. xcrun answers
+        --show-sdk-path with sdk_path and `swiftc --version` with swiftc, and fails both when they are None."""
         config = self.dir / ".config/glaeda/cmux-fleet"
         (config / "class-acceptance").mkdir(parents=True, exist_ok=True)
         (config / "acceptance").mkdir(exist_ok=True)
@@ -3264,7 +3270,9 @@ else:
                         + (f"print({rustc!r})\n" if rustc else
                            f"import os\nprint(json.load(open({state!r} + '/rustc-by-toolchain.json'))"
                            f"[os.environ.get('RUSTUP_TOOLCHAIN') or open({state!r} + '/rustup-default').read().strip()])\n"))
-        make_executable(cargo / "python3", f"#!/bin/sh\necho {python}\n")
+        make_executable(cargo / "python3", f"#!/bin/sh\necho {python}\n" if python_runs else
+                        "#!/bin/sh\necho \"xcode-select: Failed to locate 'python3', requesting installation of "
+                        "command line developer tools.\" >&2\nexit 72\n")
         if gh:
             make_executable(cargo / "gh", "#!/bin/sh\necho 'gh version 2.101.0 (2026-09-15)'\n")
         else:  # shadows a gh the host has on /usr/bin (GitHub's hosted images do)
@@ -3277,6 +3285,13 @@ else:
                 (cargo / name).unlink(missing_ok=True)
                 continue
             body = "sleep 60\n" if name == hang else f"cat <<'OUT'\n{text}\nOUT\n"
+            if name == "xcrun" and name != hang:
+                found = f"echo {shlex.quote(sdk_path)}" if sdk_path is not None else "exit 1"
+                swift = f"echo {shlex.quote(swiftc)}" if swiftc is not None else "exit 1"
+                missing = "".join(f"--find\\ {tool}) echo 'xcrun: error: unable to find utility \"{tool}\"' >&2; "
+                                  "exit 72 ;;\n" for tool in unfound)
+                body = (f'case "$*" in\n{missing}--find\\ *) echo /usr/bin/found ;;\n*--show-sdk-path*) {found} ;;\n'
+                        f"*swiftc*) {swift} ;;\n*) cat <<'OUT'\n{text}\nOUT\n;;\nesac\n")
             make_executable(cargo / name, f"#!/bin/sh\n{body}")
 
     def eligible_start(self) -> subprocess.CompletedProcess:
@@ -3450,12 +3465,391 @@ else:
         self.assertEqual(result.returncode, 1)
         self.assertIn("no Glaeda enrollment", result.stdout)
 
+    # ------------------------------------------------------------ the pool Xcode's toolchain (cmux21, 2026-10-21)
+
+    def xcode_start(self, **env: str) -> subprocess.CompletedProcess:
+        xcode = fake_xcode(self.dir)
+        return self.started("--require-eligible", "--fleet-class", "m4pro-48", "--toolchain-xcode", os.fspath(xcode),
+                            env={"PATH": f"{self.dir / 'jobpath'}:/usr/bin:/bin",
+                                 "GLAEDA_RUNNER_XCODE_PROBE_TTL_S": "0", **env})
+
+    def test_a_host_whose_xcrun_resolves_the_command_line_tools_refuses(self) -> None:
+        """cmux21 (macOS 27): Command Line Tools 27 made xcrun resolve their MacOSX27 SDK and Swift 6.4 even with
+        DEVELOPER_DIR on Xcode_26.6, so cmux-next's fast tier failed "this SDK is not supported by the compiler"
+        (jobs 119519488456, 119553662726). job-started refuses such a host before any step runs."""
+        self.fleet()
+        xcode = fake_xcode(self.dir)
+        good = os.fspath(xcode / "Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk")
+        self.node(sdk_path=good, swiftc=SWIFT_633)
+        github_env = self.dir / "github-env"
+        result = self.xcode_start(GITHUB_ENV=os.fspath(github_env))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"DEVELOPER_DIR={xcode / 'Contents/Developer'}\n", github_env.read_text(),
+                      "every later step of the job runs on the pool Xcode")
+        self.done()
+        clt = fake_clt(self.dir)
+        self.node(sdk_path=os.fspath(clt), swiftc=SWIFT_64)
+        result = self.xcode_start()
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn(f"refused: toolchain: xcrun resolves {clt} outside Xcode_26.6", result.stdout)
+        self.assertIn("Swift 6.4", result.stdout)
+        self.assertTrue(self.lock_free(), "a refused job never keeps the host lock")
+
+    def test_a_python3_or_a_cmux_tool_that_xcrun_cannot_run_refuses(self) -> None:
+        """cmux21, after the Command Line Tools were moved aside: under a stale SDKROOT the /usr/bin/python3 shim
+        failed ("xcode-select: Failed to locate 'python3'", exit 72), and app-compile, fast-tier and web-bundles
+        failed as infra. job-started refuses when python3 does not run or xcrun cannot find a tool cmux uses."""
+        self.fleet()
+        xcode = fake_xcode(self.dir)
+        good = os.fspath(xcode / "Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk")
+        self.node(sdk_path=good, swiftc=SWIFT_633, unfound=("git", "make"))
+        result = self.xcode_start()
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("refused: toolchain: xcrun --find git fails (exit 72: xcrun: error: unable to find utility",
+                      result.stdout)
+        self.assertIn("xcrun --find make fails", result.stdout)
+        self.assertTrue(self.lock_free())
+        self.node(sdk_path=good, swiftc=SWIFT_633, python_runs=False)
+        result = self.started("--require-eligible", "--fleet-class", "m4pro-48", "--toolchain-xcode",
+                              os.fspath(xcode), env={"PATH": f"{self.dir / 'jobpath'}:/usr/bin:/bin",
+                                                     "GLAEDA_RUNNER_XCODE_PROBE_TTL_S": "0"})
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("refused: node not eligible (python3 on the job PATH is missing", result.stdout,
+                      "the job PATH's python3 is checked first, as before")
+
+    def test_a_toolchain_probe_that_answers_nothing_does_not_refuse(self) -> None:
+        # a loaded mini's xcrun that times out is no verdict: the exact-string drift check still runs
+        self.fleet()
+        self.node()  # xcrun fails --show-sdk-path and swiftc
+        result = self.xcode_start()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.done()
+
+    def test_a_listener_env_that_carries_a_foreign_sdkroot_refuses(self) -> None:
+        """The runner gate ran under the /usr/bin/python3 xcrun shim, which exported SDKROOT, and passed it to
+        Runner.Listener, so every job inherited the Command Line Tools SDK (and, once that was moved aside, the
+        job-started hook itself failed to start: job 119553581129)."""
+        self.fleet()
+        xcode = fake_xcode(self.dir)
+        self.node(sdk_path=os.fspath(xcode / "Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"),
+                  swiftc=SWIFT_633)
+        result = self.xcode_start(SDKROOT="/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("refused: toolchain: the runner's environment sets "
+                      "SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk", result.stdout)
+        inside = os.fspath(xcode / "Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk")
+        result = self.xcode_start(SDKROOT=inside)
+        self.assertEqual(result.returncode, 0, "an SDKROOT inside the pool Xcode is the pool's SDK\n" + result.stdout)
+        self.done()
+
     def test_decide_is_pure_table(self) -> None:
         for name, (event_name, payload, admitted) in SAMPLE_EVENTS.items():
             with self.subTest(name):
                 ok, _ = hook.decide(event_name, payload, (payload.get("repository") or {}).get("full_name"),
                                     ["manaflow-ai/cmux"], None)
                 self.assertEqual(ok, admitted)
+
+
+SWIFT_633 = ("swift-driver version: 1.127.14.1 Apple Swift version 6.3.3 (swiftlang-6.3.3.1.2 clang-1700.6.3.2)\n"
+             "Target: arm64-apple-macosx27.0")
+SWIFT_64 = ("swift-driver version: 1.140.2 Apple Swift version 6.4 (swiftlang-6.4.0.10.4 clang-1800.2.6.1)\n"
+            "Target: arm64-apple-macosx27.0")
+
+
+def fake_xcode(base: Path, swift: str = SWIFT_633, sdk: str = "26.5") -> Path:
+    """BASE/Xcode_26.6.app with a MacOSX SDK (SDKSettings.json Version SDK) and the default toolchain's swiftc."""
+    app = base / "Xcode_26.6.app"
+    developer = app / "Contents/Developer"
+    sdks = developer / "Platforms/MacOSX.platform/Developer/SDKs"
+    (sdks / f"MacOSX{sdk}.sdk").mkdir(parents=True, exist_ok=True)
+    (sdks / f"MacOSX{sdk}.sdk/SDKSettings.json").write_text(json.dumps({"Version": sdk}))
+    if not (sdks / "MacOSX.sdk").exists():
+        (sdks / "MacOSX.sdk").symlink_to(f"MacOSX{sdk}.sdk")
+    swiftc = developer / "Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc"
+    swiftc.parent.mkdir(parents=True, exist_ok=True)
+    make_executable(swiftc, f"#!/bin/sh\ncat <<'OUT'\n{swift}\nOUT\n")
+    return app
+
+
+def fake_clt(base: Path, sdk: str = "27.0") -> Path:
+    """A Command Line Tools MacOSX SDK under BASE (SDKSettings.json Version SDK)."""
+    path = base / "CommandLineTools/SDKs/MacOSX.sdk"
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "SDKSettings.json").write_text(json.dumps({"Version": sdk}))
+    return path
+
+
+class XcodeToolchainTest(unittest.TestCase):
+    """The pool Xcode's toolchain: the listener's env, and the check that a host's xcrun resolves inside it."""
+
+    XCODE = "/Applications/Xcode_26.6.app"
+    CLT_SDK = "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
+
+    def setUp(self) -> None:
+        self.tmp = Path(os.path.realpath(tempfile.mkdtemp()))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_the_listener_env_drops_sdkroot_and_toolchains_and_pins_the_pool_xcode(self) -> None:
+        environ = {"PATH": "/opt/homebrew/bin:/usr/bin", "SDKROOT": self.CLT_SDK, "TOOLCHAINS": "swift",
+                   "DEVELOPER_DIR": "/Library/Developer/CommandLineTools", "HOME": "/Users/cmux"}
+        self.assertEqual(hook.listener_env(environ, self.XCODE),
+                         {"PATH": "/opt/homebrew/bin:/usr/bin", "HOME": "/Users/cmux",
+                          "DEVELOPER_DIR": "/Applications/Xcode_26.6.app/Contents/Developer"})
+        self.assertEqual(hook.listener_env(environ, None),
+                         {"PATH": "/opt/homebrew/bin:/usr/bin", "HOME": "/Users/cmux",
+                          "DEVELOPER_DIR": "/Library/Developer/CommandLineTools"},
+                         "a runner without a pool Xcode keeps its DEVELOPER_DIR")
+        self.assertIn("SDKROOT", environ, "a copy: the caller's mapping is left alone")
+
+    def test_swift_versions_are_read_from_swiftc(self) -> None:
+        self.assertEqual(hook.swift_version(SWIFT_633), "6.3.3")
+        self.assertEqual(hook.swift_version(SWIFT_64), "6.4")
+        self.assertEqual(hook.swift_version("Apple Swift version 6.3 (swift-6.3-RELEASE)"), "6.3")
+        self.assertIsNone(hook.swift_version(""))
+        self.assertIsNone(hook.swift_version("26.5"))
+
+    def test_mismatch_is_decided_from_the_facts_alone(self) -> None:
+        xcode_sdk = f"{self.XCODE}/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+        good = {"sdkPath": xcode_sdk, "swift": "6.3.3", "xcodeSwift": "6.3.3", "sdkVersion": "26.5",
+                "xcodeSdkVersion": "26.5"}
+        self.assertIsNone(hook.xcode_mismatch(self.XCODE, good))
+        cmux21 = {"sdkPath": self.CLT_SDK, "swift": "6.4", "xcodeSwift": "6.3.3", "sdkVersion": "27.0",
+                  "xcodeSdkVersion": "26.5"}
+        why = hook.xcode_mismatch(self.XCODE, cmux21)
+        self.assertTrue(why.startswith(f"toolchain: xcrun resolves {self.CLT_SDK} outside Xcode_26.6"), why)
+        self.assertIn("xcrun swiftc is Swift 6.4, Xcode_26.6's is 6.3.3", why)
+        self.assertIn("SDK 27.0 is newer than Xcode_26.6's SDK 26.5", why)
+        cases = {
+            "swift only": ({"swift": "6.4"}, "xcrun swiftc is Swift 6.4"),
+            "newer sdk only": ({"sdkVersion": "27.0"}, "SDK 27.0 is newer"),
+            "a point release of the same sdk": ({"sdkVersion": "26.6"}, None),
+            "an older sdk inside xcode": ({"sdkVersion": "26.2"}, None),
+            "a sibling Xcode's sdk": ({"sdkPath": xcode_sdk.replace("Xcode_26.6", "Xcode_26.6-beta")}, "outside"),
+            "no sdk path (a timeout)": ({"sdkPath": ""}, None),
+            "not a path": ({"sdkPath": "26.5"}, None),
+            "no swift version": ({"swift": None}, None),
+            "no xcode swift version": ({"xcodeSwift": None, "swift": "6.4"}, None),
+            "unreadable sdk settings": ({"sdkVersion": None}, None),
+            "a tool xcrun cannot find": ({"broken": ["xcrun --find git fails (exit 72: unable to find utility)"]},
+                                         "toolchain: xcrun --find git fails (exit 72"),
+            "a python3 that does not run": ({"broken": ["/usr/bin/python3 does not run (exit 72: xcode-select)"]},
+                                            "/usr/bin/python3 does not run"),
+            "nothing broken": ({"broken": []}, None),
+        }
+        for name, (change, want) in cases.items():
+            with self.subTest(name):
+                got = hook.xcode_mismatch(self.XCODE, {**good, **change})
+                if want is None:
+                    self.assertIsNone(got)
+                else:
+                    self.assertIn(want, got or "")
+
+    def test_a_foreign_sdkroot_or_toolchains_in_an_env_is_named(self) -> None:
+        inside = f"{self.XCODE}/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+        self.assertIsNone(hook.leaked_toolchain_env({"PATH": "/usr/bin"}, self.XCODE))
+        self.assertIsNone(hook.leaked_toolchain_env({"SDKROOT": inside}, self.XCODE))
+        self.assertEqual(hook.leaked_toolchain_env({"SDKROOT": self.CLT_SDK}, self.XCODE),
+                         f"toolchain: the runner's environment sets SDKROOT={self.CLT_SDK}, outside Xcode_26.6")
+        self.assertIn("TOOLCHAINS=swift", hook.leaked_toolchain_env({"TOOLCHAINS": "swift"}, self.XCODE))
+        self.assertIn("SDKROOT=", hook.leaked_toolchain_env({"SDKROOT": inside}, None),
+                      "without a pool Xcode any SDKROOT path is foreign")
+        for name in ("macosx", "macosx26.5", "iphonesimulator"):
+            with self.subTest(name):
+                self.assertIsNone(hook.leaked_toolchain_env({"SDKROOT": name}, self.XCODE),
+                                  "an SDK name resolves through DEVELOPER_DIR: only a path is a leak")
+
+    def test_the_xcrun_shims_own_sdkroot_is_not_a_leak(self) -> None:
+        """/usr/bin/python3 execs Xcode's (or the Command Line Tools') python with SDKROOT set to what xcrun resolved
+        for it: under that interpreter SDKROOT says nothing about the listener's env, and the clean-env probe
+        (xcode_refusal) judges what xcrun resolves instead."""
+        self.assertTrue(hook.under_xcrun_shim("/Applications/Xcode_26.3.app/Contents/Developer/usr/bin/python3"))
+        self.assertTrue(hook.under_xcrun_shim("/Library/Developer/CommandLineTools/usr/bin/python3"))
+        self.assertFalse(hook.under_xcrun_shim("/opt/homebrew/bin/python3"))
+        self.assertFalse(hook.under_xcrun_shim(os.path.expanduser("~/.local/python-3.13.15/bin/python3")))
+
+    def probe_env(self, sdk_path: str | None, swiftc: str | None, hang: bool = False,
+                  unfound: tuple = (), shim_runs: bool = True) -> dict[str, str]:
+        bin_dir = self.tmp / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        found = "sleep 30" if hang else f"echo {shlex.quote(sdk_path)}" if sdk_path is not None else "exit 1"
+        swift = f"cat <<'OUT'\n{swiftc}\nOUT\n" if swiftc is not None else "exit 1"
+        missing = "".join(f"--find\\ {tool}) echo 'xcrun: error: unable to find utility' >&2; exit 72 ;;\n"
+                          for tool in unfound)
+        make_executable(bin_dir / "xcrun", f'#!/bin/sh\nenv > {self.tmp / "xcrun.env"}\n'
+                        f'echo "$*" >> {self.tmp / "xcrun.calls"}\n'
+                        f'case "$*" in\n{missing}--find\\ *) echo /usr/bin/found ;;\n'
+                        f'*--show-sdk-path*) {found} ;;\n*swiftc*) {swift} ;;\n*) exit 1 ;;\nesac\n')
+        make_executable(bin_dir / "python3", "#!/bin/sh\nexit 0\n")
+        make_executable(self.tmp / "shim-python3", "#!/bin/sh\nexit 0\n" if shim_runs else
+                        "#!/bin/sh\necho \"xcode-select: Failed to locate 'python3'\" >&2\nexit 72\n")
+        for name, value in (("SHIM_PYTHON", os.fspath(self.tmp / "shim-python3")), ("XCRUN", os.fspath(bin_dir / "xcrun"))):
+            patch = mock.patch.object(hook, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        return {"PATH": f"{bin_dir}:/usr/bin:/bin", "HOME": os.fspath(self.tmp), "SDKROOT": self.CLT_SDK,
+                "TOOLCHAINS": "swift"}
+
+    def test_the_probe_runs_xcrun_in_the_clean_env_and_refuses_a_definite_mismatch(self) -> None:
+        xcode = fake_xcode(self.tmp)
+        sdk = xcode / "Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+        cache = self.tmp / "cache.json"
+        env = self.probe_env(os.fspath(sdk), SWIFT_633)
+        self.assertEqual(hook.xcode_facts(os.fspath(xcode), env, time.monotonic() + 10),
+                         {"sdkPath": os.fspath(sdk), "swift": "6.3.3", "xcodeSwift": "6.3.3", "sdkVersion": "26.5",
+                          "xcodeSdkVersion": "26.5", "broken": []}, "the fake answers every probe: a pass is a real pass")
+        self.assertIsNone(hook.xcode_refusal(os.fspath(xcode), env, cache=cache))
+        seen = dict(line.split("=", 1) for line in (self.tmp / "xcrun.env").read_text().splitlines() if "=" in line)
+        self.assertNotIn("SDKROOT", seen)
+        self.assertNotIn("TOOLCHAINS", seen)
+        self.assertEqual(seen["DEVELOPER_DIR"], os.fspath(xcode / "Contents/Developer"))
+        clt = fake_clt(self.tmp)
+        env = self.probe_env(os.fspath(clt), SWIFT_64)
+        self.assertIsNone(hook.xcode_refusal(os.fspath(xcode), env, cache=cache),
+                          "a pass is reused for XCODE_PROBE_TTL_S")
+        why = hook.xcode_refusal(os.fspath(xcode), env, cache=cache, ttl=0)
+        self.assertIn(f"xcrun resolves {clt} outside Xcode_26.6", why)
+        self.assertIn("SDK 27.0 is newer than Xcode_26.6's SDK 26.5", why)
+        cache.unlink()
+        self.assertIsNotNone(hook.xcode_refusal(os.fspath(xcode), env, cache=cache))
+        self.assertFalse(cache.exists(), "a refusal is never cached: every look and recheck probes again")
+
+    def test_one_probe_batch_refuses_a_tool_xcrun_cannot_find_or_a_python3_that_does_not_run(self) -> None:
+        xcode = fake_xcode(self.tmp)
+        sdk = os.fspath(xcode / "Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk")
+        cache = self.tmp / "cache.json"
+        env = self.probe_env(sdk, SWIFT_633, unfound=("clang", "ld"))
+        why = hook.xcode_refusal(os.fspath(xcode), env, cache=cache)
+        self.assertIn("xcrun --find clang fails (exit 72: xcrun: error: unable to find utility)", why)
+        self.assertIn("xcrun --find ld fails", why)
+        self.assertNotIn("--find git", why)
+        calls = (self.tmp / "xcrun.calls").read_text().splitlines()
+        self.assertEqual(sorted(c.split()[1] for c in calls if c.startswith("--find")), sorted(hook.CMUX_TOOLS))
+        self.assertEqual(set(hook.CMUX_TOOLS),
+                         {"swift", "swiftc", "clang", "git", "make", "ld", "xcodebuild", "python3"})
+        self.assertFalse(cache.exists())
+        env = self.probe_env(sdk, SWIFT_633, shim_runs=False)
+        why = hook.xcode_refusal(os.fspath(xcode), env, cache=cache)
+        self.assertEqual(why, f"toolchain: {self.tmp / 'shim-python3'} does not run "
+                              "(exit 72: xcode-select: Failed to locate 'python3')")
+        env = self.probe_env(sdk, SWIFT_633)
+        self.assertIsNone(hook.xcode_refusal(os.fspath(xcode), env, cache=cache))
+        self.assertTrue(cache.exists(), "a pass is cached")
+
+    def test_the_probe_is_one_batch_whose_partial_answers_still_count(self) -> None:
+        """The probes run as one shell batch under one deadline. A batch killed at its deadline keeps what it
+        already saw: a definite failure before the hang refuses, and the probes it never reached are no answer."""
+        xcode = fake_xcode(self.tmp)
+        env = self.probe_env(None, SWIFT_633, hang=True, unfound=("git",))
+        with mock.patch.object(hook.subprocess, "run", side_effect=AssertionError("one batch, not serial probes")):
+            start = time.monotonic()
+            facts = hook.xcode_facts(os.fspath(xcode), env, time.monotonic() + 2.0)
+        self.assertLess(time.monotonic() - start, 10)
+        self.assertEqual(facts["sdkPath"], "", "the hung probe is no answer")
+        self.assertIn("xcrun --find git fails (exit 72: xcrun: error: unable to find utility)", facts["broken"])
+        self.assertEqual(facts["xcodeSwift"], "6.3.3")
+
+    def test_a_probe_that_hangs_answers_within_its_budget_and_does_not_refuse(self) -> None:
+        xcode = fake_xcode(self.tmp)
+        env = self.probe_env(None, None, hang=True)
+        start = time.monotonic()
+        self.assertIsNone(hook.xcode_refusal(os.fspath(xcode), env, cache=self.tmp / "cache.json",
+                                             deadline=time.monotonic() + 1.0))
+        self.assertLess(time.monotonic() - start, 10)
+        self.assertFalse((self.tmp / "cache.json").exists(), "no answer is never cached as a pass")
+
+    def test_xcrun_runs_by_absolute_path_so_a_path_without_it_refuses_nothing(self) -> None:
+        """The Xcode probe runs XCRUN (/usr/bin/xcrun), never PATH's: a PATH without xcrun would exit 127 for every
+        `xcrun --find` and refuse a healthy host."""
+        self.assertEqual(hook.XCRUN, "/usr/bin/xcrun")
+        xcode = fake_xcode(self.tmp)
+        sdk = os.fspath(xcode / "Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk")
+        env = self.probe_env(sdk, SWIFT_633)
+        (self.tmp / "bin" / "xcrun").rename(self.tmp / "xcrun")
+        with mock.patch.object(hook, "XCRUN", os.fspath(self.tmp / "xcrun")):
+            facts = hook.xcode_facts(os.fspath(xcode), env, time.monotonic() + 10)
+        self.assertEqual((facts["sdkPath"], facts["swift"], facts["broken"]), (sdk, "6.3.3", []))
+
+    def test_the_batch_leaves_no_temp_file_even_when_killed_at_its_deadline(self) -> None:
+        xcode = fake_xcode(self.tmp)
+        scratch = self.tmp / "scratch"
+        scratch.mkdir()
+        for hang in (False, True):
+            with self.subTest(hang=hang), mock.patch.object(hook.tempfile, "tempdir", os.fspath(scratch)):
+                env = self.probe_env(None if hang else "/x", SWIFT_633, hang=hang)
+                hook.xcode_facts(os.fspath(xcode), env, time.monotonic() + (1.0 if hang else 10))
+                self.assertEqual(list(scratch.iterdir()), [])
+
+    def test_only_a_pass_that_saw_the_sdk_and_both_swifts_is_cached(self) -> None:
+        xcode = fake_xcode(self.tmp)
+        sdk = os.fspath(xcode / "Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk")
+        cache = self.tmp / "cache.json"
+        for name, (sdk_path, swiftc) in {"no sdk path": (None, SWIFT_633), "no xcrun swiftc": (sdk, None)}.items():
+            with self.subTest(name):
+                self.assertIsNone(hook.xcode_refusal(os.fspath(xcode), self.probe_env(sdk_path, swiftc), cache=cache))
+                self.assertFalse(cache.exists())
+        own = xcode / "Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc"
+        own.rename(own.with_name("swiftc.gone"))
+        self.assertIsNone(hook.xcode_refusal(os.fspath(xcode), self.probe_env(sdk, SWIFT_633), cache=cache))
+        self.assertFalse(cache.exists(), "the Xcode's own swiftc did not answer")
+        own.with_name("swiftc.gone").rename(own)
+        self.assertIsNone(hook.xcode_refusal(os.fspath(xcode), self.probe_env(sdk, SWIFT_633), cache=cache))
+        self.assertTrue(cache.exists())
+
+    def test_the_xcode_probe_runs_after_the_receipt_probes_on_its_own_budget(self) -> None:
+        """Slow Xcode probes on a loaded mini must not starve xcodebuild -version or xcrun --show-sdk-version into a
+        '' != want drift refusal: the receipt probes run first on ELIGIBILITY_BUDGET_S, then the Xcode probe on
+        XCODE_PROBE_BUDGET_S. Its refusal still wins over drift, as the clearer reason."""
+        want = {"rustcVersion": "rustc 1.98.1", "cargoVersion": "cargo 1.98.1", "zigVersion": "0.16.0",
+                "xcodeVersion": "26.6", "xcodeBuild": "17F113", "macosSdkVersion": "26.5"}
+        answers = {"rustc": "rustc 1.98.1", "cargo": "cargo 1.98.1", "zig": "0.16.0", "python3": "3.13",
+                   "gh": "gh version 2", "xcodebuild": "Xcode 26.6\nBuild version 17F113", "xcrun": "26.5"}
+        order: list[str] = []
+
+        def probe(argv, env, cwd, deadline):
+            order.append(argv[0])
+            return answers.get(argv[0], "")
+
+        budgets: list[float] = []
+
+        def refusal(xcode_app, env, deadline=None):
+            order.append("xcode_refusal")
+            budgets.append(deadline - time.monotonic())
+            return "toolchain: xcrun resolves /x outside Xcode_26.6"
+
+        with mock.patch.object(hook, "_probe", side_effect=probe), \
+                mock.patch.object(hook, "xcode_refusal", side_effect=refusal):
+            why, _ = hook.toolchain_refusal("m4pro-48", want, self.XCODE, align=False)
+            self.assertEqual(why, "toolchain: xcrun resolves /x outside Xcode_26.6")
+            self.assertEqual(order[-1], "xcode_refusal")
+            self.assertIn("xcodebuild", order)
+            self.assertGreater(budgets[0], hook.XCODE_PROBE_BUDGET_S - 2)
+            answers["xcodebuild"] = ""
+            order.clear()
+            why, _ = hook.toolchain_refusal("m4pro-48", want, self.XCODE, align=False)
+            self.assertEqual(why, "toolchain: xcrun resolves /x outside Xcode_26.6", "the clearer reason wins")
+
+    def test_the_runner_xcode_is_the_job_started_hooks_toolchain_xcode(self) -> None:
+        runner = self.tmp / "actions-runner-glaeda-1"
+        (runner / "glaeda-hooks").mkdir(parents=True)
+        self.assertIsNone(hook.runner_xcode(runner))
+        script = runner / hook.RUNNER_HOOK_SCRIPT
+        script.write_text("#!/bin/bash\nexec /usr/bin/python3 /hook job-started --allowed-owner manaflow-ai "
+                          "--require-eligible --fleet-class m6-16 --toolchain-xcode '/Applications/Xcode 26.app'\n")
+        self.assertEqual(hook.runner_xcode(runner), "/Applications/Xcode 26.app")
+        script.write_text("#!/bin/bash\nexec /usr/bin/python3 /hook job-started --allowed-owner manaflow-ai\n")
+        self.assertIsNone(hook.runner_xcode(runner))
+
+    def test_an_adopted_listener_is_stale_unless_it_was_started_clean(self) -> None:
+        dev = f"{self.XCODE}/Contents/Developer"
+        self.assertIsNone(hook.adopted_env_stale("clean", {"SDKROOT": self.CLT_SDK}, self.XCODE),
+                          "a gate that started it with the clean env says so across the reload")
+        self.assertEqual(hook.adopted_env_stale("SDKROOT was set", {}, self.XCODE), "SDKROOT was set")
+        self.assertIsNone(hook.adopted_env_stale(None, {"DEVELOPER_DIR": dev}, self.XCODE))
+        self.assertIn("SDKROOT=", hook.adopted_env_stale(None, {"SDKROOT": self.CLT_SDK, "DEVELOPER_DIR": dev},
+                                                        self.XCODE))
+        self.assertIn("DEVELOPER_DIR", hook.adopted_env_stale(None, {}, self.XCODE),
+                      "a listener from before the gate pinned DEVELOPER_DIR")
+        self.assertIsNone(hook.adopted_env_stale(None, {}, None))
 
 
 FAKE_LISTENER = """#!/usr/bin/env python3
@@ -4361,6 +4755,43 @@ class GateTest(unittest.TestCase):
             gate.eligible_at -= hook.GATE_ELIGIBLE_EVERY_S
             self.assertIsNone(gate.claimed(), "no --require-eligible: never held for eligibility")
             look.assert_not_called()
+
+    def test_the_listener_starts_without_sdkroot_and_on_the_pool_xcode(self) -> None:
+        """cmux21: the gate ran under the /usr/bin/python3 xcrun shim, which put SDKROOT in its env, and run.sh
+        inherited it, so every job built against the Command Line Tools SDK."""
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("exec /usr/bin/python3 /hook job-started --require-eligible --fleet-class m6-16 "
+                          "--toolchain-xcode /Applications/Xcode_26.6.app --instance 1\n")
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        leaked = {"SDKROOT": "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk", "TOOLCHAINS": "swift"}
+        with mock.patch.dict(os.environ, leaked), mock.patch.object(hook.subprocess, "Popen") as popen:
+            gate.start()
+        env = popen.call_args.kwargs["env"]
+        self.assertNotIn("SDKROOT", env)
+        self.assertNotIn("TOOLCHAINS", env)
+        self.assertEqual(env["DEVELOPER_DIR"], "/Applications/Xcode_26.6.app/Contents/Developer")
+        self.assertEqual(env["PATH"], os.environ["PATH"])
+        self.assertIsNone(gate.stale_env)
+
+    def test_an_adopted_listener_with_a_stale_env_is_restarted_once_idle(self) -> None:
+        """A gate that reloads from a hook before the clean env adopts a listener that still carries SDKROOT: the
+        stale env holds it like an ineligible node (stopped only while idle, by the usual stop), and the gate
+        starts a clean one. A gate that started its listener clean says so across a reload."""
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("exec /usr/bin/python3 /hook job-started --allowed-owner manaflow-ai --instance 1 "
+                          "--toolchain-xcode /Applications/Xcode_26.6.app\n")
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        gate.child = mock.Mock(pid=4242)
+        gate.stale_env = "the runner's environment sets SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
+        self.assertEqual(gate.ineligible(), f"listener env: {gate.stale_env}; restarting it on the pool Xcode's env")
+        gate.child = None
+        self.assertIsNone(gate.ineligible(), "a stopped listener is no longer stale: the next start() is clean")
+        with mock.patch.object(hook.subprocess, "Popen"):
+            gate.start()
+        self.assertIsNone(gate.stale_env)
+        self.assertIsNone(gate.ineligible())
 
     def test_every_runner_holds_while_free_disk_is_under_its_floor(self) -> None:
         script = self.runner / hook.RUNNER_HOOK_SCRIPT
@@ -5432,6 +5863,33 @@ class GateTest(unittest.TestCase):
         script.write_bytes(cr.hook_wrappers(ctx)["listen.sh"])
         script.chmod(0o755)
         return script
+
+    def test_listen_sh_clears_sdkroot_and_pins_the_pool_xcode(self) -> None:
+        text = self.listen_sh(sys.executable).read_text()
+        self.assertIn("unset SDKROOT TOOLCHAINS\n", text)
+        self.assertNotIn("DEVELOPER_DIR", text, "a runner with no pool Xcode keeps the host's")
+        ctx = mock.Mock(python=sys.executable, hook_dir=HOOK.parent, runner_dir=self.runner, org="manaflow-ai",
+                        repo=None, min_free_gib=0, capacity_units=4, labels=["glaeda-mini"], session_runner=False,
+                        member={"hardware": "m6-16", "xcodeApps": ["/Applications/Xcode_26.6.app"]})
+        text = cr.hook_wrappers(ctx)["listen.sh"].decode()
+        self.assertIn("export DEVELOPER_DIR=/Applications/Xcode_26.6.app/Contents/Developer\n", text)
+        self.assertLess(text.index("unset SDKROOT"), text.index("listen --runner-dir"))
+        self.assertLess(text.index("unset SDKROOT"), text.index("exec ./run.sh"), "the fallback run.sh is clean too")
+
+    def test_hooks_prefer_a_python_that_is_not_the_xcrun_shim(self) -> None:
+        # a stand-in shim, so the test means the same on a Mac (where /usr/bin/python3 is the shim) and on Linux CI
+        brew, shim = self.tmp / "brew-python3", self.tmp / "shim-python3"
+        make_executable(brew, "#!/bin/sh\n")
+        make_executable(shim, "#!/bin/sh\n")
+        with mock.patch.object(cr, "XCRUN_SHIM_PYTHON", os.path.realpath(shim)):
+            with mock.patch.object(cr.shutil, "which", return_value=os.fspath(shim)), \
+                    mock.patch.object(cr, "HOOK_PYTHONS", (os.fspath(brew), os.fspath(shim))):
+                self.assertEqual(cr.hook_python(), os.fspath(brew))
+            with mock.patch.object(cr.shutil, "which", return_value="/opt/custom/bin/python3"):
+                self.assertEqual(cr.hook_python(), "/opt/custom/bin/python3", "a python3 on PATH that is not the shim")
+            with mock.patch.object(cr.shutil, "which", return_value=None), \
+                    mock.patch.object(cr, "HOOK_PYTHONS", ("/nonexistent/python3", os.fspath(shim))):
+                self.assertEqual(cr.hook_python(), os.path.realpath(shim), "the shim only when nothing else runs")
 
     def test_listen_sh_runs_the_runner_without_a_gate_that_cannot_start(self) -> None:
         (self.runner / "run.sh").write_text(f"#!/bin/bash\necho plain run.sh > {self.tmp / 'ran'}\nexit 0\n")

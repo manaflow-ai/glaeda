@@ -127,6 +127,44 @@ What `--apply` does:
      rustup change). The check takes about a second and runs
      on every job, so a mini that drifts or loses eligibility stops taking PR jobs at
      once, and refusal recovery re-runs the job elsewhere.
+   - Jobs build with the pool Xcode (`--toolchain-xcode`), never past it. On cmux21
+     (macOS 27, 2026-10-21) Command Line Tools 27 made `xcrun --show-sdk-path` answer
+     `/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk` (Swift 6.4) even with
+     `xcode-select` and `DEVELOPER_DIR` on Xcode_26.6, and the gate, started through the
+     `/usr/bin/python3` xcrun shim, passed the shim's `SDKROOT` to `Runner.Listener` and so
+     to every job: cmux-next's fast tier failed "this SDK is not supported by the
+     compiler", and once the CLT were moved aside the job-started hook itself could not
+     start until the runners restarted. So:
+     - `listen.sh` runs `unset SDKROOT TOOLCHAINS` and exports
+       `DEVELOPER_DIR=<pool Xcode>/Contents/Developer`; the gate scrubs its own
+       environment the same way and starts `run.sh` with it (`listener_env`). A listener a
+       reloaded gate adopts from an older gate with another environment is stopped once
+       idle and started clean. The hooks run under a python3 that is not the shim
+       (`glaeda-cmux-runner` prefers PATH's python3, then Homebrew's; the shim last).
+     - job-started refuses when the runner's environment still sets `TOOLCHAINS` or an
+       `SDKROOT` outside the pool Xcode, and pins an admitted job's later steps to
+       `DEVELOPER_DIR` through `$GITHUB_ENV` when the runner's environment does not.
+     - With `--require-eligible`, job-started (and the gate's eligibility look, which then
+       holds the listener off) runs `xcrun --show-sdk-path` and `xcrun swiftc --version` in
+       that clean environment and refuses with `toolchain: xcrun resolves <path> outside
+       Xcode_26.6; ...` when the SDK is not inside the Xcode's `MacOSX.platform`, when the
+       Swift version differs from the Xcode's own `XcodeDefault.xctoolchain` swiftc, or when
+       the SDK's `SDKSettings` major is newer than the Xcode's. It also refuses when `xcrun
+       --find` fails for a tool cmux jobs use (swift, swiftc, clang, git, make, ld,
+       xcodebuild, python3), or when `python3 -c 'import sys'` fails for PATH's python3 or
+       the `/usr/bin/python3` shim: on cmux21, once the CLT were moved aside, a stale
+       `SDKROOT` made the shim exit 72 ("xcode-select: Failed to locate 'python3'") and
+       app-compile, fast-tier and web-bundles failed as infra. The probes run after the
+       receipt probes (which keep their 20 s), as one shell batch in its own process group
+       under its own 15 s deadline, killed whole at the deadline;
+       a probe that did not finish, or printed nothing, is no answer and refuses nothing,
+       so a loaded mini never leaves the fleet for it (the exact receipt check still
+       compares `xcrun --show-sdk-version`). A pass that saw the SDK path and both Swift
+       versions is cached for 10 minutes in
+       `~/.local/state/glaeda/cmux-runner/xcode-probe.json`; a refusal or a partial answer
+       never is. An `SDKROOT` that is an SDK name (`macosx`) is not a leak; only a path is.
+     - glaeda-mini-health reports the same mismatch as `toolchain_mismatch` (error, root's
+       fix: move `/Library/Developer/CommandLineTools` aside), so ci-dash alerts.
    - With weighted capacity (`--capacity-units N`, baked in from the manifest class for
      every member, see 2d), the job takes a share of the mini instead of the whole host
      lock. It holds a shared `flock` on `host.lock` (so `with-host-lock`'s `LOCK_EX`,
@@ -1282,6 +1320,7 @@ runners) looks for what stopped runner minis on 2026-09-25 and 26 without anythi
 | `runner_stopped:<agent>`: a runner LaunchAgent loaded but not running, two runs in a row | `launchctl kickstart` (nothing runs in it, so no job is cut) |
 | `runner_unloaded:<agent>` (not one `cmux_mini_fix.sh` holds) | none: `glaeda-cmux-runner-fleet --apply` |
 | `node_ineligible`: the runner hook's eligibility check, for the fleet class its job-started hook requires, refuses (for example the class receipt's staged generation is gone) | none: restage the generation or re-enroll ([enrollment](CMUX_FLEET_ENROLLMENT.md)) |
+| `toolchain_mismatch`: in the env the runner gives its jobs, xcrun resolves an SDK outside the job-started hook's `--toolchain-xcode`, a swiftc of another Swift than that Xcode's, a newer-major SDK, a cmux tool `xcrun --find` cannot find, or a python3 (PATH's or the `/usr/bin/python3` shim) that does not start (Command Line Tools past the pool Xcode, cmux21 2026-10-21) | none: root moves `/Library/Developer/CommandLineTools` aside or `xcode-select -s` the pool Xcode; the next look admits the host |
 
 A heal runs at most every 10 minutes and 3 times a day per finding (a heal that worked but did not last counts),
 then the finding reads `impossible`. The report,

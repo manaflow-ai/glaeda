@@ -70,6 +70,14 @@ Each run checks, as the runner user and without sudo:
                                      (--require-eligible --fleet-class), names a reason, so job-started refuses every
                                      job here (a missing staged generation, a receipt that does not validate, a node
                                      that is not eligible). Restaging or re-enrolling is an operator's: reported only.
+  toolchain_mismatch                 xcrun, in the env the runner gives its jobs (no SDKROOT or TOOLCHAINS,
+                                     DEVELOPER_DIR on the job-started hook's --toolchain-xcode), resolves an SDK
+                                     outside that Xcode, a swiftc of another Swift version than its toolchain's, an
+                                     SDK of a newer major than its own, a cmux tool `xcrun --find` cannot find, or a
+                                     python3 (PATH's, the /usr/bin/python3 shim) that does not start (the runner
+                                     hook's xcode_refusal): cmux21,
+                                     2026-10-21, Command Line Tools 27 on macOS 27 past Xcode_26.6. job-started refuses
+                                     every job and the gate holds the listener off. Root's: reported only.
   ota_not_converging                 glaeda-update's converge.json (its step 8) says this host does not run the release
                                      its ring wants, by installed tool and runner hook digests, past the alertAfter
                                      time it wrote: "running X, wants Y, because Z". glaeda-update keeps retrying with
@@ -464,6 +472,29 @@ class Mini:
             return None
         try:
             return refusal(argv[argv.index("--fleet-class") + 1])[0]
+        except Exception:  # noqa: BLE001  (a hook that cannot answer is no finding)
+            return None
+
+    def toolchain_mismatch(self) -> str | None:
+        """Why xcrun on this host, in the env the runner gives its jobs, does not build with the runner's pool Xcode
+        (the runner hook's xcode_refusal for its job-started hook's --toolchain-xcode), or None when it does, the
+        runner names no pool Xcode, or the hook cannot answer."""
+        dirs = self.runner_dirs()
+        try:
+            text = (dirs[0] / "glaeda-hooks" / "job-started.sh").read_text(encoding="utf-8")
+            argv = shlex.split(next(line for line in text.splitlines() if line.startswith("exec ")))
+        except (IndexError, StopIteration, OSError, ValueError):
+            return None
+        if "--toolchain-xcode" not in argv[:-1]:
+            return None
+        xcode = argv[argv.index("--toolchain-xcode") + 1]
+        hook = self.hook()
+        refusal = getattr(hook, "xcode_refusal", None) if hook is not None else None
+        clean = getattr(hook, "listener_env", None) if hook is not None else None
+        if refusal is None or clean is None:
+            return None
+        try:
+            return refusal(xcode, clean(os.environ, xcode))
         except Exception:  # noqa: BLE001  (a hook that cannot answer is no finding)
             return None
 
@@ -951,6 +982,16 @@ def check_node_eligibility(mini: Mini) -> list[dict[str, Any]]:
     return [finding("node_ineligible", "error", why, "impossible",
                     "job-started refuses every job here; restage the class receipt's generation or re-enroll "
                     "(docs/CMUX_FLEET_ENROLLMENT.md)")]
+
+
+def check_toolchain(mini: Mini) -> list[dict[str, Any]]:
+    why = mini.toolchain_mismatch()
+    if not why:
+        return []
+    return [finding("toolchain_mismatch", "error", why, "impossible",
+                    "job-started refuses every job and the gate holds the listener off; root: move "
+                    "/Library/Developer/CommandLineTools aside (or xcode-select -s the pool Xcode), then the next "
+                    "look admits the host")]
 
 
 def utc(stamp: Any) -> float | None:
@@ -1540,7 +1581,8 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
         # keeps that probe nor reroutes on it until the tunnel is back (tailscale_no_route's restart may fix it)
         tunnel_down = any(f["code"] in TUNNEL_DOWN for f in tailnet)
         found = (check_console(mini) + check_power(mini) + tailnet + check_runners(mini)
-                 + check_node_eligibility(mini) + check_leaked_test_apps(mini) + check_disk_accounting(mini)
+                 + check_node_eligibility(mini) + check_toolchain(mini) + check_leaked_test_apps(mini)
+                 + check_disk_accounting(mini)
                  + check_daemon_heal(mini) + check_ota(mini, now)
                  + check_claude_route(mini, now, apply and not tunnel_down, tunnel_down))
         if apply and mini.tailnet_route_ok:

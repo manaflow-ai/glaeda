@@ -261,6 +261,25 @@ def which(name: str, extra: tuple[str, ...] = ()) -> str | None:
     return None
 
 
+# The hooks' interpreter, best first. /usr/bin/python3 is the xcrun shim: it runs Xcode's (or the Command Line Tools')
+# python with SDKROOT exported into its environment, which the gate once passed to every job (cmux21, 2026-10-21), and
+# it fails outright when that SDK is gone. A fleet member's job PATH has Homebrew's python3 anyway (the hook's
+# MIN_WORKLOAD_PYTHON), so the shim is the last resort.
+HOOK_PYTHONS = ("/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3")
+XCRUN_SHIM_PYTHON = "/usr/bin/python3"
+
+
+def hook_python() -> str | None:
+    """python3 on PATH unless it is the xcrun shim, else the first HOOK_PYTHONS that runs, the shim last."""
+    found = shutil.which("python3")
+    if found and os.path.realpath(found) != XCRUN_SHIM_PYTHON:
+        return found
+    for candidate in HOOK_PYTHONS:
+        if os.access(candidate, os.X_OK) and os.path.realpath(candidate) != XCRUN_SHIM_PYTHON:
+            return candidate
+    return XCRUN_SHIM_PYTHON if os.access(XCRUN_SHIM_PYTHON, os.X_OK) else found
+
+
 def write_atomic(path: Path, data: bytes, mode: int, make_parent: bool = True) -> None:
     """Write and sync a unique stage beside path, then rename it over path: a reader, or a crash, sees the old
     file or the whole new one. --refresh-hooks passes make_parent=False: it never recreates a removed runner."""
@@ -339,7 +358,7 @@ class Context:
         self.gh = args.gh or which("gh", ("/opt/homebrew/bin/gh", "/usr/local/bin/gh"))
         self.gh_state = "missing" if self.gh is None else "logged in"
         self.xcode_app = args.xcode_app
-        self.python = args.python or which("python3", ("/opt/homebrew/bin/python3", "/usr/bin/python3"))
+        self.python = args.python or hook_python()
         self.agents = self.home / "Library/LaunchAgents"
         self.logs = self.home / "Library/Logs"
         self.state = self.home / ".local/state/glaeda/cmux-runner"
@@ -758,6 +777,12 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
               + [SESSION_FIT_UNITS] * (getattr(ctx, "session_runner", False) is True), default=0)
     if ctx.capacity_units and fit:
         gate += f" --fit-units {fit}"
+    # The runner and every job it runs build with the pool Xcode: no SDKROOT or TOOLCHAINS to send xcrun past it
+    # (the hook's listener_env does the same for the run.sh the gate starts).
+    xcode_apps = (ctx.member or {}).get("xcodeApps") or []
+    toolchain_env = "unset SDKROOT TOOLCHAINS\n" + (
+        f"export DEVELOPER_DIR={shlex.quote(os.fspath(Path(xcode_apps[0]) / 'Contents/Developer'))}\n"
+        if xcode_apps else "")
     listen = (
         "#!/bin/bash\n"
         "# glaeda-cmux-runner listener gate (generated, receipt-owned): the runner LaunchAgent's program. The\n"
@@ -765,6 +790,7 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         "# run, the runner runs without it, as it did before the gate. bash, like run.sh, stays the job's main\n"
         "# program for macOS privacy grants.\n"
         f"cd {shlex.quote(os.fspath(ctx.runner_dir))} || exit 1\n"
+        + toolchain_env +
         f"{gate} &\n"
         "gate=$!\n"
         "stopping=\n"
@@ -2058,7 +2084,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--token-stdin", action="store_true",
                    help="with --apply, read the registration (or, with --uninstall, removal) token from stdin; "
                         "without --apply, plan that path")
-    p.add_argument("--python", help="interpreter the job hooks run (default: python3 on PATH)")
+    p.add_argument("--python", help="interpreter the job hooks run (default: python3 on PATH unless it is the "
+                   "/usr/bin/python3 xcrun shim, else Homebrew's; HOOK_PYTHONS)")
     p.add_argument("--xcode-app", help="check the Xcode that routed jobs select (the value of the repo's "
                    "CMUX_CI_XCODE_APP_PR variable, such as /Applications/Xcode_26.6.app); a warning, never a block")
     p.add_argument("--skip-launchctl", action="store_true", help="write the plist but do not load or unload it")
