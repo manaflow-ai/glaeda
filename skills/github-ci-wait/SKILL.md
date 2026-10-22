@@ -36,6 +36,21 @@ glaeda-gh budget                                 # REST and GraphQL left, the da
   PR conflicts with its base, 64 on bad arguments.
 - Run one background `wait` per PR, run or comment (Bash `run_in_background`), not one wait
   looping over several: each then notifies you on its own when it exits, and you carry on meanwhile.
+- Every `wait` prints one line on **stderr** before it blocks, naming what it is waiting for, its
+  deadline as a wall-clock time, and, with `--sha`, the commit it is pinned to. Read it one way
+  only: the line in your capture says that wait reached the point of blocking. Its absence says
+  nothing — the wait may have been reaped, or stderr may have been a stream the line was dropped
+  on rather than becoming the wait's own failure (a closed fd, a pipe with no reader, a full pipe).
+  To tell a live wait from a gone one, look for the process: `pgrep -af "glaeda-gh wait"`.
+  A `wait` launched from a session's foreground shell is reaped with that shell, silently; a bare
+  `&` from inside a tool call is what gets reaped — use the harness's background mode, or
+  `setsid nohup … </dev/null &`.
+  **Capture stderr or the line tells you nothing.** With `wait … > file` it goes to the terminal
+  and the file is empty while blocked. Keep the streams apart if you parse the result:
+  `… --json > wait.json 2> wait.err`, and read `wait.err` for the line. `2>&1` works too, but then
+  the capture is no longer one JSON document. The daemon-down, failing-daemon and hung-daemon
+  notices go to the same place, so `2>&-` loses them too — and loses nothing else: they never
+  appear in `--json` stdout.
 - Exit 1 is a red, not a merge verdict. Where the repo's merge bar excuses base reds (cmux
   `feat-cmux-next`), compare the failed check with the base before holding the PR.
 - The summary names what failed and the failed step, e.g.
