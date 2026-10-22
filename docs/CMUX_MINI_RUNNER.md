@@ -270,14 +270,40 @@ What `--apply` does:
        a costlier side lane (cmux's release-build, reload-build, cmux-tui) that finds
        fewer units than it needs waits for them instead of refusing, as does a root
        runner that lost a race for its units.
-     - Every runner stops while a job already admitted to this mini waits for units
-       (`admit.want-<pid>`), a root runner also while one waits for a canonical root or
+     - Every runner but the gui runner (its reserve, below) stops while a job already
+       admitted to this mini waits for units (`admit.want-<pid>`), a root runner also while one waits for a canonical root or
        persistent-dd, and a gui runner while one waits for the gui token or a root. That
        job goes first, so a job taken now would only queue behind it.
      - A gui runner (`--gui-runner`, below) stops while the gui token is taken, every
        canonical root is taken, or every unit is. Only it carries the gui pool label, so
        holding it keeps no compile off the mini, and GitHub hands the GUI job to another
        mini's gui runner instead.
+     - **The gui runner's reserve.** While the gui runner has no job and nothing but
+       units holds it (not the fleet, heat, memory pressure, a locked console, the gui
+       token or the canonical roots), its gate holds an flock on
+       `capacity/<gui token>.reserve`. Every other admission (runner jobs, ci-step
+       `admit` and `fits`) and every other runner's gate then leaves one unit free
+       (`GUI_RESERVE_UNITS`): a root runner listens with 6 units free instead of 5, a
+       session runner with 7 instead of 6. The gui runner's own job takes the unit: one
+       that fits in the reserve goes ahead of a side job waiting here for units, which
+       could not have taken that unit, and a job waiting for units is no reason to hold
+       the gui runner. The gate keeps the reserve through its new job's admission (until
+       the job's holder runs) and then lets it go, so the other lanes get the unit back
+       while the job runs. A costlier gui-label job (cmux-next's `swift-test`, isolated at
+       4) waits its turn for its 4 units like any job, the reserved one out of other
+       lanes' reach meanwhile; what helps it most is that its runner now listens through
+       CPU saturation and through other lanes' waiters, so it queues on a mini, ahead of
+       later jobs, instead of in GitHub's queue. A reserve never makes a job unfittable
+       (one that needs the whole mini ignores it, and the fast tier, which takes no unit,
+       keeps none), and a flock dies with its gate, so a mini with no gui runner, or a
+       stopped one, keeps nothing. Before it, side and root jobs filled every unit on the
+       minis and the gui runners sat held as full: on 2026-10-21 about 6 of 13 gui
+       runners listened and gui-label jobs queued 1.5 to 3 h.
+     - The gui runner is never held for CPU saturation (85% busy), only for memory
+       pressure: its jobs come one per mini and are admitted by units like any other,
+       and the CPU mark held it whenever the other lanes kept the mini busy. Nothing
+       local says whether gui jobs are queued, and the gate polls no GitHub API, so the
+       exemption is unconditional.
      - A session runner (`--session-runner`, `guiRunners` above 1) carries only the session
        pool label and stops only while fewer than 6 units are free (`--fit-units 6`, the
        costliest of its jobs: generated files and action exports), a job here waits for units, or the console is locked. Its jobs (cmux-next daemon tests, generated files, action exports,

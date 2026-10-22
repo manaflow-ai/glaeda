@@ -78,11 +78,14 @@ eligibility (Gate.ineligible: the node status or the class receipt's toolchain, 
 every GATE_ELIGIBLE_EVERY_S; a new refusal holds once a recheck agrees, and a held answer survives a hook reload),
 so its label's jobs go to an eligible runner, or wait in GitHub's queue when none is, instead of failing in "Set up
 job". A gui runner also stops listening while the console session is locked or nobody is logged in there
-(console_refusal). A fast runner (--fast-runner) runs cmux-next's fast-tier on the fast tokens (FAST_TOKENS)
-instead of the shared units, and its gate looks at those tokens, never at the units. Every runner also stops listening while free disk is under its job-started hook's --min-free-gib,
+(console_refusal). A gui runner is never held for CPU saturation, only memory pressure (Gate.saturated), and while it
+is idle its gate holds the gui runner's reserve (GUI_RESERVE: capacity/<gui token>.reserve): every other job on the
+mini, and every other runner's gate, leaves one unit free for its next job, so the side and root lanes cannot fill
+the mini and keep the gui label queued. A fast runner (--fast-runner) runs cmux-next's fast-tier on the fast tokens
+(FAST_TOKENS) instead of the shared units, and its gate looks at those tokens, never at the units. Every runner also stops listening while free disk is under its job-started hook's --min-free-gib,
 and starts the same eviction in the background, listening again once it made room (Gate.low_disk). Full means every
-unit this runner's own --capacity-units scans, read from its job-started hook; for a root runner it also means the
-mini cannot admit a compile or an app-host shard (mini_full).
+unit this runner's own --capacity-units scans, read from its job-started hook, is taken or kept for an idle gui
+runner's reserve; for a root runner it also means the mini cannot admit a compile or an app-host shard (mini_full).
 """
 
 from __future__ import annotations
@@ -322,6 +325,41 @@ ADMIT_WANT = "admit.want-"
 # a preempted fleet build, lsof and ps timeouts), so a marker counts until it is this old or its pid is gone.
 ADMIT_FRESH_S = 180.0
 HOLDERS_BUDGET_S = 10.0  # token_holders stops looking after this long: the log line is not worth more
+# The gui runner's reserve: one unit per gui runner that no other job takes while that runner is idle. Side and root
+# jobs (compiles, daemon tests, fast-tier off the fast runner, isolated builds: 3 to 6 units each) filled every unit
+# on a mini, so its one gui runner's gate held the listener off as full, and the gui label's jobs (app-host shards,
+# cmux-next's swift test) queued 1.5 to 3 h with 13 gui runners online (2026-10-21 ~23:00Z: about 6 listening). The
+# gui runner's listener gate holds an flock on capacity/<gui token>.reserve while its runner has no job and nothing
+# but capacity holds it off (Gate.reserve); every other admission (take_capacity, ci-step admit and fits) and every
+# other runner's gate (mini_full) then leaves GUI_RESERVE_UNITS units free, and the gui runner's own job takes them.
+# A flock dies with its gate, so a mini without a gui runner, or with a stopped one, reserves nothing, and no host
+# list or flag says which minis have one. A reserve never makes a job unfittable: one that needs the whole mini
+# ignores it (reserve_for).
+GUI_RESERVE = ".reserve"
+GUI_RESERVE_UNITS = 1
+UNITS_FULL = "capacity units on this mini"  # in mini_full's answers that are about units (Gate.reserves)
+
+
+def gui_reserved(capacity_dir: Path, own_token: str | None = None) -> int:
+    """The units this mini keeps for idle gui runners: GUI_RESERVE_UNITS for each <gui token>.reserve an idle gui
+    runner's gate holds, except own_token's (a gui runner's own job takes its own reserve). Never raises: an
+    unreadable ledger reserves nothing."""
+    try:
+        paths = sorted(capacity_dir.glob(f"*{GUI_RESERVE}"))
+    except OSError:
+        return 0
+    own = f"{own_token}{GUI_RESERVE}" if own_token is not None else None
+    return sum(GUI_RESERVE_UNITS for path in paths if path.name != own and not probe(path))
+
+
+def reserve_for(reserved: int, units: int, total: int) -> int:
+    """The reserved units a job of `units` must leave free on a mini of `total`: at most what is left beside it, and
+    none for a job that takes no unit (the fast runner's fast-tier listens and admits with every unit taken)."""
+    return max(0, min(reserved, total - units)) if units > 0 else 0
+
+
+def kept_note(kept: int) -> str:
+    return f" and {kept} {'is' if kept == 1 else 'are'} kept for the gui runner" if kept else ""
 
 
 def is_guest(repo: str | None, home_repo: str = DEFAULT_HOME_REPO) -> bool:
@@ -2069,9 +2107,11 @@ def yield_idle_warm(capacity_dir: Path, name: str = WARM_HOLDER) -> str:
         return ""
 
 
-def holder_file(state_dir: Path) -> Path:
-    """One pid file per runner (RUNNER_NAME comes from the runner, not the job)."""
-    name = "".join(c for c in os.environ.get("RUNNER_NAME", "") if c.isalnum() or c in "-_.")
+def holder_file(state_dir: Path, runner: str | None = None) -> Path:
+    """One pid file per runner (RUNNER_NAME comes from the runner, not the job; the listener gate, which has none,
+    passes its runner's name)."""
+    name = "".join(c for c in (os.environ.get("RUNNER_NAME", "") if runner is None else runner)
+                   if c.isalnum() or c in "-_.")
     return state_dir / (f"{HOLDER_FILE}-{name}.pid" if name else f"{HOLDER_FILE}.pid")
 
 
@@ -2453,7 +2493,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                   instance: int = 0, workflow: str = "", warm_keys: tuple[str, ...] = (),
                   owned_state_dir: str = "", taken_out: dict[str, Any] | None = None,
                   warm_target: tuple[Any, ...] = ("", None, 0), klass: str | None = None,
-                  one_holder: bool = False, since: float | None = None, gui_token: str = "gui") -> tuple[bool, str]:
+                  one_holder: bool = False, since: float | None = None, gui_token: str = "gui",
+                  gui_runner: bool = False) -> tuple[bool, str]:
     """Weighted admission for one of several runners on this mini, without ever waiting on a job.
     When held, taken_out (if given) receives the units and tokens taken, for the job log; on a capacity refusal it
     receives "wants", the kinds a waiter marker names (CAPACITY_WAIT): the token kind or "units" it lacks, else
@@ -2462,6 +2503,11 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
     needs a kind it needs (fair_turn); None is a newcomer. klass, when given,
     is the class itself (a ci-step names it, step_admit) instead of one looked up from the job id. one_holder
     refuses, under admission.lock, when this holder file's holder is still alive (a ci-step key admits once).
+    Every job but the gui runner's own (gui_runner: job-started --gui-runner) leaves the units idle gui runners
+    reserve free (gui_reserved, GUI_RESERVE). The gui runner's job takes them, and one that fits in the reserve its
+    gate holds never queues behind another lane's job waiting for units: that job could not have taken the
+    reserved unit. A costlier one waits its turn (fair_turn) like any job; its gate keeps the reserve until it is
+    admitted (Gate.admitted), so the reserved unit stays out of other lanes' reach meanwhile.
     One detached holder keeps, for the whole job: a shared lock on the fleet host lock (with-host-lock
     takes it exclusively, so the build worker and our jobs exclude each other), `units` unit files and
     the job class's tokens. Everything is a flock, so a holder that dies releases all of it."""
@@ -2501,7 +2547,11 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
             return False, f"{job or 'this job'} is already admitted"
         if taken_out is not None:
             taken_out["wants"] = list(tokens)
-        behind = fair_turn(capacity_dir, {*tokens, *(("units",) if units else ())},
+        # the gui runner's job that fits in the reserve its gate holds takes the reserved unit, which no waiter here
+        # could take
+        in_reserve = (gui_runner and 0 < units <= GUI_RESERVE_UNITS
+                      and not probe(capacity_dir / f"{gui_token}{GUI_RESERVE}"))
+        behind = fair_turn(capacity_dir, {*tokens, *(("units",) if units and not in_reserve else ())},
                            time.time() if since is None else since)
         if behind:
             return False, behind
@@ -2578,20 +2628,28 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                 if taken_out is not None:
                     taken_out["wants"] = [token]
                 return False, f"capacity: {held} ({job or 'unknown job'} is {klass})"
-        got = 0
+        # every job but the gui runner's own leaves the idle gui runners' reserve free (GUI_RESERVE)
+        kept = reserve_for(gui_reserved(capacity_dir, gui_token if gui_runner else None), units, total)
+        got = spare = 0
         unit_fds: list[int] = []
         for slot in range(total):
-            if got == units:
+            if got == units and spare >= kept:
                 break
             fd = lock_file(capacity_dir / f"unit-{slot}", fcntl.LOCK_EX)
-            if fd is not None:
+            if fd is None:
+                continue
+            if got < units:
                 fds.append(fd)
                 unit_fds.append(fd)
                 got += 1
-        if got < units:
+            else:  # free beside this job's units: one the reserve keeps (under admission.lock, so it stays free)
+                os.close(fd)
+                spare += 1
+        if got < units or spare < kept:
             if taken_out is not None:
                 taken_out["wants"] = ["units"]
-            return False, (f"capacity: {got} of {total} units free, {job or 'an unknown job'} ({klass}) needs {units}")
+            return False, (f"capacity: {got + spare} of {total} units free, {job or 'an unknown job'} ({klass}) "
+                           f"needs {units}{kept_note(kept)}")
         root = next((name for name in taken if name.startswith("root-")), None)
         split = named[root] if root and klass in ROOT_SWITCHERS else None
         if split is not None:  # its own holder (ROOT_SWITCHERS); the main holder must not inherit it
@@ -2795,7 +2853,8 @@ def step_fits(capacity_dir: Path, total: int, compile_slots: int, roots: int, ho
     would hand back), and under
     admission.lock, held without waiting so no admission meets a unit the probe holds, enough unit files and one
     free copy of each token are free (an idle catch-up's locks count as free: it yields them to the next job), and
-    no job admitted here waits for units or one of those tokens (CAPACITY_WAIT: it goes first)."""
+    no job admitted here waits for units or one of those tokens (CAPACITY_WAIT: it goes first). The units an idle gui
+    runner reserves (GUI_RESERVE) are not free to a step."""
     if total <= 0 or host_held(host_lock, reservation, now, state_dir) or host_waiters(host_lock, state_dir):
         return []
     try:
@@ -2819,11 +2878,13 @@ def step_fits(capacity_dir: Path, total: int, compile_slots: int, roots: int, ho
             return name in yielding or probe(capacity_dir / name)
 
         units = sum(1 for slot in range(total) if free(f"unit-{slot}"))
+        reserved = gui_reserved(capacity_dir)  # a step is never the gui runner's job: it leaves the reserve free
         waited = {kind for waiter in admission_waiters(capacity_dir) for kind in waiter["wants"]}
         fits = []
         for klass in STEP_CLASSES:
             need, tokens = CLASS_COST[klass]
-            if units < min(need, total) or waited & {*tokens, "units"}:  # a waiting job goes first (fair_turn)
+            need = min(need, total)
+            if units < need + reserve_for(reserved, need, total) or waited & {*tokens, "units"}:  # fair_turn
                 continue
             copies = {"persistent-dd": max(1, compile_slots), "root": max(1, roots)}
             if all(any(free((f"root-{c + 1}" if token == "root" else token if c == 0 else f"{token}-{c}")
@@ -3045,7 +3106,14 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
 
     With the scope of a fast runner (scope.fast, the fast pool label: cmux-next's fast-tier), full means only that a
     fast token is taken or a job here waits for one: its job takes the fast tokens and none of the shared units,
-    so a mini whose units the side lane fills still takes it. Every other scope ignores the fast tokens."""
+    so a mini whose units the side lane fills still takes it. Every other scope ignores the fast tokens.
+
+    The gui runner's reserve (GUI_RESERVE): while an idle gui runner's gate holds it, every other scope counts
+    GUI_RESERVE_UNITS fewer units free (but never so many that its next job could not fit the mini at all), so a
+    root, side or session runner that would take the gui runner's unit stops listening first. The gui runner counts
+    its reserve as its own, and a job waiting here for units is no reason to hold it: a job that fits in the
+    reserve takes the reserved unit, which that waiter could not have taken, and a costlier one waits its turn
+    here instead of in GitHub's queue (take_capacity)."""
     if capacity_dir is None or total <= 0:
         return None
     try:
@@ -3076,21 +3144,26 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
         # fit_units: a side runner whose label brings costlier jobs (listen --fit-units: glaeda-ios-sim's isolated
         # builds, a session runner's jobs)
         need = min(max(ROOT_FIT_UNITS if root else 1, fit_units), total)
+        gui = scope is not None and scope.gui
+        # every runner but the gui runner leaves the idle gui runners' reserve free (GUI_RESERVE); the gui runner's
+        # own reserve is its next job's
+        kept = reserve_for(gui_reserved(capacity_dir, scope.gui_token if gui else None), need, total)
         free = 0
         for slot in range(total):
             if not open_to_jobs(f"unit-{slot}", capacity_dir / f"unit-{slot}"):
                 continue
             free += 1
-            if free >= need:
+            if free >= need + kept:
                 break
         if free == 0:
-            return f"all {total} capacity units on this mini are taken"
-        if free < need:
-            return (f"only {free} of {total} capacity units on this mini are free; "
-                    f"{'a compile' if root else 'its next job'} needs {need}")
-        # a job already here waits for what this runner's next job would take (CAPACITY_WAIT): it goes first
-        compete = {"units"} | ({"root", "persistent-dd"} if root else set()) | (
-            {scope.gui_token, "root"} if scope is not None and scope.gui else set())
+            return f"all {total} {UNITS_FULL} are taken"
+        if free < need + kept:
+            return (f"only {free} of {total} {UNITS_FULL} are free; "
+                    f"{'a compile' if root else 'its next job'} needs {need}{kept_note(kept)}")
+        # a job already here waits for what this runner's next job would take (CAPACITY_WAIT): it goes first. Not
+        # for units on the gui runner: its next job takes the reserved unit, which the waiter could not have taken
+        compete = ({"units"} if not gui else set()) | ({"root", "persistent-dd"} if root else set()) | (
+            {scope.gui_token, "root"} if gui else set())
         for waiter in admission_waiters(capacity_dir):
             shared = compete & set(waiter["wants"])
             if shared:
@@ -3430,6 +3503,7 @@ class Gate:
         self.listening_since: float | None = None  # when start() last started run.sh (GATE_FIRST_POLL_S)
         self.first_poll_noted = False
         self.swept_at = time.monotonic() - GATE_SWEEP_S + GATE_POLL_S  # first sweep on the second poll
+        self.reserve_fd: int | None = None  # a gui runner's capacity/<gui token>.reserve flock while it is idle
 
     def reload(self) -> None:
         """An --apply replaced this hook: re-exec the new one in place, keeping run.sh as our child, so a gate
@@ -3506,9 +3580,18 @@ class Gate:
         return why
 
     def saturated(self) -> str | None:
-        """Use sampled host CPU and VM pressure with hysteresis; unreadable probes never hold a listener."""
+        """Use sampled host CPU and VM pressure with hysteresis; unreadable probes never hold a listener.
+
+        The gui runner is held for memory pressure only. Its label brings the console jobs (app-host shards, lag,
+        cmux-next's swift test), one at a time per mini, and their units are admitted like any other job's; the
+        CPU mark held it whenever the side and root lanes kept the mini busy, which they did for hours
+        (2026-10-21: about 6 of 13 gui runners listening, gui-label jobs queued 1.5 to 3 h). Nothing local says
+        whether gui jobs are queued (the gate reads no GitHub API), so the exemption is unconditional."""
         now = time.monotonic()
-        if now - self.cpu_at >= GATE_CPU_EVERY_S:
+        gui = runner_scope(self.runner_dir).gui
+        if gui:
+            self.cpu_busy = None
+        elif now - self.cpu_at >= GATE_CPU_EVERY_S:
             _, self.cpu_busy = host_io()
             self.cpu_at = now
         if now - self.memory_at >= GATE_CPU_EVERY_S:
@@ -3707,6 +3790,44 @@ class Gate:
         self.full_why = why
         return why
 
+    def reserve(self, want: bool) -> None:
+        """Hold or let go of this gui runner's reserve (GUI_RESERVE: capacity/<gui token>.reserve), which keeps
+        GUI_RESERVE_UNITS units from every other job and runner on the mini. step() holds it while the runner is
+        idle and reserves() agrees, keeps it through a new job's admission, and lets it go once that job is
+        admitted (admitted()). Only a gui runner with a capacity ledger reserves. The flock is the gate's own fd (not inherited by run.sh, closed by a reload's exec, which
+        takes it again on its next poll), so a gate that dies reserves nothing. Never raises: a reserve it cannot
+        take is tried again on the next poll."""
+        if want and self.reserve_fd is None:
+            scope = runner_scope(self.runner_dir)
+            if not scope.gui or scope.units <= 0 or self.capacity_dir is None or not self.capacity_dir.is_dir():
+                return
+            with contextlib.suppress(OSError):
+                self.reserve_fd = lock_file(self.capacity_dir / f"{scope.gui_token}{GUI_RESERVE}", fcntl.LOCK_EX)
+        elif not want and self.reserve_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(self.reserve_fd)
+            self.reserve_fd = None
+
+    def reserves(self, why: str | None) -> bool:
+        """Whether an idle gui runner keeps its reserve, given claimed()'s answer: only while nothing holds it or
+        only units do (full(), UNITS_FULL), and its console can run a GUI job. Held off for the fleet, heat, memory
+        pressure, a locked console, the gui token or the canonical roots, it could take no job, so the unit would
+        only sit idle."""
+        return (why is None or (why == self.full_why and UNITS_FULL in why)) and self.locked() is None
+
+    def admitted(self) -> bool:
+        """Whether this runner's job holds its admission: the holder job-started leaves (holder_file, named for the
+        runner in its .runner file) is alive. Until then a busy gui runner keeps its reserve, so a job waiting here
+        for units cannot take the reserved unit in the seconds between the listener taking the job and its
+        job-started admitting it. Unreadable counts as admitted: the reserve goes back, as before it existed."""
+        try:
+            name = json.loads((self.runner_dir / ".runner").read_text(encoding="utf-8-sig")).get("agentName")
+        except (OSError, ValueError, AttributeError):
+            return True
+        if not isinstance(name, str) or not name:
+            return True
+        return holder_alive(holder_file(self.state_dir, name))
+
     def tree(self) -> tuple[list[int], dict[int, tuple[int, str]]]:
         table = processes()
         return (descendants(self.child.pid, table) if self.child is not None else []), table
@@ -3870,8 +3991,11 @@ class Gate:
                     self.fast_until = time.monotonic() + 5.0
                 self.streak = 0  # a claim must hold for two idle polls, not carry over from the job
                 self.load_since = None  # the hold limit times a pause, never a job
+                if self.reserve_fd is not None and self.admitted():
+                    self.reserve(False)  # its job has its units: the reserve goes back to the other lanes
                 return None
             why = self.claimed()
+            self.reserve(self.reserves(why))
             self.streak = self.streak + 1 if why else 0
             if why and self.streak >= GATE_CONFIRM and not self.first_poll(why):
                 why = self.confirmed()
@@ -3882,6 +4006,7 @@ class Gate:
             return 0
         self.reload()
         why = self.claimed()
+        self.reserve(self.reserves(why))
         if why:
             if why != self.held:
                 gate_log(f"holding the listener off: {why}")
@@ -5422,7 +5547,8 @@ def main(argv: list[str] | None = None) -> int:
                                                workflow=job_workflow(),
                                                warm_keys=job_warm_keys(event), taken_out=taken,
                                                warm_target=job_warm_target(event), since=since,
-                                               gui_token=args.gui_token, klass=admit_class)
+                                               gui_token=args.gui_token, klass=admit_class,
+                                               gui_runner=args.gui_runner)
                     if held or not note.startswith("capacity:"):
                         break
                     waited = time.monotonic() - start

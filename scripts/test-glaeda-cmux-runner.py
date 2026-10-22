@@ -911,6 +911,80 @@ class HookTest(unittest.TestCase):
             self.finish("f0")
         self.assertTrue(hook.probe(capacity / "fast-0.token") and hook.probe(capacity / "fast-1.token"))
 
+    def hold_gui_reserve(self, token: str = "gui") -> int:
+        """Hold <token>.reserve as an idle gui runner's listener gate does (Gate.reserve)."""
+        capacity = self.dir / "capacity"
+        capacity.mkdir(parents=True, exist_ok=True)
+        fd = hook.lock_file(capacity / f"{token}{hook.GUI_RESERVE}", fcntl.LOCK_EX)
+        self.assertIsNotNone(fd)
+        return fd
+
+    def test_an_idle_gui_runner_keeps_one_unit_from_every_other_job(self) -> None:
+        """cmux-next's swift test queued 1.5 to 3 h on the gui label (2026-10-21): side and root jobs filled each
+        mini's units, so the gui runners' gates held them off as full. While an idle gui runner's gate holds its
+        reserve, every other job leaves one unit free, and the gui runner's own job takes it, even past a side job
+        waiting for units. A mini without a gui runner (no reserve held) admits as before."""
+        self.fleet()
+        self.take_units(12)
+        reserve = self.hold_gui_reserve()
+        unlocked = self.fake_ioreg(False)
+        try:
+            side = self.job("swift-package-tests", "s0", 14)
+            self.assertEqual(side.returncode, 1, side.stdout)
+            self.assertIn("refused: capacity: 2 of 14 units free, swift-package-tests (light) needs 2 and 1 is kept "
+                          "for the gui runner", side.stdout)
+            (self.dir / "capacity" / f"{hook.ADMIT_WANT}{os.getppid()}").write_text(
+                json.dumps({"since": time.time() - 30, "wants": ["units"], "who": "s9 daemon-test (run 1)"}) + "\n")
+            gui = self.job("app-host-unit-tests", "g0", 14, None, "--gui-runner", env=unlocked)
+            self.assertEqual(gui.returncode, 0, gui.stdout + gui.stderr)
+            self.assertIn("holding 1/14 units+gui+root-1 for app-host-unit-tests (gui-step", gui.stdout)
+            os.close(reserve)  # the gui runner is busy now: its gate lets the reserve go
+            (self.dir / "capacity" / f"{hook.ADMIT_WANT}{os.getppid()}").unlink()
+            after = self.job("swift-package-tests", "s1", 14)
+            self.assertIn("refused: capacity: 1 of 14 units free, swift-package-tests (light) needs 2", after.stdout)
+            self.assertNotIn("kept for the gui runner", after.stdout, "no reserve held: nothing kept")
+            self.finish("g0")
+            self.assertEqual(self.job("swift-package-tests", "s1", 14).returncode, 0, "2 free, no reserve: admitted")
+        finally:
+            for runner in ("g0", "s1"):
+                self.finish(runner)
+
+    def test_a_gui_runner_job_costlier_than_the_reserve_still_waits_its_turn(self) -> None:
+        """The reserve is one unit: a gui-label job that costs more (cmux-next's swift test, isolated at 4) takes the
+        reserved unit too, but waits behind an older job for the rest (fair_turn), so no lane jumps another for
+        units it never kept. A reserve never makes a job unfittable: one as large as the mini ignores it."""
+        self.fleet()
+        reserve = self.hold_gui_reserve()
+        self.addCleanup(os.close, reserve)
+        swift = {"GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/cmux-next.yml@refs/heads/feat-cmux-next"}
+        marker = self.dir / "capacity" / f"{hook.ADMIT_WANT}{os.getppid()}"
+        marker.write_text(json.dumps({"since": time.time() - 30, "wants": ["units"], "who": "s9 daemon-test (run 1)"})
+                          + "\n")
+        env = {**self.fake_ioreg(False), **swift}
+        waits = self.job("swift-test", "g0", 14, None, "--gui-runner", env=env)
+        self.assertEqual(waits.returncode, 1, waits.stdout)
+        self.assertIn("s9 daemon-test (run 1) has waited longer here for units", waits.stdout)
+        marker.unlink()
+        fds = self.take_units(14)
+        fast = self.job("fast-tier", "f0", 14, None, "--fast-runner", env=self.FAST_TIER)
+        self.assertEqual(fast.returncode, 0, fast.stdout + fast.stderr)
+        self.assertIn("holding 0/14 units+fast-0+fast-1 for fast-tier (fast", fast.stdout,
+                      "the fast tier takes no unit, so it keeps none for the gui runner")
+        self.finish("f0")
+        for fd in fds:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        whole = self.job("fast-tier", "s0", 5, None, env=self.FAST_TIER)
+        self.assertEqual(whole.returncode, 0, whole.stdout + whole.stderr)
+        self.assertIn("holding 5/5 units for fast-tier (isolated", whole.stdout)
+        self.finish("s0")
+        try:
+            self.take_units(10)
+            ok = self.job("swift-test", "g0", 14, None, "--gui-runner", env=env)
+            self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+            self.assertIn("holding 4/14 units for swift-test (isolated", ok.stdout, "its own reserve is its to take")
+        finally:
+            self.finish("g0")
+
     def test_a_fast_tier_job_on_a_side_runner_still_costs_its_general_units(self) -> None:
         self.fleet()
         try:
@@ -2821,6 +2895,25 @@ time.sleep(60)
                 self.ci_step("release", "--job-key", key)
         self.assertTrue(self.lock_free(), "every step holder let go")
 
+    def test_ci_steps_leave_an_idle_gui_runner_its_unit(self) -> None:
+        """A ci-step is never the gui runner's job: fits and admit leave the reserved unit free as runner jobs do."""
+        self.fleet()
+        worker = self.ci_worker()
+        self.take_units(2)
+        self.assertEqual(self.fits(6), ["light", "isolated"])
+        capacity = self.dir / "capacity"
+        reserve = hook.lock_file(capacity / f"gui{hook.GUI_RESERVE}", fcntl.LOCK_EX)
+        try:
+            self.assertEqual(self.fits(6), ["light"], "4 free: an isolated step's 4 would take the kept unit")
+            status, refused = self.ci_step("admit", "--class", "isolated", "--job-key", "r1-1-1",
+                                           "--watch-pid", str(worker.pid), units=6)
+            self.assertEqual(status, 1, refused)
+            self.assertIn("capacity: 4 of 6 units free, ci-step r1-1-1 (isolated) needs 4 and 1 is kept for the gui "
+                          "runner", refused["reason"])
+        finally:
+            os.close(reserve)
+        self.assertEqual(self.fits(6), ["light", "isolated"], "the reserve is gone with its gate")
+
     def test_ci_step_holder_ends_with_the_worker(self) -> None:
         self.fleet()
         worker = self.ci_worker()
@@ -4637,6 +4730,130 @@ class GateTest(unittest.TestCase):
         for fd in [held, *roots]:
             os.close(fd)
         self.assertEqual(hook.mini_full(self.units(5), 5, session), "all 5 capacity units on this mini are taken")
+
+    def test_an_idle_gui_runners_reserve_holds_the_other_runners_a_unit_early(self) -> None:
+        """While an idle gui runner's gate holds <gui token>.reserve, every other runner (root, side, session) counts
+        one unit fewer free, so none of them listens for a job that would take the gui runner's unit. The gui
+        runner counts the unit as its own, and a job waiting here for units is no reason to hold it: its next job
+        takes the reserved unit, not theirs. The fast runner takes no general unit either way."""
+        root = hook.RunnerScope(10, 2, 2, True)
+        side = hook.RunnerScope(10, 2, 2)
+        session = hook.RunnerScope(10, 2, 2, False, False, session=True)
+        gui = hook.RunnerScope(10, 2, 2, False, True)
+        fast = hook.RunnerScope(10, 2, 2, False, False, fast=True)
+        capacity = self.units(9)
+        for scope in (side, session, gui):
+            self.assertIsNone(hook.mini_full(capacity, 10, scope), "no reserve: one free unit is room")
+        reserve = hook.lock_file(capacity / f"gui{hook.GUI_RESERVE}", fcntl.LOCK_EX)
+        self.addCleanup(os.close, reserve)
+        for scope in (side, session):
+            self.assertEqual(hook.mini_full(capacity, 10, scope), "only 1 of 10 capacity units on this mini are "
+                             "free; its next job needs 1 and 1 is kept for the gui runner")
+        self.assertIsNone(hook.mini_full(capacity, 10, gui), "the reserved unit is the gui runner's own")
+        self.assertIsNone(hook.mini_full(capacity, 10, fast))
+
+        def reserved(held: int) -> Path:
+            ledger = self.units(held)
+            self.addCleanup(os.close, hook.lock_file(ledger / f"gui{hook.GUI_RESERVE}", fcntl.LOCK_EX))
+            return ledger
+
+        self.assertEqual(hook.mini_full(reserved(5), 10, root), "only 5 of 10 capacity units on this mini are "
+                         "free; a compile needs 5 and 1 is kept for the gui runner")
+        self.assertIsNone(hook.mini_full(reserved(4), 10, root), "6 free: a compile and the kept unit")
+        self.assertIsNone(hook.mini_full(reserved(0), 5, root), "a reserve never makes a compile unfittable")
+        self.assertIsNone(hook.mini_full(self.units(5), 10, root), "no gui runner on the mini: nothing kept")
+        (capacity / f"{hook.ADMIT_WANT}{os.getpid()}").write_text(
+            json.dumps({"since": time.time(), "wants": ["units"], "who": "s1 daemon-test (run 4)"}) + "\n")
+        self.assertIsNone(hook.mini_full(capacity, 10, gui), "a job waiting for units does not hold the gui runner")
+        (capacity / f"{hook.ADMIT_WANT}{os.getpid()}").write_text(
+            json.dumps({"since": time.time(), "wants": ["gui"], "who": "r0 app-host-unit-tests (run 4)"}) + "\n")
+        self.assertEqual(hook.mini_full(capacity, 10, gui), "r0 app-host-unit-tests (run 4) waits here for gui")
+        (capacity / f"{hook.ADMIT_WANT}{os.getpid()}").unlink()
+        self.assertEqual(hook.mini_full(self.units(10), 10, gui), "all 10 capacity units on this mini are taken")
+
+    def gui_gate(self, capacity: Path, gui: bool = True) -> hook.Gate:
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(exist_ok=True)
+        script.write_text("#!/bin/bash\nexec /usr/bin/python3 /hook job-started --capacity-units 10 --instance 3"
+                          + (" --gui-runner" if gui else "") + "\n")
+        gate = self.full_gate(capacity)
+        self.addCleanup(gate.reserve, False)
+        return gate
+
+    def test_an_idle_gui_runners_gate_holds_its_reserve_and_lets_it_go_with_a_job(self) -> None:
+        """The reserve is a flock, so it lives exactly as long as the gate wants it: held while the gui runner has
+        no job and nothing but units holds it, and through a new job's admission (else a job waiting here for units
+        takes the unit in the seconds before job-started runs); let go once that job holds its units, or while the
+        gui token, a locked console, a fleet build or heat keeps it off (its unit would only sit idle); and gone
+        with the gate's process."""
+        capacity = self.units(0)
+        reserve = capacity / f"gui{hook.GUI_RESERVE}"
+        gate = self.gui_gate(capacity)
+        console = [None]
+        with mock.patch.object(gate, "start"), mock.patch.object(gate, "stop"), \
+                mock.patch.object(gate, "reload"), mock.patch.object(gate, "saturated", return_value=None), \
+                mock.patch.object(hook, "console_refusal", side_effect=lambda: console[0]), \
+                mock.patch.object(gate, "busy", return_value=False) as busy:
+            gate.step()  # no listener: free, so it starts one
+            self.assertFalse(hook.probe(reserve), "idle: the reserve is held")
+            gate.child = mock.Mock(poll=mock.Mock(return_value=None))
+            (self.runner / ".runner").write_text("\ufeff" + json.dumps({"agentName": "mini-glaeda-3"}),
+                                                 encoding="utf-8")
+            busy.return_value = True
+            gate.step()
+            self.assertFalse(hook.probe(reserve), "a job not yet admitted: the reserved unit waits for it")
+            self.state.mkdir(parents=True, exist_ok=True)
+            holder = hook.holder_file(self.state, "mini-glaeda-3")
+            holder.write_text(f"{os.getpid()}\n")
+            gate.step()
+            self.assertTrue(hook.probe(reserve), "its job holds its units: the reserve goes to the other lanes")
+            holder.unlink()
+            busy.return_value = False
+            gate.step()
+            self.assertFalse(hook.probe(reserve), "idle again")
+            fds = [hook.lock_file(capacity / f"unit-{slot}", fcntl.LOCK_EX) for slot in range(10)]
+            gate.step()
+            self.assertFalse(hook.probe(reserve), "held off as full: still the gui lane's unit")
+            token = hook.lock_file(capacity / "gui.token", fcntl.LOCK_EX)
+            while fds:
+                os.close(fds.pop())
+            gate.step()
+            self.assertTrue(hook.probe(reserve), "held off for the gui token: it could take no job")
+            os.close(token)
+            gate.step()
+            self.assertFalse(hook.probe(reserve))
+            console[0], gate.console_at = "console: the console session (cmux) is screen-locked", -1e9
+            gate.step()
+            self.assertTrue(hook.probe(reserve), "a gui runner that cannot take a job keeps no unit")
+        capacity = self.units(0)
+        other = self.gui_gate(capacity, gui=False)
+        with mock.patch.object(other, "start"), mock.patch.object(other, "reload"), \
+                mock.patch.object(other, "saturated", return_value=None), \
+                mock.patch.object(other, "busy", return_value=False):
+            other.step()
+        self.assertEqual(list(capacity.glob(f"*{hook.GUI_RESERVE}")), [], "only a gui runner reserves")
+
+    def test_a_gui_runner_listens_through_cpu_saturation_but_not_memory_pressure(self) -> None:
+        """The CPU hold kept the gui runners off while side and root jobs kept their minis busy, so the gui label
+        queued for hours. A gui runner's jobs are admitted by units like any other, and the gui token keeps them
+        one per mini, so the CPU mark no longer holds it; memory pressure still does."""
+        for name, value in (("GATE_CPU_PAUSE", 80.0), ("GATE_CPU_RESUME", 70.0), ("GATE_CPU_EVERY_S", 0.0)):
+            patcher = mock.patch.object(hook, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        pressure = [1]
+        with mock.patch.object(hook, "host_io", return_value=(0.0, 99.0)), \
+                mock.patch.object(hook, "memory_pressure_level", side_effect=lambda: pressure[0]), \
+                mock.patch.object(hook, "console_refusal", return_value=None):
+            gui = self.gui_gate(self.units(0))
+            self.assertIsNone(gui.claimed(), "99% CPU: the gui runner listens")
+            pressure[0] = 2
+            why = gui.claimed()
+            self.assertTrue(why and why.startswith(hook.SATURATED) and "memory pressure level 2" in why, why)
+            self.assertNotIn("CPU busy", why)
+            pressure[0] = 1
+            side = self.gui_gate(self.units(0), gui=False)
+            self.assertTrue((side.claimed() or "").startswith(hook.SATURATED), "every other runner keeps the CPU hold")
 
     def test_runner_scope_reads_the_session_runner_flag(self) -> None:
         script = self.runner / hook.RUNNER_HOOK_SCRIPT
