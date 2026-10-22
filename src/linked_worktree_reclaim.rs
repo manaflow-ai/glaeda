@@ -1001,10 +1001,17 @@ fn observe_detailed(
     })
 }
 
-/// Most concurrent observations [`observe_linked_worktrees`] runs.
+/// Most concurrent observations [`observe_linked_worktrees`] runs, whatever a caller asks for.
 pub const MAX_LINKED_WORKTREE_OBSERVATION_WORKERS: usize = 8;
 
-/// Observe every inventory entry with a small bounded pool, in inventory order.
+/// Concurrent observations when the caller does not say: each worker runs one Git read at a
+/// time, so this is also the most Git processes a sweep runs at once. cosmic-gray, a Mac that
+/// hosts agent sessions, ran eight `git status` at once under the old core-count pool (2026-10-21)
+/// and its own reads then ran past their deadlines. Two keeps a 70-worktree sweep near a minute.
+pub const DEFAULT_LINKED_WORKTREE_OBSERVATION_WORKERS: usize = 2;
+
+/// Observe every inventory entry with a pool of `workers` (clamped to one through
+/// [`MAX_LINKED_WORKTREE_OBSERVATION_WORKERS`]), in inventory order.
 ///
 /// Each observation runs several `git status`-class reads, which dominate a sweep: sequentially a
 /// 33-worktree cmux checkout took about 50 seconds. Stale registrations are reported as errors
@@ -1015,17 +1022,31 @@ pub fn observe_linked_worktrees(
     inventory: &LinkedWorktreeInventory,
     evidence: &ProcessUseEvidence,
     executor: &(impl TimedCommandExecutor + Sync),
+    workers: usize,
 ) -> Vec<Result<LinkedWorktreeFacts, LinkedWorktreeReclaimError>> {
-    let entries = &inventory.linked;
-    let workers = std::thread::available_parallelism()
-        .map_or(1, std::num::NonZeroUsize::get)
+    bounded_map(&inventory.linked, workers, |entry| {
+        Some(observe_linked_worktree(
+            observer, inventory, entry, evidence, executor,
+        ))
+    })
+    .into_iter()
+    .map(|result| result.unwrap_or_else(|| Err(observation_lost())))
+    .collect()
+}
+
+/// Apply `work` to every item on at most `workers` threads (clamped to one through
+/// [`MAX_LINKED_WORKTREE_OBSERVATION_WORKERS`]), returning results in item order. An item whose
+/// worker panicked is `None`.
+fn bounded_map<T: Sync, R: Send>(
+    items: &[T],
+    workers: usize,
+    work: impl Fn(&T) -> Option<R> + Sync,
+) -> Vec<Option<R>> {
+    let workers = workers
         .clamp(1, MAX_LINKED_WORKTREE_OBSERVATION_WORKERS)
-        .min(entries.len().max(1));
+        .min(items.len().max(1));
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let mut ordered: Vec<Result<LinkedWorktreeFacts, LinkedWorktreeReclaimError>> = (0..entries
-        .len())
-        .map(|_| Err(observation_lost()))
-        .collect();
+    let mut ordered: Vec<Option<R>> = (0..items.len()).map(|_| None).collect();
     let observed = std::thread::scope(|scope| {
         let handles = (0..workers)
             .map(|_| {
@@ -1033,13 +1054,10 @@ pub fn observe_linked_worktrees(
                     let mut local = Vec::new();
                     loop {
                         let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let Some(entry) = entries.get(index) else {
+                        let Some(item) = items.get(index) else {
                             break;
                         };
-                        local.push((
-                            index,
-                            observe_linked_worktree(observer, inventory, entry, evidence, executor),
-                        ));
+                        local.push((index, work(item)));
                     }
                     local
                 })
@@ -2488,6 +2506,47 @@ mod tests {
 
     fn policy() -> LinkedWorktreeReclaimPolicy {
         LinkedWorktreeReclaimPolicy::new(DAY).expect("valid policy")
+    }
+
+    /// Run `bounded_map` over `items` with `workers` and return the most calls ever in flight.
+    fn peak_in_flight(items: usize, workers: usize) -> (usize, Vec<usize>) {
+        let in_flight = std::sync::atomic::AtomicUsize::new(0);
+        let peak = std::sync::atomic::AtomicUsize::new(0);
+        let inputs: Vec<usize> = (0..items).collect();
+        let outputs = bounded_map(&inputs, workers, |item| {
+            let now = in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            peak.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            Some(item * 10)
+        });
+        (
+            peak.load(std::sync::atomic::Ordering::SeqCst),
+            outputs
+                .into_iter()
+                .map(|output| output.expect("observed"))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn observation_pool_never_runs_more_than_its_workers() {
+        // cosmic-gray, 2026-10-21: eight `git status` at once on a Mac that hosts sessions.
+        let (peak, outputs) = peak_in_flight(12, 2);
+        assert!(peak <= 2, "peak {peak} exceeded two workers");
+        assert_eq!(outputs, (0..12).map(|item| item * 10).collect::<Vec<_>>());
+        let (peak, _) = peak_in_flight(12, 1);
+        assert_eq!(peak, 1);
+    }
+
+    #[test]
+    fn observation_pool_clamps_workers_to_the_declared_range() {
+        let (peak, _) = peak_in_flight(3, 0);
+        assert_eq!(peak, 1, "zero workers still observes, one at a time");
+        let (peak, _) = peak_in_flight(40, 64);
+        assert!(peak <= MAX_LINKED_WORKTREE_OBSERVATION_WORKERS);
+        let (_, outputs) = peak_in_flight(0, 2);
+        assert!(outputs.is_empty());
     }
 
     fn clean_idle() -> LinkedWorktreeFacts {

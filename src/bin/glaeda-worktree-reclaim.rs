@@ -5,13 +5,14 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use clap::builder::TypedValueParser;
 use clap::{Parser, ValueEnum};
 use glaeda::linked_worktree_reclaim::{
-    GithubLookup, LINKED_WORKTREE_GIT_TIMEOUT, LinkedWorktreeFacts,
-    LinkedWorktreeReclaimCompensation, LinkedWorktreeReclaimDecision, LinkedWorktreeReclaimOutcome,
-    LinkedWorktreeReclaimPolicy, LinkedWorktreeReclaimVeto, LocalBranchDecision,
-    LocalBranchDeletion, LocalBranchFinishedEvidence, LocalBranchReport, ProcessUseEvidence,
-    landed_worktree_tips, list_linked_worktrees, observe_linked_worktrees,
+    DEFAULT_LINKED_WORKTREE_OBSERVATION_WORKERS, GithubLookup, LINKED_WORKTREE_GIT_TIMEOUT,
+    LinkedWorktreeFacts, LinkedWorktreeReclaimCompensation, LinkedWorktreeReclaimDecision,
+    LinkedWorktreeReclaimOutcome, LinkedWorktreeReclaimPolicy, LinkedWorktreeReclaimVeto,
+    LocalBranchDecision, LocalBranchDeletion, LocalBranchFinishedEvidence, LocalBranchReport,
+    ProcessUseEvidence, landed_worktree_tips, list_linked_worktrees, observe_linked_worktrees,
     plan_linked_worktree_reclaim, reclaim_linked_worktree, reclaim_local_branches,
 };
 use glaeda::process::ProcessExecutor;
@@ -127,6 +128,15 @@ struct Cli {
     /// Select human or JSON output.
     #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
     output: OutputFormat,
+
+    /// Most worktrees observed at once, which is also the most Git processes this runs at once
+    /// (1 to 8). Kept low by default so a sweep never crowds the host's own work.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_LINKED_WORKTREE_OBSERVATION_WORKERS,
+        value_parser = clap::value_parser!(u8).range(1..=8).map(usize::from),
+    )]
+    git_workers: usize,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -229,6 +239,7 @@ struct Report {
     max_reclaims: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_branch_deletions: Option<usize>,
+    git_workers: usize,
     budget_exhausted: bool,
     circuit_breaker_tripped: bool,
     repositories: Vec<RepositoryReport>,
@@ -334,7 +345,7 @@ fn main() -> ExitCode {
                     &observer, &inventory, github, &executor,
                 ));
             }
-            observe_linked_worktrees(&observer, &inventory, &evidence, &executor)
+            observe_linked_worktrees(&observer, &inventory, &evidence, &executor, cli.git_workers)
         };
         let mut summary = Summary {
             linked: inventory.linked().len(),
@@ -475,6 +486,7 @@ fn main() -> ExitCode {
         finished_idle_seconds: policy.finished_idle_seconds(),
         max_reclaims: cli.max_reclaims,
         max_branch_deletions: branches_requested.then_some(cli.max_branch_deletions),
+        git_workers: cli.git_workers,
         budget_exhausted: budget_exhausted || branch_budget_exhausted,
         circuit_breaker_tripped,
         repositories,

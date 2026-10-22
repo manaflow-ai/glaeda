@@ -289,7 +289,7 @@ class MiniSetupTest(unittest.TestCase):
             self.assertTrue(doc["StandardOutPath"].startswith(os.fspath(self.home / "Library/Logs")))
             # dedupe is never urgent; pressure must still free space while a build fills the disk
             self.assertEqual(doc.get("ProcessType"),
-                             "Background" if label in ("disk-dedupe", "fleet-cas-prune", "seed-prefetch") else None)
+                             "Background" if label in ("disk-dedupe", "fleet-cas-prune", "seed-prefetch", "worktree-reclaim") else None)
         warm = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.idle-warm.plist").read_bytes())
         repair = plistlib.loads((self.home / "Library/LaunchAgents/com.teamleaderleo.glaeda.idle-repair.plist").read_bytes())
         self.assertEqual(repair["ProgramArguments"], ["/usr/bin/python3", os.fspath(bin_dir / "glaeda-idle-repair"), "--apply"])

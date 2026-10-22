@@ -779,6 +779,9 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
                                  "--apply", "--output", "json"],
             # hourly: finished work is reclaimable after an hour idle, unfinished after three days
             "StartInterval": 3600,
+            # Never urgent (disk pressure has its own agent): throttle CPU and I/O like taskpolicy -b
+            # so its `git status` reads stay behind the sessions and builds on this host.
+            "ProcessType": "Background",
             "LowPriorityIO": True,
             "Nice": 10,
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-worktree-reclaim.jsonl"),

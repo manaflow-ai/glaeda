@@ -61,4 +61,15 @@ case " $* " in
     fi
     ;;
 esac
-exec "$reclaim" --branches ${window[@]+"${window[@]}"} "$@" "${repositories[@]}"
+# GLAEDA_RECLAIM_GIT_WORKERS (1-8) declares how many Git processes the sweep may run at once; unset,
+# the command's own default (two) holds. A bad value is ignored rather than stopping every sweep.
+workers=()
+case " $* " in
+  *" --git-workers"*) ;;
+  *)
+    if [[ "${GLAEDA_RECLAIM_GIT_WORKERS:-}" =~ ^[1-8]$ ]]; then
+      workers=(--git-workers "$GLAEDA_RECLAIM_GIT_WORKERS")
+    fi
+    ;;
+esac
+exec "$reclaim" --branches ${window[@]+"${window[@]}"} ${workers[@]+"${workers[@]}"} "$@" "${repositories[@]}"

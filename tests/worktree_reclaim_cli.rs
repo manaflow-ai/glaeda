@@ -452,6 +452,32 @@ fn plan_classifies_real_worktrees_and_changes_nothing() {
     assert!(dirty.join("scratch.txt").exists());
 }
 
+/// The observation pool is a declared setting: two by default (a Mac that hosts agent sessions
+/// must not see eight `git status` at once), one to eight when asked, recorded in the receipt.
+#[test]
+fn git_workers_is_declared_bounded_and_recorded() {
+    let fixture = Fixture::new();
+    fixture.add("one");
+    fixture.add("two");
+    fixture.add("three");
+    let default = document(&fixture.plan(&fixture.main));
+    assert_eq!(default["git_workers"], 2);
+    let single = document(&fixture.run(&fixture.main, &["--git-workers", "1"]));
+    assert_eq!(single["git_workers"], 1);
+    assert_eq!(
+        single["repositories"][0]["summary"], default["repositories"][0]["summary"],
+        "the pool size changes how fast, never what is decided"
+    );
+    for refused in ["0", "9", "many"] {
+        let output = fixture.run(&fixture.main, &["--git-workers", refused]);
+        assert_eq!(output.status.code(), Some(2), "--git-workers {refused}");
+        assert!(
+            output.stdout.is_empty(),
+            "--git-workers {refused} ran anyway"
+        );
+    }
+}
+
 #[test]
 fn a_linked_worktree_is_not_accepted_as_the_repository() {
     let fixture = Fixture::new();

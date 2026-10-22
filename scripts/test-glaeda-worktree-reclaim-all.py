@@ -118,5 +118,22 @@ class ReclaimDiscoveryTest(unittest.TestCase):
         self.assertNotIn("--minimum-idle-seconds", self.sweep())
 
 
+    def test_git_workers_setting_passes_through_only_when_valid(self):
+        repo = self.repository()
+        self.git(repo, "worktree", "add", "-qb", "lane", str(self.root / "lane"))
+        # Unset: the command's own default (two) applies, and the argv stays as it was.
+        self.assertNotIn("--git-workers", self.sweep())
+        self.env["GLAEDA_RECLAIM_GIT_WORKERS"] = "1"
+        argv = self.sweep()
+        self.assertEqual(argv[argv.index("--git-workers") + 1], "1")
+        # A caller's own flag wins over the setting.
+        argv = self.sweep("--git-workers", "3")
+        self.assertEqual(argv.count("--git-workers"), 1)
+        self.assertEqual(argv[argv.index("--git-workers") + 1], "3")
+        # Garbage or out of range is ignored rather than stopping every sweep.
+        for bad in ("0", "9", "two", "-1"):
+            self.env["GLAEDA_RECLAIM_GIT_WORKERS"] = bad
+            self.assertNotIn("--git-workers", self.sweep(), bad)
+
 if __name__ == "__main__":
     unittest.main()
