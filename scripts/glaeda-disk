@@ -59,7 +59,14 @@ reusable inputs, so the explicit cmux-next family below only considers the
 generated Build, Index, Logs and Products children beneath a validated runner
 or dev-daily Release root.  Those children require a conservative 72-hour idle
 window plus a fresh process/lock/lease check; unknown children and all preserved
-inputs remain visible to accounting but are never deleted by this family.
+inputs remain visible to accounting and are kept.  The cache has an LRU size cap
+(cmux_next_ci_cap_gib in disk-policy.json or --cmux-next-cap-gib, default 40 GiB, 0 off): while a
+pressure run measures it over the cap, the window gives way, least recently used first, until it is
+under the cap or the free target is met, and a state root no enrolled runner owns (a scheme state by
+name, a dev-daily/release state by its runner-and-workspace key) idle past a job's timeout goes whole,
+inputs included. Enrolled runners' states lose only generated output, and the process/lock/lease/
+Runner.Worker vetoes still hold (docs/CMUX_NEXT_CI_RETENTION.md). Only a pressure run walks the cache; a text
+report shows its last measurement, and its run line records how far over the cap it is.
 
 Each enrolled GitHub runner's checkout (~/actions-runner*/_work/<repo>/<repo>) has two families.
 runner-checkout-build is SwiftPM's Packages/*/.build and Packages/*/*/.build plus cargo-tagged target
@@ -180,6 +187,9 @@ from pathlib import Path
 HOME = Path.home()
 SNAPSHOT = HOME / ".cache/glaeda-disk/sizes.json"
 DEDUPE_STATE = HOME / ".cache/glaeda-disk/dedupe.json"
+# The last pressure run's du of ~/Library/Caches/cmux-next-ci (cmux_next_ci_cap_state): reports read it beside
+# the size snapshot and never walk the cache themselves.
+CMUX_NEXT_CAP_RECORD = HOME / ".cache/glaeda-disk/cmux-next-cap.json"
 MEASURE_LOCK = HOME / ".cache/glaeda-disk/measure.lock"
 ACCOUNTING = HOME / ".cache/glaeda-disk/accounting.json"
 HEALTH_SUMMARY = HOME / ".local/state/glaeda/disk/summary.json"
@@ -540,6 +550,11 @@ CMUX_NEXT_CI_FAMILY = "cmux-next-ci-generated"
 CMUX_NEXT_CI_ROOT = "cmux-next-ci"
 CMUX_NEXT_CI_MIN_IDLE_HOURS = 72.0
 CMUX_NEXT_CI_DRAIN = False
+# Bytes the whole cmux-next-ci cache is over its LRU cap (cmux_next_ci_cap_gib) in this pressure run, 0 within
+# it. While over, the 72 h window gives way, least recently used first, until the cache is back under the cap
+# (or the free target is met); every in-use veto still holds. cmux11s sat at 14-37 GiB free under a 40 GiB
+# runner floor, jobs refused at setup, with 78 GiB of cmux-next-ci "reclaimable 0.0G" (2026-10-21).
+CMUX_NEXT_CI_OVER = 0
 CMUX_NEXT_CI_DRAIN_RESERVATION: dict | None = None
 CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "c2e275f265b42f35b0743d32b67231bf1158f87dcf936342efe0082006ccf61d",
@@ -878,10 +893,11 @@ def item_window(fam: Family, path: Path, idle_hours: float, archived: frozenset[
     """The idle window for one candidate: a seed the archive already holds may go at once (the newest of each
     root still stay, by keep_verdict), and SwiftPM scratch left in the trash or under the emergency floor
     (EMERGENCY_DEVS) may go at once (its lock keeps what a job holds), and so may an idle runner's build output
-    while the runner gate holds for disk (FLOOR_HOLD). Everything else waits out its family's window."""
+    while the runner gate holds for disk (FLOOR_HOLD), and cmux-next output while that cache is over its cap
+    (cmux_next_ci_over). Everything else waits out its family's window."""
     if fam.id == "cmux-seeds" and path.name in archived:
         return 0.0
-    if fam.id == CMUX_NEXT_CI_FAMILY and CMUX_NEXT_CI_DRAIN:
+    if fam.id == CMUX_NEXT_CI_FAMILY and (CMUX_NEXT_CI_DRAIN or cmux_next_ci_over()):
         return 0.0
     if fam.id == SPM_SCRATCH:
         if path.name.startswith(SPM_TRASH):
@@ -908,6 +924,18 @@ def floor_hold_family(fam: Family, path: Path) -> bool:
 def floor_hold_only(fam: Family, item: "Item", idle_hours: float) -> bool:
     """Reclaimable only because of the floor hold: younger than its family's own window."""
     return floor_hold_family(fam, Path(item.path)) and item.idle_hours < idle_window(fam, idle_hours)
+
+
+def cmux_next_ci_over() -> int:
+    """Bytes the cmux-next-ci cache is over its cap, counted only in a pressure run (never a drain)."""
+    return CMUX_NEXT_CI_OVER if ACTIVITY_MODE == "pressure" and not CMUX_NEXT_CI_DRAIN else 0
+
+
+def cmux_next_cap_only(fam: Family, path: Path, idle: float, idle_hours: float) -> bool:
+    """Reclaimable only because the cmux-next-ci cache is over its cap: an unowned state root listed whole, or
+    generated output younger than the family's own window. apply stops these once the cache is under the cap."""
+    return (fam.id == CMUX_NEXT_CI_FAMILY and cmux_next_ci_over() > 0
+            and (cmux_next_ci_state_for(path, fam.root) is None or idle < idle_window(fam, idle_hours)))
 
 
 # The idle sweep (--idle): windows from how often each family is read again, not from free space.
@@ -970,6 +998,11 @@ POLICY_DEFAULTS: dict[str, Any] = {
     # A busy host cleans too: deletes skip only what a job uses (open, named by a command, its root's
     # current seed or checkout), never the whole pass. true restores the old defer-while-CI-runs rule.
     "defer_during_ci": False,
+    # LRU size cap on ~/Library/Caches/cmux-next-ci (CMUX_NEXT_CI_OVER); 0 turns it off. --cmux-next-cap-gib.
+    "cmux_next_ci_cap_gib": 40.0,
+    # Over the cap, a cmux-next state no enrolled runner owns goes whole (inputs too) only once idle this long:
+    # GitHub's default job timeout (timeout-minutes 360), so no job can still be using it.
+    "cmux_next_ci_unowned_idle_hours": 6.0,
 }
 ACTIVITY_MODE: str | None = None  # "pressure" or "sweep" while main acts; None keeps the wall-clock rule
 ROLE = "fleet-mini"
@@ -4406,9 +4439,11 @@ def candidates(fam: Family) -> list[Path]:
             _DISCOVERED[key] = discover_caches(fam.root)
         level = list(_DISCOVERED[key])
     elif fam.checkout_builds:
-        key = f"checkout-builds:{fam.id}:" + os.fspath(fam.root)
+        key = f"checkout-builds:{fam.id}:" + os.fspath(fam.root) + (":over-cap" if cmux_next_ci_over() else "")
         if key not in _DISCOVERED:
-            _DISCOVERED[key] = (cmux_next_ci_generated_paths(fam.root) if fam.id == CMUX_NEXT_CI_FAMILY
+            _DISCOVERED[key] = (cmux_next_ci_generated_paths(fam.root, whole_stale=True)
+                                if fam.id == CMUX_NEXT_CI_FAMILY and cmux_next_ci_over()
+                                else cmux_next_ci_generated_paths(fam.root) if fam.id == CMUX_NEXT_CI_FAMILY
                                 else runner_checkout_builds(fam.root) if fam.id == RUNNER_BUILD_FAMILY
                                 else runner_git_garbage(fam.root) if fam.id == RUNNER_GIT_GARBAGE_FAMILY
                                 else checkout_builds(fam.root))
@@ -4811,6 +4846,9 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             verdict = "reclaimable"
             if path.name in archived and fam.id == "cmux-seeds":
                 reasons.append("the seed archive holds it")
+            if cmux_next_cap_only(fam, path, idle, idle_hours):
+                reasons.append(f"cmux-next-ci is {gib(cmux_next_ci_over()).strip()} over its size cap "
+                               "(least recently used first)")
             if (fam.mirror_idle_hours is not None and idle >= fam.mirror_idle_hours
                     and not derived_data(fam, path)):
                 reasons.append(f"idle {fam.mirror_idle_hours:g}h+: its checkouts are mirrors")
@@ -5782,9 +5820,13 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
     lsof_at, lsof_items = time.monotonic(), 0
     archived = archived_seeds() if any(i.family == "cmux-seeds" for i in items) else frozenset()
     # Among pressure hot-tier items, evict greatest reuse distance, then oldest use.
+    cap_left = cmux_next_ci_over()  # what the cmux-next-ci cache is still over its cap
+
     def order(i):
-        if floor_hold_only(family_of(i), i, idle_hours):
-            return (-1, 0, i.idle_hours, i.bytes)  # reclaimable only by FLOOR_HOLD: warm builds go last
+        if floor_hold_only(family_of(i), i, idle_hours) \
+                or cmux_next_cap_only(family_of(i), Path(i.path), i.idle_hours, idle_hours):
+            # reclaimable only by FLOOR_HOLD or the cmux-next cap: warm builds go last, least recently used first
+            return (-1, 0, i.idle_hours, i.bytes)
         if i.family == RUNNER_GIT_GARBAGE_FAMILY:  # garbage nothing reads goes before anything that costs a rebuild
             return (2, 0, i.idle_hours, i.bytes)
         if ACTIVITY_MODE == "pressure" and (i.family in FLEET_FAMILY_IDS or i.family == RUNNER_BUILD_FAMILY):
@@ -5812,14 +5854,19 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 continue
             if dev not in targets or free_bytes(p.parent)[0] >= targets[dev]:
                 continue
+        # an item younger than its family's window goes only while a budget that let it go still allows:
+        # the floor hold stops at the floor plus target_margin_gib, the cmux-next cap once the cache is under it
+        warm: list[bool] = []
         if floor_hold_only(fam, i, idle_hours):
-            # reclaimable only by the floor hold: it stops at the floor plus target_margin_gib
             try:
                 stop = FLOOR_HOLD.get(p.parent.stat().st_dev)
-                if stop is None or free_bytes(p.parent)[0] >= stop:
-                    continue
+                warm.append(stop is not None and free_bytes(p.parent)[0] < stop)
             except OSError:
-                continue
+                warm.append(False)
+        if cmux_next_cap_only(fam, p, i.idle_hours, idle_hours):
+            warm.append(cap_left > 0)
+        if warm and not any(warm):
+            continue
         # fresh re-observation right before the destructive step. cmux jobs clone their warm state with
         # `cp -cR SOURCE ...` at any moment and a clone leaves the source's times alone, so those families
         # re-read the command lines per item rather than trusting the ones from the start of a long run.
@@ -5917,9 +5964,17 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                     remove(p, after_rename=None if stale_hash is None
                            else lambda h=stale_hash: h.unlink(missing_ok=True))
                     gone = True
+                    if fam.id == CMUX_NEXT_CI_FAMILY and p.parent.parent.parent in tuple(
+                            fam.root / kind for kind in CMUX_NEXT_RELEASE_KINDS):
+                        # a whole unowned release state: no empty <key>/Release left behind (no runner uses the key)
+                        for empty in (p.parent, p.parent.parent):
+                            with contextlib.suppress(OSError):
+                                empty.rmdir()
                 if not fam.transcripts:
                     outcome = "reclaimed" if gone else "changed:in-use"
                     released += i.bytes if gone else 0
+                    if gone and fam.id == CMUX_NEXT_CI_FAMILY:
+                        cap_left -= i.bytes
                 if common:  # drop the deleted worktree's record from its repository
                     subprocess.run(["git", "--git-dir", common, "worktree", "prune"],
                                    capture_output=True, timeout=60)
@@ -5956,7 +6011,7 @@ def cmux_next_ci_state_roots(root: Path) -> list[Path]:
     """Validated per-runner DerivedData roots owned by cmux-next CI.
 
     The workflow's reusable scheme roots are ``cmux-scheme/<runner>``.  Older
-    dev-daily runs use ``dev-daily-release/<fingerprint>/Release/<xcode-hash>``.
+    dev-daily runs use ``dev-daily-release/<key>/Release/<xcode-hash>``.
     Names outside these shapes are intentionally ignored so a generic cache
     directory can never become a deletion candidate by accident.
     """
@@ -5965,21 +6020,23 @@ def cmux_next_ci_state_roots(root: Path) -> list[Path]:
     roots: list[Path] = []
     scheme = root / "cmux-scheme"
     for runner in _children(scheme) if scheme.is_dir() and not scheme.is_symlink() else []:
-        if runner.is_dir() and not runner.is_symlink():
+        # an aside tree remove() left (a deletion in progress or interrupted) is never a state root
+        if runner.is_dir() and not runner.is_symlink() and not DELETING_RE.fullmatch(runner.name):
             roots.append(runner)
-    # Both dev-daily and release-compile use a fingerprint/Release/xcode state
-    # root.  Real Xcode output names the final component ``xcode-<hash>``;
+    # Both dev-daily and release-compile use a <key>/Release/xcode state root, the
+    # key one per runner and workspace (cmux_next_ci_release_key), not a source
+    # fingerprint.  Real Xcode output names the final component ``xcode-<hash>``;
     # older fixtures used the bare hash.  Keep the shape strict so arbitrary
     # cache directories never become deletion candidates.
     for daily_name in ("dev-daily-release", "release-compile"):
         daily = root / daily_name
         if daily.is_symlink() or not daily.is_dir():
             continue
-        for fingerprint in _children(daily):
-            if fingerprint.is_symlink() or not fingerprint.is_dir() \
-                    or re.fullmatch(r"[0-9a-fA-F]{8,64}", fingerprint.name) is None:
+        for key in _children(daily):
+            if key.is_symlink() or not key.is_dir() \
+                    or re.fullmatch(r"[0-9a-fA-F]{8,64}", key.name) is None:
                 continue
-            release = fingerprint / "Release"
+            release = key / "Release"
             if release.is_symlink() or not release.is_dir():
                 continue
             for xcode_hash in _children(release):
@@ -5990,37 +6047,136 @@ def cmux_next_ci_state_roots(root: Path) -> list[Path]:
     return roots
 
 
-def cmux_next_ci_runner(path: Path, root: Path) -> Path | None:
-    """The enrolled runner whose cmux-scheme/<agentName> state holds generated child PATH, or None (a dev-daily
-    or release state, or a runner no longer enrolled here). cmux-next.yml names the state after the runner."""
-    state = cmux_next_ci_state_for(path, root)
-    if state is None or state.parent != root / "cmux-scheme":
-        return None
+def runner_config(runner: Path) -> dict:
+    """A runner's .runner (UTF-8 with a byte order mark), or {} when unreadable."""
+    try:
+        doc = json.loads((runner / ".runner").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return {}
+    return doc if isinstance(doc, dict) else {}
+
+
+def runner_work_folder(runner: Path) -> Path:
+    """The runner's work folder: .runner's workFolder, relative to the runner directory or absolute; _work."""
+    work = runner_config(runner).get("workFolder")
+    return runner / (work if isinstance(work, str) and work else "_work")
+
+
+def enrolled_runner_names() -> dict[str, Path]:
+    """agentName -> runner directory for every enrolled runner."""
+    names: dict[str, Path] = {}
     for runner in enrolled_runners():
-        try:
-            name = json.loads((runner / ".runner").read_text(encoding="utf-8-sig")).get("agentName")
-        except (OSError, ValueError, AttributeError):
-            continue
-        if name == state.name:
-            return runner
+        name = runner_config(runner).get("agentName")
+        if isinstance(name, str):
+            names.setdefault(name, runner)
+    return names
+
+
+CMUX_NEXT_RELEASE_KINDS = ("dev-daily-release", "release-compile")
+
+
+def cmux_next_ci_release_key(runner_name: str, workspace: str) -> str:
+    """The <key> of a dev-daily-release/release-compile state: cmux's scripts/cmux-next/release-derived-data-path.sh
+    names it sha256("$RUNNER_NAME\n$GITHUB_WORKSPACE\n")[:16], one per runner and workspace (cmux11s,
+    2026-10-21: release-compile/3c965dbc3ce04dc2 is cmux11s-mac-mini-glaeda-1 in its _work/cmux/cmux)."""
+    return hashlib.sha256(f"{runner_name}\n{workspace}\n".encode()).hexdigest()[:16]
+
+
+def cmux_next_ci_release_keys() -> dict[str, Path]:
+    """Release state key -> enrolled runner, for its cmux checkout ($GITHUB_WORKSPACE: <workFolder>/cmux/cmux)
+    as given and as resolved."""
+    keys: dict[str, Path] = {}
+    for name, runner in enrolled_runner_names().items():
+        workspace = os.fspath(runner_work_folder(runner) / "cmux/cmux")
+        for ws in {workspace, os.path.realpath(workspace)}:
+            keys.setdefault(cmux_next_ci_release_key(name, ws), runner)
+    return keys
+
+
+def cmux_next_ci_owner(state: Path, root: Path) -> Path | None:
+    """The enrolled runner a validated state root belongs to: cmux-scheme/<agentName>, or <kind>/<key>/Release/...
+    by its release key. None for a runner no longer enrolled here, or a shape neither names."""
+    if state.parent == root / "cmux-scheme":
+        return enrolled_runner_names().get(state.name)
+    if state.parent.parent.parent in tuple(root / kind for kind in CMUX_NEXT_RELEASE_KINDS):
+        return cmux_next_ci_release_keys().get(state.parent.parent.name)
     return None
 
 
-def cmux_next_ci_generated_paths(root: Path) -> list[Path]:
+def cmux_next_ci_runner(path: Path, root: Path) -> Path | None:
+    """The enrolled runner whose state (cmux-scheme/<agentName>, or a release state by its key) holds generated
+    child PATH, or None (a runner no longer enrolled here)."""
+    state = cmux_next_ci_state_for(path, root)
+    return None if state is None else cmux_next_ci_owner(state, root)
+
+
+def cmux_next_ci_stale_roots(root: Path) -> list[Path]:
+    """Validated state roots the size cap may take whole, inputs included: those no runner enrolled here owns
+    (a scheme state by name, a release state by key; cmux_next_ci_owner), idle at least a job's timeout
+    (cmux_next_ci_unowned_idle_hours). Only a host with enrolled runners can say an owner is gone, so elsewhere
+    there are none. An enrolled runner's states, and a younger unowned one, keep their inputs."""
+    if not enrolled_runner_names():
+        return []
+    idle_s = float(POLICY["cmux_next_ci_unowned_idle_hours"]) * 3600
+    now = time.time()
+    return [s for s in cmux_next_ci_state_roots(root)
+            if cmux_next_ci_owner(s, root) is None and now - newest_mtime(s, 2, 3000) >= idle_s]
+
+
+def cmux_next_ci_generated_paths(root: Path, whole_stale: bool = False) -> list[Path]:
     """Generated children eligible for the cmux-next retention family.
 
     Inputs and unknown state are deliberately absent from this list. In
     particular, SourcePackages, ModuleCache.noindex and SDK caches remain
     available for future runs and are never treated as disposable output.
+    With ``whole_stale`` (the cache is over its cap), an unowned state root
+    (cmux_next_ci_stale_roots) is listed whole instead of its children.
     """
     found: list[Path] = []
+    stale = set(cmux_next_ci_stale_roots(root)) if whole_stale else set()
     for state in cmux_next_ci_state_roots(root):
+        if state in stale:
+            found.append(state)
+            continue
         for child in _children(state):
             if child.name in CMUX_NEXT_CI_PRESERVED_NAMES or child.is_symlink():
                 continue
             if child.name in CMUX_NEXT_CI_GENERATED_NAMES and (child.is_dir() or child.is_file()):
                 found.append(child)
     return found
+
+
+def cmux_next_ci_cap_state(fams: list[Family], cap_gib: float, measure: bool = False) -> dict[str, float] | None:
+    """The cmux-next-ci cache's size against CAP_GIB: used, cap and over bytes, and when it was measured (at).
+
+    With ``measure`` (a pressure run) one du of its whole root, inputs included, which CMUX_NEXT_CAP_RECORD keeps;
+    without, that record alone, so a report never walks the cache (7-10 s on a mini). None when the cap does not
+    apply: off (0), the family not in this run, no enrolled glaeda runner (not a CI host), or the size unknown
+    (the 72 h window then stands). The du is a probe, not an eviction measurement, so its timeout records no
+    eviction_stuck and no cooldown."""
+    fam = next((f for f in fams if f.id == CMUX_NEXT_CI_FAMILY), None)
+    if fam is None or cap_gib <= 0 or not enrolled_runners():
+        return None
+    if measure:
+        used, at = du_bytes(fam.root, record_timeout=False), time.time()
+        if used is not None:
+            with contextlib.suppress(OSError):
+                CMUX_NEXT_CAP_RECORD.parent.mkdir(parents=True, exist_ok=True)
+                tmp = CMUX_NEXT_CAP_RECORD.with_suffix(f".{os.getpid()}.tmp")
+                tmp.write_text(json.dumps({"root": os.fspath(fam.root), "used": used, "at": at}))
+                os.replace(tmp, CMUX_NEXT_CAP_RECORD)
+    else:
+        try:
+            doc = json.loads(CMUX_NEXT_CAP_RECORD.read_text())
+            used, at = int(doc["used"]), float(doc["at"])
+            if doc.get("root") != os.fspath(fam.root):
+                return None
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+    if used is None:
+        return None
+    cap = int(cap_gib * GIB)
+    return {"used": used, "cap": cap, "over": max(0, used - cap), "at": at}
 
 
 def cmux_next_ci_family(root: Path | None = None) -> Family:
@@ -6066,7 +6222,7 @@ def cmux_next_ci_state_for_path(path: Path, root: Path) -> Path | None:
 
 def cmux_next_ci_busy(fam: Family, path: Path, opened: list[str] | frozenset[str],
                       commands: str) -> str:
-    """Fresh process/lease/lock veto for one cmux-next generated child.
+    """Fresh process/lease/lock veto for one cmux-next generated child, or an unowned state root the cap takes whole.
 
     Marker presence is treated as active or ambiguous state. A stale marker is
     therefore a safe keep until the owner repairs it; this family never guesses
@@ -6075,6 +6231,8 @@ def cmux_next_ci_busy(fam: Family, path: Path, opened: list[str] | frozenset[str
     if fam.id != CMUX_NEXT_CI_FAMILY:
         return ""
     state = cmux_next_ci_state_for(path, fam.root)
+    if state is None and cmux_next_ci_over() and path in cmux_next_ci_stale_roots(fam.root):
+        state = path  # an unowned state root the cap takes whole: the same vetoes, on the root itself
     if state is None:
         return "cmux-next state root is no longer validated"
     if (runner := cmux_next_ci_runner(path, fam.root)) is not None and (why := runner_job_live(runner, commands)):
@@ -6471,6 +6629,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
                          "the runner hook passes its own --min-free-gib when it evicts before refusing a job")
     ap.add_argument("--need", type=float, default=None,
                     help="make room for this many GiB before a job; derives thresholds from the policy margins")
+    ap.add_argument("--cmux-next-cap-gib", type=float, default=POLICY["cmux_next_ci_cap_gib"],
+                    help="under pressure, while ~/Library/Caches/cmux-next-ci is over this many GiB, its least "
+                         "recently used generated output (and states no enrolled runner owns) go whatever their age; "
+                         "0 turns the cap off (default %(default)g, disk-policy.json cmux_next_ci_cap_gib)")
     ap.add_argument("--cmux-next-drain", action="store_true",
                     help="explicit enrolled-runner maintenance: drain cmux-next generated output under host.lock")
     ap.add_argument("--cmux-next-reservation-owner",
@@ -6546,6 +6708,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
             print("refresh lock unavailable; skipped")
             return 0
 
+    if not math.isfinite(a.cmux_next_cap_gib) or a.cmux_next_cap_gib < 0:
+        ap.error("--cmux-next-cap-gib must be a non-negative GiB value")
     if a.need is not None:
         if not math.isfinite(a.need) or a.need <= 0:
             ap.error("--need must be a positive GiB value")
@@ -6664,6 +6828,22 @@ def _main_impl(argv: list[str] | None = None) -> int:
             print(why)
             RUN["skipped"] = "defer_during_ci"
             return 0
+    # only a pressure run measures the cap (one du) and acts on it (cmux_next_ci_over); a text report shows the last
+    # measurement, and --json (glaeda-fleet-status asks every mini on every call) neither measures nor shows it
+    global CMUX_NEXT_CI_OVER
+    pressure = ACTIVITY_MODE == "pressure" and not a.cmux_next_drain
+    cap = (cmux_next_ci_cap_state(fams, a.cmux_next_cap_gib, measure=True) if pressure
+           else cmux_next_ci_cap_state(fams, a.cmux_next_cap_gib, measure=False)
+           if not sweep and not a.cmux_next_drain and not a.refresh and not a.json else None)
+    CMUX_NEXT_CI_OVER = cap["over"] if cap and pressure else 0
+    RUN["cmux_next_ci_over_gib"] = round(cap["over"] / GIB, 1) if cap and pressure else None
+    if cap and not a.json:
+        measured = "" if pressure else f", measured {max(0.0, time.time() - cap['at']) / 60:.0f} min ago"
+        print(f"cmux-next-ci: {gib(cap['used']).strip()} of its {cap['cap'] / GIB:g} GiB cap "
+              f"({gib(cap['over']).strip()} over){measured}"
+              + ("; a pressure run takes its least recently used output first, whatever its age"
+                 if cap["over"] and pressure else
+                 "; a pressure run would take its least recently used output first" if cap["over"] else ""))
     # Aside trees a killed deletion left, in the directories of the families this run judges (so a pressure
     # run looks only on the filesystems under pressure); `--family interrupted-deletions` alone looks in all.
     if not a.family or INTERRUPTED in a.family:
@@ -6917,7 +7097,7 @@ def write_run_line(started: float, free_before: int | None) -> None:
            "reclaimed_gib": round(RUN.get("released", 0) / GIB, 1),
            "reached": None if target is None or after is None else after >= target,
            "blocked": RUN.get("blocked", {}), "duration_s": round(time.time() - started, 1),
-           "skipped": RUN.get("skipped")}
+           "skipped": RUN.get("skipped"), "cmux_next_ci_over_gib": RUN.get("cmux_next_ci_over_gib")}
     with contextlib.suppress(OSError):
         RUN_LOG.parent.mkdir(parents=True, exist_ok=True)
         with RUN_LOG.open("a") as f:
