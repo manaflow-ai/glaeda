@@ -1751,6 +1751,28 @@ class ClientTest(Base):
         ok = gg.parse_pr(pr_node(4, rollup="SUCCESS", checks=[check_run("build")]))
         self.assertEqual(gg.verdict("pr", {**ok, "checksTruncated": True, "checkState": "SUCCESS"}, "green"), 0)
 
+    def test_over_100_checks_a_superseded_cancel_does_not_end_the_wait_while_checks_run(self) -> None:
+        """manaflow-ai/cmux#24539 (77 checks shown of more): 0 failed and 7 running, but GitHub's rollup
+        said FAILURE over superseded cancelled attempts, and the wait exited 1 after 5s."""
+        running = check_run("fast tier", status="IN_PROGRESS", conclusion=None)
+        data = gg.parse_pr(pr_node(1, rollup="FAILURE", checks=[check_run("build"), running]))
+        cancelled = {"name": "changes", "conclusion": "CANCELLED"}
+        many = {**data, "checksTruncated": True, "checkState": "FAILURE", "superseded": [cancelled]}
+        self.assertIsNone(gg.verdict("pr", many, "green"))
+        self.assertIsNone(gg.verdict("pr", many, "required"))
+        # a shown failure still fails at once
+        broken = gg.parse_pr(pr_node(2, rollup="FAILURE", checks=[check_run("lint", conclusion="FAILURE"), running]))
+        self.assertEqual(gg.verdict("pr", {**broken, "checksTruncated": True, "checkState": "FAILURE",
+                                           "superseded": [cancelled]}, "green"), 1)
+        self.assertEqual(gg.verdict("pr", {**broken, "checksTruncated": True, "checkState": "FAILURE",
+                                           "superseded": [cancelled]}, "required"), 1)
+        # with no superseded attempt to explain it, the rollup's FAILURE is a check past the first 100
+        self.assertEqual(gg.verdict("pr", {**many, "superseded": []}, "green"), 1)
+        # once the shown checks finish, the rollup decides as before
+        done = gg.parse_pr(pr_node(3, rollup="FAILURE", checks=[check_run("build")]))
+        self.assertEqual(gg.verdict("pr", {**done, "checksTruncated": True, "checkState": "FAILURE",
+                                           "superseded": [cancelled]}, "green"), 1)
+
     def test_a_check_cancelled_before_any_step_is_held_for_the_rescue(self) -> None:
         """manaflow-ai/cmux#20608: the owned-pool rescue cancelled a fast tier still queued for a
         runner (no step ran) and re-ran it; a wait that read the gap exited 1 before the re-run."""

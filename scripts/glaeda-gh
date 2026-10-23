@@ -2749,6 +2749,12 @@ def check_verdict(data: dict, until: str = "green", now: float | None = None,
             return None  # every shown check finishes first, as under 100 checks
         if groups["failed"] and until != "required":
             return EXIT_FAIL
+        # GitHub's rollup still counts a superseded attempt that failed or was cancelled, so its FAILURE
+        # can be that attempt rather than a check past the first 100: with no shown failure, the shown
+        # checks finish first, and then the rollup decides (manaflow-ai/cmux#24539: 0 failed and 7
+        # running, yet the wait exited 1 after 5s). A failure past the first 100 fails that much later.
+        if not groups["failed"] and groups["pending"] and data.get("superseded"):
+            return None
         return None if groups["held"] else EXIT_FAIL
     if not checks:
         return None  # nothing has reported yet
