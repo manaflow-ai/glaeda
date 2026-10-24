@@ -2634,6 +2634,12 @@ class RestartTest(Base):
         patcher = mock.patch.object(gg, "restart_service", side_effect=self.fake_restart)
         patcher.start()
         self.addCleanup(patcher.stop)
+        self.active_for: float | None = None  # the unit as systemctl reports it; None: not active
+        self.main_pid = 1  # its MainPID, the pid hold() and silent() write daemon.json as
+        unit = mock.patch.object(gg, "unit_active_for", side_effect=lambda: None if self.active_for is None
+                                 else (self.active_for, self.main_pid))
+        unit.start()
+        self.addCleanup(unit.stop)
         self.lock: Any = None
         self.addCleanup(lambda: self.lock and self.lock.close())
 
@@ -2725,14 +2731,141 @@ class RestartTest(Base):
         self.hold(stale=True)
         gg.RESTART_SETTLE, saved = 0.3, gg.RESTART_SETTLE
         self.addCleanup(setattr, gg, "RESTART_SETTLE", saved)
-        with mock.patch.object(gg, "restart_service", return_value=(True, "launchctl kickstart")), \
+        linux = mock.patch.object(gg.sys, "platform", "linux")  # macOS keeps its rule (its own test)
+        linux.start()
+        self.addCleanup(linux.stop)
+        with mock.patch.object(gg, "restart_service", return_value=(True, "systemctl --user restart")), \
                 mock.patch.object(gg, "lock_holder", return_value=None):
             code, text = self.run_restart()
         self.assertEqual(code, 3, text)
         self.assertIn("Tell the user", text)
         self.assertFalse(gg.restart_record()["ok"])
-        self.assertIsNone(gg.recent_restart())  # a failed restart starts no cooldown
+        # the restart ran, so it starts the cooldown: the daemon it started may only be slow
+        self.assertIsNotNone(gg.recent_restart())
+        code, text = self.run_restart()
+        self.assertEqual(code, 0, text)
+        self.assertIn("Do not restart it again", text)
+
+    def test_a_restart_whose_command_failed_starts_no_cooldown(self) -> None:
+        self.hold(stale=True)
+        gg.RESTART_SETTLE, saved = 0.3, gg.RESTART_SETTLE
+        self.addCleanup(setattr, gg, "RESTART_SETTLE", saved)
+        with mock.patch.object(gg, "restart_service", return_value=(False, "systemctl --user restart")), \
+                mock.patch.object(gg, "lock_holder", return_value=None):
+            code, text = self.run_restart()
+        self.assertEqual(code, 3, text)
+        self.assertIsNone(gg.recent_restart())
         self.assertEqual(gg.down_message(), gg.DOWN)
+
+    def silent(self, lag: float | None, pid: int = 1, heartbeat: bool = True) -> None:
+        """No visible lock; daemon.json's last heartbeat `lag` seconds ago (None: no daemon.json)."""
+        if lag is not None:
+            record = {"pid": pid, "at": time.time() - lag}
+            if heartbeat:
+                record["heartbeat"] = 30
+            gg.write_json(gg.BASE / "daemon.json", record)
+
+    def test_a_fresh_record_from_another_pid_does_not_hide_a_silent_unit(self) -> None:
+        self.active_for = gg.STALE_HEARTBEAT + 120
+        self.silent(5, pid=self.main_pid + 1)  # an earlier daemon's, or another serve's
+        code, text = self.run_restart()
+        self.assertEqual((code, self.calls), (0, [True]), text)
+
+    def test_an_older_daemons_fetch_record_does_not_hide_a_silent_unit(self) -> None:
+        self.active_for = gg.STALE_HEARTBEAT + 120
+        self.silent(5, heartbeat=False)  # written only when it fetched something: no heartbeat
+        code, text = self.run_restart()
+        self.assertEqual((code, self.calls), (0, [True]), text)
+
+    def test_a_daemon_before_its_first_heartbeat_is_not_hung(self) -> None:
+        """The lock's new holder has not written a heartbeat yet; the stale one is its predecessor's."""
+        self.hold(stale=True)  # daemon.json: pid 1, silent past STALE_HEARTBEAT
+        (gg.BASE / "daemon.lock").write_text(json.dumps({"pid": 4321, "since": time.time() - 2}) + "\n")
+        self.assertIsNone(gg.daemon_stale())
+        code, text = self.run_restart()
+        self.assertEqual((code, self.calls), (0, []), text)
+        self.assertIn("nothing to restart", text)
+        (gg.BASE / "daemon.lock").write_text(json.dumps({"pid": 4321, "since": time.time() - gg.STALE_HEARTBEAT - 5}) + "\n")
+        self.assertIsNotNone(gg.daemon_stale(), "a new holder that stays silent is hung")
+
+    def test_a_restart_that_died_midway_holds_nobody_back(self) -> None:
+        gone = subprocess.Popen([sys.executable, "-c", "pass"])
+        gone.wait()  # reaped: its pid names no process
+        gg.write_json(gg.BASE / "restart.json", {"at": time.time() - 5, "by": gone.pid, "how": "starting"})
+        self.assertIsNone(gg.recent_restart(), "its writer is gone: nothing is restarting it")
+        gg.write_json(gg.BASE / "restart.json", {"at": time.time() - 5, "by": os.getpid(), "how": "starting"})
+        self.assertIsNotNone(gg.recent_restart(), "while its writer runs, that restart is under way")
+        code, text = self.run_restart()  # holds restart.lock itself: no other restart can be running
+        self.assertEqual((code, self.calls), (0, [False]), text)
+
+    def test_a_hung_holder_whose_status_file_is_gone_is_restarted(self) -> None:
+        self.hold(stale=True)
+        (gg.BASE / "daemon.lock").write_text(json.dumps({"pid": 4321, "since": time.time() - gg.STALE_HEARTBEAT - 60}) + "\n")
+        (gg.BASE / "daemon.json").unlink()
+        self.assertIsNotNone(gg.daemon_stale())
+        (gg.BASE / "daemon.json").write_text("{not json")
+        self.assertIsNotNone(gg.daemon_stale(), "an unreadable one says nothing either")
+        with mock.patch.object(gg, "is_serve", return_value=False):
+            code, text = self.run_restart()
+        self.assertEqual((code, self.calls), (0, [True]), text)
+
+    def test_a_holder_that_writes_heartbeats_is_not_stale(self) -> None:
+        self.hold(stale=False)
+        (gg.BASE / "daemon.lock").write_text(json.dumps({"pid": 1, "since": time.time() - 3 * gg.STALE_HEARTBEAT}) + "\n")
+        self.assertIsNone(gg.daemon_stale(), "its own recent heartbeat counts, not when it took the lock")
+
+    def test_on_macos_a_restart_without_a_heartbeat_starts_no_cooldown(self) -> None:
+        self.hold(stale=True)
+        gg.RESTART_SETTLE, saved = 0.3, gg.RESTART_SETTLE
+        self.addCleanup(setattr, gg, "RESTART_SETTLE", saved)
+        with mock.patch.object(gg.sys, "platform", "darwin"), \
+                mock.patch.object(gg, "restart_service", return_value=(True, "nothing: launchd has already scheduled the respawn")), \
+                mock.patch.object(gg, "lock_holder", return_value=None):
+            code, text = self.run_restart()
+        self.assertEqual(code, 3, text)
+        self.assertIsNone(gg.recent_restart())
+
+    def test_an_active_unit_silent_without_a_visible_lock_is_restarted(self) -> None:
+        """huge-blue, 10-23: the lock was on a deleted file and nothing wrote a heartbeat; start was a no-op."""
+        self.active_for = gg.STALE_HEARTBEAT + 120
+        self.silent(gg.STALE_HEARTBEAT + 60)
+        code, text = self.run_restart()
+        self.assertEqual((code, self.calls), (0, [True]), text)
+
+    def test_an_active_unit_with_no_heartbeat_file_is_restarted_once_it_is_old(self) -> None:
+        self.active_for = gg.STALE_HEARTBEAT + 120
+        code, text = self.run_restart()
+        self.assertEqual((code, self.calls), (0, [True]), text)
+
+    def test_a_unit_that_became_active_recently_is_only_started(self) -> None:
+        self.active_for = 30  # a daemon starting up, before its first heartbeat
+        self.silent(gg.STALE_HEARTBEAT + 60)  # the previous daemon's last one
+        code, text = self.run_restart()
+        self.assertEqual((code, self.calls), (0, [False]), text)
+
+    def test_an_active_unit_with_a_fresh_heartbeat_is_not_restarted(self) -> None:
+        """A daemon whose lock file was moved still writes heartbeats and re-locks itself within a tick."""
+        self.active_for = gg.STALE_HEARTBEAT + 120
+        self.silent(5)
+        code, text = self.run_restart()
+        self.assertEqual((code, self.calls), (0, [False]), text)
+
+    def test_silent_unit_restarts_once_across_sessions(self) -> None:
+        self.active_for = gg.STALE_HEARTBEAT + 120
+        self.silent(gg.STALE_HEARTBEAT + 60)
+        gg.RESTART_SETTLE, saved = 0.3, gg.RESTART_SETTLE
+        self.addCleanup(setattr, gg, "RESTART_SETTLE", saved)
+        ran: list[bool] = []
+
+        def slow(hung: bool) -> tuple[bool, str]:
+            ran.append(hung)
+            return True, "systemctl --user restart glaeda-gh.service"  # ran, but no heartbeat in time
+
+        with mock.patch.object(gg, "restart_service", side_effect=slow), mock.patch.object(gg.sys, "platform", "linux"):
+            first, _ = self.run_restart()
+            second, text = self.run_restart()
+        self.assertEqual((first, second, ran), (3, 0, [True]), text)
+        self.assertIn("Do not restart it again", text)
 
     def test_stop_process_escalates_to_sigkill(self) -> None:
         child = subprocess.Popen([sys.executable, "-c",
@@ -2833,6 +2966,27 @@ class LaunchdRestartTest(unittest.TestCase):
         with mock.patch.object(gg.sys, "platform", "linux"), mock.patch.object(gg, "run_bounded", fake):
             self.assertTrue(gg.restart_service(True)[0])
         self.assertEqual([a[2] for a in seen], ["reset-failed", "restart"])
+
+    def test_unit_active_for_reads_systemd_monotonic_time(self) -> None:
+        def answer(out: str, code: int = 0) -> Any:
+            return lambda argv, timeout=None: subprocess.CompletedProcess(argv, code, out, "")
+
+        ago = time.monotonic() / 2  # a CI runner may have booted only minutes ago
+        entered = int((time.monotonic() - ago) * 1e6)
+        with mock.patch.object(gg.sys, "platform", "linux"):
+            with mock.patch.object(gg, "run_bounded", answer(f"ActiveState=active\nActiveEnterTimestampMonotonic={entered}\nMainPID=77\n")):
+                active, main = gg.unit_active_for()
+                self.assertAlmostEqual(active, ago, delta=5)
+                self.assertEqual(main, 77)
+            with mock.patch.object(gg, "run_bounded", answer(f"ActiveState=inactive\nActiveEnterTimestampMonotonic={entered}\n")):
+                self.assertIsNone(gg.unit_active_for())
+            with mock.patch.object(gg, "run_bounded", answer("ActiveState=active\nActiveEnterTimestampMonotonic=0\nMainPID=77\n")):
+                self.assertIsNone(gg.unit_active_for())
+            with mock.patch.object(gg, "run_bounded", answer("", 1)):
+                self.assertIsNone(gg.unit_active_for())
+        with mock.patch.object(gg.sys, "platform", "darwin"), mock.patch.object(gg, "run_bounded") as run:
+            self.assertIsNone(gg.unit_active_for())
+            run.assert_not_called()
 
     def test_error_5_reloads_once(self) -> None:
         (ok, how), seen = self.run_with({"kickstart": 5})

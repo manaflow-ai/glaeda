@@ -2647,14 +2647,34 @@ def restart_record() -> dict | None:
     return record if isinstance(record, dict) and isinstance(record.get("at"), (int, float)) else None
 
 
-def recent_restart(now: float | None = None) -> float | None:
-    """Seconds since the last `glaeda-gh restart`, while that is under RESTART_COOLDOWN. A restart that
-    failed does not count: sessions must not be told to wait on a restart that did not happen."""
+def recent_restart(now: float | None = None, holding: bool = False) -> float | None:
+    """Seconds since the last `glaeda-gh restart`, while that is under RESTART_COOLDOWN. A restart whose
+    command failed does not count: sessions must not be told to wait on a restart that did not happen.
+    One that ran but saw no heartbeat within RESTART_SETTLE does: the daemon it started may just be
+    slow, and another session restarting it again would kill that one (the 10-19 kickstart storm).
+    `holding`: the caller holds restart.lock, so no other restart is in progress, whatever pid wrote a
+    "starting" record."""
     record = restart_record()
-    if record is None or record.get("ok") is False:
+    if record is None or (record.get("ok") is False and not record.get("ran")):
         return None
+    if record.get("how") == "starting" and (holding or not alive(record.get("by"))):
+        return None  # a restart that died before it finished: nothing is starting a daemon
     ago = (time.time() if now is None else now) - record["at"]
     return ago if 0 <= ago < RESTART_COOLDOWN else None
+
+
+def alive(pid: Any) -> bool:
+    """Whether `pid` (the restart that wrote a "starting" record) still runs. Never touches restart.lock,
+    so it cannot make a real restart's lock attempt fail."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:  # another user's: it exists
+        return True
+    return True
 
 
 def down_message() -> str:
@@ -2668,13 +2688,62 @@ def down_message() -> str:
 
 def daemon_stale() -> float | None:
     """Seconds since the daemon's last heartbeat, when that is so long ago that it looks hung."""
-    status = read_json(BASE / "daemon.json")
-    # an older daemon wrote daemon.json only when it fetched something: its silence means nothing
-    at = status.get("at") if isinstance(status, dict) and status.get("heartbeat") else None
-    if not isinstance(at, (int, float)):
-        return None
-    lag = time.time() - at
+    holder = lock_holder() if lock_held() else None
+    if holder is not None:
+        # The holder's own record: its silence counts from its last heartbeat, or from when it took
+        # the lock when daemon.json is its predecessor's (before its first heartbeat), missing or
+        # unreadable. One read of daemon.json, so a heartbeat written meanwhile is never missed.
+        lag = holder["silent"]
+    else:
+        status = read_json(BASE / "daemon.json")
+        # an older daemon (no holder record) wrote daemon.json only when it fetched something: its
+        # silence means nothing
+        at = status.get("at") if isinstance(status, dict) and status.get("heartbeat") else None
+        if not isinstance(at, (int, float)):
+            return None
+        lag = time.time() - at
     return lag if lag > STALE_HEARTBEAT else None
+
+
+def unit_active_for() -> tuple[float, int] | None:
+    """Linux: (seconds since glaeda-gh.service last became active, its main pid). None when it is not
+    active, on macOS, or when systemctl cannot say."""
+    if sys.platform == "darwin":
+        return None
+    try:
+        result = run_bounded(["systemctl", "--user", "show", SYSTEMD_UNIT, "-p", "ActiveState",
+                              "-p", "ActiveEnterTimestampMonotonic", "-p", "MainPID"], SUBPROCESS_DEADLINE)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    props = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+    if result.returncode != 0 or props.get("ActiveState") != "active":
+        return None
+    try:
+        entered = int(props.get("ActiveEnterTimestampMonotonic", "")) / 1e6
+        main = int(props.get("MainPID", ""))
+    except ValueError:
+        return None
+    # systemd's monotonic timestamps and time.monotonic() are both CLOCK_MONOTONIC on Linux
+    return (time.monotonic() - entered, main) if entered > 0 else None
+
+
+def silent_unit() -> float | None:
+    """Linux: seconds the active unit has written no heartbeat, when no daemon lock is visible and that
+    is over STALE_HEARTBEAT (and the unit has been active that long). That daemon is hung where clients
+    cannot see its lock (huge-blue, 10-23: a cleanup deleted ~/.cache/glaeda under it), and `systemctl
+    --user start` is a no-op on an active unit, so only a restart recovers it. A daemon on this version
+    whose lock was only moved re-execs onto the visible one within a tick, writing heartbeats meanwhile,
+    so it never looks silent here. Only a heartbeat the unit's own main pid wrote counts: one left by an
+    earlier daemon, or an older daemon's fetch record (no heartbeat), says nothing about this one."""
+    unit = unit_active_for()
+    if unit is None or unit[0] <= STALE_HEARTBEAT:
+        return None
+    active, main = unit
+    status = read_json(BASE / "daemon.json")
+    mine = isinstance(status, dict) and status.get("heartbeat") and status.get("pid") == main
+    at = status.get("at") if mine else None
+    silent = min(time.time() - at, active) if isinstance(at, (int, float)) else active
+    return silent if silent > STALE_HEARTBEAT else None
 
 
 def daemon_failing() -> dict | None:
@@ -5472,15 +5541,16 @@ def cmd_restart(force: bool = False) -> int:
             print("glaeda-gh: the daemon is running and its heartbeat is fresh; nothing to restart. "
                   "If a wait printed an older warning, re-run it.")
             return EXIT_OK
-        ago = recent_restart()
+        ago = recent_restart(holding=True)
         if ago is not None and not force:
             record = restart_record() or {}
             print(f"glaeda-gh: the daemon was restarted {int(ago)}s ago (pid {record.get('by', '?')}: "
                   f"{record.get('how', '?')}). Do not restart it again: a new daemon writes a heartbeat as soon "
                   f"as it holds its lock. Re-run your wait; after {RESTART_COOLDOWN}s a restart is allowed again.")
             return EXIT_OK
-        hung = running  # running but silent: restart; not running: start
-        holder = lock_holder() if hung else None
+        # running but silent, or an active unit silent with no visible lock: restart; not running: start
+        hung = running or silent_unit() is not None
+        holder = lock_holder() if running else None
         killed = None
         began = time.time()
         write_json(BASE / "restart.json", {"at": began, "by": os.getpid(), "how": "starting"})
@@ -5499,7 +5569,10 @@ def cmd_restart(force: bool = False) -> int:
         # Success is a heartbeat written after the restart began (a new daemon writes one as soon as
         # it holds the lock), not merely a held lock: a hung holder that survived holds it too.
         ok = started and new_heartbeat(began, RESTART_SETTLE)
-        write_json(BASE / "restart.json", {"at": began, "by": os.getpid(), "how": how, "ok": ok})
+        # macOS keeps its rule (a restart without a heartbeat starts no cooldown): its "spawn scheduled"
+        # path succeeds without running anything
+        ran = started and sys.platform != "darwin"
+        write_json(BASE / "restart.json", {"at": began, "by": os.getpid(), "how": how, "ok": ok, "ran": ran})
         if ok:
             print(f"glaeda-gh: restarted the daemon ({how}); a new daemon holds its lock and wrote its heartbeat. "
                   "Re-run your wait.")
