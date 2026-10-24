@@ -2668,6 +2668,41 @@ class RestartTest(Base):
         self.assertEqual((code, self.calls), (0, [False]), text)
         self.assertIn("Do not restart it again", text)
 
+    def test_a_daemon_that_waited_on_a_replaced_lock_file_waits_on_the_new_one(self) -> None:
+        """The waiter got the old inode once its holder re-executed off it; it must not poll beside the
+        daemon that locked the new file."""
+        old = open(gg.BASE / "daemon.lock", "a+")
+        self.addCleanup(old.close)
+        (gg.BASE / "daemon.lock").rename(gg.BASE / "moved.lock")
+        opened: list[Any] = []
+        real_open = open
+
+        def first_open_is_the_old_file(path: Any, *args: Any, **kwargs: Any) -> Any:
+            if Path(path) == gg.BASE / "daemon.lock" and not opened:
+                opened.append(old)
+                return old  # it opened the file before it was moved
+            handle = real_open(path, *args, **kwargs)
+            opened.append(handle)
+            return handle
+
+        with mock.patch("builtins.open", side_effect=first_open_is_the_old_file):
+            lock = gg.hold_daemon_lock()
+        self.addCleanup(lock.close)
+        self.assertEqual(len(opened), 2)
+        self.assertFalse(gg.lock_replaced(lock))
+        self.assertTrue(old.closed, "the old inode's lock was let go")
+
+    def test_lock_replaced_sees_a_removed_or_swapped_lock_file(self) -> None:
+        lock = open(gg.BASE / "daemon.lock", "a+")
+        self.addCleanup(lock.close)
+        self.assertFalse(gg.lock_replaced(lock))
+        (gg.BASE / "daemon.lock").rename(gg.BASE / "moved.lock")
+        self.assertTrue(gg.lock_replaced(lock), "removed")
+        (gg.BASE / "daemon.lock").write_text("")
+        self.assertTrue(gg.lock_replaced(lock), "another file at the path")
+        os.replace(gg.BASE / "moved.lock", gg.BASE / "daemon.lock")
+        self.assertFalse(gg.lock_replaced(lock), "its own file back")
+
     def test_hung_daemon_is_restarted(self) -> None:
         self.hold(stale=True)
         with mock.patch.object(gg, "lock_holder", return_value=None):

@@ -2450,10 +2450,22 @@ def acquire_lock(lock: Any, sleep: Callable[[float], Any] = time.sleep) -> None:
     record_holder(lock)
 
 
+def hold_daemon_lock() -> Any:
+    """Take the daemon lock on the file at BASE/daemon.lock. A daemon that waited on a file which was
+    moved or replaced meanwhile (a daemon before it re-executed off it) lets that one go and waits on
+    the current file instead, so two daemons never poll, each locking a different inode."""
+    while True:
+        BASE.mkdir(parents=True, exist_ok=True, mode=0o700)
+        lock = open(BASE / "daemon.lock", "a+")
+        acquire_lock(lock)
+        if not lock_replaced(lock):
+            return lock
+        log({"event": "relock", "pid": os.getpid()})
+        lock.close()
+
+
 def serve(foreground_ok: bool = False) -> int:
-    BASE.mkdir(parents=True, exist_ok=True, mode=0o700)
-    lock = open(BASE / "daemon.lock", "a+")
-    acquire_lock(lock)
+    lock = hold_daemon_lock()
     first_heartbeat()
     me = Path(__file__).resolve()
     stamp = me.stat().st_mtime
@@ -2482,8 +2494,27 @@ def serve(foreground_ok: bool = False) -> int:
             if me.stat().st_mtime != stamp:
                 log({"event": "reexec"})
                 os.execv(sys.executable, [sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
+            if lock_replaced(lock):
+                # A cleanup moved or deleted BASE (huge-blue, 10-24: a hygiene pass trashed ~/.cache/glaeda):
+                # this daemon still polls, but its lock is on a file nobody can see, so every client reads
+                # "not running" and restart's start is a no-op on the active unit. Start over on the new path.
+                log({"event": "reexec", "why": "daemon.lock was removed or replaced"})
+                os.execv(sys.executable, [sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
         except OSError:
             pass
+
+
+def lock_replaced(lock: Any) -> bool:
+    """Whether BASE/daemon.lock is no longer the file this daemon holds its lock on: removed, or another
+    file now at that path. An unreadable path is not proof, so that answers False."""
+    try:
+        here = os.stat(BASE / "daemon.lock")
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    mine = os.fstat(lock.fileno())
+    return (here.st_dev, here.st_ino) != (mine.st_dev, mine.st_ino)
 
 
 SYSTEMD_UNIT = "glaeda-gh.service"
