@@ -233,6 +233,7 @@ CONTROLLER_CONFIG = Path.home() / ".local/share/cmux-fleet-client/client.json"
 CONTROLLER_TOKEN = Path.home() / ".config/cmux/build-fleet/controller.token"
 CONTROLLER_TIMEOUT = 3  # a tick must not stall on an unreachable controller
 CONTROLLER_DEADLINE = 6  # one whole controller request
+CONTROLLER_RUN_MAX_WAIT = 300  # one bounded long-poll request for an active run waiter
 CONTROLLER_FEED_EVERY = 20  # seconds between change-feed reads: each request costs the controller a tailnet
 # whois, and 18 hosts at one read per tick drove tailscaled into a kernel panic on cmux-lawrence (10-07)
 CONTROLLER_RETRY = 60  # after a failure, the controller is left alone this long, doubling up to CONTROLLER_ABSENT
@@ -653,12 +654,14 @@ class Controller:
             token = None
         return cls(base, token)
 
-    def get(self, path: str) -> dict:
+    def get(self, path: str, timeout: float | None = None) -> dict:
         """One JSON answer. Raises NoReceiver (404, 503) or WatchError."""
         headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
         request = urllib.request.Request(self.base + path, headers=headers)
         try:
-            with hard_deadline(CONTROLLER_DEADLINE), OPENER.open(request, timeout=CONTROLLER_TIMEOUT) as response:
+            budget = CONTROLLER_TIMEOUT if timeout is None else timeout
+            deadline = CONTROLLER_DEADLINE if timeout is None else timeout + CONTROLLER_DEADLINE
+            with hard_deadline(deadline), OPENER.open(request, timeout=budget) as response:
                 doc = json.loads(response.read(MAX_BODY))
         except urllib.error.HTTPError as error:
             if error.code in {404, 503}:
@@ -670,9 +673,12 @@ class Controller:
             raise WatchError("controller: not a JSON object")
         return doc
 
-    def run(self, run_id: int) -> dict | None:
-        """The controller's view of a run, or None when it has never seen it. Raises WatchError."""
-        doc = self.get(f"/v1/github/runs/{int(run_id)}?wait=0")
+    def run(self, run_id: int, wait: int = 0) -> dict | None:
+        """The controller's view of a run, optionally long-polling until it changes state."""
+        if not isinstance(wait, int) or not 0 <= wait <= CONTROLLER_RUN_MAX_WAIT:
+            raise WatchError(f"controller run wait must be 0..{CONTROLLER_RUN_MAX_WAIT} seconds")
+        timeout = CONTROLLER_TIMEOUT if wait == 0 else wait + CONTROLLER_TIMEOUT
+        doc = self.get(f"/v1/github/runs/{int(run_id)}?wait={wait}", timeout=timeout)
         run = doc.get("run")
         return run if doc.get("known") and isinstance(run, dict) else None
 
@@ -1782,12 +1788,20 @@ class Daemon:
             self.beat = self.now
 
     def store(self, key: str, prior: dict | None, **fields: Any) -> None:
-        entry = {"key": key, "fetchedAt": self.now, "dataAt": None, "data": None, "error": None}
-        if prior:
-            entry.update({k: prior[k] for k in ("dataAt", "data", "etag", "jobs", "jobsEtag", "jobsAt", "restAt", "source", "restParts")
-                          if k in prior})
-        entry.update(fields)
-        write_json(cache_dir() / file_name(key), entry)
+        cache_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
+        cache = cache_dir() / file_name(key)
+        with bounded_lock(cache_dir() / ".write.lock") as held:
+            if not held:
+                self.errors.append(f"{key}: cache write lock timeout")
+                return
+            current = read_json(cache)
+            base = current if isinstance(current, dict) else prior
+            entry = {"key": key, "fetchedAt": self.now, "dataAt": None, "data": None, "error": None}
+            if base:
+                entry.update({k: base[k] for k in ("dataAt", "data", "etag", "jobs", "jobsEtag", "jobsAt", "restAt", "source", "restParts")
+                              if k in base})
+            entry.update(fields)
+            write_json(cache, entry)
 
     def fail(self, entries: list[dict], message: str) -> None:
         self.errors.append(message)
@@ -3384,6 +3398,58 @@ def serving_waits() -> bool:
             and daemon_failing() is None and daemon_stale() is None)
 
 
+def controller_wait_run(key: str, timeout: float) -> dict | None:
+    """Use one bounded controller long-poll and publish it through the cache write lock."""
+    controller = Controller.from_env()
+    if controller is None:
+        return None
+    _, owner, repo, run_id = split_key(key)
+    wait = max(0, min(CONTROLLER_RUN_MAX_WAIT, int(timeout)))
+    try:
+        baseline = controller.run(run_id, wait=0)
+        if not isinstance(baseline, dict) or str(baseline.get("id")) != str(run_id):
+            return None
+        expected_repo = f"{owner}/{repo}"
+        if str(baseline.get("repo") or "").lower() != expected_repo:
+            return None
+        expected_attempt = baseline.get("attempt")
+        run = controller.run(run_id, wait=wait)
+    except (NoReceiver, WatchError, OSError):
+        return None
+    if (not isinstance(run, dict) or str(run.get("id")) != str(run_id)
+            or str(run.get("repo") or "").lower() != expected_repo
+            or run.get("attempt") != expected_attempt):
+        return None
+    candidate = controller_run(run)
+    cache_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
+    cache = cache_dir() / file_name(key)
+    with bounded_lock(cache_dir() / ".write.lock") as held:
+        if not held:
+            return None
+        prior = read_json(cache) or {}
+        prior_data = prior.get("data") or {}
+        try:
+            if (prior_data.get("run_attempt") is not None
+                    and int(candidate.get("run_attempt") or 0) < int(prior_data["run_attempt"])):
+                return None
+        except (TypeError, ValueError):
+            return None
+        prior_updated = iso_epoch(prior_data.get("updated_at"))
+        candidate_updated = iso_epoch(candidate.get("updated_at"))
+        if prior_updated is not None and candidate_updated is not None and candidate_updated < prior_updated:
+            return None
+        now = time.time()
+        rest_at = (prior.get("restAt") if prior.get("source") == "controller"
+                   and isinstance(prior.get("restAt"), (int, float)) else now)
+        entry = {"key": key, "fetchedAt": now, "dataAt": now, "restAt": rest_at,
+                 "data": candidate, "error": None, "source": "controller"}
+        for field in ("etag", "jobs", "jobsEtag", "jobsAt", "restParts"):
+            if field in prior:
+                entry[field] = prior[field]
+        write_json(cache, entry)
+    return entry
+
+
 def subscribe_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_json: bool,
                    sha: str | None = None, grace: float = RESCUE_GRACE) -> int:
     """`wait pr|run` as a request the daemon rules on: this process writes it and becomes BLOCKER, a bash
@@ -3404,6 +3470,17 @@ def subscribe_wait(kind: str, target: str, until: str, timeout: float, jobs: boo
     if sha:
         sha, exact = resolve_sha(sha)
     say_waiting(waiting_line(key, until, sha, exact, timeout))
+    req = wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace)
+    if kind == "run" and not jobs:
+        started = time.monotonic()
+        controller_wait_run(key, timeout)
+        done = wait_step(req, time.time())
+        if done is not None:
+            sys.stdout.write(done[1])
+            return done[0]
+        # The one-shot request may have returned an in-progress run or a transport fallback. The
+        # remaining deadline is recomputed after the blocking call before the FIFO wait begins.
+        timeout = max(0.0, timeout - (time.monotonic() - started))
     try:
         rid = write_wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace, os.getpid())
     except OSError:

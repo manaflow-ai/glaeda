@@ -376,6 +376,28 @@ class ControllerTest(Base):
             self.daemon.tick(NOW + 5 * gg.CYCLE + gg.TICK + i * gg.CYCLE)
         self.assertEqual(len(self.gh.rest_calls()), 2)
 
+    def test_controller_run_supports_one_shot_long_poll(self) -> None:
+        controller = gg.Controller("http://controller:18765", None)
+        payload = {"known": True, "run": ctl_run(41, "completed", "success")}
+        with mock.patch.object(controller, "get", return_value=payload) as get:
+            self.assertEqual(controller.run(41, wait=7)["id"], 41)
+        get.assert_called_once_with("/v1/github/runs/41?wait=7", timeout=10)
+
+    def test_controller_run_rejects_unbounded_wait(self) -> None:
+        controller = gg.Controller("http://controller:18765", None)
+        with self.assertRaisesRegex(gg.WatchError, r"0\.\.300"):
+            controller.run(41, wait=301)
+
+    def test_cache_store_fails_closed_when_write_lock_times_out(self) -> None:
+        @contextlib.contextmanager
+        def unavailable_lock(*_args, **_kwargs):
+            yield False
+
+        key = "run:o/r/42"
+        with mock.patch.object(gg, "bounded_lock", unavailable_lock):
+            self.daemon.store(key, None, data={"id": 42, "status": "in_progress"})
+        self.assertIsNone(gg.read_cache(key))
+
     def test_refusal_reported_by_the_controller_is_held_until_the_rescue_attempt(self) -> None:
         now = time.time()
         self.ctl.runs[31] = ctl_run(31, "completed", "failure", iso(now))
@@ -1376,6 +1398,61 @@ class ClientTest(Base):
         self.assertIn("result: timeout", text)
         # waiting registered interest for the daemon to pick up
         self.assertIsNotNone(gg.read_json(gg.watch_dir() / gg.file_name("run:o/r/7")))
+
+    def test_wait_run_uses_controller_long_poll_once(self) -> None:
+        run = {"id": 9, "repo": "o/r", "name": "fast", "event": "workflow_dispatch",
+               "head_sha": "a" * 40, "attempt": 1, "status": "completed", "conclusion": "success",
+               "url": "https://github.com/o/r/actions/runs/9", "updated_at": iso(time.time())}
+        controller = mock.Mock()
+        controller.run.return_value = run
+        with mock.patch.object(gg.Controller, "from_env", return_value=controller):
+            entry = gg.controller_wait_run("run:o/r/9", timeout=5)
+        self.assertEqual(entry["data"]["status"], "completed")
+        self.assertEqual(controller.run.call_args_list,
+                         [mock.call(9, wait=0), mock.call(9, wait=5)])
+        self.assertIsNotNone(entry["restAt"])
+
+    def test_long_poll_result_is_fresh_for_the_wait_started_before_it(self) -> None:
+        run = ctl_run(14, "completed", "success", repo="o/r")
+        controller = mock.Mock()
+        controller.run.return_value = run
+        req = gg.wait_request("run", "o/r/14", "green", 5, False, False, None, True, gg.RESCUE_GRACE)
+        with mock.patch.object(gg.Controller, "from_env", return_value=controller):
+            self.assertIsNotNone(gg.controller_wait_run("run:o/r/14", 5))
+        result = gg.wait_step(req, time.time())
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], gg.EXIT_OK)
+
+    def test_controller_wait_rejects_foreign_repo(self) -> None:
+        controller = mock.Mock()
+        controller.run.return_value = ctl_run(10, "completed", "success", repo="other/repo")
+        with mock.patch.object(gg.Controller, "from_env", return_value=controller):
+            self.assertIsNone(gg.controller_wait_run("run:o/r/10", 5))
+        controller.run.assert_called_once_with(10, wait=0)
+
+    def test_controller_wait_does_not_clobber_newer_attempt(self) -> None:
+        key = "run:o/r/12"
+        self.put(key, {"id": 12, "status": "queued", "conclusion": None, "run_attempt": 2,
+                       "updated_at": iso(time.time() + 20)})
+        controller = mock.Mock()
+        controller.run.side_effect = [ctl_run(12, "completed", "failure", iso(time.time()), repo="o/r"),
+                                      ctl_run(12, "completed", "failure", iso(time.time()), repo="o/r")]
+        with mock.patch.object(gg.Controller, "from_env", return_value=controller):
+            self.assertIsNone(gg.controller_wait_run(key, 5))
+        self.assertEqual(gg.read_cache(key)["data"]["run_attempt"], 2)
+
+    def test_controller_wait_preserves_controller_rest_safety_clock(self) -> None:
+        key = "run:o/r/15"
+        old_rest = time.time() - 120
+        self.put(key, {"id": 15, "status": "in_progress", "conclusion": None, "run_attempt": 1,
+                       "updated_at": iso(time.time())}, source="controller", restAt=old_rest)
+        controller = mock.Mock()
+        current = iso(time.time() + 1)
+        controller.run.side_effect = [ctl_run(15, "in_progress", updated=current, repo="o/r"),
+                                       ctl_run(15, "in_progress", updated=current, repo="o/r")]
+        with mock.patch.object(gg.Controller, "from_env", return_value=controller):
+            entry = gg.controller_wait_run(key, 5)
+        self.assertEqual(entry["restAt"], old_rest)
 
     def test_conflicting_pr_stops_green_and_done_but_not_merged(self) -> None:
         pending = [check_run("a"), check_run("b", "IN_PROGRESS", None)]

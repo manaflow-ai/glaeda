@@ -61,7 +61,10 @@ glaeda-gh budget                                 # REST and GraphQL left, the da
   when an optional check never finishes. The headline (`checks SUCCESS: ...`) is the verdict
   `wait` used; when GitHub's own rollup differs, the line says so. Attempts a newer attempt or
   run replaced are listed as `superseded` and not counted.
-- `wait` only rules on data fetched after it started, so it answers within about a minute at the earliest.
+- `wait` only rules on data fetched after it started. For a run wait on a configured controller, the
+  client makes one bounded long-poll request to the existing run endpoint (up to 300 seconds), then
+  uses the normal cache verdict path; unknown or unavailable controllers fall back to the daemon's
+  ordinary wait cadence. This is a one-shot request, not a client-side polling loop.
 - Add `--json` for machine-readable output. URLs work too: `glaeda-gh wait pr https://github.com/o/r/pull/12`.
 
 ## Waiting on a file or a process: no sleep loops
