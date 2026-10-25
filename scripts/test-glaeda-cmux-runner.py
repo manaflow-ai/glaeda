@@ -857,6 +857,27 @@ class HookTest(unittest.TestCase):
     def shared_lock_blocks_exclusive(self) -> bool:
         return not self.lock_free()
 
+    def test_fleet_gateway_clients_wait_as_light_and_leave_compile_tokens_free(self) -> None:
+        """release-compile-fast and the other compile-check gateway clients only wait on the Linux pool: they take
+        light units and no persistent-dd or root, so a compile on the same mini is admitted beside them."""
+        self.fleet()
+        next_yml = {"GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/cmux-next.yml@refs/heads/feat-cmux-next"}
+        try:
+            for n, name in enumerate(("release-compile-fast", "swift-canary-fleet", "app-compile-fleet")):
+                waiter = self.job(name, f"w{n}", 14, env=next_yml)
+                self.assertEqual(waiter.returncode, 0, waiter.stdout + waiter.stderr)
+                self.assertIn(f"2/14 units for {name} (light", waiter.stdout)
+                self.assertNotIn("persistent-dd", waiter.stdout)
+            compile_ = self.job("macos-compile-admission", "c0", 14)
+            self.assertEqual(compile_.returncode, 0, compile_.stdout + compile_.stderr)
+            self.assertIn("persistent-dd", compile_.stdout)
+        finally:
+            for r in ("w0", "w1", "w2", "c0"):
+                self.finish(r)
+        # Only cmux-next.yml's jobs: the same id in another workflow is still an unknown job, a compile.
+        self.assertEqual(hook.job_class("release-compile-fast", "manaflow-ai/cmux", workflow="other.yml")[0], "compile")
+        self.assertEqual(hook.job_class("release-compile-fast", "manaflow-ai/cmux", workflow="cmux-next.yml")[0], "light")
+
     def test_capacity_admits_by_weight_and_refuses_fast_when_full(self) -> None:
         self.fleet()
         try:

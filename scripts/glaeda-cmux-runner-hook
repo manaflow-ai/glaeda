@@ -234,6 +234,16 @@ WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "
                         ("nightly.yml", "build-nightly-app"): "isolated",
                         ("cmux-next.yml", "swift-test"): "isolated", ("cmux-next.yml", "release-compile"): "isolated",
                         ("cmux-next.yml", "cmux-scheme-compile"): "isolated",
+                        # Fleet gateway clients (runs-on vars.CI_COMPILE_CHECK_GATEWAY): `cmux-ci compile-check`
+                        # submits to the Linux pool and waits for its verdict (up to about 4 min), no build on this
+                        # mini. As unknown jobs they were compiles and held persistent-dd and a root while waiting,
+                        # so a real compile on the same mini waited behind them (2026-10-24: "holding
+                        # 5/14 units+persistent-dd+root-1 for release-compile-fast (compile"). The Mac fallback
+                        # after a no-verdict is a separate job with its own class. Keyed by workflow: another
+                        # workflow's job of the same id stays a compile.
+                        ("cmux-next.yml", "release-compile-fast"): "light",
+                        ("cmux-next.yml", "swift-canary-fleet"): "light",
+                        ("cmux-next.yml", "app-compile-fleet"): "light",
                         ("cmux-next.yml", "fast-tier"): "isolated", ("cmux-next.yml", "swift-canary"): "isolated",
                         ("cmux-next-frame-pacing.yml", "build"): "isolated",
                         ("cmux-next-frame-pacing.yml", "bench"): "gui-step",
