@@ -38,6 +38,7 @@ Every source except the manifest is optional. Without a flag the source shows as
 | disk | one read-only SSH probe per member, never on `never_touch` hosts (below) | on; `--no-disk` |
 | jobs | the tail of each member's `~/Library/Logs/glaeda-cmux-jobs.jsonl` (below) | on; `--no-jobs` |
 | tooling | each member's `~/glaeda-runner/scripts/.glaeda-source.json` against the local `origin/main` (below) | on; `--no-tooling` |
+| daemon_heal | each macOS member's root daemon-heal: installed, and its own report judged (below) | on; `--no-daemon-heal` |
 
 Split collection from building to reuse or replay a view:
 
@@ -229,6 +230,27 @@ The text output adds one `runner tooling:` line per member:
 ```text
 cmux13s-mac-mini  5e1f0c2a9b3d, 3 behind origin/main 63b5493c1d2e
 ```
+
+## Root daemon-heal
+
+The `daemon_heal` probe reads four things on each member, read-only: whether the root LaunchDaemon and its
+snapshot exist, whether launchd lists it (`launchctl print`), its `state/report.json` (at most 64 KiB), and
+the member's clock. Output that is not exactly the probe's is a `probe_failed`, never a verdict. That covers
+a marker repeated or out of order, no clock, more than one report line, unreadable JSON, and output cut off
+at 70,000 bytes on the member. Linux members answer
+`@not_darwin` and are skipped. `glaeda-daemon-heal`'s own `judge` decides, on the member's clock, so this tool
+and `glaeda-mini-health` read a report the same way ([CMUX_MINI_RUNNER.md](CMUX_MINI_RUNNER.md), 2l2). Only the
+verdict, the tags and a cleaned reason leave the member.
+
+| Code | When | Action |
+| --- | --- | --- |
+| `daemon_heal_missing` (warn) | the LaunchDaemon or its snapshot is not installed | the one root install (2l2), with the fleet sudo password; it keeps itself current after that |
+| `daemon_heal_stale` (warn) | its passes stopped, it predates self-update, or it is not loaded: a reinstall fixes it | the same root install; the summary says which |
+| `daemon_heal_stale` (warn) | it lags its channel, its files drifted from their release, or it has not read the channel, for `release.stale_s` | no reinstall: read its report's `release.error` (a read-only command, safe) |
+| `probe_failed` (info) | the probe failed | a refresh |
+
+The text output adds one `root daemon-heal:` line per macOS member, such as
+`current: runs r-20261026-429a09a466b7`.
 
 ## Bounds and privacy
 
