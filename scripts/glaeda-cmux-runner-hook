@@ -1063,69 +1063,93 @@ def _json_file(path: Path) -> Any:
 
 
 def _probe(argv: list[str], env: dict[str, str], cwd: Path, deadline: float) -> str:
+    return _probe_answer(argv, env, cwd, deadline)[0]
+
+
+def _probe_answer(argv: list[str], env: dict[str, str], cwd: Path, deadline: float) -> tuple[str, bool]:
+    """(stdout when it exited 0, else "", whether it ran out of time). Out of time (the deadline passed before or
+    while it ran) is no answer at all, which a caller may tell apart from a probe that ran and failed."""
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        return ""
+        return "", True
     try:
         out = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, env=env,
                              cwd=cwd, timeout=remaining, check=False)
-    except (OSError, subprocess.TimeoutExpired):
-        return ""
-    return out.stdout.strip() if out.returncode == 0 else ""
+    except subprocess.TimeoutExpired:
+        return "", True
+    except OSError:
+        return "", False
+    return (out.stdout.strip() if out.returncode == 0 else ""), False
 
 
 def node_refusal(fleet_class: str | None) -> tuple[str | None, dict[str, Any]]:
     """(why this node is not an eligible fleet node, {}) or (None, its class receipt's toolchain). No effects."""
+    why, want, _timed_out = node_answer(fleet_class)
+    return why, want
+
+
+def node_answer(fleet_class: str | None) -> tuple[str | None, dict[str, Any], bool]:
+    """node_refusal plus whether the refusal is only a probe that ran out of ELIGIBILITY_BUDGET_S (the class receipt
+    validator or the generation's node status, on a mini too loaded to start Python in time). job-started still
+    refuses then, but names the timeout; the health agent reports no node_ineligible for it (cmux10s-mac-mini at
+    load ~275 read "does not validate" while the same validator said `valid` in 0.08 s by hand)."""
     home = Path.home()
     deadline = time.monotonic() + ELIGIBILITY_BUDGET_S
     config = Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config") / "glaeda" / "cmux-fleet"
     if not fleet_class:
-        return "node not eligible (no fleet class configured for this runner)", {}
+        return "node not eligible (no fleet class configured for this runner)", {}, False
     receipt = _json_file(config / "class-acceptance" / f"{fleet_class}.json")
     enrollment = _json_file(config / "enrollment.json")
     if not isinstance(enrollment, dict):
-        return "node not eligible (no Glaeda enrollment on this mini)", {}
+        return "node not eligible (no Glaeda enrollment on this mini)", {}, False
     if not isinstance(receipt, dict):
-        return f"node not eligible (no {fleet_class} class receipt)", {}
+        return f"node not eligible (no {fleet_class} class receipt)", {}, False
     acceptance = _json_file(config / "acceptance" / f"{FLEET_ROLE}.json")
     if not receipt.get("receiptSha256") or (enrollment.get("classAcceptanceSha256") != receipt.get("receiptSha256")
                                             and not receipt_source(enrollment, acceptance, receipt, fleet_class)):
-        return f"node not eligible (the enrollment does not reference the {fleet_class} class receipt)", {}
+        return f"node not eligible (the enrollment does not reference the {fleet_class} class receipt)", {}, False
     commit = str(((receipt.get("glaedaCandidate") or {}) if isinstance(receipt.get("glaedaCandidate"), dict) else {})
                  .get("commit") or "")
     if not re.fullmatch(r"[0-9a-f]{12,40}", commit):
-        return "node not eligible (the class receipt names no Glaeda candidate)", {}
+        return "node not eligible (the class receipt names no Glaeda candidate)", {}, False
     generation = home / "Projects" / "glaeda-generations" / commit[:12]
     if not generation.is_dir():
-        return f"node not eligible (no node status from generation {commit[:12]})", {}
+        return f"node not eligible (no node status from generation {commit[:12]})", {}, False
     # The receipt's own sha is a claim; the generation's validator recomputes it from the content.
-    valid = _probe([sys.executable, "-B", "-c",
-                    "import json, sys; sys.path.insert(0, 'scripts'); import cmux_fleet; "
-                    "cmux_fleet.validate_class_acceptance(json.load(open(sys.argv[1]))); print('valid')",
-                    os.fspath(config / "class-acceptance" / f"{fleet_class}.json")], dict(os.environ), generation, deadline)
+    valid, slow = _probe_answer([sys.executable, "-B", "-c",
+                                 "import json, sys; sys.path.insert(0, 'scripts'); import cmux_fleet; "
+                                 "cmux_fleet.validate_class_acceptance(json.load(open(sys.argv[1]))); print('valid')",
+                                 os.fspath(config / "class-acceptance" / f"{fleet_class}.json")],
+                                dict(os.environ), generation, deadline)
+    if slow:
+        return (f"node not eligible (the {fleet_class} class receipt validator timed out after "
+                f"{ELIGIBILITY_BUDGET_S:.0f} s; no answer, not an invalid receipt)"), {}, True
     if valid != "valid":
-        return f"node not eligible (the {fleet_class} class receipt does not validate)", {}
-    status_out = _probe([sys.executable, "-B", os.fspath(generation / "scripts" / "cmux_fleet.py"), "status",
-                         os.fspath(config / "enrollment.json"), "--acceptance",
-                         os.fspath(config / "acceptance" / f"{FLEET_ROLE}.json")], dict(os.environ), generation,
-                        deadline)
+        return f"node not eligible (the {fleet_class} class receipt does not validate)", {}, False
+    status_out, slow = _probe_answer([sys.executable, "-B", os.fspath(generation / "scripts" / "cmux_fleet.py"),
+                                      "status", os.fspath(config / "enrollment.json"), "--acceptance",
+                                      os.fspath(config / "acceptance" / f"{FLEET_ROLE}.json")],
+                                     dict(os.environ), generation, deadline)
+    if slow:
+        return (f"node not eligible (the node status from generation {commit[:12]} timed out after "
+                f"{ELIGIBILITY_BUDGET_S:.0f} s; no answer)"), {}, True
     try:
         status = json.loads(status_out)
     except ValueError:
         status = None
     if not isinstance(status, dict) or status.get("schema") != NODE_STATUS_SCHEMA:
-        return f"node not eligible (no node status from generation {commit[:12]})", {}
+        return f"node not eligible (no node status from generation {commit[:12]})", {}, False
     roles = status.get("roles") if isinstance(status.get("roles"), list) else []
     build_role = [r for r in roles if isinstance(r, dict) and r.get("role") == FLEET_ROLE]
     if (status.get("state") != "eligible" or status.get("routingCandidateEligible") is not True
             or not build_role or build_role[0].get("eligible") is not True):
         why = ", ".join(f"{r.get('role')}: {r.get('reason')}" for r in roles if isinstance(r, dict)) or "no roles"
-        return f"node not eligible (state {status.get('state')}, {why})", {}
+        return f"node not eligible (state {status.get('state')}, {why})", {}, False
     want = receipt.get("toolchain") if isinstance(receipt.get("toolchain"), dict) else {}
     missing = [f for f in REQUIRED_TOOLCHAIN if not str(want.get(f) or "").strip() or str(want.get(f)) == "unknown"]
     if missing:
-        return f"node not eligible (the {fleet_class} class receipt records no {', '.join(missing)})", {}
-    return None, want
+        return f"node not eligible (the {fleet_class} class receipt records no {', '.join(missing)})", {}, False
+    return None, want, False
 
 
 # The class receipt's source node never adopts it (glaeda-mini-enroll --renew leaves its current, accept-local

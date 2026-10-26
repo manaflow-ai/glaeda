@@ -391,6 +391,8 @@ class Mini:
             if not RUNNER_AGENT.fullmatch(label):
                 continue
             code, text = sh(["/bin/launchctl", "print", f"gui/{self.uid}/{label}"])
+            if code == 127:
+                continue  # launchctl did not answer in time (a loaded mini) or could not run: unknown, not unloaded
             state = re.search(r"^\s*state = (\S+)", text, re.M)
             last = re.search(r"^\s*last exit code = (.+)$", text, re.M)
             out.append((label, code == 0, bool(state and state.group(1) == "running"),
@@ -467,11 +469,16 @@ class Mini:
         if "--require-eligible" not in argv or "--fleet-class" not in argv[:-1]:
             return None
         hook = self.hook()
+        fleet_class = argv[argv.index("--fleet-class") + 1]
+        answer = getattr(hook, "node_answer", None) if hook is not None else None
         refusal = getattr(hook, "node_refusal", None) if hook is not None else None
-        if refusal is None:
-            return None
         try:
-            return refusal(argv[argv.index("--fleet-class") + 1])[0]
+            if answer is not None:
+                why, _want, timed_out = answer(fleet_class)
+                # A probe that ran out of time on a loaded mini is no answer: never node_ineligible, whose remedy
+                # restages the generation and re-adopts a receipt that is fine.
+                return None if timed_out else why
+            return refusal(fleet_class)[0] if refusal is not None else None
         except Exception:  # noqa: BLE001  (a hook that cannot answer is no finding)
             return None
 

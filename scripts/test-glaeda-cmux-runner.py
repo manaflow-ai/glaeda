@@ -3234,7 +3234,8 @@ time.sleep(60)
              hang: str | None = None, default: str = "1.98.1-aarch64-apple-darwin",
              installed: tuple = ("1.88.0-aarch64-apple-darwin", "1.98.1-aarch64-apple-darwin"),
              python: str = "3.13", gh: bool = True, sdk_path: str | None = None,
-             swiftc: str | None = None, python_runs: bool = True, unfound: tuple = ()) -> None:
+             swiftc: str | None = None, python_runs: bool = True, unfound: tuple = (),
+             slow: str | None = None) -> None:
         """A fake Glaeda node under HOME (self.dir): enrollment, class receipt, staged CLI, toolchain. xcrun answers
         --show-sdk-path with sdk_path and `swiftc --version` with swiftc, and fails both when they are None."""
         config = self.dir / ".config/glaeda/cmux-fleet"
@@ -3251,11 +3252,14 @@ time.sleep(60)
             status = {"schema": "glaeda-cmux-fleet-node-status/v1", "state": state, "routingCandidateEligible": routing,
                       "roles": [{"role": role, "eligible": routing,
                                  "reason": "ok" if routing else "acceptance_missing_or_rejected"}]}
+            # slow: "validate" or "status" sleeps in that probe, as a Python start on a mini at load 275 does
             (gen / "cmux_fleet.py").write_text(
-                "import json\n"
-                f"def validate_class_acceptance(doc):\n    if not {valid!r}:\n        raise ValueError('digest')\n"
+                "import json, time\n"
+                f"def validate_class_acceptance(doc):\n    if {slow == 'validate'!r}:\n        time.sleep(30)\n"
+                f"    if not {valid!r}:\n        raise ValueError('digest')\n"
                 "    return doc\n"
-                f"if __name__ == '__main__':\n    print(json.dumps({status!r}))\n")
+                f"if __name__ == '__main__':\n    if {slow == 'status'!r}:\n        time.sleep(30)\n"
+                f"    print(json.dumps({status!r}))\n")
         cargo = self.dir / "jobpath"
         cargo.mkdir(parents=True, exist_ok=True)
         have = {**self.TOOLCHAIN, **(tools or {})}
@@ -3468,6 +3472,34 @@ else:
         self.assertEqual(result.returncode, 1)
         self.assertIn("diffRustcVersion", result.stdout)
         self.assertTrue(self.lock_free())
+
+    def test_a_timed_out_eligibility_probe_is_named_as_a_timeout_not_an_invalid_receipt(self) -> None:
+        """On a mini too loaded to start Python within ELIGIBILITY_BUDGET_S the validator or node status gives no
+        answer. node_answer flags it, so the health agent raises no node_ineligible; the refusal names the timeout."""
+        import shutil as _sh
+        for slow, text in (("validate", "m4pro-48 class receipt validator timed out after 1 s"),
+                           ("status", "node status from generation 3809eed51fdd timed out after 1 s")):
+            with self.subTest(slow):
+                _sh.rmtree(self.dir / "Projects", ignore_errors=True)
+                self.node(slow=slow)
+                with mock.patch.dict(os.environ, {"HOME": os.fspath(self.dir), "XDG_CONFIG_HOME": ""}), \
+                        mock.patch.object(hook, "ELIGIBILITY_BUDGET_S", 1.0):
+                    start = time.monotonic()
+                    why, want, timed_out = hook.node_answer("m4pro-48")
+                    self.assertLess(time.monotonic() - start, 10)
+                    self.assertEqual(hook.node_refusal("m4pro-48"), (why, want))
+                self.assertTrue(timed_out)
+                self.assertIn(text, why)
+                self.assertNotIn("does not validate", why)
+                self.assertEqual(want, {})
+        for kwargs, timed_out in ((dict(valid=False), False), ({}, False)):
+            with self.subTest(**kwargs):
+                _sh.rmtree(self.dir / "Projects", ignore_errors=True)
+                self.node(**kwargs)
+                with mock.patch.dict(os.environ, {"HOME": os.fspath(self.dir), "XDG_CONFIG_HOME": ""}):
+                    why, _want, got = hook.node_answer("m4pro-48")
+                self.assertEqual(got, timed_out, why)
+                self.assertEqual(why is None, not kwargs, why)
 
     def test_hung_tool_refuses_within_the_budget(self) -> None:
         self.fleet()

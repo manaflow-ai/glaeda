@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -290,6 +291,34 @@ class NodeEligibility(unittest.TestCase):
         mini, _ = self.mini("exec /usr/bin/python3 hook job-started --allowed-owner manaflow-ai")
         mini._hook.xcode_refusal = lambda xcode_app, env: "toolchain: x"
         self.assertIsNone(mini.toolchain_mismatch())
+
+    def test_a_timed_out_eligibility_probe_is_no_finding(self) -> None:
+        """The hook's node_answer flags a probe that ran out of time (a mini at load 275 cannot start Python in
+        20 s): no node_ineligible, whose remedy restages a generation that is fine. A real refusal still reports."""
+        started = ("exec /usr/bin/python3 hook job-started --allowed-owner manaflow-ai "
+                   "--require-eligible --fleet-class m4pro-48")
+        mini, asked = self.mini(started)
+        timeout = "node not eligible (the m4pro-48 class receipt validator timed out after 20 s; no answer)"
+        mini._hook.node_answer = lambda fleet_class: (asked.append(fleet_class), (timeout, {}, True))[1]
+        self.assertIsNone(mini.node_refusal())
+        self.assertEqual(asked, ["m4pro-48"])
+        mini._hook.node_answer = lambda fleet_class: ("node not eligible (state enrolling, x: y)", {}, False)
+        self.assertEqual(mini.node_refusal(), "node not eligible (state enrolling, x: y)")
+        self.assertEqual(health.check_node_eligibility(mini)[0]["id"], "node_ineligible")
+        mini._hook.node_answer = lambda fleet_class: 1 / 0
+        self.assertIsNone(mini.node_refusal(), "a hook that cannot answer is no finding")
+
+    def test_a_launchctl_that_does_not_answer_is_not_an_unloaded_runner(self) -> None:
+        agents = self.home / "Library/LaunchAgents"
+        agents.mkdir(parents=True)
+        for label in ("com.teamleaderleo.glaeda.cmux-runner", "com.teamleaderleo.glaeda.cmux-runner.9"):
+            (agents / f"{label}.plist").write_text("")
+        answers = {"com.teamleaderleo.glaeda.cmux-runner": (127, ""),  # timed out at load 275
+                   "com.teamleaderleo.glaeda.cmux-runner.9": (113, "Could not find service")}
+        with mock.patch.object(health, "AGENTS", agents), \
+                mock.patch.object(health, "sh", lambda argv, **_: answers[argv[-1].rsplit("/", 1)[1]]):
+            got = health.Mini(self.home).runner_agents()
+        self.assertEqual(got, [("com.teamleaderleo.glaeda.cmux-runner.9", False, False, "?")])
 
     def test_a_runner_that_does_not_require_eligibility_is_not_checked(self) -> None:
         mini, asked = self.mini("exec /usr/bin/python3 hook job-started --allowed-owner manaflow-ai")
