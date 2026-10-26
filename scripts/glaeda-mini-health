@@ -54,8 +54,10 @@ Each run checks, as the runner user and without sudo:
                                      standalone /usr/local/bin/tailscale nor the app bundle's): the tunnel is not
                                      checked, which is no answer, not a healthy tunnel. Reported only.
   tailscale_probe_error              the Tailscale CLI gave no BackendState (it timed out, failed or printed no JSON;
-                                     a loaded mini can time out with the tunnel up). The check could not look, so the
-                                     tunnel is not judged down: reported only, never healed.
+                                     a loaded mini can time out with the tunnel up), or `route -n get` named no
+                                     interface for the tailnet address. The check could not look, so the
+                                     tunnel is not judged down: reported only, never healed. It keeps
+                                     tailscale_no_route's count as it was (it did not look at the route).
   runner_stopped:<agent>             a runner LaunchAgent is loaded but not running (KeepAlive leaves it after a clean
                                      exit). Healed after two runs in a row with `launchctl kickstart`; nothing runs
                                      in it, so no job is disturbed. The listener gate's holds keep the agent running,
@@ -941,8 +943,12 @@ def check_tailscale(mini: Mini) -> list[dict[str, Any]]:
                         "install Tailscale (the standalone tailscaled or the app) as the mini's setup does")]
     if got[1] == "Running":
         via = mini.tailnet_route()
-        if via is None or via.startswith("utun"):
-            mini.tailnet_route_ok = via is not None
+        if via is None:  # route -n get named no interface (a loaded mini): the check could not look, as above
+            return [finding("tailscale_probe_error", "warn", f"/sbin/route -n get {TAILNET_PROBE_IP} named no "
+                            "interface", "impossible", "the probe could not read the tailnet route; the tunnel "
+                            "is not judged on it")]
+        if via.startswith("utun"):
+            mini.tailnet_route_ok = True
             return []
         f = finding("tailscale_no_route", "error", f"Tailscale ({got[0]}) BackendState Running, but the OS "
                     f"routes {TAILNET_PROBE_IP} out of {via}, not the tunnel: no tailnet host reaches ssh here",
@@ -1668,7 +1674,10 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
                 f["note"] = f"healing is off ({KILL_SWITCH})"
         findings.append(f)
     ids = {f["id"] for f in findings}
-    seen = {k: v for k, v in seen.items() if k in ids | {f["id"] for f in found}}
+    # a CLI that gave no BackendState never looked at the route: tailscale_no_route's count neither grows nor
+    # starts again (cmuxs-mac-mini-5, 2026-10-26: a 15 s status timeout every other run kept it at 1 for hours)
+    unlooked = {"tailscale_no_route"} if any(f["code"] == "tailscale_probe_error" for f in found) else set()
+    seen = {k: v for k, v in seen.items() if k in ids | {f["id"] for f in found} | unlooked}
     tries = {k: v for k, v in tries.items() if k in ids}
     report = {"schema": SCHEMA, "at": iso(now), "findings": findings,
               "healed": sorted(healed + getattr(mini, "daemon_healed", []), key=lambda h: h.get("t") or 0)[-HEALED_MAX:],

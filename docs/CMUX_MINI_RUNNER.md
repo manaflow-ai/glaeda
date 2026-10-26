@@ -1319,7 +1319,7 @@ runners) looks for what stopped runner minis on 2026-09-25 and 26 without anythi
 | `tailscale_down`: a BackendState other than `Running`, two runs in a row | `tailscale up` when Stopped, else `scutil --nc stop/start` of the Tailscale VPN service; a standalone tailscaled or a logged-out node is reported only |
 | `tailscale_no_route`: BackendState `Running`, but `route -n get 100.100.100.100` leaves by a non-utun interface (the tailnet route is gone), two runs in a row | a restart of Tailscale (never a config, auth or flag change), only on an idle CI runner mini the fleet registry opted in, at most once every 6 h per mini (below); elsewhere reported only |
 | `tailscale_cli_missing`: a host with runner LaunchAgents has neither `/usr/local/bin/tailscale` (standalone) nor the Tailscale app's CLI | reported only (warn): the tunnel is not checked, so it is not counted healthy |
-| `tailscale_probe_error`: the Tailscale CLI gave no BackendState (timeout, error, no JSON) | reported only: the check could not look, so the tunnel is not judged down |
+| `tailscale_probe_error`: the Tailscale CLI gave no BackendState (timeout, error, no JSON), or `route -n get 100.100.100.100` named no interface | reported only: the check could not look, so the tunnel is not judged down |
 | `runner_stopped:<agent>`: a runner LaunchAgent loaded but not running, two runs in a row | `launchctl kickstart` (nothing runs in it, so no job is cut) |
 | `runner_unloaded:<agent>` (not one `cmux_mini_fix.sh` holds) | none: `glaeda-cmux-runner-fleet --apply` |
 | `node_ineligible`: the runner hook's eligibility check, for the fleet class its job-started hook requires, refuses (for example the class receipt's staged generation is gone) | none: restage the generation or re-enroll ([enrollment](CMUX_FLEET_ENROLLMENT.md)) |
@@ -1347,7 +1347,10 @@ all of them failing closed (`heal_tailscale_route` in the script):
    mini-setup's receipt role `fleet-mini`. A name holding "lawrence" (cmux-lawrence) refuses whatever the
    opt-in says. A name (the tailnet name from `tailscale status --json` included) or fact that cannot be read
    refuses.
-2. **Persistent.** The two-runs rule has reported it; by hand (no `--apply`) it never restarts.
+2. **Persistent.** The two-runs rule has reported it; by hand (no `--apply`) it never restarts. A run whose CLI
+   gave no BackendState, or whose `route -n get` named no interface (`tailscale_probe_error`), did not look at
+   the route, so it keeps the count as it was: it neither adds a run nor starts the count again. Only a run that
+   sees the route on the tunnel does that.
 3. **Idle.** glaeda-disk's `host_busy` (the gate glaeda-idle-repair uses: no Runner.Worker or build, no
    dev-build worker job, no reservation, the host lock free) says idle. Then it takes
    `/Users/Shared/cmux-build-fleet/host.lock` exclusively, as with-host-lock and a fleet build do, so the runner

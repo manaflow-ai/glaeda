@@ -626,9 +626,13 @@ class Tailscale(Base):
         self.mini.route = "en0"
         self.assertEqual(self.ids(self.run_once(apply=False)), ["tailscale_no_route"])
 
-    def test_a_route_it_cannot_read_is_no_finding(self) -> None:
+    def test_a_route_it_cannot_read_is_a_probe_error_never_a_heal(self) -> None:
         self.mini.route = None
-        self.assertEqual(self.run_once()["findings"], [])
+        self.run_once()
+        report = self.run_once(NOW + 120)
+        self.assertEqual(self.ids(report), ["tailscale_probe_error"])
+        self.assertEqual((report["findings"][0]["severity"], report["findings"][0]["auto_fix"]), ("warn", "impossible"))
+        self.assertEqual(self.mini.did, [])
 
     def test_a_runner_host_without_any_tailscale_cli_is_a_warning_not_healthy(self) -> None:
         self.mini.ts = None  # neither /usr/local/bin/tailscale nor the app bundle's CLI
@@ -694,6 +698,38 @@ class TailscaleRouteRestart(Base):
         self.assertEqual((healed["code"], healed["auto_fix"]), ("tailscale_no_route", "done"))
         self.assertIn("restarted", healed["action"])
         self.assertIn("utun4", healed["action"])
+
+    def test_a_run_whose_cli_did_not_answer_keeps_the_count_without_adding_to_it(self) -> None:
+        # cmuxs-mac-mini-5, 2026-10-26: `status --json` timed out every other run, which started the count again
+        self.run_once()
+        self.mini.ts = ("app", None, "status --json timed out after 15 s")
+        self.assertEqual(self.ids(self.run_once(NOW + 120)), ["tailscale_probe_error"])
+        self.assertEqual(self.mini.did, [], "a run that could not look restarts nothing")
+        self.mini.ts = ("app", "Running", "")
+        report = self.run_once(NOW + 240)
+        self.assertEqual([h["id"] for h in report["heals"]], ["tailscale_no_route"])
+        self.assertEqual(self.restarts(), 1)
+
+    def test_a_run_whose_route_lookup_named_no_interface_keeps_the_count_too(self) -> None:
+        # cmuxs-mac-mini-5, 2026-10-26: under load, runs that read no route reported nothing and started the count again
+        self.run_once()
+        self.mini.route = None
+        report = self.run_once(NOW + 120)
+        self.assertEqual(self.ids(report), ["tailscale_probe_error"])
+        self.assertIn("named no interface", report["findings"][0]["evidence"])
+        self.assertEqual(self.mini.did, [], "a run that could not look restarts nothing")
+        self.mini.route = "en0"
+        report = self.run_once(NOW + 240)
+        self.assertEqual([h["id"] for h in report["heals"]], ["tailscale_no_route"])
+        self.assertEqual(self.restarts(), 1)
+
+    def test_a_route_seen_on_the_tunnel_still_starts_the_count_again(self) -> None:
+        self.run_once()
+        self.mini.route = "utun4"
+        self.run_once(NOW + 120)
+        self.mini.route = "en0"
+        self.assertEqual(self.run_once(NOW + 240)["findings"], [])
+        self.assertEqual(self.restarts(), 0)
 
     def test_the_attempt_is_written_before_the_restart_runs(self) -> None:
         self.broken_twice()
