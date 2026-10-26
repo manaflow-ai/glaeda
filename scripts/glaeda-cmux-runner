@@ -732,6 +732,8 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
                       f" --trusted-repo {shlex.quote(ctx.member['trustedRepo'])}")
             if ctx.member.get("trustedNextNightly"):
                 scope += " --trusted-next-nightly"
+        elif dev_compile_instance(ctx.member, ctx.instance):
+            scope += " --dev-compile-runner"
         else:  # PR runners: an unlocked test keychain (the login keychain is locked in the runner session)
             scope += " --test-keychain"
             # and a fresh testmanagerd for each job that takes the gui token (a wedged one hangs every XCTest run)
@@ -2172,6 +2174,7 @@ def main(argv: list[str] | None = None) -> int:
         if not args.capacity_units:
             ctx.capacity_units = int(member.get("capacityUnits") or 0)
         ctx.fast_runner, ctx.gui_runner, ctx.session_runner = member_roles(member, ctx.instance)
+        dev = dev_compile_instance(member, ctx.instance)
         is_root = (ctx.instance < int(member.get("canonicalRoots") or 1) and not ctx.gui_runner and not ctx.fast_runner
                    and not ctx.session_runner)
         # The console gui runner carries the session label only on a mini without session runners (guiRunners 1). With
@@ -2179,16 +2182,16 @@ def main(argv: list[str] | None = None) -> int:
         # session job (generated files, action exports) taken there with less room would wait and, through its
         # admit.want marker, hold every runner on the mini. The session runners listen with room for one.
         console_session = int(member.get("guiRunners") or 0) <= 1
-        roots = (member.get("fastPools", []) if ctx.fast_runner
+        roots = (member.get("devPools", []) if dev
+                 else member.get("fastPools", []) if ctx.fast_runner
                  else [*member.get("guiPools", []), *(member.get("sessionPools", []) if console_session else [])]
                  if ctx.gui_runner
                  else member.get("sessionPools", []) if ctx.session_runner
                  else member.get("rootPools", []) if is_root else member.get("sidePools", []))
-        # The gui and fast runners leave out the pool and iOS simulator labels: a pool-label or iOS job must never
-        # take the one runner a mini's GUI (or fast-tier) jobs wait for, and the picker's live count of the pool's
-        # runners stays the root and side runners it can route to.
+        # Dedicated roles leave out ordinary pool and iOS labels, so those jobs cannot take a DEV, GUI or fast
+        # instance. The pool's live count includes only the root and side instances it can route to.
         own = ([label for label in member["labels"] if label not in member.get("pools", []) and label != IOS_SIM_JOB_LABEL]
-               if ctx.gui_runner or ctx.session_runner or ctx.fast_runner else member["labels"])
+               if dev or ctx.gui_runner or ctx.session_runner or ctx.fast_runner else member["labels"])
         ctx.labels = list(dict.fromkeys([*BASE_LABELS, *own, *roots]))
         ctx.labels_requested = True
         if not args.name:
@@ -2209,6 +2212,12 @@ def main(argv: list[str] | None = None) -> int:
     # Every --apply and --uninstall holds the runner lock from its plan to its receipt (runner_lock).
     with runner_lock(ctx.home, wait=True) if args.apply else contextlib.nullcontext():
         return install_or_uninstall(ctx, args, raw_argv)
+
+
+def dev_compile_instance(member: dict[str, Any], instance: int) -> bool:
+    """DEV uses the first existing side instance; every neighbor keeps its normal job admission and labels.
+    Derive the index from canonicalRoots too when restoring an older member receipt."""
+    return bool(member.get("devCompile")) and instance == int(member.get("canonicalRoots") or 1)
 
 
 def member_roles(member: dict[str, Any], instance: int) -> tuple[bool, bool, bool]:

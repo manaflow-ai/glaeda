@@ -490,6 +490,50 @@ class HookTest(unittest.TestCase):
                                    repo="manaflow-ai/cmux", env=environ)
             self.assertEqual(result.returncode == 0, bool(trusted), result.stdout + result.stderr)
 
+    def test_dev_compile_runner_is_exact_job_and_event(self) -> None:
+        workflow = "manaflow-ai/cmux/.github/workflows/cmux-next.yml@refs/heads/feat-cmux-next"
+        push = {"ref": "refs/heads/feat-cmux-next", "repository": CMUX}
+        args = {"event_name": "push", "ref": "refs/heads/feat-cmux-next", "repository": "manaflow-ai/cmux",
+                "event": push, "workflow_ref": workflow, "job": "cmux-scheme-compile"}
+        self.assertIsNone(hook.dev_compile_refusal(**args))
+        dispatch = {"repository": CMUX, "inputs": {"dev_daily": "true"}}
+        self.assertIsNone(hook.dev_compile_refusal(**{**args, "event_name": "workflow_dispatch", "event": dispatch}))
+        for overrides in (
+                {"job": "other"}, {"workflow_ref": workflow.replace("cmux-next.yml", "ci.yml")},
+                {"event": {"ref": "refs/heads/feat-cmux-next", "repository": {"full_name": "other/cmux"}}},
+                {"workflow_ref": workflow.replace("feat-cmux-next", "main")},
+                {"ref": "refs/heads/main"}, {"event_name": "schedule"},
+                {"event_name": "workflow_dispatch", "ref": "refs/heads/main",
+                 "event": {"repository": CMUX, "inputs": {"dev_daily": "true"}}},
+                {"event": {"repository": CMUX, "inputs": {"dev_daily": "false"}},
+                 "event_name": "workflow_dispatch"},
+                {"repository": "other/cmux"}):
+            with self.subTest(overrides=overrides):
+                self.assertIsNotNone(hook.dev_compile_refusal(**{**args, **overrides}))
+
+    def test_dev_compile_instance_gate_leaves_ordinary_admission_unchanged(self) -> None:
+        self.fleet()
+        push = event(self.dir, "dev-push", {"repository": CMUX, "ref": "refs/heads/feat-cmux-next"})
+        env = {"GITHUB_REF": "refs/heads/feat-cmux-next", "GITHUB_JOB": "cmux-scheme-compile",
+               "GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/cmux-next.yml@refs/heads/feat-cmux-next"}
+        args = ("--allowed-repo", "manaflow-ai/cmux", "--no-disk", "--watch-pid", str(os.getpid()),
+                "--state-dir", os.fspath(self.dir / "state"))
+        try:
+            admitted = self.run_hook("job-started", "push", push, *args, "--dev-compile-runner",
+                                     repo="manaflow-ai/cmux", env=env)
+            self.assertEqual(admitted.returncode, 0, admitted.stdout + admitted.stderr)
+            self.finish("")
+            ordinary = {**env, "GITHUB_JOB": "claude-wrapper"}
+            refused = self.run_hook("job-started", "push", push, *args, "--dev-compile-runner",
+                                    repo="manaflow-ai/cmux", env=ordinary)
+            self.assertEqual(refused.returncode, 1, refused.stdout)
+            self.assertIn("admits only cmux-scheme-compile", refused.stdout)
+            neighbor = self.run_hook("job-started", "push", push, *args,
+                                     repo="manaflow-ai/cmux", env=ordinary)
+            self.assertEqual(neighbor.returncode, 0, neighbor.stdout + neighbor.stderr)
+        finally:
+            self.finish("")
+
     def test_disk_pressure_never_fails_and_is_bounded(self) -> None:
         marker = self.dir / "disk-ran"
         slow = make_executable(self.dir / "glaeda-disk-slow", "import time, pathlib, sys\n"
@@ -947,6 +991,48 @@ class HookTest(unittest.TestCase):
         for fd in fds:
             self.addCleanup(os.close, fd)
         return fds
+
+    def test_dev_compile_wait_holds_admissions_only_while_waiting(self) -> None:
+        self.fleet()
+        self.take_units(12)
+        capacity = self.dir / "capacity"
+        waiter = None
+        try:
+            ordinary = self.job("swift-package-tests", "normal", 14)
+            self.assertEqual(ordinary.returncode, 0, ordinary.stdout + ordinary.stderr)
+            self.assertIn("holding 2/14 units", ordinary.stdout, "no cores are kept for an idle DEV instance")
+            self.finish("normal")
+            push = event(self.dir, "dev-wait", {"repository": CMUX, "ref": "refs/heads/feat-cmux-next"})
+            environ = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0",
+                       "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"),
+                       "GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": os.fspath(push),
+                       "GITHUB_REF": "refs/heads/feat-cmux-next", "GITHUB_REPOSITORY": "manaflow-ai/cmux",
+                       "GITHUB_JOB": "cmux-scheme-compile", "RUNNER_NAME": "dev",
+                       "GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/cmux-next.yml@refs/heads/feat-cmux-next"}
+            waiter = subprocess.Popen([sys.executable, os.fspath(HOOK), "job-started", "--allowed-repo",
+                                       "manaflow-ai/cmux", "--no-disk", "--dev-compile-runner", "--state-dir",
+                                       os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()),
+                                       "--capacity-units", "14", "--capacity-dir", os.fspath(capacity),
+                                       "--instance", "1", "--gui-wait", "6"], env=environ,
+                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            marker = capacity / f"{hook.ADMIT_WANT}{waiter.pid}"
+            self.assertTrue(wait_for_path(marker), "the DEV hook waits for shared units")
+            late = self.job("swift-package-tests", "late", 14)
+            self.assertEqual(late.returncode, 1, late.stdout)
+            self.assertIn("dev cmux-scheme-compile has waited longer here for units", late.stdout)
+            out, _ = waiter.communicate(timeout=15)
+            self.assertEqual(waiter.returncode, 1, out)
+            self.assertIn("refused: capacity:", out)
+            self.assertFalse(marker.exists(), "the refusal releases its admission priority")
+            after = self.job("swift-package-tests", "after", 14)
+            self.assertEqual(after.returncode, 0, after.stdout + after.stderr)
+        finally:
+            if waiter is not None:
+                if waiter.poll() is None:
+                    waiter.kill()
+                waiter.communicate()
+            for runner in ("normal", "late", "dev", "after"):
+                self.finish(runner)
 
     def test_a_fast_tier_job_on_the_fast_runner_runs_while_every_general_unit_is_taken(self) -> None:
         """cmux-next's fast-tier queued a median 38.5 min (p90 73) behind the side lane for the 5 shared units.
@@ -5006,6 +5092,7 @@ class GateTest(unittest.TestCase):
             self.assertEqual(hook.job_workflow(), "")
 
     def test_dev_compile_capacity_wait_is_bounded_for_push_and_daily(self) -> None:
+        self.assertEqual(hook.DEV_COMPILE_CAPACITY_WAIT_S, 60.0)
         push = {"repository": CMUX, "ref": "refs/heads/feat-cmux-next"}
         self.assertEqual(
             hook.dev_compile_capacity_wait("manaflow-ai/cmux", hook.DEFAULT_HOME_REPO, "push",
@@ -7242,10 +7329,16 @@ class RunnerTest(unittest.TestCase):
         again = [hook.runner_scope(self.fast_home / f"actions-runner-glaeda-{k}") for k in (4, 5)]
         self.assertEqual(again, scopes)
 
-    def fast_labels(self, classes: dict, name: str) -> tuple[list[list[str]], list[str]]:
+    def fast_labels(self, classes: dict, name: str, *, dev_compile: bool = False,
+                    ios_sim: bool = False) -> tuple[list[list[str]], list[str]]:
         """Apply every instance of mini-std under these runner classes: (labels per instance, job-started.sh texts)."""
         manifest = json.loads(json.dumps(MANIFEST))
         manifest["defaults"]["runner"] = {"classes": {"std": classes}}
+        if dev_compile:
+            manifest["hosts"]["mini-std"].setdefault("overrides", {})["runner"] = {"devCompile": True}
+        if ios_sim:
+            manifest["hosts"]["mini-std"]["roles"].append("ios-simulators")
+            manifest["defaults"]["ios_simulator"] = {"runtimes": ["23F77"]}
         path = self.state / f"{name}.json"
         path.write_text(json.dumps(manifest))
         home = self.home.parent / f"operator-{name}"  # each fleet shape installs into a fresh home
@@ -7262,6 +7355,48 @@ class RunnerTest(unittest.TestCase):
                  .replace(os.fspath(home), "HOME") for k in range(classes["runners"])]
         self.fast_home = home
         return labels, hooks
+
+    def test_dev_compile_uses_one_existing_side_instance_and_preserves_neighbors(self) -> None:
+        shape = {"runners": 6, "capacityUnits": 14, "compileSlots": 2, "canonicalRoots": 2,
+                 "guiRunners": 1, "fastRunners": 1}
+        with mock.patch.object(cr, "ios_sim_present", return_value=True):
+            normal, normal_hooks = self.fast_labels(shape, "normal-dev-baseline", ios_sim=True)
+            dev, dev_hooks = self.fast_labels(shape, "dev-instance", dev_compile=True, ios_sim=True)
+        for instance in (0, 1, 3, 4, 5):
+            self.assertEqual(dev[instance], normal[instance], f"neighbor {instance} keeps every label")
+            self.assertEqual(dev_hooks[instance], normal_hooks[instance], f"neighbor {instance} keeps its hook")
+        self.assertIn("glaeda-ios-sim", dev[3], "the ordinary side instance still admits iOS jobs")
+        self.assertEqual([label for label in dev[2] if label not in cr.BASE_LABELS],
+                         ["glaeda-mini", "glaeda-class-std", "glaeda-dedicated", "xcode-26.6",
+                          "glaeda-dev-std-xcode-26.6"])
+        self.assertEqual(["glaeda-dev-std-xcode-26.6" in labels for labels in dev],
+                         [False, False, True, False, False, False])
+        self.assertEqual(sum("glaeda-std-xcode-26.6" in labels for labels in dev), 3,
+                         "two roots and one side instance count in the normal pool")
+        self.assertEqual(["--dev-compile-runner" in text for text in dev_hooks],
+                         [False, False, True, False, False, False])
+        for text in dev_hooks:
+            self.assertIn("--capacity-units 14 --compile-slots 2 --canonical-roots 2", text)
+        self.assertNotIn("--test-keychain", dev_hooks[2])
+        self.assertNotIn("--recycle-testmanagerd", dev_hooks[2])
+        with mock.patch.dict(os.environ, {"HOME": os.fspath(self.fast_home)}):
+            for instance in range(shape["runners"]):
+                self.invoke("--apply", "--instance", str(instance))
+        for instance, original in enumerate(dev_hooks):
+            suffix = f"-{instance}" if instance else ""
+            again = (self.fast_home / f"actions-runner-glaeda{suffix}/glaeda-hooks/job-started.sh").read_text()
+            self.assertEqual(again.replace(os.fspath(self.fast_home), "HOME"), original)
+
+    def test_dev_compile_install_refuses_without_existing_side_instance(self) -> None:
+        manifest = copy.deepcopy(MANIFEST)
+        manifest["defaults"]["runner"] = {"devCompile": True, "classes": {"std": {"runners": 1}}}
+        path = self.state / "dev-no-side.json"
+        path.write_text(json.dumps(manifest))
+        err = io.StringIO()
+        with mock.patch.object(cr, "xcode_present", return_value=True), contextlib.redirect_stderr(err):
+            self.assertEqual(cr.main(["--apply", "--manifest", os.fspath(path), "--member", "mini-std"]), 2)
+        self.assertIn("needs an existing side instance", err.getvalue())
+        self.assertEqual(self.tree(), {}, "invalid routing fails before installing or relabeling a runner")
 
     def test_fast_runners_one_makes_the_last_instance_the_fast_runner(self) -> None:
         base = {"runners": 5, "capacityUnits": 10, "compileSlots": 2, "canonicalRoots": 2}
@@ -8196,6 +8331,16 @@ class ManifestLabelsTest(unittest.TestCase):
         with mock.patch.object(cr, "xcode_present", return_value=False):
             self.assertEqual(cr.member_labels(MANIFEST, "mini-std")[0]["labels"],
                              ["glaeda-mini", "glaeda-class-std", "glaeda-dedicated"])
+        dev = copy.deepcopy(MANIFEST)
+        dev["hosts"]["mini-std"].setdefault("overrides", {})["runner"] = {"devCompile": True}
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            summary, why = cr.member_labels(dev, "mini-std")
+        self.assertIsNone(why)
+        self.assertEqual(summary["pools"], ["glaeda-std-xcode-26.6"])
+        self.assertEqual(summary["devPools"], ["glaeda-dev-std-xcode-26.6"])
+        self.assertTrue(summary["devCompile"])
+        self.assertNotIn("glaeda-dev-std-xcode-26.6", summary["labels"], "DEV labels belong to one instance")
+        self.assertEqual(summary["devCompileInstance"], 1)
         aws = copy.deepcopy(MANIFEST)
         aws["hosts"]["mini-std"].setdefault("overrides", {})["runner"] = {"poolPrefix": "aws-"}
         with mock.patch.object(cr, "xcode_present", return_value=True):
@@ -8204,7 +8349,7 @@ class ManifestLabelsTest(unittest.TestCase):
         self.assertIn("glaeda-aws-std-xcode-26.6", member["labels"])
         self.assertEqual(member["rootPools"], ["glaeda-aws-root-std-xcode-26.6"])
         self.assertEqual(member["sidePools"], ["glaeda-aws-side-std-xcode-26.6", "glaeda-aws-side-light-xcode-26.6"])
-        for prefix in ("root-", "side-", "gui-", "trusted-", "std-", "light-", "xl-"):
+        for prefix in ("root-", "side-", "gui-", "trusted-", "std-", "light-", "xl-", "dev-"):
             invalid = copy.deepcopy(MANIFEST)
             invalid["hosts"]["mini-std"].setdefault("overrides", {})["runner"] = {"poolPrefix": prefix}
             member, why = cr.member_labels(invalid, "mini-std")
@@ -8251,6 +8396,43 @@ fleet_labels = load("glaeda_fleet_labels_under_test", ROOT / "scripts" / "glaeda
 
 class FleetLabelsModuleTest(unittest.TestCase):
     """The shared rule glaeda-mini-fleet imports: pin its strings and its declared/conforming views."""
+
+    def test_dev_compile_declares_a_separate_pool_without_adding_capacity(self) -> None:
+        manifest = copy.deepcopy(MANIFEST)
+        before = fleet_labels.member_labels(manifest, "mini-std", lambda app: True)[0]
+        manifest["hosts"]["mini-std"].setdefault("overrides", {})["runner"] = {"devCompile": True}
+        after, why = fleet_labels.member_labels(manifest, "mini-std", lambda app: True)
+        self.assertIsNone(why)
+        for field in ("runners", "capacityUnits", "compileSlots", "canonicalRoots", "pools", "labels"):
+            self.assertEqual(after[field], before[field], field)
+        self.assertEqual(fleet_labels.declared_pools(manifest), {
+            "glaeda-dev-std-xcode-26.6": ["mini-std"], "glaeda-std-xcode-26.3": ["override"],
+            "glaeda-std-xcode-26.6": ["mini-std"]})
+        self.assertNotIn("glaeda-dev-std-xcode-26.6", fleet_labels.declared_pools(
+            manifest, lambda member, app: member != "mini-std"))
+        self.assertEqual(fleet_labels.widened_labels(after["devPools"]), after["devPools"])
+        manifest["hosts"]["mini-std"]["overrides"]["runner"]["poolPrefix"] = "dev-"
+        self.assertEqual(fleet_labels.member_labels(manifest, "mini-std", lambda app: True)[0], after,
+                         "the DEV namespace never moves neighboring instances out of their normal pool")
+
+    def test_dev_compile_malformed_manifest_fails_closed(self) -> None:
+        cases = [({"devCompile": value}, {}, "devCompile must be boolean")
+                 for value in ("true", 1, None, [])]
+        cases += [({"devCompile": True}, shape, "needs an existing side instance") for shape in (
+            {"runners": 1}, {"runners": 2, "canonicalRoots": 2},
+            {"runners": 3, "canonicalRoots": 1, "guiRunners": 1, "fastRunners": 1})]
+        cases += [({"devCompile": True, "poolPrefix": "aws-"}, {}, "devCompile uses poolPrefix"),
+                  ({"devCompile": True, "trustedRef": "refs/heads/main", "trustedRepo": "manaflow-ai/cmux"},
+                   {}, "dedicated std runner without trustedRef")]
+        for runner, shape, message in cases:
+            with self.subTest(runner=runner, shape=shape):
+                manifest = copy.deepcopy(MANIFEST)
+                manifest["defaults"]["runner"] = {"classes": {"std": shape}}
+                manifest["hosts"]["mini-std"].setdefault("overrides", {})["runner"] = runner
+                summary, why = fleet_labels.member_labels(manifest, "mini-std", lambda app: True)
+                self.assertIsNone(summary)
+                self.assertIn(message, why)
+                self.assertFalse(any("dev-" in label for label in fleet_labels.declared_pools(manifest)))
 
     def test_pool_label_string(self) -> None:
         self.assertEqual(fleet_labels.pool_label("std", "26.6"), "glaeda-std-xcode-26.6")

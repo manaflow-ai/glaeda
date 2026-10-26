@@ -1030,6 +1030,38 @@ def trusted_refusal(event_name: str | None, ref: str | None, repository: str | N
     return None
 
 
+def dev_compile_refusal(event_name: str | None, ref: str | None, repository: str | None, event: Any,
+                        workflow_ref: str | None, job: str | None) -> str | None:
+    """Why a DEV compile priority runner must refuse this job, or None.
+
+    The label is a soft priority lane: the workflow still has its normal
+    cascade fallback.  Only the exact cmux NEXT DEV compile may use it.
+    """
+    repos = {(repository or "").lower(), (_repo_name(event.get("repository")) or "").lower()
+             if isinstance(event, dict) else ""}
+    if repos != {"manaflow-ai/cmux"}:
+        return "dev compile runner admits only manaflow-ai/cmux"
+    if job != "cmux-scheme-compile":
+        return "dev compile runner admits only cmux-scheme-compile"
+    path = (workflow_ref or "").split("@", 1)[0]
+    if path != "manaflow-ai/cmux/.github/workflows/cmux-next.yml":
+        return "dev compile runner admits only cmux-next.yml"
+    if workflow_ref != path + "@refs/heads/feat-cmux-next":
+        return "dev compile runner requires cmux-next.yml from feat-cmux-next"
+    if event_name == "push" and ref == "refs/heads/feat-cmux-next":
+        if isinstance(event, dict) and event.get("ref") == ref:
+            return None
+        return "dev compile runner requires the feat-cmux-next push ref"
+    if event_name == "workflow_dispatch":
+        if ref != "refs/heads/feat-cmux-next":
+            return "dev compile runner requires the feat-cmux-next dispatch ref"
+        inputs = event.get("inputs") if isinstance(event, dict) else None
+        if isinstance(inputs, dict) and str(inputs.get("dev_daily", "")).lower() == "true":
+            return None
+        return "dev compile runner requires workflow_dispatch input dev_daily=true"
+    return "dev compile runner admits only a feat-cmux-next push or dev_daily dispatch"
+
+
 def reservation_refusal(path: str, now: float) -> str | None:
     """Why an active or unreadable reservation refuses this job, or None. Parsed by glaeda_reservation,
     shared with glaeda-mini-fleet, which the installer copies next to this hook."""
@@ -5947,6 +5979,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--trusted-repo", help="the one repository --trusted-ref admits")
     p.add_argument("--trusted-next-nightly", action="store_true",
                    help="also admit only cmux nightly-next's exact nightly app push on attempt 1")
+    p.add_argument("--dev-compile-runner", action="store_true",
+                   help="this instance admits only cmux NEXT DEV Release compile jobs (shared host capacity)")
     p.add_argument("--disk", help="glaeda-disk path (default: PATH, then ~/.local/bin)")
     p.add_argument("--no-disk", action="store_true")
     p.add_argument("--no-telemetry", action="store_true", help="do not sample the host while the job runs")
@@ -6087,6 +6121,12 @@ def main(argv: list[str] | None = None) -> int:
                                tuple(args.allow_event))
         if not admit:
             return refused(reason)
+        if args.dev_compile_runner:
+            why = dev_compile_refusal(os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REF"),
+                                      os.environ.get("GITHUB_REPOSITORY"), event,
+                                      os.environ.get("GITHUB_WORKFLOW_REF"), os.environ.get("GITHUB_JOB"))
+            if why:
+                return refused(why)
         if args.trusted_ref or args.trusted_repo or args.trusted_next_nightly:
             why = trusted_refusal(os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REF"),
                                   os.environ.get("GITHUB_REPOSITORY"), event, args.trusted_ref or "(unset)",

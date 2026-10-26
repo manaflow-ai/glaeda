@@ -61,7 +61,8 @@ MAX_RUNNERS = 16
 TRUSTED_REF_RE = r"refs/heads/[A-Za-z0-9._/-]+"
 REPO_RE = r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
 POOL_PREFIX_RE = r"[a-z0-9]+-"
-RESERVED_POOL_PREFIXES = {"root-", "side-", "gui-", "fast-", "trusted-", "std-", "light-", "xl-"}
+RESERVED_POOL_PREFIXES = {"root-", "side-", "gui-", "fast-", "trusted-", "std-", "light-", "xl-", "dev-"}
+DEV_COMPILE_POOL_PREFIX = "dev-"
 
 
 def merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
@@ -227,14 +228,26 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
             or availability != "dedicated" or "dev-builds" in roles)):
         return None, (f"{member} runner.trustedNextNightly must be boolean and true needs a dedicated "
                       "manaflow-ai/cmux trusted main runner with no dev-builds")
+    dev_compile = runner.get("devCompile", False) if isinstance(runner, dict) else False
+    if not isinstance(dev_compile, bool):
+        return None, f"{member} runner.devCompile must be boolean"
+    if dev_compile and (klass != "std" or availability != "dedicated" or trusted_ref is not None):
+        return None, f"{member} runner.devCompile needs a dedicated std runner without trustedRef"
     pool_prefix = runner.get("poolPrefix", "") if isinstance(runner, dict) else ""
-    if not (isinstance(pool_prefix, str) and (pool_prefix == "" or (
-            re.fullmatch(POOL_PREFIX_RE, pool_prefix) and pool_prefix not in RESERVED_POOL_PREFIXES))):
+    prefix_ok = isinstance(pool_prefix, str) and (pool_prefix == "" or (
+        re.fullmatch(POOL_PREFIX_RE, pool_prefix) and
+        (pool_prefix not in RESERVED_POOL_PREFIXES or (dev_compile and pool_prefix == DEV_COMPILE_POOL_PREFIX))))
+    if not prefix_ok:
         return None, f"{member} runner.poolPrefix must be empty or a lowercase prefix such as aws-"
+    if dev_compile and pool_prefix not in ("", DEV_COMPILE_POOL_PREFIX):
+        return None, f"{member} runner.devCompile uses poolPrefix {DEV_COMPILE_POOL_PREFIX}"
+    normal_pool_prefix = "" if dev_compile and pool_prefix == DEV_COMPILE_POOL_PREFIX else pool_prefix
     ready = [a for a in apps if re.fullmatch(VERSION_RE, str(a.get("version") or "")) and xcode_ok(a)]
     versions = [str(a["version"]) for a in ready]
     # Opportunistic members never carry a pool label, so they never receive a required job.
-    pools = [pool_label(klass, v, bool(trusted_ref), pool_prefix) for v in versions] if availability == "dedicated" else []
+    pools = [pool_label(klass, v, bool(trusted_ref), normal_pool_prefix) for v in versions] if availability == "dedicated" else []
+    dev_pools = ([pool_label(klass, v, False, DEV_COMPILE_POOL_PREFIX) for v in versions]
+                 if dev_compile and availability == "dedicated" else [])
     # Declared (the ios-simulators role) and, when the caller can look (the installer on the mini), a simulator
     # runtime actually present: an iOS job routed here must be able to boot one. Without a check (the fleet
     # plan) this is the declared view.
@@ -287,14 +300,18 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
     if compile_slots > roots:
         return None, (f"runner.classes.{klass}.compileSlots {compile_slots} needs canonicalRoots {compile_slots} "
                       "(every compile holds a root)")
+    if dev_compile and roots + gui + fast >= runners:
+        return None, f"{member} runner.devCompile needs an existing side instance after canonicalRoots"
     return {"member": member, "class": klass, "availability": availability, "roles": roles,
             "labels": list(dict.fromkeys(labels)), "pools": list(dict.fromkeys(pools)),
+            "devPools": list(dict.fromkeys(dev_pools)),
             "minFreeGib": floor if isinstance(floor, (int, float)) and floor > 0 else None,
             "hardware": hardware, "xcodeApps": [str(a.get("path")) for a in ready], "iosSim": ios_sim,
             "runners": runners, "capacityUnits": units, "compileSlots": compile_slots,
             "trustedRef": trusted_ref, "trustedRepo": trusted_repo, "trustedNextNightly": next_nightly,
+            "devCompile": dev_compile, "devCompileInstance": roots if dev_compile else None,
             "canonicalRoots": roots, "rootPools": [root_label(label) for label in dict.fromkeys(pools)],
-            "sidePools": list(dict.fromkeys(side_label(pool_label(k, v, bool(trusted_ref), pool_prefix))
+            "sidePools": list(dict.fromkeys(side_label(pool_label(k, v, bool(trusted_ref), normal_pool_prefix))
                                             for v in (versions if pools else []) for k in side_classes(klass))),
             "guiRunners": gui, "guiPools": [gui_label(label) for label in dict.fromkeys(pools)] if gui else [],
             "sessionPools": [session_label(label) for label in dict.fromkeys(pools)] if gui else [],
@@ -309,6 +326,6 @@ def declared_pools(manifest: Any, xcode_ok: Callable[[str, dict[str, Any]], bool
     for member in hosts if isinstance(hosts, dict) else {}:
         check = (lambda app, m=member: xcode_ok(m, app)) if xcode_ok else (lambda app: True)
         summary, _ = member_labels(manifest, member, check)
-        for label in (summary or {}).get("pools", []):
+        for label in [*(summary or {}).get("pools", []), *(summary or {}).get("devPools", [])]:
             out.setdefault(label, []).append(member)
     return {label: sorted(members) for label, members in sorted(out.items())}

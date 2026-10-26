@@ -528,6 +528,20 @@ runner is named `<member>-glaeda` unless `--name` says otherwise:
 one a pool picker routes a whole run to. Opportunistic members never carry it, so
 they never receive a required job.
 
+`runner.devCompile: true` on a dedicated std member assigns its first existing
+side instance (`instance == canonicalRoots`) to the DEV compile lane. That
+instance carries `glaeda-dev-std-xcode-<version>` without ordinary pool, root,
+side, GUI, session, fast or iOS labels. Only its hook passes
+`--dev-compile-runner`; every other instance keeps its normal labels and hook.
+A shape with no side instance is refused. This reuses an instance and adds no
+runners, cores, compile slots or canonical roots.
+
+DEV and ordinary jobs share the capacity ledger. Ordinary jobs can use all
+available units while DEV is idle. A DEV hook waiting for capacity uses the
+existing `admit.want` fairness mechanism, then refuses after 60 seconds so the
+workflow can use its normal fallback. The DEV label provides routing priority;
+it does not reserve cores or exclusive host capacity.
+
 `glaeda-macos-<major>` is observed on the mini, not declared, so a fleet that straddles an
 OS upgrade can route a job to one macOS (`runs-on: [glaeda-std-xcode-26.6, glaeda-macos-27]`).
 It is never the bare `macos-<N>`: that is GitHub-hosted vocabulary, and cmux's workflows check
