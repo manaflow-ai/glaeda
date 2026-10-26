@@ -69,6 +69,10 @@ name, a dev-daily/release state by its runner-and-workspace key) idle past a job
 inputs included. Enrolled runners' states lose only generated output, and the process/lock/lease/
 Runner.Worker vetoes still hold (docs/CMUX_NEXT_CI_RETENTION.md). Only a pressure run walks the cache; a text
 report shows its last measurement, and its run line records how far over the cap it is.
+The per-host build root (cmux_next_ci_host_roots, default dev-daily-release/host: one tree a mini's DEV
+compiles share under flock on its lock, so their compilation cache hits) is never the cap's: it goes whole, after
+everything else, only once idle cmux_next_ci_host_idle_hours (48) or while free is still under the runner floor,
+and never while its lock is held. Per-instance dev-daily-release states, now its fallback only, go first.
 
 Each enrolled GitHub runner's checkout (~/actions-runner*/_work/<repo>/<repo>) has two families.
 runner-checkout-build is SwiftPM's Packages/*/.build and Packages/*/*/.build plus cargo-tagged target
@@ -849,6 +853,9 @@ EMERGENCY_DEVS: frozenset[int] = frozenset()
 # not the gate: a runner that was never held can still take a job between the floor and the resume mark. cmux11s and cmux9s sat at 8-25 GiB under a 30 GiB floor with 25-40 GiB of it
 # "recent" while the gate held every runner idle (2026-10-21).
 FLOOR_HOLD: dict[int, int] = {}
+# Filesystems under FLOOR_HOLD -> the runner floor itself (floor_gib), in bytes: a per-host cmux-next build root
+# younger than its idle window goes only while free is still below it, after everything else (cmux_next_ci_host_roots).
+CMUX_NEXT_HOST_FLOOR: dict[int, int] = {}
 GATE_DISK_RESUME_GIB = 2.0  # glaeda-cmux-runner-hook's: a disk hold ends only this far above the floor
 
 
@@ -920,6 +927,12 @@ def item_window(fam: Family, path: Path, idle_hours: float, archived: frozenset[
     (cmux_next_ci_over). Everything else waits out its family's window."""
     if fam.id == "cmux-seeds" and path.name in archived:
         return 0.0
+    if cmux_next_ci_host_root(fam, path):  # never the cap's: its own idle window, or at once under the floor hold
+        with contextlib.suppress(OSError):
+            if fam.root.stat().st_dev in FLOOR_HOLD:
+                return 0.0
+        window = float(POLICY["cmux_next_ci_host_idle_hours"])
+        return max(window, fam.min_idle_hours) if RUNNER_CACHE_PROFILE else window  # that profile's 7-day minimum
     if fam.id == CMUX_NEXT_CI_FAMILY and (CMUX_NEXT_CI_DRAIN or cmux_next_ci_over()):
         return 0.0
     if fam.id == SPM_SCRATCH:
@@ -966,6 +979,7 @@ def cmux_next_cap_only(fam: Family, path: Path, idle: float, idle_hours: float) 
     """Reclaimable only because the cmux-next-ci cache is over its cap: an unowned state root listed whole, or
     generated output younger than the family's own window. apply stops these once the cache is under the cap."""
     return (fam.id == CMUX_NEXT_CI_FAMILY and cmux_next_ci_over() > 0 and not cmux_next_ci_floor_slot(fam, path)
+            and not cmux_next_ci_host_root(fam, path)
             and (cmux_next_ci_state_for(path, fam.root) is None or idle < idle_window(fam, idle_hours)))
 
 
@@ -1034,6 +1048,14 @@ POLICY_DEFAULTS: dict[str, Any] = {
     # Over the cap, a cmux-next state no enrolled runner owns goes whole (inputs too) only once idle this long:
     # GitHub's default job timeout (timeout-minutes 360), so no job can still be using it.
     "cmux_next_ci_unowned_idle_hours": 6.0,
+    # Per-host cmux-next build roots, relative to the cmux-next-ci cache (cmux#25147: the DEV Release compile builds
+    # from one tree per mini, so the compilation cache's path-bearing keys match whichever runner instance builds).
+    # Builds hold flock(2) on <root>/lock; <root>/src and <root>/Release/xcode-<toolchain> are one warm state, and the
+    # per-instance states beside it (<kind>/<key>) are only its busy-lock fallback. A host root goes whole and last
+    # (cmux_next_ci_host_roots): never for the size cap, only once idle cmux_next_ci_host_idle_hours, or while free is
+    # still under the runner floor after everything else, and never while its lock is held. [] turns this off.
+    "cmux_next_ci_host_roots": ["dev-daily-release/host"],
+    "cmux_next_ci_host_idle_hours": 48.0,
     # --dedupe also clones identical files in capture and evidence trees (screen-capture frames, UI evidence),
     # with its own floor: one PNG frame is 16-200 KiB, so Xcode's 1 MiB floor saw 2.7 of the 11.2 GiB of
     # identical frames in cmux-mac-mini's ~/messageslab-26. "~" is the account's home; globs are allowed; a
@@ -3375,6 +3397,7 @@ def interrupted_families(fams: list[Family]) -> list[Family]:
         dirs = {fam.root}
         if fam.id == CMUX_NEXT_CI_FAMILY:  # a whole state set aside leaves no candidate where it sat
             dirs.update(cmux_next_ci_state_parents(fam.root))
+            dirs.update(cmux_next_ci_host_parents(fam.root))
         if fam.discover or fam.checkout_builds:
             dirs.update(p.parent for p in candidates(fam))
         else:  # a match family's candidates sit within depth levels too: an aside one left no candidate behind
@@ -4427,7 +4450,8 @@ def job_busy(fam: Family, path: Path) -> bool:
         return False
     if fam.id == INTERRUPTED:  # renamed away from every job's path; its deleter's pid is its in-use signal
         return False
-    if fam.id == CMUX_NEXT_CI_FAMILY and path in cmux_next_ci_state_roots(fam.root):
+    if fam.id == CMUX_NEXT_CI_FAMILY and (path in cmux_next_ci_state_roots(fam.root)
+                                         or cmux_next_ci_host_root(fam, path)):
         return False  # a whole state's inputs are wider than the budget; cmux_next_ci_busy is its signal
     return fam.reclaimable and not fam.discover and cmux_active(path)
 
@@ -4912,7 +4936,12 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             verdict = "reclaimable"
             if path.name in archived and fam.id == "cmux-seeds":
                 reasons.append("the seed archive holds it")
-            if cmux_next_ci_floor_slot(fam, path):
+            if cmux_next_ci_host_root(fam, path):
+                reasons.append("the per-host cmux-next build root, last of everything: "
+                               + (f"idle {float(POLICY['cmux_next_ci_host_idle_hours']):g}h+"
+                                  if idle >= float(POLICY["cmux_next_ci_host_idle_hours"])
+                                  else "only while free stays under the runner floor"))
+            elif cmux_next_ci_floor_slot(fam, path):
                 reasons.append("an idle runner's whole cmux-next slot, under the runner floor (its next job builds "
                                "cold; least recently used first, after every generated child)")
             elif cmux_next_cap_only(fam, path, idle, idle_hours):
@@ -5865,7 +5894,8 @@ APPLY_LSOF_ITEMS, APPLY_LSOF_S = 8, 20.0  # apply re-takes lsof for discovered i
 
 def apply(items: list[Item], families: dict[str, Family], receipt: Path,
           targets: dict[int, int] | None, idle_hours: float, halt=None,
-          all_families: list[Family] | None = None, receipt_sweep: bool | None = None) -> int:
+          all_families: list[Family] | None = None, receipt_sweep: bool | None = None,
+          taken: dict[Path, int] | None = None) -> int:
     """Delete reclaimable items, largest first. With `targets` (filesystem device -> free bytes
     to stop at), only items on those filesystems are touched, each until its own target. With `halt`
     (the idle sweep's host_busy), each deletion first asks it and the run stops once it names a reason."""
@@ -5890,18 +5920,31 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
     archived = archived_seeds() if any(i.family == "cmux-seeds" for i in items) else frozenset()
     # Among pressure hot-tier items, evict greatest reuse distance, then oldest use.
     cap_left = cmux_next_ci_over()  # what the cmux-next-ci cache is still over its cap
-    taken_in: dict[Path, int] = {}  # bytes this pass took from inside each cmux-next state root
+    # bytes this pass took from inside each cmux-next state root and host root; TAKEN shares it across main's passes
+    taken_in: dict[Path, int] = {} if taken is None else taken
 
     def order(i):
-        if cmux_next_ci_floor_slot(family_of(i), Path(i.path)):
+        if cmux_next_ci_host_root(family_of(i), Path(i.path)):
+            # the per-host build root is every DEV compile's warm state: after everything else, slots included
+            return (-3, 0, i.idle_hours, i.bytes)
+        slot = cmux_next_ci_floor_slot(family_of(i), Path(i.path))
+        warm = slot or floor_hold_only(family_of(i), i, idle_hours) \
+            or cmux_next_cap_only(family_of(i), Path(i.path), i.idle_hours, idle_hours)
+        if warm and cmux_next_ci_fallback_item(family_of(i), Path(i.path)):
+            # a per-instance state of a kind with a host root is only that root's busy-lock fallback: before every
+            # other warm cmux-next item, its generated children first, then the state whole
+            whole = slot or Path(i.path) in cmux_next_ci_state_roots(family_of(i).root)
+            return (-1, 1 if whole else 2, i.idle_hours, i.bytes)
+        if slot:
             # a whole slot costs its runner a cold build: after every generated child, least recently used first
             return (-2, 0, i.idle_hours, i.bytes)
-        if floor_hold_only(family_of(i), i, idle_hours) \
-                or cmux_next_cap_only(family_of(i), Path(i.path), i.idle_hours, idle_hours):
+        if warm:
             # reclaimable only by FLOOR_HOLD or the cmux-next cap: warm builds go last, least recently used first
             return (-1, 0, i.idle_hours, i.bytes)
         if i.family == RUNNER_GIT_GARBAGE_FAMILY:  # garbage nothing reads goes before anything that costs a rebuild
             return (2, 0, i.idle_hours, i.bytes)
+        if cmux_next_ci_fallback_item(family_of(i), Path(i.path)):  # due by its own window: first of its band
+            return (0, math.inf, i.idle_hours, i.bytes)
         if ACTIVITY_MODE == "pressure" and (i.family in FLEET_FAMILY_IDS or i.family == RUNNER_BUILD_FAMILY):
             return (1, i.jobs_since if i.jobs_since is not None else -1, i.idle_hours, i.bytes)
         return (0, value(i, families[i.family]), 0, 0)
@@ -5943,6 +5986,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             warm.append(cap_left > 0)
         if warm and not any(warm):
             continue
+        if cmux_next_ci_host_floor_only(fam, p, i.idle_hours) and not cmux_next_ci_host_floor_unmet(p):
+            continue  # the host root goes for the floor only while free is still under the floor itself
         # fresh re-observation right before the destructive step. cmux jobs clone their warm state with
         # `cp -cR SOURCE ...` at any moment and a clone leaves the source's times alone, so those families
         # re-read the command lines per item rather than trusting the ones from the start of a long run.
@@ -5950,7 +5995,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             print(f"stopped: {why}")
             break
         if fam.id in FLEET_FAMILY_IDS or fam.id in (CMUX_NEXT_CI_FAMILY, HQ_CACHE_FAMILY, CANONICAL_ADMISSION) or (
-                fam.id == INTERRUPTED and fam.root in cmux_next_ci_state_parents(HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT)):
+                fam.id == INTERRUPTED and fam.root in (cmux_next_ci_state_parents(HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT)
+                                                       + cmux_next_ci_host_parents(HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT))):
             # Pressure eligibility is intentionally broad, so take fresh cwd/open-file evidence immediately
             # before each rename. A job may start using a candidate after the survey or during a long pass.
             try:
@@ -6015,6 +6061,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             outcome = "changed:kept"
         elif cmux_next_ci_floor_slot(fam, p) and not floor_stop_unmet(p):
             continue  # free reached the floor hold's stop while the evidence was re-taken
+        elif cmux_next_ci_host_floor_only(fam, p, idle_now) and not cmux_next_ci_host_floor_unmet(p):
+            continue  # likewise free reached the floor
         elif not git_exempt(fam, p, idle_now) and not fam.git_disposable and family_git_state(fam, p) != "none":
             outcome = "changed:git"  # a clone appeared at the top of the cache since the survey
         elif (fam.git_disposable and p.is_dir() and not git_exempt(fam, p, idle_now)
@@ -6039,6 +6087,10 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 elif i.family == INTERRUPTED:
                     finish_deletion(p)
                     gone = True
+                elif cmux_next_ci_host_root(fam, p):
+                    # only under its own lock (a build may take it now); for the floor alone, only while still under it
+                    gone = remove_cmux_next_host(p, needed=(lambda q=p: cmux_next_ci_host_floor_unmet(q))
+                                                 if cmux_next_ci_host_floor_only(fam, p, idle_now) else None)
                 else:
                     # rustup skips reinstalling a toolchain whose update hash still matches the channel
                     # the moment the toolchain is renamed away, so an interrupted delete cannot leave it behind
@@ -6058,14 +6110,16 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                     outcome = "reclaimed" if gone else "changed:in-use"
                     took = i.bytes
                     if gone and fam.id == CMUX_NEXT_CI_FAMILY:
-                        if whole_state:
+                        if whole_state or cmux_next_ci_host_root(fam, p):
                             took = max(0, took - taken_in.get(p, 0))  # its children's bytes were counted already
                         else:
                             taken_in[p.parent] = taken_in.get(p.parent, 0) + took
                         cap_left -= took
-                    elif gone and fam.id == INTERRUPTED and p.parent in cmux_next_ci_state_parents(
-                            HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT):
+                    elif gone and fam.id == INTERRUPTED and p.parent in (
+                            cmux_next_ci_state_parents(HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT)
+                            + cmux_next_ci_host_parents(HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT)):
                         cap_left -= took  # an aside slot was part of the cache the cap measured
+                        taken_in[p.parent] = taken_in.get(p.parent, 0) + took  # a host root's measure held it too
                     released += took if gone else 0
                 if common:  # drop the deleted worktree's record from its repository
                     subprocess.run(["git", "--git-dir", common, "worktree", "prune"],
@@ -6109,9 +6163,13 @@ def cmux_next_ci_aside_busy(path: Path, opened: list[str] | frozenset[str], comm
     fail-closed socket search, markers, unknown children. "" for any other aside tree."""
     root = HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT
     m = DELETING_RE.fullmatch(path.name)
-    if m is None or path.parent not in cmux_next_ci_state_parents(root):
+    if m is None:
         return ""
     original = path.with_name(path.name[len(DELETING_PREFIX):m.start(1) - 1])
+    if path.parent in cmux_next_ci_host_roots(root):  # a host root's child set aside: its builds' lock, on the root
+        return cmux_next_ci_host_lock_held(path.parent)
+    if path.parent not in cmux_next_ci_state_parents(root):
+        return ""
     runner = cmux_next_ci_owner(original, root)
     if runner == OWNER_UNKNOWN:
         return "an enrolled runner's .runner names no agent: whose cmux-next state this is is unknown"
@@ -6287,15 +6345,151 @@ def cmux_next_ci_runner(path: Path, root: Path) -> Path | None:
 
 def cmux_next_ci_stale_roots(root: Path) -> list[Path]:
     """Validated state roots the size cap may take whole, inputs included: those no runner enrolled here owns
-    (a scheme state by name, a release state by key; cmux_next_ci_owner), idle at least a job's timeout
+    (a scheme state by name, a release state by key; cmux_next_ci_owner), and per-instance states of a kind with a
+    host root (only that root's busy-lock fallback, cmux_next_ci_fallback_item), each idle at least a job's timeout
     (cmux_next_ci_unowned_idle_hours). Only a host with enrolled runners can say an owner is gone, so elsewhere
-    there are none. An enrolled runner's states, and a younger unowned one, keep their inputs."""
+    there are none. An enrolled runner's other states, and younger ones, keep their inputs; every in-use veto,
+    the owner's Runner.Worker included, still holds (cmux_next_ci_busy)."""
     if not enrolled_runner_names():
         return []
     idle_s = float(POLICY["cmux_next_ci_unowned_idle_hours"]) * 3600
     now = time.time()
+    fam = cmux_next_ci_family(root)
     return [s for s in cmux_next_ci_state_roots(root)
-            if cmux_next_ci_owner(s, root) is None and now - newest_mtime(s, 2, 3000) >= idle_s]
+            if (cmux_next_ci_owner(s, root) is None or cmux_next_ci_fallback_item(fam, s))
+            and now - newest_mtime(s, 2, 3000) >= idle_s]
+
+
+def cmux_next_ci_stale_roots_cached(root: Path) -> frozenset[Path]:
+    """cmux_next_ci_stale_roots once per run (one newest_mtime walk per state, not one per question), kept with the
+    run's candidate lists (_DISCOVERED)."""
+    key = "cmux-next-stale:" + os.fspath(root)
+    if key not in _DISCOVERED:
+        _DISCOVERED[key] = frozenset(cmux_next_ci_stale_roots(root))
+    return _DISCOVERED[key]
+
+
+def cmux_next_ci_host_paths(root: Path) -> list[Path]:
+    """Where disk-policy.json's cmux_next_ci_host_roots put the per-host build roots under ROOT, whether or not one
+    is there: relative paths only, no . or .. segment, never ROOT itself."""
+    found: list[Path] = []
+    for rel in POLICY["cmux_next_ci_host_roots"]:
+        rel_path = Path(rel)
+        if rel_path.is_absolute() or not rel_path.parts or any(p in (".", "..") for p in rel.split("/")):
+            continue
+        if (root / rel_path) not in found:
+            found.append(root / rel_path)
+    return found
+
+
+def cmux_next_ci_host_roots(root: Path) -> list[Path]:
+    """The per-host build roots (cmux_next_ci_host_paths) present under ROOT: real directories with no symlink from
+    ROOT down. Each is one item of the cmux-next family, whole, and never a state root (its key is no hex key), so
+    the size cap never takes it: it goes once idle cmux_next_ci_host_idle_hours (item_window), or under the floor
+    hold while free is still below the floor itself, after everything else (apply's order), and only under its own
+    lock (remove_cmux_next_host). cmux13s/cmux14, 2026-10-26: 14-16 GiB, 424 of 502 compile jobs cache hits warm."""
+    if root.is_symlink() or not root.is_dir():
+        return []
+    found = []
+    for host in cmux_next_ci_host_paths(root):
+        step, ok = root, True
+        for part in host.relative_to(root).parts:
+            step = step / part
+            if step.is_symlink() or not step.is_dir():
+                ok = False
+                break
+        if ok:
+            found.append(host)
+    return found
+
+
+def cmux_next_ci_host_parents(root: Path) -> list[Path]:
+    """The host roots themselves: remove_cmux_next_host renames each child aside inside its root (the root and its
+    lock stay), so an interrupted removal leaves the aside there (interrupted_families)."""
+    return cmux_next_ci_host_roots(root)
+
+
+def cmux_next_ci_host_root(fam: Family, path: Path) -> bool:
+    """Whether PATH is a per-host cmux-next build root listed whole (cmux_next_ci_host_roots)."""
+    return fam.id == CMUX_NEXT_CI_FAMILY and path in cmux_next_ci_host_roots(fam.root)
+
+
+def cmux_next_ci_host_floor_only(fam: Family, path: Path, idle: float) -> bool:
+    """Whether a host root is due only for the floor hold: younger than cmux_next_ci_host_idle_hours."""
+    return cmux_next_ci_host_root(fam, path) and idle < float(POLICY["cmux_next_ci_host_idle_hours"])
+
+
+def cmux_next_ci_host_floor_unmet(path: Path) -> bool | None:
+    """Whether free space on PATH's filesystem is still below the runner floor itself (CMUX_NEXT_HOST_FLOOR); None
+    when it cannot be read (falsy: the host root stays)."""
+    try:
+        floor = CMUX_NEXT_HOST_FLOOR.get(path.parent.stat().st_dev)
+        return floor is not None and free_bytes(path.parent)[0] < floor
+    except OSError:
+        return None
+
+
+def cmux_next_ci_fallback_item(fam: Family, path: Path) -> bool:
+    """Whether PATH is inside a per-instance state (<kind>/<hex key>/...) of a kind that has a host root here: the
+    host lock's fallback only (cmux compile-dev-release.sh), so it goes before every other cmux-next item."""
+    if fam.id != CMUX_NEXT_CI_FAMILY:
+        return False
+    try:
+        rel = path.relative_to(fam.root).parts
+    except ValueError:
+        return False
+    return (len(rel) >= 2 and re.fullmatch(r"[0-9a-fA-F]{8,64}", rel[1]) is not None
+            and any(h.parent == fam.root / rel[0] for h in cmux_next_ci_host_roots(fam.root)))
+
+
+def cmux_next_ci_host_lock_held(host: Path) -> str:
+    """Why a host root's builds hold it, from flock(2) on <root>/lock, or "". cmux's host_build_lock.py takes it
+    exclusive without waiting, and the clone, xcodebuild and ditto inherit it, so the kernel holds it until the last
+    of them exits. Probed shared and released at once; a lock that cannot be read or is a symlink counts as held."""
+    try:
+        fd = os.open(host / "lock", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return ""
+    except OSError as e:
+        return f"cmux-next host lock unreadable ({e.strerror})"
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return "a cmux-next build holds the host root (flock on its lock)"
+    except OSError as e:
+        return f"cmux-next host lock unreadable ({e.strerror})"
+    finally:
+        os.close(fd)
+    return ""
+
+
+def remove_cmux_next_host(host: Path, needed=None) -> bool:
+    """Empty a host root only under its own lock: flock(2) exclusive on <root>/lock, without waiting, held while
+    every child but the lock is removed (each renamed aside first, as remove() does). The lock file itself stays, the
+    same inode, so a build that opened it before this and flocks it now or later still excludes every other build
+    (a lock file replaced under it would let two builds hold two inodes at once). A build that starts meanwhile finds
+    the lock taken and builds per instance (cmux's fallback); one after sets up a fresh tree. False when a build holds
+    the lock. A child that cannot be removed raises, as remove() does. NEEDED (the floor hold's case) is asked again
+    once the lock is held, before anything goes: falsy raises SlotNotNeeded and nothing is touched."""
+    if host.is_symlink() or os.path.ismount(host) or host.lstat().st_dev != host.parent.stat().st_dev:
+        raise OSError("refusing a host root that is a link or a mount point")
+    try:  # created when missing, as the build's `exec 9>>lock` does, so both meet the same inode
+        fd = os.open(host / "lock", os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False
+        if needed is not None and not needed():
+            raise SlotNotNeeded(f"{host.name}: free reached the runner floor; kept")
+        for child in _children(host):
+            if child.name != "lock":
+                remove(child)
+    finally:
+        os.close(fd)
+    return True
 
 
 def cmux_next_ci_floor_slots(root: Path) -> list[Path]:
@@ -6395,9 +6589,17 @@ def cmux_next_ci_slot_recheck(fam: Family, path: Path, floor: bool = True):
 
 
 def cmux_next_ci_floor_slot(fam: Family, path: Path) -> bool:
-    """Whether PATH is an enrolled runner's whole cmux-next state root, listed only under the floor hold."""
-    return (fam.id == CMUX_NEXT_CI_FAMILY and not CMUX_NEXT_CI_DRAIN and path in cmux_next_ci_state_roots(fam.root)
-            and cmux_next_ci_owner(path, fam.root) is not None)
+    """Whether PATH is an enrolled runner's whole cmux-next state root, listed only under the floor hold. Outside
+    it, an owned fallback state the size cap lists whole (cmux_next_ci_stale_roots) is the cap's, as an unowned one."""
+    if not (fam.id == CMUX_NEXT_CI_FAMILY and not CMUX_NEXT_CI_DRAIN and path in cmux_next_ci_state_roots(fam.root)
+            and cmux_next_ci_owner(path, fam.root) is not None):
+        return False
+    try:
+        held = fam.root.stat().st_dev in FLOOR_HOLD
+    except OSError:
+        held = False
+    return held or not (cmux_next_ci_over() and cmux_next_ci_fallback_item(fam, path)
+                        and path in cmux_next_ci_stale_roots_cached(fam.root))
 
 
 def cmux_next_ci_generated_paths(root: Path, whole_stale: bool = False) -> list[Path]:
@@ -6422,6 +6624,8 @@ def cmux_next_ci_generated_paths(root: Path, whole_stale: bool = False) -> list[
                 found.append(child)
     # its generated children are listed as well and go first (apply's order); the slot itself goes after them
     found.extend(slot for slot in cmux_next_ci_floor_slots(root) if slot not in stale)
+    if not CMUX_NEXT_CI_DRAIN:  # listed whole and always, so a report shows it; its window decides (item_window)
+        found.extend(cmux_next_ci_host_roots(root))
     return found
 
 
@@ -6509,6 +6713,8 @@ def cmux_next_ci_busy(fam: Family, path: Path, opened: list[str] | frozenset[str
     """
     if fam.id != CMUX_NEXT_CI_FAMILY:
         return ""
+    if cmux_next_ci_host_root(fam, path):  # no runner's state: its builds' flock is its in-use signal
+        return cmux_next_ci_host_lock_held(path)
     state = cmux_next_ci_state_for(path, fam.root)
     if state is None and cmux_next_ci_over() and path in cmux_next_ci_stale_roots(fam.root):
         state = path  # an unowned state root the cap takes whole: the same vetoes, on the root itself
@@ -7472,11 +7678,12 @@ def _main_impl(argv: list[str] | None = None) -> int:
             print(f"idle sweep: the last one ran within {IDLE_SWEEP_EVERY_S // 60} min")
             RUN["skipped"] = "no pressure; idle sweep ran within the hour"
             return 0
-    global ACTIVITY_MODE, EMERGENCY_DEVS, FLOOR_HOLD
+    global ACTIVITY_MODE, EMERGENCY_DEVS, FLOOR_HOLD, CMUX_NEXT_HOST_FLOOR
     ACTIVITY_MODE = "sweep" if sweep else "pressure" if a.pressure else None
     # the idle sweep judges by reuse windows alone; a pressure run or a report sees the emergency floor
     EMERGENCY_DEVS = frozenset() if sweep else emergency_devs(fss, a.emergency, floor_gib)
     FLOOR_HOLD = floor_hold(fss, floor_gib) if ACTIVITY_MODE == "pressure" else {}
+    CMUX_NEXT_HOST_FLOOR = {dev: int(floor_gib * GIB) for dev in FLOOR_HOLD}
     busy = host_busy() if sweep else ""
     if sweep:
         print(f"idle sweep: {'host busy, ' + busy if busy else 'host idle'}")
@@ -7656,9 +7863,16 @@ def _main_impl(argv: list[str] | None = None) -> int:
         print()
         halt = (cmux_next_drain_halt if a.cmux_next_drain
                 else host_busy if sweep and POLICY["defer_during_ci"] else None)
-        logical_released = stale_marker_released + apply(items, {f.id: f for f in fams}, a.receipt,
-                                 {fs.dev: fs.target for fs in shown} if a.pressure else None, idle, halt,
-                                 all_families=fams, receipt_sweep=sweep)
+        by_id = {f.id: f for f in fams}
+        # the per-host cmux-next build root goes after everything else, idle runners' whole checkouts included
+        last = {id(i) for i in items if i.family in by_id and cmux_next_ci_host_root(by_id[i.family], Path(i.path))}
+
+        taken: dict[Path, int] = {}  # one tally across both passes: an aside finished first is in the host's size
+
+        def apply_pass(chosen: list[Item]) -> int:
+            return apply(chosen, by_id, a.receipt, {fs.dev: fs.target for fs in shown} if a.pressure else None,
+                         idle, halt, all_families=fams, receipt_sweep=sweep, taken=taken)
+        logical_released = stale_marker_released + apply_pass([i for i in items if id(i) not in last])
         # A drained runner is explicitly held by cmux_mini_fix; once its listener and worker
         # are absent, its disposable checkout can be cleared under this same eviction lock.
         if not RUNNER_CACHE_PROFILE:
@@ -7671,6 +7885,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
         if a.pressure and not RUNNER_CACHE_PROFILE and not a.cmux_next_drain \
                 and (not a.family or RUNNER_IDLE_CHECKOUT_FAMILY in a.family):
             logical_released += evict_idle_runner_checkouts(a.receipt, floor_gib)
+        if last:
+            logical_released += apply_pass([i for i in items if id(i) in last])
         # a home clone that fetch after fetch left in many packs: repacked at most hourly or under pressure,
         # after the eviction lock is released, so a gc of many minutes never holds back another eviction
         home_clone_gc_due = ((sweep or a.pressure) and ROLE == "fleet-mini" and not RUNNER_CACHE_PROFILE

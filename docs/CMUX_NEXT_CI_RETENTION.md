@@ -31,7 +31,7 @@ a process, holds a socket, has a `.cmux-active`, `.build.active`, `.lock`,
 `lease.json`, or `reservation.json` marker, or contains an unknown direct
 child. Apply re-collects process evidence immediately before each rename. The
 family never deletes a source checkout, nor a whole state root except a stale one
-under the size cap below. Use the normal `glaeda-disk` report first; `--apply`
+under the size cap below, a runner floor slot, or the per-host build root below. Use the normal `glaeda-disk` report first; `--apply`
 writes the standard JSONL receipt and rechecks every candidate.
 
 ## Size cap
@@ -56,6 +56,35 @@ output and keep `SourcePackages` and the module caches. Every veto above still
 holds, and a runner with a `Runner.Worker` keeps its states. An unmeasurable
 cache keeps the 72-hour window. cmux11s refused jobs at 21 GiB free under a
 40 GiB floor with 78 GiB here and nothing reclaimable (2026-10-21).
+
+## The per-host build root
+
+cmux#25147 builds the DEV Release compile on each mini from one tree,
+`dev-daily-release/host` (`src`, `Release/xcode-<toolchain>`, `lock`), so the
+compilation cache's path-bearing keys match whichever runner instance builds
+(cmux14, 2026-10-26: 424 of 502 compile jobs hit the cache warm, 548 s of
+`xcodebuild` against 794 s cold). Builds hold `flock(2)` on its `lock`; a busy
+lock builds in the old per-instance state, `dev-daily-release/<key>`, which is
+now only that fallback. `disk-policy.json`'s `cmux_next_ci_host_roots` (default
+`["dev-daily-release/host"]`, `[]` off) names such roots, relative to the cache.
+
+A host root is one item, listed whole, and never a state root, so the size cap
+never takes it. Apply takes it after everything else, the runner floor's slots
+included, and only:
+
+- once idle `cmux_next_ci_host_idle_hours` (default 48), or
+- under the runner floor hold while free space is still below the floor itself.
+
+It is never touched while its lock is held: the survey probes the lock, and the
+removal takes it exclusive, without waiting, and holds it while it removes every
+child except `lock` itself. The lock file keeps its inode, so a build that had
+already opened it still excludes every other build. A build that starts
+meanwhile falls back per instance, and one that starts after sets up a fresh
+tree. A process open in it or naming it keeps it too. Among the other
+cmux-next items, the per-instance states of a kind with a host root go first,
+and over the size cap such a state idle `cmux_next_ci_unowned_idle_hours` goes
+whole, inputs included, as an unowned one does (its runner's `Runner.Worker`
+and every other veto still keep it).
 
 The ordinary `--dedupe` pass visits only reusable package/module/SDK inputs. Build
 output is write-heavy, so it is excluded from the periodic WatchPaths agent. An

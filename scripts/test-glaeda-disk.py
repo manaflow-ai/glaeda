@@ -3695,6 +3695,180 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertTrue((st["mini-glaeda"] / "SourcePackages").is_dir())
         self.assertFalse([p for p in st["mini-glaeda"].parent.iterdir() if p.name.startswith(gd.DELETING_PREFIX)])
 
+    def _cmux_next_host_tree(self, hours: float = 2.0):
+        """_cmux_next_cap_tree plus cmux#25147's per-host DEV build root: dev-daily-release/host with its source
+        clone (.git included), its Release DerivedData and the lock its builds flock."""
+        home, fam, st = self._cmux_next_cap_tree()
+        host = fam.root / "dev-daily-release/host"
+        make(host / "src/.git", age_hours=hours)
+        xcode = host / "Release/xcode-2c2299e9015ce0c8"
+        for name in ("CompilationCache.noindex", "SourcePackages", "Build"):
+            make(xcode / name, age_hours=hours)
+        (host / "lock").write_text('{"pid": 1, "runner": "mini-glaeda"}')
+        self._age(host, hours=hours)
+        return home, fam, st, host
+
+    def test_the_per_host_cmux_next_root_goes_last_and_only_under_the_floor(self) -> None:
+        """cmux#25147's host tree (14-16 GiB, 424 of 502 compile jobs hit warm on cmux14, 2026-10-26) is never the
+        cap's: under the runner floor hold everything else goes first, the per-instance dev-daily state (its
+        fallback) before all, and the host tree only while free is still below the floor itself."""
+        home, fam, st, host = self._cmux_next_host_tree()
+        dev = home.stat().st_dev
+        everything_else = [st["daily"] / "Build", st["daily"],  # the per-instance fallback state first, then whole
+                           st["release-old"], st["gone-runner"],  # then least recently used: 8 h, 7 h (whole)
+                           st["mini-glaeda"] / "Build", st["mini-glaeda-2"] / "Build", st["release-new"] / "Build",
+                           st["mini-glaeda"], st["mini-glaeda-2"], st["release-new"]]  # then the other slots
+        # over the cap with no floor hold: the host tree is listed, but its 48 h window holds
+        gd._DISCOVERED.clear()
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "CMUX_NEXT_CI_OVER", gd.GIB):
+            v = {Path(i.path): i.verdict for i in gd.survey([fam], 6, 0)}
+        self.assertEqual(v[host], "recent")
+        self.assertNotIn(host / "Release/xcode-2c2299e9015ce0c8", v)  # never a state root of its own
+        # 35 GiB free: under the hold's 50 GiB stop, above the 30 GiB floor. Everything else goes; the host stays
+        with mock.patch.object(gd, "CMUX_NEXT_HOST_FLOOR", {dev: 30 * gd.GIB}):
+            _, removed, items = self._floor_apply(home, fam, 35.0, 0.0, over=100 * gd.GIB)
+        self.assertIn("per-host cmux-next build root", " ".join(
+            next(i for i in items if Path(i.path) == host).reasons))
+        self.assertEqual(removed, everything_else)
+        self.assertTrue((host / "Release/xcode-2c2299e9015ce0c8/CompilationCache.noindex").is_dir())
+        # over the cap, the per-instance fallback state idle past a job's timeout goes whole, inputs included; an
+        # enrolled runner's other state as idle keeps its inputs
+        shutil.rmtree(home)
+        home, fam, st, host = self._cmux_next_host_tree()
+        for key in ("daily", "mini-glaeda"):
+            self._age(st[key], hours=7)
+        with mock.patch.object(gd, "HOME", home):
+            stale = gd.cmux_next_ci_stale_roots(fam.root)
+        self.assertIn(st["daily"], stale)
+        self.assertNotIn(st["mini-glaeda"], stale)
+        self.assertNotIn(host, stale)
+        # 10 GiB free: still under the floor after everything else, so the host tree goes, last
+        shutil.rmtree(home)
+        home, fam, st, host = self._cmux_next_host_tree()
+        with mock.patch.object(gd, "CMUX_NEXT_HOST_FLOOR", {dev: 30 * gd.GIB}):
+            _, removed, _ = self._floor_apply(home, fam, 10.0, 0.0, over=100 * gd.GIB)
+        self.assertEqual(removed[:len(everything_else)], everything_else)
+        self.assertEqual(sorted(removed[len(everything_else):]), [host / "Release", host / "src"])  # last
+        # emptied, its lock left in place (the same inode a build may already have open), and no aside left
+        self.assertEqual([p.name for p in host.iterdir()], ["lock"])
+
+    def test_the_per_host_cmux_next_root_is_kept_while_its_lock_is_held_and_goes_once_idle(self) -> None:
+        home, fam, st, host = self._cmux_next_host_tree()
+        dev = home.stat().st_dev
+        with open(host / "lock", "a") as build:  # cmux host_build_lock.py: flock(LOCK_EX | LOCK_NB), held by xcodebuild
+            fcntl.flock(build, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with mock.patch.object(gd, "CMUX_NEXT_HOST_FLOOR", {dev: 30 * gd.GIB}):
+                _, removed, items = self._floor_apply(home, fam, 10.0, 0.0, over=100 * gd.GIB)
+            self.assertNotIn(host, removed)
+            self.assertEqual(next(i for i in items if Path(i.path) == host).verdict, "in-use")
+            # a build that takes the lock between the survey and the rename keeps it too
+            fcntl.flock(build, fcntl.LOCK_UN)
+            self.assertEqual(gd.cmux_next_ci_host_lock_held(host), "")
+            fcntl.flock(build, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertFalse(gd.remove_cmux_next_host(host))
+        self.assertTrue((host / "src/.git").is_dir())
+        # idle 48 h: an idle sweep (no pressure, no floor) takes it, git clone and all; younger, it stays
+        receipt = self.receipt()
+        for hours, gone in ((47.0, False), (49.0, True)):
+            self._age(host, hours=hours)
+            gd._DISCOVERED.clear()
+            with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                    mock.patch.object(gd, "command_lines", return_value=""), \
+                    mock.patch.object(gd, "ACTIVITY_MODE", "sweep"), contextlib.redirect_stdout(io.StringIO()):
+                items = [i for i in gd.survey([fam], 6, 0) if Path(i.path) == host]
+                gd.apply(items, {fam.id: fam}, receipt, None, 6, all_families=[fam])
+            self.assertEqual(not (host / "src").exists(), gone, hours)
+        # an interrupted removal's aside tree is finished like any other, unless a build holds its lock
+        aside = host / f"{gd.DELETING_PREFIX}src-999999"
+        make(aside / "x")
+        with mock.patch.object(gd, "HOME", home):
+            self.assertIn(host, gd.cmux_next_ci_host_parents(fam.root))
+            self.assertEqual(gd.cmux_next_ci_aside_busy(aside, [], ""), "")
+            with open(host / "lock", "a") as build:
+                fcntl.flock(build, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.assertIn("holds the host root", gd.cmux_next_ci_aside_busy(aside, [], ""))
+        # [] in disk-policy.json turns the rule off: the tree is then nobody's to judge, and kept
+        with mock.patch.dict(gd.POLICY, {"cmux_next_ci_host_roots": []}):
+            self.assertEqual(gd.cmux_next_ci_host_roots(fam.root), [])
+        self.assertEqual(gd.POLICY_DEFAULTS["cmux_next_ci_host_roots"], ["dev-daily-release/host"])
+        self.assertEqual(gd.POLICY_DEFAULTS["cmux_next_ci_host_idle_hours"], 48.0)
+
+    def test_the_host_lock_keeps_its_inode_so_a_build_that_opened_it_still_excludes_others(self) -> None:
+        # a build opened host/lock (fd 9) before the removal and flocks it after: a new lock file at the path would
+        # let a second build lock another inode and share host/src with it
+        home, fam, st, host = self._cmux_next_host_tree()
+        inode = (host / "lock").stat().st_ino
+        with open(host / "lock", "a") as early:
+            self.assertTrue(gd.remove_cmux_next_host(host))
+            fcntl.flock(early, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertEqual((host / "lock").stat().st_ino, inode)
+            with open(host / "lock", "a") as late, self.assertRaises(BlockingIOError):
+                fcntl.flock(late, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_over_the_cap_an_idle_owned_fallback_state_goes_whole_without_a_floor_hold(self) -> None:
+        home, fam, st, host = self._cmux_next_host_tree()
+        for key in st:
+            self._age(st[key], hours=3)
+        self._age(st["daily"], hours=7)  # the owned per-instance fallback, idle past a job's timeout
+        receipt = self.receipt()
+        gd._DISCOVERED.clear()
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "command_lines", return_value=""), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "CMUX_NEXT_CI_OVER", 1), \
+                contextlib.redirect_stdout(io.StringIO()):
+            items = gd.survey([fam], 6, 0)
+            self.assertFalse(gd.cmux_next_ci_floor_slot(fam, st["daily"]))
+            gd.apply(items, {fam.id: fam}, receipt, None, 6, all_families=[fam])
+        records = [json.loads(line) for line in receipt.read_text().splitlines()]
+        self.assertEqual([(Path(r["path"]), r["outcome"]) for r in records], [(st["daily"], "reclaimed")])
+        self.assertFalse(st["daily"].exists())
+        self.assertTrue((host / "src").is_dir())
+
+    def test_a_finished_host_aside_counts_against_the_cap(self) -> None:
+        home, fam, st, host = self._cmux_next_host_tree()
+        aside = host / f"{gd.DELETING_PREFIX}src-999999"
+        make(aside / "x", mib=3)
+        inter = gd.Family(gd.INTERRUPTED, host, True, "finish", build_output=True, max_idle_hours=0.0,
+                          rebuild_minutes=0.1)
+        items = [gd.Item(gd.INTERRUPTED, os.fspath(aside), 3 * 1024 * 1024, 48, "reclaimable", []),
+                 gd.Item(fam.id, os.fspath(st["mini-glaeda"] / "Build"), 1024 * 1024, 5, "reclaimable", [])]
+        receipt = self.receipt()
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "command_lines", return_value=""), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), \
+                mock.patch.object(gd, "CMUX_NEXT_CI_OVER", 2 * 1024 * 1024), contextlib.redirect_stdout(io.StringIO()):
+            gd.apply(items, {fam.id: fam, inter.id: inter}, receipt, None, 6, all_families=[fam, inter])
+        self.assertFalse(aside.exists())
+        self.assertTrue((st["mini-glaeda"] / "Build").is_dir())  # the aside alone brought the cache under its cap
+        # the host root measured with that aside in it: a later pass sharing the tally counts only the rest
+        taken = {host: 3 * 1024 * 1024}
+        self._age(host, hours=49)
+        item = gd.Item(fam.id, os.fspath(host), 5 * 1024 * 1024, 49, "reclaimable", [])
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "command_lines", return_value=""), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "sweep"), contextlib.redirect_stdout(io.StringIO()):
+            released = gd.apply([item], {fam.id: fam}, receipt, None, 6, all_families=[fam], taken=taken)
+        self.assertEqual(released, 2 * 1024 * 1024)
+        self.assertEqual([p.name for p in host.iterdir()], ["lock"])
+        # for the floor alone, free is read again under the lock: met by then, nothing goes
+        make(host / "src")
+        with self.assertRaises(gd.SlotNotNeeded):
+            gd.remove_cmux_next_host(host, needed=lambda: False)
+        self.assertTrue((host / "src").is_dir())
+        # a host root that is a mount point is refused whole
+        with mock.patch.object(gd.os.path, "ismount", return_value=True), self.assertRaises(OSError):
+            gd.remove_cmux_next_host(host)
+
+    def test_main_takes_the_per_host_cmux_next_root_after_idle_runners_checkouts(self) -> None:
+        home, fam, st, host = self._cmux_next_host_tree()
+        other = gd.Item(fam.id, os.fspath(st["mini-glaeda"] / "Build"), gd.GIB, 5.0, "reclaimable", [])
+        last = gd.Item(fam.id, os.fspath(host), 14 * gd.GIB, 2.0, "reclaimable", [])
+        with mock.patch.object(gd, "HOME", home):
+            _, _, _, apply = self._main_run(["--pressure", "--apply"], items=[last, other], families=[fam])
+        self.assertEqual([[i.path for i in call.args[0]] for call in apply.call_args_list],
+                         [[other.path], [last.path]])  # its own pass, after the runner checkouts' last resort
+
     @staticmethod
     def _release_key(name: str, runner: Path) -> str:
         """cmux scripts/cmux-next/release-derived-data-path.sh: sha256("$RUNNER_NAME\n$GITHUB_WORKSPACE\n")[:16]."""
@@ -3971,7 +4145,7 @@ class GlaedaDiskTest(unittest.TestCase):
                 mock.patch.object(gd, "EVICT_LOCK", self.root / "evict.lock"), \
                 mock.patch.object(gd, "EVICT_OWNER", self.root / "evict.owner.json"), \
                 mock.patch.object(gd, "HEALTH_SUMMARY", self.root / "summary.json"), \
-                mock.patch.object(gd, "default_families", return_value=[]), \
+                mock.patch.object(gd, "default_families", return_value=over.pop("families", [])), \
                 mock.patch.object(gd, "runner_floor_gib", return_value=30.0), \
                 mock.patch.object(gd, "filesystems", return_value=fss), \
                 mock.patch.object(gd, "free_bytes", return_value=(int(free_gib * gd.GIB), total)), \
