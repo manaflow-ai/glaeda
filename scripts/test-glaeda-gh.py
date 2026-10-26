@@ -44,6 +44,8 @@ spec = importlib.util.spec_from_loader("glaeda_gh", loader)
 gg = importlib.util.module_from_spec(spec)
 sys.modules["glaeda_gh"] = gg
 loader.exec_module(gg)
+# A host's own upstream.json (a lane VM's) must not turn every Daemon here into an upstream client.
+gg.UPSTREAM_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-upstream-{os.getpid()}.json"
 
 TOKEN = "ghp_faketoken_must_never_touch_disk"
 NOW = float(int(time.time()))  # watch files carry real mtimes
@@ -708,6 +710,177 @@ class ControllerTest(Base):
         finally:
             for k, v in saved.items():
                 os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+
+
+class UpstreamTest(Base):
+    """A host with no login reads through upstream.json's program: one request per tick, never GitHub."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.asked: list[dict] = []
+        self.answers: dict[str, dict | None] = {}
+        self.broken: Exception | None = None
+
+        def ask(request: dict) -> dict:
+            self.asked.append(request)
+            if self.broken is not None:
+                raise self.broken
+            return {"entries": {k["key"]: self.answers.get(k["key"]) for k in request["keys"]}}
+
+        self.daemon = gg.Daemon(transport=self.gh, token=lambda: self.fail("read a token"), controller=None,
+                                upstream=ask)
+
+    def pr_data(self) -> dict:
+        return {"number": 7, "state": "OPEN", "checks": [], "headRefOid": "a" * 40}
+
+    def test_a_watched_pr_is_filled_from_the_upstream_with_no_github_request(self) -> None:
+        gg.register("pr:o/r#7")
+        gg.register("run:o/r/9", jobs=True)
+        self.answers["pr:o/r#7"] = {"data": self.pr_data(), "dataAt": NOW - 30, "error": None}
+        self.answers["run:o/r/9"] = {"data": {"id": 9, "status": "completed"}, "dataAt": NOW - 5, "jobs": [{"id": 1}]}
+        status = self.daemon.tick(now=NOW)
+        self.assertEqual(self.gh.calls, [])
+        self.assertEqual(len(self.asked), 1)
+        self.assertEqual(sorted(k["key"] for k in self.asked[0]["keys"]), ["pr:o/r#7", "run:o/r/9"])
+        self.assertIn({"key": "run:o/r/9", "jobs": True}, self.asked[0]["keys"])
+        pr = gg.read_cache("pr:o/r#7")
+        self.assertEqual(pr["data"]["number"], 7)
+        self.assertEqual(pr["dataAt"], NOW - 30)  # the upstream's age, not this host's
+        self.assertEqual(pr["source"], "upstream")
+        self.assertEqual(gg.read_cache("run:o/r/9")["jobs"], [{"id": 1}])
+        self.assertEqual(status["upstream"]["state"], "ok")
+
+    def test_reads_are_paced_and_a_new_key_is_asked_for_soon(self) -> None:
+        gg.register("pr:o/r#7")
+        self.daemon.tick(now=NOW)  # the upstream has not read it yet: null
+        self.assertIsNone(gg.read_cache("pr:o/r#7"))
+        self.daemon.tick(now=NOW + 1)
+        self.assertEqual(len(self.asked), 1, "a key with no data waits UPSTREAM_NEW")
+        self.answers["pr:o/r#7"] = {"data": self.pr_data(), "dataAt": NOW + 2}
+        self.daemon.tick(now=NOW + gg.UPSTREAM_NEW)
+        self.assertEqual(len(self.asked), 2)
+        self.assertIsNotNone(gg.read_cache("pr:o/r#7")["data"])
+        self.daemon.tick(now=NOW + gg.UPSTREAM_NEW + 2)
+        self.assertEqual(len(self.asked), 2, "a key with data waits for the full cycle")
+        self.daemon.tick(now=NOW + gg.UPSTREAM_EVERY)
+        self.assertEqual(len(self.asked), 3)
+
+    def test_no_watch_no_request(self) -> None:
+        self.daemon.tick(now=NOW)
+        self.daemon.tick(now=NOW + gg.UPSTREAM_EVERY)
+        self.assertEqual(self.asked, [])
+
+    def test_a_failing_upstream_names_the_cause_and_keeps_old_data(self) -> None:
+        gg.register("pr:o/r#7")
+        gg.register("pr:o/r#8")
+        self.answers["pr:o/r#7"] = {"data": self.pr_data(), "dataAt": NOW}
+        self.daemon.tick(now=NOW)
+        self.broken = gg.WatchError("upstream: no broker socket")
+        status = self.daemon.tick(now=NOW + gg.UPSTREAM_EVERY)
+        self.assertEqual(status["upstream"]["state"], "failing")
+        self.assertIn("upstream: no broker socket", status["errors"])
+        self.assertEqual(gg.read_cache("pr:o/r#7")["data"]["number"], 7)  # kept, and the outage named on it
+        self.assertIn("no broker socket", gg.read_cache("pr:o/r#7")["error"])
+        self.assertIn("no broker socket", gg.read_cache("pr:o/r#8")["error"])
+        self.broken = None
+        self.daemon.tick(now=NOW + 2 * gg.UPSTREAM_EVERY)
+        self.assertIsNone(gg.read_cache("pr:o/r#7")["error"])
+
+    def test_past_the_key_cap_the_least_recently_read_go_first(self) -> None:
+        keys = [f"pr:o/r#{n}" for n in range(1, 6)]
+        for k in keys:
+            gg.register(k)
+            self.answers[k] = {"data": self.pr_data(), "dataAt": NOW}
+        with mock.patch.object(gg, "UPSTREAM_MAX_KEYS", 2):
+            for i in range(5):
+                self.daemon.tick(now=NOW + i * gg.UPSTREAM_EVERY)
+        asked = [k["key"] for r in self.asked for k in r["keys"]]
+        self.assertEqual(set(asked), set(keys), "every key is read in turn")
+        self.assertTrue(all(len(r["keys"]) <= 2 for r in self.asked))
+
+    def test_keys_that_keep_failing_do_not_starve_one_with_data(self) -> None:
+        bad = [f"pr:o/r#{n}" for n in range(10, 14)]
+        for k in bad:
+            gg.register(k)
+            self.answers[k] = {"data": None, "error": "NOT_FOUND", "missing": True}
+        gg.register("pr:o/r#7")
+        self.answers["pr:o/r#7"] = {"data": self.pr_data(), "dataAt": NOW}
+        with mock.patch.object(gg, "UPSTREAM_MAX_KEYS", 2):
+            for i in range(30):
+                self.daemon.tick(now=NOW + i * gg.UPSTREAM_NEW)
+        asked = [k["key"] for r in self.asked for k in r["keys"]]
+        self.assertGreaterEqual(asked.count("pr:o/r#7"), 2)
+        # a key the upstream answered with an error waits for full cycles, not UPSTREAM_NEW: one full read per
+        # UPSTREAM_EVERY, plus the reads that first fill the 5 new keys 2 at a time
+        self.assertLessEqual(len(self.asked), 30 * gg.UPSTREAM_NEW // gg.UPSTREAM_EVERY + 1 + 3)
+
+    def test_a_pr_github_says_does_not_exist_fails_a_wait_instead_of_timing_out(self) -> None:
+        gg.register("pr:o/r#404")
+        self.answers["pr:o/r#404"] = {"data": None, "error": "NOT_FOUND", "missing": True, "fetchedAt": NOW}
+        self.daemon.tick(now=NOW)
+        entry = gg.read_cache("pr:o/r#404")
+        self.assertTrue(entry["missing"])
+        self.assertEqual(entry["fetchedAt"], NOW)
+        req = {"key": "pr:o/r#404", "kind": "pr", "until": "green", "grace": 0, "began": NOW - 1, "timeout": 60,
+               "target": "o/r#404"}
+        self.assertEqual(gg.wait_step(req, NOW)[0], gg.EXIT_FAIL)
+
+    def test_heads_and_posts_are_refused_with_a_reason(self) -> None:
+        key = gg.parse_key("head", "o/r@" + "b" * 40)
+        gg.register(key, consumer="me")
+        gg.outbox_dir().mkdir(parents=True)
+        gg.write_json(gg.outbox_dir() / "x1.json", {"id": "x1", "kind": "comment", "body": "hi"})
+        self.daemon.tick(now=NOW)
+        self.assertIn("login", gg.read_cache(key)["error"])
+        self.assertEqual(self.asked, [])
+        done = gg.read_json(gg.posted_dir() / "x1.json")
+        self.assertEqual(done["state"], "failed")
+        self.assertIn("no login", done["error"])
+        self.assertEqual(self.gh.calls, [])
+
+    def test_upstream_json_switches_the_mode_and_runs_the_program(self) -> None:
+        tmp = Path(self.tmp.name)
+        program = tmp / "up"
+        program.write_text("#!/bin/sh\nread line\nprintf '%%s\\n' \"$line\" > %s\n"
+                           "echo '{\"entries\": {\"pr:o/r#7\": {\"data\": {\"number\": 7}, \"dataAt\": 5}}}'\n"
+                           % (tmp / "seen"))
+        program.chmod(0o755)
+        config = tmp / "upstream.json"
+        gg.write_json(config, {"command": [os.fspath(program)]})
+        with mock.patch.object(gg, "UPSTREAM_CONFIG", config):
+            daemon = gg.Daemon(transport=self.gh, token=lambda: self.fail("read a token"), controller=None)
+            gg.register("pr:o/r#7")
+            daemon.tick(now=NOW)
+        self.assertEqual(json.loads((tmp / "seen").read_text()), {"keys": [{"key": "pr:o/r#7", "jobs": False}]})
+        self.assertEqual(gg.read_cache("pr:o/r#7")["data"], {"number": 7})
+        self.assertEqual(self.gh.calls, [])
+
+    def test_read_registers_and_answers_from_the_cache(self) -> None:
+        self.daemon.store("pr:o/r#7", None, data={"number": 7}, dataAt=NOW)
+        self.daemon.store("pr:o/r#8", None, error="NOT_FOUND", missing=True)
+        out = io.StringIO()
+        req = json.dumps({"keys": [{"key": "pr:o/r#7", "jobs": False}, {"key": "run:o/r/9", "jobs": True}]})
+        with mock.patch.object(gg, "daemon_running", lambda grace=0.0: True), \
+                mock.patch.object(gg, "daemon_failing", lambda: None), contextlib.redirect_stdout(out):
+            self.assertEqual(gg.cmd_read(req), 0)
+        doc = json.loads(out.getvalue())
+        self.assertEqual(doc["entries"]["pr:o/r#7"]["data"], {"number": 7})
+        self.assertIsNone(doc["entries"]["run:o/r/9"])
+        req = json.dumps({"keys": [{"key": "pr:o/r#8", "jobs": False}]})
+        with mock.patch.object(gg, "daemon_running", lambda grace=0.0: True), \
+                mock.patch.object(gg, "daemon_failing", lambda: None), contextlib.redirect_stdout(out := io.StringIO()):
+            gg.cmd_read(req)
+        self.assertTrue(json.loads(out.getvalue())["entries"]["pr:o/r#8"]["missing"])
+        self.assertTrue(gg.read_json(gg.watch_dir() / gg.file_name("run:o/r/9"))["jobs"])
+        self.assertTrue((gg.watch_dir() / gg.file_name("pr:o/r#7")).exists())
+
+    def test_read_refuses_what_is_not_a_key(self) -> None:
+        for bad in ("nope", json.dumps({"keys": [{"key": "head:o/r@" + "a" * 40}]}),
+                    json.dumps({"keys": [{"key": "pr:O/r#7"}]}), json.dumps({"keys": [{"key": "pr:o/r#07"}]}),
+                    json.dumps({"keys": [{"key": "pr:o/r#7", "jobs": "yes"}]}),
+                    json.dumps({"keys": [{"key": "pr:o/r#7"}] * (gg.UPSTREAM_MAX_KEYS + 1)})):
+            with self.assertRaises(gg.WatchError, msg=bad):
+                gg.read_request(bad)
 
 
 class TransportErrorTest(unittest.TestCase):
@@ -2505,6 +2678,7 @@ gg = importlib.util.module_from_spec(spec)
 sys.modules["glaeda_gh"] = gg
 loader.exec_module(gg)
 gg.BASE = Path(sys.argv[3])
+gg.UPSTREAM_CONFIG = Path(sys.argv[3]) / "no-upstream.json"
 """
 
 

@@ -17,6 +17,7 @@
     glaeda-gh post review OWNER/REPO#N [--event comment|approve|request-changes] --body-file F [--wait S]
     glaeda-gh post status [ID] [--wait S] [--json]      one write's URL or error, or the queue and recent writes
     glaeda-gh budget [--json]                           REST and GraphQL quota as last seen
+    glaeda-gh read < REQUEST                            cached entries for an upstream client (upstream.json)
     glaeda-gh restart [--force]                         restart a down or hung daemon, once for every session
     glaeda-gh gh ARG...                                 one `gh` call, brokered: served from the cache when it
                                                         can be, refused when it reads local source through the
@@ -59,6 +60,16 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   left) it stops that API until the quota resets. The quota is shared, so this also protects
   every other tool on the account.
 - The token comes from `gh auth token` and stays in memory; it is never written or logged.
+- A host with no GitHub login of its own (a VM that may hold no token) can read through an upstream
+  instead: ~/.config/glaeda/upstream.json, {"command": ["PROGRAM", "ARG", ...]}, names a program that
+  carries `read` requests to another host's glaeda-gh (a broker that daemon's host serves, say). The
+  daemon then makes no GitHub request at all: every UPSTREAM_EVERY seconds, and UPSTREAM_NEW after a
+  key appears with no data yet, it runs that program once with every watched key as one JSON line on
+  stdin, {"keys": [{"key": "pr:o/r#1", "jobs": false}, ...]}, and caches what it prints,
+  {"entries": {KEY: {"data", "dataAt", "error", "jobs"?} or null}}, keeping the upstream's dataAt. That
+  host's daemon is the one poller, so any number of such hosts cost the quota nothing more than its own
+  watches. `post` and `checks` need a login, so their requests fail with that reason; the controller is
+  not read. `glaeda-gh read` is the other end: one request on stdin, the cached entries on stdout.
 - The cmux build controller on the tailnet (cmuxterm-hq#675) receives GitHub's workflow_run,
   check_suite and issue_comment webhooks. Each tick the daemon reads its change feed once: free,
   so a finished run shows up within about TICK seconds and costs no quota, a check event on a
@@ -232,6 +243,13 @@ COMMENTS_LAST = 50  # comments per issue per read: more than this within one 15 
 COMMENT_BODY_MAX = 4000
 STEPS_BATCH = 50  # check runs per steps query
 EXIT_OK, EXIT_FAIL, EXIT_TIMEOUT, EXIT_DOWN, EXIT_CONFLICT = 0, 1, 2, 3, 4
+UPSTREAM_CONFIG = Path.home() / ".config/glaeda/upstream.json"  # {"command": [...]}: read through it, no token
+UPSTREAM_EVERY = 20  # seconds between upstream reads of every watched key (the upstream polls each PR every 60)
+UPSTREAM_NEW = 3  # a key with no data yet is asked for again this soon: the upstream fills it within a tick or two
+UPSTREAM_DEADLINE = 60  # one run of the upstream command
+UPSTREAM_MAX_KEYS = 200  # keys per upstream read (and per `read`); a longer list waits for the next one
+UPSTREAM_KINDS = ("pr", "run", "comment")
+UPSTREAM_ERROR_MAX = 300
 CONTROLLER_DEFAULT = "http://100.89.225.106:18765"  # cmux-lawrence since the 2026-09-28 move
 CONTROLLER_CONFIG = Path.home() / ".local/share/cmux-fleet-client/client.json"
 CONTROLLER_TOKEN = Path.home() / ".config/cmux/build-fleet/controller.token"
@@ -578,16 +596,16 @@ def http(method: str, url: str, headers: dict[str, str], body: bytes | None = No
         raise WatchError(f"request failed: {type(error).__name__}") from None
 
 
-def run_bounded(argv: list[str], timeout: float | None = None) -> subprocess.CompletedProcess:
+def run_bounded(argv: list[str], timeout: float | None = None, input_text: str | None = None) -> subprocess.CompletedProcess:
     """subprocess.run(capture_output=True, text=True) with a deadline that holds. On a timeout run()
     kills only the child and then waits for its pipes, which a grandchild that inherited them keeps
     open for as long as it lives. Here the child leads its own process group and the whole group is
     killed. Raises subprocess.TimeoutExpired or OSError."""
     timeout = SUBPROCESS_DEADLINE if timeout is None else timeout
-    with subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          text=True, start_new_session=True) as proc:
+    with subprocess.Popen(argv, stdin=subprocess.DEVNULL if input_text is None else subprocess.PIPE,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True) as proc:
         try:
-            out, err = proc.communicate(timeout=timeout)
+            out, err = proc.communicate(input=input_text, timeout=timeout)
         except subprocess.TimeoutExpired:
             with contextlib.suppress(OSError):
                 os.killpg(proc.pid, signal.SIGKILL)
@@ -625,6 +643,80 @@ def gh_token() -> str:
     if not TOKEN_RE.fullmatch(token):
         raise WatchError("gh auth token printed something that is not a GitHub token")
     return token
+
+
+# ---------------------------------------------------------------- upstream (a host with no login)
+
+
+def upstream_command() -> list[str] | None:
+    """The upstream program from UPSTREAM_CONFIG, or None (read GitHub with this host's own login)."""
+    doc = read_json(UPSTREAM_CONFIG)
+    command = doc.get("command") if isinstance(doc, dict) else None
+    if isinstance(command, list) and command and all(isinstance(a, str) and a for a in command):
+        return command
+    return None
+
+
+def run_upstream(command: list[str], request: dict) -> dict:
+    exe = command[0] if "/" in command[0] else shutil.which(command[0]) or os.fspath(Path.home() / ".local/bin" / command[0])
+    try:
+        result = run_bounded([exe, *command[1:]], UPSTREAM_DEADLINE, input_text=json.dumps(request) + "\n")
+    except subprocess.TimeoutExpired:
+        raise WatchError(f"upstream: no answer within {UPSTREAM_DEADLINE}s") from None
+    except OSError as error:
+        raise WatchError(f"upstream: {type(error).__name__} running {command[0]}") from None
+    try:
+        answer = json.loads(result.stdout.strip().splitlines()[-1]) if result.stdout.strip() else None
+    except ValueError:
+        answer = None
+    if not isinstance(answer, dict):
+        tail = (result.stderr or "").strip().splitlines()[-1:] or [f"exit {result.returncode}"]
+        raise WatchError(f"upstream: {command[0]}: {tail[0]}"[:UPSTREAM_ERROR_MAX])
+    return answer
+
+
+def read_request(text: str) -> list[tuple[str, bool]]:
+    """The (key, jobs) pairs of one upstream request line; WatchError on anything else."""
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        raise WatchError("read takes one JSON line on stdin: {\"keys\": [{\"key\": ..., \"jobs\": ...}]}") from None
+    keys = doc.get("keys") if isinstance(doc, dict) else None
+    if not isinstance(keys, list) or len(keys) > UPSTREAM_MAX_KEYS:
+        raise WatchError(f"read takes a list of at most {UPSTREAM_MAX_KEYS} keys")
+    out = []
+    for item in keys:
+        key = item.get("key") if isinstance(item, dict) else None
+        jobs = item.get("jobs", False) if isinstance(item, dict) else None
+        kind = key.split(":", 1)[0] if isinstance(key, str) else None
+        if kind not in UPSTREAM_KINDS or not isinstance(jobs, bool):
+            raise WatchError(f"read serves {', '.join(UPSTREAM_KINDS)} keys, not {str(key)[:80]!r}")
+        target = key.split(":", 1)[1]
+        if not re.fullmatch(rf"{NAME}/{NAME}[#/]\d+", target) or parse_key(kind, target) != key:
+            raise WatchError(f"not a key: {key[:80]!r}")
+        out.append((key, jobs))
+    return out
+
+
+def cmd_read(text: str) -> int:
+    """`read`: register each key (sessions' interest, as `status` does) and print what the cache holds
+    now, never waiting and never reading GitHub. The other end of an upstream (UPSTREAM_CONFIG)."""
+    pairs = read_request(text)
+    if not daemon_running(grace=DOWN_GRACE):
+        print(json.dumps({"error": "glaeda-gh is not running on the upstream host"}))
+        return EXIT_DOWN
+    broken = daemon_failing()
+    if broken is not None:
+        print(json.dumps({"error": failing_message(broken)[:UPSTREAM_ERROR_MAX]}))
+        return EXIT_DOWN
+    entries: dict[str, Any] = {}
+    for key, jobs in pairs:
+        register(key, jobs)
+        cached = read_cache(key)
+        entries[key] = None if cached is None else {
+            k: cached.get(k) for k in ("data", "dataAt", "error", "fetchedAt", "jobs", "missing") if k in cached}
+    print(json.dumps({"entries": entries}, sort_keys=True))
+    return EXIT_OK
 
 
 # ---------------------------------------------------------------- cmux build controller
@@ -1067,8 +1159,13 @@ def consumer_policy() -> dict:
 
 class Daemon:
     def __init__(self, transport: Callable = http, token: Callable[[], str] = gh_token,
-                 controller: Any = "env") -> None:
+                 controller: Any = "env", upstream: Any = "config") -> None:
         self.transport = transport
+        # "config" re-reads UPSTREAM_CONFIG every tick, so writing or removing it switches the mode
+        # without a restart; a test passes a callable (request -> answer) or None.
+        self.upstream_source = upstream
+        self.upstream_at = float("-inf")  # the last full upstream read
+        self.upstream_status: dict[str, Any] | None = None
         # "env" (or any callable) is re-read every tick, so a daemon follows a controller move
         # (cmux-fleet-client's client.json repointed) without a restart; an instance stays fixed.
         self.controller_source: Callable[[], Any] | None = (
@@ -1224,6 +1321,8 @@ class Daemon:
         would overstate the spend of the very call that reads the spend."""
         if time.monotonic() >= self.tick_deadline:
             raise OutOfTime
+        if self.upstream() is not None:
+            raise WatchError("this host reads GitHub through its upstream (upstream.json) and has no login")
         if self.token is None:
             self.token = self.token_source()
         headers = {"Authorization": f"Bearer {self.token}", "Accept": "application/vnd.github+json",
@@ -1660,6 +1759,9 @@ class Daemon:
             # and again in serve_waits: a long read phase must not look like a dead daemon; ticks that
             # keep raising stop marking, so their blockers hand the wait back (resume_wait says why)
             mark_waits_served()
+        up = self.upstream()
+        if up is not None:
+            return self.upstream_tick(up)
         try:
             self.post_tick()  # first, so a long read phase never delays a write
         except Exception as error:  # noqa: BLE001  a bad queue entry must not stop the reads
@@ -1693,6 +1795,11 @@ class Daemon:
         # After the reads, so a busy daemon never pays for it: its own responses' x-ratelimit
         # headers have already brought the view up to date, and only an idle one goes stale.
         self.refresh_budget()
+        return self.finish_tick(entries, prs, runs, comments, heads)
+
+    def finish_tick(self, entries: list[dict], prs: list[dict], runs: list[dict], comments: list[dict],
+                    heads: list[dict]) -> dict:
+        """Rule on the waits, prune, and write the heartbeat: the end of every tick, whatever read it."""
         self.tick_deadline = float("inf")
         try:
             waiting = self.serve_waits()
@@ -1724,6 +1831,8 @@ class Daemon:
                   "batch": dict(self.batch), "oldestData": oldest, "deferred": len(self.deferred),
                   "outbox": {"queued": len(list(outbox_dir().glob("*.json"))) if outbox_dir().is_dir() else 0,
                              "holdUntil": self.post_hold if self.post_hold > self.now else None}}
+        if self.upstream_status is not None:
+            status["upstream"] = self.upstream_status
         # the heartbeat lets clients tell a hung daemon (lock held, nothing written) from an idle one
         recovered, self.failing = self.failing is not None, None
         if recovered or prs or runs or comments or heads or self.errors or self.now - self.beat >= HEARTBEAT_EVERY:
@@ -1731,6 +1840,86 @@ class Daemon:
             self.beat = self.now
         self.status = status
         return status
+
+    # -- upstream: no login here; another host's glaeda-gh reads GitHub (UPSTREAM_CONFIG)
+
+    def upstream(self) -> Callable[[dict], dict] | None:
+        source = self.upstream_source
+        if source == "config":
+            command = upstream_command()
+            return None if command is None else (lambda req: run_upstream(command, req))
+        return source if callable(source) else None
+
+    def upstream_tick(self, ask: Callable[[dict], dict]) -> dict:
+        """One tick with an upstream: refuse what needs a login, read the due keys in one request, rule."""
+        self.upstream_status = self.upstream_status or {"state": "starting"}
+        self.controller_status = {"state": "off", "why": "reads through upstream"}
+        self.upstream_refuse_posts()
+        entries = self.watches()
+        due = []
+        full = self.now - self.upstream_at >= UPSTREAM_EVERY
+        for e in entries:
+            kind = split_key(e["key"])[0]
+            if kind not in UPSTREAM_KINDS:
+                if e["cache"] is None:
+                    self.store(e["key"], None, error=f"{kind} reads need a GitHub login; this host reads through "
+                                                     "its upstream")
+                continue
+            fresh = e["cache"] is None  # the upstream has answered nothing for it yet, not even an error
+            if full or (fresh and self.now - self.attempted.get(e["key"], float("-inf")) >= UPSTREAM_NEW):
+                due.append(e)
+        # The least recently asked first (a key never asked is -inf): past UPSTREAM_MAX_KEYS they rotate, none starves.
+        due = sorted(due, key=lambda e: (self.attempted.get(e["key"], float("-inf")), e["key"]))[:UPSTREAM_MAX_KEYS]
+        if full:
+            self.upstream_at = self.now
+        if due:
+            for e in due:
+                self.attempted[e["key"]] = self.now
+            self.upstream_read(ask, due)
+        self.attempted = {k: t for k, t in self.attempted.items() if self.now - t < 2 * IDLE_EXPIRY}
+        kinds = {kind: [e for e in due if e["key"].startswith(kind + ":")] for kind in CYCLES}
+        return self.finish_tick(entries, kinds["pr"], kinds["run"], kinds["comment"], [])
+
+    def upstream_read(self, ask: Callable[[dict], dict], due: list[dict]) -> None:
+        request = {"keys": [{"key": e["key"], "jobs": e["jobs"]} for e in due]}
+        try:
+            answer = ask(request)
+            got = answer.get("entries") if isinstance(answer, dict) else None
+            if not isinstance(got, dict):
+                why = answer.get("error") if isinstance(answer, dict) and isinstance(answer.get("error"), str) else None
+                raise WatchError(f"upstream: {why or 'its answer has no entries'}"[:UPSTREAM_ERROR_MAX])
+        except Exception as error:  # noqa: BLE001  a broken upstream is reported, never fatal
+            why = str(error) if isinstance(error, WatchError) else f"upstream: {describe(error)}"
+            self.errors.append(why)
+            self.upstream_status = {"state": "failing", "error": why, "at": self.now}
+            for e in due:  # the data is kept; a status names the outage instead of showing it as current
+                self.store(e["key"], e["cache"], error=why)
+            return
+        self.upstream_status = {"state": "ok", "at": self.now, "keys": len(due)}
+        for e in due:
+            entry = got.get(e["key"])
+            if not isinstance(entry, dict):
+                continue  # the upstream has not read it yet: asked again in UPSTREAM_NEW
+            data = entry.get("data") if isinstance(entry.get("data"), dict) else None
+            error = entry.get("error") if isinstance(entry.get("error"), str) else None
+            if data is None and error is None:
+                continue  # registered there, not read yet
+            at, fetched = entry.get("dataAt"), entry.get("fetchedAt")
+            fields: dict[str, Any] = {"error": error[:UPSTREAM_ERROR_MAX] if error else None, "source": "upstream",
+                                      "missing": entry.get("missing") is True}
+            if isinstance(fetched, (int, float)):
+                fields["fetchedAt"] = min(self.now, float(fetched))  # a wait rules only on reads after it began
+            if data is not None:
+                fields.update(data=data, dataAt=float(at) if isinstance(at, (int, float)) else self.now)
+            if isinstance(entry.get("jobs"), list):
+                fields["jobs"] = entry["jobs"]
+            self.store(e["key"], e["cache"], **fields)
+
+    def upstream_refuse_posts(self) -> None:
+        for path in sorted(outbox_dir().glob("*.json")) if outbox_dir().is_dir() else []:
+            item = read_json(path)
+            self.post_finish(path, item if isinstance(item, dict) else {"id": path.stem},
+                             error="this host reads GitHub through its upstream and has no login to post with")
 
     def serve_waits(self) -> int:
         """Rule on the `wait pr|run` requests clients left in waits/ (subscribe_wait): keep their interest
@@ -6180,6 +6369,8 @@ def parser() -> argparse.ArgumentParser:
     po.add_argument("--wait", type=float, default=0, metavar="S",
                     help="seconds to wait for the URL (default 0: queue and return; the write survives the session)")
     po.add_argument("--json", action="store_true")
+    sub.add_parser("read", help="an upstream's end: register the keys of one JSON request on stdin and print "
+                                "the cached entries (see upstream.json)")
     b = sub.add_parser("budget", help="REST and GraphQL quota as the daemon last saw it")
     b.add_argument("--json", action="store_true")
     a = sub.add_parser("audit", help="what this host's gh traffic is, and how much of it a cache would answer")
@@ -6223,6 +6414,8 @@ def main(argv: list[str] | None = None) -> int:
             return serve(args.foreground_ok)
         if args.command == "budget":
             return cmd_budget(args.json)
+        if args.command == "read":
+            return cmd_read(sys.stdin.readline())
         if args.command == "audit":
             if args.last < 0:
                 raise WatchError("--last must be 0 (all of it) or more lines")
