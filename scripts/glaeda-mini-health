@@ -87,10 +87,11 @@ Each run checks, as the runner user and without sudo:
   ota_stale                          no glaeda-update run has finished since converge.json's staleAfter: its agent is
                                      not running, or every run dies. Reported only.
 
-  daemon_heal_stale                  the root LaunchDaemon from scripts/glaeda-daemon-heal is missing or is not this
-                                     release's copy (script or config/macos-daemons.json). Healed where `sudo -n` works
-                                     (headless AWS hosts) by reinstalling it; elsewhere the root command is the note.
-                                     Also run on a host without glaeda runners.
+  daemon_heal_stale                  the root LaunchDaemon from scripts/glaeda-daemon-heal is missing, or its own
+                                     report says it is not running its passes or has not kept itself on the stable
+                                     release (glaeda-daemon-heal judge). Healed where `sudo -n` works (headless AWS
+                                     hosts) by reinstalling it; elsewhere the root command is the note. Also run on a
+                                     host without glaeda runners.
   daemon_hot:<name>                  a macOS daemon from config/macos-daemons.json has held hot_cores (fseventsd,
                                      audiomxd, WirelessRadioManagerd), from glaeda-daemon-heal's root report: that
                                      daemon restarts it at hot_hours (wait_idle daemons when the host is idle, or at
@@ -1062,7 +1063,16 @@ def check_daemon_heal(mini: Mini) -> list[dict[str, Any]]:
         return []
     out = []
     why = None
-    if not status.get("installed"):
+    fixable = True
+    verdict = status.get("verdict")
+    if isinstance(verdict, dict) and verdict.get("state") in ("current", "stale", "missing"):
+        # A copy that keeps itself on stable: its own report says whether it does, not this user's release bytes.
+        if verdict["state"] != "current":
+            why = str(verdict.get("why") or verdict["state"])[:300]
+            fixable = verdict.get("reinstall") is not False
+        elif status.get("loaded") is False:  # a report from before it was booted out reads current for a while
+            why = "the root daemon-heal LaunchDaemon is installed but not loaded"
+    elif not status.get("installed"):
         why = "the root daemon-heal LaunchDaemon is not installed"
     elif not status.get("current"):
         why = "the root daemon-heal LaunchDaemon is not this release's copy: " + ", ".join(status.get("stale") or [])
@@ -1072,7 +1082,10 @@ def check_daemon_heal(mini: Mini) -> list[dict[str, Any]]:
         age = status.get("reportAgeS")
         why = ("the root daemon-heal LaunchDaemon is loaded but its report is "
                + ("missing" if age is None else f"{age} s old") + ": its passes are not running")
-    if why:
+    if why and not fixable:  # a reinstall cannot make it read its channel or take a release it refused
+        out.append(finding("daemon_heal_stale", "warn", why, "impossible",
+                           "its report's release.error says why; it retries every release.every_s"))
+    elif why:
         out.append(finding("daemon_heal_stale", "warn", why,
                            "pending" if mini.sudo_ok() else "impossible",
                            "reinstalled with sudo -n" if mini.sudo_ok() else
@@ -1527,6 +1540,9 @@ def heal_node_toolchain(mini: Mini, f: dict[str, Any]) -> tuple[bool, str]:
 def heal_daemon_heal(mini: Mini, f: dict[str, Any]) -> tuple[bool, str]:
     ok, what = mini.install_daemon_heal()
     status = mini.daemon_heal_status() if ok else None
+    verdict = (status or {}).get("verdict")
+    if isinstance(verdict, dict):  # healed only once its own report says so, not when the bytes are in place
+        return bool(verdict.get("state") == "current" and status.get("loaded") is not False), what
     return bool(status and status.get("current") and status.get("loaded") is not False), what
 
 

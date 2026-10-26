@@ -1385,6 +1385,50 @@ all of them failing closed (`heal_tailscale_route` in the script):
 8. **Kill switch.** `touch ~/.config/glaeda/tailscale-restart-off`, or `GLAEDA_TAILSCALE_RESTART=off` in the
    agent's environment (as glaeda-disk's `disk-off`); `mini-health.disabled` stops it too.
 
+## 2l2. Root daemon-heal: one install, then it keeps itself current
+
+`scripts/glaeda-daemon-heal` is a root LaunchDaemon (`com.teamleaderleo.glaeda.daemon-heal`) that restarts a
+macOS system daemon stuck hot or bloated (fseventsd's swap filled cmuxs-mac-mini-6's disk, 2026-10-25). Its
+desired state is `config/macos-daemons.json`. Root runs a root-owned snapshot of both under
+`/Library/Application Support/glaeda/daemon-heal` with `/usr/bin/python3 -I`, never a file the runner user can
+write.
+
+That snapshot follows the stable release on its own. Every `release.every_s` an apply pass reads
+`ota-channels/control.json` and `stable.json` from the first of `release.sources` that answers, over HTTPS
+from github.com only. When the tag or the installed bytes differ, it downloads `release.json` (the SHA-256 must
+match the channel), then `glaeda-hygiene-aarch64-apple-darwin.tar.gz` (the size and SHA-256 must match
+`release.json`). It reads only `glaeda/scripts/glaeda-daemon-heal` and `glaeda/config/macos-daemons.json` from
+the archive. The new pair is staged root-owned and must complete a plan pass of its own code against its own
+policy before it replaces the snapshot. The next pass, two minutes later, runs it. When a policy changes
+`every_s`, a detached `--install --apply --after-pid` reloads the LaunchDaemon after the pass that noticed it
+exits. A paused control file stops it, as it stops glaeda-update. So a release that changes either file reaches
+every installed mini with no hand step. `SelfUpdate` in `scripts/test-glaeda-daemon-heal.py` proves this with a
+real staged run.
+
+The one hand step is the first install, and a copy installed before this existed counts as one. With the
+fleet sudo password (section 1), pin the hashes from the release commit, not from the mini's own copy:
+
+```bash
+gen=~/.local/state/glaeda/update/generations/<stable tag>/glaeda
+sudo /usr/bin/python3 -I $gen/scripts/glaeda-daemon-heal --install --policy $gen/config/macos-daemons.json --apply \
+  --expect-sha256 $(git show <its commit>:scripts/glaeda-daemon-heal | shasum -a 256) \
+  --expect-policy-sha256 $(git show <its commit>:config/macos-daemons.json | shasum -a 256)
+```
+
+Its report (`state/report.json`, readable by anyone) records the tag it runs, the tag its channel wants, when it
+last read the channel and the last error. `judge` in the script turns that report into `current`, `stale` or
+`missing`:
+
+- `missing`: not installed.
+- `stale`: no pass within `report_stale_passes` passes, a copy from before self-update, more than
+  `release.stale_s` behind its channel (for example a release whose plan pass failed), or no channel read for
+  `release.stale_s`.
+- `current`: none of these.
+
+`glaeda-mini-health` reports a verdict other than `current` as `daemon_heal_stale`. Where `sudo -n` works it
+reinstalls only when a reinstall can fix the verdict (`reinstall` in the verdict). It never reinstalls for a
+channel the daemon cannot read, or for a release the daemon refused.
+
 ## 2m. Build mesh: the fleet index and kept state between PR minis
 
 Compiled products (2j) are one object per build. The bigger saving is kept compile-admission state: a

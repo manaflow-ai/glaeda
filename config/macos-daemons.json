@@ -9,6 +9,12 @@
   "max_restarts_per_day": 4,
   "stop_wait_s": 10,
   "report_stale_passes": 3,
+  "release": {
+    "note": "The root copy keeps itself on the stable release: every every_s it reads the channel from the first of sources that answers, and replaces its script and this policy when the release's differ (hash chain channel, release.json, archive). stale_s: how long it may lag its channel, or go without reading it, before glaeda-mini-health and glaeda-fleet-status call it daemon_heal_stale.",
+    "every_s": 600,
+    "stale_s": 3600,
+    "sources": ["teamleaderleo/glaeda", "manaflow-ai/glaeda"]
+  },
   "busy": ["Runner.Worker", "xcodebuild", "xctest", "swift-build", "swift-test"],
   "daemons": [
     {

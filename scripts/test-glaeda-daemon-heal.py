@@ -4,16 +4,23 @@
 from __future__ import annotations
 
 import copy
+import gzip
+import hashlib
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import plistlib
 import re
 import signal
+import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
+import urllib.error
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -364,6 +371,341 @@ class Install(unittest.TestCase):
         import ast
         tree = ast.parse((ROOT / "scripts" / "glaeda-daemon-heal").read_text(), feature_version=(3, 9))
         self.assertFalse([n for n in ast.walk(tree) if type(n).__name__ == "Match"])
+
+
+SCRIPT_BYTES = (ROOT / "scripts" / "glaeda-daemon-heal").read_bytes()
+POLICY_BYTES = POLICY_PATH.read_bytes()
+ORIGIN, MIRROR = heal.RELEASE_SOURCES
+
+
+def tar_gz(files: dict) -> bytes:
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w", format=tarfile.PAX_FORMAT) as tar:
+        for name, data in files.items():
+            info = tarfile.TarInfo(name)
+            info.size, info.mode = len(data), 0o755
+            tar.addfile(info, io.BytesIO(data))
+    return gzip.compress(raw.getvalue(), mtime=0)
+
+
+class Channel:
+    """The ota-channels files and releases on one or both sources, as GitHub serves them; records each download."""
+
+    def __init__(self) -> None:
+        self.files: dict[str, bytes] = {}
+        self.down: set[str] = set()
+        self.got: list[str] = []
+
+    def publish(self, n: int, script: bytes = SCRIPT_BYTES, policy: bytes = POLICY_BYTES, sources=(ORIGIN, MIRROR),
+                members: dict | None = None, release_sha: str | None = None, paused: bool = False,
+                ancestors: range | None = None) -> str:
+        tag, commit = f"r-20261026-{n:012x}", f"{n:040x}"
+        ancestry = "".join(f"{k:040x}\n" for k in (ancestors if ancestors is not None else range(n, 0, -1)))
+        archive = tar_gz(members if members is not None else {
+            "glaeda/README.md": b"glaeda\n", heal.MEMBERS[heal.SCRIPT_NAME]: script,
+            heal.MEMBERS[heal.POLICY_NAME]: policy, heal.ANCESTRY: ancestry.encode()})
+        release = json.dumps({"schema": heal.RELEASE_SCHEMA, "repository": heal.REPOSITORY, "tag": tag,
+                              "source": commit, "assets": {heal.ARCHIVE: {
+                                  "size": len(archive), "sha256": hashlib.sha256(archive).hexdigest()}}}).encode()
+        entry = {"schema": heal.CHANNEL_SCHEMA, "ring": "stable", "tag": tag, "source": commit,
+                 "releaseSha256": release_sha or hashlib.sha256(release).hexdigest()}
+        for source in sources:
+            self.files[heal.release_url(source, "ota-channels", "control.json")] = json.dumps(
+                {"schema": heal.CONTROL_SCHEMA, "paused": paused}).encode()
+            self.files[heal.release_url(source, "ota-channels", "stable.json")] = json.dumps(entry).encode()
+            self.files[heal.release_url(source, tag, "release.json")] = release
+            self.files[heal.release_url(source, tag, heal.ARCHIVE)] = archive
+        return tag
+
+    def get(self, url: str, limit: int) -> bytes:
+        self.got.append(url)
+        if any(url.startswith(f"https://github.com/{s}/") for s in self.down) or url not in self.files:
+            raise urllib.error.URLError("connection refused")
+        if len(self.files[url]) > limit:
+            raise heal.HealError("too big")
+        return self.files[url]
+
+
+def edited_policy(**changes) -> bytes:
+    doc = json.loads(POLICY_BYTES)
+    doc.update(changes)
+    return (json.dumps(doc, indent=2) + "\n").encode()
+
+
+class SelfUpdate(unittest.TestCase):
+    """The installed root copy follows the stable release: a release that changes the script or the policy reaches
+    the snapshot on its own, through the same hash chain glaeda-update checks."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name) / "daemon-heal"
+        self.state_dir = self.dir / "state"
+        self.state_dir.mkdir(parents=True)
+        for name, data in ((heal.SCRIPT_NAME, SCRIPT_BYTES), (heal.POLICY_NAME, POLICY_BYTES)):
+            (self.dir / name).write_bytes(data)  # what a root --install of today's release left
+        self.channel = Channel()
+        self.host = FakeHost()
+
+    def installed(self, name: str) -> bytes:
+        return (self.dir / name).read_bytes()
+
+    def run_pass(self, seconds: float = 0, python: str = sys.executable) -> dict:
+        self.host.advance(seconds)
+        return heal.run_pass(self.dir / heal.POLICY_NAME, self.state_dir, True, self.host, install_dir=self.dir,
+                             get=self.channel.get, python=python)
+
+    def verdict(self, report: dict, after: float = 0) -> dict:
+        """The judgment `after` seconds on, of a pass then that holds this release state (passes kept running)."""
+        now = heal.parse_iso(report["at"]) + after
+        return heal.judge({**report, "at": heal.iso(now)}, now, True)
+
+    def test_a_release_that_changes_the_script_and_the_policy_reaches_the_snapshot_with_no_hand_step(self) -> None:
+        script = SCRIPT_BYTES + b"\n# released later\n"
+        policy = edited_policy(hot_hours=3)
+        tag = self.channel.publish(2, script=script, policy=policy)
+        report = self.run_pass()  # the staged pair really runs: a plan pass of the new code with its policy
+        self.assertEqual((self.installed(heal.SCRIPT_NAME), self.installed(heal.POLICY_NAME)), (script, policy))
+        self.assertEqual((report["release"]["tag"], report["release"]["wants"], report["release"]["error"]),
+                         (tag, tag, None))
+        self.assertEqual(self.verdict(report)["state"], "current")
+        later = edited_policy(hot_hours=4)  # a release that changes only the policy, picked up within every_s
+        tag3 = self.channel.publish(3, script=script, policy=later)
+        self.run_pass(60)
+        self.assertEqual(self.installed(heal.POLICY_NAME), policy, "not due yet")
+        report = self.run_pass(POLICY["release"]["every_s"])
+        self.assertEqual((self.installed(heal.POLICY_NAME), report["release"]["tag"]), (later, tag3))
+        mode = (self.dir / heal.SCRIPT_NAME).stat().st_mode & 0o777
+        self.assertEqual(mode, 0o555)
+
+    def test_a_release_that_changes_only_the_script_reaches_the_snapshot(self) -> None:
+        script = SCRIPT_BYTES + b"\n# only the script\n"
+        tag = self.channel.publish(2, script=script)
+        report = self.run_pass()
+        self.assertEqual((self.installed(heal.SCRIPT_NAME), self.installed(heal.POLICY_NAME)), (script, POLICY_BYTES))
+        self.assertEqual(report["release"]["tag"], tag)
+        self.assertFalse((self.dir / "staged" / heal.PAIR_MARK).exists(), "the swap finished")
+
+    def test_a_release_that_does_not_descend_from_the_installed_one_is_refused(self) -> None:
+        self.channel.publish(2, script=SCRIPT_BYTES + b"# 2\n")
+        self.run_pass()
+        self.channel.publish(3, script=SCRIPT_BYTES + b"# 3, from a branch\n", ancestors=range(3, 2, -1))
+        report = self.run_pass(POLICY["release"]["every_s"])
+        self.assertEqual(self.installed(heal.SCRIPT_NAME), SCRIPT_BYTES + b"# 2\n")
+        self.assertIn("does not descend", report["release"]["error"])
+
+    def test_a_crash_before_state_is_saved_still_refuses_a_downgrade(self) -> None:
+        self.channel.publish(1, script=SCRIPT_BYTES + b"# 1\n")
+        self.run_pass()
+        saved = (self.state_dir / "state.json").read_bytes()
+        self.channel.publish(2, script=SCRIPT_BYTES + b"# 2\n")
+        self.run_pass(POLICY["release"]["every_s"])
+        (self.state_dir / "state.json").write_bytes(saved)  # the pass died after the swap, before its state
+        self.channel.publish(1, script=SCRIPT_BYTES + b"# 1\n")  # a lagging source names the older release
+        report = self.run_pass(POLICY["release"]["every_s"])
+        self.assertEqual(self.installed(heal.SCRIPT_NAME), SCRIPT_BYTES + b"# 2\n")
+        self.assertIn("does not descend", report["release"]["error"])
+
+    def test_a_truncated_download_is_an_error_not_a_crash(self) -> None:
+        import http.client
+        self.channel.publish(2, script=b"# new\n")
+        real = self.channel.get
+
+        def truncated(url: str, limit: int) -> bytes:
+            if url.endswith(heal.ARCHIVE):
+                raise http.client.IncompleteRead(b"partial")
+            return real(url, limit)
+        self.channel.get = truncated
+        report = self.run_pass()
+        self.assertTrue(report["release"]["error"])
+        self.assertEqual(self.installed(heal.SCRIPT_NAME), SCRIPT_BYTES)
+        self.assertTrue((self.state_dir / "report.json").exists(), "the pass still saved its report")
+
+    def test_malformed_release_metadata_is_an_error_not_a_crash(self) -> None:
+        self.channel.publish(2, script=b"# new\n")
+        url = next(u for u in self.channel.files if u.endswith("/release.json") and f"/{ORIGIN}/" in u)
+        doc = json.loads(self.channel.files[url])
+        doc["assets"] = ["not", "a", "map"]
+        self.channel.files[url] = json.dumps(doc).encode()
+        stable = heal.release_url(ORIGIN, "ota-channels", "stable.json")
+        entry = json.loads(self.channel.files[stable])
+        entry["releaseSha256"] = hashlib.sha256(self.channel.files[url]).hexdigest()
+        self.channel.files[stable] = json.dumps(entry).encode()
+        report = self.run_pass()
+        self.assertIn("has no", report["release"]["error"])
+        self.assertEqual(self.installed(heal.SCRIPT_NAME), SCRIPT_BYTES)
+
+    def test_a_swap_cut_short_is_finished_before_the_next_policy_load(self) -> None:
+        script, policy = SCRIPT_BYTES + b"# next\n", edited_policy(hot_hours=5)
+        stage = self.dir / "staged"
+        stage.mkdir()
+        (stage / heal.SCRIPT_NAME).write_bytes(script)
+        (stage / heal.POLICY_NAME).write_bytes(policy)
+        hashes = {heal.SCRIPT_NAME: heal.sha256(script), heal.POLICY_NAME: heal.sha256(policy)}
+        (stage / heal.PAIR_MARK).write_text(json.dumps({"files": hashes, "release": {"tag": "r-9", "commit": "c9"}}))
+        (self.dir / heal.POLICY_NAME).write_bytes(policy)  # died after the policy, before the script
+        self.assertTrue(heal.finish_pair(self.dir, root=False))
+        self.assertEqual((self.installed(heal.SCRIPT_NAME), self.installed(heal.POLICY_NAME)), (script, policy))
+        self.assertEqual(json.loads(self.installed(heal.INSTALLED))["commit"], "c9", "the release is swapped with it")
+        self.assertFalse((stage / heal.PAIR_MARK).exists())
+        (stage / heal.PAIR_MARK).write_text(json.dumps({"files": {heal.SCRIPT_NAME: "0" * 64,
+                                                                  heal.POLICY_NAME: "0" * 64}, "release": None}))
+        (stage / heal.SCRIPT_NAME).write_bytes(b"# torn\n")
+        self.assertTrue(heal.finish_pair(self.dir, root=False))
+        self.assertEqual(self.installed(heal.SCRIPT_NAME), script, "a mark the staged files do not match is dropped")
+        self.assertFalse(heal.finish_pair(self.dir, root=False))
+
+    def test_the_staged_run_keeps_bounded_output_and_a_timeout(self) -> None:
+        code, out, _err = heal.bounded_run([sys.executable, "-c", "print('x' * 5_000_000)"], 30, limit=1000)
+        self.assertEqual((code, len(out)), (0, 1000))
+        code, _out, _err = heal.bounded_run([sys.executable, "-c", "import time; time.sleep(30)"], 0.5)
+        self.assertEqual(code, 124)
+        started = heal.time.time()  # a descendant that keeps the pipes open is killed with it
+        code, _out, _err = heal.bounded_run(["/bin/sh", "-c", "sleep 30 & sleep 30"], 0.5)
+        self.assertEqual(code, 124)
+        self.assertLess(heal.time.time() - started, 4)
+
+    def test_the_same_release_costs_two_small_reads_and_rewrites_nothing(self) -> None:
+        tag = self.channel.publish(2)
+        self.run_pass()
+        before = (self.dir / heal.SCRIPT_NAME).stat().st_mtime_ns
+        self.channel.got.clear()
+        report = self.run_pass(POLICY["release"]["every_s"])
+        self.assertEqual([u.rsplit("/", 1)[1] for u in self.channel.got], ["control.json", "stable.json"])
+        self.assertEqual(((self.dir / heal.SCRIPT_NAME).stat().st_mtime_ns, report["release"]["tag"]), (before, tag))
+        self.assertIsNone(report["release"]["installedAt"], "the hand install already held these bytes")
+
+    def test_files_that_drift_from_their_release_are_restored_at_the_next_pass(self) -> None:
+        self.channel.publish(2)
+        self.run_pass()
+        (self.dir / heal.SCRIPT_NAME).write_bytes(b"print('hand edit')\n")
+        self.run_pass(POLICY["every_s"])  # drift is checked every pass, not every release.every_s
+        self.assertEqual(self.installed(heal.SCRIPT_NAME), SCRIPT_BYTES)
+
+    def test_files_that_drift_and_cannot_be_repaired_show_as_stale(self) -> None:
+        tag = self.channel.publish(2)
+        self.run_pass()
+        (self.dir / heal.SCRIPT_NAME).write_bytes(b"print('hand edit')\n")
+        url = next(u for u in self.channel.files if u.endswith(heal.ARCHIVE) and f"/{ORIGIN}/" in u)
+        del self.channel.files[url]  # the repair cannot download its release
+        report = self.run_pass(POLICY["every_s"])
+        self.assertEqual((report["release"]["tag"], report["release"]["wants"]), (tag, tag))
+        self.assertTrue(report["release"]["drifted"] and report["release"]["error"])
+        verdict = self.verdict(report, POLICY["release"]["stale_s"] + 1)
+        self.assertEqual(verdict["state"], "stale")
+        self.assertIn("not the " + tag, verdict["why"])
+
+    def test_the_mirror_answers_when_the_repository_does_not(self) -> None:
+        tag = self.channel.publish(2, script=SCRIPT_BYTES + b"# 2\n")
+        self.channel.down.add(ORIGIN)
+        report = self.run_pass()
+        self.assertEqual((report["release"]["source"], report["release"]["tag"]), (MIRROR, tag))
+
+    def test_a_paused_channel_installs_nothing(self) -> None:
+        self.channel.publish(2, script=b"# new\n", paused=True)
+        report = self.run_pass()
+        self.assertEqual(self.installed(heal.SCRIPT_NAME), SCRIPT_BYTES)
+        self.assertEqual(self.channel.got[-1].rsplit("/", 1)[1], "control.json")
+        self.assertEqual(self.verdict(report)["state"], "current")
+
+    def refused(self, why: str, **publish) -> dict:
+        self.channel.publish(2, **publish)
+        report = self.run_pass()
+        self.assertEqual((self.installed(heal.SCRIPT_NAME), self.installed(heal.POLICY_NAME)),
+                         (SCRIPT_BYTES, POLICY_BYTES), why)
+        self.assertRegex(report["release"]["error"], why)
+        self.assertIn("hot", report, "the heal pass itself still ran")
+        return report
+
+    def test_a_release_json_that_is_not_the_channels_is_refused(self) -> None:
+        self.refused("does not match the channel", script=b"# evil\n", release_sha="0" * 64)
+
+    def test_an_archive_that_is_not_release_jsons_is_refused(self) -> None:
+        self.channel.publish(2, script=b"# evil\n")
+        url = next(u for u in self.channel.files if u.endswith(heal.ARCHIVE) and f"/{ORIGIN}/" in u)
+        self.channel.files[url] = tar_gz({heal.MEMBERS[heal.SCRIPT_NAME]: b"# swapped\n"})
+        report = self.run_pass()
+        self.assertEqual(self.installed(heal.SCRIPT_NAME), SCRIPT_BYTES)
+        self.assertIn("does not match release.json", report["release"]["error"])
+
+    def test_a_release_without_the_two_files_is_refused(self) -> None:
+        self.refused("ships no", members={heal.MEMBERS[heal.SCRIPT_NAME]: SCRIPT_BYTES})
+
+    def test_a_pair_that_cannot_plan_a_pass_is_never_installed_and_shows_as_stale(self) -> None:
+        report = self.refused("its own plan pass failed", script=b"raise SystemExit(3)\n")
+        self.assertEqual(self.verdict(report)["state"], "current", "within stale_s it is a lag, not a fault")
+        verdict = self.verdict(report, POLICY["release"]["stale_s"] + 1)
+        self.assertEqual(verdict["state"], "stale")
+        self.assertIn("plan pass failed", verdict["why"])
+
+    def test_a_policy_its_own_code_refuses_is_never_installed(self) -> None:
+        self.refused("its own plan pass failed", policy=b'{"schema": "nope"}')
+
+    def test_an_unreachable_channel_is_stale_after_stale_s(self) -> None:
+        report = self.run_pass()  # nothing published: every source refuses
+        self.assertIn("no release source answered", report["release"]["error"])
+        self.assertEqual(self.verdict(report)["state"], "stale")
+        self.assertIn("has not read its release channel", self.verdict(report)["why"])
+
+    def test_root_reads_nothing_the_runner_user_writes(self) -> None:
+        text = SCRIPT_BYTES.decode()
+        for path in ("~/", ".config/glaeda", ".local/state/glaeda", "Path.home", "expanduser", "HOME"):
+            self.assertNotIn(path, text.split("# ---------------------------------------------------------------- the "
+                                              "release this copy follows")[1].split("def judge")[0], path)
+        with self.assertRaises(heal.HealError):
+            heal.fetch("http://github.com/x", 10)
+        with self.assertRaises(heal.HealError):
+            heal.fetch("https://example.com/x", 10)
+        for bad in ("http://release-assets.githubusercontent.com/x", "https://evil.example/x",
+                    "https://github.com.evil.example/x", "https://release-assets.githubusercontent.com:8443/x"):
+            with self.assertRaisesRegex(heal.HealError, "refusing a redirect", msg=bad):
+                heal.HttpsOnly().redirect_request(None, None, 302, "Found", {}, bad)
+        self.assertTrue(heal.url_ok("https://release-assets.githubusercontent.com/github-production-release-asset/1"))
+        for sources in (["someone/glaeda"], [], [ORIGIN, ORIGIN], [{"x": 1}]):
+            bad = copy.deepcopy(POLICY)
+            bad["release"]["sources"] = sources
+            with self.assertRaises(heal.HealError, msg=sources):
+                heal.validate_policy(bad)
+
+
+class Judge(unittest.TestCase):
+    def report(self, **release) -> dict:
+        rel = {"tag": "r-1", "wants": "r-1", "okAt": heal.iso(T0), "behindSince": None, "error": None,
+               "staleAfterS": 3600, **release}
+        return {"at": heal.iso(T0), "staleAfterS": 360, "release": rel}
+
+    def test_states(self) -> None:
+        self.assertEqual(heal.judge({}, T0, False)["state"], "missing")
+        self.assertEqual(heal.judge(None, T0, True)["state"], "stale")
+        old = heal.judge({"at": heal.iso(T0), "hot": []}, T0, True)
+        self.assertEqual(old["state"], "stale")
+        self.assertIn("one root --install", old["why"])
+        self.assertEqual(heal.judge(self.report(), T0 + 300, True)["state"], "current")
+        self.assertIn("not running", heal.judge(self.report(), T0 + 400, True)["why"])
+        behind = self.report(wants="r-2", behindSince=heal.iso(T0 - 4000), error="boom")
+        self.assertIn("named r-2", heal.judge(behind, T0, True)["why"])
+        self.assertIn("boom", heal.judge(behind, T0, True)["why"])
+        self.assertEqual(heal.judge(self.report(okAt=heal.iso(T0 - 4000)), T0, True)["state"], "stale")
+
+
+class Reload(unittest.TestCase):
+    def test_a_plist_that_no_longer_matches_the_policy_is_reloaded_once_from_a_detached_helper(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            d, plist = Path(tmp) / "heal", Path(tmp) / "x.plist"
+            (d / "state").mkdir(parents=True)
+            (d / heal.POLICY_NAME).write_bytes(edited_policy(every_s=300))
+            plist.write_bytes(heal.desired_install(POLICY_PATH, d)["plist"])  # loaded at the old interval
+            spawn = mock.Mock()
+            state: dict = {}
+            self.assertTrue(heal.schedule_reload(d, plist, state, T0, 600, spawn))
+            argv, kw = spawn.call_args
+            self.assertEqual(argv[0][:2], ["/usr/bin/python3", "-I"])
+            self.assertIn("--after-pid", argv[0])
+            self.assertTrue(kw["start_new_session"])
+            self.assertFalse(heal.schedule_reload(d, plist, state, T0 + 60, 600, spawn), "once per every_s")
+            plist.write_bytes(heal.desired_install(d / heal.POLICY_NAME, d)["plist"])
+            self.assertFalse(heal.schedule_reload(d, plist, {}, T0, 600, spawn))
+            self.assertEqual(spawn.call_count, 1)
 
 
 if __name__ == "__main__":
