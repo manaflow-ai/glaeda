@@ -1357,6 +1357,21 @@ all of them failing closed (`heal_tailscale_route` in the script):
    hook admits no job and idle listeners stop listening for the restart and its re-check (about 35 s), and
    rechecks that no Runner.Worker or build started meanwhile. A job dispatched to a listener in that window is
    refused by job-started (and re-run elsewhere), as during any fleet build.
+   **A mini that is never idle drains** (cmuxs-mac-mini-5, 2026-10-26: 12 runners, never idle, off the tailnet for
+   16 h). Once the finding has waited `TAILSCALE_DRAIN_AFTER_S` (1 h) for an idle mini, mini-health writes a
+   `glaeda-reservation/v1` marker owned by `glaeda-mini-health` to `/Users/Shared/cmux-build-fleet/reservation.json`
+   (under glaeda-mini-fleet's `.reservation.lock`, never over another marker, and only after `tailscale-drain.json` is written, so a cap can always be recorded; removal is under the same lock and only while the file still holds the bytes this pass read, so a reserve made meanwhile, or another pass's drain, is never removed): job-started refuses new jobs fast and the listener gate stops idle listeners, so
+   GitHub hands the work to other runners. While draining, idle means no Runner.Worker, build or `jobs/` entry (the
+   marker is ours); then the restart runs under the host lock as above and the marker goes, fixed or not. The drain
+   is capped at `TAILSCALE_DRAIN_MAX_S` (2 h, beyond 284 of the 303 `timeout-minutes` in cmux's workflows): past
+   it the marker goes, the finding is `impossible` naming what still runs, and no drain starts for 6 h
+   (`tailscale-drain.json` beside STATE). The marker's own `until` is the cap plus 10 minutes, so a mini-health that
+   stops leaves no hold. No drain on a host the fleet reservation list holds (glaeda-disk `host_reservation`,
+   `config/fleet-reservations.json`: cmux16-24 until 2026-10-28) or that cannot say (fail closed), and none by
+   hand. The marker also goes when the route is seen on the tunnel or a gate (kill switch, opt-in, window, an unwritable restart state) refuses; a run that cannot judge the route keeps it, but the cap and the kill switches still end it.
+   A Tailscale CLI that times out under load no longer hides the finding: when `route -n get` still names a
+   non-utun interface, the run counts as `tailscale_no_route`; after the restart a CLI with no answer is judged on
+   the route alone.
 4. **Once per 6 h per mini, 3 failures and it stops.** `~/.local/state/glaeda/mini-health/tailscale-restart.json`
    records the attempt, counted as failed, before the restart runs, so a crash mid-restart still counts; an
    unreadable file refuses. After 3 failed restarts in a row (`failures`) it restarts no more until a run sees the
