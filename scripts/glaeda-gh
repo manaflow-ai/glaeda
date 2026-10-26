@@ -89,6 +89,9 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   or 5xx is retried POST_ATTEMPTS times, and a write whose answer was lost is looked up first (the open PR for
   its head, a comment or review with the same body) so it never lands twice. The result (URL, or why it
   failed) stays in posted/ for `post status ID`.
+  A trusted exact-head cmux review receipt also wakes its existing risk grader immediately: one fresh
+  PR read, then removal of the current risk tier (the grader restores it). Delivery and `riskRegrade`
+  are recorded separately; a failed or uncertain label effect is reported without replaying the receipt.
 - `wait file` and `wait pid` poll the local disk or process table once a second in one process. They
   exist so no session writes a sleep loop (the polling hook refuses those).
 
@@ -268,6 +271,9 @@ POST_UNREADABLE = 60  # a queue file unreadable this long after its last write i
 POST_BODY_MAX = 65536  # GitHub's limit for a comment, review or PR body
 POST_ID = re.compile(r"\d{13}-\d+-[0-9a-f]{6}")  # queued-at ms, client pid, random: sorts oldest first
 THROTTLED = re.compile(r"submitted too quickly|secondary rate limit|abuse detection", re.I)
+# Match cmux's base-owned risk classifier. This only wakes that classifier; it never grants SHIP authority.
+RISK_RECEIPT = re.compile(r"^\W*(?:independent\s+)?review\s*\(([^)\n]*)\)\s*:\W*(ship|block|fix|not ship|hold)(?![\w-])",
+                          re.I)
 VERDICTS = {"success", "neutral", "failure", "timed_out", "action_required", "startup_failure"}
 
 NAME = r"[A-Za-z0-9_.-]+"
@@ -1302,12 +1308,15 @@ class Daemon:
         log({"event": "post-throttled", "id": item["id"], "wait": round(wait)})
 
     def post_one(self, path: Path, item: dict) -> None:
+        if item.get("delivered"):
+            self.post_delivered(path, item)
+            return
         if item.get("uncertain"):
             # The last attempt's answer was lost: it may have landed. Look before writing twice, and send only
             # when the look answered "not there"; a look that failed leaves it uncertain for the next try.
             found, looked = self.post_find(item)
             if found:
-                self.post_finish(path, item, url=found, note="found after a lost answer")
+                self.post_delivered(path, item, found, note="found after a lost answer")
                 return
             if not looked:
                 self.post_at = self.now
@@ -1331,7 +1340,7 @@ class Daemon:
         if 200 <= status < 300:
             self.post_backoff = POST_BACKOFF
             note = self.post_after(item, doc)
-            self.post_finish(path, item, url=doc.get("html_url"), number=doc.get("number"), note=note)
+            self.post_delivered(path, item, doc, note=note)
         elif status in {403, 422, 429} and (THROTTLED.search(text) or status == 429 or h.get("retry-after")
                                             or h.get("x-ratelimit-remaining") == "0"):
             self.post_hold_for(h, path, item)
@@ -1341,7 +1350,8 @@ class Daemon:
             self.post_retry(path, item, f"HTTP {status}")
         elif item["kind"] == "pr" and status == 422 and "already exists" in text:
             found, _ = self.post_find(item)
-            self.post_finish(path, item, url=found, note="a pull request for this head is already open",
+            self.post_finish(path, item, url=found.get("html_url") if found else None,
+                             note="a pull request for this head is already open",
                              error=None if found else f"HTTP 422: {doc.get('message') or 'already exists'}")
         else:
             errors = "; ".join(str(e.get("message") or e.get("code")) for e in doc.get("errors") or []
@@ -1362,8 +1372,81 @@ class Daemon:
             return None
         return f"reviewers not requested: HTTP {status} {(answer or {}).get('message', '') if isinstance(answer, dict) else ''}".strip()
 
-    def post_find(self, item: dict) -> tuple[str | None, bool]:
-        """(the URL of this write if it already landed, whether the look got an answer): the open PR for its head,
+    def post_delivered(self, path: Path, item: dict, doc: dict | None = None, note: str | None = None) -> None:
+        """Checkpoint delivery before follow-up effects: a failed/interrupted regrade never replays content."""
+        if doc is not None:
+            item["delivered"] = {"url": doc.get("html_url"), "number": doc.get("number"), "note": note}
+            first = next((line for line in str(item.get("body") or "").splitlines() if line.strip()), "")
+            receipt = RISK_RECEIPT.match(first)
+            heads = re.findall(r"(?<![\w])[0-9a-f]{40}(?![\w])", first)
+            user = doc.get("user") or {}
+            if (item.get("kind") in {"comment", "review"} and item.get("repo") == "manaflow-ai/cmux"
+                    and receipt and "self" not in receipt.group(1).lower() and len(heads) == 1
+                    and isinstance(user, dict) and user.get("type") == "User"
+                    and doc.get("author_association") in {"OWNER", "MEMBER", "COLLABORATOR"}):
+                item["riskRegrade"] = {"state": "pending", "head": heads[0]}
+            write_json(path, item)
+        regrade = item.get("riskRegrade")
+        if regrade and regrade["state"] == "pending":
+            try:
+                self.post_risk_regrade(path, item)
+            except OutOfTime:
+                raise  # the next outbox turn resumes follow-up work, never the delivered POST
+            except Exception as error:  # noqa: BLE001 preserve successful delivery even if follow-up fails
+                regrade.update(state="failed", error=describe(error))
+            write_json(path, item)
+        delivery = item["delivered"]
+        note = delivery.get("note")
+        if regrade and regrade["state"] in {"failed", "uncertain"}:
+            note = "; ".join(filter(None, [note, f"risk regrade {regrade['state']}: {regrade.get('error', '')}"]))
+        self.post_finish(path, item, url=delivery.get("url"), number=delivery.get("number"), note=note)
+
+    def post_risk_regrade(self, path: Path, item: dict) -> None:
+        """One fresh PR read and at most one label removal, using the existing unlabeled event.
+
+        The trusted base classifier restores its tier and decides evidence. No code is fetched or run.
+        Record uncertainty before DELETE; after a crash we report it rather than repeat an unknown effect.
+        """
+        regrade = item["riskRegrade"]
+        if self.mode("rest") == "stop":
+            regrade.update(state="failed", error="REST budget stopped")
+            return
+        status, _, pull = self.request("GET", f"/repos/{item['repo']}/pulls/{item['number']}")
+        if status != 200 or not isinstance(pull, dict):
+            regrade.update(state="failed", error=f"PR metadata HTTP {status}")
+            return
+        if (pull.get("state") != "open" or (pull.get("base") or {}).get("ref") != "feat-cmux-next"
+                or (pull.get("head") or {}).get("sha") != regrade["head"]):
+            regrade.update(state="skipped", reason="PR is not open on the receipt's head and feat-cmux-next base")
+            return
+        labels = [label.get("name") for label in pull.get("labels") or [] if isinstance(label, dict)
+                  and label.get("name") in {"risk:low", "risk:medium", "risk:normal", "risk:high"}]
+        if len(labels) != 1:
+            regrade.update(state="skipped", reason="no single current risk tier")
+            return
+        if self.mode("rest") == "stop":
+            regrade.update(state="failed", error="REST budget stopped")
+            return
+        regrade.update(state="uncertain", label=labels[0], error="label write interrupted; inspect the risk run")
+        write_json(path, item)
+        try:
+            status, h, answer = self.request("DELETE", f"/repos/{item['repo']}/issues/{item['number']}/labels/"
+                                            + urllib.parse.quote(labels[0], safe=""), content=True)
+        except OutOfTime:
+            regrade.update(state="pending")  # request refused before sending
+            write_json(path, item)
+            raise
+        if 200 <= status < 300:
+            regrade.update(state="triggered")
+            regrade.pop("error", None)
+        else:
+            regrade.update(state="failed", error=f"label removal HTTP {status}")
+            if status in {403, 422, 429} and (status == 429 or h.get("retry-after")
+                    or h.get("x-ratelimit-remaining") == "0" or THROTTLED.search(json.dumps(answer)[:2000])):
+                self.post_hold_for(h, path, item)
+
+    def post_find(self, item: dict) -> tuple[dict | None, bool]:
+        """(this write if it already landed, whether the look got an answer): the open PR for its head,
         or a comment or review with the same body posted since it was queued."""
         repo, since = item["repo"], dt.datetime.fromtimestamp(item["queuedAt"] - 60, dt.timezone.utc)
         if item["kind"] == "pr":
@@ -1384,7 +1467,8 @@ class Daemon:
             return None, False
         for found in reversed(doc):
             if isinstance(found, dict) and (item["kind"] == "pr" or (found.get("body") or "") == item["body"]):
-                return found.get("html_url"), True
+                if found.get("html_url"):
+                    return found, True
         return None, True
 
     def post_retry(self, path: Path, item: dict, error: str, uncertain: bool = False) -> None:

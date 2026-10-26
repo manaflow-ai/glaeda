@@ -7500,5 +7500,166 @@ class PostTest(unittest.TestCase):
         self.assertEqual(status["outbox"], {"queued": 1, "holdUntil": None})
 
 
+class RiskReceiptPostTest(unittest.TestCase):
+    """A delivered exact-head review wakes cmux's existing risk grader, without replaying content."""
+
+    setUp = PostTest.setUp
+    daemon = PostTest.daemon
+    queue = PostTest.queue
+    step = PostTest.step
+    head = "a" * 40
+    url = "https://github.com/manaflow-ai/cmux/pull/7#issuecomment-1"
+
+    def receipt(self, **changes) -> dict:
+        return {"body": f"Review (independent Codex): SHIP at {self.head}", "html_url": self.url,
+                "user": {"type": "User", "login": "reviewer"}, "author_association": "COLLABORATOR", **changes}
+
+    def pull(self, **changes) -> dict:
+        return {"state": "open", "base": {"ref": "feat-cmux-next"}, "head": {"sha": self.head},
+                "labels": [{"name": "risk:high"}, {"name": "ready-to-land"}], **changes}
+
+    def test_risk_receipt_immediately_regrades_comments_and_reviews_including_block(self) -> None:
+        for kind, verdict in (("comment", "SHIP"), ("review", "SHIP"), ("comment", "BLOCK"),
+                              ("review", "FIX"), ("comment", "NOT SHIP"), ("comment", "HOLD")):
+            with self.subTest(kind=kind, verdict=verdict):
+                body = f"Review (independent Codex): {verdict} at {self.head}\nDetails."
+                item = self.queue(kind, "manaflow-ai/cmux#7", "--body", body)
+                d, t = self.daemon((201, {}, self.receipt(body=body)), (200, {}, self.pull()), (200, {}, []))
+                self.step(d, NOW)
+                self.assertEqual([c[:2] for c in t.calls[1:]], [
+                    ("GET", "/repos/manaflow-ai/cmux/pulls/7"),
+                    ("DELETE", "/repos/manaflow-ai/cmux/issues/7/labels/risk%3Ahigh")])
+                state = gg.post_state(item["id"])
+                self.assertEqual((state["state"], state["riskRegrade"]["state"]), ("posted", "triggered"))
+                self.assertEqual(state["riskRegrade"]["head"], self.head)
+                self.step(d, NOW + gg.POST_SPACING)
+                self.assertEqual(len(t.calls), 3)
+
+    def test_risk_receipt_reconciliation_triggers_without_a_second_comment(self) -> None:
+        for kind in ("comment", "review"):
+            with self.subTest(kind=kind):
+                body = "\n" + self.receipt()["body"]  # the classifier reads the first nonblank line
+                item = self.queue(kind, "manaflow-ai/cmux#7", "--body", body)
+                d, t = self.daemon((502, {}, {}), (200, {}, [self.receipt(body=body)]),
+                                   (200, {}, self.pull()), (200, {}, []))
+                self.step(d, NOW)
+                self.step(d, NOW + gg.POST_RETRY)
+                self.assertEqual([c[0] for c in t.calls], ["POST", "GET", "GET", "DELETE"])
+                self.assertEqual(gg.post_state(item["id"])["riskRegrade"]["state"], "triggered")
+
+    def test_risk_receipt_ignores_unrelated_untrusted_self_and_nonfirstline_posts(self) -> None:
+        for target, body, posted in (
+                ("o/r#7", self.receipt()["body"], self.receipt()),
+                ("manaflow-ai/cmux#7", "ordinary comment", self.receipt(body="ordinary comment")),
+                ("manaflow-ai/cmux#7", f"Intro\n{self.receipt()['body']}", self.receipt()),
+                ("manaflow-ai/cmux#7", f"Review (self): SHIP at {self.head}", self.receipt()),
+                ("manaflow-ai/cmux#7", f"Review (Codex): SHIP at {self.head[:12]}", self.receipt()),
+                ("manaflow-ai/cmux#7", f"Review (Codex): SHIP at {self.head}a", self.receipt()),
+                ("manaflow-ai/cmux#7", self.receipt()["body"], self.receipt(author_association="CONTRIBUTOR")),
+                ("manaflow-ai/cmux#7", self.receipt()["body"], self.receipt(user={"type": "Bot"})),
+                ("manaflow-ai/cmux#7", self.receipt()["body"], {"html_url": self.url})):
+            with self.subTest(target=target, body=body, posted=posted):
+                item = self.queue("comment", target, "--body", body)
+                d, t = self.daemon((201, {}, posted))
+                self.step(d, NOW)
+                self.assertEqual(len(t.calls), 1)
+                self.assertEqual(gg.post_state(item["id"])["state"], "posted")
+
+    def test_risk_receipt_reads_fresh_identity_and_only_removes_one_current_tier(self) -> None:
+        for pull, label in ((self.pull(), "risk:high"),
+                            (self.pull(labels=[{"name": "risk:normal"}]), "risk:normal"),
+                            (self.pull(state="closed"), None),
+                            (self.pull(base={"ref": "main"}), None),
+                            (self.pull(head={"sha": "b" * 40}), None),
+                            (self.pull(labels=[{"name": "risk:human-ok"}]), None),
+                            (self.pull(labels=[{"name": "risk:high"}, {"name": "risk:low"}]), None)):
+            with self.subTest(pull=pull):
+                item = self.queue("comment", "manaflow-ai/cmux#7", "--body", self.receipt()["body"])
+                d, t = self.daemon((201, {}, self.receipt()), (200, {}, pull), (200, {}, []))
+                self.step(d, NOW)
+                self.assertEqual(len(t.calls), 3 if label else 2)
+                if label:
+                    self.assertEqual(t.calls[-1][1], f"/repos/manaflow-ai/cmux/issues/7/labels/{label.replace(':', '%3A')}")
+                self.assertEqual(gg.post_state(item["id"])["riskRegrade"]["state"], "triggered" if label else "skipped")
+
+    def test_risk_receipt_regrade_failure_never_reposts_or_retries_the_comment(self) -> None:
+        for answer in ((403, {"retry-after": "120"}, {"message": "secondary rate limit"}),
+                       (502, {}, {}), gg.WatchError("request failed: TimeoutError")):
+            with self.subTest(answer=answer):
+                item = self.queue("comment", "manaflow-ai/cmux#7", "--body", self.receipt()["body"])
+                d, t = self.daemon((201, {}, self.receipt()), (200, {}, self.pull()), answer)
+                self.step(d, NOW)
+                state = gg.post_state(item["id"])
+                self.assertEqual((state["state"], state["url"]), ("posted", self.url))
+                self.assertEqual(state["riskRegrade"]["state"], "failed")
+                self.assertIn("risk regrade", state["note"])
+                self.step(d, NOW + 600)
+                self.assertEqual(len(t.calls), 3)
+
+    def test_risk_receipt_checkpoint_resumes_after_delivery_without_reposting(self) -> None:
+        item = self.queue("comment", "manaflow-ai/cmux#7", "--body", self.receipt()["body"])
+        d, _ = self.daemon((201, {}, self.receipt()), gg.OutOfTime())
+        self.step(d, NOW)
+        queued = gg.read_json(gg.outbox_dir() / f"{item['id']}.json")
+        self.assertEqual(queued["delivered"]["url"], self.url)
+        again, t = self.daemon((200, {}, self.pull()), (200, {}, []))
+        self.step(again, NOW + gg.POST_SPACING)
+        self.assertEqual([c[0] for c in t.calls], ["GET", "DELETE"])
+        self.assertEqual(gg.post_state(item["id"])["riskRegrade"]["state"], "triggered")
+
+    def test_risk_receipt_crash_during_label_write_does_not_repeat_an_uncertain_effect(self) -> None:
+        item = self.queue("comment", "manaflow-ai/cmux#7", "--body", self.receipt()["body"])
+        d, transport = self.daemon((201, {}, self.receipt()), (200, {}, self.pull()))
+
+        def crash(method, *args):
+            if method == "DELETE":
+                raise SystemExit
+            return transport(method, *args)
+
+        d.transport = crash
+        with self.assertRaises(SystemExit):
+            self.step(d, NOW)
+        again, t = self.daemon()
+        self.step(again, NOW + gg.POST_SPACING)
+        self.assertEqual(t.calls, [])
+        state = gg.post_state(item["id"])
+        self.assertEqual((state["state"], state["riskRegrade"]["state"]), ("posted", "uncertain"))
+
+    def test_risk_receipt_respects_stopped_rest_budget(self) -> None:
+        item = self.queue("comment", "manaflow-ai/cmux#7", "--body", self.receipt()["body"])
+        d, t = self.daemon((201, {}, self.receipt()))
+        d.note_budget("rest", 5000, 0, NOW + 300)
+        self.step(d, NOW)
+        self.assertEqual(len(t.calls), 1)
+        self.assertEqual(gg.post_state(item["id"])["riskRegrade"]["state"], "failed")
+
+    def test_risk_receipt_metadata_failure_finishes_delivery_without_label_effect(self) -> None:
+        for answer in ((404, {}, {}), (429, {"retry-after": "120"}, {}),
+                       gg.WatchError("request failed: TimeoutError")):
+            with self.subTest(answer=answer):
+                item = self.queue("comment", "manaflow-ai/cmux#7", "--body", self.receipt()["body"])
+                d, t = self.daemon((201, {}, self.receipt()), answer)
+                self.step(d, NOW)
+                state = gg.post_state(item["id"])
+                self.assertEqual((state["state"], state["riskRegrade"]["state"]), ("posted", "failed"))
+                self.assertEqual(len(t.calls), 2)
+                if isinstance(answer, tuple) and answer[0] == 429:
+                    self.assertEqual(d.backoff["rest"], NOW + 120)
+
+    def test_risk_receipt_label_throttle_holds_other_writes_without_replaying_delivery(self) -> None:
+        item = self.queue("comment", "manaflow-ai/cmux#7", "--body", self.receipt()["body"])
+        d, t = self.daemon((201, {}, self.receipt()), (200, {}, self.pull()),
+                           (429, {"retry-after": "120"}, {}), (201, {}, {"html_url": "other"}))
+        self.step(d, NOW)
+        other = self.queue("comment", "o/r#8", "--body", "other")
+        self.step(d, NOW + gg.POST_SPACING)
+        self.assertEqual(len(t.calls), 3)
+        self.assertEqual(d.post_hold, NOW + 120)
+        self.step(d, NOW + 120)
+        self.assertEqual(len(t.calls), 4)
+        self.assertEqual(gg.post_state(item["id"])["riskRegrade"]["state"], "failed")
+        self.assertEqual(gg.post_state(other["id"])["url"], "other")
+
+
 if __name__ == "__main__":
     unittest.main()
