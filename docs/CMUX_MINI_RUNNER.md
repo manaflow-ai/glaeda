@@ -259,7 +259,10 @@ What `--apply` does:
      working directory is inside it and that has no terminal, plus their descendants; the
      runner's and glaeda's own processes, git maintenance, multiplexer and agent sessions with
      everything under them, and `~/.cache/git-repair/protected` are spared), runs the same
-     disk pressure pass and always exits 0. The two-minute `glaeda-mini-health` agent repeats
+     disk pressure pass detached and always exits 0. One pass runs at a time per host
+     (`~/.cache/glaeda-disk/hook-pass.lock`): a trigger at or above glaeda-disk's target is
+     skipped, and triggers that arrive while a pass runs leave one `hook-pass.pending` the
+     running pass serves with a single follow-up; both skips get a line in glaeda-disk's run log. The two-minute `glaeda-mini-health` agent repeats
      that ownership check when a post-job hook was skipped, and the listener gate sweeps its
      own idle runner's `_work` for such orphans every ten minutes (never while that runner has
      a Runner.Worker, and never without ps and lsof evidence).

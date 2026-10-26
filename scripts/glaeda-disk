@@ -601,6 +601,7 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "ebd2ebff13a12fb4038187d5398a61fe6509ead3b58b2f0aa561e1fa80cbcb7e",
     "9809f36fece71390cf0070407c0d2d960b9a9c2c825581ed478a297a89ec3129",
     "d5e73be990d67d9499ff352d01fda2e1392a6fd257a57770b23008b3bf55fb59",
+    "0c2c8880e3b17af8324f8304121c4159bee8ade5c31496b9af713586cb90bcfc",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -1023,6 +1024,19 @@ DISK_OFF = HOME / ".config/glaeda/disk-off"
 RUN_LOG = HOME / ("Library/Logs/glaeda-disk-runs.jsonl" if sys.platform == "darwin"
                   else ".local/state/glaeda/disk-runs.jsonl")
 RUN: dict[str, Any] = {}  # what this run did, for its run line; _main_impl fills it
+
+
+def config_sha256(disk: Path | None = None, policy: Path | None = None) -> str:
+    """What decides a default run's targets: this script's bytes (POLICY_DEFAULTS) and DISK_POLICY's ("" when absent).
+    The runner hook computes the same and trusts a run line's targets only when they match."""
+    h = hashlib.sha256()
+    for path in (disk or Path(os.path.abspath(__file__)), policy or DISK_POLICY):
+        try:
+            h.update(path.read_bytes())
+        except OSError:
+            pass
+        h.update(b"\0")
+    return h.hexdigest()
 POLICY_DEFAULTS: dict[str, Any] = {
     "enabled": True,
     "low": "25%:60-200",
@@ -7665,6 +7679,13 @@ def _main_impl(argv: list[str] | None = None) -> int:
     under = any(fs.under for fs in fss.values() if a.pressure or not fs.tmpfs)
     sweep = a.idle and not (a.pressure and under)
     RUN["floor_gib"] = round(floor_gib, 1)
+    # every filesystem's exact target, and whether they are the ones a plain `--pressure --apply` works to: the runner
+    # hook skips its pass while every one is met (disk_targets there)
+    RUN["targets"] = {fs.mount: fs.target for fs in fss.values()}
+    RUN["config_sha256"] = config_sha256()
+    RUN["default_targets"] = (a.low == POLICY["low"] and a.target == POLICY["target"] and a.need is None
+                              and a.tmpfs_low == "75%" and a.tmpfs_target == "90%" and not a.family
+                              and not a.root_override and not a.runner_caches)
     with contextlib.suppress(OSError):
         if (home_fs := fss.get(HOME.stat().st_dev)) is not None:
             RUN.update(target_gib=round(home_fs.target / GIB, 1), target_bytes=home_fs.target)
@@ -7973,7 +7994,9 @@ def write_run_line(started: float, free_before: int | None) -> None:
         return None if b is None else round(b / GIB, 1)
     row = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(), "mode": RUN.get("mode"),
            "off": bool(RUN.get("off")), "free_gib_before": g(free_before), "free_gib_after": g(after),
-           "target_gib": RUN.get("target_gib"), "floor_gib": RUN.get("floor_gib"),
+           "target_gib": RUN.get("target_gib"), "target_bytes": target, "targets": RUN.get("targets"),
+           "default_targets": bool(RUN.get("default_targets")), "config_sha256": RUN.get("config_sha256"),
+           "floor_gib": RUN.get("floor_gib"),
            "reclaimed_gib": round(RUN.get("released", 0) / GIB, 1),
            "reached": None if target is None or after is None else after >= target,
            "blocked": RUN.get("blocked", {}), "duration_s": round(time.time() - started, 1),

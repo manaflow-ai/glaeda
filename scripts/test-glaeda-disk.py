@@ -4172,6 +4172,9 @@ class GlaedaDiskTest(unittest.TestCase):
             self.assertIn(key, row)
         self.assertEqual((row["mode"], row["off"], row["skipped"]), ("pressure", False, None))
         self.assertEqual((row["free_gib_before"], row["target_gib"], row["floor_gib"]), (20.0, 170.0, 30.0))
+        self.assertEqual(row["target_bytes"], 170 * gd.GIB)
+        self.assertEqual((row["targets"], row["default_targets"]), ({"/": 170 * gd.GIB}, True))  # the hook's skip
+        self.assertEqual(row["config_sha256"], gd.config_sha256())
         self.assertEqual(row["reclaimed_gib"], 3.0)
         self.assertFalse(row["reached"])
         self.assertEqual(row["blocked"], {"code-sign-clones": 12.0})
@@ -4182,6 +4185,16 @@ class GlaedaDiskTest(unittest.TestCase):
         # a report writes none
         self._main_run(["report"])
         self.assertEqual(len((self.root / "runs.jsonl").read_text().splitlines()), 2)
+
+    def test_the_run_line_says_when_its_targets_are_not_the_defaults(self) -> None:
+        """The runner hook skips its pass on a run line's targets only when they are a plain --pressure --apply's
+        under the same glaeda-disk and disk-policy.json (config_sha256)."""
+        _, rows, _, _ = self._main_run(["--pressure", "--apply", "--target", "100"])
+        self.assertFalse(rows[-1]["default_targets"], "a custom target must never let the runner hook skip")
+        policy = self.root / "policy.json"
+        before = gd.config_sha256(policy=policy)
+        policy.write_text("{}")
+        self.assertNotEqual(before, gd.config_sha256(policy=policy))
 
     def test_a_deferred_run_writes_its_reason(self) -> None:
         lock = self.root / "measure.lock"

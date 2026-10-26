@@ -62,7 +62,9 @@ through its holder; each release is logged as a "capacity_release" line. The exi
 safety brake. glaeda-fleet-status reads the completed lines (source "jobs").
 
 job-completed stops the sampler (it writes the record), starts the same disk pressure pass detached (bounded
-by the same timeout, so the runner takes its next job at once) and always exits 0. A
+by its own timeout, so the runner takes its next job at once) and always exits 0. One such pass runs at a time per
+host: a trigger at or above glaeda-disk's target is skipped, and one that arrives while a pass runs is coalesced
+into that pass's single follow-up (both logged in glaeda-disk's run log as "runner hook" skips). A
 cmux compile admission may leave a bounded `glaeda-compile-telemetry.json` in `RUNNER_TEMP`; the completed
 record embeds its cache and phase counters after validating the run identity.
 
@@ -103,6 +105,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import datetime
 import fcntl
 import hashlib
 import importlib.machinery
@@ -110,6 +113,7 @@ import importlib.util
 import json
 import math
 import os
+import platform
 import plistlib
 import re
 import select
@@ -130,6 +134,7 @@ DISK_TIMEOUT_S = 120  # a pass a hook or the gate waits on or reaps
 # DISK_TIMEOUT_S every one (a pass per job) was killed mid-apply while holding evict.lock, and the LaunchAgent's pass,
 # which has no bound, skipped as busy (274 of 277 passes on 2026-10-26, none finished for over an hour)
 BACKGROUND_DISK_TIMEOUT_S = 15 * 60
+BACKGROUND_DISK_TIMEOUT_MAX_S = 6 * 3600  # an override above this is cut to it, so the bound's lifetime stays finite
 BACKGROUND_DISK_TIMEOUT_ENV = "GLAEDA_RUNNER_BACKGROUND_DISK_TIMEOUT"  # GLAEDA_RUNNER_DISK_TIMEOUT bounds the others
 EVICT_TIMEOUT_S = 60  # job-started waits at most this long for an eviction under the disk floor
 # The runner's own environment (its LaunchAgent), never a job's env:, which does not reach hooks.
@@ -5618,30 +5623,256 @@ def disk_pressure(explicit: str | None, floor_gib: float = 0.0, timeout: float =
         return f"glaeda-disk skipped: {type(error).__name__}"
 
 
+# job-completed's passes: one at a time per host, triggers coalesced, none started above the target. Every job on
+# every runner started its own detached pass, and a pass takes 11-28 min under pressure, so on cmux14 2889 of 2986
+# passes (2026-10-24..26) skipped as eviction_busy, each still starting glaeda-disk and measuring (median 10.6 s).
+DISK_PASS_LOCK = "hook-pass.lock"  # held by the one bounding process running passes (DISK_BOUND), never by a hook
+DISK_PASS_PENDING = "hook-pass.pending"  # a trigger no pass has started after yet
+DISK_PASS_LIFETIME_FACTOR = 4  # a bound serves follow-ups for at most this many pass bounds, then leaves the trigger
+HOOK_SKIP_ABOVE_TARGET = "above target (runner hook)"
+HOOK_SKIP_COALESCED = "coalesced into the running pass (runner hook)"
+HOOK_SKIP_MARK = "(runner hook)"
+DISK_TARGET_MAX_AGE_S = 6 * 3600  # an older target is not trusted: the trigger runs its pass
+
 DISK_BOUND = """# glaeda-disk-bound (leftover_spared reads this name)
-import subprocess, sys
+# argv: TIMEOUT LIFETIME LOCK PENDING EVICT_LOCK GLAEDA-DISK-ARGV...
+# Holds LOCK while it runs passes, one at a time; never runs one without it. A trigger writes PENDING, then starts
+# this; one that finds LOCK held exits at once and leaves PENDING to the holder. The holder renames PENDING to
+# PENDING.claimed right before a pass that starts after it and removes that only once the pass ran (it stays when
+# another evict.lock holder outlasted the bound or glaeda-disk skipped as busy), and checks both again after it lets
+# go of LOCK, so no trigger is dropped.
+# Each pass is bounded by TIMEOUT and the holder by LIFETIME; a trigger left then is served by the next one.
+import fcntl, os, subprocess, sys, time
+timeout, lifetime = float(sys.argv[1]), float(sys.argv[2])
+lock, pending, evict = sys.argv[3:6]
+argv = sys.argv[6:]
+end = time.monotonic() + lifetime
+BUSY = (b"another eviction running", b"another measurement running")
+
+claimed = pending + ".claimed"  # the triggers the current pass serves; removed only once a pass ran after them
+
+def waiting():
+    return os.path.lexists(pending) or os.path.lexists(claimed)
+
+def evict_free(deadline):
+    try:
+        fd = os.open(evict, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return True  # no lock file: no pass has ever run
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(1)
+                continue
+            except OSError:
+                return True
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return True
+    finally:
+        os.close(fd)
+
+def run_pass():
+    # another glaeda-disk --apply (the gate's, job-started's, the LaunchAgent's) holding evict.lock would only make
+    # this pass skip as eviction_busy: wait for it within the bound. True when glaeda-disk ran a pass.
+    deadline = min(time.monotonic() + timeout, end)
+    if not evict_free(deadline) or deadline - time.monotonic() <= 0:
+        return False
+    try:
+        out = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             timeout=deadline - time.monotonic(), check=False).stdout or b""
+    except subprocess.TimeoutExpired:
+        return True  # it ran, cut at its bound
+    except OSError:
+        return False  # glaeda-disk did not start: keep the trigger
+    return not any(busy in out for busy in BUSY)
+
 try:
-    subprocess.run(sys.argv[2:], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                   timeout=float(sys.argv[1]), check=False)
-except (OSError, subprocess.TimeoutExpired):
-    pass
+    held = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+except OSError:
+    sys.exit(0)  # never an unlocked pass; the trigger stays pending
+while time.monotonic() < end:
+    try:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit(0)  # a pass is running; it serves PENDING
+    try:
+        misses = 0
+        while waiting() and time.monotonic() < end:
+            try:
+                os.replace(pending, claimed)  # triggers from here on wait for the next pass
+            except FileNotFoundError:
+                pass
+            except OSError:
+                sys.exit(0)  # cannot claim it: leave it to the next bound, never a pass for an unclaimed trigger
+            if not os.path.lexists(claimed):
+                continue
+            if run_pass():
+                misses = 0
+                try:
+                    os.unlink(claimed)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    sys.exit(0)  # cannot mark it served: leave it to the next bound rather than pass again
+            else:
+                time.sleep(min(30, 2 ** misses, max(0, end - time.monotonic())))
+                misses += 1
+    finally:
+        fcntl.flock(held, fcntl.LOCK_UN)
+    if not waiting():
+        break
 """
 
 
+def disk_state_dir() -> Path:
+    """glaeda-disk's own state directory, where its evict.lock lives; the hook's pass lock and trigger sit beside it."""
+    return evict_lock_path().parent
+
+
+def disk_run_log() -> Path:
+    """glaeda-disk's RUN_LOG: one JSON line per --apply run, with the target it worked to."""
+    return Path.home() / ("Library/Logs/glaeda-disk-runs.jsonl" if sys.platform == "darwin"
+                          else ".local/state/glaeda/disk-runs.jsonl")
+
+
+def disk_config_sha256(disk: str | None) -> str | None:
+    """glaeda-disk's config_sha256 for the glaeda-disk this hook runs: its bytes and disk-policy.json's."""
+    if disk is None:
+        return None
+    h = hashlib.sha256()
+    for path in (Path(os.path.abspath(disk)), Path.home() / ".config/glaeda/disk-policy.json"):
+        with contextlib.suppress(OSError):
+            h.update(path.read_bytes())
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def disk_targets(log: Path | None = None, now: float | None = None, config: str | None = None) -> dict[str, int] | None:
+    """Every filesystem's exact target (mount: bytes) from glaeda-disk's newest own --pressure run line, or None (run
+    the pass) unless that line is a plain `--pressure --apply`'s (default_targets) under the same glaeda-disk and
+    disk-policy.json (config, its config_sha256), at least this runner's floor,
+    under DISK_TARGET_MAX_AGE_S old and well formed. The hook's own skip lines and other modes' lines are passed over;
+    an older pressure line never stands in for the newest."""
+    try:
+        with (log or disk_run_log()).open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            start = max(0, f.tell() - 262144)
+            f.seek(start)
+            lines = f.read().decode("utf-8", "replace").splitlines()[1 if start else 0:]
+    except OSError:
+        return None
+    for line in reversed(lines):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            return None
+        if not isinstance(row, dict):
+            return None
+        if row.get("mode") != "pressure" or HOOK_SKIP_MARK in str(row.get("skipped") or ""):
+            continue
+        try:
+            at = datetime.datetime.strptime(str(row.get("at")), "%Y-%m-%dT%H:%M:%S%z").timestamp()
+            floor = float(row.get("floor_gib"))
+        except (TypeError, ValueError):
+            return None
+        targets = row.get("targets")
+        if ((time.time() if now is None else now) - at > DISK_TARGET_MAX_AGE_S or row.get("default_targets") is not True
+                or config is None or row.get("config_sha256") != config
+                or not math.isfinite(floor) or floor < hooks_floor_gib() or not isinstance(targets, dict) or not targets
+                or not all(isinstance(v, int) and not isinstance(v, bool) and v > 0 for v in targets.values())):
+            return None
+        return {str(mount): value for mount, value in targets.items()}
+    return None
+
+
+def disk_short(targets: dict[str, int]) -> str | None:
+    """The first filesystem below its target ("<free> of <target> GiB on <mount>"), "" when every one is met, or None
+    when one cannot be read (run the pass)."""
+    for mount, target in targets.items():
+        try:
+            free = shutil.disk_usage(mount).free
+        except OSError:
+            return None
+        if free < target:
+            return f"{free / 1024**3:.1f} of {target / 1024**3:g} GiB on {mount}"
+    return ""
+
+
+def disk_skip_line(why: str, free: float, targets: dict[str, int] | None) -> None:
+    """A skipped trigger's line in glaeda-disk's RUN_LOG, in its own schema, so skips are counted where passes are."""
+    home = None
+    with contextlib.suppress(OSError):
+        home = (targets or {}).get(os.fspath(Path.home()), None) or next(
+            (v for m, v in (targets or {}).items() if os.stat(m).st_dev == Path.home().stat().st_dev), None)
+    row = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(), "mode": "pressure", "off": False,
+           "free_gib_before": round(free, 1), "free_gib_after": round(free, 1),
+           "target_gib": None if home is None else round(home / 1024**3, 1), "target_bytes": home,
+           "targets": targets, "default_targets": False, "config_sha256": None, "floor_gib": None,
+           "reclaimed_gib": 0.0,
+           "reached": None if home is None else free * 1024**3 >= home,
+           "blocked": {}, "duration_s": 0.0, "skipped": why, "cmux_next_ci_over_gib": None}
+    with contextlib.suppress(OSError):
+        log = disk_run_log()
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("a") as f:
+            f.write(json.dumps(row) + "\n")
+
+
+def disk_pass_running(lock: Path) -> bool:
+    """True when a bounding process holds the pass lock. Probes with a non-blocking exclusive flock it lets go of at
+    once; the bounding process's own try decides, so a probe that races it only costs a fork."""
+    try:
+        fd = os.open(lock, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)  # closing drops a lock the probe took
+    return False
+
+
 def disk_pressure_detached(explicit: str | None, timeout: float = BACKGROUND_DISK_TIMEOUT_S) -> str:
-    """job-completed's pass: the same glaeda-disk run in a detached process, bounded by BACKGROUND_DISK_TIMEOUT_S, so the
-    runner takes its next job at once ("Complete runner" took 121-124 s on main's macOS jobs while job-completed
-    waited on it, and dependent jobs waited for those outputs). glaeda-disk's evict.lock keeps one --apply at a time,
-    so the LaunchAgent's pass meanwhile skips rather than racing it, and job-started's floor eviction
-    waits for it (wait_for_running_pass). The child leaves the runner's
-    session and execs with RUNNER_TRACKING_ID dropped, so the runner's orphan cleanup does not kill it, and closes every
-    inherited fd, so it holds no lock of this job's. Best effort: returns a note, never raises."""
+    """job-completed's pass: glaeda-disk --pressure in a detached process (DISK_BOUND), each pass bounded by
+    BACKGROUND_DISK_TIMEOUT_S, so the runner takes its next job at once ("Complete runner" took 121-124 s on main's
+    macOS jobs while job-completed waited on it). One pass at a time per host: a trigger above glaeda-disk's target is
+    skipped (a stat and a log read); otherwise it writes the pending trigger, and while a pass runs it is coalesced
+    into it (the running pass does one more for every batch of triggers), so no trigger is lost and none queues.
+    The child leaves the runner's session and execs with RUNNER_TRACKING_ID dropped, so the runner's orphan cleanup
+    does not kill it, and closes every inherited fd, so it holds no lock of this job's. Best effort: returns a note,
+    never raises."""
     try:
         argv = disk_argv(explicit)
         if argv is None:
             return "glaeda-disk not installed; skipped"
         timeout = float(os.environ.get(BACKGROUND_DISK_TIMEOUT_ENV) or timeout)
+        if not math.isfinite(timeout) or timeout <= 0:
+            timeout = BACKGROUND_DISK_TIMEOUT_S
+        timeout = min(timeout, BACKGROUND_DISK_TIMEOUT_MAX_S)
+        state, log = disk_state_dir(), disk_run_log()
+        free, targets = free_gib(str(Path.home())), disk_targets(log, config=disk_config_sha256(argv[1]))
+        if targets is not None and disk_short(targets) == "":
+            disk_skip_line(HOOK_SKIP_ABOVE_TARGET, free, targets)
+            return f"glaeda-disk skipped: every filesystem at or above its target ({free:.1f} GiB free on home)"
+        state.mkdir(parents=True, exist_ok=True)
+        lock, pending = state / DISK_PASS_LOCK, state / DISK_PASS_PENDING
+        pending.touch()  # before the probe: a holder that lets go after it still sees this trigger
+        if disk_pass_running(lock):
+            disk_skip_line(HOOK_SKIP_COALESCED, free, targets)
+            return "glaeda-disk pass already running; this trigger is coalesced into its follow-up"
         env = {key: value for key, value in os.environ.items() if key != "RUNNER_TRACKING_ID"}
+        bound = [f"{timeout * DISK_PASS_LIFETIME_FACTOR:g}", os.fspath(lock), os.fspath(pending),
+                 os.fspath(evict_lock_path())]
         child = os.fork()
     except Exception as error:  # noqa: BLE001  (never fail the job on housekeeping)
         return f"glaeda-disk skipped: {type(error).__name__}"
@@ -5665,7 +5896,7 @@ def disk_pressure_detached(explicit: str | None, timeout: float = BACKGROUND_DIS
             os.closerange(3, execing)
             os.closerange(execing + 1, limit)
             # exec, so the bounding process's own environment is clean too, not only glaeda-disk's
-            os.execve(sys.executable, [sys.executable, "-c", DISK_BOUND, f"{timeout:g}", *argv], env)
+            os.execve(sys.executable, [sys.executable, "-c", DISK_BOUND, f"{timeout:g}", *bound, *argv], env)
         finally:
             os._exit(0)
     with contextlib.suppress(OSError):
