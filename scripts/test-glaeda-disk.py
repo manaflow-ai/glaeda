@@ -11,6 +11,7 @@ import fcntl
 import hashlib
 import io
 import json
+import errno
 import os
 import plistlib
 import shutil
@@ -2964,6 +2965,12 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(sorted(Path(r).name for r in removed), ["code_sign_clone.Old1", "code_sign_clone.Old2"])
         self.assertTrue((bundle / "code_sign_clone.New").is_dir())
 
+    @staticmethod
+    def _registered_long_ago(runner_file: Path) -> None:
+        """A .runner written a day ago: no worker under an older name can still be running (enrolled_runner_roster)."""
+        old = time.time() - 24 * 3600
+        os.utime(runner_file, (old, old))
+
     def _cmux_next_runners(self) -> tuple[Path, "gd.Family"]:
         """Two enrolled runners named mini-glaeda and mini-glaeda-2, each with its cmux-next scheme state, and
         a state no enrolled runner owns, all built an hour ago."""
@@ -2972,6 +2979,7 @@ class GlaedaDiskTest(unittest.TestCase):
             (home / runner / "glaeda-hooks").mkdir(parents=True)
             # the runner writes .runner as UTF-8 with a byte order mark
             (home / runner / ".runner").write_text(json.dumps({"agentName": name}), encoding="utf-8-sig")
+            self._registered_long_ago(home / runner / ".runner")
         root = home / "Library/Caches/cmux-next-ci"
         for name in ("mini-glaeda", "mini-glaeda-2", "gone-runner"):
             make(root / "cmux-scheme" / name / "Build", age_hours=1)
@@ -2985,10 +2993,12 @@ class GlaedaDiskTest(unittest.TestCase):
         dev = home.stat().st_dev
 
         def verdicts(hold):
+            gd._DISCOVERED.clear()
             with mock.patch.object(gd, "HOME", home), \
                     mock.patch.object(gd, "process_evidence", return_value=([], worker)), \
                     mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "FLOOR_HOLD", hold):
-                return {Path(i.path).parent.name: (i.verdict, i.reasons) for i in gd.survey([fam], 6, 0)}
+                return {Path(i.path).parent.name: (i.verdict, i.reasons) for i in gd.survey([fam], 6, 0)
+                        if Path(i.path).name == "Build"}
         v = verdicts({})
         self.assertEqual(v["mini-glaeda"][0], "recent")
         self.assertEqual(v["mini-glaeda-2"], ("in-use", ["actions-runner-glaeda-2 is running a job (Runner.Worker)"]))
@@ -2996,7 +3006,8 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(v["mini-glaeda"][0], "reclaimable")
         self.assertEqual(v["mini-glaeda-2"][0], "in-use")  # a runner with a job keeps its output
         self.assertEqual(v["gone-runner"][0], "recent")  # no enrolled runner to ask: its window stands
-        patches, removed = self._floor_disk(25.0)
+        patches, removed = self._floor_disk(25.0, freed_gib=30.0)
+        gd._DISCOVERED.clear()
         with patches[0], patches[1], mock.patch.object(gd, "HOME", home), \
                 mock.patch.object(gd, "process_evidence", return_value=([], worker)), \
                 mock.patch.object(gd, "command_lines", return_value=worker), \
@@ -3004,8 +3015,576 @@ class GlaedaDiskTest(unittest.TestCase):
                 mock.patch.object(gd, "FLOOR_HOLD", {dev: 50 * gd.GIB}), contextlib.redirect_stdout(io.StringIO()):
             items = gd.survey([fam], 6, 0)
             gd.apply(items, {fam.id: fam}, self.receipt(), None, 6, all_families=[fam])
+        # the Build alone brought free (25 + 30) past the hold's stop (50): the slot's inputs stay
         self.assertEqual(removed, [str(fam.root / "cmux-scheme/mini-glaeda/Build")])
-        self.assertTrue((fam.root / "cmux-scheme/mini-glaeda/SourcePackages").is_dir())  # inputs stay
+        self.assertTrue((fam.root / "cmux-scheme/mini-glaeda/SourcePackages").is_dir())
+
+    def test_the_cmux_next_build_log_is_generated_not_an_unknown_owners_state(self) -> None:
+        # cmux14, 2026-10-25: every idle state's Build "in-use: cmux-next state has unknown children:
+        # cmux-next-build.log", so the pressure runs freed 0.0 GiB at 10.8 GiB free under a 30 GiB floor
+        root = self.root / "Library/Caches/cmux-next-ci"
+        state = root / "cmux-scheme/runner-a"
+        make(state / "Build", age_hours=96)
+        (state / "cmux-next-build.log").write_text("** BUILD SUCCEEDED **\n")
+        self._age(state / "cmux-next-build.log", hours=96)
+        (state / "SourcePackages").mkdir()
+        fam = gd.cmux_next_ci_family(root)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            got = {Path(i.path).name: i.verdict for i in gd.survey([fam], 24, 0)}
+        self.assertEqual(got, {"Build": "reclaimable", "cmux-next-build.log": "reclaimable"})
+
+    def test_under_the_runner_floor_idle_runners_whole_slots_go_least_recently_used_after_their_output(self) -> None:
+        """cmux14, 2026-10-25: 115 GiB of cmux-next-ci, most of it the slots' inputs, at 10.8 GiB free under a
+        30 GiB floor. Under the floor hold an idle enrolled runner's whole slot may go, after every generated
+        child, least recently used first, until free reaches the hold's stop; a runner with a job, a process in a
+        slot and a slot no enrolled runner owns keep theirs."""
+        home, fam, st = self._cmux_next_cap_tree()
+        worker = f"{home}/actions-runner-glaeda-2/bin/Runner.Worker spawnclient 1 2\n"
+        dev = home.stat().st_dev
+
+        def survey(hold):
+            gd._DISCOVERED.clear()
+            with mock.patch.object(gd, "HOME", home), \
+                    mock.patch.object(gd, "process_evidence", return_value=([], worker)), \
+                    mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "FLOOR_HOLD", hold):
+                return gd.survey([fam], 6, 0)
+        # no hold: no whole slot is listed at all
+        self.assertFalse({Path(i.path) for i in survey({})} & set(st.values()))
+        v = {Path(i.path): (i.verdict, i.reasons) for i in survey({dev: 50 * gd.GIB})}
+        # enrolled runners' slots are listed whole; a slot no enrolled runner owns is not (the cap's 6 h rule)
+        for key in ("mini-glaeda", "daily", "mini-glaeda-2", "release-new"):
+            self.assertIn(st[key], v, key)
+        for key in ("gone-runner", "release-old"):
+            self.assertNotIn(st[key], v, key)
+        self.assertEqual(v[st["mini-glaeda"]][0], "reclaimable")
+        self.assertIn("whole cmux-next slot", " ".join(v[st["mini-glaeda"]][1]))
+        for key in ("mini-glaeda-2", "release-new"):  # runner 2 has a job
+            self.assertEqual(v[st[key]][0], "in-use", key)
+        # apply: every idle Build first, then the slots least recently used first, until free reaches 50 GiB
+        patches, removed = self._floor_disk(20.0, freed_gib=4.0)
+        receipt = self.receipt()
+        gd._DISCOVERED.clear()
+        with patches[0], patches[1], mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd, "process_evidence", return_value=([], worker)), \
+                mock.patch.object(gd, "command_lines", return_value=worker), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), \
+                mock.patch.object(gd, "FLOOR_HOLD", {dev: 50 * gd.GIB}), contextlib.redirect_stdout(io.StringIO()):
+            items = gd.survey([fam], 6, 0)
+            gd.apply(items, {fam.id: fam}, receipt, None, 6, all_families=[fam])
+        self.assertEqual([Path(r) for r in removed],
+                         [st["mini-glaeda"] / "Build", st["daily"] / "Build",  # generated output first (5 h, 3 h)
+                          st["mini-glaeda"], st["daily"]])  # then the idle slots, least recently used first
+        for key in ("mini-glaeda-2", "release-new"):
+            self.assertTrue((st[key] / "SourcePackages").is_dir(), key)
+        # the stop: with free already at the hold's stop, no slot goes
+        for key in ("mini-glaeda", "daily"):
+            (st[key] / "SourcePackages").mkdir(parents=True)
+            (st[key] / "info.plist").write_text("{}")
+        patches, removed = self._floor_disk(50.0)
+        gd._DISCOVERED.clear()
+        with patches[0], patches[1], mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "command_lines", return_value=""), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), \
+                mock.patch.object(gd, "FLOOR_HOLD", {dev: 50 * gd.GIB}), contextlib.redirect_stdout(io.StringIO()):
+            items = gd.survey([fam], 6, 0)
+            gd.apply(items, {fam.id: fam}, self.receipt(), None, 6, all_families=[fam])
+        self.assertFalse(set(map(Path, removed)) & set(st.values()))
+
+    def test_a_slot_a_job_takes_after_the_survey_is_kept(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        dev = home.stat().st_dev
+        patches, removed = self._floor_disk(20.0, freed_gib=1.0)
+        named = f"xcodebuild -derivedDataPath {st['mini-glaeda']}\n"
+        gd._DISCOVERED.clear()
+        with patches[0], patches[1], mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd, "command_lines", return_value=""), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), \
+                mock.patch.object(gd, "FLOOR_HOLD", {dev: 50 * gd.GIB}), contextlib.redirect_stdout(io.StringIO()):
+            with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+                items = [i for i in gd.survey([fam], 6, 0) if Path(i.path) == st["mini-glaeda"]]
+            self.assertEqual([i.verdict for i in items], ["reclaimable"])
+            with mock.patch.object(gd, "process_evidence", return_value=([], named)):
+                gd.apply(items, {fam.id: fam}, self.receipt(), None, 6, all_families=[fam])
+        self.assertEqual(removed, [])
+        self.assertTrue((st["mini-glaeda"] / "SourcePackages").is_dir())
+
+    def _floor_apply(self, home, fam, free_gib, freed_gib, evidence=([], ""), over=0, slots_only=False, during=None):
+        """One pressure apply under a 50 GiB floor hold stop. Returns (released, removed, items)."""
+        dev = home.stat().st_dev
+        patches, removed = self._floor_disk(free_gib, freed_gib=freed_gib)
+        gd._DISCOVERED.clear()
+        with patches[0], patches[1], mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd, "command_lines", return_value=evidence[1]), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "CMUX_NEXT_CI_OVER", over), \
+                mock.patch.object(gd, "FLOOR_HOLD", {dev: 50 * gd.GIB}), contextlib.redirect_stdout(io.StringIO()):
+            with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+                items = gd.survey([fam], 6, 0)
+            if slots_only:
+                items = [i for i in items if Path(i.path).name not in gd.CMUX_NEXT_CI_GENERATED_NAMES]
+            with mock.patch.object(gd, "process_evidence", side_effect=during or (lambda: evidence)):
+                released = gd.apply(items, {fam.id: fam}, self.receipt(), None, 6, all_families=[fam])
+        return released, [Path(r) for r in removed], items
+
+    def test_a_floor_slot_is_not_stopped_by_the_spent_cap_budget(self) -> None:
+        # over the cap by one byte: the first Build spends the cap's budget, and the floor hold still wants 50 GiB
+        home, fam, st = self._cmux_next_cap_tree()
+        _, removed, _ = self._floor_apply(home, fam, 20.0, 4.0, over=1)
+        for key in ("mini-glaeda", "daily"):
+            self.assertIn(st[key], removed, key)
+
+    def test_a_slots_bytes_count_once_with_its_children(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        worker = f"{home}/actions-runner-glaeda-2/bin/Runner.Worker spawnclient 1 2\n"  # runner 2 has a job
+        released, removed, items = self._floor_apply(home, fam, 20.0, 4.0, evidence=([], worker))
+        size = {Path(i.path): i.bytes for i in items}
+        self.assertEqual(removed, [st["mini-glaeda"] / "Build", st["daily"] / "Build", st["mini-glaeda"],
+                                       st["daily"]])
+        # each slot's measured size includes its Build: the pass counts what the slots held, not more
+        self.assertEqual(released, size[st["mini-glaeda"]] + size[st["daily"]])
+
+    def test_the_floor_stop_is_read_again_right_before_a_slot_goes(self) -> None:
+        # free reaches the stop while the fresh evidence is taken: the slot stays
+        home, fam, st = self._cmux_next_cap_tree()
+        dev = home.stat().st_dev
+        state = {"free": 20 * gd.GIB}
+
+        calls = {"n": 0}
+
+        def evidence():  # apply's first read leaves free under the stop; the per-item fresh read sees it met
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                state["free"] = 60 * gd.GIB  # another job's cleanup finished meanwhile
+            return [], ""
+        gd._DISCOVERED.clear()
+        with mock.patch.object(gd, "free_bytes", side_effect=lambda _p: (state["free"], 460 * gd.GIB)), \
+                mock.patch.object(gd, "remove") as remove, mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd, "command_lines", return_value=""), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), \
+                mock.patch.object(gd, "FLOOR_HOLD", {dev: 50 * gd.GIB}), contextlib.redirect_stdout(io.StringIO()):
+            with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+                items = [i for i in gd.survey([fam], 6, 0) if Path(i.path) == st["mini-glaeda"]]
+            self.assertEqual([i.verdict for i in items], ["reclaimable"])
+            with mock.patch.object(gd, "process_evidence", side_effect=evidence):
+                gd.apply(items, {fam.id: fam}, self.receipt(), None, 6, all_families=[fam])
+        self.assertGreaterEqual(calls["n"], 2)  # it got past the pre-item stop check to the fresh evidence
+        remove.assert_not_called()
+
+    def test_a_slot_whose_runner_takes_a_job_during_the_rename_is_put_back(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        worker = f"{home}/actions-runner-glaeda/bin/Runner.Worker spawnclient 1 2\n"
+        calls = {"n": 0}
+
+        def during():  # idle at the last check before the rename, then runner 1's Runner.Worker appears
+            calls["n"] += 1
+            return ([], "") if calls["n"] <= 2 else ([], worker)  # before the loop, before the rename, after it
+        released, removed, items = self._floor_apply(home, fam, 20.0, 4.0, slots_only=True, during=during)
+        self.assertNotIn(st["mini-glaeda"], removed)
+        self.assertTrue((st["mini-glaeda"] / "SourcePackages").is_dir())  # back at its path
+        self.assertFalse([p for p in st["mini-glaeda"].parent.iterdir() if p.name.startswith(gd.DELETING_PREFIX)])
+        self.assertEqual(next(i for i in items if Path(i.path) == st["mini-glaeda"]).verdict, "blocked")
+
+    def test_a_slot_with_inputs_wider_than_the_marker_search_still_goes(self) -> None:
+        # a real slot's module cache holds thousands of entries: more than cmux_active's 5000-entry budget
+        home, fam, st = self._cmux_next_cap_tree()
+        wide = st["mini-glaeda"] / "ModuleCache.noindex"
+        wide.mkdir()
+        for n in range(5001):
+            (wide / f"m{n}.pcm").touch()
+        self._age(st["mini-glaeda"], hours=5)
+        _, removed, items = self._floor_apply(home, fam, 20.0, 4.0, slots_only=True)
+        self.assertEqual(next(i for i in items if Path(i.path) == st["mini-glaeda"]).verdict, "reclaimable")
+        self.assertIn(st["mini-glaeda"], removed)
+
+    def test_a_slot_in_use_is_kept_aside_when_a_new_slot_took_its_path(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        worker = f"{home}/actions-runner-glaeda/bin/Runner.Worker spawnclient 1 2\n"
+        calls = {"n": 0}
+
+        def during():  # after the rename, runner 1's job is live and has already made a new slot at the path
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                return [], ""
+            if not st["mini-glaeda"].exists():
+                make(st["mini-glaeda"] / "Build")
+            return [], worker
+        _, removed, items = self._floor_apply(home, fam, 20.0, 4.0, slots_only=True, during=during)
+        self.assertNotIn(st["mini-glaeda"], removed)
+        aside = [p for p in st["mini-glaeda"].parent.iterdir() if p.name.startswith(gd.DELETING_PREFIX)]
+        self.assertEqual(len(aside), 1)  # the tree the job may still use is not deleted
+        self.assertTrue((aside[0] / "SourcePackages").is_dir())
+        self.assertTrue((st["mini-glaeda"] / "Build").exists())  # nor the job's new slot
+        self.assertEqual(next(i for i in items if Path(i.path) == st["mini-glaeda"]).verdict, "blocked")
+
+    def test_a_slot_put_back_never_replaces_an_empty_slot_a_job_made(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        worker = f"{home}/actions-runner-glaeda/bin/Runner.Worker spawnclient 1 2\n"
+        calls = {"n": 0}
+
+        def during():  # after the rename, runner 1's job is live and has made an empty slot (its cwd)
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                return [], ""
+            if not st["mini-glaeda"].exists():
+                st["mini-glaeda"].mkdir()
+                made.append(st["mini-glaeda"].stat().st_ino)
+            return [], worker
+        made: list[int] = []
+        _, removed, _ = self._floor_apply(home, fam, 20.0, 4.0, slots_only=True, during=during)
+        self.assertNotIn(st["mini-glaeda"], removed)
+        self.assertEqual(st["mini-glaeda"].stat().st_ino, made[0])  # the job's directory is still the one there
+        self.assertEqual(list(st["mini-glaeda"].iterdir()), [])
+        aside = [p for p in st["mini-glaeda"].parent.iterdir() if p.name.startswith(gd.DELETING_PREFIX)]
+        self.assertEqual(len(aside), 1)
+        self.assertTrue((aside[0] / "SourcePackages").is_dir())
+
+    def test_rename_noreplace_refuses_an_empty_directory(self) -> None:
+        src, dst = self.root / "src", self.root / "dst"
+        src.mkdir()
+        dst.mkdir()
+        with self.assertRaises(OSError) as raised:
+            gd.rename_noreplace(src, dst)
+        self.assertIn(raised.exception.errno, (errno.EEXIST, errno.ENOTSUP))
+        self.assertTrue(src.is_dir() and dst.is_dir())
+        if raised.exception.errno == errno.EEXIST:
+            dst.rmdir()
+            gd.rename_noreplace(src, dst)
+            self.assertTrue(dst.is_dir() and not src.exists())
+
+    def test_an_unknown_owner_vetoes_a_state_and_its_children(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "FLOOR_HOLD", {home.stat().st_dev: 50 * gd.GIB}):
+            (home / "actions-runner-glaeda-2/.runner").write_text("{not json")
+            # mini-glaeda-2's own slot and children: no runner matches by name, and one .runner cannot be read
+            self.assertEqual(gd.cmux_next_ci_owner(st["mini-glaeda-2"], fam.root), gd.OWNER_UNKNOWN)
+            for path in (st["mini-glaeda-2"], st["mini-glaeda-2"] / "Build", st["gone-runner"]):
+                self.assertIn("unknown", gd.cmux_next_ci_busy(fam, path, [], ""), path)
+            # a runner it can read still owns its own
+            self.assertEqual(gd.cmux_next_ci_owner(st["mini-glaeda"], fam.root), home / "actions-runner-glaeda")
+
+    def test_a_release_owner_comes_from_one_read_of_its_runner(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        runner = home / "actions-runner-glaeda"
+        good = (runner / ".runner").read_text(encoding="utf-8-sig")
+        reads = {"n": 0}
+        real = gd.runner_config
+
+        def config(r):  # the first read of runner 1 succeeds, any later one fails
+            if r == runner:
+                reads["n"] += 1
+                if reads["n"] > 1:
+                    return {}
+            return real(r)
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "runner_config", side_effect=config):
+            self.assertEqual(gd.cmux_next_ci_owner(st["daily"], fam.root), runner)
+        self.assertEqual(reads["n"], 1)
+        self.assertTrue(good)
+
+    def test_a_stale_root_the_cap_takes_is_put_back_when_its_tree_turns_busy(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        vetted = mock.patch.dict(gd.CMUX_NEXT_CI_VETTED_OWNER, {st["gone-runner"]: None})
+        vetted.start()
+        self.addCleanup(vetted.stop)
+        doomed = st["gone-runner"].with_name(f"{gd.DELETING_PREFIX}{st['gone-runner'].name}-{os.getpid()}")
+        recheck = gd.cmux_next_ci_slot_recheck(fam, st["gone-runner"], floor=False)
+        os.rename(st["gone-runner"], doomed)
+        (doomed / "unknown-child").mkdir()  # something new arrived in the detached tree
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            with self.assertRaises(gd.SlotTaken):
+                recheck()
+        self.assertTrue((st["gone-runner"] / "SourcePackages").is_dir())
+        (st["gone-runner"] / "unknown-child").rmdir()
+        recheck = gd.cmux_next_ci_slot_recheck(fam, st["gone-runner"], floor=False)
+        os.rename(st["gone-runner"], doomed)
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "free_bytes", return_value=(400 * gd.GIB, 460 * gd.GIB)):
+            recheck()  # idle, and no floor stop applies to the cap's stale root: remove() deletes it
+        self.assertTrue(doomed.is_dir())
+
+    def test_a_state_a_renamed_runner_left_stays_unknown_for_a_jobs_timeout(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        runner = home / "actions-runner-glaeda"
+        # runner 1 re-registered as another name just now: its old Runner.Worker may still use cmux-scheme/mini-glaeda
+        (runner / ".runner").write_text(json.dumps({"agentName": "renamed"}), encoding="utf-8-sig")
+        with mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd, "FLOOR_HOLD", {fam.root.stat().st_dev: 50 * gd.GIB}):
+            self.assertEqual(gd.cmux_next_ci_owner(st["mini-glaeda"], fam.root), gd.OWNER_UNKNOWN)
+            self.assertIn("unknown", gd.cmux_next_ci_busy(fam, st["mini-glaeda"], [], ""))
+            self.assertNotIn(st["mini-glaeda"], gd.cmux_next_ci_stale_roots(fam.root))  # on every later pass too
+            self._registered_long_ago(runner / ".runner")
+            self.assertIsNone(gd.cmux_next_ci_owner(st["mini-glaeda"], fam.root))  # a job's timeout later: gone
+
+    def test_a_runner_whose_config_went_missing_just_now_is_not_known_gone(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        runner = home / "actions-runner-glaeda-2"
+        (runner / ".runner").unlink()  # mid re-registration: its old Runner.Worker may still use its state
+        with mock.patch.object(gd, "HOME", home):
+            self.assertEqual(gd.cmux_next_ci_owner(st["mini-glaeda-2"], fam.root), gd.OWNER_UNKNOWN)
+            self.assertNotIn(st["mini-glaeda-2"], gd.cmux_next_ci_stale_roots(fam.root))
+            self._registered_long_ago(runner)  # removed a job's timeout ago: gone
+            self.assertIsNone(gd.cmux_next_ci_owner(st["mini-glaeda-2"], fam.root))
+
+    def test_an_aside_slot_finished_counts_against_the_cap(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        aside = st["gone-runner"].with_name(f"{gd.DELETING_PREFIX}gone-runner-999999")
+        os.rename(st["gone-runner"], aside)
+        self._age(aside, hours=30)
+        with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), \
+                mock.patch.object(gd, "CMUX_NEXT_CI_OVER", 1), mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "command_lines", return_value=""), contextlib.redirect_stdout(io.StringIO()):
+            gd._DISCOVERED.clear()
+            fams = [fam] + [f for f in gd.interrupted_families([fam]) if f.root == aside.parent]
+            items = gd.survey(fams, 6, 0)
+            by_path = {Path(i.path): i for i in items}
+            self.assertIn(aside, by_path)
+            for i in items:  # the aside first, then the cap's young output
+                i.verdict = "reclaimable" if Path(i.path) in (aside, st["mini-glaeda"] / "Build") else "blocked"
+            items.sort(key=lambda i: Path(i.path) != aside)
+            gd.apply(items, {f.id: f for f in fams}, self.receipt(), None, 6, all_families=fams)
+        self.assertFalse(aside.exists())
+        self.assertTrue((st["mini-glaeda"] / "Build").exists())  # the aside's bytes already met the cap
+
+    def test_a_drain_lists_no_whole_slot(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        with mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd, "FLOOR_HOLD", {fam.root.stat().st_dev: 50 * gd.GIB}):
+            self.assertIn(st["mini-glaeda"], gd.cmux_next_ci_floor_slots(fam.root))
+            with mock.patch.object(gd, "CMUX_NEXT_CI_DRAIN", True), mock.patch.dict(gd._DISCOVERED, {}, clear=True):
+                self.assertEqual(gd.cmux_next_ci_floor_slots(fam.root), [])
+                listed = gd.candidates(fam)
+                self.assertFalse(set(listed) & set(gd.cmux_next_ci_state_roots(fam.root)))
+                self.assertIn(st["mini-glaeda"] / "Build", listed)
+
+    def test_an_unreadable_directory_in_a_slot_counts_as_holding_a_socket(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("root reads any directory")
+        home, fam, st = self._cmux_next_cap_tree()
+        build = st["mini-glaeda"] / "Build"
+        build.chmod(0)
+        try:
+            self.assertTrue(gd.cmux_next_ci_holds_socket(st["mini-glaeda"]))
+        finally:
+            build.chmod(0o755)
+        self.assertFalse(gd.cmux_next_ci_holds_socket(st["mini-glaeda"]))
+
+    def test_a_blank_agent_name_leaves_the_roster_incomplete(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        (home / "actions-runner-glaeda-2/.runner").write_text(json.dumps({"agentName": " "}), encoding="utf-8-sig")
+        with mock.patch.object(gd, "HOME", home):
+            names, complete, _ = gd.enrolled_runner_roster()
+            self.assertNotIn(" ", names)
+            self.assertFalse(complete)
+            self.assertEqual(gd.cmux_next_ci_owner(st["mini-glaeda-2"], fam.root), gd.OWNER_UNKNOWN)
+
+    def test_a_slot_is_not_deleted_beside_a_new_one_when_free_space_cannot_be_read(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        slot, runner = st["mini-glaeda"], home / "actions-runner-glaeda"
+        doomed = slot.with_name(f"{gd.DELETING_PREFIX}{slot.name}-{os.getpid()}")
+        with mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd, "FLOOR_HOLD", {slot.parent.stat().st_dev: 50 * gd.GIB}), \
+                mock.patch.dict(gd.CMUX_NEXT_CI_VETTED_OWNER, {slot: runner}), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            recheck = gd.cmux_next_ci_slot_recheck(fam, slot, floor=True)
+            os.rename(slot, doomed)
+            slot.mkdir()  # a new slot stands at the path
+            with mock.patch.object(gd, "free_bytes", side_effect=OSError(errno.EIO, "unreadable")), \
+                    self.assertRaises(gd.SlotNotNeeded):
+                recheck()
+        self.assertTrue((doomed / "SourcePackages").is_dir())  # left aside, not handed to remove()
+
+    def test_a_slot_whose_runner_is_renamed_after_its_veto_is_put_back(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        slot, runner = st["mini-glaeda"], home / "actions-runner-glaeda"
+        doomed = slot.with_name(f"{gd.DELETING_PREFIX}{slot.name}-{os.getpid()}")
+        worker = f"{runner}/bin/Runner.Worker spawnclient 1 2\n"
+        with mock.patch.object(gd, "HOME", home), \
+                mock.patch.object(gd, "FLOOR_HOLD", {slot.parent.stat().st_dev: 50 * gd.GIB}), \
+                mock.patch.object(gd, "free_bytes", return_value=(10 * gd.GIB, 460 * gd.GIB)), \
+                mock.patch.dict(gd.CMUX_NEXT_CI_VETTED_OWNER, {}):
+            self.assertEqual(gd.cmux_next_ci_busy(fam, slot, [], ""), "")  # vetted under runner 1
+            recheck = gd.cmux_next_ci_slot_recheck(fam, slot, floor=True)
+            os.rename(slot, doomed)
+            # runner 1 is re-registered under another name while its old Runner.Worker still runs
+            (runner / ".runner").write_text(json.dumps({"agentName": "renamed"}), encoding="utf-8-sig")
+            self._registered_long_ago(runner / ".runner")  # past the roster's own window: the vetted owner holds it
+            self.assertIsNone(gd.cmux_next_ci_owner(slot, fam.root))
+            with mock.patch.object(gd, "process_evidence", return_value=([], worker)), \
+                    self.assertRaises(gd.SlotTaken):
+                recheck()
+        self.assertTrue((slot / "SourcePackages").is_dir())  # put back
+
+    def test_no_state_parent_is_found_through_a_symlink(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        outside = self.root / "outside"
+        (outside / ("ab" * 8) / "Release").mkdir(parents=True)
+        os.symlink(outside, fam.root / "dev-daily-release-link")
+        shutil.rmtree(fam.root / "release-compile")
+        os.symlink(outside, fam.root / "release-compile")
+        parents = gd.cmux_next_ci_state_parents(fam.root)
+        self.assertFalse([d for d in parents if d.resolve().is_relative_to(outside.resolve())], parents)
+        self.assertIn(fam.root / "cmux-scheme", parents)
+        linked_root = self.root / "linked-cmux-next-ci"
+        os.symlink(fam.root, linked_root)
+        self.assertEqual(gd.cmux_next_ci_state_parents(linked_root), [])
+
+    def test_an_aside_slot_keeps_its_vetoes_on_a_later_pass(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        scheme = st["mini-glaeda"].parent
+        aside = scheme / f"{gd.DELETING_PREFIX}mini-glaeda-999999"
+        os.rename(st["mini-glaeda"], aside)
+        wide = aside / "ModuleCache.noindex"
+        wide.mkdir()
+        for n in range(3001):
+            (wide / f"m{n}.pcm").touch()
+        sock_dir = Path(tempfile.mkdtemp(dir="/tmp"))
+        server = socket.socket(socket.AF_UNIX)
+        try:
+            server.bind(os.fspath(sock_dir / "s"))
+            os.rename(sock_dir / "s", aside / "Build" / "s")
+            # the generic search gives up past its budget (where it meets the wide cache first depends on the
+            # filesystem's listing order, so that is simulated): the aside's own vetoes still see the socket
+            with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "holds_socket", return_value=False), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                fams = [f for f in gd.interrupted_families([fam]) if f.root == scheme]
+                self.assertEqual(len(fams), 1)
+                self.assertIn("socket", gd.cmux_next_ci_aside_busy(aside, [], ""))
+                worker = f"{home}/actions-runner-glaeda/bin/Runner.Worker spawnclient 1 2\n"
+                os.unlink(aside / "Build" / "s")
+                self.assertEqual(gd.cmux_next_ci_aside_busy(aside, [], ""), "")
+                self.assertIn("Runner.Worker", gd.cmux_next_ci_aside_busy(aside, [], worker))
+                with mock.patch.object(gd, "process_evidence", return_value=([], worker)), \
+                        mock.patch.object(gd, "command_lines", return_value=worker):
+                    items = [i for i in gd.survey(fams, 6, 0) if Path(i.path) == aside]
+                    self.assertEqual(len(items), 1)
+                    items[0].verdict = "reclaimable"
+                    gd.apply(items, {f.id: f for f in fams}, self.receipt(), None, 6, all_families=fams)
+            self.assertTrue((aside / "SourcePackages").is_dir())  # its runner's job keeps it on the second pass
+        finally:
+            server.close()
+            shutil.rmtree(sock_dir, ignore_errors=True)
+
+    def test_no_cmux_next_state_root_is_busy_for_its_width_alone(self) -> None:
+        # an unowned stale root the cap takes whole, and an enrolled runner's slot, each wider than cmux_active's budget
+        home, fam, st = self._cmux_next_cap_tree()
+        for key in ("gone-runner", "mini-glaeda"):
+            wide = st[key] / "ModuleCache.noindex"
+            wide.mkdir()
+            for n in range(5001):
+                (wide / f"m{n}.pcm").touch()
+            self.assertTrue(gd.cmux_active(st[key]), key)  # the generic search gives up
+            self.assertFalse(gd.job_busy(fam, st[key]), key)
+
+    def test_a_socket_past_a_wide_cache_still_keeps_a_slot(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        wide = st["mini-glaeda"] / "ModuleCache.noindex"
+        wide.mkdir()
+        for n in range(3001):
+            (wide / f"m{n}.pcm").touch()
+        self.assertFalse(gd.cmux_next_ci_tree_busy(st["mini-glaeda"]))  # the cache alone is not activity
+        sock_dir = Path(tempfile.mkdtemp(dir="/tmp"))  # AF_UNIX paths are short: bind short, then move in
+        try:
+            server = socket.socket(socket.AF_UNIX)
+            server.bind(os.fspath(sock_dir / "s"))
+            os.rename(sock_dir / "s", st["mini-glaeda"] / "Build" / "s")
+            self.assertIn("socket", gd.cmux_next_ci_tree_busy(st["mini-glaeda"]))
+        finally:
+            server.close()
+            shutil.rmtree(sock_dir, ignore_errors=True)
+        crowded = st["daily"] / "Build"
+        for n in range(3001):
+            (crowded / f"f{n}").touch()
+        self.assertIn("socket", gd.cmux_next_ci_tree_busy(st["daily"]))  # a search that cannot finish fails closed
+
+    def test_an_unreadable_runner_config_makes_no_state_unowned(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        old = time.time() - 30 * 86400
+        for key in ("gone-runner", "release-old"):
+            for d in (st[key], *st[key].rglob("*")):
+                os.utime(d, (old, old))
+        with mock.patch.object(gd, "HOME", home):
+            self.assertIn(st["gone-runner"], gd.cmux_next_ci_stale_roots(fam.root))
+            (home / "actions-runner-glaeda-2/.runner").write_text("{not json")
+            self.assertEqual(gd.cmux_next_ci_stale_roots(fam.root), [])
+
+    def test_a_slot_left_aside_is_found_when_no_state_is_left_beside_it(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        scheme = st["mini-glaeda"].parent
+        for child in list(scheme.iterdir()):
+            shutil.rmtree(child)
+        aside = scheme / f"{gd.DELETING_PREFIX}mini-glaeda-999999"
+        make(aside / "Build")
+        release = st["daily"].parent
+        shutil.rmtree(st["daily"])
+        aside_release = release / f"{gd.DELETING_PREFIX}{st['daily'].name}-999999"
+        make(aside_release / "Build")
+        with mock.patch.object(gd, "HOME", home):
+            roots = {f.root for f in gd.interrupted_families([fam])}
+        self.assertIn(scheme, roots)
+        self.assertIn(release, roots)
+
+    def test_a_socket_that_moves_with_the_slot_keeps_it(self) -> None:
+        home, fam, st = self._cmux_next_cap_tree()
+        calls = {"n": 0}
+        real_tree_busy = gd.cmux_next_ci_tree_busy
+
+        def tree_busy(state):  # a socket appears in the tree between the last check and the rename
+            return "cmux-next state holds a socket" if gd.DELETING_PREFIX in state.name else real_tree_busy(state)
+        with mock.patch.object(gd, "cmux_next_ci_tree_busy", side_effect=tree_busy):
+            _, removed, items = self._floor_apply(home, fam, 20.0, 4.0, slots_only=True)
+        self.assertNotIn(st["mini-glaeda"], removed)
+        self.assertTrue((st["mini-glaeda"] / "SourcePackages").is_dir())  # put back
+        self.assertEqual(next(i for i in items if Path(i.path) == st["mini-glaeda"]).verdict, "blocked")
+
+    def test_a_slot_that_cannot_be_put_back_for_another_reason_stays_aside(self) -> None:
+        # the floor is met after the rename, and the rename back fails without a new slot at the path
+        home, fam, st = self._cmux_next_cap_tree()
+        dev = home.stat().st_dev
+        state = {"free": 20 * gd.GIB, "n": 0}
+
+        def evidence():
+            state["n"] += 1
+            if state["n"] > 2:
+                state["free"] = 60 * gd.GIB
+            return [], ""
+
+        def rename(src, dst):  # the put-back alone fails
+            raise PermissionError(errno.EACCES, "Permission denied")
+        gd._DISCOVERED.clear()
+        with mock.patch.object(gd, "free_bytes", side_effect=lambda _p: (state["free"], 460 * gd.GIB)), \
+                mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "command_lines", return_value=""), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "rename_noreplace", rename), \
+                mock.patch.object(gd, "FLOOR_HOLD", {dev: 50 * gd.GIB}), contextlib.redirect_stdout(io.StringIO()):
+            with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+                items = [i for i in gd.survey([fam], 6, 0) if Path(i.path) == st["mini-glaeda"]]
+            with mock.patch.object(gd, "process_evidence", side_effect=evidence):
+                gd.apply(items, {fam.id: fam}, self.receipt(), None, 6, all_families=[fam])
+        aside = [p for p in st["mini-glaeda"].parent.iterdir() if p.name.startswith(gd.DELETING_PREFIX)]
+        self.assertEqual(len(aside), 1)
+        self.assertTrue((aside[0] / "SourcePackages").is_dir())  # not deleted
+
+    def test_a_slot_no_longer_needed_after_the_rename_is_put_back(self) -> None:
+        # free reaches the stop while the post-rename evidence is taken: the slot goes back to its path
+        home, fam, st = self._cmux_next_cap_tree()
+        dev = home.stat().st_dev
+        state = {"free": 20 * gd.GIB, "n": 0}
+
+        def evidence():
+            state["n"] += 1
+            if state["n"] > 2:  # before the loop, before the rename, after it
+                state["free"] = 60 * gd.GIB
+            return [], ""
+        gd._DISCOVERED.clear()
+        with mock.patch.object(gd, "free_bytes", side_effect=lambda _p: (state["free"], 460 * gd.GIB)), \
+                mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "command_lines", return_value=""), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), \
+                mock.patch.object(gd, "FLOOR_HOLD", {dev: 50 * gd.GIB}), contextlib.redirect_stdout(io.StringIO()):
+            with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+                items = [i for i in gd.survey([fam], 6, 0) if Path(i.path) == st["mini-glaeda"]]
+            with mock.patch.object(gd, "process_evidence", side_effect=evidence):
+                released = gd.apply(items, {fam.id: fam}, self.receipt(), None, 6, all_families=[fam])
+        self.assertEqual(released, 0)
+        self.assertTrue((st["mini-glaeda"] / "SourcePackages").is_dir())
+        self.assertFalse([p for p in st["mini-glaeda"].parent.iterdir() if p.name.startswith(gd.DELETING_PREFIX)])
 
     @staticmethod
     def _release_key(name: str, runner: Path) -> str:
@@ -3023,6 +3602,7 @@ class GlaedaDiskTest(unittest.TestCase):
                                  ("actions-runner-glaeda-2", "mini-glaeda-2")):
                 (home / runner / "glaeda-hooks").mkdir(parents=True)
                 (home / runner / ".runner").write_text(json.dumps({"agentName": name}), encoding="utf-8-sig")
+                self._registered_long_ago(home / runner / ".runner")
         root = home / "Library/Caches/cmux-next-ci"
         xcode = "Release/xcode-2c2299e9015ce0c8"
         key1 = self._release_key("mini-glaeda", home / "actions-runner-glaeda")

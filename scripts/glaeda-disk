@@ -167,6 +167,7 @@ import calendar
 import collections
 import contextlib
 import ctypes
+import errno
 import fcntl
 import glob
 import gzip
@@ -599,6 +600,9 @@ CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
 CMUX_NEXT_CI_GENERATED_NAMES = frozenset({
     "Build", "Index.noindex", "Logs", "Products", "Intermediates.noindex",
     "DerivedSources", "XCBuildData",
+    # the workflow's xcodebuild log beside its Build: unknown, it vetoed every idle state as in use, so a pressure
+    # run took nothing (cmux14, 2026-10-25: 10.8 GiB free under a 30 GiB floor, every Build "unknown children")
+    "cmux-next-build.log",
 })
 CMUX_NEXT_CI_ACTIVITY_MARKERS = frozenset({
     ".cmux-active", ".build.active", ".lock", "lease.json", "reservation.json",
@@ -927,7 +931,8 @@ def floor_hold_family(fam: Family, path: Path) -> bool:
     cmux_next_ci_busy), and code-sign clones (keep_live_app_clones and app_clone_running keep the live ones)."""
     if fam.id == RUNNER_BUILD_FAMILY or fam.app_clones:
         return True
-    return fam.id == CMUX_NEXT_CI_FAMILY and not CMUX_NEXT_CI_DRAIN and cmux_next_ci_runner(path, fam.root) is not None
+    return fam.id == CMUX_NEXT_CI_FAMILY and not CMUX_NEXT_CI_DRAIN and (
+        cmux_next_ci_runner(path, fam.root) is not None or cmux_next_ci_floor_slot(fam, path))
 
 
 def floor_hold_only(fam: Family, item: "Item", idle_hours: float) -> bool:
@@ -943,7 +948,7 @@ def cmux_next_ci_over() -> int:
 def cmux_next_cap_only(fam: Family, path: Path, idle: float, idle_hours: float) -> bool:
     """Reclaimable only because the cmux-next-ci cache is over its cap: an unowned state root listed whole, or
     generated output younger than the family's own window. apply stops these once the cache is under the cap."""
-    return (fam.id == CMUX_NEXT_CI_FAMILY and cmux_next_ci_over() > 0
+    return (fam.id == CMUX_NEXT_CI_FAMILY and cmux_next_ci_over() > 0 and not cmux_next_ci_floor_slot(fam, path)
             and (cmux_next_ci_state_for(path, fam.root) is None or idle < idle_window(fam, idle_hours)))
 
 
@@ -3338,6 +3343,8 @@ def interrupted_families(fams: list[Family]) -> list[Family]:
         if not fam.reclaimable or fam.id == INTERRUPTED:
             continue
         dirs = {fam.root}
+        if fam.id == CMUX_NEXT_CI_FAMILY:  # a whole state set aside leaves no candidate where it sat
+            dirs.update(cmux_next_ci_state_parents(fam.root))
         if fam.discover or fam.checkout_builds:
             dirs.update(p.parent for p in candidates(fam))
         else:  # a match family's candidates sit within depth levels too: an aside one left no candidate behind
@@ -4390,6 +4397,8 @@ def job_busy(fam: Family, path: Path) -> bool:
         return False
     if fam.id == INTERRUPTED:  # renamed away from every job's path; its deleter's pid is its in-use signal
         return False
+    if fam.id == CMUX_NEXT_CI_FAMILY and path in cmux_next_ci_state_roots(fam.root):
+        return False  # a whole state's inputs are wider than the budget; cmux_next_ci_busy is its signal
     return fam.reclaimable and not fam.discover and cmux_active(path)
 
 
@@ -4465,7 +4474,8 @@ def candidates(fam: Family) -> list[Path]:
             _DISCOVERED[key] = discover_caches(fam.root)
         level = list(_DISCOVERED[key])
     elif fam.checkout_builds:
-        key = f"checkout-builds:{fam.id}:" + os.fspath(fam.root) + (":over-cap" if cmux_next_ci_over() else "")
+        key = (f"checkout-builds:{fam.id}:" + os.fspath(fam.root) + (":over-cap" if cmux_next_ci_over() else "")
+               + (":floor" if FLOOR_HOLD else "") + (":drain" if CMUX_NEXT_CI_DRAIN else ""))
         if key not in _DISCOVERED:
             _DISCOVERED[key] = (cmux_next_ci_generated_paths(fam.root, whole_stale=True)
                                 if fam.id == CMUX_NEXT_CI_FAMILY and cmux_next_ci_over()
@@ -4872,7 +4882,10 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             verdict = "reclaimable"
             if path.name in archived and fam.id == "cmux-seeds":
                 reasons.append("the seed archive holds it")
-            if cmux_next_cap_only(fam, path, idle, idle_hours):
+            if cmux_next_ci_floor_slot(fam, path):
+                reasons.append("an idle runner's whole cmux-next slot, under the runner floor (its next job builds "
+                               "cold; least recently used first, after every generated child)")
+            elif cmux_next_cap_only(fam, path, idle, idle_hours):
                 reasons.append(f"cmux-next-ci is {gib(cmux_next_ci_over()).strip()} over its size cap "
                                "(least recently used first)")
             if (fam.mirror_idle_hours is not None and idle >= fam.mirror_idle_hours
@@ -5847,8 +5860,12 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
     archived = archived_seeds() if any(i.family == "cmux-seeds" for i in items) else frozenset()
     # Among pressure hot-tier items, evict greatest reuse distance, then oldest use.
     cap_left = cmux_next_ci_over()  # what the cmux-next-ci cache is still over its cap
+    taken_in: dict[Path, int] = {}  # bytes this pass took from inside each cmux-next state root
 
     def order(i):
+        if cmux_next_ci_floor_slot(family_of(i), Path(i.path)):
+            # a whole slot costs its runner a cold build: after every generated child, least recently used first
+            return (-2, 0, i.idle_hours, i.bytes)
         if floor_hold_only(family_of(i), i, idle_hours) \
                 or cmux_next_cap_only(family_of(i), Path(i.path), i.idle_hours, idle_hours):
             # reclaimable only by FLOOR_HOLD or the cmux-next cap: warm builds go last, least recently used first
@@ -5883,7 +5900,10 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         # an item younger than its family's window goes only while a budget that let it go still allows:
         # the floor hold stops at the floor plus target_margin_gib, the cmux-next cap once the cache is under it
         warm: list[bool] = []
-        if floor_hold_only(fam, i, idle_hours):
+        if cmux_next_ci_floor_slot(fam, p):
+            if not floor_stop_unmet(p):
+                continue
+        elif floor_hold_only(fam, i, idle_hours):
             try:
                 stop = FLOOR_HOLD.get(p.parent.stat().st_dev)
                 warm.append(stop is not None and free_bytes(p.parent)[0] < stop)
@@ -5899,7 +5919,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         if halt is not None and (why := halt()):
             print(f"stopped: {why}")
             break
-        if fam.id in FLEET_FAMILY_IDS or fam.id == CMUX_NEXT_CI_FAMILY:
+        if fam.id in FLEET_FAMILY_IDS or fam.id == CMUX_NEXT_CI_FAMILY or (
+                fam.id == INTERRUPTED and fam.root in cmux_next_ci_state_parents(HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT)):
             # Pressure eligibility is intentionally broad, so take fresh cwd/open-file evidence immediately
             # before each rename. A job may start using a candidate after the survey or during a long pass.
             try:
@@ -5943,6 +5964,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         elif fam.discover and not fresh_layout:
             outcome = "changed:layout"
         elif (cmux_next_ci_busy(fam, p, cwds, cmds)
+                or (fam.id == INTERRUPTED and cmux_next_ci_aside_busy(p, cwds, cmds))
                 or (fam.id == RUNNER_BUILD_FAMILY and runner_job_live(fam.root.parent, cmds))
                 or (fam.app_clones and app_clone_running(p, cmds))
                 or in_cwd(i.path, cwds) or named_by(i.path, cmds) or holds_socket(p) or job_busy(fam, p)
@@ -5959,6 +5981,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             outcome = "changed:modified"
         elif keep_verdict(fam, p):
             outcome = "changed:kept"
+        elif cmux_next_ci_floor_slot(fam, p) and not floor_stop_unmet(p):
+            continue  # free reached the floor hold's stop while the evidence was re-taken
         elif not git_exempt(fam, p, idle_now) and not fam.git_disposable and family_git_state(fam, p) != "none":
             outcome = "changed:git"  # a clone appeared at the top of the cache since the survey
         elif (fam.git_disposable and p.is_dir() and not git_exempt(fam, p, idle_now)
@@ -5966,6 +5990,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
               and (g != "git" or family_git_loss(fam, p))):
             outcome = "changed:git"  # the checkout gained something to lose since the survey
         else:
+            whole_state = fam.id == CMUX_NEXT_CI_FAMILY and p in cmux_next_ci_state_roots(fam.root)
             try:
                 common = git_common_dir(p) if fam.git_disposable else ""
                 if fam.transcripts:
@@ -5987,8 +6012,9 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                     # the moment the toolchain is renamed away, so an interrupted delete cannot leave it behind
                     stale_hash = (p.parent.parent / "update-hashes" / p.name
                                   if fresh_layout == "rustup-toolchain" else None)
-                    remove(p, after_rename=None if stale_hash is None
-                           else lambda h=stale_hash: h.unlink(missing_ok=True))
+                    remove(p, after_rename=cmux_next_ci_slot_recheck(fam, p, floor=cmux_next_ci_floor_slot(fam, p))
+                           if whole_state
+                           else None if stale_hash is None else lambda h=stale_hash: h.unlink(missing_ok=True))
                     gone = True
                     if fam.id == CMUX_NEXT_CI_FAMILY and p.parent.parent.parent in tuple(
                             fam.root / kind for kind in CMUX_NEXT_RELEASE_KINDS):
@@ -5998,12 +6024,24 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                                 empty.rmdir()
                 if not fam.transcripts:
                     outcome = "reclaimed" if gone else "changed:in-use"
-                    released += i.bytes if gone else 0
+                    took = i.bytes
                     if gone and fam.id == CMUX_NEXT_CI_FAMILY:
-                        cap_left -= i.bytes
+                        if whole_state:
+                            took = max(0, took - taken_in.get(p, 0))  # its children's bytes were counted already
+                        else:
+                            taken_in[p.parent] = taken_in.get(p.parent, 0) + took
+                        cap_left -= took
+                    elif gone and fam.id == INTERRUPTED and p.parent in cmux_next_ci_state_parents(
+                            HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT):
+                        cap_left -= took  # an aside slot was part of the cache the cap measured
+                    released += took if gone else 0
                 if common:  # drop the deleted worktree's record from its repository
                     subprocess.run(["git", "--git-dir", common, "worktree", "prune"],
                                    capture_output=True, timeout=60)
+            except SlotTaken:
+                outcome = "changed:in-use"
+            except SlotNotNeeded:
+                continue  # as the stop check before the rename
             except (OSError, subprocess.SubprocessError) as e:
                 outcome = f"incomplete:{e.__class__.__name__}"
         is_sweep = halt is not None if receipt_sweep is None else receipt_sweep
@@ -6031,6 +6069,41 @@ def cmux_next_ci_dirs(home: Path | None = None) -> list[Path]:
     if not root.is_dir() or root.is_symlink():
         return []
     return [d for d in _children(root) if d.is_dir() and not d.is_symlink()]
+
+
+def cmux_next_ci_aside_busy(path: Path, opened: list[str] | frozenset[str], commands: str) -> str:
+    """For an aside tree (DELETING_PREFIX<name>-<pid>) where cmux-next state roots sit, the state's own vetoes,
+    as if it were still at <name>: its runner's job (unknown ownership refuses), a process naming it, the
+    fail-closed socket search, markers, unknown children. "" for any other aside tree."""
+    root = HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT
+    m = DELETING_RE.fullmatch(path.name)
+    if m is None or path.parent not in cmux_next_ci_state_parents(root):
+        return ""
+    original = path.with_name(path.name[len(DELETING_PREFIX):m.start(1) - 1])
+    runner = cmux_next_ci_owner(original, root)
+    if runner == OWNER_UNKNOWN:
+        return "an enrolled runner's .runner names no agent: whose cmux-next state this is is unknown"
+    if runner is not None and (why := runner_job_live(runner, commands)):
+        return why
+    if named_by(os.fspath(original), commands) or named_by(os.fspath(path), commands):
+        return "cmux-next state is referenced by a process"
+    return cmux_next_ci_tree_busy(path)
+
+
+def cmux_next_ci_state_parents(root: Path) -> list[Path]:
+    """The directories cmux_next_ci_state_roots' roots sit in (cmux-scheme, each <kind>/<key>/Release), whether
+    or not a state is left in them."""
+    if root.is_symlink() or not root.is_dir():
+        return []
+    found = [root / "cmux-scheme"]
+    for kind in CMUX_NEXT_RELEASE_KINDS:
+        if (root / kind).is_symlink():
+            continue
+        for key in _children(root / kind):
+            if not key.is_symlink() and re.fullmatch(r"[0-9a-fA-F]{8,64}", key.name):
+                found.append(key / "Release")
+    real = root.resolve()
+    return [d for d in found if d.is_dir() and not d.is_symlink() and d.resolve().is_relative_to(real)]
 
 
 def cmux_next_ci_state_roots(root: Path) -> list[Path]:
@@ -6088,14 +6161,43 @@ def runner_work_folder(runner: Path) -> Path:
     return runner / (work if isinstance(work, str) and work else "_work")
 
 
+def enrolled_runner_roster() -> tuple[dict[str, Path], bool, dict[Path, Path]]:
+    """From one read of each enrolled runner's .runner: agentName -> runner directory, whether every one named its
+    agent (while one cannot be read, mid-write, malformed or with a blank name, a state no name matches may be its),
+    and each named runner's work folder (runner_work_folder) from that same read. A .runner rewritten within a
+    job's timeout (cmux_next_ci_unowned_idle_hours) leaves the roster incomplete too, as does one removed
+    within it: a Runner.Worker started under the old name may still be on its way to the old name's state."""
+    names: dict[str, Path] = {}
+    work: dict[Path, Path] = {}
+    complete = True
+    recent = time.time() - float(POLICY["cmux_next_ci_unowned_idle_hours"]) * 3600
+    try:  # a runner whose .runner went missing just now (mid re-registration) is not known gone either
+        for runner in HOME.glob("actions-runner*"):
+            if (not runner.is_symlink() and (runner / "glaeda-hooks").is_dir()
+                    and not (runner / ".runner").is_file() and runner.stat().st_mtime > recent):
+                complete = False
+    except OSError:
+        complete = False
+    for runner in enrolled_runners():
+        try:
+            if (runner / ".runner").stat().st_mtime > recent:
+                complete = False
+        except OSError:
+            complete = False
+        config = runner_config(runner)
+        name = config.get("agentName")
+        if isinstance(name, str) and name.strip():
+            names.setdefault(name, runner)
+            folder = config.get("workFolder")
+            work[runner] = runner / (folder if isinstance(folder, str) and folder else "_work")
+        else:
+            complete = False
+    return names, complete, work
+
+
 def enrolled_runner_names() -> dict[str, Path]:
     """agentName -> runner directory for every enrolled runner."""
-    names: dict[str, Path] = {}
-    for runner in enrolled_runners():
-        name = runner_config(runner).get("agentName")
-        if isinstance(name, str):
-            names.setdefault(name, runner)
-    return names
+    return enrolled_runner_roster()[0]
 
 
 CMUX_NEXT_RELEASE_KINDS = ("dev-daily-release", "release-compile")
@@ -6108,25 +6210,40 @@ def cmux_next_ci_release_key(runner_name: str, workspace: str) -> str:
     return hashlib.sha256(f"{runner_name}\n{workspace}\n".encode()).hexdigest()[:16]
 
 
-def cmux_next_ci_release_keys() -> dict[str, Path]:
+def cmux_next_ci_release_keys(roster: tuple[dict[str, Path], bool, dict[Path, Path]] | None = None) -> dict[str, Path]:
     """Release state key -> enrolled runner, for its cmux checkout ($GITHUB_WORKSPACE: <workFolder>/cmux/cmux)
-    as given and as resolved."""
+    as given and as resolved, from one roster read (enrolled_runner_roster)."""
+    names, _, work = enrolled_runner_roster() if roster is None else roster
     keys: dict[str, Path] = {}
-    for name, runner in enrolled_runner_names().items():
-        workspace = os.fspath(runner_work_folder(runner) / "cmux/cmux")
+    for name, runner in names.items():
+        workspace = os.fspath(work[runner] / "cmux/cmux")
         for ws in {workspace, os.path.realpath(workspace)}:
             keys.setdefault(cmux_next_ci_release_key(name, ws), runner)
     return keys
 
 
+# cmux_next_ci_owner's answer while an enrolled runner's .runner cannot be read: the state may be that runner's.
+# Not None, so nothing takes the state as unowned, and every in-use veto refuses it (cmux_next_ci_busy).
+OWNER_UNKNOWN = Path("/nonexistent/glaeda-disk-owner-unknown")
+
+# state root -> the owner cmux_next_ci_busy last vetted it under. A slot's post-rename recheck holds its runner to
+# that one: a .runner rewritten in between (re-registered, renamed) would otherwise drop the old Runner.Worker.
+CMUX_NEXT_CI_VETTED_OWNER: dict[Path, Path | None] = {}
+
+
 def cmux_next_ci_owner(state: Path, root: Path) -> Path | None:
     """The enrolled runner a validated state root belongs to: cmux-scheme/<agentName>, or <kind>/<key>/Release/...
-    by its release key. None for a runner no longer enrolled here, or a shape neither names."""
+    by its release key. None for a runner no longer enrolled here, or a shape neither names; OWNER_UNKNOWN when
+    no runner matched but one's .runner could not be read in the same read."""
+    roster = enrolled_runner_roster()
+    names, complete, _ = roster
     if state.parent == root / "cmux-scheme":
-        return enrolled_runner_names().get(state.name)
-    if state.parent.parent.parent in tuple(root / kind for kind in CMUX_NEXT_RELEASE_KINDS):
-        return cmux_next_ci_release_keys().get(state.parent.parent.name)
-    return None
+        owner = names.get(state.name)
+    elif state.parent.parent.parent in tuple(root / kind for kind in CMUX_NEXT_RELEASE_KINDS):
+        owner = cmux_next_ci_release_keys(roster).get(state.parent.parent.name)
+    else:
+        return None
+    return owner if owner is not None or complete else OWNER_UNKNOWN
 
 
 def cmux_next_ci_runner(path: Path, root: Path) -> Path | None:
@@ -6149,6 +6266,108 @@ def cmux_next_ci_stale_roots(root: Path) -> list[Path]:
             if cmux_next_ci_owner(s, root) is None and now - newest_mtime(s, 2, 3000) >= idle_s]
 
 
+def cmux_next_ci_floor_slots(root: Path) -> list[Path]:
+    """Validated state roots of runners enrolled here, listed whole while the runner gate holds for disk on their
+    filesystem (FLOOR_HOLD): a slot's inputs (SourcePackages, module and compilation caches) are what a cold build
+    of that runner fetches again, and with 14 slots at 4-11 GiB each they are most of the cache. They go last, least
+    recently used first, only up to the floor hold's stop, and under every in-use veto (cmux_next_ci_busy: the
+    runner's Runner.Worker, a process naming or open in it, a marker, an unknown child). cmux14, 2026-10-25: 115
+    GiB of cmux-next-ci, 10.8 GiB free under a 30 GiB floor, Swift compiles refused."""
+    if CMUX_NEXT_CI_DRAIN:
+        return []  # a drain takes generated output only (cmux_next_ci_floor_slot): never a slot's inputs
+    try:
+        if root.stat().st_dev not in FLOOR_HOLD:
+            return []
+    except OSError:
+        return []
+    return [s for s in cmux_next_ci_state_roots(root) if cmux_next_ci_owner(s, root) is not None]
+
+
+def floor_stop_unmet(path: Path) -> bool | None:
+    """Whether free space on PATH's filesystem is still under the floor hold's stop; None when it cannot be read
+    (falsy, so nothing more is taken for the floor, and never proof the stop was met)."""
+    try:
+        stop = FLOOR_HOLD.get(path.parent.stat().st_dev)
+        return stop is not None and free_bytes(path.parent)[0] < stop
+    except OSError:
+        return None
+
+
+RENAME_EXCL = 0x4  # macOS renamex_np: fail with EEXIST if the destination exists
+RENAME_NOREPLACE = 0x1  # Linux renameat2
+
+
+def rename_noreplace(src: Path, dst: Path) -> None:
+    """Rename SRC to DST atomically, failing with EEXIST when anything is at DST, even an empty directory (which
+    os.rename would replace). Raises OSError(ENOTSUP) where the platform has no such rename."""
+    import ctypes
+    import ctypes.util
+    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    a, b = os.fsencode(src), os.fsencode(dst)
+    if hasattr(libc, "renamex_np"):
+        rc = libc.renamex_np(a, b, ctypes.c_uint(RENAME_EXCL))
+    elif hasattr(libc, "renameat2"):
+        rc = libc.renameat2(-100, a, -100, b, ctypes.c_uint(RENAME_NOREPLACE))  # AT_FDCWD
+    else:
+        raise OSError(errno.ENOTSUP, "no atomic no-replace rename here")
+    if rc != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err), os.fspath(dst))
+
+
+class SlotTaken(OSError):
+    """A runner's job took its slot between the last check and the rename: the slot was put back, or, when a new
+    slot already stands at its path, left aside under its deleting name. remove() deletes neither; the
+    interrupted-deletions family finishes an aside tree only once this pid is gone and nothing has it open."""
+
+
+class SlotNotNeeded(OSError):
+    """Free reached the floor hold's stop while the post-rename evidence was taken: the slot was put back."""
+
+
+def cmux_next_ci_slot_recheck(fam: Family, path: Path, floor: bool = True):
+    """after_rename for a whole slot. A slot is only its own runner's, and that runner's Runner.Worker shows in ps
+    long before its build reaches the slot, so the fresh ps right before the rename already keeps a job's slot;
+    this closes the rest: if the runner took a job, or anything is open in the detached tree, put it back. Free
+    space is read again after that evidence too: a slot no longer needed for the floor hold goes back as well
+    (FLOOR: the floor hold took it; a stale root the cap takes whole has no stop)."""
+    doomed = path.with_name(f"{DELETING_PREFIX}{path.name}-{os.getpid()}")
+    vetted = CMUX_NEXT_CI_VETTED_OWNER.get(path, OWNER_UNKNOWN)  # never vetted: whose it is is unknown
+
+    def recheck() -> None:
+        runner = cmux_next_ci_owner(path, fam.root)
+        try:
+            opened, cmds = process_evidence()
+        except NoEvidence:
+            opened, cmds = None, ""
+        taken = (opened is None or OWNER_UNKNOWN in (runner, vetted) or runner != vetted
+                 or (runner is not None and runner_job_live(runner, cmds))
+                 or in_cwd(os.fspath(doomed), open_index(opened)) or named_by(os.fspath(path), cmds)
+                 or named_by(os.fspath(doomed), cmds) or bool(cmux_next_ci_tree_busy(doomed)))
+        unmet = floor_stop_unmet(path) if floor else True
+        if not taken and unmet:
+            return  # nobody's, and still needed: remove() deletes it
+        try:
+            rename_noreplace(doomed, path)
+        except OSError as e:
+            if not taken and unmet is False and e.errno in (errno.EEXIST, errno.ENOTEMPTY) and os.path.lexists(path):
+                return  # the floor was met, but a new slot stands at the path: the detached one is nobody's
+            # in use, or the rename back failed for another reason: the detached tree stays aside, never deleted
+            # from here (interrupted-deletions finishes it once this pid is gone and its own vetoes pass)
+            raise (SlotTaken if taken else SlotNotNeeded)(
+                f"{path.name}: could not be put back ({e.strerror}); left aside as {doomed.name}")
+        if taken:
+            raise SlotTaken(f"{path.name}: its runner took a job; put back")
+        raise SlotNotNeeded(f"{path.name}: free reached the floor hold's stop; put back")
+    return recheck
+
+
+def cmux_next_ci_floor_slot(fam: Family, path: Path) -> bool:
+    """Whether PATH is an enrolled runner's whole cmux-next state root, listed only under the floor hold."""
+    return (fam.id == CMUX_NEXT_CI_FAMILY and not CMUX_NEXT_CI_DRAIN and path in cmux_next_ci_state_roots(fam.root)
+            and cmux_next_ci_owner(path, fam.root) is not None)
+
+
 def cmux_next_ci_generated_paths(root: Path, whole_stale: bool = False) -> list[Path]:
     """Generated children eligible for the cmux-next retention family.
 
@@ -6169,6 +6388,8 @@ def cmux_next_ci_generated_paths(root: Path, whole_stale: bool = False) -> list[
                 continue
             if child.name in CMUX_NEXT_CI_GENERATED_NAMES and (child.is_dir() or child.is_file()):
                 found.append(child)
+    # its generated children are listed as well and go first (apply's order); the slot itself goes after them
+    found.extend(slot for slot in cmux_next_ci_floor_slots(root) if slot not in stale)
     return found
 
 
@@ -6259,14 +6480,62 @@ def cmux_next_ci_busy(fam: Family, path: Path, opened: list[str] | frozenset[str
     state = cmux_next_ci_state_for(path, fam.root)
     if state is None and cmux_next_ci_over() and path in cmux_next_ci_stale_roots(fam.root):
         state = path  # an unowned state root the cap takes whole: the same vetoes, on the root itself
+    if state is None and FLOOR_HOLD and cmux_next_ci_floor_slot(fam, path):
+        state = path  # an enrolled runner's slot the floor hold takes whole: the same vetoes, its runner's job first
     if state is None:
         return "cmux-next state root is no longer validated"
-    if (runner := cmux_next_ci_runner(path, fam.root)) is not None and (why := runner_job_live(runner, commands)):
+    runner = cmux_next_ci_owner(state, fam.root)
+    CMUX_NEXT_CI_VETTED_OWNER[state] = runner
+    if runner == OWNER_UNKNOWN:
+        return "an enrolled runner's .runner names no agent: whose cmux-next state this is is unknown"
+    if runner is not None and (why := runner_job_live(runner, commands)):
         return why
     state_text = os.fspath(state)
     if in_cwd(state_text, opened) or named_by(state_text, commands):
         return "cmux-next state is referenced by a process"
-    if holds_socket(state):
+    return cmux_next_ci_tree_busy(state)
+
+
+# The tools' own caches inside a state (Xcode's module, compilation and SDK stat caches, SwiftPM's packages): wide
+# (thousands of entries in one directory) and written only by the compiler and SwiftPM, never a socket's home.
+CMUX_NEXT_CI_TOOL_CACHES = frozenset({"ModuleCache.noindex", "SDKStatCaches.noindex", "SDKExplicitPrecompiledModules",
+                                      "CompilationCache.noindex", "SourcePackages"})
+
+
+def cmux_next_ci_holds_socket(state: Path, budget: int = 3000) -> bool:
+    """holds_socket for a cmux-next state, two levels down as holds_socket, failing closed: a tree it cannot
+    finish within `budget` entries, or a directory it cannot read, counts as holding one. The tools' caches (CMUX_NEXT_CI_TOOL_CACHES) are not
+    listed, so a real slot's width alone never makes it busy."""
+    frontier = [state]
+    for depth in range(2):
+        nxt: list[Path] = []
+        for d in frontier:
+            try:
+                with os.scandir(d) as it:
+                    for e in it:
+                        budget -= 1
+                        if budget < 0:
+                            return True
+                        try:
+                            st = e.stat(follow_symlinks=False)
+                        except FileNotFoundError:
+                            continue
+                        if stat.S_ISSOCK(st.st_mode):
+                            return True
+                        if stat.S_ISDIR(st.st_mode) and not (depth == 0 and e.name in CMUX_NEXT_CI_TOOL_CACHES):
+                            nxt.append(Path(e.path))
+            except FileNotFoundError:
+                continue  # gone since it was listed
+            except OSError:
+                return True  # unreadable: a socket in it cannot be ruled out
+        frontier = nxt
+    return False
+
+
+def cmux_next_ci_tree_busy(state: Path) -> str:
+    """cmux_next_ci_busy's vetoes read from the tree itself: a socket, an activity marker in it or beside it,
+    a child the family does not know. Also read on a slot's detached tree (cmux_next_ci_slot_recheck)."""
+    if cmux_next_ci_holds_socket(state):
         return "cmux-next state holds a socket"
     for ancestor in (state, state.parent):
         for entry in _children(ancestor):
