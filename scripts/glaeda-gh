@@ -856,6 +856,23 @@ def brief(check: dict) -> dict:
     return {k: check.get(k) for k in ("name", "workflow", "conclusion", "required", "url")}
 
 
+def outranks(new: dict, new_order: tuple, old: dict, old_order: tuple) -> bool:
+    """Whether `new` replaces `old`, a check of the same workflow and name. Mostly the newer attempt, but a
+    job can have a same-named twin in its own run (the compile routed to one runner, its skipped twin on
+    another): a job that ran beats a skipped one, and a queued or running job is never replaced by a
+    cancelled one, since a newer attempt only starts once the older one has finished."""
+    skipped = [(c.get("conclusion") or "").upper() == "SKIPPED" for c in (new, old)]
+    if skipped[0] != skipped[1]:
+        return skipped[1]
+    live = [c.get("status") not in {"COMPLETED", None} for c in (new, old)]
+    cancelled = [(c.get("conclusion") or "").upper() == "CANCELLED" for c in (new, old)]
+    if live[1] and cancelled[0]:
+        return False
+    if live[0] and cancelled[1]:
+        return True
+    return new_order >= old_order
+
+
 def parse_pr(node: dict) -> dict:
     commits = ((node.get("commits") or {}).get("nodes") or [{}])
     rollup = ((commits[0] or {}).get("commit") or {}).get("statusCheckRollup") or {}
@@ -898,15 +915,19 @@ def parse_pr(node: dict) -> dict:
         # a rerun leaves the old attempt in the list (cancelled, then passed): keep the newest per
         # (workflow, name), so same-named jobs in different workflows stay separate
         ident = f"{check['workflow'] or ''}\0{check['name']}"
-        if ident not in latest or order >= latest[ident][0]:
+        if ident not in latest or outranks(check, order, *reversed(latest[ident])):
             if ident in latest:
                 superseded.append(latest[ident][1])
             latest[ident] = (order, check)
         else:
             superseded.append(check)
     checks = [check for _, check in latest.values()]
-    # only the ones that would have counted against the PR are worth naming
-    superseded = [brief(c) for c in superseded if (c.get("conclusion") or "").upper() not in PASSED][:20]
+    # only the ones that would have counted against the PR are worth keeping. One that ran nothing (GitHub
+    # stamps it started and completed at once), such as a twin cancelled before it began, stays as evidence
+    # for check_verdict (the rollup still counts it) but is marked so status never names it: it has no
+    # error to chase, whichever of the pair has the higher id
+    superseded = [{**brief(c), "ranNothing": bool(c.get("completedAt") and c.get("startedAt") == c.get("completedAt"))}
+                  for c in superseded if (c.get("conclusion") or "").upper() not in PASSED][:20]
     base = node.get("baseRef") or {}
     required = set((base.get("branchProtectionRule") or {}).get("requiredStatusCheckContexts") or [])
     for rule in ((base.get("rules") or {}).get("nodes") or []):
@@ -975,10 +996,11 @@ def jobs_attempt(jobs: list[dict] | None) -> int:
 def newest_verdict(found: list[tuple[int, str, str]]) -> tuple[str, str]:
     """(status, conclusion) of a check from its runs (id, status, conclusion): the newest run with a verdict,
     so a later skipped, cancelled or still-running run never hides an earlier failure; the newest run when
-    none has a verdict yet."""
+    none has a verdict yet, but not a skipped twin while a run of that name is still going."""
     found = sorted(found)
     verdicts = [r for r in found if r[1] == "completed" and r[2] in VERDICTS]
-    _, status, conclusion = verdicts[-1] if verdicts else found[-1]
+    ran = [r for r in found if r[2] != "skipped"] or found
+    _, status, conclusion = verdicts[-1] if verdicts else ran[-1]
     return status, conclusion
 
 
@@ -3070,9 +3092,10 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
                    else "its run was cancelled while a job was still queued")
             lines.append(f"  held: {label(c)}{steps_note(c)}: {why}; "
                          f"pending up to {int(grace)}s for the re-run  {c.get('url') or ''}".rstrip())
-        for c in (data.get("superseded") or [])[:10]:
+        for c in [c for c in data.get("superseded") or [] if not c.get("ranNothing")][:10]:
             optional = " (not required)" if marked and not c.get("required") else ""
-            lines.append(f"  superseded: {label(c)} {outcome(c.get('conclusion'))}{optional}, "
+            lines.append(f"  superseded: {label(c)} {outcome(c.get('conclusion')) if c.get('conclusion') else 'pending'}"
+                         f"{optional}, "
                          "replaced by a newer attempt or run (not counted)")
         lines.append(str(data.get("url") or ""))
     elif kind == "comment":

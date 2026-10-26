@@ -1559,6 +1559,54 @@ class ClientTest(Base):
         alone = gg.parse_pr(pr_node(2, rollup="FAILURE", checks=old))
         self.assertEqual(gg.verdict("pr", alone, "green"), 1)
 
+    def test_a_skipped_twin_in_the_same_run_is_not_a_failed_attempt(self) -> None:
+        # manaflow-ai/cmux run 40341221417 (PR #25393): "cmux-next Release compile (Xcode 26)" has two jobs in
+        # one run. The real one (121636522702, blacksmith macOS) was queued; its twin (121636524434, ubuntu)
+        # was skipped with no steps and has the higher id. Status called the queued job a failed attempt
+        # replaced by a newer one, and counted the skipped twin as the check.
+        name = "cmux-next Release compile (Xcode 26)"
+        suite = {"conclusion": None, "workflowRun": {"databaseId": 40341221417, "workflow": {"name": "cmux-next"}}}
+        real = {**check_run(name, "QUEUED", None), "databaseId": 121636522702, "startedAt": None,
+                "detailsUrl": "https://ci/job/121636522702", "checkSuite": suite}
+        twin = {**check_run(name, conclusion="SKIPPED"), "databaseId": 121636524434,
+                "startedAt": "2026-10-26T14:37:31Z", "completedAt": "2026-10-26T14:37:31Z",
+                "detailsUrl": "https://ci/job/121636524434", "checkSuite": suite}
+        for order in ([real, twin], [twin, real]):
+            data = gg.parse_pr(pr_node(1, rollup="PENDING", checks=order))
+            self.assertEqual([(c["status"], c["url"]) for c in data["checks"]],
+                             [("QUEUED", "https://ci/job/121636522702")])
+            self.assertEqual(data["superseded"], [])
+            self.assertIsNone(gg.verdict("pr", data))
+            text = gg.summary("pr:o/r#1", {"data": data})
+            self.assertNotIn("superseded", text)
+            self.assertIn("1 pending", text)
+        # The real job's result is what counts once it finishes, whichever id is higher.
+        failed = {**real, "status": "COMPLETED", "conclusion": "FAILURE"}
+        data = gg.parse_pr(pr_node(1, rollup="FAILURE", checks=[failed, twin]))
+        self.assertEqual(gg.verdict("pr", data), 1)
+        passed = {**real, "status": "COMPLETED", "conclusion": "SUCCESS"}
+        self.assertEqual(gg.verdict("pr", gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[twin, passed]))), 0)
+        # A twin cancelled before it started does not replace the queued job either.
+        cancelled = {**twin, "conclusion": "CANCELLED"}
+        # It stays as evidence (GitHub's rollup still counts it), but status never names it, whichever
+        # of the pair has the lower id.
+        live = {**real, "databaseId": 121636524435}
+        for order in ([real, cancelled], [cancelled, real], [live, cancelled], [cancelled, live]):
+            data = gg.parse_pr(pr_node(1, rollup="PENDING", checks=order))
+            self.assertEqual([c["status"] for c in data["checks"]], ["QUEUED"])
+            self.assertEqual([c["ranNothing"] for c in data["superseded"]], [True])
+            self.assertNotIn("superseded", gg.summary("pr:o/r#1", {"data": data}))
+            # Past 100 checks GitHub's FAILURE rollup may be that twin: the queued job is waited for.
+            self.assertIsNone(gg.check_verdict({**data, "checkState": "FAILURE", "checksTruncated": True}, "done"))
+            self.assertIsNone(gg.check_verdict({**data, "checkState": "FAILURE", "checksTruncated": True}, "green"))
+        # A pending check that is superseded reads as pending, never as failed.
+        line = gg.summary("pr:o/r#1", {"data": {**data, "superseded": [gg.brief(data["checks"][0])]}})
+        self.assertIn(f"superseded: cmux-next / {name} pending", line)
+        # The head reading picks the running job over the skipped twin too.
+        self.assertEqual(gg.newest_verdict([(121636522702, "queued", ""), (121636524434, "completed", "skipped")]),
+                         ("queued", ""))
+        self.assertEqual(gg.newest_verdict([(1, "completed", "skipped")]), ("completed", "skipped"))
+
     def test_same_name_in_two_workflows_stays_separate(self) -> None:
         def in_workflow(check: dict, workflow: str, db: int) -> dict:
             return {**check, "databaseId": db, "checkSuite": {"workflowRun": {"workflow": {"name": workflow}}}}
