@@ -548,7 +548,9 @@ class HookTest(unittest.TestCase):
 
     def test_job_completed_disk_pass_runs_detached_and_bounded(self) -> None:
         """job-completed held its runner up to DISK_TIMEOUT_S (120 s) on glaeda-disk: "Complete runner" took 121-124 s
-        on main's macOS jobs, and dependent jobs waited for it. The pass now runs detached, still bounded."""
+        on main's macOS jobs, and dependent jobs waited for it. The pass now runs detached, still bounded, by its own
+        bound: nothing waits on it, and cut at DISK_TIMEOUT_S every pass on cmux14 under the floor (192-685 s whole) was
+        killed holding evict.lock while the LaunchAgent's pass skipped as busy for over an hour."""
         marker = self.dir / "disk-pass"
         slow = make_executable(self.dir / "glaeda-disk-slow", "import os, pathlib, sys, time\n"
                                f"pathlib.Path({os.fspath(marker)!r}).write_text(' '.join([str(os.getpid()), "
@@ -558,7 +560,8 @@ class HookTest(unittest.TestCase):
         start = time.monotonic()
         result = self.run_hook("job-completed", None, None, "--disk", os.fspath(slow),
                                "--state-dir", os.fspath(self.dir / "state"),
-                               env={"GLAEDA_RUNNER_DISK_TIMEOUT": "20", "RUNNER_TRACKING_ID": "github_job"})
+                               env={"GLAEDA_RUNNER_DISK_TIMEOUT": "1", hook.BACKGROUND_DISK_TIMEOUT_ENV: "8",
+                                    "RUNNER_TRACKING_ID": "github_job"})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertLess(time.monotonic() - start, 15, "job-completed waited on glaeda-disk")
         self.assertIn("glaeda-disk started in the background", result.stdout)
@@ -576,10 +579,22 @@ class HookTest(unittest.TestCase):
         self.assertEqual(tracking, "-", "the runner's orphan cleanup would kill a pass carrying RUNNER_TRACKING_ID")
         self.assertNotEqual(int(sid), os.getsid(0), "the pass must leave the runner's session")
         self.assertTrue(hook.pid_alive(int(pid)), "the pass outlives job-completed")
-        deadline = time.monotonic() + 40  # bounded: killed at GLAEDA_RUNNER_DISK_TIMEOUT, not left for 60 s
+        time.sleep(max(0.0, start + 3 - time.monotonic()))
+        self.assertTrue(hook.pid_alive(int(pid)), "the detached pass was cut at the hooks' GLAEDA_RUNNER_DISK_TIMEOUT")
+        deadline = start + 20  # bounded: killed at its own 8 s bound, not left for 60 s
         while hook.pid_alive(int(pid)) and time.monotonic() < deadline:
             time.sleep(0.1)
         self.assertFalse(hook.pid_alive(int(pid)), "the detached pass ran past its timeout")
+
+    def test_job_completed_disk_pass_outlasts_a_whole_pass(self) -> None:
+        """By default the detached pass gets longer than the slowest whole pass measured (685 s on cmux14)."""
+        self.assertGreater(hook.BACKGROUND_DISK_TIMEOUT_S, 685)
+        quick = make_executable(self.dir / "glaeda-disk-quick", "import sys\n")
+        result = self.run_hook("job-completed", None, None, "--disk", os.fspath(quick),
+                               "--state-dir", os.fspath(self.dir / "state"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"glaeda-disk started in the background (bounded by {hook.BACKGROUND_DISK_TIMEOUT_S:g} s)",
+                      result.stdout)
 
     # ------------------------------------------------------------ host lock, reservation, disk floor
 
