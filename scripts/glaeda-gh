@@ -138,6 +138,7 @@ from http.client import HTTPException  # the http() helper below shadows the `ht
 import json
 import math
 import os
+import plistlib
 import re
 import shlex
 import shutil
@@ -2546,11 +2547,34 @@ def under_service() -> bool:
 
 
 def service_loaded() -> bool:
-    """Whether this user's glaeda-gh service is loaded (launchd) or enabled or running (systemd)."""
+    """Whether this user's glaeda-gh service is loaded (launchd) or enabled or running (systemd), or about to be
+    (a restart in progress). Between a restart's bootout and its bootstrap nothing is loaded, and a shell serve
+    started then would take daemon.lock from the service, so the probes run holding restart.lock (cmd_restart):
+    a restart that holds it counts as loaded, and none can begin while they run."""
+    try:
+        BASE.mkdir(parents=True, exist_ok=True, mode=0o700)
+        guard = open(BASE / "restart.lock", "a+")
+    except OSError:
+        return True  # cannot tell whether a restart is in progress
+    with guard:
+        return not try_lock(guard) or service_probed()
+
+
+def service_probed() -> bool:
+    """service_loaded's probes, without restart.lock."""
     if sys.platform == "darwin":
-        # the LaunchAgent, or the same label as a system LaunchDaemon on a headless Mac
-        probes = [["launchctl", "print", f"gui/{os.getuid()}/{LAUNCH_LABEL}"],
-                  ["launchctl", "print", f"system/{LAUNCH_LABEL}"]]
+        # the LaunchAgent, the copy restart loads while nobody is logged in (launchd_domain), or the
+        # same label as a system LaunchDaemon on a headless Mac. Only a definite "not there" (113, or 125 for a
+        # gui domain nobody is logged in to) counts as not loaded: a probe that cannot tell refuses the shell serve
+        for target, absent in ((f"gui/{os.getuid()}/{LAUNCH_LABEL}", (NOT_LOADED, NO_GUI_DOMAIN)),
+                               (f"user/{os.getuid()}/{LAUNCH_LABEL}", (NOT_LOADED,)),
+                               (f"system/{LAUNCH_LABEL}", (NOT_LOADED,))):
+            try:
+                if run_bounded(["launchctl", "print", target], 10).returncode not in absent:
+                    return True
+            except (OSError, subprocess.TimeoutExpired):
+                return True
+        return False
     else:
         probes = [["systemctl", "--user", "--quiet", "is-enabled", SYSTEMD_UNIT],
                   ["systemctl", "--user", "--quiet", "is-active", SYSTEMD_UNIT]]
@@ -2613,9 +2637,39 @@ LAUNCHCTL_ERROR_5 = (f"If launchctl answers \"5: Input/output error\": from boot
                      f"~/Library/LaunchAgents/{LAUNCH_LABEL}.plist. Never run glaeda-gh serve yourself")
 
 
-def start_hint(restart: bool = False) -> str:
+def start_hint(restart: bool = False, domain: str | None = None) -> str:
     """How to (re)start the daemon here, including when its service was never loaded."""
     if sys.platform == "darwin":
+        domain = domain or launchd_domain()
+        if domain is None:
+            return DOMAIN_UNKNOWN_HINT[0].upper() + DOMAIN_UNKNOWN_HINT[1:]
+        if domain.startswith("user/"):
+            try:
+                system = system_daemon_loaded()
+            except (OSError, subprocess.TimeoutExpired):
+                system = None
+            if system is None:
+                return (f"nobody is logged in here and {SYSTEM_UNKNOWN_HINT}, which loads a Background copy in "
+                        f"user/$(id -u). Never run glaeda-gh serve yourself")
+            if system:
+                return SYSTEM_DAEMON_HINT[0].upper() + SYSTEM_DAEMON_HINT[1:] + ". Never run glaeda-gh serve yourself"
+            return (f"nobody is logged in here, so gui/$(id -u) does not exist and the daemon runs from a Background "
+                    f"copy of its LaunchAgent in user/$(id -u): launchctl bootout user/$(id -u)/{LAUNCH_LABEL}; "
+                    f"launchctl bootstrap user/$(id -u) {background_copy_path()} (glaeda-gh restart writes that copy). "
+                    f"Logging the user in, or a reboot with automatic login, brings the LaunchAgent back. "
+                    f"Never run glaeda-gh serve yourself. Its log is ~/Library/Logs/glaeda-gh.err")
+        try:
+            system = system_daemon_loaded() is not False  # loaded, or launchctl cannot tell
+            copy = not unloaded(f"user/{os.getuid()}/{LAUNCH_LABEL}")
+        except (OSError, subprocess.TimeoutExpired):
+            system = copy = True
+        if system or copy:
+            return (f"check first that neither the system LaunchDaemon (sudo launchctl print system/{LAUNCH_LABEL}) "
+                    f"nor the Background copy of a logged-out restart (launchctl print "
+                    f"user/$(id -u)/{LAUNCH_LABEL}) is loaded: either runs the daemon, and the LaunchAgent must "
+                    f"not start beside it. Restart a loaded system daemon as root (sudo launchctl kickstart -k "
+                    f"system/{LAUNCH_LABEL}); boot a loaded copy out (launchctl bootout user/$(id -u)/{LAUNCH_LABEL}) "
+                    f"and run glaeda-gh restart again. Never run glaeda-gh serve yourself")
         if restart:
             return f"launchctl kickstart -k gui/$(id -u)/{LAUNCH_LABEL}. {LAUNCHCTL_ERROR_5}"
         return (f"launchctl kickstart gui/$(id -u)/{LAUNCH_LABEL} (if launchctl cannot find the service, load it: "
@@ -5558,10 +5612,90 @@ def cmd_gh_install_shim(print_only: bool) -> int:
     return EXIT_OK
 
 
-def launchd_state() -> str | None:
-    """The LaunchAgent's `state = ...` line (running, spawn scheduled, not running), or None."""
+# launchctl's answer for a gui/UID domain that does not exist: "125: Domain does not support specified
+# action". A Mac whose user was logged out (cmux16, 2026-10-24: the console sat at the login window with
+# no reboot to log it back in) has no gui domain, so its LaunchAgent cannot load there at all.
+NO_GUI_DOMAIN = 125
+
+
+def launchd_domain() -> str | None:
+    """gui/UID while this user has a login session; user/UID when launchd says there is none; None when
+    launchctl cannot tell (any other answer, or none): callers then change nothing."""
+    gui = f"gui/{os.getuid()}"
     try:
-        result = run_bounded(["launchctl", "print", f"gui/{os.getuid()}/{LAUNCH_LABEL}"], 10)
+        code = run_bounded(["launchctl", "print", gui], 10).returncode
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return gui if code == 0 else f"user/{os.getuid()}" if code == NO_GUI_DOMAIN else None
+
+
+DOMAIN_UNKNOWN_HINT = (f"launchctl could not say whether anyone is logged in here (launchctl print gui/$(id -u) "
+                       f"answered neither 0 nor {NO_GUI_DOMAIN}), so nothing was started or stopped: run "
+                       f"glaeda-gh restart again, and if it persists check launchctl print gui/$(id -u), "
+                       f"launchctl print user/$(id -u)/{LAUNCH_LABEL} and sudo launchctl print "
+                       f"system/{LAUNCH_LABEL} by hand. Never run glaeda-gh serve yourself")
+
+
+def background_copy_path() -> Path:  # read BASE at call time: tests move it
+    return BASE / f"{LAUNCH_LABEL}.background.plist"
+
+
+def background_plist() -> str:
+    """The LaunchAgent's plist, as a copy the user domain loads. launchd refuses an Aqua job there
+    ("5: Input/output error"); the same job marked Background runs. The LaunchAgent stays the one
+    source: the copy is rewritten from it on every user-domain restart and lives only until the next reboot."""
+    source = Path.home() / "Library/LaunchAgents" / f"{LAUNCH_LABEL}.plist"
+    with open(source, "rb") as handle:
+        job = plistlib.load(handle)
+    if not isinstance(job, dict):
+        raise ValueError(f"{source} is a plist {type(job).__name__}, not a job")
+    job["LimitLoadToSessionType"] = "Background"
+    BASE.mkdir(parents=True, exist_ok=True, mode=0o700)
+    copy = background_copy_path()
+    # launchctl refuses a job file group or others can write, and a umask of 002 would make it one; a rename
+    # also leaves an older copy's mode behind
+    part = copy.with_name(copy.name + ".part")
+    fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as handle:
+        os.fchmod(handle.fileno(), 0o600)
+        plistlib.dump(job, handle)
+    os.replace(part, copy)
+    return os.fspath(copy)
+
+
+# launchctl print's answer for a service its domain does not have (measured on cmux16 and cmux17, macOS 27, in
+# the user, system and gui domains). Any other failure says nothing either way, so callers fail closed on it.
+NOT_LOADED = 113
+
+
+def unloaded(target: str) -> bool:
+    """Whether launchctl says TARGET (domain/label) is not loaded; False when it is, or when it cannot tell."""
+    return run_bounded(["launchctl", "print", target], 10).returncode == NOT_LOADED
+
+
+def system_daemon_loaded() -> bool | None:
+    """Whether a headless Mac's system LaunchDaemon with the service's label is loaded (service_loaded): None
+    when launchctl's answer is neither loaded (0) nor not loaded (113)."""
+    code = run_bounded(["launchctl", "print", f"system/{LAUNCH_LABEL}"], 10).returncode
+    return True if code == 0 else False if code == NOT_LOADED else None
+
+
+SYSTEM_UNKNOWN_HINT = (f"launchctl could not say whether the system LaunchDaemon system/{LAUNCH_LABEL} is loaded: "
+                       f"check with sudo launchctl print system/{LAUNCH_LABEL} before starting anything. If it is "
+                       f"loaded: sudo launchctl kickstart -k system/{LAUNCH_LABEL}; if not: glaeda-gh restart")
+
+
+SYSTEM_DAEMON_HINT = (f"the system LaunchDaemon system/{LAUNCH_LABEL} runs the daemon on this headless Mac; restart "
+                      f"it as root: sudo launchctl kickstart -k system/{LAUNCH_LABEL}")
+
+
+def launchd_state(domain: str | None = None) -> str | None:
+    """The service's `state = ...` line (running, spawn scheduled, not running), or None."""
+    domain = domain or launchd_domain()
+    if domain is None:
+        return None
+    try:
+        result = run_bounded(["launchctl", "print", f"{domain}/{LAUNCH_LABEL}"], 10)
     except (OSError, subprocess.TimeoutExpired):
         return None
     if result.returncode != 0:
@@ -5578,25 +5712,79 @@ def restart_service(hung: bool) -> tuple[bool, str]:
         argv = ["systemctl", "--user", "restart" if hung else "start", SYSTEMD_UNIT]
         result = run_bounded(argv, SUBPROCESS_DEADLINE)
         return result.returncode == 0, " ".join(argv)
-    target = f"gui/{os.getuid()}/{LAUNCH_LABEL}"
-    if not hung and launchd_state() == "spawn scheduled":
-        return True, "nothing: launchd has already scheduled the respawn"
+    domain = launchd_domain()
+    if domain is None:
+        # booting a copy out, or loading one, on a guess about the login session could leave no daemon at all
+        return False, "nothing: " + DOMAIN_UNKNOWN_HINT
+    target = f"{domain}/{LAUNCH_LABEL}"
+    # A headless Mac's system LaunchDaemon (service_loaded) runs the daemon there: neither a copy nor the
+    # LaunchAgent may start beside it, whether or not someone is logged in
+    system = system_daemon_loaded()
+    if system is None:
+        return False, "nothing: " + SYSTEM_UNKNOWN_HINT
+    if system:
+        return False, "nothing: " + SYSTEM_DAEMON_HINT
+    if domain.startswith("user/"):
+        # Always reload, never kickstart and never wait on a scheduled respawn: either would keep running a copy
+        # of an older LaunchAgent
+        try:
+            plist = background_plist()
+        except Exception as error:  # OSError, plistlib's and expat's parse errors, a plist that is not a job
+            return False, f"no Background copy for {domain}: {type(error).__name__}: {error}"
+        if launchd_domain() != domain:
+            return False, "nothing: someone logged in or out while restarting; run glaeda-gh restart again"
+        loaded = reload_job(target, domain, plist)
+        how = (f"launchctl bootout and bootstrap {target} from {plist} "
+               f"(nobody is logged in, so gui/{os.getuid()} does not exist)")
+        return loaded == 0, how + ("" if loaded == 0 else f" (bootstrap exit {loaded})")
+    # Logged in again: the copy a logged-out restart loaded would keep a second KeepAlive daemon (waiting on
+    # daemon.lock behind this one) and is what a hung-holder stop would hit first, so it goes now
+    if launchd_domain() != domain:
+        return False, "nothing: someone logged in or out while restarting; run glaeda-gh restart again"
+    gone, dropped = drop_background_copy()
+    if not gone:
+        return False, dropped + f"; not starting {target} beside it"
+    if not hung and launchd_state(domain) == "spawn scheduled":
+        return True, dropped + "nothing: launchd has already scheduled the respawn"
     argv = ["launchctl", "kickstart"] + (["-k"] if hung else []) + [target]
     result = run_bounded(argv, SUBPROCESS_DEADLINE)
     if result.returncode == 0:
-        return True, " ".join(argv)
+        return True, dropped + " ".join(argv)
     # 5 (launchd reported "spawn failed") or 113 (not loaded): unload and load it, once, here
     plist = os.fspath(Path.home() / "Library/LaunchAgents" / f"{LAUNCH_LABEL}.plist")
+    loaded = reload_job(target, domain, plist)
+    how = f"{dropped}{' '.join(argv)} (exit {result.returncode}), then launchctl bootout and bootstrap"
+    return loaded == 0, how + ("" if loaded == 0 else f" (bootstrap exit {loaded})")
+
+
+def reload_job(target: str, domain: str, plist: str) -> int:
+    """launchctl bootout TARGET, then bootstrap PLIST into DOMAIN; bootstrap's exit code."""
     run_bounded(["launchctl", "bootout", target], SUBPROCESS_DEADLINE)
     # bootout can return before the job is torn down, and bootstrap answers 5 while it is still loaded
     deadline = time.monotonic() + BOOTSTRAP_RETRY
     while True:
-        loaded = run_bounded(["launchctl", "bootstrap", f"gui/{os.getuid()}", plist], SUBPROCESS_DEADLINE)
+        loaded = run_bounded(["launchctl", "bootstrap", domain, plist], SUBPROCESS_DEADLINE)
         if loaded.returncode == 0 or time.monotonic() >= deadline:
-            break
+            return loaded.returncode
         time.sleep(1)
-    how = f"{' '.join(argv)} (exit {result.returncode}), then launchctl bootout and bootstrap"
-    return loaded.returncode == 0, how + ("" if loaded.returncode == 0 else f" (bootstrap exit {loaded.returncode})")
+
+
+def drop_background_copy() -> tuple[bool, str]:
+    """Boot out the user-domain copy if one is loaded. (no copy is left loaded, what was done: a prefix for
+    restart's report, or why the copy is still there)."""
+    copy = f"user/{os.getuid()}/{LAUNCH_LABEL}"
+    if unloaded(copy):
+        return True, ""
+    out = run_bounded(["launchctl", "bootout", copy], SUBPROCESS_DEADLINE)
+    # bootout can return before the job is torn down (reload_job): it is gone when print says it is not loaded,
+    # and a print that cannot tell keeps the LaunchAgent off like a copy still there
+    deadline = time.monotonic() + BOOTSTRAP_RETRY
+    while not unloaded(copy):
+        if time.monotonic() >= deadline:
+            return False, (f"launchctl bootout {copy} (the Background copy from a logged-out restart) exited "
+                           f"{out.returncode} and it is still loaded after {BOOTSTRAP_RETRY}s")
+        time.sleep(1)
+    return True, f"launchctl bootout {copy} (the Background copy from a logged-out restart), then "
 
 
 def cmd_restart(force: bool = False) -> int:
