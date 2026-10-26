@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,12 +33,13 @@ class PruneTest(unittest.TestCase):
         self.root.mkdir()
         self.lock = Path(self.tmp.name) / "host.lock"
         self.lock.write_text("")
-        self.saved = (fp.ROOT, fp.HOST_LOCK, fp.running_commands)
+        self.saved = (fp.ROOT, fp.HOST_LOCK, fp.running_commands, fp.reserved_above_floor)
         fp.ROOT, fp.HOST_LOCK = self.root, self.lock
         fp.running_commands = lambda: ["/usr/libexec/something", "zsh"]
+        fp.reserved_above_floor = lambda: ""
 
     def tearDown(self) -> None:
-        fp.ROOT, fp.HOST_LOCK, fp.running_commands = self.saved
+        fp.ROOT, fp.HOST_LOCK, fp.running_commands, fp.reserved_above_floor = self.saved
         self.tmp.cleanup()
 
     def env(self, sign_key: str = "") -> None:
@@ -188,6 +190,42 @@ class PruneTest(unittest.TestCase):
         finally:
             os.close(held)
         self.assertTrue(all(p.exists() for p in paths))
+
+
+    def test_a_reserved_host_above_its_floor_is_left_alone(self) -> None:
+        self.env()
+        paths = self.node(10)
+        fp.reserved_above_floor = lambda: "reserved for someone until 2026-10-28T23:59:59Z (r1); 80 GiB free, floor 30"
+        rec = self.run_main("--apply", "--node-gib", "0")
+        self.assertTrue(rec["result"].startswith("deferred: reserved for someone"), rec)
+        self.assertTrue(all(p.exists() for p in paths))
+        self.assertIn("would remove", self.run_main("--node-gib", "0")["node_store"], "a plan still reports")
+
+    def test_reserved_above_floor_reads_glaeda_disk_and_fails_closed(self) -> None:
+        real = self.saved[3]
+        with mock.patch.object(fp.importlib.machinery, "SourceFileLoader", side_effect=OSError("gone")):
+            self.assertIn("kept as reserved", real())
+        # the real glaeda-disk loads (its dataclasses need the module in sys.modules) and answers from a made-up list
+        gd = fp.load_glaeda_disk(ROOT / "scripts/glaeda-disk")
+        listing = Path(self.tmp.name) / "fleet-reservations.json"
+        listing.write_text(json.dumps({"expires": "2999-01-01T00:00:00Z", "reservations": [{"id": "r9", "owner": "someone", "hosts": ["cmux30"],
+                                                         "from": "2000-01-01T00:00:00Z",
+                                                         "until": "2999-01-01T00:00:00Z"}]}))
+        gd.FLEET_RESERVATIONS = listing
+        gd.host_names = lambda: {"cmux30"}
+        gd.runner_floor_gib = lambda: 0.0
+        self.assertIn("reserved for someone", real(gd))
+        gd.host_names = lambda: {"cmux31"}
+        gd.HOST_RESERVATION_LOCAL = Path(self.tmp.name) / "no-reservation.json"
+        self.assertEqual(real(gd), "")
+        listing.unlink()
+        self.assertIn("kept as reserved", real(gd))
+
+    def test_a_reserved_host_never_runs_store_gc(self) -> None:
+        fp.reserved_above_floor = lambda: "reserved for someone until 2999-01-01T00:00:00Z (r9); 80 GiB free, floor 30"
+        with mock.patch.object(fp, "store_gc", side_effect=AssertionError("gc ran on a reserved host")):
+            rec = self.run_main("--apply")
+        self.assertTrue(rec["result"].startswith("deferred: reserved"), rec)
 
 
 if __name__ == "__main__":

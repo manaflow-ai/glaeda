@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 from dataclasses import replace
 from unittest import mock
@@ -39,6 +40,14 @@ spec = importlib.util.spec_from_loader("glaeda_disk", loader)
 gd = importlib.util.module_from_spec(spec)
 sys.modules["glaeda_disk"] = gd
 loader.exec_module(gd)
+# Every test runs on an unreserved host unless it says otherwise (HostReservationTest): an empty reservation list, so a
+# test's host never reads the real ~/.local/share/glaeda/fleet-reservations.json, or fails closed without one.
+_NO_RESERVATIONS = tempfile.NamedTemporaryFile("w", suffix="-fleet-reservations.json", delete=False)
+_NO_RESERVATIONS.write('{"schema": "glaeda-fleet-reservations/v1", "expires": "2999-01-01T00:00:00Z", '
+                       '"reservations": [], "aliases": {}}')
+_NO_RESERVATIONS.close()
+gd.FLEET_RESERVATIONS = Path(_NO_RESERVATIONS.name)
+gd.HOST_RESERVATION_LOCAL = Path(_NO_RESERVATIONS.name + ".none")
 # An --apply in a test must never reap the real $TMPDIR of the host running the suite: without a tmp of
 # the test's own, the TMPDIR reaper does nothing.
 _reap_tmpdir_test_residue = gd.reap_tmpdir_test_residue
@@ -6189,6 +6198,226 @@ class ActivityClockTest(unittest.TestCase):
             gd.main(["--pressure", "--no-snapshot"])
             gd.main(["--pressure", "--need", "50", "--no-snapshot"])
         self.assertEqual(seen, [("54", "70", 30.0), ("55", "71", 50.0)])
+
+MAIN_GLOBALS = ("ROLE", "RUNNER_CACHE_PROFILE", "CMUX_NEXT_CI_DRAIN", "ACTIVITY_MODE", "EMERGENCY_DEVS", "FLOOR_HOLD",
+                "CMUX_NEXT_HOST_FLOOR", "CMUX_NEXT_CI_OVER", "_JOB_STARTS", "_JOB_STARTS_READ", "_RUNNING_JOB_HOURS",
+                "_MEASURE_BUDGET_REACHED", "_EVICT_HANDLE", "_HOOK_PASS_FD")
+
+
+def keep_main_globals(stack: contextlib.ExitStack) -> None:
+    """glaeda-disk's main sets these for its run; put each back when the stack closes, so no later test sees it."""
+    for name in MAIN_GLOBALS:
+        if hasattr(gd, name):
+            stack.enter_context(mock.patch.object(gd, name, getattr(gd, name)))
+
+
+class HostReservationTest(unittest.TestCase):
+    """A reserved fleet mini gets floor-pressure eviction only. The list lives only on the host; fixtures are made up."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.list = self.root / "fleet-reservations.json"
+        self.local = self.root / "reservation.json"
+        self.list.write_text(json.dumps({"schema": "glaeda-fleet-reservations/v1", "expires": "2026-10-27T13:00:00Z",
+                                         "aliases": {"cmux30": ["cmux-thirty"]},
+                                         "reservations": [{"id": "r1", "owner": "someone", "hosts": ["cmux30"],
+                                                           "from": "2026-10-25T22:00:00Z",
+                                                           "until": "2026-10-28T23:59:59Z"}]}))
+        self.during = gd.reservation_time("2026-10-27T00:00:00Z")
+
+    def reserved(self, names, now=None) -> str:
+        return gd.host_reservation(self.during if now is None else now, self.list, set(names), self.local)
+
+    def test_an_active_entry_or_alias_reserves_and_it_lapses_by_itself(self) -> None:
+        self.assertIn("reserved for someone until 2026-10-28T23:59:59Z (r1)", self.reserved({"cmux30"}))
+        self.assertIn("reserved for someone", self.reserved({"CMUX-Thirty"}))
+        self.assertEqual(self.reserved({"cmux31"}), "")
+        doc = json.loads(self.list.read_text())
+        self.list.write_text(json.dumps(dict(doc, expires="2026-10-30T00:00:00Z")))
+        self.assertEqual(self.reserved({"cmux30"}, gd.reservation_time("2026-10-29T00:00:00Z")), "", "lapsed")
+        self.assertEqual(self.reserved({"cmux30"}, gd.reservation_time("2026-10-25T21:59:59Z")), "", "not yet")
+
+    def test_an_unreadable_list_fails_closed(self) -> None:
+        self.list.write_text("{nope")
+        self.assertIn("unreadable", self.reserved({"cmux31"}))
+        self.list.unlink()
+        self.assertIn("unreadable", self.reserved({"cmux31"}))
+
+    def test_the_host_local_reservation_counts(self) -> None:
+        now = int(self.during)
+        self.local.write_text(json.dumps({"schema": "glaeda-reservation/v1", "owner": "fleet", "since": now - 60,
+                                          "until": now + 60}))
+        self.assertIn("host reservation by fleet", self.reserved({"cmux31"}))
+        self.local.write_text(json.dumps({"schema": "glaeda-reservation/v1", "owner": "fleet", "since": now - 60,
+                                          "until": now - 1}))
+        self.assertEqual(self.reserved({"cmux31"}), "")
+
+    def test_a_malformed_list_anywhere_fails_closed(self) -> None:
+        good = {"id": "r2", "owner": "someone-else", "hosts": ["cmux40"], "from": "2026-10-25T00:00:00Z",
+                "until": "2026-10-28T00:00:00Z"}
+        bad_docs = (
+            [],  # not an object
+            {"aliases": {}},  # no reservations
+            {"reservations": {"r1": good}},
+            {"reservations": [dict(good, hosts="cmux31")]},  # a string, not a list: never matched letter by letter
+            {"reservations": [dict(good, hosts=[31])]},
+            {"reservations": ["cmux31"]},
+            {"reservations": [dict(good, until="soon")]},  # a bad time on an entry naming another host
+            {"reservations": [dict(good, hosts=["cmux31"], until=good["from"])]},  # zero length
+            {"reservations": [dict(good, hosts=["cmux31"], **{"from": good["until"], "until": good["from"]})]},
+            {"reservations": [good], "aliases": {"cmux40": "cmux-forty"}},
+            {"reservations": [good], "aliases": []},
+        )
+        for doc in bad_docs:
+            with self.subTest(doc=doc):  # each with a fresh expires, so only its own fault can make it fail
+                self.list.write_text(json.dumps(dict(doc, expires="2026-10-27T13:00:00Z") if isinstance(doc, dict)
+                                                else doc))
+                self.assertIn("unreadable", self.reserved({"cmux31"}))
+        fresh = "2026-10-27T13:00:00Z"
+        self.list.write_text(json.dumps({"reservations": [good], "expires": fresh}))
+        self.assertEqual(self.reserved({"cmux31"}), "", "a well-formed list without this host")
+        for expires in (None, "2026-10-26T23:59:59Z", "soon", 12):
+            with self.subTest(expires=expires):
+                doc = {"reservations": [good]} if expires is None else {"reservations": [good], "expires": expires}
+                self.list.write_text(json.dumps(doc))
+                self.assertIn("kept as reserved", self.reserved({"cmux31"}))
+
+    def test_a_missing_list_is_reserved_whatever_the_host_local_file_says(self) -> None:
+        now = int(self.during)
+        self.local.write_text(json.dumps({"schema": "glaeda-reservation/v1", "owner": "fleet", "since": now - 600,
+                                          "until": now - 60}))
+        self.list.unlink()
+        self.assertIn("kept as reserved", self.reserved({"cmux31"}))
+
+    def test_the_list_is_read_from_the_fleet_owners_home(self) -> None:
+        owner = types.SimpleNamespace(pw_dir=os.fspath(self.root / "fleet-home"))
+        with mock.patch.object(gd, "FLEET_RESERVATIONS", None), mock.patch.object(gd, "FLEET_ROOT", self.root), \
+                mock.patch.object(gd.pwd, "getpwuid", return_value=owner) as getpwuid:
+            self.assertEqual(gd.fleet_reservations_path(),
+                             self.root / "fleet-home/.local/share/glaeda/fleet-reservations.json")
+            getpwuid.assert_called_once_with(self.root.stat().st_uid)
+            self.assertIn("kept as reserved", gd.host_reservation(self.during, None, {"cmux31"}, self.local),
+                          "nothing written there yet")
+        with mock.patch.object(gd, "FLEET_RESERVATIONS", None), \
+                mock.patch.object(gd, "FLEET_ROOT", self.root / "absent"):
+            self.assertEqual(gd.fleet_reservations_path(), gd.HOME / gd.FLEET_RESERVATIONS_NAME)
+
+    def test_a_reserved_hosts_pressure_starts_at_the_floor_itself(self) -> None:
+        fam = gd.Family("home", gd.HOME, False, "")
+        total = 1000 * gd.GIB
+        with mock.patch.object(gd, "free_bytes", return_value=(100 * gd.GIB, total)):
+            plain = next(iter(gd.filesystems([fam], "1", "1", floor_gib=30.0).values()))
+            held = next(iter(gd.filesystems([fam], "30", "50", floor_gib=30.0, reserved=True).values()))
+        self.assertEqual(plain.low, int((30 + gd.POLICY["low_margin_gib"]) * gd.GIB))
+        self.assertEqual(held.low, 30 * gd.GIB)
+        self.assertEqual(held.target, int((30 + gd.POLICY["target_margin_gib"]) * gd.GIB))
+
+    def test_a_local_marker_that_is_there_but_unreadable_holds_the_host(self) -> None:
+        now = int(self.during)
+        for text in ("{nope", "[]", json.dumps({"schema": "other", "since": now - 60, "until": now + 60}),
+                     json.dumps({"schema": "glaeda-reservation/v1", "since": "yesterday", "until": now + 60}),
+                     json.dumps({"schema": "glaeda-reservation/v1", "until": now + 60})):
+            with self.subTest(text=text):
+                self.local.write_text(text)
+                self.assertIn("marker unreadable", self.reserved({"cmux31"}))
+        self.local.write_text(json.dumps({"schema": "glaeda-reservation/v1", "since": now + 600, "until": now + 900}))
+        self.assertIn("host reservation", self.reserved({"cmux31"}), "a future since holds, as the runner hook reads it")
+        real_read = Path.read_text
+
+        def read_text(path, *args, **kwargs):
+            if path == self.local:
+                raise PermissionError("denied")
+            return real_read(path, *args, **kwargs)
+        with mock.patch.object(Path, "read_text", read_text):
+            self.assertIn("marker unreadable (PermissionError)", self.reserved({"cmux31"}))
+        self.local.unlink()
+        self.assertEqual(self.reserved({"cmux31"}), "", "no marker, no hold")
+
+    def test_a_reserved_pressure_pass_does_nothing_but_evict(self) -> None:
+        """Under its floor, a reserved host runs the pressure pass and nothing else: no marker clearing, paused-work
+        cleanup, test-residue reaping, clone gc or repack; and no dedupe at all."""
+        empty = self.root / "empty"
+        empty.mkdir()
+        state = self.root / "state"
+        state.mkdir()
+        why = "reserved for someone until 2026-10-28T23:59:59Z (r1)"
+        with contextlib.ExitStack() as stack:
+            for name in ("SNAPSHOT", "DEDUPE_STATE", "CMUX_NEXT_CAP_RECORD", "MEASURE_LOCK", "ACCOUNTING",
+                         "HEALTH_SUMMARY", "EVICT_LOCK", "HOOK_PASS_LOCK", "HOOK_PASS_PENDING", "EVICT_OWNER",
+                         "NESTED_KEEP"):
+                stack.enter_context(mock.patch.object(gd, name, state / name))
+            keep_main_globals(stack)
+            for name in ("clear_stale_build_markers", "cleanup_paused_runner_work", "reap_tmpdir_test_residue",
+                         "gc_home_clones", "repack_runner_checkouts", "dedupe_xcode", "dedupe_captures"):
+                stack.enter_context(mock.patch.object(gd, name, side_effect=AssertionError(f"{name} ran")))
+            stack.enter_context(mock.patch.object(gd, "default_families",
+                                                  return_value=[gd.Family("tmp", empty, True, "scratch")]))
+            stack.enter_context(mock.patch.object(gd, "host_reservation", return_value=why))
+            stack.enter_context(mock.patch.object(gd, "runner_floor_gib", return_value=30.0))
+            stack.enter_context(mock.patch.object(gd, "free_bytes", return_value=(20 * gd.GIB, 1000 * gd.GIB)))
+            stack.enter_context(mock.patch.object(gd, "DARWIN", True))
+            stack.enter_context(mock.patch.object(gd, "disk_off", return_value=""))
+            stack.enter_context(mock.patch.object(gd, "notify_disk"))
+            evict = stack.enter_context(mock.patch.object(gd, "evict_idle_runner_checkouts", return_value=0))
+            stack.enter_context(mock.patch.dict(gd.RUN, clear=True))
+            out = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            for args in (("--pressure",), ("--dedupe",), ("--dedupe-builds",)):
+                with self.subTest(args=args):
+                    code = gd._main_impl(["--apply", "--top", "0", "--no-snapshot",
+                                          "--receipt", os.fspath(self.root / "receipt.jsonl"), *args])
+                    self.assertEqual(code, 0, out.getvalue())
+        self.assertIn("eviction summary", out.getvalue(), "the pressure pass itself ran")
+        evict.assert_called_once()  # the floor's last resort still runs
+        self.assertIn("no dedupe", out.getvalue())
+
+    def run_disk(self, *args: str, reserved: str, floor: float, free_gib: float):
+        """glaeda-disk's main on a fake fleet mini; returns (exit code, output, the families' low/target it used)."""
+        seen, run = {}, {}
+
+        def filesystems(fams, low, target, *rest, reserved=False):
+            seen.update(low=low, target=target, **({"reserved": True} if reserved else {}))
+            run.update(gd.RUN)
+            raise SystemExit(0)  # stop before any survey: the gate is what is under test
+        with contextlib.ExitStack() as globals_back, mock.patch.object(gd, "host_reservation", return_value=reserved), \
+                mock.patch.object(gd, "runner_floor_gib", return_value=floor), \
+                mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd, "filesystems", side_effect=filesystems), \
+                mock.patch.object(gd, "disk_off", return_value=""), mock.patch.dict(gd.RUN, clear=True), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            keep_main_globals(globals_back)
+            try:
+                code = gd._main_impl(["--apply", "--top", "0", "--no-snapshot", *args])
+            except SystemExit as stop:
+                code = stop.code
+        return code, out.getvalue(), seen, run
+
+    def test_a_reserved_host_runs_only_floor_pressure_to_the_floor_plus_the_margin(self) -> None:
+        why = "reserved for someone until 2026-10-28T23:59:59Z (r1)"
+        for args in (("--idle",), ()):
+            with self.subTest(args=args):
+                code, out, seen, run = self.run_disk(*args, reserved=why, floor=30.0, free_gib=50)
+                self.assertEqual(code, 0)
+                self.assertIn("only floor-pressure eviction runs here", out)
+                self.assertIn("nothing deleted", out)
+                self.assertEqual(seen, {}, "never reached a survey")
+        code, out, seen, run = self.run_disk("--pressure", "--idle", reserved=why, floor=0.0, free_gib=50)
+        self.assertIn("no runner floor", out)
+        self.assertEqual(seen, {})
+        code, out, seen, run = self.run_disk("--pressure", "--idle", reserved=why, floor=30.0, free_gib=50)
+        margin = gd.POLICY["target_margin_gib"]
+        self.assertEqual(seen, {"low": "30", "target": f"{30 + margin:g}", "reserved": True})
+        self.assertEqual(run["reserved"], why)
+        # the runner-cache profile is held to the same rule (given a root, as a Linux CI host has none of its own)
+        with mock.patch.object(gd, "runner_cache_families", return_value=[gd.Family("x", self.root, True, "x")]), \
+                mock.patch.object(gd, "runner_profile_roots_safe", return_value=True):
+            code, out, seen, run = self.run_disk("--runner-caches", reserved=why, floor=30.0, free_gib=50)
+        self.assertIn("nothing deleted", out)
+        self.assertEqual(seen, {})
+        # an unreserved host keeps its policy
+        code, out, seen, run = self.run_disk("--pressure", reserved="", floor=30.0, free_gib=50)
+        self.assertEqual(seen, {"low": gd.POLICY["low"], "target": gd.POLICY["target"]})
+
 
 if __name__ == "__main__":
     unittest.main()

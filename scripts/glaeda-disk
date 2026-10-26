@@ -5213,8 +5213,112 @@ def runner_floor_gib(home: Path = HOME) -> float:
     return floor
 
 
+# A fleet reservation hands a host to one person for a while. On a reserved fleet mini only floor-pressure eviction
+# runs: no idle sweep, and a pressure run acts only below the runner floor and works only back to the floor plus
+# target_margin_gib, so state its holder keeps idle is not aged out. The list is never part of this repository: the
+# fleet's own writer puts it on each host, in the home of the user that owns FLEET_ROOT
+# (~/.local/share/glaeda/fleet-reservations.json, schema glaeda-fleet-reservations/v1:
+# {"expires", "reservations": [{"id", "owner", "hosts": [...], "from", "until"}], "aliases": {host: [...]}}; the
+# writer stamps expires 13 h after each write and refreshes it every 6 h). The host-local reservation
+# (FLEET_ROOT/reservation.json, glaeda-reservation/v1, the one the runner hook reads) counts too. Fails closed: a
+# missing, unreadable, malformed or expired list, or one with no expires, reads as reserved, whatever the
+# host-local file says.
+FLEET_RESERVATIONS: Path | None = None  # None: fleet_reservations_path(); tests point it at a fixture
+FLEET_RESERVATIONS_NAME = ".local/share/glaeda/fleet-reservations.json"
+UPDATE_CONFIG = HOME / ".config/glaeda/update.json"
+HOST_RESERVATION_LOCAL = FLEET_ROOT / "reservation.json"
+
+
+def fleet_reservations_path() -> Path:
+    """The list in the home of the user that owns FLEET_ROOT (the fleet account, also when this runs as root);
+    this user's home when FLEET_ROOT or its owner cannot be read."""
+    if FLEET_RESERVATIONS is not None:
+        return FLEET_RESERVATIONS
+    with contextlib.suppress(OSError, KeyError):
+        return Path(pwd.getpwuid(FLEET_ROOT.stat().st_uid).pw_dir) / FLEET_RESERVATIONS_NAME
+    return HOME / FLEET_RESERVATIONS_NAME
+
+
+def reservation_time(value: Any) -> float:
+    """An ISO 8601 time (Z or an offset; a naive one is UTC) as Unix seconds; ValueError otherwise."""
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"not an ISO 8601 time: {value!r}")
+    text = value.strip()
+    text = text[:-1] + "+00:00" if text[-1:] in "Zz" else text
+    import datetime as _dt
+    when = _dt.datetime.fromisoformat(text)
+    return (when if when.tzinfo else when.replace(tzinfo=_dt.timezone.utc)).timestamp()
+
+
+def host_names() -> set[str]:
+    """This host's names as the registry spells them: glaeda-update's configured host, and the machine name without
+    .local, lowercased."""
+    names = {platform.node().split(".")[0].lower()}
+    with contextlib.suppress(OSError, ValueError, AttributeError):
+        host = json.loads(UPDATE_CONFIG.read_text()).get("host")
+        if isinstance(host, str) and host:
+            names.add(host.lower())
+    return {n for n in names if n}
+
+
+def _str_list(value: Any, what: str) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
+        raise ValueError(f"{what} must be a list of names")
+    return value
+
+
+def host_reservation(now: float | None = None, path: Path | None = None, names: set[str] | None = None,
+                     local: Path | None = None) -> str:
+    """Why this host is reserved now ("" when it is not): an active fleet reservation naming it (or an alias), an
+    active host-local reservation, or a reservation list that is missing, unreadable or malformed anywhere."""
+    now = time.time() if now is None else now
+    names = host_names() if names is None else {n.lower() for n in names}
+    try:
+        doc = json.loads((fleet_reservations_path() if path is None else path).read_text())
+        if not isinstance(doc, dict):
+            raise ValueError("malformed")
+        entries, aliases = doc["reservations"], doc.get("aliases", {})
+        if not isinstance(entries, list) or not isinstance(aliases, dict):
+            raise ValueError("malformed")
+        if reservation_time(doc["expires"]) <= now:  # KeyError without one: the writer stopped refreshing it
+            return f"fleet reservations expired at {doc['expires']}; kept as reserved"
+        alias = {str(h).lower(): {a.lower() for a in _str_list(v, "aliases")} for h, v in aliases.items()}
+        hit = ""
+        for e in entries:  # every entry is checked, so one malformed entry anywhere fails closed
+            if not isinstance(e, dict):
+                raise ValueError("malformed entry")
+            hosts = {h.lower() for h in _str_list(e["hosts"], "hosts")}
+            hosts |= {a for h in list(hosts) for a in alias.get(h, ())}
+            start, end = reservation_time(e["from"]), reservation_time(e["until"])
+            if start >= end:
+                raise ValueError("from must be before until")
+            if not hit and names & hosts and start <= now <= end:
+                hit = f"reserved for {e.get('owner', '?')} until {e['until']} ({e.get('id', '?')})"
+        if hit:
+            return hit
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        return f"fleet reservations unreadable ({type(error).__name__}); kept as reserved"
+    marker = HOST_RESERVATION_LOCAL if local is None else local
+    try:  # a marker that is there but cannot be read or understood holds the host, as host_busy reads it
+        try:
+            text = marker.read_text()
+        except FileNotFoundError:
+            return ""  # only a marker that is certainly absent holds nothing
+        held = json.loads(text)
+        since, until = held["since"], held["until"]
+        if (held.get("schema") != "glaeda-reservation/v1" or not all(
+                isinstance(v, int) and not isinstance(v, bool) for v in (since, until))):
+            raise ValueError("not a glaeda-reservation/v1 marker")
+    except (OSError, ValueError, TypeError, AttributeError, KeyError) as error:
+        return f"host reservation marker unreadable ({type(error).__name__}); kept as reserved"
+    if now < until:  # the runner hook's rule: a marker holds from when it is written until until, since or not
+        return f"host reservation by {held.get('owner', '?')} until {until}"
+    return ""
+
+
 def filesystems(fams: list[Family], low: str, target: str,
-                tmpfs_low: str = "75%", tmpfs_target: str = "90%", floor_gib: float = 0.0) -> dict[int, Fs]:
+                tmpfs_low: str = "75%", tmpfs_target: str = "90%", floor_gib: float = 0.0,
+                reserved: bool = False) -> dict[int, Fs]:
     out: dict[int, Fs] = {}
     for f in fams:
         dev = f.root.stat().st_dev
@@ -5224,9 +5328,11 @@ def filesystems(fams: list[Family], low: str, target: str,
             lo, tg = (tmpfs_low, tmpfs_target) if tmpfs else (low, target)
             lo_b, tg_b = space(lo, total), space(tg, total)
             # a runner's disk floor (runner_floor_gib) lifts both on HOME's volume, where the gate measures it,
-            # never past half the disk, as space() keeps a small disk from permanent pressure
+            # never past half the disk, as space() keeps a small disk from permanent pressure; a reserved host's
+            # pressure starts at the floor itself, not the floor plus low_margin_gib
             if floor_gib > 0 and not tmpfs and dev == HOME.stat().st_dev:
-                lo_b = max(lo_b, min(int((floor_gib + POLICY["low_margin_gib"]) * GIB), total // 2))
+                lo_margin = 0.0 if reserved else POLICY["low_margin_gib"]
+                lo_b = max(lo_b, min(int((floor_gib + lo_margin) * GIB), total // 2))
                 tg_b = max(tg_b, min(int((floor_gib + POLICY["target_margin_gib"]) * GIB), total // 2))
             out[dev] = Fs(dev, str(mount_point(f.root)), free, total, lo_b, tg_b, tmpfs)
     return out
@@ -7705,6 +7811,9 @@ def _main_impl(argv: list[str] | None = None) -> int:
         a.low = f"{a.need + POLICY['low_margin_gib']:g}"
         a.target = f"{a.need + POLICY['target_margin_gib']:g}"
 
+    # before any family is built: a reserved host's families keep its holder's ages (keep_legacy_ages, once 12 h lands)
+    reserved = (host_reservation() if role == "fleet-mini" and DARWIN and (a.apply or a.dedupe or a.dedupe_builds)
+                else "")
     global RUNNER_CACHE_PROFILE
     RUNNER_CACHE_PROFILE = bool(a.runner_caches)
     fams = runner_cache_families() if RUNNER_CACHE_PROFILE else default_families(role)
@@ -7723,6 +7832,9 @@ def _main_impl(argv: list[str] | None = None) -> int:
         fams = [f for f in fams if f.id in a.family]
     if RUNNER_CACHE_PROFILE and not runner_profile_roots_safe(fams):
         print("runner cache profile roots are not safe; skipped")
+        return 0
+    if (a.dedupe or a.dedupe_builds) and reserved:
+        print(f"{reserved}: only floor-pressure eviction runs here; no dedupe")
         return 0
     if a.dedupe or a.dedupe_builds:
         dd = next((f.root for f in fams if f.id == "xcode-derived-data"), None)
@@ -7748,8 +7860,20 @@ def _main_impl(argv: list[str] | None = None) -> int:
         return 0
     try:
         floor_gib = max(runner_floor_gib(), a.floor_gib if math.isfinite(a.floor_gib) else 0.0)
+        if reserved:
+            RUN["reserved"] = reserved
+            a.idle = False  # no idle sweep on a reserved host
+            if not a.pressure or floor_gib <= 0:
+                print(f"{reserved}: only floor-pressure eviction runs here"
+                      f"{'' if a.pressure else ' (--pressure)'}{'' if floor_gib > 0 else ', and it has no runner floor'}; "
+                      "nothing deleted")
+                RUN["skipped"] = "reserved host: floor-pressure eviction only"
+                return 0
+            # pressure below the floor only, and only back to the floor plus the margin
+            a.low, a.target = f"{floor_gib:g}", f"{floor_gib + POLICY['target_margin_gib']:g}"
+            print(f"{reserved}: only floor-pressure eviction runs here")
         fss = filesystems(fams or [Family("home", HOME, False, "")], a.low, a.target,
-                          a.tmpfs_low, a.tmpfs_target, floor_gib)
+                          a.tmpfs_low, a.tmpfs_target, floor_gib, **({"reserved": True} if reserved else {}))
         space(a.emergency, GIB)
     except ValueError:
         ap.error(f"--low/--target/--tmpfs-*/--emergency take GiB or N%: {a.low!r}, {a.target!r}, "
@@ -7864,7 +7988,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
                 fcntl.flock(maintenance_handle, fcntl.LOCK_UN)
                 maintenance_handle.close()
             return result
-        stale_marker_released = clear_stale_build_markers(a.receipt)
+        if not reserved:  # a reserved host gets the floor-pressure pass and nothing else
+            stale_marker_released = clear_stale_build_markers(a.receipt)
     idle = a.idle_hours if a.idle_hours is not None else IDLE_SWEEP_HOURS if sweep else (6 if under else 24)
     at, known, measured_at = (0.0, {}, {}) if a.refresh or a.no_snapshot else load_snapshot_meta()
     original_known = set(known)
@@ -7992,10 +8117,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
         logical_released = stale_marker_released + apply_pass([i for i in items if id(i) not in last])
         # A drained runner is explicitly held by cmux_mini_fix; once its listener and worker
         # are absent, its disposable checkout can be cleared under this same eviction lock.
-        if not RUNNER_CACHE_PROFILE:
+        if not RUNNER_CACHE_PROFILE and not reserved:
             logical_released += cleanup_paused_runner_work(a.receipt)
         # test scratch left in $TMPDIR, two days untouched: too small per entry for any family's size floor
-        if not RUNNER_CACHE_PROFILE and not a.cmux_next_drain \
+        if not RUNNER_CACHE_PROFILE and not a.cmux_next_drain and not reserved \
                 and (not a.family or TMP_TEST_RESIDUE_FAMILY in a.family):
             logical_released += reap_tmpdir_test_residue(a.receipt, halt=halt)
         # still under the runner gate's floor after every family: idle runners' whole checkouts, last
@@ -8007,9 +8132,9 @@ def _main_impl(argv: list[str] | None = None) -> int:
         # a home clone that fetch after fetch left in many packs: repacked at most hourly or under pressure,
         # after the eviction lock is released, so a gc of many minutes never holds back another eviction
         home_clone_gc_due = ((sweep or a.pressure) and ROLE == "fleet-mini" and not RUNNER_CACHE_PROFILE
-                             and not a.cmux_next_drain and (not a.family or HOME_CLONE_GC_FAMILY in a.family))
+                             and not a.cmux_next_drain and not reserved and (not a.family or HOME_CLONE_GC_FAMILY in a.family))
         runner_repack_due = ((sweep or a.pressure) and ROLE == "fleet-mini" and not RUNNER_CACHE_PROFILE
-                             and not a.cmux_next_drain
+                             and not a.cmux_next_drain and not reserved
                              and (not a.family or RUNNER_CHECKOUT_REPACK_FAMILY in a.family))
         remaining = []
         for fs in shown:
