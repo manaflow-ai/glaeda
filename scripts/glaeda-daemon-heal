@@ -692,6 +692,10 @@ def stage_check(files: dict[str, bytes], install_dir: Path, root: bool, run=boun
         doc = None
     if not isinstance(doc, dict) or not str(doc.get("schema") or "").startswith("glaeda-daemon-heal/"):
         raise HealError(f"its own plan pass failed (exit {code}): {(err or out).strip()[-160:]}")
+    if doc.get("follows") != RING:
+        # Code from before self-update would run, but never update again: a hand install newer than the channel
+        # (no installed.json, so no ancestry to check) would be stranded on it for good.
+        raise HealError(f"its code does not keep itself on the {RING} release; kept")
 
 
 def pair_hashes(install_dir: Path) -> dict[str, str | None]:
@@ -824,6 +828,7 @@ def run_pass(policy_path: Path, state_dir: Path, apply: bool, host: Host | None 
             except (HealError, OSError, ValueError) as e:  # never at the cost of this pass's report
                 new_state["release"]["error"] = f"reload: {str(e)[:200]}"
     report["staleAfterS"] = policy["report_stale_passes"] * policy["every_s"]
+    report["follows"] = RING  # stage_check: a release whose code says so keeps itself current once installed
     if "release" in new_state:
         report["release"] = release_report(new_state["release"], policy)
     if apply:

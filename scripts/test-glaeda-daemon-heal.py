@@ -638,6 +638,11 @@ class SelfUpdate(unittest.TestCase):
         self.assertEqual(verdict["state"], "stale")
         self.assertIn("plan pass failed", verdict["why"])
 
+    def test_code_that_would_not_update_itself_again_is_never_installed(self) -> None:
+        # A plan pass of code from before self-update: its report says nothing of following a release.
+        old = b"import json\nprint(json.dumps({'schema': 'glaeda-daemon-heal/v1', 'hot': []}))\n"
+        self.refused("does not keep itself on the stable release", script=old)
+
     def test_a_policy_its_own_code_refuses_is_never_installed(self) -> None:
         self.refused("its own plan pass failed", policy=b'{"schema": "nope"}')
 
