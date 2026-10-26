@@ -4196,6 +4196,149 @@ class GlaedaDiskTest(unittest.TestCase):
         policy.write_text("{}")
         self.assertNotEqual(before, gd.config_sha256(policy=policy))
 
+    def _queue(self):
+        """This test's runner-hook queue files, in place of the home's."""
+        lock, pending = self.root / "hook-pass.lock", self.root / "hook-pass.pending"
+        lock.touch()
+        return lock, pending, mock.patch.object(gd, "HOOK_PASS_LOCK", lock), \
+            mock.patch.object(gd, "HOOK_PASS_PENDING", pending)
+
+    def test_a_pressure_run_joins_a_running_hook_pass_instead_of_skipping_as_busy(self) -> None:
+        """The LaunchAgent's 15-minute pass raced the runner hook's queued pass and skipped as eviction_busy."""
+        lock, pending, p_lock, p_pending = self._queue()
+        with p_lock, p_pending, lock.open("a") as held, \
+                mock.patch.dict(os.environ, {gd.CALLER_ENV: "disk-pressure LaunchAgent"}), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None) as cap:
+            os.environ.pop(gd.HOOK_PASS_ENV, None)
+            fcntl.flock(held, fcntl.LOCK_EX)
+            status, rows, survey, _ = self._main_run(["--pressure", "--idle", "--apply"], free_gib=100.0)
+        self.assertEqual(status, 0)
+        self.assertEqual((rows[-1]["skipped"], rows[-1]["caller"]), (gd.COALESCED_INTO_HOOK, "disk-pressure LaunchAgent"))
+        self.assertTrue(pending.exists(), "the running hook pass serves this trigger with its follow-up")
+        survey.assert_not_called()
+        cap.assert_not_called()
+
+    def test_a_run_that_takes_the_hook_lock_holds_it_and_serves_the_waiting_triggers(self) -> None:
+        """A run that finds the hook's lock free takes it for its whole run, so a hook pass started meanwhile only
+        queues behind it, and it clears the triggers it served (and only when it did its pass)."""
+        lock, pending, p_lock, p_pending = self._queue()
+        claimed = Path(f"{pending}.claimed")
+        seen = []
+
+        def working(*_a, **_k) -> None:
+            seen.append(hook_held())
+
+        def hook_held() -> bool:
+            with lock.open("a") as probe:
+                try:
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return True
+                return False
+
+        pending.touch()
+        with p_lock, p_pending, mock.patch.object(gd, "HOOK_PASS_CLAIMED", claimed), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            os.environ.pop(gd.HOOK_PASS_ENV, None)
+            with mock.patch.object(gd, "write_health_summary", side_effect=working):
+                status, rows, _, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
+        self.assertEqual((status, rows[-1]["skipped"]), (0, None))
+        self.assertTrue(seen and all(seen), "the hook lock is held while the run works")
+        self.assertFalse(pending.exists() or claimed.exists(), "the triggers it served are cleared")
+        self.assertFalse(hook_held(), "and the lock is let go")
+
+    def test_a_run_deferred_for_ci_still_leaves_or_keeps_its_trigger(self) -> None:
+        lock, pending, p_lock, p_pending = self._queue()
+        claimed = Path(f"{pending}.claimed")
+        with p_lock, p_pending, mock.patch.object(gd, "HOOK_PASS_CLAIMED", claimed), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None), \
+                mock.patch.object(gd, "ci_defer", return_value="deferred: a CI job is running (x)"):
+            os.environ.pop(gd.HOOK_PASS_ENV, None)
+            with lock.open("a") as held:
+                fcntl.flock(held, fcntl.LOCK_EX)
+                _, rows, _, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0,
+                                               policy={"defer_during_ci": True})
+                self.assertEqual(rows[-1]["skipped"], gd.COALESCED_INTO_HOOK)
+                self.assertTrue(pending.exists(), "joined before the deferral")
+            _, rows, _, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0, policy={"defer_during_ci": True})
+        self.assertEqual(rows[-1]["skipped"], "defer_during_ci")
+        self.assertTrue(claimed.exists(), "a deferred run did no pass, so its claimed trigger stays")
+
+    def test_a_lock_taking_run_that_does_no_pass_leaves_its_own_trigger(self) -> None:
+        lock, pending, p_lock, p_pending = self._queue()
+        claimed = Path(f"{pending}.claimed")
+        self.assertFalse(pending.exists())
+        with p_lock, p_pending, mock.patch.object(gd, "HOOK_PASS_CLAIMED", claimed), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None), \
+                mock.patch.object(gd, "ci_defer", return_value="deferred: a CI job is running (x)"):
+            os.environ.pop(gd.HOOK_PASS_ENV, None)
+            _, rows, _, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0, policy={"defer_during_ci": True})
+        self.assertEqual(rows[-1]["skipped"], "defer_during_ci")
+        self.assertTrue(claimed.exists())
+
+    def test_a_trigger_that_cannot_be_left_never_overlaps_the_running_pass(self) -> None:
+        lock, _, p_lock, _ = self._queue()
+        with p_lock, mock.patch.object(gd, "HOOK_PASS_PENDING", self.root / "missing" / "hook-pass.pending"), \
+                lock.open("a") as held, mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            os.environ.pop(gd.HOOK_PASS_ENV, None)
+            fcntl.flock(held, fcntl.LOCK_EX)
+            _, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
+        self.assertEqual(rows[-1]["skipped"], gd.COALESCED_INTO_HOOK)
+        survey.assert_not_called()
+
+    def test_a_json_run_that_joins_the_queue_reports_deferred(self) -> None:
+        lock, _, p_lock, p_pending = self._queue()
+        with p_lock, p_pending, lock.open("a") as held, mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            os.environ.pop(gd.HOOK_PASS_ENV, None)
+            fcntl.flock(held, fcntl.LOCK_EX)
+            status, _, _, _ = self._main_run(["--pressure", "--apply", "--json"], free_gib=100.0)
+        self.assertEqual(status, 3)
+
+    def test_an_emergency_run_joins_the_queue_too(self) -> None:
+        """Below the emergency mark the hook's pass deletes the same way, so the LaunchAgent's run still joins it."""
+        lock, pending, p_lock, p_pending = self._queue()
+        with p_lock, p_pending, lock.open("a") as held, mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            os.environ.pop(gd.HOOK_PASS_ENV, None)
+            fcntl.flock(held, fcntl.LOCK_EX)
+            _, rows, _, _ = self._main_run(["--pressure", "--apply"], free_gib=20.0)
+        self.assertEqual(rows[-1]["skipped"], gd.COALESCED_INTO_HOOK)
+
+    def test_the_hook_pass_itself_and_floor_evictions_are_never_queued(self) -> None:
+        lock, pending, p_lock, p_pending = self._queue()
+        with p_lock, p_pending, lock.open("a") as held, mock.patch.dict(os.environ, {gd.HOOK_PASS_ENV: "1"}), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None):
+            fcntl.flock(held, fcntl.LOCK_EX)
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
+        self.assertEqual((status, rows[-1]["skipped"]), (0, None))
+        self.assertFalse(pending.exists())
+        survey.assert_called()
+
+    def test_a_held_evict_lock_skips_before_the_cap_measurement(self) -> None:
+        """A busy run spent 10-20 s in the cmux-next cap's du before it found evict.lock taken; it now stops first,
+        and its run line names its caller and the holder with when it took the lock."""
+        _, _, p_lock, p_pending = self._queue()
+        lock = self.root / "evict.lock"
+        with p_lock, p_pending, lock.open("a") as held, mock.patch.dict(os.environ, {gd.CALLER_ENV: "test"}), \
+                mock.patch.object(gd, "cmux_next_ci_cap_state", return_value=None) as cap:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            (self.root / "evict.owner.json").write_text(json.dumps({
+                "pid": os.getpid(), "owner": "cmux", "started_at": time.time() - 60,
+                "command": "glaeda-disk --pressure --apply --top 0"}))
+            status, rows, survey, _ = self._main_run(["--pressure", "--apply"], free_gib=100.0)
+        self.assertEqual(status, 0)
+        row = rows[-1]
+        self.assertEqual((row["skipped"], row["caller"]), ("eviction_busy", "test"))
+        self.assertEqual((row["evict_owner"]["pid"], row["evict_owner"]["command"]),
+                         (os.getpid(), "glaeda-disk --pressure --apply --top 0"))
+        self.assertIsNotNone(row["evict_owner"]["since"])
+        cap.assert_not_called()
+        survey.assert_not_called()
+
+    def test_the_run_line_names_its_caller_without_the_variable(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(gd.CALLER_ENV, None)
+            self.assertTrue(gd.run_caller())
+
     def test_a_deferred_run_writes_its_reason(self) -> None:
         lock = self.root / "measure.lock"
         with lock.open("a") as held:

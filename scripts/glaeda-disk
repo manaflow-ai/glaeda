@@ -206,6 +206,16 @@ MEASURE_LOCK = HOME / ".cache/glaeda-disk/measure.lock"
 ACCOUNTING = HOME / ".cache/glaeda-disk/accounting.json"
 HEALTH_SUMMARY = HOME / ".local/state/glaeda/disk/summary.json"
 EVICT_LOCK = HOME / ".cache/glaeda-disk/evict.lock"  # one --apply at a time (the runner hooks and the LaunchAgent)
+# The runner hook's one-pass-at-a-time queue (glaeda-cmux-runner-hook DISK_PASS_LOCK/PENDING): a pressure run that is
+# not the hook's own pass (HOOK_PASS_ENV) and finds a pass under way leaves its trigger there instead of racing it.
+HOOK_PASS_LOCK = HOME / ".cache/glaeda-disk/hook-pass.lock"
+HOOK_PASS_PENDING = HOME / ".cache/glaeda-disk/hook-pass.pending"
+HOOK_PASS_ENV = "GLAEDA_DISK_HOOK_PASS"  # "1" in the hook's own pass and its floor evictions: never queued
+# Any other --pressure --apply run (the LaunchAgent's, idle-repair's) takes HOOK_PASS_LOCK itself (take_hook_pass), so
+# it and the hook's pass never overlap, or leaves its trigger to the pass that holds it.
+CALLER_ENV = "GLAEDA_DISK_CALLER"  # who started this run, for its run line; else the parent's command
+COALESCED_INTO_HOOK = "coalesced into the running pass (glaeda-disk)"
+UNSERVED = ("eviction_busy", "measurement_busy", "defer_during_ci")  # a run that skipped these did no pass
 EVICT_OWNER = HOME / ".cache/glaeda-disk/evict.owner.json"
 EVICT_OWNER_STALE_S = 30 * 60
 RUNNER_HELD_DIR = ".local/state/glaeda/mini-fleet/runner-held"
@@ -602,6 +612,7 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "9809f36fece71390cf0070407c0d2d960b9a9c2c825581ed478a297a89ec3129",
     "d5e73be990d67d9499ff352d01fda2e1392a6fd257a57770b23008b3bf55fb59",
     "0c2c8880e3b17af8324f8304121c4159bee8ade5c31496b9af713586cb90bcfc",
+    "fca8abb34684680ad0344a7a82b0ee8b2b476f6490407de27eb410904f5fac91",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -1024,6 +1035,74 @@ DISK_OFF = HOME / ".config/glaeda/disk-off"
 RUN_LOG = HOME / ("Library/Logs/glaeda-disk-runs.jsonl" if sys.platform == "darwin"
                   else ".local/state/glaeda/disk-runs.jsonl")
 RUN: dict[str, Any] = {}  # what this run did, for its run line; _main_impl fills it
+
+
+def run_caller() -> str:
+    """Who started this run: CALLER_ENV, else the parent process's command (bounded), else its pid."""
+    named = os.environ.get(CALLER_ENV, "").strip()
+    if named:
+        return named[:120]
+    try:
+        out = subprocess.run(["ps", "-o", "command=", "-p", str(os.getppid())], capture_output=True, text=True,
+                             timeout=5, check=False).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        out = ""
+    return (out or f"pid {os.getppid()}")[:120]
+
+
+HOOK_PASS_CLAIMED = Path(f"{HOOK_PASS_PENDING}.claimed")
+_HOOK_PASS_FD: int | None = None  # HOOK_PASS_LOCK, held for the rest of this run once taken (take_hook_pass)
+
+
+def take_hook_pass() -> bool | None:
+    """Take the runner hook's one-pass-at-a-time lock for this run, as the hook's pass process does: True when taken
+    (held until this process exits, so no hook pass overlaps it; the triggers waiting are claimed for it), False when
+    a pass holds it (this run's trigger is then left for that pass, which serves it with its follow-up), None when
+    the lock cannot be used (the run goes on as before). The trigger is written before the second try, so a pass that
+    lets go in between either sees it or leaves the lock to this run."""
+    global _HOOK_PASS_FD
+    try:
+        HOOK_PASS_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(HOOK_PASS_LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except OSError:
+        return None
+    for attempt in range(2):
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            if attempt:
+                os.close(fd)
+                return False
+            try:
+                os.close(os.open(HOOK_PASS_PENDING, os.O_WRONLY | os.O_CREAT, 0o600))
+            except OSError:
+                os.close(fd)
+                return False  # never overlap the running pass, which is freeing space now; the next run comes back
+            continue
+        except OSError:
+            os.close(fd)
+            return None
+        _HOOK_PASS_FD = fd
+        with contextlib.suppress(OSError):
+            os.replace(HOOK_PASS_PENDING, HOOK_PASS_CLAIMED)  # served by this run, which starts after them
+        return True
+    return False
+
+
+def release_hook_pass(served: bool) -> None:
+    """Let go of the hook's lock; the claimed triggers are cleared only when this run did its pass, and a run that did
+    none leaves its own trigger claimed too, for the next pass."""
+    global _HOOK_PASS_FD
+    if _HOOK_PASS_FD is None:
+        return
+    with contextlib.suppress(OSError):
+        if served:
+            HOOK_PASS_CLAIMED.unlink()
+        else:
+            os.close(os.open(HOOK_PASS_CLAIMED, os.O_WRONLY | os.O_CREAT, 0o600))
+    with contextlib.suppress(OSError):
+        os.close(_HOOK_PASS_FD)
+    _HOOK_PASS_FD = None
 
 
 def config_sha256(disk: Path | None = None, policy: Path | None = None) -> str:
@@ -7716,10 +7795,25 @@ def _main_impl(argv: list[str] | None = None) -> int:
     if a.pressure:
         # only families on a filesystem under pressure are surveyed or touched
         fams = [f for f in fams if fss[f.root.stat().st_dev].under]
+        # Before the cap's du (10-20 s on a mini): a run that would only find evict.lock taken stops here. Another
+        # caller's pressure run (the LaunchAgent's, idle-repair's) joins the runner hook's queue while a hook pass is
+        # under way, so that pass serves it with its one follow-up rather than this run skipping as busy. It does so
+        # before any deferral, so a deferred run's trigger is still left (or kept claimed) for a later pass.
+        if a.apply and not a.cmux_next_drain and not RUNNER_CACHE_PROFILE \
+                and os.environ.get(HOOK_PASS_ENV) != "1" and take_hook_pass() is False:
+            return deferred(COALESCED_INTO_HOOK, "a runner hook pass is under way; this run joins its queue")
         if a.apply and POLICY["defer_during_ci"] and (why := ci_defer(fss, ci_jobs(), a.emergency, floor_gib)):
             print(why)
             RUN["skipped"] = "defer_during_ci"
             return 0
+        if a.apply and not a.cmux_next_drain and not RUNNER_CACHE_PROFILE:
+            if eviction_lock_is_held():
+                owner = eviction_owner_status()
+                RUN["evict_owner"] = owner
+                write_eviction_status(a.receipt, owner)
+                write_eviction_contention_health(a.receipt)
+                return deferred("eviction_busy", f"another eviction running; skipped before measuring "
+                                                 f"({eviction_owner_text(owner)})", owner=owner)
     # only a pressure run measures the cap (one du) and acts on it (cmux_next_ci_over); a text report shows the last
     # measurement, and --json (glaeda-fleet-status asks every mini on every call) neither measures nor shows it
     global CMUX_NEXT_CI_OVER
@@ -7760,6 +7854,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
         # its lock descriptor remained open.
         if acquire_evict_lock() is None:
             owner = eviction_owner_status()
+            RUN["evict_owner"] = owner
             write_eviction_status(a.receipt, owner)
             write_eviction_contention_health(a.receipt)
             result = deferred("eviction_busy", f"another eviction running; skipped ({eviction_owner_text(owner)})",
@@ -7985,6 +8080,16 @@ def _home_free() -> int | None:
         return None
 
 
+def _owner_line(owner: Any) -> dict[str, Any] | None:
+    """The busy skip's evict.lock holder for the run line: its pid, command and when it took the lock."""
+    if not isinstance(owner, dict):
+        return None
+    started = owner.get("started_at")
+    return {"pid": owner.get("pid"), "command": str(owner.get("command") or "")[:120] or None,
+            "since": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(started))
+            if isinstance(started, (int, float)) else None}
+
+
 def write_run_line(started: float, free_before: int | None) -> None:
     """The run's one line in RUN_LOG; a log that cannot be written never fails the run."""
     after = _home_free()
@@ -8000,7 +8105,8 @@ def write_run_line(started: float, free_before: int | None) -> None:
            "reclaimed_gib": round(RUN.get("released", 0) / GIB, 1),
            "reached": None if target is None or after is None else after >= target,
            "blocked": RUN.get("blocked", {}), "duration_s": round(time.time() - started, 1),
-           "skipped": RUN.get("skipped"), "cmux_next_ci_over_gib": RUN.get("cmux_next_ci_over_gib")}
+           "skipped": RUN.get("skipped"), "cmux_next_ci_over_gib": RUN.get("cmux_next_ci_over_gib"),
+           "caller": RUN.get("caller"), "evict_owner": _owner_line(RUN.get("evict_owner"))}
     with contextlib.suppress(OSError):
         RUN_LOG.parent.mkdir(parents=True, exist_ok=True)
         with RUN_LOG.open("a") as f:
@@ -8010,11 +8116,15 @@ def write_run_line(started: float, free_before: int | None) -> None:
 def _logged_main(args: list[str]) -> int:
     """_main_impl, then one run line when it was an --apply run (whatever it did, or why it skipped)."""
     RUN.clear()
+    RUN["caller"] = run_caller()
     started, before = time.time(), _home_free()
     try:
-        return _main_impl(args)
+        status = _main_impl(args)
+        release_hook_pass(served=status == 0 and RUN.get("skipped") not in UNSERVED)
+        return status
     except BaseException as e:
         RUN.setdefault("skipped", f"error: {type(e).__name__}")
+        release_hook_pass(served=False)
         raise
     finally:
         if RUN.get("apply"):

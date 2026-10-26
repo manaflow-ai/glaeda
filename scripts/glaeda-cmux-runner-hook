@@ -51,7 +51,8 @@ With --capacity-units N (several runners on one mini, docs/CMUX_MINI_RUNNER.md 2
 share instead: a shared lock on host.lock plus units and tokens under FLEET_DIR/capacity (take_capacity). When
 they are taken a cmux job waits for them, with no time limit, and logs what it waits for and who holds it
 (CAPACITY_WAIT); another repository's job waits --guest-wait seconds and then refuses with "refused: capacity: ...".
-Only then does it run glaeda-disk --pressure --apply --top 0, bounded and never able to fail the job.
+Only then does it trigger the same queued glaeda-disk --pressure pass job-completed does (below), never able to fail
+the job and never holding it.
 
 An admitted job also gets a detached host sampler (unless --no-telemetry): it records load, the cores used by
 this job, by the other runner slots' jobs and by everything outside them, and the top outside processes, and
@@ -4064,7 +4065,7 @@ class Gate:
         before = free_or_none(path)
         try:
             proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.DEVNULL)
+                                    stderr=subprocess.DEVNULL, env=floor_disk_env("listener gate floor eviction"))
         except OSError as error:
             gate_log(f"under the {floor:g} GiB disk floor: glaeda-disk skipped: {type(error).__name__}")
             return
@@ -5604,8 +5605,14 @@ def disk_argv(explicit: str | None, floor_gib: float = 0.0) -> list[str] | None:
     return [sys.executable, disk, "--pressure", "--apply", "--top", "0", *floor]
 
 
+def floor_disk_env(caller: str) -> dict[str, str]:
+    """A floor eviction's environment: it must free space now, so glaeda-disk never folds it into the queued pass
+    (GLAEDA_DISK_HOOK_PASS, as the queue's own pass), and its run line names the caller."""
+    return {**os.environ, "GLAEDA_DISK_HOOK_PASS": "1", "GLAEDA_DISK_CALLER": caller}
+
+
 def disk_pressure(explicit: str | None, floor_gib: float = 0.0, timeout: float = DISK_TIMEOUT_S) -> str:
-    """Best effort. Returns a one-line note; never raises."""
+    """The floor eviction before refusing a job (evict). Best effort. Returns a one-line note; never raises."""
     try:
         argv = disk_argv(explicit, floor_gib)
         if argv is None:
@@ -5614,7 +5621,7 @@ def disk_pressure(explicit: str | None, floor_gib: float = 0.0, timeout: float =
         result = subprocess.run(
             argv,
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            timeout=timeout, check=False,
+            timeout=timeout, check=False, env=floor_disk_env("runner hook floor eviction"),
         )
         return f"glaeda-disk exited {result.returncode}"
     except subprocess.TimeoutExpired:
@@ -5646,8 +5653,10 @@ import fcntl, os, subprocess, sys, time
 timeout, lifetime = float(sys.argv[1]), float(sys.argv[2])
 lock, pending, evict = sys.argv[3:6]
 argv = sys.argv[6:]
+os.environ["GLAEDA_DISK_HOOK_PASS"] = "1"  # glaeda-disk's HOOK_PASS_ENV: this is the queue's own pass
+os.environ.setdefault("GLAEDA_DISK_CALLER", "runner hook pass")
 end = time.monotonic() + lifetime
-BUSY = (b"another eviction running", b"another measurement running")
+BUSY = (b"another eviction running", b"another measurement running", b"deferred: a CI job is running")
 
 claimed = pending + ".claimed"  # the triggers the current pass serves; removed only once a pass ran after them
 
@@ -5682,13 +5691,13 @@ def run_pass():
     if not evict_free(deadline) or deadline - time.monotonic() <= 0:
         return False
     try:
-        out = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                             timeout=deadline - time.monotonic(), check=False).stdout or b""
+        done = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              timeout=deadline - time.monotonic(), check=False)
     except subprocess.TimeoutExpired:
         return True  # it ran, cut at its bound
     except OSError:
         return False  # glaeda-disk did not start: keep the trigger
-    return not any(busy in out for busy in BUSY)
+    return done.returncode == 0 and not any(busy in (done.stdout or b"") for busy in BUSY)
 
 try:
     held = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
@@ -5814,7 +5823,7 @@ def disk_skip_line(why: str, free: float, targets: dict[str, int] | None) -> Non
            "free_gib_before": round(free, 1), "free_gib_after": round(free, 1),
            "target_gib": None if home is None else round(home / 1024**3, 1), "target_bytes": home,
            "targets": targets, "default_targets": False, "config_sha256": None, "floor_gib": None,
-           "reclaimed_gib": 0.0,
+           "caller": "runner hook trigger", "evict_owner": None, "reclaimed_gib": 0.0,
            "reached": None if home is None else free * 1024**3 >= home,
            "blocked": {}, "duration_s": 0.0, "skipped": why, "cmux_next_ci_over_gib": None}
     with contextlib.suppress(OSError):
@@ -6252,7 +6261,10 @@ def main(argv: list[str] | None = None) -> int:
         if skip_disk:  # nothing ran, so nothing to free; the runner is back on the queue at once
             print(f"{PREFIX}: refused in job-started; no disk pass", flush=True)
     if not args.no_disk and not skip_disk:
-        note = disk_pressure_detached(args.disk) if args.phase == "job-completed" else disk_pressure(args.disk)
+        # both phases trigger the one queued pass: job-started ran its own pass before every job, which spent 10-20 s
+        # measuring and then skipped as busy behind the queue's (cmux14, 2026-10-26: 23 of 28 busy skips in an hour
+        # came within 150 s of a job start); under the floor, evict() above still frees space before admitting
+        note = disk_pressure_detached(args.disk)
         print(f"{PREFIX}: {note}", flush=True)
     if args.phase == "job-completed":  # last: between this job and the next
         note = install_staged_hook(Path(__file__).resolve().parent)
