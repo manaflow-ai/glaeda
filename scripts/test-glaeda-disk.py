@@ -1450,6 +1450,70 @@ class GlaedaDiskTest(unittest.TestCase):
                 mock.patch.object(gd.subprocess, "run", lambda argv, **_: subprocess.CompletedProcess(argv, 113)):
             self.assertTrue(gd.owner_retired(one))
 
+    def test_a_retired_workers_cache_entries_idle_a_week_are_mirrors(self) -> None:
+        """cmux14, 2026-10-25: at the 30 GiB floor with 0.0G reclaimable, while its unloaded hq workers'
+        cmux-workspaces (idle 190 h), cmux-tui-target (289 h) and swiftpm (310 h) read git-checkout or unchecked."""
+        real = gd.hq_cache_family()
+        self.assertEqual((real.root, real.reference_root), (gd.FLEET_ROOT / "cache", gd.FLEET_ROOT))
+        self.assertEqual(real.mirror_idle_hours, gd.CMUX_JOB_MIRROR_HOURS)
+        self.assertTrue(real.retired_only)
+        self.assertEqual(real.owner_job, gd.HQ_BUILD_WORKERS)
+        cache = self.root / "cache"
+        fam = gd.hq_cache_family(cache)
+        self.assertEqual(fam.reference_root, self.root)
+        week = gd.CMUX_JOB_MIRROR_HOURS
+        for name, hours in (("cmux-workspaces", week + 22), ("swiftpm", week + 142), ("fresh-workspaces", 72),
+                            ("leased", week + 50), ("cmux-tui-target", week + 121)):
+            make(cache / name, age_hours=hours)
+        for name in ("cmux-workspaces", "fresh-workspaces", "leased"):
+            (cache / name / "key/src/.git").mkdir(parents=True)
+            t = time.time() - (72 if name == "fresh-workspaces" else week + 22) * 3600
+            for d in (cache / name / "key/src/.git", cache / name / "key/src", cache / name / "key", cache / name):
+                os.utime(d, (t, t))
+        (cache / "swiftpm/repositories/dep/.git").mkdir(parents=True)
+        t = time.time() - (week + 142) * 3600
+        for d in (cache / "swiftpm/repositories/dep/.git", cache / "swiftpm/repositories/dep",
+                  cache / "swiftpm/repositories", cache / "swiftpm"):
+            os.utime(d, (t, t))
+        (self.root / "jobs").mkdir()
+        (self.root / "jobs/j.json").write_text(json.dumps({"state": "running", "path": os.fspath(cache / "leased")}))
+        gd._LIVE_REFERENCES.clear()
+        self.addCleanup(gd._LIVE_REFERENCES.clear)
+        real_git = gd.family_git_state
+
+        def git_state(f, path):  # a cargo target dir too large to search
+            return "unchecked" if path.name == "cmux-tui-target" else real_git(f, path)
+
+        with mock.patch.object(gd, "family_git_state", git_state):
+            with mock.patch.object(gd, "owner_retired", return_value=True):
+                items = {Path(i.path).name: i for i in gd.survey([fam], 24, 0)}
+            with mock.patch.object(gd, "owner_retired", return_value=False):  # a worker builds here
+                live = {Path(i.path).name: i.verdict for i in gd.survey([fam], 24, 0)}
+        self.assertEqual({k: i.verdict for k, i in items.items()}, {
+            "cmux-workspaces": "reclaimable", "swiftpm": "reclaimable", "cmux-tui-target": "reclaimable",
+            "fresh-workspaces": "git-checkout",  # idle three days: its clone still has to lose nothing
+            "leased": "in-use"})  # a running fleet job names it
+        self.assertIn("idle 168h+: its checkouts are mirrors", items["cmux-workspaces"].reasons)
+        self.assertIn("live lease or running job", items["leased"].reasons)
+        self.assertEqual({k for k, v in live.items() if v != "report-only"}, {"leased"})
+        reclaim = [i for i in items.values() if i.verdict == "reclaimable"]
+        # between the survey and the delete a fleet job leases swiftpm and a process starts in cmux-tui-target:
+        # apply re-reads both (the survey's cached references and process snapshot are stale by then)
+        (self.root / "jobs/late.json").write_text(json.dumps({"until": time.time() + 600,
+                                                              "path": os.fspath(cache / "swiftpm")}))
+        late = ([], f"cargo build --target-dir {cache / 'cmux-tui-target'}\n")
+        receipt = self.receipt()
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(gd, "owner_retired", return_value=True), \
+                mock.patch.object(gd, "family_git_state", git_state), \
+                mock.patch.object(gd, "process_evidence", return_value=late), \
+                mock.patch.object(gd, "command_lines", return_value=late[1]):
+            gd.apply(reclaim, {fam.id: fam}, receipt, None, 24)
+        self.assertEqual(sorted(p.name for p in cache.iterdir()),
+                         ["cmux-tui-target", "fresh-workspaces", "leased", "swiftpm"])
+        outcomes = {Path(r["path"]).name: r["outcome"] for r in map(json.loads, receipt.read_text().splitlines())}
+        self.assertEqual(outcomes, {"cmux-workspaces": "reclaimed", "swiftpm": "changed:in-use",
+                                    "cmux-tui-target": "changed:in-use"})
+
     def test_pressure_waits_for_a_ci_job_until_the_emergency_floor(self) -> None:
         job = "/Users/cmux/actions-runner-glaeda-2/bin/Runner.Worker spawnclient 148 151"
         self.assertTrue(gd.CI_WORKER.search(job))
@@ -1937,6 +2001,51 @@ class GlaedaDiskTest(unittest.TestCase):
             self.assertFalse(gd.canonical_root_held(two / "src"))
         self.assertTrue(gd.canonical_root_held(tmp / "cmux-ci-next" / "derived-data-x"))
         self.assertFalse(gd.remove_canonical_admission(tmp / "cmux-ci-next" / "derived-data-x"))
+
+    def test_canonical_admission_gives_way_under_the_runner_floor_only_while_no_job_holds_its_root(self) -> None:
+        """cmux14, 2026-10-25: at the 30 GiB floor with 9.1 and 8.7 GiB of admission DerivedData idle 9 and 21 h
+        ("recent" under the 24 h window) on two roots no job held, and 0.0G reclaimable."""
+        tmp, capacity = self.root / "tmp", self.root / "capacity"
+        capacity.mkdir()
+        for k in (1, 2, 3):
+            (capacity / f"root-{k}.token").touch()
+        roots = {k: tmp / ("cmux-ci" if k == 1 else f"cmux-ci-{k}") for k in (1, 2, 3)}
+        for k, hours in ((1, 9.3), (2, 20.9), (3, 0.5)):
+            make(roots[k] / "derived-data-compile-admission", age_hours=hours)
+            make(roots[k] / "src", age_hours=hours)
+        job = open(capacity / "root-3.token")
+        self.addCleanup(job.close)
+        fcntl.flock(job, fcntl.LOCK_EX)  # a compile (or a product consumer) holds root 3
+        dev = tmp.stat().st_dev
+
+        def verdicts(hold):
+            with mock.patch.object(gd, "CANONICAL_CAPACITY", capacity), \
+                    mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "FLOOR_HOLD", hold):
+                fams = gd.canonical_admission_families(tmp)
+                return fams, {os.path.relpath(i.path, tmp): i.verdict for i in gd.survey(fams, 6, 0)}
+        _, above = verdicts({})
+        self.assertEqual(set(above.values()), {"recent", "in-use"})  # above the floor the 24 h window stands
+        fams, under = verdicts({dev: 50 * gd.GIB})
+        self.assertEqual(under, {"cmux-ci/derived-data-compile-admission": "reclaimable",
+                                 "cmux-ci-2/derived-data-compile-admission": "reclaimable",
+                                 "cmux-ci-3/derived-data-compile-admission": "in-use"})
+        # least recently used first, and only down to the floor plus target_margin_gib: 35 -> 45 -> stop at 50
+        patches, removed = self._floor_disk(35.0)
+        with patches[0], patches[1], mock.patch.object(gd, "CANONICAL_CAPACITY", capacity), \
+                mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), \
+                mock.patch.object(gd, "FLOOR_HOLD", {dev: 50 * gd.GIB}), contextlib.redirect_stdout(io.StringIO()):
+            items = gd.survey(fams, 6, 0)
+            gd.apply(items, {f.id: f for f in fams}, self.receipt(), None, 6, all_families=fams)
+        self.assertEqual(len(removed), 2)
+        self.assertFalse((roots[2] / "derived-data-compile-admission").exists(), "the older root goes first")
+        self.assertFalse((roots[1] / "derived-data-compile-admission").exists())
+        self.assertTrue((roots[3] / "derived-data-compile-admission").exists(), "a held root keeps its build")
+        self.assertTrue(all((roots[k] / "src").exists() for k in roots), "src stays the tmp family's to judge")
+        # a root without a token file is outside the runner hook's protocol: its 24 h window stands
+        (capacity / "root-1.token").unlink()
+        make(roots[1] / "derived-data-compile-admission", age_hours=9.3)
+        _, under = verdicts({dev: 50 * gd.GIB})
+        self.assertEqual(under["cmux-ci/derived-data-compile-admission"], "recent")
 
     def test_the_tmp_family_deletes_a_whole_canonical_root_only_under_its_root_token(self) -> None:
         """The tmp family judges /private/tmp/cmux-ci and cmux-ci-<k> as one item each and may delete a whole one

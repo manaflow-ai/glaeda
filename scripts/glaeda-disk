@@ -124,9 +124,11 @@ disposable; newer ones stay when a live reservation or lease names them.
 Under the runner gate's disk floor (FLOOR_HOLD) the windows that only keep things warm give way, least
 recently used first and only down to the floor plus target_margin_gib: an idle runner's checkout build
 output, its cmux-next scheme state's generated output (cmux-scheme/<runner name>, only while that runner
-has no Runner.Worker), and code-sign clones other than each bundle's newest copy and any running app's.
+has no Runner.Worker), a canonical build root's admission DerivedData while no job holds the root's token,
+and code-sign clones other than each bundle's newest copy and any running app's.
 cmux7s sat at 21 GiB under a 30 GiB floor with 40 GiB of media CI's cmux DEV clones and 20 GiB of
-per-runner cmux-next Build "recent" (2026-10-21).
+per-runner cmux-next Build "recent" (2026-10-21). cmux14 sat at the floor with 17.9 GiB of admission
+DerivedData idle 9-21 h on two roots no job held (2026-10-25).
 
 Kill switch: while ~/.config/glaeda/disk-off exists, or disk-policy.json has "enabled": false, an
 --apply (or --dedupe) run deletes nothing; it says so and exits 0. Every --apply run, whatever it
@@ -515,6 +517,12 @@ def live_artifact_references(root: Path = FLEET_ROOT) -> frozenset[str]:
     result = frozenset(refs)
     _LIVE_REFERENCES[key] = result
     return result
+
+
+def fresh_artifact_references(root: Path) -> frozenset[str]:
+    """live_artifact_references read again now: apply's re-check before a delete, never the survey's cached set."""
+    _LIVE_REFERENCES.pop(os.fspath(root), None)
+    return live_artifact_references(root)
 
 
 def artifact_referenced(path: Path, references: frozenset[str]) -> bool:
@@ -930,9 +938,16 @@ def item_window(fam: Family, path: Path, idle_hours: float, archived: frozenset[
 def floor_hold_family(fam: Family, path: Path) -> bool:
     """Whether the runner gate's floor hold lets PATH go before its family's window: an idle runner's checkout
     build output, an enrolled runner's cmux-next scheme output (its Runner.Worker vetoes it in
-    cmux_next_ci_busy), and code-sign clones (keep_live_app_clones and app_clone_running keep the live ones)."""
+    cmux_next_ci_busy), a canonical root's admission DerivedData once the root has a token file (the token keeps
+    it while a compile or a product consumer holds the root: canonical_root_held, re-checked at apply with fresh
+    process evidence and taken exclusive to delete; the next compile on the root clears it anyway, and a rerun
+    restores it from the artifact; a root without a token file keeps its 24 h window), and code-sign clones
+    (keep_live_app_clones and app_clone_running keep the live ones)."""
     if fam.id == RUNNER_BUILD_FAMILY or fam.app_clones:
         return True
+    if fam.id == CANONICAL_ADMISSION:  # only where the runner hook's token protocol is in force on this root
+        token = canonical_root_token(path)
+        return token is not None and token.is_file() and not token.is_symlink()
     return fam.id == CMUX_NEXT_CI_FAMILY and not CMUX_NEXT_CI_DRAIN and (
         cmux_next_ci_runner(path, fam.root) is not None or cmux_next_ci_floor_slot(fam, path))
 
@@ -2159,6 +2174,7 @@ def bazel_family(root: Path) -> Family:
 
 # launchd services of the hq build workers that read and write /Users/Shared/cmux-build-fleet/cache
 HQ_BUILD_WORKERS = ("system/ai.manaflow.cmux-build-worker", "system/ai.manaflow.cmux-lent-worker")
+HQ_CACHE_FAMILY = "hq-build-fleet-cache"
 
 # A reload-cloud unit's checkouts are mirrors: cmux-base is a clone of GitHub (sync-repo.sh checks out
 # origin/<branch> into it) and work/<slot> is that clone with the developer's tree rsynced over it from their
@@ -2185,6 +2201,25 @@ def transcript_candidates(root: Path, archives: bool = False) -> list[Path]:
                 except OSError:
                     continue
     return found
+
+
+# The hq build workers' shared cache: the dedicated dev-build worker (cmuxterm-hq#661) and the lent worker
+# on borrowed minis (ai.manaflow.cmux-lent-worker, CMUX_CI_SHARED_CACHE_DIR) both build in it. It is
+# retired, and reclaimable, only while neither service is loaded. Naming only the dev-build worker
+# labelled the lent minis' live cmux-workspaces "RETIRED" (cmux12s, 2026-10-11).
+# A retired worker's checkouts are mirrors as a reload unit's are: cmux-workspaces/<key>/src is a clone the
+# worker synced from GitHub, swiftpm holds SwiftPM's own clones, and no person edits either. So once an entry
+# sat idle a week, no git check keeps it, and a tree too deep to search (cmux-tui-target, a cargo target dir)
+# is not kept as "unchecked" either. A fleet lease or running job that names an entry still keeps it, as in
+# fleet-artifacts over the same directory. cmux14 sat at the 30 GiB floor with 0.0G reclaimable while
+# cmux-workspaces (11.6 GiB, idle 190 h), cmux-tui-target (4.2 GiB, 289 h) and swiftpm (3.9 GiB, 310 h) of
+# its unloaded workers read "git-checkout" and "unchecked" (2026-10-25).
+def hq_cache_family(root: Path | None = None) -> Family:
+    return Family(HQ_CACHE_FAMILY, FLEET_ROOT / "cache" if root is None else root, True,
+                  "the hq build worker rebuilds its cache", retired_only=True,
+                  owner="cmux dev-build and lent build workers (hq controller)",
+                  owner_job=HQ_BUILD_WORKERS, mirror_idle_hours=CMUX_JOB_MIRROR_HOURS,
+                  reference_root=FLEET_ROOT if root is None else root.parent, platform="macos")
 
 
 def default_families(role: str = "fleet-mini") -> list[Family]:
@@ -2276,14 +2311,7 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
                            app_clones=True, build_output=True, min_idle_hours=2.0,
                            owner="Chromium-based apps, one bundle copy per launch",
                            rebuild_minutes=0.5, platform="macos"))
-    # The hq build workers' shared cache: the dedicated dev-build worker (cmuxterm-hq#661) and the lent worker
-    # on borrowed minis (ai.manaflow.cmux-lent-worker, CMUX_CI_SHARED_CACHE_DIR) both build in it. It is
-    # retired, and reclaimable, only while neither service is loaded. Naming only the dev-build worker
-    # labelled the lent minis' live cmux-workspaces "RETIRED" (cmux12s, 2026-10-11).
-    fams.append(Family("hq-build-fleet-cache", Path("/Users/Shared/cmux-build-fleet/cache"), True,
-                       "the hq build worker rebuilds its cache", retired_only=True,
-                       owner="cmux dev-build and lent build workers (hq controller)",
-                       owner_job=HQ_BUILD_WORKERS, platform="macos"))
+    fams.append(hq_cache_family())
     bazel_user = ""
     with contextlib.suppress(KeyError):
         bazel_user = pwd.getpwuid(uid).pw_name
@@ -5921,7 +5949,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         if halt is not None and (why := halt()):
             print(f"stopped: {why}")
             break
-        if fam.id in FLEET_FAMILY_IDS or fam.id == CMUX_NEXT_CI_FAMILY or (
+        if fam.id in FLEET_FAMILY_IDS or fam.id in (CMUX_NEXT_CI_FAMILY, HQ_CACHE_FAMILY, CANONICAL_ADMISSION) or (
                 fam.id == INTERRUPTED and fam.root in cmux_next_ci_state_parents(HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT)):
             # Pressure eligibility is intentionally broad, so take fresh cwd/open-file evidence immediately
             # before each rename. A job may start using a candidate after the survey or during a long pass.
@@ -5970,6 +5998,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 or (fam.id == RUNNER_BUILD_FAMILY and runner_job_live(fam.root.parent, cmds))
                 or (fam.app_clones and app_clone_running(p, cmds))
                 or in_cwd(i.path, cwds) or named_by(i.path, cmds) or holds_socket(p) or job_busy(fam, p)
+                or (fam.reference_root is not None
+                    and artifact_referenced(p, fresh_artifact_references(fam.reference_root)))
                 or (i.family == "claude-scratchpad" and claude_session_active(p.name, idle_hours * 3600))
                 or (i.family == SPM_SCRATCH and spm_scratch_held(p))
                 or (i.family == CANONICAL_ADMISSION and canonical_root_held(p))
