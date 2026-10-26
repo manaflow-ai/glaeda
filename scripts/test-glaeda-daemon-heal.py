@@ -44,6 +44,8 @@ class FakeHost(heal.Host):
         self.signals: list[tuple[int, int]] = []
         self.respawn: dict[str, int] = {}
         self.survives_term = False
+        self.sizes: dict[int, int] = {}  # pid -> footprint bytes
+        self.asked: list[list[int]] = []
 
     def add(self, pid: int, exe: str, rate: float, uid: int = 0) -> None:
         self.procs[pid] = [uid, 0.0, exe, rate]
@@ -58,6 +60,10 @@ class FakeHost(heal.Host):
 
     def processes(self):
         return [(pid, r[0], r[1], r[2]) for pid, r in self.procs.items()]
+
+    def footprints(self, pids):
+        self.asked.append(list(pids))
+        return {pid: self.sizes[pid] for pid in pids if pid in self.sizes and pid in self.procs}
 
     def signal(self, pid: int, sig: int) -> bool:
         self.signals.append((pid, sig))
@@ -104,7 +110,8 @@ class Policy(unittest.TestCase):
                 heal.validate_policy(bad)
 
     def test_numbers_are_validated(self) -> None:
-        for key, value in (("hot_hours", 0), ("hot_cores", "1"), ("every_s", True), ("busy_hot_hours", 1)):
+        for key, value in (("hot_hours", 0), ("hot_cores", "1"), ("every_s", True), ("busy_hot_hours", 1),
+                           ("footprint_gib", 0), ("footprint_gib", None)):
             bad = copy.deepcopy(POLICY)
             bad[key] = value
             with self.assertRaises(heal.HealError, msg=key):
@@ -123,6 +130,41 @@ class Policy(unittest.TestCase):
         self.assertEqual(heal.cpu_seconds("0:12.59"), 12.59)
         self.assertEqual(heal.cpu_seconds("1-02:03:04"), ((24 + 2) * 60 + 3) * 60 + 4)
         self.assertIsNone(heal.cpu_seconds("-"))
+
+    def test_footprint_parsing(self) -> None:
+        self.assertEqual(heal.footprint_bytes("102G"), 102 << 30)
+        self.assertEqual(heal.footprint_bytes("1264M"), 1264 << 20)
+        self.assertEqual(heal.footprint_bytes("31M+"), 31 << 20)
+        self.assertEqual(heal.footprint_bytes("4096K-"), 4096 << 10)
+        self.assertEqual(heal.footprint_bytes("12B"), 12)
+        self.assertEqual(heal.footprint_bytes("1.5T"), int(1.5 * (1 << 40)))
+        for bad in ("", "-", "MEM", "12X", "G"):
+            self.assertIsNone(heal.footprint_bytes(bad), bad)
+
+    def test_host_reads_footprints_from_top_for_the_asked_pids_only(self) -> None:
+        top = ("Processes: 900 total\nPhysMem: 37G used (3421M wired, 11G compressor), 11G unused.\n\n"
+               "PID  MEM  \n427  102G \n1    31M+ \n9    5M\n")
+        calls = []
+
+        def fake_sh(argv, timeout=15):
+            calls.append(argv)
+            return 0, top, ""
+
+        real = heal.sh
+        heal.sh = fake_sh
+        try:
+            self.assertEqual(heal.Host().footprints([1, 427]), {427: 102 << 30, 1: 31 << 20})
+            self.assertEqual(heal.Host().footprints([]), {})
+        finally:
+            heal.sh = real
+        self.assertEqual(len(calls), 1, "no pids: top is not run")
+        heal.sh = lambda argv, timeout=15: (1, top, "top: failure")
+        try:
+            self.assertEqual(heal.Host().footprints([427]), {}, "a failed top measures nothing, whatever it printed")
+        finally:
+            heal.sh = real
+        self.assertEqual(calls[0][:2], ["/usr/bin/top", "-l"])
+        self.assertEqual([calls[0][i + 1] for i, a in enumerate(calls[0]) if a == "-pid"], ["1", "427"])
 
 
 class Reconcile(Base):
@@ -205,6 +247,62 @@ class Reconcile(Base):
         actions = self.run_for(self.policy["hot_hours"] + 0.1)
         self.assertEqual(self.host.signals, [(421, signal.SIGTERM), (421, signal.SIGKILL)])
         self.assertIn("SIGKILL after SIGTERM", actions[0]["action"])
+
+    def test_bloated_daemon_restarts_at_once_even_on_a_busy_host_and_while_cool(self) -> None:
+        """cmuxs-mac-mini-6 10-25: fseventsd at 102 GiB (65 GiB of it swap) and 3 GiB of disk free."""
+        self.host.add(427, FSEV["path"], 0.0)
+        self.host.sizes[427] = 102 << 30
+        self.host.add(77, "/Users/cmux/actions-runner-glaeda/bin/Runner.Worker", 0.0, uid=501)
+        self.host.respawn[FSEV["path"]] = 9000
+        report = self.tick()
+        self.assertEqual([a["name"] for a in report["actions"]], ["fseventsd"])
+        self.assertEqual(self.host.signals, [(427, signal.SIGTERM)])
+        self.assertEqual(report["healed"][0]["footprint_gib"], 102.0)
+        self.assertEqual(self.tick()["actions"], [], "the fresh daemon is small and cool")
+
+    def test_a_footprint_under_the_cap_waits_for_the_cpu_rule(self) -> None:
+        self.host.add(427, FSEV["path"], 0.0)
+        self.host.sizes[427] = int(self.policy["footprint_gib"] * heal.GIB) - 1
+        self.assertEqual(self.run_for(self.policy["busy_hot_hours"] + 1), [])
+        self.assertEqual(self.tick()["hot"], [])
+
+    def test_the_footprint_cap_follows_the_policy(self) -> None:
+        self.policy["footprint_gib"] = 1
+        self.host.add(427, FSEV["path"], 0.0)
+        self.host.sizes[427] = 1 << 30
+        self.assertEqual(len(self.tick()["actions"]), 1)
+
+    def test_a_bloated_daemon_is_held_to_the_daily_restart_cap(self) -> None:
+        self.policy["max_restarts_per_day"] = 2
+        pid = 100
+        self.host.add(pid, FSEV["path"], 0.0)
+        actions = []
+        for _ in range(5):
+            for p in list(self.host.procs):
+                self.host.sizes[p] = 50 << 30
+            self.host.respawn[FSEV["path"]] = pid = pid + 1
+            actions += self.tick()["actions"]
+        self.assertEqual(len(actions), 2)
+        hot = self.tick()["hot"][0]
+        self.assertIn("2 restarts in the last day", hot["waiting"])
+        self.assertEqual(hot["footprint_gib"], 50.0)
+
+    def test_plan_reports_a_bloated_daemon_without_signalling(self) -> None:
+        self.host.add(427, FSEV["path"], 0.0)
+        self.host.sizes[427] = 102 << 30
+        hot = self.tick(apply=False)["hot"]
+        self.assertEqual(self.host.signals, [])
+        self.assertEqual(hot[0]["waiting"], "would restart now (plan)")
+        self.assertIn("footprint 102.0 GiB", hot[0]["why"])
+
+    def test_footprints_are_asked_once_per_pass_for_the_policy_daemons_only(self) -> None:
+        self.host.add(427, FSEV["path"], 0.0)
+        self.host.add(500, FSEV["path"], 0.0, uid=501)  # a user process at that path is not the daemon
+        self.host.add(283, WRM["path"], 0.0)
+        self.host.sizes[500] = 900 << 30
+        self.tick()
+        self.assertEqual(self.host.asked, [[283, 427]], "the user process at fseventsd's path is not asked")
+        self.assertEqual(self.host.signals, [])
 
     def test_a_new_pid_starts_over(self) -> None:
         self.host.add(421, FSEV["path"], 1.0)

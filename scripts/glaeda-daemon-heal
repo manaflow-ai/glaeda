@@ -15,6 +15,11 @@ what clears fseventsd's wedged notify thread (cmux9 10-20: 100% CPU and 27 GiB R
 after one restart). A `wait_idle` daemon (fseventsd: a restart drops live FSEvents streams) waits while a process
 named in `busy` runs, up to busy_hot_hours. At most max_restarts_per_day per daemon, so nothing loops.
 
+A daemon whose memory footprint (top's MEM: resident, compressed and swapped pages) is footprint_gib or more is
+restarted at once, busy host or not: a wedged fseventsd never gives that memory back, and its swap files take the
+disk the runners need. cmuxs-mac-mini-6 10-25: fseventsd at 102 GiB footprint for 14 days, 65 GiB of swap files on
+the VM volume and 3 GiB left on a 460 GiB disk, while its CPU streak kept breaking and the busy wait held it 8 h.
+
 Only processes whose executable is exactly a policy path run as a system account (uid < 500) are touched, and a
 policy path must lie under a SIP-protected system directory. The installed copy and its policy are root-owned
 snapshots under INSTALL_DIR run by /usr/bin/python3 -I, so nothing the runner user (or a PR job) can write runs as
@@ -52,8 +57,10 @@ POLICY_NAME = "macos-daemons.json"
 SYSTEM_PREFIXES = ("/System/", "/usr/libexec/", "/usr/sbin/", "/usr/bin/", "/sbin/")
 SYSTEM_UID_MAX = 499
 DAY_S = 86400
+GIB = 1 << 30
+UNITS = {"B": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
 POLICY_KEYS = {"every_s": int, "hot_cores": (int, float), "hot_hours": (int, float), "busy_hot_hours": (int, float),
-               "max_restarts_per_day": int, "stop_wait_s": (int, float), "report_stale_passes": int, "busy": list,
+               "footprint_gib": (int, float), "max_restarts_per_day": int, "stop_wait_s": (int, float), "report_stale_passes": int, "busy": list,
                "daemons": list}
 
 
@@ -120,6 +127,12 @@ def cpu_seconds(text: str) -> float | None:
     return ((int(d or 0) * 24 + int(h or 0)) * 60 + int(mi)) * 60 + float(s)
 
 
+def footprint_bytes(text: str) -> int | None:
+    """top's MEM column (102G, 1264M, 31M+, 4096K, 12B) in bytes."""
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([BKMGT])[+-]?", text.strip())
+    return None if not m else int(float(m.group(1)) * UNITS[m.group(2)])
+
+
 class Host:
     """What a pass reads and does. Tests replace these methods."""
 
@@ -133,6 +146,25 @@ class Host:
                 if cpu is not None:
                     rows.append((int(parts[0]), int(parts[1]), cpu, parts[3].strip()))
         return rows
+
+    def footprints(self, pids: list[int]) -> dict[int, int]:
+        """pid -> memory footprint in bytes (top's MEM, which counts compressed and swapped pages; ps rss does not)."""
+        if not pids:
+            return {}
+        argv = ["/usr/bin/top", "-l", "1", "-s", "0", "-stats", "pid,mem"]
+        for pid in pids:
+            argv += ["-pid", str(pid)]
+        code, text, _err = sh(argv, timeout=30)
+        if code != 0:  # a failed top measured nothing, whatever it printed
+            return {}
+        out = {}
+        for line in text.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0].isdigit() and int(parts[0]) in pids:
+                size = footprint_bytes(parts[1])
+                if size is not None:
+                    out[int(parts[0])] = size
+        return out
 
     def signal(self, pid: int, sig: int) -> bool:
         try:
@@ -192,14 +224,20 @@ def reconcile(host: Host, policy: dict[str, Any], state: dict[str, Any], apply: 
                 for k, v in (state.get("restarts") or {}).items() if isinstance(v, list)}
     healed = [h for h in state.get("healed") or [] if isinstance(h, dict) and now - h.get("t", 0) < DAY_S]
     hot_s, busy_hot_s = policy["hot_hours"] * 3600, policy["busy_hot_hours"] * 3600
+    cap = int(policy["footprint_gib"] * GIB)
     hot, actions = [], []
+    found = {}
+    for daemon in policy["daemons"]:
+        mine = [(p, c) for p, u, c, exe in rows if exe == daemon["path"] and u <= SYSTEM_UID_MAX]
+        if len(mine) == 1:  # not running, or more than one: nothing to judge
+            found[daemon["name"]] = mine[0]
+    sizes = host.footprints(sorted(pid for pid, _c in found.values()))
     for daemon in policy["daemons"]:
         name = daemon["name"]
-        mine = [(p, c) for p, u, c, exe in rows if exe == daemon["path"] and u <= SYSTEM_UID_MAX]
-        if len(mine) != 1:  # not running, or more than one: nothing to judge
+        if name not in found:
             samples.pop(name, None)
             continue
-        pid, cpu = mine[0]
+        pid, cpu = found[name]
         prev = samples.get(name)
         since = None
         cores = None
@@ -208,13 +246,20 @@ def reconcile(host: Host, policy: dict[str, Any], state: dict[str, Any], apply: 
             if cores >= policy["hot_cores"]:
                 since = prev.get("since") or prev["t"]
         samples[name] = {"pid": pid, "t": now, "cpu": cpu, "since": since}
-        if since is None:
+        size = sizes.get(pid)
+        bloated = size is not None and size >= cap
+        if since is None and not bloated:
             continue
-        hot_for = now - since
-        entry = {"name": name, "pid": pid, "cores": round(cores or 0, 2), "since": iso(since),
+        hot_for = 0.0 if since is None else now - since
+        entry = {"name": name, "pid": pid, "cores": round(cores or 0, 2), "since": iso(since or now),
                  "hot_for_s": round(hot_for)}
-        due = hot_for >= hot_s
-        if due and daemon["wait_idle"] and busy and hot_for < busy_hot_s:
+        if size is not None:
+            entry["footprint_gib"] = round(size / GIB, 1)
+        due = hot_for >= hot_s and since is not None
+        if bloated:  # memory a wedged daemon never returns: its swap fills the disk, so no busy wait
+            due = True
+            entry["why"] = f"footprint {entry['footprint_gib']} GiB is at least {policy['footprint_gib']} GiB"
+        elif due and daemon["wait_idle"] and busy and hot_for < busy_hot_s:
             entry["waiting"] = f"host busy ({', '.join(busy)}); restarts anyway at {policy['busy_hot_hours']} h"
             due = False
         if due and len(restarts.get(name, [])) >= policy["max_restarts_per_day"]:
@@ -233,7 +278,8 @@ def reconcile(host: Host, policy: dict[str, Any], state: dict[str, Any], apply: 
         actions.append({"name": name, "ok": ok, "action": what})
         if ok:
             samples.pop(name, None)
-            healed.append({"name": name, "t": now, "at": iso(now), "since": iso(since), "cores": entry["cores"],
+            healed.append({"name": name, "t": now, "at": iso(now), "since": entry["since"], "cores": entry["cores"],
+                           **({"footprint_gib": entry["footprint_gib"]} if "footprint_gib" in entry else {}),
                            "action": what})
         else:
             entry["waiting"] = what
