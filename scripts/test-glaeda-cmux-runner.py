@@ -4660,6 +4660,30 @@ class GateTest(unittest.TestCase):
             os.environ.pop("GITHUB_WORKFLOW_REF", None)
             self.assertEqual(hook.job_workflow(), "")
 
+    def test_dev_compile_capacity_wait_is_bounded_for_push_and_daily(self) -> None:
+        push = {"repository": CMUX, "ref": "refs/heads/feat-cmux-next"}
+        self.assertEqual(
+            hook.dev_compile_capacity_wait("manaflow-ai/cmux", hook.DEFAULT_HOME_REPO, "push",
+                                           "refs/heads/feat-cmux-next", push, "cmux-scheme-compile",
+                                           "cmux-next.yml"),
+            hook.DEV_COMPILE_CAPACITY_WAIT_S)
+        daily = {"repository": CMUX, "inputs": {"dev_daily": "true"}}
+        self.assertEqual(
+            hook.dev_compile_capacity_wait("manaflow-ai/cmux", hook.DEFAULT_HOME_REPO, "workflow_dispatch",
+                                           "refs/heads/feat-cmux-next", daily, "cmux-scheme-compile",
+                                           "cmux-next.yml"),
+            hook.DEV_COMPILE_CAPACITY_WAIT_S)
+
+    def test_other_capacity_waits_remain_unbounded(self) -> None:
+        event = {"repository": CMUX, "ref": "refs/heads/feat-cmux-next"}
+        for job, workflow, event_name in (("cmux-scheme-compile", "cmux-next.yml", "pull_request"),
+                                          ("generated-files", "cmux-next.yml", "push"),
+                                          ("cmux-scheme-compile", "other.yml", "push")):
+            with self.subTest(job=job, workflow=workflow, event=event_name):
+                self.assertIsNone(hook.dev_compile_capacity_wait(
+                    "manaflow-ai/cmux", hook.DEFAULT_HOME_REPO, event_name,
+                    "refs/heads/feat-cmux-next", event, job, workflow))
+
     def test_runner_scope_reads_the_hook_and_the_runner_directory(self) -> None:
         self.assertEqual(hook.runner_scope(self.runner), hook.RunnerScope(), "no hook script: no units, no root")
         script = self.runner / hook.RUNNER_HOOK_SCRIPT

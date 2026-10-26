@@ -329,8 +329,13 @@ DEFAULT_HOME_REPO = "manaflow-ai/cmux"
 
 
 GUEST_WAIT_S = 600.0  # guests have no rescue workflow: a full mini holds their job this long before refusing
-# CAPACITY_WAIT: a cmux job that finds its units or tokens taken waits for them, with no time limit, instead of
-# failing. GitHub handed the job to this runner and never moves it to another one, so a refusal only turned a
+# A DEV Release compile is placed again when the runner that accepted it is already full. GitHub cannot move a
+# job after it has entered runner setup, so the hook refuses after this short bounded wait; the owned-pool rescue
+# then re-runs it through placement, where an idle warm-cache mini (or the configured overflow) can take it.
+DEV_COMPILE_CAPACITY_WAIT_S = 60.0
+# CAPACITY_WAIT: an ordinary cmux job that finds its units or tokens taken waits for them, with no time limit,
+# instead of failing. The DEV cmux-next scheme compile is the bounded exception above: GitHub handed the job to
+# this runner and never moves it to another one, so a refusal only turned a
 # capacity problem into a red job and a rescue round trip (cmux PR #15160's compile admission, 2026-09-28: refused
 # after 240 s on cmux10s while two E2E builds on the mini's non-root runners held both canonical roots). A job
 # waiting here is still in its runner's setup, and cmux's owned-pool rescue re-runs a job that waits there too
@@ -403,6 +408,27 @@ def job_workflow() -> str:
     event = load_event(os.environ.get("GITHUB_EVENT_PATH")) if os.environ.get("GITHUB_EVENT_PATH") else None
     path = event.get("workflow") if isinstance(event, dict) else None
     return path.rsplit("/", 1)[-1] if isinstance(path, str) and path.startswith(".github/workflows/") else ""
+
+
+def dev_compile_capacity_wait(repo: str | None, home_repo: str, event_name: str | None,
+                              ref: str | None, event: dict[str, Any] | None, job: str,
+                              workflow: str) -> float | None:
+    """The bounded capacity wait for cmux NEXT's DEV compile, or None for ordinary jobs.
+
+    A push to feat-cmux-next runs the DEV Release product in ``cmux-scheme-compile``. A DEV daily
+    workflow_dispatch carries ``inputs.dev_daily=true``. Once either job has been claimed by a runner,
+    waiting longer only strands it on one mini; a refusal lets the owned-pool rescue run placement again.
+    """
+    if repo is None or repo.lower() != home_repo.lower() or workflow != "cmux-next.yml" \
+            or job != "cmux-scheme-compile":
+        return None
+    if event_name == "push" and ref == "refs/heads/feat-cmux-next":
+        return DEV_COMPILE_CAPACITY_WAIT_S
+    if event_name == "workflow_dispatch" and isinstance(event, dict):
+        inputs = event.get("inputs")
+        if isinstance(inputs, dict) and str(inputs.get("dev_daily", "")).lower() == "true":
+            return DEV_COMPILE_CAPACITY_WAIT_S
+    return None
 
 
 def job_class(job: str, repo: str | None, home_repo: str = DEFAULT_HOME_REPO,
@@ -5847,6 +5873,10 @@ def main(argv: list[str] | None = None) -> int:
             # A cmux job waits for capacity with no limit (CAPACITY_WAIT); a guest has no rescue workflow, so it
             # waits GUEST_WAIT_S for room and is then refused.
             cap = args.guest_wait if is_guest(repo, args.home_repo) else args.gui_wait
+            if cap is None:
+                cap = dev_compile_capacity_wait(
+                    repo, args.home_repo, os.environ.get("GITHUB_EVENT_NAME"),
+                    os.environ.get("GITHUB_REF"), event, os.environ.get("GITHUB_JOB", ""), job_workflow())
             start, since = time.monotonic(), time.time()
             marker = args.capacity_dir / f"{ADMIT_WANT}{os.getpid()}"
             shown, shown_at = "", 0.0
