@@ -145,6 +145,8 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
+          # HEAD^1 is the base: scripts/test-fleet-rule-lints.py refuses an allowlist that grew against it.
+          fetch-depth: 2
           persist-credentials: false
           show-progress: false
 
@@ -240,6 +242,7 @@ jobs:
               Path("scripts/test-hot-run.py"),
               Path("scripts/test-hot-pressure-shadow.py"),
               Path("scripts/test-benchmark-hot-state-fanout.py"),
+              Path("scripts/test-fleet-rule-lints.py"),
               Path("scripts/test-benchmark-pnpm-task-dependencies.py"),
               Path("scripts/test-benchmark-linker-throughput.py"),
               Path("scripts/test-hot-observe.py"),
@@ -392,6 +395,7 @@ jobs:
           suite python3 scripts/test-quarry-parallel.py
           suite python3 scripts/test-status-page.py
           suite python3 scripts/test-unittest-shard.py
+          suite env FLEET_RULE_BASE=HEAD^1 python3 scripts/test-fleet-rule-lints.py
           # a test that leaves files in the checkout fails, as it did before the split
           dirty=$(git status --porcelain=v1 --untracked-files=all)
           dirty=${dirty//%/%25}

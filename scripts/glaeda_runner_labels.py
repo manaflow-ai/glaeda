@@ -56,15 +56,12 @@ PERSONAL = ("runs only in teamleaderleo/glaeda, a personal-account repository: B
             "only and no owned runner serves it")
 HOSTED_ON_PURPOSE = ("measures the developer loop on a GitHub-hosted runner, so the hosted image is the thing "
                      "measured; it is dispatched or runs on pull requests that change the benchmark")
-HOSTED_BASELINE = ("the GitHub-hosted baseline the owned-runner JIT canary is compared with, so the hosted image is "
-                   "the thing measured; dispatched by hand")
 HOSTED_PROBE = ("records evidence from a fresh GitHub-hosted Ubuntu 24.04 VM (GLAEDA_PROBE_PROVIDER=github-hosted-ubuntu): "
                 "the hosted image, its preinstalled packages and cgroup layout, is the thing probed")
 PERSONAL_MACOS = PERSONAL + "; builds the aarch64-apple-darwin target"
 
 # (workflow file, job id) -> why the job stays on a GitHub-hosted image.
 HOSTED_ALLOWED: dict[tuple[str, str], str] = {
-    ("big-red-jit-canary.yml", "hosted-baseline"): HOSTED_BASELINE,
     ("control.yml", "control"): PERSONAL,
     ("developer-loop-benchmark.yml", "fresh-hosted"): HOSTED_ON_PURPOSE,
     ("developer-loop-benchmark.yml", "prepared-hosted"): HOSTED_ON_PURPOSE,

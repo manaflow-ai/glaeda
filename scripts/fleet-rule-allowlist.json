@@ -1,0 +1,124 @@
+{
+  "_doc": "scripts/test-fleet-rule-lints.py: rule -> path -> exact match count and why it is allowed. Counts may only go down.",
+  "keychain": {},
+  "pkill": {
+    "scripts/cmux_mini_fix.sh": {
+      "count": 3,
+      "reason": "SIGSTOP/SIGCONT of one runner's own listener tree, matched by that runner directory's escaped absolute path (runner_supervisors), on a CI mini glaeda manages; it freezes the runner glaeda installed so a job cannot start mid-repair. Debt: record the listener PIDs from launchd and signal those"
+    },
+    "scripts/glaeda-cmux-runner": {
+      "count": 5,
+      "reason": "the gate wrapper glaeda writes for its own runner: SIGSTOP/CONT/INT/TERM only processes whose command line is under that runner's own directory (escaped absolute path), i.e. the listener the gate itself supervises; 1 comment line. Debt: signal the gate's recorded child PID"
+    },
+    "scripts/glaeda-cmux-runner-hook": {
+      "count": 4,
+      "reason": "kills scoped -u to the runner user on a CI mini glaeda manages: SecurityAgent by exact name (-x; cancels keychain prompts a job's locked test keychain queued) and Diagnostics Reporter by its app executable path (-f '/Diagnostics Reporter.app/Contents/MacOS/', since its name is longer than -x compares; dismisses crash dialogs a job left); 2 comment lines"
+    },
+    "scripts/glaeda-idle-warm": {
+      "count": 1,
+      "reason": "pkill -9 -u <own uid> -x 'Problem Reporter': closes the crash dialog its own fuzz replay caused on a CI mini; scoped to the runner user"
+    },
+    "scripts/glaeda-wallpaper-rotate": {
+      "count": 2,
+      "reason": "pkill -x -u <own uid> WallpaperAgent: this user's agent, which launchd restarts to reload the wallpaper store; 1 comment line"
+    },
+    "scripts/test-glaeda-cmux-runner.py": {
+      "count": 4,
+      "reason": "test fixtures: fake pkill and expected argv for the scoped SecurityAgent and Diagnostics Reporter kills; nothing is signalled"
+    }
+  },
+  "big-red": {
+    "scripts/benchmark-hot-state-fanout": {
+      "count": 1,
+      "reason": "docstring of a historical benchmark harness naming where it was measured; no host is targeted"
+    },
+    "scripts/glaeda-gh": {
+      "count": 3,
+      "reason": "comments recording incidents seen on that host; no code path depends on it"
+    },
+    "scripts/glaeda_release.py": {
+      "count": 1,
+      "reason": "LEGACY_REQUIRED_HOSTS only lets release policies signed before 2026-10-19 still parse; the list is not enforced and promotion requires no host"
+    },
+    "scripts/hot_run_impl.py": {
+      "count": 2,
+      "reason": "debt: resource-profile names big-red-heavy/big-red-background (CLI interface, systemd scope limits only, run on any host); rename with an alias in a follow-up"
+    },
+    "scripts/quarry_parallel_impl.py": {
+      "count": 1,
+      "reason": "comment recording where a measurement was taken"
+    },
+    "scripts/test-external-execution-request.py": {
+      "count": 3,
+      "reason": "test fixtures using the name as data (resource class, machine string)"
+    },
+    "scripts/test-glaeda-cmux-runner.py": {
+      "count": 1,
+      "reason": "test fixture: a reservation owner string"
+    },
+    "scripts/test-glaeda-disk.py": {
+      "count": 1,
+      "reason": "test fixture: a remote-path string that must not be treated as local"
+    },
+    "scripts/test-glaeda-gh.py": {
+      "count": 1,
+      "reason": "test docstring recording an incident"
+    },
+    "scripts/test-glaeda-update.py": {
+      "count": 15,
+      "reason": "test fixtures for legacy release policies whose requiredHosts named the host (parsed, not enforced)"
+    },
+    "scripts/test-hot-run.py": {
+      "count": 6,
+      "reason": "tests of the big-red-* resource-profile names (debt with hot_run_impl.py)"
+    },
+    "scripts/test-owned-workstation-capability.py": {
+      "count": 1,
+      "reason": "test fixture: a node id string"
+    },
+    "scripts/test-provider-neutral-request.py": {
+      "count": 1,
+      "reason": "test of the big-red-focused resource-class name (debt with verify_focused_impl.py)"
+    },
+    "scripts/test-trusted-agent-dispatch.py": {
+      "count": 1,
+      "reason": "test fixture: a backend name string"
+    },
+    "scripts/test-verify-focused.py": {
+      "count": 1,
+      "reason": "test of the big-red-required resource-class name (debt with verify_focused_impl.py)"
+    },
+    "scripts/verify_focused_impl.py": {
+      "count": 2,
+      "reason": "debt: resource-class names big-red-focused/big-red-required are labels in a request schema, no host is reached; rename in a follow-up"
+    },
+    "src/bin/glaeda-cargo-target-value.rs": {
+      "count": 1,
+      "reason": "debt: matches the big-red-heavy resource-profile name (see hot_run_impl.py)"
+    },
+    "src/bin/glaeda-hot-run.rs": {
+      "count": 12,
+      "reason": "debt: the big-red-heavy/big-red-background resource-profile enum (systemd scope limits on any host); rename with an alias in a follow-up"
+    },
+    "src/bin/glaeda-owned-agent-presence.rs": {
+      "count": 8,
+      "reason": "unit-test fixtures using the name as a node id string"
+    },
+    "src/linked_worktree_reclaim.rs": {
+      "count": 1,
+      "reason": "comment recording where an incident was seen"
+    },
+    "tests/native_hot_run_deadline_contract.rs": {
+      "count": 13,
+      "reason": "tests of the big-red-* resource-profile names (debt with glaeda-hot-run.rs)"
+    },
+    "tests/native_hot_run_macos_contract.rs": {
+      "count": 1,
+      "reason": "test of the big-red-heavy resource-profile name (debt with glaeda-hot-run.rs)"
+    },
+    "tests/quarry_parallel_live_producer_composition.rs": {
+      "count": 12,
+      "reason": "test fixtures: request and reservation id strings and a test name"
+    }
+  }
+}
