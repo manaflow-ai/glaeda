@@ -315,6 +315,12 @@ def _managed_plist(install: Install) -> tuple[bool, str]:
     return True, "managed"
 
 
+def _device_bound(recorded: object, install_device: int, daemons_device: int) -> bool:
+    """Whether the install directory is still on the filesystem its manifest was written for: the recorded st_dev,
+    or, since a reboot renumbers it, the filesystem of the LaunchDaemons directory whose daemon runs the snapshot."""
+    return recorded == install_device or install_device == daemons_device
+
+
 def _managed_install(install: Install) -> tuple[bool, str]:
     if not os.path.lexists(install.install_dir):
         return False, "missing"
@@ -358,9 +364,13 @@ def _managed_install(install: Install) -> tuple[bool, str]:
         return False, "install manifest points at another interpreter"
     try:
         device = install.install_dir.stat().st_dev
+        daemons_device = install.plist.parent.stat().st_dev
     except OSError as exc:
         return False, f"cannot stat install device: {exc}"
-    if manifest.get("device") != device:
+    # macOS renumbers APFS st_dev across boots, so the recorded number goes stale on every reboot and then refused
+    # every reinstall and uninstall (2026-10-27: 16777232 recorded, 16777230 after a restart, same volume). The
+    # binding that holds is today's: the snapshot lives on the filesystem of the LaunchDaemon that runs it.
+    if not _device_bound(manifest.get("device"), device, daemons_device):
         return False, "install manifest is bound to another filesystem"
     if manifest.get("sha256") != _sha256(install.snapshot):
         return False, "install snapshot digest does not match its manifest"

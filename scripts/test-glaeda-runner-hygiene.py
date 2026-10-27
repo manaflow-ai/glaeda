@@ -122,6 +122,14 @@ class RunnerHygieneTest(unittest.TestCase):
         self.install.snapshot.write_bytes(self.source.read_bytes())
         self.assertEqual(json.loads(self.install.manifest.read_text())["sha256"], digest)
 
+    def test_a_device_number_renumbered_by_a_reboot_still_binds(self) -> None:
+        # APFS st_dev changes across boots (16777232 recorded, 16777230 after a restart, same volume): a manifest
+        # written before a restart refused every reinstall and uninstall after it
+        self.assertTrue(rh._device_bound(16777232, 16777232, 16777232))
+        self.assertTrue(rh._device_bound(16777232, 16777230, 16777230))
+        self.assertFalse(rh._device_bound(16777232, 16777240, 16777230))  # moved off its LaunchDaemon's filesystem
+        self.assertTrue(rh._device_bound(16777240, 16777240, 16777230))  # where it was installed, as before
+
     def test_atomic_write_uses_os_directory_fsync_on_python39(self) -> None:
         target = self.base / "atomic" / "snapshot"
         with mock.patch.object(rh.Path, "open", side_effect=IsADirectoryError), \
