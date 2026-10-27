@@ -812,8 +812,8 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-wallpaper.log"),
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-wallpaper.err"),
         },
-        # Keeps the fleet compilation-cache node store and local Xcode CAS within budget; it exits at
-        # once on a host without fleet-cas and defers while any build runs or holds the host lock.
+        # Keeps the fleet compilation-cache node store (a hard cap, builds or not) and local Xcode CAS (only while
+        # no build runs or holds the host lock) within budget; it exits at once on a host without fleet-cas.
         LABEL_PREFIX + "fleet-cas-prune": {
             "Label": LABEL_PREFIX + "fleet-cas-prune",
             "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-fleet-cas-prune"), "--apply"],

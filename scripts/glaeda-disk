@@ -8236,6 +8236,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
         runner_repack_due = ((sweep or a.pressure) and ROLE == "fleet-mini" and not RUNNER_CACHE_PROFILE
                              and not a.cmux_next_drain and not reserved
                              and (not a.family or RUNNER_CHECKOUT_REPACK_FAMILY in a.family))
+        # the fleet compilation-cache node store's hard cap, on every pressure pass: the runner hook's pass before each
+        # job and its floor eviction run this one (glaeda-fleet-cas-prune keeps its own working-set rule)
+        if a.pressure and ROLE == "fleet-mini" and not RUNNER_CACHE_PROFILE and not a.cmux_next_drain and not a.family:
+            logical_released += fleet_cas_node_cap()
         remaining = []
         for fs in shown:
             try:
@@ -8314,6 +8318,31 @@ def _owner_line(owner: Any) -> dict[str, Any] | None:
     return {"pid": owner.get("pid"), "command": str(owner.get("command") or "")[:120] or None,
             "since": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(started))
             if isinstance(started, (int, float)) else None}
+
+
+FLEET_CAS_ROOT = FLEET_ROOT / "xcode"
+FLEET_CAS_PRUNE_TIMEOUT_S = 300.0
+
+
+def fleet_cas_node_cap(root: Path | None = None, prune: Path | None = None) -> int:
+    """Run `glaeda-fleet-cas-prune --apply --node-only` (installed beside this script) on a host with fleet-cas, bounded
+    by FLEET_CAS_PRUNE_TIMEOUT_S; the bytes it reports freed, 0 when it is absent, fails or freed nothing. Never raises."""
+    root = FLEET_CAS_ROOT if root is None else root
+    prune = Path(os.path.abspath(__file__)).with_name("glaeda-fleet-cas-prune") if prune is None else prune
+    if not (root / "fleet-cas.env").is_file() or not prune.is_file():
+        return 0
+    try:
+        out = subprocess.run([sys.executable, os.fspath(prune), "--apply", "--node-only"], capture_output=True,
+                             text=True, timeout=FLEET_CAS_PRUNE_TIMEOUT_S, check=False,
+                             env={**os.environ, "GLAEDA_FLEET_CAS_ROOT": os.fspath(root)})
+        rec = json.loads(out.stdout.strip().splitlines()[-1]) if out.stdout.strip() else {}
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return 0
+    m = re.match(r"removed (\d+) oldest files, ([0-9.]+) GiB", str(rec.get("node_store") or ""))
+    if not m:
+        return 0
+    print(f"  fleet-cas node store: {rec['node_store']}")
+    return int(float(m.group(2)) * GIB)
 
 
 def write_run_line(started: float, free_before: int | None) -> None:

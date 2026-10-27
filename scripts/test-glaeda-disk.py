@@ -6576,6 +6576,28 @@ class HostReservationTest(unittest.TestCase):
         self.assertEqual(seen, {"low": gd.POLICY["low"], "target": gd.POLICY["target"]})
         self.assertEqual(run["age_hours"], 12.0)
 
+class FleetCasNodeCapTest(unittest.TestCase):
+    """glaeda-disk's pressure passes (before every job and under the floor) run the fleet-cas node-store cap."""
+
+    def test_runs_the_node_only_prune_and_reports_what_it_freed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root, prune = Path(tmp) / "xcode", Path(tmp) / "glaeda-fleet-cas-prune"
+            calls = Path(tmp) / "calls"
+            prune.write_text("import json, os, sys\n"
+                             f"open({os.fspath(calls)!r}, 'a').write(' '.join(sys.argv[1:]) + ' ' + os.environ['GLAEDA_FLEET_CAS_ROOT'] + '\\n')\n"
+                             "print(json.dumps({'node_store': 'removed 12 oldest files, 3.5 GiB', 'result': 'ok'}))\n")
+            self.assertEqual(gd.fleet_cas_node_cap(root, prune), 0, "no fleet-cas on this host: not run")
+            self.assertFalse(calls.exists())
+            root.mkdir()
+            (root / "fleet-cas.env").write_text("FLEET_CAS_STORE=x\n")
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(gd.fleet_cas_node_cap(root, prune), int(3.5 * gd.GIB))
+            self.assertEqual(calls.read_text(), f"--apply --node-only {root}\n")
+            self.assertIn("fleet-cas node store: removed 12 oldest files", out.getvalue())
+            prune.write_text("print('not json')\n")
+            self.assertEqual(gd.fleet_cas_node_cap(root, prune), 0)
+            self.assertEqual(gd.fleet_cas_node_cap(root, Path(tmp) / "missing"), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

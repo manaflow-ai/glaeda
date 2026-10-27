@@ -3,27 +3,37 @@
 
     glaeda-fleet-cas-prune                 plan: sizes, budgets, what would go
     glaeda-fleet-cas-prune --apply         prune (the hourly LaunchAgent from glaeda-mini-setup)
+    glaeda-fleet-cas-prune --apply --node-only
+                                           only the node-store cap (glaeda-disk's pressure passes, which run
+                                           before every job and under the runner floor)
 
 Two stores under /Users/Shared/cmux-build-fleet/xcode (docs/CMUX_BUILD_SLOT_MODES.md):
 
   cas         Xcode's own local CAS. The node does not manage it and its layout is Xcode's, so
-              it only ever goes whole, once it is over --local-cas-gib. On a reader it only
+              it only ever goes whole, once it is over --local-cas-gib (20), and only while no
+              build runs and the host lock is free (a build has it open). On a reader it only
               speeds up repeat builds (everything in it comes back from the node); the writer
               empties it at the start of every writer build, so the writer's is left alone.
   node-store  the node daemon's cache of the fleet store: one file per object (cas/) or index
               entry (kv/), named by hash in two-hex-digit shards. Any file may go: a missing one
               is fetched again, and its signature re-verified, on the next lookup. Oldest mtime
-              goes first until the store is under 90% of --node-gib. stats.json stays. The
-              writer's node store must stay consistent with the fleet store, so it is never
-              pruned here.
+              goes first until the store is under 90% of --node-gib. stats.json stays. It is a
+              hard cap: it holds while builds run (on a busy mini a build always runs, and
+              cmux15's writer store reached 73 GiB, 2026-10-26). Removing a file mid-build is a
+              cache miss, never a wrong result: a missing object is fetched again from the fleet
+              store and its ID recomputed from the bytes (get_or_fetch), or the build compiles; a
+              reader's index entries are signed by the writer and fetched again the same way.
+              On the writer only cas/ objects go, which are content-addressed and written through
+              before they are acknowledged. Its kv/ index entries stay: the fleet store keeps the
+              first value for a key, so a writer that lost its own entry and computed another
+              would then serve a value the fleet store does not hold (kv_put).
 
-A missing index entry in the middle of a build means a compile, so nothing is deleted while a
-build can be running: the run is skipped (exit 0, "deferred") while any xcodebuild, Xcode build
-service or GitHub Actions Runner.Worker runs. Sizes and the plan are worked out without any lock;
-only the deletes run under the fleet host lock (host.lock, the same flock with-host-lock and the
-runner hook take), taken without waiting, after checking for a build once more. Holding it
-refuses new jobs and takes idle listeners offline (#1206), so it is held only for a rename and
-the unlinks; the renamed local CAS is removed after the lock is released.
+A missing local CAS in the middle of a build breaks the build, so the local CAS goes only while no
+xcodebuild, Xcode build service or GitHub Actions Runner.Worker runs. Sizes and the plan are worked
+out without any lock; the local CAS rename runs under the fleet host lock (host.lock, the same flock
+with-host-lock and the runner hook take), taken without waiting, after checking for a build once
+more. Holding it refuses new jobs and takes idle listeners offline (#1206), so it is held only for
+the rename; the renamed local CAS is removed after the lock is released.
 
 The fleet store (xcode/fleet-store, on the store host only) is pruned by `fleet-cas gc`, which
 knows which entries are still read (glaeda#1216): kept are entries used within --gc-keep-days,
@@ -131,10 +141,18 @@ def tree_bytes(path: Path) -> int:
     return total
 
 
-def node_files(store: Path) -> list[tuple[float, int, str]]:
-    """(mtime, bytes, path) of every object and index entry; stats.json and anything else stays."""
+TMP_STALE_S = 6 * 3600  # a CAS temp file untouched this long belongs to no live write
+
+
+def node_files(store: Path, subs: tuple[str, ...] = ("cas", "kv")) -> list[tuple[float, int, str]]:
+    """(mtime, bytes, path) of every object (cas/) and index entry (kv/) under subs; stats.json and anything else
+    stays. A name with a dot is an in-flight write (the daemon writes name.tmp<pid>.<seq> and renames it when done,
+    as fleet-cas gc.rs skips them): unlinking one would fail that write and the build, so it is never counted or
+    removed while young. One untouched for TMP_STALE_S is a write an interrupted daemon left; it counts and goes
+    first."""
     out = []
-    for sub in ("cas", "kv"):
+    stale_before = time.time() - TMP_STALE_S
+    for sub in subs:
         for dirpath, _, files in os.walk(store / sub):
             for f in files:
                 p = os.path.join(dirpath, f)
@@ -142,13 +160,19 @@ def node_files(store: Path) -> list[tuple[float, int, str]]:
                     st = os.lstat(p)
                 except OSError:
                     continue
+                if "." in f:
+                    if st.st_mtime >= stale_before:
+                        continue  # in flight
+                    out.append((0.0, st.st_blocks * 512, p))  # abandoned: before every object
+                    continue
                 out.append((st.st_mtime, st.st_blocks * 512, p))
     return out
 
 
-def plan_node(files: list[tuple[float, int, str]], budget: int) -> list[tuple[float, int, str]]:
-    """Oldest first until the rest fits in 90% of the budget; nothing while it is under budget."""
-    total = sum(b for _, b, _ in files)
+def plan_node(files: list[tuple[float, int, str]], budget: int, total: int | None = None) -> list[tuple[float, int, str]]:
+    """Oldest first until the store (total, by default the files' sum) fits in 90% of the budget; nothing while it is
+    under budget."""
+    total = sum(b for _, b, _ in files) if total is None else total
     if total <= budget:
         return []
     goal = int(budget * 0.9)
@@ -225,8 +249,10 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--apply", action="store_true", help="delete (default: plan only)")
     ap.add_argument("--node-gib", type=float, default=20, help="node-store budget (default %(default)s)")
-    ap.add_argument("--local-cas-gib", type=float, default=30,
+    ap.add_argument("--local-cas-gib", type=float, default=20,
                     help="the local Xcode CAS goes whole above this (default %(default)s)")
+    ap.add_argument("--node-only", action="store_true",
+                    help="only the node-store cap: no local CAS, no sweep, no fleet-store gc")
     ap.add_argument("--gc-keep-days", type=int, default=14,
                     help="on the store host: fleet-cas gc keeps entries used within this many days")
     a = ap.parse_args(argv)
@@ -235,7 +261,7 @@ def main(argv: list[str] | None = None) -> int:
         rec["result"] = f"deferred: {held}"
         print(json.dumps(rec))
         return 0
-    if a.apply:
+    if a.apply and not a.node_only:
         rec.update(store_gc(ROOT, a.gc_keep_days))
     if not (ROOT / "fleet-cas.env").exists():
         rec["result"] = "no fleet-cas on this host"
@@ -244,50 +270,33 @@ def main(argv: list[str] | None = None) -> int:
     writer = is_writer(ROOT)
     rec["role"] = "writer" if writer else "reader"
     commands = running_commands()
-    if commands is None:
+    if commands is None and not a.node_only:
         rec["result"] = "deferred: ps failed, cannot rule out a running build"
         print(json.dumps(rec))
         return 0
-    if a.apply and (why := busy(commands)):
-        rec["result"] = f"deferred: a build is running ({why})"
-        print(json.dumps(rec))
-        return 0
-    if a.apply:
+    building = busy(commands) if commands is not None else "ps failed"  # --node-only: the cap needs no build check
+    if a.apply and not a.node_only:
         rec["swept_bytes"] = sweep(ROOT)
     # Measure and plan with no lock held: these walks are the slow part.
     local = ROOT / "cas"
-    local_bytes = tree_bytes(local) if local.is_dir() else 0
+    local_bytes = tree_bytes(local) if local.is_dir() and not a.node_only else 0
     rec["local_cas_bytes"] = local_bytes
-    drop_local = not writer and local_bytes > a.local_cas_gib * GIB
+    drop_local = not writer and not a.node_only and local_bytes > a.local_cas_gib * GIB
     store = ROOT / "node-store"
     files = node_files(store) if store.is_dir() else []
     rec["node_store_bytes"] = sum(b for _, b, _ in files)
-    doomed = [] if writer else plan_node(files, int(a.node_gib * GIB))
-    rec["local_cas"] = ("kept: the writer empties it before every writer build" if writer
+    # the writer's kv/ entries stay (above); its objects count against the cap with them
+    prunable = [f for f in files if not writer or f"{os.sep}kv{os.sep}" not in f[2][len(os.fspath(store)):]]
+    doomed = plan_node(prunable, int(a.node_gib * GIB), total=rec["node_store_bytes"])
+    rec["local_cas"] = ("not judged (--node-only)" if a.node_only
+                        else "kept: the writer empties it before every writer build" if writer
                         else ("would remove" if drop_local else "within budget"))
-    rec["node_store"] = ("kept: the writer's node store must match the fleet store" if writer
-                         else f"would remove {len(doomed)} oldest files, "
-                              f"{sum(b for _, b, _ in doomed) / GIB:.1f} GiB")
-    if not a.apply or not (drop_local or doomed):
+    rec["node_store"] = f"would remove {len(doomed)} oldest files, {sum(b for _, b, _ in doomed) / GIB:.1f} GiB"
+    if not a.apply:
         rec["result"] = "ok"
         print(json.dumps(rec))
         return 0
-    lock = take_lock(HOST_LOCK)
-    if lock is None:
-        rec["result"] = "deferred: a build holds the host lock"
-        print(json.dumps(rec))
-        return 0
-    renamed = None
-    try:
-        again = running_commands()
-        if again is None or (why := busy(again)):
-            rec["result"] = f"deferred: a build started ({why if again else 'ps failed'})"
-            print(json.dumps(rec))
-            return 0
-        if drop_local and local.is_dir():
-            renamed = ROOT / f"{PRUNING}{os.getpid()}"
-            os.rename(local, renamed)
-            rec["local_cas"] = "removed"
+    if doomed:  # the hard cap: no lock and no build check; a file a running build still wants is fetched again
         freed = 0
         for _, b, p in doomed:
             try:
@@ -295,14 +304,29 @@ def main(argv: list[str] | None = None) -> int:
                 freed += b
             except FileNotFoundError:
                 pass
-        if doomed:
-            rec["node_store"] = f"removed {len(doomed)} oldest files, {freed / GIB:.1f} GiB"
-    finally:
-        if lock != -1:
-            os.close(lock)
+        rec["node_store"] = f"removed {len(doomed)} oldest files, {freed / GIB:.1f} GiB"
+    renamed, rec["result"] = None, "ok"
+    if drop_local:
+        lock = None if building else take_lock(HOST_LOCK)
+        if building:
+            rec["local_cas"] = f"deferred: a build is running ({building})"
+            rec["result"] = rec["local_cas"]
+        elif lock is None:
+            rec["local_cas"] = rec["result"] = "deferred: a build holds the host lock"
+        else:
+            try:
+                again = running_commands()
+                if again is None or (why := busy(again)):
+                    rec["local_cas"] = rec["result"] = f"deferred: a build started ({why if again else 'ps failed'})"
+                elif local.is_dir():
+                    renamed = ROOT / f"{PRUNING}{os.getpid()}"
+                    os.rename(local, renamed)
+                    rec["local_cas"] = "removed"
+            finally:
+                if lock != -1:
+                    os.close(lock)
     if renamed is not None:  # the slow part, with the lock released: nothing reads this path
         shutil.rmtree(renamed, ignore_errors=True)
-    rec["result"] = "ok"
     print(json.dumps(rec))
     return 0
 
