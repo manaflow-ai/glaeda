@@ -92,6 +92,7 @@
         "service-cache"
       ],
       "exclusive": true,
+      "loopback_options": "from=\"127.0.0.1,::1\",no-agent-forwarding,no-X11-forwarding",
       "no_backups": false
     },
     "launchd": {

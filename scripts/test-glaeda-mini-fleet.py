@@ -610,6 +610,43 @@ class CheckTests(unittest.TestCase):
             self.assertEqual(len(ssh), 1, ssh)
             self.assertIn("lacks its declared options", ssh[0]["detail"])
 
+    LOOPBACK = 'from="127.0.0.1,::1",no-agent-forwarding,no-X11-forwarding'
+
+    def test_a_declared_loopback_key_is_not_drift_and_any_other_option_still_is(self) -> None:
+        self.manifest["defaults"]["authorized_keys"]["loopback_options"] = self.LOOPBACK
+        self.manifest["defaults"]["authorized_keys"]["exclusive"] = True
+        own = f"ak_key\tauthorized_keys|{mf.options_digest(self.LOOPBACK)}|256 {STRAY} cmux-loopback@m (ED25519)\n"
+        self.assertFalse([i for i in self.issues(probe_text() + own) if i["area"] == "ssh"])
+        wide = mf.options_digest('from="10.0.0.0/8"')
+        wider = f"ak_key\tauthorized_keys|{wide}|256 {STRAY} x (ED25519)\n"
+        ssh = [i["detail"] for i in self.issues(probe_text() + wider) if i["area"] == "ssh"]
+        self.assertTrue(any("not allowed" in d for d in ssh), ssh)
+        bare = f"ak_key\tauthorized_keys|no|256 {STRAY} cmux-loopback@m (ED25519)\n"
+        for lines in (own + bare, bare + own):  # the same key on an unrestricted line too, either order
+            ssh = [i["detail"] for i in self.issues(probe_text() + lines) if i["area"] == "ssh"]
+            self.assertEqual(sum("not allowed" in d for d in ssh), 1, ssh)
+        # a listed key restricted to loopback is still drift: it would not reach the host from anywhere else
+        listed = f"ak_key\tauthorized_keys|{mf.options_digest(self.LOOPBACK)}|256 {FP['coordinator']} c (ED25519)\n"
+        text = "\n".join(l for l in probe_text().splitlines() if FP["coordinator"] not in l) + "\n" + listed
+        ssh = [i["detail"] for i in self.issues(text) if i["area"] == "ssh"]
+        self.assertTrue(any("carries options" in d for d in ssh), ssh)
+        del self.manifest["defaults"]["authorized_keys"]["loopback_options"]
+        ssh = [i["detail"] for i in self.issues(probe_text() + own) if i["area"] == "ssh"]
+        self.assertTrue(any("not allowed" in d for d in ssh), ssh)
+
+    def test_loopback_options_must_take_keys_only_from_loopback(self) -> None:
+        self.assertTrue(mf.loopback_only(self.LOOPBACK))
+        for bad in ('from="127.0.0.1,10.0.0.1"', 'from="*"', 'from="!10.0.0.1,127.0.0.1"', "no-pty", 'from=""',
+                    'from="127.0.0.1",from="10.0.0.1"', 7, " " + self.LOOPBACK,
+                    'from="127.0.0.1,::1",FROM="10.0.0.1"', 'from=127.0.0.1', 'From="10.0.0.1"'):
+            data = copy.deepcopy(self.manifest)
+            data["defaults"]["authorized_keys"]["loopback_options"] = bad
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "m.json"
+                path.write_text(json.dumps(data))
+                with self.assertRaisesRegex(mf.Failure, "loopback_options"):
+                    mf.load_manifest(path)
+
     def test_options_must_be_one_printable_field(self) -> None:
         for bad in ("", " no-pty", "no-pty\nssh-ed25519 AAAA x", 7, 'command="x', 'no-pty, from="x"'):
             data = copy.deepcopy(self.manifest)

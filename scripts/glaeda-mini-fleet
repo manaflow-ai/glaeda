@@ -408,6 +408,13 @@ def load_manifest(path: Path, text: str | None = None) -> dict[str, Any]:
     for name, host in data["hosts"].items():
         validate_toolchain(path, f"host {name}", host.get("overrides", {}).get("toolchain"))
         validate_ios_simulator(path, f"host {name}", host.get("overrides", {}).get("ios_simulator"))
+    for where, policy in [("defaults", data["defaults"])] + \
+            [(f"host {n}", h.get("overrides", {})) for n, h in data["hosts"].items()]:
+        loop = (policy.get("authorized_keys") or {}).get("loopback_options")
+        if loop is not None and (not isinstance(loop, str) or not loop.isprintable() or loop != loop.strip()
+                                 or not options_well_formed(loop) or not loopback_only(loop)):
+            raise Failure(f"{path}: {where} authorized_keys.loopback_options must be one options field whose "
+                          f"from= names only 127.0.0.1 and ::1")
     for key_id, key in data["keys"].items():
         public = key.get("public_key")
         if public is not None and (not isinstance(public, str) or "\n" in public.strip()
@@ -467,6 +474,29 @@ def ios_simulator_drift(ios: dict[str, Any], obs: dict[str, Any]) -> list[tuple[
                 out.append((f"no available {device} simulator on iOS {short}",
                             f"xcrun simctl create '{device}' '{device}' {have[build]['identifier']}"))
     return out
+
+
+LOOPBACK_SOURCES = {"127.0.0.1", "::1"}
+
+
+def loopback_only(options: str) -> bool:
+    """True when the options field takes a key only from this host's own loopback: exactly one from= whose
+    every pattern is 127.0.0.1 or ::1, with no negation or wildcard. Such a key lets in nobody who is not
+    already running on the host."""
+    tokens, current, quoted = [], "", False
+    for i, c in enumerate(options):  # split on commas outside quotes, as sshd does
+        if c == '"' and (i == 0 or options[i - 1] != "\\"):
+            quoted = not quoted
+        if c == "," and not quoted:
+            tokens.append(current)
+            current = ""
+        else:
+            current += c
+    tokens.append(current)
+    froms = [t.split("=", 1)[1] if "=" in t else "" for t in tokens if t.split("=", 1)[0].lower() == "from"]
+    if len(froms) != 1 or not (froms[0].startswith('"') and froms[0].endswith('"') and len(froms[0]) > 2):
+        return False
+    return set(froms[0][1:-1].split(",")) <= LOOPBACK_SOURCES
 
 
 def options_well_formed(options: str) -> bool:
@@ -1164,11 +1194,20 @@ def check_host(manifest: dict[str, Any], name: str, obs: dict[str, Any]) -> list
             drift("ssh", f"required key {key_id} ({manifest['keys'][key_id]['comment']}) missing", f"add key {key_id}",
                   {"kind": "add_key", "key": key_id})
     allowed = {manifest["keys"][k]["fingerprint"] for k in keys.get("require", []) + keys.get("allow", [])}
+    # A host's own loopback key (its capture baseline makes one for `ssh localhost`) differs per host, so it
+    # is matched by its declared loopback-only options, which the probe reports as a digest.
+    loopback = options_digest(keys["loopback_options"]) if keys.get("loopback_options") else None
     if keys.get("exclusive"):
-        for fp, k in by_fp.items():
-            if fp not in allowed:
-                label = known.get(fp, "unlisted")
-                drift("ssh", f"{label} key {fp[7:19]} ({k['comment']}) not allowed here", f"remove key {fp}")
+        # Every line, not one per fingerprint: the same key on a second, unrestricted line would let it in from
+        # anywhere while its loopback line looked fine.
+        flagged: set[str] = set()
+        for k in obs["authorized_keys"]:
+            fp = k.get("fingerprint")
+            if not fp or fp in allowed or fp in flagged or (loopback and k["options"] == loopback):
+                continue
+            flagged.add(fp)
+            label = known.get(fp, "unlisted")
+            drift("ssh", f"{label} key {fp[7:19]} ({k['comment']}) not allowed here", f"remove key {fp}")
     for k in obs["authorized_keys"]:
         if not k.get("fingerprint"):
             drift("ssh", "authorized_keys has an unparseable line")
@@ -1178,7 +1217,7 @@ def check_host(manifest: dict[str, Any], name: str, obs: dict[str, Any]) -> list
                 drift("ssh", f"key {known[k['fingerprint']]} lacks its declared options "
                              f"({'none' if not k['options'] else 'different ones'}); replace its line",
                       f"remove key {k['fingerprint']}, then add key {known[k['fingerprint']]}")
-            elif not want and k["options"]:
+            elif not want and k["options"] and (k["options"] != loopback or k["fingerprint"] in allowed):
                 drift("ssh", f"key {k['fingerprint'][7:19]} carries options; review them")
     for k in obs["authorized_keys"]:
         if k.get("file") != "authorized_keys":
