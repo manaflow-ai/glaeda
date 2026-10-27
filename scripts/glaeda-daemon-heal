@@ -38,6 +38,12 @@ helper, after the pass exits. Nothing the runner user can write is read: not ~/.
 copies glaeda-update keeps. The report says what it runs and what the channel wants, and `judge` turns a report into
 current, stale or missing for glaeda-mini-health and glaeda-fleet-status (daemon_heal_missing, daemon_heal_stale).
 A copy installed before this existed cannot update itself: one root --install of a current release makes it.
+
+The same root pass also keeps the cmux fleet's root ops scripts current (config/fleet-ops.json, a third file of the
+snapshot that follows the release with the other two): each one's body, pinned to its source commit and SHA-256, at
+/Library/Application Support/cmux-fleet-ops/NAME with its LaunchDaemon. It acts only on a fleet Mac that already has
+that directory and no ec2-user account, never on a reserved host, and treats a reservation list it cannot read as a
+reservation (fleet_ops_hold).
 Stdlib only; runs on macOS /usr/bin/python3 (3.9).
 """
 
@@ -52,8 +58,10 @@ import io
 import json
 import os
 import plistlib
+import pwd
 import re
 import signal
+import stat
 import subprocess
 import sys
 import tarfile
@@ -73,6 +81,7 @@ PLIST = Path("/Library/LaunchDaemons") / f"{LABEL}.plist"
 SYSTEM_PYTHON = "/usr/bin/python3"  # SIP-protected; a Homebrew python is writable by the runner user
 SCRIPT_NAME = "glaeda-daemon-heal"
 POLICY_NAME = "macos-daemons.json"
+FLEET_OPS_NAME = "fleet-ops.json"
 SYSTEM_PREFIXES = ("/System/", "/usr/libexec/", "/usr/sbin/", "/usr/bin/", "/sbin/")
 SYSTEM_UID_MAX = 499
 DAY_S = 86400
@@ -92,11 +101,19 @@ TAG_RE = re.compile(r"r-\d{8}-[0-9a-f]{12}")
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 HEX64 = re.compile(r"[0-9a-f]{64}")
 ARCHIVE = "glaeda-hygiene-aarch64-apple-darwin.tar.gz"
-MEMBERS = {SCRIPT_NAME: "glaeda/scripts/glaeda-daemon-heal", POLICY_NAME: "glaeda/config/macos-daemons.json"}
-MODES = {SCRIPT_NAME: 0o555, POLICY_NAME: 0o444}
+MEMBERS = {SCRIPT_NAME: "glaeda/scripts/glaeda-daemon-heal", POLICY_NAME: "glaeda/config/macos-daemons.json",
+           FLEET_OPS_NAME: "glaeda/config/fleet-ops.json"}
+MODES = {SCRIPT_NAME: 0o555, POLICY_NAME: 0o444, FLEET_OPS_NAME: 0o444}
+OPTIONAL = {FLEET_OPS_NAME}  # releases from before it ship the other two only
 MAX_META = 1 << 20
 MAX_ARCHIVE = 200 << 20  # glaeda-update MAX_ASSET
 MAX_MEMBER = 1 << 20
+FLEET_OPS_SCHEMA = "glaeda-fleet-ops/v1"
+FLEET_OPS_DIR = Path("/Library/Application Support/cmux-fleet-ops")  # fixed here: no policy file directs root's writes
+FLEET_ROOT = Path("/Users/Shared/cmux-build-fleet")
+RESERVATIONS_SCHEMA = "glaeda-fleet-reservations/v1"
+OP_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
+MAX_OP_BODY = 256 << 10
 MAX_EXTRACTED = 1 << 30  # glaeda-update MAX_EXTRACTED: what the whole archive may expand to
 ANCESTRY = "ancestry.txt"  # glaeda_release.ANCESTRY: the release's commit and its ancestors, at the archive root
 URL_HOSTS = ("github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com")
@@ -411,8 +428,12 @@ def desired_install(policy_path: Path, install_dir: Path = INSTALL_DIR) -> dict[
         "StandardOutPath": os.fspath(state_dir / "heal.log"),
         "StandardErrorPath": os.fspath(state_dir / "heal.err"),
     }
-    return {"files": {script: (Path(__file__).read_bytes(), MODES[SCRIPT_NAME]),
-                      install_dir / POLICY_NAME: (policy_bytes, MODES[POLICY_NAME])},
+    # Not fleet-ops.json: a hand install takes the script and the policy (pinned by --expect-*), and drops any
+    # fleet-ops.json the snapshot had (finish_pair). Only the release chain (refresh) installs fleet-ops.json, so
+    # root never runs an op body it did not verify against the signed release.
+    files = {script: (Path(__file__).read_bytes(), MODES[SCRIPT_NAME]),
+             install_dir / POLICY_NAME: (policy_bytes, MODES[POLICY_NAME])}
+    return {"files": files,
             "plist": plistlib.dumps(plist, sort_keys=True), "state_dir": state_dir}
 
 
@@ -594,6 +615,8 @@ def release_files(source: str, entry: dict[str, Any], get=fetch, installed: str 
             try:
                 info = tar.getmember(member)
             except KeyError:
+                if name in OPTIONAL:  # a release from before it existed
+                    continue
                 raise HealError(f"{entry['tag']} ships no {member}") from None
             if not info.isfile() or info.size > MAX_MEMBER:
                 raise HealError(f"{member} in {entry['tag']} is not a small regular file")
@@ -661,9 +684,14 @@ def finish_pair(install_dir: Path, root: bool) -> bool:
     if not mark:
         return False
     want = mark.get("files") if isinstance(mark.get("files"), dict) else {}
-    staged = {name: read_bytes(stage / name) for name in MEMBERS}
-    if set(want) == set(MEMBERS) and all(data is not None and sha256(data) == want[name] for name, data in staged.items()):
-        for name in (POLICY_NAME, SCRIPT_NAME):
+    staged = {name: read_bytes(stage / name) for name in want if name in MEMBERS}
+    # A mark from a copy that predates fleet-ops.json names only the script and the policy.
+    if {SCRIPT_NAME, POLICY_NAME} <= set(want) <= set(MEMBERS) \
+            and all(data is not None and sha256(data) == want[name] for name, data in staged.items()):
+        for name in OPTIONAL - set(staged):  # a release without it: no copy of another release's stays beside it
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(install_dir / name)
+        for name in (n for n in (FLEET_OPS_NAME, POLICY_NAME, SCRIPT_NAME) if n in staged):
             path = install_dir / name
             if read_bytes(path) != staged[name] or (path.stat().st_mode & 0o777) != MODES[name]:
                 atomic_write(path, staged[name], MODES[name], root)
@@ -684,6 +712,9 @@ def stage_check(files: dict[str, bytes], install_dir: Path, root: bool, run=boun
     stage = stage_dir(install_dir, root)
     for name, data in files.items():
         atomic_write(stage / name, data, MODES[name], root)
+    for name in OPTIONAL - set(files):  # a release without it: the plan must not read an earlier stage's copy
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(stage / name)
     code, out, err = run([python, "-I", os.fspath(stage / SCRIPT_NAME), "--policy", os.fspath(stage / POLICY_NAME),
                           "--state-dir", os.fspath(install_dir / "state")], timeout=CHECK_TIMEOUT)
     try:
@@ -699,7 +730,9 @@ def stage_check(files: dict[str, bytes], install_dir: Path, root: bool, run=boun
 
 
 def pair_hashes(install_dir: Path) -> dict[str, str | None]:
-    return {name: None if (data := read_bytes(install_dir / name)) is None else sha256(data) for name in MEMBERS}
+    """The installed files' hashes, as installed.json records them: an optional file only when it is there."""
+    out = {name: None if (data := read_bytes(install_dir / name)) is None else sha256(data) for name in MEMBERS}
+    return {name: h for name, h in out.items() if h is not None or name not in OPTIONAL}
 
 
 def refresh(policy: dict[str, Any], state: dict[str, Any], now: float, install_dir: Path = INSTALL_DIR,
@@ -710,7 +743,9 @@ def refresh(policy: dict[str, Any], state: dict[str, Any], now: float, install_d
     have = {name: read_bytes(install_dir / name) for name in MEMBERS}
     hashes = pair_hashes(install_dir)
     ident = load_json(install_dir / INSTALLED)  # what the pair is, swapped with it: never ahead of or behind it
-    drifted = ident.get("files") != hashes
+    # members: the files the copy that installed this pair read from its release. A pair a copy from before
+    # fleet-ops.json installed never looked for it, so it is read again from the same release.
+    drifted = ident.get("files") != hashes or ident.get("members") != sorted(MEMBERS)
     if now - float(rel.get("checked") or 0) < policy["release"]["every_s"] and not (drifted and not rel.get("error")):
         return rel
     rel["checked"] = now
@@ -720,8 +755,9 @@ def refresh(policy: dict[str, Any], state: dict[str, Any], now: float, install_d
         if entry is not None and (entry["tag"] != ident.get("tag") or drifted):
             commit = ident.get("commit") if isinstance(ident.get("commit"), str) else None
             files = release_files(source, entry, get, commit)
-            release = {"tag": entry["tag"], "commit": entry["source"]}
-            if any(have[name] != data for name, data in files.items()):
+            release = {"tag": entry["tag"], "commit": entry["source"], "members": sorted(MEMBERS)}
+            if any(have[name] != data for name, data in files.items()) \
+                    or any(have[name] is not None for name in OPTIONAL - set(files)):
                 stage_check(files, install_dir, root, run, python)
                 commit_pair(files, install_dir, root, release)  # the next pass runs the pair
                 rel["installed_at"] = now
@@ -734,7 +770,7 @@ def refresh(policy: dict[str, Any], state: dict[str, Any], now: float, install_d
     ident = load_json(install_dir / INSTALLED)
     rel.update(tag=ident.get("tag"), commit=ident.get("commit"))
     # behind: not the release the channel names, or not the bytes of the release it says it is (a repair failed)
-    rel["drifted"] = ident.get("files") != pair_hashes(install_dir)
+    rel["drifted"] = ident.get("files") != pair_hashes(install_dir) or ident.get("members") != sorted(MEMBERS)
     if rel.get("wants") and rel.get("wants") != rel.get("tag") or rel["drifted"]:
         rel.setdefault("behind_since", now)
     else:
@@ -805,11 +841,274 @@ def schedule_reload(install_dir: Path, plist_path: Path, state: dict[str, Any], 
     return True
 
 
+# ---------------------------------------------------------------- the fleet's root ops scripts
+
+
+def load_fleet_ops(raw: bytes) -> dict[str, Any]:
+    """config/fleet-ops.json, validated: each op's body hashes to its pin and names its source commit. Everything
+    root derives from it (path, label, log) is built here from the op's name, never read from the file."""
+    try:
+        doc = json.loads(raw)
+    except ValueError as e:
+        raise HealError(f"{FLEET_OPS_NAME} is not JSON: {e}") from e
+    if not isinstance(doc, dict) or doc.get("schema") != FLEET_OPS_SCHEMA or not isinstance(doc.get("ops"), dict):
+        raise HealError(f"{FLEET_OPS_NAME} schema is not {FLEET_OPS_SCHEMA}")
+    for name, op in doc["ops"].items():
+        if not isinstance(name, str) or not OP_NAME.fullmatch(name) or not isinstance(op, dict):
+            raise HealError(f"{FLEET_OPS_NAME}: op {name!r} is not a plain name")
+        body, every, src = op.get("body"), op.get("every_s"), op.get("source")
+        if not isinstance(body, str) or not body.startswith("#!/bin/bash\n") or len(body.encode()) > MAX_OP_BODY:
+            raise HealError(f"{FLEET_OPS_NAME}: {name} body must be a bash script under {MAX_OP_BODY} bytes")
+        if sha256(body.encode()) != op.get("sha256"):
+            raise HealError(f"{FLEET_OPS_NAME}: {name} body does not hash to its sha256 pin")
+        if type(every) is not int or not 60 <= every <= DAY_S:
+            raise HealError(f"{FLEET_OPS_NAME}: {name} every_s must be an integer from 60 to {DAY_S}")
+        if not isinstance(src, dict) or not isinstance(src.get("repository"), str) \
+                or not isinstance(src.get("path"), str) or not SHA_RE.fullmatch(str(src.get("commit"))):
+            raise HealError(f"{FLEET_OPS_NAME}: {name} source needs repository, path and a full commit")
+    return doc
+
+
+def op_label(name: str) -> str:
+    return f"ai.manaflow.{name}"
+
+
+def op_plist(name: str, every_s: int, ops_dir: Path) -> dict[str, Any]:
+    """What the op's installer writes: the body every every_s, its output in /var/log/NAME.log."""
+    log = f"/var/log/{name}.log"
+    return {"Label": op_label(name), "ProgramArguments": [os.fspath(ops_dir / name)], "StartInterval": every_s,
+            "StandardOutPath": log, "StandardErrorPath": log}
+
+
+def read_small(path: Path, limit: int = MAX_META) -> bytes:
+    """A regular file's bytes, never through a symlink and never more than limit."""
+    fd = os.open(os.fspath(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"{path} is not a regular file")
+        data = os.read(fd, limit + 1)
+    finally:
+        os.close(fd)
+    if len(data) > limit:
+        raise OSError(f"{path} is over {limit} bytes")
+    return data
+
+
+def reservation_time(value: Any) -> float:
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value == value and abs(value) < 1e11:
+        return float(value)
+    t = parse_iso(value)
+    if t is None:
+        raise ValueError(f"not a time: {value!r}")
+    return t
+
+
+def strict_json(raw: bytes) -> Any:
+    """json.loads that refuses NaN and Infinity and a key given twice (the later one would win unseen)."""
+    def refuse(token: str) -> Any:
+        raise ValueError(f"{token} in a reservation file")
+
+    def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        keys = [k for k, _v in pairs]
+        if len(keys) != len(set(keys)):
+            raise ValueError("a key given twice")
+        return dict(pairs)
+    return json.loads(raw, parse_constant=refuse, object_pairs_hook=unique)
+
+
+def names_list(value: Any, what: str) -> set[str]:
+    if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
+        raise ValueError(f"{what} is not a list of names")
+    return {v.lower() for v in value}
+
+
+def fleet_ops_hold(now: float, fleet_root: Path = FLEET_ROOT, node: str | None = None) -> str:
+    """Why the ops stay as they are on this host ("" when they may be installed). Fails closed: a reservation list that
+    is missing, unreadable, or past its own "expires" holds, as an active entry naming this host or an active
+    host-local reservation does.
+    The list is the fleet user's ~/.local/share/glaeda/fleet-reservations.json (glaeda-fleet-reservations/v1), the
+    user being the owner of the fleet root. Root reads it, and the update config's host name, only to decide whether
+    to hold: whatever they say, the bytes it installs are the pinned ones."""
+    try:
+        home = Path(pwd.getpwuid(os.stat(fleet_root).st_uid).pw_dir)
+    except (OSError, KeyError) as e:
+        return f"no fleet user (owner of {fleet_root}): {type(e).__name__}"
+    names = {(node if node is not None else platform_node()).split(".")[0].lower()}
+    try:  # every OTA host has it; without its host name a reservation naming only that could be missed
+        host = strict_json(read_small(home / ".config/glaeda/update.json")).get("host")
+        if not isinstance(host, str) or not host:
+            raise ValueError("no host")
+        names.add(host.lower())
+    except (OSError, ValueError, AttributeError) as e:
+        return f"glaeda update config unreadable ({type(e).__name__}); held as reserved"
+    try:
+        doc = strict_json(read_small(home / ".local/share/glaeda/fleet-reservations.json"))
+        if not isinstance(doc, dict) or doc.get("schema") != RESERVATIONS_SCHEMA:
+            raise ValueError("schema")
+        if reservation_time(doc.get("expires")) <= now:  # its writer refreshes it; an old list is no answer
+            return f"fleet reservations expired at {doc.get('expires')}; held as reserved"
+        entries, aliases = doc["reservations"], doc.get("aliases", {})
+        if not isinstance(entries, list) or not isinstance(aliases, dict):
+            raise ValueError("malformed")
+        alias_of = {str(k).lower(): names_list(v, f"aliases of {k}") for k, v in aliases.items()}
+        reserved = ""
+        for e in entries:  # every entry is checked, so a malformed one anywhere holds
+            if not isinstance(e, dict):
+                raise ValueError("an entry is not an object")
+            hosts = names_list(e["hosts"], "hosts")
+            hosts |= {a for h in hosts for a in alias_of.get(h, ())}
+            start, until = reservation_time(e["from"]), reservation_time(e["until"])
+            if start > until:
+                raise ValueError("an entry ends before it starts")
+            if names & hosts and start <= now <= until and not reserved:
+                reserved = f"reserved until {e['until']}"
+        if reserved:
+            return reserved
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+        return f"fleet reservations unreadable ({type(e).__name__}); held as reserved"
+    local = fleet_root / "reservation.json"
+    if os.path.lexists(local):  # absent is no reservation; anything there that cannot be read holds
+        try:
+            held = strict_json(read_small(local))
+            if not isinstance(held, dict) or held.get("schema") != "glaeda-reservation/v1":
+                raise ValueError("schema")
+            since, until = reservation_time(held["since"]), reservation_time(held["until"])
+            if since > until:
+                raise ValueError("ends before it starts")
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            return f"host reservation unreadable ({type(e).__name__}); held as reserved"
+        if since <= now < until:
+            return f"host reservation until {held['until']}"
+    return ""
+
+
+def platform_node() -> str:
+    return os.uname().nodename
+
+
+def fleet_ops_eligible(ops_dir: Path) -> str:
+    """Why this host is not one the ops belong on ("" when it is): a fleet Mac whose ops directory a root install
+    already made, and not an EC2 Mac (they carry ec2-user, and nothing installs fleet ops on them)."""
+    if sys.platform != "darwin":
+        return "not macOS"
+    with contextlib.suppress(KeyError):
+        pwd.getpwnam("ec2-user")
+        return "an EC2 Mac (ec2-user): fleet ops are not installed here"
+    if not ops_dir.is_dir() or ops_dir.is_symlink():
+        return f"no {ops_dir}: not a fleet Mac a root install set up"
+    return ""
+
+
+def unload_op(name: str, ctl, wait=time.sleep) -> bool:
+    """Boot out system/ai.manaflow.NAME and wait until launchd no longer lists it."""
+    target = f"system/{op_label(name)}"
+    ctl("bootout", target)
+    for _ in range(40):  # launchd lets go of a booted-out job asynchronously
+        if op_loaded(name, ctl) is False:  # launchd said it has no such service; no answer is not that
+            return True
+        wait(0.25)
+    return False
+
+
+def op_loaded(name: str, ctl) -> bool | None:
+    """True when launchd lists system/ai.manaflow.NAME, False when it says it has no such service, None otherwise."""
+    code, said = ctl("print", f"system/{op_label(name)}")
+    if code == 0:
+        return True
+    return False if code in (36, 113) or "could not find service" in str(said).lower() else None
+
+
+def load_op(name: str, plist: Path, ctl, wait=time.sleep) -> str | None:
+    """Load plist as system/ai.manaflow.NAME afresh; None when it is loaded, else why not. A plist left that did
+    not load is removed, so the next pass sees it differ and tries again."""
+    target = f"system/{op_label(name)}"
+    if not unload_op(name, ctl, wait):
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(plist)
+        return f"launchctl bootout {target} did not unload it"
+    said = ""
+    for pause in (0, 1, 2, 4):  # a bootstrap right after a bootout can fail with EIO
+        wait(pause)
+        code, said = ctl("bootstrap", "system", os.fspath(plist))
+        if code == 0:
+            return None
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(plist)
+    return f"launchctl bootstrap: {said}"
+
+
+def fleet_ops_pass(ops_path: Path, now: float, apply: bool, ops_dir: Path = FLEET_OPS_DIR,
+                   plist_dir: Path = PLIST.parent, root: bool = True, hold=fleet_ops_hold, eligible=fleet_ops_eligible,
+                   ctl=None, ledger: Path = INSTALL_DIR / "state" / "fleet-ops-managed.json",
+                   wait=time.sleep) -> dict[str, Any]:
+    """Each op's state here (current, stale, missing) and, on apply, what was installed. A body is replaced
+    atomically (launchd runs the path afresh at each StartInterval, so no reload is needed for it); the
+    LaunchDaemon is rewritten and reloaded only when it differs from the op's, and loaded when it is not. An op this
+    pass installed earlier (the root-owned ledger) that the file no longer lists is unloaded and removed; nothing
+    it did not install is touched."""
+    ctl = ctl or launchctl
+    doc = load_fleet_ops(read_bytes(ops_path) or b"")
+    out: dict[str, Any] = {"ops": {}, "installed": []}
+    for name, op in sorted(doc["ops"].items()):
+        have = read_bytes(ops_dir / name)
+        out["ops"][name] = {"want": op["sha256"], "source": op["source"]["commit"],
+                            "have": None if have is None else sha256(have),
+                            "state": "missing" if have is None else "current" if sha256(have) == op["sha256"] else "stale"}
+    why = eligible(ops_dir) or hold(now)
+    if why:
+        out["held"] = why
+        return out
+    if not apply:
+        return out
+    if root:
+        check_root_dir(ops_dir)
+        check_root_dir(plist_dir)
+    managed = load_json(ledger).get("ops")
+    managed = {n for n in managed if isinstance(n, str) and OP_NAME.fullmatch(n)} if isinstance(managed, list) else set()
+    for name in sorted(managed - set(doc["ops"])):
+        if not unload_op(name, ctl, wait):
+            out.setdefault("errors", []).append(f"{name}: launchctl bootout did not unload it; kept, tried again next pass")
+            continue
+        for path in (plist_dir / f"{op_label(name)}.plist", ops_dir / name):
+            if path.is_file() and not path.is_symlink():
+                os.unlink(path)
+        managed.discard(name)
+        out.setdefault("removed", []).append(name)
+    for name, op in sorted(doc["ops"].items()):
+        target = ops_dir / name
+        if target.is_symlink() or target.exists() and not target.is_file():
+            out["ops"][name]["error"] = f"{target} is not a regular file; left alone"
+            continue
+        if out["ops"][name]["state"] != "current" or (target.stat().st_mode & 0o777) != 0o755:
+            managed.add(name)
+            atomic_write(ledger, json.dumps({"ops": sorted(managed)}).encode(), 0o644, root)  # before the write
+            atomic_write(target, op["body"].encode(), 0o755, root)
+            out["installed"].append(name)
+            out["ops"][name].update(state="current", have=op["sha256"])
+        plist = plist_dir / f"{op_label(name)}.plist"
+        want = op_plist(name, op["every_s"], ops_dir)
+        try:
+            same = plistlib.loads(read_bytes(plist) or b"") == want
+        except Exception:  # noqa: BLE001 (any unparsable plist is one to rewrite)
+            same = False
+        if not same:
+            managed.add(name)
+            atomic_write(ledger, json.dumps({"ops": sorted(managed)}).encode(), 0o644, root)
+            atomic_write(plist, plistlib.dumps(want, sort_keys=True), 0o644, root)
+        if not same or op_loaded(name, ctl) is not True:
+            error = load_op(name, plist, ctl, wait)
+            if error:
+                out["ops"][name]["error"] = error
+    if managed != set(load_json(ledger).get("ops") or []):
+        atomic_write(ledger, json.dumps({"ops": sorted(managed)}).encode(), 0o644, root)
+    return out
+
+
 # ---------------------------------------------------------------- main
 
 
 def run_pass(policy_path: Path, state_dir: Path, apply: bool, host: Host | None = None,
-             install_dir: Path | None = None, **release: Any) -> dict[str, Any]:
+             install_dir: Path | None = None, fleet_ops: dict[str, Any] | None = None, **release: Any) -> dict[str, Any]:
     """One pass. The installed root copy (or a test's install_dir) also keeps itself on the release."""
     policy = load_policy(policy_path)
     state = load_json(state_dir / "state.json")
@@ -827,6 +1126,25 @@ def run_pass(policy_path: Path, state_dir: Path, apply: bool, host: Host | None 
                 schedule_reload(install_dir, PLIST, new_state, report_time(report), policy["release"]["every_s"])
             except (HealError, OSError, ValueError) as e:  # never at the cost of this pass's report
                 new_state["release"]["error"] = f"reload: {str(e)[:200]}"
+    # The ops file sits beside the policy (the snapshot, the stage, or a release's config/). A copy that predates it
+    # stages a new release with only the other two files, so its absence is reported, never a failed plan pass.
+    ops_path = policy_path.with_name(FLEET_OPS_NAME)
+    live = apply and root and install_dir == INSTALL_DIR
+    if live and fleet_ops is None and ops_path.exists():
+        # Root acts only on the bytes refresh() took from the verified release and recorded in installed.json,
+        # whatever put a file at this path (a hand install leaves the snapshot's as it was).
+        ident = load_json(install_dir / INSTALLED)
+        recorded = (ident.get("files") or {}).get(FLEET_OPS_NAME) if isinstance(ident.get("files"), dict) else None
+        if not recorded or recorded != sha256(read_bytes(ops_path) or b""):
+            live = False
+            fleet_ops = {"hold": lambda now: "fleet-ops.json is not the one its release installed; a pass restores it"}
+    try:
+        report["fleetOps"] = (fleet_ops_pass(ops_path, report_time(report), live, **(fleet_ops or {}))
+                              if fleet_ops is not None or ops_path.exists() else {"error": f"no {ops_path}"})
+    except (HealError, OSError, ValueError) as e:
+        if not apply:
+            raise  # a plan pass (the staged check of a new release) refuses a pair with a bad fleet-ops.json
+        report["fleetOps"] = {"error": str(e)[:300]}
     report["staleAfterS"] = policy["report_stale_passes"] * policy["every_s"]
     report["follows"] = RING  # stage_check: a release whose code says so keeps itself current once installed
     if "release" in new_state:

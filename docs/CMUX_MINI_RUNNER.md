@@ -1464,6 +1464,39 @@ last read the channel and the last error. `judge` in the script turns that repor
 reinstalls only when a reinstall can fix the verdict (`reinstall` in the verdict). It never reinstalls for a
 channel the daemon cannot read, or for a release the daemon refused.
 
+### Fleet ops scripts
+
+The same root pass keeps the fleet's root ops scripts current. `config/fleet-ops.json` (`glaeda-fleet-ops/v1`)
+is the third file of the snapshot and follows the release with the other two. For each op it holds the body,
+pinned to its SHA-256 and to the source commit and path it came from (the source repository generates the file;
+do not edit it by hand). Each pass reports every op's installed hash against its pin (`fleetOps` in
+`state/report.json`). On an `--apply` pass by the root copy, a body that differs is replaced at
+`/Library/Application Support/cmux-fleet-ops/NAME`, mode 0755, owned by root. Its LaunchDaemon `ai.manaflow.NAME`
+(every `every_s`, logging to `/var/log/NAME.log`) is rewritten and reloaded only when it differs, and bootstrapped
+when it is not loaded.
+
+It acts only where all of the following hold. Otherwise it reports and changes nothing:
+
+- macOS, with no `ec2-user` account (EC2 Macs are not fleet-ops hosts).
+- `/Library/Application Support/cmux-fleet-ops` already exists, because a root install made it.
+- The host is not reserved. The pass reads `~/.local/share/glaeda/fleet-reservations.json`
+  (`glaeda-fleet-reservations/v1`) from the home of the user who owns `/Users/Shared/cmux-build-fleet`. A list that
+  is missing, unreadable, or past its own `expires` counts as reserved. So does an active entry naming this host
+  (its machine name or the host in `~/.config/glaeda/update.json`, plus the list's aliases), and so does an active
+  `/Users/Shared/cmux-build-fleet/reservation.json`. The list's writer refreshes it. Whatever these files say, the
+  bytes installed are the pinned ones.
+
+Only the release chain installs `fleet-ops.json`, and root acts only on a copy whose hash `installed.json`
+records for its release. The host's `~/.config/glaeda/update.json` must name it; without that the pass holds too,
+as it does for a reservation whose interval is reversed. A hand `--install` takes the script and the policy and drops
+the snapshot's `fleet-ops.json`; the next pass restores it from the release. An op that this pass installed (listed
+in the root-owned `state/fleet-ops-managed.json`) and that the file no longer lists is unloaded and removed.
+Nothing it did not install is touched. A plist that does not load is removed, so the next pass tries again.
+
+A release without the file is accepted. Its copy of the file is removed, and the ops already installed stay as
+they are. A pair installed by a copy from before the file existed reads the file from its own release at the next
+pass.
+
 ## 2m. Build mesh: the fleet index and kept state between PR minis
 
 Compiled products (2j) are one object per build. The bigger saving is kept compile-admission state: a
