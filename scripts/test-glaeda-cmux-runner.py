@@ -62,6 +62,9 @@ os.environ["GLAEDA_RUNNER_GATE_CPU_PAUSE"] = os.environ["GLAEDA_RUNNER_GATE_CPU_
 # Likewise the console check reads this Mac's real session, which a locked test host would turn into refusals: no
 # ioreg here or in the hooks the tests start (unreadable changes nothing); console tests point it at a fake.
 os.environ["GLAEDA_RUNNER_IOREG"] = "/nonexistent/ioreg"
+# The missing-Rust check reads this host's real ~/.cargo/bin: off in this process (and what it starts with its env);
+# RustToolchainMissing tests turn it on against a fake bin dir. The hooks run_hook starts get a fake HOME and PATH.
+os.environ["GLAEDA_RUNNER_TOOLCHAIN_GATE"] = "0"
 hook = load("glaeda_cmux_runner_hook", HOOK)
 # The gate evicts under its disk floor with whatever glaeda-disk it finds: in this process never this machine's own
 # (~/.local/bin); a test that wants one passes it explicitly or patches disk_pressure.
@@ -3176,12 +3179,12 @@ time.sleep(60)
 
     # ------------------------------------------------------------ ci-step admission (cmuxterm-hq#794)
 
-    def ci_step(self, phase: str, *extra: str, units: int = 7) -> tuple[int, dict]:
+    def ci_step(self, phase: str, *extra: str, units: int = 7, env: dict | None = None) -> tuple[int, dict]:
         """Run admit, release or fits as the build worker does: one JSON line on stdout. 7 units: a light step (2),
         an isolated one (4) and one more."""
         result = self.run_hook(phase, None, None, "--capacity-units", str(units),
                                "--capacity-dir", os.fspath(self.dir / "capacity"),
-                               "--state-dir", os.fspath(self.dir / "state"), *extra)
+                               "--state-dir", os.fspath(self.dir / "state"), *extra, env=env)
         lines = result.stdout.strip().splitlines()
         self.assertEqual(len(lines), 1, result.stdout + result.stderr)
         return result.returncode, json.loads(lines[0])
@@ -3266,6 +3269,50 @@ time.sleep(60)
                                      "--watch-pid", str(worker.pid))
         self.assertEqual(status, 1)
         self.assertIn("is not running", again["reason"])
+
+    def test_ci_step_takes_nothing_while_the_rust_toolchain_is_missing(self) -> None:
+        """2026-10-26: ~/.cargo/bin/rustup was deleted on the runner minis (rustc and cargo link to it). fits kept
+        advertising light and isolated, so the controller kept leasing steps that could not run cargo. Now a fleet
+        node (a --require-eligible runner) with a missing toolchain fits nothing, says why, and admit refuses."""
+        self.fleet()
+        hooks = self.dir / "actions-runner-glaeda" / "glaeda-hooks"
+        hooks.mkdir(parents=True)
+        (hooks / "job-started.sh").write_text("#!/bin/bash\nexec /usr/bin/python3 /hook job-started --require-eligible "
+                                              "--fleet-class m4pro-48 --instance 0\n")
+        bin_dir = self.dir / ".cargo" / "bin"
+        bin_dir.mkdir(parents=True)
+        for tool in ("rustc", "cargo"):
+            (bin_dir / tool).symlink_to("rustup")
+        # The worker's own PATH finds a rust elsewhere; the jobs' (the runner agent's WORKLOAD_PATH) is what counts.
+        elsewhere = self.dir / "worker-path"
+        elsewhere.mkdir()
+        for tool in ("rustup", "rustc", "cargo"):
+            make_executable(elsewhere / tool, "#!/bin/sh\nexit 0\n")
+        workload = f"{bin_dir}:{self.dir / 'no-rust-here'}"
+        env = {"PATH": os.fspath(elsewhere), "GLAEDA_RUNNER_WORKLOAD_PATH": workload}
+        (hooks.parent / ".path").write_text(f"{elsewhere}\n")  # nothing reads .path: it never decides
+        worker = self.ci_worker()
+        watch = ("--watch-pid", str(worker.pid))
+        status, fits = self.ci_step("fits", env=env)
+        self.assertEqual((status, fits["fits"], fits["unknown"]), (0, [], False))
+        self.assertIn(f"Rust toolchain missing: rustup is not installed (not on the job PATH {workload}, not in "
+                      f"{bin_dir}); {bin_dir / 'rustc'} (a link to rustup", fits["refusal"])
+        status, refused = self.ci_step("admit", "--class", "light", "--job-key", "rust-1-1", *watch, env=env)
+        self.assertEqual((status, refused["admitted"]), (1, False))
+        self.assertIn("Rust toolchain missing", refused["reason"])
+        self.assertNotIn("units", refused, "a refused step holds no units")
+        make_executable(bin_dir / "rustup", "#!/bin/sh\nexit 0\n")
+        status, fits = self.ci_step("fits", env=env)
+        self.assertEqual((fits["fits"], "refusal" in fits), (["light", "isolated"], False), "back as soon as it runs")
+        try:
+            status, admitted = self.ci_step("admit", "--class", "light", "--job-key", "rust-2-1", *watch, env=env)
+            self.assertEqual(status, 0, admitted)
+        finally:
+            self.ci_step("release", "--job-key", "rust-2-1", env=env)
+        (bin_dir / "rustup").unlink()
+        (hooks / "job-started.sh").write_text("#!/bin/bash\nexec /usr/bin/python3 /hook job-started --instance 0\n")
+        self.assertEqual(self.ci_step("fits", env=env)[1]["fits"], ["light", "isolated"],
+                         "a mini with no fleet build runner needs no Rust for its steps")
 
     def test_ci_step_refusals_are_typed_and_never_wait(self) -> None:
         fleet = self.fleet()
@@ -5577,6 +5624,124 @@ class GateTest(unittest.TestCase):
             gate.eligible_at -= hook.GATE_ELIGIBLE_EVERY_S
             self.assertIsNone(gate.claimed(), "no --require-eligible: never held for eligibility")
             look.assert_not_called()
+
+    def rust_bin(self) -> Path:
+        """A rustup bin dir as the minis had it on 2026-10-26: rustc and cargo link to a rustup that is gone. The gate's
+        own PATH (run.sh's, so the jobs') reaches it."""
+        bin_dir = self.tmp / "cargo" / "bin"
+        bin_dir.mkdir(parents=True)
+        for tool in ("rustc", "cargo"):
+            (bin_dir / tool).symlink_to("rustup")
+        for patch in (mock.patch.object(hook, "TOOLCHAIN_GATE", True),
+                      mock.patch.dict(os.environ, {"PATH": f"{bin_dir}:{self.tmp / 'no-rust-here'}",
+                                                   "CARGO_HOME": os.fspath(bin_dir.parent)})):
+            patch.start()
+            self.addCleanup(patch.stop)
+        return bin_dir
+
+    def test_toolchain_missing_names_each_tool_and_why(self) -> None:
+        bin_dir = self.rust_bin()
+        cargo_home = os.fspath(bin_dir.parent)
+        self.assertEqual(hook.toolchain_missing({"PATH": f"{bin_dir}:/nonexistent", "CARGO_HOME": cargo_home}),
+                         f"node not eligible (Rust toolchain missing: rustup is not installed (not on the job PATH "
+                         f"{bin_dir}:/nonexistent, not in {bin_dir}); {bin_dir / 'rustc'} (a link to rustup, which is "
+                         f"gone); {bin_dir / 'cargo'} (a link to rustup, which is gone))")
+        make_executable(bin_dir / "rustup", "#!/bin/sh\nexit 0\n")
+        self.assertIsNone(hook.toolchain_missing({"PATH": os.fspath(bin_dir)}), "the links resolve again")
+        self.assertEqual(hook.toolchain_missing({"PATH": "/nonexistent", "CARGO_HOME": cargo_home}),
+                         "node not eligible (Rust toolchain missing: " + "; ".join(
+                             f"{tool} is not on the job PATH /nonexistent ({bin_dir / tool} is there)"
+                             for tool in hook.RUST_TOOLS) + ")")
+        (bin_dir / "rustup").unlink()
+        brew = self.tmp / "brew"  # the minis' jobs run Homebrew's rustup proxies (/opt/homebrew/bin first)
+        brew.mkdir()
+        for tool in hook.RUST_TOOLS:
+            make_executable(brew / tool, "#!/bin/sh\nexit 0\n")
+        self.assertIsNone(hook.toolchain_missing({"PATH": f"{brew}:/usr/bin", "CARGO_HOME": cargo_home}),
+                          "a toolchain the job PATH finds elsewhere runs, whatever ~/.cargo/bin holds")
+        (brew / "rustc").unlink()
+        (brew / "rustc").symlink_to(self.tmp / "Cellar" / "rustup" / "bin" / "rustc")
+        self.assertIn(f"{brew / 'rustc'} (a link to", hook.toolchain_missing({"PATH": os.fspath(brew)}) or "",
+                      "a dangling link on the PATH is named first")
+        with mock.patch.object(hook, "TOOLCHAIN_GATE", False):
+            self.assertIsNone(hook.toolchain_missing())
+
+    def test_the_workload_path_is_the_runner_agents(self) -> None:
+        self.assertEqual(hook.WORKLOAD_DEFAULT, cr.WORKLOAD_PATH)
+        self.assertEqual(hook.workload_env()["PATH"], hook.WORKLOAD_PATH)
+
+    def test_a_missing_rust_toolchain_holds_a_require_eligible_runner_at_once(self) -> None:
+        """2026-10-26: with ~/.cargo/bin/rustup gone, a listening runner took every job its label brought until the
+        gate's next eligibility look (up to GATE_ELIGIBLE_EVERY_S) and its recheck (GATE_ELIGIBLE_RECHECK_S) agreed.
+        A missing binary is no slow probe: the gate holds on the poll that sees it, and lets go on the one after
+        it is back. The PATH is the gate's own, which run.sh and every job inherit, never the runner's .path."""
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("exec /usr/bin/python3 /hook job-started --require-eligible --fleet-class m4pro-48 "
+                          "--toolchain-xcode /Applications/Xcode_26.6.app --instance 1\n")
+        bin_dir = self.rust_bin()
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        for name in ("saturated", "hot"):
+            patch = mock.patch.object(gate, name, return_value=None)
+            patch.start()
+            self.addCleanup(patch.stop)
+        gate.eligible_at = time.monotonic()  # a look just ran and said eligible: the next is 300 s away
+        with mock.patch.object(hook, "eligibility_refusal", return_value=None) as look:
+            why = gate.claimed()
+            self.assertEqual(why, f"ineligible: {hook.toolchain_missing()}")
+            self.assertIn("rustup is not installed", why)
+            self.assertEqual(gate.confirmed(), why, "the look right before a stop holds too")
+            look.assert_not_called()
+            make_executable(bin_dir / "rustup", "#!/bin/sh\nexit 0\n")
+            self.assertIsNone(gate.claimed(), "listening again on the next poll")
+            # every mini's .path drifted to this on re-registration; nothing on a glaeda runner reads it
+            (self.runner / ".path").write_text("/usr/bin:/bin:/usr/sbin:/sbin\n")
+            self.assertIsNone(gate.claimed(), "a .path without the toolchain never holds a runner whose PATH has it")
+        script.write_text("exec /usr/bin/python3 /hook job-started --fleet-class m4pro-48 --instance 1\n")
+        (bin_dir / "rustup").unlink()
+        self.assertIsNone(gate.claimed(), "no --require-eligible: never held for the toolchain")
+
+    def test_a_missing_toolchain_never_outlives_its_return(self) -> None:
+        """The threaded look's toolchain_refusal also refuses a missing toolchain, but the per-poll check owns that
+        answer: a look that meets it changes nothing (a held refusal stands, none is stored), so a runner listens
+        again on the first poll after rustup is back, unless something else holds it; a reload never carries it."""
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("exec /usr/bin/python3 /hook job-started --require-eligible --fleet-class m4pro-48\n")
+        bin_dir = self.rust_bin()
+        why = f"node not eligible ({hook.TOOLCHAIN_MISSING}: rustup is not installed)"
+        with mock.patch.dict(os.environ, {hook.GATE_INELIGIBLE_ENV: why}):
+            gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        self.assertIsNone(gate.eligible_why, "a reload drops a carried missing-toolchain answer")
+        for name in ("saturated", "hot"):
+            patch = mock.patch.object(gate, name, return_value=None)
+            patch.start()
+            self.addCleanup(patch.stop)
+        release = threading.Event()
+
+        def slow_look(*_args):
+            release.wait(5)  # the look is still running when rustup comes back
+            return why
+
+        with mock.patch.object(hook, "eligibility_refusal", side_effect=slow_look):
+            self.assertIn(hook.TOOLCHAIN_MISSING, gate.claimed() or "")
+            gate.eligible_at -= hook.GATE_ELIGIBLE_EVERY_S
+            make_executable(bin_dir / "rustup", "#!/bin/sh\nexit 0\n")
+            self.assertIsNone(gate.claimed(), "listening again on the first poll after it is back")
+            self.assertTrue(gate.eligible_look.is_alive())
+            release.set()
+            gate.eligible_look.join(5)
+            self.assertIsNone(gate.eligible_why, "the look's late answer is never stored, so it cannot hold 300 s")
+            self.assertIsNone(gate.eligible_new, "no recheck queued for it either")
+            self.assertIsNone(gate.claimed())
+        held = "node not eligible (state x, build: stale receipt)"
+        gate.eligible_why = held  # another refusal was already holding the runner
+        gate.eligible_at -= hook.GATE_ELIGIBLE_EVERY_S
+        with mock.patch.object(hook, "eligibility_refusal", return_value=why):
+            gate.claimed()
+            gate.eligible_look.join(5)
+        self.assertEqual(gate.eligible_why, held, "a look that meets a missing toolchain keeps the held refusal")
+        self.assertEqual(gate.claimed(), f"ineligible: {held}")
 
     def test_the_listener_starts_without_sdkroot_and_on_the_pool_xcode(self) -> None:
         """cmux21: the gate ran under the /usr/bin/python3 xcrun shim, which put SDKROOT in its env, and run.sh

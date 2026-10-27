@@ -211,9 +211,13 @@ class FakeMini(health.Mini):
         return self.refusal
 
     toolchain: str | None = None
+    toolchain_gone: str | None = None
 
     def toolchain_mismatch(self):
         return self.toolchain
+
+    def toolchain_missing(self):
+        return self.toolchain_gone
 
     def install_rust_toolchain(self, toolchain):
         self.toolchain_installs.append(toolchain)
@@ -318,6 +322,55 @@ class NodeEligibility(unittest.TestCase):
         mini._hook.xcode_refusal = lambda xcode_app, env: 1 / 0
         self.assertIsNone(mini.toolchain_mismatch(), "a hook that cannot answer is no finding")
 
+    def test_a_missing_rust_toolchain_is_read_from_the_hook_for_a_fleet_node(self) -> None:
+        mini, _ = self.mini("exec /usr/bin/python3 hook job-started --require-eligible --fleet-class m4pro-48")
+        why = "node not eligible (Rust toolchain missing: rustc is not on the job PATH /usr/bin:/bin (...))"
+        homes: list[Path] = []
+
+        def fleet_toolchain_missing(home=None):
+            homes.append(home)
+            return why
+
+        mini._hook.fleet_toolchain_missing = fleet_toolchain_missing
+        self.assertEqual(mini.toolchain_missing(), why)
+        self.assertEqual(homes, [self.home], "the runner user's own runners and ~/.cargo/bin")
+        mini._hook.fleet_toolchain_missing = lambda home=None: 1 / 0
+        self.assertIsNone(mini.toolchain_missing(), "a hook that cannot answer is no finding")
+        del mini._hook.fleet_toolchain_missing
+        self.assertIsNone(mini.toolchain_missing(), "an older hook without the check is no finding")
+
+    def test_the_real_hook_reads_the_runners_workload_path(self) -> None:
+        """Against the real hook: the runners' WORKLOAD_PATH decides, never this agent's launchd PATH nor the runner's
+        .path (which drifted to /usr/bin:/bin:... on every re-registered mini while its jobs ran on WORKLOAD_PATH)."""
+        spec = importlib.util.spec_from_loader("hook_for_health_test", importlib.machinery.SourceFileLoader(
+            "hook_for_health_test", os.fspath(ROOT / "scripts" / "glaeda-cmux-runner-hook")))
+        real = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(real)
+        real.TOOLCHAIN_GATE = True
+        mini, _ = self.mini("exec /usr/bin/python3 hook job-started --require-eligible --fleet-class m4pro-48")
+        mini._hook = real
+        brew = self.home / "brew" / "bin"
+        brew.mkdir(parents=True)
+        for tool in ("rustup", "rustc", "cargo"):
+            (brew / tool).write_text("#!/bin/sh\n")
+            (brew / tool).chmod(0o755)
+        (self.home / "actions-runner-glaeda" / ".path").write_text("/usr/bin:/bin:/usr/sbin:/sbin\n")
+        real.WORKLOAD_PATH = f"{brew}:/usr/bin:/bin"
+        with mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}):
+            self.assertIsNone(mini.toolchain_missing(), "a .path without rust, a workload PATH with it: healthy")
+            (brew / "rustup").unlink()
+            self.assertIn("rustup is not installed", mini.toolchain_missing() or "")
+            (self.home / "actions-runner-glaeda" / "glaeda-hooks" / "job-started.sh").write_text(
+                "exec /usr/bin/python3 hook job-started\n")
+            self.assertIsNone(mini.toolchain_missing(), "a mini with no fleet build runner needs no Rust")
+
+    def test_the_remedy_follows_the_cause(self) -> None:
+        mini = FakeMini()
+        mini.toolchain_gone = f"node not eligible (Rust toolchain missing: rustc {health.TOOLCHAIN_OFF_PATH} /usr/bin)"
+        self.assertIn("WORKLOAD_PATH", health.check_toolchain_missing(mini)[0]["note"])
+        mini.toolchain_gone = "node not eligible (Rust toolchain missing: rustup is not installed (...))"
+        self.assertIn("reinstall rustup", health.check_toolchain_missing(mini)[0]["note"])
+
     def test_a_runner_without_a_pool_xcode_has_no_toolchain_to_check(self) -> None:
         mini, _ = self.mini("exec /usr/bin/python3 hook job-started --allowed-owner manaflow-ai")
         mini._hook.xcode_refusal = lambda xcode_app, env: "toolchain: x"
@@ -407,6 +460,17 @@ class Detection(Base):
         f = report["findings"][0]
         self.assertEqual((f["severity"], f["auto_fix"]), ("error", "impossible"))
         self.assertIn("3809eed51fdd", f["evidence"])
+
+    def test_a_missing_rust_toolchain_is_a_named_error(self) -> None:
+        # 2026-10-26: ~/.cargo/bin/rustup was deleted on the runner minis and health said nothing
+        self.mini.toolchain_gone = ("node not eligible (Rust toolchain missing: /Users/cmux/.cargo/bin/rustup, "
+                                    "/Users/cmux/.cargo/bin/rustc (a link to rustup, which is gone))")
+        report = self.run_once()
+        self.assertEqual(self.ids(report), ["toolchain_missing"])
+        f = report["findings"][0]
+        self.assertEqual((f["severity"], f["auto_fix"]), ("error", "impossible"))
+        self.assertIn("/Users/cmux/.cargo/bin/rustup", f["evidence"])
+        self.assertIn("rustup", f["note"])
 
     def test_a_toolchain_outside_the_pool_xcode_is_an_error_this_user_cannot_heal(self) -> None:
         # cmux21, 2026-10-21: Command Line Tools 27 made xcrun resolve their SDK and Swift 6.4 past Xcode_26.6
