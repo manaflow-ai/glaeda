@@ -64,10 +64,10 @@ window plus a fresh process/lock/lease check; unknown children and all preserved
 inputs remain visible to accounting and are kept.  The cache has an LRU size cap
 (cmux_next_ci_cap_gib in disk-policy.json or --cmux-next-cap-gib, default 40 GiB, 0 off): while a
 pressure run measures it over the cap, the window gives way, least recently used first, until it is
-under the cap or the free target is met, and a state root no enrolled runner owns (a scheme state by
-name, a dev-daily/release state by its runner-and-workspace key) idle past a job's timeout goes whole,
-inputs included. Enrolled runners' states lose only generated output, and the process/lock/lease/
-Runner.Worker vetoes still hold (docs/CMUX_NEXT_CI_RETENTION.md). Only a pressure run walks the cache; a text
+under the cap or the free target is met, and a state root idle past a job's timeout goes whole, inputs
+included, whoever owns it; a younger state loses only generated output. The process/lock/lease vetoes still
+hold, and a runner's running job keeps the states it has built in since it began (a state last built in before
+that is its last job's, as an idle runner's is) (docs/CMUX_NEXT_CI_RETENTION.md). Only a pressure run walks the cache; a text
 report shows its last measurement, and its run line records how far over the cap it is.
 The per-host build root (cmux_next_ci_host_roots, default dev-daily-release/host: one tree a mini's DEV
 compiles share under flock on its lock, so their compilation cache hits) is never the cap's: it goes whole, after
@@ -2181,6 +2181,33 @@ def runner_job_live(runner: Path, cmds: str) -> str:
     names = {os.fspath(runner), os.fspath(runner.resolve())}
     pattern = "(?:" + "|".join(map(re.escape, sorted(names))) + r")/bin(?:\.[0-9.]+)?/Runner\.Worker(?:\s|$)"
     return f"{runner.name} is running a job (Runner.Worker)" if re.search(pattern, cmds, re.M) else ""
+
+
+# One `ps -o lstart=,command=` line: the process's start ("Tue Oct 27 03:10:26 2026", LC_ALL=C), then its command.
+PS_LSTART_RE = re.compile(r"\s*([A-Z][a-z]{2} [A-Z][a-z]{2} +\d{1,2} \d{2}:\d{2}:\d{2} \d{4})\s+(.*)$")
+
+
+def runner_job_started(runner: Path) -> float | None:
+    """When the runner's running job began: its Runner.Worker's start (ps lstart), the earliest when ps shows more
+    than one. None when ps fails, shows none, or a start cannot be read: callers then hold the job to be using
+    everything the runner owns."""
+    try:
+        ps = subprocess.run(["ps", "-axww", "-o", "lstart=,command="], capture_output=True, text=True, timeout=60,
+                            env={**os.environ, "LC_ALL": "C"})
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if ps.returncode != 0:
+        return None
+    starts = []
+    for line in ps.stdout.splitlines():
+        m = PS_LSTART_RE.match(line)
+        if m is None or not runner_job_live(runner, m.group(2)):
+            continue
+        try:
+            starts.append(time.mktime(time.strptime(m.group(1), "%a %b %d %H:%M:%S %Y")))
+        except ValueError:
+            return None
+    return min(starts) if starts else None
 
 
 def runner_checkout_families(home: Path | None = None) -> list[Family]:
@@ -7834,6 +7861,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                                   if fresh_layout == "rustup-toolchain" else None)
                     remove(p, after_rename=cmux_next_ci_slot_recheck(fam, p, floor=cmux_next_ci_floor_slot(fam, p))
                            if whole_state
+                           else cmux_next_ci_child_recheck(fam, p) if fam.id == CMUX_NEXT_CI_FAMILY
                            else mirror_rename_recheck(p, bundled[2]) if mirror_due(fam, p, idle_now)
                            else None if stale_hash is None else lambda h=stale_hash: h.unlink(missing_ok=True))
                     gone = True
@@ -8081,20 +8109,21 @@ def cmux_next_ci_runner(path: Path, root: Path) -> Path | None:
 
 
 def cmux_next_ci_stale_roots(root: Path) -> list[Path]:
-    """Validated state roots the size cap may take whole, inputs included: those no runner enrolled here owns
-    (a scheme state by name, a release state by key; cmux_next_ci_owner), and per-instance states of a kind with a
-    host root (only that root's busy-lock fallback, cmux_next_ci_fallback_item), each idle at least a job's timeout
-    (cmux_next_ci_unowned_idle_hours). Only a host with enrolled runners can say an owner is gone, so elsewhere
-    there are none. An enrolled runner's other states, and younger ones, keep their inputs; every in-use veto,
-    the owner's Runner.Worker included, still holds (cmux_next_ci_busy)."""
+    """Validated state roots the size cap may take whole, inputs included: every state idle at least a job's
+    timeout (cmux_next_ci_unowned_idle_hours), whoever owns it, least recently used first like the rest of the
+    cap. An enrolled runner keeps a state per runner and kind (cmux-scheme/<runner>, <kind>/<runner key>), so with
+    only their generated output the cap's to take, the inputs of states no job had built in for hours held the
+    cache over its cap for good (cmux14, 2026-10-27: 79 GiB against 40, eight states of five runners, 4-5 GiB of
+    SourcePackages and module cache each). A younger state keeps its inputs. Only a host with enrolled runners
+    applies the cap, so elsewhere there are none, and while an enrolled runner's .runner cannot be read none is
+    (the state may be that runner's, mid-registration). Every in-use veto, its runner's running job included,
+    still holds (cmux_next_ci_busy)."""
     if not enrolled_runner_names():
         return []
     idle_s = float(POLICY["cmux_next_ci_unowned_idle_hours"]) * 3600
     now = time.time()
-    fam = cmux_next_ci_family(root)
     return [s for s in cmux_next_ci_state_roots(root)
-            if (cmux_next_ci_owner(s, root) is None or cmux_next_ci_fallback_item(fam, s))
-            and now - newest_mtime(s, 2, 3000) >= idle_s]
+            if cmux_next_ci_owner(s, root) != OWNER_UNKNOWN and now - newest_mtime(s, 2, 3000) >= idle_s]
 
 
 def cmux_next_ci_stale_roots_cached(root: Path) -> frozenset[Path]:
@@ -8304,7 +8333,8 @@ def cmux_next_ci_slot_recheck(fam: Family, path: Path, floor: bool = True):
         except NoEvidence:
             opened, cmds = None, ""
         taken = (opened is None or OWNER_UNKNOWN in (runner, vetted) or runner != vetted
-                 or (runner is not None and runner_job_live(runner, cmds))
+                 or (runner is not None and runner_job_live(runner, cmds)
+                     and not cmux_next_ci_job_predates(doomed, runner))
                  or in_cwd(os.fspath(doomed), open_index(opened)) or named_by(os.fspath(path), cmds)
                  or named_by(os.fspath(doomed), cmds) or bool(cmux_next_ci_tree_busy(doomed)))
         unmet = floor_stop_unmet(path) if floor else True
@@ -8325,6 +8355,79 @@ def cmux_next_ci_slot_recheck(fam: Family, path: Path, floor: bool = True):
     return recheck
 
 
+def cmux_next_ci_state_written(state: Path, skip: frozenset[str] = frozenset()) -> float:
+    """When STATE was last written: the newest mtime of the state root and its direct children (newest_mtime one
+    level down), leaving out the children named in SKIP. 0 when it cannot be read."""
+    return newest_mtime(state, 1, 3000, skip_names=skip)
+
+
+def cmux_next_ci_job_predates(state: Path, runner: Path, written: float | None = None) -> bool:
+    """Whether RUNNER's running job began after STATE was last written (WRITTEN, else read now), so it has not built
+    there: a build into a state rewrites its top level (xcodebuild's info.plist as it starts, cmux's
+    cmux-next-build.log as it ends), and the steps that read a state's products follow the build into it in the same
+    job (cmux-next.yml). Such a state is the runner's last job's, as an idle runner's is (cmux14, 2026-10-27: ten
+    runners busy around the clock, each job minutes to two hours old, every state last built in before its runner's
+    job began, so nothing was ever reclaimable). False when the job's start or the state's times cannot be read."""
+    started = runner_job_started(runner)
+    if started is None:
+        return False
+    last = cmux_next_ci_state_written(state) if written is None else written
+    return 0 < last < started
+
+
+def cmux_next_ci_child_recheck(fam: Family, path: Path):
+    """after_rename for a state's generated child: once the child is renamed aside, fresh evidence, and the child
+    goes back when anything has started on its state since the last check before the rename. That is a process
+    naming the state or open in it; its owner changed from the one cmux_next_ci_busy vetted (a re-registration); its
+    runner running a job that the state's times (taken before the rename, so the rename's own change to the state
+    directory is not mistaken for a build) do not predate, or any running job in a drain; a write to any other
+    top-level entry of the state since then (a build that began: xcodebuild rewrites its info.plist first); or a
+    marker, socket or unknown child (cmux_next_ci_tree_busy). Evidence that cannot be taken or read puts the child
+    back too."""
+    state = cmux_next_ci_state_for(path, fam.root)
+    if state is None:
+        return None
+    vetted = CMUX_NEXT_CI_VETTED_OWNER.get(state, OWNER_UNKNOWN)  # never vetted: whose it is is unknown
+    written = cmux_next_ci_state_written(state)
+    doomed = path.with_name(f"{DELETING_PREFIX}{path.name}-{os.getpid()}")
+
+    def recheck() -> None:
+        try:
+            opened, cmds = process_evidence()
+        except NoEvidence:
+            opened, cmds = None, ""
+        runner = cmux_next_ci_owner(state, fam.root)
+        since = cmux_next_ci_children_written(state, doomed.name)
+        taken = (opened is None or written <= 0 or since is None or since > written
+                 or OWNER_UNKNOWN in (runner, vetted) or runner != vetted
+                 or (runner is not None and runner_job_live(runner, cmds)
+                     and (CMUX_NEXT_CI_DRAIN or not cmux_next_ci_job_predates(state, runner, written)))
+                 or in_cwd(os.fspath(state), open_index(opened)) or named_by(os.fspath(state), cmds)
+                 or bool(cmux_next_ci_tree_busy(state, aside=doomed.name)))
+        if not taken:
+            return
+        try:
+            rename_noreplace(doomed, path)
+        except OSError as e:
+            raise SlotTaken(f"{path.name}: could not be put back ({e.strerror}); left aside as {doomed.name}")
+        raise SlotTaken(f"{path.name}: something started on {state}; put back")
+    return recheck
+
+
+def cmux_next_ci_children_written(state: Path, skip: str) -> float | None:
+    """The newest mtime among STATE's direct children other than SKIP (not the state directory itself, whose mtime the
+    rename aside just moved): 0 when there are none, None when the state or a child cannot be read."""
+    newest = 0.0
+    try:
+        with os.scandir(state) as it:
+            for entry in it:
+                if entry.name != skip:
+                    newest = max(newest, entry.stat(follow_symlinks=False).st_mtime)
+    except OSError:
+        return None
+    return newest
+
+
 def cmux_next_ci_floor_slot(fam: Family, path: Path) -> bool:
     """Whether PATH is an enrolled runner's whole cmux-next state root, listed only under the floor hold. Outside
     it, an owned fallback state the size cap lists whole (cmux_next_ci_stale_roots) is the cap's, as an unowned one."""
@@ -8335,8 +8438,7 @@ def cmux_next_ci_floor_slot(fam: Family, path: Path) -> bool:
         held = fam.root.stat().st_dev in FLOOR_HOLD
     except OSError:
         held = False
-    return held or not (cmux_next_ci_over() and cmux_next_ci_fallback_item(fam, path)
-                        and path in cmux_next_ci_stale_roots_cached(fam.root))
+    return held or not (cmux_next_ci_over() and path in cmux_next_ci_stale_roots_cached(fam.root))
 
 
 def cmux_next_ci_generated_paths(root: Path, whole_stale: bool = False) -> list[Path]:
@@ -8487,7 +8589,8 @@ def cmux_next_ci_busy(fam: Family, path: Path, opened: list[str] | frozenset[str
     CMUX_NEXT_CI_VETTED_OWNER[state] = runner
     if runner == OWNER_UNKNOWN:
         return "an enrolled runner's .runner names no agent: whose cmux-next state this is is unknown"
-    if runner is not None and (why := runner_job_live(runner, commands)):
+    if runner is not None and (why := runner_job_live(runner, commands)) \
+            and (CMUX_NEXT_CI_DRAIN or not cmux_next_ci_job_predates(state, runner)):
         return why
     state_text = os.fspath(state)
     if in_cwd(state_text, opened) or named_by(state_text, commands):
@@ -8531,9 +8634,11 @@ def cmux_next_ci_holds_socket(state: Path, budget: int = 3000) -> bool:
     return False
 
 
-def cmux_next_ci_tree_busy(state: Path) -> str:
+def cmux_next_ci_tree_busy(state: Path, aside: str = "") -> str:
     """cmux_next_ci_busy's vetoes read from the tree itself: a socket, an activity marker in it or beside it,
-    a child the family does not know. Also read on a slot's detached tree (cmux_next_ci_slot_recheck)."""
+    a child the family does not know. Also read on a slot's detached tree (cmux_next_ci_slot_recheck), and on a
+    state one of whose generated children is renamed aside as ASIDE (cmux_next_ci_child_recheck), which is not
+    an unknown child."""
     if cmux_next_ci_holds_socket(state):
         return "cmux-next state holds a socket"
     for ancestor in (state, state.parent):
@@ -8542,7 +8647,7 @@ def cmux_next_ci_tree_busy(state: Path) -> str:
                 return f"cmux-next active or ambiguous marker: {entry.name}"
     unknown = [entry.name for entry in _children(state)
                if entry.name not in CMUX_NEXT_CI_PRESERVED_NAMES
-               and entry.name not in CMUX_NEXT_CI_GENERATED_NAMES]
+               and entry.name not in CMUX_NEXT_CI_GENERATED_NAMES and entry.name != aside]
     if unknown:
         return "cmux-next state has unknown children: " + ", ".join(sorted(unknown)[:4])
     return ""

@@ -12,8 +12,29 @@ The key is one per runner and workspace, not a source fingerprint: cmux's
 `sha256("$RUNNER_NAME\n$GITHUB_WORKSPACE\n")[:16]`. glaeda-disk computes it for
 each enrolled runner (`<workFolder>/cmux/cmux`, the work folder read from its
 `.runner`, as given and resolved), so a release
-state's owner is known like a `cmux-scheme/<runner>` state's: a runner with a
-`Runner.Worker` keeps its output, and the runner floor hold covers it.
+state's owner is known like a `cmux-scheme/<runner>` state's, and the runner
+floor hold covers it.
+
+## A runner's running job
+
+A runner whose `Runner.Worker` runs keeps the states its job may be using:
+those written since the job began. Every build into a state rewrites the
+state's top level (xcodebuild's `info.plist` as it starts, cmux's
+`cmux-next-build.log` as it ends), and the steps that read a state's products
+follow the build into it in the same job, so a state whose top level is older
+than the `Runner.Worker` (its `ps` start time) holds the runner's last job's
+output, as an idle runner's does. A job whose start `ps` cannot show keeps
+everything its runner owns. Once any state's generated child is renamed
+aside, evidence is taken again, against the state's times read before the
+rename: if a process names the state or is open in it, its owner changed (a
+re-registration), its runner's job no longer predates it (in a drain, any
+running job), another top-level entry of the state was written since (a build
+that began rewrites `info.plist`), a marker, socket or unknown child appeared,
+or the state cannot be read, the child is put back. cmux14,
+2026-10-27: ten runners had a job around the clock, every state was last built
+in before its runner's job began, and the cache sat at 79 GiB against its
+40 GiB cap with nothing reclaimable. An explicit drain (below) still refuses
+any live `Runner.Worker`.
 
 The Xcode state component may be the historical bare hash or the production
 `xcode-<hash>` form. The family rejects symlinked layout parents and state
@@ -48,12 +69,14 @@ neither measures nor shows it. A pressure run line records
 `cmux_next_ci_over_gib`. Only a pressure run acts: while the
 cache is over the cap, the 72-hour window gives way, and candidates go least
 recently used first until the cache is back under the cap or the free target is
-met. Over the cap a state root no enrolled runner owns (a `cmux-scheme` state by
-name, a release state by key) and idle at least `cmux_next_ci_unowned_idle_hours`
-(default 6, GitHub's default job timeout) is listed whole, inputs included, and
-leaves no empty `<key>/Release` behind; a younger one loses only generated output. Every enrolled runner's states lose only generated
-output and keep `SourcePackages` and the module caches. Every veto above still
-holds, and a runner with a `Runner.Worker` keeps its states. An unmeasurable
+met. Over the cap a state root idle at least `cmux_next_ci_unowned_idle_hours`
+(default 6, GitHub's default job timeout) is listed whole, inputs included,
+whoever owns it, and a release state leaves no empty `<key>/Release` behind; a
+younger one loses only generated output. Keeping every enrolled runner's inputs
+held the cache over its cap for good: a runner keeps a state per kind, and on
+cmux14 (2026-10-27) eight states of five runners held 4-5 GiB of
+`SourcePackages` and module cache each. Every veto above still holds, a
+runner's running job included (above). An unmeasurable
 cache keeps the 72-hour window. cmux11s refused jobs at 21 GiB free under a
 40 GiB floor with 78 GiB here and nothing reclaimable (2026-10-21).
 
@@ -83,8 +106,8 @@ meanwhile falls back per instance, and one that starts after sets up a fresh
 tree. A process open in it or naming it keeps it too. Among the other
 cmux-next items, the per-instance states of a kind with a host root go first,
 and over the size cap such a state idle `cmux_next_ci_unowned_idle_hours` goes
-whole, inputs included, as an unowned one does (its runner's `Runner.Worker`
-and every other veto still keep it).
+whole, inputs included, as any other does (its runner's running job and every
+other veto still keep it).
 
 The ordinary `--dedupe` pass visits only reusable package/module/SDK inputs. Build
 output is write-heavy, so it is excluded from the periodic WatchPaths agent. An
