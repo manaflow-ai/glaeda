@@ -584,6 +584,15 @@ class DiskAndLeaks(Base):
         self.assertIn("5.0 GiB", report["findings"][0]["evidence"])
         self.assertIn("/Users/Shared", report["findings"][0]["evidence"])
 
+    def test_a_census_residual_is_named_not_pending(self) -> None:
+        self.mini.disk = {"schema": "glaeda-disk/v1", "accounting": [{
+            "accounting_gap": 40 * 1024**3,
+            "residual": {"category": "apfs-invisible (open-deleted/purgeable)", "bytes": 40 * 1024**3}}]}
+        report = self.run_once()
+        self.assertEqual(self.ids(report), ["disk_unmeasured"])
+        self.assertIn("apfs-invisible", report["findings"][0]["evidence"])
+        self.assertEqual(report["findings"][0]["auto_fix"], "impossible")
+
     def test_runner_profile_unmeasured_remainder_is_not_a_volume_finding(self) -> None:
         self.mini.disk = {"schema": "glaeda-disk/v1", "accounting": [{
             "scope": "runner-cache-profile", "unclassified": 300 * 1024**3,

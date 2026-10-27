@@ -1208,6 +1208,15 @@ def check_disk_accounting(mini: Mini) -> list[dict[str, Any]]:
             if isinstance(entry, dict) and entry.get("path") and isinstance(entry.get("bytes"), (int, float)):
                 top.append(f"{entry['path']} {entry['bytes'] / 1024**3:.1f} GiB")
     where = "; top level: " + ", ".join(top[:5]) if top else ""
+    residuals = [x.get("residual") for x in accounting if isinstance(x, dict)]
+    if residuals and all(isinstance(r, dict) and str(r.get("category", "")).startswith("apfs-invisible")
+                         for r in residuals):
+        # glaeda-disk's volume census walked every directory: what is left is not a measurement to refresh
+        findings.append(finding("disk_unmeasured", "warn",
+                                f"{missing / 1024**3:.1f} GiB used space is outside every walked directory: "
+                                f"{residuals[0]['category']}", "impossible",
+                                "open-deleted files, purgeable space or root-only dirs; the census repeats daily"))
+        return findings
     findings.append(finding("disk_unmeasured", "warn", f"{missing / 1024**3:.1f} GiB used space remains outside measured items and complete shared-runner coverage{where}",
                             "pending", "glaeda-disk reports bounded known-heavy roots and refreshes their accounting"))
     return findings

@@ -3279,7 +3279,7 @@ def fixed_measurement_roots() -> list[Path]:
 
 
 def _du_output(argv: list[str], allow_nonzero: bool = False,
-               record_timeout: bool = True) -> str | None:
+               record_timeout: bool = True, timeout: float | None = None) -> str | None:
     """Run one du walk with a killable process group; None means the tree is unsized.
 
     Report-only accounting and tooling probes use the same bounded walker, but a timeout there
@@ -3297,7 +3297,7 @@ def _du_output(argv: list[str], allow_nonzero: bool = False,
         )
         _ACTIVE_DU_PROCS[proc.pid] = proc
         try:
-            out, _ = proc.communicate(timeout=DU_TIMEOUT_S)
+            out, _ = proc.communicate(timeout=DU_TIMEOUT_S if timeout is None else timeout)
         except subprocess.TimeoutExpired:
             # du can be stuck in a kernel open() on a dead or remote filesystem.  Kill the group
             # and do not wait indefinitely for a post-kill read: callers must remain fail-closed.
@@ -6622,6 +6622,396 @@ def reconciled_known_coverage(coverage: list[dict[str, Any]]) -> int:
     return max(totals, default=0)
 
 
+# Whole-volume census: a report-only, once-a-day pass that sizes every directory of the Data volume no
+# family or fixed accounting root already sizes, so `accounting_gap` names its bytes instead of leaving
+# half the volume unexplained (Leo, 2026-10-27: "and how can <100gb be free on >256gb minis all the time").
+# It walks top-down: a directory that is sized is skipped, a directory that holds sized paths is opened and
+# its loose files counted, and any other directory gets one throttled `du` as "unclassified:<path>". A walk
+# that times out is opened one level instead, so the next slice resumes at a finer grain. It never deletes,
+# never uses sudo, and a root-only directory is reported as "unreadable:<path>" with du's lower bound.
+CENSUS_STATE = HOME / ".cache/glaeda-disk/census.json"
+CENSUS_LOCK = HOME / ".cache/glaeda-disk/census.lock"
+CENSUS_EVERY_S = 24 * 3600  # a new census starts at most once a day
+CENSUS_RESUME_S = 3600  # an unfinished census continues at most hourly, one bounded slice at a time
+CENSUS_BUDGET_S = 5 * 60  # wall clock per slice; no new walk starts after it
+CENSUS_DU_TIMEOUT_S = 120  # one walk; past it the directory is opened one level instead
+CENSUS_SAVE_EVERY_S = 10.0
+CENSUS_ROWS_SHOWN = 48
+CENSUS_SCOPE = "volume-census"
+CENSUS_FILES = ".glaeda-census-files"  # pseudo child naming the loose files of an opened directory
+CENSUS_AUTOLAUNCH = True
+DATA_VOLUME = Path("/System/Volumes/Data")
+APFS_INVISIBLE = "apfs-invisible (open-deleted/purgeable)"
+
+
+_CENSUS_FIRMLINK_MEM: dict[str, bool] = {}
+_PRIVATE_LINKS = ("var", "tmp", "etc")
+
+
+def _firmlinked(name: str) -> bool:
+    """Whether /NAME and the Data volume's NAME are one directory (a firmlink such as /Users or /private)."""
+    hit = _CENSUS_FIRMLINK_MEM.get(name)
+    if hit is None:
+        try:
+            a, b = os.stat(Path("/") / name), os.stat(DATA_VOLUME / name)
+            hit = (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+        except OSError:
+            hit = False
+        _CENSUS_FIRMLINK_MEM[name] = hit
+    return hit
+
+
+def census_canon(path: str) -> str:
+    """One name per directory for coverage checks and overlap: /Users/... not /System/Volumes/Data/Users/...,
+    /private/var/... not /var/..., so a snapshot size and a census row of the same tree always overlap."""
+    path = os.path.abspath(path)
+    data = str(DATA_VOLUME)
+    if path.startswith(data + "/"):
+        rest = path[len(data):]
+        if _firmlinked(rest.split("/", 2)[1]):
+            path = rest
+    parts = path.split("/", 2)
+    if len(parts) > 1 and parts[1] in _PRIVATE_LINKS and _private_link(parts[1]):
+        path = "/private" + path
+    return path
+
+
+def _private_link(name: str) -> bool:
+    """macOS: /var, /tmp and /etc are symlinks into /private; elsewhere they are real directories."""
+    key = "private:" + name
+    hit = _CENSUS_FIRMLINK_MEM.get(key)
+    if hit is None:
+        hit = _CENSUS_FIRMLINK_MEM[key] = os.path.realpath("/" + name) == "/private/" + name
+    return hit
+
+
+def census_roots() -> list[Path]:
+    if not DARWIN or RUNNER_CACHE_PROFILE:
+        return []
+    return [DATA_VOLUME] if DATA_VOLUME.is_dir() else []
+
+
+def load_census(path: Path | None = None) -> dict[str, Any]:
+    try:
+        doc = json.loads((path or CENSUS_STATE).read_text())
+        return doc if isinstance(doc, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_census(state: dict[str, Any], path: Path | None = None) -> None:
+    path = path or CENSUS_STATE
+    with contextlib.suppress(OSError):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(state, separators=(",", ":")))
+        os.replace(tmp, path)
+
+
+def census_due(state: dict[str, Any], now: float) -> bool:
+    if state.get("complete"):
+        return now - float(state.get("started_at", 0)) >= CENSUS_EVERY_S
+    return now - float(state.get("slice_at", 0)) >= CENSUS_RESUME_S
+
+
+def census_covered() -> set[str]:
+    """Paths glaeda already sizes: every snapshot size and every fixed accounting root that was walked."""
+    _, sizes = load_snapshot()
+    paths = set(sizes)
+    for record in _accounting_cache().values():
+        for row in (record.get("top_level") or []) if isinstance(record, dict) else []:
+            if isinstance(row, dict) and isinstance(row.get("path"), str):
+                paths.add(row["path"])
+    return {census_canon(p) for p in paths}
+
+
+def _census_du_argv(path: Path) -> list[str]:
+    # never enter a FileProvider/cloud tree below an unowned directory: du can block in the kernel there
+    skips = [arg for name in sorted(MEASURE_SKIP_COMPONENTS)
+             for arg in (("-I", name) if DARWIN else (f"--exclude={name}",))]
+    argv = ["du", "-xsk", *skips, str(path)]
+    if os.path.exists("/usr/sbin/taskpolicy"):
+        return ["/usr/sbin/taskpolicy", "-b", *argv]  # background QoS: CPU and I/O throttled
+    if ionice := shutil.which("ionice"):
+        return [ionice, "-c", "3", *argv]
+    return argv
+
+
+def _census_du(path: Path, timeout: float) -> tuple[int, bool] | None:
+    out = _du_output(_census_du_argv(path), allow_nonzero=True, record_timeout=False, timeout=timeout)
+    if out is None:
+        return None
+    lines = out.splitlines()
+    sized = [line.split(None, 1) for line in lines if not line.startswith("du:")]
+    sized = [fields for fields in sized if len(fields) == 2 and fields[0].isdigit()]
+    if not sized:
+        return None
+    return int(sized[-1][0]) * 1024, not any(line.startswith("du:") for line in lines)
+
+
+def census_pass(roots: list[Path], covered: set[str], state: dict[str, Any] | None = None, *,
+                budget_s: float = CENSUS_BUDGET_S, now: float | None = None, clock=time.monotonic,
+                path: Path | None = None) -> dict[str, Any]:
+    """Run one bounded slice of the census, resuming ``state`` and saving progress to ``path``."""
+    now = time.time() if now is None else now
+    state = dict(state or {})
+    try:
+        root_dev = roots[0].stat().st_dev if roots else None
+    except OSError:
+        root_dev = None
+    if state.get("pending") and not state.get("complete") and state.get("dev") != root_dev:
+        state = {"last": state.get("last")}  # the volume changed under an unfinished census: start over
+    if not state.get("pending") or state.get("complete"):
+        last = ({"rows": state.get("rows", {}), "completed_at": state.get("completed_at"),
+                 "dev": state.get("dev")} if state.get("complete") else state.get("last"))
+        try:
+            dev = roots[0].stat().st_dev if roots else None
+        except OSError:
+            dev = None
+        state = {"schema": "glaeda-disk-census/v1", "started_at": now, "dev": dev, "complete": False,
+                 "pending": [str(r) for r in reversed(roots)], "rows": {}, "last": last}
+    state["slice_at"] = now
+    save_census(state, path)  # a launcher reading the state now sees this slice and does not start another
+    skipped_covered: list[str] = state.setdefault("covered_skips", [])
+    skipped_files: list[str] = state.setdefault("covered_files", [])
+    ancestors = {str(parent) for p in covered for parent in Path(p).parents}
+    pending: list[str] = state["pending"]  # a stack: the next directory is the last entry
+    rows: dict[str, list[Any]] = state["rows"]
+    dev = state.get("dev")
+    deadline = clock() + budget_s
+    saved = clock()
+
+    # directories opened part way, each with where to go on: a child opened meanwhile has its own entry
+    cursor: dict[str, Any] = state.setdefault("cursors", {})
+
+    def expand(current: Path) -> bool:
+        """Open one directory, reading its entries one at a time; False means the slice ended inside it and
+        ``cursor`` holds how far it got, so the next slice goes on from there instead of starting it over."""
+        key = str(current)
+        part = cursor.get(key)
+        after, files = (str(part["after"]), int(part["files"])) if part else ("", 0)
+        try:
+            if not part:
+                files = os.lstat(current).st_blocks * 512
+            # names in sorted order, so a resumed slice goes on after the last name it read: an entry added
+            # or removed meanwhile can be missed by this census, never counted twice
+            names = sorted(name for name in os.listdir(current) if name > after)
+        except OSError:
+            probe = _census_du(current, max(1.0, min(CENSUS_DU_TIMEOUT_S, deadline - clock())))
+            rows[key] = [probe[0] if probe else 0, "unreadable", False]
+            return True
+        children: list[str] = []
+        for name in names:
+            if clock() >= deadline:
+                cursor[key] = {"after": after, "files": files}
+                pending.append(key)
+                pending.extend(sorted(children, reverse=True))
+                return False
+            after = name
+            entry_path = os.path.join(current, name)
+            child = census_canon(entry_path)
+            try:
+                est = os.lstat(entry_path)
+            except OSError:
+                rows[child] = [0, "unreadable", False]  # vanished or not ours to stat: named, never dropped
+                continue
+            if stat.S_ISDIR(est.st_mode):
+                if dev is not None and est.st_dev != dev:
+                    continue  # another volume mounted here
+                if name in MEASURE_SKIP_COMPONENTS:
+                    rows[child] = [0, "skipped", False]  # FileProvider: du can block in the kernel there
+                else:
+                    children.append(child)
+            elif child not in covered:  # a sized file is counted by its own size, not again here
+                files += est.st_blocks * 512
+            else:
+                skipped_files.append(child)
+        cursor.pop(key, None)
+        rows[str(current / CENSUS_FILES)] = [files, "unclassified", True]
+        pending.extend(sorted(children, reverse=True))
+        return True
+
+    try:
+        while clock() < deadline:
+            if not pending:
+                # a directory skipped because it was sized is walked after all if that size has since gone
+                back = [p for p in skipped_covered if p not in covered]
+                if not back:
+                    break
+                pending.extend(back)
+                skipped_covered[:] = [p for p in skipped_covered if p in covered]
+            current = Path(pending.pop())
+            key = str(current)
+            if key in covered:
+                skipped_covered.append(key)
+                continue
+            if key in ancestors or key in [str(r) for r in roots] or key in cursor:
+                if not expand(current):
+                    break
+            else:
+                # One row per directory nothing sizes (its subtree is that row): the census names where the
+                # unexplained bytes are at the first level glaeda does not already own, not every leaf.
+                result = _census_du(current, max(1.0, min(CENSUS_DU_TIMEOUT_S, deadline - clock())))
+                if result is None:
+                    if clock() >= deadline:
+                        pending.append(key)  # the slice ran out during the walk: the next one retries it
+                        break
+                    if not expand(current):  # timed out: opened one level instead, so each piece is smaller
+                        break
+                else:
+                    size, complete = result
+                    rows[key] = [size, "unclassified" if complete else "unreadable", complete]
+            if clock() - saved >= CENSUS_SAVE_EVERY_S:
+                save_census(state, path)
+                saved = clock()
+    finally:
+        state["complete"] = not pending and not any(p not in covered for p in skipped_covered)
+        if state["complete"]:
+            # a sized file whose size has since gone from the snapshot goes back into its directory's files row
+            for gone in [f for f in skipped_files if f not in covered]:
+                with contextlib.suppress(OSError):
+                    row = rows.setdefault(str(Path(gone).parent / CENSUS_FILES), [0, "unclassified", True])
+                    row[0] += os.lstat(gone).st_blocks * 512
+            skipped_files[:] = [f for f in skipped_files if f in covered]
+        if state["complete"]:
+            state["completed_at"] = now
+            state["last"] = None
+        save_census(state, path)
+    return state
+
+
+def census_for(dev: int, state: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """The newest complete census of this volume (or the one in progress before any completed)."""
+    state = load_census() if state is None else state
+    if state.get("complete") and state.get("dev") == dev:
+        return {"rows": state.get("rows", {}), "complete": True, "at": state.get("completed_at")}
+    last = state.get("last")
+    if isinstance(last, dict) and last.get("dev") == dev and last.get("rows"):
+        return {"rows": last["rows"], "complete": True, "at": last.get("completed_at")}
+    if state.get("dev") == dev and state.get("rows"):
+        return {"rows": state["rows"], "complete": False, "at": state.get("slice_at")}
+    return None
+
+
+def _census_label(key: str, kind: str) -> str:
+    path = Path(census_canon(key))
+    shown = f"{path.parent} (files)" if path.name == CENSUS_FILES else str(path)
+    parts = Path(shown).parts
+    if parts[:4] == ("/", "System", "Volumes", "Data"):
+        parts = ("/", *parts[4:])  # an unfirmlinked physical path is redacted the same way
+    if len(parts) >= 3 and parts[1] == "Users" and parts[2] not in {HOME.name, "Shared"}:
+        return f"{kind}:private-user-data"  # never name another account's home
+    return f"{kind}:{shown}"
+
+
+def census_catalogue(census: dict[str, Any] | None) -> list[tuple[Path, int, str]]:
+    if not census:
+        return []
+    out = []
+    for key, row in census["rows"].items():
+        if not (isinstance(row, list) and row and isinstance(row[0], int) and row[0] > 0):
+            continue
+        # a tree deleted since the census (an apply, a finished job) no longer holds its bytes
+        if not os.path.lexists(os.path.dirname(key) if key.endswith("/" + CENSUS_FILES) else key):
+            continue
+        out.append((Path(census_canon(key)), int(row[0]), "census"))
+    return out
+
+
+def census_coverage_row(census: dict[str, Any]) -> dict[str, Any]:
+    merged: dict[str, list[Any]] = {}
+    for key, row in census["rows"].items():
+        label = _census_label(key, str(row[1]))
+        hit = merged.setdefault(label, [0, row[1]])
+        hit[0] += int(row[0])
+    ranked = sorted(merged.items(), key=lambda kv: -kv[1][0])
+    children = [{"category": label, "bytes": size, "private": label.endswith(":private-user-data"),
+                 "classification": kind} for label, (size, kind) in ranked[:CENSUS_ROWS_SHOWN]
+                if size or kind != "unclassified"]  # an unreadable or skipped tree stays named at 0 bytes
+    rest = sum(size for _, (size, _) in ranked[CENSUS_ROWS_SHOWN:])
+    if rest:
+        children.append({"category": "unclassified:other", "bytes": rest, "private": False,
+                         "classification": "unclassified"})
+    return {"scope": CENSUS_SCOPE, "complete": census["complete"], "at": census["at"],
+            "platform": "macos", "children": children}
+
+
+def _census_lock():
+    try:
+        CENSUS_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        handle = CENSUS_LOCK.open("a+")
+    except OSError:
+        return None
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
+def _background_argv(argv: list[str]) -> list[str]:
+    """Run the whole census process at background QoS (macOS) or idle I/O class (Linux), not only its du."""
+    if os.path.exists("/usr/sbin/taskpolicy"):
+        return ["/usr/sbin/taskpolicy", "-b", *argv]
+    if ionice := shutil.which("ionice"):
+        return [ionice, "-c", "3", *argv]
+    return argv
+
+
+def launch_background_census() -> bool:
+    """Start one detached, throttled census slice when one is due, handing it the lock this process took."""
+    if not CENSUS_AUTOLAUNCH or not census_roots() or not census_due(load_census(), time.time()):
+        return False
+    handle = _census_lock()
+    if handle is None:
+        return False  # a slice is running
+    fd = handle.fileno()
+    try:
+        subprocess.Popen(_background_argv([sys.executable, os.path.abspath(__file__), "--census",
+                                           "--census-lock-fd", str(fd)]),
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         stdin=subprocess.DEVNULL, start_new_session=True, pass_fds=(fd,))
+    except (OSError, subprocess.SubprocessError):
+        handle.close()
+        return False
+    handle.close()  # the child holds the same open file description, and with it the lock
+    return True
+
+
+def census_main(args: list[str]) -> int:
+    ap = argparse.ArgumentParser(prog="glaeda-disk --census")
+    ap.add_argument("--census", action="store_true")
+    ap.add_argument("--census-budget-s", type=float, default=CENSUS_BUDGET_S)
+    ap.add_argument("--census-lock-fd", type=int, default=None, help=argparse.SUPPRESS)
+    a = ap.parse_args(args)
+    with contextlib.suppress(OSError):
+        os.nice(19)
+    if a.census_lock_fd is not None:
+        try:
+            handle = os.fdopen(a.census_lock_fd, "a+")
+        except (OSError, ValueError):
+            handle = None
+    else:
+        handle = _census_lock()
+    if handle is None:
+        print("census already running; skipped")
+        return 0
+    budget = max(1.0, a.census_budget_s)
+    # a filesystem call that blocks in the kernel must not keep the lock forever: progress is saved every
+    # CENSUS_SAVE_EVERY_S, and the default SIGALRM action ends the process well past the slice budget
+    signal.alarm(int(budget + 3 * CENSUS_DU_TIMEOUT_S))
+    with handle:
+        roots, state = census_roots(), load_census()
+        if not roots or not census_due(state, time.time()):
+            print("census not due; skipped")
+            return 0
+        state = census_pass(roots, census_covered(), state, budget_s=max(1.0, a.census_budget_s))
+    print(f"census {'complete' if state['complete'] else 'paused'}: {len(state['rows'])} rows, "
+          f"{len(state['pending'])} directories left")
+    return 0
+
+
 def top_level_catalogued(catalogued: list[tuple[Path, int, str]]) -> list[tuple[Path, int, str]]:
     """Keep the highest-level item from each overlapping path set.
 
@@ -6646,8 +7036,13 @@ def top_level_catalogued(catalogued: list[tuple[Path, int, str]]) -> list[tuple[
     return selected
 
 
-def filesystem_accounting(fss: list[Fs], items: list[Item]) -> list[dict[str, Any]]:
+def filesystem_accounting(fss: list[Fs], items: list[Item],
+                          sizes: dict[str, int] | None = None) -> list[dict[str, Any]]:
     """Show df-used minus catalogued bytes and bounded top-level volume usage.
+
+    ``measured`` is every sized byte on the volume, counting the outermost path of each overlapping set
+    once: catalogue items, every other snapshot size (``sizes``, including candidates below the report
+    floor), the fixed accounting roots and the whole-volume census rows.
 
     The top-level walk is cached for six hours. Item sizes stay the authoritative measured catalog;
     this report deliberately calls out anything the catalog does not own so a zero reclaimable result
@@ -6727,7 +7122,26 @@ def filesystem_accounting(fss: list[Fs], items: list[Item]) -> list[dict[str, An
                 blocked_by_verdict[verdict] = blocked_by_verdict.get(verdict, 0) + size
         blocked = sum(blocked_by_verdict.values())
         unchecked = blocked_by_verdict.get("unchecked", 0)
-        measured = sum(size for _, size, _ in top_level_catalogued(ordered))
+        census = None if RUNNER_CACHE_PROFILE else census_for(fs.dev)
+        sized_rows = [(Path(census_canon(str(path))), size, verdict) for path, size, verdict in catalogued]
+        listed = {str(path) for path, _, _ in catalogued}
+        for path, size in (sizes or {}).items():
+            if path in listed or size <= 0:
+                continue
+            try:
+                if Path(path).stat().st_dev == fs.dev:
+                    sized_rows.append((Path(census_canon(path)), size, "sized"))
+            except OSError:
+                continue
+        for row in top:
+            if isinstance(row, dict) and isinstance(row.get("path"), str) and isinstance(row.get("bytes"), int):
+                sized_rows.append((Path(census_canon(row["path"])), row["bytes"], "sized"))
+        sized_rows.extend(census_catalogue(census))
+        outermost = top_level_catalogued(sorted(sized_rows, key=lambda row: (len(row[0].parts), str(row[0]))))
+        measured = sum(size for _, size, _ in outermost)
+        shared = Path("/Users/Shared")
+        measured_shared = (math.inf if any(path in shared.parents for path, _, _ in outermost) else
+                           sum(size for path, size, _ in outermost if path == shared or shared in path.parents))
         # A report-only checkout must not mask a reclaimable build directory nested inside it.
         # Deduplicate reclaimable candidates independently so this number is the bytes the next
         # apply can actually target, rather than every item carrying a reclaimable verdict.
@@ -6750,12 +7164,27 @@ def filesystem_accounting(fss: list[Fs], items: list[Item]) -> list[dict[str, An
             coverage = accounting_coverage(fs.dev, now)
             coverage_at = now if coverage else 0.0
         _ACCOUNTING_COVERAGE_MEM[(fs.dev, fs.mount)] = (coverage_at, coverage)
+        coverage = [row for row in coverage if row.get("scope") != CENSUS_SCOPE]
         unclassified = max(0, used - measured)
-        known_coverage = min(unclassified, reconciled_known_coverage(coverage))
+        # The shared-runner coverage rows have no paths: subtract only what they hold beyond the sized
+        # paths already measured inside /Users/Shared, or the same bytes would leave the gap twice.
+        known_coverage = min(unclassified, int(max(0, reconciled_known_coverage(coverage) - measured_shared)))
+        if census is not None:
+            coverage = [*coverage, census_coverage_row(census)]
+        if census is not None and census["complete"]:
+            # The census already sized the shared tree by path, so the path-less coverage rows add nothing.
+            gap = unclassified
+            unreadable = sum(1 for row in census["rows"].values() if row[1] in ("unreadable", "skipped"))
+            residual = APFS_INVISIBLE + (f" and {unreadable} unreadable or skipped dirs (lower bounds)"
+                                         if unreadable else "")
+        else:
+            gap = max(0, unclassified - known_coverage)
+            residual = "unwalked (volume census in progress)" if census else "unwalked (no volume census yet)"
         entry = {"dev": fs.dev, "mount": fs.mount, "used": used, "measured": measured,
                  "unmeasured": unclassified, "unclassified": unclassified,
                  "known_coverage": known_coverage,
-                 "accounting_gap": max(0, unclassified - known_coverage),
+                 "accounting_gap": gap,
+                 "residual": {"category": residual, "bytes": gap},
                  "reclaimable": reclaimable, "blocked": blocked, "unchecked": unchecked,
                  "blocked_by_verdict": blocked_by_verdict, "top_level": top,
                  "scope": "runner-cache-profile" if RUNNER_CACHE_PROFILE else "volume",
@@ -7025,6 +7454,8 @@ def report(items: list[Item], fss: list[Fs], limit: int, idle_hours: float,
               f"(unchecked {gib(a.get('unchecked', 0)).strip()}), "
               f"unclassified {gib(a.get('unclassified', a.get('unmeasured', 0))).strip()} "
               f"(df used {gib(a['used']).strip()}, measured {gib(a['measured']).strip()})")
+        if isinstance(a.get("residual"), dict):
+            print(f"  accounting gap {gib(a['residual'].get('bytes', 0)).strip()}: {a['residual'].get('category')}")
         container = a.get("container") or {}
         if container.get("free") is not None:
             print(f"  APFS container free {gib(container['free']).strip()} of "
@@ -9212,15 +9643,19 @@ def _main_impl(argv: list[str] | None = None) -> int:
         print(f"refresh budget reached after {a.refresh_budget_s:g}s; completed measurements were saved; "
               "the next refresh will continue\n")
     shown = [fs for fs in fss.values() if not a.pressure or fs.under]
-    accounting = filesystem_accounting(shown, items)
+    accounting = filesystem_accounting(shown, items, known)
     # A before/after receipt must compare the same filesystem set even when a pressure
     # report only displays volumes currently below the threshold.
     receipt_accounting_before = (accounting if len(shown) == len(fss)
-                                 else filesystem_accounting(list(fss.values()), items))
+                                 else filesystem_accounting(list(fss.values()), items, known))
     before_fs_receipt = filesystem_receipt_state(fss)
     operation = "idle" if sweep else "pressure" if a.pressure else "apply"
     RUN["mode"] = operation
     write_health_summary(shown, items, accounting, a.receipt)
+    # After accounting.json holds this run's fixed-root walk, so the census skips those roots; never from an
+    # apply, whose deletions it would race (another process's apply only leaves rows the next census drops).
+    if not a.no_snapshot and not a.refresh and not a.pressure and not a.apply:
+        launch_background_census()
     # Xcode copies are sized by a walk, so only a report shows them (the agent runs with --top 0)
     tooling = (simulator_runtimes() + (xcode_items() if a.top or a.json else [])) \
         if sweep and DARWIN and not RUNNER_CACHE_PROFILE else []
@@ -9316,7 +9751,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
         # deliberately separate: logical catalogue bytes can differ from physical free
         # blocks because of APFS clones, snapshots, concurrent jobs, or failed measurements.
         after_fss, after_fs_receipt = reobserve_filesystems(fss)
-        after_accounting = filesystem_accounting(after_fss, items)
+        after_accounting = filesystem_accounting(after_fss, items, known)
         write_health_summary(after_fss, items, after_accounting, a.receipt)
         summary = write_eviction_summary(a.receipt, operation, logical_released,
                                          before_fs_receipt, after_fs_receipt,
@@ -9436,6 +9871,8 @@ def _logged_main(args: list[str]) -> int:
 def main(argv: list[str] | None = None) -> int:
     """Run the disk command, bounding only the owned background refresh process."""
     args = list(sys.argv[1:] if argv is None else argv)
+    if "--census" in args:
+        return census_main(args)
     background = "--refresh" in args and "--refresh-lock-fd" in args and "--apply" not in args
     if not background:
         return _logged_main(args)
