@@ -1793,6 +1793,35 @@ class HookTest(unittest.TestCase):
             marker.unlink(missing_ok=True)
             self.finish("n0")
 
+    def test_a_nightly_sign_or_verify_job_needs_no_compile_tokens(self) -> None:
+        """nightly.yml's sign and verify jobs were unknown jobs, so compiles: first in line, they still waited for the
+        persistent-dd and canonical root a PR compile held, though they never use either. Light now: with both held
+        and 3 units free they are admitted at once; generate-nightly-deltas is isolated."""
+        for job in ("build-sign-notarize-nightly", "verify-signed-nightly", "verify-final-dmg-nightly",
+                    "recover-nightly-next-notarization", "verify-recovered-nightly-next",
+                    "sign-nightly-identity-legacy", "verify-nightly-identity-legacy"):
+            self.assertEqual(hook.job_class(job, "manaflow-ai/cmux", workflow="nightly.yml"), ("light", False))
+        self.assertEqual(hook.job_class("generate-nightly-deltas", "manaflow-ai/cmux", workflow="nightly.yml"),
+                         ("isolated", False))
+        self.fleet()
+        self.take_units(11)
+        capacity = self.dir / "capacity"
+        for token in ("persistent-dd", "root-1"):  # a PR compile running on the mini
+            fd = hook.lock_file(capacity / f"{token}.token", fcntl.LOCK_EX)
+            self.assertIsNotNone(fd)
+            self.addCleanup(os.close, fd)
+        try:
+            for job, runner in (("verify-signed-nightly", "n1"), ("build-sign-notarize-nightly", "n2")):
+                with self.subTest(job=job):
+                    admitted = self.nightly_job("refs/heads/nightly-next", runner, job)
+                    self.assertEqual(admitted.returncode, 0, admitted.stdout + admitted.stderr)
+                    self.assertIn("a nightly job: it goes ahead of every other job waiting here", admitted.stdout)
+                    self.assertIn(f"holding 2/14 units for {job} (light", admitted.stdout)
+                    self.finish(runner)
+        finally:
+            for runner in ("n1", "n2"):
+                self.finish(runner)
+
     def dev_daily_job(self, runner: str, job: str = "verify", *extra: str) -> subprocess.CompletedProcess:
         ref = "refs/heads/main"
         dispatch = event(self.dir, f"dev-daily-{runner}", {"repository": CMUX, "inputs": {"source_run_id": "1"}})

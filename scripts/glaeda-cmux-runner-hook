@@ -377,7 +377,22 @@ WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "
                         # they were compiles (5 units, persistent-dd and a root): cmux run 40566469307's verify
                         # was refused with "3 of 14 units free, verify (compile) needs 5".
                         ("cmux-next-dev-daily.yml", "verify"): "light",
-                        ("cmux-next-dev-daily.yml", "tip-dmg-build"): "light"}
+                        ("cmux-next-dev-daily.yml", "tip-dmg-build"): "light",
+                        # nightly.yml's sign, notarize and verify jobs (nightly-next sends them to an owned Mac's
+                        # label, cmux pick-nightly-sign-runner) sign, notarize, mount and check an app they download:
+                        # codesign, notarytool, hdiutil and scripts, in the workspace and $RUNNER_TEMP. No compile,
+                        # canonical root, kept DerivedData or XCTest. As unknown jobs they were compiles (5 units,
+                        # persistent-dd and a root), so a nightly verify first in line (FEED_FIRST) still waited for
+                        # a PR compile's persistent-dd and root, which it never uses. generate-nightly-deltas runs
+                        # Sparkle's BinaryDelta over whole apps: isolated.
+                        ("nightly.yml", "build-sign-notarize-nightly"): "light",
+                        ("nightly.yml", "verify-signed-nightly"): "light",
+                        ("nightly.yml", "verify-final-dmg-nightly"): "light",
+                        ("nightly.yml", "recover-nightly-next-notarization"): "light",
+                        ("nightly.yml", "verify-recovered-nightly-next"): "light",
+                        ("nightly.yml", "sign-nightly-identity-legacy"): "light",
+                        ("nightly.yml", "verify-nightly-identity-legacy"): "light",
+                        ("nightly.yml", "generate-nightly-deltas"): "isolated"}
 # root: the canonical root (/private/tmp/cmux-ci) that compiles build in and that app-host test consumers
 # restore a product into with rm -rf of its src, so one root job per root per mini (cmux#14338 adds a second).
 # product (cli-product-tests) runs its XCTest bundle through the same user testmanagerd as the gui jobs, so it
