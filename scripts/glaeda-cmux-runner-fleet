@@ -3,13 +3,18 @@
 
     glaeda-cmux-runner-fleet                        plan: which members are eligible and how many runners each gets
     glaeda-cmux-runner-fleet --apply                stage the scripts and apply every instance on every eligible member
-    glaeda-cmux-runner-fleet --apply --hosts a,b    only these members
+    glaeda-cmux-runner-fleet --apply --hosts a,b    only these members, each on the manifest's runner.org/group
     glaeda-cmux-runner-fleet --apply --include-ineligible --skip-launchctl
                                                     install on members that do not pass the gate yet, left stopped
     glaeda-cmux-runner-fleet --apply --org manaflow-ai --group glaeda-minis --migrate-from-repo manaflow-ai/cmux
                                                     move every member from repo to org scope, one member at a time
     glaeda-cmux-runner-fleet --apply --hosts a --allow-downgrade "roll back #1384"
                                                     deploy although the guard below refuses, with the reason recorded
+
+Scope. With no --org or --repo, each member's pool instances register where the manifest says: runner.org and
+runner.group (defaults, or the host's overrides; a trusted-only member stays on runner.trustedRepo), or
+manaflow-ai/cmux when the manifest names neither. So a re-apply keeps the scope the pools have, with no flags.
+--org/--group or --repo, when passed, apply to every chosen member instead.
 
 Org scope (--org, --group) lets every repository the runner group allows use the pools; the hook then admits
 any repository of that org and costs other repositories as guests (glaeda-cmux-runner-hook job_class). A member
@@ -640,6 +645,19 @@ def apply_dedicated(member: str, entry: dict[str, Any], extra: list[str]) -> dic
     return {"dedicated": entry["name"], "exit": code, "state": state, "name": name}
 
 
+def member_scope(args: argparse.Namespace, manifest: dict[str, Any], member: str) -> tuple[str | None, str | None,
+                                                                                       str | None]:
+    """(repo, org, group) the member's pool instances register to: --repo/--org/--group when passed, for every
+    member; else the manifest's runner.org/runner.group (glaeda_fleet_labels.pool_scope; a trusted-only member stays
+    on its runner.trustedRepo); else the default repository."""
+    if args.scope_flags:
+        return args.repo, args.org, args.group
+    scope, _ = load_labels().pool_scope(manifest, member)
+    if scope is None:
+        return DEFAULT_REPO, None, None
+    return scope.get("repo"), scope.get("org"), scope.get("group")
+
+
 def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, manifest: dict[str, Any],
                scratch: Path) -> dict[str, Any]:
     started = time.monotonic()
@@ -651,6 +669,11 @@ def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, m
     if bad:
         row["eligible"], row["action"] = False, f"bad runner.dedicated: {bad}"
         return row
+    if not args.scope_flags:
+        _, bad = load_labels().pool_scope(manifest, member)
+        if bad:
+            row["eligible"], row["action"] = False, f"bad runner scope: {bad}"
+            return row
     if eligible is None:
         row["eligible"], row["action"] = False, "unreachable"
         return row
@@ -678,8 +701,10 @@ def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, m
     extra = ["--headless"] if ((manifest.get("hosts") or {}).get(member) or {}).get("gui") is False else []
     if args.skip_launchctl:
         extra.append("--skip-launchctl")
+    repo, org, group = member_scope(args, manifest, member)
+    row["scope"] = f"{org}/{group}" if org and group else org or repo
     with concurrent.futures.ThreadPoolExecutor(max_workers=row["runners"]) as pool:
-        results = list(pool.map(lambda k: apply_instance(member, k, args.repo, extra, args.org, args.group,
+        results = list(pool.map(lambda k: apply_instance(member, k, repo, extra, org, group,
                                                          args.migrate_from_repo), range(row["runners"])))
     # a dedicated runner keeps its own scope (never --org/--migrate-from-repo) and its own labels
     results += [apply_dedicated(member, entry, extra) for entry in dedicated]
@@ -714,8 +739,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--apply", action="store_true", help="stage and apply (default: plan, read-only)")
     p.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     scope = p.add_mutually_exclusive_group()
-    scope.add_argument("--repo", help=f"register to OWNER/REPO (default {DEFAULT_REPO})")
-    scope.add_argument("--org", help="register to this organization instead (needs gh as an org admin)")
+    scope.add_argument("--repo", help=("register every member to OWNER/REPO (default: the manifest's "
+                                        f"runner.org/group, else {DEFAULT_REPO})"))
+    scope.add_argument("--org", help="register every member to this organization instead (needs gh as an org admin)")
     p.add_argument("--group", help="org runner group (with --org)")
     p.add_argument("--migrate-from-repo", metavar="OWNER/REPO",
                    help="with --org: deregister each instance from this repository first; one member at a time")
@@ -730,13 +756,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--jobs", type=int, default=16, help="members at once")
     p.add_argument("--output", choices=("human", "json"), default="human")
     args = p.parse_args(argv)
+    args.scope_flags = bool(args.org or args.repo)  # else each member's scope comes from the manifest (member_scope)
     try:
         manifest = json.loads(args.manifest.expanduser().read_text())
     except (OSError, ValueError) as error:
         print(f"glaeda-cmux-runner-fleet: cannot read the manifest: {type(error).__name__}", file=sys.stderr)
         return 2
-    if not args.org:
-        args.repo = args.repo or DEFAULT_REPO
     if args.repo and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+", args.repo):
         print("glaeda-cmux-runner-fleet: --repo must be OWNER/REPO", file=sys.stderr)
         return 2
@@ -787,11 +812,13 @@ def main(argv: list[str] | None = None) -> int:
             print("glaeda-cmux-runner-fleet: nothing changed; pass --allow-downgrade REASON to deploy anyway",
                   file=sys.stderr)
             return 2
-    if args.org and args.group and args.apply:
-        why = group_refusal(args.org, args.group, args.migrate_from_repo)
-        if why:
-            print(f"glaeda-cmux-runner-fleet: {why}; nothing changed", file=sys.stderr)
-            return 2
+    if args.apply:  # every org group a member would register into, checked before any member is touched
+        groups = {member_scope(args, manifest, m)[1:] for m in chosen}
+        for org, group in sorted((o, g) for o, g in groups if o and g):
+            why = group_refusal(org, group, args.migrate_from_repo)
+            if why:
+                print(f"glaeda-cmux-runner-fleet: {why}; nothing changed", file=sys.stderr)
+                return 2
     with tempfile.TemporaryDirectory(prefix="glaeda-runner-fleet-") as tmp, \
             concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
         futures = {pool.submit(one_member, m, s, args, manifest, Path(tmp)): m for m, s in chosen.items()}
