@@ -1942,6 +1942,68 @@ class Runners(Base):
         self.assertEqual(self.mini.did, [])
 
 
+class RunnerBelowPin(Base):
+    OLD = "2.300.0"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        self.mini.home = self.home
+
+    def runner(self, name: str, version: str, updated: bool) -> Path:
+        """A runner dir: updated is the self-updater's layout (bin -> bin.X), else a fresh unpack with a receipt."""
+        d = self.home / name
+        (d / "glaeda-hooks").mkdir(parents=True)
+        (d / "config.sh").write_text("#!/bin/sh\n")
+        if updated:
+            (d / f"bin.{version}").mkdir()
+            (d / "bin").symlink_to(d / f"bin.{version}")
+        else:
+            (d / "bin").mkdir()
+        receipts = self.home / health.RUNNER_RECEIPTS / f"instance-{name}"
+        receipts.mkdir(parents=True)
+        (receipts / "receipt.json").write_text(json.dumps({"runnerDir": os.fspath(d), "runnerDirOwned": True,
+                                                           "runnerVersion": "2.200.0" if updated else version}))
+        return d
+
+    def test_the_pin_is_glaeda_cmux_runners(self) -> None:
+        runner = load("glaeda_cmux_runner_pin", ROOT / "scripts" / "glaeda-cmux-runner")
+        self.assertEqual(health.RUNNER_PIN, runner.PINNED_RUNNER_VERSION)
+
+    def test_runners_below_the_pin_are_warned_about_and_never_touched(self) -> None:
+        a = self.runner("actions-runner-glaeda", self.OLD, updated=False)
+        b = self.runner("actions-runner-glaeda-1", self.OLD, updated=True)
+        self.runner("actions-runner-glaeda-2", health.RUNNER_PIN, updated=True)
+        self.runner("actions-runner-glaeda-3", "9.0.0", updated=False)
+        report = self.run_once()
+        self.assertEqual([(f["id"], f["severity"], f["auto_fix"]) for f in report["findings"]],
+                         [("runner_below_pin:0", "warn", "impossible"), ("runner_below_pin:1", "warn", "impossible")])
+        self.assertIn(self.OLD, report["findings"][0]["evidence"])
+        self.assertTrue((a / "bin").is_dir() and not (a / "bin").is_symlink())
+        self.assertEqual(os.readlink(b / "bin"), os.fspath(b / f"bin.{self.OLD}"))
+        self.assertEqual(self.mini.did, [])
+
+    def test_a_receipt_glaeda_cmux_runner_would_not_count_is_no_finding(self) -> None:
+        for broken, updated in [(b, u) for b in ("unowned", "no config.sh") for u in (False, True)]:
+            with self.subTest(broken, updated=updated):
+                d = self.runner("actions-runner-glaeda", self.OLD, updated=updated)
+                if broken == "unowned":
+                    receipt = self.home / health.RUNNER_RECEIPTS / "instance-actions-runner-glaeda" / "receipt.json"
+                    receipt.write_text(json.dumps({"runnerDir": os.fspath(d), "runnerVersion": self.OLD}))
+                else:
+                    (d / "config.sh").unlink()
+                self.assertEqual(self.run_once()["findings"], [])
+                shutil.rmtree(d)
+                shutil.rmtree(self.home / health.RUNNER_RECEIPTS)
+
+    def test_an_unknown_version_is_no_finding(self) -> None:
+        d = self.home / "actions-runner-glaeda"
+        (d / "glaeda-hooks").mkdir(parents=True)
+        (d / "bin").mkdir()
+        self.assertEqual(self.run_once()["findings"], [])
+
+
 class DaemonHeal(Base):
     """The root daemon-heal LaunchDaemon is kept installed; its hot daemons show up in the report."""
 
