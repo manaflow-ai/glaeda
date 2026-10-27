@@ -2050,7 +2050,7 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertFalse((roots[1] / "derived-data-compile-admission").exists())
         self.assertTrue((roots[3] / "derived-data-compile-admission").exists(), "a held root keeps its build")
         self.assertTrue(all((roots[k] / "src").exists() for k in roots), "src stays the tmp family's to judge")
-        # a root without a token file is outside the runner hook's protocol: its 24 h window stands
+        # a root without a token file is outside the runner hook's protocol: its 12 h window stands
         (capacity / "root-1.token").unlink()
         make(roots[1] / "derived-data-compile-admission", age_hours=9.3)
         _, under = verdicts({dev: 50 * gd.GIB})
@@ -3727,7 +3727,7 @@ class GlaedaDiskTest(unittest.TestCase):
                            st["release-old"], st["gone-runner"],  # then least recently used: 8 h, 7 h (whole)
                            st["mini-glaeda"] / "Build", st["mini-glaeda-2"] / "Build", st["release-new"] / "Build",
                            st["mini-glaeda"], st["mini-glaeda-2"], st["release-new"]]  # then the other slots
-        # over the cap with no floor hold: the host tree is listed, but its 48 h window holds
+        # over the cap with no floor hold: the host tree is listed, but its age exemption (cmux_next_ci_host_idle_hours, inf by default) holds
         gd._DISCOVERED.clear()
         with mock.patch.object(gd, "HOME", home), mock.patch.object(gd, "process_evidence", return_value=([], "")), \
                 mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), mock.patch.object(gd, "CMUX_NEXT_CI_OVER", gd.GIB):
@@ -3890,7 +3890,7 @@ class GlaedaDiskTest(unittest.TestCase):
     def _cmux_next_cap_tree(self, runners: bool = True) -> tuple[Path, "gd.Family", dict[str, Path]]:
         """cmux11s's layout, 2026-10-21: two enrolled runners' scheme states and a scheme state no enrolled
         runner owns; release-compile states keyed by runner 2 and by a runner no longer enrolled, and a dev-daily
-        state keyed by runner 1; all younger than the family's 72 h window. Each state keeps its SourcePackages
+        state keyed by runner 1; all younger than the family's 12 h window. Each state keeps its SourcePackages
         input beside a 1 MiB Build."""
         home = self.root / "home"
         if runners:
@@ -3951,7 +3951,7 @@ class GlaedaDiskTest(unittest.TestCase):
                 self.assertIsNone(gd.cmux_next_ci_cap_state([other], 40.0))  # the family is not in this run
             with mock.patch.object(gd, "du_bytes", return_value=30 * gd.GIB):
                 self.assertEqual(gd.cmux_next_ci_cap_state([fam], 40.0, measure=True)["over"], 0)
-            with mock.patch.object(gd, "du_bytes", return_value=None):  # an unsized cache keeps the 72 h window
+            with mock.patch.object(gd, "du_bytes", return_value=None):  # an unsized cache keeps the 12 h window
                 self.assertIsNone(gd.cmux_next_ci_cap_state([fam], 40.0, measure=True))
         # a host with no enrolled glaeda runner is no CI host: the cap never applies there
         with mock.patch.object(gd, "HOME", self.root / "bare"), mock.patch.object(gd, "CMUX_NEXT_CAP_RECORD", record), \
@@ -4019,7 +4019,7 @@ class GlaedaDiskTest(unittest.TestCase):
                     mock.patch.object(gd, "process_evidence", return_value=([], worker)), \
                     mock.patch.object(gd, "ACTIVITY_MODE", mode), mock.patch.object(gd, "CMUX_NEXT_CI_OVER", over):
                 return {Path(i.path): (i.verdict, i.reasons) for i in gd.survey([fam], 24, 0)}
-        # within the cap: the generated children alone, each waiting out the 72 h window
+        # within the cap: the generated children alone, each waiting out the 12 h window
         v = verdicts(0)
         self.assertEqual(set(v), {s / "Build" for s in st.values()})
         self.assertEqual(v[st["mini-glaeda"] / "Build"][0], "recent")
@@ -4130,7 +4130,7 @@ class GlaedaDiskTest(unittest.TestCase):
                 self.assertIs(cap.call_args[1]["measure"], False, argv)
                 self.assertRegex(printed.getvalue(),
                                  r"cmux-next-ci: 47\.0G of its 25 GiB cap \(22\.0G over\), measured 1\d min ago", argv)
-                self.assertEqual(gd.cmux_next_ci_over(), 0)  # no pressure run: the 72 h window stands
+                self.assertEqual(gd.cmux_next_ci_over(), 0)  # no pressure run: the 12 h window stands
             # glaeda-fleet-status's `--json --top 0 --max-age 1000000` on every mini neither measures nor prints it
             cap.reset_mock()
             self._main_run(["--json", "--max-age", "1000000"])

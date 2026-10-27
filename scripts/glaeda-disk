@@ -59,7 +59,7 @@ The cmux-next workflow keeps per-runner state under
 ~/Library/Caches/cmux-next-ci.  Its SourcePackages and module/SDK caches are
 reusable inputs, so the explicit cmux-next family below only considers the
 generated Build, Index, Logs and Products children beneath a validated runner
-or dev-daily Release root.  Those children require a conservative 72-hour idle
+or dev-daily Release root.  Those children require a DEFAULT_AGE_HOURS (12 h) idle
 window plus a fresh process/lock/lease check; unknown children and all preserved
 inputs remain visible to accounting and are kept.  The cache has an LRU size cap
 (cmux_next_ci_cap_gib in disk-policy.json or --cmux-next-cap-gib, default 40 GiB, 0 off): while a
@@ -91,7 +91,7 @@ into it with gc.auto=0 (cmux's nightly.yml writes it), so git never consolidates
 Tests leave one small scratch entry per case in the runner user's $TMPDIR (cmux-cli-socket-<uuid>,
 git-pr-<uuid>, TemporaryDirectory.<rand>, ...): tens of thousands, each under the 50 MiB item floor, so no
 family reclaims them. user-tmp-test-residue removes entries named by TMP_TEST_RESIDUE on every apply (not only
-under pressure) once nothing in the whole entry changed for 48 hours and no process holds or names it.
+under pressure) once nothing in the whole entry changed for 12 hours and no process holds or names it.
 
 A clone directly in a CI runner account's home (~/cmux) that is fetched branch after branch gains a pack per
 fetch and git consolidates only at 50: home-clone-gc runs `git gc --prune=1.day.ago` (work trees never pruned)
@@ -585,7 +585,7 @@ CMUX_NEXT_CI_ROOT = "cmux-next-ci"
 CMUX_NEXT_CI_MIN_IDLE_HOURS = DEFAULT_AGE_HOURS
 CMUX_NEXT_CI_DRAIN = False
 # Bytes the whole cmux-next-ci cache is over its LRU cap (cmux_next_ci_cap_gib) in this pressure run, 0 within
-# it. While over, the 72 h window gives way, least recently used first, until the cache is back under the cap
+# it. While over, the 12 h window gives way, least recently used first, until the cache is back under the cap
 # (or the free target is met); every in-use veto still holds. cmux11s sat at 14-37 GiB free under a 40 GiB
 # runner floor, jobs refused at setup, with 78 GiB of cmux-next-ci "reclaimable 0.0G" (2026-10-21).
 CMUX_NEXT_CI_OVER = 0
@@ -975,7 +975,7 @@ def floor_hold_family(fam: Family, path: Path) -> bool:
     cmux_next_ci_busy), a canonical root's admission DerivedData once the root has a token file (the token keeps
     it while a compile or a product consumer holds the root: canonical_root_held, re-checked at apply with fresh
     process evidence and taken exclusive to delete; the next compile on the root clears it anyway, and a rerun
-    restores it from the artifact; a root without a token file keeps its 24 h window), and code-sign clones
+    restores it from the artifact; a root without a token file keeps its 12 h window), and code-sign clones
     (keep_live_app_clones and app_clone_running keep the live ones)."""
     if fam.id == RUNNER_BUILD_FAMILY or fam.app_clones:
         return True
@@ -1035,7 +1035,7 @@ def idle_families(fams: list[Family]) -> list[Family]:
 # little (p90 5 h, p99 46 h) while the job count separates reuse from cruft. Under pressure an item goes
 # once pressure_jobs (~p90) jobs passed it, or once it is past its family's window with at least min_jobs
 # (~p50) jobs since. The idle sweep (no pressure) takes one past sweep_jobs (~p95), or one idle
-# soft_idle_hours with pressure_jobs since: the soft 24 h rule, never an age cap on a quiet fleet. A host
+# soft_idle_hours with pressure_jobs since: the soft 12 h rule, never an age cap on a quiet fleet. A host
 # without a job log keeps the wall-clock windows. Every threshold is a key of DISK_POLICY.
 DISK_POLICY = HOME / ".config/glaeda/disk-policy.json"
 # The kill switch (or "enabled": false in DISK_POLICY): an --apply run deletes nothing.
@@ -6933,7 +6933,7 @@ def cmux_next_ci_cap_state(fams: list[Family], cap_gib: float, measure: bool = F
     With ``measure`` (a pressure run) one du of its whole root, inputs included, which CMUX_NEXT_CAP_RECORD keeps;
     without, that record alone, so a report never walks the cache (7-10 s on a mini). None when the cap does not
     apply: off (0), the family not in this run, no enrolled glaeda runner (not a CI host), or the size unknown
-    (the 72 h window then stands). The du is a probe, not an eviction measurement, so its timeout records no
+    (the 12 h window then stands). The du is a probe, not an eviction measurement, so its timeout records no
     eviction_stuck and no cooldown."""
     fam = next((f for f in fams if f.id == CMUX_NEXT_CI_FAMILY), None)
     if fam is None or cap_gib <= 0 or not enrolled_runners():
