@@ -2807,6 +2807,199 @@ class TickBudgetTest(Base):
         for k in keys:
             self.assertIsNone(gg.read_cache(k)["error"], k)
 
+    def test_a_busy_daemon_reads_the_waited_and_the_longest_unread_first(self) -> None:
+        """2026-10-27: with GraphQL stopped, every PR and run went over REST, PRs always ahead of runs; ticks ran out of
+        time on the PRs and a run a `wait run` was blocked on went unread for 581 s and counting."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 0, "reset": NOW + 1800}}  # GraphQL stopped
+        for n in range(1, 6):
+            gg.register(f"pr:o/r#{n}")
+        gg.register("run:o/r/1")
+        gg.register("run:o/r/2", waited=True)
+        for key in [f"pr:o/r#{n}" for n in range(1, 6)] + ["run:o/r/1", "run:o/r/2"]:  # all read a while ago, alike
+            gg.write_json(gg.cache_dir() / gg.file_name(key), {"key": key, "fetchedAt": NOW - 2 * gg.CYCLE,
+                                                               "dataAt": NOW - 2 * gg.CYCLE, "error": None,
+                                                               "data": {"status": "in_progress"}})
+        order: list[str] = []
+
+        reads = [0]
+
+        def read(e: dict) -> None:
+            reads[0] += 1
+            if reads[0] % 3 == 0:
+                raise gg.OutOfTime()  # two reads a tick, then the deadline stops the third before it sends
+            order.append(e["key"])
+            self.daemon.store(e["key"], e["cache"], data={"status": "in_progress"}, dataAt=self.daemon.now)
+
+        with mock.patch.object(self.daemon, "fetch_pr_rest", side_effect=read), \
+                mock.patch.object(self.daemon, "fetch_run", side_effect=read):
+            self.daemon.tick(NOW)
+            self.assertEqual(order[0], "run:o/r/2", "the waited run first, ahead of every PR")
+            for t in range(1, 4):
+                self.daemon.tick(NOW + t * gg.TICK)
+        self.assertEqual(sorted(set(order)), sorted([f"pr:o/r#{n}" for n in range(1, 6)] + ["run:o/r/1", "run:o/r/2"]),
+                         "every key is reached: a deferred key never starves behind the rest")
+
+    def entry(self, key: str, source: str, at: float, waited: bool = False, deferred: bool = False) -> dict:
+        if deferred:
+            self.daemon.deferred_before[key] = NOW - 10
+        return {"key": key, "cache": {"source": source, "fetchedAt": at, "restAt": at}, "waitedAt": NOW if waited else None}
+
+    def order(self, entries: list[dict]) -> list[str]:
+        """The REST order tick() reads in, from the entries due() returned."""
+        self.daemon.now = NOW
+        return [e["key"] for e in self.daemon.rest_order(entries)]
+
+    def test_a_deferred_run_goes_ahead_of_new_prs(self) -> None:
+        """due() put a deferred key first only within its kind, so a deferred run sat behind every new PR."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 0, "reset": NOW + 1800}}
+        for n in range(1, 4):
+            gg.register(f"pr:o/r#{n}")
+        gg.register("run:o/r/1")
+        self.daemon.deferred.add("run:o/r/1")
+        order: list[str] = []
+        with mock.patch.object(self.daemon, "fetch_pr_rest", side_effect=lambda e: order.append(e["key"])), \
+                mock.patch.object(self.daemon, "fetch_run", side_effect=lambda e: order.append(e["key"])):
+            self.daemon.tick(NOW)
+        self.assertEqual(order[0], "run:o/r/1")
+
+    def test_a_read_cut_off_before_its_request_keeps_its_place(self) -> None:
+        """A read the tick deadline stopped before it sent anything was not a read: the key stays deferred, first."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 0, "reset": NOW + 1800}}
+        for i in (1, 2):
+            self.gh.runs[i] = {"id": i, "status": "in_progress", "conclusion": None, "run_attempt": 1}
+            gg.register(f"run:o/r/{i}", waited=True)
+        self.spend_budget_after(1)  # the first read's request is answered, then the deadline passes
+        status = self.daemon.tick(NOW)
+        self.assertEqual(status["deferred"], 1)
+        (cut,) = self.daemon.deferred
+        self.assertNotIn(cut, self.daemon.rest_tried, "not sent, so not counted as a read")
+        self.daemon.transport = self.gh
+        status = self.daemon.tick(NOW + gg.TICK)
+        self.assertEqual(status["fetched"]["run"], 1)
+        self.assertIn(cut, self.daemon.rest_tried)
+
+    def test_new_watches_arriving_every_tick_do_not_starve_a_deferred_one(self) -> None:
+        """One read a tick and a new (never-read) watch every tick: a key first deferred earlier is read before the
+        newer deferrals, whose never-read age would otherwise sort first every time."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 0, "reset": NOW + 1800}}
+        for i in (1, 2):
+            key = f"run:o/r/{i}"
+            gg.register(key)
+            gg.write_json(gg.cache_dir() / gg.file_name(key), {"key": key, "fetchedAt": NOW - 2 * gg.CYCLE,
+                                                               "dataAt": NOW - 2 * gg.CYCLE, "error": None,
+                                                               "data": {"status": "in_progress"}})
+        order: list[str] = []
+
+        def read(e: dict) -> None:
+            if order and order[-1] == "cut":
+                order.pop()
+                raise gg.OutOfTime()  # one read a tick
+            order.extend([e["key"], "cut"])
+            self.daemon.store(e["key"], e["cache"], data={"status": "in_progress"}, dataAt=self.daemon.now)
+
+        with mock.patch.object(self.daemon, "fetch_run", side_effect=read):
+            for t in range(6):
+                gg.register(f"run:o/r/{100 + t}")  # a new watch every tick
+                self.daemon.tick(NOW + t * gg.TICK)
+                if order and order[-1] == "cut":
+                    order.pop()
+        self.assertIn("run:o/r/1", order[:3])
+        self.assertIn("run:o/r/2", order[:3], "both deferred keys are read before the newer arrivals pile up")
+
+    def test_a_read_that_defers_itself_does_not_keep_its_place(self) -> None:
+        """A read that stores its data and defers itself for the rest (fill_steps_rest, out of time for the steps)
+        was served: it queues behind keys deferred while it was read, not ahead of them forever."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 0, "reset": NOW + 1800}}
+        order: list[str] = []
+
+        def read(e: dict) -> None:
+            if order and order[-1] == "cut":
+                order.pop()
+                raise gg.OutOfTime()
+            order.extend([e["key"], "cut"])
+            self.daemon.store(e["key"], e["cache"], data={"status": "in_progress"}, dataAt=self.daemon.now)
+            if e["key"] == "run:o/r/1":
+                self.daemon.deferred.add(e["key"])  # served, with work left for the next tick
+
+        with mock.patch.object(self.daemon, "fetch_run", side_effect=read):
+            for t in range(5):
+                if t == 1:  # arrive after run 1 first deferred itself
+                    gg.register("run:o/r/2")
+                    gg.register("run:o/r/3")
+                else:
+                    gg.register("run:o/r/1")
+                self.daemon.tick(NOW + t * gg.TICK)
+                if order and order[-1] == "cut":
+                    order.pop()
+        self.assertIn("run:o/r/2", order, order)
+        self.assertIn("run:o/r/3", order, order)
+
+    def test_a_pr_read_cut_off_partway_does_not_hold_the_head(self) -> None:
+        """The real fetch_pr_rest sends several requests; a deadline inside it (after some answers) had its turn: a
+        waited run behind it is read next tick, not after that PR forever."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 0, "reset": NOW + 1800}}
+        self.daemon.paths["pr"] = self.daemon.paths["run"] = "rest"
+        self.gh.prs[("o", "r", 1)] = pr_node(1)
+        gg.register("pr:o/r#1")
+        self.daemon.deferred.add("pr:o/r#1")
+        self.daemon.deferred_since["pr:o/r#1"] = NOW - 600  # deferred long ago, so it heads the order
+        self.gh.runs[2] = {"id": 2, "status": "in_progress", "conclusion": None, "run_attempt": 1}
+        gg.register("run:o/r/2", waited=True)
+        self.daemon.deferred.add("run:o/r/2")
+        inner, count = self.daemon.transport, [0]
+
+        def transport(method, url, headers, body):
+            count[0] += 1
+            if count[0] % 2 == 0:
+                self.daemon.tick_deadline = float("-inf")  # two requests a tick: the PR never finishes in one
+            return inner(method, url, headers, body)
+        self.daemon.transport = transport
+        self.daemon.tick(NOW)
+        run_reads = lambda: [c for c in self.gh.rest_calls() if "/actions/runs/2" in c[1]]
+        self.assertEqual(run_reads(), [], "the PR, deferred first, takes this tick")
+        self.daemon.tick(NOW + gg.TICK)
+        self.assertTrue(run_reads(), "the waited run is read the tick after the PR's partial read")
+
+    def test_failed_controller_fed_reads_move_back(self) -> None:
+        """A controller-fed run keeps restAt when its REST read fails; the failure still moves it back
+        (rest_tried), so failing keys cannot hold the head of the order."""
+        failing = [self.entry(f"run:o/r/{i}", "controller", NOW - 3600) for i in (1, 2, 3)]
+        healthy = self.entry("run:o/r/4", "controller", NOW - 600)
+        self.assertEqual(self.order(failing + [healthy])[-1], "run:o/r/4")
+        self.daemon.rest_tried.update({"run:o/r/1": NOW - 1, "run:o/r/2": NOW - 1})  # read and failed last tick
+        self.assertEqual(self.order(failing + [healthy])[:2], ["run:o/r/3", "run:o/r/4"])
+
+    def test_a_waited_new_key_breaks_the_tie_with_other_new_keys(self) -> None:
+        new_pr = {"key": "pr:o/r#1", "cache": None, "waitedAt": None}
+        new_run = {"key": "run:o/r/1", "cache": None, "waitedAt": NOW}
+        self.assertEqual(self.order([new_pr, new_run]), ["run:o/r/1", "pr:o/r#1"])
+
+    def test_deferred_keys_go_ahead_of_waited_new_ones(self) -> None:
+        old = self.entry("pr:o/r#1", "rest", NOW - 30, deferred=True)
+        waited = self.entry("run:o/r/2", "controller", NOW - 3600, waited=True)
+        self.assertEqual(self.order([waited, old]), ["pr:o/r#1", "run:o/r/2"])
+
+    def test_waiters_kept_busy_do_not_starve_an_unwaited_key(self) -> None:
+        """A waited key is aged WAIT_PRIORITY, not ranked absolutely: with waited runs due every cycle and room for
+        one read a tick, an unwaited run unread longer than that still gets its turn."""
+        self.daemon.now = NOW
+        cached = lambda key, at: {"key": key, "cache": {"source": "rest", "fetchedAt": at}, "waitedAt": None}
+        old = cached("run:o/r/9", NOW - gg.WAIT_PRIORITY - 60)
+        waited = [{**cached(f"run:o/r/{i}", NOW - 30), "waitedAt": NOW} for i in range(1, 4)]
+        fresh_unwaited = cached("run:o/r/8", NOW - 10)
+        never = {"key": "run:o/r/7", "cache": None, "waitedAt": None}
+        entries = [fresh_unwaited, *waited, old, never]
+        ordered = self.order(entries)
+        self.assertEqual(ordered[:2], ["run:o/r/7", "run:o/r/9"],
+                         "a never-read key, then one unread past the waiters' head start")
+        self.assertEqual(ordered[-1], "run:o/r/8", "a fresh unwaited key waits behind the waiters")
+
     def test_pr_batches_left_over_go_first_next_tick(self) -> None:
         keys = []
         for n in range(1, 31):

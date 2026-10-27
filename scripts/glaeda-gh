@@ -294,6 +294,7 @@ REST_SAFETY = 900  # a run the controller tracks is still read over REST this of
 # was read from GitHub for this long, is read once more (a lost completion delivery: manaflow-ai/cmux run
 # 40557947333, 2026-10-27, finished on GitHub while the controller kept it in_progress and its waiter blocked).
 STALE_RUN_REREAD = 180
+WAIT_PRIORITY = STALE_RUN_REREAD  # in a busy tick, a waited key is read as if this much longer unread
 # A watch counts as waited on this long after a wait (or a downstream's) last registered it: past the client's
 # controller long-poll (subscribe_wait), which registers once before it blocks, and the daemon's touches after it.
 WAIT_INTEREST = CONTROLLER_RUN_MAX_WAIT + 2 * TOUCH_EVERY
@@ -1293,6 +1294,9 @@ class Daemon:
         self.now = time.time()
         self.errors: list[str] = []
         self.attempted: dict[str, float] = {}  # when each key was last fetched: a new one at most once per cycle
+        self.rest_tried: dict[str, float] = {}  # when a REST read of each key last ended, answered or failed
+        self.deferred_before: dict[str, float] = {}  # deferred by the last tick: when each was first deferred
+        self.deferred_since: dict[str, float] = {}  # when each key still deferred was first deferred
         self.sent: list[tuple[float, str]] = []  # (time, rest|rest304|graphql) for the last hour's counts
         self.paths: dict[str, str] = dict(BUCKETS)  # the bucket each kind reads over now
         self.reads: list[tuple[float, str, str]] = []  # (time, kind, bucket) per entry read, for the last hour
@@ -1815,6 +1819,27 @@ class Daemon:
         at = e.get("waitedAt")
         return isinstance(at, (int, float)) and self.now - at < WAIT_INTEREST
 
+    def last_read(self, e: dict) -> float:
+        """When GitHub was last read for this entry, or a REST read of it last ended (a read that failed must move
+        back too, or failing keys would hold the head of every tick): a controller-fed run's REST clock, else its
+        last fetch. Never read nor tried (no cache) sorts first, so a new watch is filled at once."""
+        c = e.get("cache") or {}
+        at = c.get("restAt") if c.get("source") == "controller" else c.get("fetchedAt")
+        return max(float(at) if isinstance(at, (int, float)) else float("-inf"),
+                   self.rest_tried.get(e["key"], float("-inf")))
+
+    def rest_order(self, entries: list[dict]) -> list[dict]:
+        """The order a tick reads REST keys in. Keys the last tick ran out of time for go first, ahead of new ones
+        of either kind (due() put them first only within their kind, so deferred runs still sat behind every new
+        PR), oldest deferral first, so a newer one (a new watch, never read) cannot overtake a key deferred tick
+        after tick. Then the longest unread, a key a wait is blocked on counted WAIT_PRIORITY older, and waited
+        first on a tie (two never-read keys). Aging, not an absolute rank: an unread key's place only improves
+        while read keys move back, so waiters cannot starve the rest."""
+        carried = self.deferred_before
+        return sorted(entries, key=lambda e: (e["key"] not in carried, carried.get(e["key"], 0.0),
+                                              self.last_read(e) - (WAIT_PRIORITY if self.waited(e) else 0),
+                                              not self.waited(e)))
+
     def due(self, kind: str, entries: list[dict]) -> list[dict]:
         mine = [e for e in entries if e["key"].startswith(kind + ":")]
         path = self.route(kind)
@@ -1989,6 +2014,9 @@ class Daemon:
             # there must not stop GitHub polling (it did: glaeda#1305). A WatchError is expected and
             # says what failed; anything else is a bug, so it carries its code site.
             self.controller_down(error, None if isinstance(error, WatchError) else error_site(error))
+        # due() consumes the deferred set; the REST order below still needs it, oldest deferral first
+        self.deferred_since = {k: self.deferred_since.get(k, self.now) for k in self.deferred}
+        self.deferred_before = dict(self.deferred_since)
         prs, runs, comments = self.due("pr", entries), self.due("run", entries), self.due("comment", entries)
         heads = self.due("head", entries)
         over = {kind: self.paths[kind] for kind in BALANCED}  # due() routed each kind
@@ -1998,19 +2026,29 @@ class Daemon:
             self.batched(kind, batch, fetch)
             self.post_between()
         over_rest = (prs if over["pr"] == "rest" else []) + (runs if over["run"] == "rest" else [])
+        # With PRs always ahead of runs, a busy daemon read PRs tick after tick while a blocked `wait run` sat on a
+        # run nobody reached (2026-10-27: 581 s and counting, with STALE_RUN_REREAD due at 180 s).
+        over_rest = self.rest_order(over_rest)
         for i, e in enumerate(over_rest):
             # A read is admitted only when its worst case fits in the share, so the share holds at a
             # request, not at a batch; the rest go first next tick, over whichever bucket is richer.
             if self.mode("rest") == "stop" or not self.rest_room(REST_READ_MAX[e["key"].split(":", 1)[0]]):
                 self.defer(over_rest[i:])
                 break
+            sent = len(self.sent)
             try:
                 (self.fetch_pr_rest if e["key"].startswith("pr:") else self.fetch_run)(e)
             except OutOfTime:
                 self.defer(over_rest[i:])
-                break
+                if len(self.sent) > sent:  # cut off partway: it had its turn, and queues as a new deferral
+                    self.rest_tried[e["key"]] = self.now
+                    self.deferred_since.pop(e["key"], None)
+                break  # (cut off before its first request, it was not read: it keeps its place, first next tick)
             except Exception as error:  # noqa: BLE001
                 self.errors.append(f"{e['key']}: {describe(error)}")
+            self.rest_tried[e["key"]] = self.now  # read, or failed: either way it moves back
+            # and a read that deferred itself for the rest of its work (fill_steps_rest) queues as a new deferral
+            self.deferred_since.pop(e["key"], None)
         for e in self.jobs_only:
             try:
                 self.read_jobs(e, {}, False)  # read_jobs reads the list a failed attempt is missing
@@ -2032,6 +2070,7 @@ class Daemon:
             self.errors.append(f"waits: {describe(error)} at {error_site(error)}")
         self.deferred &= {e["key"] for e in entries}
         self.attempted = {k: t for k, t in self.attempted.items() if self.now - t < 2 * IDLE_EXPIRY}
+        self.rest_tried = {k: t for k, t in self.rest_tried.items() if self.now - t < 2 * IDLE_EXPIRY}
         oldest = self.oldest_data(entries, {e["key"] for e in prs + runs + comments + heads})
         self.prune({e["key"] for e in entries})
         self.post_prune()
