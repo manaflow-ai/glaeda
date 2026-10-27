@@ -141,6 +141,10 @@ Each run checks, as the runner user and without sudo:
                                      audiomxd, WirelessRadioManagerd), from glaeda-daemon-heal's root report: that
                                      daemon restarts it at hot_hours (wait_idle daemons when the host is idle, or at
                                      busy_hot_hours). Reported here so ci-dash sees the wait; the heal is root's.
+  disk_root_copy_stale:<uid>         a runner account's root-pinned glaeda-disk job (glaeda-runner-hygiene) is not the
+                                     bytes its release's --apply leaves, from glaeda-daemon-heal's root report
+                                     (runnerHygiene): that pass reinstalls it, so stale is pending and a failed check
+                                     or reinstall is an error the report's why names. The heal is root's.
   claude_route                       Claude Code (~/.local/bin/claude, the capture jobs' agent) does not go through a
                                      fleet route from config/claude-routes.json that answers: ~/.claude/settings.json
                                      names no route (a personal login, which expires: cmux-mac-mini, 2026-10-21), a
@@ -1869,6 +1873,25 @@ def check_daemon_heal(mini: Mini) -> list[dict[str, Any]]:
              "since": h.get("since"), "evidence": f"{h['name']} at {h.get('cores')} cores",
              "action": str(h.get("action") or "")[:200], "auto_fix": "done"}
             for h in report.get("healed") or [] if isinstance(h, dict) and h.get("name")]
+        hygiene = report.get("runnerHygiene") if isinstance(report.get("runnerHygiene"), dict) else {}
+        accounts = hygiene.get("accounts") if isinstance(hygiene.get("accounts"), dict) else {}
+        if hygiene.get("error"):
+            out.append(finding("disk_root_copy_stale:all", "error",
+                               f"the root pass could not check runner accounts' root-pinned glaeda-disk: "
+                               f"{str(hygiene['error'])[:200]}", "impossible",
+                               "glaeda-daemon-heal's report runnerHygiene.error"))
+        for uid, a in sorted(accounts.items()):
+            if not isinstance(a, dict) or a.get("state") not in ("stale", "error"):
+                continue
+            stale = a["state"] == "stale"
+            out.append(finding(f"disk_root_copy_stale:{uid}", "warn" if stale else "error",
+                               f"runner account {a.get('user') or uid}'s root-pinned glaeda-disk "
+                               f"({str(a.get('sha256') or 'none')[:12]}) is not its release's "
+                               f"({str(a.get('wants') or 'none')[:12]}): {a.get('why')}",
+                               "pending" if stale else "impossible",
+                               "the root glaeda-daemon-heal pass reinstalls it" if stale else
+                               "root: the release's glaeda-runner-hygiene --user "
+                               f"{a.get('user') or '<account>'} --apply (docs/RUNNER_ACCOUNT_HYGIENE.md)"))
         for h in report.get("hot") or []:
             if not isinstance(h, dict) or not h.get("name"):
                 continue

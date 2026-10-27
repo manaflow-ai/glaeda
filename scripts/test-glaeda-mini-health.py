@@ -2556,6 +2556,27 @@ class DaemonHeal(Base):
         self.assertIn("1.5 h", f[0]["evidence"])
         self.assertIn("restarts at 2 h", f[0]["note"])
 
+    def test_a_runner_accounts_stale_root_copy_is_reported_from_the_root_report(self) -> None:
+        root = self.dir / "report.json"
+        root.write_text(json.dumps({"runnerHygiene": {"accounts": {
+            "501": {"user": "cmux", "state": "stale", "sha256": "ca7d" * 16, "wants": "fb3e" * 16,
+                    "why": "snapshot is not this source", "action": "reinstall"},
+            "502": {"user": "ci", "state": "error", "why": "glaeda-runner-hygiene: install manifest is bound"},
+            "503": {"user": "ok", "state": "current"}}}}))
+        self.mini.heal_status = {"installed": True, "current": True, "loaded": True, "reportFresh": True,
+                                 "report": os.fspath(root)}
+        f = {x["id"]: x for x in self.run_once()["findings"]}
+        self.assertEqual(sorted(f), ["disk_root_copy_stale:501", "disk_root_copy_stale:502"])
+        self.assertEqual((f["disk_root_copy_stale:501"]["auto_fix"], f["disk_root_copy_stale:501"]["severity"]),
+                         ("pending", "warn"))
+        self.assertIn("ca7dca7dca7d", f["disk_root_copy_stale:501"]["evidence"])
+        self.assertEqual((f["disk_root_copy_stale:502"]["auto_fix"], f["disk_root_copy_stale:502"]["severity"]),
+                         ("impossible", "error"))
+        self.assertIn("--user ci --apply", f["disk_root_copy_stale:502"]["note"])
+        root.write_text(json.dumps({"runnerHygiene": {"accounts": {}, "error": "cannot list /x: EIO"}}))
+        f = self.run_once()["findings"]
+        self.assertEqual([(x["id"], x["severity"]) for x in f], [("disk_root_copy_stale:all", "error")])
+
 
 class DaemonHealLiveness(Base):
     """An installed copy that is unloaded, or whose passes stopped, is no healthy healer."""
