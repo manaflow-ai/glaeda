@@ -5057,6 +5057,11 @@ class BrokerBase(Base):
         # The repeat delay is real time, and most of these tests make the same call twice on
         # purpose. BrokerRepeatTest turns it back on and replaces the hold.
         os.environ["CMUX_GH_MIN_REPEAT_SECONDS"] = "0"
+        # The answer cache runs gh as a child instead of exec'ing it, and these tests read what the
+        # exec was handed. BrokerAnswerCacheTest turns it back on.
+        os.environ["GLAEDA_GH_CACHE_TTL"] = "0"
+        for name in ("GLAEDA_GH_CACHE_DISABLE", "GH_TOKEN", "GITHUB_TOKEN", "GH_REPO", "GH_HOST"):
+            os.environ.pop(name, None)
 
     def fake_gh(self) -> Path:
         """A stand-in for the real gh that records the arguments it was handed."""
@@ -8002,6 +8007,394 @@ class RiskReceiptPostTest(unittest.TestCase):
         self.assertEqual(len(t.calls), 4)
         self.assertEqual(gg.post_state(item["id"])["riskRegrade"]["state"], "failed")
         self.assertEqual(gg.post_state(other["id"])["url"], "other")
+
+
+class BrokerAnswerCacheTest(BrokerBase):
+    """Identical read-only calls within the TTL share one real gh run."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        os.environ["GLAEDA_GH_CACHE_TTL"] = "60"
+        self.count = self.home / "count"
+        gh = self.home / "bin" / "gh"
+        gh.write_text("#!/bin/sh\n"
+                      f"n=$(($(cat {self.count} 2>/dev/null || echo 0) + 1)); echo $n > {self.count}\n"
+                      f"printf '%s\\n' \"$@\" >> {self.passed}\n"
+                      "echo \"answer $n\"\necho \"note $n\" >&2\nexit ${FAKE_GH_RC:-0}\n")
+        gh.chmod(0o755)
+
+    def runs(self) -> int:
+        return int(self.count.read_text()) if self.count.exists() else 0
+
+    def test_an_identical_read_is_answered_once(self) -> None:
+        args = ["api", "repos/o/r/actions/runs/5/jobs", "--jq", ".jobs[].name"]
+        first = self.run_gh(args)
+        second = self.run_gh(args)
+        self.assertEqual(first[:3], (0, "answer 1\n", "note 1\n"))
+        self.assertEqual(second[:3], (0, "answer 1\n", "note 1\n"))
+        self.assertEqual(self.runs(), 1)
+        routes = [json.loads(line).get("route") for line in gg.broker_log().read_text().splitlines()]
+        self.assertIn("cache", routes)
+
+    def test_pr_view_and_run_view_are_kept(self) -> None:
+        for args in (["pr", "view", "7", "-R", "o/r", "--json", "body"],
+                     ["run", "view", "12", "-R", "o/r", "--log-failed"]):
+            with self.subTest(args=args):
+                before = self.runs()
+                self.run_gh(args)
+                _code, out, _err, _ = self.run_gh(args)
+                self.assertEqual(self.runs(), before + 1)
+                self.assertEqual(out, f"answer {before + 1}\n")
+
+    def test_different_arguments_are_different_answers(self) -> None:
+        self.run_gh(["api", "repos/o/r/actions/runs/5/jobs"])
+        self.run_gh(["api", "repos/o/r/actions/runs/6/jobs"])
+        self.run_gh(["api", "repos/o/r/actions/runs/5/jobs", "--jq", ".total_count"])
+        self.assertEqual(self.runs(), 3)
+
+    def test_an_answer_past_the_ttl_is_read_again(self) -> None:
+        args = ["api", "repos/o/r/pulls/7"]
+        self.run_gh(args)
+        for path in gg.gh_cache_dir().glob("*.json"):
+            if path.name != "writes.json":
+                doc = json.loads(path.read_text())
+                doc["at"] -= 61
+                path.write_text(json.dumps(doc))
+        _code, out, _err, _ = self.run_gh(args)
+        self.assertEqual((out, self.runs()), ("answer 2\n", 2))
+
+    def test_a_failed_answer_is_not_kept(self) -> None:
+        os.environ["FAKE_GH_RC"] = "1"
+        self.addCleanup(os.environ.pop, "FAKE_GH_RC", None)
+        args = ["api", "repos/o/r/pulls/7"]
+        first = self.run_gh(args)
+        second = self.run_gh(args)
+        self.assertEqual((first[0], second[0], self.runs()), (1, 1, 2))
+
+    def test_a_write_to_the_repository_is_never_answered_with_the_read_before_it(self) -> None:
+        read = ["pr", "view", "7", "-R", "o/r", "--json", "body"]
+        self.run_gh(read)
+        self.run_gh(["api", "repos/o/other/pulls/9"])
+        comment = ["pr", "comment", "7", "-R", "o/r", "--body", "hi"]
+        code, _out, _err, passed = self.run_gh(comment)
+        self.assertEqual((code, passed, self.runs()), (0, None, 3), "a write runs once, as a child")
+        self.assertIn("comment", self.passed.read_text())
+        _code, out, _err, _ = self.run_gh(read)
+        self.assertEqual(out, "answer 4\n")
+        _code, out, _err, _ = self.run_gh(["api", "repos/o/other/pulls/9"])
+        self.assertEqual(out, "answer 2\n", "a write to another repository leaves this one's answers")
+
+    def test_a_read_during_a_write_is_not_kept_for_others(self) -> None:
+        """A write is stamped again when it finishes, so an answer read while it was in flight is
+        older than that stamp and is not served."""
+        key = "e" * 40
+        started = time.time()
+        gg.gh_cache_put(key, started, 0, b"old\n", b"")
+        self.assertIsNotNone(gg.gh_cache_get(key, "o/r", started + 1))
+        gg.gh_cache_note_write("o/r", started + 0.5)
+        self.assertIsNone(gg.gh_cache_get(key, "o/r", started + 1))
+
+    def test_a_failing_write_still_returns_its_code_and_stamps(self) -> None:
+        os.environ["FAKE_GH_RC"] = "3"
+        self.addCleanup(os.environ.pop, "FAKE_GH_RC", None)
+        code, _out, _err, passed = self.run_gh(["pr", "merge", "7", "-R", "o/r"])
+        self.assertEqual((code, passed, self.runs()), (3, None, 1))
+        self.assertIn("o/r", gg.gh_cache_writes())
+
+    def test_a_write_naming_no_repository_stamps_them_all(self) -> None:
+        self.run_gh(["api", "repos/o/r/pulls/7"])
+        self.run_gh(["api", "-X", "PATCH", "user", "-f", "name=x"])
+        _code, out, _err, _ = self.run_gh(["api", "repos/o/r/pulls/7"])
+        self.assertEqual(out, "answer 3\n")
+
+    def test_uncacheable_reads_go_straight_to_gh(self) -> None:
+        for args in (["api", "graphql", "-f", "query=query{viewer{login}}"],
+                     ["api", "-i", "repos/o/r/pulls/7"],
+                     ["api", "--verbose", "repos/o/r/pulls/7"],
+                     ["api", "repos/{owner}/{repo}/branches/{branch}"],
+                     ["api", "rate_limit"],
+                     ["pr", "view"],
+                     ["pr", "view", "7", "-R", "o/r", "--web"],
+                     ["run", "view", "12", "-R", "o/r", "-w"],
+                     ["pr", "list", "-R", "o/r"]):
+            with self.subTest(args=args):
+                _code, _out, _err, passed = self.run_gh(args)
+                self.assertEqual(passed, args)
+        self.assertEqual(self.runs(), 0)
+
+    def test_the_resolved_repository_is_part_of_a_question_that_names_none(self) -> None:
+        one, two = self.checkout("o/one"), self.checkout("o/two")
+        nowhere = self.home / "nowhere"
+        nowhere.mkdir()
+        here = os.getcwd()
+        self.addCleanup(os.chdir, here)
+        for where in (one, two, one):
+            os.chdir(where)
+            self.run_gh(["pr", "view", "7", "--json", "body"])
+            self.run_gh(["api", "repos/{owner}/{repo}/pulls/7"])
+        self.assertEqual(self.runs(), 4)
+        # the same directory, its remote changed: another repository, another question
+        self.git_checkout(one, '[remote "origin"]\n\turl = git@github.com:o/three.git\n')
+        os.chdir(one)
+        self.run_gh(["pr", "view", "7", "--json", "body"])
+        self.assertEqual(self.runs(), 5)
+        # a directory whose repository cannot be known is never cached: exec'd, never filled
+        os.chdir(nowhere)
+        for _ in range(2):
+            _code, _out, _err, passed = self.run_gh(["pr", "view", "7", "--json", "body"])
+            self.assertIsNotNone(passed)
+        self.assertEqual(self.runs(), 5)
+
+    def test_writes_go_through_once_and_are_never_kept(self) -> None:
+        for args in (["api", "-X", "POST", "repos/o/r/issues/7/comments", "-f", "body=hi"],
+                     ["api", "repos/o/r/issues/7/comments", "-f", "body=hi"],
+                     ["api", "graphql", "--input", "q.json"],
+                     ["api", "graphql", "-F", "query=@q.graphql"],
+                     ["auth", "switch"]):
+            with self.subTest(args=args):
+                before = self.runs()
+                self.run_gh(args)
+                self.run_gh(args)
+                self.assertEqual(self.runs(), before + 2)
+
+    def test_debug_output_is_never_kept(self) -> None:
+        with mock.patch.dict(os.environ, {"GH_DEBUG": "api"}):
+            _code, _out, _err, passed = self.run_gh(["api", "repos/o/r/pulls/7"])
+        self.assertIsNotNone(passed)
+
+    def test_another_account_in_hosts_yml_is_another_question(self) -> None:
+        config = self.home / "gh-config"
+        config.mkdir(exist_ok=True)
+        (config / "hosts.yml").write_text("github.com:\n    user: one\n")
+        args = ["api", "repos/o/r/pulls/7"]
+        self.run_gh(args)
+        self.run_gh(args)
+        (config / "hosts.yml").write_text("github.com:\n    user: two\n")
+        self.run_gh(args)
+        self.assertEqual(self.runs(), 2)
+
+    def test_a_fill_whose_lock_is_held_runs_gh_the_ordinary_way(self) -> None:
+        key = "f" * 40
+        gg.gh_cache_dir().mkdir(parents=True, exist_ok=True)
+        with mock.patch.object(gg, "GH_CACHE_FILL_WAIT", 0.1), \
+                gg.bounded_lock(gg.gh_cache_dir() / f".{key}.lock") as held:
+            self.assertTrue(held)
+            ran: list[int] = []
+            self.assertIsNone(gg.gh_cache_fill(str(self.home / "bin" / "gh"), ["api", "x"], key, None, ran))
+        self.assertEqual((ran, self.runs()), ([], 0))
+
+    def test_a_hung_fill_is_stopped_at_its_deadline(self) -> None:
+        hung = self.home / "bin" / "hung"
+        hung.write_text("#!/bin/sh\nsleep 30\n")
+        hung.chmod(0o755)
+        started = time.monotonic()
+        rc, _out, err = gg.gh_cache_child(str(hung), [], True, 0.5)
+        self.assertEqual(rc, 124)
+        self.assertIn(b"stopped", err)
+        self.assertLess(time.monotonic() - started, 10)
+
+    def test_a_queued_post_stamps_its_repository(self) -> None:
+        args = mock.Mock(kind="comment", target="O/R#7", body="hi", body_file=None, wait=0, json=False,
+                         head=None, base=None, title=None, reviewer=None, event="comment")
+        with mock.patch.object(gg, "daemon_running", return_value=False), \
+                contextlib.redirect_stderr(io.StringIO()):
+            gg.cmd_post(args)
+        self.assertIn("o/r", gg.gh_cache_writes())
+
+    def test_another_token_is_another_question(self) -> None:
+        args = ["api", "repos/o/r/pulls/7"]
+        self.run_gh(args)
+        os.environ["GH_TOKEN"] = "ghs_installation_token_for_another_account"
+        self.run_gh(args)
+        self.assertEqual(self.runs(), 2)
+        stored = "".join(p.read_text() for p in gg.gh_cache_dir().glob("*.json"))
+        self.assertNotIn("ghs_installation", stored)
+
+    def test_off_when_the_ttl_is_zero_or_disabled(self) -> None:
+        args = ["api", "repos/o/r/pulls/7"]
+        for env in ({"GLAEDA_GH_CACHE_TTL": "0"}, {"GLAEDA_GH_CACHE_DISABLE": "1"}):
+            with self.subTest(env=env), mock.patch.dict(os.environ, env):
+                _code, _out, _err, passed = self.run_gh(args)
+                self.assertEqual(passed, args)
+
+    def test_a_fill_that_finds_a_sibling_answer_does_not_run_gh(self) -> None:
+        """Identical calls arriving together: the second takes the key's lock after the first stored
+        its answer, and reads that instead of running gh again."""
+        key = "k" * 40
+        gg.gh_cache_put(key, time.time(), 0, b"stored\n", b"")
+        ran: list[int] = []
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = gg.gh_cache_fill(str(self.home / "bin" / "gh"), ["api", "x"], key, None, ran)
+        self.assertEqual((code, out.getvalue(), ran, self.runs()), (0, "stored\n", [0], 0))
+
+    def test_a_big_answer_is_not_kept(self) -> None:
+        key = "b" * 40
+        gg.gh_cache_put(key, time.time(), 0, b"x" * (gg.GH_CACHE_MAX_BYTES + 1), b"")
+        self.assertIsNone(gg.gh_cache_get(key, None, time.time()))
+
+    def test_old_fill_locks_are_pruned_and_fresh_ones_kept(self) -> None:
+        gg.gh_cache_dir().mkdir(parents=True, exist_ok=True)
+        old, fresh = gg.gh_cache_dir() / (".o" * 20 + ".lock"), gg.gh_cache_dir() / (".f" * 20 + ".lock")
+        old.touch()
+        fresh.touch()
+        os.utime(old, (time.time() - gg.GH_CACHE_LOCK_KEEP - 5,) * 2)
+        gg.gh_cache_prune(time.time())
+        self.assertEqual((old.exists(), fresh.exists()), (False, True))
+
+    def test_a_held_lock_is_never_pruned(self) -> None:
+        gg.gh_cache_dir().mkdir(parents=True, exist_ok=True)
+        lock = gg.gh_cache_dir() / ".h.lock"
+        lock.touch()
+        os.utime(lock, (time.time() - gg.GH_CACHE_LOCK_KEEP - 5,) * 2)
+        with open(lock, "a+") as holder:
+            fcntl.flock(holder, fcntl.LOCK_EX)
+            gg.gh_cache_prune(time.time())
+            self.assertTrue(lock.exists())
+
+    def test_a_fill_lock_whose_file_was_replaced_is_not_held(self) -> None:
+        """The interleaving: a fill opens the lock file, the pruner removes it, another fill creates a new one;
+        the first, taking its lock, finds the path no longer its file and yields False."""
+        gg.gh_cache_dir().mkdir(parents=True, exist_ok=True)
+        lock = gg.gh_cache_dir() / ".r.lock"
+        lock.touch()
+        real_open = open
+
+        def opened_then_replaced(path, *a, **k):
+            handle = real_open(path, *a, **k)
+            if Path(path) == lock:
+                lock.unlink()
+                lock.touch()
+            return handle
+        with mock.patch("builtins.open", opened_then_replaced):
+            with gg.gh_cache_fill_lock(lock, 0.1) as held:
+                self.assertFalse(held)
+        with gg.gh_cache_fill_lock(lock, 0.1) as held:
+            self.assertTrue(held)
+
+    def test_old_answers_are_pruned(self) -> None:
+        gg.gh_cache_put("c" * 40, time.time(), 0, b"x", b"")
+        old = gg.gh_cache_dir() / ("c" * 40 + ".json")
+        os.utime(old, (time.time() - gg.GH_CACHE_KEEP - 5,) * 2)
+        (gg.gh_cache_dir() / ".pruned").unlink()
+        gg.gh_cache_put("d" * 40, time.time(), 0, b"x", b"")
+        self.assertFalse(old.exists())
+
+    def test_what_counts_as_a_write(self) -> None:
+        def write(args: list[str]) -> bool:
+            words, method, _seen, _values = gg.broker_words(args)
+            return gg.gh_cache_is_write(args, words, method)
+        for args in (["pr", "merge", "7"], ["pr", "edit", "7"], ["run", "rerun", "5"], ["workflow", "run", "x"],
+                     ["auth", "switch"], ["api", "graphql", "--input", "q.json"],
+                     ["api", "-X", "DELETE", "repos/o/r/x"], ["api", "repos/o/r/x", "-F", "a=1"],
+                     ["api", "graphql", "-f", "query=mutation{x}"], ["something-new", "verb"]):
+            with self.subTest(args=args):
+                self.assertTrue(write(args))
+        for args in (["pr", "view", "7"], ["pr", "list"], ["run", "list"], ["api", "repos/o/r"],
+                     ["api", "graphql", "-f", "query=query{viewer{login}}"], ["search", "prs", "x"], []):
+            with self.subTest(args=args):
+                self.assertFalse(write(args))
+
+
+class BrokerSweepTest(BrokerBase):
+    """A per-job occupancy sweep is refused past GH_SWEEP_MAX distinct targets; polling is not."""
+
+    def test_a_sweep_is_refused_with_a_message_naming_the_replacement(self) -> None:
+        with mock.patch.object(gg, "GH_SWEEP_MAX", 3):
+            for n in range(3):
+                _code, _out, _err, passed = self.run_gh(["api", f"repos/o/r/actions/runs/{n}/jobs"])
+                self.assertIsNotNone(passed)
+            code, _out, err, passed = self.run_gh(["api", "repos/o/r/actions/jobs/99", "--jq", ".runner_name"])
+        self.assertEqual((code, passed), (gg.GH_SWEEP_EXIT, None))
+        self.assertIn("glaeda-gh runners o", err)
+        self.assertIn("GLAEDA_GH_SWEEP_OK=1", err)
+
+    def test_polling_one_run_is_never_a_sweep(self) -> None:
+        with mock.patch.object(gg, "GH_SWEEP_MAX", 2):
+            for _ in range(10):
+                _code, _out, _err, passed = self.run_gh(["api", "repos/o/r/actions/runs/5/jobs"])
+                self.assertIsNotNone(passed)
+
+    def test_the_window_forgets_and_the_override_passes(self) -> None:
+        with mock.patch.object(gg, "GH_SWEEP_MAX", 1):
+            self.run_gh(["api", "repos/o/r/actions/jobs/1"])
+            with mock.patch.dict(os.environ, {"GLAEDA_GH_SWEEP_OK": "1"}):
+                self.assertIsNotNone(self.run_gh(["api", "repos/o/r/actions/jobs/2"])[3])
+            self.assertIsNone(self.run_gh(["api", "repos/o/r/actions/jobs/3"])[3])
+            later = time.time() + gg.GH_SWEEP_WINDOW + 1
+            self.assertIsNone(gg.gh_sweep_refusal(["api", "repos/o/r/actions/jobs/4"], "GET", later))
+
+    def test_what_is_a_sweep_target(self) -> None:
+        for path, want in (("repos/O/R/actions/runs/5/jobs?per_page=100", "o/r run 5"),
+                           ("/repos/o/r/actions/runs/5/attempts/2/jobs", "o/r run 5"),
+                           ("https://api.github.com/repos/o/r/actions/jobs/7", "o/r job 7"),
+                           ("repos/o/r/actions/jobs/7/logs", None), ("repos/o/r/actions/runs/5", None),
+                           ("orgs/o/actions/runners", None)):
+            with self.subTest(path=path):
+                self.assertEqual(gg.gh_sweep_target(["api", path], "GET"), want)
+        self.assertIsNone(gg.gh_sweep_target(["api", "repos/o/r/actions/jobs/7"], "POST"))
+
+
+class RunnersTest(BrokerBase):
+    def test_runners_counts_online_busy_and_idle_per_label(self) -> None:
+        lines = "\n".join(json.dumps(r) for r in (
+            {"name": "a", "status": "online", "busy": True, "labels": ["self-hosted", "mini"]},
+            {"name": "b", "status": "online", "busy": False, "labels": ["self-hosted", "mini"]},
+            {"name": "c", "status": "offline", "busy": False, "labels": ["self-hosted"]}))
+        done = subprocess.CompletedProcess([], 0, lines + "\n", "")
+        out = io.StringIO()
+        with mock.patch.object(gg, "run_bounded", return_value=done) as ran, contextlib.redirect_stdout(out):
+            self.assertEqual(gg.cmd_runners("o", None, True), 0)
+        argv = ran.call_args[0][0]
+        self.assertIn("orgs/o/actions/runners?per_page=100", argv)
+        self.assertEqual(argv[2:4], ["gh", "api"], "read through this broker, so the cache shares it")
+        bad = subprocess.CompletedProcess([], 0, "not json\n", "")
+        with mock.patch.object(gg, "run_bounded", return_value=bad), self.assertRaises(gg.WatchError):
+            gg.cmd_runners("o", None, True)
+        with mock.patch.object(gg, "run_bounded", side_effect=OSError("no")), self.assertRaises(gg.WatchError):
+            gg.cmd_runners("o", None, True)
+        doc = json.loads(out.getvalue())
+        self.assertEqual((doc["runners"], doc["online"], doc["busy"], doc["busyRunners"]), (3, 2, 1, ["a"]))
+        self.assertEqual(doc["labels"]["mini"], {"online": 2, "busy": 1})
+        with mock.patch.object(gg, "run_bounded", return_value=done) as ran, contextlib.redirect_stdout(io.StringIO()):
+            gg.cmd_runners("o/r", "mini", False)
+        self.assertIn("repos/o/r/actions/runners?per_page=100", ran.call_args[0][0])
+        with self.assertRaises(gg.WatchError):
+            gg.cmd_runners("not a scope", None, False)
+
+
+class BrokerAnswerCacheReviewTest(BrokerBase):
+    """Round-two findings: output environment, process group, and ^C on a write."""
+
+    def test_output_environment_is_part_of_the_key(self) -> None:
+        os.environ["GLAEDA_GH_CACHE_TTL"] = "60"
+        args = ["pr", "view", "7", "-R", "o/r"]
+        words, method, seen, values = gg.broker_words(args)
+        with mock.patch.object(sys.stdout, "isatty", return_value=False):
+            plain = gg.gh_cache_key(args, words, values, seen, method, "/gh")
+            self.assertIsNotNone(plain)
+            for name, value in (("GH_FORCE_TTY", "1"), ("CLICOLOR_FORCE", "1"), ("NO_COLOR", "1"),
+                                ("GLAMOUR_STYLE", "dark"), ("COLUMNS", "80")):
+                with self.subTest(name=name), mock.patch.dict(os.environ, {name: value}):
+                    self.assertNotEqual(gg.gh_cache_key(args, words, values, seen, method, "/gh"), plain)
+
+    def test_a_fill_child_stays_in_the_callers_process_group(self) -> None:
+        probe = self.home / "bin" / "pgid"
+        probe.write_text("#!/bin/sh\nps -o pgid= -p $$\n")
+        probe.chmod(0o755)
+        rc, out, _err = gg.gh_cache_child(str(probe), [], True, 10)
+        self.assertEqual((rc, int(out.decode().strip())), (0, os.getpgrp()))
+
+    def test_a_write_child_gets_default_sigint(self) -> None:
+        probe = self.home / "bin" / "sigint"
+        out = self.home / "sigint.txt"
+        # SigIgn in /proc is Linux only; ask the shell instead: `trap` prints an ignored INT
+        probe.write_text(f"#!/bin/sh\ntrap > {out}\n")
+        probe.chmod(0o755)
+        rc, _o, _e = gg.gh_cache_child(str(probe), [], False, None)
+        self.assertEqual(rc, 0)
+        self.assertNotIn("INT", out.read_text())
+        self.assertIsNot(signal.getsignal(signal.SIGINT), signal.SIG_IGN)
 
 
 if __name__ == "__main__":
