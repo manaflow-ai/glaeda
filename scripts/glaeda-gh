@@ -4222,12 +4222,15 @@ def cmd_wait_pid(target: str, timeout: float, as_json: bool) -> int:
 
 def head_served(entry: dict | None, now: float, max_age: float) -> tuple[dict | None, bool]:
     """(data, fresh): a head's data, and whether it is recent enough. Settled data is good for
-    HEAD_SETTLED_TTL * 2, pending data for max_age."""
+    HEAD_SETTLED_TTL and two of the daemon's head cycles (the configured one, as the daemon paces
+    by it), pending data for max_age."""
     data = (entry or {}).get("data")
     if not data:
         return None, False
     age = now - ((entry or {}).get("dataAt") or 0)
-    return data, age < (HEAD_SETTLED_TTL + 2 * CYCLE if data.get("settled") else max_age)
+    if not data.get("settled"):
+        return data, age < max_age
+    return data, age < HEAD_SETTLED_TTL + 2 * daemon_policy()["cycles"]["head"]
 
 
 def cmd_checks(repo: str, shas: list[str], consumer: str, max_age: float, wait: float, as_json: bool) -> int:

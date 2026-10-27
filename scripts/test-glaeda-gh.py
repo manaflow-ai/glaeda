@@ -8065,6 +8065,13 @@ class DaemonPolicyTest(Base):
         gg.DAEMON_CONFIG.write_text("{not json")
         self.assertEqual(gg.daemon_policy()["cycle"], 60)
 
+    def test_settled_heads_stay_fresh_for_two_configured_cycles(self) -> None:
+        entry = {"data": {"settled": True}, "dataAt": NOW - (gg.HEAD_SETTLED_TTL + 2 * 60 + 30)}
+        self.assertFalse(gg.head_served(entry, NOW, 30)[1])  # the default cycle: stale
+        self.configure({"cycle": 300})
+        self.assertTrue(gg.head_served(entry, NOW, 30)[1])  # the daemon re-reads it later than that
+        self.assertFalse(gg.head_served({"data": {"settled": False}, "dataAt": NOW - 60}, NOW, 30)[1])
+
     def test_floors_from_the_config_drive_the_mode(self) -> None:
         self.daemon.now = NOW
         self.daemon.budget = {"rest": {"limit": 5000, "remaining": 1000, "reset": NOW + 1800}}
