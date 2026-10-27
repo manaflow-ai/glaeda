@@ -167,5 +167,14 @@ kept the whole root fresh, so every tree on a mini stayed. Past 12 h idle, a col
 build is cheap: Blacksmith's cold Release build had a median of 620 s, against
 830 s on a warm pool mini, over 22 builds.
 
-The key defaults to `""`. With any value other than that label, the root stays
-a single `library-caches` item, as before.
+The key defaults to `glaeda-trusted-next-nightly`. cmux#26048 routes the build
+to that label first, `vars.CI_NIGHTLY_NEXT_DEDICATED_LABEL` is set to it, and the
+builder is online. A pool tree is never taken while the runner it is named
+after (`agentName`) has a job: its `Runner.Worker` shows in a fresh `ps`, in the
+survey and again right before the delete. It also stays when `ps` fails or a
+`.runner` is mid-rewrite.
+
+To opt out, set the key to `""` or any other value in `disk-policy.json`. The
+root then stays a single `library-caches` item, as before, unless a dedicated
+runner keeps a tree in it by role (`.glaeda-keep.json`). In that case the root
+is split anyway, so the kept tree does not hold every other runner's stale tree.

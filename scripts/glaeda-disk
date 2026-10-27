@@ -1507,9 +1507,13 @@ POLICY_DEFAULTS: dict[str, Any] = {
     # only under the runner floor. A finite number here ages it again.
     "cmux_next_ci_host_idle_hours": float("inf"),
     # The label cmux's nightly-next build routes to its one dedicated builder by (vars.CI_NIGHTLY_NEXT_DEDICATED_LABEL).
-    # Only NIGHTLY_NEXT_DEDICATED_LABEL turns the cmux-nightly-next fallback eviction on; "" (or any other value)
-    # leaves that cache as it was. Set it only once that variable is set, so no fallback goes before the routing.
-    "nightly_next_dedicated_label": "",
+    # Only NIGHTLY_NEXT_DEDICATED_LABEL turns the cmux-nightly-next fallback eviction on by itself. It is the default:
+    # cmux#26048 routes the build to that label first (then owned Macs, then Blacksmith),
+    # vars.CI_NIGHTLY_NEXT_DEDICATED_LABEL is glaeda-trusted-next-nightly and its builder is online, so pool runners'
+    # fallback trees go after DEFAULT_AGE_HOURS idle, never while their runner has a job (nightly_next_runner_busy).
+    # A policy file's "" (or any other value) opts out back to how it was before: the root stays whole unless a
+    # dedicated runner keeps a tree in it by role (nightly_next_split).
+    "nightly_next_dedicated_label": NIGHTLY_NEXT_DEDICATED_LABEL,
     # --dedupe also clones identical files in capture and evidence trees (screen-capture frames, UI evidence),
     # with its own floor: one PNG frame is 16-200 KiB, so Xcode's 1 MiB floor saw 2.7 of the 11.2 GiB of
     # identical frames in cmux-mac-mini's ~/messageslab-26. "~" is the account's home; globs are allowed; a
@@ -1531,6 +1535,10 @@ DEVBOX_TRANSCRIPT_DAYS = 30
 DEVBOX_TRANSCRIPT_DELETE_DAYS = 180
 
 
+# String keys whose "" is a setting (an opt-out), not a missing value
+POLICY_EMPTY_STRINGS = frozenset({"nightly_next_dedicated_label"})
+
+
 def policy_overrides(path: Path | None = None) -> dict[str, Any]:
     """The keys DISK_POLICY sets, each with a value of its default's type; an unreadable file sets none."""
     out: dict[str, Any] = {}
@@ -1548,7 +1556,7 @@ def policy_overrides(path: Path | None = None) -> dict[str, Any]:
                 if isinstance(value, list) and all(isinstance(v, str) and v for v in value):
                     out[key] = list(value)
             elif isinstance(default, str):
-                if isinstance(value, str) and value:
+                if isinstance(value, str) and (value or key in POLICY_EMPTY_STRINGS):
                     out[key] = value
             elif isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
                 if math.isfinite(value):
@@ -6770,6 +6778,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
                 reasons.append(busy_reason)
         if fam.id == RUNNER_BUILD_FAMILY and not blind and (why := runner_job_live(fam.root.parent, cmds)):
             reasons.append(why)
+        if fam.id == NIGHTLY_NEXT_FAMILY and not blind and (why := nightly_next_runner_busy(path, cmds)):
+            reasons.append(why)
         if in_cwd(sp, opened):
             reasons.append("open by a process")
         if named_by(sp, cmds):
@@ -8468,7 +8478,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         if halt is not None and (why := halt()):
             print(f"stopped: {why}")
             break
-        if fam.id in FLEET_FAMILY_IDS or fam.id in (CMUX_NEXT_CI_FAMILY, HQ_CACHE_FAMILY, CANONICAL_ADMISSION) \
+        if fam.id in FLEET_FAMILY_IDS or fam.id in (CMUX_NEXT_CI_FAMILY, HQ_CACHE_FAMILY, CANONICAL_ADMISSION,
+                                                     NIGHTLY_NEXT_FAMILY) \
                 or media_tour_dd(fam, p) or (
                 fam.id == INTERRUPTED and fam.root in (cmux_next_ci_state_parents(HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT)
                                                        + cmux_next_ci_host_parents(HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT))):
@@ -8482,7 +8493,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             cwds = open_index(opened)
         if fam.build_output and fam.root.is_relative_to(FLEET_CI):
             cmds = command_lines() or cmds
-        if fam.id == RUNNER_BUILD_FAMILY or fam.app_clones:
+        if fam.id in (RUNNER_BUILD_FAMILY, NIGHTLY_NEXT_FAMILY) or fam.app_clones:
             # the runner may have taken a job since the survey (its Runner.Worker shows in a fresh ps), or an
             # app may have started from a clone: a running app names only its installed path, so ps it is
             cmds = command_lines()
@@ -8517,6 +8528,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         elif (cmux_next_ci_busy(fam, p, cwds, cmds)
                 or (fam.id == INTERRUPTED and cmux_next_ci_aside_busy(p, cwds, cmds))
                 or (fam.id == RUNNER_BUILD_FAMILY and runner_job_live(fam.root.parent, cmds))
+                or (fam.id == NIGHTLY_NEXT_FAMILY and nightly_next_runner_busy(p, cmds))
                 or (fam.app_clones and app_clone_running(p, cmds))
                 or in_cwd(i.path, cwds) or named_by(i.path, cmds) or holds_socket(p) or job_busy(fam, p)
                 or (fam.reference_root is not None
@@ -9254,6 +9266,19 @@ def nightly_next_family(root: Path | None = None) -> Family:
                   # build fetches again: build output, not a checkout anyone works in
                   build_output=True, min_idle_hours=window, max_idle_hours=window,
                   owner="cmux nightly_build_state.py, per runner", rebuild_minutes=4, platform="macos")
+
+
+def nightly_next_runner_busy(path: Path, cmds: str) -> str:
+    """Why a pool runner's cmux-nightly-next tree is in use, or "": the enrolled runner it is named after (agentName)
+    has a job (its Runner.Worker in cmds), or no enrolled runner has that name while a .runner is changing (a runner
+    mid re-registration may be the tree's). Every tree is in use when cmds is empty (ps failed)."""
+    if not cmds:
+        return "no process list (ps failed)"
+    names, complete, _ = enrolled_runner_roster()
+    runner = names.get(path.name)
+    if runner is not None:
+        return runner_job_live(runner, cmds)
+    return "" if complete else f"no enrolled runner is named {path.name} while a runner's .runner is changing"
 
 
 def nightly_next_fallback(path: Path) -> bool:
