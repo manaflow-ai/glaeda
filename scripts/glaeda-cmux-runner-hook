@@ -27,7 +27,9 @@ re-runs it elsewhere) when:
     Unix seconds) with now < until, whoever owns it; an unreadable or invalid file also refuses, an expired
     one is ignored (parsed by glaeda_reservation.py, installed next to this hook)
   * free disk is below --min-free-gib even after one bounded glaeda-disk --pressure run evicted idle caches
-    (evict; skipped with --no-disk)
+    (evict; skipped with --no-disk). Above the floor but under the pre-job target (the floor plus
+    PREJOB_MARGIN_GIB) it starts the queued pass before the job and waits up to PREJOB_WAIT_S for that target
+    (prejob_evict), then admits it: the eviction happens before every job, not after it
   * the job needs the console session (a gui class job, or any job on a --gui-runner or --session-runner) and the
     console session is screen-locked or no user is logged in at the console (console_refusal, cmuxterm-hq#757)
     (a CONSOLE_SKIPPERS job is admitted as light instead: its take-gui step gives way and it skips)
@@ -138,6 +140,15 @@ BACKGROUND_DISK_TIMEOUT_S = 15 * 60
 BACKGROUND_DISK_TIMEOUT_MAX_S = 6 * 3600  # an override above this is cut to it, so the bound's lifetime stays finite
 BACKGROUND_DISK_TIMEOUT_ENV = "GLAEDA_RUNNER_BACKGROUND_DISK_TIMEOUT"  # GLAEDA_RUNNER_DISK_TIMEOUT bounds the others
 EVICT_TIMEOUT_S = 60  # job-started waits at most this long for an eviction under the disk floor
+# Before every job, not after it (Leo, 2026-10-26: "Just throw it away. Just delete more stuff, more often"): free disk
+# is brought to the pre-job target, the floor plus PREJOB_MARGIN_GIB, before a job is admitted. Only checking the floor
+# admitted several jobs at 31 GiB under a 30 GiB floor, and together they wrote the disk down to 0.1 GiB while every
+# pass skipped as busy (cmuxs-mac-mini-6, 2026-10-25 18:46-19:02). Above the floor a job waits at most PREJOB_WAIT_S
+# for the queued pass and is then admitted; under it, evict() and the floor refusal (the job runs elsewhere) apply.
+PREJOB_MARGIN_GIB = 20.0  # glaeda-disk's target_margin_gib, the room it frees above the floor
+PREJOB_MARGIN_ENV = "GLAEDA_RUNNER_PREJOB_MARGIN_GIB"
+PREJOB_WAIT_S = 30.0
+PREJOB_POLL_S = 1.0
 # The runner's own environment (its LaunchAgent), never a job's env:, which does not reach hooks.
 FLEET_DIR = os.environ.get("GLAEDA_FLEET_DIR") or "/Users/Shared/cmux-build-fleet"
 HOST_LOCK = f"{FLEET_DIR}/host.lock"
@@ -1592,6 +1603,57 @@ def evict(path: str, min_free_gib: float, explicit: str | None) -> str:
         return evicted(path, min_free_gib, waited, before)
     ran = disk_pressure(explicit, min_free_gib, max(1.0, deadline - time.monotonic()))
     return evicted(path, min_free_gib, f"{waited}; {ran}", before)
+
+
+def prejob_margin_gib() -> float:
+    """PREJOB_MARGIN_GIB, or PREJOB_MARGIN_ENV when it is a finite number from 0 to 500."""
+    try:
+        value = float(os.environ.get(PREJOB_MARGIN_ENV) or PREJOB_MARGIN_GIB)
+    except ValueError:
+        return PREJOB_MARGIN_GIB
+    return value if math.isfinite(value) and 0 <= value <= 500 else PREJOB_MARGIN_GIB
+
+
+def prejob_target_gib(min_free_gib: float) -> float:
+    """The free space a job starts at: the floor plus prejob_margin_gib, or 0 (no target) for a runner with no floor."""
+    return min_free_gib + prejob_margin_gib() if min_free_gib > 0 else 0.0
+
+
+def pass_active() -> bool:
+    """Whether a glaeda-disk pass is freeing space now or about to: a trigger no pass has served yet (DISK_PASS_PENDING
+    or its .claimed, which disk_pressure_detached writes before its detached child takes the pass lock), the queued
+    pass (the hook's pass lock), or any --apply holding evict.lock."""
+    state = disk_state_dir()
+    pending = state / DISK_PASS_PENDING
+    return (os.path.lexists(pending) or os.path.lexists(f"{pending}.claimed")
+            or disk_pass_running(state / DISK_PASS_LOCK) or wait_for_running_pass(time.monotonic()))
+
+
+def prejob_evict(path: str, min_free_gib: float, explicit: str | None, wait_s: float = PREJOB_WAIT_S) -> str | None:
+    """Evict before the job: above the floor but under the pre-job target, start the one queued glaeda-disk pass now
+    (disk_pressure_detached, which coalesces into a running one) and wait for free space to reach the target, at most
+    wait_s, polling free space every PREJOB_POLL_S and stopping early once no pass runs. The pass is never cut or
+    killed here, and the job is admitted whatever it freed: it is above the floor. None when there is nothing to do
+    (no floor, at or above the target, or already under the floor, which evict() handles). Never raises."""
+    try:
+        target = prejob_target_gib(min_free_gib)
+        if target <= 0 or not disk_refusal(path, target) or disk_refusal(path, min_free_gib):
+            return None
+        before = free_or_none(path)
+        started = disk_pressure_detached(explicit)
+        start = time.monotonic()
+        deadline = start + max(0.0, wait_s)
+        while time.monotonic() < deadline and disk_refusal(path, target):
+            time.sleep(min(PREJOB_POLL_S, max(0.0, deadline - time.monotonic())))
+            if time.monotonic() - start >= PREJOB_POLL_S and not pass_active():
+                break
+        after = free_or_none(path)
+        freed = f"{after - before:.1f} GiB" if before is not None and after is not None else "an unknown amount"
+        reached = "reached" if not disk_refusal(path, target) else "not reached; admitted above the floor"
+        return (f"under the {target:g} GiB pre-job target ({min_free_gib:g} GiB floor + {target - min_free_gib:g}): "
+                f"{started}; waited {time.monotonic() - start:.0f} s, freed {freed}, target {reached}")
+    except Exception as error:  # noqa: BLE001  (never fail the job on housekeeping)
+        return f"pre-job eviction skipped: {type(error).__name__}"
 
 
 def evict_lock_path() -> Path:
@@ -6154,6 +6216,15 @@ def main(argv: list[str] | None = None) -> int:
         why = disk_refusal(disk_path, args.min_free_gib)
         if why:
             return refused(why, disk=True)
+        prejob = None if args.no_disk else prejob_evict(disk_path, args.min_free_gib, args.disk)
+        if prejob:
+            print(f"{PREFIX}: {prejob}", flush=True)
+            # the jobs already running may have written the disk below the floor while this one waited
+            if disk_refusal(disk_path, args.min_free_gib):
+                print(f"{PREFIX}: {evict(disk_path, args.min_free_gib, args.disk)}", flush=True)
+                why = disk_refusal(disk_path, args.min_free_gib)
+                if why:
+                    return refused(why, disk=True)
         # before any capacity is taken: a job that needs the console session fails on a locked one
         admit_class = None
         if args.gui_runner or args.session_runner or job_class(

@@ -851,6 +851,123 @@ class HookTest(unittest.TestCase):
         self.assertEqual(run.call_args.kwargs["timeout"], hook.EVICT_TIMEOUT_S)
         self.assertEqual(hook.EVICT_TIMEOUT_S, 60)
 
+    def prejob(self, frees: list[float], active: bool = True, wait_s: float = 2.0, floor: float = 30.0):
+        """prejob_evict with free space read from frees (the last repeats), a pass running while active."""
+        reads = iter(frees)
+        last = [frees[0]]
+
+        def free(_path: str) -> float:
+            last[0] = next(reads, last[0])
+            return last[0]
+
+        with mock.patch.object(hook, "free_gib", side_effect=free), \
+                mock.patch.object(hook, "disk_pressure_detached", return_value="glaeda-disk started") as started, \
+                mock.patch.object(hook, "pass_active", return_value=active), \
+                mock.patch.object(hook, "PREJOB_POLL_S", 0.05), mock.patch.dict(os.environ):
+            os.environ.pop(hook.PREJOB_MARGIN_ENV, None)
+            begin = time.monotonic()
+            note = hook.prejob_evict(os.fspath(self.dir), floor, None, wait_s=wait_s)
+            return note, started, time.monotonic() - begin
+
+    def test_prejob_eviction_runs_before_the_job_and_waits_for_the_target(self) -> None:
+        """Above the floor but under the floor plus PREJOB_MARGIN_GIB, the queued pass starts before the job and the
+        job waits until free space reaches the target."""
+        self.assertEqual(hook.PREJOB_MARGIN_GIB, 20.0)
+        self.assertEqual(hook.prejob_target_gib(30), 50.0)
+        self.assertEqual(hook.prejob_target_gib(0), 0.0, "a runner with no floor has no target")
+        note, started, _ = self.prejob([35.0, 35.0, 35.0, 42.0, 51.0])
+        started.assert_called_once_with(None)
+        self.assertRegex(note, r"^under the 50 GiB pre-job target \(30 GiB floor \+ 20\): glaeda-disk started; "
+                               r"waited [0-9]+ s, freed 16\.0 GiB, target reached$")
+
+    def test_prejob_eviction_is_bounded_and_admits_above_the_floor(self) -> None:
+        note, started, took = self.prejob([35.0], wait_s=0.5)
+        started.assert_called_once()
+        self.assertLess(took, 5, "bounded by wait_s")
+        self.assertIn("target not reached; admitted above the floor", note)
+
+    def test_prejob_eviction_stops_waiting_once_no_pass_runs(self) -> None:
+        note, _, took = self.prejob([35.0], active=False, wait_s=30)
+        self.assertLess(took, 5, "no pass is freeing space: the job does not wait out the bound")
+        self.assertIn("target not reached", note)
+
+    def test_prejob_eviction_does_nothing_at_the_target_under_the_floor_or_without_one(self) -> None:
+        for frees, floor in (([50.0], 30.0), ([80.0], 30.0), ([29.0], 30.0), ([1.0], 0.0)):
+            with self.subTest(frees=frees, floor=floor):
+                note, started, _ = self.prejob(frees, floor=floor)
+                self.assertIsNone(note)
+                started.assert_not_called()
+
+    def test_a_trigger_no_pass_has_served_yet_counts_as_an_active_pass(self) -> None:
+        """disk_pressure_detached returns before its detached child takes the pass lock; the pending trigger it wrote
+        first keeps the pre-job wait going until a pass served it."""
+        with mock.patch.dict(os.environ, {"HOME": os.fspath(self.dir)}):
+            state = hook.disk_state_dir()
+            state.mkdir(parents=True, exist_ok=True)
+            self.assertFalse(hook.pass_active())
+            for name in (hook.DISK_PASS_PENDING, f"{hook.DISK_PASS_PENDING}.claimed"):
+                (state / name).touch()
+                self.assertTrue(hook.pass_active(), name)
+                (state / name).unlink()
+            self.assertFalse(hook.pass_active())
+
+    def test_the_floor_is_checked_again_after_the_prejob_wait(self) -> None:
+        """Running jobs can write the disk below the floor while this one waits: it then evicts and is refused, as
+        under the floor before the wait."""
+        self.fleet()
+        frees = iter([35.0, 35.0, 20.0])  # the two floor checks, then the one after the wait
+        last = [35.0]
+
+        def free(_path):
+            last[0] = next(frees, last[0])
+            return last[0]
+        push = event(self.dir, "push", {"repository": CMUX})
+        env = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0",
+               "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"),
+               "GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": os.fspath(push), "GITHUB_REPOSITORY": "manaflow-ai/cmux"}
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(hook, "free_gib", side_effect=free), \
+                mock.patch.object(hook, "prejob_evict", return_value="under the 50 GiB pre-job target: waited 30 s"), \
+                mock.patch.object(hook, "evict", return_value="under the 30 GiB disk floor: glaeda-disk exited 0") as ev, \
+                mock.patch.object(hook, "start_runner_parent_watchdog"), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            code = hook.main(["job-started", "--allowed-repo", "manaflow-ai/cmux",
+                              "--reservation", os.fspath(self.dir / "fleet" / "reservation.json"),
+                              "--host-lock", os.fspath(self.dir / "fleet" / "host.lock"), "--min-free-gib", "30",
+                              "--state-dir", os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid())])
+        self.assertEqual(code, 1, out.getvalue())
+        ev.assert_called_once()
+        text = out.getvalue()
+        self.assertLess(text.index("pre-job target"), text.index("disk floor"))
+        self.assertIn("20.0 GiB free, 30 GiB required", text)
+        self.assertTrue(self.lock_free())
+
+    def test_prejob_margin_override_is_bounded(self) -> None:
+        for value, want in (("5", 5.0), ("0", 0.0), ("-1", 20.0), ("501", 20.0), ("nan", 20.0), ("x", 20.0)):
+            with self.subTest(value=value), mock.patch.dict(os.environ, {hook.PREJOB_MARGIN_ENV: value}):
+                self.assertEqual(hook.prejob_margin_gib(), want)
+
+    def test_job_started_evicts_to_the_prejob_target_before_admitting(self) -> None:
+        """The whole hook, with the real detached pass: free space between the floor and the target starts the queued
+        pass before admission, and the job waits while that pass (here a 2 s fake glaeda-disk) runs, through its
+        startup, so the pass has finished by the time the job is admitted."""
+        self.fleet()
+        marker = self.dir / "disk-ran"
+        disk = make_executable(self.dir / "glaeda-disk-fake", "import pathlib, sys, time\n"
+                               "time.sleep(2)\n"
+                               f"pathlib.Path({os.fspath(marker)!r}).write_text(' '.join(sys.argv[1:]))\n")
+        floor = max(1.0, hook.free_gib(os.fspath(self.dir / "fleet")) - 5)  # above the floor, under floor + 20
+        push = event(self.dir, "push", {"repository": CMUX})
+        result = self.run_hook("job-started", "push", push, "--allowed-repo", "manaflow-ai/cmux", "--disk",
+                               os.fspath(disk), "--min-free-gib", f"{floor:.1f}", "--state-dir",
+                               os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()), repo="manaflow-ai/cmux")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertRegex(result.stdout, r"under the [0-9.]+ GiB pre-job target \([0-9.]+ GiB floor \+ 20\): "
+                                        r"glaeda-disk started in the background \(bounded by [0-9]+ s\); waited ([2-9]|[1-9][0-9]) s")
+        self.assertLess(result.stdout.index("pre-job target"), result.stdout.index("admitted"), "evicted, then admitted")
+        self.assertTrue(marker.read_text().startswith("--pressure --apply"), "the pass ran before admission")
+        self.run_hook("job-completed", None, None, "--no-disk", "--state-dir", os.fspath(self.dir / "state"))
+
     def test_lock_held_by_another_build_refuses_fast(self) -> None:
         fleet = self.fleet()
         holder = subprocess.Popen([sys.executable, "-c",
