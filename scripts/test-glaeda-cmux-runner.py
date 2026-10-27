@@ -4896,6 +4896,148 @@ class GateTest(unittest.TestCase):
                 mock.patch.object(hook, "pid_alive", side_effect=lambda pid: pid != 4242):
             self.assertEqual(hook.lock_waiters(os.fspath(self.lock), {4245}), [4243])
 
+    def waited(self, t0: float, start: float, until: float, pids=(77,), notes: list[str] | None = None,
+               step: float = 60, identity=lambda pid: f"start-{pid}") -> list[int]:
+        """Gate readings every `step` seconds from start to until (as a polling gate takes them); the last one."""
+        t, out = start, []
+        while True:
+            out = hook.bounded_waiters(self.state, list(pids), now=t0 + t,
+                                       log=notes.append if notes is not None else None, identity=identity)
+            if t >= until:
+                return out
+            t = min(until, t + step)
+
+    def test_a_waiter_that_never_gets_the_host_is_yielded_to_for_a_bounded_time(self) -> None:
+        hold, waive = hook.GATE_WAITER_MAX_HOLD_S, hook.GATE_WAITER_WAIVE_S
+        notes: list[str] = []
+        t0 = 1_000_000.0
+        self.assertEqual(self.waited(t0, 0, hold - 60, notes=notes), [77], "yielded to within the hold")
+        self.assertEqual(notes, [])
+        self.assertEqual(self.waited(t0, hold, hold + 1, notes=notes), [], "past the hold the gate listens anyway")
+        self.assertEqual(len(notes), 1)
+        self.assertIn("pid 77", notes[0])
+        self.assertIn("without getting it", notes[0])
+        self.assertEqual(self.waited(t0, hold + 60, hold + waive - 60, notes=notes), [])
+        self.assertEqual(len(notes), 1, "one note per waived stretch, not one per poll")
+        self.assertEqual(self.waited(t0, hold + waive, hold + waive + 1, notes=notes), [77],
+                         "then honoured again, so a slow build still gets a turn")
+        self.assertEqual(self.waited(t0, hold + waive + 60, 2 * hold + waive + 1, notes=notes), [])
+        self.assertEqual(len(notes), 2)
+        # another pid on the same host has its own span
+        self.assertEqual(self.waited(t0, 2 * hold + waive + 2, 2 * hold + waive + 2, (77, 88)), [88])
+
+    def test_replay_a_worker_waiting_for_over_an_hour_is_bounded(self) -> None:
+        # 2026-10-26, a std mini: the fleet worker (one pid) waited for host.lock from 22:19Z, taking it now and then
+        # only to hand its build back for disk (2 to 12 min a try) and wait again. Every gate held its listener off
+        # for over an hour (until at least 23:28Z). Replayed at the gate's 30 s waiter cadence, with the lock taken
+        # for 2 min at 22:47Z and 23:13Z as the worker did: the listeners must come back within the hold.
+        t0 = 5_000_000.0  # 22:19:00Z
+        notes: list[str] = []
+        hold = hook.GATE_WAITER_MAX_HOLD_S
+        self.assertLessEqual(hold, 10 * 60, "the policy bound is at most 10 min")
+        resumed = None
+        for t in range(0, 69 * 60, 30):  # to 23:28Z
+            if 28 * 60 <= t < 30 * 60 or 54 * 60 <= t < 56 * 60:
+                continue  # the worker holds the lock: the gate reads "holds the host lock", no waiter reading
+            owed = hook.bounded_waiters(self.state, [44], now=t0 + t, log=notes.append, identity=lambda pid: "w")
+            if not owed and resumed is None:
+                resumed = t
+        self.assertIsNotNone(resumed)
+        self.assertLessEqual(resumed, hold + 30, "listening again within one reading of the hold")
+        self.assertTrue(notes and "pid 44" in notes[0], notes)
+
+    def test_a_waiter_that_got_the_host_starts_a_new_wait(self) -> None:
+        hold, gap = hook.GATE_WAITER_MAX_HOLD_S, hook.GATE_WAITER_GAP_S
+        t0 = 2_000_000.0
+        self.assertEqual(self.waited(t0, 0, hold - 120), [77])
+        # unseen past the gap (it held the host for a build): the next wait starts afresh
+        self.assertEqual(self.waited(t0, hold - 120 + gap, hold - 120 + gap + hold - 60), [77])
+        # unseen for less than the gap (a hand-back's eviction under the lock): the same wait goes on
+        self.assertEqual(self.waited(t0, hold - 120 + gap + hold - 60 + gap - 60,
+                                     hold - 120 + gap + hold - 60 + gap - 60), [])
+
+    def test_a_reused_pid_or_a_reboot_starts_its_own_wait(self) -> None:
+        hold = hook.GATE_WAITER_MAX_HOLD_S
+        t0 = 3_000_000.0
+        self.assertEqual(self.waited(t0, 0, hold + 1), [])  # pid 77's wait is past the hold
+        self.assertEqual(self.waited(t0, hold + 30, hold + 30, identity=lambda pid: "another-start"), [77],
+                         "a new process with the same pid is a new waiter")
+        self.assertEqual(self.waited(t0, hold + 60, hold + 60, identity=lambda pid: None), [77],
+                         "an unreadable start honours the waiter")
+        # the monotonic clock restarts at boot: a reading before the last sighting is a new span
+        self.assertEqual(self.waited(0.0, 5, 5), [77])
+
+    def test_an_unwritable_waiter_record_honours_every_waiter(self) -> None:
+        self.state.mkdir(parents=True, exist_ok=True)
+        (self.state / hook.WAITER_SPANS_FILE).write_text("not json")
+        self.assertEqual(self.waited(1.0, 0, 0), [77], "a torn record starts afresh")
+        blocked = self.tmp / "file-not-dir"
+        blocked.touch()
+        notes: list[str] = []
+        for t in (0.0, 10 * hook.GATE_WAITER_MAX_HOLD_S):
+            self.assertEqual(hook.bounded_waiters(blocked / "state", [77], now=t, log=notes.append,
+                                                  identity=lambda pid: "w"), [77], "no record: nothing to bound by")
+        self.assertEqual(notes, [], "no 'listening anyway' note while still holding")
+
+    def test_a_locked_waiter_record_honours_every_waiter_and_logs_nothing(self) -> None:
+        self.assertEqual(self.waited(1.0, 0, hook.GATE_WAITER_MAX_HOLD_S + 1), [])
+        fd = os.open(self.state / (Path(hook.WAITER_SPANS_FILE).stem + ".lock"), os.O_RDWR)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        notes: list[str] = []
+        with mock.patch.object(hook, "WAITER_SPANS_LOCK_S", 0.1):
+            self.assertEqual(self.waited(1.0, hook.GATE_WAITER_MAX_HOLD_S + 60, hook.GATE_WAITER_MAX_HOLD_S + 60,
+                                         notes=notes), [77])
+        self.assertEqual(notes, [])
+
+    def test_concurrent_waiter_readers_keep_each_others_spans(self) -> None:
+        # Two gates read while a third holds the record's lock; the later-scheduled one sampled an older time.
+        t0 = 4_000_000.0
+        hold = hook.GATE_WAITER_MAX_HOLD_S
+        self.waited(t0, 0, 0, (77,))
+        fd = os.open(self.state / (Path(hook.WAITER_SPANS_FILE).stem + ".lock"), os.O_RDWR)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        readers = [threading.Thread(target=self.waited, args=(t0, 90, 90, (88,))),
+                   threading.Thread(target=self.waited, args=(t0, 60, 60, (77,)))]
+        for reader in readers:
+            reader.start()
+        time.sleep(0.3)  # both block on the lock
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        for reader in readers:
+            reader.join(timeout=10)
+        spans = json.loads((self.state / hook.WAITER_SPANS_FILE).read_text())
+        self.assertEqual(sorted(spans), ["77:start-77", "88:start-88"], "neither update lost the other's span")
+        self.assertEqual(spans["77:start-77"]["since"], t0, "77's wait kept its start")
+        self.assertEqual(self.waited(t0, hold + 1, hold + 1, (77,)), [], "and is bounded from that start")
+
+    def test_a_stale_waiter_reading_neither_restarts_nor_rewinds_a_span(self) -> None:
+        t0 = 6_000_000.0
+        hold = hook.GATE_WAITER_MAX_HOLD_S
+        self.waited(t0, 0, 120)
+        self.assertEqual(self.waited(t0, 90, 90), [77])  # a reading sampled before the last sighting
+        spans = json.loads((self.state / hook.WAITER_SPANS_FILE).read_text())
+        self.assertEqual(spans["77:start-77"], {"since": t0, "seen": t0 + 120})
+        self.assertEqual(self.waited(t0, 150, hold + 1), [])
+        # bounded_waiters reads the clock itself only once it holds the lock
+        with mock.patch.object(hook.time, "monotonic", return_value=t0 + hold + 2):
+            self.assertEqual(hook.bounded_waiters(self.state, [77], identity=lambda pid: "start-77"), [])
+
+    def test_the_gate_stops_yielding_to_a_waiter_past_the_hold(self) -> None:
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        with mock.patch.object(hook, "lock_waiters", return_value=[77]), \
+                mock.patch.object(hook, "process_identity", return_value="w"):
+            self.assertEqual(sorted(hook.host_waiters(os.fspath(self.lock), self.state)), [77])
+            spans = json.loads((self.state / hook.WAITER_SPANS_FILE).read_text())
+            spans["77:w"]["since"] -= hook.GATE_WAITER_MAX_HOLD_S + 1
+            (self.state / hook.WAITER_SPANS_FILE).write_text(json.dumps(spans))
+            gate.waiting = {77}
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                why = gate.confirmed()
+            self.assertNotEqual(why, "a fleet build is waiting for the host (pid 77)")
+            self.assertIn("listening anyway", out.getvalue())
+            self.assertEqual(gate.waiting, set())
+
     def test_lock_waiter_parser_counts_only_a_blocked_exclusive_lock(self) -> None:
         process_table = """\
 101  hrtimer_nanosleep worker-current

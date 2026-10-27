@@ -901,6 +901,22 @@ GATE_RESTART_FREE_S = float(os.environ.get("GLAEDA_RUNNER_GATE_RESTART_FREE_S") 
 GATE_LISTENING_SINCE_ENV = "GLAEDA_RUNNER_GATE_LISTENING_SINCE"
 GATE_WATCH_S = 0.1  # while a job is below the disk floor, notice its Worker exit promptly
 GATE_WAITER_EVERY_S = 30.0
+# The yield to a fleet build waiting for the host lock is bounded (policy, declared here; env overrides it). A waiter
+# seen waiting for GATE_WAITER_MAX_HOLD_S without a break longer than GATE_WAITER_GAP_S is not getting the host
+# (2026-10-26, a std mini: the controller handed its worker a build needing 250 GiB free on a disk with 80. Each try
+# waited 2 to 12 min for the lock behind runner jobs, took it, failed for disk and queued again, and the gate kept 11
+# of 12 listeners off from 22:19Z for over an hour). The hold is 10 min: a fleet build that the drain lets in gets the
+# lock within one runner job's tail, which the worker log put at 2 to 12 min that day. Past it the gate takes the
+# runners back and logs why once; after GATE_WAITER_WAIVE_S it honours the same wait again, so a build that is only
+# slow still gets a drained host once per cycle and no listener stays held without anyone stepping in.
+GATE_WAITER_MAX_HOLD_S = float(os.environ.get("GLAEDA_RUNNER_GATE_WAITER_MAX_HOLD_S") or 10 * 60)
+GATE_WAITER_WAIVE_S = float(os.environ.get("GLAEDA_RUNNER_GATE_WAITER_WAIVE_S") or 20 * 60)
+# A waiter not seen this long starts a new wait. A worker that took the lock and handed the job back re-queues within
+# seconds to minutes (its eviction runs under the lock, and the gate takes no reading while the lock is held); a build
+# that ran holds it far longer.
+GATE_WAITER_GAP_S = 10 * 60.0
+WAITER_SPANS_FILE = "fleet-waiter-spans.json"  # in the state dir, shared by every runner's gate and job-started
+WAITER_SPANS_LOCK_S = 2.0  # waiting for another reader's update; past it every waiter is honoured
 GATE_MAX_FAILURES = 5  # consecutive failed polls before the gate hands the runner back
 GATE_FALLBACK = 70  # listen.sh runs run.sh itself: the gate broke before any runner started
 # A throttled mini (macOS thermal pressure, notifyutil's com.apple.system.thermalpressurelevel: 0 nominal,
@@ -3022,7 +3038,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                         break
                     time.sleep(0.1)
             fds.append(fd)
-            waiting = lock_waiters(host_lock, holder_pids(state_dir) | yielding_family(host_lock))
+            waiting = bounded_waiters(state_dir, lock_waiters(host_lock, holder_pids(state_dir) | yielding_family(host_lock)),
+                                      log=lambda note: print(f"{PREFIX}: {note}", flush=True))
             # lsof sees only this user's processes, which is how the fleet worker runs today.
             if waiting:  # flock has no writer preference: stop admitting so the build worker gets in
                 # This must not be a retryable capacity refusal: a draining fleet
@@ -3782,11 +3799,94 @@ def host_held(host_lock: str, reservation: str, now: float, state_dir: Path | No
 
 
 def host_waiters(host_lock: str, state_dir: Path) -> set[int]:
-    """Fleet builds waiting for the host lock. lsof costs about 0.3 s of CPU on a mini, so the gate asks at
-    most every GATE_WAITER_EVERY_S, and a stop needs the same pid in two readings."""
+    """Fleet builds waiting for the host lock that the gate still yields to (bounded_waiters). lsof costs about
+    0.3 s of CPU on a mini, so the gate asks at most every GATE_WAITER_EVERY_S, and a stop needs the same pid in
+    two readings."""
     if not os.path.exists(host_lock):
         return set()
-    return set(lock_waiters(host_lock, holder_pids(state_dir) | yielding_family(host_lock)))
+    return set(bounded_waiters(state_dir, lock_waiters(host_lock, holder_pids(state_dir) | yielding_family(host_lock)),
+                               log=gate_log))
+
+
+def bounded_waiters(state_dir: Path, waiting: list[int] | set[int], now: float | None = None,
+                    log: Callable[[str], None] | None = None,
+                    identity: Callable[[int], str | None] | None = None) -> list[int]:
+    """The waiters still owed a yield. Each waiter's wait span is kept in WAITER_SPANS_FILE, updated under its
+    flock so every runner's gate and job-started agree on it. A span is keyed by pid and process start
+    (process_identity), so a reused pid starts its own, and a reboot leaves no span to match. Times are
+    time.monotonic (system-wide, immune to wall clock steps), read once the lock is held; a reading a little behind a
+    span's last sighting (a caller's own `now`) neither ends the span nor moves its sighting back. A span starts when a
+    waiter is first seen and ends when it is not seen for GATE_WAITER_GAP_S. Within it the waiter is honoured for
+    GATE_WAITER_MAX_HOLD_S, then ignored for GATE_WAITER_WAIVE_S, and so on; the first reading that ignores it in a
+    cycle logs why, after the record holds that. A record that cannot be locked, read or written honours every
+    waiter, as before the bound."""
+    waiting = sorted(set(waiting))
+    if not waiting:
+        return []
+    identity = identity or process_identity
+    path = state_dir / WAITER_SPANS_FILE
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path.with_suffix(".lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError:
+        return waiting
+    try:
+        deadline = time.monotonic() + WAITER_SPANS_LOCK_S
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    return waiting
+                time.sleep(0.05)
+        now = time.monotonic() if now is None else now  # after the lock: no reader writes an older sighting
+        try:
+            record = json.loads(path.read_text())
+            spans = record if isinstance(record, dict) else {}
+        except (FileNotFoundError, ValueError):
+            spans = {}  # none yet, or torn by a crash between write and replace: rewritten below
+        except OSError:
+            return waiting
+        kept: dict[str, dict[str, Any]] = {}
+        for key, span in spans.items():  # spans of waiters this reading missed, still within the gap
+            if isinstance(span, dict) and all(isinstance(span.get(k), (int, float)) for k in ("since", "seen")) \
+                    and span["since"] <= span["seen"] and abs(now - span["seen"]) < GATE_WAITER_GAP_S:
+                kept[key] = span
+        owed: list[int] = []
+        notes: list[str] = []
+        cycle = GATE_WAITER_MAX_HOLD_S + GATE_WAITER_WAIVE_S
+        for pid in waiting:
+            who = identity(pid)
+            if who is None:  # gone, or unreadable: honour it, and keep no span a reused pid could inherit
+                owed.append(pid)
+                continue
+            key = f"{pid}:{who}"
+            span = kept.get(key) or {"since": now}
+            span["seen"] = max(span["seen"], now) if "seen" in span else now
+            kept[key] = span
+            waited = max(0.0, now - span["since"])
+            if GATE_WAITER_MAX_HOLD_S <= 0 or cycle <= 0 or waited % cycle < GATE_WAITER_MAX_HOLD_S:
+                owed.append(pid)
+                continue
+            turn = int(waited // cycle)
+            if span.get("noted") != turn:
+                span["noted"] = turn
+                notes.append(f"a fleet build (pid {pid}) has waited for the host for {waited / 60:.0f} min without "
+                             f"getting it: listening anyway for up to {GATE_WAITER_WAIVE_S / 60:g} min (look at what "
+                             "the fleet handed this host)")
+        try:
+            tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(kept, sort_keys=True))
+            os.replace(tmp, path)
+        except OSError:
+            return waiting
+    finally:
+        os.close(fd)
+    if log is not None:
+        for note in notes:
+            log(note)
+    return sorted(owed)
 
 
 def processes() -> dict[int, tuple[int, str]]:
