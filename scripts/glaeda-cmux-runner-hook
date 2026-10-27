@@ -4112,6 +4112,41 @@ LISTENER_DONE = ("Skipping message Job.", "Caught exception from acquiring job m
                  "Runner execution has finished")
 
 
+def runner_worker(runner_dir: Path, command: str, program: str = "Worker") -> bool:
+    """command is a Runner.<program> of the runner in runner_dir: bin/Runner.Worker, or bin.<version>/Runner.Worker
+    once the runner updated itself (its listener spawns the Worker by the resolved path)."""
+    return re.search(r"(?:^|\s)" + re.escape(os.fspath(runner_dir)) + r"/bin(?:\.[^/\s]+)?/Runner\." +
+                     re.escape(program) + r"(?:\s|$)", command) is not None
+
+
+def runner_has_job(runner_dir: Path, commands: list[str]) -> bool:
+    """The runner in runner_dir has a job, given every process's command line: a Runner.Worker of it, or a
+    request its live listener took and has not finished (listener_request). A request in the diag of a listener
+    that is gone is no job: nothing can run it, and it would hold the runner busy for good. An unreadable diag
+    raises (callers count that as busy)."""
+    if any(runner_worker(runner_dir, command) for command in commands):
+        return True
+    listening = any(runner_worker(runner_dir, command, "Listener") for command in commands)
+    return listening and listener_request(runner_dir) is not None
+
+
+def runner_busy_now(runner_dir: Path) -> bool:
+    """runner_has_job from a fresh, untruncated process table. Anything that cannot be read counts as busy: a
+    deferred stop is retried, a cancelled job is lost."""
+    try:
+        out = subprocess.run(["/bin/ps", "-axww", "-o", "command="], stdin=subprocess.DEVNULL, capture_output=True,
+                             text=True, timeout=60, check=True).stdout
+        return runner_has_job(runner_dir, out.splitlines())
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def runner_busy_main(argv: list[str]) -> int:
+    """`busy --runner-dir D` for shell: exit 3 only when that runner is idle, so a crash (1) or an older hook without
+    this phase (2) never reads as idle; 0 when it has a job or this cannot tell."""
+    return 0 if len(argv) != 1 or runner_busy_now(Path(argv[0])) else 3
+
+
 def listener_request(runner_dir: Path) -> str | None:
     """The runner request the listener has acknowledged or dispatched and not yet finished, from the tail of the
     newest _diag/Runner_*.log (a listener writes a new one each start; Worker_*.log files are jobs' own), or None.
@@ -4638,8 +4673,17 @@ class Gate:
             gate_log(f"the leftover sweep failed ({type(error).__name__}); trying again later")
 
     def busy(self) -> bool:
-        """The runner has a job: a Runner.Worker under its tree, or a request its listener is taking."""
-        return self.worker() or self.taking() is not None
+        """The runner has a job: a Runner.Worker under its tree, or a request its live listener is taking. A request
+        left in the diag of a listener that is gone holds nothing (nothing can run it), so it never pins the gate."""
+        return self.worker() or (self.listening() and self.taking() is not None)
+
+    def listening(self) -> bool:
+        """A Runner.Listener of this runner under its tree. A failed look counts as listening."""
+        try:
+            pids, table = self.tree()
+        except Exception:  # noqa: BLE001
+            return True
+        return any(runner_worker(self.runner_dir, table[pid][1], "Listener") for pid in pids)
 
     def worker_pids(self) -> tuple[int, ...]:
         """Runner.Worker descendants, used to wake a disk hold when the job exits."""
@@ -4647,8 +4691,7 @@ class Gate:
             pids, table = self.tree()
         except Exception:  # noqa: BLE001
             return ()
-        worker = os.fspath(self.runner_dir / "bin" / "Runner.Worker")
-        return tuple(pid for pid in pids if worker in table[pid][1])
+        return tuple(pid for pid in pids if runner_worker(self.runner_dir, table[pid][1]))
 
     def job_left(self) -> bool:
         """After run.sh exited: a Runner.Worker of this runner anywhere (an orphan is no longer in tree()), or a
@@ -4658,8 +4701,7 @@ class Gate:
             table = processes()
         except Exception:  # noqa: BLE001
             return True
-        worker = os.fspath(self.runner_dir / "bin" / "Runner.Worker")
-        found = any(command == worker or command.startswith(worker + " ") for _, command in table.values())
+        found = any(runner_worker(self.runner_dir, command) for _, command in table.values())
         return found or self.taking() is not None
 
     def worker(self) -> bool:
@@ -4668,8 +4710,7 @@ class Gate:
             pids, table = self.tree()
         except Exception:  # noqa: BLE001
             return True
-        worker = os.fspath(self.runner_dir / "bin" / "Runner.Worker")
-        return any(worker in table[pid][1] for pid in pids)
+        return any(runner_worker(self.runner_dir, table[pid][1]) for pid in pids)
 
     def taking(self) -> str | None:
         """The runner request the listener has acknowledged and not finished (listener_request). An unreadable
@@ -6396,10 +6437,11 @@ def disk_pressure_detached(explicit: str | None, timeout: float = BACKGROUND_DIS
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog=PREFIX)
     p.add_argument("phase", choices=("job-started", "job-completed", "check", "listen", "take-root", "take-gui",
-                                     "admit", "release", "fits"),
+                                     "admit", "release", "fits", "busy"),
                    help="check: the eligibility gate only, read-only (no lock, no rustup change); "
                         "listen: run the runner's run.sh under the listener gate (the LaunchAgent's program); "
-                        "admit, release, fits: the build worker's ci-step admission (one JSON line each)")
+                        "admit, release, fits: the build worker's ci-step admission (one JSON line each); "
+                        "busy --runner-dir D: exit 3 when that runner is idle, 0 when it has a job or it cannot tell")
     p.add_argument("--class", dest="step_class", choices=STEP_CLASSES, help="admit: the ci-step's class")
     p.add_argument("--job-key", help="admit, release: the ci-step's key (runner name, run id and attempt)")
     p.add_argument("--runner-dir", type=Path, help="listen: the runner directory whose run.sh the gate runs")
@@ -6476,6 +6518,8 @@ def main(argv: list[str] | None = None) -> int:
         p.error(f"--gui-token must be a simple capacity token name other than {FRESH_RESERVE_TOKEN}")
     if args.parse_only:
         return 0
+    if args.phase == "busy":
+        return runner_busy_main([os.fspath(args.runner_dir)] if args.runner_dir else [])
     args.min_free_gib = runner_floor_gib(args.min_free_gib, args.gui_runner or args.session_runner)
     # the runner LaunchAgent's environment can switch sampling off fleet-wide without a reinstall
     telemetry = not args.no_telemetry and os.environ.get("GLAEDA_RUNNER_TELEMETRY", "1") != "0"

@@ -482,7 +482,7 @@ def prepare_headless(member: str, summary: dict[str, Any], manifest: dict[str, A
             # drains, so an in-flight build never sees a moving toolchain.
             f"if [ \"$(/usr/bin/xcode-select -p 2>/dev/null || true)\" != {q}/Contents/Developer ]; then "
             "if /usr/bin/pgrep -f '/actions-runner[^ ]*/bin/Runner.Listener' >/dev/null 2>&1 || "
-            "/usr/bin/pgrep -f '/actions-runner[^ ]*/bin/Runner.Worker' >/dev/null 2>&1; then "
+            "/usr/bin/pgrep -f '/actions-runner[^ ]*/bin[^/ ]*/Runner.Worker' >/dev/null 2>&1; then "
             "echo 'refusing Xcode selection change while a runner is active' >&2; exit 1; fi; "
             "fi; "
             f"if [ -d {q} ]; then "

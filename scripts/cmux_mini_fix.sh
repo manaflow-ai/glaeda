@@ -269,8 +269,49 @@ runner_launchctl() {
   esac
 }
 
+runner_idle() {  # DIR: true only when that runner has no job, as the gate and glaeda-cmux-runner decide it (a
+  # Worker under bin or a self-update's bin.<version>, or a request its live listener took). The runner's own hook
+  # answers, else the fleet copy's; with neither, or any other answer (a crash, an older hook), it has a job.
+  local hook="$1/glaeda-hooks/glaeda-cmux-runner-hook" py="$HOME/.local/bin/python3" rc=0
+  [ -x "$py" ] || py=python3
+  [ -f "$hook" ] || hook="$HOME/glaeda-runner/scripts/glaeda-cmux-runner-hook"
+  [ -f "$hook" ] || return 1
+  "$py" "$hook" busy --runner-dir "$1" >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 3 ]
+}
+
+runner_re() {  # DIR as a literal pgrep pattern
+  printf '%s' "$1" | sed 's/[][\.*^$+?(){}|]/\\&/g'
+}
+
+runner_supervisors() {  # DIR: the pgrep pattern for its listeners and what starts them (the gate, run.sh, run-helper.sh)
+  local re; re=$(runner_re "$1")
+  printf '%s' "$re/bin[^/ ]*/Runner\.Listener|listen --runner-dir $re( |\$)|$re/run(-helper)?\.sh"
+}
+
+runner_freeze() {  # DIR: SIGSTOP its listeners and their spawners until a look finds none left running; false when
+  # a signal failed or the tree kept changing (pkill 1, nothing matched, is fine)
+  local rc tries=0 pattern table matches running; pattern=$(runner_supervisors "$1")
+  while [ "$tries" -lt 5 ]; do
+    tries=$((tries + 1))
+    rc=0; pkill -STOP -f "$pattern" 2>/dev/null || rc=$?
+    [ "$rc" -le 1 ] || return 1
+    # every match stopped (state T): nothing of it can start a listener or take a job now. A ps that fails is no proof.
+    table=$(ps -axww -o stat=,command=) || return 1
+    rc=0; matches=$(printf '%s\n' "$table" | grep -E -- "$pattern") || rc=$?
+    [ "$rc" -le 1 ] || return 1  # grep's 1 is no match; anything else is a failed look
+    running=$(printf '%s\n' "$matches" | awk 'NF && $1 !~ /^T/') || return 1
+    [ -n "$running" ] || return 0
+  done
+  return 1
+}
+
+runner_thaw() {  # DIR
+  pkill -CONT -f "$(runner_supervisors "$1")" 2>/dev/null || true
+}
+
 runner_hold() {  # WAIT_SECONDS
-  local r dir plist label domain deadline
+  local r dir plist label domain deadline disabled
   mkdir -p "$(held_dir)"
   for r in "$HOME"/actions-runner*/.runner; do
     [ -f "$r" ] || continue
@@ -280,19 +321,24 @@ runner_hold() {  # WAIT_SECONDS
     domain=$(runner_domain "$plist")
     if ! runner_launchctl "$plist" print "$domain/$label" >/dev/null 2>&1; then say "unchanged: $label is not loaded"; continue; fi
     deadline=$(( $(date +%s) + $1 ))
-    while pgrep -f "$dir/bin/Runner.Worker" >/dev/null 2>&1; do
+    # the last look and the stop happen with its listener frozen, as the gate's own stop: it cannot take a job between
+    while ! { runner_freeze "$dir" && runner_idle "$dir"; }; do
+      runner_thaw "$dir"
       [ "$(date +%s)" -lt "$deadline" ] || refuse "$label is still running a job after $1 seconds; rerun once it ends"
       say "$label is running a job; waiting for it to end"
       sleep 30
     done
     : > "$(held_dir)/$(basename "$dir")"
-    if ! runner_launchctl "$plist" disable "$domain/$label"; then
+    disabled=1
+    runner_launchctl "$plist" disable "$domain/$label" || disabled=
+    [ -z "$disabled" ] || runner_launchctl "$plist" bootout "$domain/$label" 2>/dev/null || true
+    runner_thaw "$dir"  # gone after the bootout, else thawed
+    if [ -z "$disabled" ]; then
       case "$plist" in
         /Library/LaunchDaemons/*) say "marked $label held; launchd disable was refused, the listener gate remains active"; continue ;;
         *) refuse "could not disable $label" ;;
       esac
     fi
-    runner_launchctl "$plist" bootout "$domain/$label" 2>/dev/null || true
     case "$plist" in
       /Library/LaunchDaemons/*) say "held $label; the headless listener gate remains active"; continue ;;
     esac
