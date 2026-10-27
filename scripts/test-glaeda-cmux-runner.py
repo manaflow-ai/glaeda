@@ -6779,6 +6779,51 @@ class GateTest(unittest.TestCase):
             lsof.assert_not_called()
         self.assertEqual(stops, [])
 
+    def test_a_waiter_refusal_on_the_mini_brings_the_waiter_reading_forward(self) -> None:
+        """cmux-austin-mini-0, 2026-10-27: job-started refused a job at 17:48:12 for a fleet waiter, after 766 s in
+        the capacity wait; the gate had read no waiter during the job (its 30 s cadence), so the runner took a
+        nightly verify at 17:49:29 and refused it too, and stopped only at 17:49:50. Now job-started's refusal notes
+        it in the mini's state dir, and every gate reads the waiters at its next poll."""
+        self.state.mkdir(parents=True, exist_ok=True)
+        gate, stops = self.gate([None] * 3, busy=[True, True])
+        gate.worker_pids = lambda: [4242]
+        with mock.patch.object(hook, "host_waiters", side_effect=[set(), {77}, {77}]) as lsof:
+            gate.step()  # the job waits for capacity; no waiter yet
+            self.assertEqual(lsof.call_count, 1)
+            hook.refused_note(self.state, 4242).touch()
+            hook.note_waiter_refusal(self.state, "a fleet build is waiting for the host (pid 77)")
+            gate.step()  # within GATE_WAITER_EVERY_S, but the note makes it look now
+            self.assertEqual(lsof.call_count, 2)
+            self.assertEqual(gate.watching, (4242,), "the refused job's worker is watched")
+            gate.step()  # the worker exited: still_waiting reads again and stops
+        self.assertEqual(stops, ["a fleet build is waiting for the host (pid 77)"])
+
+    def test_the_waiter_note_counts_once_and_only_for_waiter_refusals(self) -> None:
+        self.state.mkdir(parents=True, exist_ok=True)
+        hook.note_waiter_refusal(self.state, "capacity: 1 of 10 units free")
+        hook.note_waiter_refusal(self.state, "host reserved by someone")
+        self.assertIsNone(hook.waiter_seen_stamp(self.state))
+        gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+        gate.waiting_at = time.monotonic()
+        self.assertFalse(gate.waiters_due())
+        hook.note_waiter_refusal(self.state, "a fleet build is waiting for the host (pid 77)")
+        self.assertIsNotNone(hook.waiter_seen_stamp(self.state))
+        self.assertTrue(gate.waiters_due(), "a new refusal brings the reading forward")
+        self.assertFalse(gate.waiters_due(), "once per refusal, then the cadence again")
+        later = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+        later.waiting_at = time.monotonic()
+        self.assertFalse(later.waiters_due(), "a gate started after the note does not take it as new")
+        hook.note_waiter_refusal(self.state, "a fleet build is waiting for the host (pid 78)")
+        self.assertTrue(later.waiters_due())
+        self.assertTrue(gate.waiters_due())
+
+    def test_job_started_notes_a_waiter_refusal_in_the_state_dir(self) -> None:
+        # take_capacity's waiter refusal and the gate's reason share one prefix, which the note keys on.
+        self.assertTrue(f"{hook.WAITER_REFUSAL} (pid 1)".startswith("a fleet build is waiting for the host"))
+        source = HOOK.read_text()
+        self.assertIn("note_waiter_refusal(args.state_dir, why)", source)
+        self.assertIn('return False, f"{WAITER_REFUSAL} (pid {waiting[0]})"', source)
+
     def test_a_job_under_the_disk_floor_wakes_the_gate_when_its_worker_exits(self) -> None:
         import threading
         gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)

@@ -1126,6 +1126,12 @@ GATE_WAITER_WAIVE_S = float(os.environ.get("GLAEDA_RUNNER_GATE_WAITER_WAIVE_S") 
 # that ran holds it far longer.
 GATE_WAITER_GAP_S = 10 * 60.0
 WAITER_SPANS_FILE = "fleet-waiter-spans.json"  # in the state dir, shared by every runner's gate and job-started
+# job-started touches this in the mini's state dir when it refuses a job for a fleet build waiting for the host. Every
+# gate on the mini reads the host's waiters at its next poll instead of after GATE_WAITER_EVERY_S, so no listener takes
+# another job only to refuse it (2026-10-27, cmux-austin-mini-0: a job refused at 17:48:12 after 766 s in the capacity
+# wait, and the same runner took and refused a nightly verify at 17:49:29; its gate stopped only at 17:49:50).
+WAITER_SEEN_FILE = "fleet-waiter-seen"
+WAITER_REFUSAL = "a fleet build is waiting for the host"
 WAITER_SPANS_LOCK_S = 2.0  # waiting for another reader's update; past it every waiter is honoured
 GATE_MAX_FAILURES = 5  # consecutive failed polls before the gate hands the runner back
 GATE_FALLBACK = 70  # listen.sh runs run.sh itself: the gate broke before any runner started
@@ -3639,7 +3645,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
             if waiting:  # flock has no writer preference: stop admitting so the build worker gets in
                 # This must not be a retryable capacity refusal: a draining fleet
                 # worker waits for our parent Runner.Worker to exit before claiming.
-                return False, f"a fleet build is waiting for the host (pid {waiting[0]})"
+                return False, f"{WAITER_REFUSAL} (pid {waiting[0]})"
         taken: list[str] = []
         named: dict[str, int] = {}
         warm_for = warm_note = ""
@@ -4798,6 +4804,7 @@ class Gate:
         self.waiting: set[int] = set()
         self.job_waited = False  # a fleet build was waiting, or the host was reserved, at the last poll of a job
         self.waiting_at = -GATE_WAITER_EVERY_S
+        self.waiter_seen = waiter_seen_stamp(state_dir)  # the last job-started waiter refusal this gate acted on
         self.worker_noted = False
         self.defer_noted = False  # stop() said once that it kept a listener taking a job
         self.source = source_identity()
@@ -4896,7 +4903,7 @@ class Gate:
             # load and heat never hold it off, only what would fail its job here (disk, a missing Rust toolchain)
             return self.low_disk() or self.dedicated_toolchain()
         why = host_held(self.host_lock, self.reservation, time.time(), self.state_dir)
-        if why is None and self.waiters and time.monotonic() - self.waiting_at >= GATE_WAITER_EVERY_S:
+        if why is None and self.waiters and self.waiters_due():
             self.waiting, self.waiting_at = host_waiters(self.host_lock, self.state_dir), time.monotonic()
         if why is None and self.waiting:
             why = f"a fleet build is waiting for the host (pid {min(self.waiting)})"
@@ -4905,6 +4912,16 @@ class Gate:
             self.yield_to_fleet()
         return (why or self.shed(self.saturated()) or self.full() or self.shed(self.hot()) or self.locked()
                 or self.low_disk() or self.ineligible())
+
+    def waiters_due(self) -> bool:
+        """Time to read the host's waiters: GATE_WAITER_EVERY_S since the last reading, or a job-started on this
+        mini refused a job for a waiter since this gate last looked (WAITER_SEEN_FILE). The note only brings the
+        reading forward; the reading, and confirmed()'s second one before a stop, still decide."""
+        stamp = waiter_seen_stamp(self.state_dir)
+        if stamp is not None and stamp != self.waiter_seen:
+            self.waiter_seen = stamp
+            return True
+        return time.monotonic() - self.waiting_at >= GATE_WAITER_EVERY_S
 
     def yield_to_fleet(self) -> None:
         """A fleet build waiting for the host lock waits for every holder, the idle catch-up's shared hold
@@ -5455,7 +5472,7 @@ class Gate:
                 # ends: with a queue behind the label the next job comes before two idle polls, and each is
                 # refused (cmux10s, 2026-10-14: 14 PR jobs in two minutes under a soak's reservation). A job
                 # job-started refused ends in seconds, so its worker is watched; any other is seen on a poll.
-                if self.waiters and time.monotonic() - self.waiting_at >= GATE_WAITER_EVERY_S:
+                if self.waiters and self.waiters_due():
                     self.waiting, self.waiting_at = host_waiters(self.host_lock, self.state_dir), time.monotonic()
                 reserved = self.still_reserved()
                 self.job_waited = bool(self.waiting) or reserved is not None
@@ -5613,6 +5630,28 @@ def listen(runner_dir: Path, host_lock: str, reservation: str, state_dir: Path, 
         if not gate.terminating:
             gate.sweep()
         time.sleep(GATE_POLL_S if not gate.terminating else 0.5)
+
+
+def waiter_seen_stamp(state_dir: Path) -> int | None:
+    """WAITER_SEEN_FILE's mtime (ns), or None when there is none."""
+    try:
+        return (state_dir / WAITER_SEEN_FILE).stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def note_waiter_refusal(state_dir: Path, why: str) -> None:
+    """After job-started refused for a fleet waiter: touch WAITER_SEEN_FILE so every gate here reads the waiters at
+    its next poll (Gate.waiters_due). Never raises; a note it cannot write leaves the gates on their cadence."""
+    if not why.startswith(WAITER_REFUSAL):
+        return
+    with contextlib.suppress(OSError):
+        state_dir.mkdir(parents=True, exist_ok=True)
+        path = state_dir / WAITER_SEEN_FILE
+        try:  # one stamp per refusal: a new file's creation, else one utime (APFS keeps nanoseconds)
+            os.utime(path)
+        except FileNotFoundError:
+            os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644))
 
 
 def refused_note(state_dir: Path, worker: int) -> Path:
@@ -7340,6 +7379,7 @@ def main(argv: list[str] | None = None) -> int:
                 with contextlib.suppress(OSError):
                     args.state_dir.mkdir(parents=True, exist_ok=True)
                     refused_note(args.state_dir, worker).touch()
+            note_waiter_refusal(args.state_dir, why)
             if telemetry:
                 with contextlib.suppress(Exception):  # observation never hides or changes a refusal
                     job_event("refused", job_meta(repo, args.home_repo), args.job_log, decision=why[:400],
