@@ -4122,12 +4122,22 @@ def listen_fit_units(runner_dir: Path) -> int:
 DEDICATED_ADMIT_TIMEOUT_S = 600
 
 
-def dedicated_admission(script: Path) -> tuple[bool, str]:
-    """(admitted, note) from a dedicated runner's own admission script, run with the job's environment and output.
-    It holds nothing of glaeda's (no host lock, capacity or root), so the runners beside it never wait for it."""
+# The runner's disk floor (--min-free-gib, the manifest's runner.dedicated minFreeGib) as the admission script sees it,
+# so a builder that checks free disk reads the same number the listener gate holds the runner off under.
+DEDICATED_FLOOR_ENV = "GLAEDA_MIN_FREE_GIB"
+
+
+def dedicated_admission(script: Path, min_free_gib: float = 0.0) -> tuple[bool, str]:
+    """(admitted, note) from a dedicated runner's own admission script, run with the job's environment and output,
+    plus DEDICATED_FLOOR_ENV when the runner has a disk floor. It holds nothing of glaeda's (no host lock, capacity or
+    root), so the runners beside it never wait for it."""
+    env = dict(os.environ)
+    env.pop(DEDICATED_FLOOR_ENV, None)
+    if min_free_gib > 0:
+        env[DEDICATED_FLOOR_ENV] = f"{min_free_gib:g}"
     try:
         code = subprocess.run([os.fspath(script)], stdin=subprocess.DEVNULL, timeout=DEDICATED_ADMIT_TIMEOUT_S,
-                              cwd=JOB_CWD, check=False).returncode
+                              cwd=JOB_CWD, env=env, check=False).returncode
     except (OSError, subprocess.TimeoutExpired) as error:
         return False, f"the dedicated runner's admission {script.name} could not run ({type(error).__name__})"
     if code != 0:
@@ -7383,6 +7393,10 @@ def main(argv: list[str] | None = None) -> int:
     args.min_free_gib = runner_floor_gib(args.min_free_gib, args.gui_runner or args.session_runner)
     # the floor a job is refused under, after eviction (DISK_JOB_PEAK_GIB); a tour runner's floor is cmux's measure
     admit_floor = admit_floor_gib(args.min_free_gib, args.gui_runner or args.session_runner)
+    if args.dedicated_admit:
+        # a dedicated runner's floor is its builder's own (runner.dedicated minFreeGib): never capped at one job's
+        # measured growth, so the hook refuses where the builder would, and the gate holds the runner off there
+        admit_floor = args.min_free_gib
     # the runner LaunchAgent's environment can switch sampling off fleet-wide without a reinstall
     telemetry = not args.no_telemetry and os.environ.get("GLAEDA_RUNNER_TELEMETRY", "1") != "0"
 
@@ -7634,7 +7648,7 @@ def main(argv: list[str] | None = None) -> int:
                 with contextlib.suppress(OSError):
                     marker.unlink()
         elif args.dedicated_admit:
-            held, note = dedicated_admission(args.dedicated_admit)
+            held, note = dedicated_admission(args.dedicated_admit, args.min_free_gib)
         else:
             with contextlib.suppress(OSError):  # a crashed job's record must not show in this job's log lines
                 roots_file(args.state_dir).unlink(missing_ok=True)

@@ -961,15 +961,18 @@ class HookTest(unittest.TestCase):
 
     def test_the_gui_and_session_runners_refuse_under_the_floor_a_cmux_next_tour_needs(self) -> None:
         """job-started holds the runners that take cmux-next tours to cmux's tour-requirements.json floor (vendored
-        as CMUX_TOUR_REQUIREMENTS), above a lower --min-free-gib, and leaves the other runners on theirs."""
+        as CMUX_TOUR_REQUIREMENTS), above a lower --min-free-gib, and leaves the other runners on theirs. A dedicated
+        runner refuses under its whole --min-free-gib (its builder's floor), not the per-job cap."""
         self.fleet()
         tour = hook.CMUX_TOUR_REQUIREMENTS["min_free_gib"]
         push = event(self.dir, "push", {"repository": CMUX})
         env = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0",
                "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"),
                "GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": os.fspath(push), "GITHUB_REPOSITORY": "manaflow-ai/cmux"}
+        admit = make_executable(self.dir / "admit.sh", "#!/bin/sh\nexit 0\n")
+        # a dedicated runner's floor is its builder's: never capped at one job's growth
         for role, floor in (([], min(tour - 10, hook.DISK_JOB_PEAK_GIB)), (["--gui-runner"], tour),
-                            (["--session-runner"], tour)):
+                            (["--session-runner"], tour), (["--dedicated-admit", os.fspath(admit)], tour - 10)):
             with self.subTest(role=role):
                 floors: list[float] = []
                 with mock.patch.dict(os.environ, env, clear=True), \
@@ -10569,6 +10572,10 @@ class DedicatedRunnerTest(unittest.TestCase):
                                ({"name": "x-glaeda"}, "pool instance"), ({"name": "x-glaeda-2"}, "pool instance"),
                                ({"env": {"lower": "x"}}, "env"),
                                ({"surprise": 1}, "unknown keys"), ({"group": "g"}, "group goes with org"),
+                               ({"minFreeGib": 0}, "minFreeGib"), ({"minFreeGib": "40"}, "minFreeGib"),
+                               ({"minFreeGib": True}, "minFreeGib"), ({"minFreeGib": float("inf")}, "minFreeGib"),
+                               ({"minFreeGib": 20000}, "minFreeGib"), ({"minFreeGib": 10 ** 1000}, "minFreeGib"),
+                               ({"minFreeGib": float("nan")}, "minFreeGib"),
                                ({"labels": ["x", "glaeda-std-xcode-26.6".upper()]}, "pool labels"),
                                ({"labels": ["glaeda-std-xcode-26.6"]}, "pool labels")):
             with self.subTest(change):
@@ -10580,6 +10587,32 @@ class DedicatedRunnerTest(unittest.TestCase):
         headless["hosts"]["mini-std"]["gui"] = False
         _, why = fleet_labels.dedicated_runners(headless, "mini-std")
         self.assertIn("gui: false", why or "")
+
+    def test_an_entry_floor_is_the_runner_floor_and_the_admission_sees_it(self) -> None:
+        """A builder that needs more free disk than the member's floor declares minFreeGib: the dedicated runner's
+        --min-free-gib is that, so its listener gate holds it off under the builder's floor (the job goes to the
+        next pool) instead of the builder refusing a job the runner already took at runner setup."""
+        good, why = fleet_labels.dedicated_runners(dedicated_manifest(NIGHTLY), "mini-std")
+        self.assertIsNone(why)
+        self.assertIsNone(good[0]["minFreeGib"])
+        good, why = fleet_labels.dedicated_runners(dedicated_manifest({**NIGHTLY, "minFreeGib": 40}), "mini-std")
+        self.assertIsNone(why)
+        self.assertEqual(good[0]["minFreeGib"], 40.0)
+        fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            receipt = self.invoke("--apply", "--manifest", self.manifest({**NIGHTLY, "minFreeGib": 40}),
+                                  "--member", "mini-std", "--dedicated", "nightly-next")
+        self.assertTrue(receipt["ready"], receipt["blocking"])
+        runner = self.home / "actions-runner-glaeda-nightly-next"
+        self.assertEqual(hook.runner_scope(runner).min_free_gib, 40.0)
+        # the admission script reads the same floor, and never one inherited from the hook's own environment
+        script = make_executable(self.home / "floor.sh", f"#!{sys.executable}\nimport os, sys\n"
+                                 "sys.exit(0 if os.environ.get('GLAEDA_MIN_FREE_GIB') == '40' else 7)\n")
+        absent = make_executable(self.home / "absent.sh", f"#!{sys.executable}\nimport os, sys\n"
+                                 "sys.exit(0 if 'GLAEDA_MIN_FREE_GIB' not in os.environ else 7)\n")
+        with mock.patch.dict(os.environ, {"GLAEDA_MIN_FREE_GIB": "1"}):
+            self.assertTrue(hook.dedicated_admission(script, 40.0)[0])
+            self.assertTrue(hook.dedicated_admission(absent)[0])
 
     def test_install_registers_exactly_its_labels_with_its_own_admission_and_watch(self) -> None:
         fake_pw = mock.Mock(pw_dir=os.fspath(self.home))

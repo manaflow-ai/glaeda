@@ -2589,8 +2589,9 @@ def dedicated_context(ctx: Context, args: argparse.Namespace, manifest: Any) -> 
     ctx.labels, ctx.labels_requested = list(entry["labels"]), True
     ctx.capacity_units = 0  # never in the mini's capacity ledger: its jobs are the builder's, admitted by its hook
     if not args.min_free_gib:
+        # the entry's own floor (its builder's), else the member's disk.min_free_gib
         summary, _ = fleet_labels().member_labels(manifest, args.member, lambda app: True)
-        ctx.min_free_gib = float((summary or {}).get("minFreeGib") or 0)
+        ctx.min_free_gib = float(entry.get("minFreeGib") or (summary or {}).get("minFreeGib") or 0)
     return None
 
 
@@ -2791,7 +2792,7 @@ def install_or_uninstall(ctx: Context, args: argparse.Namespace, raw_argv: list[
             ctx.member = kept
             if not args.capacity_units:
                 ctx.capacity_units = int(kept.get("capacityUnits") or 0)
-            if not args.min_free_gib:
+            if not args.min_free_gib and dedicated_of(ctx) is None:
                 ctx.min_free_gib = float(kept.get("minFreeGib") or 0)
             # and its role: the fast runner's and the gui runner's hooks stay theirs
             fast, gui, session = member_roles(kept, ctx.instance)
