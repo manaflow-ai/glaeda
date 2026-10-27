@@ -8108,8 +8108,7 @@ class BrokerAnswerCacheTest(BrokerBase):
         self.assertEqual(out, "answer 3\n")
 
     def test_uncacheable_reads_go_straight_to_gh(self) -> None:
-        for args in (["api", "graphql", "-f", "query=query{viewer{login}}"],
-                     ["api", "-i", "repos/o/r/pulls/7"],
+        for args in (["api", "-i", "repos/o/r/pulls/7"],
                      ["api", "--verbose", "repos/o/r/pulls/7"],
                      ["api", "repos/{owner}/{repo}/branches/{branch}"],
                      ["api", "rate_limit"],
@@ -8361,6 +8360,70 @@ class RunnersTest(BrokerBase):
         self.assertIn("repos/o/r/actions/runners?per_page=100", ran.call_args[0][0])
         with self.assertRaises(gg.WatchError):
             gg.cmd_runners("not a scope", None, False)
+
+
+class BrokerGraphqlCacheTest(BrokerBase):
+    """A `gh api graphql` query is kept like a GET, keyed on the query and its variables."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        os.environ["GLAEDA_GH_CACHE_TTL"] = "60"
+        self.count = self.home / "count"
+        gh = self.home / "bin" / "gh"
+        gh.write_text("#!/bin/sh\n"
+                      f"n=$(($(cat {self.count} 2>/dev/null || echo 0) + 1)); echo $n > {self.count}\n"
+                      "echo \"answer $n\"\n")
+        gh.chmod(0o755)
+
+    def runs(self) -> int:
+        return int(self.count.read_text()) if self.count.exists() else 0
+
+    Q = "query=query($id:ID!,$after:String){node(id:$id){... on Workflow{runs(first:50,after:$after){nodes{databaseId}}}}}"
+
+    def test_the_same_page_is_read_once_whatever_the_flag_order(self) -> None:
+        first = self.run_gh(["api", "graphql", "-f", self.Q, "-f", "id=W1", "-f", "after=C1"])
+        second = self.run_gh(["api", "graphql", "-f", "after=C1", "-f", self.Q, "-f", "id=W1"])
+        third = self.run_gh(["api", "graphql", "--raw-field=after=C1", "-f", self.Q, "-fid=W1"])
+        self.assertEqual((first[1], second[1], third[1], self.runs()), ("answer 1\n",) * 3 + (1,))
+        self.assertEqual((first[3], second[3], third[3]), (None, None, None))
+
+    def test_another_page_or_variable_kind_is_another_question(self) -> None:
+        self.run_gh(["api", "graphql", "-f", self.Q, "-f", "id=W1", "-f", "after=C1"])
+        self.run_gh(["api", "graphql", "-f", self.Q, "-f", "id=W1", "-f", "after=C2"])
+        self.run_gh(["api", "graphql", "-f", self.Q, "-f", "id=W2", "-f", "after=C1"])
+        self.run_gh(["api", "graphql", "-f", self.Q, "-F", "id=W1", "-f", "after=C1"])
+        self.run_gh(["api", "graphql", "-f", self.Q, "-f", "id=W1", "-f", "after=C1", "--jq", ".data"])
+        self.assertEqual(self.runs(), 5)
+
+    def test_a_mutation_is_a_write_and_clears_every_answer(self) -> None:
+        read = ["api", "graphql", "-f", self.Q, "-f", "id=W1"]
+        self.run_gh(read)
+        mutation = ["api", "graphql", "-f", "query=mutation{addComment(input:{}){clientMutationId}}"]
+        self.run_gh(mutation)
+        self.run_gh(mutation)
+        _code, out, _err, _ = self.run_gh(read)
+        self.assertEqual((out, self.runs()), ("answer 4\n", 4))
+
+    def test_a_repeated_field_keeps_its_order(self) -> None:
+        self.run_gh(["api", "graphql", "-f", "query=query{a}", "-f", "query=query{b}"])
+        self.run_gh(["api", "graphql", "-f", "query=query{b}", "-f", "query=query{a}"])
+        self.run_gh(["api", "graphql", "-f", self.Q, "-f", "ids[]=1", "-f", "ids[]=2"])
+        self.run_gh(["api", "graphql", "-f", self.Q, "-f", "ids[]=2", "-f", "ids[]=1"])
+        self.assertEqual(self.runs(), 4)
+
+    def test_a_branch_placeholder_in_a_field_is_never_kept(self) -> None:
+        args = ["api", "graphql", "-f", self.Q, "-F", "ref={branch}"]
+        self.run_gh(args)
+        _code, _out, _err, passed = self.run_gh(args)
+        self.assertEqual(passed, args, "exec'd every time: the checked-out branch is not on the line")
+
+    def test_a_query_from_a_file_is_never_kept(self) -> None:
+        for args in (["api", "graphql", "-F", "query=@q.graphql"], ["api", "graphql", "--input", "q.json"]):
+            with self.subTest(args=args):
+                before = self.runs()
+                self.run_gh(args)
+                self.run_gh(args)
+                self.assertEqual(self.runs(), before + 2)
 
 
 class BrokerAnswerCacheReviewTest(BrokerBase):

@@ -5625,7 +5625,8 @@ def broker_plan(args: list[str], now: float) -> tuple[str, str | None, str | Non
 # keyed on the exact arguments plus everything else that can change what gh prints, and hands an
 # identical call the same bytes for GH_CACHE_TTL seconds.
 #
-# Only reads are kept (`pr view`, `run view`, and `gh api` GET), only answers that exited 0, only
+# Only reads are kept (`pr view`, `run view`, `gh api` GET, and a `gh api graphql` query -- never a
+# mutation -- keyed on its query text and variables in any order), only answers that exited 0, only
 # from a stdout that is not a terminal (gh prints a person a different shape), and never a
 # `--web` or `--watch`. Any call that might write -- every subcommand not on GH_CACHE_PURE, every
 # non-GET `gh api`, and a GraphQL call carrying a mutation -- stamps the time for its repository
@@ -5751,9 +5752,14 @@ def gh_cache_key(args: list[str], words: list[str], values: dict[str, str], seen
             or any(os.environ.get(name) for name in GH_CACHE_DEBUG_ENV):
         return None
     head = tuple(words[:2])
-    if head[:1] == ("api",):
-        if method != "GET" or len(words) < 2 or BROKER_FREE_RE.match(words[1]) \
-                or AUDIT_GRAPHQL_RE.match(words[1]):
+    graphql = head[:1] == ("api",) and len(words) > 1 and bool(AUDIT_GRAPHQL_RE.match(words[1]))
+    if graphql:
+        # A GraphQL read is a POST, so the method says nothing: the query does. gh_cache_is_write
+        # calls a mutation, or a body read from a file, a write; anything else is a read.
+        if gh_cache_is_write(args, words, method):
+            return None
+    elif head[:1] == ("api",):
+        if method != "GET" or len(words) < 2 or BROKER_FREE_RE.match(words[1]):
             return None
     elif head not in GH_CACHE_READS or len(words) < 3:
         return None  # `pr view` with no target reads the checked-out branch, which is not on the line
@@ -5774,9 +5780,41 @@ def gh_cache_key(args: list[str], words: list[str], values: dict[str, str], seen
         resolved = broker_repo(values)
         if resolved is None:
             return None
-    ident = [args, resolved, os.environ.get("GH_REPO") or "", os.environ.get("GH_HOST") or "",
+    # A GraphQL question is its query and variables, in whatever order the flags came: two
+    # scripts asking for the same page share one answer.
+    question = gh_cache_graphql_question(args) if graphql else args
+    ident = [question, resolved, os.environ.get("GH_REPO") or "", os.environ.get("GH_HOST") or "",
              gh_cache_identity(real)]
     return hashlib.sha256(json.dumps(ident).encode()).hexdigest()[:40]
+
+
+GH_CACHE_FIELD_FLAGS = {"-f": "f", "--raw-field": "f", "-F": "F", "--field": "F"}
+
+
+def gh_cache_graphql_question(args: list[str]) -> list:
+    """[fields as `f:name=value` / `F:name=value`, every other argument in order]. The kind stays in
+    each field because `-F n=1` sends a number and `-f n=1` a string."""
+    fields, other, i = [], [], 0
+    while i < len(args):
+        arg = args[i]
+        name, eq, value = arg.partition("=")
+        if arg in GH_CACHE_FIELD_FLAGS and i + 1 < len(args):
+            fields.append(f"{GH_CACHE_FIELD_FLAGS[arg]}:{args[i + 1]}")
+            i += 2
+            continue
+        if eq and name in ("--raw-field", "--field"):
+            fields.append(f"{GH_CACHE_FIELD_FLAGS[name]}:{value}")
+        elif arg[:2] in ("-f", "-F") and len(arg) > 2:
+            fields.append(f"{arg[1]}:{arg[2:]}")
+        else:
+            other.append(arg)
+        i += 1
+    # gh keeps the last of a repeated field and sends `name[]` fields as an array in order, so a field
+    # name that repeats makes the order part of the question: sorted only when every name is unique.
+    names = [f[2:].partition("=")[0] for f in fields]
+    if len(set(names)) == len(names) and not any(n.endswith("[]") for n in names):
+        fields = sorted(fields)
+    return [fields, other]
 
 
 def gh_cache_writes() -> dict[str, float]:
