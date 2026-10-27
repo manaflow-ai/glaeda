@@ -216,6 +216,9 @@ JOB_CLASSES = {"macos-compile-admission": "compile", "app-host-unit-tests": "gui
 # minis first") compiles the universal Release app into its own workspace (build-universal, cleared at job
 # start) and restores its own compile cache lineage: no canonical root, no kept DerivedData, no GUI. As an
 # unknown id it would take the compile class and hold the root a seed on the same mini waits for.
+# nightly.yml's `build-nightly-ghostty-cli-helper` (cmux: owned macOS 26 instead of macOS 15) runs Zig in the
+# workspace's ghostty/ with its own Zig and helper caches under $HOME: no canonical root, Xcode DerivedData or GUI.
+# It takes the light class (no token) at its measured cores (JOB_CORES), not a whole isolated slot.
 # cmux-tui's `cdp-browser-smoke` drives a headless Playwright Chromium from cargo tests in the workspace: no
 # console session or canonical root. Its `macos-relay` job runs the chatmux-relay Rust tests in the workspace
 # and has the same no-root contract. reload-build's `build` is a Debug build of the dev app (or the iOS app)
@@ -257,6 +260,7 @@ WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "
                         ("test-e2e.yml", "build"): "compile-gui", ("test-e2e.yml", "test"): "gui-step",
                         ("seed-derived-data.yml", "seed"): "seed",
                         ("nightly.yml", "build-nightly-app"): "isolated",
+                        ("nightly.yml", "build-nightly-ghostty-cli-helper"): "light",
                         ("cmux-next.yml", "swift-test"): "isolated", ("cmux-next.yml", "release-compile"): "isolated",
                         ("cmux-next.yml", "cmux-scheme-compile"): "isolated",
                         # Fleet gateway clients (runs-on vars.CI_COMPILE_CHECK_GATEWAY): `cmux-ci compile-check`
@@ -344,6 +348,9 @@ JOB_CORES: dict[tuple[str, ...], int] = {
     ("ci.yml", "remote-daemon-macos-tests"): 1,  # light: 52, 0.36/0.55/0.67
     ("ci.yml", "claude-wrapper"): 1,  # light: 48, 0.11/0.32/0.37
     ("ci.yml", "release-build"): 3,  # isolated: 28, 1.92/2.04/2.08
+    # No mini telemetry yet (it ran on Blacksmith macOS 15): its cold universal build on an owned macOS 26 mini
+    # measured 422 s user + 46 s sys over 133 s wall, 3.51 cores (2026-10-27); a helper cache hit is near 0.
+    ("nightly.yml", "build-nightly-ghostty-cli-helper"): 4,
     ("manaflow-ai/cmuxterm-hq", "build-fleet-go.yml", "test"): 1,  # guest isolated: 919, 0.24/0.42/0.52
 }
 

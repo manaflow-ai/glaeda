@@ -3301,6 +3301,9 @@ time.sleep(60)
         # the nightly app build compiles in its own workspace: no root a seed on the trusted mini waits for
         self.assertEqual(hook.job_class("build-nightly-app", home, home, "nightly.yml"), ("isolated", False))
         self.assertEqual(hook.job_class("build-nightly-app", home, home, "other.yml"), ("compile", True))
+        # the nightly Ghostty helper runs Zig in its workspace: light (no root), sized by its measured cores
+        self.assertEqual(hook.job_class("build-nightly-ghostty-cli-helper", home, home, "nightly.yml"), ("light", False))
+        self.assertEqual(hook.job_units("light", "build-nightly-ghostty-cli-helper", home, home, "nightly.yml"), 4)
         self.assertEqual(hook.job_class("rerun", home, home, "app-host-test-rerun.yml"), ("gui", False))
         self.assertEqual(hook.job_class("cdp-browser-smoke", home, home, "cmux-tui.yml"), ("isolated", False))
         # cmux-tui's macOS relay lane only runs chatmux-relay Rust tests in the workspace: no root or GUI token.
