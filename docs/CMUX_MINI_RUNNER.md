@@ -544,7 +544,7 @@ NEXT's feed compiles from `cmux-next.yml` on `feat-cmux-next`:
 `release-compile` that gates the nightly-next promotion.
 
 DEV and ordinary jobs share the capacity ledger, but while the slot is idle its
-gate holds `capacity/fresh.reserve`, which keeps `FRESH_RESERVE_UNITS` (4, one
+gate holds `capacity/fresh.reserve`, which keeps `FRESH_RESERVE_UNITS` (3, one
 release-compile) from every other job and runner gate on the mini, like the gui
 runner's one-unit reserve. PR jobs beside it drain off those units instead of
 refilling them, so the slot keeps listening for the next feed compile; the slot
@@ -849,8 +849,8 @@ in at the producer's root. So one root job per root per mini:
   key names the root, so the job holds that root itself with `glaeda-canonical-root take <root>` before
   it clears it. On a trusted mini with 2 runners, 14 units and `canonicalRoots` 2, two seeds (one per
   root) run at once; with one runner nothing changes.
-- The nightly app build (nightly.yml's `build-nightly-app`, trusted runners only) is isolated: 4 units,
-  no token. It compiles into its own workspace, so it never holds a root a seed on the same mini waits for.
+- The nightly app build (nightly.yml's `build-nightly-app`, trusted runners only) is isolated: no token, and 3
+  units, its measured p75 cores (`JOB_CORES`). It compiles into its own workspace, so it never holds a root a seed on the same mini waits for.
 - `defaults.runner.classes.<class>.canonicalRoots` (default 1, at most `runners`) runners per mini
   (instances 0 and up) also carry the root pool label `glaeda-root-<class>-xcode-<version>`. Root jobs
   should run on that label, so GitHub queues them until a root runner is free instead of handing one to a

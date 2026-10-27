@@ -336,6 +336,11 @@ JOB_CORES: dict[tuple[str, ...], int] = {
     ("cmux-next-pr-autofix.yml", "action-exports"): 6,  # isolated: 373, 4.74/5.43/5.95
     ("cmux-next-base-autofix.yml", "action-exports"): 6,  # isolated: 254, 3.74/5.14/5.81
     ("cmux-next.yml", "cmux-scheme-compile"): 3,  # isolated: 619, 2.28/2.60/2.93
+    # The Release compiles, from cmuxterm-hq build-fleet/data jobs.csv, successful jobs 2026-10-01 to 10-26 (n,
+    # p50/p75/p90 cores): Leo, 2026-10-26: "COMPILES SHOULDNT NEED A PURE EMPTY FUCKING MACHINE JUST MEASURE IT
+    # WE'VE ALREADY MEASURED IT". Both had the isolated class's 4.
+    ("cmux-next.yml", "release-compile"): 3,  # isolated: 6061, 2.57/2.96/3.28
+    ("nightly.yml", "build-nightly-app"): 3,  # isolated: 341, 1.79/2.20/2.47
     ("cmux-next-media.yml", "tour"): 2,  # isolated: 618, 1.06/1.73/2.36
     ("cmux-tui.yml", "macos"): 6,  # compile (an unknown job): 692, 4.91/5.53/6.11
     ("cmux-tui.yml", "build"): 2,  # isolated: 475, 1.36/1.46/1.53
@@ -400,14 +405,14 @@ GUI_RESERVE_UNITS = 1
 # The freshness slot's reserve: the DEV compile runner (--dev-compile-runner, the glaeda-dev-* label, which only
 # cmux NEXT's feed compiles target: a feat-cmux-next push's Release compile and DEV compile, a DEV daily's) holds
 # capacity/fresh.reserve the same way while it is idle, for FRESH_RESERVE_UNITS, the costlier of those jobs
-# (release-compile is isolated, 4; cmux-scheme-compile 3). Without it the slot shared the mini's units with the PR
+# (their JOB_CORES: 3 each). Without it the slot shared the mini's units with the PR
 # side runners beside it: on 2026-10-26 from 23:53Z both DEV runners were held off as full while PR jobs filled
 # their minis, and a feat-cmux-next push's nightly-next promote compile queued 30+ min on the shared side label
 # behind 21 PR jobs. With the reserve, PR jobs on that mini drain off those units instead of refilling them, so the
 # slot is listening for the next feed compile; cmux's placement takes it only while idle and otherwise falls back
 # to the side label and Blacksmith, so the reservation never makes a job wait on it.
 FRESH_RESERVE_TOKEN = "fresh"
-FRESH_RESERVE_UNITS = 4
+FRESH_RESERVE_UNITS = max(JOB_CORES[("cmux-next.yml", job)] for job in ("cmux-scheme-compile", "release-compile"))
 UNITS_FULL = "capacity units on this mini"  # in mini_full's answers that are about units (Gate.reserves)
 
 
@@ -5404,6 +5409,9 @@ class JobSamples:
         self.disk_sum = self.disk_max = 0.0
         self.busies = 0
         self.busy_sum = 0.0
+        # free GiB on the disk the floor checks (--min-free-gib), at admission and at the end: what a job wrote
+        self.disk_free_start: float | None = None
+        self.disk_free_end: float | None = None
 
     def add(self, load: float | None, split: tuple[float, float, float, dict[str, float], dict[str, float]],
             interval: float, queue: tuple[int, int] | None = None, disk: float | None = None,
@@ -5472,6 +5480,8 @@ class JobSamples:
             "other_runner_jobs": [{"runner": k, "core_seconds": round(v)}
                                   for k, v in sorted(self.runners_by.items(), key=lambda kv: -kv[1])[:8]],
             "thermal_limited": self.thermal,
+            "disk_free_start_gib": None if self.disk_free_start is None else round(self.disk_free_start, 1),
+            "disk_free_end_gib": None if self.disk_free_end is None else round(self.disk_free_end, 1),
             "verdict": "contended" if reasons else "clear", "reasons": reasons,
         }
 
@@ -5628,7 +5638,7 @@ def job_event(event: str, meta: dict[str, Any], log: Path = JOB_LOG, **fields: A
 
 
 def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Path = JOB_LOG,
-                  interval: float = SAMPLE_S) -> str:
+                  interval: float = SAMPLE_S, disk_path: str | None = None) -> str:
     """Fork the detached sampler. Best effort: returns a note, never raises, never fails the job."""
     try:
         pid_file = sampler_file(state_dir)
@@ -5652,6 +5662,8 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
         started = time.time()
         started_mono = time.monotonic()
         samples = JobSamples(meta, os.cpu_count() or 1, started, interval)
+        if disk_path:
+            samples.disk_free_start = free_or_none(disk_path)
         deadline = time.monotonic() + HOLDER_MAX_S
         tick = 0
         dynamic_units = admitted_units = int(meta.get("units") or 0)
@@ -5733,6 +5745,8 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
                 time.sleep(min(1.0, left))
             if finished:
                 break
+        if disk_path:
+            samples.disk_free_end = free_or_none(disk_path)
         record = samples.summary(time.time())
         final, gui = holdings
         if final != record.get("roots", []):
@@ -6884,7 +6898,8 @@ def main(argv: list[str] | None = None) -> int:
                 job_event("started", meta, args.job_log)
             except Exception:  # noqa: BLE001
                 pass
-            note = start_sampler(owner.pid, args.state_dir, meta, args.job_log)
+            note = start_sampler(owner.pid, args.state_dir, meta, args.job_log,
+                                 disk_path=None if args.no_disk else disk_path)
             print(f"{PREFIX}: {note}", flush=True)
     else:
         if telemetry:

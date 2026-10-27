@@ -1307,13 +1307,13 @@ class HookTest(unittest.TestCase):
         beside them. While the slot's gate holds fresh.reserve, every other job on the mini leaves
         FRESH_RESERVE_UNITS free, and the slot's own feed compile takes them, past a PR job waiting for units."""
         self.fleet()
-        self.take_units(9)
+        self.take_units(10)
         reserve = self.hold_gui_reserve(hook.FRESH_RESERVE_TOKEN)
         self.addCleanup(os.close, reserve)
         try:
             side = self.job("swift-package-tests", "s0", 14)
             self.assertEqual(side.returncode, 1, side.stdout)
-            self.assertIn("refused: capacity: 5 of 14 units free, swift-package-tests (light) needs 2 and 4 are kept "
+            self.assertIn("refused: capacity: 4 of 14 units free, swift-package-tests (light) needs 2 and 3 are kept "
                           "for an idle reserving runner", side.stdout)
             (self.dir / "capacity" / f"{hook.ADMIT_WANT}{os.getppid()}").write_text(
                 json.dumps({"since": time.time() - 30, "wants": ["units"], "who": "s9 daemon-test (run 1)"}) + "\n")
@@ -1327,7 +1327,7 @@ class HookTest(unittest.TestCase):
                 env={"GITHUB_JOB": "release-compile", "RUNNER_NAME": "d0", "GITHUB_REF": ref,
                      "GITHUB_WORKFLOW_REF": f"manaflow-ai/cmux/.github/workflows/cmux-next.yml@{ref}"})
             self.assertEqual(fresh.returncode, 0, fresh.stdout + fresh.stderr)
-            self.assertIn("holding 4/14 units for release-compile (isolated", fresh.stdout)
+            self.assertIn("holding 3/14 units for release-compile (isolated", fresh.stdout)
         finally:
             (self.dir / "capacity" / f"{hook.ADMIT_WANT}{os.getppid()}").unlink(missing_ok=True)
             self.finish("d0")
@@ -1343,7 +1343,7 @@ class HookTest(unittest.TestCase):
                  "GITHUB_WORKFLOW_REF": f"manaflow-ai/cmux/.github/workflows/nightly.yml@{ref}"})
 
     def test_a_waiting_nightly_job_is_admitted_next_and_keeps_no_reserve(self) -> None:
-        """2026-10-27 04:27Z: a nightly-next build-nightly-app (isolated, 4 units) waited 13+ min on a side runner
+        """2026-10-27 04:27Z: a nightly-next build-nightly-app (isolated, then 4 units) waited 13+ min on a side runner
         behind PR jobs that reached the mini first, then, the oldest waiter, with 3 of 14 units free while an idle
         DEV slot (4) and an idle gui runner (1) kept their reserves. A nightly job goes ahead of every waiter, a PR
         job past FEED_JUMP_S too, and keeps no reserve; the same job from a pull request does neither."""
@@ -1361,13 +1361,13 @@ class HookTest(unittest.TestCase):
             marker.unlink()
             pr = self.nightly_job("refs/pull/1/merge", "p0")
             self.assertEqual(pr.returncode, 1, pr.stdout)
-            self.assertIn("6 of 14 units free, build-nightly-app (isolated) needs 4 and 5 are kept", pr.stdout)
+            self.assertIn("6 of 14 units free, build-nightly-app (isolated) needs 3 and 4 are kept", pr.stdout)
             marker.write_text(json.dumps({"since": time.time() - hook.FEED_JUMP_S - 60, "wants": ["units"],
                                           "who": "s9 fast-tier (run 1)"}) + "\n")
             nightly = self.nightly_job("refs/heads/nightly-next", "n0")
             self.assertEqual(nightly.returncode, 0, nightly.stdout + nightly.stderr)
             self.assertIn("a nightly job: it goes ahead of every other job waiting here", nightly.stdout)
-            self.assertIn("holding 4/14 units for build-nightly-app (isolated", nightly.stdout)
+            self.assertIn("holding 3/14 units for build-nightly-app (isolated", nightly.stdout)
         finally:
             marker.unlink(missing_ok=True)
             self.finish("n0")
@@ -3312,6 +3312,12 @@ time.sleep(60)
         # cmux-next's side-lane jobs build in their workspace or $RUNNER_TEMP: no root, no kept DerivedData
         self.assertEqual(hook.job_class("swift-test", home, home, "cmux-next.yml"), ("isolated", False))
         self.assertEqual(hook.job_class("release-compile", home, home, "cmux-next.yml"), ("isolated", False))
+        # the Release compiles cost their measured p75 cores, not the class's 4
+        for workflow, job in (("cmux-next.yml", "release-compile"), ("nightly.yml", "build-nightly-app"),
+                              ("cmux-next.yml", "cmux-scheme-compile")):
+            with self.subTest(job=job):
+                self.assertEqual(hook.job_units(hook.job_class(job, home, home, workflow)[0], job, home, home,
+                                                workflow), 3)
         self.assertEqual(hook.job_class("cmux-scheme-compile", home, home, "cmux-next.yml"), ("isolated", False))
         # cmux-next's nightly frame-pacing bench: reload-build's `build`, called from it (GITHUB_WORKFLOW_REF names
         # the caller), builds in its workspace; `bench` takes the gui token itself (take-gui) and draws in the console
@@ -6406,14 +6412,15 @@ class GateTest(unittest.TestCase):
                                                      fcntl.LOCK_EX))
             return ledger
 
-        self.assertIsNone(hook.mini_full(reserved(5), 10, side), "5 free: its job and the slot's 4")
-        self.assertEqual(hook.mini_full(reserved(6), 10, side), "only 4 of 10 capacity units on this mini are "
-                         "free; its next job needs 1 and 4 are kept for an idle reserving runner")
-        self.assertIsNone(hook.mini_full(reserved(6), 10, fresh), "the reserved units are the slot's own")
-        self.assertEqual(hook.mini_full(self.units(7), 10, fresh), "only 3 of 10 capacity units on this mini are "
-                         "free; its next job needs 4")
+        self.assertEqual(hook.FRESH_RESERVE_UNITS, 3, "the feed compiles' measured cost (JOB_CORES)")
+        self.assertIsNone(hook.mini_full(reserved(6), 10, side), "4 free: its job and the slot's 3")
+        self.assertEqual(hook.mini_full(reserved(7), 10, side), "only 3 of 10 capacity units on this mini are "
+                         "free; its next job needs 1 and 3 are kept for an idle reserving runner")
+        self.assertIsNone(hook.mini_full(reserved(7), 10, fresh), "the reserved units are the slot's own")
+        self.assertEqual(hook.mini_full(self.units(8), 10, fresh), "only 2 of 10 capacity units on this mini are "
+                         "free; its next job needs 3")
         self.assertIsNone(hook.mini_full(self.units(9), 10, side), "no slot on the mini: nothing kept")
-        ledger = reserved(6)
+        ledger = reserved(7)
         (ledger / f"{hook.ADMIT_WANT}{os.getpid()}").write_text(
             json.dumps({"since": time.time(), "wants": ["units"], "who": "s1 daemon-test (run 4)"}) + "\n")
         self.assertIsNone(hook.mini_full(ledger, 10, fresh), "a PR job waiting for units does not hold the slot")
@@ -9851,6 +9858,17 @@ class JobTelemetryTest(unittest.TestCase):
         self.assertEqual(own[:3], (4.0, 2.0, 2.0))
         self.assertEqual(peer[:3], (2.0, 4.0, 2.0))
         self.assertEqual(own[3], {"cmux DEV (cmux)": 2.0})
+
+    def test_summary_records_disk_free_at_start_and_end(self) -> None:
+        """The disk floor (--min-free-gib) is a judgement call: each job records the free GiB on the disk the floor
+        checks at admission and at its end, so a floor can come from what jobs write."""
+        samples = self.hook.JobSamples({}, 14, 0.0)
+        record = samples.summary(10.0)
+        self.assertIsNone(record["disk_free_start_gib"])
+        self.assertIsNone(record["disk_free_end_gib"])
+        samples.disk_free_start, samples.disk_free_end = 61.234, 48.96
+        record = samples.summary(10.0)
+        self.assertEqual((record["disk_free_start_gib"], record["disk_free_end_gib"]), (61.2, 49.0))
 
     def test_summary_flags_outside_cpu_not_its_own_load(self) -> None:
         samples = self.hook.JobSamples({"job": "macos-compile-admission"}, 14, 1000.0)
