@@ -428,6 +428,11 @@ def enroll_python(ctx: Context) -> str | None:
     return enroll_module().pick_python(None, ctx.home)
 
 
+def unanswered_enroll_python(ctx: Context) -> str | None:
+    """A Python 3.13+ candidate that is there but did not answer enroll_python's probe in time, or None."""
+    return enroll_module().unanswered_python(ctx.home)
+
+
 def owned_brew() -> str | None:
     """brew, when this user owns it. Shared minis often have another account's Homebrew.
 
@@ -1433,6 +1438,13 @@ def plan_enroll_python(ctx: Context) -> dict[str, Any]:
     found = enroll_python(ctx)
     if found:
         return {**act, "state": "unchanged", "value": found, "note": ""}
+    # A loaded host can miss the probe's deadline: a brew install then ran `brew update` for half an hour inside
+    # the update agent's setup while Python 3.13 sat there (2026-10-27). A Python that is there is never reinstalled.
+    slow = unanswered_enroll_python(ctx)
+    if slow:
+        return {**act, "state": "skipped", "value": slow,
+                "note": f"{slow} is there but did not answer its version check in time (a loaded host); "
+                        "not reinstalled, the next run checks again"}
     brew = owned_brew()
     if brew and not brew_allowed(ctx):
         return {**act, "state": "blocked", "value": None,
@@ -1686,7 +1698,9 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]]) -> None:
             if not act["applied"]:
                 act["state"], act["note"] = "failed", f"brew install git exited {code}: {out.strip()[-300:]}"[:400]
         if kind == "python" and state == "create":
-            code, out = brew_install(act["brew"], act["formula"])
+            # no `brew update` first: python@3.13 from the installed formulae is enough, and an auto-update holds
+            # the update agent's setup on the network
+            code, out = brew_install(act["brew"], act["formula"], no_auto_update=True)
             found = enroll_python(ctx)
             act["applied"] = found is not None
             act["value"] = found

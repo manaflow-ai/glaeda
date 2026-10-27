@@ -2008,6 +2008,8 @@ HOOK_HISTORY = SCRIPT_DIR.parent.parent / "hook-history.json"
 REFRESH_GAP_WAIT_S = 240.0
 REFRESH_GAP_POLL_S = 0.5
 JOB_RUNNING = "the runner has a job; a later run installs it"
+HOOK_CHECK_TIMEOUT_S = 60  # one --parse-only start of the new hook; on an idle mini it takes 0.1 s
+HOOK_CHECK_SLOW = "the new hook's argument check did not finish in time"
 # A runner busy at every refresh still goes idle between jobs, and that is when its gate runs. So a refresh that finds a
 # job leaves the checked new files beside the old ones as .<name>.next, with NEXT_RECORD naming the hook they replace,
 # and the hook's job-completed installs them at the end of that job (glaeda-cmux-runner-hook install_staged_hook): the
@@ -2081,10 +2083,26 @@ def new_hook_accepts(calls: list[tuple[str, list[str]]], staged: Path) -> str | 
     for wrapper, (python, _, *args) in calls:
         if not os.path.isabs(python) or not os.access(python, os.X_OK):
             return f"{wrapper} runs the hook with {python[:120]!r}, not an executable absolute path"
-        code, out = run([python, os.fspath(staged), *args, "--parse-only"], timeout=60)
-        if code != 0:
-            return f"the new hook rejects {wrapper}'s arguments (exit {code}: {out[-200:]})"
+        try:
+            result = subprocess.run([python, os.fspath(staged), *args, "--parse-only"], stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                    timeout=HOOK_CHECK_TIMEOUT_S, check=False)
+        except subprocess.TimeoutExpired:
+            # a loaded host (load 160 on a fleet mini, 2026-10-27), not a hook that rejects anything: no verdict
+            return f"{HOOK_CHECK_SLOW} ({wrapper}, {HOOK_CHECK_TIMEOUT_S} s)"
+        except OSError as error:
+            return f"the new hook rejects {wrapper}'s arguments (exit 127: {str(error)[-200:]})"
+        if result.returncode != 0:
+            return f"the new hook rejects {wrapper}'s arguments (exit {result.returncode}: {result.stdout.strip()[-200:]})"
     return None
+
+
+def hook_check_note(entry: dict[str, Any], why: str) -> dict[str, Any]:
+    """refresh_hook_dir's answer for new_hook_accepts' why: a check that timed out is deferred to a later run (it never
+    marks the release's hook bad); a rejection blocks."""
+    if why.startswith(HOOK_CHECK_SLOW):
+        return {**entry, "state": "deferred", "note": why + "; a later run checks again"}
+    return {**entry, "state": "blocked", "note": why + "; re-run glaeda-cmux-runner --apply"}
 
 
 def stage_file(path: Path, data: bytes, mode: int) -> Path:
@@ -2188,7 +2206,7 @@ def refresh_hook_dir(runner_dir: Path, receipt: Any, apply: bool, sources: dict[
     if not apply:  # a plan writes nothing: it checks this copy's hook where it is
         why = new_hook_accepts(calls, HOOK_SOURCE)
         if why:
-            return {**entry, "state": "blocked", "note": why + "; re-run glaeda-cmux-runner --apply"}
+            return hook_check_note(entry, why)
         return {**entry, "state": "update"}
     try:
         staged = stage_file(hook_dir / HOOK_NAME, *sources[HOOK_NAME])
@@ -2197,7 +2215,7 @@ def refresh_hook_dir(runner_dir: Path, receipt: Any, apply: bool, sources: dict[
     try:
         why = new_hook_accepts(calls, staged)
         if why:
-            return {**entry, "state": "blocked", "note": why + "; re-run glaeda-cmux-runner --apply"}
+            return hook_check_note(entry, why)
         if busy or worker_running(runner_dir):  # a job has the runner, or took it during the checks
             try:
                 stage_next(hook_dir, staged, stale, sources)

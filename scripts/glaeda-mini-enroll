@@ -120,10 +120,13 @@ class Paths:
         return self.home / ".cache/glaeda/cmux-native-cache"
 
 
+PYTHON_PROBE_TIMEOUT_S = 10
+
+
 def python_version(path: str) -> tuple[int, int] | None:
     try:
         out = subprocess.run([path, "-c", "import sys; print(*sys.version_info[:2])"],
-                             capture_output=True, text=True, timeout=10, check=False)
+                             capture_output=True, text=True, timeout=PYTHON_PROBE_TIMEOUT_S, check=False)
     except (OSError, subprocess.TimeoutExpired):
         return None
     parts = out.stdout.split()
@@ -141,15 +144,56 @@ PYTHON_FIX = ("brew install python@3.13 (as the account that owns Homebrew), "
               "or put a CPython 3.13+ at ~/.local/bin/python3")
 
 
-def pick_python(explicit: str | None, home: Path | None = None) -> str | None:
-    """The first Python 3.13+ found. glaeda-mini-setup calls this too, so both agree."""
+def python_candidates(explicit: str | None, home: Path | None = None) -> list[str]:
+    """Where pick_python looks, in order."""
     local = (home or Path.home()) / ".local/bin"
     # /usr/bin/python3 is Apple's 3.9 at best, and before the Command Line Tools exist running it
     # opens an install dialog, so a PATH lookup that lands there is never probed.
     found = [w for w in (shutil.which(n) for n in ("python3.14", "python3.13", "python3"))
              if w and not w.startswith("/usr/bin/")]
-    candidates = [explicit] if explicit else [*PYTHON_CANDIDATES, *(os.fspath(local / n) for n in USER_PYTHONS), *found]
-    for candidate in candidates:
+    return [explicit] if explicit else [*PYTHON_CANDIDATES, *(os.fspath(local / n) for n in USER_PYTHONS), *found]
+
+
+def unanswered_python(home: Path | None = None) -> str | None:
+    """The first executable candidate that did not answer its version probe within PYTHON_PROBE_TIMEOUT_S, or that
+    answers 3.13+ now: a Python that is there, on a host too loaded to start it in time (load 130 on a fleet mini,
+    2026-10-27). glaeda-mini-setup asks this after pick_python found nothing, so a slow host never reinstalls it."""
+    for candidate in python_candidates(None, home):
+        if not candidate or not os.access(candidate, os.X_OK):
+            continue
+        try:
+            out = subprocess.run([candidate, "-c", "import sys; print(*sys.version_info[:2])"],
+                                 capture_output=True, text=True, timeout=PYTHON_PROBE_TIMEOUT_S, check=False)
+        except subprocess.TimeoutExpired:
+            if path_names_python_313(candidate):  # a bare python3 that times out could be any version
+                return candidate
+            continue
+        except OSError:
+            continue
+        parts = out.stdout.split()
+        if out.returncode == 0 and len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit() and \
+                (int(parts[0]), int(parts[1])) >= (3, 13):
+            return candidate
+    return None
+
+
+def path_names_python_313(candidate: str) -> bool:
+    """Whether the candidate's own name or the file it resolves to names a Python 3.13+ (python3.13,
+    python@3.14, Versions/3.13), so a version probe it missed cannot hide an older Python."""
+    try:
+        resolved = os.path.realpath(candidate)
+    except OSError:
+        resolved = candidate
+    for path in (candidate, resolved):
+        for match in re.finditer(r"(?:python@?|Versions/)3\.(\d+)", path):
+            if int(match.group(1)) >= 13:
+                return True
+    return False
+
+
+def pick_python(explicit: str | None, home: Path | None = None) -> str | None:
+    """The first Python 3.13+ found. glaeda-mini-setup calls this too, so both agree."""
+    for candidate in python_candidates(explicit, home):
         if candidate and os.access(candidate, os.X_OK):
             version = python_version(candidate)
             if version and version >= (3, 13):

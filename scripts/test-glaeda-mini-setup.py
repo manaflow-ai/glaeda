@@ -87,6 +87,7 @@ class MiniSetupTest(unittest.TestCase):
             mock.patch.object(ms, "run", recording_run),
             mock.patch.dict(os.environ, {"HOME": os.fspath(self.home)}),
             mock.patch.object(ms, "enroll_python", lambda ctx: "/opt/homebrew/bin/python3.13"),
+            mock.patch.object(ms, "unanswered_enroll_python", lambda ctx: None),  # never probe the real host
             mock.patch.object(ms, "brew_install", mock.Mock(side_effect=AssertionError("brew must not run"))),
         ]
         for p in self.patches:
@@ -791,10 +792,23 @@ class MiniSetupTest(unittest.TestCase):
                 mock.patch.object(ms, "owned_brew", lambda: "/opt/homebrew/bin/brew"), \
                 mock.patch.object(ms, "brew_allowed", lambda ctx: True):
             receipt = self.invoke("--apply")
-        ms.brew_install.assert_called_once_with("/opt/homebrew/bin/brew", "python@3.13")
+        ms.brew_install.assert_called_once_with("/opt/homebrew/bin/brew", "python@3.13", no_auto_update=True)
         act = self.python_action(receipt)
         self.assertEqual((act["state"], act["applied"], act["value"]), ("create", True, "/opt/homebrew/bin/python3.13"))
         self.assertTrue(receipt["ready"], receipt["blocking"])
+
+    def test_a_python_too_slow_to_answer_is_never_reinstalled(self) -> None:
+        """A loaded host (load 130) missed the 10 s version probe; setup then ran brew install python@3.13, whose
+        auto-update held the update agent for half an hour while Python 3.13 was there all along."""
+        with mock.patch.object(ms, "enroll_python", lambda ctx: None), \
+                mock.patch.object(ms, "unanswered_enroll_python", lambda ctx: "/opt/homebrew/bin/python3.13"), \
+                mock.patch.object(ms, "owned_brew", lambda: "/opt/homebrew/bin/brew"), \
+                mock.patch.object(ms, "brew_allowed", lambda ctx: True):
+            receipt = self.invoke("--apply")
+        act = self.python_action(receipt)
+        self.assertEqual((act["state"], act["value"]), ("skipped", "/opt/homebrew/bin/python3.13"))
+        ms.brew_install.assert_not_called()
+        self.assertNotIn("action:enroll-python", receipt["blocking"])
 
     def test_plan_only_names_the_brew_install(self) -> None:
         with mock.patch.object(ms, "enroll_python", lambda ctx: None), \

@@ -8184,6 +8184,19 @@ class RunnerTest(unittest.TestCase):
         self.assertIn("rejects job-started.sh", blocked["note"])
         self.assertEqual((hooks / cr.HOOK_NAME).read_bytes(), older)
         started.write_text(wrapper)
+        # a check that times out on a loaded host is no verdict: deferred to a later run, never blocked
+        real_run = subprocess.run
+
+        def slow(argv, *args, **kwargs):
+            if "--parse-only" in argv:
+                raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+            return real_run(argv, *args, **kwargs)
+
+        with mock.patch.object(cr.subprocess, "run", side_effect=slow):
+            slowed = self.invoke("--refresh-hooks", "--apply")["runners"][0]
+        self.assertEqual(slowed["state"], "deferred")
+        self.assertTrue(slowed["note"].startswith(cr.HOOK_CHECK_SLOW), slowed["note"])
+        self.assertEqual((hooks / cr.HOOK_NAME).read_bytes(), older)
         # a directory whose marker no longer matches the receipt is not this command's
         marker = self.home / "actions-runner-glaeda" / cr.MARKER
         install_id = marker.read_text()
