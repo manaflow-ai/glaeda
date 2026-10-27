@@ -748,6 +748,8 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         elif dev_compile_instance(ctx.member, ctx.instance):
             scope += " --dev-compile-runner"
         else:  # PR runners: an unlocked test keychain (the login keychain is locked in the runner session)
+            if nightly_slot_instance(ctx.member, ctx.instance):  # the nightly slot: nightly jobs only, same setup
+                scope += " --nightly-runner"
             scope += " --test-keychain"
             # and a fresh testmanagerd for each job that takes the gui token (a wedged one hangs every XCTest run)
             recycle = " --recycle-testmanagerd"
@@ -2519,6 +2521,7 @@ def main(argv: list[str] | None = None) -> int:
             ctx.capacity_units = int(member.get("capacityUnits") or 0)
         ctx.fast_runner, ctx.gui_runner, ctx.session_runner = member_roles(member, ctx.instance)
         dev = dev_compile_instance(member, ctx.instance)
+        nightly = nightly_slot_instance(member, ctx.instance)
         is_root = (ctx.instance < int(member.get("canonicalRoots") or 1) and not ctx.gui_runner and not ctx.fast_runner
                    and not ctx.session_runner)
         # The console gui runner carries the session label only on a mini without session runners (guiRunners 1). With
@@ -2527,6 +2530,7 @@ def main(argv: list[str] | None = None) -> int:
         # admit.want marker, hold every runner on the mini. The session runners listen with room for one.
         console_session = int(member.get("guiRunners") or 0) <= 1
         roots = (member.get("devPools", []) if dev
+                 else member.get("nightlyPools", []) if nightly
                  else member.get("fastPools", []) if ctx.fast_runner
                  else [*member.get("guiPools", []), *(member.get("sessionPools", []) if console_session else [])]
                  if ctx.gui_runner
@@ -2535,7 +2539,7 @@ def main(argv: list[str] | None = None) -> int:
         # Dedicated roles leave out ordinary pool and iOS labels, so those jobs cannot take a DEV, GUI or fast
         # instance. The pool's live count includes only the root and side instances it can route to.
         own = ([label for label in member["labels"] if label not in member.get("pools", []) and label != IOS_SIM_JOB_LABEL]
-               if dev or ctx.gui_runner or ctx.session_runner or ctx.fast_runner else member["labels"])
+               if dev or nightly or ctx.gui_runner or ctx.session_runner or ctx.fast_runner else member["labels"])
         ctx.labels = list(dict.fromkeys([*BASE_LABELS, *own, *roots]))
         ctx.labels_requested = True
         if not args.name:
@@ -2724,6 +2728,17 @@ def dev_compile_instance(member: dict[str, Any], instance: int) -> bool:
     """DEV uses the first existing side instance; every neighbor keeps its normal job admission and labels.
     Derive the index from canonicalRoots too when restoring an older member receipt."""
     return bool(member.get("devCompile")) and instance == int(member.get("canonicalRoots") or 1)
+
+
+def nightly_slot_instance(member: dict[str, Any], instance: int) -> bool:
+    """The nightly slot (runner.nightlySlot) is the next side instance after canonicalRoots, after the freshness
+    slot when the member has one; like it, it reuses an instance and its neighbors keep their labels and hooks."""
+    if not member.get("nightlySlot"):
+        return False
+    at = member.get("nightlyInstance")
+    if not isinstance(at, int) or isinstance(at, bool):
+        at = int(member.get("canonicalRoots") or 1) + int(bool(member.get("devCompile")))
+    return instance == at
 
 
 def member_roles(member: dict[str, Any], instance: int) -> tuple[bool, bool, bool]:

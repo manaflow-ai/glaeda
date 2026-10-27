@@ -1325,12 +1325,33 @@ def dev_compile_refusal(event_name: str | None, ref: str | None, repository: str
 # 13+ min in this hook on a side runner behind a fast-tier, a generated-files and a swift test job that had arrived
 # first, and at 04:47Z, the oldest waiter, it still waited with 3 of 14 units free, because the fresh reserve (4) and a
 # gui reserve (1) made its 4 units need 9 free.
+# NIGHTLY_SLOT: FEED_FIRST orders the jobs a mini's runners already took, but GitHub hands a queued job to the next
+# idle runner in arrival order, so a nightly job queued on a side label waited behind every PR job queued there before
+# it, and none of it reached this hook (2026-10-27 14:08Z: a nightly-next build-nightly-app on the light side label
+# was never acquired by a runner while every side runner ran PR jobs, and its re-run then queued on Blacksmith). The
+# nightly slot (glaeda-cmux-runner --nightly-runner, the manifest's runner.nightlySlot) is one instance per mini with
+# its own label, glaeda-nightly-<class>-xcode-<version>, that no PR job asks for. It admits only nightly-tier jobs
+# (nightly_slot_refusal), and its gate listens however full the mini is (CPU saturation and units hold it no more than
+# they hold the freshness slot), so GitHub hands it the nightly job at once. Its job then waits here first in line:
+# ahead of every other waiter, no other admission takes a unit and every other runner's gate on the mini holds while it
+# waits (mini_full), and it keeps no reserve, so it takes the next units that free up. Disk, a fleet build's host
+# claim, eligibility and heat still hold it. Leo, 2026-10-27: "a waiting nightly, promote or nightly sign/verify job is
+# admitted on a mini ahead of every PR, DEV and side job and may use any reserve, and no new PR job starts on a mini
+# where a nightly job waits."
 NIGHTLY_REFS = ("refs/heads/nightly-next", "refs/heads/main")
 NIGHTLY_EVENTS = ("push", "schedule", "workflow_dispatch")
 NIGHTLY_WORKFLOW = "manaflow-ai/cmux/.github/workflows/nightly.yml"
 PROMOTE_COMPILE = "release-compile"  # cmux-next.yml's, on a feat-cmux-next push: nightly-next's promote gate
 TIER_NIGHTLY, TIER_DEV = "nightly", "dev"
 FEED_JUMP_S = 20 * 60.0
+
+
+def nightly_slot_refusal(tier: str) -> str | None:
+    """Why the nightly slot refuses a job of this job_tier(), or None: it takes only nightly jobs (NIGHTLY_SLOT)."""
+    if tier == TIER_NIGHTLY:
+        return None
+    return ("the nightly slot admits only nightly jobs (nightly.yml on nightly-next or main, and the Release compile "
+            "that gates nightly-next's promotion)")
 
 
 def job_tier(event_name: str | None, ref: str | None, repository: str | None, event: Any,
@@ -3258,18 +3279,20 @@ def admission_rank(tier: str, since: float, pid: int, now: float) -> tuple[int, 
 
 
 def fair_turn(capacity_dir: Path, needs: set[str], since: float, tier: str = "",
-              takes_units: bool = False) -> str | None:
+              takes_units: bool = False, new_job: bool = False) -> str | None:
     """Why an admission needing these kinds (tokens and "units") must wait behind a waiter ahead of it, or None.
     Ahead is older, except across tiers (FEED_FIRST, admission_rank). A waiting nightly job also stops every other
-    admission that takes a unit (takes_units), one the reserve its own gate holds would cover too."""
+    admission that takes a unit (takes_units), one the reserve its own gate holds would cover too, and every new job
+    of another tier (new_job: job-started), the fast tier on its own fast tokens too: no new PR job starts on a mini
+    where a nightly job waits. A ci-step lease inside a running job is not a new job, so it never waits on one."""
     now = time.time()
     mine = admission_rank(tier, since, os.getpid(), now)
     for waiter in admission_waiters(capacity_dir, os.getpid()):
         if admission_rank(waiter["tier"], waiter["since"], waiter["pid"], now) >= mine:
             continue
         shared = needs & set(waiter["wants"])
-        if waiter["tier"] == TIER_NIGHTLY and takes_units:  # a later nightly job too: arrival order among them
-            shared.add("units")
+        if waiter["tier"] == TIER_NIGHTLY and (takes_units or (new_job and tier != TIER_NIGHTLY)):
+            shared.add("units")  # a later nightly job too: arrival order among them
         if shared:
             who = waiter["who"] or "pid " + str(waiter["pid"])
             if (waiter["since"], waiter["pid"]) > (since, os.getpid()) or waiter["tier"] == TIER_NIGHTLY != tier:
@@ -3343,7 +3366,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                   owned_state_dir: str = "", taken_out: dict[str, Any] | None = None,
                   warm_target: tuple[Any, ...] = ("", None, 0), klass: str | None = None,
                   one_holder: bool = False, since: float | None = None, gui_token: str = "gui",
-                  gui_runner: bool = False, fresh_runner: bool = False, tier: str = "") -> tuple[bool, str]:
+                  gui_runner: bool = False, fresh_runner: bool = False, tier: str = "",
+                  new_job: bool = False) -> tuple[bool, str]:
     """Weighted admission for one of several runners on this mini, without ever waiting on a job.
     When held, taken_out (if given) receives the units and tokens taken, for the job log; on a capacity refusal it
     receives "wants", the kinds a waiter marker names (CAPACITY_WAIT): the token kind or "units" it lacks, else
@@ -3403,7 +3427,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         in_reserve = (own_reserve is not None and 0 < units <= reserve_units(f"{own_reserve}{GUI_RESERVE}")
                       and not probe(capacity_dir / f"{own_reserve}{GUI_RESERVE}"))
         needs = {*tokens, *(("units",) if units and not in_reserve else ())}
-        behind = fair_turn(capacity_dir, needs, time.time() if since is None else since, tier, units > 0)
+        behind = fair_turn(capacity_dir, needs, time.time() if since is None else since, tier, units > 0, new_job)
         if behind:
             # a waiter behind another names every kind it needs, units too: a newcomer that fits must not take the
             # units it waits for in the poll between the waiter ahead being admitted and this one's next try
@@ -3851,6 +3875,7 @@ class RunnerScope(NamedTuple):
     session: bool = False
     fresh: bool = False
     dedicated: bool = False
+    nightly: bool = False
 
 
 def reserve_token(scope: RunnerScope | None) -> str | None:
@@ -3910,10 +3935,12 @@ def runner_scope(runner_dir: Path) -> RunnerScope:
     gui_match = re.search(r"\s--gui-token\s+([A-Za-z0-9._-]+)(?:\s|$)", text)
     gui_token = gui_match.group(1) if gui_match else "gui"
     dedicated = re.search(r"\s--dedicated-admit\s", text) is not None
+    nightly = (re.search(r"\s--nightly-runner(?:\s|$)", text) is not None
+               and not fast and not session and not gui and not fresh and not dedicated)
     return RunnerScope(flag("capacity-units", 0), max(1, flag("compile-slots", 1)), roots,
-                       instance < roots and not gui and not fast and not session and not dedicated, gui,
-                       runner_floor_gib(min_free_gib(text), gui or session), gui_token,
-                       fast, session, fresh, dedicated)
+                       instance < roots and not gui and not fast and not session and not dedicated and not nightly,
+                       gui, runner_floor_gib(min_free_gib(text), gui or session), gui_token,
+                       fast, session, fresh, dedicated, nightly)
 
 
 def eligibility_scope(runner_dir: Path) -> tuple[str, str | None] | None:
@@ -4054,6 +4081,8 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
         if scope is not None and scope.fast:
             for waiter in admission_waiters(capacity_dir):
                 shared = set(FAST_TOKENS) & set(waiter["wants"])
+                if waiter["tier"] == TIER_NIGHTLY:  # no new job starts while a nightly job waits (FEED_FIRST)
+                    shared.add("units")
                 if shared:
                     return f"{waiter['who'] or 'a job'} waits here for {', '.join(sorted(shared))}"
             for name in FAST_TOKENS:
@@ -4734,7 +4763,7 @@ class Gate:
         runs slower beats one that waits 30+ minutes for a mini to cool."""
         now = time.monotonic()
         scope = runner_scope(self.runner_dir)
-        if scope.gui or scope.fresh:
+        if scope.gui or scope.fresh or scope.nightly:
             self.cpu_busy = None
         elif now - self.cpu_at >= GATE_CPU_EVERY_S:
             _, self.cpu_busy = host_io()
@@ -4973,6 +5002,9 @@ class Gate:
         answer, so a full mini's retrying admissions never read as free and restart a listener; the fresh
         look right before a stop (confirmed()) stops only on a reading of its own."""
         scope = runner_scope(self.runner_dir)
+        if scope.nightly:  # NIGHTLY_SLOT: its one job shape goes first here, so it listens on a full mini
+            self.full_why = None
+            return None
         why = mini_full(self.capacity_dir, scope.units, scope, max(self.fit_units, listen_fit_units(self.runner_dir)))
         if isinstance(why, Unknown):
             return None if fresh else self.full_why
@@ -6997,6 +7029,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="also admit only cmux nightly-next's exact nightly app push on attempt 1")
     p.add_argument("--dev-compile-runner", action="store_true",
                    help="this instance admits only cmux NEXT DEV Release compile jobs (shared host capacity)")
+    p.add_argument("--nightly-runner", action="store_true",
+                   help="the nightly slot (runner.nightlySlot): this instance admits only nightly-tier jobs "
+                        "(job_tier) and its gate listens on a full mini (NIGHTLY_SLOT)")
     p.add_argument("--dedicated-admit", type=Path,
                    help="job-started: a dedicated runner (glaeda-cmux-runner --dedicated). It takes no host lock, "
                         "capacity or reservation; after glaeda's own checks this script, the builder's admission, "
@@ -7151,6 +7186,12 @@ def main(argv: list[str] | None = None) -> int:
                                tuple(args.allow_event))
         if not admit:
             return refused(reason)
+        if args.nightly_runner:
+            why = nightly_slot_refusal(job_tier(os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REF"),
+                                                os.environ.get("GITHUB_REPOSITORY"), event,
+                                                os.environ.get("GITHUB_WORKFLOW_REF"), os.environ.get("GITHUB_JOB")))
+            if why:
+                return refused(why)
         if args.dev_compile_runner:
             why = dev_compile_refusal(os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REF"),
                                       os.environ.get("GITHUB_REPOSITORY"), event,
@@ -7273,7 +7314,7 @@ def main(argv: list[str] | None = None) -> int:
                                                warm_target=job_warm_target(event), since=since,
                                                gui_token=args.gui_token, klass=admit_class,
                                                gui_runner=args.gui_runner,
-                                               fresh_runner=args.dev_compile_runner, tier=tier)
+                                               fresh_runner=args.dev_compile_runner, tier=tier, new_job=True)
                     if held or not note.startswith("capacity:"):
                         break
                     waited = time.monotonic() - start

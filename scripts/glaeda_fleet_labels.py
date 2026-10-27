@@ -61,8 +61,17 @@ MAX_RUNNERS = 16
 TRUSTED_REF_RE = r"refs/heads/[A-Za-z0-9._/-]+"
 REPO_RE = r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
 POOL_PREFIX_RE = r"[a-z0-9]+-"
-RESERVED_POOL_PREFIXES = {"root-", "side-", "gui-", "fast-", "trusted-", "std-", "light-", "xl-", "dev-"}
+RESERVED_POOL_PREFIXES = {"root-", "side-", "gui-", "fast-", "trusted-", "std-", "light-", "xl-", "dev-", "nightly-"}
 DEV_COMPILE_POOL_PREFIX = "dev-"
+# A host's runner.nightlySlot: true gives its next side instance after canonicalRoots (after the freshness slot when
+# devCompile is set too) the nightly pool label glaeda-nightly-<class>-xcode-<version> instead of its side label. Only
+# cmux's nightly jobs (glaeda-cmux-runner-hook --nightly-runner: nightly.yml on nightly-next or main, and the Release
+# compile that gates nightly-next's promotion) run there. GitHub hands a queued job to the next idle runner in arrival
+# order, so a nightly job queued on a side label waited behind every PR job queued there before it (2026-10-27
+# 14:08Z: a nightly-next build-nightly-app on the light side label was never acquired by a runner while 37 side
+# runners ran PR jobs). No PR job carries this label, so the nightly job is the only one this runner can take; it
+# listens on a full mini, and its job waits there first in line (FEED_FIRST) while no other job takes a unit.
+NIGHTLY_POOL_PREFIX = "nightly-"
 
 
 def merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
@@ -233,6 +242,11 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
         return None, f"{member} runner.devCompile must be boolean"
     if dev_compile and (klass != "std" or availability != "dedicated" or trusted_ref is not None):
         return None, f"{member} runner.devCompile needs a dedicated std runner without trustedRef"
+    nightly_slot = runner.get("nightlySlot", False) if isinstance(runner, dict) else False
+    if not isinstance(nightly_slot, bool):
+        return None, f"{member} runner.nightlySlot must be boolean"
+    if nightly_slot and (availability != "dedicated" or trusted_ref is not None):
+        return None, f"{member} runner.nightlySlot needs a dedicated runner without trustedRef"
     pool_prefix = runner.get("poolPrefix", "") if isinstance(runner, dict) else ""
     prefix_ok = isinstance(pool_prefix, str) and (pool_prefix == "" or (
         re.fullmatch(POOL_PREFIX_RE, pool_prefix) and
@@ -241,6 +255,8 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
         return None, f"{member} runner.poolPrefix must be empty or a lowercase prefix such as aws-"
     if dev_compile and pool_prefix not in ("", DEV_COMPILE_POOL_PREFIX):
         return None, f"{member} runner.devCompile uses poolPrefix {DEV_COMPILE_POOL_PREFIX}"
+    if nightly_slot and pool_prefix not in ("", DEV_COMPILE_POOL_PREFIX):
+        return None, f"{member} runner.nightlySlot needs the default pool namespace (no poolPrefix)"
     normal_pool_prefix = "" if dev_compile and pool_prefix == DEV_COMPILE_POOL_PREFIX else pool_prefix
     ready = [a for a in apps if re.fullmatch(VERSION_RE, str(a.get("version") or "")) and xcode_ok(a)]
     versions = [str(a["version"]) for a in ready]
@@ -248,6 +264,8 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
     pools = [pool_label(klass, v, bool(trusted_ref), normal_pool_prefix) for v in versions] if availability == "dedicated" else []
     dev_pools = ([pool_label(klass, v, False, DEV_COMPILE_POOL_PREFIX) for v in versions]
                  if dev_compile and availability == "dedicated" else [])
+    nightly_pools = ([pool_label(klass, v, False, NIGHTLY_POOL_PREFIX) for v in versions]
+                     if nightly_slot and availability == "dedicated" else [])
     # Declared (the ios-simulators role) and, when the caller can look (the installer on the mini), a simulator
     # runtime actually present: an iOS job routed here must be able to boot one. Without a check (the fleet
     # plan) this is the declared view.
@@ -302,9 +320,13 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
                       "(every compile holds a root)")
     if dev_compile and roots + gui + fast >= runners:
         return None, f"{member} runner.devCompile needs an existing side instance after canonicalRoots"
+    if nightly_slot and roots + gui + fast + int(dev_compile) >= runners:
+        return None, (f"{member} runner.nightlySlot needs an existing side instance after canonicalRoots"
+                      + (" and the freshness slot" if dev_compile else ""))
     return {"member": member, "class": klass, "availability": availability, "roles": roles,
             "labels": list(dict.fromkeys(labels)), "pools": list(dict.fromkeys(pools)),
-            "devPools": list(dict.fromkeys(dev_pools)),
+            "devPools": list(dict.fromkeys(dev_pools)), "nightlyPools": list(dict.fromkeys(nightly_pools)),
+            "nightlySlot": nightly_slot, "nightlyInstance": roots + int(dev_compile) if nightly_slot else None,
             "minFreeGib": floor if isinstance(floor, (int, float)) and floor > 0 else None,
             "hardware": hardware, "xcodeApps": [str(a.get("path")) for a in ready], "iosSim": ios_sim,
             "runners": runners, "capacityUnits": units, "compileSlots": compile_slots,
@@ -326,7 +348,8 @@ def declared_pools(manifest: Any, xcode_ok: Callable[[str, dict[str, Any]], bool
     for member in hosts if isinstance(hosts, dict) else {}:
         check = (lambda app, m=member: xcode_ok(m, app)) if xcode_ok else (lambda app: True)
         summary, _ = member_labels(manifest, member, check)
-        for label in [*(summary or {}).get("pools", []), *(summary or {}).get("devPools", [])]:
+        for label in [*(summary or {}).get("pools", []), *(summary or {}).get("devPools", []),
+                      *(summary or {}).get("nightlyPools", [])]:
             out.setdefault(label, []).append(member)
     return {label: sorted(members) for label, members in sorted(out.items())}
 

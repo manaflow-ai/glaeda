@@ -562,6 +562,24 @@ label and Blacksmith, so no job waits on the reservation. A DEV hook waiting
 for capacity uses the existing `admit.want` fairness mechanism, then refuses
 after 60 seconds so the workflow can use its normal fallback.
 
+`runner.nightlySlot: true` on a dedicated member (no `trustedRef`, no
+`poolPrefix`) gives its next side instance after `canonicalRoots`, after the
+freshness slot when `devCompile` is set too, the nightly pool label
+`glaeda-nightly-<class>-xcode-<version>` in place of its side label, and its
+hook `--nightly-runner`. Like the freshness slot it reuses an instance and adds no
+runners, cores or roots; its neighbors keep their labels and hooks. It admits
+only nightly-tier jobs (the hook's `job_tier`: `nightly.yml` on `nightly-next`
+or `main`, and the Release compile that gates nightly-next's promotion). GitHub
+hands a queued job to the next idle runner in arrival order, so a nightly job
+queued on a side label waited behind every PR job queued there first and never
+reached a mini (2026-10-27). No PR job asks for the nightly label, and the slot's
+gate listens however full the mini is (units, waiters and CPU saturation do not
+hold it; disk, a fleet build's host claim, eligibility and heat still do), so
+the nightly job is taken at once. Its job then waits first in line (FEED_FIRST):
+no other admission takes a unit, every other runner's gate on the mini holds,
+and it keeps no reserve. NEXT's app build on attempt 1 still waits at most
+`NIGHTLY_CAPACITY_WAIT_S`, then is refused so its re-run takes Blacksmith.
+
 `glaeda-macos-<major>` is observed on the mini, not declared, so a fleet that straddles an
 OS upgrade can route a job to one macOS (`runs-on: [glaeda-std-xcode-26.6, glaeda-macos-27]`).
 It is never the bare `macos-<N>`: that is GitHub-hosted vocabulary, and cmux's workflows check
