@@ -4603,6 +4603,119 @@ def fake_clt(base: Path, sdk: str = "27.0") -> Path:
     return path
 
 
+class MirrorBorrowTest(unittest.TestCase):
+    """A cmux runner checkout borrows the mini's git mirror at job-completed and drops its local copies; at
+    job-started a borrower whose mirror is gone or was rebuilt loses its .git, so checkout clones it whole."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name).resolve()
+        self.env = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GIT_CONFIG_NOSYSTEM": "1",
+                    "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_COMMITTER_NAME": "t",
+                    "GIT_COMMITTER_EMAIL": "t@example.com"}
+        self.patch = mock.patch.dict(os.environ, self.env)
+        self.patch.start()
+        src = self.dir / "src"
+        src.mkdir()
+        self.git(src, "init", "-q", "-b", "main")
+        for n in range(3):
+            (src / f"f{n}.bin").write_bytes(os.urandom(200_000))
+            self.git(src, "add", "-A")
+            self.git(src, "commit", "-qm", f"c{n}")
+        self.mirror = self.dir / "fleet" / "git" / "cmux.git"
+        self.mirror.parent.mkdir(parents=True)
+        self.git(self.dir, "clone", "-q", "--bare", "--no-local", os.fspath(src), os.fspath(self.mirror))
+        (self.mirror / "glaeda-verified").write_text("now\n")
+        self.ws = self.dir / "actions-runner-glaeda-2" / "_work" / "cmux" / "cmux"
+        self.ws.parent.mkdir(parents=True)
+        self.git(self.dir, "clone", "-q", "--no-local", os.fspath(src), os.fspath(self.ws))
+        self.git(self.ws, "remote", "set-url", "origin", "https://github.com/manaflow-ai/cmux")
+        self.git(self.ws, "repack", "-a", "-d", "-q")
+        (self.ws / "local.txt").write_text("only here\n")
+        self.git(self.ws, "add", "-A")
+        self.git(self.ws, "commit", "-qm", "pull request commit")  # an object the mirror lacks
+
+    def tearDown(self) -> None:
+        self.patch.stop()
+        self.tmp.cleanup()
+
+    def git(self, cwd: Path, *args: str) -> str:
+        return subprocess.run(["git", "-C", os.fspath(cwd), *args], env=self.env, capture_output=True, text=True,
+                              check=True).stdout.strip()
+
+    def borrow(self) -> str:
+        with mock.patch.object(hook, "BORROW_REPACK_MIN", 0):
+            return hook.borrow_mirror(os.fspath(self.ws), self.mirror)
+
+    def test_a_checkout_borrows_the_mirror_and_keeps_only_what_the_mirror_lacks(self) -> None:
+        before = hook.pack_bytes(self.ws / ".git")
+        note = self.borrow()
+        self.assertIn("borrows", note)
+        self.assertIn("repacked against the mirror", note)
+        self.assertEqual(hook.alternates_of(self.ws / ".git"), [os.fspath(self.mirror / "objects")])
+        self.assertLess(hook.pack_bytes(self.ws / ".git"), before / 10)
+        self.git(self.ws, "fsck", "--no-dangling")  # every object still reads, through the mirror
+        self.assertEqual(self.git(self.ws, "show", "HEAD:local.txt"), "only here")
+        self.assertEqual(self.git(self.ws, "status", "--porcelain"), "")
+        self.assertEqual(hook.guard_borrowed_checkout(os.fspath(self.ws), self.mirror), "")
+        self.assertTrue((self.ws / ".git").is_dir())
+        self.assertNotIn("borrows", self.borrow())  # idempotent: the second pass only repacks what is new
+
+    def test_a_borrower_whose_mirror_was_rebuilt_or_removed_loses_its_git(self) -> None:
+        self.borrow()
+        rebuilt = self.mirror.with_name("cmux.git.new")
+        shutil.copytree(self.mirror, rebuilt)
+        shutil.rmtree(self.mirror)
+        rebuilt.rename(self.mirror)  # what a reseed does: a new directory at the same path
+        self.assertIn("gone or was rebuilt", hook.guard_borrowed_checkout(os.fspath(self.ws), self.mirror))
+        self.assertFalse((self.ws / ".git").exists())
+        self.assertTrue((self.ws / "local.txt").exists())  # only .git goes; checkout clones into the workspace
+
+    def test_a_missing_mirror_resets_the_borrower(self) -> None:
+        self.borrow()
+        shutil.rmtree(self.mirror)
+        self.assertIn("gone or was rebuilt", hook.guard_borrowed_checkout(os.fspath(self.ws), self.mirror))
+        self.assertFalse((self.ws / ".git").exists())
+
+    def test_nothing_borrows_an_unproven_mirror_or_from_another_repository(self) -> None:
+        (self.mirror / "glaeda-verified").unlink()
+        self.assertEqual(self.borrow(), "")
+        (self.mirror / "glaeda-verified").write_text("now\n")
+        (self.mirror / "glaeda-repair-pending").write_text("x\n")
+        self.assertEqual(self.borrow(), "")
+        (self.mirror / "glaeda-repair-pending").unlink()
+        self.git(self.ws, "remote", "set-url", "origin", "https://github.com/manaflow-ai/other")
+        self.assertEqual(self.borrow(), "")
+        self.assertEqual(hook.alternates_of(self.ws / ".git"), [])
+        outside = self.dir / "elsewhere" / "cmux"
+        shutil.copytree(self.ws, outside)
+        self.assertEqual(hook.borrow_mirror(os.fspath(outside), self.mirror), "")
+        self.assertEqual(hook.borrow_mirror(None, self.mirror), "")
+        self.assertEqual(hook.guard_borrowed_checkout(os.fspath(self.ws), self.mirror), "")  # not a borrower
+
+    def test_a_repack_past_its_time_is_killed_and_leaves_the_checkout_readable(self) -> None:
+        real = subprocess.Popen
+
+        class Slow:
+            pid = 4242
+            returncode = None
+
+            def communicate(self, timeout=None):
+                if timeout and timeout < 5:
+                    raise subprocess.TimeoutExpired("git repack", timeout)
+                return "", ""
+
+        def popen(argv, *a, **kw):  # subprocess.run (the origin read) still runs for real
+            return Slow() if "repack" in argv else real(argv, *a, **kw)
+        killed = []
+        with mock.patch.object(hook, "BORROW_REPACK_MIN", 0), mock.patch.object(hook.subprocess, "Popen", popen), \
+                mock.patch.object(hook.os, "killpg", lambda pid, sig: killed.append(pid)):
+            note = hook.borrow_mirror(os.fspath(self.ws), self.mirror, timeout=1)
+        self.assertIn("repack timed out", note)
+        self.assertEqual(killed, [4242])
+        self.git(self.ws, "fsck", "--no-dangling")
+
+
 class DiskPassCoalesceTest(unittest.TestCase):
     """job-completed's disk passes: one at a time per host, triggers coalesced into one follow-up, none started above
     glaeda-disk's target. On cmux14, 2889 of 2986 passes (2026-10-24..26) skipped as eviction_busy: every job started

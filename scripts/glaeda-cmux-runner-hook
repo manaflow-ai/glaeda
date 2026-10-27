@@ -2479,6 +2479,140 @@ def evict_own_checkout(workspace: str | None, explicit: str | None, timeout: flo
         return ""
 
 
+# One copy of cmux's objects per mini instead of one per runner. Each runner's checkout kept its own packs: 0.5-1.6 GiB
+# for a depth-1 checkout, 9-12 GiB for a full-history one, 15-33 GiB of runner .git per mini (2026-10-27). glaeda-git-
+# mirror keeps one full mirror per mini and never removes an object from it, so at job-completed a cmux checkout
+# borrows the mirror's object store (objects/info/alternates) and one `repack -a -d -l` drops the local copies of
+# what the mirror holds. The next job's fetch then sends only what the mirror lacks (a pull request's own commits).
+# A borrower records which mirror it borrowed (its objects directory's device and inode). At job-started, a borrower
+# whose mirror is gone or was rebuilt (a reseed is a new directory and may lack a force-pushed commit) loses its .git,
+# before any step reads it, so actions/checkout clones it whole.
+MIRROR_DIR = Path(os.environ.get("GLAEDA_GIT_MIRROR_DIR") or os.path.join(FLEET_DIR, "git")) / "cmux.git"
+BORROW_RECORD = "glaeda-mirror-borrow.json"
+BORROW_ORIGINS = frozenset({"https://github.com/manaflow-ai/cmux", "https://github.com/manaflow-ai/cmux.git",
+                            "git@github.com:manaflow-ai/cmux.git"})
+BORROW_REPACK_MIN = 128 * 1024**2  # local packs under this are not worth a repack
+BORROW_REPACK_TIMEOUT_S = 300.0
+
+
+def mirror_identity(mirror: Path = MIRROR_DIR) -> dict | None:
+    """The mirror's objects directory as {"objects", "dev", "ino"} when it is a usable full mirror, else None:
+    glaeda-git-mirror's connectivity walk has passed once (glaeda-verified), no repair is pending, not shallow."""
+    try:
+        objects = mirror / "objects"
+        st = os.stat(objects, follow_symlinks=False)
+        if not stat.S_ISDIR(st.st_mode) or mirror.is_symlink() or not (mirror / "HEAD").is_file() \
+                or not (mirror / "glaeda-verified").is_file() or (mirror / "glaeda-repair-pending").exists() \
+                or (mirror / "shallow").exists():
+            return None
+        return {"objects": os.fspath(objects), "dev": st.st_dev, "ino": st.st_ino}
+    except OSError:
+        return None
+
+
+def runner_git_dir(workspace: str | None) -> Path | None:
+    """The workspace's own .git directory, when the workspace is a runner's _work checkout."""
+    if not workspace:
+        return None
+    ws = Path(workspace)
+    git_dir = ws / ".git"
+    if "_work" not in ws.parts or not any(p.startswith("actions-runner") for p in ws.parts) \
+            or git_dir.is_symlink() or not git_dir.is_dir():
+        return None
+    return git_dir
+
+
+def alternates_of(git_dir: Path) -> list[str]:
+    try:
+        return [line.strip() for line in (git_dir / "objects/info/alternates").read_text().splitlines() if line.strip()]
+    except OSError:
+        return []
+
+
+def guard_borrowed_checkout(workspace: str | None, mirror: Path = MIRROR_DIR) -> str:
+    """job-started: drop the .git of a checkout that borrows a mirror that is gone or not the one it borrowed.
+    Returns a note, or "". Never raises."""
+    try:
+        git_dir = runner_git_dir(workspace)
+        objects = os.fspath(mirror / "objects")
+        if git_dir is None or objects not in alternates_of(git_dir):
+            return ""
+        try:
+            recorded = json.loads((git_dir / BORROW_RECORD).read_text())
+        except (OSError, ValueError):
+            recorded = None
+        try:
+            st = os.stat(objects, follow_symlinks=False)
+            same = isinstance(recorded, dict) and recorded.get("dev") == st.st_dev \
+                and recorded.get("ino") == st.st_ino and stat.S_ISDIR(st.st_mode)
+        except OSError:
+            same = False
+        if same:
+            return ""
+        shutil.rmtree(git_dir)
+        return f"removed {git_dir}: it borrowed objects from a mirror that is gone or was rebuilt (checkout clones it)"
+    except Exception as error:  # noqa: BLE001  (never fail the job on housekeeping)
+        return f"borrowed checkout guard: {type(error).__name__}"
+
+
+def pack_bytes(git_dir: Path) -> int:
+    total = 0
+    with contextlib.suppress(OSError), os.scandir(git_dir / "objects" / "pack") as it:
+        for e in it:
+            if e.name.endswith(".pack") and e.is_file(follow_symlinks=False):
+                total += e.stat(follow_symlinks=False).st_size
+    return total
+
+
+def borrow_mirror(workspace: str | None, mirror: Path = MIRROR_DIR, timeout: float = BORROW_REPACK_TIMEOUT_S) -> str:
+    """job-completed: point a cmux runner checkout at the mini's mirror and drop the local copies of what it holds.
+    Returns a note, or "". Never raises."""
+    try:
+        git_dir = runner_git_dir(workspace)
+        identity = mirror_identity(mirror)
+        if git_dir is None or identity is None or not (git_dir / "objects" / "pack").is_dir():
+            return ""
+        origin = subprocess.run(["git", "--git-dir", os.fspath(git_dir), "config", "--get", "remote.origin.url"],
+                                capture_output=True, text=True, timeout=30, check=False).stdout.strip()
+        if origin not in BORROW_ORIGINS:
+            return ""
+        alternates = alternates_of(git_dir)
+        notes = []
+        if identity["objects"] not in alternates:
+            record = git_dir / BORROW_RECORD
+            tmp = record.with_name(f".{record.name}.{os.getpid()}")
+            tmp.write_text(json.dumps(identity) + "\n")
+            os.replace(tmp, record)  # the record first: a borrower without it is reset at the next job-started
+            info = git_dir / "objects" / "info"
+            info.mkdir(exist_ok=True)
+            tmp = info / f".alternates.{os.getpid()}"
+            tmp.write_text("".join(f"{line}\n" for line in [*alternates, identity["objects"]]))
+            os.replace(tmp, info / "alternates")
+            notes.append(f"{git_dir} borrows {identity['objects']}")
+        before = pack_bytes(git_dir)
+        if before > BORROW_REPACK_MIN:
+            # -l: objects the mirror holds are left out of the new pack; -a -d: the old packs go once it is written,
+            # so a repack cut short leaves the old packs (and only a temporary file, which git ignores).
+            proc = subprocess.Popen(["git", "--git-dir", os.fspath(git_dir), "-c", "gc.auto=0", "repack", "-a", "-d",
+                                     "-l", "-q"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.PIPE, text=True, cwd="/", start_new_session=True)
+            try:
+                _, err = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(OSError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                with contextlib.suppress(Exception):
+                    proc.communicate(timeout=5)
+                return "; ".join([*notes, f"repack timed out after {timeout:g} s"])
+            if proc.returncode != 0:
+                return "; ".join([*notes, f"repack exit {proc.returncode}: {(err or '').strip()[-160:]}"])
+            after = pack_bytes(git_dir)
+            notes.append(f"repacked against the mirror: {before / 1024**2:.0f} MiB -> {after / 1024**2:.0f} MiB")
+        return "; ".join(notes)
+    except Exception as error:  # noqa: BLE001  (never fail the job on housekeeping)
+        return f"mirror borrow: {type(error).__name__}"
+
+
 def workspace_damage(ws: Path) -> str:
     """Why the reused workspace cannot take a plain checkout, or "". A failed checkout (glaeda-2, three
     cmux-tui runs on 2026-10-12) leaves skip-worktree entries with no sparse setting, or tracked files that
@@ -7412,6 +7546,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{PREFIX}: admitted: {reason}; {note}", flush=True)
         if not args.no_disk and (own := evict_own_checkout(os.environ.get("GITHUB_WORKSPACE"), args.disk)):
             print(f"{PREFIX}: {own}", flush=True)
+        if guarded := guard_borrowed_checkout(os.environ.get("GITHUB_WORKSPACE")):
+            print(f"{PREFIX}: {guarded}", flush=True)
         unsparsed = ""
         with contextlib.suppress(Exception):  # must not fail an admitted job
             unsparsed = unsparse_workspace(os.environ.get("GITHUB_WORKSPACE"))
@@ -7454,6 +7590,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{PREFIX}: {note}", flush=True)
         for note in cleanup_job_leftovers():
             print(f"{PREFIX}: {note}", flush=True)
+        if not args.no_disk and (borrowed := borrow_mirror(os.environ.get("GITHUB_WORKSPACE"))):
+            print(f"{PREFIX}: {borrowed}", flush=True)
         worker = args.watch_pid or current_worker
         if worker:
             with contextlib.suppress(OSError):
