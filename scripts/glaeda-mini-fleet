@@ -44,7 +44,8 @@ relocatable CPython copied from this Mac into ~/.local, Homebrew git-fetched int
 /opt/homebrew the login user owns (from the --from host's /opt/homebrew over the LAN, else GitHub),
 brew install of rustup, zig and python@3.13 (then brew pin, as class receipts pin toolchain strings)
 with /opt/homebrew/bin/python3 linked to python3.13 for the workload PATH, and of gh (left unpinned:
-no receipt names it) for cmux CI jobs that call it, Glaeda and its setup,
+no receipt names it) for cmux CI jobs that call it, of git (unpinned) on a host whose policy sets
+git.source homebrew, Glaeda and its setup,
 ~/glaeda moved (clean fetch, detached checkout, refused when dirty) to --glaeda-ref or main's tip
 when its glaeda-mini-enroll lacks an option onboarding passes, rustup's default and pinned
 toolchains, the Metal toolchain, cmux scripts/setup.sh, and the reviewed Glaeda candidate
@@ -288,7 +289,13 @@ BREW_FORMULAS = ("rustup", "zig", "python@3.13")
 BREW_PYTHON = ("python@3.13", "python3.13")
 # Homebrew formulas fix installs and never pins: cmux CI jobs call gh (authenticated by GH_TOKEN, so no gh auth),
 # and no class receipt names it (cmux_fleet_bootstrap's toolchain observations and MACOS_WORKLOAD_TOOLS omit it).
-BREW_UNPINNED = ("gh",)
+BREW_UNPINNED = ("gh", "git")
+# A host whose manifest policy says git.source "homebrew" runs checkout with Homebrew's git (first on the workload
+# PATH) instead of Xcode's. Xcode's git runs its shell subcommands (git submodule) from inside Xcode.app; on a mini
+# whose runner context has no App Management or Full Disk Access grant, each command they start waits about 6 s on an
+# unanswered privacy prompt, so actions/checkout took about 11 minutes there. Drop the key once the grant is made.
+GIT_SOURCES = ("homebrew", "system")
+HOMEBREW_GIT = "/opt/homebrew/bin/git"
 # Files sshd reads by default (OpenSSH AuthorizedKeysFile); every other authorized_keys* is a copy.
 LIVE_KEY_FILES = ("authorized_keys", "authorized_keys2")
 # Reservations: a marker on the mini that every scheduler skips until it expires.
@@ -555,7 +562,12 @@ def validate_onboarding(path: Path, data: dict[str, Any]) -> None:
             and re.fullmatch(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)?", str(pin.get("expires", "")))):
         raise Failure(f"{path}: candidate needs source (40 hex), sha256 (64 hex), run, artifact and repo, "
                       "and optionally expires (an ISO time such as 2026-10-24T15:15:27Z)")
-    for name, host in data["hosts"].items():
+    for name, host in [("defaults", {"overrides": {}}), *data["hosts"].items()]:
+        # The policy git_source reads: defaults merged with the host's overrides, as host_policy does.
+        git = merge(data.get("defaults") or {}, host.get("overrides") or {}).get("git")
+        if git is not None and not (isinstance(git, dict) and set(git) <= {"source", "note"}
+                                    and git.get("source", "system") in GIT_SOURCES):
+            raise Failure(f"{path}: host {name} git takes source ({' or '.join(GIT_SOURCES)}) and note")
         if "lan_ip" in host and not re.fullmatch(r"(\d{1,3}\.){3}\d{1,3}", str(host["lan_ip"])):
             raise Failure(f"{path}: host {name} lan_ip must be an IPv4 address")
 
@@ -580,6 +592,11 @@ def toolchain(manifest: dict[str, Any], name: str) -> dict[str, Any]:
     if not entry or not all(isinstance(entry.get(k), str) for k in ("path", "version", "build")):
         return {}
     return {"xcode": {"app": entry["path"], "version": entry["version"], "build": entry["build"]}}
+
+
+def git_source(manifest: dict[str, Any], name: str) -> str:
+    """Which git the host's jobs should run: "homebrew" (HOMEBREW_GIT) or "system" (the default, Xcode's)."""
+    return (host_policy(manifest, name).get("git") or {}).get("source", "system")
 
 
 def cmux_checkout(manifest: dict[str, Any], name: str) -> dict[str, Any]:
@@ -858,6 +875,10 @@ def parse_preflight(out: dict[str, Any]) -> dict[str, Any]:
         "brew_python3": out.get("pf_brew_python3") or None,
         # gh as the workload PATH resolves it: its path, "" when none, None from a probe that predates the question.
         "gh": out.get("pf_gh"),
+        # git as the workload PATH resolves it, the same way as gh.
+        "git": out.get("pf_git"),
+        # The probe skipped the checkout's git walk until the policy's git is installed.
+        "submodules_skipped": bool(out.get("pf_submodule_skipped")),
         # state: empty (directories only), partial (an interrupted homebrew_fetch: a .git, no brew) or files.
         "brew_dir": None if brew_dir is None else {"owner": brew_dir[0], "state": brew_dir[1]},
         "brew_formulas": {f: state == "pinned" for f, _, state in (v.partition("|") for v in out["pf_brew_formula"])},
@@ -2108,7 +2129,7 @@ def cmd_release(manifest: dict[str, Any], hosts: list[str], owner: str | None, f
 DEFAULT_CMUX_ROOT = "~/cmux"  # where fix clones cmux on a mini
 # Columns of the preflight table, in the order onboarding meets them.
 PREFLIGHT_CHECKS = ("os", "xcode", "select", "licence", "launch", "metal", "rust", "zig", "tools", "python", "python3",
-                    "gh", "cmux", "setup", "glaeda", "headless_sudo", "power", "disk", "update", "autoupdate", "candidate", "node", "enroll", "runner",
+                    "gh", "git", "cmux", "setup", "glaeda", "headless_sudo", "power", "disk", "update", "autoupdate", "candidate", "node", "enroll", "runner",
                     "brew", "pins", "secrets")
 # An unknown here means the bootstrap would refuse or cannot be predicted, so it blocks like a failure.
 UNKNOWN_BLOCKS = frozenset({"xcode", "select", "licence", "launch", "metal", "zig", "headless_sudo", "power", "disk"})
@@ -2151,6 +2172,7 @@ def preflight_script(manifest: dict[str, Any], name: str) -> bytes:
         "CANDIDATE_PIN": operator_candidate_source(),
         "ENROLL_FLAGS": " ".join(ENROLL_FLAGS),
         "PIN_FORMULAS": " ".join(BREW_FORMULAS),
+        "GIT_SOURCE": git_source(manifest, name),
     }
     header = "".join(f"{k}={shlex.quote(v)}\n" for k, v in inputs.items())
     return PROBE.read_bytes() + b"\n" + header.encode() + PREFLIGHT_PROBE.read_bytes()
@@ -2394,6 +2416,17 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
     else:
         put("gh", "fail", "not on the workload PATH; cmux CI jobs call gh", f"{as_owner}brew install gh", brew_group,
             brew("gh"))
+    # git: only a host whose policy asks for Homebrew's git is checked (GIT_SOURCES); the rest use whatever is there.
+    git = pf.get("git")
+    if git_source(manifest, name) != "homebrew":
+        put("git", "info", git or "none on the workload PATH")
+    elif git is None:  # the policy asks for a git this probe cannot show: not ready until a fresh probe does
+        put("git", "fail", "the probe predates this check; rerun preflight", "rerun glaeda-mini-fleet preflight", "self")
+    elif git == HOMEBREW_GIT:
+        put("git", "ok", f"{git} (policy git.source homebrew)")
+    else:
+        put("git", "fail", f"the workload PATH's git is {git or 'none'}; policy git.source homebrew wants {HOMEBREW_GIT}",
+            f"{as_owner}brew install git", brew_group, brew("git"))
 
     # The checkout acceptance builds.
     depth = f" --depth {checkout['depth']}" if checkout["depth"] else ""
@@ -2404,6 +2437,9 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
         put("cmux", "fail", f"no checkout at {root}", clone, "self",
             {"kind": "cmux_clone", "repo": checkout["repo"], "ref": checkout["ref"], "root": root, "depth": checkout["depth"]})
         put("setup", "fail", "no checkout", f"after the clone: cd {root} && ./scripts/setup.sh", "self", setup)
+    elif pf.get("submodules_skipped"):
+        put("cmux", "todo", "the checkout's git walk waits for the policy's git (see git)", "install git first, then "
+            "rerun preflight", "self")
     else:
         errors = [s for s in pf.get("submodules", []) if s.startswith(("fatal:", "error:", "warning:"))]
         if errors:
@@ -2715,14 +2751,17 @@ def render_preflight(results: list[dict[str, Any]]) -> str:
 # ---------------------------------------------------------------- fix and sudo-plan
 
 # The order fix runs a host's repairs in, so each runs after what it builds on.
-FIX_ORDER = ("xcode_share", "xcode_clone", "python", "cmux_clone", "submodules", "homebrew_fetch", "brew", "python_link",
+# The checkout comes after brew: a git.source homebrew host clones and walks it with the git brew installs.
+FIX_ORDER = ("xcode_share", "xcode_clone", "python", "homebrew_fetch", "brew", "python_link", "cmux_clone", "submodules",
              "rust_default", "rust_channel", "glaeda", "glaeda_sync", "metal", "setup", "candidate")
 # What each repair needs to pass first (checks, or repairs made earlier in the same run).
 # glaeda-mini-setup builds glaeda-worktree-reclaim with cargo, under the Python enroll will use.
 FIX_NEEDS = {"metal": ("licence", "launch"), "setup": ("cmux", "licence", "launch", "metal", "zig"), "brew": ("brew",),
              "python_link": ("brew",), "glaeda": ("python", "rust", "headless_sudo"),
              # git runs through the /usr/bin shim, which needs a selected, licensed developer directory.
-             "homebrew_fetch": ("select", "licence")}
+             "homebrew_fetch": ("select", "licence"),
+             # git.source homebrew: the checkout is cloned and walked with Homebrew's git, never Xcode's.
+             "cmux_clone": ("git",), "submodules": ("git",)}
 # Remote functions that only read; every other one takes the host's step lock.
 # share_send only reads, and stays lock-free so one source can feed several peers at once.
 READ_ONLY_FUNCTIONS = {"candidate_check", "share_have", "share_source", "share_send", "host_check"}
