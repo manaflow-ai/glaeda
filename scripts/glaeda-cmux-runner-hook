@@ -512,6 +512,20 @@ GUI_RESERVE_UNITS = 1
 # to the side label and Blacksmith, so the reservation never makes a job wait on it.
 FRESH_RESERVE_TOKEN = "fresh"
 FRESH_RESERVE_UNITS = max(JOB_CORES[("cmux-next.yml", job)] for job in ("cmux-scheme-compile", "release-compile"))
+# A reserving runner's gate keeps its reserve through its own job, lent to that job: the job's admission holder (the
+# detached process whose flocks are the job's units, take_capacity) also holds an flock on
+# capacity/<token>.reserve.lent, and while that flock is held the reserve keeps nothing (gui_reserved), since the job
+# holds those units itself. The flock dies with the holder, as the job's units go back, so the reserve is whole again
+# at that moment, with no gate poll in between and no pid to trust. Before, the gate let the reserve go once its job
+# was admitted and took it again on its first idle poll, seconds after job-completed released the units: a PR job
+# waiting here for units took them in that gap, so the slot found the mini full right after each job and held its
+# listener off (2026-10-27 05:07:50Z: "only 1 of 14 capacity units on this mini are free; its next job needs 4", 6 s
+# after a DEV compile ended), and a feed compile its listener took at once met a PR waiter ahead of it for units
+# instead of its own reserve (run 40452488452, refused at 05:06Z: "has waited longer here for units"). Like every file
+# in the ledger, any process of the runner user can take the flock; the ledger is cooperative between the jobs on one
+# mini, which can take unit flocks directly as well.
+RESERVE_LENT = ".lent"
+LEND_WAIT_S = 5.0  # an admission waits this long for the previous job's holder to let go of the lend
 UNITS_FULL = "capacity units on this mini"  # in mini_full's answers that are about units (Gate.reserves)
 
 
@@ -521,16 +535,27 @@ def reserve_units(name: str) -> int:
     return FRESH_RESERVE_UNITS if name == f"{FRESH_RESERVE_TOKEN}{GUI_RESERVE}" else GUI_RESERVE_UNITS
 
 
+def lent_file(reserve: Path) -> Path:
+    return reserve.with_name(reserve.name + RESERVE_LENT)
+
+
+def reserve_lent(reserve: Path) -> bool:
+    """Whether this reserve is lent to its runner's own admitted job: that job's holder holds <token>.reserve.lent
+    (RESERVE_LENT). Never raises: an unreadable file lends nothing."""
+    return not probe(lent_file(reserve))
+
+
 def gui_reserved(capacity_dir: Path, own_token: str | None = None) -> int:
     """The units this mini keeps for idle reserving runners: reserve_units() for each <token>.reserve an idle gui
-    runner's (or the freshness slot's) gate holds, except own_token's (a runner's own job takes its own reserve).
-    Never raises: an unreadable ledger reserves nothing."""
+    runner's (or the freshness slot's) gate holds, except own_token's (a runner's own job takes its own reserve) and
+    one lent to its runner's running job (RESERVE_LENT). Never raises: an unreadable ledger reserves nothing."""
     try:
         paths = sorted(capacity_dir.glob(f"*{GUI_RESERVE}"))
     except OSError:
         return 0
     own = f"{own_token}{GUI_RESERVE}" if own_token is not None else None
-    return sum(reserve_units(path.name) for path in paths if path.name != own and not probe(path))
+    return sum(reserve_units(path.name) for path in paths
+               if path.name != own and not probe(path) and not reserve_lent(path))
 
 
 def reserve_for(reserved: int, units: int, total: int) -> int:
@@ -1115,6 +1140,7 @@ GATE_ELIGIBLE_RECHECK_S = 30.0
 GATE_INELIGIBLE_ENV = "GLAEDA_RUNNER_GATE_INELIGIBLE"
 # Across a reload: "clean" when this gate started its listener with listener_env, else why its env is stale.
 GATE_LISTENER_ENV = "GLAEDA_RUNNER_GATE_LISTENER_ENV"
+GATE_RESERVE_FD_ENV = "GLAEDA_RUNNER_GATE_RESERVE_FD"  # a reload hands its reserve flock's fd to the new gate
 
 
 def _repo_name(repo: Any) -> str | None:
@@ -3185,8 +3211,8 @@ def admission_waiters(capacity_dir: Path, skip_pid: int = 0) -> list[dict[str, A
             if not math.isfinite(since):  # an infinite or NaN since would break the one total order
                 continue
             wants = [str(kind) for kind in data.get("wants") or [] if isinstance(kind, str)]
-        except (OSError, ValueError, TypeError, KeyError, AttributeError):
-            continue
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
+            continue  # OverflowError: a since too large for a float (an integer past 1e308)
         tier = data.get("tier") if data.get("tier") in (TIER_NIGHTLY, TIER_DEV) else ""
         waiters.append({"pid": pid, "since": since, "wants": wants, "who": str(data.get("who") or "")[:200],
                         "tier": tier})
@@ -3430,12 +3456,25 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                 return False, f"capacity: {held} ({job or 'unknown job'} is {klass})"
         # every job but a reserving runner's own leaves the idle reserves free (GUI_RESERVE, FRESH_RESERVE_TOKEN); a
         # nightly job keeps none (FEED_FIRST)
-        kept = 0 if tier == TIER_NIGHTLY else reserve_for(gui_reserved(capacity_dir, own_reserve), units, total)
+        def kept_now() -> int:
+            return 0 if tier == TIER_NIGHTLY else reserve_for(gui_reserved(capacity_dir, own_reserve), units, total)
+
+        kept = kept_now()
+        lent: int | None = None
+        if own_reserve is not None and units > 0:
+            # the reserving runner's own job: its holder lends the reserve (RESERVE_LENT) for as long as it lives. Taken
+            # before the units and let go before them (hold's close_first), so the lend never outlives the job's units.
+            # The previous job's holder may still be letting go: wait for it briefly. One not taken leaves the reserve
+            # counted beside this job, which keeps more units from the other lanes, never fewer.
+            lend_until = time.monotonic() + LEND_WAIT_S
+            while (lent := lock_file(lent_file(capacity_dir / f"{own_reserve}{GUI_RESERVE}"), fcntl.LOCK_EX)) is None \
+                    and time.monotonic() < lend_until:
+                time.sleep(0.1)
+            if lent is not None:
+                fds.append(lent)
         got = spare = 0
         unit_fds: list[int] = []
         for slot in range(total):
-            if got == units and spare >= kept:
-                break
             fd = lock_file(capacity_dir / f"unit-{slot}", fcntl.LOCK_EX)
             if fd is None:
                 continue
@@ -3446,6 +3485,9 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
             else:  # free beside this job's units: one the reserve keeps (under admission.lock, so it stays free)
                 os.close(fd)
                 spare += 1
+        # a lend that ended during the scan (its holder let the job's units go) makes the reserve whole again: the
+        # larger of the two looks, so units freed by that holder are never counted as spare beside a kept-at-0 reserve
+        kept = max(kept, kept_now())
         if got < units or spare < kept:
             if taken_out is not None:
                 taken_out["wants"] = ["units"]
@@ -3455,8 +3497,11 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         split = named[root] if root and klass in ROOT_SWITCHERS else None
         if split is not None:  # its own holder (ROOT_SWITCHERS); the main holder must not inherit it
             fds.remove(split)
+        # a lent reserve covers the job's whole admission: its units are never released early (the sampler's
+        # dynamic release), else the reserve would stay lent while the units it stands for went to other jobs
         held, note = hold(fds, watch_pid, state_dir, drop=(admission,) if split is None else (admission, split),
-                          release_fds=unit_fds)
+                          release_fds=[] if own_reserve is not None and units > 0 else unit_fds,
+                          close_first=(lent,) if lent is not None else ())
         fds = [] if split is None else [split]  # the holder has them now, or hold closed them
         if held and split is not None:
             held, why = hold(fds, watch_pid, state_dir, drop=(admission,), pid_file=root_holder_file(state_dir, root),
@@ -3485,12 +3530,15 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
 
 
 def hold(fds: list[int], watch: int | JobOwner, state_dir: Path, drop: tuple[int, ...] = (),
-         pid_file: Path | None = None, release_fds: list[int] | None = None) -> tuple[bool, str]:
+         pid_file: Path | None = None, release_fds: list[int] | None = None,
+         close_first: tuple[int, ...] = ()) -> tuple[bool, str]:
     """Hand the locked fds to a detached holder that keeps them until job-completed or the job's owner exits.
     watch is the owner job-started pinned (JobOwner), or a pid a step resolved just now (take-root, take-gui).
     Closes this process's copies either way. The holder closes `drop` (locks that must not outlive the
     admission). Succeeds only once the holder reports its own pid. pid_file defaults to the runner's
-    holder file; take-root passes its own so a second holder for the same job lives beside it."""
+    holder file; take-root passes its own so a second holder for the same job lives beside it. close_first (fds
+    among fds) are let go before every other lock when the holder ends (the reserve's lend, RESERVE_LENT, so no
+    reader sees the job's units free while the reserve still counts as lent)."""
     owner = watch if isinstance(watch, JobOwner) else JobOwner.of(watch)
     if owner is None:
         close_all(fds)
@@ -3556,6 +3604,7 @@ def hold(fds: list[int], watch: int | JobOwner, state_dir: Path, drop: tuple[int
                         pass
                 time.sleep(HOLDER_POLL_S)
         finally:
+            close_all(list(close_first))
             for leftover in ("releasing", "pid_file"):  # still ours: released, or the job died first
                 with contextlib.suppress(Exception):
                     path = releasing if leftover == "releasing" else pid_file
@@ -4568,12 +4617,20 @@ class Gate:
             os.environ[GATE_INELIGIBLE_ENV] = self.eligible_why
         if self.child is not None:
             os.environ[GATE_LISTENER_ENV] = self.stale_env or "clean"
+        if self.reserve_fd is not None:  # the flock stays held across the exec: no admission sees the reserve free
+            with contextlib.suppress(OSError):
+                os.set_inheritable(self.reserve_fd, True)
+                os.environ[GATE_RESERVE_FD_ENV] = str(self.reserve_fd)
         try:
             os.execv(sys.executable, [sys.executable, *argv])
         except OSError:
             os.environ.pop(GATE_LISTENING_SINCE_ENV, None)
             os.environ.pop(GATE_INELIGIBLE_ENV, None)
             os.environ.pop(GATE_LISTENER_ENV, None)
+            os.environ.pop(GATE_RESERVE_FD_ENV, None)
+            if self.reserve_fd is not None:
+                with contextlib.suppress(OSError):
+                    os.set_inheritable(self.reserve_fd, False)
             signal.pthread_sigmask(signal.SIG_UNBLOCK, blocked)
             gate_log("the reload failed; keeping this gate")
 
@@ -4841,21 +4898,60 @@ class Gate:
     def reserve(self, want: bool) -> None:
         """Hold or let go of this gui runner's reserve (GUI_RESERVE: capacity/<gui token>.reserve), which keeps
         GUI_RESERVE_UNITS units from every other job and runner on the mini. step() holds it while the runner is
-        idle and reserves() agrees, keeps it through a new job's admission, and lets it go once that job is
-        admitted (admitted()). Only a gui runner with a capacity ledger reserves. The flock is the gate's own fd (not inherited by run.sh, closed by a reload's exec, which
-        takes it again on its next poll), so a gate that dies reserves nothing. Never raises: a reserve it cannot
+        idle and reserves() agrees, and keeps it through the runner's own job, which its admission holder lends
+        (RESERVE_LENT), so it is whole again the moment that job's units go back. Only a gui runner with a capacity
+        ledger reserves. The flock is the gate's own fd (not inherited by run.sh; a reload hands it to the new gate,
+        adopt_reserve), so a gate that dies reserves nothing. Never raises: a reserve it cannot
         take is tried again on the next poll."""
         if want and self.reserve_fd is None:
-            scope = runner_scope(self.runner_dir)
-            token = reserve_token(scope)
-            if token is None or scope.units <= 0 or self.capacity_dir is None or not self.capacity_dir.is_dir():
+            path = self.reserve_path()
+            if path is None:
                 return
             with contextlib.suppress(OSError):
-                self.reserve_fd = lock_file(self.capacity_dir / f"{token}{GUI_RESERVE}", fcntl.LOCK_EX)
+                self.reserve_fd = lock_file(path, fcntl.LOCK_EX)
         elif not want and self.reserve_fd is not None:
             with contextlib.suppress(OSError):
                 os.close(self.reserve_fd)
             self.reserve_fd = None
+
+    def adopt_reserve(self, handed: str | None) -> None:
+        """Take over the reserve flock the gate before a reload held (GATE_RESERVE_FD_ENV), so the reserve is never
+        free across the exec. Only an fd open on this runner's own <token>.reserve is kept; anything else is closed
+        if it was a number, and ignored otherwise. Never raises."""
+        try:
+            fd = int(handed or "")
+        except ValueError:
+            return
+        if fd < 3:
+            return
+        path = self.reserve_path()
+        try:
+            same = path is not None and os.path.samestat(os.fstat(fd), os.stat(path, follow_symlinks=False))
+        except OSError:
+            same = False
+        if not same:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            return
+        with contextlib.suppress(OSError):
+            os.set_inheritable(fd, False)
+        self.reserve_fd = fd
+
+    def reserve_path(self) -> Path | None:
+        """This runner's capacity/<token>.reserve, or None when it reserves nothing (reserve())."""
+        scope = runner_scope(self.runner_dir)
+        token = reserve_token(scope)
+        if token is None or scope.units <= 0 or self.capacity_dir is None or not self.capacity_dir.is_dir():
+            return None
+        return self.capacity_dir / f"{token}{GUI_RESERVE}"
+
+    def keeps_reserve(self, why: str | None) -> bool:
+        """reserves(why), except that a held reserve is never let go once a job has arrived meanwhile: claimed() can
+        read the runner's own new job (its gui token, its units) as a reason to hold off, and a reserve dropped then
+        stays dropped through that job, reopening the gap at its end (review of glaeda#1651)."""
+        if self.reserves(why):
+            return True
+        return self.reserve_fd is not None and self.busy()
 
     def reserves(self, why: str | None) -> bool:
         """Whether an idle gui runner keeps its reserve, given claimed()'s answer: only while nothing holds it or
@@ -4863,19 +4959,6 @@ class Gate:
         pressure, a locked console, the gui token or the canonical roots, it could take no job, so the unit would
         only sit idle."""
         return (why is None or (why == self.full_why and UNITS_FULL in why)) and self.locked() is None
-
-    def admitted(self) -> bool:
-        """Whether this runner's job holds its admission: the holder job-started leaves (holder_file, named for the
-        runner in its .runner file) is alive. Until then a busy gui runner keeps its reserve, so a job waiting here
-        for units cannot take the reserved unit in the seconds between the listener taking the job and its
-        job-started admitting it. Unreadable counts as admitted: the reserve goes back, as before it existed."""
-        try:
-            name = json.loads((self.runner_dir / ".runner").read_text(encoding="utf-8-sig")).get("agentName")
-        except (OSError, ValueError, AttributeError):
-            return True
-        if not isinstance(name, str) or not name:
-            return True
-        return holder_alive(holder_file(self.state_dir, name))
 
     def tree(self) -> tuple[list[int], dict[int, tuple[int, str]]]:
         table = processes()
@@ -5091,16 +5174,25 @@ class Gate:
                     self.fast_until = time.monotonic() + 5.0
                 self.streak = 0  # a claim must hold for two idle polls, not carry over from the job
                 self.load_since = None  # the hold limit times a pause, never a job
-                if self.reserve_fd is not None and self.admitted():
-                    self.reserve(False)  # its job has its units: the reserve goes back to the other lanes
+                # the reserve stays held through the runner's own job: its admission lends it (RESERVE_LENT), so it
+                # keeps nothing while that job holds its units and is whole the moment they go back. One the job could
+                # not borrow keeps its units from the other lanes meanwhile, the safe side.
+                if self.reserve_fd is None and self.locked() is None:
+                    # one let go at an idle look a job then beat, or a reload's: a job of its own always gets it
+                    # back, read from nothing but the job itself, so no state is lost across a reload
+                    self.reserve(True)
                 return None
             why = self.claimed()
-            self.reserve(self.reserves(why))
+            if self.reserves(why):
+                self.reserve(True)
             self.streak = self.streak + 1 if why else 0
             if why and self.streak >= GATE_CONFIRM and not self.first_poll(why):
                 why = self.confirmed()
                 if why and not self.busy():  # the fresh look and the busy check right before the signal
                     self.stop(why)
+            # let go only after the last look (confirmed() included), and never with a job of its own arrived
+            # (keeps_reserve); a job that beats even this busy() check gets it back on its first busy poll
+            self.reserve(self.keeps_reserve(why))
             return None
         if self.terminating:
             return 0
@@ -5109,7 +5201,7 @@ class Gate:
             self.reserve(False)  # a runner GitHub no longer knows takes no job: it keeps no units from the others
             return None
         why = self.claimed()
-        self.reserve(self.reserves(why))
+        self.reserve(self.keeps_reserve(why))
         if why:
             if why != self.held:
                 gate_log(f"holding the listener off: {why}")
@@ -5191,6 +5283,7 @@ class Gate:
 def listen(runner_dir: Path, host_lock: str, reservation: str, state_dir: Path, waiters: bool,
            adopt: int = 0, capacity_dir: Path | None = None, fit_units: int = 1) -> int:
     gate = Gate(runner_dir, host_lock, reservation, state_dir, waiters, capacity_dir, fit_units)
+    gate.adopt_reserve(os.environ.pop(GATE_RESERVE_FD_ENV, None))
     marker = os.environ.pop(GATE_LISTENER_ENV, None)
     xcode = runner_xcode(runner_dir)
     if adopt:

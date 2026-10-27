@@ -1496,6 +1496,151 @@ class HookTest(unittest.TestCase):
             (self.dir / "capacity" / f"{hook.ADMIT_WANT}{os.getppid()}").unlink(missing_ok=True)
             self.finish("d0")
 
+    def test_a_freshness_slots_reserve_lent_to_its_job_is_whole_again_when_that_job_ends(self) -> None:
+        """2026-10-27 05:06-05:07Z: the slot's gate let its reserve go once its job was admitted and took it again
+        only on its next idle poll, so PR jobs waiting for units took the job's 4 units the moment job-completed let
+        them go: the slot found the mini full (1 of 14 free) and held its listener off, and a DEV compile its
+        listener took at once was refused behind an older PR waiter (run 40452488452). Lent to its job, the reserve
+        keeps nothing while that job holds its units and is whole the moment the job's holder exits."""
+        self.fleet()
+        self.take_units(10)
+        reserve_fd = self.hold_gui_reserve(hook.FRESH_RESERVE_TOKEN)
+        self.addCleanup(os.close, reserve_fd)
+        reserve = self.dir / "capacity" / f"{hook.FRESH_RESERVE_TOKEN}{hook.GUI_RESERVE}"
+        holder = subprocess.Popen([sys.executable, "-c", "import fcntl, os, sys, time\n"
+                                   "fd = os.open(sys.argv[1], os.O_RDONLY | os.O_CREAT, 0o644)\n"
+                                   "fcntl.flock(fd, fcntl.LOCK_EX)\nprint('held', flush=True)\ntime.sleep(60)\n",
+                                   os.fspath(hook.lent_file(reserve))], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: (holder.kill(), holder.wait(), holder.stdout.close()))
+        self.assertEqual(holder.stdout.readline().strip(), "held")  # the slot's job's holder lends the reserve
+        waiter = self.dir / "capacity" / f"{hook.ADMIT_WANT}{os.getppid()}"
+        try:
+            side = self.job("swift-package-tests", "s0", 14)
+            self.assertEqual(side.returncode, 0, side.stdout + side.stderr)
+            self.assertNotIn("kept for an idle reserving runner", side.stdout, "lent to a running job: nothing kept")
+            self.finish("s0")
+            holder.kill()
+            holder.wait()
+            again = self.job("swift-package-tests", "s1", 14)
+            self.assertEqual(again.returncode, 1, again.stdout)
+            self.assertIn(f"{hook.FRESH_RESERVE_UNITS} are kept for an idle reserving runner", again.stdout,
+                          "its job ended: kept at once")
+            waiter.write_text(json.dumps({"since": time.time() - 300, "wants": ["units"],
+                                          "who": "s9 release-compile (run 40450610811)"}) + "\n")
+            ref = "refs/heads/feat-cmux-next"
+            dispatch = event(self.dir, "dev-daily", {"repository": CMUX, "ref": ref,
+                                                     "inputs": {"dev_daily": "true"}})
+            fresh = self.run_hook(
+                "job-started", "workflow_dispatch", dispatch, "--allowed-repo", "manaflow-ai/cmux", "--no-disk",
+                "--state-dir", os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()), "--gui-wait", "0",
+                "--capacity-units", "14", "--capacity-dir", os.fspath(self.dir / "capacity"), "--dev-compile-runner",
+                repo="manaflow-ai/cmux",
+                env={"GITHUB_JOB": "cmux-scheme-compile", "RUNNER_NAME": "d0", "GITHUB_REF": ref,
+                     "GITHUB_WORKFLOW_REF": f"manaflow-ai/cmux/.github/workflows/cmux-next.yml@{ref}"})
+            self.assertEqual(fresh.returncode, 0, fresh.stdout + fresh.stderr)
+            self.assertIn("for cmux-scheme-compile (isolated", fresh.stdout, "its own reserve: no PR waiter ahead")
+            self.assertTrue(hook.reserve_lent(reserve), "its admission holder lends the reserve while the job runs")
+            self.finish("d0")
+            self.assertFalse(hook.reserve_lent(reserve), "the job's units went back: so did the lend")
+        finally:
+            waiter.unlink(missing_ok=True)
+            for runner in ("s0", "s1", "d0"):
+                self.finish(runner)
+
+    def slot_job(self, runner: str = "d0") -> subprocess.CompletedProcess:
+        ref = "refs/heads/feat-cmux-next"
+        push = event(self.dir, f"fresh-{runner}", {"repository": CMUX, "ref": ref})
+        return self.run_hook(
+            "job-started", "push", push, "--allowed-repo", "manaflow-ai/cmux", "--no-disk", "--state-dir",
+            os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()), "--gui-wait", "0",
+            "--capacity-units", "14", "--capacity-dir", os.fspath(self.dir / "capacity"), "--dev-compile-runner",
+            repo="manaflow-ai/cmux",
+            env={"GITHUB_JOB": "release-compile", "RUNNER_NAME": runner, "GITHUB_REF": ref,
+                 "GITHUB_WORKFLOW_REF": f"manaflow-ai/cmux/.github/workflows/cmux-next.yml@{ref}"})
+
+    def test_the_slots_holder_lends_first_lets_the_lend_go_first_and_never_releases_units_early(self) -> None:
+        """Review: a lend held while the holder released units early (the sampler's dynamic release) kept the reserve
+        at 0 while those units went to other jobs; and a holder that let its units go before its lend let a reader
+        count them spare beside a kept-at-0 reserve. The slot's job's holder ignores release requests and lets its
+        lend go before its units."""
+        self.fleet()
+        reserve_fd = self.hold_gui_reserve(hook.FRESH_RESERVE_TOKEN)
+        self.addCleanup(os.close, reserve_fd)
+        capacity = self.dir / "capacity"
+        reserve = capacity / f"{hook.FRESH_RESERVE_TOKEN}{hook.GUI_RESERVE}"
+        try:
+            fresh = self.slot_job()
+            self.assertEqual(fresh.returncode, 0, fresh.stdout + fresh.stderr)
+            self.assertTrue(hook.reserve_lent(reserve))
+            units = hook.FRESH_RESERVE_UNITS
+            taken = [slot for slot in range(14) if not hook.probe(capacity / f"unit-{slot}")]
+            self.assertEqual(len(taken), units)
+            main = hook.holder_file(self.dir / "state", "d0")
+            main.with_name(main.name + ".release").write_text(json.dumps({"keep_units": 1}))
+            time.sleep(hook.HOLDER_POLL_S * 3)
+            self.assertEqual([slot for slot in range(14) if not hook.probe(capacity / f"unit-{slot}")], taken,
+                             "a lent reserve's job keeps every unit it was admitted with")
+        finally:
+            self.finish("d0")
+        self.assertFalse(hook.reserve_lent(reserve))
+        self.assertTrue(all(hook.probe(capacity / f"unit-{slot}") for slot in range(14)))
+
+    def test_the_slots_next_job_waits_briefly_for_the_previous_holders_lend(self) -> None:
+        """Review: an old holder still owning the lend made the next slot job admit unlent and with early release on.
+        The admission waits LEND_WAIT_S for the lend, and a slot job never releases units early either way."""
+        self.fleet()
+        reserve_fd = self.hold_gui_reserve(hook.FRESH_RESERVE_TOKEN)
+        self.addCleanup(os.close, reserve_fd)
+        reserve = self.dir / "capacity" / f"{hook.FRESH_RESERVE_TOKEN}{hook.GUI_RESERVE}"
+        old = subprocess.Popen([sys.executable, "-c", "import fcntl, os, sys, time\n"
+                                "fd = os.open(sys.argv[1], os.O_RDONLY | os.O_CREAT, 0o644)\n"
+                                "fcntl.flock(fd, fcntl.LOCK_EX)\nprint('held', flush=True)\ntime.sleep(1.5)\n",
+                                os.fspath(hook.lent_file(reserve))], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: (old.kill(), old.wait(), old.stdout.close()))
+        self.assertEqual(old.stdout.readline().strip(), "held")
+        try:
+            fresh = self.slot_job()
+            self.assertEqual(fresh.returncode, 0, fresh.stdout + fresh.stderr)
+            self.assertTrue(hook.reserve_lent(reserve), "the old holder let go: this job holds the lend")
+        finally:
+            self.finish("d0")
+
+    def test_an_admission_rereads_the_reserve_after_its_unit_scan(self) -> None:
+        """Review: a PR admission read the reserve as lent (keeping 0), the slot's job ended during its unit scan,
+        and it took units the whole reserve needed. The larger of the looks before and after the scan counts."""
+        self.fleet()
+        self.take_units(10)
+        reserve_fd = self.hold_gui_reserve(hook.FRESH_RESERVE_TOKEN)
+        self.addCleanup(os.close, reserve_fd)
+        reserve = self.dir / "capacity" / f"{hook.FRESH_RESERVE_TOKEN}{hook.GUI_RESERVE}"
+        lend = hook.lock_file(hook.lent_file(reserve), fcntl.LOCK_EX)
+        real = hook.gui_reserved
+        looks = []
+
+        def ends_mid_scan(*args, **kwargs):
+            looks.append(1)
+            if len(looks) == 2:  # the job ends between the two looks
+                os.close(lend)
+            return real(*args, **kwargs)
+
+        taken: dict = {}
+        with mock.patch.object(hook, "gui_reserved", side_effect=ends_mid_scan), \
+                mock.patch.object(hook, "fair_turn", return_value=None), \
+                mock.patch.object(hook, "hold", return_value=(True, "held")):
+            ok, why = hook.take_capacity(os.fspath(self.dir / "fleet" / "host.lock"), self.dir / "capacity", 14,
+                                         "swift-package-tests", os.getpid(), self.dir / "state", taken_out=taken)
+        self.assertFalse(ok, why)
+        self.assertIn(f"{hook.FRESH_RESERVE_UNITS} are kept for an idle reserving runner", why)
+
+    def test_a_waiter_marker_with_a_since_past_float_range_is_skipped(self) -> None:
+        """A marker is written by a job on this mini, so it is untrusted: a since too large for a float raised
+        OverflowError out of admission_waiters (and every gate and admission that reads it)."""
+        capacity = self.dir / "capacity"
+        capacity.mkdir(parents=True, exist_ok=True)
+        (capacity / f"{hook.ADMIT_WANT}{os.getppid()}").write_text('{"since": 1' + "0" * 400 + ', "wants": ["units"]}\n')
+        self.assertEqual(hook.admission_waiters(capacity), [])
+        self.assertIsNone(hook.fair_turn(capacity, {"units"}, time.time()))
+
     def nightly_job(self, ref: str, runner: str, job: str = "build-nightly-app") -> subprocess.CompletedProcess:
         push = event(self.dir, f"nightly-{runner}", {"repository": CMUX, "ref": ref})
         return self.run_hook(
@@ -6630,21 +6775,195 @@ class GateTest(unittest.TestCase):
             self.assertFalse(hook.probe(reserve), "idle: the slot holds its reserve")
             self.assertEqual(hook.gui_reserved(capacity), hook.FRESH_RESERVE_UNITS)
             self.assertEqual(hook.gui_reserved(capacity, hook.FRESH_RESERVE_TOKEN), 0, "its own job takes it")
-        # A job arrives: the reserve stays until that job holds its admission, then goes back to the other lanes.
+        # A job arrives: the reserve stays whole until that job holds its admission, then is lent to it: it keeps
+        # nothing while the job holds its units, and is whole again the moment the job's holder lets them go, before
+        # any gate poll (2026-10-27 05:07:50Z: PR waiters took the units in the seconds before the next idle poll).
         gate.child = mock.Mock(poll=mock.Mock(return_value=None))
         (self.runner / ".runner").write_text("\ufeff" + json.dumps({"agentName": "mini-glaeda-1"}), encoding="utf-8")
+        holder_proc = subprocess.Popen([sys.executable, "-c", "import fcntl, os, sys, time\n"
+                                   "fd = os.open(sys.argv[1], os.O_RDONLY | os.O_CREAT, 0o644)\n"
+                                   "fcntl.flock(fd, fcntl.LOCK_EX)\nprint('held', flush=True)\nsys.stdin.read()\n",
+                                   os.fspath(hook.lent_file(reserve))], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: (holder_proc.kill(), holder_proc.wait(), holder_proc.stdout.close(),
+                                 holder_proc.stdin.close()))
         with mock.patch.object(gate, "start"), mock.patch.object(gate, "stop"), \
                 mock.patch.object(gate, "reload"), mock.patch.object(gate, "saturated", return_value=None), \
                 mock.patch.object(gate, "busy", return_value=True):
             gate.step()
             self.assertFalse(hook.probe(reserve), "a job not yet admitted: its units wait for it")
+            self.assertEqual(hook.gui_reserved(capacity), hook.FRESH_RESERVE_UNITS)
             self.state.mkdir(parents=True, exist_ok=True)
             holder = hook.holder_file(self.state, "mini-glaeda-1")
-            holder.write_text(f"{os.getpid()}\n")
+            holder.write_text(f"{holder_proc.pid}\n")
+            self.assertEqual(holder_proc.stdout.readline().strip(), "held")  # its admission holder took the lend
             gate.step()
-            self.assertTrue(hook.probe(reserve), "its job holds its units: the reserve is released")
-            self.assertEqual(hook.gui_reserved(capacity), 0)
+            self.assertFalse(hook.probe(reserve), "its job holds its units: the reserve is kept, lent to that job")
+            self.assertTrue(hook.reserve_lent(reserve))
+            self.assertEqual(hook.gui_reserved(capacity), 0, "lent: its job's own units are the reserve")
+            gate.step()
+            self.assertEqual(hook.gui_reserved(capacity), 0, "still lent on the next poll")
+            holder_proc.stdin.close()
+            holder_proc.wait()
+            self.assertEqual(hook.gui_reserved(capacity), hook.FRESH_RESERVE_UNITS,
+                             "the job let its units go: the reserve is whole at once, with no gate poll")
             holder.unlink()
+        # The next job of the slot's own listener, taken before any idle poll, finds its reserve whole (take_capacity
+        # in_reserve): an older PR job waiting for units does not go ahead of it.
+        self.assertFalse(hook.probe(reserve))
+        with mock.patch.object(gate, "start"), mock.patch.object(gate, "stop"), \
+                mock.patch.object(gate, "reload"), mock.patch.object(gate, "saturated", return_value=None), \
+                mock.patch.object(gate, "busy", return_value=False):
+            gate.step()
+            self.assertFalse(hook.probe(reserve), "idle again: still held")
+        # Review: the gate once read "admitted, not lent" (a holder letting go, or one that took no lend) as a reason to
+        # drop the reserve, reopening the gap. It keeps the reserve through any job of its own; unlent, the reserve still
+        # counts beside the job, the safe side.
+        gate.child = mock.Mock(poll=mock.Mock(return_value=None))
+        holder.write_text(f"{os.getpid()}\n")
+        with mock.patch.object(gate, "start"), mock.patch.object(gate, "stop"), \
+                mock.patch.object(gate, "reload"), mock.patch.object(gate, "saturated", return_value=None), \
+                mock.patch.object(gate, "busy", return_value=True):
+            gate.step()
+            self.assertFalse(hook.probe(reserve), "admitted without a lend: still held")
+            self.assertEqual(hook.gui_reserved(capacity), hook.FRESH_RESERVE_UNITS, "and counted beside the job")
+        holder.unlink()
+        gate.reserve(False)
+        self.assertTrue(hook.probe(reserve))
+
+    def test_a_job_arriving_during_the_idle_look_keeps_the_reserve(self) -> None:
+        """Review: a job taken after busy() read false but before claimed() finished made claimed() see the runner's
+        own job (its gui token) and drop the reserve, which then stayed dropped through the job."""
+        capacity = self.units(0)
+        reserve = capacity / f"gui{hook.GUI_RESERVE}"
+        gate = self.gui_gate(capacity)
+        busy = [False]
+        with mock.patch.object(gate, "start"), mock.patch.object(gate, "stop"), \
+                mock.patch.object(gate, "reload"), mock.patch.object(gate, "saturated", return_value=None), \
+                mock.patch.object(hook, "console_refusal", return_value=None), \
+                mock.patch.object(gate, "busy", side_effect=lambda: busy[0]):
+            gate.step()
+            self.assertFalse(hook.probe(reserve), "idle: held")
+            gate.child = mock.Mock(poll=mock.Mock(return_value=None))
+            real = gate.claimed
+
+            def job_arrives():
+                busy[0] = True  # the listener took a job during the look
+                token = hook.lock_file(capacity / "gui.token", fcntl.LOCK_EX)
+                self.addCleanup(os.close, token)
+                return real()
+
+            with mock.patch.object(gate, "claimed", side_effect=job_arrives):
+                busy[0] = False
+                gate.step()
+            self.assertFalse(hook.probe(reserve), "its own job arrived meanwhile: the reserve stays")
+            gate.step()
+            self.assertFalse(hook.probe(reserve), "and through the job")
+
+    def test_a_job_arriving_during_the_confirming_look_keeps_the_reserve(self) -> None:
+        """Review (round 6): the reserve was let go on claimed()'s answer, before confirmed(); a job taken during the
+        confirming look then skipped the stop and never got the reserve back. It is let go only after the last look,
+        and only with no job of its own."""
+        capacity = self.units(0)
+        reserve = capacity / f"gui{hook.GUI_RESERVE}"
+        gate = self.gui_gate(capacity)
+        busy = [False]
+        with mock.patch.object(gate, "start"), mock.patch.object(gate, "stop") as stop, \
+                mock.patch.object(gate, "reload"), mock.patch.object(gate, "saturated", return_value=None), \
+                mock.patch.object(gate, "first_poll", return_value=False), \
+                mock.patch.object(hook, "console_refusal", return_value=None), \
+                mock.patch.object(gate, "busy", side_effect=lambda: busy[0]):
+            gate.step()
+            self.assertFalse(hook.probe(reserve), "idle: held")
+            gate.child = mock.Mock(poll=mock.Mock(return_value=None))
+
+            def job_arrives():
+                busy[0] = True  # the listener took a job during the confirming look
+                return "held for the fleet"
+
+            gate.streak = hook.GATE_CONFIRM
+            with mock.patch.object(gate, "claimed", return_value="held for the fleet"), \
+                    mock.patch.object(gate, "confirmed", side_effect=job_arrives):
+                gate.step()
+            stop.assert_not_called()
+            self.assertFalse(hook.probe(reserve), "its own job arrived during confirmed(): the reserve stays")
+            gate.step()
+            self.assertFalse(hook.probe(reserve), "and through the job")
+            gate.reserve(False)
+
+    def test_a_job_beating_the_last_busy_check_gets_the_reserve_back(self) -> None:
+        """A job that arrives after the idle look's last busy() read finds the reserve let go; its first busy poll
+        takes it back, so the job's end does not reopen the gap. Review (round 7): the retake reads only the job, so a
+        reload between the drop and that poll loses nothing."""
+        capacity = self.units(0)
+        reserve = capacity / f"gui{hook.GUI_RESERVE}"
+        gate = self.gui_gate(capacity)
+        busy = [False]
+        with mock.patch.object(gate, "start"), mock.patch.object(gate, "stop"), \
+                mock.patch.object(gate, "reload"), mock.patch.object(gate, "saturated", return_value=None), \
+                mock.patch.object(hook, "console_refusal", return_value=None), \
+                mock.patch.object(gate, "busy", side_effect=lambda: busy[0]):
+            gate.step()
+            self.assertFalse(hook.probe(reserve), "idle: held")
+            gate.child = mock.Mock(poll=mock.Mock(return_value=None))
+            with mock.patch.object(gate, "claimed", return_value="held for the fleet"):
+                gate.step()
+            self.assertTrue(hook.probe(reserve), "a hold with no job: let go")
+        child = gate.child
+        gate.reserve(False)
+        gate = self.gui_gate(capacity)  # a reload: a new gate with nothing carried over
+        self.addCleanup(gate.reserve, False)
+        gate.child = child
+        with mock.patch.object(gate, "start"), mock.patch.object(gate, "stop"), \
+                mock.patch.object(gate, "reload"), mock.patch.object(gate, "saturated", return_value=None), \
+                mock.patch.object(hook, "console_refusal", return_value=None), \
+                mock.patch.object(gate, "busy", return_value=True):
+            gate.step()
+            self.assertFalse(hook.probe(reserve), "the job that beat the check gets the reserve back, reload or not")
+
+    def test_a_lend_is_a_flock_so_a_file_or_a_pid_lends_nothing(self) -> None:
+        """Review: a .lent naming a pid could be satisfied by a reused pid or written by any job. The lend is the
+        admission holder's flock on <token>.reserve.lent: the file's contents mean nothing, and the lend dies with the
+        process that holds it."""
+        capacity = self.units(0)
+        reserve = capacity / f"{hook.FRESH_RESERVE_TOKEN}{hook.GUI_RESERVE}"
+        fd = hook.lock_file(reserve, fcntl.LOCK_EX)
+        self.addCleanup(os.close, fd)
+        hook.lent_file(reserve).write_text(f"{os.getpid()} {hook.process_identity(os.getpid())}\n")
+        self.assertFalse(hook.reserve_lent(reserve), "contents lend nothing")
+        self.assertEqual(hook.gui_reserved(capacity), hook.FRESH_RESERVE_UNITS)
+        lend = hook.lock_file(hook.lent_file(reserve), fcntl.LOCK_EX)
+        self.assertTrue(hook.reserve_lent(reserve))
+        self.assertEqual(hook.gui_reserved(capacity), 0)
+        os.close(lend)
+        self.assertEqual(hook.gui_reserved(capacity), hook.FRESH_RESERVE_UNITS, "the holder is gone: whole again")
+
+    def test_a_reload_hands_the_reserve_flock_to_the_new_gate(self) -> None:
+        """The reserve flock is the gate's fd; a reload's exec used to close it, so admissions saw the reserve free
+        until the new gate's first poll. Now the fd is inherited (GATE_RESERVE_FD_ENV) and adopted only when it is
+        open on this runner's own reserve."""
+        capacity = self.units(0)
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(exist_ok=True)
+        script.write_text("#!/bin/bash\nexec /usr/bin/python3 /hook job-started --capacity-units 10 --instance 1"
+                          " --dev-compile-runner\n")
+        reserve = capacity / f"{hook.FRESH_RESERVE_TOKEN}{hook.GUI_RESERVE}"
+        fd = hook.lock_file(reserve, fcntl.LOCK_EX)
+        os.set_inheritable(fd, True)
+        gate = self.full_gate(capacity)
+        self.addCleanup(gate.reserve, False)
+        gate.adopt_reserve(str(fd))
+        self.assertEqual(gate.reserve_fd, fd)
+        self.assertFalse(os.get_inheritable(fd), "never leaked into run.sh")
+        self.assertFalse(hook.probe(reserve), "still held")
+        other = os.open(capacity / "other", os.O_RDONLY | os.O_CREAT, 0o644)
+        second = self.full_gate(capacity)
+        second.adopt_reserve(str(other))
+        self.assertIsNone(second.reserve_fd, "an fd on another file is not a reserve")
+        with self.assertRaises(OSError):
+            os.fstat(other)
+        for junk in (None, "", "x", "2"):
+            second.adopt_reserve(junk)
+            self.assertIsNone(second.reserve_fd)
 
     def gui_gate(self, capacity: Path, gui: bool = True) -> hook.Gate:
         script = self.runner / hook.RUNNER_HOOK_SCRIPT
@@ -6680,8 +6999,11 @@ class GateTest(unittest.TestCase):
             self.state.mkdir(parents=True, exist_ok=True)
             holder = hook.holder_file(self.state, "mini-glaeda-3")
             holder.write_text(f"{os.getpid()}\n")
+            lend = hook.lock_file(hook.lent_file(reserve), fcntl.LOCK_EX)  # what its admission holder takes
             gate.step()
-            self.assertTrue(hook.probe(reserve), "its job holds its units: the reserve goes to the other lanes")
+            self.assertFalse(hook.probe(reserve), "its job holds its units: the reserve is kept, lent to it")
+            self.assertEqual(hook.gui_reserved(capacity), 0)
+            os.close(lend)
             holder.unlink()
             busy.return_value = False
             gate.step()
