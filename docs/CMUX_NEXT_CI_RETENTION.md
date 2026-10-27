@@ -118,3 +118,31 @@ process/open-file/marker checks and each rename. Any live `Runner.Worker`,
 candidate and returns a deferred result. The flag is restricted to
 `cmux-next-ci-generated` with `--pressure --need --apply`; it cannot widen ordinary cache,
 paused-runner, or idle cleanup.
+
+## The nightly-next per-runner trees
+
+cmux's `scripts/ci/nightly_build_state.py` keeps NEXT's package checkouts,
+compilation cache and notices crates under
+`~/Library/Caches/cmux-nightly-next/<runner>`, one 7-9 GiB tree per runner that
+ever built nightly-next. On 2026-10-27 that was 0-35 GiB per mini.
+
+Once the build routes to one dedicated builder (cmux's
+`vars.CI_NIGHTLY_NEXT_DEDICATED_LABEL`), set `disk-policy.json`'s
+`nightly_next_dedicated_label` to that label, `glaeda-trusted-next-nightly`.
+Then:
+
+- the root leaves `library-caches`;
+- each pool runner's tree (`<member>-glaeda[-K]`) becomes its own
+  `cmux-nightly-next-fallback` item, which goes once idle 12 h, the normal age;
+- the dedicated builder's tree (`*-nightly-next`) and any name the family does
+  not recognize are never candidates.
+
+While the builder is busy, the build still falls back to an idle pool mini and
+then Blacksmith (cmux `scripts/ci/nightly_build_runner.py`). So a recently used
+fallback tree stays warm for that overflow. Before this change, any pool build
+kept the whole root fresh, so every tree on a mini stayed. Past 12 h idle, a cold
+build is cheap: Blacksmith's cold Release build had a median of 620 s, against
+830 s on a warm pool mini, over 22 builds.
+
+The key defaults to `""`. With any value other than that label, the root stays
+a single `library-caches` item, as before.

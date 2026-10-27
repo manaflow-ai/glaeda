@@ -773,6 +773,28 @@ CMUX_NEXT_CI_ACTIVITY_MARKERS = frozenset({
 # deliberately best-effort rather than a build synchronisation primitive.
 CMUX_NEXT_CI_DEDUPE_SETTLE_MINUTES = 15.0
 CMUX_NEXT_CI_DEDUPE_DIR_NAMES = frozenset({"Products"})
+# ~/Library/Caches/cmux-nightly-next/<runner>: cmux's scripts/ci/nightly_build_state.py keeps NEXT's package
+# checkouts, compilation cache and notices crates there, one tree per runner that built nightly-next (7-9 GiB
+# each). Every pool runner of every mini could be that builder, so it held 0-35 GiB per mini (Leo, 2026-10-27:
+# "and how can <100gb be free on >256gb minis all the time"). Once the build routes to one dedicated builder
+# (cmux vars.CI_NIGHTLY_NEXT_DEDICATED_LABEL, cmux#26048; Leo: "what if we just dedicatd one, only, always, and
+# it just incrementally... did the thing? clear its stuff, etc"), that builder's tree is kept by role and every
+# pool runner's tree is its own fallback item that goes once idle DEFAULT_AGE_HOURS (read when the family is built,
+# so a reserved host's keep_legacy_ages applies). The build still
+# falls back to an idle pool mini when the builder is busy (cmux scripts/ci/nightly_build_runner.py: dedicated,
+# then owned, then Blacksmith), so a recently used fallback stays warm under the normal age; one no overflow used
+# for that long is not worth the disk (a cold Blacksmith Release build took a median 620 s against 830 s on a warm
+# pool mini, 22 builds on 2026-10-26/27). Before, the whole root was one library-caches item that any pool runner's
+# build kept fresh, so every tree on a mini stayed. Inert until disk-policy's
+# nightly_next_dedicated_label names the label cmux routes by: before that the whole root stays the
+# library-caches item it always was.
+NIGHTLY_NEXT_ROOT = "cmux-nightly-next"
+NIGHTLY_NEXT_FAMILY = "cmux-nightly-next-fallback"
+NIGHTLY_NEXT_DEDICATED_LABEL = "glaeda-trusted-next-nightly"  # cmux pr_runner_pool.NIGHTLY_DEDICATED_LABEL
+# the dedicated builder's runner: <member>-nightly-next (hand-made) or <member>-glaeda-nightly-next (glaeda#1648)
+NIGHTLY_NEXT_DEDICATED_RUNNER = re.compile(r"[A-Za-z0-9._-]+-nightly-next")
+# a pool runner's tree (cmux nightly_build_state.owned: <member>-glaeda[-K]); anything else in the root stays
+NIGHTLY_NEXT_POOL_RUNNER = re.compile(r"[A-Za-z0-9._-]+-glaeda(?:-[0-9]+)?")
 
 
 def fleet_families(ci: Path | None = None) -> list[Family]:
@@ -1419,6 +1441,10 @@ POLICY_DEFAULTS: dict[str, Any] = {
     # The newest warm compile cache per builder is exempt by role, not by age (DEFAULT_AGE_HOURS): the host root goes
     # only under the runner floor. A finite number here ages it again.
     "cmux_next_ci_host_idle_hours": float("inf"),
+    # The label cmux's nightly-next build routes to its one dedicated builder by (vars.CI_NIGHTLY_NEXT_DEDICATED_LABEL).
+    # Only NIGHTLY_NEXT_DEDICATED_LABEL turns the cmux-nightly-next fallback eviction on; "" (or any other value)
+    # leaves that cache as it was. Set it only once that variable is set, so no fallback goes before the routing.
+    "nightly_next_dedicated_label": "",
     # --dedupe also clones identical files in capture and evidence trees (screen-capture frames, UI evidence),
     # with its own floor: one PNG frame is 16-200 KiB, so Xcode's 1 MiB floor saw 2.7 of the 11.2 GiB of
     # identical frames in cmux-mac-mini's ~/messageslab-26. "~" is the account's home; globs are allowed; a
@@ -2875,6 +2901,10 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
     cmux_next_ci = HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT
     if DARWIN and cmux_next_ci.is_dir():
         fams.append(cmux_next_ci_family(cmux_next_ci))
+    if DARWIN and nightly_next_dedicated():
+        lib = next(i for i, f in enumerate(fams) if f.id == "library-caches")
+        fams[lib] = replace(fams[lib], skip=(*fams[lib].skip, NIGHTLY_NEXT_ROOT))
+        fams.append(nightly_next_family())
     user_tmp = darwin_user_tmp() if DARWIN else None
     if user_tmp is not None:
         # Apple daemons keep live state in com.apple.* entries without holding them open.
@@ -3001,6 +3031,9 @@ def runner_cache_families() -> list[Family]:
     ]
     if (HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT).is_dir():
         roots.append(replace(cmux_next_ci_family(), min_idle_hours=RUNNER_CACHE_IDLE_HOURS))
+    if nightly_next_dedicated():
+        roots.append(replace(nightly_next_family(), min_idle_hours=RUNNER_CACHE_IDLE_HOURS,
+                             max_idle_hours=RUNNER_CACHE_IDLE_HOURS))
     return [f for f in roots if f.root.is_dir()]
 
 
@@ -3413,6 +3446,28 @@ def item_mtime(fam: Family, path: Path) -> float:
     if fam.id == SPM_SCRATCH:
         with contextlib.suppress(OSError):
             newest = max(newest, spm_lock(path).stat().st_mtime)
+    if fam.id == NIGHTLY_NEXT_FAMILY:
+        newest = max(newest, nightly_next_last_use(path))
+    return newest
+
+
+# Files every nightly-next build on a runner rewrites, below its tree (cmux nightly_build_state.py's layout), each
+# glob a handful of entries. A build that reuses an identity touches neither the runner nor the identity directory:
+# SwiftPM rewrites workspace-state.json when it resolves, and the compilation cache rewrites its action cache and
+# index on every lookup (cmux14, 2026-10-27: generic/v1.1/v3.actions and v8.index at the build's end, 5 levels
+# down, under directories dated two days earlier).
+NIGHTLY_NEXT_USE_GLOBS = ("*/SourcePackages/workspace-state.json", "*/CompilationCache/*/lock",
+                          "*/CompilationCache/generic/*/*", "notices-crates", "notices-crates/*")
+
+
+def nightly_next_last_use(path: Path) -> float:
+    """The newest mtime of the files a nightly-next build on this runner writes, however deep."""
+    newest = 0.0
+    for pattern in NIGHTLY_NEXT_USE_GLOBS:
+        with contextlib.suppress(OSError):
+            for entry in path.glob(pattern):
+                with contextlib.suppress(OSError):
+                    newest = max(newest, entry.lstat().st_mtime)
     return newest
 
 
@@ -5619,6 +5674,8 @@ def candidates(fam: Family) -> list[Path]:
                           or (fam.files and e.is_file(follow_symlinks=False)))]
         if fam.include:
             level = [p for p in level if p.name.startswith(fam.include)]
+        if fam.id == NIGHTLY_NEXT_FAMILY:  # kept by role: the dedicated builder's tree and anything unrecognized
+            level = [p for p in level if nightly_next_fallback(p)]
         if fam.app_clones:
             level = keep_live_app_clones(level)
     # an aside tree (remove()'s rename) is the interrupted-deletions family's alone, whatever family's root holds it
@@ -7907,6 +7964,30 @@ def cmux_next_ci_cap_state(fams: list[Family], cap_gib: float, measure: bool = F
         return None
     cap = int(cap_gib * GIB)
     return {"used": used, "cap": cap, "over": max(0, used - cap), "at": at}
+
+
+def nightly_next_dedicated() -> bool:
+    """The nightly-next build routes to its dedicated builder: disk-policy names the label cmux routes by."""
+    return POLICY.get("nightly_next_dedicated_label") == NIGHTLY_NEXT_DEDICATED_LABEL
+
+
+def nightly_next_family(root: Path | None = None) -> Family:
+    """Pool runners' cmux-nightly-next trees, each its own item; the dedicated builder's tree is never one."""
+    root = (HOME / "Library/Caches" / NIGHTLY_NEXT_ROOT) if root is None else root
+    window = DEFAULT_AGE_HOURS  # a module global keep_legacy_ages may have raised for this run
+    return Family(NIGHTLY_NEXT_FAMILY, root, True,
+                  "a fallback nightly-next build on this runner starts cold (the dedicated builder keeps its own)",
+                  # SourcePackages/checkouts and notices-crates/git hold SwiftPM and cargo clones, which the next
+                  # build fetches again: build output, not a checkout anyone works in
+                  build_output=True, min_idle_hours=window, max_idle_hours=window,
+                  owner="cmux nightly_build_state.py, per runner", rebuild_minutes=4, platform="macos")
+
+
+def nightly_next_fallback(path: Path) -> bool:
+    """A pool runner's tree under cmux-nightly-next: never the dedicated builder's, never an unknown name."""
+    name = path.name
+    return (NIGHTLY_NEXT_POOL_RUNNER.fullmatch(name) is not None
+            and NIGHTLY_NEXT_DEDICATED_RUNNER.fullmatch(name) is None)
 
 
 def cmux_next_ci_family(root: Path | None = None) -> Family:
