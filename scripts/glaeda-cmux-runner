@@ -370,6 +370,7 @@ class Context:
         self.service_plist_path = (SYSTEM_DAEMON_DIR / f"{self.label}.plist") if self.headless else self.plist_path
         self.log_path = self.logs / f"glaeda-cmux-runner{self.suffix}.log"
         self.token_stdin = args.token_stdin
+        self.github_labels = getattr(args, "github_labels", None)
         self.stdin_token: str | None = None  # set by main() from stdin; used once, never stored
 
     def take_token(self, endpoint: str) -> str | None:
@@ -1181,6 +1182,12 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
         # A local receipt records what this copy last requested, not what GitHub currently
         # holds.  Read the registration once and use that observation for reconciliation.
         github_listed, github_found = lookup_runner(ctx)
+    if ours and configured and not github_listed and isinstance(getattr(ctx, "github_labels", None), str):
+        # the minis hold no gh login (or one that cannot list runners): the fleet read GitHub's labels with its own
+        # and passed them. Without them, every apply re-registered each idle runner in place (the token path
+        # below) whatever its labels were.
+        github_listed, github_found = True, {"labels": sorted({label.strip() for label in ctx.github_labels.split(",")
+                                                              if label.strip()})}
     # This install registered that name before and lost its local .runner (an interrupted relabel):
     # registering again replaces its own server-side entry instead of colliding with it.
     own_name = bool(ours and not configured and registered.get("owned") and registered.get("name") == ctx.name)
@@ -1500,10 +1507,9 @@ def listeners_frozen(runner_dir: Path) -> Iterator[int | None]:
     look and a stop, as the gate's own stop freezes its listener: frozen, nothing of it can start a listener,
     acknowledge a request or start a Worker, so an idle reading stays true through the stop. It looks again until a
     look finds nothing new to freeze (a listener a spawner started between two looks is frozen too). Yields how
-    many listeners it froze, or None when it could not freeze them all or the tree kept changing: the caller then
+    many processes of that tree it froze (0: nothing of the runner runs), or None when it could not freeze them all or the tree kept changing: the caller then
     stops nothing. Thawed afterwards; a booted-out process is gone by then (launchd's SIGKILL reaches it frozen)."""
     frozen: list[int] = []
-    listeners: set[int] = set()
     count: int | None = None
     try:
         for _ in range(FREEZE_LOOKS):
@@ -1516,7 +1522,7 @@ def listeners_frozen(runner_dir: Path) -> Iterator[int | None]:
                 if role and int(pid) not in frozen and int(pid) != os.getpid():
                     new.append((int(pid), role))
             if not new:
-                count = len(listeners)
+                count = len(frozen)  # everything of the runner's tree that runs: listeners and their spawners
                 break
             for pid, role in new:
                 try:
@@ -1524,8 +1530,6 @@ def listeners_frozen(runner_dir: Path) -> Iterator[int | None]:
                 except ProcessLookupError:
                     continue  # it exited: nothing left of it to take a job
                 frozen.append(pid)
-                if role == "listener":
-                    listeners.add(pid)
     except Exception:  # noqa: BLE001
         count = None
     try:
@@ -1808,14 +1812,35 @@ def verify(ctx: Context, act: dict[str, Any], wait: bool) -> None:
             "; the listener gate is holding it off while a fleet build has the host" if gate_holding(ctx) else "")
 
 
+def service_may_run(ctx: Context) -> bool:
+    """launchd may (re)start this runner's agent: it has the label loaded (KeepAlive restarts it between processes),
+    or print failed some other way. A sandbox HOME loads nothing."""
+    if getattr(ctx, "sandbox", False):
+        return False
+    domain = f"system/{ctx.label}" if ctx.headless else f"gui/{ctx.uid}/{ctx.label}"
+    return run([SUDO, LAUNCHCTL, "print", domain] if ctx.headless else [LAUNCHCTL, "print", domain])[0] \
+        != LAUNCHCTL_NOT_FOUND
+
+
 def apply_uninstall(ctx: Context, actions: list[dict[str, Any]]) -> None:
+    # Nothing is removed under a job: the agent's bootout, the deregister and the directory each cancel one. One
+    # frozen look decides for every step: with launchctl, the agent is booted out under it (and its own step then
+    # only removes the plist); otherwise (--skip-launchctl, or a plist this install does not own) any listener
+    # still running refuses too, since deregistering under a live listener orphans it.
+    removing = [act for act in actions if act["state"] == "remove"]
+    agent = next((act for act in removing if act["kind"] == "agent"), None)
+    booting_out = bool(agent) and not ctx.skip_launchctl
+    idle = not removing or ((booting_out or not service_may_run(ctx)) and stop_if_idle(
+        ctx, (lambda: bootout(ctx)) if booting_out else (lambda: True), listener_ok=booting_out))
     for act in actions:
         act["applied"] = False
         if act["state"] != "remove":
             continue
+        if not idle:
+            # failed, not skipped: a nonzero exit stops the fleet's migration before it registers the new scope
+            act["state"], act["note"] = "failed", "the runner has a job (or a listener runs); nothing removed, re-run when idle"
+            continue
         if act["kind"] == "agent":
-            if not ctx.skip_launchctl:
-                bootout(ctx)
             if ctx.headless:
                 code, out = run([SUDO, "/bin/rm", "-f", act["path"]])
                 if code != 0:
@@ -2257,6 +2282,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--latest-runner-sha256", help="the osx-arm64 SHA-256 of --latest-runner-version")
     p.add_argument("--route-repo", default=DEFAULT_REPO, help="repository whose variables the printed routing commands set")
     p.add_argument("--gh", help="gh binary (default: PATH)")
+    p.add_argument("--github-labels", metavar="LABELS",
+                   help="the labels GitHub lists for this runner now (comma-separated), as glaeda-cmux-runner-fleet "
+                        "read them with its admin gh; used when this machine's gh cannot read them itself")
     p.add_argument("--token-stdin", action="store_true",
                    help="with --apply, read the registration (or, with --uninstall, removal) token from stdin; "
                         "without --apply, plan that path")

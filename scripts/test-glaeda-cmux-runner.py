@@ -8573,6 +8573,63 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(register["state"], "blocked")
         self.assertIn("receipt labels are not authoritative", register["note"])
 
+    def test_labels_the_fleet_read_spare_a_mini_without_gh_its_re_registration(self) -> None:
+        # the minis hold no gh login, so each fleet apply re-registered every idle runner in place whatever its labels
+        real_which = cr.which
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            first = self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std")
+            labels = ",".join(first["registration"]["labels"])
+            configs = len(self.config_argvs())
+            with mock.patch.object(cr, "which", lambda name, extra=(): None if name == "gh" else real_which(name, extra)):
+                same = self.invoke("--apply", "--token-stdin", "--manifest", self.manifest(), "--member", "mini-std",
+                                   "--github-labels", labels, gh=False, stdin=REG_TOKEN)
+                self.assertEqual(self.by_kind(same)["register"]["state"], "unchanged", self.by_kind(same)["register"])
+                self.assertEqual(len(self.config_argvs()), configs, "matching labels: no config.sh, no bootout")
+                stale = self.invoke("--manifest", self.manifest(), "--member", "mini-std", "--token-stdin",
+                                    "--github-labels", "self-hosted,glaeda-mini", gh=False)
+        self.assertEqual(self.by_kind(stale)["register"]["state"], "relabel")
+        self.assertEqual(self.by_kind(stale)["register"]["previousLabels"], ["glaeda-mini", "self-hosted"])
+
+    def test_an_uninstall_never_stops_or_deregisters_a_runner_with_a_job(self) -> None:
+        for skip in (False, True):
+            ctx = mock.Mock(skip_launchctl=skip, headless=False, sandbox=True)
+            actions = [{"kind": "agent", "state": "remove", "path": "/nonexistent.plist"},
+                       {"kind": "deregister", "state": "remove", "name": "x"}]
+            with mock.patch.object(cr, "listeners_frozen", return_value=contextlib.nullcontext(0)), \
+                    mock.patch.object(cr, "runner_busy", return_value=True), \
+                    mock.patch.object(cr, "bootout") as bootout, mock.patch.object(cr, "run_with_token") as config:
+                cr.apply_uninstall(ctx, actions)
+            bootout.assert_not_called()
+            config.assert_not_called()
+            self.assertEqual([a["state"] for a in actions], ["failed", "failed"], skip)
+        # a plist this install does not own, still loaded in launchd (KeepAlive restarts it): no deregister
+        ctx = mock.Mock(skip_launchctl=False, headless=False, sandbox=False, label="x", uid=501)
+        actions = [{"kind": "agent", "state": "kept", "path": "/x.plist"}, {"kind": "deregister", "state": "remove"}]
+        with mock.patch.object(cr, "listeners_frozen", return_value=contextlib.nullcontext(0)), \
+                mock.patch.object(cr, "runner_busy", return_value=False), mock.patch.object(cr, "run", return_value=(0, "")), \
+                mock.patch.object(cr, "run_with_token") as config:
+            cr.apply_uninstall(ctx, actions)
+        config.assert_not_called()
+        self.assertEqual(actions[1]["state"], "failed")
+        # a plist this install does not own (kept): a live listener refuses the deregister
+        ctx = mock.Mock(skip_launchctl=False, headless=False, sandbox=True)
+        actions = [{"kind": "agent", "state": "kept", "path": "/x.plist"}, {"kind": "deregister", "state": "remove"}]
+        with mock.patch.object(cr, "listeners_frozen", return_value=contextlib.nullcontext(1)), \
+                mock.patch.object(cr, "runner_busy", return_value=False), mock.patch.object(cr, "run_with_token") as config:
+            cr.apply_uninstall(ctx, actions)
+        config.assert_not_called()
+        self.assertEqual(actions[1]["state"], "failed")
+
+    def test_fleet_labels_stand_in_for_a_runner_list_this_gh_cannot_read(self) -> None:
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            first = self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std")
+            (self.state / "fail-list").touch()  # gh is logged in but cannot list runners
+            same = self.invoke("--apply", "--token-stdin", "--manifest", self.manifest(), "--member", "mini-std",
+                               "--github-labels=" + ",".join(first["registration"]["labels"]), stdin=REG_TOKEN,
+                               expect=1)  # verify reads the same broken list
+        self.assertEqual(self.by_kind(same)["register"]["state"], "unchanged", self.by_kind(same)["register"])
+        self.assertEqual(len(self.config_argvs()), 1, "no re-registration")
+
     def test_manifest_apply_with_token_relabels_when_github_lookup_is_unavailable(self) -> None:
         with mock.patch.object(cr, "xcode_present", return_value=True):
             self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std")
@@ -8648,7 +8705,7 @@ class RunnerTest(unittest.TestCase):
         ps = lambda *a, **k: subprocess.CompletedProcess([], 0, next(looks), "")
         with mock.patch.object(cr.subprocess, "run", side_effect=ps), mock.patch.object(cr.os, "kill") as kill:
             with cr.listeners_frozen(runner) as frozen:
-                self.assertEqual(frozen, 1, "the listener the gate started after the first look")
+                self.assertEqual(frozen, 2, "the gate, and the listener it started after the first look")
         self.assertEqual([c.args for c in kill.call_args_list],
                          [(1, signal.SIGSTOP), (2, signal.SIGSTOP), (2, signal.SIGCONT), (1, signal.SIGCONT)])
         endless = iter(f"{n} {runner}/bin/Runner.Listener run\n" for n in range(1, 99))
@@ -8656,6 +8713,18 @@ class RunnerTest(unittest.TestCase):
                 [], 0, next(endless), "")), mock.patch.object(cr.os, "kill"):
             with cr.listeners_frozen(runner) as frozen:
                 self.assertIsNone(frozen, "a tree that keeps changing is not frozen: stop nothing")
+
+    def test_a_skip_launchctl_stop_refuses_a_live_spawner_without_a_listener(self) -> None:
+        runner = self.home / "actions-runner-glaeda-9"
+        gate = subprocess.Popen(["/bin/bash", "-c", 'exec -a "$0" /bin/sleep 60',
+                                 f"/usr/bin/python3 hook listen --runner-dir {runner} --x"])
+        self.addCleanup(lambda: (gate.kill(), gate.wait()))
+        time.sleep(0.2)
+        stop = mock.Mock(return_value=True)
+        with mock.patch.object(cr, "runner_busy", return_value=False):
+            self.assertFalse(cr.stop_if_idle(mock.Mock(runner_dir=runner), stop, listener_ok=False),
+                             "a gate between listeners starts one the moment it is thawed")
+        stop.assert_not_called()
 
     def test_a_relabel_whose_bootout_did_not_complete_keeps_the_registration(self) -> None:
         runner = self.home / "actions-runner-glaeda-8"

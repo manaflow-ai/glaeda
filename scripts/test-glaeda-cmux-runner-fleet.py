@@ -101,6 +101,11 @@ elif path == "repos/actions/runner/releases/latest":
     print(json.dumps({{"tag_name": "v2.401.0", "body": "<!-- BEGIN SHA osx-arm64 -->" + "d" * 64 + "<!-- END SHA -->",
                       "assets": [{{"name": "actions-runner-osx-arm64-2.401.0.tar.gz", "digest": "sha256:" + "d" * 64,
                                   "browser_download_url": "https://example.invalid/x"}}]}}))
+elif "/actions/runners?name=" in path:  # the operator's read of a runner's labels; FAKE_NO_RUNNERS: none listed
+    import urllib.parse
+    name = urllib.parse.unquote(path.split("name=", 1)[1].split("&", 1)[0])
+    listed = [] if os.environ.get("FAKE_NO_RUNNERS") else [{{"name": name, "labels": [{{"name": "self-hosted"}}, {{"name": "glaeda-mini"}}]}}]
+    print(json.dumps({{"total_count": len(listed), "runners": listed}}))
 elif "/repositories" in path:
     print(os.environ.get("FAKE_GROUP_REPOS", "manaflow-ai/cmux").replace(",", "\\n"))
 elif path.startswith("repos/") and path.count("/") == 2:
@@ -216,7 +221,17 @@ class FleetTest(unittest.TestCase):
         # "latest" is read once for the whole apply, through the operator's gh, and every instance is told it
         releases = [c for c in calls if c["tool"] == "gh" and "repos/actions/runner/releases/latest" in c["argv"]]
         self.assertEqual(len(releases), 1)
-        self.assertEqual(sum(1 for c in calls if c["tool"] == "gh"), 9, "eight tokens and one release read")
+        self.assertEqual(sum(1 for c in calls if c["tool"] == "gh"), 17,
+                         "eight tokens, eight label reads and one release read")
+        # the minis hold no gh login: each instance gets the labels GitHub lists for it, read here
+        self.assertTrue(all("--github-labels=glaeda-mini,self-hosted " in c["remote"] for c in applies))
+        reads = sorted(next(a for a in c["argv"] if "runners?name=" in a) for c in calls if c["tool"] == "gh"
+                       and any("runners?name=" in a for a in c["argv"]))
+        self.assertIn("repos/manaflow-ai/cmux/actions/runners?name=mini-a-glaeda-3&per_page=100", reads)
+        unlisted = self.fleet("--apply", FAKE_NO_RUNNERS="1")
+        self.assertEqual(unlisted.returncode, 0, unlisted.stdout + unlisted.stderr)
+        self.assertFalse(any("--github-labels" in c["remote"] for c in self.calls()[len(calls):]
+                             if c["tool"] == "ssh"), "a runner GitHub does not list: the mini decides as before")
         self.assertTrue(all(f"--latest-runner-version 2.401.0 --latest-runner-sha256 {'d' * 64}" in c["remote"]
                             for c in applies))
         self.assertEqual(json.loads(result.stdout)["runnerRelease"],

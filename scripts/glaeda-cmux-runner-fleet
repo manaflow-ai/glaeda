@@ -74,6 +74,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -203,6 +204,22 @@ def mint(scope: str, kind: str = "registration-token") -> str | None:
     code, out, _ = run(["gh", "api", "-X", "POST", f"{scope}/actions/runners/{kind}", "--jq", ".token"], 60)
     token = out.strip()
     return token if code == 0 and TOKEN_RE.fullmatch(token) else None
+
+
+def github_labels(scope: str, name: str) -> str | None:
+    """The labels GitHub lists for runner `name` now, comma-separated, read with this operator's gh; None when the
+    read fails or GitHub lists no such runner (the mini then decides as before). The minis hold no gh login, so
+    without this each apply re-registered every idle runner whatever its labels were."""
+    code, out, _ = run(["gh", "api", f"{scope}/actions/runners?name={urllib.parse.quote(name)}&per_page=100"], 60)
+    try:
+        runners = json.loads(out).get("runners") if code == 0 else None
+    except (ValueError, AttributeError):
+        return None
+    for found in runners if isinstance(runners, list) else []:
+        if isinstance(found, dict) and found.get("name") == name:
+            labels = sorted(str(label.get("name")) for label in found.get("labels") or [] if isinstance(label, dict))
+            return ",".join(label for label in labels if label and "," not in label)
+    return None
 
 
 def group_refusal(org: str, group: str, repo: str | None) -> str | None:
@@ -565,10 +582,13 @@ def apply_instance(member: str, instance: int, repo: str | None, extra: list[str
                     "state": f"registered to {scope}, not {migrate_from} or {org}; nothing changed"}
     scope = f"--org {_quote(org)}" + (f" --group {_quote(group)}" if group else "") if org else f"--repo {_quote(repo)}"
     version, sha, _ = latest_release()
+    labels = None if deregistered else github_labels(scope_api(repo, org),
+                                                     f"{member}-glaeda" + (f"-{instance}" if instance else ""))
+    observed = f"--github-labels={_quote(labels)} " if labels is not None else ""  # = : a label may start with -
     remote = (f"~/{REMOTE_DIR}/scripts/glaeda-cmux-runner --apply --token-stdin {scope} "
               f"--manifest ~/{REMOTE_DIR}/mini-fleet.json --member {_quote(member)} --instance {instance} "
               f"--latest-runner-version {_quote(version)} --latest-runner-sha256 {_quote(sha)} "
-              "--output json " + " ".join(_quote(a) for a in extra))
+              f"{observed}--output json " + " ".join(_quote(a) for a in extra))
     code, out, err = run(["ssh", *SSH_OPTIONS, member, remote], APPLY_TIMEOUT_S, stdin=token + "\n")
     del token
     try:
