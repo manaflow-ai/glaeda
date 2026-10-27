@@ -142,7 +142,98 @@ DISK_TIMEOUT_S = 120  # a pass a hook or the gate waits on or reaps
 BACKGROUND_DISK_TIMEOUT_S = 15 * 60
 BACKGROUND_DISK_TIMEOUT_MAX_S = 6 * 3600  # an override above this is cut to it, so the bound's lifetime stays finite
 BACKGROUND_DISK_TIMEOUT_ENV = "GLAEDA_RUNNER_BACKGROUND_DISK_TIMEOUT"  # GLAEDA_RUNNER_DISK_TIMEOUT bounds the others
-EVICT_TIMEOUT_S = 60  # job-started waits at most this long for an eviction under the disk floor
+# job-started waits at most this long for an eviction under the disk floor. At 60 s it only ever waited out part of
+# the queued pass job-completed starts (hook passes took 125-534 s on 2026-10-26, median about 250 s), and its own
+# pass then skipped as busy because the queue's next pass took evict.lock first: on cmuxs-mac-mini-6 at 05:18Z a
+# nightly build-nightly-app was refused at 23.8 GiB ("waited 60 s for a running glaeda-disk pass; glaeda-disk exited 0,
+# freed -1.0 GiB") while the pass in flight freed 16.2 GiB 100 s later. evict() now waits for running passes and
+# retries its own while it skips as busy, within this budget.
+EVICT_TIMEOUT_S = 300
+EVICT_BUSY_PAUSE_S = 2.0  # between a pass of evict()'s own that skipped as busy and its next look
+# The free disk a job is refused under, after eviction: the measured disk growth of one CMUX job, rounded up (p99
+# 10.8 GiB, max 18.7 GiB). The runner floor (--min-free-gib, the manifest's disk.min_free_gib, 30 GiB since HQ #967, a
+# judgement rather than a measurement) still decides when to evict, the pre-job target and when the gate stops
+# listening; it no longer refuses a job that fits. A runner that takes cmux's tours keeps the tour floor
+# (runner_floor_gib), which cmux measured for those jobs. glaeda-cmux-job/v1 completed lines record disk_free_start_gib,
+# disk_free_end_gib (#1650) and disk_free_min_gib, so this can be resized from build-nightly-app's own peak.
+DISK_JOB_PEAK_GIB = 20.0
+DISK_JOB_PEAK_ENV = "GLAEDA_RUNNER_JOB_DISK_GIB"  # the runner's own environment may set another, 0 to 10000 GiB
+
+
+def job_disk_gib() -> float:
+    """DISK_JOB_PEAK_GIB, or DISK_JOB_PEAK_ENV when it is a finite number from 0 to 10000."""
+    try:
+        value = float(os.environ.get(DISK_JOB_PEAK_ENV) or DISK_JOB_PEAK_GIB)
+    except ValueError:
+        return DISK_JOB_PEAK_GIB
+    return value if math.isfinite(value) and 0 <= value <= 10000 else DISK_JOB_PEAK_GIB
+
+
+DISK_LOW = "disk-low"  # capacity/disk-low.lock and capacity/disk-low-<pid>: jobs admitted under the runner floor
+
+
+def disk_low_turn(capacity_dir: Path, worker: int) -> str | None:
+    """Admit at most one job at a time between the admission floor and the runner floor: the capacity ledger counts
+    cores, not disk, so two jobs admitted together at 25 GiB could write past the disk between them (each may write
+    up to DISK_JOB_PEAK_GIB). Under capacity/disk-low.lock (taken without blocking, retried for ADMISSION_WAIT_S), a
+    marker of another job refuses this one unless that job is proven gone: its pid is dead, or alive with another
+    start identity (process_identity). An unreadable marker or an identity that cannot be read refuses too. Otherwise
+    this job's Worker leaves its own marker. Returns the refusal, or None (admitted, marker written)."""
+    try:
+        capacity_dir.mkdir(parents=True, exist_ok=True)
+        lock = os.open(capacity_dir / f"{DISK_LOW}.lock", os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+    except OSError as error:
+        return f"cannot open the disk ledger ({type(error).__name__})"
+    try:
+        deadline = time.monotonic() + ADMISSION_WAIT_S
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    return "another admission holds the disk ledger"
+                time.sleep(0.1)
+        for marker in capacity_dir.glob(f"{DISK_LOW}-*"):
+            name = marker.name[len(DISK_LOW) + 1:]
+            if not name.isdigit():
+                continue  # not a marker (disk-low.lock, a .tmp being written)
+            pid = int(name)
+            if pid == worker:
+                continue
+            gone = not 1 < pid < 2 ** 31 or not pid_alive(pid)
+            if not gone:
+                try:
+                    identity = (read_bounded(marker) or b"").decode("utf-8").strip()
+                except (OSError, UnicodeDecodeError):
+                    if not os.path.lexists(marker):
+                        continue  # removed meanwhile
+                    return f"cannot read the disk ledger's marker for pid {pid}"
+                current = process_identity(pid)
+                if not identity or current is None:
+                    return f"another job may still run here under the disk floor (pid {pid}, identity unknown)"
+                if current == identity:
+                    return f"another job admitted under the disk floor still runs here (pid {pid})"
+            with contextlib.suppress(OSError):
+                marker.unlink()  # its job is proven gone
+        identity = process_identity(worker)
+        if identity is None:
+            return f"cannot pin this job's Runner.Worker (pid {worker}) for the disk ledger"
+        mine = capacity_dir / f"{DISK_LOW}-{worker}"
+        tmp = mine.with_name(f".{mine.name}.tmp")
+        tmp.write_text(identity + "\n")
+        tmp.replace(mine)
+        return None
+    except OSError as error:
+        return f"cannot write the disk ledger ({type(error).__name__})"
+    finally:
+        os.close(lock)
+
+
+def admit_floor_gib(min_free_gib: float, takes_tours: bool) -> float:
+    """The free disk a job is refused under after eviction: the runner floor, capped at one job's measured disk
+    growth (job_disk_gib), except on a runner that takes cmux's tours, whose floor is cmux's own measure."""
+    return min_free_gib if takes_tours else min(min_free_gib, job_disk_gib())
 # Before every job, not after it (Leo, 2026-10-26: "Just throw it away. Just delete more stuff, more often"): free disk
 # is brought to the pre-job target, the floor plus PREJOB_MARGIN_GIB, before a job is admitted. Only checking the floor
 # admitted several jobs at 31 GiB under a 30 GiB floor, and together they wrote the disk down to 0.1 GiB while every
@@ -1775,26 +1866,43 @@ def evicted(path: str, min_free_gib: float, ran: str, before: float | None) -> s
     return f"under the {min_free_gib:g} GiB disk floor: {ran}, freed {freed}"
 
 
-def evict(path: str, min_free_gib: float, explicit: str | None) -> str:
-    """Free disk under the floor before refusing a job for it: one glaeda-disk --pressure run, bounded by
+def evict(path: str, min_free_gib: float, explicit: str | None, deadline: float | None = None) -> str:
+    """Free disk under the floor before refusing a job for it: glaeda-disk --pressure runs, bounded together by
     EVICT_TIMEOUT_S. Under the floor, free space is below glaeda-disk's emergency mark (20 GiB above the floor), so
     it deletes even while CI jobs run on this mini; it frees idle caches up to its runner target. glaeda-disk
     never deletes the Chromium trees (NEVER_DELETE) or anything a running job has open, names or marks busy.
-    When a pass already holds glaeda-disk's evict.lock (job-completed starts one detached), it waits for that one
-    within the same budget, then runs its own only if still under the floor.
+    When a pass already holds glaeda-disk's evict.lock (job-completed starts one detached), it waits for that one,
+    then runs its own only if still under the floor; when that one skips as busy (the queue's next pass took the
+    lock first) it waits for that pass too, and so on until a pass of its own ran or the budget is spent. deadline
+    (monotonic) is the budget's end, which job-started shares between its evictions; by default EVICT_TIMEOUT_S on.
     Returns a one-line note with the space freed; never raises."""
     before = free_or_none(path)
     start = time.monotonic()
-    deadline = start + EVICT_TIMEOUT_S
-    if not wait_for_running_pass(deadline):
-        return evicted(path, min_free_gib, disk_pressure(explicit, min_free_gib, EVICT_TIMEOUT_S), before)
-    # job-completed's detached pass (or the gate's, or the LaunchAgent's) held glaeda-disk's evict.lock: a pass of
-    # our own would have skipped as busy and refused this job while space was being freed
-    waited = f"waited {time.monotonic() - start:.0f} s for a running glaeda-disk pass"
-    if not disk_refusal(path, min_free_gib):
-        return evicted(path, min_free_gib, waited, before)
-    ran = disk_pressure(explicit, min_free_gib, max(1.0, deadline - time.monotonic()))
-    return evicted(path, min_free_gib, f"{waited}; {ran}", before)
+    deadline = start + EVICT_TIMEOUT_S if deadline is None else deadline
+    waited, busy, ran = 0.0, 0, ""
+    while True:
+        looked = time.monotonic()
+        if wait_for_running_pass(deadline):
+            # job-completed's detached pass (or the gate's, or the LaunchAgent's) held glaeda-disk's evict.lock: a
+            # pass of our own would have skipped as busy and refused this job while space was being freed
+            waited += time.monotonic() - looked
+            if not disk_refusal(path, min_free_gib):
+                ran = ""
+                break
+        left = deadline - time.monotonic()
+        if left < 1.0:
+            ran = ran or "the eviction budget is spent"
+            break
+        ran, skipped = disk_pressure_run(explicit, min_free_gib, left)
+        if not skipped or time.monotonic() >= deadline:
+            break
+        busy += 1
+        # busy behind measure.lock, which wait_for_running_pass does not watch: never a tight loop of glaeda-disk runs
+        time.sleep(min(EVICT_BUSY_PAUSE_S, max(0.0, deadline - time.monotonic())))
+    notes = [f"waited {waited:.0f} s for a running glaeda-disk pass"] if waited else []
+    if busy:
+        notes.append(f"its own pass skipped as busy {busy} time{'s' if busy > 1 else ''}")
+    return evicted(path, min_free_gib, "; ".join([*notes, *([ran] if ran else [])]), before)
 
 
 def prejob_margin_gib() -> float:
@@ -5412,11 +5520,15 @@ class JobSamples:
         # free GiB on the disk the floor checks (--min-free-gib), at admission and at the end: what a job wrote
         self.disk_free_start: float | None = None
         self.disk_free_end: float | None = None
+        # and the lowest sampled while it ran (DISK_JOB_PEAK_GIB's evidence: its peak is start minus min)
+        self.disk_free_min: float | None = None
 
     def add(self, load: float | None, split: tuple[float, float, float, dict[str, float], dict[str, float]],
             interval: float, queue: tuple[int, int] | None = None, disk: float | None = None,
-            busy: float | None = None) -> None:
+            busy: float | None = None, free: float | None = None) -> None:
         job, others, outside, by_outside, by_runner = split
+        if free is not None and math.isfinite(free):
+            self.disk_free_min = free if self.disk_free_min is None else min(self.disk_free_min, free)
         if queue is not None:
             self.queues += 1
             self.running += queue[0]
@@ -5482,6 +5594,8 @@ class JobSamples:
             "thermal_limited": self.thermal,
             "disk_free_start_gib": None if self.disk_free_start is None else round(self.disk_free_start, 1),
             "disk_free_end_gib": None if self.disk_free_end is None else round(self.disk_free_end, 1),
+            # the volume's, so other jobs' writes count too: the peak this job saw is start minus min
+            "disk_free_min_gib": None if self.disk_free_min is None else round(self.disk_free_min, 1),
             "verdict": "contended" if reasons else "clear", "reasons": reasons,
         }
 
@@ -5685,7 +5799,8 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
                 test_apps = (telemetry_test_app_owners(processes())
                              if any(os.path.basename(row[4]) == "cmux DEV" for row in rows) else {})
                 split = classify(rows, watch_pid, skip, test_apps)
-                samples.add(load_average(), split, interval, queue, *disk_busy)
+                samples.add(load_average(), split, interval, queue, *disk_busy,
+                            free=free_or_none(disk_path) if disk_path else None)
                 if dynamic_units > 1 and dynamic_total > 1:
                     now = time.monotonic()
                     job_cores = split[0]
@@ -6235,23 +6350,33 @@ def floor_disk_env(caller: str) -> dict[str, str]:
     return {**os.environ, "GLAEDA_DISK_HOOK_PASS": "1", "GLAEDA_DISK_CALLER": caller}
 
 
-def disk_pressure(explicit: str | None, floor_gib: float = 0.0, timeout: float = DISK_TIMEOUT_S) -> str:
-    """The floor eviction before refusing a job (evict). Best effort. Returns a one-line note; never raises."""
+# glaeda-disk's answers when it ran no pass because another holds evict.lock or measure.lock (DISK_BOUND's BUSY)
+DISK_BUSY = (b"another eviction running", b"another measurement running")
+
+
+def disk_pressure_run(explicit: str | None, floor_gib: float = 0.0,
+                      timeout: float = DISK_TIMEOUT_S) -> tuple[str, bool]:
+    """The floor eviction before refusing a job (evict): its one-line note, and whether glaeda-disk skipped as busy
+    (DISK_BUSY: another pass held its lock first, so nothing was freed and evict() waits for that pass instead). Best
+    effort; never raises."""
     try:
         argv = disk_argv(explicit, floor_gib)
         if argv is None:
-            return "glaeda-disk not installed; skipped"
-        timeout = float(os.environ.get("GLAEDA_RUNNER_DISK_TIMEOUT") or timeout)
+            return "glaeda-disk not installed; skipped", False
+        override = float(os.environ.get("GLAEDA_RUNNER_DISK_TIMEOUT") or timeout)
+        timeout = min(override, timeout) if math.isfinite(override) and override > 0 else timeout  # never past it
         result = subprocess.run(
             argv,
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             timeout=timeout, check=False, env=floor_disk_env("runner hook floor eviction"),
         )
-        return f"glaeda-disk exited {result.returncode}"
+        out = result.stdout if isinstance(result.stdout, bytes) else b""
+        skipped = any(mark in out for mark in DISK_BUSY)
+        return f"glaeda-disk exited {result.returncode}{' (busy)' if skipped else ''}", skipped
     except subprocess.TimeoutExpired:
-        return "glaeda-disk timed out; continuing"
+        return "glaeda-disk timed out; continuing", False
     except Exception as error:  # noqa: BLE001  (never fail the job on housekeeping)
-        return f"glaeda-disk skipped: {type(error).__name__}"
+        return f"glaeda-disk skipped: {type(error).__name__}", False
 
 
 # job-completed's passes: one at a time per host, triggers coalesced, none started above the target. Every job on
@@ -6624,6 +6749,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.phase == "busy":
         return runner_busy_main([os.fspath(args.runner_dir)] if args.runner_dir else [])
     args.min_free_gib = runner_floor_gib(args.min_free_gib, args.gui_runner or args.session_runner)
+    # the floor a job is refused under, after eviction (DISK_JOB_PEAK_GIB); a tour runner's floor is cmux's measure
+    admit_floor = admit_floor_gib(args.min_free_gib, args.gui_runner or args.session_runner)
     # the runner LaunchAgent's environment can switch sampling off fleet-wide without a reinstall
     telemetry = not args.no_telemetry and os.environ.get("GLAEDA_RUNNER_TELEMETRY", "1") != "0"
 
@@ -6747,11 +6874,26 @@ def main(argv: list[str] | None = None) -> int:
                 return refused(why)
         why = reservation_refusal(args.reservation, time.time(), taken_job=True)
         disk_path = os.path.dirname(args.host_lock)
+        disk_deadline = time.monotonic() + EVICT_TIMEOUT_S  # one budget for every eviction of this job-started
         if not why and not args.no_disk and disk_refusal(disk_path, args.min_free_gib):
-            print(f"{PREFIX}: {evict(disk_path, args.min_free_gib, args.disk)}", flush=True)
+            print(f"{PREFIX}: {evict(disk_path, args.min_free_gib, args.disk, disk_deadline)}", flush=True)
         if why:
             return refused(why)
-        why = disk_refusal(disk_path, args.min_free_gib)
+
+        def disk_why() -> str | None:
+            """The refusal for this job's disk, after eviction: under the admission floor, or under the runner floor
+            while another job admitted there still runs (disk_low_turn)."""
+            low = disk_refusal(disk_path, admit_floor)
+            if low or admit_floor >= args.min_free_gib or not disk_refusal(disk_path, args.min_free_gib):
+                return low
+            # only a pinned Runner.Worker takes the ledger's turn: its marker lives exactly as long as that job
+            turn = disk_low_turn(args.capacity_dir, owner.pid) if owner is not None \
+                else "this job's Runner.Worker is not pinned, so it cannot take the disk ledger's turn"
+            if turn:
+                return f"{disk_refusal(disk_path, args.min_free_gib) or 'under the disk floor'}: {turn}"
+            return disk_refusal(disk_path, admit_floor)  # read again: it may have waited for the ledger
+
+        why = disk_why()
         if why:
             return refused(why, disk=True)
         prejob = None if args.no_disk else prejob_evict(disk_path, args.min_free_gib, args.disk)
@@ -6759,8 +6901,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{PREFIX}: {prejob}", flush=True)
             # the jobs already running may have written the disk below the floor while this one waited
             if disk_refusal(disk_path, args.min_free_gib):
-                print(f"{PREFIX}: {evict(disk_path, args.min_free_gib, args.disk)}", flush=True)
-                why = disk_refusal(disk_path, args.min_free_gib)
+                print(f"{PREFIX}: {evict(disk_path, args.min_free_gib, args.disk, disk_deadline)}", flush=True)
+                why = disk_why()
                 if why:
                     return refused(why, disk=True)
         # before any capacity is taken: a job that needs the console session fails on a locked one

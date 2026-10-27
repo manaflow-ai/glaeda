@@ -67,7 +67,7 @@ os.environ["GLAEDA_RUNNER_IOREG"] = "/nonexistent/ioreg"
 os.environ["GLAEDA_RUNNER_TOOLCHAIN_GATE"] = "0"
 hook = load("glaeda_cmux_runner_hook", HOOK)
 # The gate evicts under its disk floor with whatever glaeda-disk it finds: in this process never this machine's own
-# (~/.local/bin); a test that wants one passes it explicitly or patches disk_pressure.
+# (~/.local/bin); a test that wants one passes it explicitly or patches disk_pressure_run.
 hook.find_disk = lambda explicit: explicit if explicit and os.path.isfile(explicit) else None
 REAL_LEVEL = hook.thermal_pressure_level  # GateTest patches the module attribute
 setup = load("glaeda_mini_setup_for_runner", ROOT / "scripts" / "glaeda-mini-setup")
@@ -823,7 +823,7 @@ class HookTest(unittest.TestCase):
 
     def test_disk_floor_refuses(self) -> None:
         self.fleet()
-        result = self.started("--min-free-gib", "999999999")
+        result = self.started("--min-free-gib", "999999999", env={hook.DISK_JOB_PEAK_ENV: "10000"})
         self.assertEqual(result.returncode, 1)
         self.assertIn("GiB required", result.stdout)
         self.assertNotIn("disk floor", result.stdout, "--no-disk: no eviction either")
@@ -838,7 +838,8 @@ class HookTest(unittest.TestCase):
         env = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0",
                "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"),
                "GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": os.fspath(push), "GITHUB_REPOSITORY": "manaflow-ai/cmux"}
-        for role, floor in (([], tour - 10), (["--gui-runner"], tour), (["--session-runner"], tour)):
+        for role, floor in (([], min(tour - 10, hook.DISK_JOB_PEAK_GIB)), (["--gui-runner"], tour),
+                            (["--session-runner"], tour)):
             with self.subTest(role=role):
                 floors: list[float] = []
                 with mock.patch.dict(os.environ, env, clear=True), \
@@ -863,7 +864,8 @@ class HookTest(unittest.TestCase):
         push = event(self.dir, "push", {"repository": CMUX})
         result = self.run_hook("job-started", "push", push, "--allowed-repo", "manaflow-ai/cmux", "--disk",
                                os.fspath(disk), "--min-free-gib", "999999999", "--state-dir",
-                               os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()), repo="manaflow-ai/cmux")
+                               os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()), repo="manaflow-ai/cmux",
+                               env={hook.DISK_JOB_PEAK_ENV: "10000"})
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertRegex(result.stdout, r"under the 1e\+09 GiB disk floor: glaeda-disk exited 0, freed -?[0-9.]+ GiB\n")
         self.assertEqual(marker.read_text(), "--pressure --apply --top 0 --floor-gib 1e+09",
@@ -878,7 +880,8 @@ class HookTest(unittest.TestCase):
         own.write_text("exec python3 /hook job-started --min-free-gib 999999999\n")
         result = self.run_hook("job-started", "push", push, "--allowed-repo", "manaflow-ai/cmux", "--disk",
                                os.fspath(disk), "--min-free-gib", "999999999", "--state-dir",
-                               os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()), repo="manaflow-ai/cmux")
+                               os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()), repo="manaflow-ai/cmux",
+                               env={hook.DISK_JOB_PEAK_ENV: "10000"})
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertEqual(marker.read_text(), "--pressure --apply --top 0")
 
@@ -906,7 +909,8 @@ class HookTest(unittest.TestCase):
         push = event(self.dir, "push", {"repository": CMUX})
         result = self.run_hook("job-started", "push", push, "--allowed-repo", "manaflow-ai/cmux", "--disk",
                                os.fspath(disk), "--min-free-gib", "999999999", "--state-dir",
-                               os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()), repo="manaflow-ai/cmux")
+                               os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()), repo="manaflow-ai/cmux",
+                               env={hook.DISK_JOB_PEAK_ENV: "10000"})
         self.assertEqual(result.returncode, 1, result.stdout)
         self.assertRegex(result.stdout, r"disk floor: waited [0-9]+ s for a running glaeda-disk pass; "
                                         r"glaeda-disk exited 0, freed")
@@ -917,7 +921,7 @@ class HookTest(unittest.TestCase):
         self.hold_evict_lock(1)
         with mock.patch.dict(os.environ, {"HOME": os.fspath(self.dir)}), \
                 mock.patch.object(hook, "disk_refusal", return_value=None) as refusal, \
-                mock.patch.object(hook, "disk_pressure") as pressure:
+                mock.patch.object(hook, "disk_pressure_run") as pressure:
             note = hook.evict(os.fspath(self.dir), 100, None)
         pressure.assert_not_called()
         refusal.assert_called_once_with(os.fspath(self.dir), 100)
@@ -928,11 +932,11 @@ class HookTest(unittest.TestCase):
         start = time.monotonic()
         with mock.patch.dict(os.environ, {"HOME": os.fspath(self.dir)}), \
                 mock.patch.object(hook, "EVICT_TIMEOUT_S", 1), \
-                mock.patch.object(hook, "disk_pressure", return_value="glaeda-disk exited 0") as pressure:
+                mock.patch.object(hook, "disk_pressure_run", return_value=("glaeda-disk exited 0", False)) as pressure:
             note = hook.evict(os.fspath(self.dir), 999999999, None)
         self.assertLess(time.monotonic() - start, 10)
-        self.assertRegex(note, r"waited [0-9]+ s for a running glaeda-disk pass; glaeda-disk exited 0")
-        self.assertLessEqual(pressure.call_args.args[2], 1.0)
+        self.assertRegex(note, r"waited [0-9]+ s for a running glaeda-disk pass; the eviction budget is spent")
+        pressure.assert_not_called()  # no run past the budget
 
     def test_job_started_eviction_is_bounded_by_its_own_timeout(self) -> None:
         with mock.patch.object(hook, "disk_argv", return_value=["glaeda-disk"]), \
@@ -940,8 +944,168 @@ class HookTest(unittest.TestCase):
                 mock.patch.dict(os.environ):
             os.environ.pop("GLAEDA_RUNNER_DISK_TIMEOUT", None)
             self.assertIn("glaeda-disk exited 0", hook.evict(os.fspath(self.dir), 100, None))
-        self.assertEqual(run.call_args.kwargs["timeout"], hook.EVICT_TIMEOUT_S)
-        self.assertEqual(hook.EVICT_TIMEOUT_S, 60)
+        self.assertAlmostEqual(run.call_args.kwargs["timeout"], hook.EVICT_TIMEOUT_S, delta=5)
+        self.assertEqual(hook.EVICT_TIMEOUT_S, 300, "longer than a typical queued pass (125-534 s, median ~250)")
+
+    def test_floor_eviction_waits_again_while_its_own_pass_skips_as_busy(self) -> None:
+        """cmuxs-mac-mini-6, 05:18Z: job-started waited out its budget behind job-completed's queued pass, then its
+        own pass skipped as busy (the queue's next pass took evict.lock first), and the nightly job was refused at
+        23.8 GiB while that pass freed 16 GiB. A pass that skips as busy is no eviction: it waits for that pass."""
+        answers = iter([b"another eviction running; skipped (pid=1)\n", b"another eviction running; skipped\n",
+                        b"eviction summary: ...\n"])
+        held = iter([True, False, True, False])  # waited for a pass, then free; then a pass held it again
+        frees = iter([25.0, 25.0, 25.0, 25.0, 31.0])
+
+        with mock.patch.object(hook, "disk_argv", return_value=["glaeda-disk"]), \
+                mock.patch.object(hook.subprocess, "run",
+                                  side_effect=lambda *a, **k: mock.Mock(returncode=0, stdout=next(answers))) as run, \
+                mock.patch.object(hook, "wait_for_running_pass", side_effect=lambda _d: next(held, False)), \
+                mock.patch.object(hook, "free_gib", side_effect=lambda _p: next(frees, 31.0)), \
+                mock.patch.object(hook, "EVICT_BUSY_PAUSE_S", 0.0):
+            note = hook.evict(os.fspath(self.dir), 30, None)
+        self.assertEqual(run.call_count, 3, "retried while busy, until a pass of its own ran")
+        self.assertRegex(note, r"^under the 30 GiB disk floor: waited [0-9]+ s for a running glaeda-disk pass; "
+                               r"its own pass skipped as busy 2 times; glaeda-disk exited 0, freed [0-9.-]+ GiB$")
+
+    def test_the_eviction_budget_bounds_every_glaeda_disk_run_even_with_a_timeout_override(self) -> None:
+        """Review: GLAEDA_RUNNER_DISK_TIMEOUT replaced the remaining budget, so a 299 s lock wait plus a 120 s run took
+        419 s. The override can only shorten a run; job-started shares one deadline between its evictions."""
+        with mock.patch.object(hook, "disk_argv", return_value=["glaeda-disk"]), \
+                mock.patch.object(hook.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=b"")) as run, \
+                mock.patch.object(hook, "wait_for_running_pass", return_value=False), \
+                mock.patch.dict(os.environ, {"GLAEDA_RUNNER_DISK_TIMEOUT": "120"}):
+            hook.evict(os.fspath(self.dir), 30, None, time.monotonic() + 5)
+            self.assertLessEqual(run.call_args.kwargs["timeout"], 5)
+            run.reset_mock()
+            note = hook.evict(os.fspath(self.dir), 30, None, time.monotonic() + 0.5)
+            run.assert_not_called()
+            self.assertIn("the eviction budget is spent", note)
+            os.environ["GLAEDA_RUNNER_DISK_TIMEOUT"] = "3"
+            hook.evict(os.fspath(self.dir), 30, None, time.monotonic() + 60)
+            self.assertLessEqual(run.call_args.kwargs["timeout"], 3, "an override still shortens a run")
+
+    def test_one_job_at_a_time_is_admitted_under_the_runner_floor(self) -> None:
+        """Review: two jobs that each see 25 GiB would both pass a 20 GiB admission floor and could together write
+        past the disk. Under the runner floor a live marker of another job refuses the next; a gone job's marker is
+        cleared."""
+        capacity = self.dir / "capacity"
+        first, second = (subprocess.Popen(["/bin/sleep", "60"]) for _ in range(2))
+        for proc in (first, second):
+            self.addCleanup(proc.wait)
+            self.addCleanup(proc.kill)
+        self.assertIsNone(hook.disk_low_turn(capacity, first.pid))
+        self.assertIsNone(hook.disk_low_turn(capacity, first.pid), "its own marker is no other job")
+        why = hook.disk_low_turn(capacity, second.pid)
+        self.assertEqual(why, f"another job admitted under the disk floor still runs here (pid {first.pid})")
+        (capacity / f"{hook.DISK_LOW}-{first.pid}").write_text("ps:Thu Jan  1 00:00:00 1970\n")
+        self.assertIsNone(hook.disk_low_turn(capacity, second.pid), "a reused pid holds nothing")
+        self.assertFalse((capacity / f"{hook.DISK_LOW}-{first.pid}").exists())
+        second.kill()
+        second.wait()
+        self.assertIsNone(hook.disk_low_turn(capacity, first.pid), "the job ended: the next one's turn")
+
+    def test_the_disk_ledger_refuses_on_unknown_ownership_and_never_blocks(self) -> None:
+        """Review: an unreadable marker, or a live pid whose identity cannot be read (a timed-out ps), let a second job
+        in; and the ledger's flock could block job-started without bound. Ambiguity refuses; the lock is bounded."""
+        capacity = self.dir / "capacity"
+        first, second = (subprocess.Popen(["/bin/sleep", "60"]) for _ in range(2))
+        for proc in (first, second):
+            self.addCleanup(proc.wait)
+            self.addCleanup(proc.kill)
+        self.assertIsNone(hook.disk_low_turn(capacity, first.pid))
+        real = hook.process_identity
+        with mock.patch.object(hook, "process_identity",
+                               side_effect=lambda pid: None if pid == first.pid else real(pid)):
+            why = hook.disk_low_turn(capacity, second.pid)
+        self.assertIn(f"pid {first.pid}, identity unknown", why or "")
+        self.assertTrue((capacity / f"{hook.DISK_LOW}-{first.pid}").exists(), "never removed on an unknown identity")
+        (capacity / f"{hook.DISK_LOW}-{first.pid}").write_text("")
+        self.assertIn("identity unknown", hook.disk_low_turn(capacity, second.pid) or "", "an empty marker refuses")
+        (capacity / f"{hook.DISK_LOW}-{first.pid}").unlink()
+        held = os.open(capacity / f"{hook.DISK_LOW}.lock", os.O_RDONLY)
+        self.addCleanup(os.close, held)
+        fcntl.flock(held, fcntl.LOCK_EX)
+        begin = time.monotonic()
+        with mock.patch.object(hook, "ADMISSION_WAIT_S", 0.3):
+            self.assertEqual(hook.disk_low_turn(capacity, second.pid), "another admission holds the disk ledger")
+        self.assertLess(time.monotonic() - begin, 5)
+
+    def test_an_unpinned_job_never_takes_the_disk_ledgers_turn(self) -> None:
+        """Review: with no pinned JobOwner, job-started guessed the parent pid and could leave a live marker before it
+        refused for the owner. Without an owner it refuses under the runner floor and writes nothing."""
+        self.fleet()
+        push = event(self.dir, "push", {"repository": CMUX})
+        env = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0",
+               "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"),
+               "GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": os.fspath(push), "GITHUB_REPOSITORY": "manaflow-ai/cmux"}
+        with mock.patch.object(hook, "free_gib", return_value=25.0), \
+                mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(hook, "job_owner", return_value=None), \
+                mock.patch.object(hook, "start_runner_parent_watchdog"), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            code = hook.main(["job-started", "--allowed-repo", "manaflow-ai/cmux", "--no-disk",
+                              "--reservation", os.fspath(self.dir / "fleet" / "reservation.json"),
+                              "--host-lock", os.fspath(self.dir / "fleet" / "host.lock"), "--min-free-gib", "30",
+                              "--capacity-dir", os.fspath(self.dir / "capacity"),
+                              "--state-dir", os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()),
+                              "--gui-wait", "0"])
+        self.assertEqual(code, 1, out.getvalue())
+        self.assertIn("is not pinned, so it cannot take the disk ledger's turn", out.getvalue())
+        self.assertEqual(list((self.dir / "capacity").glob(f"{hook.DISK_LOW}-*")), [])
+
+    def test_job_started_admits_under_the_runner_floor_only_one_job_at_a_time(self) -> None:
+        self.fleet()
+        args = ("--min-free-gib", "30", "--capacity-dir", os.fspath(self.dir / "capacity"))
+        holder = subprocess.Popen(["/bin/sleep", "60"])
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        with mock.patch.object(hook, "free_gib", return_value=25.0):
+            (self.dir / "capacity").mkdir(parents=True, exist_ok=True)
+            self.assertIsNone(hook.disk_low_turn(self.dir / "capacity", holder.pid))
+            push = event(self.dir, "push", {"repository": CMUX})
+            env = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0",
+                   "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"),
+                   "GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": os.fspath(push),
+                   "GITHUB_REPOSITORY": "manaflow-ai/cmux"}
+            with mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch.object(hook, "start_runner_parent_watchdog"), \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                code = hook.main(["job-started", "--allowed-repo", "manaflow-ai/cmux", "--no-disk",
+                                  "--reservation", os.fspath(self.dir / "fleet" / "reservation.json"),
+                                  "--host-lock", os.fspath(self.dir / "fleet" / "host.lock"), *args,
+                                  "--state-dir", os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()),
+                                  "--gui-wait", "0"])
+        self.assertEqual(code, 1, out.getvalue())
+        self.assertIn(f"25.0 GiB free, 30 GiB required: another job admitted under the disk floor still runs here "
+                      f"(pid {holder.pid})", out.getvalue())
+
+    def test_the_admission_floor_is_one_jobs_measured_disk_growth(self) -> None:
+        """The runner floor (the manifest's 30 GiB) decides when to evict; a job is refused only under what one job
+        has been measured to write (DISK_JOB_PEAK_GIB, max 18.7 GiB), or a tour runner's own floor."""
+        self.assertEqual(hook.DISK_JOB_PEAK_GIB, 20.0)
+        with mock.patch.dict(os.environ):
+            os.environ.pop(hook.DISK_JOB_PEAK_ENV, None)
+            self.assertEqual(hook.admit_floor_gib(30, False), 20.0)
+            self.assertEqual(hook.admit_floor_gib(12, False), 12.0, "a lower runner floor stands")
+            self.assertEqual(hook.admit_floor_gib(0, False), 0.0, "no floor: none")
+            self.assertEqual(hook.admit_floor_gib(40, True), 40.0, "a tour runner keeps cmux's floor")
+        for value, want in (("25", 25.0), ("0", 0.0), ("-1", 20.0), ("10001", 20.0), ("nan", 20.0), ("x", 20.0)):
+            with self.subTest(value=value), mock.patch.dict(os.environ, {hook.DISK_JOB_PEAK_ENV: value}):
+                self.assertEqual(hook.job_disk_gib(), want)
+
+    def test_a_completed_line_records_the_lowest_free_disk_the_job_saw(self) -> None:
+        samples = hook.JobSamples({"job": "build-nightly-app"}, 8, time.time() - 60)
+        samples.disk_free_start = 40.0
+        split = (1.0, 0.0, 0.0, {}, {})
+        for free in (40.0, 31.5, 22.25, 26.0, float("nan")):
+            samples.add(None, split, 10.0, free=free)
+        samples.add(None, split, 10.0, free=None)
+        samples.disk_free_end = 26.0
+        record = samples.summary(time.time())
+        self.assertEqual((record["disk_free_start_gib"], record["disk_free_end_gib"], record["disk_free_min_gib"]),
+                         (40.0, 26.0, 22.2))
+        empty = hook.JobSamples({}, 8, time.time()).summary(time.time())
+        self.assertIsNone(empty["disk_free_min_gib"])
 
     def prejob(self, frees: list[float], active: bool = True, wait_s: float = 2.0, floor: float = 30.0):
         """prejob_evict with free space read from frees (the last repeats), a pass running while active."""
@@ -1007,7 +1171,7 @@ class HookTest(unittest.TestCase):
         """Running jobs can write the disk below the floor while this one waits: it then evicts and is refused, as
         under the floor before the wait."""
         self.fleet()
-        frees = iter([35.0, 35.0, 20.0])  # the two floor checks, then the one after the wait
+        frees = iter([35.0, 35.0, 35.0, 15.0])  # the three floor checks, then the one after the wait
         last = [35.0]
 
         def free(_path):
@@ -1031,7 +1195,7 @@ class HookTest(unittest.TestCase):
         ev.assert_called_once()
         text = out.getvalue()
         self.assertLess(text.index("pre-job target"), text.index("disk floor"))
-        self.assertIn("20.0 GiB free, 30 GiB required", text)
+        self.assertIn("15.0 GiB free, 20 GiB required", text, "refused under one job's measured disk growth")
         self.assertTrue(self.lock_free())
 
     def test_prejob_margin_override_is_bounded(self) -> None:
