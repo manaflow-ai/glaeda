@@ -187,6 +187,7 @@ import fcntl
 import glob
 import gzip
 import hashlib
+import itertools
 import json
 import os
 import platform
@@ -250,6 +251,14 @@ DU_KILL_GRACE_S = 1
 # A refresh is a background convenience, not a reason to keep a runner CPU-bound for hours.  The
 # snapshot keeps completed measurements, so a later refresh can finish the remaining candidates.
 REFRESH_BUDGET_S = 10 * 60
+# A pressure --apply re-measures every candidate of every reclaimable family (fresh_for_apply). With no bound, a
+# per-user $TMPDIR of ~55,000 test scratch dirs kept every pass in that walk until the runner hook's 15 min bound
+# killed it, before it deleted anything; the hook's floor eviction then skipped as eviction_busy behind it. A CI mini
+# sat under its 30 GiB floor for five hours with 32.8 GiB of idle SwiftPM scratch reclaimable (2026-10-26). So a
+# pressure apply stops starting walks after PRESSURE_MEASURE_BUDGET_S and stops judging after twice that, then
+# deletes from what it judged: an unmeasured candidate is never deleted (it stays unsized), and the families are
+# walked round-robin, so a family of a few large caches is measured before a family of many small entries.
+PRESSURE_MEASURE_BUDGET_S = 4 * 60
 EVICTION_STUCK: list[dict[str, Any]] = []
 _EVICT_HANDLE = None
 _MEASURE_BUDGET_REACHED = False
@@ -1235,6 +1244,8 @@ POLICY_DEFAULTS: dict[str, Any] = {
     "low_margin_gib": 4.0,
     "target_margin_gib": 20.0,
     "pressure_idle_hours": 0.5,
+    # PRESSURE_MEASURE_BUDGET_S: seconds a pressure --apply spends starting size walks (0: no bound)
+    "pressure_measure_budget_s": float(PRESSURE_MEASURE_BUDGET_S),
     "pressure_jobs": 80,
     "min_jobs": 6,
     "sweep_jobs": 190,
@@ -5351,6 +5362,20 @@ def candidates(fam: Family) -> list[Path]:
     return owned
 
 
+def pressure_measure_budget_s() -> float:
+    """disk-policy.json's pressure_measure_budget_s, PRESSURE_MEASURE_BUDGET_S by default (0: no bound)."""
+    return float(POLICY.get("pressure_measure_budget_s", PRESSURE_MEASURE_BUDGET_S))
+
+
+def pressure_survey_deadlines(now: float | None = None) -> tuple[float | None, float | None]:
+    """A pressure apply's (measure, judge) deadlines: walks stop starting at the budget, verdicts at twice it."""
+    budget = pressure_measure_budget_s()
+    if budget <= 0:
+        return None, None
+    now = time.monotonic() if now is None else now
+    return now + budget, now + 2 * budget
+
+
 def fresh_for_apply(known: dict[str, int], fams: list[Family]) -> dict[str, int]:
     """The snapshot sizes an --apply may reuse: sizes decide what gets deleted under pressure, so every
     reclaimable candidate is re-measured. A discovering family's root is the whole home directory, so
@@ -5527,7 +5552,7 @@ def _measure_missing(paths: list[Path], deadline: float | None = None) -> dict[s
 
 def survey(families: list[Family], idle_hours: float, min_bytes: int,
            known: dict[str, int] | None = None, defer_bulk: bool = False,
-           deadline: float | None = None) -> list[Item]:
+           deadline: float | None = None, judge_deadline: float | None = None) -> list[Item]:
     """Judge every candidate live. Sizes come from `known` when present; the rest are measured.
 
     With defer_bulk, unsized candidates of bulk_sizes families are left out instead of measured,
@@ -5540,7 +5565,14 @@ def survey(families: list[Family], idle_hours: float, min_bytes: int,
         evidence = process_evidence()
     except NoEvidence as error:
         evidence = error
-    return _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk, deadline)
+    return _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk, deadline, judge_deadline)
+
+
+def round_robin_work(families: list[Family]) -> list[tuple[Family, Path]]:
+    """Every family's candidates, one family's next candidate after another's: a deadline that stops the walks
+    leaves a few of each family unmeasured, not every family after one with tens of thousands of entries."""
+    queues = [[(fam, path) for path in candidates(fam)] for fam in families]
+    return [pair for row in itertools.zip_longest(*queues) for pair in row if pair is not None]
 
 
 def bounded_refresh_survey(families: list[Family], idle_hours: float, min_bytes: int,
@@ -5573,14 +5605,14 @@ def bounded_refresh_survey(families: list[Family], idle_hours: float, min_bytes:
 
 
 def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
-            deadline: float | None = None) -> list[Item]:
+            deadline: float | None = None, judge_deadline: float | None = None) -> list[Item]:
     global _MEASURE_BUDGET_REACHED
     _MEASURE_BUDGET_REACHED = False
     _NESTED_WALKS.clear()
     now = time.time()
     items: list[Item] = []
     known = known if known is not None else {}
-    work = [(fam, path) for fam in families for path in candidates(fam)]
+    work = round_robin_work(families)
     if defer_bulk:
         work = [(fam, path) for fam, path in work if not fam.bulk_sizes or str(path) in known]
     for fam in families:
@@ -5609,21 +5641,14 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
     work = [(fam, path) for fam, path in work if str(path) in known]
     sizes = [known[str(path)] for _, path in work]
     floors = [min_bytes if fam.min_bytes is None else fam.min_bytes for fam, _ in work]
-    idles = []
-    if deadline is None:
-        idles = [(now - item_mtime(fam, path)) / 3600
-                 if size >= floor else 0.0 for (fam, path), size, floor in zip(work, sizes, floors)]
+    judge_deadline = deadline if judge_deadline is None else judge_deadline
+    if judge_deadline is None:
+        idles: list[float | None] = [(now - item_mtime(fam, path)) / 3600
+                                     if size >= floor else 0.0 for (fam, path), size, floor in zip(work, sizes, floors)]
     else:
-        # A refresh deadline also covers the live verdict pass.  A large completed batch must not
-        # turn a bounded measurement into another unbounded walk of every candidate's metadata.
-        keep = 0
-        for (fam, path), size, floor in zip(work, sizes, floors):
-            if time.monotonic() >= deadline:
-                _MEASURE_BUDGET_REACHED = True
-                break
-            idles.append((now - item_mtime(fam, path)) / 3600 if size >= floor else 0.0)
-            keep += 1
-        work, sizes, floors = work[:keep], sizes[:keep], floors[:keep]
+        # A deadline also covers the live verdict pass, ages included: each candidate's age is read in the verdict
+        # loop below, so a pass that runs out of time keeps every candidate it fully judged, not none.
+        idles = [None] * len(work)
     if isinstance(evidence, NoEvidence):
         cwds, cmds, blind = [], "", f"no process evidence ({evidence})"
     else:
@@ -5636,8 +5661,15 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
     references_by_root: dict[str, frozenset[str]] = {}
     archived = archived_seeds() if any(fam.id == "cmux-seeds" for fam, _ in work) else frozenset()
     for (fam, path), size, idle, floor in zip(work, sizes, idles, floors):
+        # the verdicts' socket, lock and git checks count against the judge deadline too: what is judged by then
+        # is kept (and may be deleted), the rest is left out
+        if judge_deadline is not None and time.monotonic() >= judge_deadline:
+            _MEASURE_BUDGET_REACHED = True
+            break
         if size < floor:
             continue
+        if idle is None:
+            idle = (now - item_mtime(fam, path)) / 3600
         sp = str(path)
         reasons = []
         if blind:
@@ -8760,9 +8792,11 @@ def _main_impl(argv: list[str] | None = None) -> int:
                 maintenance_handle.close()
             return result
         measure_lock = None
-    refresh_deadline = None
+    refresh_deadline = judge_deadline = None
     if a.refresh and a.refresh_budget_s > 0:
         refresh_deadline = time.monotonic() + a.refresh_budget_s
+    elif a.pressure and a.apply:
+        refresh_deadline, judge_deadline = pressure_survey_deadlines()
     background_refresh = a.refresh and not a.apply and a.refresh_lock_fd is not None
     if background_refresh:
         items = bounded_refresh_survey(
@@ -8773,7 +8807,13 @@ def _main_impl(argv: list[str] | None = None) -> int:
             known.update(_REFRESH_PROGRESS_KNOWN)
     else:
         items = survey(fams, idle, a.min_mib * 1024**2, known,
-                       defer_bulk=bool(at) and not a.apply, deadline=refresh_deadline)
+                       defer_bulk=bool(at) and not a.apply, deadline=refresh_deadline,
+                       judge_deadline=judge_deadline)
+        if judge_deadline is not None and _MEASURE_BUDGET_REACHED:
+            RUN["measure_budget_reached"] = True
+            if not a.json:
+                print(f"pressure measure budget ({pressure_measure_budget_s():g} s) reached: deleting from the "
+                      "candidates measured so far; the rest stay unsized and are never deleted this pass\n")
     # Release the measurement lock before starting a background refresh. The child must be able to
     # acquire it, otherwise every stale report spawns a refresh that immediately skips.
     if measure_lock is not None:
@@ -8992,7 +9032,8 @@ def write_run_line(started: float, free_before: int | None) -> None:
            "blocked": RUN.get("blocked", {}), "duration_s": round(time.time() - started, 1),
            "skipped": RUN.get("skipped"), "cmux_next_ci_over_gib": RUN.get("cmux_next_ci_over_gib"),
            "caller": RUN.get("caller"), "evict_owner": _owner_line(RUN.get("evict_owner")),
-           "bundle_failed": RUN.get("bundle_failed", [])}
+           "bundle_failed": RUN.get("bundle_failed", []),
+           "measure_budget_reached": bool(RUN.get("measure_budget_reached"))}
     with contextlib.suppress(OSError):
         RUN_LOG.parent.mkdir(parents=True, exist_ok=True)
         with RUN_LOG.open("a") as f:
