@@ -618,9 +618,9 @@ class FakeCmux:
         self.runs, self.jobs, self.pulls, self.effects = {}, {}, {}, []
 
     def add_run(self, run_id=7, status="in_progress", attempt=1, head=SHA, event="pull_request", pr=5,
-                head_repo=REPO, jobs=()):
+                head_repo=REPO, jobs=(), path=".github/workflows/ci.yml"):
         self.runs[run_id] = {"id": run_id, "status": status, "run_attempt": attempt, "head_sha": head,
-                             "event": event, "repository": {"full_name": REPO},
+                             "event": event, "repository": {"full_name": REPO}, "path": path,
                              "head_repository": {"full_name": head_repo},
                              "pull_requests": [{"number": pr}] if pr else []}
         self.jobs[run_id] = list(jobs)
@@ -811,9 +811,104 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(notes[8][1], "someone else re-ran the run")
         self.assertEqual(notes[9][1], "watch limit reached")
 
-    def test_nightly_run_is_rescued_without_a_pull_request(self):
-        self.cmux.add_run(event="schedule", pr=None, jobs=[job(1, created=NOW - 600)])
-        store, ledger = fake_ledger(ledger_doc(reservation(priority="nightly", created=NOW - 600)))
+    def test_push_run_is_rescued_without_a_pull_request(self):
+        self.cmux.add_run(event="push", pr=None, jobs=[job(1, created=NOW - 600)])
+        store, ledger = fake_ledger(ledger_doc(reservation(priority="warm", created=NOW - 600)))
+        self.tick(ledger, now=NOW, seen={"job:1": NOW - 200})
+        self.assertEqual(self.cmux.effects, [("cancel", 7)])
+
+    def test_nightly_dev_and_promote_runs_are_never_cancelled(self):
+        """The rulebook: a started nightly, DEV or promote build is never cancelled for a slow or busy runner. This
+        list is written out here, not read from the script, so dropping a workflow from the guard fails CI."""
+        cases = [
+            ("nightly priority", dict(event="schedule", pr=None), "nightly"),
+            ("dev priority", dict(event="workflow_dispatch", pr=None), "dev"),
+            ("nightly.yml", dict(event="push", pr=None, path=".github/workflows/nightly.yml"), "pr"),
+            ("nightly.yml dispatch", dict(event="workflow_dispatch", pr=None,
+                                          path=".github/workflows/nightly.yml"), "warm"),
+            ("DEV daily", dict(event="workflow_dispatch", pr=None,
+                               path=".github/workflows/cmux-next-dev-daily.yml"), "pr"),
+            ("promote push", dict(event="push", pr=None, path=".github/workflows/cmux-next.yml"), "pr"),
+            ("nightly-next train", dict(event="workflow_dispatch", pr=None,
+                                        path=".github/workflows/nightly-next-train.yml"), "pr"),
+            ("release", dict(event="push", pr=None, path=".github/workflows/release.yml"), "pr"),
+            ("nightly sign", dict(event="push", pr=None, path=".github/workflows/nightly-sign.yml"), "pr"),
+            ("nightly-next tick", dict(event="schedule", pr=None,
+                                       path=".github/workflows/nightly-next-tick.yml"), "pr"),
+            ("nightly-next canary", dict(event="workflow_dispatch", pr=None,
+                                         path=".github/workflows/nightly-next-canary.yml"), "pr"),
+        ]
+        refused = [{"name": "Set up runner", "conclusion": "failure"}]
+        for name, run, priority in cases:
+            for stuck in ([job(1, created=NOW - 600)],
+                          [job(1, status="completed", runner="m1-glaeda", conclusion="failure", steps=refused)]):
+                with self.subTest(name=name, refused=bool(stuck[0]["runner_name"])):
+                    self.cmux = FakeCmux()
+                    self.api = gr.GitHub("repo-token", self.cmux)
+                    self.cmux.add_run(jobs=stuck, **run)
+                    store, ledger = fake_ledger(ledger_doc(reservation(priority=priority, created=NOW - 600)))
+                    seen = {"job:1": NOW - 200}
+                    for at in (NOW, NOW + 100, NOW + 200):
+                        self.tick(ledger, now=at, seen=seen)
+                    self.assertEqual(self.cmux.effects, [])
+                    entry = store.doc()["reservations"][0]
+                    self.assertEqual(entry["state"], "released")
+                    self.assertIn("never cancelled", entry["note"])
+
+    def test_a_rescuing_entry_for_a_nightly_run_is_released_not_cancelled(self):
+        """A reservation already `rescuing` (written by an older agent) still never cancels a nightly or DEV run."""
+        for path in (".github/workflows/nightly.yml", ".github/workflows/cmux-next-dev-daily.yml"):
+            with self.subTest(path=path):
+                self.cmux = FakeCmux()
+                self.api = gr.GitHub("repo-token", self.cmux)
+                self.cmux.add_run(event="workflow_dispatch", pr=None, path=path, jobs=[job(1, created=NOW - 600)])
+                store, ledger = fake_ledger(ledger_doc(reservation(state="rescuing", created=NOW - 600)))
+                self.tick(ledger, now=NOW, seen={"job:1": NOW - 200})
+                self.assertEqual(self.cmux.effects, [])
+                self.assertEqual(store.doc()["reservations"][0]["state"], "released")
+
+    def test_an_older_agents_cancel_of_a_nightly_run_is_never_forced_and_is_restored(self):
+        """A stale `rescuing` entry whose cancel an older agent recorded: no force-cancel while the run settles,
+        and once it ends cancelled it is re-run, so a protected run is never left cancelled."""
+        self.cmux.add_run(event="push", pr=None, path=".github/workflows/nightly.yml",
+                          jobs=[job(1, created=NOW - 600)])
+        store, ledger = fake_ledger(ledger_doc(reservation(state="rescuing", created=NOW - 600)))
+        seen = {f"cancel:{REPO.lower()}#7.1": NOW - gr.FORCE_CANCEL_SECONDS - 5, "job:1": NOW - 200}
+        self.tick(ledger, now=NOW, seen=seen)
+        self.assertEqual(self.cmux.effects, [])
+        self.assertEqual(store.doc()["reservations"][0]["state"], "rescuing")
+        self.cmux.runs[7].update(status="completed", conclusion="cancelled")
+        self.tick(ledger, now=NOW + 20, seen=seen)
+        self.assertEqual(self.cmux.effects, [("rerun", 7)])
+        self.assertEqual(store.doc()["reservations"][0]["state"], "rescued")
+
+    def test_a_protected_run_is_restored_from_the_ledgers_cancel_at_alone(self):
+        """The agent's own cancel record is gone (pruned, or a restart lost it), but the ledger's cancel_at
+        says an older agent cancelled this DEV run: it is watched, never forced, and re-run once cancelled."""
+        self.cmux.add_run(event="workflow_dispatch", pr=None, path=".github/workflows/cmux-next-dev-daily.yml",
+                          jobs=[job(1, created=NOW - 600)])
+        store, ledger = fake_ledger(ledger_doc(reservation(state="rescuing", created=NOW - 600,
+                                                           cancel_at=gr.utc(NOW - 500))))
+        self.tick(ledger, now=NOW, seen={})
+        self.assertEqual(self.cmux.effects, [])
+        self.assertEqual(store.doc()["reservations"][0]["state"], "rescuing")
+        self.cmux.runs[7].update(status="completed", conclusion="cancelled")
+        self.tick(ledger, now=NOW + 20, seen={})
+        self.assertEqual(self.cmux.effects, [("rerun", 7)])
+        self.assertEqual(store.doc()["reservations"][0]["state"], "rescued")
+
+    def test_a_protected_run_with_no_cancel_on_record_is_never_rerun(self):
+        self.cmux.add_run(event="push", pr=None, path=".github/workflows/nightly.yml", status="completed",
+                          jobs=[job(1, created=NOW - 600)])
+        self.cmux.runs[7]["conclusion"] = "cancelled"
+        store, ledger = fake_ledger(ledger_doc(reservation(state="rescuing", created=NOW - 600)))
+        self.tick(ledger, now=NOW, seen={})
+        self.assertEqual(self.cmux.effects, [])
+        self.assertEqual(store.doc()["reservations"][0]["state"], "released")
+
+    def test_cmux_next_pull_request_runs_keep_the_rescue(self):
+        self.cmux.add_run(path=".github/workflows/cmux-next.yml", jobs=[job(1, created=NOW - 600)])
+        store, ledger = fake_ledger(ledger_doc(reservation(created=NOW - 600)))
         self.tick(ledger, now=NOW, seen={"job:1": NOW - 200})
         self.assertEqual(self.cmux.effects, [("cancel", 7)])
 

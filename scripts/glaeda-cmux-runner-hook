@@ -461,6 +461,14 @@ GUEST_WAIT_S = 600.0  # guests have no rescue workflow: a full mini holds their 
 # job after it has entered runner setup, so the hook refuses after this short bounded wait; the owned-pool rescue
 # then re-runs it through placement, where an idle warm-cache mini (or the configured overflow) can take it.
 DEV_COMPILE_CAPACITY_WAIT_S = 60.0
+# The DEV daily publisher's Mac jobs (verify, the tip DMG) take 1.6 and 2.5 min p95 on Blacksmith, and their
+# timeout-minutes (15 and 20) count the wait inside "Set up runner". A full mini held tip-dmg-build there 19 min
+# (cmux run 40466210697, 2026-10-27) until GitHub timed it out and the DEV feed went stale. So every job of that
+# workflow waits DEV_COMPILE_CAPACITY_WAIT_S at most and is then refused; cmux's owned-pool rescue re-runs a refused
+# job, and attempt 2 takes Blacksmith. The bound, like the DEV compile's, is when the last try starts: one try can
+# wait ADMISSION_WAIT_S more for admission.lock, so the refusal comes within DEV_BOUND_WORST_S, far inside the 15
+# and 20 minute timeouts it protects.
+DEV_DAILY_WORKFLOW = "cmux-next-dev-daily.yml"
 # CAPACITY_WAIT: an ordinary cmux job that finds its units or tokens taken waits for them, with no time limit,
 # instead of failing. The DEV cmux-next scheme compile is the bounded exception above: GitHub handed the job to
 # this runner and never moves it to another one, so a refusal only turned a
@@ -562,11 +570,15 @@ def dev_compile_capacity_wait(repo: str | None, home_repo: str, event_name: str 
     """The bounded capacity wait for cmux NEXT's DEV compile, or None for ordinary jobs.
 
     A push to feat-cmux-next runs the DEV Release product in ``cmux-scheme-compile``. A DEV daily
-    workflow_dispatch carries ``inputs.dev_daily=true``. Once either job has been claimed by a runner,
+    workflow_dispatch carries ``inputs.dev_daily=true``. Every job of DEV_DAILY_WORKFLOW (the publisher's verify
+    and tip DMG jobs, whose short timeouts count this wait) is bounded too. Once a job has been claimed by a runner,
     waiting longer only strands it on one mini; a refusal lets the owned-pool rescue run placement again.
     """
-    if repo is None or repo.lower() != home_repo.lower() or workflow != "cmux-next.yml" \
-            or job != "cmux-scheme-compile":
+    if repo is None or repo.lower() != home_repo.lower():
+        return None
+    if workflow == DEV_DAILY_WORKFLOW:
+        return DEV_COMPILE_CAPACITY_WAIT_S
+    if workflow != "cmux-next.yml" or job != "cmux-scheme-compile":
         return None
     if event_name == "push" and ref == "refs/heads/feat-cmux-next":
         return DEV_COMPILE_CAPACITY_WAIT_S
@@ -575,6 +587,13 @@ def dev_compile_capacity_wait(repo: str | None, home_repo: str, event_name: str 
         if isinstance(inputs, dict) and str(inputs.get("dev_daily", "")).lower() == "true":
             return DEV_COMPILE_CAPACITY_WAIT_S
     return None
+
+
+def bounded_wait(cap: float | None, bound: float | None) -> float | None:
+    """The shorter of an explicit wait (`cap`, None for no limit) and a job's own bound (None for none)."""
+    if bound is None:
+        return cap
+    return bound if cap is None else min(cap, bound)
 
 
 def slot_capacity_wait(cap: float | None, dev_compile_runner: bool) -> float | None:
@@ -976,6 +995,8 @@ def export_root(name: str) -> str:
             pass
     return f"{CANONICAL_ROOT_ENV}={path} via {'+'.join(wrote) or 'nothing (no GITHUB_ENV or RUNNER_TEMP)'}"
 ADMISSION_WAIT_S = 30.0  # admissions are serialized briefly so two jobs never split the free units
+# A DEV-bounded job's worst wait before its refusal (DEV_DAILY_WORKFLOW's comment).
+DEV_BOUND_WORST_S = DEV_COMPILE_CAPACITY_WAIT_S + ADMISSION_WAIT_S + ADMIT_POLL_S
 # The listener gate reads its runner's --capacity-units from the job-started hook glaeda-cmux-runner wrote.
 RUNNER_HOOK_SCRIPT = "glaeda-hooks/job-started.sh"
 LISTEN_SCRIPT = "glaeda-hooks/listen.sh"
@@ -6933,10 +6954,10 @@ def main(argv: list[str] | None = None) -> int:
             # A cmux job waits for capacity with no limit (CAPACITY_WAIT); a guest has no rescue workflow, so it
             # waits GUEST_WAIT_S for room and is then refused.
             cap = args.guest_wait if is_guest(repo, args.home_repo) else args.gui_wait
-            if cap is None:
-                cap = dev_compile_capacity_wait(
-                    repo, args.home_repo, os.environ.get("GITHUB_EVENT_NAME"),
-                    os.environ.get("GITHUB_REF"), event, os.environ.get("GITHUB_JOB", ""), job_workflow())
+            # The DEV bound holds over a longer --gui-wait too; a shorter one is kept.
+            cap = bounded_wait(cap, dev_compile_capacity_wait(
+                repo, args.home_repo, os.environ.get("GITHUB_EVENT_NAME"),
+                os.environ.get("GITHUB_REF"), event, os.environ.get("GITHUB_JOB", ""), job_workflow()))
             cap = slot_capacity_wait(cap, args.dev_compile_runner)
             tier = job_tier(os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REF"),
                             os.environ.get("GITHUB_REPOSITORY"), event, os.environ.get("GITHUB_WORKFLOW_REF"),

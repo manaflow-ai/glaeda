@@ -33,7 +33,8 @@ exits 0: routing never fails a job.
 
 `agent` is one tick of the always-on side: publish the state, then watch every live reservation,
 release it when its jobs start or its run ends, and rescue a run whose pool job waited RESCUE_SECONDS
-with no runner (or was refused at start): cancel it, then re-run it once it has finished. The re-run
+with no runner (or was refused at start): cancel it, then re-run it once it has finished. A nightly, DEV
+or promote run (never_cancelled()) is never cancelled: its reservation is released instead. The re-run
 is attempt 2, which `route` never sends to an owned machine. GitHub never re-routes a queued job, so
 this is the only way off a busy pool. Run it every 20 s from launchd or a systemd timer, never on
 cmux-lawrence. No endpoint listens anywhere: every call is outbound to the GitHub API.
@@ -923,6 +924,19 @@ def route(req: Request, state_text: str, ledger: Ledger | None, *, now: Callable
 
 SETUP_STEPS = {"Set up job", "Set up runner", "Complete job", "Complete runner"}
 
+# The rulebook: a started nightly, DEV or promote build is never cancelled unless it is stuck past its timeout or
+# certain to fail; a slow or busy runner is not a reason, and neither is a newer tip. Their own rescue (cmux
+# owned_pool_rescue.py) re-runs a refused or timed-out job elsewhere without this agent, so this agent never
+# cancels one: its reservation is released instead. The priorities route gives such runs, and the workflow files
+# that build, sign or publish a feed, whatever priority the reservation names.
+NEVER_CANCEL_PRIORITIES = frozenset({"nightly", "dev"})
+NEVER_CANCEL_WORKFLOWS = frozenset({
+    "nightly.yml", "nightly-sign.yml", "release.yml", "cmux-next-dev-daily.yml",
+    "nightly-next-train.yml", "nightly-next-tick.yml", "nightly-next-canary.yml",
+})
+# cmux-next.yml's push runs compile and promote the DEV and nightly-next feeds.
+NEVER_CANCEL_PUSH_WORKFLOWS = frozenset({"cmux-next.yml"})
+
 
 def job_labels(job: dict[str, Any]) -> list[str]:
     return [str(label) for label in job.get("labels") or []]
@@ -962,6 +976,18 @@ def trusted_run(run: dict[str, Any], entry: dict[str, Any]) -> str | None:
     if run.get("head_sha") != entry["head_sha"]:
         return "the run's head commit differs from the reservation"
     return None
+
+
+def never_cancelled(run: dict[str, Any], entry: dict[str, Any]) -> str:
+    """Why this run is a nightly, DEV or promote build this agent never cancels, or ''."""
+    workflow = str(run.get("path") or "").split("@", 1)[0].rsplit("/", 1)[-1]
+    if entry.get("priority") in NEVER_CANCEL_PRIORITIES:
+        return f"a {entry['priority']} run is never cancelled"
+    if workflow in NEVER_CANCEL_WORKFLOWS:
+        return f"a {workflow} run is never cancelled"
+    if workflow in NEVER_CANCEL_PUSH_WORKFLOWS and run.get("event") == "push":
+        return f"a {workflow} push run is never cancelled"
+    return ""
 
 
 def pull_moved(api: GitHub, repo: str, run: dict[str, Any]) -> str:
@@ -1039,7 +1065,15 @@ def watch_one(api: GitHub, entry: dict[str, Any], *, now: float, seen: dict[str,
             return {"state": "failed", "note": f"not rescued: {why}"}
         key = f"cancel:{repo.lower()}#{run_id}.{attempt}"
         mine = seen.get(key)
+        kept = never_cancelled(run, entry)
+        # An older agent's cancel of a protected run, by this agent's own record or the ledger's durable cancel_at
+        # (the seen record may be pruned, or lost to a restart).
+        cancelled_before = mine is not None or bool(entry.get("cancel_at"))
         if run.get("status") != "completed":
+            if kept:
+                # No cancel and no force-cancel, even after an older agent's cancel: if that one lands, the
+                # finished run is re-run below, so it is never left cancelled.
+                return None if cancelled_before else {"state": "released", "note": f"not rescued: {kept}"}
             if mine is None:
                 _, _, stuck, refused = pool_jobs(api, entry, now=now, seen=seen, rescue_seconds=rescue_seconds)
                 if not (stuck or refused):
@@ -1058,6 +1092,10 @@ def watch_one(api: GitHub, entry: dict[str, Any], *, now: float, seen: dict[str,
                 api.ok("POST", f"/repos/{repo}/actions/runs/{run_id}/force-cancel")
                 return {"forced": True}
             return None
+        if kept and cancelled_before and run.get("conclusion") == "cancelled":
+            # An older agent cancelled a protected run: restore it, whatever moved meanwhile.
+            api.ok("POST", f"/repos/{repo}/actions/runs/{run_id}/rerun")
+            return {"state": "rescued", "note": f"re-ran run {run_id}, which an older agent cancelled ({kept})"}
         if mine is None:
             return {"state": "released", "note": "the run finished before this agent cancelled it"}
         if run.get("conclusion") != "cancelled":
@@ -1073,6 +1111,9 @@ def watch_one(api: GitHub, entry: dict[str, Any], *, now: float, seen: dict[str,
     if stuck or refused:
         if why:
             return {"state": "released", "note": f"not rescued: {why}"}
+        kept = never_cancelled(run, entry)
+        if kept:
+            return {"state": "released", "note": f"not rescued: {kept}", "started": started}
         moved = pull_moved(api, repo, run)
         if moved:
             return {"state": "released", "note": f"not rescued: {moved}"}
