@@ -109,6 +109,9 @@ MAX_CONTENDED_JOBS = 5  # per member, newest first
 CONSOLE_STATES = ("unlocked", "locked", "no_user")
 # A retired owner's family above this is worth a person's decision.
 RETIRED_WARN_BYTES = 5 * GIB
+# glaeda-disk's user-tmp-test-residue reaps test scratch 12 h idle; this many past 12 h means it is not keeping up
+# (~55,000 entries on one CI mini stalled every pressure pass, 2026-10-26).
+TMP_RESIDUE_WARN = 10_000
 # fleet-cas-prune runs hourly; three missed runs is a stopped LaunchAgent, not a busy host.
 PRUNE_SILENT_SECONDS = 3 * 3600
 PRUNE_LABEL = "com.teamleaderleo.glaeda.fleet-cas-prune"
@@ -689,8 +692,12 @@ def parse_disk(stdout: str, at: int) -> dict[str, Any]:
                                                   "platform": clean(coverage.get("platform"), 20),
                                                   "children": children[:32]})
             accounting.append(clean_entry)
+        residue = report.get("tmp_test_residue") if isinstance(report.get("tmp_test_residue"), dict) else None
         row.update(free=free, total=total, low=num(home.get("low")), families=families[:MAX_DISK_FAMILIES],
-                   sizes_at=sizes_at + skew if sizes_at is not None else None, accounting=accounting)
+                   sizes_at=sizes_at + skew if sizes_at is not None else None, accounting=accounting,
+                   tmp_test_residue=None if residue is None else {
+                       k: int(residue[k]) for k in ("entries", "test_residue", "idle")
+                       if num(residue.get(k)) is not None})
     job_at = next((int(x) for x in sections.get("prune_job_at", []) if x.strip().isdigit()), None)
     row["prune_job_at"] = job_at + skew if job_at is not None else None
     prune_lines = json_lines(sections.get("prune", []))
@@ -1525,6 +1532,8 @@ class Builder:
                                                "suspect_entries": stamp_of(gc.get("suspect_entries"))},
                 "reclaimed_24h": None if reclaimed is None else {
                     "bytes": num(reclaimed.get("bytes")) or 0, "count": num(reclaimed.get("count")) or 0},
+                "tmp_test_residue": row.get("tmp_test_residue") if isinstance(row.get("tmp_test_residue"), dict)
+                else None,
             }
             d = m["disk"]
             if not d["installed"]:
@@ -1546,6 +1555,10 @@ class Builder:
                          self.action(member, "retire_cache", "person", None,
                                      note="its owner's launchd service is not loaded; glaeda-disk only reports "
                                           "this family, so a person decides whether it goes"))
+            residue = d["tmp_test_residue"] or {}
+            if (residue.get("idle") or 0) >= TMP_RESIDUE_WARN:
+                warn("tmp_test_residue", f"{residue['idle']} test scratch entries in $TMPDIR untouched 12 h+ "
+                                         f"({residue.get('entries', '?')} entries in all)", report)
             for what, line in (("prune", d["prune"]), ("gc", d["gc"])):
                 result = (line or {}).get("result") or ""
                 if result.startswith(("failed", "skipped: kept entries")):
@@ -1888,6 +1901,9 @@ def disk_line(d: dict[str, Any] | None, at: int) -> str:
     reclaimed = d.get("reclaimed_24h")
     if reclaimed:
         parts.append(f"reclaimed 24h {gib(reclaimed.get('bytes'))} GiB")
+    residue = d.get("tmp_test_residue")
+    if residue and "test_residue" in residue:
+        parts.append(f"tmp test scratch {residue['test_residue']} ({residue.get('idle', '?')} idle 12h+)")
     return clean("; ".join(parts), MAX_TEXT)
 
 

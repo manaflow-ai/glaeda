@@ -737,6 +737,24 @@ class DiskTests(unittest.TestCase):
         self.assertEqual(row["gc"]["suspect_entries"], 0)  # the count, never the tool's text
         self.assertEqual(row["sizes_at"], 1799999100)
 
+    def test_tmpdir_test_scratch_is_counted_and_a_buildup_warns(self):
+        report = {"schema": "glaeda-disk/v2", "free": 200 * GIB, "total": 460 * GIB,
+                  "filesystems": [{"free": 200 * GIB, "total": 460 * GIB, "low": 69 * GIB}],
+                  "tmp_test_residue": {"entries": 47000, "test_residue": 45000, "idle": 44000, "idle_hours": 12,
+                                       "runner_host": True, "path": "/private/var/folders/x/T"}}
+        row = fs.parse_disk("@disk\n" + json.dumps(report) + "\n@now\n1800000000\n", AT)
+        self.assertEqual(row["tmp_test_residue"], {"entries": 47000, "test_residue": 45000, "idle": 44000})
+        doc = build(disk=disk(mini_a=row, mini_b=disk_row(tmp_test_residue={"entries": 300, "test_residue": 20,
+                                                                            "idle": 3})))
+        [f] = by_id(doc, "disk.tmp_test_residue")
+        self.assertEqual((f["member"], f["severity"]), ("mini-a", "warn"))
+        self.assertIn("44000 test scratch entries", f["summary"])
+        self.assertIn("tmp test scratch 20 (3 idle 12h+)", fs.disk_line(self.member(doc, "mini-b")["disk"], AT))
+        # an older glaeda-disk prints no count: nothing is shown and nothing warns
+        old = build(disk=disk(mini_a=disk_row()))
+        self.assertNotIn("tmp test scratch", fs.disk_line(self.member(old)["disk"], AT))
+        self.assertFalse(by_id(old, "disk.tmp_test_residue"))
+
     def test_disk_output_stays_bounded(self):
         families = [{"family": f"f{i}" + "x" * 500, "bytes": i * GIB, "owner": "o" * 5000, "retired": True}
                     for i in range(5000)]
