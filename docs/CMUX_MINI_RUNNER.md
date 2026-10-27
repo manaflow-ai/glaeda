@@ -569,7 +569,10 @@ freshness slot when `devCompile` is set too, the nightly pool label
 hook `--nightly-runner`. Like the freshness slot it reuses an instance and adds no
 runners, cores or roots; its neighbors keep their labels and hooks. It admits
 only nightly-tier jobs (the hook's `job_tier`: `nightly.yml` on `nightly-next`
-or `main`, and the Release compile that gates nightly-next's promotion). GitHub
+or `main`, main's dispatch of `cmux-next-dev-daily.yml` (the DEV feed's sign,
+verify and tip DMG), and the Release compile that gates nightly-next's promotion).
+The DEV daily's Mac jobs (`verify`, `tip-dmg-build`) are `light` (they work only
+in `$RUNNER_TEMP`) and wait up to `NIGHTLY_CAPACITY_WAIT_S` on main's dispatch. GitHub
 hands a queued job to the next idle runner in arrival order, so a nightly job
 queued on a side label waited behind every PR job queued there first and never
 reached a mini (2026-10-27). No PR job asks for the nightly label, and the slot's

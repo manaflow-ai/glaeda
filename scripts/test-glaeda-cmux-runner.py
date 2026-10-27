@@ -608,8 +608,23 @@ class HookTest(unittest.TestCase):
                    "event": {"ref": "refs/heads/nightly-next", "repository": CMUX},
                    "workflow_ref": "manaflow-ai/cmux/.github/workflows/nightly.yml@refs/heads/nightly-next",
                    "job": "build-nightly-app"}
+        # main's dispatch of the DEV daily publisher is the DEV feed's sign and verify: a nightly job
+        publish = {"event_name": "workflow_dispatch", "ref": "refs/heads/main", "repository": "manaflow-ai/cmux",
+                   "event": {"repository": CMUX, "inputs": {"source_run_id": "1"}},
+                   "workflow_ref": "manaflow-ai/cmux/.github/workflows/cmux-next-dev-daily.yml@refs/heads/main",
+                   "job": "verify"}
+        for job in ("verify", "tip-dmg-build", "sign"):
+            with self.subTest(publish=job):
+                self.assertEqual(hook.job_tier(**{**publish, "job": job}), hook.TIER_NIGHTLY)
+        for overrides in ({"event_name": "push", "event": {"ref": "refs/heads/main", "repository": CMUX}},
+                          {"event_name": "schedule"}, {"event_name": "pull_request"}, {"ref": "refs/pull/1/merge"},
+                          {"ref": "refs/heads/feat-cmux-next"}, {"repository": "other/cmux"},
+                          {"workflow_ref": publish["workflow_ref"].replace("@refs/heads/main", "@refs/heads/other")},
+                          {"job": ""}):
+            with self.subTest(publish=overrides):
+                self.assertEqual(hook.job_tier(**{**publish, **overrides}), "")
         for key in hook.UNTRUSTED_PAYLOAD_KEYS:  # a payload that carries a pull request is never a feed's
-            for args in (dev, {**dev, "job": "release-compile"}, nightly):
+            for args in (dev, {**dev, "job": "release-compile"}, nightly, publish):
                 with self.subTest(key=key, job=args["job"]):
                     self.assertEqual(hook.job_tier(**{**args, "event": {**args["event"], key: {"number": 1}}}), "")
 
@@ -1777,6 +1792,82 @@ class HookTest(unittest.TestCase):
         finally:
             marker.unlink(missing_ok=True)
             self.finish("n0")
+
+    def dev_daily_job(self, runner: str, job: str = "verify", *extra: str) -> subprocess.CompletedProcess:
+        ref = "refs/heads/main"
+        dispatch = event(self.dir, f"dev-daily-{runner}", {"repository": CMUX, "inputs": {"source_run_id": "1"}})
+        return self.run_hook(
+            "job-started", "workflow_dispatch", dispatch, "--allowed-repo", "manaflow-ai/cmux", "--no-disk",
+            "--state-dir", os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()),
+            "--capacity-units", "14", "--capacity-dir", os.fspath(self.dir / "capacity"), "--instance", "2",
+            *extra, repo="manaflow-ai/cmux",
+            env={"GITHUB_JOB": job, "RUNNER_NAME": runner, "GITHUB_REF": ref,
+                 "GITHUB_WORKFLOW_REF": f"manaflow-ai/cmux/.github/workflows/cmux-next-dev-daily.yml@{ref}"})
+
+    def test_the_dev_daily_publish_is_admitted_on_a_capacity_short_mini(self) -> None:
+        """cmux runs 40566433783 and 40566469307 (2026-10-27): the DEV daily publisher's verify, an unknown job and so
+        a compile, was refused in runner setup with "3 of 14 units free, verify (compile) needs 5" after 60 s, behind
+        idle reserves. It is a light nightly job now: on the same mini it is admitted at once, ahead of a PR job that
+        has waited past FEED_JUMP_S, with the idle DEV slot's and gui runner's reserves kept for nobody."""
+        self.fleet()
+        self.take_units(11)
+        for token in (hook.FRESH_RESERVE_TOKEN, "gui"):  # the live mini: an idle DEV slot and an idle gui runner
+            self.addCleanup(os.close, self.hold_gui_reserve(token))
+        marker = self.dir / "capacity" / f"{hook.ADMIT_WANT}{os.getppid()}"
+        marker.write_text(json.dumps({"since": time.time() - hook.FEED_JUMP_S - 60, "wants": ["units"],
+                                      "who": "s9 fast-tier (run 1)"}) + "\n")
+        try:
+            for job, runner in (("verify", "v0"), ("tip-dmg-build", "t0")):
+                with self.subTest(job=job):
+                    admitted = self.dev_daily_job(runner, job, "--gui-wait", "0")
+                    self.assertEqual(admitted.returncode, 0, admitted.stdout + admitted.stderr)
+                    self.assertIn("a nightly job: it goes ahead of every other job waiting here", admitted.stdout)
+                    self.assertIn(f"holding 2/14 units for {job} (light", admitted.stdout)
+                    self.finish(runner)
+        finally:
+            marker.unlink(missing_ok=True)
+            for runner in ("v0", "t0"):
+                self.finish(runner)
+
+    def test_the_dev_daily_publish_waits_on_a_full_mini_instead_of_failing(self) -> None:
+        """With no unit free it waits in setup (its own bound, not the old 60 s) and is admitted when units free up."""
+        self.fleet()
+        capacity = self.dir / "capacity"
+        self.take_units(12)
+        last = [hook.lock_file(capacity / f"unit-{slot}", fcntl.LOCK_EX) for slot in (12, 13)]
+        self.assertNotIn(None, last)
+        ref = "refs/heads/main"
+        dispatch = event(self.dir, "dev-daily-w0", {"repository": CMUX, "inputs": {"source_run_id": "1"}})
+        environ = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0",
+                   "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"),
+                   "GLAEDA_RUNNER_SHIM_PYTHON": "python3",
+                   "GLAEDA_RUNNER_XCRUN": os.fspath(self.dir / "jobpath" / "xcrun"),
+                   "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_EVENT_PATH": os.fspath(dispatch),
+                   "GITHUB_REF": ref, "GITHUB_REPOSITORY": "manaflow-ai/cmux", "GITHUB_JOB": "verify",
+                   "RUNNER_NAME": "w0",
+                   "GITHUB_WORKFLOW_REF": f"manaflow-ai/cmux/.github/workflows/cmux-next-dev-daily.yml@{ref}"}
+        waiter = subprocess.Popen([sys.executable, os.fspath(HOOK), "job-started", "--allowed-repo",
+                                   "manaflow-ai/cmux", "--no-disk", "--state-dir", os.fspath(self.dir / "state"),
+                                   "--watch-pid", str(os.getpid()), "--capacity-units", "14", "--capacity-dir",
+                                   os.fspath(capacity), "--instance", "2"], env=environ,
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        try:
+            marker = capacity / f"{hook.ADMIT_WANT}{waiter.pid}"
+            self.assertTrue(wait_for_path(marker), "the publish job waits for units")
+            time.sleep(hook.ADMIT_POLL_S * 2)
+            self.assertIsNone(waiter.poll(), "still waiting, not refused")
+            while last:  # a running job ends and frees two units
+                os.close(last.pop())
+            out, _ = waiter.communicate(timeout=30)
+            self.assertEqual(waiter.returncode, 0, out)
+            self.assertIn("holding 2/14 units for verify (light", out)
+        finally:
+            for fd in last:
+                os.close(fd)
+            if waiter.poll() is None:
+                waiter.kill()
+                waiter.communicate()
+            self.finish("w0")
 
     def test_no_other_job_starts_while_a_nightly_job_waits(self) -> None:
         """A PR job that arrives while a nightly job waits here does not start, though its units are free, and the
@@ -6216,13 +6307,18 @@ class GateTest(unittest.TestCase):
 
     def test_dev_daily_publisher_jobs_wait_a_bounded_time(self) -> None:
         """cmux-next-dev-daily.yml's Mac jobs have 15 and 20 minute timeouts that count the wait in runner setup
-        (run 40466210697 timed out after 19 min there), so each is refused after the bound, whatever its event."""
+        (run 40466210697 timed out after 19 min there), so each is refused after a bound, whatever its event. Main's
+        dispatch, the feed's publish and a nightly job, waits the nightly bound (DEV_DAILY_FEED): 60 s refused
+        nearly every attempt 1 (runs 40566433783, 40566469307); anything else keeps 60 s."""
         for job in ("verify", "tip-dmg-build", "anything-new"):
-            for event_name in ("workflow_dispatch", "push"):
-                with self.subTest(job=job, event=event_name):
+            for event_name, ref, bound in (("workflow_dispatch", "refs/heads/main", hook.NIGHTLY_CAPACITY_WAIT_S),
+                                           ("push", "refs/heads/main", hook.DEV_COMPILE_CAPACITY_WAIT_S),
+                                           ("workflow_dispatch", "refs/heads/other", hook.DEV_COMPILE_CAPACITY_WAIT_S)):
+                with self.subTest(job=job, event=event_name, ref=ref):
                     self.assertEqual(hook.dev_compile_capacity_wait(
-                        "manaflow-ai/cmux", hook.DEFAULT_HOME_REPO, event_name, "refs/heads/main",
-                        {"repository": CMUX}, job, "cmux-next-dev-daily.yml"), hook.DEV_COMPILE_CAPACITY_WAIT_S)
+                        "manaflow-ai/cmux", hook.DEFAULT_HOME_REPO, event_name, ref,
+                        {"repository": CMUX}, job, "cmux-next-dev-daily.yml"), bound)
+        self.assertLess(hook.NIGHTLY_BOUND_WORST_S, 15 * 60, "inside verify's 15-minute timeout")
         self.assertIsNone(hook.dev_compile_capacity_wait(
             "someone/else", hook.DEFAULT_HOME_REPO, "workflow_dispatch", "refs/heads/main", {}, "verify",
             "cmux-next-dev-daily.yml"))

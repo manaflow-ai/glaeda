@@ -370,7 +370,14 @@ WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "
                         ("cmux-next.yml", "daemon-test"): "isolated", ("cmux-next.yml", "generated-files"): "isolated",
                         ("cmux-next-pr-autofix.yml", "action-exports"): "isolated",
                         ("cmux-next-base-autofix.yml", "action-exports"): "isolated",
-                        ("cmux-next-media.yml", "tour"): "isolated"}
+                        ("cmux-next-media.yml", "tour"): "isolated",
+                        # DEV_DAILY_WORKFLOW's Mac jobs work only in $RUNNER_TEMP: verify unpacks the signed app
+                        # with ditto and runs codesign --verify and a Python check; tip-dmg-build runs ditto and
+                        # hdiutil. No compile, canonical root, kept DerivedData or console session. As unknown jobs
+                        # they were compiles (5 units, persistent-dd and a root): cmux run 40566469307's verify
+                        # was refused with "3 of 14 units free, verify (compile) needs 5".
+                        ("cmux-next-dev-daily.yml", "verify"): "light",
+                        ("cmux-next-dev-daily.yml", "tip-dmg-build"): "light"}
 # root: the canonical root (/private/tmp/cmux-ci) that compiles build in and that app-host test consumers
 # restore a product into with rm -rf of its src, so one root job per root per mini (cmux#14338 adds a second).
 # product (cli-product-tests) runs its XCTest bundle through the same user testmanagerd as the gui jobs, so it
@@ -469,6 +476,12 @@ DEV_COMPILE_CAPACITY_WAIT_S = 60.0
 # wait ADMISSION_WAIT_S more for admission.lock, so the refusal comes within DEV_BOUND_WORST_S, far inside the 15
 # and 20 minute timeouts it protects.
 DEV_DAILY_WORKFLOW = "cmux-next-dev-daily.yml"
+# DEV_DAILY_FEED: main's dispatch of that workflow is the DEV feed's sign, verify and publish, a nightly job
+# (job_tier), so it waits as long as the nightly-next app build does (NIGHTLY_CAPACITY_WAIT_S, below) instead of
+# DEV_COMPILE_CAPACITY_WAIT_S: first in line, it takes the next units that free up. 60 s refused nearly every
+# attempt 1 (2026-10-27: every DEV daily publish that day needed the rescue's attempt 2). The 300 s bound still
+# ends far inside the 15 and 20 minute timeouts and within the rescue's REFUSAL_SECONDS (NIGHTLY_BOUND_WORST_S).
+DEV_DAILY_REF = "refs/heads/main"
 # NEXT's nightly app build (nightly.yml build-nightly-app on a nightly-next push, attempt 1) is placed on an owned
 # label only while one of its runners is idle (cmux scripts/ci/nightly_build_runner.py), but an idle listener does
 # not mean free units. FEED_FIRST puts a nightly job first in line and preempts nothing, so it waits for running PR
@@ -619,7 +632,7 @@ def dev_compile_capacity_wait(repo: str | None, home_repo: str, event_name: str 
     if repo is None or repo.lower() != home_repo.lower():
         return None
     if workflow == DEV_DAILY_WORKFLOW:
-        return DEV_COMPILE_CAPACITY_WAIT_S
+        return NIGHTLY_CAPACITY_WAIT_S if dev_daily_feed(event_name, ref) else DEV_COMPILE_CAPACITY_WAIT_S
     if workflow != "cmux-next.yml" or job != "cmux-scheme-compile":
         return None
     if event_name == "push" and ref == "refs/heads/feat-cmux-next":
@@ -629,6 +642,12 @@ def dev_compile_capacity_wait(repo: str | None, home_repo: str, event_name: str 
         if isinstance(inputs, dict) and str(inputs.get("dev_daily", "")).lower() == "true":
             return DEV_COMPILE_CAPACITY_WAIT_S
     return None
+
+
+def dev_daily_feed(event_name: str | None, ref: str | None) -> bool:
+    """Whether a DEV_DAILY_WORKFLOW job is main's dispatch, the only one that signs and publishes (DEV_DAILY_FEED).
+    job_tier() checks the rest (workflow ref, repository, payload) before such a job ranks as nightly."""
+    return event_name == "workflow_dispatch" and ref == DEV_DAILY_REF
 
 
 def nightly_capacity_wait(tier: str, event_name: str | None, ref: str | None, job: str | None, workflow: str,
@@ -1318,8 +1337,9 @@ def dev_compile_refusal(event_name: str | None, ref: str | None, repository: str
 # FEED_FIRST: a mini's admission queue (fair_turn) ranks waiters by tier, not only by arrival. Leo, 2026-10-27, on a
 # nightly app build queued behind PR jobs: "BUT WTF COULD POSSIBLY BE MORE IMPORTANT ON OUR FUCKING MINIS".
 #   - NIGHTLY: every nightly.yml job of manaflow-ai/cmux on a nightly-next or main push, schedule or dispatch (NEXT and
-#     classic nightly: build-nightly-app, promote, the sign, notarize and verify jobs), and the Release compile on a
-#     feat-cmux-next push that gates nightly-next's promotion. A waiting nightly job is admitted next, ahead of every
+#     classic nightly: build-nightly-app, promote, the sign, notarize and verify jobs), every job of main's dispatch
+#     of cmux-next-dev-daily.yml (the DEV feed's sign, verify and tip DMG: DEV_DAILY_FEED), and the Release compile
+#     on a feat-cmux-next push that gates nightly-next's promotion. A waiting nightly job is admitted next, ahead of every
 #     other waiter however long it has waited; no admission of any other tier takes a unit while one waits here; and
 #     it keeps no idle runner's reserve (GUI_RESERVE, FRESH_RESERVE_TOKEN).
 #   - DEV: the other feed compiles the freshness slot admits (dev_compile_refusal: a feat-cmux-next push's DEV
@@ -1347,6 +1367,7 @@ def dev_compile_refusal(event_name: str | None, ref: str | None, repository: str
 NIGHTLY_REFS = ("refs/heads/nightly-next", "refs/heads/main")
 NIGHTLY_EVENTS = ("push", "schedule", "workflow_dispatch")
 NIGHTLY_WORKFLOW = "manaflow-ai/cmux/.github/workflows/nightly.yml"
+DEV_DAILY_WORKFLOW_PATH = f"manaflow-ai/cmux/.github/workflows/{DEV_DAILY_WORKFLOW}"
 PROMOTE_COMPILE = "release-compile"  # cmux-next.yml's, on a feat-cmux-next push: nightly-next's promote gate
 TIER_NIGHTLY, TIER_DEV = "nightly", "dev"
 FEED_JUMP_S = 20 * 60.0
@@ -1356,8 +1377,8 @@ def nightly_slot_refusal(tier: str) -> str | None:
     """Why the nightly slot refuses a job of this job_tier(), or None: it takes only nightly jobs (NIGHTLY_SLOT)."""
     if tier == TIER_NIGHTLY:
         return None
-    return ("the nightly slot admits only nightly jobs (nightly.yml on nightly-next or main, and the Release compile "
-            "that gates nightly-next's promotion)")
+    return ("the nightly slot admits only nightly jobs (nightly.yml on nightly-next or main, main's DEV daily publish, "
+            "and the Release compile that gates nightly-next's promotion)")
 
 
 def job_tier(event_name: str | None, ref: str | None, repository: str | None, event: Any,
@@ -1372,6 +1393,8 @@ def job_tier(event_name: str | None, ref: str | None, repository: str | None, ev
     repos = {(repository or "").lower(), (_repo_name(event.get("repository")) or "").lower()}
     if repos != {"manaflow-ai/cmux"} or not job or event_name not in NIGHTLY_EVENTS:
         return ""
+    if workflow_ref == f"{DEV_DAILY_WORKFLOW_PATH}@{DEV_DAILY_REF}":
+        return TIER_NIGHTLY if dev_daily_feed(event_name, ref) else ""
     if ref not in NIGHTLY_REFS or workflow_ref != f"{NIGHTLY_WORKFLOW}@{ref}":
         return ""
     if event_name == "push" and event.get("ref") != ref:
