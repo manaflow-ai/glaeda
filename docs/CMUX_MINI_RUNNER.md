@@ -831,6 +831,11 @@ LaunchAgent `com.teamleaderleo.glaeda.cmux-runner.dedicated.nightly-next`, recei
   refuses the job. It takes no host lock, capacity unit, root or gui token, and the mini's reservation never refuses it.
 - **The gate holds it only for what would fail its job here**: the disk floor and a missing Rust toolchain. Fleet
   builds, reservations, CPU load and heat never hold a dedicated runner off.
+- **Warm state kept by role** (optional `keep`: paths under `~/` or `{runnerDir}/`). The installer writes them to
+  `<runner>/.glaeda-keep.json`, and glaeda-disk never takes them or anything inside them (`role_keep`), however old:
+  for the nightly builder, its `_work/cmux/cmux` checkout and its `~/Library/Caches/cmux-nightly-next/<runner>`
+  DerivedData. Everything else of that runner still goes by age: its `_work/_temp` leftovers after 12 h,
+  other checkouts, test TMPDIRs and other DerivedData.
 - **The watch loop** (optional) is the builder's own, run as `<agent label>.watch` beside the runner, with the
   entry's `env` and the workload PATH. `env` also goes into the runner's `.env`; a declared `PATH` is merged into
   `.path` instead (`runner_path`). `~/` and `{runnerDir}` are expanded on the mini.

@@ -200,6 +200,24 @@ KILL_SWITCH = HOME / ".config/glaeda/mini-health.disabled"
 AGENTS = HOME / "Library/LaunchAgents"
 HELD = HOME / ".local/state/glaeda/mini-fleet/runner-held"  # cmux_mini_fix.sh runner_hold's marks
 # an instance (.K) or a dedicated runner (.dedicated.NAME, glaeda-cmux-runner --dedicated; never its .watch agent)
+GLAEDA_LABEL_PREFIX = "com.teamleaderleo.glaeda."  # every agent glaeda installs (watch loops included)
+LISTENER_RE = re.compile(r"(/\S+?)/bin(?:\.[0-9.]+)?/Runner\.Listener(?:\s|$)")
+
+
+def starts_runner(word: str, cwd: str = "") -> bool:
+    """A plist program word that starts a GitHub runner: a Runner.Listener, or a run.sh, runsvc.sh or run-helper.sh
+    that sits in a directory holding a runner registration (.runner). A bare "run.sh" is found through the plist's
+    WorkingDirectory, which the caller passes as `cwd`; a working directory or an argument naming a runner
+    directory is not a runner by itself (a cleaner or a tool may run there)."""
+    if re.search(r"/Runner\.Listener$", word):
+        return True
+    with contextlib.suppress(OSError):
+        if re.search(r"(?:^|/)(?:run|runsvc|run-helper)\.sh$", word):
+            script = Path(word) if os.path.isabs(word) else (Path(cwd) / word if cwd else None)
+            return script is not None and (script.parent / ".runner").is_file()
+    return False
+
+
 RUNNER_AGENT = re.compile(r"com\.teamleaderleo\.glaeda\.cmux-runner(?:\.\d+|\.dedicated\.[a-z][a-z0-9-]*)?")
 RUNNER_DIR = re.compile(r"actions-runner-glaeda(?:-(\d+|[a-z][a-z0-9-]*))?")
 RUNNER_PIN = "2.338.0"  # glaeda-cmux-runner's PINNED_RUNNER_VERSION; a test keeps the two equal
@@ -363,6 +381,8 @@ class Mini:
 
     def __init__(self, home: Path = HOME) -> None:
         self.home = home
+        self.daemons_dir = Path("/Library/LaunchDaemons")
+        self.global_agents_dir = Path("/Library/LaunchAgents")
         self.uid = os.getuid()
         self._hook: Any = None
         self.tailnet_route_ok = False  # check_tailscale saw the tailnet route on the tunnel this run
@@ -620,6 +640,37 @@ class Mini:
             if doc.get("cause") == "registration_deleted" and name in dirs and (dirs[name] / ".runner").is_file():
                 out.append({**doc, "dir": name})
         return out
+
+    def foreign_runners(self) -> list[tuple[str, str]]:
+        """(where, what) for each GitHub runner glaeda does not own: a LaunchAgent (the user's or /Library's) or
+        LaunchDaemon plist that is not
+        glaeda's (its Label, RUNNER_AGENT) and starts a runner (the run.sh or runsvc.sh of a directory with a .runner,
+        or a Runner.Listener), and a running Runner.Listener whose runner directory is not ~/actions-runner-glaeda*."""
+        out = []
+        for folder in (self.home / "Library/LaunchAgents", self.global_agents_dir, self.daemons_dir):
+            for plist in sorted(folder.glob("*.plist")) if folder.is_dir() else []:
+                try:
+                    doc = plistlib.loads(plist.read_bytes())
+                except Exception:  # unreadable or not a plist: nothing to say about it
+                    continue
+                if not isinstance(doc, dict):
+                    continue
+                # launchd's own name for the job (its Label), not the file's: a renamed file changes neither way
+                label = str(doc.get("Label") or plist.name[:-len(".plist")])
+                if RUNNER_AGENT.fullmatch(label) or label.startswith(GLAEDA_LABEL_PREFIX):
+                    continue
+                args = doc.get("ProgramArguments")
+                words = [str(w) for w in (args if isinstance(args, list) else [])] + [str(doc.get("Program") or "")]
+                cwd = str(doc.get("WorkingDirectory") or "")  # only to find a bare run.sh, never a runner itself
+                if any(starts_runner(w, cwd) for w in words if w):
+                    out.append((os.fspath(plist), f"{label} starts a GitHub runner glaeda does not manage"))
+        own = os.path.realpath(self.home) + "/actions-runner-glaeda"
+        for _pid, _uid, _stat, command in self.processes():
+            m = LISTENER_RE.search(command)
+            if m and not (os.path.realpath(m.group(1)) + "-").startswith(own + "-") \
+                    and os.path.realpath(m.group(1)) != own:
+                out.append((m.group(1), f"Runner.Listener runs from {m.group(1)}, not a glaeda runner directory"))
+        return sorted(set(out))
 
     def runner_agents(self) -> list[tuple[str, bool, bool, str]]:
         """(label, loaded, running, last exit) for each runner LaunchAgent plist."""
@@ -1523,6 +1574,15 @@ def check_runners(mini: Mini) -> list[dict[str, Any]]:
             out.append(finding(f"runner_stopped:{agent}", "error", f"{label} is loaded but not running "
                                f"(last exit code {last})", "pending", "launchctl kickstart"))
     return out
+
+
+def check_foreign_runners(mini: Mini) -> list[dict[str, Any]]:
+    """Leo, 2026-10-27: "why the fuck not manage it with glaeda????????" A runner glaeda does not install gets none of
+    its reconcilers (.path repair, toolchain hold, hook refresh, disk eviction, this heal)."""
+    return [finding(f"runner_unmanaged:{Path(where).name}", "error", f"{what} ({where})", "impossible",
+                    "declare it as runner.dedicated in mini-fleet.json, apply it with glaeda-cmux-runner-fleet --apply "
+                    "--hosts <this mini>, then remove the hand-made one between jobs (docs/CMUX_MINI_RUNNER.md 2e1)")
+            for where, what in mini.foreign_runners()]
 
 
 def version_key(version: str) -> tuple[int, ...]:
@@ -2429,7 +2489,8 @@ def iso(t: float) -> str:
 
 def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = STATE,
         report_path: Path = REPORT, heal_ok: bool = True, runner: bool = True) -> dict[str, Any]:
-    """One pass. runner=False is a host with no glaeda runner (a capture-only mini): only its Claude route."""
+    """One pass. runner=False is a host with no glaeda runner (a capture-only mini): only its Claude route and
+    runner_unmanaged."""
     now = time.time() if now is None else now
     state = load_json(state_path) if apply else {}
     seen: dict[str, Any] = state.get("seen") or {}
@@ -2444,6 +2505,7 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
         # keeps that probe nor reroutes on it until the tunnel is back (tailscale_no_route's restart may fix it)
         tunnel_down = any(f["code"] in TUNNEL_DOWN for f in tailnet)
         found = (check_console(mini) + check_power(mini) + tailnet + check_runners(mini) + check_runner_versions(mini)
+                 + check_foreign_runners(mini)
                  + check_node_eligibility(mini) + check_toolchain_missing(mini) + check_toolchain(mini)
                  + check_leaked_test_apps(mini)
                  + check_checkout_steps(mini, now, state_path.parent / CHECKOUT_CACHE, apply)
@@ -2455,8 +2517,8 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
         tm = check_testmanagerd(mini, now)
         carried = tm is None and "testmanagerd_wedged" in previous  # a test runs, or the log was unreadable: no heal
         found += [previous["testmanagerd_wedged"]] if carried else tm or []
-    else:
-        found = check_claude_route(mini, now, apply)
+    else:  # no glaeda runner here, yet a hand-made one is still a fault (it may be the only runner on the host)
+        found = check_claude_route(mini, now, apply) + check_foreign_runners(mini)
 
     findings, heals = [], []
     route_healed = False  # heal_tailscale_route ran this pass (it looks after the drain itself)
@@ -2556,11 +2618,17 @@ def main(argv: list[str] | None = None) -> int:
         # report is written where capture-host reads it.
         claude = (run(mini, args.apply, state_path=STATE, report_path=REPORT, heal_ok=not KILL_SWITCH.exists(),
                       runner=False) if mini.claude_bin() else None)
+        # without Claude there is no report to write, but a hand-made runner is still said
+        foreign = check_foreign_runners(mini) if claude is None else []
+        if foreign and args.apply:
+            for f in foreign:
+                print(json.dumps({"finding": f["id"], "evidence": f["evidence"]}, separators=(",", ":")), flush=True)
         heals = ([{"id": "daemon_heal_stale", "ok": healed[0], "action": healed[1]}] if healed else []) \
             + (claude["heals"] if claude else [])
         if not args.apply:
             print(json.dumps({"schema": SCHEMA, "skipped": "no glaeda runner on this host",
-                              "findings": [f["id"] for f in stale] + [f["id"] for f in (claude or {}).get("findings", [])]}))
+                              "findings": [f["id"] for f in stale + foreign]
+                              + [f["id"] for f in (claude or {}).get("findings", [])]}))
         elif heals or (claude and claude["changed"]):
             print(json.dumps({"findings": [f["id"] for f in (claude or {}).get("findings", [])], "heals": heals},
                              separators=(",", ":")), flush=True)

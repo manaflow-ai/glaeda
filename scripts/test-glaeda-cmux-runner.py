@@ -9975,6 +9975,7 @@ class DedicatedRunnerTest(unittest.TestCase):
         for change, needle in (({"labels": ["self-hosted", "x"]}, "leave out"), ({"labels": []}, "non-empty"),
                                ({"org": "manaflow-ai"}, "exactly one of repo"), ({"admit": ["relative.py"]}, "admit"),
                                ({"name": "Bad Name"}, "name"), ({"name": "123"}, "name"),
+                               ({"name": "x-glaeda"}, "pool instance"), ({"name": "x-glaeda-2"}, "pool instance"),
                                ({"env": {"lower": "x"}}, "env"),
                                ({"surprise": 1}, "unknown keys"), ({"group": "g"}, "group goes with org"),
                                ({"labels": ["x", "glaeda-std-xcode-26.6".upper()]}, "pool labels"),
@@ -10154,6 +10155,22 @@ class DedicatedRunnerTest(unittest.TestCase):
                         "--dedicated", "nightly-next")
         self.assertFalse((self.home / "Library/LaunchAgents" / f"{label}.watch.plist").exists())
         self.assertEqual(json.loads((self.state / "runners.json").read_text())["runners"], [])
+
+    def test_keep_paths_are_written_for_glaeda_disk_and_validated(self) -> None:
+        fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
+        runner = self.home / "actions-runner-glaeda-nightly-next"
+        kept = {**NIGHTLY, "keep": ["{runnerDir}/_work/cmux/cmux", "~/Library/Caches/cmux-nightly-next/x"]}
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            self.invoke("--apply", "--manifest", self.manifest(kept), "--member", "mini-std", "--dedicated", "nightly-next")
+        self.assertEqual(json.loads((runner / cr.ROLE_KEEP_MARKER).read_text()),
+                         [f"{runner}/_work/cmux/cmux", f"{self.home}/Library/Caches/cmux-nightly-next/x"])
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std", "--dedicated", "nightly-next")
+        self.assertFalse((runner / cr.ROLE_KEEP_MARKER).exists(), "dropped from the manifest: kept no longer")
+        for bad in (["/abs"], ["~/../x"], ["relative"], "~/x", [""]):
+            with self.subTest(bad=bad):
+                _, why = fleet_labels.dedicated_runners(dedicated_manifest({**NIGHTLY, "keep": bad}), "mini-std")
+                self.assertIn("keep", why or "")
 
     def test_a_relabel_starts_the_runner_only_under_its_new_admission(self) -> None:
         fake_pw = mock.Mock(pw_dir=os.fspath(self.home))

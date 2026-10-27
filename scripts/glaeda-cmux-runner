@@ -2655,6 +2655,24 @@ def restart_watch(ctx: Context, act: dict[str, Any]) -> None:
         act["state"], act["note"] = "failed", ("launchctl bootstrap failed: " + out)[:400]
 
 
+ROLE_KEEP_MARKER = ".glaeda-keep.json"  # glaeda-disk ROLE_KEEP_MARKER: the warm state it keeps by role
+
+
+def keep_role_paths(ctx: Context) -> None:
+    """Write the dedicated entry's keep paths, expanded, to <runner>/ROLE_KEEP_MARKER (glaeda-disk role_keep reads
+    it); an entry with none removes the marker."""
+    marker = ctx.runner_dir / ROLE_KEEP_MARKER
+    keep = [dedicated_word(ctx, k) for k in (dedicated_of(ctx) or {}).get("keep") or []]
+    if not keep:
+        marker.unlink(missing_ok=True)
+        return
+    data = (json.dumps(keep, indent=1) + "\n").encode()
+    with contextlib.suppress(OSError):
+        if marker.read_bytes() == data:
+            return
+    write_atomic(marker, data, 0o644, make_parent=False)
+
+
 def keep_runner_env(ctx: Context, write: bool = True) -> bool:
     """Set the dedicated runner's declared env in its .env (config.sh writes the file; the runner reads it at start),
     keeping every other line. A declared PATH goes to .path instead (the jobs' PATH), merged as runner_path does.
@@ -2698,6 +2716,7 @@ def keep_runner_env(ctx: Context, write: bool = True) -> bool:
             write_atomic(path, want.encode(), 0o644, make_parent=False)
     if write:
         write_atomic(marker, json.dumps({"keys": sorted(env), "path": owned_path}).encode(), 0o644, make_parent=False)
+        keep_role_paths(ctx)
     return changed
 
 
