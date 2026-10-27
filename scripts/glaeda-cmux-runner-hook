@@ -477,7 +477,13 @@ DEV_DAILY_WORKFLOW = "cmux-next-dev-daily.yml"
 # reservation falls back within minutes. So that job waits NIGHTLY_CAPACITY_WAIT_S at most and is then refused:
 # cmux's owned-pool rescue re-runs a refused nightly-next build, and attempt 2 takes the picker's moving Blacksmith
 # label. Like the DEV bound, it limits when the last try starts (NIGHTLY_BOUND_WORST_S).
-NIGHTLY_CAPACITY_WAIT_S = 90.0
+# Sized from the waits FEED_FIRST gives that job, not from Blacksmith at its best: the refusal's re-run waited about
+# 40 minutes when Blacksmith's macOS labels stalled (2026-10-27), and this hook cannot see the picker's stall verdict.
+# A 90 s bound refused builds that would have started a few minutes later: of 11 owned nightly-next builds
+# (2026-10-27 06:35-08:43Z) 10 were admitted within 5 minutes (p50 0.1, max 9.4 min). 5 minutes is also the most
+# that fits cmux's owned-pool rescue: it counts a setup failure as a refusal (and re-runs it off the fleet) only
+# within REFUSAL_SECONDS (360 s) of the job's start, and NIGHTLY_BOUND_WORST_S stays under that.
+NIGHTLY_CAPACITY_WAIT_S = 300.0
 NIGHTLY_APP_JOB = "build-nightly-app"
 NIGHTLY_NEXT_REF = "refs/heads/nightly-next"
 # CAPACITY_WAIT: an ordinary cmux job that finds its units or tokens taken waits for them, with no time limit,

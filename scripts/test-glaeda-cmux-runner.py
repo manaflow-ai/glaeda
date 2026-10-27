@@ -6043,8 +6043,10 @@ class GateTest(unittest.TestCase):
         re-run (attempt 2, the picker's Blacksmith label) builds it within minutes. Main's nightly, other nightly
         jobs, later attempts and non-nightly tiers keep their waits."""
         bound = hook.NIGHTLY_CAPACITY_WAIT_S
-        self.assertEqual(bound, 90.0)
-        self.assertLessEqual(hook.NIGHTLY_BOUND_WORST_S, 2.5 * 60)
+        self.assertEqual(bound, 300.0)
+        # the refusal must come within cmux owned_pool_rescue.py REFUSAL_SECONDS (360 s), or the rescue reads it as an
+        # ordinary failure and never re-runs it off the fleet
+        self.assertLess(hook.NIGHTLY_BOUND_WORST_S, 360)
         args = (hook.TIER_NIGHTLY, "push", "refs/heads/nightly-next", "build-nightly-app", "nightly.yml")
         self.assertEqual(hook.nightly_capacity_wait(*args, "1"), bound)
         for attempt in ("2", "", None, " 1", "01"):  # only an exact attempt 1; anything else keeps its wait
