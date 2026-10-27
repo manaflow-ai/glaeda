@@ -70,6 +70,10 @@ What `--apply` does:
    state). The token is read from gh's stdout into memory and passed to `config.sh`
    only as `ACTIONS_RUNNER_INPUT_TOKEN` in that child's environment, which the runner
    reads and clears. It is never in an argv, a file, a log, or the output.
+   `config.sh` overwrites `.path` with the PATH it ran under (a bare one over ssh), so
+   afterwards the entries of the old and new `.path` are merged and `/opt/homebrew/bin`,
+   `/usr/local/bin` and the user's `~/.cargo/bin` are made sure of (`keep_runner_path`).
+   The LaunchAgent sets its own PATH; `.path` is what `bin/runsvc.sh` would run under.
 3. Writes the job hooks into `~/actions-runner-glaeda/glaeda-hooks/`:
    - job-started admits only `push`, `pull_request`, `merge_group`,
      `workflow_dispatch`, `schedule` and `workflow_run` (so `issue_comment`,

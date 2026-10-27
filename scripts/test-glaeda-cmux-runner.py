@@ -178,6 +178,8 @@ if argv[:1] == ["remove"]:
     save({"runners": [r for r in runners()["runners"] if r["name"] != name]})
     os.remove(os.path.join(here, ".runner"))
     sys.exit(0)
+# The real config.sh runs env.sh first, which overwrites .path with the PATH config.sh runs under.
+open(os.path.join(here, ".path"), "w").write(os.environ.get("PATH", "") + "\n")
 if token != os.environ["FAKE_REG_TOKEN"]:
     print("bad token " + str(token)); sys.exit(1)
 name = argv[argv.index("--name") + 1]
@@ -8204,6 +8206,76 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(saved["registration"]["runnerId"], 4243)
         self.assertIn("glaeda-class-std", saved["registration"]["labels"])
         self.assertEqual(self.by_kind(receipt)["verify"]["state"], "ok")
+
+    def test_reregistration_over_bare_ssh_path_keeps_homebrew_and_cargo_on_runner_path(self) -> None:
+        # 2026-10-26: a re-registration over ssh left .path at /usr/bin:/bin:/usr/sbin:/sbin, without Homebrew.
+        bare = "/usr/bin:/bin:/usr/sbin:/sbin"
+        runner = self.home / "actions-runner-glaeda"
+        cargo = os.fspath(self.home / ".cargo/bin")
+        local = os.fspath(self.home / ".local/bin")
+        with mock.patch.dict(os.environ, {"PATH": bare}):
+            self.invoke("--apply", "--labels", "ram48")
+            entries = (runner / ".path").read_text().strip().split(":")
+            self.assertEqual(entries[:2], ["/opt/homebrew/bin", "/usr/local/bin"])
+            self.assertIn(cargo, entries)
+            self.assertTrue(set(bare.split(":")) <= set(entries), entries)
+            self.assertEqual(len(entries), len(set(entries)), entries)
+            # a hand-added entry survives a re-registration (--replace) that runs under the bare PATH again
+            (runner / ".path").write_text(f"{local}:{bare}\n")
+            with mock.patch.object(cr, "xcode_present", return_value=True):
+                receipt = self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std",
+                                      "--name", "mini-test-glaeda")
+        self.assertEqual(self.by_kind(receipt)["register"]["state"], "updated")
+        self.assertIn("--replace", self.config_argvs()[-1])
+        entries = (runner / ".path").read_text().strip().split(":")
+        self.assertEqual(entries[:2], ["/opt/homebrew/bin", "/usr/local/bin"])
+        self.assertIn(local, entries)
+        self.assertIn(cargo, entries)
+        self.assertNotIn("", entries)
+
+    def test_failed_reregistration_still_keeps_homebrew_on_runner_path(self) -> None:
+        # env.sh rewrites .path before config.sh rejects the token: the failed relabel must not leave it bare
+        bare = "/usr/bin:/bin:/usr/sbin:/sbin"
+        runner = self.home / "actions-runner-glaeda"
+        local = os.fspath(self.home / ".local/bin")
+        with mock.patch.dict(os.environ, {"PATH": bare}):
+            self.invoke("--apply", "--labels", "ram48")
+            (runner / ".path").write_text(f"{local}:{bare}\n")
+            with mock.patch.object(cr, "xcode_present", return_value=True), \
+                    mock.patch.object(cr, "read_token", lambda gh, ep: REG_TOKEN + "X"):
+                receipt = self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std",
+                                      "--name", "mini-test-glaeda", expect=1)
+        self.assertEqual(self.by_kind(receipt)["register"]["state"], "failed")
+        self.assertIn("--replace", self.config_argvs()[-1])
+        entries = (runner / ".path").read_text().strip().split(":")
+        self.assertEqual(entries[:2], ["/opt/homebrew/bin", "/usr/local/bin"])
+        self.assertIn(local, entries)
+        self.assertIn(os.fspath(self.home / ".cargo/bin"), entries)
+
+    def test_reregistration_with_a_non_utf8_runner_path_keeps_its_bytes(self) -> None:
+        bare = "/usr/bin:/bin:/usr/sbin:/sbin"
+        runner = self.home / "actions-runner-glaeda"
+        with mock.patch.dict(os.environ, {"PATH": bare}):
+            self.invoke("--apply", "--labels", "ram48")
+            (runner / ".path").write_bytes(b"/opt/odd\xff/bin:/usr/bin\n")
+            with mock.patch.object(cr, "xcode_present", return_value=True):
+                receipt = self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std",
+                                      "--name", "mini-test-glaeda")
+        self.assertEqual(self.by_kind(receipt)["register"]["state"], "updated")
+        entries = (runner / ".path").read_bytes().strip().split(b":")
+        self.assertEqual(entries[:3], [b"/opt/homebrew/bin", b"/usr/local/bin", b"/opt/odd\xff/bin"])
+        self.assertEqual(cr.read_runner_path(self.home / "missing"), "")
+
+    def test_runner_path_merges_in_order_without_duplicates(self) -> None:
+        home = Path("/Users/cmux")
+        self.assertEqual(cr.runner_path(home, "/usr/bin:/bin:/usr/sbin:/sbin"),
+                         "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/cmux/.cargo/bin")
+        self.assertEqual(cr.runner_path(home, "/Users/cmux/.local/bin:/Users/cmux/.cargo/bin:/usr/bin:/bin",
+                                        "/usr/bin:/bin:/usr/sbin:/sbin"),
+                         "/opt/homebrew/bin:/usr/local/bin:/Users/cmux/.local/bin:/Users/cmux/.cargo/bin:"
+                         "/usr/bin:/bin:/usr/sbin:/sbin")
+        self.assertEqual(cr.runner_path(home, ""), "/opt/homebrew/bin:/usr/local/bin:/Users/cmux/.cargo/bin:"
+                                                   "/usr/bin:/bin:/usr/sbin:/sbin")
 
     def human(self, *args: str) -> str:
         out = io.StringIO()

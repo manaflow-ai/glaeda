@@ -1358,11 +1358,43 @@ def download_and_unpack(ctx: Context, act: dict[str, Any], install_id: str) -> N
     act["applied"] = True
 
 
+def runner_path(home: Path, *paths: str) -> str:
+    """The PATH a runner's .path keeps: Homebrew first (the workload PATH's order), every entry the given PATHs
+    already had in their order, then the runner user's ~/.cargo/bin and the system directories, each once."""
+    entries = ["/opt/homebrew/bin", "/usr/local/bin"]
+    for path in paths:
+        entries += path.split(":")
+    entries += [os.fspath(home / ".cargo/bin"), *WORKLOAD_PATH.split(":")]
+    return ":".join(dict.fromkeys(e for e in entries if e))
+
+
+def read_runner_path(runner_dir: Path) -> str:
+    """The runner's .path, "" when it is missing or unreadable. Bytes that are not UTF-8 round-trip unchanged
+    (surrogateescape) instead of raising mid-registration."""
+    try:
+        return (runner_dir / ".path").read_bytes().decode("utf-8", "surrogateescape").strip()
+    except OSError:
+        return ""
+
+
+def keep_runner_path(ctx: Context, before: str) -> None:
+    """config.sh's env.sh overwrites .path with the PATH it ran under, and runsvc.sh runs the runner with it. A
+    registration over ssh runs under a bare /usr/bin:/bin:/usr/sbin:/sbin and so dropped /opt/homebrew/bin
+    (2026-10-26). Merge the .path that was there before with the new one and make sure Homebrew and ~/.cargo/bin
+    are on it."""
+    after = read_runner_path(ctx.runner_dir)
+    merged = runner_path(ctx.home, before, after)
+    if merged != after:
+        write_atomic(ctx.runner_dir / ".path", (merged + "\n").encode("utf-8", "surrogateescape"), 0o644,
+                     make_parent=False)
+
+
 def register(ctx: Context, act: dict[str, Any]) -> None:
     token = ctx.take_token(f"{ctx.scope_api}/actions/runners/registration-token")
     if token is None:
         act["state"], act["note"] = "failed", "could not obtain a registration token (needs repo or org admin)"
         return
+    path_before = read_runner_path(ctx.runner_dir)
     argv = [os.fspath(ctx.runner_dir / "config.sh"), "--unattended", "--url", ctx.scope_url,
             "--name", ctx.name, "--labels", ",".join(l for l in ctx.labels if l not in BASE_LABELS),
             "--work", "_work"]
@@ -1373,6 +1405,11 @@ def register(ctx: Context, act: dict[str, Any]) -> None:
     code, out = run_with_token(argv, token, ctx.runner_dir)
     del token
     act["argv"] = argv
+    # env.sh rewrites .path before config.sh can fail (a bad token, a timeout), so this runs either way
+    try:
+        keep_runner_path(ctx, path_before)
+    except OSError as error:  # the registration's outcome stands; a later --apply or relabel fixes .path
+        act["pathNote"] = f"could not rewrite .path ({type(error).__name__}: {error})"[:300]
     if code != 0 or not (ctx.runner_dir / ".runner").is_file():
         act["state"], act["note"] = "failed", f"config.sh failed: {out[-400:]}"
         return
