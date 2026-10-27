@@ -33,13 +33,14 @@ class PruneTest(unittest.TestCase):
         self.root.mkdir()
         self.lock = Path(self.tmp.name) / "host.lock"
         self.lock.write_text("")
-        self.saved = (fp.ROOT, fp.HOST_LOCK, fp.running_commands, fp.reserved_above_floor)
+        self.saved = (fp.ROOT, fp.HOST_LOCK, fp.running_commands, fp.reserved_above_floor, fp.toolchain_overlap)
         fp.ROOT, fp.HOST_LOCK = self.root, self.lock
         fp.running_commands = lambda: ["/usr/libexec/something", "zsh"]
         fp.reserved_above_floor = lambda: ""
+        fp.toolchain_overlap = lambda paths: ""
 
     def tearDown(self) -> None:
-        fp.ROOT, fp.HOST_LOCK, fp.running_commands, fp.reserved_above_floor = self.saved
+        fp.ROOT, fp.HOST_LOCK, fp.running_commands, fp.reserved_above_floor, fp.toolchain_overlap = self.saved
         self.tmp.cleanup()
 
     def env(self, sign_key: str = "") -> None:
@@ -244,6 +245,28 @@ class PruneTest(unittest.TestCase):
         self.assertTrue(rec["result"].startswith("deferred: reserved for someone"), rec)
         self.assertTrue(all(p.exists() for p in paths))
         self.assertIn("would remove", self.run_main("--node-gib", "0")["node_store"], "a plan still reports")
+
+    def test_a_node_store_aliasing_the_job_toolchain_is_never_pruned(self) -> None:
+        """A node-store/cas that leads into ~/.rustup (a symlink) is the job toolchain: nothing is unlinked, even over
+        the hard cap, and a glaeda-disk that cannot be asked prunes nothing either."""
+        real = self.saved[4]
+        home = Path(self.tmp.name) / "home"
+        toolchain = home / ".rustup/toolchains/1.98.1-aarch64-apple-darwin/bin"
+        toolchain.mkdir(parents=True)
+        (toolchain / "rustc").write_bytes(b"\0" * 4096)
+        (self.root / "node-store").mkdir()
+        (self.root / "node-store/cas").symlink_to(home / ".rustup")
+        self.env()
+        gd = fp.load_glaeda_disk(ROOT / "scripts/glaeda-disk")
+        gd.HOME = home
+        fp.toolchain_overlap = lambda paths: real(paths, gd)
+        rec = self.run_main("--apply", "--node-gib", "0", "--node-only")
+        self.assertIn("overlaps the job toolchain", rec["result"])
+        self.assertTrue((toolchain / "rustc").exists())
+        (self.root / "node-store/cas").unlink()
+        self.assertEqual(real([self.root, self.root / "node-store/cas"], gd), "")
+        with mock.patch.object(fp.importlib.machinery, "SourceFileLoader", side_effect=OSError("gone")):
+            self.assertIn("nothing pruned", real([self.root]))
 
     def test_reserved_above_floor_reads_glaeda_disk_and_fails_closed(self) -> None:
         real = self.saved[3]

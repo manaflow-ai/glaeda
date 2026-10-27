@@ -487,15 +487,101 @@ def referenced_main_checkout(path: Path, *, nested: bool = False) -> str:
     return ""
 
 
-def never_delete(path: Path) -> bool:
+# The toolchain a job runs, never deleted by any family at any pressure: rustup's binary and the cargo/rustc links
+# to it, rustup's home with every installed toolchain, and the tools glaeda-cmux-runner-hook's job-started probes
+# on the job PATH (rustup, rustc, cargo, python3, gh, git, xcodebuild) plus the Xcode apps. All 14 runner minis lost
+# ~/.cargo/bin/rustup on 2026-10-26 (21:26-00:48Z); job-started then refused every job ("cannot name a toolchain
+# for 'rustc 1.98.1'"). Whatever removed it, glaeda-disk must never be able to.
+TOOLCHAIN_HOME_PATHS = (".cargo/bin", ".rustup")  # under HOME; CARGO_HOME/bin and RUSTUP_HOME too
+# Every tool job-started probes (glaeda-cmux-runner-hook TOOLCHAIN_PROBES, toolchain_refusal, xcode_refusal).
+TOOLCHAIN_TOOLS = ("rustup", "rustc", "cargo", "zig", "python3", "gh", "git", "xcodebuild", "xcrun", "swift", "swiftc",
+                   "clang", "make", "ld")
+TOOLCHAIN_ROOTS = ("/Applications",)  # the pool Xcode (--toolchain-xcode) and every other Xcode_*.app
+# Where TOOLCHAIN_TOOLS are looked up: every one of the fleet's fixed tool directories, each match kept (not only the
+# first, so the order a job's PATH puts them in does not matter), never the caller's PATH, which inside a job can
+# name a checkout's own bin directory and would then keep that checkout.
+TOOLCHAIN_BIN_DIRS = (".cargo/bin", ".local/bin")  # under HOME
+TOOLCHAIN_SYSTEM_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin")
+_TOOLCHAIN_KEEP: dict[tuple[str, str, str], tuple[str, ...]] = {}
+
+
+def toolchain_keep(fresh: bool = False) -> tuple[str, ...]:
+    """The job toolchain: TOOLCHAIN_HOME_PATHS, CARGO_HOME/bin, RUSTUP_HOME, TOOLCHAIN_ROOTS, and each TOOLCHAIN_TOOLS
+    binary in any of the fixed tool dirs with that dir. Each both as spelled (absolute, symlinks kept) and resolved,
+    with every symlink on the way, so neither a symlinked ancestor nor the link's target can go. Cached per HOME,
+    CARGO_HOME and RUSTUP_HOME for never_delete, which runs for every directory a discovery walk visits; fresh
+    (remove() and finish_deletion(), just before a delete) looks again, so a tool switched mid-run is kept too."""
+    env = os.environ
+    key = (os.fspath(HOME), env.get("CARGO_HOME", ""), env.get("RUSTUP_HOME", ""))
+    if fresh or key not in _TOOLCHAIN_KEEP:
+        paths = [HOME / rel for rel in TOOLCHAIN_HOME_PATHS] + [Path(r) for r in TOOLCHAIN_ROOTS]
+        if env.get("CARGO_HOME"):
+            paths.append(Path(env["CARGO_HOME"]) / "bin")
+        if env.get("RUSTUP_HOME"):
+            paths.append(Path(env["RUSTUP_HOME"]))
+        for d in [HOME / d for d in TOOLCHAIN_BIN_DIRS] + [Path(d) for d in TOOLCHAIN_SYSTEM_BIN_DIRS]:
+            for tool in TOOLCHAIN_TOOLS:
+                if os.path.lexists(d / tool):
+                    paths += [d, d / tool]
+        out: list[str] = []
+        for path in paths:
+            out += _link_spellings(os.path.abspath(path))
+            out.append(os.path.realpath(path))
+        _TOOLCHAIN_KEEP[key] = tuple(dict.fromkeys(out))
+    return _TOOLCHAIN_KEEP[key]
+
+
+def _link_spellings(path: str, hops: int = 40) -> list[str]:
+    """PATH and every spelling it passes through on the way to its target, resolved one component at a time: a symlink
+    in any component (~/.cargo -> ~/.cache/cargo-switch/current -> /opt/job-cargo) adds each target with the rest of
+    PATH appended (~/.cache/cargo-switch/current/bin, /opt/job-cargo/bin). The link itself is never added as a path of
+    its own: it is above the spelling that runs through it, so it is kept that way, while a system link such as /tmp
+    keeps only what PATH runs through, not everything below it."""
+    out = [path]
+    todo = [path]
+    while todo and hops > 0:
+        cur = todo.pop()
+        parts = cur.split(os.sep)
+        for i in range(2, len(parts) + 1):
+            head = os.sep.join(parts[:i]) or os.sep
+            if os.path.islink(head):
+                hops -= 1
+                try:
+                    target = os.path.normpath(os.path.join(os.path.dirname(head), os.readlink(head)))
+                except OSError:
+                    break
+                nxt = os.path.join(target, *parts[i:]) if parts[i:] else target
+                out.append(nxt)
+                todo.append(nxt)
+                break
+    return out
+
+
+def _at_inside_or_above(path: Path, keep: list[str] | tuple[str, ...]) -> bool:
+    """PATH, as spelled or resolved, is at, inside or above any KEEP path."""
+    return any(p == k or p.startswith(k + "/") or k.startswith(p + "/")
+               for p in {os.path.abspath(path), os.path.realpath(path)} for k in keep)
+
+
+def toolchain_held(path: Path, fresh: bool = False) -> bool:
+    """PATH is at, inside or above a toolchain_keep() path. No family flag lifts it (not allow_stale_protected)."""
+    return _at_inside_or_above(path, toolchain_keep(fresh))
+
+
+def toolchain_within(path: Path) -> bool:
+    """PATH is at or inside a toolchain_keep() path: a discovery walk stops there, but walks on through one only
+    above it (~/.cargo, to reach the registry beside ~/.cargo/bin), which toolchain_held still keeps whole."""
+    return any(p == k or p.startswith(k + "/")
+               for p in {os.path.abspath(path), os.path.realpath(path)} for k in toolchain_keep())
+
+
+def never_delete(path: Path, walk: bool = False) -> bool:
+    """With walk (a discovery walk asking whether to descend), a directory only above the job toolchain is not
+    kept from the walk, only from being taken itself."""
     if NEVER_DELETE_NAMES.search(path.name):
         return True
-    p = os.path.realpath(path)
-    for keep in NEVER_DELETE:
-        k = os.path.realpath(HOME / keep)
-        if p == k or p.startswith(k + "/") or k.startswith(p + "/"):
-            return True
-    return False
+    return (_at_inside_or_above(path, [os.path.realpath(HOME / keep) for keep in NEVER_DELETE])
+            or (toolchain_within(path) if walk else toolchain_held(path)))
 
 
 _LIVE_REFERENCES: dict[str, frozenset[str]] = {}
@@ -854,6 +940,8 @@ def remove_spm_scratch(path: Path) -> bool:
     """owned_spm_scratch.drop(): under an exclusive lock on <fingerprint>.lock, rename the directory aside to
     .trash-<name>-<pid> (which owned_spm_scratch also sweeps, should this delete be killed) and drop its .size, then
     delete it outside the lock. False, touching nothing, while a job holds it."""
+    if toolchain_held(path, fresh=True):
+        raise OSError("refusing the job toolchain (toolchain_keep)")
     if path.is_symlink():
         raise OSError("refusing symlink")
     if os.path.ismount(path) or path.lstat().st_dev != path.parent.stat().st_dev:
@@ -3610,6 +3698,8 @@ def interrupted_families(fams: list[Family]) -> list[Family]:
 
 def finish_deletion(path: Path) -> None:
     """Delete an aside tree in place: it already has its deleting name, so a second rename adds nothing."""
+    if toolchain_held(path, fresh=True):
+        raise OSError("refusing the job toolchain (toolchain_keep)")
     if path.is_symlink():
         raise OSError("refusing symlink")
     if os.path.ismount(path) or path.lstat().st_dev != path.parent.stat().st_dev:
@@ -3854,11 +3944,11 @@ def discover_caches(root: Path, depth: int = DISCOVER_DEPTH, budget: int = DISCO
                 except OSError:
                     continue
                 if (other_fs or os.path.realpath(d) in never or SECRET_NAME.search(name)
-                        or name in DISCOVER_SKIP or never_delete(Path(d)) or vcs_at(d)
+                        or name in DISCOVER_SKIP or never_delete(Path(d), walk=True) or vcs_at(d)
                         or os.path.lexists(os.path.join(d, "pyvenv.cfg"))):
                     continue
                 if stat_layout(d):
-                    if discoverable(d):
+                    if discoverable(d) and not toolchain_held(Path(d)):
                         found.append(Path(d))
                     continue  # a sealed cache discovery may not take is not searched either
                 entries: list[os.DirEntry] = []
@@ -3874,7 +3964,7 @@ def discover_caches(root: Path, depth: int = DISCOVER_DEPTH, budget: int = DISCO
                 if left < 0:
                     break  # a partial listing can hide a layout, never invent one: stop here
                 if listing_layout(d, entries):
-                    if discoverable(d):
+                    if discoverable(d) and not toolchain_held(Path(d)):
                         found.append(Path(d))
                     continue
                 nxt += [e.path for e in entries if e.is_dir(follow_symlinks=False)]
@@ -5248,7 +5338,7 @@ def candidates(fam: Family) -> list[Path]:
     uid = os.getuid()
     owned = []
     for p in level:
-        if never_delete(p) and not fam.allow_stale_protected:
+        if (never_delete(p) and not fam.allow_stale_protected) or toolchain_held(p):
             continue
         try:
             if p.lstat().st_uid == uid:
@@ -6649,6 +6739,8 @@ def write_eviction_summary(receipt: Path, operation: str, logical_released: int,
 
 def remove(path: Path, after_rename=None) -> None:
     """Delete path. `after_rename` runs once the tree is out of the way, before the long delete."""
+    if toolchain_held(path, fresh=True):
+        raise OSError("refusing the job toolchain (toolchain_keep)")
     if path.is_symlink():
         raise OSError("refusing symlink")
     if os.path.ismount(path) or path.lstat().st_dev != path.parent.stat().st_dev:

@@ -103,6 +103,18 @@ def reserved_above_floor(gd=None) -> str:
     return "" if floor > 0 and free < floor else f"{why}; {free:.0f} GiB free, floor {floor:g}"
 
 
+def toolchain_overlap(paths: list[Path], gd=None) -> str:
+    """Why none of PATHS may be pruned: one is at, inside or above the job toolchain (glaeda-disk toolchain_held: an
+    aliased node-store/cas or cas that leads into ~/.rustup or ~/.cargo/bin), or glaeda-disk cannot be asked (fail
+    closed). "" when every path is clear."""
+    try:
+        gd = load_glaeda_disk() if gd is None else gd
+        held = [os.fspath(p) for p in paths if gd.toolchain_held(p, fresh=True)]
+    except Exception as error:  # noqa: BLE001
+        return f"cannot check the job toolchain ({type(error).__name__}); nothing pruned"
+    return f"{', '.join(held)} overlaps the job toolchain; nothing pruned" if held else ""
+
+
 def busy(commands: list[str]) -> str:
     for c in commands:
         if BUSY.search(c):
@@ -258,6 +270,10 @@ def main(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
     rec: dict = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "apply": a.apply}
     if a.apply and (held := reserved_above_floor()):  # a reserved host's caches are its holder's until the floor
+        rec["result"] = f"deferred: {held}"
+        print(json.dumps(rec))
+        return 0
+    if a.apply and (held := toolchain_overlap([ROOT, ROOT / "cas", ROOT / "node-store" / "cas", ROOT / "node-store" / "kv"])):
         rec["result"] = f"deferred: {held}"
         print(json.dumps(rec))
         return 0
