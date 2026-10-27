@@ -48,6 +48,7 @@ loader.exec_module(gg)
 gg.UPSTREAM_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-upstream-{os.getpid()}.json"
 # Nor may a host's own gh-daemon.json change the pacing the tests expect.
 gg.DAEMON_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-daemon-config-{os.getpid()}.json"
+gg.FLEET_POLICY = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-fleet-policy-{os.getpid()}.json"
 
 TOKEN = "ghp_faketoken_must_never_touch_disk"
 NOW = float(int(time.time()))  # watch files carry real mtimes
@@ -8028,6 +8029,9 @@ class DaemonPolicyTest(Base):
         self.saved_config = gg.DAEMON_CONFIG
         gg.DAEMON_CONFIG = Path(self.tmp.name) / "gh-daemon.json"
         self.addCleanup(setattr, gg, "DAEMON_CONFIG", self.saved_config)
+        for name in ("FLEET_POLICY", "UPDATE_CONFIG"):
+            self.addCleanup(setattr, gg, name, getattr(gg, name))
+            setattr(gg, name, Path(self.tmp.name) / f"{name.lower()}.json")
         self.daemon.clock_real = False  # the share runs on daemon.now here, as tick(now=...) pins it
 
     def configure(self, doc: Any) -> None:
@@ -8054,7 +8058,7 @@ class DaemonPolicyTest(Base):
         self.assertEqual(policy["floors"], {"rest": (2000, 400), "graphql": (800, 100)})
         self.assertEqual(policy["restShare"], 0.25)
         # out of range, the wrong type, NaN, a bool, and a reserve above its floor
-        self.configure({"cycle": 1, "commentCycle": "5", "restShare": 0, "floors": {
+        self.configure({"cycle": 1, "commentCycle": "5", "restShare": -0.1, "floors": {
             "rest": {"floor": 100, "reserve": 200}, "graphql": {"floor": True, "reserve": float("nan")}}})
         policy = self.daemon.policy
         self.assertEqual(policy["cycles"], {"pr": 60, "run": 60, "comment": 15, "head": 60})
@@ -8064,6 +8068,56 @@ class DaemonPolicyTest(Base):
         self.assertEqual((self.daemon.policy["restShare"], self.daemon.policy["cycle"]), (0.4, 60))
         gg.DAEMON_CONFIG.write_text("{not json")
         self.assertEqual(gg.daemon_policy()["cycle"], 60)
+
+    def test_the_fleet_policy_gives_this_host_its_share_under_the_local_config(self) -> None:
+        gg.FLEET_POLICY.write_text(json.dumps({"default": {"restShare": 0.0, "cycle": 90},
+                                               "hosts": {"lane-a": {"restShare": 0.25}, "lane-b": "junk"}}))
+        gg.UPDATE_CONFIG.write_text(json.dumps({"host": "lane-a", "ring": "stable"}))
+        self.assertEqual((gg.daemon_policy()["restShare"], gg.daemon_policy()["cycle"]), (0.25, 90))
+        gg.UPDATE_CONFIG.write_text(json.dumps({"host": "lane-b"}))
+        self.assertEqual(gg.daemon_policy()["restShare"], 0.0)  # a bad entry is the default
+        gg.UPDATE_CONFIG.write_text(json.dumps({"host": "lane-c"}))
+        self.assertEqual(gg.daemon_policy()["restShare"], 0.0)  # not named: the default
+        gg.DAEMON_CONFIG.write_text(json.dumps({"restShare": 0.3}))
+        self.assertEqual((gg.daemon_policy()["restShare"], gg.daemon_policy()["cycle"]), (0.3, 90))
+        gg.UPDATE_CONFIG.unlink()  # no update.json: the short hostname
+        gg.DAEMON_CONFIG.unlink()
+        with mock.patch.object(gg.socket, "gethostname", return_value="Lane-A.local"):
+            self.assertEqual(gg.daemon_policy()["restShare"], 0.25)
+
+    def test_the_shipped_fleet_policy_keeps_every_daemon_within_the_account_share(self) -> None:
+        doc = json.loads((ROOT / "config" / "gh-daemon.json").read_text())
+        shares = [layer["restShare"] for layer in (doc["default"], *doc["hosts"].values())]
+        self.assertTrue(all(0 <= share <= 1 for share in shares), shares)
+        self.assertEqual(doc["default"]["restShare"], 0)  # a host not named must not add to the sum
+        self.assertLessEqual(sum(shares), doc["maxRestShare"])
+        self.assertLessEqual(doc["maxRestShare"], 0.4)
+
+    def test_a_zero_share_reads_prs_and_runs_over_graphql(self) -> None:
+        """A host the fleet policy does not name: every PR and run read is GraphQL. The one REST read left
+        is the cap's own exemption, a failed attempt's job list, once per attempt."""
+        self.daemon.now = NOW
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 5000, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 1000, "reset": NOW + 1800}}
+        self.configure({"restShare": 0})
+        self.assertEqual((self.daemon.rest_cap(), self.daemon.rest_capped()), (0, True))
+        self.assertEqual(self.daemon.route("pr"), "graphql")
+        self.assertEqual(self.daemon.route("run"), "graphql")
+        self.gh.prs[("o", "r", 1)] = pr_node(1)
+        self.gh.runs[7] = {"id": 7, "name": "CI", "display_title": "fix", "status": "completed", "conclusion": "failure",
+                           "html_url": "https://github.com/o/r/actions/runs/7", "head_sha": "b" * 40, "head_branch": "x",
+                           "event": "push", "run_attempt": 1, "created_at": iso(NOW - 99), "updated_at": iso(NOW - 9)}
+        self.gh.jobs[7] = [job("build")]
+        gg.register("pr:o/r#1")
+        gg.register("run:o/r/7")
+        gg.DAEMON_CONFIG.write_text(json.dumps({"restShare": 0}))
+        self.daemon.tick(NOW)
+        self.assertGreaterEqual(len(self.gh.gql_calls()), 1)
+        self.assertEqual(self.gh.run_calls(), [])
+        self.assertEqual(len(self.gh.job_calls()), 1)
+        gg.register("run:o/r/7")
+        self.daemon.tick(NOW + 200)
+        self.assertEqual(len(self.gh.job_calls()), 1)  # once per attempt
 
     def test_settled_heads_stay_fresh_for_two_configured_cycles(self) -> None:
         entry = {"data": {"settled": True}, "dataAt": NOW - (gg.HEAD_SETTLED_TTL + 2 * 60 + 30)}

@@ -139,6 +139,7 @@ HOME = Path.home()
 CONFIG = HOME / ".config/glaeda/update.json"
 STATE_DIR = HOME / ".local/state/glaeda/update"
 BIN = HOME / ".local/bin"
+GH_POLICY = "config/gh-daemon.json"  # in the release tree; setup installs it beside BIN, in ../share/glaeda
 # The runner copy glaeda-cmux-runner-fleet stages (its STAGED and REMOTE_DIR), refreshed in step 6.
 RUNNER_SCRIPTS = HOME / "glaeda-runner/scripts"
 RUNNER_FILES = ("glaeda-cmux-runner", "glaeda-cmux-runner-hook", "glaeda_fleet_labels.py", "glaeda_reservation.py")
@@ -864,6 +865,13 @@ def tool_drift(gen: Path, bin_dir: Path, gh_only: bool = False) -> tuple[int, li
         checked += 1
         if want_sha != have_sha:
             drift.append(name)
+    # The fleet's glaeda-gh pacing (every profile installs it). Missing counts as drift too: without it the
+    # daemon falls back to its own default REST share, which the fleet's shares are split to stay under.
+    want_sha = file_sha256(gen / "glaeda" / GH_POLICY)
+    if want_sha is not None:
+        checked += 1
+        if file_sha256(bin_dir.parent / "share/glaeda" / Path(GH_POLICY).name) != want_sha:
+            drift.append(Path(GH_POLICY).name)
     return checked, drift
 
 

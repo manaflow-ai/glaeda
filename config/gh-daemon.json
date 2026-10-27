@@ -1,0 +1,11 @@
+{
+  "schema": "glaeda-gh-daemon/v1",
+  "note": "The fleet's glaeda-gh pacing, installed by glaeda-mini-setup (every profile) to ~/.local/share/glaeda/gh-daemon.json, where the daemon reads it every tick. default applies on every host; hosts[NAME] (NAME is ~/.config/glaeda/update.json host, else the short hostname) is laid over it, and ~/.config/glaeda/gh-daemon.json over both. Every daemon on the shared account polls on one REST quota, so the restShare values here sum to at most maxRestShare (a test checks it): a host not named gets 0 and reads PRs and runs over GraphQL only (its one REST read is the cap's exemption, a failed attempt's job list, once per attempt). Measured 2026-10-27, last hour per daemon: one host 2101 counted REST requests, one 546, one 155, every other host 0.",
+  "maxRestShare": 0.4,
+  "default": {"restShare": 0.0},
+  "hosts": {
+    "cosmic-gray": {"restShare": 0.25},
+    "huge-blue": {"restShare": 0.1},
+    "air-blue": {"restShare": 0.05}
+  }
+}

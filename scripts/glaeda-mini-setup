@@ -196,6 +196,7 @@ DAEMON_UNITS = frozenset({"glaeda-gh.service"})
 SKILL_SOURCE = REPO / "skills/github-ci-wait/SKILL.md"
 DAEMON_POLICY_SOURCE = REPO / "config/macos-daemons.json"  # desired state of macOS system daemons
 CLAUDE_ROUTES_SOURCE = REPO / "config/claude-routes.json"  # the fleet routes glaeda-mini-health keeps Claude on
+GH_POLICY_SOURCE = REPO / "config/gh-daemon.json"  # the fleet's glaeda-gh pacing: per-host REST shares
 # glaeda-update runs this command from a release; it sets this so setup never unloads the job running it
 UPDATE_ENV = "GLAEDA_UPDATE_RUNNING"
 OTA_RINGS = ("canary", "stable")
@@ -1018,6 +1019,11 @@ def claude_routes_path(ctx: Context) -> Path:
     return ctx.home / ".local/share/glaeda/claude-routes.json"
 
 
+def gh_policy_path(ctx: Context) -> Path:
+    """config/gh-daemon.json, where glaeda-gh reads it (every profile: every host may run the daemon)."""
+    return ctx.home / ".local/share/glaeda/gh-daemon.json"
+
+
 def is_update_agent(label: str) -> bool:
     return label == LABEL_PREFIX + "update" or label.startswith("glaeda-update.")
 
@@ -1291,9 +1297,10 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
         act["source"] = os.fspath(SCRIPT_DIR / name)
         actions.append(act)
     # a copy, not a link: the release tree it came from is replaced by the next update
-    act = file_action(ctx, "tool", skill_path(ctx), SKILL_SOURCE.read_bytes(), 0o644)
-    act["source"] = os.fspath(SKILL_SOURCE)
-    actions.append(act)
+    for dest, source in ((skill_path(ctx), SKILL_SOURCE), (gh_policy_path(ctx), GH_POLICY_SOURCE)):
+        act = file_action(ctx, "tool", dest, source.read_bytes(), 0o644)
+        act["source"] = os.fspath(source)
+        actions.append(act)
     if not ctx.gh_only:
         actions += plan_hygiene_tools(ctx)
     plan_agents(ctx, actions)
@@ -1509,6 +1516,7 @@ def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
                  "glaeda-update", "glaeda-gh", "glaeda-wallpaper-rotate", "glaeda-daemon-heal"):
         actions.append({"kind": "tool", "path": os.fspath(ctx.bin / name)})
     actions.append({"kind": "tool", "path": os.fspath(skill_path(ctx))})
+    actions.append({"kind": "tool", "path": os.fspath(gh_policy_path(ctx))})
     actions.append({"kind": "tool", "path": os.fspath(daemon_policy_path(ctx))})
     actions.append({"kind": "tool", "path": os.fspath(claude_routes_path(ctx))})
     for marker in scan_exclusion_markers(ctx):

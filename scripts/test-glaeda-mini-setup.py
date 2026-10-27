@@ -714,7 +714,7 @@ class MiniSetupTest(unittest.TestCase):
             self.assertTrue(os.access(self.home / ".local/bin" / name, os.X_OK), name)
         for label in ("disk-pressure", "disk-dedupe", "worktree-reclaim"):
             self.assertTrue((self.home / f"Library/LaunchAgents/com.teamleaderleo.glaeda.{label}.plist").is_file())
-        for name in ("macos-daemons.json", "claude-routes.json"):  # what glaeda-mini-health reads off the repo
+        for name in ("macos-daemons.json", "claude-routes.json", "gh-daemon.json"):  # what the tools read off the repo
             self.assertEqual((self.home / ".local/share/glaeda" / name).read_bytes(),
                              (ROOT / "config" / name).read_bytes(), name)
         # the build-host profile still blocks on the same machine
@@ -901,6 +901,8 @@ class MiniSetupTest(unittest.TestCase):
         config = json.loads((self.home / ".config/glaeda/update.json").read_text())
         self.assertEqual((config["ring"], config["setupArgs"]), ("stable", ["--gh-only"]))
         self.assertTrue((self.home / ".claude/skills/github-ci-wait/SKILL.md").is_file())
+        self.assertEqual((self.home / ".local/share/glaeda/gh-daemon.json").read_bytes(),
+                         (ROOT / "config/gh-daemon.json").read_bytes())  # the daemon's share, on a gh-only host too
         self.assertFalse((self.home / "Projects").exists())
         kinds = {a["kind"] for a in receipt["actions"]}
         self.assertEqual(kinds - {"dir", "tool", "agent", "config"}, set())  # no git, gitpkg, python, marker

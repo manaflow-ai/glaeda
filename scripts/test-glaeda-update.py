@@ -54,6 +54,10 @@ for name in ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-update
 reclaim = bin_dir / "glaeda-worktree-reclaim"
 reclaim.write_bytes(Path(sys.argv[sys.argv.index("--reclaim-binary") + 1]).read_bytes())
 reclaim.chmod(0o755)
+policy = Path(__file__).parents[1] / "config/gh-daemon.json"
+if policy.is_file():  # as the real setup does: the fleet's glaeda-gh pacing, in every profile
+    (bin_dir.parent / "share/glaeda").mkdir(parents=True, exist_ok=True)
+    (bin_dir.parent / "share/glaeda/gh-daemon.json").write_bytes(policy.read_bytes())
 with open(bin_dir / "setup-runs", "a") as log:
     log.write(Path(__file__).parents[2].name + " " + " ".join(sys.argv[1:]) + " " + os.environ.get("GLAEDA_UPDATE_RUNNING", "") + "\\n")
 """
@@ -99,6 +103,7 @@ class Server:
             "glaeda/scripts/glaeda-mini-setup":
                 ((FAKE_SETUP if support_headless else FAKE_SETUP.replace(" --headless", "")).encode(), 0o755),
             "glaeda/scripts/health-code": (str(health_code).encode(), 0o644),
+            "glaeda/config/gh-daemon.json": (b'{"default": {"restShare": 0}}\n', 0o644),
             "bin/glaeda-worktree-reclaim": (f"#!/bin/sh\nexit {health_code}\n".encode(), 0o755),
             **runner,
             **extra,
@@ -928,6 +933,20 @@ class UpdateTest(unittest.TestCase):
         self.assertEqual((result["result"], result["repair"]), ("current", "reinstalled glaeda-worktree-reclaim"))
         self.assertTrue(self.converge()["converged"])
         self.assertEqual(self.converge()["running"]["tools"]["drift"], [])
+
+    def test_a_missing_or_edited_fleet_gh_policy_is_reinstalled(self) -> None:
+        self.server.publish(SOURCES[0])
+        now = 1_800_000_000.0
+        self.assertEqual(self.apply(now)["result"], "updated")
+        policy = self.bin.parent / "share/glaeda/gh-daemon.json"
+        self.assertTrue(policy.is_file())
+        for n, damage in enumerate((policy.unlink, lambda: policy.write_text('{"default": {"restShare": 1}}'))):
+            damage()
+            self.assertEqual(gu.observe(self.state, self.bin, self.root, self.root / "x")["tools"]["drift"],
+                             ["gh-daemon.json"])
+            result = self.apply(now + 1 + n)
+            self.assertEqual((result["result"], result["repair"]), ("current", "reinstalled gh-daemon.json"))
+            self.assertEqual(policy.read_bytes(), b'{"default": {"restShare": 0}}\n')
 
     def test_a_gh_only_host_does_not_repair_tools_it_no_longer_installs(self) -> None:
         self.server.publish(SOURCES[0])

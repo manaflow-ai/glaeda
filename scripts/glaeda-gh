@@ -70,8 +70,11 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   A read starts only when its worst case fits. At the cap, PR and run reads move to GraphQL, or wait
   while GraphQL is stopped too, so the shared REST pool is left to `gh`, landers and nightly re-runs.
   The one read the cap never holds back is a failed attempt's job list (once per attempt). The share
-  is per daemon: hosts that each run one should split it (restShare 0.2 on two hosts is 0.4 in all). The cycle, the floors and the share are read every tick from
-  ~/.config/glaeda/gh-daemon.json, {"cycle": 60, "commentCycle": 15, "restShare": 0.4,
+  is per daemon, so the fleet splits it: config/gh-daemon.json gives each host its share (a host it
+  does not name gets 0 and reads PRs and runs over GraphQL, all but that job list), and its shares
+  sum to at most 0.4. The cycle, the floors and the share are read every tick from that file
+  (installed to ~/.local/share/glaeda/gh-daemon.json; its default, then hosts[update.json's host])
+  with ~/.config/glaeda/gh-daemon.json laid over it, {"cycle": 60, "commentCycle": 15, "restShare": 0.4,
   "floors": {"rest": {"floor": 1500, "reserve": 300}, "graphql": {"floor": 500, "reserve": 100}}};
   a missing key or a value out of range keeps its default.
 - The token comes from `gh auth token` and stays in memory; it is never written or logged.
@@ -173,6 +176,7 @@ import re
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -200,6 +204,10 @@ FLOORS = {"rest": (1500, 300), "graphql": (500, 100)}  # (floor, reserve) per qu
 # 304s) on PR reads the balancer had sent to REST, and the account ran out under a nightly re-run.
 REST_SHARE = 0.4
 DAEMON_CONFIG = Path.home() / ".config/glaeda/gh-daemon.json"  # cycle, commentCycle, floors, restShare
+# The fleet's copy of config/gh-daemon.json (glaeda-mini-setup installs it): default, and hosts[NAME]
+# laid over it, under DAEMON_CONFIG. NAME is update.json's host, the name the fleet enrolled this host by.
+FLEET_POLICY = Path.home() / ".local/share/glaeda/gh-daemon.json"
+UPDATE_CONFIG = Path.home() / ".config/glaeda/update.json"
 REST_SPEND_FILE = "rest-spend.json"  # the daemon's counted REST requests per minute, kept across restarts
 # How stale this host's view of the shared quota may get before GET /rate_limit refreshes it. That
 # endpoint reports every family at once and costs no primary quota, so the only cost of a short
@@ -1179,17 +1187,38 @@ def _bounded(value: Any, default: float, low: float, high: float) -> float:
     return value if low <= value <= high else default
 
 
+def policy_host() -> str:
+    """This host's name in the fleet policy: update.json's host, else the short hostname."""
+    doc = read_json(UPDATE_CONFIG)
+    host = doc.get("host") if isinstance(doc, dict) else None
+    return host if isinstance(host, str) and host else socket.gethostname().split(".")[0].lower()
+
+
+def policy_doc() -> dict:
+    """The fleet policy's default, then its hosts[this host], then ~/.config/glaeda/gh-daemon.json."""
+    doc: dict = {}
+    fleet = read_json(FLEET_POLICY)
+    if isinstance(fleet, dict):
+        hosts = fleet.get("hosts") if isinstance(fleet.get("hosts"), dict) else {}
+        for layer in (fleet.get("default"), hosts.get(policy_host())):
+            doc.update(layer if isinstance(layer, dict) else {})
+    local = read_json(DAEMON_CONFIG)
+    doc.update(local if isinstance(local, dict) else {})
+    return doc
+
+
 def daemon_policy() -> dict:
-    """The daemon's pacing, from ~/.config/glaeda/gh-daemon.json laid over the module defaults.
+    """The daemon's pacing: ~/.config/glaeda/gh-daemon.json over the fleet policy over the module defaults.
 
     {"cycle": 60, "commentCycle": 15, "restShare": 0.4,
      "floors": {"rest": {"floor": 1500, "reserve": 300}, "graphql": {"floor": 500, "reserve": 100}}}
 
     Every key is optional, and a value that is not a number in range keeps its default, so a typo
     can neither stop the daemon nor turn it into a busy loop. A reserve above its floor keeps both
-    defaults: "stop" must come after "lean". Read every tick, so an edit applies without a restart."""
-    doc = read_json(DAEMON_CONFIG)
-    doc = doc if isinstance(doc, dict) else {}
+    defaults: "stop" must come after "lean". restShare 0 sends every PR and run read to GraphQL
+    (a failed attempt's job list is still read once: the cap never holds that back).
+    Read every tick, so an edit applies without a restart."""
+    doc = policy_doc()
     cycle = int(_bounded(doc.get("cycle"), CYCLE, 15, 900))
     comment = int(_bounded(doc.get("commentCycle"), COMMENT_CYCLE, 5, 300))
     floors = dict(FLOORS)
@@ -1201,7 +1230,7 @@ def daemon_policy() -> dict:
         floors[bucket] = (f, r) if r <= f else (floor, reserve)
     return {"cycle": cycle, "commentCycle": comment,
             "cycles": {"pr": cycle, "run": cycle, "comment": comment, "head": cycle},
-            "floors": floors, "restShare": float(_bounded(doc.get("restShare"), REST_SHARE, 0.05, 1.0))}
+            "floors": floors, "restShare": float(_bounded(doc.get("restShare"), REST_SHARE, 0.0, 1.0))}
 
 
 def consumer_policy() -> dict:
