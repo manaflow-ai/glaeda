@@ -120,7 +120,9 @@ Its windows follow reuse (IDLE_SWEEP_HOURS and friends). cmux CI's hot tier ages
 last use, not hours (item_due: pressure_jobs, min_jobs, sweep_jobs, soft_idle_hours in disk-policy.json). It also
 reports Xcode copies no pin names and simulator runtimes, and deletes a runtime only when no device
 uses it, it is not its platform's newest, it went unused for RUNTIME_IDLE_DAYS and no simulator is
-booted (simctl runtime delete restarts CoreSimulatorService). Xcode copies are never deleted.
+booted (simctl runtime delete restarts CoreSimulatorService). Xcode copies are never deleted. A shutdown
+simulator device last booted SIM_DEVICE_IDLE_HOURS ago is erased (`simctl erase`: its name, type and runtime stay,
+its data goes), never deleted, unless a process names its UDID or has a file open in it.
 
 On an owned cmux mini, cmux CI's warm state under /Users/Shared/cmux-build-fleet/ci is a local hot
 tier, evicted LRU under pressure: parked pull request builds past the measured host-job reuse distance, seeds other than each
@@ -1938,6 +1940,224 @@ def simulator_runtimes() -> list[Item]:
         return []
     runtimes, devices = simctl_json("runtime", "list"), simctl_json("list", "devices")
     return runtime_items(runtimes, devices) if runtimes is not None and devices is not None else []
+
+
+# Simulator devices (macOS, pressure passes and idle sweeps). CI jobs create a device per run and delete it in a
+# cleanup step, so a cancelled job leaves it; lanes keep named ones (kit-*). On cmux11s-mac-mini on 2026-10-27, 30
+# of 32 devices had not booted in over 80 h and held 35 GB: nothing reclaimed them, because the runtime rule only
+# deletes runtimes no device uses and the idle sweep had not run since 10-19 (the mini is never idle). A device is
+# judged on its own: erasing a shutdown device does not restart CoreSimulatorService (deleting a runtime does), and
+# simctl refuses to erase a booted one. Erase, not delete, so a job or lane that boots a device by name or UDID
+# still finds it.
+SIM_DEVICE_FAMILY = "simulator-device-data"
+SIM_DEVICE_IDLE_HOURS = DEFAULT_AGE_HOURS  # since simctl's lastBootedAt
+SIM_DEVICE_MIN_BYTES = 512 * 1024 ** 2  # dataPathSize under this: a fresh or erased device, nothing to gain
+SIM_DEVICE_BUDGET_S = 300.0  # one pass erases for at most this long; the next pass continues
+
+
+def sim_device_items(devices: object, cmds: str, opened: frozenset[str], now: float | None = None,
+                     leases: str | None = None) -> list[Item]:
+    """Judge simulator devices (`simctl list devices -j`) for erasing. Reclaimable only when shutdown, available,
+    holding at least SIM_DEVICE_MIN_BYTES of data, last booted SIM_DEVICE_IDLE_HOURS ago, no running command names
+    its UDID or its name, no capture lease names its UDID, and no process has a file or its cwd in its directory.
+    An unknown field keeps it."""
+    now = time.time() if now is None else now
+    leases = capture_lease_text() if leases is None else leases
+    by_runtime = devices.get("devices") if isinstance(devices, dict) else None
+    if not isinstance(by_runtime, dict):
+        return []
+    items = []
+    for runtime, devs in sorted(by_runtime.items()):
+        for d in devs if isinstance(devs, list) else []:
+            if not isinstance(d, dict) or not isinstance(d.get("udid"), str):
+                continue
+            udid, size = d["udid"], d.get("dataPathSize")
+            sized = isinstance(size, int) and not isinstance(size, bool)
+            size = size if sized else 0
+            idle = _iso_age_hours(d.get("lastBootedAt"), now)
+            reasons = [f"{d.get('name', '?')} ({str(runtime).rsplit('.', 1)[-1]}) {d.get('state', '?')}"]
+            keep = []
+            if d.get("state") != "Shutdown":
+                keep.append(f"it is {d.get('state', 'in an unknown state')}")
+            if d.get("isAvailable") is not True:
+                keep.append("simctl lists it unavailable")
+            if not sized:
+                keep.append("its size cannot be read")
+            elif size < SIM_DEVICE_MIN_BYTES:
+                keep.append("its data is already small")
+            if idle is None:
+                keep.append("no last-boot time")
+            data = d.get("dataPath")
+            home = os.path.dirname(data) if isinstance(data, str) and data.endswith("/data") else None
+            if home is None:
+                keep.append("no data path")
+            elif in_cwd(home, opened):
+                keep.append("a process has a file open in it")
+            name = d.get("name")
+            if not isinstance(name, str) or not name:
+                keep.append("its name cannot be read")
+            if re.search(re.escape(udid), cmds, re.I) or (
+                    isinstance(name, str) and name and re.search(
+                        r"(?:^|[\s'\"=,])" + re.escape(name) + r"(?=$|[\s'\",])", cmds, re.M)):
+                keep.append("a running command names it")  # by UDID, or by name (-destination name=...)
+            if leases is None:
+                keep.append("the capture leases cannot be read")
+            elif udid.lower() in leases.lower():
+                keep.append("a capture lease names it")
+            verdict = ("kept" if keep else "recent" if idle < SIM_DEVICE_IDLE_HOURS else "reclaimable")
+            items.append(Item(SIM_DEVICE_FAMILY, udid, size, round(idle or 0.0, 1), verdict, reasons + keep,
+                              platform="macos"))
+    return items
+
+
+def erase_idle_sim_devices(receipt: Path, halt=None, budget_s: float = SIM_DEVICE_BUDGET_S, simctl=None,
+                           below_target=None) -> int:
+    """Erase each reclaimable device, largest first, while budget_s lasts (no new erase starts after it; one erase
+    may then run up to its own 300 s limit), and, when below_target is given, only while it says free space is still
+    short. Before each erase the device is judged again: process evidence first (lsof, the slow part), then the
+    reservation, a fresh `ps`, then, holding the simulator token (sim_token) so no simulator-class job is admitted,
+    the capture leases, a fresh simctl reading and the budget, halt and target once more. What can still slip
+    between them and the erase is a job outside the simulator class that picks this device and has not yet named,
+    opened or booted it: simctl refuses to erase a Booted or Booting device, and an unbooted device holds only state
+    that went untouched for SIM_DEVICE_IDLE_HOURS, which this policy gives up. Returns the bytes simctl reports
+    released (0 for a device it cannot read back)."""
+    if not DARWIN or not shutil.which("xcrun") or SIM_DEVICE_IDLE_HOURS == float("inf"):
+        return 0
+    simctl = (lambda: simctl_json("list", "devices")) if simctl is None else simctl
+    started = time.monotonic()
+    try:
+        cmds, opened = _sim_evidence()
+    except NoEvidence as e:
+        print(f"refusing to erase simulator devices: {e}", file=sys.stderr)
+        return 0
+    first = sim_device_items(simctl(), cmds, opened)
+    released = 0
+    for i in sorted((x for x in first if x.verdict == "reclaimable"), key=lambda x: -x.bytes):
+        if time.monotonic() - started > budget_s or (halt is not None and halt()):
+            break  # a halt is a busy host (a CI job): the next idle sweep or pressure pass goes on
+        if below_target is not None and not below_target():
+            break
+        try:
+            cmds, opened = _sim_evidence()
+        except NoEvidence as e:
+            print(f"refusing to erase simulator devices: {e}", file=sys.stderr)
+            break
+        if (why := host_reservation()):
+            print(f"refusing to erase simulator devices: {why}", file=sys.stderr)
+            break
+        try:
+            cmds += "\n" + subprocess.run(["ps", "-axww", "-o", "command="], capture_output=True, text=True,
+                                          timeout=30, check=True).stdout
+        except (OSError, subprocess.SubprocessError):
+            print("refusing to erase simulator devices: ps failed", file=sys.stderr)
+            break
+        token = sim_token()
+        if token is None:
+            print("not erasing simulator devices: a simulator job holds the simulator token", file=sys.stderr)
+            break
+        try:  # held through the last reading and the erase, so no simulator job is admitted in between
+            now = {x.path: x for x in sim_device_items(simctl(), cmds, opened)}.get(i.path)
+            if time.monotonic() - started > budget_s or (halt is not None and halt()) or (
+                    below_target is not None and not below_target()):
+                break  # the readings took the rest of the budget, a job started, or the target was reached
+            if (why := host_reservation()):
+                print(f"refusing to erase simulator devices: {why}", file=sys.stderr)
+                break
+            size = 0
+            if now is None or now.verdict != "reclaimable":
+                outcome, reasons = "changed:in-use", (now.reasons if now else ["no longer listed"])
+            else:
+                reasons = now.reasons
+                try:
+                    r = subprocess.run(["xcrun", "simctl", "erase", i.path], capture_output=True, text=True,
+                                       timeout=300)
+                    outcome = "reclaimed" if r.returncode == 0 else f"incomplete:exit {r.returncode}"
+                except (OSError, subprocess.SubprocessError) as e:
+                    outcome = f"incomplete:{e.__class__.__name__}"
+        finally:
+            os.close(token)
+        if outcome == "reclaimed":
+            after = sim_device_size(simctl(), i.path)
+            if after is None:
+                reasons = reasons + ["its size after the erase could not be read; counted 0"]
+            else:
+                size = max(0, now.bytes - after)
+            released += size
+        rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(), "family": SIM_DEVICE_FAMILY,
+               "path": i.path, "outcome": outcome, "bytes": size, "idle_hours": i.idle_hours,
+               "verdict": "reclaimable" if outcome == "reclaimed" else "blocked", "reasons": reasons,
+               "rebuild": "the next boot recreates its data"}
+        with contextlib.suppress(OSError):
+            receipt.parent.mkdir(parents=True, exist_ok=True)
+            with receipt.open("a") as f:
+                f.write(json.dumps(rec) + "\n")
+        print(f"  {outcome:16s} {gib(size)}  simulator device {i.path} ({reasons[0]})")
+    return released
+
+
+# The runner hook admits a simulator-class job (ios-simulator, screenshots, a guest's *-sim) only while it holds
+# capacity/simulator.token exclusive, for the whole job. The eraser takes it the same way (created if missing, as
+# the hook's lock_file does) around its last reading and the erase, so no such job starts in between.
+SIM_TOKEN = CANONICAL_CAPACITY / "simulator.token"
+
+
+def sim_token(path: Path | None = None) -> int | None:
+    """An fd holding the simulator token exclusive, or None while a job holds it or it cannot be opened."""
+    path = SIM_TOKEN if path is None else path
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def sim_device_size(devices: object, udid: str) -> int | None:
+    """The dataPathSize simctl lists for a device, or None when it is not listed or the size is not a number."""
+    by_runtime = devices.get("devices") if isinstance(devices, dict) else None
+    for devs in by_runtime.values() if isinstance(by_runtime, dict) else ():
+        for d in devs if isinstance(devs, list) else ():
+            if isinstance(d, dict) and d.get("udid") == udid:
+                size = d.get("dataPathSize")
+                return size if isinstance(size, int) and not isinstance(size, bool) else None
+    return None
+
+
+CAPTURE_LEASE_ROOT = HOME / ".cache/cmux-capture-host"  # cmuxterm-hq build-fleet/capture-host's LEASE_ROOT
+
+
+def capture_lease_text(root: Path | None = None) -> str | None:
+    """The text of every file in each capture lease directory, where a lease records what it holds; "" when there
+    is no lease root. None when the root, a lease or any file in one cannot be read, or a file is too big to be a
+    lease record: then nothing is erased."""
+    root = CAPTURE_LEASE_ROOT if root is None else root
+    out = []
+    try:
+        with os.scandir(root) as it:
+            leases = [Path(e.path) for e in it if e.is_dir(follow_symlinks=False)]
+        for lease in leases:
+            with os.scandir(lease) as it:
+                files = [Path(e.path) for e in it if e.is_file(follow_symlinks=False)]
+            for f in files:
+                if f.stat().st_size > 65536:
+                    return None
+                out.append(f.read_text())
+    except FileNotFoundError:
+        if not root.exists():
+            return ""
+        return None  # a lease or file went away while it was read: read again next pass
+    except (OSError, UnicodeDecodeError):
+        return None
+    return "\n".join(out)
+
+
+def _sim_evidence() -> tuple[str, frozenset[str]]:
+    opened, cmds = process_evidence()
+    return cmds, open_index(opened)
 
 
 XCODE_PIN_RE = r"\s--toolchain-xcode[\s=]+(\S+)"
@@ -6688,7 +6908,7 @@ LEGACY_AGES = {"DEFAULT_AGE_HOURS": 24.0, "KEPT_BUILD_IDLE_HOURS": 24.0, "IDLE_S
                "CANONICAL_ADMISSION_IDLE_HOURS": 24.0, "IDLE_SEED_HOURS": 12.0, "RUNTIME_IDLE_DAYS": 14.0,
                "CHECKOUT_BUILD_IDLE_HOURS": 24.0, "TMP_TEST_RESIDUE_IDLE_HOURS": 48.0,
                "RUNNER_STALE_CHECKOUT_HOURS": float("inf"), "RUNNER_CACHE_IDLE_HOURS": 168.0,
-               "CMUX_JOB_MIRROR_HOURS": 168.0, "RUNNER_CHECKOUT_BLOAT_RATIO": float("inf")}
+               "CMUX_JOB_MIRROR_HOURS": 168.0, "SIM_DEVICE_IDLE_HOURS": float("inf"), "RUNNER_CHECKOUT_BLOAT_RATIO": float("inf")}
 LEGACY_POLICY = {"soft_idle_hours": 24.0, "stale_marker_max_hours": 48.0, "cmux_next_ci_host_idle_hours": 48.0}
 
 
@@ -10115,6 +10335,18 @@ def _main_impl(argv: list[str] | None = None) -> int:
         # job and its floor eviction run this one (glaeda-fleet-cas-prune keeps its own working-set rule)
         if a.pressure and ROLE == "fleet-mini" and not RUNNER_CACHE_PROFILE and not a.cmux_next_drain and not a.family:
             logical_released += fleet_cas_node_cap()
+        # idle simulator devices, on every idle sweep and on a pressure pass while free space is still short of the
+        # target: each device is judged on its own, so a busy mini (never idle) still gets them back
+        if ((sweep or a.pressure) and DARWIN and ROLE == "fleet-mini" and not RUNNER_CACHE_PROFILE
+                and not a.cmux_next_drain and not reserved and (not a.family or SIM_DEVICE_FAMILY in a.family)):
+            def short_of_target() -> bool:
+                for fs in shown:
+                    with contextlib.suppress(OSError):
+                        if free_bytes(Path(fs.mount))[0] < fs.target:
+                            return True
+                return False
+            logical_released += erase_idle_sim_devices(a.receipt, halt,
+                                                       below_target=None if sweep else short_of_target)
         remaining = []
         for fs in shown:
             try:

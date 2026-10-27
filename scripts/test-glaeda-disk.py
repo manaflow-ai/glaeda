@@ -60,6 +60,11 @@ gd.CENSUS_STATE = Path(_NO_RESERVATIONS.name + ".census-none.json")
 # Nor git gc the clones in the real home of the host running the suite: only a test's own home is gc'd.
 _gc_home_clones = gd.gc_home_clones
 gd.gc_home_clones = lambda receipt, home=None, halt=None: 0 if home is None else _gc_home_clones(receipt, home, halt)
+# Nor erase the simulator devices of the host running the suite: only a test that passes its own simctl reading.
+_erase_idle_sim_devices = gd.erase_idle_sim_devices
+gd.erase_idle_sim_devices = (lambda receipt, halt=None, budget_s=gd.SIM_DEVICE_BUDGET_S, simctl=None, below_target=None:
+                             0 if simctl is None else _erase_idle_sim_devices(receipt, halt, budget_s, simctl,
+                                                                              below_target))
 
 
 def make(path: Path, mib: int = 1, age_hours: float = 48) -> Path:
@@ -6461,6 +6466,220 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertIn(os.path.realpath("/Applications/Xcode_26.6.app"), gd.xcode_pins(home))
 
 
+# A replay of cmux11s-mac-mini's `xcrun simctl list devices -j` on 2026-10-27 (trimmed to the fields judged): 30 of
+# its 32 devices had not booted in over 80 h and held 35 GB, one was booted.
+SIM_REPLAY = {"devices": {
+    "com.apple.CoreSimulator.SimRuntime.iOS-26-5": [
+        {"udid": "11592F6E-1A41-4215-BF7D-8BE182D2922E", "name": "kit-kit-composer-files", "state": "Shutdown",
+         "isAvailable": True, "dataPathSize": 4062547968, "lastBootedAt": "2026-10-15T04:17:52Z",
+         "dataPath": "/Users/cmux/Library/Developer/CoreSimulator/Devices/11592F6E-1A41-4215-BF7D-8BE182D2922E/data"},
+        {"udid": "E6E55520-3F79-455A-A632-2DA6E48E8184", "name": "iPhone Air", "state": "Shutdown",
+         "isAvailable": True, "dataPathSize": 2871279616, "lastBootedAt": "2026-10-27T03:56:01Z",
+         "dataPath": "/Users/cmux/Library/Developer/CoreSimulator/Devices/E6E55520-3F79-455A-A632-2DA6E48E8184/data"},
+        {"udid": "354B816F-7981-4034-91FB-003E5B665460", "name": "termq-phone", "state": "Booted",
+         "isAvailable": True, "dataPathSize": 3991470080, "lastBootedAt": "2026-10-24T01:00:00Z",
+         "dataPath": "/Users/cmux/Library/Developer/CoreSimulator/Devices/354B816F-7981-4034-91FB-003E5B665460/data"},
+        {"udid": "7154399E-F98A-481C-A999-0DBA6BD39A68", "name": "kit-kit-composer-red", "state": "Shutdown",
+         "isAvailable": True, "dataPathSize": 18337792, "lastBootedAt": "2026-10-20T00:00:00Z",
+         "dataPath": "/Users/cmux/Library/Developer/CoreSimulator/Devices/7154399E-F98A-481C-A999-0DBA6BD39A68/data"},
+        {"udid": "7C4FBE1E-CEF0-4C7D-B4AC-A7A06F3E58F5", "name": "iPhone 17", "state": "Shutdown",
+         "isAvailable": True, "dataPathSize": 3848327168,
+         "dataPath": "/Users/cmux/Library/Developer/CoreSimulator/Devices/7C4FBE1E-CEF0-4C7D-B4AC-A7A06F3E58F5/data"},
+        {"udid": "8F5818EA-A6C4-4222-8F67-8399C0AA3DC6", "name": "pushopen-kit", "state": "Shutdown",
+         "isAvailable": False, "dataPathSize": 3269836800, "lastBootedAt": "2026-10-15T00:00:00Z",
+         "dataPath": "/Users/cmux/Library/Developer/CoreSimulator/Devices/8F5818EA-A6C4-4222-8F67-8399C0AA3DC6/data"},
+    ]}}
+SIM_NOW = 1793110000.0  # 2026-10-27T05:26:40Z
+
+
+class SimDeviceTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.receipt = Path(self.tmp.name) / "receipt.jsonl"
+        token = mock.patch.object(gd, "SIM_TOKEN", Path(self.tmp.name) / "simulator.token")  # never the fleet's
+        token.start()
+        self.addCleanup(token.stop)
+
+    def verdicts(self, cmds: str = "", opened: frozenset[str] = frozenset(), leases: str | None = "") -> dict:
+        return {i.reasons[0].split(" (")[0]: (i.verdict, i.reasons[1:])
+                for i in gd.sim_device_items(SIM_REPLAY, cmds, opened, SIM_NOW, leases)}
+
+    def test_the_cmux11s_replay(self) -> None:
+        v = self.verdicts()
+        self.assertEqual(v["kit-kit-composer-files"][0], "reclaimable", "shutdown, 12 days since its last boot")
+        self.assertEqual(v["iPhone Air"][0], "recent", "booted 1.5 h ago")
+        self.assertEqual(v["termq-phone"], ("kept", ["it is Booted"]))
+        self.assertEqual(v["kit-kit-composer-red"], ("kept", ["its data is already small"]))
+        self.assertEqual(v["iPhone 17"], ("kept", ["no last-boot time"]))
+        self.assertEqual(v["pushopen-kit"], ("kept", ["simctl lists it unavailable"]))
+
+    def test_a_job_or_lease_that_names_a_device_keeps_it(self) -> None:
+        udid = "11592F6E-1A41-4215-BF7D-8BE182D2922E"
+        home = f"/Users/cmux/Library/Developer/CoreSimulator/Devices/{udid}"
+        for cmds, opened, leases, why in (
+                (f"xcodebuild test -destination platform=iOS Simulator,id={udid.lower()}\n", frozenset(), "",
+                 "a running command names it"),
+                ("xcodebuild test -destination 'platform=iOS Simulator,name=kit-kit-composer-files'\n", frozenset(),
+                 "", "a running command names it"),
+                ("", gd.open_index([home + "/data/Library/x.db"]), "", "a process has a file open in it"),
+                ("", frozenset(), f"udid={udid}\n", "a capture lease names it"),
+                ("", frozenset(), None, "the capture leases cannot be read")):
+            with self.subTest(why=why):
+                with mock.patch.object(gd, "capture_lease_text", return_value=leases):
+                    self.assertEqual(self.verdicts(cmds, opened, None)["kit-kit-composer-files"], ("kept", [why]))
+        # a short name counts too: keeping a device too often is safe
+        self.assertEqual(self.verdicts("xcodebuild -destination 'platform=iOS Simulator,name=QA'\n",
+                                       leases="")["kit-kit-composer-files"][0], "reclaimable")
+        short = json.loads(json.dumps(SIM_REPLAY))
+        short["devices"]["com.apple.CoreSimulator.SimRuntime.iOS-26-5"][0]["name"] = "QA"
+        (item,) = [i for i in gd.sim_device_items(short, "xcodebuild -destination name=QA\n", frozenset(), SIM_NOW, "")
+                   if i.path == "11592F6E-1A41-4215-BF7D-8BE182D2922E"]
+        self.assertEqual((item.verdict, item.reasons[1:]), ("kept", ["a running command names it"]))
+        nameless = json.loads(json.dumps(SIM_REPLAY))
+        del nameless["devices"]["com.apple.CoreSimulator.SimRuntime.iOS-26-5"][0]["name"]
+        self.assertIn("its name cannot be read", {i.path: i.reasons for i in gd.sim_device_items(
+            nameless, "", frozenset(), SIM_NOW, "")}["11592F6E-1A41-4215-BF7D-8BE182D2922E"])
+        unsized = json.loads(json.dumps(SIM_REPLAY))
+        unsized["devices"]["com.apple.CoreSimulator.SimRuntime.iOS-26-5"][0]["dataPathSize"] = "big"
+        self.assertEqual({i.path: i.reasons[1:] for i in gd.sim_device_items(unsized, "", frozenset(), SIM_NOW, "")}
+                         ["11592F6E-1A41-4215-BF7D-8BE182D2922E"], ["its size cannot be read"])
+        # a name that is only part of another word or path is no use of it
+        self.assertEqual(self.verdicts("/tmp/kit-kit-composer-files-old/build\n")["kit-kit-composer-files"][0],
+                         "reclaimable")
+
+    def test_capture_lease_text_reads_lease_files_and_fails_closed(self) -> None:
+        root = Path(self.tmp.name) / "leases"
+        self.assertEqual(gd.capture_lease_text(root), "", "no lease root: nothing is leased")
+        (root / "lease-1").mkdir(parents=True)
+        (root / "lease-1/alias").write_text("sim 11592F6E-1A41-4215-BF7D-8BE182D2922E")
+        self.assertIn("11592F6E", gd.capture_lease_text(root))
+        (root / "lease-1/huge").write_bytes(b"x" * 70000)  # not a lease record: doubt
+        self.assertIsNone(gd.capture_lease_text(root))
+        (root / "lease-1/huge").unlink()
+        (root / "lease-1/state").write_bytes(b"\xff\xfe")  # being written or not text: doubt
+        self.assertIsNone(gd.capture_lease_text(root))
+        (root / "lease-1/state").unlink()
+        root.chmod(0)
+        try:
+            if os.access(root, os.R_OK):
+                self.skipTest("running as a user who can read a mode-0 directory")
+            self.assertIsNone(gd.capture_lease_text(root))
+        finally:
+            root.chmod(0o755)
+
+    def test_erase_judges_again_and_erases_only_what_is_still_idle(self) -> None:
+        """The first reading finds two idle devices; by the second, a job booted one. Only the other is erased, with
+        `simctl erase` (never delete), largest first, and both get a receipt line."""
+        second = json.loads(json.dumps(SIM_REPLAY))
+        devs = second["devices"]["com.apple.CoreSimulator.SimRuntime.iOS-26-5"]
+        devs.append({**devs[0], "udid": "AAAAAAAA-0000-0000-0000-000000000001", "name": "kit-other",
+                     "dataPathSize": 5 * gd.GIB})
+        first = json.loads(json.dumps(second))
+        booted = json.loads(json.dumps(second))
+        booted["devices"]["com.apple.CoreSimulator.SimRuntime.iOS-26-5"][-1]["state"] = "Booted"
+        erased = json.loads(json.dumps(booted))
+        erased["devices"]["com.apple.CoreSimulator.SimRuntime.iOS-26-5"][0]["dataPathSize"] = 1024
+        readings = iter([first, booted, booted, erased])
+        runs = []
+
+        def run(argv, **kw):
+            if argv[0] != "ps":
+                runs.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd.shutil, "which", return_value="/usr/bin/xcrun"), \
+                mock.patch.object(gd, "capture_lease_text", return_value=""), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "host_reservation", return_value=""), \
+                mock.patch.object(gd.time, "time", return_value=SIM_NOW), \
+                mock.patch.object(gd.subprocess, "run", side_effect=run), \
+                contextlib.redirect_stdout(io.StringIO()):
+            released = gd.erase_idle_sim_devices(self.receipt, simctl=lambda: next(readings))
+        self.assertEqual(runs, [["xcrun", "simctl", "erase", "11592F6E-1A41-4215-BF7D-8BE182D2922E"]])
+        self.assertEqual(released, 4062547968 - 1024)
+        recs = [json.loads(line) for line in self.receipt.read_text().splitlines()]
+        self.assertEqual([(r["path"][:8], r["outcome"]) for r in recs],
+                         [("AAAAAAAA", "changed:in-use"), ("11592F6E", "reclaimed")])
+
+    def test_a_halt_evidence_failure_reservation_or_reached_target_erases_nothing(self) -> None:
+        def no_evidence():
+            raise gd.NoEvidence("lsof failed")
+        ok = mock.patch.object(gd, "process_evidence", return_value=([], ""))
+        for name, patch, halt, reserved, short in (
+                ("evidence", mock.patch.object(gd, "process_evidence", side_effect=no_evidence), None, "", None),
+                ("halt", ok, lambda: "a CI job", "", None),
+                ("reserved mid-pass", ok, None, "reserved for someone (r1)", None),
+                ("reserved under the token", ok, None, iter(["", "reserved for someone (r1)"]), None),
+                ("target reached", ok, None, "", lambda: False)):
+            with self.subTest(name), patch, mock.patch.object(gd, "DARWIN", True), \
+                    mock.patch.object(gd, "host_reservation", **(
+                        {"side_effect": reserved} if not isinstance(reserved, str) else {"return_value": reserved})), \
+                    mock.patch.object(gd.shutil, "which", return_value="/usr/bin/xcrun"), \
+                    mock.patch.object(gd, "capture_lease_text", return_value=""), \
+                    mock.patch.object(gd.time, "time", return_value=SIM_NOW), \
+                    mock.patch.object(gd.subprocess, "run", side_effect=lambda argv, **kw: (
+                        subprocess.CompletedProcess(argv, 0, "", "") if argv[0] == "ps"
+                        else self.fail("simctl ran"))), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(gd.erase_idle_sim_devices(self.receipt, halt, simctl=lambda: SIM_REPLAY,
+                                                           below_target=short), 0)
+
+    def test_a_simulator_job_holding_the_token_stops_the_erase(self) -> None:
+        """A simulator-class job holds capacity/simulator.token for its whole run; while it does, nothing is erased,
+        and the eraser releases the token after each erase so the job it held back is admitted."""
+        held = os.open(gd.SIM_TOKEN, os.O_RDONLY | os.O_CREAT, 0o644)
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        common = (mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd.shutil, "which", return_value="/usr/bin/xcrun"),
+                  mock.patch.object(gd, "capture_lease_text", return_value=""),
+                  mock.patch.object(gd, "process_evidence", return_value=([], "")),
+                  mock.patch.object(gd, "host_reservation", return_value=""),
+                  mock.patch.object(gd.time, "time", return_value=SIM_NOW))
+        try:
+            with contextlib.ExitStack() as stack:
+                for c in common:
+                    stack.enter_context(c)
+                stack.enter_context(mock.patch.object(gd.subprocess, "run", side_effect=lambda argv, **kw: (
+                    subprocess.CompletedProcess(argv, 0, "", "") if argv[0] == "ps" else self.fail("simctl ran"))))
+                stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+                self.assertEqual(gd.erase_idle_sim_devices(self.receipt, simctl=lambda: SIM_REPLAY), 0)
+        finally:
+            os.close(held)
+        self.assertFalse(self.receipt.exists())
+        with contextlib.ExitStack() as stack:
+            for c in common:
+                stack.enter_context(c)
+            stack.enter_context(mock.patch.object(gd.subprocess, "run",
+                                                  side_effect=lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "", "")))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            gd.erase_idle_sim_devices(self.receipt, simctl=lambda: SIM_REPLAY)
+        mine = os.open(gd.SIM_TOKEN, os.O_RDONLY)
+        try:
+            fcntl.flock(mine, fcntl.LOCK_EX | fcntl.LOCK_NB)  # released after the erase
+        finally:
+            os.close(mine)
+
+    def test_an_unreadable_size_after_the_erase_counts_zero(self) -> None:
+        readings = iter([SIM_REPLAY, SIM_REPLAY, None])
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd.shutil, "which", return_value="/usr/bin/xcrun"), \
+                mock.patch.object(gd, "capture_lease_text", return_value=""), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "host_reservation", return_value=""), \
+                mock.patch.object(gd.time, "time", return_value=SIM_NOW), \
+                mock.patch.object(gd.subprocess, "run",
+                                  side_effect=lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "", "")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gd.erase_idle_sim_devices(self.receipt, simctl=lambda: next(readings, None)), 0)
+        (rec,) = map(json.loads, self.receipt.read_text().splitlines())
+        self.assertEqual((rec["outcome"], rec["bytes"]), ("reclaimed", 0))
+        self.assertIn("could not be read", rec["reasons"][-1])
+
+    def test_a_reserved_host_keeps_its_devices(self) -> None:
+        self.assertEqual(gd.LEGACY_AGES["SIM_DEVICE_IDLE_HOURS"], float("inf"))
+        self.assertEqual(gd.SIM_DEVICE_IDLE_HOURS, 12.0)
+        with mock.patch.object(gd, "SIM_DEVICE_IDLE_HOURS", float("inf")), mock.patch.object(gd, "DARWIN", True):
+            self.assertEqual(gd.erase_idle_sim_devices(self.receipt, simctl=lambda: SIM_REPLAY), 0)
+
+
 class VolumeCensusTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -8598,7 +8817,8 @@ class HostReservationTest(unittest.TestCase):
                 stack.enter_context(mock.patch.object(gd, name, state / name))
             keep_main_globals(stack)
             for name in ("clear_stale_build_markers", "cleanup_paused_runner_work", "reap_tmpdir_test_residue",
-                         "gc_home_clones", "repack_runner_checkouts", "dedupe_xcode", "dedupe_captures"):
+                         "gc_home_clones", "repack_runner_checkouts", "dedupe_xcode", "dedupe_captures",
+                         "erase_idle_sim_devices"):
                 stack.enter_context(mock.patch.object(gd, name, side_effect=AssertionError(f"{name} ran")))
             stack.enter_context(mock.patch.object(gd, "default_families",
                                                   return_value=[gd.Family("tmp", empty, True, "scratch")]))

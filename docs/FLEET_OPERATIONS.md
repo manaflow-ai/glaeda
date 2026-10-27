@@ -97,6 +97,26 @@ measurement and refresh locks, and leaves measurements committed before the
 timeout in the atomic snapshot for the next pass. A foreground report or apply is never interrupted
 by this background-only deadline.
 
+On fleet minis, simulator devices are judged one at a time on every pressure pass and idle sweep
+(family `simulator-device-data`). glaeda-disk runs `xcrun simctl erase` on a device, never
+`delete`, when all of these hold:
+- simctl lists it as shut down and available;
+- it holds at least 512 MiB of data;
+- its `lastBootedAt` is at least 12 h old;
+- no running command names its UDID or its name;
+- no capture lease under `~/.cache/cmux-capture-host` names its UDID, and every lease file can be
+  read (an unreadable lease keeps every device);
+- no process has a file open in it.
+
+The device's name, type and runtime stay, so a job or lane that boots it by name or UDID still finds it. Each
+device is judged again right before its erase, on fresh simctl, `ps` and open-file evidence and a fresh
+reservation check, while glaeda-disk holds `capacity/simulator.token`, the token the runner hook gives every
+simulator-class job for its whole run. So no such job is admitted between that check and the erase, and none is
+erased under one that is running. simctl itself refuses to erase a device that is booting or booted. No new erase starts after five minutes,
+after the idle sweep's busy check names a reason, or, on a pressure pass, once every filesystem is back above
+its target. A reserved host keeps every device. If the size after an erase can't be read, the receipt counts
+0 bytes. Receipts carry `family: simulator-device-data`.
+
 Never remove active workspaces, current seeds, checkouts, user projects, or
 unclassified space by hand. A low free-space number is a reason to refresh the
 receipt, not permission to delete a directory.
