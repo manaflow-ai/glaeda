@@ -89,6 +89,10 @@ Each run checks, as the runner user and without sudo:
                                      checkout-steps.json beside STATE). A mini whose console never answers
                                      a macOS privacy (TCC) prompt stalls every git script for its timeout (about
                                      100 s per `git submodule` call, 2026-10-27), as can a slow network or disk.
+                                     The finding says where the time went: when the median is slow, one
+                                     `git submodule status` (killed past CHECKOUT_PROBE_S, reused for an hour) in
+                                     the newest runner checkout over CHECKOUT_LOCAL_SLOW_S is local git work,
+                                     under it the step is waiting on the network.
                                      Reported only (a warning); it never refuses or delays a job.
   node_toolchain_missing              the runner hook named one exact Rust toolchain that is absent. Healed as the
                                      runner user with `rustup toolchain install ... --profile minimal`, then the
@@ -197,7 +201,7 @@ RUNNER_RECEIPTS = ".local/state/glaeda/cmux-runner"  # glaeda-cmux-runner's inst
 CHECKOUT_SLOW_S = 60  # the fleet's checkout median is 8 s (2026-10-27); a mini at 10x that is not a slow day
 CHECKOUT_MIN_SAMPLES = 10
 CHECKOUT_WINDOW_S = 3 * 86400
-CHECKOUT_MAX_LOGS = 80  # the newest worker logs (one per job) across this mini's runners
+CHECKOUT_MAX_LOGS = 300  # the newest worker logs (one per job) across this mini's runners; many jobs run no checkout
 CHECKOUT_MAX_LOG_BYTES = 16 << 20  # a worker log is about 0.2 to 1 MB; past this the rest is not read (checkout
 # runs at a job's start, so a longer log's checkout steps are in this prefix; its cache entry says "truncated")
 CHECKOUT_PASS_BYTES = 64 << 20  # read per pass at most: logs past it wait for the next pass (2 minutes later)
@@ -208,6 +212,14 @@ CHECKOUT_CACHE_SCHEMA = "glaeda-mini-health-checkout-steps/v1"
 WORKER_LOG = re.compile(r"Worker_[0-9]{8}-[0-9]{6}-utc\.log")
 STEPS_LINE = re.compile(r"\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)Z INFO StepsRunner\] "
                         r"(?:Processing step: DisplayName='(.*)'|(Step result:)|(Skipping step))")
+# Where a slow checkout's time goes: one bounded `git submodule status` in a runner's checkout, with the runners' git.
+# A healthy mini answers in well under a second; a mini whose Xcode git waits on unanswered privacy prompts takes
+# about 100 s. Over CHECKOUT_LOCAL_SLOW_S the time is local git work; under it, the step is waiting on the network.
+CHECKOUT_PROBE_S = 15  # the probe is killed (its whole process group) past this
+CHECKOUT_LOCAL_SLOW_S = 5
+CHECKOUT_PROBE_TTL_S = 3600  # a probe result is reused for an hour (kept in CHECKOUT_CACHE)
+CHECKOUT_PROBE_MAX_ENTRIES = 200  # _work entries looked at, all runners, to find a checkout
+CHECKOUT_PROBE_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"  # the runners' WORKLOAD_PATH
 CHECKOUT_STEP = re.compile(r"(?:Checkout\b.*|Run actions/checkout@\S+)")
 LOGINWINDOW = Path("/Library/Preferences/com.apple.loginwindow.plist")
 TAILSCALE_APP = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
@@ -408,6 +420,61 @@ class Mini:
             if seen > CHECKOUT_MAX_DIR_ENTRIES:
                 break
         return [(key, Path(path), size, mtime) for mtime, key, path, size in newest]
+
+    def checkout_probe(self) -> float | None:
+        """Seconds one `git submodule status` takes in the newest runner checkout (_work/<repo>/<repo>) with the git
+        the runners' PATH resolves; CHECKOUT_PROBE_S when it had to be killed; None when there is no checkout or git.
+        Read-only: GIT_OPTIONAL_LOCKS=0, no prompts, stdio closed, its own process group killed on timeout."""
+        newest: tuple[float, str] | None = None
+        seen = 0
+
+        def entries(path: Path) -> list[os.DirEntry]:
+            """At most what is left of CHECKOUT_PROBE_MAX_ENTRIES of path's entries, never following a symlink."""
+            nonlocal seen
+            out: list[os.DirEntry] = []
+            if seen >= CHECKOUT_PROBE_MAX_ENTRIES:
+                return out
+            with contextlib.suppress(OSError), os.scandir(path) as it:
+                for e in it:
+                    if seen >= CHECKOUT_PROBE_MAX_ENTRIES:
+                        break
+                    seen += 1
+                    with contextlib.suppress(OSError):
+                        if e.is_dir(follow_symlinks=False) and not e.name.startswith("_"):
+                            out.append(e)
+            return out
+
+        for d in self.runner_dirs():
+            for group in entries(d / "_work"):
+                for repo in entries(Path(group.path)):
+                    with contextlib.suppress(OSError):
+                        st = os.stat(os.path.join(repo.path, ".git"), follow_symlinks=False)
+                        if stat.S_ISDIR(st.st_mode) and (newest is None or st.st_mtime > newest[0]):
+                            newest = (st.st_mtime, repo.path)
+            if seen >= CHECKOUT_PROBE_MAX_ENTRIES:
+                break
+        git = shutil.which("git", path=CHECKOUT_PROBE_PATH)
+        if newest is None or git is None:
+            return None
+        env = {"PATH": CHECKOUT_PROBE_PATH, "HOME": os.fspath(self.home), "GIT_OPTIONAL_LOCKS": "0",
+               "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C"}
+        start = time.monotonic()
+        try:
+            # core.fsmonitor=false: a configured monitor hook would run otherwise, even with optional locks off.
+            p = subprocess.Popen([git, "-c", "core.fsmonitor=false", "-C", newest[1], "submodule", "status"], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, start_new_session=True)
+        except OSError:
+            return None
+        try:
+            code = p.wait(timeout=CHECKOUT_PROBE_S)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(OSError):
+                os.killpg(p.pid, signal.SIGKILL)
+            with contextlib.suppress(subprocess.SubprocessError):
+                p.wait(timeout=5)
+            return float(CHECKOUT_PROBE_S)
+        # A git that failed (a checkout removed under it, a broken config) timed nothing: where stays unknown.
+        return time.monotonic() - start if code == 0 else None
 
     def read_log(self, path: Path, limit: int) -> str | None:
         """The first `limit` bytes of a regular file (never a symlink, FIFO or device), or None."""
@@ -1418,24 +1485,44 @@ def _check_checkout_steps(mini: Mini, now: float, cache_path: Path, remember: bo
             steps = [[round(at), round(sec, 1)] for at, sec in checkout_durations(text)][-CHECKOUT_MAX_STEPS:]
         kept[key] = {"size": size, "mtime": mtime, "steps": steps, **({"truncated": True} if truncated else {})}
         samples += [float(sec) for at, sec in steps if 0 <= now - at <= CHECKOUT_WINDOW_S]
-    if remember and kept != logs:
-        with contextlib.suppress(OSError):
-            write_json(cache_path, {"schema": CHECKOUT_CACHE_SCHEMA, "logs": kept})
-    if len(samples) < CHECKOUT_MIN_SAMPLES:
-        return []
+    slow = len(samples) >= CHECKOUT_MIN_SAMPLES
     samples.sort()
     n = len(samples)
-    p50 = samples[n // 2] if n % 2 else (samples[n // 2 - 1] + samples[n // 2]) / 2
-    if p50 <= CHECKOUT_SLOW_S:
+    p50 = (samples[n // 2] if n % 2 else (samples[n // 2 - 1] + samples[n // 2]) / 2) if n else 0.0
+    slow = slow and p50 > CHECKOUT_SLOW_S
+    old = cache.get("probe") if cache.get("schema") == CHECKOUT_CACHE_SCHEMA else None
+    # Kept for its hour whatever this pass's median says, so a median near the line never probes more often.
+    probe = old if (isinstance(old, dict) and finite(old.get("at")) and finite(old.get("s"))
+                    and old["s"] >= 0 and 0 <= now - old["at"] <= CHECKOUT_PROBE_TTL_S) else None
+    if slow and probe is None:
+        try:
+            sec = mini.checkout_probe()
+        except Exception:  # noqa: BLE001  (a probe that cannot run leaves "where" unknown, never the finding)
+            sec = None
+        probe = None if sec is None else {"at": round(now), "s": round(sec, 2)}
+    doc = {"schema": CHECKOUT_CACHE_SCHEMA, "logs": kept, **({"probe": probe} if probe else {})}
+    if remember and doc != cache:
+        with contextlib.suppress(OSError):
+            write_json(cache_path, doc)
+    if not slow:
         return []
     p90 = samples[max(0, math.ceil(0.9 * n) - 1)]  # nearest rank
-    return [finding("checkout_slow", "warn",
-                    f"checkout steps took a median {p50:.0f} s (p90 {p90:.0f} s, slowest {samples[-1]:.0f} s) over "
-                    f"{n} steps in the last {CHECKOUT_WINDOW_S // 86400} days; over {CHECKOUT_SLOW_S} s is slow",
-                    "impossible",
-                    "time `git submodule status` in a runner's _work checkout: about 100 s with each git call "
-                    "waiting about 6 s is an unanswered macOS privacy (TCC) prompt (grant Full Disk Access at the "
-                    "console); otherwise look at the network path and the disk")]
+    stats = (f"checkout steps took a median {p50:.0f} s (p90 {p90:.0f} s, slowest {samples[-1]:.0f} s) over "
+             f"{n} steps in the last {CHECKOUT_WINDOW_S // 86400} days; over {CHECKOUT_SLOW_S} s is slow")
+    if probe is None:
+        where, note = ("where: unknown (no runner checkout or git to time)",
+                       "time `git submodule status` in a runner's _work checkout: slow there is local git work, "
+                       "fast there means the step waits on the network")
+    elif probe["s"] >= CHECKOUT_LOCAL_SLOW_S:
+        took = f"over {CHECKOUT_PROBE_S}" if probe["s"] >= CHECKOUT_PROBE_S else f"{probe['s']:.0f}"
+        where, note = (f"where: local (git submodule status took {took} s here; under 1 s on a healthy mini)",
+                       "each git call waiting about 6 s is an unanswered macOS privacy (TCC) prompt: grant Full "
+                       "Disk Access and App Management at the console, or give the host git.source homebrew in "
+                       "the mini-fleet manifest")
+    else:
+        where, note = (f"where: network (local git is fast: git submodule status took {probe['s']:.1f} s)",
+                       "the step is waiting on the fetch: look at the uplink and the route to GitHub, then the disk")
+    return [finding("checkout_slow", "warn", f"{stats}; {where}", "impossible", note)]
 
 
 def check_node_eligibility(mini: Mini) -> list[dict[str, Any]]:
