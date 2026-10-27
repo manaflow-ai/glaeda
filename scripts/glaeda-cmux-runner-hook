@@ -368,8 +368,9 @@ DEV_COMPILE_CAPACITY_WAIT_S = 60.0
 # The waiter polls every ADMIT_POLL_S and logs what it waits for, and who holds it, when that changes and every
 # ADMIT_NOTE_S. It leaves a marker, capacity/admit.want-<pid> (ADMIT_WANT: the token kinds it needs, since when,
 # and who it is), rewritten every poll: a later admission that needs one of those kinds waits behind it instead
-# of taking a token the moment it frees (fair_turn), and the listener gate holds this mini's runners whose next
-# job would compete for them (mini_full), so GitHub keeps such jobs queued for other minis.
+# of taking a token the moment it frees (fair_turn; nightly and DEV jobs rank ahead, FEED_FIRST), and the listener
+# gate holds this mini's runners whose next job would compete for them (mini_full), so GitHub keeps such jobs queued
+# for other minis.
 ADMIT_POLL_S = 2.0
 ADMIT_NOTE_S = 60.0
 ADMIT_WANT = "admit.want-"
@@ -1126,6 +1127,49 @@ def dev_compile_refusal(event_name: str | None, ref: str | None, repository: str
             return None
         return "dev compile runner requires workflow_dispatch input dev_daily=true"
     return "dev compile runner admits only a feat-cmux-next push or dev_daily dispatch"
+
+
+# FEED_FIRST: a mini's admission queue (fair_turn) ranks waiters by tier, not only by arrival. Leo, 2026-10-27, on a
+# nightly app build queued behind PR jobs: "BUT WTF COULD POSSIBLY BE MORE IMPORTANT ON OUR FUCKING MINIS".
+#   - NIGHTLY: every nightly.yml job of manaflow-ai/cmux on a nightly-next or main push, schedule or dispatch (NEXT and
+#     classic nightly: build-nightly-app, promote, the sign, notarize and verify jobs), and the Release compile on a
+#     feat-cmux-next push that gates nightly-next's promotion. A waiting nightly job is admitted next, ahead of every
+#     other waiter however long it has waited; no admission of any other tier takes a unit while one waits here; and
+#     it keeps no idle runner's reserve (GUI_RESERVE, FRESH_RESERVE_TOKEN).
+#   - DEV: the other feed compiles the freshness slot admits (dev_compile_refusal: a feat-cmux-next push's DEV
+#     compile, a DEV daily's). Ahead of PR and side jobs, except one that has waited FEED_JUMP_S: that keeps its
+#     arrival order against DEV compiles, so a stream of them cannot starve it.
+#   - everything else (PR and side jobs): arrival order.
+# Nothing running is preempted: a nightly job takes the next units that free up, and none goes to anyone else first.
+# Strict arrival order had them queue behind PR work: on 2026-10-27 from 04:27Z a nightly-next build-nightly-app sat
+# 13+ min in this hook on a side runner behind a fast-tier, a generated-files and a swift test job that had arrived
+# first, and at 04:47Z, the oldest waiter, it still waited with 3 of 14 units free, because the fresh reserve (4) and a
+# gui reserve (1) made its 4 units need 9 free.
+NIGHTLY_REFS = ("refs/heads/nightly-next", "refs/heads/main")
+NIGHTLY_EVENTS = ("push", "schedule", "workflow_dispatch")
+NIGHTLY_WORKFLOW = "manaflow-ai/cmux/.github/workflows/nightly.yml"
+PROMOTE_COMPILE = "release-compile"  # cmux-next.yml's, on a feat-cmux-next push: nightly-next's promote gate
+TIER_NIGHTLY, TIER_DEV = "nightly", "dev"
+FEED_JUMP_S = 20 * 60.0
+
+
+def job_tier(event_name: str | None, ref: str | None, repository: str | None, event: Any,
+             workflow_ref: str | None, job: str | None) -> str:
+    """This job's admission tier (FEED_FIRST): TIER_NIGHTLY, TIER_DEV or "". Pure. Only merged workflow code on a
+    protected branch qualifies: the workflow ref names the same branch the job runs on, and a pull request's ref is
+    never one of them, nor is a payload that carries a pull request, a workflow_run or a merge group."""
+    if not isinstance(event, dict) or any(key in event for key in UNTRUSTED_PAYLOAD_KEYS):
+        return ""
+    if dev_compile_refusal(event_name, ref, repository, event, workflow_ref, job) is None:
+        return TIER_NIGHTLY if job == PROMOTE_COMPILE and event_name == "push" else TIER_DEV
+    repos = {(repository or "").lower(), (_repo_name(event.get("repository")) or "").lower()}
+    if repos != {"manaflow-ai/cmux"} or not job or event_name not in NIGHTLY_EVENTS:
+        return ""
+    if ref not in NIGHTLY_REFS or workflow_ref != f"{NIGHTLY_WORKFLOW}@{ref}":
+        return ""
+    if event_name == "push" and event.get("ref") != ref:
+        return ""
+    return TIER_NIGHTLY
 
 
 # glaeda-mini-health's drain for a Tailscale restart (glaeda#1627): it wants the host idle, not jobs refused. The gate
@@ -2986,7 +3030,7 @@ def admission_waiters(capacity_dir: Path, skip_pid: int = 0) -> list[dict[str, A
             fresh = time.time() - marker.stat().st_mtime < ADMIT_FRESH_S
         except (OSError, ValueError):
             continue
-        if pid == skip_pid:
+        if pid == skip_pid or not 0 < pid < 2 ** 31:  # a pid no process has: never signalled or ranked
             continue
         if not fresh or not pid_alive(pid):
             with contextlib.suppress(OSError):
@@ -2994,23 +3038,47 @@ def admission_waiters(capacity_dir: Path, skip_pid: int = 0) -> list[dict[str, A
             continue
         try:
             data = json.loads(read_bounded(marker) or b"")
+            if isinstance(data["since"], bool):
+                continue
             since = float(data["since"])
+            if not math.isfinite(since):  # an infinite or NaN since would break the one total order
+                continue
             wants = [str(kind) for kind in data.get("wants") or [] if isinstance(kind, str)]
         except (OSError, ValueError, TypeError, KeyError, AttributeError):
             continue
-        waiters.append({"pid": pid, "since": since, "wants": wants, "who": str(data.get("who") or "")[:200]})
+        tier = data.get("tier") if data.get("tier") in (TIER_NIGHTLY, TIER_DEV) else ""
+        waiters.append({"pid": pid, "since": since, "wants": wants, "who": str(data.get("who") or "")[:200],
+                        "tier": tier})
     return sorted(waiters, key=lambda waiter: (waiter["since"], waiter["pid"]))
 
 
-def fair_turn(capacity_dir: Path, needs: set[str], since: float) -> str | None:
-    """Why an admission needing these kinds (tokens and "units") must wait behind an older waiter, or None."""
+def admission_rank(tier: str, since: float, pid: int, now: float) -> tuple[int, float, int]:
+    """A waiter's place in the queue (FEED_FIRST): nightly jobs first; then DEV compiles and other jobs that have
+    waited FEED_JUMP_S; then the rest; each by arrival. One total order, so no two waiters each wait for the other."""
+    if tier == TIER_NIGHTLY:
+        return (0, since, pid)
+    return (1 if tier == TIER_DEV or now - since >= FEED_JUMP_S else 2, since, pid)
+
+
+def fair_turn(capacity_dir: Path, needs: set[str], since: float, tier: str = "",
+              takes_units: bool = False) -> str | None:
+    """Why an admission needing these kinds (tokens and "units") must wait behind a waiter ahead of it, or None.
+    Ahead is older, except across tiers (FEED_FIRST, admission_rank). A waiting nightly job also stops every other
+    admission that takes a unit (takes_units), one the reserve its own gate holds would cover too."""
+    now = time.time()
+    mine = admission_rank(tier, since, os.getpid(), now)
     for waiter in admission_waiters(capacity_dir, os.getpid()):
-        if (waiter["since"], waiter["pid"]) >= (since, os.getpid()):
-            break
+        if admission_rank(waiter["tier"], waiter["since"], waiter["pid"], now) >= mine:
+            continue
         shared = needs & set(waiter["wants"])
+        if waiter["tier"] == TIER_NIGHTLY and takes_units:  # a later nightly job too: arrival order among them
+            shared.add("units")
         if shared:
-            return (f"capacity: {waiter['who'] or 'pid ' + str(waiter['pid'])} has waited longer here for "
-                    f"{', '.join(sorted(shared))}")
+            who = waiter["who"] or "pid " + str(waiter["pid"])
+            if (waiter["since"], waiter["pid"]) > (since, os.getpid()) or waiter["tier"] == TIER_NIGHTLY != tier:
+                kind = "a nightly job" if waiter["tier"] == TIER_NIGHTLY else "a DEV compile"
+                return f"capacity: {who} is {kind} and goes first here for {', '.join(sorted(shared))}"
+            return f"capacity: {who} has waited longer here for {', '.join(sorted(shared))}"
     return None
 
 
@@ -3020,10 +3088,13 @@ def job_who() -> str:
                                   f"(run {os.environ['GITHUB_RUN_ID']})" if os.environ.get("GITHUB_RUN_ID") else "")))
 
 
-def write_want(marker: Path, since: float, wants: list[str]) -> None:
+def write_want(marker: Path, since: float, wants: list[str], tier: str = "") -> None:
     with contextlib.suppress(OSError):
         tmp = marker.with_name(marker.name + ".tmp")
-        tmp.write_text(json.dumps({"since": since, "wants": wants, "who": job_who()}) + "\n")
+        want: dict[str, Any] = {"since": since, "wants": wants, "who": job_who()}
+        if tier:
+            want["tier"] = tier
+        tmp.write_text(json.dumps(want) + "\n")
         tmp.replace(marker)
 
 
@@ -3075,13 +3146,14 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                   owned_state_dir: str = "", taken_out: dict[str, Any] | None = None,
                   warm_target: tuple[Any, ...] = ("", None, 0), klass: str | None = None,
                   one_holder: bool = False, since: float | None = None, gui_token: str = "gui",
-                  gui_runner: bool = False, fresh_runner: bool = False) -> tuple[bool, str]:
+                  gui_runner: bool = False, fresh_runner: bool = False, tier: str = "") -> tuple[bool, str]:
     """Weighted admission for one of several runners on this mini, without ever waiting on a job.
     When held, taken_out (if given) receives the units and tokens taken, for the job log; on a capacity refusal it
     receives "wants", the kinds a waiter marker names (CAPACITY_WAIT): the token kind or "units" it lacks, else
-    every token kind its class takes. since is when this job began to wait (a
+    every kind it needs (behind another waiter: its class's tokens, and units). since is when this job began to wait (a
     waiter's own tries): it goes ahead of any admission that began later and behind any that began earlier and
-    needs a kind it needs (fair_turn); None is a newcomer. klass, when given,
+    needs a kind it needs (fair_turn); None is a newcomer. tier (job_tier) ranks it across arrival order
+    (FEED_FIRST): a nightly job also keeps no idle reserve. klass, when given,
     is the class itself (a ci-step names it, step_admit) instead of one looked up from the job id. one_holder
     refuses, under admission.lock, when this holder file's holder is still alive (a ci-step key admits once).
     Every job but the gui runner's own (gui_runner: job-started --gui-runner) leaves the units idle gui runners
@@ -3133,9 +3205,13 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         own_reserve = gui_token if gui_runner else FRESH_RESERVE_TOKEN if fresh_runner else None
         in_reserve = (own_reserve is not None and 0 < units <= reserve_units(f"{own_reserve}{GUI_RESERVE}")
                       and not probe(capacity_dir / f"{own_reserve}{GUI_RESERVE}"))
-        behind = fair_turn(capacity_dir, {*tokens, *(("units",) if units and not in_reserve else ())},
-                           time.time() if since is None else since)
+        needs = {*tokens, *(("units",) if units and not in_reserve else ())}
+        behind = fair_turn(capacity_dir, needs, time.time() if since is None else since, tier, units > 0)
         if behind:
+            # a waiter behind another names every kind it needs, units too: a newcomer that fits must not take the
+            # units it waits for in the poll between the waiter ahead being admitted and this one's next try
+            if taken_out is not None:
+                taken_out["wants"] = sorted(needs)
             return False, behind
         yielded = yield_idle_warm(capacity_dir)  # under admission.lock, so a catch-up cannot start meanwhile
         if uses_gui:  # this job will drive the console session: the idle fuzzer's app must be gone first
@@ -3211,8 +3287,9 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                 if taken_out is not None:
                     taken_out["wants"] = [token]
                 return False, f"capacity: {held} ({job or 'unknown job'} is {klass})"
-        # every job but a reserving runner's own leaves the idle reserves free (GUI_RESERVE, FRESH_RESERVE_TOKEN)
-        kept = reserve_for(gui_reserved(capacity_dir, own_reserve), units, total)
+        # every job but a reserving runner's own leaves the idle reserves free (GUI_RESERVE, FRESH_RESERVE_TOKEN); a
+        # nightly job keeps none (FEED_FIRST)
+        kept = 0 if tier == TIER_NIGHTLY else reserve_for(gui_reserved(capacity_dir, own_reserve), units, total)
         got = spare = 0
         unit_fds: list[int] = []
         for slot in range(total):
@@ -3470,7 +3547,9 @@ def step_fits(capacity_dir: Path, total: int, compile_slots: int, roots: int, ho
 
         units = sum(1 for slot in range(total) if free(f"unit-{slot}"))
         reserved = gui_reserved(capacity_dir)  # a step is never the gui runner's job: it leaves the reserve free
-        waited = {kind for waiter in admission_waiters(capacity_dir) for kind in waiter["wants"]}
+        waited = set()
+        for waiter in admission_waiters(capacity_dir):
+            waited |= set(waiter["wants"]) | ({"units"} if waiter["tier"] == TIER_NIGHTLY else set())  # FEED_FIRST
         fits = []
         for klass in STEP_CLASSES:
             need, tokens = CLASS_COST[klass]
@@ -3704,7 +3783,8 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
     Full also means a job admitted to this mini is waiting (CAPACITY_WAIT, its admit.want marker) for units or
     for a token this runner's next job would take (a root runner: a canonical root or persistent-dd; a gui
     runner: the gui token or a root). That job goes first, so a job this runner took now would only queue behind
-    it here, while GitHub could hand it to a mini with room.
+    it here, while GitHub could hand it to a mini with room. A waiting nightly job (FEED_FIRST) holds every such
+    runner, the gui runner and the freshness slot too: no admission of another tier takes a unit while it waits.
 
     With the scope of a fast runner (scope.fast, the fast pool label: cmux-next's fast-tier), full means only that a
     fast token is taken or a job here waits for one: its job takes the fast tokens and none of the shared units,
@@ -3772,6 +3852,8 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
             {scope.gui_token, "root"} if gui else set())
         for waiter in admission_waiters(capacity_dir):
             shared = compete & set(waiter["wants"])
+            if waiter["tier"] == TIER_NIGHTLY:  # no other job takes a unit while a nightly job waits (FEED_FIRST)
+                shared.add("units")
             if shared:
                 return f"{waiter['who'] or 'a job'} waits here for {', '.join(sorted(shared))}"
         if scope is not None and scope.session:
@@ -6693,6 +6775,15 @@ def main(argv: list[str] | None = None) -> int:
                     repo, args.home_repo, os.environ.get("GITHUB_EVENT_NAME"),
                     os.environ.get("GITHUB_REF"), event, os.environ.get("GITHUB_JOB", ""), job_workflow())
             cap = slot_capacity_wait(cap, args.dev_compile_runner)
+            tier = job_tier(os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REF"),
+                            os.environ.get("GITHUB_REPOSITORY"), event, os.environ.get("GITHUB_WORKFLOW_REF"),
+                            os.environ.get("GITHUB_JOB"))
+            if tier == TIER_NIGHTLY:
+                print(f"{PREFIX}: a nightly job: it goes ahead of every other job waiting here, no other job takes a "
+                      f"unit while it waits, and it keeps no idle reserve", flush=True)
+            elif tier:
+                print(f"{PREFIX}: a DEV compile: it goes ahead of PR jobs waiting here for capacity "
+                      f"(those waiting under {FEED_JUMP_S / 60:g} min)", flush=True)
             start, since = time.monotonic(), time.time()
             marker = args.capacity_dir / f"{ADMIT_WANT}{os.getpid()}"
             shown, shown_at = "", 0.0
@@ -6709,7 +6800,7 @@ def main(argv: list[str] | None = None) -> int:
                                                warm_target=job_warm_target(event), since=since,
                                                gui_token=args.gui_token, klass=admit_class,
                                                gui_runner=args.gui_runner,
-                                               fresh_runner=args.dev_compile_runner)
+                                               fresh_runner=args.dev_compile_runner, tier=tier)
                     if held or not note.startswith("capacity:"):
                         break
                     waited = time.monotonic() - start
@@ -6717,7 +6808,7 @@ def main(argv: list[str] | None = None) -> int:
                     if left <= 0:
                         break
                     wants = list(taken.get("wants") or [])
-                    write_want(marker, since, wants)
+                    write_want(marker, since, wants, tier)
                     if note != shown or time.monotonic() - shown_at >= ADMIT_NOTE_S:
                         holders = ""
                         with contextlib.suppress(Exception):  # naming holders must never fail the wait
