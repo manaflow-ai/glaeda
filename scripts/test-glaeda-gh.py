@@ -8917,5 +8917,166 @@ class BrokerAnswerCacheReviewTest(BrokerBase):
         self.assertIsNot(signal.getsignal(signal.SIGINT), signal.SIG_IGN)
 
 
+class StaleRunRereadTest(Base):
+    """manaflow-ai/cmux run 40557947333, 2026-10-27: GitHub finished the run (failure) at 18:21Z, but the controller
+    lost the completion delivery and kept it in_progress, so the daemon (which reads a controller-tracked run over
+    REST only every REST_SAFETY) kept a blocked `wait run` on that record. A waited run that stays queued or in
+    progress, unchanged and unread for STALE_RUN_REREAD, is read once more; a fresh or unwaited one is not."""
+
+    request, woken = WaitSubscriptionTest.request, WaitSubscriptionTest.woken
+
+    def setUp(self) -> None:
+        super().setUp()
+        gg.BASE.mkdir(parents=True)
+        lock = open(gg.BASE / "daemon.lock", "a+")
+        fcntl.flock(lock, fcntl.LOCK_EX)  # stands in for a running daemon that serves waits
+        self.addCleanup(lock.close)
+        gg.write_json(gg.BASE / "daemon.json", {"at": time.time(), "heartbeat": 30, "waits": gg.WAITS_CONTRACT})
+        self.ctl = FakeController()
+        feed_every, gg.CONTROLLER_FEED_EVERY = gg.CONTROLLER_FEED_EVERY, 0
+        self.addCleanup(setattr, gg, "CONTROLLER_FEED_EVERY", feed_every)
+        self.daemon = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=self.ctl)
+
+    def tick(self, key: str, at: float, waited: bool = True) -> None:
+        """One tick at `at`, with the wait's interest as fresh as serve_waits keeps it on a real clock."""
+        path = gg.watch_dir() / gg.file_name(key)
+        doc = gg.read_json(path)
+        if waited:
+            doc["waitedAt"] = at
+        else:
+            doc.pop("waitedAt", None)
+        gg.write_json(path, doc)
+        os.utime(path, (at, at))
+        self.daemon.tick(at)
+
+    def in_progress(self, run_id: int, updated: float) -> None:
+        self.ctl.runs[run_id] = ctl_run(run_id, "in_progress", "", iso(updated))
+        self.gh.runs[run_id] = {"id": run_id, "status": "in_progress", "conclusion": None, "run_attempt": 1,
+                                "updated_at": iso(updated)}
+
+    def test_a_stale_in_progress_run_is_reread_and_its_waiter_released(self) -> None:
+        now = time.time()
+        key = "run:o/r/60"
+        self.in_progress(60, now - 600)
+        rid, reader = self.request("run", "o/r/60", timeout=3600)
+        self.assertTrue(gg.read_json(gg.watch_dir() / gg.file_name(key)).get("waitedAt"), "a wait marks its watch")
+        self.tick(key, NOW)
+        self.assertEqual(self.gh.rest_calls(), [], "the controller's baseline costs no REST")
+        # GitHub finishes it; the controller never hears (a lost delivery)
+        self.gh.runs[60] = {"id": 60, "status": "completed", "conclusion": "failure", "run_attempt": 1,
+                            "updated_at": iso(now - 60)}
+        self.gh.jobs[60] = [job("build", end=now - 60)]
+        self.tick(key, NOW + gg.STALE_RUN_REREAD - gg.CYCLE)
+        self.assertEqual(self.gh.rest_calls(), [])
+        self.assertEqual(self.woken(reader), "")
+        self.tick(key, NOW + gg.STALE_RUN_REREAD + 1)
+        self.assertEqual(len(self.gh.run_calls()), 1, "one read of the run, well before REST_SAFETY")
+        entry = gg.read_cache(key)
+        self.assertEqual((entry["source"], entry["data"]["conclusion"]), ("rest", "failure"))
+        self.assertEqual(self.woken(reader), "1\n", "the waiter is released on the failure")
+        self.assertIn("failure", (gg.waits_dir() / f"{rid}.out").read_text())
+
+    def test_a_stale_in_progress_run_is_reread_and_released_on_success(self) -> None:
+        now = time.time()
+        key = "run:o/r/63"
+        self.in_progress(63, now - 600)
+        _, reader = self.request("run", "o/r/63", timeout=3600)
+        self.tick(key, NOW)
+        self.gh.runs[63] = {"id": 63, "status": "completed", "conclusion": "success", "run_attempt": 1,
+                            "updated_at": iso(now - 60)}
+        self.tick(key, NOW + gg.STALE_RUN_REREAD + 1)
+        self.assertEqual(self.woken(reader), "0\n")
+
+    def test_a_fresh_or_unwaited_run_is_not_reread(self) -> None:
+        now = time.time()
+        key = "run:o/r/61"
+        self.in_progress(61, now - 600)
+        gg.register(key)  # a `status` reader, no wait
+        self.tick(key, NOW, waited=False)
+        # fresh: a wait on it, but the controller's record is younger than STALE_RUN_REREAD
+        for t in range(0, gg.STALE_RUN_REREAD, gg.TICK):
+            self.tick(key, NOW + t)
+        self.assertEqual(self.gh.rest_calls(), [], "a fresh entry costs no REST")
+        # old enough, but nobody waits on it: the REST_SAFETY net is enough for a reader that only looks
+        self.tick(key, NOW + gg.STALE_RUN_REREAD + 1, waited=False)
+        self.assertEqual(self.gh.rest_calls(), [])
+        # a controller update keeps it fresh: no read while it keeps changing
+        self.ctl.runs[61] = ctl_run(61, "in_progress", "", iso(now - 30))
+        self.tick(key, NOW + gg.STALE_RUN_REREAD + 2)
+        self.tick(key, NOW + 2 * gg.STALE_RUN_REREAD)
+        self.assertEqual(self.gh.rest_calls(), [])
+
+    def test_a_still_running_run_is_reread_once_per_period(self) -> None:
+        now = time.time()
+        key = "run:o/r/62"
+        self.in_progress(62, now - 600)
+        self.request("run", "o/r/62", timeout=3600)
+        self.tick(key, NOW)
+        start = NOW + gg.STALE_RUN_REREAD + 1
+        self.tick(key, start)
+        self.assertEqual(len(self.gh.rest_calls()), 1)
+        for t in range(gg.TICK, gg.STALE_RUN_REREAD, gg.TICK):
+            self.tick(key, start + t)
+        self.assertEqual(len(self.gh.rest_calls()), 1, "a read resets the clock: one per STALE_RUN_REREAD")
+        self.tick(key, start + gg.STALE_RUN_REREAD)
+        self.assertEqual(len(self.gh.rest_calls()), 2)
+        self.assertIn("If-None-Match", self.gh.rest_calls()[-1][2], "conditional: an unchanged run answers a free 304")
+
+    def test_a_run_wait_marks_its_watch_before_the_controller_long_poll(self) -> None:
+        """subscribe_wait long-polls the controller (up to CONTROLLER_RUN_MAX_WAIT) before it leaves its request: the
+        daemon must already see the wait, and keep seeing it through that poll, or a lost finish waits it out."""
+        key = "run:o/r/67"
+        seen: list = []
+
+        def long_poll(k: str, timeout: float) -> None:
+            seen.append(gg.read_json(gg.watch_dir() / gg.file_name(k)))
+
+        with mock.patch.object(gg, "controller_wait_run", side_effect=long_poll), \
+                mock.patch.object(gg, "block", side_effect=SystemExit(9)), mock.patch.object(gg, "say_waiting"):
+            with self.assertRaises(SystemExit):
+                gg.subscribe_wait("run", "o/r/67", "green", 600, False, False, None, gg.RESCUE_GRACE)
+        self.assertTrue(seen and isinstance(seen[0].get("waitedAt"), float), seen)
+        e = {"key": key, "waitedAt": seen[0]["waitedAt"]}
+        self.daemon.now = seen[0]["waitedAt"] + gg.CONTROLLER_RUN_MAX_WAIT  # the long-poll's whole length
+        self.assertTrue(self.daemon.waited(e))
+
+    def test_a_long_poll_that_ends_on_the_same_in_progress_record_keeps_its_age(self) -> None:
+        key = "run:o/r/68"
+        old = time.time() - 400
+        updated = iso(time.time() - 600)
+        gg.write_json(gg.cache_dir() / gg.file_name(key), {
+            "key": key, "fetchedAt": old, "dataAt": old, "restAt": old, "source": "controller", "error": None,
+            "data": gg.controller_run(ctl_run(68, "in_progress", "", updated))})
+        controller = mock.Mock()
+        controller.run.return_value = ctl_run(68, "in_progress", "", updated)
+        with mock.patch.object(gg.Controller, "from_env", return_value=controller):
+            entry = gg.controller_wait_run(key, 5)
+        self.assertEqual((entry["dataAt"], entry["restAt"]), (old, old), "an unchanged record is not new data")
+        self.assertGreater(entry["fetchedAt"], old)
+        controller.run.return_value = ctl_run(68, "in_progress", "", iso(time.time()))
+        with mock.patch.object(gg.Controller, "from_env", return_value=controller):
+            entry = gg.controller_wait_run(key, 5)
+        self.assertGreater(entry["dataAt"], old, "a changed record is")
+
+    def test_a_downstream_wait_marks_the_upstream_watch(self) -> None:
+        out = io.StringIO()
+        with mock.patch.object(gg, "daemon_running", lambda grace=0.0: True), \
+                mock.patch.object(gg, "daemon_failing", lambda: None), contextlib.redirect_stdout(out):
+            gg.cmd_read(json.dumps({"keys": [{"key": "run:o/r/64", "jobs": False, "wait": True},
+                                             {"key": "run:o/r/65", "jobs": False}]}))
+        self.assertTrue(gg.read_json(gg.watch_dir() / gg.file_name("run:o/r/64")).get("waitedAt"))
+        self.assertIsNone(gg.read_json(gg.watch_dir() / gg.file_name("run:o/r/65")).get("waitedAt"))
+        with self.assertRaises(gg.WatchError):
+            gg.read_request(json.dumps({"keys": [{"key": "run:o/r/64", "wait": "yes"}]}))
+        asked: list[dict] = []
+        daemon = gg.Daemon(transport=self.gh, token=lambda: self.fail("read a token"), controller=None,
+                           upstream=lambda req: asked.append(req) or {"entries": {}})
+        self.request("run", "o/r/66", timeout=3600)
+        daemon.tick(now=time.time())
+        keys = {k["key"]: k for k in asked[0]["keys"]}
+        self.assertEqual(keys["run:o/r/66"].get("wait"), True)
+        self.assertNotIn("wait", keys["run:o/r/65"])
+
+
 if __name__ == "__main__":
     unittest.main()

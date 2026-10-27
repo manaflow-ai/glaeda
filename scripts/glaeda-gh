@@ -290,6 +290,13 @@ CONTROLLER_FEED_EVERY = 20  # seconds between change-feed reads: each request co
 # whois, and 18 hosts at one read per tick drove tailscaled into a kernel panic on cmux-lawrence (10-07)
 CONTROLLER_RETRY = 60  # after a failure, the controller is left alone this long, doubling up to CONTROLLER_ABSENT
 REST_SAFETY = 900  # a run the controller tracks is still read over REST this often (a lost delivery)
+# A run the controller still shows queued or in progress, that a wait is blocked on, and that neither changed nor
+# was read from GitHub for this long, is read once more (a lost completion delivery: manaflow-ai/cmux run
+# 40557947333, 2026-10-27, finished on GitHub while the controller kept it in_progress and its waiter blocked).
+STALE_RUN_REREAD = 180
+# A watch counts as waited on this long after a wait (or a downstream's) last registered it: past the client's
+# controller long-poll (subscribe_wait), which registers once before it blocks, and the daemon's touches after it.
+WAIT_INTEREST = CONTROLLER_RUN_MAX_WAIT + 2 * TOUCH_EVERY
 CONTROLLER_ABSENT = 900  # a controller without the run-events receiver (404, 503) is asked again this rarely
 FEED_PAGES = 5  # feed pages read per tick at most; a longer backlog continues on the next tick
 NUDGE_MIN = 20  # a PR a check event nudged is re-read at most this often (GraphQL points)
@@ -503,20 +510,25 @@ def bounded_lock(path: Path, seconds: float = LOCK_WAIT):
             handle.close()
 
 
-def register(key: str, jobs: bool = False, consumer: str | None = None) -> None:
+def register(key: str, jobs: bool = False, consumer: str | None = None, waited: bool = False) -> None:
     """Record interest in `key`. Wanting jobs is sticky while any reader wants them. A head's readers
-    are named consumers, each with the time it last asked."""
+    are named consumers, each with the time it last asked. A wait marks the watch waitedAt: the daemon
+    re-reads a waited run the controller may have lost the finish of (STALE_RUN_REREAD)."""
     path = watch_dir() / file_name(key)
     watch_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
     # read-modify-write: two sessions must not lose each other. Unheld, the write still happens --
     # losing a concurrent registration costs one watch, and waiting costs the gh call.
     with bounded_lock(watch_dir() / ".register.lock"):
-        _register_locked(path, key, jobs, consumer)
+        _register_locked(path, key, jobs, consumer, waited)
 
 
-def _register_locked(path: Path, key: str, jobs: bool, consumer: str | None) -> None:
+def _register_locked(path: Path, key: str, jobs: bool, consumer: str | None, waited: bool = False) -> None:
     prior = read_json(path) or {}
     doc: dict[str, Any] = {"key": key, "jobs": bool(jobs or prior.get("jobs"))}
+    if waited:
+        doc["waitedAt"] = time.time()
+    elif isinstance(prior.get("waitedAt"), (int, float)):
+        doc["waitedAt"] = prior["waitedAt"]
     if consumer:
         asked = prior.get("consumers") if isinstance(prior.get("consumers"), dict) else {}
         now = time.time()
@@ -709,8 +721,9 @@ def run_upstream(command: list[str], request: dict) -> dict:
     return answer
 
 
-def read_request(text: str) -> list[tuple[str, bool]]:
-    """The (key, jobs) pairs of one upstream request line; WatchError on anything else."""
+def read_request(text: str) -> list[tuple[str, bool, bool]]:
+    """The (key, jobs, wait) triples of one upstream request line; WatchError on anything else. `wait` (optional)
+    says a wait downstream is blocked on the key, so this host's daemon treats it as waited (STALE_RUN_REREAD)."""
     try:
         doc = json.loads(text)
     except ValueError:
@@ -722,20 +735,21 @@ def read_request(text: str) -> list[tuple[str, bool]]:
     for item in keys:
         key = item.get("key") if isinstance(item, dict) else None
         jobs = item.get("jobs", False) if isinstance(item, dict) else None
+        wait = item.get("wait", False) if isinstance(item, dict) else None
         kind = key.split(":", 1)[0] if isinstance(key, str) else None
-        if kind not in UPSTREAM_KINDS or not isinstance(jobs, bool):
+        if kind not in UPSTREAM_KINDS or not isinstance(jobs, bool) or not isinstance(wait, bool):
             raise WatchError(f"read serves {', '.join(UPSTREAM_KINDS)} keys, not {str(key)[:80]!r}")
         target = key.split(":", 1)[1]
         if not re.fullmatch(rf"{NAME}/{NAME}[#/]\d+", target) or parse_key(kind, target) != key:
             raise WatchError(f"not a key: {key[:80]!r}")
-        out.append((key, jobs))
+        out.append((key, jobs, wait))
     return out
 
 
 def cmd_read(text: str) -> int:
     """`read`: register each key (sessions' interest, as `status` does) and print what the cache holds
     now, never waiting and never reading GitHub. The other end of an upstream (UPSTREAM_CONFIG)."""
-    pairs = read_request(text)
+    triples = read_request(text)
     if not daemon_running(grace=DOWN_GRACE):
         print(json.dumps({"error": "glaeda-gh is not running on the upstream host"}))
         return EXIT_DOWN
@@ -744,8 +758,8 @@ def cmd_read(text: str) -> int:
         print(json.dumps({"error": failing_message(broken)[:UPSTREAM_ERROR_MAX]}))
         return EXIT_DOWN
     entries: dict[str, Any] = {}
-    for key, jobs in pairs:
-        register(key, jobs)
+    for key, jobs, wait in triples:
+        register(key, jobs, waited=wait)
         cached = read_cache(key)
         entries[key] = None if cached is None else {
             k: cached.get(k) for k in ("data", "dataAt", "error", "fetchedAt", "jobs", "missing", "restRun") if k in cached}
@@ -1790,9 +1804,16 @@ class Daemon:
                 path.unlink(missing_ok=True)
                 continue
             asked = doc.get("consumers") if isinstance(doc.get("consumers"), dict) else {}
+            waited = doc.get("waitedAt") if isinstance(doc.get("waitedAt"), (int, float)) else None
             out.append({"key": key, "jobs": bool(doc.get("jobs")), "cache": cached, "touched": self.now - age,
+                        "waitedAt": waited,
                         "consumers": {str(k): float(v) for k, v in asked.items() if isinstance(v, (int, float))}})
         return out
+
+    def waited(self, e: dict) -> bool:
+        """Whether a wait here (or downstream, through an upstream read) registered the watch lately."""
+        at = e.get("waitedAt")
+        return isinstance(at, (int, float)) and self.now - at < WAIT_INTEREST
 
     def due(self, kind: str, entries: list[dict]) -> list[dict]:
         mine = [e for e in entries if e["key"].startswith(kind + ":")]
@@ -1850,7 +1871,12 @@ class Daemon:
                 # Otherwise the controller answered on this tick: REST only as the safety net. A failed read leaves
                 # each of these true (restAt keeps its time), so a key is read at most once a cycle.
                 paced = self.now - self.attempted.get(e["key"], float("-inf")) >= self.policy["cycles"][kind]
-                if failed or (paced and (confirm or self.now - (c.get("restAt") or 0) >= REST_SAFETY)):
+                # Still queued or in progress by the controller's word, a wait blocked on it, and nothing new
+                # from either source for STALE_RUN_REREAD: its finish may be a lost delivery, and REST_SAFETY is
+                # too long for a waiter to sit on it. One read (an unchanged run answers 304, which is free).
+                stale = (not terminal(kind, data) and self.waited(e)
+                         and self.now - max(c.get("dataAt") or 0, c.get("restAt") or 0) >= STALE_RUN_REREAD)
+                if failed or (paced and (confirm or stale or self.now - (c.get("restAt") or 0) >= REST_SAFETY)):
                     out.append(e)
                 continue
             if c is None:
@@ -2087,7 +2113,8 @@ class Daemon:
         return self.finish_tick(entries, kinds["pr"], kinds["run"], kinds["comment"], [])
 
     def upstream_read(self, ask: Callable[[dict], dict], due: list[dict]) -> None:
-        request = {"keys": [{"key": e["key"], "jobs": e["jobs"]} for e in due]}
+        request = {"keys": [{"key": e["key"], "jobs": e["jobs"], **({"wait": True} if self.waited(e) else {})}
+                            for e in due]}
         try:
             answer = ask(request)
             got = answer.get("entries") if isinstance(answer, dict) else None
@@ -2158,7 +2185,7 @@ class Daemon:
         # LOCK_WAIT, not LOCK_WAIT per waiter.
         with lock_budget(LOCK_WAIT):
             for key, jobs in touch.items():
-                register(key, jobs)
+                register(key, jobs, waited=True)
         # What a blocker killed after its wake, or a wait handed back to Python, left behind.
         for left in d.glob("*.*"):
             rid = left.name.split(".", 1)[0]
@@ -3919,7 +3946,7 @@ def poll_wait(req: dict) -> int:
             warned = True
         now = time.monotonic()
         if now - touched >= TOUCH_EVERY:
-            register(req["key"], jobs)
+            register(req["key"], jobs, waited=True)
             touched = now
         done = wait_step(req, time.time())
         if done is not None:
@@ -3988,7 +4015,7 @@ def write_wait_request(kind: str, target: str, until: str, timeout: float, jobs:
     rid = f"{pid}-{os.urandom(4).hex()}"
     waits_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
     os.mkfifo(waits_dir() / f"{rid}.fifo", 0o600)
-    register(req["key"], jobs)
+    register(req["key"], jobs, waited=True)
     write_json(waits_dir() / f"{rid}.json", {**req, "pid": pid, "touched": req["began"]})
     return rid
 
@@ -4043,7 +4070,15 @@ def controller_wait_run(key: str, timeout: float) -> dict | None:
         now = time.time()
         rest_at = (prior.get("restAt") if prior.get("source") == "controller"
                    and isinstance(prior.get("restAt"), (int, float)) else now)
-        entry = {"key": key, "fetchedAt": now, "dataAt": now, "restAt": rest_at,
+        # An unchanged queued or in-progress record keeps its time, as apply_run's does: a long-poll that ends
+        # on the same stale record must not make it look fresh and push back the daemon's STALE_RUN_REREAD.
+        data_at = now
+        if (not terminal("run", candidate) and isinstance(prior.get("dataAt"), (int, float))
+                and all(prior_data.get(k) == candidate.get(k) for k in ("status", "conclusion", "run_attempt", "updated_at"))):
+            data_at = prior["dataAt"]
+            if isinstance(prior.get("restAt"), (int, float)):
+                rest_at = prior["restAt"]
+        entry = {"key": key, "fetchedAt": now, "dataAt": data_at, "restAt": rest_at,
                  "data": candidate, "error": None, "source": "controller"}
         for field in ("etag", "jobs", "jobsEtag", "jobsAt", "jobsTried", "restParts", "restRun"):
             if field in prior:
@@ -4074,6 +4109,8 @@ def subscribe_wait(kind: str, target: str, until: str, timeout: float, jobs: boo
     say_waiting(waiting_line(key, until, sha, exact, timeout))
     req = wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace)
     if kind == "run" and not jobs:
+        # the daemon keeps reading while this blocks (a lost finish is re-read past STALE_RUN_REREAD)
+        register(key, jobs, waited=True)
         started = time.monotonic()
         controller_wait_run(key, timeout)
         done = wait_step(req, time.time())
@@ -4127,7 +4164,7 @@ def resume_wait(rid: str) -> int:
         return EXIT_DOWN
     left = float(req["began"]) + float(req["timeout"]) - time.time()
     if left > 0 and serving_waits():
-        register(req["key"], bool(req.get("jobs")))
+        register(req["key"], bool(req.get("jobs")), waited=True)
         block(rid, left)
     drop_wait(rid)
     return poll_wait(req)
