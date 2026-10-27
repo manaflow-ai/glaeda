@@ -42,8 +42,10 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import fcntl
+import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import signal
@@ -88,6 +90,11 @@ PACK_LIMIT = 24
 SOURCE_CONFIG = ".config/glaeda/lan-cache/config.json"
 SOURCES = ("direct",)
 REPACK_TIMEOUT = 1200
+# A release reaches every mini of a site at once and setup writes their source together, so a host's first seed
+# (no mirror at all) waits SEED_SLOT_S times a slot fixed by its name, from the first pass that found no mirror:
+# a site's minis seed over its uplink one or two at a time, within SEED_SLOTS * SEED_SLOT_S. A repair never waits.
+SEED_SLOTS = 8
+SEED_SLOT_S = 600
 CONFIG = {
     "core.bare": "true",
     "gc.auto": "0",
@@ -620,6 +627,34 @@ def source(home: Path | None = None) -> str:
     return raw["source"]
 
 
+SEED_AFTER = ".first-seed-after"
+
+
+def seed_wait(home: Path | None = None, now: float | None = None, *, keep: bool = True) -> float:
+    """Seconds until this host's first-seed slot opens (0 when open).
+
+    The deadline is set once, the first time a pass finds no mirror, at now plus this host's slot, and kept in
+    GIT_DIR/SEED_AFTER (beside, never inside, the mirror), so touching the source config never moves it and a
+    mirror that later disappears is reseeded at once. A deadline further out than one host's longest slot (the
+    clock was ahead when it was written) is pulled back to now plus the slot: the wait is never more than
+    SEED_SLOTS * SEED_SLOT_S. `keep` False (plan mode) writes nothing."""
+    now = time.time() if now is None else now
+    host = platform.node().split(".")[0].lower()
+    slot = int.from_bytes(hashlib.sha256(host.encode()).digest()[:4], "big") % SEED_SLOTS
+    path = GIT_DIR / SEED_AFTER
+    try:
+        deadline = float(path.read_text().strip())
+    except (OSError, ValueError):
+        deadline = None
+    if deadline is None or deadline > now + SEED_SLOTS * SEED_SLOT_S:
+        deadline = now + slot * SEED_SLOT_S
+        if keep:
+            with_suppressed(lambda: GIT_DIR.mkdir(parents=True, exist_ok=True))
+            incoming = GIT_DIR / f".{SEED_AFTER}.{os.getpid()}"
+            with_suppressed(lambda: (incoming.write_text(f"{deadline:.0f}\n"), incoming.rename(path)))
+    return max(0.0, deadline - now)
+
+
 def run(apply: bool, *, wait: bool = False, from_github: bool = False, home: Path | None = None) -> dict:
     record: dict = {"time": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "mirror": os.fspath(MIRROR)}
@@ -629,6 +664,9 @@ def run(apply: bool, *, wait: bool = False, from_github: bool = False, home: Pat
     if not record["source"]:
         return {**record, "state": "skipped", "reason": f"no mirror source in ~/{SOURCE_CONFIG}"}
     problem = healthy(MIRROR)
+    if problem == "missing" and not (MIRROR.exists() or MIRROR.is_symlink()) \
+            and (left := seed_wait(home, keep=apply)) > 0:
+        return {**record, "state": "skipped", "reason": f"first seed waits for this host's slot: {left:.0f} s"}
     if not apply:
         return {**record, "state": "plan", "health": problem or "ok",
                 "would": f"seed from the R2 bundle ({problem}), then fetch" if problem else "fetch"}

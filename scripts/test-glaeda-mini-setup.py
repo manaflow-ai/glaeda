@@ -1144,6 +1144,35 @@ class MiniSetupTest(unittest.TestCase):
                            os.fspath(daemon_dir / "x.plist")], commands)
             self.assertIn([ms.SUDO, "/bin/launchctl", "bootout", "system/com.teamleaderleo.glaeda.update"], commands)
 
+    def test_a_runner_host_gets_the_git_mirror_source_once(self) -> None:
+        """A macOS host with a GitHub Actions runner gets glaeda-git-mirror's source config (direct) when it has none;
+        an existing one (an operator's lan config) is never rewritten, and a host without a runner, a --gh-only
+        host and Linux get none."""
+        ctx = ms.Context(self.home, True, "/usr/bin/python3", True, self.reclaim, None, None,
+                         ms.CMUX_XCODE_APP, 50, hygiene_only=True, platform_name="macos")
+        self.assertIsNone(ms.git_mirror_source_action(ctx))
+        runner = self.home / "actions-runner-glaeda-2"
+        runner.mkdir()
+        (runner / ".runner").write_text("{}")
+        act = ms.git_mirror_source_action(ctx)
+        self.assertEqual((act["state"], act["value"]), ("create", {"schema": 1, "source": "direct"}))
+        self.assertIn(act, ms.plan_install(ctx))
+        ms.apply_install(ctx, [act])
+        path = self.home / ".config/glaeda/lan-cache/config.json"
+        self.assertEqual(json.loads(path.read_text()), {"schema": 1, "source": "direct"})
+        lan = {"schema": 1, "source": "lan", "host": "cmux15", "user": "cmux", "addresses": ["10.0.0.5"]}
+        path.write_text(json.dumps(lan))
+        self.assertEqual(ms.git_mirror_source_action(ctx)["state"], "unchanged")
+        ms.apply_install(ctx, [ms.git_mirror_source_action(ctx)])
+        self.assertEqual(json.loads(path.read_text()), lan)
+        path.unlink()
+        gh_only = ms.Context(self.home, True, "/usr/bin/python3", True, self.reclaim, None, None,
+                             ms.CMUX_XCODE_APP, 50, gh_only=True, platform_name="macos")
+        self.assertIsNone(ms.git_mirror_source_action(gh_only))
+        linux = ms.Context(self.home, True, "/usr/bin/python3", True, self.reclaim, None, None,
+                           ms.CMUX_XCODE_APP, 50, hygiene_only=True, platform_name="linux")
+        self.assertIsNone(ms.git_mirror_source_action(linux))
+
     def test_headless_install_stages_and_installs_a_plist(self) -> None:
         daemon_dir = self.home / "Library/LaunchDaemons"
         with mock.patch.object(ms, "SYSTEM_DAEMON_DIR", daemon_dir):

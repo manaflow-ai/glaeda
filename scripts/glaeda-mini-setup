@@ -60,6 +60,8 @@ What --apply installs (templated for the current user):
     ~/.local/bin/glaeda-wallpaper-rotate       from scripts/glaeda-wallpaper-rotate (operator-supplied stills, every 30 minutes)
     ~/.local/bin/glaeda-runner-hygiene         from scripts/glaeda-runner-hygiene (root-installed per-account cache policy)
     ~/.claude/skills/github-ci-wait/SKILL.md    from skills/github-ci-wait: tells agent sessions to wait with glaeda-gh
+    ~/.config/glaeda/lan-cache/config.json     on a macOS host with a GitHub Actions runner: glaeda-git-mirror's
+                                               source {"schema": 1, "source": "direct"}, written once when absent
     ~/.config/glaeda/update.json               its release ring and source, written once (--ota-ring canary|stable,
                                                --ota-source teamleaderleo/glaeda|manaflow-ai/glaeda)
     ~/Library/LaunchAgents/com.teamleaderleo.glaeda.{disk-pressure,idle-repair,disk-dedupe,worktree-reclaim,fleet-cas-prune,seed-prefetch,git-mirror,lan-fetch,
@@ -1042,6 +1044,24 @@ def update_config(ctx: Context) -> dict[str, Any]:
     return {**config, "source": ctx.ota_source} if ctx.ota_source else config
 
 
+# glaeda-git-mirror runs only where ~/.config/glaeda/lan-cache/config.json names a source. A host with a GitHub
+# Actions runner gets source "direct" (GitHub and the R2 bundle), written once and never overwritten, so an
+# operator's "lan" config (glaeda-seed-lan cache) stays. glaeda-git-mirror spreads each host's first seed.
+GIT_MIRROR_SOURCE = {"schema": 1, "source": "direct"}
+
+
+def git_mirror_source_action(ctx: Context) -> dict[str, Any] | None:
+    """A create action for the mirror's source config on a macOS runner host without one, else None."""
+    if ctx.gh_only or ctx.platform == "linux" or not any(
+            (runner / ".runner").is_file() for runner in ctx.home.glob("actions-runner*")):
+        return None
+    path = ctx.home / ".config/glaeda/lan-cache/config.json"
+    act: dict[str, Any] = {"kind": "config", "path": os.fspath(path), "mode": "0o644"}
+    if path.exists() or path.is_symlink():
+        return {**act, "state": "unchanged"}
+    return {**act, "state": "create", "value": GIT_MIRROR_SOURCE}
+
+
 def update_config_action(ctx: Context) -> dict[str, Any]:
     """Preserve hand edits; explicit ring, source and role flags update their owned fields."""
     path = ctx.update_config
@@ -1305,6 +1325,8 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
         actions += plan_hygiene_tools(ctx)
     plan_agents(ctx, actions)
     actions.append(update_config_action(ctx))
+    if (mirror_source := git_mirror_source_action(ctx)) is not None:
+        actions.append(mirror_source)
     mark_owned(ctx, actions)
     if not ctx.gh_only:
         plan_host_defaults(ctx, actions)
