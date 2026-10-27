@@ -610,12 +610,47 @@ def apply_instance(member: str, instance: int, repo: str | None, extra: list[str
     return result
 
 
+def apply_dedicated(member: str, entry: dict[str, Any], extra: list[str]) -> dict[str, Any]:
+    """Apply one runner.dedicated runner (glaeda-cmux-runner --dedicated): a token for its own scope, piped over SSH.
+    A dedicated runner with a job is never stopped: its plan blocks a relabel and its agent step waits for idle."""
+    token = mint(scope_api(entry["repo"], entry["org"]))
+    if token is None:
+        return {"dedicated": entry["name"], "exit": None,
+                "state": f"no registration token (gh admin on {entry['org'] or entry['repo']}?); nothing changed"}
+    scope = (f"--org {_quote(entry['org'])}" + (f" --group {_quote(entry['group'])}" if entry["group"] else "")
+             if entry["org"] else f"--repo {_quote(entry['repo'])}")
+    version, sha, _ = latest_release()
+    # GitHub's labels for it, so a mini without gh sees a match and never re-registers it (#1645)
+    labels = github_labels(scope_api(entry["repo"], entry["org"]), f"{member}-glaeda-{entry['name']}")
+    observed = f"--github-labels={_quote(labels)} " if labels is not None else ""
+    remote = (f"~/{REMOTE_DIR}/scripts/glaeda-cmux-runner --apply --token-stdin {scope} "
+              f"--manifest ~/{REMOTE_DIR}/mini-fleet.json --member {_quote(member)} --dedicated {_quote(entry['name'])} "
+              f"--latest-runner-version {_quote(version)} --latest-runner-sha256 {_quote(sha)} {observed}--output json "
+              + " ".join(_quote(a) for a in extra if a != "--headless"))
+    code, out, err = run(["ssh", *SSH_OPTIONS, member, remote], APPLY_TIMEOUT_S, stdin=token + "\n")
+    del token
+    try:
+        acts = {a["kind"]: a for a in json.loads(out).get("actions", []) if isinstance(a, dict) and "kind" in a}
+        state = f"{acts.get('register', {}).get('state', '?')}/{acts.get('verify', {}).get('state', '?')}"
+        name = acts.get("register", {}).get("name")
+    except (ValueError, TypeError, AttributeError):
+        state, name = f"no receipt: {(err or out).strip()[-200:]}", None
+    if code != 0:
+        state = f"{state} ({_failed_note(out, err, code)})"
+    return {"dedicated": entry["name"], "exit": code, "state": state, "name": name}
+
+
 def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, manifest: dict[str, Any],
                scratch: Path) -> dict[str, Any]:
     started = time.monotonic()
     eligible, why = check(member, summary)
     row: dict[str, Any] = {"member": member, "class": summary["class"], "runners": summary.get("runners", 1),
                            "capacityUnits": summary.get("capacityUnits"), "eligible": eligible, "gate": why}
+    dedicated, bad = load_labels().dedicated_runners(manifest, member)
+    row["dedicated"] = [d["name"] for d in dedicated]
+    if bad:
+        row["eligible"], row["action"] = False, f"bad runner.dedicated: {bad}"
+        return row
     if eligible is None:
         row["eligible"], row["action"] = False, "unreachable"
         return row
@@ -646,6 +681,8 @@ def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, m
     with concurrent.futures.ThreadPoolExecutor(max_workers=row["runners"]) as pool:
         results = list(pool.map(lambda k: apply_instance(member, k, args.repo, extra, args.org, args.group,
                                                          args.migrate_from_repo), range(row["runners"])))
+    # a dedicated runner keeps its own scope (never --org/--migrate-from-repo) and its own labels
+    results += [apply_dedicated(member, entry, extra) for entry in dedicated]
     row["instances"] = results
     row["action"] = "applied" if all(r["exit"] == 0 for r in results) else "failed"
     row["seconds"] = round(time.monotonic() - started, 1)
@@ -660,8 +697,10 @@ def render(rows: list[dict[str, Any]], skipped: dict[str, str], applied: bool, g
         lines.append(f"  {row['member']:<22} {row['class']:<5} {units:<20} {row['action']:<24} {row['gate']}")
         if any(str(i.get("state", "")).startswith("NO RUNNER") for i in row.get("instances", [])):
             lines.append(f"      {row['member']} has instances with no runner: re-run for this member")
+        if row.get("dedicated") and not row.get("instances"):
+            lines.append(f"      dedicated: {', '.join(row['dedicated'])}")
         for inst in row.get("instances", []):
-            lines.append(f"      {inst['instance']}: exit={inst['exit']} {inst['state']}  {inst.get('name') or ''}")
+            lines.append(f"      {inst.get('instance', inst.get('dedicated'))}: exit={inst['exit']} {inst['state']}  {inst.get('name') or ''}")
     for member, why in sorted(skipped.items()):
         lines.append(f"  {member:<22} not a runner member: {why}")
     total = sum(r["runners"] for r in rows if r.get("eligible"))

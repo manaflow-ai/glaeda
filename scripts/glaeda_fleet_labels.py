@@ -329,3 +329,88 @@ def declared_pools(manifest: Any, xcode_ok: Callable[[str, dict[str, Any]], bool
         for label in [*(summary or {}).get("pools", []), *(summary or {}).get("devPools", [])]:
             out.setdefault(label, []).append(member)
     return {label: sorted(members) for label, members in sorted(out.items())}
+
+
+# A host's runner.dedicated list (in its overrides, or the defaults) declares runners that are not pool instances: a
+# builder that takes one job shape, such as cmux's nightly-next app build or the iOS internal archive. glaeda-cmux-runner
+# --dedicated NAME installs each one like an instance (glaeda's release, .path, hooks, gate, disk floor, OTA hook
+# refresh), but with exactly the labels listed (no self-hosted, macOS or pool label, so no other job can land on it),
+# its own repo or org scope, and its own admission: the job-started hook runs glaeda's checks, then the entry's admit
+# command, and refuses the job when that fails. watch, when given, is the builder's own loop, run as a glaeda
+# LaunchAgent beside the runner. env goes into the runner's .env and the watch loop's environment; "{runnerDir}" in a
+# value is the runner's directory. A leading "~/" in a command word or env value is the runner user's home.
+DEDICATED_NAME_RE = r"[a-z][a-z0-9-]{0,39}"  # starts with a letter: never read as a pool instance number
+RUNNER_LABEL_RE = r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}"
+ENV_NAME_RE = r"[A-Z_][A-Z0-9_]{0,63}"
+DEFAULT_LABELS = ("self-hosted", "macos", "arm64", MINI_LABEL)
+
+
+def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]], str | None]:
+    """([{name, repo, org, group, labels, admit, watch, env}], None), or ([], why the member's list is unusable).
+    Pure. A member with no runner.dedicated has none."""
+    hosts = manifest.get("hosts") if isinstance(manifest, dict) else None
+    host = hosts.get(member) if isinstance(hosts, dict) else None
+    if not isinstance(host, dict):
+        return [], f"{member} is not a member in the manifest"
+    defaults, overrides = manifest.get("defaults") or {}, host.get("overrides") or {}
+    if not isinstance(defaults, dict) or not isinstance(overrides, dict):
+        return [], f"manifest defaults or {member} overrides is not an object"
+    runner = merge(defaults, overrides).get("runner")
+    entries = runner.get("dedicated", []) if isinstance(runner, dict) else []
+    if not isinstance(entries, list):
+        return [], f"{member} runner.dedicated must be a list"
+    if entries and host.get("gui") is False:
+        # a dedicated runner is a LaunchAgent in the user's GUI session; the headless supervisor is not wired for it
+        return [], f"{member} has gui: false; runner.dedicated runs only on a member with a GUI session"
+    out: list[dict[str, Any]] = []
+    pools: set[str] | None = None  # every pool label the manifest declares, read once when there is an entry
+    for index, entry in enumerate(entries):
+        where = f"{member} runner.dedicated[{index}]"
+        if not isinstance(entry, dict):
+            return [], f"{where} is not an object"
+        unknown = sorted(set(entry) - {"name", "repo", "org", "group", "labels", "admit", "watch", "env", "note"})
+        if unknown:
+            return [], f"{where} has unknown keys: {', '.join(unknown)}"
+        name, repo, org, group = entry.get("name"), entry.get("repo"), entry.get("org"), entry.get("group")
+        if not isinstance(name, str) or not re.fullmatch(DEDICATED_NAME_RE, name):
+            return [], f"{where}.name must match {DEDICATED_NAME_RE}"
+        if name in {d["name"] for d in out}:
+            return [], f"{where}.name {name} is declared twice"
+        if (repo is None) == (org is None):
+            return [], f"{where} needs exactly one of repo (owner/name) and org"
+        if repo is not None and not (isinstance(repo, str) and re.fullmatch(REPO_RE, repo)):
+            return [], f"{where}.repo must be owner/name"
+        if org is not None and not (isinstance(org, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*", org)):
+            return [], f"{where}.org must be an organization login"
+        if group is not None and (org is None or not isinstance(group, str) or not group.strip()):
+            return [], f"{where}.group goes with org"
+        labels = entry.get("labels")
+        if not (isinstance(labels, list) and labels and all(isinstance(x, str) and re.fullmatch(RUNNER_LABEL_RE, x)
+                                                            for x in labels)):
+            return [], f"{where}.labels must be a non-empty list of runner labels"
+        if len(set(labels)) != len(labels) or any(x.lower() in DEFAULT_LABELS for x in labels):
+            return [], (f"{where}.labels must be distinct and leave out {', '.join(DEFAULT_LABELS)}: a dedicated "
+                        "runner takes only the jobs that name its own labels")
+        if pools is None:
+            pools = {label.lower() for label in declared_pools(manifest)}
+        shared = sorted(x for x in labels if x.lower() in pools)
+        if shared:
+            return [], (f"{where}.labels must leave out the manifest's pool labels ({', '.join(shared)}): a pool job "
+                        "would land on the builder, outside pool capacity and reservations")
+        commands = {}
+        for key in ("admit", "watch"):
+            argv = entry.get(key)
+            if argv is None and key == "watch":
+                continue
+            if not (isinstance(argv, list) and argv and all(isinstance(w, str) and w and "\n" not in w and "\0" not in w
+                                                           for w in argv)
+                    and (argv[0].startswith("/") or argv[0].startswith("~/"))):
+                return [], f"{where}.{key} must be a command (a list of words, the first an absolute or ~/ path)"
+            commands[key] = list(argv)
+        env = entry.get("env", {})
+        if not (isinstance(env, dict) and all(isinstance(k, str) and re.fullmatch(ENV_NAME_RE, k) and isinstance(v, str)
+                                              and "\n" not in v and "\0" not in v for k, v in env.items())):
+            return [], f"{where}.env must map NAME to a one-line string"
+        out.append({"name": name, "repo": repo, "org": org, "group": group, "labels": list(labels),
+                    "admit": commands["admit"], "watch": commands.get("watch"), "env": dict(env)})
+    return out, None

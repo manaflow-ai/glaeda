@@ -192,8 +192,9 @@ NO_RUNNER_HEAL = STATE_DIR / "daemon-heal-attempt.json"  # the last daemon-heal 
 KILL_SWITCH = HOME / ".config/glaeda/mini-health.disabled"
 AGENTS = HOME / "Library/LaunchAgents"
 HELD = HOME / ".local/state/glaeda/mini-fleet/runner-held"  # cmux_mini_fix.sh runner_hold's marks
-RUNNER_AGENT = re.compile(r"com\.teamleaderleo\.glaeda\.cmux-runner(?:\.\d+)?")
-RUNNER_DIR = re.compile(r"actions-runner-glaeda(?:-(\d+))?")
+# an instance (.K) or a dedicated runner (.dedicated.NAME, glaeda-cmux-runner --dedicated; never its .watch agent)
+RUNNER_AGENT = re.compile(r"com\.teamleaderleo\.glaeda\.cmux-runner(?:\.\d+|\.dedicated\.[a-z][a-z0-9-]*)?")
+RUNNER_DIR = re.compile(r"actions-runner-glaeda(?:-(\d+|[a-z][a-z0-9-]*))?")
 RUNNER_PIN = "2.338.0"  # glaeda-cmux-runner's PINNED_RUNNER_VERSION; a test keeps the two equal
 RUNNER_VERSION_RE = r"[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}"
 RUNNER_RECEIPTS = ".local/state/glaeda/cmux-runner"  # glaeda-cmux-runner's install receipts, under HOME
@@ -1364,7 +1365,7 @@ def check_tailscale(mini: Mini) -> list[dict[str, Any]]:
 def check_runners(mini: Mini) -> list[dict[str, Any]]:
     out = []
     for doc in mini.runner_registrations():
-        agent = re.fullmatch(r"actions-runner-glaeda(?:-(\d+))?", doc["dir"])
+        agent = RUNNER_DIR.fullmatch(doc["dir"])
         agent = (agent.group(1) or "0") if agent else doc["dir"]
         out.append(finding(f"registration_deleted:{agent}", "error",
                            f"GitHub deleted runner {doc.get('runner') or doc['dir']}'s registration "
@@ -1372,7 +1373,7 @@ def check_runners(mini: Mini) -> list[dict[str, Any]]:
                            "the mini holds no admin token: re-register it from an operator host "
                            "(glaeda-cmux-runner with a runner token); the gate retries every 10 minutes"))
     for label, loaded, running, last in mini.runner_agents():
-        agent = label.rsplit(".", 1)[1] if label[-1].isdigit() else "0"
+        agent = label.rsplit(".", 1)[1] if label[-1].isdigit() or ".dedicated." in label else "0"
         if (HELD / ("actions-runner-glaeda" + ("" if agent == "0" else f"-{agent}"))).exists():
             continue  # cmux_mini_fix.sh runner_hold stopped it on purpose (an ineligible node)
         if not loaded:
@@ -2213,7 +2214,9 @@ def _heal_tailscale_route(mini: Mini, f: dict[str, Any], now: float, runs: int, 
 
 
 def agent_label(agent: str) -> str:
-    return "com.teamleaderleo.glaeda.cmux-runner" + ("" if agent == "0" else f".{agent}")
+    """The runner LaunchAgent for a finding's agent: "0", an instance number, or a dedicated runner's name."""
+    base = "com.teamleaderleo.glaeda.cmux-runner"
+    return base if agent == "0" else f"{base}.{agent}" if agent.isdigit() else f"{base}.dedicated.{agent}"
 
 
 def heal_runner(mini: Mini, f: dict[str, Any]) -> tuple[bool, str]:

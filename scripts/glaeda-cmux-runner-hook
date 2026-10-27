@@ -3844,6 +3844,7 @@ class RunnerScope(NamedTuple):
     fast: bool = False
     session: bool = False
     fresh: bool = False
+    dedicated: bool = False
 
 
 def reserve_token(scope: RunnerScope | None) -> str | None:
@@ -3863,6 +3864,22 @@ def listen_fit_units(runner_dir: Path) -> int:
     except (OSError, UnicodeDecodeError):
         return 1
     return int(match.group(1)) if match else 1
+
+
+DEDICATED_ADMIT_TIMEOUT_S = 600
+
+
+def dedicated_admission(script: Path) -> tuple[bool, str]:
+    """(admitted, note) from a dedicated runner's own admission script, run with the job's environment and output.
+    It holds nothing of glaeda's (no host lock, capacity or root), so the runners beside it never wait for it."""
+    try:
+        code = subprocess.run([os.fspath(script)], stdin=subprocess.DEVNULL, timeout=DEDICATED_ADMIT_TIMEOUT_S,
+                              check=False).returncode
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return False, f"the dedicated runner's admission {script.name} could not run ({type(error).__name__})"
+    if code != 0:
+        return False, f"the dedicated runner's admission {script.name} refused the job (exit {code})"
+    return True, "dedicated runner: admitted by its own admission, no host lock or capacity taken"
 
 
 def runner_scope(runner_dir: Path) -> RunnerScope:
@@ -3886,10 +3903,11 @@ def runner_scope(runner_dir: Path) -> RunnerScope:
     fresh = re.search(r"\s--dev-compile-runner(?:\s|$)", text) is not None and not fast and not session and not gui
     gui_match = re.search(r"\s--gui-token\s+([A-Za-z0-9._-]+)(?:\s|$)", text)
     gui_token = gui_match.group(1) if gui_match else "gui"
+    dedicated = re.search(r"\s--dedicated-admit\s", text) is not None
     return RunnerScope(flag("capacity-units", 0), max(1, flag("compile-slots", 1)), roots,
-                       instance < roots and not gui and not fast and not session, gui,
+                       instance < roots and not gui and not fast and not session and not dedicated, gui,
                        runner_floor_gib(min_free_gib(text), gui or session), gui_token,
-                       fast, session, fresh)
+                       fast, session, fresh, dedicated)
 
 
 def eligibility_scope(runner_dir: Path) -> tuple[str, str | None] | None:
@@ -4659,6 +4677,10 @@ class Gate:
             gate_log("the reload failed; keeping this gate")
 
     def claimed(self) -> str | None:
+        if runner_scope(self.runner_dir).dedicated:
+            # a dedicated builder (a nightly or archive build) is not a pool runner: fleet builds, reservations,
+            # load and heat never hold it off, only what would fail its job here (disk, a missing Rust toolchain)
+            return self.low_disk() or self.dedicated_toolchain()
         why = host_held(self.host_lock, self.reservation, time.time(), self.state_dir)
         if why is None and self.waiters and time.monotonic() - self.waiting_at >= GATE_WAITER_EVERY_S:
             self.waiting, self.waiting_at = host_waiters(self.host_lock, self.state_dir), time.monotonic()
@@ -4749,6 +4771,8 @@ class Gate:
     def confirmed(self) -> str | None:
         """A fresh reading right before a stop: the holder still holds, or a waiter seen at least one poll ago
         is still waiting (a job-started in flight, which lsof also lists, is gone by then)."""
+        if runner_scope(self.runner_dir).dedicated:
+            return self.claimed()
         why = host_held(self.host_lock, self.reservation, time.time(), self.state_dir)
         if why is None and self.waiting:
             again = self.waiting & host_waiters(self.host_lock, self.state_dir)
@@ -4774,7 +4798,10 @@ class Gate:
         return f"a fleet build is waiting for the host (pid {min(again)})"
 
     def still_reserved(self) -> str | None:
-        """The host's reservation, read afresh (one small file): why it holds the host, or None."""
+        """The host's reservation, read afresh (one small file): why it holds the host, or None. A dedicated runner
+        never yields to one (claimed)."""
+        if runner_scope(self.runner_dir).dedicated:
+            return None
         return reservation_refusal(self.reservation, time.time()) if self.reservation else None
 
     def low_disk(self) -> str | None:
@@ -4860,6 +4887,14 @@ class Gate:
         if fresh or time.monotonic() - self.console_at >= GATE_CONSOLE_EVERY_S:
             self.console_why, self.console_at = console_refusal(), time.monotonic()
         return self.console_why
+
+    def dedicated_toolchain(self) -> str | None:
+        """toolchain_missing for a dedicated runner, every poll, logged when it changes (glaeda #1640)."""
+        missing = toolchain_missing()
+        if missing != self.missing_why:
+            gate_log(f"{missing}; held off until the toolchain is back" if missing else "the Rust toolchain is back")
+            self.missing_why = missing
+        return f"ineligible: {missing}" if missing else None
 
     def ineligible(self) -> str | None:
         """For a --require-eligible runner: why job-started would refuse every job for eligibility (GATE_ELIGIBLE_EVERY_S),
@@ -6868,6 +6903,11 @@ def main(argv: list[str] | None = None) -> int:
                    help="also admit only cmux nightly-next's exact nightly app push on attempt 1")
     p.add_argument("--dev-compile-runner", action="store_true",
                    help="this instance admits only cmux NEXT DEV Release compile jobs (shared host capacity)")
+    p.add_argument("--dedicated-admit", type=Path,
+                   help="job-started: a dedicated runner (glaeda-cmux-runner --dedicated). It takes no host lock, "
+                        "capacity or reservation; after glaeda's own checks this script, the builder's admission, "
+                        "runs and a non-zero exit refuses the job. The gate holds it only for disk and a missing "
+                        "Rust toolchain")
     p.add_argument("--disk", help="glaeda-disk path (default: PATH, then ~/.local/bin)")
     p.add_argument("--no-disk", action="store_true")
     p.add_argument("--no-telemetry", action="store_true", help="do not sample the host while the job runs")
@@ -7041,7 +7081,8 @@ def main(argv: list[str] | None = None) -> int:
             why = leaked_toolchain_env(given, args.toolchain_xcode)
             if why:
                 return refused(why)
-        why = reservation_refusal(args.reservation, time.time(), taken_job=True)
+        # a dedicated builder is not a pool runner: a reservation of the mini's pool never refuses its one job shape
+        why = None if args.dedicated_admit else reservation_refusal(args.reservation, time.time(), taken_job=True)
         disk_path = os.path.dirname(args.host_lock)
         disk_deadline = time.monotonic() + EVICT_TIMEOUT_S  # one budget for every eviction of this job-started
         if not why and not args.no_disk and disk_refusal(disk_path, args.min_free_gib):
@@ -7076,8 +7117,8 @@ def main(argv: list[str] | None = None) -> int:
                     return refused(why, disk=True)
         # before any capacity is taken: a job that needs the console session fails on a locked one
         admit_class = None
-        if args.gui_runner or args.session_runner or job_class(
-                os.environ.get("GITHUB_JOB", ""), repo, args.home_repo, job_workflow())[0] in CONSOLE_CLASSES:
+        if not args.dedicated_admit and (args.gui_runner or args.session_runner or job_class(
+                os.environ.get("GITHUB_JOB", ""), repo, args.home_repo, job_workflow())[0] in CONSOLE_CLASSES):
             why = console_refusal()
             if why and (job_workflow(), os.environ.get("GITHUB_JOB", "")) in CONSOLE_SKIPPERS:
                 print(f"{PREFIX}: {why}; admitted as light, its take-gui step skips the console steps", flush=True)
@@ -7159,6 +7200,8 @@ def main(argv: list[str] | None = None) -> int:
             finally:
                 with contextlib.suppress(OSError):
                     marker.unlink()
+        elif args.dedicated_admit:
+            held, note = dedicated_admission(args.dedicated_admit)
         else:
             with contextlib.suppress(OSError):  # a crashed job's record must not show in this job's log lines
                 roots_file(args.state_dir).unlink(missing_ok=True)

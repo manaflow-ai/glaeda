@@ -69,7 +69,7 @@ if "--apply" in remote and "--uninstall" not in remote and host in os.environ.ge
     sys.exit(1)
 if "--apply" in remote:
     time.sleep(float(os.environ.get("FAKE_APPLY_S", "0")))
-    k = remote.split("--instance ")[1].split()[0]
+    k = remote.split("--dedicated ")[1].split()[0] if "--dedicated " in remote else remote.split("--instance ")[1].split()[0]
     ok = data.strip() == "{token}"
     print(json.dumps({{"actions": [{{"kind": "register", "state": "create" if ok else "failed",
                                     "name": host + "-glaeda" + ("" if k == "0" else "-" + k)}},
@@ -246,6 +246,36 @@ class FleetTest(unittest.TestCase):
                                "--format=%H %cd", "--date=format-local:%Y-%m-%d"],
                               capture_output=True, text=True, check=True).stdout.split()
         self.assertEqual((stamp["by"], stamp["source"], stamp["date"]), ("glaeda-cmux-runner-fleet", *head))
+
+    def test_apply_installs_a_members_dedicated_runners_on_their_own_scope(self) -> None:
+        """Leo, 2026-10-27: "why the fuck not manage it with glaeda????????" A member's runner.dedicated runners (a
+        nightly builder's) are applied with the member's instances: one token minted for the entry's own scope, piped
+        on stdin, and --dedicated NAME instead of --instance. An org migration never moves them."""
+        manifest = json.loads(json.dumps(MANIFEST))
+        manifest["hosts"]["mini-a"]["overrides"] = {"runner": {"dedicated": [
+            {"name": "nightly-next", "repo": "manaflow-ai/cmux", "labels": ["glaeda-trusted-next-nightly"],
+             "admit": ["/usr/bin/python3", "~/nightly-builder/nightly_builder.py", "admit"]}]}}
+        self.manifest.write_text(json.dumps(manifest))
+        result = self.fleet("--apply", "--hosts", "mini-a", "--org", "manaflow-ai", "--group", "glaeda-minis",
+                            FAKE_GROUPS=GROUP)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        row = json.loads(result.stdout)["members"][0]
+        self.assertEqual(row["dedicated"], ["nightly-next"])
+        self.assertEqual(row["instances"][-1], {"dedicated": "nightly-next", "exit": 0, "state": "create/ok",
+                                                "name": "mini-a-glaeda-nightly-next"})
+        applies = [c for c in self.calls() if c["tool"] == "ssh" and "--dedicated" in c["remote"]]
+        self.assertEqual(len(applies), 1)
+        self.assertIn("--repo manaflow-ai/cmux", applies[0]["remote"])
+        self.assertNotIn("--org", applies[0]["remote"])
+        self.assertEqual(applies[0]["stdin"].strip(), TOKEN)
+        tokens = [c["argv"] for c in self.calls() if c["tool"] == "gh" and "registration-token" in " ".join(c["argv"])]
+        self.assertIn("repos/manaflow-ai/cmux/actions/runners/registration-token", [a for t in tokens for a in t])
+        lists = [c["argv"] for c in self.calls() if c["tool"] == "gh" and any("actions/runners?" in a for a in c["argv"])]
+        self.assertTrue(any("repos/manaflow-ai/cmux/actions/runners?name=mini-a-glaeda-nightly-next" in " ".join(a)
+                            for a in lists),
+                        "its labels are read from its own scope, so a mini without gh never re-registers it")
+        staged = json.loads((self.dir / "calls.jsonl.mini-a.manifest").read_text())
+        self.assertEqual(staged["hosts"]["mini-a"]["overrides"]["runner"]["dedicated"][0]["name"], "nightly-next")
 
     def test_org_migration_goes_one_member_at_a_time_and_skips_trusted(self) -> None:
         manifest = json.loads(json.dumps(MANIFEST))

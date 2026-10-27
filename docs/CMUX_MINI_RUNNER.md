@@ -799,6 +799,45 @@ What the gate cannot see, and the operator must keep true:
   that trusted runs wrote. A cache namespace that PR runs also write (build seeds, sccache, SwiftPM
   manifest caches) brings PR-produced bytes next to the secret.
 - Also limit the org runner group to the one repository (an admin setting).
+## 2e1. Dedicated runners: a builder's one job shape, managed like an instance
+
+A builder that takes one job shape (cmux's nightly-next app build, the iOS internal archive) used to run as a hand-made
+runner with its own LaunchAgent, outside every glaeda reconciler: no `.path` repair, no Rust toolchain hold, no OTA hook
+refresh, no mini-health heal. It is now a manifest entry, and glaeda installs it like any instance:
+
+```json
+"overrides": {"runner": {"dedicated": [{
+  "name": "nightly-next", "repo": "manaflow-ai/cmux",
+  "labels": ["glaeda-trusted-next-nightly", "glaeda-trusted-light-xcode-26.6", "glaeda-runner-<old name>"],
+  "admit": ["/usr/bin/python3", "~/nightly-builder/nightly_builder.py", "admit"],
+  "watch": ["/usr/bin/python3", "~/nightly-builder/nightly_builder.py", "watch", "--loop"],
+  "env": {"NIGHTLY_BUILDER_RUNNER_DIR": "{runnerDir}", "PATH": "~/.local/bin"}}]}}
+```
+
+`glaeda-cmux-runner --manifest M --member NAME --dedicated nightly-next --apply` installs it, and
+`glaeda-cmux-runner-fleet --apply` applies every member's entries after its instances, each with a token for the
+entry's own scope (an org migration never moves them). The install is `~/actions-runner-glaeda-nightly-next`,
+LaunchAgent `com.teamleaderleo.glaeda.cmux-runner.dedicated.nightly-next`, receipt `instance-dedicated-nightly-next/`
+(so `--refresh-hooks` reaches it) and runner name `<member>-glaeda-nightly-next`.
+
+- **Exactly its labels.** It registers with `--no-default-labels` and only the listed labels: no `self-hosted`,
+  `macOS`, `glaeda-mini` or pool label (`dedicated_runners` refuses those), so no other job can land on it. Keep a
+  runner-name label from the hand-made runner in the list and the workflows that name it need no change.
+- **Its own admission.** `job-started` runs glaeda's checks (event, repository, fork, disk floor), then
+  `glaeda-hooks/dedicated-admit.sh`, which execs the entry's `admit` with the job's environment; a non-zero exit
+  refuses the job. It takes no host lock, capacity unit, root or gui token, and the mini's reservation never refuses it.
+- **The gate holds it only for what would fail its job here**: the disk floor and a missing Rust toolchain. Fleet
+  builds, reservations, CPU load and heat never hold a dedicated runner off.
+- **The watch loop** (optional) is the builder's own, run as `<agent label>.watch` beside the runner, with the
+  entry's `env` and the workload PATH. `env` also goes into the runner's `.env`; a declared `PATH` is merged into
+  `.path` instead (`runner_path`). `~/` and `{runnerDir}` are expanded on the mini.
+- mini-health checks and kickstarts the runner agent like an instance's (`runner_stopped:<name>`).
+- `--uninstall --apply` with the same flags deregisters it and removes both agents.
+
+To move a hand-made runner over: declare the entry with the old runner's labels (`gh api
+repos/OWNER/REPO/actions/runners/ID`), apply it so the glaeda runner is online beside the old one, then, while the old
+runner has no `Runner.Worker`, boot out and archive its LaunchAgents and remove its registration.
+
 ## 2e2. Other repositories on the same minis (org scope)
 
 Registered to `manaflow-ai/cmux`, the runners serve only cmux. To let another repository of the org use

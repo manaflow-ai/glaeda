@@ -2748,5 +2748,25 @@ class Parsing(unittest.TestCase):
         self.assertFalse(health.XCTEST_RUNNING.search("/usr/bin/xcodebuild build -scheme cmux"))
 
 
+
+class DedicatedRunnerAgentTest(unittest.TestCase):
+    def test_a_dedicated_runner_is_checked_and_kickstarted_like_an_instance(self) -> None:
+        """glaeda-cmux-runner --dedicated NAME runs as com.teamleaderleo.glaeda.cmux-runner.dedicated.NAME in
+        ~/actions-runner-glaeda-NAME; its .watch agent is the builder's loop, not a runner."""
+        label = "com.teamleaderleo.glaeda.cmux-runner.dedicated.nightly-next"
+        self.assertTrue(health.RUNNER_AGENT.fullmatch(label))
+        self.assertFalse(health.RUNNER_AGENT.fullmatch(label + ".watch"))
+        self.assertEqual(health.agent_label("nightly-next"), label)
+        self.assertEqual((health.agent_label("0"), health.agent_label("3")),
+                         ("com.teamleaderleo.glaeda.cmux-runner", "com.teamleaderleo.glaeda.cmux-runner.3"))
+        self.assertEqual(health.RUNNER_DIR.fullmatch("actions-runner-glaeda-nightly-next").group(1), "nightly-next")
+        self.assertEqual(health.RUNNER_DIR.fullmatch("actions-runner-glaeda-7").group(1), "7")
+        mini = mock.Mock()
+        mini.runner_registrations.return_value = []
+        mini.runner_agents.return_value = [(label, True, False, "0")]
+        with mock.patch.object(health, "HELD", Path(tempfile.mkdtemp())):
+            found = health.check_runners(mini)
+        self.assertEqual([f["id"] for f in found], ["runner_stopped:nightly-next"])
+
 if __name__ == "__main__":
     unittest.main()

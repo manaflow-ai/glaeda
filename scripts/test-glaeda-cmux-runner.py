@@ -186,7 +186,7 @@ open(os.path.join(here, ".path"), "w").write(os.environ.get("PATH", "") + "\n")
 if token != os.environ["FAKE_REG_TOKEN"]:
     print("bad token " + str(token)); sys.exit(1)
 name = argv[argv.index("--name") + 1]
-labels = ["self-hosted", "macOS", "ARM64"] + argv[argv.index("--labels") + 1].split(",")
+labels = ([] if "--no-default-labels" in argv else ["self-hosted", "macOS", "ARM64"]) + argv[argv.index("--labels") + 1].split(",")
 doc = runners()
 if "--replace" in argv:
     doc["runners"] = [r for r in doc["runners"] if r["name"] != name]
@@ -9924,6 +9924,311 @@ MANIFEST = {
                                                        "build": "17C529"}]}}},
     },
 }
+
+
+NIGHTLY = {"name": "nightly-next", "repo": "manaflow-ai/cmux",
+           "labels": ["glaeda-trusted-next-nightly", "glaeda-runner-mini-std-nightly-next"],
+           "admit": ["/usr/bin/python3", "~/nightly-builder/nightly_builder.py", "admit"],
+           "watch": ["/usr/bin/python3", "~/nightly-builder/nightly_builder.py", "watch", "--loop"],
+           "env": {"NIGHTLY_BUILDER_RUNNER_DIR": "{runnerDir}", "PATH": "~/.local/bin"}}
+
+
+def dedicated_manifest(*entries: dict) -> dict:
+    manifest = copy.deepcopy(MANIFEST)
+    manifest["hosts"]["mini-std"]["overrides"] = {"runner": {"dedicated": [copy.deepcopy(e) for e in entries]}}
+    return manifest
+
+
+class DedicatedRunnerTest(unittest.TestCase):
+    """Leo, 2026-10-27: "why the fuck not manage it with glaeda????????" A builder's runner (the nightly-next app
+    build, the iOS internal archive) is a manifest runner.dedicated entry that glaeda-cmux-runner --dedicated installs:
+    glaeda's release, .path, hooks, gate and disk floor, with exactly its own labels, scope and admission."""
+
+    setUp, tearDown, build_release = RunnerTest.setUp, RunnerTest.tearDown, RunnerTest.build_release
+    invoke, log, by_kind, config_argvs = RunnerTest.invoke, RunnerTest.log, RunnerTest.by_kind, RunnerTest.config_argvs
+
+    def manifest(self, *entries: dict) -> str:
+        path = self.state / "mini-fleet.json"
+        path.write_text(json.dumps(dedicated_manifest(*(entries or (NIGHTLY,)))))
+        return os.fspath(path)
+
+    def test_the_manifest_entry_is_validated(self) -> None:
+        good, why = fleet_labels.dedicated_runners(dedicated_manifest(NIGHTLY), "mini-std")
+        self.assertIsNone(why)
+        self.assertEqual(good[0]["labels"], NIGHTLY["labels"])
+        self.assertEqual(fleet_labels.dedicated_runners(MANIFEST, "mini-std"), ([], None))
+        for change, needle in (({"labels": ["self-hosted", "x"]}, "leave out"), ({"labels": []}, "non-empty"),
+                               ({"org": "manaflow-ai"}, "exactly one of repo"), ({"admit": ["relative.py"]}, "admit"),
+                               ({"name": "Bad Name"}, "name"), ({"name": "123"}, "name"),
+                               ({"env": {"lower": "x"}}, "env"),
+                               ({"surprise": 1}, "unknown keys"), ({"group": "g"}, "group goes with org"),
+                               ({"labels": ["x", "glaeda-std-xcode-26.6".upper()]}, "pool labels"),
+                               ({"labels": ["glaeda-std-xcode-26.6"]}, "pool labels")):
+            with self.subTest(change):
+                _, why = fleet_labels.dedicated_runners(dedicated_manifest({**NIGHTLY, **change}), "mini-std")
+                self.assertIn(needle, why or "")
+        _, why = fleet_labels.dedicated_runners(dedicated_manifest(NIGHTLY, NIGHTLY), "mini-std")
+        self.assertIn("declared twice", why)
+        headless = dedicated_manifest(NIGHTLY)
+        headless["hosts"]["mini-std"]["gui"] = False
+        _, why = fleet_labels.dedicated_runners(headless, "mini-std")
+        self.assertIn("gui: false", why or "")
+
+    def test_install_registers_exactly_its_labels_with_its_own_admission_and_watch(self) -> None:
+        fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            receipt = self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std",
+                                  "--dedicated", "nightly-next")
+        self.assertTrue(receipt["ready"], receipt["blocking"])
+        runner = self.home / "actions-runner-glaeda-nightly-next"
+        self.assertEqual(receipt["runnerDir"], os.fspath(runner))
+        [argv] = self.config_argvs()
+        self.assertIn("--no-default-labels", argv)
+        self.assertEqual(argv[argv.index("--labels") + 1], ",".join(NIGHTLY["labels"]))
+        self.assertEqual(argv[argv.index("--name") + 1], "mini-std-glaeda-nightly-next")
+        self.assertEqual(argv[argv.index("--url") + 1], "https://github.com/manaflow-ai/cmux")
+        registered = json.loads((self.state / "runners.json").read_text())["runners"][0]
+        self.assertEqual([l["name"] for l in registered["labels"]], NIGHTLY["labels"], "no self-hosted or pool label")
+        hooks = runner / cr.HOOK_DIR
+        started = (hooks / "job-started.sh").read_text()
+        self.assertIn(f"--dedicated-admit {hooks / cr.DEDICATED_ADMIT}", started)
+        for absent in ("--capacity-units", "--require-eligible", "--test-keychain", "--trusted-ref"):
+            self.assertNotIn(absent, started)
+        self.assertIn(f"exec /usr/bin/python3 {self.home}/nightly-builder/nightly_builder.py admit",
+                      (hooks / cr.DEDICATED_ADMIT).read_text())
+        self.assertEqual(hook.runner_scope(runner).dedicated, True)
+        self.assertFalse(hook.runner_scope(runner).root)
+        label = "com.teamleaderleo.glaeda.cmux-runner.dedicated.nightly-next"
+        agent = plistlib.loads((self.home / "Library/LaunchAgents" / f"{label}.plist").read_bytes())
+        self.assertEqual(agent["Label"], label)
+        watch = plistlib.loads((self.home / "Library/LaunchAgents" / f"{label}.watch.plist").read_bytes())
+        self.assertEqual(watch["ProgramArguments"][1], f"{self.home}/nightly-builder/nightly_builder.py")
+        self.assertEqual(watch["EnvironmentVariables"]["NIGHTLY_BUILDER_RUNNER_DIR"], os.fspath(runner))
+        watch_path = watch["EnvironmentVariables"]["PATH"].split(":")
+        self.assertIn(f"{self.home}/.local/bin", watch_path)
+        self.assertIn("/usr/bin", watch_path, "a declared PATH joins the workload PATH, never replaces it")
+        self.assertIn(f"NIGHTLY_BUILDER_RUNNER_DIR={runner}", (runner / ".env").read_text().splitlines())
+        path = (runner / ".path").read_text().strip().split(":")
+        self.assertEqual(path[:3], ["/opt/homebrew/bin", "/usr/local/bin", f"{self.home}/.local/bin"])
+        self.assertIn(f"{self.home}/.cargo/bin", path)
+        bootstraps = [e["argv"][2] for e in self.log() if e["tool"] == "launchctl" and e["argv"][0] == "bootstrap"]
+        self.assertEqual(sorted(Path(b).name for b in bootstraps), [f"{label}.plist", f"{label}.watch.plist"])
+        state = self.home / ".local/state/glaeda/cmux-runner/instance-dedicated-nightly-next/receipt.json"
+        self.assertEqual(json.loads(state.read_text())["dedicated"]["name"], "nightly-next")
+        self.assertEqual(receipt["routing"]["route"], [])
+        # a re-run changes nothing and registers nothing new
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            again = self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std",
+                                "--dedicated", "nightly-next")
+        self.assertEqual(self.by_kind(again)["register"]["state"], "unchanged")
+        self.assertEqual(len(self.config_argvs()), 1)
+        # the manifest drops the watch loop and an env key: the agent this install wrote and the key both go
+        trimmed = {k: v for k, v in NIGHTLY.items() if k != "watch"}
+        trimmed["env"] = {"PATH": "~/.local/bin"}
+        (self.state / "loaded.json").write_text(json.dumps([label, f"{label}.watch"]))  # both agents run
+        env_before = (runner / ".env").read_text()
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
+                mock.patch.object(cr, "runner_busy", return_value=True):
+            busy = self.invoke("--apply", "--manifest", self.manifest(trimmed), "--member", "mini-std",
+                               "--dedicated", "nightly-next", expect=1)
+        self.assertEqual(self.by_kind(busy)["register"]["state"], "failed", "never restarted under a job")
+        self.assertEqual((runner / ".env").read_text(), env_before)
+        self.assertIn(label, json.loads((self.state / "loaded.json").read_text()))
+        before = [e for e in self.log() if e["tool"] == "launchctl"]
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            self.invoke("--apply", "--manifest", self.manifest(trimmed), "--member", "mini-std",
+                        "--dedicated", "nightly-next")
+        self.assertFalse((self.home / "Library/LaunchAgents" / f"{label}.watch.plist").exists())
+        self.assertNotIn("NIGHTLY_BUILDER_RUNNER_DIR", (runner / ".env").read_text())
+        # the env changed under a loaded, idle listener: it is restarted so its jobs see the new env
+        tail = [e["argv"] for e in self.log() if e["tool"] == "launchctl"][len(before):]
+        self.assertIn(["bootout", f"gui/{os.getuid()}/{label}"], tail)
+        self.assertTrue(any(a[0] == "bootstrap" and a[2].endswith(f"{label}.plist") for a in tail), tail)
+        self.assertIn(["bootout", f"gui/{os.getuid()}/{label}.watch"],
+                      [e["argv"] for e in self.log() if e["tool"] == "launchctl"])
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std",
+                        "--dedicated", "nightly-next")
+        self.assertTrue((self.home / "Library/LaunchAgents" / f"{label}.watch.plist").exists(), "and comes back")
+        # and an uninstall deregisters it and removes both agents
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            self.invoke("--uninstall", "--apply", "--manifest", self.manifest(), "--member", "mini-std",
+                        "--dedicated", "nightly-next")
+        self.assertFalse((self.home / "Library/LaunchAgents" / f"{label}.watch.plist").exists())
+        self.assertFalse((self.home / "Library/LaunchAgents" / f"{label}.plist").exists())
+        self.assertEqual(json.loads((self.state / "runners.json").read_text())["runners"], [])
+
+    def test_a_dropped_path_entry_leaves_path_and_a_stuck_watch_is_retried(self) -> None:
+        fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
+        runner = self.home / "actions-runner-glaeda-nightly-next"
+        label = "com.teamleaderleo.glaeda.cmux-runner.dedicated.nightly-next"
+        builder = {**NIGHTLY, "env": {"PATH": "/opt/builder-v1/bin:~/.local/bin"}}
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            self.invoke("--apply", "--manifest", self.manifest(builder), "--member", "mini-std",
+                        "--dedicated", "nightly-next")
+        path = (runner / ".path").read_text().strip().split(":")
+        self.assertIn("/opt/builder-v1/bin", path)
+        (runner / ".path").write_text(":".join([*path, "/opt/someone-else/bin"]) + "\n")  # not ours: it stays
+        # PATH goes from the manifest: the entries it added go, every other entry stays
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            self.invoke("--apply", "--manifest", self.manifest({**NIGHTLY, "env": {}}), "--member", "mini-std",
+                        "--dedicated", "nightly-next")
+        path = (runner / ".path").read_text().strip().split(":")
+        self.assertNotIn("/opt/builder-v1/bin", path)
+        self.assertNotIn(f"{self.home}/.local/bin", path)
+        self.assertIn("/opt/someone-else/bin", path)
+        self.assertEqual(path[:2], ["/opt/homebrew/bin", "/usr/local/bin"])
+        # a watch update launchd will not unload writes nothing, so the next apply sees the change again
+        watch_plist = self.home / "Library/LaunchAgents" / f"{label}.watch.plist"
+        old_watch = watch_plist.read_bytes()
+        changed = {**NIGHTLY, "watch": [*NIGHTLY["watch"], "--verbose"], "env": {}}
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
+                mock.patch.object(cr, "bootout_watch", return_value=False):
+            failed = self.invoke("--apply", "--manifest", self.manifest(changed), "--member", "mini-std",
+                                 "--dedicated", "nightly-next", expect=1)
+        self.assertEqual(next(a for a in failed["actions"] if a["kind"] == "watch")["state"], "failed")
+        self.assertEqual(watch_plist.read_bytes(), old_watch, "the old plist stays while the old agent runs")
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            again = self.invoke("--apply", "--manifest", self.manifest(changed), "--member", "mini-std",
+                                "--dedicated", "nightly-next")
+        self.assertEqual(next(a for a in again["actions"] if a["kind"] == "watch")["state"], "update")
+        self.assertIn("--verbose", plistlib.loads(watch_plist.read_bytes())["ProgramArguments"])
+        # launchd keeps the watch agent: its plist and ownership stay, and the next apply removes it
+        trimmed = {k: v for k, v in NIGHTLY.items() if k != "watch"}
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
+                mock.patch.object(cr, "bootout_watch", return_value=False) as stuck:
+            failed = self.invoke("--apply", "--manifest", self.manifest(trimmed), "--member", "mini-std",
+                                 "--dedicated", "nightly-next", expect=1)
+        stuck.assert_called_once()
+        watch = next(a for a in failed["actions"] if a["kind"] == "watch")
+        self.assertEqual(watch["state"], "failed")
+        self.assertTrue((self.home / "Library/LaunchAgents" / f"{label}.watch.plist").exists())
+        # bootout_watch itself: True only once launchd says it no longer has the agent
+        (self.state / "loaded.json").write_text(json.dumps([f"{label}.watch"]))
+        ctx = mock.Mock(uid=os.getuid())
+        self.assertTrue(cr.bootout_watch(ctx, f"{label}.watch"))
+        make_executable(self.launchctl, FAKE_LAUNCHCTL.replace('if argv[0] == "bootout":',
+                                                               'if argv[0] == "bootout" and False:'))
+        (self.state / "loaded.json").write_text(json.dumps([f"{label}.watch"]))
+        self.assertFalse(cr.bootout_watch(ctx, f"{label}.watch", wait_s=0.3))
+        make_executable(self.launchctl, FAKE_LAUNCHCTL)
+        (self.state / "loaded.json").unlink()
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            again = self.invoke("--apply", "--manifest", self.manifest(trimmed), "--member", "mini-std",
+                                "--dedicated", "nightly-next")
+        self.assertEqual(next(a for a in again["actions"] if a["kind"] == "watch")["state"], "remove")
+        self.assertFalse((self.home / "Library/LaunchAgents" / f"{label}.watch.plist").exists())
+
+    def test_an_uninstall_stops_when_the_watch_agent_does_not_unload(self) -> None:
+        fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
+        runner = self.home / "actions-runner-glaeda-nightly-next"
+        label = "com.teamleaderleo.glaeda.cmux-runner.dedicated.nightly-next"
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std", "--dedicated", "nightly-next")
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
+                mock.patch.object(cr, "bootout_watch", return_value=False):
+            stuck = self.invoke("--uninstall", "--apply", "--manifest", self.manifest(), "--member", "mini-std",
+                                "--dedicated", "nightly-next", expect=1)
+        self.assertTrue(all(a["state"] != "remove" or not a.get("applied") for a in stuck["actions"]))
+        self.assertTrue((self.home / "Library/LaunchAgents" / f"{label}.watch.plist").exists())
+        self.assertTrue((self.home / "Library/LaunchAgents" / f"{label}.plist").exists(), "the runner stays too")
+        self.assertTrue((runner / ".runner").is_file(), "still registered")
+        self.assertEqual(len(json.loads((self.state / "runners.json").read_text())["runners"]), 1)
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            self.invoke("--uninstall", "--apply", "--manifest", self.manifest(), "--member", "mini-std",
+                        "--dedicated", "nightly-next")
+        self.assertFalse((self.home / "Library/LaunchAgents" / f"{label}.watch.plist").exists())
+        self.assertEqual(json.loads((self.state / "runners.json").read_text())["runners"], [])
+
+    def test_a_relabel_starts_the_runner_only_under_its_new_admission(self) -> None:
+        fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
+        wrapper = self.home / "actions-runner-glaeda-nightly-next" / cr.HOOK_DIR / cr.DEDICATED_ADMIT
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std", "--dedicated", "nightly-next")
+        changed = {**NIGHTLY, "labels": [*NIGHTLY["labels"], "glaeda-extra"],
+                   "admit": ["/usr/bin/python3", "~/nightly-builder/nightly_builder.py", "admit", "--strict"]}
+        old_wrapper = wrapper.read_text()
+        (self.state / "loaded.json").write_text(json.dumps(["com.teamleaderleo.glaeda.cmux-runner.dedicated.nightly-next"]))
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
+                mock.patch.object(cr, "runner_busy", return_value=True):
+            busy = self.invoke("--apply", "--manifest", self.manifest(changed), "--member", "mini-std",
+                               "--dedicated", "nightly-next", expect=1)
+        self.assertIn(self.by_kind(busy)["register"]["state"], {"failed", "blocked"})
+        self.assertEqual(wrapper.read_text(), old_wrapper, "a runner under a job keeps its old labels and admission")
+        # a job that starts between the plan and the stop: relabel fails and writes no hook either
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), \
+                mock.patch.object(cr, "stop_if_idle", return_value=False):
+            raced = self.invoke("--apply", "--manifest", self.manifest(changed), "--member", "mini-std",
+                                "--dedicated", "nightly-next", expect=1)
+        self.assertEqual(self.by_kind(raced)["register"]["state"], "failed")
+        self.assertEqual(wrapper.read_text(), old_wrapper, "the stop failed: the old admission stays")
+        (self.state / "loaded.json").unlink()
+        seen = []
+        real_start = cr.start_agent
+
+        def start(ctx, act, path):
+            seen.append(wrapper.read_text())
+            return real_start(ctx, act, path)
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw), mock.patch.object(cr, "start_agent", start):
+            receipt = self.invoke("--apply", "--manifest", self.manifest(changed), "--member", "mini-std",
+                                  "--dedicated", "nightly-next")
+        self.assertEqual(self.by_kind(receipt)["register"]["state"], "updated")
+        self.assertTrue(seen, "the relabel started the runner again")
+        self.assertTrue(all("--strict" in text for text in seen), "never started under the old admission")
+
+    def test_unknown_names_and_mixed_flags_are_refused(self) -> None:
+        out = io.StringIO()
+        with contextlib.redirect_stderr(out):
+            self.assertEqual(cr.main(["--manifest", self.manifest(), "--member", "mini-std", "--dedicated", "other"]), 2)
+            self.assertEqual(cr.main(["--dedicated", "nightly-next"]), 2)
+            self.assertEqual(cr.main(["--manifest", self.manifest(), "--member", "mini-std", "--dedicated",
+                                      "nightly-next", "--instance", "1"]), 2)
+        self.assertIn("declares no runner.dedicated named other", out.getvalue())
+
+
+class DedicatedHookTest(unittest.TestCase):
+    run_hook = HookTest.run_hook
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_job_started_admits_only_what_the_builders_admission_admits(self) -> None:
+        path = event(self.dir, "push", {"repository": CMUX, "ref": "refs/heads/nightly-next"})
+        for code, admitted in ((0, True), (1, False)):
+            with self.subTest(code=code):
+                admit = make_executable(self.dir / f"admit-{code}.sh", f"#!/bin/sh\nexit {code}\n")
+                result = self.run_hook("job-started", "push", path, "--allowed-repo", "manaflow-ai/cmux", "--no-disk",
+                                       "--dedicated-admit", os.fspath(admit), repo="manaflow-ai/cmux")
+                self.assertEqual(result.returncode == 0, admitted, result.stdout + result.stderr)
+                self.assertIn("dedicated runner" if admitted else "refused the job (exit 1)", result.stdout)
+        # glaeda's own checks still run first: a fork PR never reaches the builder's admission
+        fork = event(self.dir, "fork", SAMPLE_EVENTS["fork-pr"][1])
+        marker = self.dir / "ran"
+        admit = make_executable(self.dir / "admit-mark.sh", f"#!/bin/sh\ntouch {marker}\n")
+        result = self.run_hook("job-started", "pull_request", fork, "--allowed-repo", "manaflow-ai/cmux", "--no-disk",
+                               "--dedicated-admit", os.fspath(admit), repo="manaflow-ai/cmux")
+        self.assertEqual(result.returncode, 1)
+        self.assertFalse(marker.exists())
+
+    def test_the_gate_never_holds_a_dedicated_runner_for_the_pool(self) -> None:
+        runner = self.dir / "actions-runner-glaeda-nightly-next"
+        (runner / cr.HOOK_DIR).mkdir(parents=True)
+        (runner / cr.HOOK_DIR / "job-started.sh").write_text(
+            "#!/bin/bash\nexec python3 hook job-started --allowed-repo manaflow-ai/cmux --dedicated-admit /x/a.sh\n")
+        gate = hook.Gate(runner, os.fspath(self.dir / "host.lock"), os.fspath(self.dir / "reservation.json"),
+                         self.dir / "state", waiters=False)
+        with mock.patch.object(hook, "host_held", return_value="a fleet build holds the host"), \
+                mock.patch.object(hook, "reservation_refusal", return_value="reserved"), \
+                mock.patch.object(hook.Gate, "low_disk", return_value=None):
+            self.assertIsNone(gate.claimed())
+            self.assertIsNone(gate.confirmed())
+            self.assertIsNone(gate.still_reserved())
+        with mock.patch.object(hook.Gate, "low_disk", return_value="disk: 10 GiB free"):
+            self.assertEqual(gate.claimed(), "disk: 10 GiB free")
 
 
 class ManifestLabelsTest(unittest.TestCase):
