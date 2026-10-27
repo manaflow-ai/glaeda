@@ -2249,6 +2249,14 @@ RUNNER_IDLE_CHECKOUT_HOURS = 10 / 60
 # Old runner work dirs go by age too, above the floor and in the idle sweep: a checkout no job used for
 # DEFAULT_AGE_HOURS is cloned again by its runner's next job, like one the floor took.
 RUNNER_STALE_CHECKOUT_HOURS = DEFAULT_AGE_HOURS
+# A runner checkout that one full-history job fetched into stays full-history: every later job only adds to it, and
+# runner-checkout-repack's `repack -k` keeps what no ref names. On 2026-10-27 one runner per mini (12 of 109
+# checkouts) held 6.7-7.1 GiB of packs and 22k refs/remotes/origin/* while its siblings held about 0.55 GiB: 118.5 of
+# the fleet's 198 GB of runner .git. Such a checkout goes once its runner is quiet, at any free space, and the next
+# job starts from a shallow clone or git seed again. Bloated is relative to the same repository's other checkouts on
+# this mini, so a repository that is big everywhere never counts.
+RUNNER_CHECKOUT_BLOAT_RATIO = 4.0  # times the median pack bytes of the same repository's other checkouts here
+RUNNER_CHECKOUT_BLOAT_MIN_GIB = 2.0
 
 
 def runner_checkout_last_use(runner: Path, checkout: Path) -> float:
@@ -2294,6 +2302,8 @@ def runner_checkout_git_veto(checkout: Path) -> str:
             if any(n in GIT_LOCK_NAMES for n in (*files, *dirs)) or any(
                     f.endswith(".lock") and "refs" in rel for f in files):
                 return "git holds a lock in it"
+            if len(rel) >= 2 and rel[-2] == "worktrees" and "locked" in files:
+                return "a linked worktree of it is locked"
     except OSError:
         return "git could not say whether it holds a lock"
     # the caller's GIT_* would override -C (a hook's GIT_DIR names one repository for every checkout)
@@ -2304,13 +2314,115 @@ def runner_checkout_git_veto(checkout: Path) -> str:
         return subprocess.run(["git", "-C", os.fspath(checkout), *args], capture_output=True, text=True,
                               timeout=timeout, env=env, check=True).stdout
     try:
-        tips = git("for-each-ref", "--format=%(objectname)", "refs/heads", "refs/tags", "refs/stash").split()
         heads = [ln.split(" ", 1)[1] for ln in git("worktree", "list", "--porcelain").splitlines()
                  if ln.startswith("HEAD ")]
-        local = git("rev-list", "--max-count=1", "HEAD", *heads, *tips, "--not", "--remotes", timeout=120)
+        local = unpushed_commit(git, heads)
     except (OSError, subprocess.SubprocessError, IndexError):
         return "git could not say whether a commit is only here"
-    return "a commit here is on no remote-tracking ref" if local.strip() else ""
+    if local:
+        return "a commit here is on no remote-tracking ref"
+    return submodule_git_veto(dotgit, env)
+
+
+def unpushed_commit(git, heads: list[str]) -> bool:
+    """Whether HEAD, `heads`, or any ref but a remote-tracking one (a branch, the stash, bisect, notes, refs/worktree,
+    a tag) names a commit on no remote-tracking ref. A tag
+    counts only when origin does not have it at the same object: a full-history fetch brings every tag of origin,
+    including tags of commits on no branch (cmux's cmux-rbh-src-*, 270 of them on 2026-10-27), and those are not
+    only here. Asking origin is one `git ls-remote --tags` (0.3 s), made only when a tag names such a commit; with
+    the checkout's expired job token header cleared. Raises when git cannot say, which keeps the checkout."""
+    refs = [ln.split(" ", 1) for ln in git("for-each-ref", "--format=%(objectname) %(refname)").splitlines()
+            if " " in ln]
+    # every ref but remote-tracking ones and tags: branches, the stash, bisect, notes, refs/worktree, anything
+    tips = [sha for sha, ref in refs if not ref.startswith(("refs/remotes/", "refs/tags/"))]
+    if git("rev-list", "--max-count=1", "HEAD", *heads, *tips, "--not", "--remotes", timeout=120).strip():
+        return True
+    tags = {ref: sha for sha, ref in refs if ref.startswith("refs/tags/")}
+    if not tags or not git("rev-list", "--max-count=1", *tags.values(), "--not", "--remotes", timeout=120).strip():
+        return False
+    origin = {}
+    for ln in git("-c", "http.https://github.com/.extraheader=", "-c", "credential.helper=", "ls-remote",
+                  "--tags", "origin", timeout=60).splitlines():
+        sha, _, ref = ln.partition("\t")
+        if ref and not ref.endswith("^{}"):
+            origin[ref] = sha
+    only_here = [sha for ref, sha in tags.items() if origin.get(ref) != sha]
+    return bool(only_here) and bool(git("rev-list", "--max-count=1", *only_here, "--not", "--remotes",
+                                        timeout=120).strip())
+
+
+SUBMODULE_DEPTH = 4  # submodules of submodules this deep are followed; deeper is doubt
+
+
+def submodule_git_veto(dotgit: Path, env: dict[str, str]) -> str:
+    """runner_checkout_git_veto's commit rule for every other git dir inside .git (submodule stores under modules/,
+    nested ones, those under a linked worktree's worktrees/<name>/modules): a HEAD, a linked worktree's HEAD or any
+    ref but a remote-tracking one on none of its remote-tracking refs keeps the checkout. Their locks and operations
+    are in runner_checkout_git_veto's walk of .git. A submodule (a gitlink in the index, followed through absorbed
+    submodules) whose repository sits in the work tree as its own .git directory keeps the checkout outright, and so
+    does doubt: a symlink inside .git, a git dir that cannot be read, or an index git cannot list."""
+    def unreadable(error: OSError) -> None:
+        raise error
+
+    gitdirs: list[Path] = []
+    try:
+        for root, dirs, files in os.walk(dotgit, onerror=unreadable):
+            here = Path(root)
+            is_gitdir = "HEAD" in files and "objects" in dirs
+            if here != dotgit and is_gitdir:
+                gitdirs.append(here)
+            if any((here / d).is_symlink() for d in dirs) or (here != dotgit and any(
+                    (here / f).is_symlink() for f in files if not is_gitdir)):
+                return "a symlink inside .git: git could not say what it holds"
+            # a git dir's own object store, reflogs and LFS store hold no git dirs; a directory with those names
+            # anywhere else (a submodule named refs) is walked
+            dirs[:] = [d for d in dirs if not (is_gitdir and d in ("objects", "lfs", "logs", "refs"))]
+    except OSError:
+        return "git could not say whether a submodule commit is only here"
+    why = embedded_submodule_veto(dotgit.parent, env, SUBMODULE_DEPTH)
+    if why:
+        return why
+    for gitdir in gitdirs:
+        name = os.fspath(gitdir.relative_to(dotgit))
+
+        def git(*args: str, timeout: int = 120, gitdir: Path = gitdir) -> str:
+            return subprocess.run(["git", "--git-dir", os.fspath(gitdir), *args], capture_output=True, text=True,
+                                  timeout=timeout, env=env, check=True).stdout
+        try:
+            heads = [ln.split(" ", 1)[1] for ln in git("worktree", "list", "--porcelain").splitlines()
+                     if ln.startswith("HEAD ")]
+            local = unpushed_commit(git, heads)
+        except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+            return f"git could not say whether a commit in {name} is only here"
+        if local:
+            return f"a commit in {name} is on no remote-tracking ref"
+    return ""
+
+
+def embedded_submodule_veto(tree: Path, env: dict[str, str], depth: int) -> str:
+    """Why a work tree's submodules keep the checkout, or "": a gitlink (mode 160000 in the index) whose .git is a
+    directory or a symlink, not a gitfile into the superproject's .git/modules, or such a one in an absorbed
+    submodule's own work tree. Any doubt (git cannot list an index, the nesting is deeper than depth) keeps it."""
+    try:
+        listed = subprocess.run(["git", "-C", os.fspath(tree), "ls-files", "--stage", "-z"], capture_output=True,
+                                timeout=120, env=env, check=True).stdout
+    except (OSError, subprocess.SubprocessError):
+        return f"git could not list the index of {tree.name}"
+    for entry in listed.split(b"\0"):
+        if not entry.startswith(b"160000 "):
+            continue
+        path = os.fsdecode(entry.split(b"\t", 1)[-1])
+        sub = tree / path
+        dotgit = sub / ".git"
+        if dotgit.is_symlink() or dotgit.is_dir():
+            return f"submodule {path} keeps its own repository in the work tree"
+        if not dotgit.exists():
+            continue  # not initialized: no repository of its own here
+        if depth <= 0:
+            return f"submodule {path} is nested deeper than {SUBMODULE_DEPTH}"
+        if why := embedded_submodule_veto(sub, env, depth - 1):
+            return why
+    return ""
 
 
 def idle_runner_checkout_veto(runner: Path, checkout: Path, opened: frozenset[str], cmds: str) -> str:
@@ -2331,10 +2443,64 @@ def idle_runner_checkout_veto(runner: Path, checkout: Path, opened: frozenset[st
     return ""
 
 
+def git_pack_bytes(gitdir: Path) -> int | None:
+    """Bytes of the .pack files in a git dir's objects/pack, from one directory listing (no git, no walk); None
+    when the directory or a pack in it cannot be read."""
+    total = 0
+    try:
+        with os.scandir(gitdir / "objects/pack") as it:
+            for e in it:
+                if e.name.endswith(".pack") and e.is_file(follow_symlinks=False):
+                    total += e.stat(follow_symlinks=False).st_size
+    except OSError:
+        return None
+    return total
+
+
+def checkout_origin(checkout: Path) -> str | None:
+    """The repository a checkout is of: its remote.origin.url as git reads it (includes too), normalized so https
+    and ssh spellings match (the host lowercased, the path as is). None when git cannot say; such a checkout is
+    never anyone's sibling."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0", GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL="/dev/null")
+    try:
+        out = subprocess.run(["git", "config", "--file", os.fspath(checkout / ".git/config"), "--includes", "--get",
+                              "remote.origin.url"], capture_output=True, timeout=30, check=True, env=env).stdout
+        url = os.fsdecode(out).strip()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    url = re.sub(r"^(?:https?://|ssh://|git://)?(?:[^@/]+@)?", "", url.removesuffix("/").removesuffix(".git"))
+    host, sep, path = url.replace(":", "/", 1).partition("/")
+    return f"{host.lower()}/{path}" if host and sep and path else None
+
+
+def bloated_runner_checkouts(checkouts: list[Path]) -> dict[str, int]:
+    """The checkouts whose packs are over RUNNER_CHECKOUT_BLOAT_RATIO times the median of the same repository's
+    other checkouts (by origin URL) and over RUNNER_CHECKOUT_BLOAT_MIN_GIB: path -> pack bytes. A checkout with no
+    sibling of its repository has nothing to compare with and never counts, and no checkout of a repository counts
+    when any of its checkouts' packs cannot be read."""
+    if RUNNER_CHECKOUT_BLOAT_RATIO == float("inf"):
+        return {}
+    sizes = {os.fspath(c): (checkout_origin(c), git_pack_bytes(c / ".git")) for c in checkouts}
+    unknown = {r for r, b in sizes.values() if b is None}  # a size that cannot be read could skew the median
+    out = {}
+    for path, (repo, size) in sizes.items():
+        if repo is None or repo in unknown:
+            continue
+        others = sorted(b for p, (r, b) in sizes.items() if r == repo and p != path)
+        if not others or size <= RUNNER_CHECKOUT_BLOAT_MIN_GIB * GIB:
+            continue
+        median = (others[(len(others) - 1) // 2] + others[len(others) // 2]) / 2
+        if size > RUNNER_CHECKOUT_BLOAT_RATIO * median:
+            out[path] = size
+    return out
+
+
 def evict_idle_runner_checkouts(receipt: Path, floor_gib: float, home: Path | None = None) -> int:
     """Remove idle runners' whole checkouts, least recently used first, each after fresh process evidence: every
-    one unused for RUNNER_STALE_CHECKOUT_HOURS, and under the runner gate's disk floor also younger ones (quiet for
-    RUNNER_IDLE_CHECKOUT_HOURS) until free space is back at the floor plus target_margin_gib."""
+    one unused for RUNNER_STALE_CHECKOUT_HOURS or bloated (bloated_runner_checkouts) and quiet for
+    RUNNER_IDLE_CHECKOUT_HOURS, and under the runner gate's disk floor also other quiet ones until free space is
+    back at the floor plus target_margin_gib."""
     home = HOME if home is None else home
     try:
         free, total = free_bytes(home)
@@ -2344,24 +2510,29 @@ def evict_idle_runner_checkouts(receipt: Path, floor_gib: float, home: Path | No
     under = floor_gib > 0 and free < (floor_gib + GATE_DISK_RESUME_GIB) * GIB
     target = min(int((floor_gib + POLICY["target_margin_gib"]) * GIB), total // 2)  # as filesystems() sets it
     now = time.time()
-    found = []
+    every = []
     for runner in enrolled_runners(home):
         work = runner / "_work"
         if work.is_symlink() or not work.is_dir():
             continue
-        for checkout in runner_checkouts(work):
-            if checkout.name != checkout.parent.name:  # only actions/checkout's default _work/<repo>/<repo>
-                continue
-            used = runner_checkout_last_use(runner, checkout)
-            idle = (now - used) / 3600
-            if idle >= RUNNER_IDLE_CHECKOUT_HOURS and (under or idle >= RUNNER_STALE_CHECKOUT_HOURS):
-                found.append((used, runner, checkout))
+        # only actions/checkout's default _work/<repo>/<repo>
+        every += [(runner, c) for c in runner_checkouts(work) if c.name == c.parent.name]
+    bloated = bloated_runner_checkouts([c for _, c in every])
+    found = []
+    for runner, checkout in every:
+        used = runner_checkout_last_use(runner, checkout)
+        idle = (now - used) / 3600
+        if idle >= RUNNER_IDLE_CHECKOUT_HOURS and (under or idle >= RUNNER_STALE_CHECKOUT_HOURS
+                                                   or os.fspath(checkout) in bloated):
+            found.append((used, runner, checkout))
     released = 0
     for used, runner, checkout in sorted(found, key=lambda t: t[0]):
         stale = (now - used) / 3600 >= RUNNER_STALE_CHECKOUT_HOURS
+        bloat = bloated.get(os.fspath(checkout), 0)
         try:
-            if not stale and free_bytes(home)[0] >= target:
-                break  # oldest first: every stale checkout came before this one
+            free_now = free_bytes(home)[0]
+            if not stale and not bloat and free_now >= target:
+                continue  # under the floor's last resort only until the target; stale and bloated ones still go
             opened, cmds = process_evidence()  # a job may have started since the last deletion
         except OSError:
             break
@@ -2369,8 +2540,17 @@ def evict_idle_runner_checkouts(receipt: Path, floor_gib: float, home: Path | No
             print(f"refusing to delete idle runner checkouts: {e}", file=sys.stderr)
             break
         why = idle_runner_checkout_veto(runner, checkout, open_index(opened), cmds)
-        if not why and stale and not under:  # above the floor only what git can lose nothing of goes
+        # Only the floor's last resort (under the floor, short of the target) takes a checkout git could lose
+        # something of; a stale or bloated one anywhere else goes only when git loses nothing.
+        if not why and not (under and free_now < target):
             why = runner_checkout_git_veto(checkout)
+        if not why:  # the git veto can take a minute (it may ask origin for its tags): judge the runner again now
+            try:
+                opened, cmds = process_evidence()
+            except NoEvidence as e:
+                print(f"refusing to delete idle runner checkouts: {e}", file=sys.stderr)
+                break
+            why = idle_runner_checkout_veto(runner, checkout, open_index(opened), cmds)
         size = 0
         if why:
             outcome = ("changed:modified" if why.startswith("used within")
@@ -2388,12 +2568,14 @@ def evict_idle_runner_checkouts(receipt: Path, floor_gib: float, home: Path | No
                "family": RUNNER_IDLE_CHECKOUT_FAMILY, "path": os.fspath(checkout), "bytes": size,
                "verdict": "reclaimable" if not why else "blocked",
                "reasons": [why] if why else [f"unused for {RUNNER_STALE_CHECKOUT_HOURS:g} h" if stale
+                                             else f"bloated: {gib(bloat).strip()} of packs" if bloat
                                              else "under the runner disk floor", "runner has no job"],
                "idle_hours": round((now - used) / 3600, 2)}
         with contextlib.suppress(OSError), receipt.open("a") as f:  # a lost receipt line must not stop the pass
             f.write(json.dumps(rec) + "\n")
         if outcome == "reclaimed":
-            why_now = f"unused for {RUNNER_STALE_CHECKOUT_HOURS:g} h" if stale else "under the disk floor"
+            why_now = (f"unused for {RUNNER_STALE_CHECKOUT_HOURS:g} h" if stale
+                       else f"bloated: {gib(bloat).strip()} of packs" if bloat else "under the disk floor")
             print(f"  reclaimed {gib(size).strip():>8s}  {checkout} (idle runner checkout, {why_now})")
     return released
 
@@ -6414,7 +6596,7 @@ LEGACY_AGES = {"DEFAULT_AGE_HOURS": 24.0, "KEPT_BUILD_IDLE_HOURS": 24.0, "IDLE_S
                "CANONICAL_ADMISSION_IDLE_HOURS": 24.0, "IDLE_SEED_HOURS": 12.0, "RUNTIME_IDLE_DAYS": 14.0,
                "CHECKOUT_BUILD_IDLE_HOURS": 24.0, "TMP_TEST_RESIDUE_IDLE_HOURS": 48.0,
                "RUNNER_STALE_CHECKOUT_HOURS": float("inf"), "RUNNER_CACHE_IDLE_HOURS": 168.0,
-               "CMUX_JOB_MIRROR_HOURS": 168.0}
+               "CMUX_JOB_MIRROR_HOURS": 168.0, "RUNNER_CHECKOUT_BLOAT_RATIO": float("inf")}
 LEGACY_POLICY = {"soft_idle_hours": 24.0, "stale_marker_max_hours": 48.0, "cmux_next_ci_host_idle_hours": 48.0}
 
 

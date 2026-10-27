@@ -4919,6 +4919,271 @@ class GlaedaDiskTest(unittest.TestCase):
                                  ("blocked:git", "a commit here is on no remote-tracking ref"))
                 self.assertEqual(why["actions-runner-glaeda"], ("reclaimed", "unused for 12 h"))
 
+    def _packs(self, co: Path, gib: float) -> None:
+        """A sparse .pack of gib GiB in co's object store (no .idx, so git never reads it)."""
+        pack = co / ".git/objects/pack"
+        pack.mkdir(parents=True, exist_ok=True)
+        with (pack / "pack-0000.pack").open("wb") as f:
+            f.truncate(int(gib * gd.GIB))
+        config = co / ".git/config"
+        if "url" not in (config.read_text() if config.exists() else ""):  # the repository it is a checkout of
+            with config.open("a") as f:
+                f.write(f'[remote "origin"]\n\turl = https://github.com/manaflow-ai/{co.name}.git\n')
+
+    def test_a_bloated_runner_checkout_goes_once_quiet_at_any_free_space(self) -> None:
+        """2026-10-27: one runner per mini held a 6.8 GiB full-history checkout with 22k remote refs while its
+        siblings held about 0.55 GiB. Far above the floor, it goes once its runner is quiet; its siblings stay."""
+        names = {"actions-runner-glaeda": 2, "actions-runner-glaeda-2": 2, "actions-runner-glaeda-3": 2,
+                 "actions-runner-glaeda-11": 2, "actions-runner-glaeda-12": 0.05}
+        home, cos = self._idle_checkouts(names)
+        gd.process_evidence = lambda: ([], "")
+        for name, age in names.items():
+            self._git_checkout(cos[name])
+            self._packs(cos[name], 6.8 if name in ("actions-runner-glaeda-11", "actions-runner-glaeda-12") else 0.55)
+            self._age(home / name, hours=age)
+        self.assertEqual(set(gd.bloated_runner_checkouts(list(cos.values()))),
+                         {str(cos["actions-runner-glaeda-11"]), str(cos["actions-runner-glaeda-12"])})
+        patches, removed = self._floor_disk(400.0)  # far above the floor and its target
+        receipt = self.receipt()
+        with patches[0], patches[1], contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertGreater(gd.evict_idle_runner_checkouts(receipt, 30.0, home), 0)
+        self.assertEqual(removed, [str(cos["actions-runner-glaeda-11"])])
+        self.assertTrue(cos["actions-runner-glaeda-12"].is_dir(), "used minutes ago: its job may be finishing")
+        self.assertIn("bloated: ", out.getvalue())
+        (rec,) = map(json.loads, receipt.read_text().splitlines())
+        self.assertEqual((rec["outcome"], rec["reasons"][0][:9]), ("reclaimed", "bloated: "))
+
+    def test_bloat_is_relative_to_the_same_repositorys_siblings(self) -> None:
+        root = self.root / "bloat"
+        cos = []
+        for i, (repo, size) in enumerate([("cmux", 6.8), ("cmux", 0.55), ("cmux", 0.6), ("big", 9.0), ("big", 8.0),
+                                          ("lone", 9.0), ("cmux", 1.9)]):
+            co = root / f"r{i}/_work/{repo}/{repo}"
+            self._packs(co, size)
+            cos.append(co)
+        # the 6.8 GiB cmux one only: big is big everywhere, lone has no sibling, 1.9 GiB is under the 2 GiB minimum
+        self.assertEqual(set(gd.bloated_runner_checkouts(cos)), {str(cos[0])})
+        self.assertEqual(gd.git_pack_bytes(cos[1] / ".git"), int(0.55 * gd.GIB))
+        with mock.patch.object(gd, "RUNNER_CHECKOUT_BLOAT_RATIO", float("inf")):  # a reserved host keeps legacy ages
+            self.assertEqual(gd.bloated_runner_checkouts(cos), {})
+
+    def test_a_bloated_checkout_keeps_a_commit_only_it_has(self) -> None:
+        names = {"actions-runner-glaeda": 2, "actions-runner-glaeda-2": 2, "actions-runner-glaeda-11": 2}
+        home, cos = self._idle_checkouts(names)
+        gd.process_evidence = lambda: ([], "")
+        for name, age in names.items():
+            self._git_checkout(cos[name], pushed=name != "actions-runner-glaeda-11")
+            self._packs(cos[name], 6.8 if name == "actions-runner-glaeda-11" else 0.55)
+            self._age(home / name, hours=age)
+        patches, removed = self._floor_disk(400.0)
+        receipt = self.receipt()
+        with patches[0], patches[1]:
+            self.assertEqual(gd.evict_idle_runner_checkouts(receipt, 30.0, home), 0)
+        self.assertEqual(removed, [])
+        (rec,) = map(json.loads, receipt.read_text().splitlines())
+        self.assertEqual((rec["outcome"], rec["reasons"][0]), ("blocked:git", "a commit here is on no remote-tracking ref"))
+
+    def test_past_the_target_under_the_floor_a_bloated_checkout_keeps_a_commit_only_it_has(self) -> None:
+        """Under the floor the last resort takes quiet checkouts without the git veto only until the target; a
+        bloated one past it goes only when git loses nothing."""
+        names = {"actions-runner-glaeda": 2, "actions-runner-glaeda-2": 2, "actions-runner-glaeda-11": 2}
+        home, cos = self._idle_checkouts(names)
+        gd.process_evidence = lambda: ([], "")
+        for name, age in names.items():
+            self._git_checkout(cos[name], pushed=name != "actions-runner-glaeda-11")
+            self._packs(cos[name], 6.8 if name == "actions-runner-glaeda-11" else 0.55)
+            self._age(home / name, hours=age)
+        patches, removed = self._floor_disk(31.0, freed_gib=30.0)  # under the resume mark; one removal reaches 61
+        with mock.patch.object(gd, "runner_checkout_last_use",  # the bloated one was used last, so it sorts last
+                               side_effect=lambda r, c: time.time() - 3600 * (1 if r.name.endswith("-11") else 2)), \
+                patches[0], patches[1], contextlib.redirect_stdout(io.StringIO()):
+            gd.evict_idle_runner_checkouts(self.receipt(), 30.0, home)
+        self.assertEqual(len(removed), 1)
+        self.assertNotIn(str(cos["actions-runner-glaeda-11"]), removed)
+        self.assertTrue((cos["actions-runner-glaeda-11"] / ".git").is_dir())
+
+    def test_the_git_veto_keeps_a_commit_only_a_submodule_has(self) -> None:
+        env = {"PATH": "/usr/bin:/bin:/opt/homebrew/bin", "HOME": os.fspath(self.root), "GIT_AUTHOR_NAME": "t",
+               "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x"}
+
+        def git(where: Path, *args: str) -> None:
+            subprocess.run(["git", *args], cwd=where, env=env, check=True, capture_output=True)
+        co = self.root / "sub/_work/cmux/cmux"
+        self._git_checkout(co)
+        for gitdir in (co / ".git/modules/ghostty", co / ".git/modules/ghostty/modules/nested"):
+            gitdir.parent.mkdir(parents=True, exist_ok=True)
+            git(gitdir.parent, "init", "-q", "--bare", gitdir.name)
+            git(gitdir, "--work-tree", os.fspath(self.root), "commit", "-q", "--allow-empty", "-m", "base")
+            git(gitdir, "update-ref", "refs/remotes/origin/main", "HEAD")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "")
+        nested = co / ".git/modules/ghostty/modules/nested"
+        git(nested, "--work-tree", os.fspath(self.root), "commit", "-q", "--allow-empty", "-m", "only here")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a commit in modules/ghostty/modules/nested is on no remote-tracking ref")
+        git(nested, "update-ref", "refs/remotes/origin/main", "HEAD")
+        embedded = co / "vendor/lib"
+        embedded.mkdir(parents=True)
+        git(embedded, "init", "-q")
+        git(embedded, "commit", "-q", "--allow-empty", "-m", "embedded, on no remote")
+        sha = subprocess.run(
+            ["git", "-C", os.fspath(embedded), "rev-parse", "HEAD"], env=env, check=True, capture_output=True,
+            text=True).stdout.strip()
+        git(co, "update-index", "--add", "--cacheinfo", f"160000,{sha},vendor/lib")  # a gitlink in the index
+        self.assertEqual(gd.runner_checkout_git_veto(co), "submodule vendor/lib keeps its own repository in the work tree")
+        shutil.rmtree(embedded / ".git")
+        (embedded / ".git").write_text("gitdir: ../../.git/modules/lib\n")  # absorbed: followed into its work tree
+        inner = embedded / "deeper"
+        inner.mkdir()
+        git(inner, "init", "-q")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "git could not list the index of lib")  # gitfile is dangling
+        (embedded / ".git").unlink()
+        shutil.rmtree(inner)
+        self.assertEqual(gd.runner_checkout_git_veto(co), "", "an uninitialized submodule has no repository here")
+        (co / ".git/index").write_bytes(b"not an index")  # git cannot list it: doubt keeps it
+        self.assertEqual(gd.runner_checkout_git_veto(co), "git could not list the index of cmux")
+        (co / ".git/index").unlink()
+        self.assertEqual(gd.runner_checkout_git_veto(co), "")
+        # refs beyond branches and tags, a locked linked worktree and a symlink inside .git
+        git(co, "commit", "-q", "--allow-empty", "-m", "bisect only")
+        git(co, "update-ref", "refs/bisect/bad", "HEAD")
+        git(co, "checkout", "-q", "--detach", "refs/remotes/origin/main")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a commit here is on no remote-tracking ref")
+        git(co, "update-ref", "-d", "refs/bisect/bad")
+        (co / ".git/worktrees/w").mkdir(parents=True)
+        (co / ".git/worktrees/w/locked").write_text("")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a linked worktree of it is locked")
+        shutil.rmtree(co / ".git/worktrees")
+        (co / ".git/modules/elsewhere").symlink_to(self.root)
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a symlink inside .git: git could not say what it holds")
+        (co / ".git/modules/elsewhere").unlink()
+        # a submodule store named refs is still walked
+        named_refs = co / ".git/modules/refs"
+        git(named_refs.parent, "init", "-q", "--bare", "refs")
+        git(named_refs, "--work-tree", os.fspath(self.root), "commit", "-q", "--allow-empty", "-m", "only here")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a commit in modules/refs is on no remote-tracking ref")
+        shutil.rmtree(named_refs)
+        # a linked worktree's submodule store, and a detached HEAD in a submodule's own linked worktree
+        store = co / ".git/worktrees/wt/modules/sub"
+        store.parent.mkdir(parents=True)
+        git(store.parent, "init", "-q", "--bare", "sub")
+        git(store, "--work-tree", os.fspath(self.root), "commit", "-q", "--allow-empty", "-m", "only here")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a commit in worktrees/wt/modules/sub is on no remote-tracking ref")
+        shutil.rmtree(co / ".git/worktrees")
+        ghostty = co / ".git/modules/ghostty"
+        wt = self.root / "ghostty-wt"
+        git(ghostty, "worktree", "add", "-q", "--detach", os.fspath(wt), "refs/remotes/origin/main")
+        git(wt, "commit", "-q", "--allow-empty", "-m", "only in the submodule's worktree")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a commit in modules/ghostty is on no remote-tracking ref")
+
+    def test_a_tag_origin_has_at_the_same_object_is_not_only_here(self) -> None:
+        """A full-history fetch brings origin's tags of commits on no branch (cmux-rbh-src-*): they keep nothing.
+        A tag origin lacks, or has at another object, still keeps the checkout; so does an origin git cannot ask."""
+        env = {"PATH": "/usr/bin:/bin:/opt/homebrew/bin", "HOME": os.fspath(self.root), "GIT_AUTHOR_NAME": "t",
+               "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x"}
+
+        def git(where: Path, *args: str) -> str:
+            return subprocess.run(["git", "-C", os.fspath(where), *args], env=env, check=True, capture_output=True,
+                                  text=True).stdout.strip()
+        co = self.root / "tags/_work/cmux/cmux"
+        self._git_checkout(co)
+        origin = self.root / "tags-origin.git"
+        subprocess.run(["git", "init", "-q", "--bare", os.fspath(origin)], env=env, check=True)
+        git(co, "remote", "add", "origin", os.fspath(origin))
+        git(co, "push", "-q", "origin", "HEAD:refs/heads/main")
+        git(co, "commit", "-q", "--allow-empty", "-m", "staging, on no branch")
+        git(co, "tag", "-a", "-m", "src", "cmux-rbh-src-1")
+        git(co, "push", "-q", "origin", "refs/tags/cmux-rbh-src-1")
+        git(co, "checkout", "-q", "--detach", "refs/remotes/origin/main")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "")
+        git(co, "commit", "-q", "--allow-empty", "-m", "tagged here only")
+        git(co, "tag", "local-only")
+        git(co, "checkout", "-q", "--detach", "refs/remotes/origin/main")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a commit here is on no remote-tracking ref")
+        git(co, "push", "-q", "origin", "refs/tags/local-only")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "")
+        git(co, "tag", "-f", "local-only", "refs/tags/cmux-rbh-src-1^{commit}")  # moved here: origin has it elsewhere
+        git(co, "commit", "-q", "--allow-empty", "-m", "another")
+        git(co, "tag", "-f", "local-only")
+        git(co, "checkout", "-q", "--detach", "refs/remotes/origin/main")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a commit here is on no remote-tracking ref")
+        git(co, "remote", "set-url", "origin", os.fspath(self.root / "gone.git"))
+        self.assertEqual(gd.runner_checkout_git_veto(co), "git could not say whether a commit is only here")
+
+    def test_a_submodule_commit_a_pushed_gitlink_pins_still_keeps_the_checkout(self) -> None:
+        """A job may push a superproject gitlink to a submodule commit it never pushed; the pin proves nothing."""
+        env = {"PATH": "/usr/bin:/bin:/opt/homebrew/bin", "HOME": os.fspath(self.root), "GIT_AUTHOR_NAME": "t",
+               "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x"}
+
+        def git(where: Path, *args: str) -> str:
+            return subprocess.run(["git", *args], cwd=where, env=env, check=True, capture_output=True,
+                                  text=True).stdout.strip()
+        co = self.root / "pins/_work/cmux/cmux"
+        self._git_checkout(co)
+        store = co / ".git/modules/ghostty"
+        store.parent.mkdir(parents=True)
+        git(store.parent, "init", "-q", "--bare", "ghostty")
+        git(store, "--work-tree", os.fspath(self.root), "commit", "-q", "--allow-empty", "-m", "made by a job")
+        pin = git(store, "rev-parse", "HEAD")
+        git(co, "update-index", "--add", "--cacheinfo", f"160000,{pin},ghostty")
+        git(co, "commit", "-q", "-m", "pin ghostty")
+        git(co, "update-ref", "refs/remotes/origin/main", "HEAD")  # the superproject's gitlink is pushed
+        git(co, "checkout", "-q", "--detach", "refs/remotes/origin/main")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a commit in modules/ghostty is on no remote-tracking ref")
+        git(store, "update-ref", "refs/remotes/origin/main", pin)
+        self.assertEqual(gd.runner_checkout_git_veto(co), "")
+        (store / "worktrees/w").mkdir(parents=True)  # a submodule's own locked linked worktree
+        (store / "worktrees/w/locked").write_text("")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a linked worktree of it is locked")
+        shutil.rmtree(store / "worktrees")
+        (co / ".git/modules/dangling").symlink_to(self.root / "nowhere")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a symlink inside .git: git could not say what it holds")
+
+    def test_a_job_that_starts_during_the_git_veto_keeps_its_checkout(self) -> None:
+        names = {"actions-runner-glaeda": 2, "actions-runner-glaeda-2": 2, "actions-runner-glaeda-11": 2}
+        home, cos = self._idle_checkouts(names)
+        for name, age in names.items():
+            self._git_checkout(cos[name])
+            self._packs(cos[name], 6.8 if name == "actions-runner-glaeda-11" else 0.55)
+            self._age(home / name, hours=age)
+        live = f"{home / 'actions-runner-glaeda-11'}/bin/Runner.Worker spawnclient 1 2\n"
+        reads = iter([([], ""), ([], live)])  # idle when first judged, a job by the time the veto returns
+        gd.process_evidence = lambda: next(reads, ([], live))
+        patches, removed = self._floor_disk(400.0)
+        receipt = self.receipt()
+        with patches[0], patches[1]:
+            self.assertEqual(gd.evict_idle_runner_checkouts(receipt, 30.0, home), 0)
+        self.assertEqual(removed, [])
+        (rec,) = map(json.loads, receipt.read_text().splitlines())
+        self.assertIn("running a job", rec["reasons"][0])
+
+    def test_bloat_siblings_share_an_origin_and_an_unreadable_size_counts_none(self) -> None:
+        root = self.root / "origin"
+        cos = []
+        for i, (url, size) in enumerate([("https://github.com/a/foo.git", 6.8), ("git@github.com:a/foo", 0.55),
+                                         ("https://github.com/b/foo", 0.5), ("https://github.com/b/foo", 0.6)]):
+            co = root / f"r{i}/_work/foo/foo"
+            self._packs(co, size)
+            (co / ".git/config").write_text(f'[core]\n\tbare = false\n[remote "origin"]\n\turl = {url}\n')
+            cos.append(co)
+        (cos[3] / ".git/included").write_text('[Remote "origin"]\n\tURL = https://GitHub.com/b/foo\n')  # git's spelling
+        (cos[3] / ".git/config").write_text("[include]\n\tpath = included\n")  # through an include
+        # a/foo over https and ssh is one repository; b/foo's checkouts are not its siblings
+        self.assertEqual(gd.checkout_origin(cos[0]), gd.checkout_origin(cos[1]))
+        self.assertNotEqual(gd.checkout_origin(cos[0]), gd.checkout_origin(cos[2]))
+        self.assertEqual(set(gd.bloated_runner_checkouts(cos)), {str(cos[0])})
+        self.assertEqual(set(gd.bloated_runner_checkouts([cos[0], cos[2], cos[3]])), set(), "no a/foo sibling")
+        self.assertEqual(gd.checkout_origin(cos[3]), "github.com/b/foo")
+        (cos[1] / ".git/config").write_text('[remote "origin"]\n\turl = git@github.com:A/foo\n')
+        self.assertNotEqual(gd.checkout_origin(cos[0]), gd.checkout_origin(cos[1]), "a path is case-sensitive")
+        (cos[1] / ".git/config").write_text('[remote "origin"]\n\turl = git@github.com:a/foo\n')
+        (cos[2] / ".git/config").write_bytes(b'[remote "origin"]\n\turl = https://github.com/b/f\xffoo\n')
+        gd.checkout_origin(cos[2])  # bytes that are not UTF-8 never raise
+        (cos[2] / ".git/config").write_text("[core]\n")  # no origin: never a sibling, never bloated
+        self.assertIsNone(gd.checkout_origin(cos[2]))
+        self.assertEqual(set(gd.bloated_runner_checkouts([cos[0], cos[2]])), set())
+        shutil.rmtree(cos[1] / ".git/objects/pack")  # a sibling whose packs cannot be read
+        self.assertIsNone(gd.git_pack_bytes(cos[1] / ".git"))
+        self.assertEqual(gd.bloated_runner_checkouts(cos), {})
+
     def test_the_git_veto_ignores_the_callers_git_env_and_keeps_what_it_cannot_read(self) -> None:
         co = self.root / "veto/_work/cmux/cmux"
         self._git_checkout(co, pushed=False)
