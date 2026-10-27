@@ -799,6 +799,7 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "7c3dce3781487309ea60bacbfaccf7281895aaeb6085e7c4165aac474084fb9d",
     "d3ea6871c8419875cc63492f3dd204c87ab28f07224b1776a00f34e104e57c8c",
     "3d479aa88831d2ae6301779269b77be27b17585a23fa2a198e4749e88d7aa844",
+    "b9316cb3aa5120fef83ed552cdcd109e7767ff4c269b98b5c4acbe16a4f5941a",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -2868,6 +2869,203 @@ def evict_idle_runner_checkouts(receipt: Path, floor_gib: float, home: Path | No
                        else f"bloated: {gib(bloat).strip()} of packs" if bloat else "under the disk floor")
             print(f"  reclaimed {gib(size).strip():>8s}  {checkout} (idle runner checkout, {why_now})")
     return released
+
+
+# A bloated checkout (bloated_runner_checkouts) whose runner takes job after job is never quiet for
+# RUNNER_IDLE_CHECKOUT_HOURS, so evict_idle_runner_checkouts never takes it: an hour after it reached stable
+# (2026-10-27), the tour runner's 7-8 GiB checkout (glaeda-11) was still on all 11 minis. The runner hook takes it at
+# job-started instead (--own-runner-checkout): the job's own workspace, before any step of the job runs, so no job of
+# this runner is using it and no other runner ever does. Only its .git goes; the workspace directory stays for the
+# steps that run before checkout, and actions/checkout, finding no repository there, clones at the job's depth.
+RUNNER_CHECKOUT_AT_START_FAMILY = "runner-bloated-checkout-at-start"
+# The job must be starting: its Runner.Worker began at most this long ago, and nothing in the checkout's git
+# bookkeeping is newer than that start (a checkout step rewrites the index, HEAD and FETCH_HEAD). A later step of
+# the job, or any other caller, finds the checkout already in use and is refused.
+RUNNER_JOB_START_WINDOW_S = 600.0
+
+
+def runner_agent_name(runner: Path) -> str | None:
+    """The runner's name from its .runner config (agentName), or None when it cannot be read."""
+    try:
+        doc = json.loads((runner / ".runner").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    name = doc.get("agentName") if isinstance(doc, dict) else None
+    return name if isinstance(name, str) and name else None
+
+
+def checkout_git_touched(checkout: Path) -> float:
+    """The newest mtime of the checkout's git bookkeeping, which any git command that moves it rewrites."""
+    times = [0.0]
+    for n in ("index", "HEAD", "FETCH_HEAD", "logs/HEAD", "packed-refs", "shallow", "config"):
+        with contextlib.suppress(OSError):
+            times.append((checkout / ".git" / n).lstat().st_mtime)
+    return max(times)
+
+
+def checkout_users(checkout: Path) -> tuple[str, str]:
+    """The processes other than this one and its ancestors (the job-started hook, whose working directory is the
+    workspace) that have a file open or their working directory anywhere in the checkout ("pid N (command)", or ""),
+    and every command line. ps and lsof run in this process's own group, so the hook's timeout kill takes them too.
+    Raises NoEvidence when lsof or ps cannot say."""
+    def query(argv: list[str], timeout: float) -> tuple[int, str]:
+        r = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
+                           timeout=timeout, check=False)
+        return r.returncode, r.stdout
+    try:
+        code, out = query(["ps", "-axww", "-o", "pid=,ppid=,command="], 30)
+        lcode, listing = query([shutil.which("lsof") or "/usr/sbin/lsof", "-n", "-P", "-Fpn"], 60)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise NoEvidence(f"lsof or ps: {e}") from e
+    if code != 0 or not out.strip() or lcode != 0 or not listing.strip():
+        raise NoEvidence(f"lsof or ps failed (exit {lcode}, {code})")
+    parents, commands = {}, {}
+    for line in out.splitlines():
+        fields = line.split(None, 2)
+        if len(fields) >= 2 and fields[0].isdigit() and fields[1].isdigit():
+            parents[int(fields[0])], commands[int(fields[0])] = int(fields[1]), (fields[2] if len(fields) > 2 else "")
+    mine, pid = set(), os.getpid()
+    while pid > 1 and pid not in mine:
+        mine.add(pid)
+        pid = parents.get(pid, 0)
+    names = {*spellings(os.fspath(checkout)), *spellings(os.fspath(checkout.resolve()))}
+    pid = 0
+    for line in listing.splitlines():
+        if line.startswith("p") and line[1:].isdigit():
+            pid = int(line[1:])
+        elif line.startswith("n/") and pid not in mine:
+            path = line[1:]
+            if any(path == n or path.startswith(n + "/") for n in names):
+                return f"pid {pid} ({commands.get(pid, '?')[:80]})", command_text("\n".join(commands.values()))
+    return "", command_text("\n".join(commands.values()))
+
+
+def live_linked_worktrees(checkout: Path) -> list[str] | None:
+    """The linked worktrees of the checkout's repository and of every repository stored inside its .git (absorbed
+    submodules under modules/, nested ones) whose directories still exist (each <gitdir>/worktrees/<name>/gitdir
+    names its <worktree>/.git; a --relative-paths one from worktrees/<name>), or None when any of it cannot be read.
+    A worktree whose directory is gone (a job's RUNNER_TEMP, wiped between jobs) is only a stale entry."""
+    dotgit = checkout / ".git"
+    roots = []
+    try:
+        for root, dirs, files in os.walk(dotgit, onerror=lambda e: (_ for _ in ()).throw(e)):
+            if "worktrees" in dirs and ("HEAD" in files or Path(root) == dotgit):
+                roots.append(Path(root) / "worktrees")
+            if "HEAD" in files and "objects" in dirs:  # a git dir: its stores hold no git dirs
+                dirs[:] = [d for d in dirs if d not in ("objects", "lfs", "logs", "refs", "worktrees")]
+    except OSError:
+        return None
+    live = []
+    for root in roots:
+        try:
+            entries = list(os.scandir(root))
+        except OSError:
+            return None
+        for e in entries:
+            try:
+                target = (Path(e.path) / "gitdir").read_text().strip()
+            except OSError:
+                return None
+            if not target:
+                return None
+            target = os.path.normpath(os.path.join(e.path, target))  # a relative backlink is from worktrees/<name>
+            if os.path.lexists(os.path.dirname(target)):
+                live.append(os.path.dirname(target))
+    return live
+
+
+def evict_own_runner_checkout(workspace: Path, receipt: Path, home: Path | None = None) -> str:
+    """Remove the .git of the starting job's own workspace when it is a bloated runner checkout and git loses nothing:
+    a one-line note, or "" when the workspace is not an enrolled runner's _work/<repo>/<repo>, is not bloated, or the
+    host is reserved. Any veto (git, an open file in its .git, a command naming the checkout, no process evidence)
+    keeps it and writes a blocked receipt. Never raises OSError."""
+    home = HOME if home is None else home
+    checkout = Path(os.path.abspath(workspace))
+    runner = checkout.parent.parent.parent
+    runners = enrolled_runners(home)
+    if checkout.parent.parent.name != "_work" or checkout.name != checkout.parent.name or runner not in runners:
+        return ""
+    if checkout not in runner_checkouts(runner / "_work") or host_reservation() or disk_off():
+        return ""
+    name = os.environ.get("RUNNER_NAME")
+    if not name or runner_agent_name(runner) != name:
+        return ""  # only the runner whose job is starting, about its own workspace
+    started = runner_job_started(runner)
+    if started is None or time.time() - started > RUNNER_JOB_START_WINDOW_S \
+            or checkout_git_touched(checkout) >= started:
+        return ""  # no job starting here, or this job already used the checkout
+    every = [c for r in runners if not (r / "_work").is_symlink() and (r / "_work").is_dir()
+             for c in runner_checkouts(r / "_work") if c.name == c.parent.name]
+    bloat = bloated_runner_checkouts(every).get(os.fspath(checkout), 0)
+    if not bloat:
+        return ""
+    git_dir = checkout / ".git"
+    linked = live_linked_worktrees(checkout)
+    why = ("its linked worktrees cannot be read" if linked is None
+           else f"a linked worktree uses it ({linked[0]})" if linked else runner_checkout_git_veto(checkout))
+    if not why:  # the git veto can take a minute: the evidence is read after it
+        try:
+            users, cmds = checkout_users(checkout)
+        except NoEvidence as e:
+            why = f"no process evidence: {e}"
+        else:
+            resolved = os.fspath(checkout.resolve())
+            if users:
+                why = f"open or a working directory of {users}"
+            elif named_by(os.fspath(checkout), cmds) or named_by(resolved, cmds):
+                why = "named by a running command"
+    size = 0
+    if why:
+        outcome = "blocked:git" if why.startswith(("git", "a commit", "not a plain")) else "changed:in-use"
+    else:
+        try:
+            before = free_bytes(home)[0]
+            remove(git_dir)
+            outcome = "reclaimed"
+            size = max(0, free_bytes(home)[0] - before)
+        except OSError as e:
+            outcome = f"incomplete:{e.__class__.__name__}"
+    rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(), "outcome": outcome,
+           "family": RUNNER_CHECKOUT_AT_START_FAMILY, "path": os.fspath(git_dir), "bytes": size,
+           "verdict": "blocked" if why else "reclaimable",
+           "reasons": [why] if why else [f"bloated: {gib(bloat).strip()} of packs", "its runner's job is starting"]}
+    with contextlib.suppress(OSError):
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        with receipt.open("a") as f:
+            f.write(json.dumps(rec) + "\n")
+    RUN["released"] = RUN.get("released", 0) + size
+    if why:
+        return f"kept the bloated checkout {checkout} ({gib(bloat).strip()} of packs): {why}"
+    if outcome != "reclaimed":
+        return f"could not remove {git_dir}: {outcome}"
+    return f"removed {git_dir} ({gib(bloat).strip()} of packs, bloated; freed {gib(size).strip()}); checkout clones it again"
+
+
+def own_runner_checkout_main(args: list[str]) -> int:
+    """glaeda-disk --own-runner-checkout [--receipt PATH]: evict_own_runner_checkout on $GITHUB_WORKSPACE, from the
+    runner hook at job-started. The workspace comes from the environment, so no command line names it. Exits 0."""
+    ap = argparse.ArgumentParser(prog="glaeda-disk --own-runner-checkout")
+    ap.add_argument("--own-runner-checkout", action="store_true")
+    ap.add_argument("--receipt", type=Path, default=HOME / "Projects/recovery/disk-reclaim/receipts.jsonl")
+    a = ap.parse_args(args)
+    workspace = os.environ.get("GITHUB_WORKSPACE")
+    if not workspace or not os.environ.get("RUNNER_NAME"):
+        return 0
+    RUN.clear()
+    RUN.update(caller=run_caller(), mode="own-runner-checkout", apply=True)
+    started, before = time.time(), _home_free()
+    try:
+        if (off := disk_off()):
+            RUN.update(off=True, skipped=f"kill switch: {off}")
+            return 0
+        note = evict_own_runner_checkout(Path(workspace), a.receipt)
+        if note:
+            print(note)
+        else:
+            RUN["skipped"] = "not a bloated checkout of a starting job"
+        return 0
+    finally:
+        write_run_line(started, before)
 
 
 
@@ -10502,6 +10700,8 @@ def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if "--census" in args:
         return census_main(args)
+    if "--own-runner-checkout" in args:
+        return own_runner_checkout_main(args)
     background = "--refresh" in args and "--refresh-lock-fd" in args and "--apply" not in args
     if not background:
         return _logged_main(args)

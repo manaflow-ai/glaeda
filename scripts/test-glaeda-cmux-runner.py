@@ -359,6 +359,53 @@ class HookTest(unittest.TestCase):
         self.assertNotIn("sparse", result.stdout)
         self.assertTrue((full / ".build").is_dir() and (full / "Packages" / "B.swift").is_file())
 
+    def test_job_started_asks_glaeda_disk_only_about_a_workspace_past_the_bloat_minimum(self) -> None:
+        """job-started runs glaeda-disk --own-runner-checkout (from /, in its own session, the workspace in its
+        environment) only when the workspace's packs pass the 2 GiB bloat minimum, so an ordinary job pays one
+        directory listing. A timeout kills its whole process group; nothing ever fails the job."""
+        ws = self.dir / "actions-runner-glaeda-11" / "_work" / "cmux" / "cmux"
+        pack = ws / ".git" / "objects" / "pack"
+        pack.mkdir(parents=True)
+        with (pack / "pack-1.pack").open("wb") as f:
+            f.truncate(int(1.9 * 1024**3))
+        runs = []
+
+        class Proc:
+            pid = 4242
+
+            def __init__(self, argv, **kw):
+                runs.append((argv, kw.get("cwd"), kw.get("start_new_session")))
+
+            def communicate(self, timeout=None):
+                return "measuring\nremoved it\n", ""
+        disk = self.dir / "glaeda-disk"
+        disk.write_text("")
+        with mock.patch.object(hook.subprocess, "Popen", Proc), mock.patch.object(hook.os, "killpg"):
+            self.assertEqual(hook.evict_own_checkout(os.fspath(ws), os.fspath(disk)), "")
+            self.assertEqual(hook.evict_own_checkout(None, os.fspath(disk)), "")
+            self.assertEqual(hook.evict_own_checkout(os.fspath(self.dir / "none"), os.fspath(disk)), "")
+            self.assertEqual(runs, [])
+            with (pack / "pack-2.pack").open("wb") as f:
+                f.truncate(int(0.2 * 1024**3))
+            self.assertEqual(hook.evict_own_checkout(os.fspath(ws), os.fspath(disk)), "removed it")
+        self.assertEqual(runs, [([sys.executable, os.fspath(disk), "--own-runner-checkout"], "/", True)])
+
+        class Slow(Proc):
+            calls = 0
+
+            def communicate(self, timeout=None):
+                Slow.calls += 1
+                if Slow.calls == 1:
+                    raise subprocess.TimeoutExpired("glaeda-disk", timeout)
+                return "", ""
+        killed = []
+        with mock.patch.object(hook.subprocess, "Popen", Slow), \
+                mock.patch.object(hook.os, "killpg", side_effect=lambda pid, sig: killed.append((pid, sig))):
+            self.assertIn("timed out", hook.evict_own_checkout(os.fspath(ws), os.fspath(disk), timeout=1))
+        self.assertEqual(killed, [(4242, hook.signal.SIGKILL)])
+        with mock.patch.object(hook.subprocess, "Popen", side_effect=OSError("gone")):
+            self.assertEqual(hook.evict_own_checkout(os.fspath(ws), os.fspath(disk)), "")
+
     def test_a_workspace_a_failed_checkout_left_is_reset_before_the_next(self) -> None:
         """glaeda-2 kept failing cmux-tui checkouts after the sparse job had gone (op-restore-sqlite: three
         runs on 2026-10-12, missing scripts/install-zig-ci.sh, "not uptodate"): a failed checkout leaves
