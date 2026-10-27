@@ -469,6 +469,17 @@ DEV_COMPILE_CAPACITY_WAIT_S = 60.0
 # wait ADMISSION_WAIT_S more for admission.lock, so the refusal comes within DEV_BOUND_WORST_S, far inside the 15
 # and 20 minute timeouts it protects.
 DEV_DAILY_WORKFLOW = "cmux-next-dev-daily.yml"
+# NEXT's nightly app build (nightly.yml build-nightly-app on a nightly-next push, attempt 1) is placed on an owned
+# label only while one of its runners is idle (cmux scripts/ci/nightly_build_runner.py), but an idle listener does
+# not mean free units. FEED_FIRST puts a nightly job first in line and preempts nothing, so it waits for running PR
+# jobs to end: on 2026-10-27 such builds sat in "Set up runner" with "0 of 14 units free" for minutes, and owned
+# builds' setup wait was 7.8 / 37.5 min p50 / p95. A feed may be at most 30 minutes behind its branch, and every
+# reservation falls back within minutes. So that job waits NIGHTLY_CAPACITY_WAIT_S at most and is then refused:
+# cmux's owned-pool rescue re-runs a refused nightly-next build, and attempt 2 takes the picker's moving Blacksmith
+# label. Like the DEV bound, it limits when the last try starts (NIGHTLY_BOUND_WORST_S).
+NIGHTLY_CAPACITY_WAIT_S = 90.0
+NIGHTLY_APP_JOB = "build-nightly-app"
+NIGHTLY_NEXT_REF = "refs/heads/nightly-next"
 # CAPACITY_WAIT: an ordinary cmux job that finds its units or tokens taken waits for them, with no time limit,
 # instead of failing. The DEV cmux-next scheme compile is the bounded exception above: GitHub handed the job to
 # this runner and never moves it to another one, so a refusal only turned a
@@ -612,6 +623,17 @@ def dev_compile_capacity_wait(repo: str | None, home_repo: str, event_name: str 
         if isinstance(inputs, dict) and str(inputs.get("dev_daily", "")).lower() == "true":
             return DEV_COMPILE_CAPACITY_WAIT_S
     return None
+
+
+def nightly_capacity_wait(tier: str, event_name: str | None, ref: str | None, job: str | None, workflow: str,
+                          attempt: str | None) -> float | None:
+    """NIGHTLY_CAPACITY_WAIT_S for NEXT's nightly app build on a nightly-next push's attempt 1 (the push the owned-pool
+    rescue re-runs, onto Blacksmith), else None. `tier` is job_tier()'s answer, so only merged nightly.yml code on
+    nightly-next's own ref qualifies; a dispatch or schedule there, which the rescue does not watch, keeps its wait."""
+    if (tier != TIER_NIGHTLY or event_name != "push" or ref != NIGHTLY_NEXT_REF or job != NIGHTLY_APP_JOB
+            or workflow != "nightly.yml"):
+        return None
+    return NIGHTLY_CAPACITY_WAIT_S if attempt == "1" else None
 
 
 def bounded_wait(cap: float | None, bound: float | None) -> float | None:
@@ -1022,6 +1044,8 @@ def export_root(name: str) -> str:
 ADMISSION_WAIT_S = 30.0  # admissions are serialized briefly so two jobs never split the free units
 # A DEV-bounded job's worst wait before its refusal (DEV_DAILY_WORKFLOW's comment).
 DEV_BOUND_WORST_S = DEV_COMPILE_CAPACITY_WAIT_S + ADMISSION_WAIT_S + ADMIT_POLL_S
+# The nightly-next app build's worst wait before its refusal (NIGHTLY_CAPACITY_WAIT_S's comment).
+NIGHTLY_BOUND_WORST_S = NIGHTLY_CAPACITY_WAIT_S + ADMISSION_WAIT_S + ADMIT_POLL_S
 # The listener gate reads its runner's --capacity-units from the job-started hook glaeda-cmux-runner wrote.
 RUNNER_HOOK_SCRIPT = "glaeda-hooks/job-started.sh"
 LISTEN_SCRIPT = "glaeda-hooks/listen.sh"
@@ -7055,9 +7079,15 @@ def main(argv: list[str] | None = None) -> int:
             tier = job_tier(os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REF"),
                             os.environ.get("GITHUB_REPOSITORY"), event, os.environ.get("GITHUB_WORKFLOW_REF"),
                             os.environ.get("GITHUB_JOB"))
+            nightly_bound = nightly_capacity_wait(tier, os.environ.get("GITHUB_EVENT_NAME"),
+                                                  os.environ.get("GITHUB_REF"), os.environ.get("GITHUB_JOB"),
+                                                  job_workflow(), os.environ.get("GITHUB_RUN_ATTEMPT"))
+            cap = bounded_wait(cap, nightly_bound)
             if tier == TIER_NIGHTLY:
                 print(f"{PREFIX}: a nightly job: it goes ahead of every other job waiting here, no other job takes a "
-                      f"unit while it waits, and it keeps no idle reserve", flush=True)
+                      f"unit while it waits, and it keeps no idle reserve"
+                      + (f"; it waits {nightly_bound:g} s at most, then is refused so its re-run takes Blacksmith"
+                         if nightly_bound is not None else ""), flush=True)
             elif tier:
                 print(f"{PREFIX}: a DEV compile: it goes ahead of PR jobs waiting here for capacity "
                       f"(those waiting under {FEED_JUMP_S / 60:g} min)", flush=True)
