@@ -2816,6 +2816,40 @@ FIX_TIMEOUTS = {"cmux_clone": 1800, "submodules": 1800, "brew": 5400, "rust_chan
                 "glaeda_sync": 900}
 RUSTUP_PROXIES = ("cargo", "rustc", "rustdoc", "rustup")
 BREW_STAGE = "Library/Caches/glaeda/share/homebrew/downloads"  # under the login user's home; see share brew
+# Every brew command the Homebrew step runs has a hard limit, enforced on the host: an ssh timeout on this side
+# stops nothing there, and sudo-plan --run has none. A `brew install git` once sat 8 h 15 min with no socket open.
+# At the limit the command, its process group and every descendant get SIGTERM, then SIGKILL 10 s later
+# (Homebrew starts curl in a process group of its own, so the group alone is not enough); the step exits 124.
+BREW_COMMAND_TIMEOUT = 1800
+# The bound, in perl because a mini has no timeout(1) and maybe no Python. It runs as the Homebrew owner, inside
+# sudo -u, so it can signal everything brew starts. argv: SECONDS COMMAND [ARG...].
+BREW_BOUND = r"""
+use strict; use warnings; use POSIX ();
+my $limit = shift @ARGV;
+my $pid = fork();
+defined $pid or die "fork: $!\n";
+if (!$pid) { setpgrp(0, 0); exec { $ARGV[0] } @ARGV; die "exec $ARGV[0]: $!\n"; }
+my $status;
+eval { local $SIG{ALRM} = sub { die "limit\n" }; alarm $limit; waitpid($pid, 0); $status = $?; alarm 0; };
+exit($status & 127 ? 128 + ($status & 127) : $status >> 8) if defined $status;
+sub tree {
+  my (%kids, %group, %seen);
+  open(my $ps, "-|", "ps", "-A", "-o", "pid=,ppid=,pgid=") or return ($pid);
+  while (<$ps>) { my ($p, $pp, $g) = split; next unless defined $g; push @{$kids{$pp}}, $p; push @{$group{$g}}, $p; }
+  close($ps);
+  my @todo = ($pid);
+  while (@todo) { my $p = shift @todo; next if $p == $$ || $seen{$p}++; push @todo, @{$kids{$p} || []}, @{$group{$p} || []}; }
+  return keys %seen;
+}
+my %all = map { $_ => 1 } tree();
+print STDERR "timed out after ${limit}s: stopping $ARGV[0] and its processes (" . join(" ", sort keys %all) . ")\n";
+kill "TERM", keys %all;
+for (1 .. 20) { last if waitpid($pid, POSIX::WNOHANG()) == $pid; select(undef, undef, undef, 0.5); }
+$all{$_} = 1 for tree();
+kill "KILL", keys %all;
+waitpid($pid, 0);
+exit 124;
+""".strip()
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or Path("~/.local/state").expanduser()) / "glaeda" / "mini-fleet"
 OPERATOR_CACHE = Path(os.environ.get("GLAEDA_MINI_FLEET_CACHE", "~/Library/Caches/glaeda/mini-fleet")).expanduser()
 SUDOERS_FILE = "/etc/sudoers.d/glaeda-mini-fleet"
@@ -3125,7 +3159,10 @@ def brew_commands(owner: str, formulas: list[str], as_owner: bool, as_root: bool
     run = f"sudo -H -u {owner} " if as_owner else ""
     root = "sudo " if as_owner and not as_root else ""
     # Newer Homebrew asks before installing unless told not to; sudo drops the variable, so env sets it.
-    lines = [f'brew_as() {{ {run}env HOMEBREW_NO_ASK=1 /opt/homebrew/bin/brew "$@"; }}',
+    # BREW_BOUND caps every brew command at BREW_COMMAND_TIMEOUT, so the step can never hang for hours.
+    lines = [f"brew_bound={shlex.quote(BREW_BOUND)}",
+             f'brew_as() {{ {run}/usr/bin/perl -e "$brew_bound" {BREW_COMMAND_TIMEOUT} '
+             'env HOMEBREW_NO_ASK=1 /opt/homebrew/bin/brew "$@"; }',
              # Bottles glaeda-mini-fleet share brew staged from a peer; brew checks their digests before use.
              f'staged="${{login_home:-$HOME}}/{BREW_STAGE}"',
              'if [ -n "$(ls "$staged" 2>/dev/null)" ]; then',

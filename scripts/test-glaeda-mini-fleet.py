@@ -1658,6 +1658,44 @@ class PreflightTests(unittest.TestCase):
         old = self.result(preflight_text(git=None))
         self.assertEqual((old["checks"]["git"]["state"], old["ready"]), ("fail", False))
         del self.manifest["hosts"]["build-mini-1"]["overrides"]["git"]
+
+    def test_every_brew_command_is_bounded_and_the_bound_kills_the_whole_tree(self) -> None:
+        # A `brew install git` from sudo-plan once sat 8 h 15 min: nothing on either side ever stopped it.
+        for owner_steps in (mf.brew_commands("builder", ["git"], False), mf.brew_commands("admin", ["git"], True, True)):
+            script = "\n".join(owner_steps)
+            brew_as = next(line for line in owner_steps if line.startswith("brew_as()"))
+            self.assertIn(f'/usr/bin/perl -e "$brew_bound" {mf.BREW_COMMAND_TIMEOUT} env HOMEBREW_NO_ASK=1 '
+                          '/opt/homebrew/bin/brew "$@"', brew_as)
+            self.assertEqual(script.count("/opt/homebrew/bin/brew"), 1, script)  # no brew call skips brew_as
+            subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+        # Run as the Homebrew owner (inside sudo -u), so it may signal what brew starts.
+        self.assertIn('brew_as() { sudo -H -u admin /usr/bin/perl -e "$brew_bound"',
+                      "\n".join(mf.brew_commands("admin", ["git"], True, True)))
+        bound = ["perl", "-e", mf.BREW_BOUND]
+        # Under the limit: the command's own exit code, and its signal as 128+N.
+        self.assertEqual(subprocess.run([*bound, "30", "sh", "-c", "exit 3"]).returncode, 3)
+        self.assertEqual(subprocess.run([*bound, "30", "sh", "-c", "kill -TERM $$"]).returncode, 128 + 15)
+        # Past the limit: exit 124, and a child in a process group of its own (as Homebrew starts curl) dies too.
+        with tempfile.TemporaryDirectory() as tmp:
+            pidfile = Path(tmp) / "child"
+            stuck = ("if (!fork) { setpgrp(0, 0); open(my $f, '>', $ARGV[0]) or die; print $f $$; close $f; "
+                     "exec 'sleep', '300' } $SIG{TERM} = 'IGNORE'; sleep 300")
+            started = time.monotonic()
+            run = subprocess.run([*bound, "1", "perl", "-e", stuck, os.fspath(pidfile)], capture_output=True,
+                                 text=True, timeout=60)
+            self.assertEqual(run.returncode, 124, run.stderr)
+            self.assertLess(time.monotonic() - started, 30)
+            self.assertIn("timed out after 1s", run.stderr)
+            child = int(pidfile.read_text())
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                state = subprocess.run(["ps", "-o", "stat=", "-p", str(child)], capture_output=True, text=True).stdout
+                if not state.strip() or state.strip().startswith("Z"):
+                    break
+                time.sleep(0.2)
+            else:
+                os.kill(child, 9)
+                self.fail(f"the bound left pid {child} running")
         self.assertEqual(self.result(preflight_text(git=None))["ready"], True)  # no policy: an old probe is fine
 
     def test_the_preflight_probe_runs_the_workloads_git(self) -> None:
@@ -2158,7 +2196,7 @@ class SudoPlanTests(unittest.TestCase):
         order = [script.index(s) for s in ("sudo -v", "sudo xcode-select -s /Applications/Xcode.app",
                                            "xcodebuild -license accept", "xcodebuild -runFirstLaunch",
                                            "sudo pmset -c sleep 0", "sudo pmset -a autorestart 1",
-                                           "sudo -H -u admin env HOMEBREW_NO_ASK=1 /opt/homebrew/bin/brew", "for f in rustup zig",
+                                           "sudo -H -u admin /usr/bin/perl -e \"$brew_bound\" 1800 env HOMEBREW_NO_ASK=1 /opt/homebrew/bin/brew", "for f in rustup zig",
                                            "for t in cargo rustc rustdoc rustup",
                                            'sudo -H -u admin ln -s "/opt/homebrew/opt/rustup/bin/$t"')]
         self.assertEqual(order, sorted(order))
@@ -2219,7 +2257,7 @@ class SudoPlanTests(unittest.TestCase):
         # The only sudo left drops to the Homebrew owner.
         self.assertEqual([line for line in body if re.search(r"(^|[\s;|&(])sudo (?!-H -u admin )", line)], [])
         for step in ("xcode-select -s /Applications/Xcode.app", "env DEVELOPER_DIR=", "pmset -c sleep 0",
-                     "sudo -H -u admin env HOMEBREW_NO_ASK=1 /opt/homebrew/bin/brew",
+                     "sudo -H -u admin /usr/bin/perl -e \"$brew_bound\" 1800 env HOMEBREW_NO_ASK=1 /opt/homebrew/bin/brew",
                      'sudo -H -u admin ln -s "/opt/homebrew/opt/rustup/bin/$t"',
                      'cp -nP "$staged"/* "$cache"/', 'chown -h admin "$cache"/*', 'visudo -cf "$rule"',
                      "install -m 0440 -o root"):
