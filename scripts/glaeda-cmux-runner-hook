@@ -4261,10 +4261,16 @@ class Gate:
         cmux-next's swift test), one at a time per mini, and their units are admitted like any other job's; the
         CPU mark held it whenever the side and root lanes kept the mini busy, which they did for hours
         (2026-10-21: about 6 of 13 gui runners listening, gui-label jobs queued 1.5 to 3 h). Nothing local says
-        whether gui jobs are queued (the gate reads no GitHub API), so the exemption is unconditional."""
+        whether gui jobs are queued (the gate reads no GitHub API), so the exemption is unconditional.
+
+        The freshness slot (--dev-compile-runner) is exempt the same way. Its jobs are the feed compiles, and its
+        reserve (FRESH_RESERVE_TOKEN) keeps their units free, but the PR lanes beside it keep the mini's CPU above
+        the mark: on 2026-10-27 the canary slot logged "the mini is saturated (CPU busy at least 85%)" every
+        minute and stayed offline while a nightly-next promote compile queued behind PR jobs. A feed compile that
+        runs slower beats one that waits 30+ minutes for a mini to cool."""
         now = time.monotonic()
-        gui = runner_scope(self.runner_dir).gui
-        if gui:
+        scope = runner_scope(self.runner_dir)
+        if scope.gui or scope.fresh:
             self.cpu_busy = None
         elif now - self.cpu_at >= GATE_CPU_EVERY_S:
             _, self.cpu_busy = host_io()

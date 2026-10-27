@@ -6129,6 +6129,14 @@ class GateTest(unittest.TestCase):
             pressure[0] = 1
             side = self.gui_gate(self.units(0), gui=False)
             self.assertTrue((side.claimed() or "").startswith(hook.SATURATED), "every other runner keeps the CPU hold")
+            script = self.runner / hook.RUNNER_HOOK_SCRIPT
+            script.write_text("#!/bin/bash\nexec /usr/bin/python3 /hook job-started --capacity-units 10 --instance 1"
+                              " --dev-compile-runner\n")
+            fresh = self.full_gate(self.units(0))
+            self.addCleanup(fresh.reserve, False)
+            self.assertIsNone(fresh.claimed(), "99% CPU: the freshness slot listens for the feed compiles")
+            pressure[0] = 2
+            self.assertTrue((fresh.claimed() or "").startswith(hook.SATURATED), "memory pressure still holds it")
 
     def test_runner_scope_reads_the_session_runner_flag(self) -> None:
         script = self.runner / hook.RUNNER_HOOK_SCRIPT
