@@ -6322,6 +6322,12 @@ def job_busy(fam: Family, path: Path) -> bool:
         return False
     if fam.id == INTERRUPTED:  # renamed away from every job's path; its deleter's pid is its in-use signal
         return False
+    if media_tour_dd(fam, path):
+        # A tour's DerivedData holds hundreds of module cache directories within three levels, wider than
+        # cmux_active's budget, so every media dir read as busy and a host the media role left never evicted its
+        # slots (cmux13s, 2026-10-27: 24.4 GiB "in-use" with no tour there). Its in-use signals are the tour tag
+        # lock (media_tour_tag_held) and the process, cwd and open-file evidence every item gets.
+        return False
     if fam.id == DEDICATED_RUNNER_TEMP:  # a job's scratch can be wider than the budget; a running job is seen by
         return False                     # its processes and open files, and nothing here is younger than 12 h
     if fam.id == CMUX_NEXT_CI_FAMILY and (path in cmux_next_ci_state_roots(fam.root)

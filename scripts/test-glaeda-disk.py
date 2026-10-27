@@ -7212,6 +7212,16 @@ class MediaTourDerivedDataTest(unittest.TestCase):
                                            "cmux-ci-media-pr-12-head": "reclaimable",
                                            "cmux-other": "recent"})
 
+    def test_a_wide_media_dd_is_not_a_cmux_reload_unit(self) -> None:
+        self.runner(1, ["glaeda-std-xcode-26.6"])
+        slot = make(self.root / "cmux-ci-media-slot0-base", age_hours=0.5)
+        for n in range(40):  # wider than cmux_active's budget below, as a real ModuleCache.noindex is
+            (slot / "ModuleCache.noindex" / f"m{n}").mkdir(parents=True)
+        real = gd.cmux_active
+        self.assertTrue(real(slot, 3, 10), "the bounded walk alone calls it busy")
+        with mock.patch.object(gd, "cmux_active", lambda path, levels=3, budget=5000: real(path, levels, 10)):
+            self.assertEqual(self.verdicts(), {"cmux-ci-media-slot0-base": "reclaimable"})
+
     def test_open_media_dd_is_still_in_use(self) -> None:
         self.runner(1, ["glaeda-std-xcode-26.6"])
         held = make(self.root / "cmux-ci-media-slot0-head", age_hours=0.5)
