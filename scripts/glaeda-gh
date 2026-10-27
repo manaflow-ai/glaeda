@@ -714,7 +714,9 @@ def cmd_read(text: str) -> int:
         register(key, jobs)
         cached = read_cache(key)
         entries[key] = None if cached is None else {
-            k: cached.get(k) for k in ("data", "dataAt", "error", "fetchedAt", "jobs", "missing") if k in cached}
+            k: cached.get(k) for k in ("data", "dataAt", "error", "fetchedAt", "jobs", "missing", "restRun") if k in cached}
+        if cached is not None and cached.get("source"):  # where the data came from, so a downstream wait can
+            entries[key]["origin"] = cached.get("origin") if cached.get("source") == "upstream" else cached["source"]
     print(json.dumps({"entries": entries}, sort_keys=True))
     return EXIT_OK
 
@@ -1650,7 +1652,9 @@ class Daemon:
                 self.nudged.discard(e["key"])  # a check event on its head: re-read now, not at the cycle
                 out.append(e)
                 continue
-            if kind == "run" and c is not None and e["key"] in self.controller_filled:
+            if kind == "run" and c is not None and e["key"] in self.controller_filled and c.get("source") == "controller":
+                # (a run REST has shown newer than the controller's record keeps its normal cycle below: the
+                # controller missed that attempt's deliveries, so it is not the source for it)
                 data = c.get("data") or {}
                 # A failed attempt whose job list is not this attempt's: REST reads it once (per cycle
                 # at most), for the failed steps and to tell a runner's refusal from a real failure.
@@ -1660,9 +1664,15 @@ class Daemon:
                 # A finished run with a reader newer than both its data and the last REST read: that
                 # reader's wait will not rule on older data, so REST confirms it once (it may have
                 # been rerun before the webhook said so).
-                confirm = terminal(kind, data) and e["touched"] > max(c.get("dataAt") or 0, c.get("restAt") or 0)
-                # Otherwise the controller answered on this tick: REST only as the safety net.
-                if failed or confirm or self.now - (c.get("restAt") or 0) >= REST_SAFETY:
+                # And a finish the controller reported that REST has not read since: a rerun's deliveries can be
+                # lost (manaflow-ai/cmux run 40434431701, 2026-10-27: the controller kept attempt 1 "cancelled"
+                # while GitHub had attempt 2 queued), and wait_step rules on it only once REST confirms it.
+                confirm = terminal(kind, data) and (e["touched"] > max(c.get("dataAt") or 0, c.get("restAt") or 0)
+                                                    or controller_unconfirmed(c, self.now))
+                # Otherwise the controller answered on this tick: REST only as the safety net. A failed read leaves
+                # each of these true (restAt keeps its time), so a key is read at most once a cycle.
+                paced = self.now - self.attempted.get(e["key"], float("-inf")) >= CYCLES[kind]
+                if failed or (paced and (confirm or self.now - (c.get("restAt") or 0) >= REST_SAFETY)):
                     out.append(e)
                 continue
             if c is None:
@@ -1906,7 +1916,10 @@ class Daemon:
                 continue  # registered there, not read yet
             at, fetched = entry.get("dataAt"), entry.get("fetchedAt")
             fields: dict[str, Any] = {"error": error[:UPSTREAM_ERROR_MAX] if error else None, "source": "upstream",
-                                      "missing": entry.get("missing") is True}
+                                      "missing": entry.get("missing") is True,
+                                      # provenance: a controller-only finish stays unconfirmed downstream too
+                                      "origin": entry.get("origin") if isinstance(entry.get("origin"), str) else None,
+                                      "restRun": entry.get("restRun") if isinstance(entry.get("restRun"), dict) else None}
             if isinstance(fetched, (int, float)):
                 fields["fetchedAt"] = min(self.now, float(fetched))  # a wait rules only on reads after it began
             if data is not None:
@@ -2094,7 +2107,7 @@ class Daemon:
             base = current if isinstance(current, dict) else prior
             entry = {"key": key, "fetchedAt": self.now, "dataAt": None, "data": None, "error": None}
             if base:
-                entry.update({k: base[k] for k in ("dataAt", "data", "etag", "jobs", "jobsEtag", "jobsAt", "restAt", "source", "restParts")
+                entry.update({k: base[k] for k in ("dataAt", "data", "etag", "jobs", "jobsEtag", "jobsAt", "restAt", "source", "restParts", "restRun", "origin")
                               if k in base})
             entry.update(fields)
             write_json(cache, entry)
@@ -2271,7 +2284,10 @@ class Daemon:
         prior = e["cache"] or {}
         self.reads.append((self.now, "run", "rest"))
         base = f"/repos/{owner}/{repo}/actions/runs/{run_id}"
-        state, doc, etag = self.get(base, prior.get("etag") if prior.get("data") else None)
+        # a confirmation asks without the ETag: a 304 would prove only what the ETag's own read showed, which the
+        # controller's newer record replaced (and a cache from before restRun has nothing to prove it with)
+        unconfirmed = controller_unconfirmed(prior, self.now)
+        state, doc, etag = self.get(base, prior.get("etag") if prior.get("data") and not unconfirmed else None)
         if state == "error":
             self.errors.append(f"{e['key']}: {doc}")
             return self.store(e["key"], e["cache"], error=doc)
@@ -2279,6 +2295,7 @@ class Daemon:
         fields: dict[str, Any] = {"error": None, "etag": etag, "dataAt": self.now, "restAt": self.now}
         if state == "fresh":
             fields["data"] = slim_run(doc)
+            fields["restRun"] = rest_run(fields["data"])
             # a run the controller tracks keeps that source; REST was only the safety-net check
             if prior.get("source") != "controller" or \
                     (iso_epoch(doc.get("updated_at")) or 0) > (iso_epoch((prior.get("data") or {}).get("updated_at")) or 0):
@@ -2312,7 +2329,8 @@ class Daemon:
             run = graphql_run(node)
             run["head_branch"] = run["head_branch"] or before.get("head_branch") or ""
             fresh = any(run.get(k) != before.get(k) for k in ("status", "conclusion", "run_attempt", "updated_at"))
-            fields: dict[str, Any] = {"error": None, "data": run, "dataAt": self.now, "restAt": self.now}
+            fields: dict[str, Any] = {"error": None, "data": run, "dataAt": self.now, "restAt": self.now,
+                                      "restRun": rest_run(run)}
             if prior.get("source") != "controller" or \
                     (iso_epoch(run.get("updated_at")) or 0) > (iso_epoch(before.get("updated_at")) or 0):
                 fields["source"] = "graphql"
@@ -3581,6 +3599,29 @@ def wait_request(kind: str, target: str, until: str, timeout: float, jobs: bool,
             "jobs": jobs, "json": as_json, "sha": sha, "exact": exact, "grace": grace, "began": time.time()}
 
 
+def rest_run(data: dict | None) -> dict:
+    """What a direct GitHub read (REST or GraphQL) showed of a run: kept as restRun, the proof a finish is GitHub's."""
+    data = data or {}
+    return {k: data.get(k) for k in ("run_attempt", "status", "conclusion")}
+
+
+def controller_unconfirmed(entry: dict | None, now: float | None = None) -> bool:
+    """A finished run whose finish came from the controller (directly, or through an upstream daemon) and that no
+    direct GitHub read has shown (restRun, written only by fetch_run and the GraphQL run read): the controller can
+    miss a rerun's deliveries and keep the last attempt's finish (manaflow-ai/cmux run 40434431701, 2026-10-27).
+    Bounded: once the record is REST_SAFETY old (dataAt, which an unchanged record keeps) it counts, so a wait still
+    rules when GitHub cannot be read and the controller is all there is."""
+    entry = entry or {}
+    # an upstream that does not say where its data came from (an older version) is treated as the controller's
+    origin = (entry.get("origin") or "controller") if entry.get("source") == "upstream" else entry.get("source")
+    data = entry.get("data")
+    if origin != "controller" or not terminal("run", data):
+        return False
+    if entry.get("restRun") == rest_run(data):
+        return False
+    return (time.time() if now is None else now) - (entry.get("dataAt") or 0) < REST_SAFETY
+
+
 def wait_step(req: dict, now: float) -> tuple[int, str] | None:
     """One look at a `wait pr|run` (wait_request): (exit code, what it prints) once it is decided or out
     of time, else None. Rules only on data the daemon fetched after the wait began, never on an older
@@ -3597,6 +3638,8 @@ def wait_step(req: dict, now: float) -> tuple[int, str] | None:
     # only a merge is final; a completed run can be rerun and a closed PR reopened
     final = kind == "pr" and data and data.get("state") == "MERGED"
     usable = data and ((entry.get("dataAt") or 0) >= began or final)
+    if usable and kind == "run" and controller_unconfirmed(entry, now):
+        usable = False  # the daemon reads it over REST first (Daemon.due's confirm)
     if usable and sha:
         head = str(data.get("headRefOid" if kind == "pr" else "head_sha") or "").lower()
         if head and not head.startswith(sha):
@@ -3729,10 +3772,13 @@ def waits_dir() -> Path:
 
 
 def write_wait_request(kind: str, target: str, until: str, timeout: float, jobs: bool, as_json: bool,
-                       sha: str | None, exact: bool, grace: float, pid: int) -> str:
+                       sha: str | None, exact: bool, grace: float, pid: int, began: float | None = None) -> str:
     """Leave a wait for the daemon: its FIFO first, then the request, so the daemon never sees a request
     without one. Interest is registered at once, as a polling wait does. Returns the request's id."""
     req = wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace)
+    if began is not None:  # a handoff keeps the wait's start (data read since then still counts), same deadline
+        req["timeout"] += max(0.0, req["began"] - began)
+        req["began"] = began
     rid = f"{pid}-{os.urandom(4).hex()}"
     waits_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
     os.mkfifo(waits_dir() / f"{rid}.fifo", 0o600)
@@ -3793,7 +3839,7 @@ def controller_wait_run(key: str, timeout: float) -> dict | None:
                    and isinstance(prior.get("restAt"), (int, float)) else now)
         entry = {"key": key, "fetchedAt": now, "dataAt": now, "restAt": rest_at,
                  "data": candidate, "error": None, "source": "controller"}
-        for field in ("etag", "jobs", "jobsEtag", "jobsAt", "restParts"):
+        for field in ("etag", "jobs", "jobsEtag", "jobsAt", "restParts", "restRun"):
             if field in prior:
                 entry[field] = prior[field]
         write_json(cache, entry)
@@ -3832,9 +3878,13 @@ def subscribe_wait(kind: str, target: str, until: str, timeout: float, jobs: boo
         # remaining deadline is recomputed after the blocking call before the FIFO wait begins.
         timeout = max(0.0, timeout - (time.monotonic() - started))
     try:
-        rid = write_wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace, os.getpid())
+        rid = write_wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace, os.getpid(),
+                                 began=req["began"])
     except OSError:
-        return poll_wait(wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace))
+        late = wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace)
+        late["timeout"] += max(0.0, late["began"] - req["began"])
+        late["began"] = req["began"]
+        return poll_wait(late)
     block(rid, timeout)
     return EXIT_DOWN  # not reached
 
