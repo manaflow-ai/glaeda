@@ -51,8 +51,9 @@ and job/run identifier returned by the watcher.
 Fields (`glaeda-cmux-job/v1`): `cores.job` / `cores.other_runner_jobs` / `cores.outside` (mean cores),
 `load.mean` / `load.max`, `cpu_busy_pct` (iostat, host-wide), `disk_mb_s.mean` / `.max`,
 `queue.running` / `queue.blocked` (processes in uninterruptible wait), `top_outside` (kernel executable name and user, estimated core-seconds),
-`other_runner_jobs` (co-tenant runner slots), `thermal_limited`, `rss_peak_mib` (the job tree's summed RSS at its largest
-10 s sample, null when unknown), `verdict` (`contended` or `clear`) and `reasons`.
+`other_runner_jobs` (co-tenant runner slots), `thermal_limited`, `rss_footprint_peak_mib` (the job tree's summed
+physical footprint at its largest 10 s sample: its memory; null when unknown), `rss_peak_mib` (summed RSS: shared pages
+count per process and compressed pages not at all, so it reads high or low), `verdict` (`contended` or `clear`) and `reasons`.
 
 - `contended` with high `cores.outside`: something outside every runner job used the CPU. `top_outside` names it.
 - `cores.*` come from `ps` %cpu, a decaying average that undercounts short-lived compiler processes. When

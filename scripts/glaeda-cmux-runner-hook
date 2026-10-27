@@ -5573,15 +5573,73 @@ def job_owners(rows: list[tuple[int, int, float, str, str]], job_root: int,
     return workers, owner
 
 
+def job_tree_pids(rows: list[tuple[int, int, float, str, str]], job_root: int, skip: set[int],
+                  test_app_owners: dict[int, int] | None = None) -> list[int]:
+    """This job's tree right now (its Runner.Worker, everything under it and its reparented CI test app): the same
+    tree classify counts as the job's cores."""
+    _, owner = job_owners(rows, job_root, test_app_owners)
+    return [pid for pid, _, _, _, _ in rows if pid not in skip and owner(pid) == job_root]
+
+
+def tree_kib(pids: list[int], kib: dict[int, int]) -> int | None:
+    """The sum of the nonzero readings for pids; None when none of them read nonzero (a zombie shows 0, as the whole
+    tree can while its Runner.Worker exits, and a process that exited between ps and the read has none), so an
+    unknown reading is never a 0."""
+    mine = [kib[pid] for pid in pids if kib.get(pid, 0) > 0]
+    return sum(mine) if mine else None
+
+
 def job_rss_kib(rows: list[tuple[int, int, float, str, str]], rss: dict[int, int], job_root: int,
                 skip: set[int], test_app_owners: dict[int, int] | None = None) -> int | None:
-    """Resident KiB of this job's tree right now (its Runner.Worker, everything under it and its reparented CI test
-    app), the same tree classify counts as the job's cores; None when ps gave no nonzero RSS for any of it (a zombie
-    shows 0, as the whole tree can while its Runner.Worker exits), so an unknown reading is never a 0."""
-    _, owner = job_owners(rows, job_root, test_app_owners)
-    mine = [rss[pid] for pid, _, _, _, _ in rows
-            if pid not in skip and rss.get(pid, 0) > 0 and owner(pid) == job_root]
-    return sum(mine) if mine else None
+    """Resident KiB of this job's tree right now (ps rss summed: pages its processes share count once per process,
+    and compressed or swapped pages not at all, so it can read high or low); None when ps gave no nonzero RSS."""
+    return tree_kib(job_tree_pids(rows, job_root, skip, test_app_owners), rss)
+
+
+# proc_pid_rusage(pid, RUSAGE_INFO_V0, &info) from libSystem, read through ctypes: no helper binary to build or
+# ship. rusage_info_v0 is a 16-byte uuid and ten uint64s; ri_phys_footprint is the eighth of those (index 9 of
+# the buffer as uint64s, after ri_resident_size). The footprint is the memory the kernel charges the process
+# (dirty private pages, compressed and swapped included; shared clean pages such as the dyld cache and
+# mapped files excluded), the number Activity Monitor's Memory column shows, so a tree's sum does not count
+# what its processes share once per process.
+RUSAGE_INFO_V0 = 0
+RUSAGE_V0_WORDS = 12
+RUSAGE_V0_FOOTPRINT = 9
+_LIBSYSTEM: list[Any] = []
+
+
+def _proc_pid_rusage() -> Any:
+    """libSystem's proc_pid_rusage, loaded once; None off Darwin or when it cannot be loaded."""
+    if not _LIBSYSTEM:
+        fn = None
+        if sys.platform == "darwin":
+            try:
+                import ctypes
+                fn = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True).proc_pid_rusage
+                fn.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_void_p)
+                fn.restype = ctypes.c_int
+            except (OSError, AttributeError, ImportError):
+                fn = None
+        _LIBSYSTEM.append(fn)
+    return _LIBSYSTEM[0]
+
+
+def phys_footprints_kib(pids: list[int]) -> dict[int, int]:
+    """Each pid's physical footprint in KiB, for the pids the kernel lets this user read (the runner's own
+    processes; another user's process, or one that exited, is left out). Empty off Darwin."""
+    fn = _proc_pid_rusage()
+    if fn is None:
+        return {}
+    import ctypes
+    out: dict[int, int] = {}
+    buf = (ctypes.c_uint64 * RUSAGE_V0_WORDS)()
+    for pid in pids:
+        try:
+            if fn(pid, RUSAGE_INFO_V0, ctypes.byref(buf)) == 0:
+                out[pid] = int(buf[RUSAGE_V0_FOOTPRINT]) // 1024
+        except (OSError, ctypes.ArgumentError, OverflowError):
+            continue
+    return out
 
 
 def load_average() -> float | None:
@@ -5725,13 +5783,19 @@ class JobSamples:
         self.disk_free_min: float | None = None
         # the largest resident KiB of the job's tree at any sample (from the ps pass the cores already read)
         self.rss_peak_kib: int | None = None
+        # and of its summed physical footprint (Darwin proc_pid_rusage), which counts shared pages once
+        self.footprint_peak_kib: int | None = None
 
     def add(self, load: float | None, split: tuple[float, float, float, dict[str, float], dict[str, float]],
             interval: float, queue: tuple[int, int] | None = None, disk: float | None = None,
-            busy: float | None = None, free: float | None = None, rss_kib: int | None = None) -> None:
+            busy: float | None = None, free: float | None = None, rss_kib: int | None = None,
+            footprint_kib: int | None = None) -> None:
         job, others, outside, by_outside, by_runner = split
         if rss_kib is not None:
             self.rss_peak_kib = rss_kib if self.rss_peak_kib is None else max(self.rss_peak_kib, rss_kib)
+        if footprint_kib is not None:
+            self.footprint_peak_kib = (footprint_kib if self.footprint_peak_kib is None
+                                       else max(self.footprint_peak_kib, footprint_kib))
         if free is not None and math.isfinite(free):
             self.disk_free_min = free if self.disk_free_min is None else min(self.disk_free_min, free)
         if queue is not None:
@@ -5802,8 +5866,12 @@ class JobSamples:
             # the volume's, so other jobs' writes count too: the peak this job saw is start minus min
             "disk_free_min_gib": None if self.disk_free_min is None else round(self.disk_free_min, 1),
             # the job tree's summed RSS at its largest sample (every sample_seconds, so a shorter spike can be
-            # missed); null when no sample read it
+            # missed); null when no sample read it. Shared pages count once per process and compressed or swapped
+            # pages not at all, so it can read high or low: rss_footprint_peak_mib is the job's memory.
             "rss_peak_mib": None if self.rss_peak_kib is None else round(self.rss_peak_kib / 1024, 1),
+            # the same tree's summed physical footprint at its largest sample: the job's memory (null off Darwin)
+            "rss_footprint_peak_mib": (None if self.footprint_peak_kib is None
+                                       else round(self.footprint_peak_kib / 1024, 1)),
             "verdict": "contended" if reasons else "clear", "reasons": reasons,
         }
 
@@ -6008,9 +6076,10 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
                 test_apps = (telemetry_test_app_owners(processes())
                              if any(os.path.basename(row[4]) == "cmux DEV" for row in rows) else {})
                 split = classify(rows, watch_pid, skip, test_apps)
+                tree = job_tree_pids(rows, watch_pid, skip, test_apps)
                 samples.add(load_average(), split, interval, queue, *disk_busy,
                             free=free_or_none(disk_path) if disk_path else None,
-                            rss_kib=job_rss_kib(rows, rss, watch_pid, skip, test_apps))
+                            rss_kib=tree_kib(tree, rss), footprint_kib=tree_kib(tree, phys_footprints_kib(tree)))
                 if dynamic_units > 1 and dynamic_total > 1:
                     now = time.monotonic()
                     job_cores = split[0]

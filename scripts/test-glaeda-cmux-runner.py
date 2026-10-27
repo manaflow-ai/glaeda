@@ -10700,6 +10700,47 @@ class JobTelemetryTest(unittest.TestCase):
         self.assertIsNone(self.hook.job_rss_kib(rows, zombies, 100, set()), "an all-zero reading is unknown too")
         self.assertEqual(self.hook.job_rss_kib(rows, {**rss, 101: 0}, 100, {400}, {300: 100}), 1_000_000)
 
+    def test_summary_records_the_peak_footprint_beside_rss(self) -> None:
+        split = (1.0, 0.0, 0.0, {}, {})
+        samples = self.hook.JobSamples({}, 14, 0.0)
+        for rss, fp in ((4_194_304, 1_048_576), (3_145_728, 2_097_152), (None, None)):
+            samples.add(None, split, 10.0, rss_kib=rss, footprint_kib=fp)
+        summary = samples.summary(60.0)
+        self.assertEqual((summary["rss_peak_mib"], summary["rss_footprint_peak_mib"]), (4096.0, 2048.0))
+        rss_only = self.hook.JobSamples({}, 14, 0.0)
+        rss_only.add(None, split, 10.0, rss_kib=1024)  # off Darwin: no footprint, so null and never 0
+        self.assertIsNone(rss_only.summary(60.0)["rss_footprint_peak_mib"])
+
+    def test_tree_kib_sums_nonzero_readings_of_the_tree(self) -> None:
+        self.assertEqual(self.hook.tree_kib([1, 2, 3], {1: 10, 2: 0, 4: 99}), 10)
+        self.assertIsNone(self.hook.tree_kib([1, 2], {1: 0, 2: 0}), "zombies only: unknown, not 0")
+        self.assertIsNone(self.hook.tree_kib([1], {}), "nothing readable: unknown, not 0")
+
+    @unittest.skipUnless(sys.platform == "darwin", "proc_pid_rusage is Darwin's")
+    def test_phys_footprint_is_read_for_own_processes_only(self) -> None:
+        child = subprocess.Popen([sys.executable, "-c", "import sys; b = bytearray(64 << 20); sys.stdin.read()"],
+                                 stdin=subprocess.PIPE)
+        try:
+            deadline = time.monotonic() + 10
+            got: dict[int, int] = {}
+            while time.monotonic() < deadline:
+                got = self.hook.phys_footprints_kib([os.getpid(), child.pid, 1, 999_999_999])
+                if got.get(child.pid, 0) >= 60 << 10:
+                    break
+                time.sleep(0.1)
+            self.assertGreater(got.get(os.getpid(), 0), 0)
+            self.assertGreaterEqual(got.get(child.pid, 0), 60 << 10, "the child's 64 MiB of dirty pages")
+            self.assertNotIn(999_999_999, got, "no such process")
+            if os.geteuid() != 0:
+                self.assertNotIn(1, got, "launchd is root's: not readable, left out rather than 0")
+        finally:
+            child.stdin.close()
+            child.wait(10)
+
+    def test_phys_footprint_off_darwin_is_empty(self) -> None:
+        with mock.patch.object(self.hook, "_LIBSYSTEM", [None]):
+            self.assertEqual(self.hook.phys_footprints_kib([os.getpid()]), {})
+
     def test_summary_records_the_peak_job_rss_or_null(self) -> None:
         split = (1.0, 0.0, 0.0, {}, {})
         samples = self.hook.JobSamples({}, 14, 0.0)
