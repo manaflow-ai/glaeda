@@ -786,6 +786,26 @@ class Mini:
         for _pid, _uid, _stat, command in rows:
             if any(p.search(command) for p in patterns):
                 return f"a CI job or build is running ({command[:120]})"
+        return self.listener_taking()
+
+    def listener_taking(self) -> str:
+        """A runner whose listener has acknowledged a job and not finished it (the runner hook's listener_request):
+        between the acknowledge and its Runner.Worker the job is this runner's, and no Worker shows it yet. Read
+        with the hook the runner runs; no hook, or a diag it cannot read, is no answer."""
+        dirs = self.runner_dirs()
+        if not dirs:
+            return ""
+        hook = self.hook()
+        taking = getattr(hook, "listener_request", None) if hook is not None else None
+        if taking is None:
+            return NoAnswer("the runner hook's listener_request could not be loaded")
+        for d in dirs:
+            try:
+                request = taking(d)
+            except (OSError, ValueError) as error:
+                return NoAnswer(f"cannot read {d.name}'s listener log ({type(error).__name__})")
+            if request:
+                return f"{d.name}'s listener took job {str(request)[:60]} and its Worker has not finished it"
         return ""
 
     @contextlib.contextmanager

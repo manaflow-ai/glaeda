@@ -718,6 +718,43 @@ class HookTest(unittest.TestCase):
         self.assertEqual(self.started().returncode, 0)
         self.run_hook("job-completed", None, None, "--no-disk", "--state-dir", os.fspath(self.dir / "state"))
 
+    def test_a_drain_admits_the_job_a_listener_already_took(self) -> None:
+        fleet = self.fleet()
+        now = int(time.time())
+        drain = {"schema": "glaeda-reservation/v1", "owner": "glaeda-mini-health",
+                 "purpose": "drain for a Tailscale restart: tailscale_no_route since 2026-01-01T00:00:00Z",
+                 "since": now - 60, "until": now + 3600}
+        cases = {
+            "drain": (drain, True, "admitting the job this runner already took"),
+            "other-owner": ({**drain, "owner": "fleet-session"}, False, "host reserved by fleet-session"),
+            "not-a-drain": ({**drain, "purpose": "restart now"}, False, "host reserved by glaeda-mini-health"),
+            "bare-drain-prefix": ({**drain, "purpose": "drain for "}, False, "host reserved by glaeda-mini-health"),
+            "other-drain": ({**drain, "purpose": "drain for unrelated work"}, False,
+                            "host reserved by glaeda-mini-health"),
+            "expired-drain": ({**drain, "until": now - 1}, True, "admitted"),
+            "invalid-drain": ({**drain, "until": "soon"}, False, "until is not integer"),
+        }
+        for name, (doc, admitted, text) in cases.items():
+            with self.subTest(name):
+                (fleet / "reservation.json").write_text(json.dumps(doc))
+                result = self.started()
+                self.assertEqual(result.returncode == 0, admitted, result.stdout)
+                self.assertIn(text, result.stdout)
+                self.run_hook("job-completed", None, None, "--no-disk", "--state-dir", os.fspath(self.dir / "state"))
+        (fleet / "reservation.json").unlink()
+
+    def test_a_drain_still_holds_the_listener(self) -> None:
+        marker = self.dir / "reservation.json"
+        now = int(time.time())
+        marker.write_text(json.dumps({"schema": "glaeda-reservation/v1", "owner": "glaeda-mini-health",
+                                      "purpose": "drain for a Tailscale restart: tailscale_no_route since x",
+                                      "since": now - 5,
+                                      "until": now + 600}))
+        why = hook.host_held(os.fspath(self.dir / "no-host.lock"), os.fspath(marker), time.time())
+        self.assertIn("host reserved by glaeda-mini-health for drain", why or "")
+        self.assertIsNotNone(hook.reservation_refusal(os.fspath(marker), time.time()))
+        self.assertIsNone(hook.reservation_refusal(os.fspath(marker), time.time(), taken_job=True))
+
     def test_marker_without_the_parser_refuses(self) -> None:
         fleet = self.fleet()
         (fleet / "reservation.json").write_text("{}")

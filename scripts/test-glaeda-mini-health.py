@@ -1697,6 +1697,31 @@ class TailscaleRestartReads(unittest.TestCase):
         mini.processes = lambda: []
         self.assertNotEqual(mini.jobs_running(), "", "an empty process list is unreadable")
 
+    def test_jobs_running_sees_a_job_the_listener_took_before_its_worker(self) -> None:
+        mini = self.disk("import re\nCI_WORKER = re.compile(r'Runner\\.Worker')\n"
+                         "BUILD_PROCESS = re.compile(r'xcodebuild')\n")
+        mini.processes = lambda: [(1, 501, "S", "/bin/zsh")]
+        a, b = self.home / "actions-runner-glaeda", self.home / "actions-runner-glaeda-1"
+        mini.runner_dirs = lambda: [a, b]
+        taken: dict = {}
+
+        class Hook:
+            @staticmethod
+            def listener_request(d):
+                if isinstance(taken.get(d), Exception):
+                    raise taken[d]
+                return taken.get(d)
+        mini.hook = lambda: Hook
+        self.assertEqual(mini.jobs_running(), "")
+        taken[b] = "req-1"
+        why = mini.jobs_running()
+        self.assertIn("actions-runner-glaeda-1's listener took job req-1", why)
+        self.assertNotIsInstance(why, health.NoAnswer)
+        taken[b] = OSError("gone")
+        self.assertIsInstance(mini.jobs_running(), health.NoAnswer)
+        mini.hook = lambda: None
+        self.assertIsInstance(mini.jobs_running(), health.NoAnswer, "no hook is no answer")
+
     def test_ci_mini_facts(self) -> None:
         mini = health.Mini(self.home)
         facts = mini.ci_mini_facts()

@@ -1125,9 +1125,23 @@ def dev_compile_refusal(event_name: str | None, ref: str | None, repository: str
     return "dev compile runner admits only a feat-cmux-next push or dev_daily dispatch"
 
 
-def reservation_refusal(path: str, now: float) -> str | None:
+# glaeda-mini-health's drain for a Tailscale restart (glaeda#1627): it wants the host idle, not jobs refused. The gate
+# stops idle listeners while the marker stands, so no new job comes; a job a listener already took before the gate
+# saw the marker is admitted and finishes (mini-health waits for it). Refusing it only failed that job: one
+# mini refused 28 jobs this way during a single 20-minute drain.
+DRAIN_OWNER = "glaeda-mini-health"
+DRAIN_PURPOSE = "drain for a Tailscale restart: "  # glaeda-mini-health start_drain's purpose, exactly this prefix
+
+
+def drain_marker(marker: dict[str, Any]) -> bool:
+    return marker.get("owner") == DRAIN_OWNER and str(marker.get("purpose") or "").startswith(DRAIN_PURPOSE)
+
+
+def reservation_refusal(path: str, now: float, taken_job: bool = False) -> str | None:
     """Why an active or unreadable reservation refuses this job, or None. Parsed by glaeda_reservation,
-    shared with glaeda-mini-fleet, which the installer copies next to this hook."""
+    shared with glaeda-mini-fleet, which the installer copies next to this hook. taken_job (job-started only):
+    a valid, active drain marker (drain_marker) admits the job a listener already took; any other marker, and
+    an unreadable or invalid one, refuses as before."""
     try:
         text = Path(path).read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -1145,7 +1159,13 @@ def reservation_refusal(path: str, now: float) -> str | None:
     marker, why = reservation.parse(text)
     if marker is None:
         return f"reservation {path} is not a valid {reservation.SCHEMA} marker ({why})"
-    return f"host reserved by {reservation.describe(marker)}" if reservation.active(marker, now) else None
+    if not reservation.active(marker, now):
+        return None
+    if taken_job and drain_marker(marker):
+        print(f"{PREFIX}: host draining ({reservation.describe(marker)}); admitting the job this runner already "
+              "took (its listener is held off for new ones)", flush=True)
+        return None
+    return f"host reserved by {reservation.describe(marker)}"
 
 
 FLEET_ROLE = "cmux_macos_native_build"
@@ -6489,7 +6509,7 @@ def main(argv: list[str] | None = None) -> int:
             why = leaked_toolchain_env(given, args.toolchain_xcode)
             if why:
                 return refused(why)
-        why = reservation_refusal(args.reservation, time.time())
+        why = reservation_refusal(args.reservation, time.time(), taken_job=True)
         disk_path = os.path.dirname(args.host_lock)
         if not why and not args.no_disk and disk_refusal(disk_path, args.min_free_gib):
             print(f"{PREFIX}: {evict(disk_path, args.min_free_gib, args.disk)}", flush=True)
