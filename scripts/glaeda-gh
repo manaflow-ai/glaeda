@@ -295,9 +295,14 @@ REST_SAFETY = 900  # a run the controller tracks is still read over REST this of
 # 40557947333, 2026-10-27, finished on GitHub while the controller kept it in_progress and its waiter blocked).
 STALE_RUN_REREAD = 180
 WAIT_PRIORITY = STALE_RUN_REREAD  # in a busy tick, a waited key is read as if this much longer unread
+# The client's own controller long-poll before it hands its wait to the daemon (subscribe_wait). That poll does not
+# see the cache, so a finish the daemon reads from GitHub (a lost delivery, STALE_RUN_REREAD) reaches the waiter
+# only when it ends: at 300 s, a run finished at 20:46:40Z released its waiter at 20:51:16Z, 2 min after the
+# daemon's 20:49:20Z read (2026-10-27). Once the daemon rules, it does so within a tick.
+CLIENT_RUN_LONG_POLL = STALE_RUN_REREAD
 # A watch counts as waited on this long after a wait (or a downstream's) last registered it: past the client's
 # controller long-poll (subscribe_wait), which registers once before it blocks, and the daemon's touches after it.
-WAIT_INTEREST = CONTROLLER_RUN_MAX_WAIT + 2 * TOUCH_EVERY
+WAIT_INTEREST = CLIENT_RUN_LONG_POLL + 2 * TOUCH_EVERY
 CONTROLLER_ABSENT = 900  # a controller without the run-events receiver (404, 503) is asked again this rarely
 FEED_PAGES = 5  # feed pages read per tick at most; a longer backlog continues on the next tick
 NUDGE_MIN = 20  # a PR a check event nudged is re-read at most this often (GraphQL points)
@@ -4072,7 +4077,7 @@ def controller_wait_run(key: str, timeout: float) -> dict | None:
     if controller is None:
         return None
     _, owner, repo, run_id = split_key(key)
-    wait = max(0, min(CONTROLLER_RUN_MAX_WAIT, int(timeout)))
+    wait = max(0, min(CLIENT_RUN_LONG_POLL, CONTROLLER_RUN_MAX_WAIT, int(timeout)))
     try:
         baseline = controller.run(run_id, wait=0)
         if not isinstance(baseline, dict) or str(baseline.get("id")) != str(run_id):

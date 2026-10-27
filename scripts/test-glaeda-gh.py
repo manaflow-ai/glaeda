@@ -1734,6 +1734,17 @@ class ClientTest(Base):
                          [mock.call(9, wait=0), mock.call(9, wait=5)])
         self.assertIsNotNone(entry["restAt"])
 
+    def test_the_client_long_poll_ends_by_the_stale_reread(self) -> None:
+        """The long-poll does not see the cache: a lost finish the daemon reads from GitHub at STALE_RUN_REREAD reached
+        the waiter only when the poll ended, 300 s in (2026-10-27). It ends by then, and the daemon rules from there."""
+        controller = mock.Mock()
+        controller.run.return_value = ctl_run(9, "in_progress", "", iso(time.time()), repo="o/r")
+        with mock.patch.object(gg.Controller, "from_env", return_value=controller):
+            gg.controller_wait_run("run:o/r/9", timeout=3600)
+        self.assertEqual(controller.run.call_args_list, [mock.call(9, wait=0), mock.call(9, wait=gg.STALE_RUN_REREAD)])
+        self.assertLessEqual(gg.CLIENT_RUN_LONG_POLL, gg.STALE_RUN_REREAD)
+        self.assertGreater(gg.WAIT_INTEREST, gg.CLIENT_RUN_LONG_POLL, "the wait stays marked through the poll")
+
     def test_long_poll_result_is_fresh_for_the_wait_started_before_it(self) -> None:
         run = ctl_run(14, "completed", "success", repo="o/r")
         controller = mock.Mock()
@@ -9216,7 +9227,7 @@ class StaleRunRereadTest(Base):
         self.assertIn("If-None-Match", self.gh.rest_calls()[-1][2], "conditional: an unchanged run answers a free 304")
 
     def test_a_run_wait_marks_its_watch_before_the_controller_long_poll(self) -> None:
-        """subscribe_wait long-polls the controller (up to CONTROLLER_RUN_MAX_WAIT) before it leaves its request: the
+        """subscribe_wait long-polls the controller (up to CLIENT_RUN_LONG_POLL) before it leaves its request: the
         daemon must already see the wait, and keep seeing it through that poll, or a lost finish waits it out."""
         key = "run:o/r/67"
         seen: list = []
@@ -9230,7 +9241,7 @@ class StaleRunRereadTest(Base):
                 gg.subscribe_wait("run", "o/r/67", "green", 600, False, False, None, gg.RESCUE_GRACE)
         self.assertTrue(seen and isinstance(seen[0].get("waitedAt"), float), seen)
         e = {"key": key, "waitedAt": seen[0]["waitedAt"]}
-        self.daemon.now = seen[0]["waitedAt"] + gg.CONTROLLER_RUN_MAX_WAIT  # the long-poll's whole length
+        self.daemon.now = seen[0]["waitedAt"] + gg.CLIENT_RUN_LONG_POLL  # the long-poll's whole length
         self.assertTrue(self.daemon.waited(e))
 
     def test_a_long_poll_that_ends_on_the_same_in_progress_record_keeps_its_age(self) -> None:
