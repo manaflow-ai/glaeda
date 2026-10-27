@@ -1064,6 +1064,125 @@ def archived_seeds(log: Path | None = None) -> frozenset[str]:
     return frozenset(held)
 
 
+# cmux's media tour (cmux-next-media.yml) builds two apps per tour slot into
+# ~/Library/Developer/Xcode/DerivedData/cmux-ci-media-slot<N>-{base,head}, about 12 GiB each side.
+# cmux_next_media_runner.py routes tours only to the glaeda-gui-<class>-* and glaeda-session-<class>-* labels,
+# so the media hosts are the minis where an enrolled runner carries one of them: derived from the runners'
+# own registration receipts, never a host list. Elsewhere these dirs go at once (a mini that lost its gui
+# runner, or one that never had one). On a media host, the warm slots (index below media_tour_warm_slots,
+# the workflow's CMUX_MEDIA_TOUR_SLOTS) are kept by role, not by age: they go only under the runner floor,
+# after everything else. Overflow slots and old per-PR dirs keep the family's 12 h window. The usual
+# in-use vetoes (open files, cwd, command lines) still hold for every one of them.
+MEDIA_TOUR_DD = re.compile(r"^cmux-ci-media-[A-Za-z0-9._-]+$")
+MEDIA_TOUR_WARM_SLOT = re.compile(r"^cmux-ci-media-slot(0|[1-9][0-9]*)-(?:base|head)$")
+# pr_runner_pool.gui_label()/session_label(): glaeda-gui-<class>-xcode-<version>, glaeda-session-<class>-xcode-<version>
+MEDIA_TOUR_LABEL = re.compile(r"^glaeda-(?:gui|session)-[a-z0-9]+-xcode-[0-9][0-9.]*$")
+CMUX_RUNNER_STATE = HOME / ".local/state/glaeda/cmux-runner"
+# media_tag_lock.py's lock dir: one flock per tag (ci-media-slot0 for cmux-ci-media-slot0-{base,head}), held by a
+# tour from its claim until its Runner.Worker exits, before it has opened anything in the DerivedData.
+MEDIA_TOUR_LOCKS = HOME / "Library/Caches/cmux-ci-media/locks"
+_MEDIA_TOUR_HOST: bool | None = None
+_MEDIA_TOUR_HOST_SET = False
+
+
+def media_tour_host(state: Path | None = None) -> bool | None:
+    """Whether a media tour can be routed to this host: True when an enrolled runner's registration carries a gui
+    or session pool label, False when every enrolled runner was read and none does, None when no runner is
+    enrolled here or a receipt cannot be read (not a CI mini, or unknown: nothing changes)."""
+    global _MEDIA_TOUR_HOST, _MEDIA_TOUR_HOST_SET
+    if state is None and _MEDIA_TOUR_HOST_SET:
+        return _MEDIA_TOUR_HOST
+    base = CMUX_RUNNER_STATE if state is None else state
+    enrolled, answer = 0, False
+    for path in [base / "receipt.json", *sorted(base.glob("instance-*/receipt.json"))]:
+        try:
+            doc = json.loads(path.read_text())
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError):
+            answer = None
+            break
+        if not isinstance(doc, dict) or doc.get("mode") == "uninstall":
+            continue
+        runner_dir = doc.get("runnerDir")
+        if not runner_dir or not (Path(str(runner_dir)) / ".runner").is_file():
+            continue  # not installed (any more): its labels route nothing here
+        enrolled += 1
+        labels = (doc.get("registration") or {}).get("labels") if isinstance(doc.get("registration"), dict) else None
+        if not isinstance(labels, list):
+            answer = None
+            break
+        if any(isinstance(x, str) and MEDIA_TOUR_LABEL.match(x) for x in labels):
+            answer = True
+            break
+    result = answer if enrolled or answer is None else None
+    if state is None:
+        _MEDIA_TOUR_HOST, _MEDIA_TOUR_HOST_SET = result, True
+    return result
+
+
+def media_tour_dd(fam: Family, path: Path) -> bool:
+    """Whether PATH is a cmux media tour's DerivedData (cmux-ci-media-<tag>) directly in Xcode's DerivedData."""
+    return (fam.id == "xcode-derived-data" and path.parent == fam.root and bool(MEDIA_TOUR_DD.match(path.name))
+            and not path.is_symlink())
+
+
+def media_tour_warm_slot(fam: Family, path: Path) -> bool:
+    """Whether PATH is one of a media host's warm tour slots, kept by role (see MEDIA_TOUR_DD)."""
+    if not media_tour_dd(fam, path) or media_tour_host() is not True:
+        return False
+    m = MEDIA_TOUR_WARM_SLOT.match(path.name)
+    return m is not None and int(m.group(1)) < int(POLICY["media_tour_warm_slots"])
+
+
+def media_tour_tag_lock(path: Path) -> int | None:
+    """An fd holding the tour tag lock of media DerivedData PATH (media_tag_lock.py), taken without waiting, or None
+    while a tour holds it or the lock cannot be opened or taken (fail closed). Keep it until PATH is gone: a tour
+    claiming the tag meanwhile takes the next slot or waits, so it never builds into a dir being removed."""
+    tag = path.name[len("cmux-"):]
+    for side in ("-base", "-head"):
+        if tag.endswith(side):
+            tag = tag[: -len(side)]
+            break
+    try:
+        MEDIA_TOUR_LOCKS.mkdir(parents=True, exist_ok=True)
+        fd = os.open(MEDIA_TOUR_LOCKS / f"{tag}.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def media_tour_tag_held(path: Path) -> bool:
+    """Whether a tour holds (or may hold: the lock cannot be taken) the tag of media DerivedData PATH."""
+    fd = media_tour_tag_lock(path)
+    if fd is None:
+        return True
+    os.close(fd)
+    return False
+
+
+def remove_media_tour_dd(path: Path) -> bool:
+    """Delete media DerivedData PATH only under its tour tag lock; False (nothing done) while a tour holds it."""
+    fd = media_tour_tag_lock(path)
+    if fd is None:
+        return False
+    try:
+        remove(path)
+    finally:
+        os.close(fd)
+    return True
+
+
+def media_tour_stray(fam: Family, path: Path) -> bool:
+    """Whether PATH is media tour DerivedData on an enrolled CI host that no tour can be routed to."""
+    return media_tour_dd(fam, path) and media_tour_host() is False
+
+
 def item_window(fam: Family, path: Path, idle_hours: float, archived: frozenset[str] = frozenset()) -> float:
     """The idle window for one candidate: a seed the archive already holds may go at once (the newest of each
     root still stay, by keep_verdict), and SwiftPM scratch left in the trash or under the emergency floor
@@ -1072,6 +1191,13 @@ def item_window(fam: Family, path: Path, idle_hours: float, archived: frozenset[
     (cmux_next_ci_over). Everything else waits out its family's window."""
     if fam.id == "cmux-seeds" and path.name in archived:
         return 0.0
+    if media_tour_stray(fam, path):  # no tour can reach this host: nothing will reuse it
+        return 0.0
+    if media_tour_warm_slot(fam, path):  # warm by role: only under the runner floor (floor_hold_only)
+        with contextlib.suppress(OSError):
+            if fam.root.stat().st_dev in FLOOR_HOLD:
+                return 0.0
+        return math.inf
     if cmux_next_ci_host_root(fam, path):  # never the cap's: its own idle window, or at once under the floor hold
         with contextlib.suppress(OSError):
             if fam.root.stat().st_dev in FLOOR_HOLD:
@@ -1101,7 +1227,7 @@ def floor_hold_family(fam: Family, path: Path) -> bool:
     process evidence and taken exclusive to delete; the next compile on the root clears it anyway, and a rerun
     restores it from the artifact; a root without a token file keeps its 12 h window), and code-sign clones
     (keep_live_app_clones and app_clone_running keep the live ones)."""
-    if fam.id == RUNNER_BUILD_FAMILY or fam.app_clones:
+    if fam.id == RUNNER_BUILD_FAMILY or fam.app_clones or media_tour_warm_slot(fam, path):
         return True
     if fam.id == CANONICAL_ADMISSION:  # only where the runner hook's token protocol is in force on this root
         token = canonical_root_token(path)
@@ -1111,7 +1237,10 @@ def floor_hold_family(fam: Family, path: Path) -> bool:
 
 
 def floor_hold_only(fam: Family, item: "Item", idle_hours: float) -> bool:
-    """Reclaimable only because of the floor hold: younger than its family's own window."""
+    """Reclaimable only because of the floor hold: younger than its family's own window. A media host's warm tour
+    slot has no age window, so the floor hold is the only thing that lets it go."""
+    if media_tour_warm_slot(fam, Path(item.path)):
+        return True
     return floor_hold_family(fam, Path(item.path)) and item.idle_hours < idle_window(fam, idle_hours)
 
 
@@ -1276,6 +1405,9 @@ POLICY_DEFAULTS: dict[str, Any] = {
     # Over the cap, a cmux-next state no enrolled runner owns goes whole (inputs too) only once idle this long:
     # GitHub's default job timeout (timeout-minutes 360), so no job can still be using it.
     "cmux_next_ci_unowned_idle_hours": 6.0,
+    # Warm media tour slots a media host keeps by role (cmux-ci-media-slot<N>-{base,head}, N below this): cmux's
+    # CMUX_MEDIA_TOUR_SLOTS, default 2. They go only under the runner floor; on a host no tour can reach, none stay.
+    "media_tour_warm_slots": 2,
     # Per-host cmux-next build roots, relative to the cmux-next-ci cache (cmux#25147: the DEV Release compile builds
     # from one tree per mini, so the compilation cache's path-bearing keys match whichever runner instance builds).
     # Builds hold flock(2) on <root>/lock; <root>/src and <root>/Release/xcode-<toolchain> are one warm state, and the
@@ -5837,6 +5969,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
                 reasons.append("live lease or running job")
         if fam.id == SPM_SCRATCH and spm_scratch_held(path):
             reasons.append("a job holds its lock (owned_spm_scratch.py)")
+        if media_tour_dd(fam, path) and media_tour_tag_held(path):
+            reasons.append("a media tour holds its slot's tag lock (media_tag_lock.py)")
         if fam.id == CANONICAL_ADMISSION and canonical_root_held(path):
             reasons.append("a job holds its canonical root (root token)")
         if tmp_canonical_root(fam, path) and canonical_root_held(path, whole_root=True):
@@ -5888,8 +6022,14 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
                 reasons.append(loss)
         elif not due:
             verdict = "recent"
+            if media_tour_warm_slot(fam, path):
+                reasons.append("a warm media tour slot on a media host: kept by role, only under the runner floor")
         else:
             verdict = "reclaimable"
+            if media_tour_stray(fam, path):
+                reasons.append("media tour DerivedData on a host no tour is routed to (no gui or session runner)")
+            elif media_tour_warm_slot(fam, path):
+                reasons.append("a warm media tour slot, under the runner floor: last, least recently used first")
             if path.name in archived and fam.id == "cmux-seeds":
                 reasons.append("the seed archive holds it")
             if cmux_next_ci_host_root(fam, path):
@@ -7082,7 +7222,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         if halt is not None and (why := halt()):
             print(f"stopped: {why}")
             break
-        if fam.id in FLEET_FAMILY_IDS or fam.id in (CMUX_NEXT_CI_FAMILY, HQ_CACHE_FAMILY, CANONICAL_ADMISSION) or (
+        if fam.id in FLEET_FAMILY_IDS or fam.id in (CMUX_NEXT_CI_FAMILY, HQ_CACHE_FAMILY, CANONICAL_ADMISSION) \
+                or media_tour_dd(fam, p) or (
                 fam.id == INTERRUPTED and fam.root in (cmux_next_ci_state_parents(HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT)
                                                        + cmux_next_ci_host_parents(HOME / "Library/Caches" / CMUX_NEXT_CI_ROOT))):
             # Pressure eligibility is intentionally broad, so take fresh cwd/open-file evidence immediately
@@ -7189,6 +7330,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 elif i.family == INTERRUPTED:
                     finish_deletion(p)
                     gone = True
+                elif media_tour_dd(fam, p):
+                    gone = remove_media_tour_dd(p)  # only under the tour's tag lock: a tour may claim the slot now
                 elif cmux_next_ci_host_root(fam, p):
                     # only under its own lock (a build may take it now); for the floor alone, only while still under it
                     gone = remove_cmux_next_host(p, needed=(lambda q=p: cmux_next_ci_host_floor_unmet(q))
