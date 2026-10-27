@@ -855,6 +855,47 @@ class AgentTests(unittest.TestCase):
                     self.assertEqual(entry["state"], "released")
                     self.assertIn("never cancelled", entry["note"])
 
+    def test_the_shared_delivery_list_is_never_cancelled_on_any_branch(self):
+        """never_cancelled() also reads glaeda_never_cancel's list: promote, *-nightly, named DEV runs, any ref."""
+        cases = [
+            ("promote", dict(path=".github/workflows/cloud-vm-image-promote.yml"), None),
+            ("tui nightly", dict(path=".github/workflows/cmux-tui-nightly.yml"), None),
+            ("nightly on a branch", dict(path=".github/workflows/nightly.yml@refs/heads/some-branch"), None),
+            ("DEV dispatcher", dict(path=".github/workflows/cmux-next-dev-daily-dispatch.yml"), None),
+            ("named DEV build", dict(path=".github/workflows/cmux-next.yml"), "cmux NEXT DEV daily · abc"),
+        ]
+        for name, run, title in cases:
+            with self.subTest(name=name):
+                self.cmux = FakeCmux()
+                self.api = gr.GitHub("repo-token", self.cmux)
+                self.cmux.add_run(event="workflow_dispatch", pr=None, jobs=[job(1, created=NOW - 600)], **run)
+                if title:
+                    self.cmux.runs[7].update(name=title, display_title=title)
+                store, ledger = fake_ledger(ledger_doc(reservation(priority="pr", created=NOW - 600)))
+                seen = {"job:1": NOW - 200}
+                for at in (NOW, NOW + 100, NOW + 200):
+                    self.tick(ledger, now=at, seen=seen)
+                self.assertEqual(self.cmux.effects, [])
+                self.assertIn("never cancelled", store.doc()["reservations"][0]["note"])
+
+    def test_the_cancel_itself_refuses_a_started_delivery_run(self):
+        """Defence in depth: even if never_cancelled() missed a delivery run, cancel_run() refuses it."""
+        original = gr.never_cancelled
+        gr.never_cancelled = lambda run, entry: ""
+        try:
+            self.cmux.add_run(event="workflow_dispatch", pr=None, path=".github/workflows/nightly.yml",
+                              jobs=[job(1, created=NOW - 600)])
+            store, ledger = fake_ledger(ledger_doc(reservation(created=NOW - 600)))
+            seen = {"job:1": NOW - 200}
+            for at in (NOW, NOW + 100, NOW + 200):
+                self.tick(ledger, now=at, seen=seen)
+        finally:
+            gr.never_cancelled = original
+        self.assertEqual(self.cmux.effects, [])
+        entry = store.doc()["reservations"][0]
+        self.assertEqual(entry["state"], "released")
+        self.assertIn("never cancelled", entry["note"])
+
     def test_a_rescuing_entry_for_a_nightly_run_is_released_not_cancelled(self):
         """A reservation already `rescuing` (written by an older agent) still never cancels a nightly or DEV run."""
         for path in (".github/workflows/nightly.yml", ".github/workflows/cmux-next-dev-daily.yml"):
@@ -866,6 +907,26 @@ class AgentTests(unittest.TestCase):
                 self.tick(ledger, now=NOW, seen={"job:1": NOW - 200})
                 self.assertEqual(self.cmux.effects, [])
                 self.assertEqual(store.doc()["reservations"][0]["state"], "released")
+
+    def test_a_refused_force_cancel_is_not_marked_forced(self):
+        """If the guard refuses a force-cancel (never_cancelled() missed a started delivery run), nothing is
+        recorded as forced and no force-cancel is sent; the entry fails at the give-up as before."""
+        original = gr.never_cancelled
+        gr.never_cancelled = lambda run, entry: ""
+        try:
+            self.cmux.add_run(event="push", pr=None, path=".github/workflows/nightly.yml",
+                              jobs=[job(1, created=NOW - 600)])
+            store, ledger = fake_ledger(ledger_doc(reservation(state="rescuing", created=NOW - 600)))
+            seen = {f"cancel:{REPO.lower()}#7.1": NOW - gr.FORCE_CANCEL_SECONDS - 5, "job:1": NOW - 200}
+            self.tick(ledger, now=NOW, seen=seen)
+            entry = store.doc()["reservations"][0]
+            self.assertFalse(entry.get("forced"))
+            self.assertIn("no force-cancel", entry.get("note", ""))
+            self.tick(ledger, now=NOW + gr.CANCEL_GIVE_UP_SECONDS, seen=seen)
+        finally:
+            gr.never_cancelled = original
+        self.assertEqual(self.cmux.effects, [])
+        self.assertEqual(store.doc()["reservations"][0]["state"], "failed")
 
     def test_an_older_agents_cancel_of_a_nightly_run_is_never_forced_and_is_restored(self):
         """A stale `rescuing` entry whose cancel an older agent recorded: no force-cancel while the run settles,

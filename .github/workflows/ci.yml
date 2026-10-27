@@ -222,6 +222,8 @@ jobs:
               Path("scripts/test-glaeda-fleet-status.py"),
               Path("scripts/glaeda-route"),
               Path("scripts/test-glaeda-route.py"),
+              Path("scripts/glaeda_never_cancel.py"),
+              Path("scripts/test-glaeda-never-cancel.py"),
               Path("scripts/cmux_execution_roles.py"),
               Path("scripts/test-cmux-fleet.py"),
               Path("scripts/test-cmux-execution-roles.py"),
@@ -373,6 +375,7 @@ jobs:
           suite python3 scripts/test-glaeda-mini-fleet.py
           suite python3 scripts/test-glaeda-fleet-status.py
           suite python3 scripts/test-glaeda-route.py
+          suite python3 scripts/test-glaeda-never-cancel.py
           suite python3 scripts/test-cmux-execution-roles.py
           suite python3 scripts/test-cmux-workload-request.py
           suite python3 scripts/test-owned-fleet-benchmark.py

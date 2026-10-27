@@ -66,6 +66,9 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import glaeda_never_cancel as never_cancel  # noqa: E402  (the only code that cancels a run)
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 STATE_SCHEMA = "glaeda-pool-state/v1"
 DEFAULT_REPO = "manaflow-ai/cmux"
@@ -987,7 +990,8 @@ def never_cancelled(run: dict[str, Any], entry: dict[str, Any]) -> str:
         return f"a {workflow} run is never cancelled"
     if workflow in NEVER_CANCEL_PUSH_WORKFLOWS and run.get("event") == "push":
         return f"a {workflow} push run is never cancelled"
-    return ""
+    delivery = never_cancel.delivery_reason(run)  # the shared list: nightly, DEV and promote workflows on any branch
+    return f"{delivery} is never cancelled" if delivery else ""
 
 
 def pull_moved(api: GitHub, repo: str, run: dict[str, Any]) -> str:
@@ -1081,7 +1085,10 @@ def watch_one(api: GitHub, entry: dict[str, Any], *, now: float, seen: dict[str,
                 moved = pull_moved(api, repo, run)
                 if moved:
                     return {"state": "released", "note": f"not rescued: {moved}"}
-                api.ok("POST", f"/repos/{repo}/actions/runs/{run_id}/cancel")
+                cancelled, refused_why = never_cancel.cancel_run(
+                    lambda path: api.ok("GET", path), lambda path: api.ok("POST", path), repo, run)
+                if not cancelled:
+                    return {"state": "released", "note": f"not rescued, never cancelled: {refused_why}"}
                 seen[key] = now
                 persist()  # the re-run depends on this record; keep it even if the tick dies next
                 return {"cancel_at": utc(now)}
@@ -1089,8 +1096,10 @@ def watch_one(api: GitHub, entry: dict[str, Any], *, now: float, seen: dict[str,
             if waited >= CANCEL_GIVE_UP_SECONDS:
                 return {"state": "failed", "note": f"the run did not finish {CANCEL_GIVE_UP_SECONDS} s after cancel"}
             if waited >= FORCE_CANCEL_SECONDS and not entry.get("forced"):
-                api.ok("POST", f"/repos/{repo}/actions/runs/{run_id}/force-cancel")
-                return {"forced": True}
+                forced, refused_why = never_cancel.cancel_run(
+                    lambda path: api.ok("GET", path), lambda path: api.ok("POST", path), repo, run, force=True)
+                # Refused: not marked forced, so a later tick asks again (a read may have failed) until the give-up.
+                return {"forced": True} if forced else {"note": f"no force-cancel: {refused_why}"}
             return None
         if kept and cancelled_before and run.get("conclusion") == "cancelled":
             # An older agent cancelled a protected run: restore it, whatever moved meanwhile.
