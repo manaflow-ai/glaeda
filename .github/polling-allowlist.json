@@ -1,0 +1,10 @@
+{
+  "about": "Polling loops tools/polling-guard/polling_scan.py lets stay, each with why. Waits use one glaeda-gh wait. An entry is only for a bounded loop with no glaeda-gh to wait through. match is the loop's first line, stripped. An entry that matches nothing fails the scan.",
+  "entries": [
+    {
+      "path": "scripts/quarry-trusted-runner.sh",
+      "match": "for attempt in $(seq 1 15); do",
+      "reason": "Runs once per runner install on a Quarry host, right after the runner registers, to confirm GitHub sees it online. glaeda-gh has no runner wait and need not be on that host. Bounded at 15 reads over 30 s, then a hard failure."
+    }
+  ]
+}

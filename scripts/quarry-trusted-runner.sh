@@ -17,6 +17,10 @@ autostart_plist="${HOME}/Library/LaunchAgents/io.lima-vm.autostart.${instance}.p
 autoidle_label="io.smolrunner.quarry-autoidle.${instance}"
 autoidle_plist="${HOME}/Library/LaunchAgents/${autoidle_label}.plist"
 autoidle_timeout="${SMOLRUNNER_QUARRY_IDLE_TIMEOUT:-900}"
+# launchd runs one autoidle tick this often (StartInterval): a timer, not a polling loop. Each tick
+# with the VM running reads the runner list once and adds one interval of idle time, so the first tick
+# comes one interval after load (no RunAtLoad) and the timeout is not reached early.
+autoidle_interval="${SMOLRUNNER_QUARRY_POLL_INTERVAL:-60}"
 autoidle_state="${SMOLRUNNER_QUARRY_AUTOIDLE_STATE:-${HOME}/Library/LaunchAgents/.${autoidle_label}.state}"
 launchctl_cmd="${LAUNCHCTL:-$(command -v launchctl 2>/dev/null || printf '/bin/launchctl')}"
 
@@ -496,7 +500,8 @@ write_autoidle_plist() {
 	<array>
 		<string>/bin/bash</string>
 		<string>${script_path}</string>
-		<string>autoidle-daemon</string>
+		<string>autoidle-tick</string>
+		<string>${autoidle_interval}</string>
 	</array>
 	<key>EnvironmentVariables</key>
 	<dict>
@@ -504,9 +509,9 @@ write_autoidle_plist() {
 		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
 	</dict>
 	<key>RunAtLoad</key>
-	<true/>
-	<key>KeepAlive</key>
-	<true/>
+	<false/>
+	<key>StartInterval</key>
+	<integer>${autoidle_interval}</integer>
 	<key>ProcessType</key>
 	<string>Background</string>
 	<key>StandardOutPath</key>
@@ -655,20 +660,11 @@ EOF_RUNNER
   fi
 }
 
+# A LaunchAgent written before autoidle ran on StartInterval runs this with KeepAlive. One tick, a
+# pause of one interval, then exit: launchd starts it again. `autoidle-enable` rewrites the agent.
 autoidle_daemon() {
-  local poll_interval="${SMOLRUNNER_QUARRY_POLL_INTERVAL:-15}"
-  local quiescent_interval="${SMOLRUNNER_QUARRY_QUIESCENT_INTERVAL:-60}"
-  local current_interval
-  while true; do
-    if instance_running; then
-      current_interval="${poll_interval}"
-      autoidle_tick "${current_interval}" || true
-    else
-      current_interval="${quiescent_interval}"
-      save_autoidle_state 0 "stopped"
-    fi
-    sleep "${current_interval}"
-  done
+  sleep "${autoidle_interval}"
+  autoidle_tick "${autoidle_interval}" || true
 }
 
 remove_runner() {
