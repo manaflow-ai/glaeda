@@ -38,6 +38,8 @@ What --apply installs (templated for the current user):
     ~/.local/bin/glaeda-worktree-reclaim-all   from scripts/glaeda-worktree-reclaim-all
     ~/.local/bin/glaeda-fleet-cas-prune        from scripts/glaeda-fleet-cas-prune (a no-op without fleet-cas)
     ~/.local/bin/glaeda-seed-prefetch          from scripts/glaeda-seed-prefetch (a no-op off an owned cmux runner)
+    ~/.local/bin/glaeda-git-mirror             from scripts/glaeda-git-mirror (the runner mini's full cmux git mirror,
+                                               /Users/Shared/cmux-build-fleet/git/cmux.git; a no-op without a runner)
     ~/.local/bin/glaeda-lan-fetch              from scripts/glaeda-lan-fetch (compiled products from LAN peers; a
                                                miss without a mesh config). CI calls a root-owned copy at
                                                LAN_FETCH_ROOT_COPY, which needs sudo: an operator step
@@ -60,7 +62,7 @@ What --apply installs (templated for the current user):
     ~/.claude/skills/github-ci-wait/SKILL.md    from skills/github-ci-wait: tells agent sessions to wait with glaeda-gh
     ~/.config/glaeda/update.json               its release ring and source, written once (--ota-ring canary|stable,
                                                --ota-source teamleaderleo/glaeda|manaflow-ai/glaeda)
-    ~/Library/LaunchAgents/com.teamleaderleo.glaeda.{disk-pressure,idle-repair,disk-dedupe,worktree-reclaim,fleet-cas-prune,seed-prefetch,lan-fetch,
+    ~/Library/LaunchAgents/com.teamleaderleo.glaeda.{disk-pressure,idle-repair,disk-dedupe,worktree-reclaim,fleet-cas-prune,seed-prefetch,git-mirror,lan-fetch,
                                   idle-warm,idle-fuzz,mini-health,local-guard,update,gh-watch}.plist
     build-host directories and three git defaults, each set only when unset
     on a Mac mini only: alert sounds off (defaults -g com.apple.sound.beep.volume 0, uiaudio.enabled 0,
@@ -843,6 +845,20 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-seed-prefetch.jsonl"),
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-seed-prefetch.err"),
         },
+        # The runner mini's full cmux git mirror (scripts/glaeda-git-mirror): a job fetches its commit from this
+        # disk, not GitHub. Every minute a fetch of main, feat-cmux-next and nightly-next (under a second with
+        # nothing new); a missing mirror is seeded from the R2 bundle. A no-op on a host without a runner.
+        LABEL_PREFIX + "git-mirror": {
+            "Label": LABEL_PREFIX + "git-mirror",
+            "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-git-mirror"), "--apply"],
+            "StartInterval": 60,
+            "RunAtLoad": True,
+            "ProcessType": "Background",
+            "LowPriorityIO": True,
+            "Nice": 10,
+            "StandardOutPath": os.fspath(ctx.logs / "glaeda-git-mirror.jsonl"),
+            "StandardErrorPath": os.fspath(ctx.logs / "glaeda-git-mirror.err"),
+        },
         # Idle catch-up (scripts/glaeda-idle-warm): on an idle owned cmux mini whose kept build is far from main,
         # builds main's head into that root and yields to any job; it exits at once anywhere else. Not
         # ProcessType Background: its build runs only while nothing else does, and should finish fast.
@@ -1268,7 +1284,7 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
     tools = GH_ONLY_TOOLS if ctx.gh_only else (
         "glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-runner-hygiene", "disk-pressure.sh", "glaeda-procs",
         "glaeda-local-guard", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune", "glaeda-seed-prefetch",
-        "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health", "glaeda-idle-repair",
+        "glaeda-git-mirror", "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health", "glaeda-idle-repair",
         "glaeda-update", "glaeda-gh", "glaeda-wallpaper-rotate", "glaeda-daemon-heal")
     for name in tools:
         act = file_action(ctx, "tool", ctx.bin / name, (SCRIPT_DIR / name).read_bytes(), 0o755)
@@ -1489,7 +1505,7 @@ def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
         actions.append({"kind": "agent", "label": label, "path": os.fspath(path),
                         "loaded": agent_loaded(ctx, label)})
     for name in ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-runner-hygiene", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune",
-                 "glaeda-seed-prefetch", "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health", "glaeda-idle-repair",
+                 "glaeda-seed-prefetch", "glaeda-git-mirror", "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health", "glaeda-idle-repair",
                  "glaeda-update", "glaeda-gh", "glaeda-wallpaper-rotate", "glaeda-daemon-heal"):
         actions.append({"kind": "tool", "path": os.fspath(ctx.bin / name)})
     actions.append({"kind": "tool", "path": os.fspath(skill_path(ctx))})

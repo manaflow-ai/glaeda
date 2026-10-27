@@ -1,0 +1,698 @@
+#!/usr/bin/env python3
+"""glaeda-git-mirror: keep one never-shallow cmux git mirror on each runner mini, current to the minute.
+
+    glaeda-git-mirror                  plan: the mirror's state and what --apply would do
+    glaeda-git-mirror --apply          seed if missing or broken, then fetch the new commits (the LaunchAgent)
+    glaeda-git-mirror --apply --wait   the same on demand: waits up to LOCK_WAIT seconds for a running pass
+
+A nightly-next build on a kept workspace fetched its commit from GitHub. On 2026-10-27 one such fetch
+hung for 62 minutes and died with "early EOF" (cmux run 40466772597), and the nightly with it. Leo,
+2026-10-25: "just use the fucking r2 or the ssds". So every runner mini keeps the repository on its
+own disk, at MIRROR (/Users/Shared/cmux-build-fleet/git/cmux.git), and a job fetches its commit from
+that path. Then a build's network fetch is only what the mirror has not caught up on, and a full-tree
+fetch from GitHub never happens during a build.
+
+- The mirror is bare and has full history and blobs: never shallow (a `shallow.lock` directory makes
+  any depth-limited fetch into it fail) and never partial. It holds refs/heads/{main, feat-cmux-next,
+  nightly-next}, forced to GitHub's, and nothing else. Measured 2026-10-27: 2.21 GiB, 760k objects.
+- Every LaunchAgent pass (StartInterval 60) fetches those three refs from GitHub. A pass with nothing
+  new takes under a second. Each try has a time limit (FETCH_TIMEOUT) and git's low-speed abort (under
+  1 KiB/s for 60 s); there are FETCH_TRIES tries with backoff.
+- A missing or broken mirror is seeded from the R2 git bundle that cmux's git-mirror-bundle.yml
+  refreshes (BUCKET_URL v1/any, pointer git-mirror-cmux-), never from a full GitHub clone. The bundle
+  is downloaded and checked with `git bundle verify`. A missing mirror is built in a staging
+  directory, checked for connectivity, and renamed to the path, which no reader can have open. An
+  existing broken one (shallow, partial, no main) is repaired in place by only adding objects, then
+  dropping the shallow or partial marker. The mirror is never removed and never loses an object. --seed-from-github is the
+  operator's fallback when the bucket has no bundle.
+- uploadpack.allowAnySHA1InWant is on, so `git fetch MIRROR <sha>` works for any commit it holds.
+- glaeda-disk keeps the mirror by role (family `cmux-git-mirror`, report only).
+- Nothing removes an object from it (gc.auto 0, gc.pruneExpire never, and the fold is
+  `repack --geometric`, which keeps every object of the packs it combines), so runner checkouts
+  may borrow its objects through objects/info/alternates. A reseed replaces a broken mirror; a
+  borrower that then misses an object is reset by the runner hook.
+
+It runs only where a GitHub Actions runner is installed (~/actions-runner*/.runner) and a mirror
+source is configured (SOURCE_CONFIG), and is a no-op anywhere else. One pass at a time (flock on GIT_DIR/.lock). It needs no credential: the repository and
+the bucket are public. Prints one JSON line; the last pass's record is GIT_DIR/cmux.json.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import fcntl
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Callable, Sequence
+
+FLEET_DIR = Path(os.environ.get("GLAEDA_FLEET_DIR") or "/Users/Shared/cmux-build-fleet")
+GIT_DIR = Path(os.environ.get("GLAEDA_GIT_MIRROR_DIR") or FLEET_DIR / "git")
+MIRROR = GIT_DIR / "cmux.git"
+RECORD = GIT_DIR / "cmux.json"
+REPO_URL = os.environ.get("GLAEDA_GIT_MIRROR_REPO", "https://github.com/manaflow-ai/cmux.git")
+# cmux's NEXT cache bucket (public reads; cmux git-mirror-bundle.yml writes it).
+BUCKET_URL = os.environ.get("GLAEDA_GIT_MIRROR_BUCKET_URL", "https://ci-cache-next.cmux.com")
+BUNDLE_PREFIX = "git-mirror-cmux-"
+BUNDLE_KEY = re.compile(r"git-mirror-cmux-[0-9]{10}\.[0-9a-f]{12}")
+BUNDLE_FILE = "cmux.bundle"
+BRANCHES = ("main", "feat-cmux-next", "nightly-next")
+TOOL_PATH = "/opt/homebrew/bin:/usr/local/bin"
+GIT = "/usr/bin/git" if Path("/usr/bin/git").exists() else "git"
+CURL = "/usr/bin/curl" if Path("/usr/bin/curl").exists() else "curl"
+TAR = "/usr/bin/tar" if Path("/usr/bin/tar").exists() else "tar"
+LOW_SPEED = ("-c", "http.lowSpeedLimit=1024", "-c", "http.lowSpeedTime=60")
+FETCH_TIMEOUT = 600
+FETCH_TRIES = 3
+BACKOFF = (10, 30)
+# A first seed runs at the uplink's speed: 2.2 GB at 0.4-0.9 MB/s (2026-10-27) is 40-90 minutes.
+DOWNLOAD_TIMEOUT = 10800
+DOWNLOAD_TRIES = 4
+LOCK_WAIT = 900
+# A seed writes the bundle and its unpacked copy (2.4 GB each, 2026-10-27), with room to spare.
+SEED_MIN_FREE = 12 * 1024**3
+# Each pass's fetch writes a small pack. gc --auto would fold them with a full repack inside the bounded
+# fetch (2.2 GiB), so it is off and the pass folds them geometrically once PACK_LIMIT is passed.
+PACK_LIMIT = 24
+# Which hosts keep a mirror, and from where, is the fleet's call, not each host's: `direct` (GitHub and
+# the bucket) is the only source so far. Without it the tool does nothing, so a release never starts
+# every mini at a site seeding 2 GB over one shared uplink at once (2026-10-27: 0.4-0.9 MB/s a mini).
+SOURCE_CONFIG = ".config/glaeda/lan-cache/config.json"
+SOURCES = ("direct",)
+REPACK_TIMEOUT = 1200
+CONFIG = {
+    "core.bare": "true",
+    "gc.auto": "0",
+    "maintenance.auto": "false",
+    # Runner checkouts borrow this object store (objects/info/alternates): nothing here ever deletes an
+    # object. A forced ref update leaves the old commits; the geometric fold keeps every object it packs.
+    "gc.pruneExpire": "never",
+    "gc.reflogExpire": "never",
+    "gc.reflogExpireUnreachable": "never",
+    "gc.autoDetach": "false",
+    "fetch.recurseSubmodules": "false",
+    # Every fetch keeps its pack (git unpacks one under 100 objects into loose objects by default, which no
+    # pack count would ever see with gc off), so fold_packs is the one place objects are combined. 1, not 0:
+    # git reads 0 as no limit and unpacks every fetch.
+    "fetch.unpackLimit": "1",
+    "transfer.unpackLimit": "1",
+    "uploadpack.allowAnySHA1InWant": "true",
+    "uploadpack.allowReachableSHA1InWant": "true",
+    "protocol.version": "2",
+}
+
+
+def runner_installed(home: Path | None = None) -> bool:
+    home = Path.home() if home is None else home
+    return any((runner / ".runner").is_file() for runner in home.glob("actions-runner*"))
+
+
+# Every child of a pass inherits the pass's flock (pass_fds), so a writer the pass's own death left running
+# still holds the lock and no later pass writes beside it; PASS_FILE names its process groups so the next
+# pass can stop them (macOS has no parent-death signal). A group is in PASS_FILE before its child does any
+# work: run_group's child waits for a line on stdin that the pass writes only once the file names it.
+HELD: list[int] = []
+PASS_FILE = ".pass.json"
+ORPHAN_NAMES = {"git", "git-remote-https", "git-remote-http", "git-index-pack", "git-upload-pack", "ssh", "curl",
+                "tar", "bsdtar", "zstd", "python3", "Python", "sh"}  # sh: run_group's wrapper before its exec
+
+
+def held() -> tuple[int, ...]:
+    return tuple(HELD)
+
+
+def git(repo: Path, *args: str, timeout: float = FETCH_TIMEOUT) -> str:
+    """git's stdout; CalledProcessError on failure, TimeoutExpired past `timeout`. In its own recorded process
+    group like run_group, so a timeout or a stopped pass ends git's children (index-pack, pack-objects) too."""
+    command = [GIT, "-C", os.fspath(repo), *args]
+    process = subprocess.Popen(["/bin/sh", "-c", 'read -r go || exit 125; exec "$@" </dev/null', "sh", *command],
+                               start_new_session=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True, pass_fds=held())
+    try:
+        note_groups(own_group() + [process.pid])
+        out, err = process.communicate("go\n", timeout=timeout)
+    except BaseException as error:
+        with_suppressed(lambda: os.killpg(process.pid, signal.SIGKILL))
+        process.communicate()
+        if isinstance(error, subprocess.TimeoutExpired):
+            raise subprocess.TimeoutExpired(command, timeout) from None
+        raise
+    finally:
+        with_suppressed(lambda: note_groups(own_group()))
+    if process.returncode != 0:
+        raise subprocess.CalledProcessError(process.returncode, command, out, err)
+    return out
+
+
+def note_groups(groups: list[int]) -> None:
+    """Record this pass and the process groups it runs children in (under the flock)."""
+    if not HELD:
+        return
+    incoming = GIT_DIR / f".{PASS_FILE}.{os.getpid()}"
+    incoming.write_text(json.dumps({"pid": os.getpid(), "groups": groups}))
+    incoming.rename(GIT_DIR / PASS_FILE)  # whole or not at all, so the next pass can always read it
+
+
+def run_group(command: Sequence[str], timeout: float) -> tuple[int, str]:
+    """Run `command` in its own process group, killed whole at `timeout`; (status, stderr tail). 124 is a timeout."""
+    # The child waits for the go line: if the pass dies before recording the group, it reads EOF and exits.
+    process = subprocess.Popen(["/bin/sh", "-c", 'read -r go || exit 125; exec "$@"', "sh", *command],
+                               start_new_session=True, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.PIPE, text=True, pass_fds=held())
+    try:
+        note_groups(own_group() + [process.pid])
+    except BaseException:
+        with_suppressed(lambda: os.killpg(process.pid, signal.SIGKILL))
+        process.communicate()
+        raise
+    try:
+        _, err = process.communicate("go\n", timeout=timeout)
+        return process.returncode, (err or "")[-400:]
+    except subprocess.TimeoutExpired:
+        with_suppressed(lambda: os.killpg(process.pid, signal.SIGKILL))
+        process.communicate()
+        return 124, f"timed out after {timeout:.0f} s"
+    except BaseException:  # Ctrl-C or a signal on an on-demand pass: its child stops with it
+        with_suppressed(lambda: os.killpg(process.pid, signal.SIGKILL))
+        process.wait()
+        raise
+    finally:
+        with_suppressed(lambda: note_groups(own_group()))
+
+
+def own_group() -> list[int]:
+    """This pass's own process group, when the pass leads its own session (its git, curl and tar children run
+    there). Only a session leader's group is sure to hold nothing but the pass and its children: the first
+    command of a shell pipeline leads a group its siblings share, so such a group is never recorded (main runs
+    an --apply pass in a session of its own)."""
+    return [os.getpid()] if os.getsid(0) == os.getpid() == os.getpgid(0) else []
+
+
+def in_own_session(call: Callable[[], int]) -> int:
+    """Run `call` in a child that leads a new session, so the group the pass records holds only the pass and its
+    children; the parent forwards SIGINT, SIGTERM and SIGHUP to it and returns its exit status."""
+    sys.stdout.flush()
+    pid = os.fork()
+    if pid == 0:
+        code = 1
+        try:
+            os.setsid()
+            code = call()
+        except BaseException:  # noqa: BLE001  (a signal or a crash: the child's exit status says so)
+            code = 1
+        finally:
+            sys.stdout.flush()
+            os._exit(code)
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda signum, _frame: with_suppressed(lambda: os.kill(pid, signum)))
+    while True:
+        try:
+            _, status = os.waitpid(pid, 0)
+            break
+        except InterruptedError:
+            continue
+    return os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1
+
+
+def alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def stop_orphans() -> list[int]:
+    """The flock is held but the pass that took it is dead: its children are still writing the mirror with
+    no watchdog. Stop the groups it recorded, when each still holds only a pass's own kinds of process."""
+    try:
+        recorded = json.loads((GIT_DIR / PASS_FILE).read_text())
+        pid, groups = int(recorded["pid"]), [int(group) for group in recorded["groups"]]
+    except (OSError, ValueError, KeyError, TypeError):
+        return []
+    if alive(pid):
+        return []
+    listing = subprocess.run(["/bin/ps", "-A", "-o", "pgid=,comm="], capture_output=True, text=True, timeout=30)
+    members: dict[int, set[str]] = {}
+    for line in listing.stdout.splitlines():
+        group, _, command = line.strip().partition(" ")
+        if group.isdigit():
+            members.setdefault(int(group), set()).add(Path(command.strip()).name)
+    stopped = []
+    for group in groups:
+        names = members.get(group)
+        if group > 1 and names and names <= ORPHAN_NAMES:
+            with_suppressed(lambda: os.killpg(group, signal.SIGKILL))
+            stopped.append(group)
+    return stopped
+
+
+def with_suppressed(call: Callable[[], object]) -> None:
+    try:
+        call()
+    except OSError:
+        pass
+
+
+def healthy(mirror: Path) -> str:
+    """'' when `mirror` is a usable full mirror, else why not."""
+    if not (mirror / "HEAD").is_file():
+        return "missing"
+    if (mirror / REPAIR_PENDING).exists():
+        return "repair pending"
+    try:
+        if git(mirror, "rev-parse", "--is-shallow-repository", timeout=30).strip() != "false":
+            return "shallow"
+        if any(config_values(mirror, key) for key in PARTIAL_KEYS):
+            return "partial"
+    except (OSError, subprocess.SubprocessError) as error:
+        return f"unreadable ({type(error).__name__})"
+    for branch in BRANCHES:
+        try:
+            git(mirror, "rev-parse", "--verify", "-q", f"refs/heads/{branch}^{{commit}}", timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            return f"no {branch}"
+    return ""
+
+
+def configure(mirror: Path) -> None:
+    """Idempotent: the remote, CONFIG, and the shallow guard."""
+    configure_without_guard(mirror)
+    guard(mirror)
+
+
+def guard(mirror: Path) -> None:
+    """A directory where git writes its shallow lock file: any --depth fetch into the mirror fails."""
+    lock_file = mirror / "shallow.lock"
+    if lock_file.is_file() and not lock_file.is_symlink():
+        lock_file.unlink()  # git's own lock, left by a killed fetch
+    lock_file.mkdir(exist_ok=True)
+
+
+def configure_without_guard(mirror: Path) -> None:
+    for key, value in CONFIG.items():
+        git(mirror, "config", key, value, timeout=30)
+    try:
+        git(mirror, "remote", "set-url", "origin", REPO_URL, timeout=30)
+    except subprocess.CalledProcessError:
+        git(mirror, "remote", "add", "origin", REPO_URL, timeout=30)
+
+
+def refspecs() -> list[str]:
+    return [f"+refs/heads/{branch}:refs/heads/{branch}" for branch in BRANCHES]
+
+
+def fetch(mirror: Path, url: str, *, tries: int = FETCH_TRIES, timeout: float = FETCH_TIMEOUT,
+          runner: Callable[[Sequence[str], float], tuple[int, str]] = run_group,
+          sleep: Callable[[float], None] = time.sleep, extra: Sequence[str] = ()) -> dict:
+    """Fetch BRANCHES from `url` into `mirror`, bounded and retried; removes a failed try's partial pack."""
+    command = [GIT, *LOW_SPEED, "-C", os.fspath(mirror), "fetch", "--quiet", "--no-tags", "--prune", *extra, url,
+               *refspecs()]
+    errors = []
+    for attempt in range(1, tries + 1):
+        started = time.monotonic()
+        status, err = runner(command, timeout)
+        if status == 0:
+            return {"ok": True, "tries": attempt, "seconds": round(time.monotonic() - started, 1)}
+        errors.append(f"try {attempt}: exit {status}: {err.strip()[-200:]}")
+        drop_leftovers(mirror)
+        if attempt < tries:
+            sleep(BACKOFF[min(attempt - 1, len(BACKOFF) - 1)])
+    return {"ok": False, "tries": tries, "errors": errors}
+
+
+def drop_leftovers(mirror: Path) -> None:
+    """What a killed git (its process group is dead by now) leaves in the mirror, which would make every
+    later fetch fail: temporary packs, the .keep an index-pack holds until its refs land (geometric repack
+    skips a kept pack, so they would pile up), ref locks ("cannot lock ref"), and git's own shallow.lock file
+    (the guard is a directory there)."""
+    for leftover in [*(mirror / "objects" / "pack").glob("tmp_*"), *(mirror / "objects" / "pack").glob("*.keep"),
+                     *(mirror / "refs").rglob("*.lock"),
+                     mirror / "packed-refs.lock", mirror / "shallow.lock", mirror / "config.lock",
+                     mirror / "HEAD.lock"]:
+        if leftover.is_file() and not leftover.is_symlink():
+            with_suppressed(leftover.unlink)
+
+
+def zstd() -> str | None:
+    for directory in (*TOOL_PATH.split(":"), *os.environ.get("PATH", "").split(":")):
+        candidate = Path(directory) / "zstd"
+        if directory and candidate.is_file() and os.access(candidate, os.X_OK):
+            return os.fspath(candidate)
+    return None
+
+
+def download(url: str, target: Path, timeout: float) -> None:
+    """Fetch `url` to `target` within `timeout`; a try cut off part way resumes where it stopped."""
+    target.unlink(missing_ok=True)
+    deadline = time.monotonic() + timeout
+    status = 28
+    for attempt in range(1, DOWNLOAD_TRIES + 1):
+        if attempt > 1:
+            time.sleep(min(5, max(0, deadline - time.monotonic())))
+        left = deadline - time.monotonic()
+        if left < 1:
+            break
+        status = subprocess.run([CURL, "--fail", "--silent", "--show-error", "--location", "--continue-at", "-",
+                                 "--connect-timeout", "15", "--speed-limit", "1024", "--speed-time", "60",
+                                 "--max-time", str(max(1, int(left))), "-o", os.fspath(target), url],
+                                capture_output=True, timeout=left, pass_fds=held()).returncode
+        if status == 0:
+            return
+        if status == 22 and not target.exists():  # not in the bucket (or refused): no use asking again
+            break
+        if status in (33, 36):  # the server would not resume: start over
+            target.unlink(missing_ok=True)
+    raise subprocess.CalledProcessError(status, "curl")
+
+
+def bundle_key(work: Path, fetch_url: Callable[[str, Path, float], None] = download) -> str:
+    pointer = work / "pointer"
+    fetch_url(f"{BUCKET_URL.rstrip('/')}/v1/any/latest/{BUNDLE_PREFIX}", pointer, 60)
+    key = pointer.read_text(errors="replace")[:512].strip()
+    if not BUNDLE_KEY.fullmatch(key):
+        raise ValueError(f"bundle pointer names {key[:80]!r}")
+    return key
+
+
+def unpack(archive: Path, extension: str, into: Path) -> None:
+    into.mkdir(parents=True, exist_ok=True)
+    if extension == "tar.zst":
+        decompress = subprocess.Popen([zstd() or "zstd", "-dc", os.fspath(archive)], stdout=subprocess.PIPE,
+                                      pass_fds=held())
+        try:
+            subprocess.run([TAR, "-xf", "-", "-C", os.fspath(into)], stdin=decompress.stdout, check=True,
+                           timeout=DOWNLOAD_TIMEOUT, pass_fds=held())
+        finally:
+            if decompress.stdout:
+                decompress.stdout.close()
+            if decompress.wait(timeout=60) != 0:
+                raise subprocess.CalledProcessError(decompress.returncode, "zstd -dc")
+    else:
+        subprocess.run([TAR, "-xzf", os.fspath(archive), "-C", os.fspath(into)], check=True, timeout=DOWNLOAD_TIMEOUT,
+                       pass_fds=held())
+
+
+def seed_from_bundle(staging: Path, work: Path, fetch_url: Callable[[str, Path, float], None] = download) -> str:
+    """Fill the bare repository `staging` from the newest R2 bundle; returns its key."""
+    key = bundle_key(work, fetch_url)
+    extensions = ("tar.zst", "tar.gz") if zstd() else ("tar.gz",)
+    last: Exception | None = None
+    for extension in extensions:
+        archive = work / f"bundle.{extension}"
+        try:
+            fetch_url(f"{BUCKET_URL.rstrip('/')}/v1/any/objects/{key}.{extension}", archive, DOWNLOAD_TIMEOUT)
+        except (OSError, subprocess.SubprocessError) as error:
+            last = error
+            continue
+        unpacked = work / "unpacked"
+        bundle = unpacked / BUNDLE_FILE
+        try:
+            unpack(archive, extension, unpacked)
+            git(staging, "bundle", "verify", "--quiet", os.fspath(bundle), timeout=DOWNLOAD_TIMEOUT)
+        except (OSError, subprocess.SubprocessError) as error:  # a corrupt archive: the other one may be whole
+            last = error
+            shutil.rmtree(unpacked, ignore_errors=True)
+            continue
+        finally:
+            archive.unlink(missing_ok=True)
+        # unbundle indexes the bundle's whole pack, so every object lands even in a shallow repository,
+        # where a fetch would stop at the commits it thinks it has; then the refs are set to its tips.
+        tips = {}
+        for line in git(staging, "bundle", "unbundle", os.fspath(bundle), timeout=DOWNLOAD_TIMEOUT).splitlines():
+            sha, _, ref = line.partition(" ")
+            tips[ref.strip()] = sha
+        for branch in BRANCHES:
+            if f"refs/heads/{branch}" not in tips:
+                raise RuntimeError(f"bundle {key} has no {branch}")
+            git(staging, "update-ref", f"refs/heads/{branch}", tips[f"refs/heads/{branch}"], timeout=60)
+        return key
+    raise RuntimeError(f"no archive for {key}: {last}")
+
+
+# Written before a repair changes anything and removed only once it verified, so a repair killed part way
+# (SIGKILL, a reboot) still reads as broken and the next pass repairs again.
+REPAIR_PENDING = "glaeda-repair-pending"
+PARTIAL_KEYS = ("remote.origin.promisor", "remote.origin.partialclonefilter", "extensions.partialclone")
+
+
+def config_values(repo: Path, key: str) -> list[str]:
+    result = subprocess.run([GIT, "-C", os.fspath(repo), "config", "--get-all", key], capture_output=True, text=True,
+                            timeout=30, pass_fds=held())
+    return result.stdout.splitlines() if result.returncode == 0 else []
+
+
+def unset(repo: Path, key: str) -> None:
+    subprocess.run([GIT, "-C", os.fspath(repo), "config", "--unset-all", key], capture_output=True, timeout=30,
+                   pass_fds=held())
+
+
+def fill(repo: Path, work: Path, from_github: bool, fetch_url: Callable[[str, Path, float], None]) -> str:
+    """Add the three branches' full history to `repo`: from the R2 bundle, else (operator flag) from GitHub."""
+    try:
+        return f"bundle {seed_from_bundle(repo, work, fetch_url)}"
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        if not from_github:
+            raise RuntimeError(f"R2 bundle: {type(error).__name__}: {str(error)[:200]}") from error
+        # Every object again (--refetch ignores what the repository claims to have, so a broken mirror's
+        # missing blobs come too, packed or loose) and the history past a shallow boundary.
+        extra = ["--refetch"]
+        if (repo / "shallow").exists():
+            extra.append("--unshallow")
+        result = fetch(repo, REPO_URL, extra=extra, timeout=DOWNLOAD_TIMEOUT)
+        if not result["ok"]:
+            raise RuntimeError(f"R2 bundle: {type(error).__name__}; GitHub: {result['errors'][-1]}") from error
+        return f"github (bundle: {type(error).__name__})"
+
+
+# healthy() reads refs and markers only; an object lost under them (a bad disk, a hand-made copy) shows only
+# in a full connectivity walk, which takes about a minute on cmux, so a pass walks it once a day.
+VERIFIED = "glaeda-verified"
+VERIFY_EVERY = 24 * 3600
+
+
+def connected(repo: Path) -> bool:
+    try:
+        git(repo, "fsck", "--connectivity-only", "--no-dangling", "--no-progress", timeout=REPACK_TIMEOUT)
+        return True
+    except subprocess.CalledProcessError:
+        return False
+
+
+def verified_recently(repo: Path) -> bool:
+    try:
+        return time.time() - (repo / VERIFIED).stat().st_mtime < VERIFY_EVERY
+    except OSError:
+        return False
+
+
+def verify(repo: Path) -> None:
+    """Every branch is fully connected (no missing object), and the repository reads as healthy."""
+    git(repo, "fsck", "--connectivity-only", "--no-dangling", "--no-progress", timeout=DOWNLOAD_TIMEOUT)
+    (repo / REPAIR_PENDING).unlink(missing_ok=True)  # the history is proven whole
+    (repo / VERIFIED).write_text(dt.datetime.now(dt.timezone.utc).isoformat() + "\n")
+    problem = healthy(repo)
+    if problem:
+        raise RuntimeError(f"after the seed the mirror is still {problem}")
+
+
+def seed(mirror: Path, from_github: bool, fetch_url: Callable[[str, Path, float], None] = download) -> dict:
+    """Make `mirror` a healthy full mirror without ever removing it or an object in it.
+
+    A missing mirror is built in a staging directory beside it, verified, and renamed to the path, which
+    no reader can have open. An existing one is repaired in place: objects are only added (the bundle,
+    or GitHub with the operator's flag), then a shallow or partial marker is dropped once the history is
+    whole. Jobs fetching from it, and checkouts borrowing its objects, never see it vanish or shrink.
+    """
+    free = shutil.disk_usage(mirror.parent).free
+    if free < SEED_MIN_FREE:
+        raise RuntimeError(f"{free / 1024**3:.1f} GiB free, under {SEED_MIN_FREE / 1024**3:.0f} GiB")
+    started = time.monotonic()
+    work = Path(tempfile.mkdtemp(prefix=".seed-", dir=mirror.parent))
+    try:
+        if not (mirror.exists() or mirror.is_symlink()):
+            staging = work / "cmux.git"
+            git(work, "init", "--quiet", "--bare", os.fspath(staging), timeout=60)
+            configure(staging)
+            source = fill(staging, work, from_github, fetch_url)
+            verify(staging)
+            staging.rename(mirror)
+            return {"source": source, "mode": "new", "seconds": round(time.monotonic() - started, 1)}
+        if mirror.is_symlink() or not mirror.is_dir():
+            raise RuntimeError(f"{mirror} is not a directory; left for an operator")
+        # Re-initializing an existing repository keeps its objects and refs (and writes a missing HEAD).
+        git(mirror.parent, "init", "--quiet", "--bare", os.fspath(mirror), timeout=60)
+        pending = mirror / REPAIR_PENDING
+        with pending.open("w") as marker:
+            marker.write(f"{dt.datetime.now(dt.timezone.utc).isoformat()}\n")
+            marker.flush()
+            os.fsync(marker.fileno())
+        # The guard would refuse the unshallowing a full fetch into a shallow repository does.
+        lock_dir = mirror / "shallow.lock"
+        if lock_dir.is_dir():
+            lock_dir.rmdir()
+        elif lock_dir.is_file():
+            lock_dir.unlink()  # git's own lock, left by a killed fetch
+        # What marks the mirror shallow or partial stays until the history is proven whole, and comes back if
+        # it is not, so healthy() keeps reporting it and the next pass tries again.
+        markers = {key: config_values(mirror, key) for key in PARTIAL_KEYS}
+        shallow = mirror / "shallow"
+        shallow_text = shallow.read_text() if shallow.exists() else None
+        try:
+            # A filter or promisor left on would make every fetch partial again.
+            for key in ("remote.origin.promisor", "remote.origin.partialclonefilter"):
+                unset(mirror, key)
+            configure_without_guard(mirror)
+            source = fill(mirror, work, from_github, fetch_url)
+            if shallow.exists():
+                shallow.unlink()
+            unset(mirror, "extensions.partialclone")
+            verify(mirror)
+        except BaseException:
+            for key, values in markers.items():
+                unset(mirror, key)
+                for value in values:
+                    git(mirror, "config", "--add", key, value, timeout=30)
+            if shallow_text is None:
+                shallow.unlink(missing_ok=True)
+            else:
+                shallow.write_text(shallow_text)
+            raise
+        return {"source": source, "mode": "repaired in place", "seconds": round(time.monotonic() - started, 1)}
+    finally:
+        if mirror.is_dir() and not mirror.is_symlink():
+            guard(mirror)
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def fold_packs(mirror: Path) -> dict | None:
+    """Fold small packs geometrically once there are more than PACK_LIMIT; readers keep working throughout."""
+    packs = list((mirror / "objects" / "pack").glob("*.pack"))
+    if len(packs) <= PACK_LIMIT:
+        return None
+    started = time.monotonic()
+    status, err = run_group([GIT, "-C", os.fspath(mirror), "repack", "-d", "-q", "--geometric=2"], REPACK_TIMEOUT)
+    if status != 0:
+        drop_leftovers(mirror)
+    return {"packs": len(packs), "status": status, "seconds": round(time.monotonic() - started, 1),
+            **({"error": err.strip()[-200:]} if status else {})}
+
+
+def heads(mirror: Path) -> dict[str, str]:
+    out = git(mirror, "for-each-ref", "--format=%(refname:short) %(objectname)", "refs/heads", timeout=30)
+    return dict(line.split(" ", 1) for line in out.splitlines() if " " in line)
+
+
+def lock(path: Path, wait: float) -> int | None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                os.close(fd)
+                return None
+            time.sleep(1)
+
+
+def source(home: Path | None = None) -> str:
+    """Where this host's mirror comes from (SOURCE_CONFIG `source`), or '' when it has none configured."""
+    home = Path.home() if home is None else home
+    try:
+        raw = json.loads((home / SOURCE_CONFIG).read_text())
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(raw, dict) or raw.get("schema") != 1 or raw.get("source") not in SOURCES:
+        return ""
+    return raw["source"]
+
+
+def run(apply: bool, *, wait: bool = False, from_github: bool = False, home: Path | None = None) -> dict:
+    record: dict = {"time": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "mirror": os.fspath(MIRROR)}
+    if not runner_installed(home):
+        return {**record, "state": "skipped", "reason": "no GitHub Actions runner on this host"}
+    record["source"] = source(home)
+    if not record["source"]:
+        return {**record, "state": "skipped", "reason": f"no mirror source in ~/{SOURCE_CONFIG}"}
+    problem = healthy(MIRROR)
+    if not apply:
+        return {**record, "state": "plan", "health": problem or "ok",
+                "would": f"seed from the R2 bundle ({problem}), then fetch" if problem else "fetch"}
+    fd = lock(GIT_DIR / ".lock", LOCK_WAIT if wait else 0)
+    if fd is None and stop_orphans():
+        fd = lock(GIT_DIR / ".lock", 30)
+    if fd is None:
+        return {**record, "state": "busy", "reason": "another pass holds the lock"}
+    HELD.append(fd)
+    try:
+        note_groups(own_group())
+        # Only a pass holding the flock writes the mirror (jobs only read it), so any lock git left is from a
+        # pass that was killed: clear them before anything else writes, or the repair itself would wedge.
+        if MIRROR.is_dir() and not MIRROR.is_symlink():
+            drop_leftovers(MIRROR)
+        # A seed killed part way leaves its staging directory (gigabytes) beside the mirror: under the flock
+        # no seed is running, so every one there is abandoned.
+        for abandoned in GIT_DIR.glob(".seed-*"):
+            if abandoned.is_dir() and not abandoned.is_symlink():
+                shutil.rmtree(abandoned, ignore_errors=True)
+        problem = healthy(MIRROR)
+        if not problem and not verified_recently(MIRROR):
+            if connected(MIRROR):
+                (MIRROR / VERIFIED).write_text(dt.datetime.now(dt.timezone.utc).isoformat() + "\n")
+            else:
+                problem = "missing objects"
+        if problem:
+            record["seeded"] = {"because": problem, **seed(MIRROR, from_github)}
+        configure(MIRROR)
+        result = fetch(MIRROR, REPO_URL)
+        record["fetch"] = result
+        folded = fold_packs(MIRROR)
+        if folded:
+            record["repack"] = folded
+        record["heads"] = heads(MIRROR)
+        record["state"] = "applied" if result["ok"] else "fetch-failed"
+        incoming = RECORD.with_name(f".{RECORD.name}.{os.getpid()}")
+        incoming.write_text(json.dumps(record) + "\n")
+        incoming.rename(RECORD)
+        return record
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        return {**record, "state": "error", "reason": f"{type(error).__name__}: {str(error)[:300]}"}
+    finally:
+        HELD.remove(fd)
+        with_suppressed((GIT_DIR / PASS_FILE).unlink)
+        os.close(fd)
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--wait", action="store_true", help="wait for a running pass instead of skipping")
+    parser.add_argument("--seed-from-github", action="store_true",
+                        help="operator fallback: seed from GitHub when the R2 bundle cannot be read")
+    args = parser.parse_args(argv)
+
+    def one_pass() -> int:
+        result = run(args.apply, wait=args.wait, from_github=args.seed_from_github)
+        print(json.dumps(result), flush=True)
+        return 0 if result["state"] in ("applied", "plan", "skipped", "busy") else 1
+    if args.apply and own_group() == []:
+        return in_own_session(one_pass)  # its children can then be stopped together, and only they
+    return one_pass()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
