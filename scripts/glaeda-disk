@@ -2386,7 +2386,11 @@ def submodule_git_veto(dotgit: Path, env: dict[str, str]) -> str:
             dirs[:] = [d for d in dirs if not (is_gitdir and d in ("objects", "lfs", "logs", "refs"))]
     except OSError:
         return "git could not say whether a submodule commit is only here"
-    why = embedded_submodule_veto(dotgit.parent, env, SUBMODULE_DEPTH)
+    try:
+        surveyed = frozenset(g.resolve() for g in gitdirs)
+    except (OSError, RuntimeError):
+        return "git could not say whether a submodule commit is only here"
+    why = embedded_submodule_veto(dotgit.parent, env, SUBMODULE_DEPTH, surveyed)
     if why:
         return why
     for gitdir in gitdirs:
@@ -2406,14 +2410,12 @@ def submodule_git_veto(dotgit: Path, env: dict[str, str]) -> str:
     return ""
 
 
-def embedded_submodule_veto(tree: Path, env: dict[str, str], depth: int,
-                            superproject_git: Path | None = None) -> str:
+def embedded_submodule_veto(tree: Path, env: dict[str, str], depth: int, surveyed: frozenset[Path]) -> str:
     """Why a work tree's submodules keep the checkout, or "": a gitlink (mode 160000 in the index) whose .git is a
     directory or a symlink, not a gitfile into the superproject's .git/modules, or such a one in an absorbed
-    submodule's own work tree, or one whose gitfile names a repository outside superproject_git (the checkout's .git,
-    whose stores submodule_git_veto checks). Any doubt (git cannot list an index, read a gitfile, the nesting is
-    deeper than depth) keeps it."""
-    superproject_git = tree / ".git" if superproject_git is None else superproject_git
+    submodule's own work tree, or one whose gitfile names a repository other than the git dirs submodule_git_veto
+    surveyed (resolved). Any doubt (git cannot list an index, read a gitfile, the nesting is deeper than depth)
+    keeps it."""
     try:
         listed = subprocess.run(["git", "-C", os.fspath(tree), "ls-files", "--stage", "-z"], capture_output=True,
                                 timeout=120, env=env, check=True).stdout
@@ -2434,13 +2436,12 @@ def embedded_submodule_veto(tree: Path, env: dict[str, str], depth: int,
             store = (sub / target.removeprefix("gitdir:").strip()).resolve()
         except (OSError, ValueError, RuntimeError):
             return f"git could not say where submodule {path} keeps its repository"
-        if (not target.startswith("gitdir:") or not store.is_dir()
-                or not store.is_relative_to(superproject_git.resolve())):
-            # submodule_git_veto checks the stores inside the superproject's .git; one anywhere else is not checked
+        if not target.startswith("gitdir:") or store not in surveyed:
+            # submodule_git_veto checks only the git dirs its walk of .git found; any other store is not checked
             return f"submodule {path} keeps its repository outside .git"
         if depth <= 0:
             return f"submodule {path} is nested deeper than {SUBMODULE_DEPTH}"
-        if why := embedded_submodule_veto(sub, env, depth - 1, superproject_git):
+        if why := embedded_submodule_veto(sub, env, depth - 1, surveyed):
             return why
     return ""
 

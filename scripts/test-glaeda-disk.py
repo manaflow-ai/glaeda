@@ -5172,6 +5172,14 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(gd.runner_checkout_git_veto(co), "submodule vendor/lib keeps its repository outside .git")
         (co / "vendor/lib/.git").write_text("gitdir: ../../.git/modules/objects\n")
         self.assertEqual(gd.runner_checkout_git_veto(co), "")
+        hidden = co / ".git/logs/subrepo"  # inside .git, but under a folder the store walk skips
+        hidden.parent.mkdir(parents=True, exist_ok=True)
+        git(hidden.parent, "init", "-q", "--bare", "subrepo")
+        git(hidden, "--work-tree", os.fspath(self.root), "commit", "-q", "--allow-empty", "-m", "unpushed")
+        (co / "vendor/lib/.git").write_text("gitdir: ../../.git/logs/subrepo\n")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "submodule vendor/lib keeps its repository outside .git")
+        (co / "vendor/lib/.git").write_text("gitdir: ../../.git/modules/objects\n")
+        shutil.rmtree(hidden)
         ref = os.fsencode(co / ".git/refs/heads") + b"/caf\xe9"  # a ref name git accepts that is not UTF-8
         try:
             with open(ref, "w") as f:
