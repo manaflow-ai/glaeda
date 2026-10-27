@@ -498,6 +498,11 @@ class HookTest(unittest.TestCase):
         self.assertIsNone(hook.dev_compile_refusal(**args))
         dispatch = {"repository": CMUX, "inputs": {"dev_daily": "true"}}
         self.assertIsNone(hook.dev_compile_refusal(**{**args, "event_name": "workflow_dispatch", "event": dispatch}))
+        # the push's Release compile, nightly-next's promote gate, is a feed compile too; a dispatch's is not
+        self.assertIsNone(hook.dev_compile_refusal(**{**args, "job": "release-compile"}))
+        self.assertIn("release-compile only on a feat-cmux-next push", hook.dev_compile_refusal(
+            **{**args, "job": "release-compile", "event_name": "workflow_dispatch", "event": dispatch}))
+        self.assertIsNotNone(hook.dev_compile_refusal(**{**args, "job": "release-compile-fast"}))
         for overrides in (
                 {"job": "other"}, {"workflow_ref": workflow.replace("cmux-next.yml", "ci.yml")},
                 {"event": {"ref": "refs/heads/feat-cmux-next", "repository": {"full_name": "other/cmux"}}},
@@ -1192,7 +1197,7 @@ class HookTest(unittest.TestCase):
             side = self.job("swift-package-tests", "s0", 14)
             self.assertEqual(side.returncode, 1, side.stdout)
             self.assertIn("refused: capacity: 2 of 14 units free, swift-package-tests (light) needs 2 and 1 is kept "
-                          "for the gui runner", side.stdout)
+                          "for an idle reserving runner", side.stdout)
             (self.dir / "capacity" / f"{hook.ADMIT_WANT}{os.getppid()}").write_text(
                 json.dumps({"since": time.time() - 30, "wants": ["units"], "who": "s9 daemon-test (run 1)"}) + "\n")
             gui = self.job("app-host-unit-tests", "g0", 14, None, "--gui-runner", env=unlocked)
@@ -1202,12 +1207,43 @@ class HookTest(unittest.TestCase):
             (self.dir / "capacity" / f"{hook.ADMIT_WANT}{os.getppid()}").unlink()
             after = self.job("swift-package-tests", "s1", 14)
             self.assertIn("refused: capacity: 1 of 14 units free, swift-package-tests (light) needs 2", after.stdout)
-            self.assertNotIn("kept for the gui runner", after.stdout, "no reserve held: nothing kept")
+            self.assertNotIn("kept for an idle reserving runner", after.stdout, "no reserve held: nothing kept")
             self.finish("g0")
             self.assertEqual(self.job("swift-package-tests", "s1", 14).returncode, 0, "2 free, no reserve: admitted")
         finally:
             for runner in ("g0", "s1"):
                 self.finish(runner)
+
+    def test_an_idle_freshness_slot_keeps_a_feed_compiles_units_from_pr_jobs(self) -> None:
+        """2026-10-26 23:57Z: a feat-cmux-next push's Release compile (nightly-next's promote gate) queued 30+ min on
+        the shared side label behind 21 PR jobs, while both DEV slot runners were held off as full by the PR jobs
+        beside them. While the slot's gate holds fresh.reserve, every other job on the mini leaves
+        FRESH_RESERVE_UNITS free, and the slot's own feed compile takes them, past a PR job waiting for units."""
+        self.fleet()
+        self.take_units(9)
+        reserve = self.hold_gui_reserve(hook.FRESH_RESERVE_TOKEN)
+        self.addCleanup(os.close, reserve)
+        try:
+            side = self.job("swift-package-tests", "s0", 14)
+            self.assertEqual(side.returncode, 1, side.stdout)
+            self.assertIn("refused: capacity: 5 of 14 units free, swift-package-tests (light) needs 2 and 4 are kept "
+                          "for an idle reserving runner", side.stdout)
+            (self.dir / "capacity" / f"{hook.ADMIT_WANT}{os.getppid()}").write_text(
+                json.dumps({"since": time.time() - 30, "wants": ["units"], "who": "s9 daemon-test (run 1)"}) + "\n")
+            ref = "refs/heads/feat-cmux-next"
+            push = event(self.dir, "fresh-push", {"repository": CMUX, "ref": ref})
+            fresh = self.run_hook(
+                "job-started", "push", push, "--allowed-repo", "manaflow-ai/cmux", "--no-disk", "--state-dir",
+                os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()), "--gui-wait", "0",
+                "--capacity-units", "14", "--capacity-dir", os.fspath(self.dir / "capacity"), "--dev-compile-runner",
+                repo="manaflow-ai/cmux",
+                env={"GITHUB_JOB": "release-compile", "RUNNER_NAME": "d0", "GITHUB_REF": ref,
+                     "GITHUB_WORKFLOW_REF": f"manaflow-ai/cmux/.github/workflows/cmux-next.yml@{ref}"})
+            self.assertEqual(fresh.returncode, 0, fresh.stdout + fresh.stderr)
+            self.assertIn("holding 4/14 units for release-compile (isolated", fresh.stdout)
+        finally:
+            (self.dir / "capacity" / f"{hook.ADMIT_WANT}{os.getppid()}").unlink(missing_ok=True)
+            self.finish("d0")
 
     def test_a_gui_runner_job_costlier_than_the_reserve_still_waits_its_turn(self) -> None:
         """The reserve is one unit: a gui-label job that costs more (cmux-next's swift test, isolated at 4) takes the
@@ -3168,8 +3204,8 @@ time.sleep(60)
             status, refused = self.ci_step("admit", "--class", "isolated", "--job-key", "r1-1-1",
                                            "--watch-pid", str(worker.pid), units=6)
             self.assertEqual(status, 1, refused)
-            self.assertIn("capacity: 4 of 6 units free, ci-step r1-1-1 (isolated) needs 4 and 1 is kept for the gui "
-                          "runner", refused["reason"])
+            self.assertIn("capacity: 4 of 6 units free, ci-step r1-1-1 (isolated) needs 4 and 1 is kept for an idle "
+                          "reserving runner", refused["reason"])
         finally:
             os.close(reserve)
         self.assertEqual(self.fits(6), ["light", "isolated"], "the reserve is gone with its gate")
@@ -5365,6 +5401,17 @@ class GateTest(unittest.TestCase):
                                            "cmux-next.yml"),
             hook.DEV_COMPILE_CAPACITY_WAIT_S)
 
+    def test_every_job_on_the_freshness_slot_waits_a_bounded_time(self) -> None:
+        """A push's release-compile on the slot is not a DEV compile (dev_compile_capacity_wait is None), but the
+        slot still bounds its wait, so a mini that fills while it waits refuses it back to placement. An explicit
+        longer wait is clamped and a shorter one kept; off the slot, waits are unchanged."""
+        bound = hook.DEV_COMPILE_CAPACITY_WAIT_S
+        self.assertEqual(hook.slot_capacity_wait(None, True), bound)
+        self.assertEqual(hook.slot_capacity_wait(bound * 2, True), bound)
+        self.assertEqual(hook.slot_capacity_wait(5.0, True), 5.0)
+        self.assertIsNone(hook.slot_capacity_wait(None, False))
+        self.assertEqual(hook.slot_capacity_wait(bound * 2, False), bound * 2)
+
     def test_other_capacity_waits_remain_unbounded(self) -> None:
         event = {"repository": CMUX, "ref": "refs/heads/feat-cmux-next"}
         for job, workflow, event_name in (("cmux-scheme-compile", "cmux-next.yml", "pull_request"),
@@ -5915,7 +5962,7 @@ class GateTest(unittest.TestCase):
         self.addCleanup(os.close, reserve)
         for scope in (side, session):
             self.assertEqual(hook.mini_full(capacity, 10, scope), "only 1 of 10 capacity units on this mini are "
-                             "free; its next job needs 1 and 1 is kept for the gui runner")
+                             "free; its next job needs 1 and 1 is kept for an idle reserving runner")
         self.assertIsNone(hook.mini_full(capacity, 10, gui), "the reserved unit is the gui runner's own")
         self.assertIsNone(hook.mini_full(capacity, 10, fast))
 
@@ -5925,7 +5972,7 @@ class GateTest(unittest.TestCase):
             return ledger
 
         self.assertEqual(hook.mini_full(reserved(5), 10, root), "only 5 of 10 capacity units on this mini are "
-                         "free; a compile needs 5 and 1 is kept for the gui runner")
+                         "free; a compile needs 5 and 1 is kept for an idle reserving runner")
         self.assertIsNone(hook.mini_full(reserved(4), 10, root), "6 free: a compile and the kept unit")
         self.assertIsNone(hook.mini_full(reserved(0), 5, root), "a reserve never makes a compile unfittable")
         self.assertIsNone(hook.mini_full(self.units(5), 10, root), "no gui runner on the mini: nothing kept")
@@ -5937,6 +5984,67 @@ class GateTest(unittest.TestCase):
         self.assertEqual(hook.mini_full(capacity, 10, gui), "r0 app-host-unit-tests (run 4) waits here for gui")
         (capacity / f"{hook.ADMIT_WANT}{os.getpid()}").unlink()
         self.assertEqual(hook.mini_full(self.units(10), 10, gui), "all 10 capacity units on this mini are taken")
+
+    def test_an_idle_freshness_slots_reserve_holds_the_other_runners_off_its_compile_room(self) -> None:
+        """The freshness slot (--dev-compile-runner) reserves FRESH_RESERVE_UNITS, one feed compile: every other
+        runner counts that many fewer free, so the PR side runners on its mini stop listening before they would
+        take its room. The slot counts the units as its own and listens only with room for its compile."""
+        side = hook.RunnerScope(10, 2, 2)
+        fresh = hook.RunnerScope(10, 2, 2, fresh=True)
+        self.assertEqual(hook.reserve_token(fresh), hook.FRESH_RESERVE_TOKEN)
+        self.assertIsNone(hook.reserve_token(side))
+
+        def reserved(held: int) -> Path:
+            ledger = self.units(held)
+            self.addCleanup(os.close, hook.lock_file(ledger / f"{hook.FRESH_RESERVE_TOKEN}{hook.GUI_RESERVE}",
+                                                     fcntl.LOCK_EX))
+            return ledger
+
+        self.assertIsNone(hook.mini_full(reserved(5), 10, side), "5 free: its job and the slot's 4")
+        self.assertEqual(hook.mini_full(reserved(6), 10, side), "only 4 of 10 capacity units on this mini are "
+                         "free; its next job needs 1 and 4 are kept for an idle reserving runner")
+        self.assertIsNone(hook.mini_full(reserved(6), 10, fresh), "the reserved units are the slot's own")
+        self.assertEqual(hook.mini_full(self.units(7), 10, fresh), "only 3 of 10 capacity units on this mini are "
+                         "free; its next job needs 4")
+        self.assertIsNone(hook.mini_full(self.units(9), 10, side), "no slot on the mini: nothing kept")
+        ledger = reserved(6)
+        (ledger / f"{hook.ADMIT_WANT}{os.getpid()}").write_text(
+            json.dumps({"since": time.time(), "wants": ["units"], "who": "s1 daemon-test (run 4)"}) + "\n")
+        self.assertIsNone(hook.mini_full(ledger, 10, fresh), "a PR job waiting for units does not hold the slot")
+        self.assertIsNotNone(hook.mini_full(ledger, 10, side))
+
+    def test_a_freshness_slots_gate_holds_fresh_reserve_while_idle(self) -> None:
+        capacity = self.units(0)
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(exist_ok=True)
+        script.write_text("#!/bin/bash\nexec /usr/bin/python3 /hook job-started --capacity-units 10 --instance 1"
+                          " --dev-compile-runner\n")
+        self.assertTrue(hook.runner_scope(self.runner).fresh)
+        gate = self.full_gate(capacity)
+        self.addCleanup(gate.reserve, False)
+        reserve = capacity / f"{hook.FRESH_RESERVE_TOKEN}{hook.GUI_RESERVE}"
+        with mock.patch.object(gate, "start"), mock.patch.object(gate, "stop"), \
+                mock.patch.object(gate, "reload"), mock.patch.object(gate, "saturated", return_value=None), \
+                mock.patch.object(gate, "busy", return_value=False):
+            gate.step()
+            self.assertFalse(hook.probe(reserve), "idle: the slot holds its reserve")
+            self.assertEqual(hook.gui_reserved(capacity), hook.FRESH_RESERVE_UNITS)
+            self.assertEqual(hook.gui_reserved(capacity, hook.FRESH_RESERVE_TOKEN), 0, "its own job takes it")
+        # A job arrives: the reserve stays until that job holds its admission, then goes back to the other lanes.
+        gate.child = mock.Mock(poll=mock.Mock(return_value=None))
+        (self.runner / ".runner").write_text("\ufeff" + json.dumps({"agentName": "mini-glaeda-1"}), encoding="utf-8")
+        with mock.patch.object(gate, "start"), mock.patch.object(gate, "stop"), \
+                mock.patch.object(gate, "reload"), mock.patch.object(gate, "saturated", return_value=None), \
+                mock.patch.object(gate, "busy", return_value=True):
+            gate.step()
+            self.assertFalse(hook.probe(reserve), "a job not yet admitted: its units wait for it")
+            self.state.mkdir(parents=True, exist_ok=True)
+            holder = hook.holder_file(self.state, "mini-glaeda-1")
+            holder.write_text(f"{os.getpid()}\n")
+            gate.step()
+            self.assertTrue(hook.probe(reserve), "its job holds its units: the reserve is released")
+            self.assertEqual(hook.gui_reserved(capacity), 0)
+            holder.unlink()
 
     def gui_gate(self, capacity: Path, gui: bool = True) -> hook.Gate:
         script = self.runner / hook.RUNNER_HOOK_SCRIPT

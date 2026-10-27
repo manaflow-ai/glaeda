@@ -529,18 +529,29 @@ one a pool picker routes a whole run to. Opportunistic members never carry it, s
 they never receive a required job.
 
 `runner.devCompile: true` on a dedicated std member assigns its first existing
-side instance (`instance == canonicalRoots`) to the DEV compile lane. That
-instance carries `glaeda-dev-std-xcode-<version>` without ordinary pool, root,
-side, GUI, session, fast or iOS labels. Only its hook passes
+side instance (`instance == canonicalRoots`) to the DEV compile lane, the
+freshness slot. That instance carries `glaeda-dev-std-xcode-<version>` without
+ordinary pool, root, side, GUI, session, fast or iOS labels. Only its hook passes
 `--dev-compile-runner`; every other instance keeps its normal labels and hook.
 A shape with no side instance is refused. This reuses an instance and adds no
-runners, cores, compile slots or canonical roots.
+runners, cores, compile slots or canonical roots. Its hook admits only cmux
+NEXT's feed compiles from `cmux-next.yml` on `feat-cmux-next`:
+`cmux-scheme-compile` on a push or a `dev_daily` dispatch, and on a push the
+`release-compile` that gates the nightly-next promotion.
 
-DEV and ordinary jobs share the capacity ledger. Ordinary jobs can use all
-available units while DEV is idle. A DEV hook waiting for capacity uses the
-existing `admit.want` fairness mechanism, then refuses after 60 seconds so the
-workflow can use its normal fallback. The DEV label provides routing priority;
-it does not reserve cores or exclusive host capacity.
+DEV and ordinary jobs share the capacity ledger, but while the slot is idle its
+gate holds `capacity/fresh.reserve`, which keeps `FRESH_RESERVE_UNITS` (4, one
+release-compile) from every other job and runner gate on the mini, like the gui
+runner's one-unit reserve. PR jobs beside it drain off those units instead of
+refilling them, so the slot keeps listening for the next feed compile; the slot
+itself listens only with room for one. Before this, PR side jobs filled both
+DEV minis and held the slot offline as full (2026-10-26 from 23:53Z), and a
+promote compile queued 30+ minutes behind PR jobs. The reserve goes back once
+the slot's job holds its units, and dies with the gate. cmux's placement
+takes the slot only while it has an idle runner and otherwise uses the side
+label and Blacksmith, so no job waits on the reservation. A DEV hook waiting
+for capacity uses the existing `admit.want` fairness mechanism, then refuses
+after 60 seconds so the workflow can use its normal fallback.
 
 `glaeda-macos-<major>` is observed on the mini, not declared, so a fleet that straddles an
 OS upgrade can route a job to one macOS (`runs-on: [glaeda-std-xcode-26.6, glaeda-macos-27]`).

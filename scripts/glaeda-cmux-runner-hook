@@ -386,19 +386,36 @@ HOLDERS_BUDGET_S = 10.0  # token_holders stops looking after this long: the log 
 # ignores it (reserve_for).
 GUI_RESERVE = ".reserve"
 GUI_RESERVE_UNITS = 1
+# The freshness slot's reserve: the DEV compile runner (--dev-compile-runner, the glaeda-dev-* label, which only
+# cmux NEXT's feed compiles target: a feat-cmux-next push's Release compile and DEV compile, a DEV daily's) holds
+# capacity/fresh.reserve the same way while it is idle, for FRESH_RESERVE_UNITS, the costlier of those jobs
+# (release-compile is isolated, 4; cmux-scheme-compile 3). Without it the slot shared the mini's units with the PR
+# side runners beside it: on 2026-10-26 from 23:53Z both DEV runners were held off as full while PR jobs filled
+# their minis, and a feat-cmux-next push's nightly-next promote compile queued 30+ min on the shared side label
+# behind 21 PR jobs. With the reserve, PR jobs on that mini drain off those units instead of refilling them, so the
+# slot is listening for the next feed compile; cmux's placement takes it only while idle and otherwise falls back
+# to the side label and Blacksmith, so the reservation never makes a job wait on it.
+FRESH_RESERVE_TOKEN = "fresh"
+FRESH_RESERVE_UNITS = 4
 UNITS_FULL = "capacity units on this mini"  # in mini_full's answers that are about units (Gate.reserves)
 
 
+def reserve_units(name: str) -> int:
+    """The units one held <token>.reserve keeps: the freshness slot's FRESH_RESERVE_UNITS, a gui runner's
+    GUI_RESERVE_UNITS."""
+    return FRESH_RESERVE_UNITS if name == f"{FRESH_RESERVE_TOKEN}{GUI_RESERVE}" else GUI_RESERVE_UNITS
+
+
 def gui_reserved(capacity_dir: Path, own_token: str | None = None) -> int:
-    """The units this mini keeps for idle gui runners: GUI_RESERVE_UNITS for each <gui token>.reserve an idle gui
-    runner's gate holds, except own_token's (a gui runner's own job takes its own reserve). Never raises: an
-    unreadable ledger reserves nothing."""
+    """The units this mini keeps for idle reserving runners: reserve_units() for each <token>.reserve an idle gui
+    runner's (or the freshness slot's) gate holds, except own_token's (a runner's own job takes its own reserve).
+    Never raises: an unreadable ledger reserves nothing."""
     try:
         paths = sorted(capacity_dir.glob(f"*{GUI_RESERVE}"))
     except OSError:
         return 0
     own = f"{own_token}{GUI_RESERVE}" if own_token is not None else None
-    return sum(GUI_RESERVE_UNITS for path in paths if path.name != own and not probe(path))
+    return sum(reserve_units(path.name) for path in paths if path.name != own and not probe(path))
 
 
 def reserve_for(reserved: int, units: int, total: int) -> int:
@@ -408,7 +425,7 @@ def reserve_for(reserved: int, units: int, total: int) -> int:
 
 
 def kept_note(kept: int) -> str:
-    return f" and {kept} {'is' if kept == 1 else 'are'} kept for the gui runner" if kept else ""
+    return f" and {kept} {'is' if kept == 1 else 'are'} kept for an idle reserving runner" if kept else ""
 
 
 def is_guest(repo: str | None, home_repo: str = DEFAULT_HOME_REPO) -> bool:
@@ -451,6 +468,16 @@ def dev_compile_capacity_wait(repo: str | None, home_repo: str, event_name: str 
         if isinstance(inputs, dict) and str(inputs.get("dev_daily", "")).lower() == "true":
             return DEV_COMPILE_CAPACITY_WAIT_S
     return None
+
+
+def slot_capacity_wait(cap: float | None, dev_compile_runner: bool) -> float | None:
+    """`cap`, bounded on the freshness slot (an explicit longer --gui-wait is clamped too): every job it admits (a push's release-compile too, which
+    dev_compile_capacity_wait does not name) waits at most DEV_COMPILE_CAPACITY_WAIT_S. GitHub never moves a job
+    off the runner that took it, so a refusal lets placement send it to the side label or Blacksmith instead of
+    stranding it here (review of glaeda#1636)."""
+    if not dev_compile_runner:
+        return cap
+    return DEV_COMPILE_CAPACITY_WAIT_S if cap is None else min(cap, DEV_COMPILE_CAPACITY_WAIT_S)
 
 
 def job_class(job: str, repo: str | None, home_repo: str = DEFAULT_HOME_REPO,
@@ -1057,19 +1084,26 @@ def trusted_refusal(event_name: str | None, ref: str | None, repository: str | N
     return None
 
 
+# The cmux-next.yml jobs the freshness slot admits (dev_compile_refusal); cmux's FRESH_SLOT_JOBS names the same.
+FRESH_SLOT_JOBS = ("cmux-scheme-compile", "release-compile")
+
+
 def dev_compile_refusal(event_name: str | None, ref: str | None, repository: str | None, event: Any,
                         workflow_ref: str | None, job: str | None) -> str | None:
-    """Why a DEV compile priority runner must refuse this job, or None.
+    """Why a DEV compile priority runner (the freshness slot) must refuse this job, or None.
 
     The label is a soft priority lane: the workflow still has its normal
-    cascade fallback.  Only the exact cmux NEXT DEV compile may use it.
+    cascade fallback.  Only cmux NEXT's feed compiles may use it: the DEV
+    compile (cmux-scheme-compile) on a feat-cmux-next push or a dev_daily
+    dispatch, and on a feat-cmux-next push the Release compile
+    (release-compile) that gates nightly-next's promotion.
     """
     repos = {(repository or "").lower(), (_repo_name(event.get("repository")) or "").lower()
              if isinstance(event, dict) else ""}
     if repos != {"manaflow-ai/cmux"}:
         return "dev compile runner admits only manaflow-ai/cmux"
-    if job != "cmux-scheme-compile":
-        return "dev compile runner admits only cmux-scheme-compile"
+    if job not in FRESH_SLOT_JOBS:
+        return "dev compile runner admits only cmux-scheme-compile and a push's release-compile"
     path = (workflow_ref or "").split("@", 1)[0]
     if path != "manaflow-ai/cmux/.github/workflows/cmux-next.yml":
         return "dev compile runner admits only cmux-next.yml"
@@ -1079,6 +1113,8 @@ def dev_compile_refusal(event_name: str | None, ref: str | None, repository: str
         if isinstance(event, dict) and event.get("ref") == ref:
             return None
         return "dev compile runner requires the feat-cmux-next push ref"
+    if job == "release-compile":
+        return "dev compile runner admits release-compile only on a feat-cmux-next push"
     if event_name == "workflow_dispatch":
         if ref != "refs/heads/feat-cmux-next":
             return "dev compile runner requires the feat-cmux-next dispatch ref"
@@ -2955,7 +2991,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                   owned_state_dir: str = "", taken_out: dict[str, Any] | None = None,
                   warm_target: tuple[Any, ...] = ("", None, 0), klass: str | None = None,
                   one_holder: bool = False, since: float | None = None, gui_token: str = "gui",
-                  gui_runner: bool = False) -> tuple[bool, str]:
+                  gui_runner: bool = False, fresh_runner: bool = False) -> tuple[bool, str]:
     """Weighted admission for one of several runners on this mini, without ever waiting on a job.
     When held, taken_out (if given) receives the units and tokens taken, for the job log; on a capacity refusal it
     receives "wants", the kinds a waiter marker names (CAPACITY_WAIT): the token kind or "units" it lacks, else
@@ -3010,8 +3046,9 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
             taken_out["wants"] = list(tokens)
         # the gui runner's job that fits in the reserve its gate holds takes the reserved unit, which no waiter here
         # could take
-        in_reserve = (gui_runner and 0 < units <= GUI_RESERVE_UNITS
-                      and not probe(capacity_dir / f"{gui_token}{GUI_RESERVE}"))
+        own_reserve = gui_token if gui_runner else FRESH_RESERVE_TOKEN if fresh_runner else None
+        in_reserve = (own_reserve is not None and 0 < units <= reserve_units(f"{own_reserve}{GUI_RESERVE}")
+                      and not probe(capacity_dir / f"{own_reserve}{GUI_RESERVE}"))
         behind = fair_turn(capacity_dir, {*tokens, *(("units",) if units and not in_reserve else ())},
                            time.time() if since is None else since)
         if behind:
@@ -3090,8 +3127,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                 if taken_out is not None:
                     taken_out["wants"] = [token]
                 return False, f"capacity: {held} ({job or 'unknown job'} is {klass})"
-        # every job but the gui runner's own leaves the idle gui runners' reserve free (GUI_RESERVE)
-        kept = reserve_for(gui_reserved(capacity_dir, gui_token if gui_runner else None), units, total)
+        # every job but a reserving runner's own leaves the idle reserves free (GUI_RESERVE, FRESH_RESERVE_TOKEN)
+        kept = reserve_for(gui_reserved(capacity_dir, own_reserve), units, total)
         got = spare = 0
         unit_fds: list[int] = []
         for slot in range(total):
@@ -3410,7 +3447,8 @@ class RunnerScope(NamedTuple):
     whether it is the mini's gui runner (--gui-runner, the gui pool label; never a root runner), its
     --min-free-gib disk floor (0: none), its gui token, whether it is the mini's fast runner (--fast-runner,
     the fast pool label; never a root or gui runner), and whether it is one of the mini's session runners
-    (--session-runner, only the session pool label; never a root, gui or fast runner)."""
+    (--session-runner, only the session pool label; never a root, gui or fast runner), and whether it is the
+    freshness slot (--dev-compile-runner: the DEV compile runner, which holds FRESH_RESERVE while idle)."""
     units: int = 0
     compile_slots: int = 1
     roots: int = 1
@@ -3420,6 +3458,15 @@ class RunnerScope(NamedTuple):
     gui_token: str = "gui"
     fast: bool = False
     session: bool = False
+    fresh: bool = False
+
+
+def reserve_token(scope: RunnerScope | None) -> str | None:
+    """The token whose <token>.reserve this runner's gate holds while idle, and its own job may take: a gui
+    runner's gui token, the freshness slot's FRESH_RESERVE_TOKEN, else None (it reserves nothing)."""
+    if scope is None:
+        return None
+    return scope.gui_token if scope.gui else FRESH_RESERVE_TOKEN if scope.fresh else None
 
 
 def listen_fit_units(runner_dir: Path) -> int:
@@ -3451,12 +3498,13 @@ def runner_scope(runner_dir: Path) -> RunnerScope:
     fast = re.search(r"\s--fast-runner(?:\s|$)", text) is not None
     session = re.search(r"\s--session-runner(?:\s|$)", text) is not None and not fast
     gui = re.search(r"\s--gui-runner(?:\s|$)", text) is not None and not fast and not session
+    fresh = re.search(r"\s--dev-compile-runner(?:\s|$)", text) is not None and not fast and not session and not gui
     gui_match = re.search(r"\s--gui-token\s+([A-Za-z0-9._-]+)(?:\s|$)", text)
     gui_token = gui_match.group(1) if gui_match else "gui"
     return RunnerScope(flag("capacity-units", 0), max(1, flag("compile-slots", 1)), roots,
                        instance < roots and not gui and not fast and not session, gui,
                        runner_floor_gib(min_free_gib(text), gui or session), gui_token,
-                       fast, session)
+                       fast, session, fresh)
 
 
 def eligibility_scope(runner_dir: Path) -> tuple[str, str | None] | None:
@@ -3605,11 +3653,14 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
         root = scope is not None and scope.root
         # fit_units: a side runner whose label brings costlier jobs (listen --fit-units: glaeda-ios-sim's isolated
         # builds, a session runner's jobs)
-        need = min(max(ROOT_FIT_UNITS if root else 1, fit_units), total)
+        # The freshness slot listens only with room for its costliest job (FRESH_RESERVE_UNITS): its reserve keeps
+        # that room from the other lanes, so a feed compile it takes never waits here for units.
+        fresh = scope is not None and scope.fresh
+        need = min(max(ROOT_FIT_UNITS if root else FRESH_RESERVE_UNITS if fresh else 1, fit_units), total)
         gui = scope is not None and scope.gui
-        # every runner but the gui runner leaves the idle gui runners' reserve free (GUI_RESERVE); the gui runner's
-        # own reserve is its next job's
-        kept = reserve_for(gui_reserved(capacity_dir, scope.gui_token if gui else None), need, total)
+        # every runner leaves the idle reserving runners' reserves free (GUI_RESERVE, FRESH_RESERVE_TOKEN); a
+        # reserving runner's own reserve is its next job's
+        kept = reserve_for(gui_reserved(capacity_dir, reserve_token(scope)), need, total)
         free = 0
         for slot in range(total):
             if not open_to_jobs(f"unit-{slot}", capacity_dir / f"unit-{slot}"):
@@ -3623,8 +3674,9 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
             return (f"only {free} of {total} {UNITS_FULL} are free; "
                     f"{'a compile' if root else 'its next job'} needs {need}{kept_note(kept)}")
         # a job already here waits for what this runner's next job would take (CAPACITY_WAIT): it goes first. Not
-        # for units on the gui runner: its next job takes the reserved unit, which the waiter could not have taken
-        compete = ({"units"} if not gui else set()) | ({"root", "persistent-dd"} if root else set()) | (
+        # for units on the gui runner or the freshness slot: its next job takes the reserved units, which the waiter
+        # could not have taken
+        compete = ({"units"} if not gui and not fresh else set()) | ({"root", "persistent-dd"} if root else set()) | (
             {scope.gui_token, "root"} if gui else set())
         for waiter in admission_waiters(capacity_dir):
             shared = compete & set(waiter["wants"])
@@ -4427,10 +4479,11 @@ class Gate:
         take is tried again on the next poll."""
         if want and self.reserve_fd is None:
             scope = runner_scope(self.runner_dir)
-            if not scope.gui or scope.units <= 0 or self.capacity_dir is None or not self.capacity_dir.is_dir():
+            token = reserve_token(scope)
+            if token is None or scope.units <= 0 or self.capacity_dir is None or not self.capacity_dir.is_dir():
                 return
             with contextlib.suppress(OSError):
-                self.reserve_fd = lock_file(self.capacity_dir / f"{scope.gui_token}{GUI_RESERVE}", fcntl.LOCK_EX)
+                self.reserve_fd = lock_file(self.capacity_dir / f"{token}{GUI_RESERVE}", fcntl.LOCK_EX)
         elif not want and self.reserve_fd is not None:
             with contextlib.suppress(OSError):
                 os.close(self.reserve_fd)
@@ -6309,8 +6362,8 @@ def main(argv: list[str] | None = None) -> int:
                    help=argparse.SUPPRESS)
     p.add_argument("--watch-pid", type=int, default=0, help=argparse.SUPPRESS)
     args = p.parse_args(argv)
-    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", args.gui_token):
-        p.error("--gui-token must be a simple capacity token name")
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", args.gui_token) or args.gui_token == FRESH_RESERVE_TOKEN:
+        p.error(f"--gui-token must be a simple capacity token name other than {FRESH_RESERVE_TOKEN}")
     if args.parse_only:
         return 0
     args.min_free_gib = runner_floor_gib(args.min_free_gib, args.gui_runner or args.session_runner)
@@ -6480,6 +6533,7 @@ def main(argv: list[str] | None = None) -> int:
                 cap = dev_compile_capacity_wait(
                     repo, args.home_repo, os.environ.get("GITHUB_EVENT_NAME"),
                     os.environ.get("GITHUB_REF"), event, os.environ.get("GITHUB_JOB", ""), job_workflow())
+            cap = slot_capacity_wait(cap, args.dev_compile_runner)
             start, since = time.monotonic(), time.time()
             marker = args.capacity_dir / f"{ADMIT_WANT}{os.getpid()}"
             shown, shown_at = "", 0.0
@@ -6495,7 +6549,8 @@ def main(argv: list[str] | None = None) -> int:
                                                warm_keys=job_warm_keys(event), taken_out=taken,
                                                warm_target=job_warm_target(event), since=since,
                                                gui_token=args.gui_token, klass=admit_class,
-                                               gui_runner=args.gui_runner)
+                                               gui_runner=args.gui_runner,
+                                               fresh_runner=args.dev_compile_runner)
                     if held or not note.startswith("capacity:"):
                         break
                     waited = time.monotonic() - start
