@@ -9,6 +9,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -1854,6 +1855,25 @@ class TailscaleCli(unittest.TestCase):
 
 
 class Runners(Base):
+    def test_a_deleted_registration_is_its_own_finding(self) -> None:
+        home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        state = home / ".local/state/glaeda/cmux-runner"
+        state.mkdir(parents=True)
+        (state / "registration-actions-runner-glaeda-2.json").write_text(json.dumps(
+            {"cause": "registration_deleted", "runner": "mini-a-glaeda-2", "exits": 3, "first_seen": 1}))
+        (state / "registration-actions-runner-glaeda.json").write_text("{}")  # cleared or foreign: ignored
+        (state / "registration-actions-runner-glaeda-3.json").write_text(json.dumps(
+            {"cause": "registration_deleted", "runner": "mini-a-glaeda-3"}))  # uninstalled: no runner dir
+        (home / "actions-runner-glaeda-2/glaeda-hooks").mkdir(parents=True)  # runner_dirs() finds it
+        (home / "actions-runner-glaeda-2/.runner").write_text("{}")
+        self.mini.home = home
+        report = self.run_once()
+        self.assertEqual(self.ids(report), ["registration_deleted:2"])
+        [f] = report["findings"]
+        self.assertEqual((f["severity"], f["auto_fix"]), ("error", "impossible"))
+        self.assertIn("mini-a-glaeda-2", f["evidence"])
+
     def test_stopped_agent_is_kickstarted_after_two_runs(self) -> None:
         self.mini.agents[1] = ("com.teamleaderleo.glaeda.cmux-runner.1", True, False, "0")
         first = self.run_once()

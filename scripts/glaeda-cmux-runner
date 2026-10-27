@@ -785,6 +785,10 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
     toolchain_env = "unset SDKROOT TOOLCHAINS\n" + (
         f"export DEVELOPER_DIR={shlex.quote(os.fspath(Path(xcode_apps[0]) / 'Contents/Developer'))}\n"
         if xcode_apps else "")
+    home = ctx.home if isinstance(getattr(ctx, "home", None), Path) else Path.home()
+    # the gate's default --state-dir and its registration_file()
+    registration = shlex.quote(os.fspath(home / ".local/state/glaeda/cmux-runner"
+                                         / f"registration-{Path(ctx.runner_dir).name}.json"))
     listen = (
         "#!/bin/bash\n"
         "# glaeda-cmux-runner listener gate (generated, receipt-owned): the runner LaunchAgent's program. The\n"
@@ -820,13 +824,19 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         "    done\n"
         "    exit 1\n"
         "fi\n"
+        # A deleted registration (the hook's registration_deleted) is the gate's backoff: never retried without it
+        # unless config.sh re-registered it since (.runner is newer than the record)
+        f"if [ -f {registration} ] && [ ! .runner -nt {registration} ]; then\n"
+        "    echo \"$(date -u '+%Y-%m-%d %H:%M:%SZ'): glaeda-cmux-runner-gate: the gate exited $code and GitHub deleted"
+        " this runner's registration; leaving the retry to a fresh gate\"\n"
+        "    exit 1\n"
+        "fi\n"
         "echo \"$(date -u '+%Y-%m-%d %H:%M:%SZ'): glaeda-cmux-runner-gate: the gate exited $code; running the runner without it\"\n"
         "exec ./run.sh\n"
     )
     # Explicit dirs, so a restore step that changes HOME or FLEET_DIR still finds this runner's roots record.
     roots_n = int((ctx.member or {}).get("canonicalRoots") or 1)
     capacity = shlex.quote(os.fspath(capacity_dir))
-    home = ctx.home if isinstance(getattr(ctx, "home", None), Path) else Path.home()
     state = shlex.quote(os.fspath(home / ".local/state/glaeda/cmux-runner"))
     dirs = f" --capacity-dir {capacity} --state-dir {state}"
     root = (

@@ -6591,10 +6591,11 @@ class GateTest(unittest.TestCase):
             gate.step(); gate.step()
             stop.assert_called_once_with("a fleet build holds the host lock")
 
-    def listen_sh(self, python: str, labels: list[str] | None = None, session: bool = False) -> Path:
+    def listen_sh(self, python: str, labels: list[str] | None = None, session: bool = False,
+                  home: Path | None = None) -> Path:
         ctx = mock.Mock(python=python, hook_dir=HOOK.parent, runner_dir=self.runner, org=None, repo="manaflow-ai/cmux",
                         min_free_gib=0, member=None, capacity_units=4, labels=labels or ["glaeda-mini"],
-                        session_runner=session)
+                        session_runner=session, **({"home": home} if home else {}))
         script = self.tmp / "listen.sh"
         script.write_bytes(cr.hook_wrappers(ctx)["listen.sh"])
         script.chmod(0o755)
@@ -6634,6 +6635,119 @@ class GateTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("running the runner without it", result.stdout)
         self.assertEqual((self.tmp / "ran").read_text(), "plain run.sh\n")
+
+    def test_listen_sh_leaves_a_deleted_registration_to_the_gate(self) -> None:
+        (self.runner / "run.sh").write_text(f"#!/bin/bash\necho plain run.sh > {self.tmp / 'ran'}\nexit 0\n")
+        record = self.tmp / ".local/state/glaeda/cmux-runner/registration-actions-runner-glaeda.json"
+        record.parent.mkdir(parents=True)
+        record.write_text('{"cause": "registration_deleted"}')
+        result = subprocess.run([os.fspath(self.listen_sh("/nonexistent/python3", home=self.tmp))],
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("deleted this runner's registration", result.stdout)
+        self.assertFalse((self.tmp / "ran").exists(), "a runner GitHub deleted is never retried without the backoff")
+        (self.runner / ".runner").write_text("{}")
+        later = time.time() + 60
+        os.utime(self.runner / ".runner", (later, later))  # re-registered since the record
+        result = subprocess.run([os.fspath(self.listen_sh("/nonexistent/python3", home=self.tmp))],
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.tmp / "ran").read_text(), "plain run.sh\n")
+
+    def deleted(self, name: str = "mini-a-glaeda") -> None:
+        """The listener's _diag trace and .runner as a deleted registration leaves them."""
+        (self.runner / ".runner").write_text("\ufeff" + json.dumps({"agentName": name}), encoding="utf-8")
+        (self.runner / "_diag").mkdir(exist_ok=True)
+        (self.runner / "_diag/Runner_20261024-010000-utc.log").write_text(
+            "[2026-10-24 01:00:01Z ERR  Runner] GitHub.DistributedTask.WebApi.TaskAgentNotFoundException: "
+            "Registration was not found\n")
+
+    def test_a_deleted_registration_is_recorded_and_retried_only_after_the_backoff(self) -> None:
+        # 2026-10-24 01:00Z: 36 org runners lost their registrations while the gate held them offline; each
+        # listen.sh then restarted its listener about 33k times, and nothing said why.
+        gate, _ = self.gate([None] * 20)
+        with mock.patch.object(hook.subprocess, "Popen", return_value=gate.child) as popen, \
+                mock.patch.object(hook, "processes", return_value={}):
+            gate.start()
+            self.deleted()
+            gate.child.poll.return_value = 1
+            self.assertIsNone(gate.step(), "the gate keeps the runner instead of handing launchd a restart loop")
+            record = json.loads(hook.registration_file(self.state, self.runner).read_text())
+            self.assertEqual((record["cause"], record["runner"], record["exits"]),
+                             ("registration_deleted", "mini-a-glaeda", 1))
+            self.assertAlmostEqual(record["retry_after"], time.time() + hook.GATE_REGISTRATION_RETRY_S, delta=5)
+            self.assertGreaterEqual(hook.GATE_REGISTRATION_RETRY_S, 600)
+            for _ in range(3):
+                gate.step()
+            self.assertEqual(popen.call_count, 1, "no restart inside the backoff")
+            fresh = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+            self.assertTrue(fresh.registration_wait(), "a restarted gate keeps the backoff")
+            gate.registration["retry_after"] = time.time() - 1
+            gate.step()
+            self.assertEqual(popen.call_count, 2, "after the backoff it tries once more")
+            gate.child.poll.return_value = 1
+            gate.step()
+            self.assertEqual(json.loads(hook.registration_file(self.state, self.runner).read_text())["exits"], 2)
+
+    def test_a_reconfigured_runner_listens_at_once_and_a_listener_that_stays_up_clears_the_record(self) -> None:
+        gate, _ = self.gate([None] * 20)
+        with mock.patch.object(hook.subprocess, "Popen", return_value=gate.child) as popen, \
+                mock.patch.object(hook, "processes", return_value={}):
+            gate.start()
+            self.deleted()
+            gate.child.poll.return_value = 1
+            gate.step()
+            os.utime(self.runner / ".runner", (time.time() + 60, time.time() + 60))  # config.sh re-registered it
+            gate.child = mock.Mock(pid=1)
+            gate.child.poll.return_value = None
+            popen.return_value = gate.child
+            gate.child = None
+            gate.step()
+            self.assertEqual(popen.call_count, 2)
+            gate.step()
+            self.assertTrue(hook.registration_file(self.state, self.runner).exists(), "kept until it stays up")
+            gate.listening_since -= hook.GATE_REGISTRATION_OK_S
+            gate.step()
+            self.assertFalse(hook.registration_file(self.state, self.runner).exists())
+            self.assertIsNone(gate.registration)
+
+    def test_a_job_left_behind_keeps_the_exit_with_launchd(self) -> None:
+        gate, _ = self.gate([None] * 4)
+        with mock.patch.object(hook.subprocess, "Popen", return_value=gate.child):
+            gate.start()
+            self.deleted()
+            gate.child.poll.return_value = 1
+            worker = os.fspath(self.runner / "bin/Runner.Worker")
+            with mock.patch.object(hook, "processes", return_value={77: (1, f"{worker} spawnclient 3 4")}):
+                self.assertEqual(gate.step(), 1, "an orphaned Worker still runs: no backoff beside its job")
+        self.assertFalse(hook.registration_file(self.state, self.runner).exists())
+
+    def test_an_adopted_listener_never_reads_a_diag_log_from_before_the_reload(self) -> None:
+        # a reload's exec adopts run.sh: an exit after it must not match an older start's deletion trace
+        self.deleted()
+        old = time.time() - 600
+        os.utime(self.runner / "_diag/Runner_20261024-010000-utc.log", (old, old))
+        seen = []
+        def step(gate):
+            seen.append(gate)
+            return 0
+        with mock.patch.object(hook.Gate, "step", step), mock.patch.object(hook.signal, "signal"), \
+                mock.patch.object(hook.signal, "pthread_sigmask"), mock.patch.dict(os.environ, {}):
+            hook.listen(self.runner, os.fspath(self.lock), "", self.state, False, adopt=os.getpid())
+        [gate] = seen
+        self.assertGreater(gate.started_wall, old)
+        self.assertIsNone(hook.registration_deleted(self.runner, gate.started_wall))
+        self.assertIsNotNone(hook.registration_deleted(self.runner, 0.0), "only the since bound keeps it out")
+
+    def test_any_other_exit_still_goes_to_launchd(self) -> None:
+        gate, _ = self.gate([None] * 4)
+        with mock.patch.object(hook.subprocess, "Popen", return_value=gate.child):
+            gate.start()
+            (self.runner / "_diag").mkdir(exist_ok=True)
+            (self.runner / "_diag/Runner_1.log").write_text("Runner execution has finished\n")
+            gate.child.poll.return_value = 2
+            self.assertEqual(gate.step(), 2)
+        self.assertFalse(hook.registration_file(self.state, self.runner).exists())
 
     def test_listen_sh_never_starts_a_second_runner_beside_a_live_one(self) -> None:
         script = self.listen_sh(sys.executable)

@@ -77,6 +77,7 @@ MAX_FINDINGS = 500
 MAX_TEXT = 240
 MAX_COMMAND = 400
 MAX_LABELS = 16
+MAX_DECLARED_RUNNERS = 16  # glaeda_fleet_labels.MAX_RUNNERS: a bundle's count past it is not trusted further
 MAX_QUEUE_RUNS = 25
 # Org scopes list every ephemeral hosted runner too.
 MAX_RUNNER_PAGES = 10
@@ -314,6 +315,26 @@ def runner_hook() -> Any:
                                                               SCRIPT_DIR / "glaeda-cmux-runner-hook")
 
 
+def fleet_labels() -> Any:
+    return sys.modules.get("glaeda_fleet_labels") or _load("glaeda_fleet_labels", SCRIPT_DIR / "glaeda_fleet_labels.py")
+
+
+def declared_runners(manifest: dict[str, Any], name: str) -> int | None:
+    """How many runner instances the manifest declares on a member (glaeda-cmux-runner-fleet's count), or None
+    when it declares none or the member's runner config cannot be read."""
+    try:
+        summary, _ = fleet_labels().member_labels(manifest, name, lambda app: True)
+    except Exception:  # noqa: BLE001  (a malformed manifest leaves the count unknown, never the document)
+        return None
+    runners = (summary or {}).get("runners")
+    return runners if isinstance(runners, int) and not isinstance(runners, bool) and runners > 0 else None
+
+
+def runner_names(member: str, count: int) -> list[str]:
+    """The names glaeda-cmux-runner gives a member's instances: <member>-glaeda, then <member>-glaeda-K."""
+    return [f"{member}-glaeda" + (f"-{k}" if k else "") for k in range(count)]
+
+
 def manifest_source(manifest: dict[str, Any]) -> dict[str, Any]:
     """Only what the document needs: no keys, users, or overrides."""
     hosts = {}
@@ -321,6 +342,8 @@ def manifest_source(manifest: dict[str, Any]) -> dict[str, Any]:
         hosts[name] = {"class": host.get("class"), "roles": sorted(host.get("roles") or []),
                        "hostname": host.get("hostname"), "node_id": host.get("node_id"),
                        "lima_expected": sorted((host.get("lima") or {}).get("expected") or [])}
+        if (declared := declared_runners(manifest, name)) is not None:
+            hosts[name]["runners_declared"] = declared
     return source({"fleet": clean(manifest.get("fleet", "")), "hosts": hosts,
                    "never_touch": sorted(manifest.get("never_touch") or [])})
 
@@ -1326,11 +1349,33 @@ class Builder:
                                                note="point --github-runners at the repository the fleet registers to"))
             return every
         for name, m in self.members.items():
-            if "ci-runner" in m["roles"] and name not in by_member and name not in self.never:
-                self.finding("runners", "missing", "error", "manifest role ci-runner but no runner registered", name, at,
-                             self.action(name, "register_runner", "person", None,
-                                         note="run scripts/glaeda-cmux-runner on the member with a runner token "
-                                              "from an org admin"))
+            if "ci-runner" not in m["roles"] or name in self.never:
+                continue
+            # every runner in scope: a name under the member's short hostname maps to no member (member_of)
+            registered = {norm(r["name"]) for _, r in every}
+            declared = (self.hosts.get(name) or {}).get("runners_declared")
+            if isinstance(declared, int) and not isinstance(declared, bool) and declared > 0:
+                # every declared instance by name: a host with some runners left still lost the others
+                # under the member's name (glaeda-cmux-runner-fleet passes --member) or, for an older install, the
+                # host's own name (glaeda-cmux-runner's default): either registration is that instance
+                # (glaeda-cmux-runner's default takes the short hostname: worker.example.com registers worker-glaeda)
+                aliases = {short for a, owner in self.aliases.items() if owner == name
+                           for short in (a, re.sub(r"[^a-z0-9-]+", "-", a.split(".")[0]).strip("-"))}
+                count = min(declared, MAX_DECLARED_RUNNERS)
+                missing = [n for k, n in enumerate(runner_names(name, count))
+                           if not any(norm(runner_names(a, k + 1)[k]) in registered for a in aliases)]
+                if not missing:
+                    continue
+                m["runners_missing"] = missing
+                summary = (f"{len(missing)} of {declared} declared runner(s) not registered: {', '.join(missing)}")
+            elif name in by_member:
+                continue
+            else:
+                summary = "manifest role ci-runner but no runner registered"
+            self.finding("runners", "missing", "error", summary, name, at,
+                         self.action(name, "register_runner", "person", None,
+                                     note="re-register the missing runner(s): scripts/glaeda-cmux-runner on the "
+                                          "member with a runner token from an org admin"))
         return every
 
     def fold_queue(self, runners: list[tuple[str | None, dict[str, Any]]]) -> None:

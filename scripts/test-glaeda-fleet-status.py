@@ -1185,5 +1185,86 @@ class DaemonHealTests(unittest.TestCase):
         self.assertTrue(fs.parser().parse_args(["--no-daemon-heal"]).no_daemon_heal)
 
 
+
+def declared_bundle(runners, declared=3, never=("coordinator",), truncated=False):
+    """mini-a declares `declared` runners; mini-c is never_touch and declares 2."""
+    hosts = {
+        "mini-a": {"class": "std", "roles": ["ci-runner"], "hostname": "mini-a", "node_id": None,
+                   "lima_expected": [], "runners_declared": declared},
+        "mini-c": {"class": "std", "roles": ["ci-runner"], "hostname": "mini-c", "node_id": None,
+                   "lima_expected": [], "runners_declared": 2},
+    }
+    data = {"runners": [{"name": n, "status": "online", "busy": False, "labels": ["self-hosted"]} for n in runners]}
+    if truncated:
+        data["truncated"] = True
+    sources = {"manifest": src({"fleet": "test", "hosts": hosts, "never_touch": [*never, "mini-c"]}),
+               "runners": src(data)}
+    return fs.build({"schema": fs.SOURCES_SCHEMA, "collected_at": AT, "sources": sources}, at=AT)
+
+
+class DeclaredRunnerTests(unittest.TestCase):
+    """Each declared runner instance is judged by name (2026-10-24: deleted registrations on hosts that kept others)."""
+
+    def test_runner_names_follow_the_installer(self):
+        self.assertEqual(fs.runner_names("mini-a", 3), ["mini-a-glaeda", "mini-a-glaeda-1", "mini-a-glaeda-2"])
+
+    def test_a_host_with_some_runners_still_reports_each_missing_instance(self):
+        doc = declared_bundle(["mini-a-glaeda", "Mini-A-glaeda-2"])
+        [f] = by_id(doc, "runners.missing@mini-a")
+        self.assertEqual(f["severity"], "error")
+        self.assertIn("1 of 3", f["summary"])
+        self.assertIn("mini-a-glaeda-1", f["summary"])
+        member = next(m for m in doc["members"] if m["name"] == "mini-a")
+        self.assertEqual(member["runners_missing"], ["mini-a-glaeda-1"])
+
+    def test_one_finding_lists_every_missing_instance(self):
+        doc = declared_bundle([])
+        [f] = by_id(doc, "runners.missing@mini-a")
+        self.assertIn("3 of 3", f["summary"])
+        for name in ("mini-a-glaeda,", "mini-a-glaeda-1", "mini-a-glaeda-2"):
+            self.assertIn(name, f["summary"])
+
+    def test_an_instance_registered_under_the_hostname_counts(self):
+        doc = declared_bundle(["mini-a-glaeda", "mini-a-glaeda-1", "MINI-A.local-glaeda-2"])
+        self.assertTrue(by_id(doc, "runners.missing@mini-a"), "a .local name is not the hostname alias")
+        hosts = {"mini-a": {"class": "std", "roles": ["ci-runner"], "hostname": "studio-a.example.com",
+                            "node_id": None, "lima_expected": [], "runners_declared": 3}}
+        data = {"runners": [{"name": n, "status": "online", "busy": False, "labels": []}
+                            for n in ("mini-a-glaeda", "studio-a.example.com-glaeda-1", "studio-a-glaeda-2")]}
+        doc = fs.build({"schema": fs.SOURCES_SCHEMA, "collected_at": AT, "sources": {
+            "manifest": src({"fleet": "test", "hosts": hosts, "never_touch": []}), "runners": src(data)}}, at=AT)
+        self.assertFalse(by_id(doc, "runners.missing"))
+        hosts["mini-a"]["hostname"] = "studio_a.example.com"  # glaeda-cmux-runner's default_name: studio-a-glaeda
+        data["runners"] = [{"name": n, "status": "online", "busy": False, "labels": []}
+                           for n in ("mini-a-glaeda", "studio-a-glaeda-1", "mini-a-glaeda-2")]
+        doc = fs.build({"schema": fs.SOURCES_SCHEMA, "collected_at": AT, "sources": {
+            "manifest": src({"fleet": "test", "hosts": hosts, "never_touch": []}), "runners": src(data)}}, at=AT)
+        self.assertFalse(by_id(doc, "runners.missing"))
+
+    def test_every_declared_instance_registered_is_not_a_finding(self):
+        doc = declared_bundle(["mini-a-glaeda", "mini-a-glaeda-1", "mini-a-glaeda-2", "mini-a-glaeda-7"])
+        self.assertFalse(by_id(doc, "runners.missing"))
+
+    def test_truncated_list_and_never_touch_are_not_judged(self):
+        self.assertFalse(by_id(declared_bundle([], truncated=True), "runners.missing"))
+        self.assertFalse(by_id(declared_bundle(["mini-a-glaeda"]), "runners.missing@mini-c"))
+
+    def test_manifest_source_carries_the_declared_count_from_fleet_labels(self):
+        host = {"class": "std", "availability": "dedicated", "roles": ["ci-runner"], "hardware": "m4-test",
+                "hostname": "mini-a"}
+        manifest = {"fleet": "test", "defaults": {}, "never_touch": [],
+                    "hosts": {"mini-a": host,
+                              "mini-b": {**host, "overrides": {"runner": {"classes": {"std": {"runners": 6}}}}},
+                              "mini-d": {**host, "roles": ["dev-builds"]}}}
+        hosts = fs.manifest_source(manifest)["data"]["hosts"]
+        self.assertEqual(hosts["mini-a"]["runners_declared"], 4)  # the std class default
+        self.assertEqual(hosts["mini-b"]["runners_declared"], 6)
+        self.assertNotIn("runners_declared", hosts["mini-d"])
+
+    def test_an_unknown_declared_count_keeps_the_zero_runner_check(self):
+        doc = build(runners=src({"runners": [{"name": "mini-a-ci2", "status": "online", "busy": False,
+                                              "labels": []}]}))
+        self.assertFalse(by_id(doc, "runners.missing@mini-a"))
+
 if __name__ == "__main__":
     unittest.main()

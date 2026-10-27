@@ -415,6 +415,19 @@ class Mini:
         m = re.search(r"([0-9A-F-]{36}).*io\.tailscale\.", sh(["/usr/sbin/scutil", "--nc", "list"])[1])
         return m.group(1) if m else None
 
+    def runner_registrations(self) -> list[dict[str, Any]]:
+        """The listener gate's registration_deleted records (glaeda-cmux-runner-hook registration_file), one per
+        runner GitHub no longer knows, for the runners this tool watches (runner_dirs(), as runner_agents()). A
+        record whose runner was uninstalled (its directory or .runner gone) is stale: nothing will clear it."""
+        out = []
+        dirs = {d.name: d for d in self.runner_dirs()}
+        for path in sorted((self.home / ".local/state/glaeda/cmux-runner").glob("registration-*.json")):
+            doc = load_json(path)
+            name = path.name[len("registration-"):-len(".json")]
+            if doc.get("cause") == "registration_deleted" and name in dirs and (dirs[name] / ".runner").is_file():
+                out.append({**doc, "dir": name})
+        return out
+
     def runner_agents(self) -> list[tuple[str, bool, bool, str]]:
         """(label, loaded, running, last exit) for each runner LaunchAgent plist."""
         out = []
@@ -1129,6 +1142,14 @@ def check_tailscale(mini: Mini) -> list[dict[str, Any]]:
 
 def check_runners(mini: Mini) -> list[dict[str, Any]]:
     out = []
+    for doc in mini.runner_registrations():
+        agent = re.fullmatch(r"actions-runner-glaeda(?:-(\d+))?", doc["dir"])
+        agent = (agent.group(1) or "0") if agent else doc["dir"]
+        out.append(finding(f"registration_deleted:{agent}", "error",
+                           f"GitHub deleted runner {doc.get('runner') or doc['dir']}'s registration "
+                           f"({doc.get('exits')} listener exit(s) since {doc.get('first_seen')})", "impossible",
+                           "the mini holds no admin token: re-register it from an operator host "
+                           "(glaeda-cmux-runner with a runner token); the gate retries every 10 minutes"))
     for label, loaded, running, last in mini.runner_agents():
         agent = label.rsplit(".", 1)[1] if label[-1].isdigit() else "0"
         if (HELD / ("actions-runner-glaeda" + ("" if agent == "0" else f"-{agent}"))).exists():

@@ -3993,6 +3993,78 @@ def listener_request(runner_dir: Path) -> str | None:
     return request
 
 
+# A runner GitHub removed (an org deletes a runner that has not connected for a while, so a listener the gate held
+# off long enough loses it) exits at once on every start: "The runner registration has been deleted from the
+# server, please re-configure", "Registration was not found" in _diag. Restarting it cannot help (2026-10-24: 36
+# runners looped about 33k times each), and the mini holds no admin token to re-register itself. So the gate
+# records the cause in registration-<runner dir>.json in the state dir (glaeda-mini-health reports it, an
+# operator-side reconciler re-registers from it) and tries again only every GATE_REGISTRATION_RETRY_S, or at once
+# when the runner is re-configured (.runner changes). A listener that stays up GATE_REGISTRATION_OK_S clears it.
+REGISTRATION_SCHEMA = "glaeda-runner-registration/v1"
+REGISTRATION_DELETED = "registration_deleted"
+REGISTRATION_EVIDENCE = ("The runner registration has been deleted from the server", "Registration was not found")
+GATE_REGISTRATION_RETRY_S = float(os.environ.get("GLAEDA_RUNNER_GATE_REGISTRATION_RETRY_S") or 600.0)
+GATE_REGISTRATION_OK_S = float(os.environ.get("GLAEDA_RUNNER_GATE_REGISTRATION_OK_S") or 120.0)
+REGISTRATION_TAIL = 64 * 1024  # the listener writes the error as it exits: it is in the last lines
+
+
+def registration_file(state_dir: Path, runner_dir: Path) -> Path:
+    return state_dir / f"registration-{runner_dir.name}.json"
+
+
+def runner_config(runner_dir: Path) -> tuple[str | None, float | None]:
+    """(the registered runner name, .runner's mtime): config.sh rewrites .runner when it re-registers."""
+    path = runner_dir / ".runner"
+    try:
+        mtime = path.stat().st_mtime
+        name = json.loads(path.read_text(encoding="utf-8-sig")).get("agentName")
+    except (OSError, ValueError, AttributeError):
+        return None, None
+    return (name if isinstance(name, str) else None), mtime
+
+
+def registration_deleted(runner_dir: Path, since: float) -> str | None:
+    """The evidence line when the newest _diag/Runner_*.log written since `since` (wall clock) says GitHub deleted
+    this runner's registration, else None."""
+    diag = runner_dir / "_diag"
+    try:
+        logs = sorted(n for n in os.listdir(diag) if n.startswith("Runner_") and n.endswith(".log"))
+        if not logs or (diag / logs[-1]).stat().st_mtime < since - 5:
+            return None
+        with open(diag / logs[-1], "rb") as file:
+            file.seek(max(0, os.fstat(file.fileno()).st_size - REGISTRATION_TAIL))
+            text = file.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    return next((e for e in REGISTRATION_EVIDENCE if e in text), None)
+
+
+def read_registration(state_dir: Path, runner_dir: Path) -> dict[str, Any] | None:
+    try:
+        doc = json.loads(registration_file(state_dir, runner_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return doc if isinstance(doc, dict) and doc.get("cause") == REGISTRATION_DELETED else None
+
+
+def note_registration_deleted(state_dir: Path, runner_dir: Path, evidence: str, now: float) -> dict[str, Any]:
+    """Write (atomically) and return the registration record, counting this exit."""
+    before = read_registration(state_dir, runner_dir) or {}
+    name, mtime = runner_config(runner_dir)
+    doc = {"schema": REGISTRATION_SCHEMA, "cause": REGISTRATION_DELETED, "runner": name,
+           "runner_dir": os.fspath(runner_dir), "evidence": evidence,
+           "first_seen": before.get("first_seen") or int(now), "last_seen": int(now),
+           "exits": int(before.get("exits") or 0) + 1, "retry_after": int(now + GATE_REGISTRATION_RETRY_S),
+           "runner_mtime": mtime}
+    path = registration_file(state_dir, runner_dir)
+    with contextlib.suppress(OSError):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + f".{os.getpid()}")
+        tmp.write_text(json.dumps(doc, separators=(",", ":"), sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    return doc
+
+
 GATE_DISK_RESUME_GIB = 2.0  # a disk hold ends only this far above the floor
 GATE_DISK_NOTE_S = 30 * 60  # two evictions that did not end the hold
 GATE_DISK_EVICT_EVERY_S = 15 * 60  # an eviction that left the disk short is retried this often, not every poll
@@ -4050,6 +4122,8 @@ class Gate:
         self.first_poll_noted = False
         self.swept_at = time.monotonic() - GATE_SWEEP_S + GATE_POLL_S  # first sweep on the second poll
         self.reserve_fd: int | None = None  # a gui runner's capacity/<gui token>.reserve flock while it is idle
+        self.started_wall = 0.0  # time.time() when start() last started run.sh (registration_deleted's log)
+        self.registration = read_registration(state_dir, runner_dir)  # kept across gate restarts: the backoff holds
 
     def reload(self) -> None:
         """An --apply replaced this hook: re-exec the new one in place, keeping run.sh as our child, so a gate
@@ -4413,6 +4487,18 @@ class Gate:
         worker = os.fspath(self.runner_dir / "bin" / "Runner.Worker")
         return tuple(pid for pid in pids if worker in table[pid][1])
 
+    def job_left(self) -> bool:
+        """After run.sh exited: a Runner.Worker of this runner anywhere (an orphan is no longer in tree()), or a
+        request its listener took and did not finish. A failed look counts as a job: the exit then goes to
+        launchd as before, never to the registration backoff, which would start a listener beside the job."""
+        try:
+            table = processes()
+        except Exception:  # noqa: BLE001
+            return True
+        worker = os.fspath(self.runner_dir / "bin" / "Runner.Worker")
+        found = any(command == worker or command.startswith(worker + " ") for _, command in table.values())
+        return found or self.taking() is not None
+
     def worker(self) -> bool:
         """A Runner.Worker under this runner's tree. A failed look counts as busy."""
         try:
@@ -4437,6 +4523,28 @@ class Gate:
         self.stale_env = None
         self.streak, self.stopped_one = 0, False
         self.listening_since, self.first_poll_noted = time.monotonic(), False
+        self.started_wall = time.time()
+
+    def registration_wait(self) -> bool:
+        """Whether a deleted registration still holds the listener off (its backoff, unless re-configured)."""
+        if self.registration is None:
+            return False
+        _, mtime = runner_config(self.runner_dir)
+        if mtime is not None and mtime != self.registration.get("runner_mtime"):
+            gate_log("the runner was re-configured; listening again")
+            self.registration["runner_mtime"] = mtime  # one try now; the record stays until a listener stays up
+            return False
+        return time.time() < float(self.registration.get("retry_after") or 0)
+
+    def registration_ok(self) -> None:
+        """A listener up GATE_REGISTRATION_OK_S has its registration: clear the record."""
+        if self.registration is None or self.listening_since is None \
+                or time.monotonic() - self.listening_since < GATE_REGISTRATION_OK_S:
+            return
+        self.registration = None
+        with contextlib.suppress(OSError):
+            registration_file(self.state_dir, self.runner_dir).unlink()
+        gate_log("the runner's registration is back; cleared the registration_deleted record")
 
     def first_poll(self, why: str) -> bool:
         """The listener started less than GATE_FIRST_POLL_S ago: its first poll may already carry a job, so a hold
@@ -4504,11 +4612,21 @@ class Gate:
             code = self.child.poll()
             if code is not None:
                 self.child = None
+                if self.stop_deadline is None and not self.terminating and \
+                        (evidence := registration_deleted(self.runner_dir, self.started_wall)) and \
+                        not self.job_left():
+                    self.registration = note_registration_deleted(self.state_dir, self.runner_dir, evidence,
+                                                                  time.time())
+                    gate_log(f"{REGISTRATION_DELETED}: GitHub deleted this runner's registration ({evidence}); it "
+                             f"needs re-registering, trying again in {GATE_REGISTRATION_RETRY_S:g} s "
+                             f"(exit {self.registration['exits']})")
+                    return None
                 if self.stop_deadline is None or self.terminating:
                     return code  # the runner exited on its own: launchd's KeepAlive decides, as before
                 self.stop_deadline, self.stopped_one = None, True
                 gate_log(f"holding the listener off: {self.held}")
                 return None
+            self.registration_ok()
             if self.stop_deadline is not None:
                 if time.monotonic() > self.stop_deadline:
                     if self.busy():  # a job slipped in before the stop: let it finish, never kill it
@@ -4560,6 +4678,9 @@ class Gate:
         if self.terminating:
             return 0
         self.reload()
+        if self.registration_wait():
+            self.reserve(False)  # a runner GitHub no longer knows takes no job: it keeps no units from the others
+            return None
         why = self.claimed()
         self.reserve(self.reserves(why))
         if why:
@@ -4647,6 +4768,8 @@ def listen(runner_dir: Path, host_lock: str, reservation: str, state_dir: Path, 
     xcode = runner_xcode(runner_dir)
     if adopt:
         gate.child = Adopted(adopt)  # type: ignore[assignment]
+        # registration_deleted reads only a _diag log written since: never one from before this gate's exec
+        gate.started_wall = time.time()
         with contextlib.suppress(ValueError):  # the adopted listener keeps its first poll (GATE_FIRST_POLL_S)
             gate.listening_since = float(os.environ.get(GATE_LISTENING_SINCE_ENV, ""))
         gate.stale_env = adopted_env_stale(marker, os.environ, xcode)
