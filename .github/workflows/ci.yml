@@ -33,7 +33,7 @@ jobs:
   # script tests drive cargo and some read docs (docs/CMUX_MINI_RUNNER.md, for one).
   changes:
     if: ${{ github.event_name == 'pull_request' || github.repository == 'teamleaderleo/glaeda' }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 5
     outputs:
       rust: ${{ steps.scope.outputs.rust }}
@@ -107,7 +107,7 @@ jobs:
   go:
     needs: changes
     if: ${{ needs.changes.outputs.go == 'true' }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 15
 
     steps:
@@ -138,7 +138,7 @@ jobs:
   scripts:
     needs: changes
     if: ${{ needs.changes.outputs.code == 'true' }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 15
 
     steps:
@@ -224,6 +224,8 @@ jobs:
               Path("scripts/test-glaeda-route.py"),
               Path("scripts/glaeda_never_cancel.py"),
               Path("scripts/test-glaeda-never-cancel.py"),
+              Path("scripts/glaeda_runner_labels.py"),
+              Path("scripts/test-glaeda-runner-labels.py"),
               Path("scripts/cmux_execution_roles.py"),
               Path("scripts/test-cmux-fleet.py"),
               Path("scripts/test-cmux-execution-roles.py"),
@@ -379,6 +381,7 @@ jobs:
           suite python3 scripts/test-glaeda-fleet-status.py
           suite python3 scripts/test-glaeda-route.py
           suite python3 scripts/test-glaeda-never-cancel.py
+          suite python3 scripts/test-glaeda-runner-labels.py
           suite python3 scripts/test-cmux-execution-roles.py
           suite python3 scripts/test-cmux-workload-request.py
           suite python3 scripts/test-owned-fleet-benchmark.py
@@ -462,7 +465,7 @@ jobs:
   runner-tests:
     needs: changes
     if: ${{ needs.changes.outputs.code == 'true' }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -492,7 +495,7 @@ jobs:
   lint:
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-16vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 15
     # Line tables are for local debugging; in CI they only make the target dir, every cache restore and each test
     # binary's link bigger. The environment, not ~/.cargo/config.toml: local_install_build_execution's tests refuse
@@ -556,7 +559,7 @@ jobs:
   lint-macos:
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' }}
-    runs-on: macos-15
+    runs-on: ${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-6vcpu-macos-15' || 'macos-15' }}
     timeout-minutes: 20
     steps:
       - name: Check out repository
@@ -578,7 +581,7 @@ jobs:
   test:
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-16vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 15
     # Line tables are for local debugging; in CI they only make the target dir, every cache restore and each test
     # binary's link bigger. The environment, not ~/.cargo/config.toml: local_install_build_execution's tests refuse
@@ -634,7 +637,7 @@ jobs:
   cli:
     needs: changes
     if: ${{ needs.changes.outputs.rust == 'true' }}
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-16vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 15
 
     steps:
@@ -778,9 +781,9 @@ jobs:
       fail-fast: true
       matrix:
         include:
-          - runner: macos-15
+          - runner: "${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-6vcpu-macos-15' || 'macos-15' }}"
             target: aarch64-apple-darwin
-          - runner: ubuntu-24.04
+          - runner: "${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-24.04' }}"
             target: x86_64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
@@ -814,7 +817,7 @@ jobs:
     name: ci-status
     if: ${{ always() && (github.event_name == 'pull_request' || github.repository == 'teamleaderleo/glaeda') }}
     needs: [changes, go, scripts, runner-tests, lint, lint-macos, test, cli, fleet-cas-build]
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 5
     steps:
       - name: Require every Verify job

@@ -21,7 +21,7 @@ concurrency:
 jobs:
   diff:
     name: change-scoped evidence
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 10
     continue-on-error: true
     env:
