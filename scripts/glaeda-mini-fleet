@@ -2824,10 +2824,11 @@ BREW_TIMED_OUT = 124
 # The bound, in perl because a mini has no timeout(1) and maybe no Python. It runs as the Homebrew owner, inside
 # sudo -u, so it can signal what brew starts and nothing of root's. argv: SECONDS COMMAND [ARG...].
 # The command starts in a process group of its own. At the limit the bound collects that group, every process
-# group any member leads or belongs to (Homebrew starts curl in a group of its own) and every descendant, sends
-# SIGTERM to each group and process, and 10 s later SIGKILL to what a fresh look still finds in those groups or
-# under them: a pid reused in between is in none of them, so it is never signalled. Its own group is never one.
-# Under the limit the command's exit code passes through (a signal as 128+N); at the limit it exits 124.
+# group a member of it or a descendant belongs to (Homebrew starts curl in a group of its own) and every descendant,
+# and signals each, SIGTERM and 10 s later SIGKILL. Each signal goes only to what a ps read just before it finds in
+# those groups or under them, so a pid or group id reused in the 10 s grace is never hit. If ps cannot be read, the
+# command's own group is still signalled. Under the limit the command's exit code passes through (a signal as
+# 128+N); at the limit it exits BREW_TIMED_OUT. Homebrew's own exit codes are 0 and 1, so 124 is free for that.
 BREW_BOUND = r"""
 use strict; use warnings; use POSIX ();
 my $limit = shift @ARGV;
@@ -2839,37 +2840,33 @@ eval { local $SIG{ALRM} = sub { die "limit\n" }; alarm $limit; waitpid($pid, 0);
 exit($status & 127 ? 128 + ($status & 127) : $status >> 8) if defined $status;
 my $mine = getpgrp();
 my %groups = ($pid => 1);
-sub look {  # the processes in %groups or under them, adding the groups they are in; () when ps fails
+sub look {  # (pids, groups): the processes in %groups or under them, and the groups that have any of them
   my (%kids, %pgid, @rows);
-  eval {
-    local $SIG{ALRM} = sub { die "ps\n" }; alarm 30;
+  my $ok = eval {
+    local $SIG{ALRM} = sub { die "ps\n" }; alarm 10;
     open(my $ps, "-|", "ps", "-A", "-o", "pid=,ppid=,pgid=") or die "ps\n";
     @rows = map { [split] } <$ps>;
     close($ps) or die "ps\n";
-    alarm 0;
-  } or do { alarm 0; return (); };
+    alarm 0; 1;
+  };
+  alarm 0;
+  return ([], [$pid]) unless $ok;  # no reading: the command's own group, which setpgrp made, is all we know
   for (@rows) { my ($p, $pp, $g) = @$_; next unless defined $g; push @{$kids{$pp}}, $p; $pgid{$p} = $g; }
   my %seen;
   for (my $grown = 1; $grown;) {
     $grown = 0;
     my @todo = ((grep { $groups{$pgid{$_}} } keys %pgid), keys %seen);
-    while (@todo) {
-      my $p = shift @todo;
-      next if $p == $$ || $seen{$p}++;
-      push @todo, @{$kids{$p} || []};
-    }
-    for (keys %seen) { my $g = $pgid{$_}; if (defined $g && $g != $mine && !$groups{$g}++) { $grown = 1; } }
+    while (@todo) { my $p = shift @todo; next if $p == $$ || $seen{$p}++; push @todo, @{$kids{$p} || []}; }
+    for (keys %seen) { my $g = $pgid{$_}; if ($g != $mine && !$groups{$g}++) { $grown = 1; } }
   }
-  return keys %seen;
+  my %live = map { $pgid{$_} => 1 } keys %seen;
+  return ([keys %seen], [grep { $live{$_} && $_ != $mine } keys %groups]);
 }
-my @first = look();
-print STDERR "timed out after ${limit}s: stopping $ARGV[0] (groups " . join(" ", sort keys %groups) . ")\n";
-kill "TERM", -$_ for keys %groups;
-kill "TERM", @first;
+sub stop { my ($sig) = @_; my ($pids, $gids) = look(); kill $sig, map { -$_ } @$gids; kill $sig, @$pids; }
+print STDERR "timed out after ${limit}s: stopping $ARGV[0] and everything it started\n";
+stop("TERM");
 for (1 .. 20) { last if waitpid($pid, POSIX::WNOHANG()) == $pid; select(undef, undef, undef, 0.5); }
-my @left = look();
-kill "KILL", -$_ for keys %groups;
-kill "KILL", @left;
+stop("KILL");
 waitpid($pid, 0);
 exit 124;
 """.strip()

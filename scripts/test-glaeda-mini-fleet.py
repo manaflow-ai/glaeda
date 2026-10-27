@@ -1659,6 +1659,7 @@ class PreflightTests(unittest.TestCase):
         old = self.result(preflight_text(git=None))
         self.assertEqual((old["checks"]["git"]["state"], old["ready"]), ("fail", False))
         del self.manifest["hosts"]["build-mini-1"]["overrides"]["git"]
+        self.assertEqual(self.result(preflight_text(git=None))["ready"], True)  # no policy: an old probe is fine
 
     def test_every_brew_command_is_bounded_and_the_bound_kills_the_whole_tree(self) -> None:
         # A `brew install git` from sudo-plan once sat 8 h 15 min: nothing on either side ever stopped it.
@@ -1732,7 +1733,6 @@ class PreflightTests(unittest.TestCase):
             run = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60,
                                  env={"PATH": os.environ["PATH"], "HOME": tmp, "HANG": "never"})
             self.assertEqual(run.returncode, 0, (run.stdout, run.stderr))
-        self.assertEqual(self.result(preflight_text(git=None))["ready"], True)  # no policy: an old probe is fine
 
     def test_the_preflight_probe_runs_the_workloads_git(self) -> None:
         text = mf.PREFLIGHT_PROBE.read_text()
