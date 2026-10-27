@@ -10359,6 +10359,56 @@ class JobTelemetryTest(unittest.TestCase):
         self.assertEqual(set(by_outside), {"zig (cmux)", "mds_stores (root)"})
         self.assertFalse(any("/" in key for key in by_outside), "no paths leave the host")
 
+    def test_job_rss_sums_this_jobs_tree_and_its_test_app(self) -> None:
+        rows = [
+            (100, 1, 1.0, "cmux", "/Users/cmux/actions-runner-glaeda/bin/Runner.Worker"),
+            (101, 100, 0.0, "cmux", "swift-frontend"),
+            (102, 101, 0.0, "cmux", "ld"),
+            (200, 1, 0.5, "cmux", "/Users/cmux/actions-runner-glaeda-2/bin/Runner.Worker"),
+            (201, 200, 300.0, "cmux", "node"),
+            (300, 1, 10.0, "cmux", "cmux DEV"),
+            (301, 1, 50.0, "root", "mds_stores"),
+            (400, 1, 90.0, "cmux", "ps"),
+        ]
+        rss = {100: 100_000, 101: 2_000_000, 102: 500_000, 200: 90_000, 201: 700_000, 300: 400_000,
+               301: 50_000, 400: 1_000}
+        # idle processes (0 %cpu) still hold memory, and the reparented test app is the job's
+        self.assertEqual(self.hook.job_rss_kib(rows, rss, 100, {400}, {300: 100}), 3_000_000)
+        self.assertEqual(self.hook.job_rss_kib(rows, rss, 200, {400}, {300: 100}), 790_000)
+        self.assertIsNone(self.hook.job_rss_kib(rows, {}, 100, set()), "no RSS read is unknown, not zero")
+        zombies = {pid: 0 for pid in rss}  # a tree of zombies while the Runner.Worker exits
+        self.assertIsNone(self.hook.job_rss_kib(rows, zombies, 100, set()), "an all-zero reading is unknown too")
+        self.assertEqual(self.hook.job_rss_kib(rows, {**rss, 101: 0}, 100, {400}, {300: 100}), 1_000_000)
+
+    def test_summary_records_the_peak_job_rss_or_null(self) -> None:
+        split = (1.0, 0.0, 0.0, {}, {})
+        samples = self.hook.JobSamples({}, 14, 0.0)
+        for kib in (1_048_576, None, 3_145_728, 2_097_152):
+            samples.add(None, split, 10.0, rss_kib=kib)
+        self.assertEqual(samples.summary(60.0)["rss_peak_mib"], 3072.0)
+        unknown = self.hook.JobSamples({}, 14, 0.0)
+        unknown.add(None, split, 10.0)
+        self.assertIsNone(unknown.summary(60.0)["rss_peak_mib"])
+
+    def test_ps_rows_reads_rss_from_the_same_ps_pass(self) -> None:
+        calls = []
+
+        def fake_run(argv, **_kwargs):
+            calls.append(argv[-1])
+            out = ("100 Runner.Worker\n101 swift-frontend\n" if argv[-1] == "pid=,ucomm=" else
+                   "  100     1   1.0 cmux   102400 /Users/cmux/actions-runner/bin/Runner.Worker\n"
+                   "  101   100 700.0 cmux  2048000 /Applications/Xcode.app/usr/bin/swift frontend\n")
+            return subprocess.CompletedProcess(argv, 0, out, "")
+
+        with mock.patch.object(self.hook.subprocess, "run", fake_run):
+            rss: dict[int, int] = {}
+            rows = self.hook.ps_rows(rss)
+            plain = self.hook.ps_rows()
+        self.assertEqual(rss, {100: 102400, 101: 2048000})
+        self.assertEqual(rows, plain)
+        self.assertEqual(rows[1], (101, 100, 700.0, "cmux", "swift-frontend"))
+        self.assertEqual(calls.count("pid=,ppid=,pcpu=,user=,rss=,comm="), 2, "one ps pass per call, no extra")
+
     def test_dynamic_release_needs_sustained_quiet_headroom(self) -> None:
         decide = self.hook.dynamic_release_decision
         self.assertIsNone(decide(100, 20, 2, 5, 0.8, 55, 0, 1, False))

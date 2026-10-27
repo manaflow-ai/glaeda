@@ -5418,10 +5418,11 @@ def sampler_file(state_dir: Path) -> Path:
     return state_dir / main.name.replace(HOLDER_FILE, SAMPLER_FILE, 1)
 
 
-def ps_rows() -> list[tuple[int, int, float, str, str]]:
+def ps_rows(rss: dict[int, int] | None = None) -> list[tuple[int, int, float, str, str]]:
     """(pid, ppid, %cpu, user, name) for every process. The name is the kernel's executable name (ucomm), not
     argv[0], so a process title can never carry arguments into the record; Runner.Worker keeps its argv[0]
-    because its runner directory is the only thing read from it."""
+    because its runner directory is the only thing read from it. With rss, the same ps pass also fills it with
+    each process's resident set size in KiB (ps's rss column, on macOS and Linux alike)."""
     def run(fields: str) -> str:
         return subprocess.run([PS, "-Ao", fields], stdin=subprocess.DEVNULL, capture_output=True, text=True,
                               timeout=10, check=False, env={"LC_ALL": "C"}).stdout
@@ -5431,16 +5432,18 @@ def ps_rows() -> list[tuple[int, int, float, str, str]]:
         if len(parts) == 2 and parts[0].isdigit():
             names[int(parts[0])] = parts[1].strip()
     rows = []
-    for line in run("pid=,ppid=,pcpu=,user=,comm=").splitlines():
-        parts = line.split(None, 4)
-        if len(parts) < 5:
+    for line in run("pid=,ppid=,pcpu=,user=,rss=,comm=").splitlines():
+        parts = line.split(None, 5)
+        if len(parts) < 6:
             continue
         try:
-            pid, comm = int(parts[0]), parts[4].strip()
+            pid, comm = int(parts[0]), parts[5].strip()
             name = comm if comm.endswith("Runner.Worker") else names.get(pid, "?")
             rows.append((pid, int(parts[1]), float(parts[2]), parts[3], name))
         except ValueError:
             continue
+        if rss is not None and parts[4].isdigit():
+            rss[pid] = int(parts[4])
     return rows
 
 
@@ -5485,22 +5488,7 @@ def classify(rows: list[tuple[int, int, float, str, str]], job_root: int,
              ) -> tuple[float, float, float, dict[str, float], dict[str, float]]:
     """Cores used right now by this job's tree, its reparented CI test app tree, other jobs, and everything else, plus the outside
     cores by "basename (user)" and the other jobs' cores by runner directory."""
-    parent = {pid: ppid for pid, ppid, _, _, _ in rows}
-    workers = {pid: (m.group(1) if (m := RUNNER_DIR_RE.search(comm)) else "runner")
-               for pid, _, _, _, comm in rows if comm.endswith("Runner.Worker")}
-    workers.setdefault(job_root, "this job")
-
-    def owner(pid: int) -> int | None:
-        seen = 0
-        while pid > 1 and seen < 256:
-            if pid in workers:
-                return pid
-            if test_app_owners and test_app_owners.get(pid) in workers:
-                return test_app_owners[pid]
-            pid = parent.get(pid, 0)
-            seen += 1
-        return None
-
+    workers, owner = job_owners(rows, job_root, test_app_owners)
     job = others = outside = 0.0
     by_outside: dict[str, float] = {}
     by_runner: dict[str, float] = {}
@@ -5519,6 +5507,40 @@ def classify(rows: list[tuple[int, int, float, str, str]], job_root: int,
             key = f"{os.path.basename(comm)[:60]} ({user[:24]})"
             by_outside[key] = by_outside.get(key, 0.0) + cores
     return job, others, outside, by_outside, by_runner
+
+
+def job_owners(rows: list[tuple[int, int, float, str, str]], job_root: int,
+               test_app_owners: dict[int, int] | None = None) -> tuple[dict[int, str], Callable[[int], int | None]]:
+    """The Runner.Worker pids by runner directory (job_root as "this job"), and owner(pid): the Runner.Worker whose
+    tree holds pid, following a reparented CI test app to the job that launched it, else None."""
+    parent = {pid: ppid for pid, ppid, _, _, _ in rows}
+    workers = {pid: (m.group(1) if (m := RUNNER_DIR_RE.search(comm)) else "runner")
+               for pid, _, _, _, comm in rows if comm.endswith("Runner.Worker")}
+    workers.setdefault(job_root, "this job")
+
+    def owner(pid: int) -> int | None:
+        seen = 0
+        while pid > 1 and seen < 256:
+            if pid in workers:
+                return pid
+            if test_app_owners and test_app_owners.get(pid) in workers:
+                return test_app_owners[pid]
+            pid = parent.get(pid, 0)
+            seen += 1
+        return None
+
+    return workers, owner
+
+
+def job_rss_kib(rows: list[tuple[int, int, float, str, str]], rss: dict[int, int], job_root: int,
+                skip: set[int], test_app_owners: dict[int, int] | None = None) -> int | None:
+    """Resident KiB of this job's tree right now (its Runner.Worker, everything under it and its reparented CI test
+    app), the same tree classify counts as the job's cores; None when ps gave no nonzero RSS for any of it (a zombie
+    shows 0, as the whole tree can while its Runner.Worker exits), so an unknown reading is never a 0."""
+    _, owner = job_owners(rows, job_root, test_app_owners)
+    mine = [rss[pid] for pid, _, _, _, _ in rows
+            if pid not in skip and rss.get(pid, 0) > 0 and owner(pid) == job_root]
+    return sum(mine) if mine else None
 
 
 def load_average() -> float | None:
@@ -5660,11 +5682,15 @@ class JobSamples:
         self.disk_free_end: float | None = None
         # and the lowest sampled while it ran (DISK_JOB_PEAK_GIB's evidence: its peak is start minus min)
         self.disk_free_min: float | None = None
+        # the largest resident KiB of the job's tree at any sample (from the ps pass the cores already read)
+        self.rss_peak_kib: int | None = None
 
     def add(self, load: float | None, split: tuple[float, float, float, dict[str, float], dict[str, float]],
             interval: float, queue: tuple[int, int] | None = None, disk: float | None = None,
-            busy: float | None = None, free: float | None = None) -> None:
+            busy: float | None = None, free: float | None = None, rss_kib: int | None = None) -> None:
         job, others, outside, by_outside, by_runner = split
+        if rss_kib is not None:
+            self.rss_peak_kib = rss_kib if self.rss_peak_kib is None else max(self.rss_peak_kib, rss_kib)
         if free is not None and math.isfinite(free):
             self.disk_free_min = free if self.disk_free_min is None else min(self.disk_free_min, free)
         if queue is not None:
@@ -5734,6 +5760,9 @@ class JobSamples:
             "disk_free_end_gib": None if self.disk_free_end is None else round(self.disk_free_end, 1),
             # the volume's, so other jobs' writes count too: the peak this job saw is start minus min
             "disk_free_min_gib": None if self.disk_free_min is None else round(self.disk_free_min, 1),
+            # the job tree's summed RSS at its largest sample (every sample_seconds, so a shorter spike can be
+            # missed); null when no sample read it
+            "rss_peak_mib": None if self.rss_peak_kib is None else round(self.rss_peak_kib / 1024, 1),
             "verdict": "contended" if reasons else "clear", "reasons": reasons,
         }
 
@@ -5928,7 +5957,8 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
         while True:
             sampled_at = time.monotonic()
             try:
-                rows = ps_rows()
+                rss: dict[int, int] = {}
+                rows = ps_rows(rss)
                 skip = {os.getpid()} | {pid for pid, ppid, _, _, _ in rows if ppid == os.getpid()}
                 queue = run_queue()
                 disk_busy = host_io()
@@ -5938,7 +5968,8 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
                              if any(os.path.basename(row[4]) == "cmux DEV" for row in rows) else {})
                 split = classify(rows, watch_pid, skip, test_apps)
                 samples.add(load_average(), split, interval, queue, *disk_busy,
-                            free=free_or_none(disk_path) if disk_path else None)
+                            free=free_or_none(disk_path) if disk_path else None,
+                            rss_kib=job_rss_kib(rows, rss, watch_pid, skip, test_apps))
                 if dynamic_units > 1 and dynamic_total > 1:
                     now = time.monotonic()
                     job_cores = split[0]

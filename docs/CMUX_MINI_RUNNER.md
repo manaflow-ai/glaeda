@@ -229,7 +229,9 @@ What `--apply` does:
      of the cores, or uninterruptible waits averaged at least 4 and 30% of the cores. When the
      job ends it appends one line to `~/Library/Logs/glaeda-cmux-jobs.jsonl`
      (`glaeda-cmux-job/v1`): load mean and max, host CPU busy %, disk MB/s, the run queue,
-     mean cores per bucket, the top five
+     mean cores per bucket, `rss_peak_mib` (the job tree's summed resident memory at its largest
+     sample, read from the same `ps` pass as the cores, so a spike shorter than the sample period
+     can be missed; null when no sample read it), the top five
      outside processes by estimated core-seconds, the other runner jobs seen, and a
      `contended` or `clear` verdict with its reasons. Processes are named by the kernel's
      executable name (`ucomm`, never argv) and user only. The log keeps its newest half past 16 MiB
