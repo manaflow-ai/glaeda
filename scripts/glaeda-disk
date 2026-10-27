@@ -413,6 +413,10 @@ class Family:
     # Past this idle age the checkouts inside an item are mirrors (a GitHub clone, a laptop's synced tree)
     # and no git check keeps it; process, socket and job-marker checks still do.
     mirror_idle_hours: float | None = None
+    # mirror_idle_hours applies only to the items named with one of these prefixes (empty: every item), never to one
+    # in mirror_exclude (a warm tree kept by role)
+    mirror_include: tuple[str, ...] = ()
+    mirror_exclude: tuple[str, ...] = ()
     platform: str = "unknown"  # macos | linux | shared | unknown; reporting only, never deletion authority
 
 
@@ -3530,6 +3534,22 @@ HQ_CACHE_FAMILY = "hq-build-fleet-cache"
 # window archive_mirror bundles those into ~/archive and the tree goes (Leo, 2026-10-26: "When have we ever had
 # something useful greater than 12 hours?").
 CMUX_JOB_MIRROR_HOURS = DEFAULT_AGE_HOURS
+# The same 12 h hygiene rule, on a CI mini (hygiene_mirror_host), for the trees no person works in that a git check
+# kept forever (cmux13s, 2026-10-27: 16 GiB cache/ios-workspaces read "git-checkout", 3.6 GiB split-spring-apps
+# idle 85 h and cua build-src-* idle 102 h read "unchecked", ~/Library/Caches/cmux-ci "unchecked"): the fleet
+# cache's entries, the CUA client's build trees and the cmux* trees in ~/Library/Caches. Past 12 h idle,
+# archive_mirror bundles every unpushed commit and local-only ref into ~/archive first; uncommitted work, a process,
+# an open file, a lease or a running job's command line keeps the tree. Warm compile caches stay by role:
+# cmux-next-ci, cmux-nightly-next and the fleet's xcode/ tree are other families, and cmux-release-support (a release
+# builder's warm depot_tools, ghostty and cmux trees) is NEVER_DELETE. HYGIENE_MIRROR_KEEP names them again for
+# library-caches, so no split, skip list or flag change ever lets the rule reach one.
+HYGIENE_MIRROR_KEEP = (CMUX_NEXT_CI_ROOT, NIGHTLY_NEXT_ROOT, "cmux-release-support", "cmux-ci-media")
+
+
+def hygiene_mirror_host() -> bool:
+    """The 12 h mirror rule for fleet-artifacts, cua-cache and ~/Library/Caches/cmux*: a fleet mini (macOS) whose
+    user runs enrolled CI runners, never an interactive Mac or a devbox."""
+    return DARWIN and ROLE == "fleet-mini" and bool(enrolled_runners())
 
 
 def transcript_candidates(root: Path, archives: bool = False) -> list[Path]:
@@ -3576,6 +3596,7 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
     uid = os.getuid()
     projects = HOME / "Projects"
     wt_roots = worktree_roots(projects)
+    mirror_host = role == "fleet-mini" and hygiene_mirror_host()
     fams = [
         Family("xcode-derived-data", HOME / "Library/Developer/Xcode/DerivedData", True,
                "next xcodebuild rebuilds it", owner="Xcode, per checkout", rebuild_minutes=15,
@@ -3608,6 +3629,8 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
                skip=("cmux-job", "huggingface", "codex-runtimes"), skip_prefixes=("glaeda",),
                owner="tools (XDG cache)", rebuild_minutes=5, pressure_only=role == "devbox", platform=host_cache_platform()),
         Family("library-caches", HOME / "Library/Caches", True, "the app re-downloads or rebuilds it",
+               mirror_idle_hours=CMUX_JOB_MIRROR_HOURS if mirror_host else None, mirror_include=("cmux",),
+               mirror_exclude=HYGIENE_MIRROR_KEEP,
                # glaeda: OTA candidates and LAN seed stages; PassKit: web service cookies; tidy-branches:
                # a deletion receipt; the rest are Apple daemons without the com.apple. prefix
                skip=("glaeda", "cmux-next-ci", "PassKit", "tidy-branches", "CloudKit", "GeoServices", "FamilyCircle",
@@ -3623,7 +3646,8 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
                min_idle_hours=DEFAULT_AGE_HOURS, owner="CUA recorder", rebuild_minutes=2, platform="macos"),
         Family("cua-cache", HOME / "Library/Caches/cmux/cmux-cua", True,
                "the CUA client rebuilds its frame cache", depth=1, files=True,
-               min_idle_hours=DEFAULT_AGE_HOURS, owner="cmux CUA", rebuild_minutes=1, platform="macos"),
+               min_idle_hours=DEFAULT_AGE_HOURS, mirror_idle_hours=CMUX_JOB_MIRROR_HOURS if mirror_host else None,
+               owner="cmux CUA", rebuild_minutes=1, platform="macos"),
         # Sealed caches (cache_layout) anywhere else in the home directory: ~/.npm/_cacache,
         # ~/.bun/install/cache, ~/.cargo/registry, ~/go/pkg/mod, rustup toolchains. Found by content,
         # so a tool this list never heard of is covered once its cache has a recognized layout.
@@ -3680,6 +3704,7 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
                                "the fleet worker rebuilds or fetches the artifact", depth=1,
                                files=True, allow_stale_protected=True, stale_before=ARTIFACT_CUTOFF,
                                reference_root=FLEET_ROOT, owner="cmux fleet worker", rebuild_minutes=8,
+                               mirror_idle_hours=CMUX_JOB_MIRROR_HOURS if mirror_host else None,
                                platform="macos"))
         ci_ios = FLEET_ROOT / "ci-ios"
         if ci_ios.is_dir():
@@ -4724,6 +4749,9 @@ def derived_data(fam: Family, path: Path) -> bool:
 def mirror_due(fam: Family, path: Path, idle_hours: float) -> bool:
     """A mirror family's item idle past its mirror age: it goes once archive_mirror has bundled what is unpushed."""
     return (fam.mirror_idle_hours is not None and idle_hours >= fam.mirror_idle_hours
+            and (not fam.mirror_include or path.name.startswith(fam.mirror_include))
+            and path.name not in fam.mirror_exclude
+            and (not (fam.files or fam.mirror_include) or (path.is_dir() and not path.is_symlink()))  # trees only
             and not derived_data(fam, path))
 
 
@@ -6058,6 +6086,41 @@ def mirror_repos(path: Path) -> tuple[str, dict[str, Path], list[Path]]:
     return "", gitdirs, sorted(trees)
 
 
+MOUNT_WALK_BUDGET = 2_000_000  # entries; a mirror too large to walk stays
+
+
+def mount_below(path: Path, budget: int = MOUNT_WALK_BUDGET) -> str:
+    """Why a mirror item must stay because remove() could reach another filesystem through it ("" when none can):
+    a directory below it on another device, one it cannot read (it could hide a mount that a later remove() would
+    reach once it is readable), or more than budget entries to look at."""
+    try:
+        dev = path.lstat().st_dev
+    except OSError as e:
+        return f"unreadable: {e.__class__.__name__}"
+    stack = [os.fspath(path)] if path.is_dir() and not path.is_symlink() else []
+    while stack:
+        try:
+            with os.scandir(stack.pop()) as it:
+                for e in it:
+                    budget -= 1
+                    if budget < 0:
+                        return "too large to rule out another filesystem mounted below it"
+                    if not e.is_dir(follow_symlinks=False):
+                        continue
+                    if e.stat(follow_symlinks=False).st_dev != dev:
+                        return f"another filesystem is mounted below it ({os.path.relpath(e.path, path)})"
+                    stack.append(e.path)
+        except OSError as e:
+            return f"unreadable below it: {e.__class__.__name__}"
+    return ""
+
+
+def mount_below_why(why: str) -> str:
+    """why when it is one of mount_below's answers (a tree kept for what is below it, not a failed bundle), else ""."""
+    return why if why.startswith(("another filesystem is mounted below it", "too large to rule out another",
+                                  "unreadable below it", "unreadable: ")) else ""
+
+
 def archive_mirror(path: Path) -> tuple[str, list[Path], tuple]:
     """Before a mirror item goes: bundle_unpushed for every repository mirror_repos finds. A tree with
     uncommitted work, or whose repositories cannot all be found or bundled, is kept.
@@ -6065,6 +6128,8 @@ def archive_mirror(path: Path) -> tuple[str, list[Path], tuple]:
     none: tuple = ([], [], [], {}, None)
     why, gitdirs, trees = mirror_repos(path)
     if why:
+        return why, [], none
+    if (why := mount_below(path)):  # a mirror is git_exempt, so git_state's nested-filesystem check never ran
         return why, [], none
     snap = mirror_git_snapshot(list(gitdirs.values()), trees)
     tips = mirror_tips(path, gitdirs)  # what the bundles and the servers cover, for mirror_rename_recheck
@@ -6105,6 +6170,8 @@ def mirror_moved(fam: Family, path: Path, recheck: tuple) -> str:
     if in_cwd(os.fspath(path), open_index(opened)) or named_by(os.fspath(path), cmds) or holds_socket(path) \
             or job_busy(fam, path):
         return "in use while its git work was bundled"
+    if (why := mount_below(path)):  # read again last: a mount may have appeared while the work was bundled
+        return why
     return ""
 
 
@@ -8570,9 +8637,10 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
         elif mirror_due(fam, p, idle_now) and (bundled := archive_mirror(p))[0]:
             # never deleted without a verified bundle of what is unpushed; uncommitted work no bundle holds
             dirty = bundled[0].startswith("uncommitted: ")
-            outcome = "blocked:uncommitted" if dirty else "blocked:bundle-failed"
+            mounted = bundled[0] == mount_below_why(bundled[0])
+            outcome = "blocked:uncommitted" if dirty else "blocked:mount" if mounted else "blocked:bundle-failed"
             i.reasons.append(bundled[0])
-            if not dirty:
+            if not dirty and not mounted:
                 RUN.setdefault("bundle_failed", []).append(i.path)
                 print(f"glaeda-disk: ALERT: kept {i.path}: bundling its unpushed git work failed: {bundled[0]}",
                       file=sys.stderr)

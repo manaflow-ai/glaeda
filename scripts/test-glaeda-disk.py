@@ -8595,6 +8595,189 @@ class CaptureDedupeTest(unittest.TestCase):
         self.assertTrue(all(p.read_bytes() == d for p, d in frames.items()))
 
 
+class HygieneMirrorTest(unittest.TestCase):
+    """The 12 h hygiene rule on a CI mini: fleet cache entries, CUA build trees and ~/Library/Caches/cmux* idle past
+    12 h go once their unpushed commits are bundled into ~/archive; a process in one keeps it (cmux13s, 2026-10-27)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(os.path.realpath(self.tmp.name))
+        self.saved = (gd.HOME, gd.FLEET_ROOT, gd.DARWIN, gd.ROLE)
+        gd.HOME, gd.FLEET_ROOT, gd.DARWIN, gd.ROLE = self.home, self.home / "shared-fleet", True, "fleet-mini"
+        gd._DISCOVERED.clear()
+        (gd.FLEET_ROOT / "cache").mkdir(parents=True)
+        self.env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+
+    def tearDown(self) -> None:
+        gd.HOME, gd.FLEET_ROOT, gd.DARWIN, gd.ROLE = self.saved
+        gd._DISCOVERED.clear()
+        self.tmp.cleanup()
+
+    def checkout(self, tree: Path) -> Path:
+        """A clone with a commit no remote holds, idle 26 h."""
+        repo = tree / "work"
+        subprocess.run(["git", "init", "-q", str(repo)], check=True, env=self.env)
+        (repo / "f").write_text("x")
+        subprocess.run(["git", "-C", str(repo), "add", "f"], check=True, env=self.env)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "local only"], check=True, env=self.env)
+        (tree / "build.o").write_bytes(b"o" * 4096)
+        t = time.time() - 26 * 3600
+        for dirpath, dirnames, filenames in os.walk(tree):
+            for n in dirnames + filenames:
+                os.utime(os.path.join(dirpath, n), (t, t), follow_symlinks=False)
+        os.utime(tree, (t, t))
+        return repo
+
+    def families(self, runners: bool = True) -> dict[str, gd.Family]:
+        with mock.patch.object(gd, "enrolled_runners", return_value=[self.home / "actions-runner"] if runners else []):
+            return {f.id: f for f in gd.default_families()
+                    if f.id in ("fleet-artifacts", "cua-cache", "library-caches")}
+
+    def survey(self, fam: gd.Family, cmds: str = "", opened: list[str] | None = None) -> dict[str, gd.Item]:
+        with mock.patch.object(gd, "process_evidence", return_value=(opened or [], cmds)):
+            return {Path(i.path).name: i for i in gd.survey([fam], 24, 0)}
+
+    def test_an_idle_tree_with_unpushed_commits_is_bundled_then_removed(self) -> None:
+        tree = gd.FLEET_ROOT / "cache/ios-workspaces"
+        self.checkout(tree)
+        fam = self.families()["fleet-artifacts"]
+        self.assertEqual(fam.mirror_idle_hours, gd.DEFAULT_AGE_HOURS)
+        item = self.survey(fam)["ios-workspaces"]
+        self.assertEqual(item.verdict, "reclaimable", item.reasons)
+        self.assertTrue(any("mirrors" in r for r in item.reasons))
+        receipt = self.home / "receipt.jsonl"
+        with contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            gd.apply([item], {fam.id: fam}, receipt, None, 24)
+        self.assertFalse(tree.exists())
+        bundles = sorted((self.home / "archive/glaeda-disk").glob("*.bundle"))
+        self.assertEqual(len(bundles), 1)
+        heads = subprocess.run(["git", "bundle", "list-heads", str(bundles[0])], capture_output=True, text=True,
+                               check=True).stdout
+        self.assertIn("refs/heads/", heads)
+
+    def test_a_tree_with_a_process_in_it_is_kept(self) -> None:
+        tree = gd.HOME / "Library/Caches/cmux/cmux-cua/build-src-abc"
+        repo = self.checkout(tree)
+        fam = self.families()["cua-cache"]
+        self.assertEqual(self.survey(fam)["build-src-abc"].verdict, "reclaimable")
+        item = self.survey(fam, opened=[f"{repo}"])["build-src-abc"]
+        self.assertEqual(item.verdict, "in-use", item.reasons)
+        # a process that starts after the survey keeps it at apply's fresh evidence, before any bundle goes
+        idle = self.survey(fam)["build-src-abc"]
+        receipt = self.home / "receipt.jsonl"
+        with contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(gd, "process_evidence", return_value=([], f"swift build --package-path {repo}\n")):
+            gd.apply([idle], {fam.id: fam}, receipt, None, 24)
+        self.assertTrue((repo / ".git").is_dir())
+        self.assertIn("changed:in-use", receipt.read_text())
+
+    def test_only_cmux_library_caches_and_never_a_warm_tree_kept_by_role(self) -> None:
+        caches = gd.HOME / "Library/Caches"
+        for name in ("cmux-ci", "cmux-release-support", "org.example.tool"):
+            self.checkout(caches / name)
+        items = self.survey(self.families()["library-caches"])
+        self.assertEqual(items["cmux-ci"].verdict, "reclaimable", items["cmux-ci"].reasons)
+        self.assertNotIn("cmux-release-support", items)  # NEVER_DELETE: a release builder's warm trees
+        self.assertEqual(items["org.example.tool"].verdict, "git-checkout")
+
+    def test_warm_caches_kept_by_role_never_take_the_rule_even_unsplit(self) -> None:
+        """cmux-nightly-next is a library-caches item while its split is off: the rule must still pass it by, as it
+        does cmux-next-ci, cmux-release-support and cmux-ci-media."""
+        caches = gd.HOME / "Library/Caches"
+        for name in gd.HYGIENE_MIRROR_KEEP:
+            self.checkout(caches / name)
+        policy = {**gd.POLICY, "nightly_next_dedicated_label": ""}
+        with mock.patch.object(gd, "POLICY", policy):
+            fam = self.families()["library-caches"]
+            self.assertNotIn(gd.NIGHTLY_NEXT_ROOT, fam.skip)
+            items = self.survey(fam)
+        for name in gd.HYGIENE_MIRROR_KEEP:
+            self.assertFalse(gd.mirror_due(fam, caches / name, 999.0), name)
+            if name in items:
+                self.assertNotEqual(items[name].verdict, "reclaimable", (name, items[name].reasons))
+
+    def test_a_lone_file_never_takes_the_rule_and_still_goes_by_age(self) -> None:
+        caches = gd.HOME / "Library/Caches"
+        caches.mkdir(parents=True)
+        (caches / "cmux-notes.txt").write_text("x")
+        self.assertFalse(gd.mirror_due(self.families()["library-caches"], caches / "cmux-notes.txt", 999.0))
+        files = {"fleet-artifacts": gd.FLEET_ROOT / "cache/old.tar", "cua-cache": gd.HOME / "Library/Caches/cmux/cmux-cua/f.bin"}
+        t = time.time() - 26 * 3600
+        for fid, f in files.items():
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_bytes(b"x" * 4096)
+            os.utime(f, (t, t))
+            fam = self.families()[fid]
+            self.assertFalse(gd.mirror_due(fam, f, 26.0), fid)
+            item = self.survey(fam)[f.name]
+            self.assertEqual(item.verdict, "reclaimable", (fid, item.reasons))
+            receipt = self.home / f"{fid}.jsonl"
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    mock.patch.object(gd, "process_evidence", return_value=([], "")):
+                gd.apply([item], {fam.id: fam}, receipt, None, 24)
+            self.assertFalse(f.exists(), (fid, receipt.read_text()))
+
+    def test_another_filesystem_below_a_mirror_keeps_it(self) -> None:
+        tree = gd.FLEET_ROOT / "cache/split-spring-apps"
+        (tree / "apps/vol").mkdir(parents=True)
+        fam = self.families()["fleet-artifacts"]
+        self.assertEqual(gd.mount_below(tree), "")
+        self.assertIn("too large", gd.mount_below(tree, budget=1))
+        real_scandir = os.scandir
+
+        class Entry:  # a DirEntry whose directory sits on another device
+            def __init__(self, e):
+                self._e, self.name, self.path = e, e.name, e.path
+
+            def is_dir(self, follow_symlinks=True):
+                return self._e.is_dir(follow_symlinks=follow_symlinks)
+
+            def stat(self, follow_symlinks=True):
+                st = self._e.stat(follow_symlinks=follow_symlinks)
+                return os.stat_result((st.st_mode, st.st_ino, st.st_dev + 1, *tuple(st)[3:])) \
+                    if self.name == "vol" else st
+
+        @contextlib.contextmanager
+        def scandir(path):
+            with real_scandir(path) as it:
+                yield [Entry(e) for e in it]
+        with mock.patch.object(gd.os, "scandir", scandir):
+            self.assertEqual(gd.mount_below(tree), "another filesystem is mounted below it (apps/vol)")
+        t = time.time() - 26 * 3600
+        for d in (tree / "apps/vol", tree / "apps", tree):
+            os.utime(d, (t, t))
+        item = self.survey(fam)["split-spring-apps"]
+        self.assertEqual(item.verdict, "reclaimable", item.reasons)
+        receipt = self.home / "receipt.jsonl"
+        with mock.patch.object(gd, "mount_below", return_value="another filesystem is mounted below it (apps/vol)"), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            gd.apply([item], {fam.id: fam}, receipt, None, 24)
+        self.assertTrue((tree / "apps/vol").is_dir())
+        self.assertIn("blocked:mount", receipt.read_text())
+        # an unreadable directory below it could hide a mount: inconclusive keeps it
+        os.chmod(tree / "apps/vol", 0)
+        try:
+            self.assertIn("unreadable below it", gd.mount_below(tree))
+            self.assertTrue(gd.archive_mirror(tree)[0])  # mirror_repos or mount_below refuses it, never a bundle
+        finally:
+            os.chmod(tree / "apps/vol", 0o755)
+        # and a mount that appears while the work is bundled keeps it at mirror_moved
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "mount_below", return_value="another filesystem is mounted below it (x)"):
+            self.assertIn("another filesystem", gd.mirror_moved(fam, tree, ([], [], [], {}, None)))
+
+    def test_off_where_no_ci_runner_is_enrolled(self) -> None:
+        (gd.HOME / "Library/Caches/cmux/cmux-cua").mkdir(parents=True)
+        fams = self.families(runners=False)
+        self.assertEqual({fid: f.mirror_idle_hours for fid, f in fams.items()},
+                         {"fleet-artifacts": None, "cua-cache": None, "library-caches": None})
+        self.checkout(gd.FLEET_ROOT / "cache/ios-workspaces")
+        self.assertEqual(self.survey(fams["fleet-artifacts"])["ios-workspaces"].verdict, "git-checkout")
+
+
 class NightlyNextFallbackTest(unittest.TestCase):
     """~/Library/Caches/cmux-nightly-next: the dedicated builder's tree is kept by role, a pool runner's goes once idle
     DEFAULT_AGE_HOURS, and nothing changes until disk-policy names the routing label."""
