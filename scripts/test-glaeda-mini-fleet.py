@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import unittest
 from pathlib import Path
@@ -1669,7 +1670,7 @@ class PreflightTests(unittest.TestCase):
             self.assertEqual(script.count("/opt/homebrew/bin/brew"), 1, script)  # no brew call skips brew_as
             subprocess.run(["bash", "-n"], input=script, text=True, check=True)
         # Run as the Homebrew owner (inside sudo -u), so it may signal what brew starts.
-        self.assertIn('brew_as() { sudo -H -u admin /usr/bin/perl -e "$brew_bound"',
+        self.assertIn('brew_as() { local rc=0; sudo -H -u admin /usr/bin/perl -e "$brew_bound"',
                       "\n".join(mf.brew_commands("admin", ["git"], True, True)))
         bound = ["perl", "-e", mf.BREW_BOUND]
         # Under the limit: the command's own exit code, and its signal as 128+N.
@@ -1696,6 +1697,41 @@ class PreflightTests(unittest.TestCase):
             else:
                 os.kill(child, 9)
                 self.fail(f"the bound left pid {child} running")
+
+    def test_a_brew_timeout_ends_the_homebrew_step_with_124_wherever_brew_runs(self) -> None:
+        # brew_as runs in `if !`, in a command substitution and behind `|| true`-style tests; a timeout in any of
+        # them must still fail the step with 124, never read as "not installed" or a plain failure.
+        fake = textwrap.dedent("""\
+            #!/bin/sh
+            case "$*" in
+              *"$HANG"*) exec sleep 300 ;;
+              "--cache") echo "$HOME/cache" ;;
+              "list --versions"*) exit 1 ;;
+            esac
+            exit 0
+            """)
+        with tempfile.TemporaryDirectory() as tmp:
+            brew = Path(tmp) / "opt" / "homebrew" / "bin" / "brew"  # this machine may have a real /opt/homebrew
+            brew.parent.mkdir(parents=True)
+            brew.write_text(fake)
+            brew.chmod(0o755)
+            (Path(tmp) / mf.BREW_STAGE).mkdir(parents=True)
+            (Path(tmp) / mf.BREW_STAGE / "bottle.tar.gz").write_text("")
+            with mock.patch.object(mf, "BREW_COMMAND_TIMEOUT", 1):
+                lines = mf.brew_commands("builder", ["git"], False)
+            script = "\n".join(["set -euo pipefail", *lines]).replace("/opt/homebrew", f"{tmp}/opt/homebrew")
+            for hang in ("--cache", "list --pinned", "list --versions", "install git", "link git"):
+                started = time.monotonic()
+                run = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60,
+                                     env={"PATH": os.environ["PATH"], "HOME": tmp, "HANG": hang})
+                self.assertEqual(run.returncode, 124, (hang, run.stdout, run.stderr))
+                self.assertLess(time.monotonic() - started, 30, hang)
+                if hang in ("--cache", "install git", "link git"):  # the list calls send stderr to /dev/null
+                    self.assertIn("timed out after 1s", run.stderr, hang)
+            # Nothing hangs: the step runs to the end.
+            run = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60,
+                                 env={"PATH": os.environ["PATH"], "HOME": tmp, "HANG": "never"})
+            self.assertEqual(run.returncode, 0, (run.stdout, run.stderr))
         self.assertEqual(self.result(preflight_text(git=None))["ready"], True)  # no policy: an old probe is fine
 
     def test_the_preflight_probe_runs_the_workloads_git(self) -> None:

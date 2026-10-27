@@ -2818,11 +2818,16 @@ RUSTUP_PROXIES = ("cargo", "rustc", "rustdoc", "rustup")
 BREW_STAGE = "Library/Caches/glaeda/share/homebrew/downloads"  # under the login user's home; see share brew
 # Every brew command the Homebrew step runs has a hard limit, enforced on the host: an ssh timeout on this side
 # stops nothing there, and sudo-plan --run has none. A `brew install git` once sat 8 h 15 min with no socket open.
-# At the limit the command, its process group and every descendant get SIGTERM, then SIGKILL 10 s later
-# (Homebrew starts curl in a process group of its own, so the group alone is not enough); the step exits 124.
+# At the limit BREW_BOUND stops the command and everything it started (below), and brew_as ends the step with 124.
 BREW_COMMAND_TIMEOUT = 1800
+BREW_TIMED_OUT = 124
 # The bound, in perl because a mini has no timeout(1) and maybe no Python. It runs as the Homebrew owner, inside
-# sudo -u, so it can signal everything brew starts. argv: SECONDS COMMAND [ARG...].
+# sudo -u, so it can signal what brew starts and nothing of root's. argv: SECONDS COMMAND [ARG...].
+# The command starts in a process group of its own. At the limit the bound collects that group, every process
+# group any member leads or belongs to (Homebrew starts curl in a group of its own) and every descendant, sends
+# SIGTERM to each group and process, and 10 s later SIGKILL to what a fresh look still finds in those groups or
+# under them: a pid reused in between is in none of them, so it is never signalled. Its own group is never one.
+# Under the limit the command's exit code passes through (a signal as 128+N); at the limit it exits 124.
 BREW_BOUND = r"""
 use strict; use warnings; use POSIX ();
 my $limit = shift @ARGV;
@@ -2832,21 +2837,39 @@ if (!$pid) { setpgrp(0, 0); exec { $ARGV[0] } @ARGV; die "exec $ARGV[0]: $!\n"; 
 my $status;
 eval { local $SIG{ALRM} = sub { die "limit\n" }; alarm $limit; waitpid($pid, 0); $status = $?; alarm 0; };
 exit($status & 127 ? 128 + ($status & 127) : $status >> 8) if defined $status;
-sub tree {
-  my (%kids, %group, %seen);
-  open(my $ps, "-|", "ps", "-A", "-o", "pid=,ppid=,pgid=") or return ($pid);
-  while (<$ps>) { my ($p, $pp, $g) = split; next unless defined $g; push @{$kids{$pp}}, $p; push @{$group{$g}}, $p; }
-  close($ps);
-  my @todo = ($pid);
-  while (@todo) { my $p = shift @todo; next if $p == $$ || $seen{$p}++; push @todo, @{$kids{$p} || []}, @{$group{$p} || []}; }
+my $mine = getpgrp();
+my %groups = ($pid => 1);
+sub look {  # the processes in %groups or under them, adding the groups they are in; () when ps fails
+  my (%kids, %pgid, @rows);
+  eval {
+    local $SIG{ALRM} = sub { die "ps\n" }; alarm 30;
+    open(my $ps, "-|", "ps", "-A", "-o", "pid=,ppid=,pgid=") or die "ps\n";
+    @rows = map { [split] } <$ps>;
+    close($ps) or die "ps\n";
+    alarm 0;
+  } or do { alarm 0; return (); };
+  for (@rows) { my ($p, $pp, $g) = @$_; next unless defined $g; push @{$kids{$pp}}, $p; $pgid{$p} = $g; }
+  my %seen;
+  for (my $grown = 1; $grown;) {
+    $grown = 0;
+    my @todo = ((grep { $groups{$pgid{$_}} } keys %pgid), keys %seen);
+    while (@todo) {
+      my $p = shift @todo;
+      next if $p == $$ || $seen{$p}++;
+      push @todo, @{$kids{$p} || []};
+    }
+    for (keys %seen) { my $g = $pgid{$_}; if (defined $g && $g != $mine && !$groups{$g}++) { $grown = 1; } }
+  }
   return keys %seen;
 }
-my %all = map { $_ => 1 } tree();
-print STDERR "timed out after ${limit}s: stopping $ARGV[0] and its processes (" . join(" ", sort keys %all) . ")\n";
-kill "TERM", keys %all;
+my @first = look();
+print STDERR "timed out after ${limit}s: stopping $ARGV[0] (groups " . join(" ", sort keys %groups) . ")\n";
+kill "TERM", -$_ for keys %groups;
+kill "TERM", @first;
 for (1 .. 20) { last if waitpid($pid, POSIX::WNOHANG()) == $pid; select(undef, undef, undef, 0.5); }
-$all{$_} = 1 for tree();
-kill "KILL", keys %all;
+my @left = look();
+kill "KILL", -$_ for keys %groups;
+kill "KILL", @left;
 waitpid($pid, 0);
 exit 124;
 """.strip()
@@ -3160,9 +3183,12 @@ def brew_commands(owner: str, formulas: list[str], as_owner: bool, as_root: bool
     root = "sudo " if as_owner and not as_root else ""
     # Newer Homebrew asks before installing unless told not to; sudo drops the variable, so env sets it.
     # BREW_BOUND caps every brew command at BREW_COMMAND_TIMEOUT, so the step can never hang for hours.
+    # A command that reached the limit ends the step with 124 even where its status is otherwise tested or ignored.
     lines = [f"brew_bound={shlex.quote(BREW_BOUND)}",
-             f'brew_as() {{ {run}/usr/bin/perl -e "$brew_bound" {BREW_COMMAND_TIMEOUT} '
-             'env HOMEBREW_NO_ASK=1 /opt/homebrew/bin/brew "$@"; }',
+             f'brew_as() {{ local rc=0; {run}/usr/bin/perl -e "$brew_bound" {BREW_COMMAND_TIMEOUT} '
+             'env HOMEBREW_NO_ASK=1 /opt/homebrew/bin/brew "$@" || rc=$?; '
+             f'if [ "$rc" = {BREW_TIMED_OUT} ]; then echo "brew $1: timed out after {BREW_COMMAND_TIMEOUT}s" >&2; '
+             f'exit {BREW_TIMED_OUT}; fi; return "$rc"; }}',
              # Bottles glaeda-mini-fleet share brew staged from a peer; brew checks their digests before use.
              f'staged="${{login_home:-$HOME}}/{BREW_STAGE}"',
              'if [ -n "$(ls "$staged" 2>/dev/null)" ]; then',
@@ -3173,7 +3199,9 @@ def brew_commands(owner: str, formulas: list[str], as_owner: bool, as_root: bool
              *([f'  {root}chown -h {owner} "$cache"/*'] if as_owner else []),
              "fi",
              # A pinned formula stays as it is: upgrading it would change the toolchain its class receipt names.
-             'pinned=" $({ brew_as list --pinned 2>/dev/null || true; } | tr "\\n" " ") "',
+             # Not `|| true` inside the substitution: that would hide a timeout (brew_as's exit leaves only the subshell).
+             f'pinned_list=$(brew_as list --pinned 2>/dev/null) || {{ [ $? != {BREW_TIMED_OUT} ] || exit {BREW_TIMED_OUT}; }}',
+             'pinned=" $(printf "%s" "$pinned_list" | tr "\\n" " ") "',
              f"for f in {' '.join(formulas)}; do",
              '  if ! brew_as list --versions "$f" >/dev/null 2>&1; then',
              '    if ! brew_as install "$f"; then',
