@@ -1349,6 +1349,15 @@ IDLE_PR_BUILD_HOURS = float("inf")
 IDLE_SEED_HOURS = DEFAULT_AGE_HOURS
 IDLE_SWEEP_EVERY_S = 3600  # the 15-minute agent sweeps at most hourly: an apply re-measures every candidate
 IDLE_STAMP = HOME / ".cache/glaeda-disk/idle-sweep.last"
+# The runner-cache profile (glaeda-runner-hygiene's LaunchDaemon, a root-pinned copy) runs as an enrolled runner
+# account, the same HOME as that account's disk-pressure LaunchAgent. Its narrow 5-family pass keeps its own snapshot
+# and idle stamp: sharing them, its hourly sweep touched the stamp first and every full idle sweep after it said "ran
+# within the hour", and its writes to sizes.json kept that snapshot's stamp days old (cmux-austin-mini-0, 2026-10-27).
+PROFILE_SNAPSHOT = HOME / ".cache/glaeda-disk/sizes.runner-caches.json"
+PROFILE_IDLE_STAMP = HOME / ".cache/glaeda-disk/idle-sweep.runner-caches.last"
+# and its own health summary: the shared one flipped disk_unmeasured and the accounting gap with whichever job wrote
+# last. summary.json stays the disk-pressure pass's (mini-health and ci-dash read it there).
+PROFILE_HEALTH_SUMMARY = HOME / ".local/state/glaeda/disk/summary.runner-caches.json"
 FLEET_DIR = FLEET_CI.parent
 BUILD_PROCESS = re.compile(r"(^|/)(xcodebuild|SWBBuildService|XCBBuildService)(\s|$)")
 
@@ -1863,6 +1872,22 @@ def _fresh(path: Path, seconds: float) -> bool:
         return time.time() - path.stat().st_mtime < seconds
     except OSError:
         return False
+
+
+_MAIN_STATE: tuple[Path, Path, Path] | None = None
+
+
+def use_profile_state(profile: bool) -> None:
+    """Point the snapshot, the idle stamp and the health summary at the runner-cache profile's own files
+    (PROFILE_SNAPSHOT), or back at the disk-pressure pass's."""
+    global SNAPSHOT, IDLE_STAMP, HEALTH_SUMMARY, _MAIN_STATE
+    if profile:
+        if _MAIN_STATE is None:  # remembered on the way in, so a later non-profile run gets them back
+            _MAIN_STATE = (SNAPSHOT, IDLE_STAMP, HEALTH_SUMMARY)
+        SNAPSHOT, IDLE_STAMP, HEALTH_SUMMARY = PROFILE_SNAPSHOT, PROFILE_IDLE_STAMP, PROFILE_HEALTH_SUMMARY
+    elif _MAIN_STATE is not None:  # only undoes a switch: paths a caller set itself are left alone
+        SNAPSHOT, IDLE_STAMP, HEALTH_SUMMARY = _MAIN_STATE
+        _MAIN_STATE = None
 
 
 def idle_due(stamp: Path | None = None, every_s: float = IDLE_SWEEP_EVERY_S) -> bool:
@@ -6448,7 +6473,8 @@ def fresh_for_apply(known: dict[str, int], fams: list[Family]) -> dict[str, int]
     return {k: v for k, v in known.items() if not candidate_of_selected(k)}
 
 
-def load_snapshot_meta(path: Path = SNAPSHOT) -> tuple[float, dict[str, int], dict[str, float]]:
+def load_snapshot_meta(path: Path | None = None) -> tuple[float, dict[str, int], dict[str, float]]:
+    path = SNAPSHOT if path is None else path
     try:
         doc = json.loads(path.read_text())
         sizes = {k: int(v) for k, v in doc["sizes"].items()}
@@ -6460,7 +6486,7 @@ def load_snapshot_meta(path: Path = SNAPSHOT) -> tuple[float, dict[str, int], di
         return 0.0, {}, {}
 
 
-def load_snapshot(path: Path = SNAPSHOT) -> tuple[float, dict[str, int]]:
+def load_snapshot(path: Path | None = None) -> tuple[float, dict[str, int]]:
     at, sizes, _ = load_snapshot_meta(path)
     return at, sizes
 
@@ -6478,9 +6504,10 @@ def snapshot_stamp(at: float, sizes: dict[str, int], measured_at: dict[str, floa
     return at or None
 
 
-def save_snapshot(sizes: dict[str, int], path: Path = SNAPSHOT, at: float | None = None,
+def save_snapshot(sizes: dict[str, int], path: Path | None = None, at: float | None = None,
                   measured_at: dict[str, float] | None = None) -> None:
     """`at` is when the oldest size was measured; per-item times prevent stale reports starving refresh."""
+    path = SNAPSHOT if path is None else path
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(f".{os.getpid()}.tmp")
     payload = {"at": time.time() if at is None else at, "sizes": sizes}
@@ -6551,7 +6578,7 @@ def launch_background_refresh() -> bool:
     try:
         subprocess.Popen([sys.executable, os.path.abspath(__file__), "--refresh", "--top", "0",
                           "--min-mib", "0", "--refresh-budget-s", str(REFRESH_BUDGET_S),
-                          "--refresh-lock-fd", str(fd)],
+                          "--refresh-lock-fd", str(fd), *(["--runner-caches"] if RUNNER_CACHE_PROFILE else [])],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          stdin=subprocess.DEVNULL, start_new_session=True, pass_fds=(fd,))
     except (OSError, subprocess.SubprocessError):
@@ -10195,6 +10222,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
         keep_legacy_ages()
     global RUNNER_CACHE_PROFILE
     RUNNER_CACHE_PROFILE = bool(a.runner_caches)
+    use_profile_state(RUNNER_CACHE_PROFILE)
     fams = runner_cache_families() if RUNNER_CACHE_PROFILE else default_families(role)
     if RUNNER_CACHE_PROFILE and not DARWIN:
         print("runner cache profile is macOS-only; skipped")

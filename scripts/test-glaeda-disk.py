@@ -1127,6 +1127,35 @@ class GlaedaDiskTest(unittest.TestCase):
         snap.write_text("{not json")
         self.assertEqual(gd.load_snapshot(snap), (0.0, {}))
 
+    def test_the_runner_cache_profile_keeps_its_own_snapshot_and_idle_stamp(self) -> None:
+        # glaeda-runner-hygiene's pinned pass runs as the same account as its disk-pressure LaunchAgent: sharing the
+        # idle stamp, its hourly 5-family sweep made every full sweep after it skip as "ran within the hour"
+        with mock.patch.object(gd, "SNAPSHOT", gd.SNAPSHOT), mock.patch.object(gd, "IDLE_STAMP", gd.IDLE_STAMP), \
+                mock.patch.object(gd, "HEALTH_SUMMARY", gd.HEALTH_SUMMARY), mock.patch.object(gd, "_MAIN_STATE", None):
+            main = (gd.SNAPSHOT, gd.IDLE_STAMP, gd.HEALTH_SUMMARY)
+            gd.use_profile_state(False)
+            self.assertEqual((gd.SNAPSHOT, gd.IDLE_STAMP, gd.HEALTH_SUMMARY), main)
+            gd.use_profile_state(True)
+            profile = (gd.PROFILE_SNAPSHOT, gd.PROFILE_IDLE_STAMP, gd.PROFILE_HEALTH_SUMMARY)
+            self.assertEqual((gd.SNAPSHOT, gd.IDLE_STAMP, gd.HEALTH_SUMMARY), profile)
+            self.assertFalse(set(profile) & set(main))
+            gd.use_profile_state(False)  # a reset, for a library caller that runs both
+            self.assertEqual((gd.SNAPSHOT, gd.IDLE_STAMP, gd.HEALTH_SUMMARY), main)
+            gd.SNAPSHOT = self.root / "profile.json"
+            gd.save_snapshot({"/a": 1}, at=5.0)  # the default path follows the switch, not the import-time value
+            self.assertEqual(gd.load_snapshot(), (5.0, {"/a": 1}))
+
+    def test_a_profile_background_refresh_stays_in_the_profile(self) -> None:
+        launched = []
+        with mock.patch.object(gd.subprocess, "Popen", lambda argv, **_k: launched.append(argv)), \
+                mock.patch.object(gd, "SNAPSHOT", self.root / "sizes.json"):
+            for profile in (False, True):
+                with mock.patch.object(gd, "RUNNER_CACHE_PROFILE", profile):
+                    self.assertTrue(gd.launch_background_refresh())
+                gd.release_refresh_lock(gd.acquire_refresh_lock())  # the fake child holds none: free the marker
+        self.assertNotIn("--runner-caches", launched[0])
+        self.assertIn("--runner-caches", launched[1])
+
     def test_snapshot_stamp_moves_once_every_item_is_remeasured(self) -> None:
         # A fleet mini runs only --apply passes, which re-measure every item but never ran the background
         # --refresh that alone moved `at`: its sizes.json said 8 days old while every size was minutes old.

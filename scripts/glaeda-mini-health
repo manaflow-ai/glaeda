@@ -282,6 +282,8 @@ DISK_PASS_STALE_S = 26 * 3600  # glaeda-disk's LaunchAgent runs every 15 min; a 
 DISK_AGENT = "com.teamleaderleo.glaeda.disk-pressure"  # glaeda-mini-setup's 15-minute glaeda-disk pass
 DISK_CACHE = ".cache/glaeda-disk"  # glaeda-disk's sizes.json and accounting.json, under HOME
 RUNNER_HYGIENE = "com.teamleaderleo.glaeda.runner-hygiene"  # glaeda-runner-hygiene's LABEL_PREFIX (.<uid>)
+PROFILE_SNAPSHOT = "sizes.runner-caches.json"  # glaeda-disk's PROFILE_SNAPSHOT, in DISK_CACHE
+PROFILE_SUMMARY = "summary.runner-caches.json"  # glaeda-disk's PROFILE_HEALTH_SUMMARY, beside summary.json
 SYSTEM_DAEMONS = Path("/Library/LaunchDaemons")
 OTA_CONVERGE = ".local/state/glaeda/update/converge.json"  # glaeda-update's CONVERGE, under this home
 CLAUDE_ROUTES = "claude-routes.json"  # config/, beside this script or as mini-setup installs it
@@ -944,8 +946,18 @@ class Mini:
                 daemon = SYSTEM_DAEMONS / f"{label}.plist"
                 if daemon_user(daemon) == account_name():
                     installed.append((daemon, f"system/{label}"))
-        snapshots = [cache / "sizes.json", cache / "accounting.json"]
-        if not installed and not any(p.exists() for p in snapshots):
+        # the runner-cache profile alone (no disk-pressure job for this account) keeps its own snapshot, or sizes.json
+        # from a pinned copy older than that split, and writes no accounting.json by design
+        primary = any(not target.startswith(f"system/{RUNNER_HYGIENE}.") for _, target in installed)
+        summaries = [self.disk_summary(), load_json(self.home / ".local/state/glaeda/disk" / PROFILE_SUMMARY)]
+        profile = not primary and (bool(installed) or any(
+            isinstance(x, dict) and x.get("scope") == "runner-cache-profile"
+            for summary in summaries for x in summary.get("accounting") or []))
+        sizes_path = cache / "sizes.json"
+        if profile:
+            sizes_path = max((cache / PROFILE_SNAPSHOT, sizes_path), key=lambda p: mtime(p) or 0.0)
+        snapshots = [sizes_path, cache / "accounting.json"]
+        if not installed and not any(p.exists() for p in [*snapshots, cache / PROFILE_SNAPSHOT]):
             return None
         agent, last_exit = "not installed", None
         for plist, target in installed:
@@ -955,16 +967,10 @@ class Mini:
             last_exit = last.group(1).strip() if code == 0 and last else None
             if code == 0:
                 break
-        # glaeda-disk --runner-caches (the runner-cache profile) writes no accounting.json by design
-        summary = self.disk_summary()
-        profile = (any(target.startswith(f"system/{RUNNER_HYGIENE}.") for _, target in installed)
-                   or any(isinstance(x, dict) and x.get("scope") == "runner-cache-profile"
-                          for x in summary.get("accounting") or []))
-        written = {}
-        for path in snapshots:
-            with contextlib.suppress(OSError):
-                written[path.name] = path.stat().st_mtime
-        return {"sizes": load_json(snapshots[0]), "accounting": None if profile else load_json(snapshots[1]),
+        written = {name: t for name, t in (("sizes.json", mtime(snapshots[0])), ("accounting.json", mtime(snapshots[1])))
+                   if t is not None}
+        return {"sizes": load_json(snapshots[0]), "sizes_name": snapshots[0].name,
+                "accounting": None if profile else load_json(snapshots[1]),
                 "written": written, "agent": agent, "last_exit": last_exit}
 
     # ---- tailscale_no_route's restart: its gates' reads and the restart itself
@@ -1313,6 +1319,13 @@ def account_name() -> str | None:
         return None
 
 
+def mtime(path: Path) -> float | None:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
 def account_home() -> Path | None:
     """This account's real home from the password database ($HOME can be anything)."""
     try:
@@ -1350,7 +1363,7 @@ def disk_pass_times(facts: dict[str, Any]) -> dict[str, float | None]:
     # every --apply pass rewrites sizes.json, also one that re-measured nothing (an idle mini's report-only items),
     # so the file's own write time counts; a snapshot that does not parse is missing whatever its time
     sizes_at = newest_stamp([*measured.values(), sizes.get("at"), written.get("sizes.json") if sizes else None])
-    out = {"sizes.json": sizes_at}
+    out = {str(facts.get("sizes_name") or "sizes.json"): sizes_at}
     if facts.get("accounting") is not None:
         accounting = facts["accounting"] if isinstance(facts["accounting"], dict) else {}
         if not all(isinstance(r, dict) and newest_stamp([r.get("at")]) is not None for r in accounting.values()):

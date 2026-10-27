@@ -667,6 +667,18 @@ class DiskAndLeaks(Base):
             facts = mini.disk_pass()  # glaeda-runner-hygiene --user cmux: the runner-cache profile's pass job
             self.assertEqual(facts["agent"], f"system/{health.RUNNER_HYGIENE}.{mini.uid} loaded")
             self.assertIsNone(facts["accounting"])  # that profile writes no accounting.json
+            cache = Path(tmp) / ".cache/glaeda-disk"
+            cache.mkdir(parents=True)
+            (cache / "sizes.json").write_text(json.dumps({"at": 1.0, "sizes": {}}))
+            os.utime(cache / "sizes.json", (1.0, 1.0))
+            (cache / health.PROFILE_SNAPSHOT).write_text(json.dumps({"at": NOW - 60, "sizes": {}}))
+            os.utime(cache / health.PROFILE_SNAPSHOT, (NOW - 120, NOW - 120))
+            self.assertEqual(health.disk_pass_times(mini.disk_pass()), {health.PROFILE_SNAPSHOT: NOW - 60})
+            self.headless(tmp, "cmux")  # with this account's disk-pressure job too, it is a primary account
+            facts = mini.disk_pass()
+            self.assertEqual(facts["sizes_name"], "sizes.json")
+            self.assertIsNotNone(facts["accounting"])  # the profile beside it does not exempt accounting.json
+            self.assertIn("accounting.json missing", health.check_disk_pass(mini, NOW)[0]["evidence"])
 
     def test_a_malformed_snapshot_is_missing_whenever_it_was_written(self) -> None:
         for sizes, accounting in (({"junk": 1}, {"1": "x"}), ({"sizes": {}, "at": "bad"}, {"1": {"at": "bad"}}),
