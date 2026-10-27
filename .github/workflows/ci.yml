@@ -259,6 +259,8 @@ jobs:
               Path("scripts/test-fleet-cas-bundle.py"),
               Path("scripts/glaeda-seed-prefetch"),
               Path("scripts/test-glaeda-seed-prefetch.py"),
+              Path("scripts/glaeda-git-mirror"),
+              Path("scripts/test-glaeda-git-mirror.py"),
               Path("scripts/glaeda-idle-warm"),
               Path("scripts/test-glaeda-idle-warm.py"),
               Path("scripts/glaeda-mini-health"),
@@ -347,6 +349,7 @@ jobs:
           suite bash scripts/test-glaeda-fleet-cas.sh
           suite bash scripts/test-glaeda-fleet-cas-mount.sh
           suite python3 scripts/test-glaeda-seed-prefetch.py
+          suite python3 scripts/test-glaeda-git-mirror.py
           suite python3 scripts/test-glaeda-idle-warm.py
           suite python3 scripts/test-glaeda-mini-health.py
           suite python3 scripts/test-glaeda-daemon-heal.py
