@@ -1471,12 +1471,12 @@ class GlaedaDiskTest(unittest.TestCase):
         fam = gd.hq_cache_family(cache)
         self.assertEqual(fam.reference_root, self.root)
         week = gd.CMUX_JOB_MIRROR_HOURS
-        for name, hours in (("cmux-workspaces", week + 22), ("swiftpm", week + 142), ("fresh-workspaces", 72),
+        for name, hours in (("cmux-workspaces", week + 22), ("swiftpm", week + 142), ("fresh-workspaces", 6),
                             ("leased", week + 50), ("cmux-tui-target", week + 121)):
             make(cache / name, age_hours=hours)
         for name in ("cmux-workspaces", "fresh-workspaces", "leased"):
             (cache / name / "key/src/.git").mkdir(parents=True)
-            t = time.time() - (72 if name == "fresh-workspaces" else week + 22) * 3600
+            t = time.time() - (6 if name == "fresh-workspaces" else week + 22) * 3600
             for d in (cache / name / "key/src/.git", cache / name / "key/src", cache / name / "key", cache / name):
                 os.utime(d, (t, t))
         (cache / "swiftpm/repositories/dep/.git").mkdir(parents=True)
@@ -1500,9 +1500,10 @@ class GlaedaDiskTest(unittest.TestCase):
                 live = {Path(i.path).name: i.verdict for i in gd.survey([fam], 24, 0)}
         self.assertEqual({k: i.verdict for k, i in items.items()}, {
             "cmux-workspaces": "reclaimable", "swiftpm": "reclaimable", "cmux-tui-target": "reclaimable",
-            "fresh-workspaces": "git-checkout",  # idle three days: its clone still has to lose nothing
+            "fresh-workspaces": "git-checkout",  # idle 6 h, under the mirror age: its clone has to lose nothing
             "leased": "in-use"})  # a running fleet job names it
-        self.assertIn("idle 168h+: its checkouts are mirrors", items["cmux-workspaces"].reasons)
+        self.assertIn("idle 12h+: its checkouts are mirrors (unpushed commits go to a verified bundle in ~/archive "
+                      "first)", items["cmux-workspaces"].reasons)
         self.assertIn("live lease or running job", items["leased"].reasons)
         self.assertEqual({k for k, v in live.items() if v != "report-only"}, {"leased"})
         reclaim = [i for i in items.values() if i.verdict == "reclaimable"]
@@ -1515,7 +1516,11 @@ class GlaedaDiskTest(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()), mock.patch.object(gd, "owner_retired", return_value=True), \
                 mock.patch.object(gd, "family_git_state", git_state), \
                 mock.patch.object(gd, "process_evidence", return_value=late), \
-                mock.patch.object(gd, "command_lines", return_value=late[1]):
+                mock.patch.object(gd, "command_lines", return_value=late[1]), \
+                mock.patch.object(gd, "HOME", self.root / "home"), \
+                mock.patch.object(gd, "archive_mirror", return_value=("", [], ([], [], [], {}, {}))), \
+                mock.patch.object(gd, "mirror_rename_recheck", lambda p, r: None), \
+                mock.patch.object(gd, "mirror_moved", return_value=""):  # bundling: the cmux-job tests
             gd.apply(reclaim, {fam.id: fam}, receipt, None, 24)
         self.assertEqual(sorted(p.name for p in cache.iterdir()),
                          ["cmux-tui-target", "fresh-workspaces", "leased", "swiftpm"])
@@ -5544,7 +5549,7 @@ class LinuxLayoutTest(unittest.TestCase):
         # scratch clones and leaked files are judged on any filesystem, not only a tmpfs
         self.assertTrue(tmp.files and tmp.git_disposable)
 
-    def test_cmux_job_units_go_but_unpushed_checkouts_stay(self) -> None:
+    def test_cmux_job_units_go_and_unpushed_checkouts_go_to_a_bundle(self) -> None:
         job = self.home / ".cache/cmux-job"
         # as on cmux13s: SwiftPM clones inside DerivedData, and each slot's clone one level below cmux-base
         (job / "reload-cloud-ios/DerivedData/slot-1/Build").mkdir(parents=True)
@@ -5571,8 +5576,8 @@ class LinuxLayoutTest(unittest.TestCase):
             gd.process_evidence = saved
         verdicts = {Path(i.path).relative_to(self.home).as_posix(): (i.family, i.verdict) for i in items}
         self.assertEqual(verdicts[".cache/cmux-job/reload-cloud-ios/DerivedData"], ("cmux-job-cache", "reclaimable"))
-        # a commit no remote holds keeps its checkout
-        self.assertEqual(verdicts[".cache/cmux-job/reload-cloud/cmux-base"], ("cmux-job-cache", "git-checkout"))
+        # idle past 12 h: a commit no remote holds goes to a bundle, then the checkout goes
+        self.assertEqual(verdicts[".cache/cmux-job/reload-cloud/cmux-base"], ("cmux-job-cache", "reclaimable"))
         self.assertNotIn(".cache/cmux-job", verdicts)  # not listed again as a report-only tool cache
         receipt = self.home / "receipt.jsonl"
         fams_by_id = {f.id: f for f in fams}
@@ -5585,7 +5590,8 @@ class LinuxLayoutTest(unittest.TestCase):
                 gd.process_evidence = saved
         self.assertFalse((job / "reload-cloud-ios/DerivedData").exists())
         self.assertEqual([c.name for c in (job / "reload-cloud-ios").iterdir()], [])  # no half-deleted leftover
-        self.assertTrue((base / ".git").is_dir())
+        self.assertFalse(base.exists())
+        self.assertEqual(len(list((self.home / "archive/glaeda-disk").glob("*.bundle"))), 1)
         # a delete interrupted after its rename leaves a tree nothing else will ever clean up
         dead = subprocess.Popen(["true"])
         dead.wait()
@@ -5605,7 +5611,7 @@ class LinuxLayoutTest(unittest.TestCase):
             gd.process_evidence = saved
         self.assertEqual(again[str(left)], ("interrupted-deletions", "reclaimable"))
 
-    def test_idle_cmux_job_mirrors_go_after_a_week_unless_a_job_holds_them(self) -> None:
+    def test_idle_cmux_job_mirrors_go_after_12h_bundled_unless_a_job_holds_them(self) -> None:
         """2026-10-11: 107 GiB of reload-cloud trees idle since Sep 28-Oct 2 on eight minis, all kept as
         "git-checkout (checkout below the top level)", so glaeda-disk reported 0.0 G reclaimable."""
         job = self.home / ".cache/cmux-job"
@@ -5632,9 +5638,9 @@ class LinuxLayoutTest(unittest.TestCase):
             os.utime(job / rel, (t, t))
 
         age("", 8 * 24)
-        age("slots", 3 * 24)  # idle, but not a week: its local commit still keeps it
+        age("slots", 26)  # idle past 12 h and the pass window: its local commit goes to a bundle and the tree goes
         fams = [f for f in gd.default_families() if f.id == "cmux-job-cache"]
-        self.assertEqual(fams[0].mirror_idle_hours, 168.0)
+        self.assertEqual(fams[0].mirror_idle_hours, gd.DEFAULT_AGE_HOURS)
         with mock.patch.object(gd, "process_evidence",
                                return_value=([], f"rsync -a {job}/reload-cloud/work/slot-1/ x\n")):
             items = {Path(i.path).relative_to(job).as_posix(): i for i in gd.survey(fams, 24, 0)}
@@ -5644,9 +5650,10 @@ class LinuxLayoutTest(unittest.TestCase):
             "reload-cloud/work": "in-use",  # a running command names a slot in it
             "reload-cloud-ios/cmux-base": "in-use",  # its unit's work/<slot>/.lock
             "reload-cloud-ios/work": "in-use",
-            "slots/host.1": "git-checkout",
+            "slots/host.1": "reclaimable",
             "SourcePackages/host.1": "reclaimable"})
-        self.assertIn("idle 168h+: its checkouts are mirrors", items["reload-cloud/cmux-base"].reasons)
+        self.assertIn("idle 12h+: its checkouts are mirrors (unpushed commits go to a verified bundle in ~/archive "
+                      "first)", items["reload-cloud/cmux-base"].reasons)
         receipt = self.home / "receipt.jsonl"
         with contextlib.redirect_stdout(io.StringIO()), \
                 mock.patch.object(gd, "process_evidence", return_value=([], "")):
@@ -5654,8 +5661,584 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertFalse((job / "reload-cloud/cmux-base").exists())
         self.assertFalse((job / "SourcePackages/host.1").exists())
         self.assertTrue((job / "reload-cloud/work/slot-1/.git").is_dir())
-        self.assertTrue((job / "slots/host.1/.git").is_dir())
+        self.assertFalse((job / "slots/host.1").exists())
         self.assertTrue((job / "reload-cloud-ios/cmux-base/slot-2/.git").is_dir())
+        # no remote: each deleted clone's whole history is in a verified bundle
+        bundles = sorted((self.home / "archive/glaeda-disk").glob("*.bundle"))
+        self.assertEqual(sorted(("cmux-base" in b.name, "host.1" in b.name) for b in bundles),
+                         [(False, True), (True, False)])
+        for b in bundles:
+            self.assertRegex(b.name, gd.MIRROR_BUNDLE_RE)
+            self.assertIn("refs/heads/", subprocess.run(["git", "bundle", "list-heads", str(b)], capture_output=True,
+                                                         text=True, check=True).stdout)
+
+
+    def mirror_unit(self, srv_commits: int = 1) -> tuple[Path, Path, dict]:
+        """A cmux-job reload unit idle a day whose clone's origin is a trusted stand-in for GitHub."""
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        srv = self.home / "srv"
+        subprocess.run(["git", "init", "-q", "-b", "main", str(srv)], check=True, env=env)
+        for n in range(srv_commits):
+            subprocess.run(["git", "-C", str(srv), "commit", "-q", "--allow-empty", "-m", f"c{n}"], check=True, env=env)
+        unit = self.home / ".cache/cmux-job/reload-cloud/cmux-base"
+        subprocess.run(["git", "clone", "-q", str(srv), str(unit / "slot-1")], check=True, env=env)
+        saved = gd.TRUSTED_LOCAL_REMOTES
+        gd.TRUSTED_LOCAL_REMOTES = (str(srv),)
+        self.addCleanup(setattr, gd, "TRUSTED_LOCAL_REMOTES", saved)
+        return unit, unit / "slot-1", env
+
+    def apply_mirror(self, unit: Path, between=None) -> tuple[dict, str]:
+        t = time.time() - 24 * 3600
+        for dirpath, dirnames, filenames in os.walk(unit):
+            for n in dirnames + filenames:
+                os.utime(os.path.join(dirpath, n), (t, t), follow_symlinks=False)
+        os.utime(unit, (t, t))
+        fams = [f for f in gd.default_families() if f.id == "cmux-job-cache"]
+        items = [i for i in gd.survey(fams, 24, 0) if i.path == os.fspath(unit)]
+        self.assertEqual([i.verdict for i in items], ["reclaimable"])
+        if between is not None:
+            between()
+        receipt, err = self.home / "receipt.jsonl", io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            gd.apply(items, {f.id: f for f in fams}, receipt, None, 24)
+        return json.loads(receipt.read_text().splitlines()[-1]), err.getvalue()
+
+    def bundle_heads(self) -> dict[str, str]:
+        heads = {}
+        for b in sorted((self.home / "archive/glaeda-disk").glob("*.bundle")):
+            subprocess.run(["git", "bundle", "verify", str(b)], cwd=self.home / "srv", check=True, capture_output=True)
+            out = subprocess.run(["git", "bundle", "list-heads", str(b)], capture_output=True, text=True, check=True)
+            heads.update({ln.split(" ")[1]: ln.split(" ")[0] for ln in out.stdout.splitlines()})
+        return heads
+
+    def test_a_mirrors_unpushed_commit_and_local_refs_survive_in_a_verified_bundle(self) -> None:
+        unit, clone, env = self.mirror_unit(srv_commits=2)
+        subprocess.run(["git", "-C", str(clone), "commit", "-q", "--allow-empty", "-m", "unpushed"], check=True, env=env)
+        subprocess.run(["git", "-C", str(clone), "tag", "only-here", "origin/main~1"], check=True, env=env)
+        subprocess.run(["git", "-C", str(clone), "branch", "side", "origin/main"], check=True, env=env)
+        subprocess.run(["git", "-C", str(clone), "checkout", "-q", "--detach", "HEAD"], check=True, env=env)
+        subprocess.run(["git", "-C", str(clone), "commit", "-q", "--allow-empty", "-m", "detached"], check=True, env=env)
+        detached = subprocess.run(["git", "-C", str(clone), "rev-parse", "HEAD"], capture_output=True, text=True,
+                                  check=True).stdout.strip()
+        want = {r: subprocess.run(["git", "-C", str(clone), "rev-parse", r], capture_output=True, text=True,
+                                  check=True).stdout.strip() for r in ("refs/heads/main", "refs/tags/only-here",
+                                                                       "refs/heads/side")}
+        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed", rec["reasons"])
+        self.assertFalse(unit.exists())
+        heads = self.bundle_heads()
+        self.assertEqual({r: heads.get(r) for r in want}, want)
+        self.assertEqual(heads.get(gd.ARCHIVE_REF + detached), detached)  # a commit only HEAD held
+        self.assertTrue(any("bundled to" in r for r in rec["reasons"]))
+
+    def test_a_mirror_whose_bundle_fails_is_kept_and_alerts(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        subprocess.run(["git", "-C", str(clone), "commit", "-q", "--allow-empty", "-m", "unpushed"], check=True, env=env)
+        (self.home / "archive").write_text("not a directory")  # the bundle cannot be written
+        gd.RUN.pop("bundle_failed", None)
+        rec, err = self.apply_mirror(unit)
+        self.assertEqual((rec["outcome"], rec["verdict"]), ("blocked:bundle-failed", "blocked"))
+        self.assertIn("ALERT", err)
+        self.assertEqual(gd.RUN.pop("bundle_failed"), [os.fspath(unit)])
+        self.assertTrue((clone / ".git").is_dir())
+        self.assertEqual(subprocess.run(["git", "-C", str(clone), "for-each-ref", gd.ARCHIVE_REF],
+                                        capture_output=True, text=True).stdout, "")
+
+    def test_a_mirror_with_nothing_unpushed_goes_without_a_bundle(self) -> None:
+        unit, _, _ = self.mirror_unit()
+        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed")
+        self.assertFalse(unit.exists())
+        self.assertFalse((self.home / "archive/glaeda-disk").exists())
+
+    def git(self, repo: Path, *args: str, env: dict | None = None) -> str:
+        return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, check=True,
+                              env=env).stdout.strip()
+
+    def test_a_branch_the_server_deleted_is_bundled_despite_its_stale_tracking_ref(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        srv = self.home / "srv"
+        self.git(srv, "checkout", "-q", "-b", "feat", env=env)
+        self.git(srv, "commit", "-q", "--allow-empty", "-m", "feat", env=env)
+        self.git(srv, "checkout", "-q", "main", env=env)
+        self.git(clone, "fetch", "-q", "origin", env=env)
+        self.git(clone, "branch", "mine", "origin/feat", env=env)
+        feat = self.git(clone, "rev-parse", "origin/feat")
+        self.git(srv, "branch", "-q", "-D", "feat", env=env)  # origin/feat in the clone is stale now
+        self.git(srv, "reflog", "expire", "--expire=now", "--all", env=env)
+        self.git(srv, "gc", "-q", "--prune=now", env=env)
+        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed")
+        self.assertEqual(self.bundle_heads().get("refs/heads/mine"), feat)
+
+    def test_bundle_names_never_collide_or_overwrite(self) -> None:
+        self.assertNotEqual(gd._bundle_name("/a/b_c")[16:], gd._bundle_name("/a/b/c")[16:])
+        self.assertNotEqual(gd._bundle_name("/r", "refs/heads/a_b")[16:], gd._bundle_name("/r", "refs/heads/a/b")[16:])
+        _, clone, env = self.mirror_unit()
+        self.git(clone, "commit", "-q", "--allow-empty", "-m", "unpushed", env=env)
+        written: list[Path] = []
+        args = (clone / ".git", "same", ["refs/heads/main", "--not", "origin/main"], {"refs/heads/main"}, written)
+        self.assertEqual(gd._write_bundle(*args), "")
+        first = written[0].read_bytes()
+        self.git(clone, "commit", "-q", "--allow-empty", "-m", "another", env=env)
+        self.assertIn("FileExistsError", gd._write_bundle(*args))
+        self.assertEqual((written, written[0].read_bytes()), ([written[0]], first))
+
+    def test_a_mirror_with_uncommitted_work_is_kept_but_ignored_output_goes(self) -> None:
+        unit, clone, _ = self.mirror_unit()
+        with (clone / ".git/info/exclude").open("a") as f:
+            f.write("build/\n")
+        (clone / "build").mkdir()
+        (clone / "build/out.o").write_text("x")
+        (clone / "notes.txt").write_text("edited on a laptop")
+        gd.RUN.pop("bundle_failed", None)
+        rec, err = self.apply_mirror(unit)
+        self.assertEqual((rec["outcome"], rec["verdict"]), ("blocked:uncommitted", "blocked"))
+        self.assertTrue((clone / "notes.txt").exists())
+        self.assertNotIn("bundle_failed", gd.RUN)
+        (clone / "notes.txt").unlink()
+        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed")
+
+    def test_a_checkout_in_ignored_files_has_its_local_refs_bundled(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        with (clone / ".git/info/exclude").open("a") as f:
+            f.write("vendor/\n")
+        dep = clone / "vendor/dep"
+        subprocess.run(["git", "init", "-q", "-b", "main", str(dep)], check=True, env=env)
+        self.git(dep, "commit", "-q", "--allow-empty", "-m", "only here", env=env)
+        head = self.git(dep, "rev-parse", "HEAD")
+        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed")
+        self.assertEqual(self.bundle_heads().get("refs/heads/main"), head)
+
+    def test_an_unreadable_submodule_store_keeps_the_mirror(self) -> None:
+        unit, clone, _ = self.mirror_unit()
+        store = clone / ".git/modules/sub"
+        store.mkdir(parents=True)
+        try:
+            rec, _ = self.apply_mirror(unit, between=lambda: os.chmod(store, 0))
+        finally:
+            os.chmod(store, 0o755)
+        self.assertEqual(rec["outcome"], "blocked:bundle-failed")
+        self.assertIn("unreadable submodule store", " ".join(rec["reasons"]))
+        self.assertTrue(clone.is_dir())
+
+    def test_a_commit_made_while_bundling_keeps_the_mirror(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        self.git(clone, "commit", "-q", "--allow-empty", "-m", "unpushed", env=env)
+        real = gd.archive_mirror
+
+        def racing(path):
+            out = real(path)
+            self.git(clone, "commit", "-q", "--allow-empty", "-m", "made meanwhile", env=env)
+            return out
+        with mock.patch.object(gd, "archive_mirror", racing):
+            rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        self.assertIn("its git refs or work trees changed while they were bundled", rec["reasons"])
+        self.assertTrue(clone.is_dir())
+
+    def bundled_pairs(self) -> set[tuple[str, str]]:
+        pairs = set()
+        for b in (self.home / "archive/glaeda-disk").glob("*.bundle"):
+            out = subprocess.run(["git", "bundle", "list-heads", str(b)], capture_output=True, text=True, check=True)
+            pairs |= {(ln.split(" ")[1], ln.split(" ")[0]) for ln in out.stdout.splitlines()}
+        return pairs
+
+    def test_a_nested_embedded_submodules_commits_are_bundled(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        sub, nested = clone / "sub", clone / "sub/nested"
+        for repo in (sub, nested):
+            subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True, env=env)
+        self.git(nested, "commit", "-q", "--allow-empty", "-m", "nested only", env=env)
+        head = self.git(nested, "rev-parse", "HEAD")
+        for outer, inner in ((sub, "nested"), (clone, "sub")):
+            self.git(outer, "add", inner, env=env)
+            self.git(outer, "commit", "-q", "-m", f"link {inner}", env=env)
+        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed", rec["reasons"])
+        self.assertIn(("refs/heads/main", head), self.bundled_pairs())
+
+    def test_a_repository_created_while_bundling_keeps_the_mirror(self) -> None:
+        unit, _, env = self.mirror_unit()
+        real = gd.archive_mirror
+
+        def racing(path):
+            out = real(path)
+            subprocess.run(["git", "init", "-q", str(unit / "slot-2")], check=True, env=env)
+            self.git(unit / "slot-2", "commit", "-q", "--allow-empty", "-m", "new", env=env)
+            return out
+        with mock.patch.object(gd, "archive_mirror", racing):
+            rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        self.assertTrue(any("repositories changed" in r for r in rec["reasons"]))
+        self.assertTrue((unit / "slot-2/.git").is_dir())
+
+    def test_a_tree_dirtied_before_its_snapshot_is_kept(self) -> None:
+        unit, clone, _ = self.mirror_unit()
+        real = gd.mirror_git_snapshot
+        calls = []
+
+        def dirtying(gitdirs, trees):
+            if not calls:  # after the clean check, before the baseline: the baseline itself is dirty
+                (clone / "notes.txt").write_text("edited")
+            calls.append(1)
+            return real(gitdirs, trees)
+        with mock.patch.object(gd, "mirror_git_snapshot", dirtying):
+            rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        self.assertTrue((clone / "notes.txt").exists())
+
+    def test_a_mirrors_owner_and_references_are_read_again_after_bundling(self) -> None:
+        unit, _, _ = self.mirror_unit()
+        why, _, recheck = gd.archive_mirror(unit)
+        self.assertEqual(why, "")
+        retired = gd.Family("hq", unit.parent, True, "x", retired_only=True)
+        referenced = gd.Family("hq", unit.parent, True, "x", reference_root=self.home)
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            with mock.patch.object(gd, "owner_retired", return_value=False):
+                self.assertIn("owner loaded", gd.mirror_moved(retired, unit, recheck))
+            with mock.patch.object(gd, "artifact_referenced", return_value=True):
+                self.assertIn("referenced", gd.mirror_moved(referenced, unit, recheck))
+            with mock.patch.object(gd, "owner_retired", return_value=True), \
+                    mock.patch.object(gd, "artifact_referenced", return_value=False):
+                self.assertEqual(gd.mirror_moved(retired, unit, recheck), "")
+
+    def test_a_locked_linked_worktree_keeps_the_mirror(self) -> None:
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        main = self.home / "main-clone"
+        subprocess.run(["git", "init", "-q", "-b", "main", str(main)], check=True, env=env)
+        self.git(main, "commit", "-q", "--allow-empty", "-m", "c", env=env)
+        unit = self.home / ".cache/cmux-job/reload-cloud/cmux-base"
+        unit.mkdir(parents=True)
+        self.git(main, "worktree", "add", "-q", "--detach", "--lock", str(unit / "slot-1"), env=env)
+        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "blocked:bundle-failed")
+        self.assertTrue(any("locked worktree" in r for r in rec["reasons"]))
+        self.assertTrue((unit / "slot-1/.git").is_file())
+
+    def test_a_branch_the_server_drops_after_bundling_keeps_the_mirror(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        srv = self.home / "srv"
+        self.git(srv, "checkout", "-q", "-b", "feat", env=env)
+        self.git(srv, "commit", "-q", "--allow-empty", "-m", "feat", env=env)
+        self.git(srv, "checkout", "-q", "main", env=env)
+        self.git(clone, "fetch", "-q", "origin", env=env)
+        self.git(clone, "branch", "mine", "origin/feat", env=env)  # on the server now: no bundle needed
+        real = gd.archive_mirror
+
+        def racing(path):
+            out = real(path)
+            self.git(srv, "branch", "-q", "-D", "feat", env=env)
+            self.git(srv, "reflog", "expire", "--expire=now", "--all", env=env)
+            self.git(srv, "gc", "-q", "--prune=now", env=env)
+            return out
+        with mock.patch.object(gd, "archive_mirror", racing):
+            rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        self.assertTrue(any("no longer on one" in r for r in rec["reasons"]), rec["reasons"])
+        self.assertTrue((clone / ".git").is_dir())
+
+    def test_a_directory_read_error_while_finding_repositories_keeps_the_mirror(self) -> None:
+        unit, _, _ = self.mirror_unit()
+        hidden = unit / "slot-2/deep"
+        hidden.mkdir(parents=True)
+        real = os.scandir
+
+        def failing(p):
+            if os.fspath(p) == os.fspath(unit / "slot-2"):
+                raise OSError(errno.EIO, "I/O error")
+            return real(p)
+        with mock.patch.object(gd.os, "scandir", failing):
+            why, bundles, _ = gd.archive_mirror(unit)
+        self.assertIn("unreadable", why)
+        self.assertEqual(bundles, [])
+        self.assertEqual(gd.checkouts(unit, strict=False) is None, False)
+
+    def test_a_locked_worktree_of_a_repository_inside_the_mirror_keeps_it(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        self.git(clone, "worktree", "add", "-q", "--detach", "--lock", str(unit / "slot-2"), env=env)
+        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "blocked:bundle-failed")
+        self.assertTrue(any("locked worktree" in r or "has linked worktrees" in r for r in rec["reasons"]),
+                        rec["reasons"])
+        self.assertTrue((unit / "slot-2/.git").is_file())
+
+    def test_a_commit_made_while_the_servers_are_asked_keeps_the_mirror(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        real = gd.server_still_holds
+
+        def slow(g, commits):
+            self.git(clone, "commit", "-q", "--allow-empty", "-m", "made meanwhile", env=env)
+            return real(g, commits)
+        with mock.patch.object(gd, "server_still_holds", slow):
+            rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        self.assertTrue((clone / ".git").is_dir())
+
+    def test_a_symlinked_submodule_store_keeps_the_mirror(self) -> None:
+        unit, clone, _ = self.mirror_unit()
+        (unit / "store/sub").mkdir(parents=True)
+        (clone / ".git/modules").symlink_to(unit / "store")
+        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "blocked:bundle-failed")
+        self.assertTrue(any("unreadable submodule store" in r for r in rec["reasons"]), rec["reasons"])
+        (clone / ".git/modules").unlink()
+        (clone / ".git/modules/a").mkdir(parents=True)
+        (clone / ".git/modules/a/b").symlink_to(unit / "store")
+        why, _, _ = gd.archive_mirror(unit)
+        self.assertIn("unreadable submodule store", why)
+
+    def test_an_empty_repository_goes_without_a_bundle(self) -> None:
+        unit = self.home / ".cache/cmux-job/reload-cloud/cmux-base"
+        subprocess.run(["git", "init", "-q", "-b", "main", str(unit / "slot-1")], check=True)
+        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed", rec["reasons"])
+        self.assertFalse((self.home / "archive/glaeda-disk").exists())
+
+    def test_a_job_that_starts_while_the_servers_are_asked_keeps_the_mirror(self) -> None:
+        unit, clone, _ = self.mirror_unit()
+        busy = []
+        real = gd.server_still_holds
+
+        def slow(g, commits):
+            busy.append(1)  # a job takes the unit during the network wait
+            return real(g, commits)
+        with mock.patch.object(gd, "server_still_holds", slow), \
+                mock.patch.object(gd, "job_busy", lambda fam, p: bool(busy)):
+            rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        self.assertIn("in use while its git work was bundled", rec["reasons"])
+        self.assertTrue((clone / ".git").is_dir())
+
+    def test_an_unborn_repositorys_linked_worktree_commit_is_never_lost(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        self.git(clone, "worktree", "add", "-q", "--detach", str(unit / "slot-2"), env=env)
+        self.git(unit / "slot-2", "commit", "-q", "--allow-empty", "-m", "worktree only", env=env)
+        only = self.git(unit / "slot-2", "rev-parse", "HEAD")
+        for ref in self.git(clone, "for-each-ref", "--format=%(refname)").split():
+            self.git(clone, "update-ref", "-d", "--no-deref", ref, env=env)
+        shutil.rmtree(clone / ".git/logs")  # the common repository now reads as unborn
+        rec, _ = self.apply_mirror(unit)
+        if rec["outcome"] == "reclaimed":
+            self.assertIn(only, {c for _, c in self.bundled_pairs()})
+        else:
+            self.assertTrue((unit / "slot-2/.git").is_file())
+
+    def test_unreadable_linked_worktree_records_keep_the_mirror(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        self.git(clone, "worktree", "add", "-q", "--detach", str(self.home / "outside"), env=env)
+        record = next((clone / ".git/worktrees").iterdir()) / "gitdir"
+        os.chmod(record, 0)
+        try:
+            why, bundles, _ = gd.archive_mirror(unit)
+        finally:
+            with contextlib.suppress(OSError):
+                os.chmod(record, 0o644)
+        self.assertTrue(record.exists(), "nothing prunes the record")
+        self.assertIn("unreadable linked worktree records", why)
+        self.assertEqual(bundles, [])
+
+    def test_an_unreadable_reflog_directory_keeps_the_mirror(self) -> None:
+        unit, clone, _ = self.mirror_unit()
+        hidden = clone / ".git/logs/refs/heads"
+        os.chmod(hidden, 0)
+        try:
+            self.assertIsNone(gd.files_strict(clone / ".git/logs"))
+            self.assertIsNone(gd.local_tips(clone / ".git"))
+            why, bundles, _ = gd.archive_mirror(unit)
+        finally:
+            os.chmod(hidden, 0o755)
+        self.assertTrue(why)
+        self.assertEqual(bundles, [])
+
+    def test_a_linked_worktree_inside_the_mirror_keeps_it_however_clean(self) -> None:
+        """Its record names an absolute path, so once the item is renamed the worktree cannot be checked again."""
+        unit, clone, env = self.mirror_unit()
+        with (clone / ".git/info/exclude").open("a") as f:
+            f.write("target/\n")
+        wt = clone / "target/wt"
+        self.git(clone, "worktree", "add", "-q", "--detach", str(wt), env=env)
+        (wt / "edit.txt").write_text("uncommitted")
+        self.assertTrue(gd.archive_mirror(unit)[0])
+        (wt / "edit.txt").unlink()
+        self.assertIn("has linked worktrees", gd.archive_mirror(unit)[0])
+        rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "blocked:bundle-failed")
+        self.assertTrue((wt / ".git").is_file())
+
+    def test_a_symlinked_reflog_directory_keeps_the_mirror(self) -> None:
+        unit, clone, _ = self.mirror_unit()
+        heads = clone / ".git/logs/refs/heads"
+        shutil.move(os.fspath(heads), os.fspath(self.home / "heads-elsewhere"))
+        heads.symlink_to(self.home / "heads-elsewhere")
+        self.assertIsNone(gd.files_strict(clone / ".git/logs"))
+        self.assertIsNone(gd.local_tips(clone / ".git"))
+        self.assertTrue(gd.archive_mirror(unit)[0])
+
+    def test_an_unreadable_outside_linked_worktree_keeps_the_mirror(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        parent = self.home / "locked-away"
+        parent.mkdir()
+        self.git(clone, "worktree", "add", "-q", "--detach", str(parent / "wt"), env=env)
+        os.chmod(parent, 0)
+        try:
+            why, bundles, _ = gd.archive_mirror(unit)
+        finally:
+            os.chmod(parent, 0o755)
+        self.assertIn("linked worktree", why)
+        self.assertEqual(bundles, [])
+
+    def test_a_commit_after_the_last_recheck_puts_the_mirror_back(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        real = gd.mirror_moved
+
+        def late(fam, path, recheck):
+            out = real(fam, path, recheck)
+            self.git(clone, "commit", "-q", "--allow-empty", "-m", "made after the recheck", env=env)
+            return out
+        with mock.patch.object(gd, "mirror_moved", late):
+            rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        self.assertTrue((clone / ".git").is_dir(), "renamed back to its path")
+        self.assertEqual([p.name for p in unit.parent.iterdir() if p.name.startswith(gd.DELETING_PREFIX)], [])
+
+    def test_a_checkout_referenced_while_bundling_keeps_the_mirror(self) -> None:
+        unit, clone, _ = self.mirror_unit()
+        bundled = []
+        real = gd.archive_mirror
+
+        def archive(path):
+            bundled.append(path)  # a tool names the checkout while its git work is bundled
+            return real(path)
+        with mock.patch.object(gd, "referenced_main_checkout",
+                               lambda path, nested=False: "named by ~/.local/bin/tool" if bundled else ""), \
+                mock.patch.object(gd, "archive_mirror", archive):
+            rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        self.assertTrue(any("referenced while its git work was bundled" in r for r in rec["reasons"]), rec["reasons"])
+        self.assertTrue((clone / ".git").is_dir())
+
+    def test_a_symlinked_or_special_reflog_file_keeps_the_mirror(self) -> None:
+        unit, clone, _ = self.mirror_unit()
+        log = clone / ".git/logs/HEAD"
+        log.rename(self.home / "head-log")
+        log.symlink_to(self.home / "head-log")
+        self.assertIsNone(gd.files_strict(clone / ".git/logs"))
+        self.assertIsNone(gd.local_tips(clone / ".git"))
+        self.assertTrue(gd.archive_mirror(unit)[0])
+
+    def recheck_after_rename(self, change, unit: Path | None = None) -> tuple[dict, Path]:
+        """apply with `change(doomed)` run on the renamed-aside tree, right before the post-rename recheck."""
+        unit = unit or self.mirror_unit()[0]
+        real = gd.mirror_rename_recheck
+
+        def wrapped(path, recheck):
+            inner = real(path, recheck)
+
+            def run():
+                change(path.with_name(f"{gd.DELETING_PREFIX}{path.name}-{os.getpid()}"))
+                inner()
+            return run
+        with mock.patch.object(gd, "mirror_rename_recheck", wrapped):
+            rec, _ = self.apply_mirror(unit)
+        return rec, unit
+
+    def test_work_staged_after_the_last_check_puts_the_mirror_back(self) -> None:
+        def stage(doomed):
+            (doomed / "slot-1/new.txt").write_text("x")
+            subprocess.run(["git", "-C", str(doomed / "slot-1"), "add", "new.txt"], check=True)
+        rec, unit = self.recheck_after_rename(stage)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        self.assertTrue((unit / "slot-1/new.txt").exists())
+
+    def test_a_repository_created_after_the_last_check_puts_the_mirror_back(self) -> None:
+        def create(doomed):
+            subprocess.run(["git", "init", "-q", str(doomed / "slot-9")], check=True)
+        rec, unit = self.recheck_after_rename(create)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        self.assertTrue((unit / "slot-9/.git").is_dir())
+
+    def test_a_symlinked_packed_refs_is_unreadable(self) -> None:
+        _, clone, _ = self.mirror_unit()
+        (clone / ".git/packed-refs").write_text("")
+        (clone / ".git/packed-refs").rename(self.home / "packed")
+        (clone / ".git/packed-refs").symlink_to(self.home / "packed")
+        self.assertIsNone(gd.local_tips(clone / ".git"))
+
+    def test_a_tree_that_cannot_go_back_is_kept_aside_and_never_finished(self) -> None:
+        unit, clone, env = self.mirror_unit()
+        real_rename = gd.rename_noreplace
+
+        def blocked(src, dst):
+            raise OSError(errno.EEXIST, "File exists")
+
+        def commit(doomed):
+            subprocess.run(["git", "-C", str(doomed / "slot-1"), "commit", "-q", "--allow-empty", "-m", "late"],
+                           check=True, env=env)
+        with mock.patch.object(gd, "rename_noreplace", blocked):
+            rec, _ = self.recheck_after_rename(commit, unit)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        aside = [p for p in unit.parent.iterdir() if p.name.startswith(gd.DELETING_PREFIX)]
+        self.assertEqual(len(aside), 1)
+        self.assertTrue(gd.mirror_keep_marker(aside[0]).exists())
+        with self.assertRaises(OSError):
+            gd.finish_deletion(aside[0])
+        fam = gd.Family(gd.INTERRUPTED, unit.parent, True, "x")
+        self.assertIn("kept it", gd.keep_verdict(fam, aside[0]))
+        self.assertTrue((aside[0] / "slot-1/.git").is_dir())
+        del real_rename
+
+    def test_a_symlinked_packed_refs_is_never_judged_empty(self) -> None:
+        bare = self.home / "bare.git"
+        subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+        (self.home / "packed").write_text("# pack-refs with: peeled\n")
+        (bare / "packed-refs").symlink_to(self.home / "packed")
+        self.assertFalse(gd.repo_unborn(bare))
+        self.assertTrue(gd.bundle_unpushed(bare, "k", []))
+
+    def test_a_branch_named_after_the_last_check_puts_the_mirror_back(self) -> None:
+        def name(doomed):
+            subprocess.run(["git", "-C", str(doomed / "slot-1"), "tag", "made-late", "HEAD"], check=True)
+        rec, unit = self.recheck_after_rename(name)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        self.assertIn("made-late", subprocess.run(["git", "-C", str(unit / "slot-1"), "tag"], capture_output=True,
+                                                  text=True, check=True).stdout)
+
+    def test_a_keep_marker_that_cannot_be_written_keeps_the_tree_in_place(self) -> None:
+        unit, clone, _ = self.mirror_unit()
+        with mock.patch.object(gd, "mirror_keep_marker", lambda aside: self.home / "no-such-dir" / "marker"):
+            rec, _ = self.apply_mirror(unit)
+        self.assertTrue(rec["outcome"].startswith("incomplete:"), rec["outcome"])
+        self.assertTrue((clone / ".git").is_dir())
+        self.assertEqual([p.name for p in unit.parent.iterdir() if p.name.startswith(gd.DELETING_PREFIX)], [])
+
+    def test_only_manifest_listed_bundles_at_their_hash_are_pruned_after_the_evidence_gate(self) -> None:
+        archive = self.home / "archive/glaeda-disk"
+        archive.mkdir(parents=True)
+        name = "20260901T000000-1-{:016x}-r.expires-{}.bundle".format
+        listed = {name(1, "2026-10-01"): "2026-10-01", name(2, "2026-11-19"): "2026-11-19",
+                  name(3, "2026-10-02"): "2026-10-02"}  # 3: changed since it was written
+        for n in [*listed, name(4, "2026-10-01")]:  # 4: expired by its name, but not in the manifest
+            (archive / n).write_text(n)
+        with (archive / "manifest.jsonl").open("w") as m:
+            for n, exp in listed.items():
+                m.write(json.dumps({"name": n, "sha256": gd._sha256(archive / n), "expires": exp}) + "\n")
+        (archive / name(3, "2026-10-02")).write_text("changed")
+        (self.home / "archive/other.bundle").write_text("x")
+        fams = [f for f in gd.default_families() if f.id == "cmux-job-cache"]
+        with contextlib.redirect_stderr(io.StringIO()), mock.patch.object(
+                gd, "process_evidence", side_effect=gd.NoEvidence("ps failed")):
+            gd.apply([], {f.id: f for f in fams}, self.home / "r.jsonl", None, 24)
+        self.assertTrue((archive / name(1, "2026-10-01")).exists())  # no evidence: nothing is deleted
+        self.assertEqual(gd.prune_mirror_archive("2026-10-26"), 1)
+        self.assertEqual(sorted(p.name for p in archive.glob("*.bundle")),
+                         sorted([name(2, "2026-11-19"), name(3, "2026-10-02"), name(4, "2026-10-01")]))
+        self.assertNotIn(name(1, "2026-10-01"), (archive / "manifest.jsonl").read_text())
+        self.assertTrue((self.home / "archive/other.bundle").exists())
 
     def test_interrupted_deletions_finish_once_their_deleter_is_gone(self) -> None:
         """cmux8s and cmuxs-mac-mini-3, 2026-10-11: 9.3 and 7.8 GiB renamed aside by a killed glaeda-disk sat
@@ -6381,6 +6964,7 @@ class HostReservationTest(unittest.TestCase):
             self.assertEqual(gd.POLICY["stale_marker_max_hours"], 5.0, "a disk-policy.json value stays")
         self.assertEqual((gd.DEFAULT_AGE_HOURS, gd.CMUX_NEXT_CI_MIN_IDLE_HOURS, gd.RUNTIME_IDLE_DAYS), (24.0, 72.0, 14.0))
         self.assertEqual(gd.RUNNER_STALE_CHECKOUT_HOURS, float("inf"), "no above-floor checkout eviction")
+        self.assertEqual(gd.CMUX_JOB_MIRROR_HOURS, 168.0, "no 12 h mirror deletion on a reserved host")
 
     def test_a_disk_policy_key_set_to_the_new_default_stays_on_a_reserved_host(self) -> None:
         saved = {n: getattr(gd, n) for n in gd.LEGACY_AGES}
