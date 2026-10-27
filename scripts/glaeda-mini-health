@@ -79,6 +79,17 @@ Each run checks, as the runner user and without sudo:
                                      days stays behind (GitHub deleted 33 such offline registrations on one day, all
                                      on an older release). Reported only (a warning): it self-updates on its next
                                      connect, or an operator moves it while it is idle.
+  checkout_slow                      the runners' checkout steps (actions/checkout: "Checkout ..." and "Run
+                                     actions/checkout@..." steps, never their "Post" cleanup) took a median over
+                                     CHECKOUT_SLOW_S (60 s) across at least CHECKOUT_MIN_SAMPLES of them in the
+                                     last CHECKOUT_WINDOW_S (3 days); the fleet's median is under 10 s. Read from
+                                     the timings the runners already log (each runner's _diag/Worker_*.log
+                                     StepsRunner lines, the newest CHECKOUT_MAX_LOGS of them, at most
+                                     CHECKOUT_PASS_BYTES read a pass, each parsed once and kept in
+                                     checkout-steps.json beside STATE). A mini whose console never answers
+                                     a macOS privacy (TCC) prompt stalls every git script for its timeout (about
+                                     100 s per `git submodule` call, 2026-10-27), as can a slow network or disk.
+                                     Reported only (a warning); it never refuses or delays a job.
   node_toolchain_missing              the runner hook named one exact Rust toolchain that is absent. Healed as the
                                      runner user with `rustup toolchain install ... --profile minimal`, then the
                                      next health pass revalidates the hook. Only the exact version/triple from the
@@ -149,6 +160,7 @@ import argparse
 import contextlib
 import datetime
 import fcntl
+import heapq
 import importlib.machinery
 import importlib.util
 import json
@@ -159,6 +171,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import socket
 import subprocess
 import sys
@@ -180,6 +193,22 @@ RUNNER_DIR = re.compile(r"actions-runner-glaeda(?:-(\d+))?")
 RUNNER_PIN = "2.338.0"  # glaeda-cmux-runner's PINNED_RUNNER_VERSION; a test keeps the two equal
 RUNNER_VERSION_RE = r"[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}"
 RUNNER_RECEIPTS = ".local/state/glaeda/cmux-runner"  # glaeda-cmux-runner's install receipts, under HOME
+# checkout_slow: the runners' own step timings, from the worker logs actions/runner writes under _diag.
+CHECKOUT_SLOW_S = 60  # the fleet's checkout median is 8 s (2026-10-27); a mini at 10x that is not a slow day
+CHECKOUT_MIN_SAMPLES = 10
+CHECKOUT_WINDOW_S = 3 * 86400
+CHECKOUT_MAX_LOGS = 80  # the newest worker logs (one per job) across this mini's runners
+CHECKOUT_MAX_LOG_BYTES = 16 << 20  # a worker log is about 0.2 to 1 MB; past this the rest is not read (checkout
+# runs at a job's start, so a longer log's checkout steps are in this prefix; its cache entry says "truncated")
+CHECKOUT_PASS_BYTES = 64 << 20  # read per pass at most: logs past it wait for the next pass (2 minutes later)
+CHECKOUT_MAX_DIR_ENTRIES = 20000  # _diag entries looked at per pass, all runners (each keeps a few hundred)
+CHECKOUT_MAX_STEPS = 200  # checkout steps kept per log (a job has one to a few)
+CHECKOUT_CACHE = "checkout-steps.json"  # beside STATE: each parsed log's (size, mtime) and its checkout times
+CHECKOUT_CACHE_SCHEMA = "glaeda-mini-health-checkout-steps/v1"
+WORKER_LOG = re.compile(r"Worker_[0-9]{8}-[0-9]{6}-utc\.log")
+STEPS_LINE = re.compile(r"\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)Z INFO StepsRunner\] "
+                        r"(?:Processing step: DisplayName='(.*)'|(Step result:)|(Skipping step))")
+CHECKOUT_STEP = re.compile(r"(?:Checkout\b.*|Run actions/checkout@\S+)")
 LOGINWINDOW = Path("/Library/Preferences/com.apple.loginwindow.plist")
 TAILSCALE_APP = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 # Tailscale's own address: on a healthy node the OS sends it into the tunnel (a utun interface).
@@ -353,6 +382,50 @@ class Mini:
             except Exception:  # noqa: BLE001  (an unreadable hook skips the checks that need it)
                 self._hook = False
         return self._hook or None
+
+    def worker_logs(self) -> list[tuple[str, Path, int, float]]:
+        """(key, path, size, mtime) of the runners' newest CHECKOUT_MAX_LOGS worker logs that are regular files;
+        key is "<runner dir>/<file>". At most CHECKOUT_MAX_DIR_ENTRIES _diag entries are looked at in all."""
+        newest: list[tuple[float, str, str, int]] = []  # a min-heap of (mtime, key, path, size)
+        seen = 0
+        for d in self.runner_dirs():
+            with contextlib.suppress(OSError), os.scandir(d / "_diag") as it:
+                for e in it:
+                    seen += 1
+                    if seen > CHECKOUT_MAX_DIR_ENTRIES:
+                        break
+                    if not WORKER_LOG.fullmatch(e.name):
+                        continue
+                    with contextlib.suppress(OSError):
+                        st = e.stat(follow_symlinks=False)
+                        if not stat.S_ISREG(st.st_mode):
+                            continue
+                        item = (st.st_mtime, f"{d.name}/{e.name}", e.path, st.st_size)
+                        if len(newest) < CHECKOUT_MAX_LOGS:
+                            heapq.heappush(newest, item)
+                        elif item > newest[0]:
+                            heapq.heapreplace(newest, item)
+            if seen > CHECKOUT_MAX_DIR_ENTRIES:
+                break
+        return [(key, Path(path), size, mtime) for mtime, key, path, size in newest]
+
+    def read_log(self, path: Path, limit: int) -> str | None:
+        """The first `limit` bytes of a regular file (never a symlink, FIFO or device), or None."""
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError:
+            return None
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return None
+            with os.fdopen(fd, "rb") as fh:
+                fd = -1
+                return fh.read(limit).decode("utf-8", "replace")
+        except OSError:
+            return None
+        finally:
+            if fd >= 0:
+                os.close(fd)
 
     # ---- reads
 
@@ -1253,6 +1326,109 @@ def check_runner_versions(mini: Mini) -> list[dict[str, Any]]:
     return out
 
 
+def checkout_durations(text: str) -> list[tuple[float, float]]:
+    """(end time, seconds) of each checkout step a worker log ran to a result, oldest first."""
+    out, cur = [], None
+    for line in text.splitlines():
+        if "StepsRunner]" not in line:
+            continue
+        m = STEPS_LINE.match(line)
+        if not m:
+            continue
+        try:
+            at = datetime.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S").replace(
+                tzinfo=datetime.timezone.utc).timestamp()
+        except ValueError:
+            continue
+        if m.group(2) is not None:
+            cur = (m.group(2), at)
+        elif m.group(3) and cur:
+            if CHECKOUT_STEP.fullmatch(cur[0]):
+                out.append((at, max(0.0, at - cur[1])))
+            cur = None
+        else:  # a skipped step logs no result
+            cur = None
+    return out
+
+
+def finite(x: Any) -> bool:
+    """A real number of a sane size (an int too large for a float is not)."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        return False
+    if isinstance(x, int):
+        return abs(x) < 10 ** 11
+    return math.isfinite(x) and abs(x) < 1e11
+
+
+def cached_steps(hit: Any, size: int, mtime: float) -> list[list[float]] | None:
+    """A cache entry's steps when it is for this size and mtime and every step is a finite (end, seconds) pair."""
+    if not isinstance(hit, dict) or hit.get("size") != size or hit.get("mtime") != mtime:
+        return None
+    steps = hit.get("steps")
+    if not isinstance(steps, list) or len(steps) > CHECKOUT_MAX_STEPS:
+        return None
+    if not all(isinstance(st, list) and len(st) == 2 and all(finite(v) for v in st) and st[1] >= 0 for st in steps):
+        return None
+    return steps
+
+
+def check_checkout_steps(mini: Mini, now: float, cache_path: Path, remember: bool = True) -> list[dict[str, Any]]:
+    """checkout_slow: the median checkout step over this mini's recent jobs, from its worker logs. Each log is
+    parsed once (cached by size and mtime), so a pass reads only the logs that changed. Observation only: a
+    failure here is no finding and never stops the rest of the pass."""
+    try:
+        return _check_checkout_steps(mini, now, cache_path, remember)
+    except Exception:  # noqa: BLE001  (an unreadable log or cache must not cost the other checks)
+        return []
+
+
+def _check_checkout_steps(mini: Mini, now: float, cache_path: Path, remember: bool) -> list[dict[str, Any]]:
+    recent = sorted((w for w in mini.worker_logs() if 0 <= now - w[3] <= CHECKOUT_WINDOW_S),
+                    key=lambda w: w[3], reverse=True)[:CHECKOUT_MAX_LOGS]  # worker_logs is already the newest
+    cache = load_json(cache_path)
+    logs = cache.get("logs") if cache.get("schema") == CHECKOUT_CACHE_SCHEMA else None
+    logs = logs if isinstance(logs, dict) else {}
+    kept: dict[str, Any] = {}
+    samples: list[float] = []
+    budget = CHECKOUT_PASS_BYTES
+    for key, path, size, mtime in recent:
+        hit = logs.get(key)
+        steps = cached_steps(hit, size, mtime)
+        truncated = bool(hit.get("truncated")) if steps is not None else False
+        if steps is None:
+            if budget <= 0:
+                continue  # read on a later pass
+            limit = min(CHECKOUT_MAX_LOG_BYTES, budget)
+            text = mini.read_log(path, limit)
+            if text is None:
+                continue
+            budget -= min(size, limit)
+            if size > limit and limit < CHECKOUT_MAX_LOG_BYTES:
+                continue  # cut short by the pass budget, not the per-log cap: read whole on a later pass
+            truncated = size > limit
+            steps = [[round(at), round(sec, 1)] for at, sec in checkout_durations(text)][-CHECKOUT_MAX_STEPS:]
+        kept[key] = {"size": size, "mtime": mtime, "steps": steps, **({"truncated": True} if truncated else {})}
+        samples += [float(sec) for at, sec in steps if 0 <= now - at <= CHECKOUT_WINDOW_S]
+    if remember and kept != logs:
+        with contextlib.suppress(OSError):
+            write_json(cache_path, {"schema": CHECKOUT_CACHE_SCHEMA, "logs": kept})
+    if len(samples) < CHECKOUT_MIN_SAMPLES:
+        return []
+    samples.sort()
+    n = len(samples)
+    p50 = samples[n // 2] if n % 2 else (samples[n // 2 - 1] + samples[n // 2]) / 2
+    if p50 <= CHECKOUT_SLOW_S:
+        return []
+    p90 = samples[max(0, math.ceil(0.9 * n) - 1)]  # nearest rank
+    return [finding("checkout_slow", "warn",
+                    f"checkout steps took a median {p50:.0f} s (p90 {p90:.0f} s, slowest {samples[-1]:.0f} s) over "
+                    f"{n} steps in the last {CHECKOUT_WINDOW_S // 86400} days; over {CHECKOUT_SLOW_S} s is slow",
+                    "impossible",
+                    "time `git submodule status` in a runner's _work checkout: about 100 s with each git call "
+                    "waiting about 6 s is an unanswered macOS privacy (TCC) prompt (grant Full Disk Access at the "
+                    "console); otherwise look at the network path and the disk")]
+
+
 def check_node_eligibility(mini: Mini) -> list[dict[str, Any]]:
     why = mini.node_refusal()
     if not why:
@@ -2031,6 +2207,7 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
         found = (check_console(mini) + check_power(mini) + tailnet + check_runners(mini) + check_runner_versions(mini)
                  + check_node_eligibility(mini) + check_toolchain_missing(mini) + check_toolchain(mini)
                  + check_leaked_test_apps(mini)
+                 + check_checkout_steps(mini, now, state_path.parent / CHECKOUT_CACHE, apply)
                  + check_disk_accounting(mini)
                  + check_daemon_heal(mini) + check_ota(mini, now)
                  + check_claude_route(mini, now, apply and not tunnel_down, tunnel_down))
