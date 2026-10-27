@@ -2298,12 +2298,19 @@ def runner_checkout_git_veto(checkout: Path) -> str:
     try:
         for root, dirs, files in os.walk(dotgit, onerror=unreadable):
             rel = Path(root).relative_to(dotgit).parts
-            dirs[:] = [d for d in dirs if d not in ("objects", "lfs", "logs")]
+            # only a git dir's own object store, LFS store and reflogs are skipped: a submodule store with one of
+            # those names is still walked for its locks
+            if not rel or ("HEAD" in files and "objects" in dirs):
+                dirs[:] = [d for d in dirs if d not in ("objects", "lfs", "logs")]
             if any(n in GIT_LOCK_NAMES for n in (*files, *dirs)) or any(
                     f.endswith(".lock") and "refs" in rel for f in files):
                 return "git holds a lock in it"
             if len(rel) >= 2 and rel[-2] == "worktrees" and "locked" in files:
                 return "a linked worktree of it is locked"
+            # a linked worktree's private refs (refs/worktree, refs/bisect) live in its own git dir, where
+            # for-each-ref in the main one never lists them
+            if len(rel) >= 3 and rel[-3] == "worktrees" and rel[-1] == "refs" and (files or dirs):
+                return "a linked worktree of it has refs of its own"
     except OSError:
         return "git could not say whether it holds a lock"
     # the caller's GIT_* would override -C (a hook's GIT_DIR names one repository for every checkout)
@@ -2317,7 +2324,7 @@ def runner_checkout_git_veto(checkout: Path) -> str:
         heads = [ln.split(" ", 1)[1] for ln in git("worktree", "list", "--porcelain").splitlines()
                  if ln.startswith("HEAD ")]
         local = unpushed_commit(git, heads)
-    except (OSError, subprocess.SubprocessError, IndexError):
+    except (OSError, subprocess.SubprocessError, IndexError, ValueError):  # ValueError: a ref name not UTF-8
         return "git could not say whether a commit is only here"
     if local:
         return "a commit here is on no remote-tracking ref"
@@ -2399,10 +2406,14 @@ def submodule_git_veto(dotgit: Path, env: dict[str, str]) -> str:
     return ""
 
 
-def embedded_submodule_veto(tree: Path, env: dict[str, str], depth: int) -> str:
+def embedded_submodule_veto(tree: Path, env: dict[str, str], depth: int,
+                            superproject_git: Path | None = None) -> str:
     """Why a work tree's submodules keep the checkout, or "": a gitlink (mode 160000 in the index) whose .git is a
     directory or a symlink, not a gitfile into the superproject's .git/modules, or such a one in an absorbed
-    submodule's own work tree. Any doubt (git cannot list an index, the nesting is deeper than depth) keeps it."""
+    submodule's own work tree, or one whose gitfile names a repository outside superproject_git (the checkout's .git,
+    whose stores submodule_git_veto checks). Any doubt (git cannot list an index, read a gitfile, the nesting is
+    deeper than depth) keeps it."""
+    superproject_git = tree / ".git" if superproject_git is None else superproject_git
     try:
         listed = subprocess.run(["git", "-C", os.fspath(tree), "ls-files", "--stage", "-z"], capture_output=True,
                                 timeout=120, env=env, check=True).stdout
@@ -2418,9 +2429,18 @@ def embedded_submodule_veto(tree: Path, env: dict[str, str], depth: int) -> str:
             return f"submodule {path} keeps its own repository in the work tree"
         if not dotgit.exists():
             continue  # not initialized: no repository of its own here
+        try:
+            target = dotgit.read_text().strip()
+            store = (sub / target.removeprefix("gitdir:").strip()).resolve()
+        except (OSError, ValueError, RuntimeError):
+            return f"git could not say where submodule {path} keeps its repository"
+        if (not target.startswith("gitdir:") or not store.is_dir()
+                or not store.is_relative_to(superproject_git.resolve())):
+            # submodule_git_veto checks the stores inside the superproject's .git; one anywhere else is not checked
+            return f"submodule {path} keeps its repository outside .git"
         if depth <= 0:
             return f"submodule {path} is nested deeper than {SUBMODULE_DEPTH}"
-        if why := embedded_submodule_veto(sub, env, depth - 1):
+        if why := embedded_submodule_veto(sub, env, depth - 1, superproject_git):
             return why
     return ""
 

@@ -5034,7 +5034,7 @@ class GlaedaDiskTest(unittest.TestCase):
         inner = embedded / "deeper"
         inner.mkdir()
         git(inner, "init", "-q")
-        self.assertEqual(gd.runner_checkout_git_veto(co), "git could not list the index of lib")  # gitfile is dangling
+        self.assertEqual(gd.runner_checkout_git_veto(co), "submodule vendor/lib keeps its repository outside .git")
         (embedded / ".git").unlink()
         shutil.rmtree(inner)
         self.assertEqual(gd.runner_checkout_git_veto(co), "", "an uninitialized submodule has no repository here")
@@ -5136,6 +5136,49 @@ class GlaedaDiskTest(unittest.TestCase):
         shutil.rmtree(store / "worktrees")
         (co / ".git/modules/dangling").symlink_to(self.root / "nowhere")
         self.assertEqual(gd.runner_checkout_git_veto(co), "a symlink inside .git: git could not say what it holds")
+
+    def test_the_git_veto_follow_ups(self) -> None:
+        """Codex's P2s on #1661: a submodule store named like a git dir's own folders is walked for locks, a linked
+        worktree's private refs keep the checkout, a gitfile naming a store outside .git keeps it, and a ref name
+        that is not UTF-8 is doubt."""
+        env = {"PATH": "/usr/bin:/bin:/opt/homebrew/bin", "HOME": os.fspath(self.root), "GIT_AUTHOR_NAME": "t",
+               "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x"}
+
+        def git(where: Path, *args: str) -> str:
+            return subprocess.run(["git", *args], cwd=where, env=env, check=True, capture_output=True,
+                                  text=True).stdout.strip()
+        co = self.root / "p2/_work/cmux/cmux"
+        self._git_checkout(co)
+        store = co / ".git/modules/objects"
+        store.parent.mkdir(parents=True)
+        git(store.parent, "init", "-q", "--bare", "objects")
+        git(store, "--work-tree", os.fspath(self.root), "commit", "-q", "--allow-empty", "-m", "base")
+        git(store, "update-ref", "refs/remotes/origin/main", "HEAD")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "")
+        (store / "index.lock").write_text("")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "git holds a lock in it")
+        (store / "index.lock").unlink()
+        private = co / ".git/worktrees/w/refs/worktree"
+        private.mkdir(parents=True)
+        (private / "keep").write_text(git(co, "rev-parse", "HEAD") + "\n")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "a linked worktree of it has refs of its own")
+        shutil.rmtree(co / ".git/worktrees")
+        sha = git(store, "rev-parse", "HEAD")
+        git(co, "update-index", "--add", "--cacheinfo", f"160000,{sha},vendor/lib")
+        (co / "vendor/lib").mkdir(parents=True)
+        elsewhere = co / "vendor/store.git"  # inside the checkout but outside .git: never surveyed
+        git(co / "vendor", "init", "-q", "--bare", "store.git")
+        (co / "vendor/lib/.git").write_text(f"gitdir: {elsewhere}\n")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "submodule vendor/lib keeps its repository outside .git")
+        (co / "vendor/lib/.git").write_text("gitdir: ../../.git/modules/objects\n")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "")
+        ref = os.fsencode(co / ".git/refs/heads") + b"/caf\xe9"  # a ref name git accepts that is not UTF-8
+        try:
+            with open(ref, "w") as f:
+                f.write(git(co, "rev-parse", "HEAD") + "\n")
+        except OSError:
+            self.skipTest("this filesystem refuses names that are not UTF-8")
+        self.assertEqual(gd.runner_checkout_git_veto(co), "git could not say whether a commit is only here")
 
     def test_a_job_that_starts_during_the_git_veto_keeps_its_checkout(self) -> None:
         names = {"actions-runner-glaeda": 2, "actions-runner-glaeda-2": 2, "actions-runner-glaeda-11": 2}
