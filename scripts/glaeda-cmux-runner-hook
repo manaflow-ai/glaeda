@@ -1089,8 +1089,9 @@ NIGHTLY_BOUND_WORST_S = NIGHTLY_CAPACITY_WAIT_S + ADMISSION_WAIT_S + ADMIT_POLL_
 # The listener gate reads its runner's --capacity-units from the job-started hook glaeda-cmux-runner wrote.
 RUNNER_HOOK_SCRIPT = "glaeda-hooks/job-started.sh"
 LISTEN_SCRIPT = "glaeda-hooks/listen.sh"
-LSOF = shutil.which("lsof") or "/usr/sbin/lsof"
-GIT = shutil.which("git") or "/usr/bin/git"
+# absolute: the hook leaves the job's workspace (leave_job_workspace), so a relative PATH match would stop resolving
+LSOF = os.path.abspath(shutil.which("lsof") or "/usr/sbin/lsof")
+GIT = os.path.abspath(shutil.which("git") or "/usr/bin/git")
 # Events whose code is the repository's own, or a same-repo pull request checked below. Comment,
 # check and review-comment events can run with secrets on behalf of a fork PR, so they are left out.
 ADMITTED_EVENTS = ("push", "pull_request", "merge_group", "workflow_dispatch", "schedule", "workflow_run")
@@ -4126,7 +4127,7 @@ def dedicated_admission(script: Path) -> tuple[bool, str]:
     It holds nothing of glaeda's (no host lock, capacity or root), so the runners beside it never wait for it."""
     try:
         code = subprocess.run([os.fspath(script)], stdin=subprocess.DEVNULL, timeout=DEDICATED_ADMIT_TIMEOUT_S,
-                              check=False).returncode
+                              cwd=JOB_CWD, check=False).returncode
     except (OSError, subprocess.TimeoutExpired) as error:
         return False, f"the dedicated runner's admission {script.name} could not run ({type(error).__name__})"
     if code != 0:
@@ -6900,10 +6901,10 @@ def sweep_idle_leftovers(runner_dir: Path) -> list[str]:
 
 def find_disk(explicit: str | None) -> str | None:
     if explicit:
-        return explicit if os.path.isfile(explicit) else None
+        return os.path.abspath(explicit) if os.path.isfile(explicit) else None
     found = shutil.which("glaeda-disk")
     if found:
-        return found
+        return os.path.abspath(found)  # a relative PATH entry must survive a later chdir (leave_job_workspace)
     fallback = Path.home() / ".local/bin/glaeda-disk"
     return os.fspath(fallback) if fallback.is_file() else None
 
@@ -7213,6 +7214,9 @@ def disk_pressure_detached(explicit: str | None, timeout: float = BACKGROUND_DIS
             disk_skip_line(HOOK_SKIP_COALESCED, free, targets)
             return "glaeda-disk pass already running; this trigger is coalesced into its follow-up"
         env = {key: value for key, value in os.environ.items() if key != "RUNNER_TRACKING_ID"}
+        with contextlib.suppress(OSError):  # the child runs in / (every caller: job-completed and the listener gate)
+            if "PATH" in env:
+                env["PATH"] = absolute_path_entries(env["PATH"], Path(os.getcwd()))
         bound = [f"{timeout * DISK_PASS_LIFETIME_FACTOR:g}", os.fspath(lock), os.fspath(pending),
                  os.fspath(evict_lock_path())]
         child = os.fork()
@@ -7221,6 +7225,8 @@ def disk_pressure_detached(explicit: str | None, timeout: float = BACKGROUND_DIS
     if child == 0:  # detach twice so the runner never waits on the pass
         try:
             os.setsid()
+            with contextlib.suppress(OSError):  # never keep the job's workspace (a runner checkout) as its cwd
+                os.chdir("/")
             # the middle process exits only once the pass has exec'd (the close-on-exec end reads EOF), so when the
             # hook returns no process of this job's environment, RUNNER_TRACKING_ID included, is left to clean up
             execd, execing = os.pipe()  # both close-on-exec
@@ -7244,6 +7250,40 @@ def disk_pressure_detached(explicit: str | None, timeout: float = BACKGROUND_DIS
     with contextlib.suppress(OSError):
         os.waitpid(child, 0)
     return f"glaeda-disk started in the background (bounded by {timeout:g} s)"
+
+
+def absolute_path_entries(path: str, cwd: Path) -> str:
+    """PATH with each relative (or empty, the cwd) entry made absolute against cwd, so it names the same directories
+    after a chdir."""
+    return os.pathsep.join(e if os.path.isabs(e) else os.path.join(os.fspath(cwd), e) for e in path.split(os.pathsep))
+
+
+JOB_CWD: Path | None = None  # the job's working directory the runner started the hook in (leave_job_workspace)
+
+
+def leave_job_workspace(args: argparse.Namespace) -> None:
+    """Move the hook off the job's working directory (the runner starts it in the workspace, the runner checkout):
+    while any process of ours has its cwd there, glaeda-disk's at-start and idle checkout evictions read the checkout
+    as in use (cmux8s-mac-mini, 2026-10-27: the hook, pid 6069, and the detached pass it forked kept
+    actions-runner-glaeda-11's 5.9 GiB .git). The path arguments are made absolute first; the dedicated runner's
+    admission still runs in the job's directory (JOB_CWD)."""
+    global JOB_CWD
+    try:
+        JOB_CWD = Path(os.getcwd())
+    except OSError:
+        JOB_CWD = None
+    if JOB_CWD is not None and "PATH" in os.environ:
+        # a relative PATH entry (or an empty one, the cwd) keeps naming what it named here, for every later lookup
+        # (find_disk(None), shutil.which) and every child the hook starts
+        os.environ["PATH"] = absolute_path_entries(os.environ["PATH"], JOB_CWD)
+    for name in ("disk", "runner_dir", "dedicated_admit", "job_log", "capacity_dir", "state_dir", "host_lock",
+                 "reservation", "toolchain_xcode"):
+        value = getattr(args, name, None)
+        if value is not None:
+            absolute = os.path.abspath(os.fspath(value))
+            setattr(args, name, absolute if isinstance(value, str) else Path(absolute))
+    with contextlib.suppress(OSError):
+        os.chdir("/")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -7345,6 +7385,9 @@ def main(argv: list[str] | None = None) -> int:
     admit_floor = admit_floor_gib(args.min_free_gib, args.gui_runner or args.session_runner)
     # the runner LaunchAgent's environment can switch sampling off fleet-wide without a reinstall
     telemetry = not args.no_telemetry and os.environ.get("GLAEDA_RUNNER_TELEMETRY", "1") != "0"
+
+    if args.phase in ("job-started", "job-completed"):
+        leave_job_workspace(args)
 
     owner: JobOwner | None = None
     if args.phase == "job-started":
