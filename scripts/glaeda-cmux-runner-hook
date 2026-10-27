@@ -4618,6 +4618,8 @@ class Gate:
         self.disk_evicted_at = -GATE_DISK_EVICT_EVERY_S  # when the last eviction under the floor started
         # the eviction under way: the detached glaeda-disk, when it started and the free GiB before it
         self.evicting: tuple[subprocess.Popen[bytes], float, float | None] | None = None
+        # under the floor while another glaeda-disk pass runs: when the gate began waiting for it (monotonic)
+        self.disk_waiting_since: float | None = None
         self.watching: tuple[int, ...] = ()
         self.fast_until = 0.0
         self.listening_since: float | None = None  # when start() last started run.sh (GATE_FIRST_POLL_S)
@@ -4846,10 +4848,27 @@ class Gate:
     def evict_in_background(self, path: str, floor: float) -> None:
         """Start a detached glaeda-disk --pressure run for the floor (disk_argv) unless one is under way or one
         started within GATE_DISK_EVICT_EVERY_S. It stays in the gate's process group, so launchd's cleanup covers
-        it; reap_eviction reads it on later polls, so no poll waits on it."""
+        it; reap_eviction reads it on later polls, so no poll waits on it.
+        While another pass is freeing space (pass_active: the queued pass, its trigger, or any evict.lock holder) it
+        waits for that one, as evict() does with wait_for_running_pass, instead of starting a run that would only skip
+        as eviction_busy (cmux13s, 2026-10-26..27: 145 of 219 busy skips were the gate's). It leaves one trigger in the
+        queue, so the running pass does a follow-up for this floor, and checks again on every poll; once no pass runs,
+        or after GATE_DISK_EVICT_EVERY_S of waiting (a stale trigger), it runs its own as before."""
         now = time.monotonic()
         if self.evicting is not None or now - self.disk_evicted_at < GATE_DISK_EVICT_EVERY_S:
             return
+        if self.disk_waiting_since is None or now - self.disk_waiting_since < GATE_DISK_EVICT_EVERY_S:
+            try:
+                active = pass_active()
+            except OSError:
+                active = False
+            if active:
+                if self.disk_waiting_since is None:
+                    self.disk_waiting_since = now
+                    gate_log(f"under the {floor:g} GiB disk floor: a glaeda-disk pass is running; waiting for it "
+                             f"({disk_pressure_detached(None)})")
+                return
+        self.disk_waiting_since = None
         self.disk_evicted_at = now
         argv = disk_argv(None, floor)
         if argv is None:

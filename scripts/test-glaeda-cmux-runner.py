@@ -6621,6 +6621,7 @@ class GateTest(unittest.TestCase):
         with mock.patch.object(hook.shutil, "disk_usage", side_effect=usage), \
                 mock.patch.object(hook, "disk_argv", side_effect=lambda _e, floor: ["glaeda-disk", f"{floor:g}"]), \
                 mock.patch.object(hook.subprocess, "Popen", side_effect=popen), \
+                mock.patch.object(hook, "pass_active", return_value=False), \
                 mock.patch.object(hook, "gate_log", side_effect=logs.append), \
                 mock.patch.object(hook.time, "monotonic", side_effect=lambda: clock["t"]):
             gate.child = mock.Mock(pid=1)
@@ -6646,6 +6647,55 @@ class GateTest(unittest.TestCase):
             procs[1].kill.assert_called_once()
             self.assertEqual(logs[-1], "under the 100 GiB disk floor: glaeda-disk timed out, freed 0.0 GiB")
             self.assertIsNone(gate.evicting)
+
+    def test_the_gate_waits_for_a_running_pass_instead_of_racing_it(self) -> None:
+        """Under the floor while the queued pass (or any evict.lock holder) runs, the gate's own glaeda-disk would
+        only skip as eviction_busy: it leaves one trigger for that pass, waits, and runs its own only once no pass
+        runs or after GATE_DISK_EVICT_EVERY_S."""
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("exec python3 /hook job-started --min-free-gib 100\n")
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        usage = lambda _path: mock.Mock(free=int(99 * 1024**3))  # noqa: E731
+        procs: list[mock.Mock] = []
+
+        def popen(argv: list[str], **_: object) -> mock.Mock:
+            proc = mock.Mock(argv=argv)
+            proc.poll.return_value = None
+            procs.append(proc)
+            return proc
+
+        logs: list[str] = []
+        clock = {"t": 1000.0}
+        active = {"on": True}
+        with mock.patch.object(hook.shutil, "disk_usage", side_effect=usage), \
+                mock.patch.object(hook, "disk_argv", side_effect=lambda _e, floor: ["glaeda-disk", f"{floor:g}"]), \
+                mock.patch.object(hook.subprocess, "Popen", side_effect=popen), \
+                mock.patch.object(hook, "pass_active", side_effect=lambda: active["on"]), \
+                mock.patch.object(hook, "disk_pressure_detached", return_value="coalesced") as trigger, \
+                mock.patch.object(hook, "gate_log", side_effect=logs.append), \
+                mock.patch.object(hook.time, "monotonic", side_effect=lambda: clock["t"]):
+            gate.child = mock.Mock(pid=1)
+            for _ in range(5):
+                self.assertIsNotNone(gate.low_disk())
+                clock["t"] += 30
+            self.assertEqual(procs, [], "no run of its own while a pass runs")
+            trigger.assert_called_once()
+            self.assertEqual(logs, ["under the 100 GiB disk floor: a glaeda-disk pass is running; waiting for it "
+                                    "(coalesced)"])
+            active["on"] = False
+            gate.low_disk()
+            self.assertEqual([p.argv for p in procs], [["glaeda-disk", "100"]], "the pass ended short: its own run")
+            procs[0].poll.return_value = 0
+            gate.low_disk()
+            # a pass that never ends (a stale trigger): waited at most GATE_DISK_EVICT_EVERY_S, then its own run
+            clock["t"] += hook.GATE_DISK_EVICT_EVERY_S
+            active["on"] = True
+            gate.low_disk()
+            self.assertEqual(len(procs), 1)
+            clock["t"] += hook.GATE_DISK_EVICT_EVERY_S
+            gate.low_disk()
+            self.assertEqual(len(procs), 2, "a wait past GATE_DISK_EVICT_EVERY_S runs its own")
 
     def test_a_root_runner_holds_while_a_token_its_jobs_need_is_taken(self) -> None:
         root = hook.RunnerScope(4, 2, 2, True)
