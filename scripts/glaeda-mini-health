@@ -116,6 +116,13 @@ Each run checks, as the runner user and without sudo:
                                      hook's xcode_refusal): cmux21,
                                      2026-10-21, Command Line Tools 27 on macOS 27 past Xcode_26.6. job-started refuses
                                      every job and the gate holds the listener off. Root's: reported only.
+  disk_pass_stale                    glaeda-disk has not finished a pass in DISK_PASS_STALE_S (26 h): sizes.json's newest
+                                     per-item measurement or accounting.json's newest record is older, or either is
+                                     missing, on a macOS host with glaeda-disk's LaunchAgent or snapshots (its agent
+                                     runs every 15 min and rewrites both; the runner-cache profile writes no
+                                     accounting.json, so only sizes.json counts there). Names the agent's launchd
+                                     state and last exit.
+                                     The disk table and eviction read these snapshots. Reported only.
   ota_not_converging                 glaeda-update's converge.json (its step 8) says this host does not run the release
                                      its ring wants, by installed tool and runner hook digests, past the alertAfter
                                      time it wrote: "running X, wants Y, because Z". glaeda-update keeps retrying with
@@ -253,6 +260,11 @@ SESSION_LINES = (WEDGE_SIGNATURE, "Closing session", "Tearing down", "Created se
 XCTEST_RUNNING = re.compile(r"(?:^|/)xctest(?:\s|$)|(?:^|/)xcodebuild\s(?:.*\s)?(?:test|test-without-building)(?:\s|$)")
 LEAKED_TEST_APP = re.compile(r"^\s*'?(.*/actions-runner[^/]+/_work/_temp/cmux-derived-data-tests-[^/]+/Build/Products/Debug/cmux DEV\.app)(?:/Contents/MacOS/[^ ]+)?'?(?:\s|$)")
 LEAKED_APP_TERM_S = 1.0
+DISK_PASS_STALE_S = 26 * 3600  # glaeda-disk's LaunchAgent runs every 15 min; a day without a pass is a stall
+DISK_AGENT = "com.teamleaderleo.glaeda.disk-pressure"  # glaeda-mini-setup's 15-minute glaeda-disk pass
+DISK_CACHE = ".cache/glaeda-disk"  # glaeda-disk's sizes.json and accounting.json, under HOME
+RUNNER_HYGIENE = "com.teamleaderleo.glaeda.runner-hygiene"  # glaeda-runner-hygiene's LABEL_PREFIX (.<uid>)
+SYSTEM_DAEMONS = Path("/Library/LaunchDaemons")
 OTA_CONVERGE = ".local/state/glaeda/update/converge.json"  # glaeda-update's CONVERGE, under this home
 CLAUDE_ROUTES = "claude-routes.json"  # config/, beside this script or as mini-setup installs it
 CLAUDE_PROBE_S = 60  # a route that does not answer hangs `claude -p` in its retries until it is killed
@@ -863,6 +875,47 @@ class Mini:
         path = self.home / ".local/state/glaeda/disk/summary.json"
         return load_json(path)
 
+    def disk_pass(self) -> dict[str, Any] | None:
+        """glaeda-disk's own snapshots and the launchd state of the job that runs its pass, or None on a host with
+        neither. The pass runs from this user's LaunchAgent (glaeda-mini-setup), or the same label as a system
+        LaunchDaemon run as this user on a headless host, or glaeda-runner-hygiene's per-account LaunchDaemon."""
+        if sys.platform != "darwin":  # Linux hosts run glaeda-disk from a systemd timer with its own cadence
+            return None
+        cache = self.home / DISK_CACHE
+        installed = [(plist, target) for plist, target in
+                     [(self.home / "Library/LaunchAgents" / f"{DISK_AGENT}.plist", f"gui/{self.uid}/{DISK_AGENT}")]
+                     if plist.exists()]
+        # a fake HOME (tests, an overridden $HOME) never reads the system's daemons, and a system daemon is this
+        # account's pass only when its UserName is this account: a headless host's disk-pressure, or
+        # glaeda-runner-hygiene's runner-cache profile (com.teamleaderleo.glaeda.runner-hygiene.<uid>)
+        if self.home == account_home():
+            for label in (DISK_AGENT, f"{RUNNER_HYGIENE}.{self.uid}"):
+                daemon = SYSTEM_DAEMONS / f"{label}.plist"
+                if daemon_user(daemon) == account_name():
+                    installed.append((daemon, f"system/{label}"))
+        snapshots = [cache / "sizes.json", cache / "accounting.json"]
+        if not installed and not any(p.exists() for p in snapshots):
+            return None
+        agent, last_exit = "not installed", None
+        for plist, target in installed:
+            code, text = sh(["/bin/launchctl", "print", target])
+            agent = f"{target} " + ("loaded" if code == 0 else "not loaded")
+            last = re.search(r"^\s*last exit code = (.+)$", text, re.M)
+            last_exit = last.group(1).strip() if code == 0 and last else None
+            if code == 0:
+                break
+        # glaeda-disk --runner-caches (the runner-cache profile) writes no accounting.json by design
+        summary = self.disk_summary()
+        profile = (any(target.startswith(f"system/{RUNNER_HYGIENE}.") for _, target in installed)
+                   or any(isinstance(x, dict) and x.get("scope") == "runner-cache-profile"
+                          for x in summary.get("accounting") or []))
+        written = {}
+        for path in snapshots:
+            with contextlib.suppress(OSError):
+                written[path.name] = path.stat().st_mtime
+        return {"sizes": load_json(snapshots[0]), "accounting": None if profile else load_json(snapshots[1]),
+                "written": written, "agent": agent, "last_exit": last_exit}
+
     # ---- tailscale_no_route's restart: its gates' reads and the restart itself
 
     def tailscale_restart_off(self) -> str:
@@ -1191,6 +1244,93 @@ def check_leaked_test_apps(mini: Mini) -> list[dict[str, Any]]:
         return []
     return [finding("leaked_test_apps", "warn", f"{len(apps)} orphaned cmux DEV.app process(es) under runner _temp",
                     "pending", "killed by the runner post-job hook or mini-health backstop")]
+
+
+def daemon_user(plist: Path) -> str | None:
+    try:
+        user = plistlib.loads(plist.read_bytes()).get("UserName")
+    except (OSError, ValueError, AttributeError, plistlib.InvalidFileException):
+        return None
+    return user if isinstance(user, str) else None
+
+
+def account_name() -> str | None:
+    try:
+        import pwd
+        return pwd.getpwuid(os.getuid()).pw_name
+    except (ImportError, KeyError, OSError):
+        return None
+
+
+def account_home() -> Path | None:
+    """This account's real home from the password database ($HOME can be anything)."""
+    try:
+        import pwd
+        return Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (ImportError, KeyError, OSError):
+        return None
+
+
+def newest_stamp(values: Any) -> float | None:
+    stamps = []
+    for v in values:
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            try:
+                v = float(v)
+            except OverflowError:
+                continue
+            if math.isfinite(v):
+                stamps.append(v)
+    return max(stamps) if stamps else None
+
+
+def disk_pass_times(facts: dict[str, Any]) -> dict[str, float | None]:
+    """When glaeda-disk last ran a pass, per snapshot: sizes.json's newest per-item measurement (its global `at`
+    is when the oldest size was measured, so it lags a working pass by design), and accounting.json's newest
+    volume record, or either file's write time. This asks whether a pass ran, not whether every size is fresh: a pass rewrites the items it
+    measured, and one item measured within the window means the pass is alive. accounting.json is left out
+    (facts None) for the runner-cache profile, which never writes it."""
+    written = facts.get("written") if isinstance(facts.get("written"), dict) else {}
+    sizes = facts.get("sizes") if isinstance(facts.get("sizes"), dict) else {}
+    if (not isinstance(sizes.get("sizes"), dict) or newest_stamp([sizes.get("at")]) is None
+            or not all(isinstance(v, int) and not isinstance(v, bool) for v in sizes["sizes"].values())):
+        sizes = {}  # glaeda-disk's load_snapshot_meta rejects it too: no pass wrote this
+    measured = sizes.get("measured_at") if isinstance(sizes.get("measured_at"), dict) else {}
+    # every --apply pass rewrites sizes.json, also one that re-measured nothing (an idle mini's report-only items),
+    # so the file's own write time counts; a snapshot that does not parse is missing whatever its time
+    sizes_at = newest_stamp([*measured.values(), sizes.get("at"), written.get("sizes.json") if sizes else None])
+    out = {"sizes.json": sizes_at}
+    if facts.get("accounting") is not None:
+        accounting = facts["accounting"] if isinstance(facts["accounting"], dict) else {}
+        if not all(isinstance(r, dict) and newest_stamp([r.get("at")]) is not None for r in accounting.values()):
+            accounting = {}  # one record glaeda-disk did not write makes the whole snapshot suspect
+        out["accounting.json"] = newest_stamp([*(r.get("at") for r in accounting.values() if isinstance(r, dict)),
+                                               written.get("accounting.json") if accounting else None])
+    return out
+
+
+def check_disk_pass(mini: Mini, now: float) -> list[dict[str, Any]]:
+    """disk_pass_stale: glaeda-disk has not completed a pass for DISK_PASS_STALE_S. Its LaunchAgent runs every 15
+    min and rewrites both snapshots, so a missing or day-old one is a stalled pass (an unloaded agent, a pass that
+    dies, a lock that never frees), not a quiet disk. The disk table and eviction read these snapshots."""
+    facts = mini.disk_pass()
+    if facts is None:
+        return []
+    stale = []
+    for name, at in disk_pass_times(facts).items():
+        if at is None:
+            stale.append(f"{name} missing")
+        elif now - at > DISK_PASS_STALE_S:
+            stale.append(f"{name} last pass {(now - at) / 3600:.0f} h ago")
+    if not stale:
+        return []
+    agent = facts.get("agent") or "?"
+    if facts.get("last_exit"):
+        agent += f", last exit {facts['last_exit']}"
+    return [finding("disk_pass_stale", "warn", f"{'; '.join(stale)} (limit {DISK_PASS_STALE_S // 3600} h); "
+                    f"disk pass job {agent}", "impossible",
+                    "glaeda-disk --pressure --idle --apply --top 0 shows why a pass does not finish; "
+                    "~/Library/Logs/glaeda-disk.err; glaeda-mini-setup reloads the agent")]
 
 
 def check_disk_accounting(mini: Mini) -> list[dict[str, Any]]:
@@ -2307,7 +2447,7 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
                  + check_node_eligibility(mini) + check_toolchain_missing(mini) + check_toolchain(mini)
                  + check_leaked_test_apps(mini)
                  + check_checkout_steps(mini, now, state_path.parent / CHECKOUT_CACHE, apply)
-                 + check_disk_accounting(mini)
+                 + check_disk_accounting(mini) + check_disk_pass(mini, now)
                  + check_daemon_heal(mini) + check_ota(mini, now)
                  + check_claude_route(mini, now, apply and not tunnel_down, tunnel_down))
         if apply and mini.tailnet_route_ok:

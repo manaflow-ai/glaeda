@@ -1122,6 +1122,16 @@ class GlaedaDiskTest(unittest.TestCase):
         snap.write_text("{not json")
         self.assertEqual(gd.load_snapshot(snap), (0.0, {}))
 
+    def test_snapshot_stamp_moves_once_every_item_is_remeasured(self) -> None:
+        # A fleet mini runs only --apply passes, which re-measure every item but never ran the background
+        # --refresh that alone moved `at`: its sizes.json said 8 days old while every size was minutes old.
+        self.assertEqual(gd.snapshot_stamp(1000.0, {"/a": 1, "/b": 2}, {"/a": 5000.0, "/b": 6000.0}), 5000.0)
+        self.assertEqual(gd.snapshot_stamp(1000.0, {"/a": 1, "/b": 2}, {"/a": 5000.0}), 1000.0)  # /b unmeasured
+        self.assertEqual(gd.snapshot_stamp(9000.0, {"/a": 1}, {"/a": 5000.0}), 9000.0)  # never moves back
+        self.assertEqual(gd.snapshot_stamp(0.0, {"/a": 1}, {"/a": 5000.0}), 5000.0)
+        self.assertIsNone(gd.snapshot_stamp(0.0, {}, {}))
+        self.assertIsNone(gd.snapshot_stamp(1000.0, {}, {}))  # an empty pass is fresh, not 8 days old
+
     def test_snapshot_records_per_item_measurement_times(self) -> None:
         snap = self.root / "times.json"
         gd.save_snapshot({"/old": 1, "/new": 2}, snap, at=1000.0,

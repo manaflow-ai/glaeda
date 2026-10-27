@@ -15,6 +15,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 from unittest import mock
 
@@ -57,6 +58,7 @@ class FakeMini(health.Mini):
         self.did: list[str] = []
         self.leaks: list[tuple[int, str]] = []
         self.disk: dict = {}
+        self.pass_facts: dict | None = None  # no glaeda-disk agent or snapshots here: no disk pass to judge
         self.refusal: str | None = None
         self.toolchain_installs: list[str] = []
         self.claude: str | None = None  # no Claude Code here: no route to check
@@ -208,6 +210,9 @@ class FakeMini(health.Mini):
 
     def disk_summary(self):
         return self.disk
+
+    def disk_pass(self):
+        return self.pass_facts
 
     def node_refusal(self):
         return self.refusal
@@ -577,6 +582,152 @@ class DiskAndLeaks(Base):
         self.assertEqual(stuck["observed_at"], NOW)
         self.assertIn("du timed out after 45s", stuck["evidence"])
         self.assertIn("6 path(s)", stuck["evidence"])
+
+    def disk_pass(self, sizes_at: float | None, accounting_at: float | None, header_at: float | None = None,
+                  agent: str = "loaded", last_exit: str | None = "0") -> dict:
+        sizes = {} if sizes_at is None else {"at": header_at or sizes_at, "sizes": {"/a": 1, "/b": 2},
+                                             "measured_at": {"/a": sizes_at - 600, "/b": sizes_at}}
+        accounting = {} if accounting_at is None else {"16777230": {"at": accounting_at}}
+        agent = agent if agent == "not installed" else f"gui/501/com.teamleaderleo.glaeda.disk-pressure {agent}"
+        return {"sizes": sizes, "accounting": accounting, "agent": agent, "last_exit": last_exit}
+
+    def test_a_disk_pass_within_a_day_is_healthy_even_with_an_old_snapshot_header(self) -> None:
+        # sizes.json's `at` is the oldest measurement; a pass that re-measures every item minutes ago is fresh
+        self.mini.pass_facts = self.disk_pass(NOW - 900, NOW - 900, header_at=NOW - 8 * 86400)
+        self.assertEqual(self.run_once()["findings"], [])
+
+    def test_a_disk_pass_that_stopped_running_is_a_finding(self) -> None:
+        self.mini.pass_facts = self.disk_pass(NOW - 8 * 86400, NOW - 6 * 86400)
+        report = self.run_once()
+        self.assertEqual(self.ids(report), ["disk_pass_stale"])
+        f = report["findings"][0]
+        self.assertIn("sizes.json last pass 192 h ago", f["evidence"])
+        self.assertIn("accounting.json last pass 144 h ago", f["evidence"])
+        self.assertIn("disk pass job gui/501/com.teamleaderleo.glaeda.disk-pressure loaded, last exit 0", f["evidence"])
+        self.assertEqual(f["auto_fix"], "impossible")
+
+    def test_one_stale_snapshot_is_enough(self) -> None:
+        self.mini.pass_facts = self.disk_pass(NOW - 900, NOW - 27 * 3600)
+        report = self.run_once()
+        self.assertEqual(self.ids(report), ["disk_pass_stale"])
+        self.assertNotIn("sizes.json", report["findings"][0]["evidence"])
+
+    def test_missing_snapshots_and_an_unloaded_agent_are_a_finding(self) -> None:
+        self.mini.pass_facts = self.disk_pass(None, None, agent="not loaded", last_exit=None)
+        report = self.run_once()
+        self.assertEqual(self.ids(report), ["disk_pass_stale"])
+        self.assertIn("sizes.json missing; accounting.json missing", report["findings"][0]["evidence"])
+        self.assertIn("disk-pressure not loaded", report["findings"][0]["evidence"])
+
+    def test_a_lone_accounting_snapshot_still_reports_the_missing_sizes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch.object(health.sys, "platform", "darwin"):
+            cache = Path(tmp) / ".cache/glaeda-disk"
+            cache.mkdir(parents=True)
+            (cache / "accounting.json").write_text(json.dumps({"1": {"at": NOW - 60}}))
+            found = health.check_disk_pass(health.Mini(Path(tmp)), NOW)
+            self.assertEqual([f["code"] for f in found], ["disk_pass_stale"])
+            self.assertIn("sizes.json missing", found[0]["evidence"])
+            self.assertNotIn("accounting.json", found[0]["evidence"])
+
+    def test_an_overridden_home_never_reads_the_system_daemons(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch.object(health.sys, "platform", "darwin"), \
+                unittest.mock.patch.object(health, "HOME", Path(tmp)), \
+                unittest.mock.patch.object(health, "SYSTEM_DAEMONS", Path(tmp) / "system"):
+            system = Path(tmp) / "system"
+            system.mkdir()
+            (system / f"{health.DISK_AGENT}.plist").write_text("")
+            self.assertIsNone(health.Mini(Path(tmp)).disk_pass())  # $HOME=tmp is not this account's home
+        self.assertEqual(health.newest_stamp([10**1000, True, float("nan"), "1", 5.0]), 5.0)
+
+    def headless(self, tmp: str, user: str) -> None:
+        system = Path(tmp) / "system"
+        system.mkdir(exist_ok=True)
+        (system / f"{health.DISK_AGENT}.plist").write_bytes(
+            health.plistlib.dumps({"Label": health.DISK_AGENT, "UserName": user}))
+
+    def test_a_headless_daemon_run_as_this_account_is_its_pass_job(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, contextlib.ExitStack() as stack:
+            stack.enter_context(unittest.mock.patch.object(health.sys, "platform", "darwin"))
+            stack.enter_context(unittest.mock.patch.object(health, "sh", lambda argv, **_k: (0, "\tlast exit code = 0\n")))
+            stack.enter_context(unittest.mock.patch.object(health, "account_home", lambda: Path(tmp)))
+            stack.enter_context(unittest.mock.patch.object(health, "account_name", lambda: "cmux"))
+            stack.enter_context(unittest.mock.patch.object(health, "SYSTEM_DAEMONS", Path(tmp) / "system"))
+            self.headless(tmp, "cmux")
+            facts = health.Mini(Path(tmp)).disk_pass()  # no snapshot yet: the installed job alone makes a disk host
+            self.assertEqual(facts["agent"], f"system/{health.DISK_AGENT} loaded")
+            self.assertIn("sizes.json missing", health.check_disk_pass(health.Mini(Path(tmp)), NOW)[0]["evidence"])
+            self.headless(tmp, "someone-else")  # another account's daemon is not this account's pass
+            self.assertIsNone(health.Mini(Path(tmp)).disk_pass())
+            mini = health.Mini(Path(tmp))
+            (Path(tmp) / "system" / f"{health.RUNNER_HYGIENE}.{mini.uid}.plist").write_bytes(
+                health.plistlib.dumps({"Label": f"{health.RUNNER_HYGIENE}.{mini.uid}", "UserName": "cmux"}))
+            facts = mini.disk_pass()  # glaeda-runner-hygiene --user cmux: the runner-cache profile's pass job
+            self.assertEqual(facts["agent"], f"system/{health.RUNNER_HYGIENE}.{mini.uid} loaded")
+            self.assertIsNone(facts["accounting"])  # that profile writes no accounting.json
+
+    def test_a_malformed_snapshot_is_missing_whenever_it_was_written(self) -> None:
+        for sizes, accounting in (({"junk": 1}, {"1": "x"}), ({"sizes": {}, "at": "bad"}, {"1": {"at": "bad"}}),
+                                  ({"sizes": {"/a": "bad"}, "at": NOW}, {"1": {"at": NOW}, "2": {}})):
+            self.mini.pass_facts = {"sizes": sizes, "accounting": accounting, "agent": "loaded", "last_exit": "0",
+                                    "written": {"sizes.json": NOW - 60, "accounting.json": NOW - 60}}
+            self.assertIn("sizes.json missing; accounting.json missing",
+                          self.run_once()["findings"][0]["evidence"])
+
+    def test_an_idle_pass_that_re_measured_nothing_still_counts(self) -> None:
+        facts = self.disk_pass(NOW - 8 * 86400, NOW - 8 * 86400)
+        facts["written"] = {"sizes.json": NOW - 900, "accounting.json": NOW - 900}  # --apply rewrote both
+        self.mini.pass_facts = facts
+        self.assertEqual(self.run_once()["findings"], [])
+        facts["accounting"] = {"1": {"at": 0}}  # an epoch stamp is a stamp: the write time decides
+        self.assertEqual(self.run_once()["findings"], [])
+        facts["sizes"] = {}  # a file that does not parse is missing, whenever it was written
+        self.assertIn("sizes.json missing", self.run_once()["findings"][0]["evidence"])
+
+    def test_a_host_without_glaeda_disk_is_not_judged(self) -> None:
+        self.mini.pass_facts = None
+        self.assertEqual(self.run_once()["findings"], [])
+
+    def test_one_item_measured_in_the_window_means_the_pass_ran(self) -> None:
+        facts = self.disk_pass(NOW - 900, NOW - 900, header_at=NOW - 8 * 86400)
+        facts["sizes"]["sizes"]["/never-timed"] = 3  # an item with no time of its own keeps `at` old
+        self.mini.pass_facts = facts
+        self.assertEqual(self.run_once()["findings"], [])
+
+    def real_mini(self, home: Path, summary: dict | None = None) -> health.Mini:
+        mini = health.Mini(home)
+        if summary is not None:
+            path = home / ".local/state/glaeda/disk/summary.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(summary))
+        cache = home / ".cache/glaeda-disk"
+        cache.mkdir(parents=True, exist_ok=True)
+        (cache / "sizes.json").write_text(json.dumps({"at": 1.0, "sizes": {"/a": 1}, "measured_at": {"/a": NOW - 60}}))
+        os.utime(cache / "sizes.json", (NOW - 3600, NOW - 3600))  # written before its newest measurement
+        return mini
+
+    def test_disk_pass_reads_glaeda_disks_own_snapshots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch.object(health.sys, "platform", "darwin"):
+            home = Path(tmp)
+            self.assertIsNone(health.Mini(home).disk_pass())  # no agent, no snapshot: not a glaeda-disk host
+            mini = self.real_mini(home)
+            facts = mini.disk_pass()
+            self.assertEqual(health.disk_pass_times(facts), {"sizes.json": NOW - 60, "accounting.json": None})
+            self.assertEqual(facts["agent"], "not installed")
+            self.assertIn("accounting.json missing", health.check_disk_pass(mini, NOW)[0]["evidence"])
+
+    def test_the_runner_cache_profile_needs_no_accounting_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch.object(health.sys, "platform", "darwin"):
+            mini = self.real_mini(Path(tmp), {"schema": "glaeda-disk/v1",
+                                              "accounting": [{"scope": "runner-cache-profile"}]})
+            self.assertEqual(health.disk_pass_times(mini.disk_pass()), {"sizes.json": NOW - 60})
+            self.assertEqual(health.check_disk_pass(mini, NOW), [])
+            self.assertEqual(health.check_disk_pass(mini, NOW + 2 * 86400)[0]["code"], "disk_pass_stale")
+
+    def test_a_linux_host_is_not_judged_by_the_launch_agent_rule(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch.object(health.sys, "platform", "linux"):
+            mini = self.real_mini(Path(tmp))
+            self.assertIsNone(mini.disk_pass())
+            self.assertEqual(health.check_disk_pass(mini, NOW + 9 * 86400), [])
 
     def test_unmeasured_space_is_a_health_finding(self) -> None:
         self.mini.disk = {"schema": "glaeda-disk/v1", "accounting": [{"unmeasured": 5 * 1024**3,

@@ -5982,6 +5982,19 @@ def load_snapshot(path: Path = SNAPSHOT) -> tuple[float, dict[str, int]]:
     return at, sizes
 
 
+def snapshot_stamp(at: float, sizes: dict[str, int], measured_at: dict[str, float]) -> float | None:
+    """The snapshot's global `at`: when its oldest size was measured. It stays at the old stamp while any item
+    has no time of its own, and moves to the oldest item time once every item has one. Without that, a snapshot
+    that only --apply passes re-measure (a fleet mini never runs a report, so never a background --refresh) kept
+    its first stamp for days although every size in it was minutes old. None (no sizes, or no snapshot yet)
+    means now."""
+    if not sizes:
+        return None  # nothing to be stale: a pass that found no candidates is a full measurement now
+    if all(k in measured_at for k in sizes):
+        return max(at, min(measured_at[k] for k in sizes)) if at else min(measured_at[k] for k in sizes)
+    return at or None
+
+
 def save_snapshot(sizes: dict[str, int], path: Path = SNAPSHOT, at: float | None = None,
                   measured_at: dict[str, float] | None = None) -> None:
     """`at` is when the oldest size was measured; per-item times prevent stale reports starving refresh."""
@@ -9939,11 +9952,15 @@ def _main_impl(argv: list[str] | None = None) -> int:
             old_at, old_sizes, old_times = load_snapshot_meta()
             merged = {**old_sizes, **known}
             save_snapshot(merged, measured_at={**old_times, **{k: time.time() for k in known}})
-        elif not at or len(known) != before or a.apply or fresh_paths:
+        elif not at or len(known) != before or a.apply or fresh_paths or not known:
             # Keep the global stamp old until every item has been refreshed, while recording exact item times.
             updated_times = {k: v for k, v in measured_at.items() if k in known}
             updated_times.update({k: time.time() for k in fresh_paths})
-            save_snapshot(known, at=at or None, measured_at=updated_times)
+            stamp = snapshot_stamp(at, known, updated_times)
+            save_snapshot(known, at=stamp, measured_at=updated_times)
+            if at:  # the age this run reports and refreshes on is the snapshot it just wrote (None: now)
+                at = stamp or time.time()
+                age_min = (time.time() - at) / 60
         if at and age_min > a.max_age and not a.apply:
             launch_background_refresh()
     if at and not a.json:
