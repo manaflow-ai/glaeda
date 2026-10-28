@@ -30,10 +30,5 @@
     "control_credentials": false,
     "publisher_credentials": false,
     "ssh_agent": false
-  },
-  "canary": {
-    "repository": "teamleaderleo/glaeda",
-    "runner_label": "big-red-owned-linux",
-    "workflow": ".github/workflows/big-red-jit-canary.yml"
   }
 }

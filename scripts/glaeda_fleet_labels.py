@@ -406,8 +406,9 @@ def pool_scope(manifest: Any, member: str) -> tuple[dict[str, str | None] | None
 
 
 def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]], str | None]:
-    """([{name, repo, org, group, labels, admit, watch, env}], None), or ([], why the member's list is unusable).
-    Pure. A member with no runner.dedicated has none."""
+    """([{name, repo, org, group, labels, admit, watch, env, keep, minFreeGib}], None), or ([], why the member's list
+    is unusable). Pure. A member with no runner.dedicated has none. minFreeGib is the entry's own disk floor, or None
+    for the member's disk.min_free_gib."""
     hosts = manifest.get("hosts") if isinstance(manifest, dict) else None
     host = hosts.get(member) if isinstance(hosts, dict) else None
     if not isinstance(host, dict):
@@ -429,7 +430,7 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
         if not isinstance(entry, dict):
             return [], f"{where} is not an object"
         unknown = sorted(set(entry) - {"name", "repo", "org", "group", "labels", "admit", "watch", "env", "keep",
-                                       "note"})
+                                       "minFreeGib", "note"})
         if unknown:
             return [], f"{where} has unknown keys: {', '.join(unknown)}"
         name, repo, org, group = entry.get("name"), entry.get("repo"), entry.get("org"), entry.get("group")
@@ -480,7 +481,14 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
                                                and ".." not in k.split("/") for k in keep)):
             return [], (f"{where}.keep must list paths under ~/ or {{runnerDir}}/ (no ..): the warm state glaeda-disk "
                         "keeps by role")
+        # The builder's own disk floor: the runner's --min-free-gib, so the listener gate holds the runner off under
+        # it (the job goes elsewhere) instead of the builder's admission refusing a job the runner already took.
+        floor = entry.get("minFreeGib")
+        # the range check alone (no float conversion): it refuses nan and inf, and a huge int never overflows
+        if floor is not None and (isinstance(floor, bool) or not isinstance(floor, (int, float))
+                                  or not 0 < floor <= 10000):
+            return [], f"{where}.minFreeGib must be a number of GiB above 0 and at most 10000"
         out.append({"name": name, "repo": repo, "org": org, "group": group, "labels": list(labels),
                     "admit": commands["admit"], "watch": commands.get("watch"), "env": dict(env),
-                    "keep": list(keep)})
+                    "keep": list(keep), "minFreeGib": None if floor is None else float(floor)})
     return out, None

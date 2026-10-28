@@ -44,6 +44,13 @@ snapshot that follows the release with the other two): each one's body, pinned t
 /Library/Application Support/cmux-fleet-ops/NAME with its LaunchDaemon. It acts only on a fleet Mac that already has
 that directory and no ec2-user account, never on a reserved host, and treats a reservation list it cannot read as a
 reservation (fleet_ops_hold).
+The same pass keeps each runner account's glaeda-runner-hygiene job on that release: the root-pinned glaeda-disk
+at /Library/Application Support/glaeda/runner-hygiene/<uid> and its LaunchDaemon, which glaeda-update (the runner
+user's) cannot write. glaeda-disk and glaeda-runner-hygiene are two more members the release chain installs into
+this snapshot; for every account that already has a job, that glaeda-runner-hygiene --check compares the snapshot
+and plist with what its --apply leaves, and a stale job is reinstalled by its --apply. A second pass finds them
+current and changes nothing. The report's runnerHygiene says per account: current, stale (with why), or error;
+glaeda-mini-health turns a stale or failed one into disk_root_copy_stale.
 Stdlib only; runs on macOS /usr/bin/python3 (3.9).
 """
 
@@ -82,6 +89,8 @@ SYSTEM_PYTHON = "/usr/bin/python3"  # SIP-protected; a Homebrew python is writab
 SCRIPT_NAME = "glaeda-daemon-heal"
 POLICY_NAME = "macos-daemons.json"
 FLEET_OPS_NAME = "fleet-ops.json"
+DISK_NAME = "glaeda-disk"  # with HYGIENE_NAME: the release's copies the runner-hygiene pass installs from
+HYGIENE_NAME = "glaeda-runner-hygiene"
 SYSTEM_PREFIXES = ("/System/", "/usr/libexec/", "/usr/sbin/", "/usr/bin/", "/sbin/")
 SYSTEM_UID_MAX = 499
 DAY_S = 86400
@@ -102,12 +111,14 @@ SHA_RE = re.compile(r"[0-9a-f]{40}")
 HEX64 = re.compile(r"[0-9a-f]{64}")
 ARCHIVE = "glaeda-hygiene-aarch64-apple-darwin.tar.gz"
 MEMBERS = {SCRIPT_NAME: "glaeda/scripts/glaeda-daemon-heal", POLICY_NAME: "glaeda/config/macos-daemons.json",
-           FLEET_OPS_NAME: "glaeda/config/fleet-ops.json"}
-MODES = {SCRIPT_NAME: 0o555, POLICY_NAME: 0o444, FLEET_OPS_NAME: 0o444}
-OPTIONAL = {FLEET_OPS_NAME}  # releases from before it ship the other two only
+           FLEET_OPS_NAME: "glaeda/config/fleet-ops.json", DISK_NAME: "glaeda/scripts/glaeda-disk",
+           HYGIENE_NAME: "glaeda/scripts/glaeda-runner-hygiene"}
+MODES = {SCRIPT_NAME: 0o555, POLICY_NAME: 0o444, FLEET_OPS_NAME: 0o444, DISK_NAME: 0o555, HYGIENE_NAME: 0o555}
+OPTIONAL = {FLEET_OPS_NAME, DISK_NAME, HYGIENE_NAME}  # a hand install and older releases ship the first two only
+SWAP_ORDER = (FLEET_OPS_NAME, DISK_NAME, HYGIENE_NAME, POLICY_NAME, SCRIPT_NAME)  # the running script last
 MAX_META = 1 << 20
 MAX_ARCHIVE = 200 << 20  # glaeda-update MAX_ASSET
-MAX_MEMBER = 1 << 20
+MAX_MEMBER = 4 << 20  # glaeda-disk is the largest member (0.6 MiB)
 FLEET_OPS_SCHEMA = "glaeda-fleet-ops/v1"
 FLEET_OPS_DIR = Path("/Library/Application Support/cmux-fleet-ops")  # fixed here: no policy file directs root's writes
 FLEET_ROOT = Path("/Users/Shared/cmux-build-fleet")
@@ -122,6 +133,12 @@ INSTALLED = "installed.json"  # beside the pair: the release it is (tag, commit,
 FETCH_TIMEOUT = 60
 CHECK_TIMEOUT = 120  # the staged copy's plan pass (ps and one top sample)
 AFTER_PID_WAIT_S = 300
+HYGIENE_ROOT = Path("/Library/Application Support/glaeda/runner-hygiene")  # glaeda-runner-hygiene INSTALL_ROOT
+HYGIENE_DAEMONS = Path("/Library/LaunchDaemons")
+HYGIENE_LABEL = "com.teamleaderleo.glaeda.runner-hygiene"  # its LABEL_PREFIX; the plist is <label>.<uid>.plist
+HYGIENE_RECHECK_S = 6 * 3600  # an unchanged, current install is checked again this often (launchd may drop it)
+HYGIENE_TIMEOUT = 120
+HYGIENE_RETRY_S = 900  # a check or reinstall that failed is tried again this long after, not every pass
 
 
 class HealError(RuntimeError):
@@ -691,7 +708,7 @@ def finish_pair(install_dir: Path, root: bool) -> bool:
         for name in OPTIONAL - set(staged):  # a release without it: no copy of another release's stays beside it
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(install_dir / name)
-        for name in (n for n in (FLEET_OPS_NAME, POLICY_NAME, SCRIPT_NAME) if n in staged):
+        for name in (n for n in SWAP_ORDER if n in staged):
             path = install_dir / name
             if read_bytes(path) != staged[name] or (path.stat().st_mode & 0o777) != MODES[name]:
                 atomic_write(path, staged[name], MODES[name], root)
@@ -1104,11 +1121,113 @@ def fleet_ops_pass(ops_path: Path, now: float, apply: bool, ops_dir: Path = FLEE
     return out
 
 
+# ---------------------------------------------------------------- runner accounts' root-pinned glaeda-disk
+
+
+def account_name(uid: int) -> str:
+    return pwd.getpwuid(uid).pw_name
+
+
+def hygiene_pass(install_dir: Path, state: dict[str, Any], now: float, live: bool, hygiene_root: Path = HYGIENE_ROOT,
+                 daemons: Path = HYGIENE_DAEMONS, run=bounded_run, python: str = SYSTEM_PYTHON,
+                 account=account_name) -> dict[str, Any]:
+    """Keep every runner account's glaeda-runner-hygiene job (a root-pinned glaeda-disk and its LaunchDaemon) on the
+    release this copy runs. For each account that already has one (an operator enrolled it once; nothing is
+    adopted), the release's own glaeda-runner-hygiene --check compares the snapshot and plist with what that
+    release's --apply leaves; a stale one is reinstalled by that release's --apply. Only the two files refresh()
+    took from the verified release and recorded in installed.json ever run as root. state["runner_hygiene"] remembers
+    each account's last current inputs, so an unchanged one is not checked again until HYGIENE_RECHECK_S."""
+    out: dict[str, Any] = {"accounts": {}}
+    try:
+        dirs = sorted((d for d in hygiene_root.iterdir() if d.name.isdigit() and (d / "manifest.json").is_file()),
+                      key=lambda d: int(d.name))
+    except FileNotFoundError:
+        dirs = []  # no account was ever enrolled here
+    except OSError as e:  # unreadable: the accounts are not managed this pass; the cache stays, the report says so
+        return {"accounts": {}, "error": f"cannot list {hygiene_root}: {str(e)[:200]}"}
+    ident = load_json(install_dir / INSTALLED)
+    files = ident.get("files") if isinstance(ident.get("files"), dict) else {}
+    tool, disk = install_dir / HYGIENE_NAME, install_dir / DISK_NAME
+    wants = files.get(DISK_NAME)
+    verified = bool(wants and files.get(HYGIENE_NAME)) and all(
+        files.get(p.name) == sha256(read_bytes(p) or b"") for p in (tool, disk))
+    if dirs and not verified:
+        out["hold"] = "this copy holds no glaeda-disk and glaeda-runner-hygiene its release recorded; a release pass brings them"
+    cache = state.setdefault("runner_hygiene", {})
+    for d in dirs:
+        uid = d.name
+        manifest = load_json(d / "manifest.json")
+        entry: dict[str, Any] = {"user": manifest.get("user"), "sha256": manifest.get("sha256"), "wants": wants}
+        out["accounts"][uid] = entry
+        try:
+            user = account(int(uid))
+        except (KeyError, ValueError):
+            user = None
+        if not user or user != manifest.get("user") or not isinstance(manifest.get("python"), str):
+            entry.update(state="error", why="its manifest names no account with this uid and a python; left to an operator")
+            continue
+        if not verified:
+            entry.update(state="unchecked", why=out["hold"])  # daemon_heal_stale covers a release pass that fails
+            continue
+
+        def inputs() -> str:  # what --check reads: the release's two files, the snapshot, its manifest and plist
+            return sha256(json.dumps([files.get(DISK_NAME), files.get(HYGIENE_NAME)] + [
+                sha256(read_bytes(p) or b"") for p in (d / DISK_NAME, d / "manifest.json",
+                                                       daemons / f"{HYGIENE_LABEL}.{uid}.plist")]).encode())
+
+        key = inputs()
+        seen = cache.get(uid) if isinstance(cache.get(uid), dict) else {}
+        if seen.get("key") == key and now - float(seen.get("at") or 0) < HYGIENE_RECHECK_S:
+            entry.update(state="current", why=f"checked at {iso(float(seen['at']))}")
+            continue
+        if seen.get("failed") and seen.get("inputs") == key and now - float(seen.get("at") or 0) < HYGIENE_RETRY_S:
+            entry.update(state=seen.get("state") or "error", why=str(seen["failed"]), action="reinstall")
+            continue
+        argv = [python, "-I", os.fspath(tool), "--user", user, "--source", os.fspath(disk),
+                "--python", manifest["python"]]
+
+        def ask(*flags: str) -> tuple[dict[str, Any] | None, str]:
+            code, said, err = run(argv + list(flags), timeout=HYGIENE_TIMEOUT)
+            try:
+                doc = json.loads(said) if code == 0 else None
+            except ValueError:
+                doc = None
+            return (doc if isinstance(doc, dict) else None), re.sub(r"\s+", " ", (err or said).strip())[-200:]
+
+        doc, said = ask("--check")
+        if doc is not None and doc.get("state") == "stale" and live:
+            applied, said = ask("--apply")
+            entry["reinstalled"] = applied is not None
+            if applied is not None:
+                entry["at"] = iso(now)
+                doc, said = ask("--check")
+        if doc is not None and doc.get("state") == "current":
+            entry.update(state="current", why="matches its release" + (" after a reinstall" if entry.get("reinstalled") else ""))
+            cache[uid] = {"key": inputs(), "at": now}
+            continue
+        if doc is None or doc.get("state") != "stale":
+            entry.update(state="error", why=f"glaeda-runner-hygiene: {said or 'no answer'}")
+        else:  # a root pass that tried to reinstall and is still stale has failed: an error, retried
+            failed = live and "reinstalled" in entry
+            entry.update(state="error" if failed else "stale", why=", ".join(map(str, doc.get("stale") or [])) +
+                         ("" if live else "; a root pass reinstalls it") +
+                         (f"; reinstall failed: {said}" if entry.get("reinstalled") is False else
+                          "; still stale after a reinstall" if failed else ""), action="reinstall")
+        if live:  # a root pass that could not fix it waits HYGIENE_RETRY_S before trying again
+            cache[uid] = {"failed": entry["why"], "state": entry["state"], "inputs": inputs(), "at": now}
+        else:
+            cache.pop(uid, None)
+    for uid in [u for u in cache if u not in out["accounts"]]:
+        cache.pop(uid)
+    return out
+
+
 # ---------------------------------------------------------------- main
 
 
 def run_pass(policy_path: Path, state_dir: Path, apply: bool, host: Host | None = None,
-             install_dir: Path | None = None, fleet_ops: dict[str, Any] | None = None, **release: Any) -> dict[str, Any]:
+             install_dir: Path | None = None, fleet_ops: dict[str, Any] | None = None,
+             hygiene: dict[str, Any] | None = None, **release: Any) -> dict[str, Any]:
     """One pass. The installed root copy (or a test's install_dir) also keeps itself on the release."""
     policy = load_policy(policy_path)
     state = load_json(state_dir / "state.json")
@@ -1116,7 +1235,7 @@ def run_pass(policy_path: Path, state_dir: Path, apply: bool, host: Host | None 
     root = os.geteuid() == 0
     if install_dir is None and root and Path(__file__).resolve() == (INSTALL_DIR / SCRIPT_NAME).resolve():
         install_dir = INSTALL_DIR
-    for key in ("release", "reload_at"):
+    for key in ("release", "reload_at", "runner_hygiene"):
         if key in state:
             new_state[key] = state[key]
     if apply and install_dir is not None:
@@ -1129,7 +1248,7 @@ def run_pass(policy_path: Path, state_dir: Path, apply: bool, host: Host | None 
     # The ops file sits beside the policy (the snapshot, the stage, or a release's config/). A copy that predates it
     # stages a new release with only the other two files, so its absence is reported, never a failed plan pass.
     ops_path = policy_path.with_name(FLEET_OPS_NAME)
-    live = apply and root and install_dir == INSTALL_DIR
+    live = root_live = apply and root and install_dir == INSTALL_DIR
     if live and fleet_ops is None and ops_path.exists():
         # Root acts only on the bytes refresh() took from the verified release and recorded in installed.json,
         # whatever put a file at this path (a hand install leaves the snapshot's as it was).
@@ -1145,6 +1264,13 @@ def run_pass(policy_path: Path, state_dir: Path, apply: bool, host: Host | None 
         if not apply:
             raise  # a plan pass (the staged check of a new release) refuses a pair with a bad fleet-ops.json
         report["fleetOps"] = {"error": str(e)[:300]}
+    # The runner accounts' root-pinned glaeda-disk follows the same release (a test passes hygiene to run it).
+    if apply and install_dir is not None and (root_live or hygiene is not None):
+        try:
+            report["runnerHygiene"] = hygiene_pass(install_dir, new_state, report_time(report),
+                                                   **{"live": root_live, **(hygiene or {})})
+        except (HealError, OSError, ValueError) as e:  # never at the cost of this pass's report
+            report["runnerHygiene"] = {"error": str(e)[:300], "accounts": {}}
     report["staleAfterS"] = policy["report_stale_passes"] * policy["every_s"]
     report["follows"] = RING  # stage_check: a release whose code says so keeps itself current once installed
     if "release" in new_state:

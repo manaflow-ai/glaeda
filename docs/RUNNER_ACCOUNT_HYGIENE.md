@@ -52,10 +52,24 @@ CI stores, or another account's data.
 The normal mini setup and OTA release install the operator command beside the
 other Glaeda tools, but they do not guess which old accounts are disposable.
 Run the `--apply` install once for each account that is actually enrolled as a
-runner. After a Glaeda release, rerun that root command from the reviewed
-release checkout to refresh the root-owned snapshot. OTA only updates the
-user-writable helper and never broadens the profile or adopts an unowned account
-automatically.
+runner. After that, no hand step keeps it current: the root
+`glaeda-daemon-heal` LaunchDaemon, which already follows the stable release
+through the verified channel, keeps that release's `glaeda-disk` and
+`glaeda-runner-hygiene` in its own root-owned snapshot. On each pass, for every
+account that already has a job here, it runs that release's
+`glaeda-runner-hygiene --user NAME --check` and, when the snapshot or plist is
+not what its `--apply` leaves, that `--apply`. An unchanged, current job is
+checked again every 6 hours; a failed reinstall is retried after 15 minutes.
+Its report (`runnerHygiene`) feeds `glaeda-mini-health`'s
+`disk_root_copy_stale:<uid>`. OTA (`glaeda-update`, the runner user) still only
+updates the user-writable helper, and nothing adopts an unenrolled account.
+
+```sh
+glaeda-runner-hygiene --user cmux --check    # read-only: current or stale, and why
+```
+
+A plist that an older release wrote (its bytes are the ones the manifest
+recorded) is replaced; a plist edited by hand is still refused.
 
 Before removing a runner account or running `glaeda-mini-setup --uninstall`,
 uninstall its root job first with `--uninstall --apply`; the normal setup

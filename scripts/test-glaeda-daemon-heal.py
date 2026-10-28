@@ -1046,5 +1046,187 @@ class Reload(unittest.TestCase):
             self.assertEqual(spawn.call_count, 1)
 
 
+DISK_BYTES = (ROOT / "scripts" / "glaeda-disk").read_bytes()
+HYGIENE_BYTES = (ROOT / "scripts" / "glaeda-runner-hygiene").read_bytes()
+
+
+class FakeHygiene:
+    """glaeda-runner-hygiene --check/--apply over a test tree: stale while the snapshot is not --source's bytes."""
+
+    def __init__(self, root: Path) -> None:
+        self.root, self.argv, self.fail_apply = root, [], False
+
+    def __call__(self, argv: list[str], timeout: float) -> tuple[int, str, str]:
+        self.argv.append(argv)
+        source = Path(argv[argv.index("--source") + 1]).read_bytes()
+        uid = "501"  # the one account the tests enroll
+        snapshot, manifest = self.root / uid / "glaeda-disk", self.root / uid / "manifest.json"
+        if "--apply" in argv:
+            if self.fail_apply:
+                return 2, "", "glaeda-runner-hygiene: launchctl bootstrap failed"
+            snapshot.write_bytes(source)
+            doc = json.loads(manifest.read_text())
+            manifest.write_text(json.dumps({**doc, "sha256": hashlib.sha256(source).hexdigest()}))
+            return 0, json.dumps({"state": "applied"}), ""
+        stale = [] if snapshot.read_bytes() == source else ["snapshot is not this source"]
+        return 0, json.dumps({"state": "stale" if stale else "current", "stale": stale}), ""
+
+    def applies(self) -> int:
+        return sum("--apply" in a for a in self.argv)
+
+
+class RunnerHygiene(unittest.TestCase):
+    """The root pass keeps each runner account's root-pinned glaeda-disk on the release it runs, idempotently."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        self.dir, self.root, self.daemons = base / "daemon-heal", base / "runner-hygiene", base / "LaunchDaemons"
+        for d in (self.dir, self.root / "501", self.daemons):
+            d.mkdir(parents=True)
+        (self.dir / heal.DISK_NAME).write_bytes(DISK_BYTES)
+        (self.dir / heal.HYGIENE_NAME).write_bytes(HYGIENE_BYTES)
+        (self.dir / heal.INSTALLED).write_text(json.dumps({"tag": "r-20261027-000000000002", "files": {
+            heal.DISK_NAME: hashlib.sha256(DISK_BYTES).hexdigest(),
+            heal.HYGIENE_NAME: hashlib.sha256(HYGIENE_BYTES).hexdigest()}}))
+        self.snapshot = self.root / "501" / "glaeda-disk"
+        self.snapshot.write_bytes(b"# the glaeda-disk an earlier release pinned\n")
+        (self.root / "501" / "manifest.json").write_text(json.dumps({
+            "user": "cmux", "python": "/usr/bin/python3", "sha256": hashlib.sha256(self.snapshot.read_bytes()).hexdigest()}))
+        (self.daemons / f"{heal.HYGIENE_LABEL}.501.plist").write_bytes(b"<plist/>")
+        self.run = FakeHygiene(self.root)
+        self.state: dict = {}
+
+    def hygiene_pass(self, live: bool = True, now: float = T0) -> dict:
+        return heal.hygiene_pass(self.dir, self.state, now, live, self.root, self.daemons, self.run,
+                                 sys.executable, lambda uid: {501: "cmux"}[uid])
+
+    def mtimes(self) -> list:
+        return sorted((p, p.stat().st_mtime_ns) for p in self.root.rglob("*"))
+
+    def assert_planned(self, report: dict) -> None:
+        """The invariant: a root copy whose hash is not its release's always has a reconcile action."""
+        for uid, a in report["accounts"].items():
+            have = hashlib.sha256((self.root / uid / "glaeda-disk").read_bytes()).hexdigest()
+            if have != a["wants"]:
+                self.assertTrue(a.get("action") == "reinstall" and a["state"] in ("stale", "error"),
+                                f"{uid}: root copy {have[:12]} is not its release's {a['wants'][:12]} and nothing is planned")
+
+    def test_a_root_copy_that_is_not_its_release_is_reinstalled_and_a_second_pass_changes_nothing(self) -> None:
+        report = self.hygiene_pass()
+        a = report["accounts"]["501"]
+        self.assertEqual((a["state"], a["reinstalled"], self.run.applies()), ("current", True, 1))
+        self.assertEqual(self.snapshot.read_bytes(), DISK_BYTES)
+        self.assertEqual(self.run.argv[0][:3], [sys.executable, "-I", os.fspath(self.dir / heal.HYGIENE_NAME)])
+        self.assertIn(os.fspath(self.dir / heal.DISK_NAME), self.run.argv[0])
+        self.assert_planned(report)
+        before, calls = self.mtimes(), len(self.run.argv)
+        second = self.hygiene_pass(now=T0 + 120)
+        self.assertEqual((second["accounts"]["501"]["state"], len(self.run.argv), self.mtimes()),
+                         ("current", calls, before), "the second pass runs nothing and writes nothing")
+        later = self.hygiene_pass(now=T0 + heal.HYGIENE_RECHECK_S + 1)
+        self.assertEqual((later["accounts"]["501"]["state"], self.run.applies(), self.mtimes()),
+                         ("current", 1, before), "a recheck only reads")
+
+    def test_a_stale_root_copy_always_has_a_planned_reinstall(self) -> None:
+        report = self.hygiene_pass(live=False)
+        self.assertEqual((report["accounts"]["501"]["state"], report["accounts"]["501"]["action"]), ("stale", "reinstall"))
+        self.assertEqual(self.run.applies(), 0, "only a root pass reinstalls")
+        self.assert_planned(report)
+        with self.assertRaises(AssertionError):  # the invariant catches a stale copy with no action
+            self.assert_planned({"accounts": {"501": {**report["accounts"]["501"], "action": None, "state": "current"}}})
+
+    def test_a_release_change_reaches_a_current_copy_at_once(self) -> None:
+        self.hygiene_pass()
+        newer = DISK_BYTES + b"\n# released later\n"
+        (self.dir / heal.DISK_NAME).write_bytes(newer)
+        ident = json.loads((self.dir / heal.INSTALLED).read_text())
+        ident["files"][heal.DISK_NAME] = hashlib.sha256(newer).hexdigest()
+        (self.dir / heal.INSTALLED).write_text(json.dumps(ident))
+        self.hygiene_pass(now=T0 + 120)
+        self.assertEqual((self.snapshot.read_bytes(), self.run.applies()), (newer, 2))
+
+    def test_root_runs_only_the_files_its_release_recorded(self) -> None:
+        (self.dir / heal.HYGIENE_NAME).write_bytes(b"print('not the release')\n")
+        report = self.hygiene_pass()
+        self.assertEqual((self.run.argv, report["accounts"]["501"]["state"]), ([], "unchecked"))
+        self.assertIn("release pass brings them", report["hold"])
+
+    def test_a_failed_reinstall_is_retried_after_hygiene_retry_s_not_every_pass(self) -> None:
+        self.run.fail_apply = True
+        a = self.hygiene_pass()["accounts"]["501"]
+        self.assertEqual((a["state"], a["reinstalled"], a["action"]), ("error", False, "reinstall"))
+        self.assertIn("bootstrap failed", a["why"])
+        calls = len(self.run.argv)
+        self.assertEqual(self.hygiene_pass(now=T0 + 120)["accounts"]["501"]["state"], "error")
+        self.assertEqual(len(self.run.argv), calls)
+        self.run.fail_apply = False
+        self.hygiene_pass(now=T0 + heal.HYGIENE_RETRY_S + 1)
+        self.assertEqual(self.snapshot.read_bytes(), DISK_BYTES)
+
+    def test_a_release_from_before_these_members_still_installs_and_holds_the_hygiene_pass(self) -> None:
+        for name in (heal.DISK_NAME, heal.HYGIENE_NAME, heal.INSTALLED):
+            (self.dir / name).unlink()
+        (self.dir / heal.SCRIPT_NAME).write_bytes(SCRIPT_BYTES)
+        (self.dir / heal.POLICY_NAME).write_bytes(POLICY_BYTES)
+        (self.dir / "state").mkdir()
+        channel = Channel()
+        tag = channel.publish(2, members={  # an archive with only the three members older releases shipped
+            heal.MEMBERS[heal.SCRIPT_NAME]: SCRIPT_BYTES, heal.MEMBERS[heal.POLICY_NAME]: POLICY_BYTES,
+            heal.MEMBERS[heal.FLEET_OPS_NAME]: OPS_BYTES,
+            heal.ANCESTRY: "".join(f"{k:040x}\n" for k in range(2, 0, -1)).encode()})
+        hygiene = {"hygiene_root": self.root, "daemons": self.daemons, "run": self.run, "python": sys.executable,
+                   "account": lambda uid: "cmux", "live": True}
+        report = heal.run_pass(self.dir / heal.POLICY_NAME, self.dir / "state", True, FakeHost(), install_dir=self.dir,
+                               get=channel.get, python=sys.executable, hygiene=hygiene)
+        self.assertEqual((report["release"]["tag"], report["release"]["error"], report["release"]["drifted"]),
+                         (tag, None, False))
+        self.assertEqual((report["runnerHygiene"]["accounts"]["501"]["state"], self.run.argv), ("unchecked", []))
+
+    def test_an_account_its_manifest_does_not_match_is_left_alone(self) -> None:
+        report = heal.hygiene_pass(self.dir, self.state, T0, True, self.root, self.daemons, self.run,
+                                   sys.executable, lambda uid: "someone-else")
+        self.assertEqual((report["accounts"]["501"]["state"], self.run.argv), ("error", []))
+
+    def test_an_unreadable_enrollment_directory_is_an_error_not_no_work(self) -> None:
+        self.hygiene_pass()
+        cache = dict(self.state["runner_hygiene"])
+        with mock.patch.object(heal.Path, "iterdir", side_effect=OSError(5, "Input/output error")):
+            report = self.hygiene_pass(now=T0 + 120)
+        self.assertIn("Input/output error", report["error"])
+        self.assertEqual(self.state["runner_hygiene"], cache, "the cache is kept")
+
+    def test_no_enrolled_account_is_no_work(self) -> None:
+        for p in (self.root / "501").iterdir():
+            p.unlink()
+        (self.root / "501").rmdir()
+        self.assertEqual(self.hygiene_pass(), {"accounts": {}})
+
+    def test_the_release_chain_brings_both_files_and_the_root_pass_uses_them(self) -> None:
+        for name in (heal.DISK_NAME, heal.HYGIENE_NAME, heal.INSTALLED):
+            (self.dir / name).unlink()
+        (self.dir / heal.SCRIPT_NAME).write_bytes(SCRIPT_BYTES)
+        (self.dir / heal.POLICY_NAME).write_bytes(POLICY_BYTES)
+        (self.dir / "state").mkdir()
+        channel = Channel()
+        channel.publish(2, members={
+            heal.MEMBERS[heal.SCRIPT_NAME]: SCRIPT_BYTES, heal.MEMBERS[heal.POLICY_NAME]: POLICY_BYTES,
+            heal.MEMBERS[heal.FLEET_OPS_NAME]: OPS_BYTES, heal.MEMBERS[heal.DISK_NAME]: DISK_BYTES,
+            heal.MEMBERS[heal.HYGIENE_NAME]: HYGIENE_BYTES,
+            heal.ANCESTRY: "".join(f"{k:040x}\n" for k in range(2, 0, -1)).encode()})
+        hygiene = {"hygiene_root": self.root, "daemons": self.daemons, "run": self.run, "python": sys.executable,
+                   "account": lambda uid: "cmux", "live": True}
+        report = heal.run_pass(self.dir / heal.POLICY_NAME, self.dir / "state", True, FakeHost(), install_dir=self.dir,
+                               get=channel.get, python=sys.executable, hygiene=hygiene)
+        self.assertEqual(((self.dir / heal.DISK_NAME).read_bytes(), self.snapshot.read_bytes()), (DISK_BYTES, DISK_BYTES))
+        self.assertEqual(report["runnerHygiene"]["accounts"]["501"]["state"], "current")
+        calls = len(self.run.argv)
+        again = heal.run_pass(self.dir / heal.POLICY_NAME, self.dir / "state", True, FakeHost(), install_dir=self.dir,
+                              get=channel.get, python=sys.executable, hygiene=hygiene)
+        self.assertEqual((again["runnerHygiene"]["accounts"]["501"]["state"], len(self.run.argv)), ("current", calls),
+                         "state.json carries the check: the next pass runs nothing")
+
+
 if __name__ == "__main__":
     unittest.main()

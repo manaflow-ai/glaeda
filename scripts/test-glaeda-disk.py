@@ -7579,21 +7579,164 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertIn("FileExistsError", gd._write_bundle(*args))
         self.assertEqual((written, written[0].read_bytes()), ([written[0]], first))
 
-    def test_a_mirror_with_uncommitted_work_is_kept_but_ignored_output_goes(self) -> None:
-        unit, clone, _ = self.mirror_unit()
+    def dirty_mirror(self) -> tuple[Path, Path, dict]:
+        """A mirror whose clone has a committed text and binary file, then uncommitted edits, a staged new file,
+        untracked notes, and untracked build output (ignored, a CACHEDIR.TAG tree, node_modules)."""
+        unit, clone, env = self.mirror_unit()
+        self.git(clone, "config", "core.autocrlf", "false")
+        (clone / "tracked.txt").write_text("v1\n")
+        (clone / "bin.dat").write_bytes(bytes(range(256)))
+        (clone / "gone.txt").write_text("deleted later\n")
+        self.git(clone, "add", ".", env=env)
+        self.git(clone, "commit", "-q", "-m", "files", env=env)
+        (clone / "tracked.txt").write_text("v2, edited on a laptop\n")
+        (clone / "bin.dat").write_bytes(bytes(reversed(range(256))))
+        (clone / "gone.txt").unlink()
+        (clone / "staged.txt").write_text("staged\n")
+        self.git(clone, "add", "staged.txt", env=env)
+        (clone / "notes.txt").write_text("untracked notes\n")
+        (clone / "sub").mkdir()
+        (clone / "sub/deep.txt").write_text("deep\n")
         with (clone / ".git/info/exclude").open("a") as f:
             f.write("build/\n")
         (clone / "build").mkdir()
         (clone / "build/out.o").write_text("x")
-        (clone / "notes.txt").write_text("edited on a laptop")
+        (clone / ".cargo-target/release").mkdir(parents=True)
+        (clone / ".cargo-target/CACHEDIR.TAG").write_bytes(gd.CACHEDIR_TAG + b"\n")
+        (clone / ".cargo-target/release/big.rlib").write_bytes(b"\0" * 4096)
+        (clone / "node_modules").mkdir()
+        (clone / "node_modules/x.js").write_text("x")
+        return unit, clone, env
+
+    def test_a_mirrors_uncommitted_work_is_archived_then_it_goes_and_the_archive_restores_it(self) -> None:
+        unit, clone, env = self.dirty_mirror()
+        want = {n: (clone / n).read_bytes() for n in ("tracked.txt", "bin.dat", "staged.txt", "notes.txt",
+                                                      "sub/deep.txt")}
+        gd.RUN.pop("bundle_failed", None)
+        rec, err = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "reclaimed", rec["reasons"])
+        self.assertFalse(unit.exists())
+        self.assertNotIn("ALERT", err)
+        archive = self.home / "archive/glaeda-disk"
+        patches, tars = sorted(archive.glob("*.patch")), sorted(archive.glob("*.tar.gz"))
+        self.assertEqual((len(patches), len(tars)), (1, 1))
+        manifest = [json.loads(ln) for ln in (archive / "manifest.jsonl").read_text().splitlines()]
+        listed = {e["name"]: e for e in manifest}
+        for f in (*patches, *tars):
+            self.assertRegex(f.name, gd.MIRROR_BUNDLE_RE)
+            self.assertEqual(listed[f.name]["sha256"], gd._sha256(f))
+        import tarfile
+        with tarfile.open(tars[0]) as t:
+            self.assertEqual(sorted(t.getnames()), ["notes.txt", "sub/deep.txt"])  # never build output
+        # restore: the bundled commit, then the patch, then the untracked files
+        restored = self.home / "restored"
+        self.git(self.home, "clone", "-q", str(self.home / "srv"), str(restored), env=env)
+        bundle = next(archive.glob("*.bundle"))
+        self.git(restored, "fetch", "-q", str(bundle), "refs/heads/main:refs/heads/restored", env=env)
+        self.git(restored, "checkout", "-q", "restored", env=env)
+        self.assertEqual(self.git(restored, "rev-parse", "HEAD"), listed[patches[0].name]["head"])
+        self.git(restored, "apply", "--binary", str(patches[0]), env=env)
+        subprocess.run(["tar", "-xzf", str(tars[0]), "-C", str(restored)], check=True)
+        self.assertEqual({n: (restored / n).read_bytes() for n in want}, want)
+        self.assertFalse((restored / "gone.txt").exists())
+        # and they expire with the bundles
+        self.assertEqual(gd.prune_mirror_archive(today="9999-12-31"), 3)
+        self.assertEqual(sorted(p.name for p in archive.iterdir()), ["manifest.jsonl"])
+
+    def test_uncommitted_work_no_patch_can_hold_keeps_the_mirror(self) -> None:
+        unit, clone, env = self.dirty_mirror()
+        self.git(clone, "update-index", "--assume-unchanged", "tracked.txt", env=env)
         gd.RUN.pop("bundle_failed", None)
         rec, err = self.apply_mirror(unit)
         self.assertEqual((rec["outcome"], rec["verdict"]), ("blocked:uncommitted", "blocked"))
+        self.assertTrue(any("hidden from status" in r for r in rec["reasons"]))
         self.assertTrue((clone / "notes.txt").exists())
         self.assertNotIn("bundle_failed", gd.RUN)
-        (clone / "notes.txt").unlink()
+        self.assertNotIn("ALERT", err)
+
+    def test_uncommitted_work_that_changes_after_its_archive_keeps_the_mirror(self) -> None:
+        unit, clone, _ = self.dirty_mirror()
+        real = gd.archive_work_tree
+
+        def then_edit(*args):
+            out = real(*args)
+            (clone / "tracked.txt").write_text("v3, edited while it was archived\n")  # same status line
+            return out
+        with mock.patch.object(gd, "archive_work_tree", side_effect=then_edit):
+            rec, _ = self.apply_mirror(unit)
+        self.assertEqual(rec["outcome"], "changed:in-use")
+        self.assertIn("its uncommitted work changed while it was archived", rec["reasons"])
+        # a mode change alone, same bytes, is a change too
+        found = {os.path.realpath(clone)}
+        before = gd.work_tree_fingerprint(clone, found)
+        os.chmod(clone / "notes.txt", 0o755)
+        self.assertNotEqual(gd.work_tree_fingerprint(clone, found), before)
+        self.assertIn("its uncommitted work changed while it was archived", rec["reasons"])
+        self.assertEqual((clone / "tracked.txt").read_text(), "v3, edited while it was archived\n")
+
+    def test_staged_content_the_work_tree_no_longer_has_keeps_the_mirror(self) -> None:
+        unit, clone, env = self.dirty_mirror()
+        (clone / "staged.txt").unlink()  # AD: the staged blob is only in the index
         rec, _ = self.apply_mirror(unit)
-        self.assertEqual(rec["outcome"], "reclaimed")
+        self.assertEqual(rec["outcome"], "blocked:uncommitted")
+        self.assertTrue(any("staged content differs" in r for r in rec["reasons"]))
+        self.assertTrue((clone / ".git").is_dir())
+
+    def test_an_archive_that_changes_before_the_delete_keeps_the_mirror(self) -> None:
+        unit, clone, _ = self.dirty_mirror()
+        why, written, recheck = gd.archive_mirror(unit)
+        self.assertEqual(why, "")
+        tar = next(w for w in written if w.name.endswith(".tar.gz"))
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "server_still_holds", return_value=""):
+            self.assertEqual(gd.mirror_moved(self.families_job(), unit, recheck), "")
+            tar.write_bytes(b"truncated")
+            self.assertIn("changed", gd.mirror_moved(self.families_job(), unit, recheck))
+            tar.unlink()
+            self.assertIn("gone", gd.mirror_moved(self.families_job(), unit, recheck))
+
+    def families_job(self):
+        return next(f for f in gd.default_families() if f.id == "cmux-job-cache")
+
+    def test_a_symlinked_or_inside_archive_keeps_the_mirror(self) -> None:
+        unit, clone, _ = self.dirty_mirror()
+        (self.home / "archive").mkdir()
+        (self.home / "archive/glaeda-disk").symlink_to(clone)  # its archive would go with the tree
+        self.assertIn("symlink", gd.archive_mirror(unit)[0])
+        (self.home / "archive/glaeda-disk").unlink()
+        (self.home / "archive/glaeda-disk").mkdir()
+        (self.home / "archive/glaeda-disk/manifest.jsonl").symlink_to(self.home / "elsewhere.jsonl")
+        self.assertIn("symlink", gd.archive_mirror(unit)[0])
+        self.assertTrue((clone / "notes.txt").exists())
+
+    def test_a_process_that_comes_in_during_the_rename_puts_the_mirror_back(self) -> None:
+        unit, clone, _ = self.dirty_mirror()
+        calls = []
+
+        def evidence():
+            calls.append(1)  # the pass's own reads find nothing; the read after the rename finds a shell in it
+            doomed = unit.with_name(f"{gd.DELETING_PREFIX}{unit.name}-{os.getpid()}")
+            return ([os.fspath(doomed / "slot-1")] if doomed.exists() else []), ""
+        with mock.patch.object(gd, "process_evidence", side_effect=evidence):
+            rec, _ = self.apply_mirror(unit)
+        self.assertNotEqual(rec["outcome"], "reclaimed")
+        self.assertTrue((clone / "notes.txt").exists())
+
+    def test_an_expired_archive_in_use_or_changed_is_kept(self) -> None:
+        unit, _, _ = self.dirty_mirror()
+        self.assertEqual(gd.archive_mirror(unit)[0], "")
+        archive = self.home / "archive/glaeda-disk"
+        files = sorted(p for p in archive.iterdir() if p.name != "manifest.jsonl")
+        self.assertEqual(gd.prune_mirror_archive("9999-12-31", in_use=lambda p: True), 0)
+        self.assertEqual(gd.prune_mirror_archive("9999-12-31", in_use=lambda p: p.name.endswith(".expiring")), 0)
+        self.assertEqual(sorted(p for p in archive.iterdir() if p.name != "manifest.jsonl"), files)
+        self.assertEqual(stat.S_IMODE(archive.stat().st_mode), 0o700)
+        for f in archive.iterdir():
+            self.assertEqual(stat.S_IMODE(f.stat().st_mode), 0o600, f.name)
+        files[0].write_bytes(b"changed since")
+        self.assertEqual(gd.prune_mirror_archive("9999-12-31"), len(files) - 1)
+        self.assertEqual(sorted(p for p in archive.iterdir() if p.name != "manifest.jsonl"), [files[0]])
+        self.assertEqual(files[0].read_bytes(), b"changed since")
 
     def test_a_checkout_in_ignored_files_has_its_local_refs_bundled(self) -> None:
         unit, clone, env = self.mirror_unit()
@@ -7670,20 +7813,22 @@ class LinuxLayoutTest(unittest.TestCase):
         self.assertTrue(any("repositories changed" in r for r in rec["reasons"]))
         self.assertTrue((unit / "slot-2/.git").is_dir())
 
-    def test_a_tree_dirtied_before_its_snapshot_is_kept(self) -> None:
+    def test_a_tree_dirtied_before_its_snapshot_has_that_work_archived(self) -> None:
         unit, clone, _ = self.mirror_unit()
         real = gd.mirror_git_snapshot
         calls = []
 
         def dirtying(gitdirs, trees):
-            if not calls:  # after the clean check, before the baseline: the baseline itself is dirty
+            if not calls:  # after the scan, before the baseline: the baseline and the archive both hold it
                 (clone / "notes.txt").write_text("edited")
             calls.append(1)
             return real(gitdirs, trees)
         with mock.patch.object(gd, "mirror_git_snapshot", dirtying):
             rec, _ = self.apply_mirror(unit)
-        self.assertEqual(rec["outcome"], "changed:in-use")
-        self.assertTrue((clone / "notes.txt").exists())
+        self.assertEqual(rec["outcome"], "reclaimed", rec["reasons"])
+        import tarfile
+        with tarfile.open(next((self.home / "archive/glaeda-disk").glob("*.tar.gz"))) as t:
+            self.assertEqual(t.extractfile("notes.txt").read(), b"edited")
 
     def test_a_mirrors_owner_and_references_are_read_again_after_bundling(self) -> None:
         unit, _, _ = self.mirror_unit()
@@ -8593,6 +8738,348 @@ class CaptureDedupeTest(unittest.TestCase):
         self.assertGreater(passes, 2)
         self.assertEqual(changed(), {"r1": 2, "r2": 2, "r3": 2, "r4": 2})
         self.assertTrue(all(p.read_bytes() == d for p, d in frames.items()))
+
+
+class HygieneMirrorTest(unittest.TestCase):
+    """The 12 h hygiene rule on a CI mini: fleet cache entries, CUA build trees and ~/Library/Caches/cmux* idle past
+    12 h go once their unpushed commits are bundled into ~/archive; a process in one keeps it (cmux13s, 2026-10-27)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(os.path.realpath(self.tmp.name))
+        self.saved = (gd.HOME, gd.FLEET_ROOT, gd.DARWIN, gd.ROLE)
+        gd.HOME, gd.FLEET_ROOT, gd.DARWIN, gd.ROLE = self.home, self.home / "shared-fleet", True, "fleet-mini"
+        gd._DISCOVERED.clear()
+        (gd.FLEET_ROOT / "cache").mkdir(parents=True)
+        self.env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+
+    def tearDown(self) -> None:
+        gd.HOME, gd.FLEET_ROOT, gd.DARWIN, gd.ROLE = self.saved
+        gd._DISCOVERED.clear()
+        self.tmp.cleanup()
+
+    def checkout(self, tree: Path) -> Path:
+        """A clone with a commit no remote holds, idle 26 h."""
+        repo = tree / "work"
+        subprocess.run(["git", "init", "-q", str(repo)], check=True, env=self.env)
+        (repo / "f").write_text("x")
+        subprocess.run(["git", "-C", str(repo), "add", "f"], check=True, env=self.env)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "local only"], check=True, env=self.env)
+        (tree / "build.o").write_bytes(b"o" * 4096)
+        t = time.time() - 26 * 3600
+        for dirpath, dirnames, filenames in os.walk(tree):
+            for n in dirnames + filenames:
+                os.utime(os.path.join(dirpath, n), (t, t), follow_symlinks=False)
+        os.utime(tree, (t, t))
+        return repo
+
+    def families(self, runners: bool = True) -> dict[str, gd.Family]:
+        with mock.patch.object(gd, "enrolled_runners", return_value=[self.home / "actions-runner"] if runners else []):
+            return {f.id: f for f in gd.default_families()
+                    if f.id in ("fleet-artifacts", "cua-cache", "library-caches")}
+
+    def survey(self, fam: gd.Family, cmds: str = "", opened: list[str] | None = None) -> dict[str, gd.Item]:
+        with mock.patch.object(gd, "process_evidence", return_value=(opened or [], cmds)):
+            return {Path(i.path).name: i for i in gd.survey([fam], 24, 0)}
+
+    def test_an_idle_tree_with_unpushed_commits_is_bundled_then_removed(self) -> None:
+        tree = gd.FLEET_ROOT / "cache/ios-workspaces"
+        self.checkout(tree)
+        fam = self.families()["fleet-artifacts"]
+        self.assertEqual(fam.mirror_idle_hours, gd.DEFAULT_AGE_HOURS)
+        item = self.survey(fam)["ios-workspaces"]
+        self.assertEqual(item.verdict, "reclaimable", item.reasons)
+        self.assertTrue(any("mirrors" in r for r in item.reasons))
+        receipt = self.home / "receipt.jsonl"
+        with contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            gd.apply([item], {fam.id: fam}, receipt, None, 24)
+        self.assertFalse(tree.exists())
+        bundles = sorted((self.home / "archive/glaeda-disk").glob("*.bundle"))
+        self.assertEqual(len(bundles), 1)
+        heads = subprocess.run(["git", "bundle", "list-heads", str(bundles[0])], capture_output=True, text=True,
+                               check=True).stdout
+        self.assertIn("refs/heads/", heads)
+
+    def test_a_tree_with_a_process_in_it_is_kept(self) -> None:
+        tree = gd.HOME / "Library/Caches/cmux/cmux-cua/build-src-abc"
+        repo = self.checkout(tree)
+        fam = self.families()["cua-cache"]
+        self.assertEqual(self.survey(fam)["build-src-abc"].verdict, "reclaimable")
+        item = self.survey(fam, opened=[f"{repo}"])["build-src-abc"]
+        self.assertEqual(item.verdict, "in-use", item.reasons)
+        # a process that starts after the survey keeps it at apply's fresh evidence, before any bundle goes
+        idle = self.survey(fam)["build-src-abc"]
+        receipt = self.home / "receipt.jsonl"
+        with contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(gd, "process_evidence", return_value=([], f"swift build --package-path {repo}\n")):
+            gd.apply([idle], {fam.id: fam}, receipt, None, 24)
+        self.assertTrue((repo / ".git").is_dir())
+        self.assertIn("changed:in-use", receipt.read_text())
+
+    def test_only_cmux_library_caches_and_never_a_warm_tree_kept_by_role(self) -> None:
+        caches = gd.HOME / "Library/Caches"
+        for name in ("cmux-ci", "cmux-release-support", "org.example.tool"):
+            self.checkout(caches / name)
+        items = self.survey(self.families()["library-caches"])
+        self.assertEqual(items["cmux-ci"].verdict, "reclaimable", items["cmux-ci"].reasons)
+        self.assertNotIn("cmux-release-support", items)  # NEVER_DELETE: a release builder's warm trees
+        self.assertEqual(items["org.example.tool"].verdict, "git-checkout")
+
+    def test_warm_caches_kept_by_role_never_take_the_rule_even_unsplit(self) -> None:
+        """cmux-nightly-next is a library-caches item while its split is off: the rule must still pass it by, as it
+        does cmux-next-ci, cmux-release-support and cmux-ci-media."""
+        caches = gd.HOME / "Library/Caches"
+        for name in gd.HYGIENE_MIRROR_KEEP:
+            self.checkout(caches / name)
+        policy = {**gd.POLICY, "nightly_next_dedicated_label": ""}
+        with mock.patch.object(gd, "POLICY", policy):
+            fam = self.families()["library-caches"]
+            self.assertNotIn(gd.NIGHTLY_NEXT_ROOT, fam.skip)
+            items = self.survey(fam)
+        for name in gd.HYGIENE_MIRROR_KEEP:
+            self.assertFalse(gd.mirror_due(fam, caches / name, 999.0), name)
+            if name in items:
+                self.assertNotEqual(items[name].verdict, "reclaimable", (name, items[name].reasons))
+
+    def test_a_lone_file_never_takes_the_rule_and_still_goes_by_age(self) -> None:
+        caches = gd.HOME / "Library/Caches"
+        caches.mkdir(parents=True)
+        (caches / "cmux-notes.txt").write_text("x")
+        self.assertFalse(gd.mirror_due(self.families()["library-caches"], caches / "cmux-notes.txt", 999.0))
+        files = {"fleet-artifacts": gd.FLEET_ROOT / "cache/old.tar", "cua-cache": gd.HOME / "Library/Caches/cmux/cmux-cua/f.bin"}
+        t = time.time() - 26 * 3600
+        for fid, f in files.items():
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_bytes(b"x" * 4096)
+            os.utime(f, (t, t))
+            fam = self.families()[fid]
+            self.assertFalse(gd.mirror_due(fam, f, 26.0), fid)
+            item = self.survey(fam)[f.name]
+            self.assertEqual(item.verdict, "reclaimable", (fid, item.reasons))
+            receipt = self.home / f"{fid}.jsonl"
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    mock.patch.object(gd, "process_evidence", return_value=([], "")):
+                gd.apply([item], {fam.id: fam}, receipt, None, 24)
+            self.assertFalse(f.exists(), (fid, receipt.read_text()))
+
+    def test_another_filesystem_below_a_mirror_keeps_it(self) -> None:
+        tree = gd.FLEET_ROOT / "cache/split-spring-apps"
+        (tree / "apps/vol").mkdir(parents=True)
+        fam = self.families()["fleet-artifacts"]
+        self.assertEqual(gd.mount_below(tree), "")
+        self.assertIn("too large", gd.mount_below(tree, budget=1))
+        real_scandir = os.scandir
+
+        class Entry:  # a DirEntry whose directory sits on another device
+            def __init__(self, e):
+                self._e, self.name, self.path = e, e.name, e.path
+
+            def is_dir(self, follow_symlinks=True):
+                return self._e.is_dir(follow_symlinks=follow_symlinks)
+
+            def stat(self, follow_symlinks=True):
+                st = self._e.stat(follow_symlinks=follow_symlinks)
+                return os.stat_result((st.st_mode, st.st_ino, st.st_dev + 1, *tuple(st)[3:])) \
+                    if self.name == "vol" else st
+
+        @contextlib.contextmanager
+        def scandir(path):
+            with real_scandir(path) as it:
+                yield [Entry(e) for e in it]
+        with mock.patch.object(gd.os, "scandir", scandir):
+            self.assertEqual(gd.mount_below(tree), "another filesystem is mounted below it (apps/vol)")
+        t = time.time() - 26 * 3600
+        for d in (tree / "apps/vol", tree / "apps", tree):
+            os.utime(d, (t, t))
+        item = self.survey(fam)["split-spring-apps"]
+        self.assertEqual(item.verdict, "reclaimable", item.reasons)
+        receipt = self.home / "receipt.jsonl"
+        with mock.patch.object(gd, "mount_below", return_value="another filesystem is mounted below it (apps/vol)"), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            gd.apply([item], {fam.id: fam}, receipt, None, 24)
+        self.assertTrue((tree / "apps/vol").is_dir())
+        self.assertIn("blocked:mount", receipt.read_text())
+        # an unreadable directory below it could hide a mount: inconclusive keeps it
+        os.chmod(tree / "apps/vol", 0)
+        try:
+            self.assertIn("unreadable below it", gd.mount_below(tree))
+            self.assertTrue(gd.archive_mirror(tree)[0])  # mirror_repos or mount_below refuses it, never a bundle
+        finally:
+            os.chmod(tree / "apps/vol", 0o755)
+        # and a mount that appears while the work is bundled keeps it at mirror_moved
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "mount_below", return_value="another filesystem is mounted below it (x)"):
+            self.assertIn("another filesystem", gd.mirror_moved(fam, tree, ([], [], [], {}, None, {}, {})))
+
+    def test_other_archives_expire_30_days_after_their_newest_change_and_never_sooner(self) -> None:
+        archive = gd.HOME / "archive"
+        manual = archive / "cnx-wg-aziz-20261027"
+        manual.mkdir(parents=True)
+        (manual / "uncommitted.patch").write_text("diff")
+        (manual / "head.bundle").write_bytes(b"bundle")
+        (archive / "loose.tar.gz").write_bytes(b"x")
+        (archive / "busy.patch").write_bytes(b"x")
+        fresh = archive / "fresh"
+        (fresh / "deep").mkdir(parents=True)
+        (fresh / "deep/new.txt").write_text("touched two days from now")
+        later = time.time() + 2 * 86400
+        os.utime(fresh / "deep/new.txt", (later, later))
+        (archive / "glaeda-disk").mkdir()
+        (archive / "glaeda-disk/kept.bundle").write_bytes(b"listed or not, the manifest decides")
+        outside = gd.HOME / "elsewhere"
+        outside.mkdir()
+        (archive / "link").symlink_to(outside)
+        held = archive / "held"
+        held.mkdir()
+        locked = archive / "locked"
+        (locked / "inner").mkdir(parents=True)
+        everything = sorted(p.name for p in archive.iterdir())
+        self.assertEqual(gd.prune_foreign_archives(now=time.time() + 29 * 86400), [])
+        self.assertEqual(sorted(p.name for p in archive.iterdir()), everything)
+        def in_use(p: Path) -> bool:  # busy.patch comes into use only after it is renamed aside
+            return p == held or p.name.startswith(gd.DELETING_PREFIX + "busy.patch")
+        os.chmod(locked / "inner", 0)  # unreadable: kept, whatever its age
+        try:
+            gone = gd.prune_foreign_archives(now=time.time() + 31 * 86400, in_use=in_use)
+        finally:
+            os.chmod(locked / "inner", 0o755)
+        self.assertEqual(sorted(Path(p).name for p in gone), ["cnx-wg-aziz-20261027", "loose.tar.gz"])
+        self.assertEqual(sorted(p.name for p in archive.iterdir()),
+                         ["busy.patch", "fresh", "glaeda-disk", "held", "link", "locked"])
+        self.assertTrue((archive / "glaeda-disk/kept.bundle").exists() and outside.is_dir())
+
+    def test_an_archive_that_comes_into_use_or_changes_while_it_expires_goes_back(self) -> None:
+        archive = gd.HOME / "archive"
+        old = archive / "old"
+        old.mkdir(parents=True)
+        (old / "a.patch").write_text("diff")
+        calls = []
+
+        def busy_on_recheck(p: Path) -> bool:
+            calls.append(p.name)
+            return len(calls) > 1  # free at the first look, in use after the rename
+        self.assertEqual(gd.prune_foreign_archives(now=time.time() + 31 * 86400, in_use=busy_on_recheck), [])
+        self.assertEqual(sorted(p.name for p in archive.iterdir()), ["old"])
+        self.assertEqual((old / "a.patch").read_text(), "diff")
+        import socket
+        sock = socket.socket(socket.AF_UNIX)
+        self.addCleanup(sock.close)
+        cwd = os.getcwd()
+        os.chdir(old)  # a relative name: the temp path may be past the AF_UNIX length limit
+        try:
+            sock.bind("s")
+        except PermissionError:
+            self.skipTest("this sandbox refuses AF_UNIX binds")
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(gd.prune_foreign_archives(now=time.time() + 31 * 86400), [])  # a socket below it
+        (old / "s").unlink()
+        self.assertEqual(len(gd.prune_foreign_archives(now=time.time() + 31 * 86400)), 1)
+        self.assertEqual(list(archive.iterdir()), [])
+
+    def test_the_renames_own_ctime_never_reads_as_a_change(self) -> None:
+        archive = gd.HOME / "archive"
+        old = archive / "old"
+        old.mkdir(parents=True)
+        (old / "a.patch").write_text("diff")
+        newest = gd._newest_change(old)
+        root = os.lstat(archive)
+        doomed = old.with_name(f"{gd.DELETING_PREFIX}old-{os.getpid()}")
+        os.rename(old, doomed)
+        st = os.lstat(doomed)
+        later = newest + 3600  # the rename's ctime, made deterministic: never read as the entry's age
+        real = os.lstat
+
+        def lstat(q, *a, **k):
+            r = real(q, *a, **k)
+            return os.stat_result((*r[:9], later)) if os.fspath(q) == os.fspath(doomed) else r
+        with mock.patch.object(gd.os, "lstat", side_effect=lstat):
+            gd._foreign_archive_recheck(old, (root.st_dev, root.st_ino), newest, lambda p: False,
+                                        (st.st_dev, st.st_ino))  # passes: no raise
+        (doomed / "a.patch").write_text("changed")
+        later = newest + 3600
+        os.utime(doomed / "a.patch", (later, later))
+        with self.assertRaises(gd.SlotTaken):
+            gd._foreign_archive_recheck(old, (root.st_dev, root.st_ino), newest, lambda p: False)
+        self.assertEqual((old / "a.patch").read_text(), "changed")  # put back
+
+    def test_an_archive_swapped_for_another_before_its_rename_is_kept(self) -> None:
+        archive = gd.HOME / "archive"
+        archive.mkdir(parents=True)
+        f = archive / "loose.patch"
+        f.write_text("old")
+        first = os.lstat(f)
+        f.unlink()
+        f.write_text("new contents")  # a fresh file at the same name, its mtime set back
+        os.utime(f, (first.st_mtime, first.st_mtime))
+        root = os.lstat(archive)
+        doomed = f.with_name(f"{gd.DELETING_PREFIX}{f.name}-{os.getpid()}")
+        os.rename(f, doomed)
+        if (os.lstat(doomed).st_ino) == first.st_ino:
+            self.skipTest("the filesystem reused the inode")
+        with self.assertRaises(gd.SlotTaken):
+            gd._foreign_archive_recheck(f, (root.st_dev, root.st_ino), first.st_mtime + 1, lambda p: False,
+                                        (first.st_dev, first.st_ino))
+        self.assertEqual(f.read_text(), "new contents")
+
+    def test_a_file_rewritten_in_place_with_its_old_mtime_is_kept(self) -> None:
+        archive = gd.HOME / "archive"
+        archive.mkdir(parents=True)
+        f = archive / "loose.patch"
+        f.write_text("old")
+        first = os.lstat(f)
+        digest = gd._sha256(f)
+        with f.open("r+") as h:  # same inode, new bytes, old mtime
+            h.write("new")
+        os.utime(f, (first.st_mtime, first.st_mtime))
+        root = os.lstat(archive)
+        doomed = f.with_name(f"{gd.DELETING_PREFIX}{f.name}-{os.getpid()}")
+        os.rename(f, doomed)
+        with self.assertRaises(gd.SlotTaken):
+            gd._foreign_archive_recheck(f, (root.st_dev, root.st_ino), first.st_mtime + 1, lambda p: False,
+                                        (first.st_dev, first.st_ino), digest)
+        self.assertEqual(f.read_text(), "new")
+
+    def test_a_directory_swapped_for_a_fresh_file_after_its_look_is_kept(self) -> None:
+        archive = gd.HOME / "archive"
+        old = archive / "old"
+        old.mkdir(parents=True)
+        (old / "a.patch").write_text("diff")
+        real = gd.mount_below
+
+        def swap(path, *a, **k):  # after the age was judged, before the rename
+            if path == old and old.is_dir():
+                shutil.rmtree(old)
+                old.write_text("fresh data")
+            return real(path, *a, **k)
+        with mock.patch.object(gd, "mount_below", side_effect=swap), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(gd.prune_foreign_archives(now=time.time() + 31 * 86400), [])
+        self.assertEqual(old.read_text(), "fresh data")
+
+    def test_existing_archive_dirs_and_manifest_are_tightened(self) -> None:
+        root = gd.mirror_archive()
+        root.mkdir(parents=True)
+        os.chmod(root.parent, 0o755)
+        os.chmod(root, 0o755)
+        (root / "manifest.jsonl").write_text("")
+        os.chmod(root / "manifest.jsonl", 0o644)
+        tmp = root / ".t.tmp"
+        tmp.write_text("x")
+        gd._private_archive_dir()
+        gd._keep_archive(tmp, root / "x.expires-2099-01-01.patch", "2099-01-01", [])
+        self.assertEqual([stat.S_IMODE(os.stat(p).st_mode) for p in (root.parent, root, root / "manifest.jsonl")],
+                         [0o700, 0o700, 0o600])
+
+    def test_off_where_no_ci_runner_is_enrolled(self) -> None:
+        (gd.HOME / "Library/Caches/cmux/cmux-cua").mkdir(parents=True)
+        fams = self.families(runners=False)
+        self.assertEqual({fid: f.mirror_idle_hours for fid, f in fams.items()},
+                         {"fleet-artifacts": None, "cua-cache": None, "library-caches": None})
+        self.checkout(gd.FLEET_ROOT / "cache/ios-workspaces")
+        self.assertEqual(self.survey(fams["fleet-artifacts"])["ios-workspaces"].verdict, "git-checkout")
 
 
 class NightlyNextFallbackTest(unittest.TestCase):
