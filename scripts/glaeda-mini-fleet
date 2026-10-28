@@ -2885,12 +2885,14 @@ sub stop {  # signal what one fresh look finds, and always the command's own gro
 $pid = fork();
 defined $pid or die "fork: $!\n";
 if (!$pid) { setpgrp(0, 0); exec { $ARGV[0] } @ARGV; die "exec $ARGV[0]: $!\n"; }
+my ($deadline, $nap);
 sub done {  # exit with the command's own status once it has ended
   return unless waitpid($pid, POSIX::WNOHANG()) == $pid;
   my $status = $?;
+  exit 124 if clock_gettime(CLOCK_MONOTONIC) >= $deadline;  # it ended only once the limit had passed
   exit($status & 127 ? 128 + ($status & 127) : $status >> 8);
 }
-my ($deadline, $nap) = (clock_gettime(CLOCK_MONOTONIC) + $limit, 0.05);
+($deadline, $nap) = (clock_gettime(CLOCK_MONOTONIC) + $limit, 0.05);
 while (clock_gettime(CLOCK_MONOTONIC) < $deadline) {
   done();
   look();
