@@ -10,10 +10,13 @@
   "stop_wait_s": 10,
   "report_stale_passes": 3,
   "sandbox_probe": {
-    "note": "sandboxd self-heal (scripts/glaeda-daemon-heal): on an idle fleet mini, an ad-hoc signed /bin/date under (deny mach-lookup) that takes slow_s or longer kickstarts sandboxd, at most once every every_s. Seen 2026-10-27 on austin-0 and austin-1: a sandboxd stuck on one tccd request hung brew's bottle pour for 8 h; the probe took 0.1 s on healthy minis and never returned there.",
+    "note": "sandboxd self-heal (scripts/glaeda-daemon-heal; fleet decision by claude-sr2 (coordinator), 2026-10-28): on an idle, registry-opted-in fleet mini holding the fleet host.lock, an ad-hoc signed /bin/date under (deny mach-lookup) that takes slow_s or longer twice, confirm_after_s to confirm_within_s apart, reboots the mini (launchctl kickstart of sandboxd is refused under SIP). At most one reboot per reboot_every_s; a mini that would need a second within repeat_window_s is not rebooted and becomes an HQ fleet-alert issue. Seen 2026-10-27/28 on austin-0 and austin-1: a sandboxd stuck on one tccd request hung brew's bottle pour for 8 h; the probe took 0.1 s on healthy minis and never returned there, and a reboot cleared it.",
     "enabled": true,
     "slow_s": 5,
-    "every_s": 21600
+    "confirm_after_s": 240,
+    "confirm_within_s": 1800,
+    "reboot_every_s": 86400,
+    "repeat_window_s": 604800
   },
   "release": {
     "note": "The root copy keeps itself on the stable release: every every_s it reads the channel from the first of sources that answers, and replaces its script and this policy when the release's differ (hash chain channel, release.json, archive). stale_s: how long it may lag its channel, or go without reading it, before glaeda-mini-health and glaeda-fleet-status call it daemon_heal_stale.",

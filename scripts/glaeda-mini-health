@@ -66,6 +66,11 @@ Each run checks, as the runner user and without sudo:
                                      interface for the tailnet address. The check could not look, so the
                                      tunnel is not judged down: reported only, never healed. It keeps
                                      tailscale_no_route's count as it was (it did not look at the route).
+  sandboxd_wedged                    the root glaeda-daemon-heal's sandbox probe (an ad-hoc signed binary under
+                                     `(deny mach-lookup)`) hangs again on a mini it rebooted for that within the
+                                     last 7 days, so it does not reboot it again (its report's sandbox.needs_operator;
+                                     at most one such reboot a day and one a week). An error: ci-dash keeps it as an
+                                     HQ fleet-alert issue. A healed reboot shows under healed as sandboxd_wedged.
   runner_stopped:<agent>             a runner LaunchAgent is loaded but not running (KeepAlive leaves it after a clean
                                      exit). Healed after two runs in a row with `launchctl kickstart`; nothing runs
                                      in it, so no job is disturbed. The listener gate's holds keep the agent running,
@@ -2016,6 +2021,11 @@ def check_daemon_heal(mini: Mini) -> list[dict[str, Any]]:
                                "the root glaeda-daemon-heal pass reinstalls it" if stale else
                                "root: the release's glaeda-runner-hygiene --user "
                                f"{a.get('user') or '<account>'} --apply (docs/RUNNER_ACCOUNT_HYGIENE.md)"))
+        sandbox = report.get("sandbox") if isinstance(report.get("sandbox"), dict) else {}
+        if sandbox.get("needs_operator"):  # the root heal would reboot a second time within its window: a person's
+            out.append(finding("sandboxd_wedged", "error", str(sandbox["needs_operator"])[:400], "impossible",
+                               "the root glaeda-daemon-heal reboots a wedged sandboxd at most once a week per mini; "
+                               "find why it wedges again (sample sandboxd's com.apple.sandboxd.approval queue)"))
         for h in report.get("hot") or []:
             if not isinstance(h, dict) or not h.get("name"):
                 continue

@@ -54,11 +54,24 @@ glaeda-mini-health turns a stale or failed one into disk_root_copy_stale.
 The same pass keeps sandboxd answering (policy `sandbox_probe`). Homebrew pours every bottle under sandbox-exec, and a
 sandboxd whose approval queue waits forever on one tccd request hangs every sandboxed process that touches a denied
 mach service: brew sat 8 h in "Pouring" on austin-0 and austin-1 (2026-10-27; sample: 64 sandboxd.approval threads
-behind one tcc_server_message_request_authorization, and `launchctl kickstart -k system/com.apple.sandboxd` cleared
-it). On an idle fleet mini (no `busy` process, fleet host.lock free and held for the restart, not reserved, not an
-EC2 Mac, no host name holding "lawrence") an --apply pass runs an ad-hoc signed copy of /bin/date under
-`(deny mach-lookup)`. A probe that takes slow_s or longer kickstarts sandboxd, at most once every every_s per mini
-(the attempt is recorded either way), and probes once more to report whether it worked.
+behind one tcc_server_message_request_authorization). `launchctl kickstart` of sandboxd is refused under SIP ("150:
+Operation not permitted while System Integrity Protection is engaged", as root), and a reboot clears it (austin-0,
+2026-10-28: the probe went from a hang to 0.5 s and `git submodule status` from 171 s to 0.6 s). So the heal is a
+reboot, behind these gates (fleet decision by claude-sr2 (coordinator), 2026-10-28):
+  - the mini is one the fleet registry opted in: ~/.config/glaeda/tailscale-self-heal.json of the fleet user names it
+    (fleet-registry.json writes it for the ci-runner role only, the same opt-in as glaeda-mini-health's Tailscale
+    self-heal; no host list here), it is a fleet Mac (the fleet-ops directory, no ec2-user), no fleet or host-local
+    reservation holds it, none of its names holds "lawrence", and it comes back by itself (FileVault off, an
+    auto-login user with a saved password);
+  - it is idle (no `busy` process), checked before the probe and again while this pass holds the fleet host.lock
+    exclusively, right before the reboot;
+  - the probe (an ad-hoc signed copy of /bin/date under `(deny mach-lookup)`, killed at slow_s) failed twice, at least
+    confirm_after_s and at most confirm_within_s apart;
+  - no reboot by this heal in the last reboot_every_s (24 h), and none in the last repeat_window_s (7 d): a mini that
+    would need a second reboot within that window is not rebooted; the report says needs_operator, which
+    glaeda-mini-health turns into a sandboxd_wedged error that ci-dash keeps as an HQ fleet-alert issue.
+Every step (first slow probe, reboot, refusal, the first probe after a reboot) is a line in STATE/sandboxd-heal.jsonl,
+written and synced before the reboot runs.
 Stdlib only; runs on macOS /usr/bin/python3 (3.9).
 """
 
@@ -149,13 +162,20 @@ HYGIENE_DAEMONS = Path("/Library/LaunchDaemons")
 HYGIENE_LABEL = "com.teamleaderleo.glaeda.runner-hygiene"  # its LABEL_PREFIX; the plist is <label>.<uid>.plist
 HYGIENE_RECHECK_S = 6 * 3600  # an unchanged, current install is checked again this often (launchd may drop it)
 HYGIENE_TIMEOUT = 120
-HYGIENE_RETRY_S = 900
-# sandboxd's self-heal: fixed here, never from the policy, so no policy file names what root runs or restarts.
-SANDBOXD_TARGET = "system/com.apple.sandboxd"
+HYGIENE_RETRY_S = 900  # a check or reinstall that failed is tried again this long after, not every pass
+# sandboxd's self-heal: fixed here, never from the policy, so no policy file names what root runs.
+SANDBOX_REBOOT = ["/sbin/shutdown", "-r", "now", "glaeda-daemon-heal: sandboxd is wedged (sandbox probe hangs)"]
+SANDBOX_JOURNAL = "sandboxd-heal.jsonl"  # in the state dir
+SANDBOX_JOURNAL_KEEP = 200  # lines kept when the journal is compacted
+SANDBOX_OPT_IN = ".config/glaeda/tailscale-self-heal.json"  # fleet-registry.json's ci-runner opt-in (fleet user)
+SANDBOX_OPT_IN_SCHEMA = "glaeda-tailscale-self-heal/v1"
+SANDBOX_LOGINWINDOW = "/Library/Preferences/com.apple.loginwindow.plist"
+SANDBOX_KCPASSWORD = "/etc/kcpassword"
+SANDBOX_KEYS = ("slow_s", "confirm_after_s", "confirm_within_s", "reboot_every_s", "repeat_window_s")
 # The deny takes effect: on the wedged mini this hangs, while "(version 1)(allow default)" ran the same ad-hoc copy
 # in 0.016 s (austin-0, 2026-10-28). It is the shape of rule Homebrew's bottle sandbox hit.
 SANDBOX_PROBE_PROFILE = "(version 1)(deny mach-lookup)(allow default)"
-SANDBOX_PROBE_SOURCE = "/bin/date"  # copied and ad-hoc signed: a platform binary takes sandboxd's fast path  # a check or reinstall that failed is tried again this long after, not every pass
+SANDBOX_PROBE_SOURCE = "/bin/date"  # copied and ad-hoc signed: a platform binary takes sandboxd's fast path
 
 
 class HealError(RuntimeError):
@@ -201,12 +221,16 @@ def validate_policy(doc: Any) -> dict[str, Any]:
     if probe is not None:
         if not isinstance(probe, dict) or not isinstance(probe.get("enabled"), bool):
             raise HealError("policy sandbox_probe needs enabled")
-        for key in ("slow_s", "every_s"):
+        for key in SANDBOX_KEYS:
             value = probe.get(key)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
                 raise HealError(f"policy sandbox_probe.{key} must be a positive finite number")
         if probe["slow_s"] > 60:
             raise HealError("policy sandbox_probe.slow_s must be at most 60")
+        if not probe["confirm_after_s"] < probe["confirm_within_s"]:
+            raise HealError("policy sandbox_probe.confirm_after_s must be less than confirm_within_s")
+        if probe["reboot_every_s"] < DAY_S or probe["repeat_window_s"] < probe["reboot_every_s"]:
+            raise HealError("policy sandbox_probe: reboot_every_s at least a day, repeat_window_s at least that")
     release = doc["release"]
     for key in ("every_s", "stale_s"):
         if type(release.get(key)) is not int or release[key] <= 0:
@@ -293,19 +317,48 @@ class Host:
     def now(self) -> float:
         return time.time()
 
+    journal = None  # the sandboxd journal's path; run_pass sets it to STATE/sandboxd-heal.jsonl
+
     def sandbox_hold(self, now: float) -> str:
-        """Why sandboxd is left alone here ("" when it may be restarted)."""
+        """Why this mini is never rebooted by the sandboxd heal right now ("" when it may be)."""
         why = fleet_ops_eligible(FLEET_OPS_DIR) or fleet_ops_hold(now)
         if why:
             return why
-        names = {platform_node().lower()}
-        with contextlib.suppress(OSError, KeyError, ValueError, AttributeError):
+        names = {platform_node().split(".")[0].lower()}
+        try:
             home = Path(pwd.getpwuid(os.stat(FLEET_ROOT).st_uid).pw_dir)
+        except (OSError, KeyError) as e:
+            return f"no fleet user (owner of {FLEET_ROOT}): {type(e).__name__}"
+        with contextlib.suppress(OSError, KeyError, ValueError, AttributeError):
             host = strict_json(read_small(home / ".config/glaeda/update.json")).get("host")
-            if isinstance(host, str):
+            if isinstance(host, str) and host:
                 names.add(host.lower())
         if any("lawrence" in n for n in names):
-            return "cmux-lawrence: never restarted by a self-heal"
+            return "cmux-lawrence: never rebooted by a self-heal"
+        try:  # the fleet registry's opt-in: only ci-runner minis get it, never AWS, interactive or no_touch Macs
+            opt = strict_json(read_small(home / SANDBOX_OPT_IN))
+        except (OSError, ValueError) as e:
+            return f"not opted in by fleet-registry.json (~/{SANDBOX_OPT_IN}: {type(e).__name__})"
+        if not isinstance(opt, dict) or opt.get("schema") != SANDBOX_OPT_IN_SCHEMA \
+                or opt.get("source") != "fleet-registry.json" or not isinstance(opt.get("host"), str) \
+                or opt["host"].lower() not in names:
+            return f"not opted in by fleet-registry.json (~/{SANDBOX_OPT_IN} does not name {sorted(names)})"
+        return self.boots_unattended()
+
+    def boots_unattended(self) -> str:
+        """Why a reboot would not come back to a working mini ("" when it would): FileVault on stops at its unlock
+        screen (a guard reboot left a mini off the pool ~21 h, 2026-10-25), and with no auto-login the runner
+        user's LaunchAgents never start. Anything unreadable refuses."""
+        code, out, _err = sh(["/usr/bin/fdesetup", "isactive"], timeout=15)
+        if not (code == 1 and out.strip() == "false"):
+            return f"FileVault on or unknown (fdesetup isactive: {out.strip()[:40] or code}): a reboot would stop there"
+        try:
+            with open(SANDBOX_LOGINWINDOW, "rb") as f:
+                user = plistlib.load(f).get("autoLoginUser")
+        except (OSError, ValueError, plistlib.InvalidFileException, AttributeError) as e:
+            return f"no auto-login ({type(e).__name__} reading {SANDBOX_LOGINWINDOW}): a reboot would leave no console user"
+        if not isinstance(user, str) or not user or not os.path.isfile(SANDBOX_KCPASSWORD):
+            return "no auto-login user with a saved password: a reboot would leave no console user"
         return ""
 
     def sandbox_probe(self, slow_s: float) -> float | None:
@@ -349,9 +402,45 @@ class Host:
         finally:
             os.close(fd)
 
-    def kickstart_sandboxd(self) -> tuple[int, str]:
-        code, out, err = sh(["/bin/launchctl", "kickstart", "-k", SANDBOXD_TARGET], timeout=30)
+    def reboot(self) -> tuple[int, str]:
+        code, out, err = sh(SANDBOX_REBOOT, timeout=30)
         return code, (out + err).strip()[:200]
+
+    def journal_read(self) -> list[dict[str, Any]]:
+        """The sandboxd journal's entries, oldest first ([] when there is none). Unreadable raises: the reboot count
+        lives here, so a journal that cannot be read never reads as "no reboots yet"."""
+        if self.journal is None:
+            return []
+        try:
+            raw = read_small(Path(self.journal), MAX_META)
+        except FileNotFoundError:
+            return []
+        except OSError as e:
+            raise HealError(f"sandboxd journal unreadable: {e}") from e
+        rows = []
+        for line in raw.decode("utf-8", "replace").splitlines():
+            with contextlib.suppress(ValueError):
+                row = json.loads(line)
+                if isinstance(row, dict) and isinstance(row.get("t"), (int, float)):
+                    rows.append(row)
+        return rows
+
+    def journal_append(self, entry: dict[str, Any]) -> None:
+        """One line, synced before it returns (a reboot follows some of them)."""
+        if self.journal is None:
+            return
+        path = Path(self.journal)
+        path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        rows = self.journal_read()
+        if len(rows) >= 2 * SANDBOX_JOURNAL_KEEP:
+            keep = b"".join(json.dumps(r, sort_keys=True).encode() + b"\n" for r in rows[-SANDBOX_JOURNAL_KEEP:])
+            atomic_write(path, keep, 0o644, os.geteuid() == 0)
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+        try:
+            os.write(fd, json.dumps(entry, sort_keys=True).encode() + b"\n")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
 
 # ---------------------------------------------------------------- one pass
@@ -389,16 +478,18 @@ def restart(host: Host, policy: dict[str, Any], daemon: dict[str, Any], pid: int
 
 def sandbox_pass(host: Host, policy: dict[str, Any], state: dict[str, Any], now: float, busy: list[str],
                  apply: bool, actions: list, healed: list) -> tuple[dict[str, Any], dict[str, Any]]:
-    """(state, report) for sandboxd's self-heal. State: {"last": t of the last kickstart attempt}."""
+    """(state, report) for sandboxd's self-heal. State: {"first_slow": t of the first slow probe of this episode,
+    "noted": t the repeat refusal was journalled}. Reboots are read from the journal, which outlives the state."""
     probe = policy.get("sandbox_probe") or {}
-    mine = {k: v for k, v in (state.get("sandbox") or {}).items() if k == "last" and isinstance(v, (int, float))}
+    mine = {k: v for k, v in (state.get("sandbox") or {}).items()
+            if k in ("first_slow", "noted") and isinstance(v, (int, float))}
     if not probe.get("enabled"):
         return mine, {"skipped": "off in the policy"}
     if busy:
         return mine, {"skipped": f"host busy ({', '.join(busy)})"}
     hold = host.sandbox_hold(now)
     if hold:
-        return mine, {"skipped": hold}
+        return {}, {"skipped": hold}
     if not apply:
         return mine, {"skipped": "probed under --apply only"}
     slow = probe["slow_s"]
@@ -407,40 +498,79 @@ def sandbox_pass(host: Host, policy: dict[str, Any], state: dict[str, Any], now:
     if took is None:
         report["error"] = "the probe could not run"
         return mine, report
-    if took < slow:
+    try:
+        journal = host.journal_read()
+    except HealError as e:
+        report["error"] = str(e)[:200]
         return mine, report
-    last = mine.get("last")
-    if last is not None and now - last < probe["every_s"]:
-        report["waiting"] = f"sandboxd was kickstarted at {iso(last)}; at most once every {probe['every_s']} s"
+    def note(entry: dict[str, Any]) -> None:
+        try:
+            host.journal_append(entry)
+        except (HealError, OSError) as e:
+            report["journal_error"] = str(e)[:200]
+
+    failed = {r.get("for") for r in journal if r.get("action") == "reboot-failed"}
+    reboots = [r["t"] for r in journal if r.get("action") == "reboot" and r["t"] not in failed]
+    if took < slow:
+        last = journal[-1] if journal else None
+        if last and last.get("action") == "reboot":  # the first look after it
+            what = f"sandbox probe {took:.2f} s after the reboot at {iso(last['t'])}"
+            note({"t": now, "at": iso(now), "action": "after-reboot", "probe_s": round(took, 2)})
+            healed.append({"name": "sandboxd", "t": now, "at": iso(now), "since": last.get("since") or iso(last["t"]),
+                           "probe_s": last.get("probe_s"), "action": what})
+        return {}, report
+    first = mine.get("first_slow")
+    if first is None or now - first > probe["confirm_within_s"]:
+        mine = {"first_slow": now}
+        note({"t": now, "at": iso(now), "action": "slow", "probe_s": round(took, 2)})
+        report["waiting"] = f"probe slow once; confirms after {probe['confirm_after_s']} s"
+        return mine, report
+    if now - first < probe["confirm_after_s"]:
+        report["waiting"] = f"probe slow since {iso(first)}; confirms {probe['confirm_after_s']} s after it"
+        return mine, report
+    recent = [t for t in reboots if now - t < probe["repeat_window_s"]]
+    if recent:
+        last_reboot = max(recent)
+        why = (f"sandboxd is wedged again (probe {took:.1f} s >= {slow} s, slow since {iso(first)}) and this heal "
+               f"rebooted the mini at {iso(last_reboot)}, within {probe['repeat_window_s'] // 86400:g} d: not "
+               f"rebooted again (at most one reboot per {probe['reboot_every_s'] // 3600:g} h, a second within the "
+               "window needs a person)")
+        report["needs_operator"] = why
+        if not mine.get("noted"):
+            mine["noted"] = now
+            note({"t": now, "at": iso(now), "action": "refused-repeat", "probe_s": round(took, 2),
+                                 "last_reboot": iso(last_reboot)})
         return mine, report
 
-    def kick():
-        # The probe took seconds: look again under the lock, so a job or reservation that arrived meanwhile wins.
+    def reboot():
+        # The probes took seconds: look again under the lock, so a job or reservation that arrived meanwhile wins.
         names = set(policy["busy"])
         late = sorted({os.path.basename(e) for _p, _u, _c, e in host.processes() if os.path.basename(e) in names})
         why = f"host busy ({', '.join(late)})" if late else host.sandbox_hold(host.now())
         if why:
             return "refused", why
-        mine["last"] = now  # an attempt counts whatever it does
-        return host.kickstart_sandboxd()
+        try:  # logged and synced first: no reboot that the 24 h and 7 d rules could not see afterwards
+            host.journal_append({"t": now, "at": iso(now), "action": "reboot", "since": iso(first),
+                                 "probe_s": round(took, 2), "command": " ".join(SANDBOX_REBOOT[:3])})
+        except (HealError, OSError) as e:
+            return "refused", f"sandboxd journal not writable, no reboot: {str(e)[:150]}"
+        return host.reboot()
 
-    done = host.with_host_lock(kick)
+    done = host.with_host_lock(reboot)
     if done is None:
-        report["waiting"] = "fleet host.lock is held; a later idle pass restarts it"
+        report["waiting"] = "fleet host.lock is held; a later idle pass reboots"
         return mine, report
     if done[0] == "refused":
         report["skipped"] = done[1]
         return mine, report
     code, out = done
-    after = host.sandbox_probe(slow)
-    ok = code == 0 and after is not None and after < slow
-    what = (f"sandbox probe {took:.1f} s >= {slow} s: launchctl kickstart -k {SANDBOXD_TARGET} exited {code}"
-            f"{': ' + out if out else ''}; probe after: " + ("failed to run" if after is None else f"{after:.2f} s"))
-    actions.append({"name": "sandboxd", "ok": ok, "action": what})
-    report["probe_after_s"] = None if after is None else round(after, 2)
-    if ok:
-        healed.append({"name": "sandboxd", "t": now, "at": iso(now), "since": iso(now), "probe_s": round(took, 2),
-                       "action": what})
+    what = (f"sandbox probe {took:.1f} s >= {slow} s twice since {iso(first)}: {' '.join(SANDBOX_REBOOT[:3])} "
+            f"exited {code}{': ' + out if out else ''}")
+    if code != 0:
+        note({"t": host.now(), "at": iso(host.now()), "action": "reboot-failed", "for": now,
+                             "exit": code, "out": out})
+    actions.append({"name": "sandboxd", "ok": code == 0, "action": what})
+    report["rebooting"] = code == 0
     return mine, report
 
 
@@ -1377,7 +1507,10 @@ def run_pass(policy_path: Path, state_dir: Path, apply: bool, host: Host | None 
     """One pass. The installed root copy (or a test's install_dir) also keeps itself on the release."""
     policy = load_policy(policy_path)
     state = load_json(state_dir / "state.json")
-    new_state, report = reconcile(host or Host(), policy, state, apply)
+    host = host or Host()
+    if host.journal is None:
+        host.journal = state_dir / SANDBOX_JOURNAL
+    new_state, report = reconcile(host, policy, state, apply)
     root = os.geteuid() == 0
     if install_dir is None and root and Path(__file__).resolve() == (INSTALL_DIR / SCRIPT_NAME).resolve():
         install_dir = INSTALL_DIR

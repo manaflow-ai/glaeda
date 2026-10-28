@@ -2633,6 +2633,19 @@ class DaemonHeal(Base):
         self.assertIn("1.5 h", f[0]["evidence"])
         self.assertIn("restarts at 2 h", f[0]["note"])
 
+    def test_a_wedged_sandboxd_the_root_heal_will_not_reboot_again_is_an_error_for_a_person(self) -> None:
+        root = self.dir / "report.json"
+        root.write_text(json.dumps({"hot": [], "healed": [], "sandbox": {
+            "probe_s": 5.0, "needs_operator": "sandboxd is wedged again ... needs a person"}}))
+        self.mini.heal_status = {"installed": True, "current": True, "loaded": True, "reportFresh": True,
+                                 "report": os.fspath(root)}
+        f = [x for x in self.run_once()["findings"] if x["code"] == "sandboxd_wedged"]
+        self.assertEqual([(x["id"], x["severity"], x["auto_fix"]) for x in f],
+                         [("sandboxd_wedged", "error", "impossible")])
+        self.assertIn("needs a person", f[0]["evidence"])
+        root.write_text(json.dumps({"hot": [], "healed": [], "sandbox": {"probe_s": 0.1}}))
+        self.assertEqual([x for x in self.run_once()["findings"] if x["code"] == "sandboxd_wedged"], [])
+
     def test_a_runner_accounts_stale_root_copy_is_reported_from_the_root_report(self) -> None:
         root = self.dir / "report.json"
         root.write_text(json.dumps({"runnerHygiene": {"accounts": {
