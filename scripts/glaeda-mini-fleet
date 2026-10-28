@@ -2875,10 +2875,11 @@ sub look {  # (live pids, their groups, read ok) under the command, from one ps 
   my %used = map { $pgid{$_} => 1 } @live;
   return ([@live], [grep { $used{$_} && $_ != $mine } keys %groups], 1);
 }
-sub stop {  # signal what one fresh look finds
+sub stop {  # signal what one fresh look finds, and always the command's own group (ours until it is reaped)
   my ($sig) = @_;
   my ($pids, $gids) = look();
-  kill $sig, map { -$_ } @$gids;
+  my %gids = map { $_ => 1 } $pid, @$gids;
+  kill $sig, map { -$_ } keys %gids;
   kill $sig, @$pids;
 }
 $pid = fork();
@@ -2897,8 +2898,15 @@ while (clock_gettime(CLOCK_MONOTONIC) < $deadline) {
   $nap = $nap * 2 > 2 ? 2 : $nap * 2;
 }
 done();  # it may have ended while the last look or nap ran
-print STDERR "timed out after ${limit}s: stopping $ARGV[0] and everything it started\n";
+$SIG{PIPE} = "IGNORE";
 stop("TERM");
+# After the signal, and non-blocking: a full or closed stderr must not keep the bound from stopping the command.
+{ my $fl = fcntl(STDERR, POSIX::F_GETFL(), 0);
+  if ($fl) {
+    fcntl(STDERR, POSIX::F_SETFL(), $fl | POSIX::O_NONBLOCK());
+    syswrite(STDERR, "timed out after ${limit}s: stopping $ARGV[0] and everything it started\n");
+    fcntl(STDERR, POSIX::F_SETFL(), $fl);
+  } }
 for (1 .. 20) { select(undef, undef, undef, 0.5); my ($pids, $gids, $ok) = look(); last unless $ok && @$pids; }
 stop("KILL");
 waitpid($pid, 0);
