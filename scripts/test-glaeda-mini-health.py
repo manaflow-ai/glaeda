@@ -49,6 +49,7 @@ class FakeMini(health.Mini):
         self.lw: dict = {}
         self.pm = " displaysleep         0\n"
         self.procs = [(10, 501, "S", TM)]
+        self.load = {"cores": 8, "load5": 0.5, "processes": []}
         self.lines = [(NOW - 600, "Created session with socket 3"), (NOW - 590, "Tearing down <XCIDESession>")]
         self.ts: tuple[str, str | None, str] | None = ("app", "Running", "")
         self.route: str | None = "utun4"
@@ -162,6 +163,9 @@ class FakeMini(health.Mini):
 
     def processes(self):
         return self.procs
+
+    def load_facts(self):
+        return self.load
 
     def elapsed_s(self, pid):
         return 3600
@@ -443,6 +447,19 @@ class Detection(Base):
         report = self.run_once()
         self.assertEqual(report["findings"], [])
         self.assertEqual(json.loads(self.report.read_text())["schema"], "glaeda-mini-health/v1")
+
+    def test_load_high_requires_twice_cores_and_five_minutes(self) -> None:
+        self.mini.load = {"cores": 8, "load5": 16.0,
+                          "processes": [{"command": "swift-frontend", "count": 12}]}
+        self.assertEqual(health.check_load_high(self.mini), [], "the 2x boundary is healthy")
+        self.mini.load["load5"] = 16.1
+        self.assertEqual(self.ids(self.run_once(NOW)), [], "one high sample is only a spike")
+        sustained_window = 5 * 60
+        self.assertEqual(self.ids(self.run_once(NOW + sustained_window - 1)), [],
+                         "the finding stays hidden before five minutes")
+        report = self.run_once(NOW + sustained_window)
+        self.assertEqual(self.ids(report), ["load_high"])
+        self.assertIn("swift-frontend (12)", report["findings"][0]["evidence"])
 
     def test_the_report_carries_what_the_updater_says_this_host_runs(self) -> None:
         doc = {"schema": "glaeda-ota-converge/v1", "at": "2026-09-25T00:00:00Z", "converged": False,
