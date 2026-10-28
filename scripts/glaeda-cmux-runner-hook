@@ -27,7 +27,8 @@ re-runs it elsewhere) when:
     Unix seconds) with now < until, whoever owns it; an unreadable or invalid file also refuses, an expired
     one is ignored (parsed by glaeda_reservation.py, installed next to this hook)
   * free disk is below --min-free-gib even after one bounded glaeda-disk --pressure run evicted idle caches
-    (evict; skipped with --no-disk). Above the floor but under the pre-job target (the floor plus
+    (evict; skipped with --no-disk). A nightly job (or a dedicated builder's) first removes idle PR runners' work dirs
+    and holds every new job off the mini while it frees space (NIGHTLY_DISK_RESERVE). Above the floor but under the pre-job target (the floor plus
     PREJOB_MARGIN_GIB) it starts the queued pass before the job and waits up to PREJOB_WAIT_S for that target
     (prejob_evict), then admits it: the eviction happens before every job, not after it
   * the job needs the console session (a gui class job, or any job on a --gui-runner or --session-runner) and the
@@ -2097,6 +2098,229 @@ def prejob_evict(path: str, min_free_gib: float, explicit: str | None, wait_s: f
                 f"{started}; waited {time.monotonic() - start:.0f} s, freed {freed}, target {reached}")
     except Exception as error:  # noqa: BLE001  (never fail the job on housekeeping)
         return f"pre-job eviction skipped: {type(error).__name__}"
+
+
+# NIGHTLY_DISK_RESERVE: the dedicated nightly builder shares its mini's volume with the PR runners there, and they wrote
+# it down under the builder's floor between its listener gate's look and its job's setup: on 2026-10-28 at 00:04Z a
+# nightly-next build-nightly-app was refused in "Set up runner" at 20.6 GiB free (30 GiB required) while free space on
+# that mini swung between 17 and 44 GiB within minutes and every glaeda-disk pass there freed nothing. Leo, 2026-10-27:
+# "a waiting nightly, promote or nightly sign/verify job is admitted on a mini ahead of every PR, DEV and side job and
+# may use any reserve, and no new PR job starts on a mini where a nightly job waits." So:
+#   - every other runner's gate on a mini with a dedicated builder holds its listener while free disk is under the
+#     builder's floor plus one job's measured growth (job_disk_gib), so PR jobs leave that room (Gate.low_disk);
+#   - a nightly job short of disk in job-started leaves a nightly waiter marker (NIGHTLY_DISK_WANT) for as long as it
+#     frees space, so no new PR job starts here meanwhile (fair_turn, mini_full, Gate.low_disk), and it first removes
+#     what idle PR runners left in their _work (evict_idle_runners), then runs the usual glaeda-disk pass, and is
+#     refused only if both left it short.
+NIGHTLY_DISK_WANT = "disk"
+IDLE_EVICT_TRASH = ".glaeda-evict-"  # a renamed work dir being deleted; a leftover one is garbage by construction
+
+
+def builder_reserve_gib(home: Path, skip: Path | None = None) -> float:
+    """The largest disk floor of the dedicated builders enrolled under home (actions-runner-glaeda*), other than
+    skip, or 0 when there is none (NIGHTLY_DISK_RESERVE)."""
+    floors = [0.0]
+    for runner in sorted(home.glob("actions-runner-glaeda*")):
+        if skip is not None and os.path.realpath(runner) == os.path.realpath(skip):
+            continue
+        scope = runner_scope(runner)
+        if scope.dedicated:
+            floors.append(scope.min_free_gib)
+    return max(floors)
+
+
+def nightly_disk_waiter(capacity_dir: Path | None) -> str | None:
+    """Who of the nightly jobs on this mini waits for free disk (a NIGHTLY_DISK_WANT marker), or None."""
+    if capacity_dir is None:
+        return None
+    with contextlib.suppress(OSError):
+        for waiter in admission_waiters(capacity_dir):
+            if waiter["tier"] == TIER_NIGHTLY and NIGHTLY_DISK_WANT in waiter["wants"]:
+                return waiter["who"] or f"pid {waiter['pid']}"
+    return None
+
+
+@contextlib.contextmanager
+def nightly_disk_wait(capacity_dir: Path, on: bool):
+    """While a nightly job frees disk in job-started: its waiter marker (ADMIT_WANT, tier nightly, wants
+    NIGHTLY_DISK_WANT), rewritten every ADMIT_POLL_S so it stays fresh through a long eviction, removed on exit."""
+    if not on:
+        yield
+        return
+    marker = capacity_dir / f"{ADMIT_WANT}{os.getpid()}"
+    since, done, writing = time.time(), threading.Event(), threading.Lock()
+    with contextlib.suppress(OSError):
+        capacity_dir.mkdir(parents=True, exist_ok=True)
+    write_want(marker, since, [NIGHTLY_DISK_WANT, "units"], TIER_NIGHTLY)
+
+    def refresh() -> None:
+        while not done.wait(ADMIT_POLL_S):
+            with writing:  # the unlink below takes this too, so no write lands after it
+                if done.is_set():
+                    return
+                write_want(marker, since, [NIGHTLY_DISK_WANT, "units"], TIER_NIGHTLY)
+    thread = threading.Thread(target=refresh, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        with writing:
+            done.set()
+            with contextlib.suppress(OSError):
+                marker.unlink()
+
+
+RUNNER_WORK_HELD = "a nightly job's eviction still holds this runner's work"  # job-started refuses on it
+EVICT_RUNNER_LOCK = ".glaeda-evict.lock"  # <runner>/: held while another runner's job takes this runner's work away
+
+
+def idle_work_dirs(runner: Path) -> list[Path]:
+    """What an idle runner's jobs left in its _work that its next job makes again: each actions/checkout
+    _work/<repo>/<repo> and the DerivedData a workflow keeps in _work/<repo>/.glaeda-state. Never _tool, _actions or
+    _temp (the runner writes those while it sets a job up, before any hook runs), and never through a symlink."""
+    work = runner / "_work"
+    found: list[Path] = []
+    if runner.is_symlink() or work.is_symlink() or not work.is_dir():
+        return found
+    with contextlib.suppress(OSError):
+        for repo in sorted(work.iterdir()):
+            if repo.is_symlink() or not repo.is_dir() or repo.name.startswith((".", "_")):
+                continue
+            checkout = repo / repo.name
+            if checkout.is_dir() and not checkout.is_symlink():
+                found.append(checkout)
+            state = repo / ".glaeda-state"
+            if state.is_dir() and not state.is_symlink():
+                found.extend(d for d in sorted(state.iterdir())
+                             if "derived-data" in d.name and d.is_dir() and not d.is_symlink())
+    return found
+
+
+def remove_bounded(top: Path, deadline: float) -> bool:
+    """Delete the tree at top, deepest first, never following a symlink (one is unlinked as a name), with the deadline
+    (monotonic) checked before every deletion. True when it is gone; what is left is a later call's (the stale trash
+    sweep)."""
+    def due() -> bool:
+        return time.monotonic() >= deadline
+    try:
+        if due():
+            return False
+        if top.is_symlink() or not top.is_dir():
+            top.unlink(missing_ok=True)
+            return True
+        for root, dirs, files in os.walk(top, topdown=False, followlinks=False):
+            for name in files:
+                if due():
+                    return False
+                with contextlib.suppress(OSError):
+                    os.unlink(os.path.join(root, name))
+            for name in dirs:
+                if due():
+                    return False
+                path = os.path.join(root, name)
+                with contextlib.suppress(OSError):
+                    os.unlink(path) if os.path.islink(path) else os.rmdir(path)
+        if due():
+            return False
+        top.rmdir()
+        return True
+    except OSError:
+        return False
+
+
+def take_runner_work(runner: Path, busy: Callable[[Path], bool]) -> list[Path] | None:
+    """Move an idle runner's idle_work_dirs aside (to <runner>/_work/IDLE_EVICT_TRASH*), under EVICT_RUNNER_LOCK, and
+    return the trash; None when the runner has a job or the lock is taken. The lock closes the race with a job the
+    runner acquires meanwhile: that job's job-started waits for it (wait_runner_work) before any of its steps runs,
+    and then makes its workspace again; a job acquired before the lock is seen by busy (a Worker, or a request its
+    listener took)."""
+    try:
+        fd = lock_file(runner / EVICT_RUNNER_LOCK, fcntl.LOCK_EX)
+    except OSError:
+        return None
+    if fd is None:
+        return None
+    try:
+        if busy(runner):
+            return None
+        trash: list[Path] = []
+        for n, victim in enumerate(idle_work_dirs(runner)):
+            target = runner / "_work" / f"{IDLE_EVICT_TRASH}{os.getpid()}-{time.monotonic_ns()}-{n}"
+            with contextlib.suppress(OSError):
+                victim.rename(target)
+                trash.append(target)
+        return trash
+    finally:
+        os.close(fd)
+
+
+def wait_runner_work(workspace: Path | None, wait_s: float = EVICT_TIMEOUT_S) -> str | None:
+    """job-started on a pool runner: wait (at most wait_s) while a nightly job's eviction holds this runner's
+    EVICT_RUNNER_LOCK (take_runner_work), then make the job's workspace again if that eviction took it. workspace is
+    the directory the runner started the hook in, <runner>/_work/<repo>/<repo>. A note, or None; never raises."""
+    if workspace is None or workspace.parent.parent.name != "_work":
+        return None
+    runner = workspace.parent.parent.parent
+    lock = runner / EVICT_RUNNER_LOCK
+    if not os.path.lexists(lock):
+        return None
+    deadline, waited = time.monotonic() + wait_s, False
+    try:
+        while True:
+            fd = lock_file(lock, fcntl.LOCK_EX)
+            if fd is not None:
+                os.close(fd)
+                break
+            if time.monotonic() >= deadline:
+                return RUNNER_WORK_HELD
+            waited = True
+            time.sleep(0.2)
+        if not workspace.exists():
+            workspace.mkdir(parents=True, exist_ok=True)
+            return "a nightly job's eviction took this runner's idle checkout; the job clones it again"
+    except OSError as error:
+        return f"cannot look at this runner's eviction lock ({type(error).__name__})"
+    return "waited for a nightly job's eviction of this runner's work" if waited else None
+
+
+def evict_idle_runners(home: Path, path: str, target_gib: float, deadline: float,
+                       busy: Callable[[Path], bool] | None = None) -> str:
+    """For a nightly job short of disk (NIGHTLY_DISK_RESERVE): take the idle_work_dirs of every runner under home
+    that is not a dedicated builder and has no job (take_runner_work; runner_busy_now counts anything it cannot read
+    as busy), least recently used runner first, and delete them, until free disk reaches target_gib or the deadline
+    (monotonic) passes. A note; never raises."""
+    busy = busy or runner_busy_now
+    before = free_or_none(path)
+    removed, skipped = 0, 0
+    try:
+        runners = []
+        for runner in home.glob("actions-runner-glaeda*"):
+            work = runner / "_work"
+            if runner.is_symlink() or work.is_symlink() or not work.is_dir() or runner_scope(runner).dedicated:
+                continue
+            for trash in work.glob(f"{IDLE_EVICT_TRASH}*"):  # an earlier eviction ran out of time or died
+                if time.monotonic() < deadline:
+                    remove_bounded(trash, deadline)
+            with contextlib.suppress(OSError):
+                runners.append((work.stat().st_mtime, runner))
+        for _, runner in sorted(runners):
+            if not disk_refusal(path, target_gib) or time.monotonic() >= deadline:
+                break
+            if not idle_work_dirs(runner):
+                continue
+            trash = take_runner_work(runner, busy)
+            if trash is None:
+                skipped += 1
+                continue
+            for item in trash:
+                if remove_bounded(item, deadline):
+                    removed += 1
+    except Exception as error:  # noqa: BLE001  (never fail the job on housekeeping)
+        return f"idle runners' work dirs: stopped on {type(error).__name__}"
+    after = free_or_none(path)
+    freed = f"{after - before:.1f} GiB" if before is not None and after is not None else "an unknown amount"
+    return (f"a nightly job short of disk (wants {target_gib:g} GiB free): removed {removed} idle runners' work dir(s), "
+            f"skipped {skipped} busy runner(s), freed {freed}")
 
 
 def evict_lock_path() -> Path:
@@ -4878,6 +5102,8 @@ class Gate:
         self.disk_since: float | None = None  # when the current disk hold began
         self.disk_noted = False  # the hold ran past GATE_DISK_NOTE_S and said so once
         self.disk_evicted_at = -GATE_DISK_EVICT_EVERY_S  # when the last eviction under the floor started
+        self.idle_evict: threading.Thread | None = None  # a dedicated builder's evict_idle_runners, while it runs
+        self.idle_evicted_at = -GATE_DISK_EVICT_EVERY_S
         # the eviction under way: the detached glaeda-disk, when it started and the free GiB before it
         self.evicting: tuple[subprocess.Popen[bytes], float, float | None] | None = None
         # under the floor while another glaeda-disk pass runs: when the gate began waiting for it (monotonic)
@@ -5100,12 +5326,26 @@ class Gate:
         holding = self.child is None and (self.held or "").startswith("disk:")
         if not holding:
             self.disk_since, self.disk_noted = None, False
-        floor = runner_scope(self.runner_dir).min_free_gib
+        scope = runner_scope(self.runner_dir)
+        floor, reserve = scope.min_free_gib, ""
+        if not scope.dedicated and not scope.nightly:
+            # NIGHTLY_DISK_RESERVE: a nightly job freeing disk here goes first, and every other runner leaves the
+            # dedicated builder's floor plus one job's growth free
+            waiter = nightly_disk_waiter(self.capacity_dir or Path(FLEET_DIR) / "capacity")
+            if waiter:
+                return f"disk: a nightly job waits here for free disk ({waiter})"
+            builder = builder_reserve_gib(self.runner_dir.parent, self.runner_dir)
+            if builder > 0 and builder + job_disk_gib() > floor:
+                floor = builder + job_disk_gib()
+                reserve = f" (the dedicated builder's {builder:g} GiB floor + {job_disk_gib():g} GiB for a job here)"
         path, need = os.path.dirname(self.host_lock), floor + GATE_DISK_RESUME_GIB if floor > 0 and holding else floor
         self.reap_eviction(path, floor)
         why = disk_refusal(path, need)
         if why:
+            why += reserve
             self.evict_in_background(path, floor)
+            if scope.dedicated or reserve:  # the builder short of disk, or the reserve that keeps it room
+                self.evict_idle_in_background(path, floor + GATE_DISK_RESUME_GIB)
         if why is None or not holding:
             return f"disk: {why}" if why else None
         now = time.monotonic()
@@ -5116,6 +5356,20 @@ class Gate:
                      "freed enough; check with glaeda-disk --top 25")
             self.disk_noted = True
         return f"disk: {why}"
+
+    def evict_idle_in_background(self, path: str, target: float) -> None:
+        """A dedicated builder held off under its floor, or a runner held for its reserve, takes what idle PR runners left in their _work
+        (evict_idle_runners, NIGHTLY_DISK_RESERVE) in a thread, at most every GATE_DISK_EVICT_EVERY_S, so it listens
+        again even when glaeda-disk's pass frees nothing."""
+        now = time.monotonic()
+        if (self.idle_evict is not None and self.idle_evict.is_alive()) or \
+                now - self.idle_evicted_at < GATE_DISK_EVICT_EVERY_S:
+            return
+        self.idle_evicted_at = now
+        home, deadline = self.runner_dir.parent, now + EVICT_TIMEOUT_S
+        self.idle_evict = threading.Thread(
+            target=lambda: gate_log(evict_idle_runners(home, path, target, deadline)), daemon=True)
+        self.idle_evict.start()
 
     def evict_in_background(self, path: str, floor: float) -> None:
         """Start a detached glaeda-disk --pressure run for the floor (disk_argv) unless one is under way or one
@@ -7407,6 +7661,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.phase in ("job-started", "job-completed"):
         leave_job_workspace(args)
+    if args.phase == "job-started" and not args.dedicated_admit:
+        note = None
+        with contextlib.suppress(Exception):  # housekeeping that cannot look never fails the job
+            note = wait_runner_work(JOB_CWD)
+        if note == RUNNER_WORK_HELD:  # its workspace may still be taken away: run it elsewhere
+            print(f"{PREFIX}: refused: {note}", flush=True)
+            return 1
+        if note:
+            print(f"{PREFIX}: {note}", flush=True)
 
     owner: JobOwner | None = None
     if args.phase == "job-started":
@@ -7537,8 +7800,24 @@ def main(argv: list[str] | None = None) -> int:
         why = None if args.dedicated_admit else reservation_refusal(args.reservation, time.time(), taken_job=True)
         disk_path = os.path.dirname(args.host_lock)
         disk_deadline = time.monotonic() + EVICT_TIMEOUT_S  # one budget for every eviction of this job-started
+        # a nightly job short of disk goes first here (NIGHTLY_DISK_RESERVE): no new job starts on this mini while it
+        # frees space, and it takes what idle PR runners left before glaeda-disk's pass
+        nightly_disk = bool(args.dedicated_admit) or job_tier(
+            os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REF"), os.environ.get("GITHUB_REPOSITORY"),
+            event, os.environ.get("GITHUB_WORKFLOW_REF"), os.environ.get("GITHUB_JOB")) == TIER_NIGHTLY
+
+        def floor_evict() -> None:
+            """Under the floor: free space before the refusal looks (evict; a nightly job first takes idle runners')."""
+            with nightly_disk_wait(args.capacity_dir, nightly_disk):
+                if nightly_disk:
+                    print(f"{PREFIX}: " + evict_idle_runners(Path.home(), disk_path,
+                                                             args.min_free_gib + GATE_DISK_RESUME_GIB, disk_deadline),
+                          flush=True)
+                if disk_refusal(disk_path, args.min_free_gib):
+                    print(f"{PREFIX}: {evict(disk_path, args.min_free_gib, args.disk, disk_deadline)}", flush=True)
+
         if not why and not args.no_disk and disk_refusal(disk_path, args.min_free_gib):
-            print(f"{PREFIX}: {evict(disk_path, args.min_free_gib, args.disk, disk_deadline)}", flush=True)
+            floor_evict()
         if why:
             return refused(why)
 
@@ -7563,7 +7842,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{PREFIX}: {prejob}", flush=True)
             # the jobs already running may have written the disk below the floor while this one waited
             if disk_refusal(disk_path, args.min_free_gib):
-                print(f"{PREFIX}: {evict(disk_path, args.min_free_gib, args.disk, disk_deadline)}", flush=True)
+                floor_evict()
                 why = disk_why()
                 if why:
                     return refused(why, disk=True)
