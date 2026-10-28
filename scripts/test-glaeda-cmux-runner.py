@@ -6515,9 +6515,10 @@ class GateTest(unittest.TestCase):
         gate.confirmed = lambda: "held"
         gate.reload = lambda: None
         busy_seq = iter(busy or [])
-        gate.busy = lambda: next(busy_seq, False)
+        gate.busy = lambda finished=None: next(busy_seq, False)
+        gate.listener_list = lambda: ()
         stops: list[str] = []
-        gate.stop = lambda why: (stops.append(why), setattr(gate, "stop_deadline", time.monotonic() + 60),
+        gate.stop = lambda why, finished=None: (stops.append(why), setattr(gate, "stop_deadline", time.monotonic() + 60),
                                  setattr(gate, "held", why))
         return gate, stops
 
@@ -6625,13 +6626,13 @@ class GateTest(unittest.TestCase):
         gate.child = mock.Mock(poll=mock.Mock(return_value=None), pid=0)
         busy = [True, True, False]
         stops: list[str] = []
-        with mock.patch.object(gate, "busy", side_effect=lambda: busy[0] if len(busy) == 1 else busy.pop(0)), \
+        with mock.patch.object(gate, "busy", side_effect=lambda *_: busy[0] if len(busy) == 1 else busy.pop(0)), \
                 mock.patch.object(gate, "worker_pids", return_value=()), \
                 mock.patch.object(gate, "reload"), mock.patch.object(gate, "locked", return_value=None), \
                 mock.patch.object(gate, "low_disk", return_value=None), \
                 mock.patch.object(gate, "still_waiting", return_value=None), \
                 mock.patch.object(gate, "still_reserved", return_value=None), \
-                mock.patch.object(gate, "stop", side_effect=lambda why: stops.append(why) or True):
+                mock.patch.object(gate, "stop", side_effect=lambda why, *_: stops.append(why) or True):
             self.assertIsNone(gate.step(), "a job runs")
             self.assertFalse(gate.job_ending)
             gate.job_end_marker().touch()  # job-completed gave the job's units back
@@ -6660,7 +6661,7 @@ class GateTest(unittest.TestCase):
         gate.job_end_marker().touch()  # the Worker exited before any poll saw the runner busy
         stops: list[str] = []
         with mock.patch.object(gate, "busy", return_value=False), mock.patch.object(gate, "reload"), \
-                mock.patch.object(gate, "stop", side_effect=lambda why: stops.append(why) or True):
+                mock.patch.object(gate, "stop", side_effect=lambda why, *_: stops.append(why) or True):
             self.assertIsNone(gate.step())
         self.assertEqual(stops, ["only 4 of 14 capacity units on this mini are free; its next job needs 5"])
         self.assertFalse(gate.job_end_marker().exists())
@@ -7407,14 +7408,15 @@ class GateTest(unittest.TestCase):
             gate.step()  # the worker exited
         self.assertEqual(stops, ["a fleet build is waiting for the host (pid 77)"], "at once, not two idle polls")
 
-        # Any other job is polled as usual, and its runner stops on the first idle poll.
+        # Any other job is watched the same way (JOB_END_FREEZE), and its runner stops on the first idle poll.
         gate, stops = self.gate([None] * 3, busy=[True, True])
         gate.worker_pids = lambda: [4343]
         with mock.patch.object(hook, "host_waiters", return_value={77}):
             gate.step(); gate.step()
-            self.assertEqual((stops, gate.watching), ([], ()))
+            self.assertEqual((stops, gate.watching, gate.freeze_at_exit), ([], (4343,), True))
             gate.step()  # the job ended
         self.assertEqual(stops, ["a fleet build is waiting for the host (pid 77)"])
+        self.assertEqual((gate.watching, gate.freeze_at_exit), ((), False))
 
     def reserve(self, gate) -> str:
         """An active reservation of this host, as glaeda-mini-fleet reserve writes it; returns the gate's reason."""
@@ -7448,7 +7450,7 @@ class GateTest(unittest.TestCase):
         gate.worker_pids = lambda: [4343]
         with mock.patch.object(hook, "host_waiters", return_value=set()):
             gate.step(); gate.step()
-            self.assertEqual((stops, gate.watching), ([], ()))
+            self.assertEqual((stops, gate.watching), ([], (4343,)), "its Worker's exit freezes the listener too")
             gate.step()  # the job ended
         self.assertEqual(stops, [reserved])
 
@@ -7533,14 +7535,29 @@ class GateTest(unittest.TestCase):
         self.assertIn("note_waiter_refusal(args.state_dir, why)", source)
         self.assertIn('return False, f"{WAITER_REFUSAL} (pid {waiting[0]})"', source)
 
-    def test_a_job_under_the_disk_floor_wakes_the_gate_when_its_worker_exits(self) -> None:
+    @staticmethod
+    def stat(pid: int) -> str:
+        return subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+
+    def sleeper(self, **kwargs: Any) -> subprocess.Popen:
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], **kwargs)
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        self.addCleanup(lambda: os.kill(proc.pid, signal.SIGCONT) if proc.poll() is None else None)
+        return proc
+
+    def test_the_worker_exit_wakes_the_gate_and_freezes_the_listener_before_it_takes_the_next_job(self) -> None:
+        """cmuxs-mac-mini-6, 2026-10-28 17:41:58Z: a fleet build (pid 6755) was waiting while runner glaeda-11 ran
+        a swift test. Its Worker exited and the listener acknowledged the next request in the same second, ahead
+        of the gate's 2 s poll; job-started refused that job at 17:42:19 and the run sat red for 40 min. The gate
+        now waits on the Worker's exit itself (kqueue, or a pidfd) and freezes the listener at that moment."""
         import threading
         gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
         gate.child = mock.Mock(pid=1)
-        worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
-        self.addCleanup(worker.wait)
-        self.addCleanup(worker.kill)
-        gate.watching = (worker.pid,)
+        worker, listener = self.sleeper(), self.sleeper()
+        other_group = self.sleeper(start_new_session=True)  # not in the gate's group: a reused pid, never frozen
+        gate.watching, gate.freeze_at_exit = (worker.pid,), True
+        gate.listener_pids = (listener.pid, other_group.pid)
         # the listener reaps its worker as it exits; here the test does, as the parent
         reaper = threading.Timer(0.3, lambda: (worker.kill(), worker.wait()))
         reaper.start()
@@ -7549,21 +7566,120 @@ class GateTest(unittest.TestCase):
             started = time.monotonic()
             gate.nap()
             self.assertLess(time.monotonic() - started, 5.0, "woken by the worker's exit, not after GATE_POLL_S")
-            self.assertEqual(gate.watching, ())
-            self.assertGreater(gate.fast_until, time.monotonic())
-            started = time.monotonic()
-            gate.nap()
-            self.assertLess(time.monotonic() - started, 1.0, "then it polls every GATE_WATCH_S")
-            gate.stop_deadline = time.monotonic() + 60
-            with mock.patch.object(hook.time, "sleep") as sleep:
+        self.assertEqual(gate.frozen, (listener.pid,))
+        self.assertTrue(self.stat(listener.pid).startswith("T"), self.stat(listener.pid))
+        self.assertFalse(self.stat(other_group.pid).startswith("T"))
+        gate.thaw()
+        self.assertFalse(self.stat(listener.pid).startswith("T"), "thawed")
+        self.assertEqual(gate.frozen, ())
+
+    def test_an_unreaped_worker_under_the_frozen_listener_is_not_waited_on_again(self) -> None:
+        """Frozen, the listener cannot reap its exited Worker, so the zombie stays in ps. The next poll must not take
+        it for a running job and re-arm the freeze on it, or nap() would wake and freeze again at once."""
+        gate, stops = self.gate([None] * 3, busy=[True, True, True])
+        worker, listener = self.sleeper(), self.sleeper()
+        gate.worker_pids = lambda: [worker.pid]
+        gate.listener_list = lambda: (listener.pid,)
+        with mock.patch.object(hook, "host_waiters", return_value=set()), \
+                mock.patch.object(hook, "reservation_refusal", return_value="host reserved by a soak"):
+            gate.reservation = os.fspath(self.tmp / "reservation.json")
+            gate.step()
+            self.assertEqual((gate.watching, gate.freeze_at_exit), ((worker.pid,), True))
+            worker.kill()  # not reaped: a zombie, as under a frozen listener
+            with mock.patch.object(hook, "GATE_POLL_S", 30.0):
+                started = time.monotonic()
                 gate.nap()
-            sleep.assert_called_once()
-            self.assertGreater(sleep.call_args[0][0], 29.0, "a stop under way needs no fast polls")
+                self.assertLess(time.monotonic() - started, 5.0)
+            self.assertEqual((gate.done, gate.frozen), ((worker.pid,), (listener.pid,)))
+            gate.poll()  # busy (the mock), but its only Worker is the exited one: nothing to wait on
+            self.assertEqual((gate.watching, gate.freeze_at_exit), ((), False))
+            gate.thaw()
+            self.assertEqual((gate.done, gate.frozen), ((), ()))
+            with mock.patch.object(hook, "GATE_POLL_S", 0.2):
+                started = time.monotonic()
+                gate.nap()
+                self.assertGreaterEqual(time.monotonic() - started, 0.19, "a plain poll, no second freeze")
+            self.assertEqual(gate.frozen, ())
+
+    def test_with_nothing_to_watch_the_gate_naps_one_plain_poll(self) -> None:
+        gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+        gate.child = mock.Mock(pid=1)
+        worker = self.sleeper()
+        gate.watching = (worker.pid,)  # watched for disk, say, but not armed to freeze
         with mock.patch.object(hook, "GATE_POLL_S", 0.2):
-            gate.stop_deadline, gate.fast_until = None, 0.0
             started = time.monotonic()
             gate.nap()
-            self.assertGreaterEqual(time.monotonic() - started, 0.19, "nothing watched: the plain poll")
+            self.assertGreaterEqual(time.monotonic() - started, 0.19, "the plain poll")
+            gate.freeze_at_exit = True
+            started = time.monotonic()
+            gate.nap()
+            self.assertGreaterEqual(time.monotonic() - started, 0.19, "a Worker that does not exit: one poll's wait")
+        self.assertEqual(gate.frozen, ())
+
+    def test_wait_exit_reads_a_gone_pid_as_exited(self) -> None:
+        worker = self.sleeper()
+        worker.kill(); worker.wait()
+        self.assertTrue(hook.wait_exit((worker.pid,), 5.0))
+        alive = self.sleeper()
+        started = time.monotonic()
+        self.assertFalse(hook.wait_exit((alive.pid,), 0.2))
+        self.assertLess(time.monotonic() - started, 2.0)
+
+    def test_a_frozen_listener_is_thawed_whatever_the_poll_does(self) -> None:
+        gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+        listener = self.sleeper()
+        os.kill(listener.pid, signal.SIGSTOP)
+        gate.frozen = (listener.pid,)
+        gate.poll = mock.Mock(side_effect=RuntimeError("ps timed out"))
+        with self.assertRaises(RuntimeError):
+            gate.step()
+        self.assertEqual(gate.frozen, ())
+        self.assertFalse(self.stat(listener.pid).startswith("T"))
+        self.assertIn("self.thaw()  # a listener frozen at its Worker's exit never stays frozen across the exec",
+                      HOOK.read_text(), "reload() thaws before its exec")
+
+    def test_the_finished_request_of_a_frozen_listener_is_not_a_job(self) -> None:
+        """Frozen at its Worker's exit, the listener has not logged the job's end yet, so its diag still names the
+        finished request: busy() and stop() must not read it as a new request, or the stop would wait it out."""
+        gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+        gate.worker, gate.listening, gate.taking = (lambda: False), (lambda: True), (lambda: "b43ca05a")
+        self.assertTrue(gate.busy())
+        self.assertFalse(gate.busy("b43ca05a"))
+        self.assertTrue(gate.busy("50a28519"), "a different request is the next job: kept")
+
+    def test_a_waiter_seen_during_a_job_stops_the_frozen_listener_right_after_the_worker_exits(self) -> None:
+        gate, _ = self.gate([None] * 3)
+        busy = iter([True, False])
+        gate.busy = lambda finished=None: next(busy) if finished is None else False
+        gate.worker_pids = lambda: [4242]
+        gate.taking = lambda: "b43ca05a"
+        gate.listener_list = lambda: (4343,)
+        stops: list[tuple[str, str | None]] = []
+        gate.stop = lambda why, finished=None: stops.append((why, finished))
+        gate.freeze = lambda: setattr(gate, "frozen", (4343,))
+        gate.thaw = lambda: setattr(gate, "frozen", ())
+        with mock.patch.object(hook, "host_waiters", return_value={6755}):
+            gate.step()
+            self.assertEqual((gate.watching, gate.freeze_at_exit, gate.job_request, gate.listener_pids),
+                             ((4242,), True, "b43ca05a", (4343,)))
+            gate.freeze()  # nap(): the Worker exited
+            gate.step()
+        self.assertEqual(stops, [("a fleet build is waiting for the host (pid 6755)", "b43ca05a")])
+        self.assertEqual(gate.frozen, (), "thawed once the stop is sent")
+
+    def test_job_completed_brings_the_waiter_reading_forward_and_arms_the_freeze(self) -> None:
+        gate, stops = self.gate([None] * 3, busy=[True, True])
+        gate.worker_pids = lambda: [4242]
+        with mock.patch.object(hook, "host_waiters", side_effect=[set(), {6755}, {6755}]) as lsof:
+            gate.step()  # mid-job: no waiter
+            self.assertEqual((gate.watching, gate.freeze_at_exit), ((), False))
+            gate.job_end_marker().parent.mkdir(parents=True, exist_ok=True)
+            gate.job_end_marker().touch()  # job-completed ran
+            gate.step()  # within GATE_WAITER_EVERY_S, but the job's end reads the waiters now
+            self.assertEqual(lsof.call_count, 2)
+            self.assertEqual((gate.watching, gate.freeze_at_exit), ((4242,), True))
+            gate.step()  # the Worker exited
+        self.assertEqual(stops, ["a fleet build is waiting for the host (pid 6755)"])
 
     def test_the_gate_evicts_in_the_background_before_it_listens_again(self) -> None:
         script = self.runner / hook.RUNNER_HOOK_SCRIPT
@@ -7962,7 +8078,7 @@ class GateTest(unittest.TestCase):
         with mock.patch.object(gate, "start"), mock.patch.object(gate, "stop"), \
                 mock.patch.object(gate, "reload"), mock.patch.object(gate, "saturated", return_value=None), \
                 mock.patch.object(hook, "console_refusal", return_value=None), \
-                mock.patch.object(gate, "busy", side_effect=lambda: busy[0]):
+                mock.patch.object(gate, "busy", side_effect=lambda *_: busy[0]):
             gate.step()
             self.assertFalse(hook.probe(reserve), "idle: held")
             gate.child = mock.Mock(poll=mock.Mock(return_value=None))
@@ -7993,7 +8109,7 @@ class GateTest(unittest.TestCase):
                 mock.patch.object(gate, "reload"), mock.patch.object(gate, "saturated", return_value=None), \
                 mock.patch.object(gate, "first_poll", return_value=False), \
                 mock.patch.object(hook, "console_refusal", return_value=None), \
-                mock.patch.object(gate, "busy", side_effect=lambda: busy[0]):
+                mock.patch.object(gate, "busy", side_effect=lambda *_: busy[0]):
             gate.step()
             self.assertFalse(hook.probe(reserve), "idle: held")
             gate.child = mock.Mock(poll=mock.Mock(return_value=None))
@@ -8023,7 +8139,7 @@ class GateTest(unittest.TestCase):
         with mock.patch.object(gate, "start"), mock.patch.object(gate, "stop"), \
                 mock.patch.object(gate, "reload"), mock.patch.object(gate, "saturated", return_value=None), \
                 mock.patch.object(hook, "console_refusal", return_value=None), \
-                mock.patch.object(gate, "busy", side_effect=lambda: busy[0]):
+                mock.patch.object(gate, "busy", side_effect=lambda *_: busy[0]):
             gate.step()
             self.assertFalse(hook.probe(reserve), "idle: held")
             gate.child = mock.Mock(poll=mock.Mock(return_value=None))
@@ -8338,12 +8454,12 @@ class GateTest(unittest.TestCase):
         self.level = 3
         gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
         stops: list[str] = []
-        gate.stop = stops.append  # type: ignore[method-assign]
+        gate.stop = lambda why, *_: stops.append(why)  # type: ignore[method-assign]
         gate.child = mock.Mock(poll=mock.Mock(return_value=None))
-        gate.busy = lambda: True  # type: ignore[method-assign]
+        gate.busy = lambda *_: True  # type: ignore[method-assign]
         gate.step(); gate.step(); gate.step()
         self.assertEqual(stops, [])
-        gate.busy = lambda: False  # type: ignore[method-assign]
+        gate.busy = lambda *_: False  # type: ignore[method-assign]
         gate.step(); gate.step()
         self.assertEqual(stops, ["the mini is throttled (thermal pressure level 3)"])
 

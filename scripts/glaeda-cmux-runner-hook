@@ -113,6 +113,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime
+import errno
 import fcntl
 import hashlib
 import importlib.machinery
@@ -3321,6 +3322,54 @@ def pid_alive(pid: int) -> bool:
     return True
 
 
+def wait_exit(pids: tuple[int, ...], timeout: float) -> bool | None:
+    """Block until one of pids exits (kqueue NOTE_EXIT, or a pidfd on Linux), at most `timeout` seconds: True when
+    one exited (or was already gone), False on the timeout, None when neither is available here (the caller polls).
+    The kernel wakes the gate at the exit itself, before the listener that reaps the Worker can take the next job,
+    and costs nothing while it waits (no ps per poll)."""
+    if not pids:
+        return True
+    if hasattr(select, "kqueue"):
+        kq = select.kqueue()
+        try:
+            changes = [select.kevent(pid, filter=select.KQ_FILTER_PROC,
+                                     flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT, fflags=select.KQ_NOTE_EXIT)
+                       for pid in pids]
+            try:
+                events = kq.control(changes, len(changes), max(0.0, timeout))
+            except ProcessLookupError:
+                return True
+            except OSError:
+                return None
+            # a pid already gone comes back as an EV_ERROR event (ESRCH) rather than an exit; any other error (a
+            # process this user cannot watch) must not read as an exit, or the gate would spin
+            for event in events:
+                if event.flags & select.KQ_EV_ERROR and event.data != errno.ESRCH:
+                    return None
+            return bool(events)
+        finally:
+            kq.close()
+    if hasattr(os, "pidfd_open"):
+        fds: list[int] = []
+        try:
+            for pid in pids:
+                try:
+                    fds.append(os.pidfd_open(pid))
+                except ProcessLookupError:
+                    return True
+                except OSError:
+                    return None
+            poller = select.poll()
+            for fd in fds:
+                poller.register(fd, select.POLLIN)
+            return bool(poller.poll(max(0.0, timeout) * 1000))
+        finally:
+            for fd in fds:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+    return None
+
+
 def process_identity(pid: int) -> str | None:
     """Return a process start token so a reused PID cannot keep a job holder alive."""
     if pid <= 1:
@@ -5366,7 +5415,14 @@ class Gate:
         # under the floor while another glaeda-disk pass runs: when the gate began waiting for it (monotonic)
         self.disk_waiting_since: float | None = None
         self.watching: tuple[int, ...] = ()
-        self.fast_until = 0.0
+        # JOB_END_FREEZE: armed while a job runs that the gate may stop the listener after; the listener pids and the
+        # job's request, read during the job, so the freeze at the Worker's exit needs no ps and the look after it
+        # does not take the finished request for a new one
+        self.freeze_at_exit = False
+        self.listener_pids: tuple[int, ...] = ()
+        self.job_request: str | None = None
+        self.frozen: tuple[int, ...] = ()  # listeners the gate froze at a Worker's exit, thawed when step() returns
+        self.done: tuple[int, ...] = ()  # the Workers whose exit woke nap(), unreaped while their listener is frozen
         self.listening_since: float | None = None  # when start() last started run.sh (GATE_FIRST_POLL_S)
         self.first_poll_noted = False
         self.swept_at = time.monotonic() - GATE_SWEEP_S + GATE_POLL_S  # first sweep on the second poll
@@ -5399,6 +5455,7 @@ class Gate:
             return
         if self.terminating:
             return
+        self.thaw()  # a listener frozen at its Worker's exit never stays frozen across the exec
         gate_log("the hook changed; reloading the gate")
         sys.stdout.flush()
         blocked = {signal.SIGTERM, signal.SIGINT}
@@ -5915,10 +5972,17 @@ class Gate:
         except Exception as error:  # noqa: BLE001  (housekeeping never stops the gate)
             gate_log(f"the leftover sweep failed ({type(error).__name__}); trying again later")
 
-    def busy(self) -> bool:
+    def busy(self, finished: str | None = None) -> bool:
         """The runner has a job: a Runner.Worker under its tree, or a request its live listener is taking. A request
-        left in the diag of a listener that is gone holds nothing (nothing can run it), so it never pins the gate."""
-        return self.worker() or (self.listening() and self.taking() is not None)
+        left in the diag of a listener that is gone holds nothing (nothing can run it), so it never pins the gate.
+        `finished` is the request of a Worker that has exited while the gate held its listener frozen
+        (JOB_END_FREEZE): the frozen listener has not logged its end yet, and it is no longer a job."""
+        if self.worker():
+            return True
+        if not self.listening():
+            return False
+        request = self.taking()
+        return request is not None and (finished is None or request != finished)
 
     def listening(self) -> bool:
         """A Runner.Listener of this runner under its tree. A failed look counts as listening."""
@@ -5948,12 +6012,13 @@ class Gate:
         return found or self.taking() is not None
 
     def worker(self) -> bool:
-        """A Runner.Worker under this runner's tree. A failed look counts as busy."""
+        """A Runner.Worker under this runner's tree. A failed look counts as busy. A Worker nap() saw exit (done) is
+        none: under a frozen listener it stays a zombie until the listener reaps it."""
         try:
             pids, table = self.tree()
         except Exception:  # noqa: BLE001
             return True
-        return any(runner_worker(self.runner_dir, table[pid][1]) for pid in pids)
+        return any(runner_worker(self.runner_dir, table[pid][1]) for pid in pids if pid not in self.done)
 
     def taking(self) -> str | None:
         """The runner request the listener has acknowledged and not finished (listener_request). An unreadable
@@ -6003,7 +6068,37 @@ class Gate:
             self.first_poll_noted = True
         return True
 
-    def stop(self, why: str) -> bool:
+    def listener_list(self) -> tuple[int, ...]:
+        """This runner's Runner.Listener pids under its tree, read once per job for freeze()."""
+        try:
+            pids, table = self.tree()
+        except Exception:  # noqa: BLE001
+            return ()
+        return tuple(pid for pid in pids if runner_worker(self.runner_dir, table[pid][1], "Listener"))
+
+    def freeze(self) -> None:
+        """JOB_END_FREEZE: SIGSTOP the listeners the moment the job's Worker exits, before the listener can take the
+        next job, so step()'s look after the job decides with the listener held. Only processes in the gate's own
+        process group (the runner tree, as the class says) are frozen, so a pid reused since the job's last poll is
+        never touched; step() thaws them all when it returns (thaw)."""
+        group, frozen = os.getpgrp(), []
+        for pid in self.listener_pids:
+            try:
+                if os.getpgid(pid) != group:
+                    continue
+                os.kill(pid, signal.SIGSTOP)
+            except OSError:
+                continue
+            frozen.append(pid)
+        self.frozen = tuple(frozen)
+
+    def thaw(self) -> None:
+        for pid in self.frozen:  # after stop()'s SIGINT, which the listener takes as it thaws
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGCONT)
+        self.frozen, self.done = (), ()  # thawed, the listener reaps the exited Workers before the next nap()
+
+    def stop(self, why: str, finished: str | None = None) -> bool:
         """SIGINT to the listener: its graceful exit ends its session, so GitHub stops routing here. With no
         listener (run-helper.sh between listeners), SIGTERM the whole tree so nothing starts one later.
         A listener can take a job at any moment, and a SIGINT between its acknowledge and its Worker loses that
@@ -6011,6 +6106,7 @@ class Gate:
         acknowledge a request nor start a Worker, and its trace shows every acknowledge it has sent. A listener
         with a job, or taking one, is thawed and kept; an idle one gets the SIGINT before it is thawed. When the
         agent is stopping, a running job is cancelled as before, but an acquisition is still waited out.
+        `finished` is the request of a Worker that has exited (busy()): it is not one the listener is taking.
         Returns whether it signalled; step() tries again on a later poll."""
         pids, table = self.tree()
         listener = os.fspath(self.runner_dir / "bin" / "Runner.Listener")
@@ -6023,6 +6119,8 @@ class Gate:
                     frozen.append(pid)
             if listeners:
                 request, worker = self.taking(), self.worker()
+                if request is not None and request == finished and not worker:
+                    request = None
                 if (worker and not self.terminating) or (request is not None and not worker):
                     if not self.defer_noted:
                         gate_log(f"not stopping the listener ({why}): it is taking job request {request}"
@@ -6054,7 +6152,14 @@ class Gate:
                 os.kill(pid, signal.SIGKILL)
 
     def step(self) -> int | None:
-        """One poll. Returns an exit code when the gate itself should exit."""
+        """One poll. Returns an exit code when the gate itself should exit. A listener frozen at its Worker's exit
+        (JOB_END_FREEZE) is thawed when the poll returns, whatever it decided, a failed poll too."""
+        try:
+            return self.poll()
+        finally:
+            self.thaw()
+
+    def poll(self) -> int | None:
         if self.child is not None:
             code = self.child.poll()
             if code is not None:
@@ -6088,40 +6193,45 @@ class Gate:
                 self.unclaim()
                 self.stop("the runner agent is stopping")
                 return None
-            if (self.watching or self.job_waited or self.job_ending) and not self.busy():
-                self.watching, self.job_waited = (), False
-                self.fast_until = time.monotonic() + 5.0
+            armed = self.watching or self.freeze_at_exit or self.frozen or self.job_waited or self.job_ending
+            if armed and not self.busy(self.job_request):
+                finished = self.job_request
+                self.watching, self.job_waited, self.freeze_at_exit, self.job_request = (), False, False, None
                 ending = self.job_end() if self.job_ending else None
                 if (why := self.low_disk() or self.still_waiting() or self.still_reserved() or ending):
                     self.unclaim()
-                    self.stop(why)
+                    self.stop(why, finished)
                     return None
             self.reload()
             if self.busy():
                 # A fleet build seen waiting, or a reservation made, during a job stops the listener as the job
                 # ends: with a queue behind the label the next job comes before two idle polls, and each is
-                # refused (cmux10s, 2026-10-14: 14 PR jobs in two minutes under a soak's reservation). A job
-                # job-started refused ends in seconds, so its worker is watched; any other is seen on a poll.
+                # refused (cmux10s, 2026-10-14: 14 PR jobs in two minutes under a soak's reservation). The listener
+                # takes that next job within a second of its Worker's exit (cmuxs-mac-mini-6, 2026-10-28 17:41:58:
+                # the Worker exited and the next request was acknowledged in the same second), faster than any
+                # poll, so the gate waits on the Worker's exit itself and freezes the listener then
+                # (JOB_END_FREEZE, nap()).
+                if not self.job_ending and self.job_end_marker().exists():
+                    self.job_ending = True  # job-completed ran: watch the Worker until it exits (job_end)
+                    self.waiting_at = -GATE_WAITER_EVERY_S  # and read the waiters afresh before it does
                 if self.waiters and self.waiters_due():
                     self.waiting, self.waiting_at = self.blocking_waiters(), time.monotonic()
                 reserved = self.still_reserved()
                 self.job_waited = bool(self.waiting) or reserved is not None
-                workers = self.worker_pids() if self.waiting or reserved or self.low_disk() else []
-                refused = (self.waiting or reserved) and any(refused_note(self.state_dir, pid).exists()
-                                                             for pid in workers)
-                if workers and (refused or self.low_disk()):
-                    self.watching = tuple(workers)
-                    self.fast_until = time.monotonic() + 5.0
+                low = self.low_disk()
+                workers = tuple(pid for pid in self.worker_pids() if pid not in self.done) \
+                    if self.waiting or reserved or low or self.job_ending else ()
+                if workers:
+                    if workers != self.watching:  # once per job: the request its Worker runs, and who runs it
+                        self.job_request, self.listener_pids = self.taking(), self.listener_list()
+                    self.watching, self.freeze_at_exit = workers, True
+                else:  # no Worker yet (a request being taken) or none to watch: nothing to wait on
+                    self.watching, self.freeze_at_exit = (), False
                 self.streak = 0  # a claim must hold for two idle polls, not carry over from the job
                 now = time.monotonic()
                 self.busy_since = self.busy_since if self.busy_since is not None else now
                 if now - self.busy_since >= LISTEN_CLAIM_HANDOFF_S:
                     self.unclaim()  # the job's admission holds its units by now, or waits for them in the open
-                if not self.job_ending and self.job_end_marker().exists():
-                    self.job_ending = True  # job-completed ran: watch the Worker until it exits (job_end)
-                if self.job_ending:
-                    self.watching = tuple(self.worker_pids()) or self.watching
-                    self.fast_until = now + 5.0
                 self.load_since = None  # the hold limit times a pause, never a job
                 # the reserve stays held through the runner's own job: its admission lends it (RESERVE_LENT), so it
                 # keeps nothing while that job holds its units and is whole the moment they go back. One the job could
@@ -6184,29 +6294,26 @@ class Gate:
         return None
 
     def nap(self) -> None:
-        """Sleep until the next poll, waking quickly while a disk-held job exits."""
-        if self.watching:
-            if self.fast_until <= time.monotonic():
-                self.fast_until = time.monotonic() + 5.0
-            while self.watching:
-                alive = []
-                for pid in self.watching:
-                    if pid_alive(pid) and not self._zombie(pid):
-                        alive.append(pid)
-                self.watching = tuple(alive)
-                if not self.watching:
-                    self.fast_until = time.monotonic() + 5.0
-                    return
-                time.sleep(GATE_WATCH_S)
-                if time.monotonic() > self.fast_until:
-                    break
+        """Sleep until the next poll (GATE_POLL_S). While a job the gate may stop the listener after is running
+        (freeze_at_exit), wake at its Worker's exit instead and freeze the listener then (JOB_END_FREEZE), so the
+        look after the job runs before the listener can take the next one. listen() calls this between polls."""
+        if self.terminating:
+            time.sleep(0.5)
             return
-        delay = GATE_POLL_S
-        if self.fast_until > time.monotonic():
-            delay = GATE_WATCH_S
-        if self.stop_deadline is not None:
-            delay = max(0.0, self.stop_deadline - time.monotonic())
-        time.sleep(delay)
+        if not (self.freeze_at_exit and self.watching and self.child is not None):
+            time.sleep(GATE_POLL_S)
+            return
+        exited = wait_exit(self.watching, GATE_POLL_S)
+        if exited is None:  # no kqueue or pidfd: look every GATE_WATCH_S until the next poll
+            deadline = time.monotonic() + GATE_POLL_S
+            while not (exited := not all(pid_alive(pid) and not self._zombie(pid) for pid in self.watching)):
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(GATE_WATCH_S)
+        if exited:
+            # the exited ones, so the next poll neither counts their zombies as a job nor waits on them again
+            self.done = tuple(pid for pid in self.watching if not pid_alive(pid) or self._zombie(pid)) or self.watching
+            self.freeze()
 
     @staticmethod
     def _zombie(pid: int) -> bool:
@@ -6278,7 +6385,7 @@ def listen(runner_dir: Path, host_lock: str, reservation: str, state_dir: Path, 
             return code
         if not gate.terminating:
             gate.sweep()
-        time.sleep(GATE_POLL_S if not gate.terminating else 0.5)
+        gate.nap()
 
 
 def waiter_seen_stamp(state_dir: Path) -> int | None:
