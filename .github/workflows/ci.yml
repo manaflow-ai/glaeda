@@ -624,6 +624,12 @@ jobs:
           restore-keys: |
             verify-cargo-test-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-
 
+      - name: DIAGNOSTIC ancestors of the checkout (temporary)
+        run: |
+          id
+          d="$PWD"; while :; do stat -c '%n %u:%g %a %F' "$d"; [ "$d" = / ] && break; d=$(dirname "$d"); done
+          stat -c '%n %u:%g %a' "$HOME" "${CARGO_HOME:-$HOME/.cargo}" 2>&1 || true
+          ls -la "$PWD/.." | head
       - name: Run tests
         run: cargo test --locked --all-targets --all-features
 
