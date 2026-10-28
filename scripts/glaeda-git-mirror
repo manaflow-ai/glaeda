@@ -271,8 +271,14 @@ def with_suppressed(call: Callable[[], object]) -> None:
         pass
 
 
+# A read that ran out of time says the host is slow, not that the mirror is broken: healthy() reports it as SLOW
+# and the pass fetches without a repair. Taking it for broken started a 40-150 minute reseed from the bundle on
+# every loaded mini, with no fetch until it ended (cmux8s, 9s, 10s, 13s, 14, mini-6, 2026-10-27: 43-120 min behind).
+SLOW = "slow"
+
+
 def healthy(mirror: Path) -> str:
-    """'' when `mirror` is a usable full mirror, else why not."""
+    """'' when `mirror` is a usable full mirror, SLOW when a read timed out, else why not."""
     if not (mirror / "HEAD").is_file():
         return "missing"
     if (mirror / REPAIR_PENDING).exists():
@@ -282,11 +288,15 @@ def healthy(mirror: Path) -> str:
             return "shallow"
         if any(config_values(mirror, key) for key in PARTIAL_KEYS):
             return "partial"
+    except subprocess.TimeoutExpired:
+        return SLOW
     except (OSError, subprocess.SubprocessError) as error:
         return f"unreadable ({type(error).__name__})"
     for branch in BRANCHES:
         try:
             git(mirror, "rev-parse", "--verify", "-q", f"refs/heads/{branch}^{{commit}}", timeout=60)
+        except subprocess.TimeoutExpired:
+            return SLOW
         except (OSError, subprocess.SubprocessError):
             return f"no {branch}"
     return ""
@@ -488,10 +498,13 @@ VERIFIED = "glaeda-verified"
 VERIFY_EVERY = 24 * 3600
 
 
-def connected(repo: Path) -> bool:
+def connected(repo: Path) -> bool | None:
+    """Whether every branch's history is whole; None when the walk ran out of time (judged on a later pass)."""
     try:
         git(repo, "fsck", "--connectivity-only", "--no-dangling", "--no-progress", timeout=REPACK_TIMEOUT)
         return True
+    except subprocess.TimeoutExpired:
+        return None
     except subprocess.CalledProcessError:
         return False
 
@@ -595,6 +608,44 @@ def fold_packs(mirror: Path) -> dict | None:
             **({"error": err.strip()[-200:]} if status else {})}
 
 
+def early_fetch(problem: str) -> bool:
+    """Whether a pass that is about to repair fetches first: a mirror with a HEAD whose history is only incomplete
+    (a repair left pending, a lost object, a missing branch). Never a shallow or partial one, where a fetch would
+    write more shallow or promisor packs for the repair to undo."""
+    if problem not in ("repair pending", "missing objects") and not problem.startswith("no "):
+        return False
+    if MIRROR.is_symlink() or not (MIRROR / "HEAD").is_file() or (MIRROR / "shallow").exists():
+        return False
+    try:
+        return not any(config_values(MIRROR, key) for key in PARTIAL_KEYS)
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def last_record() -> dict:
+    try:
+        doc = json.loads(RECORD.read_text())
+        return doc if isinstance(doc, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_record(record: dict, previous: dict) -> dict:
+    """Write RECORD whole. fetched_at is when a fetch last succeeded, carried over a failed one, so a stalled
+    mirror reads as stale (glaeda-mini-health git_mirror_stale) however its passes end."""
+    ok = (record.get("fetch") or {}).get("ok") is True
+    before = previous.get("fetched_at")
+    if before is None and isinstance(previous.get("fetch"), dict) and previous["fetch"].get("ok") is True:
+        before = previous.get("time")  # a record from before fetched_at: its pass fetched
+    # when this write happens, not the pass's start: a pass that repaired first ends hours after it began
+    at = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    record = {**record, "fetched_at": at if ok else before}
+    incoming = RECORD.with_name(f".{RECORD.name}.{os.getpid()}")
+    incoming.write_text(json.dumps(record) + "\n")
+    incoming.rename(RECORD)
+    return record
+
+
 def heads(mirror: Path) -> dict[str, str]:
     out = git(mirror, "for-each-ref", "--format=%(refname:short) %(objectname)", "refs/heads", timeout=30)
     return dict(line.split(" ", 1) for line in out.splitlines() if " " in line)
@@ -687,26 +738,48 @@ def run(apply: bool, *, wait: bool = False, from_github: bool = False, home: Pat
         for abandoned in GIT_DIR.glob(".seed-*"):
             if abandoned.is_dir() and not abandoned.is_symlink():
                 shutil.rmtree(abandoned, ignore_errors=True)
+        previous = last_record()
         problem = healthy(MIRROR)
-        if not problem and not verified_recently(MIRROR):
-            if connected(MIRROR):
+        if problem == SLOW:
+            record["slow"], problem = "a read timed out: fetched without a repair", ""
+        elif not problem and not verified_recently(MIRROR):
+            whole = connected(MIRROR)
+            if whole:
                 (MIRROR / VERIFIED).write_text(dt.datetime.now(dt.timezone.utc).isoformat() + "\n")
-            else:
+            elif whole is False:
                 problem = "missing objects"
-        if problem:
-            record["seeded"] = {"because": problem, **seed(MIRROR, from_github)}
-        configure(MIRROR)
-        result = fetch(MIRROR, REPO_URL)
+        early_heads: dict[str, str] = {}
+        if early_fetch(problem):
+            # A repair in place runs for up to DOWNLOAD_TIMEOUT under the flock, so no later pass fetches until it
+            # ends: fetch the new commits first (a fetch only adds objects) and record them, so the mirror's tips
+            # stay current while it repairs. Jobs still wait for the repair (the runner hook reads REPAIR_PENDING).
+            early = fetch(MIRROR, REPO_URL, tries=1)
+            if early["ok"]:
+                early_heads = heads(MIRROR)
+            previous = write_record({**record, "fetch": early, "state": "repairing"}, previous)
+        result: dict = {"ok": False}
+        try:
+            if problem:
+                record["seeded"] = {"because": problem, **seed(MIRROR, from_github)}
+            configure(MIRROR)
+            result = fetch(MIRROR, REPO_URL)
+        finally:
+            if not result["ok"]:
+                # The bundle set the branches to its own (older) tips, and nothing fetched since: put back what the
+                # early fetch brought, whether the repair failed or the last fetch did.
+                for branch, sha in early_heads.items():
+                    if branch in BRANCHES:
+                        try:
+                            git(MIRROR, "update-ref", f"refs/heads/{branch}", sha, timeout=60)
+                        except (OSError, subprocess.SubprocessError):
+                            pass  # the next pass fetches the tips again
         record["fetch"] = result
         folded = fold_packs(MIRROR)
         if folded:
             record["repack"] = folded
         record["heads"] = heads(MIRROR)
         record["state"] = "applied" if result["ok"] else "fetch-failed"
-        incoming = RECORD.with_name(f".{RECORD.name}.{os.getpid()}")
-        incoming.write_text(json.dumps(record) + "\n")
-        incoming.rename(RECORD)
-        return record
+        return write_record(record, last_record())
     except (OSError, RuntimeError, subprocess.SubprocessError) as error:
         return {**record, "state": "error", "reason": f"{type(error).__name__}: {str(error)[:300]}"}
     finally:

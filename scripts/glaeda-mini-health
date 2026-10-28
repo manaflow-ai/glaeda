@@ -120,6 +120,10 @@ Each run checks, as the runner user and without sudo:
                                      hook's xcode_refusal): cmux21,
                                      2026-10-21, Command Line Tools 27 on macOS 27 past Xcode_26.6. job-started refuses
                                      every job and the gate holds the listener off. Root's: reported only.
+  git_mirror_stale                   glaeda-git-mirror's last good fetch of the runner mirror (FLEET_DIR/git/cmux.json
+                                     fetched_at) is over GIT_MIRROR_STALE_S (30 min) old, on a macOS host with a mirror
+                                     source configured. Its passes heal it (a repair fetches first); pending while a
+                                     pass runs, else impossible. Reported only.
   disk_pass_stale                    glaeda-disk has not finished a pass in DISK_PASS_STALE_S (26 h): sizes.json's newest
                                      per-item measurement or accounting.json's newest record is older, or either is
                                      missing, on a macOS host with glaeda-disk's LaunchAgent or snapshots (its agent
@@ -293,6 +297,11 @@ XCTEST_RUNNING = re.compile(r"(?:^|/)xctest(?:\s|$)|(?:^|/)xcodebuild\s(?:.*\s)?
 LEAKED_TEST_APP = re.compile(r"^\s*'?(.*/actions-runner[^/]+/_work/_temp/cmux-derived-data-tests-[^/]+/Build/Products/Debug/cmux DEV\.app)(?:/Contents/MacOS/[^ ]+)?'?(?:\s|$)")
 LEAKED_APP_TERM_S = 1.0
 DISK_PASS_STALE_S = 26 * 3600  # glaeda-disk's LaunchAgent runs every 15 min; a day without a pass is a stall
+# glaeda-git-mirror's runner mirror: its LaunchAgent fetches every minute, and a job reads its commit from it, so
+# a mirror whose last good fetch is older than this is stalled (cmuxterm-hq docs/repo-mirrors.md: fresh within 30).
+GIT_MIRROR_STALE_S = 30 * 60
+GIT_MIRROR_SOURCE = ".config/glaeda/lan-cache/config.json"  # glaeda-git-mirror's SOURCE_CONFIG, under HOME
+GIT_MIRROR_SOURCES = ("direct",)  # glaeda-git-mirror's SOURCES
 DISK_AGENT = "com.teamleaderleo.glaeda.disk-pressure"  # glaeda-mini-setup's 15-minute glaeda-disk pass
 DISK_CACHE = ".cache/glaeda-disk"  # glaeda-disk's sizes.json and accounting.json, under HOME
 RUNNER_HYGIENE = "com.teamleaderleo.glaeda.runner-hygiene"  # glaeda-runner-hygiene's LABEL_PREFIX (.<uid>)
@@ -1017,6 +1026,24 @@ class Mini:
                 "accounting": None if profile else load_json(snapshots[1]),
                 "written": written, "agent": agent, "last_exit": last_exit}
 
+    def git_mirror(self) -> dict[str, Any] | None:
+        """glaeda-git-mirror's record (FLEET_DIR/git/cmux.json) and whether a pass is running now, or None where no
+        mirror is kept: not macOS, or no mirror source configured (glaeda-git-mirror does nothing there)."""
+        config = load_json(self.home / GIT_MIRROR_SOURCE)
+        if sys.platform != "darwin" or config.get("schema") != 1 or config.get("source") not in GIT_MIRROR_SOURCES:
+            return None  # glaeda-git-mirror's source(): it does nothing without one of these
+        git_dir = FLEET_DIR / "git"
+        running = False
+        try:
+            pid = int(json.loads((git_dir / ".pass.json").read_text())["pid"])
+            os.kill(pid, 0)
+            running = True
+        except PermissionError:
+            running = True
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        return {"record": load_json(git_dir / "cmux.json"), "running": running}
+
     # ---- tailscale_no_route's restart: its gates' reads and the restart itself
 
     def tailscale_restart_off(self) -> str:
@@ -1467,6 +1494,33 @@ def check_disk_pass(mini: Mini, now: float) -> list[dict[str, Any]]:
                     f"disk pass job {agent}", "impossible",
                     "glaeda-disk --pressure --idle --apply --top 0 shows why a pass does not finish; "
                     "~/Library/Logs/glaeda-disk.err; glaeda-mini-setup reloads the agent")]
+
+
+def check_git_mirror(mini: Mini, now: float) -> list[dict[str, Any]]:
+    """git_mirror_stale: glaeda-git-mirror's last good fetch (its record's fetched_at, or the pass time of a record
+    whose fetch succeeded) is older than GIT_MIRROR_STALE_S, or there is none. Its passes heal it themselves (a
+    repair fetches first); a finding that stays is a pass that cannot finish or a fetch that keeps failing."""
+    facts = mini.git_mirror()
+    if facts is None:
+        return []
+    record = facts.get("record") if isinstance(facts.get("record"), dict) else {}
+    fetched = record.get("fetched_at")
+    if fetched is None and (record.get("fetch") or {}).get("ok") is True:
+        fetched = record.get("time")  # a record from before fetched_at
+    at = utc(fetched)
+    # a repair whose pass is gone (it failed or was killed) left the mirror incomplete, however fresh its tips
+    stopped = record.get("state") == "repairing" and not facts.get("running")
+    if at is not None and now - at <= GIT_MIRROR_STALE_S and not stopped:
+        return []
+    age = "no good fetch on record" if at is None else f"last good fetch {(now - at) / 60:.0f} min ago"
+    if stopped:
+        age = f"a repair stopped part way, {age}"
+    state = f"last pass {record.get('state') or '?'}" + (f": {str(record.get('reason'))[:120]}" if record.get("reason") else "")
+    return [finding("git_mirror_stale", "warn",
+                    f"{age} (fresh within {GIT_MIRROR_STALE_S // 60}); {state}; "
+                    f"{'a pass is running' if facts.get('running') else 'no pass running'}",
+                    "pending" if facts.get("running") else "impossible",
+                    "glaeda-git-mirror (plan) says what the next pass does; ~/Library/Logs/glaeda-git-mirror.jsonl")]
 
 
 def check_disk_accounting(mini: Mini) -> list[dict[str, Any]]:
@@ -2613,7 +2667,7 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
                  + check_node_eligibility(mini) + check_toolchain_missing(mini) + check_toolchain(mini)
                  + check_leaked_test_apps(mini)
                  + check_checkout_steps(mini, now, state_path.parent / CHECKOUT_CACHE, apply)
-                 + check_disk_accounting(mini) + check_disk_pass(mini, now)
+                 + check_disk_accounting(mini) + check_disk_pass(mini, now) + check_git_mirror(mini, now)
                  + check_daemon_heal(mini) + check_ota(mini, now)
                  + check_claude_route(mini, now, apply and not tunnel_down, tunnel_down))
         if apply and mini.tailnet_route_ok:

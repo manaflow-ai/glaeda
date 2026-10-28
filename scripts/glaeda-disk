@@ -3598,6 +3598,9 @@ def hq_cache_family(root: Path | None = None) -> Family:
                   reference_root=FLEET_ROOT if root is None else root.parent, platform="macos")
 
 
+CMUX_DEBUG_APP_PREFIX = "com.cmuxterm.app.debug."  # a tagged DEV build's bundle id, never a release app's
+
+
 def default_families(role: str = "fleet-mini") -> list[Family]:
     tmp = Path("/private/tmp") if DARWIN else Path("/tmp")
     tmpfs = tmp.is_dir() and fs_type(tmp) == "tmpfs"
@@ -3664,6 +3667,20 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
         # downloaded again.
         Family("home-caches", HOME, True, "the tool re-downloads or rebuilds it", discover=True,
                owner="tools (found by cache layout)", rebuild_minutes=5, min_idle_hours=DEFAULT_AGE_HOURS, pressure_only=role == "devbox", platform=host_cache_platform()),
+        # Tagged DEV builds' app data (cmux's reload.sh --tag and CI capture slots: com.cmuxterm.app.debug.<tag>),
+        # each with a full installed app copy under versions/N. Nothing removed them: on the nightly-next builder's
+        # mini (2026-10-28) 391 tags held 35.8 GiB under cmux-next, 354 untouched for over a day, and the builder's
+        # runner sat offline under its 40 GiB floor while glaeda-disk found 0.0G reclaimable. Only debug tags: the
+        # release and NEXT apps' own data (com.cmuxterm.app, com.cmuxterm.app.next) is never a candidate. Not on a
+        # devbox, where a tag may be a developer's live test session.
+        *([] if role == "devbox" else [
+            Family(f"cmux-debug-app-data-{app}", HOME / "Library/Application Support" / app, True,
+                   # an installed app copy is too deep for the git search to finish and holds no checkout, so it
+                   # is build output (as code-sign-clones); the process and open-file checks still keep a live tag
+                   "the next tagged DEV build recreates it", include=(CMUX_DEBUG_APP_PREFIX,), build_output=True,
+                   min_idle_hours=DEFAULT_AGE_HOURS, owner="cmux tagged DEV builds (reload.sh --tag, CI capture)",
+                   rebuild_minutes=2, platform="macos")
+            for app in ("cmux-next", "cmux")]),
         Family("simulators", HOME / "Library/Developer/CoreSimulator", False,
                "use `xcrun simctl delete unavailable` (report only)", platform="macos"),
         Family("projects", projects, False, "checkouts (report only)",

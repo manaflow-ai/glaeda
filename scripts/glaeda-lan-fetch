@@ -11,6 +11,11 @@
                                              (SLOT kept or pr-<n>; STAMP its stamp.json sha256, from the
                                              index) into this mini's root K store; exit 0 when installed,
                                              3 when the peer no longer has it
+    glaeda-lan-fetch cache BUCKET NS FILE DEST
+                                             the CI cache object https://BUCKET/v1/NS/objects/FILE from the
+                                             site's LAN cache host (glaeda-seed-serve --role cache), which
+                                             fills it from the bucket once; exit 0 when DEST holds it, 3 when
+                                             the bucket has none, anything else: download it directly
     glaeda-lan-fetch serve-local             the local broker (the lan-fetch LaunchAgent)
 
 cmux CI (scripts/ci/peer_product_source.py) calls the root-owned copy at
@@ -109,6 +114,16 @@ STATE_DEADLINE = 480.0
 STAGING_PREFIX = ".lan-state-"
 ZSTD_CANDIDATES = ("/opt/homebrew/bin/zstd", "/usr/local/bin/zstd")
 TAR = "/usr/bin/tar"
+
+# The site's LAN cache host (glaeda-seed-serve --role cache): CI cache objects, fetched over the uplink once.
+CACHE_CONFIG = HOME / ".config/glaeda/lan-cache/config.json"
+CACHE_HOST_KEY_ALIAS = "glaeda-lan-cache"
+CACHE_BUCKETS = ("ci-cache.cmux.com", "ci-cache-next.cmux.com")  # glaeda-seed-serve CACHE_BUCKETS
+CACHE_NS_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+CACHE_FILE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,250}\.tar\.(?:zst|gz)")
+CACHE_DEADLINE = 5400.0  # the host's FILL_TIMEOUT: a first fill runs at the uplink's speed
+CACHE_STALL = 120.0  # the host reports a fill's progress every 10 s and streams at LAN speed
+CACHE_CONCURRENCY = 8  # cache requests at a time, apart from product fetches (most only wait on a fill)
 
 
 def load_config(path: Path | None = None) -> dict | None:
@@ -542,6 +557,199 @@ def index_loop(stop: threading.Event, path: Path | None = None, interval: float 
         stop.wait(interval)
 
 
+# ------------------------------------------------------------------ the site's LAN cache host
+
+
+def load_cache_config(path: Path | None = None) -> dict | None:
+    """The validated LAN cache client config (glaeda-seed-lan cache writes it), or None."""
+    path = path or CACHE_CONFIG
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict) or raw.get("schema") != 1 or raw.get("source") != "lan":
+        return None
+    user, addresses = raw.get("user"), raw.get("addresses")
+    if not isinstance(user, str) or not USER_RE.fullmatch(user):
+        return None
+    if (not isinstance(addresses, list) or not 1 <= len(addresses) <= 4
+            or not all(isinstance(a, str) and ADDRESS_RE.fullmatch(a) for a in addresses)):
+        return None
+    identity, known_hosts = path.parent / "id_ed25519", path.parent / "known_hosts"
+    if not identity.is_file() or not known_hosts.is_file():
+        return None
+    return {"user": user, "addresses": addresses, "identity": identity, "known_hosts": known_hosts}
+
+
+def cache_object(bucket: object, ns: object, file: object) -> str | None:
+    """BUCKET/NS/FILE when every part is one the cache host serves, else None."""
+    if (isinstance(bucket, str) and isinstance(ns, str) and isinstance(file, str) and bucket in CACHE_BUCKETS
+            and CACHE_NS_RE.fullmatch(ns) and CACHE_FILE_RE.fullmatch(file)):
+        return f"{bucket}/{ns}/{file}"
+    return None
+
+
+def cache_transfer(config: dict, address: str, name: str, partial: int, deadline: float,
+                   cancel: threading.Event) -> tuple[str, int, float]:
+    """Stream NAME from the cache host at ADDRESS into the open file PARTIAL: (why not or '' or 'miss', bytes,
+    wait seconds).
+
+    The host answers `filling BYTES` lines while it fills the object from the bucket; the ssh is killed at
+    DEADLINE, as soon as CANCEL is set, or after CACHE_STALL seconds with neither a line nor a byte.
+    """
+    proc = subprocess.Popen(ssh_command(config, {"name": CACHE_HOST_KEY_ALIAS, "address": address},
+                                        "cache-v1 " + name.replace("/", " ")),
+                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            start_new_session=True)
+    started = time.monotonic()
+    done, stopped, alive = threading.Event(), [], [started]
+
+    def watch() -> None:
+        while not done.wait(0.2):
+            now = time.monotonic()
+            why = ("cancelled" if cancel.is_set() else "timed out" if now >= deadline
+                   else "stalled" if now - alive[0] >= CACHE_STALL else "")
+            if why:
+                stopped.append(why)
+                with contextlib.suppress(OSError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                return
+
+    watcher = threading.Thread(target=watch, daemon=True)
+    watcher.start()
+    try:
+        while True:
+            words = header_of(proc.stdout).decode(errors="replace").split()
+            alive[0] = time.monotonic()
+            if len(words) == 2 and words[0] == "filling":
+                continue
+            break
+        if words == ["miss"]:
+            return "miss", 0, 0.0
+        if len(words) != 2 or words[0] != "hit-cache" or not words[1].isdecimal():
+            return (stopped[0] if stopped else "answered " + (" ".join(words)[:60] or "nothing")), 0, 0.0
+        size, got, wait = int(words[1]), 0, time.monotonic() - started
+        os.lseek(partial, 0, os.SEEK_SET)
+        os.ftruncate(partial, 0)
+        while got < size:
+            chunk = proc.stdout.read(min(1 << 20, size - got))
+            if not chunk:
+                break
+            alive[0] = time.monotonic()
+            view = memoryview(chunk)
+            while view:
+                view = view[os.write(partial, view):]
+            got += len(chunk)
+        os.fsync(partial)
+        if stopped:
+            return stopped[0], got, wait
+        return ("" if got == size else f"short stream ({got} of {size} bytes)"), got, wait
+    finally:
+        done.set()
+        watcher.join()
+        with contextlib.suppress(OSError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.stdout.close()
+        proc.wait()
+
+
+def fetch_cache(name: str, dest: Path, config: dict | None, deadline: float | None = None,
+                cancel: threading.Event | None = None) -> tuple[int, dict]:
+    """(exit code, record). Writes DEST, whole, with the LAN cache host's copy of NAME (BUCKET/NS/FILE).
+
+    The cache host is the trusted seeder, which fetched the object from the bucket over HTTPS, as the job
+    would: the object carries no digest, so the announced size and an unbroken stream are the checks.
+    EXIT_MISS only when the host found no such object in the bucket; any other failure is EXIT_ERROR, and
+    the caller downloads from the bucket itself.
+    """
+    started = time.monotonic()
+    deadline = deadline if deadline is not None else started + CACHE_DEADLINE
+    cancel = cancel or threading.Event()
+    record: dict = {"tool": "glaeda-lan-fetch", "verb": "cache", "object": name, "source": "lan-cache"}
+    if not dest.is_absolute() or dest.exists() or dest.is_symlink() or not dest.parent.is_dir():
+        return EXIT_ERROR, {**record, "error": "DEST must be an absolute, absent path in an existing directory"}
+    if config is None:
+        return EXIT_ERROR, {**record, "error": "no LAN cache config"}
+    try:
+        # Every name below is looked up in this one directory, so a job that swaps DEST's directory for a
+        # symlink meanwhile moves nothing of ours anywhere else.
+        parent = os.open(dest.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as error:
+        return EXIT_ERROR, {**record, "error": f"DEST directory: {type(error).__name__}"}
+    try:
+        return fetch_cache_into(name, parent, dest.name, config, record, started, deadline, cancel)
+    finally:
+        os.close(parent)
+
+
+def remove_stage(parent: int, stage: str) -> None:
+    """Remove this call's private stage directory STAGE (in PARENT) and the one file it may hold."""
+    try:
+        fd = os.open(stage, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+    except OSError:
+        return
+    try:
+        with contextlib.suppress(OSError):
+            os.unlink(STAGED, dir_fd=fd)
+    finally:
+        os.close(fd)
+    with contextlib.suppress(OSError):
+        os.rmdir(stage, dir_fd=parent)
+
+
+STAGED = "object"
+
+
+def private_dir(fd: int) -> bool:
+    """FD is a directory of ours that no one else can enter or write: a stage swapped in by another user
+    between its mkdir and its open fails this."""
+    info = os.fstat(fd)
+    return stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) & 0o077 == 0
+
+
+def fetch_cache_into(name: str, parent: int, dest: str, config: dict, record: dict, started: float,
+                     deadline: float, cancel: threading.Event) -> tuple[int, dict]:
+    errors = []
+    for address in config["addresses"]:
+        if cancel.is_set() or time.monotonic() >= deadline:
+            errors.append("cancelled" if cancel.is_set() else "deadline passed")
+            break
+        # The transfer goes into a private 0700 directory this call makes beside DEST, and DEST is linked
+        # (no-replace) from there once the file is whole: no other user can reach the staged file, and DEST
+        # never shows a partial object.
+        stage_name = f".{dest}.lan-{os.getpid()}-{threading.get_ident()}-{secrets.token_hex(6)}"
+        try:
+            os.mkdir(stage_name, 0o700, dir_fd=parent)
+        except OSError as error:
+            return EXIT_ERROR, {**record, "error": f"stage directory: {type(error).__name__}"}
+        stage = fd = None
+        try:
+            stage = os.open(stage_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+            if not private_dir(stage):
+                raise PermissionError("the stage directory is not this call's own")
+            fd = os.open(STAGED, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=stage)
+            why, size, wait = cache_transfer(config, address, name, fd, deadline, cancel)
+            if why == "miss":
+                return EXIT_MISS, {**record, "reason": "not in the bucket", "seconds": round(time.monotonic() - started, 3)}
+            if not why:
+                if os.fstat(fd).st_size != size:
+                    raise OSError("the staged file is not the announced size")
+                os.fchmod(fd, 0o644)
+                # no-replace: fails if DEST appeared meanwhile
+                os.link(STAGED, dest, src_dir_fd=stage, dst_dir_fd=parent, follow_symlinks=False)
+                return EXIT_HIT, {**record, "address": address, "bytes": size, "wait_seconds": round(wait, 3),
+                                  "seconds": round(time.monotonic() - started, 3)}
+            errors.append(f"{address}: {why}")
+        except OSError as error:
+            errors.append(f"{address}: {type(error).__name__}")
+        finally:
+            for held in (fd, stage):
+                if held is not None:
+                    os.close(held)
+            remove_stage(parent, stage_name)
+    return EXIT_ERROR, {**record, "error": "; ".join(errors)[:400], "seconds": round(time.monotonic() - started, 3)}
+
+
 # ------------------------------------------------------------------ the broker
 
 
@@ -551,7 +759,8 @@ def broker_request(sha: str, dest: Path, sock_path: Path | None = None,
     sock_path = sock_path or SOCKET
     conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        conn.settimeout((STATE_DEADLINE if request else REQUEST_DEADLINE) + 20)
+        verb = (request or {}).get("verb")
+        conn.settimeout((CACHE_DEADLINE if verb == "cache" else STATE_DEADLINE if request else REQUEST_DEADLINE) + 20)
         conn.connect(os.fspath(sock_path))
     except OSError:
         conn.close()
@@ -589,6 +798,11 @@ def read_request(conn: socket.socket) -> dict:
                 or not isinstance(slot, str) or not isinstance(want, str)):
             raise ValueError("bad request")
         return {"verb": "state", "peer": peer, "root": k, "slot": slot, "stamp_sha256": want}
+    if isinstance(request, dict) and request.get("verb") == "cache":
+        name = cache_object(request.get("bucket"), request.get("ns"), request.get("file"))
+        if name is None or not isinstance(request.get("dest"), str):
+            raise ValueError("bad request")
+        return {"verb": "cache", "object": name, "dest": request["dest"]}
     if isinstance(request, dict) and request.get("verb") == "refresh-index":
         return {"verb": "refresh-index"}
     if not isinstance(request, dict) or request.get("verb") != "product":
@@ -608,6 +822,9 @@ def client_gone(conn: socket.socket) -> bool:
         return True
 
 
+CACHE_SLOTS = threading.BoundedSemaphore(CACHE_CONCURRENCY)
+
+
 def handle(conn: socket.socket, slots: threading.BoundedSemaphore) -> None:
     with conn:
         try:
@@ -615,6 +832,7 @@ def handle(conn: socket.socket, slots: threading.BoundedSemaphore) -> None:
         except (OSError, ValueError, TypeError):
             answer = {"code": EXIT_ERROR, "record": {"tool": "glaeda-lan-fetch", "error": "bad request"}}
         else:
+            slots = CACHE_SLOTS if request["verb"] == "cache" else slots
             if not slots.acquire(blocking=False):
                 answer = {"code": EXIT_ERROR, "record": {"tool": "glaeda-lan-fetch", "error": "broker busy"}}
             else:
@@ -625,6 +843,10 @@ def handle(conn: socket.socket, slots: threading.BoundedSemaphore) -> None:
                         work = lambda: fetch_state(request["peer"], request["root"], request["slot"],  # noqa: E731
                                                    request["stamp_sha256"], load_config(), deadline=deadline,
                                                    cancel=cancel)
+                    elif request["verb"] == "cache":
+                        deadline = time.monotonic() + CACHE_DEADLINE
+                        work = lambda: fetch_cache(request["object"], Path(request["dest"]),  # noqa: E731
+                                                   load_cache_config(), deadline, cancel)
                     elif request["verb"] == "refresh-index":
                         work = lambda: (EXIT_HIT, {"tool": "glaeda-lan-fetch", "verb": "refresh-index",  # noqa: E731
                                                    "peers": len(refresh_index(load_config())["peers"])})
@@ -736,6 +958,18 @@ def main(argv: list[str]) -> int:
         answered = broker_request("", Path("/"), request=request)
         if answered is None:
             answered = fetch_state(argv[1], int(argv[2]), argv[3], argv[4].lower(), load_config())
+        code, record = answered
+        print(json.dumps(record, sort_keys=True), flush=True)
+        return code
+    if len(argv) == 5 and argv[0] == "cache":
+        name = cache_object(argv[1], argv[2], argv[3])
+        if name is None:
+            print("glaeda-lan-fetch: not a cache object", file=sys.stderr)
+            return 2
+        request = {"verb": "cache", "bucket": argv[1], "ns": argv[2], "file": argv[3], "dest": argv[4]}
+        answered = broker_request("", Path("/"), request=request)
+        if answered is None:
+            answered = fetch_cache(name, Path(argv[4]), load_cache_config())
         code, record = answered
         print(json.dumps(record, sort_keys=True), flush=True)
         return code
