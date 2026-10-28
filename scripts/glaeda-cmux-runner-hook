@@ -4343,6 +4343,29 @@ def listen_fit_units(runner_dir: Path) -> int:
     return int(match.group(1)) if match else 1
 
 
+# The side label's costliest job, which a plain side runner listens with room for (side_fit_units): cmux-next's fast
+# tier off a fast runner (JOB_CORES, 5; also swift-canary 4, release-compile and cmux-scheme-compile 3, which cmux's
+# placement sends to CI_SIDE_LANE_RUNNER). From 2026-10-25 22:30Z, when the fleet reservation took every mini with a
+# fast runner, about 1,000 fast-tier jobs a day reached side runners whose listen.sh passed glaeda-ios-sim's
+# --fit-units 3 (or none), with 3 or 4 units free; each waited in "Set up runner" for the rest, and its admit.want
+# marker held the mini's other runners meanwhile. Fast-tier admission wait went from 0 to 7,904 min on 2026-10-27,
+# and the owned Macs' total from 4,222 (10-24) to 35,450. cmux's placement reads such a listener as idle, so the job
+# never cascaded to Blacksmith. Read here, not from listen.sh, so glaeda-update's hook refresh fixes the running
+# gates without an --apply that rewrites every wrapper.
+SIDE_FIT_JOBS = (("cmux-next.yml", "fast-tier"), ("cmux-next.yml", "swift-canary"),
+                 ("cmux-next.yml", "release-compile"), ("cmux-next.yml", "cmux-scheme-compile"))
+
+
+def side_fit_units(scope: RunnerScope) -> int:
+    """The units a plain side runner (no root, gui, session, fast, freshness, nightly or dedicated role) listens
+    with room for: the costliest of SIDE_FIT_JOBS. Every other role keeps its own fit (mini_full)."""
+    if scope.units <= 0 or scope.root or scope.gui or scope.session or scope.fast or scope.fresh \
+            or scope.nightly or scope.dedicated:
+        return 1
+    return max(job_units(job_class(job, DEFAULT_HOME_REPO, workflow=workflow)[0], job, DEFAULT_HOME_REPO, workflow=workflow)
+               for workflow, job in SIDE_FIT_JOBS)
+
+
 DEDICATED_ADMIT_TIMEOUT_S = 600
 
 
@@ -5502,7 +5525,8 @@ class Gate:
         if scope.nightly:  # NIGHTLY_SLOT: its one job shape goes first here, so it listens on a full mini
             self.full_why = None
             return None
-        why = mini_full(self.capacity_dir, scope.units, scope, max(self.fit_units, listen_fit_units(self.runner_dir)))
+        why = mini_full(self.capacity_dir, scope.units, scope,
+                        max(self.fit_units, listen_fit_units(self.runner_dir), side_fit_units(scope)))
         if isinstance(why, Unknown):
             return None if fresh else self.full_why
         self.full_why = why
