@@ -49,6 +49,8 @@ gg.UPSTREAM_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-upstream-
 # Nor may a host's own gh-daemon.json change the pacing the tests expect.
 gg.DAEMON_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-daemon-config-{os.getpid()}.json"
 gg.FLEET_POLICY = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-fleet-policy-{os.getpid()}.json"
+# Nor may a host's own pacer hear about the tests' secondary 403s.
+gg.PACE_CLI = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-pacer-{os.getpid()}" / "gh"
 
 TOKEN = "ghp_faketoken_must_never_touch_disk"
 NOW = float(int(time.time()))  # watch files carry real mtimes
@@ -117,6 +119,8 @@ class FakeGitHub:
         self.base_gone = False  # the base branch was deleted: its rules and protection answer 404
         self.heads: dict[tuple[str, str, str], list] = {}  # (owner, repo, sha) -> that commit's check contexts
         self.rate_limit_calls = 0  # GET /rate_limit: free, so it is counted separately
+        self.throttle: dict[str, tuple[int, dict, bytes]] = {}  # "rest"|"graphql" -> the answer every read gets
+        self.no_protection_feature = False  # a private repository's plan: rules and protection answer 403
 
     def rate(self, resource: str, remaining: int) -> dict:
         return {"x-ratelimit-limit": "5000", "x-ratelimit-remaining": str(remaining),
@@ -125,6 +129,9 @@ class FakeGitHub:
     def __call__(self, method: str, url: str, headers: dict, body: bytes | None) -> tuple[int, dict, bytes]:
         self.calls.append((method, url, dict(headers), body))
         assert headers["Authorization"] == f"Bearer {TOKEN}"
+        throttled = self.throttle.get("graphql" if url.endswith("/graphql") else "rest")
+        if throttled and not url.endswith("/rate_limit"):
+            return throttled
         if url.endswith("/graphql"):
             doc = json.loads(body)
             v, data, errors = doc["variables"], {}, []
@@ -165,6 +172,8 @@ class FakeGitHub:
             i = 0
             while f"o{i}" in v:
                 node = table.get((v[f"o{i}"], v[f"r{i}"], v[f"n{i}"]))
+                if comments and node is not None:  # comments(last: COMMENTS_LAST)
+                    node = {**node, "comments": {**node["comments"], "nodes": node["comments"]["nodes"][-gg.COMMENTS_LAST:]}}
                 data[f"{alias}{i}"] = {field: node}
                 if node is None:
                     errors.append({"type": "NOT_FOUND", "path": [f"{alias}{i}", field], "message": "Could not resolve"})
@@ -181,7 +190,16 @@ class FakeGitHub:
                                   "graphql": {"limit": 5000, "remaining": self.graphql_remaining,
                                               "reset": int(NOW + 1800)}}}
             return 200, self.rate("core", self.rest_remaining), json.dumps(body).encode()
-        if parts[4] == "actions" and parts[5] == "jobs":
+        if parts[4] == "issues":
+            payload = self.rest_issue(parts, path)
+            if payload is None:
+                self.rest_remaining -= 1
+                return 404, self.rate("core", self.rest_remaining), b'{"message": "Not Found"}'
+        elif parts[4] in {"rules", "branches"} and self.no_protection_feature:
+            self.rest_remaining -= 1
+            return 403, self.rate("core", self.rest_remaining), json.dumps({"message": (
+                "Upgrade to GitHub Pro or make this repository public to enable this feature.")}).encode()
+        elif parts[4] == "actions" and parts[5] == "jobs":
             steps = self.job_steps.get(int(parts[6]))
             payload = None if steps is None else {"id": int(parts[6]), "steps": steps}
             if payload is None:
@@ -200,6 +218,22 @@ class FakeGitHub:
             return 304, self.rate("core", self.rest_remaining), b""
         self.rest_remaining -= 1
         return 200, {**self.rate("core", self.rest_remaining), "etag": etag}, json.dumps(payload).encode()
+
+    def rest_issue(self, parts: list[str], path: str) -> Any:
+        """The REST view of the GraphQL issue nodes in self.issues: the issue, or a page of its comments."""
+        node = self.issues.get((parts[2], parts[3], int(parts[5])))
+        if node is None:
+            return None
+        comments = node["comments"]["nodes"]
+        if len(parts) == 6:
+            pull = {"merged_at": "x" if node["state"] == "MERGED" else None} if node["__typename"] == "PullRequest" else None
+            return {"html_url": node["url"], "state": "open" if node["state"] == "OPEN" else "closed",
+                    "comments": len(comments), **({"pull_request": pull} if pull else {})}
+        page = int(path.split("page=")[-1])
+        return [{"id": c["databaseId"], "html_url": c["url"], "created_at": c["createdAt"],
+                 "user": {"login": c["author"]["login"] + "[bot]" if c["author"]["login"].endswith("-bot")
+                          else c["author"]["login"]}, "body": c["body"]}
+                for c in comments[100 * (page - 1):100 * page]]
 
     def rest_pr(self, parts: list[str], path: str) -> Any:
         """The REST view of the GraphQL PR nodes in self.prs: pulls, check runs, statuses, a head's
@@ -224,20 +258,25 @@ class FakeGitHub:
         if what == "branches":
             return {"name": parts[5], "protection": {"required_status_checks": {"contexts": self.protected}}}
         sha = parts[5] if what == "commits" else path.split("head_sha=", 1)[1].split("&")[0]
-        contexts = []
+        contexts = self.heads.get((owner, repo, sha)) or []
         for node in self.prs.values():
             if node["headRefOid"] == sha:
                 contexts = ((node["commits"]["nodes"][0]["commit"]["statusCheckRollup"] or {}).get("contexts") or {}).get("nodes") or []
         runs = {c["checkSuite"]["workflowRun"]["databaseId"]: c for c in contexts
                 if ((c.get("checkSuite") or {}).get("workflowRun") or {}).get("databaseId")}
         if what == "actions":
-            return {"workflow_runs": [{"id": rid, "name": "run-name " + str(rid),  # REST: the run-name
+            page = int(path.split("page=")[-1]) if "&page=" in path else 1
+            listed = list(runs.items())[100 * (page - 1):100 * page]
+            return {"total_count": len(runs), "workflow_runs": [{"id": rid, "name": "run-name " + str(rid),  # REST: the run-name
                                        "workflow_id": {"CI": 77, "Lint": 78}.get(c["checkSuite"]["workflowRun"]["workflow"]["name"]),
                                        "check_suite_id": rid, "conclusion": (c["checkSuite"].get("conclusion") or "").lower() or None}
-                                      for rid, c in runs.items()]}
+                                      for rid, c in listed]}
         if parts[-1] == "status":
-            return {"statuses": [{"context": c["context"], "state": c["state"].lower(), "target_url": c.get("targetUrl"),
-                                  "created_at": c.get("createdAt")} for c in contexts if c["__typename"] == "StatusContext"]}
+            listed = [c for c in contexts if c["__typename"] == "StatusContext"]
+            page = int(path.split("page=")[-1]) if "&page=" in path else 1
+            return {"total_count": len(listed), "statuses": [
+                {"context": c["context"], "state": c["state"].lower(), "target_url": c.get("targetUrl"),
+                 "created_at": c.get("createdAt")} for c in listed[100 * (page - 1):100 * page]]}
         checks = [c for c in contexts if c["__typename"] == "CheckRun"]
         page = int(path.split("page=")[-1]) if "&page=" in path else 1
         checks_page = checks[100 * (page - 1):100 * page]
@@ -245,7 +284,8 @@ class FakeGitHub:
             {"id": c.get("databaseId"), "node_id": c.get("id"), "name": c["name"], "status": c["status"].lower(),
              "conclusion": (c.get("conclusion") or "").lower() or None, "details_url": c.get("detailsUrl"),
              "started_at": c.get("startedAt"), "completed_at": c.get("completedAt"),
-             "check_suite": {"id": ((c.get("checkSuite") or {}).get("workflowRun") or {}).get("databaseId")}}
+             "check_suite": {"id": ((c.get("checkSuite") or {}).get("workflowRun") or {}).get("databaseId")},
+             "app": {"slug": ((c.get("checkSuite") or {}).get("app") or {}).get("slug")}}
             for c in checks_page]}
 
     def rest_calls(self) -> list:
@@ -1454,12 +1494,12 @@ class BalanceTest(Base):
                               "graphql": {"limit": 5000, "remaining": graphql[0], "reset": NOW + graphql[1]}}
 
     def test_richness_is_what_is_left_over_the_time_to_reset(self) -> None:
-        self.budgets(rest=(600, 120), graphql=(600, 3000))  # same count: 2 minutes to go is rich
+        self.budgets(rest=(1600, 120), graphql=(1600, 3000))  # same count, both above their floors: 2 minutes to go is rich
         self.assertGreater(self.daemon.richness("rest"), 10 * self.daemon.richness("graphql"))
         self.assertEqual(self.daemon.route("pr"), "rest")
         self.assertEqual(self.daemon.route("run"), "rest")
         self.assertEqual(self.daemon.route("comment"), "graphql")  # comment watches never move
-        self.budgets(rest=(600, 3000), graphql=(600, 120))
+        self.budgets(rest=(1600, 3000), graphql=(1600, 120))
         self.assertEqual(self.daemon.route("pr"), "graphql")
         self.assertEqual(self.daemon.route("run"), "graphql")
         # a bucket below its reserve is stopped whatever its time left; the other takes every read
@@ -1531,7 +1571,7 @@ class BalanceTest(Base):
         self.daemon.tick(NOW + gg.CYCLE)
         paths = [c[1].split("/o/r/", 1)[1] for c in self.gh.rest_calls()]
         self.assertEqual(paths, ["pulls/1", f"commits/{'a' * 40}/check-runs?filter=all&per_page=100",
-                                 f"commits/{'a' * 40}/status?per_page=100", f"actions/runs?head_sha={'a' * 40}&per_page=100",
+                                 f"commits/{'a' * 40}/status?per_page=100&page=1", f"actions/runs?head_sha={'a' * 40}&per_page=100&page=1",
                                  "actions/workflows?per_page=100", "rules/branches/main?per_page=100", "branches/main"])
         over_rest = gg.read_cache(key)["data"]
         self.assertEqual(over_rest["checkState"], "FAILURE")  # computed: a failed check outranks pending ones
@@ -1653,6 +1693,356 @@ class BalanceTest(Base):
         for path in gg.BASE.rglob("*"):
             if path.is_file():
                 self.assertNotIn(TOKEN, path.read_text(), path)
+
+
+class FallbackTest(Base):
+    """A read GraphQL cannot make (its primary quota is spent, or below its floor) is made over REST with the
+    same answer, and the reverse; a secondary 403 holds both, never retried in a loop."""
+
+    GQL_SPENT = (200, {"x-ratelimit-limit": "5000", "x-ratelimit-remaining": "0", "x-ratelimit-resource": "graphql"},
+                 json.dumps({"data": None, "errors": [{"type": "RATE_LIMITED",
+                                                        "message": "API rate limit exceeded"}]}).encode())
+    REST_SPENT = (403, {"x-ratelimit-limit": "5000", "x-ratelimit-remaining": "0", "x-ratelimit-resource": "core"},
+                  json.dumps({"message": "API rate limit exceeded"}).encode())
+    SECONDARY = (403, {"x-ratelimit-limit": "5000", "x-ratelimit-remaining": "3000"},
+                 json.dumps({"message": "You have exceeded a secondary rate limit. Please wait a few minutes."}).encode())
+
+    def setUp(self) -> None:
+        super().setUp()
+        reset = str(int(NOW + 1800))
+        for answer in (self.GQL_SPENT, self.REST_SPENT):
+            answer[1]["x-ratelimit-reset"] = reset
+        checks = [workflow_check("build", 11), workflow_check("test", 11, conclusion="FAILURE"),
+                  {"__typename": "StatusContext", "context": "ci/legacy", "state": "PENDING", "targetUrl": "t",
+                   "createdAt": iso(NOW - 30)}]
+        for c in checks[:2]:
+            c["checkSuite"]["app"] = {"slug": "github-actions"}
+        self.gh.prs[("o", "r", 1)] = {**pr_node(1, checks=checks), "headRefName": "feat",
+                                      "baseRef": {"branchProtectionRule": {"requiredStatusCheckContexts": ["ci-status"]},
+                                                  "rules": {"nodes": []}}}
+        self.gh.protected = ["ci-status"]
+        self.gh.heads[("o", "r", "a" * 40)] = checks
+        self.gh.runs[7] = {"id": 7, "name": "CI", "display_title": "fix", "status": "completed", "conclusion": "success",
+                           "html_url": "https://github.com/o/r/actions/runs/7", "head_sha": "b" * 40, "head_branch": "x",
+                           "event": "push", "run_attempt": 1, "created_at": iso(NOW - 99), "updated_at": iso(NOW - 9)}
+        self.gh.issues[("o", "r", 9)] = {"__typename": "PullRequest", "url": "https://github.com/o/r/pull/9", "state": "OPEN",
+                                         "comments": {"totalCount": 130, "nodes": [
+                                             {"databaseId": 1000 + i, "url": f"https://github.com/o/r/pull/9#c{i}",
+                                              "createdAt": iso(NOW - 500 + i),
+                                              "author": {"login": "review-bot" if i % 2 else "someone"}, "body": f"comment {i}"}
+                                             for i in range(130)]}}
+        self.keys = {"pr": "pr:o/r#1", "run": "run:o/r/7", "comment": "comment:o/r#9", "head": f"head:o/r@{'a' * 40}"}
+
+    def force_low(self, *buckets: str) -> None:
+        gg.write_json(gg.DAEMON_CONFIG, {"forceLow": list(buckets or ("graphql",))})
+        self.addCleanup(lambda: gg.DAEMON_CONFIG.unlink(missing_ok=True))
+
+    def register_all(self) -> None:
+        for kind, key in self.keys.items():
+            gg.register(key, consumer="autoland" if kind == "head" else None)
+
+    def same(self, kind: str, a: dict, b: dict) -> None:
+        if kind == "pr":
+            for field in ("state", "mergeable", "mergeStateStatus", "headRefOid", "headRefName", "requiredMissing",
+                          "superseded"):  # checkState: the fake rollup is fixed, REST computes it
+                self.assertEqual(a[field], b[field], field)
+            strip = lambda cs: sorted((c["name"], c["workflow"], c["status"], c["conclusion"], c["required"]) for c in cs)
+            self.assertEqual(strip(a["checks"]), strip(b["checks"]))
+            self.assertEqual(gg.verdict("pr", a), gg.verdict("pr", b))
+        else:
+            self.assertEqual(a, b, kind)
+
+    def baseline(self, bucket: str) -> dict[str, dict]:
+        """Every kind read once over `bucket` by a daemon of its own, for the answer to compare with."""
+        gh, daemon = self.gh, self.daemon
+        self.gh = FakeGitHub()
+        self.gh.__dict__.update({k: v for k, v in gh.__dict__.items() if k not in {"calls", "step_queries"}})
+        self.gh.calls, self.gh.step_queries = [], []
+        self.daemon = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=None)
+        self.daemon.paths = {kind: bucket for kind in gg.CYCLES}
+        if bucket == "rest":
+            self.force_low()
+        self.daemon.tick(NOW)
+        gg.DAEMON_CONFIG.unlink(missing_ok=True)
+        out = {kind: gg.read_cache(key) for kind, key in self.keys.items()}
+        for kind, entry in out.items():
+            self.assertEqual(entry.get("via"), bucket, kind)
+        for path in gg.cache_dir().glob("*"):
+            path.unlink()
+        self.gh, self.daemon = gh, daemon
+        return {kind: entry["data"] for kind, entry in out.items()}
+
+    def test_graphql_spent_every_read_is_made_over_rest_in_the_same_tick(self) -> None:
+        self.register_all()
+        over_graphql = self.baseline("graphql")
+        self.daemon.paths = {kind: "graphql" for kind in gg.CYCLES}
+        self.gh.throttle["graphql"] = self.GQL_SPENT
+        self.daemon.tick(NOW)
+        self.assertEqual(self.daemon.mode("graphql"), "stop")
+        self.assertEqual(len(self.gh.gql_calls()), 1)  # the query that found the quota spent, and no other
+        for kind, key in self.keys.items():
+            entry = gg.read_cache(key)
+            self.assertEqual(entry["via"], "rest", kind)
+            self.assertIsNone(entry["error"], kind)
+            self.same(kind, entry["data"], over_graphql[kind])
+        self.assertIn("read over REST", gg.summary(self.keys["pr"], gg.read_cache(self.keys["pr"])))
+
+    def test_rest_spent_every_read_is_made_over_graphql_in_the_same_tick(self) -> None:
+        self.register_all()
+        over_rest = self.baseline("rest")
+        self.daemon.paths = {kind: "rest" for kind in gg.CYCLES}
+        self.force_low()  # so every kind starts on REST
+        self.gh.throttle["rest"] = self.REST_SPENT
+        self.daemon.tick(NOW)
+        self.assertEqual(self.daemon.mode("rest"), "stop")
+        self.assertEqual(len(self.gh.rest_calls()), 1)  # the read that found the quota spent, and no other
+        for kind, key in self.keys.items():
+            entry = gg.read_cache(key)
+            self.assertEqual(entry["via"], "graphql", kind)
+            self.assertIsNone(entry["error"], kind)
+            self.same(kind, entry["data"], over_rest[kind])
+
+    def test_graphql_low_routes_every_kind_to_rest_and_back(self) -> None:
+        self.register_all()
+        self.daemon.now = NOW
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4000, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 450, "reset": NOW + 1800}}  # below its floor
+        self.assertEqual(self.daemon.mode("graphql"), "lean")
+        self.assertEqual({kind: self.daemon.route(kind) for kind in gg.CYCLES},
+                         {"pr": "rest", "run": "rest", "comment": "rest", "head": "rest"})
+        self.daemon.budget["graphql"]["remaining"] = 4000
+        self.daemon.budget["rest"]["remaining"] = 1400  # now REST is the low one
+        self.assertEqual({kind: self.daemon.route(kind) for kind in gg.CYCLES},
+                         {"pr": "graphql", "run": "graphql", "comment": "graphql", "head": "graphql"})
+        # both low: nothing to gain, so the cheaper GraphQL reads stay where they are
+        self.daemon.budget["graphql"]["remaining"] = 450
+        self.assertEqual(self.daemon.route("comment"), "graphql")
+
+    def test_force_low_is_read_from_the_config_and_reads_go_to_rest(self) -> None:
+        self.force_low()
+        self.register_all()
+        self.daemon.tick(NOW)
+        self.assertEqual(self.gh.gql_calls(), [])
+        self.assertEqual(self.daemon.status["modes"]["graphql"], "lean")
+        for kind, key in self.keys.items():
+            self.assertEqual(gg.read_cache(key)["via"], "rest", kind)
+        gg.write_json(gg.DAEMON_CONFIG, {"forceLow": "graphql"})  # not a list: ignored
+        self.assertEqual(gg.daemon_policy()["forceLow"], ())
+
+    def test_a_secondary_403_holds_both_buckets_and_is_never_retried_in_a_loop(self) -> None:
+        self.register_all()
+        self.daemon.paths = {kind: "graphql" for kind in gg.CYCLES}
+        self.gh.throttle["graphql"] = self.SECONDARY
+        self.daemon.tick(NOW)
+        self.assertEqual(len(self.gh.calls), 1)  # no fallback to REST: the secondary limit is one for both
+        self.assertEqual({b: self.daemon.mode(b) for b in ("rest", "graphql")}, {"rest": "stop", "graphql": "stop"})
+        for i in range(1, 30):  # a minute of ticks inside the hold: nothing is sent
+            self.daemon.tick(NOW + i * gg.TICK)
+        self.assertEqual(len(self.gh.calls), 1)
+        self.gh.throttle["rest"] = self.SECONDARY
+        self.daemon.tick(NOW + gg.SECONDARY_BACKOFF + 1)  # the hold is over: one request, refused again
+        self.assertEqual(len(self.gh.calls), 2)
+        self.assertEqual(self.daemon.secondary_until - self.daemon.now, 2 * gg.SECONDARY_BACKOFF)  # doubled
+        for i in range(1, 2 * gg.SECONDARY_BACKOFF // gg.TICK):
+            self.daemon.tick(NOW + gg.SECONDARY_BACKOFF + 1 + i * gg.TICK)
+        self.assertEqual(len(self.gh.calls), 2)
+        # Retry-After longer than the back-off wins; a clean answer starts the back-off short again
+        self.gh.throttle = {"graphql": (403, {"retry-after": "500"}, self.SECONDARY[2])}
+        self.daemon.paths = {kind: "graphql" for kind in gg.CYCLES}
+        at = NOW + 3 * gg.SECONDARY_BACKOFF + 2
+        self.daemon.tick(at)
+        self.assertEqual(self.daemon.secondary_until, at + 500)
+        self.gh.throttle = {}
+        self.register_all()  # the waits are still there (a comment watch lasts only while one is)
+        for key in self.keys.values():
+            os.utime(gg.watch_dir() / gg.file_name(key), (at + 501, at + 501))
+        self.daemon.tick(at + 501)
+        self.assertEqual(self.daemon.secondary_strikes, 0)
+        # (a head's consumer asked longer ago than HEAD_INTEREST on this clock: nobody wants it read)
+        self.assertTrue(all(gg.read_cache(self.keys[kind])["data"] for kind in ("pr", "run", "comment")))
+
+    def test_secondary_hold_refuses_a_read_at_the_request_hook(self) -> None:
+        self.daemon.now = NOW
+        self.daemon.secondary_hit("graphql", None)
+        with self.assertRaises(gg.WatchError):
+            self.daemon.request("GET", "/repos/o/r/pulls/1")
+        self.assertEqual(self.gh.calls, [])
+
+    def test_the_pacers_hold_stops_every_read_and_a_secondary_403_is_reported_to_it(self) -> None:
+        self.register_all()
+        gg.BASE.mkdir(parents=True, exist_ok=True)
+        gg.write_json(gg.BASE / gg.PACE_FILE, {"hold": {"until": NOW + 120, "since": NOW, "source": "a lane"}})
+        self.daemon.tick(NOW)
+        self.assertEqual(self.gh.calls, [])
+        self.assertEqual(self.daemon.status["secondaryHold"]["until"], NOW + 120)
+        self.daemon.tick(NOW + 121)
+        self.assertTrue(self.gh.calls)  # the hold is over: reads resume
+        cli = Path(self.tmp.name) / "pacer" / "gh_quota.py"
+        cli.parent.mkdir()
+        cli.write_text("")
+        (Path(self.tmp.name) / "pacer-gh").symlink_to(cli.parent / "gh")
+        ran = []
+        self.gh.throttle["graphql"] = self.SECONDARY
+        self.daemon.paths = {kind: "graphql" for kind in gg.CYCLES}
+        with mock.patch.object(gg, "PACE_CLI", Path(self.tmp.name) / "pacer-gh"), \
+                mock.patch.object(gg, "run_bounded", lambda argv, timeout=None: ran.append(argv)):
+            self.register_all()
+            self.daemon.tick(NOW + 121 + gg.CYCLE)
+        self.assertEqual(len(ran), 1)
+        self.assertEqual(ran[0][2:], [os.fspath(cli.resolve()), "secondary", "--retry-after", str(gg.SECONDARY_BACKOFF),
+                                      "--source", "glaeda-gh"])
+
+    def test_a_hold_stops_free_reads_and_writes_too(self) -> None:
+        """The secondary limit counts every request: /rate_limit (free only against the primary limits) and the
+        outbox wait the hold out as well."""
+        self.daemon.now = NOW
+        self.daemon.secondary_hit("rest", None)
+        with self.assertRaises(gg.WatchError):
+            self.daemon.request("GET", "/rate_limit", free=True)
+        gg.BUDGET_REFRESH = 120
+        self.daemon.budget = {}
+        self.daemon.refresh_budget()
+        self.daemon.writing = True
+        with self.assertRaises(gg.WatchError):
+            self.daemon.request("POST", "/repos/o/r/issues/1/comments", {"body": "x"}, content=True)
+        self.daemon.writing = False
+        self.daemon.post_tick()
+        self.assertEqual(self.gh.calls, [])
+
+    def test_a_refusal_late_in_a_tick_holds_from_when_it_arrived(self) -> None:
+        self.daemon.clock_real = True
+        self.daemon.now = time.time() - 70  # the tick began 70 s ago
+        self.daemon.secondary_hit("graphql", None)
+        self.assertGreaterEqual(self.daemon.secondary_until, time.time() + gg.SECONDARY_BACKOFF - 1)
+        self.assertFalse(self.daemon.secondary_admit("rest", 1))
+
+    def test_more_statuses_than_rest_reads_is_never_a_verdict(self) -> None:
+        many = [{"__typename": "StatusContext", "context": f"ci/{i}", "state": "SUCCESS", "targetUrl": "t",
+                 "createdAt": iso(NOW)} for i in range(250)]
+        many[240]["state"] = "FAILURE"  # on the third page, past what REST reads
+        self.gh.heads[("o", "r", "c" * 40)] = many
+        self.gh.prs[("o", "r", 3)] = {**pr_node(3, checks=many), "headRefOid": "c" * 40}
+        self.force_low()
+        gg.register(f"head:o/r@{'c' * 40}", consumer="autoland")
+        gg.register("pr:o/r#3")
+        self.daemon.tick(NOW)
+        head = gg.read_cache(f"head:o/r@{'c' * 40}")
+        self.assertIsNone(head["data"])
+        self.assertIn("statuses", head["error"])
+        pr = gg.read_cache("pr:o/r#3")
+        self.assertEqual(pr["via"], "rest")
+        self.assertTrue(pr["data"]["checksTruncated"])
+        self.assertIsNone(gg.verdict("pr", pr["data"]))  # pending, never green
+        self.assertEqual(len([c for c in self.gh.rest_calls() if "/status?" in c[1] and c[1].endswith("page=2")]), 2)
+
+    def test_more_workflow_runs_than_rest_reads_is_never_a_verdict(self) -> None:
+        many = [workflow_check("build", 1000 + i, workflow="CI" if i else "Lint", conclusion="SUCCESS") for i in range(250)]
+        many[0]["checkSuite"]["conclusion"] = many[0]["conclusion"] = "FAILURE"
+        for c in many:
+            c["checkSuite"]["app"] = {"slug": "github-actions"}
+        self.gh.heads[("o", "r", "d" * 40)] = many
+        self.force_low()
+        gg.register(f"head:o/r@{'d' * 40}", consumer="autoland")
+        self.daemon.tick(NOW)
+        head = gg.read_cache(f"head:o/r@{'d' * 40}")
+        self.assertIsNone(head["data"])
+        self.assertIn("workflow runs over REST", head["error"])
+        # the 200 statuses case says the same: the third page of runs was never read
+        self.assertEqual(len([c for c in self.gh.rest_calls() if "actions/runs?" in c[1]]), gg.REST_RUN_PAGES)
+
+    def test_a_write_refused_by_the_secondary_limit_holds_the_reads_too(self) -> None:
+        self.daemon.now = NOW
+        self.gh.throttle["rest"] = self.SECONDARY
+        self.daemon.writing = True
+        self.daemon.request("POST", "/repos/o/r/issues/1/comments", {"body": "x"}, content=True)
+        self.daemon.writing = False
+        self.assertFalse(self.daemon.secondary_admit("graphql", 1))
+        self.register_all()
+        self.daemon.tick(NOW + gg.TICK)
+        self.assertEqual(len(self.gh.calls), 1)
+
+    def test_a_head_whose_second_page_meets_the_limit_is_read_over_rest_and_charged_once(self) -> None:
+        many = [check_run(f"CI / job-{i}") for i in range(150)]
+        self.gh.heads[("o", "r", "e" * 40)] = many
+        key = f"head:o/r@{'e' * 40}"
+        gg.register(key, consumer="session-1")
+        real = self.gh.__call__
+        def second_page_spent(method, url, headers, body):
+            if url.endswith("/graphql") and b'after:' in (body or b""):
+                return self.GQL_SPENT
+            return real(method, url, headers, body)
+        self.daemon.transport = second_page_spent
+        self.daemon.tick(NOW)
+        entry = gg.read_cache(key)
+        self.assertEqual(entry["via"], "rest")
+        self.assertEqual(len(entry["data"]["found"]), 150)
+        self.assertEqual(len(self.daemon.head_spend["session-1"]), 1)  # refunded by the failure, charged by REST
+
+    def test_a_rate_limited_answer_with_partial_data_still_spills_to_rest(self) -> None:
+        partial = (200, {"x-ratelimit-remaining": "0", "x-ratelimit-resource": "graphql",
+                         "x-ratelimit-reset": str(int(NOW + 1800))},
+                   json.dumps({"data": {"rateLimit": {"limit": 5000, "remaining": 0, "resetAt": iso(NOW + 1800), "cost": 1},
+                                        "p0": None, "h0": None, "c0": None, "w0": None},
+                               "errors": [{"type": "RATE_LIMITED", "message": "API rate limit exceeded"}]}).encode())
+        self.register_all()
+        self.daemon.paths = {kind: "graphql" for kind in gg.CYCLES}
+        self.gh.throttle["graphql"] = partial
+        self.daemon.tick(NOW)
+        for kind, key in self.keys.items():
+            entry = gg.read_cache(key)
+            self.assertEqual((entry["via"], entry["error"]), ("rest", None), kind)
+            self.assertFalse(entry.get("missing"), kind)
+
+    def test_a_low_bucket_always_hands_its_reads_over_and_never_takes_them_back_by_margin(self) -> None:
+        self.daemon.now = NOW
+        # GraphQL below its floor but about to reset, so "richer" per second than a normal REST
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 2000, "reset": NOW + 3000},
+                              "graphql": {"limit": 5000, "remaining": 450, "reset": NOW + 60}}
+        self.assertGreater(self.daemon.richness("graphql"), self.daemon.richness("rest"))
+        self.daemon.paths["pr"] = "graphql"
+        self.assertEqual(self.daemon.route("pr"), "rest")
+        self.assertEqual(self.daemon.route("pr"), "rest")  # and stays: no flapping back by the margin
+
+    def test_a_long_pacer_hold_is_honoured(self) -> None:
+        gg.BASE.mkdir(parents=True, exist_ok=True)
+        self.daemon.clock_real = True
+        gg.write_json(gg.BASE / gg.PACE_FILE, {"hold": {"until": time.time() + 1800}})
+        self.daemon.adopt_pace_hold()
+        self.assertGreater(self.daemon.secondary_until, time.time() + 1700)
+        gg.write_json(gg.BASE / gg.PACE_FILE, {"hold": {"until": time.time() + 10 ** 9}})
+        self.daemon.adopt_pace_hold()
+        self.assertLessEqual(self.daemon.secondary_until, time.time() + gg.PACE_HOLD_MAX)
+
+    def test_a_malformed_force_low_never_stops_the_daemon(self) -> None:
+        for value in (True, 1, None, {"graphql": 1}, "graphql"):
+            gg.write_json(gg.DAEMON_CONFIG, {"forceLow": value})
+            self.assertEqual(gg.daemon_policy()["forceLow"], (), value)
+        gg.DAEMON_CONFIG.unlink()
+
+    def test_a_plan_without_rulesets_keeps_graphqls_required_checks(self) -> None:
+        gg.register(self.keys["pr"])
+        self.daemon.tick(NOW)  # GraphQL names ci-status as required
+        self.assertEqual(gg.read_cache(self.keys["pr"])["data"]["requiredMissing"], ["ci-status"])
+        self.gh.no_protection_feature = True
+        self.gh.throttle["graphql"] = self.GQL_SPENT
+        self.daemon.tick(NOW + gg.CYCLE)
+        entry = gg.read_cache(self.keys["pr"])
+        self.assertIsNone(entry["error"])
+        self.assertEqual(entry["via"], "rest")
+        self.assertEqual(entry["data"]["requiredMissing"], ["ci-status"])
+        asked = len([c for c in self.gh.rest_calls() if "/rules/" in c[1]])
+        self.daemon.tick(NOW + 2 * gg.CYCLE)
+        self.assertEqual(len([c for c in self.gh.rest_calls() if "/rules/" in c[1]]), asked)  # not asked again
+
+    def test_rest_comments_read_the_last_fifty_across_pages(self) -> None:
+        self.assertEqual(gg.slim_comments([{"id": 1, "user": {"login": "cmux-bot[bot]"}, "body": "x"}])[0]["author"],
+                         {"login": "cmux-bot"})
+        self.force_low()
+        gg.register(self.keys["comment"])
+        self.daemon.tick(NOW)
+        data = gg.read_cache(self.keys["comment"])["data"]
+        self.assertEqual([c["id"] for c in data["comments"]], list(range(1080, 1130)))  # pages 1 and 2
+        self.assertEqual(data["total"], 130)
 
 
 class ClientTest(Base):
@@ -4223,11 +4613,22 @@ class HeadChecksTest(Base):
 
     def test_a_lean_quota_serves_only_reserved_consumers(self) -> None:
         self.daemon.note_budget("graphql", 5000, gg.FLOORS["graphql"][0] - 50, NOW + 1800)
+        self.daemon.note_budget("rest", 5000, gg.FLOORS["rest"][0] - 50, NOW + 1800)  # both low: nowhere to go
         gg.register(self.key(SHA_A), consumer="session-1")
         gg.register(self.key(SHA_B), consumer="autoland")
         self.daemon.tick(NOW)
         self.assertIsNone(gg.read_cache(self.key(SHA_A)))
         self.assertIsNotNone(gg.read_cache(self.key(SHA_B)))
+
+    def test_graphql_low_and_rest_not_reads_heads_over_rest(self) -> None:
+        self.daemon.note_budget("graphql", 5000, gg.FLOORS["graphql"][0] - 50, NOW + 1800)
+        gg.register(self.key(SHA_A), consumer="session-1")
+        self.daemon.tick(NOW)
+        entry = gg.read_cache(self.key(SHA_A))
+        self.assertEqual(entry["via"], "rest")
+        self.assertEqual(self.gh.gql_calls(), [])
+        self.assertEqual(entry["data"]["found"], {"check / CI / build": ["completed", "success"],
+                                                  "check / CI / test": ["completed", "failure"]})
 
     def test_spend_survives_a_daemon_restart(self) -> None:
         self.policy(reserved={}, limit=1, pool=5)
@@ -5811,6 +6212,20 @@ class BrokerSpentBucketTest(BrokerBase):
         now = time.time()
         self.assertFalse(gg.broker_bucket_spent("pr:o/r#7", now), "gh pr view is GraphQL")
         self.assertTrue(gg.broker_bucket_spent("run:o/r/9", now), "gh run view is REST")
+
+    def test_a_throttled_or_forced_low_bucket_is_spent_for_gh(self) -> None:
+        self.budget(graphql=4000, rest=4000)
+        now = time.time()
+        gg.write_json(gg.BASE / "daemon.json", {"at": now, "modes": {"graphql": "stop", "rest": "normal"}})
+        self.assertTrue(gg.broker_bucket_spent("pr:o/r#7", now), "GitHub refused GraphQL: the daemon reads it over REST")
+        self.assertFalse(gg.broker_bucket_spent("run:o/r/9", now))
+        gg.write_json(gg.BASE / "daemon.json", {"at": now, "modes": {"graphql": "stop", "rest": "stop"}})
+        self.assertFalse(gg.broker_bucket_spent("pr:o/r#7", now), "a secondary hold stops both: nothing to gain")
+        gg.write_json(gg.BASE / "daemon.json", {"at": now - 10 * gg.CYCLE, "modes": {"graphql": "stop", "rest": "normal"}})
+        self.assertFalse(gg.broker_bucket_spent("pr:o/r#7", now), "an old heartbeat says nothing about now")
+        gg.write_json(gg.DAEMON_CONFIG, {"forceLow": ["graphql"]})
+        self.addCleanup(lambda: gg.DAEMON_CONFIG.unlink(missing_ok=True))
+        self.assertTrue(gg.broker_bucket_spent("pr:o/r#7", now))
 
     def test_without_the_daemon_nothing_waits(self) -> None:
         self.budget(graphql=0, rest=4000)
@@ -7890,7 +8305,8 @@ class PostTest(unittest.TestCase):
                           "--reviewer", "lawrencecchen")
         too_quick = (422, {}, {"message": "Validation Failed",
                                "errors": [{"message": "was submitted too quickly"}]})
-        d, t = self.daemon(too_quick, (403, {"retry-after": "120"}, {"message": "You have exceeded a secondary rate limit"}),
+        d, t = self.daemon(too_quick, (403, {"retry-after": "120"}, {"message": (
+            "You have exceeded a secondary rate limit and have been temporarily blocked from content creation.")}),
                            (201, {}, {"html_url": "https://github.com/o/r/pull/9", "number": 9}), (201, {}, {}))
         self.step(d, NOW)
         self.assertEqual(d.post_hold, NOW + gg.POST_BACKOFF)
@@ -8208,7 +8624,9 @@ class RiskReceiptPostTest(unittest.TestCase):
                 self.assertEqual((state["state"], state["riskRegrade"]["state"]), ("posted", "failed"))
                 self.assertEqual(len(t.calls), 2)
                 if isinstance(answer, tuple) and answer[0] == 429:
-                    self.assertEqual(d.backoff["rest"], NOW + 120)
+                    # held from when the refusal arrived (the real clock, a moment after the tick's NOW)
+                    self.assertGreaterEqual(d.backoff["rest"], NOW + 120)
+                    self.assertLess(d.backoff["rest"], NOW + 130)
 
     def test_risk_receipt_label_throttle_holds_other_writes_without_replaying_delivery(self) -> None:
         item = self.queue("comment", "manaflow-ai/cmux#7", "--body", self.receipt()["body"])
@@ -8391,17 +8809,43 @@ class DaemonPolicyTest(Base):
 
     def test_capped_with_graphql_stopped_reads_nothing_over_rest(self) -> None:
         self.daemon.now = NOW
-        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4000, "reset": NOW + 1800},
+        self.gh.rest_remaining = gg.FLOORS["rest"][0]  # and GitHub agrees: REST is at its floor
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": gg.FLOORS["rest"][0], "reset": NOW + 1800},
                               "graphql": {"limit": 5000, "remaining": 10, "reset": NOW + 1800}}
         self.daemon.paths["run"] = "rest"
         self.spend_rest(2000)
         self.assertEqual(self.daemon.route("run"), "rest")  # nowhere richer to go
         self.assertEqual(self.daemon.mode("rest"), "lean")
-        # the share holds even so: the run waits for it rather than spend what the sessions have left
+        # REST at its floor: the share holds even so, and the run waits rather than spend what the sessions have left
         self.gh.runs[7] = {"id": 7, "status": "in_progress", "html_url": "u"}
         gg.register("run:o/r/7")
         self.daemon.tick(NOW)
         self.assertEqual(self.gh.rest_calls(), [])
+
+    def test_the_share_yields_while_graphql_is_out_and_rest_is_above_its_floor(self) -> None:
+        """A host whose REST share is spent (or 0) still reads over REST while GraphQL cannot, down to REST's floor."""
+        self.configure({"restShare": 0.0})
+        self.daemon.policy = gg.daemon_policy()
+        self.daemon.now = NOW
+        floor = gg.FLOORS["rest"][0]
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": floor + 20, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 10, "reset": NOW + 1800}}
+        self.assertTrue(self.daemon.rest_room(2))
+        self.assertFalse(self.daemon.rest_room(21))  # it would take REST below its floor
+        # nor is REST "capped" for routing then: every kind, the GraphQL ones too, goes to REST
+        self.daemon.budget["rest"]["remaining"] = 4000
+        self.assertFalse(self.daemon.rest_capped())
+        self.assertEqual({k: self.daemon.route(k) for k in gg.CYCLES},
+                         {"pr": "rest", "run": "rest", "comment": "rest", "head": "rest"})
+        self.daemon.budget["rest"]["remaining"] = floor + 20
+        self.daemon.budget["graphql"]["remaining"] = 4000  # GraphQL can read: the share holds again
+        self.assertFalse(self.daemon.rest_room(1))
+        self.daemon.budget["graphql"]["remaining"] = 10
+        self.gh.runs[7] = {"id": 7, "status": "in_progress", "html_url": "u"}
+        gg.register("run:o/r/7")
+        self.daemon.tick(NOW)
+        self.assertEqual(len(self.gh.run_calls()), 1)
+        self.assertEqual(gg.read_cache("run:o/r/7")["via"], "rest")
 
     def test_only_counted_rest_requests_spend_the_share(self) -> None:
         self.daemon.now = NOW
@@ -8451,9 +8895,12 @@ class DaemonPolicyTest(Base):
         self.spend_rest(1985, at=NOW)  # one request a read; a read starts only while 2 more fit
         self.daemon.tick(NOW)
         self.assertEqual(len(self.gh.run_calls()), 14)
-        self.assertEqual(len(self.daemon.deferred), 6)
         self.assertEqual(self.daemon.rest_spent(), 1999)
-        # and the next tick routes them to GraphQL rather than defer them again
+        # the six REST had no room for are read over GraphQL in the same tick, in one query
+        self.assertEqual(len(self.gh.gql_calls()), 1)
+        self.assertEqual(self.daemon.deferred, set())
+        self.assertEqual(sum(1 for n in range(1, 21) if gg.read_cache(f"run:o/r/{n}")["via"] == "graphql"), 6)
+        # and the next tick routes them to GraphQL
         for n in range(1, 21):
             gg.register(f"run:o/r/{n}")
         self.daemon.tick(NOW + 2)
@@ -8487,7 +8934,8 @@ class DaemonPolicyTest(Base):
         self.daemon.store(other, None, data=gg.slim_run(self.gh.runs[8]), dataAt=NOW - 5)
         gg.register(key)
         gg.register(other)
-        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+        self.gh.rest_remaining = gg.FLOORS["rest"][0]  # and GitHub agrees: REST is at its floor
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": gg.FLOORS["rest"][0], "reset": NOW + 1800},
                               "graphql": {"limit": 5000, "remaining": 10, "reset": NOW + 1800}}
         self.daemon.paths["run"] = "rest"
         self.spend_rest(2000, at=NOW)
@@ -8509,7 +8957,8 @@ class DaemonPolicyTest(Base):
         key = gg.parse_key("run", "o/r/7")
         self.daemon.store(key, None, data=gg.slim_run(failed), dataAt=NOW - 5)
         gg.register(key)
-        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+        self.gh.rest_remaining = gg.FLOORS["rest"][0]  # and GitHub agrees: REST is at its floor
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": gg.FLOORS["rest"][0], "reset": NOW + 1800},
                               "graphql": {"limit": 5000, "remaining": 10, "reset": NOW + 1800}}
         self.daemon.paths["run"] = "graphql"  # routed there while REST was capped; then GraphQL stopped
         self.spend_rest(2000, at=NOW)
@@ -8541,7 +8990,8 @@ class DaemonPolicyTest(Base):
         self.gh.jobs[7] = []  # an empty answer leaves the attempt without jobs
         key = gg.parse_key("run", "o/r/7")
         self.daemon.store(key, None, data=gg.slim_run(failed), dataAt=NOW - 5)
-        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+        self.gh.rest_remaining = gg.FLOORS["rest"][0]  # and GitHub agrees: REST is at its floor
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": gg.FLOORS["rest"][0], "reset": NOW + 1800},
                               "graphql": {"limit": 5000, "remaining": 10, "reset": NOW + 1800}}
         self.daemon.paths["run"] = "rest"
         self.spend_rest(2000, at=NOW)

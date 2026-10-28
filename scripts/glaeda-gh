@@ -56,9 +56,16 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   stay on REST: only REST names the runner, which tells a refusal from a failure). PRs over REST
   read the pull, its head's check runs, statuses and workflow runs, the workflow names, and the
   base branch's required checks, every one with If-None-Match; REST has no review decision, so the last one
-  GraphQL read is kept. Comment watches stay on GraphQL.
-- Comment watches (an issue's or PR's latest 50 comments) are one batched GraphQL query every 15 s,
-  and last only while someone waits on them.
+  GraphQL read is kept, as are the required checks on a private repository whose plan answers 403 for
+  rulesets and branch protection. A bucket below its floor moves its kinds to the other bucket when
+  that one is not, whatever the margin. Comment watches and heads (`checks`) stay on GraphQL, and move
+  to REST only while GraphQL is below its floor or throttled and REST is not. Within a tick, reads a
+  GraphQL query could not make because the quota ran out go over REST, and reads REST could not make
+  (its quota, or the share) go over GraphQL. A secondary-limit 403 holds both buckets instead: the
+  limit is one for both, so moving the reads would be the burst it refuses. The hold is Retry-After or
+  60 s doubling to 15 min, whichever is longer, and no read is sent during it.
+- Comment watches (an issue's or PR's latest 50 comments) are one batched GraphQL query every 15 s
+  (over REST: the issue and the page or two holding them), and last only while someone waits on them.
 - The X-RateLimit headers and the GraphQL rateLimit field drive a budget guard: below the floor
   (REST 1500 left, GraphQL 500) the daemon polls four times less often and skips job lists; below
   the reserve (REST 300, GraphQL 100) it stops that API until the quota resets. The quota is shared,
@@ -203,7 +210,7 @@ FLOORS = {"rest": (1500, 300), "graphql": (500, 100)}  # (floor, reserve) per qu
 # Measured 2026-10-27: the daemon spent 2549 REST requests of one hour's 5000 (756 more were free
 # 304s) on PR reads the balancer had sent to REST, and the account ran out under a nightly re-run.
 REST_SHARE = 0.4
-DAEMON_CONFIG = Path.home() / ".config/glaeda/gh-daemon.json"  # cycle, commentCycle, floors, restShare
+DAEMON_CONFIG = Path.home() / ".config/glaeda/gh-daemon.json"  # cycle, commentCycle, floors, restShare, forceLow
 # The fleet's copy of config/gh-daemon.json (glaeda-mini-setup installs it): default, and hosts[NAME]
 # laid over it, under DAEMON_CONFIG. NAME is update.json's host, the name the fleet enrolled this host by.
 FLEET_POLICY = Path.home() / ".local/share/glaeda/gh-daemon.json"
@@ -346,16 +353,41 @@ KEY_RES = {"pr": PR_RE, "run": RUN_RE, "comment": ISSUE_RE, "head": HEAD_RE}
 CYCLES = {"pr": CYCLE, "run": CYCLE, "comment": COMMENT_CYCLE, "head": CYCLE}
 BUCKETS = {"pr": "graphql", "run": "rest", "comment": "graphql", "head": "graphql"}  # each kind's usual bucket
 OTHER = {"rest": "graphql", "graphql": "rest"}
-BALANCED = ("pr", "run")  # kinds either bucket can read; comment watches stay on GraphQL
+BALANCED = ("pr", "run")  # kinds either bucket can read, routed to the richer one every tick
+# Kinds GraphQL reads more cheaply (a comment watch every 15 s, a head in one aliased query) that REST
+# reads only while GraphQL is low (below its floor) or throttled and REST is not.
+FALLBACK = ("comment", "head")
+# GitHub's secondary limit is one per account across REST and GraphQL, so a secondary 403 holds both
+# buckets (moving the reads to the other one is the burst it asks us not to send), for its Retry-After
+# or SECONDARY_BACKOFF doubling with each hit in a row up to SECONDARY_BACKOFF_MAX, whichever is longer.
+SECONDARY_BACKOFF = 60
+SECONDARY_BACKOFF_MAX = 900
+SECONDARY = re.compile(r"secondary rate limit|abuse detection", re.I)
+CONTENT_ONLY = re.compile(r"content creation", re.I)  # "...temporarily blocked from content creation"
+# The host-wide pacer for the secondary limit (gh-quota's pace.json, in this directory), when one is installed:
+# its hold stops this daemon's reads too, and a secondary 403 the daemon meets is reported to it. Read only;
+# the pacer alone writes it.
+PACE_FILE = "pace.json"
+PACE_CLI = Path.home() / ".local/lib/gh-quota/bin/gh"  # a link into the pacer's checkout, next to gh_quota.py
+PACE_DEADLINE = 5
+PACE_HOLD_MAX = 3600
+# A private repository on a plan without branch protection or rulesets answers 403 with this: there are
+# no requirements to read, as for a deleted base branch.
+NO_FEATURE = re.compile(r"Upgrade to GitHub Pro|make this repository public to enable this feature", re.I)
 RICH_WINDOW_MIN = 60  # seconds: a bucket about to reset is rich, but not infinitely so
 FULL_WINDOW = 3600  # a bucket not seen yet, or past its reset, counts as a full hour's quota
 SWITCH_MARGIN = 1.25  # a kind moves to the other bucket only when that one is this much richer
 REST_CHECK_PAGES = 5  # check-run pages (100 each) one PR read over REST takes at most
+REST_STATUS_PAGES = 2  # commit-status pages (100 each) likewise
+REST_RUN_PAGES = 2  # a commit's workflow-run pages (100 each) likewise: without its run a check has no workflow
 REST_STEPS_MAX = 10  # failed or cancelled jobs whose steps one PR read over REST looks up at most
 # The most counted REST requests one read can make before its step lookups, which are admitted one
 # at a time: a PR is its pull, REST_CHECK_PAGES of check runs, statuses, runs, workflows, rules and
 # the branch; a run is the run and its job list. The share admits a read only when this much fits.
-REST_READ_MAX = {"pr": REST_CHECK_PAGES + 6, "run": 2}
+# A comment watch is the issue and at most two pages of its comments; a head is REST_CHECK_PAGES of check
+# runs, its statuses, its workflow runs and the workflow names.
+REST_READ_MAX = {"pr": REST_CHECK_PAGES + REST_STATUS_PAGES + REST_RUN_PAGES + 4, "run": 2, "comment": 3,
+                 "head": REST_CHECK_PAGES + REST_STATUS_PAGES + REST_RUN_PAGES + 1}
 
 # NUM is the alias's PR-number variable: isRequired needs it
 PR_FIELDS = """number url title state isDraft merged mergedAt mergeable mergeStateStatus headRefOid
@@ -912,13 +944,24 @@ def slim_pull(doc: dict) -> dict:
 def slim_check_runs(doc: dict) -> dict:
     keep = ("id", "node_id", "name", "status", "conclusion", "details_url", "started_at", "completed_at")
     return {"total_count": doc.get("total_count"),
-            "check_runs": [{**{k: c.get(k) for k in keep}, "suite": (c.get("check_suite") or {}).get("id")}
+            "check_runs": [{**{k: c.get(k) for k in keep}, "suite": (c.get("check_suite") or {}).get("id"),
+                            "app": (c.get("app") or {}).get("slug")}
                            for c in doc.get("check_runs") or [] if isinstance(c, dict)]}
 
 
 def slim_statuses(doc: dict) -> list[dict]:
     return [{k: c.get(k) for k in ("context", "state", "target_url", "created_at")}
             for c in doc.get("statuses") or [] if isinstance(c, dict)]
+
+
+def slim_status_page(doc: dict) -> dict:
+    """One page of a commit's combined status, with the total it says there is."""
+    return {"total": doc.get("total_count"), "statuses": slim_statuses(doc)}
+
+
+def slim_head_runs_page(doc: dict) -> dict:
+    """One page of a commit's workflow runs, with the total it says there is."""
+    return {"total": doc.get("total_count"), "runs": slim_head_runs(doc)}
 
 
 def slim_head_runs(doc: dict) -> list[dict]:
@@ -950,9 +993,31 @@ def slim_branch(doc: dict) -> list[str]:
     return sorted(names)
 
 
-def rest_pr_node(pull: dict, checks: dict, statuses: list[dict], runs: list[dict], required: set[str],
-                 review: str | None = None, workflows: dict[str, str] | None = None) -> dict:
-    """The REST answers in the GraphQL pullRequest shape, so parse_pr reads both alike."""
+def slim_issue(doc: dict) -> dict:
+    pull = doc.get("pull_request")
+    return {"html_url": doc.get("html_url"), "state": doc.get("state"), "comments": doc.get("comments") or 0,
+            "pull": isinstance(pull, dict), "merged": bool((pull or {}).get("merged_at"))}
+
+
+def slim_comments(doc: Any) -> list[dict]:
+    """An issue's REST comments in the GraphQL comment shape parse_comments reads (REST names an App's
+    account `NAME[bot]`, GraphQL `NAME`)."""
+    return [{"databaseId": c.get("id"), "url": c.get("html_url"), "createdAt": c.get("created_at"),
+             "author": {"login": re.sub(r"\[bot\]$", "", str((c.get("user") or {}).get("login") or ""))},
+             "body": str(c.get("body") or "")[:COMMENT_BODY_MAX]}
+            for c in doc if isinstance(c, dict)] if isinstance(doc, list) else []
+
+
+def rest_issue_node(issue: dict, comments: list[dict]) -> dict:
+    """The REST answers in the GraphQL issueOrPullRequest shape."""
+    state = "MERGED" if issue.get("merged") else str(issue.get("state") or "").upper() or None
+    return {"__typename": "PullRequest" if issue.get("pull") else "Issue", "url": issue.get("html_url"),
+            "state": state, "comments": {"totalCount": issue.get("comments"), "nodes": comments[-COMMENTS_LAST:]}}
+
+
+def rest_contexts(checks: dict, statuses: list[dict], runs: list[dict], required: set[str],
+                  workflows: dict[str, str] | None = None) -> list[dict]:
+    """A commit's REST check runs and statuses as GraphQL statusCheckRollup context nodes."""
     suites = {r.get("check_suite_id"): r for r in runs}
     workflows = workflows or {}
     nodes: list[dict] = []
@@ -962,15 +1027,23 @@ def rest_pr_node(pull: dict, checks: dict, statuses: list[dict], runs: list[dict
                       "status": upper(c.get("status")), "conclusion": upper(c.get("conclusion")),
                       "detailsUrl": c.get("details_url"), "databaseId": c.get("id"), "startedAt": c.get("started_at"),
                       "completedAt": c.get("completed_at"), "isRequired": c.get("name") in required,
-                      "checkSuite": {"conclusion": upper(run.get("conclusion")), "workflowRun": {
+                      "checkSuite": {"conclusion": upper(run.get("conclusion")), "app": {"slug": c.get("app")},
+                                     "workflowRun": {
                           "databaseId": run.get("id"), "workflow": {
                               "name": workflows.get(str(run.get("workflow_id"))) or run.get("name"),
                                                                     "databaseId": run.get("workflow_id")}}}
-                      if run else {"conclusion": None, "workflowRun": None}})
+                      if run else {"conclusion": None, "app": {"slug": c.get("app")}, "workflowRun": None}})
     for c in statuses:
         nodes.append({"__typename": "StatusContext", "context": c.get("context"), "state": upper(c.get("state")),
                       "targetUrl": c.get("target_url"), "createdAt": c.get("created_at"),
                       "isRequired": c.get("context") in required})
+    return nodes
+
+
+def rest_pr_node(pull: dict, checks: dict, statuses: list[dict], runs: list[dict], required: set[str],
+                 review: str | None = None, workflows: dict[str, str] | None = None) -> dict:
+    """The REST answers in the GraphQL pullRequest shape, so parse_pr reads both alike."""
+    nodes = rest_contexts(checks, statuses, runs, required, workflows)
     rollup = None
     if nodes:
         results = [n.get("conclusion") if n["__typename"] == "CheckRun" else n.get("state") for n in nodes]
@@ -1231,7 +1304,12 @@ def daemon_policy() -> dict:
     """The daemon's pacing: ~/.config/glaeda/gh-daemon.json over the fleet policy over the module defaults.
 
     {"cycle": 60, "commentCycle": 15, "restShare": 0.4,
-     "floors": {"rest": {"floor": 1500, "reserve": 300}, "graphql": {"floor": 500, "reserve": 100}}}
+     "floors": {"rest": {"floor": 1500, "reserve": 300}, "graphql": {"floor": 500, "reserve": 100}},
+     "forceLow": ["graphql"]}
+
+    A bucket's floor is where it counts as low: below it the daemon polls it LEAN_FACTOR times less
+    often and serves what it can from the other bucket. forceLow treats the buckets it names as below
+    their floors whatever GitHub says, to show the fallback live without draining a real quota.
 
     Every key is optional, and a value that is not a number in range keeps its default, so a typo
     can neither stop the daemon nor turn it into a busy loop. A reserve above its floor keeps both
@@ -1250,7 +1328,9 @@ def daemon_policy() -> dict:
         floors[bucket] = (f, r) if r <= f else (floor, reserve)
     return {"cycle": cycle, "commentCycle": comment,
             "cycles": {"pr": cycle, "run": cycle, "comment": comment, "head": cycle},
-            "floors": floors, "restShare": float(_bounded(doc.get("restShare"), REST_SHARE, 0.0, 1.0))}
+            "floors": floors, "restShare": float(_bounded(doc.get("restShare"), REST_SHARE, 0.0, 1.0)),
+            "forceLow": tuple(b for b in ("rest", "graphql")
+                              if isinstance(doc.get("forceLow"), list) and b in doc["forceLow"])}
 
 
 def consumer_policy() -> dict:
@@ -1294,6 +1374,8 @@ class Daemon:
         self.budget: dict[str, dict] = doc if isinstance(doc, dict) else {}
         self.saved_budget = json.loads(json.dumps(self.budget))
         self.backoff: dict[str, float] = {"rest": 0.0, "graphql": 0.0}
+        self.secondary_until = 0.0  # a secondary 403 holds both buckets until then
+        self.secondary_strikes = 0  # secondary 403s since the last clean answer: each doubles the hold
         self.budget_retry = 0.0  # /rate_limit is left alone until this time after a refusal
         self.last_cycle: dict[str, float] = {kind: 0.0 for kind in CYCLES}
         self.now = time.time()
@@ -1327,6 +1409,9 @@ class Daemon:
             str(k): [float(t) for t in v if isinstance(t, (int, float))]
             for k, v in (spends or {}).items() if isinstance(v, list)}
         self.payer: dict[str, tuple[str, float]] = {}  # head key -> (consumer, time) charged for a read in flight
+        self.spill: list[dict] = []  # entries a fetch could not finish because GraphQL stopped partway
+        self.gql_limited = False  # a GraphQL answer since the last fetch began said the primary limit is reached
+        self.refunded: dict[str, str] = {}  # head key -> the consumer a failed read refunded, this tick
         self.denied: dict[str, float] = {}  # consumer -> when a head read it needed was refused for budget
         self.saved_consumers: str = ""
         self.policy = daemon_policy()  # re-read at the start of every tick
@@ -1350,10 +1435,11 @@ class Daemon:
         capped = bucket == "rest" and self.rest_capped()
         seen = self.budget.get(bucket) or {}
         if not seen or (seen.get("reset") or 0) <= self.now:
-            return "lean" if capped else "normal"
+            return "lean" if capped or bucket in self.policy.get("forceLow", ()) else "normal"
         floor, reserve = self.policy["floors"][bucket]
         remaining = seen.get("remaining", floor)
-        return "stop" if remaining < reserve else "lean" if remaining < floor or capped else "normal"
+        forced = bucket in self.policy.get("forceLow", ())
+        return "stop" if remaining < reserve else "lean" if remaining < floor or capped or forced else "normal"
 
     def charge_rest(self, minute: int, n: int) -> None:
         """Count n REST requests in that minute, on disk at once, so a daemon that dies mid-tick
@@ -1395,8 +1481,19 @@ class Daemon:
                 and jobs_attempt(c.get("jobs")) < (run.get("run_attempt") or 1))
 
     def rest_room(self, cost: int) -> bool:
-        """Whether `cost` more counted REST requests fit in the share."""
-        return self.rest_spent() + cost <= self.rest_cap()
+        """Whether `cost` more counted REST requests fit in the share, or the share yields to them."""
+        return self.rest_spent() + cost <= self.rest_cap() or self.share_yields(cost)
+
+    def share_yields(self, cost: int) -> bool:
+        """GraphQL is below its floor or throttled, so REST is the only bucket with room: the daemon's reads
+        go past its REST share while the account's REST stays above its floor, which is what sessions' own
+        gh calls keep. (A host whose share is 0 still reads over REST then, which is the fallback.)"""
+        if self.mode("graphql") == "normal":
+            return False
+        seen = self.budget.get("rest") or {}
+        if not seen or (seen.get("reset") or 0) <= self.now:
+            return True  # not seen yet, or reset since: a full hour's quota
+        return int(seen.get("remaining") or 0) - cost >= self.policy["floors"]["rest"][0]
 
     def richness(self, bucket: str) -> float:
         """What this bucket can still spend per second until its own reset, above its reserve; -1
@@ -1405,6 +1502,8 @@ class Daemon:
             return -1.0
         if bucket == "rest" and self.rest_capped():
             return -1.0  # the daemon's own REST share is spent: balanced kinds read over GraphQL
+        if bucket in self.policy.get("forceLow", ()):
+            return 0.0  # told to treat it as nearly spent: reads go elsewhere while anything else can take them
         seen = self.budget.get(bucket) or {}
         limit = seen.get("limit") or 5000
         reserve = self.policy["floors"][bucket][1]
@@ -1417,9 +1516,21 @@ class Daemon:
         only when the other is SWITCH_MARGIN richer (or the current one stopped), so the reads move in
         steps instead of flapping, and the two buckets drain about evenly."""
         current = self.paths[kind]
+        if kind in FALLBACK:
+            # GraphQL unless it is low or throttled and REST is neither (nor is the daemon's REST share spent)
+            want = ("rest" if self.mode("graphql") != "normal" and self.mode("rest") == "normal"
+                    and not self.rest_capped() else "graphql")
+            if want != current:
+                log({"event": "route", "kind": kind, "from": current, "to": want,
+                     "modes": {b: self.mode(b) for b in ("rest", "graphql")}})
+                self.paths[kind] = current = want
         if kind in BALANCED:
             here, there = self.richness(current), self.richness(OTHER[current])
-            if there >= 0 and (here < 0 or there > here * SWITCH_MARGIN):
+            # Below its floor while the other bucket is not: move, whatever the margin says. The reverse never
+            # moves by the margin (a low bucket about to reset can look richer), so the two cannot flap.
+            low = self.mode(current) != "normal" and self.mode(OTHER[current]) == "normal"
+            into_low = self.mode(OTHER[current]) != "normal" and self.mode(current) == "normal"
+            if there >= 0 and (here < 0 or low or (not into_low and there > here * SWITCH_MARGIN)):
                 log({"event": "route", "kind": kind, "from": current, "to": OTHER[current],
                      "perMinute": {current: round(here * 60, 1), OTHER[current]: round(there * 60, 1)}})
                 self.paths[kind] = current = OTHER[current]
@@ -1448,7 +1559,7 @@ class Daemon:
         the quota came back. A refusal (a dead token, a secondary limit) backs off instead of
         being retried and re-reported every tick.
         """
-        if BUDGET_REFRESH <= 0 or self.now < self.budget_retry:
+        if BUDGET_REFRESH <= 0 or self.now < self.budget_retry or self.clock() < self.secondary_until:
             return
         seen = [(self.budget.get(b) or {}).get("seenAt") for b in ("rest", "graphql")]
         ages = [self.now - t for t in seen if isinstance(t, (int, float))]
@@ -1490,6 +1601,10 @@ class Daemon:
         would overstate the spend of the very call that reads the spend."""
         if time.monotonic() >= self.tick_deadline:
             raise OutOfTime
+        bucket = "graphql" if path == "/graphql" else "rest"
+        if not self.secondary_admit(bucket, 1):
+            # never sent: any request during a secondary hold (a write, a free /rate_limit) would only extend it
+            raise WatchError(f"held: GitHub's secondary rate limit, {max(0, int(self.secondary_until - self.clock()))}s left")
         if self.upstream() is not None:
             raise WatchError("this host reads GitHub through its upstream (upstream.json) and has no login")
         if self.token is None:
@@ -1501,7 +1616,6 @@ class Daemon:
         raw_body = json.dumps(body).encode() if body is not None else None
         if raw_body is not None:
             headers["Content-Type"] = "application/json"
-        bucket = "graphql" if path == "/graphql" else "rest"
         # The outbox -- a write and the lookups that keep it from landing twice -- is what sessions
         # asked for, at most one write per POST_SPACING, and would cost the same through gh. The share
         # caps the daemon's polling, so the outbox is neither counted against it nor held by it:
@@ -1530,23 +1644,84 @@ class Daemon:
             except ValueError:
                 reset = None
             self.note_budget(bucket, h.get("x-ratelimit-limit"), h.get("x-ratelimit-remaining"), reset)
-        if status in {403, 429} and not content and (h.get("retry-after") or h.get("x-ratelimit-remaining") == "0"):
+        try:
+            doc = json.loads(raw) if raw else None
+        except ValueError:
+            doc = None
+        message = str(doc.get("message") or "") if isinstance(doc, dict) else ""
+        limited = bucket == "graphql" and isinstance(doc, dict) and any(
+            isinstance(e, dict) and e.get("type") == "RATE_LIMITED" for e in doc.get("errors") or [])
+        if status in {403, 429} and ((SECONDARY.search(message) and not (content and CONTENT_ONLY.search(message))) or (
+                not content and h.get("retry-after") and h.get("x-ratelimit-remaining") != "0")):
+            # A write's refusal too, unless GitHub says it blocks only content creation: then the outbox holds
+            # itself (post_hold_for) and the reads go on, as they may.
+            self.secondary_hit(bucket, h.get("retry-after"))
+        elif (status in {403, 429} and not content and (h.get("retry-after") or h.get("x-ratelimit-remaining") == "0")) \
+                or limited:
+            # the primary limit: this bucket only; its reads move to the other one (route, tick)
+            self.gql_limited = self.gql_limited or bucket == "graphql"
             try:
                 wait = float(h["retry-after"]) if h.get("retry-after") else float(h.get("x-ratelimit-reset", 0)) - self.now
             except ValueError:
                 wait = CYCLE
             self.backoff[bucket] = self.now + max(CYCLE, wait)
-        try:
-            doc = json.loads(raw) if raw else None
-        except ValueError:
-            doc = None
+        elif status < 400 and not free:
+            self.secondary_strikes = 0  # a clean answer: the next secondary hold starts short again
         return status, h, doc
+
+    def secondary_admit(self, bucket: str, n: int) -> bool:
+        """Whether n more read requests may go to GitHub now: not while this daemon's own secondary hold
+        lasts, nor while the host's pacer (PACE_FILE) holds every caller on the account."""
+        self.adopt_pace_hold()
+        return self.clock() >= self.secondary_until
+
+    def adopt_pace_hold(self) -> None:
+        """Take on the pacer's hold (another caller met the secondary limit), so both buckets stop for it."""
+        doc = read_json(BASE / PACE_FILE)
+        hold = doc.get("hold") if isinstance(doc, dict) else None
+        until = hold.get("until") if isinstance(hold, dict) else None
+        if isinstance(until, (int, float)) and not isinstance(until, bool) and until > max(self.clock(), self.secondary_until):
+            until = min(until, self.clock() + PACE_HOLD_MAX)  # a corrupt far future holds an hour at most
+            if until > self.secondary_until:
+                self.secondary_until = until
+                for b in self.backoff:
+                    self.backoff[b] = max(self.backoff[b], until)
+                log({"event": "secondary", "source": "pace", "hold": round(until - self.clock())})
+
+    def report_secondary(self, hold: float) -> None:
+        """Tell the host's pacer, when one is installed, so every other caller holds too. Best effort."""
+        try:
+            cli = PACE_CLI.resolve().parent / "gh_quota.py"
+            if cli.is_file():
+                run_bounded([sys.executable, "-I", os.fspath(cli), "secondary", "--retry-after", str(int(math.ceil(hold))),
+                             "--source", "glaeda-gh"], PACE_DEADLINE)
+        except (OSError, subprocess.SubprocessError) as error:
+            self.errors.append(f"pace: {describe(error)}")
+
+    def secondary_hit(self, bucket: str, retry_after: Any) -> None:
+        """A secondary 403 or 429: hold both buckets (the limit is one for REST and GraphQL), for its
+        Retry-After or the doubling back-off, whichever is longer. Never a retry within the same hold."""
+        self.secondary_strikes += 1
+        try:
+            told = float(retry_after) if retry_after else 0.0
+        except ValueError:
+            told = 0.0
+        hold = max(told, min(SECONDARY_BACKOFF_MAX, SECONDARY_BACKOFF * 2 ** (self.secondary_strikes - 1)))
+        # from when the refusal arrived: a tick can run TICK_BUDGET past self.now, its start
+        self.secondary_until = max(self.secondary_until, self.clock() + hold)
+        for b in self.backoff:
+            self.backoff[b] = max(self.backoff[b], self.secondary_until)
+        log({"event": "secondary", "bucket": bucket, "hold": round(hold), "strikes": self.secondary_strikes})
+        self.report_secondary(self.secondary_until - self.clock())
 
     # -- the outbox: content writes (comments, PRs, reviews) queued by `glaeda-gh post`
 
     def post_tick(self) -> None:
         """Send at most one queued write per tick, POST_SPACING after the last one and never while GitHub's
         secondary limit holds the outbox. Oldest first; a write waiting out its own retry is skipped."""
+        self.adopt_pace_hold()
+        if self.clock() < self.secondary_until:
+            return  # a read met the secondary limit: writes wait it out too, as one account's
         if self.now < max(self.post_hold, self.post_at + POST_SPACING):
             return
         for path in sorted(outbox_dir().glob("*.json")) if outbox_dir().is_dir() else []:
@@ -1849,7 +2024,7 @@ class Daemon:
         mine = [e for e in entries if e["key"].startswith(kind + ":")]
         path = self.route(kind)
         mode = self.mode(path)
-        if mode == "stop" or (path == "rest" and kind in BALANCED and self.rest_capped()):
+        if mode == "stop" or (path == "rest" and kind in BALANCED + FALLBACK and self.rest_capped()):
             # Spent, or the daemon's REST share is and GraphQL is stopped too: a kind with nowhere to
             # go waits rather than spend the REST the sessions are left with. Except a failed attempt
             # whose job list is not read yet, the one read the share does not hold back, whichever
@@ -1939,6 +2114,14 @@ class Daemon:
         paid = self.payer.pop(key, None)
         if paid and paid[1] in self.head_spend.get(paid[0], []):
             self.head_spend[paid[0]].remove(paid[1])
+            self.refunded[key] = paid[0]
+
+    def head_answered(self, key: str) -> None:
+        """A head read answered: its charge stands, and one a failed read on the other bucket refunded this tick
+        is charged again, so a fallback never reads a head for free past its consumer's cap."""
+        if self.payer.pop(key, None) is None and key in self.refunded:
+            self.head_spend.setdefault(self.refunded[key], []).append(self.now)
+        self.refunded.pop(key, None)
 
     def due_heads(self, mine: list[dict], mode: str) -> list[dict]:
         """Heads somebody asked for recently whose answer is missing or older than its TTL. One read serves
@@ -1999,6 +2182,8 @@ class Daemon:
         self.clock_real = now is None
         self.tick_deadline = time.monotonic() + TICK_BUDGET
         self.errors = []
+        self.refunded = {}
+        self.spill = []
         self.policy = daemon_policy()
         self.jobs_only = []
         if self.failing is None:
@@ -2013,6 +2198,7 @@ class Daemon:
         except Exception as error:  # noqa: BLE001  a bad queue entry must not stop the reads
             self.errors.append(f"outbox: {describe(error)} at {error_site(error)}")
         entries = self.watches()
+        self.adopt_pace_hold()
         try:
             self.from_controller(entries)
         except Exception as error:  # noqa: BLE001  the controller is an optional, free source: a fault
@@ -2024,13 +2210,17 @@ class Daemon:
         self.deferred_before = dict(self.deferred_since)
         prs, runs, comments = self.due("pr", entries), self.due("run", entries), self.due("comment", entries)
         heads = self.due("head", entries)
-        over = {kind: self.paths[kind] for kind in BALANCED}  # due() routed each kind
-        gql_prs, gql_runs = (prs if over["pr"] == "graphql" else []), (runs if over["run"] == "graphql" else [])
-        for kind, batch, fetch in (("pr", gql_prs, self.fetch_prs), ("comment", comments, self.fetch_comments),
-                                   ("run", gql_runs, self.fetch_runs_graphql), ("head", heads, self.fetch_heads)):
-            self.batched(kind, batch, fetch)
-            self.post_between()
-        over_rest = (prs if over["pr"] == "rest" else []) + (runs if over["run"] == "rest" else [])
+        due = {"pr": prs, "run": runs, "comment": comments, "head": heads}
+        over = {kind: self.paths[kind] for kind in due}  # due() routed each kind
+        spilled: list[dict] = []
+        for kind in ("pr", "comment", "run", "head"):
+            if over[kind] == "graphql":
+                spilled += self.batched(kind, due[kind], self.graphql_fetch[kind])
+                self.post_between()
+        over_rest = [e for kind in ("pr", "run", "comment", "head") if over[kind] == "rest" for e in due[kind]]
+        # GraphQL ran out of primary quota partway: REST reads what it could not, this tick. A secondary
+        # hold stops REST too, so the REST loop below defers them instead.
+        over_rest += spilled
         # With PRs always ahead of runs, a busy daemon read PRs tick after tick while a blocked `wait run` sat on a
         # run nobody reached (2026-10-27: 581 s and counting, with STALE_RUN_REREAD due at 180 s).
         over_rest = self.rest_order(over_rest)
@@ -2038,11 +2228,11 @@ class Daemon:
             # A read is admitted only when its worst case fits in the share, so the share holds at a
             # request, not at a batch; the rest go first next tick, over whichever bucket is richer.
             if self.mode("rest") == "stop" or not self.rest_room(REST_READ_MAX[e["key"].split(":", 1)[0]]):
-                self.defer(over_rest[i:])
+                self.to_graphql(over_rest[i:], spilled)
                 break
             sent = len(self.sent)
             try:
-                (self.fetch_pr_rest if e["key"].startswith("pr:") else self.fetch_run)(e)
+                self.rest_fetch[e["key"].split(":", 1)[0]](e)
             except OutOfTime:
                 self.defer(over_rest[i:])
                 if len(self.sent) > sent:  # cut off partway: it had its turn, and queues as a new deferral
@@ -2051,6 +2241,10 @@ class Daemon:
                 break  # (cut off before its first request, it was not read: it keeps its place, first next tick)
             except Exception as error:  # noqa: BLE001
                 self.errors.append(f"{e['key']}: {describe(error)}")
+            if self.mode("rest") == "stop" and (read_cache(e["key"]) or {}).get("error"):
+                # this read is the one that ran REST out: GraphQL reads it, and the rest, this tick
+                self.to_graphql(over_rest[i:], spilled)
+                break
             self.rest_tried[e["key"]] = self.now  # read, or failed: either way it moves back
             # and a read that deferred itself for the rest of its work (fill_steps_rest) queues as a new deferral
             self.deferred_since.pop(e["key"], None)
@@ -2063,6 +2257,20 @@ class Daemon:
         # headers have already brought the view up to date, and only an idle one goes stale.
         self.refresh_budget()
         return self.finish_tick(entries, prs, runs, comments, heads)
+
+    def to_graphql(self, left: list[dict], spilled: list[dict]) -> None:
+        """REST is throttled or its share spent with these still to read: GraphQL reads them this tick when it
+        is not stopped (and they did not just come from it); the rest go first next tick."""
+        came = {e["key"] for e in spilled}
+        if self.mode("graphql") == "stop":
+            return self.defer(left)
+        held = [e for e in left if e["key"] in came]
+        for kind in ("pr", "comment", "run", "head"):
+            mine = [e for e in left if e["key"].startswith(kind + ":") and e["key"] not in came]
+            if mine:
+                log({"event": "fallback", "to": "graphql", "kind": kind, "entries": len(mine)})
+                held += self.batched(kind, mine, self.graphql_fetch[kind])
+        self.defer(held)
 
     def finish_tick(self, entries: list[dict], prs: list[dict], runs: list[dict], comments: list[dict],
                     heads: list[dict]) -> dict:
@@ -2099,6 +2307,8 @@ class Daemon:
                   "fetched": {"pr": len(prs), "run": len(runs), "comment": len(comments), "head": len(heads)},
                   "controller": {**self.controller_status, "runs": len(self.controller_filled)},
                   "modes": {b: self.mode(b) for b in ("rest", "graphql")}, "errors": self.errors[:10],
+                  "secondaryHold": {"until": self.secondary_until, "strikes": self.secondary_strikes}
+                  if self.secondary_until > self.now else None, "forceLow": list(self.policy.get("forceLow", ())),
                   "lastHour": hour,
                   "restShare": {"spent": self.rest_spent(), "cap": self.rest_cap(),
                                 "share": self.policy["restShare"], "capped": self.rest_capped()},
@@ -2271,13 +2481,25 @@ class Daemon:
             return True
         return False
 
-    def batched(self, kind: str, entries: list[dict], fetch: Callable[[list[dict]], str | None]) -> None:
+    @property
+    def graphql_fetch(self) -> dict[str, Callable[[list[dict]], str | None]]:
+        return {"pr": self.fetch_prs, "comment": self.fetch_comments, "run": self.fetch_runs_graphql,
+                "head": self.fetch_heads}
+
+    @property
+    def rest_fetch(self) -> dict[str, Callable[[dict], None]]:
+        return {"pr": self.fetch_pr_rest, "run": self.fetch_run, "comment": self.fetch_comment_rest,
+                "head": self.fetch_head_rest}
+
+    def batched(self, kind: str, entries: list[dict], fetch: Callable[[list[dict]], str | None]) -> list[dict]:
         """Read `entries` over GraphQL in queries of self.batch[kind]. A query that times out (504)
         halves the batch (once per tick, never below GQL_BATCH_MIN) and is retried at once as two
         halves, so one heavy entry cannot keep the rest stale: it ends up alone, is remembered as
         heavy and read alone from then on (every LEAN_FACTOR cycles once it keeps timing out), and
         the batch grows back. A 502 or 503 is split and retried without shrinking. GQL_SPLITS bounds
-        the extra queries a tick spends on splitting; what is left waits for the next cycle."""
+        the extra queries a tick spends on splitting; what is left waits for the next cycle. Returns the
+        entries left unread because GraphQL stopped (its quota, or a throttle) partway, the one that hit it
+        included, for the caller to read over REST."""
         self.heavy = {k: h for k, h in self.heavy.items() if self.now - h["at"] < IDLE_EXPIRY}
         size = self.batch[kind]
         alone, rest = [], []
@@ -2292,15 +2514,23 @@ class Daemon:
         while queue:
             chunk = queue.pop(0)
             if self.mode("graphql") == "stop":
-                return
+                return chunk + [e for c in queue for e in c]
+            self.gql_limited = False
             try:
                 error = fetch(chunk)
+                spilled, self.spill = self.spill, []
             except OutOfTime:
                 self.defer(chunk + [e for c in queue for e in c])
-                return
+                return []
             except Exception as failure:  # noqa: BLE001  one bad batch must not stop the rest
                 self.errors.append(f"graphql: {describe(failure)}")
                 continue
+            if (error or self.gql_limited) and self.mode("graphql") == "stop":
+                # this query hit the limit (a RATE_LIMITED answer can still carry data.rateLimit and null aliases):
+                # whatever it stored for them, REST reads them this tick and replaces it
+                return chunk + [e for c in queue for e in c]
+            if spilled:
+                return spilled + [e for c in queue for e in c]
             if len(chunk) == 1 and chunk[0]["key"] in self.heavy or (len(chunk) == 1 and error and SLOW.search(error)):
                 # a lone read says nothing about the batch size; it only judges this entry
                 h = self.heavy.setdefault(chunk[0]["key"], {"at": self.now, "fails": 0, "oks": 0})
@@ -2332,6 +2562,7 @@ class Daemon:
                 left = [e for c in queue for e in c]
                 size = self.batch[kind]
                 queue = [chunk[:half], chunk[half:]] + [left[i:i + size] for i in range(0, len(left), size)]
+        return []
 
     def oldest_data(self, entries: list[dict], fetched: set[str]) -> dict[str, float | None]:
         """Per kind, how old the oldest data of an open (not finished) watch is. A finished one is
@@ -2374,7 +2605,7 @@ class Daemon:
             base = current if isinstance(current, dict) else prior
             entry = {"key": key, "fetchedAt": self.now, "dataAt": None, "data": None, "error": None}
             if base:
-                entry.update({k: base[k] for k in ("dataAt", "data", "etag", "jobs", "jobsEtag", "jobsAt", "jobsTried", "restAt", "source", "restParts", "restRun", "origin")
+                entry.update({k: base[k] for k in ("dataAt", "data", "etag", "jobs", "jobsEtag", "jobsAt", "jobsTried", "restAt", "source", "restParts", "restRun", "origin", "via")
                               if k in base})
             entry.update(fields)
             write_json(cache, entry)
@@ -2425,8 +2656,7 @@ class Daemon:
         for i, e in enumerate(entries):
             if i in parsed:
                 # a REST read's kept answers are dead weight in a file clients re-read every 3 s
-                extra = {"restParts": None} if kind == "pr" else {}
-                self.store(e["key"], e["cache"], dataAt=self.now, data=parsed[i], **extra)
+                self.store(e["key"], e["cache"], dataAt=self.now, data=parsed[i], restParts=None, via="graphql")
                 continue
             err = problems.get(f"{alias}{i}") or {}
             what = "pull request" if kind == "pr" else "issue or pull request"
@@ -2472,9 +2702,11 @@ class Daemon:
             if isinstance(result, str):
                 self.store(e["key"], e["cache"], error=result)
                 self.refund(e["key"])
+                if self.mode("graphql") == "stop":
+                    self.spill.append(e)  # a later page met the limit: REST reads it this tick
             else:
-                self.store(e["key"], e["cache"], error=None, dataAt=self.now, data=result)
-                self.payer.pop(e["key"], None)  # answered: the charge stands
+                self.store(e["key"], e["cache"], error=None, dataAt=self.now, data=result, restParts=None, via="graphql")
+                self.head_answered(e["key"])
 
     def head_pages(self, owner: str, repo: str, sha: str, contexts: dict) -> dict | str:
         """A head's data from its first page of contexts, following the rest page by page; an error message
@@ -2559,7 +2791,7 @@ class Daemon:
             self.errors.append(f"{e['key']}: {doc}")
             return self.store(e["key"], e["cache"], error=doc)
         # restAt: the last direct read from GitHub, over either bucket (the controller's safety-net clock)
-        fields: dict[str, Any] = {"error": None, "etag": etag, "dataAt": self.now, "restAt": self.now}
+        fields: dict[str, Any] = {"error": None, "etag": etag, "dataAt": self.now, "restAt": self.now, "via": "rest"}
         if state == "fresh":
             fields["data"] = slim_run(doc)
             fields["restRun"] = rest_run(fields["data"])
@@ -2597,7 +2829,7 @@ class Daemon:
             run["head_branch"] = run["head_branch"] or before.get("head_branch") or ""
             fresh = any(run.get(k) != before.get(k) for k in ("status", "conclusion", "run_attempt", "updated_at"))
             fields: dict[str, Any] = {"error": None, "data": run, "dataAt": self.now, "restAt": self.now,
-                                      "restRun": rest_run(run)}
+                                      "restRun": rest_run(run), "via": "graphql"}
             if prior.get("source") != "controller" or \
                     (iso_epoch(run.get("updated_at")) or 0) > (iso_epoch(before.get("updated_at")) or 0):
                 fields["source"] = "graphql"
@@ -2641,9 +2873,16 @@ class Daemon:
     def rest_part(self, old: dict, new: dict, path: str, slim: Callable[[Any], Any], absent: Any = None) -> Any:
         """A conditional GET whose slimmed answer is kept with its ETag: an unchanged resource answers
         304, which costs nothing, and its kept answer is reused. Raises WatchError on an error, except
-        a 404 when `absent` is given: then the last answer stands, or `absent` without one."""
+        a 404 when `absent` is given: then the last answer stands, or `absent` without one. A 403 saying
+        the repository's plan lacks the feature (NO_FEATURE) is `absent` too, and says so in `new`."""
         kept = old.get(path) or {}
+        if absent is not None and kept.get("unavailable"):
+            new[path] = kept  # not asked again until a GraphQL read drops the kept answers
+            return absent
         state, doc, etag = self.get(path, kept.get("etag") if "doc" in kept else None)
+        if state == "error" and absent is not None and NO_FEATURE.search(str(doc)):
+            new[path] = {"doc": absent, "unavailable": True}
+            return absent
         if state == "error" and absent is not None and str(doc).startswith("HTTP 404"):
             new[path] = {"doc": kept["doc"]} if "doc" in kept else {"doc": absent}
             return new[path]["doc"]
@@ -2666,19 +2905,19 @@ class Daemon:
             pull = self.rest_part(old, parts, f"{root}/pulls/{number}", slim_pull)
             sha = (pull.get("head") or {}).get("sha") or ""
             base = urllib.parse.quote(str((pull.get("base") or {}).get("ref") or ""), safe="/")
-            # filter=all: every attempt, as GraphQL's rollup lists them, so parse_pr dedupes both alike
-            path = f"{root}/commits/{sha}/check-runs?filter=all&per_page=100"
-            checks = self.rest_part(old, parts, path, slim_check_runs)
-            listed = list(checks.get("check_runs") or [])
-            for page in range(2, min(REST_CHECK_PAGES, -(-(checks.get("total_count") or 0) // 100)) + 1):
-                listed += self.rest_part(old, parts, f"{path}&page={page}", slim_check_runs).get("check_runs") or []
-            checks = {"total_count": checks.get("total_count"), "check_runs": listed}
-            statuses = self.rest_part(old, parts, f"{root}/commits/{sha}/status?per_page=100", slim_statuses)
-            runs = self.rest_part(old, parts, f"{root}/actions/runs?head_sha={sha}&per_page=100", slim_head_runs)
-            workflows = self.rest_part(old, parts, f"{root}/actions/workflows?per_page=100", slim_workflows)
+            checks, statuses, runs, workflows = self.rest_head(old, parts, root, sha)
+            listed = checks["check_runs"]
             # a deleted base (a stacked PR's, after its merge) has no requirements left to read
-            required = set(self.rest_part(old, parts, f"{root}/rules/branches/{base}?per_page=100", slim_rules, []))
-            required |= set(self.rest_part(old, parts, f"{root}/branches/{base}", slim_branch, []))
+            rules, protection = f"{root}/rules/branches/{base}?per_page=100", f"{root}/branches/{base}"
+            required = set(self.rest_part(old, parts, rules, slim_rules, []))
+            required |= set(self.rest_part(old, parts, protection, slim_branch, []))
+            if parts[rules].get("unavailable") and parts[protection].get("unavailable"):
+                # A private repository on a plan without either feature: GitHub enforces no required check there,
+                # so none is the true answer. GraphQL's last word is kept all the same (it can name a rule that
+                # predates a plan change); a first read with no GraphQL answer has none, and none is enforced.
+                before = prior.get("data") or {}
+                required = {c.get("name") for c in before.get("checks") or [] if c.get("required")}
+                required |= set(before.get("requiredMissing") or [])
         except WatchError as error:
             message = f"rest: {error}"
             self.errors.append(f"{e['key']}: {message}")
@@ -2688,7 +2927,91 @@ class Daemon:
         review = (prior.get("data") or {}).get("reviewDecision")  # REST has none: keep GraphQL's last
         data = parse_pr(rest_pr_node(pull, checks, statuses, runs, required, review, workflows))
         self.fill_steps_rest(e, data, root, {c.get("node_id"): c.get("id") for c in listed})
-        self.store(e["key"], e["cache"], dataAt=self.now, data=data, restParts=parts)
+        self.store(e["key"], e["cache"], dataAt=self.now, data=data, restParts=parts, via="rest")
+
+    def rest_head(self, old: dict, parts: dict, root: str, sha: str) -> tuple[dict, list, list, dict]:
+        """A commit's check runs (every attempt, up to REST_CHECK_PAGES pages), statuses, workflow runs and the
+        repository's workflow names, each a conditional read kept in `parts`. Raises WatchError."""
+        # filter=all: every attempt, as GraphQL's rollup lists them, so parse_pr dedupes both alike
+        path = f"{root}/commits/{sha}/check-runs?filter=all&per_page=100"
+        checks = self.rest_part(old, parts, path, slim_check_runs)
+        listed = list(checks.get("check_runs") or [])
+        for page in range(2, min(REST_CHECK_PAGES, -(-(checks.get("total_count") or 0) // 100)) + 1):
+            listed += self.rest_part(old, parts, f"{path}&page={page}", slim_check_runs).get("check_runs") or []
+        checks = {"total_count": checks.get("total_count"), "check_runs": listed}
+        statuses: list[dict] = []
+        total = 0
+        for page in range(1, REST_STATUS_PAGES + 1):
+            got = self.rest_part(old, parts, f"{root}/commits/{sha}/status?per_page=100&page={page}", slim_status_page)
+            statuses += got.get("statuses") or []
+            total = int(got.get("total") or 0)
+            if len(statuses) >= total or not got.get("statuses"):
+                break
+        runs: list[dict] = []
+        runs_total = 0
+        for page in range(1, REST_RUN_PAGES + 1):
+            got = self.rest_part(old, parts, f"{root}/actions/runs?head_sha={sha}&per_page=100&page={page}",
+                                 slim_head_runs_page)
+            runs += got.get("runs") or []
+            runs_total = int(got.get("total") or 0)
+            if len(runs) >= runs_total or not got.get("runs"):
+                break
+        if total > len(statuses) or runs_total > len(runs):
+            # a partial list would read as a smaller, greener head (a check without its run loses its workflow)
+            checks = {**checks, "total_count": max(int(checks.get("total_count") or 0), len(checks["check_runs"]) + 1)}
+        workflows = self.rest_part(old, parts, f"{root}/actions/workflows?per_page=100", slim_workflows)
+        return checks, statuses, runs, workflows
+
+    def fetch_head_rest(self, e: dict) -> None:
+        """One head over REST, for when GraphQL is low or throttled: the same contexts fetch_heads folds."""
+        _, owner, repo, sha = split_key(e["key"])
+        prior = e["cache"] or {}
+        self.reads.append((self.now, "head", "rest"))
+        old, parts = prior.get("restParts") or {}, {}
+        try:
+            checks, statuses, runs, workflows = self.rest_head(old, parts, f"/repos/{owner}/{repo}", sha)
+        except WatchError as error:
+            self.refund(e["key"])
+            # GitHub answers 422 (No commit found) or 404 for a commit it does not know
+            missing = not parts and re.match(r"HTTP (404|422)", str(error)) is not None
+            return self.store(e["key"], e["cache"], error="no such commit" if missing else f"rest: {error}"[:200],
+                              missing=missing)
+        if (checks.get("total_count") or 0) > len(checks["check_runs"]):
+            self.refund(e["key"])  # a partial list would read as a smaller, greener head
+            return self.store(e["key"], e["cache"], error=f"more than {REST_CHECK_PAGES * 100} checks, {REST_STATUS_PAGES * 100} statuses or "
+                              f"{REST_RUN_PAGES * 100} workflow runs over REST")
+        found: dict = {}
+        statuses_by: dict = {}
+        ids: dict = {}
+        fold_contexts(rest_contexts(checks, statuses, runs, set(), workflows), found, statuses_by, ids)
+        self.store(e["key"], e["cache"], error=None, dataAt=self.now, data=head_data(sha, found, statuses_by, ids),
+                   restParts=parts, via="rest")
+        self.head_answered(e["key"])
+
+    def fetch_comment_rest(self, e: dict) -> None:
+        """One comment watch over REST, for when GraphQL is low or throttled: the issue (its state and comment
+        count), then the page or two that hold its last COMMENTS_LAST comments. Conditional reads, so a quiet
+        issue costs nothing."""
+        _, owner, repo, number = split_key(e["key"])
+        prior = e["cache"] or {}
+        self.reads.append((self.now, "comment", "rest"))
+        root = f"/repos/{owner}/{repo}/issues/{number}"
+        old, parts = prior.get("restParts") or {}, {}
+        try:
+            issue = self.rest_part(old, parts, root, slim_issue)
+            total = int(issue.get("comments") or 0)
+            last = max(1, -(-total // 100))
+            comments: list[dict] = []
+            # the page before the last too, when the last holds fewer than COMMENTS_LAST
+            for page in ([last - 1] if last > 1 and total - 100 * (last - 1) < COMMENTS_LAST else []) + [last]:
+                comments += self.rest_part(old, parts, f"{root}/comments?per_page=100&page={page}", slim_comments)
+        except WatchError as error:
+            message = f"rest: {error}"
+            self.errors.append(f"{e['key']}: {message}")
+            return self.store(e["key"], e["cache"], error=message[:200],
+                              missing=not parts and str(error).startswith("HTTP 404"))
+        self.store(e["key"], e["cache"], error=None, dataAt=self.now, data=parse_comments(rest_issue_node(issue, comments)),
+                   restParts=parts, via="rest")
 
     def fill_steps_rest(self, e: dict, data: dict, root: str, job_ids: dict[str, Any]) -> None:
         """fill_steps over REST, for a PR read over REST (GraphQL is the poorer bucket, or stopped).
@@ -3693,7 +4016,8 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
                          "for a rescue attempt")
         lines.append(str(data.get("html_url") or ""))
     note = f"  (last error: {entry['error']})" if entry.get("error") else ""
-    lines.append(f"data {age(entry.get('dataAt'))}{note}")
+    via = {"rest": ", read over REST", "graphql": ", read over GraphQL"}.get(entry.get("via"), "")
+    lines.append(f"data {age(entry.get('dataAt'))}{via}{note}")
     return "\n".join(lines)
 
 
@@ -5512,13 +5836,20 @@ def broker_max_age(fields: list[str]) -> float:
 
 def broker_bucket_spent(key: str, now: float) -> bool:
     """True when the bucket gh would spend on `key` is below its reserve until a reset that has not
-    come yet, and the other bucket is not: then the daemon can read what gh cannot."""
+    come yet, throttled (the daemon stopped it: GitHub refused it), or named in forceLow, and the other
+    bucket is none of these: then the daemon can read what gh cannot. Below its floor alone is not
+    enough here: one gh call costs one request, and waiting for the daemon costs the caller seconds."""
     budget = read_json(BASE / "budget.json")
-    if not isinstance(budget, dict):
-        return False
-    floors = daemon_policy()["floors"]
+    budget = budget if isinstance(budget, dict) else {}
+    policy = daemon_policy()
+    floors = policy["floors"]
+    status = read_json(BASE / "daemon.json")
+    modes = status.get("modes") if isinstance(status, dict) and isinstance(status.get("modes"), dict) else {}
+    fresh = isinstance(status, dict) and isinstance(status.get("at"), (int, float)) and now - status["at"] < 2 * CYCLE
 
     def spent(bucket: str) -> bool:
+        if bucket in policy["forceLow"] or (fresh and modes.get(bucket) == "stop"):
+            return True
         seen = budget.get(bucket)
         if not isinstance(seen, dict) or (seen.get("reset") or 0) <= now:
             return False
