@@ -6370,6 +6370,32 @@ class GateTest(unittest.TestCase):
         return hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state,
                          capacity_dir=capacity)
 
+    def test_a_plain_side_runner_listens_only_with_room_for_the_side_labels_costliest_job(self) -> None:
+        # The side label's jobs as the hook costs them: the fit follows JOB_CORES, never a copy of it.
+        costs = {job: hook.job_units(hook.job_class(job, "manaflow-ai/cmux", workflow=wf)[0], job, "manaflow-ai/cmux",
+                                     workflow=wf) for wf, job in hook.SIDE_FIT_JOBS}
+        self.assertEqual(costs["fast-tier"], 5, "fast-tier off the fast runner costs JOB_CORES' 5")
+        side = hook.RunnerScope(14, 2, 2, False)
+        self.assertEqual(hook.side_fit_units(side), max(costs.values()))
+        for role in ({"root": True}, {"gui": True}, {"session": True}, {"fast": True}, {"fresh": True},
+                     {"nightly": True}, {"dedicated": True}):
+            self.assertEqual(hook.side_fit_units(side._replace(**role)), 1, f"{role} keeps its own fit")
+        self.assertEqual(hook.side_fit_units(hook.RunnerScope()), 1, "no ledger, no fit")
+        # A side runner (instance 3 of a 2-root std mini) whose listen.sh passes glaeda-ios-sim's 3, or nothing
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(exist_ok=True)
+        script.write_text("#!/bin/bash\nexec /usr/bin/python3 /hook job-started --allowed-owner manaflow-ai "
+                          "--capacity-units 14 --compile-slots 2 --canonical-roots 2 --instance 3\n")
+        listen = self.runner / hook.LISTEN_SCRIPT
+        for flags in (" --fit-units 3", ""):
+            listen.write_text(f"#!/bin/bash\n/usr/bin/python3 /hook listen --runner-dir {self.runner}{flags} &\n")
+            self.assertEqual(self.full_gate(self.units(10)).full(),
+                             "only 4 of 14 capacity units on this mini are free; its next job needs 5",
+                             "a fast tier taken with 4 units free would wait in Set up runner")
+            self.assertIsNone(self.full_gate(self.units(9)).full())
+        listen.write_text(f"#!/bin/bash\n/usr/bin/python3 /hook listen --runner-dir {self.runner} --fit-units 6 &\n")
+        self.assertIsNotNone(self.full_gate(self.units(9)).full(), "a larger listen.sh fit still counts")
+
     def test_a_mini_with_every_unit_taken_claims_the_host(self) -> None:
         self.assertIsNone(hook.mini_full(None, 2))
         self.assertIsNone(hook.mini_full(self.units(2), 0), "a single-runner mini has no units")
@@ -8207,14 +8233,14 @@ class GateTest(unittest.TestCase):
             "exec python3 /hook job-started --capacity-units 14 --canonical-roots 2 --instance 3\n")
         gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state,
                          capacity_dir=self.units(12), fit_units=3)
-        self.assertEqual(gate.claimed(), "only 2 of 14 capacity units on this mini are free; its next job needs 3")
+        # a plain side runner listens with room for the side label's costliest job (side_fit_units), above the 3
+        self.assertEqual(gate.claimed(), "only 2 of 14 capacity units on this mini are free; its next job needs 5")
         # a gate started from an older listen.sh (no flag in its argv) reads the flag from the current one
         old = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state,
                         capacity_dir=self.units(12))
-        self.assertIsNone(old.claimed())
         (self.runner / hook.LISTEN_SCRIPT).write_text(ios_sim)
         self.assertEqual(hook.listen_fit_units(self.runner), 3)
-        self.assertEqual(old.claimed(), "only 2 of 14 capacity units on this mini are free; its next job needs 3")
+        self.assertEqual(old.claimed(), "only 2 of 14 capacity units on this mini are free; its next job needs 5")
         # a session runner with 5 cores free stays off: generated-files or action exports would wait here for a sixth
         (self.runner / hook.RUNNER_HOOK_SCRIPT).write_text(
             "exec python3 /hook job-started --capacity-units 14 --canonical-roots 2 --instance 5 --session-runner\n")
