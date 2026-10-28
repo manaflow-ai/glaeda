@@ -4401,6 +4401,51 @@ time.sleep(60)
             drain.kill()
             drain.wait()
 
+    def test_nightly_job_is_admitted_while_a_fleet_build_waits(self) -> None:
+        """NIGHTLY_WAITER: cmux run 40624308094 lost a signed nightly when its DMG verify was refused for a waiting
+        fleet build. A nightly job goes first; the build gets the host when it ends."""
+        fleet = self.fleet()
+        markers = Path(str(fleet / "host.lock") + ".waiters")
+        markers.mkdir()
+        worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        push = event(self.dir, "nightly-push", {"repository": CMUX, "ref": "refs/heads/nightly-next"})
+        nightly = {"GITHUB_REF": "refs/heads/nightly-next", "GITHUB_JOB": "verify-final-dmg-nightly",
+                   "RUNNER_NAME": "n0",
+                   "GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/nightly.yml@refs/heads/nightly-next"}
+        try:
+            (markers / f"{worker.pid}-build-test").touch()
+            ordinary = self.job("swift-package-tests", "l1", 8)
+            self.assertEqual(ordinary.returncode, 1, ordinary.stdout)
+            self.assertIn("refused: a fleet build is waiting for the host", ordinary.stdout)
+            admitted = self.run_hook("job-started", "push", push, "--allowed-repo", "manaflow-ai/cmux", "--no-disk",
+                                     "--state-dir", os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()),
+                                     "--gui-wait", "0", "--capacity-units", "8",
+                                     "--capacity-dir", os.fspath(self.dir / "capacity"),
+                                     repo="manaflow-ai/cmux", env=nightly)
+            self.assertEqual(admitted.returncode, 0, admitted.stdout + admitted.stderr)
+            self.assertIn("a nightly job goes first", admitted.stdout)
+            self.finish("n0")
+            self.assertTrue(self.lock_free(), "the build worker gets the host once the nightly job ends")
+            # a nightly compile still yields on a side runner, and goes first on the nightly slot
+            dev_push = event(self.dir, "dev-push", {"repository": CMUX, "ref": "refs/heads/feat-cmux-next"})
+            compile_env = {"GITHUB_REF": "refs/heads/feat-cmux-next", "GITHUB_JOB": "release-compile",
+                           "RUNNER_NAME": "n1",
+                           "GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/cmux-next.yml@refs/heads/feat-cmux-next"}
+            for slot, code in (((), 1), (("--nightly-runner",), 0)):
+                with self.subTest(slot=slot):
+                    result = self.run_hook("job-started", "push", dev_push, "--allowed-repo", "manaflow-ai/cmux",
+                                           "--no-disk", "--state-dir", os.fspath(self.dir / "state"),
+                                           "--watch-pid", str(os.getpid()), "--gui-wait", "0",
+                                           "--capacity-units", "14", "--capacity-dir", os.fspath(self.dir / "capacity"),
+                                           *slot, repo="manaflow-ai/cmux", env=compile_env)
+                    self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+                    if code:
+                        self.assertIn("refused: a fleet build is waiting for the host", result.stdout)
+                    self.finish("n1")
+        finally:
+            worker.kill()
+            worker.wait()
+
     @unittest.skipUnless(os.path.exists(hook.LSOF), "needs lsof")
     def test_capacity_stops_admitting_while_a_fleet_build_waits(self) -> None:
         fleet = self.fleet()
@@ -7509,6 +7554,23 @@ class GateTest(unittest.TestCase):
             json.dumps({"since": time.time(), "wants": ["units"], "who": "s1 daemon-test (run 4)"}) + "\n")
         self.assertIsNone(hook.mini_full(ledger, 10, fresh), "a PR job waiting for units does not hold the slot")
         self.assertIsNotNone(hook.mini_full(ledger, 10, side))
+
+    def test_the_nightly_slot_gate_never_yields_to_a_waiting_fleet_build(self) -> None:
+        """NIGHTLY_WAITER: the nightly slot admits only nightly jobs, which a fleet build waiting for the host does not
+        hold off, so its gate does not read the host's waiters; a PR runner's gate still does."""
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(exist_ok=True)
+        script.write_text("#!/bin/bash\nexec /usr/bin/python3 /hook job-started --capacity-units 10 --instance 2"
+                          " --canonical-roots 2 --test-keychain\n")
+        self.assertTrue(hook.Gate(self.runner, os.fspath(self.lock), "", self.state).waiters)
+        script.write_text("#!/bin/bash\nexec /usr/bin/python3 /hook job-started --capacity-units 10 --instance 2"
+                          " --canonical-roots 2 --nightly-runner --test-keychain\n")
+        gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+        self.assertFalse(gate.waiters)
+        with mock.patch.object(hook, "host_waiters", return_value={77}):
+            gate.waiting_at = -hook.GATE_WAITER_EVERY_S
+            why = gate.claimed()
+        self.assertFalse(why and why.startswith(hook.WAITER_REFUSAL), why)
 
     def test_the_nightly_slot_listens_on_a_full_mini_and_its_waiting_job_holds_every_other_runner(self) -> None:
         """NIGHTLY_SLOT: the nightly slot's gate never holds it for units, a waiter or CPU saturation, so GitHub
