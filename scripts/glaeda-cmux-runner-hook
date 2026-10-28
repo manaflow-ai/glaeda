@@ -4834,6 +4834,14 @@ def nightly_waiter_key(pid: int) -> str | None:
     return f"{pid}:{start}" if start else None
 
 
+def nightly_pass_left(state_dir: Path, pid: int) -> bool:
+    """Whether a nightly job may still be admitted ahead of this waiter (NIGHTLY_WAITER_PASSES), read only. Fails
+    closed like nightly_pass: no stable identity or an unreadable record leaves no pass."""
+    key = nightly_waiter_key(pid)
+    passes = nightly_passes(state_dir)
+    return key is not None and passes is not None and passes.get(key, 0) < NIGHTLY_WAITER_PASSES
+
+
 def nightly_pass(state_dir: Path, pid: int, delta: int = 1) -> bool:
     """Reserve (delta 1) or give back (delta -1) one admission of a nightly job ahead of this waiter
     (NIGHTLY_WAITER_PASSES), under take_capacity's admission.lock. Fails closed: a waiter with no stable identity, a
@@ -5170,8 +5178,9 @@ class Gate:
                  waiters: bool = True, capacity_dir: Path | None = None, fit_units: int = 1) -> None:
         self.runner_dir, self.host_lock, self.reservation, self.state_dir, self.waiters = \
             runner_dir, host_lock, reservation, state_dir, waiters
-        if runner_scope(runner_dir).nightly:  # its jobs pass a waiting fleet build (NIGHTLY_WAITER)
-            self.waiters = False
+        # the nightly slot's jobs pass a waiting fleet build (NIGHTLY_WAITER), so its gate yields only to a waiter
+        # that has no pass left (blocking_waiters)
+        self.nightly_slot = runner_scope(runner_dir).nightly
         self.capacity_dir = capacity_dir
         self.fit_units = fit_units
         self.full_why: str | None = None  # the last known mini_full answer, kept across UNKNOWN looks
@@ -5287,7 +5296,7 @@ class Gate:
             return self.low_disk() or self.dedicated_toolchain()
         why = host_held(self.host_lock, self.reservation, time.time(), self.state_dir)
         if why is None and self.waiters and self.waiters_due():
-            self.waiting, self.waiting_at = host_waiters(self.host_lock, self.state_dir), time.monotonic()
+            self.waiting, self.waiting_at = self.blocking_waiters(), time.monotonic()
         if why is None and self.waiting:
             why = f"a fleet build is waiting for the host (pid {min(self.waiting)})"
         if why:
@@ -5295,6 +5304,15 @@ class Gate:
             self.yield_to_fleet()
         return (why or self.shed(self.saturated()) or self.full() or self.shed(self.hot()) or self.locked()
                 or self.low_disk() or self.ineligible())
+
+    def blocking_waiters(self) -> set[int]:
+        """The fleet builds waiting for the host that this gate yields to. On the nightly slot, a waiter its jobs may
+        still pass (nightly_pass_left) does not hold the gate; one whose NIGHTLY_WAITER_PASSES are spent, or whose
+        pass record cannot be read, does, so a stream of nightly jobs cannot keep the build out."""
+        waiting = host_waiters(self.host_lock, self.state_dir)
+        if self.nightly_slot:
+            waiting = {pid for pid in waiting if not nightly_pass_left(self.state_dir, pid)}
+        return waiting
 
     def waiters_due(self) -> bool:
         """Time to read the host's waiters: GATE_WAITER_EVERY_S since the last reading, or a job-started on this
@@ -5389,7 +5407,7 @@ class Gate:
             return self.claimed()
         why = host_held(self.host_lock, self.reservation, time.time(), self.state_dir)
         if why is None and self.waiting:
-            again = self.waiting & host_waiters(self.host_lock, self.state_dir)
+            again = self.waiting & self.blocking_waiters()
             self.waiting, self.waiting_at = again, time.monotonic()
             if again:
                 why = f"a fleet build is waiting for the host (pid {min(again)})"
@@ -5403,7 +5421,7 @@ class Gate:
         """A fleet build seen waiting during the job that just ended, still waiting in a fresh reading."""
         if not self.waiting:
             return None
-        again = self.waiting & host_waiters(self.host_lock, self.state_dir)
+        again = self.waiting & self.blocking_waiters()
         self.waiting, self.waiting_at = again, time.monotonic()
         if not again:
             return None
@@ -5885,7 +5903,7 @@ class Gate:
                 # refused (cmux10s, 2026-10-14: 14 PR jobs in two minutes under a soak's reservation). A job
                 # job-started refused ends in seconds, so its worker is watched; any other is seen on a poll.
                 if self.waiters and self.waiters_due():
-                    self.waiting, self.waiting_at = host_waiters(self.host_lock, self.state_dir), time.monotonic()
+                    self.waiting, self.waiting_at = self.blocking_waiters(), time.monotonic()
                 reserved = self.still_reserved()
                 self.job_waited = bool(self.waiting) or reserved is not None
                 workers = self.worker_pids() if self.waiting or reserved or self.low_disk() else []

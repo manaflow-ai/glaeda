@@ -7619,22 +7619,46 @@ class GateTest(unittest.TestCase):
         self.assertIsNone(hook.mini_full(ledger, 10, fresh), "a PR job waiting for units does not hold the slot")
         self.assertIsNotNone(hook.mini_full(ledger, 10, side))
 
-    def test_the_nightly_slot_gate_never_yields_to_a_waiting_fleet_build(self) -> None:
-        """NIGHTLY_WAITER: the nightly slot admits only nightly jobs, which a fleet build waiting for the host does not
-        hold off, so its gate does not read the host's waiters; a PR runner's gate still does."""
+    def test_the_nightly_slot_gate_yields_only_to_a_waiter_with_no_pass_left(self) -> None:
+        """NIGHTLY_WAITER: the nightly slot admits only nightly jobs, which pass a fleet build waiting for the host
+        NIGHTLY_WAITER_PASSES times, so its gate keeps listening while the waiter has a pass left and holds once the
+        passes are spent (or the record cannot be read); otherwise an endless queue of nightly jobs, each refused
+        after taking the host's shared lock for a moment, could keep the build out. A PR runner's gate always
+        yields."""
         script = self.runner / hook.RUNNER_HOOK_SCRIPT
         script.parent.mkdir(exist_ok=True)
         script.write_text("#!/bin/bash\nexec /usr/bin/python3 /hook job-started --capacity-units 10 --instance 2"
                           " --canonical-roots 2 --test-keychain\n")
-        self.assertTrue(hook.Gate(self.runner, os.fspath(self.lock), "", self.state).waiters)
+        pr_gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+        self.assertFalse(pr_gate.nightly_slot)
+        with mock.patch.object(hook, "host_waiters", return_value={77}), \
+                mock.patch.object(hook, "nightly_pass_left", return_value=True):
+            self.assertEqual(pr_gate.blocking_waiters(), {77})
         script.write_text("#!/bin/bash\nexec /usr/bin/python3 /hook job-started --capacity-units 10 --instance 2"
                           " --canonical-roots 2 --nightly-runner --test-keychain\n")
-        gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
-        self.assertFalse(gate.waiters)
-        with mock.patch.object(hook, "host_waiters", return_value={77}):
-            gate.waiting_at = -hook.GATE_WAITER_EVERY_S
-            why = gate.claimed()
-        self.assertFalse(why and why.startswith(hook.WAITER_REFUSAL), why)
+        for left, held in ((True, False), (False, True)):
+            with self.subTest(pass_left=left):
+                gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+                self.assertTrue(gate.nightly_slot and gate.waiters)
+                with mock.patch.object(hook, "host_waiters", return_value={77}), \
+                        mock.patch.object(hook, "nightly_pass_left", return_value=left), \
+                        mock.patch.object(hook, "host_held", return_value=None):
+                    gate.waiting_at = -hook.GATE_WAITER_EVERY_S
+                    why = gate.claimed()
+                self.assertEqual(bool(why and "a fleet build is waiting for the host (pid 77)" in why), held, why)
+
+    def test_nightly_pass_left_reads_the_record_and_fails_closed(self) -> None:
+        state = self.state
+        state.mkdir(parents=True, exist_ok=True)
+        waiter = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(waiter.wait)
+        self.addCleanup(waiter.kill)
+        self.assertTrue(hook.nightly_pass_left(state, waiter.pid))
+        for _ in range(hook.NIGHTLY_WAITER_PASSES):
+            self.assertTrue(hook.nightly_pass(state, waiter.pid))
+        self.assertFalse(hook.nightly_pass_left(state, waiter.pid))
+        (state / hook.NIGHTLY_PASSES_FILE).write_text("{torn")
+        self.assertFalse(hook.nightly_pass_left(state, waiter.pid))
 
     def test_the_nightly_slot_listens_on_a_full_mini_and_its_waiting_job_holds_every_other_runner(self) -> None:
         """NIGHTLY_SLOT: the nightly slot's gate never holds it for units, a waiter or CPU saturation, so GitHub
