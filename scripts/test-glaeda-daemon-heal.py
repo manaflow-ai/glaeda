@@ -53,6 +53,42 @@ class FakeHost(heal.Host):
         self.survives_term = False
         self.sizes: dict[int, int] = {}  # pid -> footprint bytes
         self.asked: list[list[int]] = []
+        self.probes: list[float | None] = []  # sandbox probe answers, in order; empty: a healthy 0.1 s
+        self.probed = 0
+        self.hold = ""
+        self.lock_held = False
+        self.reboots: list[float] = []
+        self.reboot_result = (0, "")
+        self.journal_rows: list[dict] = []
+        self.journal_broken = False
+        self.ps_broken = False
+
+    def processes_strict(self):
+        if self.ps_broken:
+            raise heal.HealError("ps gave no process list (exit 1: x)")
+        return self.processes()
+
+    def sandbox_hold(self, now: float) -> str:
+        return self.hold
+
+    def sandbox_probe(self, slow_s: float):
+        self.probed += 1
+        return self.probes.pop(0) if self.probes else 0.1
+
+    def with_host_lock(self, fn):
+        return None if self.lock_held else fn()
+
+    def reboot(self):
+        self.reboots.append(self.t)
+        return self.reboot_result
+
+    def journal_read(self):
+        if self.journal_broken:
+            raise heal.HealError("sandboxd journal unreadable: broken")
+        return [dict(r) for r in self.journal_rows]
+
+    def journal_append(self, entry):
+        self.journal_rows.append(dict(entry))
 
     def add(self, pid: int, exe: str, rate: float, uid: int = 0) -> None:
         self.procs[pid] = [uid, 0.0, exe, rate]
@@ -336,6 +372,307 @@ class Guards(Base):
             heal.install(POLICY_PATH, True, expect_sha256="nothex")
         with self.assertRaisesRegex(heal.HealError, "policy sha256"):  # shasum's "<hash>  -" is accepted for the script
             heal.install(POLICY_PATH, True, expect_sha256=good + "  -", expect_policy_sha256="0" * 64)
+
+
+class SandboxHeal(Base):
+    """sandboxd's self-heal: two slow probes a few minutes apart on an idle, opted-in mini reboot it, at most once a
+    day and never twice within a week (fleet decision by claude-sr2 (coordinator), 2026-10-28)."""
+
+    def slow_twice(self, after: float | None = None) -> dict:
+        """A slow probe now and another confirm_after_s later; the second pass's report."""
+        self.host.probes = [9.0]
+        first = self.tick()
+        self.assertIn("confirms after", first["sandbox"]["waiting"])
+        self.host.probes = [9.0]
+        return self.tick(self.policy["sandbox_probe"]["confirm_after_s"] if after is None else after)
+
+    def test_the_policy_reboots_after_two_slow_probes_once_a_day_and_once_a_week(self) -> None:
+        p = POLICY["sandbox_probe"]
+        self.assertEqual((p["enabled"], p["slow_s"], p["reboot_every_s"], p["repeat_window_s"]),
+                         (True, 5, 86400, 7 * 86400))
+        self.assertGreaterEqual(p["confirm_after_s"], 120)  # "a few minutes apart"
+        self.assertNotIn("kickstart", (ROOT / "scripts" / "glaeda-daemon-heal").read_text().split('"""', 2)[2]
+                         .split("SANDBOX_PROBE_SOURCE")[0])
+        self.assertEqual(heal.SANDBOX_REBOOT[:3], ["/sbin/shutdown", "-r", "now"])
+
+    def test_a_fast_probe_does_nothing(self) -> None:
+        report = self.tick()
+        self.assertEqual(report["sandbox"], {"probe_s": 0.1})
+        self.assertEqual((self.host.reboots, report["actions"], self.host.journal_rows), ([], [], []))
+
+    def test_one_slow_probe_never_reboots_and_a_fast_one_ends_the_episode(self) -> None:
+        self.host.probes = [9.0]
+        self.tick()
+        self.assertEqual(self.host.journal_rows[-1]["action"], "slow")
+        self.host.probes = [9.0]
+        self.assertIn("confirms", self.tick(60)["sandbox"]["waiting"])  # too soon after the first
+        self.tick(60)  # fast again
+        self.host.probes = [9.0]
+        self.assertIn("confirms after", self.tick(600)["sandbox"]["waiting"])  # a new episode starts over
+        self.assertEqual(self.host.reboots, [])
+
+    def test_two_slow_probes_apart_reboot_once_logged_before_it(self) -> None:
+        report = self.slow_twice()
+        self.assertEqual(len(self.host.reboots), 1)
+        self.assertTrue(report["sandbox"]["rebooting"])
+        self.assertTrue(report["actions"][0]["ok"])
+        self.assertIn("/sbin/shutdown -r now", report["actions"][0]["action"])
+        self.assertEqual([r["action"] for r in self.host.journal_rows], ["slow", "reboot"])
+        self.assertEqual(self.host.journal_rows[-1]["t"], self.host.reboots[0])  # logged before the reboot ran
+
+    def test_two_slow_probes_too_far_apart_are_two_episodes(self) -> None:
+        report = self.slow_twice(after=self.policy["sandbox_probe"]["confirm_within_s"] + 1)
+        self.assertIn("confirms after", report["sandbox"]["waiting"])
+        self.assertEqual(self.host.reboots, [])
+
+    def test_the_first_fast_probe_after_a_reboot_is_logged_and_healed(self) -> None:
+        self.slow_twice()
+        report = self.tick(300)
+        self.assertEqual(report["healed"][-1]["name"], "sandboxd")
+        self.assertEqual([r["action"] for r in self.host.journal_rows], ["slow", "reboot", "after-reboot"])
+        self.assertEqual(self.tick()["healed"][-1]["name"], "sandboxd")  # kept a day, not logged again
+        self.assertEqual(len(self.host.journal_rows), 3)
+
+    def test_a_second_reboot_within_7_days_is_refused_for_a_person_and_logged_once(self) -> None:
+        self.slow_twice()
+        self.tick(300)
+        for hours in (1, 2 * 24, 4 * 24):  # passes run all along: 1 h, 2 d and 6 d after the reboot
+            self.run_for(hours)
+            report = self.slow_twice()
+            self.assertIn("needs a person", report["sandbox"]["needs_operator"])
+            self.assertEqual(len(self.host.reboots), 1, hours)
+            self.tick()  # fast: the episode ends
+        self.assertEqual([r["action"] for r in self.host.journal_rows].count("refused-repeat"), 3)
+        self.run_for(25)  # past 7 d by both the clock and the passes
+        self.assertTrue(self.slow_twice()["sandbox"]["rebooting"])
+        self.assertEqual(len(self.host.reboots), 2)
+
+    def test_the_repeat_refusal_is_logged_once_per_episode(self) -> None:
+        self.slow_twice()
+        self.tick(300)
+        self.host.t += 86400
+        self.slow_twice()
+        for _ in range(5):
+            self.host.probes = [9.0]
+            self.assertIn("needs_operator", self.tick()["sandbox"])
+        self.assertEqual([r["action"] for r in self.host.journal_rows].count("refused-repeat"), 1)
+
+    def test_never_while_busy_held_reserved_or_not_opted_in(self) -> None:
+        self.host.add(500, "/Users/cmux/actions-runner-glaeda/bin/Runner.Worker", 0.1, uid=502)
+        self.host.probes = [9.0]
+        self.assertIn("host busy", self.tick()["sandbox"]["skipped"])
+        self.assertEqual(self.host.probed, 0)
+        self.host.procs.pop(500)
+        for hold in ("reserved until 2026-10-28T23:59:59Z", "cmux-lawrence: never rebooted by a self-heal",
+                     "not opted in by fleet-registry.json (x)"):
+            self.host.hold = hold
+            self.assertEqual(self.tick()["sandbox"], {"skipped": hold})
+        self.assertEqual((self.host.probed, self.host.reboots), (0, []))
+
+    def test_a_job_or_reservation_that_arrives_before_the_reboot_wins(self) -> None:
+        host = self.host
+        real = host.sandbox_probe
+        host.probes = [9.0]
+        self.tick()
+
+        def slow_then_busy(slow_s):
+            host.add(600, "/usr/bin/xcodebuild", 0.1, uid=502)
+            return real(slow_s)
+
+        host.probes = [9.0]
+        host.sandbox_probe = slow_then_busy
+        report = self.tick(self.policy["sandbox_probe"]["confirm_after_s"])
+        self.assertEqual(report["sandbox"]["skipped"], "host busy (xcodebuild)")
+        self.assertEqual((host.reboots, report["actions"]), ([], []))
+        host.procs.pop(600)
+        host.sandbox_probe = real
+        holds = iter(["", "reserved until later"])
+        host.sandbox_hold = lambda now: next(holds)
+        host.probes = [9.0]
+        self.assertEqual(self.tick()["sandbox"]["skipped"], "reserved until later")
+        self.assertEqual(host.reboots, [])
+        self.assertNotIn("reboot", [r["action"] for r in host.journal_rows])
+
+    def test_a_held_host_lock_waits(self) -> None:
+        self.host.lock_held = True
+        self.assertIn("host.lock is held", self.slow_twice()["sandbox"]["waiting"])
+        self.assertEqual(self.host.reboots, [])
+        self.host.lock_held = False
+        self.host.probes = [9.0]
+        self.assertTrue(self.tick()["sandbox"]["rebooting"])
+
+    def test_a_failed_reboot_is_logged_and_still_counts(self) -> None:
+        self.host.reboot_result = (124, "timed out")  # shutdown may have taken it before the timeout
+        report = self.slow_twice()
+        self.assertFalse(report["actions"][0]["ok"])
+        self.assertEqual([r["action"] for r in self.host.journal_rows], ["slow", "reboot", "reboot-failed"])
+        self.host.reboot_result = (0, "")
+        self.host.probes = [9.0]
+        self.assertIn("needs_operator", self.tick()["sandbox"])
+        self.assertEqual(len(self.host.reboots), 1)
+
+    def test_a_ps_that_fails_under_the_lock_never_reboots(self) -> None:
+        self.host.ps_broken = True
+        report = self.slow_twice()
+        self.assertIn("cannot tell the host is idle", report["sandbox"]["skipped"])
+        self.assertEqual(self.host.reboots, [])
+        self.assertNotIn("reboot", [r["action"] for r in self.host.journal_rows])
+
+    def test_a_forward_clock_jump_does_not_open_the_week(self) -> None:
+        self.slow_twice()
+        self.tick(300)
+        self.host.t += 30 * 86400  # the clock jumps a month; few passes have run
+        report = self.slow_twice()
+        self.assertIn("needs_operator", report["sandbox"])
+        self.assertEqual(len(self.host.reboots), 1)
+
+    def test_a_week_of_passes_and_of_clock_opens_it_even_while_busy(self) -> None:
+        self.slow_twice()
+        self.tick(300)
+        self.host.add(700, "/usr/bin/xcodebuild", 0.1, uid=502)  # busy all week: passes still count the time
+        self.run_for(7 * 24 + 1)
+        self.host.procs.pop(700)
+        self.assertTrue(self.slow_twice()["sandbox"]["rebooting"])
+        self.assertEqual(len(self.host.reboots), 2)
+
+    def test_a_journal_that_lost_a_reboot_the_state_saw_refuses(self) -> None:
+        self.slow_twice()
+        self.host.journal_rows = []
+        self.host.probes = [9.0]
+        self.assertIn("lost a reboot", self.tick(300)["sandbox"]["error"])
+        self.assertEqual(len(self.host.reboots), 1)
+
+    def test_a_journal_cut_back_to_an_older_reboot_refuses(self) -> None:
+        self.slow_twice()
+        self.assertEqual(len(self.host.reboots), 1)
+        self.host.journal_rows = [{"t": T0 - 30 * 86400, "action": "reboot"}]  # cut back to a month-old reboot
+        self.host.probes = [9.0]
+        self.assertIn("lost a reboot", self.tick(300)["sandbox"]["error"])
+        self.run_for(8 * 24)
+        self.host.probes = [9.0, 9.0]
+        self.tick()
+        self.assertIn("lost a reboot", self.tick(300)["sandbox"]["error"])
+        self.assertEqual(len(self.host.reboots), 1)
+
+    def test_an_unreadable_journal_never_reboots(self) -> None:
+        self.host.journal_broken = True
+        self.host.probes = [9.0, 9.0]
+        self.tick()
+        report = self.tick(self.policy["sandbox_probe"]["confirm_after_s"])
+        self.assertIn("unreadable", report["sandbox"]["error"])
+        self.assertEqual(self.host.reboots, [])
+
+    def test_a_plan_pass_or_an_off_policy_never_probes(self) -> None:
+        self.host.probes = [9.0]
+        self.assertEqual(self.tick(apply=False)["sandbox"], {"skipped": "probed under --apply only"})
+        self.policy["sandbox_probe"]["enabled"] = False
+        self.assertEqual(self.tick()["sandbox"], {"skipped": "off in the policy"})
+        self.assertEqual(self.host.probed, 0)
+
+    def test_a_probe_that_cannot_run_is_an_error_not_a_reboot(self) -> None:
+        self.host.probes = [None]
+        self.assertEqual(self.tick()["sandbox"], {"probe_s": None, "error": "the probe could not run"})
+        self.assertEqual(self.host.reboots, [])
+
+    def test_the_policy_block_is_validated_and_optional(self) -> None:
+        doc = copy.deepcopy(POLICY)
+        del doc["sandbox_probe"]
+        heal.validate_policy(doc)
+        good = dict(POLICY["sandbox_probe"])
+        for change in ({"enabled": "yes"}, {"slow_s": 0}, {"slow_s": 120}, {"slow_s": float("nan")},
+                       {"confirm_after_s": float("inf")}, {"confirm_after_s": 1800, "confirm_within_s": 1800},
+                       {"reboot_every_s": 3600}, {"repeat_window_s": 3600}, {"repeat_window_s": None}):
+            doc["sandbox_probe"] = {**good, **change}
+            with self.assertRaises(heal.HealError, msg=change):
+                heal.validate_policy(doc)
+        doc["sandbox_probe"] = []
+        with self.assertRaises(heal.HealError):
+            heal.validate_policy(doc)
+
+    def test_the_journal_appends_synced_lines_and_compacts(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            h = heal.Host()
+            h.journal = Path(d) / "state" / heal.SANDBOX_JOURNAL
+            self.assertEqual(h.journal_read(), [])
+            h.journal_append({"t": 0.5, "action": "reboot"})
+            for i in range(2 * heal.SANDBOX_JOURNAL_KEEP + 3):
+                h.journal_append({"t": float(i + 1), "action": "slow"})
+            rows = h.journal_read()
+            self.assertLessEqual(len(rows), 2 * heal.SANDBOX_JOURNAL_KEEP + 1)
+            self.assertEqual(rows[0], {"t": 0.5, "action": "reboot"})  # compaction never drops a reboot
+            self.assertEqual(rows[-1]["t"], float(2 * heal.SANDBOX_JOURNAL_KEEP + 3))
+            with open(h.journal, "a") as f:
+                f.write('{"t": NaN, "action": "reboot"}\n')
+            with self.assertRaisesRegex(heal.HealError, "no finite time"):
+                h.journal_read()
+            with open(h.journal, "w") as f:
+                f.write("garbage\n")
+            with self.assertRaisesRegex(heal.HealError, "not JSON"):
+                h.journal_read()
+            os.symlink(h.journal, Path(d) / "link")
+            h.journal = Path(d) / "link"
+            with self.assertRaises(heal.HealError):
+                h.journal_read()
+
+    def test_run_pass_journals_beside_its_state(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            host = FakeHost()
+            report = heal.run_pass(POLICY_PATH, Path(d) / "state", False, host)
+            self.assertEqual(host.journal, Path(d) / "state" / heal.SANDBOX_JOURNAL)
+            self.assertIn("sandbox", report)
+
+    def test_the_hold_reads_the_registry_opt_in(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            (home / ".config/glaeda").mkdir(parents=True)
+            (home / ".config/glaeda/update.json").write_text(json.dumps({"host": "cmux-austin-mini-0"}))
+            opt = home / heal.SANDBOX_OPT_IN
+            pw = mock.Mock(pw_dir=os.fspath(home))
+            with mock.patch.object(heal, "fleet_ops_eligible", return_value=""), \
+                    mock.patch.object(heal, "fleet_ops_hold", return_value=""), \
+                    mock.patch.object(heal.pwd, "getpwuid", return_value=pw), \
+                    mock.patch.object(heal.os, "stat", return_value=mock.Mock(st_uid=502)), \
+                    mock.patch.object(heal, "platform_node", return_value="cmux-mac-014.local"), \
+                    mock.patch.object(heal.Host, "boots_unattended", return_value=""):
+                self.assertIn("not opted in", heal.Host().sandbox_hold(T0))
+                opt.write_text(json.dumps({"schema": heal.SANDBOX_OPT_IN_SCHEMA, "host": "cmux14",
+                                           "source": "fleet-registry.json"}))
+                self.assertIn("does not name", heal.Host().sandbox_hold(T0))
+                opt.write_text(json.dumps({"schema": heal.SANDBOX_OPT_IN_SCHEMA, "host": "cmux-austin-mini-0",
+                                           "source": "fleet-registry.json"}))
+                self.assertEqual(heal.Host().sandbox_hold(T0), "")
+                (home / ".config/glaeda/update.json").write_text(json.dumps({"host": "cmux-lawrence"}))
+                self.assertIn("lawrence", heal.Host().sandbox_hold(T0))
+            with mock.patch.object(heal, "fleet_ops_eligible", return_value="an EC2 Mac (ec2-user)"):
+                self.assertIn("EC2", heal.Host().sandbox_hold(T0))
+            with mock.patch.object(heal, "fleet_ops_eligible", return_value=""), \
+                    mock.patch.object(heal, "fleet_ops_hold", return_value="reserved until x"):
+                self.assertEqual(heal.Host().sandbox_hold(T0), "reserved until x")
+
+    def test_a_mini_that_would_not_come_back_by_itself_is_never_rebooted(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            lw, kc = Path(d) / "loginwindow.plist", Path(d) / "kcpassword"
+            answers = {"fdesetup": (1, "false\n", "")}
+            with mock.patch.object(heal, "sh", side_effect=lambda argv, timeout=15: answers["fdesetup"]), \
+                    mock.patch.object(heal, "SANDBOX_LOGINWINDOW", os.fspath(lw)), \
+                    mock.patch.object(heal, "SANDBOX_KCPASSWORD", os.fspath(kc)):
+                self.assertIn("no auto-login", heal.Host().boots_unattended())
+                lw.write_bytes(plistlib.dumps({"autoLoginUser": "cmux"}))
+                self.assertIn("saved password", heal.Host().boots_unattended())
+                kc.write_bytes(b"x")
+                self.assertEqual(heal.Host().boots_unattended(), "")
+                for answer in ((0, "true\n", ""), (127, "", "no fdesetup"), (1, "", "")):
+                    answers["fdesetup"] = answer
+                    self.assertIn("FileVault", heal.Host().boots_unattended(), answer)
+                answers["fdesetup"] = (1, "false\n", "")
+                lw.write_bytes(b"not a plist")
+                self.assertIn("no auto-login", heal.Host().boots_unattended())
+
+    @unittest.skipUnless(sys.platform == "darwin" and os.path.exists("/usr/bin/sandbox-exec"), "macOS only")
+    def test_the_real_probe_runs_here(self) -> None:
+        took = heal.Host().sandbox_probe(5)
+        self.assertIsNotNone(took)
+        self.assertLess(took, 5)
 
 
 class Install(unittest.TestCase):

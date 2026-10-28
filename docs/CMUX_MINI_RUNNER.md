@@ -1418,6 +1418,7 @@ runners) looks for what stopped runner minis on 2026-09-25 and 26 without anythi
 | `tailscale_down`: a BackendState other than `Running`, two runs in a row | `tailscale up` when Stopped, else `scutil --nc stop/start` of the Tailscale VPN service; a standalone tailscaled or a logged-out node is reported only |
 | `tailscale_no_route`: BackendState `Running`, but `route -n get 100.100.100.100` leaves by a non-utun interface (the tailnet route is gone), two runs in a row | a restart of Tailscale (never a config, auth or flag change), only on an idle CI runner mini the fleet registry opted in, at most once every 6 h per mini (below); elsewhere reported only |
 | `tailscale_cli_missing`: a host with runner LaunchAgents has neither `/usr/local/bin/tailscale` (standalone) nor the Tailscale app's CLI | reported only (warn): the tunnel is not checked, so it is not counted healthy |
+| `sandboxd_wedged`: the root daemon-heal's sandbox probe hangs again on a mini it already rebooted for that within 7 days | none: a person (an error that ci-dash keeps as an HQ fleet-alert issue). The first time, the root daemon-heal reboots the idle mini itself (below) |
 | `tailscale_probe_error`: the Tailscale CLI gave no BackendState (timeout, error, no JSON), or `route -n get 100.100.100.100` named no interface | reported only: the check could not look, so the tunnel is not judged down |
 | `runner_stopped:<agent>`: a runner LaunchAgent loaded but not running, two runs in a row | `launchctl kickstart` (nothing runs in it, so no job is cut) |
 | `runner_unloaded:<agent>` (not one `cmux_mini_fix.sh` holds) | none: `glaeda-cmux-runner-fleet --apply` |
@@ -1504,6 +1505,51 @@ all of them failing closed (`heal_tailscale_route` in the script):
    the tunnel is back probes the route in use.
 8. **Kill switch.** `touch ~/.config/glaeda/tailscale-restart-off`, or `GLAEDA_TAILSCALE_RESTART=off` in the
    agent's environment (as glaeda-disk's `disk-off`); `mini-health.disabled` stops it too.
+
+**A wedged sandboxd's reboot** (fleet decision by claude-sr2 (coordinator), 2026-10-28), the root daemon-heal's
+(section 2l2, `sandbox_pass` in `scripts/glaeda-daemon-heal`, policy `sandbox_probe` in
+`config/macos-daemons.json`). Homebrew pours every bottle under `sandbox-exec`. A sandboxd whose
+`com.apple.sandboxd.approval` queue waits forever on one tccd request hangs every sandboxed process that looks up
+a denied mach service: brew sat 8 h in "Pouring" on austin-0 and austin-1 (2026-10-27). `launchctl kickstart -k
+system/com.apple.sandboxd` is refused under SIP, even as root ("150: Operation not permitted while System
+Integrity Protection is engaged"). A reboot clears it: on austin-0 (2026-10-28) the probe went from a hang to
+0.5 s, and `git submodule status` went from 171 s to 0.6 s. The gates fail closed, like the Tailscale restart's:
+
+1. **The same opted-in CI runner minis.** The fleet user's `~/.config/glaeda/tailscale-self-heal.json` (above)
+   must name the mini. `fleet-registry.json` writes that file for the `ci-runner` role only, so AWS Macs,
+   cmux-lawrence, the interactive Macs and `no_touch` hosts never have it. There is no host list in glaeda.
+   On top of that: a fleet Mac (`/Library/Application Support/cmux-fleet-ops`, no `ec2-user`), no fleet
+   reservation (`fleet-reservations.json`, for example cmux17-24 while theirs runs) or host-local
+   `reservation.json` holding it, and no name that holds `lawrence`. It must also come back by itself:
+   FileVault is off (`fdesetup isactive`; a guard reboot into the unlock screen kept a mini off the pool about
+   21 h on 2026-10-25), and loginwindow has an `autoLoginUser` with `/etc/kcpassword`, so the runner user's
+   LaunchAgents start again.
+2. **Two failed probes, a few minutes apart.** The probe is an ad-hoc signed copy of `/bin/date` run under
+   `(version 1)(deny mach-lookup)(allow default)` and killed at `slow_s` (5 s); a platform binary takes sandboxd's
+   fast path and never hangs. It takes 0.08 to 0.5 s on a healthy mini. A probe that times out starts an
+   episode; a second one at least `confirm_after_s` (4 min) and at most `confirm_within_s` (30 min) later
+   confirms it. A probe that fails to run, or exits nonzero, is an error and never a reboot.
+3. **Idle, under the host lock, rechecked right before.** It probes only with no `busy` process (Runner.Worker,
+   xcodebuild, xctest, swift-build, swift-test). The reboot runs only while this pass holds two locks
+   exclusively: the fleet `host.lock`, so no job is admitted, and `.reservation.lock`, the reservation writers'
+   lock, so no reserve or release interleaves. Under both it re-reads the process list and every gate in 1
+   right before the reboot. A `ps` that fails or lists nothing refuses. A job or reservation that arrived in
+   the meantime wins, and a held lock waits for a later pass.
+4. **Once a day, never twice in a week.** At most one reboot per `reboot_every_s` (24 h) per mini. If a mini would
+   need a second within `repeat_window_s` (7 days), it is not rebooted: the report carries
+   `sandbox.needs_operator`, glaeda-mini-health turns it into the `sandboxd_wedged` error, and ci-dash keeps
+   that as an HQ `fleet-alert` issue (class `sandboxd_wedged` in cmuxterm-hq `build-fleet/alerts.json`). Every
+   reboot attempt counts, including one that `shutdown` reported as failed or that timed out. The week must have
+   passed by the clock and by the root pass's own count. That count adds each pass's step, capped at
+   `2 * every_s` and never negative, so a clock jump cannot open the week early.
+5. **Every action is logged.** These all go to `state/sandboxd-heal.jsonl` beside the root report: the first
+   slow probe, the reboot (written and fsynced before `/sbin/shutdown -r now` runs), a failed reboot, the
+   refused repeat (once per episode) and the first probe after a reboot (also under `healed`, as
+   `sandboxd_wedged`). The 24 h and 7 day counts come from this file. A journal that cannot be read, a line
+   without a finite time, or a journal that has lost a reboot the root state recorded all refuse the reboot,
+   and none of them counts as "no reboots yet". Compaction keeps every reboot line. The pass's `sandbox` field in `state/report.json` says
+   what it saw.
+6. **Off** with `"enabled": false` in `sandbox_probe` (a release), like any policy change.
 
 ## 2l2. Root daemon-heal: one install, then it keeps itself current
 

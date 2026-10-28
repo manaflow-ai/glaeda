@@ -2619,15 +2619,32 @@ class DaemonHeal(Base):
         root.write_text(json.dumps({"hot": [{"name": "fseventsd", "pid": 421, "cores": 1.02, "since": "x",
                                              "hot_for_s": 5400, "waiting": "restarts at 2 h"}],
                                     "healed": [{"name": "audiomxd", "t": NOW - 60, "at": "a", "since": "s",
-                                                "cores": 1.1, "action": "audiomxd pid 5 stopped (SIGTERM)"}]}))
+                                                "cores": 1.1, "action": "audiomxd pid 5 stopped (SIGTERM)"},
+                                               {"name": "sandboxd", "t": NOW - 30, "at": "b", "since": "b",
+                                                "probe_s": 5.0, "action": "launchctl kickstart"}]}))
         self.mini.heal_status = {"installed": True, "current": True, "loaded": True, "reportFresh": True,
                                  "report": os.fspath(root)}
         r = self.run_once()
         f = r["findings"]
         self.assertEqual([x["id"] for x in f], ["daemon_hot:fseventsd"])
-        self.assertEqual([(h["id"], h["auto_fix"]) for h in r["healed"]], [("daemon_hot:audiomxd", "done")])
+        self.assertEqual([(h["id"], h["auto_fix"]) for h in r["healed"]],
+                         [("daemon_hot:audiomxd", "done"), ("sandboxd_wedged:sandboxd", "done")])
+        self.assertEqual(r["healed"][1]["evidence"], "sandbox probe took 5.0 s")
         self.assertIn("1.5 h", f[0]["evidence"])
         self.assertIn("restarts at 2 h", f[0]["note"])
+
+    def test_a_wedged_sandboxd_the_root_heal_will_not_reboot_again_is_an_error_for_a_person(self) -> None:
+        root = self.dir / "report.json"
+        root.write_text(json.dumps({"hot": [], "healed": [], "sandbox": {
+            "probe_s": 5.0, "needs_operator": "sandboxd is wedged again ... needs a person"}}))
+        self.mini.heal_status = {"installed": True, "current": True, "loaded": True, "reportFresh": True,
+                                 "report": os.fspath(root)}
+        f = [x for x in self.run_once()["findings"] if x["code"] == "sandboxd_wedged"]
+        self.assertEqual([(x["id"], x["severity"], x["auto_fix"]) for x in f],
+                         [("sandboxd_wedged", "error", "impossible")])
+        self.assertIn("needs a person", f[0]["evidence"])
+        root.write_text(json.dumps({"hot": [], "healed": [], "sandbox": {"probe_s": 0.1}}))
+        self.assertEqual([x for x in self.run_once()["findings"] if x["code"] == "sandboxd_wedged"], [])
 
     def test_a_runner_accounts_stale_root_copy_is_reported_from_the_root_report(self) -> None:
         root = self.dir / "report.json"
