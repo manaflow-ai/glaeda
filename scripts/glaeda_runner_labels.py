@@ -57,15 +57,20 @@ SELECTOR_KEY = re.compile(r"^(\s*)(?:-\s+)?(runs-on|matrix)\s*:(.*)$")
 # there (a pull request opened there). Every main head is verified in the fork (ci.yml), so no Verify job runs here
 # on a push.
 OWNER_FORM = ("falls back to GitHub-hosted only in teamleaderleo/glaeda, a personal-account repository that Blacksmith "
-              "cannot serve, for a pull request opened there (its head is not in the fork), or for a push to main in a "
-              "workflow PUSH_HERE names; the fork runs the same job on Blacksmith, and verifies every main head")
-# Owner-form workflows that still run on a push to main here, on a hosted image: the fork keeps them disabled
-# (mirror.yml keeps only ci.yml and itself enabled there), so their main-head run is this one. The set only shrinks.
-PUSH_HERE: dict[str, str] = {
-    "bootstrap-compatibility.yml": "disabled in the fork; path-filtered contract test of the bootstrap profile mapper",
-    "cultist-advisory.yml": "disabled in the fork; advisory, and its push run saves the pinned Cultist binary cache "
-                            "this repository's pull requests restore",
-    "github-resident-snapshot.yml": "disabled in the fork; path-filtered contract test of the resident snapshot",
+              "cannot serve, for a pull request opened there (its head is not in the fork), or for a push, dispatch or "
+              "schedule in a workflow BEYOND_PR names; the fork runs the same job on Blacksmith, and verifies every main head")
+# Owner-form workflows that still run here on a hosted image for something other than a pull request (a push to main,
+# a dispatch or a schedule), with why: the fork keeps them disabled (mirror.yml keeps only ci.yml and itself enabled
+# there), so that run can only happen here. The set only shrinks.
+BEYOND_PR: dict[str, str] = {
+    "bootstrap-compatibility.yml": "push to main: disabled in the fork; path-filtered contract test of the bootstrap "
+                                   "profile mapper",
+    "cultist-advisory.yml": "push to main: disabled in the fork; advisory, and its push run saves the pinned Cultist "
+                            "binary cache this repository's pull requests restore",
+    "fleet-candidate.yml": "dispatch: disabled in the fork; an operator's on-demand candidate bundle build",
+    "github-resident-snapshot.yml": "push to main: disabled in the fork; path-filtered contract test of the resident "
+                                    "snapshot",
+    "linux-acceptance.yml": "dispatch: disabled in the fork; an operator's on-demand Linux acceptance run",
 }
 PERSONAL = ("runs only in teamleaderleo/glaeda, a personal-account repository: Blacksmith installs on organizations "
             "only and no owned runner serves it")
@@ -209,8 +214,8 @@ def main(argv: list[str]) -> int:
     for (name, job), reason in sorted(HOSTED_ALLOWED.items()):
         print(f"  {name}:{job}: {reason}")
     print(f"  owner-form jobs: {OWNER_FORM}")
-    for name, reason in sorted(PUSH_HERE.items()):
-        print(f"  {name} on a push to main: {reason}")
+    for name, reason in sorted(BEYOND_PR.items()):
+        print(f"  {name}, beyond pull requests: {reason}")
     return 0
 
 

@@ -392,6 +392,8 @@ where
     {
         return Err(candidate_changed());
     }
+    // An entry renamed inside the tree keeps every count and inode: name the one path that matters again.
+    require_nested_alternates_absent(&candidate.objects)?;
     source
         .confirm(&source_binding)
         .map_err(|_| source_changed())?;
@@ -1144,6 +1146,19 @@ mod tests {
                 .kind(),
             ImmutableGitObjectPoolGenerationAuditErrorKind::NestedAlternates
         );
+    }
+
+    #[test]
+    fn alternates_renamed_in_before_final_boundary_are_refused() {
+        let fixture = Fixture::new();
+        let pending = fixture.candidate.join("objects/info/pending");
+        fs::write(&pending, b"/unexpected/objects\n").unwrap();
+        let mut source = fixture.source_observation();
+        let candidate = fixture.candidate_lease();
+        let result = audit_with_hook(&mut source, &candidate, || {
+            fs::rename(&pending, fixture.candidate.join("objects/info/alternates")).unwrap();
+        });
+        assert!(result.is_err());
     }
 
     #[test]

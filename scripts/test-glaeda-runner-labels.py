@@ -166,20 +166,22 @@ class Repository(unittest.TestCase):
     def test_the_owner_form_has_a_reason(self) -> None:
         self.assertIn("pull request opened there", rl.OWNER_FORM)
 
-    def test_only_push_here_workflows_run_hosted_on_a_push_to_main(self) -> None:
-        # A push-triggered workflow with an owner-form job runs that job on a hosted image here unless it is gated
-        # to the fork. Verify is (above); the rest are PUSH_HERE, each with its reason, and the set only shrinks.
+    def test_only_beyond_pr_workflows_run_hosted_beyond_pull_requests(self) -> None:
+        # An owner-form job runs on a hosted image here for every trigger its workflow has. Pull requests opened here
+        # are OWNER_FORM's case; a push, dispatch or schedule here is allowed only for a BEYOND_PR workflow, with its
+        # reason, unless the workflow is gated to the fork (Verify). The set only shrinks.
         here = set()
         for path in rl.workflow_files([]):
             text = path.read_text(encoding="utf-8")
             trigger = text.split("\njobs:")[0]
-            if not re.search(r"^  push:", trigger, re.M) or "github.repository_owner == 'manaflow-ai' &&" not in text:
+            others = re.findall(r"^  (push|workflow_dispatch|schedule|workflow_run|repository_dispatch|release):", trigger, re.M)
+            if not others or "github.repository_owner == 'manaflow-ai' &&" not in text:
                 continue
             if "github.repository == 'manaflow-ai/glaeda'" in text:
                 continue
             here.add(path.name)
-        self.assertEqual(here, set(rl.PUSH_HERE))
-        for name, reason in rl.PUSH_HERE.items():
+        self.assertEqual(here, set(rl.BEYOND_PR))
+        for name, reason in rl.BEYOND_PR.items():
             self.assertTrue(reason.strip(), name)
 
 
