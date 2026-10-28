@@ -9447,6 +9447,10 @@ class HostReservationTest(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.list = self.root / "fleet-reservations.json"
         self.local = self.root / "reservation.json"
+        self.update = self.root / "update.json"  # absent: not known to be a personal Mac, whatever this host is
+        update = mock.patch.object(gd, "UPDATE_CONFIG", self.update)
+        update.start()
+        self.addCleanup(update.stop)
         self.list.write_text(json.dumps({"schema": "glaeda-fleet-reservations/v1", "expires": "2026-10-27T13:00:00Z",
                                          "aliases": {"cmux30": ["cmux-thirty"]},
                                          "reservations": [{"id": "r1", "owner": "someone", "hosts": ["cmux30"],
@@ -9471,6 +9475,23 @@ class HostReservationTest(unittest.TestCase):
         self.assertIn("unreadable", self.reserved({"cmux31"}))
         self.list.unlink()
         self.assertIn("unreadable", self.reserved({"cmux31"}))
+
+    def test_a_missing_list_holds_no_hygiene_only_mac(self) -> None:
+        """A personal Mac (glaeda-mini-setup --hygiene-only) never receives the fleet's list. Failing closed there
+        held air-blue as reserved for good, so its pressure pass deleted nothing while the disk fell below 40 GiB."""
+        self.list.unlink()
+        self.assertIn("unreadable", self.reserved({"air-blue"}), "no update.json: not known to be personal")
+        self.update.write_text(json.dumps({"host": "air-blue", "setupArgs": ["--role=fleet-mini"]}))
+        self.assertIn("unreadable", self.reserved({"air-blue"}), "a fleet mini without its list fails closed")
+        self.update.write_text(json.dumps({"host": "air-blue", "setupArgs": ["--hygiene-only"]}))
+        self.assertEqual(self.reserved({"air-blue"}), "")
+        now = int(self.during)
+        self.local.write_text(json.dumps({"schema": "glaeda-reservation/v1", "owner": "fleet", "since": now - 60,
+                                          "until": now + 60}))
+        self.assertIn("host reservation by fleet", self.reserved({"air-blue"}), "a host-local marker still holds")
+        self.local.unlink()
+        self.list.write_text("{nope")
+        self.assertIn("unreadable", self.reserved({"air-blue"}), "a list that is there but broken fails closed")
 
     def test_the_host_local_reservation_counts(self) -> None:
         now = int(self.during)

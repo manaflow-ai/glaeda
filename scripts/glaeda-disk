@@ -7514,6 +7514,15 @@ def fleet_reservations_path() -> Path:
     return HOME / FLEET_RESERVATIONS_NAME
 
 
+def hygiene_only_mac(path: Path | None = None) -> bool:
+    """A personal Mac set up with glaeda-mini-setup --hygiene-only (as glaeda-local-guard reads update.json): not a
+    fleet host, so it never receives the fleet's reservation list."""
+    with contextlib.suppress(OSError, ValueError, AttributeError, TypeError):
+        return "--hygiene-only" in (json.loads((UPDATE_CONFIG if path is None else path).read_text())
+                                    .get("setupArgs") or [])
+    return False
+
+
 def reservation_time(value: Any) -> float:
     """An ISO 8601 time (Z or an offset; a naive one is UTC) as Unix seconds; ValueError otherwise."""
     if not isinstance(value, str) or not value:
@@ -7543,9 +7552,10 @@ def _str_list(value: Any, what: str) -> list[str]:
 
 
 def host_reservation(now: float | None = None, path: Path | None = None, names: set[str] | None = None,
-                     local: Path | None = None) -> str:
+                     local: Path | None = None, update: Path | None = None) -> str:
     """Why this host is reserved now ("" when it is not): an active fleet reservation naming it (or an alias), an
-    active host-local reservation, or a reservation list that is missing, unreadable or malformed anywhere."""
+    active host-local reservation, or a reservation list that is unreadable or malformed anywhere, or missing on a
+    host that is not a hygiene-only Mac."""
     now = time.time() if now is None else now
     names = host_names() if names is None else {n.lower() for n in names}
     try:
@@ -7571,6 +7581,9 @@ def host_reservation(now: float | None = None, path: Path | None = None, names: 
                 hit = f"reserved for {e.get('owner', '?')} until {e['until']} ({e.get('id', '?')})"
         if hit:
             return hit
+    except FileNotFoundError:
+        if not hygiene_only_mac(update):  # a personal Mac never gets the fleet's list; a fleet mini without it fails closed
+            return "fleet reservations unreadable (FileNotFoundError); kept as reserved"
     except (OSError, ValueError, KeyError, TypeError) as error:
         return f"fleet reservations unreadable ({type(error).__name__}); kept as reserved"
     marker = HOST_RESERVATION_LOCAL if local is None else local
