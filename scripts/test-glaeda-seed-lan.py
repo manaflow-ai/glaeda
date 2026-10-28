@@ -453,6 +453,111 @@ class InstallerTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("the seed archive must run no jobs", report["error"])
 
+    def test_cache_makes_the_host_direct_and_the_clients_lan(self):
+        argv = ("cache", "--host", "cmux15", "--address", "172.20.21.202", "cmux12s-mac-mini", "cmux13s-mac-mini",
+                "--apply")
+        code, report = self.cli(*argv)
+        self.assertEqual(code, 0, report)
+        host_conf = json.loads((self.seeder / ".config/glaeda/lan-cache/config.json").read_text())
+        self.assertEqual(host_conf, {"schema": 1, "source": "direct"})
+        command = f"/usr/bin/python3 -I {self.seeder}/.local/libexec/glaeda-seed-serve --role cache"
+        lines = self.authorized()
+        self.assertEqual(lines[0], self.foreign)
+        for client in ("cmux12s-mac-mini", "cmux13s-mac-mini"):
+            conf = self.homes / client / ".config/glaeda/lan-cache"
+            public = (conf / "id_ed25519.pub").read_text().split()
+            self.assertIn(f'restrict,from="172.20.20.0/22",command="{command}" {public[0]} {public[1]} '
+                          f"glaeda-lan-cache@{client}", lines)
+            self.assertTrue((conf / "known_hosts").read_text().startswith("glaeda-lan-cache ssh-ed25519 "))
+            config = json.loads((conf / "config.json").read_text())
+            self.assertEqual((config["source"], config["addresses"]), ("lan", ["172.20.21.202"]))
+            self.assertEqual(report["clients"][client]["ping"], "glaeda-seed-serve 1 pong")
+            # Both readers accept what it wrote.
+            lf = load("glaeda_lan_fetch_for_test", ROOT / "scripts/glaeda-lan-fetch")
+            self.assertIsNotNone(lf.load_cache_config(conf / "config.json"))
+        self.assertEqual(len(lines), 3)
+        before = self.tree()
+        self.assertEqual(self.cli(*argv)[0], 0)
+        self.assertEqual(self.tree(), before)
+        # The host is never its own client, and an untrusted host is refused.
+        self.assertEqual(self.cli("cache", "--host", "cmux15", "--address", "x", "cmux15", "--apply")[0], 1)
+        self.assertEqual(self.cli("cache", "--host", "cmuxs-mac-mini-6", "--address", "x", "cmux12s-mac-mini",
+                                  "--apply")[0], 1)
+
+    def test_a_client_the_host_does_not_answer_is_never_pointed_at_it(self):
+        (self.homes.parent / "client-ssh").write_text(f"#!{sys.executable}\nimport sys\nsys.exit(255)\n")
+        code, report = self.cli("cache", "--host", "cmux15", "--address", "172.20.21.202", "cmux12s-mac-mini",
+                                "--apply")
+        self.assertEqual(code, 1, report)
+        conf = self.homes / "cmux12s-mac-mini/.config/glaeda/lan-cache"
+        self.assertTrue((conf / "id_ed25519").exists())
+        self.assertFalse((conf / "config.json").exists())
+        self.assertFalse((conf / "known_hosts").exists())  # the pin is only staged
+        self.assertFalse(any("glaeda-lan-cache@cmux12s-mac-mini" in line for line in self.authorized()))
+
+    def test_any_address_that_answers_is_enough(self):
+        (self.homes.parent / "client-ssh").write_text(
+            f"#!{sys.executable}\nimport sys\n"
+            "print('glaeda-seed-serve 1 pong' if '172.20.21.202' in sys.argv else '')\n")
+        code, report = self.cli("cache", "--host", "cmux15", "--address", "172.20.21.9", "--address",
+                                "172.20.21.202", "cmux12s-mac-mini", "--apply")
+        self.assertEqual(code, 0, report)
+        conf = self.homes / "cmux12s-mac-mini/.config/glaeda/lan-cache"
+        self.assertTrue((conf / "config.json").exists())
+        self.assertTrue((conf / "known_hosts").read_text().startswith("glaeda-lan-cache "))
+        self.assertFalse((conf / "known_hosts.next").exists())
+
+    def test_a_client_that_stops_answering_loses_its_lan_path(self):
+        argv = ("cache", "--host", "cmux15", "--address", "172.20.21.202", "cmux12s-mac-mini", "--apply")
+        self.assertEqual(self.cli(*argv)[0], 0)
+        conf = self.homes / "cmux12s-mac-mini/.config/glaeda/lan-cache/config.json"
+        self.assertTrue(conf.exists())
+        (self.homes.parent / "client-ssh").write_text(f"#!{sys.executable}\nimport sys\nsys.exit(255)\n")
+        self.assertEqual(self.cli(*argv)[0], 1)
+        self.assertFalse(conf.exists())
+
+    def test_a_client_left_out_loses_its_lan_path_before_its_line(self):
+        base = ("cache", "--host", "cmux15", "--address", "172.20.21.202")
+        self.assertEqual(self.cli(*base, "cmux12s-mac-mini", "cmux13s-mac-mini", "--apply")[0], 0)
+        code, report = self.cli(*base, "cmux12s-mac-mini", "--apply")
+        self.assertEqual(code, 0, report)
+        self.assertEqual(report["dropped"], {"cmux13s-mac-mini": "unconfigured"})
+        self.assertFalse((self.homes / "cmux13s-mac-mini/.config/glaeda/lan-cache/config.json").exists())
+        self.assertFalse(any("glaeda-lan-cache@cmux13s-mac-mini" in line for line in self.authorized()))
+        # One that cannot be reached keeps its line.
+        self.assertEqual(self.cli(*base, "cmux12s-mac-mini", "cmux13s-mac-mini", "--apply")[0], 0)
+        shutil.move(self.homes / "cmux13s-mac-mini", self.homes.parent / "away")
+        code, report = self.cli(*base, "cmux12s-mac-mini", "--apply")
+        self.assertTrue(report["dropped"]["cmux13s-mac-mini"].startswith("kept its line"), report)
+        self.assertTrue(any("glaeda-lan-cache@cmux13s-mac-mini" in line for line in self.authorized()))
+
+    def test_a_client_that_moved_to_another_host_keeps_that_host(self):
+        base = ("cache", "--host", "cmux15", "--address", "172.20.21.202")
+        self.assertEqual(self.cli(*base, "cmux12s-mac-mini", "cmux13s-mac-mini", "--apply")[0], 0)
+        conf = self.homes / "cmux13s-mac-mini/.config/glaeda/lan-cache/config.json"
+        moved = {**json.loads(conf.read_text()), "host": "cmux14"}
+        conf.write_text(json.dumps(moved))
+        code, report = self.cli(*base, "cmux12s-mac-mini", "--apply")
+        self.assertEqual(code, 0, report)
+        self.assertEqual(json.loads(conf.read_text())["host"], "cmux14")
+        self.assertFalse(any("glaeda-lan-cache@cmux13s-mac-mini" in line for line in self.authorized()))
+
+    def test_a_refused_key_is_never_pinged_or_configured(self):
+        self.assertEqual(self.cli("cache", "--host", "cmux15", "--address", "172.20.21.202", "cmux12s-mac-mini",
+                                  "--apply")[0], 0)
+        # cmux13s's key is the same as cmux12s's: authorized for something else, so refused.
+        for name in ("id_ed25519", "id_ed25519.pub"):
+            src = self.homes / "cmux12s-mac-mini/.config/glaeda/lan-cache" / name
+            dst = self.homes / "cmux13s-mac-mini/.config/glaeda/lan-cache" / name
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(src.read_bytes())
+        code, report = self.cli("cache", "--host", "cmux15", "--address", "172.20.21.202", "cmux12s-mac-mini",
+                                "cmux13s-mac-mini", "--apply")
+        self.assertEqual(code, 1, report)
+        self.assertTrue(report["clients"]["cmux13s-mac-mini"]["authorized"].startswith("refused"))
+        self.assertNotEqual(report["clients"]["cmux13s-mac-mini"]["ping"], "glaeda-seed-serve 1 pong")
+        self.assertFalse((self.homes / "cmux13s-mac-mini/.config/glaeda/lan-cache/config.json").exists())
+
     def test_a_regenerated_client_key_replaces_its_line(self):
         self.install("cmux12s-mac-mini")
         conf = self.homes / "cmux12s-mac-mini/.config/glaeda/seed-lan"

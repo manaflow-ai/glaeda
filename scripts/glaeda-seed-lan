@@ -9,6 +9,7 @@
     glaeda-seed-lan mesh HOST HOST ... [--address HOST=IP] [--from CIDRS] [--apply]   product mesh (below)
     glaeda-seed-lan mesh-remove HOST ... [--apply]
     glaeda-seed-lan helper-install HOST ... [--admin USER] [--apply]   root-owned glaeda-lan-fetch (prints)
+    glaeda-seed-lan cache --host cmux15 --address IP [--from CIDRS] HOST ... [--apply]   the LAN cache (below)
 
 Run from this repository on the operator Mac, which reaches every host over SSH as the fleet user. Planning
 reads only. `install --apply`:
@@ -47,6 +48,15 @@ which answers product verbs only, from that mini's product cache. Any PR mini ma
 verifies the sha256 GitHub recorded, never the server. Keys are validated and deduplicated as for seeds;
 it adds and replaces only its own lines (comment glaeda-lan-mesh@HOST). mesh-remove takes the mesh off
 the given hosts (their mesh directory and every mesh line in their authorized_keys).
+
+`cache` makes --host the site's LAN cache host (the fleet registry's lan-cache role) and each HOST its
+client, so a CI cache object or a git object crosses the site's uplink once. Like `install`: the host must
+be trusted-only (glaeda-seed-serve --role cache refuses otherwise); each HOST gets ~/.config/glaeda/lan-cache/
+with its own key, known_hosts pinning the host's key under the alias glaeda-lan-cache, and config.json
+(`source: lan`, the host's addresses), which glaeda-git-mirror and glaeda-lan-fetch's broker read; the host
+authorizes each key with restrict,from="CIDRS",command="... glaeda-seed-serve --role cache" (comment
+glaeda-lan-cache@HOST). The host's own config says `source: direct`: it alone fetches from GitHub and the
+buckets. A host without that config keeps no git mirror at all.
 
 `helper-install` checks this checkout's scripts/glaeda-lan-fetch at HELPER_PATH on each HOST (root:wheel
 0755 in root:wheel 0755 directories: the only copy cmux CI will run), reading each host's copy and
@@ -215,7 +225,7 @@ print(json.dumps(out))
 CLIENT_REMOTE = r'''
 import json, os, shutil, subprocess, sys
 args = json.loads(sys.argv[1])
-if args.get("dir", "seed-lan") not in ("seed-lan", "lan-mesh"):
+if args.get("dir", "seed-lan") not in ("seed-lan", "lan-mesh", "lan-cache"):
     sys.exit("unknown directory")
 d = os.path.expanduser("~/.config/glaeda/" + args.get("dir", "seed-lan"))
 key, kh, conf = os.path.join(d, "id_ed25519"), os.path.join(d, "known_hosts"), os.path.join(d, "config.json")
@@ -238,15 +248,28 @@ if mode == "apply":
         subprocess.run([keygen, "-q", "-t", "ed25519", "-N", "", "-C", args["comment"], "-f", key], check=True,
                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
         changed.append("key")
-    for path, text in ((kh, args["known_hosts"]), (conf, args["config"])):
-        if read(path) != text:
+    # A new host pin is staged beside the live one until the host answers it, then written with the config.
+    for path, text in ((kh + ".next", args.get("next_known_hosts")), (kh, args["known_hosts"]), (conf, args["config"])):
+        if text is not None and read(path) != text:
             tmp = path + ".tmp-%d" % os.getpid()
             with open(tmp, "w") as f:
                 f.write(text)
             os.chmod(tmp, 0o600)
             os.replace(tmp, path)
             changed.append(os.path.basename(path))
+    if args["config"] is not None and os.path.lexists(kh + ".next"):
+        os.unlink(kh + ".next")
     out["public_key"] = " ".join(read(key + ".pub").split()[:2])
+elif mode == "unconfigure":
+    try:
+        parsed = json.loads(out["config"]) if out["config"] else None
+    except ValueError:
+        parsed = None
+    names = parsed.get("host") if isinstance(parsed, dict) else None
+    # Only a LAN path to this host: a client that has since moved to another cache host keeps that one.
+    if os.path.lexists(conf) and (args.get("host") is None or names in (None, args["host"])):
+        os.unlink(conf)
+        changed.append("config.json")
 elif mode == "remove":
     if os.path.isdir(d):
         shutil.rmtree(d)
@@ -419,6 +442,136 @@ def install(seeder: str, hosts: list[str], addresses: list[str], cidrs: str, use
         "then tail -n 1 ~/Library/Logs/glaeda-seed-prefetch.jsonl (look for results.*.lan)",
     ] if apply else ["rerun with --apply"]
     report["ok"] = not any(str(h.get("authorized", "")).startswith("refused") for h in report["hosts"].values())
+    return report
+
+
+CACHE_TAG = "glaeda-lan-cache@"
+CACHE_ROLE = " --role cache"
+PONG = "glaeda-seed-serve 1 pong"
+CACHE_HOST_KEY_ALIAS = "glaeda-lan-cache"  # glaeda-git-mirror and glaeda-lan-fetch LAN_HOST_KEY_ALIAS
+
+
+def cache(host: str, clients: list[str], addresses: list[str], cidrs: str, user: str, apply: bool) -> dict:
+    """The LAN cache host and its clients (see the module docstring)."""
+    check_names(host, clients, addresses, cidrs)
+    if len(set(clients)) != len(clients):
+        raise Failure("a client is named twice")
+    serve = (SCRIPT_DIR / "glaeda-seed-serve").read_bytes()
+    serve_sha = hashlib.sha256(serve).hexdigest()
+    if b'"cache"' not in serve:
+        raise Failure("this checkout's glaeda-seed-serve has no cache role")
+    report: dict = {"tool": "glaeda-seed-lan", "mode": "cache", "apply": apply, "host": host, "clients": {}}
+    probe = remote(host, SEEDER_REMOTE, {"mode": "probe", "tag": CACHE_TAG, "command_suffix": CACHE_ROLE})
+    forbidden = {name.lower() for name in NEVER_SEEDERS}
+    if any(name.lower() in forbidden for name in probe.get("names", [])):
+        raise Failure(f"{host} is {probe['names']}, which runs PR code: it can never be the cache host")
+    if probe.get("ak_symlink"):
+        raise Failure(f"{host}: ~/.ssh/authorized_keys is a symlink; refusing to replace it")
+    if not probe["trusted_ref"]:
+        raise Failure(f"{host}: its glaeda runner receipt names no trusted ref; refusing to make it the cache host")
+    if not probe["host_key"].startswith("ssh-ed25519 "):
+        raise Failure(f"{host}: no ed25519 host key")
+    direct = json.dumps({"schema": 1, "source": "direct"}, indent=1) + "\n"
+    state = remote(host, CLIENT_REMOTE, {"mode": "apply" if apply else "probe", "dir": "lan-cache",
+                                         "comment": CACHE_TAG + host, "known_hosts": "", "config": direct})
+    report["host_state"] = {"serve": "current" if probe["serve_sha"] == serve_sha else
+                                     ("stale" if probe["serve_sha"] else "missing"),
+                            "config": "current" if state["config"] == direct else "pending"}
+    known_hosts = f"{CACHE_HOST_KEY_ALIAS} {probe['host_key']}\n"
+    config = json.dumps({"schema": 1, "source": "lan", "host": host, "user": user, "addresses": addresses},
+                        indent=1) + "\n"
+    options = f'restrict,from="{cidrs}",command="{forced_command(probe, host, CACHE_ROLE)}"'
+    lines, manifest_keys, seen = [], [], set()
+    for client in clients:
+        comment = CACHE_TAG + client
+        # The key and the pinned host key first: the config that turns the LAN path on is written only once
+        # the host answers this client's key (below), so a client is never pointed at a host that refuses it.
+        state = remote(client, CLIENT_REMOTE, {"mode": "apply" if apply else "probe", "dir": "lan-cache",
+                                               "comment": comment, "known_hosts": None, "config": None,
+                                               "next_known_hosts": known_hosts})
+        entry = {"changed": state.get("changed", []),
+                 "config": "current" if state["config"] == config else ("stale" if state["config"] else "missing")}
+        public_key = state.get("public_key", "")
+        blob = public_key.split()[1] if ed25519_blob(public_key) else ""
+        others = {line.split()[-2] for c, line in probe["authorized"].items() if c != comment}
+        if public_key and not blob:
+            entry["authorized"] = "refused: not a well-formed ssh-ed25519 key"
+        elif blob and (blob in probe.get("foreign_blobs", []) or blob in others or blob in seen):
+            entry["authorized"] = "refused: this key is already authorized on the host for something else"
+        elif blob:
+            seen.add(blob)
+            line = f"{options} {public_key} {comment}"
+            lines.append(line)
+            entry["authorized"] = "current" if probe["authorized"].get(comment) == line else "pending"
+            manifest_keys.append({"id": f"lan-cache-{client}", "fingerprint": fingerprint(public_key),
+                                  "comment": comment, "status": "active", "options": options,
+                                  "role": f"the LAN cache: {client} reads CI cache objects and git mirrors from "
+                                          f"{host} (glaeda-seed-serve --role cache, forced command)",
+                                  "public_key": f"{public_key} {comment}"})
+        else:
+            entry["authorized"] = "no key yet"
+        report["clients"][client] = entry
+    # A client this run leaves out is dropped: its LAN config first, then its line on the host. One that cannot
+    # be reached keeps both (a consistent pair) until a later run can unconfigure it.
+    report["dropped"], drop = {}, []
+    for comment in sorted(probe["authorized"]):
+        former = comment[len(CACHE_TAG):]
+        if not comment.startswith(CACHE_TAG) or former in clients:
+            continue
+        if not apply:
+            report["dropped"][former] = "would unconfigure"
+            continue
+        try:
+            remote(former, CLIENT_REMOTE, {"mode": "unconfigure", "dir": "lan-cache", "host": host})
+            report["dropped"][former] = "unconfigured"
+            drop.append(comment)
+        except Failure as error:
+            report["dropped"][former] = f"kept its line: {error}"
+    if apply:
+        done = remote(host, SEEDER_REMOTE, {"mode": "apply", "tag": CACHE_TAG, "serve_sha": serve_sha, "drop": drop,
+                                            "keep_backups": KEEP_BACKUPS, "command_suffix": CACHE_ROLE,
+                                            "serve_b64": base64.b64encode(serve).decode(), "lines": lines})
+        report["host_state"]["changed"] = done.get("changed", [])
+        pm = prefetch_module()
+        pings = []
+        for address in addresses:  # a client uses every address in turn, so any one answering is enough
+            argv = pm.ssh_command({"user": user, "identity": "{home}/.config/glaeda/lan-cache/id_ed25519",
+                                   "known_hosts": "{home}/.config/glaeda/lan-cache/known_hosts.next"}, address,
+                                  "ping-v1")
+            argv[0] = CLIENT_SSH
+            argv[argv.index(f"HostKeyAlias={pm.LAN_HOST_KEY_ALIAS}")] = f"HostKeyAlias={CACHE_HOST_KEY_ALIAS}"
+            pings.append(argv)
+        failed = []
+        for client in clients:
+            entry = report["clients"][client]
+            if entry["authorized"] in ("current", "pending"):
+                for argv in pings:
+                    ping = remote(client, CLIENT_REMOTE, {"mode": "ping", "dir": "lan-cache", "argv": argv})
+                    entry["ping"] = ping.get("answer") or f"status {ping.get('status')}: {ping.get('error', '')}"
+                    if entry["ping"] == PONG:
+                        break
+            else:
+                entry["ping"] = "not asked: its key is not authorized"
+            if entry["ping"] != PONG:
+                # Fail closed: a client the host does not answer keeps no LAN path (it reads the bucket).
+                done = remote(client, CLIENT_REMOTE, {"mode": "unconfigure", "dir": "lan-cache"})
+                entry["changed"] = sorted({*entry["changed"], *done.get("changed", [])})
+                entry["config"] = "missing"
+                failed.append(CACHE_TAG + client)
+                continue
+            done = remote(client, CLIENT_REMOTE, {"mode": "apply", "dir": "lan-cache", "comment": CACHE_TAG + client,
+                                                  "known_hosts": known_hosts, "config": config})
+            entry["changed"] = sorted({*entry["changed"], *done.get("changed", [])})
+            entry["config"] = "current" if done["config"] == config else "pending"
+        if failed:  # and the host stops authorizing a key no client uses
+            remote(host, SEEDER_REMOTE, {"mode": "apply", "tag": CACHE_TAG, "serve_sha": serve_sha, "drop": failed,
+                                         "keep_backups": KEEP_BACKUPS, "command_suffix": CACHE_ROLE,
+                                         "serve_b64": "", "lines": []})
+            failed_ids = {f"lan-cache-{c[len(CACHE_TAG):]}" for c in failed}
+            manifest_keys = [k for k in manifest_keys if k["id"] not in failed_ids]
+    report["manifest_keys"] = manifest_keys
+    report["ok"] = not any(str(c.get("authorized", "")).startswith("refused") or (apply and c.get("ping") != PONG)
+                           for c in report["clients"].values())
     return report
 
 
@@ -745,6 +898,13 @@ def main(argv: list[str]) -> int:
     hin.add_argument("--admin", default="ADMIN", help="the non-cmux admin account the printed commands use")
     hin.add_argument("--apply", action="store_true")
     hin.add_argument("hosts", nargs="+")
+    cch = sub.add_parser("cache")
+    cch.add_argument("--host", required=True, help="the LAN cache host (fleet registry role lan-cache)")
+    cch.add_argument("--address", action="append", required=True, help="the host's address as the clients reach it")
+    cch.add_argument("--from", dest="cidrs", default=DEFAULT_FROM, help="authorized_keys from= (comma separated)")
+    cch.add_argument("--user", default="cmux")
+    cch.add_argument("--apply", action="store_true")
+    cch.add_argument("hosts", nargs="+")
     mrm = sub.add_parser("mesh-remove")
     mrm.add_argument("--apply", action="store_true")
     mrm.add_argument("hosts", nargs="+")
@@ -757,6 +917,8 @@ def main(argv: list[str]) -> int:
             report = mesh(args.hosts, overrides, args.cidrs, args.user, args.apply)
         elif args.command == "helper-install":
             report = helper_install(args.hosts, args.apply, args.admin)
+        elif args.command == "cache":
+            report = cache(args.host, args.hosts, args.address, args.cidrs, args.user, args.apply)
         elif args.command == "mesh-remove":
             report = mesh_remove(args.hosts, args.apply)
         else:
