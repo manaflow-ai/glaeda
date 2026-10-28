@@ -280,6 +280,128 @@ class Mirror(unittest.TestCase):
         self.assertEqual(result["seeded"]["because"], "repair pending")
         self.assertFalse((self.mirror / gm.REPAIR_PENDING).exists())
 
+    def test_a_read_that_times_out_fetches_instead_of_reseeding(self) -> None:
+        gm.run(True, home=self.home)
+        head = self.commit("two")
+        real = gm.config_values
+
+        def slow(repo, key):
+            raise subprocess.TimeoutExpired(["git", "config"], 30)
+        gm.config_values = slow
+        try:
+            self.assertEqual(gm.healthy(self.mirror), gm.SLOW)
+            self.downloads.clear()
+            result = gm.run(True, home=self.home)
+        finally:
+            gm.config_values = real
+        self.assertEqual(result["state"], "applied", result)
+        self.assertNotIn("seeded", result)  # a loaded host is not a broken mirror
+        self.assertEqual(self.downloads, [])
+        self.assertIn("slow", result)
+        self.assertEqual(result["heads"]["feat-cmux-next"], sh("git", "rev-parse", "feat-cmux-next", cwd=self.upstream))
+        self.assertEqual(result["heads"]["main"], head)
+        self.assertGreaterEqual(result["fetched_at"], result["time"])  # when the fetch was written, not the start
+
+    def test_a_connectivity_walk_that_times_out_is_not_missing_objects(self) -> None:
+        gm.run(True, home=self.home)
+        (self.mirror / gm.VERIFIED).unlink()
+        real = gm.git
+
+        def walk(repo, *args, **kw):
+            if args[:1] == ("fsck",):
+                raise subprocess.TimeoutExpired(["git", "fsck"], 1)
+            return real(repo, *args, **kw)
+        gm.git = walk
+        try:
+            self.assertIsNone(gm.connected(self.mirror))
+            result = gm.run(True, home=self.home)
+        finally:
+            gm.git = real
+        self.assertEqual(result["state"], "applied", result)
+        self.assertNotIn("seeded", result)
+        self.assertFalse((self.mirror / gm.VERIFIED).exists(), "judged on a later pass")
+
+    def test_a_repair_fetches_the_new_commits_first_and_records_them(self) -> None:
+        gm.run(True, home=self.home)
+        head = self.commit("two")
+        (self.mirror / gm.REPAIR_PENDING).write_text("x\n")
+        seen = {}
+        real = gm.seed
+
+        def watching(mirror, from_github, fetch_url=self.fake_download):
+            seen["record"] = json.loads(gm.RECORD.read_text())  # what health reads while the repair runs
+            seen["main"] = sh("git", "-C", os.fspath(mirror), "rev-parse", "main")
+            return real(mirror, from_github, fetch_url)
+        gm.seed = watching
+        try:
+            result = gm.run(True, home=self.home)
+        finally:
+            gm.seed = real
+        self.assertEqual(result["state"], "applied", result)
+        self.assertEqual(result["seeded"]["because"], "repair pending")
+        self.assertEqual(seen["main"], head)
+        self.assertEqual(seen["record"]["state"], "repairing")
+        self.assertTrue(seen["record"]["fetch"]["ok"])
+        self.assertGreaterEqual(seen["record"]["fetched_at"], seen["record"]["time"])
+
+    def test_a_repair_whose_last_fetch_fails_keeps_the_early_fetch_s_tips(self) -> None:
+        gm.run(True, home=self.home)
+        head = self.commit("newer than the bundle")
+        (self.mirror / gm.REPAIR_PENDING).write_text("x\n")
+        real_seed, real_fetch = gm.seed, gm.fetch
+        calls = []
+
+        def fetching(mirror, url, **kw):
+            calls.append(url)
+            return real_fetch(mirror, url, **kw) if len(calls) == 1 else {"ok": False, "tries": 1, "errors": ["x"]}
+        gm.fetch = fetching
+        try:
+            result = gm.run(True, home=self.home)
+        finally:
+            gm.fetch = real_fetch
+        self.assertEqual(result["state"], "fetch-failed", result)
+        self.assertEqual(result["seeded"]["because"], "repair pending")
+        self.assertEqual(sh("git", "-C", os.fspath(self.mirror), "rev-parse", "main"), head)  # not the bundle's
+
+    def test_a_repair_that_fails_keeps_the_early_fetch_s_tips(self) -> None:
+        gm.run(True, home=self.home)
+        head = self.commit("newer than the bundle")
+        (self.mirror / gm.REPAIR_PENDING).write_text("x\n")
+        real = gm.seed
+
+        def failing(mirror, from_github, fetch_url=self.fake_download):
+            sh("git", "-C", os.fspath(mirror), "update-ref", "refs/heads/main", "main~1")  # as the bundle's tips do
+            raise RuntimeError("bundle unreadable")
+        gm.seed = failing
+        try:
+            result = gm.run(True, home=self.home)
+        finally:
+            gm.seed = real
+        self.assertEqual(result["state"], "error", result)
+        self.assertEqual(sh("git", "-C", os.fspath(self.mirror), "rev-parse", "main"), head)
+
+    def test_a_record_from_before_fetched_at_carries_its_fetch_time(self) -> None:
+        gm.RECORD.write_text(json.dumps({"time": "2026-10-27T20:13:00Z", "fetch": {"ok": True}}) + "\n")
+        written = gm.write_record({"time": "2026-10-27T20:20:00Z", "fetch": {"ok": False}}, gm.last_record())
+        self.assertEqual(written["fetched_at"], "2026-10-27T20:13:00Z")
+
+    def test_a_shallow_or_partial_repair_does_not_fetch_first(self) -> None:
+        gm.run(True, home=self.home)
+        self.assertTrue(gm.early_fetch("repair pending"))
+        self.assertTrue(gm.early_fetch("no nightly-next"))
+        self.assertFalse(gm.early_fetch("shallow"))
+        self.assertFalse(gm.early_fetch("missing"))
+        sh("git", "-C", os.fspath(self.mirror), "config", "remote.origin.promisor", "true")
+        self.assertFalse(gm.early_fetch("repair pending"))
+
+    def test_a_failed_fetch_keeps_the_last_good_fetch_time(self) -> None:
+        first = gm.run(True, home=self.home)
+        gm.REPO_URL = (Path(self.temp.name) / "gone").as_uri()  # restored by setUp's cleanup
+        failed = gm.run(True, home=self.home)
+        self.assertEqual(failed["state"], "fetch-failed", failed)
+        self.assertEqual(failed["fetched_at"], first["fetched_at"])
+        self.assertEqual(json.loads(gm.RECORD.read_text())["fetched_at"], first["fetched_at"])
+
     def test_a_failed_repair_keeps_the_mirror_marked_broken(self) -> None:
         self.commit("two")
         gm.run(True, home=self.home)

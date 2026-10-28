@@ -851,13 +851,14 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
         # The runner mini's full cmux git mirror (scripts/glaeda-git-mirror): a job fetches its commit from this
         # disk, not GitHub. Every minute a fetch of main, feat-cmux-next and nightly-next (under a second with
         # nothing new); a missing mirror is seeded from the R2 bundle. A no-op on a host without a runner.
+        # Not ProcessType Background or LowPriorityIO: the jobs read this mirror, and on a mini at load 90-130
+        # throttled I/O kept each `git config` of a pass from starting within its 30 s (2026-10-27, six minis
+        # 43-120 min behind GitHub while a direct `git config` took 0.02 s). Nice keeps it below the compiles.
         LABEL_PREFIX + "git-mirror": {
             "Label": LABEL_PREFIX + "git-mirror",
             "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-git-mirror"), "--apply"],
             "StartInterval": 60,
             "RunAtLoad": True,
-            "ProcessType": "Background",
-            "LowPriorityIO": True,
             "Nice": 10,
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-git-mirror.jsonl"),
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-git-mirror.err"),
