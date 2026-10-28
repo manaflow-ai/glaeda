@@ -51,6 +51,14 @@ this snapshot; for every account that already has a job, that glaeda-runner-hygi
 and plist with what its --apply leaves, and a stale job is reinstalled by its --apply. A second pass finds them
 current and changes nothing. The report's runnerHygiene says per account: current, stale (with why), or error;
 glaeda-mini-health turns a stale or failed one into disk_root_copy_stale.
+The same pass keeps sandboxd answering (policy `sandbox_probe`). Homebrew pours every bottle under sandbox-exec, and a
+sandboxd whose approval queue waits forever on one tccd request hangs every sandboxed process that touches a denied
+mach service: brew sat 8 h in "Pouring" on austin-0 and austin-1 (2026-10-27; sample: 64 sandboxd.approval threads
+behind one tcc_server_message_request_authorization, and `launchctl kickstart -k system/com.apple.sandboxd` cleared
+it). On an idle fleet mini (no `busy` process, fleet host.lock free and held for the restart, not reserved, not an
+EC2 Mac, no host name holding "lawrence") an --apply pass runs an ad-hoc signed copy of /bin/date under
+`(deny mach-lookup)`. A probe that takes slow_s or longer kickstarts sandboxd, at most once every every_s per mini
+(the attempt is recorded either way), and probes once more to report whether it worked.
 Stdlib only; runs on macOS /usr/bin/python3 (3.9).
 """
 
@@ -59,6 +67,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime
+import fcntl
 import hashlib
 import http.client
 import io
@@ -67,6 +76,7 @@ import os
 import plistlib
 import pwd
 import re
+import shutil
 import signal
 import stat
 import subprocess
@@ -138,7 +148,11 @@ HYGIENE_DAEMONS = Path("/Library/LaunchDaemons")
 HYGIENE_LABEL = "com.teamleaderleo.glaeda.runner-hygiene"  # its LABEL_PREFIX; the plist is <label>.<uid>.plist
 HYGIENE_RECHECK_S = 6 * 3600  # an unchanged, current install is checked again this often (launchd may drop it)
 HYGIENE_TIMEOUT = 120
-HYGIENE_RETRY_S = 900  # a check or reinstall that failed is tried again this long after, not every pass
+HYGIENE_RETRY_S = 900
+# sandboxd's self-heal: fixed here, never from the policy, so no policy file names what root runs or restarts.
+SANDBOXD_TARGET = "system/com.apple.sandboxd"
+SANDBOX_PROBE_PROFILE = "(version 1)(deny mach-lookup)(allow default)"
+SANDBOX_PROBE_SOURCE = "/bin/date"  # copied and ad-hoc signed: a platform binary takes sandboxd's fast path  # a check or reinstall that failed is tried again this long after, not every pass
 
 
 class HealError(RuntimeError):
@@ -180,6 +194,16 @@ def validate_policy(doc: Any) -> dict[str, Any]:
         if d["name"] in names:
             raise HealError(f"policy daemon {d['name']} is listed twice")
         names.add(d["name"])
+    probe = doc.get("sandbox_probe")
+    if probe is not None:
+        if not isinstance(probe, dict) or not isinstance(probe.get("enabled"), bool):
+            raise HealError("policy sandbox_probe needs enabled")
+        for key in ("slow_s", "every_s"):
+            value = probe.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+                raise HealError(f"policy sandbox_probe.{key} must be positive")
+        if probe["slow_s"] > 60:
+            raise HealError("policy sandbox_probe.slow_s must be at most 60")
     release = doc["release"]
     for key in ("every_s", "stale_s"):
         if type(release.get(key)) is not int or release[key] <= 0:
@@ -266,6 +290,61 @@ class Host:
     def now(self) -> float:
         return time.time()
 
+    def sandbox_hold(self, now: float) -> str:
+        """Why sandboxd is left alone here ("" when it may be restarted)."""
+        why = fleet_ops_eligible(FLEET_OPS_DIR) or fleet_ops_hold(now)
+        if why:
+            return why
+        names = {platform_node().lower()}
+        with contextlib.suppress(OSError, KeyError, ValueError, AttributeError):
+            home = Path(pwd.getpwuid(os.stat(FLEET_ROOT).st_uid).pw_dir)
+            host = strict_json(read_small(home / ".config/glaeda/update.json")).get("host")
+            if isinstance(host, str):
+                names.add(host.lower())
+        if any("lawrence" in n for n in names):
+            return "cmux-lawrence: never restarted by a self-heal"
+        return ""
+
+    def sandbox_probe(self, slow_s: float) -> float | None:
+        """Seconds a sandboxed ad-hoc binary takes to run (slow_s when it was killed there); None if it cannot run."""
+        with tempfile.TemporaryDirectory(prefix="glaeda-sandbox-probe.") as d:
+            exe = os.path.join(d, "date")
+            try:
+                shutil.copyfile(SANDBOX_PROBE_SOURCE, exe)
+                os.chmod(exe, 0o700)
+            except OSError:
+                return None
+            if sh(["/usr/bin/codesign", "-f", "-s", "-", exe], timeout=30)[0] != 0:
+                return None
+            start = time.monotonic()
+            try:
+                subprocess.run(["/usr/bin/sandbox-exec", "-p", SANDBOX_PROBE_PROFILE, exe], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=slow_s, check=False)
+            except subprocess.TimeoutExpired:
+                return float(slow_s)
+            except OSError:
+                return None
+            return time.monotonic() - start
+
+    def with_host_lock(self, fn):
+        """fn() while holding the fleet host.lock exclusively, so no job is admitted; None if it is held now."""
+        try:
+            fd = os.open(FLEET_ROOT / "host.lock", os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except OSError:
+            return None
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return None
+            return fn()
+        finally:
+            os.close(fd)
+
+    def kickstart_sandboxd(self) -> tuple[int, str]:
+        code, out, err = sh(["/bin/launchctl", "kickstart", "-k", SANDBOXD_TARGET], timeout=30)
+        return code, (out + err).strip()[:200]
+
 
 # ---------------------------------------------------------------- one pass
 
@@ -298,6 +377,54 @@ def restart(host: Host, policy: dict[str, Any], daemon: dict[str, Any], pid: int
     fresh = [p for p, _u, _c, exe in host.processes() if exe == daemon["path"]]
     return True, f"{daemon['name']} pid {pid} stopped ({how}); " + (
         f"launchd started pid {fresh[0]}" if fresh else "launchd starts it on demand")
+
+
+def sandbox_pass(host: Host, policy: dict[str, Any], state: dict[str, Any], now: float, busy: list[str],
+                 apply: bool, actions: list, healed: list) -> tuple[dict[str, Any], dict[str, Any]]:
+    """(state, report) for sandboxd's self-heal. State: {"last": t of the last kickstart attempt}."""
+    probe = policy.get("sandbox_probe") or {}
+    mine = {k: v for k, v in (state.get("sandbox") or {}).items() if k == "last" and isinstance(v, (int, float))}
+    if not probe.get("enabled"):
+        return mine, {"skipped": "off in the policy"}
+    if busy:
+        return mine, {"skipped": f"host busy ({', '.join(busy)})"}
+    hold = host.sandbox_hold(now)
+    if hold:
+        return mine, {"skipped": hold}
+    if not apply:
+        return mine, {"skipped": "probed under --apply only"}
+    slow = probe["slow_s"]
+    took = host.sandbox_probe(slow)
+    report: dict[str, Any] = {"probe_s": None if took is None else round(took, 2)}
+    if took is None:
+        report["error"] = "the probe could not run"
+        return mine, report
+    if took < slow:
+        return mine, report
+    last = mine.get("last")
+    if last is not None and now - last < probe["every_s"]:
+        report["waiting"] = f"sandboxd was kickstarted at {iso(last)}; at most once every {probe['every_s']} s"
+        return mine, report
+
+    def kick():
+        mine["last"] = now  # an attempt counts whatever it does
+        return host.kickstart_sandboxd()
+
+    done = host.with_host_lock(kick)
+    if done is None:
+        report["waiting"] = "fleet host.lock is held; a later idle pass restarts it"
+        return mine, report
+    code, out = done
+    after = host.sandbox_probe(slow)
+    ok = code == 0 and after is not None and after < slow
+    what = (f"sandbox probe {took:.1f} s >= {slow} s: launchctl kickstart -k {SANDBOXD_TARGET} exited {code}"
+            f"{': ' + out if out else ''}; probe after: " + ("failed to run" if after is None else f"{after:.2f} s"))
+    actions.append({"name": "sandboxd", "ok": ok, "action": what})
+    report["probe_after_s"] = None if after is None else round(after, 2)
+    if ok:
+        healed.append({"name": "sandboxd", "t": now, "at": iso(now), "since": iso(now), "probe_s": round(took, 2),
+                       "action": what})
+    return mine, report
 
 
 def reconcile(host: Host, policy: dict[str, Any], state: dict[str, Any], apply: bool) -> tuple[dict, dict]:
@@ -371,8 +498,10 @@ def reconcile(host: Host, policy: dict[str, Any], state: dict[str, Any], apply: 
         else:
             entry["waiting"] = what
             hot.append(entry)
-    new_state = {"samples": samples, "restarts": restarts, "healed": healed}
-    report = {"schema": SCHEMA, "at": iso(now), "busy": busy, "hot": hot, "healed": healed, "actions": actions}
+    sandbox_state, sandbox = sandbox_pass(host, policy, state, now, busy, apply, actions, healed)
+    new_state = {"samples": samples, "restarts": restarts, "healed": healed, "sandbox": sandbox_state}
+    report = {"schema": SCHEMA, "at": iso(now), "busy": busy, "hot": hot, "healed": healed, "actions": actions,
+              "sandbox": sandbox}
     return new_state, report
 
 

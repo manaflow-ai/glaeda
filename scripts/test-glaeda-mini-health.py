@@ -2619,13 +2619,17 @@ class DaemonHeal(Base):
         root.write_text(json.dumps({"hot": [{"name": "fseventsd", "pid": 421, "cores": 1.02, "since": "x",
                                              "hot_for_s": 5400, "waiting": "restarts at 2 h"}],
                                     "healed": [{"name": "audiomxd", "t": NOW - 60, "at": "a", "since": "s",
-                                                "cores": 1.1, "action": "audiomxd pid 5 stopped (SIGTERM)"}]}))
+                                                "cores": 1.1, "action": "audiomxd pid 5 stopped (SIGTERM)"},
+                                               {"name": "sandboxd", "t": NOW - 30, "at": "b", "since": "b",
+                                                "probe_s": 5.0, "action": "launchctl kickstart"}]}))
         self.mini.heal_status = {"installed": True, "current": True, "loaded": True, "reportFresh": True,
                                  "report": os.fspath(root)}
         r = self.run_once()
         f = r["findings"]
         self.assertEqual([x["id"] for x in f], ["daemon_hot:fseventsd"])
-        self.assertEqual([(h["id"], h["auto_fix"]) for h in r["healed"]], [("daemon_hot:audiomxd", "done")])
+        self.assertEqual([(h["id"], h["auto_fix"]) for h in r["healed"]],
+                         [("daemon_hot:audiomxd", "done"), ("sandboxd_wedged:sandboxd", "done")])
+        self.assertEqual(r["healed"][1]["evidence"], "sandbox probe took 5.0 s")
         self.assertIn("1.5 h", f[0]["evidence"])
         self.assertIn("restarts at 2 h", f[0]["note"])
 

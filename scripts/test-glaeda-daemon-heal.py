@@ -53,6 +53,26 @@ class FakeHost(heal.Host):
         self.survives_term = False
         self.sizes: dict[int, int] = {}  # pid -> footprint bytes
         self.asked: list[list[int]] = []
+        self.probes: list[float | None] = []  # sandbox probe answers, in order; empty: a healthy 0.1 s
+        self.probed = 0
+        self.hold = ""
+        self.lock_held = False
+        self.kicks: list[float] = []
+        self.kick_result = (0, "")
+
+    def sandbox_hold(self, now: float) -> str:
+        return self.hold
+
+    def sandbox_probe(self, slow_s: float):
+        self.probed += 1
+        return self.probes.pop(0) if self.probes else 0.1
+
+    def with_host_lock(self, fn):
+        return None if self.lock_held else fn()
+
+    def kickstart_sandboxd(self):
+        self.kicks.append(self.t)
+        return self.kick_result
 
     def add(self, pid: int, exe: str, rate: float, uid: int = 0) -> None:
         self.procs[pid] = [uid, 0.0, exe, rate]
@@ -336,6 +356,91 @@ class Guards(Base):
             heal.install(POLICY_PATH, True, expect_sha256="nothex")
         with self.assertRaisesRegex(heal.HealError, "policy sha256"):  # shasum's "<hash>  -" is accepted for the script
             heal.install(POLICY_PATH, True, expect_sha256=good + "  -", expect_policy_sha256="0" * 64)
+
+
+class SandboxHeal(Base):
+    """sandboxd's self-heal: a slow sandbox probe on an idle, unheld mini kickstarts it, at most every every_s."""
+
+    def test_the_policy_turns_it_on_with_a_5_s_probe_and_a_6_h_window(self) -> None:
+        self.assertEqual((POLICY["sandbox_probe"]["enabled"], POLICY["sandbox_probe"]["slow_s"],
+                          POLICY["sandbox_probe"]["every_s"]), (True, 5, 6 * 3600))
+
+    def test_a_fast_probe_does_nothing(self) -> None:
+        report = self.tick()
+        self.assertEqual(report["sandbox"], {"probe_s": 0.1})
+        self.assertEqual((self.host.kicks, report["actions"]), ([], []))
+
+    def test_a_slow_probe_kickstarts_once_and_reports_the_probe_after(self) -> None:
+        self.host.probes = [5.0, 0.1]
+        report = self.tick()
+        self.assertEqual(len(self.host.kicks), 1)
+        self.assertEqual(report["sandbox"], {"probe_s": 5.0, "probe_after_s": 0.1})
+        self.assertTrue(report["actions"][0]["ok"])
+        self.assertIn("kickstart -k system/com.apple.sandboxd", report["actions"][0]["action"])
+        self.assertEqual(report["healed"][-1]["name"], "sandboxd")
+
+    def test_at_most_once_every_6_h_even_when_the_kick_did_not_help(self) -> None:
+        self.host.probes = [9.0, 9.0]
+        report = self.tick()
+        self.assertFalse(report["actions"][0]["ok"])
+        self.assertEqual(report["healed"], [])
+        for _ in range(int(6 * 3600 / self.policy["every_s"]) - 1):
+            self.host.probes = [9.0]
+            report = self.tick()
+            self.assertEqual(report["actions"], [])
+        self.assertEqual(len(self.host.kicks), 1)
+        self.assertIn("at most once every", report["sandbox"]["waiting"])
+        self.host.probes = [9.0, 0.1]
+        report = self.tick(self.policy["every_s"] * 2)
+        self.assertEqual(len(self.host.kicks), 2)
+        self.assertTrue(report["actions"][0]["ok"])
+
+    def test_never_while_busy_held_reserved_or_on_lawrence(self) -> None:
+        self.host.add(500, "/Users/cmux/actions-runner-glaeda/bin/Runner.Worker", 0.1, uid=502)
+        self.host.probes = [9.0]
+        self.assertIn("host busy", self.tick()["sandbox"]["skipped"])
+        self.assertEqual(self.host.probed, 0)
+        self.host.procs.pop(500)
+        for hold in ("reserved until 2026-10-28T00:00:00Z", "cmux-lawrence: never restarted by a self-heal"):
+            self.host.hold = hold
+            self.assertEqual(self.tick()["sandbox"], {"skipped": hold})
+        self.assertEqual((self.host.probed, self.host.kicks), (0, []))
+
+    def test_a_held_host_lock_waits_and_does_not_use_up_the_window(self) -> None:
+        self.host.probes, self.host.lock_held = [9.0], True
+        report = self.tick()
+        self.assertIn("host.lock is held", report["sandbox"]["waiting"])
+        self.assertEqual(self.host.kicks, [])
+        self.host.probes, self.host.lock_held = [9.0, 0.1], False
+        self.assertTrue(self.tick()["actions"][0]["ok"])
+
+    def test_a_plan_pass_or_an_off_policy_never_probes(self) -> None:
+        self.host.probes = [9.0]
+        self.assertEqual(self.tick(apply=False)["sandbox"], {"skipped": "probed under --apply only"})
+        self.policy["sandbox_probe"]["enabled"] = False
+        self.assertEqual(self.tick()["sandbox"], {"skipped": "off in the policy"})
+        self.assertEqual(self.host.probed, 0)
+
+    def test_a_probe_that_cannot_run_is_an_error_not_a_restart(self) -> None:
+        self.host.probes = [None]
+        self.assertEqual(self.tick()["sandbox"], {"probe_s": None, "error": "the probe could not run"})
+        self.assertEqual(self.host.kicks, [])
+
+    def test_the_policy_block_is_validated_and_optional(self) -> None:
+        doc = copy.deepcopy(POLICY)
+        del doc["sandbox_probe"]
+        heal.validate_policy(doc)
+        for bad in ({"enabled": "yes", "slow_s": 5, "every_s": 60}, {"enabled": True, "slow_s": 0, "every_s": 60},
+                    {"enabled": True, "slow_s": 120, "every_s": 60}, []):
+            doc["sandbox_probe"] = bad
+            with self.assertRaises(heal.HealError):
+                heal.validate_policy(doc)
+
+    @unittest.skipUnless(sys.platform == "darwin" and os.path.exists("/usr/bin/sandbox-exec"), "macOS only")
+    def test_the_real_probe_runs_here(self) -> None:
+        took = heal.Host().sandbox_probe(5)
+        self.assertIsNotNone(took)
+        self.assertLess(took, 5)
 
 
 class Install(unittest.TestCase):
