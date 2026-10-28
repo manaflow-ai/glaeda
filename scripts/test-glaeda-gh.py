@@ -148,7 +148,7 @@ class FakeGitHub:
                                    "branch": {"name": run["head_branch"]} if run.get("head_branch") else None}}
                 i += 1
             if "object(oid:" in doc["query"]:
-                for m in re.finditer(r'(?:h(\d+): )?repository\(owner:"([^"]+)",name:"([^"]+)"\)\{object\(oid:"([0-9a-f]+)"\)'
+                for m in re.finditer(r'(?:([hm]\d+): )?repository\(owner:"([^"]+)",name:"([^"]+)"\)\{object\(oid:"([0-9a-f]+)"\)'
                                      r'\{\.\.\. on Commit\{statusCheckRollup\{contexts\(first:100(?:, after:"(\d+)")?\)', doc["query"]):
                     alias, owner, repo, sha, after = m.groups()
                     nodes = self.heads.get((owner, repo, sha))
@@ -156,8 +156,7 @@ class FakeGitHub:
                     node = None if nodes is None else {"statusCheckRollup": {"contexts": {
                         "pageInfo": {"hasNextPage": start + 100 < len(nodes), "endCursor": str(start + 100)},
                         "nodes": nodes[start:start + 100]}}}
-                    data["repository" if alias is None else f"h{alias}"] = {"object": node} if alias is not None else {
-                        "object": node}
+                    data["repository" if alias is None else alias] = {"object": node}
                 out = {"data": data}
                 return 200, self.rate("graphql", self.graphql_remaining), json.dumps(out).encode()
             comments = "issueOrPullRequest" in doc["query"]
@@ -4291,6 +4290,34 @@ class HeadChecksTest(Base):
         self.daemon.tick(NOW)
         entry = gg.read_cache(self.key("d" * 40))
         self.assertTrue(entry["missing"])
+
+    def test_a_glaeda_head_counts_the_forks_checks_at_that_commit(self) -> None:
+        # main is verified in manaflow-ai/glaeda on Blacksmith; the personal repository has no Verify for a main head
+        self.gh.heads[("teamleaderleo", "glaeda", SHA_A)] = [check_run("Release / build")]
+        self.gh.heads[("manaflow-ai", "glaeda", SHA_A)] = [check_run(f"Verify / job {i}") for i in range(120)] + [
+            check_run("Verify / ci-status", "COMPLETED", "FAILURE")]
+        key = gg.parse_key("head", f"teamleaderleo/glaeda@{SHA_A}")
+        gg.register(key, consumer="autoland")
+        self.daemon.tick(NOW)
+        found = gg.read_cache(key)["data"]["found"]
+        self.assertEqual(found["check / Release / build"], ["completed", "success"])
+        self.assertEqual(found["check / Verify / ci-status"], ["completed", "failure"])  # past the fork's first page
+        self.assertEqual(len(found), 122)
+        self.assertEqual(len(self.gh.gql_calls()), 2)  # one batched query for both repositories, one further page
+
+    def test_a_glaeda_head_the_fork_lacks_has_only_its_own_checks(self) -> None:
+        self.gh.heads[("teamleaderleo", "glaeda", SHA_B)] = [check_run("Release / build")]
+        key = gg.parse_key("head", f"teamleaderleo/glaeda@{SHA_B}")
+        gg.register(key, consumer="autoland")
+        self.daemon.tick(NOW)
+        entry = gg.read_cache(key)
+        self.assertFalse(entry.get("missing"))
+        self.assertEqual(entry["data"]["found"], {"check / Release / build": ["completed", "success"]})
+
+    def test_other_repositories_read_only_their_own_checks(self) -> None:
+        gg.register(self.key(SHA_A), consumer="autoland")
+        self.daemon.tick(NOW)
+        self.assertNotIn(b"manaflow-ai", self.gh.gql_calls()[0][3] or b"")
 
     def test_checks_command_serves_cache_and_reports_what_it_could_not_read(self) -> None:
         gg.BASE.mkdir(parents=True, exist_ok=True)

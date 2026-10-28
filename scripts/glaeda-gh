@@ -315,6 +315,10 @@ HEAD_SETTLED_TTL = 600  # a head whose checks all finished is re-read this rarel
 HEAD_PENDING_TTL = 90  # a head with checks still running is re-read this often while someone wants it
 HEAD_INTEREST = 600  # a consumer that asked this recently still wants the head read
 HEAD_BATCH_MAX_CONTEXTS_PAGES = 20  # pages of 100 checks one head is followed through; more is an error, not a verdict
+# (owner, repo) -> the repository whose checks at the same commit are this one's checks of record too. Both mains of
+# glaeda hold the same commits (sync-main.yml), and Verify (ci.yml) verifies every main head in the fork on
+# Blacksmith, not in the personal-account repository, so a teamleaderleo/glaeda head's checks include the fork's.
+CHECKS_OF_RECORD = {("teamleaderleo", "glaeda"): ("manaflow-ai", "glaeda")}
 HEAD_MISSING_RETRY = 600  # a commit GitHub does not know is asked about this rarely
 CONSUMER_WINDOW = 3600
 CONSUMER_DEFAULTS = {"reserved": {"autoland": 1500}, "limit": 240, "pool": 600}  # head reads an hour
@@ -2447,6 +2451,8 @@ class Daemon:
         for i, e in enumerate(entries):
             _, owner, repo, sha = split_key(e["key"])
             parts.append(f"h{i}: " + head_query(owner, repo, sha))
+            if (owner, repo) in CHECKS_OF_RECORD:
+                parts.append(f"m{i}: " + head_query(*CHECKS_OF_RECORD[(owner, repo)], sha))
         self.reads += [(self.now, "head", "graphql")] * len(entries)
         doc, error = self.graphql("query{rateLimit{limit remaining resetAt cost}\n" + "\n".join(parts) + "}", {})
         if doc is None:
@@ -2468,7 +2474,12 @@ class Daemon:
                 self.store(e["key"], e["cache"], error="no such commit", missing=True)
                 self.refund(e["key"])
                 continue
-            result = self.head_pages(owner, repo, sha, (node or {}).get("contexts") or {})
+            sources = [(owner, repo, (node or {}).get("contexts") or {})]
+            if (owner, repo) in CHECKS_OF_RECORD:
+                # the fork may not have the commit yet (sync-main lags): then it adds nothing
+                record = ((data.get(f"m{i}") or {}).get("object") or {}).get("statusCheckRollup") or {}
+                sources.append((*CHECKS_OF_RECORD[(owner, repo)], record.get("contexts") or {}))
+            result = self.head_pages(sha, sources)
             if isinstance(result, str):
                 self.store(e["key"], e["cache"], error=result)
                 self.refund(e["key"])
@@ -2476,25 +2487,29 @@ class Daemon:
                 self.store(e["key"], e["cache"], error=None, dataAt=self.now, data=result)
                 self.payer.pop(e["key"], None)  # answered: the charge stands
 
-    def head_pages(self, owner: str, repo: str, sha: str, contexts: dict) -> dict | str:
-        """A head's data from its first page of contexts, following the rest page by page; an error message
-        when a later page cannot be read (the head keeps its older answer)."""
+    def head_pages(self, sha: str, sources: list[tuple[str, str, dict]]) -> dict | str:
+        """A head's data from the first page of its contexts in each repository of `sources` ((owner, repo,
+        contexts): the head's own, then its CHECKS_OF_RECORD repository's), following the rest page by page; an
+        error message when a later page cannot be read (the head keeps its older answer)."""
         runs: dict = {}
         statuses: dict = {}
         ids: dict = {}
-        for _ in range(HEAD_BATCH_MAX_CONTEXTS_PAGES):
-            fold_contexts(contexts.get("nodes"), runs, statuses, ids)
-            page = contexts.get("pageInfo") or {}
-            if not page.get("hasNextPage"):
-                return head_data(sha, runs, statuses, ids)
-            more, error = self.graphql("query{" + head_query(owner, repo, sha, page.get("endCursor")) + "}", {})
-            if more is None:
-                return error or "graphql: no response"
-            rollup = ((((more.get("data") or {}).get("repository") or {}).get("object") or {}).get("statusCheckRollup"))
-            if more.get("errors") or not rollup:  # a partial page would read as a smaller, greener head
-                return "graphql: " + str(((more.get("errors") or [{}])[0] or {}).get("message") or "no further page")[:200]
-            contexts = rollup.get("contexts") or {}
-        return f"more than {HEAD_BATCH_MAX_CONTEXTS_PAGES * 100} checks on one commit"
+        for owner, repo, contexts in sources:
+            for _ in range(HEAD_BATCH_MAX_CONTEXTS_PAGES):
+                fold_contexts(contexts.get("nodes"), runs, statuses, ids)
+                page = contexts.get("pageInfo") or {}
+                if not page.get("hasNextPage"):
+                    break
+                more, error = self.graphql("query{" + head_query(owner, repo, sha, page.get("endCursor")) + "}", {})
+                if more is None:
+                    return error or "graphql: no response"
+                rollup = ((((more.get("data") or {}).get("repository") or {}).get("object") or {}).get("statusCheckRollup"))
+                if more.get("errors") or not rollup:  # a partial page would read as a smaller, greener head
+                    return "graphql: " + str(((more.get("errors") or [{}])[0] or {}).get("message") or "no further page")[:200]
+                contexts = rollup.get("contexts") or {}
+            else:
+                return f"more than {HEAD_BATCH_MAX_CONTEXTS_PAGES * 100} checks on one commit"
+        return head_data(sha, runs, statuses, ids)
 
     def fill_steps(self, pairs: list[tuple[dict, dict]]) -> None:
         """Name the failed steps of each failed check run. A completed check does not change, so a

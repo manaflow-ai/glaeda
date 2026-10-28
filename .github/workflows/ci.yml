@@ -15,10 +15,11 @@ on:
 permissions:
   contents: read
 
-# manaflow-ai/glaeda, the fleet fork, runs this workflow for pull requests only. Its main is moved by
-# sync-main.yml in teamleaderleo/glaeda, and a push there must not run a second copy of every check:
-# the commit was verified as a pull request on one side and is verified on push here. The jobs that
-# need no other job carry the gate; the rest are skipped with them.
+# A push to main is verified in manaflow-ai/glaeda, the fleet fork, on Blacksmith, and not here: both mains hold
+# the same commits (sync-main.yml keeps them equal), so the fork's Verify at a commit is that commit's check of
+# record in both repositories (scripts/glaeda-gh reads it for a teamleaderleo/glaeda head). teamleaderleo/glaeda
+# is a personal-account repository with no Blacksmith, so it runs this workflow for its own pull requests only,
+# whose heads exist only here. The jobs that need no other job carry the gate; the rest are skipped with them.
 
 concurrency:
   group: verify-${{ github.workflow }}-${{ github.ref }}
@@ -32,7 +33,7 @@ jobs:
   # scripts and runner-tests run for any pull request that changes more than Markdown no script names, since several
   # script tests drive cargo and some read docs (docs/CMUX_MINI_RUNNER.md, for one).
   changes:
-    if: ${{ github.event_name == 'pull_request' || github.repository == 'teamleaderleo/glaeda' }}
+    if: ${{ github.event_name == 'pull_request' || github.repository == 'manaflow-ai/glaeda' }}
     runs-on: ${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 5
     outputs:
@@ -838,7 +839,7 @@ jobs:
   # require the aggregate without enumerating every conditional job above.
   ci-status:
     name: ci-status
-    if: ${{ always() && (github.event_name == 'pull_request' || github.repository == 'teamleaderleo/glaeda') }}
+    if: ${{ always() && (github.event_name == 'pull_request' || github.repository == 'manaflow-ai/glaeda') }}
     needs: [changes, go, scripts, runner-tests, lint, lint-macos, test, cli, fleet-cas-build, polling-guard]
     runs-on: ${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 5

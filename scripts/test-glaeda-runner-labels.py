@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import re
 import unittest
 from pathlib import Path
 
@@ -149,6 +150,37 @@ class Repository(unittest.TestCase):
                 text = (rl.workflow_files([])[0].parent / name).read_text(encoding="utf-8")
                 gated = "github.repository == 'teamleaderleo/glaeda'" in text
                 self.assertTrue(gated or reason in (rl.HOSTED_ON_PURPOSE, rl.HOSTED_PROBE), reason)
+
+    def test_every_main_head_is_verified_in_the_fork_and_not_here(self) -> None:
+        # The fork's Verify at a commit is its check of record in both repositories (scripts/glaeda-gh
+        # CHECKS_OF_RECORD): a push to main runs Verify on Blacksmith there and runs no hosted copy here.
+        text = (rl.workflow_files([])[0].parent / "ci.yml").read_text(encoding="utf-8")
+        gates = re.findall(r"^    if: \$\{\{(.*)\}\}$", text, re.M)
+        roots = [g for g in gates if "github.event_name == 'pull_request' ||" in g]
+        self.assertEqual(len(roots), 2, gates)  # changes, and ci-status (always())
+        for gate in roots:
+            self.assertIn("github.repository == 'manaflow-ai/glaeda'", gate)
+            self.assertNotIn("teamleaderleo", gate)
+        self.assertIn("push:", text.split("permissions:")[0])
+
+    def test_the_owner_form_has_a_reason(self) -> None:
+        self.assertIn("pull request opened there", rl.OWNER_FORM)
+
+    def test_only_push_here_workflows_run_hosted_on_a_push_to_main(self) -> None:
+        # A push-triggered workflow with an owner-form job runs that job on a hosted image here unless it is gated
+        # to the fork. Verify is (above); the rest are PUSH_HERE, each with its reason, and the set only shrinks.
+        here = set()
+        for path in rl.workflow_files([]):
+            text = path.read_text(encoding="utf-8")
+            trigger = text.split("\njobs:")[0]
+            if not re.search(r"^  push:", trigger, re.M) or "github.repository_owner == 'manaflow-ai' &&" not in text:
+                continue
+            if "github.repository == 'manaflow-ai/glaeda'" in text:
+                continue
+            here.add(path.name)
+        self.assertEqual(here, set(rl.PUSH_HERE))
+        for name, reason in rl.PUSH_HERE.items():
+            self.assertTrue(reason.strip(), name)
 
 
 if __name__ == "__main__":

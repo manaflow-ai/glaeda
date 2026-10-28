@@ -171,8 +171,12 @@ back, pause the rollout (`control.yml`, below).
   not start `release.yml`, and it cannot push commits that change workflow files. The workflow runs
   the checked-out `scripts/glaeda-sync-main` with both write keys, so anyone who can merge to either
   `main` can change the sync logic itself.
-- **Checks in the fork.** `ci.yml` (Verify) runs there for pull requests only; its jobs skip on a
-  push outside this repository. `release.yml`, `promote.yml` and `control.yml` run only here. The
+- **Checks in the fork.** `ci.yml` (Verify) runs there on Blacksmith for pull requests and for every
+  push to `main`; here it runs for this repository's own pull requests only, on GitHub-hosted runners
+  (Blacksmith installs on organizations only). Both mains hold the same commits, so the fork's Verify
+  at a commit is its check of record in both repositories, and `glaeda-gh checks teamleaderleo/glaeda
+  SHA` reads the fork's checks for that commit too. Opening a pull request in the
+  fork keeps its Verify on Blacksmith as well. `release.yml`, `promote.yml` and `control.yml` run only here. The
   fork's `main` takes changes only through pull requests and the sync's deploy key. A deploy-key
   push starts the fork's push workflows, so gate every new push-triggered workflow (or its jobs)
   with `github.repository == 'teamleaderleo/glaeda'`.
