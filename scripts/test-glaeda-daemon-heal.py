@@ -414,6 +414,28 @@ class SandboxHeal(Base):
         self.host.probes, self.host.lock_held = [9.0, 0.1], False
         self.assertTrue(self.tick()["actions"][0]["ok"])
 
+    def test_a_job_or_reservation_that_arrives_during_the_probe_wins(self) -> None:
+        host = self.host
+        real = host.sandbox_probe
+
+        def slow_then_busy(slow_s):
+            host.add(600, "/usr/bin/xcodebuild", 0.1, uid=502)
+            return real(slow_s)
+
+        host.probes = [9.0]
+        host.sandbox_probe = slow_then_busy
+        report = self.tick()
+        self.assertEqual(report["sandbox"]["skipped"], "host busy (xcodebuild)")
+        self.assertEqual((host.kicks, report["actions"]), ([], []))
+        host.procs.pop(600)
+        host.sandbox_probe = real
+        holds = iter(["", "reserved until later"])
+        host.sandbox_hold = lambda now: next(holds)
+        host.probes = [9.0]
+        self.assertEqual(self.tick()["sandbox"]["skipped"], "reserved until later")
+        self.assertEqual(host.kicks, [])
+        self.assertNotIn("last", self.state["sandbox"])  # a refusal does not use up the window
+
     def test_a_plan_pass_or_an_off_policy_never_probes(self) -> None:
         self.host.probes = [9.0]
         self.assertEqual(self.tick(apply=False)["sandbox"], {"skipped": "probed under --apply only"})

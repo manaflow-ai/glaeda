@@ -309,7 +309,8 @@ class Host:
         return ""
 
     def sandbox_probe(self, slow_s: float) -> float | None:
-        """Seconds a sandboxed ad-hoc binary takes to run (slow_s when it was killed there); None if it cannot run."""
+        """Seconds a sandboxed ad-hoc binary takes to run (slow_s when it was killed there); None if it cannot run
+        or exits nonzero (a probe that did not run says nothing about sandboxd)."""
         with tempfile.TemporaryDirectory(prefix="glaeda-sandbox-probe.") as d:
             exe = os.path.join(d, "date")
             try:
@@ -321,13 +322,14 @@ class Host:
                 return None
             start = time.monotonic()
             try:
-                subprocess.run(["/usr/bin/sandbox-exec", "-p", SANDBOX_PROBE_PROFILE, exe], stdin=subprocess.DEVNULL,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=slow_s, check=False)
+                done = subprocess.run(["/usr/bin/sandbox-exec", "-p", SANDBOX_PROBE_PROFILE, exe],
+                                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                      timeout=slow_s, check=False)
             except subprocess.TimeoutExpired:
                 return float(slow_s)
             except OSError:
                 return None
-            return time.monotonic() - start
+            return None if done.returncode != 0 else time.monotonic() - start
 
     def with_host_lock(self, fn):
         """fn() while holding the fleet host.lock exclusively, so no job is admitted; None if it is held now."""
@@ -410,12 +412,21 @@ def sandbox_pass(host: Host, policy: dict[str, Any], state: dict[str, Any], now:
         return mine, report
 
     def kick():
+        # The probe took seconds: look again under the lock, so a job or reservation that arrived meanwhile wins.
+        names = set(policy["busy"])
+        late = sorted({os.path.basename(e) for _p, _u, _c, e in host.processes() if os.path.basename(e) in names})
+        why = f"host busy ({', '.join(late)})" if late else host.sandbox_hold(host.now())
+        if why:
+            return "refused", why
         mine["last"] = now  # an attempt counts whatever it does
         return host.kickstart_sandboxd()
 
     done = host.with_host_lock(kick)
     if done is None:
         report["waiting"] = "fleet host.lock is held; a later idle pass restarts it"
+        return mine, report
+    if done[0] == "refused":
+        report["skipped"] = done[1]
         return mine, report
     code, out = done
     after = host.sandbox_probe(slow)
