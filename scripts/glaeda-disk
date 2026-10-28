@@ -817,6 +817,9 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "66d2f1ccc977f5fdb9fc65a518aa3ff994809ac0f34297aa3f6a551d6ba4a842",
     "e88379b181e54fa2b92eddc7d8120df442e09f5430bb6ff15de807588e5b42f3",
     "aa68db0113a41c526befa1f42535d6f8438f09b923d7597c49ac47b4b761316d",
+    "ea361d0b9814fa95b93c7f7dcd312c6bdd5d420ed5880ac18b610afdd708766e",
+    "95b700d406639698456d2d536eea9d698b329191a732b24608a673c1e9353d98",
+    "ea3e56492347b8a0b68427496eb010eec75b6dc9e3733989c47d0f6f78e18fc9",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -5794,11 +5797,19 @@ def prune_foreign_archives(now: float | None = None, in_use=lambda p: False) -> 
         p = Path(e.path)
         if e.name == mirror_archive().name or e.is_symlink() or e.name.startswith((DELETING_PREFIX, MIRROR_KEEP)):
             continue
+        try:
+            judged_dir = e.is_dir(follow_symlinks=False)
+        except OSError:
+            continue
         newest = _newest_change(p)
         if newest is None or newest >= cutoff or mount_below(p) or in_use(p):
             continue
         try:
             ident = (e.inode(), os.lstat(p).st_dev)[::-1]
+            # a directory judged old and then swapped for a fresh file (or back) is not what was judged, even when
+            # the filesystem reuses the inode and its coarse clock gives the new entry the old entry's time
+            if p.is_dir() != judged_dir:
+                continue
             digest = None if p.is_dir() else _sha256(p)  # read before the rename, after its age was judged
             if not p.is_dir() and _newest_change(p) != newest:
                 continue  # changed while it was hashed

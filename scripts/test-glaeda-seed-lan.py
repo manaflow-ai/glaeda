@@ -542,6 +542,16 @@ class InstallerTest(unittest.TestCase):
         self.assertEqual(json.loads(conf.read_text())["host"], "cmux14")
         self.assertFalse(any("glaeda-lan-cache@cmux13s-mac-mini" in line for line in self.authorized()))
 
+    def test_a_client_that_does_not_answer_a_new_host_keeps_its_path_to_another(self):
+        base = ("cache", "--host", "cmux15", "--address", "172.20.21.202", "cmux12s-mac-mini", "--apply")
+        self.assertEqual(self.cli(*base)[0], 0)
+        conf = self.homes / "cmux12s-mac-mini/.config/glaeda/lan-cache/config.json"
+        moved = {**json.loads(conf.read_text()), "host": "cmux14"}
+        conf.write_text(json.dumps(moved))
+        (self.homes.parent / "client-ssh").write_text(f"#!{sys.executable}\nimport sys\nsys.exit(255)\n")
+        self.assertEqual(self.cli(*base)[0], 1)
+        self.assertEqual(json.loads(conf.read_text())["host"], "cmux14", "a failed ping here never drops another host")
+
     def test_a_refused_key_is_never_pinged_or_configured(self):
         self.assertEqual(self.cli("cache", "--host", "cmux15", "--address", "172.20.21.202", "cmux12s-mac-mini",
                                   "--apply")[0], 0)

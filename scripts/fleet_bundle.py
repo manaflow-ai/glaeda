@@ -380,17 +380,19 @@ def inspect_generation(destination: Path, digest: str, source: str, target: str)
                 raise BundleError("saved generation differs from the pinned candidate")
         # Enumerate only the four owned directories with an explicit entry cap.
         # Extra code or bytecode cannot silently become part of a checked generation.
-        for prefix, fd in {"": generation, **directories}.items():
-            required = ({name for name in expected if "/" not in name} | set(directories)
-                        if not prefix else {name.split("/")[1] for name in expected if name.startswith(prefix + "/")})
-            found = set()
-            with os.scandir(fd) as entries:
-                for entry in entries:
-                    found.add(entry.name)
-                    if len(found) > len(required):
-                        raise BundleError("saved generation contains unexpected entries")
-            if found != required:
-                raise BundleError("saved generation inventory changed")
+        def check_inventory() -> None:
+            for prefix, fd in {"": generation, **directories}.items():
+                required = ({name for name in expected if "/" not in name} | set(directories)
+                            if not prefix else {name.split("/")[1] for name in expected if name.startswith(prefix + "/")})
+                found = set()
+                with os.scandir(fd) as entries:
+                    for entry in entries:
+                        found.add(entry.name)
+                        if len(found) > len(required):
+                            raise BundleError("saved generation contains unexpected entries")
+                if found != required:
+                    raise BundleError("saved generation inventory changed")
+        check_inventory()
         observed_parent = private_parent(destination.parent)
         try:
             fresh, original = os.fstat(observed_parent), os.fstat(parent)
@@ -398,6 +400,17 @@ def inspect_generation(destination: Path, digest: str, source: str, target: str)
                 raise BundleError("saved generation parent moved")
         finally:
             os.close(observed_parent)
+        # File and directory times miss a change made within one coarse filesystem clock tick (Linux): a same-size
+        # rewrite or a new entry can leave every stat field as it was. Read every file and enumerate
+        # again, before the identity checks below, which come last.
+        for name, before in observations.items():
+            parts = name.split("/")
+            directory = directories[parts[0]] if len(parts) == 2 else generation
+            data = raw if name == "candidate.tar.gz" else expected[name]
+            again, _ = read_generation_file(directory, parts[-1], len(data), stat.S_IMODE(before.st_mode))
+            if again != data:
+                raise BundleError("saved generation file changed during inspection")
+        check_inventory()
         for name, fd, parent_fd in [(destination.name, generation, parent),
                                    *((name, fd, generation) for name, fd in directories.items())]:
             named, held = os.stat(name, dir_fd=parent_fd, follow_symlinks=False), os.fstat(fd)

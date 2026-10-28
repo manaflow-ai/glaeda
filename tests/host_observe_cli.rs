@@ -113,5 +113,8 @@ fn invalid_port_fails_before_host_observation() {
 }
 
 fn live_host_surface_is_available() -> bool {
+    // The observer requires pressure stall information, which some VM kernels (Blacksmith's) leave out; there it
+    // rightly reports host_observation_unavailable.
     Path::new("/sys/devices/system/cpu/online").is_file()
+        && Path::new("/proc/pressure/cpu").is_file()
 }

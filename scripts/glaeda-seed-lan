@@ -554,7 +554,7 @@ def cache(host: str, clients: list[str], addresses: list[str], cidrs: str, user:
                 entry["ping"] = "not asked: its key is not authorized"
             if entry["ping"] != PONG:
                 # Fail closed: a client the host does not answer keeps no LAN path (it reads the bucket).
-                done = remote(client, CLIENT_REMOTE, {"mode": "unconfigure", "dir": "lan-cache"})
+                done = remote(client, CLIENT_REMOTE, {"mode": "unconfigure", "dir": "lan-cache", "host": host})
                 entry["changed"] = sorted({*entry["changed"], *done.get("changed", [])})
                 entry["config"] = "missing"
                 failed.append(CACHE_TAG + client)

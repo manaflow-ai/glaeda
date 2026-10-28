@@ -2816,6 +2816,105 @@ FIX_TIMEOUTS = {"cmux_clone": 1800, "submodules": 1800, "brew": 5400, "rust_chan
                 "glaeda_sync": 900}
 RUSTUP_PROXIES = ("cargo", "rustc", "rustdoc", "rustup")
 BREW_STAGE = "Library/Caches/glaeda/share/homebrew/downloads"  # under the login user's home; see share brew
+# Every brew command the Homebrew step runs has a hard limit, enforced on the host: an ssh timeout on this side
+# stops nothing there, and sudo-plan --run has none. A `brew install git` once sat 8 h 15 min with no socket open.
+# At the limit BREW_BOUND stops the command and everything it started (below), and brew_as ends the step with 124.
+BREW_COMMAND_TIMEOUT = 1800
+BREW_TIMED_OUT = 124
+# The bound, in perl because a mini has no timeout(1) and maybe no Python. It runs as the Homebrew owner, inside
+# sudo -u, so it can signal what brew starts and nothing of root's. argv: SECONDS COMMAND [ARG...].
+# The command starts in a process group of its own. While it runs, the bound looks (ps) at what it started every 2 s
+# at most, and remembers each process found by pid and start time (lstart, to the second; a pid comes round again only
+# after the whole pid space, so never within its first owner's second), so one that is orphaned before the limit (a
+# curl whose parent died, in a group of its own) is still known. The limit is on the monotonic clock. At the limit it
+# looks again: every process in the command's group or under it, every remembered process that is still the same
+# process, everything under those, and every process group any of them is in. It sends SIGTERM to each group and
+# process; then, while any of them lives, for up to 10 s, it looks again, and SIGKILLs what that look finds. Each
+# signal goes only to what a look taken just before it finds, so a pid or group id that ended and was reused in
+# between is never signalled; the command itself is reaped only after the last signal, so its pid and group id stay
+# ours until then. A ps that does not answer within 10 s is killed; that look signals only the command's own group,
+# and the next look asks ps again. Not covered: a process started and orphaned between two looks, and the moment
+# between a look and its signal. Under the limit the command's exit code passes through (a signal as 128+N); at the
+# limit it exits BREW_TIMED_OUT. Homebrew's own exit codes are 0 and 1, so 124 is free.
+BREW_BOUND = r"""
+use strict; use warnings; use POSIX (); use Time::HiRes qw(clock_gettime CLOCK_MONOTONIC);
+my $limit = shift @ARGV;
+my $ps_env = $ENV{GLAEDA_BREW_BOUND_PS_SECONDS} // "";  # tests shorten the ps limit to 1-9 s; nothing else
+my $ps_limit = $ps_env =~ /\A[1-9]\z/ ? $ps_env : 10;
+my $mine = getpgrp();
+my (%known, $pid);  # %known: pid => start time of every process a look found
+sub look {  # (live pids, their groups, read ok) under the command, from one ps read
+  my ($ps_pid, @rows);
+  my $ok = eval {
+    local $SIG{ALRM} = sub { kill "KILL", $ps_pid if $ps_pid; die "ps\n" };
+    alarm $ps_limit;
+    $ps_pid = open(my $ps, "-|", (-x "/bin/ps" ? "/bin/ps" : "/usr/bin/ps"), "-A", "-o", "pid=,ppid=,pgid=,stat=,lstart=") or die "ps\n";
+    @rows = map { s/^\s+|\s+$//gr } <$ps>;
+    close($ps) or die "ps\n";
+    alarm 0; 1;
+  };
+  alarm 0;
+  return ([], [$pid], 0) unless $ok;  # no reading: the command's own group, which is ours until it is reaped
+  my (%kids, %pgid, %zombie, %start);
+  for (@rows) {
+    my ($p, $pp, $g, $st, $at) = split /\s+/, $_, 5;
+    next unless defined $at;
+    push @{$kids{$pp}}, $p; $pgid{$p} = $g; $start{$p} = $at; $zombie{$p} = 1 if $st =~ /^Z/;
+  }
+  my (%seen, %groups);
+  %groups = ($pid => 1);
+  my @same = grep { defined $start{$_} && $start{$_} eq $known{$_} } keys %known;
+  for (my $grown = 1; $grown;) {
+    $grown = 0;
+    my @todo = ((grep { $groups{$pgid{$_}} } keys %pgid), @same, keys %seen);
+    while (@todo) { my $p = shift @todo; next if $p == $$ || $seen{$p}++; push @todo, @{$kids{$p} || []}; }
+    for (keys %seen) { my $g = $pgid{$_}; if ($g != $mine && !$groups{$g}++) { $grown = 1; } }
+  }
+  $known{$_} = $start{$_} for keys %seen;
+  my @live = grep { !$zombie{$_} } keys %seen;
+  my %used = map { $pgid{$_} => 1 } @live;
+  return ([@live], [grep { $used{$_} && $_ != $mine } keys %groups], 1);
+}
+sub stop {  # signal what one fresh look finds, and always the command's own group (ours until it is reaped)
+  my ($sig) = @_;
+  my ($pids, $gids) = look();
+  my %gids = map { $_ => 1 } $pid, @$gids;
+  kill $sig, map { -$_ } keys %gids;
+  kill $sig, @$pids;
+}
+$pid = fork();
+defined $pid or die "fork: $!\n";
+if (!$pid) { setpgrp(0, 0); exec { $ARGV[0] } @ARGV; die "exec $ARGV[0]: $!\n"; }
+my ($deadline, $nap);
+sub done {  # exit with the command's own status once it has ended
+  return unless waitpid($pid, POSIX::WNOHANG()) == $pid;
+  my $status = $?;
+  exit 124 if clock_gettime(CLOCK_MONOTONIC) >= $deadline;  # it ended only once the limit had passed
+  exit($status & 127 ? 128 + ($status & 127) : $status >> 8);
+}
+($deadline, $nap) = (clock_gettime(CLOCK_MONOTONIC) + $limit, 0.05);
+while (clock_gettime(CLOCK_MONOTONIC) < $deadline) {
+  done();
+  look();
+  select(undef, undef, undef, $nap);
+  $nap = $nap * 2 > 2 ? 2 : $nap * 2;
+}
+# Past the deadline it is stopped even if it ends meanwhile: the result is 124 either way.
+$SIG{PIPE} = "IGNORE";
+stop("TERM");
+# After the signal, and non-blocking: a full or closed stderr must not keep the bound from stopping the command.
+{ my $fl = fcntl(STDERR, POSIX::F_GETFL(), 0);
+  if ($fl) {
+    fcntl(STDERR, POSIX::F_SETFL(), $fl | POSIX::O_NONBLOCK());
+    syswrite(STDERR, "timed out after ${limit}s: stopping $ARGV[0] and everything it started\n");
+    fcntl(STDERR, POSIX::F_SETFL(), $fl);
+  } }
+for (1 .. 20) { select(undef, undef, undef, 0.5); my ($pids, $gids, $ok) = look(); last unless $ok && @$pids; }
+stop("KILL");
+# Reap it, but never wait on a process stuck in the kernel past SIGKILL: 124 either way.
+for (1 .. 20) { last if waitpid($pid, POSIX::WNOHANG()) != 0; select(undef, undef, undef, 0.5); }
+exit 124;
+""".strip()
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or Path("~/.local/state").expanduser()) / "glaeda" / "mini-fleet"
 OPERATOR_CACHE = Path(os.environ.get("GLAEDA_MINI_FLEET_CACHE", "~/Library/Caches/glaeda/mini-fleet")).expanduser()
 SUDOERS_FILE = "/etc/sudoers.d/glaeda-mini-fleet"
@@ -3125,7 +3224,13 @@ def brew_commands(owner: str, formulas: list[str], as_owner: bool, as_root: bool
     run = f"sudo -H -u {owner} " if as_owner else ""
     root = "sudo " if as_owner and not as_root else ""
     # Newer Homebrew asks before installing unless told not to; sudo drops the variable, so env sets it.
-    lines = [f'brew_as() {{ {run}env HOMEBREW_NO_ASK=1 /opt/homebrew/bin/brew "$@"; }}',
+    # BREW_BOUND caps every brew command at BREW_COMMAND_TIMEOUT, so the step can never hang for hours.
+    # A command that reached the limit ends the step with 124 even where its status is otherwise tested or ignored.
+    lines = [f"brew_bound={shlex.quote(BREW_BOUND)}",
+             f'brew_as() {{ local rc=0; {run}/usr/bin/perl -e "$brew_bound" {BREW_COMMAND_TIMEOUT} '
+             'env HOMEBREW_NO_ASK=1 /opt/homebrew/bin/brew "$@" || rc=$?; '
+             # No message here: the bound wrote one, and a write to a full stderr could block the step.
+             f'if [ "$rc" = {BREW_TIMED_OUT} ]; then exit {BREW_TIMED_OUT}; fi; return "$rc"; }}',
              # Bottles glaeda-mini-fleet share brew staged from a peer; brew checks their digests before use.
              f'staged="${{login_home:-$HOME}}/{BREW_STAGE}"',
              'if [ -n "$(ls "$staged" 2>/dev/null)" ]; then',
@@ -3136,7 +3241,9 @@ def brew_commands(owner: str, formulas: list[str], as_owner: bool, as_root: bool
              *([f'  {root}chown -h {owner} "$cache"/*'] if as_owner else []),
              "fi",
              # A pinned formula stays as it is: upgrading it would change the toolchain its class receipt names.
-             'pinned=" $({ brew_as list --pinned 2>/dev/null || true; } | tr "\\n" " ") "',
+             # Not `|| true` inside the substitution: that would hide a timeout (brew_as's exit leaves only the subshell).
+             f'pinned_list=$(brew_as list --pinned 2>/dev/null) || {{ [ $? != {BREW_TIMED_OUT} ] || exit {BREW_TIMED_OUT}; }}',
+             'pinned=" $(printf "%s" "$pinned_list" | tr "\\n" " ") "',
              f"for f in {' '.join(formulas)}; do",
              '  if ! brew_as list --versions "$f" >/dev/null 2>&1; then',
              '    if ! brew_as install "$f"; then',

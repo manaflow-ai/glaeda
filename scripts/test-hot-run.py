@@ -1756,8 +1756,12 @@ class HotRunTests(unittest.TestCase):
                 Path("."),
                 Path("worktrees/task"),
             )
-            task_pointer.unlink()
-            task_pointer.write_text("gitdir: elsewhere\n", encoding="utf-8")
+            # A new worktree's pointer replaces the old one through a rename, as git writes it: both files
+            # exist at once, so the replacement has its own inode. Unlink-then-write could reuse the inode
+            # within one kernel tick on ext4 (coarse ctime), which no real worktree replacement does.
+            replacement = task / ".git.new"
+            replacement.write_text("gitdir: elsewhere\n", encoding="utf-8")
+            os.replace(replacement, task_pointer)
             with self.assertRaisesRegex(
                 RuntimeError,
                 "worktree generation changed during hot-state preflight",
