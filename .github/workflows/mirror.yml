@@ -3,7 +3,8 @@ name: Mirror
 # Runs only in manaflow-ai/glaeda, the fork the Manaflow minis clone and update from
 # (docs/GLAEDA_OTA.md, Fleet mirror). Every 15 minutes it copies the release tags, the releases and
 # the ota-channels files from teamleaderleo/glaeda byte for byte, and keeps the fork's other
-# workflows disabled except ci.yml (pull request CI): releases are built, attested and promoted only
+# workflows disabled except ci.yml (Verify, on Blacksmith: pull requests, and every push to main, which makes
+# it the check of record for main in both repositories): releases are built, attested and promoted only
 # upstream. main is not copied here: sync-main.yml in teamleaderleo/glaeda keeps both mains equal in
 # both directions and never force-pushes.
 
@@ -32,7 +33,7 @@ jobs:
     steps:
       - name: Keep the fork's other workflows disabled
         # A deploy-key push to main or a tag starts the fork's workflows. ci.yml stays enabled: in the
-        # fork it runs for pull requests only.
+        # fork it verifies pull requests and every main head (teamleaderleo/glaeda verifies neither push).
         run: |
           gh api "repos/$MIRROR/actions/workflows" --paginate \
             --jq '.workflows[] | select(.state == "active" and (.path | startswith(".github/workflows/"))

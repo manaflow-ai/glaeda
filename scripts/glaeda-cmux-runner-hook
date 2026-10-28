@@ -5975,10 +5975,15 @@ def note_waiter_refusal(state_dir: Path, why: str) -> None:
     with contextlib.suppress(OSError):
         state_dir.mkdir(parents=True, exist_ok=True)
         path = state_dir / WAITER_SEEN_FILE
-        try:  # one stamp per refusal: a new file's creation, else one utime (APFS keeps nanoseconds)
-            os.utime(path)
+        try:  # one stamp per refusal: a new file's creation, else a utime strictly after the last stamp
+            last = path.stat().st_mtime_ns
         except FileNotFoundError:
             os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644))
+            return
+        # A filesystem's clock can tick coarser than two refusals (ext4 stamps from the kernel tick on Linux
+        # runners), so a plain utime could repeat the last stamp and the gates would miss the new refusal.
+        stamp = max(time.time_ns(), last + 1_000)
+        os.utime(path, ns=(stamp, stamp))
 
 
 def refused_note(state_dir: Path, worker: int) -> Path:

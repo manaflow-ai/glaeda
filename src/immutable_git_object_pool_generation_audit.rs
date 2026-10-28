@@ -362,7 +362,7 @@ where
         audit_tree(&source_objects.fd, false, true).map_err(map_source_walk_error)?;
     source_objects.revalidate().map_err(|_| source_changed())?;
 
-    let candidate_audit = audit_tree(&candidate.root.fd, true, false)?;
+    let candidate_audit = audit_tree(&candidate.root.fd, true, true)?;
     candidate.root.revalidate()?;
 
     let candidate_objects_audit = audit_tree(&candidate.objects.fd, true, true)?;
@@ -382,6 +382,18 @@ where
     }
 
     before_final_revalidation();
+    // Directory times alone miss a change made within one filesystem clock tick (Linux stamps them from a coarse
+    // clock): walk the candidate again and require the entries, sizes and file identities the audit saw, then
+    // confirm its directories last.
+    if audit_tree(&candidate.root.fd, true, true).map_err(|_| candidate_changed())?
+        != candidate_audit
+        || audit_tree(&candidate.objects.fd, true, true).map_err(|_| candidate_changed())?
+            != candidate_objects_audit
+    {
+        return Err(candidate_changed());
+    }
+    // An entry renamed inside the tree keeps every count and inode: name the one path that matters again.
+    require_nested_alternates_absent(&candidate.objects)?;
     candidate.confirm().map_err(|_| candidate_changed())?;
     source
         .confirm(&source_binding)
@@ -463,7 +475,7 @@ struct PhysicalFileIdentity {
     inode: u64,
 }
 
-#[derive(Default)]
+#[derive(Default, PartialEq, Eq)]
 struct TreeAudit {
     directories: u64,
     regular_files: u64,
@@ -1135,6 +1147,19 @@ mod tests {
                 .kind(),
             ImmutableGitObjectPoolGenerationAuditErrorKind::NestedAlternates
         );
+    }
+
+    #[test]
+    fn alternates_renamed_in_before_final_boundary_are_refused() {
+        let fixture = Fixture::new();
+        let pending = fixture.candidate.join("objects/info/pending");
+        fs::write(&pending, b"/unexpected/objects\n").unwrap();
+        let mut source = fixture.source_observation();
+        let candidate = fixture.candidate_lease();
+        let result = audit_with_hook(&mut source, &candidate, || {
+            fs::rename(&pending, fixture.candidate.join("objects/info/alternates")).unwrap();
+        });
+        assert!(result.is_err());
     }
 
     #[test]

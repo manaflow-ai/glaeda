@@ -9,7 +9,8 @@ serves this repository either. So:
 - A job that can also run in the fork picks by owner, `${{ github.repository_owner == 'manaflow-ai' &&
   'blacksmith-<n>vcpu-ubuntu-2404' || 'ubuntu-24.04' }}` (macOS rows likewise, `blacksmith-6vcpu-macos-15`): Blacksmith
   there, the hosted image only here. That form, in runs-on or a matrix row, is the one hosted spelling accepted
-  without an entry.
+  without an entry; OWNER_FORM is its reason. Verify (ci.yml) verifies every main head in the fork only, so here
+  it runs just for this repository's own pull requests, whose heads the fork does not have.
 - A job gated to this repository (`github.repository == 'teamleaderleo/glaeda'`), or one that measures or probes
   the hosted image itself, is listed in HOSTED_ALLOWED with its reason until the repository moves under an organization.
 
@@ -52,26 +53,50 @@ EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.DOTALL)
 # A key whose value, and every line nested under it, selects a runner.
 SELECTOR_KEY = re.compile(r"^(\s*)(?:-\s+)?(runs-on|matrix)\s*:(.*)$")
 
+# Why the owner form may fall back to a hosted image: in teamleaderleo/glaeda only, for work whose commit exists only
+# there (a pull request opened there). Every main head is verified in the fork (ci.yml), so no Verify job runs here
+# on a push.
+OWNER_FORM = ("falls back to GitHub-hosted only in teamleaderleo/glaeda, a personal-account repository that Blacksmith "
+              "cannot serve, for a pull request opened there (its head is not in the fork), or for a push, dispatch or "
+              "schedule in a workflow BEYOND_PR names; the fork runs the same job on Blacksmith, and verifies every main head")
+# Owner-form workflows that still run here on a hosted image for something other than a pull request (a push to main,
+# a dispatch or a schedule), with why: the fork keeps them disabled (mirror.yml keeps only ci.yml and itself enabled
+# there), so that run can only happen here. The set only shrinks.
+BEYOND_PR: dict[str, str] = {
+    "bootstrap-compatibility.yml": "push to main: disabled in the fork; path-filtered contract test of the bootstrap "
+                                   "profile mapper",
+    "cultist-advisory.yml": "push to main: disabled in the fork; advisory, and its push run saves the pinned Cultist "
+                            "binary cache this repository's pull requests restore",
+    "fleet-candidate.yml": "dispatch: disabled in the fork; an operator's on-demand candidate bundle build",
+    "github-resident-snapshot.yml": "push to main: disabled in the fork; path-filtered contract test of the resident "
+                                    "snapshot",
+    "linux-acceptance.yml": "dispatch: disabled in the fork; an operator's on-demand Linux acceptance run",
+}
 PERSONAL = ("runs only in teamleaderleo/glaeda, a personal-account repository: Blacksmith installs on organizations "
             "only and no owned runner serves it")
 HOSTED_ON_PURPOSE = ("measures the developer loop on a GitHub-hosted runner, so the hosted image is the thing "
                      "measured; it is dispatched or runs on pull requests that change the benchmark")
 HOSTED_PROBE = ("records evidence from a fresh GitHub-hosted Ubuntu 24.04 VM (GLAEDA_PROBE_PROVIDER=github-hosted-ubuntu): "
                 "the hosted image, its preinstalled packages and cgroup layout, is the thing probed")
-PERSONAL_MACOS = PERSONAL + "; builds the aarch64-apple-darwin target"
+RELEASE = (PERSONAL + "; glaeda-update installs only releases whose build-provenance attestation names this "
+           "repository's release.yml on main (SIGNER_WORKFLOW), so releases are built, attested and published here")
+SYNC = (PERSONAL + "; it holds both repositories' write deploy keys (SYNC_UPSTREAM_DEPLOY_KEY, SYNC_MIRROR_DEPLOY_KEY) "
+        "as this repository's secrets")
+CHANNELS = (PERSONAL + "; it writes the ota-channels release assets of this repository with the job token, which "
+            "the fork's mirror.yml copies")
 
 # (workflow file, job id) -> why the job stays on a GitHub-hosted image.
 HOSTED_ALLOWED: dict[tuple[str, str], str] = {
-    ("control.yml", "control"): PERSONAL,
+    ("control.yml", "control"): CHANNELS,
     ("developer-loop-benchmark.yml", "fresh-hosted"): HOSTED_ON_PURPOSE,
     ("developer-loop-benchmark.yml", "prepared-hosted"): HOSTED_ON_PURPOSE,
     ("podman-closure-probe.yml", "ubuntu-package"): HOSTED_PROBE,
     ("podman-container-closure-probe.yml", "ubuntu-container"): HOSTED_PROBE,
-    ("promote.yml", "promote"): PERSONAL,
-    ("release.yml", "build"): PERSONAL_MACOS,
-    ("release.yml", "publish"): PERSONAL,
-    ("release.yml", "canary"): PERSONAL,
-    ("sync-main.yml", "sync"): PERSONAL,
+    ("promote.yml", "promote"): CHANNELS + " (stable.json), from the canary statuses hosts post here",
+    ("release.yml", "build"): RELEASE + " (macOS row: the aarch64-apple-darwin target)",
+    ("release.yml", "publish"): RELEASE,
+    ("release.yml", "canary"): CHANNELS + " (canary.json), after publish",
+    ("sync-main.yml", "sync"): SYNC,
 }
 
 
@@ -185,7 +210,12 @@ def main(argv: list[str]) -> int:
         print("or the owner form for a job that also runs in teamleaderleo/glaeda):")
         print("\n".join(problems))
         return 1
-    print(f"PASS: only the {len(HOSTED_ALLOWED)} allowlisted jobs name a GitHub-hosted runner")
+    print(f"PASS: only the {len(HOSTED_ALLOWED)} allowlisted jobs name a GitHub-hosted runner:")
+    for (name, job), reason in sorted(HOSTED_ALLOWED.items()):
+        print(f"  {name}:{job}: {reason}")
+    print(f"  owner-form jobs: {OWNER_FORM}")
+    for name, reason in sorted(BEYOND_PR.items()):
+        print(f"  {name}, beyond pull requests: {reason}")
     return 0
 
 
