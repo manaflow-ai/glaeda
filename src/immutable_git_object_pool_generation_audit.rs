@@ -362,7 +362,7 @@ where
         audit_tree(&source_objects.fd, false, true).map_err(map_source_walk_error)?;
     source_objects.revalidate().map_err(|_| source_changed())?;
 
-    let candidate_audit = audit_tree(&candidate.root.fd, true, false)?;
+    let candidate_audit = audit_tree(&candidate.root.fd, true, true)?;
     candidate.root.revalidate()?;
 
     let candidate_objects_audit = audit_tree(&candidate.objects.fd, true, true)?;
@@ -384,9 +384,11 @@ where
     before_final_revalidation();
     candidate.confirm().map_err(|_| candidate_changed())?;
     // Directory times alone miss a change made within one filesystem clock tick (Linux stamps them from a coarse
-    // clock): walk the candidate again and require the same entries, sizes and file identities.
+    // clock): walk the candidate again and require the entries, sizes and file identities the audit saw.
     if audit_tree(&candidate.root.fd, true, true).map_err(|_| candidate_changed())?
-        != audit_tree(&candidate.root.fd, true, true).map_err(|_| candidate_changed())?
+        != candidate_audit
+        || audit_tree(&candidate.objects.fd, true, true).map_err(|_| candidate_changed())?
+            != candidate_objects_audit
     {
         return Err(candidate_changed());
     }

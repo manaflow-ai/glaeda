@@ -2486,9 +2486,14 @@ class Daemon:
                     continue
                 # A commit the fork does not have yet (sync-main pushes there within a minute) adds nothing, as does a
                 # pull request head opened here, which the fork never gets.
-                record = ((data.get(f"m{i}") or {}).get("object") or {}).get("statusCheckRollup") or {}
+                commit = (data.get(f"m{i}") or {}).get("object")
+                record = (commit or {}).get("statusCheckRollup") or {}
                 sources.append((*CHECKS_OF_RECORD[(owner, repo)], record.get("contexts") or {}))
             result = self.head_pages(sha, sources)
+            if (owner, repo) in CHECKS_OF_RECORD and commit and isinstance(result, dict) \
+                    and not ((record.get("contexts") or {}).get("nodes")):
+                # the fork has the commit but its checks have not started: not settled on this repository's alone
+                result["settled"] = False
             if isinstance(result, str):
                 self.store(e["key"], e["cache"], error=result)
                 self.refund(e["key"])

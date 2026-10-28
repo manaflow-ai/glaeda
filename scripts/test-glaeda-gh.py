@@ -4336,6 +4336,14 @@ class HeadChecksTest(Base):
         self.assertIn("Something went wrong", entry["error"])
         self.assertEqual(len(self.daemon.head_spend.get("autoland", [])), 0)  # refunded
 
+    def test_a_glaeda_head_the_fork_has_without_checks_yet_is_not_settled(self) -> None:
+        self.gh.heads[("teamleaderleo", "glaeda", SHA_C)] = [check_run("Release / build")]
+        self.gh.heads[("manaflow-ai", "glaeda", SHA_C)] = []
+        key = gg.parse_key("head", f"teamleaderleo/glaeda@{SHA_C}")
+        gg.register(key, consumer="autoland")
+        self.daemon.tick(NOW)
+        self.assertFalse(gg.read_cache(key)["data"]["settled"])
+
     def test_other_repositories_read_only_their_own_checks(self) -> None:
         gg.register(self.key(SHA_A), consumer="autoland")
         self.daemon.tick(NOW)
