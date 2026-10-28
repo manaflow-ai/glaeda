@@ -380,17 +380,19 @@ def inspect_generation(destination: Path, digest: str, source: str, target: str)
                 raise BundleError("saved generation differs from the pinned candidate")
         # Enumerate only the four owned directories with an explicit entry cap.
         # Extra code or bytecode cannot silently become part of a checked generation.
-        for prefix, fd in {"": generation, **directories}.items():
-            required = ({name for name in expected if "/" not in name} | set(directories)
-                        if not prefix else {name.split("/")[1] for name in expected if name.startswith(prefix + "/")})
-            found = set()
-            with os.scandir(fd) as entries:
-                for entry in entries:
-                    found.add(entry.name)
-                    if len(found) > len(required):
-                        raise BundleError("saved generation contains unexpected entries")
-            if found != required:
-                raise BundleError("saved generation inventory changed")
+        def check_inventory() -> None:
+            for prefix, fd in {"": generation, **directories}.items():
+                required = ({name for name in expected if "/" not in name} | set(directories)
+                            if not prefix else {name.split("/")[1] for name in expected if name.startswith(prefix + "/")})
+                found = set()
+                with os.scandir(fd) as entries:
+                    for entry in entries:
+                        found.add(entry.name)
+                        if len(found) > len(required):
+                            raise BundleError("saved generation contains unexpected entries")
+                if found != required:
+                    raise BundleError("saved generation inventory changed")
+        check_inventory()
         observed_parent = private_parent(destination.parent)
         try:
             fresh, original = os.fstat(observed_parent), os.fstat(parent)
@@ -411,6 +413,8 @@ def inspect_generation(destination: Path, digest: str, source: str, target: str)
             directory = directories[parts[0]] if len(parts) == 2 else generation
             if file_observation(os.stat(parts[-1], dir_fd=directory, follow_symlinks=False)) != file_observation(before):
                 raise BundleError("saved generation file changed during inspection")
+        # Directory times miss an entry added within one coarse filesystem clock tick (Linux), so enumerate again.
+        check_inventory()
         return {**receipt, "schema": "glaeda-fleet-generation-check/v1", "state": "verified",
                 "authority": "generation_integrity_only"}
     finally:
