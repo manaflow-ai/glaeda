@@ -2823,29 +2823,23 @@ BREW_COMMAND_TIMEOUT = 1800
 BREW_TIMED_OUT = 124
 # The bound, in perl because a mini has no timeout(1) and maybe no Python. It runs as the Homebrew owner, inside
 # sudo -u, so it can signal what brew starts and nothing of root's. argv: SECONDS COMMAND [ARG...].
-# The command starts in a process group of its own. At the limit the bound looks (ps) for every process in that group
-# or under it, every process group one of those is in (Homebrew starts curl in a group of its own) and every process
-# an earlier look found that is still the same process (pid and start time), so an orphaned curl is still found once
-# its parent is gone. It sends SIGTERM to each group and process; then, while any of them lives, for up to 10 s, it
-# looks again, and SIGKILLs what that look finds. Each signal goes only to what a look taken just before it finds, so
-# a pid or group id that ended and was reused in between is never signalled; the command itself is reaped only after
-# the last signal, so its pid and group id stay ours until then. A ps that does not answer within 10 s is killed and
-# not asked again, and the command's own group is signalled anyway. Under the limit the command's exit code passes
-# through (a signal as 128+N); at the limit it exits BREW_TIMED_OUT. Homebrew's own exit codes are 0 and 1, so 124 is
-# free.
+# The command starts in a process group of its own. While it runs, the bound looks (ps) at what it started every 2 s
+# at most, and remembers each process found by pid and start time, so one that is orphaned before the limit (a curl
+# whose parent died, in a group of its own) is still known. At the limit it looks again: every process in the
+# command's group or under it, every remembered process that is still the same process, everything under those, and
+# every process group any of them is in. It sends SIGTERM to each group and process; then, while any of them lives,
+# for up to 10 s, it looks again, and SIGKILLs what that look finds. Each signal goes only to what a look taken just
+# before it finds, so a pid or group id that ended and was reused in between is never signalled; the command itself is
+# reaped only after the last signal, so its pid and group id stay ours until then. A ps that does not answer within 10
+# s is killed and not asked again, and the command's own group is signalled anyway. Under the limit the command's exit
+# code passes through (a signal as 128+N); at the limit it exits BREW_TIMED_OUT. Homebrew's own exit codes are 0 and
+# 1, so 124 is free.
 BREW_BOUND = r"""
-use strict; use warnings; use POSIX ();
+use strict; use warnings; use POSIX (); use Time::HiRes ();
 my $limit = shift @ARGV;
-my $pid = fork();
-defined $pid or die "fork: $!\n";
-if (!$pid) { setpgrp(0, 0); exec { $ARGV[0] } @ARGV; die "exec $ARGV[0]: $!\n"; }
-my $status;
-eval { local $SIG{ALRM} = sub { die "limit\n" }; alarm $limit; waitpid($pid, 0); $status = $?; alarm 0; };
-exit($status & 127 ? 128 + ($status & 127) : $status >> 8) if defined $status;
 my $mine = getpgrp();
-my %known;  # pid => start time of every process a look found
-my $ps_failed;  # a ps that failed once is not asked again
-sub look {  # (live pids, their groups, read ok) in the command's group or under it, from one ps read
+my (%known, $ps_failed, $pid);  # %known: pid => start time of every process a look found
+sub look {  # (live pids, their groups, read ok) under the command, from one ps read
   my ($ps_pid, @rows);
   my $ok = !$ps_failed && eval {
     local $SIG{ALRM} = sub { kill "KILL", $ps_pid if $ps_pid; die "ps\n" };
@@ -2878,12 +2872,24 @@ sub look {  # (live pids, their groups, read ok) in the command's group or under
   my %used = map { $pgid{$_} => 1 } @live;
   return ([@live], [grep { $used{$_} && $_ != $mine } keys %groups], 1);
 }
-sub stop {  # signal what one fresh look finds; true while anything was found
+sub stop {  # signal what one fresh look finds
   my ($sig) = @_;
   my ($pids, $gids) = look();
   kill $sig, map { -$_ } @$gids;
   kill $sig, @$pids;
-  return @$pids || @$gids;
+}
+$pid = fork();
+defined $pid or die "fork: $!\n";
+if (!$pid) { setpgrp(0, 0); exec { $ARGV[0] } @ARGV; die "exec $ARGV[0]: $!\n"; }
+my ($deadline, $nap) = (Time::HiRes::time() + $limit, 0.05);
+while (Time::HiRes::time() < $deadline) {
+  if (waitpid($pid, POSIX::WNOHANG()) == $pid) {
+    my $status = $?;
+    exit($status & 127 ? 128 + ($status & 127) : $status >> 8);
+  }
+  look() unless $ps_failed;
+  select(undef, undef, undef, $nap);
+  $nap = $nap * 2 > 2 ? 2 : $nap * 2;
 }
 print STDERR "timed out after ${limit}s: stopping $ARGV[0] and everything it started\n";
 stop("TERM");

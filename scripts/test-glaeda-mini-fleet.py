@@ -1708,6 +1708,15 @@ class PreflightTests(unittest.TestCase):
                                  text=True, timeout=60)
             self.assertEqual(run.returncode, 124, run.stderr)
             self.assert_gone(int(pidfile.read_text()))
+        # Orphaned before the limit: an intermediate process starts a child in a group of its own and exits.
+        with tempfile.TemporaryDirectory() as tmp:
+            pidfile = Path(tmp) / "child"
+            early = ("if (!fork) { if (!fork) { setpgrp(0, 0); open(my $f, '>', $ARGV[0]) or die; print $f $$; close $f; "
+                     "exec 'sleep', '300' } select(undef, undef, undef, 0.5); exit 0 } wait; sleep 300")
+            run = subprocess.run([*bound, "3", "perl", "-e", early, os.fspath(pidfile)], capture_output=True,
+                                 text=True, timeout=60)
+            self.assertEqual(run.returncode, 124, run.stderr)
+            self.assert_gone(int(pidfile.read_text()))
         # A ps that never answers: it is killed, and the command's own group is still stopped.
         with tempfile.TemporaryDirectory() as tmp:
             fake = Path(tmp) / "ps"
