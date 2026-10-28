@@ -356,5 +356,55 @@ class TrackingIssueTest(unittest.TestCase):
         self.assertEqual(gh.issues[0]["state"], "OPEN")
 
 
+WORKFLOWS = ROOT / ".github" / "workflows"
+
+
+def top_level_block(text: str, key: str) -> str:
+    """The lines of a top-level YAML mapping key (`on:`, `concurrency:`), comments removed."""
+    out: list[str] = []
+    inside = False
+    for line in text.splitlines():
+        bare = line.split(" #", 1)[0].rstrip() if not line.lstrip().startswith("#") else ""
+        if not bare:
+            continue
+        if not line[0].isspace():
+            inside = bare == f"{key}:"
+            continue
+        if inside:
+            out.append(bare.strip())
+    return "\n".join(out)
+
+
+class WorkflowTriggerTest(unittest.TestCase):
+    """The mains cannot drift: a push to either main starts the sync at once, a schedule backs both up, and
+    overlapping syncs queue instead of racing (cancel-in-progress false)."""
+
+    def assert_event_driven(self, name: str) -> str:
+        text = (WORKFLOWS / name).read_text()
+        on = top_level_block(text, "on")
+        self.assertRegex(on, r"(?m)^push:\nbranches: \[main\]$", f"{name}: no push to main trigger")
+        self.assertRegex(on, r"(?m)^schedule:\n- cron: \"[^\"]+\"$", f"{name}: no schedule fallback")
+        self.assertIn("workflow_dispatch:", on, f"{name}: no workflow_dispatch")
+        concurrency = top_level_block(text, "concurrency")
+        self.assertIn("cancel-in-progress: false", concurrency, f"{name}: overlapping runs must queue")
+        return text
+
+    def test_sync_main_runs_on_push_and_schedule_in_teamleaderleo(self) -> None:
+        text = self.assert_event_driven("sync-main.yml")
+        self.assertIn("if: github.repository == 'teamleaderleo/glaeda'", text)
+
+    def test_a_push_to_the_fork_main_starts_sync_main_upstream(self) -> None:
+        text = self.assert_event_driven("sync-dispatch.yml")
+        self.assertIn("if: github.repository == 'manaflow-ai/glaeda'", text)
+        self.assertIn("gh workflow run sync-main.yml -R \"$UPSTREAM\" --ref main", text)
+        self.assertIn("UPSTREAM: teamleaderleo/glaeda", text)
+        # the sync's own push to the fork must not start another sync
+        self.assertIn('if [ "$up" = "$fork" ]; then', text)
+
+    def test_the_fork_mirror_keeps_sync_dispatch_enabled(self) -> None:
+        mirror = (WORKFLOWS / "mirror.yml").read_text()
+        self.assertIn('.path != ".github/workflows/sync-dispatch.yml"', mirror)
+
+
 if __name__ == "__main__":
     unittest.main()

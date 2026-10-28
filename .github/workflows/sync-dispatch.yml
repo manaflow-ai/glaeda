@@ -1,0 +1,55 @@
+name: Sync dispatch
+
+# Runs only in manaflow-ai/glaeda, the fleet fork. sync-main.yml in teamleaderleo/glaeda keeps both mains equal
+# (docs/GLAEDA_OTA.md, Sync of main), and it already runs on every push to main there. A merge here is the other
+# half: this workflow starts sync-main.yml on every push to this main, so the merge reaches teamleaderleo/glaeda (and
+# its release) in a minute or two instead of whenever that repository's schedule fires. teamleaderleo/glaeda is a
+# personal-account repository whose schedule GitHub runs only every few hours, while this one's runs every 15
+# minutes, so the schedule here is the fallback that starts the sync when the mains differ for any other reason.
+#
+# The mains are compared first (anonymous git ls-remote, both are public): the sync's own deploy-key push lands
+# here as a push too, and with the mains equal it starts nothing, so the two workflows never loop.
+#
+# Starting a workflow in another repository needs a token that repository accepts. SYNC_DISPATCH_TOKEN is a
+# fine-grained token with Actions read and write on teamleaderleo/glaeda alone. Until it is set, a run that finds
+# the mains different warns and the sync falls back to teamleaderleo/glaeda's own triggers.
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-dispatch
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    if: github.repository == 'manaflow-ai/glaeda'
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 5
+    steps:
+      - name: Start sync-main in teamleaderleo/glaeda when the mains differ
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_DISPATCH_TOKEN }}
+          UPSTREAM: teamleaderleo/glaeda
+        run: |
+          up=$(git ls-remote "https://github.com/$UPSTREAM.git" refs/heads/main | cut -f1)
+          fork=$(git ls-remote "https://github.com/$GITHUB_REPOSITORY.git" refs/heads/main | cut -f1)
+          test -n "$up" && test -n "$fork" || { echo "::error::could not read both mains"; exit 1; }
+          echo "teamleaderleo/glaeda main $up, $GITHUB_REPOSITORY main $fork" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$up" = "$fork" ]; then
+            echo "mains equal: nothing to start" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::mains differ and secret SYNC_DISPATCH_TOKEN is not set; sync-main.yml in $UPSTREAM syncs on its own schedule"
+            exit 0
+          fi
+          gh workflow run sync-main.yml -R "$UPSTREAM" --ref main
+          echo "started sync-main.yml in $UPSTREAM" >> "$GITHUB_STEP_SUMMARY"

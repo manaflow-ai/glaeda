@@ -4,9 +4,9 @@ name: Mirror
 # (docs/GLAEDA_OTA.md, Fleet mirror). Every 15 minutes it copies the release tags, the releases and
 # the ota-channels files from teamleaderleo/glaeda byte for byte, and keeps the fork's other
 # workflows disabled except ci.yml (Verify, on Blacksmith: pull requests, and every push to main, which makes
-# it the check of record for main in both repositories): releases are built, attested and promoted only
-# upstream. main is not copied here: sync-main.yml in teamleaderleo/glaeda keeps both mains equal in
-# both directions and never force-pushes.
+# it the check of record for main in both repositories) and sync-dispatch.yml (starts the main sync on a push
+# here): releases are built, attested and promoted only upstream. main is not copied here: sync-main.yml in
+# teamleaderleo/glaeda keeps both mains equal in both directions and never force-pushes.
 
 on:
   schedule:
@@ -34,10 +34,12 @@ jobs:
       - name: Keep the fork's other workflows disabled
         # A deploy-key push to main or a tag starts the fork's workflows. ci.yml stays enabled: in the
         # fork it verifies pull requests and every main head (teamleaderleo/glaeda verifies neither push).
+        # sync-dispatch.yml stays enabled: it starts sync-main.yml upstream on a push to this main.
         run: |
           gh api "repos/$MIRROR/actions/workflows" --paginate \
             --jq '.workflows[] | select(.state == "active" and (.path | startswith(".github/workflows/"))
-                  and .path != ".github/workflows/mirror.yml" and .path != ".github/workflows/ci.yml")
+                  and .path != ".github/workflows/mirror.yml" and .path != ".github/workflows/ci.yml"
+                  and .path != ".github/workflows/sync-dispatch.yml")
                   | "\(.id) \(.path)"' |
           while read -r id path; do
             gh api -X PUT "repos/$MIRROR/actions/workflows/$id/disable"
