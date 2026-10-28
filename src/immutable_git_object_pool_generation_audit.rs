@@ -1155,6 +1155,17 @@ mod tests {
     #[test]
     fn candidate_drift_before_final_boundary_is_refused() {
         let fixture = Fixture::new();
+        // The fixture makes the candidate and the hook writes into it within one kernel tick, and Linux stamps
+        // directory times from that coarse clock: the write could leave mtime and ctime as they were. Give the
+        // candidate an older mtime first, so the late write moves it as any write a tick later would.
+        fs::File::open(&fixture.candidate)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new().set_modified(
+                    std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000),
+                ),
+            )
+            .unwrap();
         let mut source = fixture.source_observation();
         let candidate = fixture.candidate_lease();
         let result = audit_with_hook(&mut source, &candidate, || {

@@ -4314,6 +4314,28 @@ class HeadChecksTest(Base):
         self.assertFalse(entry.get("missing"))
         self.assertEqual(entry["data"]["found"], {"check / Release / build": ["completed", "success"]})
 
+    def test_an_error_reading_the_forks_checks_is_an_error_not_a_smaller_head(self) -> None:
+        self.gh.heads[("teamleaderleo", "glaeda", SHA_A)] = [check_run("Release / build")]
+        key = gg.parse_key("head", f"teamleaderleo/glaeda@{SHA_A}")
+        gg.register(key, consumer="autoland")
+        real = self.gh.__call__
+
+        def partial(method, url, headers, body):
+            status, head, raw = real(method, url, headers, body)
+            if url.endswith("/graphql") and b"m0: " in (body or b""):
+                doc = json.loads(raw)
+                doc["data"]["m0"] = None
+                doc["errors"] = [{"path": ["m0"], "message": "Something went wrong"}]
+                raw = json.dumps(doc).encode()
+            return status, head, raw
+
+        self.daemon.transport = partial
+        self.daemon.tick(NOW)
+        entry = gg.read_cache(key)
+        self.assertIsNone(entry["data"])
+        self.assertIn("Something went wrong", entry["error"])
+        self.assertEqual(len(self.daemon.head_spend.get("autoland", [])), 0)  # refunded
+
     def test_other_repositories_read_only_their_own_checks(self) -> None:
         gg.register(self.key(SHA_A), consumer="autoland")
         self.daemon.tick(NOW)

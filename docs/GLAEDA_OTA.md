@@ -172,7 +172,7 @@ back, pause the rollout (`control.yml`, below).
   the checked-out `scripts/glaeda-sync-main` with both write keys, so anyone who can merge to either
   `main` can change the sync logic itself.
 - **Checks in the fork.** `ci.yml` (Verify) runs there on Blacksmith for pull requests and for every
-  push to `main`; here it runs for this repository's own pull requests only, on GitHub-hosted runners
+  push to `main` that changes more than documentation; here it runs for this repository's own pull requests only, on GitHub-hosted runners
   (Blacksmith installs on organizations only). Both mains hold the same commits, so the fork's Verify
   at a commit is its check of record in both repositories, and `glaeda-gh checks teamleaderleo/glaeda
   SHA` reads the fork's checks for that commit too. Opening a pull request in the

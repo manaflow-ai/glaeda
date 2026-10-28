@@ -2476,7 +2476,16 @@ class Daemon:
                 continue
             sources = [(owner, repo, (node or {}).get("contexts") or {})]
             if (owner, repo) in CHECKS_OF_RECORD:
-                # the fork may not have the commit yet (sync-main lags): then it adds nothing
+                # An error on the check-of-record read is an error for the head, never a head without those checks:
+                # a partial answer would read as a smaller, greener head.
+                failed = [err for err in doc.get("errors") or [] if (err.get("path") or [None])[0] == f"m{i}"]
+                if failed:
+                    self.store(e["key"], e["cache"],
+                               error="graphql: " + str(failed[0].get("message") or "check-of-record read failed")[:200])
+                    self.refund(e["key"])
+                    continue
+                # A commit the fork does not have yet (sync-main pushes there within a minute) adds nothing, as does a
+                # pull request head opened here, which the fork never gets.
                 record = ((data.get(f"m{i}") or {}).get("object") or {}).get("statusCheckRollup") or {}
                 sources.append((*CHECKS_OF_RECORD[(owner, repo)], record.get("contexts") or {}))
             result = self.head_pages(sha, sources)

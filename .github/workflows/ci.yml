@@ -17,7 +17,8 @@ permissions:
 
 # A push to main is verified in manaflow-ai/glaeda, the fleet fork, on Blacksmith, and not here: both mains hold
 # the same commits (sync-main.yml keeps them equal), so the fork's Verify at a commit is that commit's check of
-# record in both repositories (scripts/glaeda-gh reads it for a teamleaderleo/glaeda head). teamleaderleo/glaeda
+# record in both repositories (scripts/glaeda-gh reads it for a teamleaderleo/glaeda head); a documentation-only
+# push runs no Verify (paths-ignore above), in either repository, as before. teamleaderleo/glaeda
 # is a personal-account repository with no Blacksmith, so it runs this workflow for its own pull requests only,
 # whose heads exist only here. The jobs that need no other job carry the gate; the rest are skipped with them.
 
@@ -624,12 +625,11 @@ jobs:
           restore-keys: |
             verify-cargo-test-${{ runner.os }}-${{ runner.arch }}-rust-1.97.1-
 
-      - name: DIAGNOSTIC ancestors of the checkout (temporary)
-        run: |
-          id
-          d="$PWD"; while :; do stat -c '%n %u:%g %a %F' "$d"; [ "$d" = / ] && break; d=$(dirname "$d"); done
-          stat -c '%n %u:%g %a' "$HOME" "${CARGO_HOME:-$HOME/.cargo}" 2>&1 || true
-          ls -la "$PWD/.." | head
+      - name: No world-writable Cargo home
+        # Blacksmith's image ships ~/.cargo as mode 777. It is a `.cargo` directory above the checkout, so
+        # glaeda's Cargo config preflight rightly refuses that lineage (LineageUnsafe), and the local-install
+        # build tests would judge the runner image instead of the code.
+        run: chmod go-w "${CARGO_HOME:-$HOME/.cargo}"
       - name: Run tests
         run: cargo test --locked --all-targets --all-features
 
