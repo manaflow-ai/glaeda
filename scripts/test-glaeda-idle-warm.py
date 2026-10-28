@@ -17,6 +17,7 @@ import threading
 import time
 import types
 import unittest
+import unittest.mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -106,6 +107,66 @@ class GateTest(Base):
         self.assertEqual(warm.runner_setup([single]), "runners are not in capacity mode")
         unpinned = self.runner("actions-runner-glaeda-5", "--capacity-units 4")
         self.assertEqual(warm.runner_setup([unpinned]), "no toolchain Xcode pin in the runner hooks")
+
+    def test_a_catch_up_keeps_the_nightly_builders_reserve(self) -> None:
+        # The runners' own hook says where the reserve is: a dedicated builder's 40 GiB floor + 20 GiB growth.
+        self.runner("actions-runner-glaeda", "--min-free-gib 30 --capacity-units 4")
+        self.runner("actions-runner-glaeda-nightly-next", "--min-free-gib 40 --dedicated-admit /admit.sh")
+        self.assertEqual(hook.builder_reserve_gib(self.dir), 40)
+        gib = 1024 ** 3
+        warm.free_bytes = lambda path: 31 * gib  # cmux7s on 2026-10-28
+        why = warm.nightly_reserve_refusal(hook)
+        self.assertIn("31.0 GiB free", why)
+        self.assertIn("40 GiB floor + 20 GiB", why)
+        warm.free_bytes = lambda path: 59 * gib
+        self.assertIn("59.0 GiB free", warm.nightly_reserve_refusal(hook))
+        warm.free_bytes = lambda path: 61 * gib
+        self.assertEqual(warm.nightly_reserve_refusal(hook), "")
+        warm.free_bytes = lambda path: None
+        self.assertIn("under the dedicated nightly builder", warm.nightly_reserve_refusal(hook), "unknown is short")
+        # A nightly job freeing disk here goes first, whatever is free.
+        warm.free_bytes = lambda path: 400 * gib
+        waiting = types.SimpleNamespace(nightly_disk_waiter=lambda capacity: "build-nightly-app",
+                                        builder_reserve_gib=lambda home: 40.0, job_disk_gib=lambda: 20.0)
+        self.assertIn("a nightly job waits here for free disk (build-nightly-app)", warm.nightly_reserve_refusal(waiting))
+
+    def test_a_reserve_that_cannot_be_read_keeps_the_catch_up_off(self) -> None:
+        def broken() -> float:
+            raise OSError("transient")
+        for bad in (types.SimpleNamespace(builder_reserve_gib=lambda home: broken(), job_disk_gib=lambda: 20.0),
+                    types.SimpleNamespace(builder_reserve_gib=lambda home: float("nan"), job_disk_gib=lambda: 20.0),
+                    types.SimpleNamespace(builder_reserve_gib=lambda home: 40.0, job_disk_gib=lambda: -1.0)):
+            self.assertIsNone(warm.nightly_reserve(bad))
+            self.assertIn("cannot read the dedicated nightly builder's disk reserve", warm.nightly_reserve_refusal(bad))
+        waiter_broken = types.SimpleNamespace(nightly_disk_waiter=lambda capacity: broken(),
+                                              builder_reserve_gib=lambda home: 0.0, job_disk_gib=lambda: 20.0)
+        self.assertIn("cannot read the nightly disk waiters", warm.nightly_reserve_refusal(waiter_broken))
+        # The hook's own reader takes an unreadable capacity directory for no waiter; a catch-up does not.
+        quiet = types.SimpleNamespace(nightly_disk_waiter=lambda capacity: None,
+                                      builder_reserve_gib=lambda home: 0.0, job_disk_gib=lambda: 20.0)
+        self.assertEqual(warm.nightly_reserve_refusal(quiet), "", "no capacity directory yet: nothing waits")
+        (warm.FLEET_DIR / "capacity").mkdir(parents=True, exist_ok=True)
+        with unittest.mock.patch.object(warm.os, "scandir", side_effect=PermissionError("denied")):
+            self.assertIn("cannot read the nightly disk waiters (PermissionError)", warm.nightly_reserve_refusal(quiet))
+
+    def test_no_dedicated_builder_or_an_older_hook_keeps_no_reserve(self) -> None:
+        warm.free_bytes = lambda path: 1024 ** 3
+        self.runner("actions-runner-glaeda", "--min-free-gib 30 --capacity-units 4")
+        self.assertEqual(warm.nightly_reserve_refusal(hook), "", "no dedicated builder: disk-pressure's job alone")
+        self.assertEqual(warm.nightly_reserve(types.SimpleNamespace()), (0.0, 0.0))
+        self.assertEqual(warm.nightly_reserve_refusal(types.SimpleNamespace()), "")
+
+    def test_idle_refusal_answers_with_the_reserve(self) -> None:
+        saved = warm.compile_state, warm.nightly_reserve_refusal
+        stub = types.SimpleNamespace(thermal_pressure_level=lambda: 0)
+        try:
+            warm.running = lambda: ""
+            warm.compile_state = lambda now=None: (None, "")
+            warm.nightly_reserve_refusal = lambda hook_module: "31.0 GiB free, under the reserve"
+            with unittest.mock.patch.object(warm.os, "getloadavg", return_value=(0.0, 0.0, 0.0)):
+                self.assertEqual(warm.idle_refusal(stub, 5000.0, self.state), "31.0 GiB free, under the reserve")
+        finally:
+            warm.compile_state, warm.nightly_reserve_refusal = saved
 
     def test_last_job_reads_the_telemetry_tail(self) -> None:
         log = self.dir / "jobs.jsonl"
@@ -314,6 +375,123 @@ class RunTest(Base):
         paused = warm.run(True, self.state)
         self.assertEqual(paused["state"], "skip")
         self.assertIn("paused", paused["reason"])
+
+    def grouped_build(self, checkout: Path, free: str, sleep: str, timeout_s: int | None = None,
+                      no_ps: str = "", waiter: str = "None") -> dict:
+        """build() in a driver that leads its own process group, as the LaunchAgent run does, so kill_build ends
+        the fake build's `sleep` grandchild too; asserts no `sleep SLEEP` is left."""
+        driver = self.dir / "glaeda-idle-warm-watch-driver.py"
+        driver.write_text(textwrap.dedent(f"""
+            import importlib.machinery, importlib.util, json
+            from pathlib import Path
+            loader = importlib.machinery.SourceFileLoader("w", {os.fspath(ROOT / 'scripts' / 'glaeda-idle-warm')!r})
+            spec = importlib.util.spec_from_loader("w", loader)
+            warm = importlib.util.module_from_spec(spec)
+            loader.exec_module(warm)
+            warm.FLEET_DIR = Path({os.fspath(self.dir / 'fleet')!r})
+            warm.BUILD_DISK_WATCH_S = 0.2
+            if {timeout_s!r} is not None:
+                warm.BUILD_TIMEOUT_S = {timeout_s!r}
+            warm.free_bytes = lambda path: {free}
+            mode = {no_ps!r}
+            if mode:
+                real_popen = warm.subprocess.Popen
+                def no_ps(args, *rest, **kwargs):
+                    if not (args and args[0] == "/bin/ps"):
+                        return real_popen(args, *rest, **kwargs)
+                    if mode == "spawn":
+                        raise OSError("ps failed")
+                    if mode == "exit":  # ps runs, lists nothing and fails
+                        return real_popen(["/bin/sh", "-c", "exit 1"], *rest, **kwargs)
+                    proc = real_popen(args, *rest, **kwargs)
+                    def broken(*a, **k):
+                        raise OSError("read failed")
+                    proc.communicate = broken
+                    if mode == "stuck":  # a ps that is never reaped
+                        def never(timeout=None):
+                            if timeout is None:
+                                raise AssertionError("an unbounded wait on ps")
+                            raise warm.subprocess.TimeoutExpired(args, timeout)
+                        proc.wait = never
+                    return proc
+                warm.subprocess.Popen = no_ps
+            warm._grouped = warm.own_group()
+            assert warm._grouped
+            print(json.dumps(warm.build(Path({os.fspath(checkout)!r}), 2, Path({os.fspath(self.state)!r}), "/x.app",
+                                        Path({os.fspath(self.dir / 'watch.log')!r}), stop_below=40 * 1024 ** 3,
+                                        nightly_waiter={waiter})))
+        """))
+        proc = subprocess.run([sys.executable, os.fspath(driver)], capture_output=True, text=True, timeout=60,
+                              env={**os.environ, "FAKE_SLEEP": sleep})
+        time.sleep(0.2)
+        leftover = subprocess.run(["/usr/bin/pgrep", "-f", f"sleep {sleep}$"], capture_output=True, text=True).stdout
+        self.assertEqual(leftover.strip(), "", "the build's whole process group was killed")
+        if no_ps:
+            return {"returncode": proc.returncode}
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+
+    @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
+    def test_a_finished_build_whose_group_it_cannot_list_ends_with_the_catch_up(self) -> None:
+        for mode in ("spawn", "read", "stuck", "exit"):
+            with self.subTest(ps=mode):
+                result = self.grouped_build(self.fake_setup() if mode == "spawn" else self.state / ".catch-up" / "cmux",
+                                            "100 * 1024 ** 3", "0", no_ps=mode)
+                self.assertEqual(result["returncode"], -signal.SIGKILL)
+
+    @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
+    def test_a_nightly_job_waiting_for_disk_stops_the_build(self) -> None:
+        result = self.grouped_build(self.fake_setup(), "100 * 1024 ** 3", "143",
+                                    waiter="lambda: 'a nightly job waits here for free disk (build-nightly-app)'")
+        self.assertEqual(result["kept"], "false")
+        self.assertEqual(result["reason"], "stopped: a nightly job waits here for free disk (build-nightly-app)")
+
+    def test_the_reserve_is_read_again_once_the_locks_are_taken(self) -> None:
+        # A nightly waiter that appears between the idle check and the locks keeps the build from starting.
+        if sys.platform != "darwin":
+            return
+        self.fake_setup()
+        calls = []
+        def refusal(hook_module):
+            calls.append(1)
+            return "a nightly job waits here for free disk (late)"
+        saved = warm.nightly_reserve_refusal
+        try:
+            warm.nightly_reserve_refusal = refusal
+            done = warm.run(True, self.state)
+        finally:
+            warm.nightly_reserve_refusal = saved
+        self.assertEqual((done["state"], done["reason"]), ("skip", "a nightly job waits here for free disk (late)"))
+        self.assertTrue(calls)
+        self.assertFalse((self.dir / "calls").exists(), "no build started")
+
+    @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
+    def test_a_group_it_cannot_list_ends_with_the_catch_up(self) -> None:
+        # ps fails: the group cannot be seen empty, so the catch-up ends its whole group, itself included.
+        result = self.grouped_build(self.fake_setup(), "39 * 1024 ** 3", "139", no_ps="spawn")
+        self.assertEqual(result["returncode"], -signal.SIGKILL)
+
+    @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
+    def test_a_build_under_the_builders_floor_is_stopped(self) -> None:
+        checkout = self.fake_setup()
+        started = time.monotonic()
+        result = self.grouped_build(checkout, "39 * 1024 ** 3", "131")
+        self.assertLess(time.monotonic() - started, 30, "stopped long before the fake build ends")
+        self.assertEqual(result["kept"], "false")
+        self.assertIn("stopped at 39.0 GiB free, under the dedicated nightly builder's 40 GiB floor", result["reason"])
+        self.assertEqual(self.grouped_build(checkout, "100 * 1024 ** 3", "0")["kept"], "true",
+                         "room to spare: the build finishes")
+
+    @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
+    def test_a_watched_build_still_times_out(self) -> None:
+        result = self.grouped_build(self.fake_setup(), "100 * 1024 ** 3", "133", timeout_s=1)
+        self.assertEqual((result["kept"], result["reason"]), ("false", "timed out after 1 s"))
+
+    @unittest.skipUnless(sys.platform == "darwin", "runs only on macOS")
+    def test_unknown_free_disk_stops_the_whole_build_group(self) -> None:
+        result = self.grouped_build(self.fake_setup(), "None", "137")
+        self.assertEqual(result["kept"], "false")
+        self.assertIn("cannot read free disk", result["reason"])
 
     def test_kill_switch_and_no_owned_state(self) -> None:
         if sys.platform != "darwin":

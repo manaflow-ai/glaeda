@@ -54,6 +54,7 @@ import fcntl
 import importlib.machinery
 import importlib.util
 import json
+import math
 import os
 import platform
 import re
@@ -283,14 +284,76 @@ def idle_refusal(hook: Any, now: float, state: Path) -> str:
     level = hook.thermal_pressure_level()
     if level is None or level > 0:
         return f"thermal pressure {level if level is not None else 'unknown'}"
-    # No free-disk gate of its own: a catch-up rebuilds a kept root in place, and disk-pressure keeps the
-    # fleet's free-space policy (2026-09-27: the old 136 GiB floor kept cmux14, 460 GiB, from ever warming).
+    # No free-disk floor of its own (2026-09-27: the old 136 GiB floor kept cmux14, 460 GiB, from ever warming),
+    # but the nightly reserve every PR runner keeps (nightly_reserve_refusal) holds here too.
+    why = nightly_reserve_refusal(hook)
+    if why:
+        return why
     host_lock = os.fspath(FLEET_DIR / "host.lock")
     held = hook.host_held(host_lock, os.fspath(FLEET_DIR / "reservation.json"), now)
     if held:
         return held
     if os.path.exists(host_lock) and hook.lock_waiters(host_lock, set()):
         return "a fleet build is waiting for the host lock"  # flock has no writer preference: let it in
+    return ""
+
+
+def nightly_reserve(hook: Any) -> tuple[float, float] | None:
+    """(the dedicated nightly builder's disk floor here, one job's growth) in GiB from the runners' own hook
+    (builder_reserve_gib, job_disk_gib); (0, 0) with no dedicated builder or a hook that predates those helpers;
+    None when they fail or answer something that is not a finite number, which keeps a catch-up from starting."""
+    if not (hasattr(hook, "builder_reserve_gib") and hasattr(hook, "job_disk_gib")):
+        return 0.0, 0.0
+    try:
+        builder = float(hook.builder_reserve_gib(HOME))
+        growth = float(hook.job_disk_gib())
+    except Exception:  # noqa: BLE001 - a reserve we cannot read is not a reserve we may ignore
+        return None
+    if not (math.isfinite(builder) and math.isfinite(growth)) or builder < 0 or growth < 0:
+        return None
+    return (builder, growth) if builder > 0 else (0.0, 0.0)
+
+
+def nightly_waiter_refusal(hook: Any) -> str:
+    """Why a nightly job's wait for free disk keeps a catch-up off (it waits, or its markers cannot be read), or ''.
+    A hook without nightly_disk_waiter predates the reserve: nothing to read."""
+    if not hasattr(hook, "nightly_disk_waiter"):
+        return ""
+    try:
+        # the hook's reader takes an unreadable directory for no waiter; here that is unknown, so short
+        with os.scandir(FLEET_DIR / "capacity"):
+            pass
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        return f"cannot read the nightly disk waiters ({type(error).__name__})"
+    try:
+        waiter = hook.nightly_disk_waiter(FLEET_DIR / "capacity")
+    except Exception as error:  # noqa: BLE001
+        return f"cannot read the nightly disk waiters ({type(error).__name__})"
+    return f"a nightly job waits here for free disk ({waiter})" if waiter else ""
+
+
+def nightly_reserve_refusal(hook: Any) -> str:
+    """Why a catch-up must not start for the nightly builder's disk, or ''. A PR runner on a mini with a dedicated
+    nightly builder listens only with the builder's floor plus one job's growth free, and none starts while a
+    nightly job frees disk (the hook's NIGHTLY_DISK_RESERVE, Gate.low_disk); a catch-up is a compile like theirs.
+    On 2026-10-28 cmux7s's catch-up took free disk from 46 to 31 GiB while its builder needed 42, so the builder's
+    listener was held off and every PR runner with it."""
+    why = nightly_waiter_refusal(hook)
+    if why:
+        return why
+    reserve = nightly_reserve(hook)
+    if reserve is None:
+        return "cannot read the dedicated nightly builder's disk reserve"
+    builder, growth = reserve
+    if builder <= 0:
+        return ""
+    free = free_bytes(FLEET_DIR)
+    need = (builder + growth) * 1024 ** 3
+    if free is None or free < need:
+        return (f"{(free or 0) / 1024 ** 3:.1f} GiB free, under the dedicated nightly builder's {builder:g} GiB "
+                f"floor + {growth:g} GiB for a build")
     return ""
 
 
@@ -478,22 +541,35 @@ def own_group() -> bool:
         return False
 
 
-def kill_build(passes: int = 3) -> None:
-    """SIGKILL every other process in our group (the build and anything it started)."""
+def kill_build(passes: int = 3) -> bool:
+    """SIGKILL every other process in our group (the build and anything it started); whether the group was seen
+    empty (False when ps failed or members outlived every pass)."""
     me = os.getpid()
     for _ in range(passes):
         try:
-            out = subprocess.run(["/bin/ps", "-axo", "pid=,pgid="], capture_output=True, text=True, timeout=2).stdout
+            ps = subprocess.Popen(["/bin/ps", "-axo", "pid=,pgid="], stdout=subprocess.PIPE, text=True)
+        except OSError:
+            return False
+        try:
+            out, _ = ps.communicate(timeout=2)
         except (OSError, subprocess.SubprocessError):
-            return
+            with contextlib.suppress(OSError):
+                ps.kill()
+            with contextlib.suppress(OSError, subprocess.SubprocessError):  # bounded: the caller escalates
+                ps.wait(timeout=2)
+            return False
+        if ps.returncode != 0:  # a failed ps lists nothing, which is not an empty group
+            return False
+        # ps runs in our group too: it is not a member to kill or to wait for
         members = [int(pid) for pid, pgid in (line.split() for line in out.splitlines() if len(line.split()) == 2)
-                   if pgid.isdigit() and pid.isdigit() and int(pgid) == me and int(pid) != me]
+                   if pgid.isdigit() and pid.isdigit() and int(pgid) == me and int(pid) not in (me, ps.pid)]
         if not members:
-            return
+            return True
         for pid in members:
             with contextlib.suppress(OSError):
                 os.kill(pid, signal.SIGKILL)
         time.sleep(0.05)
+    return False
 
 
 def stop_fuzz_child() -> None:
@@ -599,8 +675,32 @@ def last_result(log: Path) -> dict[str, Any]:
     return {}
 
 
-def build(checkout: Path, root: int, state: Path, xcode: str, log: Path) -> dict[str, Any]:
-    """Run cmux's owned_catch_up.sh in our process group, its output appended to LOG; its result line."""
+BUILD_DISK_WATCH_S = 15.0
+END_CHILD_WAIT_S = 10.0
+
+
+def end_child() -> None:
+    """Kill the build and reap it, then kill what is left of our group (anything the build started; reaping the
+    child first, so its zombie is not counted). When the child outlives END_CHILD_WAIT_S, or the group cannot be
+    seen empty, our whole group ends, us included, so no build process outlives the locks we hold (as stop() does)."""
+    assert _child is not None
+    with contextlib.suppress(OSError):
+        _child.kill()
+    try:
+        _child.wait(timeout=END_CHILD_WAIT_S)
+    except subprocess.TimeoutExpired:
+        if _grouped:
+            os.killpg(os.getpid(), signal.SIGKILL)
+        raise
+    if _grouped and not kill_build():
+        os.killpg(os.getpid(), signal.SIGKILL)
+
+
+def build(checkout: Path, root: int, state: Path, xcode: str, log: Path, stop_below: int | None = None,
+          nightly_waiter: Any = None) -> dict[str, Any]:
+    """Run cmux's owned_catch_up.sh in our process group, its output appended to LOG; its result line. With
+    stop_below, the build is killed once free disk drops under it, and with nightly_waiter (a callable: why, or
+    ''), once a nightly job waits for free disk; both are read every BUILD_DISK_WATCH_S."""
     global _child
     env = {key: value for key, value in os.environ.items() if not key.startswith(("GITHUB_", "RUNNER_", "CMUX_"))}
     env.update(PATH=PATH, CMUX_CI_XCODE_APP=xcode, CMUX_CATCH_UP_LOG=os.fspath(log))
@@ -609,16 +709,37 @@ def build(checkout: Path, root: int, state: Path, xcode: str, log: Path) -> dict
         _child = subprocess.Popen(["/usr/bin/nice", "-n", "5", "/bin/bash", "scripts/ci/owned_catch_up.sh", str(root),
                                    os.fspath(state)], cwd=checkout, env=env, stdin=subprocess.DEVNULL,
                                   stdout=output, stderr=subprocess.STDOUT)
+    deadline = started + BUILD_TIMEOUT_S
     try:
-        code = _child.wait(timeout=BUILD_TIMEOUT_S)
-    except subprocess.TimeoutExpired:
-        kill_build() if _grouped else _child.kill()
-        _child.wait()
-        return {"kept": "false", "reason": f"timed out after {BUILD_TIMEOUT_S} s",
-                "wall_seconds": round(time.monotonic() - started, 1)}
+        while True:
+            try:
+                watched = stop_below is not None or nightly_waiter is not None
+                code = _child.wait(timeout=max(0.0, min(BUILD_DISK_WATCH_S if watched else BUILD_TIMEOUT_S,
+                                                        deadline - time.monotonic())))
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            free = free_bytes(FLEET_DIR) if stop_below else None
+            low = stop_below is not None and (free is None or free < stop_below)  # unknown free disk is short
+            waiting = nightly_waiter() if nightly_waiter is not None and not low else ""
+            if low or waiting or time.monotonic() >= deadline:
+                end_child()
+                if waiting:
+                    reason = f"stopped: {waiting}"
+                elif not low:
+                    reason = f"timed out after {BUILD_TIMEOUT_S} s"
+                elif free is None:
+                    reason = "stopped: cannot read free disk while the dedicated nightly builder keeps a floor"
+                else:
+                    reason = (f"stopped at {free / 1024 ** 3:.1f} GiB free, under the dedicated nightly builder's "
+                              f"{stop_below / 1024 ** 3:g} GiB floor")
+                return {"kept": "false", "reason": reason, "wall_seconds": round(time.monotonic() - started, 1)}
     finally:
         _child = None
-    kill_build()  # anything the build left running in our group (a detached build service)
+    # anything the build left running in our group (a detached build service); a group that cannot be seen
+    # empty ends whole, us included, so nothing of the build outlives the locks (the attempt stays recorded)
+    if _grouped and not kill_build():
+        os.killpg(os.getpid(), signal.SIGKILL)
     result = last_result(log)
     if not result:
         result = {"kept": "false", "reason": f"exit {code}, no result line"}
@@ -1281,6 +1402,14 @@ def run(apply: bool, state: Path, now: float | None = None) -> dict[str, Any]:
             busy = running()  # a job that started while the locks were taken: it will ask for them
             if busy:
                 return {**base, "state": "skip", "reason": f"busy: {busy}"}
+            # the reserve and the nightly waiters again, now the locks are ours: either may have changed since
+            why = nightly_reserve_refusal(hook)
+            if why:
+                return {**base, "state": "skip", "reason": why}
+            reserve = nightly_reserve(hook)
+            if reserve is None:
+                return {**base, "state": "skip", "reason": "cannot read the dedicated nightly builder's disk reserve"}
+            builder = reserve[0]
             logs = work / "logs"
             logs.mkdir(exist_ok=True)
             log = logs / f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-root-{root}.log"
@@ -1288,7 +1417,9 @@ def run(apply: bool, state: Path, now: float | None = None) -> dict[str, Any]:
             # failed try of this head on the next run, so it is not rebuilt into the same kill forever.
             memory["attempt"] = {"root": root, "head": head, "at": int(time.time())}
             save_memory(memory_path, memory)
-            result = build(work / "cmux", root, state, scope["xcode"], log)
+            result = build(work / "cmux", root, state, scope["xcode"], log,
+                           stop_below=int(builder * 1024 ** 3) if builder > 0 else None,
+                           nightly_waiter=(lambda: nightly_waiter_refusal(hook)) if builder > 0 else None)
             memory.pop("attempt", None)
             trim_logs(logs)
         finally:
