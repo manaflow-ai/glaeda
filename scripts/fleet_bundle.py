@@ -413,7 +413,15 @@ def inspect_generation(destination: Path, digest: str, source: str, target: str)
             directory = directories[parts[0]] if len(parts) == 2 else generation
             if file_observation(os.stat(parts[-1], dir_fd=directory, follow_symlinks=False)) != file_observation(before):
                 raise BundleError("saved generation file changed during inspection")
-        # Directory times miss an entry added within one coarse filesystem clock tick (Linux), so enumerate again.
+        # File and directory times miss a change made within one coarse filesystem clock tick (Linux): a same-size
+        # rewrite or a new entry can leave every stat field as it was. Read every file and enumerate again.
+        for name, before in observations.items():
+            parts = name.split("/")
+            directory = directories[parts[0]] if len(parts) == 2 else generation
+            data = raw if name == "candidate.tar.gz" else expected[name]
+            again, _ = read_generation_file(directory, parts[-1], len(data), stat.S_IMODE(before.st_mode))
+            if again != data:
+                raise BundleError("saved generation file changed during inspection")
         check_inventory()
         return {**receipt, "schema": "glaeda-fleet-generation-check/v1", "state": "verified",
                 "authority": "generation_integrity_only"}
