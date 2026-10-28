@@ -630,6 +630,18 @@ jobs:
         # glaeda's Cargo config preflight rightly refuses that lineage (LineageUnsafe), and the local-install
         # build tests would judge the runner image instead of the code.
         run: chmod go-w "${CARGO_HOME:-$HOME/.cargo}"
+      - name: DIAGNOSTIC host observation inputs (temporary)
+        run: |
+          for f in /proc/stat /proc/loadavg /proc/meminfo /proc/pressure/cpu /proc/pressure/memory /proc/pressure/io \
+            /proc/net/tcp /proc/net/tcp6 /proc/sys/kernel/sched_autogroup_enabled /sys/kernel/sched_ext \
+            /sys/devices/system/cpu/online /sys/devices/system/cpu/nohz_full /sys/devices/system/cpu/isolated \
+            /sys/devices/system/cpu/smt/active; do
+            if [ -e "$f" ]; then echo "present $f $(head -c 80 "$f" 2>&1 | head -1)"; else echo "MISSING $f"; fi
+          done
+          uname -a
+          systemctl --version | head -1 || true
+          systemctl is-system-running || true
+          cargo run --locked --quiet --bin glaeda-host-observe -- --output json 2>&1 | head -c 600 || true
       - name: Run tests
         run: cargo test --locked --all-targets --all-features
 
