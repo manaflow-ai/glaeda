@@ -94,6 +94,10 @@ Each run checks, as the runner user and without sudo:
                                      the newest runner checkout over CHECKOUT_LOCAL_SLOW_S is local git work,
                                      under it the step is waiting on the network.
                                      Reported only (a warning); it never refuses or delays a job.
+  load_high                         the five-minute load average is over LOAD_HIGH_FACTOR times hw.ncpu. The
+                                     finding is emitted after LOAD_HIGH_SUSTAINED_S of consecutive high passes,
+                                     and includes the most frequent commands in a bounded ps sample. Reported only;
+                                     inspect admission and those commands before changing the host.
   node_toolchain_missing              the runner hook named one exact Rust toolchain that is absent. Healed as the
                                      runner user with `rustup toolchain install ... --profile minimal`, then the
                                      next health pass revalidates the hook. Only the exact version/triple from the
@@ -251,6 +255,12 @@ CHECKOUT_PROBE_TTL_S = 3600  # a probe result is reused for an hour (kept in CHE
 CHECKOUT_PROBE_MAX_ENTRIES = 200  # _work entries looked at, all runners, to find a checkout
 CHECKOUT_PROBE_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"  # the runners' WORKLOAD_PATH
 CHECKOUT_STEP = re.compile(r"(?:Checkout\b.*|Run actions/checkout@\S+)")
+# load_high: a sustained host overload is actionable, while one scheduler spike is not.  The
+# process sample is deliberately capped: this runs from a two-minute LaunchAgent on every mini.
+LOAD_HIGH_FACTOR = 2
+LOAD_HIGH_SUSTAINED_S = 5 * 60
+LOAD_PROCESS_SAMPLE_MAX = 512
+LOAD_PROCESS_TOP = 5
 LOGINWINDOW = Path("/Library/Preferences/com.apple.loginwindow.plist")
 TAILSCALE_APP = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 # Tailscale's own address: on a healthy node the OS sends it into the tunnel (a utun interface).
@@ -562,6 +572,36 @@ class Mini:
             if len(parts) == 4 and parts[0].isdigit() and parts[1].isdigit():
                 rows.append((int(parts[0]), int(parts[1]), parts[2], parts[3].strip()))
         return rows
+
+    def load_facts(self) -> dict[str, Any] | None:
+        """Return the 1/5/15-minute load and a bounded process-command sample.
+
+        `ps` is a cheap point-in-time listing; unlike `top -l` it does not run a
+        multi-sample scan that can outlive the health process.  Only the first
+        bounded set of commands is retained for the diagnostic counts.
+        """
+        code, text = sh(["/usr/sbin/sysctl", "-n", "hw.ncpu"], timeout=5)
+        try:
+            cores = int(text.strip()) if code == 0 else 0
+        except ValueError:
+            cores = 0
+        code, text = sh(["/usr/sbin/sysctl", "-n", "vm.loadavg"], timeout=5)
+        match = re.search(r"\{\s*([^\s}]+)\s+([^\s}]+)\s+([^\s}]+)", text) if code == 0 else None
+        try:
+            load5 = float(match.group(2)) if match else float("nan")
+        except (TypeError, ValueError):
+            load5 = float("nan")
+        if cores <= 0 or not math.isfinite(load5):
+            return None
+        _code, commands = sh(["/bin/ps", "-Aww", "-o", "command="], timeout=10)
+        counts: dict[str, int] = {}
+        for line in commands.splitlines()[:LOAD_PROCESS_SAMPLE_MAX]:
+            word = line.strip().split(None, 1)[0] if line.strip() else ""
+            command = os.path.basename(word) if word else "<unknown>"
+            counts[command] = counts.get(command, 0) + 1
+        top = sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))[:LOAD_PROCESS_TOP]
+        return {"cores": cores, "load5": load5,
+                "processes": [{"command": command, "count": count} for command, count in top]}
 
     def process_tree(self) -> list[tuple[int, int, str]]:
         """(pid, ppid, command) for ownership checks that need ancestry."""
@@ -1297,6 +1337,34 @@ def check_power(mini: Mini) -> list[dict[str, Any]]:
         out.append(finding("display_sleep", "warn", f"display sleep is {m.group(1)} min; the screen lock "
                            "follows it", "impossible", "root: pmset -a displaysleep 0"))
     return out
+
+
+def check_load_high(mini: Mini) -> list[dict[str, Any]]:
+    """Report a five-minute load that exceeds twice the host's CPU count.
+
+    The caller keeps this finding across passes and only publishes it after
+    LOAD_HIGH_SUSTAINED_S, so a single build burst does not page an operator.
+    """
+    facts = mini.load_facts()
+    if not isinstance(facts, dict):
+        return []
+    cores, load5 = facts.get("cores"), facts.get("load5")
+    if not finite(cores) or not isinstance(cores, int) or cores <= 0 or not finite(load5):
+        return []
+    threshold = LOAD_HIGH_FACTOR * cores
+    if load5 <= threshold:
+        return []
+    top = facts.get("processes")
+    labels = []
+    if isinstance(top, list):
+        for item in top[:LOAD_PROCESS_TOP]:
+            if isinstance(item, dict) and isinstance(item.get("command"), str) and finite(item.get("count")):
+                labels.append(f"{item['command']} ({int(item['count'])})")
+    processes = ", ".join(labels) or "unavailable"
+    evidence = (f"5-min load {load5:.1f} exceeds {threshold} ({LOAD_HIGH_FACTOR}x {cores} cores); "
+                f"top process commands by count: {processes}")
+    return [finding("load_high", "error", evidence, "impossible",
+                    "sustained host overload; inspect admission and the listed process commands")]
 
 
 def check_leaked_test_apps(mini: Mini) -> list[dict[str, Any]]:
@@ -2540,7 +2608,7 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
         # a tunnel that is down or off its route explains a `claude -p` that does not answer: claude_route neither
         # keeps that probe nor reroutes on it until the tunnel is back (tailscale_no_route's restart may fix it)
         tunnel_down = any(f["code"] in TUNNEL_DOWN for f in tailnet)
-        found = (check_console(mini) + check_power(mini) + tailnet + check_runners(mini) + check_runner_versions(mini)
+        found = (check_console(mini) + check_power(mini) + check_load_high(mini) + tailnet + check_runners(mini) + check_runner_versions(mini)
                  + check_foreign_runners(mini)
                  + check_node_eligibility(mini) + check_toolchain_missing(mini) + check_toolchain(mini)
                  + check_leaked_test_apps(mini)
@@ -2563,6 +2631,8 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
         s = seen.get(f["id"]) or {"since": now, "runs": 0}
         s["runs"] = s.get("runs", 0) + 1
         seen[f["id"]] = s
+        if apply and f["code"] == "load_high" and now - s["since"] < LOAD_HIGH_SUSTAINED_S:
+            continue  # a spike is not a sustained overload
         if apply and s["runs"] < REPORT_AFTER.get(f["code"], 1):
             continue  # seen, not yet reported
         f["since"] = iso(s["since"])
