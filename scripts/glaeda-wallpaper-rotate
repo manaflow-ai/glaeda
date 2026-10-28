@@ -148,10 +148,11 @@ def main() -> int:
         STATE.write_text(json.dumps({"index": index + 1, "image": image.name}) + "\n")
         STATE.chmod(0o600)
     try:
-        subprocess.run(["/usr/bin/killall", "WallpaperAgent"], check=False,
+        # launchd restarts this user's WallpaperAgent, which reloads the store; -u: never another account's.
+        subprocess.run(["/usr/bin/pkill", "-x", "-u", str(os.getuid()), "WallpaperAgent"], check=False,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError:
-        # Unit tests and non-macOS hygiene installs do not have killall.
+        # Unit tests and non-macOS hygiene installs may not have /usr/bin/pkill.
         pass
     print(f"applied {image.name} ({changed} spaces)")
     return 0

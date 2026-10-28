@@ -148,7 +148,7 @@ class Repository(unittest.TestCase):
             with self.subTest(job=f"{name}:{job}"):
                 text = (rl.workflow_files([])[0].parent / name).read_text(encoding="utf-8")
                 gated = "github.repository == 'teamleaderleo/glaeda'" in text
-                self.assertTrue(gated or reason in (rl.HOSTED_ON_PURPOSE, rl.HOSTED_BASELINE, rl.HOSTED_PROBE), reason)
+                self.assertTrue(gated or reason in (rl.HOSTED_ON_PURPOSE, rl.HOSTED_PROBE), reason)
 
 
 if __name__ == "__main__":

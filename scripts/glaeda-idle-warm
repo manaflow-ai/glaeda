@@ -1167,9 +1167,10 @@ def run_replay(hook: Any, capacity: Path, ours: str, build: Path, request: Path,
 
 def dismiss_crash_dialogs() -> None:
     """A crash the fuzzer caused leaves macOS's crash dialog (not in our process group) on the console, over the
-    next GUI job: close it."""
+    next GUI job: close it. -u: only this user's dialog (the job's own), never another account's."""
     with contextlib.suppress(OSError, subprocess.SubprocessError):
-        subprocess.run(["/usr/bin/pkill", "-9", "-x", "Problem Reporter"], capture_output=True, timeout=2)
+        subprocess.run(["/usr/bin/pkill", "-9", "-u", str(os.getuid()), "-x", "Problem Reporter"],
+                       capture_output=True, timeout=2)
 
 
 # ---------------------------------------------------------------- run

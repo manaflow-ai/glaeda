@@ -1,4 +1,4 @@
-"""Fixed Big Red GitHub Actions JIT task adapter.
+"""Fixed owned-Linux GitHub Actions JIT task adapter.
 
 This is an internal semantic adapter, not a remote command surface. The Rust
 controller supplies one already-reviewed assignment identity, payload generation,

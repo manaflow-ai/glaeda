@@ -1,7 +1,7 @@
 //! Native-Linux physical backend for one trusted GitHub Actions JIT task.
 //!
 //! The GitHub delivery/catalog remains the canonical scheduler ledger. This module owns only the
-//! exact Big Red task identity and the fixed helper boundary proven by the owned-Linux primitive.
+//! exact owned-Linux task identity and the fixed helper boundary proven by the owned-Linux primitive.
 
 use std::fs;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};

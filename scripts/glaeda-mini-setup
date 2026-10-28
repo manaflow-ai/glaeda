@@ -97,7 +97,7 @@ eviction, and OTA updates continue after reboot without a `gui/$uid` login domai
 requires passwordless sudo on the host, like `glaeda-cmux-runner --headless`; it never changes
 the runner registration or controller credentials.
 
-Linux (Big Red, owned Linux machines, Linux VMs on the fleet) gets the hygiene profile, the
+Linux (owned Linux machines, Linux VMs on the fleet) gets the hygiene profile, the
 only one written for it so far, with or without the flag. It installs the same tools and
 the systemd user units in ops/systemd (glaeda-disk-pressure, glaeda-worktree-reclaim and
 glaeda-update, each a service and a timer, and the long-running glaeda-gh service) into
