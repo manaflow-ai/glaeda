@@ -4753,9 +4753,24 @@ class HeadChecksTest(Base):
         self.daemon.tick(NOW)
         found = gg.read_cache(key)["data"]["found"]
         self.assertEqual(found["check / Release / build"], ["completed", "success"])
-        self.assertEqual(found["check / Verify / ci-status"], ["completed", "failure"])  # past the fork's first page
+        self.assertEqual(found["manaflow-ai/glaeda: check / Verify / ci-status"], ["completed", "failure"])  # past page 1
         self.assertEqual(len(found), 122)
         self.assertEqual(len(self.gh.gql_calls()), 2)  # one batched query for both repositories, one further page
+
+    def test_a_same_named_check_in_the_fork_never_stands_in_for_one_here(self) -> None:
+        # a newer green check of the same name in one repository must not hide a red one in the other
+        mine = check_run("Verify / ci-status", "COMPLETED", "FAILURE")
+        mine["databaseId"] = 1
+        theirs = check_run("Verify / ci-status")
+        theirs["databaseId"] = 99
+        self.gh.heads[("teamleaderleo", "glaeda", SHA_A)] = [mine]
+        self.gh.heads[("manaflow-ai", "glaeda", SHA_A)] = [theirs]
+        key = gg.parse_key("head", f"teamleaderleo/glaeda@{SHA_A}")
+        gg.register(key, consumer="autoland")
+        self.daemon.tick(NOW)
+        found = gg.read_cache(key)["data"]["found"]
+        self.assertEqual(found["check / Verify / ci-status"], ["completed", "failure"])
+        self.assertEqual(found["manaflow-ai/glaeda: check / Verify / ci-status"], ["completed", "success"])
 
     def test_a_glaeda_head_the_fork_lacks_has_only_its_own_checks(self) -> None:
         self.gh.heads[("teamleaderleo", "glaeda", SHA_B)] = [check_run("Release / build")]

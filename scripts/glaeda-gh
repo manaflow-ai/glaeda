@@ -1264,22 +1264,23 @@ def head_query(owner: str, repo: str, sha: str, cursor: str | None = None) -> st
             + HEAD_CONTEXTS % after + "}}}")
 
 
-def fold_contexts(nodes: list, runs: dict, statuses: dict, ids: dict) -> None:
+def fold_contexts(nodes: list, runs: dict, statuses: dict, ids: dict, prefix: str = "") -> None:
     """Add one page of a head's contexts to runs (`workflow / job` -> [(id, status, conclusion)]), statuses
-    (`status / context` -> (status, conclusion)) and ids (failed Actions jobs)."""
+    (`status / context` -> (status, conclusion)) and ids (failed Actions jobs). prefix (`OWNER/REPO: `) keys another
+    repository's checks apart, so a same-named check there never stands in for one here (CHECKS_OF_RECORD)."""
     for item in nodes or []:
         if not item:
             continue
         if item.get("__typename") == "StatusContext":
             state = (item.get("state") or "").lower()
-            statuses[f"status / {item['context']}"] = (
+            statuses[f"{prefix}status / {item['context']}"] = (
                 "in_progress" if state in ("pending", "expected") else "completed",
                 "failure" if state == "error" else state)
             continue
         suite = item.get("checkSuite") or {}
         slug = (suite.get("app") or {}).get("slug")
         owner = (((suite.get("workflowRun") or {}).get("workflow") or {}).get("name") or slug or "check")
-        key = f"{owner} / {item['name']}"
+        key = f"{prefix}{owner} / {item['name']}"
         conclusion = (item.get("conclusion") or "").lower()
         runs.setdefault(key, []).append((item.get("databaseId") or 0, (item.get("status") or "").lower(), conclusion))
         if slug == "github-actions" and conclusion == "failure" and item.get("databaseId"):
@@ -2758,9 +2759,10 @@ class Daemon:
         runs: dict = {}
         statuses: dict = {}
         ids: dict = {}
-        for owner, repo, contexts in sources:
+        for n, (owner, repo, contexts) in enumerate(sources):
+            prefix = f"{owner}/{repo}: " if n else ""  # the head's own checks keep their names
             for _ in range(HEAD_BATCH_MAX_CONTEXTS_PAGES):
-                fold_contexts(contexts.get("nodes"), runs, statuses, ids)
+                fold_contexts(contexts.get("nodes"), runs, statuses, ids, prefix)
                 page = contexts.get("pageInfo") or {}
                 if not page.get("hasNextPage"):
                     break
