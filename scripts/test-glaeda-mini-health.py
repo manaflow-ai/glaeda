@@ -61,6 +61,7 @@ class FakeMini(health.Mini):
         self.leaks: list[tuple[int, str]] = []
         self.disk: dict = {}
         self.pass_facts: dict | None = None  # no glaeda-disk agent or snapshots here: no disk pass to judge
+        self.mirror_facts: dict | None = None  # no mirror source here: no runner mirror to judge
         self.refusal: str | None = None
         self.toolchain_installs: list[str] = []
         self.claude: str | None = None  # no Claude Code here: no route to check
@@ -220,6 +221,9 @@ class FakeMini(health.Mini):
 
     def disk_pass(self):
         return self.pass_facts
+
+    def git_mirror(self):
+        return self.mirror_facts
 
     def node_refusal(self):
         return self.refusal
@@ -610,6 +614,58 @@ class DiskAndLeaks(Base):
         accounting = {} if accounting_at is None else {"16777230": {"at": accounting_at}}
         agent = agent if agent == "not installed" else f"gui/501/com.teamleaderleo.glaeda.disk-pressure {agent}"
         return {"sizes": sizes, "accounting": accounting, "agent": agent, "last_exit": last_exit}
+
+    def stamp(self, at: float) -> str:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(at))
+
+    def test_a_runner_mirror_fetched_within_30_minutes_is_healthy(self) -> None:
+        self.mini.mirror_facts = {"record": {"time": self.stamp(NOW - 60), "fetched_at": self.stamp(NOW - 29 * 60),
+                                             "fetch": {"ok": False}, "state": "fetch-failed"}, "running": False}
+        self.assertEqual(self.run_once()["findings"], [])
+
+    def test_a_runner_mirror_stalled_past_30_minutes_is_a_finding(self) -> None:
+        # cmux14, 2026-10-27: a reseed held the pass for 40 min while feat-cmux-next moved on
+        self.mini.mirror_facts = {"record": {"time": self.stamp(NOW - 46 * 60), "fetch": {"ok": True},
+                                             "state": "applied"}, "running": True}
+        report = self.run_once()
+        self.assertEqual(self.ids(report), ["git_mirror_stale"])
+        f = report["findings"][0]
+        self.assertIn("last good fetch 46 min ago (fresh within 30)", f["evidence"])
+        self.assertIn("a pass is running", f["evidence"])
+        self.assertEqual((f["severity"], f["auto_fix"]), ("warn", "pending"))
+
+    def test_a_runner_mirror_whose_passes_keep_failing_is_a_finding(self) -> None:
+        self.mini.mirror_facts = {"record": {"time": self.stamp(NOW - 60), "fetched_at": self.stamp(NOW - 3 * 3600),
+                                             "fetch": {"ok": False}, "state": "fetch-failed"}, "running": False}
+        f = self.run_once()["findings"][0]
+        self.assertEqual(f["id"], "git_mirror_stale")
+        self.assertIn("last good fetch 180 min ago", f["evidence"])
+        self.assertEqual(f["auto_fix"], "impossible")
+
+    def test_a_repair_that_stopped_part_way_is_a_finding_however_fresh(self) -> None:
+        self.mini.mirror_facts = {"record": {"time": self.stamp(NOW - 120), "fetched_at": self.stamp(NOW - 120),
+                                             "fetch": {"ok": True}, "state": "repairing"}, "running": False}
+        f = self.run_once()["findings"][0]
+        self.assertEqual(f["id"], "git_mirror_stale")
+        self.assertIn("a repair stopped part way", f["evidence"])
+        self.mini.mirror_facts["running"] = True  # still repairing: the fresh tips are enough
+        self.assertEqual(self.run_once(NOW + 1)["findings"], [])
+
+    def test_only_a_source_glaeda_git_mirror_acts_on_turns_the_check_on(self) -> None:
+        home = self.dir / "home"
+        config = home / health.GIT_MIRROR_SOURCE
+        config.parent.mkdir(parents=True)
+        with mock.patch.object(health.sys, "platform", "darwin"):
+            for doc, on in (({"schema": 1, "source": "direct"}, True), ({"schema": 1, "source": "lan"}, False),
+                            ({"source": "direct"}, False)):
+                config.write_text(json.dumps(doc))
+                self.assertEqual(health.Mini(home).git_mirror() is not None, on, doc)
+
+    def test_a_runner_mirror_with_no_record_is_a_finding(self) -> None:
+        self.mini.mirror_facts = {"record": {}, "running": False}
+        f = self.run_once()["findings"][0]
+        self.assertEqual(f["id"], "git_mirror_stale")
+        self.assertIn("no good fetch on record", f["evidence"])
 
     def test_a_disk_pass_within_a_day_is_healthy_even_with_an_old_snapshot_header(self) -> None:
         # sizes.json's `at` is the oldest measurement; a pass that re-measures every item minutes ago is fresh
