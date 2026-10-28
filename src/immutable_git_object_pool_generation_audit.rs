@@ -1160,11 +1160,9 @@ mod tests {
         // candidate an older mtime first, so the late write moves it as any write a tick later would.
         fs::File::open(&fixture.candidate)
             .unwrap()
-            .set_times(
-                fs::FileTimes::new().set_modified(
-                    std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000),
-                ),
-            )
+            .set_times(fs::FileTimes::new().set_modified(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000),
+            ))
             .unwrap();
         let mut source = fixture.source_observation();
         let candidate = fixture.candidate_lease();
