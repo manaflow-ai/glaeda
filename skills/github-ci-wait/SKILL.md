@@ -99,7 +99,11 @@ Pass the commit you pushed: `--sha "$(git rev-parse HEAD)"`. Checks of an older 
 as pending until GitHub shows yours. Give the full 40-hex id. A shorter prefix is resolved in the
 current checkout; one that does not resolve must match the head GitHub shows, or `wait` exits 64
 at once rather than waiting for a commit that will never appear. For a run, a `--sha` that is not
-the run's commit is also an error: a run's commit never changes.
+the run's commit is also an error: a run's commit never changes. A workflow_dispatch run's commit is
+the dispatch ref's tip (main), not the commit it tested, so a dispatch that names the commit in its
+run-name as `OWNER/REPO@<full sha>` (manaflow-ai/cmux fast-checks: `cmux-ci test` prints
+`glaeda-gh wait run manaflow-ai/cmux/RUN --sha HEAD`) counts as that commit's. It must be the full
+id and this run's repo. A prefix, another commit or another repo's commit is still an error.
 
 ## Merge conflicts: exit 4
 
