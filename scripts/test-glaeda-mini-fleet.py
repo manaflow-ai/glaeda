@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import unittest
 from pathlib import Path
@@ -1660,6 +1661,127 @@ class PreflightTests(unittest.TestCase):
         del self.manifest["hosts"]["build-mini-1"]["overrides"]["git"]
         self.assertEqual(self.result(preflight_text(git=None))["ready"], True)  # no policy: an old probe is fine
 
+    def test_every_brew_command_is_bounded_and_the_bound_kills_the_whole_tree(self) -> None:
+        # A `brew install git` from sudo-plan once sat 8 h 15 min: nothing on either side ever stopped it.
+        for owner_steps in (mf.brew_commands("builder", ["git"], False), mf.brew_commands("admin", ["git"], True, True)):
+            script = "\n".join(owner_steps)
+            brew_as = next(line for line in owner_steps if line.startswith("brew_as()"))
+            self.assertIn(f'/usr/bin/perl -e "$brew_bound" {mf.BREW_COMMAND_TIMEOUT} env HOMEBREW_NO_ASK=1 '
+                          '/opt/homebrew/bin/brew "$@"', brew_as)
+            self.assertEqual(script.count("/opt/homebrew/bin/brew"), 1, script)  # no brew call skips brew_as
+            subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+        # Run as the Homebrew owner (inside sudo -u), so it may signal what brew starts.
+        self.assertIn('brew_as() { local rc=0; sudo -H -u admin /usr/bin/perl -e "$brew_bound"',
+                      "\n".join(mf.brew_commands("admin", ["git"], True, True)))
+        bound = ["perl", "-e", mf.BREW_BOUND]
+        # Under the limit: the command's own exit code, and its signal as 128+N.
+        self.assertEqual(subprocess.run([*bound, "30", "sh", "-c", "exit 3"]).returncode, 3)
+        self.assertEqual(subprocess.run([*bound, "30", "sh", "-c", "kill -TERM $$"]).returncode, 128 + 15)
+        # Past the limit: exit 124, and a child in a process group of its own (as Homebrew starts curl) dies too.
+        with tempfile.TemporaryDirectory() as tmp:
+            pidfile = Path(tmp) / "child"
+            stuck = ("if (!fork) { setpgrp(0, 0); open(my $f, '>', $ARGV[0]) or die; print $f $$; close $f; "
+                     "exec 'sleep', '300' } $SIG{TERM} = 'IGNORE'; sleep 300")
+            started = time.monotonic()
+            run = subprocess.run([*bound, "1", "perl", "-e", stuck, os.fspath(pidfile)], capture_output=True,
+                                 text=True, timeout=60)
+            self.assertEqual(run.returncode, 124, run.stderr)
+            self.assertLess(time.monotonic() - started, 30)
+            self.assertIn("timed out after 1s", run.stderr)
+            child = int(pidfile.read_text())
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                state = subprocess.run(["ps", "-o", "stat=", "-p", str(child)], capture_output=True, text=True).stdout
+                if not state.strip() or state.strip().startswith("Z"):
+                    break
+                time.sleep(0.2)
+            else:
+                os.kill(child, 9)
+                self.fail(f"the bound left pid {child} running")
+        # An orphan: the parent dies on SIGTERM and leaves a child that ignores it, in a group of its own and no
+        # longer under anything of ours; the bound still finds it (same pid, same start) and kills it.
+        with tempfile.TemporaryDirectory() as tmp:
+            pidfile = Path(tmp) / "child"
+            orphan = ("if (!fork) { setpgrp(0, 0); $SIG{TERM} = 'IGNORE'; open(my $f, '>', $ARGV[0]) or die; "
+                      "print $f $$; close $f; exec 'sleep', '300' } sleep 300")
+            run = subprocess.run([*bound, "1", "perl", "-e", orphan, os.fspath(pidfile)], capture_output=True,
+                                 text=True, timeout=60)
+            self.assertEqual(run.returncode, 124, run.stderr)
+            self.assert_gone(int(pidfile.read_text()))
+        # Orphaned before the limit: an intermediate process starts a child in a group of its own and exits.
+        with tempfile.TemporaryDirectory() as tmp:
+            pidfile = Path(tmp) / "child"
+            early = ("if (!fork) { if (!fork) { setpgrp(0, 0); open(my $f, '>', $ARGV[0]) or die; print $f $$; close $f; "
+                     "exec 'sleep', '300' } select(undef, undef, undef, 0.5); exit 0 } wait; sleep 300")
+            run = subprocess.run([*bound, "3", "perl", "-e", early, os.fspath(pidfile)], capture_output=True,
+                                 text=True, timeout=60)
+            self.assertEqual(run.returncode, 124, run.stderr)
+            self.assert_gone(int(pidfile.read_text()))
+        # A ps that never answers: it is killed, and the command's own group is still stopped.
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "ps"
+            fake.write_text("#!/bin/sh\nexec sleep 300\n")
+            fake.chmod(0o755)
+            # The bound runs /bin/ps by absolute path (never the PATH's); this copy points it at the stuck one.
+            stuck_ps = mf.BREW_BOUND.replace('(-x "/bin/ps" ? "/bin/ps" : "/usr/bin/ps")', repr(os.fspath(fake)))
+            self.assertNotEqual(stuck_ps, mf.BREW_BOUND)
+            env = {**os.environ, "GLAEDA_BREW_BOUND_PS_SECONDS": "1"}
+            started = time.monotonic()
+            run = subprocess.run(["perl", "-e", stuck_ps, "1", "sleep", "300"], capture_output=True, text=True,
+                                 timeout=120, env=env)
+            self.assertEqual(run.returncode, 124, run.stderr)
+            self.assertLess(time.monotonic() - started, 30)
+            # A command that ends while a slow ps runs, before the limit, keeps its own exit code.
+            run = subprocess.run(["perl", "-e", stuck_ps, "5", "sh", "-c", "sleep 1; exit 5"], capture_output=True,
+                                 text=True, timeout=120, env=env)
+            self.assertEqual(run.returncode, 5, run.stderr)
+
+    def assert_gone(self, pid: int) -> None:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout
+            if not state.strip() or state.strip().startswith("Z"):
+                return
+            time.sleep(0.2)
+        os.kill(pid, 9)
+        self.fail(f"the bound left pid {pid} running")
+
+    def test_a_brew_timeout_ends_the_homebrew_step_with_124_wherever_brew_runs(self) -> None:
+        # brew_as runs in `if !`, in a command substitution and behind `|| true`-style tests; a timeout in any of
+        # them must still fail the step with 124, never read as "not installed" or a plain failure.
+        fake = textwrap.dedent("""\
+            #!/bin/sh
+            case "$*" in
+              *"$HANG"*) exec sleep 300 ;;
+              "--cache") echo "$HOME/cache" ;;
+              "list --versions"*) exit 1 ;;
+            esac
+            exit 0
+            """)
+        with tempfile.TemporaryDirectory() as tmp:
+            brew = Path(tmp) / "opt" / "homebrew" / "bin" / "brew"  # this machine may have a real /opt/homebrew
+            brew.parent.mkdir(parents=True)
+            brew.write_text(fake)
+            brew.chmod(0o755)
+            (Path(tmp) / mf.BREW_STAGE).mkdir(parents=True)
+            (Path(tmp) / mf.BREW_STAGE / "bottle.tar.gz").write_text("")
+            with mock.patch.object(mf, "BREW_COMMAND_TIMEOUT", 1):
+                lines = mf.brew_commands("builder", ["git"], False)
+            script = "\n".join(["set -euo pipefail", *lines]).replace("/opt/homebrew", f"{tmp}/opt/homebrew")
+            for hang in ("--cache", "list --pinned", "list --versions", "install git", "link git"):
+                started = time.monotonic()
+                run = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60,
+                                     env={"PATH": os.environ["PATH"], "HOME": tmp, "HANG": hang})
+                self.assertEqual(run.returncode, 124, (hang, run.stdout, run.stderr))
+                self.assertLess(time.monotonic() - started, 30, hang)
+                if hang in ("--cache", "install git", "link git"):  # the list calls send stderr to /dev/null
+                    self.assertIn("timed out after 1s", run.stderr, hang)
+                    self.assertEqual(run.stderr.count("timed out"), 1, run.stderr)  # the bound's line, nothing else
+            # Nothing hangs: the step runs to the end.
+            run = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60,
+                                 env={"PATH": os.environ["PATH"], "HOME": tmp, "HANG": "never"})
+            self.assertEqual(run.returncode, 0, (run.stdout, run.stderr))
+
     def test_the_preflight_probe_runs_the_workloads_git(self) -> None:
         text = mf.PREFLIGHT_PROBE.read_text()
         self.assertFalse(re.findall(r"(?<![w$])\bgit -C", text), "every git call goes through wgit (WORKLOAD_PATH)")
@@ -2158,7 +2280,7 @@ class SudoPlanTests(unittest.TestCase):
         order = [script.index(s) for s in ("sudo -v", "sudo xcode-select -s /Applications/Xcode.app",
                                            "xcodebuild -license accept", "xcodebuild -runFirstLaunch",
                                            "sudo pmset -c sleep 0", "sudo pmset -a autorestart 1",
-                                           "sudo -H -u admin env HOMEBREW_NO_ASK=1 /opt/homebrew/bin/brew", "for f in rustup zig",
+                                           "sudo -H -u admin /usr/bin/perl -e \"$brew_bound\" 1800 env HOMEBREW_NO_ASK=1 /opt/homebrew/bin/brew", "for f in rustup zig",
                                            "for t in cargo rustc rustdoc rustup",
                                            'sudo -H -u admin ln -s "/opt/homebrew/opt/rustup/bin/$t"')]
         self.assertEqual(order, sorted(order))
@@ -2219,7 +2341,7 @@ class SudoPlanTests(unittest.TestCase):
         # The only sudo left drops to the Homebrew owner.
         self.assertEqual([line for line in body if re.search(r"(^|[\s;|&(])sudo (?!-H -u admin )", line)], [])
         for step in ("xcode-select -s /Applications/Xcode.app", "env DEVELOPER_DIR=", "pmset -c sleep 0",
-                     "sudo -H -u admin env HOMEBREW_NO_ASK=1 /opt/homebrew/bin/brew",
+                     "sudo -H -u admin /usr/bin/perl -e \"$brew_bound\" 1800 env HOMEBREW_NO_ASK=1 /opt/homebrew/bin/brew",
                      'sudo -H -u admin ln -s "/opt/homebrew/opt/rustup/bin/$t"',
                      'cp -nP "$staged"/* "$cache"/', 'chown -h admin "$cache"/*', 'visudo -cf "$rule"',
                      "install -m 0440 -o root"):
