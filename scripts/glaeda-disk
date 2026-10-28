@@ -3625,6 +3625,10 @@ CMUX_JOB_MIRROR_HOURS = DEFAULT_AGE_HOURS
 # builder's warm depot_tools, ghostty and cmux trees) is NEVER_DELETE. HYGIENE_MIRROR_KEEP names them again for
 # library-caches, so no split, skip list or flag change ever lets the rule reach one.
 HYGIENE_MIRROR_KEEP = (CMUX_NEXT_CI_ROOT, NIGHTLY_NEXT_ROOT, "cmux-release-support", "cmux-ci-media")
+# The fleet cache's warm compile inputs every job resolves from: SwiftPM's shared clones (CMUX_SWIFTPM_CACHE). Its
+# clones' remotes are local paths, so the mirror rule bundled their whole history on every pass and kept the tree
+# (in use): 85 bundles a pass (2026-10-28). It ages by the fleet-artifacts rule instead, kept while it is a checkout.
+FLEET_CACHE_MIRROR_KEEP = ("swiftpm",)
 
 
 def hygiene_mirror_host() -> bool:
@@ -3936,6 +3940,7 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
                                files=True, allow_stale_protected=True, stale_before=ARTIFACT_CUTOFF,
                                reference_root=FLEET_ROOT, owner="cmux fleet worker", rebuild_minutes=8,
                                mirror_idle_hours=CMUX_JOB_MIRROR_HOURS if mirror_host else None,
+                               mirror_exclude=FLEET_CACHE_MIRROR_KEEP,
                                platform="macos"))
         ci_ios = FLEET_ROOT / "ci-ios"
         if ci_ios.is_dir():
@@ -5939,6 +5944,102 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+def drop_unused_archives(written: list[Path]) -> None:
+    """Delete the archives this pass wrote for a mirror item that then stayed (in use, or not all of it could be
+    archived), and their manifest lines. The tree still holds everything they hold. Without this, a warm cache that
+    is always in use (the fleet SwiftPM cache, ~85 clones) was bundled again on every pass and its bundles kept for
+    30 days: 5,695 bundles, 65 GiB in ~/archive on one CI mini in a day (2026-10-28)."""
+    if not written:
+        return
+    root = mirror_archive()
+    names = set()
+    for f in written:
+        try:
+            if f.parent == root and MIRROR_BUNDLE_RE.fullmatch(f.name) and stat.S_ISREG(os.lstat(f).st_mode):
+                f.unlink()
+                names.add(f.name)
+        except OSError:
+            continue
+    if names:
+        _drop_manifest_lines(names)
+
+
+def _drop_manifest_lines(names: set[str]) -> None:
+    manifest = mirror_archive() / "manifest.jsonl"
+    if manifest.is_symlink() or not manifest.is_file():
+        return
+    try:
+        kept = []
+        for line in manifest.read_text().splitlines():
+            try:
+                if str(json.loads(line).get("name")) in names:
+                    continue
+            except (ValueError, AttributeError):
+                pass
+            kept.append(line)
+        tmp = manifest.with_name(f".manifest.{os.getpid()}.tmp")
+        tmp.write_text("".join(ln + "\n" for ln in kept))
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, manifest)
+    except OSError:
+        pass
+
+
+def _bundle_refs(path: Path) -> tuple[frozenset[str], frozenset[str]] | None:
+    """A git bundle's (head lines, prerequisite commits) from its header, without reading its pack; None when it is
+    not a readable bundle."""
+    heads, prereqs = set(), set()
+    try:
+        with open(path, "rb") as handle:
+            if not handle.readline().startswith(b"# v"):
+                return None
+            for raw in handle:
+                line = raw.decode(errors="replace").rstrip("\n")
+                if not line:
+                    return frozenset(heads), frozenset(prereqs)
+                if line.startswith("-"):
+                    prereqs.add(line[1:].split()[0])
+                elif not line.startswith("@"):
+                    heads.add(line)
+    except OSError:
+        return None
+    return None
+
+
+def superseded_bundles(listed: dict[str, str], root: Path) -> set[str]:
+    """Bundles a newer bundle of the same repository and ref holds entirely: the same heads (name and commit), and
+    prerequisites that are a subset of the older one's, so the newer bundle carries every commit the older one does.
+    Only .bundle files the manifest lists (name -> sha256), grouped by the whole repository-and-ref part of their name
+    (digest and readable tail). A newer bundle counts only while it is a regular file at the sha256 the manifest
+    recorded when _write_bundle had verified it, so a damaged or replaced one supersedes nothing."""
+    groups: dict[str, list[str]] = {}
+    for name in listed:
+        m = re.fullmatch(r"(\d{8}T\d{6})-\d+-([0-9a-f]{16}-.*)\.expires-\d{4}-\d{2}-\d{2}\.bundle", name)
+        if m and MIRROR_BUNDLE_RE.fullmatch(name):
+            groups.setdefault(m.group(2), []).append(name)
+    out: set[str] = set()
+    intact: dict[str, bool] = {}
+
+    def whole(name: str) -> bool:
+        if name not in intact:
+            f = root / name
+            try:
+                intact[name] = stat.S_ISREG(os.lstat(f).st_mode) and _sha256(f) == listed[name]
+            except OSError:
+                intact[name] = False
+        return intact[name]
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        refs = {n: _bundle_refs(root / n) for n in group}
+        ordered = sorted((n for n in group if refs[n] is not None), reverse=True)  # newest first, by stamp
+        for i, older in enumerate(ordered):
+            heads, prereqs = refs[older]
+            if any(refs[newer][0] == heads and refs[newer][1] <= prereqs and whole(newer) for newer in ordered[:i]):
+                out.add(older)
+    return out
+
+
 def prune_mirror_archive(today: str | None = None, in_use=lambda p: False) -> int:
     """Delete the archives manifest.jsonl lists whose expiry has passed, each only while it is a regular file
     with the sha256 the manifest recorded for it and nothing has it open (in_use); nothing the manifest does not
@@ -5953,6 +6054,12 @@ def prune_mirror_archive(today: str | None = None, in_use=lambda p: False) -> in
         lines = manifest.read_text().splitlines()
     except OSError:
         return 0
+    listed: dict[str, str] = {}
+    for line in lines:
+        with contextlib.suppress(ValueError, KeyError, TypeError, AttributeError):
+            e = json.loads(line)
+            listed[str(e["name"])] = str(e["sha256"])
+    superseded = superseded_bundles(listed, root)
     for line in lines:
         try:
             e = json.loads(line)
@@ -5961,7 +6068,7 @@ def prune_mirror_archive(today: str | None = None, in_use=lambda p: False) -> in
             kept.append(line)
             continue
         f = root / name
-        if not MIRROR_BUNDLE_RE.fullmatch(name) or expires >= today:
+        if not MIRROR_BUNDLE_RE.fullmatch(name) or (expires >= today and name not in superseded):
             kept.append(line)
         elif not os.path.lexists(f):
             continue  # already gone: nothing to list
@@ -9254,6 +9361,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             outcome = "changed:git"  # the checkout gained something to lose since the survey
         elif mirror_due(fam, p, idle_now) and (bundled := archive_mirror(p))[0]:
             # never deleted without a verified bundle of what is unpushed; uncommitted work no bundle holds
+            drop_unused_archives(bundled[1])  # the tree stays whole: what was bundled for it so far is not needed
             dirty = bundled[0].startswith("uncommitted: ")
             mounted = bundled[0] == mount_below_why(bundled[0])
             outcome = "blocked:uncommitted" if dirty else "blocked:mount" if mounted else "blocked:bundle-failed"
@@ -9263,8 +9371,9 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 print(f"glaeda-disk: ALERT: kept {i.path}: bundling its unpushed git work failed: {bundled[0]}",
                       file=sys.stderr)
         elif mirror_due(fam, p, idle_now) and (moved := mirror_moved(fam, p, bundled[2])):
-            outcome = "changed:in-use"  # its bundles stay in the archive; the tree stays too
+            outcome = "changed:in-use"  # the tree stays, so the bundles written for its delete go again
             i.reasons.append(moved)
+            drop_unused_archives(bundled[1])
         else:
             if mirror_due(fam, p, idle_now) and bundled[1]:
                 i.reasons.append("unpushed git work bundled to " + ", ".join(map(os.fspath, bundled[1])))
@@ -9328,6 +9437,8 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                                    capture_output=True, timeout=60)
             except SlotTaken:
                 outcome = "changed:in-use"
+                if mirror_due(fam, p, idle_now) and bundled[1] and p.is_dir() and not p.is_symlink():
+                    drop_unused_archives(bundled[1])  # put back whole: never when it was left aside under another name
             except SlotNotNeeded:
                 continue  # as the stop check before the rename
             except (OSError, subprocess.SubprocessError) as e:
