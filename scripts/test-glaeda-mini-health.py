@@ -656,7 +656,7 @@ class DiskAndLeaks(Base):
         config = home / health.GIT_MIRROR_SOURCE
         config.parent.mkdir(parents=True)
         with mock.patch.object(health.sys, "platform", "darwin"):
-            for doc, on in (({"schema": 1, "source": "direct"}, True), ({"schema": 1, "source": "lan"}, False),
+            for doc, on in (({"schema": 1, "source": "direct"}, True), ({"schema": 1, "source": "lan"}, True), ({"schema": 1, "source": "nfs"}, False),
                             ({"source": "direct"}, False)):
                 config.write_text(json.dumps(doc))
                 self.assertEqual(health.Mini(home).git_mirror() is not None, on, doc)

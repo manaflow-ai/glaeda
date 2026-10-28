@@ -170,6 +170,16 @@ class Mirror(unittest.TestCase):
         self.assertEqual(gm.healthy(self.mirror), "")
         self.assertTrue(guard.is_dir())
 
+    def test_a_lan_cache_client_keeps_fetching(self) -> None:
+        # glaeda-seed-lan cache writes the clients' source as lan, with the cache host's address
+        (self.home / gm.SOURCE_CONFIG).write_text(json.dumps({"schema": 1, "source": "lan", "host": "cmux15",
+                                                              "user": "cmux", "addresses": ["10.0.0.5"]}))
+        gm.run(True, home=self.home)
+        head = self.commit("two")
+        result = gm.run(True, home=self.home)
+        self.assertEqual((result["state"], result["source"]), ("applied", "lan"), result)
+        self.assertEqual(result["heads"]["main"], head)
+
     def test_nothing_happens_without_a_configured_source(self) -> None:
         (self.home / gm.SOURCE_CONFIG).unlink()
         result = gm.run(True, home=self.home)

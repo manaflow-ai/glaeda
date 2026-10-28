@@ -301,7 +301,7 @@ DISK_PASS_STALE_S = 26 * 3600  # glaeda-disk's LaunchAgent runs every 15 min; a 
 # a mirror whose last good fetch is older than this is stalled (cmuxterm-hq docs/repo-mirrors.md: fresh within 30).
 GIT_MIRROR_STALE_S = 30 * 60
 GIT_MIRROR_SOURCE = ".config/glaeda/lan-cache/config.json"  # glaeda-git-mirror's SOURCE_CONFIG, under HOME
-GIT_MIRROR_SOURCES = ("direct",)  # glaeda-git-mirror's SOURCES
+GIT_MIRROR_SOURCES = ("direct", "lan")  # glaeda-git-mirror's SOURCES
 DISK_AGENT = "com.teamleaderleo.glaeda.disk-pressure"  # glaeda-mini-setup's 15-minute glaeda-disk pass
 DISK_CACHE = ".cache/glaeda-disk"  # glaeda-disk's sizes.json and accounting.json, under HOME
 RUNNER_HYGIENE = "com.teamleaderleo.glaeda.runner-hygiene"  # glaeda-runner-hygiene's LABEL_PREFIX (.<uid>)

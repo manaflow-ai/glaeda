@@ -88,7 +88,10 @@ PACK_LIMIT = 24
 # the bucket) is the only source so far. Without it the tool does nothing, so a release never starts
 # every mini at a site seeding 2 GB over one shared uplink at once (2026-10-27: 0.4-0.9 MB/s a mini).
 SOURCE_CONFIG = ".config/glaeda/lan-cache/config.json"
-SOURCES = ("direct",)
+# `lan` (glaeda-seed-lan cache's clients, #1672) fetches as `direct` until this tool reads the site's cache host:
+# the cache rollout wrote it to every client mini at once (2026-10-28 05:16 UTC) and each mirror stopped
+# fetching, so a client must never be left with no source. Its first seed still waits for the host's slot.
+SOURCES = ("direct", "lan")
 REPACK_TIMEOUT = 1200
 # A release reaches every mini of a site at once and setup writes their source together, so a host's first seed
 # (no mirror at all) waits SEED_SLOT_S times a slot fixed by its name, from the first pass that found no mirror:
