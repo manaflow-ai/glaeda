@@ -67,9 +67,9 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime
-import fcntl
 import hashlib
 import http.client
+import importlib
 import io
 import json
 import math
@@ -333,6 +333,9 @@ class Host:
 
     def with_host_lock(self, fn):
         """fn() while holding the fleet host.lock exclusively, so no job is admitted; None if it is held now."""
+        # Loaded here, not at the top: glaeda-fleet-status loads this module for judge() on any operator machine,
+        # including ones without fcntl (its test keeps the module free of a top-level fcntl import).
+        fcntl = importlib.import_module("fcntl")
         try:
             fd = os.open(FLEET_ROOT / "host.lock", os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
         except OSError:
