@@ -389,6 +389,9 @@ WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "
                         ("nightly.yml", "build-sign-notarize-nightly"): "light",
                         ("nightly.yml", "verify-signed-nightly"): "light",
                         ("nightly.yml", "verify-final-dmg-nightly"): "light",
+                        # nightly-next's Linux signer path: its one Mac job builds the DMG from the signed app with
+                        # hdiutil (cmux nightly.yml signer-dmg-image; was a compile, 5 units + persistent-dd + root)
+                        ("nightly.yml", "signer-dmg-image"): "light",
                         ("nightly.yml", "recover-nightly-next-notarization"): "light",
                         ("nightly.yml", "verify-recovered-nightly-next"): "light",
                         ("nightly.yml", "sign-nightly-identity-legacy"): "light",
@@ -1162,6 +1165,12 @@ GATE_WAITER_WAIVE_S = float(os.environ.get("GLAEDA_RUNNER_GATE_WAITER_WAIVE_S") 
 # that ran holds it far longer.
 GATE_WAITER_GAP_S = 10 * 60.0
 WAITER_SPANS_FILE = "fleet-waiter-spans.json"  # in the state dir, shared by every runner's gate and job-started
+# Nightly jobs come first on the fleet (Leo, 2026-10-27): a nightly-tier job is admitted ahead of a waiting fleet build
+# (take_capacity), but only when it holds its capacity at once, never by waiting in admission (a lend drain waits
+# for Runner.Worker to exit), and at most NIGHTLY_WAITER_PASSES times per waiter, so a stream of nightly jobs cannot
+# keep one fleet build out for good. The count lives in the state dir, keyed by the waiter's pid and process start.
+NIGHTLY_PASSES_FILE = "fleet-waiter-nightly-passes.json"
+NIGHTLY_WAITER_PASSES = 3
 # job-started touches this in the mini's state dir when it refuses a job for a fleet build waiting for the host. Every
 # gate on the mini reads the host's waiters at its next poll instead of after GATE_WAITER_EVERY_S, so no listener takes
 # another job only to refuse it (2026-10-27, cmux-austin-mini-0: a job refused at 17:48:12 after 766 s in the capacity
@@ -3846,6 +3855,17 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         tokens = tuple(t for t in tokens if t != "root")
         if klass == "gui-step":  # and the gui token, which its step takes before that root (take-gui)
             tokens = tuple(t for t in tokens if t != gui_token)
+    passed: int | None = None  # the fleet waiter a nightly job is being admitted ahead of
+
+    def refused(note: str) -> tuple[bool, str]:
+        """A refusal; a nightly job admitted ahead of a waiter that cannot hold its capacity at once is refused for
+        the waiter instead (not retryable), so it never waits in admission while a drain waits for it to exit, and
+        gives its reserved pass back."""
+        if passed is None:
+            return False, note
+        nightly_pass(state_dir, passed, -1)
+        return False, f"{WAITER_REFUSAL} (pid {passed})"
+
     # pinned: home-repo workflows the hook does not know use /private/tmp/cmux-ci itself
     try:
         capacity_dir.mkdir(parents=True, exist_ok=True)
@@ -3905,7 +3925,11 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
             waiting = bounded_waiters(state_dir, lock_waiters(host_lock, holder_pids(state_dir) | yielding_family(host_lock)),
                                       log=lambda note: print(f"{PREFIX}: {note}", flush=True))
             # lsof sees only this user's processes, which is how the fleet worker runs today.
-            if waiting:  # flock has no writer preference: stop admitting so the build worker gets in
+            if waiting and tier == TIER_NIGHTLY and nightly_pass(state_dir, waiting[0]):
+                # NIGHTLY_WAITER_PASSES: 2026-10-28 run 40623850717's signer-dmg-image was refused for a waiter on
+                # cmux12s, and nightly-next's DMG fell back to a queued Blacksmith Mac.
+                passed = waiting[0]
+            elif waiting:  # flock has no writer preference: stop admitting so the build worker gets in
                 # This must not be a retryable capacity refusal: a draining fleet
                 # worker waits for our parent Runner.Worker to exit before claiming.
                 return False, f"{WAITER_REFUSAL} (pid {waiting[0]})"
@@ -3953,7 +3977,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                 held = f"all {copies} {what} tokens are taken" if copies > 1 else f"the {what} token is taken"
                 if taken_out is not None:
                     taken_out["wants"] = [token]
-                return False, f"capacity: {held} ({job or 'unknown job'} is {klass})"
+                return refused(f"capacity: {held} ({job or 'unknown job'} is {klass})")
         # every job but a reserving runner's own leaves the idle reserves free (GUI_RESERVE, FRESH_RESERVE_TOKEN); a
         # nightly job keeps none (FEED_FIRST)
         def kept_now() -> int:
@@ -3991,7 +4015,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         if got < units or spare < kept:
             if taken_out is not None:
                 taken_out["wants"] = ["units"]
-            return False, (f"capacity: {got + spare} of {total} units free, {job or 'an unknown job'} ({klass}) "
+            return refused(f"capacity: {got + spare} of {total} units free, {job or 'an unknown job'} ({klass}) "
                            f"needs {units}{kept_note(kept)}")
         root = next((name for name in taken if name.startswith("root-")), None)
         split = named[root] if root and klass in ROOT_SWITCHERS else None
@@ -4011,6 +4035,10 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                 release_holder(holder_file(state_dir))
                 note = why
         what = "+".join([f"{units}/{total} units", *taken]) + warm_note
+        if not held and passed is not None:
+            nightly_pass(state_dir, passed, -1)
+        if held and passed is not None:
+            note += f"; a nightly job, admitted ahead of the fleet build waiting for the host (pid {passed})"
         if held and taken_out is not None:
             taken_out.update(units=units, units_total=total, tokens=list(taken))
         if held and gui_token in taken:
@@ -4023,7 +4051,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                 roots_file(state_dir).write_text(root + "\n")
         return held, (f"holding {what} for {job or 'an unknown job'} ({klass}; {note}{yielded})" if held else note)
     except OSError as error:
-        return False, f"capacity: cannot take the ledger ({type(error).__name__})"
+        return refused(f"capacity: cannot take the ledger ({type(error).__name__})")
     finally:
         close_all(fds)
         os.close(admission)
@@ -4778,6 +4806,53 @@ def host_waiters(host_lock: str, state_dir: Path) -> set[int]:
         return set()
     return set(bounded_waiters(state_dir, lock_waiters(host_lock, holder_pids(state_dir) | yielding_family(host_lock)),
                                log=gate_log))
+
+
+def nightly_passes(state_dir: Path) -> dict[str, int] | None:
+    """The passes per waiter; {} when there is no file yet, None when it cannot be read or parsed (fail closed)."""
+    try:
+        record = json.loads((state_dir / NIGHTLY_PASSES_FILE).read_text())
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict):
+        return None
+    return {k: v for k, v in record.items() if isinstance(k, str) and isinstance(v, int)}
+
+
+def nightly_waiter_key(pid: int) -> str | None:
+    start = process_identity(pid)
+    return f"{pid}:{start}" if start else None
+
+
+def nightly_pass(state_dir: Path, pid: int, delta: int = 1) -> bool:
+    """Reserve (delta 1) or give back (delta -1) one admission of a nightly job ahead of this waiter
+    (NIGHTLY_WAITER_PASSES), under take_capacity's admission.lock. Fails closed: a waiter with no stable identity, a
+    pass record that cannot be read, or one that cannot be written is never passed. Entries of waiters no longer
+    alive are dropped (a new process start is a new key)."""
+    key = nightly_waiter_key(pid)
+    passes = nightly_passes(state_dir)
+    if key is None or passes is None:
+        return False
+    if delta > 0 and passes.get(key, 0) >= NIGHTLY_WAITER_PASSES:
+        return False
+
+    def alive(k: str) -> bool:
+        pid_text = k.split(":", 1)[0]
+        return pid_text.isdigit() and nightly_waiter_key(int(pid_text)) == k
+
+    passes = {k: v for k, v in passes.items() if k == key or alive(k)}
+    passes[key] = max(0, passes.get(key, 0) + delta)
+    path = state_dir / NIGHTLY_PASSES_FILE
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(passes))
+        os.replace(tmp, path)
+    except OSError:
+        return False
+    return True
 
 
 def bounded_waiters(state_dir: Path, waiting: list[int] | set[int], now: float | None = None,
