@@ -382,9 +382,9 @@ where
     }
 
     before_final_revalidation();
-    candidate.confirm().map_err(|_| candidate_changed())?;
     // Directory times alone miss a change made within one filesystem clock tick (Linux stamps them from a coarse
-    // clock): walk the candidate again and require the entries, sizes and file identities the audit saw.
+    // clock): walk the candidate again and require the entries, sizes and file identities the audit saw, then
+    // confirm its directories last.
     if audit_tree(&candidate.root.fd, true, true).map_err(|_| candidate_changed())?
         != candidate_audit
         || audit_tree(&candidate.objects.fd, true, true).map_err(|_| candidate_changed())?
@@ -394,6 +394,7 @@ where
     }
     // An entry renamed inside the tree keeps every count and inode: name the one path that matters again.
     require_nested_alternates_absent(&candidate.objects)?;
+    candidate.confirm().map_err(|_| candidate_changed())?;
     source
         .confirm(&source_binding)
         .map_err(|_| source_changed())?;
