@@ -969,6 +969,24 @@ def slim_head_runs(doc: dict) -> list[dict]:
             for r in doc.get("workflow_runs") or [] if isinstance(r, dict)]
 
 
+# A dispatched run names the commit it tests in its run-name as OWNER/REPO@<40 hex>: its own head_sha is the
+# dispatch ref's tip (main), never that commit (manaflow-ai/cmux fast-checks.yml). Full ids only, with the repo.
+NAMED_COMMIT = re.compile(r"(?<![\w./-])([\w.-]+/[\w.-]+)@([0-9a-fA-F]{40})(?![0-9a-zA-Z])")
+
+
+def names_commit(title: Any, repo: str, sha: str | None) -> bool:
+    """Whether a run-name names `sha` of `repo` (OWNER/REPO) as the commit the run tests. A full 40-hex id only:
+    a prefix never matches, and neither does another repo's commit or a bare sha (fast-checks' snapshot id)."""
+    if not sha or not re.fullmatch(r"[0-9a-f]{40}", sha.lower()):
+        return False
+    return (repo.lower(), sha.lower()) in {(r.lower(), c.lower()) for r, c in NAMED_COMMIT.findall(str(title or ""))}
+
+
+def run_tests_commit(data: dict, repo: str, sha: str | None) -> bool:
+    """A workflow_dispatch run whose run-name names `sha` of `repo` (names_commit): the commit it tested."""
+    return data.get("event") == "workflow_dispatch" and names_commit(data.get("display_title"), repo, sha)
+
+
 def slim_workflows(doc: dict) -> dict[str, str]:
     """Workflow id -> name. A run's own REST name is its run-name when the workflow sets one."""
     return {str(w.get("id")): str(w.get("name")) for w in doc.get("workflows") or [] if isinstance(w, dict)}
@@ -3879,12 +3897,14 @@ def run_hold(data: dict, jobs: list[dict] | None, now: float | None = None,
 
 
 def verdict(kind: str, data: dict | None, until: str = "green", sha: str | None = None,
-            jobs: list[dict] | None = None, now: float | None = None, grace: float = RESCUE_GRACE) -> int | None:
-    """EXIT_OK, EXIT_FAIL, EXIT_CONFLICT (a PR that conflicts with its base), or None while still pending."""
+            jobs: list[dict] | None = None, now: float | None = None, grace: float = RESCUE_GRACE,
+            repo: str = "") -> int | None:
+    """EXIT_OK, EXIT_FAIL, EXIT_CONFLICT (a PR that conflicts with its base), or None while still pending.
+    A run is `sha`'s when its head is, or when it is a dispatch naming `sha` of `repo` (run_tests_commit)."""
     if not data:
         return None
     if kind == "run":
-        if sha and not str(data.get("head_sha") or "").startswith(sha):
+        if sha and not str(data.get("head_sha") or "").startswith(sha) and not run_tests_commit(data, repo, sha):
             return None
         if data.get("status") != "completed":
             return None
@@ -4241,11 +4261,19 @@ def wait_step(req: dict, now: float) -> tuple[int, str] | None:
     usable = data and ((entry.get("dataAt") or 0) >= began or final)
     if usable and kind == "run" and controller_unconfirmed(entry, now):
         usable = False  # the daemon reads it over REST first (Daemon.due's confirm)
+    _, owner, repo, _ = split_key(key)
     if usable and sha:
         head = str(data.get("headRefOid" if kind == "pr" else "head_sha") or "").lower()
+        if kind == "run" and head and not head.startswith(sha) and exact and data.get("event") == "workflow_dispatch":
+            if run_tests_commit(data, f"{owner}/{repo}", sha):
+                head = ""  # a dispatch that names the commit it tested: that commit is the one to match
+            elif data.get("display_title") is None:
+                # a record without the run-name (the controller's): neither refused nor ruled on until GitHub's read
+                head, usable = "", False
         if head and not head.startswith(sha):
             if kind == "run":
-                raise WatchError(f"run {req['target']} is for commit {head[:12]}, not {sha[:12]}; a run's commit never changes")
+                raise WatchError(f"run {req['target']} is for commit {head[:12]}, not {sha[:12]}; a run's commit never "
+                                 "changes, and its run-name does not name that full commit as the one it tested")
             if not exact:
                 raise WatchError(f"--sha {sha} is not a commit in this checkout and is not the head GitHub shows "
                                  f"({head[:12]}); pass the full id (git rev-parse HEAD) to wait for a push "
@@ -4253,7 +4281,8 @@ def wait_step(req: dict, now: float) -> tuple[int, str] | None:
         elif head and not exact:
             # resolved: a later push now counts as pending, as for a full id
             req["sha"], req["exact"] = sha, exact = head, True
-    result = verdict(kind, data, until, sha, (entry or {}).get("jobs"), time.time(), grace) if usable else None
+    result = (verdict(kind, data, until, sha, (entry or {}).get("jobs"), time.time(), grace, f"{owner}/{repo}")
+              if usable else None)
     if result is not None:
         outcome_name = {EXIT_OK: "success", EXIT_CONFLICT: "conflict"}.get(result, "failure")
         extra: dict[str, Any] = {"result": outcome_name, "waited_s": waited}
@@ -4269,7 +4298,7 @@ def wait_step(req: dict, now: float) -> tuple[int, str] | None:
         extra = {"result": "timeout", "waited_s": waited}
         if sha and entry and entry.get("data"):
             head = entry["data"].get("headRefOid") or entry["data"].get("head_sha") or ""
-            if not str(head).startswith(sha):
+            if not str(head).startswith(sha) and not (kind == "run" and run_tests_commit(entry["data"], f"{owner}/{repo}", sha)):
                 extra["note"] = f"GitHub still shows head {str(head)[:10]}, not {sha[:10]}"
         return EXIT_TIMEOUT, render(key, entry, as_json, extra, until, grace)
     return None

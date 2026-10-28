@@ -2245,6 +2245,57 @@ class ClientTest(Base):
         self.assertIn("GitHub still shows head aaaaaaaaaa", text)
         self.assertEqual(self.wait("pr", "o/r#1", fill=(green, {}), sha="aaaaaaa")[0], 0)
 
+    def dispatched_run(self, title: str | None, conclusion: str | None = "success", event: str = "workflow_dispatch") -> dict:
+        """A fast-checks dispatch: its head is main's tip (cccc...), whatever commit it tested."""
+        return {"id": 9, "name": "Fast checks", "display_title": title, "status": "completed" if conclusion else "in_progress",
+                "conclusion": conclusion, "html_url": "https://github.com/o/r/actions/runs/9", "head_sha": "c" * 40,
+                "head_branch": "main", "event": event, "run_attempt": 1, "created_at": None, "updated_at": None}
+
+    def test_a_dispatch_naming_the_full_commit_in_its_run_name_is_that_commits(self) -> None:
+        tested = "b" * 40
+        green = self.dispatched_run(f"Fast checks {'a' * 40} tests o/r@{tested}")
+        self.assertEqual(self.wait("run", "o/r/9", fill=(green, {}), sha=tested)[0], 0)
+        red = self.dispatched_run(f"Fast checks {'a' * 40} tests o/r@{tested}", "failure")
+        self.assertEqual(self.wait("run", "o/r/9", fill=(red, {}), sha=tested)[0], 1)
+        running = self.dispatched_run(f"Fast checks {'a' * 40} tests o/r@{tested}", None)
+        code, text = self.wait("run", "o/r/9", fill=(running, {}), sha=tested, timeout=0.4)
+        self.assertEqual(code, 2)
+        self.assertNotIn("GitHub still shows head", text)  # it is the right run, still running
+        # its own head still counts, as for any run
+        self.assertEqual(self.wait("run", "o/r/9", fill=(green, {}), sha="c" * 40)[0], 0)
+
+    def test_a_run_name_never_matches_another_commit_a_prefix_or_another_repo(self) -> None:
+        tested = "b" * 40
+        title = f"Fast checks {'a' * 40} tests o/r@{tested}"
+        refused = [
+            (self.dispatched_run(title), "d" * 40),  # another commit
+            (self.dispatched_run(title), "bbbbbbbbbb"),  # a prefix of the named commit (resolves nowhere here)
+            (self.dispatched_run(title), "a" * 40),  # the snapshot named bare: not the tested commit
+            (self.dispatched_run(f"Fast checks {'a' * 40} tests o/other@{tested}"), tested),  # another repo's
+            (self.dispatched_run(f"Fast checks {'a' * 40} tests o/r@{tested}0"), tested),  # longer than an id
+            (self.dispatched_run(title, event="push"), tested),  # only a dispatch names what it tested
+            (self.dispatched_run(f"Fast checks {tested}"), tested),  # no repo: the old run-name
+        ]
+        for run, sha in refused:
+            with self.subTest(title=run["display_title"], sha=sha, event=run["event"]):
+                with self.assertRaisesRegex(gg.WatchError, "is for commit cccccccccc"):
+                    self.wait("run", "o/r/9", fill=(run, {}), sha=sha)
+                self.assertIsNone(gg.verdict("run", run, sha=sha, repo="o/r"))
+
+    def test_a_dispatch_without_its_run_name_waits_for_one(self) -> None:
+        # the controller's record has no run-name: neither accepted nor refused until GitHub's own read
+        code, _ = self.wait("run", "o/r/9", fill=(self.dispatched_run(None), {}), sha="b" * 40, timeout=0.4)
+        self.assertEqual(code, 2)
+
+    def test_names_commit_is_exact(self) -> None:
+        sha = "0123456789abcdef0123456789abcdef01234567"
+        self.assertTrue(gg.names_commit(f"Fast checks {'a' * 40} tests manaflow-ai/cmux@{sha}", "manaflow-ai/cmux", sha))
+        self.assertTrue(gg.names_commit(f"x Manaflow-AI/cmux@{sha.upper()}", "manaflow-ai/cmux", sha))
+        self.assertFalse(gg.names_commit(f"x manaflow-ai/cmux@{sha}", "manaflow-ai/cmux", sha[:12]))
+        self.assertFalse(gg.names_commit(f"x manaflow-ai/cmux@{sha[:12]}", "manaflow-ai/cmux", sha))
+        self.assertFalse(gg.names_commit(f"x evil/manaflow-ai/cmux@{sha}", "manaflow-ai/cmux", sha))
+        self.assertFalse(gg.names_commit(None, "manaflow-ai/cmux", sha))
+
     def test_missing_pr_fails(self) -> None:
         code, text = self.wait("pr", "o/r#404", fill=(None, {"error": "Could not resolve", "missing": True}))
         self.assertEqual(code, 1)
