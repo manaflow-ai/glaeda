@@ -2848,7 +2848,7 @@ sub look {  # (live pids, their groups, read ok) under the command, from one ps 
   my $ok = eval {
     local $SIG{ALRM} = sub { kill "KILL", $ps_pid if $ps_pid; die "ps\n" };
     alarm $ps_limit;
-    $ps_pid = open(my $ps, "-|", "ps", "-A", "-o", "pid=,ppid=,pgid=,stat=,lstart=") or die "ps\n";
+    $ps_pid = open(my $ps, "-|", (-x "/bin/ps" ? "/bin/ps" : "/usr/bin/ps"), "-A", "-o", "pid=,ppid=,pgid=,stat=,lstart=") or die "ps\n";
     @rows = map { s/^\s+|\s+$//gr } <$ps>;
     close($ps) or die "ps\n";
     alarm 0; 1;
@@ -2897,7 +2897,7 @@ while (clock_gettime(CLOCK_MONOTONIC) < $deadline) {
   select(undef, undef, undef, $nap);
   $nap = $nap * 2 > 2 ? 2 : $nap * 2;
 }
-done();  # it may have ended while the last look or nap ran
+# Past the deadline it is stopped even if it ends meanwhile: the result is 124 either way.
 $SIG{PIPE} = "IGNORE";
 stop("TERM");
 # After the signal, and non-blocking: a full or closed stderr must not keep the bound from stopping the command.

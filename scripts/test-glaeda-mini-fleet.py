@@ -1722,16 +1722,18 @@ class PreflightTests(unittest.TestCase):
             fake = Path(tmp) / "ps"
             fake.write_text("#!/bin/sh\nexec sleep 300\n")
             fake.chmod(0o755)
+            # The bound runs /bin/ps by absolute path (never the PATH's); this copy points it at the stuck one.
+            stuck_ps = mf.BREW_BOUND.replace('(-x "/bin/ps" ? "/bin/ps" : "/usr/bin/ps")', repr(os.fspath(fake)))
+            self.assertNotEqual(stuck_ps, mf.BREW_BOUND)
+            env = {**os.environ, "GLAEDA_BREW_BOUND_PS_SECONDS": "1"}
             started = time.monotonic()
-            run = subprocess.run([*bound, "1", "sleep", "300"], capture_output=True, text=True, timeout=120,
-                                 env={**os.environ, "PATH": f"{tmp}:{os.environ['PATH']}",
-                                      "GLAEDA_BREW_BOUND_PS_SECONDS": "1"})
+            run = subprocess.run(["perl", "-e", stuck_ps, "1", "sleep", "300"], capture_output=True, text=True,
+                                 timeout=120, env=env)
             self.assertEqual(run.returncode, 124, run.stderr)
             self.assertLess(time.monotonic() - started, 30)
-            # A command that ends while a slow ps runs keeps its own exit code, never 124.
-            run = subprocess.run([*bound, "2", "sh", "-c", "sleep 1; exit 5"], capture_output=True, text=True,
-                                 timeout=120, env={**os.environ, "PATH": f"{tmp}:{os.environ['PATH']}",
-                                      "GLAEDA_BREW_BOUND_PS_SECONDS": "1"})
+            # A command that ends while a slow ps runs, before the limit, keeps its own exit code.
+            run = subprocess.run(["perl", "-e", stuck_ps, "5", "sh", "-c", "sleep 1; exit 5"], capture_output=True,
+                                 text=True, timeout=120, env=env)
             self.assertEqual(run.returncode, 5, run.stderr)
 
     def assert_gone(self, pid: int) -> None:
