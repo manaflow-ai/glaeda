@@ -383,6 +383,13 @@ where
 
     before_final_revalidation();
     candidate.confirm().map_err(|_| candidate_changed())?;
+    // Directory times alone miss a change made within one filesystem clock tick (Linux stamps them from a coarse
+    // clock): walk the candidate again and require the same entries, sizes and file identities.
+    if audit_tree(&candidate.root.fd, true, true).map_err(|_| candidate_changed())?
+        != audit_tree(&candidate.root.fd, true, true).map_err(|_| candidate_changed())?
+    {
+        return Err(candidate_changed());
+    }
     source
         .confirm(&source_binding)
         .map_err(|_| source_changed())?;
@@ -463,7 +470,7 @@ struct PhysicalFileIdentity {
     inode: u64,
 }
 
-#[derive(Default)]
+#[derive(Default, PartialEq, Eq)]
 struct TreeAudit {
     directories: u64,
     regular_files: u64,
@@ -1155,15 +1162,6 @@ mod tests {
     #[test]
     fn candidate_drift_before_final_boundary_is_refused() {
         let fixture = Fixture::new();
-        // The fixture makes the candidate and the hook writes into it within one kernel tick, and Linux stamps
-        // directory times from that coarse clock: the write could leave mtime and ctime as they were. Give the
-        // candidate an older mtime first, so the late write moves it as any write a tick later would.
-        fs::File::open(&fixture.candidate)
-            .unwrap()
-            .set_times(fs::FileTimes::new().set_modified(
-                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000),
-            ))
-            .unwrap();
         let mut source = fixture.source_observation();
         let candidate = fixture.candidate_lease();
         let result = audit_with_hook(&mut source, &candidate, || {
