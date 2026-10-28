@@ -61,6 +61,12 @@ class FakeHost(heal.Host):
         self.reboot_result = (0, "")
         self.journal_rows: list[dict] = []
         self.journal_broken = False
+        self.ps_broken = False
+
+    def processes_strict(self):
+        if self.ps_broken:
+            raise heal.HealError("ps gave no process list (exit 1: x)")
+        return self.processes()
 
     def sandbox_hold(self, now: float) -> str:
         return self.hold
@@ -430,14 +436,14 @@ class SandboxHeal(Base):
     def test_a_second_reboot_within_7_days_is_refused_for_a_person_and_logged_once(self) -> None:
         self.slow_twice()
         self.tick(300)
-        for later in (3600, 2 * 86400, 6 * 86400):
-            self.host.t = T0 + later
+        for hours in (1, 2 * 24, 4 * 24):  # passes run all along: 1 h, 2 d and 6 d after the reboot
+            self.run_for(hours)
             report = self.slow_twice()
             self.assertIn("needs a person", report["sandbox"]["needs_operator"])
-            self.assertEqual(len(self.host.reboots), 1, later)
+            self.assertEqual(len(self.host.reboots), 1, hours)
             self.tick()  # fast: the episode ends
         self.assertEqual([r["action"] for r in self.host.journal_rows].count("refused-repeat"), 3)
-        self.host.t = T0 + 8 * 86400
+        self.run_for(25)  # past 7 d by both the clock and the passes
         self.assertTrue(self.slow_twice()["sandbox"]["rebooting"])
         self.assertEqual(len(self.host.reboots), 2)
 
@@ -495,14 +501,46 @@ class SandboxHeal(Base):
         self.host.probes = [9.0]
         self.assertTrue(self.tick()["sandbox"]["rebooting"])
 
-    def test_a_failed_reboot_is_logged_and_does_not_count(self) -> None:
-        self.host.reboot_result = (1, "shutdown: NOT super-user")
+    def test_a_failed_reboot_is_logged_and_still_counts(self) -> None:
+        self.host.reboot_result = (124, "timed out")  # shutdown may have taken it before the timeout
         report = self.slow_twice()
         self.assertFalse(report["actions"][0]["ok"])
         self.assertEqual([r["action"] for r in self.host.journal_rows], ["slow", "reboot", "reboot-failed"])
         self.host.reboot_result = (0, "")
         self.host.probes = [9.0]
-        self.assertTrue(self.tick()["sandbox"]["rebooting"])  # not refused as a repeat
+        self.assertIn("needs_operator", self.tick()["sandbox"])
+        self.assertEqual(len(self.host.reboots), 1)
+
+    def test_a_ps_that_fails_under_the_lock_never_reboots(self) -> None:
+        self.host.ps_broken = True
+        report = self.slow_twice()
+        self.assertIn("cannot tell the host is idle", report["sandbox"]["skipped"])
+        self.assertEqual(self.host.reboots, [])
+        self.assertNotIn("reboot", [r["action"] for r in self.host.journal_rows])
+
+    def test_a_forward_clock_jump_does_not_open_the_week(self) -> None:
+        self.slow_twice()
+        self.tick(300)
+        self.host.t += 30 * 86400  # the clock jumps a month; few passes have run
+        report = self.slow_twice()
+        self.assertIn("needs_operator", report["sandbox"])
+        self.assertEqual(len(self.host.reboots), 1)
+
+    def test_a_week_of_passes_and_of_clock_opens_it_even_while_busy(self) -> None:
+        self.slow_twice()
+        self.tick(300)
+        self.host.add(700, "/usr/bin/xcodebuild", 0.1, uid=502)  # busy all week: passes still count the time
+        self.run_for(7 * 24 + 1)
+        self.host.procs.pop(700)
+        self.assertTrue(self.slow_twice()["sandbox"]["rebooting"])
+        self.assertEqual(len(self.host.reboots), 2)
+
+    def test_a_journal_that_lost_a_reboot_the_state_saw_refuses(self) -> None:
+        self.slow_twice()
+        self.host.journal_rows = []
+        self.host.probes = [9.0]
+        self.assertIn("lost a reboot", self.tick(300)["sandbox"]["error"])
+        self.assertEqual(len(self.host.reboots), 1)
 
     def test_an_unreadable_journal_never_reboots(self) -> None:
         self.host.journal_broken = True
@@ -544,11 +582,21 @@ class SandboxHeal(Base):
             h = heal.Host()
             h.journal = Path(d) / "state" / heal.SANDBOX_JOURNAL
             self.assertEqual(h.journal_read(), [])
+            h.journal_append({"t": 0.5, "action": "reboot"})
             for i in range(2 * heal.SANDBOX_JOURNAL_KEEP + 3):
-                h.journal_append({"t": float(i), "action": "slow"})
+                h.journal_append({"t": float(i + 1), "action": "slow"})
             rows = h.journal_read()
-            self.assertLessEqual(len(rows), 2 * heal.SANDBOX_JOURNAL_KEEP)
-            self.assertEqual(rows[-1]["t"], float(2 * heal.SANDBOX_JOURNAL_KEEP + 2))
+            self.assertLessEqual(len(rows), 2 * heal.SANDBOX_JOURNAL_KEEP + 1)
+            self.assertEqual(rows[0], {"t": 0.5, "action": "reboot"})  # compaction never drops a reboot
+            self.assertEqual(rows[-1]["t"], float(2 * heal.SANDBOX_JOURNAL_KEEP + 3))
+            with open(h.journal, "a") as f:
+                f.write('{"t": NaN, "action": "reboot"}\n')
+            with self.assertRaisesRegex(heal.HealError, "no finite time"):
+                h.journal_read()
+            with open(h.journal, "w") as f:
+                f.write("garbage\n")
+            with self.assertRaisesRegex(heal.HealError, "not JSON"):
+                h.journal_read()
             os.symlink(h.journal, Path(d) / "link")
             h.journal = Path(d) / "link"
             with self.assertRaises(heal.HealError):

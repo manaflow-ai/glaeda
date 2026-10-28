@@ -63,12 +63,13 @@ reboot, behind these gates (fleet decision by claude-sr2 (coordinator), 2026-10-
     self-heal; no host list here), it is a fleet Mac (the fleet-ops directory, no ec2-user), no fleet or host-local
     reservation holds it, none of its names holds "lawrence", and it comes back by itself (FileVault off, an
     auto-login user with a saved password);
-  - it is idle (no `busy` process), checked before the probe and again while this pass holds the fleet host.lock
-    exclusively, right before the reboot;
+  - it is idle (no `busy` process), checked before the probe and again right before the reboot while this pass holds
+    the fleet host.lock and the reservation writers' .reservation.lock exclusively (a ps that fails refuses);
   - the probe (an ad-hoc signed copy of /bin/date under `(deny mach-lookup)`, killed at slow_s) failed twice, at least
     confirm_after_s and at most confirm_within_s apart;
-  - no reboot by this heal in the last reboot_every_s (24 h), and none in the last repeat_window_s (7 d): a mini that
-    would need a second reboot within that window is not rebooted; the report says needs_operator, which
+  - no reboot attempt by this heal in the last reboot_every_s (24 h), and none in the last repeat_window_s (7 d), by
+    the clock and by the passes' own capped count (a clock jump cannot open it): a mini that would need a second
+    reboot within that window is not rebooted; the report says needs_operator, which
     glaeda-mini-health turns into a sandboxd_wedged error that ci-dash keeps as an HQ fleet-alert issue.
 Every step (first slow probe, reboot, refusal, the first probe after a reboot) is a line in STATE/sandboxd-heal.jsonl,
 written and synced before the reboot runs.
@@ -285,6 +286,20 @@ class Host:
                     rows.append((int(parts[0]), int(parts[1]), cpu, parts[3].strip()))
         return rows
 
+    def processes_strict(self) -> list[tuple[int, int, float, str]]:
+        """processes(), but a ps that fails or lists nothing raises: an idle check must never pass on no answer."""
+        code, out, err = sh(["/bin/ps", "-axww", "-o", "pid=,uid=,time=,comm="])
+        rows = []
+        for line in out.splitlines():
+            parts = line.split(None, 3)
+            if len(parts) == 4 and parts[0].isdigit() and parts[1].isdigit():
+                cpu = cpu_seconds(parts[2])
+                if cpu is not None:
+                    rows.append((int(parts[0]), int(parts[1]), cpu, parts[3].strip()))
+        if code != 0 or not rows:
+            raise HealError(f"ps gave no process list (exit {code}: {err.strip()[:80]})")
+        return rows
+
     def footprints(self, pids: list[int]) -> dict[int, int]:
         """pid -> memory footprint in bytes (top's MEM, which counts compressed and swapped pages; ps rss does not)."""
         if not pids:
@@ -318,6 +333,8 @@ class Host:
         return time.time()
 
     journal = None  # the sandboxd journal's path; run_pass sets it to STATE/sandboxd-heal.jsonl
+    # A missing journal is no reboots yet (a fresh install). Losing one after a reboot is caught by the state's
+    # reboot_t, which the pass that rebooted wrote, and refuses.
 
     def sandbox_hold(self, now: float) -> str:
         """Why this mini is never rebooted by the sandboxd heal right now ("" when it may be)."""
@@ -385,22 +402,27 @@ class Host:
             return None if done.returncode != 0 else time.monotonic() - start
 
     def with_host_lock(self, fn):
-        """fn() while holding the fleet host.lock exclusively, so no job is admitted; None if it is held now."""
+        """fn() while holding the fleet host.lock exclusively (no job is admitted) and the host's reservation writer
+        lock, .reservation.lock (no reserve or release interleaves); None if either is held or cannot be opened."""
         # Loaded here, not at the top: glaeda-fleet-status loads this module for judge() on any operator machine,
         # including ones without fcntl (its test keeps the module free of a top-level fcntl import).
         fcntl = importlib.import_module("fcntl")
+        fds = []
         try:
-            fd = os.open(FLEET_ROOT / "host.lock", os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
-        except OSError:
-            return None
-        try:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
-                return None
+            for name, flags in (("host.lock", os.O_RDWR), (".reservation.lock", os.O_WRONLY | os.O_APPEND)):
+                try:
+                    fd = os.open(FLEET_ROOT / name, flags | os.O_NOFOLLOW | os.O_NONBLOCK)
+                except OSError:
+                    return None
+                fds.append(fd)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    return None
             return fn()
         finally:
-            os.close(fd)
+            for fd in fds:
+                os.close(fd)
 
     def reboot(self) -> tuple[int, str]:
         code, out, err = sh(SANDBOX_REBOOT, timeout=30)
@@ -418,11 +440,16 @@ class Host:
         except OSError as e:
             raise HealError(f"sandboxd journal unreadable: {e}") from e
         rows = []
-        for line in raw.decode("utf-8", "replace").splitlines():
-            with contextlib.suppress(ValueError):
+        for n, line in enumerate(raw.decode("utf-8", "replace").splitlines(), 1):
+            try:
                 row = json.loads(line)
-                if isinstance(row, dict) and isinstance(row.get("t"), (int, float)):
-                    rows.append(row)
+            except ValueError as e:
+                raise HealError(f"sandboxd journal line {n} is not JSON") from e
+            t = row.get("t") if isinstance(row, dict) else None
+            if isinstance(t, bool) or not isinstance(t, (int, float)) or not math.isfinite(t) \
+                    or not isinstance(row.get("action"), str):
+                raise HealError(f"sandboxd journal line {n} has no finite time or action")
+            rows.append(row)
         return rows
 
     def journal_append(self, entry: dict[str, Any]) -> None:
@@ -432,8 +459,10 @@ class Host:
         path = Path(self.journal)
         path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
         rows = self.journal_read()
-        if len(rows) >= 2 * SANDBOX_JOURNAL_KEEP:
-            keep = b"".join(json.dumps(r, sort_keys=True).encode() + b"\n" for r in rows[-SANDBOX_JOURNAL_KEEP:])
+        if len(rows) >= 2 * SANDBOX_JOURNAL_KEEP:  # every reboot line stays (the limits count them), the rest trims
+            tail = rows[-SANDBOX_JOURNAL_KEEP:]
+            kept = [r for r in rows[:-SANDBOX_JOURNAL_KEEP] if r.get("action") == "reboot"] + tail
+            keep = b"".join(json.dumps(r, sort_keys=True).encode() + b"\n" for r in kept)
             atomic_write(path, keep, 0o644, os.geteuid() == 0)
         fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o644)
         try:
@@ -479,38 +508,52 @@ def restart(host: Host, policy: dict[str, Any], daemon: dict[str, Any], pid: int
 def sandbox_pass(host: Host, policy: dict[str, Any], state: dict[str, Any], now: float, busy: list[str],
                  apply: bool, actions: list, healed: list) -> tuple[dict[str, Any], dict[str, Any]]:
     """(state, report) for sandboxd's self-heal. State: {"first_slow": t of the first slow probe of this episode,
-    "noted": t the repeat refusal was journalled}. Reboots are read from the journal, which outlives the state."""
+    "noted": t the repeat refusal was journalled, "reboot_t": the newest reboot the journal holds, "elapsed": seconds
+    since it, summed pass by pass with each step capped at 2 * every_s and never negative, "last_t": this sum's last
+    pass}. Reboots (every attempt, failed or not) are read from the journal. A wall-clock jump moves "elapsed" by at
+    most one capped step, so the 7 d rule needs both it and the clock to say a week has passed."""
     probe = policy.get("sandbox_probe") or {}
     mine = {k: v for k, v in (state.get("sandbox") or {}).items()
-            if k in ("first_slow", "noted") and isinstance(v, (int, float))}
+            if k in ("first_slow", "noted", "reboot_t", "elapsed", "last_t") and isinstance(v, (int, float))
+            and not isinstance(v, bool) and math.isfinite(v)}
     if not probe.get("enabled"):
         return mine, {"skipped": "off in the policy"}
+    report: dict[str, Any] = {}
+    try:
+        journal = host.journal_read()
+    except HealError as e:
+        return mine, {"error": str(e)[:200]}
+    newest = max((r["t"] for r in journal if r.get("action") == "reboot"), default=None)
+    if newest is None and "reboot_t" in mine:  # the state saw a reboot the journal no longer has
+        return mine, {"error": "sandboxd journal lost a reboot the state recorded; no reboot until a person looks"}
+    if newest is not None and newest != mine.get("reboot_t"):
+        mine.update(reboot_t=newest, elapsed=0.0)
+    if newest is not None and apply:  # a plan pass's state is never written, so it adds nothing
+        if "last_t" in mine:
+            mine["elapsed"] = mine.get("elapsed", 0.0) + min(max(now - mine["last_t"], 0.0), 2 * policy["every_s"])
+        mine["last_t"] = now
+    keep = ("reboot_t", "elapsed", "last_t")  # what outlives an episode
+    clean = {k: v for k, v in mine.items() if k in keep}
     if busy:
         return mine, {"skipped": f"host busy ({', '.join(busy)})"}
     hold = host.sandbox_hold(now)
     if hold:
-        return {}, {"skipped": hold}
+        return clean, {"skipped": hold}
     if not apply:
         return mine, {"skipped": "probed under --apply only"}
     slow = probe["slow_s"]
     took = host.sandbox_probe(slow)
-    report: dict[str, Any] = {"probe_s": None if took is None else round(took, 2)}
+    report["probe_s"] = None if took is None else round(took, 2)
     if took is None:
         report["error"] = "the probe could not run"
         return mine, report
-    try:
-        journal = host.journal_read()
-    except HealError as e:
-        report["error"] = str(e)[:200]
-        return mine, report
+
     def note(entry: dict[str, Any]) -> None:
         try:
             host.journal_append(entry)
         except (HealError, OSError) as e:
             report["journal_error"] = str(e)[:200]
 
-    failed = {r.get("for") for r in journal if r.get("action") == "reboot-failed"}
-    reboots = [r["t"] for r in journal if r.get("action") == "reboot" and r["t"] not in failed]
     if took < slow:
         last = journal[-1] if journal else None
         if last and last.get("action") == "reboot":  # the first look after it
@@ -518,19 +561,19 @@ def sandbox_pass(host: Host, policy: dict[str, Any], state: dict[str, Any], now:
             note({"t": now, "at": iso(now), "action": "after-reboot", "probe_s": round(took, 2)})
             healed.append({"name": "sandboxd", "t": now, "at": iso(now), "since": last.get("since") or iso(last["t"]),
                            "probe_s": last.get("probe_s"), "action": what})
-        return {}, report
+        return clean, report
     first = mine.get("first_slow")
-    if first is None or now - first > probe["confirm_within_s"]:
-        mine = {"first_slow": now}
+    if first is None or not 0 <= now - first <= probe["confirm_within_s"]:
+        mine = {**clean, "first_slow": now}
         note({"t": now, "at": iso(now), "action": "slow", "probe_s": round(took, 2)})
         report["waiting"] = f"probe slow once; confirms after {probe['confirm_after_s']} s"
         return mine, report
     if now - first < probe["confirm_after_s"]:
         report["waiting"] = f"probe slow since {iso(first)}; confirms {probe['confirm_after_s']} s after it"
         return mine, report
-    recent = [t for t in reboots if now - t < probe["repeat_window_s"]]
-    if recent:
-        last_reboot = max(recent)
+    window = probe["repeat_window_s"]
+    if newest is not None and (now - newest < window or mine.get("elapsed", 0.0) < window):
+        last_reboot = newest
         why = (f"sandboxd is wedged again (probe {took:.1f} s >= {slow} s, slow since {iso(first)}) and this heal "
                f"rebooted the mini at {iso(last_reboot)}, within {probe['repeat_window_s'] // 86400:g} d: not "
                f"rebooted again (at most one reboot per {probe['reboot_every_s'] // 3600:g} h, a second within the "
@@ -539,13 +582,18 @@ def sandbox_pass(host: Host, policy: dict[str, Any], state: dict[str, Any], now:
         if not mine.get("noted"):
             mine["noted"] = now
             note({"t": now, "at": iso(now), "action": "refused-repeat", "probe_s": round(took, 2),
-                                 "last_reboot": iso(last_reboot)})
+                  "last_reboot": iso(last_reboot)})
         return mine, report
 
     def reboot():
         # The probes took seconds: look again under the lock, so a job or reservation that arrived meanwhile wins.
+        # Both locks are held from here to the reboot: no job is admitted and no reservation is written meanwhile.
         names = set(policy["busy"])
-        late = sorted({os.path.basename(e) for _p, _u, _c, e in host.processes() if os.path.basename(e) in names})
+        try:
+            rows = host.processes_strict()
+        except HealError as e:
+            return "refused", f"cannot tell the host is idle: {str(e)[:150]}"
+        late = sorted({os.path.basename(e) for _p, _u, _c, e in rows if os.path.basename(e) in names})
         why = f"host busy ({', '.join(late)})" if late else host.sandbox_hold(host.now())
         if why:
             return "refused", why
@@ -554,6 +602,7 @@ def sandbox_pass(host: Host, policy: dict[str, Any], state: dict[str, Any], now:
                                  "probe_s": round(took, 2), "command": " ".join(SANDBOX_REBOOT[:3])})
         except (HealError, OSError) as e:
             return "refused", f"sandboxd journal not writable, no reboot: {str(e)[:150]}"
+        mine.update(reboot_t=now, elapsed=0.0, last_t=now)
         return host.reboot()
 
     done = host.with_host_lock(reboot)
@@ -566,9 +615,9 @@ def sandbox_pass(host: Host, policy: dict[str, Any], state: dict[str, Any], now:
     code, out = done
     what = (f"sandbox probe {took:.1f} s >= {slow} s twice since {iso(first)}: {' '.join(SANDBOX_REBOOT[:3])} "
             f"exited {code}{': ' + out if out else ''}")
-    if code != 0:
-        note({"t": host.now(), "at": iso(host.now()), "action": "reboot-failed", "for": now,
-                             "exit": code, "out": out})
+    if code != 0:  # logged; it still counts toward the limits (shutdown may have taken it before timing out)
+        note({"t": host.now(), "at": iso(host.now()), "action": "reboot-failed", "for": now, "exit": code,
+              "out": out})
     actions.append({"name": "sandboxd", "ok": code == 0, "action": what})
     report["rebooting"] = code == 0
     return mine, report
