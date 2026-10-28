@@ -2909,7 +2909,8 @@ stop("TERM");
   } }
 for (1 .. 20) { select(undef, undef, undef, 0.5); my ($pids, $gids, $ok) = look(); last unless $ok && @$pids; }
 stop("KILL");
-waitpid($pid, 0);
+# Reap it, but never wait on a process stuck in the kernel past SIGKILL: 124 either way.
+for (1 .. 20) { last if waitpid($pid, POSIX::WNOHANG()) != 0; select(undef, undef, undef, 0.5); }
 exit 124;
 """.strip()
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME") or Path("~/.local/state").expanduser()) / "glaeda" / "mini-fleet"
