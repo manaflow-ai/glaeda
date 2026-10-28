@@ -4862,6 +4862,32 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertTrue((idle.parent / ".glaeda-state/cas").exists())
         self.assertTrue((other.parent / ".glaeda-state/ios-e2e-mac-derived-data").exists())
 
+    def test_a_hygiene_pass_keeps_runner_submodule_stores_and_still_prunes_build_output(self) -> None:
+        """Git metadata in a runner workspace is never stale cache: .git/modules (the stores its submodule checkouts'
+        gitfiles name) survives a pressure pass however old, while DerivedData and other build output still go.
+        2026-10-28: a workspace without .git/modules failed the warm nightly-next checkout with `fatal: not a
+        git repository: ghostty/../.git/modules/ghostty`."""
+        home, fams = self._runner_checkouts()
+        idle = home / "actions-runner-glaeda/_work/cmux/cmux"
+        store = idle / ".git/modules/ghostty"
+        (store / "objects/pack").mkdir(parents=True)
+        (store / "objects/pack/pack-5678.pack").write_bytes(b"\0" * 4096)
+        (store / "HEAD").write_text("0" * 40 + "\n")
+        (idle / "ghostty").mkdir()
+        (idle / "ghostty/.git").write_text("gitdir: ../.git/modules/ghostty\n")
+        self._age(home / "actions-runner-glaeda/_work", hours=30)  # the store is as old as the build output
+        gd.process_evidence = lambda: ([], "")
+        with mock.patch.object(gd, "ACTIVITY_MODE", "pressure"), \
+                mock.patch.object(gd, "command_lines", return_value="/sbin/launchd\n"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            items = gd.survey(fams, 6, 0)
+            gd.apply(items, {f.id: f for f in fams}, self.receipt(), None, 6, all_families=fams)
+        self.assertFalse((idle / "cmux-tui/target").exists())
+        self.assertFalse((idle.parent / ".glaeda-state/ios-e2e-mac-derived-data").exists())
+        self.assertTrue((store / "objects/pack/pack-5678.pack").is_file())
+        self.assertTrue((store / "HEAD").is_file())
+        self.assertEqual((idle / "ghostty/.git").read_text(), "gitdir: ../.git/modules/ghostty\n")
+
     def test_runner_git_garbage_stays_inside_the_runners_work(self) -> None:
         home, _ = self._runner_checkouts()
         outside = self.root / "main-clone/.git"
@@ -5200,6 +5226,66 @@ class GlaedaDiskTest(unittest.TestCase):
         (rec,) = map(json.loads, receipt.read_text().splitlines())
         self.assertEqual((rec["family"], rec["outcome"], rec["path"]),
                          (gd.RUNNER_CHECKOUT_AT_START_FAMILY, "reclaimed", str(bloated / ".git")))
+
+    def test_the_job_start_keeps_the_bloated_checkouts_submodule_stores(self) -> None:
+        """Only the checkout's own store goes: its submodules' stores (.git/modules) stay under an empty repository,
+        so the submodule checkouts' gitfiles still name a store and a warm `git submodule update` reuses it."""
+        home, cos = self._own_checkout_fixture()
+        bloated = cos["actions-runner-glaeda-11"]
+        env = {"PATH": "/usr/bin:/bin:/opt/homebrew/bin", "HOME": os.fspath(self.root), "GIT_AUTHOR_NAME": "t",
+               "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x"}
+        upstream = self.root / "ghostty-upstream"
+        for args in (["init", "-q", os.fspath(upstream)],
+                     ["-C", os.fspath(upstream), "commit", "-q", "--allow-empty", "-m", "g"]):
+            subprocess.run(["git", *args], check=True, capture_output=True, env=env)
+        store = bloated / ".git/modules/ghostty"
+        # what `git submodule update` leaves: the store in .git/modules, a gitfile in the submodule checkout
+        store.parent.mkdir()
+        subprocess.run(["git", "clone", "-q", f"--separate-git-dir={store}", os.fspath(upstream),
+                        os.fspath(bloated / "ghostty")], check=True, capture_output=True, env=env)
+        self._age(bloated / ".git", hours=1)
+        gd.process_evidence = lambda: ([], f"{home}/actions-runner-glaeda-11/bin/Runner.Worker spawnclient 1 2")
+        patches, removed = self._floor_disk(400.0)
+        with patches[0], patches[1], mock.patch.object(gd, "host_reservation", return_value=""), self._starting():
+            note = gd.evict_own_runner_checkout(bloated, self.receipt(), home)
+        self.assertIn("kept its submodule stores", note)
+        self.assertEqual([(Path(r).name, Path(r).parent.parent) for r in removed], [("old", bloated)])  # old store only
+        self.assertFalse(any(p.name.startswith(".glaeda-") for p in bloated.iterdir()))
+        self.assertTrue((store / "HEAD").is_file())
+        self.assertEqual(gd.git_pack_bytes(bloated / ".git"), 0)  # the bloat is gone
+        run = lambda *a: subprocess.run(["git", *a], capture_output=True, text=True, env=env)  # noqa: E731
+        self.assertEqual(run("-C", os.fspath(bloated), "rev-parse", "--git-dir").returncode, 0)  # a repository still
+        self.assertEqual(run("-C", os.fspath(bloated / "ghostty"), "rev-parse", "--git-dir").returncode, 0)
+
+    def test_a_kept_store_is_refused_before_anything_moves(self) -> None:
+        co = self.root / "ws"
+        (co / ".git/modules/ghostty").mkdir(parents=True)
+        (co / ".git/HEAD").write_text("ref: refs/heads/main\n")
+        with mock.patch.object(gd, "toolchain_held", side_effect=lambda p, fresh=False: p == co / ".git"):
+            with self.assertRaises(OSError):
+                gd.remove_checkout_store(co)
+        self.assertEqual(sorted(p.name for p in (co / ".git").iterdir()), ["HEAD", "modules"])
+        self.assertEqual([p.name for p in co.iterdir()], [".git"])
+
+    def test_the_job_start_keeps_the_whole_store_when_git_cannot_make_a_new_one(self) -> None:
+        home, cos = self._own_checkout_fixture()
+        bloated = cos["actions-runner-glaeda-11"]
+        (bloated / ".git/modules/ghostty").mkdir(parents=True)
+        (bloated / ".git/modules/ghostty/HEAD").write_text("ref: refs/heads/main\n")
+        self._age(bloated / ".git", hours=1)
+        gd.process_evidence = lambda: ([], f"{home}/actions-runner-glaeda-11/bin/Runner.Worker spawnclient 1 2")
+        patches, removed = self._floor_disk(400.0)
+        real_run = subprocess.run
+        failing = lambda argv, *a, **k: (subprocess.CompletedProcess(argv, 1) if argv[:2] == ["git", "init"]  # noqa: E731
+                                         else real_run(argv, *a, **k))
+        with patches[0], patches[1], mock.patch.object(gd, "host_reservation", return_value=""), self._starting(), \
+                mock.patch.object(gd.subprocess, "run", side_effect=failing):
+            note = gd.evict_own_runner_checkout(bloated, self.receipt(), home)
+        self.assertIn("could not remove", note)
+        self.assertEqual(removed, [])
+        self.assertTrue((bloated / ".git/modules/ghostty/HEAD").is_file())
+        self.assertGreater(gd.git_pack_bytes(bloated / ".git"), 0)
+        self.assertFalse(any(p.name.startswith(".glaeda-") for p in bloated.iterdir()))
 
     def test_the_job_start_keeps_its_own_bloated_checkout_on_any_veto(self) -> None:
         def no_evidence():

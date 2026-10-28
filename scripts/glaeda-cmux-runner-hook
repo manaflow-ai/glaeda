@@ -2767,9 +2767,13 @@ def evict_own_checkout(workspace: str | None, explicit: str | None, timeout: flo
 # mirror keeps one full mirror per mini and never removes an object from it, so at job-completed a cmux checkout
 # borrows the mirror's object store (objects/info/alternates) and one `repack -a -d -l` drops the local copies of
 # what the mirror holds. The next job's fetch then sends only what the mirror lacks (a pull request's own commits).
-# A borrower records which mirror it borrowed (its objects directory's device and inode). At job-started, a borrower
-# whose mirror is gone or was rebuilt (a reseed is a new directory and may lack a force-pushed commit) loses its .git,
-# before any step reads it, so actions/checkout clones it whole.
+# A borrower records which mirror it borrowed (its objects directory's inode and birth time). At job-started, a
+# borrower whose mirror is gone or was rebuilt (a reseed is a new directory and may lack a force-pushed commit) loses
+# its own git store, before any step reads it, so checkout fetches it again. The device number is recorded but never
+# compared: a reboot renumbers volumes, and one mini's reboot (2026-10-28 15:41Z) made every borrower on the mini read
+# as rebuilt. Its submodules' stores (.git/modules) stay: they never borrow the mirror, and dropping them under the
+# submodule checkouts' gitfiles left `fatal: not a git repository: ghostty/../.git/modules/ghostty` for the warm
+# nightly-next builder (run 40718624408) and every reused workspace on the mini.
 MIRROR_DIR = Path(os.environ.get("GLAEDA_GIT_MIRROR_DIR") or os.path.join(FLEET_DIR, "git")) / "cmux.git"
 BORROW_RECORD = "glaeda-mirror-borrow.json"
 BORROW_ORIGINS = frozenset({"https://github.com/manaflow-ai/cmux", "https://github.com/manaflow-ai/cmux.git",
@@ -2788,9 +2792,64 @@ def mirror_identity(mirror: Path = MIRROR_DIR) -> dict | None:
                 or not (mirror / "glaeda-verified").is_file() or (mirror / "glaeda-repair-pending").exists() \
                 or (mirror / "shallow").exists():
             return None
-        return {"objects": os.fspath(objects), "dev": st.st_dev, "ino": st.st_ino}
+        identity = {"objects": os.fspath(objects), "dev": st.st_dev, "ino": st.st_ino}
+        if (birth := getattr(st, "st_birthtime", None)) is not None:
+            identity["birth"] = birth
+        return identity
     except OSError:
         return None
+
+
+def same_mirror(recorded: object, st: os.stat_result) -> bool:
+    """Whether a borrow record names the directory st is: the same inode and birth time (a record from before the birth
+    time was kept matches on the inode). The device number is compared only where there is no birth time, since a
+    reboot renumbers volumes."""
+    if not isinstance(recorded, dict) or not stat.S_ISDIR(st.st_mode) or recorded.get("ino") != st.st_ino:
+        return False
+    birth = getattr(st, "st_birthtime", None)
+    if birth is None:  # no birth time (Linux): the inode alone could be another filesystem's, so the device counts
+        return recorded.get("dev") == st.st_dev
+    return recorded.get("birth", birth) == birth
+
+
+def drop_checkout_store(git_dir: Path) -> str:
+    """Remove a runner checkout's own git store and leave an empty repository in its place, keeping its submodules'
+    stores (.git/modules) so no submodule gitfile in the workspace names a store that is gone. Returns what was kept,
+    or "". Raises OSError, with the store whole, when git cannot make the empty repository or a move fails."""
+    modules = git_dir / "modules"
+    if modules.is_symlink() or not modules.is_dir():
+        shutil.rmtree(git_dir)
+        return ""
+    # The fresh repository is made first, in a directory made for this call alone (mkdtemp): if git cannot make
+    # it, only that directory goes and the old store stays whole. Then the submodule stores move into the fresh
+    # repository, the old store moves out and the fresh one takes its place: renames within the workspace, each
+    # undone if a later one fails, so an error never leaves the workspace without its submodule stores.
+    work = Path(tempfile.mkdtemp(prefix=".glaeda-git-swap-", dir=git_dir.parent))
+    fresh, old = work / "fresh", work / "old"
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    try:
+        made = subprocess.run(["git", "init", "-q", os.fspath(fresh)], capture_output=True, timeout=60, env=env,
+                              check=False).returncode == 0 and (fresh / ".git" / "HEAD").is_file()
+    except (OSError, subprocess.SubprocessError):
+        made = False
+    if not made:
+        shutil.rmtree(work, ignore_errors=True)
+        raise OSError("git init failed; the checkout's store was kept")
+    os.rename(modules, fresh / ".git" / "modules")
+    try:
+        os.rename(git_dir, old)
+        try:
+            os.rename(fresh / ".git", git_dir)
+        except OSError:
+            os.rename(old, git_dir)
+            raise
+    except OSError:
+        os.rename(fresh / ".git" / "modules", modules)
+        shutil.rmtree(work, ignore_errors=True)
+        raise
+    shutil.rmtree(old)
+    shutil.rmtree(work, ignore_errors=True)
+    return "kept its submodule stores (.git/modules)"
 
 
 def runner_git_dir(workspace: str | None) -> Path | None:
@@ -2825,15 +2884,14 @@ def guard_borrowed_checkout(workspace: str | None, mirror: Path = MIRROR_DIR) ->
         except (OSError, ValueError):
             recorded = None
         try:
-            st = os.stat(objects, follow_symlinks=False)
-            same = isinstance(recorded, dict) and recorded.get("dev") == st.st_dev \
-                and recorded.get("ino") == st.st_ino and stat.S_ISDIR(st.st_mode)
+            same = same_mirror(recorded, os.stat(objects, follow_symlinks=False))
         except OSError:
             same = False
         if same:
             return ""
-        shutil.rmtree(git_dir)
-        return f"removed {git_dir}: it borrowed objects from a mirror that is gone or was rebuilt (checkout clones it)"
+        kept = drop_checkout_store(git_dir)
+        note = f"removed {git_dir}: it borrowed objects from a mirror that is gone or was rebuilt (checkout fetches it)"
+        return f"{note}; {kept}" if kept else note
     except Exception as error:  # noqa: BLE001  (never fail the job on housekeeping)
         return f"borrowed checkout guard: {type(error).__name__}"
 
@@ -2861,7 +2919,17 @@ def borrow_mirror(workspace: str | None, mirror: Path = MIRROR_DIR, timeout: flo
             return ""
         alternates = alternates_of(git_dir)
         notes = []
-        if identity["objects"] not in alternates:
+        if identity["objects"] in alternates:
+            # a record from before the birth time was kept, or with a device number a reboot changed: the same
+            # mirror (same_mirror), so it is brought up to date; a rebuilt mirror's borrower waits for the guard
+            record = git_dir / BORROW_RECORD
+            with contextlib.suppress(OSError, ValueError):
+                recorded = json.loads(record.read_text())
+                if recorded != identity and same_mirror(recorded, os.stat(identity["objects"], follow_symlinks=False)):
+                    tmp = record.with_name(f".{record.name}.{os.getpid()}")
+                    tmp.write_text(json.dumps(identity) + "\n")
+                    os.replace(tmp, record)
+        else:
             record = git_dir / BORROW_RECORD
             tmp = record.with_name(f".{record.name}.{os.getpid()}")
             tmp.write_text(json.dumps(identity) + "\n")

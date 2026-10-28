@@ -215,6 +215,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field, replace
@@ -821,6 +822,7 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "95b700d406639698456d2d536eea9d698b329191a732b24608a673c1e9353d98",
     "ea3e56492347b8a0b68427496eb010eec75b6dc9e3733989c47d0f6f78e18fc9",
     "116bd4fa210f949c76cf3a90d73999f5f22e06cb38ff2c7320dee32af449c285",
+    "f0399a101d657f73563eaef43c8d08129609657e4b206db4e413b42b1b1c4ccc",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -2929,8 +2931,11 @@ def evict_idle_runner_checkouts(receipt: Path, floor_gib: float, home: Path | No
 # RUNNER_IDLE_CHECKOUT_HOURS, so evict_idle_runner_checkouts never takes it: an hour after it reached stable
 # (2026-10-27), the tour runner's 7-8 GiB checkout (glaeda-11) was still on all 11 minis. The runner hook takes it at
 # job-started instead (--own-runner-checkout): the job's own workspace, before any step of the job runs, so no job of
-# this runner is using it and no other runner ever does. Only its .git goes; the workspace directory stays for the
-# steps that run before checkout, and actions/checkout, finding no repository there, clones at the job's depth.
+# this runner is using it and no other runner ever does. Only its own git store goes; the workspace directory stays
+# for the steps that run before checkout, and checkout, finding an empty repository there, fetches at the job's depth.
+# Its submodules' stores (.git/modules) stay too (remove_checkout_store): git metadata a live runner workspace's
+# submodule checkouts point at is never stale cache. Dropping them under the submodule gitfiles broke the warm
+# nightly-next builder with `fatal: not a git repository: ghostty/../.git/modules/ghostty` (2026-10-28).
 RUNNER_CHECKOUT_AT_START_FAMILY = "runner-bloated-checkout-at-start"
 # The job must be starting: its Runner.Worker began at most this long ago, and nothing in the checkout's git
 # bookkeeping is newer than that start (a checkout step rewrites the index, HEAD and FETCH_HEAD). A later step of
@@ -3028,6 +3033,51 @@ def live_linked_worktrees(checkout: Path) -> list[str] | None:
     return live
 
 
+def remove_checkout_store(checkout: Path) -> str:
+    """Remove a runner checkout's own git store and leave an empty repository in its place, keeping its submodules'
+    stores (.git/modules) so no submodule gitfile in the workspace names a store that is gone. Returns what was kept,
+    or "". Raises OSError, with the store whole, when git cannot make the empty repository or a move fails."""
+    git_dir = checkout / ".git"
+    modules = git_dir / "modules"
+    if modules.is_symlink() or not modules.is_dir():
+        remove(git_dir)
+        return ""
+    # remove()'s refusals, on the store where it is, before anything moves
+    if toolchain_held(git_dir, fresh=True) or git_dir.is_symlink() or os.path.ismount(git_dir) \
+            or git_dir.lstat().st_dev != checkout.stat().st_dev:
+        raise OSError("refusing a kept, linked or mounted store")
+    # The fresh repository is made first, in a directory made for this call alone (mkdtemp): if git cannot make
+    # it, only that directory goes and the old store stays whole. Then the submodule stores move into the fresh
+    # repository, the old store moves out and the fresh one takes its place: renames within the workspace, each
+    # undone if a later one fails, so an error never leaves the workspace without its submodule stores.
+    work = Path(tempfile.mkdtemp(prefix=".glaeda-git-swap-", dir=git_dir.parent))
+    fresh, old = work / "fresh", work / "old"
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    try:
+        made = subprocess.run(["git", "init", "-q", os.fspath(fresh)], capture_output=True, timeout=60, env=env,
+                              check=False).returncode == 0 and (fresh / ".git" / "HEAD").is_file()
+    except (OSError, subprocess.SubprocessError):
+        made = False
+    if not made:
+        shutil.rmtree(work, ignore_errors=True)
+        raise OSError("git init failed; the checkout's store was kept")
+    os.rename(modules, fresh / ".git" / "modules")
+    try:
+        os.rename(git_dir, old)
+        try:
+            os.rename(fresh / ".git", git_dir)
+        except OSError:
+            os.rename(old, git_dir)
+            raise
+    except OSError:
+        os.rename(fresh / ".git" / "modules", modules)
+        shutil.rmtree(work, ignore_errors=True)
+        raise
+    remove(old)
+    shutil.rmtree(work, ignore_errors=True)
+    return "kept its submodule stores (.git/modules)"
+
+
 def evict_own_runner_checkout(workspace: Path, receipt: Path, home: Path | None = None) -> str:
     """Remove the .git of the starting job's own workspace when it is a bloated runner checkout and git loses nothing:
     a one-line note, or "" when the workspace is not an enrolled runner's _work/<repo>/<repo>, is not bloated, or the
@@ -3068,13 +3118,13 @@ def evict_own_runner_checkout(workspace: Path, receipt: Path, home: Path | None 
                 why = f"open or a working directory of {users}"
             elif named_by(os.fspath(checkout), cmds) or named_by(resolved, cmds):
                 why = "named by a running command"
-    size = 0
+    size, kept = 0, ""
     if why:
         outcome = "blocked:git" if why.startswith(("git", "a commit", "not a plain")) else "changed:in-use"
     else:
         try:
             before = free_bytes(home)[0]
-            remove(git_dir)
+            kept = remove_checkout_store(checkout)
             outcome = "reclaimed"
             size = max(0, free_bytes(home)[0] - before)
         except OSError as e:
@@ -3092,7 +3142,9 @@ def evict_own_runner_checkout(workspace: Path, receipt: Path, home: Path | None 
         return f"kept the bloated checkout {checkout} ({gib(bloat).strip()} of packs): {why}"
     if outcome != "reclaimed":
         return f"could not remove {git_dir}: {outcome}"
-    return f"removed {git_dir} ({gib(bloat).strip()} of packs, bloated; freed {gib(size).strip()}); checkout clones it again"
+    note = (f"removed {git_dir} ({gib(bloat).strip()} of packs, bloated; freed {gib(size).strip()}); "
+            "checkout fetches it again")
+    return f"{note}; {kept}" if kept else note
 
 
 def own_runner_checkout_main(args: list[str]) -> int:
