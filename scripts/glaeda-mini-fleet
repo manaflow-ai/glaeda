@@ -2824,21 +2824,23 @@ BREW_TIMED_OUT = 124
 # The bound, in perl because a mini has no timeout(1) and maybe no Python. It runs as the Homebrew owner, inside
 # sudo -u, so it can signal what brew starts and nothing of root's. argv: SECONDS COMMAND [ARG...].
 # The command starts in a process group of its own. While it runs, the bound looks (ps) at what it started every 2 s
-# at most, and remembers each process found by pid and start time, so one that is orphaned before the limit (a curl
-# whose parent died, in a group of its own) is still known. The limit is on the monotonic clock. At the limit it looks
-# again: every process in the command's group or under it, every remembered process that is still the same process,
-# everything under those, and every process group any of them is in. It sends SIGTERM to each group and process; then,
-# while any of them lives, for up to 10 s, it looks again, and SIGKILLs what that look finds. Each signal goes only to
-# what a look taken just before it finds, so a pid or group id that ended and was reused in between is never
-# signalled; the command itself is reaped only after the last signal, so its pid and group id stay ours until then. A
-# ps that does not answer within 10 s is killed; that look signals only the command's own group, and the next look
-# asks ps again. Not covered: a process started and orphaned between two looks, and the moment between a look and its
-# signal. Under the limit the command's exit code passes through (a signal as 128+N); at the limit it exits
-# BREW_TIMED_OUT. Homebrew's own exit codes are 0 and 1, so 124 is free.
+# at most, and remembers each process found by pid and start time (lstart, to the second; a pid comes round again only
+# after the whole pid space, so never within its first owner's second), so one that is orphaned before the limit (a
+# curl whose parent died, in a group of its own) is still known. The limit is on the monotonic clock. At the limit it
+# looks again: every process in the command's group or under it, every remembered process that is still the same
+# process, everything under those, and every process group any of them is in. It sends SIGTERM to each group and
+# process; then, while any of them lives, for up to 10 s, it looks again, and SIGKILLs what that look finds. Each
+# signal goes only to what a look taken just before it finds, so a pid or group id that ended and was reused in
+# between is never signalled; the command itself is reaped only after the last signal, so its pid and group id stay
+# ours until then. A ps that does not answer within 10 s is killed; that look signals only the command's own group,
+# and the next look asks ps again. Not covered: a process started and orphaned between two looks, and the moment
+# between a look and its signal. Under the limit the command's exit code passes through (a signal as 128+N); at the
+# limit it exits BREW_TIMED_OUT. Homebrew's own exit codes are 0 and 1, so 124 is free.
 BREW_BOUND = r"""
 use strict; use warnings; use POSIX (); use Time::HiRes qw(clock_gettime CLOCK_MONOTONIC);
 my $limit = shift @ARGV;
-my $ps_limit = $ENV{GLAEDA_BREW_BOUND_PS_SECONDS} || 10;  # tests shorten it
+my $ps_env = $ENV{GLAEDA_BREW_BOUND_PS_SECONDS} // "";  # tests shorten the ps limit to 1-9 s; nothing else
+my $ps_limit = $ps_env =~ /\A[1-9]\z/ ? $ps_env : 10;
 my $mine = getpgrp();
 my (%known, $pid);  # %known: pid => start time of every process a look found
 sub look {  # (live pids, their groups, read ok) under the command, from one ps read
