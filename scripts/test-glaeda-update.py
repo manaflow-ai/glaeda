@@ -1352,6 +1352,34 @@ class ReleaseTest(unittest.TestCase):
         with self.assertRaises(gr.ReleaseError):
             gr.parse_release(release_raw, "0" * 64)
 
+    def test_hook_history_keeps_a_merged_side_branch_version_the_merge_dropped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+                   "GIT_COMMITTER_EMAIL": "t@t", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+
+            def git(*args: str) -> str:
+                return subprocess.run(["git", "-C", tmp, *args], check=True, capture_output=True, text=True,
+                                      env=env).stdout.strip()
+
+            def commit(text: str) -> None:
+                for name in gr.HOOK_FILES:
+                    (repo / "scripts" / name).write_text(f"{name} {text}\n")
+                git("add", "-A")
+                git("commit", "-q", "-m", text)
+
+            git("init", "-q", "-b", "main")
+            (repo / "scripts").mkdir()
+            commit("v1")
+            git("checkout", "-q", "-b", "side")
+            commit("side")  # a release from this branch installed it
+            git("checkout", "-q", "main")
+            commit("v2")
+            git("merge", "-q", "-s", "ours", "--no-edit", "side")  # the merge keeps main's version
+            history = json.loads(gr.hook_history(repo, git("rev-parse", "HEAD")))
+            for name in gr.HOOK_FILES:
+                self.assertEqual(set(history[name]), {gr.sha256(f"{name} {v}\n".encode()) for v in ("v1", "side", "v2")})
+
     def test_hygiene_archive_holds_the_tree_and_the_binary(self) -> None:
         head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True,
                               text=True, check=True).stdout.strip()

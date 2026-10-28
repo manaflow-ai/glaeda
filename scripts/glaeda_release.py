@@ -99,7 +99,10 @@ ANCESTRY = "ancestry.txt"
 ANCESTRY_MAX = 5000
 # {file: SHA-256 of every version of it in the source's history} for the files glaeda-cmux-runner --refresh-hooks
 # installs. A runner hook with one of these digests is one this release descends from, so replacing it is never
-# a downgrade; any other hook (installed from a newer main, or edited) is left to --apply.
+# a downgrade; any other hook (installed from a newer main, or edited) is left to --apply. The walk is --full-history:
+# git's default simplification drops a merged side branch whose version a merge did not keep, and the version a
+# release from that branch installed then read as newer, so no later release replaced it (2026-10-28: every mini
+# kept #1716's hook aa68db0113a4 after sync merge 81f4721 took manaflow-ai's side, and #1722 never rolled out).
 HOOK_HISTORY = "hook-history.json"
 HOOK_FILES = ("glaeda-cmux-runner-hook", "glaeda_reservation.py")
 HOOK_HISTORY_MAX = 1000
@@ -109,7 +112,8 @@ def hook_history(root: Path, source: str) -> bytes:
     history = {}
     for name in HOOK_FILES:
         path = f"scripts/{name}"
-        commits = subprocess.run(["git", "-C", str(root), "rev-list", f"--max-count={HOOK_HISTORY_MAX}", source,
+        commits = subprocess.run(["git", "-C", str(root), "rev-list", "--full-history", f"--max-count={HOOK_HISTORY_MAX}",
+                                  source,
                                   "--", path], check=True, capture_output=True, text=True).stdout.split()
         digests = set()
         for commit in [source, *commits]:
