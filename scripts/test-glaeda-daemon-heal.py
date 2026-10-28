@@ -431,7 +431,8 @@ class SandboxHeal(Base):
         del doc["sandbox_probe"]
         heal.validate_policy(doc)
         for bad in ({"enabled": "yes", "slow_s": 5, "every_s": 60}, {"enabled": True, "slow_s": 0, "every_s": 60},
-                    {"enabled": True, "slow_s": 120, "every_s": 60}, []):
+                    {"enabled": True, "slow_s": 120, "every_s": 60}, {"enabled": True, "slow_s": float("nan"), "every_s": 60},
+                    {"enabled": True, "slow_s": 5, "every_s": float("inf")}, {"enabled": True, "slow_s": 5, "every_s": float("nan")}, []):
             doc["sandbox_probe"] = bad
             with self.assertRaises(heal.HealError):
                 heal.validate_policy(doc)

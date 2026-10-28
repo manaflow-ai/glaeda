@@ -72,6 +72,7 @@ import hashlib
 import http.client
 import io
 import json
+import math
 import os
 import plistlib
 import pwd
@@ -151,6 +152,8 @@ HYGIENE_TIMEOUT = 120
 HYGIENE_RETRY_S = 900
 # sandboxd's self-heal: fixed here, never from the policy, so no policy file names what root runs or restarts.
 SANDBOXD_TARGET = "system/com.apple.sandboxd"
+# The deny takes effect: on the wedged mini this hangs, while "(version 1)(allow default)" ran the same ad-hoc copy
+# in 0.016 s (austin-0, 2026-10-28). It is the shape of rule Homebrew's bottle sandbox hit.
 SANDBOX_PROBE_PROFILE = "(version 1)(deny mach-lookup)(allow default)"
 SANDBOX_PROBE_SOURCE = "/bin/date"  # copied and ad-hoc signed: a platform binary takes sandboxd's fast path  # a check or reinstall that failed is tried again this long after, not every pass
 
@@ -200,8 +203,8 @@ def validate_policy(doc: Any) -> dict[str, Any]:
             raise HealError("policy sandbox_probe needs enabled")
         for key in ("slow_s", "every_s"):
             value = probe.get(key)
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
-                raise HealError(f"policy sandbox_probe.{key} must be positive")
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                raise HealError(f"policy sandbox_probe.{key} must be a positive finite number")
         if probe["slow_s"] > 60:
             raise HealError("policy sandbox_probe.slow_s must be at most 60")
     release = doc["release"]
