@@ -144,14 +144,19 @@ repository. Both repositories take pull requests, and their `main` branches are 
 directions. Releases, attestations and promotions still happen only in this repository.
 
 **Anything merged to either `main` ships to the fleet.** A merge in the fork reaches this
-repository's `main` within about 15 minutes, and every push to this `main` is released as above:
+repository's `main` within a minute or two (Sync of `main`, below; until the fork has
+its dispatch token, when this repository's sync next runs), and every push to this `main` is released as above:
 canary hosts install it within about an hour, and the minis (stable) after the 15-minute canary
 window once both required host statuses are healthy. There is no separate approval step after the merge. To hold a release
 back, pause the rollout (`control.yml`, below).
 
-- **Sync of `main`.** `.github/workflows/sync-main.yml` runs only in this repository, every 15
-  minutes, on every push to `main`, and on dispatch. It calls `scripts/glaeda-sync-main`, which
-  compares the two mains:
+- **Sync of `main`.** `.github/workflows/sync-main.yml` runs only in this repository, on every
+  push to `main`, on dispatch, and on a 15-minute schedule (which GitHub runs only every few hours
+  for this personal-account repository). In the fork, `.github/workflows/sync-dispatch.yml` starts
+  it on every push to the fork's `main` and, on the fork's own 15-minute schedule, whenever the two
+  mains differ; it needs the fork secret `SYNC_DISPATCH_TOKEN` (a fine-grained token with Actions
+  read and write on this repository alone) and, without it, only warns. It calls
+  `scripts/glaeda-sync-main`, which compares the two mains:
   - equal: nothing to do;
   - one is behind: it is fast-forwarded to the other;
   - diverged, merging cleanly: one merge commit (this repository's `main` first parent, the fork's
