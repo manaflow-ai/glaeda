@@ -1774,6 +1774,7 @@ class PreflightTests(unittest.TestCase):
                 self.assertLess(time.monotonic() - started, 30, hang)
                 if hang in ("--cache", "install git", "link git"):  # the list calls send stderr to /dev/null
                     self.assertIn("timed out after 1s", run.stderr, hang)
+                    self.assertEqual(run.stderr.count("timed out"), 1, run.stderr)  # the bound's line, nothing else
             # Nothing hangs: the step runs to the end.
             run = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60,
                                  env={"PATH": os.environ["PATH"], "HOME": tmp, "HANG": "never"})

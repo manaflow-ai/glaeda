@@ -3226,8 +3226,8 @@ def brew_commands(owner: str, formulas: list[str], as_owner: bool, as_root: bool
     lines = [f"brew_bound={shlex.quote(BREW_BOUND)}",
              f'brew_as() {{ local rc=0; {run}/usr/bin/perl -e "$brew_bound" {BREW_COMMAND_TIMEOUT} '
              'env HOMEBREW_NO_ASK=1 /opt/homebrew/bin/brew "$@" || rc=$?; '
-             f'if [ "$rc" = {BREW_TIMED_OUT} ]; then echo "brew $1: timed out after {BREW_COMMAND_TIMEOUT}s" >&2; '
-             f'exit {BREW_TIMED_OUT}; fi; return "$rc"; }}',
+             # No message here: the bound wrote one, and a write to a full stderr could block the step.
+             f'if [ "$rc" = {BREW_TIMED_OUT} ]; then exit {BREW_TIMED_OUT}; fi; return "$rc"; }}',
              # Bottles glaeda-mini-fleet share brew staged from a peer; brew checks their digests before use.
              f'staged="${{login_home:-$HOME}}/{BREW_STAGE}"',
              'if [ -n "$(ls "$staged" 2>/dev/null)" ]; then',
