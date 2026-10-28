@@ -1698,6 +1698,36 @@ class PreflightTests(unittest.TestCase):
             else:
                 os.kill(child, 9)
                 self.fail(f"the bound left pid {child} running")
+        # An orphan: the parent dies on SIGTERM and leaves a child that ignores it, in a group of its own and no
+        # longer under anything of ours; the bound still finds it (same pid, same start) and kills it.
+        with tempfile.TemporaryDirectory() as tmp:
+            pidfile = Path(tmp) / "child"
+            orphan = ("if (!fork) { setpgrp(0, 0); $SIG{TERM} = 'IGNORE'; open(my $f, '>', $ARGV[0]) or die; "
+                      "print $f $$; close $f; exec 'sleep', '300' } sleep 300")
+            run = subprocess.run([*bound, "1", "perl", "-e", orphan, os.fspath(pidfile)], capture_output=True,
+                                 text=True, timeout=60)
+            self.assertEqual(run.returncode, 124, run.stderr)
+            self.assert_gone(int(pidfile.read_text()))
+        # A ps that never answers: it is killed, and the command's own group is still stopped.
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "ps"
+            fake.write_text("#!/bin/sh\nexec sleep 300\n")
+            fake.chmod(0o755)
+            started = time.monotonic()
+            run = subprocess.run([*bound, "1", "sleep", "300"], capture_output=True, text=True, timeout=120,
+                                 env={**os.environ, "PATH": f"{tmp}:{os.environ['PATH']}"})
+            self.assertEqual(run.returncode, 124, run.stderr)
+            self.assertLess(time.monotonic() - started, 60)
+
+    def assert_gone(self, pid: int) -> None:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout
+            if not state.strip() or state.strip().startswith("Z"):
+                return
+            time.sleep(0.2)
+        os.kill(pid, 9)
+        self.fail(f"the bound left pid {pid} running")
 
     def test_a_brew_timeout_ends_the_homebrew_step_with_124_wherever_brew_runs(self) -> None:
         # brew_as runs in `if !`, in a command substitution and behind `|| true`-style tests; a timeout in any of
