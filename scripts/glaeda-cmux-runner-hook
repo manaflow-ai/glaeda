@@ -1386,8 +1386,9 @@ def dev_compile_refusal(event_name: str | None, ref: str | None, repository: str
 # (nightly_slot_refusal), and its gate listens however full the mini is (CPU saturation and units hold it no more than
 # they hold the freshness slot), so GitHub hands it the nightly job at once. Its job then waits here first in line:
 # ahead of every other waiter, no other admission takes a unit and every other runner's gate on the mini holds while it
-# waits (mini_full), and it keeps no reserve, so it takes the next units that free up. Disk, a fleet build's host
-# claim, eligibility and heat still hold it. Leo, 2026-10-27: "a waiting nightly, promote or nightly sign/verify job is
+# waits (mini_full), and it keeps no reserve, so it takes the next units that free up. Disk, a fleet build holding the
+# host lock or a reservation, eligibility and heat still hold it; a fleet build only waiting for the lock does not
+# (NIGHTLY_WAITER). Leo, 2026-10-27: "a waiting nightly, promote or nightly sign/verify job is
 # admitted on a mini ahead of every PR, DEV and side job and may use any reserve, and no new PR job starts on a mini
 # where a nightly job waits."
 NIGHTLY_REFS = ("refs/heads/nightly-next", "refs/heads/main")
@@ -3822,7 +3823,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                   warm_target: tuple[Any, ...] = ("", None, 0), klass: str | None = None,
                   one_holder: bool = False, since: float | None = None, gui_token: str = "gui",
                   gui_runner: bool = False, fresh_runner: bool = False, tier: str = "",
-                  new_job: bool = False) -> tuple[bool, str]:
+                  new_job: bool = False, nightly_runner: bool = False) -> tuple[bool, str]:
     """Weighted admission for one of several runners on this mini, without ever waiting on a job.
     When held, taken_out (if given) receives the units and tokens taken, for the job log; on a capacity refusal it
     receives "wants", the kinds a waiter marker names (CAPACITY_WAIT): the token kind or "units" it lacks, else
@@ -3925,9 +3926,16 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
             waiting = bounded_waiters(state_dir, lock_waiters(host_lock, holder_pids(state_dir) | yielding_family(host_lock)),
                                       log=lambda note: print(f"{PREFIX}: {note}", flush=True))
             # lsof sees only this user's processes, which is how the fleet worker runs today.
-            if waiting and tier == TIER_NIGHTLY and nightly_pass(state_dir, waiting[0]):
-                # NIGHTLY_WAITER_PASSES: 2026-10-28 run 40623850717's signer-dmg-image was refused for a waiter on
-                # cmux12s, and nightly-next's DMG fell back to a queued Blacksmith Mac.
+            if (waiting and tier == TIER_NIGHTLY and (klass == "light" or nightly_runner)
+                    and nightly_pass(state_dir, waiting[0])):
+                # NIGHTLY_WAITER: a nightly job on the nightly slot, or a light one (sign, notarize, verify) on any
+                # runner, goes ahead of a waiting fleet build too. Refusing it failed the whole nightly after its
+                # app was built and signed (cmux run 40624308094, 2026-10-28 04:00Z: Verify final nightly DMG
+                # refused for pid 70108 on cmux12's nightly slot; run 40623850717's signer-dmg-image the same way on
+                # cmux12s). A nightly compile on a side runner still yields, and NIGHTLY_WAITER_PASSES bounds how
+                # often one waiter is passed.
+                print(f"{PREFIX}: a fleet build is waiting for the host (pid {waiting[0]}); a nightly job goes "
+                      "first, the build gets the host when it ends", flush=True)
                 passed = waiting[0]
             elif waiting:  # flock has no writer preference: stop admitting so the build worker gets in
                 # This must not be a retryable capacity refusal: a draining fleet
@@ -5162,6 +5170,8 @@ class Gate:
                  waiters: bool = True, capacity_dir: Path | None = None, fit_units: int = 1) -> None:
         self.runner_dir, self.host_lock, self.reservation, self.state_dir, self.waiters = \
             runner_dir, host_lock, reservation, state_dir, waiters
+        if runner_scope(runner_dir).nightly:  # its jobs pass a waiting fleet build (NIGHTLY_WAITER)
+            self.waiters = False
         self.capacity_dir = capacity_dir
         self.fit_units = fit_units
         self.full_why: str | None = None  # the last known mini_full answer, kept across UNKNOWN looks
@@ -8009,7 +8019,8 @@ def main(argv: list[str] | None = None) -> int:
                                                warm_target=job_warm_target(event), since=since,
                                                gui_token=args.gui_token, klass=admit_class,
                                                gui_runner=args.gui_runner,
-                                               fresh_runner=args.dev_compile_runner, tier=tier, new_job=True)
+                                               fresh_runner=args.dev_compile_runner, tier=tier, new_job=True,
+                                               nightly_runner=args.nightly_runner)
                     if held or not note.startswith("capacity:"):
                         break
                     waited = time.monotonic() - start
