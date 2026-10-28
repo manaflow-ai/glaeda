@@ -1724,9 +1724,15 @@ class PreflightTests(unittest.TestCase):
             fake.chmod(0o755)
             started = time.monotonic()
             run = subprocess.run([*bound, "1", "sleep", "300"], capture_output=True, text=True, timeout=120,
-                                 env={**os.environ, "PATH": f"{tmp}:{os.environ['PATH']}"})
+                                 env={**os.environ, "PATH": f"{tmp}:{os.environ['PATH']}",
+                                      "GLAEDA_BREW_BOUND_PS_SECONDS": "1"})
             self.assertEqual(run.returncode, 124, run.stderr)
-            self.assertLess(time.monotonic() - started, 60)
+            self.assertLess(time.monotonic() - started, 30)
+            # A command that ends while a slow ps runs keeps its own exit code, never 124.
+            run = subprocess.run([*bound, "2", "sh", "-c", "sleep 1; exit 5"], capture_output=True, text=True,
+                                 timeout=120, env={**os.environ, "PATH": f"{tmp}:{os.environ['PATH']}",
+                                      "GLAEDA_BREW_BOUND_PS_SECONDS": "1"})
+            self.assertEqual(run.returncode, 5, run.stderr)
 
     def assert_gone(self, pid: int) -> None:
         deadline = time.monotonic() + 10
