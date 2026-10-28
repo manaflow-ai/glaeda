@@ -1818,6 +1818,41 @@ class GlaedaDiskTest(unittest.TestCase):
         finally:
             gd.HOME, gd.FLEET_ROOT, gd.DARWIN = saved
 
+    def test_tagged_debug_app_data_is_a_family_but_release_and_next_app_data_never_are(self) -> None:
+        saved = (gd.HOME, gd.FLEET_ROOT, gd.DARWIN)
+        gd.HOME = self.root
+        gd.FLEET_ROOT = self.root / "shared-fleet"
+        gd.DARWIN = True
+        try:
+            for app in ("cmux-next", "cmux"):
+                base = gd.HOME / "Library/Application Support" / app
+                for name in ("com.cmuxterm.app.debug.pcrim3.capslot1", "com.cmuxterm.app.next", "com.cmuxterm.app",
+                             "session-com.cmuxterm.app.debug.x.json.d"):
+                    (base / name).mkdir(parents=True)
+            fams = {f.id: f for f in gd.default_families()}
+            for app in ("cmux-next", "cmux"):
+                fam = fams[f"cmux-debug-app-data-{app}"]
+                self.assertTrue(fam.reclaimable)
+                self.assertEqual(fam.min_idle_hours, gd.DEFAULT_AGE_HOURS)
+                self.assertEqual([p.name for p in gd.candidates(fam)], ["com.cmuxterm.app.debug.pcrim3.capslot1"])
+            devbox = {f.id for f in gd.default_families("devbox")}
+            self.assertFalse({i for i in devbox if i.startswith("cmux-debug-app-data")}, "never on a devbox")
+            # the survey verdict on a realistic tree: an installed app copy far deeper than the git search goes
+            fam = fams["cmux-debug-app-data-cmux-next"]
+            tag = fam.root / "com.cmuxterm.app.debug.pcrim3.capslot1"
+            deep = tag / "versions/108/cmux DEV pcrim3.app/Contents/Frameworks/X.framework/Versions/A/Resources/r"
+            deep.mkdir(parents=True)
+            (deep / "blob").write_bytes(b"x" * (2 << 20))
+            stamp = time.time() - (gd.DEFAULT_AGE_HOURS + 6) * 3600
+            for d, _, files in list(os.walk(tag))[::-1]:
+                for f in files:
+                    os.utime(Path(d) / f, (stamp, stamp))
+                os.utime(d, (stamp, stamp))
+            verdicts = {Path(i.path).name: i.verdict for i in gd.survey([fam], 6, 0)}
+            self.assertEqual(verdicts, {"com.cmuxterm.app.debug.pcrim3.capslot1": "reclaimable"})
+        finally:
+            gd.HOME, gd.FLEET_ROOT, gd.DARWIN = saved
+
     def test_ci_ios_derived_data_is_reclaimable_without_deleting_runner_root(self) -> None:
         root = self.root / "ci-ios"
         old = root / "runner-a" / "derived-data"
