@@ -6479,6 +6479,93 @@ class GateTest(unittest.TestCase):
         return hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state,
                          capacity_dir=capacity)
 
+    def side_runner(self, instance: int) -> Path:
+        """A std mini's side runner (instance >= its 2 canonical roots) beside self.runner, its hook written."""
+        runner = self.tmp / f"actions-runner-glaeda-{instance}"
+        (runner / "glaeda-hooks").mkdir(parents=True, exist_ok=True)
+        (runner / hook.RUNNER_HOOK_SCRIPT).write_text(
+            "#!/bin/bash\nexec /usr/bin/python3 /hook job-started --allowed-owner manaflow-ai "
+            f"--capacity-units 14 --compile-slots 2 --canonical-roots 2 --instance {instance}\n")
+        return runner
+
+    def test_idle_gates_with_room_for_one_job_let_only_one_listen(self) -> None:
+        # 5 of 14 units free: room for one side job (side_fit_units: 5). Before LISTEN_CLAIM all three listened at once.
+        capacity = self.units(9)
+        gates = [hook.Gate(self.side_runner(i), os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state,
+                           capacity_dir=capacity) for i in (3, 4, 5)]
+        self.assertIsNone(gates[0].full(), "the first look claims the room")
+        for gate in gates[1:]:
+            self.assertEqual(gate.full(), "only 5 of 14 capacity units on this mini are free; its next job needs 5 "
+                                          "and 5 are claimed by listening runners")
+        self.assertIsNone(gates[0].full(), "its own claim never holds it")
+        self.assertEqual(hook.listen_claims(capacity), 5)
+        gates[0].unclaim()  # held off, or its job's admission took the units
+        self.assertIsNone(gates[1].full(), "a claim let go is room again")
+        self.assertIsNotNone(gates[2].full())
+        # a claim past the listener's first poll (no job queued for its label) keeps nothing from the others
+        stale = time.time() - hook.GATE_FIRST_POLL_S - 1
+        os.utime(gates[1].claim_at, (stale, stale))
+        self.assertEqual(hook.listen_claims(capacity), 0)
+        self.assertIsNone(gates[2].full())
+        # a claim dies with its gate's fd
+        for gate in gates:
+            gate.unclaim()
+        self.assertEqual(hook.listen_claims(capacity), 0)
+        # the roles with reserves or their own tokens neither claim nor count claims
+        for role in ({"gui": True}, {"fresh": True}, {"fast": True}, {"nightly": True}, {"dedicated": True}):
+            self.assertFalse(hook.claims_room(hook.RunnerScope(14, 2, 2, False)._replace(**role)), role)
+        self.assertTrue(hook.claims_room(hook.RunnerScope(14, 2, 2, True)), "a root runner claims")
+        self.assertTrue(hook.claims_room(hook.RunnerScope(14, 2, 2, False, session=True)), "a session runner claims")
+        self.assertFalse(hook.claims_room(hook.RunnerScope()), "no ledger, no claim")
+
+    def test_the_gate_looks_again_between_jobs_and_stops_the_listener_before_a_job_that_would_not_fit(self) -> None:
+        capacity = self.units(0)
+        runner = self.side_runner(3)
+        gate = hook.Gate(runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state,
+                         waiters=False, capacity_dir=capacity)
+        gate.child = mock.Mock(poll=mock.Mock(return_value=None), pid=0)
+        busy = [True, True, False]
+        stops: list[str] = []
+        with mock.patch.object(gate, "busy", side_effect=lambda: busy[0] if len(busy) == 1 else busy.pop(0)), \
+                mock.patch.object(gate, "worker_pids", return_value=()), \
+                mock.patch.object(gate, "reload"), mock.patch.object(gate, "locked", return_value=None), \
+                mock.patch.object(gate, "low_disk", return_value=None), \
+                mock.patch.object(gate, "still_waiting", return_value=None), \
+                mock.patch.object(gate, "still_reserved", return_value=None), \
+                mock.patch.object(gate, "stop", side_effect=lambda why: stops.append(why) or True):
+            self.assertIsNone(gate.step(), "a job runs")
+            self.assertFalse(gate.job_ending)
+            gate.job_end_marker().touch()  # job-completed gave the job's units back
+            self.assertIsNone(gate.step())
+            self.assertTrue(gate.job_ending, "the gate watches the Worker until it exits")
+            held = [hook.lock_file(capacity / f"unit-{slot}", fcntl.LOCK_EX) for slot in range(10)]
+            self.addCleanup(lambda: [os.close(fd) for fd in held if fd is not None])
+            self.assertIsNone(gate.step(), "the Worker exited: one look, with no confirming streak")
+        self.assertEqual(stops, ["only 4 of 14 capacity units on this mini are free; its next job needs 5"])
+        self.assertFalse(gate.job_end_marker().exists(), "the look consumes the marker")
+        self.assertFalse(gate.job_ending)
+        self.assertIsNone(gate.claim_fd, "a held-off runner claims nothing")
+
+    def test_job_completed_leaves_the_job_end_marker_beside_the_hook(self) -> None:
+        source = HOOK.read_text()
+        self.assertIn("(hook_dir / JOB_ENDING).touch()", source)
+        self.assertLess(source.index("print(f\"{PREFIX}: {release_host_lock(args.state_dir)}\""),
+                        source.index("(hook_dir / JOB_ENDING).touch()"),
+                        "the job's units are released before the gate is told to look")
+
+    def test_a_job_that_ended_between_polls_still_gets_its_look(self) -> None:
+        capacity = self.units(10)
+        gate = hook.Gate(self.side_runner(3), os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state,
+                         waiters=False, capacity_dir=capacity)
+        gate.child = mock.Mock(poll=mock.Mock(return_value=None), pid=0)
+        gate.job_end_marker().touch()  # the Worker exited before any poll saw the runner busy
+        stops: list[str] = []
+        with mock.patch.object(gate, "busy", return_value=False), mock.patch.object(gate, "reload"), \
+                mock.patch.object(gate, "stop", side_effect=lambda why: stops.append(why) or True):
+            self.assertIsNone(gate.step())
+        self.assertEqual(stops, ["only 4 of 14 capacity units on this mini are free; its next job needs 5"])
+        self.assertFalse(gate.job_end_marker().exists())
+
     def test_a_plain_side_runner_listens_only_with_room_for_the_side_labels_costliest_job(self) -> None:
         # The side label's jobs as the hook costs them: the fit follows JOB_CORES, never a copy of it.
         costs = {job: hook.job_units(hook.job_class(job, "manaflow-ai/cmux", workflow=wf)[0], job, "manaflow-ai/cmux",

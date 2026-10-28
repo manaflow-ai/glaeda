@@ -613,6 +613,10 @@ def reserve_for(reserved: int, units: int, total: int) -> int:
     return max(0, min(reserved, total - units)) if units > 0 else 0
 
 
+def claims_note(others: int) -> str:
+    return f" and {others} {'is' if others == 1 else 'are'} claimed by listening runners" if others else ""
+
+
 def kept_note(kept: int) -> str:
     return f" and {kept} {'is' if kept == 1 else 'are'} kept for an idle reserving runner" if kept else ""
 
@@ -4402,6 +4406,70 @@ def side_fit_units(scope: RunnerScope) -> int:
                for workflow, job in SIDE_FIT_JOBS)
 
 
+# LISTEN_CLAIM: a listening runner's room counts as taken for the other gates on its mini. When units freed up,
+# every idle gate on a mini read the same free units in the same poll, all started listening, and GitHub gave each a
+# job that only one of them fitted (2026-10-28 05:14:28Z on a std mini: three session runners took generated files
+# within a second and each waited about 30 minutes in Set up runner; 17% of the owned Macs' admission wait). A
+# participating gate (claims_room) now looks under capacity/LISTEN_LOCK, counts the units the other live claims hold
+# (listen_claims) on top of its own job's need, and while it listens holds an flock on its own claim file, named
+# for its runner and its need (LISTEN_CLAIM_PREFIX). The flock dies with the gate. Only gates read claims: a job's
+# admission takes real units and never waits for a claim. A claim is let go once the gate holds its listener off,
+# and LISTEN_CLAIM_HANDOFF_S into the runner's own job, by when the job's admission holds its units or waits for
+# them (CAPACITY_WAIT, whose marker holds the other gates anyway). A claim counts for the others only while it is
+# fresh (the listener's first poll, GATE_FIRST_POLL_S): a queued job reaches a new listener on
+# that poll, and a listener idle past it has no job waiting for its label, so its claim must not keep the mini's other
+# labels from listening (a std mini's two idle root listeners would otherwise hold 10 of 14 units from the side label).
+LISTEN_LOCK = "listen.lock"
+LISTEN_CLAIM_PREFIX = "listen."
+LISTEN_CLAIM_SUFFIX = ".claim"
+LISTEN_CLAIM_HANDOFF_S = 30.0
+# JOB_ENDING: job-completed, which releases the job's units, leaves this marker in the runner's glaeda-hooks/; the
+# gate then watches the job's Runner.Worker closely and, the moment it exits, looks at the mini again and stops the
+# listener before it takes the next job when that job would not fit (Gate.job_end). Without it the listener took the
+# next job about 2 s after the last ended, before the gate's next look (24% of 10-27's admission wait, 39% after the
+# side fit in #1715: a fast tier cancelled at 05:38:29Z, the next one taken at 05:38:31Z waited 23 minutes).
+JOB_ENDING = ".job-ending"
+
+
+def claims_room(scope: RunnerScope) -> bool:
+    """Whether this runner's gate claims its room while listening and counts the others' claims (LISTEN_CLAIM): root,
+    side and session runners. The gui runner and the freshness slot keep their reserves instead; the fast runner
+    takes no shared unit; the nightly slot listens on a full mini; a dedicated runner has its own admission."""
+    return scope.units > 0 and not (scope.gui or scope.fresh or scope.fast or scope.nightly or scope.dedicated)
+
+
+def listen_need(scope: RunnerScope, fit_units: int) -> int:
+    """The units mini_full requires free for this runner's next job (before reserves and claims)."""
+    root = scope.root
+    return min(max(ROOT_FIT_UNITS if root else FRESH_RESERVE_UNITS if scope.fresh else 1, fit_units), scope.units)
+
+
+def claim_path(capacity_dir: Path, runner_dir: Path, units: int) -> Path:
+    name = "".join(c for c in runner_dir.name if c.isalnum() or c in "-_")
+    return capacity_dir / f"{LISTEN_CLAIM_PREFIX}{name}.{units}{LISTEN_CLAIM_SUFFIX}"
+
+
+def listen_claims(capacity_dir: Path, own: Path | None = None) -> int:
+    """The units the other live listen claims on this mini hold (LISTEN_CLAIM). Never raises: an unreadable ledger
+    claims nothing."""
+    total = 0
+    try:
+        paths = sorted(capacity_dir.glob(f"{LISTEN_CLAIM_PREFIX}*{LISTEN_CLAIM_SUFFIX}"))
+    except OSError:
+        return 0
+    for path in paths:
+        if own is not None and path == own:
+            continue
+        units = path.name[:-len(LISTEN_CLAIM_SUFFIX)].rsplit(".", 1)[-1]
+        try:
+            fresh = time.time() - path.stat().st_mtime < GATE_FIRST_POLL_S
+        except OSError:
+            continue
+        if fresh and units.isdigit() and not probe(path):
+            total += int(units)
+    return total
+
+
 DEDICATED_ADMIT_TIMEOUT_S = 600
 
 
@@ -4525,7 +4593,7 @@ ROOT_FIT_UNITS = max(CLASS_COST[k][0] for k in ("compile", "gui", "product", "co
 
 
 def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None = None,
-              fit_units: int = 1) -> str | None:
+              fit_units: int = 1, others: int = 0) -> str | None:
     """Why none of this runner's `total` capacity units is free, or None, or UNKNOWN when it could not look.
     A job handed to a full mini is refused at once, and cmux's rescue re-runs it on Blacksmith along with the
     siblings fail-fast cancelled (cmux main full suite 36114055694: three shards refused with 0 of 4 units
@@ -4620,13 +4688,13 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
             if not open_to_jobs(f"unit-{slot}", capacity_dir / f"unit-{slot}"):
                 continue
             free += 1
-            if free >= need + kept:
+            if free >= need + kept + others:
                 break
         if free == 0:
             return f"all {total} {UNITS_FULL} are taken"
-        if free < need + kept:
+        if free < need + kept + others:
             return (f"only {free} of {total} {UNITS_FULL} are free; "
-                    f"{'a compile' if root else 'its next job'} needs {need}{kept_note(kept)}")
+                    f"{'a compile' if root else 'its next job'} needs {need}{kept_note(kept)}{claims_note(others)}")
         # a job already here waits for what this runner's next job would take (CAPACITY_WAIT): it goes first. Not
         # for units on the gui runner or the freshness slot: its next job takes the reserved units, which the waiter
         # could not have taken
@@ -5184,6 +5252,10 @@ class Gate:
         self.capacity_dir = capacity_dir
         self.fit_units = fit_units
         self.full_why: str | None = None  # the last known mini_full answer, kept across UNKNOWN looks
+        self.claim_fd: int | None = None  # this gate's listen claim (LISTEN_CLAIM) while it listens
+        self.claim_at: Path | None = None
+        self.busy_since: float | None = None  # when the runner's current job was first seen (LISTEN_CLAIM_HANDOFF_S)
+        self.job_ending = False  # job-completed left JOB_ENDING: look again the moment the Worker exits
         self.child: subprocess.Popen[bytes] | None = None
         self.stop_deadline: float | None = None  # set while a stop the gate asked for is under way
         self.streak = 0
@@ -5628,12 +5700,69 @@ class Gate:
         if scope.nightly:  # NIGHTLY_SLOT: its one job shape goes first here, so it listens on a full mini
             self.full_why = None
             return None
-        why = mini_full(self.capacity_dir, scope.units, scope,
-                        max(self.fit_units, listen_fit_units(self.runner_dir), side_fit_units(scope)))
+        fit = max(self.fit_units, listen_fit_units(self.runner_dir), side_fit_units(scope))
+        if self.capacity_dir is None or not claims_room(scope):
+            why = mini_full(self.capacity_dir, scope.units, scope, fit)
+        else:
+            why = self.claim_look(scope, fit)
         if isinstance(why, Unknown):
             return None if fresh else self.full_why
         self.full_why = why
         return why
+
+    def claim_look(self, scope: RunnerScope, fit: int) -> str | Unknown | None:
+        """mini_full with the other gates' listen claims counted (LISTEN_CLAIM), under LISTEN_LOCK so no two gates on
+        the mini read the same room: room left means this gate claims it, none means it lets its claim go. Never
+        raises for the lock: one that cannot be taken reads mini_full alone, as before."""
+        assert self.capacity_dir is not None
+        need = listen_need(scope, fit)
+        try:
+            lock = os.open(self.capacity_dir / LISTEN_LOCK, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+        except OSError:
+            return mini_full(self.capacity_dir, scope.units, scope, fit)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX)  # held for one look; every holder only probes and opens files
+            own = claim_path(self.capacity_dir, self.runner_dir, need)
+            why = mini_full(self.capacity_dir, scope.units, scope, fit, listen_claims(self.capacity_dir, own))
+            if why is None:
+                self.claim(own)
+            elif not isinstance(why, Unknown):
+                self.unclaim()
+            return why
+        finally:
+            os.close(lock)
+
+    def claim(self, path: Path) -> None:
+        """Hold this gate's listen claim at path (letting go of one for another need). Never raises."""
+        if self.claim_fd is not None and self.claim_at == path:
+            return
+        self.unclaim()
+        with contextlib.suppress(OSError):
+            fd = lock_file(path, fcntl.LOCK_EX)
+            if fd is not None:
+                self.claim_fd, self.claim_at = fd, path  # stored first: unclaim() always closes it
+                os.set_inheritable(fd, False)
+                os.utime(path)  # fresh from now (GATE_FIRST_POLL_S)
+
+    def unclaim(self) -> None:
+        if self.claim_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(self.claim_fd)
+        self.claim_fd, self.claim_at = None, None
+
+    def job_end_marker(self) -> Path:
+        return self.runner_dir / "glaeda-hooks" / JOB_ENDING
+
+    def job_end(self) -> str | None:
+        """The runner's job just ended (JOB_ENDING): a fresh look at the mini, which job-completed already gave the
+        job's units back to. Why the listener should not take the next job, or None. Never raises."""
+        self.job_ending = False
+        with contextlib.suppress(OSError):
+            self.job_end_marker().unlink()
+        try:
+            return self.full(fresh=True)
+        except Exception:  # noqa: BLE001  (the regular poll looks again)
+            return None
 
     def reserve(self, want: bool) -> None:
         """Hold or let go of this gui runner's reserve (GUI_RESERVE: capacity/<gui token>.reserve), which keeps
@@ -5888,12 +6017,15 @@ class Gate:
                         self.kill()
                 return None
             if self.terminating:
+                self.unclaim()
                 self.stop("the runner agent is stopping")
                 return None
-            if (self.watching or self.job_waited) and not self.busy():
+            if (self.watching or self.job_waited or self.job_ending) and not self.busy():
                 self.watching, self.job_waited = (), False
                 self.fast_until = time.monotonic() + 5.0
-                if (why := self.low_disk() or self.still_waiting() or self.still_reserved()):
+                ending = self.job_end() if self.job_ending else None
+                if (why := self.low_disk() or self.still_waiting() or self.still_reserved() or ending):
+                    self.unclaim()
                     self.stop(why)
                     return None
             self.reload()
@@ -5913,6 +6045,15 @@ class Gate:
                     self.watching = tuple(workers)
                     self.fast_until = time.monotonic() + 5.0
                 self.streak = 0  # a claim must hold for two idle polls, not carry over from the job
+                now = time.monotonic()
+                self.busy_since = self.busy_since if self.busy_since is not None else now
+                if now - self.busy_since >= LISTEN_CLAIM_HANDOFF_S:
+                    self.unclaim()  # the job's admission holds its units by now, or waits for them in the open
+                if not self.job_ending and self.job_end_marker().exists():
+                    self.job_ending = True  # job-completed ran: watch the Worker until it exits (job_end)
+                if self.job_ending:
+                    self.watching = tuple(self.worker_pids()) or self.watching
+                    self.fast_until = now + 5.0
                 self.load_since = None  # the hold limit times a pause, never a job
                 # the reserve stays held through the runner's own job: its admission lends it (RESERVE_LENT), so it
                 # keeps nothing while that job holds its units and is whole the moment they go back. One the job could
@@ -5922,6 +6063,13 @@ class Gate:
                     # back, read from nothing but the job itself, so no state is lost across a reload
                     self.reserve(True)
                 return None
+            self.busy_since = None
+            if self.job_ending or self.job_end_marker().exists():
+                # a job that ended between two polls, before the gate saw its marker: the same look (job_end)
+                if ending := self.job_end():
+                    self.unclaim()
+                    self.stop(ending)
+                    return None
             why = self.claimed()
             if self.reserves(why):
                 self.reserve(True)
@@ -5929,6 +6077,7 @@ class Gate:
             if why and self.streak >= GATE_CONFIRM and not self.first_poll(why):
                 why = self.confirmed()
                 if why and not self.busy():  # the fresh look and the busy check right before the signal
+                    self.unclaim()
                     self.stop(why)
             # let go only after the last look (confirmed() included), and never with a job of its own arrived
             # (keeps_reserve); a job that beats even this busy() check gets it back on its first busy poll
@@ -5939,10 +6088,12 @@ class Gate:
         self.reload()
         if self.registration_wait():
             self.reserve(False)  # a runner GitHub no longer knows takes no job: it keeps no units from the others
+            self.unclaim()
             return None
         why = self.claimed()
         self.reserve(self.keeps_reserve(why))
         if why:
+            self.unclaim()
             if why != self.held:
                 gate_log(f"holding the listener off: {why}")
             self.held, self.streak, self.free_since = why, 0, None
@@ -8130,6 +8281,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{PREFIX}: {release_host_lock(args.state_dir)}", flush=True)
     skip_disk = False
     if args.phase == "job-completed":
+        hook_dir = Path(__file__).resolve().parent
+        if hook_dir.name == "glaeda-hooks":  # a runner's install, never a source tree's copy
+            with contextlib.suppress(OSError):  # the job's units are back: the gate looks again as its Worker exits
+                (hook_dir / JOB_ENDING).touch()
         current_worker = runner_worker_pid()
         for note in cleanup_leaked_test_apps({current_worker} if current_worker else set()):
             print(f"{PREFIX}: {note}", flush=True)
