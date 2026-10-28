@@ -524,9 +524,9 @@ def sandbox_pass(host: Host, policy: dict[str, Any], state: dict[str, Any], now:
     except HealError as e:
         return mine, {"error": str(e)[:200]}
     newest = max((r["t"] for r in journal if r.get("action") == "reboot"), default=None)
-    if newest is None and "reboot_t" in mine:  # the state saw a reboot the journal no longer has
+    if "reboot_t" in mine and (newest is None or newest < mine["reboot_t"]):  # the journal lost the state's reboot
         return mine, {"error": "sandboxd journal lost a reboot the state recorded; no reboot until a person looks"}
-    if newest is not None and newest != mine.get("reboot_t"):
+    if newest is not None and newest != mine.get("reboot_t"):  # only a newer reboot is adopted
         mine.update(reboot_t=newest, elapsed=0.0)
     if newest is not None and apply:  # a plan pass's state is never written, so it adds nothing
         if "last_t" in mine:

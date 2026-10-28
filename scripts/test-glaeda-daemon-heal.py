@@ -542,6 +542,18 @@ class SandboxHeal(Base):
         self.assertIn("lost a reboot", self.tick(300)["sandbox"]["error"])
         self.assertEqual(len(self.host.reboots), 1)
 
+    def test_a_journal_cut_back_to_an_older_reboot_refuses(self) -> None:
+        self.slow_twice()
+        self.assertEqual(len(self.host.reboots), 1)
+        self.host.journal_rows = [{"t": T0 - 30 * 86400, "action": "reboot"}]  # cut back to a month-old reboot
+        self.host.probes = [9.0]
+        self.assertIn("lost a reboot", self.tick(300)["sandbox"]["error"])
+        self.run_for(8 * 24)
+        self.host.probes = [9.0, 9.0]
+        self.tick()
+        self.assertIn("lost a reboot", self.tick(300)["sandbox"]["error"])
+        self.assertEqual(len(self.host.reboots), 1)
+
     def test_an_unreadable_journal_never_reboots(self) -> None:
         self.host.journal_broken = True
         self.host.probes = [9.0, 9.0]
