@@ -2003,13 +2003,127 @@ class HookTest(unittest.TestCase):
             marker.unlink(missing_ok=True)
             self.finish("n0")
 
+    def test_a_signing_job_takes_the_whole_mini(self) -> None:
+        """Leo, 2026-10-28: the release signing jobs may run on owned Macs. Each holds the Developer ID key in a
+        temporary keychain, so on a mini it takes every unit and both fast tokens: it is admitted only on a drained
+        mini, nothing else is admitted beside it, it waits EXCLUSIVE_CAPACITY_WAIT_S at most, and it tells the job
+        (GLAEDA_JOB_CLAIM=exclusive in $GITHUB_ENV), which cmux's signing jobs require before they touch the key."""
+        for workflow, job in hook.SIGNING_JOBS:
+            self.assertEqual(hook.job_class(job, "manaflow-ai/cmux", workflow=workflow), ("exclusive", False))
+            self.assertEqual(hook.job_units("exclusive", job, "manaflow-ai/cmux", workflow=workflow),
+                             hook.EXCLUSIVE_UNITS)
+        self.assertEqual(hook.job_class("sign", "manaflow-ai/cmux", workflow="other.yml")[0], "compile",
+                         "only the named workflow's job")
+        self.assertEqual(hook.reserve_for(1, 14, 14), 0, "a job of every unit leaves no reserve beside it")
+        self.fleet()
+        capacity = self.dir / "capacity"
+        capacity.mkdir(parents=True, exist_ok=True)
+        github_env = self.dir / "github-env"
+        legacy = {"GITHUB_JOB": "sign-nightly-identity-legacy", "GITHUB_ENV": os.fspath(github_env),
+                  "GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/nightly.yml@refs/heads/nightly-next"}
+        busy = hook.lock_file(capacity / "unit-13", fcntl.LOCK_EX)  # one unit of a PR job still running
+        self.assertIsNotNone(busy)
+        try:
+            refused = self.job("sign-nightly-identity-legacy", "s0", 14, None, "--gui-wait", "0", env=legacy)
+            self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+            self.assertIn("a signing job: it takes the whole mini", refused.stdout)
+            self.assertIn("13 of 14 units free, sign-nightly-identity-legacy (exclusive) needs 14", refused.stdout)
+            self.assertNotIn("GLAEDA_JOB_CLAIM", github_env.read_text() if github_env.exists() else "",
+                             "a refused job is told nothing")
+        finally:
+            os.close(busy)
+        fast = hook.lock_file(capacity / "fast-0.token", fcntl.LOCK_EX)  # the fast tier, which takes no unit
+        try:
+            refused = self.job("sign-nightly-identity-legacy", "s0", 14, None, "--gui-wait", "0", env=legacy)
+            self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+            self.assertIn("the fast-0 token is taken", refused.stdout)
+        finally:
+            os.close(fast)
+        try:
+            admitted = self.job("sign-nightly-identity-legacy", "s0", 14, None, "--gui-wait", "0", env=legacy)
+            self.assertEqual(admitted.returncode, 0, admitted.stdout + admitted.stderr)
+            self.assertIn("holding 14/14 units+fast-0+fast-1+gui for sign-nightly-identity-legacy (exclusive",
+                          admitted.stdout)
+            self.assertIn("GLAEDA_JOB_CLAIM=exclusive for the job", admitted.stdout)
+            self.assertIn("GLAEDA_JOB_CLAIM=exclusive\n", github_env.read_text())
+            for name, runner in (("swift-package-tests", "s1"), ("verify-signed-nightly", "s2")):
+                beside = self.job(name, runner, 14, None, "--gui-wait", "0")
+                self.assertEqual(beside.returncode, 1, beside.stdout + beside.stderr)
+                self.assertIn("0 of 14 units free", beside.stdout)
+            self.assertTrue(self.shared_lock_blocks_exclusive(), "a fleet build waits for the signing job too")
+            self.assertFalse(hook.probe(capacity / "gui.token"), "the idle fuzzer sees the gui token taken")
+        finally:
+            self.finish("s0")
+        github_env.unlink()
+        light = self.job("verify-signed-nightly", "s3", 14, None, "--gui-wait", "0",
+                         env={"GITHUB_ENV": os.fspath(github_env)})
+        try:
+            self.assertEqual(light.returncode, 0, light.stdout + light.stderr)
+            self.assertNotIn("GLAEDA_JOB_CLAIM", github_env.read_text() if github_env.exists() else "",
+                             "only a job holding the whole mini is told it does")
+        finally:
+            self.finish("s3")
+
+    def test_a_gui_job_looks_for_the_idle_fuzzer_again_once_it_holds_the_gui_token(self) -> None:
+        """A fuzzer that writes its holder after the first yield and looked at gui.token before this job took it is
+        stopped by the second look, made while the token is held, so a signing job never runs beside it."""
+        self.fleet()
+        capacity = self.dir / "capacity"
+        capacity.mkdir(parents=True, exist_ok=True)
+        looks: list[bool] = []
+
+        def held(fds: list[int], *args: object, **kwargs: object) -> tuple[bool, str]:
+            hook.close_all(fds)  # the job has ended before the next one comes
+            return True, "held"
+
+        def look(where: Path) -> str:
+            looks.append(hook.probe(where / "gui.token"))  # True: the token is still free
+            return "" if len(looks) == 1 else "; stopped the idle fuzzer (pid 4242)"
+
+        with mock.patch.object(hook, "yield_idle_fuzz", side_effect=look), \
+                mock.patch.object(hook, "fair_turn", return_value=None), \
+                mock.patch.object(hook, "hold", side_effect=held):
+            ok, why = hook.take_capacity(os.fspath(self.dir / "fleet" / "host.lock"), capacity, 14,
+                                         "sign-nightly-identity-legacy", os.getpid(), self.dir / "state",
+                                         workflow="nightly.yml", klass="exclusive")
+        self.assertTrue(ok, why)
+        self.assertEqual(looks, [True, False], "once before the gui token, once while holding it")
+        self.assertIn("stopped the idle fuzzer (pid 4242)", why)
+        looks.clear()
+        with mock.patch.object(hook, "yield_idle_fuzz", side_effect=lambda where: (
+                looks.append(True), "; the idle fuzzer (pid 4242) did not stop")[1]), \
+                mock.patch.object(hook, "fair_turn", return_value=None), \
+                mock.patch.object(hook, "hold", side_effect=held):
+            ok, why = hook.take_capacity(os.fspath(self.dir / "fleet" / "host.lock"), capacity, 14,
+                                         "sign-nightly-identity-legacy", os.getpid(), self.dir / "state",
+                                         workflow="nightly.yml", klass="exclusive")
+        self.assertFalse(ok, why)
+        self.assertIn("a signing job runs beside nothing", why)
+
+    def test_job_claim_names_only_a_whole_mini(self) -> None:
+        github_env = self.dir / "env"
+        with mock.patch.dict(os.environ, {"GITHUB_ENV": os.fspath(github_env)}):
+            self.assertEqual(hook.export_job_claim(14, {"class": "exclusive", "units": 13}, ""), "")
+            self.assertEqual(hook.export_job_claim(14, {"class": "light", "units": 14}, ""), "")
+            self.assertEqual(hook.export_job_claim(0, {}, "no fleet host lock on this machine"), "")
+            # a dedicated runner holds neither capacity nor the host lock (dedicated_admission's note)
+            self.assertEqual(hook.export_job_claim(
+                0, {}, "dedicated runner: admitted by its own admission, no host lock or capacity taken"), "")
+            self.assertEqual(hook.export_job_claim(0, {}, "another build holds the fleet host lock"), "")
+            self.assertFalse(github_env.exists())
+            self.assertIn("holds the whole mini", hook.export_job_claim(14, {"class": "exclusive", "units": 14}, ""))
+            self.assertIn("holds the whole mini", hook.export_job_claim(0, {}, f"{hook.HOST_LOCK_HELD} (held)"))
+        self.assertEqual(github_env.read_text(), "GLAEDA_JOB_CLAIM=exclusive\n" * 2)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(hook.export_job_claim(14, {"class": "exclusive", "units": 14}, ""), "")
+
     def test_a_nightly_sign_or_verify_job_needs_no_compile_tokens(self) -> None:
         """nightly.yml's sign and verify jobs were unknown jobs, so compiles: first in line, they still waited for the
         persistent-dd and canonical root a PR compile held, though they never use either. Light now: with both held
-        and 3 units free they are admitted at once; generate-nightly-deltas is isolated."""
-        for job in ("build-sign-notarize-nightly", "verify-signed-nightly", "verify-final-dmg-nightly",
-                    "recover-nightly-next-notarization", "verify-recovered-nightly-next",
-                    "sign-nightly-identity-legacy", "verify-nightly-identity-legacy"):
+        and 3 units free they are admitted at once; generate-nightly-deltas is isolated. The jobs that hold the
+        Developer ID key are exclusive (SIGNING_JOBS, test_a_signing_job_takes_the_whole_mini)."""
+        for job in ("verify-signed-nightly", "verify-final-dmg-nightly", "verify-recovered-nightly-next",
+                    "signer-dmg-image", "verify-nightly-identity-legacy"):
             self.assertEqual(hook.job_class(job, "manaflow-ai/cmux", workflow="nightly.yml"), ("light", False))
         self.assertEqual(hook.job_class("generate-nightly-deltas", "manaflow-ai/cmux", workflow="nightly.yml"),
                          ("isolated", False))
@@ -2021,7 +2135,7 @@ class HookTest(unittest.TestCase):
             self.assertIsNotNone(fd)
             self.addCleanup(os.close, fd)
         try:
-            for job, runner in (("verify-signed-nightly", "n1"), ("build-sign-notarize-nightly", "n2")):
+            for job, runner in (("verify-signed-nightly", "n1"), ("verify-final-dmg-nightly", "n2")):
                 with self.subTest(job=job):
                     admitted = self.nightly_job("refs/heads/nightly-next", runner, job)
                     self.assertEqual(admitted.returncode, 0, admitted.stdout + admitted.stderr)

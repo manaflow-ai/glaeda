@@ -346,6 +346,18 @@ JOB_CLASSES = {"macos-compile-admission": "compile", "app-host-unit-tests": "gui
 # scripts/ci/media_tag_lock.py), so two tours never build into one tag directory ("ghostty.h has been modified
 # since the module file was built", cmux#21686) and the hook needs no tour token: tours are isolated, as many on
 # a mini as its units allow.
+# SIGNING_JOBS: cmux's release-environment jobs that import the Developer ID certificate into a per-job temporary
+# keychain and sign with it (cmux tests/test_ci_signing_owned_mac.py lists the same jobs). Leo, 2026-10-28, on letting
+# them run on owned Macs while Blacksmith is starved: "ok ... we can just read the code". On an owned Mac such a job
+# takes the exclusive class: every capacity unit and both fast tokens, so no other runner job, ci-step or idle lane
+# (catch-up, fuzzer) runs on the mini while the key is in its keychain, and the job's units are never given back
+# early (the sampler's dynamic release skips it). It waits EXCLUSIVE_CAPACITY_WAIT_S at most for the mini to drain,
+# then is refused so its re-run takes Blacksmith. Admitted, it tells the job through $GITHUB_ENV
+# (GLAEDA_JOB_CLAIM=exclusive); cmux's signing jobs refuse to touch the key on an owned Mac without it, so a hook
+# from before this class never signs beside a PR job.
+SIGNING_JOBS = (("nightly.yml", "build-sign-notarize-nightly"), ("nightly.yml", "recover-nightly-next-notarization"),
+                ("nightly.yml", "sign-nightly-identity-legacy"), ("release.yml", "build-sign-notarize"),
+                ("repair-v0-64-25-helper-rpaths.yml", "repair"), ("cmux-next-dev-daily.yml", "sign"))
 WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "test"): "isolated",
                         ("cmux-tui.yml", "build"): "isolated", ("cmux-tui.yml", "cdp-browser-smoke"): "isolated",
                         ("cmux-tui.yml", "macos-relay"): "isolated",
@@ -387,17 +399,17 @@ WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "
                         # persistent-dd and a root), so a nightly verify first in line (FEED_FIRST) still waited for
                         # a PR compile's persistent-dd and root, which it never uses. generate-nightly-deltas runs
                         # Sparkle's BinaryDelta over whole apps: isolated.
-                        ("nightly.yml", "build-sign-notarize-nightly"): "light",
                         ("nightly.yml", "verify-signed-nightly"): "light",
                         ("nightly.yml", "verify-final-dmg-nightly"): "light",
                         # nightly-next's Linux signer path: its one Mac job builds the DMG from the signed app with
                         # hdiutil (cmux nightly.yml signer-dmg-image; was a compile, 5 units + persistent-dd + root)
                         ("nightly.yml", "signer-dmg-image"): "light",
-                        ("nightly.yml", "recover-nightly-next-notarization"): "light",
                         ("nightly.yml", "verify-recovered-nightly-next"): "light",
-                        ("nightly.yml", "sign-nightly-identity-legacy"): "light",
                         ("nightly.yml", "verify-nightly-identity-legacy"): "light",
-                        ("nightly.yml", "generate-nightly-deltas"): "isolated"}
+                        ("nightly.yml", "generate-nightly-deltas"): "isolated",
+                        # SIGNING_JOBS: the jobs that import the Developer ID key into a temporary keychain take the
+                        # whole mini (the exclusive class, below).
+                        **{key: "exclusive" for key in SIGNING_JOBS}}
 # root: the canonical root (/private/tmp/cmux-ci) that compiles build in and that app-host test consumers
 # restore a product into with rm -rf of its src, so one root job per root per mini (cmux#14338 adds a second).
 # product (cli-product-tests) runs its XCTest bundle through the same user testmanagerd as the gui jobs, so it
@@ -438,11 +450,19 @@ WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "
 # runner keeps its WORKFLOW_JOB_CLASSES cost.
 FAST_TOKENS = ("fast-0", "fast-1")
 FAST_JOBS = {("cmux-next.yml", "fast-tier")}
+# exclusive (SIGNING_JOBS): more units than any mini has, so admission caps it at the mini's whole count, plus both
+# fast tokens, the one capacity a 0-unit job takes, and the gui token, which the idle fuzzer (glaeda-idle-warm
+# gui_refusal) checks before it starts and while it runs, so it never starts again beside the job. The gui runner's reserve never applies (reserve_for leaves none
+# beside a job of every unit).
+EXCLUSIVE_UNITS = 1 << 16
+EXCLUSIVE_CLASS = "exclusive"
+EXCLUSIVE_CAPACITY_WAIT_S = 300.0  # NIGHTLY_CAPACITY_WAIT_S: the same owned-pool rescue window
+JOB_CLAIM_ENV = "GLAEDA_JOB_CLAIM"
 CLASS_COST: dict[str, tuple[int, tuple[str, ...]]] = {
     "compile": (5, ("persistent-dd", "root")), "gui": (1, ("gui", "root")), "product": (1, ("gui", "root")),
     "compile-gui": (4, ("root",)), "gui-step": (1, ("gui", "root")),
     "isolated": (4, ()), "simulator": (1, ("simulator",)), "light": (2, ()), "seed": (5, ()),
-    "fast": (0, FAST_TOKENS)}
+    "fast": (0, FAST_TOKENS), "exclusive": (EXCLUSIVE_UNITS, (*FAST_TOKENS, "gui"))}
 # A job's own cost in cores, where it is far enough from its class's: keyed by (workflow file, job id) for the home
 # repository, (repository, workflow file, job id) for a guest. Only units change: the job keeps its class's tokens
 # (cli-regressions is a compile at 0.16 cores and still holds persistent-dd and a root). Same window as CLASS_COST;
@@ -1968,6 +1988,24 @@ def export_developer_dir(xcode_app: str) -> str:
         with open(target, "a", encoding="utf-8") as env_file:
             env_file.write(f"DEVELOPER_DIR={developer}\n")
         return f"DEVELOPER_DIR={developer} for the job"
+    return ""
+
+
+def export_job_claim(capacity_units: int, taken: dict[str, Any], note: str) -> str:
+    """Tell an admitted job, through $GITHUB_ENV, that it holds the whole mini (JOB_CLAIM_ENV=exclusive): an exclusive
+    class job that holds every capacity unit, or any job holding the fleet host lock itself (a mini without weighted
+    capacity). Nothing for any other job, and nothing when there is no $GITHUB_ENV. Returns a note, or ''."""
+    if capacity_units > 0:
+        whole = taken.get("class") == EXCLUSIVE_CLASS and taken.get("units") == capacity_units
+    else:
+        whole = note.startswith(HOST_LOCK_HELD)  # take_host_lock's own note: never a dedicated runner's, which holds nothing
+    target = os.environ.get("GITHUB_ENV")
+    if not whole or not target:
+        return ""
+    with contextlib.suppress(OSError):
+        with open(target, "a", encoding="utf-8") as env_file:
+            env_file.write(f"{JOB_CLAIM_ENV}={EXCLUSIVE_CLASS}\n")
+        return f"{JOB_CLAIM_ENV}={EXCLUSIVE_CLASS} for the job (it holds the whole mini)"
     return ""
 
 
@@ -3660,6 +3698,9 @@ def close_all(fds: list[int]) -> None:
             os.close(fd)
 
 
+HOST_LOCK_HELD = "holding the fleet host lock for this job"
+
+
 def take_host_lock(path: str, watch_pid: int | JobOwner, state_dir: Path) -> tuple[bool, str]:
     """Take the fleet host lock without waiting and leave it with a detached holder for this job.
     Admitted only once the holder itself reports its pid, so a holder that died never counts."""
@@ -3688,7 +3729,7 @@ def take_host_lock(path: str, watch_pid: int | JobOwner, state_dir: Path) -> tup
             os.close(fd)
             return False, "another build holds the fleet host lock"
     held, note = hold([fd], watch_pid, state_dir)
-    return held, (f"holding the fleet host lock for this job ({note})" if held else note)
+    return held, (f"{HOST_LOCK_HELD} ({note})" if held else note)
 
 
 def lock_file(path: Path, mode: int) -> int | None:
@@ -3970,6 +4011,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
     uses_gui = "gui" in tokens
     if uses_gui:
         tokens = tuple(gui_token if token == "gui" else token for token in tokens)
+        if klass == EXCLUSIVE_CLASS and gui_token != "gui":
+            tokens = (*tokens, "gui")  # the idle fuzzer looks at gui.token itself: hold it whatever this runner's is
     units = min(units, total)
     if roots > 1 and klass in ROOT_CONSUMERS:
         # a consumer must use the producer's root, which only its restore step knows: it takes that root
@@ -4023,8 +4066,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                 taken_out["wants"] = sorted(needs)
             return False, behind
         yielded = yield_idle_warm(capacity_dir)  # under admission.lock, so a catch-up cannot start meanwhile
-        if uses_gui:  # this job will drive the console session: the idle fuzzer's app must be gone first
-            yielded += yield_idle_fuzz(capacity_dir)
+        if uses_gui or klass == EXCLUSIVE_CLASS:  # it drives the console session, or takes the whole mini: the idle
+            yielded += yield_idle_fuzz(capacity_dir)  # fuzzer's app must be gone first
         if os.path.isdir(os.path.dirname(host_lock)):
             # created if missing, so a worker that starts later still has to wait for this job
             fd = os.open(host_lock, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o660)
@@ -4047,7 +4090,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
             waiting = bounded_waiters(state_dir, lock_waiters(host_lock, holder_pids(state_dir) | yielding_family(host_lock)),
                                       log=lambda note: print(f"{PREFIX}: {note}", flush=True))
             # lsof sees only this user's processes, which is how the fleet worker runs today.
-            if (waiting and tier == TIER_NIGHTLY and (klass == "light" or nightly_runner)
+            if (waiting and tier == TIER_NIGHTLY and (klass in ("light", EXCLUSIVE_CLASS) or nightly_runner)
                     and nightly_pass(state_dir, waiting[0])):
                 # NIGHTLY_WAITER: a nightly job on the nightly slot, or a light one (sign, notarize, verify) on any
                 # runner, goes ahead of a waiting fleet build too. Refusing it failed the whole nightly after its
@@ -4107,6 +4150,14 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                 if taken_out is not None:
                     taken_out["wants"] = [token]
                 return refused(f"capacity: {held} ({job or 'unknown job'} is {klass})")
+        if "gui" in taken or gui_token in taken:
+            # The idle fuzzer writes its holder (FUZZ_HOLDER), then looks at gui.token, before it starts its app. One
+            # that looked between the yield above and this token missed us, so look for its holder again now that
+            # the token is ours: either it sees the token taken, or its holder is there for this yield to stop.
+            again = yield_idle_fuzz(capacity_dir)
+            if klass == EXCLUSIVE_CLASS and "did not stop" in again:
+                return refused(f"capacity: {again.lstrip('; ')}, and a signing job runs beside nothing")
+            yielded += again
         # every job but a reserving runner's own leaves the idle reserves free (GUI_RESERVE, FRESH_RESERVE_TOKEN); a
         # nightly job keeps none (FEED_FIRST)
         def kept_now() -> int:
@@ -4153,7 +4204,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         # a lent reserve covers the job's whole admission: its units are never released early (the sampler's
         # dynamic release), else the reserve would stay lent while the units it stands for went to other jobs
         held, note = hold(fds, watch_pid, state_dir, drop=(admission,) if split is None else (admission, split),
-                          release_fds=[] if own_reserve is not None and units > 0 else unit_fds,
+                          release_fds=[] if own_reserve is not None and units > 0 or klass == EXCLUSIVE_CLASS
+                          else unit_fds,
                           close_first=(lent,) if lent is not None else ())
         fds = [] if split is None else [split]  # the holder has them now, or hold closed them
         if held and split is not None:
@@ -4169,7 +4221,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         if held and passed is not None:
             note += f"; a nightly job, admitted ahead of the fleet build waiting for the host (pid {passed})"
         if held and taken_out is not None:
-            taken_out.update(units=units, units_total=total, tokens=list(taken))
+            taken_out.update(units=units, units_total=total, tokens=list(taken), **{"class": klass})
         if held and gui_token in taken:
             with contextlib.suppress(OSError):
                 gui_file(state_dir).write_text("gui\n")
@@ -7108,7 +7160,8 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
                 samples.add(load_average(), split, interval, queue, *disk_busy,
                             free=free_or_none(disk_path) if disk_path else None,
                             rss_kib=tree_kib(tree, rss), footprint_kib=tree_kib(tree, phys_footprints_kib(tree)))
-                if dynamic_units > 1 and dynamic_total > 1:
+                # an exclusive job (SIGNING_JOBS) keeps every unit for its whole run, however quiet its notary wait
+                if dynamic_units > 1 and dynamic_total > 1 and meta.get("class") != EXCLUSIVE_CLASS:
                     now = time.monotonic()
                     job_cores = split[0]
                     host_busy = disk_busy[1]
@@ -8339,6 +8392,13 @@ def main(argv: list[str] | None = None) -> int:
                                                   os.environ.get("GITHUB_REF"), os.environ.get("GITHUB_JOB"),
                                                   job_workflow(), os.environ.get("GITHUB_RUN_ATTEMPT"))
             cap = bounded_wait(cap, nightly_bound)
+            claim_class = admit_class or job_class(os.environ.get("GITHUB_JOB", ""), repo, args.home_repo,
+                                                   job_workflow())[0]
+            if claim_class == EXCLUSIVE_CLASS:
+                cap = bounded_wait(cap, EXCLUSIVE_CAPACITY_WAIT_S)
+                print(f"{PREFIX}: a signing job: it takes the whole mini (every unit and fast token), so no other job "
+                      f"runs here beside it; it waits {EXCLUSIVE_CAPACITY_WAIT_S:g} s at most for the mini to drain, "
+                      "then is refused so its re-run takes Blacksmith", flush=True)
             if tier == TIER_NIGHTLY:
                 print(f"{PREFIX}: a nightly job: it goes ahead of every other job waiting here, no other job takes a "
                       f"unit while it waits, and it keeps no idle reserve"
@@ -8405,6 +8465,8 @@ def main(argv: list[str] | None = None) -> int:
                 note += f"; {aligned}"
         if args.toolchain_xcode and (pinned := export_developer_dir(args.toolchain_xcode)):
             note += f"; {pinned}"
+        if claim := export_job_claim(args.capacity_units, taken, note):
+            note += f"; {claim}"
         for root in held_roots(args.state_dir):
             settled = settle_root(int(root.rsplit("-", 1)[1]))
             if settled:

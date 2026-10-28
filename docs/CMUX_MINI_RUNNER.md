@@ -191,7 +191,11 @@ What `--apply` does:
      run shares the user's testmanagerd with the GUI jobs, see 2h2),
      `swift-package-tests` 4 units, the side lanes `cli-pipe-regressions` and the other light
      ids 2 and `remote-daemon-macos-tests` and `claude-wrapper` 1, an isolated job 4, and any
-     other job counts as a compile. The hook's `JOB_CORES` table gives a job its own measured
+     other job counts as a compile. cmux's signing jobs (`SIGNING_JOBS`: the release-environment jobs that put the
+     Developer ID key in a temporary keychain) take the `exclusive` class: every unit and both fast tokens, never
+     given back early, waiting at most 300 s for the mini to drain before a refusal sends the re-run to Blacksmith.
+     Admitted, the hook writes `GLAEDA_JOB_CLAIM=exclusive` to `$GITHUB_ENV`, and cmux's signing jobs check it
+     before they touch the key, so a mini on an older hook never signs beside another job. The hook's `JOB_CORES` table gives a job its own measured
      cost where it is far from its class's: cmux-next's generated files, both autofix
      workflows' action exports and cmux-tui's `macos` 6, cmux-next's `fast-tier` (off the fast
      runner) and `daemon-test` 5, `cmux-scheme-compile`, the iOS builds, cmux-tui's `macos-relay`
