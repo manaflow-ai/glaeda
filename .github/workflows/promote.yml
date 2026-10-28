@@ -20,6 +20,12 @@ permissions:
   contents: write
   statuses: read
 
+# stable.json has this one writer, one run at a time. The group is shared on purpose: every run decides
+# from the releases and statuses it reads when it starts, so a waiting run that GitHub replaces loses
+# nothing the run that replaced it does not do (scripts/test-delivery-concurrency.py declares it). A
+# release asset upload has no compare-and-swap, so stable.json keeps this one group rather than racing
+# writers. The one input, an operator's soak_hours, can be replaced by a later cron while it waits; GitHub
+# then shows the dispatch as cancelled and the operator dispatches it again.
 concurrency:
   group: ota-stable
   cancel-in-progress: false

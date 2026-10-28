@@ -73,6 +73,7 @@ HOSTED_ALLOWED: dict[tuple[str, str], str] = {
     ("promote.yml", "promote"): PERSONAL,
     ("release.yml", "build"): PERSONAL_MACOS,
     ("release.yml", "publish"): PERSONAL,
+    ("release.yml", "canary"): PERSONAL,
     ("sync-main.yml", "sync"): PERSONAL,
 }
 
