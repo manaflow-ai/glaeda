@@ -1478,14 +1478,7 @@ fn abort_timed_child(child: &mut Child, pid: Pid, pidfd: Option<&OwnedFd>) {
 
 #[cfg(target_os = "linux")]
 fn unique_resource_scope_unit() -> Result<String, String> {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| "system clock is before the Unix epoch".to_owned())?
-        .as_nanos();
-    Ok(format!(
-        "glaeda-hot-run-{}-{nonce}.scope",
-        std::process::id()
-    ))
+    Ok(format!("glaeda-hot-run-{}.scope", unique_nonce()?))
 }
 
 #[cfg(target_os = "linux")]
@@ -2833,27 +2826,29 @@ fn absolute_path(path: &Path) -> Result<PathBuf, String> {
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
-fn unique_temporary_path(prefix: &str) -> Result<PathBuf, String> {
-    let nonce = SystemTime::now()
+/// A name no other call in this process has used. The wall clock alone repeats across threads
+/// that read the same tick (a Blacksmith runner's test threads did, and `create_new` then
+/// failed with EEXIST), so a process-wide sequence follows it.
+fn unique_nonce() -> Result<String, String> {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| "system clock is before the Unix epoch".to_owned())?
         .as_nanos();
-    Ok(env::temp_dir().join(format!(".{prefix}-{}-{nonce}", std::process::id())))
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(format!("{}-{nanos}-{sequence}", std::process::id()))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn unique_temporary_path(prefix: &str) -> Result<PathBuf, String> {
+    Ok(env::temp_dir().join(format!(".{prefix}-{}", unique_nonce()?)))
 }
 
 fn unique_sibling_path(destination: &Path) -> Result<PathBuf, String> {
     let parent = destination
         .parent()
         .ok_or_else(|| "measurement destination has no parent".to_owned())?;
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| "system clock is before the Unix epoch".to_owned())?
-        .as_nanos();
-    Ok(parent.join(format!(
-        ".glaeda-hot-run-measurement-{}-{nonce}",
-        std::process::id()
-    )))
+    Ok(parent.join(format!(".glaeda-hot-run-measurement-{}", unique_nonce()?)))
 }
 
 fn round_seconds(duration: Duration) -> f64 {
@@ -2880,6 +2875,14 @@ mod tests {
         let path = unique_temporary_path(label).unwrap();
         fs::create_dir(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn temporary_paths_are_unique_within_one_clock_tick() {
+        let paths: std::collections::HashSet<PathBuf> = (0..1000)
+            .map(|_| unique_temporary_path("glaeda-hot-run-unique").unwrap())
+            .collect();
+        assert_eq!(paths.len(), 1000);
     }
 
     #[cfg(target_os = "linux")]
