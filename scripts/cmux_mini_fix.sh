@@ -402,6 +402,91 @@ metal() {  # DEVELOPER_DIR
   DEVELOPER_DIR="$1" xcrun metal --version | head -1
 }
 
+ios_runtime_ready() {  # DEVELOPER_DIR BUILD: the runtime is listed and available (the probe's own reading)
+  DEVELOPER_DIR="$1" xcrun simctl list runtimes </dev/null 2>/dev/null |
+    grep -E "^iOS [0-9.]+ \([0-9.]+ - $2\) - com\.apple\.[A-Za-z0-9.-]+ *\$" >/dev/null  # no -q: pipefail
+}
+data_free_kib() {
+  df -k /System/Volumes/Data 2>/dev/null | awk 'NR == 2 { print $4; found = 1 } END { exit !found }' ||
+    df -k / | awk 'NR == 2 { print $4 }'
+}
+ios_runtime_install() {  # DEVELOPER_DIR BUILD NEED_GIB FLOOR_GIB: the download itself, with the host already drained
+  local before after
+  # A booted simulator runs launchd_sim; adding a runtime under it can restart CoreSimulatorService.
+  if pgrep -x launchd_sim >/dev/null 2>&1; then held_refuse "a simulator is running"; fi
+  before=$(data_free_kib)
+  if [ "$before" -lt $((($3 + $4) * 1048576)) ]; then
+    refuse "$((before / 1048576)) GiB free on the Data volume; the download needs $(($3 + $4)) ($3 above the $4 GiB floor)"
+  fi
+  DEVELOPER_DIR="$1" xcodebuild -downloadPlatform iOS
+  after=$(data_free_kib)
+  ios_runtime_ready "$1" "$2" ||
+    refuse "the download finished but runtime $2 is not available; this Xcode yields: $(DEVELOPER_DIR="$1" xcrun simctl list runtimes </dev/null 2>/dev/null | grep '^iOS' | tr '\n' ';')"
+  say "iOS simulator runtime $2 available; used $(((before - after) * 1024)) bytes, $((after / 1048576)) GiB free"
+}
+ios_runtime() {  # DEVELOPER_DIR BUILD NEED_GIB FLOOR_GIB WAIT_SECONDS [GRACE_SECONDS]: add the pinned Xcode's iOS runtime,
+  # never remove one
+  if ios_runtime_ready "$1" "$2"; then say "unchanged: iOS simulator runtime $2 available"; return; fi
+  if pgrep -x launchd_sim >/dev/null 2>&1; then held_refuse "a simulator is running"; fi
+  # No fleet dir: nothing here takes the fleet host lock (the build worker, its run-worker.sh and the runner hook's
+  # ledger all live in that dir), so there is nothing to drain.
+  [ -d "$GLAEDA_FLEET_DIR" ] || { ios_runtime_install "$1" "$2" "$3" "$4"; return; }
+  # The fleet host lock, held exclusively for the whole download, so no build or ci-step runs beside it (each holds it,
+  # steps shared); perl creates it (0660, as the worker does) when it is absent. First a host.lock.waiters entry
+  # <pid>-ios-runtime, live while perl's pid is: the build worker then leases no new job or step here, and what runs
+  # finishes. perl waits up to WAIT_SECONDS for the lock, then runs the download as a child in its own process group
+  # (the lock fd is close-on-exec, so nothing the download starts keeps it). A TERM, INT or HUP to perl (an ssh drop,
+  # the step's timeout) goes on to that group, and perl keeps the lock and the entry until no process of the group is
+  # left (KILL 60 s after the signal), so no build starts beside a download that outlives its caller.
+  perl -MFcntl=:flock,O_RDONLY,O_CREAT,O_NOFOLLOW -MPOSIX=:signal_h,:sys_wait_h,setpgid -e '
+    my ($lock, $wait, $grace) = splice(@ARGV, 0, 3);
+    my $waiter = "";
+    sub leave { unlink $waiter if $waiter ne ""; print STDERR "glaeda-mini-fleet: $_[1]\n" if $_[1]; exit $_[0] }
+    my $fh;
+    sysopen($fh, $lock, O_RDONLY | O_CREAT | O_NOFOLLOW, 0660) or leave(20, "held: cannot open $lock ($!), skipped");
+    if (-d "$lock.waiters") {
+      my $w; $waiter = "$lock.waiters/$$-ios-runtime";
+      if (open($w, ">", $waiter)) { close($w) } else { $waiter = "" }
+    }
+    my ($deadline, $said) = (time() + $wait, 0);
+    until (flock($fh, LOCK_EX | LOCK_NB)) {
+      leave(20, "held: $lock still held after ${wait}s, skipped") if time() >= $deadline;
+      print "glaeda-mini-fleet: waiting for the jobs holding $lock to finish (no new ones start)\n" unless $said++;
+      sleep 2;
+    }
+    # TERM, INT and HUP are blocked from before the fork until the child has its own group and the handler is
+    # set, so none can end perl (and drop the lock) in between; one that came meanwhile is delivered after.
+    my $sigs = POSIX::SigSet->new(SIGTERM, SIGINT, SIGHUP);
+    sigprocmask(SIG_BLOCK, $sigs) or leave(3, "refused: sigprocmask: $!");
+    my $pid = fork();
+    defined $pid or leave(3, "refused: fork: $!");
+    if (!$pid) {
+      setpgid(0, 0);
+      $SIG{$_} = "DEFAULT" for qw(TERM INT HUP PIPE);
+      sigprocmask(SIG_UNBLOCK, $sigs);
+      exec { $ARGV[0] } @ARGV;
+      POSIX::_exit(127);
+    }
+    setpgid($pid, $pid);  # also here, so the group exists before any signal is passed on
+    my ($rc, $stop_at, $killed) = (undef, 0, 0);
+    $SIG{$_} = sub { $stop_at ||= time() + $grace; kill "TERM", -$pid } for qw(TERM INT HUP);
+    $SIG{PIPE} = "IGNORE";
+    sigprocmask(SIG_UNBLOCK, $sigs);
+    # Wait for the child, then for every process left in its group. GRACE_SECONDS (60) after a signal, or after the
+    # child ended, the group gets KILL; the lock and the waiter entry stay until no process of it is left.
+    while (1) {
+      if (!defined $rc) {
+        my $r = waitpid($pid, WNOHANG);
+        if ($r == $pid) { $rc = $?; $stop_at ||= time() + $grace }
+      }
+      last if defined $rc && !kill(0, -$pid);
+      if ($stop_at && time() >= $stop_at && !$killed) { kill "KILL", -$pid; $killed = 1 }
+      select(undef, undef, undef, 0.2);
+    }
+    leave($rc & 127 ? 128 + ($rc & 127) : $rc >> 8);
+  ' "$GLAEDA_FLEET_DIR/host.lock" "$5" "${6:-60}" /bin/bash -c "$(declare -f say refuse held_refuse data_free_kib ios_runtime_ready ios_runtime_install)
+set -euo pipefail; ios_runtime_install \"\$@\"" ios_runtime "$1" "$2" "$3" "$4"
+}
 # cmux scripts/setup.sh builds GhosttyKit, the artifacts the bootstrap checks for.
 cmux_setup() {  # ROOT DEVELOPER_DIR
   cd "$(home "$1")" && DEVELOPER_DIR="$2" ./scripts/setup.sh

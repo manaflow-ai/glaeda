@@ -48,7 +48,11 @@ no receipt names it) for cmux CI jobs that call it, of git (unpinned) on a host 
 git.source homebrew, Glaeda and its setup,
 ~/glaeda moved (clean fetch, detached checkout, refused when dirty) to --glaeda-ref or main's tip
 when its glaeda-mini-enroll lacks an option onboarding passes, rustup's default and pinned
-toolchains, the Metal toolchain, cmux scripts/setup.sh, and the reviewed Glaeda candidate
+toolchains, the Metal toolchain, a declared iOS simulator runtime missing from the host (xcodebuild
+-downloadPlatform iOS with the pinned Xcode, only with the download's disk above the host's floor and no simulator
+booted; it drains the fleet host lock (a host.lock.waiters entry holds new jobs off, up to 30 minutes) and holds it
+throughout, and it never deletes a runtime), cmux scripts/setup.sh,
+and the reviewed Glaeda candidate
 (downloaded once on this Mac with gh, sha256 checked, copied over). A step whose prerequisite
 needs root waits for sudo-plan. Without --yes it prints what it would run; with --yes it logs each
 host to its own file and ends with a fresh preflight. A rerun resumes: finished steps are skipped.
@@ -449,6 +453,46 @@ def validate_ios_simulator(path: Path, where: str, ios: Any) -> None:
         raise Failure(f"{path}: {where} ios_simulator.exclusive needs at least one runtime")
 
 
+# What one iOS simulator runtime download needs on the Data volume, above the host's disk floor. Measured
+# 2026-10-29: the arm64 iOS 26.5 (23F77) image Xcode 26.6 installs is 7.9 GiB (simctl runtime list -v); the
+# download is staged beside it before the install, so twice that plus headroom.
+IOS_RUNTIME_DOWNLOAD_GIB = 20
+# How long the download waits for the jobs holding the fleet host lock to finish, with new ones held off by its
+# host.lock.waiters entry; FIX_TIMEOUTS["ios_runtime"] adds this to the download's hour.
+IOS_RUNTIME_DRAIN_SECONDS = 1800
+
+
+def simulator_check(policy: dict[str, Any], obs: dict[str, Any], developer: str | None) -> tuple[Any, ...]:
+    """The preflight simulator check: the declared iOS simulator runtimes, and the download that adds a missing one.
+
+    Only adding: an extra runtime is check's drift for a person, never deleted here, since a delete restarts
+    CoreSimulatorService under whatever simulator runs. todo, not fail: a host without the runtime is still a
+    build host, it just takes no simulator step until fix adds it."""
+    ios = policy.get("ios_simulator") or {}
+    have = {r["build"] for r in obs.get("ios_runtimes", []) if r.get("available", True)}
+    missing = [b for b in ios.get("runtimes", []) if b not in have]
+    if not ios.get("runtimes"):
+        return ("simulator", "info", "no iOS simulator runtime declared")
+    if not missing:
+        return ("simulator", "ok", ", ".join(ios["runtimes"]))
+    build = missing[0]
+    if developer is None:
+        return ("simulator", "unknown", f"iOS simulator runtime {build} missing; no pinned Xcode to download it with")
+    floor = policy.get("disk", {}).get("min_free_gib") or bootstrap.default_min_free_gib("macos")
+    data = obs.get("disk", {}).get("/System/Volumes/Data") or obs.get("disk", {}).get("/")
+    need = IOS_RUNTIME_DOWNLOAD_GIB + floor
+    if data and data["free_gib"] < need:
+        return ("simulator", "todo", f"iOS simulator runtime {build} missing; {data['free_gib']} GiB free, the "
+                f"download needs {need} ({IOS_RUNTIME_DOWNLOAD_GIB} above the {floor} GiB floor)",
+                "free disk first (glaeda-disk on the host shows where it went)", "person")
+    detail = f"iOS simulator runtime {build} missing" + (f" (and {', '.join(missing[1:])})" if missing[1:] else "")
+    return ("simulator", "todo", detail,
+            f"DEVELOPER_DIR={developer} xcodebuild -downloadPlatform iOS (must yield {build}), "
+            "with the fleet host lock drained and held (glaeda-mini-fleet fix)", "self",
+            {"kind": "ios_runtime", "developer": developer, "build": build,
+             "need_gib": IOS_RUNTIME_DOWNLOAD_GIB, "floor_gib": floor})
+
+
 def ios_simulator_drift(ios: dict[str, Any], obs: dict[str, Any]) -> list[tuple[str, str]]:
     """(message, fix) for each way the observed iOS simulators differ from the declared ones."""
     runtimes = obs.get("ios_runtimes", [])
@@ -458,8 +502,8 @@ def ios_simulator_drift(ios: dict[str, Any], obs: dict[str, Any]) -> list[tuple[
         if build not in have:
             # -buildVersion only takes what Apple lists for this Xcode, so name the build to confirm instead.
             out.append((f"iOS simulator runtime {build} missing",
-                        f"xcodebuild -downloadPlatform iOS with the pinned Xcode (must yield {build}), "
-                        "or xcrun simctl runtime add <dmg>"))
+                        f"glaeda-mini-fleet fix HOST --yes (xcodebuild -downloadPlatform iOS with the pinned Xcode, "
+                        f"must yield {build})"))
     if ios.get("exclusive"):
         # An unavailable runtime is still extra: deleting it is the fix.
         for build, r in sorted((r["build"], r) for r in runtimes):
@@ -2167,7 +2211,7 @@ def cmd_release(manifest: dict[str, Any], hosts: list[str], owner: str | None, f
 
 DEFAULT_CMUX_ROOT = "~/cmux"  # where fix clones cmux on a mini
 # Columns of the preflight table, in the order onboarding meets them.
-PREFLIGHT_CHECKS = ("os", "xcode", "select", "licence", "launch", "metal", "rust", "zig", "tools", "python", "python3",
+PREFLIGHT_CHECKS = ("os", "xcode", "select", "licence", "launch", "metal", "simulator", "rust", "zig", "tools", "python", "python3",
                     "gh", "git", "cmux", "setup", "glaeda", "headless_sudo", "power", "disk", "update", "autoupdate", "candidate", "node", "enroll", "runner",
                     "brew", "pins", "secrets")
 # An unknown here means the bootstrap would refuse or cannot be predicted, so it blocks like a failure.
@@ -2366,6 +2410,7 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
         put("metal", "fail", f"xcrun metal --version: {metal['detail']}",
             f"DEVELOPER_DIR={developer} xcodebuild -downloadComponent MetalToolchain", "self",
             {"kind": "metal", "developer": developer})
+    put(*simulator_check(policy, obs, developer))
 
     # Build tools on the workload's fixed PATH, with versions.
     tools = pf.get("tools", {})
@@ -2792,10 +2837,11 @@ def render_preflight(results: list[dict[str, Any]]) -> str:
 # The order fix runs a host's repairs in, so each runs after what it builds on.
 # The checkout comes after brew: a git.source homebrew host clones and walks it with the git brew installs.
 FIX_ORDER = ("xcode_share", "xcode_clone", "python", "homebrew_fetch", "brew", "python_link", "cmux_clone", "submodules",
-             "rust_default", "rust_channel", "glaeda", "glaeda_sync", "metal", "setup", "candidate")
+             "rust_default", "rust_channel", "glaeda", "glaeda_sync", "metal", "ios_runtime", "setup",
+             "candidate")
 # What each repair needs to pass first (checks, or repairs made earlier in the same run).
 # glaeda-mini-setup builds glaeda-worktree-reclaim with cargo, under the Python enroll will use.
-FIX_NEEDS = {"metal": ("licence", "launch"), "setup": ("cmux", "licence", "launch", "metal", "zig"), "brew": ("brew",),
+FIX_NEEDS = {"metal": ("licence", "launch"), "ios_runtime": ("licence", "launch"), "setup": ("cmux", "licence", "launch", "metal", "zig"), "brew": ("brew",),
              "python_link": ("brew",), "glaeda": ("python", "rust", "headless_sudo"),
              # git runs through the /usr/bin shim, which needs a selected, licensed developer directory.
              "homebrew_fetch": ("select", "licence"),
@@ -2806,13 +2852,13 @@ FIX_NEEDS = {"metal": ("licence", "launch"), "setup": ("cmux", "licence", "launc
 READ_ONLY_FUNCTIONS = {"candidate_check", "share_have", "share_source", "share_send", "host_check"}
 # Steps that honor less of the host gate than the default (both the fleet host lock and reservations):
 # a drain waits out the job holding the lock, and restoring runners never builds anything.
-LOCK_GATE = {"runner_hold": "reservation", "runner_release": "none", "runner_kick": "none"}
+LOCK_GATE = {"runner_hold": "reservation", "ios_runtime": "reservation", "runner_release": "none", "runner_kick": "none"}
 SUDO_ORDER = ("select", "licence", "first_launch", "power", "autoupdate", "homebrew", "brew", "python_link")
 # Homebrew itself comes from a git fetch, never the brew.sh installer: that stalls on the Command Line Tools
 # softwareupdate the fleet does not need (the pinned Xcode is selected) and leaves an empty /opt/homebrew.
 HOMEBREW_REPO = "https://github.com/Homebrew/brew"
 FIX_TIMEOUTS = {"cmux_clone": 1800, "submodules": 1800, "brew": 5400, "rust_channel": 1800, "glaeda": 1800,
-                "metal": 3600, "setup": 5400, "python": 1800, "candidate": 1800, "homebrew_fetch": 1800,
+                "metal": 3600, "ios_runtime": 3600 + 1800, "setup": 5400, "python": 1800, "candidate": 1800, "homebrew_fetch": 1800,
                 "glaeda_sync": 900}
 RUSTUP_PROXIES = ("cargo", "rustc", "rustdoc", "rustup")
 BREW_STAGE = "Library/Caches/glaeda/share/homebrew/downloads"  # under the login user's home; see share brew
@@ -3001,6 +3047,9 @@ def describe(action: dict[str, Any], manifest: dict[str, Any] | None = None, nam
         return "clone Glaeda into ~/glaeda and run glaeda-mini-setup --apply" + (" --headless" if headless else "")
     if kind == "metal":
         return "xcodebuild -downloadComponent MetalToolchain (about 700 MB)"
+    if kind == "ios_runtime":
+        return (f"xcodebuild -downloadPlatform iOS for runtime {action['build']} (about 8 GB), with the fleet host lock "
+                f"drained and held; needs {action['need_gib'] + action['floor_gib']} GiB free")
     if kind == "setup":
         return f"cmux scripts/setup.sh in {action['root']} (builds GhosttyKit)"
     if kind == "candidate":
@@ -3468,6 +3517,8 @@ def run_repair(manifest: dict[str, Any], name: str, action: dict[str, Any], log:
         "rust_channel": ("rust_channel", lambda a: [a["root"], a["channel"]]),
         "glaeda": ("glaeda", lambda a: [a["python"], *(["--headless"] if manifest["hosts"][name].get("gui") is False else [])]),
         "metal": ("metal", lambda a: [a["developer"]]),
+        "ios_runtime": ("ios_runtime", lambda a: [a["developer"], a["build"], str(a["need_gib"]), str(a["floor_gib"]),
+                                                  str(IOS_RUNTIME_DRAIN_SECONDS)]),
         "setup": ("cmux_setup", lambda a: [a["root"], a["developer"]]),
     }
     func, args = calls[kind]
