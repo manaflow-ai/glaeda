@@ -2046,6 +2046,8 @@ class HookTest(unittest.TestCase):
                           admitted.stdout)
             self.assertIn("GLAEDA_JOB_CLAIM=exclusive for the job", admitted.stdout)
             self.assertIn("GLAEDA_JOB_CLAIM=exclusive\n", github_env.read_text())
+            self.assertIn(f"GLAEDA_HOOK_SHA256={hashlib.sha256(HOOK.read_bytes()).hexdigest()}\n",
+                          github_env.read_text(), "the admitted job learns which hook admitted it")
             for name, runner in (("swift-package-tests", "s1"), ("verify-signed-nightly", "s2")):
                 beside = self.job(name, runner, 14, None, "--gui-wait", "0")
                 self.assertEqual(beside.returncode, 1, beside.stdout + beside.stderr)
@@ -2164,9 +2166,16 @@ class HookTest(unittest.TestCase):
             self.assertFalse(github_env.exists())
             self.assertIn("holds the whole mini", hook.export_job_claim(14, {"class": "exclusive", "units": 14}, ""))
             self.assertIn("holds the whole mini", hook.export_job_claim(0, {}, f"{hook.HOST_LOCK_HELD} (held)"))
-        self.assertEqual(github_env.read_text(), "GLAEDA_JOB_CLAIM=exclusive\n" * 2)
+        claim = f"GLAEDA_JOB_CLAIM=exclusive\nGLAEDA_HOOK_SHA256={hashlib.sha256(HOOK.read_bytes()).hexdigest()}\n"
+        self.assertEqual(github_env.read_text(), claim * 2, "the claim names the hook that admitted the job")
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertEqual(hook.export_job_claim(14, {"class": "exclusive", "units": 14}, ""), "")
+        github_env.unlink()
+        with mock.patch.dict(os.environ, {"GITHUB_ENV": os.fspath(github_env)}), \
+                mock.patch.object(hook, "__file__", os.fspath(self.dir / "no-such-hook")):
+            self.assertIn("holds the whole mini", hook.export_job_claim(14, {"class": "exclusive", "units": 14}, ""))
+        self.assertEqual(github_env.read_text(), "GLAEDA_JOB_CLAIM=exclusive\n",
+                         "a hook that cannot read itself names no sha, so a job that needs one refuses itself")
 
     def test_a_nightly_sign_or_verify_job_needs_no_compile_tokens(self) -> None:
         """nightly.yml's sign and verify jobs were unknown jobs, so compiles: first in line, they still waited for the

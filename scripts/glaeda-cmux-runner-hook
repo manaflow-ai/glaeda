@@ -458,6 +458,9 @@ EXCLUSIVE_UNITS = 1 << 16
 EXCLUSIVE_CLASS = "exclusive"
 EXCLUSIVE_CAPACITY_WAIT_S = 300.0  # NIGHTLY_CAPACITY_WAIT_S: the same owned-pool rescue window
 JOB_CLAIM_ENV = "GLAEDA_JOB_CLAIM"
+# The sha256 of this hook file, written beside JOB_CLAIM_ENV: a job that holds the whole mini can tell which hook
+# admitted it (cmux's signing jobs accept only hooks that wait out an earlier job's leftover processes).
+HOOK_SHA_ENV = "GLAEDA_HOOK_SHA256"
 CLASS_COST: dict[str, tuple[int, tuple[str, ...]]] = {
     "compile": (5, ("persistent-dd", "root")), "gui": (1, ("gui", "root")), "product": (1, ("gui", "root")),
     "compile-gui": (4, ("root",)), "gui-step": (1, ("gui", "root")),
@@ -2023,9 +2026,10 @@ def export_developer_dir(xcode_app: str) -> str:
 
 
 def export_job_claim(capacity_units: int, taken: dict[str, Any], note: str) -> str:
-    """Tell an admitted job, through $GITHUB_ENV, that it holds the whole mini (JOB_CLAIM_ENV=exclusive): an exclusive
-    class job that holds every capacity unit, or any job holding the fleet host lock itself (a mini without weighted
-    capacity). Nothing for any other job, and nothing when there is no $GITHUB_ENV. Returns a note, or ''."""
+    """Tell an admitted job, through $GITHUB_ENV, that it holds the whole mini (JOB_CLAIM_ENV=exclusive) and which
+    hook admitted it (HOOK_SHA_ENV, this file's sha256): an exclusive class job that holds every capacity unit, or any
+    job holding the fleet host lock itself (a mini without weighted capacity). Nothing for any other job, and nothing
+    when there is no $GITHUB_ENV. Returns a note, or ''."""
     if capacity_units > 0:
         whole = taken.get("class") == EXCLUSIVE_CLASS and taken.get("units") == capacity_units
     else:
@@ -2034,8 +2038,11 @@ def export_job_claim(capacity_units: int, taken: dict[str, Any], note: str) -> s
     if not whole or not target:
         return ""
     with contextlib.suppress(OSError):
+        lines = f"{JOB_CLAIM_ENV}={EXCLUSIVE_CLASS}\n"
+        with contextlib.suppress(OSError):  # an unreadable hook writes no sha, and a job that needs one refuses itself
+            lines += f"{HOOK_SHA_ENV}={hashlib.sha256(Path(__file__).resolve().read_bytes()).hexdigest()}\n"
         with open(target, "a", encoding="utf-8") as env_file:
-            env_file.write(f"{JOB_CLAIM_ENV}={EXCLUSIVE_CLASS}\n")
+            env_file.write(lines)
         return f"{JOB_CLAIM_ENV}={EXCLUSIVE_CLASS} for the job (it holds the whole mini)"
     return ""
 
