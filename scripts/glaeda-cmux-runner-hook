@@ -98,8 +98,8 @@ leaves admission. The gate starts run.sh with listener_env (no SDKROOT or TOOLCH
 hook's --toolchain-xcode) and scrubs its own environment the same way; a listener it adopted on a reload whose env
 was not that (adopted_env_stale) is stopped once idle and started clean.
 A gui runner also stops listening while the console session is locked or nobody is logged in there
-(console_refusal). A gui runner is never held for CPU saturation, only memory pressure (Gate.saturated), and while it
-is idle its gate holds the gui runner's reserve (GUI_RESERVE: capacity/<gui token>.reserve): every other job on the
+(console_refusal). A gui or session runner is never held for CPU saturation, only memory pressure (Gate.saturated). While
+the gui runner is idle its gate holds the gui runner's reserve (GUI_RESERVE: capacity/<gui token>.reserve): every other job on the
 mini, and every other runner's gate, leaves one unit free for its next job, so the side and root lanes cannot fill
 the mini and keep the gui label queued. A fast runner (--fast-runner) runs cmux-next's fast-tier on the fast tokens
 (FAST_TOKENS) instead of the shared units, and its gate looks at those tokens, never at the units. Every runner also stops listening while free disk is under its job-started hook's --min-free-gib,
@@ -5769,10 +5769,16 @@ class Gate:
         reserve (FRESH_RESERVE_TOKEN) keeps their units free, but the PR lanes beside it keep the mini's CPU above
         the mark: on 2026-10-27 the canary slot logged "the mini is saturated (CPU busy at least 85%)" every
         minute and stayed offline while a nightly-next promote compile queued behind PR jobs. A feed compile that
-        runs slower beats one that waits 30+ minutes for a mini to cool."""
+        runs slower beats one that waits 30+ minutes for a mini to cool.
+
+        A session runner (--session-runner) is exempt too. Its label (cmux-next daemon tests, generated files,
+        action exports) has only these runners, one or two per std mini, and its jobs are admitted by units like
+        a gui runner's: on 2026-10-29 every std mini's side and root lanes held the CPU above the mark, every
+        session runner's gate held its listener off, GitHub showed no glaeda-session-* runner online, and a daemon
+        test (cmux#26999, run 40887257098) queued on glaeda-session-std-xcode-26.6 for over 2.5 hours."""
         now = time.monotonic()
         scope = runner_scope(self.runner_dir)
-        if scope.gui or scope.fresh or scope.nightly:
+        if scope.gui or scope.session or scope.fresh or scope.nightly:
             self.cpu_busy = None
         elif now - self.cpu_at >= GATE_CPU_EVERY_S:
             _, self.cpu_busy = host_io()

@@ -8683,6 +8683,35 @@ class GateTest(unittest.TestCase):
             pressure[0] = 2
             self.assertTrue((fresh.claimed() or "").startswith(hook.SATURATED), "memory pressure still holds it")
 
+    def test_a_session_runner_listens_through_cpu_saturation_but_not_memory_pressure(self) -> None:
+        """2026-10-29: the CPU mark held every std mini's session runner off while the side and root lanes kept the
+        minis busy, so GitHub showed no glaeda-session-* runner online and a daemon test queued on the session label
+        for hours. A session runner's jobs are admitted by units like a gui runner's, so only memory pressure holds
+        it; a plain side runner keeps the CPU hold."""
+        for name, value in (("GATE_CPU_PAUSE", 80.0), ("GATE_CPU_RESUME", 70.0), ("GATE_CPU_EVERY_S", 0.0)):
+            patcher = mock.patch.object(hook, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        pressure = [1]
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(parents=True, exist_ok=True)
+        with mock.patch.object(hook, "host_io", return_value=(0.0, 99.0)), \
+                mock.patch.object(hook, "memory_pressure_level", side_effect=lambda: pressure[0]), \
+                mock.patch.object(hook, "console_refusal", return_value=None):
+            script.write_text("#!/bin/bash\nexec /usr/bin/python3 /hook job-started --capacity-units 10 --instance 10"
+                              " --session-runner\n")
+            session = self.full_gate(self.units(0))
+            self.assertTrue(hook.runner_scope(self.runner).session)
+            self.assertIsNone(session.saturated(), "99% CPU: the session runner listens")
+            pressure[0] = 2
+            why = session.saturated()
+            self.assertTrue(why and why.startswith(hook.SATURATED) and "memory pressure level 2" in why, why)
+            self.assertNotIn("CPU busy", why)
+            pressure[0] = 1
+            script.write_text("#!/bin/bash\nexec /usr/bin/python3 /hook job-started --capacity-units 10 --instance 4\n")
+            side = self.full_gate(self.units(0))
+            self.assertTrue((side.saturated() or "").startswith(hook.SATURATED), "a side runner keeps the CPU hold")
+
     def test_runner_scope_reads_the_session_runner_flag(self) -> None:
         script = self.runner / hook.RUNNER_HOOK_SCRIPT
         script.parent.mkdir(parents=True, exist_ok=True)

@@ -362,7 +362,10 @@ What `--apply` does:
        pressure: its jobs come one per mini and are admitted by units like any other,
        and the CPU mark held it whenever the other lanes kept the mini busy. Nothing
        local says whether gui jobs are queued, and the gate polls no GitHub API, so the
-       exemption is unconditional.
+       exemption is unconditional. A session runner is exempt the same way: its label has
+       only these runners, and on 2026-10-29 the CPU mark held every one of them off on
+       every std mini while a daemon test queued on `glaeda-session-std-xcode-26.6` for
+       hours with no session runner online.
      - A session runner (`--session-runner`, `guiRunners` above 1) carries only the session
        pool label and stops only while fewer than 6 units are free (`--fit-units 6`, the
        costliest of its jobs: generated files and action exports), a job here waits for units, or the console is locked. Its jobs (cmux-next daemon tests, generated files, action exports,
