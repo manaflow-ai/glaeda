@@ -1396,6 +1396,10 @@ def dev_compile_refusal(event_name: str | None, ref: str | None, repository: str
 #   - DEV: the other feed compiles the freshness slot admits (dev_compile_refusal: a feat-cmux-next push's DEV
 #     compile, a DEV daily's). Ahead of PR and side jobs, except one that has waited FEED_JUMP_S: that keeps its
 #     arrival order against DEV compiles, so a stream of them cannot starve it.
+#   - STACK: a manaflow-ai/cmux pull request job whose PR carries the `stack-blocker` label (STACK_BLOCKER_LABEL): a
+#     PR whose landing a stack of reviewed PRs waits on. Right after nightly: ahead of DEV compiles and every other
+#     PR or side job however long they have waited, by arrival among themselves. Unlike a nightly job it only takes
+#     its place in line: it stops no other admission, holds no runner's gate and keeps the idle reserves.
 #   - everything else (PR and side jobs): arrival order.
 # Nothing running is preempted: a nightly job takes the next units that free up, and none goes to anyone else first.
 # Strict arrival order had them queue behind PR work: on 2026-10-27 from 04:27Z a nightly-next build-nightly-app sat
@@ -1421,8 +1425,35 @@ NIGHTLY_EVENTS = ("push", "schedule", "workflow_dispatch")
 NIGHTLY_WORKFLOW = "manaflow-ai/cmux/.github/workflows/nightly.yml"
 DEV_DAILY_WORKFLOW_PATH = f"manaflow-ai/cmux/.github/workflows/{DEV_DAILY_WORKFLOW}"
 PROMOTE_COMPILE = "release-compile"  # cmux-next.yml's, on a feat-cmux-next push: nightly-next's promote gate
-TIER_NIGHTLY, TIER_DEV = "nightly", "dev"
+TIER_NIGHTLY, TIER_DEV, TIER_STACK = "nightly", "dev", "stack"
 FEED_JUMP_S = 20 * 60.0
+# claude-sr2, 2026-10-29, after cmux#26809's swift test sat 45+ min queued behind ordinary PR swift tests while about
+# 15 reviewed PRs waited on it: "a PR that holds a stack ... is admitted ahead of ordinary PR swift tests, right after
+# nightly." Only a person with triage or write access on the repository can label a pull request, and the label is
+# read from the job's own event payload (GITHUB_EVENT_PATH), so it costs no API call. A label added after the run was
+# created is not in that payload: the PR's next push or update-branch carries it.
+STACK_BLOCKER_LABEL = "stack-blocker"
+STACK_BLOCKER_REPO = "manaflow-ai/cmux"
+STACK_BLOCKER_EVENTS = ("pull_request", "pull_request_target")
+
+
+def stack_blocker_tier(event_name: str | None, repository: str | None, event: Any) -> str:
+    """TIER_STACK for a job of a same-repository manaflow-ai/cmux pull request labelled STACK_BLOCKER_LABEL, else "".
+    Pure. A fork's pull request never qualifies (its jobs never take an owned mini anyway)."""
+    if event_name not in STACK_BLOCKER_EVENTS or not isinstance(event, dict):
+        return ""
+    pr = event.get("pull_request")
+    if not isinstance(pr, dict) or (repository or "").lower() != STACK_BLOCKER_REPO:
+        return ""
+    head, base = pr.get("head"), pr.get("base")
+    if not isinstance(head, dict) or not isinstance(base, dict) \
+            or _repo_name(head.get("repo")) != STACK_BLOCKER_REPO or _repo_name(base.get("repo")) != STACK_BLOCKER_REPO:
+        return ""
+    labels = pr.get("labels")
+    # GitHub label names are case-insensitive (`Stack-Blocker` is the same label), so both sides are folded.
+    names = {label["name"].casefold() for label in labels
+             if isinstance(label, dict) and isinstance(label.get("name"), str)} if isinstance(labels, list) else set()
+    return TIER_STACK if STACK_BLOCKER_LABEL.casefold() in names else ""
 
 
 def nightly_slot_refusal(tier: str) -> str | None:
@@ -3882,18 +3913,21 @@ def admission_waiters(capacity_dir: Path, skip_pid: int = 0) -> list[dict[str, A
             wants = [str(kind) for kind in data.get("wants") or [] if isinstance(kind, str)]
         except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
             continue  # OverflowError: a since too large for a float (an integer past 1e308)
-        tier = data.get("tier") if data.get("tier") in (TIER_NIGHTLY, TIER_DEV) else ""
+        tier = data.get("tier") if data.get("tier") in (TIER_NIGHTLY, TIER_DEV, TIER_STACK) else ""
         waiters.append({"pid": pid, "since": since, "wants": wants, "who": str(data.get("who") or "")[:200],
                         "tier": tier})
     return sorted(waiters, key=lambda waiter: (waiter["since"], waiter["pid"]))
 
 
 def admission_rank(tier: str, since: float, pid: int, now: float) -> tuple[int, float, int]:
-    """A waiter's place in the queue (FEED_FIRST): nightly jobs first; then DEV compiles and other jobs that have
-    waited FEED_JUMP_S; then the rest; each by arrival. One total order, so no two waiters each wait for the other."""
+    """A waiter's place in the queue (FEED_FIRST): nightly jobs first; then stack-blocker PR jobs; then DEV compiles
+    and other jobs that have waited FEED_JUMP_S; then the rest; each by arrival. One total order, so no two waiters
+    each wait for the other."""
     if tier == TIER_NIGHTLY:
         return (0, since, pid)
-    return (1 if tier == TIER_DEV or now - since >= FEED_JUMP_S else 2, since, pid)
+    if tier == TIER_STACK:
+        return (1, since, pid)
+    return (2 if tier == TIER_DEV or now - since >= FEED_JUMP_S else 3, since, pid)
 
 
 def fair_turn(capacity_dir: Path, needs: set[str], since: float, tier: str = "",
@@ -3914,7 +3948,8 @@ def fair_turn(capacity_dir: Path, needs: set[str], since: float, tier: str = "",
         if shared:
             who = waiter["who"] or "pid " + str(waiter["pid"])
             if (waiter["since"], waiter["pid"]) > (since, os.getpid()) or waiter["tier"] == TIER_NIGHTLY != tier:
-                kind = "a nightly job" if waiter["tier"] == TIER_NIGHTLY else "a DEV compile"
+                kind = {TIER_NIGHTLY: "a nightly job", TIER_STACK: "a stack-blocker PR job"}.get(waiter["tier"],
+                                                                                                 "a DEV compile")
                 return f"capacity: {who} is {kind} and goes first here for {', '.join(sorted(shared))}"
             return f"capacity: {who} has waited longer here for {', '.join(sorted(shared))}"
     return None
@@ -8387,7 +8422,8 @@ def main(argv: list[str] | None = None) -> int:
             cap = slot_capacity_wait(cap, args.dev_compile_runner)
             tier = job_tier(os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REF"),
                             os.environ.get("GITHUB_REPOSITORY"), event, os.environ.get("GITHUB_WORKFLOW_REF"),
-                            os.environ.get("GITHUB_JOB"))
+                            os.environ.get("GITHUB_JOB")) or stack_blocker_tier(
+                os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REPOSITORY"), event)
             nightly_bound = nightly_capacity_wait(tier, os.environ.get("GITHUB_EVENT_NAME"),
                                                   os.environ.get("GITHUB_REF"), os.environ.get("GITHUB_JOB"),
                                                   job_workflow(), os.environ.get("GITHUB_RUN_ATTEMPT"))
@@ -8404,6 +8440,9 @@ def main(argv: list[str] | None = None) -> int:
                       f"unit while it waits, and it keeps no idle reserve"
                       + (f"; it waits {nightly_bound:g} s at most, then is refused so its re-run takes Blacksmith"
                          if nightly_bound is not None else ""), flush=True)
+            elif tier == TIER_STACK:
+                print(f"{PREFIX}: a stack-blocker PR job (label {STACK_BLOCKER_LABEL}): it goes ahead of every other "
+                      "PR, side and DEV job waiting here for capacity, right after nightly jobs", flush=True)
             elif tier:
                 print(f"{PREFIX}: a DEV compile: it goes ahead of PR jobs waiting here for capacity "
                       f"(those waiting under {FEED_JUMP_S / 60:g} min)", flush=True)

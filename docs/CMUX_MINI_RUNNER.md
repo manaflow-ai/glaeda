@@ -587,6 +587,13 @@ no other admission takes a unit, every other runner's gate on the mini holds,
 and it keeps no reserve. NEXT's app build on attempt 1 still waits at most
 `NIGHTLY_CAPACITY_WAIT_S`, then is refused so its re-run takes Blacksmith.
 
+Right after nightly jobs in that line come stack-blocker jobs: a `manaflow-ai/cmux`
+pull request job (same repository, not a fork) whose PR carries the `stack-blocker` label
+in the job's own event payload (`GITHUB_EVENT_PATH`, no API call). They go ahead of DEV
+compiles and every other PR or side job, by arrival among themselves, but unlike a nightly
+job they hold no other admission, hold no gate and keep the idle reserves. A label added
+after the run was created reaches the hook with the PR's next run.
+
 `glaeda-macos-<major>` is observed on the mini, not declared, so a fleet that straddles an
 OS upgrade can route a job to one macOS (`runs-on: [glaeda-std-xcode-26.6, glaeda-macos-27]`).
 It is never the bare `macos-<N>`: that is GitHub-hosted vocabulary, and cmux's workflows check

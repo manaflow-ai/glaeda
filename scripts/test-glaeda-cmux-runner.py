@@ -3803,13 +3803,76 @@ time.sleep(60)
         waiting(now - 5, "boss")
         self.assertIsNone(hook.fair_turn(capacity, {"units"}, now - 60))
         # one total order: of any two waiters, exactly one is ahead
-        tiers = ("", dev, nightly)
+        tiers = ("", dev, nightly, hook.TIER_STACK)
         for a in tiers:
             for b in tiers:
                 for age_a, age_b in ((60, 5), (bound + 60, 5), (bound + 60, bound + 5), (5, 60), (5, bound + 60)):
                     ra = hook.admission_rank(a, now - age_a, 10, now)
                     rb = hook.admission_rank(b, now - age_b, 11, now)
                     self.assertNotEqual(ra < rb, rb < ra, (a, age_a, b, age_b))
+
+    def test_stack_blocker_tier_ranks_right_after_nightly(self) -> None:
+        capacity = self.dir / "capacity"
+        capacity.mkdir()
+        marker = capacity / f"{hook.ADMIT_WANT}{os.getppid()}"
+        now = time.time()
+        nightly, dev, stack = hook.TIER_NIGHTLY, hook.TIER_DEV, hook.TIER_STACK
+
+        def waiting(since: float, tier: str | None = None) -> None:
+            want: dict = {"since": since, "wants": ["units"]}
+            if tier:
+                want["tier"] = tier
+            marker.write_text(json.dumps(want))
+
+        waiting(now - 5, stack)  # a stack-blocker job that came later goes ahead of PR jobs and DEV compiles
+        self.assertEqual([w["tier"] for w in hook.admission_waiters(capacity)], [stack])
+        self.assertIn("is a stack-blocker PR job and goes first here for units",
+                      hook.fair_turn(capacity, {"units"}, now - 60))
+        self.assertIn("is a stack-blocker PR job", hook.fair_turn(capacity, {"units"}, now - hook.FEED_JUMP_S - 60))
+        self.assertIn("is a stack-blocker PR job", hook.fair_turn(capacity, {"units"}, now - 60, dev))
+        self.assertIsNone(hook.fair_turn(capacity, {"units"}, now - 60, nightly, True), "nightly still goes first")
+        self.assertIsNone(hook.fair_turn(capacity, set(), now - 60, "", True),
+                          "unlike a nightly waiter it holds no unit it does not want")
+        self.assertIn("has waited longer", hook.fair_turn(capacity, {"units"}, now, stack), "stack: arrival order")
+        waiting(now - 5, nightly)
+        self.assertIn("is a nightly job", hook.fair_turn(capacity, {"units"}, now - 60, stack))
+        rank = [hook.admission_rank(t, now - 5, 1, now) for t in (nightly, stack, dev, "")]
+        self.assertEqual(rank, sorted(rank))
+        self.assertLess(hook.admission_rank(stack, now - 5, 1, now),
+                        hook.admission_rank("", now - hook.FEED_JUMP_S - 60, 2, now), "ahead of a PR job past the jump")
+
+    def test_stack_blocker_tier_reads_the_pull_request_label(self) -> None:
+        repo = {"full_name": "manaflow-ai/cmux"}
+        fork = {"full_name": "someone/cmux"}
+
+        def event(labels: list, head: dict = repo) -> dict:
+            return {"pull_request": {"labels": labels, "head": {"repo": head}, "base": {"repo": repo}},
+                    "repository": repo}
+
+        label = [{"name": hook.STACK_BLOCKER_LABEL}]
+        tier = hook.stack_blocker_tier
+        self.assertEqual(tier("pull_request", "manaflow-ai/cmux", event(label)), hook.TIER_STACK)
+        self.assertEqual(tier("pull_request", "Manaflow-AI/cmux", event([{"name": "x"}, *label])), hook.TIER_STACK)
+        for name in ("Stack-Blocker", "STACK-BLOCKER"):  # GitHub label names are case-insensitive
+            with self.subTest(name=name):
+                self.assertEqual(tier("pull_request", "manaflow-ai/cmux", event([{"name": name}])), hook.TIER_STACK)
+        self.assertEqual(tier("pull_request", "manaflow-ai/cmux", event([{"name": None}, {"name": 3}])), "")
+        for name, args in (("no label", ("pull_request", "manaflow-ai/cmux", event([{"name": "full-ci"}]))),
+                           ("a fork", ("pull_request", "manaflow-ai/cmux", event(label, fork))),
+                           ("a push", ("push", "manaflow-ai/cmux", event(label))),
+                           ("another repo", ("pull_request", "manaflow-ai/cmuxterm-hq", event(label))),
+                           ("no payload", ("pull_request", "manaflow-ai/cmux", None)),
+                           ("labels not a list",
+                            ("pull_request", "manaflow-ai/cmux", event("stack-blocker"))),  # type: ignore
+                           ("label not an object", ("pull_request", "manaflow-ai/cmux", event(["stack-blocker"]))),
+                           ("no head", ("pull_request", "manaflow-ai/cmux",
+                                        {"pull_request": {"labels": label, "base": {"repo": repo}}}))):
+            with self.subTest(name):
+                self.assertEqual(tier(*args), "")
+        # a nightly job keeps its own tier: job_tier answers first in job-started
+        self.assertEqual(hook.job_tier("pull_request", "refs/pull/1/merge", "manaflow-ai/cmux", event(label),
+                                       "manaflow-ai/cmux/.github/workflows/cmux-next.yml@refs/pull/1/merge",
+                                       "swift-test"), "")
 
     def test_a_waiting_job_marks_its_tier(self) -> None:
         capacity = self.dir / "capacity"
