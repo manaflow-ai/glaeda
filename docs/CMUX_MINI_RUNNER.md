@@ -1071,6 +1071,13 @@ Hook classes:
   plus the per-mini `simulator` token: they
   reuse, erase and boot named devices in the user's one CoreSimulator service). A job refused only for
   that token waits for it at job start, as any capacity wait does.
+- A build worker's `simulator` ci-step (cmuxterm-hq's `scripts/ci/cmux-next-ios-sim.sh` steps) is admitted only on
+  a mini where a runner registered with `glaeda-ios-sim` (its install receipt says so). It takes the same
+  `simulator` token, plus an isolated build's 4 units because it also builds the app, and holds them until
+  release. So it never runs beside a PR simulator job or glaeda-disk's device-data erase. `fits` reports
+  `simulator_host`, and the worker advertises its `simulator` label by it. The worker is a system LaunchDaemon,
+  and simctl run from there finds no CoreSimulatorService. So the worker starts the step through
+  `launchctl asuser` in the build user's domain, where the runners' one service runs.
 - `validate` (ios-streamed-validate) stays on Blacksmith. It binds fixed ports, restarts a local Postgres
   under /tmp, changes the GUI session (open, launchctl setenv, system dark mode) and writes credentials
   to `$HOME`.

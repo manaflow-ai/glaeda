@@ -465,7 +465,10 @@ CLASS_COST: dict[str, tuple[int, tuple[str, ...]]] = {
     "compile": (5, ("persistent-dd", "root")), "gui": (1, ("gui", "root")), "product": (1, ("gui", "root")),
     "compile-gui": (4, ("root",)), "gui-step": (1, ("gui", "root")),
     "isolated": (4, ()), "simulator": (1, ("simulator",)), "light": (2, ()), "seed": (5, ()),
-    "fast": (0, FAST_TOKENS), "exclusive": (EXCLUSIVE_UNITS, (*FAST_TOKENS, "gui"))}
+    "fast": (0, FAST_TOKENS), "exclusive": (EXCLUSIVE_UNITS, (*FAST_TOKENS, "gui")),
+    # a simulator ci-step (STEP_COST_CLASS): it builds the app it then runs (cmux-next-ios-sim.sh), so it costs an
+    # isolated build's units beside the simulator token
+    "simulator-step": (4, ("simulator",))}
 # A job's own cost in cores, where it is far enough from its class's: keyed by (workflow file, job id) for the home
 # repository, (repository, workflow file, job id) for a guest. Only units change: the job keeps its class's tokens
 # (cli-regressions is a compile at 0.16 cores and still holds persistent-dd and a root). Same window as CLASS_COST;
@@ -4497,9 +4500,21 @@ def release_holder(pid_file: Path) -> str:
 # worker's pid; `release` lets them go when the step ends. A step's holder is keyed by its job key, as a runner
 # job's is by RUNNER_NAME, so several steps hold at once beside the runners' jobs.
 # Steps take no canonical root, persistent-dd or gui token yet: those classes carry per-job setup that job-started
-# does (settle_root, testmanagerd, the console check) and move behind admit with the compile phase. No simulator
-# either: the worker is a system LaunchDaemon, outside the console user's CoreSimulator service.
-STEP_CLASSES = ("light", "isolated")
+# does (settle_root, testmanagerd, the console check) and move behind admit with the compile phase.
+# simulator (scripts/cmux-next-ios-sim.sh steps) takes the mini's one simulator token, as its runners' ios-simulator
+# and screenshots jobs do, so a step never runs simulators beside a PR simulator job or glaeda-disk's device-data
+# erase, and holds it until release. Only on a simulator host (simulator_host): a runner here registered with
+# glaeda-ios-sim, which the installer gives only to an ios-simulators host with every declared runtime verified.
+# The worker is a system LaunchDaemon; simctl there finds no CoreSimulatorService ("Unable to lookup
+# com.apple.CoreSimulator.CoreSimulatorService in the bootstrap"), so the worker starts a simulator step through
+# `launchctl asuser` into the build user's domain, where the runners' one service lives (cmuxterm-hq worker
+# gui_session.go), and asks for the class only while that works.
+STEP_CLASSES = ("light", "isolated", "simulator")
+SIMULATOR_STEP_CLASS = "simulator"
+# The CLASS_COST entry a ci-step class is admitted at, where it is not its own: a simulator step compiles the app as
+# well as running it, unlike the runners' ios-simulator jobs, whose build is its own isolated job.
+STEP_COST_CLASS = {SIMULATOR_STEP_CLASS: "simulator-step"}
+IOS_SIM_RUNNER_LABEL = "glaeda-ios-sim"  # glaeda_fleet_labels.IOS_SIM_LABEL (a test keeps them equal)
 STEP_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,119}")
 STEP_ADMISSION = "glaeda-ci-step-admission/v1"
 STEP_FITS = "glaeda-ci-step-fits/v1"
@@ -4519,6 +4534,23 @@ def step_refusal(home: Path | None = None) -> str | None:
     leases no step here and the worker's heartbeat shows why (`refusal`), and admit refuses. Steps the controller
     leased to a mini that could not run cargo failed in seconds and were leased to it again."""
     return fleet_toolchain_missing(home)
+
+
+def simulator_host(state_dir: Path) -> bool:
+    """Whether a runner on this mini registered with IOS_SIM_RUNNER_LABEL: its install receipt (state_dir/receipt.json,
+    or instance-N/receipt.json) lists it. The installer adds the label only for the ios-simulators role with every
+    declared runtime build present (glaeda_fleet_labels), and keeps it through a simctl hiccup, so a step takes the
+    simulator class exactly where the mini's PR simulator jobs run. An unreadable receipt counts as no label."""
+    for receipt in sorted([state_dir / "receipt.json", *state_dir.glob("instance-*/receipt.json")]):
+        try:
+            doc = json.loads(receipt.read_text())
+        except (OSError, ValueError):
+            continue
+        registration = doc.get("registration") if isinstance(doc, dict) else None
+        labels = registration.get("labels") if isinstance(registration, dict) else None
+        if isinstance(labels, list) and IOS_SIM_RUNNER_LABEL in labels:
+            return True
+    return False
 
 
 def step_fits(capacity_dir: Path, total: int, compile_slots: int, roots: int, host_lock: str, reservation: str,
@@ -4559,8 +4591,11 @@ def step_fits(capacity_dir: Path, total: int, compile_slots: int, roots: int, ho
         for waiter in admission_waiters(capacity_dir):
             waited |= set(waiter["wants"]) | ({"units"} if waiter["tier"] == TIER_NIGHTLY else set())  # FEED_FIRST
         fits = []
+        simulators = simulator_host(state_dir)
         for klass in STEP_CLASSES:
-            need, tokens = CLASS_COST[klass]
+            if klass == SIMULATOR_STEP_CLASS and not simulators:
+                continue
+            need, tokens = CLASS_COST[STEP_COST_CLASS.get(klass, klass)]
             need = min(need, total)
             if units < need + reserve_for(reserved, need, total) or waited & {*tokens, "units"}:  # fair_turn
                 continue
@@ -4591,9 +4626,12 @@ def step_admit(klass: str, key: str, watch_pid: int, host_lock: str, reservation
     why = reservation_refusal(reservation, time.time()) or step_refusal()
     if why:
         return refused(why)
+    if klass == SIMULATOR_STEP_CLASS and not simulator_host(state_dir):
+        return refused(f"no runner on this mini is registered with {IOS_SIM_RUNNER_LABEL}: not a simulator host")
     taken: dict[str, Any] = {}
     held, note = take_capacity(host_lock, capacity_dir, total, f"ci-step {key}", watch_pid, state_dir,
-                               compile_slots, roots, klass=klass, taken_out=taken, one_holder=True)
+                               compile_slots, roots, klass=STEP_COST_CLASS.get(klass, klass), taken_out=taken,
+                               one_holder=True)
     if not held:
         return refused(note)
     holder = holder_file(state_dir)
@@ -8316,7 +8354,10 @@ def main(argv: list[str] | None = None) -> int:
                                         args.canonical_roots, args.host_lock, args.reservation, args.state_dir,
                                         time.time())
         unknown = isinstance(fits, Unknown)
-        answer: dict[str, Any] = {"schema": STEP_FITS, "fits": [] if unknown else fits, "unknown": unknown}
+        answer: dict[str, Any] = {"schema": STEP_FITS, "fits": [] if unknown else fits, "unknown": unknown,
+                                  # whether simulator steps belong here at all, apart from room now: the build worker
+                                  # advertises its simulator label by it, so a taken token reads as "no room"
+                                  "simulator_host": simulator_host(args.state_dir)}
         if why:
             answer["refusal"] = why[:2000]  # every tool, with its paths
             print(f"{PREFIX}: fits: {why}", file=sys.stderr, flush=True)

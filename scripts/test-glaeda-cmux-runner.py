@@ -3837,7 +3837,7 @@ time.sleep(60)
         fits = (capacity, 14, 1, 1, os.fspath(self.dir / "no-fleet" / "host.lock"),
                 os.fspath(self.dir / "no-reservation"), self.dir / "state", now)
         waiting(now - 5, None, ("root",))  # a PR job waiting for a root leaves unit-only ci-steps fitting
-        self.assertEqual(hook.step_fits(*fits), list(hook.STEP_CLASSES))
+        self.assertEqual(hook.step_fits(*fits), ["light", "isolated"], "no glaeda-ios-sim runner here: no simulator")
         waiting(now - 5, nightly, ("root",))  # an older nightly job waiting for a token holds a later one's units too
         self.assertIn("has waited longer here for units",
                       hook.fair_turn(capacity, {"persistent-dd"}, now, nightly, True))
@@ -4414,6 +4414,56 @@ time.sleep(60)
                 self.ci_step("release", "--job-key", key)
         self.assertTrue(self.lock_free(), "every step holder let go")
 
+    def sim_receipt(self, labels: list[str], instance: int = 3) -> None:
+        """An install receipt for runner instance N registered with these labels, as glaeda-cmux-runner writes it."""
+        path = self.dir / "state" / f"instance-{instance}" / "receipt.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"registration": {"labels": labels}}))
+
+    def test_ci_step_simulator_takes_the_runners_simulator_token(self) -> None:
+        """A simulator ci-step (cmux-next-ios-sim.sh) fits only on a mini whose runner registered with glaeda-ios-sim,
+        takes the one simulator token its runners' ios-simulator and screenshots jobs take, and holds it until
+        release: no PR simulator job and no second simulator step runs beside it, and it never starts beside one."""
+        self.assertEqual(hook.IOS_SIM_RUNNER_LABEL, fleet_labels.IOS_SIM_LABEL)
+        self.fleet()
+        worker = self.ci_worker()
+        watch = ("--watch-pid", str(worker.pid))
+        self.sim_receipt(["glaeda-mini", "glaeda-side-std-xcode-26.6"])
+        (self.dir / "state" / "receipt.json").write_text("{not json")
+        self.assertEqual(self.fits(), ["light", "isolated"], "no runner here registered with glaeda-ios-sim")
+        self.assertFalse(self.ci_step("fits")[1]["simulator_host"])
+        status, refused = self.ci_step("admit", "--class", "simulator", "--job-key", "sim-0-1", *watch)
+        self.assertEqual(status, 1, refused)
+        self.assertIn("not a simulator host", refused["reason"])
+        self.sim_receipt(["glaeda-mini", "glaeda-side-std-xcode-26.6", "glaeda-ios-sim"], instance=4)
+        self.assertEqual(self.fits(), ["light", "isolated", "simulator"])
+        self.assertTrue(self.ci_step("fits")[1]["simulator_host"])
+        try:
+            status, first = self.ci_step("admit", "--class", "simulator", "--job-key", "sim-1-1", *watch)
+            self.assertEqual((status, first["class"], first["units"], first["tokens"]),
+                             (0, "simulator", 4, ["simulator"]), "it builds the app too: an isolated build's units")
+            self.assertEqual(self.fits(), ["light"], "the simulator token and four units are taken")
+            status, second = self.ci_step("admit", "--class", "simulator", "--job-key", "sim-2-1", *watch)
+            self.assertEqual(status, 1, "one simulator step per mini")
+            self.assertIn("simulator", second["reason"])
+            ios = {"GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/test-ios.yml@refs/heads/main"}
+            pr_sim = self.job("ios-simulator", "s0", 7, None, env=ios)
+            self.assertEqual(pr_sim.returncode, 1, "a PR simulator job waits for the step's token")
+            self.assertIn("the simulator token is taken", pr_sim.stdout)
+            self.finish("s0")
+            self.ci_step("release", "--job-key", "sim-1-1")
+            self.assertEqual(self.fits(), ["light", "isolated", "simulator"], "released with the step")
+            pr_sim = self.job("ios-simulator", "s0", 7, None, env=ios)
+            self.assertEqual(pr_sim.returncode, 0, pr_sim.stdout)
+            self.assertEqual(self.fits(), ["light", "isolated"], "a PR simulator job holds the token: no step there")
+            status, beside = self.ci_step("admit", "--class", "simulator", "--job-key", "sim-3-1", *watch)
+            self.assertEqual(status, 1, beside)
+        finally:
+            self.finish("s0")
+            for key in ("sim-0-1", "sim-1-1", "sim-2-1", "sim-3-1"):
+                self.ci_step("release", "--job-key", key)
+        self.assertTrue(self.lock_free(), "every step holder let go")
+
     def test_ci_steps_leave_an_idle_gui_runner_its_unit(self) -> None:
         """A ci-step is never the gui runner's job: fits and admit leave the reserved unit free as runner jobs do."""
         self.fleet()
@@ -4515,7 +4565,7 @@ time.sleep(60)
             self.assertEqual(self.fits(), ["light"], "releasing one key leaves the other's holder")
         finally:
             self.ci_step("release", "--job-key", "iso-1-1")
-        for bad in (("--class", "compile", "--job-key", "k-1-1"), ("--class", "simulator", "--job-key", "k-1-1"),
+        for bad in (("--class", "compile", "--job-key", "k-1-1"), ("--class", "gui-step", "--job-key", "k-1-1"),
                     ("--class", "light", "--job-key", "../k"), ("--class", "light")):
             with self.subTest(bad=bad):
                 result = self.run_hook("admit", None, None, "--capacity-units", "3", *bad, *watch)
