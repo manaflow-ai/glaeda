@@ -171,6 +171,16 @@ Each run checks, as the runner user and without sudo:
                                      reports "not probed: the Tailscale tunnel is down"), its probe is not kept and
                                      it is not rerouted (a broken tunnel, not the route, is why it does not answer),
                                      so it never acts in the same run as tailscale_no_route's restart.
+  claude_missing                     a fleet mini has no Claude Code (~/.local/bin/claude), so a capture there has no
+                                     real agent and claude_route is never checked (cmux8s, 9s, 10s, 12s, 13s, 14,
+                                     2026-10-28: only four minis could run a real-Claude capture). Healed as the
+                                     runner user the way Anthropic's install.sh does it: the channel config/claude-
+                                     routes.json names (claude_code.channel) resolves to a version, the binary is
+                                     downloaded from that version's manifest and kept only when its sha256 matches,
+                                     then `claude install VERSION` links ~/.local/bin/claude. No login is made: the
+                                     next pass's claude_route routes it through a fleet gateway. Never on a personal
+                                     Mac. cmuxterm-hq build-fleet/capture-host admits no capture lease on a host whose
+                                     report has it, as for claude_route.
 
 A heal (other than tailscale_no_route's, above) is tried at most every HEAL_EVERY_S and HEAL_TRIES times a day per finding, counting heals that worked
 but did not last (a runner that exits again), so nothing loops. Each finding reads
@@ -318,6 +328,15 @@ CLAUDE_ROUTES = "claude-routes.json"  # config/, beside this script or as mini-s
 CLAUDE_PROBE_S = 60  # a route that does not answer hangs `claude -p` in its retries until it is killed
 CLAUDE_PROMPT = "Reply with exactly PONG"
 CLAUDE_PERSONAL = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")  # a person's login: it overrides the route
+CLAUDE_INSTALL_S = 600  # one download (about 250 MB) and `claude install`
+CLAUDE_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?")  # install.sh's shape, prereleases too
+
+
+def install_env(environ: dict[str, str]) -> dict[str, str]:
+    """The environment `claude install` runs with: no Anthropic or Claude Code credential or route at all (the
+    install needs none; ANTHROPIC_AUTH_TOKEN is a credential too, even where it is the gateway placeholder)."""
+    return {k: v for k, v in environ.items()
+            if not k.startswith(("ANTHROPIC_", "CLAUDE_CODE_")) and k not in CLAUDE_PERSONAL}
 
 # tailscale_no_route's self-heal (Leo, 2026-10-21): a restart of Tailscale, only on an idle CI runner mini, at most
 # once every TAILSCALE_RESTART_EVERY_S per mini, never on cmux-lawrence, the AWS Macs or a person's Mac.
@@ -898,6 +917,81 @@ class Mini:
         """The runner user's Claude Code (the capture jobs' agent), or None where it is not installed."""
         path = self.home / ".local/bin/claude"
         return path if os.access(path, os.X_OK) else None
+
+    def install_claude(self, source: dict[str, Any]) -> tuple[bool, str]:
+        """Claude Code for the runner user, as install.sh does it: SOURCE's channel (config/claude-routes.json
+        claude_code) names a version, its manifest the platform binary's sha256; a binary that does not match is
+        deleted unrun. `claude install VERSION` then links ~/.local/bin/claude, with no credential in its
+        environment (install_env). Logs in nobody. Every request stays on https (a redirect elsewhere is refused),
+        and the download is removed on every path; one that cannot be removed fails the heal."""
+        import hashlib  # noqa: PLC0415
+        import urllib.error  # noqa: PLC0415
+        import urllib.request  # noqa: PLC0415
+        base, channel = str(source.get("downloads") or ""), str(source.get("channel") or "")
+        if not base.startswith("https://") or not re.fullmatch(r"stable|latest", channel):
+            return False, "config/claude-routes.json claude_code needs an https downloads URL and channel stable or latest"
+        machine = os.uname().machine
+        platform = {"arm64": "darwin-arm64", "x86_64": "darwin-x64"}.get(machine) if sys.platform == "darwin" else None
+        if platform is None:
+            return False, f"no Claude Code build for {sys.platform}/{machine} here"
+
+        class HttpsOnly(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+                if not str(newurl).startswith("https://"):
+                    raise urllib.error.URLError(f"refused a redirect off https to {str(newurl)[:80]}")
+                return super().redirect_request(req, fp, code, msg, headers, newurl)
+        opener = urllib.request.build_opener(HttpsOnly)
+
+        def fetch(url: str) -> bytes:
+            with opener.open(url, timeout=60) as r:
+                return r.read()
+        folder = self.home / ".local/share/glaeda/claude-install"
+        made: list[Path] = []  # the download, once it exists
+
+        def attempt() -> tuple[bool, str] | tuple[int, str, str]:
+            version = fetch(f"{base}/{channel}").decode().strip()
+            if not CLAUDE_VERSION.fullmatch(version):
+                return False, f"the {channel} channel named no version"
+            manifest = json.loads(fetch(f"{base}/{version}/manifest.json"))
+            platforms = manifest.get("platforms") if isinstance(manifest, dict) else None
+            entry = platforms.get(platform) if isinstance(platforms, dict) else None
+            want = entry.get("checksum") if isinstance(entry, dict) else None
+            if not isinstance(want, str) or not re.fullmatch(r"[0-9a-f]{64}", want):
+                return False, f"the {version} manifest has no {platform} checksum"
+            folder.mkdir(parents=True, exist_ok=True)
+            binary = folder / f"claude-{version}-{platform}"
+            made.append(binary)
+            digest = hashlib.sha256()
+            with opener.open(f"{base}/{version}/{platform}/claude", timeout=CLAUDE_INSTALL_S) as r, \
+                    open(binary, "wb") as out:
+                for chunk in iter(lambda: r.read(1 << 20), b""):
+                    digest.update(chunk)
+                    out.write(chunk)
+            if digest.hexdigest() != want:
+                return False, f"Claude Code {version} for {platform} did not match its manifest's sha256; not run"
+            binary.chmod(0o755)
+            code, out_text = sh([os.fspath(binary), "install", version], timeout=CLAUDE_INSTALL_S,
+                                env=install_env(dict(os.environ)),
+                                cwd=tempfile.gettempdir())
+            return code, out_text, version
+        try:
+            result = attempt()
+        except Exception as e:  # noqa: BLE001  any transport, disk or shape failure is a failed heal, never a crash
+            result = (False, f"Claude Code download failed: {type(e).__name__}: {e}"[:200])
+        for path in made:
+            with contextlib.suppress(FileNotFoundError):
+                try:
+                    path.unlink()
+                except OSError as e:  # a download left behind (a mismatched one above all) is never healed
+                    return False, f"could not remove the download {path.name}: {e}"[:200]
+        if len(result) == 2:
+            return result  # type: ignore[return-value]
+        code, out_text, version = result  # type: ignore[misc]
+        if code != 0:
+            return False, f"`claude install {version}` exit {code}: {' '.join(out_text.split())[-160:]}"
+        if self.claude_bin() is None:
+            return False, f"`claude install {version}` left no ~/.local/bin/claude"
+        return True, f"installed Claude Code {version} ({platform}, sha256 checked) at ~/.local/bin/claude"
 
     def claude_routes(self) -> dict[str, Any]:
         """config/claude-routes.json: the repo's or release's beside this script, else the copy mini-setup installs."""
@@ -2044,6 +2138,17 @@ def claude_route_settings(mini: Mini) -> tuple[list[str], dict[str, Any]]:
     return routes, env if isinstance(env, dict) else {}
 
 
+def check_claude_missing(mini: Mini) -> list[dict[str, Any]]:
+    """A fleet mini whose config names a Claude Code source has Claude Code: a capture's real agent runs there."""
+    if mini.claude_bin() is not None or not mini.fleet_host():  # a personal Mac's tools are its owner's
+        return []
+    if not isinstance(mini.claude_routes().get("claude_code"), dict):
+        return []
+    return [finding("claude_missing", "error", "no ~/.local/bin/claude: a capture's real agent cannot run here",
+                    "pending", "installed from config/claude-routes.json claude_code (sha256 checked); until then "
+                    "capture-host admits no capture lease here")]
+
+
 def check_claude_route(mini: Mini, now: float, remember: bool = True,
                        tunnel_down: bool = False) -> list[dict[str, Any]]:
     """Claude Code goes through a fleet route that answers a real `claude -p`, checked once per probe_every_s
@@ -2110,6 +2215,19 @@ def heal_claude_route(mini: Mini, f: dict[str, Any]) -> tuple[bool, str]:
         failed.append(f"{url}: {detail}")
     return False, "no fleet route answered: " + "; ".join(failed)
 
+
+
+def heal_claude_missing(mini: Mini, f: dict[str, Any]) -> tuple[bool, str]:
+    """Install Claude Code, then route it at once: the finding is healed only when the new Claude goes through a
+    fleet route that answers, so capture-host never admits a host whose Claude is installed but unrouted."""
+    ok, what = mini.install_claude(mini.claude_routes().get("claude_code") or {})
+    if not ok:
+        return False, what
+    try:
+        routed, how = heal_claude_route(mini, {"evidence": "installed just now"})
+    except Exception as e:  # noqa: BLE001  a settings or probe-cache write that fails is a failed heal, kept
+        routed, how = False, f"{type(e).__name__}: {e}"[:160]
+    return routed, f"{what}; {how}" if routed else f"{what}, but not routed yet: {how}"
 
 
 def heal_testmanagerd(mini: Mini, f: dict[str, Any]) -> tuple[bool, str]:
@@ -2632,6 +2750,7 @@ HEALS: dict[str, tuple[Callable[[Mini, dict[str, Any]], tuple[bool, str]], int]]
     "leaked_test_apps": (lambda mini, _f: heal_leaked_test_apps(mini), 1),
     "node_toolchain_missing": (heal_node_toolchain, 1),
     "claude_route": (heal_claude_route, 1),
+    "claude_missing": (heal_claude_missing, 1),
 }
 
 
@@ -2659,8 +2778,8 @@ def iso(t: float) -> str:
 
 def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = STATE,
         report_path: Path = REPORT, heal_ok: bool = True, runner: bool = True) -> dict[str, Any]:
-    """One pass. runner=False is a host with no glaeda runner (a capture-only mini): only its Claude route and
-    runner_unmanaged."""
+    """One pass. runner=False is a host with no glaeda runner (a capture-only mini): only its Claude Code (missing,
+    route) and runner_unmanaged."""
     now = time.time() if now is None else now
     state = load_json(state_path) if apply else {}
     seen: dict[str, Any] = state.get("seen") or {}
@@ -2681,14 +2800,18 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
                  + check_checkout_steps(mini, now, state_path.parent / CHECKOUT_CACHE, apply)
                  + check_disk_accounting(mini) + check_disk_pass(mini, now) + check_git_mirror(mini, now)
                  + check_daemon_heal(mini) + check_ota(mini, now)
-                 + check_claude_route(mini, now, apply and not tunnel_down, tunnel_down))
+                 + check_claude_missing(mini) + check_claude_route(mini, now, apply and not tunnel_down, tunnel_down))
         if apply and mini.tailnet_route_ok:
             clear_restart_failures(restart_state_path(state_path), now)
         tm = check_testmanagerd(mini, now)
         carried = tm is None and "testmanagerd_wedged" in previous  # a test runs, or the log was unreadable: no heal
         found += [previous["testmanagerd_wedged"]] if carried else tm or []
     else:  # no glaeda runner here, yet a hand-made one is still a fault (it may be the only runner on the host)
-        found = check_claude_route(mini, now, apply) + check_foreign_runners(mini)
+        # Its Tailscale findings are not this pass's to report, but a tunnel that is down still holds Claude's
+        # install and reroute here, as on a runner host (a probe through it hangs and spends a try).
+        tunnel_down = any(f["code"] in TUNNEL_DOWN for f in check_tailscale(mini))
+        found = (check_claude_missing(mini) + check_claude_route(mini, now, apply and not tunnel_down, tunnel_down)
+                 + check_foreign_runners(mini))
 
     findings, heals = [], []
     route_healed = False  # heal_tailscale_route ran this pass (it looks after the drain itself)
@@ -2715,9 +2838,10 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
                 continue
             findings.append(f)
             continue
-        if f["code"] == "claude_route" and tunnel_down:
-            f["note"] = (f"not rerouted while the tunnel is down ({', '.join(sorted(TUNNEL_DOWN))}): the route may "
-                         "answer once Tailscale is back")[:300]
+        if f["code"] in ("claude_route", "claude_missing") and tunnel_down:
+            # claude_missing's heal ends in a route probe: neither installs nor reroutes until the tunnel is back
+            f["note"] = (f"not {'rerouted' if f['code'] == 'claude_route' else 'installed'} while the tunnel is down "
+                         f"({', '.join(sorted(TUNNEL_DOWN))}): the route may answer once Tailscale is back")[:300]
             findings.append(f)
             continue
         heal = HEALS.get(f["code"])
@@ -2789,7 +2913,7 @@ def main(argv: list[str] | None = None) -> int:
         # A capture-only mini still runs Claude for its captures: its route is checked and healed, and the
         # report is written where capture-host reads it.
         claude = (run(mini, args.apply, state_path=STATE, report_path=REPORT, heal_ok=not KILL_SWITCH.exists(),
-                      runner=False) if mini.claude_bin() else None)
+                      runner=False) if mini.claude_bin() or check_claude_missing(mini) else None)
         # without Claude there is no report to write, but a hand-made runner is still said
         foreign = check_foreign_runners(mini) if claude is None else []
         if foreign and args.apply:

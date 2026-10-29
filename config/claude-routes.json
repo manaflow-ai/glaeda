@@ -6,5 +6,10 @@
     "http://100.89.225.106:31415"
   ],
   "placeholder": "subrouter",
-  "probe_every_s": 1800
+  "probe_every_s": 1800,
+  "claude_code": {
+    "downloads": "https://downloads.claude.ai/claude-code-releases",
+    "channel": "stable",
+    "note": "Where glaeda-mini-health's claude_missing heal installs Claude Code on a fleet mini that has none: the channel's version, its platform binary kept only when the version's manifest.json sha256 matches (as Anthropic's install.sh does), then `claude install VERSION`. Claude Code updates itself afterwards."
+  }
 }
