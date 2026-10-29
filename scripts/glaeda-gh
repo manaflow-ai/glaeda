@@ -186,6 +186,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -7533,8 +7534,71 @@ def post_line(state: dict) -> str:
     return "; ".join(parts)
 
 
+# The host's public-body guard (leo-workspace tools/public_body_guard.py, next to gh_quota.py where PACE_CLI's link
+# points; GLAEDA_BODY_GUARD overrides): the check the gh shim runs on `gh pr|issue create|comment` and `gh api`
+# writes. A post skips the shim (the daemon writes through REST), so it asks the same guard before it queues: no
+# fleet host, session id or readable agent link in a repo not known private, and an agent's PR ends with its
+# agent-identity footer. On 2026-10-28 ten public cmux PRs named fleet hosts after lanes opened them with
+# `glaeda-gh post pr` (cmuxterm-hq#4946, pattern D). A host without the guard posts as before, as the shim does.
+BODY_GUARD_ENV = "GLAEDA_BODY_GUARD"
+
+
+def body_guard_path() -> Path | None:
+    named = os.environ.get(BODY_GUARD_ENV)
+    if named:
+        return Path(named)
+    try:
+        found = PACE_CLI.resolve().parent / "public_body_guard.py"
+    except OSError:
+        return None
+    return found if found.is_file() else None
+
+
+def body_guard_args(item: dict, body_file: str) -> list[str]:
+    """The gh call this post stands for, as the guard reads gh's arguments (with -R, so no checkout is asked)."""
+    repo = item["repo"]
+    if item["kind"] == "pr":
+        return ["pr", "create", "-R", repo, "--title", item["title"], "--head", item["head"], "--base", item["base"],
+                "--body-file", body_file]
+    if item["kind"] == "review":
+        return ["pr", "review", str(item["number"]), "-R", repo, "--body-file", body_file]
+    return ["issue", "comment", str(item["number"]), "-R", repo, "--body-file", body_file]
+
+
+def body_guard_refusal(item: dict) -> str | None:
+    """The guard's refusal of this post, or None (allowed, or no guard on this host). The guard asks GitHub
+    whether the repo is private (cached an hour); an unknown answer counts as public."""
+    path = body_guard_path()
+    if path is None:
+        return None
+    if not path.is_file():
+        return f"the body guard {path} ({BODY_GUARD_ENV}) is missing"
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("public_body_guard", path)
+    if spec is None or spec.loader is None:
+        return f"the body guard {path} could not be loaded"
+    guard = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(guard)
+    fd, name = tempfile.mkstemp(suffix=".md", prefix="glaeda-post-")
+    try:
+        with os.fdopen(fd, "w") as fh:  # inside the try: a failed write still removes the file
+            fh.write(item["body"])
+        args = body_guard_args(item, name)
+        return guard.refusal(args, os.environ) or guard.footer_refusal(args, os.environ)
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(name)
+
+
 def cmd_post(args: argparse.Namespace) -> int:
     item = post_item(args)
+    try:
+        why = body_guard_refusal(item)
+    except Exception as error:  # noqa: BLE001 - a guard that can't judge the text: nothing is posted unread
+        why = f"the body guard failed ({type(error).__name__}: {error})"
+    if why:
+        print(f"glaeda-gh: not queued: {why}", file=sys.stderr)
+        return 3
     with contextlib.suppress(Exception):
         gh_cache_note_write(str(item.get("repo") or "").lower() or None, time.time())
     write_json(outbox_dir() / f"{item['id']}.json", item)

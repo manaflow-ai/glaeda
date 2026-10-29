@@ -8364,6 +8364,16 @@ class Scripted:
         return status, h, json.dumps(doc).encode()
 
 
+def no_guard(test: unittest.TestCase) -> None:
+    """Run `post` as on a host without the public-body guard, whatever this host has."""
+    env = mock.patch.dict(os.environ, {gg.BODY_GUARD_ENV: ""})
+    pace = mock.patch.object(gg, "PACE_CLI", Path(tempfile.gettempdir()) / "glaeda-test-no-guard" / "gh")
+    env.start()
+    pace.start()
+    test.addCleanup(env.stop)
+    test.addCleanup(pace.stop)
+
+
 class PostTest(unittest.TestCase):
     """`post`: sessions queue writes; the daemon sends them one at a time, paced, and holds on GitHub's
     secondary limit ("was submitted too quickly" refused PR comments and PR creation for four lanes at
@@ -8375,6 +8385,7 @@ class PostTest(unittest.TestCase):
         saved = gg.BASE
         gg.BASE = Path(self.tmp.name) / "gh"
         self.addCleanup(setattr, gg, "BASE", saved)
+        no_guard(self)  # the host's own body guard is PostBodyGuardTest's business
 
     def daemon(self, *answers) -> tuple[Any, Scripted]:
         transport = Scripted(*answers)
@@ -8601,6 +8612,101 @@ class PostTest(unittest.TestCase):
         status = d.tick(now=NOW)
         self.assertEqual(len(t.calls), 1)
         self.assertEqual(status["outbox"], {"queued": 1, "holdUntil": None})
+
+
+class PostBodyGuardTest(unittest.TestCase):
+    """`post` asks the host's public-body guard before it queues, as the gh shim does for `gh pr|issue` writes
+    (cmuxterm-hq#4946: ten public cmux PRs named fleet hosts after `glaeda-gh post pr`)."""
+
+    GUARD = (
+        "import re, subprocess\n"
+        "CALLS = []\n"
+        "def _body(args):\n"
+        "    return open(args[args.index('--body-file') + 1]).read()\n"
+        "def refusal(args, env):\n"
+        "    CALLS.append(list(args))\n"
+        "    repo = args[args.index('-R') + 1]\n"
+        "    if repo.startswith('pub/') and re.search(r'(?<![\\w-])cmux-mini-7(?![\\w-])', _body(args)):\n"
+        "        return 'public-body-guard: refused: ' + repo + ' is public and this text names fleet host cmux-mini-7'\n"
+        "def footer_refusal(args, env):\n"
+        "    if args[:2] == ['pr', 'create'] and 'Agent session:' not in _body(args):\n"
+        "        return 'pr-footer-guard: refused: no footer'\n"
+    )
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        saved = gg.BASE
+        gg.BASE = Path(self.tmp.name) / "gh"
+        self.addCleanup(setattr, gg, "BASE", saved)
+        self.guard = Path(self.tmp.name) / "public_body_guard.py"
+        self.guard.write_text(self.GUARD)
+        env = mock.patch.dict(os.environ, {gg.BODY_GUARD_ENV: str(self.guard)})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def post(self, *argv: str) -> tuple[int, str]:
+        err = io.StringIO()
+        with mock.patch.object(gg, "daemon_running", return_value=True), contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(err):
+            code = gg.main(["post", *argv])
+        return code, err.getvalue()
+
+    def queued(self) -> int:
+        return len(list(gg.outbox_dir().glob("*.json"))) if gg.outbox_dir().is_dir() else 0
+
+    def test_a_comment_naming_a_host_in_a_public_repo_is_refused_and_not_queued(self) -> None:
+        code, err = self.post("comment", "pub/cmux#7", "--body", "built on cmux-mini-7")
+        self.assertEqual(code, 3)
+        self.assertIn("not queued: public-body-guard: refused: pub/cmux is public", err)
+        self.assertEqual(self.queued(), 0)
+
+    def test_the_same_text_in_a_private_repo_or_clean_text_is_queued(self) -> None:
+        self.assertEqual(self.post("comment", "priv/hq#7", "--body", "built on cmux-mini-7")[0], 0)
+        self.assertEqual(self.post("comment", "pub/cmux#7", "--body", "built on the fleet")[0], 0)
+        self.assertEqual(self.queued(), 2)
+
+    def test_reviews_and_prs_are_checked_as_the_gh_calls_they_stand_for(self) -> None:
+        self.assertEqual(self.post("review", "pub/cmux#7", "--body", "cmux-mini-7")[0], 3)
+        code, err = self.post("pr", "pub/cmux", "--head", "h", "--base", "b", "--title", "t", "--body", "x")
+        self.assertEqual(code, 3)
+        self.assertIn("pr-footer-guard", err)
+        self.assertEqual(self.post("pr", "pub/cmux", "--head", "h", "--base", "b", "--title", "t",
+                                   "--body", "x\n\nAgent session: [s](https://cmux.com/deeplink/agent?id=aid-1)")[0], 0)
+        self.assertEqual(self.queued(), 1)
+
+    def test_a_guard_that_breaks_queues_nothing(self) -> None:
+        self.guard.write_text("def refusal(args, env):\n    raise RuntimeError('boom')\n")
+        code, err = self.post("comment", "pub/cmux#7", "--body", "x")
+        self.assertEqual(code, 3)
+        self.assertIn("the body guard failed (RuntimeError: boom)", err)
+        self.guard.unlink()
+        self.assertIn("is missing", self.post("comment", "pub/cmux#7", "--body", "x")[1])
+        self.assertEqual(self.queued(), 0)
+
+    def test_the_body_file_is_removed_even_when_the_write_fails(self) -> None:
+        tmp = Path(self.tmp.name) / "t"
+        tmp.mkdir()
+        with mock.patch.object(gg.tempfile, "tempdir", str(tmp)), \
+                mock.patch.object(gg.os, "fdopen", side_effect=OSError(28, "No space left on device")):
+            code, err = self.post("comment", "pub/cmux#7", "--body", "x")
+        self.assertEqual(code, 3)
+        self.assertIn("No space left on device", err)
+        self.assertEqual(list(tmp.iterdir()), [])
+
+    def test_no_guard_on_the_host_posts_as_before(self) -> None:
+        with mock.patch.dict(os.environ, {gg.BODY_GUARD_ENV: ""}), \
+                mock.patch.object(gg, "PACE_CLI", Path(self.tmp.name) / "nowhere" / "gh"):
+            self.assertEqual(self.post("comment", "pub/cmux#7", "--body", "cmux-mini-7")[0], 0)
+
+    def test_the_args_are_the_gh_calls_the_shim_guards(self) -> None:
+        item = {"repo": "o/r", "kind": "comment", "number": 5}
+        self.assertEqual(gg.body_guard_args(item, "F"), ["issue", "comment", "5", "-R", "o/r", "--body-file", "F"])
+        item.update(kind="review")
+        self.assertEqual(gg.body_guard_args(item, "F"), ["pr", "review", "5", "-R", "o/r", "--body-file", "F"])
+        pr = {"repo": "o/r", "kind": "pr", "title": "T", "head": "h", "base": "b"}
+        self.assertEqual(gg.body_guard_args(pr, "F"), ["pr", "create", "-R", "o/r", "--title", "T", "--head", "h",
+                                                        "--base", "b", "--body-file", "F"])
 
 
 class RiskReceiptPostTest(unittest.TestCase):
@@ -9427,6 +9533,7 @@ class BrokerAnswerCacheTest(BrokerBase):
         self.assertLess(time.monotonic() - started, 10)
 
     def test_a_queued_post_stamps_its_repository(self) -> None:
+        no_guard(self)
         args = mock.Mock(kind="comment", target="O/R#7", body="hi", body_file=None, wait=0, json=False,
                          head=None, base=None, title=None, reviewer=None, event="comment")
         with mock.patch.object(gg, "daemon_running", return_value=False), \
