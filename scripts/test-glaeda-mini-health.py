@@ -3468,6 +3468,26 @@ class UnmanagedServiceTest(unittest.TestCase):
         self.assertEqual(sorted(p.name for d in (self.agents, self.daemons, self.globals) for p in d.iterdir()), before)
         self.assertNotIn("unmanaged_service", health.HEALS)  # report only: no heal exists
 
+    def test_a_plist_launchd_would_not_load_is_no_unmanaged_service(self) -> None:
+        # Review on #1734: any plist dict qualified, even {}, so a fleet-looking file name warned with no job behind it
+        for name, doc in (("ai.manaflow.empty-worker", {}), ("ai.manaflow.label-only-worker",
+                                                             {"Label": "ai.manaflow.label-only-worker"}),
+                          ("ai.manaflow.no-label-worker", {"ProgramArguments": ["/x/worker"]}),
+                          ("ai.manaflow.blank-label-worker", {"Label": " ", "Program": "/x/worker"}),
+                          ("ai.manaflow.empty-args-worker", {"Label": "ai.manaflow.empty-args-worker",
+                                                             "ProgramArguments": []}),
+                          ("ai.manaflow.bad-args-worker", {"Label": "ai.manaflow.bad-args-worker",
+                                                           "ProgramArguments": [7]})):
+            (self.agents / f"{name}.plist").write_bytes(plistlib.dumps(doc))
+        self.assertEqual(self.ids(), [])
+        (self.agents / "ai.manaflow.program-worker.plist").write_bytes(
+            plistlib.dumps({"Label": "ai.manaflow.program-worker", "Program": "/x/worker"}))
+        self.plist(self.daemons, "ai.manaflow.args-worker", ["/x/worker", "--loop"])
+        self.assertEqual(self.ids(), ["unmanaged_service:ai.manaflow.args-worker",
+                                      "unmanaged_service:ai.manaflow.program-worker"])
+        # runner_unmanaged still reads every job, a label-less one by its file name
+        self.assertTrue(any(p.name == "ai.manaflow.no-label-worker.plist" for p, *_ in self.mini.launchd_jobs()))
+
     def test_a_service_that_starts_a_runner_is_runner_unmanaged_not_this(self) -> None:
         old = self.home / "actions-runner"
         old.mkdir()

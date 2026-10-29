@@ -734,11 +734,13 @@ class Mini:
                 out.append({**doc, "dir": name})
         return out
 
-    def launchd_jobs(self) -> list[tuple[Path, str, list[str], str]]:
+    def launchd_jobs(self, strict: bool = False) -> list[tuple[Path, str, list[str], str]]:
         """(plist, label, program words, working directory) for every *.plist in the user's LaunchAgents, /Library's
         LaunchAgents and its LaunchDaemons that reads as a launchd job. The label is launchd's own name for the job
         (its Label), not the file's: a renamed file changes neither way. Read only; a file that is not a plist, or
-        not a dict, says nothing (a .plist.disabled or .retired-* copy is no job)."""
+        not a dict, says nothing (a .plist.disabled or .retired-* copy is no job). With strict, only a dict launchd
+        would load counts: a non-empty string Label and a program (Program, or a non-empty ProgramArguments whose
+        first word is a non-empty string); an empty {} or a label-only stub under a fleet-looking name is no job."""
         out = []
         for folder in (self.home / "Library/LaunchAgents", self.global_agents_dir, self.daemons_dir):
             try:
@@ -752,8 +754,13 @@ class Mini:
                     continue
                 if not isinstance(doc, dict):
                     continue
-                label = str(doc.get("Label") or plist.name[:-len(".plist")])
                 args = doc.get("ProgramArguments")
+                if strict and not (isinstance(doc.get("Label"), str) and doc["Label"].strip()
+                                   and ((isinstance(doc.get("Program"), str) and doc["Program"].strip())
+                                        or (isinstance(args, list) and args and isinstance(args[0], str)
+                                            and args[0].strip()))):
+                    continue
+                label = str(doc.get("Label") or plist.name[:-len(".plist")])
                 words = [str(w) for w in (args if isinstance(args, list) else [])] + [str(doc.get("Program") or "")]
                 out.append((plist, label, [w for w in words if w], str(doc.get("WorkingDirectory") or "")))
         return out
@@ -1872,7 +1879,7 @@ def check_unmanaged_services(mini: Mini) -> list[dict[str, Any]]:
     declared = policy.get("services") if isinstance(policy.get("services"), dict) else {}
     prefixes = tuple(k for k in (policy.get("prefixes") or {}) if isinstance(k, str) and k)
     out = []
-    for plist, label, words, cwd in mini.launchd_jobs():
+    for plist, label, words, cwd in mini.launchd_jobs(strict=True):  # a stub launchd would refuse is no service
         if label.startswith(GLAEDA_LABEL_PREFIX) or RUNNER_AGENT.fullmatch(label) or label in declared \
                 or (prefixes and label.startswith(prefixes)) or not any(m.search(label) for m in match) \
                 or job_starts_runner(words, cwd):
