@@ -50,6 +50,8 @@ What --apply installs (templated for the current user):
     ~/.local/share/glaeda/macos-daemons.json   from config/macos-daemons.json (that desired state and its limits)
     ~/.local/share/glaeda/claude-routes.json   from config/claude-routes.json (the fleet routes glaeda-mini-health keeps
                                                Claude Code on, so captures never wait on an expired personal login)
+    ~/.local/share/glaeda/fleet-services.json  from config/fleet-services.json (the owned launchd services that are not
+                                               glaeda's; glaeda-mini-health reports any other as unmanaged_service)
     ~/.local/bin/glaeda-mini-health            from scripts/glaeda-mini-health (finds what stops a runner mini, heals what
                                                the runner user can, reports the rest for ci-dash; off a runner, only
                                                the Claude route)
@@ -198,6 +200,7 @@ DAEMON_UNITS = frozenset({"glaeda-gh.service"})
 SKILL_SOURCE = REPO / "skills/github-ci-wait/SKILL.md"
 DAEMON_POLICY_SOURCE = REPO / "config/macos-daemons.json"  # desired state of macOS system daemons
 CLAUDE_ROUTES_SOURCE = REPO / "config/claude-routes.json"  # the fleet routes glaeda-mini-health keeps Claude on
+FLEET_SERVICES_SOURCE = REPO / "config/fleet-services.json"  # the owned non-glaeda launchd services (unmanaged_service)
 GH_POLICY_SOURCE = REPO / "config/gh-daemon.json"  # the fleet's glaeda-gh pacing: per-host REST shares
 # glaeda-update runs this command from a release; it sets this so setup never unloads the job running it
 UPDATE_ENV = "GLAEDA_UPDATE_RUNNING"
@@ -1022,6 +1025,11 @@ def claude_routes_path(ctx: Context) -> Path:
     return ctx.home / ".local/share/glaeda/claude-routes.json"
 
 
+def fleet_services_path(ctx: Context) -> Path:
+    """config/fleet-services.json, where glaeda-mini-health reads it."""
+    return ctx.home / ".local/share/glaeda/fleet-services.json"
+
+
 def gh_policy_path(ctx: Context) -> Path:
     """config/gh-daemon.json, where glaeda-gh reads it (every profile: every host may run the daemon)."""
     return ctx.home / ".local/share/glaeda/gh-daemon.json"
@@ -1337,7 +1345,8 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
 def plan_hygiene_tools(ctx: Context) -> list[dict[str, Any]]:
     """The macOS daemon policy and glaeda-worktree-reclaim: the parts of a hygiene install beyond the scripts."""
     actions: list[dict[str, Any]] = []
-    for dest, source in ((daemon_policy_path(ctx), DAEMON_POLICY_SOURCE), (claude_routes_path(ctx), CLAUDE_ROUTES_SOURCE)):
+    for dest, source in ((daemon_policy_path(ctx), DAEMON_POLICY_SOURCE), (claude_routes_path(ctx), CLAUDE_ROUTES_SOURCE),
+                         (fleet_services_path(ctx), FLEET_SERVICES_SOURCE)):
         act = file_action(ctx, "tool", dest, source.read_bytes(), 0o644)
         act["source"] = os.fspath(source)
         actions.append(act)
@@ -1542,6 +1551,7 @@ def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
     actions.append({"kind": "tool", "path": os.fspath(gh_policy_path(ctx))})
     actions.append({"kind": "tool", "path": os.fspath(daemon_policy_path(ctx))})
     actions.append({"kind": "tool", "path": os.fspath(claude_routes_path(ctx))})
+    actions.append({"kind": "tool", "path": os.fspath(fleet_services_path(ctx))})
     for marker in scan_exclusion_markers(ctx):
         actions.append({"kind": "marker", "path": os.fspath(marker)})
     for act in actions:

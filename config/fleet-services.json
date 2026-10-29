@@ -1,0 +1,140 @@
+{
+  "schema": "glaeda-fleet-services/v1",
+  "note": "The launchd services on a fleet Mac that glaeda does not install but that have an owner: each label names the installer that puts it there and why it runs. glaeda-mini-health reports every other fleet-looking service (a label in match, or one naming a runner, worker or builder) in ~/Library/LaunchAgents, /Library/LaunchAgents or /Library/LaunchDaemons as unmanaged_service, a warning it never repairs: it never unloads, boots out or deletes anything. Leo, 2026-10-27: \"why the fuck not manage it with glaeda????????\" (rulebook: every fleet runner is glaeda-managed; no hand-made runner services). A service that starts a GitHub runner is runner_unmanaged's, not this list's. To add one: name its installer (a repo path) and its reason; a hand-made service has no installer and stays reported until glaeda or a declared installer owns it.",
+  "match": [
+    "^(?:ai\\.manaflow|ai\\.cmuxterm-hq|ai\\.leo-workspace|com\\.cmux|com\\.cmuxterm|com\\.acpmux|com\\.manaflow|actions\\.runner)\\.",
+    "(?i)runner|worker|builder"
+  ],
+  "prefixes": {
+    "ai.leo-workspace.": {
+      "owner": "teamleaderleo/leo-workspace machines/host-baseline.json (tools/host-baseline, ws-deploy)",
+      "why": "leo-workspace's declared host upkeep: ws-sync, disk hygiene, clone care, the CI-mini reclaim pass"
+    },
+    "com.cmux.tart-ci.slot.": {
+      "owner": "manaflow-ai/cmuxterm-hq scripts/tart-ci-fleet.sh",
+      "why": "one tart CI VM slot worker per configured slot"
+    }
+  },
+  "services": {
+    "ai.cmuxterm-hq.guards-sync": {
+      "owner": "manaflow-ai/cmuxterm-hq tools/agent-guards/guards-sync",
+      "why": "keeps the agent guard hooks current"
+    },
+    "ai.manaflow.chromium-golden": {
+      "owner": "manaflow-ai/cmuxterm-hq build-fleet/mini-ops/chromium-golden.sh",
+      "why": "keeps the browser worker's Chromium tree at its golden generation"
+    },
+    "ai.manaflow.cmux-bench-worker": {
+      "owner": "manaflow-ai/cmuxterm-hq build-fleet/mini-ops/bench-worker/bench-worker.sh",
+      "why": "the benchmark worker"
+    },
+    "ai.manaflow.cmux-build-axiom-exporter": {
+      "owner": "manaflow-ai/cmuxterm-hq build-fleet/install-axiom-exporter.sh",
+      "why": "ships build-fleet logs to Axiom"
+    },
+    "ai.manaflow.cmux-build-cache": {
+      "owner": "manaflow-ai/cmuxterm-hq build-fleet/install.sh",
+      "why": "the build fleet's cache service"
+    },
+    "ai.manaflow.cmux-build-catch-up-fill": {
+      "owner": "manaflow-ai/cmuxterm-hq build-fleet/catch-up/install-catch-up-fill.sh",
+      "why": "fills main's catch-up builds while the fleet is idle"
+    },
+    "ai.manaflow.cmux-build-controller": {
+      "owner": "manaflow-ai/cmuxterm-hq build-fleet/install.sh (build-fleet/github-events/controller-root.sh)",
+      "why": "the build controller, on the mini that hosts it"
+    },
+    "ai.manaflow.cmux-build-worker": {
+      "owner": "manaflow-ai/cmuxterm-hq build-fleet/install.sh",
+      "why": "the build controller's worker on the mini (fleet builds, cmux-ci run)"
+    },
+    "ai.manaflow.cmux-build-worker-telemetry": {
+      "owner": "manaflow-ai/cmuxterm-hq build-fleet/mini-ops/repair-worker-telemetry.sh",
+      "why": "the build worker's telemetry exporter"
+    },
+    "ai.manaflow.cmux-disk-pressure": {
+      "owner": "manaflow-ai/cmuxterm-hq build-fleet/mini-ops/disk-policy.sh (build-fleet/disk-pressure.sh)",
+      "why": "the build worker's own disk pass (disk-policy.json)"
+    },
+    "ai.manaflow.cmux-gui-worker": {
+      "owner": "manaflow-ai/cmuxterm-hq build-fleet/mini-ops/gui-worker/gui-worker.sh",
+      "why": "the GUI capture worker"
+    },
+    "ai.manaflow.cmux-lent-worker": {
+      "owner": "manaflow-ai/cmuxterm-hq build-fleet/mini-ops/lend-worker.sh",
+      "why": "the build worker a runner mini lends between jobs"
+    },
+    "ai.manaflow.console-unlock-guard": {
+      "owner": "glaeda scripts/glaeda-daemon-heal (config/fleet-ops.json)",
+      "why": "a fleet root op glaeda-daemon-heal installs and keeps current"
+    },
+    "ai.manaflow.cua-driver": {
+      "owner": "teamleaderleo/leo-workspace tools/host_baseline_capture.py",
+      "why": "the CUA driver capture leases use"
+    },
+    "ai.manaflow.cua-ssh-appserver": {
+      "owner": "manaflow-ai/cmuxterm-hq skills/cua/cua-ssh (cua-ssh.go)",
+      "why": "cua-ssh's Codex app-server for capture leases"
+    },
+    "ai.manaflow.cua-ssh-recorder": {
+      "owner": "manaflow-ai/cmuxterm-hq skills/cua/cua-ssh (cua-ssh.go)",
+      "why": "cua-ssh's screen recorder"
+    },
+    "ai.manaflow.hq-autodeploy": {
+      "owner": "manaflow-ai/cmuxterm-hq build-fleet/autodeploy/host-install.sh",
+      "why": "deploys HQ's build-fleet tools on merge"
+    },
+    "ai.manaflow.subrouter": {
+      "owner": "manaflow-ai/cmuxterm-hq build-fleet/subrouter-dash/install.sh",
+      "why": "the local subrouter Claude and Codex route through"
+    },
+    "ai.manaflow.symbol-cache-cap": {
+      "owner": "glaeda scripts/glaeda-daemon-heal (config/fleet-ops.json)",
+      "why": "a fleet root op glaeda-daemon-heal installs and keeps current"
+    },
+    "ai.manaflow.vmpaused": {
+      "owner": "manaflow-ai/cmuxterm-hq tools/vmpause/install.sh",
+      "why": "the vmpause daemon"
+    },
+    "com.acpmux.daemon": {
+      "owner": "acpmux (its own `acpmux daemon install`)",
+      "why": "the acpmux daemon on an agent session host"
+    },
+    "com.cmux.caffeinate": {
+      "owner": "manaflow-ai/cmuxterm-hq build-fleet/server-mode.sh",
+      "why": "keeps the mini awake (server mode)"
+    },
+    "com.cmux.cmux16-arm-worker": {
+      "owner": "manaflow-ai/cmuxterm-hq tools/cmux16-armd/install.sh",
+      "why": "the ARM build host worker"
+    },
+    "com.cmux.cmux16-armd": {
+      "owner": "manaflow-ai/cmuxterm-hq tools/cmux16-armd/install.sh",
+      "why": "the ARM build host daemon"
+    },
+    "com.cmux.nx-gc": {
+      "owner": "manaflow-ai/cmuxterm-hq build-host/install-host.sh",
+      "why": "garbage-collects the nx remote build host's job trees"
+    },
+    "com.cmux.nx-keepawake": {
+      "owner": "manaflow-ai/cmuxterm-hq build-host/install-host.sh",
+      "why": "keeps an nx remote build host awake"
+    },
+    "com.cmux.trajectory-archive": {
+      "owner": "manaflow-ai/cmuxterm-hq tools/trajectory-archive/trajarchive.py",
+      "why": "archives agent trajectories off the mini"
+    },
+    "com.cmuxterm.host-remote": {
+      "owner": "manaflow-ai/cmux cmux-tui remote_host/service.rs",
+      "why": "the cmux app's own remote-host service, installed by the app"
+    },
+    "com.cmuxterm.hq.dev-app-reaper": {
+      "owner": "manaflow-ai/cmuxterm-hq tools/dev-app-reaper/dev_app_reaper.py",
+      "why": "reaps idle DEV app copies"
+    },
+    "com.manaflow.cmux-live-builder": {
+      "owner": "manaflow-ai/cmuxterm-hq build-fleet/live-builder/live-builder.sh",
+      "why": "the live builder"
+    }
+  }
+}

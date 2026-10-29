@@ -84,6 +84,14 @@ Each run checks, as the runner user and without sudo:
                                      days stays behind (GitHub deleted 33 such offline registrations on one day, all
                                      on an older release). Reported only (a warning): it self-updates on its next
                                      connect, or an operator moves it while it is idle.
+  unmanaged_service:<label>          a fleet-looking launchd service (a label config/fleet-services.json's match names:
+                                     ai.manaflow.*, com.cmux*, actions.runner.*, or any label naming a runner, worker or
+                                     builder) in ~/Library/LaunchAgents, /Library/LaunchAgents or /Library/LaunchDaemons
+                                     that glaeda does not install (com.teamleaderleo.glaeda.*) and that the file does not
+                                     declare with its installer: a hand-made service no reconciler keeps (Leo,
+                                     2026-10-27: "why the fuck not manage it with glaeda????????"). A service that
+                                     starts a GitHub runner is runner_unmanaged's. Reported only (a warning): it is never
+                                     unloaded, booted out or deleted. Also run on a host without glaeda runners.
   checkout_slow                      the runners' checkout steps (actions/checkout: "Checkout ..." and "Run
                                      actions/checkout@..." steps, never their "Post" cleanup) took a median over
                                      CHECKOUT_SLOW_S (60 s) across at least CHECKOUT_MIN_SAMPLES of them in the
@@ -188,7 +196,7 @@ but did not last (a runner that exits again), so nothing loops. Each finding rea
 "impossible" when this user cannot fix it or the tries ran out. A fixed finding leaves the report and its heal is
 kept under "healed" for a day (auto_fix "done"). The report is REPORT (ci-dash's probe reads it; cmuxterm-hq
 build-fleet/ci-dash turns each code into the operator command that fixes it); the state beside it keeps each
-finding's first sighting and the heal tries. On a host with no glaeda runner it checks only claude_route (and the daemon healer). With KILL_SWITCH
+finding's first sighting and the heal tries. On a host with no glaeda runner it checks only claude_route, runner_unmanaged and unmanaged_service (and the daemon healer). With KILL_SWITCH
 present it still reports but never heals. Prints one JSON line when it healed something or the findings changed.
 """
 
@@ -243,6 +251,11 @@ def starts_runner(word: str, cwd: str = "") -> bool:
             script = Path(word) if os.path.isabs(word) else (Path(cwd) / word if cwd else None)
             return script is not None and (script.parent / ".runner").is_file()
     return False
+
+
+def job_starts_runner(words: list[str], cwd: str = "") -> bool:
+    """A launchd job whose program words start a GitHub runner (starts_runner; cwd only finds a bare run.sh)."""
+    return any(starts_runner(w, cwd) for w in words if w)
 
 
 RUNNER_AGENT = re.compile(r"com\.teamleaderleo\.glaeda\.cmux-runner(?:\.\d+|\.dedicated\.[a-z][a-z0-9-]*)?")
@@ -325,6 +338,7 @@ PROFILE_SUMMARY = "summary.runner-caches.json"  # glaeda-disk's PROFILE_HEALTH_S
 SYSTEM_DAEMONS = Path("/Library/LaunchDaemons")
 OTA_CONVERGE = ".local/state/glaeda/update/converge.json"  # glaeda-update's CONVERGE, under this home
 CLAUDE_ROUTES = "claude-routes.json"  # config/, beside this script or as mini-setup installs it
+FLEET_SERVICES = "fleet-services.json"  # config/: the owned launchd services that are not glaeda's (unmanaged_service)
 CLAUDE_PROBE_S = 60  # a route that does not answer hangs `claude -p` in its retries until it is killed
 CLAUDE_PROMPT = "Reply with exactly PONG"
 CLAUDE_PERSONAL = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")  # a person's login: it overrides the route
@@ -720,29 +734,49 @@ class Mini:
                 out.append({**doc, "dir": name})
         return out
 
-    def foreign_runners(self) -> list[tuple[str, str]]:
-        """(where, what) for each GitHub runner glaeda does not own: a LaunchAgent (the user's or /Library's) or
-        LaunchDaemon plist that is not
-        glaeda's (its Label, RUNNER_AGENT) and starts a runner (the run.sh or runsvc.sh of a directory with a .runner,
-        or a Runner.Listener), and a running Runner.Listener whose runner directory is not ~/actions-runner-glaeda*."""
+    def launchd_jobs(self) -> list[tuple[Path, str, list[str], str]]:
+        """(plist, label, program words, working directory) for every *.plist in the user's LaunchAgents, /Library's
+        LaunchAgents and its LaunchDaemons that reads as a launchd job. The label is launchd's own name for the job
+        (its Label), not the file's: a renamed file changes neither way. Read only; a file that is not a plist, or
+        not a dict, says nothing (a .plist.disabled or .retired-* copy is no job)."""
         out = []
         for folder in (self.home / "Library/LaunchAgents", self.global_agents_dir, self.daemons_dir):
-            for plist in sorted(folder.glob("*.plist")) if folder.is_dir() else []:
+            try:
+                plists = sorted(folder.glob("*.plist")) if folder.is_dir() else []
+            except OSError:
+                continue
+            for plist in plists:
                 try:
                     doc = plistlib.loads(plist.read_bytes())
                 except Exception:  # unreadable or not a plist: nothing to say about it
                     continue
                 if not isinstance(doc, dict):
                     continue
-                # launchd's own name for the job (its Label), not the file's: a renamed file changes neither way
                 label = str(doc.get("Label") or plist.name[:-len(".plist")])
-                if RUNNER_AGENT.fullmatch(label) or label.startswith(GLAEDA_LABEL_PREFIX):
-                    continue
                 args = doc.get("ProgramArguments")
                 words = [str(w) for w in (args if isinstance(args, list) else [])] + [str(doc.get("Program") or "")]
-                cwd = str(doc.get("WorkingDirectory") or "")  # only to find a bare run.sh, never a runner itself
-                if any(starts_runner(w, cwd) for w in words if w):
-                    out.append((os.fspath(plist), f"{label} starts a GitHub runner glaeda does not manage"))
+                out.append((plist, label, [w for w in words if w], str(doc.get("WorkingDirectory") or "")))
+        return out
+
+    def fleet_services(self) -> dict[str, Any]:
+        """config/fleet-services.json: the repo's or release's beside this script, else the copy mini-setup installs;
+        {} when neither is there or readable (an install that predates it: nothing is judged)."""
+        for path in (SCRIPT_DIR.parent / "config" / FLEET_SERVICES, self.home / ".local/share/glaeda" / FLEET_SERVICES):
+            if path.is_file():
+                return load_json(path)
+        return {}
+
+    def foreign_runners(self) -> list[tuple[str, str]]:
+        """(where, what) for each GitHub runner glaeda does not own: a LaunchAgent (the user's or /Library's) or
+        LaunchDaemon plist that is not
+        glaeda's (its Label, RUNNER_AGENT) and starts a runner (the run.sh or runsvc.sh of a directory with a .runner,
+        or a Runner.Listener), and a running Runner.Listener whose runner directory is not ~/actions-runner-glaeda*."""
+        out = []
+        for plist, label, words, cwd in self.launchd_jobs():
+            if RUNNER_AGENT.fullmatch(label) or label.startswith(GLAEDA_LABEL_PREFIX):
+                continue
+            if job_starts_runner(words, cwd):
+                out.append((os.fspath(plist), f"{label} starts a GitHub runner glaeda does not manage"))
         own = os.path.realpath(self.home) + "/actions-runner-glaeda"
         for _pid, _uid, _stat, command in self.processes():
             m = LISTENER_RE.search(command)
@@ -1823,6 +1857,33 @@ def check_foreign_runners(mini: Mini) -> list[dict[str, Any]]:
             for where, what in mini.foreign_runners()]
 
 
+def check_unmanaged_services(mini: Mini) -> list[dict[str, Any]]:
+    """Leo, 2026-10-27: "why the fuck not manage it with glaeda????????" (rulebook: every fleet runner is
+    glaeda-managed; no hand-made runner services). A fleet-looking launchd job (config/fleet-services.json match) that
+    glaeda did not install and the file does not declare with its installer: nothing reconciles it, so it is reported.
+    A warning only: this never unloads, boots out or deletes it. A job that starts a runner is runner_unmanaged's."""
+    policy = mini.fleet_services()
+    try:
+        match = [re.compile(m) for m in policy.get("match") or [] if isinstance(m, str) and m]
+    except re.error:
+        match = []
+    if not match:
+        return []  # no readable policy (an install that predates it): nothing to judge
+    declared = policy.get("services") if isinstance(policy.get("services"), dict) else {}
+    prefixes = tuple(k for k in (policy.get("prefixes") or {}) if isinstance(k, str) and k)
+    out = []
+    for plist, label, words, cwd in mini.launchd_jobs():
+        if label.startswith(GLAEDA_LABEL_PREFIX) or RUNNER_AGENT.fullmatch(label) or label in declared \
+                or (prefixes and label.startswith(prefixes)) or not any(m.search(label) for m in match) \
+                or job_starts_runner(words, cwd):
+            continue
+        program = words[0] if words else "no program"
+        out.append(finding(f"unmanaged_service:{label}", "warn", f"{label} ({plist}) runs {program}", "impossible",
+                           "no reconciler keeps it: have glaeda install it, or declare it with its installer in "
+                           "glaeda config/fleet-services.json; glaeda never unloads it"))
+    return sorted(out, key=lambda f: f["id"])
+
+
 def version_key(version: str) -> tuple[int, ...]:
     return tuple(int(x) for x in version.split("."))
 
@@ -2779,7 +2840,7 @@ def iso(t: float) -> str:
 def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = STATE,
         report_path: Path = REPORT, heal_ok: bool = True, runner: bool = True) -> dict[str, Any]:
     """One pass. runner=False is a host with no glaeda runner (a capture-only mini): only its Claude Code (missing,
-    route) and runner_unmanaged."""
+    route), runner_unmanaged and unmanaged_service."""
     now = time.time() if now is None else now
     state = load_json(state_path) if apply else {}
     seen: dict[str, Any] = state.get("seen") or {}
@@ -2794,7 +2855,7 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
         # keeps that probe nor reroutes on it until the tunnel is back (tailscale_no_route's restart may fix it)
         tunnel_down = any(f["code"] in TUNNEL_DOWN for f in tailnet)
         found = (check_console(mini) + check_power(mini) + check_load_high(mini) + tailnet + check_runners(mini) + check_runner_versions(mini)
-                 + check_foreign_runners(mini)
+                 + check_foreign_runners(mini) + check_unmanaged_services(mini)
                  + check_node_eligibility(mini) + check_toolchain_missing(mini) + check_toolchain(mini)
                  + check_leaked_test_apps(mini)
                  + check_checkout_steps(mini, now, state_path.parent / CHECKOUT_CACHE, apply)
@@ -2811,7 +2872,7 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
         # install and reroute here, as on a runner host (a probe through it hangs and spends a try).
         tunnel_down = any(f["code"] in TUNNEL_DOWN for f in check_tailscale(mini))
         found = (check_claude_missing(mini) + check_claude_route(mini, now, apply and not tunnel_down, tunnel_down)
-                 + check_foreign_runners(mini))
+                 + check_foreign_runners(mini) + check_unmanaged_services(mini))
 
     findings, heals = [], []
     route_healed = False  # heal_tailscale_route ran this pass (it looks after the drain itself)
@@ -2915,7 +2976,7 @@ def main(argv: list[str] | None = None) -> int:
         claude = (run(mini, args.apply, state_path=STATE, report_path=REPORT, heal_ok=not KILL_SWITCH.exists(),
                       runner=False) if mini.claude_bin() or check_claude_missing(mini) else None)
         # without Claude there is no report to write, but a hand-made runner is still said
-        foreign = check_foreign_runners(mini) if claude is None else []
+        foreign = check_foreign_runners(mini) + check_unmanaged_services(mini) if claude is None else []
         if foreign and args.apply:
             for f in foreign:
                 print(json.dumps({"finding": f["id"], "evidence": f["evidence"]}, separators=(",", ":")), flush=True)

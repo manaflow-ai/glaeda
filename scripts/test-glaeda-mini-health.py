@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import plistlib
+import re
 import tempfile
 import time
 import unittest
@@ -3402,6 +3403,96 @@ class ForeignRunnerTest(unittest.TestCase):
             for p in [*daemons.glob("*.plist"), *global_agents.glob("*.plist")]:
                 p.unlink()
             self.assertEqual(health.check_foreign_runners(mini), [], "every runner glaeda's: no fault")
+
+
+
+class UnmanagedServiceTest(unittest.TestCase):
+    """Leo, 2026-10-27: "why the fuck not manage it with glaeda????????" A fleet-looking launchd service that glaeda
+    does not install and config/fleet-services.json does not declare is reported (a warning), never unloaded."""
+
+    def setUp(self) -> None:
+        self.home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        self.agents = self.home / "Library/LaunchAgents"
+        self.daemons = self.home / "daemons"
+        self.globals = self.home / "global-agents"
+        for d in (self.agents, self.daemons, self.globals):
+            d.mkdir(parents=True)
+        self.mini = health.Mini(self.home)
+        self.mini.daemons_dir, self.mini.global_agents_dir = self.daemons, self.globals
+
+    def plist(self, folder: Path, label: str, args: list[str], name: str | None = None) -> None:
+        (folder / (name or f"{label}.plist")).write_bytes(plistlib.dumps({"Label": label, "ProgramArguments": args}))
+
+    def ids(self) -> list[str]:
+        return [f["id"] for f in health.check_unmanaged_services(self.mini)]
+
+    def test_the_policy_declares_an_installer_and_a_reason_for_every_service(self) -> None:
+        doc = json.loads((ROOT / "config" / "fleet-services.json").read_text())
+        self.assertEqual(doc["schema"], "glaeda-fleet-services/v1")
+        for m in doc["match"]:
+            re.compile(m)
+        for label, about in {**doc["services"], **doc["prefixes"]}.items():
+            self.assertTrue(about.get("owner") and about.get("why"), label)
+            self.assertFalse(label.startswith(health.GLAEDA_LABEL_PREFIX), f"{label} is glaeda's own")
+
+    def test_only_an_undeclared_fleet_service_is_reported_and_nothing_is_changed(self) -> None:
+        # what four CI minis held on 2026-10-29
+        for label in ("com.teamleaderleo.glaeda.cmux-runner", "com.teamleaderleo.glaeda.cmux-runner.3",
+                      "com.teamleaderleo.glaeda.disk-pressure", "ai.leo-workspace.ci-mini-reclaim",
+                      "ai.manaflow.vmpaused", "ai.manaflow.cua-driver", "com.cmuxterm.host-remote",
+                      "com.cmux.trajectory-archive", "ai.manaflow.chromium-golden"):
+            self.plist(self.agents, label, ["/bin/sh", "-c", "true"])
+        for label in ("ai.manaflow.console-unlock-guard", "ai.manaflow.symbol-cache-cap", "ai.manaflow.cmux-build-worker",
+                      "ai.manaflow.cmux-lent-worker", "ai.manaflow.cmux-disk-pressure", "com.cmux.caffeinate",
+                      "com.teamleaderleo.glaeda.daemon-heal", "com.tailscale.tailscaled", "com.apple.something"):
+            self.plist(self.daemons, label, ["/usr/bin/true"])
+        # a retired copy is no job; a non-plist says nothing
+        self.plist(self.daemons, "ai.manaflow.ci-dash", ["/x/ci-dash"], name="ai.manaflow.ci-dash.plist.retired-20260928")
+        (self.agents / "broken.plist").write_text("not a plist")
+        self.assertEqual(self.ids(), [])
+        # hand-made services: one in each folder, matched by prefix or by naming a worker or builder
+        self.plist(self.agents, "ai.manaflow.cmux-perf-worker", ["/Users/cmux/perf/worker.sh", "--loop"])
+        self.plist(self.globals, "com.example.nightly-builder", ["/opt/builder"])
+        self.plist(self.daemons, "com.cmux.nx-somethingnew", ["/usr/local/bin/nx-new"])
+        self.plist(self.agents, "org.git-scm.git.hourly", ["/usr/bin/git", "maintenance"])  # not fleet-looking
+        before = sorted(p.name for d in (self.agents, self.daemons, self.globals) for p in d.iterdir())
+        with mock.patch.object(health, "sh", side_effect=AssertionError("no command runs")):
+            found = health.check_unmanaged_services(self.mini)
+        self.assertEqual([f["id"] for f in found], ["unmanaged_service:ai.manaflow.cmux-perf-worker",
+                                                    "unmanaged_service:com.cmux.nx-somethingnew",
+                                                    "unmanaged_service:com.example.nightly-builder"])
+        self.assertTrue(all(f["severity"] == "warn" and f["auto_fix"] == "impossible" for f in found))
+        self.assertIn("/Users/cmux/perf/worker.sh", found[0]["evidence"])
+        self.assertIn(os.fspath(self.agents / "ai.manaflow.cmux-perf-worker.plist"), found[0]["evidence"])
+        self.assertEqual(sorted(p.name for d in (self.agents, self.daemons, self.globals) for p in d.iterdir()), before)
+        self.assertNotIn("unmanaged_service", health.HEALS)  # report only: no heal exists
+
+    def test_a_service_that_starts_a_runner_is_runner_unmanaged_not_this(self) -> None:
+        old = self.home / "actions-runner"
+        old.mkdir()
+        (old / ".runner").write_text("{}")
+        self.plist(self.daemons, "actions.runner.manaflow-ai-cmux.mini", [f"{old}/runsvc.sh"])
+        self.assertEqual(self.ids(), [])
+        with mock.patch.object(self.mini, "processes", return_value=[]):
+            self.assertEqual([f["code"] for f in health.check_foreign_runners(self.mini)], ["runner_unmanaged"])
+
+    def test_no_readable_policy_judges_nothing(self) -> None:
+        self.plist(self.agents, "ai.manaflow.cmux-perf-worker", ["/x"])
+        with mock.patch.object(self.mini, "fleet_services", return_value={}):
+            self.assertEqual(self.ids(), [])
+        with mock.patch.object(self.mini, "fleet_services", return_value={"match": ["("]}):
+            self.assertEqual(self.ids(), [])
+
+    def test_a_pass_reports_it_on_runner_and_runnerless_hosts(self) -> None:
+        hand = [health.finding("unmanaged_service:ai.manaflow.x-worker", "warn", "x", "impossible")]
+        state, report = self.home / "state.json", self.home / "health.json"
+        mini = FakeMini()
+        with mock.patch.object(health, "check_unmanaged_services", return_value=hand):
+            for runner in (True, False):
+                out = health.run(mini, True, now=NOW, state_path=state, report_path=report, runner=runner)
+                self.assertIn("unmanaged_service:ai.manaflow.x-worker", [f["id"] for f in out["findings"]], runner)
+                self.assertEqual(out["heals"], [])
 
 
 if __name__ == "__main__":
