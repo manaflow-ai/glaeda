@@ -1562,6 +1562,19 @@ class GlaedaDiskTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             gd.space("lots", 1000)
 
+    def test_default_low_water_mark_acts_before_100_gib_on_a_256_gb_mini(self) -> None:
+        # Leo, 2026-10-27: "how can <100gb be free on >256gb minis all the time". The old 25%:60-200 started pressure
+        # only under 60 GiB on a 256 GB mini. The default is 35% held between 100 and 200 GiB, whichever is larger.
+        gib = 1024**3
+        low, target = gd.POLICY_DEFAULTS["low"], gd.POLICY_DEFAULTS["target"]
+        self.assertEqual(gd.space(low, 238 * gib), 100 * gib)  # a 256 GB mini: 35% is 83 GiB, the floor is larger
+        self.assertGreaterEqual(gd.space(low, 228 * gib), 100 * gib)  # its APFS data volume
+        self.assertEqual(gd.space(low, 460 * gib), int(460 * gib * 0.35))  # a 512 GB mini: 161 GiB
+        self.assertEqual(gd.space(low, 1863 * gib), 200 * gib)  # 2 TB: held at 200
+        for size in (228, 238, 460, 931, 1863):  # one pass always has room to free past where it started
+            self.assertGreater(gd.space(target, size * gib), gd.space(low, size * gib), size)
+        self.assertLess(gd.space(low, 30 * gib), 30 * gib)  # a small VM is not left permanently under pressure
+
     def test_tmp_family_does_not_treat_marker_search_budget_as_job_use(self) -> None:
         fam = gd.Family("tmp", self.root, True, "scratch")
         with mock.patch.object(gd, "cmux_active", return_value=True):

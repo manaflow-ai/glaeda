@@ -1506,10 +1506,14 @@ def config_sha256(disk: Path | None = None, policy: Path | None = None) -> str:
             pass
         h.update(b"\0")
     return h.hexdigest()
+# Pressure starts under 35% free, held between 100 and 200 GiB: 100 GiB on a 256 GB mini (238 GiB), about 161 on a
+# 460 GiB one, 200 from 571 GiB up. The old 25%:60-200 began only under 60 GiB on a 256 GB mini, so 60-100 GiB free was
+# never acted on (Leo, 2026-10-27: "how can <100gb be free on >256gb minis all the time"; 2026-10-26: "Just delete more
+# stuff, more often"). The target stays above it on every size: 150 GiB to 45%, at most 350.
 POLICY_DEFAULTS: dict[str, Any] = {
     "enabled": True,
-    "low": "25%:60-200",
-    "target": "35%:100-350",
+    "low": "35%:100-200",
+    "target": "45%:150-350",
     "emergency": "10%:30-60",
     "low_margin_gib": 4.0,
     "target_margin_gib": 20.0,
@@ -7800,7 +7804,7 @@ class Fs:
 
 # A glaeda runner's listener gate holds the runner while free disk is under its job-started hook's --min-free-gib,
 # and resumes only GATE_DISK_RESUME_GIB (2 GiB) above it. Pressure on a disk must start by then, or a 460 GiB mini
-# between the default low (25%:60-200, about 115 GiB) and a 150 GiB floor stays held with nothing freed. The
+# between the old default low (25%:60-200, about 115 GiB) and a 150 GiB floor stayed held with nothing freed. The
 # target sits target_margin_gib higher, so one run lifts the mini well clear of the floor.
 RUNNER_HOOKS = "actions-runner*/glaeda-hooks/job-started.sh"  # glaeda-cmux-runner's default --runner-dir
 MIN_FREE_GIB_RE = r"\s--min-free-gib[\s=]+([0-9.eE+-]+)(?=\s|$)"  # the hook's min_free_gib reads the same
