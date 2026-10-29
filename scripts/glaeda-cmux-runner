@@ -2544,9 +2544,11 @@ def main(argv: list[str] | None = None) -> int:
         ctx.labels_requested = True
         if not args.name:
             ctx.name = f"{args.member}-glaeda{ctx.suffix}"
-        if is_root:
-            # A static handle on this one root runner (cmux's warm affinity): the picker reads which runner
-            # kept a warm build and names it in runs-on, so no job ever writes a runner label.
+        if is_root or nightly:
+            # A static handle on this one runner, so no job ever writes a runner label: a root runner for cmux's
+            # warm affinity (the picker reads which runner kept a warm build and names it in runs-on), and the
+            # nightly slot for cmux's owned signing pick (scripts/ci/signing_runner.py), which offers only a runner
+            # it can pin. Without it no slot was ever offered, and nightly signing always went to Blacksmith.
             ctx.labels.append(runner_label(ctx.name))
     if args.token_stdin and args.apply:  # a plan previews the stdin path but never reads a token
         token = sys.stdin.readline(4096).strip()

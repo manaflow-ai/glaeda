@@ -574,8 +574,9 @@ after 60 seconds so the workflow can use its normal fallback.
 `runner.nightlySlot: true` on a dedicated member (no `trustedRef`, no
 `poolPrefix`) gives its next side instance after `canonicalRoots`, after the
 freshness slot when `devCompile` is set too, the nightly pool label
-`glaeda-nightly-<class>-xcode-<version>` in place of its side label, and its
-hook `--nightly-runner`. Like the freshness slot it reuses an instance and adds no
+`glaeda-nightly-<class>-xcode-<version>` in place of its side label, its own
+`glaeda-runner-<name>` label (as a root runner has), so cmux's owned signing pick can pin
+it, and its hook `--nightly-runner`. Like the freshness slot it reuses an instance and adds no
 runners, cores or roots; its neighbors keep their labels and hooks. It admits
 only nightly-tier jobs (the hook's `job_tier`: `nightly.yml` on `nightly-next`
 or `main`, main's dispatch of `cmux-next-dev-daily.yml` (the DEV feed's sign,

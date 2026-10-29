@@ -10505,7 +10505,9 @@ class RunnerTest(unittest.TestCase):
             self.assertEqual(both_hooks[instance], dev_hooks[instance], f"neighbor {instance} keeps its hook")
         self.assertEqual([label for label in both[3] if label not in cr.BASE_LABELS],
                          ["glaeda-mini", "glaeda-class-std", "glaeda-dedicated", "xcode-26.6",
-                          "glaeda-nightly-std-xcode-26.6"], "no pool, side or iOS label: no PR job reaches it")
+                          "glaeda-nightly-std-xcode-26.6", cr.runner_label("mini-std-glaeda-3")],
+                         "no pool, side or iOS label: no PR job reaches it; its own runner label, so cmux's owned "
+                         "signing pick can pin it (signing_runner.py offers only a runner it can pin)")
         self.assertEqual(["--nightly-runner" in text for text in both_hooks],
                          [False, False, False, True, False, False])
         self.assertIn("--test-keychain", both_hooks[3])
@@ -10514,6 +10516,13 @@ class RunnerTest(unittest.TestCase):
             alone, _ = self.fast_labels(shape, "nightly-alone", ios_sim=True, nightly_slot=True)
         self.assertEqual(["glaeda-nightly-std-xcode-26.6" in labels for labels in alone],
                          [False, False, True, False, False, False], "without a freshness slot: the first side instance")
+        # Every nightly slot carries its own glaeda-runner-<name> label, and no side, gui or fast runner gains one.
+        for labels in (*both, *alone):
+            pins = [label for label in labels if label.startswith("glaeda-runner-")]
+            if "glaeda-nightly-std-xcode-26.6" in labels:
+                self.assertEqual(len(pins), 1, f"a nightly slot without its pin label: {labels}")
+            elif not any(label.startswith("glaeda-root-") for label in labels):
+                self.assertEqual(pins, [], f"only roots and the nightly slot are pinned: {labels}")
         self.assertTrue(hook.runner_scope(self.fast_home / "actions-runner-glaeda-2").nightly)
         self.assertFalse(hook.runner_scope(self.fast_home / "actions-runner-glaeda-3").nightly)
 
