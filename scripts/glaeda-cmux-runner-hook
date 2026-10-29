@@ -3270,6 +3270,73 @@ def root_users(path: str) -> list[int] | None:
                   and not any(name in command[pid] for name in ROOT_SETTLE_SPARED))
 
 
+# A signing job (EXCLUSIVE_CLASS) must have the whole mini, and capacity units are not the whole story: a runner
+# whose listener died mid-job (a crash, a reboot of the listener) shows offline and not busy, its Runner.Worker is
+# gone so the units it held were released, and still the steps it started may be running in that runner's _work.
+# So an exclusive job is admitted only while no process of this user works in (lsof cwd) or names (ps) any
+# runner's _work, other than this job's own (under its Runner.Worker) and the hook's own; it waits for them like
+# for units, EXCLUSIVE_CAPACITY_WAIT_S at most, then is refused. None when ps cannot tell, which refuses too.
+RUNNER_WORK_GLOBS = ("actions-runner-glaeda*/_work", "glaeda-runner/_work")
+
+
+def stray_job_processes(home: Path, owner_pid: int) -> list[int] | None:
+    """This user's processes working in or naming a runner's _work under home that are not this job's (under
+    owner_pid) and not the hook's or this process's ancestors. None when ps or lsof cannot tell."""
+    works = sorted({os.path.realpath(w) for pattern in RUNNER_WORK_GLOBS for w in home.glob(pattern) if w.is_dir()})
+    if not works:
+        return []
+    insides = [w.rstrip("/") + "/" for w in works]
+    uid = str(os.getuid())
+    try:
+        listing = subprocess.run([PS, "-U", uid, "-ww", "-o", "pid=,ppid=,command="], stdin=subprocess.DEVNULL,
+                                 capture_output=True, text=True, timeout=10, check=False, env={"LC_ALL": "C"})
+        cwds = subprocess.run([LSOF, "-nP", "-w", "-a", "-u", uid, "-d", "cwd", "-Fpn"], stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    # Both must have answered in full: a failed or partial listing would read as "nothing in _work". This process
+    # always has a cwd, so a cwd listing that does not name it is not a whole one.
+    if listing.returncode != 0 or cwds.returncode != 0 or f"p{os.getpid()}" not in cwds.stdout.split():
+        return None
+    parent: dict[int, int] = {}
+    command: dict[int, str] = {}
+    for line in listing.stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+            parent[int(parts[0])], command[int(parts[0])] = int(parts[1]), parts[2] if len(parts) == 3 else ""
+    if os.getpid() not in parent:
+        return None
+    users = {pid for pid, argv in command.items() if any(inside in argv for inside in insides)}
+    pid = 0
+    for line in cwds.stdout.splitlines():
+        if line[:1] == "p" and line[1:].isdigit():
+            pid = int(line[1:])
+        elif line[:1] == "n" and pid in command:
+            cwd = os.path.realpath(line[1:])
+            if any(cwd == w or cwd.startswith(inside) for w, inside in zip(works, insides)):
+                users.add(pid)
+    mine, walk = set(), os.getpid()
+    for _ in range(256):  # this process and its ancestors (the hook wrapper, our own Runner.Worker); never launchd
+        if walk <= 1:
+            break
+        mine.add(walk)
+        if walk not in parent:
+            break
+        walk = parent[walk]
+
+    def ours(pid: int) -> bool:
+        for _ in range(256):
+            if (pid == owner_pid and pid > 1) or pid in mine:
+                return True
+            if pid <= 1 or pid not in parent:
+                return False
+            pid = parent[pid]
+        return True  # a loop in the table: leave it alone
+
+    return sorted(pid for pid in users if not ours(pid)
+                  and not any(name in command[pid] for name in ROOT_SETTLE_SPARED))
+
+
 def settle_root(k: int) -> str:
     """Stop the leftover processes still using root k (root_users) before this job uses it; a note for the log."""
     path = settle_path(k)
@@ -8464,6 +8531,15 @@ def main(argv: list[str] | None = None) -> int:
                                                gui_runner=args.gui_runner,
                                                fresh_runner=args.dev_compile_runner, tier=tier, new_job=True,
                                                nightly_runner=args.nightly_runner)
+                    if held and claim_class == EXCLUSIVE_CLASS:
+                        stray = stray_job_processes(Path.home(), owner.pid if owner else 0)
+                        if stray is None or stray:
+                            release_host_lock(args.state_dir)
+                            held = False
+                            note = ("capacity: cannot list the processes in the runners' _work, so the mini is not "
+                                    "known to be drained" if stray is None else
+                                    f"capacity: {len(stray)} process(es) of an earlier job still run in a runner's "
+                                    f"_work (pids {', '.join(map(str, stray[:8]))}), so the mini is not drained")
                     if held or not note.startswith("capacity:"):
                         break
                     waited = time.monotonic() - start
