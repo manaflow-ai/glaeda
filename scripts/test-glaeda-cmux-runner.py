@@ -2100,6 +2100,47 @@ class HookTest(unittest.TestCase):
         self.assertFalse(ok, why)
         self.assertIn("a signing job runs beside nothing", why)
 
+    def test_a_signing_job_waits_out_an_offline_runners_leftover_job_and_the_host_lock(self) -> None:
+        """A runner whose listener died mid-job shows offline and not busy, and its units were released with its
+        Runner.Worker, yet its steps can still run in its _work; cmux's picker now offers such a mini. A signing job
+        must not be admitted beside them, nor while a fleet build or another job holds host.lock: it is refused
+        (within EXCLUSIVE_CAPACITY_WAIT_S), so its re-run takes Blacksmith."""
+        self.fleet()
+        (self.dir / "capacity").mkdir(parents=True, exist_ok=True)
+        github_env = self.dir / "github-env"
+        legacy = {"GITHUB_JOB": "sign-nightly-identity-legacy", "GITHUB_ENV": os.fspath(github_env),
+                  "GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/nightly.yml@refs/heads/nightly-next"}
+        work = self.dir / "actions-runner-glaeda-7" / "_work" / "cmux" / "cmux"
+        work.mkdir(parents=True)
+        # A step of the dead runner's job: orphaned (its Runner.Worker is gone), still working in that _work.
+        started = subprocess.run(["/bin/sh", "-c", "/bin/sleep 60 >/dev/null 2>&1 & echo $!"], cwd=work,
+                                 capture_output=True, text=True, check=True)
+        leftover = int(started.stdout.strip())
+        try:
+            refused = self.job("sign-nightly-identity-legacy", "s0", 14, None, "--gui-wait", "0", env=legacy)
+            self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+            self.assertIn(f"1 process(es) of an earlier job still run in a runner's _work (pids {leftover})",
+                          refused.stdout)
+            self.assertNotIn("GLAEDA_JOB_CLAIM", github_env.read_text() if github_env.exists() else "")
+            self.assertTrue(self.lock_free(), "the refused job let go of everything it took")
+        finally:
+            with contextlib.suppress(OSError):
+                os.kill(leftover, signal.SIGKILL)
+        held = os.open(self.fleet() / "host.lock", os.O_RDWR)  # a fleet build, or a stranded holder, has the host
+        try:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            refused = self.job("sign-nightly-identity-legacy", "s0", 14, None, "--gui-wait", "0", env=legacy)
+            self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+            self.assertNotIn("GLAEDA_JOB_CLAIM", github_env.read_text() if github_env.exists() else "")
+        finally:
+            os.close(held)
+        try:
+            admitted = self.job("sign-nightly-identity-legacy", "s0", 14, None, "--gui-wait", "0", env=legacy)
+            self.assertEqual(admitted.returncode, 0, admitted.stdout + admitted.stderr)
+            self.assertIn("GLAEDA_JOB_CLAIM=exclusive\n", github_env.read_text())
+        finally:
+            self.finish("s0")
+
     def test_job_claim_names_only_a_whole_mini(self) -> None:
         github_env = self.dir / "env"
         with mock.patch.dict(os.environ, {"GITHUB_ENV": os.fspath(github_env)}):
