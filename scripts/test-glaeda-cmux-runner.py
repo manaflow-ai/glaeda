@@ -2143,6 +2143,104 @@ class HookTest(unittest.TestCase):
         finally:
             self.finish("s0")
 
+    def nightly_signer(self, runner: str, wait: str, *extra: str) -> subprocess.Popen:
+        """sign-nightly-identity-legacy of a nightly-next push on this mini's nightly slot, started in the background."""
+        push = event(self.dir, f"sign-{runner}", {"repository": CMUX, "ref": hook.NIGHTLY_NEXT_REF})
+        ref = hook.NIGHTLY_NEXT_REF
+        environ = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0",
+                   "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"),
+                   "GLAEDA_RUNNER_SHIM_PYTHON": "python3", "GLAEDA_RUNNER_XCRUN": os.fspath(self.dir / "jobpath" / "xcrun"),
+                   "GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": os.fspath(push),
+                   "GITHUB_REPOSITORY": "manaflow-ai/cmux", "GITHUB_JOB": "sign-nightly-identity-legacy",
+                   "RUNNER_NAME": runner, "GITHUB_REF": ref, "GITHUB_RUN_ATTEMPT": "1",
+                   "GITHUB_ENV": os.fspath(self.dir / f"github-env-{runner}"),
+                   "GITHUB_WORKFLOW_REF": f"manaflow-ai/cmux/.github/workflows/nightly.yml@{ref}"}
+        proc = subprocess.Popen(
+            [sys.executable, os.fspath(HOOK), "job-started", "--allowed-repo", "manaflow-ai/cmux", "--no-disk",
+             "--state-dir", os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()), "--gui-wait", wait,
+             "--capacity-units", "14", "--capacity-dir", os.fspath(self.dir / "capacity"), "--instance", "4",
+             *extra], env=environ, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        self.addCleanup(lambda: (proc.poll() is None and proc.kill(), proc.wait(), proc.stdout.close()))
+        return proc
+
+    def wait_for_want(self, proc: subprocess.Popen) -> Path:
+        marker = self.dir / "capacity" / f"{hook.ADMIT_WANT}{proc.pid}"
+        deadline = time.monotonic() + 30
+        while not marker.exists():
+            self.assertIsNone(proc.poll(), "the signer must still be waiting")
+            self.assertLess(time.monotonic(), deadline, "the signer never started waiting")
+            time.sleep(0.05)
+        return marker
+
+    def test_a_nightly_signing_job_on_the_nightly_slot_drains_the_mini(self) -> None:
+        """SIGNING_DRAIN: under steady PR load no mini was ever drained, so cmux's picker now sends a nightly signing
+        job to a busy mini's idle nightly slot. Waiting there it holds every other admission and runner gate (no new
+        PR or side job starts on the mini), the running job finishes, and it takes the whole mini; it waits
+        SIGNING_DRAIN_WAIT_S at most, longer than any other signing job, and stays inside the owned-pool rescue's
+        setup window, so the rescue never cancels the nightly run for it."""
+        self.assertEqual(hook.exclusive_capacity_wait(hook.TIER_NIGHTLY, True), hook.SIGNING_DRAIN_WAIT_S)
+        for tier, slot in ((hook.TIER_NIGHTLY, False), ("", True), (hook.TIER_DEV, True), (hook.TIER_STACK, True), ("", False)):
+            with self.subTest(tier=tier, slot=slot):
+                self.assertEqual(hook.exclusive_capacity_wait(tier, slot), hook.EXCLUSIVE_CAPACITY_WAIT_S)
+        self.assertGreater(hook.SIGNING_DRAIN_WAIT_S, hook.EXCLUSIVE_CAPACITY_WAIT_S)
+        self.assertLess(hook.SIGNING_DRAIN_WAIT_S + hook.ADMISSION_WAIT_S + hook.ADMIT_POLL_S, 15 * 60,
+                        "under cmux owned_pool_rescue.SETUP_WAIT_SECONDS")
+        self.fleet()
+        (self.dir / "capacity").mkdir(parents=True, exist_ok=True)
+        busy = hook.lock_file(self.dir / "capacity" / "unit-0", fcntl.LOCK_EX)  # a PR job still runs on one unit
+        self.assertIsNotNone(busy)
+        signer = self.nightly_signer("n0", "30", "--nightly-runner")
+        marker = self.wait_for_want(signer)
+        # The hold while it waits: its marker is a nightly waiter, every other runner's gate holds, and a PR job
+        # its runner already took is not admitted beside it.
+        (waiter,) = hook.admission_waiters(self.dir / "capacity")
+        self.assertEqual((waiter["pid"], waiter["tier"]), (signer.pid, hook.TIER_NIGHTLY))
+        for scope in (hook.RunnerScope(14, 2, 2), hook.RunnerScope(14, 2, 2, root=True),
+                      hook.RunnerScope(14, 2, 2, gui=True), hook.RunnerScope(14, 2, 2, fresh=True),
+                      hook.RunnerScope(14, 2, 2, fast=True)):
+            with self.subTest(scope=scope):
+                self.assertIn("waits here for", hook.mini_full(self.dir / "capacity", 14, scope) or "")
+        pr = self.job("cli-pipe-regressions", "p1", 14, None, "--gui-wait", "0")
+        self.assertEqual(pr.returncode, 1, pr.stdout + pr.stderr)
+        self.assertIsNone(signer.poll(), "the signer still waits for the running job")
+        # The running job ends: the signer takes the whole mini and the hold is gone.
+        os.close(busy)
+        out, _ = signer.communicate(timeout=30)
+        try:
+            self.assertEqual(signer.returncode, 0, out)
+            self.assertIn(f"it waits {hook.SIGNING_DRAIN_WAIT_S:g} s at most for the mini to drain, holding every "
+                          "other admission here meanwhile", out)
+            self.assertIn("holding 14/14 units+fast-0+fast-1+gui for sign-nightly-identity-legacy (exclusive", out)
+            self.assertIn("GLAEDA_JOB_CLAIM=exclusive\n", (self.dir / "github-env-n0").read_text())
+            self.assertFalse(marker.exists(), "admitted: its waiter marker is gone")
+            self.assertEqual(hook.admission_waiters(self.dir / "capacity"), [])
+        finally:
+            self.finish("n0")
+        self.assertTrue(self.lock_free(), "finished: the mini is the fleet's again")
+
+    def test_a_draining_signing_job_that_never_gets_the_mini_is_refused_and_lets_it_go(self) -> None:
+        """The fallback: a mini that does not drain within the bound refuses the signing job (cmux's twin then signs
+        on Blacksmith in the same run), and the refusal or a killed waiter leaves no hold behind."""
+        self.fleet()
+        self.take_units(1)  # a PR job that outlasts the bound
+        signer = self.nightly_signer("n0", "1", "--nightly-runner")
+        marker = self.dir / "capacity" / f"{hook.ADMIT_WANT}{signer.pid}"
+        out, _ = signer.communicate(timeout=30)
+        self.assertEqual(signer.returncode, 1, out)
+        self.assertIn("refused", out)
+        self.assertNotIn("GLAEDA_JOB_CLAIM", (self.dir / "github-env-n0").read_text()
+                         if (self.dir / "github-env-n0").exists() else "")
+        self.assertFalse(marker.exists(), "refused: its waiter marker is gone")
+        self.assertIsNone(hook.mini_full(self.dir / "capacity", 14, hook.RunnerScope(14, 2, 2, fast=True)),
+                          "no hold outlives the refusal")
+        self.assertTrue(self.lock_free(), "the refused job let go of everything it took")
+        killed = self.nightly_signer("n1", "30", "--nightly-runner")
+        marker = self.wait_for_want(killed)
+        killed.kill()
+        killed.wait()
+        self.assertEqual(hook.admission_waiters(self.dir / "capacity"), [], "a killed waiter's marker goes with it")
+        self.assertFalse(marker.exists())
+
     def test_stray_job_processes_refuses_when_ps_or_lsof_cannot_answer_in_full(self) -> None:
         """A failed, partial or empty listing must never read as "nothing in _work" (it refuses the signing job)."""
         (self.dir / "actions-runner-glaeda-7" / "_work").mkdir(parents=True)

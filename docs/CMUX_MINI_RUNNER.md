@@ -194,6 +194,11 @@ What `--apply` does:
      other job counts as a compile. cmux's signing jobs (`SIGNING_JOBS`: the release-environment jobs that put the
      Developer ID key in a temporary keychain) take the `exclusive` class: every unit and both fast tokens, never
      given back early, waiting at most 300 s for the mini to drain before a refusal sends the re-run to Blacksmith.
+     A nightly signing job on the nightly slot (cmux sends one to a busy mini's idle nightly slot when no mini is
+     drained) waits up to `SIGNING_DRAIN_WAIT_S` (600 s) instead: as a nightly waiter it stops every other admission
+     and holds every other runner's gate on the mini, so the running jobs finish and nothing new starts; then it takes
+     the whole mini, or is refused and the run's Blacksmith job signs. Its hold is its `admit.want` marker, gone when
+     it is admitted, refused or killed.
      Admitted, the hook writes `GLAEDA_JOB_CLAIM=exclusive` to `$GITHUB_ENV`, and cmux's signing jobs check it
      before they touch the key, so a mini on an older hook never signs beside another job. The hook's `JOB_CORES` table gives a job its own measured
      cost where it is far from its class's: cmux-next's generated files, both autofix

@@ -457,6 +457,17 @@ FAST_JOBS = {("cmux-next.yml", "fast-tier")}
 EXCLUSIVE_UNITS = 1 << 16
 EXCLUSIVE_CLASS = "exclusive"
 EXCLUSIVE_CAPACITY_WAIT_S = 300.0  # NIGHTLY_CAPACITY_WAIT_S: the same owned-pool rescue window
+# SIGNING_DRAIN: a nightly signing job on the nightly slot drains a busy mini. cmux's picker sends a nightly-next
+# signing job to a mini's idle nightly slot when no mini is drained (under steady PR load none ever was, so legacy
+# signing always went to Blacksmith, which itself queued 26+ min). The slot's gate listens however full the mini is,
+# and the job, a nightly waiter (FEED_FIRST), stops every other admission and holds every other runner's gate on the
+# mini while it waits: no new PR or side job starts there, the running ones finish, and the job then takes the whole
+# mini. It waits SIGNING_DRAIN_WAIT_S at most, then is refused, and the run's Blacksmith twin signs (cmux's claim
+# gate). The hold is the job's own admit.want marker: it goes when the job is admitted, refused or cancelled, and a
+# killed job's goes with its pid (admission_waiters), so it never strands the mini. 10 minutes: a PR compile on a
+# mini runs about 7, and it stays under cmux's owned-pool rescue's SETUP_WAIT_SECONDS (15 min), so the rescue never
+# cancels the nightly run for this wait; any other signing job keeps EXCLUSIVE_CAPACITY_WAIT_S.
+SIGNING_DRAIN_WAIT_S = 600.0
 JOB_CLAIM_ENV = "GLAEDA_JOB_CLAIM"
 # The sha256 of this hook file, written beside JOB_CLAIM_ENV: a job that holds the whole mini can tell which hook
 # admitted it (cmux's signing jobs accept only hooks that wait out an earlier job's leftover processes).
@@ -698,6 +709,13 @@ def dev_daily_feed(event_name: str | None, ref: str | None) -> bool:
     """Whether a DEV_DAILY_WORKFLOW job is main's dispatch, the only one that signs and publishes (DEV_DAILY_FEED).
     job_tier() checks the rest (workflow ref, repository, payload) before such a job ranks as nightly."""
     return event_name == "workflow_dispatch" and ref == DEV_DAILY_REF
+
+
+def exclusive_capacity_wait(tier: str, nightly_runner: bool) -> float:
+    """How long a signing job (EXCLUSIVE_CLASS) waits for the mini to drain: SIGNING_DRAIN_WAIT_S for a nightly job
+    on the nightly slot, which holds every other admission while it waits (SIGNING_DRAIN), else
+    EXCLUSIVE_CAPACITY_WAIT_S."""
+    return SIGNING_DRAIN_WAIT_S if tier == TIER_NIGHTLY and nightly_runner else EXCLUSIVE_CAPACITY_WAIT_S
 
 
 def nightly_capacity_wait(tier: str, event_name: str | None, ref: str | None, job: str | None, workflow: str,
@@ -8546,10 +8564,13 @@ def main(argv: list[str] | None = None) -> int:
             claim_class = admit_class or job_class(os.environ.get("GITHUB_JOB", ""), repo, args.home_repo,
                                                    job_workflow())[0]
             if claim_class == EXCLUSIVE_CLASS:
-                cap = bounded_wait(cap, EXCLUSIVE_CAPACITY_WAIT_S)
+                drain_bound = exclusive_capacity_wait(tier, args.nightly_runner)
+                cap = bounded_wait(cap, drain_bound)
                 print(f"{PREFIX}: a signing job: it takes the whole mini (every unit and fast token), so no other job "
-                      f"runs here beside it; it waits {EXCLUSIVE_CAPACITY_WAIT_S:g} s at most for the mini to drain, "
-                      "then is refused so its re-run takes Blacksmith", flush=True)
+                      f"runs here beside it; it waits {drain_bound:g} s at most for the mini to drain, "
+                      + ("holding every other admission here meanwhile, then is refused so the run's Blacksmith job "
+                         "signs" if drain_bound == SIGNING_DRAIN_WAIT_S else
+                         "then is refused so its re-run takes Blacksmith"), flush=True)
             if tier == TIER_NIGHTLY:
                 print(f"{PREFIX}: a nightly job: it goes ahead of every other job waiting here, no other job takes a "
                       f"unit while it waits, and it keeps no idle reserve"
