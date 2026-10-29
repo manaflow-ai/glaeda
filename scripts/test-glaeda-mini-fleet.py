@@ -2921,7 +2921,7 @@ echo 23F77 > {home}/runtime
                 fcntl.flock(fd, fcntl.LOCK_EX)
                 locked = self.call(home, "host_check")
                 self.assertEqual(locked.returncode, 20)
-                self.assertIn("held by another build (fleet host lock", locked.stdout)
+                self.assertIn(mf.BUSY_HOST_LOCK, locked.stdout)  # the reason fix reads as "busy, no reservation"
                 # A drain honors only reservations: it waits out the job that holds the lock.
                 gate = subprocess.run(["bash", "-c", 'say() { :; }; eval "$(sed -n "/^# >>> host gate/,/^# <<< host gate/p" '
                                        f'{mf.FIX_LIBRARY})"; host_held reservation || echo free'],
@@ -3505,6 +3505,32 @@ class HostGateTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn(f"held: {why}, skipped", out)
         self.assertEqual({c[0] for c in calls}, {"build-mini-1"})
+
+    def test_fix_runs_only_the_draining_repairs_on_a_host_the_host_lock_holds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data = json.loads(EXAMPLE.read_text())
+            data["defaults"]["ios_simulator"] = {"runtimes": ["23F77"]}
+            manifest = Path(tmp) / "m.json"
+            manifest.write_text(json.dumps(data))
+            busy = mf.BUSY_HOST_LOCK + "/Users/Shared/cmux-build-fleet/host.lock)"
+            reserved = "reserved by cache-bench for measurement until 2100-01-01T00:00:00Z"
+            # build-mini-1 lacks the runtime and Metal; build-mini-2 lacks only Metal; build-mini-3 is reserved.
+            texts = {"build-mini-1": preflight_text(metal=False),
+                     "build-mini-2": preflight_text(metal=False, node_id="cmux-mac-002")
+                     + "ios_runtime\t26.5|26.5|23F77|com.apple.CoreSimulator.SimRuntime.iOS-26-5\n",
+                     "build-mini-3": preflight_text(node_id="cmux-mac-003")}
+            data["hosts"]["build-mini-3"] = {**data["hosts"]["build-mini-2"], "node_id": "cmux-mac-003"}
+            manifest.write_text(json.dumps(data))
+            code, out, calls = run_command(texts, "--yes", command="fix", manifest=manifest, after=texts,
+                                           held={"build-mini-1": busy, "build-mini-2": busy, "build-mini-3": reserved})
+        ran = [(c[0], remote_call(c[1]).split()[-6:][0]) for c in calls if "ios_runtime" in c[1] or "metal" in remote_call(c[1])]
+        self.assertEqual([c[0] for c in calls if remote_call(c[1]).startswith("lock")], ["build-mini-1"])
+        self.assertTrue(remote_call(calls_to(calls, "ios_runtime")[0][1]).startswith("lock reservation; ios_runtime "), ran)
+        self.assertFalse(calls_to(calls, "lock; metal"))
+        self.assertIn("metal: xcodebuild -downloadComponent MetalToolchain (about 700 MB) (waits for the fleet host lock", out)
+        self.assertIn(f"build-mini-2: skipped (held: {busy})", out)
+        self.assertIn(f"build-mini-3: skipped (held: {reserved})", out)
+        self.assertEqual(code, 1)
 
     def test_wait_polls_until_the_host_is_free(self) -> None:
         answers = iter(["held by another build", "held by another build", None])

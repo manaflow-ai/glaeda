@@ -106,7 +106,8 @@ on it is left alone. Dry run by default.
 
 fix, share, sudo-plan --run, onboard, repair and upgrade skip a host another build holds (the fleet
 host lock /Users/Shared/cmux-build-fleet/host.lock) or a glaeda-reservation/v1 marker reserves, and
-exit 1; --wait waits up to 4 hours instead. Every changing step on a host checks again first.
+exit 1; --wait waits up to 4 hours instead. fix still runs, on a host only the host lock holds, the
+repairs that drain that lock themselves (the iOS simulator runtime download), and skips the rest. Every changing step on a host checks again first.
 
 The manifest's `candidate` pins the reviewed Glaeda candidate the fleet runs (source, sha256, run,
 artifact, repo, expires). upgrade writes it; preflight, fix, onboard and repair read it.
@@ -3208,6 +3209,12 @@ def routed_ssh_stream(name: str, user: str, command: str, log: Any, stdin: bytes
 
 
 HELD_EXIT = 20  # cmux_mini_fix.sh: the host is held by the fleet host lock or a reservation
+# host_held's reason when the fleet host lock alone holds the host: it checks the reservation first, so a host
+# held for this reason has no active reservation.
+BUSY_HOST_LOCK = "held by another build (fleet host lock "
+# Repairs that wait for the fleet host lock themselves, with a host.lock.waiters entry holding new jobs off, so fix
+# runs them on a host a build or step holds instead of skipping it (a busy build worker is never free on its own).
+DRAINING_REPAIRS = frozenset({"ios_runtime"})
 HOLD_WAIT_SECONDS = 4 * 3600
 HOLD_POLL_SECONDS = 60
 
@@ -3549,16 +3556,21 @@ def fetch_homebrew(manifest: dict[str, Any], name: str, log: Any, seed: str | No
 
 
 def fix_host(manifest: dict[str, Any], name: str, result: dict[str, Any], yes: bool,
-             log_dir: Path | None, seed: str | None = None) -> dict[str, Any]:
+             log_dir: Path | None, seed: str | None = None, only: frozenset[str] | None = None) -> dict[str, Any]:
     """Run (or, without yes, plan) one host's non-root repairs in order. Nothing is retried within a run.
 
-    With a seed host, the Xcode app, Python, the candidate and the Metal toolchain come from it over the LAN."""
+    With a seed host, the Xcode app, Python, the candidate and the Metal toolchain come from it over the LAN.
+    With only, just the repairs of those kinds (a busy host: the ones that drain the fleet host lock themselves)."""
     mine, root = planned_actions(result)
+    later = [a for a in mine if only is not None and a["kind"] not in only]
+    mine = [a for a in mine if a not in later]
     checks = result["checks"]
     out: dict[str, Any] = {"host": name, "planned": [], "done": [], "failed": [], "waiting": [], "log": None,
                            "sudo": [c for a in root for c in a["checks"]],
                            "person": [f"{c}: {v['fix']}" for c, v in checks.items()
                                       if v["state"] == "fail" and v["group"] == "person" and v["fix"]]}
+    out["waiting"] += [f"{'/'.join(a['checks'])}: {describe(a, manifest, name)} (waits for the fleet host lock: a build or "
+                       "step holds it)" for a in later]
     fixed: set[str] = set()
     log = None
     if yes and mine and log_dir is not None:
@@ -3641,13 +3653,24 @@ def cmd_fix(manifest: dict[str, Any], hosts: list[str], yes: bool, log_dir: Path
         select_hosts(manifest, [seed])
     targets, skipped = eligible_hosts(manifest, [h for h in hosts if h != seed])
     held = gate_hosts(manifest, targets, wait and yes)
+    # A host held only by the fleet host lock (a busy build worker, never a reservation) still gets the repairs
+    # that drain the lock themselves (DRAINING_REPAIRS); the rest wait, as on any held host.
+    busy = {h: why for h, why in held.items() if why.startswith(BUSY_HOST_LOCK)}
+    held = {h: why for h, why in held.items() if h not in busy}
     skipped.update({h: f"held: {why}" for h, why in held.items()})
     targets = [h for h in targets if h not in held]
     results = {r["host"]: r for r in preflight(manifest, observe(manifest, targets, preflight=True), targets)}
+    for name, why in busy.items():
+        if "reach" in results[name]["checks"] or \
+                not any(a["kind"] in DRAINING_REPAIRS for a in planned_actions(results[name])[0]):
+            skipped[name] = f"held: {why}"
+            held[name] = why
+    targets = [h for h in targets if h not in held]
     directory = run_log_dir("fix", log_dir) if yes else None
     reachable = [h for h in targets if "reach" not in results[h]["checks"]]
     with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
-        done = dict(zip(reachable, pool.map(lambda h: fix_host(manifest, h, results[h], yes, directory, seed), reachable)))
+        done = dict(zip(reachable, pool.map(lambda h: fix_host(manifest, h, results[h], yes, directory, seed,
+                                                                 DRAINING_REPAIRS if h in busy else None), reachable)))
     outcomes = []
     for name in [h for h in hosts if h != seed]:
         if name in skipped:
