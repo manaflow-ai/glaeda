@@ -8531,6 +8531,12 @@ class PostTest(unittest.TestCase):
         args = gg.parser().parse_args(["post", *argv])
         with mock.patch.object(sys, "stdin", io.StringIO(stdin)):
             item = gg.post_item(args)
+        # Two items queued in one millisecond by one process sort by their random suffix, so a test that
+        # queues two in a row saw them sent in either order (a fast CI runner did): keep queue order.
+        last = getattr(self, "_last_id", "")
+        if item["id"] <= last:
+            item["id"] = f"{int(last.split('-', 1)[0]) + 1:013d}-{item['id'].split('-', 1)[1]}"
+        self._last_id = item["id"]
         gg.write_json(gg.outbox_dir() / f"{item['id']}.json", item)
         return item
 
