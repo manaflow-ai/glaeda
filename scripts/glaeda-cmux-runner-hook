@@ -87,7 +87,7 @@ fits names the step classes this mini could admit right now. Each prints one JSO
 
 runs under the runner LaunchAgent's listen.sh: it runs DIR/run.sh, and while the fleet has the host (an exclusive
 host lock, a reservation, or a fleet build waiting for the lock), every capacity unit on the mini is
-taken, or the mini is saturated (sampled host CPU at least GATE_CPU_PAUSE or elevated memory pressure), it stops the idle
+taken, or the mini is saturated (host CPU over GATE_CPU_WINDOW_S at least GATE_CPU_PAUSE or elevated memory pressure), it stops the idle
 runner's listener so GitHub routes the job to another runner instead of here to be refused or slowed
 down (Gate). A --require-eligible runner also stops listening while job-started would refuse every job for
 eligibility (Gate.ineligible: the node status or the class receipt's toolchain, looked at in a thread at most
@@ -1211,6 +1211,17 @@ GATE_CONFIRM = 2  # consecutive idle polls, so a hook's or a probe's momentary h
 GATE_CPU_PAUSE = float(os.environ.get("GLAEDA_RUNNER_GATE_CPU_PAUSE") or 85.0)
 GATE_CPU_RESUME = float(os.environ.get("GLAEDA_RUNNER_GATE_CPU_RESUME") or 80.0)
 GATE_CPU_EVERY_S = float(os.environ.get("GLAEDA_RUNNER_GATE_CPU_EVERY_S") or 10.0)
+# The marks apply to CPU busy averaged over the last GATE_CPU_WINDOW_S, not to one iostat second every 10 s. A mini
+# running compiles swings 60-100% second to second, so a lone sample crossed both marks about once a minute: on
+# 10-29 one std mini's gates logged 6,582 CPU hold lines (glaeda#1751's measurements), each a pause or resume, while
+# the units ledger already sized the admissions. The average comes from the kernel's CPU tick counters
+# (host_cpu_ticks) read on the gate's own looks: two reads cover the whole span between them, with no process, no
+# thread and no wait. Bounded to 30-60 s, so a sustained rise still pauses within a minute; 0 (the rollback lever)
+# restores the single one-second sample.
+GATE_CPU_WINDOW_MIN_S, GATE_CPU_WINDOW_MAX_S = 30.0, 60.0
+_cpu_window_env = float(os.environ.get("GLAEDA_RUNNER_GATE_CPU_WINDOW_S") or GATE_CPU_WINDOW_MAX_S)
+GATE_CPU_WINDOW_S = 0.0 if _cpu_window_env <= 0 else min(GATE_CPU_WINDOW_MAX_S,
+                                                         max(GATE_CPU_WINDOW_MIN_S, _cpu_window_env))
 GATE_MEMORY_PRESSURE_HOLD = 2
 # Kept for the pure mini_saturated helper and old operator tooling; the listener gate no longer uses load average.
 GATE_LOAD_PAUSE = float(os.environ.get("GLAEDA_RUNNER_GATE_LOAD_PAUSE") or 2.0)
@@ -5295,8 +5306,9 @@ def mini_saturated(paused: bool, load: float | None = None, cores: int | None = 
 def host_saturated(paused: bool, cpu_busy: float | None = None, memory_pressure: int | None = None) -> str | None:
     """Why the listener should pause from measured host pressure, or None when it has headroom.
 
-    CPU busy is iostat's one-second sample; memory pressure 2 (elevated) or 4 (critical) is a separate
-    admission brake. Missing samples fail open so a broken probe never strands a runner.
+    CPU busy is the host's busy % averaged over GATE_CPU_WINDOW_S (Gate.cpu_look; iostat's one-second sample when
+    the window is 0); memory pressure 2 (elevated) or 4 (critical) is a separate admission brake. Missing samples
+    fail open so a broken probe never strands a runner.
     """
     memory_hot = memory_pressure is not None and memory_pressure >= GATE_MEMORY_PRESSURE_HOLD
     if cpu_busy is None and not memory_hot:
@@ -5310,7 +5322,7 @@ def host_saturated(paused: bool, cpu_busy: float | None = None, memory_pressure:
     reasons = []
     if cpu_hot:
         limit = GATE_CPU_RESUME if paused else GATE_CPU_PAUSE
-        reasons.append(f"CPU busy at least {limit:g}%")
+        reasons.append(f"CPU busy at least {limit:g}%" + (f" over {GATE_CPU_WINDOW_S:g} s" if GATE_CPU_WINDOW_S > 0 else ""))
     if memory_hot:
         reasons.append(f"memory pressure level {memory_pressure}")
     return f"{SATURATED} ({' and '.join(reasons)}; listening resumes below {GATE_CPU_RESUME:g}% CPU and normal memory pressure)"
@@ -5743,6 +5755,7 @@ class Gate:
         self.load_waived = False  # a pressure hold ran past GATE_LOAD_MAX_HOLD_S; ignored until pressure falls
         self.cpu_busy: float | None = None
         self.cpu_at = -GATE_CPU_EVERY_S
+        self.cpu_window = CpuWindow(GATE_CPU_WINDOW_S)  # read on the looks (cpu_look, cpu_feed); lost on reload
         self.memory_pressure: int | None = None
         self.memory_at = -GATE_CPU_EVERY_S
         self.console_why: str | None = None  # the last console_refusal, read at most every GATE_CONSOLE_EVERY_S
@@ -5898,8 +5911,29 @@ class Gate:
             return None
         return why
 
+    def cpu_look(self, now: float) -> float | None:
+        """Host CPU busy % for the saturation marks: the average over GATE_CPU_WINDOW_S (CpuWindow), or iostat's
+        one-second sample when the window is 0, the tick counters cannot be read, or no read lies inside the window
+        yet (the gate's first look after it starts or reloads)."""
+        ticks = host_cpu_ticks() if GATE_CPU_WINDOW_S > 0 else None
+        busy = self.cpu_window.add(now, ticks) if ticks is not None else None
+        if busy is None:
+            _, busy = host_io()
+        return busy
+
+    def cpu_feed(self, now: float) -> None:
+        """While the listener runs a job the gate makes no saturation look, but the look right after the job is the
+        one that decides whether to stop it: keep the window read on the usual cadence, so that look averages the
+        last minute instead of taking a single second. A tick read only (no iostat, no wait)."""
+        if GATE_CPU_WINDOW_S <= 0 or now - self.cpu_at < GATE_CPU_EVERY_S:
+            return
+        ticks = host_cpu_ticks()
+        if ticks is not None and (busy := self.cpu_window.add(now, ticks)) is not None:
+            self.cpu_busy, self.cpu_at = busy, now
+
     def saturated(self) -> str | None:
-        """Use sampled host CPU and VM pressure with hysteresis; unreadable probes never hold a listener.
+        """Use host CPU averaged over GATE_CPU_WINDOW_S and VM pressure with hysteresis; unreadable probes never
+        hold a listener.
 
         The gui runner is held for memory pressure only. Its label brings the console jobs (app-host shards, lag,
         cmux-next's swift test), one at a time per mini, and their units are admitted like any other job's; the
@@ -5926,7 +5960,7 @@ class Gate:
         if scope.gui or scope.session or scope.fresh or scope.nightly or scope.gateway:
             self.cpu_busy = None
         elif now - self.cpu_at >= GATE_CPU_EVERY_S:
-            _, self.cpu_busy = host_io()
+            self.cpu_busy = self.cpu_look(now)
             self.cpu_at = now
         if now - self.memory_at >= GATE_CPU_EVERY_S:
             self.memory_pressure = memory_pressure_level()
@@ -6691,6 +6725,7 @@ class Gate:
                     # job lets it go (session_look) when that is due.
                     self.unclaim(keep_first=True)
                 self.load_since = None  # the hold limit times a pause, never a job
+                self.cpu_feed(now)
                 # the reserve stays held through the runner's own job: its admission lends it (RESERVE_LENT), so it
                 # keeps nothing while that job holds its units and is whole the moment they go back. One the job could
                 # not borrow keeps its units from the other lanes meanwhile, the safe side.
@@ -7180,6 +7215,87 @@ def host_io() -> tuple[float | None, float | None]:
     except (ValueError, IndexError):
         return None, None
     return disk, busy
+
+
+# host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO, ...) from libSystem, read through ctypes like
+# proc_pid_rusage above: host_cpu_load_info is natural_t cpu_ticks[CPU_STATE_MAX], the user, system, idle and nice
+# ticks since boot summed over every CPU, the counters iostat's cpu columns are computed from. Each is a 32-bit
+# counter that wraps (at 100 Hz on 14 CPUs, after about 35 days), so CpuWindow takes differences modulo 2**32.
+HOST_CPU_LOAD_INFO = 3
+CPU_STATE_MAX = 4
+CPU_STATE_IDLE = 2
+_MACH_HOST: list[Any] = []
+
+
+def host_cpu_ticks() -> tuple[int, ...] | None:
+    """The host's cumulative CPU ticks (user, system, idle, nice), or None off Darwin or when unreadable. One mach
+    call: no process, no thread and no wait, so the gate can read it on any look."""
+    if not _MACH_HOST:
+        call = None
+        if sys.platform == "darwin":
+            try:
+                import ctypes
+                lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+                lib.mach_host_self.restype = ctypes.c_uint32
+                lib.mach_host_self.argtypes = ()
+                fn = lib.host_statistics
+                fn.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32))
+                fn.restype = ctypes.c_int
+                call = (fn, lib.mach_host_self())  # one send right for the gate's life, not one per read
+            except (OSError, AttributeError, ImportError):
+                call = None
+        _MACH_HOST.append(call)
+    if _MACH_HOST[0] is None:
+        return None
+    import ctypes
+    fn, host = _MACH_HOST[0]
+    ticks = (ctypes.c_uint32 * CPU_STATE_MAX)()
+    count = ctypes.c_uint32(CPU_STATE_MAX)
+    try:
+        if fn(host, HOST_CPU_LOAD_INFO, ctypes.byref(ticks), ctypes.byref(count)) != 0 or count.value != CPU_STATE_MAX:
+            return None
+    except (OSError, ctypes.ArgumentError):
+        return None
+    return tuple(int(t) for t in ticks)
+
+
+class CpuWindow:
+    """Host CPU busy % over the last `window` seconds, from cumulative tick counters read on the gate's looks.
+
+    add(now, ticks) records the span since the previous read: its busy ticks (all but idle) and all ticks, each a
+    difference modulo 2**32. Spans that began more than `window` seconds ago are dropped, so the average never
+    reaches further back than the window; with reads every GATE_CPU_EVERY_S it covers between window minus one
+    read interval and window. It answers None when no span is left (the first read, or a gap between reads longer
+    than the window), and the caller then takes a one-second sample instead. Memory is bounded by the window over
+    the read interval (about 6 spans at 60 s and 10 s); nothing runs between reads."""
+
+    def __init__(self, window: float) -> None:
+        self.window = window
+        self.last: tuple[float, tuple[int, ...]] | None = None
+        self.spans: list[tuple[float, int, int]] = []  # (start, busy ticks, all ticks), oldest first
+
+    def add(self, now: float, ticks: tuple[int, ...]) -> float | None:
+        if self.last is not None and now > self.last[0] and len(ticks) == len(self.last[1]) == CPU_STATE_MAX:
+            then, prev = self.last
+            delta = [(new - old) % 2**32 for new, old in zip(ticks, prev)]
+            total = sum(delta)
+            self.spans.append((then, total - delta[CPU_STATE_IDLE], total))
+        if self.last is None or now >= self.last[0]:
+            self.last = (now, tuple(ticks))
+        else:  # a clock that went back: start over rather than mix spans
+            self.last, self.spans = (now, tuple(ticks)), []
+        self.spans = [span for span in self.spans if span[0] >= now - self.window]
+        return self.busy()
+
+    def covered(self, now: float) -> float:
+        """Seconds the current average covers (0 when it has no span)."""
+        return now - self.spans[0][0] if self.spans else 0.0
+
+    def busy(self) -> float | None:
+        total = sum(span[2] for span in self.spans)
+        if total <= 0:
+            return None
+        return 100.0 * sum(span[1] for span in self.spans) / total
 
 
 def thermal_limited() -> bool | None:

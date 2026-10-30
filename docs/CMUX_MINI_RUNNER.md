@@ -358,6 +358,15 @@ What `--apply` does:
        stopped one, keeps nothing. Before it, side and root jobs filled every unit on the
        minis and the gui runners sat held as full: on 2026-10-21 about 6 of 13 gui
        runners listened and gui-label jobs queued 1.5 to 3 h.
+     - The CPU saturation marks (pause at 85% busy, resume below 80%) apply to the host's
+       CPU busy averaged over the last 60 s (`GATE_CPU_WINDOW_S`, bounded to 30-60 s; 0 goes
+       back to one `iostat` second), read from the kernel's CPU tick counters on the gate's
+       own looks every 10 s (`host_cpu_ticks`, one mach call: no process, thread or wait),
+       and kept current through a job so the look after it averages the last minute. A
+       single one-second sample of a mini running compiles swings 60-100%, and the gate
+       crossed both marks about once a minute (glaeda#1751's 10-29 measurements). The
+       gate's first look after it starts or reloads, before a read lies in the window,
+       still takes one `iostat` second.
      - The gui runner is never held for CPU saturation (85% busy), only for memory
        pressure: its jobs come one per mini and are admitted by units like any other,
        and the CPU mark held it whenever the other lanes kept the mini busy. Nothing

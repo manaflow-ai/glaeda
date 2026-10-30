@@ -60,6 +60,9 @@ cr.macos_major = lambda: None
 # hooks the tests start; pressure tests patch the thresholds and samples themselves.
 os.environ["GLAEDA_RUNNER_GATE_LOAD_PAUSE"] = os.environ["GLAEDA_RUNNER_GATE_LOAD_RESUME"] = "1000000"
 os.environ["GLAEDA_RUNNER_GATE_CPU_PAUSE"] = os.environ["GLAEDA_RUNNER_GATE_CPU_RESUME"] = "1000000"
+# and no CPU window, so a Mac running these tests never mixes its own tick counters into a patched host_io sample;
+# the CpuWindow tests set the window and the tick reader themselves.
+os.environ["GLAEDA_RUNNER_GATE_CPU_WINDOW_S"] = "0"
 # Likewise the console check reads this Mac's real session, which a locked test host would turn into refusals: no
 # ioreg here or in the hooks the tests start (unreadable changes nothing); console tests point it at a fake.
 os.environ["GLAEDA_RUNNER_IOREG"] = "/nonexistent/ioreg"
@@ -7372,9 +7375,11 @@ class GateTest(unittest.TestCase):
             fresh = load("glaeda_cmux_runner_hook_gate_defaults", HOOK)
         self.addCleanup(sys.modules.pop, "glaeda_cmux_runner_hook_gate_defaults", None)
         self.assertEqual((fresh.GATE_CPU_PAUSE, fresh.GATE_CPU_RESUME), (85.0, 80.0))
+        self.assertEqual(fresh.GATE_CPU_WINDOW_S, 60.0, "the marks apply to a 60 s average by default")
         busy = [0.0]
         gate = fresh.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
         with mock.patch.object(fresh, "GATE_CPU_EVERY_S", 0.0), \
+                mock.patch.object(fresh, "host_cpu_ticks", return_value=None), \
                 mock.patch.object(fresh, "host_io", side_effect=lambda: (0.0, busy[0])), \
                 mock.patch.object(fresh, "memory_pressure_level", return_value=1), \
                 mock.patch.object(fresh, "thermal_pressure_level", return_value=0):
@@ -7396,6 +7401,123 @@ class GateTest(unittest.TestCase):
             self.assertIsNone(hook.host_saturated(True, cpu_busy=69.9, memory_pressure=1))
             self.assertIsNone(hook.host_saturated(False, cpu_busy=None, memory_pressure=None))
 
+    # The CPU window (GATE_CPU_WINDOW_S). A trace is one host CPU busy % per second; the tick counters a 14-core mini
+    # would report for it are its running sums, and iostat's one-second sample at second t is trace[t].
+    @staticmethod
+    def compile_trace(seconds: int, seed: int = 7) -> list[float]:
+        """A compile-like trace oscillating around 80%: bursts of 95% and lulls of 62% (mean 81%), with noise."""
+        import random
+        rng = random.Random(seed)
+        return [min(100.0, max(0.0, (95.0 if t % 7 < 4 else 62.0) + rng.gauss(0, 6))) for t in range(seconds)]
+
+    def drive(self, trace: list[float], window: float = 60.0, until: int | None = None,
+              start: int = 0) -> list[tuple[int, bool]]:
+        """Gate.saturated() looked at every GATE_POLL_S over the trace, with the default marks (85/80), cadence (10 s)
+        and the given window: [(second, held)] at every change of the held state, the first look included."""
+        ticks = [0]
+        for busy in trace:
+            ticks.append(ticks[-1] + round(busy * 14))
+        offset = 2**32 - 1400 * 30  # the 32-bit counters wrap half a minute in
+        clock = [float(start)]
+
+        def counters() -> tuple[int, ...]:
+            t = min(int(clock[0]), len(trace))
+            busy, total = ticks[t], 1400 * t
+            return ((busy + offset) % 2**32, 0, (total - busy + offset) % 2**32, 0)
+
+        for name, value in (("GATE_CPU_PAUSE", 85.0), ("GATE_CPU_RESUME", 80.0), ("GATE_CPU_EVERY_S", 10.0),
+                            ("GATE_CPU_WINDOW_S", window)):
+            patcher = mock.patch.object(hook, name, value, create=True)  # create: the same trace replays on main
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        changes: list[tuple[int, bool]] = []
+        with mock.patch.object(hook, "host_cpu_ticks", side_effect=counters, create=True), \
+                mock.patch.object(hook, "host_io",
+                                  side_effect=lambda: (0.0, trace[min(int(clock[0]), len(trace) - 1)])), \
+                mock.patch.object(hook, "memory_pressure_level", return_value=1), \
+                mock.patch.object(hook.time, "monotonic", side_effect=lambda: clock[0]):
+            while clock[0] < (until if until is not None else len(trace) - 1):
+                held = gate.saturated() is not None
+                if not changes or changes[-1][1] != held:
+                    changes.append((int(clock[0]), held))
+                clock[0] += hook.GATE_POLL_S
+        return changes
+
+    def test_a_compiling_mini_does_not_flip_the_cpu_gate_once_a_minute(self) -> None:
+        trace = self.compile_trace(3600)
+        flips = len(self.drive(trace)) - 1
+        self.assertLessEqual(flips, 2, f"a 60 s average around 81% stays on one side of the marks: {flips} flips/h")
+        single = len(self.drive(trace, window=0.0)) - 1
+        self.assertGreater(single, 30, f"the one-second sample flips on the same trace ({single} flips/h)")
+
+    def test_a_sustained_rise_still_pauses_within_the_window(self) -> None:
+        trace = [50.0] * 300 + [100.0] * 300
+        changes = self.drive(trace)
+        self.assertEqual(changes[0], (0, False))
+        self.assertEqual(len(changes), 2, changes)
+        second, held = changes[1]
+        self.assertTrue(held)
+        took = second - 300
+        self.assertGreater(took, 20, f"one hot second is not a pause: paused {took} s after the rise")
+        self.assertLessEqual(took, hook.GATE_CPU_WINDOW_S + hook.GATE_CPU_EVERY_S + hook.GATE_POLL_S,
+                             f"a sustained rise pauses within the window: {took} s")
+
+    def test_a_sustained_drop_resumes(self) -> None:
+        trace = [100.0] * 600 + [40.0] * 300
+        changes = self.drive(trace)
+        self.assertEqual([held for _, held in changes], [True, False], changes)
+        took = changes[1][0] - 600
+        # 100% falling to 40%: the 60 s average is below 80% once a third of the window is at 40%
+        self.assertGreater(took, 10, f"one cool second is not a resume: resumed {took} s after the drop")
+        self.assertLessEqual(took, hook.GATE_CPU_WINDOW_S + hook.GATE_CPU_EVERY_S + hook.GATE_POLL_S,
+                             f"a sustained drop resumes within the window: {took} s")
+
+    def test_the_cpu_window_stays_within_its_bounds(self) -> None:
+        window = hook.CpuWindow(60.0)
+        self.assertIsNone(window.add(0.0, (0, 0, 0, 0)), "one read is no span: the caller samples instead")
+        busy = total = 0
+        for t in range(10, 1210, 10):  # 100% busy for 10 minutes, then idle
+            total += 14000
+            busy += 14000 if t <= 600 else 0
+            avg = window.add(float(t), (busy, 0, total - busy, 0))
+            if t >= 60:
+                self.assertLessEqual(window.covered(float(t)), 60.0, t)
+                self.assertGreaterEqual(window.covered(float(t)), 50.0, t)
+            if t == 600:
+                self.assertEqual(avg, 100.0)
+            if t >= 660:
+                self.assertEqual(avg, 0.0, f"at {t} s nothing older than the window counts")
+        self.assertIsNone(window.add(1300.0, (busy, 0, total + 1000, 0)),
+                          "a gap longer than the window leaves no span inside it")
+        wrapped = hook.CpuWindow(60.0)
+        wrapped.add(0.0, (2**32 - 700, 0, 5, 0))
+        self.assertEqual(wrapped.add(1.0, (700, 0, 5, 0)), 100.0, "the 32-bit counters wrap")
+        for env, expected in (("5", 30.0), ("45", 45.0), ("600", 60.0), ("0", 0.0)):
+            with mock.patch.dict(os.environ, {"GLAEDA_RUNNER_GATE_CPU_WINDOW_S": env}):
+                fresh = load("glaeda_cmux_runner_hook_cpu_window", HOOK)
+            sys.modules.pop("glaeda_cmux_runner_hook_cpu_window", None)
+            self.assertEqual(fresh.GATE_CPU_WINDOW_S, expected, f"GLAEDA_RUNNER_GATE_CPU_WINDOW_S={env}")
+
+    def test_the_look_after_a_job_reads_the_window_kept_through_it(self) -> None:
+        for name, value in (("GATE_CPU_PAUSE", 85.0), ("GATE_CPU_RESUME", 80.0), ("GATE_CPU_EVERY_S", 10.0),
+                            ("GATE_CPU_WINDOW_S", 60.0)):
+            patcher = mock.patch.object(hook, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        clock, busy = [1000.0], [0]
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        with mock.patch.object(hook, "host_cpu_ticks", side_effect=lambda: (busy[0], 0, 1400 * int(clock[0]) - busy[0], 0)), \
+                mock.patch.object(hook, "host_io", return_value=(0.0, 100.0)) as sample, \
+                mock.patch.object(hook, "memory_pressure_level", return_value=1), \
+                mock.patch.object(hook.time, "monotonic", side_effect=lambda: clock[0]):
+            for _ in range(60):  # a 10-minute job on a mini at 50%: the busy polls feed the window
+                gate.cpu_feed(clock[0])
+                clock[0] += 10
+                busy[0] += 7000
+            self.assertIsNone(gate.saturated(), "the look after the job averages the last minute, 50%")
+            sample.assert_not_called()  # at 100%, a one-second sample would have held it
+            self.assertAlmostEqual(gate.cpu_busy, 50.0)
     def test_gate_lines_carry_a_utc_stamp_readers_still_match(self) -> None:
         out = io.StringIO()
         with mock.patch.object(hook.time, "gmtime", return_value=time.gmtime(1790379071)), \
