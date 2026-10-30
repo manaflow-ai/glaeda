@@ -295,4 +295,62 @@ test ! -e "$run_root/run/store.pid"
 test ! -e "$run_root/run/store.bin"
 ! grep -q '^started ' "$temporary_root/missing.out"
 
+# The LAN relay: a socket-activated LaunchAgent whose only LAN client is Apple's nc.
+relay_root=$temporary_root/relay
+mkdir -p "$relay_root/home/Library/LaunchAgents" "$relay_root/bin"
+cat >"$stub_bin/plutil" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$stub_bin/plutil"
+eval "$(sed -n '/^RELAY_LABEL=/,/^# Stop the role/p' "$script" | sed '$d')"
+eval "$(sed -n '/^xml()/p' "$script")"
+say() { :; }
+bootstrap() { printf 'bootstrap %s %s\n' "$2" "$3" >>"$temporary_root/launchctl.log"; }
+AGENTS=$relay_root/home/Library/LaunchAgents LOGS=$relay_root/logs RELAY_LISTEN=127.0.0.1:7451
+BIN=$relay_root/bin apply=1 trusted=ab
+PATH="$stub_bin:$PATH" write_relay 172.20.21.158:7450
+plist=$AGENTS/com.teamleaderleo.glaeda.fleet-cas-relay.plist
+tr -d ' \n' <"$plist" >"$relay_root/plist.flat"
+grep -q '<string>/usr/bin/nc</string><string>-G</string><string>2</string><string>172.20.21.158</string><string>7450</string></array>' "$relay_root/plist.flat"
+grep -q '<key>inetdCompatibility</key><dict><key>Wait</key><false/></dict>' "$relay_root/plist.flat"
+grep -q '<key>SockNodeName</key><string>127.0.0.1</string><key>SockServiceName</key><string>7451</string>' "$relay_root/plist.flat"
+grep -q 'bootstrap com.teamleaderleo.glaeda.fleet-cas-relay' "$temporary_root/launchctl.log"
+# The relay check asks the store a real question: a marker lookup answers 0 or 1 only from a
+# fleet-cas store; a transport failure (2) through the relay fails the install.
+for code in 0 1; do
+  printf '#!/usr/bin/env bash\necho "$*" >>%q\nexit %s\n' "$relay_root/calls" "$code" >"$BIN/fleet-cas"
+  chmod +x "$BIN/fleet-cas"
+  check_relay 172.20.21.158:7450
+done
+grep -q '^marker get http://127.0.0.1:7451 glaeda-relay-check/' "$relay_root/calls"
+printf '#!/usr/bin/env bash\nexit 2\n' >"$BIN/fleet-cas"
+if PATH="$stub_bin:$PATH" check_relay 172.20.21.158:7450 2>"$relay_root/check.err"; then exit 1; fi
+grep -q 'does not reach the store at 172.20.21.158:7450' "$relay_root/check.err"
+# No --relay removes it.
+FLEET_CAS_TEST_LAUNCHCTL_LOG="$temporary_root/launchctl.log" PATH="$stub_bin:$PATH" write_relay ""
+test ! -e "$plist"
+grep -q 'bootout gui/.*/com.teamleaderleo.glaeda.fleet-cas-relay' "$temporary_root/launchctl.log"
+# A node planned with --relay points its upstream and env at the local relay.
+env "${common_env[@]}" "$script" node --relay 172.20.21.158:7450 --trusted-keys ab >"$relay_root/node-plan"
+grep -q 'relay com.teamleaderleo.glaeda.fleet-cas-relay: 127.0.0.1:7451 to /usr/bin/nc 172.20.21.158:7450' "$relay_root/node-plan"
+grep -q 'store 127.0.0.1:7451 (relay to 172.20.21.158:7450)' "$relay_root/node-plan"
+grep -q -- '--upstream http://127.0.0.1:7451' "$relay_root/node-plan"
+if env "${common_env[@]}" "$script" node --relay 172.20.21.158:7450 --store 100.89.140.13:7450 \
+  >/dev/null 2>"$relay_root/both.err"; then exit 1; fi
+grep -q 'drop --store' "$relay_root/both.err"
+
+# The store host's own gc agent: a custom store root only, its own label, the gc-only prune.
+ROOT=/Volumes/glaeda-fleet-cas launch_root=$relay_root/launch here=$repo_root FLEET_CAS_ROOT=/Volumes/glaeda-fleet-cas
+PATH="$stub_bin:$PATH" write_store_prune
+gc_plist=$AGENTS/com.teamleaderleo.glaeda.fleet-cas-store-gc.plist
+tr -d ' \n' <"$gc_plist" >"$relay_root/gc.flat"
+grep -q "<string>$relay_root/launch/glaeda-fleet-cas-prune</string><string>--apply</string><string>--store-gc-only</string>" "$relay_root/gc.flat"
+grep -q '<key>GLAEDA_FLEET_CAS_ROOT</key><string>/Volumes/glaeda-fleet-cas</string>' "$relay_root/gc.flat"
+grep -q '<key>StartInterval</key><integer>3600</integer>' "$relay_root/gc.flat"
+cmp "$repo_root/scripts/glaeda-fleet-cas-prune" "$relay_root/launch/glaeda-fleet-cas-prune"
+rm -f "$gc_plist"
+FLEET_CAS_ROOT= PATH="$stub_bin:$PATH" write_store_prune
+test ! -e "$gc_plist"
+
 echo "glaeda-fleet-cas role-scoped uninstall and bind-wait tests passed"

@@ -33,14 +33,17 @@ class PruneTest(unittest.TestCase):
         self.root.mkdir()
         self.lock = Path(self.tmp.name) / "host.lock"
         self.lock.write_text("")
-        self.saved = (fp.ROOT, fp.HOST_LOCK, fp.running_commands, fp.reserved_above_floor, fp.toolchain_overlap)
+        self.saved = (fp.ROOT, fp.HOST_LOCK, fp.running_commands, fp.reserved_above_floor, fp.toolchain_overlap,
+                      fp.free_fraction)
         fp.ROOT, fp.HOST_LOCK = self.root, self.lock
+        fp.free_fraction = lambda path: 0.5  # the test host's own free disk must not decide the gc schedule
         fp.running_commands = lambda: ["/usr/libexec/something", "zsh"]
         fp.reserved_above_floor = lambda: ""
         fp.toolchain_overlap = lambda paths: ""
 
     def tearDown(self) -> None:
-        fp.ROOT, fp.HOST_LOCK, fp.running_commands, fp.reserved_above_floor, fp.toolchain_overlap = self.saved
+        (fp.ROOT, fp.HOST_LOCK, fp.running_commands, fp.reserved_above_floor, fp.toolchain_overlap,
+         fp.free_fraction) = self.saved
         self.tmp.cleanup()
 
     def env(self, sign_key: str = "") -> None:
@@ -178,6 +181,34 @@ class PruneTest(unittest.TestCase):
         rec = fp.store_gc(self.root, 14)
         self.assertTrue(rec["gc"].startswith("skipped: kept entries name no stored object"))
         self.assertEqual(len(log.read_text().splitlines()), 1)  # only the dry run
+
+    def test_store_gc_under_disk_pressure_keeps_fewer_days_more_often(self) -> None:
+        log = self.fake_store(0)
+        rec = fp.store_gc(self.root, 14, free=0.10)
+        self.assertEqual((rec["gc"], rec["gc_keep_days"]), ("ran", 7))
+        self.assertIn("--keep-days 7", log.read_text().splitlines()[-1])
+        later = time.time() + fp.GC_EVERY_PRESSED + 1
+        self.assertEqual(fp.store_gc(self.root, 14, now=later, free=0.5), {"gc": "not due"})  # no pressure: daily
+        self.assertEqual(fp.store_gc(self.root, 4, now=later, free=0.10)["gc_keep_days"], fp.GC_MIN_KEEP_DAYS)
+
+    def test_store_gc_only_runs_gc_without_the_mini_guards(self) -> None:
+        """The store host's agent: gc only, no env file needed, and neither glaeda-disk guard is consulted."""
+        log = self.fake_store(0)
+        fp.reserved_above_floor = mock.Mock(side_effect=AssertionError("mini guard consulted"))
+        fp.toolchain_overlap = mock.Mock(side_effect=AssertionError("mini guard consulted"))
+        fp.ROOT = Path("/Volumes/glaeda-fleet-cas")
+        with mock.patch.object(fp, "store_gc", return_value={"gc": "ran"}) as gc:
+            rec = self.run_main("--apply", "--store-gc-only")
+        gc.assert_called_once_with(fp.ROOT, 14)
+        self.assertEqual((rec["gc"], rec["result"]), ("ran", "ok"))
+        self.assertNotIn("node_store", rec)
+        self.assertEqual(log.read_text() if log.exists() else "", "")
+
+    def test_store_gc_only_refuses_a_root_outside_volumes(self) -> None:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(fp.main(["--apply", "--store-gc-only"]), 2)
+        self.assertTrue(json.loads(out.getvalue())["result"].startswith("refused"))
 
     def test_no_store_no_gc(self) -> None:
         self.assertEqual(fp.store_gc(self.root, 14), {})

@@ -3,6 +3,10 @@
 
     glaeda-fleet-cas-prune                 plan: sizes, budgets, what would go
     glaeda-fleet-cas-prune --apply         prune (the hourly LaunchAgent from glaeda-mini-setup)
+    glaeda-fleet-cas-prune --apply --store-gc-only
+                                           only the fleet-store gc: the store host's own hourly agent
+                                           (glaeda-fleet-cas store with a custom store root, such as
+                                           the coordinator's external SSD), which has no mini caches
     glaeda-fleet-cas-prune --apply --node-only
                                            only the node-store cap (glaeda-disk's pressure passes, which run
                                            before every job and under the runner floor)
@@ -41,7 +45,9 @@ everything they reach, and anything written in the last day. It runs at most onc
 this same hourly job, and always as a dry run first: the real run goes ahead only when the dry
 run reports 0 "kept entries naming no stored object" (the check of gc's object-ID heuristic),
 otherwise the numbers are logged and nothing is deleted. gc takes no lock: a race with the running
-store only turns into a cache miss, never a wrong answer (gc.rs), so it is not gated on builds. Prints one JSON line per run.
+store only turns into a cache miss, never a wrong answer (gc.rs), so it is not gated on builds. While the store's volume has under 15% free, gc keeps entries
+used within half of --gc-keep-days (at least 3) and may run every 6 hours instead of daily.
+Prints one JSON line per run.
 """
 
 from __future__ import annotations
@@ -69,6 +75,9 @@ BUSY = re.compile(r"(^|/)(xcodebuild|SWBBuildService|XCBBuildService)(\s|$)"
                   r"|/actions-runner[^/\s]*/bin(?:\.[0-9.]+)?/Runner\.Worker(?:\s|$)")
 PRUNING = ".cas.pruning-"  # a local CAS renamed aside for deletion
 GC_EVERY = 86400  # seconds between fleet-store gc runs
+GC_EVERY_PRESSED = 6 * 3600  # ... while the store's volume is under GC_PRESSURE free
+GC_PRESSURE = 0.15
+GC_MIN_KEEP_DAYS = 3
 GC_REPORT = re.compile(r"kept entries naming no stored object: (\d+)")
 
 
@@ -222,14 +231,25 @@ def take_lock(path: Path):
     return fd
 
 
-def store_gc(root: Path, keep_days: int, now: float | None = None) -> dict:
-    """Daily `fleet-cas gc` on the store host: dry run, then the real run only when it is safe."""
+def free_fraction(path: Path) -> float:
+    usage = shutil.disk_usage(path)
+    return usage.free / usage.total if usage.total else 1.0
+
+
+def store_gc(root: Path, keep_days: int, now: float | None = None, free: float | None = None) -> dict:
+    """Daily `fleet-cas gc` on the store host: dry run, then the real run only when it is safe. Under disk pressure
+    (less than GC_PRESSURE of the volume free) it keeps half the days, at least GC_MIN_KEEP_DAYS, every 6 hours."""
     store, binary, stamp = root / "fleet-store", root / "bin" / "fleet-cas", root / "run" / "gc.last"
     if not (store / "kv").is_dir() or not (store / "cas").is_dir():
         return {}
     now = time.time() if now is None else now
+    free = free_fraction(store) if free is None else free
+    pressed = free < GC_PRESSURE
+    every = GC_EVERY_PRESSED if pressed else GC_EVERY
+    if pressed:
+        keep_days = max(GC_MIN_KEEP_DAYS, keep_days // 2)
     try:
-        if now - stamp.stat().st_mtime < GC_EVERY:
+        if now - stamp.stat().st_mtime < every:
             return {"gc": "not due"}
     except FileNotFoundError:
         pass
@@ -254,7 +274,8 @@ def store_gc(root: Path, keep_days: int, now: float | None = None) -> dict:
         return {"gc": "skipped: kept entries name no stored object, so the ID heuristic is suspect",
                 "gc_dry_run": dry}
     code, real = gc()
-    return {"gc": "ran" if code == 0 else "failed", "gc_dry_run": dry, "gc_run": real}
+    return {"gc": "ran" if code == 0 else "failed", "gc_keep_days": keep_days, "gc_free": round(free, 3),
+            "gc_dry_run": dry, "gc_run": real}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -265,10 +286,23 @@ def main(argv: list[str] | None = None) -> int:
                     help="the local Xcode CAS goes whole above this (default %(default)s)")
     ap.add_argument("--node-only", action="store_true",
                     help="only the node-store cap: no local CAS, no sweep, no fleet-store gc")
+    ap.add_argument("--store-gc-only", action="store_true",
+                    help="only the fleet-store gc, for a store host with a custom store root under /Volumes")
     ap.add_argument("--gc-keep-days", type=int, default=14,
                     help="on the store host: fleet-cas gc keeps entries used within this many days")
     a = ap.parse_args(argv)
     rec: dict = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "apply": a.apply}
+    if a.store_gc_only:
+        # A dedicated store volume (glaeda-fleet-cas checks it is its own APFS volume under /Volumes) holds no mini
+        # cache and no toolchain, and the host need not run glaeda-disk, so the mini guards below do not apply.
+        if not os.fspath(ROOT).startswith("/Volumes/"):
+            rec["result"] = f"refused: --store-gc-only needs a store root under /Volumes, not {ROOT}"
+            print(json.dumps(rec))
+            return 2
+        rec.update(store_gc(ROOT, a.gc_keep_days) if a.apply else {"gc": "plan only"})
+        rec["result"] = "ok"
+        print(json.dumps(rec))
+        return 0
     if a.apply and (held := reserved_above_floor()):  # a reserved host's caches are its holder's until the floor
         rec["result"] = f"deferred: {held}"
         print(json.dumps(rec))

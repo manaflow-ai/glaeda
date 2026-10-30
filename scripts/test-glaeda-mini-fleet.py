@@ -40,13 +40,16 @@ STRAY = "SHA256:DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
 
 
 def fleet_cas_text(mode: str = "read-only", node: str = "answers", build_mode: str | None = "present",
-                   store: str | None = None, stats: dict[str, int] | None = None, **kinds: str) -> str:
+                   store: str | None = None, stats: dict[str, int] | None = None, relay: str | None = None,
+                   **kinds: str) -> str:
     """Probe lines for a conforming fleet-cas host; kinds overrides a path's kind (src_cmux="symlink")."""
     lines = [f"fleet_cas_path\t{rel}|{kinds.get(rel.replace('xcode/', '').replace('/', '_').replace('.', '_').replace('-', '_'), want)}"
              for rel, want in {**mf.FLEET_CAS_PATHS, **mf.FLEET_CAS_WRITER_PATHS}.items()]
     lines += [f"fleet_cas_node_mode\t{mode}", f"fleet_cas_node\t{node}"]
     if store:
         lines.append(f"fleet_cas_store\t{store}")
+    if relay:
+        lines.append(f"fleet_cas_relay\t{relay}")
     lines += [f"fleet_cas_stat\t{k}|{v}" for k, v in (stats or {}).items()]
     if build_mode is None:
         lines.append("fleet_recipe_released\tnone")
@@ -895,6 +898,33 @@ class CatchUpTests(unittest.TestCase):
         text = fleet_cas_text(store="100.89.140.13:7450", stats={"up_calls": 12, "up_errors": 2,
                                                                   "up_skipped": 8})
         self.assertEqual([i for i in self.reader(text) if "upstream" in i["detail"]], [])
+
+    def test_reader_through_the_lan_relay_matches_the_relay_target(self) -> None:
+        self.manifest["cache_services"] = [{"kind": "compiler-cas", "endpoint": "172.20.21.158:7450"}]
+        text = fleet_cas_text(store=mf.FLEET_CAS_RELAY_LISTEN, relay="172.20.21.158:7450")
+        self.assertEqual(mf.parse_probe(probe_text(fleet_cas=text))["fleet_cas"]["relay"], "172.20.21.158:7450")
+        self.assertEqual([i for i in self.reader(text) if "upstream" in i["detail"]], [])
+        stale = fleet_cas_text(store=mf.FLEET_CAS_RELAY_LISTEN, relay="172.20.21.99:7450")
+        (issue,) = [i for i in self.reader(stale) if "configured upstream" in i["detail"]]
+        self.assertIn("172.20.21.99:7450", issue["detail"])
+        # A relay line with a direct store is not followed: the node reads the store it names.
+        direct = fleet_cas_text(store="100.89.140.13:7450", relay="172.20.21.158:7450")
+        self.assertTrue([i for i in self.reader(direct) if "configured upstream" in i["detail"]])
+
+    def test_a_lan_relay_store_needs_the_relay_on_every_reader(self) -> None:
+        self.manifest["cache_services"] = [{"kind": "compiler-cas", "endpoint": "172.20.21.158:7450",
+                                            "reader_transport": "lan-relay"}]
+        relayed = fleet_cas_text(store=mf.FLEET_CAS_RELAY_LISTEN, relay="172.20.21.158:7450")
+        loaded = (("gui", mf.FLEET_CAS_RELAY_LABEL, "not running"),)
+        obs = lambda text, jobs=(): mf.check(self.manifest, observed(**{"build-mini-1": probe_text(
+            fleet_cas=text, glaeda_jobs=jobs)}), ["build-mini-1"])
+        self.assertEqual([i for i in obs(relayed, loaded) if "relay" in i["detail"] or "upstream" in i["detail"]], [])
+        (issue,) = [i for i in obs(relayed) if "fleet-cas-relay" in i["detail"]]
+        self.assertIn("not installed", issue["detail"])
+        direct = fleet_cas_text(store="172.20.21.158:7450")
+        (issue,) = [i for i in obs(direct, loaded) if "dials the store directly" in i["detail"]]
+        self.assertIn("--store-lan", issue["fix"])
+        self.assertIsNone(mf.declared_compiler_cas_transport({"cache_services": [{"kind": "compiler-cas"}]}))
 
     def test_orphaned_reader_reports_stale_upstream(self) -> None:
         self.manifest["cache_services"] = [{"kind": "compiler-cas", "endpoint": "100.89.140.13:7450"}]

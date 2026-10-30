@@ -1,8 +1,8 @@
 #!/bin/bash
 # glaeda-fleet-cas: install the fleet compilation-cache services on this cmux mini.
 #
-#   glaeda-fleet-cas node --store HOST:PORT [--trusted-keys HEX] [--prewarm REPO] [--apply]
-#   glaeda-fleet-cas writer --store HOST:PORT --sign-key PATH --trusted-keys HEX [--apply]
+#   glaeda-fleet-cas node (--store HOST:PORT | --relay LAN_IP:PORT) [--trusted-keys HEX] [--prewarm REPO] [--apply]
+#   glaeda-fleet-cas writer (--store HOST:PORT | --relay LAN_IP:PORT) --sign-key PATH --trusted-keys HEX [--apply]
 #   glaeda-fleet-cas store --listen IP:PORT [--writers IP,IP] [--trusted-keys HEX] [--apply]
 #   glaeda-fleet-cas uninstall [node|store|all] [--apply]
 #                                                       remove selected services, keep stores
@@ -29,6 +29,20 @@
 #         --trusted-keys only signed index entries are kept; no writers by default, so a new
 #         store is read-only. The listen address should be a DHCP reservation, or the store
 #         stops binding after a lease change.
+# relay:  --relay LAN_IP:PORT, for a store that only listens on the office LAN (the coordinator's,
+#         whose tailnet port no ACL grants). macOS Local Network privacy keeps launchd-started
+#         third-party binaries such as fleet-cas off the LAN (2026-10-30 on cmux14: fleet-cas and
+#         Xcode's python3 fail, /usr/bin/nc and /usr/bin/ssh pass), so the role also installs
+#         com.teamleaderleo.glaeda.fleet-cas-relay: a socket-activated LaunchAgent that listens on
+#         127.0.0.1:7451 and hands each connection to /usr/bin/nc -G 2 LAN_IP PORT. The node, the
+#         env file and the scripts then use 127.0.0.1:7451 as the store. A dead relay or store is a
+#         refused or closed connection, which the node turns into its 30 s upstream backoff (local
+#         misses), the same as a dead store; fleet-cas-settings.sh still answers only when the node
+#         does. Without --relay the role removes the relay.
+#         A store with a custom root (--store-root on the rollout) also gets
+#         com.teamleaderleo.glaeda.fleet-cas-store-gc: hourly `glaeda-fleet-cas-prune --apply
+#         --store-gc-only`, the daily fleet-cas gc of that store and nothing else (its own label,
+#         so it never replaces a mini's fleet-cas-prune agent from glaeda-mini-setup).
 # The node and writer roles write xcode/fleet-cas.env (store address, trusted keys, signing
 # key path) for the scripts above.
 # Design: docs/CMUX_BUILD_SLOT_MODES.md. Prototype: tools/fleet-cas-prototype.
@@ -56,11 +70,13 @@ if [ "$role" = uninstall ] && [ $# -gt 0 ]; then
     node|store|all) uninstall_scope=$1; shift ;;
   esac
 fi
-apply= store= listen= writers= trusted= sign_key= prewarm= custom_store_volume_uuid=
+apply= store= relay= listen= writers= trusted= sign_key= prewarm= custom_store_volume_uuid=
+RELAY_LISTEN=127.0.0.1:7451
 while [ $# -gt 0 ]; do
   case $1 in
     --apply) apply=1 ;;
     --store) store=${2:?--store HOST:PORT}; shift ;;
+    --relay) relay=${2:?--relay LAN_IP:PORT}; shift ;;
     --listen) listen=${2:?--listen IP:PORT}; shift ;;
     --writers) writers=${2:?--writers IP,IP}; shift ;;
     --trusted-keys) trusted=${2:?--trusted-keys HEX,HEX}; shift ;;
@@ -273,6 +289,105 @@ write_prewarm() {  # repo, or empty to remove
   fi
 }
 
+# The LAN relay (see relay: above). launchd owns the 127.0.0.1 listener and starts one
+# /usr/bin/nc per connection (inetdCompatibility), so the only process that touches the LAN is
+# Apple's nc, which Local Network privacy lets through. -G 2 bounds a connect to a down store
+# below the node's own 2 s connect timeout plus its 10 s call timeout.
+RELAY_LABEL=com.teamleaderleo.glaeda.fleet-cas-relay
+relay_plist() {  # LAN_IP:PORT
+  local log=$LOGS/glaeda-fleet-cas-relay.log
+  printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
+    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+    '<plist version="1.0">' '<dict>' \
+    '    <key>Label</key>' "    <string>$RELAY_LABEL</string>" \
+    '    <key>ProgramArguments</key>' '    <array>' \
+    '        <string>/usr/bin/nc</string>' '        <string>-G</string>' '        <string>2</string>' \
+    "        <string>$(xml "${1%:*}")</string>" "        <string>$(xml "${1##*:}")</string>" '    </array>' \
+    '    <key>inetdCompatibility</key>' '    <dict>' '        <key>Wait</key>' '        <false/>' '    </dict>' \
+    '    <key>Sockets</key>' '    <dict>' '        <key>Listener</key>' '        <dict>' \
+    '            <key>SockNodeName</key>' "            <string>${RELAY_LISTEN%:*}</string>" \
+    '            <key>SockServiceName</key>' "            <string>${RELAY_LISTEN##*:}</string>" \
+    '            <key>SockType</key>' '            <string>stream</string>' \
+    '            <key>SockFamily</key>' '            <string>IPv4</string>' \
+    '        </dict>' '    </dict>' \
+    '    <key>ProcessType</key>' '    <string>Interactive</string>' \
+    '    <key>StandardErrorPath</key>' "    <string>$log</string>" '</dict>' '</plist>'
+}
+write_relay() {  # LAN_IP:PORT, or empty to remove
+  local agent=$AGENTS/$RELAY_LABEL.plist
+  if [ -z "$1" ]; then
+    [ -e "$agent" ] || return 0
+    say "remove $RELAY_LABEL"
+    [ -z "$apply" ] || { launchctl bootout "gui/$(id -u)/$RELAY_LABEL" 2>/dev/null || true; rm -f "$agent"; }
+    return 0
+  fi
+  say "relay $RELAY_LABEL: $RELAY_LISTEN to /usr/bin/nc $1"
+  [ -n "$apply" ] || return 0
+  mkdir -p "$AGENTS" "$LOGS"
+  relay_plist "$1" >"$agent.tmp"
+  plutil -lint -s "$agent.tmp"
+  if cmp -s "$agent.tmp" "$agent" && launchctl print "gui/$(id -u)/$RELAY_LABEL" >/dev/null 2>&1; then
+    rm -f "$agent.tmp"
+  else
+    mv "$agent.tmp" "$agent"
+    bootstrap "gui/$(id -u)" "$RELAY_LABEL" "$agent"
+  fi
+}
+# The relay carries the store's protocol, not only a TCP connect: a marker lookup through it
+# answers 0 (present) or 1 (absent) only from a fleet-cas store; a transport error is 2.
+check_relay() {  # LAN_IP:PORT
+  local status=0
+  for _ in $(seq 1 20); do
+    status=0
+    "$BIN/fleet-cas" marker get "http://$RELAY_LISTEN" "glaeda-relay-check/$(hostname -s)" \
+      --trusted-keys "${trusted:-0000000000000000000000000000000000000000000000000000000000000000}" >/dev/null 2>&1 || status=$?
+    [ "$status" -le 1 ] && return 0
+    sleep 0.5
+  done
+  echo "fleet-cas relay $RELAY_LISTEN does not reach the store at $1 (marker lookup exit $status)" >&2
+  tail -5 "$LOGS/glaeda-fleet-cas-relay.log" >&2 2>/dev/null || true
+  return 1
+}
+
+# The store host's prune (custom store roots only; the minis get theirs from glaeda-mini-setup).
+PRUNE_LABEL=com.teamleaderleo.glaeda.fleet-cas-store-gc
+prune_plist() {
+  local log=$LOGS/glaeda-fleet-cas-store-gc.jsonl
+  printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
+    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+    '<plist version="1.0">' '<dict>' \
+    '    <key>Label</key>' "    <string>$PRUNE_LABEL</string>" \
+    '    <key>ProgramArguments</key>' '    <array>' \
+    '        <string>/usr/bin/python3</string>' '        <string>-I</string>' \
+    "        <string>$(xml "$launch_root/glaeda-fleet-cas-prune")</string>" \
+    '        <string>--apply</string>' '        <string>--store-gc-only</string>' '    </array>' \
+    '    <key>EnvironmentVariables</key>' '    <dict>' \
+    '        <key>GLAEDA_FLEET_CAS_ROOT</key>' "        <string>$(xml "$ROOT")</string>" '    </dict>' \
+    '    <key>StartInterval</key>' '    <integer>3600</integer>' \
+    '    <key>ProcessType</key>' '    <string>Background</string>' \
+    '    <key>LowPriorityIO</key>' '    <true/>' \
+    '    <key>StandardOutPath</key>' "    <string>$log</string>" \
+    '    <key>StandardErrorPath</key>' "    <string>$LOGS/glaeda-fleet-cas-store-gc.err</string>" '</dict>' '</plist>'
+}
+write_store_prune() {
+  [ -n "${FLEET_CAS_ROOT:-}" ] || return 0
+  local agent=$AGENTS/$PRUNE_LABEL.plist src=$here/scripts/glaeda-fleet-cas-prune
+  say "prune $PRUNE_LABEL: hourly $launch_root/glaeda-fleet-cas-prune --apply --store-gc-only (GLAEDA_FLEET_CAS_ROOT=$ROOT)"
+  [ -n "$apply" ] || return 0
+  [ -f "$src" ] && [ ! -L "$src" ] || { echo "missing $src" >&2; exit 1; }
+  mkdir -p "$AGENTS" "$LOGS" "$launch_root"
+  install -m 0755 "$src" "$launch_root/glaeda-fleet-cas-prune.new"
+  mv "$launch_root/glaeda-fleet-cas-prune.new" "$launch_root/glaeda-fleet-cas-prune"
+  prune_plist >"$agent.tmp"
+  plutil -lint -s "$agent.tmp"
+  if cmp -s "$agent.tmp" "$agent" && launchctl print "gui/$(id -u)/$PRUNE_LABEL" >/dev/null 2>&1; then
+    rm -f "$agent.tmp"
+  else
+    mv "$agent.tmp" "$agent"
+    bootstrap "gui/$(id -u)" "$PRUNE_LABEL" "$agent"
+  fi
+}
+
 # Stop the role's process so launchd starts it again with the current args and binary. The
 # pid must still be this role's fleet-cas (its first argument), not a reused pid.
 restart_role() {  # role, first argument the running process was started with
@@ -404,9 +519,12 @@ install_binaries() {
 }
 
 write_env() {  # store HOST:PORT, signing key path or empty
-  say "write $ROOT/fleet-cas.env: store $1, trusted keys ${trusted:-none}${2:+, signing key $2}"
+  # FLEET_CAS_RELAY names the store behind the relay, so the fleet check (glaeda-mini-fleet) can
+  # match it against the manifest's compiler-cas endpoint; the scripts read only FLEET_CAS_STORE.
+  say "write $ROOT/fleet-cas.env: store $1${relay:+ (relay to $relay)}, trusted keys ${trusted:-none}${2:+, signing key $2}"
   [ -n "$apply" ] || return 0
-  printf 'FLEET_CAS_STORE=%s\nFLEET_CAS_TRUSTED_KEYS=%s\nFLEET_CAS_SIGN_KEY=%s\n' "$1" "$trusted" "$2" \
+  { printf 'FLEET_CAS_STORE=%s\nFLEET_CAS_TRUSTED_KEYS=%s\nFLEET_CAS_SIGN_KEY=%s\n' "$1" "$trusted" "$2"
+    [ -z "$relay" ] || printf 'FLEET_CAS_RELAY=%s\n' "$relay"; } \
     >"$ROOT/fleet-cas.env.tmp" && mv "$ROOT/fleet-cas.env.tmp" "$ROOT/fleet-cas.env"
 }
 
@@ -416,10 +534,16 @@ check_key_args() {  # hex keys only: they end up in a plist and an env file
 
 case $role in
   node | writer)
-    [ -n "$store" ] || { echo "$role needs --store HOST:PORT" >&2; exit 2; }
+    if [ -n "$relay" ]; then
+      [ -z "$store" ] || [ "$store" = "$RELAY_LISTEN" ] || { echo "--relay sets the store to $RELAY_LISTEN; drop --store" >&2; exit 2; }
+      store=$RELAY_LISTEN
+    fi
+    [ -n "$store" ] || { echo "$role needs --store HOST:PORT or --relay LAN_IP:PORT" >&2; exit 2; }
     check_key_args
     if [ -n "$apply" ]; then
-      check_upstream "$store" || exit 1
+      # With a relay, check the store itself from this shell (not launchd: no Local Network
+      # privacy here); the relay path is checked once it is installed.
+      check_upstream "${relay:-$store}" || exit 1
     fi
     node_args=(--read-only-kv)
     if [ "$role" = writer ]; then
@@ -441,6 +565,10 @@ case $role in
       case ,$trusted, in *,"$pub",*) ;; *) echo "the key at $sign_key ($pub) is not in --trusted-keys" >&2; exit 2 ;; esac
     fi
     do_ mkdir -p "$NODE_STORE"
+    write_relay "$relay"
+    if [ -n "$apply" ] && [ -n "$relay" ]; then
+      check_relay "$relay" || exit 1
+    fi
     write_env "$store" "$sign_key"
     write_service node "$SOCK" "$NODE_STORE" "${node_args[@]}" --upstream "http://$store" ${trusted:+--trusted-keys "$trusted"}
     if [ -n "$apply" ]; then
@@ -465,6 +593,7 @@ case $role in
       nc -z -G 2 "${listen%:*}" "${listen##*:}" 2>/dev/null || health_failed store
       echo "ok store listening on $listen (writers: ${writers:-none}, signed entries only: $([ -n "$trusted" ] && echo yes || echo no))"
     fi
+    write_store_prune
     ;;
   uninstall)
     case $uninstall_scope in
@@ -473,6 +602,13 @@ case $role in
     esac
     if [ "$uninstall_scope" = node ] || [ "$uninstall_scope" = all ]; then
       write_prewarm ""
+      write_relay ""
+    fi
+    if [ "$uninstall_scope" = store ] || [ "$uninstall_scope" = all ]; then
+      if [ -e "$AGENTS/$PRUNE_LABEL.plist" ]; then
+        say "stop and remove $PRUNE_LABEL (the store host's gc)"
+        [ -z "$apply" ] || { launchctl bootout "gui/$(id -u)/$PRUNE_LABEL" 2>/dev/null || true; rm -f "$AGENTS/$PRUNE_LABEL.plist"; }
+      fi
     fi
     for r in node store; do
       [ "$uninstall_scope" = all ] || [ "$uninstall_scope" = "$r" ] || continue

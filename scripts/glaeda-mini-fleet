@@ -874,6 +874,7 @@ def parse_probe(text: str) -> dict[str, Any]:
             "catch_up": out.get("fleet_catch_up") or None,  # "0" when bin/worker exports CMUX_CI_CATCH_UP=0
             "node": out.get("fleet_cas_node"),
             "store": out.get("fleet_cas_store"),
+            "relay": out.get("fleet_cas_relay"),
             "stats": {k: int(v) for k, v in (line.split("|", 1) for line in out["fleet_cas_stat"] if "|" in line)
                       if v.isdigit()},
             "stats_mtime": int(out["fleet_cas_stats_mtime"]) if out.get("fleet_cas_stats_mtime", "").isdigit() else None,
@@ -1310,7 +1311,8 @@ def check_host(manifest: dict[str, Any], name: str, obs: dict[str, Any]) -> list
         for message, fix in ios_simulator_drift(ios, obs):
             drift("ios", message, fix)
 
-    for area, message, fix in catch_up_drift(host, policy, obs, declared_compiler_cas_endpoint(manifest)):
+    for area, message, fix in catch_up_drift(host, policy, obs, declared_compiler_cas_endpoint(manifest),
+                                             declared_compiler_cas_transport(manifest)):
         drift(area, message, fix)
 
     # The declared toolchain: Xcode from the plain probe, the rest from a preflight section when observed.
@@ -1362,8 +1364,32 @@ def declared_compiler_cas_endpoint(manifest: dict[str, Any]) -> str | None:
     return next(iter(endpoints)) if len(endpoints) == 1 else None
 
 
+FLEET_CAS_RELAY_LISTEN = "127.0.0.1:7451"  # glaeda-fleet-cas --relay: the node's store is this local relay
+FLEET_CAS_RELAY_LABEL = "com.teamleaderleo.glaeda.fleet-cas-relay"
+
+
+def declared_compiler_cas_transport(manifest: dict[str, Any]) -> str | None:
+    """How readers reach the declared compiler-CAS store: "lan-relay" when the manifest's one compiler-cas service
+    says reader_transport lan-relay (a LAN-only store: glaeda-fleet-cas-rollout --store-lan), else None (direct)."""
+    transports = {
+        str(service.get("reader_transport", "")).strip()
+        for service in manifest.get("cache_services", [])
+        if isinstance(service, dict) and service.get("kind") == "compiler-cas"
+    }
+    return "lan-relay" if transports == {"lan-relay"} else None
+
+
+def effective_store(cas: dict[str, Any]) -> str | None:
+    """The fleet store a node reads: the relay's target when it goes through the local LAN relay."""
+    store = cas.get("store")
+    if store == FLEET_CAS_RELAY_LISTEN and cas.get("relay"):
+        return cas["relay"]
+    return store
+
+
 def catch_up_drift(host: dict[str, Any], policy: dict[str, Any], obs: dict[str, Any],
-                   expected_store: str | None = None) -> list[tuple[str, str, str]]:
+                   expected_store: str | None = None,
+                   expected_transport: str | None = None) -> list[tuple[str, str, str]]:
     """Drift for the fleet compile-cache catch-up roles, as (area, detail, fix). Reports only."""
     role = catch_up_role(host)
     cas = obs.get("fleet_cas") or {}
@@ -1372,7 +1398,7 @@ def catch_up_drift(host: dict[str, Any], policy: dict[str, Any], obs: dict[str, 
         # catch-up pool. Keep healthy, unused installations quiet, but surface
         # a daemon pointed at a retired store. A local socket and lifetime
         # error counters cannot establish the current upstream identity.
-        configured_store = cas.get("store")
+        configured_store = effective_store(cas)
         if expected_store and configured_store and configured_store != expected_store:
             return [("fleet-cas", f"fleet-cas node outside a catch-up role has configured upstream {configured_store}, "
                     f"manifest declares compiler-CAS store {expected_store}; its local socket can answer while remote reads "
@@ -1433,7 +1459,16 @@ def catch_up_drift(host: dict[str, Any], policy: dict[str, Any], obs: dict[str, 
     if cas.get("node") != "answers":
         out.append(("fleet-cas", "fleet-cas node does not answer on xcode/fleet-cas.sock (the fleet-cas-settings.sh "
                     "check); builds fall back to the local cache", rollout))
-    configured_store = cas.get("store")
+    if expected_transport == "lan-relay":
+        relay_state = {j["label"]: j["state"] for j in obs["launchd"]}.get(FLEET_CAS_RELAY_LABEL)
+        if cas.get("store") != FLEET_CAS_RELAY_LISTEN:
+            out.append(("fleet-cas", f"the node dials the store directly ({cas.get('store') or 'no store'}); the manifest "
+                        "declares a LAN-only store that launchd-started fleet-cas cannot reach (Local Network privacy)",
+                        "operator: glaeda-fleet-cas-rollout --store-lan for this host (the fleet-cas relay)"))
+        elif relay_state in (None, "not-loaded"):
+            out.append(("fleet-cas", f"{FLEET_CAS_RELAY_LABEL} is {relay_state or 'not installed'}; the node's store "
+                        f"{FLEET_CAS_RELAY_LISTEN} answers nothing, so every lookup is a miss", rollout))
+    configured_store = effective_store(cas)
     if expected_store and configured_store != expected_store:
         got = configured_store or "missing"
         out.append(("fleet-cas", f"configured upstream {got}, manifest declares compiler-CAS store {expected_store}; "

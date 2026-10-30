@@ -209,6 +209,26 @@ binary started by launchd reaches cmux7s's tailnet address (verified on cmux8s w
 also allowed Unix-socket and remote forwards (`permitopen` limits TCP forwards only), for
 example to the writer's signing socket, and the tailnet makes it unnecessary.
 
+A store that only listens on the office LAN (cmux-lawrence, whose tailnet port no ACL grant
+opens) is reached through the fleet-cas relay instead: `glaeda-fleet-cas-rollout --store-lan IP`
+installs `com.teamleaderleo.glaeda.fleet-cas-relay` on the writer and every node, a
+socket-activated LaunchAgent on `127.0.0.1:7451` whose program is `/usr/bin/nc -G 2 IP 7450`
+(`inetdCompatibility`, one nc per connection). launchd starts Apple's nc directly, with no
+non-Apple ancestor, so Local Network privacy lets it through, and it can reach nothing but the
+one store port: unlike the ssh relay there is no key and no other forward. The node, its
+`fleet-cas.env` (`FLEET_CAS_STORE=127.0.0.1:7451`, `FLEET_CAS_RELAY=IP:7450`) and the scripts
+then use the relay as the store. The store sees each client's LAN address, so `--writers` is
+the writer's LAN source address toward the store (the rollout reads it from the writer's route
+table; it is a DHCP lease, so a changed lease needs the rollout again, and until then the writer's
+puts are refused and builds still read). A dead relay or store is a refused or closed
+connection within nc's 2 s connect limit: the node answers its socket as before, so
+`fleet-cas-settings.sh` still enables the cache, and the node's 30 s upstream backoff turns
+lookups into local misses. The install checks the path with a signed-marker lookup through the
+relay. A manifest compiler-cas service with `"reader_transport": "lan-relay"` makes
+glaeda-mini-fleet report a reader that dials the store directly or lacks the relay agent.
+A custom-root store also gets `com.teamleaderleo.glaeda.fleet-cas-store-gc`, the hourly
+`glaeda-fleet-cas-prune --apply --store-gc-only` (the daily gc below, on that root only).
+
 `--writer HOST --sign-key PATH --trusted-keys HEX` makes that host the writer (above), and
 its tailnet address the store's only allowed writer. The writer runs on an hq-only builder
 with no PR runners: any process on the writer host can reach the signing node's socket.
