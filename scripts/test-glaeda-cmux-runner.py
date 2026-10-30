@@ -2185,7 +2185,7 @@ class HookTest(unittest.TestCase):
         finally:
             self.finish("s0")
 
-    def nightly_signer(self, runner: str, wait: str, *extra: str) -> subprocess.Popen:
+    def nightly_signer(self, runner: str, wait: str, *extra: str, env: dict | None = None) -> subprocess.Popen:
         """sign-nightly-identity-legacy of a nightly-next push on this mini's nightly slot, started in the background."""
         push = event(self.dir, f"sign-{runner}", {"repository": CMUX, "ref": hook.NIGHTLY_NEXT_REF})
         ref = hook.NIGHTLY_NEXT_REF
@@ -2196,7 +2196,7 @@ class HookTest(unittest.TestCase):
                    "GITHUB_REPOSITORY": "manaflow-ai/cmux", "GITHUB_JOB": "sign-nightly-identity-legacy",
                    "RUNNER_NAME": runner, "GITHUB_REF": ref, "GITHUB_RUN_ATTEMPT": "1",
                    "GITHUB_ENV": os.fspath(self.dir / f"github-env-{runner}"),
-                   "GITHUB_WORKFLOW_REF": f"manaflow-ai/cmux/.github/workflows/nightly.yml@{ref}"}
+                   "GITHUB_WORKFLOW_REF": f"manaflow-ai/cmux/.github/workflows/nightly.yml@{ref}", **(env or {})}
         proc = subprocess.Popen(
             [sys.executable, os.fspath(HOOK), "job-started", "--allowed-repo", "manaflow-ai/cmux", "--no-disk",
              "--state-dir", os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()), "--gui-wait", wait,
@@ -2282,6 +2282,86 @@ class HookTest(unittest.TestCase):
         killed.wait()
         self.assertEqual(hook.admission_waiters(self.dir / "capacity"), [], "a killed waiter's marker goes with it")
         self.assertFalse(marker.exists())
+
+    def signing_hooks(self, *shas: str) -> tuple[dict, str]:
+        """A glaeda-signing-hooks.txt at manaflow-ai/cmux@SHA listing these hook shas, served through
+        GLAEDA_SIGNING_HOOKS_URL as cmux's claim gate reads it, and the env that points a signer at it."""
+        sha = "c" * 40
+        listing = self.dir / "raw" / "manaflow-ai" / "cmux" / sha / hook.SIGNING_HOOKS_PATH
+        listing.parent.mkdir(parents=True, exist_ok=True)
+        listing.write_text("# glaeda runner hooks\n" + "".join(f"{s} glaeda test\n" for s in shas))
+        return ({hook.SIGNING_HOOKS_URL_ENV: (self.dir / "raw").as_uri() + "/{repo}/{sha}/" + hook.SIGNING_HOOKS_PATH,
+                 "GITHUB_SHA": sha}, sha)
+
+    def test_signing_hook_listed_reads_the_list_the_claim_gate_reads(self) -> None:
+        """SIGNING_HOOKS: True or False only from a list it read; None (no answer, the job drains as before) for an
+        unreadable or empty list, a malformed repository or commit, or no hook sha."""
+        mine = hashlib.sha256(HOOK.read_bytes()).hexdigest()
+        self.assertEqual(hook.hook_sha256(), mine)
+        if not os.path.exists(hook.CURL):
+            self.skipTest(f"no {hook.CURL}")
+        env, sha = self.signing_hooks("e" * 64, mine)
+        with mock.patch.dict(os.environ, {hook.SIGNING_HOOKS_URL_ENV: env[hook.SIGNING_HOOKS_URL_ENV]}):
+            self.assertIs(hook.signing_hook_listed("manaflow-ai/cmux", sha), True)
+            self.assertIs(hook.signing_hook_listed("manaflow-ai/cmux", sha, "f" * 64), False)
+            self.assertIsNone(hook.signing_hook_listed("manaflow-ai/cmux", "d" * 40), "no list at that commit")
+            for repo, commit, sha256 in (("manaflow-ai/cmux", "c" * 39, mine), ("../x", sha, mine), (None, sha, mine),
+                                         ("manaflow-ai/cmux", None, mine), ("manaflow-ai/cmux", sha, "")):
+                with self.subTest(repo=repo, commit=commit, sha256=sha256):
+                    self.assertIsNone(hook.signing_hook_listed(repo, commit, sha256))
+            self.signing_hooks()  # comments only
+            self.assertIsNone(hook.signing_hook_listed("manaflow-ai/cmux", sha), "an empty list is no answer")
+
+    def test_a_signing_job_its_claim_gate_would_refuse_is_refused_before_it_drains_the_mini(self) -> None:
+        """cmux12s, 2026-10-30: sign-nightly-identity-legacy waited 600 s in "Set up runner" with "10 of 14 units
+        free" (a PR swift-test held 4), and the 8 it admitted after a drain all failed their claim gate in under a
+        second, since glaeda-signing-hooks.txt at their nightly-next commit did not list the minis' hook yet. Such a
+        job is now refused in seconds, before it writes a waiter marker or holds the mini: its run's Blacksmith job
+        signs at once and no PR job waits behind it. With the hook listed, the drain is unchanged (it waits, holds PR
+        jobs off, and is admitted once the units free)."""
+        if not os.path.exists(hook.CURL):
+            self.skipTest(f"no {hook.CURL}")
+        self.fleet()
+        (self.dir / "capacity").mkdir(parents=True, exist_ok=True)
+        busy = [hook.lock_file(self.dir / "capacity" / f"unit-{slot}", fcntl.LOCK_EX) for slot in range(4)]
+        self.assertNotIn(None, busy)  # 10 of 14 units free, as on cmux12s
+        mine = hashlib.sha256(HOOK.read_bytes()).hexdigest()
+        unlisted, _ = self.signing_hooks("e" * 64)
+        begun = time.monotonic()
+        signer = self.nightly_signer("n0", "120", "--nightly-runner", env=unlisted)
+        out, _ = signer.communicate(timeout=60)
+        took = time.monotonic() - begun
+        self.assertEqual(signer.returncode, 1, out)
+        self.assertLess(took, 30, f"refused in seconds, not after the {hook.SIGNING_DRAIN_WAIT_S:g} s drain: {out}")
+        self.assertIn("does not list this hook", out)
+        self.assertNotIn("waiting (", out, "it never waited for units")
+        self.assertNotIn("GLAEDA_JOB_CLAIM", (self.dir / "github-env-n0").read_text()
+                         if (self.dir / "github-env-n0").exists() else "")
+        self.assertEqual(hook.admission_waiters(self.dir / "capacity"), [], "no hold on the mini")
+        self.assertIsNone(hook.mini_full(self.dir / "capacity", 14, hook.RunnerScope(14, 2, 2, fast=True)))
+        pr = self.job("cli-pipe-regressions", "p0", 14, None, "--gui-wait", "0")
+        try:
+            self.assertEqual(pr.returncode, 0, pr.stdout + pr.stderr)
+        finally:
+            self.finish("p0")
+        # Listed: the drain as before. It waits, PR jobs are not admitted meanwhile, and it takes the mini once the
+        # PR job's units free.
+        listed, _ = self.signing_hooks(mine)
+        signer = self.nightly_signer("n1", "60", "--nightly-runner", env=listed)
+        self.wait_for_want(signer)
+        pr = self.job("cli-pipe-regressions", "p1", 14, None, "--gui-wait", "0")
+        self.assertEqual(pr.returncode, 1, pr.stdout + pr.stderr)
+        self.assertIsNone(signer.poll(), "the signer still waits for the running job")
+        for fd in busy:
+            os.close(fd)
+        out, _ = signer.communicate(timeout=60)
+        try:
+            self.assertEqual(signer.returncode, 0, out)
+            self.assertIn("holding 14/14 units", out)
+            self.assertIn("GLAEDA_JOB_CLAIM=exclusive\n", (self.dir / "github-env-n1").read_text())
+        finally:
+            self.finish("n1")
+        self.assertTrue(self.lock_free())
 
     def test_stray_job_processes_refuses_when_ps_or_lsof_cannot_answer_in_full(self) -> None:
         """A failed, partial or empty listing must never read as "nothing in _work" (it refuses the signing job)."""

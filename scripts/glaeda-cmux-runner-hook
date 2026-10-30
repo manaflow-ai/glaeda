@@ -2156,6 +2156,58 @@ def export_job_claim(capacity_units: int, taken: dict[str, Any], note: str) -> s
     return ""
 
 
+# SIGNING_HOOKS: cmux's signing jobs accept a whole-mini claim only from a hook that scripts/ci/glaeda-signing-hooks.txt
+# lists at the run's own commit (cmux CLAIM_GATE, signing-runner-claim.sh); a job admitted by any other hook fails its
+# first step in under a second and the run's Blacksmith twin signs. That list follows glaeda's releases by a cmux PR
+# and then a nightly-next push, so for a while after every hook release no nightly-next commit lists the minis' hook.
+# On 2026-10-30 every one of the 8 sign-nightly-identity-legacy jobs cmux12s admitted (06:46Z to 15:59Z) failed there
+# after draining the mini for up to 584 s (SIGNING_DRAIN): each held every other admission on the mini and then signed
+# nothing. So before it drains anything, an exclusive job reads that list at its own commit, as its claim gate will,
+# and is refused at once when this hook is not on it: the twin signs minutes sooner and no PR job waits behind a
+# drain that could not end in a signature. A list it cannot read (network, 404, a guest) changes nothing: the job
+# drains as before and its claim gate decides. Admission, priority and the drain bounds are as they were.
+SIGNING_HOOKS_PATH = "scripts/ci/glaeda-signing-hooks.txt"
+SIGNING_HOOKS_URL = "https://raw.githubusercontent.com/{repo}/{sha}/" + SIGNING_HOOKS_PATH
+SIGNING_HOOKS_URL_ENV = "GLAEDA_SIGNING_HOOKS_URL"  # tests: a file:// template with {repo} and {sha}
+SIGNING_HOOKS_FETCH_S = 10
+CURL = "/usr/bin/curl"
+GIT_SHA = re.compile(r"[0-9a-f]{40}")
+
+
+def hook_sha256() -> str | None:
+    """This hook file's sha256, the one export_job_claim names (HOOK_SHA_ENV), or None when it cannot be read."""
+    try:
+        return hashlib.sha256(Path(__file__).resolve().read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def signing_hook_listed(repo: str | None, sha: str | None, hook: str | None = None) -> bool | None:
+    """Whether glaeda-signing-hooks.txt at repo@sha lists this hook (SIGNING_HOOKS): True, False, or None when the
+    list or the hook's own sha cannot be read, which the caller treats as no answer. The same read as cmux's claim
+    gate (curl from raw.githubusercontent.com at the run's commit), bounded to SIGNING_HOOKS_FETCH_S."""
+    hook = hook if hook is not None else hook_sha256()
+    if not hook or not repo or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) \
+            or not sha or not GIT_SHA.fullmatch(sha):
+        return None
+    template = os.environ.get(SIGNING_HOOKS_URL_ENV) or SIGNING_HOOKS_URL
+    protocols = "=https,file" if os.environ.get(SIGNING_HOOKS_URL_ENV) else "=https"
+    try:
+        fetched = subprocess.run([CURL, "-fsS", "--proto", protocols, "--max-time", str(SIGNING_HOOKS_FETCH_S),
+                                  "--max-filesize", "1048576", template.format(repo=repo, sha=sha)],
+                                 stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
+                                 timeout=SIGNING_HOOKS_FETCH_S + 5, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if fetched.returncode != 0:
+        return None
+    listed = {line.split(None, 1)[0] for line in fetched.stdout.splitlines()
+              if line.strip() and not line.lstrip().startswith("#")}
+    if not listed:
+        return None  # an empty answer is not a list (the claim gate would refuse every hook on it)
+    return hook in listed
+
+
 def runner_xcode(runner_dir: Path) -> str | None:
     """The pool Xcode: the --toolchain-xcode this runner's job-started hook passes, or None."""
     try:
@@ -9036,6 +9088,14 @@ def main(argv: list[str] | None = None) -> int:
                 cap = bounded_wait(cap, GATEWAY_CAPACITY_WAIT_S)
             claim_class = admit_class or job_class(os.environ.get("GITHUB_JOB", ""), repo, args.home_repo,
                                                    job_workflow())[0]
+            if claim_class == EXCLUSIVE_CLASS and not is_guest(repo, args.home_repo):
+                hook = hook_sha256()
+                if signing_hook_listed(repo, os.environ.get("GITHUB_SHA"), hook) is False:
+                    # SIGNING_HOOKS: its claim gate would fail it anyway, after the drain; refused now, before it
+                    # holds anything, so the run's Blacksmith job signs at once
+                    return refused(f"{SIGNING_HOOKS_PATH} at this run's commit does not list this hook "
+                                   f"({(hook or '')[:12]}), so the job's claim gate would refuse the whole mini; "
+                                   "refused before draining it, so the run's Blacksmith job signs now")
             if claim_class == EXCLUSIVE_CLASS:
                 drain_bound = exclusive_capacity_wait(tier, args.nightly_runner)
                 cap = bounded_wait(cap, drain_bound)

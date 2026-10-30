@@ -198,7 +198,10 @@ What `--apply` does:
      drained) waits up to `SIGNING_DRAIN_WAIT_S` (600 s) instead: as a nightly waiter it stops every other admission
      and holds every other runner's gate on the mini, so the running jobs finish and nothing new starts; then it takes
      the whole mini, or is refused and the run's Blacksmith job signs. Its hold is its `admit.want` marker, gone when
-     it is admitted, refused or killed.
+     it is admitted, refused or killed. Before any of that wait, a signing job of the home repository reads
+     `scripts/ci/glaeda-signing-hooks.txt` at its own commit (`SIGNING_HOOKS`, the list its claim gate reads) and is
+     refused at once when that list does not name this hook: its claim gate would fail it after the drain anyway, so
+     the run's Blacksmith job signs minutes sooner and no PR job waits behind it. A list it cannot read changes nothing.
      Admitted, the hook writes `GLAEDA_JOB_CLAIM=exclusive` to `$GITHUB_ENV`, and cmux's signing jobs check it
      before they touch the key, so a mini on an older hook never signs beside another job. The hook's `JOB_CORES` table gives a job its own measured
      cost where it is far from its class's: cmux-next's generated files, both autofix
