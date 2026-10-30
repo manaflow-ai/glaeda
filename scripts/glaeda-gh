@@ -69,7 +69,10 @@ the daemon is the only process that talks to GitHub, and clients only read its c
 - The X-RateLimit headers and the GraphQL rateLimit field drive a budget guard: below the floor
   (REST 1500 left, GraphQL 500) the daemon polls four times less often and skips job lists; below
   the reserve (REST 300, GraphQL 100) it stops that API until the quota resets. The quota is shared,
-  so this also protects every other tool on the account.
+  so this also protects every other tool on the account. GitHub answers one token's REST calls from
+  two "core" counters with their own hourly windows (run and workflow reads report one; /rate_limit,
+  pulls and job lists the other), so budget.json keeps each live counter in restCounters and "rest"
+  is the poorest of them, never just the last answer.
 - The daemon's own REST polling is capped at restShare (0.4) of the hourly REST limit: the read
   requests it sent over the last hour that GitHub counted (a 304 is free and is not counted, nor is
   the outbox -- writes sessions asked for and their dedupe lookups -- which the share never holds),
@@ -222,6 +225,8 @@ REST_SPEND_FILE = "rest-spend.json"  # the daemon's counted REST requests per mi
 # interval is the secondary limit, which one call every two minutes is nowhere near. 0 turns it off.
 BUDGET_REFRESH = 120.0
 BUDGET_RETRY = 900.0  # after a refused /rate_limit, how long before asking again
+REST_COUNTERS = 4  # most core counters budget.json keeps (GitHub showed two per token on 2026-10-30)
+RESET_JITTER = 2  # seconds: two readings whose resets differ by at most this are one core counter
 GQL_BATCH = 15  # most PRs (or runs, or comment watches) per GraphQL query
 # GitHub answers 504 when a query runs past ~10 s. Measured 2026-10-19 on cosmic-gray: 25 PRs per
 # query took 10-11 s (half answered 504), 10 took 4-6 s, 5 took 2-3 s; each cost 1 point. So each
@@ -1370,6 +1375,33 @@ def consumer_policy() -> dict:
     return policy
 
 
+def merge_counter(counters: list[dict], seen: dict) -> list[dict]:
+    """counters with one reading folded in. A reading whose reset is within RESET_JITTER of a known counter's is
+    that counter (GitHub's reset for one window can differ by a second between answers), and within one window a
+    counter only goes down, so the lower remaining wins whichever arrived last; the freshest seenAt and the
+    later reset are kept."""
+    out, merged = [], False
+    for c in counters:
+        if not merged and abs(c["reset"] - seen["reset"]) <= RESET_JITTER:
+            c = {**c, "limit": seen.get("limit", c.get("limit")), "remaining": min(c["remaining"], seen["remaining"]),
+                 "reset": max(c["reset"], seen["reset"]), "seenAt": max(c["seenAt"], seen["seenAt"])}
+            merged = True
+        out.append(c)
+    if not merged:
+        out.append(dict(seen))
+    return sorted(out, key=lambda c: c["reset"])
+
+
+def rest_counters(budget: dict) -> list[dict]:
+    """The well-formed entries of budget["restCounters"] (Daemon.settle_rest)."""
+    out = []
+    for c in budget.get("restCounters") or []:
+        if (isinstance(c, dict) and isinstance(c.get("reset"), (int, float)) and isinstance(c.get("remaining"), int)
+                and isinstance(c.get("seenAt"), (int, float))):
+            out.append(c)
+    return out
+
+
 class Daemon:
     def __init__(self, transport: Callable = http, token: Callable[[], str] = gh_token,
                  controller: Any = "env", upstream: Any = "config") -> None:
@@ -1401,6 +1433,7 @@ class Daemon:
         self.secondary_until = 0.0  # a secondary 403 holds both buckets until then
         self.secondary_strikes = 0  # secondary 403s since the last clean answer: each doubles the hold
         self.budget_retry = 0.0  # /rate_limit is left alone until this time after a refusal
+        self.rate_limit_at = float("-inf")  # when /rate_limit last answered (refresh_budget)
         self.last_cycle: dict[str, float] = {kind: 0.0 for kind in CYCLES}
         self.now = time.time()
         self.errors: list[str] = []
@@ -1562,9 +1595,46 @@ class Daemon:
 
     def note_budget(self, bucket: str, limit: Any, remaining: Any, reset: float | None) -> None:
         try:
-            self.budget[bucket] = {"limit": int(limit), "remaining": int(remaining), "reset": reset, "seenAt": self.now}
+            seen = {"limit": int(limit), "remaining": int(remaining), "reset": reset, "seenAt": self.now}
         except (TypeError, ValueError):
-            pass
+            return
+        if bucket != "rest":
+            self.budget[bucket] = seen
+            return
+        if not isinstance(reset, (int, float)):
+            # A reading that names no window cannot say which counter it is; with counters known it would only
+            # replace the poorest one with a figure mode() treats as no reading at all.
+            if not rest_counters(self.budget):
+                self.budget[bucket] = seen
+            else:
+                self.settle_rest()  # still drop a counter whose window ended, so the poorest live one shows
+            return
+        self.budget["restCounters"] = merge_counter(rest_counters(self.budget), seen)
+        self.settle_rest()
+
+    def settle_rest(self) -> None:
+        """budget["rest"] is the core counter with the least left. GitHub answers one token's REST calls from
+        two "core" counters with their own hourly windows (measured 2026-10-30: /actions/runs/N and
+        /actions/workflows/N report one, resetting at :44; /rate_limit, pulls, jobs and check runs report the
+        other, resetting at :10), and the headers and /rate_limit name both "core". Keeping only the last
+        answer made the shared reading jump between them (3126 left at 05:28Z, 0 at 05:33Z), which read as a
+        3000-call burst nobody logged, and let the gh guard and this daemon spend freely from a counter that
+        was already spent. Every live counter is kept (restCounters, at most REST_COUNTERS) and the poorest
+        one is what everything else reads; a counter past its reset is dropped. With no live counter the last
+        reading stays as it was before restCounters existed (mode() treats a passed reset as a fresh hour)."""
+        counters = rest_counters(self.budget)
+        cur = self.budget.get("rest")
+        if isinstance(cur, dict) and isinstance(cur.get("reset"), (int, float)) and isinstance(cur.get("remaining"), int):
+            # the reading itself counts too: a budget.json from before restCounters, or one lowered in place
+            seen_at = cur.get("seenAt")
+            counters = merge_counter(counters, {**cur, "seenAt": seen_at if isinstance(seen_at, (int, float)) else self.now})
+        live = [c for c in counters if c["reset"] > self.now]
+        live = sorted(live, key=lambda c: c["seenAt"], reverse=True)[:REST_COUNTERS]
+        if not live:
+            self.budget.pop("restCounters", None)
+            return
+        self.budget["restCounters"] = sorted(live, key=lambda c: c["reset"])
+        self.budget["rest"] = dict(min(live, key=lambda c: (c["remaining"], -c["seenAt"])))
 
     def refresh_budget(self) -> None:
         """Read the quota from GitHub when this host's view has gone stale.
@@ -1585,7 +1655,16 @@ class Daemon:
         """
         if BUDGET_REFRESH <= 0 or self.now < self.budget_retry or self.clock() < self.secondary_until:
             return
-        seen = [(self.budget.get(b) or {}).get("seenAt") for b in ("rest", "graphql")]
+        # REST is fresh when every core counter was seen lately, or /rate_limit answered lately: it reports only
+        # one of the counters (settle_rest), so a counter it cannot see must not force a read every tick, and a
+        # fresh hidden counter must not keep the one it can see from being refreshed.
+        counters = rest_counters(self.budget)
+        if counters:
+            oldest = min(c["seenAt"] for c in counters)
+            rest_seen = max(oldest, self.rate_limit_at) if self.rate_limit_at > float("-inf") else oldest
+        else:
+            rest_seen = (self.budget.get("rest") or {}).get("seenAt")
+        seen = [rest_seen, (self.budget.get("graphql") or {}).get("seenAt")]
         ages = [self.now - t for t in seen if isinstance(t, (int, float))]
         if len(ages) == 2 and max(ages) < BUDGET_REFRESH:
             return  # every bucket's view is recent enough; a bucket never seen always refreshes
@@ -1601,6 +1680,7 @@ class Daemon:
         if not isinstance(resources, dict):
             return self.budget_failed("no resources in the answer")
         self.budget_retry = 0.0
+        self.rate_limit_at = self.now
         for bucket, family in (("rest", "core"), ("graphql", "graphql")):
             seen = resources.get(family)
             if isinstance(seen, dict):
@@ -2210,6 +2290,7 @@ class Daemon:
         self.spill = []
         self.policy = daemon_policy()
         self.jobs_only = []
+        self.settle_rest()  # a counter whose window ended leaves the reading to the others
         if self.failing is None:
             # and again in serve_waits: a long read phase must not look like a dead daemon; ticks that
             # keep raising stop marking, so their blockers hand the wait back (resume_wait says why)
@@ -4938,6 +5019,11 @@ def cmd_budget(as_json: bool) -> int:
             rate = (status.get("perMinute") or {}).get(bucket)
             spend = f", {rate}/min to spend until then" if isinstance(rate, (int, float)) and rate >= 0 else ""
             print(f"{bucket:<8} {b.get('remaining')}/{b.get('limit')} left, resets {when}{spend}, seen {age(b.get('seenAt'))}")
+            counters = rest_counters(budget) if bucket == "rest" else []
+            if len(counters) > 1:
+                print("         core counters (the poorest is the one above): " + "; ".join(
+                    f"{c['remaining']}/{c.get('limit')} until "
+                    f"{dt.datetime.fromtimestamp(c['reset'], dt.timezone.utc).strftime('%H:%M:%SZ')}" for c in counters))
         paths, reads = status.get("paths"), status.get("reads")
         if isinstance(paths, dict):
             name = {"graphql": "GraphQL", "rest": "REST"}
