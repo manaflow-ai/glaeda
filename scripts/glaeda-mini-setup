@@ -125,6 +125,7 @@ import plistlib
 import pwd
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -219,6 +220,8 @@ GIT_CANDIDATES = ("/opt/homebrew/bin/git", "/usr/local/bin/git", "/usr/bin/git")
 # glaeda-update waits 30 minutes for this whole command; the git step must fit well inside that
 GIT_BREW_TIMEOUT = 600
 BREW_TIMEOUT = 1800
+# how long a timed-out install's processes get after TERM before KILL, and after KILL before they are reported left
+REAP_GRACE_S = 5.0
 
 
 # ---------------------------------------------------------------- small helpers
@@ -539,17 +542,146 @@ def plan_git(ctx: Context) -> dict[str, Any]:
             "note": f"git {need}+ fixes a git maintenance memory bug: the Homebrew owner runs brew install git"}
 
 
+def session_members(sid: int) -> list[tuple[int, int, str]] | None:
+    """(pid, pgid, command) of every process in session sid that has not exited; None when ps could not list them."""
+    try:
+        listing = subprocess.run(["ps", "-A", "-o", "pid=,pgid=,stat=,command="], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=RUN_TIMEOUT,
+                                 check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if listing.returncode != 0:
+        return None
+    members = []
+    for line in listing.stdout.splitlines():
+        fields = line.split(None, 3)
+        if len(fields) < 3 or not fields[0].isdigit() or not fields[1].isdigit() or fields[2].startswith("Z"):
+            continue
+        try:
+            if os.getsid(int(fields[0])) != sid:
+                continue
+        except OSError:
+            continue
+        members.append((int(fields[0]), int(fields[1]), fields[3] if len(fields) > 3 else ""))
+    return members
+
+
+def signal_session_member(pid: int, sid: int, sig: int) -> None:
+    """Signal pid only if it is still in session sid. A pid from an earlier listing may have exited and been reused;
+    a reused pid is in another session (a session is joined only by forking from a member), so the session is
+    checked again right before the signal. On Linux a pidfd pins the process between that check and the signal.
+
+    macOS has no pidfd, so there the check and the signal are two calls back to back. XNU hands out pids in order
+    (nextpid counts up and wraps only at PID_MAX, 99999; bsd/kern/kern_fork.c), so a pid freed between those two
+    calls goes to a new process only after the counter has passed every other pid once: about 100,000 forks
+    inside the microseconds between getsid and kill. The leader's own group is signalled with killpg instead
+    (reap_session), which is pinned because the leader is not reaped until the reap is over."""
+    fd = None
+    if hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal"):
+        try:
+            fd = os.pidfd_open(pid)
+        except ProcessLookupError:
+            return  # it has exited
+        except OSError:
+            fd = None  # a kernel without pidfds, or no fd to spare (EMFILE): check and signal the plain way
+    if fd is not None:
+        try:
+            if os.getsid(pid) == sid:
+                signal.pidfd_send_signal(fd, sig)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+        return
+    with contextlib.suppress(OSError):
+        if os.getsid(pid) == sid:
+            os.kill(pid, sig)
+
+
+def reap_session(sid: int, started: float) -> str:
+    """Stop every process in the session a timed-out install started (TERM, up to REAP_GRACE_S, then KILL, up to
+    REAP_GRACE_S) and say what was stopped. sid is the recorded id of the session run_install made; nothing is found
+    by name or pattern. Homebrew moves its sandbox_operation.rb children to process groups of their own (cmux9s,
+    2026-10-30), so a signal to the installer's group alone misses them; they stay in its session. The caller has
+    not reaped the session leader yet, so its pid, which numbers the session and the leader's group, cannot be
+    reused meanwhile. Only a listing that worked and came back empty ends a pass early; a failed listing is retried
+    until the pass's deadline, and the note says when the end state could not be confirmed."""
+    if sid <= 1 or sid == os.getsid(0):
+        raise ValueError(f"session {sid} is not one a timed-out install started")
+    seen: dict[int, tuple[int, str]] = {}
+    left: list[tuple[int, int, str]] | None = None
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        deadline = time.monotonic() + REAP_GRACE_S
+        members = session_members(sid)
+        while True:
+            for pid, pgid, command in members or ():
+                seen.setdefault(pid, (pgid, command))
+            with contextlib.suppress(OSError):
+                os.killpg(sid, sig)  # the leader's own group, even when ps could not list the session
+            for pid, pgid, _ in members or ():
+                if pgid != sid:  # the leader's group had its signal from killpg above
+                    signal_session_member(pid, sid, sig)
+            time.sleep(0.1)
+            left = members = session_members(sid)
+            if left == [] or time.monotonic() >= deadline:
+                break
+        if left == []:
+            break
+    elapsed = time.monotonic() - started
+    stopped = "; ".join(f"pid {pid} pgid {pgid} {command[:160]}" for pid, (pgid, command) in sorted(seen.items()))
+    note = f"reaped session {sid} after {elapsed:.0f} s: {stopped or 'no process listed'}"
+    if left is None:
+        note += "; ps could not list the session, so its end state is not confirmed"
+    elif left:
+        note += "; still running after KILL: " + "; ".join(f"pid {pid} pgid {pgid}" for pid, pgid, _ in left)
+    print(f"glaeda-mini-setup: {note}", file=sys.stderr)
+    return note
+
+
+def run_install(argv: list[str], timeout: int, env: dict[str, str] | None = None,
+                cwd: Path | None = None) -> tuple[int | None, str, str]:
+    """Run an installer for at most timeout s: (exit code, output, ""), or (None, output, what was reaped) when it
+    ran out of time. The installer leads a session of its own, so on timeout every process it started is stopped
+    with it (reap_session), not only the direct child: subprocess.run's timeout kills only that child, and brew
+    install git's grandchildren outlived it under launchd on cmux9s (2026-10-30)."""
+    started = time.monotonic()
+    proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, start_new_session=True)
+    try:
+        out, _ = proc.communicate(timeout=timeout)
+        return proc.returncode, out, ""
+    except subprocess.TimeoutExpired:
+        pass
+    except BaseException:
+        reap_session(proc.pid, started)
+        proc.kill()
+        proc.wait()
+        raise
+    note = reap_session(proc.pid, started)
+    try:
+        out, _ = proc.communicate(timeout=REAP_GRACE_S)  # what it printed before it was stopped
+    except subprocess.TimeoutExpired:
+        # a process that left the session still holds the output pipe: stop reading and reap the leader
+        for stream in (proc.stdout, proc.stderr):
+            if stream:
+                stream.close()
+        proc.kill()
+        proc.wait()
+        out = ""
+    return None, out, note
+
+
 def brew_install(brew: str, formula: str, verb: str = "install", timeout: int = BREW_TIMEOUT,
                  no_auto_update: bool = False) -> tuple[int, str]:
     env = {**os.environ, "HOMEBREW_NO_AUTO_UPDATE": "1"} if no_auto_update else None
     try:
-        result = subprocess.run([brew, verb, formula], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True, timeout=timeout, check=False, env=env)
-    except subprocess.TimeoutExpired:
-        return 1, f"brew {verb} {formula} timed out after {timeout} s"
+        code, out, reaped = run_install([brew, verb, formula], timeout, env=env)
     except OSError as error:
         return 1, str(error)
-    return result.returncode, result.stdout
+    if code is None:
+        # the callers keep the tail of the output, so the timeout and what it stopped come last
+        return 1, f"{out}\nbrew {verb} {formula} timed out after {timeout} s; {reaped}"
+    return code, out
 
 
 # ---------------------------------------------------------------- preflight (read-only)
@@ -1859,14 +1991,13 @@ def find_cargo(ctx: Context) -> str | None:
 def build_reclaim(ctx: Context) -> tuple[int, str]:
     cargo = find_cargo(ctx) or "cargo"
     try:
-        result = subprocess.run(
-            [cargo, "build", "--locked", "--release", "--bin", "glaeda-worktree-reclaim"],
-            cwd=REPO, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, timeout=1800, check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
+        code, out, reaped = run_install([cargo, "build", "--locked", "--release", "--bin", "glaeda-worktree-reclaim"],
+                                        1800, cwd=REPO)
+    except OSError as error:
         return 1, str(error)
-    return result.returncode, result.stdout
+    if code is None:
+        return 1, f"{out}\ncargo build timed out after 1800 s; {reaped}"
+    return code, out
 
 
 def apply_uninstall(ctx: Context, actions: list[dict[str, Any]]) -> None:

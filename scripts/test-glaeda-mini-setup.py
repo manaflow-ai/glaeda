@@ -17,6 +17,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -1271,6 +1272,138 @@ class MiniSetupTest(unittest.TestCase):
     def test_no_em_dashes(self) -> None:
         for name in ("glaeda-mini-setup", "glaeda-worktree-reclaim-all", "test-glaeda-mini-setup.py"):
             self.assertNotIn(chr(0x2014), (ROOT / "scripts" / name).read_text(), name)
+
+
+FAKE_INSTALLER = """#!/usr/bin/env python3
+# A brew that hangs: like Homebrew's sandbox_operation.rb children on cmux9s (2026-10-30), its grandchild moves to a
+# process group of its own, ignores TERM and HUP, outlives its parent and keeps the output pipe open.
+import os, signal, sys, time
+pid_file = os.environ["FAKE_INSTALLER_PIDS"]
+child = os.fork()
+if child == 0:
+    os.setpgid(0, 0)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    with open(pid_file, "a") as f:
+        f.write(f"grandchild {os.getpid()}\\n")
+    time.sleep(300)
+    os._exit(0)
+with open(pid_file, "a") as f:
+    f.write(f"installer {os.getpid()}\\n")
+print("pouring git", flush=True)
+time.sleep(300)
+"""
+
+
+def live(pid: int) -> bool:
+    """pid names a process that has not exited (a zombie waiting on a reaper that is not ours has exited)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+    return bool(state) and not state.startswith("Z")
+
+
+class TimedOutInstallTest(unittest.TestCase):
+    """A timed-out install is stopped with every process it started. brew install git ran past GIT_BREW_TIMEOUT on
+    cmux9s (2026-10-30); the timeout killed only brew, and three `sandbox_operation.rb extract` rubies, each in a
+    process group of its own, were left running under launchd."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="mini-setup-reap-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.brew = self.tmp / "brew"
+        self.brew.write_text(FAKE_INSTALLER)
+        self.brew.chmod(0o755)
+        self.pid_file = self.tmp / "pids"
+        os.environ["FAKE_INSTALLER_PIDS"] = os.fspath(self.pid_file)
+        self.addCleanup(os.environ.pop, "FAKE_INSTALLER_PIDS", None)
+        self.addCleanup(self.kill_started)
+
+    def started(self) -> dict[str, int]:
+        lines = self.pid_file.read_text().split() if self.pid_file.exists() else []
+        return dict(zip(lines[::2], map(int, lines[1::2])))
+
+    def kill_started(self) -> None:
+        # a failing run must not leak the fakes this test started (by their recorded pids, never by name)
+        for pid in self.started().values():
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+
+    def test_a_timed_out_brew_leaves_no_process_behind(self) -> None:
+        log = io.StringIO()
+        with mock.patch.object(ms, "REAP_GRACE_S", 1.0), contextlib.redirect_stderr(log):
+            code, out = ms.brew_install(os.fspath(self.brew), "git", timeout=2)
+        self.assertIn(f"reaped session {self.started()['installer']}", log.getvalue())
+        started = self.started()
+        self.assertEqual(set(started), {"installer", "grandchild"}, out)
+        self.assertEqual(code, 1)
+        self.assertIn("timed out after 2 s", out)
+        for name, pid in started.items():
+            self.assertFalse(live(pid), f"{name} {pid} outlived the timeout: {out}")
+        self.assertEqual(ms.session_members(started["installer"]), [])
+        # the log names what it stopped: the session, each pid with its group and command, and the time it ran
+        self.assertIn(f"session {started['installer']}", out)
+        self.assertIn(f"pid {started['grandchild']} pgid {started['grandchild']}", out)
+        self.assertIn(os.fspath(self.brew), out)
+        self.assertIn("pouring git", out)
+
+    def test_a_failed_process_listing_never_ends_the_reap_early(self) -> None:
+        """ps failing right after TERM (a loaded host) must not read as an empty session: KILL still goes out."""
+        real = ms.session_members
+        calls = []
+
+        def flaky(sid: int):
+            calls.append(sid)
+            return None if len(calls) == 2 else real(sid)  # the first listing after TERM fails
+
+        log = io.StringIO()
+        with mock.patch.object(ms, "REAP_GRACE_S", 1.0), mock.patch.object(ms, "session_members", flaky), \
+                contextlib.redirect_stderr(log):
+            code, out = ms.brew_install(os.fspath(self.brew), "git", timeout=2)
+        self.assertEqual(code, 1)
+        for name, pid in self.started().items():
+            self.assertFalse(live(pid), f"{name} {pid} outlived the timeout: {out}")
+        with mock.patch.object(ms, "REAP_GRACE_S", 0.3), mock.patch.object(ms, "session_members", lambda sid: None), \
+                contextlib.redirect_stderr(io.StringIO()):
+            sleeper = subprocess.Popen(["sleep", "30"], start_new_session=True)
+            self.addCleanup(sleeper.wait)
+            note = ms.reap_session(sleeper.pid, time.monotonic())
+        self.assertIn("not confirmed", note)  # never "reaped" with nothing checked
+        self.assertEqual(sleeper.wait(timeout=5), -signal.SIGTERM)  # the leader's group is still signalled
+
+    def test_a_pid_outside_the_session_is_never_signalled(self) -> None:
+        """A pid listed earlier that exited and was reused belongs to another session and is left alone, with a
+        pidfd (Linux) and without one (macOS)."""
+        no_pidfd = mock.patch.object(ms, "hasattr", lambda obj, name: False if "pidfd" in name else hasattr(obj, name),
+                                     create=True)
+        # Python has pidfd_open but the call fails (an old kernel: ENOSYS; no fd to spare: EMFILE)
+        failing_pidfd = mock.patch.object(ms.os, "pidfd_open", mock.Mock(side_effect=OSError(24, "EMFILE")),
+                                          create=True)
+        for label, patch in (("pidfd", contextlib.nullcontext()), ("no pidfd", no_pidfd),
+                             ("pidfd_open fails", failing_pidfd)):
+            with self.subTest(label), patch:
+                other = subprocess.Popen(["sleep", "30"], start_new_session=True)
+                self.addCleanup(other.wait)
+                self.addCleanup(other.kill)
+                ms.signal_session_member(other.pid, other.pid + 1, signal.SIGKILL)
+                time.sleep(0.2)
+                self.assertIsNone(other.poll())
+                ms.signal_session_member(other.pid, other.pid, signal.SIGKILL)
+                self.assertEqual(other.wait(timeout=5), -signal.SIGKILL)
+
+    def test_an_install_that_finishes_in_time_is_left_alone(self) -> None:
+        quick = self.tmp / "quick-brew"
+        quick.write_text("#!/bin/sh\necho \"$1 $2 done\"\n")
+        quick.chmod(0o755)
+        self.assertEqual(ms.brew_install(os.fspath(quick), "git", timeout=30), (0, "install git done\n"))
+
+    def test_the_reap_never_signals_this_process_own_session(self) -> None:
+        with self.assertRaises(ValueError):
+            ms.reap_session(os.getsid(0), time.monotonic())
 
 
 if __name__ == "__main__":
