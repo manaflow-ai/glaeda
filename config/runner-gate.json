@@ -1,0 +1,24 @@
+{
+  "schema": "glaeda-runner-gate/v1",
+  "note": "Per-mini listener-gate settings, read by scripts/glaeda-cmux-runner-hook from the release glaeda-update installed (docs/CMUX_MINI_RUNNER.md, 'Per-mini gate settings'). Keys under hosts are the short, lowercased hostname (hostname -s), not the manifest member name. cpuHold false: the CPU marks (85/80 over 60 s) never hold that mini's listeners; units, memory pressure, heat, disk and the fleet's holds still do. A host entry with an until (UTC) is ignored past it, so a trial ends by itself.",
+  "defaults": {
+    "cpuHold": true
+  },
+  "hosts": {
+    "cmux10s-mac-mini": {
+      "cpuHold": false,
+      "until": "2026-10-30T21:00:00Z",
+      "why": "A/B of the CPU hold on top of the units ledger (glaeda#1756 follow-up); control cmuxs-mac-mini"
+    },
+    "cmux8s-mac-mini": {
+      "cpuHold": false,
+      "until": "2026-10-30T21:00:00Z",
+      "why": "A/B of the CPU hold on top of the units ledger (glaeda#1756 follow-up); control cmux11s-mac-mini (both devCompile)"
+    },
+    "cmux13s-mac-mini": {
+      "cpuHold": false,
+      "until": "2026-10-30T21:00:00Z",
+      "why": "A/B of the CPU hold on top of the units ledger (glaeda#1756 follow-up); control cmux14 (both two gui runners)"
+    }
+  }
+}

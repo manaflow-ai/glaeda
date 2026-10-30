@@ -367,6 +367,19 @@ What `--apply` does:
        crossed both marks about once a minute (glaeda#1751's 10-29 measurements). The
        gate's first look after it starts or reloads, before a read lies in the window,
        still takes one `iostat` second.
+     - **Per-mini gate settings** (`config/runner-gate.json`, schema `glaeda-runner-gate/v1`).
+       Whether the CPU marks hold a mini's listeners at all is declared per mini in this
+       repository: `defaults.cpuHold`, and `hosts.<hostname -s, lowercased>.cpuHold` with an
+       optional `until` (UTC) past which the entry is ignored, so a trial ends by itself. The
+       gate reads the file from the release glaeda-update installed
+       (`~/.local/state/glaeda/update/generations/<current>/glaeda/config/runner-gate.json`)
+       at most once a minute and logs a change once ("the CPU hold is off on this mini"), so a
+       setting reaches a mini through the normal release and promote flow with no `--apply`
+       and no environment variable. With the hold off, the listeners are admitted by units,
+       memory pressure, heat, disk and the fleet's holds, as the gui, session, freshness,
+       nightly and gateway runners already are. A missing or unreadable file keeps the hold on.
+       It exists to measure (2026-10-30) whether the 60 s CPU hold buys anything on top of the
+       units ledger once std minis average 85-93% busy.
      - The gui runner is never held for CPU saturation (85% busy), only for memory
        pressure: its jobs come one per mini and are admitted by units like any other,
        and the CPU mark held it whenever the other lanes kept the mini busy. Nothing

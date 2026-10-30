@@ -1223,6 +1223,22 @@ _cpu_window_env = float(os.environ.get("GLAEDA_RUNNER_GATE_CPU_WINDOW_S") or GAT
 GATE_CPU_WINDOW_S = 0.0 if _cpu_window_env <= 0 else min(GATE_CPU_WINDOW_MAX_S,
                                                          max(GATE_CPU_WINDOW_MIN_S, _cpu_window_env))
 GATE_MEMORY_PRESSURE_HOLD = 2
+# Per-mini gate settings, declared in this repository's config/runner-gate.json and read from the release
+# glaeda-update installed (<update state>/generations/<current>/glaeda/config/runner-gate.json), so a setting reaches
+# a mini through the release and promote flow like the hook itself, and no runner needs an environment variable or an
+# --apply. Today the file says one thing: whether the CPU marks above hold a mini's listeners at all ("cpuHold"),
+# under "defaults" and per host (the short, lowercased hostname, as glaeda-cmux-runner's default runner name has it).
+# A host entry may carry an "until" (UTC, ISO 8601): past it the entry is ignored, so a trial ends by itself. With the
+# CPU hold off the listeners are admitted by units, memory pressure, heat, the disk and the fleet's holds alone, as the
+# gui, session, freshness, nightly and gateway runners already are. Read every GATE_SETTINGS_EVERY_S on the gate's
+# looks; a missing or unreadable file, or one with another schema, keeps the CPU hold on (the code default).
+# 2026-10-30: glaeda#1756's 60 s average left std minis averaging 85-93% busy held steadily (std 35 and side-std 24
+# runners held for CPU, 39 jobs queued on side-std at 15:22Z) while the units ledger already sized admission.
+# Empty means ~/.local/state/glaeda/update, resolved when read (glaeda-update's STATE_DIR).
+GATE_SETTINGS_DIR = os.environ.get("GLAEDA_RUNNER_GATE_SETTINGS_DIR") or ""
+GATE_SETTINGS_FILE = "glaeda/config/runner-gate.json"
+GATE_SETTINGS_SCHEMA = "glaeda-runner-gate/v1"
+GATE_SETTINGS_EVERY_S = 60.0
 # Kept for the pure mini_saturated helper and old operator tooling; the listener gate no longer uses load average.
 GATE_LOAD_PAUSE = float(os.environ.get("GLAEDA_RUNNER_GATE_LOAD_PAUSE") or 2.0)
 GATE_LOAD_RESUME = float(os.environ.get("GLAEDA_RUNNER_GATE_LOAD_RESUME") or 1.5)
@@ -5303,6 +5319,62 @@ def mini_saturated(paused: bool, load: float | None = None, cores: int | None = 
             f"listening resumes below {GATE_LOAD_RESUME:g})")
 
 
+def gate_host() -> str:
+    """This mini's key in config/runner-gate.json: the short, lowercased hostname, as glaeda-cmux-runner's
+    default_name has it (cmux10s-mac-mini, cmuxs-mac-mini-4)."""
+    host = os.uname().nodename.split(".")[0].lower()
+    return re.sub(r"[^a-z0-9-]+", "-", host).strip("-")
+
+
+def gate_settings_doc(update_dir: str = "") -> tuple[dict[str, Any] | None, str]:
+    """config/runner-gate.json from the release glaeda-update installed, and where it came from (or why there is
+    none). Two small reads (state.json, the file); any failure is None, which keeps every code default."""
+    base = Path(update_dir or GATE_SETTINGS_DIR or os.path.expanduser("~/.local/state/glaeda/update"))
+    try:
+        raw = read_bounded(base / "state.json")
+        tag = json.loads(raw.decode("utf-8")).get("current") if raw is not None else None
+    except (OSError, ValueError, AttributeError) as e:
+        return None, f"no installed release ({type(e).__name__})"
+    if not isinstance(tag, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", tag):
+        return None, "no installed release"
+    try:
+        raw = read_bounded(base / "generations" / tag / GATE_SETTINGS_FILE)
+        doc = json.loads(raw.decode("utf-8")) if raw is not None else None
+    except (OSError, ValueError) as e:
+        return None, f"{tag} has no readable runner-gate.json ({type(e).__name__})"
+    if not isinstance(doc, dict) or doc.get("schema") != GATE_SETTINGS_SCHEMA:
+        return None, f"{tag}'s runner-gate.json is not {GATE_SETTINGS_SCHEMA}"
+    return doc, tag
+
+
+def gate_cpu_hold(doc: dict[str, Any] | None, host: str, now: float) -> tuple[bool, str]:
+    """Whether the CPU marks hold this mini's listeners, and why: the host's entry while it is live (no "until",
+    or "until" still ahead of `now`, epoch seconds), else "defaults", else on. A value that is not a bool, or an
+    "until" that does not parse, is ignored (the entry then does not apply)."""
+    hold, why = True, "the code default"
+    if not isinstance(doc, dict):
+        return hold, why
+    defaults = doc.get("defaults")
+    if isinstance(defaults, dict) and isinstance(defaults.get("cpuHold"), bool):
+        hold, why = defaults["cpuHold"], "runner-gate.json defaults"
+    hosts = doc.get("hosts")
+    entry = hosts.get(host) if isinstance(hosts, dict) else None
+    if not isinstance(entry, dict) or not isinstance(entry.get("cpuHold"), bool):
+        return hold, why
+    until = entry.get("until")
+    if until is not None:
+        try:
+            ends = datetime.datetime.fromisoformat(str(until).replace("Z", "+00:00"))
+            if ends.tzinfo is None:
+                return hold, why
+        except ValueError:
+            return hold, why
+        if now >= ends.timestamp():
+            return hold, why
+        return entry["cpuHold"], f"runner-gate.json hosts.{host} until {until}"
+    return entry["cpuHold"], f"runner-gate.json hosts.{host}"
+
+
 def host_saturated(paused: bool, cpu_busy: float | None = None, memory_pressure: int | None = None) -> str | None:
     """Why the listener should pause from measured host pressure, or None when it has headroom.
 
@@ -5758,6 +5830,9 @@ class Gate:
         self.cpu_window = CpuWindow(GATE_CPU_WINDOW_S)  # read on the looks (cpu_look, cpu_feed); lost on reload
         self.memory_pressure: int | None = None
         self.memory_at = -GATE_CPU_EVERY_S
+        self.cpu_hold = True  # config/runner-gate.json's cpuHold for this mini (cpu_holds), read every GATE_SETTINGS_EVERY_S
+        self.cpu_hold_why = "the code default"
+        self.settings_at = -GATE_SETTINGS_EVERY_S
         self.console_why: str | None = None  # the last console_refusal, read at most every GATE_CONSOLE_EVERY_S
         self.console_at = -GATE_CONSOLE_EVERY_S
         self.eligible_why: str | None = os.environ.pop(GATE_INELIGIBLE_ENV, None) or None  # the held answer
@@ -5931,6 +6006,21 @@ class Gate:
         if ticks is not None and (busy := self.cpu_window.add(now, ticks)) is not None:
             self.cpu_busy, self.cpu_at = busy, now
 
+    def cpu_holds(self) -> bool:
+        """Whether the CPU marks hold this mini's listeners (config/runner-gate.json's cpuHold; gate_cpu_hold), read
+        at most every GATE_SETTINGS_EVERY_S. A change is logged once, so the gate log says when a mini's hold went
+        off or came back."""
+        now = time.monotonic()
+        if now - self.settings_at < GATE_SETTINGS_EVERY_S:
+            return self.cpu_hold
+        self.settings_at = now
+        doc, _ = gate_settings_doc()
+        hold, why = gate_cpu_hold(doc, gate_host(), time.time())
+        if (hold, why) != (self.cpu_hold, self.cpu_hold_why):
+            gate_log(f"the CPU hold is {'on' if hold else 'off'} on this mini ({why})")
+        self.cpu_hold, self.cpu_hold_why = hold, why
+        return hold
+
     def saturated(self) -> str | None:
         """Use host CPU averaged over GATE_CPU_WINDOW_S and VM pressure with hysteresis; unreadable probes never
         hold a listener.
@@ -5957,7 +6047,7 @@ class Gate:
         about no CPU, and the build they submit runs wherever the controller has room."""
         now = time.monotonic()
         scope = runner_scope(self.runner_dir)
-        if scope.gui or scope.session or scope.fresh or scope.nightly or scope.gateway:
+        if scope.gui or scope.session or scope.fresh or scope.nightly or scope.gateway or not self.cpu_holds():
             self.cpu_busy = None
         elif now - self.cpu_at >= GATE_CPU_EVERY_S:
             self.cpu_busy = self.cpu_look(now)

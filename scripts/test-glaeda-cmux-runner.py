@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import copy
+import datetime
 import fcntl
 import hashlib
 import importlib.machinery
@@ -63,6 +64,8 @@ os.environ["GLAEDA_RUNNER_GATE_CPU_PAUSE"] = os.environ["GLAEDA_RUNNER_GATE_CPU_
 # and no CPU window, so a Mac running these tests never mixes its own tick counters into a patched host_io sample;
 # the CpuWindow tests set the window and the tick reader themselves.
 os.environ["GLAEDA_RUNNER_GATE_CPU_WINDOW_S"] = "0"
+# and never this machine's installed glaeda release's config/runner-gate.json; the gate-settings tests point at a fake.
+os.environ["GLAEDA_RUNNER_GATE_SETTINGS_DIR"] = "/nonexistent/glaeda-update"
 # Likewise the console check reads this Mac's real session, which a locked test host would turn into refusals: no
 # ioreg here or in the hooks the tests start (unreadable changes nothing); console tests point it at a fake.
 os.environ["GLAEDA_RUNNER_IOREG"] = "/nonexistent/ioreg"
@@ -7391,6 +7394,77 @@ class GateTest(unittest.TestCase):
                 if held:
                     self.assertTrue(why.startswith(fresh.SATURATED), why)
                     self.assertIn("listening resumes below 80% CPU", why)
+
+    def gate_settings_release(self, doc: object, tag: str = "r-20261030-test") -> Path:
+        """A fake glaeda-update state dir whose current release carries `doc` as config/runner-gate.json."""
+        update = self.tmp / "glaeda-update"
+        config = update / "generations" / tag / "glaeda" / "config"
+        config.mkdir(parents=True, exist_ok=True)
+        (update / "state.json").write_text(json.dumps({"current": tag, "previous": None, "quarantined": []}))
+        (config / "runner-gate.json").write_text(doc if isinstance(doc, str) else json.dumps(doc))
+        return update
+
+    def test_runner_gate_json_turns_the_cpu_hold_off_per_host_until_its_deadline(self) -> None:
+        now = 1_800_000_000.0
+        later = datetime.datetime.fromtimestamp(now + 3600, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        earlier = datetime.datetime.fromtimestamp(now - 1, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        doc = {"schema": hook.GATE_SETTINGS_SCHEMA, "defaults": {"cpuHold": True},
+               "hosts": {"trial": {"cpuHold": False, "until": later}, "over": {"cpuHold": False, "until": earlier},
+                         "always": {"cpuHold": False}, "naive": {"cpuHold": False, "until": "2099-01-01T00:00:00"},
+                         "junk": {"cpuHold": "no"}}}
+        self.assertEqual(hook.gate_cpu_hold(doc, "trial", now)[0], False)
+        self.assertEqual(hook.gate_cpu_hold(doc, "always", now)[0], False)
+        for host in ("over", "naive", "junk", "other"):
+            self.assertEqual(hook.gate_cpu_hold(doc, host, now)[0], True, f"{host}: the entry does not apply")
+        self.assertEqual(hook.gate_cpu_hold({**doc, "defaults": {"cpuHold": False}}, "other", now)[0], False,
+                         "the defaults reach every host without an entry")
+        self.assertEqual(hook.gate_cpu_hold(None, "trial", now), (True, "the code default"))
+
+        update = self.gate_settings_release(doc)
+        read, tag = hook.gate_settings_doc(os.fspath(update))
+        self.assertEqual((read, tag), (doc, "r-20261030-test"))
+        self.assertIsNone(hook.gate_settings_doc(os.fspath(self.tmp / "missing"))[0], "no release: no settings")
+        self.assertIsNone(hook.gate_settings_doc(os.fspath(self.gate_settings_release("{not json")))[0])
+        self.assertIsNone(hook.gate_settings_doc(os.fspath(self.gate_settings_release({"schema": "other"})))[0])
+        (update / "state.json").write_text(json.dumps({"current": "../../etc"}))
+        self.assertIsNone(hook.gate_settings_doc(os.fspath(update))[0], "a tag is a name, never a path")
+
+    def test_a_mini_whose_cpu_hold_is_off_is_held_by_memory_pressure_only(self) -> None:
+        update = self.gate_settings_release({"schema": hook.GATE_SETTINGS_SCHEMA, "hosts": {"trial": {"cpuHold": False}}})
+        busy, pressure, host = [99.0], [1], ["trial"]
+        for name, value in (("GATE_CPU_PAUSE", 85.0), ("GATE_CPU_RESUME", 80.0), ("GATE_CPU_EVERY_S", 0.0),
+                            ("GATE_SETTINGS_EVERY_S", 0.0), ("GATE_SETTINGS_DIR", os.fspath(update))):
+            patcher = mock.patch.object(hook, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for name, fake in (("host_io", lambda: (0.0, busy[0])), ("memory_pressure_level", lambda: pressure[0]),
+                           ("gate_host", lambda: host[0])):
+            patcher = mock.patch.object(hook, name, side_effect=fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        logged: list[str] = []
+        with mock.patch.object(hook, "gate_log", side_effect=logged.append):
+            self.assertIsNone(gate.saturated(), "99% CPU holds nothing on a mini whose CPU hold is off")
+            self.assertTrue(any("CPU hold is off" in line for line in logged), logged)
+            pressure[0] = 2
+            self.assertTrue(gate.saturated().startswith(hook.SATURATED), "memory pressure still holds it")
+            pressure[0] = 1
+            self.assertIsNone(gate.saturated())
+            host[0] = "control"
+            why = gate.saturated()
+            self.assertTrue(why and "CPU busy at least 85%" in why, f"another mini keeps the hold: {why}")
+            self.assertTrue(any("CPU hold is on" in line for line in logged), logged)
+
+    def test_the_declared_runner_gate_json_is_valid(self) -> None:
+        doc = json.loads((ROOT / "config" / "runner-gate.json").read_text())
+        self.assertEqual(doc["schema"], hook.GATE_SETTINGS_SCHEMA)
+        self.assertIsInstance(doc["defaults"]["cpuHold"], bool)
+        for host, entry in doc.get("hosts", {}).items():
+            self.assertRegex(host, r"^[a-z0-9-]+$", "keys are hostname -s, lowercased")
+            self.assertIsInstance(entry["cpuHold"], bool, host)
+            if "until" in entry:
+                self.assertIsNotNone(datetime.datetime.fromisoformat(entry["until"].replace("Z", "+00:00")).tzinfo, host)
 
     def test_host_pressure_gate_uses_cpu_and_memory_not_load_average(self) -> None:
         with mock.patch.object(hook, "GATE_CPU_PAUSE", 80.0), mock.patch.object(hook, "GATE_CPU_RESUME", 70.0):
