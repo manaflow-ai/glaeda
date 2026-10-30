@@ -8942,7 +8942,8 @@ class DaemonPolicyTest(Base):
         self.assertTrue(all(0 <= share <= 1 for share in shares), shares)
         self.assertEqual(doc["default"]["restShare"], 0)  # a host not named must not add to the sum
         self.assertLessEqual(sum(shares), doc["maxRestShare"])
-        self.assertLessEqual(doc["maxRestShare"], 0.4)
+        # 0.1: REST is what gh, landers and reruns must use; the daemons read over GraphQL (2026-10-30)
+        self.assertLessEqual(doc["maxRestShare"], 0.1)
 
     def test_a_zero_share_reads_prs_and_runs_over_graphql(self) -> None:
         """A host the fleet policy does not name: every PR and run read is GraphQL. The one REST read left

@@ -1,11 +1,11 @@
 {
   "schema": "glaeda-gh-daemon/v1",
-  "note": "The fleet's glaeda-gh pacing, installed by glaeda-mini-setup (every profile) to ~/.local/share/glaeda/gh-daemon.json, where the daemon reads it every tick. default applies on every host; hosts[NAME] (NAME is ~/.config/glaeda/update.json host, else the short hostname) is laid over it, and ~/.config/glaeda/gh-daemon.json over both. Every daemon on the shared account polls on one REST quota, so the restShare values here sum to at most maxRestShare (a test checks it): a host not named gets 0 and reads PRs and runs over GraphQL only (its one REST read is the cap's exemption, a failed attempt's job list, once per attempt). Measured 2026-10-27, last hour per daemon: one host 2101 counted REST requests, one 546, one 155, every other host 0.",
-  "maxRestShare": 0.4,
+  "note": "The fleet's glaeda-gh pacing, installed by glaeda-mini-setup (every profile) to ~/.local/share/glaeda/gh-daemon.json, where the daemon reads it every tick. default applies on every host; hosts[NAME] (NAME is ~/.config/glaeda/update.json host, else the short hostname) is laid over it, and ~/.config/glaeda/gh-daemon.json over both. Every daemon on the shared account polls on one REST quota, so the restShare values here sum to at most maxRestShare (a test checks it): a host not named gets 0 and reads PRs and runs over GraphQL only (its one REST read is the cap's exemption, a failed attempt's job list, once per attempt). Measured 2026-10-27, last hour per daemon: one host 2101 counted REST requests, one 546, one 155, every other host 0. Measured 2026-10-30, with the shared REST quota run out again while GraphQL sat about 90% unused: cosmic-gray's daemon 1160 counted REST requests in the hour (of its 1250 cap), huge-blue's 411 (of 500), so the daemons were a third of the account's REST spend that gh, landers and reruns can only make over REST. The shares now sum to 0.1 (500 an hour): a daemon's PR and run reads go to GraphQL, 15 PRs a query, and REST stays for what only REST can read.",
+  "maxRestShare": 0.1,
   "default": {"restShare": 0.0},
   "hosts": {
-    "cosmic-gray": {"restShare": 0.25},
-    "huge-blue": {"restShare": 0.1},
-    "air-blue": {"restShare": 0.05}
+    "cosmic-gray": {"restShare": 0.06},
+    "huge-blue": {"restShare": 0.03},
+    "air-blue": {"restShare": 0.01}
   }
 }
