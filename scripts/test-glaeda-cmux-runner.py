@@ -6541,11 +6541,11 @@ class IdleLeftoverSweepTest(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def table(self, worker_of: str | None = None) -> dict[int, tuple[int, str]]:
+    def table(self, worker_of: str | None = None, bin_dir: str = "bin") -> dict[int, tuple[int, str]]:
         table = {60: (1, self.ORPHAN), 61: (60, "cmux-tui __terminal-host"),
                  62: (1, "/tmp/x/daemon"), 99: (1, "/usr/bin/python3 glaeda-cmux-runner-hook listen")}
         if worker_of:
-            table[50] = (40, f"/Users/cmux/{worker_of}/bin/Runner.Worker spawnclient 1 2")
+            table[50] = (40, f"/Users/cmux/{worker_of}/{bin_dir}/Runner.Worker spawnclient 1 2")
         return table
 
     def cwds(self) -> dict[int, str]:
@@ -6565,6 +6565,21 @@ class IdleLeftoverSweepTest(unittest.TestCase):
     def test_a_live_worker_of_this_runner_vetoes_the_sweep(self) -> None:
         self.alive = {60, 61}
         with mock.patch.object(hook, "processes", side_effect=lambda: self.table("actions-runner-glaeda-11")), \
+             mock.patch.object(hook, "process_cwds", return_value=self.cwds()):
+            self.assertEqual(hook.sweep_idle_leftovers(self.RUNNER), [])
+        self.assertEqual(self.alive, {60, 61})
+
+    def test_a_self_updated_runners_worker_vetoes_the_sweep(self) -> None:
+        """actions/runner 2.338 keeps bin/ as a link to bin.2.338.0/ and spawns the Worker by the resolved path, so a
+        substring test for bin/Runner.Worker saw no job (2026-10-30: every runner on the fleet runs that way)."""
+        self.alive = {60, 61}
+        with mock.patch.object(hook, "processes",
+                               side_effect=lambda: self.table("actions-runner-glaeda-11", "bin.2.338.0")), \
+             mock.patch.object(hook, "process_cwds", return_value=self.cwds()):
+            self.assertEqual(hook.sweep_idle_leftovers(self.RUNNER), [])
+        tables = iter([self.table()])
+        with mock.patch.object(hook, "processes",
+                               side_effect=lambda: next(tables, self.table("actions-runner-glaeda-11", "bin.2.338.0"))), \
              mock.patch.object(hook, "process_cwds", return_value=self.cwds()):
             self.assertEqual(hook.sweep_idle_leftovers(self.RUNNER), [])
         self.assertEqual(self.alive, {60, 61})
@@ -12525,6 +12540,18 @@ class NoEmDashTest(unittest.TestCase):
             self.assertNotIn(chr(0x2014), path.read_text(encoding="utf-8"), path)
 
 
+class VersionedRunnerBinTest(unittest.TestCase):
+    def test_no_worker_match_is_bin_only(self) -> None:
+        """A runner that updated itself spawns bin.<version>/Runner.Worker (actions/runner 2.338), so a look for
+        bin/Runner.Worker alone reads its job as idle. Every Worker match goes through runner_worker or allows
+        bin.<version>; this keeps a new one from coming back."""
+        narrow = re.compile(r'"bin"\s*/\s*"Runner\.Worker"|/bin/Runner\\?\.Worker')
+        for path in (HOOK, ROOT / "scripts/glaeda-cmux-runner"):
+            found = [n for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+                     if narrow.search(line) and "pgrep for bin/Runner.Worker missed" not in line]
+            self.assertEqual(found, [], f"{path.name}: a bin-only Runner.Worker match on line(s) {found}")
+
+
 class JobTelemetryTest(unittest.TestCase):
     """The per-job host sampler: attribution, verdicts, the bounded log, and the fork/finish handshake."""
 
@@ -12677,6 +12704,10 @@ class JobTelemetryTest(unittest.TestCase):
         }
         owners = self.hook.telemetry_test_app_owners(table)
         self.assertEqual(owners, {300: 100})
+        # a self-updated runner spawns bin.<version>/Runner.Worker: the same owner
+        versioned = {pid: (parent, command.replace("/bin/Runner.Worker", "/bin.2.338.0/Runner.Worker"))
+                     for pid, (parent, command) in table.items()}
+        self.assertEqual(self.hook.telemetry_test_app_owners(versioned), {300: 100})
         rows = [(pid, parent, 100.0, "cmux", command if pid in (100, 200) else "cmux DEV")
                 for pid, (parent, command) in table.items()]
         own = self.hook.classify(rows, 100, set(), owners)
