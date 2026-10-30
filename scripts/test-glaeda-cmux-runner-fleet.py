@@ -254,6 +254,24 @@ class FleetTest(unittest.TestCase):
                               capture_output=True, text=True, check=True).stdout.split()
         self.assertEqual((stamp["by"], stamp["source"], stamp["date"]), ("glaeda-cmux-runner-fleet", *head))
 
+    def test_apply_installs_the_gateway_runners_after_the_pool_instances(self) -> None:
+        """gatewayRunners adds instances after `runners` (glaeda_fleet_labels): the apply installs them too, as
+        instances runners and on, and the plan shows them beside the pool count."""
+        manifest = json.loads(json.dumps(MANIFEST))
+        manifest["defaults"]["runner"] = {"classes": {"std": {"runners": 4, "capacityUnits": 14,
+                                                              "gatewayRunners": 2}}}
+        self.manifest.write_text(json.dumps(manifest))
+        plan = self.fleet("--hosts", "mini-a", "--output", "human")
+        self.assertEqual(plan.returncode, 0, plan.stdout + plan.stderr)
+        self.assertIn("4 runners/14 units+2gw", plan.stdout)
+        result = self.fleet("--apply", "--hosts", "mini-a")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        row = json.loads(result.stdout)["members"][0]
+        self.assertEqual((row["runners"], row["gatewayRunners"]), (4, 2))
+        self.assertEqual([i["instance"] for i in row["instances"]], [0, 1, 2, 3, 4, 5])
+        applies = [c["remote"] for c in self.calls() if c["tool"] == "ssh" and "--apply" in c["remote"]]
+        self.assertEqual(sorted(int(r.split("--instance ")[1].split()[0]) for r in applies), [0, 1, 2, 3, 4, 5])
+
     def test_apply_installs_a_members_dedicated_runners_on_their_own_scope(self) -> None:
         """Leo, 2026-10-27: "why the fuck not manage it with glaeda????????" A member's runner.dedicated runners (a
         nightly builder's) are applied with the member's instances: one token minted for the entry's own scope, piped

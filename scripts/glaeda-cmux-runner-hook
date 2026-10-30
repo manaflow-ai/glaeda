@@ -102,7 +102,10 @@ A gui runner also stops listening while the console session is locked or nobody 
 the gui runner is idle its gate holds the gui runner's reserve (GUI_RESERVE: capacity/<gui token>.reserve): every other job on the
 mini, and every other runner's gate, leaves one unit free for its next job, so the side and root lanes cannot fill
 the mini and keep the gui label queued. A fast runner (--fast-runner) runs cmux-next's fast-tier on the fast tokens
-(FAST_TOKENS) instead of the shared units, and its gate looks at those tokens, never at the units. Every runner also stops listening while free disk is under its job-started hook's --min-free-gib,
+(FAST_TOKENS) instead of the shared units, and its gate looks at those tokens, never at the units. A gateway runner
+(--gateway-runner) runs only cmux's thin cmux-ci client jobs (GATEWAY_JOBS) on a gateway token (GATEWAY_TOKENS) and no
+shared unit; its gate is never held for CPU saturation or the units (GATEWAY).
+Every runner also stops listening while free disk is under its job-started hook's --min-free-gib,
 and starts the same eviction in the background, listening again once it made room (Gate.low_disk). Full means every
 unit this runner's own --capacity-units scans, read from its job-started hook, is taken or kept for an idle gui
 runner's reserve; for a root runner it also means the mini cannot admit a compile or an app-host shard (mini_full).
@@ -455,9 +458,34 @@ WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "
 # runner keeps its WORKFLOW_JOB_CLASSES cost.
 FAST_TOKENS = ("fast-0", "fast-1")
 FAST_JOBS = {("cmux-next.yml", "fast-tier")}
+# GATEWAY: a mini's gateway runners (--gateway-runner, glaeda_fleet_labels gatewayRunners: at most two, the label
+# glaeda-gateway-xcode-<version>) take only GATEWAY_JOBS, cmux's thin cmux-ci clients: each submits its build or test
+# to the cmux-ci controller and waits for the verdict, with about no CPU on the mini. On 2026-10-30 at 12:43Z every
+# std mini sat at 76 to 100% CPU, the side label cmux sent these clients to had 1 idle of 51 listeners (46 held off
+# by the gates), and no build-fleet compile ran for want of a client to submit it. So a gateway runner's gate skips the
+# CPU mark and the units (Gate.saturated, mini_full), like the nightly slot, and still holds for memory pressure, the
+# disk floor, heat and the fleet's host claim. Its job (the gateway class) takes one of GATEWAY_TOKENS and no shared
+# unit, and while it waits (for a nightly job waiting here first, FEED_FIRST, or a signing job, which takes both
+# tokens) it writes no admit.want marker, so it never holds another runner, and it waits GATEWAY_CAPACITY_WAIT_S at
+# most. job-started on a gateway runner refuses every other job at once: one that ran its build here would take the
+# mini's CPU outside its units. Keyed by (workflow file, job id) of the home repository: cmux-next.yml's
+# build-fleet clients (app-compile-fleet, swift-canary-fleet, release-compile-fast) and its client-only twins of the
+# Mac test jobs (fast-tier-fleet, swift-test-fleet, daemon-test-fleet; the bare fast-tier, swift-test and daemon-test
+# build on the mini and are refused here); fleet-compile-check.yml,
+# fleet-test-compile.yml (vars.CI_TEST_COMPILE_GATEWAY) and cmux-next-tip-test-compile.yml, whose gateway jobs run on
+# vars.CI_COMPILE_CHECK_GATEWAY's label once it names the gateway label.
+GATEWAY_CLASS = "gateway"
+GATEWAY_TOKEN_KIND = "gateway"  # CLASS_COST's token kind: any one of GATEWAY_TOKENS
+GATEWAY_TOKENS = ("gateway-0", "gateway-1")
+GATEWAY_JOBS = frozenset({("cmux-next.yml", "app-compile-fleet"), ("cmux-next.yml", "swift-canary-fleet"),
+                          ("cmux-next.yml", "release-compile-fast"), ("cmux-next.yml", "fast-tier-fleet"),
+                          ("cmux-next.yml", "swift-test-fleet"), ("cmux-next.yml", "daemon-test-fleet"),
+                          ("fleet-compile-check.yml", "compile-check"), ("fleet-test-compile.yml", "compile"),
+                          ("cmux-next-tip-test-compile.yml", "compile")})
+GATEWAY_CAPACITY_WAIT_S = 600.0  # SIGNING_DRAIN_WAIT_S: the longest a nightly signing job waits here to drain the mini
 # exclusive (SIGNING_JOBS): more units than any mini has, so admission caps it at the mini's whole count, plus both
-# fast tokens, the one capacity a 0-unit job takes, and the gui token, which the idle fuzzer (glaeda-idle-warm
-# gui_refusal) checks before it starts and while it runs, so it never starts again beside the job. The gui runner's reserve never applies (reserve_for leaves none
+# fast tokens and both gateway tokens, the capacity 0-unit jobs take (no PR client runs beside the key either), and
+# the gui token, which the idle fuzzer (glaeda-idle-warm gui_refusal) checks before it starts and while it runs, so it never starts again beside the job. The gui runner's reserve never applies (reserve_for leaves none
 # beside a job of every unit).
 EXCLUSIVE_UNITS = 1 << 16
 EXCLUSIVE_CLASS = "exclusive"
@@ -481,7 +509,9 @@ CLASS_COST: dict[str, tuple[int, tuple[str, ...]]] = {
     "compile": (5, ("persistent-dd", "root")), "gui": (1, ("gui", "root")), "product": (1, ("gui", "root")),
     "compile-gui": (4, ("root",)), "gui-step": (1, ("gui", "root")),
     "isolated": (4, ()), "simulator": (1, ("simulator",)), "light": (2, ()), "seed": (5, ()),
-    "fast": (0, FAST_TOKENS), "exclusive": (EXCLUSIVE_UNITS, (*FAST_TOKENS, "gui")),
+    "fast": (0, FAST_TOKENS), "exclusive": (EXCLUSIVE_UNITS, (*FAST_TOKENS, "gui", *GATEWAY_TOKENS)),
+    # a gateway runner's thin client (GATEWAY): no shared unit, any one gateway token
+    GATEWAY_CLASS: (0, (GATEWAY_TOKEN_KIND,)),
     # a simulator ci-step (STEP_COST_CLASS): it builds the app it then runs (cmux-next-ios-sim.sh), so it costs an
     # isolated build's units beside the simulator token
     "simulator-step": (4, ("simulator",))}
@@ -1500,6 +1530,11 @@ def stack_blocker_tier(event_name: str | None, repository: str | None, event: An
     names = {label["name"].casefold() for label in labels
              if isinstance(label, dict) and isinstance(label.get("name"), str)} if isinstance(labels, list) else set()
     return TIER_STACK if STACK_BLOCKER_LABEL.casefold() in names else ""
+
+
+def gateway_jobs_note() -> str:
+    """GATEWAY_JOBS for a refusal: "workflow job" pairs, sorted."""
+    return ", ".join(f"{workflow} {job}" for workflow, job in sorted(GATEWAY_JOBS))
 
 
 def nightly_slot_refusal(tier: str) -> str | None:
@@ -4109,8 +4144,10 @@ def token_holders(capacity_dir: Path, wants: list[str], compile_slots: int, root
             names += [f"root-{k}" for k in range(1, max(1, roots) + 1)]
         elif kind == "persistent-dd":
             names += ["persistent-dd"] + [f"persistent-dd-{c}" for c in range(1, max(1, compile_slots))]
-        elif kind in ("gui", "simulator") or kind in FAST_TOKENS:
+        elif kind in ("gui", "simulator") or kind in FAST_TOKENS or kind in GATEWAY_TOKENS:
             names.append(kind)
+        elif kind == GATEWAY_TOKEN_KIND:
+            names += list(GATEWAY_TOKENS)
     notes = []
     deadline = time.monotonic() + HOLDERS_BUDGET_S
     for name in names:
@@ -4218,7 +4255,9 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         own_reserve = gui_token if gui_runner else FRESH_RESERVE_TOKEN if fresh_runner else None
         in_reserve = (own_reserve is not None and 0 < units <= reserve_units(f"{own_reserve}{GUI_RESERVE}")
                       and not probe(capacity_dir / f"{own_reserve}{GUI_RESERVE}"))
-        needs = {*tokens, *(("units",) if units and not in_reserve else ())}
+        # the gateway kind is any one gateway token: a waiter that wants a named one (a signing job) is ahead of it
+        needs = {name for token in tokens for name in (GATEWAY_TOKENS if token == GATEWAY_TOKEN_KIND else (token,))}
+        needs |= {"units"} if units and not in_reserve else set()
         behind = fair_turn(capacity_dir, needs, time.time() if since is None else since, tier, units > 0, new_job)
         if behind:
             # a waiter behind another names every kind it needs, units too: a newcomer that fits must not take the
@@ -4274,7 +4313,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
             # persistent-dd comes in compile_slots copies once compile admission keeps its state per
             # runner; copy 0 keeps the original file name. A mini whose runners disagree on the count runs
             # as many compiles as the highest one allows, so re-apply every instance on a mini together.
-            copies = {"persistent-dd": max(1, compile_slots), "root": 1 if pinned else max(1, roots)}.get(token, 1)
+            copies = {"persistent-dd": max(1, compile_slots), "root": 1 if pinned else max(1, roots),
+                      GATEWAY_TOKEN_KIND: len(GATEWAY_TOKENS)}.get(token, 1)
             order = list(range(copies))
             if token == "root" and copies > 1 and klass != "compile-gui":
                 # this runner's own root first (instance i -> root i+1), then any free one: its kept build and
@@ -4292,7 +4332,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                         order, warm_for = warm_root_order(order, warm_keys, owned_state_dir)
             for copy in order:
                 # root tokens are named for the root they hold: root-1 is /private/tmp/cmux-ci
-                name = f"root-{copy + 1}" if token == "root" else token if copy == 0 else f"{token}-{copy}"
+                name = (f"root-{copy + 1}" if token == "root" else GATEWAY_TOKENS[copy] if token == GATEWAY_TOKEN_KIND
+                        else token if copy == 0 else f"{token}-{copy}")
                 fd = lock_file(capacity_dir / f"{name}.token", fcntl.LOCK_EX)
                 if fd is not None:
                     fds.append(fd)
@@ -4714,7 +4755,8 @@ class RunnerScope(NamedTuple):
     --min-free-gib disk floor (0: none), its gui token, whether it is the mini's fast runner (--fast-runner,
     the fast pool label; never a root or gui runner), and whether it is one of the mini's session runners
     (--session-runner, only the session pool label; never a root, gui or fast runner), and whether it is the
-    freshness slot (--dev-compile-runner: the DEV compile runner, which holds FRESH_RESERVE while idle)."""
+    freshness slot (--dev-compile-runner: the DEV compile runner, which holds FRESH_RESERVE while idle), and whether
+    it is one of the mini's gateway runners (--gateway-runner: thin cmux-ci clients only, GATEWAY)."""
     units: int = 0
     compile_slots: int = 1
     roots: int = 1
@@ -4727,6 +4769,7 @@ class RunnerScope(NamedTuple):
     fresh: bool = False
     dedicated: bool = False
     nightly: bool = False
+    gateway: bool = False
 
 
 def reserve_token(scope: RunnerScope | None) -> str | None:
@@ -4765,7 +4808,7 @@ def side_fit_units(scope: RunnerScope) -> int:
     """The units a plain side runner (no root, gui, session, fast, freshness, nightly or dedicated role) listens
     with room for: the costliest of SIDE_FIT_JOBS. Every other role keeps its own fit (mini_full)."""
     if scope.units <= 0 or scope.root or scope.gui or scope.session or scope.fast or scope.fresh \
-            or scope.nightly or scope.dedicated:
+            or scope.nightly or scope.dedicated or scope.gateway:
         return 1
     return max(job_units(job_class(job, DEFAULT_HOME_REPO, workflow=workflow)[0], job, DEFAULT_HOME_REPO, workflow=workflow)
                for workflow, job in SIDE_FIT_JOBS)
@@ -4825,8 +4868,9 @@ def claims_room(scope: RunnerScope) -> bool:
     """Whether this runner's gate claims its room while listening and counts the others' claims (LISTEN_CLAIM): root,
     side and session runners (one session runner per mini may also listen without room: SESSION_FIRST). The gui
     runner and the freshness slot keep their reserves instead; the fast runner takes no shared unit; the nightly slot
-    listens on a full mini; a dedicated runner has its own admission."""
-    return scope.units > 0 and not (scope.gui or scope.fresh or scope.fast or scope.nightly or scope.dedicated)
+    listens on a full mini; a dedicated runner has its own admission; a gateway runner takes no shared unit."""
+    return scope.units > 0 and not (scope.gui or scope.fresh or scope.fast or scope.nightly or scope.dedicated
+                                    or scope.gateway)
 
 
 def listen_need(scope: RunnerScope, fit_units: int) -> int:
@@ -4911,10 +4955,13 @@ def runner_scope(runner_dir: Path) -> RunnerScope:
     dedicated = re.search(r"\s--dedicated-admit\s", text) is not None
     nightly = (re.search(r"\s--nightly-runner(?:\s|$)", text) is not None
                and not fast and not session and not gui and not fresh and not dedicated)
+    gateway = (re.search(r"\s--gateway-runner(?:\s|$)", text) is not None
+               and not fast and not session and not gui and not fresh and not dedicated and not nightly)
     return RunnerScope(flag("capacity-units", 0), max(1, flag("compile-slots", 1)), roots,
-                       instance < roots and not gui and not fast and not session and not dedicated and not nightly,
+                       instance < roots and not gui and not fast and not session and not dedicated and not nightly
+                       and not gateway,
                        gui, runner_floor_gib(min_free_gib(text), gui or session), gui_token,
-                       fast, session, fresh, dedicated, nightly)
+                       fast, session, fresh, dedicated, nightly, gateway)
 
 
 def eligibility_scope(runner_dir: Path) -> tuple[str, str | None] | None:
@@ -5037,6 +5084,11 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
     fast token is taken or a job here waits for one: its job takes the fast tokens and none of the shared units,
     so a mini whose units the side lane fills still takes it. Every other scope ignores the fast tokens.
 
+    With the scope of a gateway runner (scope.gateway: cmux's thin cmux-ci clients, GATEWAY), full means only that
+    every gateway token is taken, or a job here waits for a gateway token (a signing job) or is a nightly job waiting
+    first in line (FEED_FIRST): its job takes a gateway token and none of the shared units, so a mini whose units are
+    all taken still takes it. Every other scope ignores the gateway tokens.
+
     The gui runner's reserve (GUI_RESERVE): while an idle gui runner's gate holds it, every other scope counts
     GUI_RESERVE_UNITS fewer units free (but never so many that its next job could not fit the mini at all), so a
     root, side or session runner that would take the gui runner's unit stops listening first. The gui runner counts
@@ -5070,6 +5122,16 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
             for name in FAST_TOKENS:
                 if not probe(capacity_dir / f"{name}.token"):
                     return f"the {name} token is taken"
+            return None
+        if scope is not None and scope.gateway:
+            for waiter in admission_waiters(capacity_dir):
+                shared = set(GATEWAY_TOKENS) & set(waiter["wants"])
+                if waiter["tier"] == TIER_NIGHTLY:  # no new job starts while a nightly job waits (FEED_FIRST)
+                    shared.add("units")
+                if shared:
+                    return f"{waiter['who'] or 'a job'} waits here for {', '.join(sorted(shared))}"
+            if not any(probe(capacity_dir / f"{name}.token") for name in GATEWAY_TOKENS):
+                return f"all {len(GATEWAY_TOKENS)} gateway tokens on this mini are taken"
             return None
         root = scope is not None and scope.root
         # fit_units: a side runner whose label brings costlier jobs (listen --fit-units: glaeda-ios-sim's isolated
@@ -5855,10 +5917,13 @@ class Gate:
         action exports) has only these runners, one or two per std mini, and its jobs are admitted by units like
         a gui runner's: on 2026-10-29 every std mini's side and root lanes held the CPU above the mark, every
         session runner's gate held its listener off, GitHub showed no glaeda-session-* runner online, and a daemon
-        test (cmux#26999, run 40887257098) queued on glaeda-session-std-xcode-26.6 for over 2.5 hours."""
+        test (cmux#26999, run 40887257098) queued on glaeda-session-std-xcode-26.6 for over 2.5 hours.
+
+        A gateway runner (--gateway-runner) is exempt as well: its jobs are thin cmux-ci clients (GATEWAY) that add
+        about no CPU, and the build they submit runs wherever the controller has room."""
         now = time.monotonic()
         scope = runner_scope(self.runner_dir)
-        if scope.gui or scope.session or scope.fresh or scope.nightly:
+        if scope.gui or scope.session or scope.fresh or scope.nightly or scope.gateway:
             self.cpu_busy = None
         elif now - self.cpu_at >= GATE_CPU_EVERY_S:
             _, self.cpu_busy = host_io()
@@ -8492,6 +8557,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--fast-runner", action="store_true",
                    help="this is the mini's fast runner (the fast pool label): a FAST_JOBS job here takes the fast "
                         "tokens instead of shared units, and the listener gate holds it while a fast token is taken")
+    p.add_argument("--gateway-runner", action="store_true",
+                   help="this is one of the mini's gateway runners (the gateway label): it admits only GATEWAY_JOBS, "
+                        "thin cmux-ci clients, on a gateway token and no shared unit, and its gate listens through CPU "
+                        "saturation and a full mini (GATEWAY)")
     p.add_argument("--capacity-dir", type=Path, default=Path(FLEET_DIR) / "capacity", help=argparse.SUPPRESS)
     p.add_argument("--host-lock", default=HOST_LOCK, help=argparse.SUPPRESS)
     p.add_argument("--reservation", default=RESERVATION, help=argparse.SUPPRESS)
@@ -8625,6 +8694,14 @@ def main(argv: list[str] | None = None) -> int:
                                tuple(args.allow_event))
         if not admit:
             return refused(reason)
+        if args.gateway_runner and (is_guest(repo, args.home_repo)
+                                    or (job_workflow(), os.environ.get("GITHUB_JOB", "")) not in GATEWAY_JOBS):
+            # GATEWAY: thin cmux-ci clients only. It listens through CPU saturation and a full mini, so any other job
+            # would run its build here outside the units; refused at once, before any disk or capacity work, it is
+            # rescued elsewhere.
+            return refused(f"the gateway runner takes only thin cmux-ci client jobs ({gateway_jobs_note()}); "
+                           f"{job_workflow() or 'an unknown workflow'} {os.environ.get('GITHUB_JOB') or 'job'} "
+                           "is not one")
         if args.nightly_runner:
             why = nightly_slot_refusal(job_tier(os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REF"),
                                                 os.environ.get("GITHUB_REPOSITORY"), event,
@@ -8707,7 +8784,10 @@ def main(argv: list[str] | None = None) -> int:
                     return refused(why, disk=True)
         # before any capacity is taken: a job that needs the console session fails on a locked one
         admit_class = None
-        if not args.dedicated_admit and (args.gui_runner or args.session_runner or job_class(
+        if args.gateway_runner:  # its thin client takes a gateway token, never a shared unit (GATEWAY)
+            admit_class = GATEWAY_CLASS
+        if not args.dedicated_admit and not args.gateway_runner and (
+                args.gui_runner or args.session_runner or job_class(
                 os.environ.get("GITHUB_JOB", ""), repo, args.home_repo, job_workflow())[0] in CONSOLE_CLASSES):
             why = console_refusal()
             if why and (job_workflow(), os.environ.get("GITHUB_JOB", "")) in CONSOLE_SKIPPERS:
@@ -8746,13 +8826,15 @@ def main(argv: list[str] | None = None) -> int:
                                                   os.environ.get("GITHUB_REF"), os.environ.get("GITHUB_JOB"),
                                                   job_workflow(), os.environ.get("GITHUB_RUN_ATTEMPT"))
             cap = bounded_wait(cap, nightly_bound)
+            if admit_class == GATEWAY_CLASS:
+                cap = bounded_wait(cap, GATEWAY_CAPACITY_WAIT_S)
             claim_class = admit_class or job_class(os.environ.get("GITHUB_JOB", ""), repo, args.home_repo,
                                                    job_workflow())[0]
             if claim_class == EXCLUSIVE_CLASS:
                 drain_bound = exclusive_capacity_wait(tier, args.nightly_runner)
                 cap = bounded_wait(cap, drain_bound)
-                print(f"{PREFIX}: a signing job: it takes the whole mini (every unit and fast token), so no other job "
-                      f"runs here beside it; it waits {drain_bound:g} s at most for the mini to drain, "
+                print(f"{PREFIX}: a signing job: it takes the whole mini (every unit, fast and gateway token), so no "
+                      f"other job runs here beside it; it waits {drain_bound:g} s at most for the mini to drain, "
                       + ("holding every other admission here meanwhile, then is refused so the run's Blacksmith job "
                          "signs" if drain_bound == SIGNING_DRAIN_WAIT_S else
                          "then is refused so its re-run takes Blacksmith"), flush=True)
@@ -8801,7 +8883,8 @@ def main(argv: list[str] | None = None) -> int:
                     if left <= 0:
                         break
                     wants = list(taken.get("wants") or [])
-                    write_want(marker, since, wants, tier, SESSION_LANE if args.session_runner else "")
+                    if admit_class != GATEWAY_CLASS:  # a gateway client's wait holds no other runner (GATEWAY)
+                        write_want(marker, since, wants, tier, SESSION_LANE if args.session_runner else "")
                     if note != shown or time.monotonic() - shown_at >= ADMIT_NOTE_S:
                         holders = ""
                         with contextlib.suppress(Exception):  # naming holders must never fail the wait

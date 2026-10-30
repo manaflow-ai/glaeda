@@ -1024,6 +1024,23 @@ in at the producer's root. So one root job per root per mini:
   units), and any other job on the fast runner keeps its own cost and never takes a fast token.
   `canonicalRoots + guiRunners + fastRunners` is at most `runners`. Turning it on or off changes instance
   labels, so it needs `glaeda-cmux-runner-fleet --apply` (refused while jobs run), by an operator with org admin.
+- `gatewayRunners` (0 to 2, default 0) adds that many gateway runners after the pool instances (instances
+  `runners` and `runners + 1`; `runners` itself and every pool instance's labels and hook stay as they are). Only
+  on a dedicated member without `trustedRef` or `poolPrefix`. A gateway runner carries the gateway label
+  `glaeda-gateway-xcode-<version>` (no class: one label spans every class's gateway runners) and none of the pool,
+  root, side, gui, session, fast or `glaeda-ios-sim` labels; its job-started hook passes `--gateway-runner` and no
+  `--test-keychain`. It runs only cmux's thin `cmux-ci` client jobs, which submit to the cmux-ci controller and
+  wait with about no CPU on the mini (the hook's `GATEWAY_JOBS`, by workflow file and job id: `cmux-next.yml`'s
+  `app-compile-fleet`, `swift-canary-fleet`, `release-compile-fast`, `fast-tier-fleet`, `swift-test-fleet` and
+  `daemon-test-fleet`, `fleet-compile-check.yml`'s `compile-check`, `fleet-test-compile.yml`'s `compile` and
+  `cmux-next-tip-test-compile.yml`'s `compile`); job-started refuses any other job at once. Its gate is never held
+  for CPU saturation or the shared units, only for memory pressure, the disk floor, heat, the fleet's host claim,
+  a nightly job waiting on the mini, a signing job waiting for the gateway tokens, or both gateway tokens taken.
+  Its job is admitted as class `gateway`: one of the mini's two tokens `gateway-0`/`gateway-1` and no shared unit;
+  while it waits for one (600 s at most) it writes no `admit.want` marker, so it holds no other runner. A signing
+  job (`exclusive`) takes both gateway tokens as well. Route a gateway label's jobs with
+  `CI_COMPILE_CHECK_GATEWAY` (and `CI_TEST_COMPILE_GATEWAY`) once its runners are online; roll back by setting the
+  label they had before. Adding gateway runners adds instances, so it needs `glaeda-cmux-runner-fleet --apply`.
 - A desktop VM runner is a future, disabled design. It may use the GUI label and a distinct `gui-vm`
   accounting token, but the guest must not receive read-write access to the host capacity ledger. A
   host-side broker, immutable VM ownership receipt, and atomic runner drain are required before any

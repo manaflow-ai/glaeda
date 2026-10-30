@@ -330,7 +330,10 @@ def declared_runners(manifest: dict[str, Any], name: str) -> int | None:
     except Exception:  # noqa: BLE001  (a malformed manifest leaves the count unknown, never the document)
         return None
     runners = (summary or {}).get("runners")
-    return runners if isinstance(runners, int) and not isinstance(runners, bool) and runners > 0 else None
+    if not (isinstance(runners, int) and not isinstance(runners, bool) and runners > 0):
+        return None
+    gateway = (summary or {}).get("gatewayRunners")  # the gateway runners come after the pool instances
+    return runners + (gateway if isinstance(gateway, int) and not isinstance(gateway, bool) and gateway > 0 else 0)
 
 
 def runner_names(member: str, count: int) -> list[str]:

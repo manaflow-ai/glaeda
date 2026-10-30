@@ -52,6 +52,18 @@ VERSION_RE = r"[0-9][0-9.]*"
 # Defaults for a class the manifest does not size: std is an M4 Pro mini (14 cores), light an M4 mini (10); xl kept
 # its old 8 units at the old 2.8 cores a unit.
 CLASS_CAPACITY = {"xl": (8, 22), "std": (4, 14), "light": (2, 10)}
+# gatewayRunners (0 to MAX_GATEWAY_RUNNERS, default 0) adds that many gateway runners after the member's `runners`
+# instances (instances runners to runners + gatewayRunners - 1; never counted in runners, so no role moves). A gateway
+# runner carries only the gateway label (gateway_label: glaeda-gateway-xcode-<version>, no class, no pool label) and
+# takes only cmux's thin cmux-ci client jobs (glaeda-cmux-runner-hook GATEWAY_JOBS): they submit to the cmux-ci
+# controller and wait, with about no local CPU. Its gate listens through CPU saturation and a full mini (units) and
+# holds for memory pressure, the disk floor and the fleet's host claim; its job takes one of the GATEWAY_TOKENS and no
+# shared unit (the hook's gateway class). On 2026-10-30 at 12:43Z every std mini sat at 76 to 100% CPU and the side
+# label cmux used for these clients had 1 idle of 51 listeners, so no client could start and the build-fleet compiles
+# they submit did not run. At most MAX_GATEWAY_RUNNERS per mini (the hook's two tokens); never on a trusted member,
+# which takes no pull request job, and only on a dedicated one (an opportunistic member carries no pool label).
+MAX_GATEWAY_RUNNERS = 2
+GATEWAY_PREFIX = "gateway"
 COMPILE_CORES = 5  # the hook's CLASS_COST["compile"] units (a test keeps them equal)
 MAX_RUNNERS = 16
 # A host's overrides.runner {trustedRef: refs/heads/main, trustedRepo: owner/name} makes its runners trusted-only:
@@ -61,7 +73,8 @@ MAX_RUNNERS = 16
 TRUSTED_REF_RE = r"refs/heads/[A-Za-z0-9._/-]+"
 REPO_RE = r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
 POOL_PREFIX_RE = r"[a-z0-9]+-"
-RESERVED_POOL_PREFIXES = {"root-", "side-", "gui-", "fast-", "trusted-", "std-", "light-", "xl-", "dev-", "nightly-"}
+RESERVED_POOL_PREFIXES = {"root-", "side-", "gui-", "fast-", "trusted-", "std-", "light-", "xl-", "dev-", "nightly-",
+                          "gateway-"}
 DEV_COMPILE_POOL_PREFIX = "dev-"
 # A host's runner.nightlySlot: true gives its next side instance after canonicalRoots (after the freshness slot when
 # devCompile is set too) the nightly pool label glaeda-nightly-<class>-xcode-<version> instead of its side label. Only
@@ -168,6 +181,12 @@ def fast_label(pool: str) -> str:
     runs on it, admitted against the mini's fast tokens rather than its shared units (glaeda-cmux-runner-hook's
     fast class), so it never waits behind side-lane jobs for a unit."""
     return _role_label(pool, "fast")
+
+
+def gateway_label(version: str) -> str:
+    """The gateway runners' label for an Xcode version: glaeda-gateway-xcode-<version>. No class: a thin client runs
+    the same on any mini, so one label spans every class's gateway runners."""
+    return f"glaeda-{GATEWAY_PREFIX}-xcode-{version}"
 
 
 def _role_label(pool: str, role: str) -> str:
@@ -294,8 +313,9 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
         roots = declared.get("canonicalRoots", 1)
         gui = declared.get("guiRunners", 0)
         fast = declared.get("fastRunners", 0)
+        gateway = declared.get("gatewayRunners", 0)
     else:
-        compile_slots, roots, gui, fast = 1, 1, 0, 0
+        compile_slots, roots, gui, fast, gateway = 1, 1, 0, 0, 0
     if not (isinstance(runners, int) and not isinstance(runners, bool) and 1 <= runners <= MAX_RUNNERS):
         return None, f"runner.classes.{klass}.runners must be 1 to {MAX_RUNNERS}"
     # every mini holds at least one compile slot, so it needs a compile's cores; glaeda-route checks the same
@@ -315,6 +335,11 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
     if not (isinstance(fast, int) and not isinstance(fast, bool) and 0 <= fast <= 1 and roots + gui + fast <= runners):
         return None, (f"runner.classes.{klass}.fastRunners must be 0 or 1, and canonicalRoots plus guiRunners plus "
                       f"fastRunners at most runners ({runners}): the fast runner is the last instance")
+    if not (isinstance(gateway, int) and not isinstance(gateway, bool) and 0 <= gateway <= MAX_GATEWAY_RUNNERS):
+        return None, f"runner.classes.{klass}.gatewayRunners must be 0 to {MAX_GATEWAY_RUNNERS}"
+    if gateway and (trusted_ref is not None or availability != "dedicated" or normal_pool_prefix):
+        return None, (f"{member} runner.classes.{klass}.gatewayRunners needs a dedicated runner without trustedRef "
+                      "(a gateway runner takes pull request jobs) in the default pool namespace (no poolPrefix)")
     if compile_slots > roots:
         return None, (f"runner.classes.{klass}.compileSlots {compile_slots} needs canonicalRoots {compile_slots} "
                       "(every compile holds a root)")
@@ -337,7 +362,10 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
                                             for v in (versions if pools else []) for k in side_classes(klass))),
             "guiRunners": gui, "guiPools": [gui_label(label) for label in dict.fromkeys(pools)] if gui else [],
             "sessionPools": [session_label(label) for label in dict.fromkeys(pools)] if gui else [],
-            "fastRunners": fast, "fastPools": [fast_label(label) for label in dict.fromkeys(pools)] if fast else []}, None
+            "fastRunners": fast, "fastPools": [fast_label(label) for label in dict.fromkeys(pools)] if fast else [],
+            "gatewayRunners": gateway,
+            "gatewayPools": list(dict.fromkeys(gateway_label(v) for v in (versions if pools else []))) if gateway
+            else []}, None
 
 
 def declared_pools(manifest: Any, xcode_ok: Callable[[str, dict[str, Any]], bool] | None = None) -> dict[str, list[str]]:

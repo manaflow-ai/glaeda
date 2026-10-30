@@ -331,6 +331,7 @@ class Context:
         self.gui_token = args.gui_token
         self.fast_runner = False  # the member's fast runner (fastRunners 1: the last instance, the fast pool label)
         self.session_runner = False  # a gui-role instance other than the console one (guiRunners above 1)
+        self.gateway_runner = False  # a gateway runner (gatewayRunners: the instances after runners, the gateway label)
         # Instance 0 keeps the original paths; instance K adds -K (dirs, logs, name) or .K (launchd label).
         self.suffix = f"-{self.instance}" if self.instance else ""
         self.label = f"{LABEL}.{self.instance}" if self.instance else LABEL
@@ -747,6 +748,9 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
                 scope += " --trusted-next-nightly"
         elif dev_compile_instance(ctx.member, ctx.instance):
             scope += " --dev-compile-runner"
+        elif getattr(ctx, "gateway_runner", False) is True:
+            # thin cmux-ci clients only (the hook's GATEWAY_JOBS): no test keychain, no gui token to recycle for
+            scope += " --gateway-runner"
         else:  # PR runners: an unlocked test keychain (the login keychain is locked in the runner session)
             if nightly_slot_instance(ctx.member, ctx.instance):  # the nightly slot: nightly jobs only, same setup
                 scope += " --nightly-runner"
@@ -2513,23 +2517,27 @@ def main(argv: list[str] | None = None) -> int:
         ctx.member = member
         if not args.min_free_gib:
             ctx.min_free_gib = float(member.get("minFreeGib") or 0)
-        if ctx.instance >= int(member.get("runners") or 1):
+        if ctx.instance >= int(member.get("runners") or 1) + int(member.get("gatewayRunners") or 0):
             print(f"glaeda-cmux-runner: {args.member} is class {member['class']} with {member.get('runners')} "
-                  f"runner(s); instance {ctx.instance} is beyond that", file=sys.stderr)
+                  f"runner(s) and {int(member.get('gatewayRunners') or 0)} gateway runner(s); instance {ctx.instance} "
+                  "is beyond that", file=sys.stderr)
             return 2
         if not args.capacity_units:
             ctx.capacity_units = int(member.get("capacityUnits") or 0)
         ctx.fast_runner, ctx.gui_runner, ctx.session_runner = member_roles(member, ctx.instance)
+        ctx.gateway_runner = gateway_instance(member, ctx.instance)
+        gateway = ctx.gateway_runner
         dev = dev_compile_instance(member, ctx.instance)
         nightly = nightly_slot_instance(member, ctx.instance)
         is_root = (ctx.instance < int(member.get("canonicalRoots") or 1) and not ctx.gui_runner and not ctx.fast_runner
-                   and not ctx.session_runner)
+                   and not ctx.session_runner and not gateway)
         # The console gui runner carries the session label only on a mini without session runners (guiRunners 1). With
         # them it takes console jobs alone: it listens with one free core (an app-host shard's cost), and a 6-core
         # session job (generated files, action exports) taken there with less room would wait and, through its
         # admit.want marker, hold every runner on the mini. The session runners listen with room for one.
         console_session = int(member.get("guiRunners") or 0) <= 1
-        roots = (member.get("devPools", []) if dev
+        roots = (member.get("gatewayPools", []) if gateway
+                 else member.get("devPools", []) if dev
                  else member.get("nightlyPools", []) if nightly
                  else member.get("fastPools", []) if ctx.fast_runner
                  else [*member.get("guiPools", []), *(member.get("sessionPools", []) if console_session else [])]
@@ -2539,7 +2547,8 @@ def main(argv: list[str] | None = None) -> int:
         # Dedicated roles leave out ordinary pool and iOS labels, so those jobs cannot take a DEV, GUI or fast
         # instance. The pool's live count includes only the root and side instances it can route to.
         own = ([label for label in member["labels"] if label not in member.get("pools", []) and label != IOS_SIM_JOB_LABEL]
-               if dev or nightly or ctx.gui_runner or ctx.session_runner or ctx.fast_runner else member["labels"])
+               if dev or nightly or gateway or ctx.gui_runner or ctx.session_runner or ctx.fast_runner
+               else member["labels"])
         ctx.labels = list(dict.fromkeys([*BASE_LABELS, *own, *roots]))
         ctx.labels_requested = True
         if not args.name:
@@ -2744,12 +2753,23 @@ def nightly_slot_instance(member: dict[str, Any], instance: int) -> bool:
     return instance == at
 
 
+def gateway_instance(member: dict[str, Any], instance: int) -> bool:
+    """A gateway runner (gatewayRunners): one of the instances after the member's `runners` pool instances. It carries
+    only the gateway label and admits only thin cmux-ci client jobs (glaeda-cmux-runner-hook --gateway-runner).
+    The hook's two gateway tokens cap them at MAX_GATEWAY_RUNNERS whatever a receipt says."""
+    runners_n = int(member.get("runners") or 1)
+    gateway_n = min(int(member.get("gatewayRunners") or 0), int(getattr(fleet_labels(), "MAX_GATEWAY_RUNNERS", 0)))
+    return runners_n <= instance < runners_n + gateway_n
+
+
 def member_roles(member: dict[str, Any], instance: int) -> tuple[bool, bool, bool]:
     """(fast runner, gui runner, session runner) for this instance of a member. The last instance is the fast
     runner when fastRunners is 1, and the guiRunners instances before it are gui-role runners: the last of them is
     the console gui runner (the gui and session pool labels), and any others are session runners (only the session
-    pool label). None carries a root or side label."""
+    pool label). None carries a root or side label. A gateway instance (past `runners`) has none of these roles."""
     runners_n = int(member.get("runners") or 1)
+    if instance >= runners_n:
+        return False, False, False
     fast_n, gui_n = int(member.get("fastRunners") or 0), int(member.get("guiRunners") or 0)
     fast = fast_n > 0 and instance >= runners_n - fast_n
     gui_role = gui_n > 0 and not fast and instance >= runners_n - fast_n - gui_n
@@ -2799,6 +2819,7 @@ def install_or_uninstall(ctx: Context, args: argparse.Namespace, raw_argv: list[
             # and its role: the fast runner's and the gui runner's hooks stay theirs
             fast, gui, session = member_roles(kept, ctx.instance)
             ctx.fast_runner, ctx.session_runner = fast, session
+            ctx.gateway_runner = gateway_instance(kept, ctx.instance)
             ctx.gui_runner = not fast and not session and (ctx.gui_runner or gui)
         # a re-run that names nothing keeps what this install registered, not the hostname default
         if not ctx.labels_requested and isinstance(registered.get("labels"), list) and registered["labels"]:

@@ -2078,7 +2078,7 @@ class HookTest(unittest.TestCase):
         try:
             admitted = self.job("sign-nightly-identity-legacy", "s0", 14, None, "--gui-wait", "0", env=legacy)
             self.assertEqual(admitted.returncode, 0, admitted.stdout + admitted.stderr)
-            self.assertIn("holding 14/14 units+fast-0+fast-1+gui for sign-nightly-identity-legacy (exclusive",
+            self.assertIn("holding 14/14 units+fast-0+fast-1+gui+gateway-0+gateway-1 for sign-nightly-identity-legacy (exclusive",
                           admitted.stdout)
             self.assertIn("GLAEDA_JOB_CLAIM=exclusive for the job", admitted.stdout)
             self.assertIn("GLAEDA_JOB_CLAIM=exclusive\n", github_env.read_text())
@@ -2246,7 +2246,7 @@ class HookTest(unittest.TestCase):
             self.assertEqual(signer.returncode, 0, out)
             self.assertIn(f"it waits {hook.SIGNING_DRAIN_WAIT_S:g} s at most for the mini to drain, holding every "
                           "other admission here meanwhile", out)
-            self.assertIn("holding 14/14 units+fast-0+fast-1+gui for sign-nightly-identity-legacy (exclusive", out)
+            self.assertIn("holding 14/14 units+fast-0+fast-1+gui+gateway-0+gateway-1 for sign-nightly-identity-legacy (exclusive", out)
             self.assertIn("GLAEDA_JOB_CLAIM=exclusive\n", (self.dir / "github-env-n0").read_text())
             self.assertFalse(marker.exists(), "admitted: its waiter marker is gone")
             self.assertEqual(hook.admission_waiters(self.dir / "capacity"), [])
@@ -2522,6 +2522,124 @@ class HookTest(unittest.TestCase):
                     self.assertTrue(hook.probe(capacity / "fast-0.token") and hook.probe(capacity / "fast-1.token"))
                 finally:
                     self.finish(runner)
+
+    # ------------------------------------------------------------ the gateway runners (GATEWAY)
+
+    def test_a_gateway_job_runs_on_a_gateway_token_with_every_unit_taken(self) -> None:
+        """2026-10-30 12:43Z: every std mini at 76-100% CPU and units, so no thin cmux-ci client could start. On a
+        gateway runner such a client takes one gateway token and no shared unit, so a full mini still admits it;
+        each mini has two tokens, one per gateway runner, and a third client is refused for want of one."""
+        self.fleet()
+        self.take_units(14)
+        capacity = self.dir / "capacity"
+        try:
+            first = self.job("app-compile-fleet", "g0", 14, None, "--gateway-runner", env=self.FAST_TIER)
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            self.assertIn("holding 0/14 units+gateway-0 for app-compile-fleet (gateway", first.stdout)
+            second = self.job("swift-test-fleet", "g1", 14, None, "--gateway-runner", env=self.FAST_TIER)
+            self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+            self.assertIn("holding 0/14 units+gateway-1 for swift-test-fleet (gateway", second.stdout)
+            third = self.job("daemon-test-fleet", "g2", 14, None, "--gateway-runner", env=self.FAST_TIER)
+            self.assertEqual(third.returncode, 1, third.stdout)
+            self.assertIn("refused: capacity: all 2 gateway tokens are taken", third.stdout)
+        finally:
+            for runner in ("g0", "g1", "g2"):
+                self.finish(runner)
+        self.assertTrue(all(hook.probe(capacity / f"{name}.token") for name in hook.GATEWAY_TOKENS))
+        # off the gateway runner the same jobs keep their own classes (non-gateway runners are unchanged)
+        try:
+            side = self.job("app-compile-fleet", "s0", 20, None, env=self.FAST_TIER)
+            self.assertEqual(side.returncode, 0, side.stdout + side.stderr)
+            self.assertIn("2/20 units for app-compile-fleet (light", side.stdout)
+        finally:
+            self.finish("s0")
+
+    def test_a_waiting_gateway_job_writes_no_admit_want_marker(self) -> None:
+        """A job waiting here for capacity leaves an admit.want marker, which holds the mini's other runners. A
+        gateway client waiting for a gateway token must hold nothing: it writes no marker, and takes the token
+        when one frees, within GATEWAY_CAPACITY_WAIT_S."""
+        self.fleet()
+        capacity = self.dir / "capacity"
+        waiter = None
+        try:
+            for runner in ("g0", "g1"):
+                held = self.job("release-compile-fast", runner, 14, None, "--gateway-runner", env=self.FAST_TIER)
+                self.assertEqual(held.returncode, 0, held.stdout + held.stderr)
+            push = event(self.dir, "gw-wait", {"repository": CMUX})
+            environ = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0",
+                       "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"),
+                       "GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": os.fspath(push),
+                       "GITHUB_REPOSITORY": "manaflow-ai/cmux", "GITHUB_JOB": "swift-canary-fleet",
+                       "RUNNER_NAME": "g2", **self.FAST_TIER}
+            waiter = subprocess.Popen([sys.executable, os.fspath(HOOK), "job-started", "--allowed-repo",
+                                       "manaflow-ai/cmux", "--no-disk", "--gateway-runner", "--state-dir",
+                                       os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()),
+                                       "--capacity-units", "14", "--capacity-dir", os.fspath(capacity),
+                                       "--instance", "13", "--gui-wait", "30"], env=environ,
+                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:  # several admission polls (ADMIT_POLL_S)
+                self.assertEqual(list(capacity.glob(f"{hook.ADMIT_WANT}*")), [], "a gateway waiter holds nothing")
+                self.assertIsNone(waiter.poll())
+                time.sleep(0.2)
+            self.assertIsNone(hook.mini_full(capacity, 14, hook.RunnerScope(14, 2, 2)), "a side runner still listens")
+            self.finish("g0")
+            out, _ = waiter.communicate(timeout=20)
+            self.assertEqual(waiter.returncode, 0, out)
+            self.assertIn("holding 0/14 units+gateway-0 for swift-canary-fleet (gateway", out)
+        finally:
+            if waiter is not None:
+                if waiter.poll() is None:
+                    waiter.kill()
+                waiter.communicate()
+            for runner in ("g0", "g1", "g2"):
+                self.finish(runner)
+
+    def test_the_gateway_runner_refuses_every_other_job(self) -> None:
+        """The gateway runner listens on a saturated, full mini, so a job that builds here would take the mini's
+        CPU outside its units. Only GATEWAY_JOBS (thin cmux-ci clients, by workflow file and job id of the home
+        repository) are admitted; any other job is refused at once, before taking anything."""
+        self.fleet()
+        capacity = self.dir / "capacity"
+        other = {"GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/other.yml@refs/heads/main"}
+        cases = (("swift-package-tests", {}, "manaflow-ai/cmux"),
+                 ("release-compile", self.FAST_TIER, "manaflow-ai/cmux"),
+                 ("generated-files", self.FAST_TIER, "manaflow-ai/cmux"),
+                 # the bare Mac test jobs build on the mini; only their -fleet client twins run here
+                 ("fast-tier", self.FAST_TIER, "manaflow-ai/cmux"),
+                 ("swift-test", self.FAST_TIER, "manaflow-ai/cmux"),
+                 ("daemon-test", self.FAST_TIER, "manaflow-ai/cmux"),
+                 ("app-compile-fleet", other, "manaflow-ai/cmux"),
+                 ("app-compile-fleet", self.FAST_TIER, "manaflow-ai/cmuxterm-hq"))
+        for index, (job, env, repo) in enumerate(cases):
+            with self.subTest(job=job, env=env, repo=repo):
+                runner = f"n{index}"
+                push = event(self.dir, f"gw-{index}", {"repository": {"full_name": repo, "fork": False}})
+                try:
+                    started = self.run_hook(
+                        "job-started", "push", push, "--allowed-owner", "manaflow-ai", "--no-disk", "--state-dir",
+                        os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()), "--gui-wait", "0",
+                        "--capacity-units", "14", "--capacity-dir", os.fspath(capacity), "--gateway-runner",
+                        repo=repo, env={"GITHUB_JOB": job, "RUNNER_NAME": runner, **env})
+                    self.assertEqual(started.returncode, 1, started.stdout + started.stderr)
+                    self.assertIn("refused: the gateway runner takes only thin cmux-ci client jobs", started.stdout)
+                    self.assertTrue(all(hook.probe(capacity / f"{n}.token") for n in hook.GATEWAY_TOKENS))
+                finally:
+                    self.finish(runner)
+        for workflow, job in (("fleet-test-compile.yml", "compile"), ("fleet-compile-check.yml", "compile-check"),
+                              ("cmux-next-tip-test-compile.yml", "compile"), ("cmux-next.yml", "fast-tier-fleet"),
+                              ("cmux-next.yml", "daemon-test-fleet")):
+            with self.subTest(workflow=workflow, job=job):
+                try:
+                    ok = self.job(job, "ok", 14, None, "--gateway-runner",
+                                  env={"GITHUB_WORKFLOW_REF": f"manaflow-ai/cmux/.github/workflows/{workflow}@refs/heads/x"})
+                    self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+                    self.assertIn(f"for {job} (gateway", ok.stdout)
+                finally:
+                    self.finish("ok")
+        # a signing job (exclusive) takes both gateway tokens too: no PR client runs beside the key
+        self.assertTrue(set(hook.GATEWAY_TOKENS) <= set(hook.CLASS_COST[hook.EXCLUSIVE_CLASS][1]))
+        self.assertEqual(hook.CLASS_COST[hook.GATEWAY_CLASS], (0, (hook.GATEWAY_TOKEN_KIND,)))
 
     def test_job_log_records_started_refused_and_completed(self) -> None:
         self.fleet()
@@ -8956,6 +9074,105 @@ class GateTest(unittest.TestCase):
         for fd in held:
             os.close(fd)
 
+    def gateway_gate(self, capacity: Path) -> hook.Gate:
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("#!/bin/bash\nexec /usr/bin/python3 /hook job-started --allowed-owner manaflow-ai"
+                          " --min-free-gib 30 --capacity-units 10 --compile-slots 2 --canonical-roots 2 --instance 12"
+                          " --gateway-runner\n")
+        return self.full_gate(capacity)
+
+    def test_runner_scope_reads_the_gateway_runner_flag(self) -> None:
+        gate = self.gateway_gate(self.units(0))
+        scope = hook.runner_scope(gate.runner_dir)
+        self.assertTrue(scope.gateway)
+        self.assertFalse(scope.root or scope.gui or scope.session or scope.fast or scope.fresh or scope.nightly
+                         or scope.dedicated)
+        self.assertIsNone(hook.reserve_token(scope), "it keeps no reserve")
+        self.assertFalse(hook.claims_room(scope), "it claims no shared units")
+        self.assertEqual(hook.side_fit_units(scope), 1)
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.write_text("exec python3 /hook job-started --capacity-units 5 --instance 0 --gateway-runner\n")
+        self.assertEqual(hook.runner_scope(self.runner), hook.RunnerScope(5, 1, 1, False, False, gateway=True),
+                         "a gateway runner is never a root runner, whatever its instance")
+        script.write_text("exec python3 /hook job-started --capacity-units 5 --instance 4 --gateway-runner "
+                          "--fast-runner\n")
+        self.assertEqual((hook.runner_scope(self.runner).gateway, hook.runner_scope(self.runner).fast), (False, True))
+
+    def test_a_gateway_runner_listens_through_cpu_saturation_and_a_full_mini(self) -> None:
+        """GATEWAY: on 2026-10-30 at 12:43Z every std mini sat at 76-100% CPU and the side label cmux used for its
+        thin cmux-ci clients had 1 idle of 51 listeners. A gateway runner's gate skips the CPU mark and the units, so
+        it listens on a saturated, full mini; a side runner beside it is still held by both."""
+        for name, value in (("GATE_CPU_PAUSE", 80.0), ("GATE_CPU_RESUME", 70.0), ("GATE_CPU_EVERY_S", 0.0)):
+            patcher = mock.patch.object(hook, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        capacity = self.units(10)
+        with mock.patch.object(hook, "host_io", return_value=(0.0, 99.0)), \
+                mock.patch.object(hook, "memory_pressure_level", return_value=1), \
+                mock.patch.object(hook, "disk_refusal", return_value=None), \
+                mock.patch.object(hook, "eligibility_scope", return_value=None):
+            gateway = self.gateway_gate(capacity)
+            self.assertIsNone(gateway.saturated(), "99% CPU: the gateway runner listens")
+            self.assertIsNone(gateway.full(), "every unit taken: the gateway runner listens")
+            self.assertIsNone(gateway.full(fresh=True))
+            self.assertIsNone(gateway.claimed())
+            self.assertIsNone(gateway.confirmed())
+            side_dir = self.side_runner(4)
+            side = hook.Gate(side_dir, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state,
+                             capacity_dir=capacity)
+            self.assertTrue((side.saturated() or "").startswith(hook.SATURATED), "a side runner keeps the CPU hold")
+            self.assertIn("capacity units on this mini are taken",
+                          hook.mini_full(capacity, 10, hook.runner_scope(side_dir)) or "")
+
+    def test_a_gateway_runner_still_holds_for_memory_pressure_disk_and_the_fleet(self) -> None:
+        patcher = mock.patch.object(hook, "GATE_CPU_EVERY_S", 0.0)  # read memory pressure on every look
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        capacity = self.units(10)
+        with mock.patch.object(hook, "host_io", return_value=(0.0, 99.0)), \
+                mock.patch.object(hook, "eligibility_scope", return_value=None):
+            gateway = self.gateway_gate(capacity)
+            with mock.patch.object(hook, "memory_pressure_level", return_value=2):
+                why = gateway.saturated()
+                self.assertTrue(why and why.startswith(hook.SATURATED) and "memory pressure level 2" in why, why)
+                self.assertNotIn("CPU busy", why)
+            with mock.patch.object(hook, "memory_pressure_level", return_value=1), \
+                    mock.patch.object(hook, "disk_refusal", return_value="only 12.0 GiB free, under 30 GiB"):
+                self.assertTrue((gateway.low_disk() or "").startswith("disk:"), "the disk floor holds it")
+                why = gateway.claimed()
+                self.assertTrue((why or "").startswith("disk:"), why)
+            with mock.patch.object(hook, "memory_pressure_level", return_value=1), \
+                    mock.patch.object(hook, "disk_refusal", return_value=None), \
+                    mock.patch.object(hook, "host_held", return_value="a fleet build holds the host"):
+                self.assertEqual(gateway.claimed(), "a fleet build holds the host", "the fleet's claim holds it")
+
+    def test_the_gateway_runner_listens_while_a_gateway_token_is_free(self) -> None:
+        gateway = hook.RunnerScope(5, 2, 2, gateway=True)
+        self.assertIsNone(hook.mini_full(self.units(5), 5, gateway), "the gateway runner takes no shared unit")
+        capacity = self.units(0)
+        first = hook.lock_file(capacity / "gateway-0.token", fcntl.LOCK_EX)
+        self.assertIsNone(hook.mini_full(capacity, 5, gateway), "one token is enough")
+        second = hook.lock_file(capacity / "gateway-1.token", fcntl.LOCK_EX)
+        self.assertEqual(hook.mini_full(capacity, 5, gateway), "all 2 gateway tokens on this mini are taken")
+        # no other runner counts the gateway tokens
+        for scope in (hook.RunnerScope(5, 2, 2, True), hook.RunnerScope(5, 2, 2), hook.RunnerScope(5, 2, 2, False, True),
+                      hook.RunnerScope(5, 2, 2, fast=True), hook.RunnerScope(5, 2, 2, session=True)):
+            self.assertIsNone(hook.mini_full(capacity, 5, scope), scope)
+        os.close(first)
+        os.close(second)
+        marker = capacity / f"{hook.ADMIT_WANT}{os.getpid()}"
+        marker.write_text(json.dumps({"since": time.time(), "wants": ["units"], "who": "r9 swift-test (run 1)"}) + "\n")
+        self.assertIsNone(hook.mini_full(capacity, 5, gateway), "a PR job waiting for units is not its business")
+        marker.write_text(json.dumps({"since": time.time(), "wants": ["fast-0", "gui", "gateway-0", "gateway-1"],
+                                      "who": "s1 build-sign-notarize (run 3)"}) + "\n")
+        self.assertEqual(hook.mini_full(capacity, 5, gateway),
+                         "s1 build-sign-notarize (run 3) waits here for gateway-0, gateway-1", "a signing job drains it")
+        marker.write_text(json.dumps({"since": time.time(), "wants": ["units"], "who": "n2 build-nightly-app (run 9)",
+                                      "tier": hook.TIER_NIGHTLY}) + "\n")
+        self.assertEqual(hook.mini_full(capacity, 5, gateway), "n2 build-nightly-app (run 9) waits here for units",
+                         "no new job starts on a mini where a nightly job waits")
+
     def test_the_full_probe_never_competes_with_an_admission(self) -> None:
         capacity = self.units(1)
         admission = os.open(capacity / "admission.lock", os.O_RDONLY)
@@ -10698,13 +10915,13 @@ class RunnerTest(unittest.TestCase):
         labels: list[list[str]] = []
         with mock.patch.dict(os.environ, {"HOME": os.fspath(home)}), \
                 mock.patch.object(cr, "xcode_present", return_value=True):
-            for instance in range(classes["runners"]):
+            for instance in range(classes["runners"] + classes.get("gatewayRunners", 0)):
                 receipt = self.invoke("--apply", "--manifest", os.fspath(path), "--member", "mini-std",
                                       "--instance", str(instance), "--replace")
                 [register] = [a for a in receipt["actions"] if a.get("kind") == "register"]
                 labels.append(register["labels"])
         hooks = [(home / f"actions-runner-glaeda{'-' + str(k) if k else ''}/glaeda-hooks/job-started.sh").read_text()
-                 .replace(os.fspath(home), "HOME") for k in range(classes["runners"])]
+                 .replace(os.fspath(home), "HOME") for k in range(classes["runners"] + classes.get("gatewayRunners", 0))]
         self.fast_home = home
         return labels, hooks
 
@@ -10807,6 +11024,51 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual([roles(l) for l in both[3:]], [["glaeda-gui-std-xcode-26.6"], ["glaeda-fast-std-xcode-26.6"]])
         self.assertIn("--gui-runner", both_hooks[3])
         self.assertNotIn("--gui-runner", both_hooks[4])
+
+    def test_gateway_runners_come_after_every_pool_instance(self) -> None:
+        """gatewayRunners adds instances after `runners`: they carry only the gateway label (no pool, side or class
+        role label) and pass --gateway-runner, and no pool instance's labels or hook change."""
+        base = {"runners": 5, "capacityUnits": 10, "compileSlots": 2, "canonicalRoots": 2, "guiRunners": 1,
+                "fastRunners": 1}
+        today, today_hooks = self.fast_labels(base, "gw-today")
+        gw, gw_hooks = self.fast_labels({**base, "gatewayRunners": 2}, "gw")
+        self.assertEqual(len(gw), 7)
+        self.assertEqual((gw[:5], gw_hooks[:5]), (today, today_hooks), "every pool instance keeps its labels and hook")
+        for k in (5, 6):
+            self.assertIn("glaeda-gateway-xcode-26.6", gw[k])
+            self.assertFalse([l for l in gw[k] if l.startswith(("glaeda-std", "glaeda-root", "glaeda-side",
+                                                                 "glaeda-gui", "glaeda-session", "glaeda-fast",
+                                                                 "glaeda-nightly", "glaeda-dev", "glaeda-runner-"))],
+                             gw[k])
+            self.assertIn(" --gateway-runner ", gw_hooks[k])
+            self.assertIn(f" --instance {k}\n", gw_hooks[k])
+            self.assertNotIn("--test-keychain", gw_hooks[k])
+            self.assertNotIn("--fast-runner", gw_hooks[k])
+            self.assertTrue(hook.runner_scope(self.fast_home / f"actions-runner-glaeda-{k}").gateway)
+        self.assertEqual([l.count("glaeda-gateway-xcode-26.6") for l in gw], [0] * 5 + [1, 1])
+        self.assertTrue(hook.runner_scope(self.fast_home / "actions-runner-glaeda-4").fast, "the fast runner stays")
+        self.assertEqual(cr.member_roles({"runners": 5, "fastRunners": 1, "guiRunners": 1}, 5), (False, False, False))
+        self.assertFalse(cr.gateway_instance({"runners": 5, "gatewayRunners": 2}, 4))
+        self.assertTrue(cr.gateway_instance({"runners": 5, "gatewayRunners": 2}, 6))
+        self.assertFalse(cr.gateway_instance({"runners": 5, "gatewayRunners": 9}, 7), "never more than two")
+        # an instance past runners + gatewayRunners is refused
+        manifest = json.loads(json.dumps(MANIFEST))
+        manifest["defaults"]["runner"] = {"classes": {"std": {**base, "gatewayRunners": 2}}}
+        path = self.state / "gw-beyond.json"
+        path.write_text(json.dumps(manifest))
+        with mock.patch.dict(os.environ, {"HOME": os.fspath(self.fast_home)}), \
+                mock.patch.object(cr, "xcode_present", return_value=True), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(cr.main(["--manifest", os.fspath(path), "--member", "mini-std", "--instance", "7"]), 2)
+        self.assertIn("2 gateway runner(s); instance 7 is beyond that", err.getvalue())
+        # a plain re-run keeps the gateway role
+        home = self.fast_home
+        with mock.patch.dict(os.environ, {"HOME": os.fspath(home)}), \
+                mock.patch.object(cr, "xcode_present", return_value=True):
+            self.invoke("--apply", "--instance", "6")
+        rerun = (home / "actions-runner-glaeda-6/glaeda-hooks/job-started.sh").read_text()
+        self.assertIn(" --gateway-runner ", rerun)
+        self.assertIn(" --instance 6\n", rerun)
 
     def test_a_plain_rerun_keeps_the_fast_and_gui_roles(self) -> None:
         """A re-run without --manifest restores the member from the receipt; the fast runner's and the gui
@@ -12506,6 +12768,38 @@ class FleetLabelsModuleTest(unittest.TestCase):
         manifest["hosts"]["mini-std"]["overrides"] = {"runner": {"poolPrefix": "fast-"}}
         std.update(canonicalRoots=2)
         self.assertIn("poolPrefix", fleet_labels.member_labels(manifest, "mini-std", lambda a: True)[1])
+
+    def test_gateway_runners_field(self) -> None:
+        manifest = json.loads(json.dumps(MANIFEST))
+        std = {"runners": 5, "capacityUnits": 5, "canonicalRoots": 2}
+        manifest["defaults"]["runner"] = {"classes": {"std": std}}
+        today = fleet_labels.member_labels(manifest, "mini-std", lambda app: True)[0]
+        self.assertEqual((today["gatewayRunners"], today["gatewayPools"]), (0, []))
+        std["gatewayRunners"] = 2
+        gw = fleet_labels.member_labels(manifest, "mini-std", lambda app: True)[0]
+        self.assertEqual((gw["gatewayRunners"], gw["gatewayPools"]), (2, ["glaeda-gateway-xcode-26.6"]))
+        self.assertEqual((gw["runners"], gw["pools"], gw["labels"]), (today["runners"], today["pools"], today["labels"]),
+                         "the pool instances, the picker's pool count and the member labels are unchanged")
+        self.assertEqual(fleet_labels.gateway_label("26.6"), "glaeda-gateway-xcode-26.6")
+        self.assertEqual(fleet_labels.declared_pools(manifest)["glaeda-std-xcode-26.6"], ["mini-std"])
+        self.assertNotIn("glaeda-gateway-xcode-26.6", fleet_labels.declared_pools(manifest))
+        for bad in (3, -1, True, "1"):
+            std["gatewayRunners"] = bad
+            self.assertIn("gatewayRunners must be 0 to 2", fleet_labels.member_labels(manifest, "mini-std", lambda a: True)[1])
+        std["gatewayRunners"] = 1
+        manifest["hosts"]["mini-std"]["overrides"] = {"runner": {"trustedRef": "refs/heads/main",
+                                                                 "trustedRepo": "manaflow-ai/cmux"}}
+        self.assertIn("gatewayRunners needs a dedicated runner without trustedRef",
+                      fleet_labels.member_labels(manifest, "mini-std", lambda a: True)[1])
+        manifest["hosts"]["mini-std"]["overrides"] = {"runner": {"poolPrefix": "aws-"}}
+        self.assertIn("no poolPrefix", fleet_labels.member_labels(manifest, "mini-std", lambda a: True)[1])
+        manifest["hosts"]["mini-std"]["overrides"] = {"runner": {"poolPrefix": "gateway-"}}
+        self.assertIn("poolPrefix", fleet_labels.member_labels(manifest, "mini-std", lambda a: True)[1])
+        manifest["hosts"]["mini-std"]["overrides"] = {}
+        manifest["hosts"]["mini-std"]["availability"] = "opportunistic"
+        manifest["hosts"]["mini-std"]["owner"] = "x"
+        self.assertIn("gatewayRunners needs a dedicated runner",
+                      fleet_labels.member_labels(manifest, "mini-std", lambda a: True)[1])
 
     def test_runner_and_module_agree(self) -> None:
         with mock.patch.object(cr, "xcode_present", return_value=True):

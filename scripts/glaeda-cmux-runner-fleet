@@ -663,6 +663,7 @@ def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, m
     started = time.monotonic()
     eligible, why = check(member, summary)
     row: dict[str, Any] = {"member": member, "class": summary["class"], "runners": summary.get("runners", 1),
+                           "gatewayRunners": summary.get("gatewayRunners") or 0,
                            "capacityUnits": summary.get("capacityUnits"), "eligible": eligible, "gate": why}
     dedicated, bad = load_labels().dedicated_runners(manifest, member)
     row["dedicated"] = [d["name"] for d in dedicated]
@@ -703,9 +704,11 @@ def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, m
         extra.append("--skip-launchctl")
     repo, org, group = member_scope(args, manifest, member)
     row["scope"] = f"{org}/{group}" if org and group else org or repo
-    with concurrent.futures.ThreadPoolExecutor(max_workers=row["runners"]) as pool:
+    # the pool instances, then the gateway runners after them (gatewayRunners: instances runners and on)
+    instances = row["runners"] + row["gatewayRunners"]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=instances) as pool:
         results = list(pool.map(lambda k: apply_instance(member, k, repo, extra, org, group,
-                                                         args.migrate_from_repo), range(row["runners"])))
+                                                         args.migrate_from_repo), range(instances)))
     # a dedicated runner keeps its own scope (never --org/--migrate-from-repo) and its own labels
     results += [apply_dedicated(member, entry, extra) for entry in dedicated]
     row["instances"] = results
@@ -718,7 +721,8 @@ def render(rows: list[dict[str, Any]], skipped: dict[str, str], applied: bool, g
     lines = [f"glaeda-cmux-runner-fleet: {'APPLY' if applied else 'PLAN (nothing changed; add --apply to act)'}"]
     lines.extend(guard_lines(guard, applied))
     for row in rows:
-        units = f"{row['runners']} runners/{row['capacityUnits']} units"
+        units = f"{row['runners']} runners/{row['capacityUnits']} units" + (
+            f"+{row['gatewayRunners']}gw" if row.get("gatewayRunners") else "")
         lines.append(f"  {row['member']:<22} {row['class']:<5} {units:<20} {row['action']:<24} {row['gate']}")
         if any(str(i.get("state", "")).startswith("NO RUNNER") for i in row.get("instances", [])):
             lines.append(f"      {row['member']} has instances with no runner: re-run for this member")
