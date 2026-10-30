@@ -4536,7 +4536,7 @@ def hold(fds: list[int], watch: int | JobOwner, state_dir: Path, drop: tuple[int
     if owner.gone():  # nothing to hold for: the locks go back now, never to a holder watching nobody
         close_all(fds)
         return False, f"{OWNER_GONE} (pid {owner.pid})"
-    watch_pid, watch_identity = owner.pid, owner.identity
+    watch_pid = owner.pid
     try:
         state_dir.mkdir(parents=True, exist_ok=True)
         pid_file = pid_file or holder_file(state_dir)
@@ -4571,7 +4571,9 @@ def hold(fds: list[int], watch: int | JobOwner, state_dir: Path, drop: tuple[int
             os.write(ready_w, me.encode())
             os.close(ready_w)
             deadline = time.monotonic() + HOLDER_MAX_S
-            while process_alive(watch_pid, watch_identity) and time.monotonic() < deadline:
+            # owner.gone(), not process_alive: a /bin/ps that times out or fails under load (a busy mini's
+            # load reaches 200+) is unknown, not gone, and must never hand a live job's units back to the ledger
+            while not owner.gone() and time.monotonic() < deadline:
                 try:
                     if pid_file.read_text().strip() != me:
                         break  # job-completed released it

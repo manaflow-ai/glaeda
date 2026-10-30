@@ -4437,6 +4437,50 @@ time.sleep(60)
         with mock.patch.object(hook, "process_identity", return_value="ps:reused"):
             self.assertTrue(me.gone(), "a reused pid is another process")
 
+    def test_a_holder_keeps_its_locks_while_the_owners_start_token_is_unreadable(self) -> None:
+        """A ci-step's holder on cmux11s (2026-10-30, load 228) let its units go 4 minutes into a 2-hour step while
+        the build worker it watched lived on: the holder's loop asked process_alive, which reads a /bin/ps that
+        times out or fails as gone. Unknown is not gone (JobOwner.gone): the holder keeps the lock until the
+        owner is proven gone, then lets it go."""
+        state = self.dir / "state"
+        lock_path = self.dir / "unit-0"
+        owner_proc = subprocess.Popen(["/bin/sleep", "60"])
+        self.addCleanup(owner_proc.wait)
+        self.addCleanup(owner_proc.kill)
+        owner = hook.JobOwner.of(owner_proc.pid)
+        self.assertIsNotNone(owner)
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        real = hook.process_identity
+        with mock.patch.object(hook, "HOLDER_POLL_S", 0.05), \
+                mock.patch.object(hook, "process_identity",
+                                  side_effect=lambda pid: None if pid == owner_proc.pid else real(pid)):
+            ok, why = hook.hold([fd], owner, state)  # the forked holder inherits the patched probe
+        self.assertTrue(ok, why)
+        holder = int(re.search(r"holder (\d+)", why).group(1))  # hold reports it; its pid file goes with it
+        self.addCleanup(lambda: hook.pid_alive(holder) and os.kill(holder, signal.SIGKILL))
+
+        def lock_free() -> bool:
+            probe = os.open(lock_path, os.O_RDWR)
+            try:
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except BlockingIOError:
+                return False
+            finally:
+                os.close(probe)
+
+        time.sleep(1.0)  # 20 polls, every one of them unable to read the owner's start token
+        self.assertTrue(hook.pid_alive(holder), "the holder gave up on a live owner whose start token was unreadable")
+        self.assertFalse(lock_free(), "the live owner's lock went back to the ledger")
+        owner_proc.kill()
+        owner_proc.wait()
+        deadline = time.monotonic() + 10
+        while hook.pid_alive(holder) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertFalse(hook.pid_alive(holder), "the holder outlived its owner")
+        self.assertTrue(lock_free(), "the owner is gone: its lock is free")
+
     def test_capacity_e2e_build_takes_the_gui_token_for_its_tests_only(self) -> None:
         # test-e2e's build compiles, then takes the gui token itself (take-gui) before its console-session tests
         self.fleet()
