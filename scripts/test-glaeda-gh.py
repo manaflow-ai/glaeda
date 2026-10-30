@@ -6201,6 +6201,30 @@ class BrokerRefusalTest(BrokerBase):
         self.assertIsNone(code)
         self.assertEqual(passed, args)
 
+    def test_a_blobless_clone_is_still_a_checkout(self) -> None:
+        """A partial clone's fetch line in `git remote -v` ends in its filter (`(fetch) [blob:none]`).
+        Reading that as a shape git_remotes cannot understand declined every blobless clone, and on
+        cosmic-gray 353 source reads an hour of manaflow-ai/cmux went to the API past this refusal."""
+        where = self.git_checkout(self.home / "roots" / "r",
+                                  '[remote "origin"]\n\turl = git@github.com:o/r.git\n'
+                                  "\tpromisor = true\n\tpartialclonefilter = blob:none\n")
+        self.assertEqual(gg.git_remotes(where), ["o/r"])
+        code, _out, err, passed = self.run_gh(["api", "repos/o/r/contents/README.md"])
+        self.assertEqual((code, passed), (gg.BROKER_EXIT_REFUSED, None))
+        self.assertIn(str(where), err)
+
+    def test_a_filter_is_only_read_after_a_fetch_marker(self) -> None:
+        for line, want in (("origin\tgit@github.com:o/r.git (fetch) [blob:none]", ["o/r"]),
+                           ("origin\tgit@github.com:o/r.git (fetch) [tree:0]", ["o/r"]),
+                           ("origin\tgit@github.com:o/r.git (push) [blob:none]", None),
+                           ("origin\tgit@github.com:o/r.git (fetch) blob:none", None),
+                           ("origin\tgit@github.com:o/r.git (fetch) [a b]", None)):
+            with self.subTest(line=line):
+                listed = subprocess.CompletedProcess([], 0, line + "\n", "")
+                none = subprocess.CompletedProcess([], 1, "", "")
+                with mock.patch.object(gg, "run_bounded", side_effect=[none, listed]):
+                    self.assertEqual(gg.git_remotes(self.home), want)
+
     def test_a_write_to_a_contents_path_is_not_a_read(self) -> None:
         self.checkout("o/r")
         args = ["api", "-X", "PUT", "repos/o/r/contents/x", "-f", "message=x"]
@@ -9456,11 +9480,80 @@ class BrokerAnswerCacheTest(BrokerBase):
                      ["pr", "view"],
                      ["pr", "view", "7", "-R", "o/r", "--web"],
                      ["run", "view", "12", "-R", "o/r", "-w"],
-                     ["pr", "list", "-R", "o/r"]):
+                     ["pr", "checks", "-R", "o/r"],
+                     ["pr", "diff", "--color", "never", "-R", "o/r"],
+                     ["pr", "checks", "my-branch", "-R", "o/r"],
+                     ["pr", "list", "-R", "o/r", "--web"]):
             with self.subTest(args=args):
                 _code, _out, _err, passed = self.run_gh(args)
                 self.assertEqual(passed, args)
         self.assertEqual(self.runs(), 0)
+
+    def test_lists_searches_and_targeted_reads_are_kept(self) -> None:
+        """The reads repeated most within 90 s on cosmic-gray (2026-10-29): issue list 82%, pr list
+        64%, search prs 61%, run list 46%."""
+        for args in (["pr", "list", "-R", "o/r", "--state", "open", "--json", "number,title"],
+                     ["issue", "list", "-R", "o/r", "--label", "research"],
+                     ["run", "list", "-R", "o/r", "--workflow", "ci.yml", "--limit", "5"],
+                     ["search", "prs", "--repo", "o/r", "--state", "open", "fix"],
+                     ["pr", "checks", "7", "-R", "o/r", "--json", "name,state"],
+                     ["pr", "diff", "7", "-R", "o/r", "--name-only"],
+                     ["issue", "view", "https://github.com/o/r/issues/9", "--json", "body"]):
+            with self.subTest(args=args):
+                before = self.runs()
+                self.run_gh(args)
+                _code, out, _err, _ = self.run_gh(args)
+                self.assertEqual((self.runs(), out), (before + 1, f"answer {before + 1}\n"))
+
+    def test_a_search_needs_no_checkout_and_any_write_ends_it(self) -> None:
+        nowhere = self.home / "nowhere"
+        nowhere.mkdir()
+        here = os.getcwd()
+        self.addCleanup(os.chdir, here)
+        os.chdir(nowhere)
+        args = ["search", "prs", "repo:o/r is:open", "--json", "number"]
+        self.run_gh(args)
+        self.run_gh(args)
+        self.assertEqual(self.runs(), 1)
+        self.run_gh(["pr", "comment", "7", "-R", "o/other", "--body", "x"])
+        self.run_gh(args)
+        self.assertEqual(self.runs(), 3, "a write to any repository can change a search")
+
+    def test_a_data_read_is_shared_across_terminals_but_not_across_forced_colour(self) -> None:
+        args = ["pr", "list", "-R", "o/r", "--json", "number"]
+        words, method, seen, values = gg.broker_words(args)
+        with mock.patch.object(sys.stdout, "isatty", return_value=False):
+            plain = gg.gh_cache_key(args, words, values, seen, method, "/gh")
+            for name, value in (("COLUMNS", "80"), ("TERM", "dumb"), ("LANG", "C"), ("GLAMOUR_STYLE", "dark"),
+                                ("PAGER", "less")):
+                with self.subTest(name=name), mock.patch.dict(os.environ, {name: value}):
+                    self.assertEqual(gg.gh_cache_key(args, words, values, seen, method, "/gh"), plain)
+            for name in ("GH_FORCE_TTY", "CLICOLOR_FORCE"):
+                with self.subTest(name=name), mock.patch.dict(os.environ, {name: "1", "COLUMNS": "80"}):
+                    self.assertNotEqual(gg.gh_cache_key(args, words, values, seen, method, "/gh"), plain)
+            rendered = ["pr", "list", "-R", "o/r"]
+            words, method, seen, values = gg.broker_words(rendered)
+            table = gg.gh_cache_key(rendered, words, values, seen, method, "/gh")
+            with mock.patch.dict(os.environ, {"COLUMNS": "80"}):
+                self.assertNotEqual(gg.gh_cache_key(rendered, words, values, seen, method, "/gh"), table)
+
+    def test_a_job_log_is_kept_past_the_ttl(self) -> None:
+        logs = ["api", "repos/o/r/actions/jobs/77/logs"]
+        jobs = ["api", "repos/o/r/actions/runs/5/jobs"]
+        self.run_gh(logs)
+        self.run_gh(jobs)
+
+        def age(seconds: float) -> None:
+            for path in gg.gh_cache_dir().glob("*.json"):
+                if path.name != "writes.json":
+                    doc = json.loads(path.read_text())
+                    doc["at"] -= seconds
+                    path.write_text(json.dumps(doc))
+        age(120)
+        self.assertEqual(self.run_gh(logs)[1], "answer 1\n")
+        self.assertEqual(self.run_gh(jobs)[1], "answer 3\n", "a jobs list is not a log")
+        age(gg.GH_CACHE_LONG_TTL)
+        self.assertEqual(self.run_gh(logs)[1], "answer 4\n")
 
     def test_the_resolved_repository_is_part_of_a_question_that_names_none(self) -> None:
         one, two = self.checkout("o/one"), self.checkout("o/two")

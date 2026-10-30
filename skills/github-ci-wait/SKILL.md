@@ -192,12 +192,35 @@ If it prints `every cycle since ... has failed with ERROR at SITE`, the daemon r
 each cycle raise, so a restart will not help. Tell the user (the message names the code site), and
 meanwhile use single `gh` reads, never a polling loop.
 
+## Reading GitHub state: the broker, NOW, pr-overlap
+
+Leo, 2026-10-29: "dont we already have apps that tell us about stuff and we can just read from that
+instead of directly callign either hte rest or graphql apis?" Read what our own systems already hold,
+never a raw API loop:
+
+- `gh` on an agent host is a chain that ends in glaeda's broker (`glaeda-gh gh`): the gh-quota shim and
+  the PATH guard keep their rules, then the broker answers. A `pr view N --json` of fields the daemon
+  holds costs nothing, and every other read it keeps (`pr view`, `pr list`, `pr checks N`, `pr diff N`,
+  `issue view N`, `issue list`, `run view`, `run list`, `search ...`, `gh api` GET and GraphQL queries)
+  is one request for every session on the host within 60 s; a finished job's log is kept 10 minutes.
+  Prefer `--json` (or `--jq`): data output is shared across terminals, a rendered table is not.
+- Status: `glaeda-gh status pr|run`, `glaeda-gh wait ...` and `glaeda-gh checks` (above) read the daemon's
+  cache; `now` (or `now json`) is the NOW page, cmuxterm-hq `reconciler-state/now`, for what is in flight
+  fleet-wide; `pr-overlap` (or `pr-overlap N`) for which open PRs touch the same files; the fleet
+  dashboard (`data.json` on cmux-lawrence:8444) for runners, the queue and alerts.
+- Source: `git show REF:PATH` in a checkout, never `gh api repos/.../contents/...` or `git/blobs`: the
+  broker refuses those when the repository is checked out on the host.
+- `which gh` that is not that chain (a bare `/usr/bin/gh` or `/opt/homebrew/bin/gh` first) is a host
+  enrollment bug: `reach enroll HOST` names it as `gh-chain`. Do not route around it with an absolute
+  path to the real gh.
+
 ## Do not
 
 - `gh run watch`, `gh pr checks --watch`, or `gh run view` / `gh pr view` / `gh api .../comments`
   in a loop.
 - Per-PR REST scans: listing PRs, then `gh api repos/.../pulls/<n>/files` (or `/reviews`, `/commits`) for each.
 - `gh run view --json jobs` just to learn which step failed: the `wait` summary already names it.
+- Calling the real gh by absolute path, or `CMUX_GH_BROKER_DISABLE=1`, to get past the broker.
 
 ## Fine to do directly
 

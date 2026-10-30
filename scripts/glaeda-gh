@@ -5571,6 +5571,9 @@ def git_remote_repo(url: str) -> str | None:
     return f"{match.group(1).lower()}/{match.group(2).lower()}"
 
 
+GIT_FILTER_RE = re.compile(r"\[[^\s\[\]]+\]")  # `[blob:none]`, `[tree:0]`, `[blob:limit=1m]`
+
+
 def git_remotes(where: Path) -> list[str] | None:
     """The owner/repo of every github.com remote git lists for the repository at or above `where`,
     lowercased, or None when that cannot be known exactly -- no repository there, a config git
@@ -5630,6 +5633,14 @@ def git_remotes(where: Path) -> list[str] | None:
         # same text, cannot read it either.
         if len(fields) == 1:
             continue
+        # A partial clone's fetch line ends in its filter: `origin<TAB>URL (fetch) [blob:none]`
+        # (git 2.56.0, any remote with a partialclonefilter). gh's own remote pattern is not
+        # anchored at the end, so it reads that line as it reads any other; declining it declined
+        # every checkout on a host whose clones are blobless, which is the fleet's default. On
+        # cosmic-gray that let 353 source reads an hour of manaflow-ai/cmux through to the API
+        # past the refusal below, and kept the cache from serving any read made inside one.
+        if len(fields) == 4 and fields[2] == "(fetch)" and GIT_FILTER_RE.fullmatch(fields[3]):
+            fields = fields[:3]
         if len(fields) != 3 or fields[2] not in ("(fetch)", "(push)"):
             return None
         # Every URL of every remote, fetch and push, and a URL this cannot read as a github.com
@@ -6338,6 +6349,29 @@ GH_CACHE_OUTPUT_ENV = ("GH_FORCE_TTY", "CLICOLOR_FORCE", "CLICOLOR", "NO_COLOR",
                        "GH_MDWIDTH", "COLUMNS", "TERM", "GH_PAGER", "PAGER", "LANG", "LC_ALL",
                        "GH_NO_UPDATE_NOTIFIER", "GH_SPINNER_DISABLED", "GH_PROMPT_DISABLED")
 GH_CACHE_READS = {("pr", "view"), ("run", "view")}  # and `api` GET
+# Reads of one object named on the line, kept like `pr view` -- but only when that object is a number
+# or a github.com URL, and nothing else is a positional word. With no target gh reads the checked-out
+# branch's PR, which is not on the line, and a value flag this does not know (`pr diff --color never`)
+# would read as one: either way two worktrees on different branches would share an answer.
+GH_CACHE_TARGETED = {("pr", "checks"), ("pr", "diff"), ("issue", "view")}
+GH_CACHE_TARGET_RE = re.compile(rf"^(?:\d+|https://github\.com/{NAME}/{NAME}/(?:pull|issues)/\d+/?)$")
+# Lists, which read no branch: the repository gh resolves is in the key (broker_repo), the rest is on the
+# line. Measured on cosmic-gray over 20,000 calls (2026-10-29), the reads repeated most within 90 s:
+# `issue list` 82%, `pr list` 64%, `search prs` 61%, `run list` 46% -- none of which this kept before.
+GH_CACHE_LISTS = {("pr", "list"), ("issue", "list"), ("run", "list"), ("label", "list"),
+                  ("release", "list"), ("workflow", "list")}
+# `gh search` asks GitHub's search index, never the working directory's repository, so it needs none.
+GH_CACHE_ANYWHERE = {"search"}
+# Flags that make gh print data rather than a rendered view: with stdout not a terminal and nothing
+# forcing one, what it prints then does not depend on the width, the terminal, the locale, the pager
+# or the markdown style, so those are left out of the key and sessions with different terminals share
+# one answer. Colour can still be forced on a pipe, so the forcing variables stay in.
+GH_CACHE_DATA_FLAGS = {"--json", "-q", "--jq", "-t", "--template"}
+GH_CACHE_FORCE_ENV = ("GH_FORCE_TTY", "CLICOLOR_FORCE", "CLICOLOR", "NO_COLOR")
+# A finished job's log never changes (a rerun is a new job id), and it is the read a lane repeats while
+# it works out why something failed: kept for GH_CACHE_KEEP, not GH_CACHE_TTL.
+GH_CACHE_LONG_RE = re.compile(rf"^(?:https?://api\.github\.com/)?/?repos/{NAME}/{NAME}/actions/jobs/\d+/logs/?$")
+GH_CACHE_LONG_TTL = 600.0
 GH_CACHE_NEVER = {"--web", "-w", "--watch", "--verbose", "--include", "-i"}
 # (subcommand, verb) pairs that never write; `None` as the verb is every verb of that subcommand.
 # A call not named here stamps a write. Listing reads rather than writes is deliberate: a write gh
@@ -6400,6 +6434,11 @@ def gh_cache_opaque(args: list[str]) -> bool:
     return False
 
 
+def gh_cache_anywhere(words: list[str]) -> bool:
+    """A read whose answer does not depend on which repository the working directory is in."""
+    return bool(words) and words[0] in GH_CACHE_ANYWHERE
+
+
 def gh_cache_is_write(args: list[str], words: list[str], method: str) -> bool:
     """Whether this call may change something on GitHub. Unknown counts as a write."""
     first, second = (words + ["", ""])[:2]
@@ -6416,10 +6455,12 @@ def gh_cache_is_write(args: list[str], words: list[str], method: str) -> bool:
     return (first, second) not in GH_CACHE_PURE and (first, None) not in GH_CACHE_PURE
 
 
-def gh_cache_identity(real: str | None) -> str:
+def gh_cache_identity(real: str | None, data: bool = False) -> str:
     """A digest of who gh will be and which gh it is: any token in the environment, the config
     directory and the contents of its hosts.yml (the active account; `gh auth switch` rewrites it),
-    and the real gh's path. Only the digest is kept, never a token."""
+    and the real gh's path. Only the digest is kept, never a token. With `data` (gh prints JSON or a
+    template to a pipe: GH_CACHE_DATA_FLAGS), only the variables that can force a terminal's output
+    onto a pipe are in it, not the whole output environment."""
     parts = [os.environ.get(name) or "" for name in ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN",
                                                        "GITHUB_ENTERPRISE_TOKEN", "GH_CONFIG_DIR")]
     hosts = gh_hosts_file()
@@ -6428,7 +6469,9 @@ def gh_cache_identity(real: str | None) -> str:
     except OSError:
         parts.append("?")
     parts.append(real or "")
-    parts += [f"{name}={os.environ.get(name, '')}" for name in GH_CACHE_OUTPUT_ENV]
+    output = GH_CACHE_FORCE_ENV if data and not any(os.environ.get(n) for n in ("GH_FORCE_TTY", "CLICOLOR_FORCE")) \
+        else GH_CACHE_OUTPUT_ENV
+    parts += [f"{name}={os.environ.get(name, '')}" for name in output]
     return hashlib.sha256("\0".join(parts).encode()).hexdigest()
 
 
@@ -6448,6 +6491,11 @@ def gh_cache_key(args: list[str], words: list[str], values: dict[str, str], seen
     elif head[:1] == ("api",):
         if method != "GET" or len(words) < 2 or BROKER_FREE_RE.match(words[1]):
             return None
+    elif head in GH_CACHE_TARGETED:
+        if len(words) != 3 or not GH_CACHE_TARGET_RE.match(words[2]):
+            return None  # see GH_CACHE_TARGETED
+    elif head in GH_CACHE_LISTS or gh_cache_anywhere(words):
+        pass
     elif head not in GH_CACHE_READS or len(words) < 3:
         return None  # `pr view` with no target reads the checked-out branch, which is not on the line
     if seen & GH_CACHE_NEVER:
@@ -6460,7 +6508,8 @@ def gh_cache_key(args: list[str], words: list[str], values: dict[str, str], seen
         return None  # the checked-out branch, or a file's contents: neither is on the line
     placeholders = any(p in a for a in args for p in ("{owner}", "{repo}"))
     resolved = None
-    if placeholders or (head[:1] != ("api",) and gh_cache_repo(words, values) is None):
+    if placeholders or (head[:1] != ("api",) and not gh_cache_anywhere(words)
+                        and gh_cache_repo(words, values) is None):
         # gh fills these from the working directory's checkout. Keyed on the repository that
         # resolves to, by broker_repo's rule (which declines anything it cannot be sure of), so a
         # directory whose remote changed is a different question.
@@ -6470,8 +6519,9 @@ def gh_cache_key(args: list[str], words: list[str], values: dict[str, str], seen
     # A GraphQL question is its query and variables, in whatever order the flags came: two
     # scripts asking for the same page share one answer.
     question = gh_cache_graphql_question(args) if graphql else args
+    data = head[:1] == ("api",) or bool(seen & GH_CACHE_DATA_FLAGS)
     ident = [question, resolved, os.environ.get("GH_REPO") or "", os.environ.get("GH_HOST") or "",
-             gh_cache_identity(real)]
+             gh_cache_identity(real, data)]
     return hashlib.sha256(json.dumps(ident).encode()).hexdigest()[:40]
 
 
@@ -6528,7 +6578,10 @@ def gh_cache_get(key: str, repo: str | None, now: float) -> dict | None:
     if not isinstance(doc, dict) or doc.get("key") != key or not isinstance(doc.get("at"), (int, float)):
         return None
     at = float(doc["at"])
-    if not 0 <= now - at < gh_cache_ttl():
+    ttl = gh_cache_ttl()
+    if ttl > 0 and doc.get("long") is True:
+        ttl = max(ttl, GH_CACHE_LONG_TTL)
+    if not 0 <= now - at < ttl:
         return None
     writes = gh_cache_writes()
     newest = max([writes.get("*", 0.0)] + ([writes.get(repo, 0.0)] if repo else list(writes.values())))
@@ -6540,10 +6593,10 @@ def gh_cache_get(key: str, repo: str | None, now: float) -> dict | None:
         return None
 
 
-def gh_cache_put(key: str, at: float, rc: int, out: bytes, err: bytes) -> None:
+def gh_cache_put(key: str, at: float, rc: int, out: bytes, err: bytes, long: bool = False) -> None:
     if rc != 0 or len(out) + len(err) > GH_CACHE_MAX_BYTES:
         return
-    write_json(gh_cache_dir() / f"{key}.json", {"key": key, "at": at, "rc": rc,
+    write_json(gh_cache_dir() / f"{key}.json", {"key": key, "at": at, "rc": rc, "long": long,
                                                "out": base64.b64encode(out).decode(),
                                                "err": base64.b64encode(err).decode()})
     gh_cache_prune(at)
@@ -6682,7 +6735,9 @@ def gh_cache_fill(real: str, args: list[str], key: str, repo: str | None, ran: l
         rc, out, err = gh_cache_child(real, args, True, GH_CACHE_FILL_DEADLINE)
         ran.append(rc)
         with contextlib.suppress(Exception):
-            gh_cache_put(key, at, rc, out, err)
+            words = broker_words(args)[0]
+            long = words[:1] == ["api"] and len(words) > 1 and bool(GH_CACHE_LONG_RE.match(words[1]))
+            gh_cache_put(key, at, rc, out, err, long)
     return gh_cache_emit({"rc": rc, "out": out, "err": err})
 
 
@@ -6854,7 +6909,8 @@ def cmd_gh(args: list[str]) -> int:
             else:
                 cache_key = gh_cache_key(args, words, values, seen, method, real)
                 if cache_key is not None:
-                    cache_repo = gh_cache_repo(words, values) or (
+                    # A search spans repositories, so any write on this host makes its answer old.
+                    cache_repo = None if gh_cache_anywhere(words) else gh_cache_repo(words, values) or (
                         None if words[:1] == ["api"] and not any("{" in a for a in args) else broker_repo(values))
                     answer = gh_cache_get(cache_key, cache_repo, now)
                     if answer is not None:
