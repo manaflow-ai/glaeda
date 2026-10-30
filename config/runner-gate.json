@@ -2,23 +2,54 @@
   "schema": "glaeda-runner-gate/v1",
   "note": "Per-mini listener-gate settings, read by scripts/glaeda-cmux-runner-hook from the release glaeda-update installed (docs/CMUX_MINI_RUNNER.md, 'Per-mini gate settings'). Keys under hosts are the short, lowercased hostname (hostname -s), not the manifest member name. cpuHold false: the CPU marks (85/80 over 60 s) never hold that mini's listeners; units, memory pressure, heat, disk and the fleet's holds still do. A host entry with an until (UTC) is ignored past it, so a trial ends by itself.",
   "defaults": {
-    "cpuHold": true
+    "cpuHold": false,
+    "why": "2026-10-30 A/B (glaeda#1757): with the CPU hold off, 3 std minis started 15% more jobs per mini-hour than 3 matched controls (difference-in-differences against the 2 h before), with no rise in failures, no slower normalized p90 and shorter nightly waits. Units, memory pressure, heat, disk and the fleet's holds still gate every listener."
   },
   "hosts": {
-    "cmux10s-mac-mini": {
-      "cpuHold": false,
-      "until": "2026-10-30T21:00:00Z",
-      "why": "A/B of the CPU hold on top of the units ledger (glaeda#1756 follow-up); control cmuxs-mac-mini"
+    "cmux16": {
+      "cpuHold": true,
+      "why": "Reserved for perf work until 20:50Z (the fleet registry's reservation, which lapses then): keeps the 85/80 CPU hold so this change does not move its measurements; the entry lapses with it, so move both together if the reservation is extended.",
+      "until": "2026-10-30T20:50:00Z"
     },
-    "cmux8s-mac-mini": {
-      "cpuHold": false,
-      "until": "2026-10-30T21:00:00Z",
-      "why": "A/B of the CPU hold on top of the units ledger (glaeda#1756 follow-up); control cmux11s-mac-mini (both devCompile)"
+    "cmux17": {
+      "cpuHold": true,
+      "why": "Reserved for perf work until 20:50Z (the fleet registry's reservation, which lapses then): keeps the 85/80 CPU hold so this change does not move its measurements; the entry lapses with it, so move both together if the reservation is extended.",
+      "until": "2026-10-30T20:50:00Z"
     },
-    "cmux13s-mac-mini": {
-      "cpuHold": false,
-      "until": "2026-10-30T21:00:00Z",
-      "why": "A/B of the CPU hold on top of the units ledger (glaeda#1756 follow-up); control cmux14 (both two gui runners)"
+    "cmux18": {
+      "cpuHold": true,
+      "why": "Reserved for perf work until 20:50Z (the fleet registry's reservation, which lapses then): keeps the 85/80 CPU hold so this change does not move its measurements; the entry lapses with it, so move both together if the reservation is extended.",
+      "until": "2026-10-30T20:50:00Z"
+    },
+    "cmux19": {
+      "cpuHold": true,
+      "why": "Reserved for perf work until 20:50Z (the fleet registry's reservation, which lapses then): keeps the 85/80 CPU hold so this change does not move its measurements; the entry lapses with it, so move both together if the reservation is extended.",
+      "until": "2026-10-30T20:50:00Z"
+    },
+    "cmux20": {
+      "cpuHold": true,
+      "why": "Reserved for perf work until 20:50Z (the fleet registry's reservation, which lapses then): keeps the 85/80 CPU hold so this change does not move its measurements; the entry lapses with it, so move both together if the reservation is extended.",
+      "until": "2026-10-30T20:50:00Z"
+    },
+    "cmux21": {
+      "cpuHold": true,
+      "why": "Reserved for perf work until 20:50Z (the fleet registry's reservation, which lapses then): keeps the 85/80 CPU hold so this change does not move its measurements; the entry lapses with it, so move both together if the reservation is extended.",
+      "until": "2026-10-30T20:50:00Z"
+    },
+    "cmux22": {
+      "cpuHold": true,
+      "why": "Reserved for perf work until 20:50Z (the fleet registry's reservation, which lapses then): keeps the 85/80 CPU hold so this change does not move its measurements; the entry lapses with it, so move both together if the reservation is extended.",
+      "until": "2026-10-30T20:50:00Z"
+    },
+    "cmux23": {
+      "cpuHold": true,
+      "why": "Reserved for perf work until 20:50Z (the fleet registry's reservation, which lapses then): keeps the 85/80 CPU hold so this change does not move its measurements; the entry lapses with it, so move both together if the reservation is extended.",
+      "until": "2026-10-30T20:50:00Z"
+    },
+    "cmux24": {
+      "cpuHold": true,
+      "why": "Reserved for perf work until 20:50Z (the fleet registry's reservation, which lapses then): keeps the 85/80 CPU hold so this change does not move its measurements; the entry lapses with it, so move both together if the reservation is extended.",
+      "until": "2026-10-30T20:50:00Z"
     }
   }
 }

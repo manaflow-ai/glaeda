@@ -378,8 +378,10 @@ What `--apply` does:
        and no environment variable. With the hold off, the listeners are admitted by units,
        memory pressure, heat, disk and the fleet's holds, as the gui, session, freshness,
        nightly and gateway runners already are. A missing or unreadable file keeps the hold on.
-       It exists to measure (2026-10-30) whether the 60 s CPU hold buys anything on top of the
-       units ledger once std minis average 85-93% busy.
+       Since 2026-10-30 the default is off: in an A/B (glaeda#1757), three std minis with the hold
+       off started 15% more jobs per mini-hour than three matched controls, with no rise in
+       failures, no slower normalized p90 and shorter nightly waits; the units ledger and memory
+       pressure were the binding limits. Reserved minis keep the hold by host entry.
      - The gui runner is never held for CPU saturation (85% busy), only for memory
        pressure: its jobs come one per mini and are admitted by units like any other,
        and the CPU mark held it whenever the other lanes kept the mini busy. Nothing
