@@ -1154,6 +1154,50 @@ class DaemonTest(Base):
         self.assertTrue(missing["missing"])
         self.assertEqual(self.daemon.budget["graphql"]["remaining"], 3999)
 
+    def sweep(self, many: bool) -> tuple[int, str]:
+        """Ten PRs looked at once: one `status pr` with ten targets, or the loop agents wrote (42 times in
+        19 transcripts) of ten `status pr` calls. The stand-in daemon ticks as each call registers, which is
+        when the real one picks a new watch up (a never-read key sorts first)."""
+        for n in range(1, 11):
+            self.gh.prs[("o", "r", n)] = pr_node(n, rollup="SUCCESS", checks=[check_run("a")])
+        gg.BASE.mkdir(parents=True, exist_ok=True)
+        lock = open(gg.BASE / "daemon.lock", "a+")
+        fcntl.flock(lock, fcntl.LOCK_EX)  # stands in for the running daemon this test drives by hand
+        ticks = iter(range(100))
+
+        def then_tick(real):
+            def wrapped(*args, **kwargs):
+                real(*args, **kwargs)
+                self.daemon.tick(NOW + next(ticks))
+            return wrapped
+        out = io.StringIO()
+        codes = []
+        try:
+            with mock.patch.object(gg, "register", then_tick(gg.register)), \
+                    mock.patch.object(gg, "register_all", then_tick(gg.register_all)), \
+                    mock.patch.object(gg, "say_waiting", lambda *_: None), contextlib.redirect_stdout(out):
+                if many:
+                    codes.append(gg.cmd_status("pr", ["o/r#1", *[str(n) for n in range(2, 11)]], False, False,
+                                               first_wait=5))
+                else:
+                    for n in range(1, 11):
+                        codes.append(gg.cmd_status("pr", f"o/r#{n}", False, False, first_wait=5))
+        finally:
+            lock.close()
+        self.assertEqual(set(codes), {0})
+        return len(self.gh.gql_calls()) + len(self.gh.rest_calls()), out.getvalue()
+
+    def test_a_ten_pr_status_is_one_upstream_read_where_the_loop_was_ten(self) -> None:
+        reads, text = self.sweep(many=True)
+        self.assertEqual(reads, 1)  # one batched GraphQL query for all ten
+        self.assertEqual([line.split()[0] for line in text.splitlines() if line.startswith("o/r#")],
+                         [f"o/r#{n}" for n in range(1, 11)])
+        self.assertEqual(text.count("checks SUCCESS: 1 passed"), 10)
+
+    def test_the_old_loop_of_single_status_calls_reads_once_per_pr(self) -> None:
+        reads, _ = self.sweep(many=False)
+        self.assertEqual(reads, 10)  # the before of the sweep test's after: one query per call
+
     def test_new_entry_fills_at_once_then_waits_for_the_cycle(self) -> None:
         self.gh.prs[("o", "r", 1)] = pr_node(1)
         self.gh.prs[("o", "r", 2)] = pr_node(2)
@@ -2469,6 +2513,80 @@ class ClientTest(Base):
         with contextlib.redirect_stdout(out):
             self.assertEqual(gg.cmd_status("pr", "o/r#1", False, True, first_wait=0), 0)
         self.assertEqual(json.loads(out.getvalue())["data"]["checkState"], "PENDING")
+
+    def status(self, *args, **kwargs) -> tuple[int, str]:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = gg.cmd_status(*args, first_wait=0, **kwargs)
+        return code, out.getvalue()
+
+    def test_status_takes_several_targets_and_bare_numbers_reuse_the_repository(self) -> None:
+        self.assertEqual(gg.status_keys("pr", ["O/R#1", "2", "#3", "o/r#1", "https://github.com/x/y/pull/4", "5"]),
+                         ["pr:o/r#1", "pr:o/r#2", "pr:o/r#3", "pr:x/y#4", "pr:x/y#5"])
+        self.assertEqual(gg.status_keys("comment", ["o/r#1", "2"]), ["comment:o/r#1", "comment:o/r#2"])
+        with self.assertRaisesRegex(gg.WatchError, "needs an OWNER/REPO#N before it"):
+            gg.status_keys("pr", ["7", "o/r#1"])
+        with self.assertRaises(gg.WatchError):
+            gg.status_keys("run", ["o/r/1", "2"])  # a run has no bare form
+
+    def test_several_targets_print_a_block_each_and_json_gives_a_list(self) -> None:
+        self.put("pr:o/r#1", gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[check_run("a")])))
+        self.put("pr:o/r#2", gg.parse_pr(pr_node(2, rollup="FAILURE", checks=[check_run("b", conclusion="FAILURE")])))
+        code, text = self.status("pr", ["o/r#1", "2"], False, False)
+        self.assertEqual(code, 0)
+        self.assertEqual(text, gg.render("pr:o/r#1", gg.read_cache("pr:o/r#1"), False)
+                         + gg.render("pr:o/r#2", gg.read_cache("pr:o/r#2"), False))
+        code, text = self.status("pr", ["o/r#1", "o/r#2"], False, True)
+        doc = json.loads(text)
+        self.assertEqual([d["key"] for d in doc], ["pr:o/r#1", "pr:o/r#2"])
+        self.assertEqual(doc[1]["data"]["checkState"], "FAILURE")
+        # one without data yet: its entry is still listed, and the exit says not everything was there
+        code, text = self.status("pr", ["o/r#1", "3"], False, True)
+        self.assertEqual(code, 1)
+        self.assertEqual([d["key"] for d in json.loads(text)], ["pr:o/r#1", "pr:o/r#3"])
+
+    def test_one_target_prints_exactly_what_it_always_has(self) -> None:
+        self.put("pr:o/r#1", gg.parse_pr(pr_node(1, rollup="PENDING", checks=[check_run("a")])))
+        entry = gg.read_cache("pr:o/r#1")
+        self.assertEqual(self.status("pr", "o/r#1", False, True), (0, gg.render("pr:o/r#1", entry, True)))
+        self.assertEqual(self.status("pr", ["o/r#1"], False, True), (0, gg.render("pr:o/r#1", entry, True)))
+        self.assertEqual(self.status("pr", ["o/r#1"], False, False), (0, gg.render("pr:o/r#1", entry, False)))
+
+    def test_field_prints_just_those_values(self) -> None:
+        red = [check_run("lint", conclusion="FAILURE"), check_run("test", conclusion="FAILURE"), check_run("ok")]
+        red[0]["checkSuite"] = {"workflowRun": {"databaseId": 5, "workflow": {"databaseId": 1, "name": "CI"}}}
+        self.put("pr:o/r#1", gg.parse_pr(pr_node(1, rollup="FAILURE", checks=red)))
+        self.put("pr:o/r#2", gg.parse_pr(pr_node(2, state="MERGED", rollup="SUCCESS", checks=[check_run("ok")])))
+        fields = gg.parse_fields("head,checks.failed")
+        self.assertEqual(self.status("pr", "o/r#1", False, False, fields=fields), (0, f"{'a' * 40}\tlint,test\n"))
+        code, text = self.status("pr", ["o/r#1", "2", "3"], False, False, fields=gg.parse_fields("state,checks.state"))
+        self.assertEqual(code, 1)  # #3 has no data yet: an empty row, not an error
+        self.assertEqual(text, "o/r#1\tOPEN\tFAILURE\no/r#2\tMERGED\tSUCCESS\no/r#3\t\t\n")
+        code, text = self.status("pr", "o/r#2", False, False, fields=gg.parse_fields("isDraft,checks.total,url"))
+        self.assertEqual(text, "false\t1\thttps://github.com/o/r/pull/2\n")
+
+    def test_an_unknown_field_names_the_valid_keys(self) -> None:
+        self.put("pr:o/r#1", gg.parse_pr(pr_node(1)))
+        with self.assertRaisesRegex(gg.WatchError, r"no 'hed' at the top level; valid keys there: .*\bhead\b"):
+            self.status("pr", "o/r#1", False, False, fields=["hed"])
+        with self.assertRaisesRegex(gg.WatchError, r"no 'red' at checks; valid keys there: failed, held, passed"):
+            self.status("pr", "o/r#1", False, False, fields=["checks.red"])
+        # a PR with no data yet refuses the typo too, rather than printing an empty column
+        with self.assertRaisesRegex(gg.WatchError, r"no 'hed' at the top level; valid keys there: .*\bhead\b"):
+            self.status("pr", ["o/r#1", "9"], False, False, fields=["head", "hed"])
+        self.assertEqual(self.status("pr", "o/r#9", False, False, fields=["head", "checks.failed", "mergeable"]),
+                         (1, "\t\t\n"))
+        for bad in ("", "head,", "checks..failed"):
+            with self.subTest(bad=bad), self.assertRaises(gg.WatchError):
+                gg.parse_fields(bad)
+
+    def test_status_cli_takes_several_targets_and_a_field(self) -> None:
+        self.put("pr:o/r#1", gg.parse_pr(pr_node(1, rollup="SUCCESS", checks=[check_run("a")])))
+        self.put("pr:o/r#2", gg.parse_pr(pr_node(2, rollup="SUCCESS", checks=[check_run("a")])))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(gg.main(["status", "pr", "o/r#1", "2", "--field", "checks.state"]), 0)
+        self.assertEqual(out.getvalue(), "o/r#1\tSUCCESS\no/r#2\tSUCCESS\n")
 
     def test_the_daemon_waits_say_what_they_wait_for_before_they_block(self) -> None:
         """The pr, run and comment kinds, the three that go through the daemon; the file and pid
@@ -8526,6 +8644,12 @@ class PostTest(unittest.TestCase):
         args = gg.parser().parse_args(["post", *argv])
         with mock.patch.object(sys, "stdin", io.StringIO(stdin)):
             item = gg.post_item(args)
+        # Two items queued in one millisecond by one process sort by their random suffix, so a test that
+        # queues two in a row saw them sent in either order (a fast CI runner did): keep queue order.
+        last = getattr(self, "_last_id", "")
+        if item["id"] <= last:
+            item["id"] = f"{int(last.split('-', 1)[0]) + 1:013d}-{item['id'].split('-', 1)[1]}"
+        self._last_id = item["id"]
         gg.write_json(gg.outbox_dir() / f"{item['id']}.json", item)
         return item
 

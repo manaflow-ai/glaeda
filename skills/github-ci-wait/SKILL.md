@@ -26,6 +26,8 @@ glaeda-gh wait pr OWNER/REPO#N --until merged    # ignores conflicts; 1 if close
 glaeda-gh wait run OWNER/REPO/RUN_ID [--jobs]    # 0 success, 1 failure
 glaeda-gh wait comment OWNER/REPO#N --author 'github-actions[bot]' --match 'REGEX' --since COMMENT_URL
 glaeda-gh status pr OWNER/REPO#N                 # one look: state, mergeable, checks, review
+glaeda-gh status pr OWNER/REPO#12 13 14 o/x#7    # several PRs, one gather (bare N reuses the repo before it)
+glaeda-gh status pr OWNER/REPO#12 13 --field head,checks.state,checks.failed   # just those, tab-separated
 glaeda-gh status run OWNER/REPO/RUN_ID --jobs
 glaeda-gh status comment OWNER/REPO#N            # the latest comments
 glaeda-gh budget                                 # REST and GraphQL left, the daemon's own use, its heartbeat
@@ -66,6 +68,13 @@ glaeda-gh budget                                 # REST and GraphQL left, the da
   uses the normal cache verdict path; unknown or unavailable controllers fall back to the daemon's
   ordinary wait cadence. This is a one-shot request, not a client-side polling loop.
 - Add `--json` for machine-readable output. URLs work too: `glaeda-gh wait pr https://github.com/o/r/pull/12`.
+- Looking at several PRs: one `status pr` with all of them, never a `for n in ...; do glaeda-gh status pr`
+  loop. The daemon reads them together (one batched GraphQL query per 15 PRs when PRs read over GraphQL);
+  a loop lands each in its own tick. `--json` then prints a list (one target still prints one object).
+  `--field a,b.c` prints just those values of the `--json` object, tab-separated, one line per PR
+  (prefixed `OWNER/REPO#N` when there are several): `head`, `state`, `mergeable`, `url`, and
+  `checks.state|failed|pending|passed|held|total`; lists print comma-joined names, instead of piping
+  `--json` into python. A quoted `'#N'` works like a bare `N` (unquoted, the shell reads `#` as a comment).
 
 ## Waiting on a file or a process: no sleep loops
 

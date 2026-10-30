@@ -3,6 +3,9 @@
 
     glaeda-gh serve                                     the daemon (LaunchAgent or systemd user unit)
     glaeda-gh status pr OWNER/REPO#N [--json]           PR state, checks, mergeability, review
+    glaeda-gh status pr OWNER/REPO#A OWNER/REPO#B C ...  several PRs in one gather (a bare N, or a quoted '#N',
+                                                        reuses the repository before it); --json gives a list
+    glaeda-gh status pr ... --field head,checks.failed  just those values, tab-separated, one line per PR
     glaeda-gh status run OWNER/REPO/RUN_ID [--jobs] [--json]
     glaeda-gh wait pr OWNER/REPO#N [--until green|done|required|merged] [--timeout S] [--json]
     glaeda-gh wait run OWNER/REPO/RUN_ID [--jobs] [--rescue-grace S] [--timeout S] [--json]
@@ -4167,10 +4170,124 @@ def emit(key: str, entry: dict | None, as_json: bool, extra: dict | None = None,
     sys.stdout.write(render(key, entry, as_json, extra, until, grace))
 
 
-def cmd_status(kind: str, target: str, jobs: bool, as_json: bool, first_wait: float | None = None) -> int:
+BARE_NUMBER = re.compile(r"#?(\d+)")
+
+
+def status_keys(kind: str, targets: list[str]) -> list[str]:
+    """The cache keys of `status`'s targets, in order and each once. For PRs and comments a bare `#N` or
+    `N` names that number in the repository of the target before it, so `o/r#1 #2 3` is three PRs."""
+    keys: list[str] = []
+    repo: str | None = None
+    for text in targets:
+        bare = BARE_NUMBER.fullmatch(text.strip()) if kind in ("pr", "comment") else None
+        if bare:
+            if repo is None:
+                raise WatchError(f"{text!r} needs an OWNER/REPO#N before it to name its repository")
+            key = f"{kind}:{repo}#{int(bare.group(1))}"
+        else:
+            key = parse_key(kind, text)
+            repo = split_key(key)[1] + "/" + split_key(key)[2]
+        if key not in keys:
+            keys.append(key)
+    return keys
+
+
+def register_all(keys: list[str], jobs: bool = False) -> None:
+    """register() for several keys under one hold of the lock, so the daemon's next tick finds every
+    one of them and reads them together (one batched GraphQL query per GQL_BATCH PRs) rather than
+    one per tick as each arrives."""
+    watch_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
+    with bounded_lock(watch_dir() / ".register.lock"):
+        for key in keys:
+            _register_locked(watch_dir() / file_name(key), key, jobs, None)
+
+
+def status_view(key: str, entry: dict | None, grace: float = RESCUE_GRACE) -> dict:
+    """What `--field` reads: the `--json` object with its `data` lifted to the top, plus `head` (the head
+    commit) and, for a PR, `checks` as this tool reads them: {state, passed, failed, pending, held,
+    total, required}, each group a list of checks (printed as their names)."""
+    entry = entry or {}
+    data = entry.get("data") if isinstance(entry.get("data"), dict) else {}
+    view: dict[str, Any] = {"key": key, **{k: v for k, v in entry.items() if k != "data"}, **data}
+    if not data:
+        return view
+    kind = split_key(key)[0]
+    if kind == "pr":
+        view["head"] = data.get("headRefOid")
+        groups = classify(data, time.time(), grace)
+        checks = data.get("checks") or []
+        result = check_verdict(data, "done", time.time(), grace) if checks else None
+        view["checks"] = {"state": {EXIT_OK: "SUCCESS", EXIT_FAIL: "FAILURE"}.get(result, "PENDING"),
+                          **groups, "total": len(checks), "required": [c for c in checks if c.get("required")]}
+    elif kind == "run":
+        view["head"] = data.get("head_sha")
+    return view
+
+
+def field_value(view: dict, path: str) -> Any:
+    here: Any = view
+    walked: list[str] = []
+    for part in path.split("."):
+        if not isinstance(here, dict) or part not in here:
+            where = ".".join(walked) or "the top level"
+            valid = ", ".join(sorted(here)) if isinstance(here, dict) else "none (not an object)"
+            raise WatchError(f"--field {path}: no {part!r} at {where}; valid keys there: {valid}")
+        here = here[part]
+        walked.append(part)
+    return here
+
+
+def field_text(value: Any) -> str:
+    """A list prints comma-joined, a check (any object with a name) as its name alone; other objects as JSON."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return str(value).lower()
+    if isinstance(value, list):
+        return ",".join(str(v.get("name")) if isinstance(v, dict) and "name" in v else field_text(v) for v in value)
+    if isinstance(value, dict):
+        return json.dumps(value, sort_keys=True)
+    return str(value).replace("\t", " ").replace("\n", " ")
+
+
+def render_fields(keys: list[str], entries: dict[str, dict | None], fields: list[str]) -> str:
+    """One line per key, `fields` tab-separated, prefixed by OWNER/REPO#N when there are several keys. An
+    entry with no data yet prints empty values; a field an entry with data does not have is an error."""
+    lines = []
+    for key in keys:
+        has = bool((entries.get(key) or {}).get("data"))
+        view = status_view(key, entries.get(key))
+        if not has and split_key(key)[0] == "pr":
+            # no data yet: check the names against the shape every PR has, so a typo is refused now
+            # rather than printing an empty column until the first read lands
+            shape = status_view(key, {"data": parse_pr({"state": "OPEN"})})
+            for f in fields:
+                field_value(shape, f)
+        values = [field_text(field_value(view, f)) if has else "" for f in fields]
+        if len(keys) > 1:
+            kind, owner, repo, number = split_key(key)
+            values.insert(0, f"{owner}/{repo}{'/' if kind == 'run' else '#'}{number}")
+        lines.append("\t".join(values))
+    return "".join(f"{line}\n" for line in lines)
+
+
+def parse_fields(text: str | None) -> list[str] | None:
+    if text is None:
+        return None
+    fields = [f.strip() for f in text.split(",")]
+    if not fields or any(not f or any(not part for part in f.split(".")) for f in fields):
+        raise WatchError(f"--field takes a comma list of dotted names (head,checks.failed), not {text!r}")
+    return fields
+
+
+def cmd_status(kind: str, target: str | list[str], jobs: bool, as_json: bool, first_wait: float | None = None,
+               fields: list[str] | None = None) -> int:
+    """One look at one or more PRs, runs or comment threads. Several targets are registered together
+    and waited for together, so the daemon gathers them in one tick. One target prints exactly what it
+    always has; several print one block (or `--json` object, in a list) each, in the order given."""
     if first_wait is None:
         first_wait = daemon_policy()["cycle"] + 10.0  # a first read lands within one configured cycle
-    key = parse_key(kind, target)
+    keys = status_keys(kind, [target] if isinstance(target, str) else list(target))
     if not daemon_running(grace=DOWN_GRACE):
         say_waiting(down_message())
         return EXIT_DOWN
@@ -4181,14 +4298,28 @@ def cmd_status(kind: str, target: str, jobs: bool, as_json: bool, first_wait: fl
     lag = daemon_stale()
     if lag is not None:
         say_waiting(stale_message(lag))
-    register(key, jobs)
+    if len(keys) == 1:
+        register(keys[0], jobs)
+    else:
+        register_all(keys, jobs)
     deadline = time.monotonic() + first_wait
-    entry = read_cache(key)
-    while (entry is None or (jobs and "jobs" not in entry and not entry.get("error"))) and time.monotonic() < deadline:
+
+    def unready(entry: dict | None) -> bool:
+        return entry is None or (jobs and "jobs" not in entry and not entry.get("error"))
+    entries = {key: read_cache(key) for key in keys}
+    while any(unready(e) for e in entries.values()) and time.monotonic() < deadline:
         time.sleep(1)
-        entry = read_cache(key)
-    emit(key, entry, as_json)
-    return EXIT_OK if entry and entry.get("data") else EXIT_FAIL
+        entries = {key: entry if not unready(entry) else read_cache(key) for key, entry in entries.items()}
+    if fields is not None:
+        sys.stdout.write(render_fields(keys, entries, fields))
+    elif len(keys) == 1:
+        emit(keys[0], entries[keys[0]], as_json)
+    elif as_json:
+        sys.stdout.write(json.dumps([{"key": k, **(entries[k] or {})} for k in keys], sort_keys=True) + "\n")
+    else:
+        for key in keys:
+            emit(key, entries[key], False)
+    return EXIT_OK if all(e and e.get("data") for e in entries.values()) else EXIT_FAIL
 
 
 def git_rev_parse(prefix: str) -> str | None:
@@ -7805,7 +7936,16 @@ def parser() -> argparse.ArgumentParser:
     for name in ("status", "wait"):
         s = sub.add_parser(name)
         s.add_argument("kind", choices=("pr", "run", "comment") + (("file", "pid") if name == "wait" else ()))
-        s.add_argument("target", help="OWNER/REPO#N, OWNER/REPO/RUN_ID, or a GitHub URL")
+        if name == "status":
+            s.add_argument("target", nargs="+",
+                           help="OWNER/REPO#N, OWNER/REPO/RUN_ID, or a GitHub URL; several are read in one gather, "
+                                "and for pr and comment a bare #N or N reuses the repository before it")
+            s.add_argument("--field", metavar="F,G",
+                           help="print just these values of the --json object, tab-separated, one line per target "
+                                "(dotted paths; head and checks.state|failed|pending|passed|held for a PR); "
+                                "lists print comma-joined")
+        else:
+            s.add_argument("target", help="OWNER/REPO#N, OWNER/REPO/RUN_ID, or a GitHub URL")
         s.add_argument("--jobs", action="store_true", help="runs: also track the job list")
         s.add_argument("--json", action="store_true")
         if name == "wait":
@@ -7927,7 +8067,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise WatchError("checks takes OWNER/REPO and full 40-hex commit ids (git rev-parse HEAD)")
             return cmd_checks(args.repo, args.shas, args.consumer, args.max_age, args.wait, args.json)
         if args.command == "status":
-            return cmd_status(args.kind, args.target, args.jobs, args.json)
+            return cmd_status(args.kind, args.target, args.jobs, args.json, fields=parse_fields(args.field))
         if args.rescue_grace < 0:
             raise WatchError("--rescue-grace must be 0 or more seconds")
         if args.kind == "file":
