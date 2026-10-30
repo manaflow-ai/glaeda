@@ -367,8 +367,21 @@ What `--apply` does:
        every std mini while a daemon test queued on `glaeda-session-std-xcode-26.6` for
        hours with no session runner online.
      - A session runner (`--session-runner`, `guiRunners` above 1) carries only the session
-       pool label and stops only while fewer than 6 units are free (`--fit-units 6`, the
-       costliest of its jobs: generated files and action exports), a job here waits for units, or the console is locked. Its jobs (cmux-next daemon tests, generated files, action exports,
+       pool label and stops while fewer than 6 units are free (`--fit-units 6`, the costliest
+       of its jobs: generated files and action exports), a job here waits for units, or the
+       console is locked. **SESSION_FIRST:** when units are what holds the session runners
+       off, one of them per mini (the holder of `capacity/session-first.lock`, an flock that
+       dies with its gate, is handed to the new gate on a reload, and is kept through the
+       runner's own job, whose admit.want marker exists only once it waits) listens anyway. Before, the side runners won the race for every
+       unit that freed up on a busy mini: on 2026-10-29 no session runner listened anywhere
+       and a daemon test queued on the session label for hours. Now GitHub hands that runner a
+       session job only when one is queued, the job waits here for units, and its admit.want
+       marker (`"lane": "session"`) holds every root, side and session runner on the mini and
+       every later admission until it is admitted, so the next units that free up are its.
+       The priority lapses `GLAEDA_RUNNER_SESSION_FIRST_S` (default 20 min) after the job
+       began to wait, so one stuck session job cannot starve the side lanes; it keeps trying
+       for units like any job. No units are reserved while no session job waits, and running
+       jobs are never touched. Its jobs (cmux-next daemon tests, generated files, action exports,
        the pr-media tour) need the logged-in session but neither the gui token nor a root, so
        a console job holding them is no reason to idle it. It never gets a console job: the
        gui label is the console gui runner's alone. Tours are `isolated` like the rest: each
@@ -987,9 +1000,10 @@ in at the producer's root. So one root job per root per mini:
   restore step. The other gui-role runners (session runners, `--session-runner`) carry only the session pool
   label `glaeda-session-<class>-xcode-<version>`; the console gui runner carries it too only with `guiRunners` 1,
   where it is the mini's one gui-role runner. Session-only jobs, which need a logged-in session but not the
-  console token, target the session label. A session runner listens only with 6 free units (`--fit-units`, its
-  costliest job: generated files, action exports), while the console gui runner listens with 1 (an app-host
-  shard's cost), so with session runners it leaves session jobs to them. With `guiRunners` 2 one session job runs
+  console token, target the session label. A session runner listens with 6 free units (`--fit-units`, its
+  costliest job: generated files, action exports), and one per mini listens without them, its job then waiting
+  there ahead of new side and root jobs (SESSION_FIRST, above), while the console gui runner listens with 1 (an
+  app-host shard's cost), so with session runners it leaves session jobs to them. With `guiRunners` 2 one session job runs
   beside a console job, while console jobs (classes `gui`, `gui-step`, `product`) still reach only the console gui
   runner, one at a time. Rolling it out is a
   cmux change pointing those jobs at the session label, an hq `build-fleet/mini-fleet.json` change, and

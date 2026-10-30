@@ -8236,6 +8236,108 @@ class GateTest(unittest.TestCase):
         for fd in [held, *roots]:
             os.close(fd)
         self.assertEqual(hook.mini_full(self.units(5), 5, session), "all 5 capacity units on this mini are taken")
+        self.assertIsNone(hook.mini_full(self.units(5), 5, session, full_ok=True), "the SESSION_FIRST listener")
+
+    def test_a_waiting_session_job_goes_first_for_session_first_s_then_lapses(self) -> None:
+        """SESSION_FIRST: a session job waiting here for units holds the mini's root, side and session listeners and
+        every later admission that needs units, so the next units that free up are its. After SESSION_FIRST_S it no
+        longer holds them: a stuck session job cannot starve the side lanes. A nightly waiter never lapses, and a
+        plain waiter (no session lane) holds as before."""
+        side = hook.RunnerScope(14, 2, 2)
+        root = hook.RunnerScope(14, 2, 2, True)
+        session = hook.RunnerScope(14, 2, 2, False, False, session=True)
+        gui = hook.RunnerScope(14, 2, 2, False, True)
+        capacity = self.units(4)  # 10 free: room for any side or root job
+        marker = capacity / f"{hook.ADMIT_WANT}{os.getpid()}"
+        waiting = 30.0
+        hook.write_want(marker, time.time() - waiting, ["units"], "", hook.SESSION_LANE)
+        [waiter] = hook.admission_waiters(capacity)
+        self.assertEqual(waiter["lane"], hook.SESSION_LANE)
+        for scope in (side, root, session):
+            self.assertEqual(hook.mini_full(capacity, 14, scope, 5), f"{waiter['who'] or 'a job'} waits here for units",
+                             scope)
+        self.assertIsNone(hook.mini_full(capacity, 14, gui), "the gui runner's next job takes its own reserve")
+        with mock.patch("os.getpid", return_value=2 ** 30):  # another admission, later than the waiter
+            self.assertIn("has waited longer here for units",
+                          hook.fair_turn(capacity, {"units"}, time.time(), takes_units=True, new_job=True) or "")
+        # past SESSION_FIRST_S: the listeners and later admissions go on; other session runners still hold
+        hook.write_want(marker, time.time() - hook.SESSION_FIRST_S - 1, ["units"], "", hook.SESSION_LANE)
+        for scope in (side, root):
+            self.assertIsNone(hook.mini_full(capacity, 14, scope, 5), scope)
+        self.assertIsNotNone(hook.mini_full(capacity, 14, session, 5), "a second session job would wait behind it")
+        with mock.patch("os.getpid", return_value=2 ** 30):
+            self.assertIsNone(hook.fair_turn(capacity, {"units"}, time.time(), takes_units=True, new_job=True))
+        # a waiter with no lane, or a nightly one, never lapses
+        for tier, lane in (("", ""), (hook.TIER_NIGHTLY, hook.SESSION_LANE)):
+            hook.write_want(marker, time.time() - hook.SESSION_FIRST_S - 1, ["units"], tier, lane)
+            self.assertIsNotNone(hook.mini_full(capacity, 14, side, 5), (tier, lane))
+        # an unknown lane is no lane
+        marker.write_text(json.dumps({"since": time.time() - hook.SESSION_FIRST_S - 1, "wants": ["units"],
+                                      "lane": "bogus"}) + "\n")
+        self.assertEqual(hook.admission_waiters(capacity)[0]["lane"], "")
+        self.assertIsNotNone(hook.mini_full(capacity, 14, side, 5))
+        marker.unlink()
+        self.assertIsNone(hook.mini_full(capacity, 14, side, 5))
+        self.assertIsNone(hook.mini_full(self.units(14), 14, session, full_ok=True), "full: the first one listens")
+
+    def session_gate(self, instance: int, capacity: Path) -> hook.Gate:
+        runner = self.tmp / f"actions-runner-glaeda-{instance}"
+        (runner / "glaeda-hooks").mkdir(parents=True, exist_ok=True)
+        (runner / hook.RUNNER_HOOK_SCRIPT).write_text(
+            "#!/bin/bash\nexec /usr/bin/python3 /hook job-started --allowed-owner manaflow-ai --capacity-units 14 "
+            f"--compile-slots 2 --canonical-roots 2 --instance {instance} --session-runner\n")
+        gate = hook.Gate(runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state,
+                         capacity_dir=capacity, fit_units=6)
+        self.addCleanup(gate.unclaim)
+        return gate
+
+    def test_one_session_runner_per_mini_listens_without_room(self) -> None:
+        """SESSION_FIRST_LOCK: when units hold the session runners off, one of them (the lock's holder) listens
+        anyway, so a burst of session jobs spreads over the minis instead of queuing on one. With room, every session
+        runner claims it like before. The lock goes with the claim: held off for another reason, or into its job."""
+        busy = self.units(10)  # 4 free: no room for a 6-unit session job
+        first, second = self.session_gate(6, busy), self.session_gate(7, busy)
+        self.assertIsNone(first.full(), "the first look takes the lock and listens without room")
+        self.assertIsNotNone(first.first_fd)
+        self.assertIn("capacity units on this mini", second.full() or "", "one listener without room per mini")
+        self.assertIsNone(first.full(), "it keeps listening")
+        marker = busy / f"{hook.ADMIT_WANT}{os.getpid()}"
+        hook.write_want(marker, time.time(), ["units"], "", hook.SESSION_LANE)
+        self.assertIn("waits here for units", first.full() or "", "its job (or another) waits here: it holds")
+        self.assertIsNone(first.first_fd, "and lets the lock go")
+        marker.unlink()
+        self.assertIsNone(second.full(), "the lock is free again: the next session runner takes it")
+        self.assertIn("capacity units on this mini", first.full() or "")
+        second.unclaim()
+        self.assertIsNone(first.full())
+        # through its own job the lock stays (a job in setup has no admit.want marker yet); only the claim goes
+        first.unclaim(keep_first=True)
+        self.assertIsNotNone(first.first_fd)
+        self.assertIn("capacity units on this mini", second.full() or "", "still one listener without room")
+        # a reload hands the lock to the new gate with the listener: no window for a second listener
+        fd = first.first_fd
+        os.set_inheritable(fd, True)
+        reloaded = self.session_gate(6, busy)
+        first.first_fd = None  # the old gate is gone; its fd now belongs to the new one
+        reloaded.adopt_session_first(str(fd))
+        self.assertEqual(reloaded.first_fd, fd)
+        self.assertFalse(os.get_inheritable(fd), "the listener it starts never holds it")
+        self.assertIn("capacity units on this mini", second.full() or "")
+        stray = os.open(self.tmp / "stray", os.O_RDONLY | os.O_CREAT, 0o644)
+        other = self.session_gate(9, busy)
+        other.adopt_session_first(str(stray))
+        self.assertIsNone(other.first_fd, "an fd on another file is not the lock")
+        with self.assertRaises(OSError):
+            os.fstat(stray)  # and is closed
+        other.adopt_session_first("not-a-number")
+        self.assertIsNone(other.first_fd)
+        reloaded.unclaim()
+        self.assertIsNone(second.full(), "let go: the next session runner takes it")
+        roomy = self.units(4)  # 10 free: room claims as before, no lock
+        third = self.session_gate(8, roomy)
+        self.assertIsNone(third.full())
+        self.assertIsNone(third.first_fd, "with room it claims instead")
+        self.assertIsNotNone(third.claim_fd)
 
     def test_an_idle_gui_runners_reserve_holds_the_other_runners_a_unit_early(self) -> None:
         """While an idle gui runner's gate holds <gui token>.reserve, every other runner (root, side, session) counts
@@ -9107,13 +9209,15 @@ class GateTest(unittest.TestCase):
         (self.runner / hook.LISTEN_SCRIPT).write_text(ios_sim)
         self.assertEqual(hook.listen_fit_units(self.runner), 3)
         self.assertEqual(old.claimed(), "only 2 of 14 capacity units on this mini are free; its next job needs 5")
-        # a session runner with 5 cores free stays off: generated-files or action exports would wait here for a sixth
+        # a session runner with 5 units free listens anyway as the mini's SESSION_FIRST listener: its job waits here
+        # for the sixth and holds the mini's other runners meanwhile, instead of losing every free unit to them
         (self.runner / hook.RUNNER_HOOK_SCRIPT).write_text(
             "exec python3 /hook job-started --capacity-units 14 --canonical-roots 2 --instance 5 --session-runner\n")
         (self.runner / hook.LISTEN_SCRIPT).write_text(session)
         five = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state,
                          capacity_dir=self.units(9))
-        self.assertEqual(five.claimed(), "only 5 of 14 capacity units on this mini are free; its next job needs 6")
+        self.assertIsNone(five.claimed(), "a session runner listens on a busy mini")
+        five.unclaim()
         self.assertIsNone(hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state,
                                     capacity_dir=self.units(8)).claimed(), "with 6 free it listens")
 

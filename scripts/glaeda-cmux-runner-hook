@@ -1271,6 +1271,7 @@ GATE_INELIGIBLE_ENV = "GLAEDA_RUNNER_GATE_INELIGIBLE"
 # Across a reload: "clean" when this gate started its listener with listener_env, else why its env is stale.
 GATE_LISTENER_ENV = "GLAEDA_RUNNER_GATE_LISTENER_ENV"
 GATE_RESERVE_FD_ENV = "GLAEDA_RUNNER_GATE_RESERVE_FD"  # a reload hands its reserve flock's fd to the new gate
+GATE_SESSION_FIRST_FD_ENV = "GLAEDA_RUNNER_GATE_SESSION_FIRST_FD"  # and its SESSION_FIRST_LOCK flock's fd
 
 
 def _repo_name(repo: Any) -> str | None:
@@ -4009,8 +4010,9 @@ def admission_waiters(capacity_dir: Path, skip_pid: int = 0) -> list[dict[str, A
         except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
             continue  # OverflowError: a since too large for a float (an integer past 1e308)
         tier = data.get("tier") if data.get("tier") in (TIER_NIGHTLY, TIER_DEV, TIER_STACK) else ""
+        lane = SESSION_LANE if data.get("lane") == SESSION_LANE else ""
         waiters.append({"pid": pid, "since": since, "wants": wants, "who": str(data.get("who") or "")[:200],
-                        "tier": tier})
+                        "tier": tier, "lane": lane})
     return sorted(waiters, key=lambda waiter: (waiter["since"], waiter["pid"]))
 
 
@@ -4037,6 +4039,8 @@ def fair_turn(capacity_dir: Path, needs: set[str], since: float, tier: str = "",
     for waiter in admission_waiters(capacity_dir, os.getpid()):
         if admission_rank(waiter["tier"], waiter["since"], waiter["pid"], now) >= mine:
             continue
+        if session_first_lapsed(waiter, now):
+            continue  # a session job past SESSION_FIRST_S still tries for units but no longer goes first
         shared = needs & set(waiter["wants"])
         if waiter["tier"] == TIER_NIGHTLY and (takes_units or (new_job and tier != TIER_NIGHTLY)):
             shared.add("units")  # a later nightly job too: arrival order among them
@@ -4056,12 +4060,14 @@ def job_who() -> str:
                                   f"(run {os.environ['GITHUB_RUN_ID']})" if os.environ.get("GITHUB_RUN_ID") else "")))
 
 
-def write_want(marker: Path, since: float, wants: list[str], tier: str = "") -> None:
+def write_want(marker: Path, since: float, wants: list[str], tier: str = "", lane: str = "") -> None:
     with contextlib.suppress(OSError):
         tmp = marker.with_name(marker.name + ".tmp")
         want: dict[str, Any] = {"since": since, "wants": wants, "who": job_who()}
         if tier:
             want["tier"] = tier
+        if lane:
+            want["lane"] = lane
         tmp.write_text(json.dumps(want) + "\n")
         tmp.replace(marker)
 
@@ -4754,6 +4760,22 @@ def side_fit_units(scope: RunnerScope) -> int:
 # that poll, and a listener idle past it has no job waiting for its label, so its claim must not keep the mini's other
 # labels from listening (a std mini's two idle root listeners would otherwise hold 10 of 14 units from the side label).
 LISTEN_LOCK = "listen.lock"
+# SESSION_FIRST: priority admission for the session label (cmux-next daemon tests, generated files, action exports).
+# Its runners listened only with room for their costliest job (6 units) that the side runners' listen claims had not
+# taken. On a busy mini the side runners won that race every time units freed up, so on 2026-10-29 a daemon test
+# queued on the session label for hours while no session runner listened. No idle reserve (6 of 14 units held for a
+# label that is idle most of the time). Instead, when units hold a session runner off, one session runner per mini
+# (the holder of capacity/SESSION_FIRST_LOCK, an flock that dies with its gate) listens anyway, like the nightly slot:
+# GitHub hands it a session job only when one is queued, and that job waits here for units (CAPACITY_WAIT) with its
+# admit.want marker naming the session lane. Every root, side and session runner on the mini already holds off while
+# a job waits here for units, and later admissions wait behind it (fair_turn), so the next units that free up go to
+# it. One listener per mini, so a burst of session jobs spreads over the minis instead of queuing on one.
+# The priority lapses SESSION_FIRST_S after the job began to wait: a session waiter that old no longer holds the
+# other runners' listeners or the admissions that came after it (fair_turn), so one stuck session job cannot starve
+# the side lanes; it keeps trying for units like any job. Running jobs are never touched.
+SESSION_LANE = "session"
+SESSION_FIRST_LOCK = "session-first.lock"
+SESSION_FIRST_S = float(os.environ.get("GLAEDA_RUNNER_SESSION_FIRST_S") or 20 * 60)
 LISTEN_CLAIM_PREFIX = "listen."
 LISTEN_CLAIM_SUFFIX = ".claim"
 LISTEN_CLAIM_HANDOFF_S = 30.0
@@ -4767,8 +4789,9 @@ JOB_ENDING = ".job-ending"
 
 def claims_room(scope: RunnerScope) -> bool:
     """Whether this runner's gate claims its room while listening and counts the others' claims (LISTEN_CLAIM): root,
-    side and session runners. The gui runner and the freshness slot keep their reserves instead; the fast runner
-    takes no shared unit; the nightly slot listens on a full mini; a dedicated runner has its own admission."""
+    side and session runners (one session runner per mini may also listen without room: SESSION_FIRST). The gui
+    runner and the freshness slot keep their reserves instead; the fast runner takes no shared unit; the nightly slot
+    listens on a full mini; a dedicated runner has its own admission."""
     return scope.units > 0 and not (scope.gui or scope.fresh or scope.fast or scope.nightly or scope.dedicated)
 
 
@@ -4926,8 +4949,15 @@ CMUX_TOUR_REQUIREMENTS_PIN = "becb28033f69367e00aec1a1bd23737a1cd74968"
 ROOT_FIT_UNITS = max(CLASS_COST[k][0] for k in ("compile", "gui", "product", "compile-gui", "gui-step"))
 
 
+def session_first_lapsed(waiter: dict[str, Any], now: float) -> bool:
+    """Whether this admission waiter is a session job (SESSION_LANE) that has waited SESSION_FIRST_S or longer, so it
+    no longer holds the mini's other listeners (SESSION_FIRST). A nightly job's waiter never lapses (FEED_FIRST)."""
+    return (waiter.get("lane") == SESSION_LANE and waiter.get("tier") != TIER_NIGHTLY
+            and now - float(waiter.get("since") or now) >= SESSION_FIRST_S)
+
+
 def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None = None,
-              fit_units: int = 1, others: int = 0) -> str | None:
+              fit_units: int = 1, others: int = 0, full_ok: bool = False) -> str | None:
     """Why none of this runner's `total` capacity units is free, or None, or UNKNOWN when it could not look.
     A job handed to a full mini is refused at once, and cmux's rescue re-runs it on Blacksmith along with the
     siblings fail-fast cancelled (cmux main full suite 36114055694: three shards refused with 0 of 4 units
@@ -4955,12 +4985,13 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
     runner carries the label, so holding it never keeps a compile off the mini.
 
     With the scope of a session runner (scope.session, guiRunners above 1: the gui runners other than the console
-    one carry only the session pool label), full means only that units are taken or a job here waits for units
-    (Gate.locked also holds it while the console is locked). Its jobs (cmux-next daemon tests, generated files,
-    action exports, the tour) need a logged-in session but neither the gui token nor a canonical root, so a console
-    job's token is no reason to hold it, and no console job reaches it: the gui label it lacks is the console
-    runner's alone. It listens only with room for the costliest of them (--fit-units, SESSION_FIT_UNITS in
-    glaeda-cmux-runner), so a job it takes never waits here for units while another mini has room.
+    one carry only the session pool label), full means only that a job here waits for units (Gate.locked also holds
+    it while the console is locked). Its jobs (cmux-next daemon tests, generated files, action exports, the tour)
+    need a logged-in session but neither the gui token nor a canonical root, so a console job's token is no reason
+    to hold it, and no console job reaches it: the gui label it lacks is the console runner's alone. It listens only
+    with room for the costliest of them (--fit-units, SESSION_FIT_UNITS in glaeda-cmux-runner), except that with
+    full_ok (the mini's SESSION_FIRST_LOCK holder) units never hold it: a session job it takes waits here for units,
+    and its waiter holds the mini's other runners until it is admitted, for SESSION_FIRST_S at most.
 
     Full also means a job admitted to this mini is waiting (CAPACITY_WAIT, its admit.want marker) for units or
     for a token this runner's next job would take (a root runner: a canonical root or persistent-dd; a gui
@@ -5014,19 +5045,20 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
         fresh = scope is not None and scope.fresh
         need = min(max(ROOT_FIT_UNITS if root else FRESH_RESERVE_UNITS if fresh else 1, fit_units), total)
         gui = scope is not None and scope.gui
+        session = scope is not None and scope.session and full_ok  # SESSION_FIRST: listening without room
         # every runner leaves the idle reserving runners' reserves free (GUI_RESERVE, FRESH_RESERVE_TOKEN); a
         # reserving runner's own reserve is its next job's
         kept = reserve_for(gui_reserved(capacity_dir, reserve_token(scope)), need, total)
         free = 0
-        for slot in range(total):
+        for slot in range(total if not session else 0):  # the SESSION_FIRST listener does not count units
             if not open_to_jobs(f"unit-{slot}", capacity_dir / f"unit-{slot}"):
                 continue
             free += 1
             if free >= need + kept + others:
                 break
-        if free == 0:
+        if free == 0 and not session:
             return f"all {total} {UNITS_FULL} are taken"
-        if free < need + kept + others:
+        if free < need + kept + others and not session:
             return (f"only {free} of {total} {UNITS_FULL} are free; "
                     f"{'a compile' if root else 'its next job'} needs {need}{kept_note(kept)}{claims_note(others)}")
         # a job already here waits for what this runner's next job would take (CAPACITY_WAIT): it goes first. Not
@@ -5034,7 +5066,10 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
         # could not have taken
         compete = ({"units"} if not gui and not fresh else set()) | ({"root", "persistent-dd"} if root else set()) | (
             {scope.gui_token, "root"} if gui else set())
+        now = time.time()
         for waiter in admission_waiters(capacity_dir):
+            if session_first_lapsed(waiter, now) and not (scope is not None and scope.session):
+                continue  # a session job waiting past SESSION_FIRST_S keeps its turn but no longer holds listeners
             shared = compete & set(waiter["wants"])
             if waiter["tier"] == TIER_NIGHTLY:  # no other job takes a unit while a nightly job waits (FEED_FIRST)
                 shared.add("units")
@@ -5587,6 +5622,7 @@ class Gate:
         self.fit_units = fit_units
         self.full_why: str | None = None  # the last known mini_full answer, kept across UNKNOWN looks
         self.claim_fd: int | None = None  # this gate's listen claim (LISTEN_CLAIM) while it listens
+        self.first_fd: int | None = None  # SESSION_FIRST_LOCK while this session runner listens without room
         self.claim_at: Path | None = None
         self.busy_since: float | None = None  # when the runner's current job was first seen (LISTEN_CLAIM_HANDOFF_S)
         self.job_ending = False  # job-completed left JOB_ENDING: look again the moment the Worker exits
@@ -5690,6 +5726,10 @@ class Gate:
             with contextlib.suppress(OSError):
                 os.set_inheritable(self.reserve_fd, True)
                 os.environ[GATE_RESERVE_FD_ENV] = str(self.reserve_fd)
+        if self.first_fd is not None:  # the listener stays up across the exec, so its SESSION_FIRST_LOCK does too
+            with contextlib.suppress(OSError):
+                os.set_inheritable(self.first_fd, True)
+                os.environ[GATE_SESSION_FIRST_FD_ENV] = str(self.first_fd)
         try:
             os.execv(sys.executable, [sys.executable, *argv])
         except OSError:
@@ -5697,9 +5737,11 @@ class Gate:
             os.environ.pop(GATE_INELIGIBLE_ENV, None)
             os.environ.pop(GATE_LISTENER_ENV, None)
             os.environ.pop(GATE_RESERVE_FD_ENV, None)
-            if self.reserve_fd is not None:
-                with contextlib.suppress(OSError):
-                    os.set_inheritable(self.reserve_fd, False)
+            os.environ.pop(GATE_SESSION_FIRST_FD_ENV, None)
+            for fd in (self.reserve_fd, self.first_fd):
+                if fd is not None:
+                    with contextlib.suppress(OSError):
+                        os.set_inheritable(fd, False)
             signal.pthread_sigmask(signal.SIG_UNBLOCK, blocked)
             gate_log("the reload failed; keeping this gate")
 
@@ -6051,6 +6093,8 @@ class Gate:
         fit = max(self.fit_units, listen_fit_units(self.runner_dir), side_fit_units(scope))
         if self.capacity_dir is None or not claims_room(scope):
             why = mini_full(self.capacity_dir, scope.units, scope, fit)
+        elif scope.session:
+            why = self.session_look(scope, fit)
         else:
             why = self.claim_look(scope, fit)
         if isinstance(why, Unknown):
@@ -6080,6 +6124,28 @@ class Gate:
         finally:
             os.close(lock)
 
+    def session_look(self, scope: RunnerScope, fit: int) -> str | Unknown | None:
+        """A session runner's look (SESSION_FIRST): with room, it claims it like any runner (claim_look). Held off
+        only by units, it takes the mini's SESSION_FIRST_LOCK if no other session runner holds it and then listens
+        anyway: its job waits here for units, ahead of the side lanes. Anything else (a job waiting here, the
+        console, the host) holds it as before. Never raises."""
+        assert self.capacity_dir is not None
+        if self.first_fd is None:
+            why = self.claim_look(scope, fit)
+            if why is None or isinstance(why, Unknown) or UNITS_FULL not in why:
+                return why
+            with contextlib.suppress(OSError):
+                fd = lock_file(self.capacity_dir / SESSION_FIRST_LOCK, fcntl.LOCK_EX)
+                if fd is not None:
+                    os.set_inheritable(fd, False)
+                    self.first_fd = fd
+            if self.first_fd is None:
+                return why  # another session runner on this mini listens without room
+        why = mini_full(self.capacity_dir, scope.units, scope, fit, full_ok=True)
+        if why is not None and not isinstance(why, Unknown):
+            self.unclaim()
+        return why
+
     def claim(self, path: Path) -> None:
         """Hold this gate's listen claim at path (letting go of one for another need). Never raises."""
         if self.claim_fd is not None and self.claim_at == path:
@@ -6092,11 +6158,17 @@ class Gate:
                 os.set_inheritable(fd, False)
                 os.utime(path)  # fresh from now (GATE_FIRST_POLL_S)
 
-    def unclaim(self) -> None:
+    def unclaim(self, keep_first: bool = False) -> None:
+        """Let go of this gate's listen claim and, unless keep_first, a session runner's SESSION_FIRST_LOCK. Never
+        raises."""
         if self.claim_fd is not None:
             with contextlib.suppress(OSError):
                 os.close(self.claim_fd)
         self.claim_fd, self.claim_at = None, None
+        if self.first_fd is not None and not keep_first:
+            with contextlib.suppress(OSError):
+                os.close(self.first_fd)
+            self.first_fd = None
 
     def job_end_marker(self) -> Path:
         return self.runner_dir / "glaeda-hooks" / JOB_ENDING
@@ -6153,6 +6225,30 @@ class Gate:
         with contextlib.suppress(OSError):
             os.set_inheritable(fd, False)
         self.reserve_fd = fd
+
+    def adopt_session_first(self, handed: str | None) -> None:
+        """Take over the SESSION_FIRST_LOCK flock the gate before a reload held (GATE_SESSION_FIRST_FD_ENV): its
+        listener, listening without room, stays up across the exec, so no other session runner on the mini may take
+        the lock meanwhile. Only an fd open on this mini's capacity/SESSION_FIRST_LOCK is kept; anything else is
+        closed if it was a number, and ignored otherwise. Never raises."""
+        try:
+            fd = int(handed or "")
+        except ValueError:
+            return
+        if fd < 3:
+            return
+        try:
+            same = self.capacity_dir is not None and os.path.samestat(
+                os.fstat(fd), os.stat(self.capacity_dir / SESSION_FIRST_LOCK, follow_symlinks=False))
+        except OSError:
+            same = False
+        if not same:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            return
+        with contextlib.suppress(OSError):
+            os.set_inheritable(fd, False)
+        self.first_fd = fd
 
     def reserve_path(self) -> Path | None:
         """This runner's capacity/<token>.reserve, or None when it reserves nothing (reserve())."""
@@ -6454,7 +6550,11 @@ class Gate:
                 now = time.monotonic()
                 self.busy_since = self.busy_since if self.busy_since is not None else now
                 if now - self.busy_since >= LISTEN_CLAIM_HANDOFF_S:
-                    self.unclaim()  # the job's admission holds its units by now, or waits for them in the open
+                    # the job's admission holds its units by now, or waits for them in the open. The SESSION_FIRST
+                    # lock stays through the job: a job still in setup has no admit.want marker yet, so letting it go
+                    # here could let a second session runner take a job onto this full mini. The idle look after the
+                    # job lets it go (session_look) when that is due.
+                    self.unclaim(keep_first=True)
                 self.load_since = None  # the hold limit times a pause, never a job
                 # the reserve stays held through the runner's own job: its admission lends it (RESERVE_LENT), so it
                 # keeps nothing while that job holds its units and is whole the moment they go back. One the job could
@@ -6573,6 +6673,7 @@ def listen(runner_dir: Path, host_lock: str, reservation: str, state_dir: Path, 
            adopt: int = 0, capacity_dir: Path | None = None, fit_units: int = 1) -> int:
     gate = Gate(runner_dir, host_lock, reservation, state_dir, waiters, capacity_dir, fit_units)
     gate.adopt_reserve(os.environ.pop(GATE_RESERVE_FD_ENV, None))
+    gate.adopt_session_first(os.environ.pop(GATE_SESSION_FIRST_FD_ENV, None))
     marker = os.environ.pop(GATE_LISTENER_ENV, None)
     xcode = runner_xcode(runner_dir)
     if adopt:
@@ -8309,7 +8410,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--session-runner", action="store_true",
                    help="this is one of the mini's session runners (only the session pool label, guiRunners above "
                         "1): its jobs need the logged-in session but no gui token or root, so the listener gate "
-                        "holds it only while units are short, a job here waits for units, or the console is locked")
+                        "holds it only while units are short (one session runner per mini listens anyway: "
+                        "SESSION_FIRST), a job here waits for units, or the console is locked")
     p.add_argument("--fast-runner", action="store_true",
                    help="this is the mini's fast runner (the fast pool label): a FAST_JOBS job here takes the fast "
                         "tokens instead of shared units, and the listener gate holds it while a fast token is taken")
@@ -8622,7 +8724,7 @@ def main(argv: list[str] | None = None) -> int:
                     if left <= 0:
                         break
                     wants = list(taken.get("wants") or [])
-                    write_want(marker, since, wants, tier)
+                    write_want(marker, since, wants, tier, SESSION_LANE if args.session_runner else "")
                     if note != shown or time.monotonic() - shown_at >= ADMIT_NOTE_S:
                         holders = ""
                         with contextlib.suppress(Exception):  # naming holders must never fail the wait
