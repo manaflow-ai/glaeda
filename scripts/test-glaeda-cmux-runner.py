@@ -7054,6 +7054,63 @@ class GateTest(unittest.TestCase):
         self.assertTrue(hook.claims_room(hook.RunnerScope(14, 2, 2, False, session=True)), "a session runner claims")
         self.assertFalse(hook.claims_room(hook.RunnerScope()), "no ledger, no claim")
 
+    def test_an_idle_claim_yields_to_the_other_labels(self) -> None:
+        # 2026-10-29, two std minis: the std and side gates logged 7,221 and 6,328 unit holds
+        # naming listening runners' claims, 6,377 and 5,442 of which would have fitted without them, while 281 and
+        # 298 jobs ran on all of each mini's runners. Each claim was stamped fresh whenever it was taken again, so a
+        # stopped gate waiting out GATE_RESTART_FREE_S, and an idle listener after any momentary hold, kept its
+        # units from the others for as long as it was idle.
+        capacity = self.units(5)  # 9 of 14 free: room for one 5-unit side job, not two
+        waiting, listening, other = (hook.Gate(self.side_runner(i), os.fspath(self.lock),
+                                               os.fspath(self.tmp / "none.json"), self.state, capacity_dir=capacity)
+                                     for i in (3, 4, 5))
+        # a gate that stopped its listener and is waiting out its free span claims nothing: no job can reach it
+        waiting.held, waiting.stopped_one, waiting.streak, waiting.free_since = "held", True, 1, time.monotonic()
+        self.assertIsNone(waiting.full())
+        self.assertIsNone(waiting.claim_fd, "a gate whose look does not start its listener holds no claim")
+        self.assertEqual(hook.listen_claims(capacity), 0)
+        # an idle listener past its first poll: nothing is queued for its label, so its claim keeps nothing
+        listening.child = mock.Mock(pid=1)
+        listening.listening_since = time.monotonic() - hook.GATE_FIRST_POLL_S - 1
+        self.assertIsNone(listening.full())
+        self.assertIsNotNone(listening.claim_fd)
+        self.assertEqual(hook.listen_claims(capacity), 0, "an idle listener's claim lapses with its first poll")
+        listening.unclaim()  # a momentary hold let it go
+        self.assertIsNone(listening.full())
+        self.assertEqual(hook.listen_claims(capacity), 0, "taking it again does not renew it")
+        self.assertIsNone(other.full(), "so the other labels' gates may listen")
+        other.unclaim()
+        # a job that just ended: the listener's next poll may carry the next job, so its claim counts again, also
+        # when the job was short enough that the gate kept its claim through it (LISTEN_CLAIM_HANDOFF_S)
+        self.assertIsNotNone(listening.claim_fd, "still held, stale")
+        listening.job_done_at = time.monotonic()
+        self.assertIsNone(listening.full())
+        self.assertEqual(hook.listen_claims(capacity), 5, "a held claim takes the job end's stamp")
+        listening.unclaim()
+        self.assertIsNone(listening.full())
+        self.assertEqual(hook.listen_claims(capacity), 5)
+        listening.unclaim()
+        # the look that starts the waiting gate's listener claims, fresh, so no other gate starts on the same room
+        waiting.free_since = time.monotonic() - hook.GATE_RESTART_FREE_S - 1
+        self.assertTrue(waiting.start_due())
+        waiting.reload = lambda: None
+        started = mock.Mock(pid=2, poll=mock.Mock(return_value=None))
+        with mock.patch.object(waiting, "start", side_effect=lambda: setattr(waiting, "child", started)), \
+                mock.patch.object(waiting, "shed", return_value=None), \
+                mock.patch.object(waiting, "locked", return_value=None), \
+                mock.patch.object(waiting, "hot", return_value=None), \
+                mock.patch.object(waiting, "low_disk", return_value=None), \
+                mock.patch.object(waiting, "ineligible", return_value=None), \
+                mock.patch.object(waiting, "registration_wait", return_value=False):
+            waiting.step()
+        self.assertIsNotNone(waiting.child, "the poll started the listener")
+        self.assertIsNotNone(waiting.claim_fd)
+        self.assertEqual(hook.listen_claims(capacity), 5)
+        self.assertEqual(other.full(), "only 9 of 14 capacity units on this mini are free; its next job needs 5 "
+                                       "and 5 are claimed by listening runners")
+        for gate in (waiting, listening, other):
+            gate.unclaim()
+
     def test_the_gate_looks_again_between_jobs_and_stops_the_listener_before_a_job_that_would_not_fit(self) -> None:
         capacity = self.units(0)
         runner = self.side_runner(3)
@@ -9204,23 +9261,28 @@ class GateTest(unittest.TestCase):
         gate.child = mock.Mock(pid=4321)
         gate.source = (0, 0, 0)
         gate.listening_since = time.monotonic() - 5.0
+        gate.job_done_at = time.monotonic() - 1.0  # a job that ended in the poll that reloads (claim_stamp)
         mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])
         self.addCleanup(signal.pthread_sigmask, signal.SIG_SETMASK, mask)
         self.addCleanup(os.environ.pop, hook.GATE_LISTENING_SINCE_ENV, None)
-        handed: list[str | None] = []
+        self.addCleanup(os.environ.pop, hook.GATE_JOB_DONE_AT_ENV, None)
+        handed: list[tuple[str | None, str | None]] = []
         with mock.patch.object(hook.os, "execv",
-                               side_effect=lambda *_: handed.append(os.environ.get(hook.GATE_LISTENING_SINCE_ENV))), \
+                               side_effect=lambda *_: handed.append((os.environ.get(hook.GATE_LISTENING_SINCE_ENV),
+                                                                     os.environ.get(hook.GATE_JOB_DONE_AT_ENV)))), \
                 mock.patch.object(hook.sys, "argv", [os.fspath(HOOK), "listen"]):
             gate.reload()
-        self.assertEqual(handed, [repr(gate.listening_since)])
-        seen: list[float | None] = []
+        self.assertEqual(handed, [(repr(gate.listening_since), repr(gate.job_done_at))])
+        seen: list[tuple[float | None, float | None]] = []
         def step(new: hook.Gate) -> int:
-            seen.append(new.listening_since)
+            seen.append((new.listening_since, new.job_done_at))
             return 0
         with mock.patch.object(hook.Gate, "step", step), mock.patch.object(hook, "Adopted", return_value=mock.Mock()):
             self.assertEqual(hook.listen(self.runner, os.fspath(self.lock), "", self.state, True, adopt=4321), 0)
-        self.assertEqual(seen, [gate.listening_since], "the adopted listener keeps its first poll")
+        self.assertEqual(seen, [(gate.listening_since, gate.job_done_at)],
+                         "the adopted listener keeps its first poll, and its claim its last job's end")
         self.assertNotIn(hook.GATE_LISTENING_SINCE_ENV, os.environ, "read once; run.sh's children never see it")
+        self.assertNotIn(hook.GATE_JOB_DONE_AT_ENV, os.environ)
 
     def test_an_ios_sim_or_session_runner_listens_only_with_room_for_its_costliest_job(self) -> None:
         self.assertNotIn("--fit-units", self.listen_sh(sys.executable).read_text())

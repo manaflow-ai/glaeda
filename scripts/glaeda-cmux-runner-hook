@@ -1207,6 +1207,7 @@ GATE_RESTART_FREE_S = float(os.environ.get("GLAEDA_RUNNER_GATE_RESTART_FREE_S") 
 # reload() hands the listener's start (time.monotonic, system-wide) to the re-executed gate here, not in argv, so a
 # rollback to a hook without it still accepts the exec.
 GATE_LISTENING_SINCE_ENV = "GLAEDA_RUNNER_GATE_LISTENING_SINCE"
+GATE_JOB_DONE_AT_ENV = "GLAEDA_RUNNER_GATE_JOB_DONE_AT"  # and when its last job ended (Gate.claim_stamp), the same way
 GATE_WATCH_S = 0.1  # while a job is below the disk floor, notice its Worker exit promptly
 GATE_WAITER_EVERY_S = 30.0
 # The yield to a fleet build waiting for the host lock is bounded (policy, declared here; env overrides it). A waiter
@@ -4783,6 +4784,15 @@ def side_fit_units(scope: RunnerScope) -> int:
 # fresh (the listener's first poll, GATE_FIRST_POLL_S): a queued job reaches a new listener on
 # that poll, and a listener idle past it has no job waiting for its label, so its claim must not keep the mini's other
 # labels from listening (a std mini's two idle root listeners would otherwise hold 10 of 14 units from the side label).
+# That freshness is anchored on the listener, not on the claim (Gate.claim_stamp): a claim is taken only on the look
+# that starts the listener (Gate.start_due) or while it listens, and it is stamped with when the listener started or
+# last finished a job. Stamped at each claim instead, it was renewed every time a gate let its claim go and took it
+# again: a stopped gate waiting out GATE_RESTART_FREE_S, whose free span a CPU or units hold kept resetting, claimed
+# afresh on every free look without ever listening, and an idle listener re-claimed after each momentary hold. On
+# 2026-10-29 the std and side gates of two std minis logged 7,221 and 6,328 unit holds that
+# named such claims, 6,377 and 5,442 of which the free units would have fitted without them, while only 281 and 298
+# jobs ran on all of each mini's runners. A claim now reserves units only through the one poll in which a job queued
+# for its label reaches the listener; past it, nothing is queued there and the claim yields to the other labels.
 LISTEN_LOCK = "listen.lock"
 # SESSION_FIRST: priority admission for the session label (cmux-next daemon tests, generated files, action exports).
 # Its runners listened only with room for their costliest job (6 units) that the side runners' listen claims had not
@@ -5649,6 +5659,7 @@ class Gate:
         self.first_fd: int | None = None  # SESSION_FIRST_LOCK while this session runner listens without room
         self.claim_at: Path | None = None
         self.busy_since: float | None = None  # when the runner's current job was first seen (LISTEN_CLAIM_HANDOFF_S)
+        self.job_done_at: float | None = None  # when the runner's last job ended (claim_stamp), monotonic
         self.job_ending = False  # job-completed left JOB_ENDING: look again the moment the Worker exits
         self.child: subprocess.Popen[bytes] | None = None
         self.stop_deadline: float | None = None  # set while a stop the gate asked for is under way
@@ -5742,6 +5753,8 @@ class Gate:
             return
         if self.listening_since is not None:
             os.environ[GATE_LISTENING_SINCE_ENV] = repr(self.listening_since)
+        if self.job_done_at is not None:
+            os.environ[GATE_JOB_DONE_AT_ENV] = repr(self.job_done_at)
         if self.eligible_why:
             os.environ[GATE_INELIGIBLE_ENV] = self.eligible_why
         if self.child is not None:
@@ -5758,6 +5771,7 @@ class Gate:
             os.execv(sys.executable, [sys.executable, *argv])
         except OSError:
             os.environ.pop(GATE_LISTENING_SINCE_ENV, None)
+            os.environ.pop(GATE_JOB_DONE_AT_ENV, None)
             os.environ.pop(GATE_INELIGIBLE_ENV, None)
             os.environ.pop(GATE_LISTENER_ENV, None)
             os.environ.pop(GATE_RESERVE_FD_ENV, None)
@@ -6140,7 +6154,9 @@ class Gate:
             fcntl.flock(lock, fcntl.LOCK_EX)  # held for one look; every holder only probes and opens files
             own = claim_path(self.capacity_dir, self.runner_dir, need)
             why = mini_full(self.capacity_dir, scope.units, scope, fit, listen_claims(self.capacity_dir, own))
-            if why is None:
+            if why is None and self.child is None and not self.start_due():
+                self.unclaim()  # not listening, and this look does not start it: no job can reach it to claim for
+            elif why is None:
                 self.claim(own)
             elif not isinstance(why, Unknown):
                 self.unclaim()
@@ -6170,9 +6186,37 @@ class Gate:
             self.unclaim()
         return why
 
+    def start_due(self) -> bool:
+        """Whether a free look now has poll() start the listener in the same poll: the gate has never held it, or
+        this look completes GATE_CONFIRM free polls and, after a stop, a whole GATE_RESTART_FREE_S free span. It must
+        agree with poll()'s own steps, which run right after the look."""
+        if self.held is None:
+            return True
+        if self.streak + 1 < GATE_CONFIRM:
+            return False
+        return not self.stopped_one or (self.free_since is not None
+                                        and time.monotonic() - self.free_since >= GATE_RESTART_FREE_S)
+
+    def claim_stamp(self) -> float:
+        """The wall-clock time a listen claim counts from (LISTEN_CLAIM): now for a gate about to start its listener;
+        for a listening one, when its listener started or last finished a job, the moments a job queued for its label
+        reaches it. So an idle listener's claim lapses GATE_FIRST_POLL_S after either, however often it is let go and
+        taken again."""
+        now = time.monotonic()
+        marks = [m for m in (self.listening_since, self.job_done_at) if m is not None]
+        since = now if self.child is None or not marks else min(max(marks), now)
+        return time.time() - (now - since)
+
     def claim(self, path: Path) -> None:
-        """Hold this gate's listen claim at path (letting go of one for another need). Never raises."""
+        """Hold this gate's listen claim at path (letting go of one for another need), stamped from claim_stamp. A
+        claim already held keeps its file but takes a newer stamp: a job short enough to end before
+        LISTEN_CLAIM_HANDOFF_S keeps its claim through the job, and the listener's next poll after it counts from the
+        job's end. Never raises."""
         if self.claim_fd is not None and self.claim_at == path:
+            stamp = self.claim_stamp()
+            with contextlib.suppress(OSError):
+                if stamp > path.stat().st_mtime:  # only ever forward: an idle claim is never renewed
+                    os.utime(path, (stamp, stamp))
             return
         self.unclaim()
         with contextlib.suppress(OSError):
@@ -6180,7 +6224,8 @@ class Gate:
             if fd is not None:
                 self.claim_fd, self.claim_at = fd, path  # stored first: unclaim() always closes it
                 os.set_inheritable(fd, False)
-                os.utime(path)  # fresh from now (GATE_FIRST_POLL_S)
+                stamp = self.claim_stamp()
+                os.utime(path, (stamp, stamp))  # fresh for GATE_FIRST_POLL_S from the listener's own mark
 
     def unclaim(self, keep_first: bool = False) -> None:
         """Let go of this gate's listen claim and, unless keep_first, a session runner's SESSION_FIRST_LOCK. Never
@@ -6201,6 +6246,7 @@ class Gate:
         """The runner's job just ended (JOB_ENDING): a fresh look at the mini, which job-completed already gave the
         job's units back to. Why the listener should not take the next job, or None. Never raises."""
         self.job_ending = False
+        self.job_done_at = time.monotonic()  # the listener's next poll may carry the next job (claim_stamp)
         with contextlib.suppress(OSError):
             self.job_end_marker().unlink()
         try:
@@ -6588,6 +6634,8 @@ class Gate:
                     # back, read from nothing but the job itself, so no state is lost across a reload
                     self.reserve(True)
                 return None
+            if self.busy_since is not None:
+                self.job_done_at = time.monotonic()  # a job ended: the next poll is a first one (claim_stamp)
             self.busy_since = None
             if self.job_ending or self.job_end_marker().exists():
                 # a job that ended between two polls, before the gate saw its marker: the same look (job_end)
@@ -6706,10 +6754,13 @@ def listen(runner_dir: Path, host_lock: str, reservation: str, state_dir: Path, 
         gate.started_wall = time.time()
         with contextlib.suppress(ValueError):  # the adopted listener keeps its first poll (GATE_FIRST_POLL_S)
             gate.listening_since = float(os.environ.get(GATE_LISTENING_SINCE_ENV, ""))
+        with contextlib.suppress(ValueError):  # and its claim still counts from its last job's end (claim_stamp)
+            gate.job_done_at = float(os.environ.get(GATE_JOB_DONE_AT_ENV, ""))
         gate.stale_env = adopted_env_stale(marker, os.environ, xcode)
         if gate.stale_env:
             gate_log(f"the adopted listener's env is stale ({gate.stale_env}); restarting it once it is idle")
     os.environ.pop(GATE_LISTENING_SINCE_ENV, None)
+    os.environ.pop(GATE_JOB_DONE_AT_ENV, None)
     # The gate's own env too (the /usr/bin/python3 shim exports SDKROOT): its eligibility probes see the job's env.
     clean = listener_env(os.environ, xcode)
     os.environ.clear()
