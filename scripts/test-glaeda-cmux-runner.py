@@ -13590,6 +13590,39 @@ class JobTelemetryTest(unittest.TestCase):
         self.assertEqual(result["cache_backend"], "fleet")
         self.assertFalse(telemetry.exists())
 
+    def test_warm_start_receipt_is_copied_when_it_is_this_jobs(self) -> None:
+        receipt = self.dir / self.hook.WARM_START_FILE
+        payload = {"schema": self.hook.WARM_START_SCHEMA, "run_id": "42", "run_attempt": "1",
+                   "source": "spm_scratch", "state": "cold", "bytes": 0, "reason": "evicted", "extra": "dropped"}
+        receipt.write_text(json.dumps(payload))
+        with mock.patch.dict(self.hook.os.environ, {"RUNNER_TEMP": str(self.dir)}, clear=False):
+            result = self.hook.warm_start_receipt({"run_id": "42", "run_attempt": "1"})
+        self.assertEqual(result, {"schema": self.hook.WARM_START_SCHEMA, "source": "spm_scratch", "state": "cold",
+                                  "bytes": 0, "reason": "evicted"})
+        self.assertFalse(receipt.exists())
+        for bad in ({"run_id": "43"}, {"state": "lukewarm"}, {"bytes": -1}, {"bytes": True}, {"source": ""},
+                    {"schema": "other/v1"}):
+            receipt.write_text(json.dumps({**payload, **bad}))
+            with mock.patch.dict(self.hook.os.environ, {"RUNNER_TEMP": str(self.dir)}, clear=False):
+                self.assertIsNone(self.hook.warm_start_receipt({"run_id": "42", "run_attempt": "1"}), bad)
+            self.assertFalse(receipt.exists())
+        receipt.write_text(" " * (self.hook.WARM_START_MAX_BYTES + 1))
+        with mock.patch.dict(self.hook.os.environ, {"RUNNER_TEMP": str(self.dir)}, clear=False):
+            self.assertIsNone(self.hook.warm_start_receipt({"run_id": "42", "run_attempt": "1"}))
+        # a job controls the file: a FIFO never blocks the sampler, and a symlink is never followed (only it goes)
+        receipt.unlink(missing_ok=True)
+        os.mkfifo(receipt)
+        with mock.patch.dict(self.hook.os.environ, {"RUNNER_TEMP": str(self.dir)}, clear=False):
+            self.assertIsNone(self.hook.warm_start_receipt({"run_id": "42", "run_attempt": "1"}))
+        self.assertFalse(receipt.exists())
+        target = self.dir / "elsewhere.json"
+        target.write_text(json.dumps(payload))
+        receipt.symlink_to(target)
+        with mock.patch.dict(self.hook.os.environ, {"RUNNER_TEMP": str(self.dir)}, clear=False):
+            self.assertIsNone(self.hook.warm_start_receipt({"run_id": "42", "run_attempt": "1"}))
+        self.assertFalse(receipt.is_symlink())
+        self.assertTrue(target.exists())
+
     def test_completed_record_accepts_legacy_v1_telemetry(self) -> None:
         telemetry = self.dir / self.hook.COMPILE_TELEMETRY_FILE
         telemetry.write_text(json.dumps({
