@@ -653,6 +653,42 @@ class HookTest(unittest.TestCase):
                 with self.subTest(key=key, job=args["job"]):
                     self.assertEqual(hook.job_tier(**{**args, "event": {**args["event"], key: {"number": 1}}}), "")
 
+    def test_mains_nightly_verify_jobs_are_nightly_jobs(self) -> None:
+        """The post-publication canary and the launch smoke verify the nightly feed: from main's own copy, on its
+        schedule, they rank as nightly jobs and the nightly slot admits them, as isolated jobs whose wait is bounded.
+        A dispatch, a pull request's copy, another branch's, a push, or a payload that carries a pull request never
+        does."""
+        for name, job in (("nightly-next-canary.yml", "canary"), ("nightly-next-launch-smoke.yml", "smoke")):
+            args = {"event_name": "schedule", "ref": "refs/heads/main", "repository": "manaflow-ai/cmux",
+                    "event": {"repository": CMUX, "schedule": "3 * * * *"},
+                    "workflow_ref": f"manaflow-ai/cmux/.github/workflows/{name}@refs/heads/main", "job": job}
+            with self.subTest(name=name):
+                self.assertEqual(hook.job_tier(**args), hook.TIER_NIGHTLY)
+                self.assertIsNone(hook.nightly_slot_refusal(hook.job_tier(**args)))
+                # a dispatch may name its own build and harness: the ordinary tier (review of #1747)
+                self.assertEqual(hook.job_tier(**{**args, "event_name": "workflow_dispatch",
+                                                  "event": {"repository": CMUX, "inputs": {"build": ""}}}), "")
+                # first in line, it holds every other gate on its mini: bounded on every attempt, then refused
+                for attempt in ("1", "2"):
+                    self.assertEqual(hook.nightly_capacity_wait(hook.TIER_NIGHTLY, "schedule", "refs/heads/main", job,
+                                                                name, attempt), hook.NIGHTLY_CAPACITY_WAIT_S)
+                self.assertIsNone(hook.nightly_capacity_wait("", "workflow_dispatch", "refs/heads/main", job, name, "1"))
+                self.assertEqual(hook.job_class(job, "manaflow-ai/cmux", workflow=name), ("isolated", False))
+            for overrides in (
+                    {"event_name": "pull_request"}, {"event_name": "push", "event": {"ref": "refs/heads/main",
+                                                                                      "repository": CMUX}},
+                    {"ref": "refs/pull/1/merge"}, {"ref": "refs/heads/feat-cmux-next"},
+                    {"workflow_ref": f"manaflow-ai/cmux/.github/workflows/{name}@refs/pull/1/merge"},
+                    {"workflow_ref": f"manaflow-ai/cmux/.github/workflows/{name}@refs/heads/feat-cmux-next"},
+                    {"workflow_ref": f"other/cmux/.github/workflows/{name}@refs/heads/main"},
+                    {"repository": "other/cmux"}, {"job": ""}):
+                with self.subTest(name=name, overrides=overrides):
+                    self.assertEqual(hook.job_tier(**{**args, **overrides}), "")
+            for key in hook.UNTRUSTED_PAYLOAD_KEYS:
+                with self.subTest(name=name, key=key):
+                    self.assertEqual(hook.job_tier(**{**args, "event": {**args["event"], key: {"number": 1}}}), "")
+        self.assertIn("canary and launch smoke", hook.nightly_slot_refusal(""))
+
     def test_dev_compile_instance_gate_leaves_ordinary_admission_unchanged(self) -> None:
         self.fleet()
         push = event(self.dir, "dev-push", {"repository": CMUX, "ref": "refs/heads/feat-cmux-next"})

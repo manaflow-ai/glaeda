@@ -399,6 +399,11 @@ WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "
                         # persistent-dd and a root), so a nightly verify first in line (FEED_FIRST) still waited for
                         # a PR compile's persistent-dd and root, which it never uses. generate-nightly-deltas runs
                         # Sparkle's BinaryDelta over whole apps: isolated.
+                        # main's post-publication canary and launch smoke (NIGHTLY_VERIFY_WORKFLOWS) download a published
+                        # DMG and run the app in it from $RUNNER_TEMP with its own HOME: no compile, canonical root or
+                        # kept DerivedData. As unknown jobs they were compiles (5 units, persistent-dd and a root).
+                        ("nightly-next-canary.yml", "canary"): "isolated",
+                        ("nightly-next-launch-smoke.yml", "smoke"): "isolated",
                         ("nightly.yml", "verify-signed-nightly"): "light",
                         ("nightly.yml", "verify-final-dmg-nightly"): "light",
                         # nightly-next's Linux signer path: its one Mac job builds the DMG from the signed app with
@@ -721,8 +726,13 @@ def exclusive_capacity_wait(tier: str, nightly_runner: bool) -> float:
 def nightly_capacity_wait(tier: str, event_name: str | None, ref: str | None, job: str | None, workflow: str,
                           attempt: str | None) -> float | None:
     """NIGHTLY_CAPACITY_WAIT_S for NEXT's nightly app build on a nightly-next push's attempt 1 (the push the owned-pool
-    rescue re-runs, onto Blacksmith), else None. `tier` is job_tier()'s answer, so only merged nightly.yml code on
+    rescue re-runs, onto Blacksmith), and for main's scheduled canary and launch smoke on any attempt, else None. `tier` is job_tier()'s answer, so only merged nightly.yml code on
     nightly-next's own ref qualifies; a dispatch or schedule there, which the rescue does not watch, keeps its wait."""
+    if tier == TIER_NIGHTLY and workflow in NIGHTLY_VERIFY_WORKFLOWS:
+        # main's canary and launch smoke (NIGHTLY_VERIFY_WORKFLOWS) hold every other gate on the mini while they wait
+        # first in line, so they wait NIGHTLY_CAPACITY_WAIT_S at most on any attempt; cmux's owned-pool rescue re-runs a
+        # refused one (a side lane), and the re-run takes the picker's moving Blacksmith label (review of #1747).
+        return NIGHTLY_CAPACITY_WAIT_S
     if (tier != TIER_NIGHTLY or event_name != "push" or ref != NIGHTLY_NEXT_REF or job != NIGHTLY_APP_JOB
             or workflow != "nightly.yml"):
         return None
@@ -1449,6 +1459,16 @@ NIGHTLY_REFS = ("refs/heads/nightly-next", "refs/heads/main")
 NIGHTLY_EVENTS = ("push", "schedule", "workflow_dispatch")
 NIGHTLY_WORKFLOW = "manaflow-ai/cmux/.github/workflows/nightly.yml"
 DEV_DAILY_WORKFLOW_PATH = f"manaflow-ai/cmux/.github/workflows/{DEV_DAILY_WORKFLOW}"
+# The nightly verify jobs that run after a nightly-next build is published: the post-publication canary and the launch
+# smoke, scheduled from main's own copy of their workflows. They verify the nightly feed, so they rank
+# with nightly jobs and the nightly slot admits them (Leo, 2026-10-27: "a waiting nightly, promote or nightly
+# sign/verify job is admitted on a mini ahead of every PR, DEV and side job"). On 2026-10-29 the canary of build
+# 4095550219401 (cmux run 40959228667) sat queued on the side label from 21:46Z behind 43 PR jobs with no side runner
+# running, while the nightly slots listened idle.
+NIGHTLY_VERIFY_WORKFLOWS = ("nightly-next-canary.yml", "nightly-next-launch-smoke.yml")
+NIGHTLY_VERIFY_REF = "refs/heads/main"
+# Only the schedule: a dispatch may pick its own build and harness, so it keeps the ordinary tier (review of #1747).
+NIGHTLY_VERIFY_EVENTS = ("schedule",)
 PROMOTE_COMPILE = "release-compile"  # cmux-next.yml's, on a feat-cmux-next push: nightly-next's promote gate
 TIER_NIGHTLY, TIER_DEV, TIER_STACK = "nightly", "dev", "stack"
 FEED_JUMP_S = 20 * 60.0
@@ -1486,7 +1506,7 @@ def nightly_slot_refusal(tier: str) -> str | None:
     if tier == TIER_NIGHTLY:
         return None
     return ("the nightly slot admits only nightly jobs (nightly.yml on nightly-next or main, main's DEV daily publish, "
-            "and the Release compile that gates nightly-next's promotion)")
+            "main's nightly-next canary and launch smoke, and the Release compile that gates nightly-next's promotion)")
 
 
 def job_tier(event_name: str | None, ref: str | None, repository: str | None, event: Any,
@@ -1503,6 +1523,10 @@ def job_tier(event_name: str | None, ref: str | None, repository: str | None, ev
         return ""
     if workflow_ref == f"{DEV_DAILY_WORKFLOW_PATH}@{DEV_DAILY_REF}":
         return TIER_NIGHTLY if dev_daily_feed(event_name, ref) else ""
+    if any(workflow_ref == f"manaflow-ai/cmux/.github/workflows/{name}@{NIGHTLY_VERIFY_REF}"
+           for name in NIGHTLY_VERIFY_WORKFLOWS):
+        # main's merged copy, on main's own ref, from its schedule: never a pull request's copy or a dispatch
+        return TIER_NIGHTLY if ref == NIGHTLY_VERIFY_REF and event_name in NIGHTLY_VERIFY_EVENTS else ""
     if ref not in NIGHTLY_REFS or workflow_ref != f"{NIGHTLY_WORKFLOW}@{ref}":
         return ""
     if event_name == "push" and event.get("ref") != ref:
