@@ -1198,19 +1198,50 @@ class MiniSetupTest(unittest.TestCase):
     def test_git_below_2_55_is_installed_with_our_brew_or_handed_to_the_operator(self) -> None:
         ctx = ms.Context(self.home, False, "/usr/bin/python3", True, self.reclaim, None, None,
                          ms.CMUX_XCODE_APP, 50, hygiene_only=True)
-        with mock.patch.object(ms, "newest_git", lambda: ("/usr/bin/git", (2, 55, 0))):
+        with mock.patch.object(ms, "probe_gits", lambda: ("/usr/bin/git", (2, 55, 0), [])):
             self.assertEqual(ms.plan_git(ctx)["state"], "unchanged")
-        old = lambda: ("/usr/bin/git", (2, 50, 1))
-        with mock.patch.object(ms, "newest_git", old), mock.patch.object(ms, "owned_brew", lambda: "/opt/homebrew/bin/brew"):
+        old = lambda: ("/usr/bin/git", (2, 50, 1), [])
+        with mock.patch.object(ms, "probe_gits", old), mock.patch.object(ms, "owned_brew", lambda: "/opt/homebrew/bin/brew"):
             self.assertEqual(ms.plan_git(ctx)["state"], "blocked")  # sandbox HOME never runs brew
             ctx.sandbox = False
             act = ms.plan_git(ctx)
             self.assertEqual((act["state"], act["brew"]), ("create", "/opt/homebrew/bin/brew"))
-        with mock.patch.object(ms, "newest_git", old), mock.patch.object(ms, "owned_brew", lambda: None):
+        with mock.patch.object(ms, "probe_gits", old), mock.patch.object(ms, "owned_brew", lambda: None):
             self.assertIn("Homebrew owner", ms.plan_git(ctx)["note"])
             linux = ms.Context(self.home, False, "/usr/bin/python3", True, self.reclaim, None, None,
                                ms.CMUX_XCODE_APP, 50, hygiene_only=True, platform_name="linux")
             self.assertIn("ppa:git-core/ppa", ms.plan_git(linux)["note"])
+
+    def test_a_git_too_slow_to_answer_is_never_reinstalled(self) -> None:
+        """cmux9s at load 100-200: Homebrew's git 2.55 missed the version probe's deadline, /usr/bin/git 2.50.1
+        answered, and setup ran brew install git, which timed out at 600 s inside the update agent and the
+        release update rolled back (2026-10-30). A git that is there is never reinstalled for a slow answer;
+        a git that fails or prints no version is not a slow answer and never holds an upgrade back."""
+        ctx = ms.Context(self.home, False, "/usr/bin/python3", True, self.reclaim, None, None,
+                         ms.CMUX_XCODE_APP, 50, hygiene_only=True)
+        ctx.sandbox = False
+        answers = {"/opt/homebrew/bin/git": "slow", "/usr/local/bin/git": "broken", "/usr/bin/git": "git version 2.50.1"}
+
+        def fake_subprocess_run(argv, **kwargs):
+            answer = answers[argv[0]]
+            if answer == "slow":
+                raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+            return subprocess.CompletedProcess(argv, 1 if answer == "broken" else 0, answer, None)
+
+        def plan() -> dict:
+            with mock.patch.object(ms, "GIT_CANDIDATES", tuple(answers)), \
+                    mock.patch.object(ms.shutil, "which", lambda name: None), \
+                    mock.patch.object(ms.os, "access", lambda path, mode: path in answers), \
+                    mock.patch.object(ms.subprocess, "run", fake_subprocess_run), \
+                    mock.patch.object(ms, "owned_brew", lambda: "/opt/homebrew/bin/brew"):
+                return ms.plan_git(ctx)
+
+        act = plan()
+        self.assertEqual((act["state"], act["value"]), ("skipped", "/opt/homebrew/bin/git"))
+        self.assertIn("did not answer", act["note"])
+        answers["/opt/homebrew/bin/git"] = "broken"  # every git answered, one broken and one old: install
+        act = plan()
+        self.assertEqual((act["state"], act["value"]), ("create", "/usr/bin/git 2.50.1"))
 
     def test_brew_git_apply_upgrades_an_outdated_keg(self) -> None:
         ctx = ms.Context(self.home, True, "/usr/bin/python3", True, self.reclaim, None, None,
