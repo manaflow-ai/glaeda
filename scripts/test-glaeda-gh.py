@@ -2553,6 +2553,7 @@ class ClientTest(Base):
 
     def test_field_prints_just_those_values(self) -> None:
         red = [check_run("lint", conclusion="FAILURE"), check_run("test", conclusion="FAILURE"), check_run("ok")]
+        red[0]["checkSuite"] = {"workflowRun": {"databaseId": 5, "workflow": {"databaseId": 1, "name": "CI"}}}
         self.put("pr:o/r#1", gg.parse_pr(pr_node(1, rollup="FAILURE", checks=red)))
         self.put("pr:o/r#2", gg.parse_pr(pr_node(2, state="MERGED", rollup="SUCCESS", checks=[check_run("ok")])))
         fields = gg.parse_fields("head,checks.failed")
@@ -2569,6 +2570,11 @@ class ClientTest(Base):
             self.status("pr", "o/r#1", False, False, fields=["hed"])
         with self.assertRaisesRegex(gg.WatchError, r"no 'red' at checks; valid keys there: failed, held, passed"):
             self.status("pr", "o/r#1", False, False, fields=["checks.red"])
+        # a PR with no data yet refuses the typo too, rather than printing an empty column
+        with self.assertRaisesRegex(gg.WatchError, r"no 'hed' at the top level; valid keys there: .*\bhead\b"):
+            self.status("pr", ["o/r#1", "9"], False, False, fields=["head", "hed"])
+        self.assertEqual(self.status("pr", "o/r#9", False, False, fields=["head", "checks.failed", "mergeable"]),
+                         (1, "\t\t\n"))
         for bad in ("", "head,", "checks..failed"):
             with self.subTest(bad=bad), self.assertRaises(gg.WatchError):
                 gg.parse_fields(bad)

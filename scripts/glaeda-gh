@@ -4157,13 +4157,13 @@ def field_value(view: dict, path: str) -> Any:
 
 
 def field_text(value: Any) -> str:
-    """A list prints comma-joined, a check (any object with a name) as its name; other objects as JSON."""
+    """A list prints comma-joined, a check (any object with a name) as its name alone; other objects as JSON."""
     if value is None:
         return ""
     if isinstance(value, bool):
         return str(value).lower()
     if isinstance(value, list):
-        return ",".join(label(v) if isinstance(v, dict) and "name" in v else field_text(v) for v in value)
+        return ",".join(str(v.get("name")) if isinstance(v, dict) and "name" in v else field_text(v) for v in value)
     if isinstance(value, dict):
         return json.dumps(value, sort_keys=True)
     return str(value).replace("\t", " ").replace("\n", " ")
@@ -4176,6 +4176,12 @@ def render_fields(keys: list[str], entries: dict[str, dict | None], fields: list
     for key in keys:
         has = bool((entries.get(key) or {}).get("data"))
         view = status_view(key, entries.get(key))
+        if not has and split_key(key)[0] == "pr":
+            # no data yet: check the names against the shape every PR has, so a typo is refused now
+            # rather than printing an empty column until the first read lands
+            shape = status_view(key, {"data": parse_pr({"state": "OPEN"})})
+            for f in fields:
+                field_value(shape, f)
         values = [field_text(field_value(view, f)) if has else "" for f in fields]
         if len(keys) > 1:
             kind, owner, repo, number = split_key(key)
