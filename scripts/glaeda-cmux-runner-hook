@@ -497,10 +497,18 @@ EXCLUSIVE_CAPACITY_WAIT_S = 300.0  # NIGHTLY_CAPACITY_WAIT_S: the same owned-poo
 # mini while it waits: no new PR or side job starts there, the running ones finish, and the job then takes the whole
 # mini. It waits SIGNING_DRAIN_WAIT_S at most, then is refused, and the run's Blacksmith twin signs (cmux's claim
 # gate). The hold is the job's own admit.want marker: it goes when the job is admitted, refused or cancelled, and a
-# killed job's goes with its pid (admission_waiters), so it never strands the mini. 10 minutes: a PR compile on a
-# mini runs about 7, and it stays under cmux's owned-pool rescue's SETUP_WAIT_SECONDS (15 min), so the rescue never
-# cancels the nightly run for this wait; any other signing job keeps EXCLUSIVE_CAPACITY_WAIT_S.
-SIGNING_DRAIN_WAIT_S = 600.0
+# killed job's goes with its pid (admission_waiters), so it never strands the mini. Any other signing job keeps
+# EXCLUSIVE_CAPACITY_WAIT_S.
+# SIGNING_DRAIN_OUTLASTS_RUNNING_JOBS: since nothing new starts on the mini while the job waits, the drain ends when
+# the longest job already running there ends, so the bound must outlast a whole job, not a compile. At 10 minutes it
+# did not: from 2026-10-29 to 10-31 every one of 23 capacity refusals of sign-nightly-identity-legacy on cmux12s and
+# cmux13s waited the full 600 s with no job admitted meanwhile, behind a PR job that started before the drain (on 21
+# of them a cmux-next swift-test, p50 1962 s and p90 2368 s on those minis), which ended 1 to 43 minutes after the
+# refusal. The bound is now an hour: the longest job those minis ran in that window took 3203 s (n 1035, p99 2410 s).
+# cmux's owned-pool rescue never judges this job (owned_pool_rescue.nightly_watched watches only build-nightly-app
+# and trusted-pool jobs of a nightly run; this job runs on the nightly slot's label), so the wait cancels nothing, and
+# it fits in the job's timeout-minutes (160) with its signing and Apple's 20 min notarization wait.
+SIGNING_DRAIN_WAIT_S = 3600.0
 JOB_CLAIM_ENV = "GLAEDA_JOB_CLAIM"
 # The sha256 of this hook file, written beside JOB_CLAIM_ENV: a job that holds the whole mini can tell which hook
 # admitted it (cmux's signing jobs accept only hooks that wait out an earlier job's leftover processes).
@@ -1285,11 +1293,23 @@ GATE_WAITER_WAIVE_S = float(os.environ.get("GLAEDA_RUNNER_GATE_WAITER_WAIVE_S") 
 GATE_WAITER_GAP_S = 10 * 60.0
 WAITER_SPANS_FILE = "fleet-waiter-spans.json"  # in the state dir, shared by every runner's gate and job-started
 # Nightly jobs come first on the fleet (Leo, 2026-10-27): a nightly-tier job is admitted ahead of a waiting fleet build
-# (take_capacity), but only when it holds its capacity at once, never by waiting in admission (a lend drain waits
-# for Runner.Worker to exit), and at most NIGHTLY_WAITER_PASSES times per waiter, so a stream of nightly jobs cannot
-# keep one fleet build out for good. The count lives in the state dir, keyed by the waiter's pid and process start.
+# (take_capacity), and each such admission counts against NIGHTLY_WAITER_PASSES per waiter, which the nightly slot's
+# gate reads (nightly_pass_left): once a waiter's passes are spent, that gate holds its listener for the waiter too,
+# so a stream of nightly jobs cannot keep one fleet build out for good. The count lives in the state dir, keyed by
+# the waiter's pid and process start.
+# HANDED_JOBS_NEVER_FAIL_FOR_A_WAITER: keeping new work off a mini whose host a fleet build waits for is the gates'
+# job (they stop the idle listeners). job-started does not refuse a job GitHub already handed this mini for that
+# waiter, since a refusal there fails the job red ("a fleet build is waiting for the host (pid 15148)": cmux run
+# 41150189497's swift-test, cmux#28544, ran no test). GitHub never moves a started job to another runner, so the job
+# is admitted here, waiting for its units like any capacity wait, and the build gets the host when the job ends; a
+# lend drain or a reserved worker waits for Runner.Worker to exit anyway, and the job never waits for the build, so
+# neither waits for the other. A nightly signing job draining the mini (SIGNING_DRAIN) is such a job too: it used to
+# be refused at once when it could not take the whole mini on its first look (cmux13s, 2026-10-31 03:05Z: three
+# sign-nightly-identity-legacy jobs in 30 s). A ci-step (step_admit) is still refused: the build worker leases it
+# elsewhere, and no job fails.
 NIGHTLY_PASSES_FILE = "fleet-waiter-nightly-passes.json"
 NIGHTLY_WAITER_PASSES = 3
+NIGHTLY_PASS_NOTED: set[int] = set()  # the waiters this process has logged a nightly pass of
 # job-started touches this in the mini's state dir when it refuses a job for a fleet build waiting for the host. Every
 # gate on the mini reads the host's waiters at its next poll instead of after GATE_WAITER_EVERY_S, so no listener takes
 # another job only to refuse it (2026-10-27, cmux-austin-mini-0: a job refused at 17:48:12 after 766 s in the capacity
@@ -4300,6 +4320,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         if klass == "gui-step":  # and the gui token, which its step takes before that root (take-gui)
             tokens = tuple(t for t in tokens if t != gui_token)
     passed: int | None = None  # the fleet waiter a nightly job is being admitted ahead of
+    handed_past: int | None = None  # a fleet waiter a handed job is admitted beside (HANDED_JOBS_NEVER_FAIL_FOR_A_WAITER)
 
     def refused(note: str) -> tuple[bool, str]:
         """A refusal; a nightly job admitted ahead of a waiter that cannot hold its capacity at once is refused for
@@ -4308,6 +4329,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         if passed is None:
             return False, note
         nightly_pass(state_dir, passed, -1)
+        if new_job:  # a handed job waits for its capacity like any other (HANDED_JOBS_NEVER_FAIL_FOR_A_WAITER)
+            return False, note
         return False, f"{WAITER_REFUSAL} (pid {passed})"
 
     # pinned: home-repo workflows the hook does not know use /private/tmp/cmux-ci itself
@@ -4379,13 +4402,20 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                 # refused for pid 70108 on cmux12's nightly slot; run 40623850717's signer-dmg-image the same way on
                 # cmux12s). A nightly compile on a side runner still yields, and NIGHTLY_WAITER_PASSES bounds how
                 # often one waiter is passed.
-                print(f"{PREFIX}: a fleet build is waiting for the host (pid {waiting[0]}); a nightly job goes "
-                      "first, the build gets the host when it ends", flush=True)
+                if waiting[0] not in NIGHTLY_PASS_NOTED:  # once per waiter: a handed job's capacity wait retries
+                    NIGHTLY_PASS_NOTED.add(waiting[0])
+                    print(f"{PREFIX}: a fleet build is waiting for the host (pid {waiting[0]}); a nightly job goes "
+                          "first, the build gets the host when it ends", flush=True)
                 passed = waiting[0]
-            elif waiting:  # flock has no writer preference: stop admitting so the build worker gets in
-                # This must not be a retryable capacity refusal: a draining fleet
-                # worker waits for our parent Runner.Worker to exit before claiming.
+            elif waiting and not new_job:  # flock has no writer preference: stop admitting so the build worker gets in
+                # A ci-step: not a retryable capacity refusal (a draining fleet worker waits for our parent
+                # Runner.Worker to exit before claiming); the build worker leases the step elsewhere.
                 return False, f"{WAITER_REFUSAL} (pid {waiting[0]})"
+            elif waiting:
+                # HANDED_JOBS_NEVER_FAIL_FOR_A_WAITER: a job GitHub already handed this runner is not refused for the
+                # waiter (a refusal fails it red); it takes its units like any job, and the build gets the host when
+                # it ends. The gates keep new jobs off the mini meanwhile.
+                handed_past = waiting[0]
         taken: list[str] = []
         named: dict[str, int] = {}
         warm_for = warm_note = ""
@@ -4503,6 +4533,9 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
             nightly_pass(state_dir, passed, -1)
         if held and passed is not None:
             note += f"; a nightly job, admitted ahead of the fleet build waiting for the host (pid {passed})"
+        elif held and handed_past is not None:
+            note += (f"; admitted though a fleet build waits for the host (pid {handed_past}): GitHub handed this job "
+                     "here, so it runs, and the build gets the host when it ends")
         if held and taken_out is not None:
             taken_out.update(units=units, units_total=total, tokens=list(taken), **{"class": klass})
         if held and gui_token in taken:

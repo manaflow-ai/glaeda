@@ -2225,8 +2225,11 @@ class HookTest(unittest.TestCase):
             with self.subTest(tier=tier, slot=slot):
                 self.assertEqual(hook.exclusive_capacity_wait(tier, slot), hook.EXCLUSIVE_CAPACITY_WAIT_S)
         self.assertGreater(hook.SIGNING_DRAIN_WAIT_S, hook.EXCLUSIVE_CAPACITY_WAIT_S)
-        self.assertLess(hook.SIGNING_DRAIN_WAIT_S + hook.ADMISSION_WAIT_S + hook.ADMIT_POLL_S, 15 * 60,
-                        "under cmux owned_pool_rescue.SETUP_WAIT_SECONDS")
+        # SIGNING_DRAIN_OUTLASTS_RUNNING_JOBS: nothing new starts while it waits, so the drain ends with the longest
+        # job already running; the bound outlasts the longest job cmux12s and cmux13s ran (3203 s, 2026-10-29 to
+        # 10-31) and leaves the job's timeout-minutes (160) room to sign and notarize.
+        self.assertGreaterEqual(hook.SIGNING_DRAIN_WAIT_S, 3203)
+        self.assertLessEqual(hook.SIGNING_DRAIN_WAIT_S + hook.ADMISSION_WAIT_S + hook.ADMIT_POLL_S, 160 * 60 / 2)
         self.fleet()
         (self.dir / "capacity").mkdir(parents=True, exist_ok=True)
         busy = hook.lock_file(self.dir / "capacity" / "unit-0", fcntl.LOCK_EX)  # a PR job still runs on one unit
@@ -2282,6 +2285,35 @@ class HookTest(unittest.TestCase):
         killed.wait()
         self.assertEqual(hook.admission_waiters(self.dir / "capacity"), [], "a killed waiter's marker goes with it")
         self.assertFalse(marker.exists())
+
+    def test_a_draining_signing_job_keeps_draining_when_a_fleet_build_starts_waiting(self) -> None:
+        """cmux13s, 2026-10-31 03:05Z: three sign-nightly-identity-legacy jobs in 30 s were refused at once with "a
+        fleet build is waiting for the host (pid 38698)" while a PR job held units. A signing job the nightly slot was
+        handed keeps draining instead (HANDED_JOBS_NEVER_FAIL_FOR_A_WAITER) and takes the whole mini once the running
+        job ends; the fleet build gets the host after it."""
+        fleet = self.fleet()
+        markers = Path(str(fleet / "host.lock") + ".waiters")
+        markers.mkdir()
+        drain = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(drain.wait)
+        self.addCleanup(drain.kill)
+        (self.dir / "capacity").mkdir(parents=True, exist_ok=True)
+        busy = hook.lock_file(self.dir / "capacity" / "unit-0", fcntl.LOCK_EX)  # a PR job still runs on one unit
+        self.assertIsNotNone(busy)
+        (markers / f"{drain.pid}-refresh-lend_drain-test").touch()
+        signer = self.nightly_signer("n0", "30", "--nightly-runner")
+        self.wait_for_want(signer)
+        self.assertIsNone(signer.poll(), "the signer waits for the running job, not refused for the waiter")
+        os.close(busy)
+        out, _ = signer.communicate(timeout=30)
+        try:
+            self.assertEqual(signer.returncode, 0, out)
+            self.assertNotIn("refused:", out)
+            self.assertIn("for sign-nightly-identity-legacy (exclusive", out)
+            self.assertEqual(out.count("a nightly job goes first"), 1, "noted once, not on every try")
+        finally:
+            self.finish("n0")
+        self.assertTrue(self.lock_free(), "the fleet build gets the host once the signer ends")
 
     def signing_hooks(self, *shas: str) -> tuple[dict, str]:
         """A glaeda-signing-hooks.txt at manaflow-ai/cmux@SHA listing these hook shas, served through
@@ -5113,30 +5145,39 @@ time.sleep(60)
                 proc.wait()
             holder.stdout.close()
 
-    def test_capacity_fleet_drain_refuses_without_entering_admission_wait(self) -> None:
+    def test_a_handed_job_is_admitted_while_a_fleet_drain_waits_and_never_fails_red(self) -> None:
+        """HANDED_JOBS_NEVER_FAIL_FOR_A_WAITER: cmux run 41150189497's swift-test (cmux#28544) was refused on cmux12s
+        with "a fleet build is waiting for the host (pid 15148)" and failed red without running a test. GitHub never
+        moves a handed job, so job-started admits it: it takes its units and never waits for the waiter (a lend
+        drain or reserved worker waits for Runner.Worker to exit), and the build gets the host when it ends. A
+        ci-step lease is still refused (the build worker leases it elsewhere)."""
         fleet = self.fleet()
         markers = Path(str(fleet / "host.lock") + ".waiters")
         markers.mkdir()
         drain = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
         try:
-            # A reserved worker waits for Runner.Worker to exit. Waiting inside its
-            # job-started child would prevent that exit and deadlock both schedulers.
-            for job in ("swift-package-tests", "macos-compile-admission"):
+            for n, job in enumerate(("swift-package-tests", "macos-compile-admission")):
                 with self.subTest(job=job):
                     (markers / f"{drain.pid}-refresh-lend_drain-test").touch()
-                    result = self.job(job, "draining", 4, None, "--gui-wait", "2")
-                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-                    self.assertIn("a fleet build is waiting for the host", result.stdout)
-                    self.assertNotIn("waiting (", result.stdout)
-                    self.assertFalse(list((self.dir / "capacity").glob("admit.want-*")))
-                    self.assertTrue(self.lock_free())
+                    result = self.job(job, f"draining{n}", 14, None, "--gui-wait", "2")
+                    try:
+                        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                        self.assertNotIn("refused", result.stdout)
+                        self.assertIn(f"admitted though a fleet build waits for the host (pid {drain.pid})",
+                                      result.stdout)
+                        self.assertNotIn("waiting (", result.stdout, "it never waited for the waiter")
+                        self.assertFalse(list((self.dir / "capacity").glob("admit.want-*")))
+                    finally:
+                        self.finish(f"draining{n}")
+                    self.assertTrue(self.lock_free(), "the build gets the host once the job ends")
         finally:
             drain.kill()
             drain.wait()
 
     def test_nightly_job_is_admitted_while_a_fleet_build_waits(self) -> None:
         """NIGHTLY_WAITER: cmux run 40624308094 lost a signed nightly when its DMG verify was refused for a waiting
-        fleet build. A nightly job goes first; the build gets the host when it ends."""
+        fleet build. A nightly job goes first; the build gets the host when it ends. Every other handed job is
+        admitted too (HANDED_JOBS_NEVER_FAIL_FOR_A_WAITER), so none fails red for the waiter."""
         fleet = self.fleet()
         markers = Path(str(fleet / "host.lock") + ".waiters")
         markers.mkdir()
@@ -5148,8 +5189,9 @@ time.sleep(60)
         try:
             (markers / f"{worker.pid}-build-test").touch()
             ordinary = self.job("swift-package-tests", "l1", 8)
-            self.assertEqual(ordinary.returncode, 1, ordinary.stdout)
-            self.assertIn("refused: a fleet build is waiting for the host", ordinary.stdout)
+            self.assertEqual(ordinary.returncode, 0, ordinary.stdout)
+            self.assertIn(f"admitted though a fleet build waits for the host (pid {worker.pid})", ordinary.stdout)
+            self.finish("l1")
             admitted = self.run_hook("job-started", "push", push, "--allowed-repo", "manaflow-ai/cmux", "--no-disk",
                                      "--state-dir", os.fspath(self.dir / "state"), "--watch-pid", str(os.getpid()),
                                      "--gui-wait", "0", "--capacity-units", "8",
@@ -5159,28 +5201,30 @@ time.sleep(60)
             self.assertIn("a nightly job goes first", admitted.stdout)
             self.finish("n0")
             self.assertTrue(self.lock_free(), "the build worker gets the host once the nightly job ends")
-            # a nightly compile still yields on a side runner, and goes first on the nightly slot
+            # a nightly compile handed to a side runner or the nightly slot is admitted either way
             dev_push = event(self.dir, "dev-push", {"repository": CMUX, "ref": "refs/heads/feat-cmux-next"})
             compile_env = {"GITHUB_REF": "refs/heads/feat-cmux-next", "GITHUB_JOB": "release-compile",
                            "RUNNER_NAME": "n1",
                            "GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/cmux-next.yml@refs/heads/feat-cmux-next"}
-            for slot, code in (((), 1), (("--nightly-runner",), 0)):
+            for slot in ((), ("--nightly-runner",)):
                 with self.subTest(slot=slot):
                     result = self.run_hook("job-started", "push", dev_push, "--allowed-repo", "manaflow-ai/cmux",
                                            "--no-disk", "--state-dir", os.fspath(self.dir / "state"),
                                            "--watch-pid", str(os.getpid()), "--gui-wait", "0",
                                            "--capacity-units", "14", "--capacity-dir", os.fspath(self.dir / "capacity"),
                                            *slot, repo="manaflow-ai/cmux", env=compile_env)
-                    self.assertEqual(result.returncode, code, result.stdout + result.stderr)
-                    if code:
-                        self.assertIn("refused: a fleet build is waiting for the host", result.stdout)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertNotIn("refused", result.stdout)
                     self.finish("n1")
         finally:
             worker.kill()
             worker.wait()
 
     @unittest.skipUnless(os.path.exists(hook.LSOF), "needs lsof")
-    def test_capacity_stops_admitting_while_a_fleet_build_waits(self) -> None:
+    def test_a_handed_job_is_admitted_while_a_fleet_build_waits_for_the_lock(self) -> None:
+        """A build worker blocked on host.lock (with-host-lock) does not fail a job GitHub handed the mini: the job is
+        admitted (HANDED_JOBS_NEVER_FAIL_FOR_A_WAITER), and the worker gets the host once both jobs end. A ci-step
+        is still refused while it waits."""
         fleet = self.fleet()
         try:
             self.assertEqual(self.job("swift-package-tests", "l0", 8).returncode, 0)
@@ -5193,16 +5237,18 @@ time.sleep(60)
                 self.assertEqual(waiter.stdout.readline().strip(), "waiting")
                 time.sleep(0.5)
                 result = self.job("swift-package-tests", "l1", 8)
-                self.assertEqual(result.returncode, 1, result.stdout)
-                self.assertIn("refused: a fleet build is waiting for the host", result.stdout)
+                self.assertEqual(result.returncode, 0, result.stdout)
+                self.assertIn("admitted though a fleet build waits for the host", result.stdout)
                 self.finish("l0")
-                self.assertEqual(waiter.wait(timeout=10), 0, "the build worker gets the host once our job ends")
+                self.finish("l1")
+                self.assertEqual(waiter.wait(timeout=10), 0, "the build worker gets the host once our jobs end")
             finally:
                 waiter.kill()
                 waiter.wait()
                 waiter.stdout.close()
         finally:
             self.finish("l0")
+            self.finish("l1")
 
     def test_capacity_a_releasing_holder_is_not_a_waiter(self) -> None:
         self.fleet()

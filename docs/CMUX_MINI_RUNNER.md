@@ -195,9 +195,12 @@ What `--apply` does:
      Developer ID key in a temporary keychain) take the `exclusive` class: every unit and both fast tokens, never
      given back early, waiting at most 300 s for the mini to drain before a refusal sends the re-run to Blacksmith.
      A nightly signing job on the nightly slot (cmux sends one to a busy mini's idle nightly slot when no mini is
-     drained) waits up to `SIGNING_DRAIN_WAIT_S` (600 s) instead: as a nightly waiter it stops every other admission
+     drained) waits up to `SIGNING_DRAIN_WAIT_S` (3600 s) instead: as a nightly waiter it stops every other admission
      and holds every other runner's gate on the mini, so the running jobs finish and nothing new starts; then it takes
-     the whole mini, or is refused and the run's Blacksmith job signs. Its hold is its `admit.want` marker, gone when
+     the whole mini, or is refused and the run's Blacksmith job signs. The bound outlasts a whole running job (a
+     cmux-next swift-test runs 30 to 40 min), not just a compile: at 600 s every capacity refusal on cmux12s and
+     cmux13s from 2026-10-29 to 10-31 was a drain that a PR job started before it outlasted
+     (`SIGNING_DRAIN_OUTLASTS_RUNNING_JOBS`). Its hold is its `admit.want` marker, gone when
      it is admitted, refused or killed. Before any of that wait, a signing job of the home repository reads
      `scripts/ci/glaeda-signing-hooks.txt` at its own commit (`SIGNING_HOOKS`, the list its claim gate reads) and is
      refused at once when that list does not name this hook: its claim gate would fail it after the drain anyway, so
@@ -221,10 +224,13 @@ What `--apply` does:
      job queued too long is. Before 2026-09-28 it refused after 240 s: cmux PR #15160's
      compile admission was refused on cmux10s while two E2E builds on the mini's non-root
      runners held both canonical roots, and a newer compile took the root that freed
-     during its wait. `--gui-wait N` caps the wait (then it refuses), for tests. Because `flock` gives no preference to the exclusive waiter, it also
-     takes nothing while another process (the build worker in `with-host-lock`) is waiting
-     for `host.lock`: it retries through the same wait, so the worker gets the host as soon
-     as the running PR jobs end.
+     during its wait. `--gui-wait N` caps the wait (then it refuses), for tests. A job that a
+     fleet build waiting for `host.lock` (the build worker in `with-host-lock`, a lend drain)
+     finds on arrival is not refused for it (`HANDED_JOBS_NEVER_FAIL_FOR_A_WAITER`): GitHub
+     never moves a handed job, so a refusal failed it red (cmux run 41150189497's swift-test,
+     2026-10-30). It takes its units as usual and the build gets the host when it ends; the
+     listener gates stop the mini's idle runners meanwhile, so no further job arrives. A
+     ci-step lease (`admit`) is still refused, and the build worker leases it elsewhere.
      Admissions on one mini are serialized for a moment (`capacity/admission.lock`),
      so two jobs never split the free units between them.
    - The toolchain check also requires `gh` on the job PATH: cmux's CI scripts call
