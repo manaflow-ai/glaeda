@@ -5882,6 +5882,63 @@ class MirrorBorrowTest(unittest.TestCase):
         self.assertEqual(hook.borrow_mirror(None, self.mirror), "")
         self.assertEqual(hook.guard_borrowed_checkout(os.fspath(self.ws), self.mirror), "")  # not a borrower
 
+    def test_a_damaged_borrower_is_reset_and_borrows_again_once(self) -> None:
+        """cmux12s glaeda-11, 2026-10-31: `repack exit 128: fatal: bad tree object` at every job-completed, for an
+        object neither the checkout nor the mirror held, while the checkout's packs grew to 493. The store is reset
+        (origin and the submodule stores kept, the reason recorded) and the borrow is retried once."""
+        (self.ws / ".git/modules/ghostty").mkdir(parents=True)
+        (self.ws / ".git/modules/ghostty/HEAD").write_text("ref: refs/heads/main\n")
+        self.borrow()
+        # the mirror loses objects the borrower dropped, in place (same objects directory, so the guard keeps it)
+        for pack in (self.mirror / "objects" / "pack").iterdir():
+            pack.unlink()
+        self.assertEqual(hook.guard_borrowed_checkout(os.fspath(self.ws), self.mirror), "")
+        note = self.borrow()
+        self.assertIn("repack exit", note)
+        self.assertIn("reset", note)
+        self.assertIn("kept its submodule stores", note)
+        self.assertIn("retried:", note)
+        git_dir = self.ws / ".git"
+        self.assertEqual(self.git(self.ws, "config", "--get", "remote.origin.url"), "https://github.com/manaflow-ai/cmux")
+        self.assertEqual(hook.alternates_of(git_dir), [os.fspath(self.mirror / "objects")])
+        self.assertTrue((git_dir / hook.BORROW_RECORD).is_file())
+        self.assertIn("error", json.loads((git_dir / hook.BORROW_RESET_RECORD).read_text()))
+        self.assertTrue((git_dir / "modules/ghostty/HEAD").is_file())
+        self.git(self.ws, "fsck", "--connectivity-only", "--no-dangling")  # an empty store reads whole again
+        self.assertNotIn("reset", self.borrow())  # nothing left to repack: the next pass is quiet
+
+    def test_a_damaged_borrower_without_submodule_stores_is_reset_too(self) -> None:
+        """Without .git/modules, drop_checkout_store removes the store outright: the reset makes the empty
+        repository itself, so origin, the reset record and the retried borrow still land (review of #1770)."""
+        self.borrow()
+        for pack in (self.mirror / "objects" / "pack").iterdir():
+            pack.unlink()
+        note = self.borrow()
+        self.assertIn("reset", note)
+        self.assertIn("retried:", note)
+        git_dir = self.ws / ".git"
+        self.assertTrue((git_dir / "HEAD").is_file())
+        self.assertEqual(self.git(self.ws, "config", "--get", "remote.origin.url"), "https://github.com/manaflow-ai/cmux")
+        self.assertEqual(hook.alternates_of(git_dir), [os.fspath(self.mirror / "objects")])
+        self.assertTrue((git_dir / hook.BORROW_RESET_RECORD).is_file())
+
+    def test_a_repack_failure_that_is_not_damage_keeps_the_store(self) -> None:
+        real = subprocess.Popen
+
+        class Fails:
+            pid = 4243
+            returncode = 128
+
+            def communicate(self, timeout=None):
+                return "", "fatal: Unable to create '/x/index.lock': File exists."
+
+        with mock.patch.object(hook, "BORROW_REPACK_MIN", 0), mock.patch.object(
+                hook.subprocess, "Popen", lambda argv, *a, **kw: Fails() if "repack" in argv else real(argv, *a, **kw)):
+            note = hook.borrow_mirror(os.fspath(self.ws), self.mirror)
+        self.assertIn("repack exit 128", note)
+        self.assertNotIn("reset", note)
+        self.assertEqual(self.git(self.ws, "show", "HEAD:local.txt"), "only here")
+
     def test_a_repack_past_its_time_is_killed_and_leaves_the_checkout_readable(self) -> None:
         real = subprocess.Popen
 

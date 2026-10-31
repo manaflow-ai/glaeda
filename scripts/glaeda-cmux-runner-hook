@@ -3165,9 +3165,41 @@ def pack_bytes(git_dir: Path) -> int:
     return total
 
 
-def borrow_mirror(workspace: str | None, mirror: Path = MIRROR_DIR, timeout: float = BORROW_REPACK_TIMEOUT_S) -> str:
+# A borrower's repack that names an object git cannot read (cmux12s glaeda-11, 2026-10-31: "repack exit 128: fatal:
+# bad tree object 7b35fc2c...", which neither the checkout's packs nor the mirror held) left the checkout as it was:
+# every later job-completed failed the same way while its packs grew to 493 (1.8 GiB), and a fetch or checkout that
+# reads the missing object fails the job. On such an error the store is marked bad (BORROW_RESET_RECORD) and reset
+# as the rebuilt-mirror guard does (drop_checkout_store keeps the submodule stores), with origin kept so the borrow
+# is retried once at once; the next job's checkout fetches what the mirror lacks.
+BORROW_RESET_RECORD = "glaeda-store-reset.json"
+STORE_DAMAGE = re.compile(r"bad (tree |commit |blob |tag )?object|missing (blob|tree|commit|tag)|unable to read|"
+                          r"could not read|is corrupt|cannot be accessed|did not receive expected object|"
+                          r"invalid object|broken link", re.IGNORECASE)
+
+
+def reset_damaged_borrower(git_dir: Path, origin: str, error: str) -> str:
+    """Replace a borrower's damaged store with an empty repository that keeps origin, and record why. Returns the
+    note. Raises OSError, with the store whole, when the reset cannot be made."""
+    kept = drop_checkout_store(git_dir)
+    if not git_dir.is_dir():  # no submodule stores: drop_checkout_store removed the store outright
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        subprocess.run(["git", "init", "-q", os.fspath(git_dir.parent)], capture_output=True, timeout=60, env=env,
+                       check=False)
+    subprocess.run(["git", "--git-dir", os.fspath(git_dir), "config", "remote.origin.url", origin],
+                   capture_output=True, timeout=30, check=False)
+    subprocess.run(["git", "--git-dir", os.fspath(git_dir), "config", "remote.origin.fetch",
+                    "+refs/heads/*:refs/remotes/origin/*"], capture_output=True, timeout=30, check=False)
+    with contextlib.suppress(OSError):
+        (git_dir / BORROW_RESET_RECORD).write_text(json.dumps({"at": int(time.time()), "error": error[-300:]}) + "\n")
+    note = f"reset {git_dir}: its store named an object git cannot read ({error.strip()[-120:]}); checkout fetches it"
+    return f"{note}; {kept}" if kept else note
+
+
+def borrow_mirror(workspace: str | None, mirror: Path = MIRROR_DIR, timeout: float = BORROW_REPACK_TIMEOUT_S,
+                  _retry: bool = True) -> str:
     """job-completed: point a cmux runner checkout at the mini's mirror and drop the local copies of what it holds.
-    Returns a note, or "". Never raises."""
+    A repack that finds the store damaged resets it and borrows once more (STORE_DAMAGE). Returns a note, or "".
+    Never raises."""
     try:
         git_dir = runner_git_dir(workspace)
         identity = mirror_identity(mirror)
@@ -3216,7 +3248,14 @@ def borrow_mirror(workspace: str | None, mirror: Path = MIRROR_DIR, timeout: flo
                     proc.communicate(timeout=5)
                 return "; ".join([*notes, f"repack timed out after {timeout:g} s"])
             if proc.returncode != 0:
-                return "; ".join([*notes, f"repack exit {proc.returncode}: {(err or '').strip()[-160:]}"])
+                failed = f"repack exit {proc.returncode}: {(err or '').strip()[-160:]}"
+                if not _retry or not STORE_DAMAGE.search(err or ""):
+                    return "; ".join([*notes, failed])
+                notes.append(failed)
+                notes.append(reset_damaged_borrower(git_dir, origin, err or ""))
+                if again := borrow_mirror(workspace, mirror, timeout, _retry=False):
+                    notes.append(f"retried: {again}")
+                return "; ".join(notes)
             after = pack_bytes(git_dir)
             notes.append(f"repacked against the mirror: {before / 1024**2:.0f} MiB -> {after / 1024**2:.0f} MiB")
         return "; ".join(notes)
