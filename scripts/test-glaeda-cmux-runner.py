@@ -11191,6 +11191,11 @@ class RunnerTest(unittest.TestCase):
         self.assertIn("--canonical-roots 2 --instance 4 --gui-runner --gui-token gui\n", started)
         self.assertNotIn("--gui-runner", (self.home / "actions-runner-glaeda-2/glaeda-hooks/job-started.sh").read_text())
         self.assertEqual(hook.runner_scope(self.home / "actions-runner-glaeda-4"), hook.RunnerScope(10, 2, 2, False, True))
+        agents = self.home / "Library/LaunchAgents"
+        session_create = {k: plistlib.loads((agents / f"com.teamleaderleo.glaeda.cmux-runner{'' if k == 0 else f'.{k}'}.plist")
+                                            .read_bytes()).get("SessionCreate", False) for k in (0, 2, 4)}
+        self.assertEqual(session_create, {0: True, 2: True, 4: False},
+                         "the gui runner runs in the console session, where LaunchServices can launch its UI tests")
 
     def test_gui_runners_two_adds_a_session_runner_beside_the_console_one(self) -> None:
         base = {"runners": 6, "capacityUnits": 10, "compileSlots": 2, "canonicalRoots": 2}
@@ -11215,6 +11220,10 @@ class RunnerTest(unittest.TestCase):
                 self.invoke("--apply", "--instance", instance)
         again = [hook.runner_scope(self.fast_home / f"actions-runner-glaeda-{k}") for k in (4, 5)]
         self.assertEqual(again, scopes)
+        agents = self.fast_home / "Library/LaunchAgents"
+        self.assertEqual([plistlib.loads((agents / f"com.teamleaderleo.glaeda.cmux-runner.{k}.plist").read_bytes())
+                          .get("SessionCreate", False) for k in (3, 4, 5)], [True, False, False],
+                         "the session and console gui runners have no session of their own; a side runner keeps one")
 
     def fast_labels(self, classes: dict, name: str, *, dev_compile: bool = False,
                     ios_sim: bool = False, nightly_slot: bool = False) -> tuple[list[list[str]], list[str]]:

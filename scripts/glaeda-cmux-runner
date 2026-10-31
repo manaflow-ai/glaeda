@@ -931,7 +931,6 @@ def agent_plist(ctx: Context) -> dict[str, Any]:
         "KeepAlive": True,
         "ThrottleInterval": 10,
         "ProcessType": "Interactive",
-        "SessionCreate": True,
         "EnvironmentVariables": {
             "ACTIONS_RUNNER_HOOK_JOB_STARTED": os.fspath(ctx.hook_dir / "job-started.sh"),
             "ACTIONS_RUNNER_HOOK_JOB_COMPLETED": os.fspath(ctx.hook_dir / "job-completed.sh"),
@@ -940,9 +939,21 @@ def agent_plist(ctx: Context) -> dict[str, Any]:
         "StandardOutPath": os.fspath(ctx.log_path),
         "StandardErrorPath": os.fspath(ctx.logs / f"glaeda-cmux-runner{ctx.suffix}.err"),
     }
+    if not console_session_runner(ctx):
+        plist["SessionCreate"] = True
     if ctx.headless:
         plist["UserName"] = pwd.getpwuid(ctx.uid).pw_name
     return plist
+
+
+def console_session_runner(ctx: Context) -> bool:
+    """The gui and session runners run in the console user's security session, every other runner in one of its own
+    (SessionCreate). Their jobs launch and drive apps there (XCUITest, captures), and on macOS 27 LaunchServices can stop
+    mapping a SessionCreate session to the console's: `lsappinfo front` reads [ NULL ] from it and xcodebuild dies
+    launching the test runner with "IDELaunchServicesLauncher.m:418 Assertion failed: childPID > 0" (cmuxs-mac-mini-3
+    and cmux8s, 2026-10-30; a fresh SessionCreate agent there could not see Finder, one without it could). It isolates
+    nothing from such a job: any job can bootstrap a LaunchAgent into gui/<uid> and run in the console session anyway."""
+    return not ctx.headless and bool(getattr(ctx, "gui_runner", False) or getattr(ctx, "session_runner", False))
 
 
 def hook_sources() -> dict[str, tuple[bytes, int]]:

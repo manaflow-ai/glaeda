@@ -1163,8 +1163,8 @@ fail with errSecInteractionNotAllowed. On PR runners (not trusted ones) the job-
 it first in the user search list and the user's default keychain. It holds test junk only, and every PR job
 can read it.
 
-Unlock state is per security session, and each runner's LaunchAgent has `SessionCreate`, so that unlock
-never reaches the desktop. There the default keychain stayed locked, and Spotlight put "Spotlight wants to
+Unlock state is per security session, and every runner's LaunchAgent but the gui and session runners' has
+`SessionCreate`, so their unlock never reaches the desktop. There the default keychain stayed locked, and Spotlight put "Spotlight wants to
 use the cmux-ci keychain" over UI tests (cmux run 36309272077). The hook therefore also writes and kickstarts
 `com.teamleaderleo.glaeda.test-keychain-unlock`, a LaunchAgent limited to the Aqua session that runs
 `security unlock-keychain` on the test keychain. Its RunAtLoad unlocks it again at every login.
@@ -1200,6 +1200,19 @@ A symlinked entry is removed, never followed.
 **Never store credentials as the runner user on a PR mini** (`gh auth login`, `git credential-osxkeychain`,
 `security import`, Keychain Access). Without an explicit keychain they land in `cmux-ci`, and any later PR job
 can copy that file and read them. Credentials belong on trusted or signing hosts.
+
+## 2h1. The gui and session runners run in the console session
+
+Every runner's LaunchAgent has `SessionCreate` (its own security session) except the gui and session runners'.
+Their jobs launch and drive apps in the console session (XCUITest, captures), and on macOS 27 LaunchServices can
+stop mapping a `SessionCreate` session to the console's: from it `lsappinfo front` reads `[ NULL ]` and
+`lsappinfo find bundleid=com.apple.finder` finds nothing while Finder runs, and xcodebuild dies launching the UI
+test runner with `IDELaunchServicesLauncher.m:418 Assertion failed: childPID > 0` (cmuxs-mac-mini-3 and cmux8s,
+2026-10-30: every UI job there failed so; a fresh LaunchAgent with `SessionCreate` could not see Finder, one without
+it could, on the same mini). The session buys a GUI job no isolation: any job can bootstrap a LaunchAgent into
+`gui/<uid>` and run in the console session anyway. A re-apply (or `glaeda-cmux-runner-fleet --apply`) rewrites the
+plist, and the agent step restarts the runner only while it is idle. cmux's GUI activation preflight
+(`scripts/ci/preflight-e2e-gui-activation.py`) fails such a runner in seconds with that cause named.
 
 ## 2h2. A fresh testmanagerd for each XCTest job
 
