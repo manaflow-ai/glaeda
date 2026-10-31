@@ -7098,6 +7098,31 @@ class AuditTest(BrokerBase):
             gg.cmd_audit(empty, 10, False)
 
 
+    def test_the_repeats_the_cache_answered_are_told_apart_from_those_it_did_not(self) -> None:
+        log = self.write_log([(0, "pr view 7 o/r"), (10, "pr view 7 o/r"), (20, "pr view 7 o/r"),
+                              (30, "run view 5 o/r"), (40, "run view 5 o/r")])
+        gg.broker_log().parent.mkdir(parents=True, exist_ok=True)
+        records = [(0, "pass", "pr view 7 o/r"), (10, "cache", "pr view 7 o/r"), (20, "pass", "pr view 7 o/r"),
+                   (30, "pass", "run view 5 o/r"), (40, "cache", "run view 5 o/r"), (41, "pass", None),
+                   (-500, "pass", "run view 5 o/r")]
+        gg.broker_log().write_text("".join(json.dumps({"at": NOW + at, "route": route, **({"line": line} if line else {})})
+                                           + "\n" for at, route, line in sorted(records)))
+        doc = self.audit_json(log)
+        self.assertEqual(doc["repeatsWithin"]["calls"], 3)
+        self.assertEqual(doc["decisionReads"], {"reads": 5, "repeats": 3, "repeatsReachedGitHub": 1})
+        self.assertIn("1 (20.0%) re-read within 90 seconds", self.audit_text(log))
+
+    def test_a_call_through_the_broker_records_its_read(self) -> None:
+        os.environ["GLAEDA_GH_CACHE_TTL"] = "90"
+        args = ["pr", "view", "7", "-R", "o/r", "--json", "body"]
+        self.run_gh(args)
+        self.run_gh(args)
+        self.run_gh(["pr", "comment", "7", "-R", "o/r", "--body", "x"])
+        records = [json.loads(line) for line in gg.broker_log().read_text().splitlines()]
+        self.assertEqual([(r["route"], r.get("line")) for r in records],
+                         [("pass", "pr view pr:o/r#7"), ("cache", "pr view pr:o/r#7"), ("pass", None)])
+
+
 class BrokerRepeatTest(BrokerBase):
     """The 30 s repeat delay lives here rather than in the PATH guard, because only this side knows
     whether a call is about to spend a request."""
@@ -9605,8 +9630,8 @@ class DaemonPolicyTest(Base):
         self.assertEqual(gg.broker_max_age(["title"]), gg.BROKER_MAX_AGE)
 
 
-class BrokerAnswerCacheTest(BrokerBase):
-    """Identical read-only calls within the TTL share one real gh run."""
+class CountingGhBase(BrokerBase):
+    """A fake gh that counts its runs and answers "answer N"."""
 
     def setUp(self) -> None:
         super().setUp()
@@ -9621,6 +9646,10 @@ class BrokerAnswerCacheTest(BrokerBase):
 
     def runs(self) -> int:
         return int(self.count.read_text()) if self.count.exists() else 0
+
+
+class BrokerAnswerCacheTest(CountingGhBase):
+    """Identical read-only calls within the TTL share one real gh run."""
 
     def test_an_identical_read_is_answered_once(self) -> None:
         args = ["api", "repos/o/r/actions/runs/5/jobs", "--jq", ".jobs[].name"]
@@ -9695,7 +9724,7 @@ class BrokerAnswerCacheTest(BrokerBase):
         self.addCleanup(os.environ.pop, "FAKE_GH_RC", None)
         code, _out, _err, passed = self.run_gh(["pr", "merge", "7", "-R", "o/r"])
         self.assertEqual((code, passed, self.runs()), (3, None, 1))
-        self.assertIn("o/r", gg.gh_cache_writes())
+        self.assertTrue({"o/r pr 7", "o/r prs"} <= set(gg.gh_cache_writes()))
 
     def test_a_write_naming_no_repository_stamps_them_all(self) -> None:
         self.run_gh(["api", "repos/o/r/pulls/7"])
@@ -9864,7 +9893,7 @@ class BrokerAnswerCacheTest(BrokerBase):
         with mock.patch.object(gg, "daemon_running", return_value=False), \
                 contextlib.redirect_stderr(io.StringIO()):
             gg.cmd_post(args)
-        self.assertIn("o/r", gg.gh_cache_writes())
+        self.assertEqual(set(gg.gh_cache_writes()), {"o/r pr 7", "o/r runlists", "o/r other"})
 
     def test_another_token_is_another_question(self) -> None:
         args = ["api", "repos/o/r/pulls/7"]
@@ -9959,6 +9988,247 @@ class BrokerAnswerCacheTest(BrokerBase):
                      ["api", "graphql", "-f", "query=query{viewer{login}}"], ["search", "prs", "x"], []):
             with self.subTest(args=args):
                 self.assertFalse(write(args))
+
+
+class BrokerAnswerHitRateTest(CountingGhBase):
+    """What raised the answer cache's hit rate (2026-10-31): one key per question however it is spelled,
+    write stamps no wider than what the write changes, a 90 s window, the daemon's own copy of a PR or
+    run as the change signal, and a longer life for what cannot change."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        os.environ.pop("GLAEDA_GH_CACHE_TTL", None)  # the shipped default, not the 60 those tests pin
+
+    def age(self, seconds: float) -> None:
+        for path in gg.gh_cache_dir().glob("*.json"):
+            if path.name != "writes.json":
+                doc = json.loads(path.read_text())
+                doc["at"] -= seconds
+                path.write_text(json.dumps(doc))
+
+    def daemon_entry(self, key: str, data: dict, jobs: list | None = None, fetched_age: float = 0.0) -> None:
+        entry = {"key": key, "fetchedAt": time.time() - fetched_age, "dataAt": time.time() - fetched_age,
+                 "data": data, "error": None}
+        if jobs is not None:
+            entry["jobs"] = jobs
+        gg.write_json(gg.cache_dir() / gg.file_name(key), entry)
+
+    def test_one_question_is_one_answer_however_it_is_spelled(self) -> None:
+        spellings = (
+            [["pr", "view", "7", "-R", "O/R", "--json", "state,headRefOid"],
+             ["pr", "view", "7", "--repo=o/r", "--json=headRefOid,state"],
+             ["pr", "view", "--json", "headRefOid,state,state", "7", "-Ro/r"],
+             ["pr", "view", "https://github.com/o/r/pull/7", "--json", "state,headRefOid"]],
+            [["api", "repos/o/r/actions/runs/5/jobs?per_page=100&filter=latest", "--jq", ".jobs[].name"],
+             ["api", "/repos/o/r/actions/runs/5/jobs?filter=latest&per_page=100", "-q", ".jobs[].name"]],
+            [["run", "view", "12", "-R", "o/r", "--log-failed"], ["run", "view", "--log-failed", "12", "--repo", "o/r"]],
+        )
+        for group in spellings:
+            with self.subTest(group=group[0]):
+                before = self.runs()
+                outs = {self.run_gh(args)[1] for args in group}
+                self.assertEqual((self.runs(), outs), (before + 1, {f"answer {before + 1}\n"}))
+
+    def test_different_questions_stay_different(self) -> None:
+        for args in (["pr", "view", "7", "-R", "o/r", "--json", "state"],
+                     ["pr", "view", "7", "-R", "o/r", "--json", "state,title"],
+                     ["pr", "view", "8", "-R", "o/r", "--json", "state"],
+                     ["pr", "view", "7", "-R", "o/other", "--json", "state"],
+                     ["api", "repos/o/r/actions/runs/5/jobs?page=1"],
+                     ["api", "repos/o/r/actions/runs/5/jobs?page=2"],
+                     ["api", "repos/o/r/issues?labels=a&labels=b"],
+                     ["api", "repos/o/r/issues?labels=b&labels=a"],
+                     ["api", "https://api.github.com/repos/o/r/pulls/7"],
+                     ["api", "repos/o/r/pulls/7"],
+                     ["issue", "view", "https://github.com/o/r/pull/7", "--json", "title"],
+                     ["pr", "view", "7", "-R", "o/r", "--json", "state", "--jq", ".state"],
+                     # the last of a repeated field wins, whichever spelling carried it
+                     ["api", "-X", "GET", "repos/o/r/issues", "-f", "state=open", "--raw-field", "state=closed"],
+                     ["api", "-X", "GET", "repos/o/r/issues", "--raw-field", "state=closed", "-f", "state=open"],
+                     ["api", "-X", "GET", "repos/o/r/issues", "-F", "per_page=5", "-f", "per_page=6"]):
+            self.run_gh(args)
+        self.assertEqual(self.runs(), 15)
+        self.run_gh(["api", "-X", "GET", "repos/o/r/issues", "--raw-field", "state=open", "--raw-field", "state=closed"])
+        self.assertEqual(self.runs(), 15, "-f and --raw-field are one flag")
+
+    def test_a_line_with_a_flag_it_does_not_know_is_kept_as_typed(self) -> None:
+        """`--unknown 7` could be a flag with a value: moving it could make 7 the PR number."""
+        args = ["pr", "view", "--unknown", "7", "-R", "o/r"]
+        self.assertIsNone(gg.gh_cache_canonical(args))
+        self.assertIsNone(gg.gh_cache_canonical(["api", "x", "--", "-y"]))
+        self.assertIsNone(gg.gh_cache_canonical(["pr", "view", "7", "-abc"]))
+        self.run_gh(args)
+        self.run_gh(args)
+        self.run_gh(["pr", "view", "-R", "o/r", "--unknown", "7"])
+        self.assertEqual(self.runs(), 2)
+
+    def test_a_write_stamps_what_it_changes_and_no_more(self) -> None:
+        pr7 = ["pr", "view", "7", "-R", "o/r", "--json", "body"]
+        pr8 = ["pr", "view", "8", "-R", "o/r", "--json", "body"]
+        run5 = ["run", "view", "5", "-R", "o/r", "--json", "status"]
+        listed = ["pr", "list", "-R", "o/r", "--json", "number"]
+        reads = (pr7, pr8, run5, listed)
+
+        def fresh() -> dict[str, bool]:
+            before = self.runs()
+            fetched = {}
+            for name, args in zip(("pr7", "pr8", "run5", "list"), reads):
+                ran = self.runs()
+                self.run_gh(args)
+                fetched[name] = self.runs() > ran
+            return fetched
+        fresh()
+        self.run_gh(["pr", "comment", "7", "-R", "o/r", "--body", "hi"])
+        self.assertEqual(fresh(), {"pr7": True, "pr8": False, "run5": False, "list": True})
+        self.assertEqual(gg.gh_cache_post_scopes({"kind": "pr", "repo": "o/r"}), ["runlists", "other"],
+                         "a queued PR stamps what `pr create` does")
+        self.run_gh(["pr", "merge", "8", "-R", "o/r", "--squash", "--match-head-commit", "a" * 40])
+        self.assertEqual(fresh(), {"pr7": True, "pr8": True, "run5": False, "list": True},
+                         "a merge moves the base: every PR's mergeability, not the runs")
+        self.run_gh(["run", "rerun", "5", "-R", "o/r", "--failed"])
+        self.assertEqual(fresh(), {"pr7": True, "pr8": True, "run5": True, "list": True},
+                         "a rerun changes the run and the checks of the PRs it reports to")
+        self.run_gh(["api", "-X", "POST", "repos/o/r/issues/8/comments", "-f", "body=x"])
+        self.assertEqual(fresh(), {"pr7": False, "pr8": True, "run5": False, "list": True})
+        self.run_gh(["label", "create", "x", "-R", "o/r"])
+        self.assertEqual(fresh(), {"pr7": True, "pr8": True, "run5": True, "list": True},
+                         "a write this does not know is as wide as it was")
+        self.run_gh(["pr", "comment", "7", "--weird-flag", "8", "-R", "o/r", "--body", "x"])
+        self.assertEqual(fresh(), {"pr7": True, "pr8": True, "run5": True, "list": True},
+                         "an unknown flag could make any word the PR: the whole repository")
+        self.run_gh(["api", "graphql", "-f", "query=mutation{x}"])
+        self.assertEqual(fresh(), {"pr7": True, "pr8": True, "run5": True, "list": True},
+                         "a mutation names no repository: every answer")
+
+    def test_a_list_of_runs_is_stamped_only_by_writes_that_make_runs(self) -> None:
+        lists = (["run", "list", "-R", "o/r", "--workflow", "ci.yml", "--json", "databaseId"],
+                 ["api", "repos/o/r/actions/workflows/ci.yml/runs?per_page=5"],
+                 ["api", "repos/o/r/actions/runs?branch=main"])
+
+        def fetched() -> bool:
+            before = self.runs()
+            for args in lists:
+                self.run_gh(args)
+            return {0: False, len(lists): True}[self.runs() - before]
+        fetched()
+        for write, starts in ((["pr", "comment", "7", "-R", "o/r", "--body", "x"], True),
+                              (["issue", "create", "-R", "o/r", "--title", "t", "--body", "b"], True),
+                              (["api", "-X", "POST", "repos/o/r/issues/7/comments", "-f", "body=x"], True),
+                              (["api", "-X", "POST", "repos/o/r/issues", "-f", "title=t"], True),
+                              (["api", "-X", "POST", "repos/o/r/pulls/7/reviews", "-f", "event=COMMENT"], True),
+                              (["api", "-X", "PUT", "repos/o/r/branches/main/protection"], True),
+                              (["pr", "edit", "7", "-R", "o/r", "--add-label", "full-ci"], True),
+                              (["workflow", "run", "ci.yml", "-R", "o/r"], True),
+                              (["api", "-X", "POST", "repos/o/r/actions/workflows/ci.yml/dispatches", "-f", "ref=main"], True),
+                              (["run", "rerun", "5", "-R", "o/r"], True),
+                              (["pr", "merge", "7", "-R", "o/r", "--squash"], True),
+                              (["pr", "create", "-R", "o/r", "--title", "t", "--body", "b"], True)):
+            with self.subTest(write=write):
+                self.run_gh(write)
+                self.assertEqual(fetched(), starts)
+
+    def test_a_write_still_runs_every_time_and_never_reads_the_cache(self) -> None:
+        merge = ["pr", "merge", "7", "-R", "o/r", "--squash", "--match-head-commit", "b" * 40]
+        self.run_gh(["pr", "view", "7", "-R", "o/r", "--json", "headRefOid"])
+        for _ in range(2):
+            code, _out, _err, passed = self.run_gh(merge)
+            self.assertEqual((code, passed), (0, None))
+        self.assertEqual(self.runs(), 3)
+        self.assertEqual(self.passed.read_text().count("--match-head-commit"), 2)
+
+    def test_git_credential_is_not_a_write(self) -> None:
+        words, method, _seen, _values = gg.broker_words(["auth", "git-credential", "get"])
+        self.assertFalse(gg.gh_cache_is_write(["auth", "git-credential", "get"], words, method))
+
+    def test_the_window_is_ninety_seconds(self) -> None:
+        args = ["pr", "view", "7", "-R", "o/r", "--json", "body"]
+        self.run_gh(args)
+        self.age(80)
+        self.assertEqual(self.run_gh(args)[1], "answer 1\n")
+        self.age(11)
+        self.assertEqual(self.run_gh(args)[1], "answer 2\n")
+
+    def test_a_change_the_daemon_sees_drops_the_answer_from_any_host(self) -> None:
+        key = "pr:o/r#7"
+        self.daemon_entry(key, {"number": 7, "headRefOid": "a" * 40, "state": "OPEN"})
+        args = ["pr", "view", "7", "-R", "o/r", "--json", "body"]
+        self.run_gh(args)
+        self.assertEqual(self.run_gh(args)[1], "answer 1\n", "the daemon's copy unchanged: kept")
+        self.daemon_entry(key, {"number": 7, "headRefOid": "b" * 40, "state": "OPEN"})
+        self.assertEqual(self.run_gh(args)[1], "answer 2\n", "a push another host made, seen by the daemon")
+        (gg.cache_dir() / gg.file_name(key)).unlink()
+        self.assertEqual(self.run_gh(args)[1], "answer 2\n", "no daemon entry: the TTL decides")
+
+    def test_a_completed_run_the_daemon_watches_is_kept_until_it_changes(self) -> None:
+        key = "run:o/r/5"
+        done = {"id": 5, "status": "completed", "conclusion": "failure", "run_attempt": 1}
+        self.daemon_entry(key, done, jobs=[{"id": 1, "status": "completed"}])
+        view = ["run", "view", "5", "-R", "o/r", "--log-failed"]
+        jobs = ["api", "repos/o/r/actions/runs/5/jobs"]
+        self.run_gh(view)
+        self.run_gh(jobs)
+        self.age(300)
+        self.assertEqual((self.run_gh(view)[1], self.run_gh(jobs)[1]), ("answer 1\n", "answer 2\n"))
+        self.daemon_entry(key, {**done, "status": "queued", "conclusion": None, "run_attempt": 2})
+        self.assertEqual((self.run_gh(view)[1], self.run_gh(jobs)[1]), ("answer 3\n", "answer 4\n"),
+                         "a rerun the controller's webhook reported")
+
+    def test_a_run_the_daemon_stopped_reading_gets_the_ordinary_window(self) -> None:
+        self.daemon_entry("run:o/r/5", {"id": 5, "status": "completed", "conclusion": "success"},
+                          fetched_age=gg.TERMINAL_REFRESH + 3 * gg.CYCLE)
+        view = ["run", "view", "5", "-R", "o/r", "--json", "jobs"]
+        self.run_gh(view)
+        self.age(120)
+        self.assertEqual(self.run_gh(view)[1], "answer 2\n")
+
+    def test_a_live_run_gets_the_ordinary_window(self) -> None:
+        self.daemon_entry("run:o/r/5", {"id": 5, "status": "in_progress", "conclusion": None})
+        view = ["run", "view", "5", "-R", "o/r", "--json", "jobs"]
+        self.run_gh(view)
+        self.age(120)
+        self.assertEqual(self.run_gh(view)[1], "answer 2\n")
+
+    def test_a_completed_job_is_kept_and_a_running_one_is_not(self) -> None:
+        gh = self.home / "bin" / "gh"
+        reply = self.home / "reply.json"
+        gh.write_text("#!/bin/sh\n"
+                      f"n=$(($(cat {self.count} 2>/dev/null || echo 0) + 1)); echo $n > {self.count}\n"
+                      f"cat {reply}\n")
+        cases = ((["api", "repos/o/r/actions/jobs/9"], {"id": 9, "status": "completed"}, True),
+                 (["api", "repos/o/r/actions/jobs/10"], {"id": 10, "status": "in_progress"}, False),
+                 (["api", "repos/o/r/actions/runs/5/attempts/1/jobs"],
+                  {"total_count": 2, "jobs": [{"status": "completed"}, {"status": "completed"}]}, True),
+                 (["api", "repos/o/r/actions/runs/5/attempts/2/jobs"],
+                  {"total_count": 2, "jobs": [{"status": "completed"}, {"status": "queued"}]}, False),
+                 (["api", "repos/o/r/actions/runs/5/attempts/3/jobs"],
+                  {"total_count": 40, "jobs": [{"status": "completed"}]}, False),
+                 (["api", "repos/o/r/actions/jobs/11", "--jq", ".status"], {"id": 11, "status": "completed"}, False))
+        for args, doc, kept in cases:
+            with self.subTest(args=args):
+                reply.write_text(json.dumps(doc))
+                self.run_gh(args)
+                self.age(300)
+                before = self.runs()
+                self.run_gh(args)
+                self.assertEqual(self.runs() == before, kept)
+
+    def test_identical_calls_arriving_together_run_gh_once(self) -> None:
+        """Three processes, three spellings, one gh run: the canonical key is what they lock on."""
+        gh = self.home / "bin" / "gh"
+        gh.write_text("#!/bin/sh\n"
+                      f"echo x >> {self.count}.runs\nsleep 1\necho together\n")
+        env = {**os.environ, "GLAEDA_GH_DIR": str(gg.BASE), "CMUX_GH_MIN_REPEAT_SECONDS": "0"}
+        env.pop(gg.BROKER_MARK, None)
+        env.pop(gg.BROKER_DEPTH, None)
+        script = os.fspath(ROOT / "scripts" / "glaeda-gh")
+        lines = (["pr", "view", "7", "-R", "o/r", "--json", "state,body"],
+                 ["pr", "view", "7", "--repo=O/R", "--json=body,state"],
+                 ["pr", "view", "https://github.com/o/r/pull/7", "--json", "body,state"])
+        procs = [subprocess.Popen([sys.executable, script, "gh", *args], env=env, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, stdin=subprocess.DEVNULL) for args in lines]
+        outs = [proc.communicate(timeout=60)[0] for proc in procs]
+        self.assertEqual(outs, [b"together\n"] * 3)
+        self.assertEqual(len((self.home / "count.runs").read_text().splitlines()), 1)
 
 
 class BrokerSweepTest(BrokerBase):

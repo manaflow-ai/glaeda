@@ -210,6 +210,8 @@ GUARD = "scripts/glaeda_never_cancel.py"
 # Each hit outside the guard's one POST, by file and exact line, with why it cancels no GitHub run.
 ALLOWED = {
     ("src/main.rs", '"cancel",'): "the local personal-worker queue's `glaeda job cancel` subcommand in a CLI test",
+    ("scripts/glaeda-gh", 'GH_CACHE_RUN_WRITES = {"rerun", "cancel"}'):
+        "the answer cache reads a caller's `gh run cancel N` to decide what to invalidate; it cancels nothing",
 }
 GUARD_LINE = "post(f\"/repos/{repo}/actions/runs/{run_id}/{'force-cancel' if force else 'cancel'}\")"
 

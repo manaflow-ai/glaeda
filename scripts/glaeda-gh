@@ -2058,7 +2058,7 @@ class Daemon:
         write_json(posted_dir() / path.name, done)
         path.unlink(missing_ok=True)
         with contextlib.suppress(Exception):  # answers this host's gh cache kept from before the write
-            gh_cache_note_write(str(item.get("repo") or "").lower() or None, time.time())
+            gh_cache_note_write(str(item.get("repo") or "").lower() or None, time.time(), gh_cache_post_scopes(item))
         log({"event": "post", "id": done.get("id"), "state": done["state"], "url": url, "error": error})
 
     def post_prune(self) -> None:
@@ -6363,30 +6363,18 @@ def broker_hold(seconds: float) -> None:
     extend_lock_budget(seconds)
 
 
-def broker_log_call(words: list[str], values: dict[str, str]) -> None:
-    """Append this call to the shared log: time, caller, the subcommand, and an identifier.
+def broker_log_call(words: list[str], values: dict[str, str]) -> str:
+    """Append this call to the shared log: time, caller, the subcommand, and an identifier. Returns
+    that subcommand-and-identifier text, which the decision log keeps too (cmd_audit's "reached
+    GitHub" figure), whether or not the PATH guard already wrote the call log's line.
 
     The PATH guard writes the same shape when it has no broker to delegate to, so `glaeda-gh audit`
     reads one format from every host."""
+    line = broker_call_line(words, values)
     if os.environ.get("CMUX_GH_GUARD_LOGGED") == "1":
-        return
+        return line
     caller = broker_caller()
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    # `api` carries its path in words[1], and the target is that path with its query cut: one or
-    # the other, never both, or the query comes back in through the subcommand.
-    head = words[:1] if words[:1] == ["api"] else words[:2]
-    # A subcommand is a word. Anything else in that slot (`gh "pr view 7\n2026-..."`, or a value a
-    # flag this does not know about left behind) must not reach a line-oriented shared log.
-    kept: list[str] = []
-    for word in head:
-        if not re.fullmatch(r"[a-z][a-z0-9-]{0,30}", word):
-            break
-        kept.append(word)
-    head = kept
-    line = " ".join(x for x in [*head, broker_logged_target(words, values)] if x)
-    # A backstop under the parse above, which is a parse of someone else's command line: however a
-    # credential reached this line, it does not stay in it.
-    line = BROKER_SECRET_RE.sub("[redacted]", line)
     path = guard_log()
     try:
         # 0700 like every other state path here: credentials are stripped, but this is every repo,
@@ -6418,6 +6406,27 @@ def broker_log_call(words: list[str], values: dict[str, str]) -> None:
             stream.write(f"{stamp} {caller} {line}\n")
     except OSError:
         pass
+    return line
+
+
+def broker_call_line(words: list[str], values: dict[str, str]) -> str:
+    """The subcommand words and one identifier for this call, as the call log keeps them."""
+    # `api` carries its path in words[1], and the target is that path with its query cut: one or
+    # the other, never both, or the query comes back in through the subcommand.
+    head = words[:1] if words[:1] == ["api"] else words[:2]
+    # A subcommand is a word. Anything else in that slot (`gh "pr view 7\n2026-..."`, or a value a
+    # flag this does not know about left behind) must not reach a line-oriented shared log.
+    kept: list[str] = []
+    for word in head:
+        if not re.fullmatch(r"[a-z][a-z0-9-]{0,30}", word):
+            break
+        kept.append(word)
+    head = kept
+    line = " ".join(x for x in [*head, broker_logged_target(words, values)] if x)
+    # A backstop under the parse above, which is a parse of someone else's command line: however a
+    # credential reached this line, it does not stay in it.
+    line = BROKER_SECRET_RE.sub("[redacted]", line)
+    return line
 
 
 def broker_hops() -> int:
@@ -6549,9 +6558,28 @@ def broker_plan(args: list[str], now: float) -> tuple[str, str | None, str | Non
 # host's own write is never answered with what it read just before. A write from another host is
 # bounded by the TTL, which is the trade this makes.
 #
+# A write is stamped no wider than what it can change (gh_cache_write_scope): a comment on PR 7
+# stamps PR 7 and the repository's lists, not every answer the host holds for the repository. Until
+# 2026-10-31 every write stamped its whole repository, and on cosmic-gray a write to manaflow-ai/cmux
+# came about every 30 s (comments, dispatches, reruns, merges), so most answers were thrown away
+# before anyone asked again: 1,000 of 17,090 calls were answered here over 8 hours, against 40% of
+# reads repeating within 90 s. Replaying that host's log, scoping alone took the PR and run reads
+# answered here from 12% to 16%, and the 90 s window to 18%.
+#
+# Each answer about one PR or run also remembers what glaeda's daemon held for that target when it
+# was read (gh_cache_watch). The daemon reads its watched targets every cycle and hears the
+# controller's webhooks within a tick, so when its copy changes the answer is dropped at once, from
+# whichever host the change came; and a completed run the daemon still watches, unchanged since the
+# answer, is kept for GH_CACHE_DONE_TTL, because a rerun would show up there first.
+#
 # Identical calls arriving together are filled once: the first takes the key's lock and runs gh,
-# the rest wait up to GH_CACHE_FILL_WAIT on that lock and then read its answer.
-GH_CACHE_TTL = 60.0
+# the rest wait up to GH_CACHE_FILL_WAIT on that lock and then read its answer. Identical means the
+# same question, not the same bytes (gh_cache_canonical): `-R O/R --json b,a` and `--json=a,b
+# --repo o/r` share one answer and one fill.
+GH_CACHE_TTL = 90.0  # the window cosmic-gray's repeats fall in (glaeda-gh audit: AUDIT_WINDOW)
+# An answer that cannot change: a completed job, a completed attempt's jobs, or a completed run the
+# daemon still watches and has seen no change in. As long as an answer is kept at all (GH_CACHE_KEEP).
+GH_CACHE_DONE_TTL = float(TERMINAL_REFRESH)
 GH_CACHE_MAX_BYTES = 2 * 1024 * 1024  # a bigger answer (a whole log) is passed on, not stored
 GH_CACHE_FILL_WAIT = 30.0
 GH_CACHE_KEEP = 600.0  # stored answers older than this are deleted
@@ -6603,6 +6631,56 @@ GH_CACHE_PURE = {
 }
 GH_CACHE_REPO_RE = re.compile(rf"^(?:https?://api\.github\.com/)?/?repos/({NAME})/({NAME})(?:[/?]|$)")
 GH_CACHE_MUTATION_RE = re.compile(r"\bmutation\b")
+# What one answer is about, read off an API path: a PR or issue (one number space), a run, or a job.
+GH_CACHE_API_PR_RE = re.compile(rf"^(?:https?://api\.github\.com/)?/?repos/({NAME})/({NAME})/(?:pulls|issues)/(\d+)(?:[/?]|$)")
+GH_CACHE_API_RUN_RE = re.compile(rf"^(?:https?://api\.github\.com/)?/?repos/({NAME})/({NAME})/actions/runs/(\d+)(?:[/?]|$)")
+GH_CACHE_API_JOB_RE = re.compile(rf"^(?:https?://api\.github\.com/)?/?repos/({NAME})/({NAME})/actions/jobs/(\d+)(?:[/?]|$)")
+GH_CACHE_PR_URL_RE = re.compile(rf"^https://github\.com/({NAME})/({NAME})/(?:pull|issues)/(\d+)/?$")
+# Lists of workflow runs: the REST reads repeated most on cosmic-gray (1,092 of 1,400 within 90 s over
+# 8 hours, 2026-10-30), which a comment or a label cannot change.
+GH_CACHE_API_RUNS_LIST_RE = re.compile(
+    rf"^(?:https?://api\.github\.com/)?/?repos/({NAME})/({NAME})/actions/(?:workflows/[^/?]+/)?runs/?(?:\?.*)?$")
+# Reads that never change what GitHub holds, so they stamp nothing. `auth git-credential` is git
+# asking gh for a password on every https fetch: it stamped every answer on the host, about once
+# every 40 minutes on cosmic-gray.
+GH_CACHE_PURE |= {("auth", "git-credential"), ("variable", "list"), ("variable", "get"), ("secret", "list"),
+                  ("ruleset", "list"), ("ruleset", "view"), ("gist", "view"), ("gist", "list")}
+# Boolean flags the canonical form may move: with every flag on a line known to take a value or not,
+# reordering them cannot attach a value to the wrong flag. A flag in neither list keeps the line as
+# typed (gh_cache_canonical returns None), which costs an answer, never a wrong one.
+GH_CACHE_BOOL_FLAGS = {"--log", "--log-failed", "--exit-status", "--paginate", "--slurp", "--name-only",
+                       "--patch", "--comments", "--required", "--verbose", "--include", "--silent",
+                       "--web", "--watch", "--fail-fast"}
+# Not `-i`, `-w` or any other one-letter flag: `-i` is `--include` to `gh api` and `--interval VALUE` to
+# `gh pr checks`, so a short flag's arity depends on the command and the line is kept as typed.
+# Two spellings of one flag, beyond the pair broker_words knows: only those that mean the same in
+# every read gh has. `-b` is `--body` in one command and `--branch` in another, so it stays as typed;
+# `-f` and `-F` are not aliases (a string and a typed value) and stay apart.
+GH_CACHE_FLAG_ALIAS = {**BROKER_FLAG_ALIAS, "-q": "--jq", "-t": "--template", "-L": "--limit", "-H": "--header",
+                       "-f": "--raw-field", "-F": "--field"}
+# Request fields, string or typed: one ordered group, because gh sends them in the order given and the
+# last of a repeated name wins whichever of the two spellings carried it. Sorting them apart by flag
+# name answered `-f state=open --raw-field state=closed` with `--raw-field state=closed -f state=open`.
+GH_CACHE_FIELD_GROUP = {"--raw-field", "--field"}
+# The subcommand verbs that change one PR or issue named on the line, and nothing else about the
+# repository but its lists.
+GH_CACHE_TARGET_WRITES = {"comment", "edit", "ready", "close", "reopen", "review", "lock", "unlock"}
+# `gh run` verbs that change one run named on the line (a rerun, or stopping it). This only reads the
+# caller's command line to decide what to invalidate; the broker runs that write as it was typed.
+GH_CACHE_RUN_WRITES = {"rerun", "cancel"}
+# Verbs that change one PR and, through the base branch, every other PR's mergeability.
+GH_CACHE_BASE_WRITES = {"merge", "update-branch"}
+# The flags of those writes, by whether they take a value, so their one positional word (the PR) can
+# be found. A write carrying a flag in neither set is stamped as wide as before.
+GH_CACHE_WRITE_VALUE_FLAGS = BROKER_VALUE_FLAGS | {
+    "--match-head-commit", "--subject", "--author-email", "--add-label", "--remove-label", "--milestone",
+    "--add-reviewer", "--remove-reviewer", "--add-assignee", "--remove-assignee", "--add-project",
+    "--remove-project", "-r", "-a", "-m", "-T", "--template", "-e", "--comment", "-c", "--reason"}
+GH_CACHE_WRITE_BOOL_FLAGS = {
+    "--squash", "-s", "--merge", "--rebase", "--auto", "--disable-auto", "--delete-branch", "-d", "--admin",
+    "--approve", "--request-changes", "--undo", "--yes", "--edit-last", "--create-if-none", "--delete-last",
+    "--draft", "--failed", "--debug", "--force", "--remove-milestone", "--fill", "--fill-first",
+    "--fill-verbose", "--no-maintainer-edit", "--dry-run", "--editor", "--web", "-w"}
 
 
 def gh_cache_dir() -> Path:
@@ -6735,7 +6813,7 @@ def gh_cache_key(args: list[str], words: list[str], values: dict[str, str], seen
             return None
     # A GraphQL question is its query and variables, in whatever order the flags came: two
     # scripts asking for the same page share one answer.
-    question = gh_cache_graphql_question(args) if graphql else args
+    question = gh_cache_graphql_question(args) if graphql else (gh_cache_canonical(args) or args)
     data = head[:1] == ("api",) or bool(seen & GH_CACHE_DATA_FLAGS)
     ident = [question, resolved, os.environ.get("GH_REPO") or "", os.environ.get("GH_HOST") or "",
              gh_cache_identity(real, data)]
@@ -6771,37 +6849,331 @@ def gh_cache_graphql_question(args: list[str]) -> list:
     return [fields, other]
 
 
+def gh_cache_canonical(args: list[str]) -> list | None:
+    """The question a non-GraphQL call asks, with the spelling taken out: flags in one order (a flag
+    given twice keeps its occurrences in order, since gh keeps the last or appends), each by one
+    name, glued values split off, `--repo` and `--json` lists normalised, an API path without its
+    host or leading slash and with its query in order, and a PR URL as its number and repository.
+
+    None -- the line is used as typed -- when any flag on it is one this does not know to take a
+    value or not, or the line has a `--`: moving such a flag could hand it the next word."""
+    words: list[str] = []
+    flags: list[tuple[str, str | None]] = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            return None
+        if arg.startswith("--") and "=" in arg:
+            name, value = arg.split("=", 1)
+            if name not in BROKER_VALUE_FLAGS:
+                return None
+        elif arg.startswith("-") and arg != "-":
+            name, value = arg, None
+            if not arg.startswith("--") and len(arg) > 2:
+                if arg[:2] not in BROKER_VALUE_FLAGS:
+                    return None  # `-abc`: several short flags in one word
+                name, value = arg[:2], arg[2:]
+            elif name in BROKER_VALUE_FLAGS:
+                if i + 1 >= len(args):
+                    return None  # gh rejects it; keep the line as typed
+                value = args[i + 1]
+                i += 1
+            elif name not in GH_CACHE_BOOL_FLAGS:
+                return None
+        else:
+            words.append(arg)
+            i += 1
+            continue
+        name = GH_CACHE_FLAG_ALIAS.get(name, name)
+        if name == "--repo" and value is not None:
+            value = value.rstrip("/").lower()
+        elif name == "--json" and value is not None:
+            # gh prints the fields as one JSON object whose keys Go sorts, so the order asked in and
+            # a field asked twice change nothing gh prints.
+            value = ",".join(sorted({f for f in value.split(",") if f}))
+        flags.append((name, value))
+        i += 1
+    if words[:1] == ["api"] and len(words) > 1:
+        # gh drops a leading slash from a path. The host stays: `https://api.github.com/x` and `x` are
+        # one request only when gh's own host is github.com, which this does not decide.
+        path = words[1] if "://" in words[1] else words[1].lstrip("/")
+        base, mark, query = path.partition("?")
+        pairs = [q for q in query.split("&") if q]
+        if mark and len({q.partition("=")[0] for q in pairs}) == len(pairs):
+            query = "&".join(sorted(pairs))  # a name given twice is an array: order kept
+        words[1] = base + (f"?{query}" if mark and query else "")
+    elif tuple(words[:2]) in {("pr", "view"), ("pr", "checks"), ("pr", "diff"), ("issue", "view")} \
+            and len(words) == 3 and not any(name == "--repo" for name, _ in flags):
+        match = GH_CACHE_PR_URL_RE.match(words[2])
+        # `issue view` of a pull URL is answered by gh as the PR, and `pr view` of an issues URL is
+        # an error: only the URL kind that matches the subcommand is rewritten.
+        kind = "issues" if words[0] == "issue" else "pull"
+        if match and f"/{kind}/" in words[2]:
+            words[2] = match.group(3)
+            flags.append(("--repo", f"{match.group(1)}/{match.group(2)}".lower()))
+    # Stable: one flag's repeats keep their order, and so do all request fields together.
+    flags.sort(key=lambda flag: "--field" if flag[0] in GH_CACHE_FIELD_GROUP else flag[0])
+    return ["canonical", words, [list(flag) for flag in flags]]
+
+
+def gh_cache_target(words: list[str], values: dict[str, str], repo: str | None) -> list | None:
+    """[kind, owner/repo, id] for an answer about one PR or issue ("pr"), run ("run") or job ("job"),
+    or None for anything else (a list, a search, an endpoint about the repository)."""
+    first, second = (words + ["", ""])[:2]
+    if first == "api" and len(words) > 1:
+        for kind, pattern in (("pr", GH_CACHE_API_PR_RE), ("run", GH_CACHE_API_RUN_RE), ("job", GH_CACHE_API_JOB_RE)):
+            match = pattern.match(words[1])
+            if match:
+                return [kind, f"{match.group(1)}/{match.group(2)}".lower(), match.group(3)]
+        return None
+    if (first, second) in {("pr", "view"), ("pr", "checks"), ("pr", "diff"), ("issue", "view")} and len(words) == 3:
+        match = GH_CACHE_PR_URL_RE.match(words[2])
+        if match:
+            return ["pr", f"{match.group(1)}/{match.group(2)}".lower(), match.group(3)]
+        if re.fullmatch(r"\d+", words[2]) and repo:
+            return ["pr", repo, str(int(words[2]))]
+        return None
+    if (first, second) == ("run", "view") and repo:
+        if len(words) == 3 and re.fullmatch(r"\d+", words[2]):
+            return ["run", repo, words[2]]
+        if len(words) == 2 and re.fullmatch(r"\d+", values.get("--job") or ""):
+            return ["job", repo, values["--job"]]
+    return None
+
+
+def gh_cache_stamps(target: list | None, repo: str | None, words: list[str] | None = None) -> list[str] | None:
+    """The writes.json entries that make an answer old: one about `target`, or about `repo` when it
+    is about nothing narrower (a list of workflow runs has a scope of its own, "runlists"). None when the
+    answer names no repository (every write counts)."""
+    if target is None and repo and words and (
+            tuple(words[:2]) == ("run", "list")
+            or (words[:1] == ["api"] and len(words) > 1 and GH_CACHE_API_RUNS_LIST_RE.match(words[1]))):
+        return ["*", repo, f"{repo} runlists"]
+    if target:
+        kind, repo, ident = target
+        narrow = {"pr": [f"{repo} pr {ident}", f"{repo} prs"], "run": [f"{repo} run {ident}", f"{repo} runs"],
+                  "job": [f"{repo} jobs", f"{repo} runs"]}[kind]
+        return ["*", repo, *narrow]
+    if repo:
+        return ["*", repo, f"{repo} other"]
+    return None
+
+
+def gh_cache_write_scope(args: list[str], words: list[str], method: str,
+                         values: dict[str, str]) -> tuple[str | None, list[str]]:
+    """(repository or None, the scopes this write stamps): "pr N", "run ID", "prs" (every PR's
+    mergeability or checks), "runs" (every run), "jobs", "runlists" (the lists of workflow runs: a
+    write that can start one) and "other" (the other lists, and everything not one target). [] is
+    the whole repository, as every write was before; a write naming no repository stamps every one.
+
+    Narrow only where what the write changes is known: anything else, a GraphQL mutation included,
+    stays as wide as it was."""
+    repo = gh_cache_repo(words, values)
+    if repo is None:
+        repo = broker_repo(values) if words[:1] != ["api"] else None
+    if repo is None:
+        return None, []
+    first, second = (words + ["", ""])[:2]
+    rest = words[2:]
+    if first == "api":
+        if AUDIT_GRAPHQL_RE.match(second):
+            return repo, []
+        path = re.sub(r"^https://api\.github\.com/", "", second).lstrip("/").split("?")[0]
+        tail = path.split("/")[3:]  # after repos/OWNER/REPO
+        if len(tail) >= 2 and tail[0] in ("pulls", "issues") and tail[1].isdigit():
+            if tail[0] == "pulls" and tail[2:3] and tail[2] in GH_CACHE_BASE_WRITES:
+                return repo, [f"pr {int(tail[1])}", "prs", "runlists", "other"]
+            # An edit, a label, a comment or a review: each can start a workflow (pull_request,
+            # issues, issue_comment, pull_request_review), so the run lists go with them.
+            return repo, [f"pr {int(tail[1])}", "runlists", "other"]
+        if tail in (["issues"], ["pulls"]):
+            return repo, ["runlists", "other"]  # a new issue or PR: issues.opened, pull_request
+        if len(tail) >= 3 and tail[:2] == ["actions", "runs"] and tail[2].isdigit():
+            return repo, [f"run {tail[2]}", "runlists", "jobs", "prs", "other"]
+        if len(tail) >= 3 and tail[:2] == ["actions", "jobs"] and tail[2].isdigit():
+            return repo, ["runs", "runlists", "jobs", "prs", "other"]
+        if len(tail) >= 4 and tail[:2] == ["actions", "workflows"] and tail[3] == "dispatches":
+            return repo, ["runlists", "prs", "other"]  # a new run: its checks reach a PR on that branch
+        return repo, []
+    rest = gh_cache_write_positionals(args)
+    if rest is None:
+        return repo, []
+    rest = rest[2:]
+    number = next((w for w in rest[:1] if re.fullmatch(r"\d+", w)), None)
+    url = GH_CACHE_PR_URL_RE.match(rest[0]) if rest else None
+    if url:
+        number = url.group(3)
+    if first in ("pr", "issue") and number is not None and len(rest) == 1:
+        if first == "pr" and second in GH_CACHE_BASE_WRITES:
+            return repo, [f"pr {int(number)}", "prs", "runlists", "other"]
+        if second in GH_CACHE_TARGET_WRITES:
+            # A label, a ready-for-review, a reopen, a comment or a review can each start a workflow
+            # (pull_request, issue_comment, pull_request_review): the run lists go with them.
+            return repo, [f"pr {int(number)}", "runlists", "other"]
+    if (first, second) in {("pr", "create"), ("issue", "create")}:
+        return repo, ["runlists", "other"]  # pull_request, issues.opened
+    if first == "run" and second in GH_CACHE_RUN_WRITES and rest[:1] and rest[0].isdigit() and len(rest) == 1:
+        return repo, [f"run {rest[0]}", "runlists", "jobs", "prs", "other"]
+    if (first, second) == ("workflow", "run"):
+        return repo, ["runlists", "prs", "other"]
+    return repo, []
+
+
+def gh_cache_write_positionals(args: list[str]) -> list[str] | None:
+    """The positional words of a `gh pr|issue|run|workflow` write, or None when a flag on it is in
+    neither GH_CACHE_WRITE_VALUE_FLAGS nor GH_CACHE_WRITE_BOOL_FLAGS (its value could be read as the
+    PR's number) or the line has a `--`."""
+    words, i = [], 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            return None
+        if arg.startswith("-") and arg != "-":
+            name = arg.split("=", 1)[0]
+            if "=" in arg and name.startswith("--"):
+                pass
+            elif not name.startswith("--") and len(name) > 2:
+                if name[:2] not in GH_CACHE_WRITE_VALUE_FLAGS:
+                    return None  # `-abc`, or a glued value on a flag this does not know
+            elif name in GH_CACHE_WRITE_VALUE_FLAGS:
+                i += 1
+            elif name not in GH_CACHE_WRITE_BOOL_FLAGS:
+                return None
+        else:
+            words.append(arg)
+        i += 1
+    return words
+
+
+def gh_cache_post_scopes(item: dict) -> list[str]:
+    """What a queued `post` changes, as gh_cache_write_scope has it for the same write made directly: a
+    comment or review its PR or issue, the lists and the run lists (it can start a workflow); a new PR
+    the lists and the run lists. Anything else stamps the whole repository."""
+    number = item.get("number")
+    if item.get("kind") in ("comment", "review") and isinstance(number, int) and not isinstance(number, bool):
+        return [f"pr {number}", "runlists", "other"]
+    if item.get("kind") == "pr":
+        return ["runlists", "other"]
+    return []
+
+
+GH_CACHE_WATCH_KIND = {"pr": "pr", "run": "run"}
+
+
+def gh_cache_watch(target: list | None) -> tuple[str, dict] | None:
+    """(daemon key, its cached entry) for the PR or run an answer is about, when glaeda's daemon holds
+    data for it; None otherwise. Never raises: this is a lookup in front of a gh call."""
+    if not target or target[0] not in GH_CACHE_WATCH_KIND:
+        return None
+    kind, repo, ident = target
+    try:
+        key = parse_key(kind, f"{repo}{'#' if kind == 'pr' else '/'}{ident}")
+        entry = read_cache(key)
+    except (WatchError, OSError, ValueError):
+        return None
+    if not isinstance(entry, dict) or not isinstance(entry.get("data"), dict):
+        return None
+    return key, entry
+
+
+def gh_cache_watch_mark(kind: str, entry: dict) -> str:
+    """A digest of what the daemon holds for one target: its data, and a run's jobs. It changes when
+    the daemon has seen the target change, which is what an answer kept beside it is checked against."""
+    held = {"data": entry.get("data"), "jobs": entry.get("jobs") if kind == "run" else None}
+    return hashlib.sha256(json.dumps(held, sort_keys=True, default=str).encode()).hexdigest()[:32]
+
+
+def gh_cache_done(words: list[str], seen: set[str], out: bytes) -> bool:
+    """Whether a stored answer can no longer change: a completed job, or every job of one attempt
+    completed. Read from the answer itself, so only for a raw `gh api` read (no --jq or template)."""
+    if words[:1] != ["api"] or len(words) < 2 or seen & {"--jq", "-q", "--template", "-t", "--paginate"}:
+        return False
+    path = re.sub(r"^https://api\.github\.com/", "", words[1]).lstrip("/").split("?")[0]
+    try:
+        doc = json.loads(out)
+    except ValueError:
+        return False
+    if not isinstance(doc, dict):
+        return False
+    if re.fullmatch(rf"repos/{NAME}/{NAME}/actions/jobs/\d+/?", path):
+        return doc.get("status") == "completed"
+    if re.fullmatch(rf"repos/{NAME}/{NAME}/actions/runs/\d+/attempts/\d+/jobs/?", path):
+        jobs = doc.get("jobs")
+        return (isinstance(jobs, list) and bool(jobs) and doc.get("total_count") == len(jobs)
+                and all(isinstance(j, dict) and j.get("status") == "completed" for j in jobs))
+    return False
+
+
 def gh_cache_writes() -> dict[str, float]:
     doc = read_json(gh_cache_dir() / "writes.json")
     return {str(k): float(v) for k, v in (doc if isinstance(doc, dict) else {}).items()
             if isinstance(v, (int, float)) and not isinstance(v, bool)}
 
 
-def gh_cache_note_write(repo: str | None, now: float) -> None:
+def gh_cache_note_write(repo: str | None, now: float, scopes: list[str] | None = None) -> None:
     """Stamp a write, so no answer read before it is served after it. A write is stamped when it
     starts and again when it finishes (gh_cache_write), so a read that began while it was in flight
     is older than the second stamp and is not served either. Bounded like every lock here: losing
-    a stamp to a wedged sibling costs at most one TTL of staleness, never the gh call."""
+    a stamp to a wedged sibling costs at most one TTL of staleness, never the gh call.
+
+    `scopes` (gh_cache_write_scope) narrows the stamp to what the write can change within `repo`;
+    none stamps the whole repository, and no repository stamps every answer on the host."""
+    names = [f"{repo} {scope}" for scope in scopes] if repo and scopes else [repo or "*"]
     with bounded_lock(gh_cache_dir().parent / ".answers-writes.lock"):
         writes = {k: v for k, v in gh_cache_writes().items() if now - v < GH_CACHE_KEEP}
-        writes[repo or "*"] = max(writes.get(repo or "*", 0.0), now)
+        for name in names:
+            writes[name] = max(writes.get(name, 0.0), now)
         write_json(gh_cache_dir() / "writes.json", writes)
 
 
 def gh_cache_get(key: str, repo: str | None, now: float) -> dict | None:
     """The stored answer for `key`, if it is younger than the TTL and than every write that could
-    have changed it."""
+    have changed it, and glaeda's daemon has seen no change in the PR or run it is about."""
     doc = read_json(gh_cache_dir() / f"{key}.json")
     if not isinstance(doc, dict) or doc.get("key") != key or not isinstance(doc.get("at"), (int, float)):
         return None
     at = float(doc["at"])
     ttl = gh_cache_ttl()
-    if ttl > 0 and doc.get("long") is True:
+    long = ttl > 0 and doc.get("long") is True
+    if long:
         ttl = max(ttl, GH_CACHE_LONG_TTL)
+    watch = doc.get("watch")
+    watched = None  # the daemon's entry when it still holds what it held at the read; None unknown
+    if isinstance(watch, list) and len(watch) == 3 and all(isinstance(x, str) for x in watch):
+        daemon_key, mark, kind = watch
+        entry = None
+        with contextlib.suppress(Exception):
+            entry = read_cache(daemon_key)
+        if isinstance(entry, dict) and isinstance(entry.get("data"), dict):
+            if gh_cache_watch_mark(kind, entry) != mark:
+                # The daemon read this PR or run again since the answer was taken, and what it read
+                # is different: a push, a new check, a rerun, a merge -- from this host or any other.
+                return None
+            watched = entry
+        # No entry any more (the watch lapsed): nothing to compare with, so the TTL and the write
+        # stamps decide, as for an answer the daemon never held.
+    if ttl > 0 and not long and (doc.get("done") is True or (
+            watched and doc.get("doneWhenRead") is True and isinstance(watched.get("fetchedAt"), (int, float))
+            and now - watched["fetchedAt"] < TERMINAL_REFRESH + 2 * CYCLE)):
+        # Cannot change (a completed job), or a completed run whose daemon copy is still being read
+        # and has not changed since. A rerun reaches that copy through the controller's webhook
+        # within a tick, or the daemon's own re-read of a finished run (TERMINAL_REFRESH) when the
+        # controller misses it -- the same bound `wait run` lives with -- and a rerun from this host
+        # stamps the run at once. Never past what the daemon would see: GH_CACHE_DONE_TTL is
+        # TERMINAL_REFRESH.
+        ttl = max(ttl, GH_CACHE_DONE_TTL)
     if not 0 <= now - at < ttl:
         return None
     writes = gh_cache_writes()
-    newest = max([writes.get("*", 0.0)] + ([writes.get(repo, 0.0)] if repo else list(writes.values())))
+    stamps = doc.get("stamps")
+    if isinstance(stamps, list) and all(isinstance(x, str) for x in stamps):
+        newest = max([writes.get(name, 0.0) for name in stamps] + [0.0])
+    else:
+        # An answer kept before writes were scoped, or one naming no repository: every write to its
+        # repository counts, however narrowly it was stamped.
+        newest = max([writes.get("*", 0.0)] + ([v for k, v in writes.items() if k == repo or k.startswith(f"{repo} ")]
+                                               if repo else list(writes.values())))
     if newest >= at:
         return None
     try:
@@ -6810,13 +7182,36 @@ def gh_cache_get(key: str, repo: str | None, now: float) -> dict | None:
         return None
 
 
-def gh_cache_put(key: str, at: float, rc: int, out: bytes, err: bytes, long: bool = False) -> None:
+def gh_cache_put(key: str, at: float, rc: int, out: bytes, err: bytes, long: bool = False,
+                 meta: dict | None = None) -> None:
+    """Keep one answer. `meta` carries what makes it old (gh_cache_meta): the write stamps it is
+    checked against, the daemon entry it is checked against, and whether it can still change."""
     if rc != 0 or len(out) + len(err) > GH_CACHE_MAX_BYTES:
         return
-    write_json(gh_cache_dir() / f"{key}.json", {"key": key, "at": at, "rc": rc, "long": long,
-                                               "out": base64.b64encode(out).decode(),
-                                               "err": base64.b64encode(err).decode()})
+    doc = {"key": key, "at": at, "rc": rc, "long": long,
+           "out": base64.b64encode(out).decode(), "err": base64.b64encode(err).decode()}
+    doc.update({k: v for k, v in (meta or {}).items() if k in ("stamps", "watch", "doneWhenRead", "done")})
+    write_json(gh_cache_dir() / f"{key}.json", doc)
     gh_cache_prune(at)
+
+
+def gh_cache_meta(words: list[str], values: dict[str, str], repo: str | None) -> dict:
+    """What an answer about to be read must be checked against later, taken before gh runs: the write
+    stamps for its target (gh_cache_stamps) and, when glaeda's daemon holds the PR or run, a mark of
+    what it holds now. A mark taken before the read can only be older than the answer, so a change
+    the daemon sees afterwards always drops it -- never the other way round."""
+    target = gh_cache_target(words, values, repo)
+    meta: dict[str, Any] = {}
+    stamps = gh_cache_stamps(target, repo, words)
+    if stamps is not None:
+        meta["stamps"] = stamps
+    held = gh_cache_watch(target)
+    if held is not None:
+        daemon_key, entry = held
+        kind = daemon_key.split(":", 1)[0]
+        meta["watch"] = [daemon_key, gh_cache_watch_mark(kind, entry), kind]
+        meta["doneWhenRead"] = kind == "run" and terminal("run", entry.get("data"))
+    return meta
 
 
 def gh_cache_prune(now: float) -> None:
@@ -6934,40 +7329,53 @@ def gh_cache_fill_lock(path: Path, seconds: float):
             handle.close()
 
 
-def gh_cache_fill(real: str, args: list[str], key: str, repo: str | None, ran: list[int]) -> int | None:
+def gh_cache_fill(real: str, args: list[str], key: str, repo: str | None, ran: list[int],
+                  note: dict | None = None) -> int | None:
     """Run the real gh once for `key` and keep its answer; an identical call already doing that is
     waited for instead. None when the key's lock could not be had in GH_CACHE_FILL_WAIT: the caller
     then runs gh the ordinary way. Once gh has run its exit code is in `ran`, so a caller that
-    catches an error from here knows not to run it a second time."""
+    catches an error from here knows not to run it a second time.
+
+    `note` is the call's "pass" decision: written when gh runs here, replaced by a "cache" one when a
+    sibling's answer serves it, and left to the caller when the lock could not be had. One decision
+    per call, so the audit does not count a waited call as both."""
     gh_cache_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
+    note = note if note is not None else {"route": "pass"}
     with gh_cache_fill_lock(gh_cache_dir() / f".{key}.lock", GH_CACHE_FILL_WAIT) as held:
         if not held:
-            return None
+            return None  # the caller runs gh, and writes the note
         answer = gh_cache_get(key, repo, time.time())
         if answer is not None:
-            broker_note({"route": "cache", "waited": True})
+            broker_note({"route": "cache", "waited": True, **({"line": note["line"]} if "line" in note else {})})
             ran.append(answer["rc"])
             return gh_cache_emit(answer)
+        words, _method, seen, values = broker_words(args)
+        meta: dict = {}
+        with contextlib.suppress(Exception):
+            meta = gh_cache_meta(words, values, repo)
+        broker_note({**{k: v for k, v in note.items() if k != "written"}, "filled": True})
+        note["written"] = True  # the caller's record: it must not write the decision a second time
         at = time.time()
         rc, out, err = gh_cache_child(real, args, True, GH_CACHE_FILL_DEADLINE)
         ran.append(rc)
         with contextlib.suppress(Exception):
-            words = broker_words(args)[0]
             long = words[:1] == ["api"] and len(words) > 1 and bool(GH_CACHE_LONG_RE.match(words[1]))
-            gh_cache_put(key, at, rc, out, err, long)
+            meta["done"] = rc == 0 and gh_cache_done(words, seen, out)
+            gh_cache_put(key, at, rc, out, err, long, meta)
     return gh_cache_emit({"rc": rc, "out": out, "err": err})
 
 
-def gh_cache_write(real: str, args: list[str], repo: str | None, ran: list[int]) -> int:
-    """Run a write as a child and stamp its repository again once it finished, so nothing read
-    while it was in flight outlives it."""
+def gh_cache_write(real: str, args: list[str], repo: str | None, ran: list[int],
+                   scopes: list[str] | None = None) -> int:
+    """Run a write as a child and stamp it again once it finished, so nothing read while it was in
+    flight outlives it."""
     try:
         rc, _out, _err = gh_cache_child(real, args, False, None)
         ran.append(rc)
     finally:
         if ran:
             with contextlib.suppress(Exception):
-                gh_cache_note_write(repo, time.time())
+                gh_cache_note_write(repo, time.time(), scopes)
     return rc
 
 
@@ -7089,7 +7497,8 @@ def cmd_gh(args: list[str]) -> int:
     now = time.time()
     real = None
     hops = broker_hops()
-    cache_key, cache_repo, writing, write_repo = None, None, False, None
+    cache_key, cache_repo, writing, write_repo, write_scopes = None, None, False, None, []
+    pending: dict | None = None  # the "pass" record of a read the answer cache fills, written once it is known
     try:
         real = broker_real_gh()
         if hops:
@@ -7102,26 +7511,29 @@ def cmd_gh(args: list[str]) -> int:
         # repeat hold inside gives its own time back (see broker_hold): the budget bounds waiting
         # on a sibling, and a deliberate 30 s brake is not that.
         with lock_budget():
-            broker_log_call(words, values)
+            # The call's logged identifier rides on each read's decision, so `audit` can say how many
+            # repeat reads still reached GitHub, not only how many were asked for.
+            line = broker_log_call(words, values)
+            said = {"line": line} if audit_category(line.split())[1] else {}
             route, payload, key = broker_plan(args, now)
             if route == "refuse":
                 broker_note({"route": "refuse"})
                 print(payload, file=sys.stderr)
                 return BROKER_EXIT_REFUSED
             if route == "serve":
-                broker_note({"route": "serve", "key": key})
+                broker_note({"route": "serve", "key": key, **said})
                 print(payload)
                 return EXIT_OK
             if key is not None and not sys.stdout.isatty() and broker_bucket_spent(key, now) \
                     and daemon_running():
-                line = broker_await(args, key)
-                if line is not None:
-                    broker_note({"route": "serve", "key": key, "spent": True})
-                    print(line)
+                answered = broker_await(args, key)
+                if answered is not None:
+                    broker_note({"route": "serve", "key": key, "spent": True, **said})
+                    print(answered)
                     return EXIT_OK
             if gh_cache_is_write(args, words, method):
-                write_repo = gh_cache_repo(words, values)
-                gh_cache_note_write(write_repo, now)
+                write_repo, write_scopes = gh_cache_write_scope(args, words, method, values)
+                gh_cache_note_write(write_repo, now, write_scopes)
                 writing = gh_cache_ttl() > 0
             else:
                 cache_key = gh_cache_key(args, words, values, seen, method, real)
@@ -7131,7 +7543,7 @@ def cmd_gh(args: list[str]) -> int:
                         None if words[:1] == ["api"] and not any("{" in a for a in args) else broker_repo(values))
                     answer = gh_cache_get(cache_key, cache_repo, now)
                     if answer is not None:
-                        broker_note({"route": "cache"})
+                        broker_note({"route": "cache", **said})
                         return gh_cache_emit(answer)
                 refusal = gh_sweep_refusal(words, method, now)
                 if refusal:
@@ -7150,11 +7562,14 @@ def cmd_gh(args: list[str]) -> int:
                 # target read once is never watched, or a sweep over fifty PRs would cost more
                 # than it saves.
                 register(key)
-                broker_note({"route": "pass", "key": key, "watched": True})
+                pending = {"route": "pass", "key": key, "watched": True, **said}
             else:
-                broker_note({"route": "pass", "key": key})
+                pending = {"route": "pass", "key": key, **said}
+            if cache_key is None:
+                broker_note(pending)
+                pending = None
     except Exception as error:  # noqa: BLE001  the broker never fails a call: that is the whole contract
-        cache_key, writing = None, False
+        cache_key, writing, pending = None, False, None
         if not isinstance(error, WatchError) or str(error) != "already brokered":
             broker_note({"route": "error", "error": describe(error), "site": error_site(error)})
         if real is None:
@@ -7185,14 +7600,16 @@ def cmd_gh(args: list[str]) -> int:
         ran: list[int] = []
         try:
             if writing:
-                return gh_cache_write(real, args, write_repo, ran)
-            filled = gh_cache_fill(real, args, cache_key, cache_repo, ran)
+                return gh_cache_write(real, args, write_repo, ran, write_scopes)
+            filled = gh_cache_fill(real, args, cache_key, cache_repo, ran, pending)
             if filled is not None:
                 return filled
         except Exception as error:  # noqa: BLE001  fails open, but never runs gh twice
             broker_note({"route": "error", "error": describe(error), "site": error_site(error)})
             if ran:
-                return ran[0]
+                return ran[0]  # its decision is written: gh ran inside the fill
+    if pending is not None and not pending.get("written"):
+        broker_note(pending)
     try:
         # Survives the exec, so this call is not brokered twice; tagged with the pid so it means
         # nothing to anything gh goes on to spawn (see broker_hops). execv keeps the pid, which is
@@ -7300,6 +7717,7 @@ def cmd_audit(path: Path, last: int, as_json: bool) -> int:
     per_read: dict[str, list[int]] = {}
     seen: dict[str, float] = {}
     hot: dict[str, int] = {}
+    since = None  # the first call in the window: the decision records counted below start there
     for line in lines:
         match = AUDIT_LINE.match(line)
         if not match:
@@ -7307,6 +7725,8 @@ def cmd_audit(path: Path, last: int, as_json: bool) -> int:
         stamp, _caller, text = match.groups()
         words = text.split()
         at = iso_epoch(stamp)
+        if since is None and at is not None:
+            since = at
         total += 1
         category, cacheable = audit_category(words)
         counts[category] = counts.get(category, 0) + 1
@@ -7329,6 +7749,12 @@ def cmd_audit(path: Path, last: int, as_json: bool) -> int:
     if not total:
         raise WatchError(f"no gh calls logged in {path}")
     served = {}
+    # What became of the repeats: a decision record that names its read (`line`, written since
+    # 2026-10-31) says whether the cache answered it or it reached GitHub. Counted over the same
+    # window as the call log above, and with the same rule for a repeat, so "reached GitHub" is the
+    # part of `repeatsWithin` a cache did not absorb -- the number the cache exists to bring down.
+    named = {"reads": 0, "repeats": 0, "repeatsReachedGitHub": 0}
+    named_seen: dict[str, float] = {}
     # Both files, newest last, for the same reason the call log reads its predecessor: these counts
     # are the broker's before/after number, and reading only the live file truncated them at every
     # rotation. Each line is self-contained JSON, so unlike the call log there is nothing to glue.
@@ -7347,6 +7773,16 @@ def cmd_audit(path: Path, last: int, as_json: bool) -> int:
             if not isinstance(route, str):
                 continue  # a record of some other shape is not a decision
             served[route] = served.get(route, 0) + 1
+            said, at = record.get("line"), record.get("at")
+            if (not isinstance(said, str) or not isinstance(at, (int, float)) or since is None or at < since - 1
+                    or route not in ("pass", "cache", "serve") or AUDIT_BARE.fullmatch(said)):
+                continue
+            named["reads"] += 1
+            if 0 <= at - named_seen.get(said, float("-inf")) <= AUDIT_WINDOW:
+                named["repeats"] += 1
+                named["repeatsReachedGitHub"] += route == "pass"
+            if route == "pass":
+                named_seen[said] = at  # a repeat is a re-read of what last came from GitHub
     # Not a second JSON field: this is `categories["raw gh api graphql"]` by construction, and a
     # count under two names is a count that can disagree with itself.
     batched = counts.get("raw gh api graphql", 0)
@@ -7354,7 +7790,7 @@ def cmd_audit(path: Path, last: int, as_json: bool) -> int:
         print(json.dumps({"calls": total, "categories": counts, "cacheableReads": reads,
                           "repeatsWithin": {"seconds": AUDIT_WINDOW, "calls": repeats},
                           "perRead": {k: {"reads": v[0], "repeats": v[1]} for k, v in per_read.items()},
-                          "brokerDecisions": served}, sort_keys=True))
+                          "brokerDecisions": served, "decisionReads": named}, sort_keys=True))
         return EXIT_OK
     print(f"{total} gh calls logged in {path}\n")
     print(f"{'category':<34}{'calls':>8}{'share':>8}")
@@ -7374,6 +7810,11 @@ def cmd_audit(path: Path, last: int, as_json: bool) -> int:
     if hot:
         print("hottest targets: " + "; ".join(f"{text} x{n}" for text, n in
                                               sorted(hot.items(), key=lambda kv: -kv[1])[:5]))
+    if named["reads"]:
+        reached = named["repeatsReachedGitHub"]
+        print(f"of {named['reads']} cacheable reads the broker recorded in this window, {reached} "
+              f"({100 * reached / named['reads']:.1f}%) re-read within {int(AUDIT_WINDOW)} seconds what this host had "
+              f"read from GitHub and still reached it; the cache answered {named['repeats'] - reached} other repeats.")
     if served:
         print("\nbroker decisions so far: " + ", ".join(f"{k} {v}" for k, v in sorted(served.items())))
     if batched:
@@ -7873,7 +8314,7 @@ def cmd_post(args: argparse.Namespace) -> int:
         print(f"glaeda-gh: not queued: {why}", file=sys.stderr)
         return 3
     with contextlib.suppress(Exception):
-        gh_cache_note_write(str(item.get("repo") or "").lower() or None, time.time())
+        gh_cache_note_write(str(item.get("repo") or "").lower() or None, time.time(), gh_cache_post_scopes(item))
     write_json(outbox_dir() / f"{item['id']}.json", item)
     if not daemon_running(DOWN_GRACE):
         print(f"glaeda-gh: queued as {item['id']}; it is posted once the daemon runs. " + DOWN, file=sys.stderr)
