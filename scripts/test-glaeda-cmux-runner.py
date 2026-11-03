@@ -2574,13 +2574,14 @@ class HookTest(unittest.TestCase):
     def test_a_nightly_sign_or_verify_job_needs_no_compile_tokens(self) -> None:
         """nightly.yml's sign and verify jobs were unknown jobs, so compiles: first in line, they still waited for the
         persistent-dd and canonical root a PR compile held, though they never use either. Light now: with both held
-        and 3 units free they are admitted at once; generate-nightly-deltas is isolated. The jobs that hold the
-        Developer ID key are exclusive (SIGNING_JOBS, test_a_signing_job_takes_the_whole_mini)."""
+        and 3 units free they are admitted at once. The jobs that hold the Developer ID key or a Sparkle key
+        (generate-nightly-deltas) are exclusive (SIGNING_JOBS, test_a_signing_job_takes_the_whole_mini)."""
         for job in ("verify-signed-nightly", "verify-final-dmg-nightly", "verify-recovered-nightly-next",
                     "signer-dmg-image", "verify-nightly-identity-legacy"):
             self.assertEqual(hook.job_class(job, "manaflow-ai/cmux", workflow="nightly.yml"), ("light", False))
+        # cmux#29261's claim gate fails generate-nightly-deltas without GLAEDA_JOB_CLAIM=exclusive (run 41603733816).
         self.assertEqual(hook.job_class("generate-nightly-deltas", "manaflow-ai/cmux", workflow="nightly.yml"),
-                         ("isolated", False))
+                         ("exclusive", False))
         self.fleet()
         self.take_units(11)
         capacity = self.dir / "capacity"

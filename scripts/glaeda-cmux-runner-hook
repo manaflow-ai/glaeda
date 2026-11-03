@@ -362,7 +362,8 @@ JOB_CLASSES = {"macos-compile-admission": "compile", "app-host-unit-tests": "gui
 SIGNING_JOBS = (("nightly.yml", "promote-nightly-next"), ("nightly.yml", "build-sign-notarize-nightly"),
                 ("nightly.yml", "recover-nightly-next-notarization"), ("nightly.yml", "publish-nightly"),
                 ("nightly.yml", "publish-nightly-next-github"), ("nightly.yml", "publish-nightly-next-github-names"),
-                ("nightly.yml", "sign-nightly-identity-legacy"), ("release.yml", "build-sign-notarize"),
+                ("nightly.yml", "sign-nightly-identity-legacy"), ("nightly.yml", "generate-nightly-deltas"),
+                ("release.yml", "build-sign-notarize"),
                 ("repair-v0-64-25-helper-rpaths.yml", "repair"), ("cmux-next-dev-daily.yml", "sign"))
 WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "test"): "isolated",
                         ("cmux-tui.yml", "build"): "isolated", ("cmux-tui.yml", "cdp-browser-smoke"): "isolated",
@@ -415,8 +416,8 @@ WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "
                         # codesign, notarytool, hdiutil and scripts, in the workspace and $RUNNER_TEMP. No compile,
                         # canonical root, kept DerivedData or XCTest. As unknown jobs they were compiles (5 units,
                         # persistent-dd and a root), so a nightly verify first in line (FEED_FIRST) still waited for
-                        # a PR compile's persistent-dd and root, which it never uses. generate-nightly-deltas runs
-                        # Sparkle's BinaryDelta over whole apps: isolated.
+                        # a PR compile's persistent-dd and root, which it never uses. generate-nightly-deltas holds the
+                        # Sparkle key, so it is a SIGNING_JOBS entry (cmux#29261 gave it the claim gate).
                         # main's post-publication canary and launch smoke (NIGHTLY_VERIFY_WORKFLOWS) download a published
                         # DMG and run the app in it from $RUNNER_TEMP with its own HOME: no compile, canonical root or
                         # kept DerivedData. As unknown jobs they were compiles (5 units, persistent-dd and a root).
@@ -429,7 +430,6 @@ WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "
                         ("nightly.yml", "signer-dmg-image"): "light",
                         ("nightly.yml", "verify-recovered-nightly-next"): "light",
                         ("nightly.yml", "verify-nightly-identity-legacy"): "light",
-                        ("nightly.yml", "generate-nightly-deltas"): "isolated",
                         # SIGNING_JOBS: the jobs that import the Developer ID key into a temporary keychain take the
                         # whole mini (the exclusive class, below).
                         **{key: "exclusive" for key in SIGNING_JOBS}}
