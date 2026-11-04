@@ -59,6 +59,13 @@ jobs:
           elif ! grep -q -e "no assets match" -e "release not found" channels/err; then
             cat channels/err; exit 1
           fi
+          # cmux's signing claim gate trusts only the runner hooks its glaeda-signing-hooks.txt lists, read at
+          # each nightly-next run's own commit. A release whose hook is not on feat-cmux-next's list yet would
+          # make stable hosts refuse those runs' sign and publish jobs (run 41889861374), so it waits for
+          # cmuxterm-hq's sync PR to merge. An unreadable list fails this run and stable stays where it is.
+          gh api -H "Accept: application/vnd.github.raw" \
+            "repos/manaflow-ai/cmux/contents/scripts/ci/glaeda-signing-hooks.txt?ref=feat-cmux-next" \
+            > channels/glaeda-signing-hooks.txt
           # releases newest first, down to stable; soaking ones count too, since their canary failures
           # block promoting anything older
           gh release list --limit 40 --json tagName,publishedAt \
@@ -79,8 +86,10 @@ jobs:
               set -e
               case "$code" in 0) ;; 1) descends=false ;; *) echo "stable $stable_source is not in main's history" >&2; exit 1 ;; esac
             fi
+            git show "$source:scripts/glaeda-cmux-runner-hook" > channels/hook
             python3 scripts/glaeda_release.py candidate --release channels/release.json --published "$created" \
-              --statuses channels/statuses.json --descends "$descends" >> channels/candidates.jsonl
+              --statuses channels/statuses.json --descends "$descends" \
+              --hook channels/hook --trusted-hooks channels/glaeda-signing-hooks.txt >> channels/candidates.jsonl
             considered=$((considered + 1))
             if [ "$tag" = "$stable_tag" ] || [ "$considered" -ge 20 ]; then break; fi
           done < channels/releases.txt

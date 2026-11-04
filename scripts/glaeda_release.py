@@ -126,6 +126,21 @@ def hook_history(root: Path, source: str) -> bytes:
     return canonical(history)
 
 
+# cmux's list of runner hooks its signing claim gate trusts (scripts/ci/glaeda-signing-hooks.txt on
+# feat-cmux-next, which cmuxterm-hq's sync PR updates). A nightly-next run reads it at its own commit, so a
+# hook stable installs before that list has it refuses the run's sign and publish jobs (run 41889861374,
+# 2026-11-04). promote holds such a release until the sync PR has merged.
+TRUSTED_HOOK_LINE = re.compile(r"^([0-9a-f]{64})(?:\s|$)")
+
+
+def trusted_hooks(text: str) -> frozenset[str]:
+    """The SHA-256 digests cmux's glaeda-signing-hooks.txt lists, one per non-comment line."""
+    found = frozenset(m.group(1) for line in text.splitlines() if (m := TRUSTED_HOOK_LINE.match(line.strip())))
+    if not found:
+        raise ReleaseError("cmux's trust list names no runner hook")
+    return found
+
+
 def hygiene_asset(target: str) -> str:
     return f"glaeda-hygiene-{target}.tar.gz"
 
@@ -380,6 +395,10 @@ def choose(candidates: list[dict], stable: dict | None, now: dt.datetime,
         if stable is not None and not candidate.get("descendsFromStable"):
             reasons.append(f"{entry['tag']}: does not descend from stable")
             continue
+        if candidate.get("hookTrusted") is False:
+            reasons.append(f"{entry['tag']}: cmux does not trust its runner hook {candidate['hook'][:12]} yet"
+                           " (waits for the glaeda-signing-hooks sync PR)")
+            continue
         ok, why = promotion(entry, stable, candidate["statuses"], now,
                             soak_hours if soak_hours is not None else policy["soakHours"],
                             smoke_passed=candidate.get("smoked") is True)
@@ -423,6 +442,8 @@ def main(argv: list[str] | None = None) -> int:
     d.add_argument("--published", required=True, help="the release's creation time (ISO 8601)")
     d.add_argument("--statuses", type=Path, required=True, help="its source commit's statuses (API JSON)")
     d.add_argument("--descends", choices=("true", "false"), required=True, help="descends from stable")
+    d.add_argument("--hook", type=Path, help="the release source's scripts/glaeda-cmux-runner-hook")
+    d.add_argument("--trusted-hooks", type=Path, help="cmux's scripts/ci/glaeda-signing-hooks.txt")
     p = sub.add_parser("promote", help="print stable.json for the best candidate (exit 3 if none)")
     p.add_argument("--candidates", type=Path, required=True, help="JSON lines from `candidate`")
     p.add_argument("--stable", type=Path, help="current stable.json; absent means none yet")
@@ -465,9 +486,14 @@ def main(argv: list[str] | None = None) -> int:
                 raise ReleaseError("statuses must be the API's JSON list")
             entry = channel_entry("canary", doc, release_raw, a.published)
             policy = parse_policy(doc.get("policy"), legacy=doc.get("policy") is None)
-            print(json.dumps({"entry": entry, "policy": policy, "statuses": statuses,
-                              "descendsFromStable": a.descends == "true", "smoked": smoked(doc)},
-                             sort_keys=True))
+            out = {"entry": entry, "policy": policy, "statuses": statuses,
+                   "descendsFromStable": a.descends == "true", "smoked": smoked(doc)}
+            if (a.hook is None) != (a.trusted_hooks is None):
+                raise ReleaseError("--hook and --trusted-hooks go together")
+            if a.hook is not None:
+                out["hook"] = sha256(a.hook.read_bytes())
+                out["hookTrusted"] = out["hook"] in trusted_hooks(a.trusted_hooks.read_text())
+            print(json.dumps(out, sort_keys=True))
         elif a.command == "promote":
             stable = parse_channel(a.stable.read_bytes(), "stable") if a.stable else None
             candidates = [json.loads(line) for line in a.candidates.read_text().splitlines() if line.strip()]
