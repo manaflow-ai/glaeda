@@ -573,6 +573,59 @@ class HookTest(unittest.TestCase):
                                    repo="manaflow-ai/cmux", env=environ)
             self.assertEqual(result.returncode == 0, bool(trusted), result.stdout + result.stderr)
 
+    def test_trusted_next_signing_is_an_exact_opt_in(self) -> None:
+        # Leo, 2026-11-04: "reserve cmux15": its trusted main runners also take nightly-next's own signing and
+        # publishing jobs (nightly.yml's SIGNING_JOBS on the protected nightly-next push), through the capacity
+        # ledger's exclusive claim, so a signing job never drains a PR mini.
+        ref = "refs/heads/nightly-next"
+        payload = {"ref": ref, "repository": {**CMUX, "default_branch": "main"}}
+        workflow_ref = f"manaflow-ai/cmux/.github/workflows/nightly.yml@{ref}"
+        args = {"event_name": "push", "ref": ref, "repository": "manaflow-ai/cmux", "event": payload,
+                "trusted_ref": "refs/heads/main", "trusted_repo": "manaflow-ai/cmux",
+                "trusted_next_signing": True, "workflow_ref": workflow_ref,
+                "job": "build-sign-notarize-nightly", "run_attempt": "1"}
+        signing = [job for workflow, job in hook.SIGNING_JOBS if workflow == "nightly.yml"]
+        self.assertEqual(len(signing), 8)
+        for job in signing:
+            for attempt in ("1", "2"):  # a re-run signs here too: there is no other signer now
+                with self.subTest(job=job, attempt=attempt):
+                    self.assertIsNone(hook.trusted_refusal(**{**args, "job": job, "run_attempt": attempt}))
+        cases = [
+            {"trusted_next_signing": False}, {"event_name": "schedule"}, {"event_name": "workflow_dispatch"},
+            {"ref": "refs/heads/feat-cmux-next"}, {"repository": "manaflow-ai/other"},
+            {"event": {**payload, "ref": "refs/heads/main"}},
+            {"event": {**payload, "repository": {"full_name": "manaflow-ai/other"}}},
+            {"workflow_ref": None}, {"workflow_ref": "manaflow-ai/cmux/.github/workflows/nightly.yml@refs/heads/main"},
+            {"workflow_ref": f"manaflow-ai/cmux/.github/workflows/release.yml@{ref}"},
+            {"workflow_ref": f"other/cmux/.github/workflows/nightly.yml@{ref}"},
+            {"job": "build-nightly-app"}, {"job": "build-sign-notarize"}, {"job": "sign"}, {"job": None},
+            {"trusted_ref": "refs/heads/feat-cmux-next"}, {"trusted_repo": "manaflow-ai/other"},
+            *[{"event": {**payload, key: {}}} for key in ("pull_request", "workflow_run", "merge_group")],
+        ]
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                self.assertIn("untrusted:", hook.trusted_refusal(**{**args, **overrides}))
+        # each opt-in keeps its own jobs when a member has both
+        both = {**args, "trusted_next_nightly": True}
+        self.assertIsNone(hook.trusted_refusal(**both))
+        self.assertIsNone(hook.trusted_refusal(**{**both, "job": "build-nightly-app"}))
+        self.assertIn("untrusted:", hook.trusted_refusal(**{**both, "job": "build-nightly-app", "run_attempt": "2"}))
+        self.assertIn("untrusted:", hook.trusted_refusal(**{**args, "job": "build-nightly-app"}))
+        # main's own push and schedule jobs stay admitted as before
+        for event_name in ("push", "schedule"):
+            self.assertIsNone(hook.trusted_refusal(**{**args, "event_name": event_name, "job": "seed",
+                "ref": "refs/heads/main", "event": {**payload, "ref": "refs/heads/main"}}))
+        # nothing new starts on the mini while it waits, so it waits out the longest running job, like the slot's
+        self.assertEqual(hook.exclusive_capacity_wait(hook.TIER_NIGHTLY, True), hook.SIGNING_DRAIN_WAIT_S)
+        path = event(self.dir, "next-signing", payload)
+        environ = {"GITHUB_REF": ref, "GITHUB_WORKFLOW_REF": workflow_ref, "GITHUB_JOB": "publish-nightly",
+                   "GITHUB_RUN_ATTEMPT": "2"}
+        for trusted in (("--trusted-ref", "refs/heads/main", "--trusted-repo", "manaflow-ai/cmux"), ()):
+            result = self.run_hook("job-started", "push", path, "--allowed-owner", "manaflow-ai",
+                                   "--trusted-next-signing", "--no-disk", *trusted,
+                                   repo="manaflow-ai/cmux", env=environ)
+            self.assertEqual(result.returncode == 0, bool(trusted), result.stdout + result.stderr)
+
     def test_dev_compile_runner_is_exact_job_and_event(self) -> None:
         workflow = "manaflow-ai/cmux/.github/workflows/cmux-next.yml@refs/heads/feat-cmux-next"
         push = {"ref": "refs/heads/feat-cmux-next", "repository": CMUX}
@@ -11489,6 +11542,12 @@ class RunnerTest(unittest.TestCase):
             self.invoke("--apply", "--manifest", os.fspath(path), "--member", "mini-std")
         self.assertIn("--trusted-ref refs/heads/main --trusted-repo manaflow-ai/cmux", (hooks / "job-started.sh").read_text())
         self.assertIn("--trusted-next-nightly", (hooks / "job-started.sh").read_text())
+        self.assertNotIn("--trusted-next-signing", (hooks / "job-started.sh").read_text())
+        manifest["hosts"]["mini-std"]["overrides"]["runner"]["trustedNextSigning"] = True
+        path.write_text(json.dumps(manifest))
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            self.invoke("--apply", "--manifest", os.fspath(path), "--member", "mini-std")
+        self.assertIn("--trusted-next-nightly --trusted-next-signing", (hooks / "job-started.sh").read_text())
         self.assertNotIn("--test-keychain", (hooks / "job-started.sh").read_text(), "a secret-holding host keeps its keychains")
         self.assertNotIn("--recycle-testmanagerd", (hooks / "job-started.sh").read_text() +
                          (hooks / "glaeda-canonical-root").read_text(), "a trusted-ref host runs no PR XCTest")
@@ -12839,6 +12898,27 @@ class DedicatedRunnerTest(unittest.TestCase):
         _, why = fleet_labels.dedicated_runners(headless, "mini-std")
         self.assertIn("gui: false", why or "")
 
+    def test_an_entry_that_yields_to_exclusive_passes_the_opt_in_to_its_hook(self) -> None:
+        good, why = fleet_labels.dedicated_runners(dedicated_manifest(NIGHTLY), "mini-std")
+        self.assertIsNone(why)
+        self.assertFalse(good[0]["yieldToExclusive"])
+        good, why = fleet_labels.dedicated_runners(dedicated_manifest({**NIGHTLY, "yieldToExclusive": True}),
+                                                   "mini-std")
+        self.assertIsNone(why)
+        self.assertTrue(good[0]["yieldToExclusive"])
+        for bad in ("yes", 1, None):
+            with self.subTest(bad=bad):
+                _, why = fleet_labels.dedicated_runners(dedicated_manifest({**NIGHTLY, "yieldToExclusive": bad}),
+                                                        "mini-std")
+                self.assertIn("yieldToExclusive", why or "")
+        fake_pw = mock.Mock(pw_dir=os.fspath(self.home))
+        with mock.patch.object(cr.pwd, "getpwuid", return_value=fake_pw):
+            receipt = self.invoke("--apply", "--manifest", self.manifest({**NIGHTLY, "yieldToExclusive": True}),
+                                  "--member", "mini-std", "--dedicated", "nightly-next")
+        self.assertTrue(receipt["ready"], receipt["blocking"])
+        hooks = self.home / "actions-runner-glaeda-nightly-next" / cr.HOOK_DIR
+        self.assertIn(" --yield-to-exclusive", (hooks / "job-started.sh").read_text())
+
     def test_an_entry_floor_is_the_runner_floor_and_the_admission_sees_it(self) -> None:
         """A builder that needs more free disk than the member's floor declares minFreeGib: the dedicated runner's
         --min-free-gib is that, so its listener gate holds it off under the builder's floor (the job goes to the
@@ -12883,7 +12963,8 @@ class DedicatedRunnerTest(unittest.TestCase):
         hooks = runner / cr.HOOK_DIR
         started = (hooks / "job-started.sh").read_text()
         self.assertIn(f"--dedicated-admit {hooks / cr.DEDICATED_ADMIT}", started)
-        for absent in ("--capacity-units", "--require-eligible", "--test-keychain", "--trusted-ref"):
+        for absent in ("--capacity-units", "--require-eligible", "--test-keychain", "--trusted-ref",
+                       "--yield-to-exclusive"):
             self.assertNotIn(absent, started)
         self.assertIn(f"exec /usr/bin/python3 {self.home}/nightly-builder/nightly_builder.py admit",
                       (hooks / cr.DEDICATED_ADMIT).read_text())
@@ -13121,6 +13202,45 @@ class DedicatedHookTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertFalse(marker.exists())
 
+    def test_a_yielding_dedicated_runner_waits_while_a_signing_job_wants_or_holds_the_mini(self) -> None:
+        # Leo, 2026-11-04: "reserve cmux15". Its nightly-only builders hold nothing in the capacity ledger, so with
+        # runner.dedicated yieldToExclusive (--yield-to-exclusive) one starts no job while a signing job on the mini
+        # waits for it to drain or holds it: otherwise the signing job's drain never ends (or runs beside a job).
+        capacity = self.dir / "capacity"
+        capacity.mkdir()
+        path = event(self.dir, "push", {"repository": CMUX, "ref": "refs/heads/nightly-next"})
+        admit = make_executable(self.dir / "admit.sh", "#!/bin/sh\nexit 0\n")
+        base = ("job-started", "push", path, "--allowed-repo", "manaflow-ai/cmux", "--no-disk",
+                "--dedicated-admit", os.fspath(admit), "--capacity-dir", os.fspath(capacity))
+        yielding = (*base, "--yield-to-exclusive", "--exclusive-yield-wait", "1")
+        self.assertIsNone(hook.exclusive_claim(capacity))
+        result = self.run_hook(*yielding, repo="manaflow-ai/cmux")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        # a signing job waiting for the mini: its admit.want marker names the exclusive class
+        marker = capacity / f"{hook.ADMIT_WANT}{os.getpid()}"
+        hook.write_want(marker, time.time(), ["units"], hook.TIER_NIGHTLY, klass=hook.EXCLUSIVE_CLASS)
+        self.assertIn("waits for this mini", hook.exclusive_claim(capacity))
+        result = self.run_hook(*yielding, repo="manaflow-ai/cmux")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("signing job", result.stdout)
+        # without the opt-in (every other mini) nothing changes
+        result = self.run_hook(*base, repo="manaflow-ai/cmux")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        # any other waiter does not hold it
+        hook.write_want(marker, time.time(), ["units"], hook.TIER_NIGHTLY)
+        self.assertIsNone(hook.exclusive_claim(capacity))
+        marker.unlink()
+        # a signing job holding the mini: it holds both gateway tokens, which only the exclusive class takes together
+        fds = [hook.lock_file(capacity / f"{token}.token", fcntl.LOCK_EX) for token in hook.GATEWAY_TOKENS]
+        try:
+            self.assertIn("holds this mini", hook.exclusive_claim(capacity))
+            result = self.run_hook(*yielding, repo="manaflow-ai/cmux")
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        finally:
+            for fd in fds:
+                os.close(fd)
+        self.assertIsNone(hook.exclusive_claim(capacity))
+
     def test_the_gate_never_holds_a_dedicated_runner_for_the_pool(self) -> None:
         runner = self.dir / "actions-runner-glaeda-nightly-next"
         (runner / cr.HOOK_DIR).mkdir(parents=True)
@@ -13298,6 +13418,29 @@ class ManifestLabelsTest(unittest.TestCase):
             host["overrides"]["runner"] = trusted
             host["roles"].append("dev-builds")
             self.assertIn("trustedNextNightly", cr.member_labels(manifest, "mini-std")[1])
+
+    def test_trusted_next_signing_manifest_fails_closed(self) -> None:
+        trusted = {"trustedRef": "refs/heads/main", "trustedRepo": "manaflow-ai/cmux", "trustedNextSigning": True}
+        with mock.patch.object(cr, "xcode_present", return_value=True):
+            manifest = json.loads(json.dumps(MANIFEST))
+            host = manifest["hosts"]["mini-std"]
+            host["roles"].remove("dev-builds")
+            host["overrides"] = {"runner": trusted}
+            summary = cr.member_labels(manifest, "mini-std")[0]
+            self.assertTrue(summary["trustedNextSigning"])
+            self.assertIn("glaeda-trusted-next-signing", summary["labels"])
+            self.assertNotIn("glaeda-trusted-next-signing", cr.member_labels(MANIFEST, "mini-std")[0]["labels"])
+            self.assertFalse(cr.member_labels(MANIFEST, "mini-std")[0]["trustedNextSigning"])
+            for bad in ({**trusted, "trustedNextSigning": "true"}, {**trusted, "trustedNextSigning": 1},
+                        {**trusted, "trustedNextSigning": None}, {"trustedNextSigning": True},
+                        {**trusted, "trustedRef": "refs/heads/feat-cmux-next"},
+                        {**trusted, "trustedRepo": "manaflow-ai/other"}):
+                with self.subTest(bad=bad):
+                    host["overrides"]["runner"] = bad
+                    self.assertIn("trustedNextSigning", cr.member_labels(manifest, "mini-std")[1])
+            host["overrides"]["runner"] = trusted
+            host["roles"].append("dev-builds")
+            self.assertIn("trustedNextSigning", cr.member_labels(manifest, "mini-std")[1])
 
     def test_ios_sim_label_needs_the_manifest_and_a_runtime(self) -> None:
         def rt(build: str, available: bool = True, platform: str = "iOS") -> dict:
