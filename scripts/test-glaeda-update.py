@@ -1405,6 +1405,50 @@ class ReleaseTest(unittest.TestCase):
     def entry(self, letter: str, published: str) -> dict:
         return {**self.canary(published), "tag": "r-20260925-" + letter * 12, "source": letter * 40}
 
+    def test_a_release_whose_runner_hook_cmux_does_not_trust_yet_is_not_promoted(self) -> None:
+        # 2026-11-04: stable moved cmux15 to hook f9666752 before cmux's trust list had it at the commit
+        # nightly-next runs signed from, and the hook refused their publish and sign jobs (run 41889861374).
+        # The release waits until the trust-list sync PR has merged; an older trusted release still goes.
+        ok = [self.status("air-blue", "success", "2026-09-25T01:00:00Z")]
+        old = {"entry": self.entry("a", "2026-09-25T01:00:00Z"), "statuses": ok, "descendsFromStable": True,
+               "hook": "1" * 64, "hookTrusted": True}
+        new = {"entry": self.entry("b", "2026-09-25T04:00:00Z"), "statuses": ok, "descendsFromStable": True,
+               "hook": "2" * 64, "hookTrusted": False}
+        chosen, why = gr.choose([new, old], None, self.NOW)
+        self.assertEqual(chosen["tag"], old["entry"]["tag"], why)
+        held, why = gr.choose([new], None, self.NOW)
+        self.assertIsNone(held)
+        self.assertIn("cmux does not trust its runner hook 222222222222 yet", why)
+        self.assertEqual(gr.choose([{**new, "hookTrusted": True}], None, self.NOW)[0]["tag"], new["entry"]["tag"])
+
+    def test_candidate_reads_the_hook_and_cmux_trust_list(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            release_raw = gr.canonical(gr.release_manifest("c" * 40, "r-20260925-" + "c" * 12, {"x": b"x"}))
+            (d / "release.json").write_bytes(release_raw)
+            (d / "statuses.json").write_text("[]")
+            hook = b"#!/usr/bin/env python3\n"
+            (d / "hook").write_bytes(hook)
+            digest = gr.sha256(hook)
+            trusted = d / "glaeda-signing-hooks.txt"
+            base = ["candidate", "--release", str(d / "release.json"), "--published", "2026-09-25T00:00:00Z",
+                    "--statuses", str(d / "statuses.json"), "--descends", "true",
+                    "--hook", str(d / "hook"), "--trusted-hooks", str(trusted)]
+
+            def run() -> dict:
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(gr.main(base), 0)
+                return json.loads(out.getvalue())
+
+            trusted.write_text("# comment " + digest + "\n" + "f" * 64 + " glaeda #1\n")
+            self.assertEqual((run()["hook"], run()["hookTrusted"]), (digest, False))
+            trusted.write_text("# comment\n" + digest + " glaeda #1838: runner hook\n")
+            self.assertEqual((run()["hook"], run()["hookTrusted"]), (digest, True))
+            # an unreadable or empty trust list holds the release rather than guessing
+            trusted.write_text("")
+            self.assertEqual(gr.main(base), 1)
+
     def test_choose_takes_the_newest_soaked_healthy_release_not_only_the_canary(self) -> None:
         ok = [self.status("air-blue", "success", "2026-09-25T01:00:00Z")]
         bad = [self.status("big-red", "failure", "2026-09-25T01:00:00Z")]
