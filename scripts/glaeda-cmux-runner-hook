@@ -771,8 +771,8 @@ def dev_daily_feed(event_name: str | None, ref: str | None) -> bool:
 
 def exclusive_capacity_wait(tier: str, nightly_runner: bool) -> float:
     """How long a signing job (EXCLUSIVE_CLASS) waits for the mini to drain: SIGNING_DRAIN_WAIT_S for a nightly job
-    on the nightly slot, which holds every other admission while it waits (SIGNING_DRAIN), else
-    EXCLUSIVE_CAPACITY_WAIT_S."""
+    on the nightly slot or on a TRUSTED_NEXT_SIGNING runner (nightly_runner is true for either), which holds every
+    other admission while it waits (SIGNING_DRAIN), else EXCLUSIVE_CAPACITY_WAIT_S."""
     return SIGNING_DRAIN_WAIT_S if tier == TIER_NIGHTLY and nightly_runner else EXCLUSIVE_CAPACITY_WAIT_S
 
 
@@ -1440,13 +1440,14 @@ UNTRUSTED_PAYLOAD_KEYS = ("pull_request", "workflow_run", "merge_group")
 
 def trusted_refusal(event_name: str | None, ref: str | None, repository: str | None, event: Any,
                     trusted_ref: str, trusted_repo: str, *, trusted_next_nightly: bool = False,
-                    workflow_ref: str | None = None, job: str | None = None,
+                    trusted_next_signing: bool = False, workflow_ref: str | None = None, job: str | None = None,
                     run_attempt: str | None = None) -> str | None:
     """Why a job is not merged code of trusted_repo on trusted_ref, or None. Pure. For a push or schedule the
     workflow file and the default checkout come from that ref, so PR code runs only if a merged workflow
     fetches it (docs/CMUX_MINI_RUNNER.md 2e)."""
     why = f"untrusted: this runner takes only {trusted_repo} {trusted_ref} push and schedule jobs"
-    if trusted_next_nightly and (trusted_ref != "refs/heads/main" or trusted_repo != "manaflow-ai/cmux"):
+    if (trusted_next_nightly or trusted_next_signing) and (
+            trusted_ref != "refs/heads/main" or trusted_repo != "manaflow-ai/cmux"):
         return "untrusted: NEXT nightly opt-in needs manaflow-ai/cmux trusted main admission"
     if event_name not in TRUSTED_EVENTS:
         return f"{why}, not {event_name}"
@@ -1457,14 +1458,20 @@ def trusted_refusal(event_name: str | None, ref: str | None, repository: str | N
         return f"{why}, not {' / '.join(sorted(r or '(unknown)' for r in repos))}"
     if any(key in event for key in UNTRUSTED_PAYLOAD_KEYS):
         return f"{why}; the payload carries {', '.join(k for k in UNTRUSTED_PAYLOAD_KEYS if k in event)}"
-    if trusted_next_nightly and ref == "refs/heads/nightly-next":
+    if (trusted_next_nightly or trusted_next_signing) and ref == "refs/heads/nightly-next":
         # A fixed exception, never a general extra-ref list. Schedules run on the default branch;
         # NEXT promotion reaches this runner only through the protected nightly-next push.
-        if (event_name == "push" and event.get("ref") == ref and run_attempt == "1"
-                and workflow_ref == "manaflow-ai/cmux/.github/workflows/nightly.yml@refs/heads/nightly-next"
-                and job == "build-nightly-app"):
+        exact = (event_name == "push" and event.get("ref") == ref
+                 and workflow_ref == "manaflow-ai/cmux/.github/workflows/nightly.yml@refs/heads/nightly-next")
+        if exact and trusted_next_nightly and run_attempt == "1" and job == "build-nightly-app":
             return None
-        return "untrusted: NEXT nightly needs its exact nightly.yml build-nightly-app push on attempt 1"
+        # TRUSTED_NEXT_SIGNING: and nightly.yml's own signing and publishing jobs, on any attempt (a re-run has no
+        # other signer now). They take the exclusive class here like on any mini (SIGNING_JOBS).
+        if exact and trusted_next_signing and ("nightly.yml", job) in SIGNING_JOBS:
+            return None
+        return ("untrusted: NEXT nightly needs its exact nightly.yml "
+                + " or ".join(filter(None, ("build-nightly-app push on attempt 1" if trusted_next_nightly else "",
+                                            "signing job push" if trusted_next_signing else ""))))
     if ref != trusted_ref:
         return f"{why}, not ref {ref or '(unset)'}"
     if event_name == "push" and event.get("ref") != trusted_ref:
@@ -4393,7 +4400,8 @@ def admission_waiters(capacity_dir: Path, skip_pid: int = 0) -> list[dict[str, A
         tier = data.get("tier") if data.get("tier") in (TIER_NIGHTLY, TIER_DEV, TIER_STACK) else ""
         lane = SESSION_LANE if data.get("lane") == SESSION_LANE else ""
         waiters.append({"pid": pid, "since": since, "wants": wants, "who": str(data.get("who") or "")[:200],
-                        "tier": tier, "lane": lane})
+                        "tier": tier, "lane": lane,
+                        "class": EXCLUSIVE_CLASS if data.get("class") == EXCLUSIVE_CLASS else ""})
     return sorted(waiters, key=lambda waiter: (waiter["since"], waiter["pid"]))
 
 
@@ -4441,7 +4449,8 @@ def job_who() -> str:
                                   f"(run {os.environ['GITHUB_RUN_ID']})" if os.environ.get("GITHUB_RUN_ID") else "")))
 
 
-def write_want(marker: Path, since: float, wants: list[str], tier: str = "", lane: str = "") -> None:
+def write_want(marker: Path, since: float, wants: list[str], tier: str = "", lane: str = "",
+               klass: str = "") -> None:
     with contextlib.suppress(OSError):
         tmp = marker.with_name(marker.name + ".tmp")
         want: dict[str, Any] = {"since": since, "wants": wants, "who": job_who()}
@@ -4449,6 +4458,8 @@ def write_want(marker: Path, since: float, wants: list[str], tier: str = "", lan
             want["tier"] = tier
         if lane:
             want["lane"] = lane
+        if klass == EXCLUSIVE_CLASS:  # YIELD_TO_EXCLUSIVE: a yielding dedicated runner holds off for it
+            want["class"] = klass
         tmp.write_text(json.dumps(want) + "\n")
         tmp.replace(marker)
 
@@ -5269,6 +5280,48 @@ def dedicated_admission(script: Path, min_free_gib: float = 0.0) -> tuple[bool, 
     if code != 0:
         return False, f"the dedicated runner's admission {script.name} refused the job (exit {code})"
     return True, "dedicated runner: admitted by its own admission, no host lock or capacity taken"
+
+
+# YIELD_TO_EXCLUSIVE (Leo, 2026-11-04: "reserve cmux15"): a dedicated runner holds nothing in the capacity ledger, so
+# a signing job (EXCLUSIVE_CLASS) on its mini could never drain it: the job waits for every process in any runner's
+# _work to end (stray_job_processes), and a busy dedicated builder keeps starting new ones. A runner.dedicated entry
+# with yieldToExclusive (--yield-to-exclusive) therefore starts no job while a signing job on the mini waits for it
+# (its admit.want marker names the exclusive class) or holds it (both gateway tokens are taken, which only the
+# exclusive class takes together: CLASS_COST). Its job waits YIELD_TO_EXCLUSIVE_WAIT_S at most, then is refused. The
+# yielding runner's own hook runs in its job's _work, so a signing job admitted while this check passed still sees it
+# there and waits; nothing starts beside a held claim.
+YIELD_TO_EXCLUSIVE_WAIT_S = 3 * 3600.0  # a drain (SIGNING_DRAIN_WAIT_S) plus a signing job's 160 min timeout, about
+ABANDONED = "abandoned"
+
+
+def exclusive_claim(capacity_dir: Path) -> str | None:
+    """Why a yielding dedicated runner holds off now (a signing job waits for this mini or holds it), or None."""
+    with contextlib.suppress(OSError):
+        for waiter in admission_waiters(capacity_dir):
+            if waiter.get("class") == EXCLUSIVE_CLASS:
+                return f"a signing job waits for this mini to drain ({waiter.get('who') or 'pid ' + str(waiter['pid'])})"
+    if all((capacity_dir / f"{token}.token").exists() and not probe(capacity_dir / f"{token}.token")
+           for token in GATEWAY_TOKENS):
+        return "a signing job holds this mini (every unit and token)"
+    return None
+
+
+def yield_to_exclusive(capacity_dir: Path, owner: Any, cap: float | None) -> tuple[bool, str]:
+    """(True, "") once no signing job wants or holds this mini, (False, why) after cap seconds
+    (YIELD_TO_EXCLUSIVE_WAIT_S when None), or (False, ABANDONED) when the job is cancelled meanwhile."""
+    bound = YIELD_TO_EXCLUSIVE_WAIT_S if cap is None else cap
+    start, shown = time.monotonic(), ""
+    while (why := exclusive_claim(capacity_dir)) is not None:
+        if owner is not None and owner.gone():
+            return False, ABANDONED
+        waited = time.monotonic() - start
+        if waited >= bound:
+            return False, f"{why}; this dedicated runner yielded {waited:.0f} s, its bound (YIELD_TO_EXCLUSIVE)"
+        if why != shown:
+            print(f"{PREFIX}: waiting: {why}; this dedicated runner starts nothing beside it", flush=True)
+            shown = why
+        time.sleep(min(ADMIT_POLL_S, max(0.0, bound - waited)))
+    return True, ""
 
 
 def runner_scope(runner_dir: Path) -> RunnerScope:
@@ -9096,6 +9149,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--trusted-repo", help="the one repository --trusted-ref admits")
     p.add_argument("--trusted-next-nightly", action="store_true",
                    help="also admit only cmux nightly-next's exact nightly app push on attempt 1")
+    p.add_argument("--trusted-next-signing", action="store_true",
+                   help="also admit cmux nightly-next's own nightly.yml signing and publishing jobs (SIGNING_JOBS) "
+                        "on its push, any attempt, which drain the mini like the nightly slot's (TRUSTED_NEXT_SIGNING)")
+    p.add_argument("--yield-to-exclusive", action="store_true",
+                   help="job-started, a dedicated runner: start no job while a signing job on this mini waits for "
+                        "it to drain or holds it (YIELD_TO_EXCLUSIVE)")
+    p.add_argument("--exclusive-yield-wait", type=float, default=None, help=argparse.SUPPRESS)
     p.add_argument("--dev-compile-runner", action="store_true",
                    help="this instance admits only cmux NEXT DEV Release compile jobs (shared host capacity)")
     p.add_argument("--nightly-runner", action="store_true",
@@ -9315,10 +9375,11 @@ def main(argv: list[str] | None = None) -> int:
                                       os.environ.get("GITHUB_WORKFLOW_REF"), os.environ.get("GITHUB_JOB"))
             if why:
                 return refused(why)
-        if args.trusted_ref or args.trusted_repo or args.trusted_next_nightly:
+        if args.trusted_ref or args.trusted_repo or args.trusted_next_nightly or args.trusted_next_signing:
             why = trusted_refusal(os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REF"),
                                   os.environ.get("GITHUB_REPOSITORY"), event, args.trusted_ref or "(unset)",
                                   args.trusted_repo or "(unset)", trusted_next_nightly=args.trusted_next_nightly,
+                                  trusted_next_signing=args.trusted_next_signing,
                                   workflow_ref=os.environ.get("GITHUB_WORKFLOW_REF"), job=os.environ.get("GITHUB_JOB"),
                                   run_attempt=os.environ.get("GITHUB_RUN_ATTEMPT"))
             if why:
@@ -9446,7 +9507,7 @@ def main(argv: list[str] | None = None) -> int:
                                    f"({(hook or '')[:12]}), so the job's claim gate would refuse the whole mini; "
                                    "refused before draining it, so the run's Blacksmith job signs now")
             if claim_class == EXCLUSIVE_CLASS:
-                drain_bound = exclusive_capacity_wait(tier, args.nightly_runner)
+                drain_bound = exclusive_capacity_wait(tier, args.nightly_runner or args.trusted_next_signing)
                 cap = bounded_wait(cap, drain_bound)
                 print(f"{PREFIX}: a signing job: it takes the whole mini (every unit, fast and gateway token), so no "
                       f"other job runs here beside it; it waits {drain_bound:g} s at most for the mini to drain, "
@@ -9499,7 +9560,8 @@ def main(argv: list[str] | None = None) -> int:
                         break
                     wants = list(taken.get("wants") or [])
                     if admit_class != GATEWAY_CLASS:  # a gateway client's wait holds no other runner (GATEWAY)
-                        write_want(marker, since, wants, tier, SESSION_LANE if args.session_runner else "")
+                        write_want(marker, since, wants, tier, SESSION_LANE if args.session_runner else "",
+                                   claim_class)
                     if note != shown or time.monotonic() - shown_at >= ADMIT_NOTE_S:
                         holders = ""
                         with contextlib.suppress(Exception):  # naming holders must never fail the wait
@@ -9513,7 +9575,13 @@ def main(argv: list[str] | None = None) -> int:
                 with contextlib.suppress(OSError):
                     marker.unlink()
         elif args.dedicated_admit:
-            held, note = dedicated_admission(args.dedicated_admit, args.min_free_gib)
+            held, note = True, ""
+            if args.yield_to_exclusive:
+                held, note = yield_to_exclusive(args.capacity_dir, owner, args.exclusive_yield_wait)
+                if note == ABANDONED:
+                    return abandoned()
+            if held:
+                held, note = dedicated_admission(args.dedicated_admit, args.min_free_gib)
         else:
             with contextlib.suppress(OSError):  # a crashed job's record must not show in this job's log lines
                 roots_file(args.state_dir).unlink(missing_ok=True)

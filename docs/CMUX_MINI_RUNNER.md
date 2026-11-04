@@ -914,6 +914,16 @@ PR pool label, signing capability, or permission to restore PR-produced caches o
 seeds. Keep local NEXT DerivedData and cache lineage separate from main. The cmux workflow must
 retain its ephemeral overflow/rescue path until the merged hook and host eligibility are verified.
 
+`runner.trustedNextSigning: true` (TRUSTED_NEXT_SIGNING; Leo, 2026-11-04: "reserve cmux15") is the same kind of
+default-off trust decision, with the same requirements (a dedicated `manaflow-ai/cmux` trusted main runner with no
+`dev-builds`). It adds `--trusted-next-signing` to the host hook and the `glaeda-trusted-next-signing` label, and
+admits, besides main's own jobs, nightly.yml's signing and publishing jobs (the hook's `SIGNING_JOBS` of nightly.yml)
+on the exact nightly-next push, on any attempt. Such a job takes the exclusive class on the member's pool like on any
+mini (every unit and token, then no process of an earlier job in any runner's `_work`), holds every other admission
+there while it waits, and waits `SIGNING_DRAIN_WAIT_S` at most, like a nightly-slot signing job. Its dedicated runners
+declare `yieldToExclusive` (section 2e1) so they start nothing while it waits or signs. The hook's bytes change, so
+cmux's `scripts/ci/glaeda-signing-hooks.txt` must list the new sha256 at nightly-next before the OTA.
+
 What the gate cannot see, and the operator must keep true:
 
 - The trust boundary is whoever can push to main: main's ruleset must block direct pushes, with no
@@ -1042,6 +1052,16 @@ which admits what the hook's `trusted_refusal` admits, and of that only nightly.
 refuses a signing job. This is how a second mini
 serves main's trusted seed pool and the trusted nightly app build's runner label without a trusted pool of its own.
 Like every dedicated runner it takes no capacity units, so its jobs run beside the host's other dedicated runners.
+
+### Yielding to a signing job (`yieldToExclusive`)
+
+A dedicated runner holds nothing in the capacity ledger, so a signing job (the exclusive class) on its mini could not
+drain it: the job waits until no process works in any runner's `_work`, and a busy builder keeps starting new jobs.
+A runner.dedicated entry with `"yieldToExclusive": true` gets the hook's `--yield-to-exclusive`: before its own
+admission it waits while a signing job on the mini waits to drain it (its `admit.want` marker names the exclusive
+class) or holds it (both gateway tokens taken, which only the exclusive class takes together), for
+`YIELD_TO_EXCLUSIVE_WAIT_S` (3 h) at most, then refuses. cmux15's nightly-only runners declare it, with
+`trustedNextSigning` on its pool (section 2e). Without the key nothing changes.
 
 ## 2e2. Other repositories on the same minis (org scope)
 

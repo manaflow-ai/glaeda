@@ -737,6 +737,8 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
     dedicated = dedicated_of(ctx)
     if dedicated:  # glaeda's checks, then the builder's own admission (dedicated-admit.sh below)
         scope += f" --dedicated-admit {shlex.quote(os.fspath(ctx.hook_dir / DEDICATED_ADMIT))}"
+        if dedicated.get("yieldToExclusive"):  # the hook's YIELD_TO_EXCLUSIVE
+            scope += " --yield-to-exclusive"
     trusted_entry = dedicated if (dedicated or {}).get("trustedRef") else None
     if trusted_entry:
         # A trusted runner.dedicated entry (glaeda_fleet_labels DEDICATED_TRUSTED) holds a trusted pool's labels:
@@ -754,6 +756,8 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
                       f" --trusted-repo {shlex.quote(ctx.member['trustedRepo'])}")
             if ctx.member.get("trustedNextNightly"):
                 scope += " --trusted-next-nightly"
+            if ctx.member.get("trustedNextSigning"):
+                scope += " --trusted-next-signing"
         elif dev_compile_instance(ctx.member, ctx.instance):
             scope += " --dev-compile-runner"
         elif getattr(ctx, "gateway_runner", False) is True:

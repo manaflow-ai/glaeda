@@ -18,6 +18,8 @@ MINI_LABEL = "glaeda-mini"
 # declares (23F77) is available, because the pinned Xcode refuses any other iOS SDK's simulators. With nothing
 # declared, the member carries no label.
 IOS_SIM_LABEL = "glaeda-ios-sim"
+# TRUSTED_NEXT_SIGNING: the pool label of a member whose trusted main runners also take nightly-next's signing jobs
+TRUSTED_NEXT_SIGNING_LABEL = "glaeda-trusted-next-signing"
 IOS_SIM_ROLE = "ios-simulators"
 # The macOS major version the runner's host really runs (sw_vers on the mini), so a job can ask for one OS when a
 # fleet straddles an upgrade: glaeda-macos-27. Never the bare macos-<N>, which is GitHub-hosted runner vocabulary
@@ -317,6 +319,14 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
             or availability != "dedicated" or "dev-builds" in roles)):
         return None, (f"{member} runner.trustedNextNightly must be boolean and true needs a dedicated "
                       "manaflow-ai/cmux trusted main runner with no dev-builds")
+    # TRUSTED_NEXT_SIGNING (Leo, 2026-11-04: "reserve cmux15"): the same opt-in for nightly-next's own signing and
+    # publishing jobs, which take the exclusive class on the member's pool (the hook's --trusted-next-signing).
+    next_signing = runner.get("trustedNextSigning", False) if isinstance(runner, dict) else False
+    if not isinstance(next_signing, bool) or (next_signing and (
+            trusted_ref != "refs/heads/main" or trusted_repo != "manaflow-ai/cmux"
+            or availability != "dedicated" or "dev-builds" in roles)):
+        return None, (f"{member} runner.trustedNextSigning must be boolean and true needs a dedicated "
+                      "manaflow-ai/cmux trusted main runner with no dev-builds")
     dev_compile = runner.get("devCompile", False) if isinstance(runner, dict) else False
     if not isinstance(dev_compile, bool):
         return None, f"{member} runner.devCompile must be boolean"
@@ -385,6 +395,7 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
     labels = [MINI_LABEL, f"glaeda-class-{klass}", f"glaeda-{availability}",
               *(["glaeda-trusted"] if trusted_ref else []),
               *(["glaeda-trusted-next-nightly"] if next_nightly else []),
+              *([TRUSTED_NEXT_SIGNING_LABEL] if next_signing else []),
               *[f"xcode-{v}" for v in versions], *pools,
               *([IOS_SIM_LABEL] if ios_sim else []),
               *([macos_label(macos_major)] if isinstance(macos_major, str)
@@ -448,6 +459,7 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
             "hardware": hardware, "xcodeApps": [str(a.get("path")) for a in ready], "iosSim": ios_sim,
             "runners": runners, "capacityUnits": units, "compileSlots": compile_slots,
             "trustedRef": trusted_ref, "trustedRepo": trusted_repo, "trustedNextNightly": next_nightly,
+            "trustedNextSigning": next_signing,
             "devCompile": dev_compile, "devCompileInstance": roots if dev_compile else None,
             "canonicalRoots": roots, "rootsTakeSide": roots_take_side,
             "rootPools": list(dict.fromkeys(r for label in dict.fromkeys(pools) for r in root_pools(label))),
@@ -554,7 +566,7 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
         if not isinstance(entry, dict):
             return [], f"{where} is not an object"
         unknown = sorted(set(entry) - {"name", "repo", "org", "group", "labels", "admit", "watch", "env", "keep",
-                                       "minFreeGib", "note", "trustedRef", "trustedRepo"})
+                                       "minFreeGib", "note", "trustedRef", "trustedRepo", "yieldToExclusive"})
         if unknown:
             return [], f"{where} has unknown keys: {', '.join(unknown)}"
         name, repo, org, group = entry.get("name"), entry.get("repo"), entry.get("org"), entry.get("group")
@@ -626,10 +638,14 @@ def dedicated_runners(manifest: Any, member: str) -> tuple[list[dict[str, Any]],
         if floor is not None and (isinstance(floor, bool) or not isinstance(floor, (int, float))
                                   or not 0 < floor <= 10000):
             return [], f"{where}.minFreeGib must be a number of GiB above 0 and at most 10000"
+        # YIELD_TO_EXCLUSIVE: the runner starts no job while a signing job on its mini wants or holds it
+        yields = entry.get("yieldToExclusive", False)
+        if not isinstance(yields, bool):
+            return [], f"{where}.yieldToExclusive must be boolean"
         out.append({"name": name, "repo": repo, "org": org, "group": group, "labels": list(labels),
                     "admit": commands["admit"], "watch": commands.get("watch"), "env": dict(env),
                     "keep": list(keep), "minFreeGib": None if floor is None else float(floor),
-                    "trustedRef": trusted_ref, "trustedRepo": trusted_repo})
+                    "trustedRef": trusted_ref, "trustedRepo": trusted_repo, "yieldToExclusive": yields})
     return out, None
 
 
