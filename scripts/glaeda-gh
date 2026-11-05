@@ -513,11 +513,38 @@ def file_name(key: str) -> str:
     return hashlib.sha256(key.encode()).hexdigest()[:32] + ".json"
 
 
+# A watch's mtime is its last read. A read within this long of the last touch leaves the file alone when nothing could
+# tell the two apart: on cosmic-gray (2026-11-05) fseventsd held a 27 GB footprint while watch/ files were rewritten
+# with the same bytes many times a minute. 5 s is noise against what reads the mtime: IDLE_BACKOFF_AFTER (300 s),
+# TERMINAL_GRACE (120 s) and IDLE_EXPIRY (15 min). The one exact comparison, a reader newer than the cache's last
+# fetch (Daemon.due), keeps its answer: the touch is skipped only while the mtime is already past every stamp the
+# cache holds, so the comparison comes out the same with or without it (interest_fresh).
+INTEREST_QUIET = 5.0
+
+
+def interest_fresh(path: Path, key: str, now: float | None = None) -> bool:
+    """Whether touching PATH (KEY's watch) now would change nothing a reader of its mtime decides: touched within
+    INTEREST_QUIET and already newer than the cache's fetchedAt, dataAt and restAt."""
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return False
+    now = time.time() if now is None else now
+    if not 0 <= now - mtime < INTEREST_QUIET:
+        return False
+    c = read_cache(key) or {}
+    stamps = [c.get(k) for k in ("fetchedAt", "dataAt", "restAt")]
+    return all(mtime > s for s in stamps if isinstance(s, (int, float)) and not isinstance(s, bool))
+
+
 def touch_interest(key: str) -> None:
     """A read the cache answered still counts as interest: the watch's mtime is its last read (the daemon's idle
-    backoff and IDLE_EXPIRY go by it). Only an existing watch is touched, and a failure costs nothing."""
+    backoff and IDLE_EXPIRY go by it). Only an existing watch is touched, and a failure costs nothing. A touch
+    that would change nothing (interest_fresh) is skipped."""
+    path = watch_dir() / file_name(key)
     try:
-        os.utime(watch_dir() / file_name(key))
+        if not interest_fresh(path, key):
+            os.utime(path)
     except OSError:
         pass
 
@@ -636,6 +663,15 @@ def _register_locked(path: Path, key: str, jobs: bool, consumer: str | None, wai
         doc["consumers"] = {**{k: v for k, v in asked.items() if now - float(v or 0) < HEAD_INTEREST}, consumer: now}
     elif isinstance(prior.get("consumers"), dict):
         doc["consumers"] = prior["consumers"]
+    if doc == prior:
+        # The same bytes again: the registration is only a read's interest, so refresh the mtime (or not even
+        # that, interest_fresh) rather than replace the file through a temporary one.
+        try:
+            if not interest_fresh(path, key):
+                os.utime(path)
+            return
+        except OSError:
+            pass
     write_json(path, doc)
 
 
@@ -4933,11 +4969,23 @@ exit "$rc"
 WAIT_FILES = (".json", ".fifo", ".out", ".out.err", ".out.rc", ".out.mark")
 
 
+# How fresh waits/.served may be and still not be touched again. A blocker asks `.served -nt .out.mark` once every
+# WAITS_CHECK (60 s), its mark made at its previous look; touched at most every SERVED_QUIET plus a tick, a live
+# daemon's .served is always newer than a mark 60 s old. Touching it every TICK (2 s) was ~30 fseventsd events a
+# minute on cosmic-gray for no blocker's benefit (2026-11-05).
+SERVED_QUIET = 10.0
+
+
 def mark_waits_served() -> None:
-    """Tell the blockers a daemon that rules on waits is ticking (BLOCKER reads waits/.served)."""
+    """Tell the blockers a daemon that rules on waits is ticking (BLOCKER reads waits/.served), at most once every
+    SERVED_QUIET."""
     with contextlib.suppress(OSError):
         if waits_dir().is_dir():
-            (waits_dir() / ".served").touch()
+            served = waits_dir() / ".served"
+            with contextlib.suppress(OSError):
+                if 0 <= time.time() - served.stat().st_mtime < SERVED_QUIET:
+                    return
+            served.touch()
 
 
 def waits_dir() -> Path:

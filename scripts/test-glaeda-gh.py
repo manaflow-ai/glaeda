@@ -11065,5 +11065,59 @@ class StaleRunRereadTest(Base):
         self.assertNotIn("wait", keys["run:o/r/65"])
 
 
+class QuietWritesTest(Base):
+    """cosmic-gray, 2026-11-05: fseventsd at a 27 GB footprint. In 40 s, 14 watch files were replaced with the same
+    bytes and waits/.served was touched every tick. A write that changes nothing a reader decides is skipped."""
+
+    def watch(self, key: str) -> Path:
+        return gg.watch_dir() / gg.file_name(key)
+
+    def test_a_same_content_register_refreshes_the_mtime_without_replacing_the_file(self) -> None:
+        gg.register("pr:o/r#1")
+        path = self.watch("pr:o/r#1")
+        inode = path.stat().st_ino
+        self.age_watch("pr:o/r#1", 60)
+        gg.register("pr:o/r#1")
+        self.assertEqual(path.stat().st_ino, inode, "the same registration replaced the file")
+        self.assertLess(time.time() - path.stat().st_mtime, 5, "the registration did not count as interest")
+        gg.register("pr:o/r#1", jobs=True)  # a real change is still written
+        self.assertTrue(gg.read_json(path)["jobs"])
+        self.assertNotEqual(path.stat().st_ino, inode)
+
+    def test_a_fresh_touch_is_skipped_unless_the_cache_was_read_after_it(self) -> None:
+        gg.register("pr:o/r#1")
+        path = self.watch("pr:o/r#1")
+        at = time.time() - 2
+        os.utime(path, (at, at))
+        gg.touch_interest("pr:o/r#1")
+        self.assertEqual(path.stat().st_mtime, at, "a touch 2 s after the last one was written")
+        gg.register("pr:o/r#1")
+        self.assertEqual(path.stat().st_mtime, at, "a same-content registration 2 s after the last touch was written")
+        # A fetch since the last touch: a reader now is newer than it (Daemon.due re-reads on that), so it is touched.
+        gg.write_json(gg.cache_dir() / gg.file_name("pr:o/r#1"), {"key": "pr:o/r#1", "fetchedAt": at + 1})
+        gg.touch_interest("pr:o/r#1")
+        self.assertGreater(path.stat().st_mtime, at + 1)
+        # Older than INTEREST_QUIET: touched.
+        os.utime(path, (time.time() - gg.INTEREST_QUIET - 1,) * 2)
+        gg.touch_interest("pr:o/r#1")
+        self.assertLess(time.time() - path.stat().st_mtime, 2)
+
+    def test_served_is_touched_at_most_once_per_quiet_window(self) -> None:
+        gg.waits_dir().mkdir(parents=True, exist_ok=True)
+        served = gg.waits_dir() / ".served"
+        gg.mark_waits_served()
+        self.assertTrue(served.exists())
+        at = time.time() - 3
+        os.utime(served, (at, at))
+        gg.mark_waits_served()
+        self.assertEqual(served.stat().st_mtime, at)
+        old = time.time() - gg.SERVED_QUIET - 1
+        os.utime(served, (old, old))
+        gg.mark_waits_served()
+        self.assertGreater(served.stat().st_mtime, old + 1)
+        # Well under a blocker's look: a mark WAITS_CHECK old is always older than a live daemon's .served.
+        self.assertLess(gg.SERVED_QUIET + gg.TICK, gg.WAITS_CHECK / 2)
+
+
 if __name__ == "__main__":
     unittest.main()
