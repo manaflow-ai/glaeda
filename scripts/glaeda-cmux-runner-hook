@@ -434,6 +434,8 @@ WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "
                         ("nightly-next-canary.yml", "canary"): "isolated",
                         ("nightly-next-launch-smoke.yml", "smoke"): "isolated",
                         ("nightly.yml", "verify-signed-nightly"): "light",
+                        # the release-surface ack gate only waits for an environment approval: no key, no build
+                        ("nightly.yml", "await-release-surface-ack"): "light",
                         ("nightly.yml", "verify-final-dmg-nightly"): "light",
                         # nightly-next's Linux signer path: its one Mac job builds the DMG from the signed app with
                         # hdiutil (cmux nightly.yml signer-dmg-image; was a compile, 5 units + persistent-dd + root)
@@ -1452,9 +1454,12 @@ TRUSTED_NIGHTLY_WORKFLOW = "manaflow-ai/cmux/.github/workflows/nightly.yml"
 # runner (glaeda-trusted-next-signing) in one-mini mode. That runner already took main's push and schedule jobs; it
 # now takes these on a workflow_dispatch too (34 of the classic nightly's last 40 runs), from main's exact nightly.yml
 # only. Each signs or publishes the app main's own nightly.yml built at github.sha, never a ref from the dispatch's
-# inputs. All but verify-signed-nightly are SIGNING_JOBS (exclusive class); the verify holds no key and stays light.
+# inputs. Also main's nightly-next promotion jobs (a dispatch with promote_nightly_next_sha runs them): they push a
+# reviewed SHA to nightly-next with main's own checkout. All but verify-signed-nightly and await-release-surface-ack
+# are SIGNING_JOBS (exclusive class); those two hold no key and stay light.
 CLASSIC_SIGNING_JOBS = ("build-sign-notarize-nightly", "verify-signed-nightly", "publish-nightly",
-                        "generate-nightly-deltas", "republish-nightly-deltas")
+                        "generate-nightly-deltas", "republish-nightly-deltas", "promote-nightly-next",
+                        "promote-nightly-next-acked", "await-release-surface-ack")
 
 
 def trusted_refusal(event_name: str | None, ref: str | None, repository: str | None, event: Any,

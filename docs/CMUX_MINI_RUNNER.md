@@ -934,9 +934,11 @@ Blacksmith) widens that runner, and only that runner, in three exact ways:
   its push (payload ref, repository and hostile-payload checks still apply), since cmux's one-mini mode routes a
   dispatched run's signing jobs here too;
 - main's classic `nightly.yml` signing and publishing jobs (`CLASSIC_SIGNING_JOBS`: `build-sign-notarize-nightly`,
-  `verify-signed-nightly`, `publish-nightly`, `generate-nightly-deltas`, `republish-nightly-deltas`) are admitted on
-  a `workflow_dispatch` of the exact `nightly.yml@refs/heads/main` (main's push and schedule jobs were already
-  admitted). Every other dispatch, workflow, ref, fork and pull request stays refused, and a trusted runner without
+  `verify-signed-nightly`, `publish-nightly`, `generate-nightly-deltas`, `republish-nightly-deltas`, and main's
+  nightly-next promotion jobs `promote-nightly-next`, `promote-nightly-next-acked`, `await-release-surface-ack`) are
+  admitted on a `workflow_dispatch` of the exact `nightly.yml@refs/heads/main` (main's push and schedule jobs were
+  already admitted). `verify-signed-nightly` and `await-release-surface-ack` hold no key and are light; the others are
+  exclusive. Every other dispatch, workflow, ref, fork and pull request stays refused, and a trusted runner without
   `--trusted-next-signing` still refuses every dispatch;
 - nightly-next's short key-holding jobs (`promote-nightly-next-acked`, `keep-published-dsyms`,
   `sentry-dsyms-nightly`, `sign-release-notes`, `publish-release-notes`, `publish-nightly-reel`,
