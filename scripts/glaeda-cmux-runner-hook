@@ -359,10 +359,20 @@ JOB_CLASSES = {"macos-compile-admission": "compile", "app-host-unit-tests": "gui
 # then is refused so its re-run takes Blacksmith. Admitted, it tells the job through $GITHUB_ENV
 # (GLAEDA_JOB_CLAIM=exclusive); cmux's signing jobs refuse to touch the key on an owned Mac without it, so a hook
 # from before this class never signs beside a PR job.
+# ONE_MINI_NIGHTLY (Lawrence, 2026-11-05: every classic and nightly-next nightly job on one Mac mini, cmux15, with no
+# Blacksmith): nightly-next's short jobs that hold a release key (cmux tests/test_nightly_owned_minis_only.py
+# PENDING_GLAEDA, from promote-nightly-next-acked to legacy-identity-target below) ran on GitHub-hosted ubuntu because
+# the trusted signing runner admitted only SIGNING_JOBS. They are SIGNING_JOBS now: the exclusive class, so each one
+# drains the Mac once, like the other signing jobs.
 SIGNING_JOBS = (("nightly.yml", "promote-nightly-next"), ("nightly.yml", "build-sign-notarize-nightly"),
                 ("nightly.yml", "recover-nightly-next-notarization"), ("nightly.yml", "publish-nightly"),
                 ("nightly.yml", "publish-nightly-next-github"), ("nightly.yml", "publish-nightly-next-github-names"),
                 ("nightly.yml", "sign-nightly-identity-legacy"), ("nightly.yml", "generate-nightly-deltas"),
+                ("nightly.yml", "promote-nightly-next-acked"), ("nightly.yml", "keep-published-dsyms"),
+                ("nightly.yml", "sentry-dsyms-nightly"), ("nightly.yml", "sign-release-notes"),
+                ("nightly.yml", "publish-release-notes"), ("nightly.yml", "publish-nightly-reel"),
+                ("nightly.yml", "publish-nightly-identity-legacy"), ("nightly.yml", "republish-nightly-deltas"),
+                ("nightly.yml", "legacy-identity-target"),
                 ("release.yml", "build-sign-notarize"),
                 ("repair-v0-64-25-helper-rpaths.yml", "repair"), ("cmux-next-dev-daily.yml", "sign"))
 WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "test"): "isolated",
@@ -1433,9 +1443,18 @@ def decide(event_name: str | None, event: Any, repository: str | None,
     return True, f"{event_name} on {repo or '(unknown)'}"
 
 
-# workflow_dispatch is not here: a dispatched workflow on main can check out any ref from its inputs.
+# workflow_dispatch is not here: a dispatched workflow on main can check out any ref from its inputs. The one
+# exception is ONE_MINI_NIGHTLY's, on a --trusted-next-signing runner only (trusted_refusal).
 TRUSTED_EVENTS = ("push", "schedule")
 UNTRUSTED_PAYLOAD_KEYS = ("pull_request", "workflow_run", "merge_group")
+TRUSTED_NIGHTLY_WORKFLOW = "manaflow-ai/cmux/.github/workflows/nightly.yml"
+# ONE_MINI_NIGHTLY: main's classic nightly.yml signing and publishing jobs, which cmux routes to the trusted signing
+# runner (glaeda-trusted-next-signing) in one-mini mode. That runner already took main's push and schedule jobs; it
+# now takes these on a workflow_dispatch too (34 of the classic nightly's last 40 runs), from main's exact nightly.yml
+# only. Each signs or publishes the app main's own nightly.yml built at github.sha, never a ref from the dispatch's
+# inputs. All but verify-signed-nightly are SIGNING_JOBS (exclusive class); the verify holds no key and stays light.
+CLASSIC_SIGNING_JOBS = ("build-sign-notarize-nightly", "verify-signed-nightly", "publish-nightly",
+                        "generate-nightly-deltas", "republish-nightly-deltas")
 
 
 def trusted_refusal(event_name: str | None, ref: str | None, repository: str | None, event: Any,
@@ -1449,7 +1468,9 @@ def trusted_refusal(event_name: str | None, ref: str | None, repository: str | N
     if (trusted_next_nightly or trusted_next_signing) and (
             trusted_ref != "refs/heads/main" or trusted_repo != "manaflow-ai/cmux"):
         return "untrusted: NEXT nightly opt-in needs manaflow-ai/cmux trusted main admission"
-    if event_name not in TRUSTED_EVENTS:
+    # ONE_MINI_NIGHTLY: a signing runner checks a dispatch below like a push: payload, exact workflow, job
+    dispatch = trusted_next_signing and event_name == "workflow_dispatch"
+    if event_name not in TRUSTED_EVENTS and not dispatch:
         return f"{why}, not {event_name}"
     if not isinstance(event, dict):
         return f"{why}; the event payload is missing"
@@ -1461,17 +1482,26 @@ def trusted_refusal(event_name: str | None, ref: str | None, repository: str | N
     if (trusted_next_nightly or trusted_next_signing) and ref == "refs/heads/nightly-next":
         # A fixed exception, never a general extra-ref list. Schedules run on the default branch;
         # NEXT promotion reaches this runner only through the protected nightly-next push.
-        exact = (event_name == "push" and event.get("ref") == ref
-                 and workflow_ref == "manaflow-ai/cmux/.github/workflows/nightly.yml@refs/heads/nightly-next")
-        if exact and trusted_next_nightly and run_attempt == "1" and job == "build-nightly-app":
+        exact = event.get("ref") == ref and workflow_ref == f"{TRUSTED_NIGHTLY_WORKFLOW}@refs/heads/nightly-next"
+        if exact and event_name == "push" and trusted_next_nightly and run_attempt == "1" \
+                and job == "build-nightly-app":
             return None
         # TRUSTED_NEXT_SIGNING: and nightly.yml's own signing and publishing jobs, on any attempt (a re-run has no
-        # other signer now). They take the exclusive class here like on any mini (SIGNING_JOBS).
-        if exact and trusted_next_signing and ("nightly.yml", job) in SIGNING_JOBS:
+        # other signer now). They take the exclusive class here like on any mini (SIGNING_JOBS). ONE_MINI_NIGHTLY:
+        # on a dispatch of that exact nightly.yml too, which cmux's one-mini mode also sends here.
+        if exact and event_name in ("push", "workflow_dispatch") and trusted_next_signing \
+                and ("nightly.yml", job) in SIGNING_JOBS:
             return None
         return ("untrusted: NEXT nightly needs its exact nightly.yml "
                 + " or ".join(filter(None, ("build-nightly-app push on attempt 1" if trusted_next_nightly else "",
-                                            "signing job push" if trusted_next_signing else ""))))
+                                            "signing job push or dispatch" if trusted_next_signing else ""))))
+    if dispatch:
+        # ONE_MINI_NIGHTLY: main's classic nightly signing and publishing jobs, from main's exact nightly.yml
+        if not (ref == trusted_ref and event.get("ref") == ref and workflow_ref == f"{TRUSTED_NIGHTLY_WORKFLOW}@{ref}"
+                and job in CLASSIC_SIGNING_JOBS):
+            return (f"{why}; a workflow_dispatch only for main's exact nightly.yml signing and publishing jobs "
+                    f"({', '.join(CLASSIC_SIGNING_JOBS)})")
+        return None
     if ref != trusted_ref:
         return f"{why}, not ref {ref or '(unset)'}"
     if event_name == "push" and event.get("ref") != trusted_ref:
@@ -9192,7 +9222,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="also admit only cmux nightly-next's exact nightly app push on attempt 1")
     p.add_argument("--trusted-next-signing", action="store_true",
                    help="also admit cmux nightly-next's own nightly.yml signing and publishing jobs (SIGNING_JOBS) "
-                        "on its push, any attempt, which drain the mini like the nightly slot's (TRUSTED_NEXT_SIGNING)")
+                        "on its push or dispatch, any attempt, and main's nightly.yml CLASSIC_SIGNING_JOBS on its "
+                        "dispatch, which drain the mini like the nightly slot's (TRUSTED_NEXT_SIGNING, "
+                        "ONE_MINI_NIGHTLY)")
     p.add_argument("--yield-to-exclusive", action="store_true",
                    help="job-started, a dedicated runner: start no job while a signing job on this mini waits for "
                         "it to drain or holds it (YIELD_TO_EXCLUSIVE)")

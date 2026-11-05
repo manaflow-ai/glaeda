@@ -927,6 +927,22 @@ there while it waits, and waits `SIGNING_DRAIN_WAIT_S` at most, like a nightly-s
 declare `yieldToExclusive` (section 2e1) so they start nothing while it waits or signs. The hook's bytes change, so
 cmux's `scripts/ci/glaeda-signing-hooks.txt` must list the new sha256 at nightly-next before the OTA.
 
+ONE_MINI_NIGHTLY (Lawrence, 2026-11-05: every classic and nightly-next nightly job on one Mac mini, cmux15, with no
+Blacksmith) widens that runner, and only that runner, in three exact ways:
+
+- a `workflow_dispatch` of the exact `nightly.yml@refs/heads/nightly-next` is admitted for its `SIGNING_JOBS` like
+  its push (payload ref, repository and hostile-payload checks still apply), since cmux's one-mini mode routes a
+  dispatched run's signing jobs here too;
+- main's classic `nightly.yml` signing and publishing jobs (`CLASSIC_SIGNING_JOBS`: `build-sign-notarize-nightly`,
+  `verify-signed-nightly`, `publish-nightly`, `generate-nightly-deltas`, `republish-nightly-deltas`) are admitted on
+  a `workflow_dispatch` of the exact `nightly.yml@refs/heads/main` (main's push and schedule jobs were already
+  admitted). Every other dispatch, workflow, ref, fork and pull request stays refused, and a trusted runner without
+  `--trusted-next-signing` still refuses every dispatch;
+- nightly-next's short key-holding jobs (`promote-nightly-next-acked`, `keep-published-dsyms`,
+  `sentry-dsyms-nightly`, `sign-release-notes`, `publish-release-notes`, `publish-nightly-reel`,
+  `publish-nightly-identity-legacy`, `republish-nightly-deltas`, `legacy-identity-target`) are `SIGNING_JOBS`: the
+  exclusive class, so each one drains the mini once.
+
 What the gate cannot see, and the operator must keep true:
 
 - The trust boundary is whoever can push to main: main's ruleset must block direct pushes, with no
