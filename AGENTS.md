@@ -62,6 +62,23 @@ Product details live in `README.md` and `docs/COMPUTE_RUNTIME.md`.
   raw logs, repository contents, environment dumps, and private paths out of
   public evidence.
 
+## cmux nightlies: one Mac mini, never cancelled
+
+Lawrence, 2026-11-04. The whole cmux nightly (build, sign, notarize, verify and
+publish, for cmux-next on `nightly-next` and classic on `main`) runs on one Mac
+mini: cmux15, the signing-reserved mini (`trustedNextSigning`, its
+`glaeda-trusted-next-signing` and nightly-only runners). This applies to every
+human and agent that changes runners, labels, admission or the manifest:
+
+- Never give a nightly label to another host, and never move a nightly job to
+  Blacksmith, a GitHub-hosted runner or another mini. Never split one nightly
+  across minis.
+- Never cancel a nightly run, job or queue to make room. A queued nightly waits;
+  cmux's sign yield hands an older build's slot to a newer one with nothing
+  cancelled.
+- When the nightly mini is short of capacity, report it and fix that mini
+  (runners, disk, admission). Do not reroute the nightly.
+
 ## Native Apple agent builds
 
 For initialized native projects, prefer `glaeda-apple submit --operation check`.
