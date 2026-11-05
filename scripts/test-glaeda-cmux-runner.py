@@ -660,23 +660,26 @@ class HookTest(unittest.TestCase):
                                           "workflow": ".github/workflows/nightly.yml"}}
         args = {"ref": ref, "repository": "manaflow-ai/cmux", "trusted_ref": ref, "trusted_repo": "manaflow-ai/cmux",
                 "trusted_next_signing": True, "workflow_ref": workflow_ref, "run_attempt": "1"}
+        # and main's nightly-next promotion jobs (promote-nightly-next, promote-nightly-next-acked,
+        # await-release-surface-ack), which main's dispatch with promote_nightly_next_sha runs
         self.assertEqual(set(hook.CLASSIC_SIGNING_JOBS),
                          {"build-sign-notarize-nightly", "verify-signed-nightly", "publish-nightly",
-                          "generate-nightly-deltas", "republish-nightly-deltas"})
+                          "generate-nightly-deltas", "republish-nightly-deltas", "promote-nightly-next",
+                          "promote-nightly-next-acked", "await-release-surface-ack"})
         for job in hook.CLASSIC_SIGNING_JOBS:
             for event_name, payload in payloads.items():
                 for attempt in ("1", "3"):
                     with self.subTest(job=job, event_name=event_name, attempt=attempt):
                         self.assertIsNone(hook.trusted_refusal(**{**args, "event_name": event_name, "event": payload,
                                                                   "job": job, "run_attempt": attempt}))
-            # the jobs that hold a release key take the whole Mac; the verify holds none and stays light
-            want = "light" if job == "verify-signed-nightly" else hook.EXCLUSIVE_CLASS
+            # the jobs that hold a release key take the whole Mac; the verify and the ack gate hold none: light
+            want = "light" if job in ("verify-signed-nightly", "await-release-surface-ack") else hook.EXCLUSIVE_CLASS
             self.assertEqual(hook.job_class(job, "manaflow-ai/cmux", hook.DEFAULT_HOME_REPO, "nightly.yml")[0], want)
         dispatch = {**args, "event_name": "workflow_dispatch", "event": payloads["workflow_dispatch"],
                     "job": "publish-nightly"}
         cases = [
             # a dispatch is admitted only on the signing runner, only for these jobs, only from main's nightly.yml
-            {"trusted_next_signing": False}, {"job": "build-nightly-app"}, {"job": "promote-nightly-next"},
+            {"trusted_next_signing": False}, {"job": "build-nightly-app"}, {"job": "probe-nightly-tag-permission"},
             {"job": "decide"}, {"job": "seed"}, {"job": None},
             {"workflow_ref": None}, {"workflow_ref": f"manaflow-ai/cmux/.github/workflows/release.yml@{ref}"},
             {"workflow_ref": f"manaflow-ai/cmux/.github/workflows/seed-derived-data.yml@{ref}"},
