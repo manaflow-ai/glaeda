@@ -20,7 +20,7 @@ this admits only:
   - the two key-free jobs (preflight, verify-stapled: the hook's AUTO_RESUME_LIGHT_JOBS, light) of main's
     auto-resume-nightly-notarization.yml, on its workflow_run after main's own nightly.yml run on main or its dispatch
     from main (the hook's auto_resume_refusal). Its key-holding jobs are signing jobs (refused below: the trusted
-    signing runner takes them) and the rest is refused.
+    signing runner takes them) and every other job is refused.
 
 It refuses everything else the hook's FEED_FIRST nightly tier (job_tier) ranks first: main's DEV daily publish
 (cmux-next-dev-daily.yml), main's nightly-next canary and launch smoke, and every PR, DEV compile and side job. It

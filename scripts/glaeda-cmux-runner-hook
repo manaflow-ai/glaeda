@@ -376,8 +376,11 @@ SIGNING_JOBS = (("nightly.yml", "promote-nightly-next"), ("nightly.yml", "build-
                 # AUTO_RESUME (below trusted_refusal): the classic continuation's key-holding jobs
                 ("auto-resume-nightly-notarization.yml", "poll"),
                 ("auto-resume-nightly-notarization.yml", "wait-and-staple"),
+                ("auto-resume-nightly-notarization.yml", "poll-outer"),
                 ("auto-resume-nightly-notarization.yml", "staple-outer"),
+                ("auto-resume-nightly-notarization.yml", "poll-stapled"),
                 ("auto-resume-nightly-notarization.yml", "staple-stapled"),
+                ("auto-resume-nightly-notarization.yml", "publish"),
                 ("auto-resume-nightly-notarization.yml", "generate-deltas"),
                 ("auto-resume-nightly-notarization.yml", "republish-deltas"),
                 ("release.yml", "build-sign-notarize"),
@@ -1478,11 +1481,10 @@ CLASSIC_SIGNING_JOBS = ("build-sign-notarize-nightly", "verify-signed-nightly", 
 # API (nightly.yml, this repository, its head_sha, branch and attempt, a push, schedule or dispatch) before any other
 # job runs; the jobs read only that run's artifacts. So, on a --trusted-next-signing runner only, the payload's
 # workflow_run (otherwise refused here: UNTRUSTED_PAYLOAD_KEYS) is admitted when it names exactly main's nightly.yml
-# run on main of manaflow-ai/cmux, from a push, schedule or dispatch, with no pull request. The key-holding jobs that
-# also run on macOS (AUTO_RESUME_SIGNING_JOBS) are SIGNING_JOBS: exclusive, on the trusted signing runner. The two
-# key-free jobs (AUTO_RESUME_LIGHT_JOBS) are light, for the nightly-only runners (glaeda-nightly-only-admit).
-# AUTO_RESUME_LINUX_ONLY stay refused: they need bash 4 and a mini's /bin/bash is 3.2 (poll-outer and poll-stapled run
-# scripts/ci/poll-outer-notarizations.sh: mapfile, declare -A; publish compares digests with ${actual,,}).
+# run on main of manaflow-ai/cmux, from a push, schedule or dispatch, with no pull request. Every job that holds a
+# key (AUTO_RESUME_SIGNING_JOBS) is a SIGNING_JOBS entry: exclusive, on the trusted signing runner. The two key-free
+# jobs (AUTO_RESUME_LIGHT_JOBS) are light, for the nightly-only runners (glaeda-nightly-only-admit). The ubuntu jobs
+# run on a mini's /bin/bash 3.2: poll-outer, poll-stapled and publish since cmux #36561 (main 7badd980).
 AUTO_RESUME_FILE = "auto-resume-nightly-notarization.yml"
 AUTO_RESUME_WORKFLOW = f"manaflow-ai/cmux/.github/workflows/{AUTO_RESUME_FILE}"
 AUTO_RESUME_REF = "refs/heads/main"
@@ -1490,7 +1492,6 @@ AUTO_RESUME_SOURCE_PATH = ".github/workflows/nightly.yml"
 AUTO_RESUME_SOURCE_EVENTS = ("push", "schedule", "workflow_dispatch")
 AUTO_RESUME_SIGNING_JOBS = tuple(job for workflow, job in SIGNING_JOBS if workflow == AUTO_RESUME_FILE)
 AUTO_RESUME_LIGHT_JOBS = ("preflight", "verify-stapled")
-AUTO_RESUME_LINUX_ONLY = ("poll-outer", "poll-stapled", "publish")
 
 
 def auto_resume_refusal(event_name: str | None, ref: str | None, repository: str | None, event: Any,
@@ -1541,13 +1542,12 @@ def trusted_refusal(event_name: str | None, ref: str | None, repository: str | N
         return "untrusted: NEXT nightly opt-in needs manaflow-ai/cmux trusted main admission"
     if trusted_next_signing and event_name in ("workflow_run", "workflow_dispatch") \
             and workflow_file(workflow_ref) == AUTO_RESUME_FILE:
-        # AUTO_RESUME: main's exact continuation after main's own nightly, only its key-holding macOS-portable jobs
+        # AUTO_RESUME: main's exact continuation after main's own nightly, only its key-holding jobs
         resume_why = auto_resume_refusal(event_name, ref, repository, event, workflow_ref)
         if resume_why:
             return f"{why}; {AUTO_RESUME_FILE}: {resume_why}"
         if job not in AUTO_RESUME_SIGNING_JOBS:
-            return (f"{why}; {AUTO_RESUME_FILE} only for its key-holding jobs ({', '.join(AUTO_RESUME_SIGNING_JOBS)})"
-                    + ("; this one needs bash 4 (Linux only)" if job in AUTO_RESUME_LINUX_ONLY else ""))
+            return f"{why}; {AUTO_RESUME_FILE} only for its key-holding jobs ({', '.join(AUTO_RESUME_SIGNING_JOBS)})"
         return None
     # ONE_MINI_NIGHTLY: a signing runner checks a dispatch below like a push: payload, exact workflow, job
     dispatch = trusted_next_signing and event_name == "workflow_dispatch"

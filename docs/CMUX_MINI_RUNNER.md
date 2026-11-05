@@ -954,14 +954,14 @@ main as the default branch (`auto_resume_refusal`). Every job of that workflow c
 only the source run's artifacts, which `preflight` checks through the API first. The jobs rank as nightly
 (`job_tier`).
 
-- On a `--trusted-next-signing` runner: `poll`, `wait-and-staple`, `staple-outer`, `staple-stapled`,
-  `generate-deltas`, `republish-deltas` (`AUTO_RESUME_SIGNING_JOBS`). Each holds a release key (Apple certificate,
-  notary API key, Sparkle key or R2 key), so each is a `SIGNING_JOBS` entry: exclusive class, one drain of the mini.
+- On a `--trusted-next-signing` runner: `poll`, `wait-and-staple`, `poll-outer`, `staple-outer`, `poll-stapled`,
+  `staple-stapled`, `publish`, `generate-deltas`, `republish-deltas` (`AUTO_RESUME_SIGNING_JOBS`). Each holds a
+  release key (Apple certificate, notary API key, Sparkle key, R2 key or the release app key), so each is a
+  `SIGNING_JOBS` entry: exclusive class, one drain of the mini.
 - On the nightly-only runners (`glaeda-nightly-only-admit`): `preflight` and `verify-stapled`
   (`AUTO_RESUME_LIGHT_JOBS`), light; they hold no key.
-- Refused everywhere: `poll-outer`, `poll-stapled` and `publish` (`AUTO_RESUME_LINUX_ONLY`). They run on ubuntu and
-  need bash 4 (`scripts/ci/poll-outer-notarizations.sh` uses `mapfile` and `declare -A`; `publish` compares digests
-  with `${actual,,}`), and a mini's `/bin/bash` is 3.2. Admit them when cmux makes those steps bash 3.2 portable.
+- The ubuntu jobs run on a mini's `/bin/bash` 3.2: `poll-outer`, `poll-stapled` and `publish` since cmux #36561
+  (main `7badd980`).
 
 A `workflow_run` from nightly-next, `rc/**`, a feature branch, a pull request or another repository, and a dispatch
 of another branch's copy, stay refused, and a trusted runner without `--trusted-next-signing` still refuses every
