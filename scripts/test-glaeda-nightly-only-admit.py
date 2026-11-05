@@ -144,7 +144,10 @@ class RefusalTest(unittest.TestCase):
         for name in hook.AUTO_RESUME_SIGNING_JOBS:
             with self.subTest(signing=name):
                 self.assertIn("signing job", self.why(**resume(name)))
-        for name in ("poll-outer", "poll-stapled", "publish", "decide"):
+        for name in ("poll-outer", "poll-stapled", "publish"):
+            with self.subTest(signing_now=name):
+                self.assertIn("signing job", self.why(**resume(name)))
+        for name in ("decide",):
             with self.subTest(other=name):
                 self.assertIsNotNone(self.why(**resume(name)))
         for changes in ({"head_branch": "nightly-next"}, {"head_branch": "feat-x"},

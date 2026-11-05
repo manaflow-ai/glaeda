@@ -757,7 +757,9 @@ class HookTest(unittest.TestCase):
         payloads = {"workflow_run": run_payload, "workflow_dispatch": dispatch_payload}
         args = {"ref": ref, "repository": "manaflow-ai/cmux", "trusted_ref": ref, "trusted_repo": "manaflow-ai/cmux",
                 "trusted_next_signing": True, "workflow_ref": workflow_ref, "run_attempt": "1"}
-        signing = ("poll", "wait-and-staple", "staple-outer", "staple-stapled", "generate-deltas", "republish-deltas")
+        # cmux #36561 (main 7badd980) made poll-outer, poll-stapled and publish run on a mini's /bin/bash 3.2
+        signing = ("poll", "wait-and-staple", "poll-outer", "staple-outer", "poll-stapled", "staple-stapled",
+                   "publish", "generate-deltas", "republish-deltas")
         self.assertEqual(set(hook.AUTO_RESUME_SIGNING_JOBS), set(signing))
         self.assertEqual(set(hook.AUTO_RESUME_LIGHT_JOBS), {"preflight", "verify-stapled"})
         for job in signing:
@@ -775,9 +777,8 @@ class HookTest(unittest.TestCase):
         for job in hook.AUTO_RESUME_LIGHT_JOBS:
             self.assertEqual(hook.job_class(job, "manaflow-ai/cmux", hook.DEFAULT_HOME_REPO,
                                             "auto-resume-nightly-notarization.yml")[0], "light")
-        # not on the trusted signing runner: the key-free jobs (their own route) and the jobs that need bash 4 on
-        # cmux15's /bin/bash 3.2 (poll-outer-notarizations.sh: mapfile, declare -A; publish: ${actual,,})
-        for job in ("preflight", "verify-stapled", "poll-outer", "poll-stapled", "publish", "decide", None):
+        # not on the trusted signing runner: the key-free jobs (their own route) and jobs the workflow does not have
+        for job in ("preflight", "verify-stapled", "decide", None):
             with self.subTest(refused_job=job):
                 self.assertIn("untrusted:", hook.trusted_refusal(**{**args, "event_name": "workflow_run",
                                                                     "event": run_payload, "job": job}))
