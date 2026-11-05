@@ -585,13 +585,34 @@ class HookTest(unittest.TestCase):
                 "trusted_next_signing": True, "workflow_ref": workflow_ref,
                 "job": "build-sign-notarize-nightly", "run_attempt": "1"}
         signing = [job for workflow, job in hook.SIGNING_JOBS if workflow == "nightly.yml"]
-        self.assertEqual(len(signing), 8)
+        self.assertEqual(len(signing), 17)
+        # ONE_MINI_NIGHTLY: a dispatched nightly-next run (cmux one-mini mode sends its signing jobs here too) signs
+        # here like its push; its payload names the same ref
+        dispatch = {"ref": ref, "repository": {**CMUX, "default_branch": "main"}, "inputs": {},
+                    "workflow": ".github/workflows/nightly.yml"}
         for job in signing:
             for attempt in ("1", "2"):  # a re-run signs here too: there is no other signer now
-                with self.subTest(job=job, attempt=attempt):
-                    self.assertIsNone(hook.trusted_refusal(**{**args, "job": job, "run_attempt": attempt}))
+                for event_name, payload_now in (("push", payload), ("workflow_dispatch", dispatch)):
+                    with self.subTest(job=job, attempt=attempt, event_name=event_name):
+                        self.assertIsNone(hook.trusted_refusal(**{**args, "job": job, "run_attempt": attempt,
+                                                                  "event_name": event_name,
+                                                                  "event": payload_now}))
+        for overrides in ({"trusted_next_signing": False}, {"event": {**dispatch, "ref": "refs/heads/main"}},
+                          {"event": {k: v for k, v in dispatch.items() if k != "ref"}},
+                          {"workflow_ref": "manaflow-ai/cmux/.github/workflows/nightly.yml@refs/heads/main"},
+                          {"workflow_ref": f"manaflow-ai/cmux/.github/workflows/release.yml@{ref}"},
+                          {"job": "build-nightly-app"}, {"job": "decide"}, {"job": None},
+                          *[{"event": {**dispatch, key: {}}} for key in ("pull_request", "workflow_run",
+                                                                          "merge_group")]):
+            with self.subTest(dispatch=overrides):
+                self.assertIn("untrusted:", hook.trusted_refusal(
+                    **{**args, "event_name": "workflow_dispatch", "event": dispatch, **overrides}))
+        # trusted_next_nightly's app build stays push-only on attempt 1
+        self.assertIn("untrusted:", hook.trusted_refusal(
+            **{**args, "trusted_next_nightly": True, "trusted_next_signing": False, "event_name": "workflow_dispatch",
+               "event": dispatch, "job": "build-nightly-app"}))
         cases = [
-            {"trusted_next_signing": False}, {"event_name": "schedule"}, {"event_name": "workflow_dispatch"},
+            {"trusted_next_signing": False}, {"event_name": "schedule"},
             {"ref": "refs/heads/feat-cmux-next"}, {"repository": "manaflow-ai/other"},
             {"event": {**payload, "ref": "refs/heads/main"}},
             {"event": {**payload, "repository": {"full_name": "manaflow-ai/other"}}},
@@ -625,6 +646,92 @@ class HookTest(unittest.TestCase):
                                    "--trusted-next-signing", "--no-disk", *trusted,
                                    repo="manaflow-ai/cmux", env=environ)
             self.assertEqual(result.returncode == 0, bool(trusted), result.stdout + result.stderr)
+
+    def test_trusted_next_signing_admits_classic_nightly_signing_on_main(self) -> None:
+        # ONE_MINI_NIGHTLY (Lawrence, 2026-11-05): every classic and nightly-next nightly job on cmux15. main's own
+        # nightly.yml signing and publishing jobs (CLASSIC_SIGNING_JOBS) run on the trusted signing runner on its
+        # push, schedule and workflow_dispatch (34 of its last 40 runs were dispatched), from main's exact nightly.yml.
+        ref = "refs/heads/main"
+        workflow_ref = f"manaflow-ai/cmux/.github/workflows/nightly.yml@{ref}"
+        repo = {**CMUX, "default_branch": "main"}
+        payloads = {"push": {"ref": ref, "repository": repo},
+                    "schedule": {"schedule": "17 */6 * * *", "repository": repo},
+                    "workflow_dispatch": {"ref": ref, "repository": repo, "inputs": {"force": "false"},
+                                          "workflow": ".github/workflows/nightly.yml"}}
+        args = {"ref": ref, "repository": "manaflow-ai/cmux", "trusted_ref": ref, "trusted_repo": "manaflow-ai/cmux",
+                "trusted_next_signing": True, "workflow_ref": workflow_ref, "run_attempt": "1"}
+        self.assertEqual(set(hook.CLASSIC_SIGNING_JOBS),
+                         {"build-sign-notarize-nightly", "verify-signed-nightly", "publish-nightly",
+                          "generate-nightly-deltas", "republish-nightly-deltas"})
+        for job in hook.CLASSIC_SIGNING_JOBS:
+            for event_name, payload in payloads.items():
+                for attempt in ("1", "3"):
+                    with self.subTest(job=job, event_name=event_name, attempt=attempt):
+                        self.assertIsNone(hook.trusted_refusal(**{**args, "event_name": event_name, "event": payload,
+                                                                  "job": job, "run_attempt": attempt}))
+            # the jobs that hold a release key take the whole Mac; the verify holds none and stays light
+            want = "light" if job == "verify-signed-nightly" else hook.EXCLUSIVE_CLASS
+            self.assertEqual(hook.job_class(job, "manaflow-ai/cmux", hook.DEFAULT_HOME_REPO, "nightly.yml")[0], want)
+        dispatch = {**args, "event_name": "workflow_dispatch", "event": payloads["workflow_dispatch"],
+                    "job": "publish-nightly"}
+        cases = [
+            # a dispatch is admitted only on the signing runner, only for these jobs, only from main's nightly.yml
+            {"trusted_next_signing": False}, {"job": "build-nightly-app"}, {"job": "promote-nightly-next"},
+            {"job": "decide"}, {"job": "seed"}, {"job": None},
+            {"workflow_ref": None}, {"workflow_ref": f"manaflow-ai/cmux/.github/workflows/release.yml@{ref}"},
+            {"workflow_ref": f"manaflow-ai/cmux/.github/workflows/seed-derived-data.yml@{ref}"},
+            {"workflow_ref": "manaflow-ai/cmux/.github/workflows/nightly.yml@refs/heads/feat-x"},
+            {"workflow_ref": f"other/cmux/.github/workflows/nightly.yml@{ref}"},
+            {"ref": "refs/heads/rc/1.2"}, {"ref": "refs/heads/feat-x"}, {"repository": "manaflow-ai/other"},
+            {"event": {**payloads["workflow_dispatch"], "ref": "refs/heads/feat-x"}},
+            {"event": {k: v for k, v in payloads["workflow_dispatch"].items() if k != "ref"}},
+            {"event": {**payloads["workflow_dispatch"], "repository": {"full_name": "manaflow-ai/other"}}},
+            {"event": None},
+            {"trusted_ref": "refs/heads/feat-x"}, {"trusted_repo": "manaflow-ai/other"},
+            {"event_name": "pull_request"}, {"event_name": "pull_request_target"}, {"event_name": "workflow_run"},
+            {"event_name": "merge_group"}, {"event_name": "repository_dispatch"},
+            *[{"event": {**payloads["workflow_dispatch"], key: {}}}
+              for key in ("pull_request", "workflow_run", "merge_group")],
+        ]
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                self.assertIn("untrusted:", hook.trusted_refusal(**{**dispatch, **overrides}))
+        # a plain trusted main runner (no signing opt-in) still refuses every dispatch, as before
+        plain = {k: v for k, v in dispatch.items() if k != "trusted_next_signing"}
+        self.assertIn("not workflow_dispatch", hook.trusted_refusal(**plain))
+        # main's push and schedule jobs stay admitted as before (any merged workflow on main)
+        for event_name in ("push", "schedule"):
+            self.assertIsNone(hook.trusted_refusal(**{**args, "event_name": event_name, "event": payloads[event_name],
+                                                      "job": "seed", "workflow_ref": None}))
+        path = event(self.dir, "classic-dispatch", payloads["workflow_dispatch"])
+        environ = {"GITHUB_REF": ref, "GITHUB_WORKFLOW_REF": workflow_ref, "GITHUB_JOB": "generate-nightly-deltas",
+                   "GITHUB_RUN_ATTEMPT": "1"}
+        for flags, admitted in ((("--trusted-next-signing",), True), ((), False)):
+            result = self.run_hook("job-started", "workflow_dispatch", path, "--allowed-owner", "manaflow-ai",
+                                   "--trusted-ref", ref, "--trusted-repo", "manaflow-ai/cmux", *flags, "--no-disk",
+                                   repo="manaflow-ai/cmux", env=environ)
+            self.assertEqual(result.returncode == 0, admitted, result.stdout + result.stderr)
+
+    def test_nightly_next_key_jobs_are_exclusive_signing_jobs(self) -> None:
+        # ONE_MINI_NIGHTLY: nightly-next's short jobs that hold a release key (cmux
+        # tests/test_nightly_owned_minis_only.py PENDING_GLAEDA) run on the trusted signing runner in the exclusive
+        # class, like the other SIGNING_JOBS: one drain of the Mac per job
+        ref = "refs/heads/nightly-next"
+        payload = {"ref": ref, "repository": {**CMUX, "default_branch": "main"}}
+        args = {"event_name": "push", "ref": ref, "repository": "manaflow-ai/cmux", "event": payload,
+                "trusted_ref": "refs/heads/main", "trusted_repo": "manaflow-ai/cmux", "trusted_next_signing": True,
+                "workflow_ref": f"manaflow-ai/cmux/.github/workflows/nightly.yml@{ref}", "run_attempt": "1"}
+        for job in ("promote-nightly-next-acked", "keep-published-dsyms", "sentry-dsyms-nightly",
+                    "sign-release-notes", "publish-release-notes", "publish-nightly-reel",
+                    "publish-nightly-identity-legacy", "republish-nightly-deltas", "legacy-identity-target"):
+            with self.subTest(job=job):
+                self.assertIn(("nightly.yml", job), hook.SIGNING_JOBS)
+                self.assertEqual(hook.job_class(job, "manaflow-ai/cmux", hook.DEFAULT_HOME_REPO, "nightly.yml")[0],
+                                 hook.EXCLUSIVE_CLASS)
+                self.assertIsNone(hook.trusted_refusal(**{**args, "job": job}))
+                # another workflow's job of the same id is not a signing job
+                self.assertNotEqual(hook.job_class(job, "manaflow-ai/cmux", hook.DEFAULT_HOME_REPO, "ci.yml")[0],
+                                    hook.EXCLUSIVE_CLASS)
 
     def test_dev_compile_runner_is_exact_job_and_event(self) -> None:
         workflow = "manaflow-ai/cmux/.github/workflows/cmux-next.yml@refs/heads/feat-cmux-next"
