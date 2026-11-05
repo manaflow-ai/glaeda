@@ -945,6 +945,28 @@ Blacksmith) widens that runner, and only that runner, in three exact ways:
   `publish-nightly-identity-legacy`, `republish-nightly-deltas`, `legacy-identity-target`) are `SIGNING_JOBS`: the
   exclusive class, so each one drains the mini once.
 
+AUTO_RESUME (the same goal) admits main's `auto-resume-nightly-notarization.yml`, the classic continuation of a nightly
+whose Apple notarization outlived the run, on its `workflow_run` and its `workflow_dispatch`. Both must be main's own
+copy (`GITHUB_WORKFLOW_REF` `...@refs/heads/main`, `GITHUB_REF` main, a dispatch payload ref of main); a
+`workflow_run` must name exactly `manaflow-ai/cmux`'s `.github/workflows/nightly.yml` run on `main` (head and base
+repository `manaflow-ai/cmux`, source event push, schedule or dispatch, no pull request), with action `completed` and
+main as the default branch (`auto_resume_refusal`). Every job of that workflow checks out `refs/heads/main` and reads
+only the source run's artifacts, which `preflight` checks through the API first. The jobs rank as nightly
+(`job_tier`).
+
+- On a `--trusted-next-signing` runner: `poll`, `wait-and-staple`, `staple-outer`, `staple-stapled`,
+  `generate-deltas`, `republish-deltas` (`AUTO_RESUME_SIGNING_JOBS`). Each holds a release key (Apple certificate,
+  notary API key, Sparkle key or R2 key), so each is a `SIGNING_JOBS` entry: exclusive class, one drain of the mini.
+- On the nightly-only runners (`glaeda-nightly-only-admit`): `preflight` and `verify-stapled`
+  (`AUTO_RESUME_LIGHT_JOBS`), light; they hold no key.
+- Refused everywhere: `poll-outer`, `poll-stapled` and `publish` (`AUTO_RESUME_LINUX_ONLY`). They run on ubuntu and
+  need bash 4 (`scripts/ci/poll-outer-notarizations.sh` uses `mapfile` and `declare -A`; `publish` compares digests
+  with `${actual,,}`), and a mini's `/bin/bash` is 3.2. Admit them when cmux makes those steps bash 3.2 portable.
+
+A `workflow_run` from nightly-next, `rc/**`, a feature branch, a pull request or another repository, and a dispatch
+of another branch's copy, stay refused, and a trusted runner without `--trusted-next-signing` still refuses every
+`workflow_run` and dispatch.
+
 What the gate cannot see, and the operator must keep true:
 
 - The trust boundary is whoever can push to main: main's ruleset must block direct pushes, with no
