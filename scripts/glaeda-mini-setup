@@ -1136,12 +1136,32 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
     return agents
 
 
+# Agents that only do work beside glaeda runners on a fleet Mac: each exits at once anywhere else, but still wakes
+# every 30 s to 5 min. A --hygiene-only Mac without a glaeda runner (Leo's laptop and desktops) does not get them;
+# a headless EC2 runner Mac is --hygiene-only too, so the runners decide, not the profile (Leo, 2026-11-08:
+# "It's just, like, random garbage that was accumulated").
+RUNNER_ONLY_AGENTS = frozenset(LABEL_PREFIX + name for name in (
+    "idle-warm", "idle-fuzz", "mini-health", "git-mirror", "seed-prefetch", "lan-fetch", "fleet-cas-prune",
+    "wallpaper"))
+
+
+def has_glaeda_runner(ctx: Context) -> bool:
+    """A glaeda runner directory here, registered (.runner) or hooked (glaeda-hooks), as glaeda-cmux-runner makes."""
+    try:
+        return any((runner / ".runner").is_file() or (runner / "glaeda-hooks").is_dir()
+                   for runner in ctx.home.glob("actions-runner-glaeda*"))
+    except OSError:
+        return True  # unreadable: keep the agents, which gate themselves
+
+
 def agent_names(ctx: Context) -> list[str]:
     """LaunchAgent labels on macOS; systemd unit file names on Linux."""
     if ctx.platform != "linux":
+        runner_only_ok = not ctx.hygiene_only or has_glaeda_runner(ctx)
         return [label for label in agent_plists(ctx)
-                if not ctx.gh_only or is_update_agent(label) or is_gh_agent(label)
-                or label == LABEL_PREFIX + "disk-pressure"]
+                if (not ctx.gh_only or is_update_agent(label) or is_gh_agent(label)
+                    or label == LABEL_PREFIX + "disk-pressure")
+                and (runner_only_ok or label not in RUNNER_ONLY_AGENTS)]
     if ctx.gh_only:
         return [name for name in LINUX_UNITS if name in GH_ONLY_LINUX_UNITS]
     return [name for name in LINUX_UNITS if ctx.role == "devbox" or name not in DEVBOX_LINUX_UNITS]
@@ -1711,6 +1731,10 @@ def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
         ctx.role = role
         labels.update(agent_names(ctx))
     ctx.role = original_role
+    # and every agent the receipt owns, so one agent_names() no longer lists (a runner-only agent on a host
+    # whose glaeda runner is gone) is still removed with its tool
+    labels.update(a["label"] for a in (receipt or {}).get("actions", [])
+                  if a.get("kind") == "agent" and a.get("owned") and a.get("label"))
     for label in sorted(labels):
         path = agent_path(ctx, label)
         actions.append({"kind": "agent", "label": label, "path": os.fspath(path),

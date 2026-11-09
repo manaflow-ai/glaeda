@@ -729,6 +729,35 @@ class MiniSetupTest(unittest.TestCase):
                      "--reclaim-binary", os.fspath(self.reclaim)])
         self.assertIn("diskFree", json.loads(out.getvalue())["blocking"])
 
+    def test_hygiene_only_without_a_glaeda_runner_drops_the_runner_agents(self) -> None:
+        """A personal Mac (air-blue) gets no runner-only agents, and setup removes the ones an earlier release
+        installed; a headless EC2 runner Mac is --hygiene-only too, so a glaeda runner keeps them."""
+        agents = self.home / "Library/LaunchAgents"
+        runner_only = sorted(ms.RUNNER_ONLY_AGENTS)
+        old = ms.agent_names
+        with mock.patch.object(ms, "agent_names", lambda ctx: [*old(ctx), *(
+                label for label in runner_only if label not in old(ctx))]):
+            self.invoke("--hygiene-only", "--apply")  # what an earlier release left on the laptop
+        for label in runner_only:
+            self.assertTrue((agents / f"{label}.plist").is_file(), label)
+        receipt = self.invoke("--hygiene-only", "--apply")
+        removed = {a["label"] for a in receipt["actions"] if a["kind"] == "agent" and a["state"] == "remove"}
+        self.assertEqual(removed, set(runner_only))
+        for label in runner_only:
+            self.assertFalse((agents / f"{label}.plist").exists(), label)
+        for label in ("disk-pressure", "disk-dedupe", "worktree-reclaim", "update", "local-guard", "gh-watch"):
+            self.assertTrue((agents / f"com.teamleaderleo.glaeda.{label}.plist").is_file(), label)
+        runner = self.home / "actions-runner-glaeda"
+        (runner / "glaeda-hooks").mkdir(parents=True)
+        self.invoke("--hygiene-only", "--apply")
+        for label in runner_only:
+            self.assertTrue((agents / f"{label}.plist").is_file(), label)
+        # uninstall after the runner is gone still removes the agents the receipt owns
+        (runner / "glaeda-hooks").rmdir()
+        self.invoke("--hygiene-only", "--uninstall", "--apply")
+        for label in runner_only:
+            self.assertFalse((agents / f"{label}.plist").exists(), label)
+
     def test_hygiene_only_still_blocks_without_python(self) -> None:
         self.patches[0].stop()
         pre = fake_preflight()(None)
