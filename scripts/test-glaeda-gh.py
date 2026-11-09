@@ -10657,6 +10657,68 @@ class DaemonPolicyTest(Base):
         self.assertEqual(len(self.gh.run_calls()), 1)
         self.assertEqual(gg.read_cache("run:o/r/7")["via"], "rest")
 
+    def test_a_yielding_share_reads_over_rest_at_the_lean_pace(self) -> None:
+        """Past its share with GraphQL out, the daemon still reads over REST, but a quarter as often: on 2026-11-09 the
+        yield ran at the full cycle, 1,271 counted REST requests in 15 minutes from one host whose share is 300/h."""
+        self.configure({"restShare": 0.0})
+        self.daemon.now = NOW
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4000, "reset": NOW + 3000},
+                              "graphql": {"limit": 5000, "remaining": 10, "reset": NOW + 3000}}
+        self.assertTrue(self.daemon.past_share())
+        self.assertFalse(self.daemon.rest_capped())  # the share yields: REST still reads
+        self.assertEqual(self.daemon.mode("rest"), "lean")
+        self.assertEqual({k: self.daemon.route(k) for k in gg.CYCLES},
+                         {"pr": "rest", "run": "rest", "comment": "rest", "head": "rest"})
+        self.gh.runs[7] = {"id": 7, "status": "in_progress", "html_url": "u"}
+        gg.register("run:o/r/7")
+        self.daemon.tick(NOW)
+        self.assertEqual(len(self.gh.run_calls()), 1)
+        for later in (NOW + 61, NOW + 121, NOW + 181):
+            self.daemon.budget["rest"]["remaining"] = 4000
+            self.daemon.budget["graphql"] = {"limit": 5000, "remaining": 10, "reset": NOW + 3000}
+            gg.register("run:o/r/7")
+            self.daemon.tick(later)
+        self.assertEqual(len(self.gh.run_calls()), 1)  # the full cycle would have read it three more times
+        self.daemon.budget["rest"]["remaining"] = 4000
+        self.daemon.budget["graphql"] = {"limit": 5000, "remaining": 10, "reset": NOW + 3000}
+        gg.register("run:o/r/7")
+        self.daemon.tick(NOW + gg.CYCLE * gg.LEAN_FACTOR + 1)
+        self.assertEqual(len(self.gh.run_calls()), 2)
+
+    def test_a_yielding_share_admits_head_consumers_and_paces_every_head(self) -> None:
+        """Review F1/F2 at 99070e23: lean only for being past the share must still admit an unreserved consumer, and a
+        reserved one's head must be read at most once per lean cycle too."""
+        self.configure({"restShare": 0.0})
+        sha = "a" * 40
+        for consumer in ("session-1", "autoland"):
+            self.daemon.now = NOW
+            self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4000, "reset": NOW + 3000},
+                                  "graphql": {"limit": 5000, "remaining": 10, "reset": NOW + 3000}}
+            self.daemon.attempted.clear()
+            self.daemon.head_spend = {}
+            entry = {"key": f"head:o/r@{sha}", "cache": None, "consumers": {consumer: NOW}}
+            self.assertEqual(self.daemon.mode("rest"), "lean")
+            self.assertEqual([e["key"] for e in self.daemon.due("head", [entry])], [entry["key"]], consumer)
+            for later in (NOW + 91, NOW + 182):
+                self.daemon.now = later
+                entry["consumers"] = {consumer: later}
+                self.assertEqual(self.daemon.due("head", [entry]), [], (consumer, later))
+            self.daemon.now = NOW + gg.CYCLE * gg.LEAN_FACTOR + 1
+            entry["consumers"] = {consumer: self.daemon.now}
+            self.assertEqual([e["key"] for e in self.daemon.due("head", [entry])], [entry["key"]], consumer)
+
+    def test_within_its_share_the_daemon_reads_rest_at_the_full_cycle(self) -> None:
+        self.configure({"restShare": 0.1})
+        self.daemon.now = NOW
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4000, "reset": NOW + 3000},
+                              "graphql": {"limit": 5000, "remaining": 10, "reset": NOW + 3000}}
+        self.assertFalse(self.daemon.past_share())
+        self.assertEqual(self.daemon.mode("rest"), "normal")
+        self.daemon.budget["rest"]["remaining"] = gg.FLOORS["rest"][0] - 1  # below the floor: lean, no fallback
+        self.assertEqual(self.daemon.mode("rest"), "lean")
+        self.assertFalse(self.daemon.rest_above_floor())
+        self.assertEqual(self.daemon.route("comment"), "graphql")
+
     def test_only_counted_rest_requests_spend_the_share(self) -> None:
         self.daemon.now = NOW
         answers = iter([(200, {}, b"{}"), (304, {}, b""), (200, {}, b"{}")])

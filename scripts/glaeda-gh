@@ -1694,10 +1694,15 @@ class Daemon:
     # -- budget
 
     def mode(self, bucket: str) -> str:
-        """normal, lean (below the floor) or stop (below the reserve, or told to back off)."""
+        """normal, lean (below the floor, or REST past the daemon's own share) or stop (below the reserve, or told
+        to back off). Past its share REST is lean even while the share yields (share_yields): the yield lets reads go
+        on over REST while GraphQL is out, at a quarter of the pace (LEAN_FACTOR) and without job lists, never at the
+        full cycle. On 2026-11-08/09 the share yielded from each REST reset (:18) to GraphQL's (~:33) and
+        cosmic-gray's daemon sent 1,271 counted REST requests in those 15 minutes (85 a minute; its share is 300 an
+        hour), and the account's REST ran out by :50 every hour while GraphQL was out from :05 (both out :05-:18)."""
         if self.backoff[bucket] > self.now:
             return "stop"
-        capped = bucket == "rest" and self.rest_capped()
+        capped = bucket == "rest" and self.past_share()
         seen = self.budget.get(bucket) or {}
         if not seen or (seen.get("reset") or 0) <= self.now:
             return "lean" if capped or bucket in self.policy.get("forceLow", ()) else "normal"
@@ -1731,6 +1736,20 @@ class Daemon:
     def rest_cap(self) -> int:
         limit = (self.budget.get("rest") or {}).get("limit") or 5000
         return int(self.policy["restShare"] * limit)
+
+    def past_share(self) -> bool:
+        """The largest read no longer fits in the daemon's own REST share, whether or not the share yields."""
+        return self.rest_spent() + max(REST_READ_MAX.values()) > self.rest_cap()
+
+    def rest_above_floor(self) -> bool:
+        """REST is neither told to look low (forceLow) nor seen below its floor: what a fallback read over REST
+        needs. Unlike mode("rest") == "normal", true while REST is lean only for being past the daemon's share."""
+        if "rest" in self.policy.get("forceLow", ()):
+            return False
+        seen = self.budget.get("rest") or {}
+        if not seen or (seen.get("reset") or 0) <= self.now:
+            return True
+        return int(seen.get("remaining") or 0) >= self.policy["floors"]["rest"][0]
 
     def rest_capped(self) -> bool:
         """The daemon spent its share of the hourly REST limit, as near as the largest read can tell:
@@ -1782,9 +1801,10 @@ class Daemon:
         steps instead of flapping, and the two buckets drain about evenly."""
         current = self.paths[kind]
         if kind in FALLBACK:
-            # GraphQL unless it is low or throttled and REST is neither (nor is the daemon's REST share spent)
-            want = ("rest" if self.mode("graphql") != "normal" and self.mode("rest") == "normal"
-                    and not self.rest_capped() else "graphql")
+            # GraphQL unless it is low or throttled and REST is neither (nor is the daemon's REST share spent, unless it
+            # yields): REST lean only for being past the share still takes them, at the lean pace (mode)
+            want = ("rest" if self.mode("graphql") != "normal" and self.mode("rest") != "stop"
+                    and self.rest_above_floor() and not self.rest_capped() else "graphql")
             if want != current:
                 log({"event": "route", "kind": kind, "from": current, "to": want,
                      "modes": {b: self.mode(b) for b in ("rest", "graphql")}})
@@ -2403,7 +2423,10 @@ class Daemon:
                     self.attempted[e["key"]] = self.now
             return []
         if kind == "head":
-            return self.due_heads(mine, mode)
+            # REST lean only because the daemon is past its own share (the yield): consumers are admitted as when
+            # normal, and every head, a reserved consumer's too, is read at most once per lean cycle (review F1, F2)
+            yielding = path == "rest" and mode == "lean" and self.rest_above_floor()
+            return self.due_heads(mine, "normal" if yielding else mode, paced=yielding)
         interval = self.policy["cycles"][kind] * (LEAN_FACTOR if mode == "lean" else 1)
         full = self.now - self.last_cycle[kind] >= interval
         if full:
@@ -2519,7 +2542,7 @@ class Daemon:
             self.head_spend.setdefault(self.refunded[key], []).append(self.now)
         self.refunded.pop(key, None)
 
-    def due_heads(self, mine: list[dict], mode: str) -> list[dict]:
+    def due_heads(self, mine: list[dict], mode: str, paced: bool = False) -> list[dict]:
         """Heads somebody asked for recently whose answer is missing or older than its TTL. One read serves
         every consumer of the head; it is charged to the first consumer (reserved ones first) that may pay.
         A head nobody may pay for is left to the cache, and the refused consumers are marked denied."""
@@ -2547,6 +2570,8 @@ class Daemon:
             asked = {n: t for n, t in e["consumers"].items() if self.now - t < HEAD_INTEREST}
             c = e["cache"] or {}
             retry = HEAD_MISSING_RETRY if c.get("missing") else self.policy["cycles"]["head"]
+            if paced:
+                retry = max(retry, self.policy["cycles"]["head"] * LEAN_FACTOR)
             if e["key"] in self.deferred:
                 self.deferred.discard(e["key"])  # the last tick ran out of time for it: no cycle to wait
             elif self.now - self.attempted.get(e["key"], float("-inf")) < retry:
