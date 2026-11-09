@@ -745,25 +745,31 @@ def bounded_lock(path: Path, seconds: float = LOCK_WAIT):
             handle.close()
 
 
-def register(key: str, jobs: bool = False, consumer: str | None = None, waited: bool = False) -> None:
+def register(key: str, jobs: bool = False, consumer: str | None = None, waited: bool = False,
+             began: float | None = None) -> None:
     """Record interest in `key`. Wanting jobs is sticky while any reader wants them. A head's readers
     are named consumers, each with the time it last asked. A wait marks the watch waitedAt: the daemon
-    re-reads a waited run the controller may have lost the finish of (STALE_RUN_REREAD)."""
+    re-reads a waited run the controller may have lost the finish of (STALE_RUN_REREAD). A new wait passes its start
+    (BEGAN, kept as waitBegan; a touch leaves it): the daemon makes one confirming read of a finished run for it."""
     path = watch_dir() / file_name(key)
     watch_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
     # read-modify-write: two sessions must not lose each other. Unheld, the write still happens --
     # losing a concurrent registration costs one watch, and waiting costs the gh call.
     with bounded_lock(watch_dir() / ".register.lock"):
-        _register_locked(path, key, jobs, consumer, waited)
+        _register_locked(path, key, jobs, consumer, waited, began)
 
 
-def _register_locked(path: Path, key: str, jobs: bool, consumer: str | None, waited: bool = False) -> None:
+def _register_locked(path: Path, key: str, jobs: bool, consumer: str | None, waited: bool = False,
+                     began: float | None = None) -> None:
     prior = read_json(path) or {}
     doc: dict[str, Any] = {"key": key, "jobs": bool(jobs or prior.get("jobs"))}
     if waited:
         doc["waitedAt"] = time.time()
     elif isinstance(prior.get("waitedAt"), (int, float)):
         doc["waitedAt"] = prior["waitedAt"]
+    starts = [t for t in (began, prior.get("waitBegan")) if isinstance(t, (int, float)) and not isinstance(t, bool)]
+    if starts:
+        doc["waitBegan"] = max(starts)
     if consumer:
         asked = prior.get("consumers") if isinstance(prior.get("consumers"), dict) else {}
         now = time.time()
@@ -1667,6 +1673,11 @@ class Daemon:
         self.errors: list[str] = []
         self.attempted: dict[str, float] = {}  # when each key was last fetched: a new one at most once per cycle
         self.rest_tried: dict[str, float] = {}  # when a REST read of each key last ended, answered or failed
+        # when a confirming read (wait_confirms) of each run was last made ahead of the rest, and the finish it was
+        # for (rest_run): one such read per finish
+        self.confirm_tried: dict[str, tuple[float, dict]] = {}
+        # the runs this tick's due() put first as confirming reads: their finish, and their cache's fetchedAt then
+        self.confirming: dict[str, tuple[dict, Any]] = {}
         self.repo_parts: dict[str, dict] = {}  # REST path -> {"at", "part"}: repo/base-level answers every PR shares
         self.deferred_before: dict[str, float] = {}  # deferred by the last tick: when each was first deferred
         self.deferred_since: dict[str, float] = {}  # when each key still deferred was first deferred
@@ -2379,8 +2390,9 @@ class Daemon:
                 continue
             asked = doc.get("consumers") if isinstance(doc.get("consumers"), dict) else {}
             waited = doc.get("waitedAt") if isinstance(doc.get("waitedAt"), (int, float)) else None
+            began = doc.get("waitBegan") if isinstance(doc.get("waitBegan"), (int, float)) else None
             out.append({"key": key, "jobs": bool(doc.get("jobs")), "cache": cached, "touched": self.now - age,
-                        "waitedAt": waited,
+                        "waitedAt": waited, "waitBegan": began,
                         "consumers": {str(k): float(v) for k, v in asked.items() if isinstance(v, (int, float))}})
         return out
 
@@ -2399,14 +2411,16 @@ class Daemon:
                    self.rest_tried.get(e["key"], float("-inf")))
 
     def rest_order(self, entries: list[dict]) -> list[dict]:
-        """The order a tick reads REST keys in. Keys the last tick ran out of time for go first, ahead of new ones
+        """The order a tick reads REST keys in. A finished run a wait only needs confirmed (wait_confirms) goes first:
+        one read each, and then it is an ordinary key. Keys the last tick ran out of time for go next, ahead of new ones
         of either kind (due() put them first only within their kind, so deferred runs still sat behind every new
         PR), oldest deferral first, so a newer one (a new watch, never read) cannot overtake a key deferred tick
         after tick. Then the longest unread, a key a wait is blocked on counted WAIT_PRIORITY older, and waited
         first on a tie (two never-read keys). Aging, not an absolute rank: an unread key's place only improves
         while read keys move back, so waiters cannot starve the rest."""
         carried = self.deferred_before
-        return sorted(entries, key=lambda e: (e["key"] not in carried, carried.get(e["key"], 0.0),
+        return sorted(entries, key=lambda e: (not self.wait_confirms(e), e["key"] not in carried,
+                                              carried.get(e["key"], 0.0),
                                               self.last_read(e) - (WAIT_PRIORITY if self.waited(e) else 0),
                                               not self.waited(e)))
 
@@ -2466,7 +2480,8 @@ class Daemon:
             if e["key"] in first:
                 continue
             if kind == "run" and c is not None and self.run_needs_confirm(e) \
-                    and self.now - self.attempted.get(e["key"], float("-inf")) >= self.policy["cycles"][kind]:
+                    and (self.now - self.attempted.get(e["key"], float("-inf")) >= self.policy["cycles"][kind]
+                         or self.first_confirm(e)):
                 out.append(e)  # a wait (or a rerun) since GitHub last showed this finish: read it once now
                 continue
             if (kind == "pr" and c is not None and e["key"] in self.nudged
@@ -2522,10 +2537,39 @@ class Daemon:
         # first read a wait on a PR or run that does not exist cannot say so, and on a daemon at its GraphQL pace
         # (76 deferred, 2026-11-08) `wait pr o/r#999999 --timeout 120` timed out with "no data yet" instead.
         # Bounded: its first read stores an answer (or an error), and then it is an ordinary key.
-        out.sort(key=lambda e: not (e["cache"] is None and self.waited(e)))
+        # So does a finished run a wait is blocked on that GitHub has not shown since (run_needs_confirm): wait_step will
+        # not rule on it until that read, and behind 88 deferred keys on a lean daemon (2026-11-09, a 60 s confirmation
+        # wait on a CI run) it timed out every time while the cache held its failure.
+        # Bounded too: the read stores restRunAt, and then the run no longer needs confirming for that wait.
+        out.sort(key=lambda e: not (self.wait_confirms(e) or (e["cache"] is None and self.waited(e))))
+        if kind == "run":
+            self.confirming = {e["key"]: (rest_run((e["cache"] or {}).get("data")), (e["cache"] or {}).get("fetchedAt"))
+                               for e in out if self.wait_confirms(e)}
         for e in out:
             self.attempted[e["key"]] = self.now
         return out
+
+    def wait_confirms(self, e: dict) -> bool:
+        """A finished run a wait is blocked on that GitHub has not shown since the wait (run_needs_confirm): the cache
+        holds the answer, and wait_step rules on it after one read. That read goes ahead of every other, deferred keys
+        included; then the run is an ordinary key again. Once per finish and wait (confirm_tried, waitBegan): a wait's
+        touches move waitedAt, so a wait held on (rescue grace), or a run GitHub keeps refusing, would otherwise take
+        the head of every cycle ahead of healthy deferred work (review of glaeda#1924). Later reads age and defer."""
+        if not (e["key"].startswith("run:") and self.waited(e) and self.run_needs_confirm(e)):
+            return False
+        tried = self.confirm_tried.get(e["key"])
+        if tried is None or tried[1] != rest_run((e.get("cache") or {}).get("data")):
+            return True  # (a new finish, a rerun's say, gets its own first read)
+        began = e.get("waitBegan")
+        return isinstance(began, (int, float)) and began > tried[0]  # a new wait since
+
+    def first_confirm(self, e: dict) -> bool:
+        """A wait that began after this run's last read (waitBegan, which touches leave) and needs its finish
+        confirmed: read now, not when the cycle's pace allows. A run read just before the wait began otherwise sat a
+        whole cycle, as long as a short confirmation wait. Once per wait: the read is an attempt after its start."""
+        began = e.get("waitBegan")
+        return (isinstance(began, (int, float)) and began > self.attempted.get(e["key"], float("-inf"))
+                and self.wait_confirms(e))
 
     def run_needs_confirm(self, e: dict) -> bool:
         """A finished run a wait blocks on, or a rerun was brokered for, after GitHub last showed it (restRunAt): its
@@ -2762,10 +2806,18 @@ class Daemon:
         except Exception as error:  # noqa: BLE001  the waits are the clients' business; the reads go on
             waiting = None
             self.errors.append(f"waits: {describe(error)} at {error_site(error)}")
+        # A confirming read that was made has had its turn ahead of the rest (wait_confirms): it stored an answer or
+        # an error (fetchedAt moved), even if what it read next (a failed attempt's jobs) is deferred. One cut off
+        # before its request keeps its place.
+        for key, (finish, fetched) in self.confirming.items():
+            if key not in self.deferred or (read_cache(key) or {}).get("fetchedAt") != fetched:
+                self.confirm_tried[key] = (self.now, finish)
+        self.confirming = {}
         self.deferred &= {e["key"] for e in entries}
         self.nudged &= {e["key"] for e in entries}
         self.attempted = {k: t for k, t in self.attempted.items() if self.now - t < 2 * IDLE_EXPIRY}
         self.rest_tried = {k: t for k, t in self.rest_tried.items() if self.now - t < 2 * IDLE_EXPIRY}
+        self.confirm_tried = {k: t for k, t in self.confirm_tried.items() if self.now - t[0] < 2 * IDLE_EXPIRY}
         oldest = self.oldest_data(entries, {e["key"] for e in prs + runs + comments + heads})
         self.prune({e["key"] for e in entries})
         self.post_prune()
@@ -5508,7 +5560,7 @@ def poll_wait(req: dict) -> int:
             warned = True
         now = time.monotonic()
         if now - touched >= TOUCH_EVERY:
-            register(req["key"], jobs, waited=True)
+            register(req["key"], jobs, waited=True, began=req["began"])  # (the same start every touch)
             touched = now
         done = wait_step(req, time.time())
         if done is not None:
@@ -5616,7 +5668,7 @@ def write_wait_request(kind: str, target: str, until: str, timeout: float, jobs:
     rid = f"{pid}-{os.urandom(4).hex()}"
     waits_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
     os.mkfifo(waits_dir() / f"{rid}.fifo", 0o600)
-    register(req["key"], jobs, waited=True)
+    register(req["key"], jobs, waited=True, began=req["began"])
     write_json(waits_dir() / f"{rid}.json", {**req, "pid": pid, "touched": req["began"]})
     return rid
 
@@ -5717,7 +5769,7 @@ def subscribe_wait(kind: str, target: str, until: str, timeout: float, jobs: boo
     req = wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace, settle)
     if kind == "run" and not jobs:
         # the daemon keeps reading while this blocks (a lost finish is re-read past STALE_RUN_REREAD)
-        register(key, jobs, waited=True)
+        register(key, jobs, waited=True, began=req["began"])
         started = time.monotonic()
         controller_wait_run(key, timeout)
         done = wait_step(req, time.time())
@@ -5780,7 +5832,7 @@ def resume_wait(rid: str) -> int:
         return EXIT_DOWN
     left = float(req["began"]) + float(req["timeout"]) - time.time()
     if left > 0 and serving_waits():
-        register(req["key"], bool(req.get("jobs")), waited=True)
+        register(req["key"], bool(req.get("jobs")), waited=True, began=float(req["began"]))
         block(rid, left, req)
     drop_wait(rid)
     try:
