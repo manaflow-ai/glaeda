@@ -486,11 +486,16 @@ contexts(first: 100) { totalCount pageInfo { hasNextPage endCursor } nodes { __t
 # only each check suite's newest attempt, and one that ended in startup_failure ran no jobs: after two such reruns of
 # run 41931705470, cmux#35906's "publish tree-addressed cmux-tui" red was gone from it, and the PR merged as 633d5e38
 # at e1d1894a with that red not excused. Such an attempt is no result, never green. So each read also counts every
-# suite's check runs in its newest attempt and in all of them; a suite whose newest attempt ran nothing but an older
-# one ran something has its check runs (every attempt) read by id (last_real_contexts) and folded in, newest per name.
+# suite's check runs in its newest attempt; a suite whose newest attempt ran nothing has its check runs (every attempt)
+# read by id (last_real_contexts), one query for the whole batch, and folded in, newest per name.
+# The count of every attempt's runs is not asked here (2026-11-08): GitHub prices a connection nested under
+# checkSuites(first: 100) at 100 requests per PR whatever its own first is, so the two counts were 200 of the 204
+# requests in each PR of the batched read, 20 points for a batch of ten. The suites whose newest attempt ran nothing
+# (on a cmux head about 15 of 55, mostly apps' suites that never run anything) are read by id instead, where each
+# suite is one request: a suite that never ran anything comes back with no runs and adds nothing.
 SUITE_ATTEMPTS = ("checkSuites(first: 100) { pageInfo { hasNextPage } nodes { id "
-                  "latest: checkRuns(first: 1) { totalCount } "
-                  "every: checkRuns(first: 1, filterBy: { checkType: ALL }) { totalCount } } }")
+                  "latest: checkRuns(first: 1) { totalCount } } }")
+SUITE_RUNS_BATCH = 100  # suite ids per SUITE_RUNS query: GitHub's nodes(ids:) takes at most 100
 PR_FIELDS = PR_FIELDS.replace("SUITE_ATTEMPTS", SUITE_ATTEMPTS)
 SUITE_RUNS = """query($suites: [ID!]!) { rateLimit { limit remaining resetAt cost } suiteRuns: nodes(ids: $suites) {
 ... on CheckSuite { id conclusion app { slug } workflowRun { databaseId workflow { name databaseId } }
@@ -499,8 +504,9 @@ checkRuns(first: 100, filterBy: { checkType: ALL }) { pageInfo { hasNextPage } n
 
 
 def ran_nothing_suites(commit: dict | None) -> list[str] | str:
-    """The ids of COMMIT's check suites whose newest attempt ran no check run while an older attempt ran some; an
-    error message when COMMIT has more suites than one page shows (one past it could hide a red: never greener)."""
+    """The ids of COMMIT's check suites whose newest attempt ran no check run (an older attempt may have run some:
+    last_real_contexts reads them); an error message when COMMIT has more suites than one page shows (one past it
+    could hide a red: never greener)."""
     if commit is None:
         return []  # no such commit here (a fork that lacks it): nothing to read
     suites = commit.get("checkSuites")
@@ -517,10 +523,9 @@ def ran_nothing_suites(commit: dict | None) -> list[str] | str:
         # A null node, or a null, missing or non-count total, is GitHub failing that field beside a nested error:
         # read as zero it made a partial read look complete and could hide an older red (glaeda#1844 F1).
         latest = count_field(suite, "latest")
-        every = count_field(suite, "every")
-        if latest is None or every is None:
+        if latest is None:
             return "graphql: last real attempt: malformed check suite counts (a partial read)"
-        if latest == 0 and every > 0:
+        if latest == 0:
             if not suite.get("id"):
                 return "graphql: last real attempt: malformed check suite (no id)"
             out.append(suite["id"])
@@ -534,6 +539,24 @@ def count_field(suite: object, field: str) -> int | None:
     holder = suite.get(field)
     total = holder.get("totalCount") if isinstance(holder, dict) else None
     return total if type(total) is int and total >= 0 else None
+
+
+def suites_contexts(suites: list[str] | str, runs: dict[str, list[dict]],
+                    runs_error: str | None) -> tuple[list[dict], str | None]:
+    """The check-run context nodes of SUITES (ran_nothing_suites: a list, or its error) out of RUNS (suite_runs);
+    ([], error) when SUITES or RUNS could not be read: a partial read would be a smaller, greener head."""
+    if isinstance(suites, str):
+        return [], suites
+    if not suites:
+        return [], None
+    if runs_error:
+        return [], runs_error
+    for s in suites:
+        if s not in runs:
+            return [], "graphql: last real attempt: a suite could not be read"
+        if isinstance(runs[s], str):
+            return [], runs[s]
+    return [node for s in suites for node in runs[s]], None
 
 
 COMMENT_FIELDS = f"""comments(last: {COMMENTS_LAST}) {{ totalCount nodes {{ databaseId url createdAt
@@ -3147,13 +3170,23 @@ class Daemon:
             problems[str(path[0])] = err
         alias, field = ("p", "pullRequest") if kind == "pr" else ("c", "issueOrPullRequest")
         parsed = {}
+        attempts: dict[int, list[str] | str] = {}  # PR alias -> its suites whose newest attempt ran nothing
+        if kind == "pr":
+            for i in range(len(entries)):
+                node = (data.get(f"{alias}{i}") or {}).get(field)
+                if node:
+                    commit = (((node.get("commits") or {}).get("nodes") or [{}])[0] or {}).get("commit") or {}
+                    attempts[i] = ran_nothing_suites(commit)
+        # one read for the whole batch's suites, not one per PR: most cmux heads have a few such suites
+        suite_runs, suites_error = self.suite_runs(
+            [s for found in attempts.values() if isinstance(found, list) for s in found], paced=False)
         for i, e in enumerate(entries):
             node = (data.get(f"{alias}{i}") or {}).get(field)
             if node:
                 page_error = None
                 if kind == "pr":
                     page_error = self.extend_pr_contexts(e, node)
-                    page_error = self.add_last_real_contexts(node) or page_error
+                    page_error = self.add_last_real_contexts(node, attempts[i], suite_runs, suites_error) or page_error
                 parsed[i] = parse_pr(node) if kind == "pr" else parse_comments(node)
                 if page_error:
                     parsed[i]["checksPageError"] = page_error
@@ -3182,11 +3215,12 @@ class Daemon:
         """GraphQL points the follow-up check pages spent in the last hour (PR_PAGES_POINTS_PER_HOUR)."""
         return sum(points for at, why, points in self.gql_log if why == "pr-pages" and self.now - at < 3600)
 
-    def add_last_real_contexts(self, node: dict) -> str | None:
-        """Add to a PR node's rollup the check runs of the suites whose newest attempt ran nothing (last_real_contexts);
-        the error when they cannot be read, so the cached rollup is partial, never green."""
+    def add_last_real_contexts(self, node: dict, suites: list[str] | str, runs: dict[str, list[dict]],
+                               runs_error: str | None) -> str | None:
+        """Add to a PR node's rollup the check runs of SUITES, its suites whose newest attempt ran nothing, from RUNS
+        (suite_runs over the batch); the error when they cannot be read, so the cached rollup is partial, never green."""
         commit = (((node.get("commits") or {}).get("nodes") or [{}])[0] or {}).get("commit") or {}
-        extra, error = self.last_real_contexts(ran_nothing_suites(commit))
+        extra, error = suites_contexts(suites, runs, runs_error)
         if extra:
             rollup = commit.get("statusCheckRollup")
             if not isinstance(rollup, dict):
@@ -3291,6 +3325,11 @@ class Daemon:
             for e in entries:
                 self.refund(e["key"])
             return message
+        # Suites whose newest attempt ran nothing, in each head and its check-of-record commit: one read for the batch.
+        attempts = {alias: ran_nothing_suites((data.get(alias) or {}).get("object"))
+                    for i in range(len(entries)) for alias in (f"h{i}", f"m{i}")}
+        suite_runs, suites_error = self.suite_runs(
+            [s for found in attempts.values() if isinstance(found, list) for s in found], paced=False)
         for i, e in enumerate(entries):
             _, owner, repo, sha = split_key(e["key"])
             node = ((data.get(f"h{i}") or {}).get("object") or {}).get("statusCheckRollup")
@@ -3315,11 +3354,11 @@ class Daemon:
                 sources.append((*CHECKS_OF_RECORD[(owner, repo)], record.get("contexts") or {}))
             # Suites whose newest attempt ran nothing, in each source (the check-of-record one under its prefix).
             extra, extra_error = [], None
-            objects = [("", (data.get(f"h{i}") or {}).get("object"))]
+            objects = [("", f"h{i}")]
             if (owner, repo) in CHECKS_OF_RECORD:
-                objects.append(("{}/{}: ".format(*CHECKS_OF_RECORD[(owner, repo)]), commit))
+                objects.append(("{}/{}: ".format(*CHECKS_OF_RECORD[(owner, repo)]), f"m{i}"))
             for prefix, obj in objects:
-                nodes, extra_error = self.last_real_contexts(ran_nothing_suites(obj))
+                nodes, extra_error = suites_contexts(attempts[obj], suite_runs, suites_error)
                 if extra_error:
                     break
                 extra.append((prefix, nodes))
@@ -3347,33 +3386,67 @@ class Daemon:
         partial read would be a smaller, greener head."""
         if isinstance(suites, str):
             return [], suites
-        if not suites:
-            return [], None
-        if not self.gql_room():
-            # Paced like every other query (glaeda#1844 F2): a batch of heads with startup_failure suites must not spend
-            # past graphqlPerMinute. Unread is partial, never green; the next cycle reads it.
-            return [], "graphql: last real attempt: held by graphqlPerMinute; read next cycle"
-        reason, self.gql_reason = self.gql_reason, "last-real-attempt"
-        try:
-            doc, error = self.graphql(SUITE_RUNS, {"suites": suites})
-        finally:
-            self.gql_reason = reason
-        if doc is None:
-            return [], error or "graphql: no response"
-        found = (doc.get("data") or {}).get("suiteRuns")
-        if doc.get("errors") or not isinstance(found, list) or len(found) != len(suites) or not all(found):
-            message = str(((doc.get("errors") or [{}])[0] or {}).get("message") or "a suite could not be read")
-            return [], "graphql: last real attempt: " + message[:200]
-        nodes = []
-        for suite in found:
-            runs = suite.get("checkRuns") or {}
-            if (runs.get("pageInfo") or {}).get("hasNextPage"):
-                return [], "graphql: last real attempt: more than 100 check runs in one suite"
-            context = {"conclusion": suite.get("conclusion"), "app": suite.get("app"),
-                       "workflowRun": suite.get("workflowRun")}
-            nodes += [{"__typename": "CheckRun", **run, "checkSuite": context, "lastRealAttempt": True}
-                      for run in runs.get("nodes") or [] if run]
-        return nodes, None
+        runs, error = self.suite_runs(suites)
+        return suites_contexts(suites, runs, error)
+
+    def suite_runs(self, suites: list[str], paced: bool = True) -> tuple[dict[str, list[dict] | str], str | None]:
+        """Suite id -> its check-run context nodes over every attempt (statusCheckRollup's shape, marked
+        lastRealAttempt), or the error that suite alone could not be read with (held by the pace, no response, a
+        nested error), SUITE_RUNS_BATCH suites per query. The second value is always None, kept for the callers.
+
+        Paced like every other query (glaeda#1844 F2): past graphqlPerMinute it reads nothing, and unread is partial,
+        never green; the next cycle reads it. A batch's own follow-up (PACED false) is never held: it is part of the
+        read the ceiling already admitted, and holding a later chunk starved the PRs whose suites sort last, which the
+        next cycle held the same way (router-review BLOCK on glaeda#1916 at 73069ea7). It is bounded by the batch: at
+        most GQL_BATCH PRs (or heads and their check-of-record commits) of at most 100 suites, so 2 * GQL_BATCH queries
+        of one point each, and far fewer in practice (a cmux head has about 15 such suites)."""
+        suites = list(dict.fromkeys(suites))
+        out: dict[str, list[dict] | str] = {}
+        # Every failure is the error of the suites it left unread only (router-review BLOCKs on glaeda#1916 at
+        # a01313fc and af5363f6): the batch holds many PRs' suites, and what was read stays read.
+        for start in range(0, len(suites), SUITE_RUNS_BATCH):
+            chunk = suites[start:start + SUITE_RUNS_BATCH]
+            if paced and not self.gql_room():
+                for suite_id in suites[start:]:
+                    out[suite_id] = "graphql: last real attempt: held by graphqlPerMinute; read next cycle"
+                break
+            reason, self.gql_reason = self.gql_reason, "last-real-attempt"
+            try:
+                doc, error = self.graphql(SUITE_RUNS, {"suites": chunk})
+            finally:
+                self.gql_reason = reason
+            if doc is None:
+                for suite_id in suites[start:]:
+                    out[suite_id] = error or "graphql: no response"
+                break
+            found = (doc.get("data") or {}).get("suiteRuns")
+            errors = [e for e in doc.get("errors") or [] if isinstance(e, dict)]
+            message = "graphql: last real attempt: " + str(
+                (errors[0] if errors else {}).get("message") or "a suite could not be read")[:200]
+            # a nested error names its suite by path (["suiteRuns", i, ...]); one with no such path names them all
+            hit: set[int] = set()
+            for e in errors:
+                path = e.get("path")
+                if isinstance(path, list) and len(path) > 1 and path[0] == "suiteRuns" and type(path[1]) is int:
+                    hit.add(path[1])
+                else:
+                    hit.update(range(len(chunk)))
+            if not isinstance(found, list) or len(found) != len(chunk):
+                found = [None] * len(chunk)
+            for n, (suite_id, suite) in enumerate(zip(chunk, found)):
+                runs = suite.get("checkRuns") if isinstance(suite, dict) else None
+                nodes = runs.get("nodes") if isinstance(runs, dict) else None
+                if n in hit or not isinstance(nodes, list) or not all(isinstance(r, dict) for r in nodes):
+                    out[suite_id] = message  # a null field beside an error is no empty suite: never greener
+                    continue
+                if (runs.get("pageInfo") or {}).get("hasNextPage"):
+                    out[suite_id] = "graphql: last real attempt: more than 100 check runs in one suite"
+                    continue
+                context = {"conclusion": suite.get("conclusion"), "app": suite.get("app"),
+                           "workflowRun": suite.get("workflowRun")}
+                out[suite_id] = [{"__typename": "CheckRun", **run, "checkSuite": context, "lastRealAttempt": True}
+                                 for run in nodes]
+        return out, None
 
     def head_pages(self, sha: str, sources: list[tuple[str, str, dict]],
                    extra: list[tuple[str, list[dict]]] = ()) -> dict | str:
