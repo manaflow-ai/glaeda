@@ -459,9 +459,17 @@ REST_RUN_PAGES = 2  # a commit's workflow-run pages (100 each) likewise: without
 REST_STEPS_MAX = 10  # failed or cancelled jobs whose steps one PR read over REST looks up at most
 # The most counted REST requests one read can make before its step lookups, which are admitted one
 # at a time: a PR is its pull, REST_CHECK_PAGES of check runs, statuses, runs, workflows, rules and
-# the branch; a run is the run and its job list. The share admits a read only when this much fits.
+# the branch; a run is the run and its job list. The share admits a read only when this much fits. The
+# workflows, rules and branch reads are shared (REST_REPO_PART_TTL), but a cold or expired share still sends them.
 # A comment watch is the issue and at most two pages of its comments; a head is REST_CHECK_PAGES of check
 # runs, its statuses, its workflow runs and the workflow names.
+# The repository- and base-level parts of a REST PR read (the workflow names, the base's rulesets and its
+# classic protection) are the same answer for every PR on that repository and base. The daemon keeps one
+# answer for all of them this long; past it, the next PR read refreshes it with one conditional read. The
+# branch's ETag moves with every commit to the base, so without this each PR paid a counted 200 after
+# every base move. A required check added or dropped on the base shows within this time.
+REST_REPO_PART_TTL = 600
+REST_REPO_PART_KEEP = 3600  # an answer past its TTL still lends its ETag to the refresh this long
 REST_READ_MAX = {"pr": REST_CHECK_PAGES + REST_STATUS_PAGES + REST_RUN_PAGES + 4, "run": 2, "comment": 3,
                  "head": REST_CHECK_PAGES + REST_STATUS_PAGES + REST_RUN_PAGES + 1}
 
@@ -1636,6 +1644,7 @@ class Daemon:
         self.errors: list[str] = []
         self.attempted: dict[str, float] = {}  # when each key was last fetched: a new one at most once per cycle
         self.rest_tried: dict[str, float] = {}  # when a REST read of each key last ended, answered or failed
+        self.repo_parts: dict[str, dict] = {}  # REST path -> {"at", "part"}: repo/base-level answers every PR shares
         self.deferred_before: dict[str, float] = {}  # deferred by the last tick: when each was first deferred
         self.deferred_since: dict[str, float] = {}  # when each key still deferred was first deferred
         self.sent: list[tuple[float, str]] = []  # (time, rest|rest304|graphql) for the last hour's counts
@@ -3542,18 +3551,44 @@ class Daemon:
             new[path] = {"doc": absent, "unavailable": True}
             return absent
         if state == "error" and absent is not None and str(doc).startswith("HTTP 404"):
-            new[path] = {"doc": kept["doc"]} if "doc" in kept else {"doc": absent}
+            new[path] = {"doc": kept["doc"], "gone": True} if "doc" in kept else {"doc": absent, "gone": True}
             return new[path]["doc"]
         if state == "error":
             raise WatchError(doc)
         new[path] = kept if state == "same" else {"etag": etag, "doc": slim(doc)}
         return new[path]["doc"]
 
+    def repo_part(self, old: dict, new: dict, path: str, slim: Callable[[Any], Any], absent: Any = None) -> Any:
+        """rest_part for a repository- or base-level path every PR on it reads alike: one answer serves every
+        PR read for REST_REPO_PART_TTL, then one conditional read (with the newest ETag known) refreshes it
+        for all. A per-PR `unavailable` stands as in rest_part; a 404 (a deleted base) is shared as the fact,
+        and each PR keeps its own last answer, as rest_part does. An error is never shared."""
+        kept = old.get(path) or {}
+        if absent is not None and kept.get("unavailable"):
+            new[path] = kept
+            return absent
+        shared = self.repo_parts.get(path)
+        if shared is None or self.now - shared["at"] >= REST_REPO_PART_TTL:
+            lent = (shared or {}).get("part") or {}
+            seed = {path: lent} if lent.get("etag") and "doc" in lent else old
+            scratch: dict = {}
+            self.rest_part(seed, scratch, path, slim, absent)  # raises on an error: nothing is shared
+            shared = self.repo_parts[path] = {"at": self.now, "part": scratch[path]}
+            for stale in [p for p, v in self.repo_parts.items() if self.now - v["at"] >= REST_REPO_PART_KEEP]:
+                del self.repo_parts[stale]
+        part = shared["part"]
+        if part.get("gone"):
+            new[path] = {"doc": kept["doc"], "gone": True} if "doc" in kept else {"doc": absent, "gone": True}
+        else:
+            new[path] = part
+        return new[path]["doc"]
+
     def fetch_pr_rest(self, e: dict) -> None:
         """One PR over REST, for when GraphQL is the poorer bucket: the pull, its head's check runs,
         statuses and workflow runs (for superseded runs), the repo's workflow names, and the base
         branch's required checks from its rulesets and classic protection. Every read is conditional,
-        so a quiet PR costs nothing. A failed read keeps the cached data and says why."""
+        so a quiet PR costs nothing; the last three are shared by every PR on the repository and base
+        (repo_part). A failed read keeps the cached data and says why."""
         _, owner, repo, number = split_key(e["key"])
         prior = e["cache"] or {}
         self.reads.append((self.now, "pr", "rest"))
@@ -3567,8 +3602,8 @@ class Daemon:
             listed = checks["check_runs"]
             # a deleted base (a stacked PR's, after its merge) has no requirements left to read
             rules, protection = f"{root}/rules/branches/{base}?per_page=100", f"{root}/branches/{base}"
-            required = set(self.rest_part(old, parts, rules, slim_rules, []))
-            required |= set(self.rest_part(old, parts, protection, slim_branch, []))
+            required = set(self.repo_part(old, parts, rules, slim_rules, []))
+            required |= set(self.repo_part(old, parts, protection, slim_branch, []))
             if parts[rules].get("unavailable") and parts[protection].get("unavailable"):
                 # A private repository on a plan without either feature: GitHub enforces no required check there,
                 # so none is the true answer. GraphQL's last word is kept all the same (it can name a rule that
@@ -3617,7 +3652,7 @@ class Daemon:
         if total > len(statuses) or runs_total > len(runs):
             # a partial list would read as a smaller, greener head (a check without its run loses its workflow)
             checks = {**checks, "total_count": max(int(checks.get("total_count") or 0), len(checks["check_runs"]) + 1)}
-        workflows = self.rest_part(old, parts, f"{root}/actions/workflows?per_page=100", slim_workflows)
+        workflows = self.repo_part(old, parts, f"{root}/actions/workflows?per_page=100", slim_workflows)
         return checks, statuses, runs, workflows
 
     def fetch_head_rest(self, e: dict) -> None:

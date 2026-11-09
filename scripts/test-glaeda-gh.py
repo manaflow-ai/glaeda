@@ -2054,7 +2054,8 @@ class BalanceTest(Base):
         # nothing changed: every conditional read answers 304, which costs no quota
         before = self.gh.rest_remaining
         self.daemon.tick(NOW + 2 * gg.CYCLE)
-        self.assertEqual(len(self.gh.rest_calls()), 14)  # 7 reads, all 304 the second time
+        # the 4 PR-level reads, all 304; the 3 repo/base-level answers are shared within REST_REPO_PART_TTL
+        self.assertEqual(len(self.gh.rest_calls()), 11)
         self.assertEqual(self.gh.rest_remaining, before)
         self.assertEqual(gg.read_cache(key)["data"]["checks"], over_rest["checks"])
 
@@ -2304,10 +2305,53 @@ class BalanceTest(Base):
         self.daemon.tick(NOW)
         self.assertEqual(gg.read_cache("pr:o/r#5")["data"]["requiredMissing"], ["ci-status"])
         self.gh.base_gone = True
-        self.daemon.tick(NOW + gg.CYCLE)
+        later = NOW + gg.REST_REPO_PART_TTL  # past the shared answer, so the 404 is what is read
+        self.daemon.tick(later)
         entry = gg.read_cache("pr:o/r#5")
         self.assertIsNone(entry["error"])
         self.assertEqual(entry["data"]["requiredMissing"], ["ci-status"])
+        self.assertEqual(len([c for c in self.gh.rest_calls() if "/branches/main" in c[1]]), 4)  # 404 read
+        # a PR first read on the gone base shares the 404, not another PR's kept requirements
+        self.gh.prs[("o", "r", 15)] = pr_node(15, checks=[workflow_check("build", 5)])
+        gg.register("pr:o/r#15")
+        self.daemon.tick(later + gg.CYCLE)
+        self.assertIsNone(gg.read_cache("pr:o/r#15")["error"])
+        self.assertEqual(gg.read_cache("pr:o/r#15")["data"]["requiredMissing"], [])
+        self.assertEqual(gg.read_cache("pr:o/r#5")["data"]["requiredMissing"], ["ci-status"])
+        self.assertEqual(len([c for c in self.gh.rest_calls() if "/branches/main" in c[1]]), 4)  # shared
+
+    def test_prs_on_one_base_share_the_repo_and_base_reads(self) -> None:
+        """Workflows, rules and the base branch are one answer for every PR on that repository and base: N PRs
+        read over REST cost 4 reads each plus 3 in all, within REST_REPO_PART_TTL, and 3 again past it."""
+        shared = ("actions/workflows?per_page=100", "rules/branches/main?per_page=100", "branches/main")
+        for n in range(1, 6):
+            self.gh.prs[("o", "r", n)] = {**pr_node(n, checks=[workflow_check("build", 5)]), "headRefOid": f"{n}" * 40}
+            gg.register(f"pr:o/r#{n}")
+        self.gh.protected = ["ci-status"]
+        self.budgets(rest=(4000, 1800), graphql=(300, 3000))
+        asked = lambda: [c[1].split("/o/r/", 1)[1] for c in self.gh.rest_calls()]
+        self.daemon.tick(NOW)
+        self.assertEqual(sorted(p for p in asked() if p.startswith("pulls/")), [f"pulls/{n}" for n in range(1, 6)])
+        for path in shared:
+            self.assertEqual(asked().count(path), 1, path)
+        self.assertEqual(len(asked()), 5 * 4 + 3)
+        for n in range(1, 6):
+            entry = gg.read_cache(f"pr:o/r#{n}")
+            self.assertEqual(entry["data"]["requiredMissing"], ["ci-status"], n)
+            self.assertTrue(all(f"/repos/o/r/{p}" in entry["restParts"] for p in shared), n)  # kept per PR too
+        self.daemon.tick(NOW + gg.CYCLE)  # within the TTL: only the PR-level reads (all 304)
+        for path in shared:
+            self.assertEqual(asked().count(path), 1, path)
+        self.assertEqual(len(asked()), 2 * 5 * 4 + 3)
+        # past the TTL, one conditional read refreshes each for every PR: a base move is one counted 200
+        self.gh.protected = ["ci-status", "lint"]
+        before = self.gh.rest_remaining
+        self.daemon.tick(NOW + gg.CYCLE + gg.IDLE_BACKOFF_MAX)  # the PRs' next read (idle backoff), past the TTL
+        for path in shared:
+            self.assertEqual(asked().count(path), 2, path)
+        self.assertEqual(before - self.gh.rest_remaining, 1)  # the branch's 200; the rest answered 304
+        for n in range(1, 6):
+            self.assertEqual(gg.read_cache(f"pr:o/r#{n}")["data"]["requiredMissing"], ["ci-status", "lint"], n)
 
     def test_a_graphql_read_drops_the_kept_rest_answers(self) -> None:
         self.gh.prs[("o", "r", 6)] = pr_node(6, checks=[workflow_check("build", 5)])
@@ -2702,6 +2746,10 @@ class FallbackTest(Base):
         asked = len([c for c in self.gh.rest_calls() if "/rules/" in c[1]])
         self.daemon.tick(NOW + 2 * gg.CYCLE)
         self.assertEqual(len([c for c in self.gh.rest_calls() if "/rules/" in c[1]]), asked)  # not asked again
+        self.daemon.repo_parts.clear()  # nor once the shared answer is gone: the PR's own kept answer stands
+        self.daemon.tick(NOW + 3 * gg.CYCLE + gg.REST_REPO_PART_TTL)
+        self.assertEqual(len([c for c in self.gh.rest_calls() if "/rules/" in c[1]]), asked)
+        self.assertEqual(gg.read_cache(self.keys["pr"])["data"]["requiredMissing"], ["ci-status"])
 
     def test_rest_comments_read_the_last_fifty_across_pages(self) -> None:
         self.assertEqual(gg.slim_comments([{"id": 1, "user": {"login": "cmux-bot[bot]"}, "body": "x"}])[0]["author"],
