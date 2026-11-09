@@ -875,7 +875,7 @@ class UpdateTest(unittest.TestCase):
 
         with mock.patch.object(gu.subprocess, "run", fake_run):
             self.assertEqual(gu.health(self.bin, self.root, gh_only=True), (True, "tools run"))
-            self.assertEqual(ran, ["glaeda-gh", "glaeda-update"])
+            self.assertEqual(ran, ["glaeda-disk", "glaeda-gh", "glaeda-update"])
             ran.clear()
             gu.health(self.bin, self.root)
         self.assertEqual(ran, ["glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-worktree-reclaim",

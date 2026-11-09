@@ -60,6 +60,10 @@ gd.CENSUS_STATE = Path(_NO_RESERVATIONS.name + ".census-none.json")
 # Nor git gc the clones in the real home of the host running the suite: only a test's own home is gc'd.
 _gc_home_clones = gd.gc_home_clones
 gd.gc_home_clones = lambda receipt, home=None, halt=None: 0 if home is None else _gc_home_clones(receipt, home, halt)
+# Nor repack the shared mirrors of the host running the suite: only a test's own home's.
+_compact_shared_mirrors = gd.compact_shared_mirrors
+gd.compact_shared_mirrors = (lambda receipt, home=None, halt=None:
+                             0 if home is None else _compact_shared_mirrors(receipt, home, halt))
 # Nor erase the simulator devices of the host running the suite: only a test that passes its own simctl reading.
 _erase_idle_sim_devices = gd.erase_idle_sim_devices
 gd.erase_idle_sim_devices = (lambda receipt, halt=None, budget_s=gd.SIM_DEVICE_BUDGET_S, simctl=None, below_target=None:
@@ -7096,6 +7100,175 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual((first["outcome"], first["verdict"], first["reasons"][-1]),
                          ("failed:exit-128", "failed", "gc failed:exit-128"))
         self.assertIn("its last gc failed within 24h", second["reasons"][0])
+
+    def _shared_mirror(self, packs: int = 4) -> tuple[Path, Path, str]:
+        """A home whose tools/wt mirror ~/Projects/.wt-mirrors/o/r.git holds packs packs, one of them an object
+        no ref names (a worktree's commit before its ref moves); returns home, the mirror and that object."""
+        home = self.root / "home"
+        src = self.root / "src"
+        src.mkdir(parents=True)
+        self._git("init", "-q", "-b", "main", os.fspath(src))
+        mirror = home / "Projects/.wt-mirrors/o/r.git"
+        mirror.parent.mkdir(parents=True)
+        self._git("init", "-q", "--bare", os.fspath(mirror))
+        for n in range(packs - 1):  # each fetch leaves a pack of its own
+            (src / f"f{n}").write_text(str(n) * 100)
+            self._git("-C", os.fspath(src), "add", f"f{n}")
+            self._git("-C", os.fspath(src), "commit", "-q", "-m", f"c{n}")
+            self._git("-C", os.fspath(mirror), "-c", "fetch.unpackLimit=1", "fetch", "-q", os.fspath(src),
+                      "+main:refs/heads/main")
+        (self.root / "in-flight").write_text("in flight\n")
+        loose = self._git("--git-dir", os.fspath(mirror), "hash-object", "-w",
+                          os.fspath(self.root / "in-flight")).strip()
+        subprocess.run(["git", "--git-dir", os.fspath(mirror), "pack-objects", "-q",
+                        os.fspath(mirror / "objects/pack/pack")], input=loose + "\n", text=True, check=True,
+                       capture_output=True)
+        (mirror / "objects" / loose[:2] / loose[2:]).unlink()
+        self.assertEqual(gd.git_pack_count(mirror), packs)
+        return home, mirror, loose
+
+    def test_shared_mirror_compact_folds_a_wt_mirror_and_loses_nothing(self) -> None:
+        # an agent lane host, 2026-11-09: the cmuxterm-hq mirror's 42 packs, 5.4 GiB, were 3.5 GiB as one pack
+        home, mirror, loose = self._shared_mirror(4)
+        (home / "Projects/.wt-mirrors/o/link.git").symlink_to(mirror)  # never through a symlink
+        self.assertEqual(gd.shared_mirrors(home), [mirror])
+        heads = self._git("--git-dir", os.fspath(mirror), "rev-list", "--all").split()
+        receipt = self.receipt()
+        gd.process_evidence = lambda: ([], "")
+        with self._gc_log(), contextlib.redirect_stdout(io.StringIO()):
+            gd.compact_shared_mirrors(receipt, home)
+        self.assertEqual(gd.git_pack_count(mirror), 1)
+        self.assertFalse(os.path.lexists(mirror / "objects/maintenance.lock"))  # held only while git ran
+        rec = json.loads(receipt.read_text())
+        self.assertEqual((rec["family"], rec["outcome"], rec["packs"], rec["packs_after"]),
+                         (gd.SHARED_MIRROR_COMPACT_FAMILY, "reclaimed", 4, 1))
+        self.assertEqual(self._git("--git-dir", os.fspath(mirror), "cat-file", "-t", loose).strip(), "blob")
+        self.assertEqual(self._git("--git-dir", os.fspath(mirror), "rev-list", "--all").split(), heads)
+        self._git("--git-dir", os.fspath(mirror), "fsck", "--no-progress")
+
+    def test_shared_mirrors_never_lie_beneath_a_symlinked_folder(self) -> None:
+        home, mirror, _ = self._shared_mirror(4)
+        outside = self.root / "outside"
+        shutil.move(os.fspath(home / "Projects"), os.fspath(outside))
+        (home / "Projects").symlink_to(outside)  # ~/Projects leads outside home (review F2)
+        self.assertEqual(gd.shared_mirrors(home), [])
+
+    def test_shared_mirror_compact_lock_is_freed_when_its_holder_is_gone(self) -> None:
+        home, mirror, _ = self._shared_mirror(4)
+        lock = mirror / "objects/maintenance.lock"
+        # stopped with SIGTERM: the wrapper's trap removes the lock (review F1)
+        argv = ["/bin/sh", "-c", f'echo "{gd.SHARED_MIRROR_LOCK_MARK} $$" > "$0"; '
+                'trap \'rm -f "$0"; exit 143\' HUP INT TERM; "$@"; s=$?; rm -f "$0"; exit $s',
+                os.fspath(lock), "sleep", "2"]
+        lock.write_text(gd.SHARED_MIRROR_LOCK_MARK + "\n")
+        proc = subprocess.Popen(argv)
+        for _ in range(200):
+            if lock.read_text().strip() != gd.SHARED_MIRROR_LOCK_MARK:
+                break
+            time.sleep(0.01)
+        self.assertFalse(gd.release_abandoned_compact_lock(lock))  # its holder runs
+        proc.terminate()
+        proc.wait(timeout=10)  # sh runs the trap once its child (git) exits
+        self.assertFalse(lock.exists())
+        # killed outright, or a reboot: the pid it names is gone, so the next pass frees it
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        lock.write_text(f"{gd.SHARED_MIRROR_LOCK_MARK} {dead.pid}\n")
+        self.assertTrue(gd.release_abandoned_compact_lock(lock))
+        # git's own lock, and ours before the wrapper started (under an hour), stay
+        lock.write_text("")
+        self.assertFalse(gd.release_abandoned_compact_lock(lock))
+        lock.write_text(gd.SHARED_MIRROR_LOCK_MARK + "\n")
+        self.assertFalse(gd.release_abandoned_compact_lock(lock))
+        os.utime(lock, (time.time() - 2 * 3600,) * 2)
+        self.assertTrue(gd.release_abandoned_compact_lock(lock))
+        # a pass after a SIGKILL compacts again
+        lock.write_text(f"{gd.SHARED_MIRROR_LOCK_MARK} {dead.pid}\n")
+        gd.process_evidence = lambda: ([], "")
+        receipt = self.receipt()
+        with self._gc_log(), contextlib.redirect_stdout(io.StringIO()):
+            gd.compact_shared_mirrors(receipt, home)
+        self.assertEqual(gd.git_pack_count(mirror), 1)
+        self.assertFalse(lock.exists())
+
+    def test_shared_mirror_compact_below_the_pack_threshold_does_nothing(self) -> None:
+        home, mirror, _ = self._shared_mirror(3)
+        receipt = self.receipt()
+        with self._gc_log():
+            self.assertEqual(gd.compact_shared_mirrors(receipt, home), 0)
+        self.assertEqual(gd.git_pack_count(mirror), 3)
+        self.assertFalse(receipt.exists())
+
+    def test_shared_mirror_compact_vetoes(self) -> None:
+        cases = {
+            "holds gc.pid": lambda m: (m / "gc.pid").write_text("1 host"),
+            "holds objects/maintenance.lock": lambda m: (m / "objects/maintenance.lock").write_text(""),
+            "a repack is writing a pack": lambda m: (m / "objects/pack/.tmp-77-pack-abc").write_text(""),
+            "a repack, gc or maintenance command": lambda m: setattr(
+                gd, "process_evidence", lambda: ([], f"git -C {m} repack -d --geometric=2\n")),
+        }
+        for reason, make_busy in cases.items():
+            with self.subTest(reason):
+                shutil.rmtree(self.root / "home", ignore_errors=True)
+                shutil.rmtree(self.root / "src", ignore_errors=True)
+                gd.process_evidence = lambda: ([], "")
+                home, mirror, _ = self._shared_mirror(4)
+                make_busy(mirror)
+                receipt = self.receipt()
+                receipt.unlink(missing_ok=True)
+                with self._gc_log():
+                    self.assertEqual(gd.compact_shared_mirrors(receipt, home), 0)
+                self.assertEqual(gd.git_pack_count(mirror), 4)
+                self.assertIn(reason, json.loads(receipt.read_text())["reasons"][0])
+        # a fetch loop never holds it off (cmux16, 2026-11-08: ~700 packs an hour): its command, its cwd, its
+        # temporary pack; nor does a repack's temporary pack a killed run left two hours ago
+        shutil.rmtree(self.root / "home", ignore_errors=True)
+        shutil.rmtree(self.root / "src", ignore_errors=True)
+        home, mirror, _ = self._shared_mirror(4)
+        (mirror / "objects/pack/tmp_pack_abc123").write_text("")
+        stale = mirror / "objects/pack/.tmp-1-pack-old"
+        stale.write_text("")
+        os.utime(stale, (time.time() - 2 * 3600,) * 2)
+        fetch = f"git -C {mirror} fetch --prune origin\n"
+        self.assertEqual(gd.shared_mirror_veto(mirror, frozenset([os.fspath(mirror)]), fetch, time.time()), "")
+        gd.process_evidence = lambda: ([os.fspath(mirror)], fetch)
+        receipt = self.receipt()
+        receipt.unlink(missing_ok=True)
+        with self._gc_log(), contextlib.redirect_stdout(io.StringIO()):
+            gd.compact_shared_mirrors(receipt, home)
+        self.assertEqual(json.loads(receipt.read_text())["outcome"], "reclaimed")
+        self.assertEqual(gd.git_pack_count(mirror), 1)
+
+    def test_shared_mirror_compact_runs_under_the_floor_on_every_role_only(self) -> None:
+        dev = gd.HOME.stat().st_dev
+        under = {dev: gd.Fs(dev, "/", 10 * gd.GIB, 460 * gd.GIB, 34 * gd.GIB, 50 * gd.GIB)}
+        room = {dev: gd.Fs(dev, "/", 300 * gd.GIB, 460 * gd.GIB, 34 * gd.GIB, 50 * gd.GIB)}
+        receipt = ["--receipt", os.fspath(self.receipt())]
+        fss = {"value": room}
+        with mock.patch.object(gd, "EVICT_LOCK", self.root / "evict.lock"), \
+                mock.patch.object(gd, "EVICT_OWNER", self.root / "evict.owner.json"), \
+                mock.patch.object(gd, "MEASURE_LOCK", self.root / "measure.lock"), \
+                mock.patch.object(gd, "HEALTH_SUMMARY", self.root / "summary.json"), \
+                mock.patch.object(gd, "IDLE_STAMP", self.root / "idle.stamp"), \
+                mock.patch.object(gd, "default_families", return_value=[]), \
+                mock.patch.object(gd, "filesystems", side_effect=lambda *a, **k: fss["value"]), \
+                mock.patch.object(gd, "survey", return_value=[]), \
+                mock.patch.object(gd, "apply", return_value=0), \
+                mock.patch.object(gd, "cleanup_paused_runner_work", return_value=0), \
+                mock.patch.object(gd, "evict_idle_runner_checkouts", return_value=0), \
+                mock.patch.object(gd, "notify_disk"), \
+                mock.patch.object(gd, "gc_home_clones", return_value=0), \
+                mock.patch.object(gd, "repack_runner_checkouts", return_value=0), \
+                mock.patch.object(gd, "compact_shared_mirrors", return_value=0) as compact, \
+                contextlib.redirect_stdout(io.StringIO()):
+            gd.main(["--pressure", "--apply", "--role", "devbox", "--no-snapshot", "--top", "0", *receipt])
+            gd.main(["--pressure", "--idle", "--apply", "--role", "devbox", "--no-snapshot", "--top", "0", *receipt])
+            compact.assert_not_called()  # room to spare: neither the pressure pass nor the idle sweep
+            fss["value"] = under
+            gd.main(["--apply", "--role", "devbox", "--no-snapshot", "--top", "0", *receipt])
+            compact.assert_not_called()  # a plain --apply is not the floor's pass
+            gd.main(["--pressure", "--apply", "--role", "devbox", "--no-snapshot", "--top", "0", *receipt])
+            compact.assert_called_once()
 
     def test_home_clone_gc_runs_on_pressure_and_sweeps_of_fleet_minis_only(self) -> None:
         dev = gd.HOME.stat().st_dev

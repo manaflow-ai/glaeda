@@ -17,7 +17,10 @@ home="${HOME:?HOME is required}"
 python="${GLAEDA_PYTHON:-/opt/homebrew/bin/python3}"
 disk="${GLAEDA_DISK:-$home/.local/bin/glaeda-disk}"
 export GLAEDA_DISK_CALLER="${GLAEDA_DISK_CALLER:-disk-pressure LaunchAgent}"
+# GLAEDA_DISK_PRESSURE_ONLY=1 (setup's --gh-only profile): only below the floor, no idle sweep.
+idle=(--idle)
+[[ "${GLAEDA_DISK_PRESSURE_ONLY:-}" == 1 ]] && idle=()
 if [[ -n "${GLAEDA_ROLE:-}" ]]; then
-  exec "$python" "$disk" --role "$GLAEDA_ROLE" --pressure --idle --apply --top 0
+  exec "$python" "$disk" --role "$GLAEDA_ROLE" --pressure ${idle[@]+"${idle[@]}"} --apply --top 0
 fi
-exec "$python" "$disk" --pressure --idle --apply --top 0
+exec "$python" "$disk" --pressure ${idle[@]+"${idle[@]}"} --apply --top 0

@@ -81,9 +81,11 @@ glaeda-mini-enroll needs Python 3.13+ (accept-local uses os.waitid). Setup looks
 enroll does and is not ready without it, so a missing interpreter shows up here, not 13 minutes
 into enrollment. When Homebrew belongs to another account, the fix is printed instead.
 
---gh-only is narrower still: glaeda-gh (its daemon, the github-ci-wait skill) and glaeda-update with its
-agent or timer, and nothing else, so a host that runs agent lanes gets the shared GitHub watcher on the same
-release ring as every other host (huge-blue, which has no disk or worktree reclaim of its own).
+--gh-only is narrower still: glaeda-gh (its daemon, the github-ci-wait skill), glaeda-update with its
+agent or timer, and glaeda-disk's pressure pass (the disk-pressure agent or timer, without the idle sweep), so a
+host that runs agent lanes gets the shared GitHub watcher on the same release ring as every other host, and
+below its free-space floor glaeda clears old unused caches and compacts the shared repository mirrors there too
+(huge-blue and the lane VMs, whose worktree reclaim is leo-workspace's hygiene reconciler).
 
 --hygiene-only is for machines that are not fleet build hosts, such as personal MacBooks.
 It installs the tools and LaunchAgents above and nothing else: no build-host directories,
@@ -190,11 +192,13 @@ LINUX_UNITS = (
     "glaeda-gh.service",
 )
 DEVBOX_LINUX_UNITS = frozenset({"glaeda-projects-tidy.service", "glaeda-projects-tidy.timer"})
-# --gh-only: the shared GitHub watcher and the updater that keeps it on its release ring, nothing else.
-# For a host that runs agent lanes but no glaeda hygiene (no disk or worktree reclaim of its own).
-GH_ONLY_TOOLS = ("glaeda-update", "glaeda-gh")
+# --gh-only: the shared GitHub watcher, the updater that keeps it on its release ring, and glaeda-disk's pressure
+# pass, which acts only below the free-space floor (Leo, 2026-11-08: cleanup "on every machine ... this is what
+# glaeda is for"). For a host that runs agent lanes whose worktree reclaim is its own.
+GH_ONLY_TOOLS = ("glaeda-update", "glaeda-gh", "glaeda-disk", "disk-pressure.sh")
 PROFILE_FLAGS = ("--gh-only", "--hygiene-only")
-GH_ONLY_LINUX_UNITS = frozenset({"glaeda-update.service", "glaeda-update.timer", "glaeda-gh.service"})
+GH_ONLY_LINUX_UNITS = frozenset({"glaeda-update.service", "glaeda-update.timer", "glaeda-gh.service",
+                                 "glaeda-disk-pressure.service", "glaeda-disk-pressure.timer"})
 # long-running Linux services with no timer: enabled and started themselves
 DAEMON_UNITS = frozenset({"glaeda-gh.service"})
 # the Claude Code skill installed beside the tools
@@ -920,7 +924,9 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             # --idle: with no pressure, an hourly sweep of idle reproducible data while no job runs.
             "LowPriorityIO": True,
             "Nice": 10,
-            "EnvironmentVariables": {"GLAEDA_PYTHON": python, "GLAEDA_DISK": disk, "GLAEDA_ROLE": ctx.role},
+            # a --gh-only host: only below the floor, never the idle sweep (its worktree reclaim is its own)
+            "EnvironmentVariables": {"GLAEDA_PYTHON": python, "GLAEDA_DISK": disk, "GLAEDA_ROLE": ctx.role,
+                                     **({"GLAEDA_DISK_PRESSURE_ONLY": "1"} if ctx.gh_only else {})},
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-disk.log"),
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-disk.err"),
         },
@@ -1134,7 +1140,8 @@ def agent_names(ctx: Context) -> list[str]:
     """LaunchAgent labels on macOS; systemd unit file names on Linux."""
     if ctx.platform != "linux":
         return [label for label in agent_plists(ctx)
-                if not ctx.gh_only or is_update_agent(label) or is_gh_agent(label)]
+                if not ctx.gh_only or is_update_agent(label) or is_gh_agent(label)
+                or label == LABEL_PREFIX + "disk-pressure"]
     if ctx.gh_only:
         return [name for name in LINUX_UNITS if name in GH_ONLY_LINUX_UNITS]
     return [name for name in LINUX_UNITS if ctx.role == "devbox" or name not in DEVBOX_LINUX_UNITS]

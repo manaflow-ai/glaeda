@@ -893,16 +893,20 @@ class MiniSetupTest(unittest.TestCase):
         self.assertEqual(self.states(again), {"unchanged"})
         self.assertFalse(any("systemctl" in os.path.basename(c[0]) for c in self.calls))
 
-    def test_gh_only_installs_the_watcher_and_its_updater_and_nothing_else(self) -> None:
-        """A lane host with no glaeda hygiene (huge-blue): glaeda-gh on the release ring, nothing that reclaims."""
+    def test_gh_only_installs_the_watcher_its_updater_and_the_floor_pass(self) -> None:
+        """A lane host whose worktree reclaim is not glaeda's (huge-blue): glaeda-gh on the release ring, and
+        glaeda-disk's pressure pass, which acts only below the floor (Leo, 2026-11-08: "on every machine")."""
         self.linux()
         receipt = self.invoke("--gh-only", "--ota-ring", "stable", "--apply")
         self.assertEqual((receipt["platform"], receipt["profile"]), ("linux", "gh"))
         self.assertTrue(receipt["ready"], receipt["blocking"])
         units = self.home / ".config/systemd/user"
         self.assertEqual(sorted(p.name for p in units.iterdir()),
-                         ["glaeda-gh.service", "glaeda-update.service", "glaeda-update.timer"])
-        self.assertEqual(sorted(p.name for p in (self.home / ".local/bin").iterdir()), ["glaeda-gh", "glaeda-update"])
+                         ["glaeda-disk-pressure.service", "glaeda-disk-pressure.timer", "glaeda-gh.service",
+                          "glaeda-update.service", "glaeda-update.timer"])
+        self.assertNotIn("--idle", (units / "glaeda-disk-pressure.service").read_text())
+        self.assertEqual(sorted(p.name for p in (self.home / ".local/bin").iterdir()),
+                         ["disk-pressure.sh", "glaeda-disk", "glaeda-gh", "glaeda-update"])
         config = json.loads((self.home / ".config/glaeda/update.json").read_text())
         self.assertEqual((config["ring"], config["setupArgs"]), ("stable", ["--gh-only"]))
         self.assertTrue((self.home / ".claude/skills/github-ci-wait/SKILL.md").is_file())
@@ -930,13 +934,20 @@ class MiniSetupTest(unittest.TestCase):
         self.invoke("--apply")  # no profile named: the recorded one stays
         self.assertEqual(json.loads(config_path.read_text())["setupArgs"], ["--gh-only"])
 
-    def test_gh_only_on_a_mac_keeps_two_agents(self) -> None:
+    def test_gh_only_on_a_mac_keeps_three_agents(self) -> None:
         receipt = self.invoke("--gh-only", "--apply")
         self.assertEqual(receipt["profile"], "gh")
         labels = sorted(a["label"] for a in receipt["actions"] if a["kind"] == "agent")
+        pressure = ms.LABEL_PREFIX + "disk-pressure"
         self.assertEqual(labels, sorted(l for l in ms.agent_plists(self.ctx_for_steps())
-                                        if ms.is_update_agent(l) or ms.is_gh_agent(l)))
-        self.assertEqual(len(labels), 2)
+                                        if ms.is_update_agent(l) or ms.is_gh_agent(l) or l == pressure))
+        self.assertEqual(len(labels), 3)
+        # only below the floor: disk-pressure.sh leaves out the idle sweep
+        gh_ctx = self.ctx_for_steps()
+        gh_ctx.gh_only = True
+        self.assertEqual(ms.agent_plists(gh_ctx)[pressure]["EnvironmentVariables"]["GLAEDA_DISK_PRESSURE_ONLY"], "1")
+        self.assertNotIn("GLAEDA_DISK_PRESSURE_ONLY",
+                         ms.agent_plists(self.ctx_for_steps())[pressure]["EnvironmentVariables"])
         self.assertFalse(any(a["kind"] == "marker" for a in receipt["actions"]))
 
     def test_linux_fleet_role_does_not_install_devbox_tidy_units(self) -> None:

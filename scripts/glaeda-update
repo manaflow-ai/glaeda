@@ -16,8 +16,8 @@ written once by setup and never overwritten:
 
 For a GUI-less macOS host, setupArgs also contains `--headless`; this keeps OTA reinstalls in
 the system launchd domain instead of silently returning to a GUI-only agent. A lane host with no glaeda
-hygiene has `["--gh-only"]`: setup installs only glaeda-gh and this updater, and the health check runs only
-those two.
+hygiene has `["--gh-only"]`: setup installs only glaeda-gh, this updater and glaeda-disk's pressure pass, and the
+health check runs only those three.
 
 `source` is where releases and channel files are downloaded from: this repository, or its read-only
 mirror manaflow-ai/glaeda, which the Manaflow minis use (docs/GLAEDA_OTA.md, Fleet mirror). The mirror
@@ -131,7 +131,7 @@ MAX_EXTRACTED = 1024 * 1024 * 1024
 TOOLS = ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-runner-hygiene", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all",
          "glaeda-fleet-cas-prune", "glaeda-seed-prefetch", "glaeda-git-mirror", "glaeda-idle-warm", "glaeda-mini-health", "glaeda-update", "glaeda-gh")
 # what a --gh-only host installs (glaeda-mini-setup GH_ONLY_TOOLS): its health and drift checks cover only these
-GH_ONLY_TOOLS = ("glaeda-update", "glaeda-gh")
+GH_ONLY_TOOLS = ("glaeda-update", "glaeda-gh", "glaeda-disk")
 RELEASE_SCHEMA = "glaeda-release/v1"
 STATUS_PREFIX = "glaeda-ota/"
 MAX_ASSET = 200 * 1024 * 1024
@@ -486,10 +486,10 @@ def gh_only(config: dict) -> bool:
 def health(bin_dir: Path, channel_dir: Path, gh_only: bool = False) -> tuple[bool | None, str]:
     """The installed tools run, and the installed glaeda-update plans from the channel files this
     run already fetched, so a network blip cannot fail (and quarantine) a good release. A --gh-only
-    host installs only glaeda-gh and glaeda-update, so only those are checked there. (None, why) when a
+    host installs only glaeda-gh, glaeda-update and glaeda-disk, so only those are checked there. (None, why) when a
     check timed out: a host too busy to start Python in 120 s says nothing about the release (cosmic-gray
     at load 200 quarantined r-20261022-e5ce794d9efd on `glaeda-disk --help`, 2026-10-22)."""
-    hygiene = [] if gh_only else [
+    hygiene = [[sys.executable, str(bin_dir / "glaeda-disk"), "--help"]] if gh_only else [
         [sys.executable, str(bin_dir / "glaeda-disk"), "--help"],
         [sys.executable, str(bin_dir / "glaeda-worktree"), "--help"],
         [sys.executable, str(bin_dir / "glaeda-projects"), "--help"],
@@ -979,7 +979,7 @@ def file_sha256(path: Path) -> str | None:
 def tool_drift(gen: Path, bin_dir: Path, gh_only: bool = False) -> tuple[int, list[str]]:
     """(tools compared, tools whose installed bytes are not the release's). Only a tool both installed and
     in the release is compared: a host profile need not install every tool, and setup owns which. A
-    --gh-only host compares only its two: hygiene tools left from an earlier profile are no longer setup's,
+    --gh-only host compares only its own: hygiene tools left from an earlier profile are no longer setup's,
     and a "repair" that reran setup for them would fail on every run."""
     checked, drift = 0, []
     for name in GH_ONLY_TOOLS if gh_only else TOOLS:

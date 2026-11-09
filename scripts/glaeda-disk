@@ -110,6 +110,13 @@ on the clone with the most packs once it has ten, at most one per idle sweep or 
 eviction lock is released, when no lock, missing work tree, process, command or hour-old git activity touches
 it or its linked work trees. Only a home with enrolled runners. A slow gc runs on; it is never killed.
 
+Below the floor, on every role, shared-mirror-compact folds the shared repository copies every checkout borrows
+from (tools/wt's bare mirrors, <root>/.wt-mirrors/<owner>/<repo>.git) into one pack each with
+`git repack -a -d -k -l` (keeps every object), the one with the most object bytes and at least four packs per
+pass, after the eviction lock is released. It holds objects/maintenance.lock while git runs, and waits only while
+another repack, gc or git maintenance run works on that mirror. Fetches (a fetch loop too) and worktree reads go
+on beside it.
+
 The folders lanes leave directly in a fleet mini's home (home-scratch: ~/cnx-*-evidence, an ad-hoc clone, a build
 root), on a mini with enrolled runners only, follow the same 12 h rule: idle 12 h, unpushed commits are bundled and
 uncommitted work archived into ~/archive, then the tree goes, on every pressure pass and idle sweep. A process, an
@@ -4986,8 +4993,114 @@ def repack_runner_checkouts(receipt: Path, home: Path | None = None, halt=None) 
                       halt)
 
 
-def _gc_clones(receipt: Path, clones: list[tuple[int, Path, Path]], family: str, git_args, veto, halt) -> int:
-    """Run `git <git_args(tree)>` on the first of clones (packs, tree, git dir) that veto clears."""
+# The shared repository copies every checkout on a host borrows from: tools/wt's bare mirrors
+# (<root>/.wt-mirrors/<owner>/<repo>.git, every role). Their fetches pile up packs that git's hourly geometric
+# repack folds but never merges into one, so objects stay duplicated across packs. An agent lane host's
+# cmuxterm-hq mirror held 42 packs, 5.4 GiB, that `git repack -a -d -k -l` made one pack of 3.5 GiB in 3 min
+# 16 s (2026-11-09). -k keeps every unreachable object: a worktree's commit no ref names yet stays. Only under
+# the floor (Leo, 2026-11-08: "Below the free-space floor it will: compact the shared repo copies").
+SHARED_MIRROR_COMPACT_FAMILY = "shared-mirror-compact"
+SHARED_MIRROR_COMPACT_PACKS = 4  # one big pack and a few fetches' packs gain little
+SHARED_MIRROR_GLOBS = (".wt-mirrors/*/*.git", "*/.wt-mirrors/*/*.git")  # wt's root is home or a folder in it
+# The full repack's memory: unbounded, the cmuxterm-hq mirror's took 9.6 GB resident; two threads with a
+# bounded delta window took 5.3 GB and 209 s for the same 3.5 GiB pack, a background job beside builds.
+SHARED_MIRROR_REPACK_ARGS = ("repack", "-a", "-d", "-k", "-l", "-q", "--threads=2", "--window-memory=256m")
+SHARED_MIRROR_TMP_STALE_S = 3600  # a repack's temporary pack this young is a repack still writing
+# A fetch loop must not hold the fold off: cmux16's cmux mirror gained ~700 packs an hour from one (2026-11-08), and
+# that is the mirror that most needs it. Only another fold of the same packs waits: these subcommands on its path.
+SHARED_MIRROR_BUSY_GIT = re.compile(r"(?:^|\s)(repack|gc|maintenance|multi-pack-index|prune|pack-redundant)(?=\s|$)")
+
+
+def shared_mirrors(home: Path) -> list[Path]:
+    """The bare tools/wt mirrors under home, each once, never through a symlink."""
+    found: dict[str, Path] = {}
+    for pattern in SHARED_MIRROR_GLOBS:
+        for gitdir in sorted(home.glob(pattern)):
+            rel = gitdir.relative_to(home)
+            if any((home / q).is_symlink() for q in (rel, *list(rel.parents)[:-1])):
+                continue  # every folder between home and the mirror: a symlinked ~/Projects leads outside home
+            if gitdir.is_dir() and (gitdir / "objects/pack").is_dir() and (gitdir / "HEAD").is_file():
+                found.setdefault(os.fspath(gitdir.resolve()), gitdir)
+    return list(found.values())
+
+
+def shared_mirror_veto(gitdir: Path, opened: frozenset[str], cmds: str, now: float) -> str:
+    """Why a shared mirror must not be repacked now, or "". Fetches, their temporary packs and worktree reads
+    go on beside a repack (it deletes only packs it folded, and -k keeps what they write); another repack, gc
+    or git maintenance run on it must not: gc.pid, objects/maintenance.lock, a repack's own young .tmp- pack,
+    or a running command naming the mirror with one of SHARED_MIRROR_BUSY_GIT's subcommands."""
+    with contextlib.suppress(OSError):
+        if now - (gitdir / "gc.pid").lstat().st_mtime < HOME_CLONE_GC_PID_STALE_S:
+            return "a git operation holds gc.pid"
+    if os.path.lexists(gitdir / "objects/maintenance.lock"):
+        return "git maintenance holds objects/maintenance.lock"
+    with contextlib.suppress(OSError), os.scandir(gitdir / "objects/pack") as it:
+        for e in it:
+            if e.name.startswith(".tmp-"):
+                with contextlib.suppress(OSError):
+                    if now - e.stat(follow_symlinks=False).st_mtime < SHARED_MIRROR_TMP_STALE_S:
+                        return "a repack is writing a pack"
+    p, resolved = os.fspath(gitdir), os.fspath(gitdir.resolve())
+    for line in cmds.splitlines():
+        if SHARED_MIRROR_BUSY_GIT.search(line) and (named_by(p, line) or named_by(resolved, line)):
+            return f"a repack, gc or maintenance command runs on it: {p}"
+    return ""
+
+
+SHARED_MIRROR_LOCK_MARK = "glaeda-disk"  # the text of a maintenance.lock this family took; git's own are not it
+
+
+def release_abandoned_compact_lock(lock: Path) -> bool:
+    """Remove a maintenance.lock this family took whose holder is gone (SIGKILL, a reboot): its text names the
+    wrapper's pid, and that pid no longer runs; or it names none (the wrapper never started) and is an hour old.
+    A lock git or anyone else took is never touched."""
+    try:
+        text = lock.read_text(errors="replace").strip()
+        age = time.time() - lock.lstat().st_mtime
+    except OSError:
+        return False
+    word, _, pid = text.partition(" ")
+    if word != SHARED_MIRROR_LOCK_MARK:
+        return False
+    if pid.isdigit():
+        try:
+            os.kill(int(pid), 0)
+            return False
+        except ProcessLookupError:
+            pass
+        except OSError:  # it runs as someone else: alive
+            return False
+    elif age < SHARED_MIRROR_TMP_STALE_S:
+        return False
+    with contextlib.suppress(OSError):
+        lock.unlink()
+        return True
+    return False
+
+
+def compact_shared_mirrors(receipt: Path, home: Path | None = None, halt=None) -> int:
+    """Under the floor, fold the shared mirror with the most object bytes once it has SHARED_MIRROR_COMPACT_PACKS
+    packs into one pack (SHARED_MIRROR_REPACK_ARGS: every object kept). It holds objects/maintenance.lock while
+    it runs, so git maintenance and host-baseline's clone care skip that mirror meanwhile. One per pass, with
+    gc_home_clones' slow-run and failure rules."""
+    home = HOME if home is None else home
+    clones = []
+    for gitdir in shared_mirrors(home):
+        release_abandoned_compact_lock(gitdir / "objects/maintenance.lock")
+        packs = git_pack_count(gitdir)
+        if packs >= SHARED_MIRROR_COMPACT_PACKS:
+            clones.append((git_object_bytes(gitdir), packs, gitdir))
+    clones.sort(key=lambda c: (-c[0], -c[1]))
+    return _gc_clones(receipt, [(packs, gitdir, gitdir) for _, packs, gitdir in clones], SHARED_MIRROR_COMPACT_FAMILY,
+                      lambda tree: list(SHARED_MIRROR_REPACK_ARGS),
+                      lambda tree, gitdir, index, cmds, now: shared_mirror_veto(gitdir, index, cmds, now),
+                      halt, lock=lambda gitdir: gitdir / "objects/maintenance.lock")
+
+
+def _gc_clones(receipt: Path, clones: list[tuple[int, Path, Path]], family: str, git_args, veto, halt,
+               lock=None) -> int:
+    """Run `git <git_args(tree)>` on the first of clones (packs, tree, git dir) that veto clears. With lock, the
+    file lock(gitdir) is created exclusively before git starts and removed when it exits (a held one blocks)."""
     if not clones:
         return 0
     if halt is not None and (why := halt()):
@@ -5016,6 +5129,17 @@ def _gc_clones(receipt: Path, clones: list[tuple[int, Path, Path]], family: str,
                 break
             index = open_index(opened)
             why = veto(tree, gitdir, index, cmds, time.time())
+        held = lock(gitdir) if lock is not None and not why else None
+        if held is not None:
+            try:
+                fd = os.open(held, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+                with contextlib.suppress(OSError):
+                    os.write(fd, SHARED_MIRROR_LOCK_MARK.encode() + b"\n")
+                os.close(fd)
+            except FileExistsError:
+                why, held = f"a git operation holds {os.path.relpath(held, gitdir)}", None
+            except OSError as e:
+                why, held = f"cannot take {os.path.relpath(held, gitdir)}: {e.__class__.__name__}", None
         if why:
             rec.update(outcome="changed:in-use", verdict="blocked", reasons=[why], bytes=0)
         else:
@@ -5024,6 +5148,11 @@ def _gc_clones(receipt: Path, clones: list[tuple[int, Path, Path]], family: str,
             nice = shutil.which("nice")
             argv = [*([nice, "-n", "15"] if nice else []), git, "-c", "gc.worktreePruneExpire=never",
                     "-C", os.fspath(tree), *git_args(tree)]
+            if held is not None:  # the lock goes when git exits or the wrapper is stopped, also after this pass;
+                # it names the wrapper's pid, so release_abandoned_compact_lock frees it after a SIGKILL or reboot
+                argv = ["/bin/sh", "-c", f'echo "{SHARED_MIRROR_LOCK_MARK} $$" > "$0"; '
+                        'trap \'rm -f "$0"; exit 143\' HUP INT TERM; "$@"; s=$?; rm -f "$0"; exit $s',
+                        os.fspath(held), *argv]
             proc = None
             try:
                 HOME_CLONE_GC_LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -5035,6 +5164,9 @@ def _gc_clones(receipt: Path, clones: list[tuple[int, Path, Path]], family: str,
                                             start_new_session=True)
             except OSError as e:
                 rec.update(outcome=f"incomplete:{e.__class__.__name__}", bytes=0)
+                if held is not None:
+                    with contextlib.suppress(OSError):
+                        held.unlink()
             if proc is not None:
                 try:
                     code = proc.wait(timeout=HOME_CLONE_GC_WAIT_S)
@@ -12558,6 +12690,9 @@ def _main_impl(argv: list[str] | None = None) -> int:
         runner_repack_due = ((sweep or a.pressure) and ROLE == "fleet-mini" and not RUNNER_CACHE_PROFILE
                              and not a.cmux_next_drain and not reserved
                              and (not a.family or RUNNER_CHECKOUT_REPACK_FAMILY in a.family))
+        # the shared repository copies (tools/wt's mirrors), on every role, only under the floor
+        mirror_compact_due = (a.pressure and under and not RUNNER_CACHE_PROFILE and not a.cmux_next_drain
+                              and not reserved and (not a.family or SHARED_MIRROR_COMPACT_FAMILY in a.family))
         # the fleet compilation-cache node store's hard cap, on every pressure pass: the runner hook's pass before each
         # job and its floor eviction run this one (glaeda-fleet-cas-prune keeps its own working-set rule)
         if a.pressure and ROLE == "fleet-mini" and not RUNNER_CACHE_PROFILE and not a.cmux_next_drain and not a.family:
@@ -12626,6 +12761,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
             gc_home_clones(a.receipt, halt=halt)
         if runner_repack_due:
             repack_runner_checkouts(a.receipt, halt=halt)
+        if mirror_compact_due:
+            compact_shared_mirrors(a.receipt, halt=halt)
     return 0
 
 
