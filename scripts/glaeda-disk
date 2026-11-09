@@ -5001,6 +5001,21 @@ def repack_runner_checkouts(receipt: Path, home: Path | None = None, halt=None) 
 # the floor (Leo, 2026-11-08: "Below the free-space floor it will: compact the shared repo copies").
 SHARED_MIRROR_COMPACT_FAMILY = "shared-mirror-compact"
 SHARED_MIRROR_COMPACT_PACKS = 4  # one big pack and a few fetches' packs gain little
+# A fold rewrites every byte of every pack but can free at most the bytes outside the largest one, so a mirror
+# whose largest pack holds more than this share of its pack bytes is left alone. a dev host's blobless cmux mirror
+# (2026-11-09): one ~8 GiB pack and a tiny pack from a lazy blob fetch every few seconds, so it always had 4 packs
+# and was folded about three times an hour, each time 8 GiB written and 8 GiB of transient space, to free next to
+# nothing (lazily fetched blobs are not in the big pack). Its small packs are clone care's to merge (host-baseline,
+# past its pack limit). A geometric fold that leaves the big pack (`repack -d --geometric=2`) is no way out: the
+# git 2.50.1 (Apple) and 2.43 on the fleet refuse one in a partial clone (host_baseline_clones.GEOMETRIC_REFUSED),
+# and whether a full -a in a partial clone honours --keep-pack for promisor objects differs by git version.
+SHARED_MIRROR_DOMINANT_SHARE = 0.8
+# The pack files a fold wrote, "<name>.pack <epoch>" per line in the mirror's git dir: the same file and format as
+# host-baseline's clone care (host_baseline_clones.REPACKED_FILE). leo-workspace's repo_mirrors pack_rate leaves
+# these packs out; a full -a fold's output has a .promisor beside it like a blobless fetch's, and a dev host's 8 GiB
+# folds read as a 22.8 GiB an hour fetch storm (2026-11-09). Lines older than REPACKED_KEEP_S go at the next write.
+SHARED_MIRROR_REPACKED_FILE = "clone-care-repacked"
+SHARED_MIRROR_REPACKED_KEEP_S = 2 * 3600
 SHARED_MIRROR_GLOBS = (".wt-mirrors/*/*.git", "*/.wt-mirrors/*/*.git")  # wt's root is home or a folder in it
 # The full repack's memory: unbounded, the cmuxterm-hq mirror's took 9.6 GB resident; two threads with a
 # bounded delta window took 5.3 GB and 209 s for the same 3.5 GiB pack, a background job beside builds.
@@ -5088,19 +5103,54 @@ def compact_shared_mirrors(receipt: Path, home: Path | None = None, halt=None) -
     for gitdir in shared_mirrors(home):
         release_abandoned_compact_lock(gitdir / "objects/maintenance.lock")
         packs = git_pack_count(gitdir)
-        if packs >= SHARED_MIRROR_COMPACT_PACKS:
+        if packs >= SHARED_MIRROR_COMPACT_PACKS and not one_pack_dominates(gitdir):
             clones.append((git_object_bytes(gitdir), packs, gitdir))
     clones.sort(key=lambda c: (-c[0], -c[1]))
     return _gc_clones(receipt, [(packs, gitdir, gitdir) for _, packs, gitdir in clones], SHARED_MIRROR_COMPACT_FAMILY,
                       lambda tree: list(SHARED_MIRROR_REPACK_ARGS),
                       lambda tree, gitdir, index, cmds, now: shared_mirror_veto(gitdir, index, cmds, now),
-                      halt, lock=lambda gitdir: gitdir / "objects/maintenance.lock")
+                      halt, lock=lambda gitdir: gitdir / "objects/maintenance.lock",
+                      record=lambda gitdir: gitdir / SHARED_MIRROR_REPACKED_FILE)
+
+
+def one_pack_dominates(gitdir: Path) -> bool:
+    """True when the largest pack holds more than SHARED_MIRROR_DOMINANT_SHARE of the mirror's pack bytes: a fold
+    would rewrite it to free at most the small rest."""
+    sizes = []
+    with contextlib.suppress(OSError), os.scandir(gitdir / "objects/pack") as it:
+        for e in it:
+            if e.name.endswith(".pack") and not e.name.startswith((".tmp-", "tmp_")):
+                with contextlib.suppress(OSError):
+                    sizes.append(e.stat(follow_symlinks=False).st_size)
+    total = sum(sizes)
+    return total > 0 and max(sizes) > SHARED_MIRROR_DOMINANT_SHARE * total
+
+
+def compact_wrapper(lock: Path, record: Path | None, argv: list[str]) -> list[str]:
+    """argv run under /bin/sh holding LOCK: the lock names the wrapper's pid (release_abandoned_compact_lock frees it
+    after a SIGKILL or reboot) and goes when git exits or the wrapper is stopped, also after the pass that started
+    it. When git succeeds and RECORD is set, the packs in LOCK's objects/pack that were not there when git started
+    are added to RECORD (SHARED_MIRROR_REPACKED_FILE), dropping lines past SHARED_MIRROR_REPACKED_KEEP_S. (Not by
+    mtime: Linux stamps files from a coarse clock, so a quick repack's pack can share the lock's mtime.) A pack a
+    fetch wrote meanwhile is in it too: repo_mirrors then misses a few minutes of lazy fetches."""
+    script = (f'lock=$0 rec=$1; shift; echo "{SHARED_MIRROR_LOCK_MARK} $$" > "$lock"; '
+              'tmp="$rec.glaeda-disk.$$"; dir=$(dirname "$lock")/pack; '
+              'trap \'rm -f "$lock" "$tmp" "$tmp.before"; exit 143\' HUP INT TERM; '
+              '[ -z "$rec" ] || ls "$dir" > "$tmp.before"; "$@"; s=$?; '
+              'if [ "$s" -eq 0 ] && [ -n "$rec" ] && [ -f "$tmp.before" ]; then now=$(date +%s); '
+              '{ if [ -f "$rec" ]; then awk -v now="$now" '
+              f'\'$1 ~ /\\.pack$/ && $2 ~ /^[0-9.]+$/ && now - $2 <= {SHARED_MIRROR_REPACKED_KEEP_S}\' "$rec"; fi; '
+              'ls "$dir" | grep "\\.pack$" | grep -vxF -f "$tmp.before" | sed "s|\\$| $now|"; } > "$tmp" '
+              '&& mv -f "$tmp" "$rec"; fi; '
+              'rm -f "$lock" "$tmp" "$tmp.before"; exit $s')
+    return ["/bin/sh", "-c", script, os.fspath(lock), os.fspath(record) if record is not None else "", *argv]
 
 
 def _gc_clones(receipt: Path, clones: list[tuple[int, Path, Path]], family: str, git_args, veto, halt,
-               lock=None) -> int:
+               lock=None, record=None) -> int:
     """Run `git <git_args(tree)>` on the first of clones (packs, tree, git dir) that veto clears. With lock, the
-    file lock(gitdir) is created exclusively before git starts and removed when it exits (a held one blocks)."""
+    file lock(gitdir) is created exclusively before git starts and removed when it exits (a held one blocks);
+    with record too, the packs git wrote are added to the file record(gitdir) (compact_wrapper)."""
     if not clones:
         return 0
     if halt is not None and (why := halt()):
@@ -5148,11 +5198,8 @@ def _gc_clones(receipt: Path, clones: list[tuple[int, Path, Path]], family: str,
             nice = shutil.which("nice")
             argv = [*([nice, "-n", "15"] if nice else []), git, "-c", "gc.worktreePruneExpire=never",
                     "-C", os.fspath(tree), *git_args(tree)]
-            if held is not None:  # the lock goes when git exits or the wrapper is stopped, also after this pass;
-                # it names the wrapper's pid, so release_abandoned_compact_lock frees it after a SIGKILL or reboot
-                argv = ["/bin/sh", "-c", f'echo "{SHARED_MIRROR_LOCK_MARK} $$" > "$0"; '
-                        'trap \'rm -f "$0"; exit 143\' HUP INT TERM; "$@"; s=$?; rm -f "$0"; exit $s',
-                        os.fspath(held), *argv]
+            if held is not None:
+                argv = compact_wrapper(held, record(gitdir) if record is not None else None, argv)
             proc = None
             try:
                 HOME_CLONE_GC_LOG.parent.mkdir(parents=True, exist_ok=True)

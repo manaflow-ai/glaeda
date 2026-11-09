@@ -7146,6 +7146,60 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(self._git("--git-dir", os.fspath(mirror), "rev-list", "--all").split(), heads)
         self._git("--git-dir", os.fspath(mirror), "fsck", "--no-progress")
 
+    def test_shared_mirror_compact_records_its_packs_for_the_pack_rate(self) -> None:
+        # a dev host, 2026-11-09: the fold's output has a .promisor like a blobless fetch's, and repo_mirrors'
+        # pack_rate read three 8 GiB folds an hour as a 22.8 GiB fetch storm; it leaves out clone-care-repacked's packs
+        home, mirror, _ = self._shared_mirror(4)
+        record = mirror / gd.SHARED_MIRROR_REPACKED_FILE
+        now = time.time()
+        record.write_text(f"pack-old.pack {now - 3 * 3600:.0f}\npack-recent.pack {now - 600:.0f}\ngarbage\n")
+        before = {p.name for p in (mirror / "objects/pack").glob("*.pack")}
+        gd.process_evidence = lambda: ([], "")
+        with self._gc_log(), contextlib.redirect_stdout(io.StringIO()):
+            gd.compact_shared_mirrors(self.receipt(), home)
+        made = {p.name for p in (mirror / "objects/pack").glob("*.pack")}
+        self.assertEqual(len(made), 1)
+        self.assertFalse(made & before)
+        rows = dict(line.split(" ") for line in record.read_text().splitlines())
+        # host_baseline_clones.repacked's format: "<name>.pack <epoch>"; stale and malformed lines are dropped
+        self.assertEqual(set(rows), made | {"pack-recent.pack"})
+        self.assertLess(abs(float(rows[made.pop()]) - time.time()), 120)
+        self.assertEqual([p.name for p in mirror.iterdir() if "glaeda-disk." in p.name], [])
+
+    def test_shared_mirror_compact_leaves_a_mirror_one_pack_dominates(self) -> None:
+        # a dev host's blobless cmux mirror, 2026-11-09: one ~8 GiB pack plus a lazy fetch's tiny pack every few
+        # seconds; each fold rewrote 8 GiB, about three times an hour, and freed next to nothing
+        home, mirror, _ = self._shared_mirror(4)
+        self.assertFalse(gd.one_pack_dominates(mirror))
+        big = self.root / "big"
+        big.write_bytes(os.urandom(256 * 1024))  # incompressible: the pack stays this big
+        oid = self._git("--git-dir", os.fspath(mirror), "hash-object", "-w", os.fspath(big)).strip()
+        subprocess.run(["git", "--git-dir", os.fspath(mirror), "pack-objects", "-q",
+                        os.fspath(mirror / "objects/pack/pack")], input=oid + "\n", text=True, check=True,
+                       capture_output=True)
+        (mirror / "objects" / oid[:2] / oid[2:]).unlink()
+        self.assertTrue(gd.one_pack_dominates(mirror))
+        receipt = self.receipt()
+        gd.process_evidence = lambda: ([], "")
+        with self._gc_log():
+            self.assertEqual(gd.compact_shared_mirrors(receipt, home), 0)
+        self.assertEqual(gd.git_pack_count(mirror), 5)
+        self.assertFalse(receipt.exists())
+        self.assertFalse((mirror / gd.SHARED_MIRROR_REPACKED_FILE).exists())
+        # once the small packs add up to more than a fifth of the bytes, a fold is worth its write again
+        for n in range(2):
+            extra = self.root / f"extra{n}"
+            extra.write_bytes(os.urandom(64 * 1024))
+            oid = self._git("--git-dir", os.fspath(mirror), "hash-object", "-w", os.fspath(extra)).strip()
+            subprocess.run(["git", "--git-dir", os.fspath(mirror), "pack-objects", "-q",
+                            os.fspath(mirror / "objects/pack/pack")], input=oid + "\n", text=True, check=True,
+                           capture_output=True)
+            (mirror / "objects" / oid[:2] / oid[2:]).unlink()
+        self.assertFalse(gd.one_pack_dominates(mirror))
+        with self._gc_log(), contextlib.redirect_stdout(io.StringIO()):
+            gd.compact_shared_mirrors(receipt, home)
+        self.assertEqual(gd.git_pack_count(mirror), 1)
+
     def test_shared_mirrors_never_lie_beneath_a_symlinked_folder(self) -> None:
         home, mirror, _ = self._shared_mirror(4)
         outside = self.root / "outside"
@@ -7157,9 +7211,7 @@ class GlaedaDiskTest(unittest.TestCase):
         home, mirror, _ = self._shared_mirror(4)
         lock = mirror / "objects/maintenance.lock"
         # stopped with SIGTERM: the wrapper's trap removes the lock (review F1)
-        argv = ["/bin/sh", "-c", f'echo "{gd.SHARED_MIRROR_LOCK_MARK} $$" > "$0"; '
-                'trap \'rm -f "$0"; exit 143\' HUP INT TERM; "$@"; s=$?; rm -f "$0"; exit $s',
-                os.fspath(lock), "sleep", "2"]
+        argv = gd.compact_wrapper(lock, mirror / gd.SHARED_MIRROR_REPACKED_FILE, ["sleep", "2"])
         lock.write_text(gd.SHARED_MIRROR_LOCK_MARK + "\n")
         proc = subprocess.Popen(argv)
         for _ in range(200):
