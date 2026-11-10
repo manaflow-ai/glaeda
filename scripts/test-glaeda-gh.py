@@ -11242,6 +11242,27 @@ class DaemonPolicyTest(Base):
         self.daemon.tick(NOW + gg.CYCLE * gg.LEAN_FACTOR + 1)
         self.assertEqual(len(self.gh.run_calls()), 2)
 
+    def test_the_yield_is_bounded_past_the_cap(self) -> None:
+        """GraphQL out: the share yields up to the cap again (REST_YIELD_MIN at least), then holds; restYield sets it."""
+        self.configure({"restShare": 0.06})  # a cap of 300, a yield of 300
+        self.daemon.now = NOW
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4000, "reset": NOW + 3000},
+                              "graphql": {"limit": 5000, "remaining": 10, "reset": NOW + 3000}}
+        self.spend_rest(590)
+        self.assertTrue(self.daemon.rest_room(10))
+        self.assertFalse(self.daemon.rest_room(11))
+        self.assertTrue(self.daemon.rest_capped())
+        self.configure({"restShare": 0.0})  # no share: the fallback still gets REST_YIELD_MIN
+        self.daemon.rest_minutes = {}
+        self.spend_rest(gg.REST_YIELD_MIN - 1)
+        self.assertTrue(self.daemon.rest_room(1))
+        self.assertFalse(self.daemon.rest_room(2))
+        self.configure({"restShare": 0.0, "restYield": 1000})
+        self.assertTrue(self.daemon.rest_room(500))
+        for bad in (1e9, -5, float("nan"), "300"):  # a typo keeps the default yield, never turns it off
+            self.configure({"restShare": 0.0, "restYield": bad})
+            self.assertEqual(self.daemon.rest_yield(), gg.REST_YIELD_MIN, bad)
+
     def test_a_yielding_share_admits_head_consumers_and_paces_every_head(self) -> None:
         """Review F1/F2 at 99070e23: lean only for being past the share must still admit an unreserved consumer, and a
         reserved one's head must be read at most once per lean cycle too."""
@@ -11530,7 +11551,7 @@ class DaemonPolicyTest(Base):
         self.spend_rest(990)
         self.daemon.tick(NOW)
         status = gg.read_json(gg.BASE / "daemon.json")
-        self.assertEqual(status["restShare"], {"spent": 990, "cap": 2000, "share": 0.4, "capped": False})
+        self.assertEqual(status["restShare"], {"spent": 990, "cap": 2000, "yield": 2000, "share": 0.4, "capped": False})
         lock = open(gg.BASE / "daemon.lock", "a+")
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:

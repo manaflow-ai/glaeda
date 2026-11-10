@@ -95,7 +95,9 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   kept per minute in rest-spend.json across restarts.
   A read starts only when its worst case fits. At the cap, PR and run reads move to GraphQL, or wait
   while GraphQL is stopped too, so the shared REST pool is left to `gh`, landers and nightly re-runs.
-  The one read the cap never holds back is a failed attempt's job list (once per attempt). The share
+  The one read the cap never holds back is a failed attempt's job list (once per attempt). While GraphQL is out the share
+  yields (REST is the only bucket left), but only by the cap again (by default, and at least 150; restYield sets it) in the hour,
+  at the lean pace: unbounded, the yield was the daemon's largest REST spend. The share
   is per daemon, so the fleet splits it: config/gh-daemon.json gives each host its share (a host it
   does not name gets 0 and reads PRs and runs over GraphQL, all but that job list), and its shares
   sum to at most 0.4. The cycle, the floors and the share are read every tick from that file
@@ -254,6 +256,11 @@ GRAPHQL_PER_MINUTE = 40
 # Measured 2026-10-27: the daemon spent 2549 REST requests of one hour's 5000 (756 more were free
 # 304s) on PR reads the balancer had sent to REST, and the account ran out under a nightly re-run.
 REST_SHARE = 0.4
+# What the share may yield past its cap in an hour while GraphQL is out (share_yields), by default: the cap again, at
+# least REST_YIELD_MIN (policy restYield sets any other value). Unbounded, the yield was the daemon's biggest REST spend: on 2026-11-10 at 01:35Z cosmic-gray's
+# daemon had 601 counted REST in the hour against its cap of 300, GraphQL stopped and every run read over REST
+# (spend.json: GET /repos/{owner}/{repo}/actions/runs/{id} the top route), and 873 in the hour before the pool hit 0.
+REST_YIELD_MIN = 150
 DAEMON_CONFIG = Path.home() / ".config/glaeda/gh-daemon.json"  # cycle, commentCycle, floors, restShare, forceLow
 # The fleet's copy of config/gh-daemon.json (glaeda-mini-setup installs it): default, and hosts[NAME]
 # laid over it, under DAEMON_CONFIG. NAME is update.json's host, the name the fleet enrolled this host by.
@@ -1696,6 +1703,9 @@ def daemon_policy() -> dict:
                        "restLeft": int(_bounded(alarms.get("restLeft"), ALARM_REST_LEFT, 0, 100000))},
             "cycles": {"pr": cycle, "run": cycle, "comment": comment, "head": cycle},
             "floors": floors, "restShare": float(_bounded(doc.get("restShare"), REST_SHARE, 0.0, 1.0)),
+            # restYield out of range (or not a number) is left out, so the default yield holds, never 0 by a typo
+            **({"restYield": int(doc["restYield"])} if isinstance(doc.get("restYield"), (int, float))
+               and not isinstance(doc.get("restYield"), bool) and 0 <= doc["restYield"] <= 100000 else {}),
             "forceLow": tuple(b for b in ("rest", "graphql")
                               if isinstance(doc.get("forceLow"), list) and b in doc["forceLow"])}
 
@@ -2102,12 +2112,20 @@ class Daemon:
         """Whether `cost` more counted REST requests fit in the share, or the share yields to them."""
         return self.rest_spent() + cost <= self.rest_cap() or self.share_yields(cost)
 
+    def rest_yield(self) -> int:
+        """Counted REST the share may yield past its cap in an hour (policy restYield, else REST_YIELD_MIN or the
+        cap, whichever is more)."""
+        given = self.policy.get("restYield")
+        return int(given) if isinstance(given, int) else max(self.rest_cap(), REST_YIELD_MIN)
+
     def share_yields(self, cost: int) -> bool:
         """GraphQL is below its floor or throttled, so REST is the only bucket with room: the daemon's reads
         go past its REST share while the account's REST stays above its floor, which is what sessions' own
         gh calls keep. (A host whose share is 0 still reads over REST then, which is the fallback.)"""
         if self.mode("graphql") == "normal":
             return False
+        if self.rest_spent() + cost > self.rest_cap() + self.rest_yield():
+            return False  # the yield is spent too: the rest wait for GraphQL, or the next hour
         seen = self.budget.get("rest") or {}
         if not seen or (seen.get("reset") or 0) <= self.now:
             return True  # not seen yet, or reset since: a full hour's quota
@@ -3167,7 +3185,7 @@ class Daemon:
                   "secondaryHold": {"until": self.secondary_until, "strikes": self.secondary_strikes}
                   if self.secondary_until > self.now else None, "forceLow": list(self.policy.get("forceLow", ())),
                   "lastHour": hour,
-                  "restShare": {"spent": self.rest_spent(), "cap": self.rest_cap(),
+                  "restShare": {"spent": self.rest_spent(), "cap": self.rest_cap(), "yield": self.rest_yield(),
                                 "share": self.policy["restShare"], "capped": self.rest_capped()},
                   "heartbeat": HEARTBEAT_EVERY, "paths": dict(self.paths), "reads": reads, "graphqlBy": graphql_by,
                   "spendBy": self.spend_by(), "alarms": self.alarms,
