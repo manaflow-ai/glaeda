@@ -400,7 +400,8 @@ UPSTREAM_EVERY = 20  # seconds between upstream reads of every watched key (the 
 UPSTREAM_NEW = 3  # a key with no data yet is asked for again this soon: the upstream fills it within a tick or two
 UPSTREAM_DEADLINE = 60  # one run of the upstream command
 UPSTREAM_MAX_KEYS = 200  # keys per upstream read (and per `read`); a longer list waits for the next one
-UPSTREAM_KINDS = ("pr", "run", "comment")
+UPSTREAM_KINDS = ("pr", "run", "comment", "head")  # a head is read for a named consumer, on its budget there
+CONSUMER_RE = re.compile(r"[A-Za-z0-9_.-]{1,40}")  # a head consumer's name (checks --consumer, read's consumer)
 UPSTREAM_ERROR_MAX = 300
 CONTROLLER_DEFAULT = "http://100.89.225.106:18765"  # cmux-lawrence since the 2026-09-28 move
 CONTROLLER_CONFIG = Path.home() / ".local/share/cmux-fleet-client/client.json"
@@ -1300,10 +1301,12 @@ def run_upstream(command: list[str], request: dict) -> dict:
     return answer
 
 
-def read_request(text: str) -> list[tuple[str, bool, bool]]:
-    """The (key, jobs, wait) triples of one upstream request line; WatchError on anything else. `wait` (optional)
-    says a wait downstream is blocked on the key, so this host's daemon treats it as waited (STALE_RUN_REREAD).
-    `reader` (optional, HOST/READER) names the downstream waiter; read_readers gives it."""
+def read_request(text: str) -> list[tuple[str, bool, bool, str | None]]:
+    """The (key, jobs, wait, consumer) of each key in one upstream request line; WatchError on anything else. `wait`
+    (optional) says a wait downstream is blocked on the key, so this host's daemon treats it as waited
+    (STALE_RUN_REREAD). A head key must name the `consumer` its read is charged to (as `checks --consumer`): this
+    host's daemon reads it within that consumer's head budget, never on an unnamed one. `reader` (optional,
+    HOST/READER) names the downstream waiter; read_readers gives it."""
     try:
         doc = json.loads(text)
     except ValueError:
@@ -1316,13 +1319,19 @@ def read_request(text: str) -> list[tuple[str, bool, bool]]:
         key = item.get("key") if isinstance(item, dict) else None
         jobs = item.get("jobs", False) if isinstance(item, dict) else None
         wait = item.get("wait", False) if isinstance(item, dict) else None
+        consumer = item.get("consumer") if isinstance(item, dict) else None
         kind = key.split(":", 1)[0] if isinstance(key, str) else None
         if kind not in UPSTREAM_KINDS or not isinstance(jobs, bool) or not isinstance(wait, bool):
             raise WatchError(f"read serves {', '.join(UPSTREAM_KINDS)} keys, not {str(key)[:80]!r}")
         target = key.split(":", 1)[1]
-        if not re.fullmatch(rf"{NAME}/{NAME}[#/]\d+", target) or parse_key(kind, target) != key:
+        form = rf"{NAME}/{NAME}@[0-9a-f]{{40}}" if kind == "head" else rf"{NAME}/{NAME}[#/]\d+"
+        if not re.fullmatch(form, target) or parse_key(kind, target) != key:
             raise WatchError(f"not a key: {key[:80]!r}")
-        out.append((key, jobs, wait))
+        if kind != "head":
+            consumer = None
+        elif not isinstance(consumer, str) or not CONSUMER_RE.fullmatch(consumer):
+            raise WatchError(f"a head key needs a consumer (a short name: letters, digits, . _ -): {key[:80]!r}")
+        out.append((key, jobs, wait, consumer))
     return out
 
 
@@ -1339,7 +1348,7 @@ def read_readers(text: str) -> dict[str, str]:
 def cmd_read(text: str) -> int:
     """`read`: register each key (sessions' interest, as `status` does) and print what the cache holds
     now, never waiting and never reading GitHub. The other end of an upstream (UPSTREAM_CONFIG)."""
-    triples = read_request(text)
+    items = read_request(text)
     readers = read_readers(text)
     if not daemon_running(grace=DOWN_GRACE):
         print(json.dumps({"error": "glaeda-gh is not running on the upstream host"}))
@@ -1349,13 +1358,26 @@ def cmd_read(text: str) -> int:
         print(json.dumps({"error": failing_message(broken)[:UPSTREAM_ERROR_MAX]}))
         return EXIT_DOWN
     entries: dict[str, Any] = {}
-    for key, jobs, wait in triples:
-        register(key, jobs, waited=wait, reader=readers.get(key))
+    ledger = None
+    for key, jobs, wait, consumer in items:
+        # A head is registered under its consumer, as `checks` does: the daemon reads it charged to that consumer's
+        # head budget (due_heads, head_allowed), or leaves it to the cache and marks the consumer denied.
+        register(key, jobs, consumer=consumer, waited=wait, reader=readers.get(key))
         cached = read_cache(key)
+        budgets = (entries.get(key) or {}).get("budgets") or {}  # an earlier line's consumers, for this same key
         entries[key] = None if cached is None else {
             k: cached.get(k) for k in ("data", "dataAt", "error", "fetchedAt", "jobs", "missing", "restRun", "restRunAt") if k in cached}
         if cached is not None and cached.get("source"):  # where the data came from, so a downstream wait can
             entries[key]["origin"] = cached.get("origin") if cached.get("source") == "upstream" else cached["source"]
+        if consumer:
+            if ledger is None:
+                doc = read_json(BASE / CONSUMERS_FILE)
+                ledger = doc.get("consumers") if isinstance(doc, dict) and isinstance(doc.get("consumers"), dict) else {}
+            mine = ledger.get(consumer) if isinstance(ledger.get(consumer), dict) else {}
+            # each asking consumer's head budget here, so a downstream `checks` can say "budget spent" for every
+            # consumer refused, not only the last one asked (upstream_denials)
+            budgets[consumer] = {k: mine.get(k) for k in ("spent", "limit", "deniedAt")}
+            entries[key] = {**(entries[key] or {}), "budgets": budgets}
     print(json.dumps({"entries": entries}, sort_keys=True))
     return EXIT_OK
 
@@ -3773,6 +3795,8 @@ class Daemon:
         full = self.now - self.upstream_at >= UPSTREAM_EVERY
         for e in entries:
             kind = split_key(e["key"])[0]
+            if kind == "head" and not self.head_askers(e):
+                continue  # nobody asked for it lately (HEAD_INTEREST): the upstream is not charged for it either
             if kind not in UPSTREAM_KINDS:
                 if e["cache"] is None:
                     self.store(e["key"], None, error=f"{kind} reads need a GitHub login; this host reads through "
@@ -3786,18 +3810,39 @@ class Daemon:
         if full:
             self.upstream_at = self.now
         if due:
-            for e in due:
-                self.attempted[e["key"]] = self.now
-            self.upstream_read(ask, due)
+            # Heads go in a request of their own: an upstream older than head keys refuses a whole request that has
+            # one, and that must not stop the PRs' and runs' reads.
+            for part in ([e for e in due if not e["key"].startswith("head:")],
+                         [e for e in due if e["key"].startswith("head:")]):
+                if part:
+                    self.upstream_read(ask, part)
         self.attempted = {k: t for k, t in self.attempted.items() if self.now - t < 2 * IDLE_EXPIRY}
         kinds = {kind: [e for e in due if e["key"].startswith(kind + ":")] for kind in CYCLES}
         return self.finish_tick(entries, kinds["pr"], kinds["run"], kinds["comment"], [])
 
+    def head_askers(self, e: dict) -> list[str]:
+        """The consumers that registered a head here (checks --consumer) within HEAD_INTEREST, newest first."""
+        asked = e.get("consumers") or {}
+        return sorted((n for n, t in asked.items() if self.now - t < HEAD_INTEREST), key=lambda n: (-asked[n], n))
+
     def upstream_read(self, ask: Callable[[dict], dict], due: list[dict]) -> None:
-        request = {"keys": [{"key": e["key"], "jobs": e["jobs"], **({"wait": True} if self.waited(e) else {}),
-                             **({"reader": f"{policy_host()}/{waiter_of(e).split('/')[-1]}"}
-                                if safe_reader(f"{policy_host()}/{waiter_of(e).split('/')[-1]}") else {})}
-                            for e in due]}
+        # A head goes up once per consumer that asked for it here: the upstream registers each and charges its one
+        # read to the first that may pay, as this host's own due_heads would. Whole keys go up to UPSTREAM_MAX_KEYS
+        # lines; only those sent are stamped, so the rest stay least recently asked and go first next tick.
+        keys, sent = [], []
+        for e in due:
+            reader = f"{policy_host()}/{waiter_of(e).split('/')[-1]}"
+            lines = [{"key": e["key"], "jobs": e["jobs"], **({"wait": True} if self.waited(e) else {}),
+                      **({"reader": reader} if safe_reader(reader) else {}), **({"consumer": n} if n else {})}
+                     for n in (self.head_askers(e) if e["key"].startswith("head:") else [None])]
+            if keys and len(keys) + len(lines) > UPSTREAM_MAX_KEYS:
+                break
+            keys += lines[:UPSTREAM_MAX_KEYS]
+            sent.append(e)
+        due = sent
+        for e in due:
+            self.attempted[e["key"]] = self.now
+        request = {"keys": keys}
         try:
             answer = ask(request)
             got = answer.get("entries") if isinstance(answer, dict) else None
@@ -3812,6 +3857,7 @@ class Daemon:
                 self.store(e["key"], e["cache"], error=why)
             return
         self.upstream_status = {"state": "ok", "at": self.now, "keys": len(due)}
+        self.upstream_denials(got)
         for e in due:
             entry = got.get(e["key"])
             if not isinstance(entry, dict):
@@ -3836,6 +3882,16 @@ class Daemon:
             if isinstance(entry.get("jobs"), list):
                 fields["jobs"] = entry["jobs"]
             self.store(e["key"], e["cache"], **fields)
+
+    def upstream_denials(self, got: dict) -> None:
+        """A head consumer the upstream refused for its budget is denied here too (this host's consumers ledger), so
+        `checks` on this host says "budget spent" instead of "not read yet"."""
+        for entry in got.values():
+            budgets = entry.get("budgets") if isinstance(entry, dict) else None
+            for name, budget in budgets.items() if isinstance(budgets, dict) else ():
+                at = budget.get("deniedAt") if isinstance(budget, dict) else None
+                if isinstance(name, str) and isinstance(at, (int, float)) and not isinstance(at, bool):
+                    self.denied[name] = max(self.denied.get(name) or 0, min(self.now, float(at)))
 
     def upstream_refuse_posts(self) -> None:
         for path in sorted(outbox_dir().glob("*.json")) if outbox_dir().is_dir() else []:
@@ -6876,7 +6932,7 @@ def cmd_checks(repo: str, shas: list[str], consumer: str, max_age: float, wait: 
     """Every check of each commit, from the daemon's cache. The daemon reads each head once for all
     sessions, within the consumer's hourly budget; a head it may not read is served stale or reported
     unread, and this command never reads GitHub itself."""
-    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,40}", consumer or ""):
+    if not CONSUMER_RE.fullmatch(consumer or ""):
         raise WatchError("--consumer must be a short name (letters, digits, . _ -), e.g. autoland")
     keys = {}
     for sha in shas:

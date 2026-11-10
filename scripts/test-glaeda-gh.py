@@ -1479,13 +1479,10 @@ class UpstreamTest(Base):
                "target": "o/r#404"}
         self.assertEqual(gg.wait_step(req, NOW)[0], gg.EXIT_FAIL)
 
-    def test_heads_and_posts_are_refused_with_a_reason(self) -> None:
-        key = gg.parse_key("head", "o/r@" + "b" * 40)
-        gg.register(key, consumer="me")
+    def test_posts_are_refused_with_a_reason(self) -> None:
         gg.outbox_dir().mkdir(parents=True)
         gg.write_json(gg.outbox_dir() / "x1.json", {"id": "x1", "kind": "comment", "body": "hi"})
         self.daemon.tick(now=NOW)
-        self.assertIn("login", gg.read_cache(key)["error"])
         self.assertEqual(self.asked, [])
         done = gg.read_json(gg.posted_dir() / "x1.json")
         self.assertEqual(done["state"], "failed")
@@ -1528,6 +1525,123 @@ class UpstreamTest(Base):
         self.assertTrue(json.loads(out.getvalue())["entries"]["pr:o/r#8"]["missing"])
         self.assertTrue(gg.read_json(gg.watch_dir() / gg.file_name("run:o/r/9"))["jobs"])
         self.assertTrue((gg.watch_dir() / gg.file_name("pr:o/r#7")).exists())
+
+    def test_read_takes_a_head_key_only_with_its_consumer(self) -> None:
+        key = gg.parse_key("head", "O/R@" + "A" * 40)
+        self.assertEqual(key, "head:o/r@" + "a" * 40)
+        ok = json.dumps({"keys": [{"key": key, "jobs": False, "consumer": "compile-fallback"},
+                                  {"key": "pr:o/r#7", "jobs": False, "consumer": "ignored"}]})
+        self.assertEqual(gg.read_request(ok), [(key, False, False, "compile-fallback"), ("pr:o/r#7", False, False, None)])
+        for bad in ({"key": key},  # no consumer: nobody's budget to charge
+                    {"key": key, "consumer": ""}, {"key": key, "consumer": "a b"}, {"key": key, "consumer": "x" * 41},
+                    {"key": key, "consumer": 7},
+                    {"key": "head:o/r@" + "a" * 39, "consumer": "c"}, {"key": "head:o/r@" + "a" * 41, "consumer": "c"},
+                    {"key": "head:o/r@" + "A" * 40, "consumer": "c"}, {"key": "head:o/r@" + "g" * 40, "consumer": "c"},
+                    {"key": "head:o/r#7", "consumer": "c"}, {"key": "head:O/r@" + "a" * 40, "consumer": "c"}):
+            with self.assertRaises(gg.WatchError, msg=bad):
+                gg.read_request(json.dumps({"keys": [bad]}))
+        with self.assertRaisesRegex(gg.WatchError, "consumer"):
+            gg.read_request(json.dumps({"keys": [{"key": key}]}))
+
+    def test_read_registers_a_head_under_its_consumer_and_answers_its_cache(self) -> None:
+        key = gg.parse_key("head", "o/r@" + "a" * 40)
+        data = {"sha": "a" * 40, "found": {"CI / compile": ["completed", "success"]}, "ids": {}, "settled": True}
+        self.daemon.store(key, None, data=data, dataAt=NOW)
+        gg.write_json(gg.BASE / gg.CONSUMERS_FILE, {"consumers": {"lane-x": {"spent": 1, "limit": 3, "deniedAt": None}}})
+        out = io.StringIO()
+        with mock.patch.object(gg, "daemon_running", lambda grace=0.0: True), \
+                mock.patch.object(gg, "daemon_failing", lambda: None), contextlib.redirect_stdout(out):
+            self.assertEqual(gg.cmd_read(json.dumps({"keys": [{"key": key, "jobs": False, "consumer": "lane-x"}]})), 0)
+        entry = json.loads(out.getvalue())["entries"][key]
+        self.assertEqual(entry["data"], data)
+        self.assertEqual(entry["dataAt"], NOW)
+        self.assertEqual(entry["budgets"], {"lane-x": {"spent": 1, "limit": 3, "deniedAt": None}})
+        self.assertIn("lane-x", gg.read_json(gg.watch_dir() / gg.file_name(key))["consumers"])
+
+    def test_read_answers_a_budget_for_every_consumer_of_one_head(self) -> None:
+        # Two consumers asking for one head in one request: each one's budget comes back, the first not overwritten.
+        key = gg.parse_key("head", "o/r@" + "a" * 40)
+        gg.write_json(gg.BASE / gg.CONSUMERS_FILE, {"consumers": {"a": {"spent": 3, "limit": 3, "deniedAt": NOW - 5},
+                                                                  "b": {"spent": 3, "limit": 3, "deniedAt": NOW - 4}}})
+        out = io.StringIO()
+        with mock.patch.object(gg, "daemon_running", lambda grace=0.0: True), \
+                mock.patch.object(gg, "daemon_failing", lambda: None), contextlib.redirect_stdout(out):
+            self.assertEqual(gg.cmd_read(json.dumps({"keys": [{"key": key, "consumer": "a"},
+                                                              {"key": key, "consumer": "b"}]})), 0)
+        budgets = json.loads(out.getvalue())["entries"][key]["budgets"]
+        self.assertEqual({n: b["deniedAt"] for n, b in budgets.items()}, {"a": NOW - 5, "b": NOW - 4})
+
+    def test_every_consumer_the_upstream_denied_on_a_shared_head_is_denied_here(self) -> None:
+        key = gg.parse_key("head", "o/r@" + "c" * 40)
+        gg.register(key, consumer="a")
+        gg.register(key, consumer="b")
+        self.answers[key] = {"error": "budget spent", "budgets": {"a": {"spent": 3, "limit": 3, "deniedAt": NOW - 2},
+                                                                   "b": {"spent": 3, "limit": 3, "deniedAt": NOW - 1}}}
+        self.daemon.tick(now=NOW)
+        self.assertEqual(sorted(k["consumer"] for k in self.asked[0]["keys"]), ["a", "b"])
+        self.assertEqual({n: self.daemon.denied.get(n) for n in ("a", "b")}, {"a": NOW - 2, "b": NOW - 1})
+
+    def test_heads_past_the_key_cap_rotate_instead_of_starving(self) -> None:
+        # Each head goes up once per consumer, so lines outnumber keys: a head that did not fit is not stamped as
+        # asked, and goes first on the next tick.
+        keys = [gg.parse_key("head", f"o/r@{c * 40}") for c in "def"]
+        for key in keys:
+            gg.register(key, consumer="a")
+            gg.register(key, consumer="b")
+        with mock.patch.object(gg, "UPSTREAM_MAX_KEYS", 4):
+            self.daemon.tick(now=NOW)
+            self.daemon.tick(now=NOW + gg.UPSTREAM_NEW)
+        sent = [sorted({k["key"] for k in r["keys"]}) for r in self.asked]
+        self.assertTrue(all(len(r["keys"]) <= 4 for r in self.asked))
+        self.assertEqual(sent, [keys[:2], sorted([keys[0], keys[2]])])
+
+    def test_a_head_goes_upstream_with_its_consumer_and_checks_serves_it(self) -> None:
+        sha = "b" * 40
+        key = gg.parse_key("head", f"o/r@{sha}")
+        gg.register(key, consumer="compile-fallback")
+        found = {"CI / compile (verdict: ok)": ["completed", "success"], "status / ci/compile": ["completed", "success"]}
+        now = time.time()
+        self.answers[key] = {"data": {"sha": sha, "found": found, "ids": {}, "settled": True}, "dataAt": now - 2,
+                             "fetchedAt": now - 2, "budgets": {"compile-fallback": {"spent": 1, "limit": 3,
+                                                                                    "deniedAt": None}}}
+        self.daemon.tick(now=NOW)
+        # the reader (#1931) goes with a head as with any key
+        self.assertEqual([{k: v for k, v in line.items() if k != "reader"} for line in self.asked[0]["keys"]],
+                         [{"key": key, "jobs": False, "consumer": "compile-fallback"}])
+        self.assertTrue(all(gg.safe_reader(line["reader"]) for line in self.asked[0]["keys"]))
+        entry = gg.read_cache(key)
+        self.assertNotIn("login", entry.get("error") or "")
+        self.assertEqual((entry["source"], entry["data"]["found"], entry["dataAt"]), ("upstream", found, now - 2))
+        self.assertEqual(self.gh.calls, [])
+        out = io.StringIO()
+        with mock.patch.object(gg, "daemon_running", lambda grace=0.0: True), \
+                mock.patch.object(gg, "daemon_failing", lambda: None), contextlib.redirect_stdout(out):
+            code = gg.cmd_checks("o/r", [sha], "compile-fallback", 120, 0, True)
+        doc = json.loads(out.getvalue())
+        self.assertEqual(code, gg.EXIT_OK)
+        self.assertEqual(doc["heads"][sha]["found"], found)
+        self.assertTrue(doc["heads"][sha]["settled"])
+        # an upstream older than head keys refuses a request that has one: the PRs' read is a request of its own
+        gg.register("pr:o/r#7")
+        self.answers["pr:o/r#7"] = {"data": self.pr_data(), "dataAt": NOW}
+        real = self.daemon.upstream_source
+
+        def old(request: dict) -> dict:
+            if any(k["key"].startswith("head:") for k in request["keys"]):
+                raise gg.WatchError("upstream: read serves pr, run, comment keys")
+            return real(request)
+
+        self.daemon.upstream_source = old
+        self.daemon.tick(now=NOW + gg.UPSTREAM_EVERY)
+        self.assertEqual(gg.read_cache("pr:o/r#7")["data"]["number"], 7)
+        self.assertIsNone(gg.read_cache("pr:o/r#7")["error"])
+        self.assertIn("read serves", gg.read_cache(key)["error"])
+        self.assertEqual(gg.read_cache(key)["data"]["found"], found)  # kept, the outage named on it
+        self.daemon.upstream_source = real
+        # a head nobody here asked for within HEAD_INTEREST is not sent: the upstream would charge nobody for it
+        self.asked.clear()
+        self.daemon.tick(now=NOW + gg.HEAD_INTEREST + gg.UPSTREAM_EVERY)
+        self.assertEqual([k for r in self.asked for k in r["keys"] if k["key"] == key], [])
 
     def test_read_refuses_what_is_not_a_key(self) -> None:
         for bad in ("nope", json.dumps({"keys": [{"key": "head:o/r@" + "a" * 40}]}),
@@ -5792,6 +5906,52 @@ class HeadChecksTest(Base):
         ledger = gg.read_json(gg.BASE / gg.CONSUMERS_FILE)["consumers"]
         self.assertEqual(ledger["autoland"]["spent"], 2)  # the head session-1 read is shared, not read twice
         self.assertTrue(ledger["autoland"]["reserved"])
+
+    def test_a_downstream_head_is_charged_to_its_consumer_and_denied_past_its_budget(self) -> None:
+        """An upstream reads a lane VM's head on that consumer's budget: past it, nothing is read from the host's
+        pool, and the lane VM's own `checks` says the budget is spent."""
+        self.policy(limit=1, pool=100)
+        up, down = gg.BASE, Path(self.tmp.name) / "down"
+
+        @contextlib.contextmanager
+        def at(base: Path):
+            saved, gg.BASE = gg.BASE, base
+            try:
+                yield
+            finally:
+                gg.BASE = saved
+
+        def ask(request: dict) -> dict:
+            out = io.StringIO()
+            with at(up), mock.patch.object(gg, "daemon_running", lambda grace=0.0: True), \
+                    mock.patch.object(gg, "daemon_failing", lambda: None), contextlib.redirect_stdout(out):
+                gg.cmd_read(json.dumps(request))
+            return json.loads(out.getvalue())
+
+        with at(down):
+            lane = gg.Daemon(transport=self.gh, token=lambda: self.fail("read a token"), controller=None, upstream=ask)
+            gg.register(self.key(SHA_A), consumer="lane-x")
+            lane.tick(now=NOW)  # registers it upstream under lane-x
+        self.daemon.tick(NOW)  # the upstream reads it, charged to lane-x
+        self.assertEqual(len(self.gh.gql_calls()), 1)
+        with at(down):
+            lane.tick(now=NOW + gg.UPSTREAM_EVERY)
+            self.assertEqual(gg.read_cache(self.key(SHA_A))["data"]["found"]["check / CI / build"],
+                             ["completed", "success"])
+            gg.register(self.key(SHA_B), consumer="lane-x")
+            lane.tick(now=NOW + 2 * gg.UPSTREAM_EVERY)
+        self.daemon.tick(NOW + gg.TICK)  # lane-x has spent its one read: SHA_B is not read on the host's pool
+        self.assertEqual(len(self.gh.gql_calls()), 1)
+        self.assertIsNone(gg.read_cache(self.key(SHA_B)))
+        ledger = gg.read_json(gg.BASE / gg.CONSUMERS_FILE)["consumers"]["lane-x"]
+        self.assertEqual((ledger["spent"], ledger["limit"]), (1, 1))
+        self.assertIsNotNone(ledger["deniedAt"])
+        with at(down):
+            lane.tick(now=NOW + 3 * gg.UPSTREAM_EVERY)
+            self.assertIsNone(gg.read_cache(self.key(SHA_B)))
+            # the denial reaches the lane VM's ledger, so its `checks` names it instead of "not read yet"
+            self.assertEqual(gg.read_json(gg.BASE / gg.CONSUMERS_FILE)["consumers"]["lane-x"]["deniedAt"],
+                             ledger["deniedAt"])
 
     def test_the_shared_pool_caps_all_unreserved_consumers_together(self) -> None:
         self.policy(reserved={"autoland": 5}, limit=5, pool=2)
