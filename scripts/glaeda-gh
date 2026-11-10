@@ -1988,8 +1988,11 @@ def head_query(owner: str, repo: str, sha: str, cursor: str | None = None,
 
 def fold_contexts(nodes: list, runs: dict, statuses: dict, ids: dict, prefix: str = "") -> None:
     """Add one page of a head's contexts to runs (`workflow / job` -> [(id, status, conclusion)]), statuses
-    (`status / context` -> (status, conclusion)) and ids (failed Actions jobs). prefix (`OWNER/REPO: `) keys another
-    repository's checks apart, so a same-named check there never stands in for one here (CHECKS_OF_RECORD)."""
+    (`status / context` -> (status, conclusion, state)) and ids (failed Actions jobs). prefix (`OWNER/REPO: `) keys
+    another repository's checks apart, so a same-named check there never stands in for one here (CHECKS_OF_RECORD).
+    A status's `error` is folded into the conclusion `failure` (every reader of `found` counts it red), and its own
+    state is kept beside it (head_data's statusStates): an `error` is a poster that gave no verdict, which a reader
+    such as a fallback dispatcher must tell apart from a red."""
     for item in nodes or []:
         if not item:
             continue
@@ -1997,7 +2000,7 @@ def fold_contexts(nodes: list, runs: dict, statuses: dict, ids: dict, prefix: st
             state = (item.get("state") or "").lower()
             statuses[f"{prefix}status / {item['context']}"] = (
                 "in_progress" if state in ("pending", "expected") else "completed",
-                "failure" if state == "error" else state)
+                "failure" if state == "error" else state, state)
             continue
         suite = item.get("checkSuite") or {}
         slug = (suite.get("app") or {}).get("slug")
@@ -2011,11 +2014,12 @@ def fold_contexts(nodes: list, runs: dict, statuses: dict, ids: dict, prefix: st
 
 def head_data(sha: str, runs: dict, statuses: dict, ids: dict) -> dict:
     found = {key: list(newest_verdict(rs)) for key, rs in runs.items()}
-    found.update({key: list(value) for key, value in statuses.items()})
+    found.update({key: list(value[:2]) for key, value in statuses.items()})
     # no check yet is not "all finished": a push's checks appear a few seconds later
     running = any(st != "completed" for rs in runs.values() for _, st, _ in rs)
     settled = bool(found) and not running and all(status == "completed" for status, _ in found.values())
-    return {"sha": sha, "found": found, "ids": ids, "settled": settled}
+    states = {key: value[2] for key, value in statuses.items() if len(value) > 2}
+    return {"sha": sha, "found": found, "ids": ids, "settled": settled, "statusStates": states}
 
 
 def _bounded(value: Any, default: float, low: float, high: float) -> float:
@@ -7122,7 +7126,7 @@ def cmd_checks(repo: str, shas: list[str], consumer: str, max_age: float, wait: 
         if sha in served:
             data, fresh, at = served[sha]
             heads[sha] = {"found": data.get("found", {}), "ids": data.get("ids", {}), "settled": bool(data.get("settled")),
-                          "at": at, "stale": not fresh}
+                          "statusStates": data.get("statusStates", {}), "at": at, "stale": not fresh}
         elif sha in missing:
             unread[sha] = "no such commit"
         else:

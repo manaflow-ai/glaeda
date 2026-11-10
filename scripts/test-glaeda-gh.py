@@ -576,6 +576,35 @@ class UnfinishedStatusTest(Base):
         self.assertEqual(gg.read_cache(key)["data"]["headSeenAt"], NOW)
 
 
+class StatusStateTest(unittest.TestCase):
+    """cmuxterm-hq#8968 review (2026-11-10): a head's data folded a status `error` into `failure`, the same answer a
+    real red gives, so a reader could not tell a poster that gave no verdict (compile-status with the results service
+    down) from a failed check. `found` keeps the fold (every gate reads `error` as red), and `statusStates` keeps each
+    status's own state beside it."""
+
+    def test_an_error_status_is_red_in_found_and_error_in_status_states(self) -> None:
+        runs: dict = {}
+        statuses: dict = {}
+        ids: dict = {}
+        gg.fold_contexts([status_context("cmux-next/compile", "ERROR"), status_context("ci/red", "FAILURE"),
+                          status_context("ci/wait", "PENDING"), status_context("ci/ok", "SUCCESS")],
+                         runs, statuses, ids)
+        data = gg.head_data("a" * 40, runs, statuses, ids)
+        self.assertEqual(data["found"]["status / cmux-next/compile"], ["completed", "failure"])
+        self.assertEqual(data["found"]["status / ci/red"], ["completed", "failure"])
+        self.assertEqual(data["statusStates"], {"status / cmux-next/compile": "error", "status / ci/red": "failure",
+                                                "status / ci/wait": "pending", "status / ci/ok": "success"})
+        self.assertFalse(data["settled"])
+
+    def test_the_rest_path_keeps_the_state_too(self) -> None:
+        nodes = gg.rest_contexts({"check_runs": []}, [{"context": "cmux-next/compile", "state": "error"}], [], set())
+        runs: dict = {}
+        statuses: dict = {}
+        gg.fold_contexts(nodes, runs, statuses, {})
+        self.assertEqual(gg.head_data("b" * 40, runs, statuses, {})["statusStates"],
+                         {"status / cmux-next/compile": "error"})
+
+
 class FakeController:
     """Stands in for the cmux build controller: /v1/github/runs/<id> and the change feed. A change
     to `runs` shows up in the feed, as a webhook delivery would; suites and comments are queued."""
