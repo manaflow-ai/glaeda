@@ -446,6 +446,8 @@ class Base(unittest.TestCase):
         # An idle tick ends with a free GET /rate_limit; these tests count the daemon's requests, so
         # it is off here and BudgetRefreshTest turns it back on.
         gg.BUDGET_REFRESH = 0
+        # A watch's reader comes from the session running the suite unless pinned: every test registers as one tool.
+        self.saved_reader, gg._reader = gg._reader, "tool:test"
         self.gh = FakeGitHub()
         self.daemon = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=None)
         # A `wait pr|run` against a daemon that serves waits execs into bash: never the test runner.
@@ -455,6 +457,7 @@ class Base(unittest.TestCase):
 
     def tearDown(self) -> None:
         gg.BASE, gg.WAIT_POLL, gg.DOWN_GRACE, gg.DOWN_PATIENCE, gg.BUDGET_REFRESH = self.saved
+        gg._reader = self.saved_reader
         self.tmp.cleanup()
 
     def age_watch(self, key: str, seconds: float) -> None:
@@ -1352,7 +1355,8 @@ class UpstreamTest(Base):
         self.assertEqual(self.gh.calls, [])
         self.assertEqual(len(self.asked), 1)
         self.assertEqual(sorted(k["key"] for k in self.asked[0]["keys"]), ["pr:o/r#7", "run:o/r/9"])
-        self.assertIn({"key": "run:o/r/9", "jobs": True}, self.asked[0]["keys"])
+        # each key names its waiter here, so the upstream's spend log charges the read to it
+        self.assertIn({"key": "run:o/r/9", "jobs": True, "reader": f"{gg.policy_host()}/tool:test"}, self.asked[0]["keys"])
         pr = gg.read_cache("pr:o/r#7")
         self.assertEqual(pr["data"]["number"], 7)
         self.assertEqual(pr["dataAt"], NOW - 30)  # the upstream's age, not this host's
@@ -1501,7 +1505,8 @@ class UpstreamTest(Base):
             daemon = gg.Daemon(transport=self.gh, token=lambda: self.fail("read a token"), controller=None)
             gg.register("pr:o/r#7")
             daemon.tick(now=NOW)
-        self.assertEqual(json.loads((tmp / "seen").read_text()), {"keys": [{"key": "pr:o/r#7", "jobs": False}]})
+        self.assertEqual(json.loads((tmp / "seen").read_text()),
+                         {"keys": [{"key": "pr:o/r#7", "jobs": False, "reader": f"{gg.policy_host()}/tool:test"}]})
         self.assertEqual(gg.read_cache("pr:o/r#7")["data"], {"number": 7})
         self.assertEqual(self.gh.calls, [])
 
@@ -11228,8 +11233,8 @@ class SpendByPathTest(Base):
         self.assertEqual(spend["rest"], {"requests": 4, "counted": 2})
         runs = [r for r in spend["restByRoute"] if r["route"] == "GET /repos/{owner}/{repo}/actions/runs/{id}"][0]
         self.assertEqual((runs["requests"], runs["counted"], runs["topCaller"]), (2, 1, "run o/r"))
-        self.assertIn({"route": "GET /repos/{owner}/{repo}/pulls/{id}", "kind": "pr", "repo": "o/q", "requests": 1,
-                       "counted": 1}, spend["restByCaller"])
+        self.assertIn({"route": "GET /repos/{owner}/{repo}/pulls/{id}", "kind": "pr", "repo": "o/q", "waiter": "",
+                       "requests": 1, "counted": 1}, spend["restByCaller"])
         self.assertEqual(self.daemon.rest_spent(), 2)  # the share's own count agrees
 
     def test_a_tick_charges_rest_reads_to_their_watch_and_graphql_to_its_query(self) -> None:
@@ -11291,9 +11296,17 @@ class SpendAlarmTest(Base):
         cmd = Path(self.tmp.name) / "tell-coordinator"
         cmd.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {self.told}\n")
         cmd.chmod(0o755)
-        for name, value in (("NOTICES_DIR", self.notices), ("ALARM_CMD", cmd)):
+        for name, value in (("NOTICES_DIR", self.notices), ("ALARM_CMD", cmd),
+                            ("SPENDERS_CMD", os.fspath(Path(self.tmp.name) / "no-gh-quota"))):
             self.addCleanup(setattr, gg, name, getattr(gg, name))
             setattr(gg, name, value)
+
+    def tearDown(self) -> None:
+        # An alarm's tell-coordinator runs in the background and writes told.txt in the test's directory: a test that
+        # never read told_lines() left it running while tearDown removed that directory ("Directory not empty").
+        for p in self.daemon.alarm_procs:
+            p.wait(10)
+        super().tearDown()
 
     def policy(self, **alarms: Any) -> None:
         self.daemon.policy = {**self.daemon.policy, "alarms": {"pool": False, "share": True, "restLeft": 1000, **alarms}}
@@ -11316,7 +11329,7 @@ class SpendAlarmTest(Base):
         reset = NOW + 3000
         self.seen(4000, NOW, reset)
         self.daemon.check_alarms()
-        self.seen(3700, NOW + 300, reset)  # 60 a minute: dry in about an hour, reset in 45 minutes: fine
+        self.seen(3800, NOW + 300, reset)  # 40 a minute: dry after the reset, and under half the limit's pace: fine
         self.daemon.check_alarms()
         self.assertEqual(self.told_lines(), [])
         self.seen(1500, NOW + 600, reset)  # 250 a minute over the 10 minutes: dry in 6 minutes
@@ -11397,6 +11410,64 @@ class SpendAlarmTest(Base):
         self.assertIn("480/h against its cap of 300", told[0])
         self.assertIn("GET /repos/{owner}/{repo}/actions/runs/{id}/jobs?per_page 80 (run o/r)", told[0])
 
+    def spenders(self, rows: list[dict]) -> None:
+        cmd = Path(self.tmp.name) / "gh-quota"
+        cmd.write_text(f"#!/bin/sh\ncat <<'EOF'\n{json.dumps(rows)}\nEOF\n")
+        cmd.chmod(0o755)
+        gg.SPENDERS_CMD = os.fspath(cmd)
+
+    def test_the_pool_alarm_fires_at_half_the_hourly_limit_and_names_who_spent_it(self) -> None:
+        """2026-11-10 11:23Z: the pool drained 158 a minute and the alarm came 25 minutes before dry, naming only this
+        daemon's routes. Past half the limit's pace it fires, and names the host's top callers and each route's waiter."""
+        self.policy(pool=True)
+        self.spenders([{"caller": "tool:pr_owner.py", "rest": 900, "graphql": 3, "source": "gh shim"},
+                       {"caller": "gcp-agent-lane-2", "rest": 1200, "graphql": 0, "source": "lane-gh-broker"},
+                       {"caller": "session:quiet", "rest": 0, "graphql": 40, "source": "gh shim"}])
+        reset = NOW + 3000
+        self.seen(4900, NOW, reset)
+        self.daemon.check_alarms()
+        self.seen(4700, NOW + 300, reset)  # 40 a minute: under half of 5000 an hour (41.7)
+        self.daemon.check_alarms()
+        self.assertEqual(self.told_lines(), [])
+        self.daemon.transport = lambda *a: (200, {}, b"{}")
+        with self.daemon.calling("pr", "o/r", "session:lane-7"):
+            for n in range(5):
+                self.daemon.request("GET", f"/repos/o/r/pulls/{n}")
+        self.seen(4300, NOW + 600, reset)  # 60 a minute over the 10: dry in 72 minutes, after the reset
+        self.daemon.check_alarms()
+        told = self.told_lines()
+        self.assertEqual(len(told), 1, told)
+        self.assertIn("--severity warn", told[0])
+        self.assertIn("draining 60.0/min (past 50% of its 5000 an hour, 42/min)", told[0])
+        self.assertIn("GET /repos/{owner}/{repo}/pulls/{id} 5 (pr o/r; waiter session:lane-7)", told[0])
+        self.assertIn("last hour: gcp-agent-lane-2 1200 (lane-gh-broker); tool:pr_owner.py 900 (gh shim).", told[0])
+        self.assertNotIn("session:quiet", told[0])
+        self.assertEqual(self.notice_lines()[-1]["data"]["spenders"][0]["caller"], "gcp-agent-lane-2")
+
+    def test_the_pace_alarm_is_off_at_a_zero_share(self) -> None:
+        for name in ("FLEET_POLICY", "UPDATE_CONFIG", "DAEMON_CONFIG"):
+            self.addCleanup(setattr, gg, name, getattr(gg, name))
+            setattr(gg, name, Path(self.tmp.name) / f"{name.lower()}.json")
+        gg.DAEMON_CONFIG.write_text(json.dumps({"alarms": {"pool": True, "paceShare": 0}}))
+        self.daemon.policy = gg.daemon_policy()  # through the config file, as the daemon reads it every tick
+        self.assertEqual(self.daemon.policy["alarms"]["paceShare"], 0.0)
+        self.spenders([])
+        reset = NOW + 3000
+        self.seen(4900, NOW, reset)
+        self.daemon.check_alarms()
+        self.seen(4300, NOW + 600, reset)
+        self.daemon.check_alarms()
+        self.assertEqual(self.told_lines(), [])
+
+    def test_an_unreadable_spenders_list_still_sends_the_alarm(self) -> None:
+        self.policy(pool=True)
+        self.seen(800, NOW, NOW + 1200)
+        self.daemon.check_alarms()
+        told = self.told_lines()
+        self.assertEqual(len(told), 1, told)
+        self.assertIn("Top REST callers on", told[0])
+        self.assertIn("unknown", told[0])
+
     def test_an_alarm_with_no_inbox_still_writes_its_notice(self) -> None:
         gg.ALARM_CMD = Path(self.tmp.name) / "missing"
         self.policy(pool=True)
@@ -11409,10 +11480,111 @@ class SpendAlarmTest(Base):
         for name in ("FLEET_POLICY", "UPDATE_CONFIG", "DAEMON_CONFIG"):
             self.addCleanup(setattr, gg, name, getattr(gg, name))
             setattr(gg, name, Path(self.tmp.name) / f"{name.lower()}.json")
-        self.assertEqual(gg.daemon_policy()["alarms"], {"pool": False, "share": True, "restLeft": 1000})
-        gg.DAEMON_CONFIG.write_text(json.dumps({"alarms": {"pool": True, "share": False, "restLeft": 2000}}))
-        self.assertEqual(gg.daemon_policy()["alarms"], {"pool": True, "share": False, "restLeft": 2000})
+        self.assertEqual(gg.daemon_policy()["alarms"], {"pool": False, "share": True, "restLeft": 1000, "paceShare": 0.5})
+        gg.DAEMON_CONFIG.write_text(json.dumps({"alarms": {"pool": True, "share": False, "restLeft": 2000,
+                                                           "paceShare": 0.25}}))
+        self.assertEqual(gg.daemon_policy()["alarms"], {"pool": True, "share": False, "restLeft": 2000, "paceShare": 0.25})
+        gg.DAEMON_CONFIG.write_text(json.dumps({"alarms": {"paceShare": 2}}))  # out of range: the default
+        self.assertEqual(gg.daemon_policy()["alarms"]["paceShare"], 0.5)
         del fleet
+
+
+class ReaderTest(Base):
+    """Each watch names who reads it, and the spend log charges each REST route to that waiter."""
+
+    def readers(self, key: str) -> dict:
+        return gg.read_json(gg.watch_dir() / gg.file_name(key)).get("readers") or {}
+
+    def test_a_session_registers_by_its_name_and_a_tool_by_its_own(self) -> None:
+        gg._reader = None
+        with mock.patch.dict(os.environ, {"ACPMUX_SESSION_NAME": "lane-7", "GLAEDA_GH_READER": ""}):
+            self.assertEqual(gg.reader_name(), "session:lane-7")
+        gg._reader = None
+        env = {k: "" for k in gg.READER_KEYS}
+        with mock.patch.dict(os.environ, {**env, "GLAEDA_GH_READER": ""}), \
+                mock.patch.object(gg, "parent_command", return_value=["/usr/bin/python3", "/x/tools/pr_owner.py", "sweep"]):
+            self.assertEqual(gg.reader_name(), "tool:pr_owner.py")
+
+    def test_no_command_line_text_ever_becomes_a_reader(self) -> None:
+        """A parent `bash -c 'TOKEN=... python3 probe.py'` is tool:unknown: only a session's name or an executable's or
+        script's base name is kept, and the payload is in no file the watch, the spend log or an alarm writes."""
+        secret = "TOKEN=ghp_inline_secret_123"
+        env = {k: "" for k in gg.READER_KEYS}
+        for words in (["bash", "-c", f"{secret} python3 probe.py"], ["/bin/sh", f"{secret} x"], ["env", secret, "gh"]):
+            gg._reader = None
+            with mock.patch.dict(os.environ, {**env, "GLAEDA_GH_READER": ""}), \
+                    mock.patch.object(gg, "parent_command", return_value=words), \
+                    mock.patch.object(gg, "parent_pid", return_value=1):
+                self.assertEqual(gg.reader_name(), "tool:unknown", words)
+        gg._reader = None
+        with mock.patch.dict(os.environ, {**env, "GLAEDA_GH_READER": secret, "ACPMUX_SESSION_NAME": f"x {secret}"}), \
+                mock.patch.object(gg, "parent_command", return_value=["bash", "-c", secret]), \
+                mock.patch.object(gg, "parent_pid", return_value=1):
+            self.assertEqual(gg.reader_name(), "tool:unknown")
+            gg.register("pr:o/r#9")
+            gg.register("pr:o/r#9", reader=f"host/{secret}")  # a reader handed in is held to the same shape
+        line = json.dumps({"keys": [{"key": "pr:o/r#9", "jobs": False, "reader": f"host/tool:{secret}"}]})
+        self.assertEqual(gg.read_readers(line), {})
+        self.gh.prs[("o", "r", 9)] = pr_node(9, checks=[workflow_check("build", 5)])
+        self.budgets(rest=(4000, 1800), graphql=(50, 3000))
+        self.daemon.tick(NOW)
+        self.daemon.save_spend(force=True)
+        written = "".join(f.read_text(errors="replace") for f in gg.BASE.rglob("*") if f.is_file())
+        self.assertNotIn("ghp_inline_secret", written)
+        self.assertNotIn("ghp_inline_secret", "\n".join(gg.spend_lines(self.daemon.spend_by())))
+
+    def test_register_and_a_cached_read_add_their_reader_once(self) -> None:
+        gg._reader = "session:a"
+        gg.register("pr:o/r#1")
+        self.assertEqual(list(self.readers("pr:o/r#1")), ["session:a"])
+        gg._reader = "tool:merge_hold.py"
+        gg.touch_interest("pr:o/r#1")
+        self.assertEqual(sorted(self.readers("pr:o/r#1")), ["session:a", "tool:merge_hold.py"])
+        path = gg.watch_dir() / gg.file_name("pr:o/r#1")
+        before = path.read_text()
+        gg.touch_interest("pr:o/r#1")  # the latest reader, named within READER_REFRESH: the file is not rewritten
+        self.assertEqual(path.read_text(), before)
+
+    def test_the_latest_reader_is_the_waiter_even_when_it_read_lately_before(self) -> None:
+        """A at 0 s, B at 60 s, A at 120 s: A is the waiter, not B (every reader's time kept for 5 minutes said B)."""
+        for who in ("session:a", "session:b", "session:a"):
+            gg._reader = who
+            gg.touch_interest("pr:o/r#1") if (gg.watch_dir() / gg.file_name("pr:o/r#1")).exists() else gg.register("pr:o/r#1")
+        doc = gg.read_json(gg.watch_dir() / gg.file_name("pr:o/r#1"))
+        self.assertEqual(doc["reader"], "session:a")
+        entry = [e for e in self.daemon.watches() if e["key"] == "pr:o/r#1"][0]
+        self.assertEqual(gg.waiter_of(entry), "session:a")
+
+    def test_an_upstream_read_names_the_downstream_waiter(self) -> None:
+        line = json.dumps({"keys": [{"key": "pr:o/r#2", "jobs": False, "reader": "gcp-agent-lane-2/session:x"},
+                                    {"key": "pr:o/r#3", "jobs": False}]})
+        self.assertEqual(gg.read_readers(line), {"pr:o/r#2": "gcp-agent-lane-2/session:x"})
+        gg.read_request(line)  # still a valid request
+
+    def test_the_spend_log_charges_a_rest_read_to_its_waiter(self) -> None:
+        self.gh.prs[("o", "r", 5)] = pr_node(5, checks=[workflow_check("build", 5)])
+        self.budgets(rest=(4000, 1800), graphql=(50, 3000))
+        gg._reader = "session:waiter-1"
+        gg.register("pr:o/r#5")
+        self.daemon.tick(NOW)
+        routes = self.daemon.spend_by()["restByRoute"]
+        pulls = [r for r in routes if r["route"].startswith("GET /repos/{owner}/{repo}/pulls/")]
+        self.assertEqual(pulls[0]["topWaiter"], "session:waiter-1", routes)
+        self.assertIn("waiter session:waiter-1", "\n".join(gg.spend_lines(self.daemon.spend_by())))
+
+    def test_a_job_list_read_inside_a_batch_is_charged_to_its_own_waiter(self) -> None:
+        """A GraphQL batch's REST job reads ran under the batch's caller, so two readers both showed "2 waiters"."""
+        self.daemon.transport = lambda *a: (200, {}, b'{"jobs": []}')
+        failed = {"id": 1, "status": "completed", "conclusion": "failure", "run_attempt": 1}
+        entries = [{"key": f"run:o/r/{n}", "jobs": False, "cache": None, "reader": who}
+                   for n, who in ((1, "session:a"), (2, "session:b"))]
+        with self.daemon.calling("run", "o/r", gg.waiters_of(entries)):
+            for e in entries:
+                self.daemon.read_jobs(e, {"data": {**failed, "id": int(e["key"][-1])}}, True)
+        rows = [r for r in self.daemon.spend_by()["restByCaller"] if "jobs" in r["route"]]
+        self.assertEqual(sorted(r["waiter"] for r in rows), ["session:a", "session:b"], rows)
+
+    budgets = BalanceTest.budgets
 
 
 class DaemonPolicyTest(Base):

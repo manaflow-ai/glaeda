@@ -108,11 +108,15 @@ the daemon is the only process that talks to GitHub, and clients only read its c
 - Spend by path. Every request the daemon sends is logged per minute in spend.json (an hour kept, across
   restarts): REST by route template (GET /repos/{owner}/{repo}/actions/runs/{id}, the query's parameter names
   only), GraphQL points by query name (pr, run, last-real-attempt, ...), each with its caller, the watch kind and
-  repository (or outbox, a session's queued write). daemon.json's spendBy holds the hour's top routes and callers,
+  repository (or outbox, a session's queued write), and its waiter: each watch file names its readers
+  (session:NAME, tool:NAME, or HOST/READER for a lane VM's read through an upstream), and a read is charged to
+  the one that read it last. daemon.json's spendBy holds the hour's top routes and callers,
   which `budget` prints and the fleet's quota readers (gh_quota.py spenders, ci-dash) can read with no API call.
 - Alarms, before the pool is empty rather than after. The pool alarm (policy "alarms": {"pool": true}, on one
-  host: the pool is the account's) fires when the poorest REST counter is under alarms.restLeft (1000) or its
-  drain over the last minutes runs it dry before its reset; the share alarm (every host) when this daemon's own
+  host: the pool is the account's) fires when the poorest REST counter is under alarms.restLeft (1000), its
+  drain over the last minutes runs it dry before its reset, or that drain is past alarms.paceShare (0.5) of the
+  hourly limit (42 a minute of 5000); it names the host's top REST callers (gh-quota usage) as well as this
+  daemon's routes and their waiters. The share alarm (every host) when this daemon's own
   REST pace over the last 10 minutes is past its cap by half. Each is a notice line in
   ~/.local/state/notices/glaeda-gh.jsonl and a `tell-coordinator --from glaeda-gh` (WARN, or FIRE under the
   reserve or within 10 minutes of dry), naming the top routes; at most once an hour unless it gets worse.
@@ -287,7 +291,7 @@ SPEND_RECENT = 600  # seconds: the window an alarm names the top routes of, and 
 # leo-workspace tools/coord_inbox.py, delivered to the coordinator through acpmux) and written as a notice line
 # (~/.local/state/notices/glaeda-gh.jsonl, the schema of cmuxterm-hq tools/fleet-reconcilers/notices.py), at most
 # once per ALARM_EVERY for one alarm unless it gets worse. Policy "alarms" ({"pool": bool, "share": bool,
-# "restLeft": N}) turns each on; the pool is the whole account's, so one host (config/gh-daemon.json) watches it.
+# "restLeft": N, "paceShare": 0..1, 0 for off}) turns each on; the pool is the whole account's, so one host (config/gh-daemon.json) watches it.
 ALARM_CMD = Path(os.environ.get("GLAEDA_GH_ALARM_CMD") or Path.home() / ".local/bin/tell-coordinator")
 NOTICES_DIR = Path(os.environ.get("NOTICES_DIR") or Path.home() / ".local/state/notices")
 ALARMS_FILE = "alarms.json"  # when each alarm was last sent, so a restart does not send it again
@@ -296,6 +300,16 @@ ALARM_REST_LEFT = 1000  # the pool alarm fires below this much REST left on the 
 ALARM_TREND_MIN = 300.0  # seconds of readings in one window a drain projection needs
 ALARM_TREND_KEEP = 900.0  # seconds of readings the projection is drawn over
 ALARM_FIRE_WITHIN = 600.0  # a pool projected empty within this, or under the REST reserve, is a FIRE
+# The pace alarm: the pool draining faster than this share of its hourly limit (policy alarms.paceShare). Half of
+# 5000 is 42 a minute. On 2026-11-10 (11:23Z) the pool drained at 158 a minute and the alarm said so only once it
+# projected dry 25 minutes out; at half the limit there is still an hour's room to find the caller.
+ALARM_PACE_SHARE = 0.5
+# Who spent the pool on this host, for the alarm to name: leo-workspace tools/gh_quota.py `usage --json`, which counts
+# every caller on the login here (the gh shim's sessions and tools, this daemon, the lane-gh broker's VMs). This
+# daemon's own routes are a fraction of it (11:23Z: about 13 a minute of the 158).
+SPENDERS_CMD = os.environ.get("GLAEDA_GH_SPENDERS_CMD") or os.fspath(Path.home() / ".local/bin/gh-quota")
+SPENDERS_TIMEOUT = 10.0
+SPENDERS_TOP = 3
 # How stale this host's view of the shared quota may get before GET /rate_limit refreshes it. That
 # endpoint reports every family at once and costs no primary quota, so the only cost of a short
 # interval is the secondary limit, which one call every two minutes is nowhere near. 0 turns it off.
@@ -725,26 +739,69 @@ def spend_summary(rows: list[dict], seconds: float = 3600.0, top: int = SPEND_TO
     gql = [r for r in rows if r["bucket"] == "graphql"]
     routes: dict[str, dict] = {}
     for r in rest:
-        mine = routes.setdefault(r["name"], {"route": r["name"], "requests": 0, "counted": 0, "callers": {}})
+        mine = routes.setdefault(r["name"], {"route": r["name"], "requests": 0, "counted": 0, "callers": {},
+                                             "waiters": {}})
         mine["requests"] += r["requests"]
         mine["counted"] += r["counted"]
         who = f"{r['kind']} {r['repo']}".strip()
         mine["callers"][who] = mine["callers"].get(who, 0) + r["counted"]
+        if r.get("waiter"):
+            mine["waiters"][r["waiter"]] = mine["waiters"].get(r["waiter"], 0) + r["counted"]
     by_route = []
     for mine in routes.values():
-        callers = mine.pop("callers")
+        callers, waiters = mine.pop("callers"), mine.pop("waiters")
         lead = max(callers.items(), key=lambda kv: (kv[1], kv[0]), default=("", 0))
-        by_route.append({**mine, "topCaller": lead[0], "topCallerCounted": lead[1], "callers": len(callers)})
+        held = max(waiters.items(), key=lambda kv: (kv[1], kv[0]), default=("", 0))
+        by_route.append({**mine, "topCaller": lead[0], "topCallerCounted": lead[1], "callers": len(callers),
+                         "topWaiter": held[0], "topWaiterCounted": held[1], "waiters": len(waiters)})
     def rank(r: dict, field: str) -> tuple:
         return (-r[field], -r["requests"], r.get("route") or r.get("name") or "", r.get("kind", ""), r.get("repo", ""))
     return {"window": int(seconds),
             "rest": {"requests": sum(r["requests"] for r in rest), "counted": sum(r["counted"] for r in rest)},
             "graphql": {"queries": sum(r["requests"] for r in gql), "points": sum(r["points"] for r in gql)},
             "restByRoute": sorted(by_route, key=lambda r: rank(r, "counted"))[:top],
-            "restByCaller": [{"route": r["name"], "kind": r["kind"], "repo": r["repo"], "requests": r["requests"],
-                              "counted": r["counted"]} for r in sorted(rest, key=lambda r: rank(r, "counted"))[:top]],
+            "restByCaller": [{"route": r["name"], "kind": r["kind"], "repo": r["repo"], "waiter": r.get("waiter", ""),
+                              "requests": r["requests"], "counted": r["counted"]}
+                             for r in sorted(rest, key=lambda r: rank(r, "counted"))[:top]],
             "graphqlByQuery": [{"query": r["name"], "kind": r["kind"], "repo": r["repo"], "queries": r["requests"],
                                 "points": r["points"]} for r in sorted(gql, key=lambda r: rank(r, "points"))[:top]]}
+
+
+def route_waiter(r: dict) -> str:
+    """"; waiter W" for a restByRoute row whose reads were for a named waiter (spend_summary topWaiter)."""
+    return f"; waiter {r['topWaiter']}" if r.get("topWaiter") else ""
+
+
+def host_spenders(run: Callable[..., Any] = subprocess.run) -> list[dict]:
+    """This host's top REST spenders on the shared login over the last hour (SPENDERS_CMD usage --json), [] when it
+    cannot say. Each row is {caller, rest, graphql, source}."""
+    try:
+        done = run([SPENDERS_CMD, "usage", "--json"], capture_output=True, text=True, timeout=SPENDERS_TIMEOUT)
+        rows = json.loads(done.stdout or "[]")
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return []
+    rows = [r for r in rows if isinstance(r, dict) and isinstance(r.get("rest"), int) and r.get("rest") > 0] \
+        if isinstance(rows, list) else []
+    rows.sort(key=lambda r: (-r["rest"], str(r.get("caller"))))
+    return [{k: r.get(k) for k in ("caller", "rest", "graphql", "source")} for r in rows[:SPENDERS_TOP]]
+
+
+def spenders_text(rows: list[dict]) -> str:
+    if not rows:
+        return f"Top REST callers on {policy_host()}: unknown ({Path(SPENDERS_CMD).name} usage gave none); glaeda-gh budget."
+    said = "; ".join(f"{r['caller']} {r['rest']}" + (f" ({r['source']})" if r.get("source") else "") for r in rows)
+    return f"Top REST callers on {policy_host()}, last hour: {said}."
+
+
+def waiter_of(e: dict) -> str:
+    """The reader that read a watch entry last (the watch's `reader`), "" when none is named."""
+    return e.get("reader") if isinstance(e.get("reader"), str) else ""
+
+
+def waiters_of(entries: list[dict]) -> str:
+    """The spend log's waiter of a batch: its one waiter, or how many there are."""
+    names = sorted({waiter_of(e) for e in entries} - {""})
+    return names[0] if len(names) == 1 else f"{len(names)} waiters" if names else ""
 
 
 def caller_of(key: str) -> tuple[str, str]:
@@ -800,12 +857,118 @@ def interest_fresh(path: Path, key: str, now: float | None = None) -> bool:
     return all(mtime > s for s in stamps if isinstance(s, (int, float)) and not isinstance(s, bool))
 
 
+# Who keeps a watch read: each watch file names its readers ({"session:NAME" or "tool:NAME": last time}), so the
+# spend log and the alarms can say which waiter a REST route is spent for. On 2026-11-10 the pool alarm named
+# "pr manaflow-ai/cmux" behind pulls, check runs and job reads, and nothing said which of the dozens of sessions,
+# lane VMs and reconcilers kept those PRs watched. A reader already named within READER_REFRESH is not written again,
+# so a hot read stays a stat and a utime.
+READER_REFRESH = 300.0
+READER_KEYS = ("ACPMUX_SESSION_NAME", "CMUX_AGENT_SESSION", "ACPMUX_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_THREAD_ID")
+READER_WRAPPERS = re.compile(r"(?i)(ba|z|da|)sh|python3?(\.\d+)?|env|xargs|timeout|nice|gh|glaeda-gh")
+# A reader's name is written to watch files, spend logs, upstream requests and alarms, so it never carries command-line
+# text: only a session's name or id, or an executable's or script's base name, each held to this shape. A parent
+# `bash -c 'TOKEN=... python3 probe.py'` once gave the reader `tool:TOKEN=... python3 probe.py` (review, glaeda#1931).
+READER_NAME = re.compile(r"[A-Za-z0-9._-]{1,64}")
+# A reader handed in (GLAEDA_GH_READER, a downstream HOST/READER over the upstream): KIND:NAME parts of that shape.
+READER_SAFE = re.compile(r"(?:[A-Za-z0-9._-]{1,64}/)?(?:session|tool):[A-Za-z0-9._-]{1,64}")
+_reader: str | None = None
+
+
+def parent_command(pid: int) -> list[str]:
+    """The words of process PID's command line ([] when it cannot be read): /proc on Linux, ps elsewhere."""
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        return [w for w in raw.decode(errors="replace").split("\0") if w]
+    except OSError:
+        pass
+    try:
+        done = subprocess.run(["ps", "-o", "args=", "-p", str(pid)], capture_output=True, text=True, timeout=2)
+        return done.stdout.split()
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+
+def parent_pid(pid: int) -> int:
+    try:
+        for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+            if line.startswith("PPid:"):
+                return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        done = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True, timeout=2)
+        return int(done.stdout.strip() or 0)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return 0
+
+
+def safe_reader(text: Any) -> str:
+    """TEXT when it is a reader name of the safe shape (READER_SAFE), else ""."""
+    return text if isinstance(text, str) and READER_SAFE.fullmatch(text) else ""
+
+
+def command_tool(words: list[str]) -> str:
+    """The tool a command line runs: its executable's base name, or, behind an interpreter or wrapper, the next word's
+    (the script) when it is a path rather than a flag; "" when that is a wrapper too or not of the READER_NAME shape.
+    Nothing else of the command line is looked at, so no argument (an inline TOKEN=..., a -c program) is ever kept."""
+    for word in words[:2]:
+        name = Path(word).name
+        if word.startswith("-") or not READER_NAME.fullmatch(name):
+            return ""
+        if not READER_WRAPPERS.fullmatch(name):
+            return name
+    return ""
+
+
+def reader_name() -> str:
+    """This process's reader: GLAEDA_GH_READER, else its agent session (session:NAME), else the first tool up its
+    process tree that is not a shell, interpreter or wrapper (tool:pr_owner.py), else tool:unknown. Worked out once per
+    process, and always of the READER_SAFE shape."""
+    global _reader
+    if _reader is None:
+        named = safe_reader(os.environ.get("GLAEDA_GH_READER", "").strip())
+        session = next((os.environ[k].strip() for k in READER_KEYS if os.environ.get(k, "").strip()), "")
+        _reader = named or (f"session:{session}" if READER_NAME.fullmatch(session) else "")
+        pid = os.getppid()
+        for _ in range(4 if not _reader else 0):
+            tool = command_tool(parent_command(pid))
+            if tool:
+                _reader = f"tool:{tool}"
+                break
+            pid = parent_pid(pid)
+            if pid <= 1:
+                break
+        _reader = _reader or "tool:unknown"
+    return _reader
+
+
+def readers_of(doc: dict, now: float) -> dict[str, float]:
+    """A watch file's readers still within IDLE_EXPIRY."""
+    got = doc.get("readers") if isinstance(doc.get("readers"), dict) else {}
+    return {str(k): float(v) for k, v in got.items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and now - v < IDLE_EXPIRY}
+
+
+def reader_fresh(doc: dict, reader: str, now: float) -> bool:
+    """Whether READER is the watch's latest reader already, named within READER_REFRESH: writing it again would change
+    nothing waiter_of decides. Another reader in between makes it stale at once, so a read is never charged to a
+    reader that came and went (A, then B, then A again: A is the latest)."""
+    at = doc.get("readerAt")
+    return doc.get("reader") == reader and isinstance(at, (int, float)) and not isinstance(at, bool) \
+        and 0 <= now - at < READER_REFRESH
+
+
 def touch_interest(key: str) -> None:
     """A read the cache answered still counts as interest: the watch's mtime is its last read (the daemon's idle
     backoff and IDLE_EXPIRY go by it). Only an existing watch is touched, and a failure costs nothing. A touch
-    that would change nothing (interest_fresh) is skipped."""
+    that would change nothing (interest_fresh) is skipped. A reader the watch has not named lately is added
+    (register), so the spend log can say who the watch is read for."""
     path = watch_dir() / file_name(key)
     try:
+        doc = read_json(path)
+        if isinstance(doc, dict) and doc.get("key") == key and not reader_fresh(doc, reader_name(), time.time()):
+            register(key)
+            return
         if not interest_fresh(path, key):
             os.utime(path)
     except OSError:
@@ -902,23 +1065,33 @@ def bounded_lock(path: Path, seconds: float = LOCK_WAIT):
 
 
 def register(key: str, jobs: bool = False, consumer: str | None = None, waited: bool = False,
-             began: float | None = None) -> None:
+             began: float | None = None, reader: str | None = None) -> None:
     """Record interest in `key`. Wanting jobs is sticky while any reader wants them. A head's readers
     are named consumers, each with the time it last asked. A wait marks the watch waitedAt: the daemon
     re-reads a waited run the controller may have lost the finish of (STALE_RUN_REREAD). A new wait passes its start
-    (BEGAN, kept as waitBegan; a touch leaves it): the daemon makes one confirming read of a finished run for it."""
+    (BEGAN, kept as waitBegan; a touch leaves it): the daemon makes one confirming read of a finished run for it.
+    READER (default: this process's, reader_name) joins the watch's readers."""
     path = watch_dir() / file_name(key)
     watch_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
     # read-modify-write: two sessions must not lose each other. Unheld, the write still happens --
     # losing a concurrent registration costs one watch, and waiting costs the gh call.
     with bounded_lock(watch_dir() / ".register.lock"):
-        _register_locked(path, key, jobs, consumer, waited, began)
+        _register_locked(path, key, jobs, consumer, waited, began, reader)
 
 
 def _register_locked(path: Path, key: str, jobs: bool, consumer: str | None, waited: bool = False,
-                     began: float | None = None) -> None:
+                     began: float | None = None, reader: str | None = None) -> None:
     prior = read_json(path) or {}
     doc: dict[str, Any] = {"key": key, "jobs": bool(jobs or prior.get("jobs"))}
+    now = time.time()
+    reader = safe_reader(reader) or reader_name()
+    readers = readers_of(prior, now)
+    if reader_fresh(prior, reader, now):
+        doc["reader"], doc["readerAt"] = reader, prior["readerAt"]
+    else:
+        readers[reader] = now
+        doc["reader"], doc["readerAt"] = reader, now
+    doc["readers"] = readers
     if waited:
         doc["waitedAt"] = time.time()
     elif isinstance(prior.get("waitedAt"), (int, float)):
@@ -1129,7 +1302,8 @@ def run_upstream(command: list[str], request: dict) -> dict:
 
 def read_request(text: str) -> list[tuple[str, bool, bool]]:
     """The (key, jobs, wait) triples of one upstream request line; WatchError on anything else. `wait` (optional)
-    says a wait downstream is blocked on the key, so this host's daemon treats it as waited (STALE_RUN_REREAD)."""
+    says a wait downstream is blocked on the key, so this host's daemon treats it as waited (STALE_RUN_REREAD).
+    `reader` (optional, HOST/READER) names the downstream waiter; read_readers gives it."""
     try:
         doc = json.loads(text)
     except ValueError:
@@ -1152,10 +1326,21 @@ def read_request(text: str) -> list[tuple[str, bool, bool]]:
     return out
 
 
+def read_readers(text: str) -> dict[str, str]:
+    """{key: reader} of an upstream request line that read_request accepted: each item's `reader`, when it names one."""
+    out = {}
+    for item in json.loads(text).get("keys") or []:
+        reader = safe_reader(item.get("reader") if isinstance(item, dict) else None)
+        if reader and isinstance(item.get("key"), str):
+            out[item["key"]] = reader
+    return out
+
+
 def cmd_read(text: str) -> int:
     """`read`: register each key (sessions' interest, as `status` does) and print what the cache holds
     now, never waiting and never reading GitHub. The other end of an upstream (UPSTREAM_CONFIG)."""
     triples = read_request(text)
+    readers = read_readers(text)
     if not daemon_running(grace=DOWN_GRACE):
         print(json.dumps({"error": "glaeda-gh is not running on the upstream host"}))
         return EXIT_DOWN
@@ -1165,7 +1350,7 @@ def cmd_read(text: str) -> int:
         return EXIT_DOWN
     entries: dict[str, Any] = {}
     for key, jobs, wait in triples:
-        register(key, jobs, waited=wait)
+        register(key, jobs, waited=wait, reader=readers.get(key))
         cached = read_cache(key)
         entries[key] = None if cached is None else {
             k: cached.get(k) for k in ("data", "dataAt", "error", "fetchedAt", "jobs", "missing", "restRun", "restRunAt") if k in cached}
@@ -1745,7 +1930,8 @@ def daemon_policy() -> dict:
     alarms = doc.get("alarms") if isinstance(doc.get("alarms"), dict) else {}
     return {"cycle": cycle, "commentCycle": comment, "graphqlPerMinute": per_minute,
             "alarms": {"pool": alarms.get("pool") is True, "share": alarms.get("share") is not False,
-                       "restLeft": int(_bounded(alarms.get("restLeft"), ALARM_REST_LEFT, 0, 100000))},
+                       "restLeft": int(_bounded(alarms.get("restLeft"), ALARM_REST_LEFT, 0, 100000)),
+                       "paceShare": float(_bounded(alarms.get("paceShare"), ALARM_PACE_SHARE, 0.0, 1.0))},
             "cycles": {"pr": cycle, "run": cycle, "comment": comment, "head": cycle},
             "floors": floors, "restShare": float(_bounded(doc.get("restShare"), REST_SHARE, 0.0, 1.0)),
             # restYield out of range (or not a number) is left out, so the default yield holds, never 0 by a typo
@@ -1892,7 +2078,7 @@ class Daemon:
         self.spend: dict[int, dict[str, list[int]]] = load_spend(read_json(BASE / SPEND_FILE))
         self.spend_saved_at = float("-inf")
         self.spend_dirty = False
-        self.caller: tuple[str, str] = ("other", "")  # what the request being sent is for (calling)
+        self.caller: tuple[str, ...] = ("other", "", "")  # what the request being sent is for (calling)
         alarms = read_json(BASE / ALARMS_FILE)
         self.alarms: dict[str, dict] = {  # alarm -> {"at", "level", ...}; a malformed entry is dropped, never fatal
             str(k): v for k, v in (alarms if isinstance(alarms, dict) else {}).items()
@@ -1935,9 +2121,9 @@ class Daemon:
         self.saved_rest_minutes = dict(self.rest_minutes)
 
     @contextlib.contextmanager
-    def calling(self, kind: str, repo: str = ""):
-        """The requests sent inside are charged to (KIND, REPO) in the spend log."""
-        prior, self.caller = self.caller, (kind, repo)
+    def calling(self, kind: str, repo: str = "", waiter: str = ""):
+        """The requests sent inside are charged to (KIND, REPO) in the spend log, read for WAITER (waiter_of)."""
+        prior, self.caller = self.caller, (kind, repo, waiter)
         try:
             yield
         finally:
@@ -1946,9 +2132,9 @@ class Daemon:
     def note_spend(self, bucket: str, name: str, counted: int, points: int = 0) -> None:
         """One request in the spend log: NAME is a REST route template or a GraphQL query name; COUNTED is 1 when
         it cost the shared pool (not a 304, not /rate_limit), whether or not the daemon's share was charged."""
-        kind, repo = self.caller
-        row = self.spend.setdefault(int(self.clock() // 60), {}).setdefault(
-            "\t".join((bucket, name, kind, repo)), [0, 0, 0])
+        kind, repo, waiter = (tuple(self.caller) + ("", "", ""))[:3]
+        key = "\t".join((bucket, name, kind, repo) + ((waiter.replace("\t", " "),) if waiter else ()))
+        row = self.spend.setdefault(int(self.clock() // 60), {}).setdefault(key, [0, 0, 0])
         row[0] += 1
         row[1] += counted
         row[2] += points
@@ -1967,8 +2153,8 @@ class Daemon:
                     mine[2] += points
         out = []
         for key, (requests, counted, points) in total.items():
-            bucket, name, kind, repo = (key.split("\t") + ["", "", "", ""])[:4]
-            out.append({"bucket": bucket, "name": name, "kind": kind, "repo": repo, "requests": requests,
+            bucket, name, kind, repo, waiter = (key.split("\t") + ["", "", "", "", ""])[:5]
+            out.append({"bucket": bucket, "name": name, "kind": kind, "repo": repo, "waiter": waiter, "requests": requests,
                         "counted": counted, "points": points})
         return out
 
@@ -2023,8 +2209,8 @@ class Daemon:
         firing: dict[str, tuple[str, str, dict]] = {}
         rows = self.spend_rows(SPEND_RECENT)
         recent = spend_summary(rows, SPEND_RECENT, top=3)
-        top = "; ".join(f"{r['route']} {r['counted']} ({r['topCaller'] or '?'})" for r in recent["restByRoute"]
-                        if r["counted"]) or "no counted REST from this daemon"
+        top = "; ".join(f"{r['route']} {r['counted']} ({r['topCaller'] or '?'}{route_waiter(r)})"
+                        for r in recent["restByRoute"] if r["counted"]) or "no counted REST from this daemon"
         clock = lambda t: dt.datetime.fromtimestamp(t, dt.timezone.utc).strftime("%H:%MZ")  # noqa: E731
         pool = self.pool_projection()
         held: set[str] = set()  # alarms neither sent nor cleared this tick
@@ -2033,14 +2219,20 @@ class Daemon:
         if policy.get("pool") and pool is not None and pool["reset"] - self.now > 60:
             left, reset = pool["remaining"], pool["reset"]
             low = left < policy.get("restLeft", ALARM_REST_LEFT)
-            if low or pool["dryAt"] is not None:
+            limit = (self.budget.get("rest") or {}).get("limit") or 5000
+            share = policy.get("paceShare", ALARM_PACE_SHARE)
+            fast = isinstance(share, (int, float)) and share > 0 and pool["perMinute"] is not None \
+                and pool["perMinute"] * 60 >= share * limit
+            if low or fast or pool["dryAt"] is not None:
                 fire = left < self.policy["floors"]["rest"][1] or (
                     pool["dryAt"] is not None and pool["dryAt"] - self.now < ALARM_FIRE_WITHIN)
                 pace = f", draining {pool['perMinute']}/min" if pool["perMinute"] else ""
+                if fast:
+                    pace += f" (past {share:.0%} of its {limit} an hour, {share * limit / 60:.0f}/min)"
                 dry = f", dry at {clock(pool['dryAt'])}" if pool["dryAt"] is not None else ""
                 text = (f"{'FIRE' if fire else 'WARN'} shared GitHub REST pool on {policy_host()}: {left} left{pace}"
                         f"{dry}, resets {clock(reset)}. This daemon's top REST routes, last "
-                        f"{SPEND_RECENT // 60} min: {top}. Who spent it: gh_quota.py usage; glaeda-gh budget.")
+                        f"{SPEND_RECENT // 60} min: {top}.")
                 firing["pool"] = ("fire" if fire else "warn", text, {**pool, "top": recent["restByRoute"]})
         cap = self.rest_cap()
         # the share's own measure: the outbox (sessions' writes) is never held to it (request)
@@ -2048,7 +2240,8 @@ class Daemon:
         pace = sum(r["counted"] for r in polling) * 3600 // SPEND_RECENT
         if policy.get("share", True) and pace > max(cap * 3 // 2, cap + 150):
             mine = spend_summary(polling, SPEND_RECENT, top=3)["restByRoute"]
-            routes = "; ".join(f"{r['route']} {r['counted']} ({r['topCaller'] or '?'})" for r in mine if r["counted"])
+            routes = "; ".join(f"{r['route']} {r['counted']} ({r['topCaller'] or '?'}{route_waiter(r)})"
+                               for r in mine if r["counted"])
             text = (f"WARN glaeda-gh on {policy_host()} is spending REST at {pace}/h against its cap of {cap} "
                     f"({self.rest_spent()} in the last hour). Top routes, last {SPEND_RECENT // 60} min: {routes}.")
             firing["share"] = ("warn", text, {"pace": pace, "cap": cap, "spent": self.rest_spent(), "top": mine})
@@ -2064,6 +2257,10 @@ class Daemon:
                     self.alarms[name] = {k: v for k, v in last.items() if k != "cleared"}
                     changed = True
                 continue
+            if name == "pool":  # read only when it is sent: at most a few times an hour
+                spenders = host_spenders()
+                data = {**data, "spenders": spenders}
+                text += " " + spenders_text(spenders)
             self.send_alarm(name, level, text, data)
             self.alarms[name] = {"at": self.now, "level": level, "text": text,
                                  **({"reset": data["reset"]} if "reset" in data else {})}
@@ -3072,7 +3269,8 @@ class Daemon:
             waited = doc.get("waitedAt") if isinstance(doc.get("waitedAt"), (int, float)) else None
             began = doc.get("waitBegan") if isinstance(doc.get("waitBegan"), (int, float)) else None
             out.append({"key": key, "jobs": bool(doc.get("jobs")), "cache": cached, "touched": self.now - age,
-                        "waitedAt": waited, "waitBegan": began,
+                        "waitedAt": waited, "waitBegan": began, "readers": readers_of(doc, time.time()),
+                        "reader": doc.get("reader") if isinstance(doc.get("reader"), str) else "",
                         "consumers": {str(k): float(v) for k, v in asked.items() if isinstance(v, (int, float))}})
         return out
 
@@ -3437,7 +3635,7 @@ class Daemon:
                 break
             sent = len(self.sent)
             try:
-                with self.calling(*caller_of(e["key"])):
+                with self.calling(*caller_of(e["key"]), waiter_of(e)):
                     self.rest_fetch[e["key"].split(":", 1)[0]](e)
             except OutOfTime:
                 self.defer(over_rest[i:])
@@ -3456,7 +3654,7 @@ class Daemon:
             self.deferred_since.pop(e["key"], None)
         for e in self.jobs_only:
             try:
-                with self.calling(*caller_of(e["key"])):
+                with self.calling(*caller_of(e["key"]), waiter_of(e)):
                     self.read_jobs(e, {}, False)  # read_jobs reads the list a failed attempt is missing
             except Exception as error:  # noqa: BLE001
                 self.errors.append(f"{e['key']} jobs: {describe(error)}")
@@ -3596,7 +3794,9 @@ class Daemon:
         return self.finish_tick(entries, kinds["pr"], kinds["run"], kinds["comment"], [])
 
     def upstream_read(self, ask: Callable[[dict], dict], due: list[dict]) -> None:
-        request = {"keys": [{"key": e["key"], "jobs": e["jobs"], **({"wait": True} if self.waited(e) else {})}
+        request = {"keys": [{"key": e["key"], "jobs": e["jobs"], **({"wait": True} if self.waited(e) else {}),
+                             **({"reader": f"{policy_host()}/{waiter_of(e).split('/')[-1]}"}
+                                if safe_reader(f"{policy_host()}/{waiter_of(e).split('/')[-1]}") else {})}
                             for e in due]}
         try:
             answer = ask(request)
@@ -3672,8 +3872,9 @@ class Daemon:
         # One registration per key, all under one bound: a wedged holder of .register.lock costs a tick
         # LOCK_WAIT, not LOCK_WAIT per waiter.
         with lock_budget(LOCK_WAIT):
-            for key, jobs in touch.items():
-                register(key, jobs, waited=True)
+            for key, (jobs, readers) in touch.items():
+                for reader in readers or [None]:
+                    register(key, jobs, waited=True, reader=reader or "tool:glaeda-gh wait")
         # What a blocker killed after its wake, or a wait handed back to Python, left behind.
         for left in d.glob("*.*"):
             rid = left.name.split(".", 1)[0]
@@ -3703,7 +3904,9 @@ class Daemon:
         if req.get("code") is None:
             before = dict(req)
             if now - float(req.get("touched") or 0) >= TOUCH_EVERY:
-                touch[req["key"]] = touch.get(req["key"], False) or bool(req.get("jobs"))
+                jobs_before, readers = touch.get(req["key"], (False, []))
+                touch[req["key"]] = (jobs_before or bool(req.get("jobs")),
+                                     readers + [str(req["reader"])] if isinstance(req.get("reader"), str) else readers)
                 req["touched"] = now
                 self.note_wait_state(d, rid, req)
             try:
@@ -3774,7 +3977,7 @@ class Daemon:
             self.gql_reason = kind
             repos = sorted({caller_of(e["key"])[1] for e in chunk})
             try:
-                with self.calling(kind, repos[0] if len(repos) == 1 else f"{len(repos)} repos"):
+                with self.calling(kind, repos[0] if len(repos) == 1 else f"{len(repos)} repos", waiters_of(chunk)):
                     error = fetch(chunk)
                 spilled, self.spill = self.spill, []
             except OutOfTime:
@@ -4365,7 +4568,9 @@ class Daemon:
                           and (self.rest_room(1) or prior.get("jobsTried") != attempt))
         if (e["jobs"] and self.mode("rest") == "normal") or failed_attempt:
             try:
-                jstate, jdoc, jetag = self.get(base + "/jobs?per_page=100", prior.get("jobsEtag") if "jobs" in prior else None)
+                with self.calling(*caller_of(e["key"]), waiter_of(e)):  # its own waiter, inside a batch's call too
+                    jstate, jdoc, jetag = self.get(base + "/jobs?per_page=100",
+                                                   prior.get("jobsEtag") if "jobs" in prior else None)
             except OutOfTime:  # the run itself is read: store it, and its jobs wait for a later read
                 jstate, jdoc, jetag = "late", None, None
             if failed_attempt and jstate != "late":  # sent: a tick out of time sent nothing, so it is not tried
@@ -6364,7 +6569,7 @@ def write_wait_request(kind: str, target: str, until: str, timeout: float, jobs:
     waits_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
     os.mkfifo(waits_dir() / f"{rid}.fifo", 0o600)
     register(req["key"], jobs, waited=True, began=req["began"])
-    write_json(waits_dir() / f"{rid}.json", {**req, "pid": pid, "touched": req["began"]})
+    write_json(waits_dir() / f"{rid}.json", {**req, "pid": pid, "touched": req["began"], "reader": reader_name()})
     return rid
 
 
@@ -6878,11 +7083,12 @@ def spend_lines(spend: Any) -> list[str]:
            f"of {rest.get('requests', 0)} sent (304s and rate_limit are free), {gql.get('points', 0)} GraphQL points "
            f"in {gql.get('queries', 0)} queries ({SPEND_FILE})"]
     for r in spend.get("restByRoute") or []:
+        held = f"; waiter {r['topWaiter']} {r.get('topWaiterCounted', 0)}" if r.get("topWaiter") else ""
         out.append(f"  REST {r.get('counted', 0):>5} of {r.get('requests', 0):>5}  {r.get('route')}  "
-                   f"(most: {r.get('topCaller') or '?'} {r.get('topCallerCounted', 0)}; {r.get('callers', 0)} callers)")
+                   f"(most: {r.get('topCaller') or '?'} {r.get('topCallerCounted', 0)}; {r.get('callers', 0)} callers{held})")
     for r in spend.get("restByCaller") or []:
         out.append(f"  REST {r.get('counted', 0):>5} of {r.get('requests', 0):>5}  {r.get('route')}  "
-                   f"by {r.get('kind')} {r.get('repo') or ''}".rstrip())
+                   f"by {r.get('kind')} {r.get('repo') or ''}{' for ' + r['waiter'] if r.get('waiter') else ''}".rstrip())
     for r in spend.get("graphqlByQuery") or []:
         out.append(f"  GraphQL {r.get('points', 0):>5} points in {r.get('queries', 0):>4}  {r.get('query')}  "
                    f"by {r.get('kind')} {r.get('repo') or ''}".rstrip())
