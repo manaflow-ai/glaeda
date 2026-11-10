@@ -69,6 +69,8 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   60 s doubling to 15 min, whichever is longer, and no read is sent during it.
 - Comment watches (an issue's or PR's latest 50 comments) are one batched GraphQL query every 15 s
   (over REST: the issue and the page or two holding them), and last only while someone waits on them.
+- A merged or closed PR's failed steps are not read (its cached ones are kept), and a job whose steps read GitHub
+  refused for good (404, 410, 422) is not asked again for STEPS_RETRY (15 minutes); a 5xx is asked again next read.
 - Reads follow interest. A PR nobody has waited on or read for IDLE_BACKOFF_AFTER (5 minutes) is polled about
   as often as it was last read, up to every 10 minutes, and its check events no longer re-read it early; a read
   (a `status`, a wait, the broker answering from the cache) puts it back on every cycle. A comment wait on a
@@ -552,6 +554,11 @@ REST_CHECK_PAGES = 5  # check-run pages (100 each) one PR read over REST takes a
 REST_STATUS_PAGES = 2  # commit-status pages (100 each) likewise
 REST_RUN_PAGES = 2  # a commit's workflow-run pages (100 each) likewise: without its run a check has no workflow
 REST_STEPS_MAX = 10  # failed or cancelled jobs whose steps one PR read over REST looks up at most
+# A job whose steps read GitHub refused for good (404 for a job of a deleted run, 410, 422) is not asked again for
+# this long: each such read was retried on every read of its PR, a counted request each time. A 5xx or a transport
+# error is asked again at the normal pace: the steps hold a runner refusal for the rescue, whose grace is 360 s.
+STEPS_RETRY = 900.0
+STEPS_GONE = re.compile(r"HTTP (?:404|410|422)\b")
 # The most counted REST requests one read can make before its step lookups, which are admitted one
 # at a time: a PR is its pull, REST_CHECK_PAGES of check runs, statuses, runs, workflows, rules and
 # the branch; a run is the run and its job list. The share admits a read only when this much fits. The
@@ -733,6 +740,9 @@ def load_spend(doc: Any) -> dict[int, dict[str, list[int]]]:
     return out
 
 
+SPEND_WAITERS_SHOWN = 3  # waiters named inside one restByCaller or graphqlByQuery row
+
+
 def spend_summary(rows: list[dict], seconds: float = 3600.0, top: int = SPEND_TOP) -> dict:
     """The spend log's tables, most spent first: REST by route (with the caller that spent most on it), REST by
     route and caller, GraphQL by query and caller, and each bucket's totals."""
@@ -757,15 +767,38 @@ def spend_summary(rows: list[dict], seconds: float = 3600.0, top: int = SPEND_TO
                          "topWaiter": held[0], "topWaiterCounted": held[1], "waiters": len(waiters)})
     def rank(r: dict, field: str) -> tuple:
         return (-r[field], -r["requests"], r.get("route") or r.get("name") or "", r.get("kind", ""), r.get("repo", ""))
+
+    def by_caller(rows: list[dict], field: str) -> list[dict]:
+        """ROWS merged per name, kind and repo before ranking, its waiters inside (most FIELD first): a key holds
+        the waiter too, so twelve 1-point pr queries for twelve waiters were twelve rows, not one of 12 (#1931)."""
+        merged: dict[tuple, dict] = {}
+        for r in rows:
+            row = merged.setdefault((r["name"], r["kind"], r["repo"]), {"name": r["name"], "kind": r["kind"],
+                                                                         "repo": r["repo"], "requests": 0,
+                                                                         field: 0, "waiters": {}})
+            row["requests"] += r["requests"]
+            row[field] += r[field]
+            if r.get("waiter"):
+                row["waiters"][r["waiter"]] = row["waiters"].get(r["waiter"], 0) + r[field]
+        out = sorted(merged.values(), key=lambda r: rank(r, field))[:top]
+        for row in out:
+            row["waiters"] = [{"waiter": w, field: n} for w, n in
+                              sorted(row["waiters"].items(), key=lambda kv: (-kv[1], kv[0]))[:SPEND_WAITERS_SHOWN]]
+        return out
     return {"window": int(seconds),
             "rest": {"requests": sum(r["requests"] for r in rest), "counted": sum(r["counted"] for r in rest)},
             "graphql": {"queries": sum(r["requests"] for r in gql), "points": sum(r["points"] for r in gql)},
             "restByRoute": sorted(by_route, key=lambda r: rank(r, "counted"))[:top],
-            "restByCaller": [{"route": r["name"], "kind": r["kind"], "repo": r["repo"], "waiter": r.get("waiter", ""),
-                              "requests": r["requests"], "counted": r["counted"]}
-                             for r in sorted(rest, key=lambda r: rank(r, "counted"))[:top]],
+            "restByCaller": [{"route": r["name"], "kind": r["kind"], "repo": r["repo"], "requests": r["requests"],
+                              "counted": r["counted"], "waiters": r["waiters"]} for r in by_caller(rest, "counted")],
             "graphqlByQuery": [{"query": r["name"], "kind": r["kind"], "repo": r["repo"], "queries": r["requests"],
-                                "points": r["points"]} for r in sorted(gql, key=lambda r: rank(r, "points"))[:top]]}
+                                "points": r["points"], "waiters": r["waiters"]} for r in by_caller(gql, "points")]}
+
+
+def waiters_text(r: dict, field: str) -> str:
+    """" for W1 5, W2 3" from a spend_summary row's top waiters."""
+    shown = [f"{w.get('waiter')} {w.get(field, 0)}" for w in r.get("waiters") or [] if isinstance(w, dict)]
+    return f" for {', '.join(shown)}" if shown else ""
 
 
 def route_waiter(r: dict) -> str:
@@ -1876,6 +1909,13 @@ def slim_run(doc: dict) -> dict:
     return {k: doc.get(k) for k in keep}
 
 
+def settled_pr(data: dict) -> bool:
+    """A merged or closed PR: its failed steps are not read from GitHub (on 2026-11-10 cosmic-gray's daemon read 54
+    jobs/{id} in ten minutes, most for merged cmux PRs). Steps already cached are still carried forward: `wait pr
+    --until green|done` rules on a merged PR too, and a runner refusal inside the rescue grace is held by them."""
+    return str(data.get("state") or "").upper() in {"MERGED", "CLOSED"}
+
+
 def wants_steps(c: dict) -> bool:
     """A check whose steps the daemon reads once: a failure (which steps failed) or a cancellation
     (did any step run: the owned-pool rescue cancels a job still queued for a runner, then re-runs it)."""
@@ -2187,6 +2227,7 @@ class Daemon:
         self.alarm_procs: list[subprocess.Popen] = []  # tell-coordinator runs not yet reaped
         self.writing = False  # inside the outbox: its requests are sessions' writes, not the daemon's polling
         self.jobs_only: list[dict] = []  # failed runs whose job list is read though runs cannot be (due)
+        self.steps_failed: dict[Any, float] = {}  # job id -> when GitHub refused its steps for good (STEPS_RETRY)
 
     # -- budget
 
@@ -4588,7 +4629,7 @@ class Daemon:
                     continue
                 if c["id"] in known:
                     c["failedSteps"], c["stepCount"] = known[c["id"]]
-                else:
+                elif not settled_pr(data):  # a settled PR keeps what is cached; nothing new is read for it
                     want.setdefault(c["id"], []).append(c)
                     owners.setdefault(c["id"], set()).add(e["key"])
         ids = list(want)[:2 * STEPS_BATCH]  # the rest wait a cycle (failed and cancelled checks; each is read once)
@@ -4908,14 +4949,19 @@ class Daemon:
         the rest on the next one. Without its steps a refused or never-started check cannot be held."""
         known = known_steps([(e, data)])
         left = REST_STEPS_MAX
+        self.steps_failed = {j: t for j, t in self.steps_failed.items() if self.now - t < STEPS_RETRY}
         for c in data.get("checks") or []:
             if not wants_steps(c):
                 continue
             if c["id"] in known:
                 c["failedSteps"], c["stepCount"] = known[c["id"]]
                 continue
+            if settled_pr(data):
+                continue  # kept above when cached; nothing new is read for a settled PR
             job_id = job_ids.get(c["id"])
             if not job_id or not c.get("runId") or left <= 0 or self.mode("rest") == "stop" or not self.rest_room(1):
+                continue
+            if job_id in self.steps_failed:
                 continue
             left -= 1
             try:
@@ -4925,6 +4971,8 @@ class Daemon:
                 return
             if state != "fresh" or not isinstance(doc, dict):
                 self.errors.append(f"{e['key']} steps: {doc}")
+                if STEPS_GONE.match(str(doc)):
+                    self.steps_failed[job_id] = self.now
                 continue
             steps = doc.get("steps")
             c["failedSteps"], c["stepCount"] = failed_steps(steps), len(steps) if isinstance(steps, list) else None
@@ -7235,10 +7283,10 @@ def spend_lines(spend: Any) -> list[str]:
                    f"(most: {r.get('topCaller') or '?'} {r.get('topCallerCounted', 0)}; {r.get('callers', 0)} callers{held})")
     for r in spend.get("restByCaller") or []:
         out.append(f"  REST {r.get('counted', 0):>5} of {r.get('requests', 0):>5}  {r.get('route')}  "
-                   f"by {r.get('kind')} {r.get('repo') or ''}{' for ' + r['waiter'] if r.get('waiter') else ''}".rstrip())
+                   f"by {r.get('kind')} {r.get('repo') or ''}".rstrip() + waiters_text(r, "counted"))
     for r in spend.get("graphqlByQuery") or []:
         out.append(f"  GraphQL {r.get('points', 0):>5} points in {r.get('queries', 0):>4}  {r.get('query')}  "
-                   f"by {r.get('kind')} {r.get('repo') or ''}".rstrip())
+                   f"by {r.get('kind')} {r.get('repo') or ''}".rstrip() + waiters_text(r, "points"))
     return out
 
 
