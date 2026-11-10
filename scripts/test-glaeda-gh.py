@@ -54,6 +54,10 @@ gg.FLEET_POLICY = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-fleet-policy
 gg.PACE_CLI = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-pacer-{os.getpid()}" / "gh"
 # Nor may a host's own expected-contexts.json add contexts the tests do not post.
 gg.EXPECTED_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-expected-{os.getpid()}.json"
+# Nor may a test's alarm reach the host's coordinator, or its notices.
+gg.ALARM_CMD = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-alarm-{os.getpid()}" / "tell-coordinator"
+_NOTICES = tempfile.TemporaryDirectory(prefix="glaeda-gh-test-notices-")  # removed when the run ends
+gg.NOTICES_DIR = Path(_NOTICES.name)
 
 TOKEN = "ghp_faketoken_must_never_touch_disk"
 NOW = float(int(time.time()))  # watch files carry real mtimes
@@ -10761,6 +10765,228 @@ class RiskReceiptPostTest(unittest.TestCase):
         self.assertEqual(len(t.calls), 4)
         self.assertEqual(gg.post_state(item["id"])["riskRegrade"]["state"], "failed")
         self.assertEqual(gg.post_state(other["id"])["url"], "other")
+
+
+
+class SpendByPathTest(Base):
+    """spend.json and daemon.json spendBy: what the daemon spent, by REST route and GraphQL query, and for whom."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.daemon.clock_real = False
+        self.daemon.now = NOW
+
+    def test_route_templates(self) -> None:
+        self.assertEqual(gg.route_of("GET", "/repos/o/r/pulls/12"), "GET /repos/{owner}/{repo}/pulls/{id}")
+        self.assertEqual(gg.route_of("GET", f"/repos/o/r/commits/{'a' * 40}/check-runs?filter=all&per_page=100"),
+                         "GET /repos/{owner}/{repo}/commits/{sha}/check-runs?filter&per_page")
+        self.assertEqual(gg.route_of("GET", "/repos/o/r/rules/branches/feat/x?per_page=100"),
+                         "GET /repos/{owner}/{repo}/rules/branches/{branch}?per_page")
+        self.assertEqual(gg.route_of("GET", "/repos/o/r/branches/feat/x"), "GET /repos/{owner}/{repo}/branches/{branch}")
+        self.assertEqual(gg.route_of("DELETE", "/repos/o/r/issues/3/labels/needs%20review"),
+                         "DELETE /repos/{owner}/{repo}/issues/{id}/labels/{label}")
+        self.assertEqual(gg.route_of("GET", "/rate_limit"), "GET /rate_limit")
+        self.assertEqual(gg.caller_of("run:o/r/77"), ("run", "o/r"))
+        self.assertEqual(gg.caller_of(f"head:o/r@{'b' * 40}"), ("head", "o/r"))
+
+    def test_rest_requests_are_logged_by_route_and_caller_and_a_304_is_free(self) -> None:
+        answers = iter([(200, {}, b"{}"), (304, {}, b""), (200, {}, b"{}"), (200, {}, b"{}")])
+        self.daemon.transport = lambda *a: next(answers)
+        with self.daemon.calling("run", "o/r"):
+            self.daemon.request("GET", "/repos/o/r/actions/runs/1")
+            self.daemon.request("GET", "/repos/o/r/actions/runs/2", etag="x")
+        with self.daemon.calling("pr", "o/q"):
+            self.daemon.request("GET", "/repos/o/q/pulls/5")
+        self.daemon.request("GET", "/rate_limit", free=True)
+        spend = self.daemon.spend_by()
+        self.assertEqual(spend["rest"], {"requests": 4, "counted": 2})
+        runs = [r for r in spend["restByRoute"] if r["route"] == "GET /repos/{owner}/{repo}/actions/runs/{id}"][0]
+        self.assertEqual((runs["requests"], runs["counted"], runs["topCaller"]), (2, 1, "run o/r"))
+        self.assertIn({"route": "GET /repos/{owner}/{repo}/pulls/{id}", "kind": "pr", "repo": "o/q", "requests": 1,
+                       "counted": 1}, spend["restByCaller"])
+        self.assertEqual(self.daemon.rest_spent(), 2)  # the share's own count agrees
+
+    def test_a_tick_charges_rest_reads_to_their_watch_and_graphql_to_its_query(self) -> None:
+        self.gh.runs[9] = {"id": 9, "status": "in_progress", "html_url": "u9"}
+        gg.register("run:o/r/9")
+        self.daemon.paths["run"] = "rest"
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800}}
+        self.daemon.policy = {**self.daemon.policy, "restShare": 0.4}
+        self.daemon.tick(NOW)
+        rows = self.daemon.spend_rows()
+        self.assertTrue(any(r["bucket"] == "rest" and r["kind"] == "run" and r["repo"] == "o/r" for r in rows), rows)
+        gg.register("pr:o/r#1")
+        self.gh.prs[1] = pr_node(1)
+        self.daemon.paths["pr"] = "graphql"
+        self.daemon.tick(NOW + gg.CYCLE + 1)
+        gql = self.daemon.spend_by(7200)["graphqlByQuery"]
+        self.assertTrue(any(q["query"] == "pr" and q["kind"] == "pr" and q["repo"] == "o/r" and q["points"] >= 1
+                            for q in gql), gql)
+        status = gg.read_json(gg.BASE / "daemon.json")
+        self.assertIn("spendBy", status)
+
+    def test_the_log_survives_a_restart_and_keeps_an_hour(self) -> None:
+        self.daemon.transport = lambda *a: (200, {}, b"{}")
+        with self.daemon.calling("pr", "o/r"):
+            self.daemon.request("GET", "/repos/o/r/pulls/1")
+        self.daemon.now = NOW - 4000
+        with self.daemon.calling("pr", "o/r"):
+            self.daemon.request("GET", "/repos/o/r/pulls/2")  # dated over an hour back by the pinned clock
+        self.daemon.now = NOW
+        self.daemon.save_spend(force=True)
+        again = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=None)
+        again.clock_real, again.now = False, NOW
+        self.assertEqual(again.spend_by()["rest"], {"requests": 1, "counted": 1})
+        self.assertEqual(len(gg.read_json(gg.BASE / gg.SPEND_FILE)["minutes"]), 1)
+
+    def test_budget_prints_the_tables(self) -> None:
+        lines = gg.spend_lines({"window": 3600, "rest": {"requests": 9, "counted": 7},
+                                "graphql": {"queries": 2, "points": 4},
+                                "restByRoute": [{"route": "GET /x", "requests": 9, "counted": 7, "topCaller": "run o/r",
+                                                 "topCallerCounted": 7, "callers": 1}],
+                                "restByCaller": [], "graphqlByQuery": [{"query": "pr", "kind": "pr", "repo": "o/r",
+                                                                        "queries": 2, "points": 4}]})
+        self.assertIn("7 counted REST of 9 sent", lines[0])
+        self.assertIn("GET /x", lines[1])
+        self.assertIn("run o/r 7", lines[1])
+        self.assertIn("pr  by pr o/r", lines[2])
+
+
+class SpendAlarmTest(Base):
+    """The pool and share alarms: a notice line and tell-coordinator, before the pool runs dry."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.daemon.clock_real = False
+        self.daemon.now = NOW
+        self.notices = Path(self.tmp.name) / "notices"
+        self.told = Path(self.tmp.name) / "told.txt"
+        cmd = Path(self.tmp.name) / "tell-coordinator"
+        cmd.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {self.told}\n")
+        cmd.chmod(0o755)
+        for name, value in (("NOTICES_DIR", self.notices), ("ALARM_CMD", cmd)):
+            self.addCleanup(setattr, gg, name, getattr(gg, name))
+            setattr(gg, name, value)
+
+    def policy(self, **alarms: Any) -> None:
+        self.daemon.policy = {**self.daemon.policy, "alarms": {"pool": False, "share": True, "restLeft": 1000, **alarms}}
+
+    def told_lines(self) -> list[str]:
+        for p in self.daemon.alarm_procs:
+            p.wait(10)
+        return self.told.read_text().splitlines() if self.told.exists() else []
+
+    def notice_lines(self) -> list[dict]:
+        path = self.notices / "glaeda-gh.jsonl"
+        return [json.loads(x) for x in path.read_text().splitlines()] if path.exists() else []
+
+    def seen(self, remaining: int, at: float, reset: float) -> None:
+        self.daemon.now = at
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": remaining, "reset": reset, "seenAt": at}}
+
+    def test_the_pool_alarm_fires_on_a_drain_that_runs_dry_before_the_reset(self) -> None:
+        self.policy(pool=True)
+        reset = NOW + 3000
+        self.seen(4000, NOW, reset)
+        self.daemon.check_alarms()
+        self.seen(3700, NOW + 300, reset)  # 60 a minute: dry in about an hour, reset in 45 minutes: fine
+        self.daemon.check_alarms()
+        self.assertEqual(self.told_lines(), [])
+        self.seen(1500, NOW + 600, reset)  # 250 a minute over the 10 minutes: dry in 6 minutes
+        self.daemon.check_alarms()
+        told = self.told_lines()
+        self.assertEqual(len(told), 1, told)
+        self.assertIn("--severity fire", told[0])
+        self.assertIn("1500 left", told[0])
+        self.assertIn("dry at", told[0])
+        self.assertEqual(self.notice_lines()[-1]["kind"], "pool")
+        self.assertEqual(self.notice_lines()[-1]["level"], "warn")
+        self.seen(1400, NOW + 620, reset)  # still firing: not sent again within the hour
+        self.daemon.check_alarms()
+        self.assertEqual(len(self.told_lines()), 1)
+        self.assertEqual(gg.read_json(gg.BASE / gg.ALARMS_FILE)["pool"]["level"], "fire")
+
+    def test_another_rest_window_running_low_is_sent_again(self) -> None:
+        self.policy(pool=True)
+        self.seen(800, NOW, NOW + 1200)
+        self.daemon.check_alarms()
+        self.seen(900, NOW + 60, NOW + 2400)  # the other core counter, its own window
+        self.daemon.check_alarms()
+        self.assertEqual(len(self.told_lines()), 2)
+
+    def test_no_cleared_notice_in_the_minute_before_a_reset(self) -> None:
+        self.policy(pool=True)
+        self.seen(800, NOW, NOW + 100)
+        self.daemon.check_alarms()
+        self.seen(700, NOW + 50, NOW + 100)
+        self.daemon.check_alarms()
+        self.assertEqual([n["level"] for n in self.notice_lines()], ["warn"])
+
+    def test_a_malformed_alarms_file_is_dropped(self) -> None:
+        gg.write_json(gg.BASE / gg.ALARMS_FILE, {"pool": "x", "share": {"at": "soon"}})
+        again = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=None)
+        self.assertEqual(again.alarms, {})
+
+    def test_the_pool_alarm_fires_under_rest_left_and_only_where_the_policy_asks(self) -> None:
+        self.seen(800, NOW, NOW + 1200)
+        self.policy(pool=False)
+        self.daemon.check_alarms()
+        self.assertEqual(self.told_lines(), [])
+        self.policy(pool=True)
+        self.daemon.check_alarms()
+        told = self.told_lines()
+        self.assertEqual(len(told), 1, told)
+        self.assertIn("--severity warn", told[0])
+        self.assertIn("800 left", told[0])
+
+    def test_a_cleared_alarm_says_so_once_and_a_restart_does_not_resend(self) -> None:
+        self.policy(pool=True)
+        self.seen(800, NOW, NOW + 1200)
+        self.daemon.check_alarms()
+        self.seen(1500, NOW + 30, NOW + 1200)
+        self.daemon.check_alarms()
+        self.assertEqual([n["level"] for n in self.notice_lines()], ["warn", "info"])
+        again = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=None)
+        again.clock_real = False
+        again.policy = self.daemon.policy
+        again.now, again.budget = NOW + 60, {"rest": {"limit": 5000, "remaining": 700, "reset": NOW + 1200,
+                                                      "seenAt": NOW + 60}}
+        again.check_alarms()
+        self.assertEqual(len(self.told_lines()), 1)  # within the hour of the first
+
+    def test_the_share_alarm_names_the_routes_that_spent_it(self) -> None:
+        self.policy()
+        self.daemon.policy = {**self.daemon.policy, "restShare": 0.06}  # a cap of 300
+        self.daemon.transport = lambda *a: (200, {}, b"{}")
+        with self.daemon.calling("run", "o/r"):
+            for n in range(80):  # 80 in 10 minutes is 480 an hour: past 300 + 150
+                self.daemon.request("GET", f"/repos/o/r/actions/runs/{n}/jobs?per_page=100")
+        with self.daemon.calling("outbox", "o/r"):
+            for n in range(200):  # sessions' writes are not the share's
+                self.daemon.request("POST", f"/repos/o/r/issues/{n}/comments", content=True)
+        self.daemon.check_alarms()
+        told = self.told_lines()
+        self.assertEqual(len(told), 1, told)
+        self.assertIn("480/h against its cap of 300", told[0])
+        self.assertIn("GET /repos/{owner}/{repo}/actions/runs/{id}/jobs?per_page 80 (run o/r)", told[0])
+
+    def test_an_alarm_with_no_inbox_still_writes_its_notice(self) -> None:
+        gg.ALARM_CMD = Path(self.tmp.name) / "missing"
+        self.policy(pool=True)
+        self.seen(500, NOW, NOW + 1200)
+        self.daemon.check_alarms()
+        self.assertEqual(self.notice_lines()[0]["data"]["severity"], "warn")
+
+    def test_policy_reads_alarms(self) -> None:
+        fleet = Path(self.tmp.name) / "fleet.json"
+        for name in ("FLEET_POLICY", "UPDATE_CONFIG", "DAEMON_CONFIG"):
+            self.addCleanup(setattr, gg, name, getattr(gg, name))
+            setattr(gg, name, Path(self.tmp.name) / f"{name.lower()}.json")
+        self.assertEqual(gg.daemon_policy()["alarms"], {"pool": False, "share": True, "restLeft": 1000})
+        gg.DAEMON_CONFIG.write_text(json.dumps({"alarms": {"pool": True, "share": False, "restLeft": 2000}}))
+        self.assertEqual(gg.daemon_policy()["alarms"], {"pool": True, "share": False, "restLeft": 2000})
+        del fleet
 
 
 class DaemonPolicyTest(Base):
