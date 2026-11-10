@@ -2500,6 +2500,8 @@ class Daemon:
                 continue
             if item.get("joinedInto") and self.post_member(path, item):
                 continue  # it goes out in (or went out with) its leader's comment: no request of its own
+            if self.backoff["rest"] > self.now and not (item.get("kind") == "comment" and self.post_over_graphql(item)):
+                continue  # REST's hour is spent (rest_out): it waits for the reset; a comment behind it goes over GraphQL
             self.writing = True
             try:
                 with self.calling("outbox", str(item.get("repo") or "")):
@@ -2582,6 +2584,8 @@ class Daemon:
             if item["kind"] == "comment":
                 self.note_status(item, doc.get("node_id"), doc.get("id"), doc.get("html_url"))
             self.post_delivered(path, item, doc, note=note)
+        elif self.rest_out(status, h, text):
+            write_json(path, item)  # nothing was written: GraphQL posts it if it can, else it waits for REST's reset
         elif status in {403, 422, 429} and (THROTTLED.search(text) or status == 429 or h.get("retry-after")
                                             or h.get("x-ratelimit-remaining") == "0"):
             self.post_hold_for(h, path, item)
@@ -2689,8 +2693,11 @@ class Daemon:
             regrade.pop("error", None)
         else:
             regrade.update(state="failed", error=f"label removal HTTP {status}")
-            if status in {403, 422, 429} and (status == 429 or h.get("retry-after")
-                    or h.get("x-ratelimit-remaining") == "0" or THROTTLED.search(json.dumps(answer)[:2000])):
+            text = json.dumps(answer)[:2000]
+            if self.rest_out(status, h, text):
+                pass  # REST's hour, not a secondary limit: comments go on over GraphQL
+            elif status in {403, 422, 429} and (status == 429 or h.get("retry-after")
+                    or h.get("x-ratelimit-remaining") == "0" or THROTTLED.search(text)):
                 self.post_hold_for(h, path, item)
 
     def post_find(self, item: dict) -> tuple[dict | None, bool]:
@@ -2901,6 +2908,22 @@ class Daemon:
         return bool(errors) and not any(e.get("type") in GQL_REFUSALS for e in errors) and all(
             e.get("type") in GQL_TRANSIENT_TYPES or GQL_TRANSIENT.search(str(e.get("message") or ""))
             for e in errors)
+
+    def rest_out(self, status: int, h: dict, text: str) -> bool:
+        """REST's own hourly limit (a 403 or 429 with no requests left, and no secondary limit named): nothing was
+        written. REST is backed off until its reset, so the next turn sends a comment over GraphQL (post_over_graphql)
+        and only writes REST alone can make wait, as gql_out does the other way. Before, it held every queued write
+        until REST's reset: on 2026-11-10 receipts queued 10 to 48 deep in an hour while GraphQL had points."""
+        if status not in {403, 429} or h.get("x-ratelimit-remaining") != "0" or h.get("retry-after") \
+                or THROTTLED.search(text):
+            return False
+        try:
+            until = float(h.get("x-ratelimit-reset") or 0)
+        except ValueError:
+            until = 0.0
+        self.backoff["rest"] = max(self.backoff["rest"], until, self.now + CYCLE)
+        log({"event": "post-rest-out", "until": round(self.backoff["rest"])})
+        return True
 
     def gql_out(self, status: int, h: dict, doc: Any) -> bool:
         """GraphQL's own hourly limit (a RATE_LIMITED error, or no points left and no secondary limit named): nothing

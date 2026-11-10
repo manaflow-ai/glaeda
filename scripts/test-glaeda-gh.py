@@ -10739,6 +10739,30 @@ class PostJoinTest(unittest.TestCase):
         self.assertEqual(t.calls[-1][1], "/repos/o/r/issues/7/comments")
         self.assertEqual(gg.post_state(item["id"])["state"], "posted")
 
+    def test_rest_spent_routes_the_comment_over_graphql_not_a_hold(self) -> None:
+        """2026-11-10: receipts queued 10 to 48 deep while REST's hour was spent and GraphQL had points."""
+        item = self.queue("comment", "o/r#7", "--body", "landed")
+        pr = self.queue("pr", "o/r", "--head", "lane/x", "--base", "main", "--title", "t", "--body", "b")
+        spent = (403, {"x-ratelimit-remaining": "0", "x-ratelimit-reset": str(int(NOW + 900))},
+                 {"message": "API rate limit exceeded for user"})
+        d, t = self.daemon(spent, self.subject(), self.made("IC_9", "u"))
+        d.budget = {"graphql": {"limit": 5000, "remaining": 300, "reset": NOW + 3000},
+                    "rest": {"limit": 5000, "remaining": 4900, "reset": NOW + 3000}}  # REST reads richer
+        gg.write_json(gg.BASE / gg.POST_SUBJECTS, {})
+        self.step(d, NOW)
+        self.assertEqual(t.calls[0][:2], ("POST", "/repos/o/r/issues/7/comments"))
+        self.assertLessEqual(d.post_hold, NOW + gg.POST_SPACING)  # not held
+        self.assertGreaterEqual(d.backoff["rest"], NOW + 900)
+        self.step(d, NOW + gg.POST_SPACING)
+        self.step(d, NOW + 2 * gg.POST_SPACING)
+        self.assertEqual(gg.post_state(item["id"])["state"], "posted")
+        self.assertTrue(all(c[1] == "/graphql" for c in t.calls[1:]), t.calls)
+        self.assertEqual(gg.post_state(pr["id"])["state"], "queued")  # REST alone writes it: it waits for the reset
+        t.answers.append((201, {}, {"html_url": "https://github.com/o/r/pull/9", "number": 9}))
+        self.step(d, NOW + 901)
+        self.assertEqual(t.calls[-1][:2], ("POST", "/repos/o/r/pulls"))
+        self.assertEqual(gg.post_state(pr["id"])["state"], "posted")
+
     def test_an_edit_is_recorded_before_it_is_sent(self) -> None:
         d, t, first, second = self.status_pair("IC_1")
         t.answers[-1] = gg.WatchError("connection reset")  # the answer to the edit is lost
