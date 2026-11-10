@@ -773,18 +773,42 @@ def route_waiter(r: dict) -> str:
     return f"; waiter {r['topWaiter']}" if r.get("topWaiter") else ""
 
 
-def host_spenders(run: Callable[..., Any] = subprocess.run) -> list[dict]:
-    """This host's top REST spenders on the shared login over the last hour (SPENDERS_CMD usage --json), [] when it
-    cannot say. Each row is {caller, rest, graphql, source}."""
+def host_spenders(run: Callable[..., Any] = subprocess.run) -> tuple[list[dict], int | None]:
+    """This host's top REST spenders on the shared login over the last hour (SPENDERS_CMD usage --json), with the REST
+    all its callers spent: ([], None) when it cannot say. Each row is {caller, rest, graphql, source}."""
     try:
         done = run([SPENDERS_CMD, "usage", "--json"], capture_output=True, text=True, timeout=SPENDERS_TIMEOUT)
         rows = json.loads(done.stdout or "[]")
     except (OSError, subprocess.SubprocessError, ValueError):
-        return []
-    rows = [r for r in rows if isinstance(r, dict) and isinstance(r.get("rest"), int) and r.get("rest") > 0] \
-        if isinstance(rows, list) else []
+        return [], None
+    if not isinstance(rows, list):
+        return [], None
+    rows = [r for r in rows if isinstance(r, dict) and isinstance(r.get("rest"), int) and not isinstance(r["rest"], bool)
+            and r["rest"] > 0]
     rows.sort(key=lambda r: (-r["rest"], str(r.get("caller"))))
-    return [{k: r.get(k) for k in ("caller", "rest", "graphql", "source")} for r in rows[:SPENDERS_TOP]]
+    return ([{k: r.get(k) for k in ("caller", "rest", "graphql", "source")} for r in rows[:SPENDERS_TOP]],
+            sum(r["rest"] for r in rows))
+
+
+# The pool alarm names the part of the pool's pace that no log on this host holds, once it is this share of the pace
+# and at least UNLOGGED_MIN an hour. GitHub's limit is the login's, on every host signed in to it and every token of
+# it: on 2026-11-10 cosmic-gray's logs held about 64 of the pool's 180 a minute, and every alarm named only those.
+UNLOGGED_SHARE = 0.25
+UNLOGGED_MIN = 300
+
+
+def unlogged_text(per_minute: float | None, host_rest: int | None) -> tuple[str, int | None]:
+    """(" About G an hour ... ", G) when the pool's pace (PER_MINUTE) is past what this host's callers spent in the
+    last hour (HOST_REST) by UNLOGGED_SHARE and UNLOGGED_MIN, else ("", None)."""
+    if not per_minute or host_rest is None:
+        return "", None
+    pace = per_minute * 60
+    gap = round(pace - host_rest)
+    if gap < UNLOGGED_MIN or gap < UNLOGGED_SHARE * pace:
+        return "", None
+    return (f" About {gap} REST an hour ({gap / pace:.0%} of the pool's pace) is in no log on {policy_host()}: other "
+            f"hosts signed in to this login (their `{Path(SPENDERS_CMD).name} usage`), or its token used outside gh.",
+            gap)
 
 
 def spenders_text(rows: list[dict]) -> str:
@@ -2321,9 +2345,10 @@ class Daemon:
                     changed = True
                 continue
             if name == "pool":  # read only when it is sent: at most a few times an hour
-                spenders = host_spenders()
-                data = {**data, "spenders": spenders}
-                text += " " + spenders_text(spenders)
+                spenders, host_rest = host_spenders()
+                gap_text, gap = unlogged_text(data.get("perMinute"), host_rest)
+                data = {**data, "spenders": spenders, "hostRest": host_rest, "unlogged": gap}
+                text += " " + spenders_text(spenders) + gap_text
             self.send_alarm(name, level, text, data)
             self.alarms[name] = {"at": self.now, "level": level, "text": text,
                                  **({"reset": data["reset"]} if "reset" in data else {})}

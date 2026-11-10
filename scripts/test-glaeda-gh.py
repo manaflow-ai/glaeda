@@ -11655,6 +11655,25 @@ class SpendAlarmTest(Base):
         self.assertIn("last hour: gcp-agent-lane-2 1200 (lane-gh-broker); tool:pr_owner.py 900 (gh shim).", told[0])
         self.assertNotIn("session:quiet", told[0])
         self.assertEqual(self.notice_lines()[-1]["data"]["spenders"][0]["caller"], "gcp-agent-lane-2")
+        # 60 a minute is 3600 an hour; this host's callers spent 2100 of it
+        self.assertIn("About 1500 REST an hour (42% of the pool's pace) is in no log on", told[0])
+        self.assertEqual((self.notice_lines()[-1]["data"]["hostRest"], self.notice_lines()[-1]["data"]["unlogged"]),
+                         (2100, 1500))
+
+    def test_the_pool_alarm_names_no_gap_when_this_host_spent_the_pace(self) -> None:
+        """The gap is named only past a quarter of the pace and UNLOGGED_MIN: here this host's callers spent it all."""
+        self.policy(pool=True)
+        self.spenders([{"caller": "gcp-agent-lane-2", "rest": 3500, "graphql": 0, "source": "lane-gh-broker"}])
+        reset = NOW + 3000
+        self.seen(4900, NOW, reset)
+        self.daemon.check_alarms()
+        self.seen(4300, NOW + 600, reset)
+        self.daemon.check_alarms()
+        told = self.told_lines()
+        self.assertEqual(len(told), 1, told)
+        self.assertNotIn("in no log on", told[0])
+        self.assertIsNone(self.notice_lines()[-1]["data"]["unlogged"])
+        self.assertEqual(gg.unlogged_text(60.0, None), ("", None))  # usage could not say: nothing is guessed
 
     def test_the_pace_alarm_is_off_at_a_zero_share(self) -> None:
         for name in ("FLEET_POLICY", "UPDATE_CONFIG", "DAEMON_CONFIG"):
