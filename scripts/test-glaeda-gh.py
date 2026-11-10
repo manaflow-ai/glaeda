@@ -11655,25 +11655,59 @@ class SpendAlarmTest(Base):
         self.assertIn("last hour: gcp-agent-lane-2 1200 (lane-gh-broker); tool:pr_owner.py 900 (gh shim).", told[0])
         self.assertNotIn("session:quiet", told[0])
         self.assertEqual(self.notice_lines()[-1]["data"]["spenders"][0]["caller"], "gcp-agent-lane-2")
-        # 60 a minute is 3600 an hour; this host's callers spent 2100 of it
-        self.assertIn("About 1500 REST an hour (42% of the pool's pace) is in no log on", told[0])
+        # the pool spent 5000 - 4300 = 700 since its window opened; this host's callers logged 2100 in the hour: no gap
+        self.assertNotIn("in no log on", told[0])
         self.assertEqual((self.notice_lines()[-1]["data"]["hostRest"], self.notice_lines()[-1]["data"]["unlogged"]),
-                         (2100, 1500))
+                         (2100, None))
 
-    def test_the_pool_alarm_names_no_gap_when_this_host_spent_the_pace(self) -> None:
-        """The gap is named only past a quarter of the pace and UNLOGGED_MIN: here this host's callers spent it all."""
+    def test_the_pool_alarm_names_rest_no_log_on_this_host_holds(self) -> None:
+        """2026-11-10: the pool drained 180 a minute while cosmic-gray's logs held about 64."""
         self.policy(pool=True)
-        self.spenders([{"caller": "gcp-agent-lane-2", "rest": 3500, "graphql": 0, "source": "lane-gh-broker"}])
-        reset = NOW + 3000
-        self.seen(4900, NOW, reset)
+        self.spenders([{"caller": "gcp-agent-lane-2", "rest": 900, "graphql": 0, "source": "lane-gh-broker"}])
+        reset = NOW + 1200  # the window opened 40 min ago
+        self.seen(2000, NOW, reset)
         self.daemon.check_alarms()
-        self.seen(4300, NOW + 600, reset)
+        self.seen(1000, NOW + 600, reset)
         self.daemon.check_alarms()
         told = self.told_lines()
         self.assertEqual(len(told), 1, told)
-        self.assertNotIn("in no log on", told[0])
-        self.assertIsNone(self.notice_lines()[-1]["data"]["unlogged"])
-        self.assertEqual(gg.unlogged_text(60.0, None), ("", None))  # usage could not say: nothing is guessed
+        self.assertIn("At least 3100 of the 4000 REST the pool spent in the last 50 min (78%) is in no log on", told[0])
+        self.assertEqual(self.notice_lines()[-1]["data"]["unlogged"], 3100)
+
+    def test_a_logged_burst_after_an_idle_hour_is_not_called_unlogged(self) -> None:
+        """#1936 review F1: 50 idle minutes, then 600 logged requests in 10 minutes. The pace reads 3600 an hour, but
+        the pool spent 600 and this host logged all 600: nothing is unlogged."""
+        self.assertEqual(gg.unlogged_text(5000, 4400, NOW + 600, NOW, 600), ("", None))
+        self.assertEqual(gg.unlogged_text(5000, 4400, NOW + 600, NOW, 0)[1], 600)  # the same burst, none of it logged
+
+    def test_a_usage_command_that_fails_or_says_nothing_is_unknown(self) -> None:
+        """#1936 review F2: a failed or empty usage read was hostRest 0, and the alarm called it all unlogged."""
+        for out, code in (("", 0), ("", 1), ("[]", 1), ("not json", 0)):
+            with self.subTest(out=out, code=code):
+                cmd = Path(self.tmp.name) / "gh-quota"
+                cmd.write_text(f"#!/bin/sh\nprintf '%s' '{out}'\nexit {code}\n")
+                cmd.chmod(0o755)
+                gg.SPENDERS_CMD = os.fspath(cmd)
+                self.assertEqual(gg.host_spenders(), ([], None))
+        self.spenders([])
+        self.assertEqual(gg.host_spenders(), ([], 0))  # it answered: this host spent nothing
+        self.assertEqual(gg.unlogged_text(5000, 1000, NOW + 600, NOW, None), ("", None))
+
+    def test_a_counter_that_expired_during_the_usage_read_gives_no_gap(self) -> None:
+        # 4,500 requests, all logged; the tick began before the reset, usage finished after it and its rolling hour
+        # kept 3,300: the expired counter must not call 1,200 unlogged.
+        self.assertEqual(gg.unlogged_text(5000, 500, NOW, NOW + 5, 3300), ("", None))
+        self.assertEqual(gg.unlogged_text(5000, 500, NOW, NOW, 3300), ("", None))  # at the reset itself too
+        self.assertEqual(gg.unlogged_text(5000, 500, NOW + 5, NOW, 3300)[1], 1200)  # before it, the same numbers count
+
+    def test_a_window_just_after_a_reset_is_too_early_to_measure(self) -> None:
+        """#1937 review: two minutes after a reset, 100 spent and none logged is no measure; the alarm says it is too
+        early, never that nothing is unlogged."""
+        text, gap = gg.unlogged_text(5000, 4900, NOW + 3480, NOW, 0)
+        self.assertIsNone(gap)
+        self.assertIn("Too early in GitHub's window (2 min old)", text)
+        self.assertEqual(gg.unlogged_text(5000, 4900, NOW + 3480, NOW, None), ("", None))  # unknown still says nothing
+        self.assertIsNotNone(gg.unlogged_text(5000, 3000, NOW + 2900, NOW, 0)[1])  # 11 min in: measured
 
     def test_the_pace_alarm_is_off_at_a_zero_share(self) -> None:
         for name in ("FLEET_POLICY", "UPDATE_CONFIG", "DAEMON_CONFIG"):

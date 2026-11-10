@@ -778,7 +778,9 @@ def host_spenders(run: Callable[..., Any] = subprocess.run) -> tuple[list[dict],
     all its callers spent: ([], None) when it cannot say. Each row is {caller, rest, graphql, source}."""
     try:
         done = run([SPENDERS_CMD, "usage", "--json"], capture_output=True, text=True, timeout=SPENDERS_TIMEOUT)
-        rows = json.loads(done.stdout or "[]")
+        if done.returncode != 0 or not (done.stdout or "").strip():
+            return [], None  # it could not say: an empty answer is not "spent nothing" (#1936 review)
+        rows = json.loads(done.stdout)
     except (OSError, subprocess.SubprocessError, ValueError):
         return [], None
     if not isinstance(rows, list):
@@ -790,25 +792,36 @@ def host_spenders(run: Callable[..., Any] = subprocess.run) -> tuple[list[dict],
             sum(r["rest"] for r in rows))
 
 
-# The pool alarm names the part of the pool's pace that no log on this host holds, once it is this share of the pace
-# and at least UNLOGGED_MIN an hour. GitHub's limit is the login's, on every host signed in to it and every token of
-# it: on 2026-11-10 cosmic-gray's logs held about 64 of the pool's 180 a minute, and every alarm named only those.
+# The pool alarm names the REST no log on this host holds, once it is this share of what the pool spent and at least
+# UNLOGGED_MIN. GitHub's limit is the login's, on every host signed in to it and every token of it: on 2026-11-10
+# cosmic-gray's logs held about 64 of the pool's 180 a minute, and every alarm named only those.
 UNLOGGED_SHARE = 0.25
 UNLOGGED_MIN = 300
+UNLOGGED_EARLY = 600  # a window younger than this is too early to measure (#1937 review)
 
 
-def unlogged_text(per_minute: float | None, host_rest: int | None) -> tuple[str, int | None]:
-    """(" About G an hour ... ", G) when the pool's pace (PER_MINUTE) is past what this host's callers spent in the
-    last hour (HOST_REST) by UNLOGGED_SHARE and UNLOGGED_MIN, else ("", None)."""
-    if not per_minute or host_rest is None:
+def unlogged_text(limit: int | None, remaining: int | None, reset: float | None, now: float,
+                  host_rest: int | None) -> tuple[str, int | None]:
+    """(" At least G of the U REST ... ", G) for the REST no log on this host holds, else ("", None). Both sides
+    cover the same requests, so a burst is not taken for a rate (#1936 review): U is what GitHub says the pool spent
+    since its window opened (LIMIT - REMAINING, at most an hour back from RESET), and HOST_REST is every logged call
+    on this host in the last hour, which holds that window. G = U - HOST_REST can only understate what is unlogged.
+    NOW is read after the usage read: a long tick can cross RESET first (#1937 review)."""
+    if host_rest is None or not isinstance(limit, int) or not isinstance(remaining, int) or reset is None:
         return "", None
-    pace = per_minute * 60
-    gap = round(pace - host_rest)
-    if gap < UNLOGGED_MIN or gap < UNLOGGED_SHARE * pace:
+    if reset <= now:  # the counter expired while usage ran: the host's hour has dropped requests it still counts
         return "", None
-    return (f" About {gap} REST an hour ({gap / pace:.0%} of the pool's pace) is in no log on {policy_host()}: other "
-            f"hosts signed in to this login (their `{Path(SPENDERS_CMD).name} usage`), or its token used outside gh.",
-            gap)
+    since = max(0.0, min(3600.0, 3600.0 - (reset - now)))
+    if since < UNLOGGED_EARLY:  # a fresh window has spent too little to compare: say so, never "nothing unlogged"
+        return (f" Too early in GitHub's window ({since / 60:.0f} min old) to say how much REST no log on "
+                f"{policy_host()} holds.", None)
+    used = limit - remaining
+    gap = used - host_rest
+    if gap < UNLOGGED_MIN or gap < UNLOGGED_SHARE * used:
+        return "", None
+    return (f" At least {gap} of the {used} REST the pool spent in the last {since / 60:.0f} min ({gap / used:.0%}) is "
+            f"in no log on {policy_host()}: other hosts signed in to this login (their `{Path(SPENDERS_CMD).name} "
+            f"usage`), or its token used outside gh.", gap)
 
 
 def spenders_text(rows: list[dict]) -> str:
@@ -2346,7 +2359,8 @@ class Daemon:
                 continue
             if name == "pool":  # read only when it is sent: at most a few times an hour
                 spenders, host_rest = host_spenders()
-                gap_text, gap = unlogged_text(data.get("perMinute"), host_rest)
+                gap_text, gap = unlogged_text((self.budget.get("rest") or {}).get("limit") or 5000,
+                                              data.get("remaining"), data.get("reset"), self.clock(), host_rest)
                 data = {**data, "spenders": spenders, "hostRest": host_rest, "unlogged": gap}
                 text += " " + spenders_text(spenders) + gap_text
             self.send_alarm(name, level, text, data)
