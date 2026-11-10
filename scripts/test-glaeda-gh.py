@@ -12022,6 +12022,8 @@ class DaemonPolicyTest(Base):
         self.assertLessEqual(sum(shares), doc["maxRestShare"])
         # 0.1: REST is what gh, landers and reruns must use; the daemons read over GraphQL (2026-10-30)
         self.assertLessEqual(doc["maxRestShare"], 0.1)
+        # the share is a hard cap: no layer of the fleet's config lets a daemon yield past it into the pool (hq#8948)
+        self.assertEqual([layer for layer in (doc["default"], *doc["hosts"].values()) if "restYield" in layer], [])
 
     def test_the_shipped_fleet_policy_keeps_a_graphql_reserve_for_lands(self) -> None:
         """config/gh-daemon.json: every daemon stops GraphQL below 1000 left, the share of the hour kept for lands,
@@ -12150,84 +12152,50 @@ class DaemonPolicyTest(Base):
         self.daemon.tick(NOW)
         self.assertEqual(self.gh.rest_calls(), [])
 
-    def test_the_share_yields_while_graphql_is_out_and_rest_is_above_its_floor(self) -> None:
-        """A host whose REST share is spent (or 0) still reads over REST while GraphQL cannot, down to REST's floor."""
+    def test_the_share_is_a_hard_cap_while_graphql_is_out(self) -> None:
+        """hq#8948: a daemon past its REST share (or with share 0) never spends the shared pool because GraphQL is low.
+        Every daemon used to yield the cap again (at least 150): cosmic-gray 548 to 613 an hour on a cap of 300."""
         self.configure({"restShare": 0.0})
-        self.daemon.policy = gg.daemon_policy()
+        self.daemon.now = NOW
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4000, "reset": NOW + 3000},
+                              "graphql": {"limit": 5000, "remaining": 10, "reset": NOW + 3000}}
+        self.assertTrue(self.daemon.past_share())
+        self.assertEqual(self.daemon.rest_yield(), 0)
+        self.assertFalse(self.daemon.rest_room(1))
+        self.assertTrue(self.daemon.rest_capped())
+        self.assertEqual({k: self.daemon.route(k) for k in ("comment", "head")}, {"comment": "graphql", "head": "graphql"})
+        # GraphQL stopped too: the run waits on what the cache holds, and no REST is sent
+        self.gh.runs[7] = {"id": 7, "status": "in_progress", "html_url": "u"}
+        gg.register("run:o/r/7")
+        self.daemon.tick(NOW)
+        self.assertEqual(self.gh.rest_calls(), [])
+        self.configure({"restShare": 0.06})  # a cap of 300 and nothing past it, GraphQL out or not
+        self.daemon.rest_minutes = {}
+        self.spend_rest(290)
+        self.assertTrue(self.daemon.rest_room(10))
+        self.assertFalse(self.daemon.rest_room(11))
+
+    def test_a_host_override_still_sets_a_bounded_yield_and_bad_values_keep_none(self) -> None:
+        """restYield is a host's local override only (the fleet config may not set it); with it the yield stays
+        above the pool's floor, and holds once GraphQL can read."""
+        self.configure({"restShare": 0.0, "restYield": 1000})
         self.daemon.now = NOW
         floor = gg.FLOORS["rest"][0]
         self.daemon.budget = {"rest": {"limit": 5000, "remaining": floor + 20, "reset": NOW + 1800},
                               "graphql": {"limit": 5000, "remaining": 10, "reset": NOW + 1800}}
         self.assertTrue(self.daemon.rest_room(2))
         self.assertFalse(self.daemon.rest_room(21))  # it would take REST below its floor
-        # nor is REST "capped" for routing then: every kind, the GraphQL ones too, goes to REST
-        self.daemon.budget["rest"]["remaining"] = 4000
-        self.assertFalse(self.daemon.rest_capped())
-        self.assertEqual({k: self.daemon.route(k) for k in gg.CYCLES},
-                         {"pr": "rest", "run": "rest", "comment": "rest", "head": "rest"})
-        self.daemon.budget["rest"]["remaining"] = floor + 20
         self.daemon.budget["graphql"]["remaining"] = 4000  # GraphQL can read: the share holds again
         self.assertFalse(self.daemon.rest_room(1))
-        self.daemon.budget["graphql"]["remaining"] = 10
-        self.gh.runs[7] = {"id": 7, "status": "in_progress", "html_url": "u"}
-        gg.register("run:o/r/7")
-        self.daemon.tick(NOW)
-        self.assertEqual(len(self.gh.run_calls()), 1)
-        self.assertEqual(gg.read_cache("run:o/r/7")["via"], "rest")
-
-    def test_a_yielding_share_reads_over_rest_at_the_lean_pace(self) -> None:
-        """Past its share with GraphQL out, the daemon still reads over REST, but a quarter as often: on 2026-11-09 the
-        yield ran at the full cycle, 1,271 counted REST requests in 15 minutes from one host whose share is 300/h."""
-        self.configure({"restShare": 0.0})
-        self.daemon.now = NOW
-        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4000, "reset": NOW + 3000},
-                              "graphql": {"limit": 5000, "remaining": 10, "reset": NOW + 3000}}
-        self.assertTrue(self.daemon.past_share())
-        self.assertFalse(self.daemon.rest_capped())  # the share yields: REST still reads
-        self.assertEqual(self.daemon.mode("rest"), "lean")
-        self.assertEqual({k: self.daemon.route(k) for k in gg.CYCLES},
-                         {"pr": "rest", "run": "rest", "comment": "rest", "head": "rest"})
-        self.gh.runs[7] = {"id": 7, "status": "in_progress", "html_url": "u"}
-        gg.register("run:o/r/7")
-        self.daemon.tick(NOW)
-        self.assertEqual(len(self.gh.run_calls()), 1)
-        for later in (NOW + 61, NOW + 121, NOW + 181):
-            self.daemon.budget["rest"]["remaining"] = 4000
-            self.daemon.budget["graphql"] = {"limit": 5000, "remaining": 10, "reset": NOW + 3000}
-            gg.register("run:o/r/7")
-            self.daemon.tick(later)
-        self.assertEqual(len(self.gh.run_calls()), 1)  # the full cycle would have read it three more times
-        self.daemon.budget["rest"]["remaining"] = 4000
-        self.daemon.budget["graphql"] = {"limit": 5000, "remaining": 10, "reset": NOW + 3000}
-        gg.register("run:o/r/7")
-        self.daemon.tick(NOW + gg.CYCLE * gg.LEAN_FACTOR + 1)
-        self.assertEqual(len(self.gh.run_calls()), 2)
-
-    def test_the_yield_is_bounded_past_the_cap(self) -> None:
-        """GraphQL out: the share yields up to the cap again (REST_YIELD_MIN at least), then holds; restYield sets it."""
-        self.configure({"restShare": 0.06})  # a cap of 300, a yield of 300
-        self.daemon.now = NOW
-        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4000, "reset": NOW + 3000},
-                              "graphql": {"limit": 5000, "remaining": 10, "reset": NOW + 3000}}
-        self.spend_rest(590)
-        self.assertTrue(self.daemon.rest_room(10))
-        self.assertFalse(self.daemon.rest_room(11))
-        self.assertTrue(self.daemon.rest_capped())
-        self.configure({"restShare": 0.0})  # no share: the fallback still gets REST_YIELD_MIN
-        self.daemon.rest_minutes = {}
-        self.spend_rest(gg.REST_YIELD_MIN - 1)
-        self.assertTrue(self.daemon.rest_room(1))
-        self.assertFalse(self.daemon.rest_room(2))
-        self.configure({"restShare": 0.0, "restYield": 1000})
-        self.assertTrue(self.daemon.rest_room(500))
-        for bad in (1e9, -5, float("nan"), "300"):  # a typo keeps the default yield, never turns it off
+        for bad in (1e9, -5, float("nan"), "300"):  # a typo keeps the default: no yield
             self.configure({"restShare": 0.0, "restYield": bad})
-            self.assertEqual(self.daemon.rest_yield(), gg.REST_YIELD_MIN, bad)
+            self.assertEqual(self.daemon.rest_yield(), gg.REST_YIELD_DEFAULT, bad)
+        self.assertEqual(gg.REST_YIELD_DEFAULT, 0)
 
     def test_a_yielding_share_admits_head_consumers_and_paces_every_head(self) -> None:
         """Review F1/F2 at 99070e23: lean only for being past the share must still admit an unreserved consumer, and a
         reserved one's head must be read at most once per lean cycle too."""
-        self.configure({"restShare": 0.0})
+        self.configure({"restShare": 0.0, "restYield": 1000})  # a host override: with no yield the heads go to GraphQL
         sha = "a" * 40
         for consumer in ("session-1", "autoland"):
             self.daemon.now = NOW
@@ -12512,7 +12480,7 @@ class DaemonPolicyTest(Base):
         self.spend_rest(990)
         self.daemon.tick(NOW)
         status = gg.read_json(gg.BASE / "daemon.json")
-        self.assertEqual(status["restShare"], {"spent": 990, "cap": 2000, "yield": 2000, "share": 0.4, "capped": False})
+        self.assertEqual(status["restShare"], {"spent": 990, "cap": 2000, "yield": 0, "share": 0.4, "capped": False})
         lock = open(gg.BASE / "daemon.lock", "a+")
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
