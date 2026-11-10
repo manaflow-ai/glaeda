@@ -160,6 +160,14 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   A trusted exact-head cmux review receipt also wakes its existing risk grader immediately: one fresh
   PR read, then removal of the current risk tier (the grader restores it). Delivery and `riskRegrade`
   are recorded separately; a failed or uncertain label effect is reported without replaying the receipt.
+  Comments are cheaper three ways. Comments for one thread already queued together (within POST_JOIN_WINDOW)
+  go out as one, each body whole and in order under a rule, and every caller gets that comment's URL; a body
+  that a wait, a bot or a reader keys on (a `<!--` marker, a slash command, an @mention, a review receipt) is
+  never joined, nor another writer's, nor any on a thread a comment wait watches. A comment goes through GraphQL's addComment while
+  GraphQL is the richer bucket (the outbox's own reading: the daemon's REST share never holds writes). And a
+  comment queued with --status-key KEY edits the same writer's earlier KEY comment in place, over GraphQL,
+  while that is still the thread's last comment and no comment wait watches the thread. Comment waits see an
+  edit as new: a comment counts as said when it was created or last edited.
 - `wait file` and `wait pid` poll the local disk or process table once a second in one process. They
   exist so no session writes a sleep loop (the polling hook refuses those).
 
@@ -454,6 +462,39 @@ POST_UNREADABLE = 60  # a queue file unreadable this long after its last write i
 POST_BODY_MAX = 65536  # GitHub's limit for a comment, review or PR body
 POST_ID = re.compile(r"\d{13}-\d+-[0-9a-f]{6}")  # queued-at ms, client pid, random: sorts oldest first
 THROTTLED = re.compile(r"submitted too quickly|secondary rate limit|abuse detection", re.I)
+# Comments for one thread that are in the queue together, queued within POST_JOIN_WINDOW of the first, go out as one
+# comment: each body whole, in queue order, under a rule. Only what is already queued is joined (no write waits for a
+# partner): over 2026-11-10 01:00-02:00Z, 110 comments went to 53 threads, and holding each for 60 s would have
+# joined 3 of them while delaying all 110. A body that starts with a machine-read marker (`<!--`: review-running,
+# pr-owner, risk receipts), a slash command or an @mention, or carries a status key is never joined: its readers read
+# it whole, from its first line. Only one writer's comments are joined, and a join a wait began watching since is undone
+# before its retry (post_unjoin).
+POST_JOIN_WINDOW = 60
+POST_JOIN_RULE = "\n\n---\n\n"
+JOIN_MENTION = re.compile(r"(?<![\w.`])@[A-Za-z0-9][\w-]*")  # an @mention: a bot or a person is called; never joined
+# A comment queued with --status-key KEY is that writer's status on its thread: the next one from the same writer
+# ("by") with the same key edits it in place, over GraphQL, while it is still the thread's last comment, no comment
+# wait watches the thread, and it is under POST_STATUS_MAX old. router-review's review-running marker and its
+# verdict (one run token) were 2 comments per review, back to back: 25 of the 63 the shared login posted on the 20
+# busiest threads in that hour.
+POST_STATUS_MAX = 6 * 3600
+STATUS_KEY = re.compile(r"[\w.:=@/-]{1,120}")
+POST_STATUSES = "statuses.json"  # thread -> the last status comment the outbox posted there
+POST_SUBJECTS = "subjects.json"  # thread -> its GraphQL node id (an issue's or PR's id never changes)
+POST_EDITS = "edited.json"  # the comments the outbox edited in place: only their edits count as said again
+POST_EDITS_KEEP = 2000
+GQL_TRANSIENT = re.compile(r"something went wrong|timed? ?out|timeout|internal (?:server )?error|try (?:again|later)|"
+                           r"service unavailable|temporarily|loading", re.I)
+GQL_TRANSIENT_TYPES = frozenset({"INTERNAL", "INTERNAL_ERROR", "SERVICE_UNAVAILABLE", "TIMEOUT"})
+GQL_REFUSALS = frozenset({"NOT_FOUND", "FORBIDDEN", "UNPROCESSABLE", "ARGUMENT_ERROR", "INSUFFICIENT_SCOPES",
+                          "SAML_ERROR", "UNAUTHENTICATED"})
+SUBJECT_QUERY = """query($o: String!, $r: String!, $n: Int!) { repository(owner: $o, name: $r) {
+issueOrPullRequest(number: $n) { ... on Issue { id comments(last: 1) { nodes { id } } }
+... on PullRequest { id comments(last: 1) { nodes { id } } } } } }"""
+ADD_COMMENT = """mutation($s: ID!, $b: String!) { addComment(input: {subjectId: $s, body: $b}) {
+commentEdge { node { id databaseId url authorAssociation author { __typename login } } } } }"""
+EDIT_COMMENT = """mutation($c: ID!, $b: String!) { updateIssueComment(input: {id: $c, body: $b}) {
+issueComment { id databaseId url authorAssociation author { __typename login } } } }"""
 # Match cmux's base-owned risk classifier. This only wakes that classifier; it never grants SHIP authority.
 RISK_RECEIPT = re.compile(r"^\W*(?:independent\s+)?review\s*\(([^)\n]*)\)\s*:\W*(ship|block|fix|not ship|hold)(?![\w-])",
                           re.I)
@@ -598,7 +639,7 @@ def suites_contexts(suites: list[str] | str, runs: dict[str, list[dict]],
     return [node for s in suites for node in runs[s]], None
 
 
-COMMENT_FIELDS = f"""comments(last: {COMMENTS_LAST}) {{ totalCount nodes {{ databaseId url createdAt
+COMMENT_FIELDS = f"""comments(last: {COMMENTS_LAST}) {{ totalCount nodes {{ databaseId url createdAt lastEditedAt
 author {{ login }} body }} }}"""
 ISSUE_FIELDS = f"""__typename ... on Issue {{ url state {COMMENT_FIELDS} }}
 ... on PullRequest {{ url state {COMMENT_FIELDS} }}"""
@@ -1348,6 +1389,9 @@ def slim_comments(doc: Any) -> list[dict]:
     """An issue's REST comments in the GraphQL comment shape parse_comments reads (REST names an App's
     account `NAME[bot]`, GraphQL `NAME`)."""
     return [{"databaseId": c.get("id"), "url": c.get("html_url"), "createdAt": c.get("created_at"),
+             # REST has no lastEditedAt; updated_at past created_at is an edit (the outbox's status edits)
+             **({"lastEditedAt": c["updated_at"]} if c.get("updated_at") and c.get("updated_at") != c.get("created_at")
+                else {}),
              "author": {"login": re.sub(r"\[bot\]$", "", str((c.get("user") or {}).get("login") or ""))},
              "body": str(c.get("body") or "")[:COMMENT_BODY_MAX]}
             for c in doc if isinstance(c, dict)] if isinstance(doc, list) else []
@@ -1419,6 +1463,7 @@ def parse_comments(node: dict) -> dict:
     return {"url": node.get("url"), "state": node.get("state"), "type": node.get("__typename"),
             "total": comments.get("totalCount"),
             "comments": [{"id": c.get("databaseId"), "url": c.get("url"), "createdAt": c.get("createdAt"),
+                          **({"editedAt": c["lastEditedAt"]} if c.get("lastEditedAt") else {}),
                           "author": (c.get("author") or {}).get("login"),
                           "body": str(c.get("body") or "")[:COMMENT_BODY_MAX]}
                          for c in comments.get("nodes") or [] if c]}
@@ -2453,6 +2498,8 @@ class Daemon:
                 continue
             if (item.get("notBefore") or 0) > self.now:
                 continue
+            if item.get("joinedInto") and self.post_member(path, item):
+                continue  # it goes out in (or went out with) its leader's comment: no request of its own
             self.writing = True
             try:
                 with self.calling("outbox", str(item.get("repo") or "")):
@@ -2505,6 +2552,15 @@ class Daemon:
                 self.post_at = self.now
                 self.post_retry(path, item, "could not look for an earlier attempt", uncertain=True)
                 return
+        # a look that answered "not there": nothing landed, so a join may still be undone; it is resent over REST
+        resend = bool(item.pop("uncertain", False))
+        if item["kind"] == "comment" and not item.get("group"):
+            self.post_join(path, item)
+        elif item.get("group") and not item.get("delivered") \
+                and self.thread_watched(str(item["repo"]), item["number"]):
+            self.post_unjoin(path, item)  # a wait began watching the thread since the join: each goes out alone
+        if item["kind"] == "comment" and not resend and self.post_over_graphql(item):
+            return self.post_comment_graphql(path, item)
         method, api, body = post_request(item)
         write_json(path, {**item, "uncertain": True})  # a daemon that dies mid-request looks it up first
         try:
@@ -2523,6 +2579,8 @@ class Daemon:
         if 200 <= status < 300:
             self.post_backoff = POST_BACKOFF
             note = self.post_after(item, doc)
+            if item["kind"] == "comment":
+                self.note_status(item, doc.get("node_id"), doc.get("id"), doc.get("html_url"))
             self.post_delivered(path, item, doc, note=note)
         elif status in {403, 422, 429} and (THROTTLED.search(text) or status == 429 or h.get("retry-after")
                                             or h.get("x-ratelimit-remaining") == "0"):
@@ -2673,14 +2731,286 @@ class Daemon:
 
     def post_finish(self, path: Path, item: dict, url: str | None = None, number: Any = None,
                     note: str | None = None, error: str | None = None) -> None:
-        done = {k: v for k, v in item.items() if k not in {"body", "notBefore", "holdUntil"}}
+        done = {k: v for k, v in item.items() if k not in {"body", "ownBody", "notBefore", "holdUntil"}}
         done.update({"state": "failed" if error else "posted", "url": url, "number": number, "note": note,
                      "error": error, "finishedAt": self.now})
         write_json(posted_dir() / path.name, done)
         path.unlink(missing_ok=True)
+        for member in item.get("group") or []:  # one comment for all of them: each caller gets its URL
+            mpath = outbox_dir() / f"{member}.json"
+            other = read_json(mpath)
+            if isinstance(other, dict) and other.get("joinedInto") == item.get("id"):
+                self.post_finish(mpath, other, url=url, number=number, error=error,
+                                 note=f"posted in one comment with {len(item['group'])} other queued comment"
+                                      f"{'s' if len(item['group']) > 1 else ''} for this thread")
         with contextlib.suppress(Exception):  # answers this host's gh cache kept from before the write
             gh_cache_note_write(str(item.get("repo") or "").lower() or None, time.time(), gh_cache_post_scopes(item))
         log({"event": "post", "id": done.get("id"), "state": done["state"], "url": url, "error": error})
+
+    # -- the outbox's comments: joined per thread, over the richer bucket, a writer's status edited in place
+
+    @staticmethod
+    def joinable(item: dict) -> bool:
+        """Plain prose only: never anything a wait, a bot or a reader keys on (a slash command, an @mention, an HTML
+        marker, a review receipt), nor a status, nor a write already tried."""
+        body = str(item.get("body") or "")
+        first = next((line for line in body.splitlines() if line.strip()), "").strip()
+        return (item.get("kind") == "comment" and not item.get("status") and not item.get("uncertain")
+                and not item.get("delivered") and not item.get("group") and not item.get("joinedInto")
+                and not int(item.get("attempts") or 0) and isinstance(item.get("by"), str) and bool(item["by"])
+                and not first.startswith(("<!--", "/")) and not RISK_RECEIPT.match(first)
+                and not JOIN_MENTION.search(body))
+
+    def post_join(self, path: Path, item: dict) -> None:
+        """Join the comments queued for this thread within POST_JOIN_WINDOW of ITEM into ITEM's comment, in queue
+        order. Each member is marked joinedInto first, then the leader is written with the joined body and its
+        group: a crash between the two leaves members whose leader does not name them, and those are released
+        (post_member) instead of being posted twice."""
+        if not self.joinable(item) or self.thread_watched(str(item["repo"]), item["number"]):
+            return  # a wait watching the thread may match a member's first line: each goes out on its own
+        # at most what every comment reader keeps of a body (COMMENT_BODY_MAX characters): a member past it would
+        # drop out of the cached comment a wait matches (`--match READY` after a long comment)
+        members, size = [], len(str(item["body"]))
+        for other_path in sorted(outbox_dir().glob("*.json")):  # queue order
+            if other_path.stem <= path.stem:
+                continue  # the leader, and what was queued before it
+            other = read_json(other_path)
+            if not isinstance(other, dict) or other.get("id") != other_path.stem:
+                continue
+            if other.get("kind") not in {"comment", "review"} or other.get("repo") != item.get("repo") \
+                    or other.get("number") != item.get("number"):
+                continue  # another thread's write: it does not stand between this thread's comments
+            if (not self.joinable(other) or other.get("by") != item.get("by") or (other.get("notBefore") or 0) > self.now
+                    or not 0 <= float(other.get("queuedAt") or 0) - float(item.get("queuedAt") or 0) <= POST_JOIN_WINDOW):
+                break  # a write to this thread that stays on its own: nothing queued after it moves ahead of it
+            grown = size + len(POST_JOIN_RULE) + len(str(other["body"]))
+            if grown > COMMENT_BODY_MAX:
+                break
+            members.append((other_path, other))
+            size = grown
+        if not members:
+            return
+        for other_path, other in members:
+            write_json(other_path, {**other, "joinedInto": item["id"]})
+        item["group"] = [other["id"] for _, other in members]
+        item["ownBody"] = item["body"]
+        item["body"] = POST_JOIN_RULE.join([str(item["body"])] + [str(other["body"]) for _, other in members])
+        write_json(path, item)
+        log({"event": "post-join", "id": item["id"], "joined": item["group"]})
+
+    def post_unjoin(self, path: Path, item: dict) -> None:
+        """Undo a join not yet sent: the leader takes back its own body and its members, no longer named, are released
+        (post_member) and sent on their own."""
+        item["body"] = item.pop("ownBody", item["body"])
+        released = item.pop("group", [])
+        write_json(path, item)
+        log({"event": "post-unjoin", "id": item["id"], "released": released})
+
+    def post_member(self, path: Path, item: dict) -> bool:
+        """A member of a joined comment: True while its leader holds it (or once it took the leader's answer),
+        False when the leader does not name it (a join cut short), so it is sent on its own."""
+        leader = item["joinedInto"]
+        queued = read_json(outbox_dir() / f"{leader}.json")
+        if isinstance(queued, dict) and item["id"] in (queued.get("group") or []):
+            return True
+        done = read_json(posted_dir() / f"{leader}.json")
+        if not isinstance(queued, dict) and isinstance(done, dict) and item["id"] in (done.get("group") or []):
+            self.post_finish(path, item, url=done.get("url"), number=done.get("number"), error=done.get("error"),
+                             note="posted in one comment with other queued comments for this thread")
+            return True
+        item.pop("joinedInto", None)
+        write_json(path, item)
+        return False
+
+    def outbox_richness(self, bucket: str) -> float:
+        """richness() for the outbox: the daemon's own REST share does not hold sessions' writes."""
+        if self.backoff[bucket] > self.now:
+            return -1.0
+        seen = self.budget.get(bucket) or {}
+        limit = seen.get("limit") or 5000
+        reserve = self.policy["floors"][bucket][1]
+        if not seen or (seen.get("reset") or 0) <= self.now:
+            return max(0, limit - reserve) / FULL_WINDOW
+        return max(0, seen.get("remaining", limit) - reserve) / max(seen["reset"] - self.now, RICH_WINDOW_MIN)
+
+    def post_over_graphql(self, item: dict) -> bool:
+        """A comment goes through GraphQL's addComment while GraphQL is the richer bucket, as the reads choose (a
+        lost answer is looked for, and resent, over REST)."""
+        if item.get("uncertain"):
+            return False
+        if self.status_editable(item) and self.outbox_richness("graphql") > 0:
+            return True  # only GraphQL edits in place: a writer's status goes there while it has any points
+        seen = self.budget.get("graphql") or {}
+        if not seen or (seen.get("reset") or 0) <= self.now:
+            return False  # no live GraphQL reading: REST, as before
+        return self.outbox_richness("graphql") > max(self.outbox_richness("rest"), 0.0)
+
+    def status_editable(self, item: dict) -> dict | None:
+        """The writer's earlier status comment on this thread that ITEM may replace in place (not yet checked to be
+        the thread's last: post_comment_graphql reads that), else None."""
+        if item.get("kind") != "comment" or not item.get("status"):
+            return None
+        statuses = read_json(BASE / POST_STATUSES)
+        thread = f"{str(item['repo']).lower()}#{int(item['number'])}"
+        prior = statuses.get(thread) if isinstance(statuses, dict) else None
+        ok = (isinstance(prior, dict) and prior.get("key") == item["status"] and prior.get("by") == item.get("by")
+              and isinstance(prior.get("nodeId"), str) and self.now - float(prior.get("at") or 0) < POST_STATUS_MAX
+              and not self.thread_watched(str(item["repo"]), item["number"]))
+        return prior if ok else None
+
+    def thread_watched(self, repo: str, number: Any) -> bool:
+        """A comment wait is watching this thread: an edit in place would be a comment it never sees as new."""
+        return (watch_dir() / file_name(f"comment:{repo.lower()}#{int(number)}")).exists()
+
+    def note_status(self, item: dict, node_id: Any, database_id: Any, url: Any) -> None:
+        """Remember (or forget) the last status comment the outbox posted on this thread."""
+        thread = f"{str(item['repo']).lower()}#{int(item['number'])}"
+        statuses = read_json(BASE / POST_STATUSES)
+        statuses = statuses if isinstance(statuses, dict) else {}
+        if item.get("status") and isinstance(node_id, str) and node_id:
+            statuses[thread] = {"by": item.get("by"), "key": item["status"], "nodeId": node_id, "id": database_id,
+                                "url": url, "at": self.now}
+        elif thread not in statuses:
+            return
+        else:
+            statuses.pop(thread)
+        statuses = {k: v for k, v in statuses.items() if isinstance(v, dict)
+                    and self.now - float(v.get("at") or 0) < POST_STATUS_MAX}
+        write_json(BASE / POST_STATUSES, statuses)
+
+    def post_gql(self, query: str, variables: dict, reason: str) -> tuple[int, dict, Any]:
+        """One outbox GraphQL request: content, so a secondary limit holds the outbox; logged in the spend log."""
+        status, h, doc = self.request("POST", "/graphql", {"query": query, "variables": variables}, content=True)
+        rate = ((doc.get("data") or {}).get("rateLimit") or {}) if isinstance(doc, dict) else {}
+        cost = rate.get("cost") if isinstance(rate, dict) and isinstance(rate.get("cost"), int) else 1
+        self.gql_log.append((self.now, reason, cost))
+        self.note_spend("graphql", reason, 1, cost)
+        return status, h, doc
+
+    @staticmethod
+    def gql_throttled(status: int, h: dict, doc: Any) -> bool:
+        """A secondary limit, as the REST path tells one: a lasting 403 (scope, SSO, a block) fails the item
+        instead of holding every write."""
+        return (status == 429 or bool(h.get("retry-after"))
+                or (status in {403, 422, 200} and bool(THROTTLED.search(json.dumps(doc)[:4000] if doc else ""))))
+
+    @staticmethod
+    def gql_transient(errors: list[dict]) -> bool:
+        """GitHub's own failure answered as HTTP 200 (an internal error, a timeout): retried like a 5xx. A refusal
+        that names the request (NOT_FOUND, FORBIDDEN, a validation error) still fails the write."""
+        return bool(errors) and not any(e.get("type") in GQL_REFUSALS for e in errors) and all(
+            e.get("type") in GQL_TRANSIENT_TYPES or GQL_TRANSIENT.search(str(e.get("message") or ""))
+            for e in errors)
+
+    def gql_out(self, status: int, h: dict, doc: Any) -> bool:
+        """GraphQL's own hourly limit (a RATE_LIMITED error, or no points left and no secondary limit named): nothing
+        ran. GraphQL is backed off until its reset, so the next turn sends the write over REST (post_over_graphql)
+        instead of holding every queued write."""
+        # only a definite refusal: every error is RATE_LIMITED, or a 403 for the spent counter. A 200 that spent the
+        # last point on an internal error may still have written: that one is retried uncertain (post_find first)
+        errors = [e for e in (doc.get("errors") or []) if isinstance(e, dict)] if isinstance(doc, dict) else []
+        limited = bool(errors) and all(e.get("type") == "RATE_LIMITED" for e in errors)
+        spent = (h.get("x-ratelimit-remaining") == "0" and status == 403
+                 and not THROTTLED.search(json.dumps(doc)[:4000] if doc else ""))
+        if not (limited or spent):
+            return False
+        try:
+            until = float(h.get("x-ratelimit-reset") or 0)
+        except ValueError:
+            until = 0.0
+        self.backoff["graphql"] = max(self.backoff["graphql"], until, self.now + CYCLE)
+        return True
+
+    def post_comment_graphql(self, path: Path, item: dict) -> None:
+        """addComment (or, for the writer's own status, updateIssueComment) with the same queue semantics as REST:
+        uncertain while in flight, held on a secondary limit, retried on a 5xx, failed on a refusal."""
+        repo, number = str(item["repo"]), int(item["number"])
+        owner, name = repo.split("/", 1)
+        thread = f"{repo.lower()}#{number}"
+        subjects = read_json(BASE / POST_SUBJECTS)
+        subjects = subjects if isinstance(subjects, dict) else {}
+        prior = self.status_editable(item)
+        editable = prior is not None
+        subject, last = subjects.get(thread), None
+        if subject is None or editable:
+            try:
+                status, h, doc = self.post_gql(SUBJECT_QUERY, {"o": owner, "r": name, "n": number}, "outbox-subject")
+            except WatchError as error:
+                self.post_at = self.now
+                return self.post_retry(path, item, describe(error))  # a read: nothing was written
+            node = (((doc.get("data") or {}).get("repository") or {}).get("issueOrPullRequest") or {}) \
+                if isinstance(doc, dict) else {}
+            if self.gql_out(status, h, doc):
+                write_json(path, item)  # GraphQL is out (backed off): the next turn posts over REST
+                return None
+            if self.gql_throttled(status, h, doc):
+                return self.post_hold_for(h, path, item)
+            if status == 401:
+                return self.post_retry(path, item, "graphql subject: HTTP 401")  # request() re-reads the token
+            if status != 200 or not isinstance(node, dict) or not node.get("id"):
+                if (status >= 500 or not isinstance(doc, dict) or not doc.get("errors")
+                        or self.gql_transient([e for e in doc["errors"] if isinstance(e, dict)])):
+                    return self.post_retry(path, item, f"graphql subject: HTTP {status}")
+                message = str(((doc.get("errors") or [{}])[0] or {}).get("message") or "")[:200]
+                return self.post_finish(path, item, error=f"graphql: {message or 'no such issue or pull request'}")
+            subject = subjects[thread] = node["id"]
+            write_json(BASE / POST_SUBJECTS, dict(list(subjects.items())[-2000:]))
+            nodes = (node.get("comments") or {}).get("nodes") or []
+            last = nodes[-1] if nodes and isinstance(nodes[-1], dict) else None
+        if item.get("group") and self.thread_watched(repo, number):
+            self.post_unjoin(path, item)  # a wait began watching during the lookup: the leader goes out alone
+        edit = bool(editable and last and last.get("id") == prior.get("nodeId"))
+        if edit and isinstance(prior.get("id"), int):
+            # before the edit is sent: an edit that lands behind a lost answer is still one the waits see
+            edits = read_json(BASE / POST_EDITS)
+            edits = [x for x in edits if isinstance(x, int) and x != prior["id"]] if isinstance(edits, list) else []
+            write_json(BASE / POST_EDITS, (edits + [prior["id"]])[-POST_EDITS_KEEP:])
+        write_json(path, {**item, "uncertain": True})
+        try:
+            if edit:
+                status, h, doc = self.post_gql(EDIT_COMMENT, {"c": prior["nodeId"], "b": item["body"]}, "outbox")
+            else:
+                status, h, doc = self.post_gql(ADD_COMMENT, {"s": subject, "b": item["body"]}, "outbox")
+        except WatchError as error:
+            self.post_at = self.now
+            return self.post_retry(path, item, describe(error), uncertain=True)
+        except OutOfTime:
+            write_json(path, item)  # raised before anything was sent
+            raise
+        self.post_at = self.now
+        item["uncertain"] = False
+        doc = doc if isinstance(doc, dict) else {}
+        data = doc.get("data") if isinstance(doc.get("data"), dict) else {}
+        made = ((((data.get("addComment") or {}).get("commentEdge") or {}).get("node"))
+                or ((data.get("updateIssueComment") or {}).get("issueComment")))
+        errors = [e for e in doc.get("errors") or [] if isinstance(e, dict)]
+        text = json.dumps(errors)[:2000]
+        if status == 200 and isinstance(made, dict) and made.get("url"):
+            self.post_backoff = POST_BACKOFF
+            self.note_status(item, made.get("id"), made.get("databaseId"), made.get("url"))
+            note = "edited this writer's earlier status comment, the thread's last" if edit else None
+
+            author = made.get("author") if isinstance(made.get("author"), dict) else {}
+            # the REST answer's shape, for post_delivered's risk-receipt check
+            answer = {"html_url": made["url"], "author_association": made.get("authorAssociation"),
+                      "user": {"type": author.get("__typename"), "login": author.get("login")}}
+            return self.post_delivered(path, item, answer, note=note)
+        if status == 401:
+            return self.post_retry(path, item, "graphql: HTTP 401")  # refused before it ran; request() re-reads the token
+        if self.gql_out(status, h, doc):
+            write_json(path, item)  # not run: GraphQL is out, so the next turn sends it over REST
+            return None
+        if self.gql_throttled(status, h, doc):
+            return self.post_hold_for(h, path, item)
+        if status >= 500 or (status == 200 and (not errors or self.gql_transient(errors))):
+            # it may have landed: the retry looks for it over REST first (post_find)
+            return self.post_retry(path, item, f"graphql: HTTP {status}", uncertain=True)
+        if edit and any(e.get("type") == "NOT_FOUND" for e in errors):
+            self.note_status({**item, "status": None}, None, None, None)  # deleted: post it as a new comment
+            write_json(path, item)
+            return None
+        said = "; ".join(str(e.get("message") or e.get("type")) for e in errors) or str(doc.get("message") or "")
+        return self.post_finish(path, item, error=f"graphql: HTTP {status}: {said}"[:300])
 
     def post_prune(self) -> None:
         for path in posted_dir().glob("*.json") if posted_dir().is_dir() else []:
@@ -3286,6 +3616,8 @@ class Daemon:
 
     def upstream_refuse_posts(self) -> None:
         for path in sorted(outbox_dir().glob("*.json")) if outbox_dir().is_dir() else []:
+            if not path.exists():
+                continue  # a joined comment's member, finished with its leader
             item = read_json(path)
             self.post_finish(path, item if isinstance(item, dict) else {"id": path.stem},
                              error="this host reads GitHub through its upstream and has no login to post with")
@@ -4391,8 +4723,10 @@ class Daemon:
             if c.get("deleted"):
                 by_id.pop(c.get("id"), None)
             else:
+                edited = c.get("updated_at") if c.get("updated_at") not in {None, c.get("created_at")} else None
                 by_id[c.get("id")] = {"id": c.get("id"), "url": c.get("url"), "createdAt": c.get("created_at"),
-                                      "author": c.get("author"), "body": str(c.get("body") or "")[:COMMENT_BODY_MAX]}
+                                      "author": c.get("author"), "body": str(c.get("body") or "")[:COMMENT_BODY_MAX],
+                                      "editedAt": edited or (by_id.get(c.get("id")) or {}).get("editedAt")}
             data["comments"] = sorted(by_id.values(), key=lambda x: x.get("id") or 0)[-2 * COMMENTS_LAST:]
             self.store(key, e["cache"], data=data, dataAt=self.now, error=None)
             e["cache"] = read_cache(key)
@@ -6402,11 +6736,24 @@ def login(name: str | None) -> str:
     return re.sub(r"\[bot\]$", "", str(name or "").strip().lower().removeprefix("app/"))
 
 
+def outbox_edits() -> frozenset:
+    """The comment ids the outbox edited in place (POST_EDITS)."""
+    edits = read_json(BASE / POST_EDITS)
+    return frozenset(x for x in edits if isinstance(x, int)) if isinstance(edits, list) else frozenset()
+
+
 def comment_matches(c: dict, author: str | None, pattern: re.Pattern | None, since_id: int | None,
-                    since_time: float | None) -> bool:
+                    since_time: float | None, edited_ids: set | frozenset = frozenset()) -> bool:
+    """A comment the outbox edited in place (a writer's status, POST_STATUS_MAX; its ids in EDITED_IDS) was said
+    again when it was edited, so a wait that began before the edit, or names that comment, sees the new text.
+    Anyone else's edit (a typo fix, a ticked box, a bot's sticky comment) is not a new comment."""
+    edited = iso_epoch(c.get("editedAt")) if c.get("editedAt") and c.get("id") in edited_ids else None
     if since_id is not None and (c.get("id") or 0) <= since_id:
-        return False
-    if since_time is not None and (iso_epoch(c.get("createdAt")) or 0) < int(since_time):
+        # `--since` this very comment: an outbox edit of it is newer than it, whenever the wait began. An older one's
+        # edit is not (the outbox edits a comment only while it is the thread's last, so before the named one).
+        if edited is None or (c.get("id") or 0) < since_id:
+            return False
+    if since_time is not None and max(iso_epoch(c.get("createdAt")) or 0, edited or 0) < int(since_time):
         return False
     if author and login(c.get("author")) != login(author):
         return False
@@ -6458,7 +6805,9 @@ def cmd_wait_comment(target: str, timeout: float, as_json: bool, author: str | N
             emit(key, entry, as_json, {"result": "failure", "waited_s": waited})
             return EXIT_FAIL
         comments = ((entry or {}).get("data") or {}).get("comments") or []
-        found = next((c for c in comments if comment_matches(c, author, pattern, since_id, since_time)), None)
+        edits = outbox_edits()
+        found = next((c for c in comments if comment_matches(c, author, pattern, since_id, since_time, edits)),
+                     None)
         if found:
             if as_json:
                 print(json.dumps({"key": key, "result": "success", "waited_s": waited, "comment": found,
@@ -6474,7 +6823,7 @@ def cmd_wait_comment(target: str, timeout: float, as_json: bool, author: str | N
                 print(f"result: success\nwaited_s: {waited}")
             return EXIT_OK
         if now - start >= timeout:
-            newer = sum(1 for c in comments if comment_matches(c, None, None, since_id, since_time))
+            newer = sum(1 for c in comments if comment_matches(c, None, None, since_id, since_time, edits))
             where = "since the wait began" if not since else f"after {since}"
             hint = "; to include a reply posted before the wait, pass --since with your own comment's URL" if not since else ""
             emit(key, entry, as_json, {"result": "timeout", "waited_s": waited,
@@ -9743,6 +10092,13 @@ def post_item(args: argparse.Namespace) -> dict:
             raise WatchError("--head, --base, --title and --reviewer are for post pr")
         if args.kind == "comment" and args.event != "comment":
             raise WatchError("--event is for post review")
+        key = getattr(args, "status_key", None)
+        if key is not None and not isinstance(key, str):
+            key = None  # a caller's own namespace without the flag (an older argv, a test's Mock)
+        if key:
+            if args.kind != "comment" or not STATUS_KEY.fullmatch(key):
+                raise WatchError("--status-key is for post comment: letters, digits and . : = @ / - (120 at most)")
+            item["status"] = key
         item.update(repo=f"{m.group(1)}/{m.group(2)}", number=int(m.group(3)))
         if args.kind == "review":
             item["event"] = args.event.upper().replace("-", "_")
@@ -9874,6 +10230,12 @@ def cmd_post_status(post_id: str | None, wait: float, as_json: bool, queued: boo
         state = post_state(post_id) or state
     if as_json:
         print(json.dumps(state, indent=2, sort_keys=True))
+    elif state["state"] == "posted":
+        # stdout is the URL alone (`url=$(glaeda-gh post comment ...)`, then `wait comment --since "$url"`); a note
+        # (joined with other queued comments, an edit in place, an open PR found) goes to stderr
+        print(state.get("url") or "posted")
+        if state.get("note"):
+            print(f"glaeda-gh: {state['note']}", file=sys.stderr)
     else:
         print(post_line(state))
     if state["state"] == "queued" and queued and wait <= 0:
@@ -9995,6 +10357,9 @@ def parser() -> argparse.ArgumentParser:
                     help="review: the verdict (default comment)")
     po.add_argument("--wait", type=float, default=0, metavar="S",
                     help="seconds to wait for the URL (default 0: queue and return; the write survives the session)")
+    po.add_argument("--status-key", metavar="KEY",
+                    help="comment: this is your status KEY on the thread; your next comment with the same KEY edits "
+                         "this one in place while it is still the thread's last comment and nobody waits on it")
     po.add_argument("--json", action="store_true")
     sub.add_parser("read", help="an upstream's end: register the keys of one JSON request on stdin and print "
                                 "the cached entries (see upstream.json)")

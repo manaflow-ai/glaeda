@@ -10506,6 +10506,408 @@ class PostTest(unittest.TestCase):
         self.assertEqual(status["outbox"], {"queued": 1, "holdUntil": None})
 
 
+class PostJoinTest(unittest.TestCase):
+    """Leo, 2026-11-09, on sessions' queued comments: "when things get queued, don't they go in batches?" The
+    outbox joins the comments queued for one thread, posts over GraphQL while it is richer, and edits a writer's
+    own status comment in place when it is still the thread's last."""
+
+    daemon, queue, step = PostTest.daemon, PostTest.queue, PostTest.step
+
+    def setUp(self) -> None:
+        PostTest.setUp(self)
+        env = mock.patch.dict(os.environ, {"CMUX_SURFACE_ID": "surface-1"})  # one writer, whatever host runs this
+        env.start()
+        self.addCleanup(env.stop)
+
+    def as_writer(self, who: str, *argv: str) -> dict:
+        with mock.patch.dict(os.environ, {"CMUX_SURFACE_ID": who}):
+            return self.queue(*argv)
+
+    GQL_RICH = {"graphql": {"limit": 5000, "remaining": 4900, "reset": NOW + 3000},
+                "rest": {"limit": 5000, "remaining": 400, "reset": NOW + 3000}}
+
+    def rich(self, d: Any) -> Any:
+        d.budget = {k: dict(v) for k, v in self.GQL_RICH.items()}
+        return d
+
+    @staticmethod
+    def subject(last: str | None = None) -> tuple:
+        nodes = [{"id": last}] if last else []
+        return (200, {}, {"data": {"repository": {"issueOrPullRequest": {"id": "I_1", "comments": {"nodes": nodes}}}}})
+
+    @staticmethod
+    def made(node: str, url: str, edit: bool = False) -> tuple:
+        comment = {"id": node, "databaseId": 5, "url": url, "authorAssociation": "MEMBER",
+                   "author": {"__typename": "User", "login": "me"}}
+        data = {"updateIssueComment": {"issueComment": comment}} if edit else \
+            {"addComment": {"commentEdge": {"node": comment}}}
+        return (200, {}, {"data": data})
+
+    def test_comments_queued_for_one_thread_go_out_as_one(self) -> None:
+        a = self.queue("comment", "o/r#7", "--body", "one")
+        other = self.queue("comment", "o/r#8", "--body", "elsewhere")
+        b = self.queue("comment", "o/r#7", "--body", "two")
+        c = self.queue("comment", "o/r#7", "--body", "three")
+        d, t = self.daemon((201, {}, {"html_url": "https://github.com/o/r/pull/7#issuecomment-1"}),
+                           (201, {}, {"html_url": "https://github.com/o/r/pull/8#issuecomment-2"}))
+        self.step(d, NOW)
+        self.assertEqual(t.calls, [("POST", "/repos/o/r/issues/7/comments",
+                                    {"body": gg.POST_JOIN_RULE.join(["one", "two", "three"])})])
+        for item in (a, b, c):  # each caller gets the comment that holds its section
+            state = gg.post_state(item["id"])
+            self.assertEqual((state["state"], state["url"]), ("posted", "https://github.com/o/r/pull/7#issuecomment-1"))
+        self.assertEqual(gg.post_state(other["id"])["state"], "queued")
+        self.step(d, NOW + gg.POST_SPACING)
+        self.assertEqual(t.calls[1], ("POST", "/repos/o/r/issues/8/comments", {"body": "elsewhere"}))
+        self.assertEqual(list(gg.outbox_dir().glob("*.json")), [])
+
+    def test_markers_and_comments_queued_apart_are_not_joined(self) -> None:
+        self.queue("comment", "o/r#7", "--body", "one")
+        self.queue("comment", "o/r#7", "--body", "<!-- review-running sha=abc -->\nrunning")
+        late = self.queue("comment", "o/r#7", "--body", "much later")
+        late["queuedAt"] += gg.POST_JOIN_WINDOW + 1
+        gg.write_json(gg.outbox_dir() / f"{late['id']}.json", late)
+        ok = (201, {}, {"html_url": "u"})
+        d, t = self.daemon(ok, ok, ok)
+        for n in range(3):
+            self.step(d, NOW + n * gg.POST_SPACING)
+        self.assertEqual([c[2]["body"] for c in t.calls],
+                         ["one", "<!-- review-running sha=abc -->\nrunning", "much later"])
+
+    def test_a_member_whose_leader_dropped_it_is_sent_alone(self) -> None:
+        a = self.queue("comment", "o/r#7", "--body", "one")
+        b = self.queue("comment", "o/r#7", "--body", "two")
+        gg.write_json(gg.outbox_dir() / f"{b['id']}.json", {**b, "joinedInto": a["id"]})  # the leader never named it
+        ok = (201, {}, {"html_url": "u"})
+        d, t = self.daemon(ok, ok)
+        d.now = NOW
+        member = gg.read_json(gg.outbox_dir() / f"{b['id']}.json")
+        self.assertFalse(d.post_member(gg.outbox_dir() / f"{b['id']}.json", member))
+        self.assertNotIn("joinedInto", gg.read_json(gg.outbox_dir() / f"{b['id']}.json"))
+
+    def test_a_comment_goes_over_graphql_while_it_is_richer(self) -> None:
+        item = self.queue("comment", "o/r#7", "--body", "landed")
+        d, t = self.daemon(self.subject(), self.made("IC_1", "https://github.com/o/r/pull/7#issuecomment-5"))
+        self.rich(d)
+        self.step(d, NOW)
+        self.assertEqual([c[1] for c in t.calls], ["/graphql", "/graphql"])
+        self.assertIn("addComment", t.calls[1][2]["query"])
+        self.assertEqual(t.calls[1][2]["variables"], {"s": "I_1", "b": "landed"})
+        state = gg.post_state(item["id"])
+        self.assertEqual((state["state"], state["url"]), ("posted", "https://github.com/o/r/pull/7#issuecomment-5"))
+        again = self.queue("comment", "o/r#7", "--body", "again")  # the subject is cached: one request
+        d.transport.answers.append(self.made("IC_2", "u2"))
+        self.step(d, NOW + gg.POST_SPACING)
+        self.assertEqual(len(t.calls), 3)
+        self.assertEqual(gg.post_state(again["id"])["url"], "u2")
+
+    def test_no_graphql_reading_posts_over_rest(self) -> None:
+        self.queue("comment", "o/r#7", "--body", "landed")
+        d, t = self.daemon((201, {}, {"html_url": "u"}))
+        self.step(d, NOW)
+        self.assertEqual(t.calls[0][1], "/repos/o/r/issues/7/comments")
+
+    def status_pair(self, last_for_second: str) -> tuple[Any, Any, dict, dict]:
+        first = self.queue("comment", "o/r#7", "--body", "running", "--status-key", "review-run=abc")
+        d, t = self.daemon(self.subject(), self.made("IC_1", "u1"))
+        self.rich(d)
+        self.step(d, NOW)
+        second = self.queue("comment", "o/r#7", "--body", "verdict", "--status-key", "review-run=abc")
+        t.answers += [self.subject(last_for_second), self.made(last_for_second, "u2", edit=last_for_second == "IC_1")]
+        return d, t, first, second
+
+    def test_a_writers_status_is_edited_in_place_while_it_is_the_last_comment(self) -> None:
+        d, t, first, second = self.status_pair("IC_1")
+        self.step(d, NOW + gg.POST_SPACING)
+        self.assertIn("updateIssueComment", t.calls[3][2]["query"])
+        self.assertEqual(t.calls[3][2]["variables"], {"c": "IC_1", "b": "verdict"})
+        self.assertEqual(gg.post_state(second["id"])["url"], "u2")
+
+    def test_a_status_another_comment_followed_is_posted_new(self) -> None:
+        d, t, first, second = self.status_pair("IC_9")
+        self.step(d, NOW + gg.POST_SPACING)
+        self.assertIn("addComment", t.calls[3][2]["query"])
+
+    def test_a_watched_thread_gets_a_new_comment_not_an_edit(self) -> None:
+        d, t, first, second = self.status_pair("IC_1")
+        t.answers[-1] = self.made("IC_2", "u2")
+        gg.watch_dir().mkdir(parents=True, exist_ok=True)
+        (gg.watch_dir() / gg.file_name("comment:o/r#7")).write_text("{}")
+        self.step(d, NOW + gg.POST_SPACING)
+        self.assertIn("addComment", t.calls[-1][2]["query"])
+
+    def test_a_status_comment_is_never_joined(self) -> None:
+        self.queue("comment", "o/r#7", "--body", "one")
+        self.queue("comment", "o/r#7", "--body", "running", "--status-key", "k")
+        ok = (201, {}, {"html_url": "u"})
+        d, t = self.daemon(ok, ok)
+        self.step(d, NOW)
+        self.step(d, NOW + gg.POST_SPACING)
+        self.assertEqual([c[2]["body"] for c in t.calls], ["one", "running"])
+
+    def test_a_wait_sees_a_comment_the_outbox_edited_after_it_began(self) -> None:
+        at = gg.dt.datetime.fromtimestamp(NOW + 10, gg.dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        old = {"id": 5, "createdAt": "2026-01-01T00:00:00Z", "editedAt": at, "body": "verdict",
+               "author": {"login": "me"}}
+        ours = frozenset({5})
+        # --since the edited comment itself: its edit is newer, even one finished before the wait began
+        self.assertTrue(gg.comment_matches(old, None, re.compile("verdict"), 5, None, ours))
+        self.assertFalse(gg.comment_matches(old, None, None, 6, None, ours))  # an older comment's edit preceded 6
+        self.assertTrue(gg.comment_matches(old, None, None, None, NOW, ours))  # edited after the wait began
+        self.assertFalse(gg.comment_matches(old, None, None, None, NOW + 20, ours))
+        self.assertFalse(gg.comment_matches({**old, "editedAt": None}, None, None, None, NOW, ours))
+        # anyone else's edit (a typo fix, a ticked box) is not a new comment
+        self.assertFalse(gg.comment_matches(old, None, None, 5, None))
+        self.assertFalse(gg.comment_matches(old, None, None, None, NOW))
+
+    def test_an_edit_in_place_is_recorded_for_the_waits(self) -> None:
+        d, t, first, second = self.status_pair("IC_1")
+        self.step(d, NOW + gg.POST_SPACING)
+        self.assertEqual(gg.outbox_edits(), frozenset({5}))
+
+    def test_a_risk_receipt_and_a_watched_thread_are_not_joined(self) -> None:
+        self.queue("comment", "o/r#7", "--body", "one")
+        self.queue("comment", "o/r#7", "--body", "Review (codex): SHIP " + "a" * 40)
+        self.queue("comment", "o/r#8", "--body", "one")
+        self.queue("comment", "o/r#8", "--body", "two")
+        gg.watch_dir().mkdir(parents=True, exist_ok=True)
+        (gg.watch_dir() / gg.file_name("comment:o/r#8")).write_text("{}")
+        ok = (201, {}, {"html_url": "u"})
+        d, t = self.daemon(ok, ok, ok, ok)
+        for n in range(4):
+            self.step(d, NOW + n * gg.POST_SPACING)
+        self.assertEqual([c[2]["body"] for c in t.calls], ["one", "Review (codex): SHIP " + "a" * 40, "one", "two"])
+
+    def test_a_crash_mid_join_releases_the_members(self) -> None:
+        a = self.queue("comment", "o/r#7", "--body", "one")
+        b = self.queue("comment", "o/r#7", "--body", "two")
+        d, t = self.daemon((201, {}, {"html_url": "u1"}), (201, {}, {"html_url": "u2"}))
+        d.now = NOW
+        real = gg.write_json
+
+        def crash(path, doc):  # the daemon dies after marking the members, before writing the leader
+            if Path(path).stem == a["id"]:
+                raise KeyboardInterrupt
+            real(path, doc)
+        with mock.patch.object(gg, "write_json", crash), self.assertRaises(KeyboardInterrupt):
+            d.post_join(gg.outbox_dir() / f"{a['id']}.json", gg.read_json(gg.outbox_dir() / f"{a['id']}.json"))
+        self.step(d, NOW)
+        self.step(d, NOW + gg.POST_SPACING)
+        self.assertEqual([c[2]["body"] for c in t.calls], ["one", "two"])
+        self.assertEqual([gg.post_state(i["id"])["url"] for i in (a, b)], ["u1", "u2"])
+
+    def test_graphql_out_at_the_subject_leaves_the_comment_for_rest(self) -> None:
+        item = self.queue("comment", "o/r#7", "--body", "landed")
+        out = (200, {}, {"data": None, "errors": [{"type": "RATE_LIMITED", "message": "API rate limit exceeded"}]})
+        d, t = self.daemon(out, (201, {}, {"html_url": "u"}))
+        self.rich(d)
+        self.step(d, NOW)
+        self.assertEqual(gg.post_state(item["id"])["state"], "queued")
+        self.assertGreater(d.backoff["graphql"], NOW)
+        self.step(d, NOW + gg.POST_SPACING)
+        self.assertEqual(t.calls[-1][1], "/repos/o/r/issues/7/comments")
+        self.assertEqual((gg.post_state(item["id"])["state"], gg.post_state(item["id"])["url"]), ("posted", "u"))
+
+    def test_a_401_retries_the_comment_with_a_fresh_token(self) -> None:
+        for answers in ([(401, {}, {"message": "Bad credentials"})],
+                        [self.subject(), (401, {}, {"message": "Bad credentials"})]):
+            with self.subTest(at=len(answers)):
+                for p in gg.outbox_dir().glob("*.json"):
+                    p.unlink()
+                item = self.queue("comment", "o/r#7", "--body", "landed")
+                d, t = self.daemon(*answers)
+                self.rich(d)
+                self.step(d, NOW)
+                state = gg.post_state(item["id"])
+                self.assertEqual(state["state"], "queued")
+                self.assertIsNone(d.token)
+                self.assertFalse(gg.read_json(gg.outbox_dir() / f"{item['id']}.json").get("uncertain"))
+
+    def test_graphql_spent_routes_the_write_over_rest_not_a_hold(self) -> None:
+        item = self.queue("comment", "o/r#7", "--body", "landed")
+        spent = (403, {"x-ratelimit-remaining": "0", "x-ratelimit-reset": str(int(NOW + 900))},
+                 {"message": "API rate limit exceeded for user"})
+        d, t = self.daemon(self.subject(), spent, (201, {}, {"html_url": "u"}))
+        self.rich(d)
+        d.policy["floors"]["graphql"] = (0, 0)  # the reading says rich; the answer says spent
+        gg.write_json(gg.BASE / gg.POST_SUBJECTS, {})
+        self.step(d, NOW)
+        self.step(d, NOW + gg.POST_SPACING)
+        self.assertLessEqual(d.post_hold, NOW + gg.POST_SPACING)  # not held
+        self.assertGreaterEqual(d.backoff["graphql"], NOW + 900)
+        self.step(d, NOW + 2 * gg.POST_SPACING)
+        self.assertEqual(t.calls[-1][1], "/repos/o/r/issues/7/comments")
+        self.assertEqual(gg.post_state(item["id"])["state"], "posted")
+
+    def test_an_edit_is_recorded_before_it_is_sent(self) -> None:
+        d, t, first, second = self.status_pair("IC_1")
+        t.answers[-1] = gg.WatchError("connection reset")  # the answer to the edit is lost
+        self.step(d, NOW + gg.POST_SPACING)
+        self.assertEqual(gg.outbox_edits(), frozenset({5}))
+
+    def test_githubs_own_failure_over_graphql_is_retried_not_failed(self) -> None:
+        for answers, uncertain in (
+                ([(200, {}, {"data": None, "errors": [{"message": "Something went wrong while executing your query."
+                                                                  " Please include `ABC:1` when reporting this issue."}]})],
+                 False),
+                ([self.subject(), (200, {}, {"data": {"addComment": None},
+                                             "errors": [{"message": "Timeout on validation of query"}]})], True)):
+            with self.subTest(at=len(answers)):
+                for p in gg.outbox_dir().glob("*.json"):
+                    p.unlink()
+                gg.write_json(gg.BASE / gg.POST_SUBJECTS, {})
+                item = self.queue("comment", "o/r#7", "--body", "landed")
+                d, t = self.daemon(*answers)
+                self.rich(d)
+                self.step(d, NOW)
+                self.assertEqual(gg.post_state(item["id"])["state"], "queued")
+                queued = gg.read_json(gg.outbox_dir() / f"{item['id']}.json")
+                self.assertEqual(bool(queued.get("uncertain")), uncertain)  # a mutation's may have landed
+        self.assertFalse(gg.Daemon.gql_transient([{"type": "UNPROCESSABLE", "message": "Body is too long, try again"}]))
+        self.assertFalse(gg.Daemon.gql_transient([{"message": "Could not resolve to a node"}]))
+
+    def test_a_joined_callers_stdout_is_its_url_alone(self) -> None:
+        a = self.queue("comment", "o/r#7", "--body", "one")
+        b = self.queue("comment", "o/r#7", "--body", "two")
+        d, t = self.daemon((201, {}, {"html_url": "https://github.com/o/r/pull/7#issuecomment-5"}))
+        self.step(d, NOW)
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(gg.cmd_post_status(b["id"], 0, False), 0)
+        self.assertEqual(out.getvalue(), "https://github.com/o/r/pull/7#issuecomment-5\n")  # `--since "$url"` takes it
+        self.assertIn("posted in one comment", err.getvalue())
+
+    def test_a_status_is_edited_in_place_even_while_rest_is_richer(self) -> None:
+        d, t, first, second = self.status_pair("IC_1")
+        d.budget = {"graphql": {"limit": 5000, "remaining": 400, "reset": NOW + 3000},
+                    "rest": {"limit": 5000, "remaining": 4900, "reset": NOW + 3000}}
+        self.step(d, NOW + gg.POST_SPACING)
+        self.assertIn("updateIssueComment", t.calls[3][2]["query"])
+        self.assertFalse(d.post_over_graphql({"kind": "comment", "repo": "o/r", "number": 8, "body": "x"}))
+
+    def test_a_join_stays_within_what_the_comment_readers_keep(self) -> None:
+        long = "x" * 4000
+        self.queue("comment", "o/r#7", "--body", long)
+        ready = self.queue("comment", "o/r#7", "--body", "READY-TO-LAND")
+        ok = (201, {}, {"html_url": "u"})
+        d, t = self.daemon(ok, ok)
+        self.step(d, NOW)
+        self.step(d, NOW + gg.POST_SPACING)
+        self.assertEqual([c[2]["body"] for c in t.calls], [long, "READY-TO-LAND"])  # posted apart
+        # every posted body is one a wait reads back whole, so `--match READY-TO-LAND` sees the reply
+        self.assertTrue(all(len(c[2]["body"]) <= gg.COMMENT_BODY_MAX for c in t.calls))
+        self.assertTrue(gg.comment_matches({"id": 10, "body": "READY-TO-LAND"[:gg.COMMENT_BODY_MAX]}, None,
+                                           re.compile("READY-TO-LAND"), 9, None))
+        self.assertEqual(gg.post_state(ready["id"])["state"], "posted")
+
+    def test_only_one_writers_plain_text_is_joined(self) -> None:
+        # Codex review of 3005c6c: two `/callsign reserve` requests joined into one comment gave both callers one
+        # receipt. Slash commands, @mentions and another writer's comments go out on their own.
+        bodies = ["/callsign reserve", "/callsign reserve", "cc @someone please look", "mine"]
+        for body in bodies:
+            self.queue("comment", "o/r#7", "--body", body)
+        self.as_writer("surface-2", "comment", "o/r#7", "--body", "theirs")
+        ok = (201, {}, {"html_url": "u"})
+        d, t = self.daemon(*[ok] * 5)
+        for n in range(5):
+            self.step(d, NOW + n * gg.POST_SPACING)
+        self.assertEqual([c[2]["body"] for c in t.calls], bodies + ["theirs"])
+
+    def test_a_join_a_wait_began_watching_since_is_undone_before_its_retry(self) -> None:
+        # Codex review of 3005c6c: `progress` and `READY` joined, the write was held, then a wait matching ^READY began
+        progress = self.queue("comment", "o/r#7", "--body", "progress")
+        ready = self.queue("comment", "o/r#7", "--body", "READY")
+        held = (403, {"retry-after": "60"}, {"message": "You have exceeded a secondary rate limit and have been "
+                                                        "temporarily blocked from content creation."})
+        ok = (201, {}, {"html_url": "u1"})
+        d, t = self.daemon(held, ok, (201, {}, {"html_url": "u2"}))
+        self.step(d, NOW)
+        self.assertEqual(t.calls[0][2]["body"], gg.POST_JOIN_RULE.join(["progress", "READY"]))
+        gg.watch_dir().mkdir(parents=True, exist_ok=True)
+        (gg.watch_dir() / gg.file_name("comment:o/r#7")).write_text("{}")
+        self.step(d, d.post_hold)
+        self.step(d, d.post_hold + gg.POST_SPACING)
+        self.assertEqual([c[2]["body"] for c in t.calls[1:]], ["progress", "READY"])
+        self.assertEqual([gg.post_state(i["id"])["url"] for i in (progress, ready)], ["u1", "u2"])
+
+    def test_a_write_that_stays_alone_ends_the_join(self) -> None:
+        # Codex review of ee4cc19: `starting`, a running marker, then `finished` were sent as `starting...finished`
+        # and then the marker, after the work it announced was done
+        bodies = ["starting", "<!-- review-running sha=abc -->\nrunning", "finished"]
+        for body in bodies:
+            self.queue("comment", "o/r#7", "--body", body)
+        ok = (201, {}, {"html_url": "u"})
+        d, t = self.daemon(ok, ok, ok)
+        for n in range(3):
+            self.step(d, NOW + n * gg.POST_SPACING)
+        self.assertEqual([c[2]["body"] for c in t.calls], bodies)
+
+    def test_a_join_whose_answer_was_lost_is_undone_once_it_is_known_not_to_have_landed(self) -> None:
+        # Codex review of ee4cc19: the lost answer kept the join `uncertain`, so a wait matching ^READY registered
+        # since then saw the two resent as one comment
+        progress = self.queue("comment", "o/r#7", "--body", "progress")
+        ready = self.queue("comment", "o/r#7", "--body", "READY")
+        d, t = self.daemon(gg.WatchError("connection reset"), (200, {}, []),
+                           (201, {}, {"html_url": "u1"}), (201, {}, {"html_url": "u2"}))
+        self.step(d, NOW)
+        self.assertEqual(t.calls[0][2]["body"], gg.POST_JOIN_RULE.join(["progress", "READY"]))
+        gg.watch_dir().mkdir(parents=True, exist_ok=True)
+        (gg.watch_dir() / gg.file_name("comment:o/r#7")).write_text("{}")
+        leader = gg.read_json(gg.outbox_dir() / f"{progress['id']}.json")
+        for n in range(1, 4):
+            self.step(d, max(NOW + n * gg.POST_SPACING, float(leader.get("notBefore") or 0) + n * gg.POST_SPACING))
+        self.assertEqual(t.calls[1][0], "GET")  # looked first: not there
+        self.assertEqual([c[2]["body"] for c in t.calls[2:]], ["progress", "READY"])
+        self.assertEqual([gg.post_state(i["id"])["url"] for i in (progress, ready)], ["u1", "u2"])
+
+    def test_a_wait_that_registers_during_the_subject_lookup_splits_the_join(self) -> None:
+        # Codex review of a2ce203: the join was decided, then a wait matching ^READY registered while the subject
+        # was looked up, and the mutation sent `progress ... READY` as one comment
+        progress = self.queue("comment", "o/r#7", "--body", "progress")
+        ready = self.queue("comment", "o/r#7", "--body", "READY")
+
+        def subject_then_watch(*_a, **_k):
+            gg.watch_dir().mkdir(parents=True, exist_ok=True)
+            (gg.watch_dir() / gg.file_name("comment:o/r#7")).write_text("{}")
+            return self.subject()
+        d, t = self.daemon(self.subject(), self.made("IC_1", "u1"), self.made("IC_2", "u2"))
+        self.rich(d)
+        real = d.post_gql
+        calls = []
+
+        def gql(query, variables, reason):
+            calls.append(reason)
+            if reason == "outbox-subject":
+                subject_then_watch()
+            return real(query, variables, reason)
+        d.post_gql = gql
+        self.step(d, NOW)
+        self.assertEqual(t.calls[1][2]["variables"]["b"], "progress")
+        self.step(d, NOW + gg.POST_SPACING)
+        self.assertEqual(t.calls[-1][2]["variables"]["b"], "READY")
+        self.assertEqual([gg.post_state(i["id"])["url"] for i in (progress, ready)], ["u1", "u2"])
+
+    def test_an_internal_error_that_spent_the_last_point_stays_uncertain(self) -> None:
+        # Codex review of a2ce203: a 200 with an INTERNAL error and no points left may have written the comment
+        item = self.queue("comment", "o/r#7", "--body", "landed")
+        last = (200, {"x-ratelimit-remaining": "0", "x-ratelimit-reset": str(int(NOW + 900))},
+                {"data": {"addComment": None}, "errors": [{"type": "INTERNAL", "message": "Something went wrong"}]})
+        d, t = self.daemon(self.subject(), last)
+        self.rich(d)
+        self.step(d, NOW)
+        self.assertTrue(gg.read_json(gg.outbox_dir() / f"{item['id']}.json").get("uncertain"))  # post_find goes first
+
+    def test_a_lasting_graphql_refusal_fails_the_comment_not_the_outbox(self) -> None:
+        item = self.queue("comment", "o/r#7", "--body", "landed")
+        d, t = self.daemon(self.subject(), (403, {}, {"errors": [{"type": "FORBIDDEN", "message": "SAML enforcement"}]}))
+        self.rich(d)
+        self.step(d, NOW)
+        state = gg.post_state(item["id"])
+        self.assertEqual(state["state"], "failed")
+        self.assertIn("SAML", state["error"])
+        self.assertLessEqual(d.post_hold, NOW)
+
+
 class PostBodyGuardTest(unittest.TestCase):
     """`post` asks the host's public-body guard before it queues, as the gh shim does for `gh pr|issue` writes
     (cmuxterm-hq#4946: ten public cmux PRs named fleet hosts after `glaeda-gh post pr`)."""
