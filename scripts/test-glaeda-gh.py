@@ -1325,6 +1325,11 @@ class GraphqlDietTest(Base):
         self.assertLess(hour, 300, self.daemon.status.get("graphqlBy"))
 
 
+def untimed(line: dict) -> dict:
+    """An upstream request line without the interest times it carries (touched, waitedAt, asked)."""
+    return {k: v for k, v in line.items() if k not in ("touched", "waitedAt", "asked")}
+
+
 class UpstreamTest(Base):
     """A host with no login reads through upstream.json's program: one request per tick, never GitHub."""
 
@@ -1356,7 +1361,8 @@ class UpstreamTest(Base):
         self.assertEqual(len(self.asked), 1)
         self.assertEqual(sorted(k["key"] for k in self.asked[0]["keys"]), ["pr:o/r#7", "run:o/r/9"])
         # each key names its waiter here, so the upstream's spend log charges the read to it
-        self.assertIn({"key": "run:o/r/9", "jobs": True, "reader": f"{gg.policy_host()}/tool:test"}, self.asked[0]["keys"])
+        self.assertIn({"key": "run:o/r/9", "jobs": True, "reader": f"{gg.policy_host()}/tool:test"},
+                      [untimed(line) for line in self.asked[0]["keys"]])
         pr = gg.read_cache("pr:o/r#7")
         self.assertEqual(pr["data"]["number"], 7)
         self.assertEqual(pr["dataAt"], NOW - 30)  # the upstream's age, not this host's
@@ -1502,8 +1508,8 @@ class UpstreamTest(Base):
             daemon = gg.Daemon(transport=self.gh, token=lambda: self.fail("read a token"), controller=None)
             gg.register("pr:o/r#7")
             daemon.tick(now=NOW)
-        self.assertEqual(json.loads((tmp / "seen").read_text()),
-                         {"keys": [{"key": "pr:o/r#7", "jobs": False, "reader": f"{gg.policy_host()}/tool:test"}]})
+        self.assertEqual([untimed(line) for line in json.loads((tmp / "seen").read_text())["keys"]],
+                         [{"key": "pr:o/r#7", "jobs": False, "reader": f"{gg.policy_host()}/tool:test"}])
         self.assertEqual(gg.read_cache("pr:o/r#7")["data"], {"number": 7})
         self.assertEqual(self.gh.calls, [])
 
@@ -1581,6 +1587,52 @@ class UpstreamTest(Base):
         self.assertEqual(sorted(k["consumer"] for k in self.asked[0]["keys"]), ["a", "b"])
         self.assertEqual({n: self.daemon.denied.get(n) for n in ("a", "b")}, {"a": NOW - 2, "b": NOW - 1})
 
+    def test_consumers_past_the_cap_rotate_on_one_head(self) -> None:
+        # #1933 review F1: a head with more askers than fit sent the same newest ones every tick, so a consumer with
+        # budget left (autoland) never went up while every one sent was spent.
+        key = gg.parse_key("head", "o/r@" + "9" * 40)
+        for n in ("a", "b", "c"):
+            gg.register(key, consumer=n)
+        with mock.patch.object(gg, "UPSTREAM_MAX_KEYS", 2):
+            self.daemon.tick(now=NOW)
+            self.daemon.tick(now=NOW + gg.UPSTREAM_NEW)
+        sent = [[k["consumer"] for k in r["keys"]] for r in self.asked]
+        self.assertTrue(all(len(r) <= 2 for r in sent), sent)
+        self.assertEqual(sent[0], ["a", "b"])
+        self.assertEqual(sent[1][0], "c")  # never sent goes first
+
+    def test_a_head_goes_up_with_this_hosts_own_interest_times(self) -> None:
+        key = gg.parse_key("head", "o/r@" + "8" * 40)
+        gg.register(key, consumer="lane-x")
+        asked = gg.read_json(gg.watch_dir() / gg.file_name(key))["consumers"]["lane-x"]
+        self.daemon.tick(now=NOW)
+        line = self.asked[0]["keys"][0]
+        self.assertEqual((line["consumer"], line["asked"]), ("lane-x", asked))
+        self.assertIsInstance(line["touched"], float)
+
+    def test_read_stamps_the_downstream_times_and_renews_nothing(self) -> None:
+        # #1933 review F2: each poll of the cache renewed the consumer's interest here, so one ask downstream was read
+        # again at 600 s. The upstream keeps the downstream's own times: interest ends when the downstream's does.
+        key = gg.parse_key("head", "o/r@" + "7" * 40)
+        then = time.time() - 500
+        line = {"key": key, "consumer": "lane-x", "asked": then, "touched": then, "wait": True, "waitedAt": then}
+        for _ in range(2):  # a second poll with the same times moves nothing
+            with mock.patch.object(gg, "daemon_running", lambda grace=0.0: True), \
+                    mock.patch.object(gg, "daemon_failing", lambda: None), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(gg.cmd_read(json.dumps({"keys": [line]})), 0)
+        path = gg.watch_dir() / gg.file_name(key)
+        doc = gg.read_json(path)
+        self.assertAlmostEqual(doc["consumers"]["lane-x"], then, places=3)
+        self.assertAlmostEqual(doc["waitedAt"], then, places=3)
+        self.assertAlmostEqual(path.stat().st_mtime, then, places=0)
+        # a time from the future is held to now, and a newer local ask is never moved back
+        gg.register(key, consumer="lane-x")
+        local = gg.read_json(path)["consumers"]["lane-x"]
+        gg.register(key, consumer="lane-x", at={"asked": then})
+        self.assertEqual(gg.read_json(path)["consumers"]["lane-x"], local)
+        gg.register(key, consumer="lane-y", at={"asked": time.time() + 3600})
+        self.assertLessEqual(gg.read_json(path)["consumers"]["lane-y"], time.time())
+
     def test_heads_past_the_key_cap_rotate_instead_of_starving(self) -> None:
         # Each head goes up once per consumer, so lines outnumber keys: a head that did not fit is not stamped as
         # asked, and goes first on the next tick.
@@ -1606,7 +1658,7 @@ class UpstreamTest(Base):
                                                                                     "deniedAt": None}}}
         self.daemon.tick(now=NOW)
         # the reader (#1931) goes with a head as with any key
-        self.assertEqual([{k: v for k, v in line.items() if k != "reader"} for line in self.asked[0]["keys"]],
+        self.assertEqual([{k: v for k, v in untimed(line).items() if k != "reader"} for line in self.asked[0]["keys"]],
                          [{"key": key, "jobs": False, "consumer": "compile-fallback"}])
         self.assertTrue(all(gg.safe_reader(line["reader"]) for line in self.asked[0]["keys"]))
         entry = gg.read_cache(key)
