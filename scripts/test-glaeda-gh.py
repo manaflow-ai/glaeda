@@ -11909,6 +11909,42 @@ class SpendAlarmTest(Base):
         self.assertEqual(gg.unlogged_text(5000, 4900, NOW + 3480, NOW, None), ("", None))  # unknown still says nothing
         self.assertIsNotNone(gg.unlogged_text(5000, 3000, NOW + 2900, NOW, 0)[1])  # 11 min in: measured
 
+    def test_the_stale_alarm_warns_when_waited_data_starves(self) -> None:
+        """huge-blue 2026-11-11: a merged PR read OPEN for 50 minutes behind a fresh heartbeat, and nothing alarmed."""
+        self.policy()
+        key = gg.parse_key("pr", "o/r#5")
+        gg.write_json(gg.cache_dir() / gg.file_name(key), {"key": key, "fetchedAt": NOW - 700, "dataAt": NOW - 700,
+                                                           "data": gg.parse_pr(pr_node(5)), "error": None})
+        gg.register(key, waited=True)
+        self.gh.prs[("o", "r", 5)] = pr_node(5)
+        with mock.patch.object(gg, "parse_pr", side_effect=AttributeError("bug")):
+            self.daemon.tick(NOW)
+        told = self.told_lines()
+        self.assertEqual(len(told), 1, told)
+        self.assertIn("pr data that waits are blocked on is 700s old", told[0])
+        self.assertIn("o/r#5", told[0])
+        self.assertIn("AttributeError", told[0])
+        self.assertEqual(gg.read_json(gg.BASE / gg.ALARMS_FILE)["stale"]["level"], "warn")
+        self.assertEqual(self.notice_lines()[-1]["kind"], "stale")
+        # read again: the alarm clears, once
+        self.daemon.tick(NOW + gg.CYCLE)
+        self.assertTrue(gg.read_json(gg.BASE / gg.ALARMS_FILE)["stale"].get("cleared"))
+
+    def test_the_stale_alarm_stays_quiet_when_the_quota_explains_it_or_policy_turns_it_off(self) -> None:
+        self.policy()
+        self.daemon.stale_waited = {"pr": 2000.0}
+        self.daemon.backoff = {"rest": NOW + 600, "graphql": NOW + 600}
+        self.daemon.check_alarms()
+        self.daemon.backoff = {"rest": 0.0, "graphql": 0.0}
+        self.policy(stale=False)
+        self.daemon.check_alarms()
+        self.assertEqual(self.told_lines(), [])
+        self.policy()
+        self.daemon.check_alarms()
+        told = self.told_lines()
+        self.assertEqual(len(told), 1)
+        self.assertTrue(told[0].startswith("--from glaeda-gh --severity fire FIRE"), told[0])
+
     def test_the_pace_alarm_is_off_at_a_zero_share(self) -> None:
         for name in ("FLEET_POLICY", "UPDATE_CONFIG", "DAEMON_CONFIG"):
             self.addCleanup(setattr, gg, name, getattr(gg, name))
@@ -13757,6 +13793,75 @@ class StaleDataTest(Base):
         self.assertIn("direct read answered", said.getvalue())
         self.assertIn("MERGED", out.getvalue())
         self.assertEqual(len(self.gh.gql_calls()), 1, "one direct read, not a loop")
+
+    def starved_request(self) -> tuple[str, int]:
+        gg.BASE.mkdir(parents=True, exist_ok=True)
+        lock = open(gg.BASE / "daemon.lock", "a+")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        self.addCleanup(lock.close)
+        gg.write_json(gg.BASE / "daemon.json", {"at": time.time(), "heartbeat": 30, "waits": gg.WAITS_CONTRACT})
+        rid = gg.write_wait_request("pr", "o/r#9", "merged", 3600, False, False, None, True, gg.RESCUE_GRACE,
+                                    os.getpid(), began=time.time() - gg.STALE_DATA_AFTER - 60)
+        reader = os.open(gg.waits_dir() / f"{rid}.fifo", os.O_RDONLY | os.O_NONBLOCK)
+        self.addCleanup(os.close, reader)
+        self.put("pr:o/r#9", gg.parse_pr(pr_node(9)), at=time.time() - 3000)
+        return rid, reader
+
+    def test_no_hand_back_while_the_quota_explains_old_data(self) -> None:
+        """Both buckets out: the wait's own read could not get through either, and every wait would turn into a
+        Python poll for the rest of its timeout. It stays on the blocker."""
+        rid, _ = self.starved_request()
+        self.daemon.now = time.time()
+        self.daemon.backoff = {"rest": time.time() + 600, "graphql": time.time() + 600}
+        self.daemon.serve_waits()
+        self.assertTrue((gg.waits_dir() / f"{rid}.fifo").exists(), "a quota-starved wait was handed back")
+        self.assertIsNone(gg.read_json(gg.waits_dir() / f"{rid}.json").get("stale"))
+        self.daemon.backoff = {"rest": 0.0, "graphql": 0.0}  # the quota is back and the data is still old
+        self.daemon.serve_waits()
+        self.assertFalse((gg.waits_dir() / f"{rid}.fifo").exists())
+
+    def test_a_handed_back_request_past_its_deadline_is_dropped(self) -> None:
+        rid, _ = self.starved_request()
+        self.daemon.serve_waits()
+        req = gg.read_json(gg.waits_dir() / f"{rid}.json")
+        self.assertIsNotNone(req["stale"])
+        gg.write_json(gg.waits_dir() / f"{rid}.json", {**req, "began": time.time() - float(req["timeout"]) - gg.WAITS_LEFTOVER - 10})
+        self.daemon.serve_waits()
+        self.assertFalse((gg.waits_dir() / f"{rid}.json").exists(), "a reused pid would keep it for ever")
+
+    def test_a_direct_read_never_writes_the_daemons_rest_spend(self) -> None:
+        """The client's Daemon read rest-spend.json at construction; charging a REST read wrote that old copy back over
+        the minutes the daemon counted since."""
+        gg.BASE.mkdir(parents=True, exist_ok=True)
+        self.gh.runs[7] = {"id": 7, "name": "CI", "status": "completed", "conclusion": "success", "html_url": "u",
+                           "run_attempt": 1, "head_sha": "a" * 40}
+        minute = str(int(time.time() // 60))
+        gg.write_json(gg.BASE / gg.REST_SPEND_FILE, {minute: 5})
+        real = gg.Daemon
+
+        def client(**kw: Any) -> Any:
+            made = real(transport=self.gh, token=lambda: TOKEN, controller=None, upstream=None)
+            gg.write_json(gg.BASE / gg.REST_SPEND_FILE, {minute: 40})  # the daemon counted more meanwhile
+            return made
+
+        req = {"key": gg.parse_key("run", "o/r/7"), "kind": "run", "began": time.time() - 700}
+        gg.register(req["key"], waited=True)
+        with mock.patch.object(gg, "Daemon", side_effect=client):
+            self.assertIsNone(gg.direct_read(req))
+        self.assertTrue(self.gh.rest_calls(), "no read was made")
+        self.assertEqual(gg.read_json(gg.BASE / gg.REST_SPEND_FILE), {minute: 40})
+        self.assertEqual(gg.read_cache(req["key"])["data"]["conclusion"], "success")
+
+    def test_a_direct_read_heeds_the_daemons_stop(self) -> None:
+        gg.BASE.mkdir(parents=True, exist_ok=True)
+        gg.write_json(gg.BASE / "daemon.json", {"at": time.time(), "heartbeat": 30,
+                                                "modes": {"graphql": "stop", "rest": "normal"}})
+        real = gg.Daemon
+        with mock.patch.object(gg, "Daemon", side_effect=lambda **kw: real(
+                transport=self.gh, token=lambda: TOKEN, controller=None, upstream=None)):
+            error = gg.direct_read({"key": "pr:o/r#9", "kind": "pr", "began": time.time() - 700})
+        self.assertIn("quota", error)
+        self.assertEqual(self.gh.calls, [])
 
     def test_wait_starved_is_bounded(self) -> None:
         now = time.time()
