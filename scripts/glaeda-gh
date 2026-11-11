@@ -607,7 +607,7 @@ PR_FIELDS = """number url title state isDraft merged mergedAt mergeable mergeSta
 headRefName reviewDecision updatedAt baseRef { branchProtectionRule { requiredStatusCheckContexts }
 rules(first: 50) { nodes { type parameters { ... on RequiredStatusChecksParameters {
   requiredStatusChecks { context } } } } } } commits(last: 1) { nodes { commit { SUITE_ATTEMPTS statusCheckRollup { state
-contexts(first: 100) { totalCount pageInfo { hasNextPage endCursor } nodes { __typename
+contexts(first: 100) { totalCount PR_COUNTS pageInfo { hasNextPage endCursor } nodes { __typename
 ... on CheckRun { id name status conclusion detailsUrl databaseId startedAt completedAt
   isRequired(pullRequestNumber: NUM) checkSuite { conclusion workflowRun { databaseId workflow { name databaseId } } } }
 ... on StatusContext { context state targetUrl createdAt isRequired(pullRequestNumber: NUM) } } } } } } }"""
@@ -622,10 +622,24 @@ contexts(first: 100) { totalCount pageInfo { hasNextPage endCursor } nodes { __t
 # requests in each PR of the batched read, 20 points for a batch of ten. The suites whose newest attempt ran nothing
 # (on a cmux head about 15 of 55, mostly apps' suites that never run anything) are read by id instead, where each
 # suite is one request: a suite that never ran anything comes back with no runs and adds nothing.
-SUITE_ATTEMPTS = ("checkSuites(first: 100) { pageInfo { hasNextPage } nodes { id "
+SUITE_ATTEMPTS = ("checkSuites(first: 100) { totalCount pageInfo { hasNextPage } nodes { id "
                   "latest: checkRuns(first: 1) { totalCount } } }")
 SUITE_RUNS_BATCH = 100  # suite ids per SUITE_RUNS query: GitHub's nodes(ids:) takes at most 100
 PR_FIELDS = PR_FIELDS.replace("SUITE_ATTEMPTS", SUITE_ATTEMPTS)
+# A PR's fingerprint (pr_fingerprint): what a verdict or a wait reads from a PR, as counts. The full read above costs
+# about 1.4 points a PR (contexts, suites and rules at up to 100 each) and the daemons re-read every watched PR every
+# cycle: on 2026-11-11 11Z, PR reads were 1,550 of the two daemons' ~2,000 GraphQL points an hour (huge-blue 602,
+# cosmic-gray 949), most of them answers identical to the last. PR_PROBE asks only the fingerprint, about 3 requests a
+# PR, so ten PRs cost 1 point; a PR whose fingerprint matches its last full read is confirmed (dataAt moves) without
+# the full read, its check pages, its last-real-attempt suites or its steps. Any change, a PR never fully read, a
+# partial one, or one fully read longer than PR_FULL_EVERY ago, is read in full.
+PR_COUNTS = ("checkRunCount checkRunCountsByState { state count } statusContextCount "
+             "statusContextCountsByState { state count }")
+PR_FIELDS = PR_FIELDS.replace("PR_COUNTS", PR_COUNTS)
+PR_PROBE_FIELDS = (f"number state isDraft merged mergeable mergeStateStatus headRefOid reviewDecision commits(last: 1) "
+                   f"{{ nodes {{ commit {{ checkSuites(first: 1) {{ totalCount }} statusCheckRollup {{ state "
+                   f"contexts(first: 1) {{ totalCount {PR_COUNTS} }} }} }} }} }}")
+PR_FULL_EVERY = 600  # a probed PR is still read in full this often (a renamed check, a base's required contexts)
 SUITE_RUNS = """query($suites: [ID!]!) { rateLimit { limit remaining resetAt cost } suiteRuns: nodes(ids: $suites) {
 ... on CheckSuite { id conclusion app { slug } workflowRun { databaseId workflow { name databaseId } }
 checkRuns(first: 100, filterBy: { checkType: ALL }) { pageInfo { hasNextPage } nodes { id name status conclusion
@@ -1664,8 +1678,8 @@ def pr_query(keys: list[str], kind: str = "pr") -> tuple[str, dict]:
     for i, key in enumerate(keys):
         _, owner, repo, number = split_key(key)
         decls.append(f"$o{i}: String!, $r{i}: String!, $n{i}: Int!")
-        if kind == "pr":
-            fields = PR_FIELDS.replace("NUM", f"$n{i}")
+        if kind in ("pr", "probe"):
+            fields = PR_FIELDS.replace("NUM", f"$n{i}") if kind == "pr" else PR_PROBE_FIELDS
             parts.append(f"p{i}: repository(owner: $o{i}, name: $r{i}) {{ pullRequest(number: $n{i}) {{ {fields} }} }}")
         else:
             parts.append(f"c{i}: repository(owner: $o{i}, name: $r{i}) {{ issueOrPullRequest(number: $n{i}) "
@@ -1889,6 +1903,37 @@ def outranks(new: dict, new_order: tuple, old: dict, old_order: tuple) -> bool:
     if live[0] and cancelled[1]:
         return True
     return new_order >= old_order
+
+
+def pr_fingerprint(node: dict | None) -> str | None:
+    """What a PR node says that a verdict or a wait reads, as one string: its state, mergeability, head and review, its
+    rollup's state, and its check runs and statuses counted by state, and its suite count. The same from the full read
+    and from PR_PROBE. None when the counts are missing (a node from REST, or an answer without them): never probed."""
+    if not isinstance(node, dict):
+        return None
+    commits = (node.get("commits") or {}).get("nodes") if isinstance(node.get("commits"), dict) else None
+    commit = ((commits or [{}])[0] or {}).get("commit") if isinstance(commits, list) else None
+    if not isinstance(commit, dict):
+        return None
+    rollup = commit.get("statusCheckRollup")
+    contexts = rollup.get("contexts") if isinstance(rollup, dict) else None
+    suites = commit.get("checkSuites")
+    if rollup is not None and not (isinstance(contexts, dict) and isinstance(contexts.get("checkRunCountsByState"), list)
+                                   and isinstance(contexts.get("statusContextCountsByState"), list)):
+        return None
+    if not isinstance(suites, dict) or not isinstance(suites.get("totalCount"), int):
+        return None
+
+    def counts(rows: Any) -> list:
+        return sorted((str(r.get("state")), r.get("count")) for r in rows or [] if isinstance(r, dict) and r.get("count"))
+
+    return json.dumps([node.get(k) for k in ("state", "isDraft", "merged", "mergeable", "mergeStateStatus",
+                                             "headRefOid", "reviewDecision")]
+                      + [None if rollup is None else rollup.get("state"),
+                         None if contexts is None else contexts.get("totalCount"),
+                         None if contexts is None else counts(contexts.get("checkRunCountsByState")),
+                         None if contexts is None else counts(contexts.get("statusContextCountsByState")),
+                         suites.get("totalCount")], sort_keys=True)
 
 
 def drop_null_contexts(node: dict) -> int:
@@ -4112,10 +4157,17 @@ class Daemon:
         if due:
             # Heads go in a request of their own: an upstream older than head keys refuses a whole request that has
             # one, and that must not stop the PRs' and runs' reads.
+            # Each read sets upstream_status: a failing first read must not be called "ok" by a head read after it
+            # (the stale alarm holds, and stale waits stay, only for an "ok" upstream). Either failing, the tick fails.
+            failed = None
             for part in ([e for e in due if not e["key"].startswith("head:")],
                          [e for e in due if e["key"].startswith("head:")]):
                 if part:
                     self.upstream_read(ask, part)
+                    if self.upstream_status.get("state") == "failing":
+                        failed = failed or self.upstream_status
+            if failed is not None:
+                self.upstream_status = failed
         self.attempted = {k: t for k, t in self.attempted.items() if self.now - t < 2 * IDLE_EXPIRY}
         self.consumer_sent = {k: t for k, t in self.consumer_sent.items() if self.now - t < 2 * HEAD_INTEREST}
         kinds = {kind: [e for e in due if e["key"].startswith(kind + ":")] for kind in CYCLES}
@@ -4472,7 +4524,7 @@ class Daemon:
             base = current if isinstance(current, dict) else prior
             entry = {"key": key, "fetchedAt": self.now, "dataAt": None, "data": None, "error": None}
             if base:
-                entry.update({k: base[k] for k in ("dataAt", "data", "etag", "jobs", "jobsEtag", "jobsAt", "jobsTried", "restAt", "source", "restParts", "restRun", "restRunAt", "origin", "via", "rerunAt")
+                entry.update({k: base[k] for k in ("dataAt", "data", "etag", "jobs", "jobsEtag", "jobsAt", "jobsTried", "restAt", "source", "restParts", "restRun", "restRunAt", "origin", "via", "rerunAt", "fp", "fullAt")
                               if k in base})
             entry.update(fields)
             if key.startswith("pr:") and isinstance(entry.get("data"), dict) and "data" in fields:
@@ -4524,6 +4576,7 @@ class Daemon:
             problems[str(path[0])] = err
         alias, field = ("p", "pullRequest") if kind == "pr" else ("c", "issueOrPullRequest")
         parsed = {}
+        fps: dict[int, str | None] = {}  # PR alias -> its fingerprint (pr_fingerprint), None when partial
         attempts: dict[int, list[str] | str] = {}  # PR alias -> its suites whose newest attempt ran nothing
         nulls: dict[int, int] = {}  # PR alias -> context nodes GitHub answered null (drop_null_contexts)
         if kind == "pr":
@@ -4548,12 +4601,15 @@ class Daemon:
                 parsed[i] = parse_pr(node) if kind == "pr" else parse_comments(node)
                 if page_error:
                     parsed[i]["checksPageError"] = page_error
+                if kind == "pr":
+                    fps[i] = None if page_error else pr_fingerprint(node)
         if kind == "pr":
             self.fill_steps([(entries[i], d) for i, d in parsed.items()])
         for i, e in enumerate(entries):
             if i in parsed:
                 # a REST read's kept answers are dead weight in a file clients re-read every 3 s
-                self.store(e["key"], e["cache"], dataAt=self.now, data=parsed[i], restParts=None, via="graphql")
+                more = {"fp": fps.get(i), "fullAt": self.now} if kind == "pr" else {}
+                self.store(e["key"], e["cache"], dataAt=self.now, data=parsed[i], restParts=None, via="graphql", **more)
                 continue
             err = problems.get(f"{alias}{i}") or {}
             what = "pull request" if kind == "pr" else "issue or pull request"
@@ -4660,7 +4716,56 @@ class Daemon:
         return f"graphql: more than {PR_CONTEXT_MAX_PAGES * 100} PR checks"
 
     def fetch_prs(self, entries: list[dict]) -> str | None:
-        return self.fetch_aliased(entries, "pr")
+        """The batch's PRs: the ones a probe may confirm (probe_ok) are probed first, one cheap query (PR_PROBE_FIELDS),
+        and only the rest, and the probed ones that changed, are read in full."""
+        probe = [e for e in entries if self.probe_ok(e)]
+        full = [e for e in entries if not self.probe_ok(e)]
+        if probe:
+            changed, error = self.probe_prs(probe)
+            if error is not None:
+                self.fail(entries, error)
+                return error
+            full += changed
+        return self.fetch_aliased(full, "pr") if full else None
+
+    def probe_ok(self, e: dict) -> bool:
+        """Whether this PR's cached answer may be confirmed by a probe instead of read in full: a whole GraphQL read
+        (no error, nothing partial) with its fingerprint, read in full within PR_FULL_EVERY, still open, and every
+        failed or cancelled check's steps already read (fill_steps reads a few a cycle and only on a full read)."""
+        c = e.get("cache") or {}
+        data = c.get("data")
+        # (an answer from an upstream keeps this host's old fp: never confirmed against it)
+        return (isinstance(c.get("fp"), str) and c.get("via") in ("graphql", "graphql-probe") and not c.get("error")
+                and c.get("source") != "upstream"
+                and isinstance(data, dict) and not data.get("checksPageError") and data.get("state") == "OPEN"
+                and isinstance(c.get("fullAt"), (int, float)) and self.now - c["fullAt"] < PR_FULL_EVERY
+                and not any(wants_steps(ch) and "failedSteps" not in ch for ch in data.get("checks") or []))
+
+    def probe_prs(self, entries: list[dict]) -> tuple[list[dict], str | None]:
+        """One PR_PROBE query for ENTRIES: those whose fingerprint matches their cache are confirmed (dataAt and
+        fetchedAt move, the answer stays); the ones that changed, or that the probe could not read, come back to be read
+        in full. (changed, None), or ([], the error) when the whole query failed."""
+        query, variables = pr_query([e["key"] for e in entries], "probe")
+        reason, self.gql_reason = self.gql_reason, "pr-probe"
+        try:
+            doc, error = self.graphql(query, variables)
+        finally:
+            self.gql_reason = reason
+        if doc is None:
+            return [], error or "graphql: no response"
+        data = doc.get("data") or {}
+        if not data and doc.get("errors"):
+            return [], "graphql: " + str((doc["errors"][0] or {}).get("message"))[:200]
+        failed = {str((err.get("path") or [""])[0]) for err in doc.get("errors") or [] if isinstance(err, dict)}
+        changed = []
+        for i, e in enumerate(entries):
+            node = (data.get(f"p{i}") or {}).get("pullRequest")
+            if f"p{i}" in failed or pr_fingerprint(node) != (e.get("cache") or {}).get("fp"):
+                changed.append(e)
+                continue
+            self.reads.append((self.now, "pr", "graphql"))
+            self.store(e["key"], e["cache"], dataAt=self.now, via="graphql-probe")
+        return changed, None
 
     def fetch_comments(self, entries: list[dict]) -> str | None:
         return self.fetch_aliased(entries, "comment")
@@ -6409,7 +6514,8 @@ def summary(key: str, entry: dict | None, until: str = "done", grace: float = RE
                          "for a rescue attempt")
         lines.append(str(data.get("html_url") or ""))
     note = f"  (last error: {entry['error']})" if entry.get("error") else ""
-    via = {"rest": ", read over REST", "graphql": ", read over GraphQL"}.get(entry.get("via"), "")
+    via = {"rest": ", read over REST", "graphql": ", read over GraphQL",
+           "graphql-probe": ", confirmed unchanged over GraphQL"}.get(entry.get("via"), "")
     lines.append(f"data {age(entry.get('dataAt'))}{via}{note}")
     return "\n".join(lines)
 

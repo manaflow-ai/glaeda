@@ -214,6 +214,9 @@ class FakeGitHub:
         self.rate_limit_calls = 0  # GET /rate_limit: free, so it is counted separately
         self.throttle: dict[str, tuple[int, dict, bytes]] = {}  # "rest"|"graphql" -> the answer every read gets
         self.no_protection_feature = False  # a private repository's plan: rules and protection answer 403
+        self.counts = False  # answer the fingerprint's counts (pr_fingerprint): off, no PR is ever probed
+        self.probes = 0  # PR_PROBE queries answered
+        self.full_reads = 0  # full PR queries answered
 
     def rate(self, resource: str, remaining: int) -> dict:
         return {"x-ratelimit-limit": "5000", "x-ratelimit-remaining": str(remaining),
@@ -274,6 +277,11 @@ class FakeGitHub:
                 out = {"data": data}
                 return 200, self.rate("graphql", self.graphql_remaining), json.dumps(out).encode()
             comments = "issueOrPullRequest" in doc["query"]
+            if not comments:
+                if "checkSuites(first: 1) { totalCount }" in doc["query"]:
+                    self.probes += 1
+                else:
+                    self.full_reads += 1
             alias, field, table = ("c", "issueOrPullRequest", self.issues) if comments else ("p", "pullRequest", self.prs)
             i = 0
             while f"o{i}" in v:
@@ -283,6 +291,8 @@ class FakeGitHub:
                 if not comments and node is not None:
                     node = copy.deepcopy(node)
                     node["commits"]["nodes"][0]["commit"].update(self.suite_counts(node["headRefOid"]))
+                    if self.counts:
+                        self.add_counts(node, doc["query"])
                 data[f"{alias}{i}"] = {field: node}
                 if node is None:
                     errors.append({"type": "NOT_FOUND", "path": [f"{alias}{i}", field], "message": "Could not resolve"})
@@ -327,6 +337,32 @@ class FakeGitHub:
             return 304, self.rate("core", self.rest_remaining), b""
         self.rest_remaining -= 1
         return 200, {**self.rate("core", self.rest_remaining), "etag": etag}, json.dumps(payload).encode()
+
+    @staticmethod
+    def add_counts(node: dict, query: str) -> None:
+        """The connection-level counts GitHub answers beside the contexts (and the suites' totalCount), when the
+        query asks for them: a full read that forgot one would never match its probe."""
+        commit = node["commits"]["nodes"][0]["commit"]
+        if isinstance(commit.get("checkSuites"), dict) and re.search(r"checkSuites\(first: \d+\) \{ totalCount", query):
+            commit["checkSuites"]["totalCount"] = len(commit["checkSuites"].get("nodes") or [])
+        rollup = commit.get("statusCheckRollup")
+        if not rollup or "checkRunCountsByState" not in query:
+            return
+        contexts = rollup["contexts"]
+        runs: dict[str, int] = {}
+        statuses: dict[str, int] = {}
+        for c in contexts.get("nodes") or []:
+            if not isinstance(c, dict):
+                continue
+            if c.get("__typename") == "StatusContext":
+                statuses[c["state"]] = statuses.get(c["state"], 0) + 1
+            else:
+                state = c.get("conclusion") or c.get("status")
+                runs[state] = runs.get(state, 0) + 1
+        contexts["checkRunCount"] = sum(runs.values())
+        contexts["checkRunCountsByState"] = [{"state": k, "count": v} for k, v in runs.items()]
+        contexts["statusContextCount"] = sum(statuses.values())
+        contexts["statusContextCountsByState"] = [{"state": k, "count": v} for k, v in statuses.items()]
 
     def suite_counts(self, sha: str, repo: str | None = None) -> dict:
         """A commit's checkSuites as SUITE_ATTEMPTS asks: each suite's check runs in its newest attempt
@@ -1400,6 +1436,25 @@ class UpstreamTest(Base):
         self.assertEqual(pr["source"], "upstream")
         self.assertEqual(gg.read_cache("run:o/r/9")["jobs"], [{"id": 1}])
         self.assertEqual(status["upstream"]["state"], "ok")
+
+    def test_a_failed_pr_read_is_not_called_ok_by_the_head_read_after_it(self) -> None:
+        """glaeda#1949: the PR and run read failed, the head read in the same tick succeeded, and upstream_status
+        ended "ok". The stale alarm holds only for an "ok" upstream, so it stayed quiet through a real outage."""
+        head = "head:o/r@" + "a" * 40
+        gg.register("pr:o/r#7")
+        gg.register(head, consumer="merge-guard")
+        real = self.daemon.upstream_read
+
+        def pr_read_fails(ask, due):
+            if any(e["key"].startswith("pr:") for e in due):
+                return real(lambda request: (_ for _ in ()).throw(OSError("upstream down")), due)
+            return real(ask, due)
+
+        with mock.patch.object(self.daemon, "upstream_read", side_effect=pr_read_fails):
+            status = self.daemon.tick(now=NOW)
+        self.assertEqual(sorted(len(r["keys"]) for r in self.asked), [1], "the head read went up")
+        self.assertEqual(status["upstream"]["state"], "failing")
+        self.assertIn("OSError", status["upstream"]["error"])
 
     def test_a_controller_only_finish_stays_unconfirmed_downstream(self) -> None:
         """The upstream's provenance travels with the data: a finish only its controller reported is not ruled on
@@ -13740,6 +13795,121 @@ class QuietWritesTest(Base):
         self.assertGreater(served.stat().st_mtime, old + 1)
         # Well under a blocker's look: a mark WAITS_CHECK old is always older than a live daemon's .served.
         self.assertLess(gg.SERVED_QUIET + gg.TICK, gg.WAITS_CHECK / 2)
+
+
+class PrProbeTest(Base):
+    """2026-11-11: the shared GraphQL quota ran out four times in a day and every session's PR data went stale with it.
+    PR reads were 1,550 of the two daemons' ~2,000 points an hour, each one the full PR (about 1.4 points a PR) again
+    and again for PRs that had not changed. A PR whose fingerprint (pr_fingerprint) matches its last full read is
+    confirmed by a probe of 1 point per batch; any change, and every PR_FULL_EVERY, is read in full."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.gh.counts = True
+        for n in range(1, 11):
+            self.gh.prs[("o", "r", n)] = pr_node(n, rollup="PENDING", checks=[check_run("a"), check_run(
+                "b", status="IN_PROGRESS", conclusion=None)])
+            gg.register(gg.parse_key("pr", f"o/r#{n}"), waited=True)
+
+    def cycles(self, daemon: Any, count: int) -> None:
+        """COUNT cycles of DAEMON with every watch read by its waiter each cycle (no idle backoff)."""
+        for k in range(count):
+            at = NOW + gg.CYCLE * k
+            for n in range(1, 11):
+                path = gg.watch_dir() / gg.file_name(f"pr:o/r#{n}")
+                os.utime(path, (at, at))
+            daemon.tick(at)
+
+    def test_unchanged_prs_are_probed_not_read_in_full(self) -> None:
+        self.daemon.tick(NOW)
+        self.assertEqual((self.gh.full_reads, self.gh.probes), (1, 0), "the first read is the full one")
+        before = gg.read_cache("pr:o/r#3")
+        self.assertIsInstance(before["fp"], str)
+        later = NOW + gg.CYCLE
+        status = self.daemon.tick(later)
+        self.assertEqual(status["errors"], [])
+        self.assertEqual((self.gh.full_reads, self.gh.probes), (1, 1), "an unchanged batch costs one probe")
+        after = gg.read_cache("pr:o/r#3")
+        self.assertEqual(after["dataAt"], later, "a confirmed PR's data is fresh")
+        self.assertEqual(after["via"], "graphql-probe")
+        self.assertEqual(after["data"]["checks"], before["data"]["checks"])
+        self.assertEqual(after["fullAt"], NOW)
+
+    def test_a_changed_pr_is_read_in_full_and_only_it(self) -> None:
+        self.daemon.tick(NOW)
+        node = self.gh.prs[("o", "r", 4)]
+        node["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"][1].update(
+            status="COMPLETED", conclusion="FAILURE")
+        node["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["state"] = "FAILURE"
+        later = NOW + gg.CYCLE
+        self.daemon.tick(later)
+        self.assertEqual((self.gh.full_reads, self.gh.probes), (2, 1))
+        full = [json.loads(body)["variables"] for _, url, _, body in self.gh.calls if url.endswith("/graphql")
+                and b"checkSuites(first: 1) { totalCount }" not in body and b'"o0"' in body]
+        self.assertEqual([v.get("n0") for v in full][-1], 4)
+        self.assertNotIn("n1", full[-1], "only the changed PR is read in full")
+        cached = gg.read_cache("pr:o/r#4")
+        self.assertEqual(cached["via"], "graphql")
+        self.assertEqual(cached["data"]["checkState"], "FAILURE")
+        self.assertEqual([c["conclusion"] for c in cached["data"]["checks"] if c["name"] == "b"], ["FAILURE"])
+
+    def test_every_pr_is_read_in_full_every_pr_full_every(self) -> None:
+        self.cycles(self.daemon, int(gg.PR_FULL_EVERY // gg.CYCLE) + 2)
+        self.assertEqual(self.gh.full_reads, 2, "a probe never stands in for more than PR_FULL_EVERY")
+        self.assertEqual(self.gh.probes, int(gg.PR_FULL_EVERY // gg.CYCLE))
+
+    def test_a_new_head_or_a_merge_is_never_confirmed(self) -> None:
+        self.daemon.tick(NOW)
+        self.gh.prs[("o", "r", 2)]["headRefOid"] = "b" * 40
+        self.gh.prs[("o", "r", 5)].update(state="MERGED", merged=True)
+        self.daemon.tick(NOW + gg.CYCLE)
+        self.assertEqual(gg.read_cache("pr:o/r#2")["data"]["headRefOid"], "b" * 40)
+        self.assertEqual(gg.read_cache("pr:o/r#5")["data"]["state"], "MERGED")
+
+    def test_a_partial_read_is_never_probed(self) -> None:
+        node = self.gh.prs[("o", "r", 7)]
+        node["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"].append(None)
+        self.daemon.tick(NOW)
+        self.assertIn("checksPageError", gg.read_cache("pr:o/r#7")["data"])
+        self.assertIsNone(gg.read_cache("pr:o/r#7")["fp"])
+        self.daemon.tick(NOW + gg.CYCLE)
+        self.assertEqual(gg.read_cache("pr:o/r#7")["via"], "graphql", "a partial PR is read in full again")
+
+    def test_an_upstream_answer_is_never_confirmed_against_this_hosts_fingerprint(self) -> None:
+        """Review of glaeda#1950 (F2): an upstream's answer kept this host's fp, fullAt and via."""
+        self.daemon.tick(NOW)
+        key = "pr:o/r#6"
+        cached = gg.read_cache(key)
+        self.daemon.now = NOW + 1
+        self.daemon.store(key, cached, dataAt=NOW + 1, data=cached["data"], source="upstream")
+        self.assertFalse(self.daemon.probe_ok({"key": key, "cache": gg.read_cache(key)}))
+        self.assertTrue(self.daemon.probe_ok({"key": "pr:o/r#5", "cache": gg.read_cache("pr:o/r#5")}))
+
+    def test_a_failed_probe_fails_the_batch_and_spends_nothing_more(self) -> None:
+        self.daemon.tick(NOW)
+        self.gh.throttle["graphql"] = (502, self.gh.rate("graphql", 3000), b"bad gateway")
+        status = self.daemon.tick(NOW + gg.CYCLE)
+        self.assertTrue(status["errors"])
+        self.assertEqual(self.gh.full_reads, 1)
+
+    def test_points_per_hour_drop_for_settled_prs(self) -> None:
+        """The harness for the PR's before and after numbers: ten watched PRs whose answers do not change, an
+        hour of cycles, GraphQL points as GitHub counts them (graphql_cost) for each query the daemon sent."""
+
+        def points(counts: bool) -> int:
+            self.gh.calls.clear()
+            self.gh.counts = counts
+            with tempfile.TemporaryDirectory() as tmp, mock.patch.object(gg, "BASE", Path(tmp) / "gh"):
+                for n in range(1, 11):
+                    gg.register(gg.parse_key("pr", f"o/r#{n}"), waited=True)
+                daemon = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=None)
+                self.cycles(daemon, int(3600 // gg.CYCLE))
+            return sum(graphql_cost(json.loads(body)["query"]) for _, url, _, body in self.gh.calls
+                       if url.endswith("/graphql"))
+
+        old, new = points(False), points(True)
+        print(f"\nPR GraphQL points an hour, 10 unchanged PRs: before {old}, after {new}", file=sys.stderr)
+        self.assertLess(new, old / 3)
 
 
 class StaleDataTest(Base):
