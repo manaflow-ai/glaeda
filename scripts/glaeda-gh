@@ -6472,6 +6472,13 @@ def verdict(kind: str, data: dict | None, until: str = "green", sha: str | None 
         return EXIT_FAIL
     if until == "merged":
         return EXIT_OK if data.get("state") == "MERGED" else None
+    if until == "done" and data.get("state") == "MERGED":
+        # Nothing more runs for it: a merged PR is done whatever its head still shows (leo-workspace#4370, 2026-11-11:
+        # `--until done` saw MERGED at 600 s, then waited 15 min more on "checks: none reported yet"). A finished red
+        # still fails; a pending, missing or other-head check no longer holds the wait.
+        # (judged as green would: under "done" a red waits for the running checks, and that None would read as OK)
+        decided = check_verdict(data, "green", now, grace, settle)
+        return EXIT_FAIL if decided == EXIT_FAIL else EXIT_OK
     if sha and not str(data.get("headRefOid") or "").startswith(sha):
         return None  # the push has not reached GitHub yet, or these are an older commit's checks
     if conflicting(data):
@@ -7166,6 +7173,8 @@ def wait_step(req: dict, now: float) -> tuple[int, str] | None:
                              "merge or rebase onto the base and push")
         elif kind == "pr" and data.get("state") == "CLOSED":
             extra["note"] = "PR was closed without being merged"
+        elif kind == "pr" and until == "done" and data.get("state") == "MERGED":
+            extra["note"] = "PR was merged: done, whatever its checks still show"
         if kind == "run" and result == EXIT_FAIL and grace > 0 and run_hold(data, entry.get("jobs"), time.time(), float("inf")):
             extra["note"] = f"a glaeda runner refused this attempt at setup and no rescue attempt followed within {int(grace)}s"
         extra.update(wait_outcome(req, result, entry, waited))
