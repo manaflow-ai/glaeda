@@ -12050,14 +12050,14 @@ class ReaderTest(Base):
         """2026-11-11, huge-blue: claude-sr2-coord's waits from cosmic-gray ran under sshd with only what reach exports
         (ACPMUX_FROM, CMUX_AGENT_SESSION_ID, CMUX_AGENT_HOST), and every one read as tool:unknown."""
         reach = {"ACPMUX_FROM": "claude-sr2-coord", "CMUX_AGENT_SESSION_ID": "fbe26a19-ee72", "CMUX_AGENT_HOST": "cosmic-gray",
-                 "CMUX_AGENT_HARNESS": "claude", "SSH_CLIENT": "100.84.217.73 62759 22"}
+                 "CMUX_AGENT_HARNESS": "claude", "SSH_CLIENT": "192.0.2.7 62759 22"}
         self.assertEqual(self.reader_in(reach), "cosmic-gray/session:claude-sr2-coord")
         self.assertEqual(self.reader_in(reach, "/home/leo/.wt/checkouts/cmux/fix--base-red/web"),
                          "cosmic-gray/session:claude-sr2-coord:agent:fix--base-red")  # the helper's own checkout
         self.assertEqual(self.reader_in({**reach, "ACPMUX_FROM": ""}), "cosmic-gray/session:fbe26a19-ee72")
         self.assertEqual(self.reader_in({**reach, "CMUX_AGENT_HOST": "huge-blue"}), "session:claude-sr2-coord")
         # no session at all, under sshd: where the ssh came from, never tool:unknown
-        self.assertEqual(self.reader_in({"SSH_CLIENT": "100.84.217.73 62759 22"}), "tool:ssh-from-100.84.217.73")
+        self.assertEqual(self.reader_in({"SSH_CLIENT": "192.0.2.7 62759 22"}), "tool:ssh-from-192.0.2.7")
         for reader in ("cosmic-gray/session:claude-sr2-coord", "cosmic-gray/session:claude-sr2-coord:agent:fix--base-red"):
             self.assertEqual(gg.safe_reader(reader), reader)
         self.assertEqual(gg.safe_reader("session:a:agent:b c"), "")

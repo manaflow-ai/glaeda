@@ -2296,6 +2296,7 @@ class Daemon:
         # the runs this tick's due() put first as confirming reads: their finish, and their cache's fetchedAt then
         self.confirming: dict[str, tuple[dict, Any]] = {}
         self.repo_parts: dict[str, dict] = {}  # REST path -> {"at", "part"}: answers every watch on them shares
+        self.job_lists_asked: dict[str, float] = {}  # a run's job-list page -> the tick that last asked it
         self.deferred_before: dict[str, float] = {}  # deferred by the last tick: when each was first deferred
         self.deferred_since: dict[str, float] = {}  # when each key still deferred was first deferred
         self.sent: list[tuple[float, str]] = []  # (time, rest|rest304|graphql) for the last hour's counts
@@ -5033,8 +5034,9 @@ class Daemon:
         for stale in [p for p, v in self.repo_parts.items() if self.now - v["at"] >= REST_REPO_PART_KEEP]:
             del self.repo_parts[stale]
         over = len(self.repo_parts) - REST_SHARED_MAX
-        if over > 0:
-            for stale in sorted(self.repo_parts, key=lambda p: self.repo_parts[p]["at"])[:over]:
+        if over > 0:  # oldest first; this tick's answers last, so the one just stored is never the one dropped
+            for stale in sorted(self.repo_parts, key=lambda p: (self.repo_parts[p]["at"] >= self.now,
+                                                                self.repo_parts[p]["at"]))[:over]:
                 del self.repo_parts[stale]
 
     def head_part(self, old: dict, new: dict, path: str, slim: Callable[[Any], Any]) -> Any:
@@ -5194,7 +5196,7 @@ class Daemon:
             got = self.run_cache_job(owner, repo, c["runId"], job_id)
             if got is None and left > 0 and self.rest_room(1):
                 try:
-                    got, sent = self.run_list_job(root, c["runId"], job_id)
+                    got, sent = self.run_list_job(root, c["runId"], job_id, left)
                 except OutOfTime:  # the PR's checks and statuses are read; it goes first next tick for the steps
                     self.deferred.add(e["key"])
                     return
@@ -5230,24 +5232,26 @@ class Daemon:
                 return [j["failedSteps"], j["stepCount"]]
         return None
 
-    def run_list_job(self, root: str, run_id: Any, job_id: Any) -> tuple[list | None, int]:
-        """([failedSteps, stepCount] of JOB_ID or None, counted-or-sent requests) from RUN_ID's job list, one page
-        after another (REST_JOB_PAGES at most), each shared by every PR (head_part). A page the store holds is read
-        again only when it does not show the job completed yet, at most once a tick. Raises OutOfTime."""
+    def run_list_job(self, root: str, run_id: Any, job_id: Any, budget: int = REST_STEPS_MAX) -> tuple[list | None, int]:
+        """([failedSteps, stepCount] of JOB_ID or None, requests sent) from RUN_ID's job list, one page after another
+        (REST_JOB_PAGES, and BUDGET requests, at most), each shared by every PR (repo_parts). A page the store holds is
+        read again, conditional on its ETag, only when it does not show the job completed yet, and a page is asked at
+        most once a tick, answered or not (a failed read is not repeated for each failed job of the run). Raises
+        OutOfTime."""
         sent = 0
         for page in range(1, REST_JOB_PAGES + 1):
             path = f"{root}/actions/runs/{run_id}/jobs?filter=all&per_page=100&page={page}"
             shared = self.repo_parts.get(path)
             doc = (shared or {}).get("part", {}).get("doc") if shared else None
             found = next((j for j in (doc or {}).get("jobs") or [] if j.get("id") == job_id), None)
-            if not settled_job(found) and (shared is None or shared["at"] < self.now):
-                if not self.rest_room(1):
+            if not settled_job(found) and self.job_lists_asked.get(path) != self.now:
+                if sent >= budget or not self.rest_room(1):
                     return None, sent
-                if shared is not None:
-                    shared["at"] = float("-inf")  # past its TTL: the read below is conditional on its ETag
+                self.job_lists_asked = {p: t for p, t in self.job_lists_asked.items() if t == self.now}
+                self.job_lists_asked[path] = self.now
                 sent += 1
-                try:
-                    doc = self.head_part({}, {}, path, slim_run_jobs)
+                try:  # TTL 0: always asked, with the newest ETag; a failure leaves the stored page as it was
+                    doc = self.repo_part({}, {}, path, slim_run_jobs, None, 0)
                 except WatchError as error:
                     self.errors.append(f"{root} run {run_id} jobs: {error}")
                     return None, sent
