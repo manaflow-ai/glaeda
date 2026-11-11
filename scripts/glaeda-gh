@@ -114,8 +114,10 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   restarts): REST by route template (GET /repos/{owner}/{repo}/actions/runs/{id}, the query's parameter names
   only), GraphQL points by query name (pr, run, last-real-attempt, ...), each with its caller, the watch kind and
   repository (or outbox, a session's queued write), and its waiter: each watch file names its readers
-  (session:NAME, tool:NAME, or HOST/READER for a lane VM's read through an upstream), and a read is charged to
-  the one that read it last. daemon.json's spendBy holds the hour's top routes and callers,
+  (session:NAME, tool:NAME, or HOST/READER for a lane VM's read through an upstream or a wait over reach; a helper
+  inside a session adds :agent:ID, from GLAEDA_GH_AGENT, CMUX_AGENT_NAME or its checkout), and a read is charged to
+  the one that read it last. A route's waiters are the PRs' readers, one read per PR or commit whatever the number
+  of waits on it: a REST read of a commit, a pull or a run's job list serves every watch on it (repo_parts). daemon.json's spendBy holds the hour's top routes and callers,
   which `budget` prints and the fleet's quota readers (gh_quota.py spenders, ci-dash) can read with no API call.
 - Alarms, before the pool is empty rather than after. The pool alarm (policy "alarms": {"pool": true}, on one
   host: the pool is the account's) fires when the poorest REST counter is under alarms.restLeft (1000), its
@@ -559,7 +561,8 @@ SWITCH_MARGIN = 1.25  # a kind moves to the other bucket only when that one is t
 REST_CHECK_PAGES = 5  # check-run pages (100 each) one PR read over REST takes at most
 REST_STATUS_PAGES = 2  # commit-status pages (100 each) likewise
 REST_RUN_PAGES = 2  # a commit's workflow-run pages (100 each) likewise: without its run a check has no workflow
-REST_STEPS_MAX = 10  # failed or cancelled jobs whose steps one PR read over REST looks up at most
+REST_STEPS_MAX = 10  # step reads (a run's job-list page or one job) one PR read over REST makes at most
+REST_JOB_PAGES = 3  # pages (100 jobs each) of one run's job list a step lookup reads before it reads the job alone
 # A job whose steps read GitHub refused for good (404 for a job of a deleted run, 410, 422) is not asked again for
 # this long: each such read was retried on every read of its PR, a counted request each time. A 5xx or a transport
 # error is asked again at the normal pace: the steps hold a runner refusal for the rescue, whose grace is 360 s.
@@ -578,6 +581,15 @@ STEPS_GONE = re.compile(r"HTTP (?:404|410|422)\b")
 # every base move. A required check added or dropped on the base shows within this time.
 REST_REPO_PART_TTL = 600
 REST_REPO_PART_KEEP = 3600  # an answer past its TTL still lends its ETag to the refresh this long
+# A commit's check runs, statuses and workflow runs, a pull and a run's job list are read the same way for every
+# watch that needs them (a PR and a head watch on one commit, PRs whose failed jobs share a run): one answer serves
+# them all for REST_HEAD_PART_TTL, and past it the newest ETag known makes the refresh conditional, so a commit
+# nothing changed on answers 304 (free). Before, a GraphQL read dropped a PR's kept answers (restParts=None), so the
+# next REST read of that PR sent every one of them cold: on 2026-11-11 huge-blue's daemon sent 19 check-run, 17
+# status, 17 workflow-run and 22 pull reads in an hour and not one came back 304. Short, so a nudged PR (NUDGE_MIN)
+# still reads its head anew. REST_SHARED_MAX bounds the store; the oldest answers go first.
+REST_HEAD_PART_TTL = 15
+REST_SHARED_MAX = 600
 REST_READ_MAX = {"pr": REST_CHECK_PAGES + REST_STATUS_PAGES + REST_RUN_PAGES + 4, "run": 2, "comment": 3,
                  "head": REST_CHECK_PAGES + REST_STATUS_PAGES + REST_RUN_PAGES + 1}
 
@@ -940,14 +952,24 @@ def interest_fresh(path: Path, key: str, now: float | None = None) -> bool:
 # lane VMs and reconcilers kept those PRs watched. A reader already named within READER_REFRESH is not written again,
 # so a hot read stays a stat and a utime.
 READER_REFRESH = 300.0
-READER_KEYS = ("ACPMUX_SESSION_NAME", "CMUX_AGENT_SESSION", "ACPMUX_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_THREAD_ID")
+# ACPMUX_FROM and CMUX_AGENT_SESSION_ID are what `reach HOST CMD` exports on the far side of its ssh hop (the caller's
+# session name, its harness session id, CMUX_AGENT_HOST its host): without them every wait an agent on another host
+# ran through reach was tool:unknown (2026-11-11, huge-blue: claude-sr2-coord's waits from cosmic-gray, parent sshd).
+READER_KEYS = ("ACPMUX_SESSION_NAME", "ACPMUX_FROM", "CMUX_AGENT_SESSION", "ACPMUX_SESSION_ID", "CMUX_AGENT_SESSION_ID",
+               "CLAUDE_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CODEX_SESSION_ID")
+# A helper names itself inside its session (session:NAME:agent:ID): GLAEDA_GH_AGENT, else CMUX_AGENT_NAME, else, for
+# a subagent (Claude Code's AI_AGENT ends in _agent; it shares its parent's session variables) or a caller over
+# reach, the checkout it works in (`wt new` gives each helper its own: .../checkouts/REPO/NAME). claude-sr2-coord's
+# helpers all read as session:claude-sr2-coord, so a spend alarm could not tell which of a dozen helpers held a PR.
+READER_AGENT_KEYS = ("GLAEDA_GH_AGENT", "CMUX_AGENT_NAME")
+READER_ENV = READER_KEYS + READER_AGENT_KEYS + ("GLAEDA_GH_READER", "AI_AGENT", "CMUX_AGENT_HOST", "SSH_CLIENT")
 READER_WRAPPERS = re.compile(r"(?i)(ba|z|da|)sh|python3?(\.\d+)?|env|xargs|timeout|nice|gh|glaeda-gh")
 # A reader's name is written to watch files, spend logs, upstream requests and alarms, so it never carries command-line
 # text: only a session's name or id, or an executable's or script's base name, each held to this shape. A parent
 # `bash -c 'TOKEN=... python3 probe.py'` once gave the reader `tool:TOKEN=... python3 probe.py` (review, glaeda#1931).
 READER_NAME = re.compile(r"[A-Za-z0-9._-]{1,64}")
 # A reader handed in (GLAEDA_GH_READER, a downstream HOST/READER over the upstream): KIND:NAME parts of that shape.
-READER_SAFE = re.compile(r"(?:[A-Za-z0-9._-]{1,64}/)?(?:session|tool):[A-Za-z0-9._-]{1,64}")
+READER_SAFE = re.compile(r"(?:[A-Za-z0-9._-]{1,64}/)?(?:session|tool):[A-Za-z0-9._-]{1,64}(?::agent:[A-Za-z0-9._-]{1,64})?")
 _reader: str | None = None
 
 
@@ -997,24 +1019,64 @@ def command_tool(words: list[str]) -> str:
     return ""
 
 
+def checkout_name(cwd: str) -> str:
+    """The checkout CWD is in: NAME of a .../checkouts/REPO/NAME path (`wt new`), "" when it is in none."""
+    parts = Path(cwd).parts
+    for i in range(len(parts) - 2):
+        if parts[i] == "checkouts" and READER_NAME.fullmatch(parts[i + 2]):
+            return parts[i + 2]
+    return ""
+
+
+def reader_agent(remote: bool) -> str:
+    """The helper inside a session that reads: GLAEDA_GH_AGENT or CMUX_AGENT_NAME, else, for a subagent or a caller
+    over reach (REMOTE), its checkout's name, else "helper" for a subagent; "" for the session itself."""
+    named = next((os.environ[k].strip() for k in READER_AGENT_KEYS if os.environ.get(k, "").strip()), "")
+    if READER_NAME.fullmatch(named):
+        return named
+    sub = os.environ.get("AI_AGENT", "").strip().endswith("_agent")
+    if not (sub or remote):
+        return ""
+    try:
+        where = checkout_name(os.getcwd())
+    except OSError:
+        where = ""
+    return where or ("helper" if sub else "")
+
+
+def reader_host() -> str:
+    """The host a caller over reach runs on (CMUX_AGENT_HOST, when it is not this one), else ""."""
+    host = os.environ.get("CMUX_AGENT_HOST", "").strip().lower()
+    here = {socket.gethostname().split(".")[0].lower(), policy_host()}
+    return host if READER_NAME.fullmatch(host) and host not in here else ""
+
+
 def reader_name() -> str:
-    """This process's reader: GLAEDA_GH_READER, else its agent session (session:NAME), else the first tool up its
-    process tree that is not a shell, interpreter or wrapper (tool:pr_owner.py), else tool:unknown. Worked out once per
-    process, and always of the READER_SAFE shape."""
+    """This process's reader: GLAEDA_GH_READER, else its agent session (session:NAME, HOST/session:NAME for a caller
+    over reach), with the helper inside it (session:NAME:agent:ID, reader_agent), else the first tool up its process
+    tree that is not a shell, interpreter or wrapper (tool:pr_owner.py), else, over ssh, tool:ssh-from-ADDRESS, else
+    tool:unknown. Worked out once per process, and always of the READER_SAFE shape."""
     global _reader
     if _reader is None:
         named = safe_reader(os.environ.get("GLAEDA_GH_READER", "").strip())
         session = next((os.environ[k].strip() for k in READER_KEYS if os.environ.get(k, "").strip()), "")
-        _reader = named or (f"session:{session}" if READER_NAME.fullmatch(session) else "")
+        _reader = named
+        if not _reader and READER_NAME.fullmatch(session):
+            host = reader_host()
+            agent = reader_agent(bool(host))
+            _reader = safe_reader(f"{host + '/' if host else ''}session:{session}{':agent:' + agent if agent else ''}")
         pid = os.getppid()
         for _ in range(4 if not _reader else 0):
             tool = command_tool(parent_command(pid))
-            if tool:
+            if tool and tool not in ("sshd", "sshd-session"):
                 _reader = f"tool:{tool}"
                 break
             pid = parent_pid(pid)
             if pid <= 1:
                 break
+        if not _reader:
+            client = os.environ.get("SSH_CLIENT", "").split()
+            _reader = safe_reader(f"tool:ssh-from-{client[0]}") if client else ""
         _reader = _reader or "tool:unknown"
     return _reader
 
@@ -1936,8 +1998,24 @@ def failed_steps(steps: list | None) -> list[str]:
 def slim_jobs(doc: dict) -> list[dict]:
     keep = ("id", "name", "status", "conclusion", "html_url", "run_attempt", "runner_name", "labels",
             "started_at", "completed_at")
-    return [{**{k: j.get(k) for k in keep}, "failedSteps": failed_steps(j.get("steps"))}
+    return [{**{k: j.get(k) for k in keep}, "failedSteps": failed_steps(j.get("steps")),
+             "stepCount": len(j["steps"]) if isinstance(j.get("steps"), list) else None}
             for j in doc.get("jobs") or []]
+
+
+def slim_run_jobs(doc: Any) -> dict:
+    """A run's job list as fill_steps_rest keeps it: each job's id, status, failed steps and step count."""
+    doc = doc if isinstance(doc, dict) else {}
+    return {"total": doc.get("total_count") or 0, "jobs": [
+        {"id": j.get("id"), "status": j.get("status"), "failedSteps": failed_steps(j.get("steps")),
+         "stepCount": len(j["steps"]) if isinstance(j.get("steps"), list) else None}
+        for j in doc.get("jobs") or [] if isinstance(j, dict)]}
+
+
+def settled_job(j: Any) -> bool:
+    """A job a list showed completed with its steps: its failed steps and step count are final."""
+    return isinstance(j, dict) and j.get("status") == "completed" and isinstance(j.get("failedSteps"), list) \
+        and isinstance(j.get("stepCount"), int)
 
 
 def jobs_attempt(jobs: list[dict] | None) -> int:
@@ -2180,7 +2258,7 @@ class Daemon:
         self.confirm_tried: dict[str, tuple[float, dict]] = {}
         # the runs this tick's due() put first as confirming reads: their finish, and their cache's fetchedAt then
         self.confirming: dict[str, tuple[dict, Any]] = {}
-        self.repo_parts: dict[str, dict] = {}  # REST path -> {"at", "part"}: repo/base-level answers every PR shares
+        self.repo_parts: dict[str, dict] = {}  # REST path -> {"at", "part"}: answers every watch on them shares
         self.deferred_before: dict[str, float] = {}  # deferred by the last tick: when each was first deferred
         self.deferred_since: dict[str, float] = {}  # when each key still deferred was first deferred
         self.sent: list[tuple[float, str]] = []  # (time, rest|rest304|graphql) for the last hour's counts
@@ -3966,7 +4044,8 @@ class Daemon:
         # recently sent first (consumer_sent), so every consumer goes up in turn, as keys rotate.
         keys, sent, lines_of = [], [], {}
         for e in due:
-            reader = f"{policy_host()}/{waiter_of(e).split('/')[-1]}"
+            # a reader that names its own host (a caller over reach) keeps it; any other is this host's
+            reader = waiter_of(e) if "/" in waiter_of(e) else f"{policy_host()}/{waiter_of(e)}"
             base = {"key": e["key"], "jobs": e["jobs"], **({"reader": reader} if safe_reader(reader) else {}),
                     **({"touched": e["touched"]} if isinstance(e.get("touched"), (int, float)) else {}),
                     **({"wait": True, "waitedAt": e["waitedAt"]} if self.waited(e) else {})}
@@ -4804,30 +4883,44 @@ class Daemon:
         new[path] = kept if state == "same" else {"etag": etag, "doc": slim(doc)}
         return new[path]["doc"]
 
-    def repo_part(self, old: dict, new: dict, path: str, slim: Callable[[Any], Any], absent: Any = None) -> Any:
-        """rest_part for a repository- or base-level path every PR on it reads alike: one answer serves every
-        PR read for REST_REPO_PART_TTL, then one conditional read (with the newest ETag known) refreshes it
-        for all. A per-PR `unavailable` stands as in rest_part; a 404 (a deleted base) is shared as the fact,
-        and each PR keeps its own last answer, as rest_part does. An error is never shared."""
+    def repo_part(self, old: dict, new: dict, path: str, slim: Callable[[Any], Any], absent: Any = None,
+                  ttl: float = REST_REPO_PART_TTL) -> Any:
+        """rest_part for a path every watch that needs it reads alike (a repository- or base-level path every PR on
+        it reads, or a commit's, a pull's or a run's job list, REST_HEAD_PART_TTL): one answer serves every read for
+        TTL, then one conditional read (with the newest ETag known) refreshes it for all. A per-PR `unavailable`
+        stands as in rest_part; a 404 (a deleted base) is shared as the fact, and each PR keeps its own last answer,
+        as rest_part does. An error is never shared."""
         kept = old.get(path) or {}
         if absent is not None and kept.get("unavailable"):
             new[path] = kept
             return absent
         shared = self.repo_parts.get(path)
-        if shared is None or self.now - shared["at"] >= REST_REPO_PART_TTL:
+        if shared is None or self.now - shared["at"] >= ttl:
             lent = (shared or {}).get("part") or {}
             seed = {path: lent} if lent.get("etag") and "doc" in lent else old
             scratch: dict = {}
             self.rest_part(seed, scratch, path, slim, absent)  # raises on an error: nothing is shared
             shared = self.repo_parts[path] = {"at": self.now, "part": scratch[path]}
-            for stale in [p for p, v in self.repo_parts.items() if self.now - v["at"] >= REST_REPO_PART_KEEP]:
-                del self.repo_parts[stale]
+            self.forget_parts()
         part = shared["part"]
         if part.get("gone"):
             new[path] = {"doc": kept["doc"], "gone": True} if "doc" in kept else {"doc": absent, "gone": True}
         else:
             new[path] = part
         return new[path]["doc"]
+
+    def forget_parts(self) -> None:
+        """Drop shared answers past REST_REPO_PART_KEEP, then the oldest past REST_SHARED_MAX."""
+        for stale in [p for p, v in self.repo_parts.items() if self.now - v["at"] >= REST_REPO_PART_KEEP]:
+            del self.repo_parts[stale]
+        over = len(self.repo_parts) - REST_SHARED_MAX
+        if over > 0:
+            for stale in sorted(self.repo_parts, key=lambda p: self.repo_parts[p]["at"])[:over]:
+                del self.repo_parts[stale]
+
+    def head_part(self, old: dict, new: dict, path: str, slim: Callable[[Any], Any]) -> Any:
+        """A commit's, a pull's or a run's job-list read, shared by every watch on it (repo_part, REST_HEAD_PART_TTL)."""
+        return self.repo_part(old, new, path, slim, None, REST_HEAD_PART_TTL)
 
     def fetch_pr_rest(self, e: dict) -> None:
         """One PR over REST, for when GraphQL is the poorer bucket: the pull, its head's check runs,
@@ -4841,7 +4934,7 @@ class Daemon:
         root = f"/repos/{owner}/{repo}"
         old, parts = prior.get("restParts") or {}, {}
         try:
-            pull = self.rest_part(old, parts, f"{root}/pulls/{number}", slim_pull)
+            pull = self.head_part(old, parts, f"{root}/pulls/{number}", slim_pull)
             sha = (pull.get("head") or {}).get("sha") or ""
             base = urllib.parse.quote(str((pull.get("base") or {}).get("ref") or ""), safe="/")
             checks, statuses, runs, workflows = self.rest_head(old, parts, root, sha)
@@ -4873,15 +4966,15 @@ class Daemon:
         repository's workflow names, each a conditional read kept in `parts`. Raises WatchError."""
         # filter=all: every attempt, as GraphQL's rollup lists them, so parse_pr dedupes both alike
         path = f"{root}/commits/{sha}/check-runs?filter=all&per_page=100"
-        checks = self.rest_part(old, parts, path, slim_check_runs)
+        checks = self.head_part(old, parts, path, slim_check_runs)
         listed = list(checks.get("check_runs") or [])
         for page in range(2, min(REST_CHECK_PAGES, -(-(checks.get("total_count") or 0) // 100)) + 1):
-            listed += self.rest_part(old, parts, f"{path}&page={page}", slim_check_runs).get("check_runs") or []
+            listed += self.head_part(old, parts, f"{path}&page={page}", slim_check_runs).get("check_runs") or []
         checks = {"total_count": checks.get("total_count"), "check_runs": listed}
         statuses: list[dict] = []
         total = 0
         for page in range(1, REST_STATUS_PAGES + 1):
-            got = self.rest_part(old, parts, f"{root}/commits/{sha}/status?per_page=100&page={page}", slim_status_page)
+            got = self.head_part(old, parts, f"{root}/commits/{sha}/status?per_page=100&page={page}", slim_status_page)
             statuses += got.get("statuses") or []
             total = int(got.get("total") or 0)
             if len(statuses) >= total or not got.get("statuses"):
@@ -4889,7 +4982,7 @@ class Daemon:
         runs: list[dict] = []
         runs_total = 0
         for page in range(1, REST_RUN_PAGES + 1):
-            got = self.rest_part(old, parts, f"{root}/actions/runs?head_sha={sha}&per_page=100&page={page}",
+            got = self.head_part(old, parts, f"{root}/actions/runs?head_sha={sha}&per_page=100&page={page}",
                                  slim_head_runs_page)
             runs += got.get("runs") or []
             runs_total = int(got.get("total") or 0)
@@ -4953,13 +5046,19 @@ class Daemon:
                    restParts=parts, via="rest")
 
     def fill_steps_rest(self, e: dict, data: dict, root: str, job_ids: dict[str, Any]) -> None:
-        """fill_steps over REST, for a PR read over REST (GraphQL is the poorer bucket, or stopped).
-        An Actions check run's id is its job's id, and GET .../actions/jobs/ID lists the steps. A
-        completed job does not change, so each is read once; at most REST_STEPS_MAX per read, and
-        the rest on the next one. Without its steps a refused or never-started check cannot be held."""
+        """fill_steps over REST, for a PR read over REST (GraphQL is the poorer bucket, or stopped). An Actions
+        check run's id is its job's id, and a run's job list names every job's steps. A completed job does not
+        change, so each is read once. Steps come, cheapest first, from the PR's own cache, the run watch's cached
+        job list (free), and the run's job list (`runs/ID/jobs?filter=all`, one read for every job of the run,
+        shared by every PR and tick through repo_parts, conditional past REST_HEAD_PART_TTL); a job none of those
+        names (a run past REST_JOB_PAGES pages) is read alone, GET .../actions/jobs/ID. At most REST_STEPS_MAX
+        reads per PR read, and the rest on the next one. Without its steps a refused or never-started check
+        cannot be held. On 2026-11-11 huge-blue's daemon sent 22 jobs/{id} reads in an hour, one per failed job
+        of a few runs."""
         known = known_steps([(e, data)])
         left = REST_STEPS_MAX
         self.steps_failed = {j: t for j, t in self.steps_failed.items() if self.now - t < STEPS_RETRY}
+        _, owner, repo, _ = split_key(e["key"])
         for c in data.get("checks") or []:
             if not wants_steps(c):
                 continue
@@ -4969,14 +5068,27 @@ class Daemon:
             if settled_pr(data):
                 continue  # kept above when cached; nothing new is read for a settled PR
             job_id = job_ids.get(c["id"])
-            if not job_id or not c.get("runId") or left <= 0 or self.mode("rest") == "stop" or not self.rest_room(1):
+            if not job_id or not c.get("runId") or self.mode("rest") == "stop":
                 continue
             if job_id in self.steps_failed:
+                continue
+            got = self.run_cache_job(owner, repo, c["runId"], job_id)
+            if got is None and left > 0 and self.rest_room(1):
+                try:
+                    got, sent = self.run_list_job(root, c["runId"], job_id)
+                except OutOfTime:  # the PR's checks and statuses are read; it goes first next tick for the steps
+                    self.deferred.add(e["key"])
+                    return
+                left -= sent
+            if got is not None:
+                c["failedSteps"], c["stepCount"] = got
+                continue
+            if left <= 0 or not self.rest_room(1):
                 continue
             left -= 1
             try:
                 state, doc, _ = self.get(f"{root}/actions/jobs/{job_id}", None)
-            except OutOfTime:  # the PR's checks and statuses are read; it goes first next tick for the steps
+            except OutOfTime:
                 self.deferred.add(e["key"])
                 return
             if state != "fresh" or not isinstance(doc, dict):
@@ -4986,6 +5098,46 @@ class Daemon:
                 continue
             steps = doc.get("steps")
             c["failedSteps"], c["stepCount"] = failed_steps(steps), len(steps) if isinstance(steps, list) else None
+
+    @staticmethod
+    def run_cache_job(owner: str, repo: str, run_id: Any, job_id: Any) -> list | None:
+        """[failedSteps, stepCount] of JOB_ID from the run watch's cached job list (no request), or None."""
+        try:
+            jobs = (read_cache(f"run:{owner}/{repo}/{int(run_id)}") or {}).get("jobs")
+        except (TypeError, ValueError):
+            return None
+        for j in jobs if isinstance(jobs, list) else []:
+            if isinstance(j, dict) and j.get("id") == job_id and settled_job(j):
+                return [j["failedSteps"], j["stepCount"]]
+        return None
+
+    def run_list_job(self, root: str, run_id: Any, job_id: Any) -> tuple[list | None, int]:
+        """([failedSteps, stepCount] of JOB_ID or None, counted-or-sent requests) from RUN_ID's job list, one page
+        after another (REST_JOB_PAGES at most), each shared by every PR (head_part). A page the store holds is read
+        again only when it does not show the job completed yet, at most once a tick. Raises OutOfTime."""
+        sent = 0
+        for page in range(1, REST_JOB_PAGES + 1):
+            path = f"{root}/actions/runs/{run_id}/jobs?filter=all&per_page=100&page={page}"
+            shared = self.repo_parts.get(path)
+            doc = (shared or {}).get("part", {}).get("doc") if shared else None
+            found = next((j for j in (doc or {}).get("jobs") or [] if j.get("id") == job_id), None)
+            if not settled_job(found) and (shared is None or shared["at"] < self.now):
+                if not self.rest_room(1):
+                    return None, sent
+                if shared is not None:
+                    shared["at"] = float("-inf")  # past its TTL: the read below is conditional on its ETag
+                sent += 1
+                try:
+                    doc = self.head_part({}, {}, path, slim_run_jobs)
+                except WatchError as error:
+                    self.errors.append(f"{root} run {run_id} jobs: {error}")
+                    return None, sent
+                found = next((j for j in doc.get("jobs") or [] if j.get("id") == job_id), None)
+            if settled_job(found):
+                return [found["failedSteps"], found["stepCount"]], sent
+            if found is not None or int((doc or {}).get("total") or 0) <= 100 * page:
+                return None, sent  # listed but not finished, or not in the run at all: read alone
+        return None, sent
 
     def controller_down(self, error: Exception, site: str | None = None) -> None:
         """Leave the controller alone for a while; REST serves meanwhile. The cursor is kept, so the

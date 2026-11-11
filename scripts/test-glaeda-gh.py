@@ -2590,6 +2590,63 @@ class BalanceTest(Base):
         self.daemon.tick(NOW + 4 * gg.CYCLE)
         self.assertEqual(jobs(), 2)
 
+    def test_a_runs_failed_jobs_come_from_one_job_list_read_for_every_pr(self) -> None:
+        """2026-11-11, huge-blue: 22 jobs/{id} reads an hour, one per failed job. The run's job list names every
+        job's steps: one read serves each failed job of the run, for every PR that shows it, and no jobs/{id}."""
+        now = time.time()
+        checks = [{**workflow_check(name, 5, conclusion="FAILURE", node_id=f"CR_{name}"), "databaseId": job_id,
+                   "startedAt": iso(now - 7), "completedAt": iso(now)} for name, job_id in (("build", 51), ("test", 52))]
+        for n in (4, 7):
+            self.gh.prs[("o", "r", n)] = pr_node(n, rollup="FAILURE", checks=checks)
+            gg.register(f"pr:o/r#{n}")
+        runner = [{"name": "Set up job", "conclusion": "success"}, {"name": "Set up runner", "conclusion": "failure"}]
+        self.gh.jobs[5] = [{"id": 51, "status": "completed", "conclusion": "failure", "steps": runner},
+                           {"id": 52, "status": "completed", "conclusion": "failure",
+                            "steps": [{"name": "Run tests", "conclusion": "failure"}]},
+                           {"id": 53, "status": "completed", "conclusion": "success", "steps": []}]
+        self.budgets(rest=(4000, 1800), graphql=(50, 3000))  # GraphQL below its reserve: PRs over REST
+        self.daemon.tick(NOW)
+        for n in (4, 7):
+            got = {c["name"]: c["failedSteps"] for c in gg.read_cache(f"pr:o/r#{n}")["data"]["checks"]}
+            self.assertEqual(got, {"build": ["Set up runner"], "test": ["Run tests"]})
+        self.assertEqual([c for c in self.gh.rest_calls() if "/actions/jobs/" in c[1]], [])
+        self.assertEqual(len([c for c in self.gh.rest_calls() if "/actions/runs/5/jobs" in c[1]]), 1)
+
+    def test_steps_a_run_watch_cached_cost_nothing(self) -> None:
+        """A run watch already holds its jobs' steps: a PR read over REST takes them from that cache, no request."""
+        build = {**workflow_check("build", 5, conclusion="FAILURE", node_id="CR_build"), "databaseId": 51}
+        self.gh.prs[("o", "r", 4)] = pr_node(4, rollup="FAILURE", checks=[build])
+        cached_jobs = gg.slim_jobs({"jobs": [{"id": 51, "status": "completed", "conclusion": "failure",
+                                              "steps": [{"name": "Build", "conclusion": "failure"}]}]})
+        gg.write_json(gg.cache_dir() / gg.file_name("run:o/r/5"), {"key": "run:o/r/5", "jobs": cached_jobs})
+        self.budgets(rest=(4000, 1800), graphql=(50, 3000))
+        gg.register("pr:o/r#4")
+        self.daemon.tick(NOW)
+        self.assertEqual(gg.read_cache("pr:o/r#4")["data"]["checks"][0]["failedSteps"], ["Build"])
+        self.assertEqual(self.gh.job_calls(), [])
+
+    def test_a_pr_and_a_head_on_one_commit_share_its_reads_and_a_graphql_read_keeps_their_etags(self) -> None:
+        """One check-runs, status and runs?head_sha read per commit, whatever the number of watches on it; and a
+        GraphQL read in between no longer drops the ETags, so the next REST read of an unchanged head is a free 304."""
+        self.gh.prs[("o", "r", 4)] = pr_node(4, checks=[workflow_check("build", 5)])
+        sha = self.gh.prs[("o", "r", 4)]["headRefOid"]
+        self.budgets(rest=(4000, 1800), graphql=(50, 3000))
+        gg.register("pr:o/r#4")
+        gg.register(f"head:o/r@{sha}")
+        self.daemon.tick(NOW)
+        head_reads = lambda: [c for c in self.gh.rest_calls() if f"/commits/{sha}/" in c[1] or f"head_sha={sha}" in c[1]]  # noqa: E731
+        self.assertEqual(len([c for c in head_reads() if "/check-runs" in c[1]]), 1, head_reads())
+        self.assertEqual(len([c for c in head_reads() if "/status" in c[1]]), 1)
+        self.assertEqual(len([c for c in head_reads() if "head_sha=" in c[1]]), 1)
+        # a GraphQL read stores restParts=None; the shared store still lends the ETags to the next REST read
+        self.daemon.store("pr:o/r#4", gg.read_cache("pr:o/r#4"), restParts=None, via="graphql")
+        before, spent = len(self.gh.rest_calls()), self.gh.rest_remaining
+        gg.register("pr:o/r#4")
+        self.daemon.tick(NOW + gg.CYCLE)
+        again = self.gh.rest_calls()[before:]
+        self.assertTrue(again and all(c[2].get("If-None-Match") for c in again if "/pulls/" in c[1] or sha in c[1]), again)
+        self.assertEqual(self.gh.rest_remaining, spent)  # every one answered 304
+
     def merges_with_a_cached_refusal(self, rest: tuple, graphql: tuple) -> None:
         """Review, glaeda#1931: an OPEN to MERGED refresh dropped the cached failedSteps, so `wait pr --until green` on
         the merged PR failed at once on a runner refusal still inside the rescue grace. The cached steps carry forward."""
@@ -2968,7 +3025,8 @@ class FallbackTest(Base):
         self.assertEqual(pr["via"], "rest")
         self.assertTrue(pr["data"]["checksTruncated"])
         self.assertIsNone(gg.verdict("pr", pr["data"]))  # pending, never green
-        self.assertEqual(len([c for c in self.gh.rest_calls() if "/status?" in c[1] and c[1].endswith("page=2")]), 2)
+        # the head and the PR watch on one commit share its reads: page 2 is read once for both (repo_parts)
+        self.assertEqual(len([c for c in self.gh.rest_calls() if "/status?" in c[1] and c[1].endswith("page=2")]), 1)
 
     def test_more_workflow_runs_than_rest_reads_is_never_a_verdict(self) -> None:
         many = [workflow_check("build", 1000 + i, workflow="CI" if i else "Lint", conclusion="SUCCESS") for i in range(250)]
@@ -11876,10 +11934,10 @@ class ReaderTest(Base):
 
     def test_a_session_registers_by_its_name_and_a_tool_by_its_own(self) -> None:
         gg._reader = None
-        with mock.patch.dict(os.environ, {"ACPMUX_SESSION_NAME": "lane-7", "GLAEDA_GH_READER": ""}):
+        env = {k: "" for k in gg.READER_ENV}
+        with mock.patch.dict(os.environ, {**env, "ACPMUX_SESSION_NAME": "lane-7"}):
             self.assertEqual(gg.reader_name(), "session:lane-7")
         gg._reader = None
-        env = {k: "" for k in gg.READER_KEYS}
         with mock.patch.dict(os.environ, {**env, "GLAEDA_GH_READER": ""}), \
                 mock.patch.object(gg, "parent_command", return_value=["/usr/bin/python3", "/x/tools/pr_owner.py", "sweep"]):
             self.assertEqual(gg.reader_name(), "tool:pr_owner.py")
@@ -11888,7 +11946,7 @@ class ReaderTest(Base):
         """A parent `bash -c 'TOKEN=... python3 probe.py'` is tool:unknown: only a session's name or an executable's or
         script's base name is kept, and the payload is in no file the watch, the spend log or an alarm writes."""
         secret = "TOKEN=ghp_inline_secret_123"
-        env = {k: "" for k in gg.READER_KEYS}
+        env = {k: "" for k in gg.READER_ENV}
         for words in (["bash", "-c", f"{secret} python3 probe.py"], ["/bin/sh", f"{secret} x"], ["env", secret, "gh"]):
             gg._reader = None
             with mock.patch.dict(os.environ, {**env, "GLAEDA_GH_READER": ""}), \
@@ -11911,6 +11969,49 @@ class ReaderTest(Base):
         written = "".join(f.read_text(errors="replace") for f in gg.BASE.rglob("*") if f.is_file())
         self.assertNotIn("ghp_inline_secret", written)
         self.assertNotIn("ghp_inline_secret", "\n".join(gg.spend_lines(self.daemon.spend_by())))
+
+    def reader_in(self, env: dict, cwd: str = "/home/leo", parents: list | None = None) -> str:
+        """reader_name() with ENV (every other reader variable unset), the working directory CWD and, up the process
+        tree, the command lines PARENTS (none by default: a shell under sshd)."""
+        gg._reader = None
+        with mock.patch.dict(os.environ, {**{k: "" for k in gg.READER_ENV}, **env}), \
+                mock.patch.object(gg.os, "getcwd", return_value=cwd), \
+                mock.patch.object(gg, "policy_host", return_value="huge-blue"), \
+                mock.patch.object(gg.socket, "gethostname", return_value="huge-blue"), \
+                mock.patch.object(gg, "parent_command", side_effect=list(parents or [["sshd: leo@notty"]]) + [[]] * 4), \
+                mock.patch.object(gg, "parent_pid", return_value=1 if not parents else 2):
+            return gg.reader_name()
+
+    def test_a_wait_over_reach_names_the_calling_session_and_its_host(self) -> None:
+        """2026-11-11, huge-blue: claude-sr2-coord's waits from cosmic-gray ran under sshd with only what reach exports
+        (ACPMUX_FROM, CMUX_AGENT_SESSION_ID, CMUX_AGENT_HOST), and every one read as tool:unknown."""
+        reach = {"ACPMUX_FROM": "claude-sr2-coord", "CMUX_AGENT_SESSION_ID": "fbe26a19-ee72", "CMUX_AGENT_HOST": "cosmic-gray",
+                 "CMUX_AGENT_HARNESS": "claude", "SSH_CLIENT": "100.84.217.73 62759 22"}
+        self.assertEqual(self.reader_in(reach), "cosmic-gray/session:claude-sr2-coord")
+        self.assertEqual(self.reader_in(reach, "/home/leo/.wt/checkouts/cmux/fix--base-red/web"),
+                         "cosmic-gray/session:claude-sr2-coord:agent:fix--base-red")  # the helper's own checkout
+        self.assertEqual(self.reader_in({**reach, "ACPMUX_FROM": ""}), "cosmic-gray/session:fbe26a19-ee72")
+        self.assertEqual(self.reader_in({**reach, "CMUX_AGENT_HOST": "huge-blue"}), "session:claude-sr2-coord")
+        # no session at all, under sshd: where the ssh came from, never tool:unknown
+        self.assertEqual(self.reader_in({"SSH_CLIENT": "100.84.217.73 62759 22"}), "tool:ssh-from-100.84.217.73")
+        for reader in ("cosmic-gray/session:claude-sr2-coord", "cosmic-gray/session:claude-sr2-coord:agent:fix--base-red"):
+            self.assertEqual(gg.safe_reader(reader), reader)
+        self.assertEqual(gg.safe_reader("session:a:agent:b c"), "")
+
+    def test_a_helper_names_itself_inside_its_session(self) -> None:
+        """A subagent shares its parent's session variables: on cosmic-gray every helper's waits read as
+        session:claude-sr2-coord. Its own name, else its checkout, else "helper" tells them apart."""
+        session = {"ACPMUX_SESSION_NAME": "claude-sr2-coord", "ACPMUX_SESSION_ID": "01a18a35"}
+        sub = {**session, "AI_AGENT": "claude-code_2-1-312_agent"}
+        self.assertEqual(self.reader_in(session, "/Users/leoli/.wt/checkouts/glaeda/fix--x"), "session:claude-sr2-coord")
+        self.assertEqual(self.reader_in(sub, "/Users/leoli/.wt/checkouts/glaeda/fix--x/scripts"),
+                         "session:claude-sr2-coord:agent:fix--x")
+        self.assertEqual(self.reader_in(sub, "/Users/leoli/Projects"), "session:claude-sr2-coord:agent:helper")
+        self.assertEqual(self.reader_in({**sub, "GLAEDA_GH_AGENT": "waiter-fix"}), "session:claude-sr2-coord:agent:waiter-fix")
+        self.assertEqual(self.reader_in({**session, "CMUX_AGENT_NAME": "lane-3"}), "session:claude-sr2-coord:agent:lane-3")
+        self.assertEqual(self.reader_in({**sub, "GLAEDA_GH_AGENT": "a b"}, "/x"), "session:claude-sr2-coord:agent:helper")
+        self.assertEqual(self.reader_in({"CLAUDE_CODE_SESSION_ID": "fbe26a19"}), "session:fbe26a19")
+        self.assertEqual(self.reader_in({**session, "GLAEDA_GH_READER": "tool:merge_hold.py"}), "tool:merge_hold.py")
 
     def test_register_and_a_cached_read_add_their_reader_once(self) -> None:
         gg._reader = "session:a"
