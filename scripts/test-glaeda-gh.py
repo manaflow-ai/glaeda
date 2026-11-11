@@ -2391,6 +2391,50 @@ class BalanceTest(Base):
         self.assertEqual(data["requiredMissing"], [])
         self.assertEqual(len(self.gh.gql_calls()), 2)
 
+    def paged_pr(self, number: int, checks: list) -> None:
+        first = pr_node(number, checks=checks[:100])
+        contexts = first["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]
+        contexts["totalCount"] = len(checks)
+        contexts["pageInfo"] = {"hasNextPage": True, "endCursor": "100"}
+        first["baseRef"] = {"branchProtectionRule": {"requiredStatusCheckContexts": ["job-149"]}, "rules": {"nodes": []}}
+        self.gh.prs[("o", "r", number)] = first
+        self.gh.heads[("o", "r", "a" * 40)] = checks
+
+    def test_an_unchanged_paged_pr_keeps_its_whole_answer_without_its_pages(self) -> None:
+        """cosmic-gray, 2026-11-11 15:40Z: 7 of 74 PRs sat partial ("PR check pages wait for the per-minute ceiling"),
+        were never probed, and were read in full every cycle. A full read whose first page agrees with the whole
+        cached answer (same fingerprint, same first-page checks) keeps it and reads no pages."""
+        self.gh.counts = True
+        checks = [workflow_check(f"job-{i}", 5) for i in range(150)]
+        self.paged_pr(12, checks)
+        self.budgets(rest=(300, 3000), graphql=(4000, 3000))
+        gg.register("pr:o/r#12", waited=True)
+        self.daemon.tick(NOW)
+        whole = gg.read_cache("pr:o/r#12")
+        self.assertEqual(len(whole["data"]["checks"]), 150)
+        self.assertIsInstance(whole["fp"], str)
+        calls = len(self.gh.gql_calls())
+        # past PR_FULL_EVERY: the full read is due, and the pace has no room for its pages
+        later = NOW + gg.PR_FULL_EVERY + gg.CYCLE
+        os.utime(gg.watch_dir() / gg.file_name("pr:o/r#12"), (later, later))
+        self.daemon.gql_log = [(later - 1, "other", self.daemon.policy.get("graphqlPerMinute", gg.GRAPHQL_PER_MINUTE) - 2)]
+        self.daemon.tick(later)
+        kept = gg.read_cache("pr:o/r#12")
+        self.assertNotIn("checksPageError", kept["data"], "not stored partial for want of pages")
+        self.assertEqual(len(kept["data"]["checks"]), 150)
+        self.assertEqual((kept["dataAt"], kept["fullAt"], kept["via"]), (later, later, "graphql-probe"))
+        self.assertEqual(len(self.gh.gql_calls()) - calls, 1, "the first page only: no pages, no suite read")
+        # a check on the first page changed: read whole again (pages and all), never kept
+        self.gh.prs[("o", "r", 12)]["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"][3].update(
+            status="IN_PROGRESS", conclusion=None)
+        again = later + gg.PR_FULL_EVERY + gg.CYCLE
+        os.utime(gg.watch_dir() / gg.file_name("pr:o/r#12"), (again, again))
+        self.daemon.gql_log = []
+        self.daemon.tick(again)
+        changed = gg.read_cache("pr:o/r#12")
+        self.assertEqual(changed["via"], "graphql")
+        self.assertEqual([c["status"] for c in changed["data"]["checks"] if c["name"] == "job-3"], ["IN_PROGRESS"])
+
     def test_status_pr_does_not_page_when_required_checks_are_in_first_slice(self) -> None:
         checks = [workflow_check(f"job-{i}", 5) for i in range(150)]
         checks[99]["isRequired"] = True

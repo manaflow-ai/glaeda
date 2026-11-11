@@ -4679,11 +4679,15 @@ class Daemon:
         fps: dict[int, str | None] = {}  # PR alias -> its fingerprint (pr_fingerprint), None when partial
         attempts: dict[int, list[str] | str] = {}  # PR alias -> its suites whose newest attempt ran nothing
         nulls: dict[int, int] = {}  # PR alias -> context nodes GitHub answered null (drop_null_contexts)
+        kept: set[int] = set()  # PR aliases whose cached, paged answer this first page confirms (unchanged_paged)
         if kind == "pr":
             for i in range(len(entries)):
                 node = (data.get(f"{alias}{i}") or {}).get(field)
                 if node:
                     nulls[i] = drop_null_contexts(node)
+                    if not nulls[i] and f"{alias}{i}" not in limits and self.unchanged_paged(entries[i], node):
+                        kept.add(i)
+                        continue
                     commit = (((node.get("commits") or {}).get("nodes") or [{}])[0] or {}).get("commit") or {}
                     attempts[i] = ran_nothing_suites(commit)
         # one read for the whole batch's suites, not one per PR: most cmux heads have a few such suites
@@ -4691,6 +4695,8 @@ class Daemon:
             [s for found in attempts.values() if isinstance(found, list) for s in found], paced=False)
         for i, e in enumerate(entries):
             node = (data.get(f"{alias}{i}") or {}).get(field)
+            if i in kept:
+                continue
             if node:
                 page_error = None
                 if kind == "pr":
@@ -4710,6 +4716,9 @@ class Daemon:
             self.fill_steps([(entries[i], d) for i, d in parsed.items()])
         self.limited = [e for i, e in enumerate(entries) if f"{alias}{i}" in limits]
         for i, e in enumerate(entries):
+            if i in kept:
+                self.store(e["key"], e["cache"], dataAt=self.now, via="graphql-probe", fullAt=self.now)
+                continue
             if i in parsed:
                 # a REST read's kept answers are dead weight in a file clients re-read every 3 s
                 more = {"fp": fps.get(i), "fullAt": self.now} if kind == "pr" else {}
@@ -4720,6 +4729,28 @@ class Daemon:
             # only GitHub saying NOT_FOUND for this alias means it does not exist (or is not visible)
             self.store(e["key"], e["cache"], error=str(err.get("message") or f"no data for this {what}")[:200],
                        missing=err.get("type") == "NOT_FOUND")
+
+    def unchanged_paged(self, e: dict, node: dict) -> bool:
+        """Whether a full read's first page of a PR past one page of checks confirms its cached, whole answer: the
+        cache is a whole GraphQL read with a fingerprint, the fingerprint (every check run and status counted by
+        state, over all pages) is the same, and every check on this first page reads as cached. Then the cache stands
+        (dataAt and fullAt move) and its follow-up pages, its last-real-attempt suites and its steps are not read.
+        cosmic-gray, 2026-11-11 15:40Z: 7 of 74 open PRs sat partial with "PR check pages wait for the per-minute
+        ceiling"; a partial PR is never probed, so each was read in full again every cycle, and pages that waited for
+        the ceiling made it partial again (688 "pr" points in the hour, the daemon at its 40 a minute)."""
+        contexts = ((((node.get("commits") or {}).get("nodes") or [{}])[0] or {}).get("commit") or {}).get(
+            "statusCheckRollup") or {}
+        if not ((contexts.get("contexts") or {}).get("pageInfo") or {}).get("hasNextPage"):
+            return False  # one page: the full read is cheap and replaces the answer whole
+        if not self.probe_ok({**e, "cache": {**(e.get("cache") or {}), "fullAt": self.now}}):
+            return False  # (probe_ok's rules but the PR_FULL_EVERY bound: this is that full read)
+        cached = e["cache"]
+        if pr_fingerprint(node) != cached.get("fp"):
+            return False
+        known = {(c.get("workflow"), c.get("name")): (c.get("status"), c.get("conclusion"))
+                 for c in cached["data"].get("checks") or []}
+        first = parse_pr(node).get("checks") or []
+        return all(known.get((c.get("workflow"), c.get("name"))) == (c.get("status"), c.get("conclusion")) for c in first)
 
     def gql_minute_points(self) -> int:
         """GraphQL points this daemon spent in the last 60 s (graphqlPerMinute)."""
