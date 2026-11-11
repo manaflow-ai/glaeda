@@ -452,6 +452,13 @@ NUDGE_MIN = 20  # a PR a check event nudged is re-read at most this often (Graph
 # its own check events, so the TTL is only the safety net there too.
 IDLE_BACKOFF_AFTER = 300  # a PR nobody has read or waited on for this long is polled as often as it was last read
 IDLE_BACKOFF_MAX = 600  # ... but no less often than this (it expires at IDLE_EXPIRY)
+# A waited, unfinished watch is read every cycle (60 s; 240 s when lean). Data older than this on one is starved, not
+# paced: daemon.json's staleWaited says so, `restart` restarts a daemon whose heartbeat is fresh but whose waited data
+# is this old, and a wait hands itself back from the daemon and reads GitHub once itself (direct_read). The heartbeat
+# alone vouched for data that was 50 minutes old on huge-blue (2026-11-11), and `restart` refused.
+STALE_DATA_AFTER = 600
+DIRECT_READ_BUDGET = 60  # seconds a wait's own fallback read (direct_read) may take
+RECENT_ERRORS_KEEP = 3600  # daemon.json's recentErrors: the distinct errors of this long, newest first
 COMMENT_FED_CYCLE = 120  # comment watches on a repository the controller's issue_comment webhooks cover
 HEAD_PENDING_FED_TTL = 180  # a running head on such a repository: its check events re-read it sooner
 HEAD_ALIGN = 30  # a head read also takes the heads due within this long, so they share one query
@@ -1117,8 +1124,15 @@ def touch_interest(key: str) -> None:
 def write_json(path: Path, doc: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{time.monotonic_ns()}.tmp")
-    tmp.write_text(json.dumps(doc, sort_keys=True) + "\n")
-    os.replace(tmp, path)
+    try:
+        tmp.write_text(json.dumps(doc, sort_keys=True) + "\n")
+        os.replace(tmp, path)
+    except BaseException:
+        # A write cut off (a full disk, or a deadline's exception raised into it) left its empty temporary file behind
+        # for good: huge-blue's cache held dozens of zero-byte .budget.json.*.tmp files, some days old (2026-11-11).
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
 
 
 def read_json(path: Path) -> Any:
@@ -1875,13 +1889,36 @@ def outranks(new: dict, new_order: tuple, old: dict, old_order: tuple) -> bool:
     return new_order >= old_order
 
 
+def drop_null_contexts(node: dict) -> int:
+    """Remove the null (or non-object) context nodes from a PR node's rollup, in place; how many there were. A null
+    node is a context GitHub failed to read: the rollup is partial, so the caller marks it (checksPageError)."""
+    commits = (node.get("commits") or {}).get("nodes") if isinstance(node.get("commits"), dict) else None
+    commit = ((commits or [{}])[0] or {}).get("commit") if isinstance(commits, list) else None
+    rollup = commit.get("statusCheckRollup") if isinstance(commit, dict) else None
+    contexts = rollup.get("contexts") if isinstance(rollup, dict) else None
+    nodes = contexts.get("nodes") if isinstance(contexts, dict) else None
+    if not isinstance(nodes, list):
+        return 0
+    kept = [c for c in nodes if isinstance(c, dict)]
+    contexts["nodes"] = kept
+    return len(nodes) - len(kept)
+
+
+def null_contexts_error(count: int) -> str:
+    return f"graphql: {count} check context{'s' if count != 1 else ''} came back null (a partial rollup)"
+
+
 def parse_pr(node: dict) -> dict:
     commits = ((node.get("commits") or {}).get("nodes") or [{}])
     rollup = ((commits[0] or {}).get("commit") or {}).get("statusCheckRollup") or {}
     contexts = rollup.get("contexts") or {}
     latest: dict[str, tuple[tuple, dict]] = {}
     superseded: list[dict] = []  # replaced by a newer attempt or run; GitHub's rollup still counts them
-    nodes = contexts.get("nodes") or []
+    # GitHub answers a context it failed to resolve as null beside an error. One such node raised AttributeError here,
+    # which batched() swallowed for the whole batch: up to GQL_BATCH PRs kept their old data, with no error stored,
+    # for as long as GitHub kept answering it (huge-blue 2026-11-11: a merged PR read OPEN for 50 minutes).
+    # fetch_aliased marks such a PR partial (drop_null_contexts); this only keeps the parse total.
+    nodes = [c for c in contexts.get("nodes") or [] if isinstance(c, dict)]
     # A run the concurrency group cancelled for a newer run of the same workflow on this commit
     # leaves failed checks (ci-status: cancelled) that the newer run replaces when it gets there.
     def workflow_run(c: dict) -> tuple[object, int]:
@@ -2269,6 +2306,8 @@ class Daemon:
         # key -> {"at": last lone read, "fails": lone timeouts in a row, "oks": lone answers in a row}
         self.heavy: dict[str, dict] = {}
         self.since: dict[str, float] = {}  # key -> when the daemon first saw it watched, for oldestData
+        self.stale_waited: dict[str, float | None] = {}  # oldest_data's, for the watches a wait is blocked on
+        self.recent_errors: dict[str, float] = {}  # error -> when last seen (daemon.json recentErrors)
         self.beat = float("-inf")
         self.status: dict[str, Any] = {}  # the last good tick's daemon.json
         self.failing: dict[str, Any] | None = None  # set while ticks raise: the latest error and since when
@@ -3930,6 +3969,11 @@ class Daemon:
         self.rest_tried = {k: t for k, t in self.rest_tried.items() if self.now - t < 2 * IDLE_EXPIRY}
         self.confirm_tried = {k: t for k, t in self.confirm_tried.items() if self.now - t[0] < 2 * IDLE_EXPIRY}
         oldest = self.oldest_data(entries, {e["key"] for e in prs + runs + comments + heads})
+        # errors[] is this tick's only, and a heartbeat tick writes it empty: what failed a minute ago stays visible
+        for message in self.errors:
+            self.recent_errors[message] = self.now
+        self.recent_errors = dict(sorted(((m, t) for m, t in self.recent_errors.items()
+                                          if self.now - t < RECENT_ERRORS_KEEP), key=lambda x: -x[1])[:10])
         self.prune({e["key"] for e in entries})
         self.post_prune()
         first_minute = int(self.clock() // 60) - 60
@@ -3973,6 +4017,8 @@ class Daemon:
                   "spendBy": self.spend_by(), "alarms": self.alarms,
                   "perMinute": {b: round(self.richness(b) * 60, 1) for b in ("rest", "graphql")},
                   "batch": dict(self.batch), "oldestData": oldest, "deferred": len(self.deferred),
+                  "staleWaited": dict(self.stale_waited), "staleAfter": STALE_DATA_AFTER,
+                  "recentErrors": [{"error": m, "at": t} for m, t in self.recent_errors.items()],
                   "outbox": {"queued": len(list(outbox_dir().glob("*.json"))) if outbox_dir().is_dir() else 0,
                              "holdUntil": self.post_hold if self.post_hold > self.now else None}}
         if self.upstream_status is not None:
@@ -4174,6 +4220,8 @@ class Daemon:
 
     def serve_wait(self, d: Path, rid: str, req: Any, now: float, touch: dict[str, bool]) -> bool | None:
         """One request: None while pending, else whether its blocker was woken. Raises on a bad one."""
+        if isinstance(req, dict) and req.get("stale") is not None and waiter_alive(req.get("pid")):
+            return None  # handed back (below): its blocker takes it to resume_wait within WAITS_CHECK
         if (not isinstance(req, dict) or not waiter_alive(req.get("pid")) or not (d / f"{rid}.fifo").exists()
                 or now > float(req["began"]) + float(req["timeout"]) + WAITS_LEFTOVER):
             drop_wait(rid)
@@ -4199,6 +4247,16 @@ class Daemon:
                 (d / f"{rid}.out").write_text(done[1])
                 (d / f"{rid}.out.rc").write_text(f"{done[0]}\n")
                 req["code"] = done[0]
+            else:
+                starved = wait_starved(req, read_cache(req["key"]), now)
+                if starved is not None:
+                    # This daemon is not refreshing what the wait is blocked on: hand the wait back (its blocker sees
+                    # the FIFO gone and execs wait-resume), where poll_wait says so and reads GitHub once itself.
+                    req["stale"] = round(starved)
+                    write_json(d / f"{rid}.json", req)
+                    with contextlib.suppress(OSError):
+                        (d / f"{rid}.fifo").unlink()
+                    return None
             if req != before:
                 write_json(d / f"{rid}.json", req)
             if req.get("code") is None:
@@ -4261,7 +4319,22 @@ class Daemon:
                 self.defer(chunk + [e for c in queue for e in c])
                 return []
             except Exception as failure:  # noqa: BLE001  one bad batch must not stop the rest
-                self.errors.append(f"graphql: {describe(failure)}")
+                # A bug on one entry's answer (an AttributeError on a null node, huge-blue 2026-11-11) used to drop the
+                # whole chunk here with nothing stored: every PR in it kept its old data, errors[] was empty again by the
+                # next heartbeat, and the batch was cut the same way next cycle. Split the chunk so the healthy entries
+                # are read this tick, and store the error (with its code site) on an entry read alone, so `status` and
+                # `wait` say what failed and oldestData shows it. Bounded by GQL_SPLITS like a timeout's split.
+                message = f"graphql: {describe(failure)} at {error_site(failure)}"
+                self.errors.append(message)
+                self.spill = []
+                if len(chunk) >= 2 and splits + 2 <= GQL_SPLITS:
+                    splits += 2
+                    half = (len(chunk) + 1) // 2
+                    queue = [chunk[:half], chunk[half:]] + queue
+                    continue
+                with contextlib.suppress(Exception):  # noqa: BLE001  storing the error must not stop the rest
+                    for e in chunk:
+                        self.store(e["key"], e["cache"], error=message[:300])
                 continue
             if (error or self.gql_limited) and self.mode("graphql") == "stop":
                 # this query hit the limit (a RATE_LIMITED answer can still carry data.rateLimit and null aliases):
@@ -4304,8 +4377,11 @@ class Daemon:
 
     def oldest_data(self, entries: list[dict], fetched: set[str]) -> dict[str, float | None]:
         """Per kind, how old the oldest data of an open (not finished) watch is. A finished one is
-        re-read only every TERMINAL_REFRESH by design, so it does not count."""
+        re-read only every TERMINAL_REFRESH by design, so it does not count. self.stale_waited gets the same
+        for the watches a wait is blocked on only: those are read every cycle, so an old one there is starved
+        (STALE_DATA_AFTER), where an idle PR's old data is only its backoff."""
         oldest: dict[str, float | None] = {kind: None for kind in CYCLES}
+        self.stale_waited = {kind: None for kind in CYCLES}
         self.since = {e["key"]: self.since.get(e["key"], self.now) for e in entries}
         for e in entries:
             kind = split_key(e["key"])[0]
@@ -4316,6 +4392,8 @@ class Daemon:
             seen = (cached or {}).get("dataAt") or self.since[e["key"]]
             age_s = max(0.0, self.now - seen)
             oldest[kind] = max(oldest[kind] or 0.0, age_s)
+            if self.waited(e):
+                self.stale_waited[kind] = max(self.stale_waited[kind] or 0.0, age_s)
         return oldest
 
     def tick_failed(self, error: str, site: str, now: float | None = None) -> None:
@@ -4396,10 +4474,12 @@ class Daemon:
         alias, field = ("p", "pullRequest") if kind == "pr" else ("c", "issueOrPullRequest")
         parsed = {}
         attempts: dict[int, list[str] | str] = {}  # PR alias -> its suites whose newest attempt ran nothing
+        nulls: dict[int, int] = {}  # PR alias -> context nodes GitHub answered null (drop_null_contexts)
         if kind == "pr":
             for i in range(len(entries)):
                 node = (data.get(f"{alias}{i}") or {}).get(field)
                 if node:
+                    nulls[i] = drop_null_contexts(node)
                     commit = (((node.get("commits") or {}).get("nodes") or [{}])[0] or {}).get("commit") or {}
                     attempts[i] = ran_nothing_suites(commit)
         # one read for the whole batch's suites, not one per PR: most cmux heads have a few such suites
@@ -4412,6 +4492,8 @@ class Daemon:
                 if kind == "pr":
                     page_error = self.extend_pr_contexts(e, node)
                     page_error = self.add_last_real_contexts(node, attempts[i], suite_runs, suites_error) or page_error
+                    # a context GitHub could not read may be a red one: partial, never greener
+                    page_error = page_error or (null_contexts_error(nulls[i]) if nulls.get(i) else None)
                 parsed[i] = parse_pr(node) if kind == "pr" else parse_comments(node)
                 if page_error:
                     parsed[i]["checksPageError"] = page_error
@@ -4508,13 +4590,18 @@ class Daemon:
             contexts_more = (rollup_more or {}).get("contexts") or {}
             if more.get("errors") or not rollup_more:
                 return "graphql: PR check page unavailable"
-            nodes.extend(contexts_more.get("nodes") or [])
-            reported |= {c.get("name") or c.get("context") for c in contexts_more.get("nodes") or []}
+            more_nodes = contexts_more.get("nodes") or []
+            dropped = sum(1 for c in more_nodes if not isinstance(c, dict))
+            more_nodes = [c for c in more_nodes if isinstance(c, dict)]
+            nodes.extend(more_nodes)
+            reported |= {c.get("name") or c.get("context") for c in more_nodes}
             page = contexts_more.get("pageInfo") or {}
             cursor = page.get("endCursor")
             contexts["nodes"] = nodes
             contexts["totalCount"] = contexts_more.get("totalCount", contexts.get("totalCount", len(nodes)))
             contexts["pageInfo"] = page
+            if dropped:
+                return null_contexts_error(dropped)
             if not page.get("hasNextPage"):
                 return None
             if required and required.issubset(reported):
@@ -5343,6 +5430,26 @@ def clear_failing() -> None:
         write_json(BASE / "daemon.json", status)
 
 
+TEMP_FILE = re.compile(r"\.(?P<name>.+)\.(?P<pid>\d+)\.\d+\.tmp")  # write_json's temporary files
+
+
+def sweep_temp_files(now: float | None = None) -> int:
+    """Remove write_json's temporary files under BASE that an earlier write left when it was cut off (before
+    write_json cleaned up after itself): only one whose writer pid is gone and that is an hour old. How many."""
+    now = time.time() if now is None else now
+    gone = 0
+    for folder in (BASE, *(p for p in BASE.iterdir() if p.is_dir())) if BASE.is_dir() else ():
+        for path in folder.glob(".*.tmp"):
+            found = TEMP_FILE.fullmatch(path.name)
+            if found is None or waiter_alive(int(found["pid"])):
+                continue
+            with contextlib.suppress(OSError):
+                if now - path.stat().st_mtime >= 3600:
+                    path.unlink()
+                    gone += 1
+    return gone
+
+
 def first_heartbeat(now: float | None = None) -> None:
     """Write a heartbeat as soon as the lock is ours, before the first tick (which can take
     TICK_BUDGET and more). Until then daemon.json held the previous process's last heartbeat, so a
@@ -5352,6 +5459,7 @@ def first_heartbeat(now: float | None = None) -> None:
     status = read_json(BASE / "daemon.json")
     status = status if isinstance(status, dict) else {}
     status.pop("failing", None)
+    status.pop("staleWaited", None)  # the previous process's starvation is not this one's (daemon_starved)
     write_json(BASE / "daemon.json", {**status, "pid": os.getpid(), "at": now, "startedAt": now,
                                       "heartbeat": HEARTBEAT_EVERY})
 
@@ -5506,6 +5614,10 @@ def hold_daemon_lock() -> Any:
 def serve(foreground_ok: bool = False) -> int:
     lock = hold_daemon_lock()
     first_heartbeat()
+    with contextlib.suppress(OSError):
+        swept = sweep_temp_files()
+        if swept:
+            log({"event": "swept", "tempFiles": swept})
     me = Path(__file__).resolve()
     stamp = me.stat().st_mtime
     daemon = Daemon()
@@ -5838,6 +5950,30 @@ def silent_unit() -> float | None:
     at = status.get("at") if mine else None
     silent = min(time.time() - at, active) if isinstance(at, (int, float)) else active
     return silent if silent > STALE_HEARTBEAT else None
+
+
+def daemon_starved(status: Any = None) -> dict | None:
+    """When the daemon's heartbeat may be fresh but the data a wait is blocked on is not: {"kind", "age", "quota"}
+    for the kind with the oldest waited data past STALE_DATA_AFTER (daemon.json staleWaited), else None. "quota" is
+    true when GitHub's own limits explain it (GraphQL stopped and REST stopped or at the daemon's share), which a
+    restart cannot fix."""
+    status = read_json(BASE / "daemon.json") if status is None else status
+    if not isinstance(status, dict):
+        return None
+    stale = status.get("staleWaited")
+    if not isinstance(stale, dict):
+        return None
+    bound = status.get("staleAfter") if isinstance(status.get("staleAfter"), (int, float)) else STALE_DATA_AFTER
+    at = status.get("at") if isinstance(status.get("at"), (int, float)) else time.time()
+    ages = {k: v + max(0.0, time.time() - at) for k, v in stale.items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)}
+    kind = max(ages, key=ages.get, default=None)
+    if kind is None or ages[kind] <= bound:
+        return None
+    modes = status.get("modes") if isinstance(status.get("modes"), dict) else {}
+    share = status.get("restShare") if isinstance(status.get("restShare"), dict) else {}
+    quota = modes.get("graphql") == "stop" and (modes.get("rest") == "stop" or bool(share.get("capped")))
+    return {"kind": kind, "age": ages[kind], "quota": quota}
 
 
 def daemon_failing() -> dict | None:
@@ -6787,6 +6923,54 @@ def cmd_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_
     return poll_wait(wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace, settle))
 
 
+def wait_starved(req: dict, entry: dict | None, now: float) -> float | None:
+    """How old the data a wait is blocked on is, when it is starved: the wait has run STALE_DATA_AFTER and nothing was
+    read for its target in that long (since the wait began, for a target never read), and no direct read was tried
+    in that long. None otherwise. Only for an undecided wait: wait_step rules first."""
+    began = float(req["began"])
+    if now - began < STALE_DATA_AFTER:
+        return None
+    if now - float(req.get("directAt") or float("-inf")) < STALE_DATA_AFTER:
+        return None
+    seen = (entry or {}).get("dataAt")
+    age_s = now - (seen if isinstance(seen, (int, float)) and not isinstance(seen, bool) else began)
+    return age_s if age_s > STALE_DATA_AFTER else None
+
+
+def direct_read(req: dict) -> str | None:
+    """One read of the wait's target from GitHub by this process, outside the daemon's queue, stored in the cache the
+    way the daemon stores it (so wait_step rules on it): a PR over GraphQL, a run over REST. The fallback for a wait
+    whose daemon heartbeats but has not refreshed this target (wait_starved). None, or why it could not read."""
+    key, kind = req["key"], req["kind"]
+    if kind not in ("pr", "run"):
+        return f"no direct read for a {kind}"
+    if upstream_command() is not None:
+        return "this host reads GitHub through an upstream (no login here)"
+    daemon = Daemon(controller=None, upstream=None)
+    if daemon.mode("graphql" if kind == "pr" else "rest") == "stop":
+        return "GitHub's quota for this read is spent"
+    daemon.now = time.time()
+    daemon.tick_deadline = time.monotonic() + DIRECT_READ_BUDGET
+    entry = {"key": key, "jobs": bool(req.get("jobs")), "cache": read_cache(key), "touched": daemon.now,
+             "waitedAt": daemon.now, "waitBegan": float(req["began"]), "readers": [], "reader": "", "consumers": {}}
+    try:
+        with daemon.calling(*caller_of(key), "tool:glaeda-gh wait (direct read)"):
+            if kind == "pr":
+                daemon.gql_reason = "pr-direct"
+                error = daemon.fetch_prs([entry])
+            else:
+                daemon.fetch_run(entry)
+                error = None
+    except OutOfTime:
+        return f"no answer within {DIRECT_READ_BUDGET}s"
+    except Exception as failure:  # noqa: BLE001  a fallback read never stops the wait
+        return f"{describe(failure)} at {error_site(failure)}"
+    if error:
+        return error
+    cached = read_cache(key) or {}
+    return None if (cached.get("dataAt") or 0) >= daemon.now else (cached.get("error") or "no data stored")
+
+
 def poll_wait(req: dict) -> int:
     """Re-read the cache until wait_step decides REQ, saying what a down, failing or stale daemon means.
     A wait the daemon stopped ruling on (resume_wait) carries on here, from when it began."""
@@ -6820,6 +7004,18 @@ def poll_wait(req: dict) -> int:
             register(req["key"], jobs, waited=True, began=req["began"])  # (the same start every touch)
             touched = now
         done = wait_step(req, time.time())
+        if done is None or done[0] == EXIT_TIMEOUT:
+            starved = wait_starved(req, read_cache(req["key"]), time.time())
+            if starved is not None:
+                # The daemon heartbeats but has not refreshed this target: say so, loudly, and read it once here
+                # instead of waiting out the timeout on data that old.
+                req["directAt"] = time.time()
+                say_waiting(f"glaeda-gh: WARNING: the daemon has not refreshed {key_name(req['key'])} for "
+                            f"{int(starved)}s (its heartbeat is fresh, its data is not); reading GitHub directly once."
+                            "\nnext: glaeda-gh restart")
+                error = direct_read(req)
+                say_waiting("glaeda-gh: direct read " + (f"failed: {error}" if error else "answered") + ".")
+                done = wait_step(req, time.time())
         if done is not None:
             sys.stdout.write(done[1])
             return done[0]
@@ -7088,7 +7284,7 @@ def resume_wait(rid: str) -> int:
         say_waiting("next: glaeda-gh wait --help")
         return EXIT_DOWN
     left = float(req["began"]) + float(req["timeout"]) - time.time()
-    if left > 0 and serving_waits():
+    if left > 0 and serving_waits() and req.get("stale") is None:  # (a stale one was handed back on purpose)
         register(req["key"], bool(req.get("jobs")), waited=True, began=float(req["began"]))
         block(rid, left, req)
     drop_wait(rid)
@@ -10552,10 +10748,20 @@ def cmd_restart(force: bool = False) -> int:
             say_waiting(failing_message(broken))
             return EXIT_DOWN
         lag = daemon_stale() if running else None
-        if running and lag is None and not force:
-            print("glaeda-gh: the daemon is running and its heartbeat is fresh; nothing to restart. "
-                  "If a wait printed an older warning, re-run it.")
+        # A fresh heartbeat is not health: the data it vouches for must be fresh too (STALE_DATA_AFTER)
+        starved = daemon_starved() if running and lag is None else None
+        if starved is not None and starved["quota"] and not force:
+            print(f"glaeda-gh: the daemon is running, but its {starved['kind']} data for waits is "
+                  f"{int(starved['age'])}s old because GitHub's quota is spent (GraphQL stopped, REST at its share). "
+                  "A restart would not read any sooner; a wait reads its own target once (direct_read).")
             return EXIT_OK
+        if running and lag is None and starved is None and not force:
+            print("glaeda-gh: the daemon is running, its heartbeat is fresh and the data its waits are blocked on is "
+                  f"under {STALE_DATA_AFTER}s old; nothing to restart. If a wait printed an older warning, re-run it.")
+            return EXIT_OK
+        if starved is not None:
+            print(f"glaeda-gh: the daemon's heartbeat is fresh, but its {starved['kind']} data for waits is "
+                  f"{int(starved['age'])}s old (over {STALE_DATA_AFTER}s): it is not refreshing, so restarting it.")
         ago = recent_restart(holding=True)
         if ago is not None and not force:
             record = restart_record() or {}
@@ -10563,7 +10769,7 @@ def cmd_restart(force: bool = False) -> int:
                   f"{record.get('how', '?')}). Do not restart it again: a new daemon writes a heartbeat as soon "
                   f"as it holds its lock. Re-run your wait; after {RESTART_COOLDOWN}s a restart is allowed again.")
             return EXIT_OK
-        # running but silent, or an active unit silent with no visible lock: restart; not running: start
+        # running but silent (or starved), or an active unit silent with no visible lock: restart; not running: start
         hung = running or silent_unit() is not None
         holder = lock_holder() if running else None
         killed = None

@@ -5543,6 +5543,34 @@ class RestartTest(Base):
         self.assertIn("Restarting it will not fix this", text)
 
 
+    # A fresh heartbeat with starved waited data (huge-blue 2026-11-11: oldestData.pr 3061 s, "nothing to restart")
+    def fresh(self, stale: dict, modes: dict | None = None, capped: bool = False) -> None:
+        self.lock = open(gg.BASE / "daemon.lock", "a+")
+        fcntl.flock(self.lock, fcntl.LOCK_EX)
+        gg.write_json(gg.BASE / "daemon.json", {"pid": 1, "at": time.time() - 5, "heartbeat": 30,
+                                                "staleWaited": stale, "staleAfter": gg.STALE_DATA_AFTER,
+                                                "modes": modes or {"rest": "lean", "graphql": "normal"},
+                                                "restShare": {"capped": capped}})
+
+    def test_fresh_heartbeat_with_starved_data_is_restarted(self) -> None:
+        self.fresh({"pr": 3061.0, "run": 22.0, "comment": None, "head": None})
+        with mock.patch.object(gg, "lock_holder", return_value=None):
+            code, text = self.run_restart()
+        self.assertEqual((code, self.calls), (0, [True]), text)
+        self.assertIn("pr data for waits is 30", text)
+
+    def test_fresh_heartbeat_with_fresh_data_is_left_alone(self) -> None:
+        self.fresh({"pr": 40.0, "run": 22.0, "comment": None, "head": None})
+        code, text = self.run_restart()
+        self.assertEqual((code, self.calls), (0, []), text)
+        self.assertIn("nothing to restart", text)
+
+    def test_quota_starvation_is_not_restarted(self) -> None:
+        self.fresh({"pr": 3061.0}, modes={"rest": "lean", "graphql": "stop"}, capped=True)
+        code, text = self.run_restart()
+        self.assertEqual((code, self.calls), (0, []), text)
+        self.assertIn("quota is spent", text)
+
 class LaunchdRestartTest(unittest.TestCase):
     # tests that drive the system-daemon probe through their own launchctl fake; the rest have no system daemon
     REAL_SYSTEM_PROBE = {"test_a_headless_launch_daemon_is_not_doubled_by_a_user_domain_copy",
@@ -13625,6 +13653,155 @@ class QuietWritesTest(Base):
         self.assertGreater(served.stat().st_mtime, old + 1)
         # Well under a blocker's look: a mark WAITS_CHECK old is always older than a live daemon's .served.
         self.assertLess(gg.SERVED_QUIET + gg.TICK, gg.WAITS_CHECK / 2)
+
+
+class StaleDataTest(Base):
+    """huge-blue, 2026-11-11: a merged PR read OPEN for 50 minutes while `restart` called the daemon healthy. One
+    null check context in GitHub's answer raised AttributeError in parse_pr; batched() dropped the whole batch with
+    nothing stored, errors[] was empty again by the next heartbeat, and `wait` sat out its hour on that data."""
+
+    def put(self, key: str, data: dict | None, at: float) -> None:
+        gg.write_json(gg.cache_dir() / gg.file_name(key), {"key": key, "fetchedAt": at, "dataAt": at if data else None,
+                                                          "data": data, "error": None})
+
+    def test_a_null_check_context_does_not_cost_its_batch(self) -> None:
+        for n in (1, 2, 3):
+            checks = [check_run("a"), None] if n == 2 else [check_run("a")]
+            self.gh.prs[("o", "r", n)] = pr_node(n, rollup="SUCCESS", checks=checks)
+            gg.register(gg.parse_key("pr", f"o/r#{n}"), waited=True)
+        status = self.daemon.tick(NOW)
+        self.assertEqual(status["errors"], [])
+        for n in (1, 3):
+            cached = gg.read_cache(f"pr:o/r#{n}")
+            self.assertEqual(cached["dataAt"], NOW, n)
+            self.assertNotIn("checksPageError", cached["data"])
+        partial = gg.read_cache("pr:o/r#2")
+        self.assertEqual(partial["dataAt"], NOW, "the PR with a null context was not read")
+        self.assertIn("came back null", partial["data"]["checksPageError"], "a partial rollup must read pending")
+        self.assertEqual([c["name"] for c in partial["data"]["checks"]], ["a"])
+
+    def test_a_batch_that_raises_is_split_and_its_error_stored(self) -> None:
+        for n in (1, 2, 3):
+            self.gh.prs[("o", "r", n)] = pr_node(n, rollup="SUCCESS", checks=[check_run("a")])
+            gg.register(gg.parse_key("pr", f"o/r#{n}"), waited=True)
+        real = gg.parse_pr
+
+        def bug_on_two(node: dict) -> dict:
+            if node.get("number") == 2:
+                raise AttributeError("a bug on one PR's answer")
+            return real(node)
+
+        with mock.patch.object(gg, "parse_pr", side_effect=bug_on_two):
+            status = self.daemon.tick(NOW)
+        for n in (1, 3):
+            self.assertEqual(gg.read_cache(f"pr:o/r#{n}")["dataAt"], NOW, f"PR {n} lost its read to PR 2's bug")
+        broken = gg.read_cache("pr:o/r#2")
+        self.assertIsNone(broken["dataAt"])
+        self.assertRegex(broken["error"], r"graphql: AttributeError at glaeda-gh:\d+ bug_on_two|"
+                                          r"graphql: AttributeError at test-glaeda-gh.py:\d+ bug_on_two")
+        self.assertTrue(any("AttributeError at" in e for e in status["errors"]), status["errors"])
+        # and a heartbeat tick with nothing due still shows it
+        later = self.daemon.tick(NOW + gg.TICK)
+        self.assertTrue(any("AttributeError" in r["error"] for r in later["recentErrors"]), later["recentErrors"])
+
+    def test_starved_waited_data_is_reported_beside_the_heartbeat(self) -> None:
+        key = gg.parse_key("pr", "o/r#5")
+        self.gh.prs[("o", "r", 5)] = pr_node(5, rollup="SUCCESS", checks=[check_run("a")])
+        self.put(key, gg.parse_pr(pr_node(5)), at=NOW - 700)
+        gg.register(key, waited=True)
+        with mock.patch.object(gg, "parse_pr", side_effect=AttributeError("bug")):
+            status = self.daemon.tick(NOW)
+        self.assertGreaterEqual(status["staleWaited"]["pr"], 700)
+        self.assertEqual(status["staleAfter"], gg.STALE_DATA_AFTER)
+        starved = gg.daemon_starved(status)
+        self.assertEqual(starved["kind"], "pr")
+        self.assertFalse(starved["quota"])
+        # an unwaited (idle) PR's old data is its backoff, not starvation
+        gg.write_json(gg.watch_dir() / gg.file_name(key), {"key": key})
+        with mock.patch.object(gg, "parse_pr", side_effect=AttributeError("bug")):
+            status = self.daemon.tick(NOW + gg.CYCLE)
+        self.assertIsNone(status["staleWaited"]["pr"])
+        self.assertIsNone(gg.daemon_starved(status))
+
+    def test_a_starved_wait_is_handed_back_to_read_github_itself(self) -> None:
+        gg.BASE.mkdir(parents=True, exist_ok=True)
+        lock = open(gg.BASE / "daemon.lock", "a+")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        self.addCleanup(lock.close)
+        gg.write_json(gg.BASE / "daemon.json", {"at": time.time(), "heartbeat": 30, "waits": gg.WAITS_CONTRACT})
+        began = time.time() - gg.STALE_DATA_AFTER - 60
+        rid = gg.write_wait_request("pr", "o/r#9", "merged", 3600, False, False, None, True, gg.RESCUE_GRACE,
+                                    os.getpid(), began=began)
+        reader = os.open(gg.waits_dir() / f"{rid}.fifo", os.O_RDONLY | os.O_NONBLOCK)
+        self.addCleanup(os.close, reader)
+        self.put("pr:o/r#9", gg.parse_pr(pr_node(9)), at=time.time() - 3000)  # OPEN, 50 minutes old
+        self.daemon.serve_waits()
+        req = gg.read_json(gg.waits_dir() / f"{rid}.json")
+        self.assertGreater(req["stale"], gg.STALE_DATA_AFTER)
+        self.assertFalse((gg.waits_dir() / f"{rid}.fifo").exists(), "the blocker was not handed the wait back")
+        self.daemon.serve_waits()  # a later tick leaves it for its blocker, not dropping its request
+        self.assertTrue((gg.waits_dir() / f"{rid}.json").exists())
+
+        # resume_wait does not block it on the daemon again; poll_wait says so loudly and reads GitHub once
+        self.gh.prs[("o", "r", 9)] = pr_node(9, state="MERGED", rollup="SUCCESS", checks=[check_run("a")])
+        real = gg.Daemon
+        direct = lambda **kw: real(transport=self.gh, token=lambda: TOKEN, controller=None, upstream=None)  # noqa: E731
+        said = io.StringIO()
+        out = io.StringIO()
+        with mock.patch.object(gg, "Daemon", side_effect=direct), mock.patch.object(gg, "block") as block, \
+                self.diagnostics_in(said), contextlib.redirect_stdout(out):
+            code = gg.resume_wait(rid)
+        block.assert_not_called()
+        self.assertEqual(code, gg.EXIT_OK, said.getvalue() + out.getvalue())
+        self.assertIn("WARNING: the daemon has not refreshed o/r#9", said.getvalue())
+        self.assertIn("direct read answered", said.getvalue())
+        self.assertIn("MERGED", out.getvalue())
+        self.assertEqual(len(self.gh.gql_calls()), 1, "one direct read, not a loop")
+
+    def test_wait_starved_is_bounded(self) -> None:
+        now = time.time()
+        req = {"began": now - 30}
+        self.assertIsNone(gg.wait_starved(req, None, now), "a young wait is never starved")
+        req = {"began": now - gg.STALE_DATA_AFTER - 5}
+        self.assertIsNone(gg.wait_starved(req, {"dataAt": now - 30}, now))
+        self.assertIsNotNone(gg.wait_starved(req, {"dataAt": now - 3000}, now))
+        self.assertIsNotNone(gg.wait_starved(req, None, now), "never read since the wait began")
+        req["directAt"] = now - 10
+        self.assertIsNone(gg.wait_starved(req, {"dataAt": now - 3000}, now), "one direct read per STALE_DATA_AFTER")
+
+
+class TempFileTest(unittest.TestCase):
+    def test_a_write_cut_off_leaves_no_temporary_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "budget.json"
+
+            def full_disk(self: Path, text: str, *args: Any, **kwargs: Any) -> int:
+                self.touch()  # opened, then the disk filled
+                raise OSError(28, "No space left on device")
+
+            with mock.patch.object(Path, "write_text", full_disk), self.assertRaises(OSError):
+                gg.write_json(target, {"a": 1})
+            self.assertEqual(os.listdir(tmp), [])
+
+    def test_sweep_removes_only_old_temp_files_of_dead_writers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            saved, gg.BASE = gg.BASE, Path(tmp)
+            self.addCleanup(setattr, gg, "BASE", saved)
+            child = subprocess.Popen(["true"])
+            child.wait()
+            (gg.BASE / "cache").mkdir()
+            dead_old = gg.BASE / f".budget.json.{child.pid}.123.tmp"
+            dead_old_nested = gg.BASE / "cache" / f".x.json.{child.pid}.124.tmp"
+            dead_new = gg.BASE / f".budget.json.{child.pid}.125.tmp"
+            alive_old = gg.BASE / f".budget.json.{os.getpid()}.126.tmp"
+            other = gg.BASE / ".something.tmp"
+            for path in (dead_old, dead_old_nested, dead_new, alive_old, other):
+                path.write_text("")
+            for path in (dead_old, dead_old_nested, alive_old, other):
+                os.utime(path, (time.time() - 7200, time.time() - 7200))
+            self.assertEqual(gg.sweep_temp_files(), 2)
+            self.assertFalse(dead_old.exists() or dead_old_nested.exists())
+            self.assertTrue(dead_new.exists() and alive_old.exists() and other.exists())
 
 
 if __name__ == "__main__":
