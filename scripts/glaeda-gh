@@ -1141,6 +1141,8 @@ def touch_interest(key: str) -> None:
     path = watch_dir() / file_name(key)
     try:
         doc = read_json(path)
+        if isinstance(doc, dict) and doc.get("dormant"):
+            return  # an answered one-off look: a cache answer does not make it a watch again (once_answered)
         if isinstance(doc, dict) and doc.get("key") == key and not reader_fresh(doc, reader_name(), time.time()):
             register(key)
             return
@@ -3693,6 +3695,12 @@ class Daemon:
                 path.unlink(missing_ok=True)
                 continue
             key = doc["key"]
+            if doc.get("dormant"):
+                # an answered one-off look's record (once_answered): never polled, kept so a look again later is a
+                # repeat reader's; it ends at IDLE_EXPIRY after its last interest like any watch
+                if age > IDLE_EXPIRY:
+                    path.unlink(missing_ok=True)
+                continue
             try:
                 parse_key(split_key(key)[0], key.split(":", 1)[1])
             except (WatchError, ValueError, IndexError):
@@ -3715,11 +3723,30 @@ class Daemon:
                      "reader": doc.get("reader") if isinstance(doc.get("reader"), str) else "",
                      "consumers": {str(k): float(v) for k, v in asked.items() if isinstance(v, (int, float))},
                      "since": since}
-            if self.once_answered(entry):
-                path.unlink(missing_ok=True)
+            if self.once_answered(entry) and self.make_dormant(path, doc, self.now - age):
                 continue
             out.append(entry)
         return out
+
+    def make_dormant(self, path: Path, doc: dict, touched: float) -> bool:
+        """Turn an answered watch into its dormant record, under .register.lock and only if nobody registered it since
+        it was read (its mtime is still TOUCHED): a registration racing the daemon is never lost (review of #1960).
+        The record keeps `since` (a look again later is a repeat reader's, F3) and the last interest as its mtime."""
+        with bounded_lock(watch_dir() / ".register.lock") as held:
+            if not held:
+                return False
+            try:
+                if path.stat().st_mtime != touched:
+                    return False
+            except OSError:
+                return True  # gone already
+            dormant = {"key": doc["key"], "dormant": True}
+            if isinstance(doc.get("since"), (int, float)) and not isinstance(doc.get("since"), bool):
+                dormant["since"] = doc["since"]
+            write_json(path, dormant)
+            with contextlib.suppress(OSError):
+                os.utime(path, (touched, touched))
+        return True
 
     def once_answered(self, e: dict) -> bool:
         """Whether nothing live needs this PR or run watch any more: no wait is on it, its last interest was a one-off
@@ -3738,9 +3765,16 @@ class Daemon:
         if not (ended_wait or one_off):
             return False
         cached = e.get("cache") or {}
-        if cached.get("error") or (e["jobs"] and "jobs" not in cached):
-            return False  # not answered yet: a failed read, or a `--jobs` look whose job list is still to come
-        return self.last_read(e) >= touched
+        if cached.get("error"):
+            return False  # not answered yet: the last read failed
+        # A read that ended in the cache, not one tried: rest_tried moves when a REST read runs out of time too (F1).
+        read_at = cached.get("restAt") if cached.get("source") == "controller" else cached.get("fetchedAt")
+        if not isinstance(read_at, (int, float)) or read_at < touched:
+            return False
+        if e["jobs"]:  # a `--jobs` look: its job list read since the ask, not one kept from before (F2)
+            jobs_at = cached.get("jobsAt")
+            return isinstance(jobs_at, (int, float)) and jobs_at >= touched
+        return True
 
     def waited(self, e: dict) -> bool:
         """Whether a wait here (or downstream, through an upstream read) registered the watch lately."""
@@ -8097,7 +8131,8 @@ def cmd_budget(as_json: bool) -> int:
     status = read_json(BASE / "daemon.json") or {}
     lag = daemon_stale() if running else None
     broken = daemon_failing() if running else None
-    watching = len(list(watch_dir().glob("*.json"))) if watch_dir().is_dir() else 0
+    watching = sum(1 for p in watch_dir().glob("*.json") if not (read_json(p) or {}).get("dormant")) \
+        if watch_dir().is_dir() else 0
     if as_json:
         print(json.dumps({"daemon": running, "stale": lag is not None, "failing": broken is not None,
                           "budget": budget, "watching": watching, "last": status}, sort_keys=True))

@@ -1214,7 +1214,8 @@ class GraphqlDietTest(Base):
         os.utime(path, (at, at))
 
     def watched(self) -> set[str]:
-        return {gg.read_json(p)["key"] for p in gg.watch_dir().glob("*.json")}
+        """The keys the daemon polls: an answered look's dormant record is not a watch."""
+        return {d["key"] for d in map(gg.read_json, gg.watch_dir().glob("*.json")) if not d.get("dormant")}
 
     def test_a_status_sweep_is_read_once_and_leaves_the_watch_set(self) -> None:
         """2026-11-11 16:37Z: land-list.sh's one `glaeda-gh status pr` over 140 candidates held each PR as a watch for
@@ -1234,17 +1235,68 @@ class GraphqlDietTest(Base):
         self.assertTrue(all(gg.read_cache(k) and gg.read_cache(k).get("data") for k in keys))
 
     def test_a_status_read_asked_again_later_keeps_its_watch(self) -> None:
-        """A repeat reader (the same status a minute or more later) is the old idle-backoff watch."""
+        """A repeat reader (the same status a minute or more later) is the old idle-backoff watch, even when the daemon
+        has ticked, read the first look and set it aside in between (review of #1960 F3)."""
+        self.gh.prs[("o", "r", 1)] = pr_node(1)
+        with mock.patch.object(gg.time, "time", return_value=NOW - 1):
+            gg.register("pr:o/r#1", once=True)
+        self.touch("pr:o/r#1", NOW - 1)
+        for i in range(3):  # the first look is read, then set aside: not polled
+            self.daemon.tick(NOW + i * gg.CYCLE)
+        self.assertEqual(self.pr_reads(), 1)
+        self.assertEqual(self.watched(), set())
+        with mock.patch.object(gg.time, "time", return_value=NOW + 3 * gg.CYCLE):
+            gg.register("pr:o/r#1", once=True)  # the same look three minutes later, on the real clock
+        self.touch("pr:o/r#1", NOW + 3 * gg.CYCLE)
+        for i in range(3, 7):
+            self.daemon.tick(NOW + i * gg.CYCLE + 1)
+        self.assertEqual(self.watched(), {"pr:o/r#1"})
+        self.assertGreaterEqual(self.pr_reads(), 4)  # every cycle again, as a watch someone keeps reading
+
+    def test_an_out_of_time_read_does_not_answer_a_look(self) -> None:
+        """Review of #1960 F1: a REST read that ran out of time moves rest_tried, not the cache: no answer yet."""
         self.gh.prs[("o", "r", 1)] = pr_node(1)
         gg.register("pr:o/r#1", once=True)
         self.stamp_watch("pr:o/r#1", NOW - 1)
         self.daemon.tick(NOW)
         gg.register("pr:o/r#1", once=True)
-        self.touch("pr:o/r#1", NOW + 2 * gg.CYCLE)
-        for i in range(2, 5):
-            self.daemon.tick(NOW + i * gg.CYCLE + 1)
+        self.stamp_watch("pr:o/r#1", NOW + 10)  # asked again, within ONCE_SPAN: still one look
+        self.daemon.rest_tried["pr:o/r#1"] = NOW + 20  # a read tried after the ask and cut short
+        [e] = [e for e in self.daemon.watches() if e["key"] == "pr:o/r#1"]
+        self.assertFalse(self.daemon.once_answered(e))
         self.assertIn("pr:o/r#1", self.watched())
-        self.assertGreaterEqual(self.pr_reads(), 3)
+
+    def test_a_jobs_look_waits_for_a_job_list_read_since_the_ask(self) -> None:
+        """Review of #1960 F2: a `status run --jobs` whose cache holds an older job list is not answered by a run read
+        alone."""
+        key = "run:o/r/9"
+        gg.register(key, jobs=True, once=True)
+        self.stamp_watch(key, NOW)
+        gg.write_json(gg.cache_dir() / gg.file_name(key),
+                      {"key": key, "fetchedAt": NOW + 5, "dataAt": NOW + 5, "error": None,
+                       "data": {"status": "in_progress"}, "jobs": [], "jobsAt": NOW - 600})
+        self.daemon.now = NOW + 6
+        [e] = [e for e in self.daemon.watches() if e["key"] == key]
+        self.assertFalse(self.daemon.once_answered(e))
+        gg.write_json(gg.cache_dir() / gg.file_name(key),
+                      {**gg.read_cache(key), "jobsAt": NOW + 5})
+        self.daemon.now = NOW + 7
+        self.assertEqual([e for e in self.daemon.watches() if e["key"] == key], [])
+        self.assertEqual(self.watched(), set())
+
+    def test_a_registration_racing_the_set_aside_is_kept(self) -> None:
+        """Review of #1960: the daemon sets an answered look aside under .register.lock and only if its mtime is what
+        it read, so a wait registered in between is never lost."""
+        self.gh.prs[("o", "r", 1)] = pr_node(1)
+        gg.register("pr:o/r#1", once=True)
+        self.stamp_watch("pr:o/r#1", NOW - 1)
+        self.daemon.tick(NOW)
+        path = gg.watch_dir() / gg.file_name("pr:o/r#1")
+        doc = gg.read_json(path)
+        gg.register("pr:o/r#1", waited=True)  # a wait lands between the daemon's stat and its set-aside
+        self.assertFalse(self.daemon.make_dormant(path, doc, NOW - 1))
+        self.assertTrue(gg.read_json(path).get("waitedAt"))
+        self.assertFalse(gg.read_json(path).get("dormant"))
 
     def test_a_watch_whose_wait_ended_leaves_once_read(self) -> None:
         """A wait that ended (no touch for WAIT_INTEREST) is no reason to keep polling until IDLE_EXPIRY."""
