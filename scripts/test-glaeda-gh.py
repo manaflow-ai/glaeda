@@ -3379,6 +3379,28 @@ class ClientTest(Base):
         self.assertTrue(gg.controller_unconfirmed(entry, entry["dataAt"] + 1))
         self.assertFalse(gg.controller_unconfirmed(entry, entry["dataAt"] + gg.REST_SAFETY))
 
+    def test_a_finish_the_quota_keeps_from_being_confirmed_ends_the_wait(self) -> None:
+        """manaflow-ai/cmux run 43054254048, 2026-11-11 ~16:05Z: the controller showed completed/success at 253 s and
+        the wait ran past 857 s for a confirmation read the quota refused (GraphQL stopped, REST stopped)."""
+        run = {"id": 15, "name": "CI", "status": "completed", "conclusion": "success", "run_attempt": 1,
+               "head_sha": "a" * 40, "html_url": "https://github.com/o/r/actions/runs/15", "event": "push"}
+        req = gg.wait_request("run", "o/r/15", "green", 60, False, False, None, True, gg.RESCUE_GRACE)
+        self.put("run:o/r/15", run, source="controller")
+        status = {"pid": 1, "at": time.time(), "modes": {"graphql": "normal", "rest": "lean"}, "restShare": {"capped": False}}
+        gg.write_json(gg.BASE / "daemon.json", status)
+        self.assertIsNone(gg.wait_step(req, time.time()), "GitHub can be read: the finish is confirmed first")
+        gg.write_json(gg.BASE / "daemon.json", {**status, "modes": {"graphql": "stop", "rest": "stop"}, "x": 1})
+        code, text = gg.wait_step(req, time.time())
+        self.assertEqual(code, gg.EXIT_OK)
+        self.assertIn("finish not confirmed by a GitHub read: GitHub's quota stops the daemon's reads", text)
+        # REST at the daemon's share counts as stopped too; an upstream host never rules so (its upstream confirms)
+        gg.write_json(gg.BASE / "daemon.json", {**status, "modes": {"graphql": "stop", "rest": "lean"},
+                                                "restShare": {"capped": True}, "x": 22})
+        self.assertEqual(gg.wait_step(req, time.time())[0], gg.EXIT_OK)
+        gg.write_json(gg.BASE / "daemon.json", {**status, "modes": {"graphql": "stop", "rest": "stop"},
+                                                "upstream": {"state": "ok"}, "x": 333})
+        self.assertIsNone(gg.wait_step(req, time.time()))
+
     def test_the_handoff_keeps_the_wait_start_and_its_deadline(self) -> None:
         """After the long-poll, the daemon's request keeps the wait's own start: a controller finish read during the
         long-poll still counts once it is REST_SAFETY old, and the deadline does not move."""
@@ -4103,6 +4125,41 @@ class ClientTest(Base):
         done = gg.parse_pr(pr_node(3, rollup="FAILURE", checks=[check_run("build")]))
         self.assertEqual(gg.verdict("pr", {**done, "checksTruncated": True, "checkState": "FAILURE",
                                            "superseded": [cancelled]}, "green"), 1)
+
+    def test_over_100_checks_a_red_rollup_of_only_superseded_attempts_is_green(self) -> None:
+        """manaflow-ai/cmux#41298, 2026-11-11: 191 contexts, 85 counted checks all passing, and `wait --until done`
+        exited 1 ("0 check(s) failed") on the rollup's FAILURE from a superseded, cancelled "risk evidence" attempt.
+        The rollup's counts over every page say whether any red is left besides the superseded ones."""
+        cancelled = {"name": "risk evidence", "conclusion": "CANCELLED"}
+        done = gg.parse_pr(pr_node(5, rollup="FAILURE", checks=[check_run("build")]))
+        base = {**done, "checksTruncated": True, "checkState": "FAILURE", "superseded": [cancelled]}
+        only = {"runs": {"SUCCESS": 189, "CANCELLED": 1}, "statuses": {"SUCCESS": 1}}
+        for until in ("green", "done", "required"):
+            self.assertEqual(gg.verdict("pr", {**base, "checkCounts": only}, until), 0, until)
+        # a red past the first 100 besides the superseded one: still a failure
+        more = {"runs": {"SUCCESS": 188, "CANCELLED": 1, "FAILURE": 1}, "statuses": {}}
+        self.assertEqual(gg.verdict("pr", {**base, "checkCounts": more}, "green"), 1)
+        # something still running past the first 100: not decided by the counts
+        running = {"runs": {"SUCCESS": 188, "CANCELLED": 1, "IN_PROGRESS": 1}, "statuses": {}}
+        self.assertEqual(gg.verdict("pr", {**base, "checkCounts": running}, "green"), 1)
+        # no counts (an older read): the rollup decides, as before
+        self.assertEqual(gg.verdict("pr", base, "green"), 1)
+        # a superseded red read by suite id (lastRealAttempt) is in no count: it never cancels a red past page 1
+        uncounted = {**base, "superseded": [{"name": "x", "conclusion": "FAILURE", "lastRealAttempt": True}],
+                     "checkCounts": {"runs": {"SUCCESS": 100, "FAILURE": 1}, "statuses": {}}}
+        self.assertEqual(gg.verdict("pr", uncounted, "green"), 1)
+        self.assertEqual(gg.verdict("pr", uncounted, "done"), 1)
+        last = {**check_run("x", conclusion="FAILURE"), "lastRealAttempt": True, "databaseId": 1,
+                "checkSuite": {"conclusion": "STARTUP_FAILURE", "workflowRun": {"databaseId": 7, "workflow": {"name": "CI"}}}}
+        newer = {**check_run("x"), "databaseId": 2,
+                 "checkSuite": {"conclusion": "SUCCESS", "workflowRun": {"databaseId": 7, "workflow": {"name": "CI"}}}}
+        parsed = gg.parse_pr(pr_node(7, checks=[last, newer]))
+        self.assertTrue(parsed["superseded"] and all(c.get("lastRealAttempt") for c in parsed["superseded"]), parsed)
+        # parse_pr keeps the counts a read asked for
+        node = pr_node(6, checks=[check_run("build")])
+        node["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"].update(
+            checkRunCountsByState=[{"state": "SUCCESS", "count": 1}], statusContextCountsByState=[])
+        self.assertEqual(gg.parse_pr(node)["checkCounts"], {"runs": {"SUCCESS": 1}, "statuses": {}})
 
     def test_a_check_cancelled_before_any_step_is_held_for_the_rescue(self) -> None:
         """manaflow-ai/cmux#20608: the owned-pool rescue cancelled a fast tier still queued for a

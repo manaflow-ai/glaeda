@@ -2021,7 +2021,9 @@ def parse_pr(node: dict) -> dict:
     # stamps it started and completed at once), such as a twin cancelled before it began, stays as evidence
     # for check_verdict (the rollup still counts it) but is marked so status never names it: it has no
     # error to chase, whichever of the pair has the higher id
-    superseded = [{**brief(c), "ranNothing": bool(c.get("completedAt") and c.get("startedAt") == c.get("completedAt"))}
+    superseded = [{**brief(c), "ranNothing": bool(c.get("completedAt") and c.get("startedAt") == c.get("completedAt")),
+                   # read by suite id, not from the rollup: not in its counts (rollup_red_is_superseded)
+                   **({"lastRealAttempt": True} if c.get("lastRealAttempt") else {})}
                   for c in superseded if (c.get("conclusion") or "").upper() not in PASSED]
     # the cache keeps 20; the ones dropped past that that status would count still reach its count line
     superseded_omitted = sum(1 for c in superseded[20:] if not c["ranNothing"])
@@ -2048,6 +2050,7 @@ def parse_pr(node: dict) -> dict:
         "checkState": rollup.get("state"), "checks": checks, "superseded": superseded,
         "supersededOmitted": superseded_omitted,
         "checksTotal": contexts.get("totalCount", len(checks)),
+        "checkCounts": check_counts(contexts),
         "checksTruncated": bool((contexts.get("pageInfo") or {}).get("hasNextPage")),
     }
 
@@ -6403,6 +6406,40 @@ def settling(data: dict, now: float, settle: float = SETTLE_GRACE) -> float | No
     return left if left > 0 else None
 
 
+def check_counts(contexts: dict) -> dict | None:
+    """The rollup's check runs and statuses counted by state over every page (checkRunCountsByState,
+    statusContextCountsByState), or None when the read did not ask for them."""
+    runs, statuses = contexts.get("checkRunCountsByState"), contexts.get("statusContextCountsByState")
+    if not isinstance(runs, list) or not isinstance(statuses, list):
+        return None
+    tally = lambda rows: {str(r.get("state")): int(r.get("count") or 0) for r in rows  # noqa: E731
+                          if isinstance(r, dict) and isinstance(r.get("count"), int)}
+    return {"runs": tally(runs), "statuses": tally(statuses)}
+
+
+COUNT_PENDING = {"QUEUED", "IN_PROGRESS", "PENDING", "WAITING", "REQUESTED", "EXPECTED"}
+COUNT_BAD = {"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE", "ERROR"}
+
+
+def rollup_red_is_superseded(data: dict) -> bool:
+    """Whether a truncated rollup's FAILURE is only superseded attempts: over every page nothing is pending, and no
+    more contexts are red than the superseded red attempts shown. manaflow-ai/cmux#41298, 2026-11-11: 191 contexts,
+    85 counted checks all passing, and `wait --until done` failed on the rollup's FAILURE from a superseded,
+    cancelled "risk evidence" attempt a newer run had replaced. Unknown counts: False (the rollup decides)."""
+    counts = data.get("checkCounts")
+    if not isinstance(counts, dict):
+        return False
+    rows = [*(counts.get("runs") or {}).items(), *(counts.get("statuses") or {}).items()]
+    if any(state in COUNT_PENDING and n for state, n in rows):
+        return False
+    red = sum(n for state, n in rows if state in COUNT_BAD)
+    # only attempts the rollup itself listed: one add_last_real_contexts read by suite id is in no count (review of
+    # #1958: an uncounted superseded red cancelled a real red past page 1)
+    superseded = sum(1 for c in data.get("superseded") or []
+                     if str(c.get("conclusion") or "").upper() in COUNT_BAD and not c.get("lastRealAttempt"))
+    return red <= superseded
+
+
 def check_verdict(data: dict, until: str = "green", now: float | None = None,
                   grace: float = RESCUE_GRACE, settle: float = SETTLE_GRACE) -> int | None:
     """The checks alone, whatever the PR's state or head: EXIT_OK, EXIT_FAIL, EXIT_NOTHING (nothing reported on the
@@ -6440,6 +6477,8 @@ def check_verdict(data: dict, until: str = "green", now: float | None = None,
         # running, yet the wait exited 1 after 5s). A failure past the first 100 fails that much later.
         if not groups["failed"] and groups["pending"] and data.get("superseded"):
             return None
+        if not groups["failed"] and not groups["pending"] and not groups["held"] and rollup_red_is_superseded(data):
+            return EXIT_OK  # every red context on every page is a superseded attempt
         return None if groups["held"] else EXIT_FAIL
     if not checks:
         # nothing has reported yet: not started while the head settles (or its push time is unknown), then said so
@@ -7131,6 +7170,36 @@ def controller_unconfirmed(entry: dict | None, now: float | None = None) -> bool
     return (time.time() if now is None else now) - (entry.get("dataAt") or 0) < REST_SAFETY
 
 
+_CONFIRM_REFUSED: dict[str, Any] = {}  # daemon.json's mtime -> confirm_refused's answer (wait_step runs every poll)
+
+
+def confirm_refused() -> str | None:
+    """Why the daemon cannot read GitHub to confirm a finished run now, or None: both of its routes stopped by the
+    quota (GraphQL stopped, REST stopped or at the daemon's share), as daemon.json says. A wait then rules on the
+    finish it has instead of sitting out the confirmation bounds (RUN_CONFIRM_MAX, REST_SAFETY) on a read that cannot
+    happen: manaflow-ai/cmux run 43054254048, 2026-11-11 ~16:05Z, showed completed/success at 253 s and its wait ran
+    past 857 s, both buckets stopped. A host reading through an upstream never says so (its upstream confirms)."""
+    path = BASE / "daemon.json"
+    try:
+        info = path.stat()
+        stamp = (info.st_mtime_ns, info.st_size)
+    except OSError:
+        return None
+    if _CONFIRM_REFUSED.get("stamp") == stamp:
+        return _CONFIRM_REFUSED.get("why")
+    status = read_json(path)
+    why = None
+    if isinstance(status, dict) and not isinstance(status.get("upstream"), dict):
+        modes = status.get("modes") if isinstance(status.get("modes"), dict) else {}
+        share = status.get("restShare") if isinstance(status.get("restShare"), dict) else {}
+        if modes.get("graphql") == "stop" and (modes.get("rest") == "stop" or share.get("capped") is True):
+            why = ("GitHub's quota stops the daemon's reads (GraphQL stopped, REST "
+                   f"{'stopped' if modes.get('rest') == 'stop' else 'at its share'})")
+    _CONFIRM_REFUSED.clear()
+    _CONFIRM_REFUSED.update(stamp=stamp, why=why)
+    return why
+
+
 def run_confirmed_since(entry: dict | None) -> float:
     """When a wait may last have been answered by an older attempt: a `gh run rerun` this host brokered (rerunAt)."""
     at = (entry or {}).get("rerunAt")
@@ -7170,10 +7239,12 @@ def wait_step(req: dict, now: float) -> tuple[int, str] | None:
     # only a merge is final; a completed run can be rerun and a closed PR reopened
     final = kind == "pr" and data and data.get("state") == "MERGED"
     usable = data and ((entry.get("dataAt") or 0) >= began or final)
-    if usable and kind == "run" and controller_unconfirmed(entry, now):
-        usable = False  # the daemon reads it over REST first (Daemon.due's confirm)
-    if usable and kind == "run" and run_unconfirmed(entry, began, now):
-        usable = False  # maybe a superseded attempt: the daemon reads GitHub once first (Daemon.due)
+    unconfirmed = usable and kind == "run" and (controller_unconfirmed(entry, now) or run_unconfirmed(entry, began, now))
+    refused = confirm_refused() if unconfirmed else None
+    if unconfirmed and refused is None:
+        # the daemon reads GitHub once first (Daemon.due's confirm): the controller's finish, or a finish that may be
+        # a superseded attempt's
+        usable = False
     _, owner, repo, _ = split_key(key)
     if usable and sha:
         head = str(data.get("headRefOid" if kind == "pr" else "head_sha") or "").lower()
@@ -7211,6 +7282,8 @@ def wait_step(req: dict, now: float) -> tuple[int, str] | None:
             extra["note"] = "PR was closed without being merged"
         elif kind == "pr" and until == "done" and data.get("state") == "MERGED":
             extra["note"] = "PR was merged: done, whatever its checks still show"
+        if unconfirmed and refused is not None:
+            extra["note"] = f"finish not confirmed by a GitHub read: {refused}"
         if kind == "run" and result == EXIT_FAIL and grace > 0 and run_hold(data, entry.get("jobs"), time.time(), float("inf")):
             extra["note"] = f"a glaeda runner refused this attempt at setup and no rescue attempt followed within {int(grace)}s"
         extra.update(wait_outcome(req, result, entry, waited))
