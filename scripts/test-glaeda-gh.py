@@ -11945,6 +11945,57 @@ class SpendAlarmTest(Base):
         self.assertEqual(len(told), 1)
         self.assertTrue(told[0].startswith("--from glaeda-gh --severity fire FIRE"), told[0])
 
+    def test_the_stale_alarm_escalates_to_fire_once_and_resends_hourly(self) -> None:
+        self.policy()
+        self.daemon.stale_waited, self.daemon.stale_waited_key = {"pr": 700.0}, {"pr": "pr:o/r#5"}
+        self.daemon.check_alarms()
+        self.daemon.now, self.daemon.stale_waited = NOW + 1200, {"pr": 1900.0}
+        self.daemon.check_alarms()  # worse: a FIRE goes out at once
+        self.daemon.now, self.daemon.stale_waited = NOW + 1300, {"pr": 2000.0}
+        self.daemon.check_alarms()  # still FIRE, within the hour: nothing new
+        levels = [line.split()[3] for line in self.told_lines()]
+        self.assertEqual(levels, ["warn", "fire"])
+        self.daemon.now = NOW + 1200 + gg.ALARM_EVERY + 1
+        self.daemon.check_alarms()
+        self.assertEqual(len(self.told_lines()), 3, "a stale alarm still firing is said again each hour")
+
+    def test_a_quota_stop_holds_the_stale_alarm_rather_than_clearing_it(self) -> None:
+        """A brief quota stop while the data is still old must not tell anyone it is fixed (review of glaeda#1946)."""
+        self.policy()
+        self.daemon.stale_waited = {"pr": 700.0}
+        self.daemon.check_alarms()
+        self.daemon.backoff = {"rest": NOW + 600, "graphql": NOW + 600}
+        self.daemon.check_alarms()
+        self.assertFalse(gg.read_json(gg.BASE / gg.ALARMS_FILE)["stale"].get("cleared"))
+        self.assertEqual([n["level"] for n in self.notice_lines()], ["warn"])
+        self.daemon.backoff = {"rest": 0.0, "graphql": 0.0}
+        self.daemon.stale_waited = {"pr": 30.0}  # really read again: now it clears, once
+        self.daemon.check_alarms()
+        self.assertEqual([n["level"] for n in self.notice_lines()], ["warn", "info"])
+
+    def test_an_upstream_host_holds_the_stale_alarm_and_restart_says_why(self) -> None:
+        """Its data is the upstream's to read; that daemon's own alarm covers it, and a restart here cannot help."""
+        self.policy()
+        self.daemon.upstream_status = {"state": "ok", "at": NOW}
+        self.daemon.stale_waited = {"pr": 2000.0}
+        self.daemon.check_alarms()
+        self.assertEqual(self.told_lines(), [])
+        starved = gg.daemon_starved({"at": time.time(), "staleWaited": {"pr": 2000.0}, "upstream": {"state": "ok"},
+                                     "modes": {"graphql": "normal", "rest": "normal"}})
+        self.assertTrue(starved["quota"])
+        self.assertIn("upstream", starved["why"])
+
+    def test_a_failing_upstream_link_still_raises_the_stale_alarm(self) -> None:
+        """The upstream never gets this host's waited keys while the link fails, so no alarm there covers them."""
+        self.policy()
+        self.daemon.upstream_status = {"state": "failing", "error": "unreachable", "at": NOW}
+        self.daemon.stale_waited = {"pr": 2000.0}
+        self.daemon.check_alarms()
+        self.assertEqual(len(self.told_lines()), 1)
+        starved = gg.daemon_starved({"at": time.time(), "staleWaited": {"pr": 2000.0},
+                                     "upstream": {"state": "failing"}, "modes": {"graphql": "normal", "rest": "normal"}})
+        self.assertFalse(starved["quota"])
+
     def test_the_pace_alarm_is_off_at_a_zero_share(self) -> None:
         for name in ("FLEET_POLICY", "UPDATE_CONFIG", "DAEMON_CONFIG"):
             self.addCleanup(setattr, gg, name, getattr(gg, name))

@@ -457,6 +457,8 @@ IDLE_BACKOFF_MAX = 600  # ... but no less often than this (it expires at IDLE_EX
 # is this old, and a wait hands itself back from the daemon and reads GitHub once itself (direct_read). The heartbeat
 # alone vouched for data that was 50 minutes old on huge-blue (2026-11-11), and `restart` refused.
 STALE_DATA_AFTER = 600
+DIRECT_QUOTA = "GitHub's quota for this read is spent"  # direct_read's refusals no restart can help with
+DIRECT_UPSTREAM = "this host reads GitHub through an upstream (no login here)"
 DIRECT_READ_BUDGET = 60  # seconds a wait's own fallback read (direct_read) may take
 RECENT_ERRORS_KEEP = 3600  # daemon.json's recentErrors: the distinct errors of this long, newest first
 COMMENT_FED_CYCLE = 120  # comment watches on a repository the controller's issue_comment webhooks cover
@@ -2473,14 +2475,28 @@ class Daemon:
         Old data then is the quota's doing, which neither a restart nor a wait's own read can fix (daemon_starved)."""
         return self.mode("graphql") == "stop" and (self.mode("rest") == "stop" or self.rest_capped())
 
-    def stale_alarm(self) -> tuple[str, str, dict] | None:
+    def stale_explained(self) -> str | None:
+        """Why old waited data is not this daemon's fault, which neither a restart nor a wait's own read can fix:
+        "quota" (quota_starved), or "upstream" (this host reads through another host's daemon, whose own alarm
+        covers it). None when it is this daemon's to fix."""
+        # Only a working upstream: one this host cannot reach never gets its waited keys, so nothing there alarms on
+        # them, and this host's alarm must (review of glaeda#1947).
+        if (getattr(self, "upstream_status", None) or {}).get("state") == "ok":
+            return "upstream"
+        return "quota" if self.quota_starved() else None
+
+    def stale_alarm(self) -> tuple[str, str, dict] | str | None:
         """The stale alarm (alarms.stale, on by default): data a wait is blocked on older than STALE_DATA_AFTER while
-        the quota does not explain it (staleWaited). The heartbeat stays fresh through this, so nothing else says it
-        (huge-blue 2026-11-11: a merged PR read OPEN for 50 minutes). FIRE at three times the bound."""
+        nothing outside this daemon explains it (staleWaited). The heartbeat stays fresh through this, so nothing else
+        says it (huge-blue 2026-11-11: a merged PR read OPEN for 50 minutes). FIRE at three times the bound. "held"
+        while the data is still old but explained (stale_explained): the alarm is neither sent nor cleared, so a brief
+        quota stop never tells anyone it is fixed (review of glaeda#1946)."""
         stale = {k: v for k, v in (getattr(self, "stale_waited", None) or {}).items() if isinstance(v, (int, float))}
         kind = max(stale, key=stale.get, default=None)
-        if kind is None or stale[kind] <= STALE_DATA_AFTER or self.quota_starved():
+        if kind is None or stale[kind] <= STALE_DATA_AFTER:
             return None
+        if self.stale_explained() is not None:
+            return "held"
         age_s = int(stale[kind])
         level = "fire" if age_s >= 3 * STALE_DATA_AFTER else "warn"
         where = getattr(self, "stale_waited_key", {}).get(kind) or "?"
@@ -2538,7 +2554,9 @@ class Daemon:
             firing["share"] = ("warn", text, {"pace": pace, "cap": cap, "spent": self.rest_spent(), "top": mine})
         if policy.get("stale", True):
             stale = self.stale_alarm()
-            if stale is not None:
+            if stale == "held":
+                held.add("stale")
+            elif stale is not None:
                 firing["stale"] = stale
         changed = False
         for name, (level, text, data) in firing.items():
@@ -4279,7 +4297,7 @@ class Daemon:
                 # Not while GitHub's quota explains the old data: the wait's own read could not get through either,
                 # and every live wait would turn into a Python poll for the rest of its timeout (the memory the
                 # blocker saves; review of glaeda#1942).
-                starved = None if self.quota_starved() else wait_starved(req, read_cache(req["key"]), now)
+                starved = None if self.stale_explained() else wait_starved(req, read_cache(req["key"]), now)
                 if starved is not None:
                     # This daemon is not refreshing what the wait is blocked on: hand the wait back (its blocker sees
                     # the FIFO gone and execs wait-resume), where poll_wait says so and reads GitHub once itself.
@@ -6009,7 +6027,10 @@ def daemon_starved(status: Any = None) -> dict | None:
     modes = status.get("modes") if isinstance(status.get("modes"), dict) else {}
     share = status.get("restShare") if isinstance(status.get("restShare"), dict) else {}
     quota = modes.get("graphql") == "stop" and (modes.get("rest") == "stop" or bool(share.get("capped")))
-    return {"kind": kind, "age": ages[kind], "quota": quota}
+    upstream = (status.get("upstream") if isinstance(status.get("upstream"), dict) else {}).get("state") == "ok"
+    return {"kind": kind, "age": ages[kind], "quota": quota or upstream,
+            "why": "this host reads GitHub through an upstream, whose daemon reads it" if upstream
+            else "GitHub's quota is spent (GraphQL stopped, REST at its share)"}
 
 
 def daemon_failing() -> dict | None:
@@ -6983,7 +7004,7 @@ def direct_read(req: dict) -> str | None:
     bucket = "graphql" if kind == "pr" else "rest"
     try:
         if upstream_command() is not None:
-            return "this host reads GitHub through an upstream (no login here)"
+            return DIRECT_UPSTREAM
         daemon = Daemon(controller=None, upstream=None)
     except Exception as failure:  # noqa: BLE001  a fallback read never stops the wait
         return f"{describe(failure)} at {error_site(failure)}"
@@ -6991,7 +7012,7 @@ def direct_read(req: dict) -> str | None:
     # daemon.json's modes carry it (a fresh Daemon here starts with no backoff).
     modes = (read_json(BASE / "daemon.json") or {}).get("modes")
     if daemon.mode(bucket) == "stop" or (isinstance(modes, dict) and modes.get(bucket) == "stop"):
-        return "GitHub's quota for this read is spent"
+        return DIRECT_QUOTA
     # A wait's own read is a session's request, not the daemon's polling: it is not charged to the daemon's REST share,
     # and above all this process must never write rest-spend.json from the copy it read at construction, which would
     # overwrite the minutes the daemon counted since (review of glaeda#1942).
@@ -7061,7 +7082,7 @@ def poll_wait(req: dict) -> int:
                             f"{int(starved)}s (its heartbeat is fresh, its data is not); reading GitHub directly once.")
                 error = direct_read(req)
                 say_waiting("glaeda-gh: direct read " + (f"failed: {error}" if error else "answered") + "."
-                            + ("" if error and "quota" in error else "\nnext: glaeda-gh restart"))
+                            + ("" if error in (DIRECT_QUOTA, DIRECT_UPSTREAM) else "\nnext: glaeda-gh restart"))
                 done = wait_step(req, time.time())
         if done is not None:
             sys.stdout.write(done[1])
@@ -10799,7 +10820,7 @@ def cmd_restart(force: bool = False) -> int:
         starved = daemon_starved() if running and lag is None else None
         if starved is not None and starved["quota"] and not force:
             print(f"glaeda-gh: the daemon is running, but its {starved['kind']} data for waits is "
-                  f"{int(starved['age'])}s old because GitHub's quota is spent (GraphQL stopped, REST at its share). "
+                  f"{int(starved['age'])}s old because {starved['why']}. "
                   "A restart would not read any sooner; a wait reads its own target once (direct_read).")
             return EXIT_OK
         if running and lag is None and starved is None and not force:
