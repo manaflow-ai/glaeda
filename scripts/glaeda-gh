@@ -1597,7 +1597,8 @@ def cmd_read(text: str) -> int:
         cached = read_cache(key)
         budgets = (entries.get(key) or {}).get("budgets") or {}  # an earlier line's consumers, for this same key
         entries[key] = None if cached is None else {
-            k: cached.get(k) for k in ("data", "dataAt", "error", "fetchedAt", "jobs", "missing", "restRun", "restRunAt") if k in cached}
+            k: cached.get(k) for k in ("data", "dataAt", "error", "fetchedAt", "jobs", "jobsAt", "missing", "restRun", "restRunAt")
+            if k in cached}
         if cached is not None and cached.get("source"):  # where the data came from, so a downstream wait can
             entries[key]["origin"] = cached.get("origin") if cached.get("source") == "upstream" else cached["source"]
         if consumer:
@@ -3740,6 +3741,10 @@ class Daemon:
                     return False
             except OSError:
                 return True  # gone already
+            # A forwarded registration may keep the mtime (an older downstream `touched`) while it adds a wait or a
+            # job list: the file must still be what the daemon read (review of #1961 F2).
+            if read_json(path) != doc:
+                return False
             dormant = {"key": doc["key"], "dormant": True}
             if isinstance(doc.get("since"), (int, float)) and not isinstance(doc.get("since"), bool):
                 dormant["since"] = doc["since"]
@@ -4399,6 +4404,10 @@ class Daemon:
                 fields.update(data=data, dataAt=float(at) if isinstance(at, (int, float)) else self.now)
             if isinstance(entry.get("jobs"), list):
                 fields["jobs"] = entry["jobs"]
+                # when the upstream read that job list, so a downstream `--jobs` look is answered (once_answered)
+                jobs_at = entry.get("jobsAt")
+                if isinstance(jobs_at, (int, float)) and not isinstance(jobs_at, bool):
+                    fields["jobsAt"] = min(self.now, float(jobs_at))
             self.store(e["key"], e["cache"], **fields)
 
     def upstream_denials(self, got: dict) -> None:
