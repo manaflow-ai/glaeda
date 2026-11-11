@@ -1204,6 +1204,76 @@ class GraphqlDietTest(Base):
             self.daemon.tick(NOW + i * gg.CYCLE)
         self.assertEqual(self.pr_reads() - before, 3)
 
+    def stamp_watch(self, key: str, at: float, **fields: object) -> None:
+        """Set a watch's fields and its mtime (its last interest) to the test's clock."""
+        path = gg.watch_dir() / gg.file_name(key)
+        doc = gg.read_json(path)
+        if "since" in doc:
+            doc["since"] = at
+        gg.write_json(path, {**doc, **fields})
+        os.utime(path, (at, at))
+
+    def watched(self) -> set[str]:
+        return {gg.read_json(p)["key"] for p in gg.watch_dir().glob("*.json")}
+
+    def test_a_status_sweep_is_read_once_and_leaves_the_watch_set(self) -> None:
+        """2026-11-11 16:37Z: land-list.sh's one `glaeda-gh status pr` over 140 candidates held each PR as a watch for
+        IDLE_EXPIRY, read every cycle for IDLE_BACKOFF_AFTER and then backed off: ~90 extra PRs and about seven
+        reads each for one look. A one-off read's watch is read once, then dropped; the cache still answers."""
+        for n in range(1, 21):
+            self.gh.prs[("o", "r", n)] = pr_node(n)
+        keys = [f"pr:o/r#{n}" for n in range(1, 21)]
+        gg.register_all(keys, once=True)
+        for key in keys:
+            self.stamp_watch(key, NOW - 1)
+        for i in range(15):  # the old rules kept each one for 15 cycles
+            self.daemon.tick(NOW + i * gg.CYCLE)
+        self.assertEqual(self.watched(), set())
+        reads = sum(1 for c in self.gh.gql_calls() if "pullRequest(number:" in json.loads(c[3])["query"])
+        self.assertLessEqual(reads, 2)  # one batched read (two at most if the batch halves), not ~7 per PR
+        self.assertTrue(all(gg.read_cache(k) and gg.read_cache(k).get("data") for k in keys))
+
+    def test_a_status_read_asked_again_later_keeps_its_watch(self) -> None:
+        """A repeat reader (the same status a minute or more later) is the old idle-backoff watch."""
+        self.gh.prs[("o", "r", 1)] = pr_node(1)
+        gg.register("pr:o/r#1", once=True)
+        self.stamp_watch("pr:o/r#1", NOW - 1)
+        self.daemon.tick(NOW)
+        gg.register("pr:o/r#1", once=True)
+        self.touch("pr:o/r#1", NOW + 2 * gg.CYCLE)
+        for i in range(2, 5):
+            self.daemon.tick(NOW + i * gg.CYCLE + 1)
+        self.assertIn("pr:o/r#1", self.watched())
+        self.assertGreaterEqual(self.pr_reads(), 3)
+
+    def test_a_watch_whose_wait_ended_leaves_once_read(self) -> None:
+        """A wait that ended (no touch for WAIT_INTEREST) is no reason to keep polling until IDLE_EXPIRY."""
+        self.gh.prs[("o", "r", 1)] = pr_node(1)
+        gg.register("pr:o/r#1", waited=True)
+        self.stamp_watch("pr:o/r#1", NOW, waitedAt=NOW)
+        for i in range(15):
+            self.daemon.tick(NOW + i * gg.CYCLE + 1)
+        self.assertNotIn("pr:o/r#1", self.watched())
+        # every cycle while the wait counts (WAIT_INTEREST), then gone: not ~5 more backed-off reads to IDLE_EXPIRY
+        self.assertLessEqual(self.pr_reads(), gg.WAIT_INTEREST // gg.CYCLE + 2)
+
+    def test_the_watch_set_stays_the_size_of_its_live_waits_across_sweeps(self) -> None:
+        """Sweeps come and go; the watch set between them is the live waits alone, whatever the sweeps covered."""
+        for n in range(1, 41):
+            self.gh.prs[("o", "r", n)] = pr_node(n)
+        waited = [f"pr:o/r#{n}" for n in range(1, 4)]
+        for sweep in range(3):
+            start = NOW + sweep * 30 * gg.CYCLE
+            gg.register_all([f"pr:o/r#{n}" for n in range(1, 41)], once=True)
+            for key in [f"pr:o/r#{n}" for n in range(4, 41)]:
+                self.stamp_watch(key, start - 1)
+            for i in range(30):
+                for key in waited:  # the live waits touch every cycle
+                    gg.register(key, waited=True)
+                    self.stamp_watch(key, start + i * gg.CYCLE - 1, waitedAt=start + i * gg.CYCLE - 1)
+                self.daemon.tick(start + i * gg.CYCLE)
+            self.assertEqual(self.watched(), set(waited))
+
     def test_a_waited_pr_never_backs_off(self) -> None:
         self.gh.prs[("o", "r", 1)] = pr_node(1)
         for i in range(12):
