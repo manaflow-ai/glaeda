@@ -2424,9 +2424,27 @@ class BalanceTest(Base):
         self.assertEqual(len(kept["data"]["checks"]), 150)
         self.assertEqual((kept["dataAt"], kept["fullAt"], kept["via"]), (later, later, "graphql-probe"))
         self.assertEqual(len(self.gh.gql_calls()) - calls, 1, "the first page only: no pages, no suite read")
+        # the same fingerprint but a first-page check that reads differently than cached: read whole, never kept
+        entry = gg.read_cache("pr:o/r#12")
+        entry["data"]["checks"] = [{**c, "conclusion": "FAILURE"} if c["name"] == "job-5" else c
+                                   for c in entry["data"]["checks"]]
+        gg.write_json(gg.cache_dir() / gg.file_name("pr:o/r#12"), entry)
+        third = later + gg.PR_FULL_EVERY + gg.CYCLE
+        os.utime(gg.watch_dir() / gg.file_name("pr:o/r#12"), (third, third))
+        self.daemon.gql_log = []
+        self.daemon.tick(third)
+        self.assertEqual(gg.read_cache("pr:o/r#12")["via"], "graphql", "a first-page difference is read whole")
+        self.assertEqual([c["conclusion"] for c in gg.read_cache("pr:o/r#12")["data"]["checks"] if c["name"] == "job-5"],
+                         ["SUCCESS"])
+        # kept answers are read whole again at PR_WHOLE_EVERY, however often a first page confirms them
+        bound = third + gg.PR_WHOLE_EVERY
+        os.utime(gg.watch_dir() / gg.file_name("pr:o/r#12"), (bound, bound))
+        self.daemon.tick(bound)
+        self.assertEqual(gg.read_cache("pr:o/r#12")["via"], "graphql")
         # a check on the first page changed: read whole again (pages and all), never kept
         self.gh.prs[("o", "r", 12)]["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"][3].update(
             status="IN_PROGRESS", conclusion=None)
+        later = bound
         again = later + gg.PR_FULL_EVERY + gg.CYCLE
         os.utime(gg.watch_dir() / gg.file_name("pr:o/r#12"), (again, again))
         self.daemon.gql_log = []

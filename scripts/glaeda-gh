@@ -646,6 +646,7 @@ PR_PROBE_FIELDS = (f"number state isDraft merged mergeable mergeStateStatus head
                    f"{{ nodes {{ commit {{ checkSuites(first: 1) {{ totalCount }} statusCheckRollup {{ state "
                    f"contexts(first: 1) {{ totalCount {PR_COUNTS} }} }} }} }} }}")
 PR_FULL_EVERY = 600  # a probed PR is still read in full this often (a renamed check, a base's required contexts)
+PR_WHOLE_EVERY = 1800  # ... and a PR past one page of checks is read whole (pages and all) at least this often
 SUITE_RUNS = """query($suites: [ID!]!) { rateLimit { limit remaining resetAt cost } suiteRuns: nodes(ids: $suites) {
 ... on CheckSuite { id conclusion app { slug } workflowRun { databaseId workflow { name databaseId } }
 checkRuns(first: 100, filterBy: { checkType: ALL }) { pageInfo { hasNextPage } nodes { id name status conclusion
@@ -4621,7 +4622,7 @@ class Daemon:
             base = current if isinstance(current, dict) else prior
             entry = {"key": key, "fetchedAt": self.now, "dataAt": None, "data": None, "error": None}
             if base:
-                entry.update({k: base[k] for k in ("dataAt", "data", "etag", "jobs", "jobsEtag", "jobsAt", "jobsTried", "restAt", "source", "restParts", "restRun", "restRunAt", "origin", "via", "rerunAt", "fp", "fullAt")
+                entry.update({k: base[k] for k in ("dataAt", "data", "etag", "jobs", "jobsEtag", "jobsAt", "jobsTried", "restAt", "source", "restParts", "restRun", "restRunAt", "origin", "via", "rerunAt", "fp", "fullAt", "wholeAt")
                               if k in base})
             entry.update(fields)
             if key.startswith("pr:") and isinstance(entry.get("data"), dict) and "data" in fields:
@@ -4721,7 +4722,7 @@ class Daemon:
                 continue
             if i in parsed:
                 # a REST read's kept answers are dead weight in a file clients re-read every 3 s
-                more = {"fp": fps.get(i), "fullAt": self.now} if kind == "pr" else {}
+                more = {"fp": fps.get(i), "fullAt": self.now, "wholeAt": self.now} if kind == "pr" else {}
                 self.store(e["key"], e["cache"], dataAt=self.now, data=parsed[i], restParts=None, via="graphql", **more)
                 continue
             err = problems.get(f"{alias}{i}") or {}
@@ -4745,12 +4746,16 @@ class Daemon:
         if not self.probe_ok({**e, "cache": {**(e.get("cache") or {}), "fullAt": self.now}}):
             return False  # (probe_ok's rules but the PR_FULL_EVERY bound: this is that full read)
         cached = e["cache"]
+        whole = cached.get("wholeAt")
+        if not isinstance(whole, (int, float)) or self.now - whole >= PR_WHOLE_EVERY:
+            return False  # pages, the base's rules and required flags are read whole this often (review of #1956)
         if pr_fingerprint(node) != cached.get("fp"):
             return False
-        known = {(c.get("workflow"), c.get("name")): (c.get("status"), c.get("conclusion"))
+        known = {(c.get("workflow"), c.get("name")): (c.get("status"), c.get("conclusion"), bool(c.get("required")))
                  for c in cached["data"].get("checks") or []}
         first = parse_pr(node).get("checks") or []
-        return all(known.get((c.get("workflow"), c.get("name"))) == (c.get("status"), c.get("conclusion")) for c in first)
+        return all(known.get((c.get("workflow"), c.get("name"))) == (c.get("status"), c.get("conclusion"),
+                                                                      bool(c.get("required"))) for c in first)
 
     def gql_minute_points(self) -> int:
         """GraphQL points this daemon spent in the last 60 s (graphqlPerMinute)."""
