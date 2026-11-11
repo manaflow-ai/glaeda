@@ -4405,6 +4405,100 @@ class OverloadTest(Base):
             self.daemon.tick(NOW + cycle * gg.CYCLE)
         self.assertNotIn("pr:o/r#3", self.daemon.heavy)
 
+    def resource_limited(self, partial, field="statusCheckRollup"):
+        """Answer PR queries as GitHub does past its per-query resource limit: 200, with each PR `partial(prs)` names
+        missing a field (its check rollup, null) beside an error of type RESOURCE_LIMITS_EXCEEDED for it."""
+        sizes = []
+
+        def transport(method, url, headers, body):
+            status, h, out = self.gh(method, url, headers, body)
+            if url.endswith("/graphql"):
+                doc = json.loads(body)
+                if "pullRequest(number:" in doc["query"]:
+                    prs = [doc["variables"][f"n{i}"] for i in range(sum(k.startswith("n") for k in doc["variables"]))]
+                    sizes.append(len(prs))
+                    answer = json.loads(out)
+                    for i, n in enumerate(prs):
+                        if n in partial(prs):
+                            path = [f"p{i}", "pullRequest", "commits", "nodes", 0, "commit", field]
+                            answer["data"][f"p{i}"]["pullRequest"]["commits"]["nodes"][0]["commit"][path[-1]] = None
+                            answer.setdefault("errors", []).append({
+                                "type": "RESOURCE_LIMITS_EXCEEDED", "path": path, "locations": [{"line": 1, "column": 2}],
+                                "message": "Resource limits for this query exceeded."})
+                    out = json.dumps(answer).encode()
+            return status, h, out
+        self.daemon.transport = transport
+        return sizes
+
+    def test_a_resource_limit_halves_the_batch_and_rereads_only_the_partial_prs(self) -> None:
+        """Measured 2026-11-08 on ten large cmux PRs read ten to a query: 5 of the 10 came back partial."""
+        keys = self.watch(10)
+        sizes = self.resource_limited(lambda prs: {2, 5, 7, 9} if len(prs) > 5 else set())
+        self.daemon.tick(NOW)
+        self.assertEqual(sizes, [10, 4])  # the four partial PRs again, in one query at the halved size; no others
+        self.assertEqual(self.daemon.batch["pr"], 5)
+        self.assertEqual(gg.read_json(gg.BASE / "daemon.json")["batch"]["pr"], 5)
+        for key in keys:
+            entry = gg.read_cache(key)
+            self.assertIsNotNone(entry["data"], key)
+            self.assertNotIn("checksPageError", entry["data"], key)  # every PR whole on this tick
+        sizes.clear()
+        self.daemon.tick(NOW + gg.CYCLE)
+        self.assertEqual(sizes, [5, 5])  # the next cycle reads at the smaller size: nothing partial, nothing re-read
+
+    def test_null_check_suites_past_the_resource_limit_converge_to_clean_reads(self) -> None:
+        """2026-11-11 13:40Z: every checkSuites node of a batch came back null beside RESOURCE_LIMITS_EXCEEDED; 25 of
+        cosmic-gray's 72 PRs and 16 of huge-blue's 28 sat partial ("malformed check suite counts"), and a partial PR
+        is never probed, so each was read in full every cycle at the size that failed."""
+        keys = self.watch(10)
+        sizes = self.resource_limited(lambda prs: set(prs) if len(prs) > 3 else set(), field="checkSuites")
+        partial = lambda: [k for k in keys if "checksPageError" in (gg.read_cache(k)["data"] or {})]
+        for cycle in range(4):
+            for n in range(1, 11):
+                os.utime(gg.watch_dir() / gg.file_name(f"pr:o/r#{n}"), (NOW + cycle * gg.CYCLE,) * 2)
+            self.daemon.tick(NOW + cycle * gg.CYCLE)
+            if not partial():
+                break
+        self.assertEqual(partial(), [], "every PR whole once the batch fits under the limit")
+        self.assertLessEqual(self.daemon.batch["pr"], 3)
+        sizes.clear()
+        for n in range(1, 11):
+            os.utime(gg.watch_dir() / gg.file_name(f"pr:o/r#{n}"), (NOW + 9 * gg.CYCLE,) * 2)
+        self.daemon.tick(NOW + 9 * gg.CYCLE)
+        self.assertEqual(partial(), [], "and it stays whole: the next cycle reads at the size that fits")
+        self.assertTrue(all(size <= 3 for size in sizes), sizes)
+
+    def test_clean_batches_grow_the_batch_back(self) -> None:
+        self.watch(10)
+        limit = [5]
+        self.resource_limited(lambda prs: set(prs) if len(prs) > limit[0] else set())
+        self.daemon.tick(NOW)
+        self.assertEqual(self.daemon.batch["pr"], 5)
+        limit[0] = 100  # GitHub answers whole again
+        for cycle in range(1, 4):
+            for n in range(1, 11):
+                os.utime(gg.watch_dir() / gg.file_name(f"pr:o/r#{n}"), (NOW + cycle * gg.CYCLE,) * 2)
+            self.daemon.tick(NOW + cycle * gg.CYCLE)
+        self.assertEqual(self.daemon.batch["pr"], 6)  # one more after GQL_GROW_AFTER clean queries, not a jump
+        self.assertEqual(gg.read_json(gg.BASE / "daemon.json")["batch"]["pr"], 6)
+
+    def test_a_pr_partial_even_alone_is_stored_partial_and_not_reread_again(self) -> None:
+        keys = self.watch(4)
+        sizes = self.resource_limited(lambda prs: {3} & set(prs))
+        self.daemon.tick(NOW)
+        self.assertEqual(sizes, [4, 1])  # #3 once more, alone; then it waits for the next cycle
+        entry = gg.read_cache("pr:o/r#3")
+        self.assertIn("Resource limits for this query exceeded", entry["data"]["checksPageError"])  # pending, not green
+        for key in keys:
+            if key != "pr:o/r#3":
+                self.assertNotIn("checksPageError", gg.read_cache(key)["data"], key)
+        self.daemon.batch["pr"] = 1
+        sizes.clear()
+        self.daemon.tick(NOW + gg.CYCLE)
+        self.assertEqual(sizes, [1, 1, 1, 1])  # at the floor: one query a PR, #3 not read twice
+        self.assertEqual(self.daemon.batch["pr"], 1)
+        self.assertIn("Resource limits", gg.read_cache("pr:o/r#3")["data"]["checksPageError"])
+
     def test_a_pr_never_read_counts_in_the_oldest_data(self) -> None:
         self.watch(1)
         self.overloaded(poison=1)
@@ -5599,13 +5693,31 @@ class RestartTest(Base):
 
 
     # A fresh heartbeat with starved waited data (huge-blue 2026-11-11: oldestData.pr 3061 s, "nothing to restart")
-    def fresh(self, stale: dict, modes: dict | None = None, capped: bool = False) -> None:
+    def fresh(self, stale: dict, modes: dict | None = None, capped: bool = False, why: dict | None = None) -> None:
         self.lock = open(gg.BASE / "daemon.lock", "a+")
         fcntl.flock(self.lock, fcntl.LOCK_EX)
         gg.write_json(gg.BASE / "daemon.json", {"pid": 1, "at": time.time() - 5, "heartbeat": 30,
                                                 "staleWaited": stale, "staleAfter": gg.STALE_DATA_AFTER,
                                                 "modes": modes or {"rest": "lean", "graphql": "normal"},
-                                                "restShare": {"capped": capped}})
+                                                "restShare": {"capped": capped}, **({"staleWhy": why} if why else {})})
+
+    def test_a_quota_floor_stop_is_named_and_not_restarted(self) -> None:
+        """huge-blue 2026-11-11: GraphQL at the fleet's 1000 reserve, REST lean but not at its share, PR data 2509 s
+        old, no error recorded: `restart` restarted the daemon three times. The daemon now records why (staleWhy)."""
+        why = {"pr": {"why": "the shared GraphQL quota is under the daemon's reserve: 990 left, no GraphQL reads "
+                             "below 1000 (kept for lands), resets 14:26Z", "quota": True}}
+        self.fresh({"pr": 2509.0}, modes={"rest": "lean", "graphql": "stop"}, why=why)
+        code, text = self.run_restart()
+        self.assertEqual((code, self.calls), (0, []), text)
+        self.assertIn("990 left", text)
+
+    def test_a_slowing_quota_is_named_when_the_daemon_is_restarted(self) -> None:
+        why = {"pr": {"why": "the shared GraphQL quota is under the daemon's floor: 1200 left", "quota": False}}
+        self.fresh({"pr": 2509.0}, modes={"rest": "lean", "graphql": "lean"}, why=why)
+        with mock.patch.object(gg, "lock_holder", return_value=None):
+            code, text = self.run_restart()
+        self.assertEqual(self.calls, [True], text)
+        self.assertIn("The quota slows it (the shared GraphQL quota is under the daemon's floor: 1200 left)", text)
 
     def test_fresh_heartbeat_with_starved_data_is_restarted(self) -> None:
         self.fresh({"pr": 3061.0, "run": 22.0, "comment": None, "head": None})
@@ -12014,6 +12126,50 @@ class SpendAlarmTest(Base):
         self.daemon.check_alarms()
         self.assertEqual(len(self.told_lines()), 3, "a stale alarm still firing is said again each hour")
 
+    def test_a_graphql_reserve_stop_is_the_recorded_stale_reason(self) -> None:
+        """huge-blue 2026-11-11: the shared GraphQL quota sat at the fleet's reserve; GraphQL stopped, REST lean but
+        under its share, so quota_starved() was false and PR data 2509 s old carried no cause. Now the cause is in
+        daemon.json (staleWhy), it holds the alarm, and daemon_starved names it."""
+        self.policy()
+        floor, reserve = self.daemon.policy["floors"]["graphql"]
+        self.daemon.budget["graphql"] = {"limit": 5000, "remaining": reserve - 10, "reset": NOW + 1200}
+        self.daemon.stale_waited, self.daemon.stale_waited_key = {"pr": 2509.0}, {"pr": "pr:o/r#5"}
+        self.assertFalse(self.daemon.quota_starved())
+        self.daemon.check_alarms()
+        self.assertEqual(self.told_lines(), [], "explained by the quota: held, not alarmed as a fault")
+        why = self.daemon.stale_why()
+        self.assertTrue(why["pr"]["quota"])
+        self.assertIn(f"{reserve - 10} left", why["pr"]["why"])
+        self.assertIn(f"below {reserve}", why["pr"]["why"])
+        starved = gg.daemon_starved({"at": time.time(), "staleWaited": {"pr": 2509.0}, "staleWhy": why,
+                                     "modes": {"graphql": "stop", "rest": "lean"}, "restShare": {"capped": False}})
+        self.assertTrue(starved["quota"])
+        self.assertIn(f"{reserve - 10} left", starved["why"])
+
+    def test_daemon_json_carries_the_stale_reason(self) -> None:
+        self.policy()
+        key = gg.parse_key("pr", "o/r#5")
+        gg.write_json(gg.cache_dir() / gg.file_name(key), {"key": key, "fetchedAt": NOW - 2509, "dataAt": NOW - 2509,
+                                                           "data": gg.parse_pr(pr_node(5)), "error": None})
+        gg.register(key, waited=True)
+        reserve = self.daemon.policy["floors"]["graphql"][1]
+        self.daemon.budget["graphql"] = {"limit": 5000, "remaining": reserve - 10, "reset": NOW + 1200}
+        self.daemon.budget["rest"] = {"limit": 5000, "remaining": 10, "reset": NOW + 1200}
+        self.daemon.tick(NOW)
+        why = gg.read_json(gg.BASE / "daemon.json")["staleWhy"]
+        self.assertTrue(why["pr"]["quota"], why)
+        self.assertIn("left", why["pr"]["why"])
+
+    def test_a_lean_quota_is_named_in_the_stale_alarm(self) -> None:
+        self.policy()
+        floor, reserve = self.daemon.policy["floors"]["graphql"]
+        self.daemon.budget["graphql"] = {"limit": 5000, "remaining": reserve + 10, "reset": NOW + 1200}
+        self.daemon.stale_waited, self.daemon.stale_waited_key = {"pr": 2509.0}, {"pr": "pr:o/r#5"}
+        self.daemon.check_alarms()
+        told = self.told_lines()
+        self.assertEqual(len(told), 1, told)
+        self.assertIn(f"Quota: the shared GraphQL quota is under the daemon's floor: {reserve + 10} left", told[0])
+
     def test_a_quota_stop_holds_the_stale_alarm_rather_than_clearing_it(self) -> None:
         """A brief quota stop while the data is still old must not tell anyone it is fixed (review of glaeda#1946)."""
         self.policy()
@@ -13795,6 +13951,44 @@ class QuietWritesTest(Base):
         self.assertGreater(served.stat().st_mtime, old + 1)
         # Well under a blocker's look: a mark WAITS_CHECK old is always older than a live daemon's .served.
         self.assertLess(gg.SERVED_QUIET + gg.TICK, gg.WAITS_CHECK / 2)
+
+
+class ScarceWaitedFirstTest(Base):
+    """huge-blue 2026-11-11: with GraphQL under the floor (lean) every PR was read LEAN_FACTOR times less often, the
+    ones a session waits on too, and in watch order. Now waited PRs keep their cycle and go first, oldest first."""
+
+    def test_waited_prs_keep_their_cycle_and_go_first_oldest_first_when_graphql_is_lean(self) -> None:
+        for n in range(1, 9):
+            self.gh.prs[("o", "r", n)] = pr_node(n)
+            gg.register(gg.parse_key("pr", f"o/r#{n}"), waited=n in (6, 3))
+        self.daemon.tick(NOW)
+        for n in (3, 6):  # #6's data is the older one
+            key = f"pr:o/r#{n}"
+            entry = gg.read_cache(key)
+            gg.write_json(gg.cache_dir() / gg.file_name(key), {**entry, "dataAt": NOW - (500 if n == 6 else 100)})
+        floor, reserve = self.daemon.policy["floors"]["graphql"]
+        self.daemon.budget["graphql"] = {"limit": 5000, "remaining": reserve + 10, "reset": NOW + 3000}
+        self.daemon.budget["rest"] = {"limit": 5000, "remaining": 10, "reset": NOW + 3000}  # REST cannot take them
+        self.daemon.now = NOW + gg.CYCLE
+        for n in range(1, 9):
+            path = gg.watch_dir() / gg.file_name(f"pr:o/r#{n}")
+            os.utime(path, (NOW + gg.CYCLE, NOW + gg.CYCLE))
+        self.assertEqual(self.daemon.mode("graphql"), "lean")
+        due = [e["key"] for e in self.daemon.due("pr", self.daemon.watches())]
+        self.assertEqual(due, ["pr:o/r#6", "pr:o/r#3"], "only the waited PRs, oldest data first")
+
+    def test_a_paced_backlog_reads_waited_prs_first(self) -> None:
+        """After a quota stop every PR is due at once and the GraphQL pace defers most; the waited ones go first."""
+        for n in range(1, 9):
+            self.gh.prs[("o", "r", n)] = pr_node(n)
+            gg.register(gg.parse_key("pr", f"o/r#{n}"), waited=n == 7)
+        self.daemon.tick(NOW)
+        self.daemon.deferred = {f"pr:o/r#{n}" for n in range(1, 9)}
+        self.daemon.deferred_since = {f"pr:o/r#{n}": NOW - n for n in range(1, 9)}  # #8 deferred first
+        self.daemon.now = NOW + 5
+        due = [e["key"] for e in self.daemon.due("pr", self.daemon.watches())]
+        self.assertEqual(due[0], "pr:o/r#7", due)
+        self.assertEqual(due[1:], [f"pr:o/r#{n}" for n in (8, 6, 5, 4, 3, 2, 1)], "the rest: oldest deferral first")
 
 
 class PrProbeTest(Base):
