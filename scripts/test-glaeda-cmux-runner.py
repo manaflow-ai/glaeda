@@ -76,6 +76,9 @@ os.environ["GLAEDA_RUNNER_IOREG"] = "/nonexistent/ioreg"
 # The missing-Rust check reads this host's real ~/.cargo/bin: off in this process (and what it starts with its env);
 # RustToolchainMissing tests turn it on against a fake bin dir. The hooks run_hook starts get a fake HOME and PATH.
 os.environ["GLAEDA_RUNNER_TOOLCHAIN_GATE"] = "0"
+# The off-the-tailnet hold reads this host's real Tailscale: off in this process; GateOffTheTailnet turns it on with
+# tailnet_look patched.
+os.environ["GLAEDA_RUNNER_GATE_TAILNET"] = "off"
 hook = load("glaeda_cmux_runner_hook", HOOK)
 REAL_FIND_DISK = hook.find_disk
 REAL_LEAVE_JOB_WORKSPACE = hook.leave_job_workspace
@@ -7982,6 +7985,70 @@ class IdleLeftoverSweepTest(unittest.TestCase):
              mock.patch.object(hook, "gate_log") as log:
             gate.sweep()  # never raises
         self.assertIn("leftover sweep failed", log.call_args[0][0])
+
+
+class GateOffTheTailnet(unittest.TestCase):
+    """2026-11-11: a CI mini was off the tailnet for 4+ h and its runners kept taking build-fleet compile
+    jobs, each failing after 300 s with "controller unreachable" (three PRs in an hour). The gate holds the
+    listener off while the mini's own Tailscale says it is off the tailnet, so GitHub hands the job elsewhere."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        self.runner = self.tmp / "actions-runner-glaeda"
+        self.runner.mkdir()
+        self.state = self.tmp / "state"
+        self.state.mkdir()
+        patch = mock.patch.dict(os.environ, {"GLAEDA_RUNNER_GATE_TAILNET": "on"})
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.gate = hook.Gate(self.runner, os.fspath(self.tmp / "host.lock"), os.fspath(self.tmp / "none.json"),
+                              self.state)
+
+    def look(self, state, via) -> str | None:
+        """One off_tailnet() poll whose look is due and reads (state, via), waited for."""
+        self.gate.tailnet_at -= hook.GATE_TAILNET_EVERY_S
+        with mock.patch.object(hook, "tailnet_look", return_value=(state, via)):
+            self.gate.off_tailnet()
+            self.gate.tailnet_thread.join(5)
+        return self.gate.off_tailnet()
+
+    def test_the_two_signals(self) -> None:
+        self.assertIsNone(hook.tailnet_refusal("Running", "utun4"))
+        self.assertIn("BackendState NeedsLogin", hook.tailnet_refusal("NeedsLogin", None) or "")
+        self.assertIn("Stopped", hook.tailnet_refusal("Stopped", "utun4") or "")
+        self.assertIn("out of en0", hook.tailnet_refusal("Running", "en0") or "")
+        self.assertIn("out of en0", hook.tailnet_refusal(None, "en0") or "", "a CLI that timed out is judged on the route")
+        self.assertIsNone(hook.tailnet_refusal(None, None), "a probe that cannot answer never holds")
+        self.assertIsNone(hook.tailnet_refusal(None, "utun2"))
+
+    def test_held_after_two_looks_agree_and_cleared_by_one_clear_look(self) -> None:
+        self.assertIsNone(self.look("NeedsLogin", "en0"), "one look never holds: a blip is not off the tailnet")
+        held = self.look("NeedsLogin", "en0")
+        self.assertIn("off the tailnet", held or "")
+        self.assertIn("off the tailnet", self.gate.claimed() or "", "claimed() holds the listener off for it")
+        self.assertIn("off the tailnet", self.gate.confirmed() or "", "and the last look before a stop agrees")
+        self.assertIsNone(self.look("Running", "utun3"), "one clear look listens again")
+        self.assertIsNone(self.look("Running", "en0"), "and the count starts over")
+
+    def test_a_look_that_cannot_answer_releases(self) -> None:
+        self.look("Stopped", None)
+        self.assertIsNotNone(self.look("Stopped", None))
+        self.assertIsNone(self.look(None, None), "no Tailscale CLI, or no answer: never held on a guess")
+
+    def test_a_broken_look_never_holds(self) -> None:
+        self.gate.tailnet_at -= hook.GATE_TAILNET_EVERY_S
+        with mock.patch.object(hook, "tailnet_look", side_effect=RuntimeError("boom")):
+            self.gate.off_tailnet()
+            self.gate.tailnet_thread.join(5)
+        self.assertIsNone(self.gate.off_tailnet())
+
+    def test_the_kill_switch(self) -> None:
+        self.look("NeedsLogin", "en0")
+        self.look("NeedsLogin", "en0")
+        with mock.patch.dict(os.environ, {"GLAEDA_RUNNER_GATE_TAILNET": "off"}):
+            self.assertIsNone(self.gate.off_tailnet())
 
 
 class GateTest(unittest.TestCase):

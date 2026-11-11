@@ -1448,6 +1448,27 @@ GATE_CONSOLE_EVERY_S = 30.0
 # off, GitHub hands the job to an eligible runner on the same label. The look runs in a thread (its probes take up
 # to 2 x ELIGIBILITY_BUDGET_S) at most every GATE_ELIGIBLE_EVERY_S, and the gate uses the last answer.
 GATE_ELIGIBLE_EVERY_S = float(os.environ.get("GLAEDA_RUNNER_GATE_ELIGIBLE_EVERY_S") or 300.0)
+# A mini off the tailnet (2026-11-11: one CI mini, offline to the tailnet for 4+ h) still listens to GitHub, which
+# needs no tailnet, so its runners kept taking build-fleet compile jobs. Those hand the commit to the fleet
+# controller over the tailnet, so each failed after 300 s with "controller unreachable" (cmux-ci exit 69) and no
+# verdict: three PRs in one hour. glaeda-mini-health sees the same host (tailscale_down,
+# tailscale_no_route) but only restarts Tailscale, and drains only after an hour never idle, so for that hour, and
+# after a restart that does not fix it, every job that needs the tailnet lands here and fails. The gate holds the
+# listener off while this mini's own Tailscale says it is off the tailnet: its BackendState is not Running
+# (NeedsLogin, Stopped, ...), or the OS routes Tailscale's own address out of a non-tunnel interface (mini-health's
+# two signals, tailnet_refusal). Held off, GitHub hands the job to a runner that can reach the controller. Host-local
+# only: a controller outage leaves every mini on the tailnet, so it never holds the fleet. The look runs in a thread
+# at most every GATE_TAILNET_EVERY_S and holds only after GATE_TAILNET_CONFIRM looks in a row agree; one clear look
+# (or a look that cannot answer, or no Tailscale CLI at all) listens again. Off with GLAEDA_RUNNER_GATE_TAILNET=off.
+GATE_TAILNET_EVERY_S = float(os.environ.get("GLAEDA_RUNNER_GATE_TAILNET_EVERY_S") or 60.0)
+GATE_TAILNET_CONFIRM = 2
+GATE_TAILNET_ENV = "GLAEDA_RUNNER_GATE_TAILNET"
+TAILNET_PROBE_IP = "100.100.100.100"  # Tailscale's own address: on a node on the tailnet the OS sends it into a utun
+TAILSCALE_STANDALONE = "/usr/local/bin/tailscale"
+TAILSCALE_APP = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+TAILSCALE_CLI_ENV = {"TAILSCALE_BE_CLI": "1"}  # the app's binary is its CLI only with this, from a LaunchAgent
+
+
 # A new refusal is looked at once more this soon, and holds only when that look agrees: a probe that timed out on a
 # busy mini reads as a refusal (an empty xcodebuild or node status) and must not hold a good runner for 300 s.
 GATE_ELIGIBLE_RECHECK_S = 30.0
@@ -2132,6 +2153,42 @@ def workload_env() -> dict[str, str]:
     """The env a runner job gets its Rust from, for a caller outside the listener (the build worker's fits and admit,
     the health agent): the LaunchAgent's WORKLOAD_PATH, and this process's CARGO_HOME if it sets one."""
     return {"PATH": WORKLOAD_PATH, **({"CARGO_HOME": os.environ["CARGO_HOME"]} if os.environ.get("CARGO_HOME") else {})}
+
+
+def tailnet_refusal(state: str | None, via: str | None) -> str | None:
+    """Why this mini is off the tailnet, from its Tailscale BackendState and the interface the OS routes
+    TAILNET_PROBE_IP out of; None when on it or when neither says (a probe that could not answer never holds)."""
+    if via is not None and not via.startswith("utun"):
+        return f"off the tailnet: the OS routes {TAILNET_PROBE_IP} out of {via}, not the Tailscale tunnel"
+    if state is not None and state != "Running":
+        return f"off the tailnet: Tailscale BackendState {state}"
+    return None
+
+
+def tailnet_look() -> tuple[str | None, str | None]:
+    """(BackendState, the interface TAILNET_PROBE_IP routes out of), each None when it cannot be read; (None, None)
+    on a host with no Tailscale CLI, which is never judged off the tailnet."""
+    standalone = os.path.exists(TAILSCALE_STANDALONE) and "Tailscale.app" not in os.path.realpath(TAILSCALE_STANDALONE)
+    cli = TAILSCALE_STANDALONE if standalone else TAILSCALE_APP if os.path.exists(TAILSCALE_APP) else None
+    if cli is None:
+        return None, None
+    state = None
+    try:
+        p = subprocess.run([cli, "status", "--json"], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           errors="replace", timeout=15, check=False, env={**os.environ, **TAILSCALE_CLI_ENV})
+        got = json.loads(p.stdout).get("BackendState")
+        state = got if isinstance(got, str) and got else None
+    except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+        state = None
+    via = None
+    try:
+        p = subprocess.run(["/sbin/route", "-n", "get", TAILNET_PROBE_IP], stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, errors="replace", timeout=10, check=False)
+        m = re.search(r"^\s*interface:\s*(\S+)", p.stdout, re.M) if p.returncode == 0 else None
+        via = m.group(1) if m else None
+    except (OSError, subprocess.SubprocessError):
+        via = None
+    return state, via
 
 
 def toolchain_missing(env: dict[str, str] | None = None, home: Path | None = None) -> str | None:
@@ -6623,6 +6680,10 @@ class Gate:
         self.missing_why: str | None = None  # the last toolchain_missing answer, read every poll
         self.eligible_at = -GATE_ELIGIBLE_EVERY_S
         self.eligible_look: threading.Thread | None = None
+        self.tailnet_why: str | None = None  # the held off-the-tailnet answer (off_tailnet)
+        self.tailnet_seen = 0  # looks in a row that found this mini off the tailnet
+        self.tailnet_at = -GATE_TAILNET_EVERY_S
+        self.tailnet_thread: threading.Thread | None = None
         self.stale_env: str | None = None  # why an adopted listener's env is not listener_env's (listen())
         self.disk_warned_at: float | None = None  # when the last low-disk warning was logged
         self.disk_evicted_at = -GATE_DISK_EVICT_EVERY_S  # when the last eviction under the floor started
@@ -6730,7 +6791,7 @@ class Gate:
             self.load_since = None  # the fleet's claim, not load, is holding this gate
             self.yield_to_fleet()
         return (why or self.shed(self.saturated()) or self.full() or self.shed(self.hot()) or self.locked()
-                or self.low_disk() or self.ineligible())
+                or self.low_disk() or self.ineligible() or self.off_tailnet())
 
     def blocking_waiters(self) -> set[int]:
         """The fleet builds waiting for the host that this gate yields to. On the nightly slot, a waiter its jobs may
@@ -6901,7 +6962,7 @@ class Gate:
             self.load_since = None
             self.yield_to_fleet()
         return (why or self.shed(self.saturated()) or self.full(fresh=True) or self.shed(self.hot(fresh=True))
-                or self.locked(fresh=True) or self.low_disk() or self.ineligible())
+                or self.locked(fresh=True) or self.low_disk() or self.ineligible() or self.off_tailnet())
 
     def still_waiting(self) -> str | None:
         """A fleet build seen waiting during the job that just ended, still waiting in a fresh reading."""
@@ -7109,6 +7170,36 @@ class Gate:
             self.eligible_look = threading.Thread(target=look, name="eligibility", daemon=True)
             self.eligible_look.start()
         return f"ineligible: {self.eligible_why}" if self.eligible_why else None
+
+    def off_tailnet(self) -> str | None:
+        """Why this mini is off the tailnet, from the last looks (GATE_TAILNET_EVERY_S, in a thread so no poll waits on
+        the Tailscale CLI): held once GATE_TAILNET_CONFIRM looks in a row say so, cleared by the first that does not."""
+        if (os.environ.get(GATE_TAILNET_ENV) or "").strip().lower() in ("off", "0", "false", "no"):
+            self.tailnet_why, self.tailnet_seen = None, 0
+            return None
+        running = self.tailnet_thread is not None and self.tailnet_thread.is_alive()
+        if not running and time.monotonic() - self.tailnet_at >= GATE_TAILNET_EVERY_S:
+            self.tailnet_at = time.monotonic()
+
+            def look() -> None:
+                try:
+                    why = tailnet_refusal(*tailnet_look())
+                except Exception as error:  # noqa: BLE001 - a broken look must never stop the gate
+                    why = None
+                    gate_log(f"the tailnet look failed ({type(error).__name__}); not holding for it")
+                self.tailnet_seen = self.tailnet_seen + 1 if why else 0
+                held = why if why and self.tailnet_seen >= GATE_TAILNET_CONFIRM else None
+                if why and not held:
+                    self.tailnet_at = time.monotonic() - GATE_TAILNET_EVERY_S + GATE_ELIGIBLE_RECHECK_S
+                if held != self.tailnet_why and (held or self.tailnet_why):
+                    gate_log(f"{held}; held off so a runner that reaches the build-fleet controller takes the job"
+                             if held else "on the tailnet again")
+                if held or not why:
+                    self.tailnet_why = held
+
+            self.tailnet_thread = threading.Thread(target=look, name="tailnet", daemon=True)
+            self.tailnet_thread.start()
+        return self.tailnet_why
 
     def full(self, fresh: bool = False) -> str | None:
         """Every unit this runner's jobs could take is held. A look an admission blocked keeps the previous
