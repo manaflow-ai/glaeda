@@ -1192,6 +1192,15 @@ class) or holds it (both gateway tokens taken, which only the exclusive class ta
 `YIELD_TO_EXCLUSIVE_WAIT_S` (3 h) at most, then refuses. cmux15's nightly-only runners declare it, with
 `trustedNextSigning` on its pool (section 2e). Without the key nothing changes.
 
+That wait is the backstop. A runner that listens through a signing job is handed its label's next job and holds it in
+`job-started` until the signing ends, while the same label's runners on another mini are idle: GitHub does not take a
+job back. On cmux15 on 2026-11-12 that was 252 min over eight published nightlies (23.5 min at worst, for jobs of
+seconds); cmux7s-mac-mini, same labels and no signing, waited 1 min. So the yielding runner's listener gate reads the
+same claim (`Gate.exclusive_yield`): it stops an idle listener while a signing job waits or holds the mini, stops a
+busy one as its job ends (`JOB_END_FREEZE`), and starts it again once the claim is gone. The label's queue then goes
+to a runner that can start it, so a member whose dedicated runners all yield needs a second member with the same
+labels.
+
 ### A LAN relay for an owner-only runner (`lanRelay`)
 
 macOS Local Network privacy refuses a LAN connection from every process under a runner, Apple's `/usr/bin/ssh` and

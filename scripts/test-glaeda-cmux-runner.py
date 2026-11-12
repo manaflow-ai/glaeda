@@ -9730,6 +9730,45 @@ class GateTest(unittest.TestCase):
             gate.step()  # the job ended
         self.assertEqual(stops, ["draining for a relabel to a,b"])
 
+    def test_a_signing_claim_seen_during_a_job_stops_a_yielding_listener_as_the_job_ends(self) -> None:
+        """cmux15, 2026-11-12: a nightly-only runner finished a job while a signing job waited for the mini to drain,
+        took the label's next job within a second and held it in job-started for the whole signing (12.5 min for
+        job 131076020681, a 3 s job). A claim seen during a job stops the listener at that job's end."""
+        capacity = self.tmp / "capacity"
+        capacity.mkdir()
+        marker = capacity / f"{hook.ADMIT_WANT}{os.getpid()}"
+        for flags, stopped in ((" --yield-to-exclusive", True), ("", False)):
+            write_hook(self.runner, f"exec python3 /hook job-started --dedicated-admit /x/a.sh{flags}\n")
+            gate, stops = self.gate([None] * 3, busy=[True, True])
+            gate.capacity_dir = capacity
+            gate.worker_pids = lambda: [4343]
+            with mock.patch.object(hook, "host_waiters", return_value=set()):
+                gate.step()
+                self.assertEqual(gate.watching, ())
+                hook.write_want(marker, time.time(), ["units"], hook.TIER_NIGHTLY, klass=hook.EXCLUSIVE_CLASS)
+                gate.step()
+                self.assertEqual((stops, gate.watching), ([], (4343,) if stopped else ()), "never under its job")
+                gate.step()  # the job ended
+            self.assertEqual(len(stops), 1 if stopped else 0, stops)
+            if stopped:
+                self.assertIn("a signing job waits for this mini to drain", stops[0])
+            marker.unlink()
+
+    def test_a_signing_claim_gone_by_the_end_of_the_job_keeps_the_listener(self) -> None:
+        capacity = self.tmp / "capacity"
+        capacity.mkdir()
+        marker = capacity / f"{hook.ADMIT_WANT}{os.getpid()}"
+        write_hook(self.runner, "exec python3 /hook job-started --dedicated-admit /x/a.sh --yield-to-exclusive\n")
+        gate, stops = self.gate([None] * 3, busy=[True])
+        gate.capacity_dir = capacity
+        gate.worker_pids = lambda: [4343]
+        with mock.patch.object(hook, "host_waiters", return_value=set()):
+            hook.write_want(marker, time.time(), ["units"], hook.TIER_NIGHTLY, klass=hook.EXCLUSIVE_CLASS)
+            gate.step()
+            marker.unlink()
+            gate.step()
+        self.assertEqual(stops, [])
+
     def test_a_drain_holds_an_idle_listener_off_until_its_marker_goes_or_expires(self) -> None:
         gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
         self.assertIsNone(gate.draining())
@@ -14976,6 +15015,63 @@ class DedicatedHookTest(unittest.TestCase):
             self.assertIsNone(gate.still_reserved())
         with mock.patch.object(hook.Gate, "low_disk", return_value="disk: 10 GiB free"):
             self.assertEqual(gate.claimed(), "disk: 10 GiB free")
+
+    def test_a_yielding_dedicated_runners_gate_stops_listening_for_a_signing_job(self) -> None:
+        # cmux15, 2026-11-12: its nightly-only runners listened through every signing job, were handed the label's
+        # next job and waited in job-started (252 min over eight published nightlies, 23.5 min at worst, for jobs of
+        # seconds) while cmux7s-mac-mini's runners of the same label sat idle. The gate reads job-started's claim.
+        capacity = self.dir / "capacity"
+        capacity.mkdir()
+        base = "#!/bin/bash\nexec python3 hook job-started --allowed-repo manaflow-ai/cmux --dedicated-admit /x/a.sh"
+
+        def gate(name: str, flags: str, capacity_dir: Path | None = capacity) -> Any:
+            runner = self.dir / name
+            (runner / cr.HOOK_DIR).mkdir(parents=True)
+            (runner / cr.HOOK_DIR / "job-started.sh").write_text(f"{base}{flags}\n")
+            return hook.Gate(runner, os.fspath(self.dir / "host.lock"), os.fspath(self.dir / "reservation.json"),
+                             self.dir / "state", waiters=False, capacity_dir=capacity_dir)
+
+        yielding = gate("actions-runner-glaeda-nightly-only-3", " --yield-to-exclusive --capacity-dir /x/capacity")
+        last = gate("actions-runner-glaeda-nightly-only-4", " --yield-to-exclusive")  # the flag ends the line
+        plain = gate("actions-runner-glaeda-nightly-only-1", "")  # every other mini's dedicated runner
+        blind = gate("actions-runner-glaeda-nightly-only-5", " --yield-to-exclusive", None)  # no ledger to read
+        pool = self.dir / "actions-runner-glaeda-2"  # the flag means nothing off a dedicated runner
+        (pool / cr.HOOK_DIR).mkdir(parents=True)
+        (pool / cr.HOOK_DIR / "job-started.sh").write_text(
+            "#!/bin/bash\nexec python3 hook job-started --capacity-units 5 --yield-to-exclusive\n")
+        self.assertEqual([hook.runner_scope(g.runner_dir).yields for g in (yielding, last, plain, blind)],
+                         [True, True, False, True])
+        self.assertFalse(hook.runner_scope(pool).yields)
+        marker = capacity / f"{hook.ADMIT_WANT}{os.getpid()}"
+        with mock.patch.object(hook.Gate, "low_disk", return_value=None):
+            self.assertIsNone(yielding.claimed())
+            # a signing job waits for the mini to drain: the yielding runner stops listening, the others go on
+            hook.write_want(marker, time.time(), ["units"], hook.TIER_NIGHTLY, klass=hook.EXCLUSIVE_CLASS)
+            for held in (yielding, last):
+                self.assertIn("waits for this mini", held.claimed())
+                self.assertIn("waits for this mini", held.confirmed())
+            self.assertIsNone(plain.claimed())
+            self.assertIsNone(blind.claimed())
+            # any other waiter holds nothing
+            hook.write_want(marker, time.time(), ["units"], hook.TIER_NIGHTLY)
+            self.assertIsNone(yielding.claimed())
+            marker.unlink()
+            # the signing job holds the mini (both gateway tokens): held until it lets go, then it listens again
+            fds = [hook.lock_file(capacity / f"{token}.token", fcntl.LOCK_EX) for token in hook.GATEWAY_TOKENS]
+            try:
+                self.assertIn("holds this mini", yielding.claimed())
+                self.assertIsNone(plain.claimed())
+            finally:
+                for fd in fds:
+                    os.close(fd)
+            self.assertIsNone(yielding.claimed())
+            # a ledger that cannot be read holds nothing (job-started still yields)
+            with mock.patch.object(hook, "exclusive_claim", side_effect=RuntimeError("ledger")):
+                self.assertIsNone(yielding.claimed())
+        # disk and the toolchain are read first, as before
+        hook.write_want(marker, time.time(), ["units"], hook.TIER_NIGHTLY, klass=hook.EXCLUSIVE_CLASS)
+        with mock.patch.object(hook.Gate, "low_disk", return_value="disk: 10 GiB free"):
+            self.assertEqual(yielding.claimed(), "disk: 10 GiB free")
 
 
 class ManifestLabelsTest(unittest.TestCase):

@@ -5508,6 +5508,7 @@ class RunnerScope(NamedTuple):
     nightly: bool = False
     gateway: bool = False
     trusted_signing: bool = False
+    yields: bool = False  # --yield-to-exclusive (YIELD_TO_EXCLUSIVE): its gate stops listening for a signing job too
 
 
 def reserve_token(scope: RunnerScope | None) -> str | None:
@@ -5677,6 +5678,14 @@ def dedicated_admission(script: Path, min_free_gib: float = 0.0) -> tuple[bool, 
 # exclusive class takes together: CLASS_COST). Its job waits YIELD_TO_EXCLUSIVE_WAIT_S at most, then is refused. The
 # yielding runner's own hook runs in its job's _work, so a signing job admitted while this check passed still sees it
 # there and waits; nothing starts beside a held claim.
+#
+# The wait above is the backstop, not the route. A runner that listens through a claim is handed the label's next job
+# and keeps it for the whole signing, while the same label's runners on the mini beside it sit idle: a runner cannot
+# hand back a job GitHub gave it. cmux15, 2026-11-12, eight published nightlies: 252 min of this wait over 141 jobs
+# (longest 23.5 min; job 131076020681 waited 08:54:52-09:07:21Z for a 3 s job) against 1 min over 83 jobs on
+# cmux7s-mac-mini, whose runners carry the same labels and yield to nothing. So the yielding runner's listener gate
+# reads the same claim (Gate.exclusive_yield): it stops an idle listener, and one whose job ends under a claim
+# (JOB_END_FREEZE), and listens again once the claim is gone, so GitHub queues the job for a runner that can start it.
 YIELD_TO_EXCLUSIVE_WAIT_S = 3 * 3600.0  # a drain (SIGNING_DRAIN_WAIT_S) plus a signing job's 160 min timeout, about
 ABANDONED = "abandoned"
 
@@ -5742,7 +5751,8 @@ def runner_scope(runner_dir: Path) -> RunnerScope:
                        and not gateway,
                        gui, runner_floor_gib(min_free_gib(text), gui or session), gui_token,
                        fast, session, fresh, dedicated, nightly, gateway,
-                       re.search(r"\s--trusted-next-signing(?:\s|$)", text) is not None)
+                       re.search(r"\s--trusted-next-signing(?:\s|$)", text) is not None,
+                       dedicated and re.search(r"\s--yield-to-exclusive(?:\s|$)", text) is not None)
 
 
 def eligibility_scope(runner_dir: Path) -> tuple[str, str | None] | None:
@@ -6782,7 +6792,8 @@ class Gate:
         if runner_scope(self.runner_dir).dedicated:
             # a dedicated builder (a nightly or archive build) is not a pool runner: fleet builds, reservations,
             # load and heat never hold it off, only what would fail its job here (disk, a missing Rust toolchain)
-            return self.low_disk() or self.dedicated_toolchain()
+            # or keep it waiting in job-started (a signing job's claim on a yieldToExclusive runner)
+            return self.low_disk() or self.dedicated_toolchain() or self.exclusive_yield()
         why = host_held(self.host_lock, self.reservation, time.time(), self.state_dir,
                         nightly_slot=runner_scope(self.runner_dir).nightly)
         if why is None and self.waiters and self.waiters_due():
@@ -6794,6 +6805,19 @@ class Gate:
             self.yield_to_fleet()
         return (why or self.shed(self.saturated()) or self.full() or self.shed(self.hot()) or self.locked()
                 or self.low_disk() or self.ineligible() or self.off_tailnet())
+
+    def exclusive_yield(self) -> str | None:
+        """YIELD_TO_EXCLUSIVE at the listener: why a yieldToExclusive dedicated runner takes no job now (a signing
+        job waits for this mini or holds it: exclusive_claim, job-started's own reading), or None. A job taken under
+        a claim waits in job-started until the signing ends, so the gate holds the listener off instead and GitHub
+        hands the job to a runner of the label that can start it. A ledger that cannot be read holds nothing:
+        job-started still yields."""
+        if self.capacity_dir is None or not runner_scope(self.runner_dir).yields:
+            return None
+        try:
+            return exclusive_claim(self.capacity_dir)
+        except Exception:  # noqa: BLE001
+            return None
 
     def blocking_waiters(self) -> set[int]:
         """The fleet builds waiting for the host that this gate yields to. On the nightly slot, a waiter its jobs may
@@ -7692,7 +7716,7 @@ class Gate:
                 self.watching, self.job_waited, self.freeze_at_exit, self.job_request = (), False, False, None
                 ending = self.job_end() if self.job_ending else None
                 if (why := self.draining() or self.low_disk() or self.still_waiting() or self.still_reserved()
-                        or ending):
+                        or self.exclusive_yield() or ending):
                     self.unclaim()
                     self.stop(why, finished)
                     return None
@@ -7710,7 +7734,9 @@ class Gate:
                     self.waiting_at = -GATE_WAITER_EVERY_S  # and read the waiters afresh before it does
                 if self.waiters and self.waiters_due():
                     self.waiting, self.waiting_at = self.blocking_waiters(), time.monotonic()
-                reserved = self.still_reserved() or self.draining()  # RUNNER_DRAIN stops it at the job's end too
+                # RUNNER_DRAIN stops it at the job's end too, and so does a signing job's claim (exclusive_yield):
+                # a job that ends while the signing job waits for the drain is the one a queued job replaces at once
+                reserved = self.still_reserved() or self.draining() or self.exclusive_yield()
                 self.job_waited = bool(self.waiting) or reserved is not None
                 self.low_disk()  # advisory cleanup only: never watch or freeze a Worker for disk
                 workers = tuple(pid for pid in self.worker_pids() if pid not in self.done) \
