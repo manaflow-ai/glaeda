@@ -4675,8 +4675,10 @@ class Daemon:
         # (read every IDLE_BACKOFF_MAX) finds old data that no wait has been blocked on yet. Its starvation is the time
         # a wait has actually waited, not the data's age, or the alarm fired at once on a PR that the next tick
         # reads (huge-blue 2026-11-12: FIRE at 2637 s, cleared 21 s later, and `restart` said nothing was wrong).
-        self.waited_since = {e["key"]: getattr(self, "waited_since", {}).get(e["key"], self.now)
-                             for e in entries if self.waited(e)}
+        # A key this daemon has not seen yet starts at the wait's own start (waitBegan, kept in the watch file), so
+        # a restart does not make a wait that has already been blocked for long look new for another bound.
+        prior = getattr(self, "waited_since", {})
+        self.waited_since = {e["key"]: prior.get(e["key"], self.wait_start(e)) for e in entries if self.waited(e)}
         for e in entries:
             kind = split_key(e["key"])[0]
             cached = read_cache(e["key"]) if e["key"] in fetched else e["cache"]
@@ -4691,6 +4693,13 @@ class Daemon:
                 self.stale_waited[kind] = blocked
                 self.stale_waited_key[kind] = e["key"]
         return oldest
+
+    def wait_start(self, e: dict) -> float:
+        """When the wait on this watch began, from its persisted waitBegan (never in the future), else now."""
+        began = e.get("waitBegan")
+        if isinstance(began, (int, float)) and not isinstance(began, bool):
+            return min(float(began), self.now)
+        return self.now
 
     def tick_failed(self, error: str, site: str, now: float | None = None) -> None:
         """A tick raised. The daemon is alive but refreshes nothing, so keep the heartbeat and say

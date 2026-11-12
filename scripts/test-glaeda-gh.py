@@ -4810,6 +4810,33 @@ class OverloadTest(Base):
         self.assertGreater(self.daemon.stale_waited["pr"], gg.STALE_DATA_AFTER)  # waited past the bound: stale
         self.assertIsNotNone(self.daemon.stale_alarm())
 
+    def test_a_restarted_daemon_counts_a_wait_from_its_persisted_start(self) -> None:
+        """After a restart the daemon has no waited_since of its own: a wait already blocked past the bound counts from
+        the waitBegan its watch file keeps, not from the new daemon's first look, so it is not fresh for another
+        STALE_DATA_AFTER. A wait with no persisted start still counts from the first look, and a start in the future
+        (clock skew) never makes a negative wait."""
+        keys = self.watch(1)
+        self.daemon.tick(NOW)
+        old = NOW + 3 * gg.STALE_DATA_AFTER
+        began = old - gg.STALE_DATA_AFTER - 100  # the wait has been blocked 700 s on 1800 s old data
+        restarted = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=None)
+        restarted.now = old
+        cache = gg.read_cache(keys[0])
+        restarted.oldest_data([{"key": keys[0], "cache": cache, "waitedAt": old, "waitBegan": began}], set())
+        self.assertEqual(restarted.waited_since[keys[0]], began)
+        self.assertGreaterEqual(restarted.stale_waited["pr"], gg.STALE_DATA_AFTER + 100)
+        self.assertIsNotNone(restarted.stale_alarm())
+        for persisted, blocked in ((None, 0.0), (old + 50, 0.0)):  # no start kept; a start ahead of this clock
+            fresh = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=None)
+            fresh.now = old
+            fresh.oldest_data([{"key": keys[0], "cache": cache, "waitedAt": old, "waitBegan": persisted}], set())
+            self.assertEqual(fresh.stale_waited["pr"], blocked)
+            self.assertIsNone(fresh.stale_alarm())
+        # a key the running daemon already counts keeps its own start: a later touch's waitBegan does not reset it
+        restarted.now = old + 10
+        restarted.oldest_data([{"key": keys[0], "cache": cache, "waitedAt": old + 10, "waitBegan": old + 5}], set())
+        self.assertEqual(restarted.waited_since[keys[0]], began)
+
     def test_the_oldest_data_age_is_reported(self) -> None:
         keys = self.watch(3)
         self.daemon.tick(NOW)
