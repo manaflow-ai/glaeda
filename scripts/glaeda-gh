@@ -4670,7 +4670,11 @@ class Daemon:
         oldest: dict[str, float | None] = {kind: None for kind in CYCLES}
         self.stale_waited = {kind: None for kind in CYCLES}
         self.stale_waited_key: dict[str, str] = {}
-        self.since = {e["key"]: self.since.get(e["key"], self.now) for e in entries}
+        # A waited key this daemon has not seen yet is watched since its wait began (waitBegan) at the latest: after a
+        # restart, a target never read successfully (504s since it was registered) keeps its age instead of starting
+        # at zero, which capped its blocked time at zero and silenced the alarm (review of glaeda#1970, F1).
+        self.since = {e["key"]: self.since.get(e["key"], self.wait_start(e) if self.waited(e) else self.now)
+                      for e in entries}
         # When a wait first took an interest in each key (kept while it keeps it): a wait that lands on an idle PR
         # (read every IDLE_BACKOFF_MAX) finds old data that no wait has been blocked on yet. Its starvation is the time
         # a wait has actually waited, not the data's age, or the alarm fired at once on a PR that the next tick

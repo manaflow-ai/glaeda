@@ -4832,6 +4832,15 @@ class OverloadTest(Base):
             fresh.oldest_data([{"key": keys[0], "cache": cache, "waitedAt": old, "waitBegan": persisted}], set())
             self.assertEqual(fresh.stale_waited["pr"], blocked)
             self.assertIsNone(fresh.stale_alarm())
+        # a target never read successfully (no dataAt: 504s since it was registered) is as old as its wait after a
+        # restart too, not zero (review of glaeda#1970, F1)
+        never_read = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=None)
+        never_read.now = old
+        never_read.oldest_data([{"key": keys[0], "cache": None, "waitedAt": old, "waitBegan": began}], set())
+        self.assertEqual(never_read.stale_waited["pr"], gg.STALE_DATA_AFTER + 100)
+        self.assertEqual(never_read.oldest_data([{"key": keys[0], "cache": None, "waitedAt": old}], set())["pr"],
+                         gg.STALE_DATA_AFTER + 100)
+        self.assertIsNotNone(never_read.stale_alarm())
         # a key the running daemon already counts keeps its own start: a later touch's waitBegan does not reset it
         restarted.now = old + 10
         restarted.oldest_data([{"key": keys[0], "cache": cache, "waitedAt": old + 10, "waitBegan": old + 5}], set())
