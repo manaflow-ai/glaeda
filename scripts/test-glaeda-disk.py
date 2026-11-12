@@ -1080,6 +1080,32 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertFalse(gd.in_cwd("/tmp/fo", index))
         self.assertFalse(gd.in_cwd("/tmp/foo/a", index))
 
+    def test_process_evidence_reads_the_tuple_the_query_returns(self) -> None:
+        # _owned_query returns (exit code, text); process_evidence once read .stdout off that text and crashed
+        # with AttributeError on every pass, every 2 s, at near-zero free space (cmux22, 2026-11-11).
+        calls = []
+
+        def query(argv, timeout):
+            calls.append(argv[0])
+            return (0, "p1\nn/tmp/a\nnoise\nn/var/b\n") if argv[0].endswith("lsof") else (0, "/bin/sh -c x\n")
+        with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd, "_owned_query", side_effect=query):
+            opened, commands = self.gd_evidence()
+        self.assertEqual(opened, ["/tmp/a", "/var/b"])
+        self.assertIn("/bin/sh -c x", commands)
+        self.assertEqual(len(calls), 2)
+
+    def test_process_evidence_failures_raise_no_evidence_never_a_crash(self) -> None:
+        cases = [
+            lambda argv, timeout: (1, ""),  # lsof exits nonzero
+            lambda argv, timeout: (0, ""),  # lsof empty
+            lambda argv, timeout: (0, "") if argv[0].endswith("lsof") else (1, ""),
+            lambda argv, timeout: (_ for _ in ()).throw(OSError(28, "No space left on device")),
+        ]
+        for query in cases:
+            with mock.patch.object(gd, "DARWIN", True), mock.patch.object(gd, "_owned_query", side_effect=query):
+                with self.assertRaises(gd.NoEvidence):
+                    self.gd_evidence()
+
     def test_missing_process_evidence_fails_closed(self) -> None:
         make(self.root / "old")
 
