@@ -4671,6 +4671,12 @@ class Daemon:
         self.stale_waited = {kind: None for kind in CYCLES}
         self.stale_waited_key: dict[str, str] = {}
         self.since = {e["key"]: self.since.get(e["key"], self.now) for e in entries}
+        # When a wait first took an interest in each key (kept while it keeps it): a wait that lands on an idle PR
+        # (read every IDLE_BACKOFF_MAX) finds old data that no wait has been blocked on yet. Its starvation is the time
+        # a wait has actually waited, not the data's age, or the alarm fired at once on a PR that the next tick
+        # reads (huge-blue 2026-11-12: FIRE at 2637 s, cleared 21 s later, and `restart` said nothing was wrong).
+        self.waited_since = {e["key"]: getattr(self, "waited_since", {}).get(e["key"], self.now)
+                             for e in entries if self.waited(e)}
         for e in entries:
             kind = split_key(e["key"])[0]
             cached = read_cache(e["key"]) if e["key"] in fetched else e["cache"]
@@ -4680,8 +4686,9 @@ class Daemon:
             seen = (cached or {}).get("dataAt") or self.since[e["key"]]
             age_s = max(0.0, self.now - seen)
             oldest[kind] = max(oldest[kind] or 0.0, age_s)
-            if self.waited(e) and age_s >= (self.stale_waited[kind] or 0.0):
-                self.stale_waited[kind] = age_s
+            blocked = min(age_s, self.now - self.waited_since[e["key"]]) if self.waited(e) else 0.0
+            if self.waited(e) and blocked >= (self.stale_waited[kind] or 0.0):
+                self.stale_waited[kind] = blocked
                 self.stale_waited_key[kind] = e["key"]
         return oldest
 

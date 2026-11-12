@@ -4794,6 +4794,22 @@ class OverloadTest(Base):
         self.daemon.tick(NOW + 5 * gg.CYCLE)
         self.assertEqual(gg.read_json(gg.BASE / "daemon.json")["oldestData"]["pr"], 5 * gg.CYCLE)
 
+    def test_a_wait_on_an_idle_old_pr_is_not_stale_until_it_has_waited(self) -> None:
+        """The alarm and `restart` read the same staleWaited: a wait that lands on old idle data counts from when it
+        began waiting, so neither says "stale" for data the next tick reads (huge-blue 2026-11-12)."""
+        keys = self.watch(1)
+        self.daemon.tick(NOW)
+        old = NOW + 3 * gg.STALE_DATA_AFTER
+        entry = {"key": keys[0], "cache": gg.read_cache(keys[0]), "waitedAt": old}
+        self.daemon.now = old
+        self.daemon.oldest_data([entry], set())
+        self.assertLess(self.daemon.stale_waited["pr"], 1)  # data is 1800 s old, the wait is new
+        self.daemon.now = old + gg.STALE_DATA_AFTER + 5
+        entry["waitedAt"] = self.daemon.now
+        self.daemon.oldest_data([entry], set())
+        self.assertGreater(self.daemon.stale_waited["pr"], gg.STALE_DATA_AFTER)  # waited past the bound: stale
+        self.assertIsNotNone(self.daemon.stale_alarm())
+
     def test_the_oldest_data_age_is_reported(self) -> None:
         keys = self.watch(3)
         self.daemon.tick(NOW)
@@ -12371,6 +12387,7 @@ class SpendAlarmTest(Base):
         gg.write_json(gg.cache_dir() / gg.file_name(key), {"key": key, "fetchedAt": NOW - 700, "dataAt": NOW - 700,
                                                            "data": gg.parse_pr(pr_node(5)), "error": None})
         gg.register(key, waited=True)
+        self.daemon.waited_since = {key: NOW - 700}  # the wait has been blocked on this data as long as it is old
         self.gh.prs[("o", "r", 5)] = pr_node(5)
         with mock.patch.object(gg, "parse_pr", side_effect=AttributeError("bug")):
             self.daemon.tick(NOW)
@@ -12440,6 +12457,7 @@ class SpendAlarmTest(Base):
         gg.write_json(gg.cache_dir() / gg.file_name(key), {"key": key, "fetchedAt": NOW - 2509, "dataAt": NOW - 2509,
                                                            "data": gg.parse_pr(pr_node(5)), "error": None})
         gg.register(key, waited=True)
+        self.daemon.waited_since = {key: NOW - 2509}  # the wait has been blocked on this data as long as it is old
         reserve = self.daemon.policy["floors"]["graphql"][1]
         self.daemon.budget["graphql"] = {"limit": 5000, "remaining": reserve - 10, "reset": NOW + 1200}
         self.daemon.budget["rest"] = {"limit": 5000, "remaining": 10, "reset": NOW + 1200}
@@ -14448,6 +14466,7 @@ class StaleDataTest(Base):
         self.gh.prs[("o", "r", 5)] = pr_node(5, rollup="SUCCESS", checks=[check_run("a")])
         self.put(key, gg.parse_pr(pr_node(5)), at=NOW - 700)
         gg.register(key, waited=True)
+        self.daemon.waited_since = {key: NOW - 700}  # the wait has been blocked on this data as long as it is old
         with mock.patch.object(gg, "parse_pr", side_effect=AttributeError("bug")):
             status = self.daemon.tick(NOW)
         self.assertGreaterEqual(status["staleWaited"]["pr"], 700)
