@@ -107,7 +107,9 @@ the mini and keep the gui label queued. A fast runner (--fast-runner) runs cmux-
 (--gateway-runner) runs only cmux's thin cmux-ci client jobs (GATEWAY_JOBS) on a gateway token (GATEWAY_TOKENS) and no
 shared unit; its gate is never held for CPU saturation or the units (GATEWAY).
 Every runner warns while free disk is under its job-started hook's --min-free-gib and starts the same bounded
-eviction in the background while it keeps listening (Gate.low_disk). Full means every
+eviction in the background while it keeps listening (Gate.low_disk), except that an idle pool runner stops
+listening while free disk is under one job's measured peak (job_disk_gib, DISK_SHORT_HOLD), where a job it took could
+not fit. Full means every
 unit this runner's own --capacity-units scans, read from its job-started hook, is taken or kept for an idle gui
 runner's reserve; for a root runner it also means the mini cannot admit a compile or an app-host shard (mini_full).
 """
@@ -6990,10 +6992,19 @@ class Gate:
         return reservation_refusal(self.reservation, time.time(), nightly_slot=scope.nightly) if self.reservation else None
 
     def low_disk(self) -> str | None:
-        """Warn and request bounded cleanup below this runner's disk target, never hold its listener.
-        The housekeeping floor is advisory: stopping the listener at 30 GiB (and resuming at 32) left usable
-        minis idle and froze listeners at their running Worker's exit. Job admission keeps its existing
-        measured disk-growth checks and disk-low ledger. Disk observations never arm JOB_END_FREEZE.
+        """Warn and request bounded cleanup below this runner's disk target. The housekeeping floor is advisory:
+        stopping the listener at 30 GiB (and resuming at 32) left usable minis idle and froze listeners at their
+        running Worker's exit. Job admission keeps its existing measured disk-growth checks and disk-low ledger. Disk
+        observations never arm JOB_END_FREEZE.
+
+        One reading does hold an idle pool runner's listener (DISK_SHORT_HOLD): free disk under one job's measured
+        peak (job_disk_gib), whatever the floor, after cleanup was requested. A job taken there cannot fit: job-started admits it with a
+        warning (a disk floor never refuses), and it then fails mid-build (cmux run 43119216549, 2026-11-11: admitted
+        at 19.8 GiB free, its fast tier's link stopped at ld errno=28 after 13 minutes). Held, the listener takes
+        nothing and GitHub hands the job to a runner with room, or the rescue moves it once it waits past its budget:
+        slower, never failed. The nightly's own listeners and a dedicated builder are never held here (their jobs come
+        first and keep their own reserve), nor a gateway runner (its thin cmux-ci clients build elsewhere), nor a runner
+        with no disk floor.
         """
         scope = runner_scope(self.runner_dir)
         floor, reserve = scope.min_free_gib, ""
@@ -7019,6 +7030,18 @@ class Gate:
         path = os.path.dirname(self.host_lock)
         self.reap_eviction(path, floor)
         why = disk_refusal(path, floor)
+        # The peak is read on its own, not only under the floor: a floor under one job's peak (--min-free-gib 30 with
+        # GLAEDA_RUNNER_JOB_DISK_GIB=40, at 35 GiB free) must still hold the listener.
+        short = None
+        if not scope.dedicated and not nightly_own and not scope.gateway and scope.min_free_gib > 0:
+            short = disk_refusal(path, job_disk_gib())
+        if short:
+            target = max(floor, job_disk_gib())
+            self.evict_in_background(path, target)
+            if reserve:
+                self.evict_idle_in_background(path, target + GATE_DISK_RESUME_GIB)
+            return (f"disk: {short} for one job's measured peak, cleanup requested; holding the listener so the "
+                    "job goes to a runner with room (DISK_SHORT_HOLD)")
         if why:
             self.evict_in_background(path, floor)
             if scope.dedicated or reserve:

@@ -474,6 +474,12 @@ What `--apply` does:
      hysteresis. Unresolved warnings repeat at most every 30 minutes. The builder reserve remains a cleanup
      target. Job admission retains its existing measured job-growth floor (normally 20 GiB), tour and dedicated
      builder requirements, and single-job disk-low ledger; this change adds no hard-stop threshold.
+     One reading does hold an idle pool runner (`DISK_SHORT_HOLD`), whatever its floor: free disk under one job's
+     measured peak (`GLAEDA_RUNNER_JOB_DISK_GIB`, 20 GiB). A job taken there cannot fit (2026-11-11: a fast tier
+     admitted at 19.8 GiB free failed its link with `ld` errno 28 after 13 minutes), so the listener stops and the
+     job goes to a runner with room or waits, slower but never failed. A running job is never stopped or frozen
+     for it; the nightly's own listeners, dedicated builders, gateway runners and runners with no floor are never
+     held for disk.
      `glaeda-disk --pressure` reads the highest floor among the user's runner hooks and starts freeing at floor
      + 4 GiB, up to floor + 20 GiB (never past half the disk). Cleanup can run during CI and protects live work.
      cmux CI's hot tier (parked PR builds,
