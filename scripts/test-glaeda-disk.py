@@ -65,6 +65,10 @@ gd.gc_home_clones = lambda receipt, home=None, halt=None: 0 if home is None else
 _compact_shared_mirrors = gd.compact_shared_mirrors
 gd.compact_shared_mirrors = (lambda receipt, home=None, halt=None:
                              0 if home is None else _compact_shared_mirrors(receipt, home, halt))
+# And room for every repack, gc and archive whatever the host running the suite has free (a 2 GiB /tmp failed the
+# success tests under the 4 GiB floor, glaeda#1972 F3); the tests of the gate itself use RELIEF_ROOM.
+RELIEF_ROOM = gd.relief_room
+gd.relief_room = lambda path, peak, slow: ""
 # Nor erase the simulator devices of the host running the suite: only a test that passes its own simctl reading.
 _erase_idle_sim_devices = gd.erase_idle_sim_devices
 gd.erase_idle_sim_devices = (lambda receipt, halt=None, budget_s=gd.SIM_DEVICE_BUDGET_S, simctl=None, below_target=None:
@@ -7230,6 +7234,9 @@ class GlaedaDiskTest(unittest.TestCase):
     def test_shared_mirror_compact_waits_for_room_for_its_peak(self) -> None:
         # an agent lane host, 2026-11-12: a pressure repack of the 49 GB shared cmux mirror on a 97% full disk took free
         # space to 113 MB and the host's review service refused a review; a repack starts only with room for its peak
+        room = mock.patch.object(gd, "relief_room", RELIEF_ROOM)
+        room.start()
+        self.addCleanup(room.stop)
         home, mirror, _ = self._shared_mirror(4)
         peak = gd.git_relief_peak(mirror)
         # whole bytes of every object file, never count-objects' KiB (review F2): the packs and their indexes, and a
@@ -7248,7 +7255,17 @@ class GlaedaDiskTest(unittest.TestCase):
         (borrower / "objects/info/alternates").write_text(f"{mirror / 'objects'}\n")
         self.assertLess(gd.git_relief_peak(borrower), peak)
         self.assertGreaterEqual(gd.git_relief_peak(borrower, alternates=True), peak)
+        # a chain (a --shared clone of a --shared clone) counts every store git follows, and a cycle ends (F1)
+        second = self.root / "second.git"
+        self._git("init", "-q", "--bare", os.fspath(second))
+        (second / "objects/info/alternates").write_text(f"{borrower / 'objects'}\n")
+        self.assertGreaterEqual(gd.git_relief_peak(second, alternates=True), peak)
+        (mirror / "objects/info").mkdir(exist_ok=True)
+        (mirror / "objects/info/alternates").write_text(f"{second / 'objects'}\n")
+        self.assertGreaterEqual(gd.git_relief_peak(second, alternates=True), peak)
+        (mirror / "objects/info/alternates").unlink()
         shutil.rmtree(borrower)
+        shutil.rmtree(second)
         real = gd.free_bytes
         gd.process_evidence = lambda: ([], "")
         for free, total in ((113 * 1024**2, 495 * gd.GIB), (peak + gd.RELIEF_SLOW_FLOOR - 1, 100 * gd.GIB),
@@ -7274,6 +7291,9 @@ class GlaedaDiskTest(unittest.TestCase):
 
     def test_every_git_relief_waits_for_room_for_its_peak(self) -> None:
         # the class: home clone gc and runner checkout repack go through the same gate as the mirror compact
+        room = mock.patch.object(gd, "relief_room", RELIEF_ROOM)
+        room.start()
+        self.addCleanup(room.stop)
         gd.process_evidence = lambda: ([], "")
         for name, make, run in (
                 ("home-clone-gc", lambda: self._home_clone(3)[:2], lambda r, h: gd.gc_home_clones(r, h)),
@@ -7308,7 +7328,7 @@ class GlaedaDiskTest(unittest.TestCase):
                 found.append(owner)
         self.assertTrue(found)
         self.assertEqual(sorted(set(found) - allowed), [], "a git writer outside the relief gate (relief_room)")
-        for fn in ("_gc_clones", "_write_bundle", "archive_work_tree"):
+        for fn in ("_gc_clones", "_write_bundle", "archive_work_tree", "archive_git_dir"):
             body = src.split(f"\ndef {fn}(", 1)[1].split("\ndef ", 1)[0]
             self.assertIn("relief_room(", body, fn)
 
@@ -8814,6 +8834,9 @@ class LinuxLayoutTest(unittest.TestCase):
     def test_a_bundle_or_archive_without_room_for_it_keeps_the_tree(self) -> None:
         # a relief that writes before it frees must fit (the 2026-11-12 repack outage's class): with no room in
         # ~/archive the bundle and the uncommitted work's archive are not written, and the tree stays
+        room = mock.patch.object(gd, "relief_room", RELIEF_ROOM)
+        room.start()
+        self.addCleanup(room.stop)
         real = gd.free_bytes
         tight = lambda p: (gd.RELIEF_QUICK_FLOOR - 1, 495 * gd.GIB) if "archive" in os.fspath(p) else real(p)
         for name in ("bundle", "archive"):
@@ -9057,6 +9080,19 @@ class LinuxLayoutTest(unittest.TestCase):
         written: list[Path] = []
         self.assertEqual(gd.archive_git_dir(clone / ".git", "k", written, ["missing commit x"]), "")
         self.assertEqual(len(written), 1)
+
+    def test_a_damaged_git_dir_without_room_for_its_tar_is_not_written(self) -> None:
+        # glaeda#1972 F2: a damaged repository's whole git dir goes to a tar; that writer fits in what is free too
+        _, clone, _ = self.mirror_unit()
+        room = mock.patch.object(gd, "relief_room", RELIEF_ROOM)
+        room.start()
+        self.addCleanup(room.stop)
+        written: list[Path] = []
+        with mock.patch.object(gd, "free_bytes", lambda p: (0, 495 * gd.GIB)):
+            why = gd.archive_git_dir(clone / ".git", "k", written, ["missing commit x"])
+        self.assertTrue(why.startswith(f"tar of {clone / '.git'}: no room"), why)
+        self.assertEqual(written, [])
+        self.assertEqual(list((self.home / "archive/glaeda-disk").glob("*.tar.gz")), [])
 
     def test_a_repository_that_only_fails_for_other_reasons_is_not_called_damaged(self) -> None:
         _, clone, _ = self.mirror_unit()

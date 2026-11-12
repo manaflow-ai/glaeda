@@ -4916,14 +4916,20 @@ def git_relief_peak(gitdir: Path, alternates: bool = False) -> int:
     (`rev-list --disk-usage` does not: it counts the packed bytes as stored, not as written); with alternates, the
     stores objects/info/alternates names are added, since a bundle takes objects from them."""
     stores, total = [gitdir / "objects"], 0
-    if alternates:
-        with contextlib.suppress(OSError):
-            for line in (gitdir / "objects/info/alternates").read_text().splitlines():
-                if line.strip() and not line.startswith("#"):
-                    alt = Path(line.strip())
-                    stores.append(alt if alt.is_absolute() else gitdir / "objects" / alt)
+    if alternates:  # transitively, as git follows them (a --shared clone of a --shared clone); each store once
+        visited: set[str] = set()
+        for store in stores:  # grows while it is read
+            key = os.path.realpath(store)
+            if key in visited:
+                continue
+            visited.add(key)
+            with contextlib.suppress(OSError):
+                for line in (store / "info/alternates").read_text().splitlines():
+                    if line.strip() and not line.startswith("#"):
+                        alt = Path(line.strip())
+                        stores.append(alt if alt.is_absolute() else store / alt)
     seen: set[tuple[int, int]] = set()
-    for store in stores:
+    for store in dict.fromkeys(Path(os.path.realpath(st)) for st in stores):
         for dirpath, _, names in os.walk(store):
             for name in names:
                 with contextlib.suppress(OSError):
@@ -7073,6 +7079,12 @@ def archive_git_dir(gitdir: Path, key: str, written: list[Path], damage: list[st
         want = files_strict(gitdir)
         if want is None:
             return f"git dir of {gitdir} has an unreadable or special file; no tar can hold it"
+        peak = 0  # the tar before gzip: an upper bound
+        for f in want:
+            with contextlib.suppress(OSError):
+                peak += os.lstat(f).st_size
+        if (why := relief_room(mirror_archive(), peak, slow=False)):
+            return f"tar of {gitdir}: {why}"
         with tarfile.open(tmp, "w:gz") as t:
             t.add(os.fspath(gitdir), arcname="git", recursive=True)
         with tarfile.open(tmp, "r:gz") as t:
