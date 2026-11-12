@@ -225,7 +225,10 @@ class GateTest(Base):
                 return subprocess.CompletedProcess(args, 0)
             warm.subprocess.run = fetch
             self.assertEqual(warm.main_head(self.state), "b" * 40)
-            self.assertIn("+refs/heads/main:refs/remotes/origin/main", calls[0])
+            # NEXT's tip, not classic main (Leo, 2026-11-12: "this one just keeps building that shit").
+            self.assertEqual(warm.BRANCH, "feat-cmux-next")
+            self.assertIn("+refs/heads/feat-cmux-next:refs/remotes/origin/feat-cmux-next", calls[0])
+            self.assertNotIn("+refs/heads/main:refs/remotes/origin/main", calls[0])
             # Up to date, or GitHub unreachable: no fetch, the mirror's head.
             self.assertEqual(warm.main_head(self.state), "b" * 40)
             warm.remote_head = lambda: ""
@@ -972,7 +975,7 @@ class CheckoutTest(unittest.TestCase):
             source, work = Path(tmp) / "source", Path(tmp) / "work"
             run = lambda *args, cwd=source: subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
             source.mkdir()
-            run("init", "-q", "-b", "main")
+            run("init", "-q", "-b", warm.BRANCH)  # the branch the catch-up fetches
             run("config", "uploadpack.allowFilter", "true")
             for text in ("zero\n", "one\n"):  # two commits, so a depth-1 clone is shallow
                 (source / "a.txt").write_text(text)

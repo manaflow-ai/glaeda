@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""glaeda-idle-warm: while an owned cmux mini is idle, build main's head into a root whose kept build is far.
+"""glaeda-idle-warm: while an owned cmux mini is idle, build NEXT's tip (feat-cmux-next) into a root whose kept build is far.
 
     glaeda-idle-warm              plan: would this mini warm now, which root, and why not
     glaeda-idle-warm --apply      warm (the 1-minute LaunchAgent from glaeda-mini-setup)
@@ -70,6 +70,13 @@ from typing import Any
 FLEET_DIR = Path(os.environ.get("GLAEDA_FLEET_DIR") or "/Users/Shared/cmux-build-fleet")
 HOME = Path.home()
 REPO_URL = os.environ.get("GLAEDA_IDLE_WARM_REPO", "https://github.com/manaflow-ai/cmux.git")
+# The branch an idle root keeps building: cmux NEXT's tip. Classic `main` is no longer maintained, and every PR
+# the owned minis compile now merges onto feat-cmux-next, so a root warmed at main's head was far for all of them.
+# An idle Mac that keeps building the tip is also the simple fallback that the tip still builds between nightlies
+# (Leo, 2026-11-12: "we still want to ensure that things work. there is the fallback simple route of 'this one just
+# keeps building that shit'"). "main" in the names below means this branch.
+BRANCH = os.environ.get("GLAEDA_IDLE_WARM_BRANCH") or "feat-cmux-next"
+BRANCH_REFSPEC = f"+refs/heads/{BRANCH}:refs/remotes/origin/{BRANCH}"
 # Hostnames (lowercase, no .local) this never runs on: cmux-mac-mini (production iOS soak, hostname
 # cmuxs-Mac-mini-5) and Lawrence's machines (the fleet coordinator and subrouter).
 NEVER_HOSTS = ("cmuxs-mac-mini-5",)
@@ -362,7 +369,7 @@ def nightly_reserve_refusal(hook: Any) -> str:
 
 def mirror_head(mirror: Path) -> str:
     try:
-        out = subprocess.run([GIT, "-C", os.fspath(mirror), "rev-parse", "refs/remotes/origin/main"],
+        out = subprocess.run([GIT, "-C", os.fspath(mirror), "rev-parse", f"refs/remotes/origin/{BRANCH}"],
                              capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -373,7 +380,7 @@ def mirror_head(mirror: Path) -> str:
 def remote_head() -> str:
     """Main's head on GitHub (one unauthenticated ls-remote, no API quota), or '' when it cannot say."""
     try:
-        out = subprocess.run([GIT, "ls-remote", REPO_URL, "refs/heads/main"], capture_output=True, text=True,
+        out = subprocess.run([GIT, "ls-remote", REPO_URL, f"refs/heads/{BRANCH}"], capture_output=True, text=True,
                              timeout=LS_REMOTE_TIMEOUT_S, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -398,7 +405,7 @@ def main_head(state: Path) -> str:
         lock = os.open(mirror.parent / "lock", os.O_RDONLY | os.O_CREAT, 0o644)
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         subprocess.run([GIT, "-C", os.fspath(mirror), "fetch", "-q", "--filter=blob:none",
-                        f"--depth={MIRROR_DEPTH}", "origin", "+refs/heads/main:refs/remotes/origin/main"],
+                        f"--depth={MIRROR_DEPTH}", "origin", BRANCH_REFSPEC],
                        capture_output=True, timeout=MIRROR_FETCH_TIMEOUT_S,
                        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
     except (OSError, subprocess.SubprocessError):
@@ -648,7 +655,7 @@ def prepare_checkout(work: Path, head: str) -> None:
         subprocess.run([GIT, "clone", "-q", f"--depth={CLONE_DEPTH}", "--filter=blob:none", "--no-checkout",
                         REPO_URL, os.fspath(checkout)], check=True, capture_output=True, timeout=GIT_TIMEOUT_S,
                        env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "PATH": PATH})
-    git(checkout, "fetch", "-q", f"--depth={CLONE_DEPTH}", "origin", "+refs/heads/main:refs/remotes/origin/main")
+    git(checkout, "fetch", "-q", f"--depth={CLONE_DEPTH}", "origin", BRANCH_REFSPEC)
     git(checkout, "cat-file", "-e", f"{head}^{{commit}}", timeout=60)
     git(checkout, "-c", "advice.detachedHead=false", "checkout", "-q", "--force", "--detach", head)
     git(checkout, "clean", "-ffdxq")
