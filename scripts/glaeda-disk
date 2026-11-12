@@ -116,6 +116,10 @@ from (tools/wt's bare mirrors, <root>/.wt-mirrors/<owner>/<repo>.git) into one p
 pass, after the eviction lock is released. It holds objects/maintenance.lock while git runs, and waits only while
 another repack, gc or git maintenance run works on that mirror. Fetches (a fetch loop too) and worktree reads go
 on beside it.
+A repack or gc (this one, home-clone-gc, runner-checkout-repack) starts only when free space covers its peak, the
+whole object store written beside the old packs, plus the larger of 4 GiB and 2% of the filesystem; an archive or
+bundle written before a tree goes needs its own bytes plus 256 MiB. One without room is skipped, its receipt line
+blocked:no-room, and a later pass tries again after the cheap reliefs have run.
 
 The folders lanes leave directly in a fleet mini's home (home-scratch: ~/cnx-*-evidence, an ad-hoc clone, a build
 root), on a mini with enrolled runners only, follow the same 12 h rule: idle 12 h, unpushed commits are bundled and
@@ -4878,6 +4882,58 @@ def git_object_bytes(gitdir: Path) -> int:
     return kib * 1024
 
 
+# A relief that writes before it frees (a repack's new pack beside the old ones, an archive before its checkout goes)
+# must fit in what is free. An agent lane host, 2026-11-12: a pressure pass's full repack of the 49 GB shared cmux
+# mirror on a 97% full disk held about 16 GB of deleted but still open packs, free space fell to 113 MB and the
+# host's review service refused a review: the relief was the outage. A relief starts only when free space covers its
+# projected peak plus a floor (relief_room). The cheap reliefs (expired worktrees, caches with a recorded owner) run
+# earlier in the same pass, so a repack judges the room they left; one that does not fit waits for a later pass.
+RELIEF_SLOW_FLOOR = 4 * GIB  # a repack or gc runs for minutes while builds and fetches write beside it
+RELIEF_SLOW_FLOOR_SHARE = 0.02  # ... or this share of the filesystem, whichever is more
+RELIEF_QUICK_FLOOR = GIB // 4  # an archive is written in seconds
+
+
+def relief_room(path: Path, peak: int, slow: bool) -> str:
+    """Why a relief whose writes peak at PEAK bytes on PATH's filesystem must not start now, or "": free space must
+    cover the peak plus the floor (RELIEF_SLOW_FLOOR, or its share of the filesystem, for a repack or gc;
+    RELIEF_QUICK_FLOOR for an archive). An unreadable filesystem has no room."""
+    try:
+        free, total = free_bytes(path)
+    except OSError as e:
+        return f"no room: cannot read free space at {path}: {e.__class__.__name__}"
+    floor = max(RELIEF_SLOW_FLOOR, int(RELIEF_SLOW_FLOOR_SHARE * total)) if slow else RELIEF_QUICK_FLOOR
+    if free >= peak + floor:
+        return ""
+    return (f"no room: its peak needs {gib(peak + floor).strip()} free ({gib(peak).strip()} written before anything "
+            f"is freed, plus a {gib(floor).strip()} floor), {gib(free).strip()} free")
+
+
+def git_relief_peak(gitdir: Path, alternates: bool = False) -> int:
+    """A repack or gc's peak: its new pack can hold every object (-k keeps the unreachable ones) and is written while
+    the old packs stay, and a reader holding an old pack open keeps its bytes after the delete. So the whole object
+    store in bytes: every file under objects/ (packs, indexes, loose objects, garbage), summed from lstat, never
+    count-objects' rounded KiB. A bundle's objects are a subset of the store it reads, so this bounds a bundle too
+    (`rev-list --disk-usage` does not: it counts the packed bytes as stored, not as written); with alternates, the
+    stores objects/info/alternates names are added, since a bundle takes objects from them."""
+    stores, total = [gitdir / "objects"], 0
+    if alternates:
+        with contextlib.suppress(OSError):
+            for line in (gitdir / "objects/info/alternates").read_text().splitlines():
+                if line.strip() and not line.startswith("#"):
+                    alt = Path(line.strip())
+                    stores.append(alt if alt.is_absolute() else gitdir / "objects" / alt)
+    seen: set[tuple[int, int]] = set()
+    for store in stores:
+        for dirpath, _, names in os.walk(store):
+            for name in names:
+                with contextlib.suppress(OSError):
+                    st = os.lstat(os.path.join(dirpath, name))
+                    if stat.S_ISREG(st.st_mode) and (st.st_dev, st.st_ino) not in seen:
+                        seen.add((st.st_dev, st.st_ino))
+                        total += st.st_size
+    return total
+
+
 def _ref_tree_state(root: Path) -> tuple[float, str] | None:
     """Newest mtime below a refs/ or logs/refs/ tree and the first *.lock in it; None past the budget."""
     newest, budget, stack = 0.0, HOME_CLONE_REF_BUDGET, [os.fspath(root)]
@@ -5181,6 +5237,8 @@ def _gc_clones(receipt: Path, clones: list[tuple[int, Path, Path]], family: str,
                 break
             index = open_index(opened)
             why = veto(tree, gitdir, index, cmds, time.time())
+        if not why:  # last, on the free space the earlier reliefs left: a smaller clone may still fit
+            why = relief_room(gitdir, git_relief_peak(gitdir), slow=True)
         held = lock(gitdir) if lock is not None and not why else None
         if held is not None:
             try:
@@ -5193,7 +5251,8 @@ def _gc_clones(receipt: Path, clones: list[tuple[int, Path, Path]], family: str,
             except OSError as e:
                 why, held = f"cannot take {os.path.relpath(held, gitdir)}: {e.__class__.__name__}", None
         if why:
-            rec.update(outcome="changed:in-use", verdict="blocked", reasons=[why], bytes=0)
+            rec.update(outcome="blocked:no-room" if why.startswith("no room") else "changed:in-use",
+                       verdict="blocked", reasons=[why], bytes=0)
         else:
             before = git_object_bytes(gitdir)
             git = shutil.which("git") or "git"
@@ -6840,6 +6899,9 @@ def archive_work_tree(root: Path, inside: Path, trees: set[str], written: list[P
     tmps: list[Path] = []
     try:
         _private_archive_dir()
+        peak = len(patch) + sum(os.lstat(f).st_size for _, f, _ in files)  # the tar before gzip: an upper bound
+        if (why := relief_room(mirror_archive(), peak, slow=False)):
+            return f"archive of {root}: {why}", fingerprint
         if patch:
             dest = mirror_archive() / f"{name}.expires-{expires}.patch"
             tmp = dest.with_name(f".{dest.name}.{os.getpid()}.tmp")
@@ -6891,6 +6953,8 @@ def _write_bundle(gitdir: Path, name: str, revs: list[str], heads: set[str], wri
     tmp = dest.with_name(f".{dest.name}.{os.getpid()}.tmp")
     try:
         _private_archive_dir()
+        if (why := relief_room(mirror_archive(), git_relief_peak(gitdir, alternates=True), slow=False)):
+            return f"bundle of {gitdir}: {why}"
         if _git_dir_run(gitdir, "bundle", "create", str(tmp), "--stdin", stdin="\n".join(revs) + "\n",
                         timeout=600) is None or _git_dir_run(gitdir, "bundle", "verify", str(tmp), timeout=600) is None:
             return f"git bundle create or verify failed for {gitdir}"
