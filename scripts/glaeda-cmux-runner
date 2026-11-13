@@ -2332,6 +2332,9 @@ def sync_dir(path: Path) -> None:
 # while a signing runner has a new hook pending, with a known blocker rechecked through the build controller at no
 # GitHub cost (glaeda#1864). A read that fails is retried once, then holds like a blocker, inside the same cap
 # (2026-11-05 10:16Z: a failed read let a signing runner take hook bcdd1aac over a run in progress that lacked it).
+# A commit with no list at all is not a failed read (sign_hold_absent): its claim gate reads none, so either hook
+# serves it and it holds nothing. cmux#41694 deleted the list from nightly-next on 2026-11-12; read as a failure, that
+# 404 deferred every hook on the signing runners from then on, with no cap (sign_hold_tips).
 SIGN_HOLD_REPO = "manaflow-ai/cmux"
 # SIGN_HOLD_SOURCES: the (workflow file, the branches whose runs hold) the hold reads. One entry per workflow whose
 # signing jobs this runner admits, so the hold covers every one of them: nightly.yml on nightly-next (TRUSTED_NEXT_SIGNING)
@@ -2357,6 +2360,9 @@ SIGN_HOLD_RUNS_URL = ("https://api.github.com/repos/{repo}/actions/workflows/{wo
 SIGN_HOLD_PAGE_SIZE = 100
 SIGN_HOLD_PAGES = 3
 SIGN_HOLD_LIST_URL = "https://raw.githubusercontent.com/{repo}/{sha}/scripts/ci/glaeda-signing-hooks.txt"
+# A file every commit that can hold has (a run of nightly.yml is what holds): read to tell "this commit has no list"
+# from "this commit cannot be read" when the list answers 404.
+SIGN_HOLD_PROBE_URL = "https://raw.githubusercontent.com/{repo}/{sha}/.github/workflows/nightly.yml"
 SIGN_HOLD_ACTIVE = frozenset({"queued", "in_progress", "waiting", "requested", "pending"})
 SIGN_HOLD_CAP_S = 3 * 3600.0
 SIGN_HOLD_MEMO_S = 300.0
@@ -2394,10 +2400,12 @@ def signing_runner(hook_dir: Path) -> bool:
     return False
 
 
-def sign_hold_fetch(url: str, protocols: str = "=https") -> str | None:
-    """The body at url, read anonymously with curl, or None on any failure."""
+def sign_hold_fetch(url: str, protocols: str = "=https", status: bool = False) -> str | None:
+    """The body at url, read anonymously with curl, or None on any failure. With status, the HTTP status of the final
+    answer instead ("404"), or None when there was none."""
+    mode = ["-sSL", "-o", os.devnull, "-w", "%{http_code}"] if status else ["-fsSL"]
     try:
-        got = subprocess.run([CURL, "-fsSL", "--proto", protocols, "--max-time", str(SIGN_HOLD_FETCH_S),
+        got = subprocess.run([CURL, *mode, "--proto", protocols, "--max-time", str(SIGN_HOLD_FETCH_S),
                               "--max-filesize", "4194304", "-H", "Accept: application/vnd.github+json", url],
                              stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
                              timeout=SIGN_HOLD_FETCH_S + 5, check=False)
@@ -2409,6 +2417,15 @@ def sign_hold_fetch(url: str, protocols: str = "=https") -> str | None:
 def sign_hold_read(url: str) -> str | None:
     """One anonymous read for the hold (sign_hold_blockers' whole pass is what is retried)."""
     return sign_hold_fetch(url)
+
+
+def sign_hold_absent(ref: str) -> bool:
+    """Whether SIGN_HOLD_REPO at ref (a commit or a branch) has no signing-hook list: the list answers 404 while the
+    same ref serves nightly.yml. Asked only after the list read failed. Anything else (a 403 or 5xx, no answer, a ref
+    that serves neither file) is an unreadable answer, as before."""
+    if sign_hold_fetch(SIGN_HOLD_LIST_URL.format(repo=SIGN_HOLD_REPO, sha=ref), status=True) != "404":
+        return False
+    return sign_hold_fetch(SIGN_HOLD_PROBE_URL.format(repo=SIGN_HOLD_REPO, sha=ref)) is not None
 
 
 def sign_hold_runs() -> list[dict] | None:
@@ -2508,7 +2525,10 @@ def sign_hold_blockers(digest: str, cache: dict[str, bool], home: Path | None = 
         if sha not in cache:
             text = sign_hold_read(SIGN_HOLD_LIST_URL.format(repo=SIGN_HOLD_REPO, sha=sha))
             if text is None:
-                return None
+                if not sign_hold_absent(sha):
+                    return None
+                cache[sha] = True  # no list at this commit: its gate reads none, so the new hook serves it too
+                continue
             listed = {ln.split(None, 1)[0] for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#")}
             if not listed:
                 return None  # an empty answer is not a list
@@ -2524,7 +2544,8 @@ def sign_hold_blockers(digest: str, cache: dict[str, bool], home: Path | None = 
 def sign_hold_tips(digest: str, installed: str | None) -> list[str] | None:
     """The SIGN_HOLD_SOURCES branches whose tip lists installed (the hook on disk) and not digest (the one about to be
     installed), or None when a tip's list cannot be read. A tip that lists neither is refused whichever hook is on disk,
-    so it holds nothing (as in sign_hold_blockers)."""
+    so it holds nothing (as in sign_hold_blockers); nor does a tip with no list (sign_hold_absent), which refuses
+    neither."""
     held = []
     for branch in sorted({b for _, branches in SIGN_HOLD_SOURCES for b in branches}):
         # one read per tip for SIGN_HOLD_MEMO_S, shared by every runner whatever hook it has on disk (the memo's
@@ -2534,11 +2555,11 @@ def sign_hold_tips(digest: str, installed: str | None) -> list[str] | None:
             listed = memo[1]
         else:
             text = sign_hold_read(SIGN_HOLD_LIST_URL.format(repo=SIGN_HOLD_REPO, sha=branch))
-            if text is None:
+            if text is None and not sign_hold_absent(branch):
                 return None
-            listed = frozenset(ln.split(None, 1)[0] for ln in text.splitlines()
+            listed = frozenset(ln.split(None, 1)[0] for ln in (text or "").splitlines()
                                if ln.strip() and not ln.lstrip().startswith("#"))
-            if not listed:
+            if not listed and text is not None:
                 return None  # an empty answer is not a list
             _SIGN_HOLD_MEMO[("tip", branch)] = (time.time(), listed, [])
         if digest not in listed and installed is not None and installed in listed:

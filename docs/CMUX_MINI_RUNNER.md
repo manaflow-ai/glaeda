@@ -962,7 +962,11 @@ on the exact nightly-next push, on any attempt. Such a job takes the exclusive c
 mini (every unit and token, then no process of an earlier job in any runner's `_work`), holds every other admission
 there while it waits, and waits `SIGNING_DRAIN_WAIT_S` at most, like a nightly-slot signing job. Its dedicated runners
 declare `yieldToExclusive` (section 2e1) so they start nothing while it waits or signs. The hook's bytes change, so
-cmux's `scripts/ci/glaeda-signing-hooks.txt` must list the new sha256 at nightly-next before the OTA.
+a branch that carries `scripts/ci/glaeda-signing-hooks.txt` (cmux main) must list the new sha256 before the OTA: the
+runner refresh keeps the old hook on a signing runner while an active run's commit, or a signing branch's tip, lists
+the old hook and not the new one (`SIGN_HOLD`). A commit with no list holds nothing: nightly-next has had none since
+2026-11-12 (cmux#41694), and its claim gate reads none. Only a 404 for the list from a commit that serves
+`nightly.yml` counts as "no list"; any other failed read keeps the old hook, as before.
 
 ONE_MINI_NIGHTLY (Lawrence, 2026-11-05: every classic and nightly-next nightly job on one Mac mini, cmux15, with no
 Blacksmith) widens that runner, and only that runner, in three exact ways:

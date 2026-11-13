@@ -11876,10 +11876,11 @@ class RunnerTest(unittest.TestCase):
                                              for i, st, sha, _, branch in chosen[(page - 1) * size:page * size]]})
 
     def github(self, runs: list[tuple], lists: dict[str, str] | None, fail: str = "",
-               controller: str = "follows"):
+               controller: str = "follows", absent: tuple[str, ...] = ()):
         """A fake anonymous GitHub and build controller: runs [(id, status, head sha)] (nightly.yml on nightly-next)
         or [(id, status, head sha, workflow, branch)], lists {sha: glaeda-signing-hooks.txt}; a url containing fail
-        answers None. The controller answers a run's status from runs ("follows"), or nothing ("down"). Returns the
+        answers None. A sha or branch in absent has no list: its list read fails with status 404 and it serves
+        nightly.yml. The controller answers a run's status from runs ("follows"), or nothing ("down"). Returns the
         reads it was asked for."""
         reads: list[str] = []
 
@@ -11887,6 +11888,12 @@ class RunnerTest(unittest.TestCase):
             reads.append(url)
             if fail and fail in url:
                 return None
+            if "raw.githubusercontent.com" in url and url.split("/")[-4] in absent:
+                if url.endswith("/nightly.yml"):
+                    return "name: Nightly\n"
+                return "404" if _kw.get("status") else None
+            if _kw.get("status"):
+                return None  # a list a test does not serve was not answered at all: unreadable, never "no list"
             if "/v1/github/runs/" in url:
                 rid = int(url.rsplit("/", 1)[1].split("?")[0])
                 match = [r for r in runs if r[0] == rid]
@@ -12123,6 +12130,85 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(done["state"], "deferred")
         self.assertIn("nightly-next at its tip does not list hook", done["note"])
         self.assertEqual((hooks / cr.HOOK_NAME).read_text(), self.OLDER_HOOK)
+
+    def test_sign_hold_holds_nothing_for_a_branch_that_carries_no_list(self) -> None:
+        # 2026-11-12: cmux#41694 deleted glaeda-signing-hooks.txt from nightly-next and its claim gate stopped reading
+        # one. The list's 404 was read as a failed read, so every refresh deferred the new hook on the signing runners
+        # "until it does", with no cap. A commit with no list refuses neither hook, so it holds nothing: not as a
+        # queued run's commit, not as a branch tip.
+        hooks = self.signing_install()
+        reads = self.github([(43300000001, "queued", self.OLD_SHA)], {"main": "f" * 64 + " neither\n"},
+                            absent=(self.OLD_SHA, "nightly-next"))
+        doc = self.invoke("--refresh-hooks", "--apply")
+        self.assertEqual(doc["runners"][0]["state"], "updated")
+        self.assertEqual((hooks / cr.HOOK_NAME).read_bytes(), HOOK.read_bytes())
+        self.assertNotIn("signHold", doc)
+        for ref in (self.OLD_SHA, "nightly-next"):
+            self.assertEqual([u for u in reads if f"/{ref}/" in u],
+                             [cr.SIGN_HOLD_LIST_URL.format(repo=cr.SIGN_HOLD_REPO, sha=ref)] * 2
+                             + [cr.SIGN_HOLD_PROBE_URL.format(repo=cr.SIGN_HOLD_REPO, sha=ref)],
+                             "the list, its status, then a file that ref must have")
+
+    def test_sign_hold_still_holds_for_a_branch_that_keeps_its_list(self) -> None:
+        # main's classic gate still reads its list: nightly-next having none changes nothing for main
+        old_only = f"{self.older_digest()} old\n"
+        for name, runs, lists, said in (
+                ("main's tip", [], {"main": old_only}, "main at its tip does not list hook"),
+                ("a queued main run", [(43300000002, "queued", self.NEW_SHA, "nightly.yml", "main")],
+                 {self.NEW_SHA: old_only}, "run 43300000002 at bbbbbbbbbbbb")):
+            with self.subTest(holds=name):
+                cr._SIGN_HOLD_MEMO.clear()
+                hooks = self.signing_install()
+                self.github(runs, lists, absent=("nightly-next",))
+                done = self.invoke("--refresh-hooks", "--apply")["runners"][0]
+                self.assertEqual(done["state"], "deferred")
+                self.assertIn(said, done["note"])
+                self.assertEqual((hooks / cr.HOOK_NAME).read_text(), self.OLDER_HOOK)
+                (self.home / ".local/state/glaeda/cmux-runner" / cr.SIGN_HOLD_STATE).unlink()
+
+    def test_sign_hold_takes_only_a_404_from_a_readable_commit_as_no_list(self) -> None:
+        # a 404 from a ref that serves nothing else (a commit GitHub does not know yet), and any other failed answer
+        # (403 from a spent anonymous budget, a 5xx, no answer), are unreadable as before: the old hook stays
+        list_url = cr.SIGN_HOLD_LIST_URL.format(repo=cr.SIGN_HOLD_REPO, sha=self.OLD_SHA)
+        for name, tip_fails in (("a queued run's commit", False), ("a branch tip", True)):
+            with self.subTest(unknown=name):
+                cr._SIGN_HOLD_MEMO.clear()
+                hooks = self.signing_install()
+                ref = "nightly-next" if tip_fails else self.OLD_SHA
+                self.github([] if tip_fails else [(7, "queued", self.OLD_SHA)], {}, absent=(ref,),
+                            fail=f"/{ref}/.github/")
+                with contextlib.redirect_stderr(io.StringIO()):
+                    done = self.invoke("--refresh-hooks", "--apply")["runners"][0]
+                self.assertEqual(done["state"], "deferred")
+                self.assertIn("tip list cannot be read" if tip_fails else "could not read", done["note"])
+                self.assertEqual((hooks / cr.HOOK_NAME).read_text(), self.OLDER_HOOK)
+                (self.home / ".local/state/glaeda/cmux-runner" / cr.SIGN_HOLD_STATE).unlink()
+        for status in ("403", "500", "000", "200", None):
+            with self.subTest(status=status):
+                asked: list[str] = []
+
+                def fetch(url: str, **kw) -> str | None:
+                    asked.append(url)
+                    return status if kw.get("status") else None
+
+                with mock.patch.object(cr, "sign_hold_fetch", fetch):
+                    self.assertFalse(cr.sign_hold_absent(self.OLD_SHA))
+                self.assertEqual(asked, [list_url], "nothing else is read once the list did not answer 404")
+
+    def test_sign_hold_fetch_reads_a_status_without_failing_on_it(self) -> None:
+        # curl -f turns every status from 400 up into one exit code, so the status read asks curl for the code itself
+        calls: list[list[str]] = []
+
+        def run(argv, **_kw):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, stdout="404", stderr="")
+
+        with mock.patch.object(cr.subprocess, "run", run):
+            self.assertEqual(cr.sign_hold_fetch("https://raw.githubusercontent.com/x", status=True), "404")
+            self.assertEqual(cr.sign_hold_fetch("https://raw.githubusercontent.com/x"), "404")
+        self.assertEqual(calls[0][1:6], ["-sSL", "-o", os.devnull, "-w", "%{http_code}"])
+        self.assertNotIn("-fsSL", calls[0])
+        self.assertEqual(calls[1][1], "-fsSL")
 
     def test_sign_hold_reads_each_branch_tip_once_whatever_hook_is_on_disk(self) -> None:
         # two signing runners at different hooks ask about the same rollout: the tips are read once, not once each
