@@ -11400,6 +11400,19 @@ class NightlyNextFallbackTest(unittest.TestCase):
                 self.assertFalse([p for p in items if p == self.root or p == tree or tree in p.parents])
                 self.assertEqual({items[self.root / n] for n in ("cmux15-glaeda", "cmux15-glaeda-1")}, {"reclaimable"})
 
+    def test_the_one_job_tree_is_kept_only_on_a_mac(self) -> None:
+        """The same home (the tree a month idle, two enrolled signing runners) keeps the tree as a Mac and nothing
+        as a Linux host: signing runners are Macs, so a same-named directory there is nobody's kept tree."""
+        tree = self.one_job_tree()
+        self.sign("glaeda")
+        self.sign("glaeda-1")
+        self.assertEqual(gd.one_job_keep(), (os.fspath(tree),))
+        with mock.patch.object(gd, "DARWIN", False):
+            self.assertEqual(gd.one_job_keep(), ())
+            self.assertNotIn(os.fspath(tree), gd.role_keep())
+            self.assertFalse(gd.toolchain_held(tree))
+            self.assertFalse(gd.toolchain_held(self.root))
+
     def test_the_one_job_name_is_never_a_fallback_tree(self) -> None:
         """The fallback family takes pool runners' trees by name; the one-job tree's name must stay outside it."""
         self.assertFalse(gd.nightly_next_fallback(self.root / gd.NIGHTLY_NEXT_ONE_JOB))
