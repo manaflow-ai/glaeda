@@ -592,7 +592,9 @@ class HookTest(unittest.TestCase):
                 "trusted_next_signing": True, "workflow_ref": workflow_ref,
                 "job": "build-sign-notarize-nightly", "run_attempt": "1"}
         signing = [job for workflow, job in hook.SIGNING_JOBS if workflow == "nightly.yml"]
-        self.assertEqual(len(signing), 17)
+        self.assertEqual(len(signing), 18)
+        # ONE_JOB_NIGHTLY (cmux#42267): the one job that builds, signs and publishes is one of them
+        self.assertIn("nightly-next-one", signing)
         # ONE_MINI_NIGHTLY: a dispatched nightly-next run (cmux one-mini mode sends its signing jobs here too) signs
         # here like its push; its payload names the same ref
         dispatch = {"ref": ref, "repository": {**CMUX, "default_branch": "main"}, "inputs": {},
@@ -2960,6 +2962,36 @@ class HookTest(unittest.TestCase):
     def test_nightly_next_github_names_publish_holds_the_whole_mini_before_credentials(self) -> None:
         """publish-nightly-next-github-names holds a release key, so it takes the exclusive claim."""
         self._assert_nightly_job_holds_the_whole_mini("publish-nightly-next-github-names")
+
+    def test_the_one_job_nightly_holds_the_whole_mini_before_credentials(self) -> None:
+        """ONE_JOB_NIGHTLY (cmux#42267): nightly-next-one builds and signs in one job, so it holds the Developer ID
+        key and takes the exclusive claim from its first step, build included."""
+        self._assert_nightly_job_holds_the_whole_mini("nightly-next-one")
+
+    def test_the_one_job_nightly_signs_only_on_the_signing_runner_from_nightly_next(self) -> None:
+        """nightly-next-one is admitted where the other nightly-next signing jobs are and nowhere else: not on the
+        runner that only builds nightly-next (--trusted-next-nightly), and not on a dispatch of main's nightly.yml,
+        which has no such job."""
+        ref = "refs/heads/nightly-next"
+        repo = {**CMUX, "default_branch": "main"}
+        args = {"event_name": "push", "ref": ref, "repository": "manaflow-ai/cmux",
+                "event": {"ref": ref, "repository": repo}, "trusted_ref": "refs/heads/main",
+                "trusted_repo": "manaflow-ai/cmux", "trusted_next_signing": True, "run_attempt": "1",
+                "workflow_ref": f"manaflow-ai/cmux/.github/workflows/nightly.yml@{ref}", "job": "nightly-next-one"}
+        for attempt in ("1", "2"):
+            self.assertIsNone(hook.trusted_refusal(**{**args, "run_attempt": attempt}))
+        self.assertEqual(hook.job_tier(**{k: args[k] for k in ("event_name", "ref", "repository", "event",
+                                                               "workflow_ref", "job")}), hook.TIER_NIGHTLY)
+        main = "refs/heads/main"
+        for overrides in ({"trusted_next_signing": False}, {"trusted_next_signing": False, "trusted_next_nightly": True},
+                          {"event_name": "workflow_dispatch", "ref": main,
+                           "workflow_ref": f"manaflow-ai/cmux/.github/workflows/nightly.yml@{main}",
+                           "event": {"ref": main, "repository": repo, "inputs": {},
+                                     "workflow": ".github/workflows/nightly.yml"}},
+                          {"workflow_ref": f"manaflow-ai/cmux/.github/workflows/cmux-next.yml@{ref}"},
+                          {"event": {"ref": ref, "repository": repo, "pull_request": {}}}):
+            with self.subTest(overrides=overrides):
+                self.assertIn("untrusted:", hook.trusted_refusal(**{**args, **overrides}))
 
     def test_a_gui_job_looks_for_the_idle_fuzzer_again_once_it_holds_the_gui_token(self) -> None:
         """A fuzzer that writes its holder after the first yield and looked at gui.token before this job took it is

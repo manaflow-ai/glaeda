@@ -408,6 +408,11 @@ SIGNING_JOBS = (("nightly.yml", "promote-nightly-next"), ("nightly.yml", "build-
                 ("nightly.yml", "publish-release-notes"), ("nightly.yml", "publish-nightly-reel"),
                 ("nightly.yml", "publish-nightly-identity-legacy"), ("nightly.yml", "republish-nightly-deltas"),
                 ("nightly.yml", "legacy-identity-target"),
+                # ONE_JOB_NIGHTLY (Leo, 2026-11-12, on the nightly's speed: "we need to start freaking enforcing,
+                # like, the speed"; cmux#42267): nightly-next's nightly-next-one builds, signs, notarizes and
+                # publishes in one job on the trusted signing runner, so the build no longer waits for a second
+                # run and a second drain. It holds the key for its whole run, build included: one claim, one drain.
+                ("nightly.yml", "nightly-next-one"),
                 # AUTO_RESUME (below trusted_refusal): the classic continuation's key-holding jobs that do
                 # work. Its three jobs that only wait on Apple's notary queue are not here: they are light
                 # (AUTO_RESUME_POLL_JOBS), because an exclusive class has no bound on how long a job runs and

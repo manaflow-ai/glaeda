@@ -986,6 +986,13 @@ Blacksmith) widens that runner, and only that runner, in three exact ways:
   `publish-nightly-identity-legacy`, `republish-nightly-deltas`, `legacy-identity-target`) are `SIGNING_JOBS`: the
   exclusive class, so each one drains the mini once.
 
+ONE_JOB_NIGHTLY (Leo, 2026-11-12, on the nightly's speed: "we need to start freaking enforcing, like, the speed";
+cmux#42267) adds one `SIGNING_JOBS` entry, `nightly-next-one`: nightly-next's job that builds, signs, notarizes and
+publishes in one job on this runner, admitted on the same exact `nightly.yml@refs/heads/nightly-next` push or
+dispatch as the others. It holds the Developer ID key for its whole run, so it is exclusive from its first step,
+build included: one claim and one drain per nightly, where the two-run pipeline drained the mini once per signing
+job. No other runner class admits it, and main's `nightly.yml` has no such job (a dispatch of it stays refused).
+
 AUTO_RESUME (the same goal) admits main's `auto-resume-nightly-notarization.yml`, the classic continuation of a nightly
 whose Apple notarization outlived the run, on its `workflow_run` and its `workflow_dispatch`. Both must be main's own
 copy (`GITHUB_WORKFLOW_REF` `...@refs/heads/main`, `GITHUB_REF` main, a dispatch payload ref of main); a
