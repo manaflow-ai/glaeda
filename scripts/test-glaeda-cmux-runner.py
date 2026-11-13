@@ -1204,6 +1204,27 @@ class HookTest(unittest.TestCase):
         self.assertEqual(hook.job_tier(**daily), hook.TIER_DEV)
         self.assertEqual(hook.job_tier(**{**dev, "job": "swift-test"}), "")
         self.assertEqual(hook.job_tier(**{**dev, "event_name": "pull_request"}), "")
+        # FEED_TREE: a feat-cmux-next push's cmux-tui tree build feeds that push's nightly, so it ranks with the DEV
+        # compiles; a branch's or a pull request's copy of the workflow, a dispatch and every other job do not
+        tree = {**dev, "workflow_ref": "manaflow-ai/cmux/.github/workflows/cmux-tui-artifacts.yml@refs/heads/feat-cmux-next",
+                "job": "build"}
+        self.assertTrue(hook.feed_tree_build(**tree))
+        self.assertEqual(hook.job_tier(**tree), hook.TIER_DEV)
+        self.assertIsNotNone(hook.nightly_slot_refusal(hook.job_tier(**tree)), "no nightly slot takes it")
+        self.assertIsNotNone(hook.dev_compile_refusal(**tree), "nor the freshness slot")
+        branch = "refs/heads/feat-cmux-next-ios-slack-alerts"
+        for overrides in (
+                {"job": "publish"}, {"job": ""}, {"event_name": "pull_request"}, {"event_name": "workflow_dispatch"},
+                {"repository": "other/cmux"}, {"ref": "refs/pull/1/merge"},
+                {"ref": branch, "event": {"ref": branch, "repository": CMUX},
+                 "workflow_ref": tree["workflow_ref"].replace("refs/heads/feat-cmux-next", branch)},
+                {"event": {"ref": branch, "repository": CMUX}},
+                {"event": {"ref": tree["ref"], "repository": CMUX, "pull_request": {"number": 1}}},
+                {"workflow_ref": tree["workflow_ref"].replace("feat-cmux-next", "main")},
+                {"workflow_ref": tree["workflow_ref"].replace("cmux-tui-artifacts.yml", "cmux-tui.yml")}):
+            with self.subTest(tree=overrides):
+                self.assertFalse(hook.feed_tree_build(**{**tree, **overrides}))
+                self.assertEqual(hook.job_tier(**{**tree, **overrides}), "")
         nightly = {**dev, "ref": "refs/heads/nightly-next",
                    "event": {"ref": "refs/heads/nightly-next", "repository": CMUX},
                    "workflow_ref": "manaflow-ai/cmux/.github/workflows/nightly.yml@refs/heads/nightly-next",
@@ -4209,6 +4230,37 @@ class HookTest(unittest.TestCase):
                 self.finish(runner)
         self.assertTrue(self.lock_free())
 
+    def test_two_cmux_tui_tree_builds_run_side_by_side_while_a_compile_holds_the_root(self) -> None:
+        """TREE_BUILD: cmux's reusable cmux-tui `build` is cargo in its workspace under every caller, so it takes
+        units and no token. As an unknown job under cmux-tui-artifacts.yml it was a compile pinned to root 1: a
+        feat-cmux-next push's tree build waited 49 min for the root a branch's tree build held (cmux run
+        43346255778), then hit its 60 min timeout, and the nightly that needed the tree gave up."""
+        self.fleet()
+
+        def run(runner: str, workflow: str, job: str = "build") -> subprocess.CompletedProcess:
+            ref = f"manaflow-ai/cmux/.github/workflows/{workflow}@refs/heads/feat-cmux-next"
+            return self.job(job, runner, 14, None, env={"GITHUB_WORKFLOW_REF": ref})
+
+        try:
+            compile_ = run("r0", "ci.yml", "macos-compile-admission")
+            self.assertIn("holding 5/14 units+persistent-dd+root-1 for macos-compile-admission (", compile_.stdout)
+            for runner in ("s0", "s1"):
+                done = run(runner, "cmux-tui-artifacts.yml")
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                self.assertIn("holding 4/14 units for build (isolated", done.stdout)
+                self.assertNotIn("is in no job table", done.stdout)
+            # the same job id under a workflow no table names is still a compile, and its log says so once
+            unlisted = run("s2", "some-new-caller.yml")
+            self.assertEqual(unlisted.returncode, 1, unlisted.stdout + unlisted.stderr)
+            self.assertIn("some-new-caller.yml build is in no job table of this hook, so it is costed as a compile: "
+                          "5 units and the persistent-dd and root tokens (canonical root 1)", unlisted.stdout)
+            self.assertIn("list it in WORKFLOW_JOB_CLASSES", unlisted.stdout)
+            self.assertIn("the persistent-dd token is taken (build is compile)", unlisted.stdout)
+        finally:
+            for runner in ("r0", "s0", "s1", "s2"):
+                self.finish(runner)
+        self.assertTrue(self.lock_free())
+
     def test_capacity_a_job_cost_override_keeps_its_class_tokens(self) -> None:
         """cli-regressions is an unknown job (a compile, pinned to root 1) that measures 0.16 cores: it costs 1 core
         but still holds persistent-dd and the root, so a compile still waits for those, not for cores."""
@@ -5208,7 +5260,7 @@ time.sleep(60)
         waiting(now - 5, nightly)
         self.assertIn("has waited longer", hook.fair_turn(capacity, {"units"}, now, nightly, True))
         waiting(now - 5, dev)  # a DEV compile that came later
-        self.assertIn("is a DEV compile and goes first here for units", hook.fair_turn(capacity, {"units"}, now - 60))
+        self.assertIn("is a feed build and goes first here for units", hook.fair_turn(capacity, {"units"}, now - 60))
         self.assertIsNone(hook.fair_turn(capacity, {"units"}, now - bound - 10), "past the bound: arrival order")
         waiting(now - 5, "boss")  # only the known tiers count
         self.assertEqual([w["tier"] for w in hook.admission_waiters(capacity)], [""])
@@ -5698,6 +5750,17 @@ time.sleep(60)
         self.assertEqual(hook.job_class("cdp-browser-smoke", home, home, "cmux-tui.yml"), ("isolated", False))
         # cmux-tui's macOS relay lane only runs chatmux-relay Rust tests in the workspace: no root or GUI token.
         self.assertEqual(hook.job_class("macos-relay", home, home, "cmux-tui.yml"), ("isolated", False))
+        # TREE_BUILD: the reusable cmux-tui `build` under every workflow that calls it (GITHUB_WORKFLOW_REF names the
+        # caller): cargo in the workspace, so units and no token
+        self.assertEqual(hook.TREE_BUILD_CALLERS, ("cmux-tui-artifacts.yml", "cmux-tui-nightly.yml",
+                                                   "cmux-tui-release.yml", "macos-cross-parity.yml"))
+        for caller in ("cmux-tui.yml", *hook.TREE_BUILD_CALLERS):
+            with self.subTest(caller=caller):
+                self.assertEqual(hook.job_class("build", home, home, caller), ("isolated", False))
+        self.assertEqual(hook.CLASS_COST["isolated"][1], (), "no persistent-dd, no root")
+        self.assertEqual(hook.job_units("isolated", "build", home, home, "cmux-tui-artifacts.yml"), 4,
+                         "the class's units until it is measured under this caller")
+        self.assertEqual(hook.job_class("publish", home, home, "cmux-tui-artifacts.yml"), ("compile", True))
         self.assertEqual(hook.job_class("build", home, home, "reload-build.yml"), ("isolated", False))
         self.assertEqual(hook.job_class("build-mac", home, home, "ios-e2e.yml"), ("isolated", False))
         self.assertEqual(hook.job_class("build-mac", home, home, "other.yml"), ("compile", True))

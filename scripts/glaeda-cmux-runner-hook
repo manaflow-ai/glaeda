@@ -425,9 +425,21 @@ SIGNING_JOBS = (("nightly.yml", "promote-nightly-next"), ("nightly.yml", "build-
                 ("auto-resume-nightly-notarization.yml", "republish-deltas"),
                 ("release.yml", "build-sign-notarize"),
                 ("repair-v0-64-25-helper-rpaths.yml", "repair"), ("cmux-next-dev-daily.yml", "sign"))
+# The workflows besides cmux-tui.yml that call cmux's reusable cmux-tui-build-package.yml; none has a `build` job of
+# its own (cmux at e46f9264703d).
+TREE_BUILD_CALLERS = ("cmux-tui-artifacts.yml", "cmux-tui-nightly.yml", "cmux-tui-release.yml",
+                      "macos-cross-parity.yml")
 WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "test"): "isolated",
                         ("cmux-tui.yml", "build"): "isolated", ("cmux-tui.yml", "cdp-browser-smoke"): "isolated",
                         ("cmux-tui.yml", "macos-relay"): "isolated",
+                        # TREE_BUILD: the same reusable `build` (cmux-tui-build-package.yml: cargo into the
+                        # workspace's cmux-tui/target) under its other callers. The table is keyed by the caller's
+                        # file, so each caller is listed (TREE_BUILD_CALLERS). As unknown jobs they were compiles:
+                        # 5 units, persistent-dd and canonical root 1, none of which the job touches. On 2026-11-13
+                        # the tree build of a feat-cmux-next push (cmux run 43346255778) waited 49 min here for
+                        # root 1, held by a branch's tree build on the same mini, and was cancelled by its 60 min
+                        # timeout 7 min into the cargo build; the nightly that needed the tree gave up after 45 min.
+                        **{(caller, "build"): "isolated" for caller in TREE_BUILD_CALLERS},
                         ("reload-build.yml", "build"): "isolated", ("ios-e2e.yml", "build-mac"): "isolated",
                         ("app-host-test-rerun.yml", "rerun"): "gui",
                         ("test-e2e.yml", "build"): "compile-gui", ("test-e2e.yml", "test"): "gui-step",
@@ -899,6 +911,16 @@ def job_class(job: str, repo: str | None, home_repo: str = DEFAULT_HOME_REPO,
     if (workflow, job) in WORKFLOW_JOB_CLASSES:
         return WORKFLOW_JOB_CLASSES[(workflow, job)], False
     return JOB_CLASSES.get(job, "compile"), job not in JOB_CLASSES
+
+
+def unlisted_job_note(workflow: str, job: str) -> str:
+    """What a home-repo job that no job table names is told once, before it waits (UNLISTED_JOB). It is costed as a
+    compile, the safe side for a job that does use the kept DerivedData or a root, and a long wait for a job that
+    uses neither (TREE_BUILD): the line names the table to list it in, so the job's own log says why it queued."""
+    units, tokens = CLASS_COST["compile"]
+    return (f"{workflow or 'an unknown workflow'} {job or 'job'} is in no job table of this hook, so it is costed as "
+            f"a compile: {units} units and the {' and '.join(tokens)} tokens (canonical root 1). If it builds only "
+            "in its workspace, list it in WORKFLOW_JOB_CLASSES")
 
 
 def job_units(klass: str, job: str, repo: str | None, home_repo: str = DEFAULT_HOME_REPO, workflow: str = "") -> int:
@@ -1754,8 +1776,9 @@ def dev_compile_refusal(event_name: str | None, ref: str | None, repository: str
 #     other waiter however long it has waited; no admission of any other tier takes a unit while one waits here; and
 #     it keeps no idle runner's reserve (GUI_RESERVE, FRESH_RESERVE_TOKEN).
 #   - DEV: the other feed compiles the freshness slot admits (dev_compile_refusal: a feat-cmux-next push's DEV
-#     compile, a DEV daily's). Ahead of PR and side jobs, except one that has waited FEED_JUMP_S: that keeps its
-#     arrival order against DEV compiles, so a stream of them cannot starve it.
+#     compile, a DEV daily's), and a feat-cmux-next push's cmux-tui tree build (FEED_TREE). Ahead of PR and side
+#     jobs, except one that has waited FEED_JUMP_S: that keeps its arrival order against feed builds, so a stream of
+#     them cannot starve it.
 #   - STACK: a manaflow-ai/cmux pull request job whose PR carries the `stack-blocker` label (STACK_BLOCKER_LABEL): a
 #     PR whose landing a stack of reviewed PRs waits on. Right after nightly: ahead of DEV compiles and every other
 #     PR or side job however long they have waited, by arrival among themselves. Unlike a nightly job it only takes
@@ -1865,6 +1888,28 @@ def hosted_route_refusal(workflow_ref: str | None, job: str | None) -> str | Non
     return None
 
 
+# FEED_TREE: cmux-tui-artifacts.yml's `build` on a feat-cmux-next push builds the cmux-tui tree that push's nightly-next
+# app bundles. nightly-next compiles first and then waits 45 min at most for the tree, so a tree build queued behind
+# branch builds is nightly time. It ranks with the DEV feed compiles (TIER_DEV): ahead of PR and branch jobs that have
+# waited under FEED_JUMP_S, behind nightly and stack-blocker jobs. It stops no other admission, is bounded by no
+# refusal and reaches no priority runner (the freshness and nightly slots check their own lists). A branch's or a pull
+# request's copy of the workflow, and a dispatch, keep the ordinary order.
+FEED_TREE_WORKFLOW = "manaflow-ai/cmux/.github/workflows/cmux-tui-artifacts.yml"
+FEED_TREE_REF = "refs/heads/feat-cmux-next"
+FEED_TREE_JOB = "build"
+
+
+def feed_tree_build(event_name: str | None, ref: str | None, repository: str | None, event: Any,
+                    workflow_ref: str | None, job: str | None) -> bool:
+    """Whether this job is the cmux-tui tree build of a feat-cmux-next push (FEED_TREE). Pure. Only the merged
+    workflow on feat-cmux-next's own ref, from that ref's own push payload."""
+    if not isinstance(event, dict) or any(key in event for key in UNTRUSTED_PAYLOAD_KEYS):
+        return False
+    repos = {(repository or "").lower(), (_repo_name(event.get("repository")) or "").lower()}
+    return (repos == {"manaflow-ai/cmux"} and job == FEED_TREE_JOB and event_name == "push" and ref == FEED_TREE_REF
+            and event.get("ref") == ref and workflow_ref == f"{FEED_TREE_WORKFLOW}@{FEED_TREE_REF}")
+
+
 def job_tier(event_name: str | None, ref: str | None, repository: str | None, event: Any,
              workflow_ref: str | None, job: str | None) -> str:
     """This job's admission tier (FEED_FIRST): TIER_NIGHTLY, TIER_DEV or "". Pure. Only merged workflow code on a
@@ -1886,6 +1931,8 @@ def job_tier(event_name: str | None, ref: str | None, repository: str | None, ev
         return ""
     if dev_compile_refusal(event_name, ref, repository, event, workflow_ref, job) is None:
         return TIER_NIGHTLY if job == PROMOTE_COMPILE and event_name == "push" else TIER_DEV
+    if feed_tree_build(event_name, ref, repository, event, workflow_ref, job):
+        return TIER_DEV
     repos = {(repository or "").lower(), (_repo_name(event.get("repository")) or "").lower()}
     if repos != {"manaflow-ai/cmux"} or not job or event_name not in NIGHTLY_EVENTS:
         return ""
@@ -4822,7 +4869,7 @@ def fair_turn(capacity_dir: Path, needs: set[str], since: float, tier: str = "",
                 return f"capacity: {who} is a signing job and goes first here for {', '.join(sorted(shared))}"
             if (waiter["since"], waiter["pid"]) > (since, os.getpid()) or waiter["tier"] == TIER_NIGHTLY != tier:
                 kind = {TIER_NIGHTLY: "a nightly job", TIER_STACK: "a stack-blocker PR job"}.get(waiter["tier"],
-                                                                                                 "a DEV compile")
+                                                                                                 "a feed build")
                 return f"capacity: {who} is {kind} and goes first here for {', '.join(sorted(shared))}"
             return f"capacity: {who} has waited longer here for {', '.join(sorted(shared))}"
     return None
@@ -10127,8 +10174,12 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{PREFIX}: a stack-blocker PR job (label {STACK_BLOCKER_LABEL}): it goes ahead of every other "
                       "PR, side and DEV job waiting here for capacity, right after nightly jobs", flush=True)
             elif tier:
-                print(f"{PREFIX}: a DEV compile: it goes ahead of PR jobs waiting here for capacity "
-                      f"(those waiting under {FEED_JUMP_S / 60:g} min)", flush=True)
+                print(f"{PREFIX}: a feed build (a DEV compile or feat-cmux-next's cmux-tui tree build): it goes ahead "
+                      f"of PR jobs waiting here for capacity (those waiting under {FEED_JUMP_S / 60:g} min)",
+                      flush=True)
+            if not admit_class and job_class(os.environ.get("GITHUB_JOB", ""), repo, args.home_repo,
+                                             job_workflow())[1]:
+                print(f"{PREFIX}: {unlisted_job_note(job_workflow(), os.environ.get('GITHUB_JOB', ''))}", flush=True)
             start, since = time.monotonic(), time.time()
             marker = args.capacity_dir / f"{ADMIT_WANT}{os.getpid()}"
             shown, shown_at = "", 0.0

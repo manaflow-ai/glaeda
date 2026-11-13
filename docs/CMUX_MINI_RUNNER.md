@@ -707,6 +707,17 @@ compiles and every other PR or side job, by arrival among themselves, but unlike
 job they hold no other admission, hold no gate and keep the idle reserves. A label added
 after the run was created reaches the hook with the PR's next run.
 
+Then come the feed builds (`TIER_DEV`): the DEV compiles, and the cmux-tui tree build of a
+`feat-cmux-next` push (`cmux-tui-artifacts.yml`'s `build`, `FEED_TREE`), which the push's
+nightly-next app waits 45 min at most to bundle. They go ahead of PR and branch jobs that have
+waited under `FEED_JUMP_S` (20 min) and hold no other admission. That tree build is cmux's reusable
+cmux-tui `build`: cargo in its workspace, so it is isolated (units, no token) under every
+workflow that calls it (`TREE_BUILD_CALLERS`). The job table is keyed by the caller's file, so a
+new caller must be listed there. Until it is, the job is an unknown job, a compile that waits for
+persistent-dd and canonical root 1, and its log says so once before it waits: `<workflow> <job>
+is in no job table of this hook`. On 2026-11-13 the tree build of a `feat-cmux-next` push waited
+49 min for root 1 that way, behind a branch's tree build, and was cancelled by its 60 min timeout.
+
 `glaeda-macos-<major>` is observed on the mini, not declared, so a fleet that straddles an
 OS upgrade can route a job to one macOS (`runs-on: [glaeda-std-xcode-26.6, glaeda-macos-27]`).
 It is never the bare `macos-<N>`: that is GitHub-hosted vocabulary, and cmux's workflows check
