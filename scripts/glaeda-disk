@@ -240,6 +240,7 @@ import plistlib
 import pwd
 import math
 import re
+import shlex
 import shutil
 import signal
 import stat
@@ -676,10 +677,46 @@ def real_runner_dir(runner: Path) -> bool:
         return False
 
 
+def signing_runner(runner: Path) -> bool:
+    """RUNNER's job-started runs the hook with SIGNING_RUNNER_FLAG: an enrolled nightly signing runner
+    (glaeda-cmux-runner signing_runner reads the same wrapper)."""
+    if not (real_runner_dir(runner) and (runner / ".runner").is_file()):
+        return False
+    try:
+        text = (runner / "glaeda-hooks/job-started.sh").read_text()
+    except (OSError, UnicodeDecodeError):
+        return False
+    for line in text.splitlines():
+        try:
+            if SIGNING_RUNNER_FLAG in shlex.split(line, comments=True):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def one_job_keep() -> tuple[str, ...]:
+    """The one-job nightly's kept tree (NIGHTLY_NEXT_ONE_JOB), as spelled and resolved, on a Mac with an enrolled
+    signing runner; () anywhere else and while the tree does not exist."""
+    tree = HOME / "Library/Caches" / NIGHTLY_NEXT_ROOT / NIGHTLY_NEXT_ONE_JOB
+    if not os.path.lexists(tree):
+        return ()
+    try:
+        runners = list(HOME.glob("actions-runner-glaeda*"))
+    except OSError:
+        return ()
+    if not any(signing_runner(r) for r in runners):
+        return ()
+    home = os.path.realpath(HOME)
+    return tuple(s for s in dict.fromkeys((os.path.abspath(tree), os.path.realpath(tree)))
+                 if s.startswith(home + "/"))
+
+
 def role_keep() -> tuple[str, ...]:
-    """Every enrolled dedicated runner's kept paths (ROLE_KEEP_MARKER), as spelled and resolved. Read fresh each
-    call: a marker is small, and a keep the installer just added must hold for the very next delete."""
-    out: list[str] = []
+    """Every enrolled dedicated runner's kept paths (ROLE_KEEP_MARKER), as spelled and resolved, and the signing
+    Mac's one-job tree (one_job_keep). Read fresh each call: a marker is small, and a keep the installer just
+    added must hold for the very next delete."""
+    out: list[str] = list(one_job_keep())
     home = os.path.realpath(HOME)
     for runner in HOME.glob("actions-runner-glaeda-*"):
         if not (real_runner_dir(runner) and (runner / ".runner").is_file() and (runner / "glaeda-hooks").is_dir()):
@@ -979,6 +1016,17 @@ NIGHTLY_NEXT_DEDICATED_LABEL = "glaeda-trusted-next-nightly"  # cmux pr_runner_p
 NIGHTLY_NEXT_DEDICATED_RUNNER = re.compile(r"[A-Za-z0-9._-]+-nightly-next")
 # a pool runner's tree (cmux nightly_build_state.owned: <member>-glaeda[-K]); anything else in the root stays
 NIGHTLY_NEXT_POOL_RUNNER = re.compile(r"[A-Za-z0-9._-]+-glaeda(?:-[0-9]+)?")
+# ONE_JOB_TREE (Leo, 2026-11-12, on the nightly's speed: "we need to start freaking enforcing, like, the speed";
+# cmux#42267): nightly-next's one job (nightly-next-one) builds, signs and publishes on the signing Mac and keeps its
+# warm build state in one fixed tree per Mac, NIGHTLY_NEXT_ROOT/NIGHTLY_NEXT_ONE_JOB, shared by that Mac's signing
+# runners (the job holds the whole Mac, so one runs at a time): only the first run builds cold, whichever runner
+# takes the next. Kept by role (role_keep, one_job_keep) while a signing runner is enrolled on the Mac, its
+# job-started running the hook with SIGNING_RUNNER_FLAG: never an item of any family, however old and at any
+# pressure. The name is outside NIGHTLY_NEXT_POOL_RUNNER, so the fallback family never offered it; the role keep
+# also holds it against every other family, and a test holds the pattern. A Mac with no signing runner keeps
+# nothing by this name: there the tree is an unrecognized name in the root, as before.
+NIGHTLY_NEXT_ONE_JOB = "one-job"
+SIGNING_RUNNER_FLAG = "--trusted-next-signing"  # glaeda-cmux-runner SIGN_HOLD_FLAG
 
 
 def fleet_families(ci: Path | None = None) -> list[Family]:

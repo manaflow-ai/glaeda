@@ -191,6 +191,16 @@ Then:
 - the dedicated builder's tree (`*-nightly-next`) and any name the family does
   not recognize are never candidates.
 
+The one-job nightly (cmux's `nightly-next-one`) keeps its warm build state in
+one fixed tree per Mac, `~/Library/Caches/cmux-nightly-next/one-job`, shared by
+that Mac's signing runners, so whichever runner takes the next nightly builds
+warm. On a Mac with an enrolled signing runner (its `job-started.sh` runs the
+hook with `--trusted-next-signing`) that tree is kept by role: it is no
+family's item, however old and at any pressure, and the root above it is split
+as it is for any role keep. A Mac with no signing runner keeps nothing by that
+name. When the one-job nightly is retired, remove the tree by hand and drop
+`NIGHTLY_NEXT_ONE_JOB`: nothing else ages it out.
+
 While the builder is busy, the build still falls back to an idle pool mini and
 then Blacksmith (cmux `scripts/ci/nightly_build_runner.py`). So a recently used
 fallback tree stays warm for that overflow. Before this change, any pool build

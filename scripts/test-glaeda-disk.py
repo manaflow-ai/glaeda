@@ -11348,6 +11348,98 @@ class NightlyNextFallbackTest(unittest.TestCase):
         os.utime(runner / ".runner", (old, old))  # not mid re-registration
         return runner
 
+    def sign(self, name: str, line: str | None = None) -> Path:
+        """An enrolled runner whose job-started runs the hook as the installer writes it for a signing runner."""
+        runner = self.enroll(name)
+        line = line or ("exec /usr/bin/python3 glaeda-cmux-runner-hook job-started --allowed-owner manaflow-ai "
+                        "--trusted-ref refs/heads/main --trusted-repo manaflow-ai/cmux --trusted-next-signing")
+        (runner / "glaeda-hooks/job-started.sh").write_text(f"#!/bin/sh\n{line}\n")
+        return runner
+
+    def one_job_tree(self) -> Path:
+        tree = self.root / gd.NIGHTLY_NEXT_ONE_JOB
+        (tree / "DerivedData/Build").mkdir(parents=True)
+        (tree / "DerivedData/Build/blob").write_bytes(b"x" * 4096)
+        old = time.time() - 30 * 24 * 3600
+        for p in [self.root, *self.root.rglob("*")]:
+            os.utime(p, (old, old), follow_symlinks=False)
+        return tree
+
+    def test_the_one_job_tree_is_kept_by_role_on_the_signing_mac(self) -> None:
+        """ONE_JOB_TREE: a month idle, the one-job nightly's tree is no family's item on a Mac with an enrolled
+        signing runner, with the routing label or without, while the signing runners' own pool trees still go."""
+        tree = self.one_job_tree()
+        self.assertEqual(gd.one_job_keep(), (), "no signing runner here: nothing kept by this name")
+        self.assertFalse(gd.toolchain_held(tree))
+        self.sign("glaeda")
+        self.sign("glaeda-1")
+        for pool in ("cmux15-glaeda", "cmux15-glaeda-1"):
+            (self.root / pool / "CompilationCache").mkdir(parents=True)
+        self.assertEqual(gd.one_job_keep(), (os.fspath(tree),))
+        self.assertIn(os.fspath(tree), gd.role_keep())
+        self.assertTrue(gd.toolchain_held(tree))
+        self.assertTrue(gd.toolchain_held(tree / "DerivedData/Build"), "inside the kept tree")
+        self.assertTrue(gd.toolchain_held(self.root), "above it: the root is never taken whole")
+        self.assertFalse(gd.toolchain_held(self.root / "cmux15-glaeda"))
+        with self.assertRaises(OSError):
+            gd.remove(tree)
+        old = time.time() - 30 * 24 * 3600
+        for p in self.root.rglob("*"):
+            os.utime(p, (old, old), follow_symlinks=False)
+        for label in ("", gd.NIGHTLY_NEXT_DEDICATED_LABEL):
+            gd._DISCOVERED.clear()
+            policy = {**gd.POLICY, "nightly_next_dedicated_label": label}
+            with self.subTest(label=label), mock.patch.object(gd, "POLICY", policy), \
+                    mock.patch.object(gd, "process_evidence", return_value=([], "/bin/zsh\n")):
+                fams = {f.id: f for f in gd.default_families()}
+                self.assertIn(gd.NIGHTLY_NEXT_FAMILY, fams, "the keep splits the root, as any role keep in it does")
+                self.assertIn(gd.NIGHTLY_NEXT_ROOT, fams["library-caches"].skip)
+                self.assertNotIn(tree, gd.candidates(fams[gd.NIGHTLY_NEXT_FAMILY]))
+                listed = [f for f in fams.values() if f.reclaimable and f.root.is_relative_to(self.home)]
+                items = {Path(i.path): i.verdict for i in gd.survey(listed, 0, 0)}
+                self.assertFalse([p for p in items if p == self.root or p == tree or tree in p.parents])
+                self.assertEqual({items[self.root / n] for n in ("cmux15-glaeda", "cmux15-glaeda-1")}, {"reclaimable"})
+
+    def test_the_one_job_name_is_never_a_fallback_tree(self) -> None:
+        """The fallback family takes pool runners' trees by name; the one-job tree's name must stay outside it."""
+        self.assertFalse(gd.nightly_next_fallback(self.root / gd.NIGHTLY_NEXT_ONE_JOB))
+        self.assertIsNone(gd.NIGHTLY_NEXT_POOL_RUNNER.fullmatch(gd.NIGHTLY_NEXT_ONE_JOB))
+        self.one_job_tree()
+        fam = gd.nightly_next_family(self.root)
+        self.assertNotIn(gd.NIGHTLY_NEXT_ONE_JOB, [p.name for p in gd.candidates(fam)])
+
+    def test_only_an_enrolled_signing_runner_keeps_the_one_job_tree(self) -> None:
+        tree = self.one_job_tree()
+        # a wrapper that names the flag only in a comment, or another runner class's flag
+        self.sign("glaeda-2", "exec python3 hook job-started --trusted-next-nightly  # --trusted-next-signing")
+        self.assertEqual(gd.one_job_keep(), ())
+        # a directory with the wrapper but no registration
+        stray = self.home / "actions-runner-glaeda-stray"
+        (stray / "glaeda-hooks").mkdir(parents=True)
+        (stray / "glaeda-hooks/job-started.sh").write_text("exec python3 hook job-started --trusted-next-signing\n")
+        self.assertEqual(gd.one_job_keep(), ())
+        # a symlink named like a runner, to a signing runner outside the home
+        outside = Path(os.path.realpath(tempfile.mkdtemp(dir=self.home.parent)))
+        self.addCleanup(shutil.rmtree, outside, True)
+        (outside / "glaeda-hooks").mkdir()
+        (outside / ".runner").write_text("{}")
+        (outside / "glaeda-hooks/job-started.sh").write_text("exec python3 hook job-started --trusted-next-signing\n")
+        (self.home / "actions-runner-glaeda-linked").symlink_to(outside)
+        self.assertEqual(gd.one_job_keep(), ())
+        self.assertFalse(gd.toolchain_held(tree))
+        # the tree as a symlink out of the home: only its spelling under the home is kept, never the target
+        self.sign("glaeda")
+        shutil.rmtree(tree)
+        target = outside / "elsewhere"
+        target.mkdir()
+        tree.symlink_to(target)
+        self.assertEqual(gd.one_job_keep(), (os.fspath(tree),))
+        self.assertFalse(gd.toolchain_held(target))
+        # and with no tree there is nothing to keep, so the root is not split for it
+        tree.unlink()
+        self.assertEqual(gd.one_job_keep(), ())
+        self.assertNotIn(gd.NIGHTLY_NEXT_FAMILY, self.families(""))
+
     def test_a_pool_tree_whose_runner_has_a_job_is_in_use(self) -> None:
         """A fallback build that started on the runner (its Runner.Worker in ps) holds its tree in the survey and,
         when the job starts after the survey, at apply's fresh ps right before the delete."""
