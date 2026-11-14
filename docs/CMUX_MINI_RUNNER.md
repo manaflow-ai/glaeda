@@ -1512,6 +1512,21 @@ Hook classes:
   under /tmp, changes the GUI session (open, launchctl setenv, system dark mode) and writes credentials
   to `$HOME`.
 
+### The sim-first runner (`simRunners`)
+
+`runner.classes.<class>.simRunners: 1` adds one instance after the pool and gateway runners
+(instance `runners + gatewayRunners`) on a member that carries `glaeda-ios-sim`. It carries only
+`glaeda-sim-xcode-<version>` (no pool, class role or `glaeda-ios-sim` label, so no compile reaches it) and passes
+`--sim-runner`. Its gate ignores the shared units (SIM_FIRST): it listens while the mini's `simulator` token is free
+and no simulator, nightly or signing job waits there, and it keeps every host hold, including CPU saturation,
+because simulator jobs measure frame rates. A job it takes waits on the mini for units, and its `admit.want` marker
+(lane `sim`) holds the root, side and session listeners and later admissions, so the next freed units are its. The
+priority lapses after `GLAEDA_RUNNER_SIM_FIRST_S` (default 20 minutes). It reserves nothing while idle.
+
+Without it, a full mini's gate stopped every runner carrying `glaeda-ios-sim`: on 2026-11-14 at 13:30Z cmux's iOS
+picker read `0 glaeda-ios-sim free` and sent run 43600021760's phone cells to Blacksmith macOS, which queued them
+40 minutes. cmux's picker routes simulator jobs to the sim label when such a runner is online and idle.
+
 ## 2h. Test keychain
 
 The cmux user's login keychain is locked in the runner's launchd session, so tests that add keychain items

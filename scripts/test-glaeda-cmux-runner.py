@@ -3610,6 +3610,35 @@ class HookTest(unittest.TestCase):
 
     # ------------------------------------------------------------ the gateway runners (GATEWAY)
 
+    def test_the_sim_first_runner_admits_only_simulator_jobs(self) -> None:
+        """SIM_FIRST: the sim-first runner listens on a full mini and its job's wait holds the mini's other runners, so
+        only simulator jobs (the simulator and simulator-step classes) are admitted there; a build or compile routed
+        to it is refused at once and rescued. The reliability matrix's phone cells (job `ios`) build the FFI and test
+        in one simulator: a simulator step, never a compile with a canonical root."""
+        self.fleet()
+        test_ios = {"GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/test-ios.yml@refs/heads/main"}
+        matrix = {"GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/ios-reliability-matrix.yml@refs/heads/x"}
+        self.assertEqual(hook.job_class("ios", "manaflow-ai/cmux", workflow="ios-reliability-matrix.yml"),
+                         ("simulator-step", False))
+        for job, env in (("ios-simulator-build", test_ios), ("mobile-core-package", test_ios),
+                         ("release-compile", self.FAST_TIER), ("ios", self.FAST_TIER)):
+            with self.subTest(job=job):
+                try:
+                    started = self.job(job, "sr", 14, None, "--sim-runner", env=env)
+                    self.assertEqual(started.returncode, 1, started.stdout + started.stderr)
+                    self.assertIn("refused: the sim-first runner takes only simulator jobs", started.stdout)
+                finally:
+                    self.finish("sr")
+        for job, env, klass in (("ios-simulator", test_ios, "simulator"), ("ios", matrix, "simulator-step")):
+            with self.subTest(job=job):
+                try:
+                    ok = self.job(job, "sr", 14, None, "--sim-runner", env=env)
+                    self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+                    self.assertIn(f"for {job} ({klass}", ok.stdout)
+                finally:
+                    self.finish("sr")
+        self.assertTrue(hook.probe(self.dir / "capacity" / f"{hook.SIM_TOKEN}.token"), "released with the job")
+
     def test_a_gateway_job_runs_on_a_gateway_token_with_every_unit_taken(self) -> None:
         """2026-10-30 12:43Z: every std mini at 76-100% CPU and units, so no thin cmux-ci client could start. On a
         gateway runner such a client takes one gateway token and no shared unit, so a full mini still admits it;
@@ -10924,6 +10953,98 @@ class GateTest(unittest.TestCase):
                           " --gateway-runner\n")
         return self.full_gate(capacity)
 
+    def sim_gate(self, capacity: Path) -> hook.Gate:
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("#!/bin/bash\nexec /usr/bin/python3 /hook job-started --allowed-owner manaflow-ai"
+                          " --min-free-gib 30 --sim-runner --test-keychain --recycle-testmanagerd --capacity-units 10"
+                          " --compile-slots 2 --canonical-roots 2 --instance 13\n")
+        return self.full_gate(capacity)
+
+    def test_runner_scope_reads_the_sim_runner_flag(self) -> None:
+        scope = hook.runner_scope(self.sim_gate(self.units(0)).runner_dir)
+        self.assertTrue(scope.sim)
+        self.assertFalse(scope.root or scope.gui or scope.session or scope.fast or scope.fresh or scope.nightly
+                         or scope.dedicated or scope.gateway)
+        self.assertIsNone(hook.reserve_token(scope), "it keeps no reserve")
+        self.assertFalse(hook.claims_room(scope), "it claims no room: its job waits for units")
+        self.assertEqual(hook.side_fit_units(scope), 1)
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.write_text("exec python3 /hook job-started --capacity-units 5 --instance 0 --sim-runner\n")
+        self.assertEqual(hook.runner_scope(self.runner), hook.RunnerScope(5, 1, 1, False, False, sim=True),
+                         "a sim-first runner is never a root runner, whatever its instance")
+        script.write_text("exec python3 /hook job-started --capacity-units 5 --instance 4 --sim-runner --fast-runner\n")
+        self.assertEqual((hook.runner_scope(self.runner).sim, hook.runner_scope(self.runner).fast), (False, True))
+
+    def test_the_sim_first_runner_listens_on_a_full_mini_while_the_simulator_is_free(self) -> None:
+        """SIM_FIRST: on 2026-11-14 at 13:30Z every runner carrying glaeda-ios-sim on a full mini was held off, cmux's
+        picker read 0 free and sent run 43600021760's phone cells to Blacksmith (40 minutes queued). The sim-first
+        runner ignores the units: it holds only for the simulator token, a simulator, nightly or signing job waiting
+        here. A side runner beside it is still held by the units."""
+        sim = hook.RunnerScope(10, 2, 2, sim=True)
+        full = self.units(10)
+        self.assertIsNone(hook.mini_full(full, 10, sim), "every unit taken: it listens")
+        self.assertIn("capacity units on this mini are taken", hook.mini_full(full, 10, hook.RunnerScope(10, 2, 2)) or "")
+        token = hook.lock_file(full / f"{hook.SIM_TOKEN}.token", fcntl.LOCK_EX)
+        self.assertEqual(hook.mini_full(full, 10, sim), "the simulator token is taken", "one simulator job per mini")
+        os.close(token)
+        self.assertIsNone(hook.mini_full(full, 10, sim))
+        marker = full / f"{hook.ADMIT_WANT}{os.getpid()}"
+        marker.write_text(json.dumps({"since": time.time(), "wants": ["units"], "who": "r9 swift-test (run 1)"}) + "\n")
+        self.assertIsNone(hook.mini_full(full, 10, sim), "a PR job waiting for units: its job waits its turn here")
+        for want, why in (({"wants": ["simulator"]}, "the simulator token"),
+                          ({"wants": ["units"], "lane": hook.SIM_LANE}, "the simulator token"),
+                          ({"wants": ["units"], "tier": hook.TIER_NIGHTLY}, "units"),
+                          ({"wants": ["units", "gui"], "class": hook.EXCLUSIVE_CLASS}, "the whole mini")):
+            marker.write_text(json.dumps({"since": time.time(), "who": "w1 a (run 2)", **want}) + "\n")
+            self.assertEqual(hook.mini_full(full, 10, sim), f"w1 a (run 2) waits here for {why}", want)
+        marker.unlink()
+        # no other runner counts the simulator token for listening
+        token = hook.lock_file(self.units(0) / f"{hook.SIM_TOKEN}.token", fcntl.LOCK_EX)
+        for scope in (hook.RunnerScope(10, 2, 2), hook.RunnerScope(10, 2, 2, session=True),
+                      hook.RunnerScope(10, 2, 2, gateway=True)):
+            self.assertIsNone(hook.mini_full(self.units(0), 10, scope), scope)
+        os.close(token)
+
+    def test_a_waiting_sim_job_goes_first_for_sim_first_s_then_lapses(self) -> None:
+        """SIM_FIRST: the sim-first runner's job waiting here for units holds the root, side and session listeners and
+        every later admission that needs units; after SIM_FIRST_S it no longer does, so a stuck simulator job cannot
+        starve the mini's other lanes."""
+        side, root = hook.RunnerScope(14, 2, 2), hook.RunnerScope(14, 2, 2, True)
+        session = hook.RunnerScope(14, 2, 2, session=True)
+        capacity = self.units(4)
+        marker = capacity / f"{hook.ADMIT_WANT}{os.getpid()}"
+        hook.write_want(marker, time.time() - 30, ["units"], "", hook.SIM_LANE)
+        [waiter] = hook.admission_waiters(capacity)
+        self.assertEqual(waiter["lane"], hook.SIM_LANE)
+        for scope in (side, root, session):
+            self.assertEqual(hook.mini_full(capacity, 14, scope, 5), f"{waiter['who'] or 'a job'} waits here for units",
+                             scope)
+        with mock.patch("os.getpid", return_value=2 ** 30):
+            self.assertIn("has waited longer here for units",
+                          hook.fair_turn(capacity, {"units"}, time.time(), takes_units=True, new_job=True) or "")
+        hook.write_want(marker, time.time() - hook.SIM_FIRST_S - 1, ["units"], "", hook.SIM_LANE)
+        for scope in (side, root, session):  # a lapsed sim waiter holds no session runner either (only session ones do)
+            self.assertIsNone(hook.mini_full(capacity, 14, scope, 5), scope)
+        with mock.patch("os.getpid", return_value=2 ** 30):
+            self.assertIsNone(hook.fair_turn(capacity, {"units"}, time.time(), takes_units=True, new_job=True))
+        marker.unlink()
+
+    def test_the_sim_first_runner_keeps_the_cpu_hold(self) -> None:
+        """A simulator job's frame rate is measured (cmux#43095), so a saturated mini still holds the sim-first
+        runner off, unlike the gateway and session runners."""
+        for name, value in (("GATE_CPU_PAUSE", 80.0), ("GATE_CPU_RESUME", 70.0), ("GATE_CPU_EVERY_S", 0.0)):
+            patcher = mock.patch.object(hook, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        with mock.patch.object(hook, "host_io", return_value=(0.0, 99.0)), \
+                mock.patch.object(hook, "memory_pressure_level", return_value=1), \
+                mock.patch.object(hook, "disk_refusal", return_value=None), \
+                mock.patch.object(hook, "eligibility_scope", return_value=None):
+            gate = self.sim_gate(self.units(10))
+            self.assertTrue((gate.saturated() or "").startswith(hook.SATURATED))
+            self.assertIsNone(gate.full(), "the units never hold it")
+
     def test_runner_scope_reads_the_gateway_runner_flag(self) -> None:
         gate = self.gateway_gate(self.units(0))
         scope = hook.runner_scope(gate.runner_dir)
@@ -13472,13 +13593,13 @@ class RunnerTest(unittest.TestCase):
         labels: list[list[str]] = []
         with mock.patch.dict(os.environ, {"HOME": os.fspath(home)}), \
                 mock.patch.object(cr, "xcode_present", return_value=True):
-            for instance in range(classes["runners"] + classes.get("gatewayRunners", 0)):
+            for instance in range(cr.member_instances(classes)):
                 receipt = self.invoke("--apply", "--manifest", os.fspath(path), "--member", "mini-std",
                                       "--instance", str(instance), "--replace")
                 [register] = [a for a in receipt["actions"] if a.get("kind") == "register"]
                 labels.append(register["labels"])
         hooks = [(home / f"actions-runner-glaeda{'-' + str(k) if k else ''}/glaeda-hooks/job-started.sh").read_text()
-                 .replace(os.fspath(home), "HOME") for k in range(classes["runners"] + classes.get("gatewayRunners", 0))]
+                 .replace(os.fspath(home), "HOME") for k in range(cr.member_instances(classes))]
         self.fast_home = home
         return labels, hooks
 
@@ -13617,7 +13738,7 @@ class RunnerTest(unittest.TestCase):
                 mock.patch.object(cr, "xcode_present", return_value=True), \
                 contextlib.redirect_stderr(io.StringIO()) as err:
             self.assertEqual(cr.main(["--manifest", os.fspath(path), "--member", "mini-std", "--instance", "7"]), 2)
-        self.assertIn("2 gateway runner(s); instance 7 is beyond that", err.getvalue())
+        self.assertIn("2 gateway runner(s) and 0 sim-first runner(s); instance 7 is beyond that", err.getvalue())
         # a plain re-run keeps the gateway role
         home = self.fast_home
         with mock.patch.dict(os.environ, {"HOME": os.fspath(home)}), \
@@ -13626,6 +13747,59 @@ class RunnerTest(unittest.TestCase):
         rerun = (home / "actions-runner-glaeda-6/glaeda-hooks/job-started.sh").read_text()
         self.assertIn(" --gateway-runner ", rerun)
         self.assertIn(" --instance 6\n", rerun)
+
+    def test_the_sim_first_runner_comes_after_the_gateway_runners_on_a_simulator_mini(self) -> None:
+        """SIM_FIRST: simRunners 1 adds one instance after the pool and gateway runners. It carries only the sim label
+        (no pool, side, class role or glaeda-ios-sim label, so no compile reaches it), passes --sim-runner with the
+        PR runners' test keychain, and no other instance's labels or hook change. A member without the simulator
+        role gets none."""
+        base = {"runners": 5, "capacityUnits": 14, "compileSlots": 2, "canonicalRoots": 2, "guiRunners": 1,
+                "fastRunners": 1, "gatewayRunners": 1}
+        with mock.patch.object(cr, "ios_sim_present", return_value=True):
+            today, today_hooks = self.fast_labels(base, "sim-today", ios_sim=True)
+            sim, sim_hooks = self.fast_labels({**base, "simRunners": 1}, "sim", ios_sim=True)
+        self.assertEqual(len(sim), 7)
+        self.assertEqual((sim[:6], sim_hooks[:6]), (today, today_hooks), "every other instance keeps its labels and hook")
+        self.assertEqual([l for l in sim[6] if l not in cr.BASE_LABELS],
+                         ["glaeda-mini", "glaeda-class-std", "glaeda-dedicated", "xcode-26.6", "glaeda-sim-xcode-26.6"])
+        self.assertIn(" --sim-runner --test-keychain", sim_hooks[6])
+        self.assertIn(" --instance 6\n", sim_hooks[6])
+        self.assertNotIn("--gateway-runner", sim_hooks[6])
+        scope = hook.runner_scope(self.fast_home / "actions-runner-glaeda-6")
+        self.assertTrue(scope.sim)
+        self.assertFalse(scope.root or scope.gateway or scope.session or scope.gui or scope.fast)
+        self.assertEqual([l.count("glaeda-sim-xcode-26.6") for l in sim], [0] * 6 + [1])
+        self.assertTrue(cr.sim_instance({"runners": 5, "gatewayRunners": 1, "simRunners": 1}, 6))
+        self.assertFalse(cr.sim_instance({"runners": 5, "gatewayRunners": 1, "simRunners": 1}, 5), "the gateway one")
+        self.assertFalse(cr.sim_instance({"runners": 5, "simRunners": 3}, 6), "never more than one")
+        self.assertEqual(cr.member_instances({"runners": 5, "gatewayRunners": 1, "simRunners": 1}), 7)
+        # no simulator role: no sim-first runner, and its instance is refused
+        manifest = json.loads(json.dumps(MANIFEST))
+        manifest["defaults"]["runner"] = {"classes": {"std": {**base, "simRunners": 1}}}
+        path = self.state / "sim-no-role.json"
+        path.write_text(json.dumps(manifest))
+        with mock.patch.dict(os.environ, {"HOME": os.fspath(self.fast_home)}), \
+                mock.patch.object(cr, "xcode_present", return_value=True), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(cr.main(["--manifest", os.fspath(path), "--member", "mini-std", "--instance", "6"]), 2)
+        self.assertIn("0 sim-first runner(s); instance 6 is beyond that", err.getvalue())
+        # a plain re-run keeps the sim-first role
+        with mock.patch.dict(os.environ, {"HOME": os.fspath(self.fast_home)}), \
+                mock.patch.object(cr, "xcode_present", return_value=True), \
+                mock.patch.object(cr, "ios_sim_present", return_value=True):
+            self.invoke("--apply", "--instance", "6")
+        rerun = (self.fast_home / "actions-runner-glaeda-6/glaeda-hooks/job-started.sh").read_text()
+        self.assertIn(" --sim-runner ", rerun)
+        # a simctl hiccup keeps the sim-first runner: its own prior label stands in for glaeda-ios-sim, which it lacks
+        manifest = json.loads(json.dumps(MANIFEST))
+        manifest["defaults"]["runner"] = {"classes": {"std": {**base, "simRunners": 1}}}
+        manifest["hosts"]["mini-std"]["roles"].append("ios-simulators")
+        manifest["defaults"]["ios_simulator"] = {"runtimes": ["23F77"]}
+        with mock.patch.object(cr, "ios_sim_present", return_value=None), \
+                mock.patch.object(cr, "xcode_present", return_value=True):
+            kept, _ = cr.member_labels(manifest, "mini-std", ["glaeda-sim-xcode-26.6"])
+            lost, _ = cr.member_labels(manifest, "mini-std", ["glaeda-std-xcode-26.6"])
+        self.assertEqual((kept["simRunners"], lost["simRunners"]), (1, 0))
 
     def test_a_plain_rerun_keeps_the_fast_and_gui_roles(self) -> None:
         """A re-run without --manifest restores the member from the receipt; the fast runner's and the gui
@@ -15717,6 +15891,34 @@ class FleetLabelsModuleTest(unittest.TestCase):
         self.assertIn("fastRunners must be 0 or 1", fleet_labels.member_labels(manifest, "mini-std", lambda a: True)[1])
         manifest["hosts"]["mini-std"]["overrides"] = {"runner": {"poolPrefix": "fast-"}}
         std.update(canonicalRoots=2)
+        self.assertIn("poolPrefix", fleet_labels.member_labels(manifest, "mini-std", lambda a: True)[1])
+
+    def test_sim_runners_field(self) -> None:
+        manifest = json.loads(json.dumps(MANIFEST))
+        std = {"runners": 5, "capacityUnits": 5, "canonicalRoots": 2, "simRunners": 1}
+        manifest["defaults"]["runner"] = {"classes": {"std": std}}
+        no_role = fleet_labels.member_labels(manifest, "mini-std", lambda app: True)[0]
+        self.assertEqual((no_role["simRunners"], no_role["simPools"]), (0, []), "no ios-simulators role: none")
+        manifest["hosts"]["mini-std"]["roles"].append("ios-simulators")
+        manifest["defaults"]["ios_simulator"] = {"runtimes": ["23F77"]}
+        std["simRunners"] = 0
+        today = fleet_labels.member_labels(manifest, "mini-std", lambda app: True)[0]
+        std["simRunners"] = 1
+        sim = fleet_labels.member_labels(manifest, "mini-std", lambda app: True)[0]
+        self.assertEqual((sim["simRunners"], sim["simPools"]), (1, ["glaeda-sim-xcode-26.6"]))
+        self.assertEqual((sim["runners"], sim["pools"], sim["labels"]), (today["runners"], today["pools"], today["labels"]),
+                         "the pool instances, the picker's pool count and the member labels are unchanged")
+        self.assertEqual(fleet_labels.sim_label("26.6"), "glaeda-sim-xcode-26.6")
+        self.assertNotIn("glaeda-sim-xcode-26.6", fleet_labels.declared_pools(manifest))
+        for bad in (2, -1, True, "1"):
+            std["simRunners"] = bad
+            self.assertIn("simRunners must be 0 to 1", fleet_labels.member_labels(manifest, "mini-std", lambda a: True)[1])
+        std["simRunners"] = 1
+        manifest["hosts"]["mini-std"]["overrides"] = {"runner": {"trustedRef": "refs/heads/main",
+                                                                 "trustedRepo": "manaflow-ai/cmux"}}
+        self.assertIn("simRunners needs a dedicated runner without trustedRef",
+                      fleet_labels.member_labels(manifest, "mini-std", lambda a: True)[1])
+        manifest["hosts"]["mini-std"]["overrides"] = {"runner": {"poolPrefix": "sim-"}}
         self.assertIn("poolPrefix", fleet_labels.member_labels(manifest, "mini-std", lambda a: True)[1])
 
     def test_gateway_runners_field(self) -> None:

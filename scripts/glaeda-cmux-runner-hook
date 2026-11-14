@@ -429,7 +429,11 @@ SIGNING_JOBS = (("nightly.yml", "promote-nightly-next"), ("nightly.yml", "build-
 # its own (cmux at e46f9264703d).
 TREE_BUILD_CALLERS = ("cmux-tui-artifacts.yml", "cmux-tui-nightly.yml", "cmux-tui-release.yml",
                       "macos-cross-parity.yml")
-WORKFLOW_JOB_CLASSES = {("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "test"): "isolated",
+WORKFLOW_JOB_CLASSES = {# the iOS reliability matrix's phone cells: cargo builds the FFI xcframework, then xcodebuild tests
+                        # in one booted simulator, so a simulator step's units and the simulator token. As an unknown
+                        # job it was a compile (5 units, persistent-dd and a canonical root, no simulator token).
+                        ("ios-reliability-matrix.yml", "ios"): "simulator-step",
+                        ("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "test"): "isolated",
                         ("cmux-tui.yml", "build"): "isolated", ("cmux-tui.yml", "cdp-browser-smoke"): "isolated",
                         ("cmux-tui.yml", "macos-relay"): "isolated",
                         # TREE_BUILD: the same reusable `build` (cmux-tui-build-package.yml: cargo into the
@@ -4843,7 +4847,7 @@ def admission_waiters(capacity_dir: Path, skip_pid: int = 0) -> list[dict[str, A
         except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
             continue  # OverflowError: a since too large for a float (an integer past 1e308)
         tier = data.get("tier") if data.get("tier") in (TIER_NIGHTLY, TIER_DEV, TIER_STACK) else ""
-        lane = SESSION_LANE if data.get("lane") == SESSION_LANE else ""
+        lane = data.get("lane") if data.get("lane") in (SESSION_LANE, SIM_LANE) else ""
         waiters.append({"pid": pid, "since": since, "wants": wants, "who": str(data.get("who") or "")[:200],
                         "tier": tier, "lane": lane,
                         "class": EXCLUSIVE_CLASS if data.get("class") == EXCLUSIVE_CLASS else "",
@@ -5588,6 +5592,7 @@ class RunnerScope(NamedTuple):
     gateway: bool = False
     trusted_signing: bool = False
     yields: bool = False  # --yield-to-exclusive (YIELD_TO_EXCLUSIVE): its gate stops listening for a signing job too
+    sim: bool = False  # --sim-runner (SIM_FIRST): the sim-first runner listens on a full mini
 
 
 def reserve_token(scope: RunnerScope | None) -> str | None:
@@ -5626,7 +5631,7 @@ def side_fit_units(scope: RunnerScope) -> int:
     """The units a plain side runner (no root, gui, session, fast, freshness, nightly or dedicated role) listens
     with room for: the costliest of SIDE_FIT_JOBS. Every other role keeps its own fit (mini_full)."""
     if scope.units <= 0 or scope.root or scope.gui or scope.session or scope.fast or scope.fresh \
-            or scope.nightly or scope.dedicated or scope.gateway:
+            or scope.nightly or scope.dedicated or scope.gateway or scope.sim:
         return 1
     return max(job_units(job_class(job, DEFAULT_HOME_REPO, workflow=workflow)[0], job, DEFAULT_HOME_REPO, workflow=workflow)
                for workflow, job in SIDE_FIT_JOBS)
@@ -5671,6 +5676,21 @@ LISTEN_LOCK = "listen.lock"
 SESSION_LANE = "session"
 SESSION_FIRST_LOCK = "session-first.lock"
 SESSION_FIRST_S = float(os.environ.get("GLAEDA_RUNNER_SESSION_FIRST_S") or 20 * 60)
+# SIM_FIRST: the sim-first runner (--sim-runner, glaeda_fleet_labels simRunners: one per simulator mini, only the sim
+# label glaeda-sim-xcode-<version>) listens while units are full, as the SESSION_FIRST holder does, so cmux's picker
+# counts the mini's simulator as free and GitHub hands it a queued simulator job. That job waits here for units
+# (CAPACITY_WAIT) with its admit.want marker naming the sim lane: every root, side and session runner on the mini
+# holds behind it and later admissions wait their turn (fair_turn), so the next units that free up are its. It holds
+# only for what a simulator job could not get here: the mini's one simulator token taken, or a simulator job or a
+# nightly job already waiting here, plus every host hold (CPU saturation, memory, disk, the fleet's claim). Before, a
+# simulator mini's only listeners for its simulator were its root and side runners, which a full mini holds off: on
+# 2026-11-14 at 13:30Z cmux's picker read "0 glaeda-ios-sim free" and sent run 43600021760's phone cells to Blacksmith
+# macOS, which queued it 40 minutes. The priority lapses SIM_FIRST_S after the job began to wait, as SESSION_FIRST's
+# does. No idle reserve: units are taken only by the job GitHub hands it.
+SIM_LANE = "sim"
+SIM_FIRST_S = float(os.environ.get("GLAEDA_RUNNER_SIM_FIRST_S") or 20 * 60)
+SIM_TOKEN = "simulator"  # CLASS_COST["simulator"]'s token: one simulator job per mini
+SIM_FIRST_CLASSES = frozenset({"simulator", "simulator-step"})  # the only job classes the sim-first runner admits
 LISTEN_CLAIM_PREFIX = "listen."
 LISTEN_CLAIM_SUFFIX = ".claim"
 LISTEN_CLAIM_HANDOFF_S = 30.0
@@ -5688,7 +5708,7 @@ def claims_room(scope: RunnerScope) -> bool:
     runner and the freshness slot keep their reserves instead; the fast runner takes no shared unit; the nightly slot
     listens on a full mini; a dedicated runner has its own admission; a gateway runner takes no shared unit."""
     return scope.units > 0 and not (scope.gui or scope.fresh or scope.fast or scope.nightly or scope.dedicated
-                                    or scope.gateway)
+                                    or scope.gateway or scope.sim)
 
 
 def listen_need(scope: RunnerScope, fit_units: int) -> int:
@@ -5825,13 +5845,15 @@ def runner_scope(runner_dir: Path) -> RunnerScope:
                and not fast and not session and not gui and not fresh and not dedicated)
     gateway = (re.search(r"\s--gateway-runner(?:\s|$)", text) is not None
                and not fast and not session and not gui and not fresh and not dedicated and not nightly)
+    sim = (re.search(r"\s--sim-runner(?:\s|$)", text) is not None
+           and not fast and not session and not gui and not fresh and not dedicated and not nightly and not gateway)
     return RunnerScope(flag("capacity-units", 0), max(1, flag("compile-slots", 1)), roots,
                        instance < roots and not gui and not fast and not session and not dedicated and not nightly
-                       and not gateway,
+                       and not gateway and not sim,
                        gui, runner_floor_gib(min_free_gib(text), gui or session), gui_token,
                        fast, session, fresh, dedicated, nightly, gateway,
                        re.search(r"\s--trusted-next-signing(?:\s|$)", text) is not None,
-                       dedicated and re.search(r"\s--yield-to-exclusive(?:\s|$)", text) is not None)
+                       dedicated and re.search(r"\s--yield-to-exclusive(?:\s|$)", text) is not None, sim)
 
 
 def eligibility_scope(runner_dir: Path) -> tuple[str, str | None] | None:
@@ -5901,10 +5923,12 @@ ROOT_FIT_UNITS = max(CLASS_COST[k][0] for k in ("compile", "gui", "product", "co
 
 
 def session_first_lapsed(waiter: dict[str, Any], now: float) -> bool:
-    """Whether this admission waiter is a session job (SESSION_LANE) that has waited SESSION_FIRST_S or longer, so it
-    no longer holds the mini's other listeners (SESSION_FIRST). A nightly job's waiter never lapses (FEED_FIRST)."""
-    return (waiter.get("lane") == SESSION_LANE and waiter.get("tier") != TIER_NIGHTLY
-            and now - float(waiter.get("since") or now) >= SESSION_FIRST_S)
+    """Whether this admission waiter is a session job (SESSION_LANE) that has waited SESSION_FIRST_S or longer, or a
+    sim-first runner's job (SIM_LANE) that has waited SIM_FIRST_S, so it no longer holds the mini's other listeners
+    (SESSION_FIRST, SIM_FIRST). A nightly job's waiter never lapses (FEED_FIRST)."""
+    limit = {SESSION_LANE: SESSION_FIRST_S, SIM_LANE: SIM_FIRST_S}.get(waiter.get("lane") or "")
+    return (limit is not None and waiter.get("tier") != TIER_NIGHTLY
+            and now - float(waiter.get("since") or now) >= limit)
 
 
 def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None = None,
@@ -6003,6 +6027,17 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
             if not any(probe(capacity_dir / f"{name}.token") for name in GATEWAY_TOKENS):
                 return f"all {len(GATEWAY_TOKENS)} gateway tokens on this mini are taken"
             return None
+        if scope is not None and scope.sim:  # SIM_FIRST: units never hold it; its job waits here for them, first
+            for waiter in admission_waiters(capacity_dir):
+                if waiter["tier"] == TIER_NIGHTLY:  # no new job starts while a nightly job waits (FEED_FIRST)
+                    return f"{waiter['who'] or 'a job'} waits here for units"
+                if waiter["class"] == EXCLUSIVE_CLASS:  # a signing job drains the whole mini
+                    return f"{waiter['who'] or 'a job'} waits here for the whole mini"
+                if waiter["lane"] == SIM_LANE or SIM_TOKEN in waiter["wants"]:
+                    return f"{waiter['who'] or 'a job'} waits here for the {SIM_TOKEN} token"
+            if not probe(capacity_dir / f"{SIM_TOKEN}.token"):
+                return f"the {SIM_TOKEN} token is taken"
+            return None
         root = scope is not None and scope.root
         # fit_units: a side runner whose label brings costlier jobs (listen --fit-units: glaeda-ios-sim's isolated
         # builds, a session runner's jobs)
@@ -6034,7 +6069,8 @@ def mini_full(capacity_dir: Path | None, total: int, scope: RunnerScope | None =
             {scope.gui_token, "root"} if gui else set())
         now = time.time()
         for waiter in admission_waiters(capacity_dir):
-            if session_first_lapsed(waiter, now) and not (scope is not None and scope.session):
+            if session_first_lapsed(waiter, now) and not (scope is not None and scope.session
+                                                          and waiter["lane"] == SESSION_LANE):
                 continue  # a session job waiting past SESSION_FIRST_S keeps its turn but no longer holds listeners
             shared = compete & set(waiter["wants"])
             if waiter["tier"] == TIER_NIGHTLY:  # no other job takes a unit while a nightly job waits (FEED_FIRST)
@@ -9857,6 +9893,10 @@ def main(argv: list[str] | None = None) -> int:
                    help="this is one of the mini's gateway runners (the gateway label): it admits only GATEWAY_JOBS, "
                         "thin cmux-ci clients, on a gateway token and no shared unit, and its gate listens through CPU "
                         "saturation and a full mini (GATEWAY)")
+    p.add_argument("--sim-runner", action="store_true",
+                   help="this is the mini's sim-first runner (the sim label): its gate listens on a full mini while "
+                        "the simulator token is free, and a job it takes waits here for units ahead of the side "
+                        "lanes for SIM_FIRST_S (SIM_FIRST)")
     p.add_argument("--capacity-dir", type=Path, default=Path(FLEET_DIR) / "capacity", help=argparse.SUPPRESS)
     p.add_argument("--host-lock", default=HOST_LOCK, help=argparse.SUPPRESS)
     p.add_argument("--reservation", default=RESERVATION, help=argparse.SUPPRESS)
@@ -10154,6 +10194,11 @@ def main(argv: list[str] | None = None) -> int:
             # It listens on a full mini (it needs no general units), so any other job would wait here for units
             # with no limit and idle the runner; refused, it is rescued onto its own pool.
             return refused("the fast runner takes only the fast tier")
+        if args.sim_runner and (admit_class or job_class(os.environ.get("GITHUB_JOB", ""), repo, args.home_repo,
+                                                          job_workflow())[0]) not in SIM_FIRST_CLASSES:
+            # SIM_FIRST: it listens on a full mini and its job's wait holds the mini's other runners, so any other job
+            # here would jump the side lanes; refused, it is rescued onto its own pool.
+            return refused("the sim-first runner takes only simulator jobs")
         if owner is None:  # fail closed: with no pinned owner no holder could watch the job
             return refused(f"cannot pin this job's Runner.Worker (pid {args.watch_pid or os.getppid()})")
         admit_start = time.monotonic()
@@ -10251,7 +10296,8 @@ def main(argv: list[str] | None = None) -> int:
                         break
                     wants = list(taken.get("wants") or [])
                     if admit_class != GATEWAY_CLASS:  # a gateway client's wait holds no other runner (GATEWAY)
-                        write_want(marker, since, wants, tier, SESSION_LANE if args.session_runner else "",
+                        write_want(marker, since, wants, tier,
+                                   SESSION_LANE if args.session_runner else SIM_LANE if args.sim_runner else "",
                                    claim_class, args.trusted_next_signing)
                     if note != shown or time.monotonic() - shown_at >= ADMIT_NOTE_S:
                         holders = ""

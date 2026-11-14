@@ -874,6 +874,7 @@ def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, m
     eligible, why = check(member, summary)
     row: dict[str, Any] = {"member": member, "class": summary["class"], "runners": summary.get("runners", 1),
                            "gatewayRunners": summary.get("gatewayRunners") or 0,
+                           "simRunners": summary.get("simRunners") or 0,
                            "capacityUnits": summary.get("capacityUnits"), "eligible": eligible, "gate": why}
     dedicated, bad = load_labels().dedicated_runners(manifest, member)
     row["dedicated"] = [d["name"] for d in dedicated]
@@ -892,7 +893,7 @@ def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, m
         row["action"] = f"skip (trusted-only runner stays on {summary['trustedRepo']})"
         return row
     if summary.get("dedicatedOnly"):
-        row["runners"], row["gatewayRunners"] = 0, 0
+        row["runners"], row["gatewayRunners"], row["simRunners"] = 0, 0, 0
         installed, why = installed_pool_instances(member)
         row["retire"] = installed if installed is not None else why
     if not args.apply:
@@ -903,7 +904,7 @@ def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, m
         elif eligible or args.include_ineligible:
             # SURPLUS: the plan names the instances an apply would retire (read-only listing)
             installed, _ = installed_pool_instances(member)
-            surplus = surplus_instances(installed or [], row["runners"] + row["gatewayRunners"])
+            surplus = surplus_instances(installed or [], row["runners"] + row["gatewayRunners"] + row["simRunners"])
             if surplus:
                 row["retire"] = surplus
                 row["action"] += f"; retire surplus instances {surplus} when idle"
@@ -935,8 +936,9 @@ def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, m
         if not isinstance(row["retire"], list):
             results.append({"instance": None, "exit": None, "state": f"retire: {row['retire']}"})
     else:
-        # the pool instances, then the gateway runners after them (gatewayRunners: instances runners and on)
-        instances = row["runners"] + row["gatewayRunners"]
+        # the pool instances, then the gateway runners after them (gatewayRunners: instances runners and on), then the
+        # sim-first runner (simRunners)
+        instances = row["runners"] + row["gatewayRunners"] + row["simRunners"]
         with concurrent.futures.ThreadPoolExecutor(max_workers=instances) as pool:
             results = list(pool.map(lambda k: apply_instance(member, k, repo, extra, org, group,
                                                              args.migrate_from_repo), range(instances)))
@@ -968,7 +970,8 @@ def render(rows: list[dict[str, Any]], skipped: dict[str, str], applied: bool, g
     lines.extend(guard_lines(guard, applied))
     for row in rows:
         units = f"{row['runners']} runners/{row['capacityUnits']} units" + (
-            f"+{row['gatewayRunners']}gw" if row.get("gatewayRunners") else "")
+            f"+{row['gatewayRunners']}gw" if row.get("gatewayRunners") else "") + (
+            f"+{row['simRunners']}sim" if row.get("simRunners") else "")
         lines.append(f"  {row['member']:<22} {row['class']:<5} {units:<20} {row['action']:<24} {row['gate']}")
         if any(str(i.get("state", "")).startswith("NO RUNNER") for i in row.get("instances", [])):
             lines.append(f"      {row['member']} has instances with no runner: re-run for this member")

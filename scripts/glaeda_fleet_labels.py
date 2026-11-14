@@ -66,6 +66,17 @@ CLASS_CAPACITY = {"xl": (8, 22), "std": (4, 14), "light": (2, 10)}
 # which takes no pull request job, and only on a dedicated one (an opportunistic member carries no pool label).
 MAX_GATEWAY_RUNNERS = 2
 GATEWAY_PREFIX = "gateway"
+# simRunners (0 or 1, default 0) adds a sim-first runner after the gateway runners (instance runners + gatewayRunners;
+# never counted in runners, so no role moves). It carries only the sim label (sim_label: glaeda-sim-xcode-<version>,
+# no class, no pool label), so only the iOS simulator jobs cmux's picker routes to that label reach it, and only a
+# member with the ios-simulators role and its runtimes (IOS_SIM_LABEL) gets one. Its gate keeps listening when the
+# mini's shared units are full (SIM_FIRST in glaeda-cmux-runner-hook): its job waits on the mini for units and goes
+# first for the next ones that free up. Before, only the root and side runners of a simulator mini carried
+# IOS_SIM_LABEL, and a full mini's gate stopped all of them: on 2026-11-14 at 13:30Z cmux's picker read "0
+# glaeda-ios-sim free" with 2 of the label's runners online, and sent run 43600021760's phone cells to Blacksmith
+# macOS, where it queued 40 minutes.
+MAX_SIM_RUNNERS = 1
+SIM_PREFIX = "sim"
 COMPILE_CORES = 5  # the hook's CLASS_COST["compile"] units (a test keeps them equal)
 MAX_RUNNERS = 16
 # A host's overrides.runner {trustedRef: refs/heads/main, trustedRepo: owner/name} makes its runners trusted-only:
@@ -76,7 +87,7 @@ TRUSTED_REF_RE = r"refs/heads/[A-Za-z0-9._/-]+"
 REPO_RE = r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+"
 POOL_PREFIX_RE = r"[a-z0-9]+-"
 RESERVED_POOL_PREFIXES = {"root-", "side-", "gui-", "fast-", "trusted-", "std-", "light-", "xl-", "dev-", "nightly-",
-                          "gateway-"}
+                          "gateway-", "sim-"}
 DEV_COMPILE_POOL_PREFIX = "dev-"
 # The classes that may hold the DEV freshness slot (runner.devCompile). An xl slot (an M5 Ultra Studio) also carries
 # the std DEV label (dev_classes), so the feed's Release compile queued on
@@ -281,6 +292,12 @@ def gateway_label(version: str) -> str:
     return f"glaeda-{GATEWAY_PREFIX}-xcode-{version}"
 
 
+def sim_label(version: str) -> str:
+    """The sim-first runners' label for an Xcode version: glaeda-sim-xcode-<version>. No class: a simulator job runs
+    the same on any simulator mini, so one label spans every class's sim-first runners."""
+    return f"glaeda-{SIM_PREFIX}-xcode-{version}"
+
+
 def _role_label(pool: str, role: str) -> str:
     """Insert a runner role after an optional pool namespace and before class metadata."""
     parts = pool.split("-")
@@ -443,10 +460,11 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
         gui = declared.get("guiRunners", 0)
         fast = declared.get("fastRunners", 0)
         gateway = declared.get("gatewayRunners", 0)
+        sim = declared.get("simRunners", 0)
     else:
-        compile_slots, roots, gui, fast, gateway = 1, 1, 0, 0, 0
+        compile_slots, roots, gui, fast, gateway, sim = 1, 1, 0, 0, 0, 0
     if dedicated_only:
-        gateway = 0  # DEDICATED_ONLY: no pool instance, so no gateway runner after them either
+        gateway = sim = 0  # DEDICATED_ONLY: no pool instance, so no gateway or sim-first runner after them either
     if not (isinstance(runners, int) and not isinstance(runners, bool) and 1 <= runners <= MAX_RUNNERS):
         return None, f"runner.classes.{klass}.runners must be 1 to {MAX_RUNNERS}"
     # every mini holds at least one compile slot, so it needs a compile's cores; glaeda-route checks the same
@@ -471,6 +489,12 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
     if gateway and (trusted_ref is not None or availability != "dedicated" or normal_pool_prefix):
         return None, (f"{member} runner.classes.{klass}.gatewayRunners needs a dedicated runner without trustedRef "
                       "(a gateway runner takes pull request jobs) in the default pool namespace (no poolPrefix)")
+    if not (isinstance(sim, int) and not isinstance(sim, bool) and 0 <= sim <= MAX_SIM_RUNNERS):
+        return None, f"runner.classes.{klass}.simRunners must be 0 to {MAX_SIM_RUNNERS}"
+    if sim and (trusted_ref is not None or availability != "dedicated" or normal_pool_prefix):
+        return None, (f"{member} runner.classes.{klass}.simRunners needs a dedicated runner without trustedRef "
+                      "(a sim-first runner takes pull request jobs) in the default pool namespace (no poolPrefix)")
+    sim = sim if ios_sim else 0  # only a member that can boot the declared runtimes gets one (IOS_SIM_LABEL)
     if compile_slots > roots:
         return None, (f"runner.classes.{klass}.compileSlots {compile_slots} needs canonicalRoots {compile_slots} "
                       "(every compile holds a root)")
@@ -499,7 +523,9 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
             "fastRunners": fast, "fastPools": [fast_label(label) for label in dict.fromkeys(pools)] if fast else [],
             "gatewayRunners": gateway,
             "gatewayPools": list(dict.fromkeys(gateway_label(v) for v in (versions if pools else []))) if gateway
-            else []}, None
+            else [],
+            "simRunners": sim,
+            "simPools": list(dict.fromkeys(sim_label(v) for v in (versions if pools else []))) if sim else []}, None
 
 
 def declared_pools(manifest: Any, xcode_ok: Callable[[str, dict[str, Any]], bool] | None = None) -> dict[str, list[str]]:
