@@ -88,7 +88,7 @@ from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 STAGED = ("glaeda-cmux-runner", "glaeda-cmux-runner-hook", "glaeda_fleet_labels.py", "glaeda_reservation.py",
-          "glaeda-promotion-admit", "glaeda-nightly-only-admit")
+          "glaeda-promotion-admit", "glaeda-capture-admit", "glaeda-nightly-only-admit")
 # HQ's nightly promotion lease runs ~/.local/bin/glaeda-promotion-admit over ssh: every stage installs the staged copy
 # there (a temp file renamed into place, so a running request never reads a half-written file)
 PROMOTION_ADMIT = "glaeda-promotion-admit"

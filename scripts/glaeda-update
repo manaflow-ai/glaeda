@@ -149,7 +149,7 @@ RUNNER_SCRIPTS = HOME / "glaeda-runner/scripts"
 # glaeda-nightly-only-admit: the admit command of the nightly-only and trusted runner.dedicated entries (run from this
 # copy, fresh per job), so a merged fix to it reaches the minis by OTA with the runner files, never a fleet --apply.
 RUNNER_FILES = ("glaeda-cmux-runner", "glaeda-cmux-runner-hook", "glaeda_fleet_labels.py", "glaeda_reservation.py",
-                "glaeda-nightly-only-admit")
+                "glaeda-nightly-only-admit", "glaeda-promotion-admit", "glaeda-capture-admit")
 SOURCE_STAMP = ".glaeda-source.json"
 STAMP_BY = "glaeda-update"
 ANCESTRY = "ancestry.txt"  # glaeda_release.ANCESTRY: the release's commit and its ancestors

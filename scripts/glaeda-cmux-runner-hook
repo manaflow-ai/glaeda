@@ -2738,8 +2738,32 @@ def promotion_identity_refusal(lease: dict[str, Any], environ: Any) -> str | Non
     return None
 
 
+def capture_identity_refusal(lease: dict[str, Any], environ: Any) -> str | None:
+    """Capture leases never inherit promotion/signing authority."""
+    jobs = {"pr-capture-cloud.yml": "capture", "ios-screen-sharing-proof.yml": "proof"}
+    workflow = lease.get("workflow")
+    if (lease.get("repository") != "manaflow-ai/cmuxterm-hq" or lease.get("ref") != "refs/heads/main"
+            or not isinstance(workflow, str) or jobs.get(workflow) != lease.get("job")):
+        return "the lease is not a protected HQ capture workflow/job on main"
+    want = {"GITHUB_REPOSITORY": lease["repository"], "GITHUB_RUN_ID": str(lease.get("run_id")),
+            "GITHUB_RUN_ATTEMPT": str(lease.get("run_attempt")), "GITHUB_SHA": lease.get("source_sha"),
+            "GITHUB_WORKFLOW_SHA": lease.get("source_sha"), "GITHUB_JOB": lease["job"],
+            "RUNNER_NAME": lease.get("runner_name"), "GITHUB_REF": "refs/heads/main",
+            "GITHUB_EVENT_NAME": "workflow_dispatch",
+            "GITHUB_WORKFLOW_REF": f"{lease['repository']}/.github/workflows/{workflow}@refs/heads/main"}
+    if any(not isinstance(value, str) or environ.get(name) != value for name, value in want.items()):
+        return "this job does not match the exact protected capture lease identity"
+    try:
+        expires = datetime.datetime.fromisoformat(lease["expires_at"].replace("Z", "+00:00")).timestamp()
+    except (KeyError, TypeError, ValueError):
+        return "the capture lease expiry is unreadable"
+    if time.time() >= expires:
+        return "the capture lease expired before job adoption"
+    return None
+
+
 def promotion_adopt(lease_dir: Path, owner: JobOwner, state_dir: Path,
-                    environ: Any = None) -> tuple[bool, str, dict[str, Any]]:
+                    environ: Any = None, identity_check: Any = None) -> tuple[bool, str, dict[str, Any]]:
     """job-started on a lease runner: adopt the lease's exclusive claim for this job, or refuse it. Never takes or
     waits for capacity. Returns (admitted, note, taken) where taken is what export_job_claim reads."""
     environ = os.environ if environ is None else environ
@@ -2749,11 +2773,13 @@ def promotion_adopt(lease_dir: Path, owner: JobOwner, state_dir: Path,
             raise ValueError("not an object")
     except (OSError, ValueError) as error:
         return False, f"promotion lease: cannot read the lease ({type(error).__name__})", {}
-    why = promotion_identity_refusal(lease, environ)
+    why = (identity_check or promotion_identity_refusal)(lease, environ)
     if why:
         return False, f"promotion lease {str(lease.get('lease_id'))[:24]}: {why}", {}
     try:
         with promotion_locked(lease_dir):
+            if identity_check and (why := identity_check(lease, environ)):
+                return False, why, {}
             state = json.loads((lease_dir / PROMOTION_STATE_FILE).read_text())
             if not isinstance(state, dict):
                 raise ValueError("not an object")
@@ -4111,7 +4137,8 @@ def root_users(path: str) -> list[int] | None:
 # runner's _work, other than this job's own (under its Runner.Worker) and the hook's own; it waits for them like
 # for units, EXCLUSIVE_CAPACITY_WAIT_S at most, then is refused. None when ps cannot tell, which refuses too.
 RUNNER_WORK_GLOBS = ("actions-runner-glaeda*/_work", "glaeda-runner/_work",
-                     ".local/state/glaeda/promotion/*/runner/_work")  # a promotion lease's runner (PROMOTION_LEASE)
+                     ".local/state/glaeda/promotion/*/runner/_work",
+                     ".local/state/glaeda/capture/*/runner/_work")  # exclusive lease runners
 
 
 def stray_job_processes(home: Path, owner_pid: int) -> list[int] | None:
@@ -5278,7 +5305,7 @@ def hold(fds: list[int], watch: int | JobOwner, state_dir: Path, drop: tuple[int
             # owner.gone(), not process_alive: a /bin/ps that times out or fails under load (a busy mini's
             # load reaches 200+) is unknown, not gone, and must never hand a live job's units back to the ledger
             while (not owner.gone() or (keep_while is not None and promotion_adopted_alive(keep_while))) \
-                    and time.monotonic() < deadline:
+                    and (getattr(owner, "retain_without_deadline", False) or time.monotonic() < deadline):
                 try:
                     if pid_file.read_text().strip() != me:
                         break  # job-completed released it
@@ -9836,7 +9863,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--state-dir", type=Path, default=Path.home() / ".local/state/glaeda/cmux-runner",
                    help=argparse.SUPPRESS)
     p.add_argument("--watch-pid", type=int, default=0, help=argparse.SUPPRESS)
-    p.add_argument("--promotion-lease", type=Path,
+    leases = p.add_mutually_exclusive_group()
+    leases.add_argument("--capture-lease", type=Path, help="adopt one exact protected HQ capture lease")
+    leases.add_argument("--promotion-lease", type=Path,
                    help="job-started, job-completed: this runner is a nightly promotion lease's JIT runner "
                         "(glaeda-promotion-admit): adopt the lease's exclusive claim for its one matching job "
                         "(PROMOTION_LEASE), refuse any other, and leave the release to the lease")
@@ -9967,15 +9996,21 @@ def main(argv: list[str] | None = None) -> int:
                                tuple(args.allow_event))
         if not admit:
             return refused(reason)
-        if args.promotion_lease is not None:
+        if args.promotion_lease is not None or args.capture_lease is not None:
             # PROMOTION_LEASE: the claim is already held for this job; adopt it at once or refuse
             if owner is None:
                 return refused(f"cannot pin this job's Runner.Worker (pid {args.watch_pid or os.getppid()})")
-            adopted, note, taken = promotion_adopt(args.promotion_lease, owner, args.state_dir)
+            lease_dir = args.capture_lease or args.promotion_lease
+            adopted, note, taken = promotion_adopt(lease_dir, owner, args.state_dir,
+                                                    identity_check=capture_identity_refusal if args.capture_lease else None)
             if not adopted:
                 return refused(note)
             if claim := export_job_claim(int(taken["units_total"]), taken, note):
                 note += f"; {claim}"
+            if args.capture_lease and os.environ.get("GITHUB_ENV"):
+                with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
+                    env_file.write(f"GLAEDA_CAPTURE_LEASE_ID={lease_dir.name}\n"
+                                   f"GLAEDA_CAPTURE_CLEANUP_PATH={lease_dir / 'cleanup.json'}\n")
             print(f"{PREFIX}: admitted: {reason}; {note}", flush=True)
             return 0
         if args.gateway_runner and (is_guest(repo, args.home_repo)
@@ -10308,9 +10343,10 @@ def main(argv: list[str] | None = None) -> int:
     else:
         if telemetry:
             print(f"{PREFIX}: {finish_sampler(args.state_dir)}", flush=True)
-        if args.promotion_lease is not None:  # PROMOTION_LEASE: released by the lease once the Runner.Worker ends
-            print(f"{PREFIX}: the promotion lease keeps its exclusive claim until this job's Runner.Worker ends",
-                  flush=True)
+        if args.promotion_lease is not None or args.capture_lease is not None:
+            note = ("the capture lease owns claim release after this job and its required cleanup" if args.capture_lease
+                    else "the promotion lease keeps its exclusive claim until this job's Runner.Worker ends")
+            print(f"{PREFIX}: {note}", flush=True)
         else:
             print(f"{PREFIX}: {release_host_lock(args.state_dir)}", flush=True)
     skip_disk = False

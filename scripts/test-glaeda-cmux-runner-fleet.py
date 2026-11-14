@@ -562,6 +562,7 @@ class FleetTest(unittest.TestCase):
         calls = self.calls()
         scp = [c for c in calls if c["tool"] == "scp" and any(a.endswith("/glaeda-cmux-runner-hook") for a in c["argv"])]
         self.assertTrue(scp and any(a.endswith("/glaeda-promotion-admit") for a in scp[0]["argv"]), scp)
+        self.assertTrue(any(a.endswith("/glaeda-capture-admit") for a in scp[0]["argv"]), scp)
         install = [c["remote"] for c in calls if c["tool"] == "ssh" and "~/.local/bin/glaeda-promotion-admit" in c["remote"]]
         self.assertEqual(len(install), 1, install)
         self.assertIn("mv -f ~/.local/bin/.glaeda-promotion-admit.tmp ~/.local/bin/glaeda-promotion-admit", install[0])

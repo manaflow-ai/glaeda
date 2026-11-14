@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""Lease a whole owned Mac before starting one protected staging capture job.
+
+HQ's fleet-reconcilers admission job sends the version-1 request on stdin over
+existing fleet SSH. No account credential is accepted. The unique JIT listener
+starts only after every host capacity token is held. Its hook adopts that same
+claim only for the exact HQ main workflow/run/attempt/SHA/job/runner identity.
+
+Unlike promotion, capture has no controller status or overflow route. Admission
+expires in at most 900 seconds. A proven-unassigned listener is withdrawn then;
+an acknowledged or adopted job retains its claim until its worker exits AND its
+exact cleanup receipt is present. Missing cleanup quarantines the whole host,
+including after a crash or timeout; no deadline silently frees it. The protected
+workflow bounds execution with its job timeout and records verified cleanup.
+Unknown assignment retains the claim for safe recovery.
+
+Request fields are declared below. source_sha is the HQ workflow SHA, never the
+captured application's SHA. The receipt adds hook_sha256, workflow and ref to the
+shared lifecycle receipt. HQ pins this helper, its promotion lifecycle import,
+and the installed hook before submitting secrets to the matching protected job.
+"""
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import json
+import hashlib
+import os
+import fcntl
+import contextlib
+from pathlib import Path
+import sys
+
+HERE = Path(__file__).resolve()
+loader = importlib.machinery.SourceFileLoader('glaeda_capture_lifecycle', str(HERE.with_name('glaeda-promotion-admit')))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+core = importlib.util.module_from_spec(spec)
+sys.modules[loader.name] = core
+loader.exec_module(core)
+
+
+class CapturePolicy:
+    entrypoint = HERE
+    fields = ('version', 'lease_id', 'repository', 'run_id', 'run_attempt', 'source_sha', 'workflow', 'job',
+              'ref', 'created_at', 'expires_at', 'runner_label', 'runner_name', 'encoded_jit_config', 'runtime_sha256', 'host_lock_sha256')
+    jobs = {'pr-capture-cloud.yml': 'capture', 'ios-screen-sharing-proof.yml': 'proof'}
+
+    @staticmethod
+    def root():
+        return Path.home() / '.local/state/glaeda/capture'
+
+    @staticmethod
+    def authority(request):
+        # The protected provider owns the existing fleet SSH admission boundary.
+        # Nothing supplied in this request grants controller or account access.
+        return None
+
+    runtime_names = ('glaeda-capture-admit', 'glaeda-promotion-admit',
+                     'glaeda-cmux-runner-hook', 'glaeda_reservation.py')
+
+    def freeze(self, lease, request):
+        runtime = lease.dir / 'runtime'
+        expected = request['runtime_sha256']
+        source = core.source_runner() / 'glaeda-hooks'
+        data = {name: (HERE.parent / name if name in self.runtime_names[:2] else source / name).read_bytes()
+                for name in self.runtime_names}
+        if any(hashlib.sha256(data[name]).hexdigest() != expected[name] for name in self.runtime_names):
+            raise core.Refusal('capture runtime changed or does not match the protected provider pins')
+        runtime.mkdir(mode=0o700, exist_ok=True)
+        for name, blob in data.items():
+            path = runtime / name
+            if path.exists():
+                if path.read_bytes() != blob:
+                    raise core.Refusal('existing lease runtime differs; refusing replacement')
+            else:
+                with path.open('xb') as stream:
+                    stream.write(blob)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                path.chmod(0o500)
+        return runtime / 'glaeda-capture-admit'
+
+    @staticmethod
+    def load_frozen_hook(runtime, request):
+        for name, digest in request['runtime_sha256'].items():
+            if hashlib.sha256((runtime / name).read_bytes()).hexdigest() != digest:
+                raise core.Refusal('frozen capture runtime digest mismatch')
+        path = runtime / 'glaeda-cmux-runner-hook'
+        loader = importlib.machinery.SourceFileLoader('glaeda_capture_hook', str(path))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[loader.name] = module
+        loader.exec_module(module)
+        return module
+
+    def recover(self, lease):
+        runtime = lease.dir / 'runtime'
+        identity = lease.lease()
+        self.load_frozen_hook(runtime, identity)  # verifies every byte before importing the frozen lifecycle
+        loader = importlib.machinery.SourceFileLoader('glaeda_capture_recovery', str(runtime / 'glaeda-capture-admit'))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        frozen = importlib.util.module_from_spec(spec)
+        sys.modules[loader.name] = frozen
+        loader.exec_module(frozen)
+        policy = frozen.CapturePolicy()
+        hook = policy.load_frozen_hook(runtime, identity)
+        return frozen.core.recover(lease, hook, policy)
+
+    @staticmethod
+    def reservation(lease):
+        identity = lease.lease()
+        return {'schema': 'glaeda-reservation/v1', 'owner': 'glaeda-capture-admit',
+                'purpose': 'protected capture lease ' + identity['lease_id'],
+                'since': int(core.parse_time(identity['created_at'])), 'until': 253402300799}
+
+    @contextlib.contextmanager
+    def reservation_lock(self, hook):
+        path = Path(hook.RESERVATION).parent / '.reservation.lock'
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o664)
+        try:
+            deadline = core.time.monotonic() + 10
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if core.time.monotonic() >= deadline:
+                        raise core.Refusal('reservation writer remained busy')
+                    core.time.sleep(0.1)
+            yield
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def sync_directory(path):
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def reserve(self, lease, hook):
+        with self.reservation_lock(hook):
+            # No overwrite, even of an expired or unreadable foreign reservation.
+            fd = os.open(hook.RESERVATION, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+            with os.fdopen(fd, 'w') as stream:
+                json.dump(self.reservation(lease), stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            self.sync_directory(Path(hook.RESERVATION).parent)
+
+    def unreserve(self, lease, hook):
+        with self.reservation_lock(hook):
+            path = Path(hook.RESERVATION)
+            if not path.exists():
+                return
+            if path.is_symlink() or json.loads(path.read_text()) != self.reservation(lease):
+                raise core.Refusal('reservation no longer belongs to this capture lease; keeping it')
+            path.unlink()
+            self.sync_directory(path.parent)
+
+    @staticmethod
+    def cleaned(lease):
+        try:
+            receipt = json.loads((lease.dir / 'cleanup.json').read_text())
+            identity = lease.lease()
+        except (OSError, ValueError):
+            return False
+        fields = ('lease_id', 'repository', 'run_id', 'run_attempt', 'source_sha', 'workflow', 'job', 'runner_name')
+        return (isinstance(receipt, dict) and set(receipt) == {*fields, 'version', 'cleaned'}
+                and type(receipt.get('version')) is int and receipt['version'] == 1
+                and receipt.get('cleaned') is True
+                and all(type(receipt.get(k)) is type(identity.get(k)) and receipt.get(k) == identity.get(k)
+                        for k in fields))
+
+    def host_refusal(self, hook, total):
+        try:
+            actual = hashlib.sha256((Path(hook.FLEET_DIR) / 'bin/with-host-lock').read_bytes()).hexdigest()
+        except OSError:
+            return 'with-host-lock quarantine guard is missing'
+        if actual != self.host_lock_sha256:
+            return 'with-host-lock quarantine guard does not match protected provider pin'
+        if why := hook.reservation_refusal(hook.RESERVATION, core.time.time()):
+            return why
+        # Dedicated builders can bypass the ledger. Never place test credentials
+        # on such a host, even if a momentary process snapshot looks idle.
+        for runner in Path.home().glob('actions-runner-glaeda*'):
+            if not runner.is_dir():
+                continue
+            wrapper = runner / 'glaeda-hooks/job-started.sh'
+            if not wrapper.is_file():
+                return 'an installed runner has no readable admission wrapper'
+            scope = hook.runner_scope(runner)
+            if scope.dedicated:
+                return 'a dedicated runner is not covered by the capture whole-host ledger'
+            if scope.units != total:
+                return 'installed runners disagree on the whole-host capacity ledger'
+        return None
+
+    def validate(self, request, now):
+        def bad(why):
+            return core.Refusal('invalid capture request: ' + why, 2)
+        if not isinstance(request, dict) or set(request) != set(self.fields):
+            raise bad('exact version-1 field set required; no credentials or extra capabilities')
+        if type(request['version']) is not int or request['version'] != 1:
+            raise bad('version must be 1')
+        lease = request['lease_id']
+        if not isinstance(lease, str) or not core.LEASE_RE.fullmatch(lease):
+            raise bad('lease_id must be 24 lowercase hex')
+        if request['repository'] != 'manaflow-ai/cmuxterm-hq' or request['ref'] != 'refs/heads/main':
+            raise bad('only the HQ main protected workflows are admitted')
+        workflow = request['workflow']
+        if not isinstance(workflow, str) or self.jobs.get(workflow) != request['job']:
+            raise bad('workflow/job is not a protected capture entry')
+        for field in ('run_id', 'run_attempt'):
+            if not core.positive_int(request[field]):
+                raise bad(field + ' must be a positive integer')
+        if not isinstance(request['source_sha'], str) or not core.SHA_RE.fullmatch(request['source_sha']):
+            raise bad('source_sha must be the full HQ workflow SHA')
+        if request['runner_name'] != 'cmux-capture-' + lease:
+            raise bad('runner name does not bind the lease')
+        if request['runner_label'] != 'cmux-capture-' + lease + '-' + request['job']:
+            raise bad('runner label does not bind the lease and job')
+        created, expires = (core.parse_time(request[k]) for k in ('created_at', 'expires_at'))
+        if (created is None or expires is None or created > now + core.CLOCK_SKEW_S
+                or not 0 < expires - created <= 900 or expires <= now):
+            raise bad('lease must have an unexpired admission window of at most 900 seconds')
+        if (not isinstance(request['host_lock_sha256'], str)
+                or not core.re.fullmatch(r'[0-9a-f]{64}', request['host_lock_sha256'])):
+            raise bad('host_lock_sha256 must pin the quarantine-aware fleet helper')
+        self.host_lock_sha256 = request['host_lock_sha256']
+        pins = request['runtime_sha256']
+        if (not isinstance(pins, dict) or set(pins) != set(self.runtime_names)
+                or any(not isinstance(v, str) or not core.re.fullmatch(r'[0-9a-f]{64}', v) for v in pins.values())):
+            raise bad('runtime_sha256 must pin all four capture runtime files')
+        jit = request['encoded_jit_config']
+        if not isinstance(jit, str) or not core.JIT_RE.fullmatch(jit):
+            raise bad('invalid encoded JIT config')
+        return request
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    policy = CapturePolicy()
+    if len(argv) == 2 and argv[0] == '--recover':
+        if not core.LEASE_RE.fullmatch(argv[1]):
+            return 2
+        lease = core.Lease(policy.root(), argv[1])
+        identity = lease.lease()
+        if (identity.get('lease_id') != argv[1] or identity.get('repository') != 'manaflow-ai/cmuxterm-hq'
+                or identity.get('ref') != 'refs/heads/main'
+                or policy.jobs.get(str(identity.get('workflow'))) != identity.get('job')):
+            return 2
+        # Recovery never fabricates cleanup. A dead/crashed credential-bearing
+        # lease retains its holder until a protected cleanup actually wrote the
+        # exact matching receipt. Active/unknown processes retain it regardless.
+        reason = policy.recover(lease)
+        phase = lease.state().get('phase')
+        print(json.dumps({'lease_id': argv[1], 'phase': phase, 'reason': reason}))
+        return 0 if phase in core.TERMINAL else 1
+    return core.main(argv, policy)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

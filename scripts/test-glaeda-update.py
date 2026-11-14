@@ -530,6 +530,9 @@ class UpdateTest(unittest.TestCase):
         self.assertEqual(gu.refresh_runner_scripts(self.state, copy), f"refreshed to {entry['tag']}")
         self.assertEqual((copy / "glaeda-cmux-runner").read_text(), f"glaeda-cmux-runner at {SOURCES[0]}")
         self.assertTrue(os.access(copy / "glaeda-cmux-runner", os.X_OK))
+        for helper in ("glaeda-capture-admit", "glaeda-promotion-admit"):
+            self.assertEqual((copy / helper).read_text(), f"{helper} at {SOURCES[0]}")
+            self.assertTrue(os.access(copy / helper, os.X_OK))
         stamp = json.loads((copy / gu.SOURCE_STAMP).read_text())
         self.assertEqual((stamp["by"], stamp["tag"], stamp["source"], stamp["date"]),
                          ("glaeda-update", entry["tag"], SOURCES[0], "2026-09-25"))
@@ -589,9 +592,11 @@ class UpdateTest(unittest.TestCase):
         entry = self.server.publish(SOURCES[0], runner_files=self.runner_files("the fixed release"),
                                     hook_history=self.older())
         self.assertEqual(self.run_update()["result"], "updated")
+        helper = self.runner_files("the fixed release")[gu.PROMOTION_ADMIT]
         self.assertEqual(gu.runner_steps(self.state, staged, home, bin_dir=self.bin),
                          {"runnerScripts": f"refreshed to {entry['tag']}", "runnerHooks": f"{entry['tag']}: 1 updated",
-                          "promotionAdmit": f"{entry['tag']} has no {gu.PROMOTION_ADMIT}"})
+                          "promotionAdmit": f"installed {entry['tag']}'s {gr.sha256(helper)[:12]}"})
+        self.assertEqual((self.bin / gu.PROMOTION_ADMIT).read_bytes(), helper)
         self.assertEqual(hook.read_bytes(), self.runner_files("the fixed release")["glaeda-cmux-runner-hook"])
         self.assertEqual(os.stat(hook).st_mode & 0o777, 0o755)
         self.assertEqual((hook.parent / "job-started.sh").read_bytes(), wrapper, "wrappers are --apply's")
@@ -619,9 +624,11 @@ class UpdateTest(unittest.TestCase):
         newer = self.server.publish(SOURCES[1], runner_files=self.runner_files("the next release"),
                                     ancestry=[SOURCES[1], SOURCES[0], "d" * 40], hook_history=self.older())
         self.assertEqual(self.run_update()["result"], "updated")
+        helper = self.runner_files("the next release")[gu.PROMOTION_ADMIT]
         self.assertEqual(gu.runner_steps(self.state, staged, home, bin_dir=self.bin),
                          {"runnerScripts": f"refreshed to {newer['tag']}", "runnerHooks": f"{newer['tag']}: 1 updated",
-                          "promotionAdmit": f"{newer['tag']} has no {gu.PROMOTION_ADMIT}"})
+                          "promotionAdmit": f"installed {newer['tag']}'s {gr.sha256(helper)[:12]}"})
+        self.assertEqual((self.bin / gu.PROMOTION_ADMIT).read_bytes(), helper)
         self.assertEqual(hook.read_bytes(), self.runner_files("the next release")["glaeda-cmux-runner-hook"])
 
     # ---- step 6b: glaeda-promotion-admit (2026-11-01: #1780 and #1794 merged, and every promotion-eligible mini

@@ -305,13 +305,13 @@ def validate(request: Any, now: float) -> dict[str, Any]:
     return request
 
 
-def identity(request: dict[str, Any]) -> dict[str, Any]:
+def identity(request: dict[str, Any], policy: Any = None) -> dict[str, Any]:
     """Every field but the JIT config: what a repeat request must match, and what the hook reads (lease.json)."""
-    return {name: request[name] for name in FIELDS if name != "encoded_jit_config"}
+    return {name: request[name] for name in (policy.fields if policy else FIELDS) if name != "encoded_jit_config"}
 
 
-def fingerprint(request: dict[str, Any]) -> str:
-    return hashlib.sha256(json.dumps(identity(request), sort_keys=True).encode()).hexdigest()
+def fingerprint(request: dict[str, Any], policy: Any = None) -> str:
+    return hashlib.sha256(json.dumps(identity(request, policy), sort_keys=True).encode()).hexdigest()
 
 
 # ---------------------------------------------------------------- the host
@@ -519,12 +519,13 @@ def listener_group(runner_dir: Path, pgid: Any, ident: Any) -> list[int] | None:
     return sorted({pid for pid, _ in members})
 
 
-def promotion_claim_owner(hook: Any, lease: Lease, owner: Any) -> Any:
+def promotion_claim_owner(hook: Any, lease: Lease, owner: Any, policy: Any = None) -> Any:
     """The existing holder follows this exact supervisor, then its recorded listener group until recovery proves
     it safe to stop. This also covers acknowledgement before the assigned marker or job-started adoption. The
-    helper supplies a JobOwner to the unchanged hook; no hook bytes or signing trust are changed."""
+    capture policy additionally keeps ownership until its exact cleanup receipt exists."""
     class PromotionOwner(hook.JobOwner):
         __slots__ = ()
+        retain_without_deadline = bool(policy)
 
         def gone(self) -> bool:
             if not super().gone():
@@ -533,6 +534,8 @@ def promotion_claim_owner(hook: Any, lease: Lease, owner: Any) -> Any:
                 state = json.loads((lease.dir / "state.json").read_text())
                 if not state or state.get("phase") not in ("claiming", "starting", "ready", *TERMINAL):
                     return False
+                if policy and (state.get("adopted") or state.get("assigned")) and not policy.cleaned(lease):
+                    return False  # a crashed supervisor cannot free a possibly credential-bearing capture
                 group = listener_group(lease.runner_dir, state.get("listener_pid"), state.get("listener_identity"))
             except (OSError, ValueError, AttributeError):
                 return False  # unknown lease state must not release a possibly active claim
@@ -541,7 +544,7 @@ def promotion_claim_owner(hook: Any, lease: Lease, owner: Any) -> Any:
     return PromotionOwner(owner.pid, owner.identity)
 
 
-def recover(lease: Lease, hook: Any) -> str:
+def recover(lease: Lease, hook: Any, policy: Any = None) -> str:
     """Recover only a proven-unassigned listener after its supervisor dies. Assigned or unknown listeners keep
     their runner tree and exclusive claim; an acknowledged job may not have reached job-started adoption yet."""
     with hook.promotion_locked(lease.dir, wait_s=60.0):
@@ -551,9 +554,16 @@ def recover(lease: Lease, hook: Any) -> str:
         if not state:
             return "its lease state is unknown; keeping the listener and claim"
         if state.get("phase") in TERMINAL:
+            if policy:
+                if (state.get("adopted") or state.get("assigned")) and not policy.cleaned(lease):
+                    return "capture cleanup is not proven; retaining durable reservation"
+                policy.unreserve(lease, hook)
             return f"already {state.get('phase')}"
         if hook.promotion_adopted_alive(lease.dir):
             return "its adopted Runner.Worker still runs; its holder keeps the claim until that ends"
+        if policy and (state.get("adopted") or state.get("assigned") or state.get("phase") == "quarantined"):
+            if not policy.cleaned(lease):
+                return "capture quarantined: no matching successful cleanup receipt; keeping the claim"
         group = listener_group(lease.runner_dir, state.get("listener_pid"), state.get("listener_identity"))
         if group is None:
             return "its listener process state is unknown; keeping the listener and claim"
@@ -605,6 +615,8 @@ def recover(lease: Lease, hook: Any) -> str:
         runner = str(lease.lease().get("runner_name") or "")
         released = hook.release_holder(hook.holder_file(Path.home() / ".local/state/glaeda/cmux-runner", runner)) \
             if runner else "no runner name to release"
+        if policy:
+            policy.unreserve(lease, hook)
         shutil.rmtree(lease.runner_dir, ignore_errors=True)
         phase = "released" if isinstance(state.get("adopted"), dict) else "failed"
         hook.promotion_write_state(lease.dir, {**state, "phase": phase, "ended_at": time.time(),
@@ -612,7 +624,7 @@ def recover(lease: Lease, hook: Any) -> str:
     return f"recovered ({released})"
 
 
-def prune(root: Path, now: float) -> None:
+def prune(root: Path, now: float, policy: Any = None) -> None:
     """Finished lease records older than KEEP_TERMINAL_S (only ours: lease-id names with a terminal state), lease
     dirs a request left half made (TMP_RE), and leases whose supervisor died while starting or ready (recover)."""
     hook: Any = None
@@ -628,12 +640,25 @@ def prune(root: Path, now: float) -> None:
         state = lease.state()
         with contextlib.suppress(OSError):
             if state.get("phase") in TERMINAL and now - (path / "state.json").stat().st_mtime > KEEP_TERMINAL_S:
+                if policy:
+                    try:
+                        policy.recover(lease)
+                        # An unremoved owned marker keeps the only cleanup identity available.
+                        hook = policy.load_frozen_hook(lease.dir / "runtime", lease.lease())
+                        if Path(hook.RESERVATION).exists():
+                            continue
+                    except Exception:
+                        continue
                 shutil.rmtree(path, ignore_errors=True)
                 continue
         if state.get("phase") in ("starting", "ready") and not supervisor_alive(path):
             try:
-                hook = hook or load_hook(source_runner())
-                log(f"lease {path.name}: {recover(lease, hook)}")
+                if policy:
+                    reason = policy.recover(lease)
+                else:
+                    hook = hook or load_hook(source_runner())
+                    reason = recover(lease, hook)
+                log(f"lease {path.name}: {reason}")
             except Exception as error:  # noqa: BLE001 - one bad record never stops a request
                 log(f"lease {path.name}: could not recover ({type(error).__name__}: {str(error)[:160]})")
 
@@ -643,10 +668,11 @@ def half_made(lease: Lease) -> bool:
     return not lease.lease() and not (lease.dir / "supervisor.json").exists()
 
 
-def spawn_supervisor(lease: Lease, request: dict[str, Any]) -> subprocess.Popen:
+def spawn_supervisor(lease: Lease, request: dict[str, Any], policy: Any = None) -> subprocess.Popen:
     log_fd = os.open(lease.dir / "supervisor.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
     try:
-        child = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--supervise", os.fspath(lease.dir)],
+        entrypoint = policy.freeze(lease, request) if policy else Path(__file__).resolve()
+        child = subprocess.Popen([sys.executable, os.fspath(entrypoint), "--supervise", os.fspath(lease.dir)],
                                  stdin=subprocess.PIPE, stdout=log_fd, stderr=log_fd, cwd="/", close_fds=True,
                                  start_new_session=True)
     finally:
@@ -684,32 +710,32 @@ def answer(lease: Lease, deadline: float, child: subprocess.Popen | None = None)
         time.sleep(0.2)
 
 
-def admit(text: str) -> int:
+def admit(text: str, policy: Any = None) -> int:
     now = time.time()
     try:
         request = json.loads(text)
     except ValueError:
         raise Refusal("invalid request: not JSON", 2) from None
-    request = validate(request, now)
+    request = policy.validate(request, now) if policy else validate(request, now)
     expires = parse_time(request["expires_at"]) or now
 
     def authority() -> None:  # only before a claim: a repeat of an accepted request never fails on the tailnet
-        why = verify_authority(request["controller_url"])
+        why = policy.authority(request) if policy else verify_authority(request["controller_url"])
         if why:
             raise Refusal(f"invalid request: {why}", 2)
 
     child: subprocess.Popen | None = None
-    root = promotion_root()
+    root = policy.root() if policy else promotion_root()
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     lease = Lease(root, request["lease_id"])
     with admit_lock(root):
-        prune(root, now)
+        prune(root, now, policy)
         if lease.dir.exists() and half_made(lease):
             log(f"lease {request['lease_id']}: a half-made lease dir; starting it again")
             shutil.rmtree(lease.dir)
         if lease.dir.exists():
             known = lease.lease()
-            if known.get("fingerprint") != fingerprint(request):
+            if known.get("fingerprint") != fingerprint(request, policy):
                 raise Refusal(f"lease {request['lease_id']} is known with another request; refused", 3)
             state = lease.state()
             if lease.receipt() is None and state.get("phase") not in TERMINAL and not supervisor_alive(lease.dir):
@@ -718,9 +744,10 @@ def admit(text: str) -> int:
                         raise Refusal("the lease expired before it was ready")
                     authority()
                     log(f"lease {request['lease_id']}: resuming its claim")
-                    child = spawn_supervisor(lease, request)
+                    child = spawn_supervisor(lease, request, policy)
                 else:  # prune recovers these; one it could not is tried once more, and the request then ends
-                    log(f"lease {request['lease_id']}: {recover(lease, load_hook(source_runner()))}")
+                    reason = policy.recover(lease) if policy else recover(lease, load_hook(source_runner()))
+                    log(f"lease {request['lease_id']}: {reason}")
             else:
                 log(f"lease {request['lease_id']}: a repeat request")
         else:
@@ -730,10 +757,10 @@ def admit(text: str) -> int:
             made = root / f".{request['lease_id']}.tmp-{os.getpid()}"  # whole or not at all: renamed in place
             shutil.rmtree(made, ignore_errors=True)
             made.mkdir(mode=0o700)
-            write_json(made / "lease.json", {**identity(request), "fingerprint": fingerprint(request)})
+            write_json(made / "lease.json", {**identity(request, policy), "fingerprint": fingerprint(request, policy)})
             write_json(made / "state.json", {"phase": "claiming", "since": now})
             os.rename(made, lease.dir)
-            child = spawn_supervisor(lease, request)
+            child = spawn_supervisor(lease, request, policy)
     return answer(lease, expires + ANSWER_GRACE_S, child)
 
 
@@ -741,21 +768,30 @@ def admit(text: str) -> int:
 
 
 class Supervisor:
-    def __init__(self, lease_dir: Path, request: dict[str, Any]) -> None:
+    def __init__(self, lease_dir: Path, request: dict[str, Any], policy: Any = None) -> None:
+        self.policy = policy
+        self.job = request["job"] if policy else JOB
+        self.repository = request["repository"] if policy else REPOSITORY
+        self.workflow = request["workflow"] if policy else WORKFLOW
         self.lease = Lease(lease_dir.parent, lease_dir.name)
         self.request = request
         self.lease_id = request["lease_id"]
         self.expires = parse_time(request["expires_at"]) or time.time()
         self.source = source_runner()
-        self.hook = load_hook(self.source)
+        self.hook = (policy.load_frozen_hook(self.lease.dir / "runtime", request)
+                     if policy else load_hook(self.source))
         self.settings = runner_settings(self.source)
+        self.hook_digest = hashlib.sha256((self.lease.dir / "runtime/glaeda-cmux-runner-hook" if policy else
+                                           self.source / "glaeda-hooks/glaeda-cmux-runner-hook").read_bytes()).hexdigest()
+        if policy and not hasattr(self.hook, "capture_identity_refusal"):
+            raise Refusal("the installed runner hook predates capture leases")
         self.state_dir = Path.home() / ".local/state/glaeda/cmux-runner"  # the hook's default --state-dir
         self.capacity_dir = Path(self.settings["capacity_dir"] or Path(self.hook.FLEET_DIR) / "capacity")
         self.poll = float(os.environ.get(POLL_ENV) or STATUS_POLL_S)
         self.tick = min(TICK_S, self.poll)
         self.listener: subprocess.Popen | None = None
         # holder_file() and the waiter marker's who are this lease runner's
-        os.environ.update(RUNNER_NAME=request["runner_name"], GITHUB_JOB=JOB, GITHUB_RUN_ID=str(request["run_id"]))
+        os.environ.update(RUNNER_NAME=request["runner_name"], GITHUB_JOB=self.job, GITHUB_RUN_ID=str(request["run_id"]))
 
     def say(self, message: str) -> None:
         log(f"lease {self.lease_id}: {message}")
@@ -787,28 +823,35 @@ class Supervisor:
             self.update(phase="failed", reason="this mini has no weighted capacity ledger to take whole")
             return False
         hook_sha = hashlib.sha256((self.source / "glaeda-hooks/glaeda-cmux-runner-hook").read_bytes()).hexdigest()
-        if hook.signing_hook_listed(REPOSITORY, self.request["source_sha"], hook_sha) is False:
+        if not self.policy and hook.signing_hook_listed(REPOSITORY, self.request["source_sha"], hook_sha) is False:
             self.update(phase="failed", reason=f"{hook.SIGNING_HOOKS_PATH} at the source sha does not list this hook")
             return False
         me = hook.JobOwner.of(os.getpid())
         if me is None:
             self.update(phase="failed", reason="cannot pin the supervisor's own identity")
             return False
-        me = promotion_claim_owner(hook, self.lease, me)
+        me = promotion_claim_owner(hook, self.lease, me, self.policy)
         since = time.time()
         marker = self.capacity_dir / f"{hook.ADMIT_WANT}{os.getpid()}"
         shown = ""
         try:
             while True:
+                if self.policy and (why := self.policy.host_refusal(hook, total)):
+                    self.update(phase="failed", reason=why)
+                    return False
                 taken: dict[str, Any] = {}
                 held, note = hook.take_capacity(
-                    hook.HOST_LOCK, self.capacity_dir, total, JOB, me, self.state_dir,
-                    int(self.settings["compile_slots"]), int(self.settings["canonical_roots"]), REPOSITORY,
-                    hook.DEFAULT_HOME_REPO, workflow=WORKFLOW, taken_out=taken, klass=hook.EXCLUSIVE_CLASS,
-                    since=since, gui_token=self.settings["gui_token"], tier=hook.TIER_NIGHTLY,
+                    hook.HOST_LOCK, self.capacity_dir, total, self.job, me, self.state_dir,
+                    int(self.settings["compile_slots"]), int(self.settings["canonical_roots"]), self.repository,
+                    hook.DEFAULT_HOME_REPO, workflow=self.workflow, taken_out=taken, klass=hook.EXCLUSIVE_CLASS,
+                    since=since, gui_token=self.settings["gui_token"], tier="" if self.policy else hook.TIER_NIGHTLY,
                     keep_while=self.lease.dir)  # the holder also stays while an adopted Runner.Worker lives
                 if held:
                     stray = hook.stray_job_processes(Path.home(), os.getpid())
+                    if self.policy and (why := self.policy.host_refusal(hook, total)):
+                        hook.release_host_lock(self.state_dir)
+                        self.update(phase="failed", reason=why)
+                        return False
                     if stray is None or stray:
                         hook.release_host_lock(self.state_dir)
                         held, note = False, "an earlier job's processes still run in a runner's _work"
@@ -820,7 +863,8 @@ class Supervisor:
                 if note != shown:
                     self.say(f"waiting for the whole mini: {note[:300]}")
                     shown = note
-                hook.write_want(marker, since, list(taken.get("wants") or ["units"]), hook.TIER_NIGHTLY)
+                hook.write_want(marker, since, list(taken.get("wants") or ["units"]),
+                                "" if self.policy else hook.TIER_NIGHTLY)
                 time.sleep(min(CLAIM_POLL_S, max(0.0, self.expires - time.time())))
         finally:
             with contextlib.suppress(OSError):
@@ -831,6 +875,8 @@ class Supervisor:
             self.release_claim()
             self.update(phase="failed", reason="the claim's holder did not record itself")
             return False
+        if self.policy:
+            self.policy.reserve(self.lease, hook)
         self.update(phase="starting", holder_pid=holder, units=int(taken["units"]), units_total=total,
                     claimed_at=time.time())
         self.say(f"holding the whole mini ({note[:300]})")
@@ -855,18 +901,20 @@ class Supervisor:
         hooks = dest / "glaeda-hooks"
         hooks.mkdir()
         for name in ("glaeda-cmux-runner-hook", "glaeda_reservation.py"):
-            source = self.source / "glaeda-hooks" / name
+            source = (self.lease.dir / "runtime" if self.policy else self.source / "glaeda-hooks") / name
             if source.exists():
                 shutil.copy2(source, hooks / name)
         python = shlex.quote(self.settings["python"])
         hook = shlex.quote(os.fspath(hooks / "glaeda-cmux-runner-hook"))
-        common = (f" --promotion-lease {shlex.quote(os.fspath(self.lease.dir))} --no-disk"
+        lease_flag = "--capture-lease" if self.policy else "--promotion-lease"
+        common = (f" {lease_flag} {shlex.quote(os.fspath(self.lease.dir))} --no-disk"
                   f" --state-dir {shlex.quote(os.fspath(self.state_dir))}")
         started = ("#!/bin/bash\n"
                    "# glaeda-promotion-admit lease runner job-started hook (generated). It adopts the lease's exclusive\n"
                    "# claim for the one matching job and refuses any other; a non-zero exit fails the job first.\n"
-                   f"exec {python} {hook} job-started{common} --allowed-repo {shlex.quote(REPOSITORY)}"
-                   f" --capacity-dir {shlex.quote(os.fspath(self.capacity_dir))}\n")
+                   f"exec {python} {hook} job-started{common} --allowed-repo {shlex.quote(self.repository)}"
+                   f" --capacity-dir {shlex.quote(os.fspath(self.capacity_dir))}"
+                   f"{' --allow-event workflow_dispatch' if self.policy else ''}\n")
         completed = ("#!/bin/bash\n"
                      "# glaeda-promotion-admit lease runner job-completed hook (generated). Never fails the job.\n"
                      f"{python} {hook} job-completed{common} || true\n"
@@ -879,6 +927,10 @@ class Supervisor:
         (dest / ".path").write_text(WORKLOAD_PATH + "\n")
 
     def start_listener(self) -> None:
+        if self.policy:
+            copied = self.lease.runner_dir / "glaeda-hooks/glaeda-cmux-runner-hook"
+            if hashlib.sha256(copied.read_bytes()).hexdigest() != self.hook_digest:
+                raise Refusal("runner hook changed while preparing the capture lease")
         hooks = self.lease.runner_dir / "glaeda-hooks"
         env = {"HOME": os.fspath(Path.home()), "PATH": WORKLOAD_PATH, "LANG": "en_US.UTF-8",
                "USER": os.environ.get("USER", ""), "LOGNAME": os.environ.get("LOGNAME", ""),
@@ -988,7 +1040,8 @@ class Supervisor:
         a job is never adopted after this, and this never runs after one was. False when the listener has, or may
         have, a job. A listener that has a session (logged Listening for Jobs) is stopped only when session_ok: the
         controller released the lease (overflow, or parent_completed), or the claim is already lost or never was
-        whole (a dead holder, a failed start). A deadline alone never stops a listener that can take a job."""
+        whole (a dead holder, a failed start). Capture explicitly permits withdrawal on its admission deadline
+        only with this frozen unassigned proof; promotion still waits for controller authority."""
         with self.hook.promotion_locked(self.lease.dir, wait_s=60.0):
             self.owned()
             state = self.lease.state()
@@ -1025,14 +1078,18 @@ class Supervisor:
         self.cleanup()
 
     def cleanup(self) -> None:
+        if self.policy:
+            self.policy.unreserve(self.lease, self.hook)
         shutil.rmtree(self.lease.runner_dir, ignore_errors=True)
 
     def write_receipt(self) -> None:
         request = self.request
         receipt = {"lease_id": self.lease_id, "repository": request["repository"], "run_id": request["run_id"],
                    "run_attempt": request["run_attempt"], "source_sha": request["source_sha"],
-                   "ready_at": rfc3339(time.time()), "runners": {JOB: request["runner_label"]},
+                   "ready_at": rfc3339(time.time()), "runners": {self.job: request["runner_label"]},
                    "exclusive_claim": self.lease_id, "runner_name": request["runner_name"]}
+        if self.policy:
+            receipt.update(workflow=request["workflow"], job=self.job, ref=request["ref"], hook_sha256=self.hook_digest)
         write_json(self.lease.receipt_path, receipt)
         self.update(phase="ready", ready_at=receipt["ready_at"])
         self.say("ready: the listener is online and the whole mini is held; receipt written")
@@ -1050,14 +1107,38 @@ class Supervisor:
         hook = self.hook
         state = self.lease.state()
         adopted = state.get("adopted")
+        if self.policy and not self.holder_alive(state):
+            if not adopted and not state.get("assigned"):
+                return not self.withdraw("holder lost before adoption", phase="failed", session_ok=True)
+            if state.get("phase") != "quarantined":
+                self.update(phase="quarantined", reason="holder lost; durable reservation retains host")
+                self.say("holder lost; durable reservation retains host until cleanup")
+            group = listener_group(self.lease.runner_dir, state.get("listener_pid"), state.get("listener_identity"))
+            worker_gone = (hook.JobOwner(int(adopted["pid"]), str(adopted["identity"])).gone()
+                           if isinstance(adopted, dict) else group == [])
+            if worker_gone and group is not None and self.policy.cleaned(self.lease):
+                self.finish()
+                return False
+            return True
         if isinstance(adopted, dict):
             if self.lease.receipt() is None and self.online():
                 self.write_receipt()
             if hook.JobOwner(int(adopted["pid"]), str(adopted["identity"])).gone():
+                if self.policy and not self.policy.cleaned(self.lease):
+                    if state.get("phase") != "quarantined":
+                        self.update(phase="quarantined", reason="capture cleanup is not proven; retaining the whole host")
+                        self.say("quarantined: missing or invalid cleanup receipt; whole-host claim retained")
+                    return True
                 self.finish()
                 return False
             return True
         phase = state.get("phase")
+        if self.policy and phase == "quarantined":
+            if self.policy.cleaned(self.lease) and listener_group(
+                    self.lease.runner_dir, state.get("listener_pid"), state.get("listener_identity")) == []:
+                self.finish()
+                return False
+            return True
         if phase not in hook.PROMOTION_LIVE:
             return False
         if not self.holder_alive(state):
@@ -1072,15 +1153,25 @@ class Supervisor:
             if time.time() >= self.expires:
                 return not self.withdraw("expires_at passed before the listener was online", phase="expired")
             return True
-        # ready: a receipt was given, so the deadline releases nothing
+        # Promotion readiness waits for controller authority; capture expiry still
+        # requires a frozen proof of no assignment and never releases cleanup quarantine.
         if hook.runner_busy_now(self.lease.runner_dir):
             if not isinstance(state.get("assigned"), dict):
                 with hook.promotion_locked(self.lease.dir):
                     self.owned()
                     self.mark_assigned(self.lease.state(), "a Runner.Worker, or a request its listener took")
             return True  # a Runner.Worker (or a job its listener took) keeps the claim until it ends
+        if self.policy and isinstance(state.get("assigned"), dict) and not self.listener_pids():
+            if not self.policy.cleaned(self.lease):
+                if phase != "quarantined":
+                    self.update(phase="quarantined", reason="assigned capture has no cleanup receipt")
+                return True
         if not self.listener_pids():  # nothing can take the job here any more: never hold the mini for nothing
             return not self.withdraw("the listener exited with no adopted job", phase="failed")
+        if self.policy:
+            if time.time() >= self.expires:
+                return not self.withdraw("capture admission expired without a job", phase="expired", session_ok=True)
+            return True
         if time.monotonic() - last_status[0] < self.poll:
             return True
         last_status[0] = time.monotonic()
@@ -1140,16 +1231,16 @@ class Supervisor:
             time.sleep(self.tick)
 
 
-def supervise(lease_dir: Path) -> int:
+def supervise(lease_dir: Path, policy: Any = None) -> int:
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
     text = sys.stdin.read(MAX_REQUEST + 1)
     sys.stdin.close()
-    request = validate(json.loads(text), time.time())
+    request = policy.validate(json.loads(text), time.time()) if policy else validate(json.loads(text), time.time())
     lease = Lease(lease_dir.parent, lease_dir.name)
-    if lease.lease().get("fingerprint") != fingerprint(request) or lease_dir.name != request["lease_id"]:
+    if lease.lease().get("fingerprint") != fingerprint(request, policy) or lease_dir.name != request["lease_id"]:
         raise Refusal("the supervisor's request is not its lease's")
     try:
-        supervisor = Supervisor(lease_dir, request)
+        supervisor = Supervisor(lease_dir, request, policy)
     except Exception as error:  # noqa: BLE001 - nothing is held yet: say why, so the request ends at once
         why = str(error) if isinstance(error, Refusal) else type(error).__name__
         if recorded_supervisor(lease.dir) == os.getpid():  # never a second supervisor's write
@@ -1158,16 +1249,16 @@ def supervise(lease_dir: Path) -> int:
     return supervisor.run()
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, policy: Any = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     try:
         if argv == ["--request-stdin"]:
             text = sys.stdin.read(MAX_REQUEST + 1)
             if len(text) > MAX_REQUEST:
                 raise Refusal("invalid request: too large", 2)
-            return admit(text)
+            return admit(text, policy)
         if len(argv) == 2 and argv[0] == "--supervise":
-            return supervise(Path(argv[1]))
+            return supervise(Path(argv[1]), policy)
         print(f"usage: {PREFIX} --request-stdin", file=sys.stderr)
         return 2
     except Refusal as refusal:

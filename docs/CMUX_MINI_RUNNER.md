@@ -213,7 +213,50 @@ What `--apply` does:
      taking its own, any other job on that runner is refused, and the lease lets the claim go once the adopted
      Runner.Worker has exited. The claim's holder stays while that adopted Runner.Worker lives even if the lease's
      supervisor dies, a listener that exits while ready with no job lets the claim go, and the next request stops a
-     dead supervisor's leftover listener and removes its runner tree. See the helper's docstring for the request, receipt and withdrawal rules. The hook's `JOB_CORES` table gives a job its own measured
+     dead supervisor's leftover listener and removes its runner tree. See the helper's docstring for the request, receipt and withdrawal rules.
+     Protected staging capture uses a separate `glaeda-capture-admit` policy from
+     `~/glaeda-runner/scripts`, with the same exclusive holder and listener lifecycle.
+     It admits only HQ main's `pr-capture-cloud.yml/capture` and
+     `ios-screen-sharing-proof.yml/proof` for one exact run, attempt, workflow SHA and
+     unique runner. No account secret enters the admission request. The helper
+     rejects reserved hosts, dedicated-builder hosts and inconsistent capacity
+     ledgers. HQ also restricts candidates to dedicated owned test Macs and verifies
+     console, Secure Enclave and existing capture permissions before credentials.
+     Its hook exports `GLAEDA_CAPTURE_LEASE_ID`, `GLAEDA_CAPTURE_CLEANUP_PATH`, the
+     exclusive claim and hook digest. HQ pins the helper, shared lifecycle, hook and
+     reservation parser bytes (`runtime_sha256`) and the quarantine-aware fleet
+     `with-host-lock` (`host_lock_sha256`). The adapter refuses mismatched installed
+     bytes, freezes the four runtime files per lease, and runs that immutable
+     generation through cleanup despite OTA. HQ checks the readiness receipt before the protected
+     credential step. The application source/artifact identity is a separate HQ
+     binding; `source_sha` here always means the HQ workflow SHA.
+     Capture's admission window is at most 900 seconds. Only a proven-unassigned
+     listener can expire; an assigned job holds the whole host through its execution
+     and cleanup. The workflow writes a version-1 cleanup receipt atomically to the
+     exported path only after verifying its run-owned app/account state is removed.
+     It binds lease_id, repository, run_id, run_attempt, source_sha, workflow, job,
+     runner_name and `cleaned: true`. Missing/mismatched cleanup after worker exit
+     quarantines the host and retains its exclusive holder, including after a
+     supervisor crash. Before its listener starts it creates the shared
+     `reservation.json` exclusively under `.reservation.lock`, with owner
+     `glaeda-capture-admit` and its exact lease id. That durable marker survives
+     holder death/reboot and holds ordinary runner, worker and `with-host-lock`
+     admission until verified cleanup or proven-unassigned withdrawal removes it.
+     The holder's ordinary five-day deadline never releases capture quarantine.
+     Never kill the holder to clear that state. After protected
+     cleanup supplies the verified receipt, a live supervisor releases naturally;
+     `glaeda-capture-admit --recover LEASE_ID` recovers a dead supervisor only after
+     checking that receipt and proving the old listener/worker gone. It cannot
+     synthesize cleanup or unlock a live/unknown owner. The workflow's own timeout
+     bounds active execution; it never converts failed cleanup into a free host.
+     Detector: `scripts/test-glaeda-capture-admit.py` runs a fake listener against
+     real flock tokens, including wrong identities, expiry, holder loss, runtime
+     changes and cleanup quarantine. Set `HQ_CAPTURE_ADMISSION` to the companion
+     `build-fleet/pr_capture/capture_admission.py` and run the two
+     `test_real_hq_*_receipt_contract` cases to exercise real producer/consumer
+     readiness and exported-claim checks for both workflows. Deployment requires both the Glaeda OTA and
+     HQ fleet-helper receipts before any staging account run.
+     The hook's `JOB_CORES` table gives a job its own measured
      cost where it is far from its class's: cmux-next's generated files, both autofix
      workflows' action exports and cmux-tui's `macos` 6, cmux-next's `fast-tier` (off the fast
      runner) and `daemon-test` 5, `cmux-scheme-compile`, the iOS builds, cmux-tui's `macos-relay`
