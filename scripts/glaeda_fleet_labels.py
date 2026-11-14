@@ -491,10 +491,14 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
                       "(a gateway runner takes pull request jobs) in the default pool namespace (no poolPrefix)")
     if not (isinstance(sim, int) and not isinstance(sim, bool) and 0 <= sim <= MAX_SIM_RUNNERS):
         return None, f"runner.classes.{klass}.simRunners must be 0 to {MAX_SIM_RUNNERS}"
+    # Only a member that can boot the declared runtimes gets one (IOS_SIM_LABEL), and that is decided before the
+    # placement check: simRunners is a class default, so every member of the class reads it, and a member with no
+    # simulator (a trustedRef nightly host) is not misconfigured by it. On 2026-11-14 the check ran first and held
+    # cmux15, the nightly host, out of every runner-heal pass ("simRunners needs a dedicated runner").
+    sim = sim if ios_sim else 0
     if sim and (trusted_ref is not None or availability != "dedicated" or normal_pool_prefix):
         return None, (f"{member} runner.classes.{klass}.simRunners needs a dedicated runner without trustedRef "
                       "(a sim-first runner takes pull request jobs) in the default pool namespace (no poolPrefix)")
-    sim = sim if ios_sim else 0  # only a member that can boot the declared runtimes gets one (IOS_SIM_LABEL)
     if compile_slots > roots:
         return None, (f"runner.classes.{klass}.compileSlots {compile_slots} needs canonicalRoots {compile_slots} "
                       "(every compile holds a root)")

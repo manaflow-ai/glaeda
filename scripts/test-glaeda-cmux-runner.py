@@ -15899,6 +15899,14 @@ class FleetLabelsModuleTest(unittest.TestCase):
         manifest["defaults"]["runner"] = {"classes": {"std": std}}
         no_role = fleet_labels.member_labels(manifest, "mini-std", lambda app: True)[0]
         self.assertEqual((no_role["simRunners"], no_role["simPools"]), (0, []), "no ios-simulators role: none")
+        # The class default reaches a trustedRef member with no simulator (cmux15, the nightly host): it gets none
+        # and still gets its summary, instead of being held out of runner heal.
+        manifest["hosts"]["mini-std"]["overrides"] = {"runner": {"trustedRef": "refs/heads/main",
+                                                                 "trustedRepo": "manaflow-ai/cmux"}}
+        trusted, why = fleet_labels.member_labels(manifest, "mini-std", lambda a: True)
+        self.assertIsNotNone(trusted, why)
+        self.assertEqual(trusted["simRunners"], 0)
+        del manifest["hosts"]["mini-std"]["overrides"]
         manifest["hosts"]["mini-std"]["roles"].append("ios-simulators")
         manifest["defaults"]["ios_simulator"] = {"runtimes": ["23F77"]}
         std["simRunners"] = 0
