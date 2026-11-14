@@ -433,6 +433,9 @@ WORKFLOW_JOB_CLASSES = {# the iOS reliability matrix's phone cells: cargo builds
                         # in one booted simulator, so a simulator step's units and the simulator token. As an unknown
                         # job it was a compile (5 units, persistent-dd and a canonical root, no simulator token).
                         ("ios-reliability-matrix.yml", "ios"): "simulator-step",
+                        # The App Review gate's secret-free walk (cmux#43109; the credentialed reviewer-path stays
+                        # on Blacksmith): builds the NEXT app, then walks it in one booted simulator per family.
+                        ("ios-review-gate.yml", "walk"): "simulator-step",
                         ("cmux-tui.yml", "lint"): "isolated", ("cmux-tui.yml", "test"): "isolated",
                         ("cmux-tui.yml", "build"): "isolated", ("cmux-tui.yml", "cdp-browser-smoke"): "isolated",
                         ("cmux-tui.yml", "macos-relay"): "isolated",

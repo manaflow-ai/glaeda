@@ -3620,6 +3620,8 @@ class HookTest(unittest.TestCase):
         matrix = {"GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/ios-reliability-matrix.yml@refs/heads/x"}
         self.assertEqual(hook.job_class("ios", "manaflow-ai/cmux", workflow="ios-reliability-matrix.yml"),
                          ("simulator-step", False))
+        self.assertEqual(hook.job_class("walk", "manaflow-ai/cmux", workflow="ios-review-gate.yml"),
+                         ("simulator-step", False))
         for job, env in (("ios-simulator-build", test_ios), ("mobile-core-package", test_ios),
                          ("release-compile", self.FAST_TIER), ("ios", self.FAST_TIER)):
             with self.subTest(job=job):
