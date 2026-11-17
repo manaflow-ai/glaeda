@@ -1291,16 +1291,24 @@ def runner_jobs_in_flight(home: Path, own: Path, table: dict[int, tuple[int, str
     any runner install in home other than own (a job running), and each other install there that listens with no
     Worker and sorts before own (an idle listener that may take a job in the same burst: every idle listener counts
     the ones before it, so a burst of N jobs is admitted only while N jobs' disk is free, not N times one job's)."""
+    running, listening = runner_jobs_in_flight_detail(home, own, table)
+    return len(running) + listening
+
+
+def runner_jobs_in_flight_detail(home: Path, own: Path,
+                                 table: dict[int, tuple[int, str]]) -> tuple[list[tuple[str, int]], int]:
+    """runner_jobs_in_flight's parts: each running job as (its runner install's name, its Runner.Worker pid), and the
+    number of idle pool listeners that sort before own."""
     prefix = r"(?:^|\s)" + re.escape(os.fspath(home)) + r"/(actions-runner[^/\s]*)/bin(?:\.[^/\s]+)?/Runner\."
-    workers, listeners = set(), set()
-    count = 0
-    for _ppid, command in table.values():
+    running: list[tuple[str, int]] = []
+    listeners = set()
+    for pid, (_ppid, command) in table.items():
         if (match := re.search(prefix + r"Worker(?:\s|$)", command)) and match.group(1) != own.name:
-            workers.add(match.group(1))
-            count += 1
+            running.append((match.group(1), pid))
         elif (match := re.search(prefix + r"Listener(?:\s|$)", command)) and match.group(1) != own.name:
             listeners.add(match.group(1))
-    return count + sum(1 for name in listeners - workers if name < own.name and pool_listener(home / name))
+    workers = {name for name, _pid in running}
+    return running, sum(1 for name in listeners - workers if name < own.name and pool_listener(home / name))
 
 
 def pool_listener(runner_dir: Path) -> bool:
@@ -1316,14 +1324,123 @@ def runner_jobs_need_gib(in_flight: int, per_job_gib: float) -> float:
     return round(RUNNER_JOBS_FLOOR_GIB + per_job_gib * (in_flight + 1), 1)
 
 
-def runner_jobs_refusal(free: float, in_flight: int, per_job_gib: float, source: str) -> str | None:
-    """Why an idle listener takes no job for disk with in_flight jobs running beside it (RUNNER_JOBS_DISK), or None."""
-    need = runner_jobs_need_gib(in_flight, per_job_gib)
+def runner_jobs_refusal(free: float, in_flight: int, per_job_gib: float, source: str,
+                        written_gib: float = 0.0) -> str | None:
+    """Why an idle listener takes no job for disk with in_flight jobs running beside it (RUNNER_JOBS_DISK), or None.
+    written_gib is what the running jobs have already written of their p95 (RUNNER_JOB_WRITTEN): it is gone from free
+    disk already, so it is not reserved a second time."""
+    need = round(runner_jobs_need_gib(in_flight, per_job_gib) - written_gib, 1)
     if free >= need:
         return None
+    less = (f", less {written_gib:g} GiB the running jobs already wrote (RUNNER_JOB_WRITTEN)"
+            if written_gib > 0 else "")
     return (f"{free:.1f} GiB free, {need:g} GiB required: {RUNNER_JOBS_FLOOR_GIB:g} GiB + {per_job_gib:g} GiB "
-            f"for each of {in_flight} runner job{'s' if in_flight != 1 else ''} in flight (or listening first) and this one "
-            f"({RUNNER_JOB_DISK_NAME}: {source})")
+            f"for each of {in_flight} runner job{'s' if in_flight != 1 else ''} in flight (or listening first) and this one"
+            f"{less} ({RUNNER_JOB_DISK_NAME}: {source})")
+
+
+# RUNNER_JOB_WRITTEN ("reservation counted twice"; Leo: "disk floors and probes warn, never refuse"). RUNNER_JOBS_DISK
+# charged a running job its full p95 even after it had written that space, so its bytes counted twice: once as gone
+# from free disk, once more as a reservation. 2026-11-17 12:36Z-12:55Z: light minis cmux17, cmux18, cmux19 and cmux21
+# (228 GiB disks resting at 25-35 GiB free, every idle cache already deleted, the space the running jobs' spm-scratch)
+# held side-std listeners for disk while 160 side-std jobs queued and their CPUs ran under 60%. A running job is now
+# charged its remaining growth, max(0, p95 - what it already wrote). Its own sampler measures that, not each gate:
+# at start it reads its runner's _work (du, bounded), and every JOB_WRITTEN_EVERY_S it reads it again together with the
+# owned SwiftPM scratch its packages' .build links point at (readlink only to find them; a root first seen mid-job is
+# measured from then, so it can only read less written). Written is that growth capped by the job's own free-disk
+# drop since admission, so an APFS clone du counts whole (a DerivedData seed) never reads as written. The sampler
+# writes it to JOB_WRITTEN_FILE for its runner; a gate trusts it only for the same live Runner.Worker and while it is
+# fresh. No file, another Worker, a stale or unreadable one: the full p95, as before.
+JOB_WRITTEN_SCHEMA = "glaeda-job-written/v1"
+JOB_WRITTEN_FILE = "job-written-{runner}.json"
+JOB_WRITTEN_EVERY_S = 180.0  # a warm cmux _work's du took 3.1 s on cmux18 (DISK_SHAPE_DU_TIMEOUT_S)
+JOB_WRITTEN_DU_TIMEOUT_S = 15.0
+JOB_WRITTEN_FRESH_S = 3 * JOB_WRITTEN_EVERY_S  # older: the sampler stopped measuring; charge the full p95
+JOB_WRITTEN_MAX_PACKAGES = 64
+
+
+def job_written_file(state_dir: Path, runner_name: str) -> Path:
+    name = "".join(c for c in runner_name if c.isalnum() or c in "-_.")
+    return state_dir / JOB_WRITTEN_FILE.format(runner=name)
+
+
+def job_scratch_roots(workspace: Path) -> list[Path]:
+    """The owned SwiftPM scratch roots (STORE/spm-scratch/<fingerprint>) the job's packages link their .build to
+    (cmux owned_spm_scratch.py link: Packages/*/*/.build), found by readlink alone, never by walking a tree."""
+    roots: list[Path] = []
+    try:
+        for n, build in enumerate(workspace.glob("Packages/*/*/.build")):
+            if n >= JOB_WRITTEN_MAX_PACKAGES:
+                break
+            if not build.is_symlink():
+                continue
+            target = Path(os.readlink(build))
+            root = (target if target.is_absolute() else build.parent / target).parent
+            if root.parent.name == "spm-scratch" and root not in roots:
+                roots.append(root)
+    except OSError:
+        pass
+    return roots
+
+
+class JobWritten:
+    """What one running job has written so far (RUNNER_JOB_WRITTEN): the growth of its runner's _work and of the owned
+    SwiftPM scratch it links, from a baseline taken when each was first seen."""
+
+    def __init__(self, work: Path, workspace: Path | None,
+                 du: Callable[[Path, float], float | None] = work_gib) -> None:
+        self.work, self.workspace, self.du = work, workspace, du
+        self.base: dict[Path, float] = {}
+        start = du(work, JOB_WRITTEN_DU_TIMEOUT_S)
+        if start is not None:
+            self.base[work] = start
+
+    def written(self, free_drop: float | None) -> float | None:
+        """GiB written since the job started, at most its free_drop; None when _work has no baseline or reading."""
+        if self.work not in self.base or free_drop is None:
+            return None
+        for root in job_scratch_roots(self.workspace) if self.workspace is not None else []:
+            if root not in self.base and (size := self.du(root, JOB_WRITTEN_DU_TIMEOUT_S)) is not None:
+                self.base[root] = size
+                continue  # its baseline is now: nothing written yet as far as this reading knows
+        total = 0.0
+        for path, base in self.base.items():
+            now = self.du(path, JOB_WRITTEN_DU_TIMEOUT_S)
+            if now is None:
+                if path == self.work:
+                    return None
+                continue  # an unread scratch root counts nothing written: the safe side
+            total += max(0.0, now - base)
+        return round(max(0.0, min(total, free_drop)), 2)
+
+
+def write_job_written(state_dir: Path, runner_name: str, worker_pid: int, written: float, now: float) -> None:
+    path = job_written_file(state_dir, runner_name)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}")
+    tmp.write_text(json.dumps({"schema": JOB_WRITTEN_SCHEMA, "worker_pid": worker_pid, "written_gib": written,
+                               "at": round(now, 1)}))
+    os.replace(tmp, path)
+
+
+def job_written_gib(state_dir: Path, runner_name: str, worker_pid: int, now: float | None = None) -> float | None:
+    """What the job of runner_name's Runner.Worker worker_pid has written (RUNNER_JOB_WRITTEN), or None (unmeasured:
+    no file, another Worker's, stale or malformed)."""
+    try:
+        raw = read_bounded(job_written_file(state_dir, runner_name), 4096)
+        if raw is None:
+            return None
+        doc = json.loads(raw)
+    except (OSError, ValueError, UnicodeDecodeError, RecursionError):
+        return None
+    if not isinstance(doc, dict) or doc.get("schema") != JOB_WRITTEN_SCHEMA or doc.get("worker_pid") != worker_pid:
+        return None
+    at, written = doc.get("at"), doc.get("written_gib")
+    if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in (at, written)):
+        return None
+    age = (time.time() if now is None else now) - at
+    if not -5 <= age <= JOB_WRITTEN_FRESH_S or written < 0:
+        return None
+    return float(written)
 
 
 # LABEL_DISK: `label-disk-samples` reads each label's measured job disk growth on a mini, `label-disk-table` pools the
@@ -9031,11 +9148,16 @@ class Gate:
         if free >= runner_jobs_need_gib(max(0, len(runner_dirs(home)) - 1), per):
             return None
         try:
-            in_flight = runner_jobs_in_flight(home, self.runner_dir, processes())
+            running, listening = runner_jobs_in_flight_detail(home, self.runner_dir, processes())
         except Exception:  # noqa: BLE001
             return None
-        why = runner_jobs_refusal(free, in_flight, per, source)
-        return (why, runner_jobs_need_gib(in_flight, per)) if why else None
+        # RUNNER_JOB_WRITTEN: a running job is charged only what it has still to write of its p95
+        now = time.time()
+        written = round(sum(min(per, job_written_gib(self.state_dir, name, pid, now) or 0.0)
+                            for name, pid in running), 1)
+        in_flight = len(running) + listening
+        why = runner_jobs_refusal(free, in_flight, per, source, written)
+        return (why, round(runner_jobs_need_gib(in_flight, per) - written, 1)) if why else None
 
     def evict_idle_in_background(self, path: str, target: float) -> None:
         """Below a builder's floor or reserve, reclaim idle PR runners' _work in a bounded thread
@@ -10845,8 +10967,10 @@ def job_event(event: str, meta: dict[str, Any], log: Path = JOB_LOG, **fields: A
 
 
 def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Path = JOB_LOG,
-                  interval: float = SAMPLE_S, disk_path: str | None = None) -> str:
-    """Fork the detached sampler. Best effort: returns a note, never raises, never fails the job."""
+                  interval: float = SAMPLE_S, disk_path: str | None = None, workspace: str | None = None) -> str:
+    """Fork the detached sampler. Best effort: returns a note, never raises, never fails the job. With workspace
+    (GITHUB_WORKSPACE, <runner>/_work/<repo>/<repo>) and disk_path it also reports what the job has written
+    (RUNNER_JOB_WRITTEN)."""
     try:
         pid_file = sampler_file(state_dir)
         state_dir.mkdir(parents=True, exist_ok=True)
@@ -10871,6 +10995,12 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
         samples = JobSamples(meta, os.cpu_count() or 1, started, interval)
         if disk_path:
             samples.disk_free_start = free_or_none(disk_path)
+        written = None  # RUNNER_JOB_WRITTEN: (the runner's name, the job's JobWritten)
+        with contextlib.suppress(Exception):
+            ws = Path(workspace) if workspace else None
+            if disk_path and ws is not None and ws.parent.parent.name == "_work":
+                written = (ws.parent.parent.parent.name, JobWritten(ws.parent.parent, ws))
+        written_at = time.monotonic()
         deadline = time.monotonic() + HOLDER_MAX_S
         tick = 0
         dynamic_units = admitted_units = int(meta.get("units") or 0)
@@ -10927,6 +11057,10 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
                     limited = thermal_limited()
                     if limited is not None:
                         samples.thermal = bool(samples.thermal) or limited
+                if written is not None and time.monotonic() - written_at >= JOB_WRITTEN_EVERY_S:
+                    written_at = time.monotonic()
+                    report_job_written(written[1], state_dir, written[0], watch_pid, disk_path,
+                                       samples.disk_free_start)
             except Exception:  # noqa: BLE001  (a bad sample is skipped, not fatal)
                 pass
             tick += 1
@@ -10957,6 +11091,9 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
                 time.sleep(min(1.0, left))
             if finished:
                 break
+        if written is not None:
+            with contextlib.suppress(OSError):
+                job_written_file(state_dir, written[0]).unlink()
         if disk_path:
             samples.disk_free_end = free_or_none(disk_path)
         record = samples.summary(time.time())
@@ -10979,6 +11116,21 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
             if pid_file.read_text().strip() == str(os.getpid()):
                 pid_file.unlink()
         os._exit(0)
+
+
+def report_job_written(tracker: JobWritten, state_dir: Path, runner_name: str, worker_pid: int,
+                       disk_path: str | None, free_start: float | None) -> float | None:
+    """RUNNER_JOB_WRITTEN: measure what the job has written (capped by its free-disk drop since admission) and write
+    it for the other runners' gates; unmeasured, the file is removed, so they charge the full p95."""
+    free = free_or_none(disk_path) if disk_path else None
+    drop = None if free is None or free_start is None else free_start - free
+    value = tracker.written(drop)
+    if value is None:
+        with contextlib.suppress(OSError):
+            job_written_file(state_dir, runner_name).unlink()
+        return None
+    write_job_written(state_dir, runner_name, worker_pid, value, time.time())
+    return value
 
 
 def finish_sampler(state_dir: Path, wait_s: float = 5.0) -> str:
@@ -12441,7 +12593,8 @@ def main(argv: list[str] | None = None) -> int:
             except Exception:  # noqa: BLE001
                 pass
             note = start_sampler(owner.pid, args.state_dir, meta, args.job_log,
-                                 disk_path=None if args.no_disk else disk_path)
+                                 disk_path=None if args.no_disk else disk_path,
+                                 workspace=os.environ.get("GITHUB_WORKSPACE"))
             print(f"{PREFIX}: {note}", flush=True)
     else:
         if telemetry:

@@ -10598,6 +10598,79 @@ class GateTest(unittest.TestCase):
         self.assertIsNone(answers[names[1]], "the second counts the first: 20.6 GiB")
         self.assertIn("25.9 GiB required", answers[names[2]] or "", "the third would not fit beside them")
 
+    def test_a_running_job_is_charged_only_what_it_has_still_to_write(self) -> None:
+        """RUNNER_JOB_WRITTEN ("reservation counted twice"; Leo: "disk floors and probes warn, never refuse").
+        2026-11-17 12:36Z-12:55Z cmux17/18/19/21 held side-std listeners at 25-35 GiB free while 160 jobs queued: a
+        running job's full p95 was reserved although it had already written it. A job that wrote 5 GiB of its 5.3 is
+        charged 0.3; an unmeasured one (no file, another Worker's, stale) still the full 5.3; the next job always 5.3."""
+        write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 14\n")
+        for name in ("actions-runner-glaeda-2", "actions-runner-glaeda-3"):
+            (self.tmp / name).mkdir()
+        disk = self.runner_job_disk_file(5.3)
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        table = self.workers("actions-runner-glaeda-2", "actions-runner-glaeda-3")  # Workers 100 and 101
+        free = {"gib": 21.0}
+        usage = lambda _path: mock.Mock(free=int(free["gib"] * 1024**3))  # noqa: E731
+        now = time.time()
+        with mock.patch.object(hook.shutil, "disk_usage", side_effect=usage), \
+                mock.patch.object(hook, "processes", return_value=table), \
+                mock.patch.object(gate, "evict_in_background"), \
+                mock.patch.dict(os.environ, {hook.DISK_JOB_PEAK_ENV: "20", hook.RUNNER_JOB_DISK_ENV: os.fspath(disk)}):
+            self.assertIn("21.0 GiB free, 25.9 GiB required", gate.low_disk() or "", "unmeasured: full p95 each")
+            hook.write_job_written(self.state, "actions-runner-glaeda-2", 100, 5.0, now)
+            self.assertAlmostEqual(hook.job_written_gib(self.state, "actions-runner-glaeda-2", 100), 5.0)
+            self.assertIsNone(gate.low_disk(), "10 + 0.3 + 5.3 + 5.3 = 20.9 GiB: the written 5 GiB is not reserved again")
+            free["gib"] = 20.5
+            why = gate.low_disk()
+            self.assertIn("20.5 GiB free, 20.9 GiB required", why or "")
+            self.assertIn("less 5 GiB the running jobs already wrote (RUNNER_JOB_WRITTEN)", why or "")
+            hook.write_job_written(self.state, "actions-runner-glaeda-2", 100, 9.0, now)
+            free["gib"] = 20.7
+            self.assertIn("20.9 GiB required", gate.low_disk() or "", "past its p95 a job is charged 0, never less")
+            free["gib"] = 21.0
+            hook.write_job_written(self.state, "actions-runner-glaeda-2", 77, 5.0, now)
+            self.assertIn("25.9 GiB required", gate.low_disk() or "", "another Worker's file: the full p95")
+            hook.write_job_written(self.state, "actions-runner-glaeda-2", 100, 5.0,
+                                   now - hook.JOB_WRITTEN_FRESH_S - 60)
+            self.assertIn("25.9 GiB required", gate.low_disk() or "", "a stale file: the full p95")
+            hook.job_written_file(self.state, "actions-runner-glaeda-2").write_text("{nope")
+            self.assertIn("25.9 GiB required", gate.low_disk() or "", "a malformed file: the full p95")
+            # the new job and a listener before it are never discounted, whatever files exist
+            hook.write_job_written(self.state, self.runner.name, 100, 5.0, now)
+            hook.write_job_written(self.state, "actions-runner-glaeda-3", 4242, 5.0, now)
+            self.assertIn("25.9 GiB required", gate.low_disk() or "")
+
+    def test_a_job_measures_what_it_wrote_in_its_work_and_linked_scratch(self) -> None:
+        """The sampler's side of RUNNER_JOB_WRITTEN: _work's and the linked spm-scratch root's growth since first seen,
+        capped by the job's free-disk drop (an APFS clone du counts whole never reads as written); no _work reading:
+        unmeasured, and the file goes so the gates charge the full p95."""
+        runner = self.tmp / "actions-runner-glaeda-2"
+        workspace = runner / "_work/cmux/cmux"
+        package = workspace / "Packages/CmuxNext/Core"
+        package.mkdir(parents=True)
+        scratch = self.tmp / "store/spm-scratch/fp1"
+        (scratch / "Packages__CmuxNext__Core").mkdir(parents=True)
+        sizes = {runner / "_work": 10.0, scratch: 3.0}
+        du = lambda path, _timeout: sizes.get(path)  # noqa: E731
+        tracker = hook.JobWritten(runner / "_work", workspace, du)
+        sizes[runner / "_work"] = 12.0
+        self.assertEqual(tracker.written(50.0), 2.0, "no scratch linked yet: _work's growth")
+        (package / ".build").symlink_to(scratch / "Packages__CmuxNext__Core", target_is_directory=True)
+        self.assertEqual(hook.job_scratch_roots(workspace), [scratch])
+        self.assertEqual(tracker.written(50.0), 2.0, "a scratch root first seen now counts from now")
+        sizes[scratch] = 6.0
+        self.assertEqual(tracker.written(50.0), 5.0)
+        self.assertEqual(tracker.written(1.5), 1.5, "capped by the free-disk drop: clones cost nothing")
+        self.assertIsNone(tracker.written(None), "no free-disk reading: unmeasured")
+        with mock.patch.object(hook, "free_or_none", return_value=40.0):
+            self.assertEqual(hook.report_job_written(tracker, self.state, runner.name, 321, "/", 45.0), 5.0)
+        self.assertEqual(hook.job_written_gib(self.state, runner.name, 321), 5.0, "the gates read what it wrote")
+        sizes.pop(runner / "_work")
+        with mock.patch.object(hook, "free_or_none", return_value=40.0):
+            self.assertIsNone(hook.report_job_written(tracker, self.state, runner.name, 321, "/", 45.0))
+        self.assertFalse(hook.job_written_file(self.state, runner.name).exists(), "unmeasured: the file goes")
+        self.assertIsNone(hook.JobWritten(runner / "_work", workspace, du).written(50.0), "no baseline: unmeasured")
+
     def test_an_installed_hook_reads_the_staged_runner_job_disk(self) -> None:
         """The hook runs from ~/actions-runner-glaeda-K/glaeda-hooks/; the json is the staged runner copy in
         ~/glaeda-runner/scripts."""
