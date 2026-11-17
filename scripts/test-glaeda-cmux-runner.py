@@ -4483,6 +4483,32 @@ class HookTest(unittest.TestCase):
                 self.finish(runner)
         self.assertTrue(self.lock_free())
 
+    def test_launch_smokes_light_jobs_run_beside_a_compile(self) -> None:
+        """nightly-next-launch-smoke.yml's pick (reads the feed and the workflow's runs with the job token), record
+        (writes a marker and saves it to the cache) and crashed (a rollback dispatch and an issue) build nothing on
+        the nightly slot. As unknown jobs they were compiles: cmux run 44021676892's pick was refused with "is in no
+        job table of this hook, so it is costed as a compile: 5 units" and 4 of 14 units free."""
+        self.fleet()
+        name = "nightly-next-launch-smoke.yml"
+        ref = {"GITHUB_WORKFLOW_REF": f"manaflow-ai/cmux/.github/workflows/{name}@refs/heads/main"}
+        runners = ["r0"]
+        try:
+            compile_ = self.job("macos-compile-admission", "r0", 14, None, env={
+                "GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/ci.yml@refs/heads/main"})
+            self.assertIn("holding 5/14 units+persistent-dd+root-1 for macos-compile-admission (", compile_.stdout)
+            for index, job in enumerate(("pick", "record", "crashed")):
+                with self.subTest(job=job):
+                    self.assertEqual(hook.job_class(job, "manaflow-ai/cmux", workflow=name), ("light", False))
+                    runners.append(f"s{index}")
+                    done = self.job(job, runners[-1], 14, None, env=ref)
+                    self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                    self.assertIn(f"for {job} (light", done.stdout)
+                    self.assertNotIn("is in no job table", done.stdout)
+        finally:
+            for runner in runners:
+                self.finish(runner)
+        self.assertTrue(self.lock_free())
+
     def test_capacity_a_job_cost_override_keeps_its_class_tokens(self) -> None:
         """cli-regressions is an unknown job (a compile, pinned to root 1) that measures 0.16 cores: it costs 1 core
         but still holds persistent-dd and the root, so a compile still waits for those, not for cores."""

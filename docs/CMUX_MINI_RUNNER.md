@@ -757,7 +757,8 @@ a dispatch of them keeps the ordinary tier), and the Release compile that gates
 nightly-next's promotion). The canary and the smoke are `isolated` jobs (4 units, no
 token) and wait at most `NIGHTLY_CAPACITY_WAIT_S` on any attempt, since a nightly
 waiter holds every other gate on its mini; a refused one is re-run by cmux's
-owned-pool rescue, and the re-run takes Blacksmith.
+owned-pool rescue, and the re-run takes Blacksmith. The launch smoke's `pick`,
+`record` and `crashed` jobs share its slot and build nothing, so they are `light`.
 The DEV daily's Mac jobs (`verify`, `tip-dmg-build`) are `light` (they work only
 in `$RUNNER_TEMP`) and wait up to `NIGHTLY_CAPACITY_WAIT_S` on main's dispatch. GitHub
 hands a queued job to the next idle runner in arrival order, so a nightly job

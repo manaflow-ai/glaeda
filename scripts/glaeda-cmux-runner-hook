@@ -567,6 +567,14 @@ WORKFLOW_JOB_CLASSES = {# the iOS reliability matrix's phone cells: cargo builds
                         # kept DerivedData. As unknown jobs they were compiles (5 units, persistent-dd and a root).
                         ("nightly-next-canary.yml", "canary"): "isolated",
                         ("nightly-next-launch-smoke.yml", "smoke"): "isolated",
+                        # The launch smoke's other jobs share the smoke's nightly slot and build nothing: pick checks
+                        # out scripts/ci and reads the feed and this workflow's runs with the job token, record writes
+                        # a marker file and saves it to the cache, crashed dispatches the rollback and files an issue.
+                        # As unknown jobs they were compiles (5 units, persistent-dd and a root): cmux run
+                        # 44021676892's pick was refused with 4 of 14 units free.
+                        ("nightly-next-launch-smoke.yml", "pick"): "light",
+                        ("nightly-next-launch-smoke.yml", "record"): "light",
+                        ("nightly-next-launch-smoke.yml", "crashed"): "light",
                         ("nightly.yml", "verify-signed-nightly"): "light",
                         # the release-surface ack gate only waits for an environment approval: no key, no build
                         ("nightly.yml", "await-release-surface-ack"): "light",
