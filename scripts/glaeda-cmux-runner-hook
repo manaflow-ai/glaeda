@@ -1416,6 +1416,7 @@ class JobWritten:
 def write_job_written(state_dir: Path, runner_name: str, worker_pid: int, written: float, now: float) -> None:
     path = job_written_file(state_dir, runner_name)
     tmp = path.with_name(f".{path.name}.{os.getpid()}")
+    state_dir.mkdir(parents=True, exist_ok=True)
     tmp.write_text(json.dumps({"schema": JOB_WRITTEN_SCHEMA, "worker_pid": worker_pid, "written_gib": written,
                                "at": round(now, 1)}))
     os.replace(tmp, path)
