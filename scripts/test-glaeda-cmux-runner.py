@@ -10626,7 +10626,9 @@ class GateTest(unittest.TestCase):
             self.assertIn("less 5 GiB the running jobs already wrote (RUNNER_JOB_WRITTEN)", why or "")
             hook.write_job_written(self.state, "actions-runner-glaeda-2", 100, 9.0, now)
             free["gib"] = 20.7
-            self.assertIn("20.9 GiB required", gate.low_disk() or "", "past its p95 a job is charged 0, never less")
+            self.assertIsNone(gate.low_disk(), "past its p95 a job is charged 0: 10 + 0 + 5.3 + 5.3 = 20.6")
+            free["gib"] = 20.5
+            self.assertIn("20.5 GiB free, 20.6 GiB required", gate.low_disk() or "", "charged 0, never less")
             free["gib"] = 21.0
             hook.write_job_written(self.state, "actions-runner-glaeda-2", 77, 5.0, now)
             self.assertIn("25.9 GiB required", gate.low_disk() or "", "another Worker's file: the full p95")

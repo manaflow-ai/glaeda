@@ -1401,8 +1401,7 @@ class JobWritten:
             return None
         for root in job_scratch_roots(self.workspace) if self.workspace is not None else []:
             if root not in self.base and (size := self.du(root, JOB_WRITTEN_DU_TIMEOUT_S)) is not None:
-                self.base[root] = size
-                continue  # its baseline is now: nothing written yet as far as this reading knows
+                self.base[root] = size  # its baseline is now: anything it wrote before reads as unwritten (safe)
         total = 0.0
         for path, base in self.base.items():
             now = self.du(path, JOB_WRITTEN_DU_TIMEOUT_S)
