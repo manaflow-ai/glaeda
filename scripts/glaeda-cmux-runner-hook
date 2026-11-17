@@ -7833,9 +7833,12 @@ def urgent_queued(summary: dict[str, Any] | None, labels: frozenset[str] | None,
     return False
 
 
-def oldest_queued_s(summary: dict[str, Any] | None, labels: frozenset[str] | None, now: float) -> float | None:
-    """How long the longest-waiting queued job this runner could take has waited, in a fresh feed (a lost delivery,
-    older than HOST_LOAD_CAP_JOB_MAX_AGE_S, does not count), or None when none waits or the feed cannot say."""
+def oldest_queued_s(summary: dict[str, Any] | None, labels: frozenset[str] | None, now: float,
+                    max_age: float | None = HOST_LOAD_CAP_JOB_MAX_AGE_S) -> float | None:
+    """How long the longest-waiting queued job this runner could take has waited, in a fresh feed, or None when none
+    waits or the feed cannot say. A job older than max_age (a lost delivery, for the load cap) does not count; None
+    counts every one, as the memory cap does: listening for a lost delivery costs nothing, and a gui or session
+    label's real job can queue for hours (2026-10-21: 1.5 to 3 h)."""
     if not isinstance(summary, dict) or not labels:
         return None
     delivery = summary.get("delivery")
@@ -7845,7 +7848,7 @@ def oldest_queued_s(summary: dict[str, Any] | None, labels: frozenset[str] | Non
             if isinstance(job, dict) and isinstance(job.get("labels"), list) and job["labels"]
             and set(job["labels"]) <= labels and job.get("status") not in ("in_progress", "completed")
             and isinstance(job.get("created"), (int, float))
-            and now - job["created"] <= HOST_LOAD_CAP_JOB_MAX_AGE_S]
+            and (max_age is None or now - job["created"] <= max_age)]
     return max(ages) if ages else None
 
 
@@ -7855,7 +7858,7 @@ def oldest_queued_s(summary: dict[str, Any] | None, labels: frozenset[str] | Non
 # 2.8-6.5 GiB each, and at 12:07Z the next day it sat at pressure level 2 with 3.0 of 4 GiB of swap used and 2 GiB
 # reclaimable. The memory-pressure hold (GATE_MEMORY_PRESSURE_HOLD) only reacts once Darwin is already compressing
 # and swapping, and the RAM ledger is off because measured peaks do not add (RAM_LEDGER_ENV). So an idle listener
-# also looks at what a new job could get without compression or swap: free, speculative, purgeable and file-backed
+# also looks at what a new job could get without compression or swap: free, purgeable and file-backed
 # pages (reclaimable_mib, one sysctl). Under needGiB, or at memory pressure level 2 or more, a new job will not fit:
 # the listener takes none, and listens again once resumeGiB is reclaimable at normal pressure. It never strands a
 # job and never fails one: it only defers, as HOST_LOAD_CAP does. While another host's listener keeps up with the
@@ -7868,9 +7871,17 @@ MEMORY_CAP_ENV = "GLAEDA_RUNNER_MEMORY_CAP"
 MEMORY_CAP_NEED_GIB = 4.0  # a swift-frontend at its peak (2.8-6.5 GiB in the 11-16 Jetsam reports)
 MEMORY_CAP_RESUME_GIB = 5.0
 MEMORY_CAP_MAX_WAIT_MIN = 10.0
+MEMORY_CAP_MAX_WAIT_LIMIT_MIN = 60.0  # a longer maxWaitMin is not a setting: no hold may outlast an hour
+# One idle listener on a mini resumes at a time: every gate there reads the same memory, and a swift-frontend reaches
+# its peak minutes after admission, so when memory recovers the others wait this long after one has started
+# (MEMORY_CAP_START_FILE's mtime in the state dir) before they look again.
+MEMORY_CAP_STAGGER_S = float(os.environ.get("GLAEDA_RUNNER_MEMORY_CAP_STAGGER_S") or 90.0)
+MEMORY_CAP_START_FILE = "mem-cap-start"
 MEMORY_CAPPED = "a new job will not fit in this mini's memory"
-RECLAIMABLE_KEYS = ("hw.pagesize", "vm.page_free_count", "vm.page_speculative_count", "vm.page_purgeable_count",
-                    "vm.page_pageable_external_count")
+# Speculative pages are file-backed pages already in vm.page_pageable_external_count, so they are not added again.
+# The file-backed count also holds running compiles' mapped executables, so this is an upper bound: it leans toward
+# admitting, and the memory-pressure level backs it.
+RECLAIMABLE_KEYS = ("hw.pagesize", "vm.page_free_count", "vm.page_purgeable_count", "vm.page_pageable_external_count")
 
 
 class MemoryCap(NamedTuple):
@@ -7894,7 +7905,7 @@ def _memory_cap(value: Any) -> MemoryCap | None | bool:
             wait = float(value.get("maxWaitMin", code[2]))
         except (TypeError, ValueError):
             return False
-        if not (0 < need <= resume and 0 < wait and math.isfinite(resume) and math.isfinite(wait)):
+        if not (0 < need <= resume and 0 < wait <= MEMORY_CAP_MAX_WAIT_LIMIT_MIN and math.isfinite(resume)):
             return False
     else:
         return False
@@ -7922,7 +7933,7 @@ def gate_memory_cap(doc: dict[str, Any] | None, host: str, now: float, raw: str 
 
 def parse_reclaimable(text: str) -> int | None:
     """MiB reclaimable without compression or swap from `sysctl -n` of RECLAIMABLE_KEYS (one number a line, in
-    order): (free + speculative + purgeable + file-backed pages) x the page size. None unless every key read."""
+    order): (free + purgeable + file-backed pages) x the page size. None unless every key read."""
     try:
         values = [int(line.strip()) for line in text.strip().splitlines()]
     except ValueError:
@@ -8576,6 +8587,8 @@ class Gate:
         self.mem_why: str | None = None
         self.mem_since: float | None = None
         self.mem_waived = False  # a hold ran past maxWaitMin; ignored until a new job fits again
+        self.mem_held = False  # memory was short at the last look: the resume mark applies (hysteresis)
+        self.mem_unread_noted = False
         self.stale_env: str | None = None  # why an adopted listener's env is not listener_env's (listen())
         self.disk_warned_at: float | None = None  # when the last low-disk warning was logged
         self.disk_evicted_at = -GATE_DISK_EVICT_EVERY_S  # when the last eviction under the floor started
@@ -8855,11 +8868,19 @@ class Gate:
             return self.mem_release(None)
         now = time.monotonic()
         if now - self.mem_at >= GATE_CPU_EVERY_S:
-            self.mem_reading, self.mem_at = (reclaimable_mib(), memory_pressure_level()), now
-        short = memory_short(self.mem_cap, self.mem_why is not None, *self.mem_reading)
+            fresh = now - self.memory_at < GATE_CPU_EVERY_S  # saturated() just read the level
+            level = self.memory_pressure if fresh else memory_pressure_level()
+            self.mem_reading, self.mem_at = (reclaimable_mib(), level), now
+            if self.mem_reading[0] is None and sys.platform == "darwin" and not self.mem_unread_noted:
+                gate_log("the memory cap cannot read reclaimable memory (sysctl); only memory pressure applies")
+                self.mem_unread_noted = True
+        short = memory_short(self.mem_cap, self.mem_held, *self.mem_reading)
         if short is None:
-            self.mem_waived = False
+            if self.mem_held and (wait := self.mem_stagger()):
+                return wait
+            self.mem_waived = self.mem_held = False
             return self.mem_release(None)
+        self.mem_held = True
         if self.mem_waived:
             return None
         self.cap_look()  # the load cap's feed: one read a minute serves both caps
@@ -8867,7 +8888,7 @@ class Gate:
         wall = time.time()
         if urgent_queued(self.cap_summary, self.cap_labels, host, wall):
             return self.mem_release(f"{short}, but an urgent or pinned job of this runner's label is queued: listening")
-        waited = oldest_queued_s(self.cap_summary, self.cap_labels, wall)
+        waited = oldest_queued_s(self.cap_summary, self.cap_labels, wall, max_age=None)
         if waited is not None and waited >= self.mem_cap.max_wait_s:
             return self.mem_release(f"{short}, but a job of this runner's label has waited {waited / 60:.0f} min: "
                                     "listening (the job runs here, slower)")
@@ -8883,6 +8904,22 @@ class Gate:
             gate_log(why)
         self.mem_why, self.mem_since = why, since
         return why
+
+    def mem_stagger(self) -> str | None:
+        """When memory recovers, one held listener on the mini resumes at a time (MEMORY_CAP_STAGGER_S): None and the
+        shared stamp touched for this one, or why it waits because another started within the stagger."""
+        path = self.state_dir / MEMORY_CAP_START_FILE
+        with contextlib.suppress(OSError):
+            ago = time.time() - path.stat().st_mtime
+            if 0 <= ago < MEMORY_CAP_STAGGER_S:
+                why = (f"{MEMORY_CAPPED} (another listener on this mini started {ago:.0f} s ago; the next one waits "
+                       f"{MEMORY_CAP_STAGGER_S:g} s for its job's memory to show)")
+                self.mem_why = self.mem_why or why
+                return why
+        with contextlib.suppress(OSError):
+            path.touch()
+            os.utime(path)
+        return None
 
     def mem_release(self, note: str | None) -> None:
         """End a MEMORY_CAP hold, logging why once."""

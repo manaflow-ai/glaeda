@@ -8696,7 +8696,7 @@ class MemoryCapTest(unittest.TestCase):
         self.jobs: list[dict] = []
         self.feed = True
         for name, value in (("GATE_CPU_EVERY_S", 0.0), ("GATE_SETTINGS_EVERY_S", 0.0),
-                            ("HOST_LOAD_CAP_FEED_EVERY_S", 0.0)):
+                            ("HOST_LOAD_CAP_FEED_EVERY_S", 0.0), ("MEMORY_CAP_STAGGER_S", 0.0)):
             patcher = mock.patch.object(hook, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -8754,15 +8754,17 @@ class MemoryCapTest(unittest.TestCase):
         self.assertEqual(hook.gate_memory_cap(doc, "bad", now, raw=""), hook.gate_memory_cap(doc, "x", now, raw=""))
         self.assertEqual(hook.gate_memory_cap(doc, "junk", now, raw=""), hook.gate_memory_cap(doc, "x", now, raw=""))
         self.assertEqual(hook.gate_memory_cap(doc, "big", now, raw=""), hook.MemoryCap(8192, 10240, 600.0))
+        self.assertIs(hook._memory_cap({"maxWaitMin": 61}), False, "no hold may outlast an hour")
+        self.assertIs(hook._memory_cap({"maxWaitMin": float("inf")}), False)
         self.assertIsNone(hook.gate_memory_cap({"defaults": {"memoryCap": False}}, "x", now, raw=""))
         declared = json.loads((ROOT / "config" / "runner-gate.json").read_text())
         self.assertEqual(hook.gate_memory_cap(declared, "cmux17", now, raw=""), hook.MemoryCap(4096, 5120, 600.0),
                          "the declared cap")
 
     def test_reclaimable_and_short(self) -> None:
-        self.assertEqual(hook.parse_reclaimable("16384\n3453\n2068\n0\n124835\n"), (3453 + 2068 + 124835) // 64)
+        self.assertEqual(hook.parse_reclaimable("16384\n3453\n0\n124835\n"), (3453 + 124835) // 64)
         self.assertIsNone(hook.parse_reclaimable("16384\n3453\n"), "a key that did not read")
-        self.assertIsNone(hook.parse_reclaimable("x\n1\n2\n3\n4\n"))
+        self.assertIsNone(hook.parse_reclaimable("x\n1\n2\n3\n"))
         cap = hook.MemoryCap(4096, 5120, 600.0)
         self.assertIsNone(hook.memory_short(cap, False, 4500, 1))
         self.assertIn("under 5 GiB", hook.memory_short(cap, True, 4500, 1) or "", "held: resumes at 5 GiB")
@@ -8806,6 +8808,35 @@ class MemoryCapTest(unittest.TestCase):
         self.assertIsNone(self.poll())
         self.mem[0] = 1000
         self.assertIsNotNone(self.poll(), "once memory recovered, a new shortage holds again")
+
+    def test_hysteresis_survives_a_release(self) -> None:
+        self.jobs = [self.job("in_progress", "cmux20-glaeda-1"), self.job("queued", ago=1, workflow="nightly-next")]
+        self.assertIsNone(self.poll(), "an urgent job: listening")
+        self.mem[0] = 4500
+        self.jobs.pop()
+        self.assertIsNotNone(self.poll(), "still under the 5 GiB resume mark after the urgent release")
+        self.mem[0] = 6000
+        self.assertIsNone(self.poll())
+
+    def test_a_gui_runner_counts_a_job_queued_for_hours(self) -> None:
+        self.jobs = [self.job("in_progress", "cmux20-glaeda-1"),
+                     self.job("queued", ago=hook.HOST_LOAD_CAP_JOB_MAX_AGE_S + 600)]
+        with mock.patch.object(hook, "runner_scope", return_value=hook.RunnerScope(gui=True)):
+            self.assertIsNone(self.poll(), "a job queued over 3 h is real for the memory cap: listening")
+
+    def test_one_listener_resumes_at_a_time(self) -> None:
+        self.jobs = [self.job("in_progress", "cmux20-glaeda-1")]
+        self.assertIsNotNone(self.poll())
+        other = hook.Gate(self.runner, os.fspath(self.tmp / "host.lock"), os.fspath(self.tmp / "none.json"),
+                          self.state)
+        other.mem_held = True
+        with mock.patch.object(hook, "MEMORY_CAP_STAGGER_S", 90.0):
+            self.mem[0] = 8000
+            self.assertIsNone(self.poll(), "the first held listener resumes")
+            why = other.memory_capped()
+            self.assertTrue(why and "another listener on this mini started" in why, why)
+            os.utime(self.state / hook.MEMORY_CAP_START_FILE, (time.time() - 120, time.time() - 120))
+            self.assertIsNone(other.memory_capped(), "past the stagger the next one resumes")
 
     def test_exempt_runners_and_the_off_switch(self) -> None:
         self.jobs = [self.job("in_progress", "cmux20-glaeda-1")]

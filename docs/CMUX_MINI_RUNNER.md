@@ -487,13 +487,13 @@ What `--apply` does:
        cmux17's JetsamEvent killed a dozen daemons for low swap while eight `swift-frontend`
        processes held 2.8-6.5 GiB each. The memory-pressure hold reacts only once Darwin is already
        compressing and swapping. So an idle listener also reads what a new job could get without
-       compression or swap: free, speculative, purgeable and file-backed pages (one `sysctl`).
+       compression or swap: free, purgeable and file-backed pages (one `sysctl`).
        Under `needGiB` (4), or at memory pressure level 2 or more, it takes no new job, and listens
        again at `resumeGiB` (5) and normal pressure. It never strands or fails a job; it only
        defers. While another host's listener keeps up with the label (the load cap's feed) it
        holds. An urgent or pinned job queued, a job of its label waiting `maxWaitMin` (10), or a
        hold that long with no other listener known to keep up, and it listens until memory
-       recovers: the job runs here, slower. The nightly, freshness, gateway and dedicated runners
+       recovers: the job runs here, slower. When memory recovers, one held listener on a mini resumes at a time, 90 s apart (`mem-cap-start` in the state dir), as a new job's compile peaks minutes after it starts; `maxWaitMin` above 60 is not a setting. The nightly, freshness, gateway and dedicated runners
        are exempt; the gui and session runners are not, as they are held for memory pressure too.
        `memoryCap` in `config/runner-gate.json` (`true`, `false`, or a dict of `needGiB`,
        `resumeGiB` and `maxWaitMin`) sets it by default or per host; `GLAEDA_RUNNER_MEMORY_CAP=off`
