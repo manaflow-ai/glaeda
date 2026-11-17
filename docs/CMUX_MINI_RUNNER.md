@@ -482,6 +482,22 @@ What `--apply` does:
        `hostLoadCap` in `config/runner-gate.json` sets the cap (a number, `false` for off) by
        default or per host; `CMUX_CI_HOST_LOAD_CAP` in the runner LaunchAgent's environment wins,
        and `off` or 0 turns it off.
+     - **Memory cap** (`MEMORY_CAP`, cmuxterm-hq#12838). The 16 GiB minis (cmux17, 18, 21, 22)
+       showed macOS's "out of application memory" panel running 4-6 jobs: on 2026-11-16 at 22:34Z
+       cmux17's JetsamEvent killed a dozen daemons for low swap while eight `swift-frontend`
+       processes held 2.8-6.5 GiB each. The memory-pressure hold reacts only once Darwin is already
+       compressing and swapping. So an idle listener also reads what a new job could get without
+       compression or swap: free, speculative, purgeable and file-backed pages (one `sysctl`).
+       Under `needGiB` (4), or at memory pressure level 2 or more, it takes no new job, and listens
+       again at `resumeGiB` (5) and normal pressure. It never strands or fails a job; it only
+       defers. While another host's listener keeps up with the label (the load cap's feed) it
+       holds. An urgent or pinned job queued, a job of its label waiting `maxWaitMin` (10), or a
+       hold that long with no other listener known to keep up, and it listens until memory
+       recovers: the job runs here, slower. The nightly, freshness, gateway and dedicated runners
+       are exempt; the gui and session runners are not, as they are held for memory pressure too.
+       `memoryCap` in `config/runner-gate.json` (`true`, `false`, or a dict of `needGiB`,
+       `resumeGiB` and `maxWaitMin`) sets it by default or per host; `GLAEDA_RUNNER_MEMORY_CAP=off`
+       in the runner LaunchAgent's environment turns it off.
      - The gui runner is never held for CPU saturation (85% busy), only for memory
        pressure: its jobs come one per mini and are admitted by units like any other,
        and the CPU mark held it whenever the other lanes kept the mini busy. Nothing

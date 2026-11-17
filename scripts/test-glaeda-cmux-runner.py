@@ -8672,6 +8672,154 @@ class HostLoadCapTest(unittest.TestCase):
         self.assertIsNotNone(self.poll(), "and back on")
 
 
+class MemoryCapTest(unittest.TestCase):
+    """cmuxterm-hq#12838's memory cap at the listener (MEMORY_CAP). The 16 GiB minis showed macOS's out-of-application-
+    memory panel running 4-6 jobs (cmux17's 2026-11-16 22:34Z JetsamEvent: low-swap kills while eight swift-frontend
+    processes held 2.8-6.5 GiB each). An idle listener takes no new job while reclaimable memory is under needGiB or
+    memory pressure is elevated, and only defers: it never strands a job."""
+
+    LABEL = "glaeda-side-std-xcode-26.6"
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        self.runner = self.tmp / "actions-runner-glaeda-2"
+        self.runner.mkdir()
+        (self.runner / ".runner").write_text(json.dumps({"agentName": "cmux17-glaeda-2"}))
+        self.state = self.tmp / "state"
+        (self.state / "instance-2").mkdir(parents=True)
+        (self.state / "instance-2" / "receipt.json").write_text(json.dumps({"registration": {
+            "name": "cmux17-glaeda-2", "labels": ["glaeda-mini", self.LABEL]}}))
+        self.mem = [2048]  # MiB reclaimable
+        self.pressure = [1]
+        self.jobs: list[dict] = []
+        self.feed = True
+        for name, value in (("GATE_CPU_EVERY_S", 0.0), ("GATE_SETTINGS_EVERY_S", 0.0),
+                            ("HOST_LOAD_CAP_FEED_EVERY_S", 0.0)):
+            patcher = mock.patch.object(hook, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for name, fake in (("reclaimable_mib", lambda: self.mem[0]), ("memory_pressure_level", lambda: self.pressure[0]),
+                           ("gate_host", lambda: "cmux17"), ("load_cap_fetch", self.fetch),
+                           ("gate_settings_doc", lambda *a: (None, "")), ("gate_log", lambda line: None)):
+            patcher = mock.patch.object(hook, name, side_effect=fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.dict(os.environ, {"GLAEDA_RUNNER_MEMORY_CAP": ""})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.gate = hook.Gate(self.runner, os.fspath(self.tmp / "host.lock"), os.fspath(self.tmp / "none.json"),
+                              self.state)
+        self.addCleanup(self.join)
+
+    def stamp(self, ago: float) -> str:
+        return datetime.datetime.fromtimestamp(time.time() - ago, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def fetch(self, now: float) -> dict | None:
+        if not self.feed:
+            return None
+        return hook.load_cap_summary({"receiver_last_delivery": self.stamp(5), "jobs": self.jobs}, now)
+
+    def job(self, status: str, runner: str | None = None, ago: float = 10.0, workflow: str = "cmux-next") -> dict:
+        return {"status": status, "labels": [self.LABEL], "runner": runner, "created_at": self.stamp(ago),
+                "workflow": workflow, "head_branch": "lane/x", "name": "compile"}
+
+    def join(self) -> None:
+        if self.gate.cap_thread is not None:
+            self.gate.cap_thread.join(5)
+
+    def poll(self) -> str | None:
+        """Two looks: the first starts the feed read (waited for), the second decides with it."""
+        (self.state / hook.HOST_LOAD_CAP_FEED_FILE).unlink(missing_ok=True)
+        self.gate.cap_feed_at = -hook.HOST_LOAD_CAP_FEED_EVERY_S - 1
+        self.gate.memory_capped()
+        self.join()
+        return self.gate.memory_capped()
+
+    def test_settings_and_the_kill_switch(self) -> None:
+        now = 1_800_000_000.0
+        code = hook.gate_memory_cap(None, "x", now, raw="")
+        self.assertEqual(code, hook.MemoryCap(4096, 5120, 600.0), "on by default at the code marks")
+        for raw in ("off", "0", "false", "OFF"):
+            self.assertIsNone(hook.gate_memory_cap(None, "x", now, raw=raw), raw)
+        later = datetime.datetime.fromtimestamp(now + 60, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        doc = {"defaults": {"memoryCap": {"needGiB": 6, "maxWaitMin": 5}},
+               "hosts": {"off": {"memoryCap": False, "until": later}, "bad": {"memoryCap": {"needGiB": 9, "resumeGiB": 2}},
+                         "junk": {"memoryCap": "no"}, "big": {"memoryCap": {"needGiB": 8, "resumeGiB": 10}}}}
+        self.assertEqual(hook.gate_memory_cap(doc, "x", now, raw=""), hook.MemoryCap(6144, 6144, 300.0),
+                         "a resume under the need is raised to it")
+        self.assertIsNone(hook.gate_memory_cap(doc, "off", now, raw=""), "a live host entry turns it off")
+        self.assertIsNotNone(hook.gate_memory_cap(doc, "off", now + 120, raw=""), "a lapsed entry is ignored")
+        self.assertEqual(hook.gate_memory_cap(doc, "bad", now, raw=""), hook.gate_memory_cap(doc, "x", now, raw=""))
+        self.assertEqual(hook.gate_memory_cap(doc, "junk", now, raw=""), hook.gate_memory_cap(doc, "x", now, raw=""))
+        self.assertEqual(hook.gate_memory_cap(doc, "big", now, raw=""), hook.MemoryCap(8192, 10240, 600.0))
+        self.assertIsNone(hook.gate_memory_cap({"defaults": {"memoryCap": False}}, "x", now, raw=""))
+        declared = json.loads((ROOT / "config" / "runner-gate.json").read_text())
+        self.assertEqual(hook.gate_memory_cap(declared, "cmux17", now, raw=""), hook.MemoryCap(4096, 5120, 600.0),
+                         "the declared cap")
+
+    def test_reclaimable_and_short(self) -> None:
+        self.assertEqual(hook.parse_reclaimable("16384\n3453\n2068\n0\n124835\n"), (3453 + 2068 + 124835) // 64)
+        self.assertIsNone(hook.parse_reclaimable("16384\n3453\n"), "a key that did not read")
+        self.assertIsNone(hook.parse_reclaimable("x\n1\n2\n3\n4\n"))
+        cap = hook.MemoryCap(4096, 5120, 600.0)
+        self.assertIsNone(hook.memory_short(cap, False, 4500, 1))
+        self.assertIn("under 5 GiB", hook.memory_short(cap, True, 4500, 1) or "", "held: resumes at 5 GiB")
+        self.assertIn("under 4 GiB", hook.memory_short(cap, False, 2048, 1) or "")
+        self.assertIn("pressure level 2", hook.memory_short(cap, False, 9000, 2) or "", "pressure says it too")
+        self.assertIsNone(hook.memory_short(cap, False, None, None), "unreadable holds nothing")
+        self.assertIsNone(hook.memory_short(None, False, 0, 4), "off holds nothing")
+
+    def test_holds_while_another_host_keeps_up_and_never_strands(self) -> None:
+        self.jobs = [self.job("in_progress", "cmux20-glaeda-1")]
+        why = self.poll()
+        self.assertTrue(why and why.startswith(hook.MEMORY_CAPPED) and "another host" in why, why)
+        self.assertEqual(self.gate.claimed(), why, "claimed() holds the listener off for it")
+
+        self.jobs.append(self.job("queued", ago=600 + 5))
+        self.assertIsNone(self.poll(), "a job waited maxWaitMin with no listener taking it: it runs here, slower")
+        self.jobs.pop()
+        self.assertIsNotNone(self.poll())
+        self.jobs.append(self.job("queued", ago=1, workflow="nightly-next"))
+        self.assertIsNone(self.poll(), "an urgent job listens at once")
+        self.jobs.pop()
+        self.assertIsNotNone(self.poll())
+
+        self.gate.mem_since = time.monotonic() - 3600
+        self.assertIsNotNone(self.poll(), "while another host keeps up, a long hold still holds")
+        self.mem[0] = 4500
+        self.assertIsNotNone(self.poll(), "held: 4.4 GiB is under the 5 GiB resume mark")
+        self.mem[0] = 6000
+        self.assertIsNone(self.poll(), "room again: listens")
+        self.pressure[0] = 2
+        self.assertIsNotNone(self.poll(), "elevated pressure holds even with room")
+
+    def test_with_no_feed_it_waits_at_most_max_wait_then_listens_until_memory_recovers(self) -> None:
+        self.feed = False
+        why = self.poll()
+        self.assertTrue(why and "may wait 10 min" in why, why)
+        self.gate.mem_since = time.monotonic() - 601
+        self.assertIsNone(self.poll(), "past maxWaitMin it listens")
+        self.assertIsNone(self.poll(), "and keeps listening while memory stays short (no flapping)")
+        self.mem[0] = 8000
+        self.assertIsNone(self.poll())
+        self.mem[0] = 1000
+        self.assertIsNotNone(self.poll(), "once memory recovered, a new shortage holds again")
+
+    def test_exempt_runners_and_the_off_switch(self) -> None:
+        self.jobs = [self.job("in_progress", "cmux20-glaeda-1")]
+        self.assertIsNotNone(self.poll())
+        for scope in (hook.RunnerScope(gateway=True), hook.RunnerScope(nightly=True), hook.RunnerScope(fresh=True)):
+            with mock.patch.object(hook, "runner_scope", return_value=scope):
+                self.assertIsNone(self.gate.memory_capped(), scope)
+        with mock.patch.object(hook, "runner_scope", return_value=hook.RunnerScope(gui=True)):
+            self.assertIsNotNone(self.gate.memory_capped(), "a gui runner is held for memory, as for pressure")
+        with mock.patch.dict(os.environ, {"GLAEDA_RUNNER_MEMORY_CAP": "off"}):
+            self.assertIsNone(self.poll(), "GLAEDA_RUNNER_MEMORY_CAP=off turns it off")
+        self.assertIsNotNone(self.poll(), "and back on")
+
+
 class GateOffTheTailnet(unittest.TestCase):
     """2026-11-11: a CI mini was off the tailnet for 4+ h and its runners kept taking build-fleet compile
     jobs, each failing after 300 s with "controller unreachable" (three PRs in an hour). The gate holds the

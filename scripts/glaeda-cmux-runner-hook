@@ -7779,10 +7779,12 @@ def load_cap_fetch(now: float) -> dict[str, Any] | None:
 
 
 def load_cap_verdict(summary: dict[str, Any] | None, labels: frozenset[str] | None, host: str,
-                     now: float) -> str | None:
+                     now: float, grace: float | None = None) -> str | None:
     """Why another host's listener keeps up with this runner's label (so an over-cap mini may hold its listener off),
     or None, which listens: no feed, a stale one, no other host serving a job this runner could take, or such a job
-    queued that is urgent, pinned to this host, or has waited HOST_LOAD_CAP_GRACE_S (no idle listener took it)."""
+    queued that is urgent, pinned to this host, or has waited `grace` (HOST_LOAD_CAP_GRACE_S by default: no idle
+    listener took it)."""
+    grace = HOST_LOAD_CAP_GRACE_S if grace is None else grace
     if not isinstance(summary, dict) or not labels:
         return None
     delivery = summary.get("delivery")
@@ -7805,9 +7807,156 @@ def load_cap_verdict(summary: dict[str, Any] | None, labels: frozenset[str] | No
             continue  # a lost delivery
         if job.get("urgent") or (pinned is not None and any(pinned.search(label.lower()) for label in job["labels"])):
             return None
-        if age is None or age >= HOST_LOAD_CAP_GRACE_S:
+        if age is None or age >= grace:
             return None
     return f"another host's listener takes {served[0]} jobs"
+
+
+def urgent_queued(summary: dict[str, Any] | None, labels: frozenset[str] | None, host: str, now: float) -> bool:
+    """Whether a job this runner could take is queued and urgent (a nightly or promotion) or pinned to this host,
+    in a fresh feed: load_cap_verdict's exemptions, read alone."""
+    if not isinstance(summary, dict) or not labels:
+        return False
+    delivery = summary.get("delivery")
+    if not isinstance(delivery, (int, float)) or now - delivery > HOST_LOAD_CAP_FEED_STALE_S:
+        return False
+    pinned = re.compile(rf"(?:^|[^a-z0-9]){re.escape(host.lower())}(?:$|[^a-z0-9])") if host else None
+    for job in summary.get("jobs") if isinstance(summary.get("jobs"), list) else []:
+        if not isinstance(job, dict) or not isinstance(job.get("labels"), list) or not job["labels"] \
+                or not set(job["labels"]) <= labels or job.get("status") in ("in_progress", "completed"):
+            continue
+        created = job.get("created")
+        if isinstance(created, (int, float)) and now - created > HOST_LOAD_CAP_JOB_MAX_AGE_S:
+            continue  # a lost delivery
+        if job.get("urgent") or (pinned is not None and any(pinned.search(label.lower()) for label in job["labels"])):
+            return True
+    return False
+
+
+def oldest_queued_s(summary: dict[str, Any] | None, labels: frozenset[str] | None, now: float) -> float | None:
+    """How long the longest-waiting queued job this runner could take has waited, in a fresh feed (a lost delivery,
+    older than HOST_LOAD_CAP_JOB_MAX_AGE_S, does not count), or None when none waits or the feed cannot say."""
+    if not isinstance(summary, dict) or not labels:
+        return None
+    delivery = summary.get("delivery")
+    if not isinstance(delivery, (int, float)) or now - delivery > HOST_LOAD_CAP_FEED_STALE_S:
+        return None
+    ages = [now - job["created"] for job in (summary.get("jobs") if isinstance(summary.get("jobs"), list) else [])
+            if isinstance(job, dict) and isinstance(job.get("labels"), list) and job["labels"]
+            and set(job["labels"]) <= labels and job.get("status") not in ("in_progress", "completed")
+            and isinstance(job.get("created"), (int, float))
+            and now - job["created"] <= HOST_LOAD_CAP_JOB_MAX_AGE_S]
+    return max(ages) if ages else None
+
+
+# MEMORY_CAP (cmuxterm-hq#12838; Leo, 2026-11-05: "i meant can you do all of htem"): the 16 GiB minis (cmux17, 18,
+# 21, 22) showed macOS's "out of application memory" panel running 4-6 jobs: on 2026-11-16 at 22:34Z cmux17's
+# JetsamEvent killed homed, tccd and a dozen other daemons for low-swap while eight swift-frontend processes held
+# 2.8-6.5 GiB each, and at 12:07Z the next day it sat at pressure level 2 with 3.0 of 4 GiB of swap used and 2 GiB
+# reclaimable. The memory-pressure hold (GATE_MEMORY_PRESSURE_HOLD) only reacts once Darwin is already compressing
+# and swapping, and the RAM ledger is off because measured peaks do not add (RAM_LEDGER_ENV). So an idle listener
+# also looks at what a new job could get without compression or swap: free, speculative, purgeable and file-backed
+# pages (reclaimable_mib, one sysctl). Under needGiB, or at memory pressure level 2 or more, a new job will not fit:
+# the listener takes none, and listens again once resumeGiB is reclaimable at normal pressure. It never strands a
+# job and never fails one: it only defers, as HOST_LOAD_CAP does. While another host's listener keeps up with the
+# label (the controller's feed, shared with the load cap) it holds; a job of its label that has waited maxWaitMin,
+# an urgent (nightly, promotion) or pinned job, or a hold past maxWaitMin with no feed to say, and it listens: the
+# job then runs here, slower, rather than not at all. Exempt like the load cap: the nightly, freshness, gateway and
+# dedicated runners. config/runner-gate.json's memoryCap (true, false or a dict of needGiB, resumeGiB and
+# maxWaitMin) sets it by default or per host; GLAEDA_RUNNER_MEMORY_CAP=off in the runner's environment turns it off.
+MEMORY_CAP_ENV = "GLAEDA_RUNNER_MEMORY_CAP"
+MEMORY_CAP_NEED_GIB = 4.0  # a swift-frontend at its peak (2.8-6.5 GiB in the 11-16 Jetsam reports)
+MEMORY_CAP_RESUME_GIB = 5.0
+MEMORY_CAP_MAX_WAIT_MIN = 10.0
+MEMORY_CAPPED = "a new job will not fit in this mini's memory"
+RECLAIMABLE_KEYS = ("hw.pagesize", "vm.page_free_count", "vm.page_speculative_count", "vm.page_purgeable_count",
+                    "vm.page_pageable_external_count")
+
+
+class MemoryCap(NamedTuple):
+    need_mib: int
+    resume_mib: int
+    max_wait_s: float
+
+
+def _memory_cap(value: Any) -> MemoryCap | None | bool:
+    """One memoryCap value read: false is off (None), true the code marks, a dict sets needGiB <= resumeGiB and
+    maxWaitMin (> 0 each), each defaulting to the code mark. Anything else is not a setting (False)."""
+    code = (MEMORY_CAP_NEED_GIB, MEMORY_CAP_RESUME_GIB, MEMORY_CAP_MAX_WAIT_MIN)
+    if value is False:
+        return None
+    if value is True:
+        need, resume, wait = code
+    elif isinstance(value, dict):
+        try:
+            need = float(value.get("needGiB", code[0]))
+            resume = float(value.get("resumeGiB", max(code[1], need)))
+            wait = float(value.get("maxWaitMin", code[2]))
+        except (TypeError, ValueError):
+            return False
+        if not (0 < need <= resume and 0 < wait and math.isfinite(resume) and math.isfinite(wait)):
+            return False
+    else:
+        return False
+    return MemoryCap(int(need * 1024), int(resume * 1024), wait * 60.0)
+
+
+def gate_memory_cap(doc: dict[str, Any] | None, host: str, now: float, raw: str | None = None) -> MemoryCap | None:
+    """The memory cap for this mini, or None when it is off: GLAEDA_RUNNER_MEMORY_CAP "off" (or 0, false, no) wins;
+    else the host's live memoryCap entry in runner-gate.json, else defaults.memoryCap, else the code marks. A value
+    that is not a bool or a valid dict is ignored."""
+    env = os.environ.get(MEMORY_CAP_ENV) if raw is None else raw
+    if env is not None and env.strip().lower() in ("off", "0", "false", "no", "disabled"):
+        return None
+    cap: MemoryCap | None = _memory_cap(True)  # type: ignore[assignment]
+    defaults = doc.get("defaults") if isinstance(doc, dict) else None
+    if isinstance(defaults, dict) and "memoryCap" in defaults and (got := _memory_cap(defaults["memoryCap"])) is not False:
+        cap = got  # type: ignore[assignment]
+    hosts = doc.get("hosts") if isinstance(doc, dict) else None
+    entry = hosts.get(host) if isinstance(hosts, dict) else None
+    if isinstance(entry, dict) and "memoryCap" in entry and _live_entry(entry, now) \
+            and (got := _memory_cap(entry["memoryCap"])) is not False:
+        cap = got  # type: ignore[assignment]
+    return cap
+
+
+def parse_reclaimable(text: str) -> int | None:
+    """MiB reclaimable without compression or swap from `sysctl -n` of RECLAIMABLE_KEYS (one number a line, in
+    order): (free + speculative + purgeable + file-backed pages) x the page size. None unless every key read."""
+    try:
+        values = [int(line.strip()) for line in text.strip().splitlines()]
+    except ValueError:
+        return None
+    if len(values) != len(RECLAIMABLE_KEYS) or values[0] <= 0 or any(value < 0 for value in values):
+        return None
+    return sum(values[1:]) * values[0] // (1 << 20)
+
+
+def reclaimable_mib() -> int | None:
+    """This Mac's reclaimable memory (parse_reclaimable) in one sysctl, or None off Darwin or when it cannot be read."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        out = subprocess.run([SYSCTL, "-n", *RECLAIMABLE_KEYS], stdin=subprocess.DEVNULL, capture_output=True,
+                             text=True, timeout=5, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return parse_reclaimable(out.stdout) if out.returncode == 0 else None
+
+
+def memory_short(cap: MemoryCap | None, held: bool, reclaimable: int | None, pressure: int | None) -> str | None:
+    """Why a new job will not fit in memory now, or None: memory pressure at GATE_MEMORY_PRESSURE_HOLD or more, or
+    reclaimable memory under the cap's need (its resume mark once `held`, so it does not flap). Unreadable
+    readings hold nothing."""
+    if cap is None:
+        return None
+    if pressure is not None and pressure >= GATE_MEMORY_PRESSURE_HOLD:
+        return f"memory pressure level {pressure}" + (f", {reclaimable / 1024:.1f} GiB reclaimable"
+                                                      if reclaimable is not None else "")
+    mark = cap.resume_mib if held else cap.need_mib
+    if reclaimable is not None and reclaimable < mark:
+        return f"{reclaimable / 1024:.1f} GiB reclaimable, under {mark / 1024:g} GiB"
+    return None
 
 
 def mean_load_per_core(samples: list[tuple[float, float]], cores: int | None, now: float) -> float | None:
@@ -8419,6 +8568,14 @@ class Gate:
         self.cap_labels: frozenset[str] | None = None
         self.cap_feed_at = -HOST_LOAD_CAP_FEED_EVERY_S
         self.cap_thread: threading.Thread | None = None
+        # MEMORY_CAP: the cap in force (gate_memory_cap, refreshed with the other settings), its last reading, why it
+        # holds and since when (monotonic)
+        self.mem_cap: MemoryCap | None = gate_memory_cap(None, "", 0.0)
+        self.mem_at = -GATE_CPU_EVERY_S
+        self.mem_reading: tuple[int | None, int | None] = (None, None)
+        self.mem_why: str | None = None
+        self.mem_since: float | None = None
+        self.mem_waived = False  # a hold ran past maxWaitMin; ignored until a new job fits again
         self.stale_env: str | None = None  # why an adopted listener's env is not listener_env's (listen())
         self.disk_warned_at: float | None = None  # when the last low-disk warning was logged
         self.disk_evicted_at = -GATE_DISK_EVICT_EVERY_S  # when the last eviction under the floor started
@@ -8539,7 +8696,7 @@ class Gate:
         if why:
             self.load_since = None  # the fleet's claim, not load, is holding this gate
             self.yield_to_fleet()
-        return (why or self.shed(self.saturated()) or self.load_capped() or self.full() or self.shed(self.hot()) or self.stalled()
+        return (why or self.shed(self.saturated()) or self.load_capped() or self.memory_capped() or self.full() or self.shed(self.hot()) or self.stalled()
                 or self.locked() or self.low_disk() or self.ineligible() or self.off_tailnet())
 
     def exclusive_yield(self) -> str | None:
@@ -8685,6 +8842,55 @@ class Gate:
         self.cap_why = why
         return why
 
+    def memory_capped(self) -> str | None:
+        """MEMORY_CAP: why this listener takes no new job because one will not fit in the mini's memory, or None. Only
+        defers: an urgent or pinned job of its label queued, a job of its label waiting the cap's maxWaitMin, or a hold
+        that long with no other host's listener known to keep up, and it listens; the job runs here, slower."""
+        scope = runner_scope(self.runner_dir)
+        if scope.nightly or scope.fresh or scope.gateway or scope.dedicated:
+            return self.mem_release(None)
+        self.cpu_holds()  # refreshes self.mem_cap with the other settings, at most every GATE_SETTINGS_EVERY_S
+        if self.mem_cap is None:
+            self.mem_waived = False
+            return self.mem_release(None)
+        now = time.monotonic()
+        if now - self.mem_at >= GATE_CPU_EVERY_S:
+            self.mem_reading, self.mem_at = (reclaimable_mib(), memory_pressure_level()), now
+        short = memory_short(self.mem_cap, self.mem_why is not None, *self.mem_reading)
+        if short is None:
+            self.mem_waived = False
+            return self.mem_release(None)
+        if self.mem_waived:
+            return None
+        self.cap_look()  # the load cap's feed: one read a minute serves both caps
+        host = runner_host(runner_config(self.runner_dir)[0]) or gate_host()
+        wall = time.time()
+        if urgent_queued(self.cap_summary, self.cap_labels, host, wall):
+            return self.mem_release(f"{short}, but an urgent or pinned job of this runner's label is queued: listening")
+        waited = oldest_queued_s(self.cap_summary, self.cap_labels, wall)
+        if waited is not None and waited >= self.mem_cap.max_wait_s:
+            return self.mem_release(f"{short}, but a job of this runner's label has waited {waited / 60:.0f} min: "
+                                    "listening (the job runs here, slower)")
+        since = self.mem_since if self.mem_since is not None else now
+        verdict = load_cap_verdict(self.cap_summary, self.cap_labels, host, wall, grace=self.mem_cap.max_wait_s)
+        if verdict is None and now - since >= self.mem_cap.max_wait_s:
+            self.mem_waived = True
+            return self.mem_release(f"{short} for {self.mem_cap.max_wait_s / 60:g} min with no other listener known "
+                                    "to keep up with this runner's label: listening (the job runs here, slower)")
+        why = (f"{MEMORY_CAPPED} ({short}) while " + (verdict or "a job of its label may wait "
+                                                      f"{self.mem_cap.max_wait_s / 60:g} min for room"))
+        if why != self.mem_why:
+            gate_log(why)
+        self.mem_why, self.mem_since = why, since
+        return why
+
+    def mem_release(self, note: str | None) -> None:
+        """End a MEMORY_CAP hold, logging why once."""
+        if self.mem_why is not None:
+            gate_log(note or "a new job fits in this mini's memory again")
+        self.mem_why, self.mem_since = None, None
+        return None
+
     def cap_release(self, note: str | None) -> None:
         """End a HOST_LOAD_CAP hold, logging why once."""
         if self.cap_why is not None:
@@ -8714,6 +8920,12 @@ class Gate:
         if cap != self.cap:
             gate_log(f"the host load cap is {f'{cap:g} per core' if cap > 0 else 'off'} on this mini")
         self.cap = cap
+        mem_cap = gate_memory_cap(doc, gate_host(), time.time())
+        if mem_cap != self.mem_cap:
+            gate_log("the memory cap is " + (f"{mem_cap.need_mib / 1024:g} GiB reclaimable (resume "
+                                             f"{mem_cap.resume_mib / 1024:g}, wait at most "
+                                             f"{mem_cap.max_wait_s / 60:g} min)" if mem_cap else "off") + " on this mini")
+        self.mem_cap = mem_cap
         return hold
 
     def saturated(self) -> str | None:
@@ -8866,7 +9078,7 @@ class Gate:
         if why:
             self.load_since = None
             self.yield_to_fleet()
-        return (why or self.shed(self.saturated()) or self.load_capped() or self.full(fresh=True) or self.shed(self.hot(fresh=True))
+        return (why or self.shed(self.saturated()) or self.load_capped() or self.memory_capped() or self.full(fresh=True) or self.shed(self.hot(fresh=True))
                 or self.stalled() or self.locked(fresh=True) or self.low_disk() or self.ineligible() or self.off_tailnet())
 
     def still_waiting(self) -> str | None:
