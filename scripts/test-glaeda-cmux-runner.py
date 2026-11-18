@@ -20094,5 +20094,107 @@ class SimDynamicTest(unittest.TestCase):
         self.assertNotIn("SIM_TOKEN_COPIES", disk)
 
 
+class StepBackfillTest(unittest.TestCase):
+    """STEP_BACKFILL: a ci-step takes units a job waiting here for units cannot use now. 2026-11-18 13:45Z: five lent
+    minis held 10-13 of 14 units with PR jobs waiting for more, and their workers advertised no step class while 228
+    cmux-ci steps queued. A waiter that fits now is still owed its units, and one waiting STEP_BACKFILL_S or longer
+    gets the whole old turn back, so a stream of steps cannot starve it."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        self.capacity = self.dir / "capacity"
+        self.capacity.mkdir()
+        (self.capacity / "admission.lock").touch()
+        self.state = self.dir / "state"
+        self.state.mkdir()
+        self.held: list[int] = []
+        self.addCleanup(lambda: [os.close(fd) for fd in self.held])
+        self.light = hook.class_need("light").cores
+        patcher = mock.patch.object(hook, "mem_chunks_total", return_value=0)  # units only, on any test host
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def hold_units(self, count: int) -> None:
+        for slot in range(count):
+            fd = hook.lock_file(self.capacity / f"unit-{slot}", fcntl.LOCK_EX)
+            self.assertIsNotNone(fd)
+            self.held.append(fd)
+
+    def waiter(self, need: int | None, waited: float, tier: str = "") -> None:
+        want: dict[str, object] = {"since": time.time() - waited, "wants": ["units"], "who": "w0 job (run 1)"}
+        if need is not None:
+            want["need"] = need
+        if tier:
+            want["tier"] = tier
+        (self.capacity / f"{hook.ADMIT_WANT}{os.getppid()}").write_text(json.dumps(want))
+
+    def fits(self) -> list[str]:
+        return hook.step_fits(self.capacity, 14, 1, 1, os.fspath(self.dir / "fleet" / "host.lock"),
+                              os.fspath(self.dir / "no-reservation"), self.state, time.time())
+
+    def keep(self, fds: list[int], *args: object, **kwargs: object) -> tuple[bool, str]:
+        self.held.extend(fds)  # the admitted step runs on: its holder keeps every lock
+        return True, "held"
+
+    def admit(self) -> tuple[int, dict]:
+        with mock.patch.object(hook, "step_refusal", return_value=None), \
+                mock.patch.object(hook, "hold", side_effect=self.keep), \
+                mock.patch.object(hook, "lock_waiters", return_value=[]), \
+                mock.patch.object(hook, "bounded_waiters", return_value=[]):
+            return hook.step_admit("light", "step-1-1", os.getpid(), os.fspath(self.dir / "fleet" / "host.lock"),
+                                   os.fspath(self.dir / "no-reservation"), self.capacity, 14, self.state)
+
+    def test_todays_case_a_step_takes_units_the_waiting_job_cannot_use(self) -> None:
+        now = time.time()
+        waiter = [{"pid": 1, "since": now - 60, "wants": ["units"], "who": "", "tier": "", "need": 8, "mem": 0}]
+        self.assertIsNone(hook.step_backfill_refusal(waiter, 1, 0, 1, 0, now), "13 of 14 held: the 1-unit step fits")
+        self.hold_units(14 - self.light)  # room for a light step only; the PR job needs 8
+        self.waiter(8, 60)
+        self.assertIn("light", self.fits(), "the waiter could not use the free units")
+        status, result = self.admit()
+        self.assertEqual(status, 0, result)
+        self.assertEqual(result["units"], self.light)
+
+    def test_a_waiter_past_the_bound_keeps_its_turn(self) -> None:
+        self.hold_units(14 - self.light)
+        self.waiter(8, hook.STEP_BACKFILL_S + 60)
+        self.assertEqual(self.fits(), [], "starvation: no step takes a unit until the old waiter is admitted")
+        status, result = self.admit()
+        self.assertEqual(status, 1)
+        self.assertIn("no step takes a unit until it is admitted", result["reason"])
+
+    def test_a_waiter_that_fits_keeps_its_units(self) -> None:
+        self.hold_units(14 - 8)  # 8 free: the waiter's need exactly
+        self.waiter(8, 60)
+        self.assertEqual(self.fits(), [], "a step would take units the waiter can run on now")
+        status, result = self.admit()
+        self.assertEqual(status, 1)
+        self.assertIn("the jobs waiting here that fit them need 8 units", result["reason"])
+        for fd in self.held[:self.light]:  # free light's units beside the waiter's 8: the step fits beside it
+            os.close(fd)
+        del self.held[:self.light]
+        self.assertIn("light", self.fits())
+        self.assertEqual(self.admit()[0], 0)
+
+    def test_old_markers_and_nightly_jobs_keep_the_old_turn(self) -> None:
+        self.hold_units(14 - self.light)
+        self.waiter(None, 60)  # a hook before STEP_BACKFILL names no need
+        self.assertEqual(self.fits(), [])
+        self.waiter(8, 60, hook.TIER_NIGHTLY)
+        self.assertEqual(self.fits(), [])
+        self.assertEqual(self.admit()[0], 1)
+
+    def test_the_marker_carries_the_need(self) -> None:
+        marker = self.capacity / f"{hook.ADMIT_WANT}{os.getppid()}"
+        hook.write_want(marker, time.time(), ["units"], need=9, mem=3)
+        self.assertEqual([(w["need"], w["mem"]) for w in hook.admission_waiters(self.capacity)], [(9, 3)])
+        for bad in (True, -1, "8", 10 ** 6):
+            with self.subTest(need=bad):
+                marker.write_text(json.dumps({"since": time.time(), "wants": ["units"], "need": bad}))
+                self.assertEqual([w["need"] for w in hook.admission_waiters(self.capacity)], [None])
+
+
 if __name__ == "__main__":
     unittest.main()

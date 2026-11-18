@@ -6545,7 +6545,8 @@ def admission_waiters(capacity_dir: Path, skip_pid: int = 0) -> list[dict[str, A
         tier = data.get("tier") if data.get("tier") in (TIER_NIGHTLY, TIER_DEV, TIER_STACK) else ""
         lane = data.get("lane") if data.get("lane") in (SESSION_LANE, SIM_LANE) else ""
         waiters.append({"pid": pid, "since": since, "wants": wants, "who": str(data.get("who") or "")[:200],
-                        "tier": tier, "lane": lane,
+                        "tier": tier, "lane": lane, "need": want_count(data.get("need")),
+                        "mem": want_count(data.get("mem")) or 0,
                         "class": EXCLUSIVE_CLASS if data.get("class") == EXCLUSIVE_CLASS else "",
                         "signs_first": (data.get("signs_first") is True and tier == TIER_NIGHTLY
                                         and data.get("class") == EXCLUSIVE_CLASS)})
@@ -6602,6 +6603,59 @@ def fair_turn(capacity_dir: Path, needs: set[str], since: float, tier: str = "",
     return None
 
 
+# STEP_BACKFILL: a ci-step may take units a job waiting here for units cannot use now. Before, any waiter that named
+# "units" stopped every step (fair_turn, step_fits), however few units it lacked and however many sat free beside it:
+# on 2026-11-18 at 13:45Z five lent minis held 10-13 of 14 units with one to four PR jobs waiting for more, their
+# build workers claim-paused runner_job and advertised no class, while 228 cmux-ci steps queued (the oldest 875 min).
+# A step that fits in the 1-4 free units took nothing the waiting job could have run on. The fair turn exists so a
+# stream of small admissions cannot starve a job that needs many units: each would take a unit as it freed, and the
+# job would never see its count free at once. So a step yields where it would take a waiter's turn:
+#   - a waiter whose need fits in what is free now (units and RAM) is owed it: the step fits only in what is left
+#     beside every such waiter's need;
+#   - a waiter that has waited STEP_BACKFILL_S or longer gets the old turn: no step takes a unit until it is admitted,
+#     so the most a waiter loses to steps is that bound plus the steps already running;
+#   - a nightly job (FEED_FIRST), a signing job first in line (SIGNS_FIRST) and a waiter whose marker names no need
+#     (a hook before this rule) keep the old turn too.
+# The waiter's need is the units (with the idle reserve it must leave) and RAM chunks its last refusal counted, which
+# job-started writes in its admit.want marker (write_want: need, mem). PR jobs and the other admissions keep fair_turn
+# as before; only a ci-step (step_admit, step_fits) backfills.
+STEP_BACKFILL_S = float(os.environ.get("GLAEDA_RUNNER_STEP_BACKFILL_S") or 10 * 60)
+WANT_COUNT_MAX = 10000  # a need past any host's units or GiB is a bad marker
+
+
+def want_count(value: Any) -> int | None:
+    """A waiter marker's need or mem: an int in 0..WANT_COUNT_MAX, else None (unknown)."""
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= WANT_COUNT_MAX:
+        return None
+    return value
+
+
+def step_backfill_refusal(waiters: list[dict[str, Any]], free_units: int, mem_left: int, step_units: int,
+                          step_mem: int, now: float) -> str | None:
+    """Why a ci-step taking step_units units and step_mem RAM chunks must leave them to the jobs waiting here
+    (STEP_BACKFILL), or None. free_units and mem_left are what is free now, before the step takes its share."""
+    owed_units = owed_mem = 0
+    for waiter in waiters:
+        nightly = waiter["tier"] == TIER_NIGHTLY
+        if "units" not in waiter["wants"] and not nightly:
+            continue
+        who = waiter["who"] or "pid " + str(waiter["pid"])
+        need, mem = waiter.get("need"), int(waiter.get("mem") or 0)
+        if nightly or waiter.get("signs_first", False) or need is None:
+            kind = "a nightly job" if nightly else "a signing job" if waiter.get("signs_first") else "a job"
+            return f"capacity: {who} is {kind} waiting here for units and goes first"
+        waited = now - waiter["since"]
+        if waited >= STEP_BACKFILL_S:
+            return (f"capacity: {who} has waited {waited / 60:.0f} min here for {need} units, past "
+                    f"{STEP_BACKFILL_S / 60:g} min: no step takes a unit until it is admitted")
+        if need <= free_units and mem <= mem_left:
+            owed_units, owed_mem = owed_units + need, owed_mem + mem
+    if (owed_units and free_units - step_units < owed_units) or (owed_mem and mem_left - step_mem < owed_mem):
+        return (f"capacity: {free_units} units and {mem_left} GiB free; the jobs waiting here that fit them need "
+                f"{owed_units} units and {owed_mem} GiB, so a step taking {step_units} and {step_mem} GiB waits")
+    return None
+
+
 def job_who() -> str:
     """This job as a waiter marker and the log name it: runner, job id and run."""
     return " ".join(filter(None, (os.environ.get("RUNNER_NAME"), os.environ.get("GITHUB_JOB") or "a job",
@@ -6609,10 +6663,14 @@ def job_who() -> str:
 
 
 def write_want(marker: Path, since: float, wants: list[str], tier: str = "", lane: str = "",
-               klass: str = "", signs_first: bool = False) -> None:
+               klass: str = "", signs_first: bool = False, need: int | None = None, mem: int | None = None) -> None:
     with contextlib.suppress(OSError):
         tmp = marker.with_name(marker.name + ".tmp")
         want: dict[str, Any] = {"since": since, "wants": wants, "who": job_who()}
+        if want_count(need) is not None:  # STEP_BACKFILL: what a ci-step must leave it
+            want["need"] = need
+            if want_count(mem):
+                want["mem"] = mem
         if tier:
             want["tier"] = tier
         if lane:
@@ -6679,7 +6737,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                   one_holder: bool = False, since: float | None = None, gui_token: str = "gui",
                   gui_runner: bool = False, fresh_runner: bool = False, tier: str = "",
                   new_job: bool = False, nightly_runner: bool = False,
-                  keep_while: Path | None = None, signs_first: bool = False) -> tuple[bool, str]:
+                  keep_while: Path | None = None, signs_first: bool = False,
+                  backfill: bool = False) -> tuple[bool, str]:
     """Weighted admission for one of several runners on this mini, without ever waiting on a job.
     When held, taken_out (if given) receives the units and tokens taken, for the job log; on a capacity refusal it
     receives "wants", the kinds a waiter marker names (CAPACITY_WAIT): the token kind or "units" it lacks, else
@@ -6689,6 +6748,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
     (FEED_FIRST): a nightly job also keeps no idle reserve. klass, when given,
     is the class itself (a ci-step names it, step_admit) instead of one looked up from the job id. one_holder
     refuses, under admission.lock, when this holder file's holder is still alive (a ci-step key admits once).
+    backfill (a ci-step, step_admit) may take units a waiter cannot use now (STEP_BACKFILL) instead of yielding to
+    every waiter for units; taken_out's "need" and "mem" are what this job needs, for its waiter marker.
     Every job but the gui runner's own (gui_runner: job-started --gui-runner) leaves the units idle gui runners
     reserve free (gui_reserved, GUI_RESERVE). The gui runner's job takes them, and one that fits in the reserve its
     gate holds never queues behind another lane's job waiting for units: that job could not have taken the
@@ -6761,7 +6822,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         if one_holder and holder_alive(holder_file(state_dir)):
             return False, f"{job or 'this job'} is already admitted"
         if taken_out is not None:
-            taken_out["wants"] = list(tokens)
+            taken_out.update(wants=list(tokens), need=units, mem=chunks)  # need, mem: STEP_BACKFILL
         # the gui runner's job that fits in the reserve its gate holds takes the reserved unit, which no waiter here
         # could take
         own_reserve = gui_token if gui_runner else FRESH_RESERVE_TOKEN if fresh_runner else None
@@ -6771,6 +6832,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         needs = {name for token in tokens for name in (GATEWAY_TOKENS if token == GATEWAY_TOKEN_KIND else (token,))}
         # RAM waits as units do; a job the gui runner's reserve covers still never queues behind a units waiter
         needs |= {"units"} if units and not in_reserve else set()
+        if backfill:  # STEP_BACKFILL: the units waiters are weighed once the free units are counted, below
+            needs.discard("units")
         behind = fair_turn(capacity_dir, needs, time.time() if since is None else since, tier, units > 0, new_job,
                            signs_first and klass == EXCLUSIVE_CLASS)
         if behind:
@@ -6943,7 +7006,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         kept = max(kept, kept_now())
         if got < units or spare < kept:
             if taken_out is not None:
-                taken_out["wants"] = ["units"]
+                taken_out.update(wants=["units"], need=units + kept)  # it waits for the reserve beside its units too
             return refused(f"capacity: {got + spare} of {total} units free, {job or 'an unknown job'} ({klass}) "
                            f"needs {units}{kept_note(kept)}")
         mem_got = mem_spare = 0
@@ -6962,6 +7025,10 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                 taken_out["wants"] = ["units"]
             return refused(f"capacity: {mem_got + mem_spare} of {mem_total} GiB of RAM free, "
                            f"{job or 'an unknown job'} ({klass}) needs {chunks} GiB")
+        if backfill and (why := step_backfill_refusal(admission_waiters(capacity_dir), got + spare,
+                                                      mem_got + mem_spare if chunks else
+                                                      mem_free(capacity_dir, mem_total), units, chunks, time.time())):
+            return refused(why)
         root = next((name for name in taken if name.startswith("root-")), None)
         split = named[root] if root and klass in ROOT_SWITCHERS else None
         if split is not None:  # its own holder (ROOT_SWITCHERS); the main holder must not inherit it
@@ -7230,7 +7297,8 @@ def step_fits(capacity_dir: Path, total: int, compile_slots: int, roots: int, ho
     would hand back), and under
     admission.lock, held without waiting so no admission meets a unit the probe holds, enough unit files and one
     free copy of each token are free (an idle catch-up's locks count as free: it yields them to the next job), and
-    no job admitted here waits for units or one of those tokens (CAPACITY_WAIT: it goes first). The units an idle gui
+    no job admitted here waits for one of those tokens (CAPACITY_WAIT: it goes first), nor for units it could take
+    now or has waited STEP_BACKFILL_S for (STEP_BACKFILL: a step takes units a waiter cannot use). The units an idle gui
     runner reserves (GUI_RESERVE) are not free to a step."""
     if total <= 0 or host_drain(Path.home(), now) or host_held(host_lock, reservation, now, state_dir) \
             or host_waiters(host_lock, state_dir):
@@ -7258,9 +7326,10 @@ def step_fits(capacity_dir: Path, total: int, compile_slots: int, roots: int, ho
         units = sum(1 for slot in range(total) if free(f"unit-{slot}"))
         # a step is never the gui runner's job: it leaves the reserve free, and a starved root job's (STARVED_RESERVE)
         reserved = gui_reserved(capacity_dir) + starved_reserved(capacity_dir)
-        waited = set()
-        for waiter in admission_waiters(capacity_dir):
-            waited |= set(waiter["wants"]) | ({"units"} if waiter["tier"] == TIER_NIGHTLY else set())  # FEED_FIRST
+        waiters = admission_waiters(capacity_dir)
+        waited = set()  # the tokens waiters want; units are weighed per class (STEP_BACKFILL)
+        for waiter in waiters:
+            waited |= set(waiter["wants"]) - {"units"}
         fits = []
         simulators = simulator_host(state_dir)
         mem_total = mem_chunks_total()
@@ -7271,9 +7340,12 @@ def step_fits(capacity_dir: Path, total: int, compile_slots: int, roots: int, ho
             cost = STEP_COST_CLASS.get(klass, klass)
             step_need, tokens = class_need(cost), CLASS_COST[cost][1]
             need = min(step_need.cores, total)
-            if units < need + reserve_for(reserved, need, total) or waited & {*tokens, "units"}:  # fair_turn
+            if units < need + reserve_for(reserved, need, total) or waited & set(tokens):  # fair_turn
                 continue
-            if mem_left < min(mem_chunks(step_need.mib), mem_total):  # CAPACITY_ARITHMETIC: its RAM too
+            step_mem = min(mem_chunks(step_need.mib), mem_total)
+            if mem_left < step_mem:  # CAPACITY_ARITHMETIC: its RAM too
+                continue
+            if step_backfill_refusal(waiters, units, mem_left, need, step_mem, now):  # STEP_BACKFILL
                 continue
             # SIM_DYNAMIC: a simulator copy past the first fits only with headroom for it, as take_capacity admits it
             copies = {"persistent-dd": max(1, compile_slots), "root": max(1, roots),
@@ -7311,7 +7383,7 @@ def step_admit(klass: str, key: str, watch_pid: int, host_lock: str, reservation
     taken: dict[str, Any] = {}
     held, note = take_capacity(host_lock, capacity_dir, total, f"ci-step {key}", watch_pid, state_dir,
                                compile_slots, roots, klass=STEP_COST_CLASS.get(klass, klass), taken_out=taken,
-                               one_holder=True)
+                               one_holder=True, backfill=True)
     if not held:
         return refused(note)
     holder = holder_file(state_dir)
@@ -14273,7 +14345,7 @@ def main(argv: list[str] | None = None) -> int:
                     if admit_class != GATEWAY_CLASS:  # a gateway client's wait holds no other runner (GATEWAY)
                         write_want(marker, since, wants, tier,
                                    SESSION_LANE if args.session_runner else SIM_LANE if args.sim_runner else "",
-                                   claim_class, args.trusted_next_signing)
+                                   claim_class, args.trusted_next_signing, taken.get("need"), taken.get("mem"))
                     if note != shown or time.monotonic() - shown_at >= ADMIT_NOTE_S:
                         holders = ""
                         with contextlib.suppress(Exception):  # naming holders must never fail the wait
