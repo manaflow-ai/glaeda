@@ -1144,6 +1144,11 @@ classes (`light`, `isolated`) the mini could admit now, from the listener gate's
 build holds or waits for the host lock. `admit` takes the class's units without waiting and leaves them with a
 holder that watches the worker's pid, or exits 1 with the capacity reason; a key admits once. The holder files
 are named by a digest of the key, so one key's `release` never touches another's. Each prints one JSON line.
+A runner job waiting for units (`admit.want`, which names its need) holds off a step only where the step would take
+its turn (`STEP_BACKFILL`): when its need fits in what is free now, the step fits only beside it; when it does not,
+the step may take the free units it cannot use, until the job has waited `STEP_BACKFILL_S` (10 min,
+`GLAEDA_RUNNER_STEP_BACKFILL_S`), after which no step takes a unit until it is admitted. A nightly or signing
+waiter, or a marker without a need, holds every step as before.
 A dev build's exclusive host lock and a step's shared one exclude each other, as with runner jobs. Steps take no
 root, persistent-dd, gui or simulator token yet: the worker is a system LaunchDaemon outside the console
 session, and root classes move behind `admit` with compile placement.
