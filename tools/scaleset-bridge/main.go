@@ -50,7 +50,7 @@ func serve(ctx context.Context, input io.Reader, output io.Writer, server *serve
 		}
 
 		response := server.handle(ctx, request)
-		request.Start.PrivateKey = ""
+		request.Start.clearSecrets()
 		if err := encodeResponse(encoder, response); err != nil {
 			return err
 		}

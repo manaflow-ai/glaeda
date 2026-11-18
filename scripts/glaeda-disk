@@ -10,6 +10,9 @@
     glaeda-disk --dead --apply      now, job or no job: delete only what nothing can use (ended steps' checkouts,
                                     stopped unclaimed Tart VMs, retired services' folders, unused journey caches)
     glaeda-disk --pressure --idle --apply  pressure first; with no pressure, an hourly idle sweep
+    On a fleet mini build caches have no age window (BUILD_CACHES_UNWINDOWED): every whole --pressure --apply
+    pass sweeps too, every time, and takes each build cache nothing live holds, past the free target; summary.json's
+    outlived_build_caches names what a pass left behind
     glaeda-disk --low 15% --target 25%  thresholds as GiB free or as a share of each filesystem
     glaeda-disk --pressure --apply deletes while jobs run; it holds only while the host is CPU-saturated
                                     (host_saturated), and never below --emergency; deletes run at low IO priority
@@ -404,6 +407,15 @@ LIBRARY_PRIVACY_SKIP_NAMES = (
 LIBRARY_GUARDED_PARENTS = ((), ("Application Support",), ("Metadata",))
 
 
+# Set by --root-census only: the root LaunchDaemon glaeda-runner-hygiene installs on a CI mini (a host with an
+# enrolled runner account). It runs in launchd's system domain with no login session, so a guarded folder cannot put
+# a prompt on any screen: TCC lets root read it or refuses it silently. There every folder is walked, other accounts'
+# homes included, so the CI mini's accounting names each byte instead of "can't read user folders" (Leo, 2026-11-17).
+# Every walk run as a person's account (the LaunchAgent, the worker's lent eviction, a devbox) keeps the guards above:
+# that is where the cmux19 Photos prompt came from.
+ROOT_CENSUS_MODE = False
+
+
 def walk_reaches_a_home_library(root: Path) -> bool:
     """A du walk of ROOT can enter the guarded folders of some home's ~/Library: ROOT is /, the Data volume,
     /Users, a home (not /Users/Shared), its Library, or that Library's Application Support or Metadata; likewise
@@ -430,7 +442,7 @@ def privacy_guarded(parent: Path, name: str) -> bool:
     """The directory NAME in PARENT is one macOS guards with a privacy prompt (on macOS only): a PRIVACY_SKIP_NAMES
     folder at any depth, as du -I skips it, or a LIBRARY_PRIVACY_SKIP_NAMES folder directly in a Library or in its
     Application Support or Metadata (a simulator's own data/Containers deeper down is still walked)."""
-    if not DARWIN:
+    if not DARWIN or ROOT_CENSUS_MODE:
         return False
     if any(fnmatch.fnmatchcase(name, pattern) for pattern in PRIVACY_SKIP_NAMES):
         return True
@@ -443,8 +455,9 @@ def privacy_guarded(parent: Path, name: str) -> bool:
 def du_skip_args(root: Path | None = None) -> list[str]:
     """du's flags that keep a walk of ROOT out of FileProvider/iCloud trees and, on macOS, privacy-guarded
     folders (and a home's guarded Library folders, when the walk reaches one)."""
-    names = [*sorted(MEASURE_SKIP_COMPONENTS), *(PRIVACY_SKIP_NAMES if DARWIN else ())]
-    if DARWIN and root is not None and walk_reaches_a_home_library(root):
+    guarded = DARWIN and not ROOT_CENSUS_MODE
+    names = [*sorted(MEASURE_SKIP_COMPONENTS), *(PRIVACY_SKIP_NAMES if guarded else ())]
+    if guarded and root is not None and walk_reaches_a_home_library(root):
         names += LIBRARY_PRIVACY_SKIP_NAMES
     # The spelling follows the du that runs (BSD's -I, GNU's --exclude), not DARWIN, which a suite may set
     # on a Linux host.
@@ -933,6 +946,38 @@ PARKED_IDLE_HOURS = float("inf")  # parked builds age by host-job reuse distance
 # sweep's host-busy gate plus the normal process, socket, lease and recheck guards
 # remain in force before any deletion.
 PARKED_NO_LOG_IDLE_HOURS = DEFAULT_AGE_HOURS
+# No age window for a build cache on a fleet mini (Leo, 2026-11-18: "these build caches, if they're not being used,
+# they're not useful. So stop holding on to [junk]."). Local disk holds only what a running or queued build
+# uses now: a build cache (DerivedData, target dirs, per-hash and per-PR caches, seeds, admission and scheme output)
+# goes on the first pass after nothing live holds it, under pressure or not, past the free target, with no job-count
+# reuse distance and no pressure-only rule. What still keeps one: the never-delete list, live evidence (an open file,
+# a command line, a lock, lease or token, a socket, a running job that may hold it, a running VM), and one working
+# cache per kind by role (each root's current seed, SEED_KEEP; the per-host cmux-next build root; a media host's
+# tour slots; the nightly builder's warm inputs for its queued nightly; a cmux-tui tree a job may be linking into).
+# A reserved host keeps its holder's ages (keep_legacy_ages); disk-policy.json "build_caches_unwindowed": false
+# turns it off on one host. build_cache_unwindowed decides it per item; outlived_build_caches reports what a pass
+# left behind (summary.json), which cmuxterm-hq's detector reads.
+BUILD_CACHES_UNWINDOWED = False  # set by main: a fleet-mini pass, not reserved, not the runner-cache profile
+BUILD_CACHE_FAMILY_NAMES = ("cmux-pr-builds", "cmux-seeds", "cmux-kept-build", "ci-derived-data",
+                            "ci-ios-derived-data", "cmux-ci-admission", "cmux-ci-runner-admission",
+                            "cmux-spm-scratch", "cmux-fast-tier-seed-root", "cmux-next-ci-generated",
+                            "runner-checkout-build", "xcode-derived-data")
+
+
+def build_cache_family(fam: "Family") -> bool:
+    """A family whose items are build caches: build output, or one of the build-state families by id."""
+    return fam.build_output or fam.id in BUILD_CACHE_FAMILY_NAMES
+
+
+def build_cache_unwindowed(fam: "Family", path: Path | None = None) -> bool:
+    """Whether this item has no age window: a build cache on a fleet mini this run, other than the one working
+    cache per kind kept by role (see BUILD_CACHES_UNWINDOWED)."""
+    if not BUILD_CACHES_UNWINDOWED or not build_cache_family(fam) or fam.id == NIGHTLY_NEXT_FAMILY:
+        return False
+    if path is None:
+        return True
+    return not (media_tour_warm_slot(fam, path) or cmux_next_ci_host_root(fam, path)
+                or cmux_next_ci_tui_tree(fam, path) or cua_source_clone(fam, path))
 
 
 def fleet_stores(ci: Path | None = None) -> list[Path]:
@@ -1120,6 +1165,7 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "7def763ca3c6912cffc14dca5a28be0ee55279c747f22f7d70904b2d11ebd28b",
     "6c95f41f8ece6366199891978fbdb75f18f385b3266b3105d0571d6bbcbcd2fe",
     "3082c5a63cbe5d98a837b3fe648cab09dcddeb1c79cc475716a62b9529d024ba",
+    "52e9a71a38132cdf79e49f2b751940cb6b10dceededf16fa43ae28bf2cb05e72",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -1785,7 +1831,15 @@ def media_tour_stray(fam: Family, path: Path) -> bool:
 
 
 def item_window(fam: Family, path: Path, idle_hours: float, archived: frozenset[str] = frozenset()) -> float:
-    """The idle window for one candidate: a seed the archive already holds may go at once (the newest of each
+    """The idle window for one candidate: none for a build cache on a fleet mini (build_cache_unwindowed), else
+    family_item_window's."""
+    if build_cache_unwindowed(fam, path):
+        return 0.0
+    return family_item_window(fam, path, idle_hours, archived)
+
+
+def family_item_window(fam: Family, path: Path, idle_hours: float, archived: frozenset[str] = frozenset()) -> float:
+    """The family's idle window for one candidate: a seed the archive already holds may go at once (the newest of each
     root still stay, by keep_verdict), and SwiftPM scratch left in the trash or under the emergency floor
     (EMERGENCY_DEVS) may go at once (its lock keeps what a job holds), and so may an idle runner's build output
     while the runner gate holds for disk (FLOOR_HOLD), and cmux-next output while that cache is over its cap
@@ -2026,6 +2080,8 @@ POLICY_DEFAULTS: dict[str, Any] = {
     "low_margin_gib": 4.0,
     "target_margin_gib": 20.0,
     "pressure_idle_hours": 0.5,
+    # false: build caches keep their families' age windows on this host (BUILD_CACHES_UNWINDOWED)
+    "build_caches_unwindowed": True,
     # PRESSURE_MEASURE_BUDGET_S: seconds a pressure --apply spends starting size walks (0: no bound)
     "pressure_measure_budget_s": float(PRESSURE_MEASURE_BUDGET_S),
     "pressure_jobs": 80,
@@ -2199,8 +2255,13 @@ def item_due(fam: "Family", idle_hours: float, window: float) -> tuple[bool, int
     A hot-tier item used since the oldest running CI job started is never due: that job may hold it
     (a `cp -cR` clone leaves the source's times alone, and a step between commands names no path),
     which the old defer-while-CI-runs rule covered. Its own run counts toward jobs_since, so without
-    this a job could age the seed it started from past pressure_jobs."""
+    this a job could age the seed it started from past pressure_jobs.
+
+    A build cache with no age window (build_cache_unwindowed) is due at once, sweep or pressure: no job count and
+    no running job's age keep it, only its own live evidence (judged by the caller and again by apply)."""
     jobs = jobs_since_use(fam, idle_hours)
+    if window <= 0 and build_cache_unwindowed(fam):
+        return True, jobs
     if ACTIVITY_MODE == "pressure" and fam.id in FLEET_FAMILY_IDS:
         # Pressure spends disposable hot state until the free target, even on a quiet host.
         # A running job may touch a source between commands; cwd, command-line, socket and job-unit
@@ -4575,6 +4636,10 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
         Family(TART_VMS, HOME / ".tart/vms", True, "a stopped VM nobody claims: the next tart clone makes it again",
                owner="Tart (tart clone, tart create)", rebuild_minutes=30, min_idle_hours=TART_VM_IDLE_HOURS,
                reference_root=FLEET_ROOT, platform="macos"),
+        # Lima instances (LIMA_VMS: ~/.lima/<name>, the Linux worker VMs and their base), judged like Tart VMs.
+        Family(LIMA_VMS, HOME / ".lima", True, "a stopped VM nobody claims: the next limactl clone makes it again",
+               skip_prefixes=(".", "_"), owner="Lima (limactl create, limactl clone)",
+               rebuild_minutes=30, min_idle_hours=TART_VM_IDLE_HOURS, reference_root=FLEET_ROOT, platform="macos"),
         # cmux's journey harness keeps a build per job and its fetch scratch here (scripts/journeys/build_cache.py,
         # ~/.cache/cmux-journeys/{builds,fetch}/<entry>). As one ~/.cache item it read "unchecked" (an app bundle is too
         # deep for the git search) and stayed forever: 7 GiB on cmux21, 4.6 GiB on cmux22 (2026-11-15). An entry is
@@ -5369,8 +5434,8 @@ JOURNEY_IDLE_HOURS = 3 * 24.0
 
 # --dead: reclaim only what nothing can still use, whatever the free space and whether a job runs. These families'
 # items are dead by their own evidence, never by age alone or a quiet host: ended steps' checkouts (only those, in
-# tmp and user-tmp), stopped Tart VMs and images nobody claims, home folders whose owner service retired (only those,
-# in home-scratch), the journey cache's long-unused entries, and the aside trees of an interrupted deletion. Every
+# tmp and user-tmp), stopped Tart and Lima VMs and Tart images nobody claims, home folders whose owner service
+# retired (only those, in home-scratch), the journey cache's long-unused entries, and the aside trees of an interrupted deletion. Every
 # per-item check still holds (an open file, a running command, a socket, a lease). Anything a live job might touch
 # (its workspace, $TMPDIR scratch by age, the warm build stores) stays with the pressure and idle passes.
 DEAD_MODE = False
@@ -5378,7 +5443,7 @@ DEAD_MODE = False
 
 def dead_family_ids() -> frozenset[str]:
     return frozenset({*STEP_CHECKOUT_FAMILIES, HOME_SCRATCH_FAMILY, TART_IMAGES, TART_IPSWS, TART_VMS,
-                      *(f"journey-{sub}" for sub in JOURNEY_SUBDIRS), INTERRUPTED})
+                      LIMA_VMS, *(f"journey-{sub}" for sub in JOURNEY_SUBDIRS), INTERRUPTED})
 
 
 def dead_item(fam: Family, path: Path) -> bool:
@@ -5422,9 +5487,9 @@ def item_mtime(fam: Family, path: Path) -> float:
     # git-loss check before deletion.
     skip_names = frozenset(VCS_MARKERS) if (fam.id == "tmp" or RUNNER_CACHE_PROFILE) else frozenset()
     # Tart's access date first, and a walk that never lists a digest directory, which would move that date
-    tart = (tart_vm_last_use(path) if fam.id == TART_VMS else tart_last_use(path) if fam.id in TART_FAMILIES
-            else 0.0)
-    newest = newest_mtime(path, 1 if fam.id in TART_FAMILIES else 2 if fam.reclaimable else 1,
+    tart = (tart_vm_last_use(path) if fam.id in (TART_VMS, LIMA_VMS) else tart_last_use(path)
+            if fam.id in TART_FAMILIES else 0.0)
+    newest = newest_mtime(path, 1 if fam.id in ROOT_SAFE_FAMILIES else 2 if fam.reclaimable else 1,
                           3000 if fam.reclaimable else 300, access=fam.discover, skip_names=skip_names)
     if fam.id == SPM_SCRATCH:
         with contextlib.suppress(OSError):
@@ -6249,6 +6314,7 @@ OUT_OF_BAND_FAMILY_IDS = frozenset({
     "cua-cache",
     "cmux-ghosttykit-cache",
     "tart-vms",            # TART_VMS: a stopped VM: Tart's run lock and a tart command naming it still keep one in use
+    "lima-vms",            # LIMA_VMS: a stopped VM: a live hostagent and a limactl command naming it still keep one
     *(f"journey-{sub}" for sub in JOURNEY_SUBDIRS),  # journey rounds are no CI job; a running app still keeps its build
     INTERRUPTED,           # aside trees a killed deletion left; its own owner check still applies
 })
@@ -6306,7 +6372,7 @@ def interrupted_families(fams: list[Family]) -> list[Family]:
     for fam in fams:
         if not fam.reclaimable or fam.id == INTERRUPTED:
             continue
-        if fam.id in TART_FAMILIES and not tart_root_safe(fam.root):
+        if fam.id in ROOT_SAFE_FAMILIES and not tart_root_safe(fam.root):
             continue  # a symlinked or out-of-HOME Tart store is someone else's, its aside trees too (#1813)
         dirs = {fam.root}
         if fam.id == CMUX_NEXT_CI_FAMILY:  # a whole state set aside leaves no candidate where it sat
@@ -6698,8 +6764,10 @@ def keep_verdict(fam: "Family", path: Path) -> str:
         return rustup_verdict(path)
     if fam.checkout_builds and path.parent.name == "cache" and path.parent.parent.name == "apple-build":
         return apple_build_verdict(path)
-    if fam.id == TART_VMS and os.path.lexists(path / ROLE_KEEP_MARKER):
+    if fam.id in (TART_VMS, LIMA_VMS) and os.path.lexists(path / ROLE_KEEP_MARKER):
         return f"claimed ({ROLE_KEEP_MARKER} in it)"
+    if fam.id == LIMA_VMS and path.name in LIMA_BASE_NAMES:
+        return "the Linux worker VMs' base (ai.manaflow.cmux-linux-vm clones every slot from it)"
     return ""
 
 
@@ -9007,7 +9075,7 @@ def tart_seen(fam: Family, items: list[Path]) -> None:
     if fam.id == TART_IMAGES:
         for item in items:
             tart_last_use(item)
-    elif fam.id == TART_VMS:
+    elif fam.id in (TART_VMS, LIMA_VMS):
         for item in items:
             tart_vm_last_use(item)
 
@@ -9067,8 +9135,66 @@ def tart_vm_held(path: Path, cmds: str) -> str:
     return ""
 
 
+# Lima instances (`limactl create|clone`: ~/.lima/<name>, Lima's default LIMA_HOME, each a Linux disk). The Linux
+# worker VMs on fleet Macs (manaflow-ai/cmuxterm-hq build-fleet/mini-ops/linux-vm: ai.manaflow.cmux-linux-vm's slots
+# <host>-lvm-<k>, cloned from the stopped base cmux-linux-bake) live here, and no family listed them (Leo, 2026-11-17:
+# "and you guys haven't even set up linux vms on any of them... glaeda many months ago the whole point was to have
+# that"). Like a Tart VM, a stopped instance nothing touched for TART_VM_IDLE_HOURS goes: a running hostagent (its
+# ha.pid names a live process), a limactl command naming it, an open file, a fleet lease naming its path or a
+# .glaeda-keep.json claim in it (the supervisor writes one into each slot and the base) keeps it, and the base
+# (LIMA_BASE_NAMES) stays by name too. Lima's own entries (_config, _disks, _networks: every "_" name) and dot
+# entries are never items, and a ~/.lima that is a symlink or resolves outside HOME is never walked (tart_root_safe).
+LIMA_VMS = "lima-vms"
+# the base every slot is cloned from: an APFS clonefile clone reads none of its blocks, so its dates never move and
+# a missing claim would let --dead take it after TART_VM_IDLE_HOURS; it stays by name as well as by its claim
+LIMA_BASE_NAMES = frozenset({"cmux-linux-bake"})
+LIMA_VM_RUN = re.compile(r"(?:^|/)(?:limactl|lima)\s")
+ROOT_SAFE_FAMILIES = TART_FAMILIES | {LIMA_VMS}  # walked only when tart_root_safe(root)
+
+
+def lima_vm_held(path: Path, cmds: str) -> str:
+    """Why a Lima instance is in use, or "": its hostagent's ha.pid names a live process (Lima removes the file when
+    the instance stops; a stale one whose pid was reused keeps the instance, which only errs toward keeping), or a
+    running limactl or lima command names it. An unreadable or malformed ha.pid counts as held."""
+    try:
+        fd = os.open(path / "ha.pid", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        fd = None
+    except OSError:
+        return "its ha.pid is unreadable"
+    if fd is not None:
+        try:
+            st = os.fstat(fd)
+            raw = os.read(fd, 64)
+            # the read moves the pid file's atime (Linux relatime): hand Lima's date back, or this probe alone
+            # would make a stopped instance read as used (tart_vm_last_use counts its files' atime)
+            with contextlib.suppress(OSError, NotImplementedError):
+                os.utime(fd, ns=(st.st_atime_ns, st.st_mtime_ns))
+        except OSError:
+            return "its ha.pid is unreadable"
+        finally:
+            os.close(fd)
+        try:
+            pid = int(raw.decode("ascii", "replace").strip())
+        except ValueError:
+            return "its ha.pid is malformed"
+        if pid <= 0:
+            return "its ha.pid is malformed"
+        try:
+            os.kill(pid, 0)
+            return f"Lima runs it (hostagent pid {pid} in ha.pid is live)"
+        except PermissionError:
+            return f"Lima runs it (hostagent pid {pid} in ha.pid is live)"
+        except OSError:
+            pass  # a pid file the hostagent left on a crash: nothing runs it
+    for line in cmds.splitlines():
+        if LIMA_VM_RUN.search(line) and re.search(r"(?:^|\s)" + re.escape(path.name) + r"(?:\s|$)", line):
+            return f"a running limactl command names it ({line.strip()[:120]})"
+    return ""
+
+
 def candidates(fam: Family) -> list[Path]:
-    if fam.id in TART_FAMILIES and not tart_root_safe(fam.root):
+    if fam.id in ROOT_SAFE_FAMILIES and not tart_root_safe(fam.root):
         return []
     if fam.id == TART_IMAGES:
         level = tart_image_dirs(fam.root)
@@ -9571,13 +9697,15 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             reasons.append("a job holds its lock (owned_spm_scratch.py)")
         if fam.id == TART_VMS and not blind and (why := tart_vm_held(path, cmds)):
             reasons.append(why)
+        if fam.id == LIMA_VMS and not blind and (why := lima_vm_held(path, cmds)):
+            reasons.append(why)
         if media_tour_dd(fam, path) and media_tour_tag_held(path):
             reasons.append("a media tour holds its slot's tag lock (media_tag_lock.py)")
         if fam.id == CANONICAL_ADMISSION and canonical_root_held(path):
             reasons.append("a job holds its canonical root (root token)")
         if tmp_canonical_root(fam, path) and canonical_root_held(path, whole_root=True):
             reasons.append("a job holds this canonical root (root token)")
-        if fam.pressure_only and ACTIVITY_MODE != "pressure":
+        if fam.pressure_only and ACTIVITY_MODE != "pressure" and not build_cache_unwindowed(fam, path):
             reasons.append(("runner build output" if fam.id == RUNNER_BUILD_FAMILY else "package cache")
                            + ": pressure-only policy")
         if fam.git_disposable and (reference := referenced_main_checkout(path, nested=fam.nested_git)):
@@ -9603,7 +9731,7 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             reasons.append("holds a socket")
         if deletable_age and job_busy(fam, path):
             reasons.append("a cmux reload job holds its unit (.cmux-active or .lock)")
-        if fam.pressure_only and ACTIVITY_MODE != "pressure":
+        if fam.pressure_only and ACTIVITY_MODE != "pressure" and not build_cache_unwindowed(fam, path):
             verdict = "kept"
         elif not fam.reclaimable:
             verdict = "report-only"
@@ -10455,7 +10583,7 @@ def _census_du(path: Path, timeout: float) -> tuple[int, bool] | None:
 
 def census_pass(roots: list[Path], covered: set[str], state: dict[str, Any] | None = None, *,
                 budget_s: float = CENSUS_BUDGET_S, now: float | None = None, clock=time.monotonic,
-                path: Path | None = None) -> dict[str, Any]:
+                path: Path | None = None, open_also: frozenset[str] = frozenset()) -> dict[str, Any]:
     """Run one bounded slice of the census, resuming ``state`` and saving progress to ``path``."""
     now = time.time() if now is None else now
     state = dict(state or {})
@@ -10551,7 +10679,7 @@ def census_pass(roots: list[Path], covered: set[str], state: dict[str, Any] | No
             if key in covered:
                 skipped_covered.append(key)
                 continue
-            if key in ancestors or key in [str(r) for r in roots] or key in cursor:
+            if key in ancestors or key in open_also or key in [str(r) for r in roots] or key in cursor:
                 if not expand(current):
                     break
             else:
@@ -10685,6 +10813,9 @@ def launch_background_census() -> bool:
     """Start one detached, throttled census slice when one is due, handing it the lock this process took."""
     if not CENSUS_AUTOLAUNCH or not census_roots() or not census_due(load_census(), time.time()):
         return False
+    with contextlib.suppress(OSError):
+        if root_census_for(DATA_VOLUME.stat().st_dev, time.time()) is not None:
+            return False  # a CI mini's root census already walks every folder this one would
     handle = _census_lock()
     if handle is None:
         return False  # a slice is running
@@ -10732,6 +10863,221 @@ def census_main(args: list[str]) -> int:
     print(f"census {'complete' if state['complete'] else 'paused'}: {len(state['rows'])} rows, "
           f"{len(state['pending'])} directories left")
     return 0
+
+
+# Root census (CI minis): the same walk as the census above, run as root by the LaunchDaemon glaeda-runner-hygiene
+# installs beside each enrolled runner account's job, with no privacy guard (ROOT_CENSUS_MODE). The census above
+# runs as the fleet user: other accounts' homes, root-only /private/var and /Library trees and every guarded folder
+# came back as "unreadable" lower bounds or "skipped" at 0 bytes, and the gap took the rest. That is why the gap kept
+# coming back after each fix (0448e9b1 #1662 added the census, 688b3d30 #1803 ran it on CI minis, dfce52a4 #1911
+# named the APFS volumes; then ec497028 #2088 and 218b9210 #2118 made it skip every guarded folder after the cmux19
+# prompt, at 0 bytes). Each row carries the account that owns it; the doc is world-readable (0644) under a root-owned
+# directory, and the unprivileged pass merges it in place of its own census (filesystem_accounting).
+ROOT_CENSUS_DIR = Path("/Library/Application Support/glaeda/root-census")
+ROOT_CENSUS_STATE = ROOT_CENSUS_DIR / "census.json"
+ROOT_CENSUS_LOCK = ROOT_CENSUS_DIR / "census.lock"
+ROOT_CENSUS_BUDGET_S = 15 * 60  # one slice; the daemon starts one every half hour
+ROOT_CENSUS_MAX_AGE_S = 3 * CENSUS_EVERY_S  # an older complete census no longer describes the volume
+ROOT_CENSUS_SCOPE = "root-census"
+ROOT_CENSUS_OWNERS_SCOPE = "root-census-owners"
+ROOT_PROTECTED = "protected"  # a tree even root cannot list (SIP, or TCC refusing a daemon): du's lower bound
+
+
+def _row_owner(key: str) -> str:
+    """The account that owns a census row's directory (its parent, for a loose-files row)."""
+    path = Path(key)
+    if path.name == CENSUS_FILES:
+        path = path.parent
+    try:
+        uid = os.lstat(path).st_uid
+    except OSError:
+        return ""
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return f"uid {uid}"
+
+
+def apfs_local_snapshots() -> list[str]:
+    """The Data volume's local APFS snapshots (Time Machine, OS updates): their blocks are in df's used and in no
+    directory. tmutil names them; it reports no sizes."""
+    try:
+        out = subprocess.run(["/usr/bin/tmutil", "listlocalsnapshots", "/"], capture_output=True, text=True,
+                             timeout=30, check=False).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [line.strip() for line in out.splitlines() if line.strip().startswith("com.apple.")]
+
+
+def root_census_slice(roots: list[Path], state_path: Path, budget_s: float = ROOT_CENSUS_BUDGET_S,
+                      now: float | None = None) -> dict[str, Any]:
+    """One bounded slice of the root census: every folder walked, each row [bytes, kind, complete, owner]; a tree
+    du could not fully read even as root is ROOT_PROTECTED, never "unreadable"."""
+    global ROOT_CENSUS_MODE
+    now = time.time() if now is None else now
+    state = load_census(state_path)
+    meta = state.get("meta") if isinstance(state.get("meta"), dict) else {}
+    # /Users and every home in it are opened, never sized whole, so each account's bytes are rows of its own
+    open_also: set[str] = set()
+    for root in roots:
+        users = root / "Users"
+        open_also.add(census_canon(str(users)))
+        with contextlib.suppress(OSError):
+            open_also.update(census_canon(str(users / name)) for name in os.listdir(users))
+    saved, ROOT_CENSUS_MODE = ROOT_CENSUS_MODE, True
+    try:
+        state = census_pass(roots, set(), state, budget_s=budget_s, now=now, path=state_path,
+                            open_also=frozenset(open_also))
+    finally:
+        ROOT_CENSUS_MODE = saved
+    if state.get("complete"):
+        by_owner: dict[str, int] = {}
+        for key, row in state["rows"].items():
+            if not isinstance(row, list) or len(row) < 3:
+                continue
+            if row[1] == "unreadable":
+                row[1] = ROOT_PROTECTED
+            owner = _row_owner(key) or "unknown"
+            row[3:] = [owner]
+            by_owner[owner] = by_owner.get(owner, 0) + int(row[0])
+        meta = {"by_owner": by_owner, "snapshots": apfs_local_snapshots(), "at": now}
+    state["meta"] = meta
+    state["mount"] = str(roots[0]) if roots else ""
+    save_census(state, state_path)
+    return state
+
+
+def root_census_main(args: list[str]) -> int:
+    ap = argparse.ArgumentParser(prog="glaeda-disk --root-census")
+    ap.add_argument("--root-census", action="store_true")
+    ap.add_argument("--census-budget-s", type=float, default=ROOT_CENSUS_BUDGET_S)
+    a = ap.parse_args(args)
+    if not DARWIN or os.geteuid() != 0:
+        print("glaeda-disk --root-census runs as root on macOS (glaeda-runner-hygiene's census daemon)", file=sys.stderr)
+        return 2
+    os.umask(0o022)  # the doc is read by the unprivileged pass
+    with contextlib.suppress(OSError):
+        os.nice(19)
+    try:
+        ROOT_CENSUS_DIR.mkdir(mode=0o755, parents=True, exist_ok=True)
+        st = os.lstat(ROOT_CENSUS_DIR)
+    except OSError as e:
+        print(f"root census: {ROOT_CENSUS_DIR}: {e}", file=sys.stderr)
+        return 2
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != 0 or st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        print(f"root census: {ROOT_CENSUS_DIR} is not a root-owned, protected directory", file=sys.stderr)
+        return 2
+    try:
+        handle = ROOT_CENSUS_LOCK.open("a+")
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("root census already running; skipped")
+        return 0
+    budget = max(1.0, a.census_budget_s)
+    signal.alarm(int(budget + 3 * CENSUS_DU_TIMEOUT_S))
+    with handle:
+        roots = [DATA_VOLUME] if DATA_VOLUME.is_dir() else []
+        if not roots or not census_due(load_census(ROOT_CENSUS_STATE), time.time()):
+            print("root census not due; skipped")
+            return 0
+        state = root_census_slice(roots, ROOT_CENSUS_STATE, budget)
+    print(f"root census {'complete' if state['complete'] else 'paused'}: {len(state['rows'])} rows, "
+          f"{len(state['pending'])} directories left")
+    return 0
+
+
+def root_census_for(dev: int, now: float, path: Path | None = None) -> dict[str, Any] | None:
+    """The newest complete root census of this volume, fresh enough to describe it, or None. macOS renumbers st_dev
+    at each boot, so a census of the Data volume still counts when the Data volume is now this dev."""
+    doc = load_census(path or ROOT_CENSUS_STATE)
+    if not doc:
+        return None
+    try:
+        data_dev = DATA_VOLUME.stat().st_dev
+    except OSError:
+        data_dev = None
+    if doc.get("mount") == str(DATA_VOLUME) and data_dev == dev:
+        doc = {**doc, "dev": dev, **({"last": {**doc["last"], "dev": dev}} if isinstance(doc.get("last"), dict) else {})}
+    census = census_for(dev, doc)
+    if census is None or not census["complete"]:
+        return None
+    try:
+        if now - float(census.get("at") or 0) > ROOT_CENSUS_MAX_AGE_S:
+            return None
+    except (TypeError, ValueError):
+        return None
+    meta = doc.get("meta") if isinstance(doc.get("meta"), dict) else {}
+    return {**census, "by_owner": meta.get("by_owner") or {}, "snapshots": meta.get("snapshots") or []}
+
+
+def root_census_catalogue(census: dict[str, Any]) -> list[tuple[Path, int, str]]:
+    """Root census rows as sized paths. A tree this account cannot even stat (another account's home) still holds
+    its bytes: only a path that is gone (ENOENT) drops out."""
+    out = []
+    for key, row in census["rows"].items():
+        if not (isinstance(row, list) and row and isinstance(row[0], int) and row[0] > 0):
+            continue
+        try:
+            os.lstat(os.path.dirname(key) if key.endswith("/" + CENSUS_FILES) else key)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            pass
+        out.append((Path(census_canon(key)), int(row[0]), "census"))
+    return out
+
+
+def _root_label(key: str) -> str:
+    path = Path(census_canon(key))
+    return f"{path.parent} (files)" if path.name == CENSUS_FILES else str(path)
+
+
+def root_census_coverage(census: dict[str, Any]) -> list[dict[str, Any]]:
+    """The root census as two coverage rows: its largest trees, each with its owning account (and CENSUS_OWNERS'
+    owner where one is named), and the bytes per account."""
+    ranked = sorted(((int(row[0]), key, row) for key, row in census["rows"].items()
+                     if isinstance(row, list) and len(row) > 1 and isinstance(row[0], int)), reverse=True,
+                    key=lambda t: t[0])
+    children = []
+    for size, key, row in ranked[:CENSUS_ROWS_SHOWN]:
+        if not size and row[1] == "unclassified":
+            continue
+        label = _root_label(key)
+        account = row[3] if len(row) > 3 and row[3] else ""
+        owner = census_owner(label) or (f"{account}'s files" if account else "")
+        children.append({"category": f"{row[1]}:{label}", "bytes": size, "private": False,
+                         "classification": str(row[1]), **({"owner": owner} if owner else {}),
+                         **({"account": account} if account else {})})
+    rest = sum(size for size, _, _ in ranked[CENSUS_ROWS_SHOWN:])
+    if rest:
+        children.append({"category": "unclassified:other", "bytes": rest, "private": False,
+                         "classification": "unclassified"})
+    owners = sorted((census.get("by_owner") or {}).items(), key=lambda kv: -int(kv[1]))
+    return [{"scope": ROOT_CENSUS_SCOPE, "complete": True, "at": census["at"], "platform": "macos",
+             "children": children},
+            {"scope": ROOT_CENSUS_OWNERS_SCOPE, "complete": True, "at": census["at"], "platform": "macos",
+             "children": [{"category": f"account:{name}", "bytes": int(size), "private": False,
+                           "classification": "account"} for name, size in owners]}]
+
+
+def root_census_residual(census: dict[str, Any], shown: int = 3) -> str:
+    """What the gap left after a root census sits in: APFS snapshots, purgeable and open-deleted blocks, and the
+    trees even root could not list (named, with their lower bounds)."""
+    text = APFS_INVISIBLE + " after a root census of every folder"
+    snaps = census.get("snapshots") or []
+    if snaps:
+        text += f"; {len(snaps)} local APFS snapshots"
+    held = sorted(((int(row[0]), key, row[1]) for key, row in census["rows"].items()
+                   if isinstance(row, list) and len(row) > 1 and row[1] in (ROOT_PROTECTED, "skipped")
+                   and isinstance(row[0], int)), reverse=True)
+    if held:
+        named = []
+        for size, key, _ in held[:shown]:
+            label = _root_label(key)
+            owner = census_owner(label)
+            named.append(f"{label} >={size / GIB:.1f}G" + (f" ({owner})" if owner else ""))
+        text += f"; {len(held)} SIP-protected or FileProvider trees as lower bounds, largest: " + ", ".join(named)
+    return text
 
 
 def top_level_catalogued(catalogued: list[tuple[Path, int, str]]) -> list[tuple[Path, int, str]]:
@@ -10845,7 +11191,9 @@ def filesystem_accounting(fss: list[Fs], items: list[Item],
         blocked = sum(blocked_by_verdict.values())
         unchecked = blocked_by_verdict.get("unchecked", 0)
         census = None if RUNNER_CACHE_PROFILE else census_for(fs.dev)
-        sized_rows = [(Path(census_canon(str(path))), size, verdict) for path, size, verdict in catalogued]
+        # On a CI mini the root census (every folder, every account) stands in for this account's census
+        root_census = None if RUNNER_CACHE_PROFILE else root_census_for(fs.dev, now)
+        sized_rows =[(Path(census_canon(str(path))), size, verdict) for path, size, verdict in catalogued]
         listed = {str(path) for path, _, _ in catalogued}
         for path, size in (sizes or {}).items():
             if path in listed or size <= 0:
@@ -10858,7 +11206,7 @@ def filesystem_accounting(fss: list[Fs], items: list[Item],
         for row in top:
             if isinstance(row, dict) and isinstance(row.get("path"), str) and isinstance(row.get("bytes"), int):
                 sized_rows.append((Path(census_canon(row["path"])), row["bytes"], "sized"))
-        sized_rows.extend(census_catalogue(census))
+        sized_rows.extend(root_census_catalogue(root_census) if root_census else census_catalogue(census))
         outermost = top_level_catalogued(sorted(sized_rows, key=lambda row: (len(row[0].parts), str(row[0]))))
         volumes = None if RUNNER_CACHE_PROFILE else apfs_sibling_volumes(fs.mount, now)
         measured = sum(size for _, size, _ in outermost) + sum(v["bytes"] for v in volumes or [])
@@ -10888,12 +11236,15 @@ def filesystem_accounting(fss: list[Fs], items: list[Item],
             coverage_at = now if coverage else 0.0
         _ACCOUNTING_COVERAGE_MEM[(fs.dev, fs.mount)] = (coverage_at, coverage)
         coverage = [row for row in coverage
-                    if row.get("scope") not in (CENSUS_SCOPE, APFS_VOLUMES_SCOPE, SIM_RUNTIME_SCOPE)]
+                    if row.get("scope") not in (CENSUS_SCOPE, APFS_VOLUMES_SCOPE, SIM_RUNTIME_SCOPE,
+                                                ROOT_CENSUS_SCOPE, ROOT_CENSUS_OWNERS_SCOPE)]
         unclassified = max(0, used - measured)
         # The shared-runner coverage rows have no paths: subtract only what they hold beyond the sized
         # paths already measured inside /Users/Shared, or the same bytes would leave the gap twice.
         known_coverage = min(unclassified, int(max(0, reconciled_known_coverage(coverage) - measured_shared)))
-        if census is not None:
+        if root_census is not None:
+            coverage = [*coverage, *root_census_coverage(root_census)]
+        elif census is not None:
             coverage = [*coverage, census_coverage_row(census)]
         if DARWIN and not RUNNER_CACHE_PROFILE and (sim := sim_runtime_row(now)):
             coverage = [*coverage, sim]
@@ -10902,7 +11253,11 @@ def filesystem_accounting(fss: list[Fs], items: list[Item],
                                     "children": [{"category": f"volume:{v['role']} ({v['name']})", "bytes": v["bytes"],
                                                   "private": False, "classification": "keep", "owner": v["owner"]}
                                                  for v in volumes]}]
-        if census is not None and census["complete"]:
+        if root_census is not None:
+            # Root sized every folder of every account: what is left is no folder at all
+            gap = unclassified
+            residual = root_census_residual(root_census)
+        elif census is not None and census["complete"]:
             # The census already sized the shared tree by path, so the path-less coverage rows add nothing.
             gap = unclassified
             unreadable = sum(1 for row in census["rows"].values() if row[1] in ("unreadable", "skipped"))
@@ -11017,6 +11372,47 @@ def write_eviction_contention_health(receipt: Path) -> None:
             payload.pop("eviction_contention", None)
         else:
             payload["eviction_contention"] = contention
+        HEALTH_SUMMARY.parent.mkdir(parents=True, exist_ok=True)
+        tmp = HEALTH_SUMMARY.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(payload, separators=(",", ":")))
+        os.replace(tmp, HEALTH_SUMMARY)
+    except OSError:
+        pass
+
+
+OUTLIVED_TOP = 10
+
+
+def outlived_build_caches(items: list[Item], families: dict[str, Family]) -> dict[str, Any]:
+    """What an --apply pass left of the build caches nothing live holds: unwindowed build-cache items still on disk
+    that the pass judged reclaimable (or recent) and did not take. Kept ones (live evidence, role keep, never-delete)
+    are not in it. cmuxterm-hq's detector reads it from summary.json: nonzero after two passes is the bug."""
+    left = []
+    for i in items:
+        fam = families.get(i.family)
+        if (fam is not None and i.verdict in ("reclaimable", "recent") and build_cache_unwindowed(fam, Path(i.path))
+                and os.path.lexists(i.path)):
+            left.append(i)
+    left.sort(key=lambda i: -i.bytes)
+    return {"bytes": sum(i.bytes for i in left), "count": len(left),
+            "top": [{"family": i.family, "path": i.path, "bytes": i.bytes, "idle_hours": i.idle_hours,
+                     "verdict": i.verdict} for i in left[:OUTLIVED_TOP]]}
+
+
+def write_outlived_health(outlived: dict[str, Any] | None) -> None:
+    """Set (or, off a fleet mini's unwindowed pass, drop) summary.json's outlived_build_caches."""
+    try:
+        try:
+            payload = json.loads(HEALTH_SUMMARY.read_text())
+            if not isinstance(payload, dict):
+                payload = {}
+        except (OSError, ValueError):
+            payload = {}
+        payload.setdefault("schema", "glaeda-disk/v1")
+        if outlived is None:
+            payload.pop("outlived_build_caches", None)
+        else:
+            payload["outlived_build_caches"] = outlived
         HEALTH_SUMMARY.parent.mkdir(parents=True, exist_ok=True)
         tmp = HEALTH_SUMMARY.with_suffix(f".{os.getpid()}.tmp")
         tmp.write_text(json.dumps(payload, separators=(",", ":")))
@@ -11480,7 +11876,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
             with receipt.open("a") as f:
                 f.write(json.dumps(rec) + "\n")
             continue
-        if targets is not None:
+        if targets is not None and not build_cache_unwindowed(fam, p):  # a build cache goes past the target too
             try:
                 dev = p.parent.stat().st_dev
             except OSError:
@@ -11573,6 +11969,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 or (fam.id == NIGHTLY_NEXT_FAMILY and nightly_next_runner_busy(p, cmds))
                 or (fam.app_clones and app_clone_running(p, cmds))
                 or (fam.id == TART_VMS and tart_vm_held(p, cmds))
+                or (fam.id == LIMA_VMS and lima_vm_held(p, cmds))
                 or in_cwd(i.path, cwds) or named_by(i.path, cmds) or holds_socket(p) or job_busy(fam, p)
                 or (fam.reference_root is not None
                     and artifact_referenced(p, fresh_artifact_references(fam.reference_root)))
@@ -13436,8 +13833,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
                 else "")
     if reserved:
         keep_legacy_ages()
-    global RUNNER_CACHE_PROFILE
+    global RUNNER_CACHE_PROFILE, BUILD_CACHES_UNWINDOWED
     RUNNER_CACHE_PROFILE = bool(a.runner_caches)
+    BUILD_CACHES_UNWINDOWED = (role == "fleet-mini" and not reserved and not RUNNER_CACHE_PROFILE
+                               and bool(POLICY["build_caches_unwindowed"]))
     use_profile_state(RUNNER_CACHE_PROFILE)
     fams = runner_cache_families() if RUNNER_CACHE_PROFILE else default_families(role)
     if RUNNER_CACHE_PROFILE and not DARWIN:
@@ -13504,6 +13903,12 @@ def _main_impl(argv: list[str] | None = None) -> int:
     # a tmpfs is under pressure at a quarter full, so it shortens the idle window only for
     # pressure runs, which then touch nothing but that filesystem's families
     under = any(fs.under for fs in fss.values() if a.pressure or not fs.tmpfs)
+    # A build's caches go when it ends, not when the disk runs short: on a fleet mini every whole pressure pass (the
+    # runner hook's after each job, the gate's, the LaunchAgent's) sweeps when there is no pressure, every time.
+    every_pass_sweeps = (BUILD_CACHES_UNWINDOWED and a.pressure and a.apply and not a.family
+                         and not a.cmux_next_drain and not DEAD_MODE)
+    if every_pass_sweeps:
+        a.idle = True
     sweep = a.idle and not (a.pressure and under)
     RUN["floor_gib"] = round(floor_gib, 1)
     # every filesystem's exact target, and whether they are the ones a plain `--pressure --apply` works to: the runner
@@ -13522,7 +13927,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
         if not a.idle:
             RUN["skipped"] = "no pressure"
             return 0
-        if not idle_due():
+        if not every_pass_sweeps and not idle_due():
             print(f"idle sweep: the last one ran within {IDLE_SWEEP_EVERY_S // 60} min")
             RUN["skipped"] = "no pressure; idle sweep ran within the hour"
             return 0
@@ -13908,6 +14313,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
         after_fss, after_fs_receipt = reobserve_filesystems(fss)
         after_accounting = filesystem_accounting(after_fss, items, known)
         write_health_summary(after_fss, items, after_accounting, a.receipt)
+        if not DEAD_MODE and not a.family and not a.cmux_next_drain:
+            outlived = outlived_build_caches(items, by_id) if BUILD_CACHES_UNWINDOWED else None
+            RUN["outlived_build_cache_gib"] = round(outlived["bytes"] / GIB, 1) if outlived else None
+            write_outlived_health(outlived)
         summary = write_eviction_summary(a.receipt, operation, logical_released,
                                          before_fs_receipt, after_fs_receipt,
                                          receipt_accounting_before, after_accounting)
@@ -14046,6 +14455,8 @@ def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if "--census" in args:
         return census_main(args)
+    if "--root-census" in args:
+        return root_census_main(args)
     if "--own-runner-checkout" in args:
         return own_runner_checkout_main(args)
     background = "--refresh" in args and "--refresh-lock-fd" in args and "--apply" not in args

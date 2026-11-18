@@ -64,6 +64,10 @@
       "owner": "manaflow-ai/cmuxterm-hq build-fleet/mini-ops/lend-worker.sh",
       "why": "the build worker a runner mini lends between jobs"
     },
+    "ai.manaflow.cmux-linux-vm": {
+      "owner": "manaflow-ai/cmuxterm-hq build-fleet/mini-ops/linux-vm/install.sh",
+      "why": "Linux worker VMs (Lima) on the Mac's spare capacity, as build controller Linux pool workers"
+    },
     "ai.manaflow.console-unlock-guard": {
       "owner": "glaeda scripts/glaeda-daemon-heal (config/fleet-ops.json)",
       "why": "a fleet root op glaeda-daemon-heal installs and keeps current"

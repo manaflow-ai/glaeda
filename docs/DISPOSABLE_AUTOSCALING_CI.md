@@ -144,6 +144,16 @@ cursor poll proving the message absent; a newly observed later message is left u
 redelivery. Conflicting, runner-bearing, or Started evidence before durable clone ownership remains
 recovery debt.
 
+The bridge config now names one credential kind. Besides the Keychain App key, an enrollment
+(schema 2; schema 1 still decodes as the Keychain kind) may name `installation_token_file`: the
+path of a one-hour installation token that the App key's home host pushes, because the key itself
+never leaves that host. Each session start re-reads the file without following links and requires
+an operator-owned, single-link, mode-600 file for the expected App with runner-admin write and at
+least 15 minutes of life. The bridge (protocol 3) ends a token session at its next poll once under
+10 minutes remain, and the existing bounded supervisor restarts it with the freshly pushed token.
+`tools/scaleset-bridge/cmd/scaleset-enroll` is the separate plan-by-default command that creates
+the trusted runner group and scale set the bridge refuses to create.
+
 A private guest-handoff foundation consumes the bridge's guaranteed-zeroization JIT value as one
 secret standard-input line to a fixed template-bound guest launcher, without placing the value in
 argv, the inherited environment, logs, Debug, serialization, or an ordinary copied `String`. The

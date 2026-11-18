@@ -2475,6 +2475,8 @@ class HookTest(unittest.TestCase):
         # Only cmux-next.yml's jobs: the same id in another workflow is still an unknown job, a compile.
         self.assertEqual(hook.job_class("release-compile-fast", "manaflow-ai/cmux", workflow="other.yml")[0], "compile")
         self.assertEqual(hook.job_class("release-compile-fast", "manaflow-ai/cmux", workflow="cmux-next.yml")[0], "light")
+        self.assertEqual(hook.job_class("tooling-tests", "manaflow-ai/cmux", workflow="cmux-next-guards.yml"),
+                         ("light", False))
 
     def test_capacity_admits_by_weight_and_refuses_fast_when_full(self) -> None:
         self.fleet()

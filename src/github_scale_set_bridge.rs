@@ -34,10 +34,16 @@ use crate::github_scale_set_protocol::{
 };
 use crate::{disposable_worker_reconciler::ScaleSetDemand, execution_admission::EpochMillis};
 
-const PROTOCOL_VERSION: u8 = 2;
+const PROTOCOL_VERSION: u8 = 3;
 const MAX_PROTOCOL_LINE_BYTES: usize = 128 * 1024;
 const MAX_PRIVATE_KEY_BYTES: usize = 64 * 1024;
 const MAX_JIT_CONFIG_BYTES: usize = 64 * 1024;
+const MAX_INSTALLATION_TOKEN_FILE_BYTES: u64 = 16 * 1024;
+const MAX_INSTALLATION_TOKEN_BYTES: usize = 1024;
+/// The bridge refuses to start a token session with less life than this (`credential_expiring`).
+/// Checking it before spawning keeps a stale pushed file from costing a bridge process.
+const MIN_INSTALLATION_TOKEN_START_SECONDS: i64 = 15 * 60;
+const RUNNER_ADMIN_PERMISSION: &str = "organization_self_hosted_runners";
 const MAX_EVENTS: usize = 50;
 const MAX_ACQUIRE_REQUESTS: usize = 50;
 const MAX_LABELS: usize = 32;
@@ -101,6 +107,51 @@ impl GitHubAppKeychainConfig {
     }
 }
 
+/// A GitHub App installation token that the App key's home host mints and pushes to this host as a
+/// JSON file. The App private key never leaves its home; this host holds only an hour-long token.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct InstallationTokenFileConfig {
+    github_config_url: String,
+    app_id: u64,
+    path: PathBuf,
+}
+
+impl InstallationTokenFileConfig {
+    pub(crate) fn new(
+        github_config_url: &str,
+        app_id: u64,
+        path: &Path,
+    ) -> Result<Self, ScaleSetBridgeError> {
+        if !valid_github_config_url(github_config_url)
+            || app_id == 0
+            || !canonical_absolute_path(path)
+        {
+            return Err(ScaleSetBridgeError::new("invalid_installation_token_file"));
+        }
+        Ok(Self {
+            github_config_url: github_config_url.to_owned(),
+            app_id,
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+/// Exactly one credential source per enrolled bridge.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum ScaleSetBridgeCredential {
+    GitHubAppKeychain(GitHubAppKeychainConfig),
+    InstallationTokenFile(InstallationTokenFileConfig),
+}
+
+impl ScaleSetBridgeCredential {
+    fn github_config_url(&self) -> &str {
+        match self {
+            Self::GitHubAppKeychain(config) => &config.github_config_url,
+            Self::InstallationTokenFile(config) => &config.github_config_url,
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ScaleSetBridgeTarget {
     id: u32,
@@ -151,7 +202,7 @@ impl ScaleSetBridgeTarget {
 pub(crate) struct ScaleSetBridgeConfig {
     program: PathBuf,
     program_digest: Sha256Digest,
-    github_app: GitHubAppKeychainConfig,
+    credential: ScaleSetBridgeCredential,
     target: ScaleSetBridgeTarget,
 }
 
@@ -162,15 +213,33 @@ impl ScaleSetBridgeConfig {
         github_app: GitHubAppKeychainConfig,
         target: ScaleSetBridgeTarget,
     ) -> Result<Self, ScaleSetBridgeError> {
+        Self::with_credential(
+            program,
+            program_digest,
+            ScaleSetBridgeCredential::GitHubAppKeychain(github_app),
+            target,
+        )
+    }
+
+    pub(crate) fn with_credential(
+        program: &Path,
+        program_digest: Sha256Digest,
+        credential: ScaleSetBridgeCredential,
+        target: ScaleSetBridgeTarget,
+    ) -> Result<Self, ScaleSetBridgeError> {
         if program != Path::new(BRIDGE_PROGRAM) || !canonical_absolute_path(program) {
             return Err(ScaleSetBridgeError::new("invalid_bridge_program"));
         }
         Ok(Self {
             program: program.to_path_buf(),
             program_digest,
-            github_app,
+            credential,
             target,
         })
+    }
+
+    pub(crate) const fn credential(&self) -> &ScaleSetBridgeCredential {
+        &self.credential
     }
 }
 
@@ -221,6 +290,218 @@ impl fmt::Debug for GitHubAppPrivateKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("[REDACTED]")
     }
+}
+
+/// One pushed installation token, held only in zeroizing memory.
+struct InstallationToken {
+    value: Zeroizing<String>,
+    expires_at_unix: i64,
+}
+
+impl fmt::Debug for InstallationToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
+/// The exact single-token document the key home pushes (hq `read_token_push`).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstallationTokenFileWire {
+    app_id: u64,
+    token: ZeroizingTokenWire,
+    expires_at: String,
+    permissions: std::collections::BTreeMap<String, String>,
+    minted_at: String,
+}
+
+/// The token string, wiped on drop on every path, including decode refusals.
+struct ZeroizingTokenWire(Zeroizing<String>);
+
+impl<'de> Deserialize<'de> for ZeroizingTokenWire {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(|value| Self(Zeroizing::new(value)))
+    }
+}
+
+/// Decode and check one token document: its App, runner-admin write, a bounded token and at least
+/// the start headroom the bridge requires.
+fn parse_installation_token(
+    bytes: &[u8],
+    expected_app_id: u64,
+    now_unix: i64,
+) -> Result<InstallationToken, ScaleSetBridgeError> {
+    let wire: InstallationTokenFileWire = serde_json::from_slice(bytes)
+        .map_err(|_| ScaleSetBridgeError::new("invalid_installation_token_file"))?;
+    if wire.app_id != expected_app_id {
+        return Err(ScaleSetBridgeError::new("installation_token_wrong_app"));
+    }
+    if wire
+        .permissions
+        .get(RUNNER_ADMIN_PERMISSION)
+        .map(String::as_str)
+        != Some("write")
+    {
+        return Err(ScaleSetBridgeError::new(
+            "installation_token_lacks_runner_write",
+        ));
+    }
+    if !bounded_token(&wire.token.0, MAX_INSTALLATION_TOKEN_BYTES)
+        || parse_utc_timestamp(&wire.minted_at).is_none()
+    {
+        return Err(ScaleSetBridgeError::new("invalid_installation_token_file"));
+    }
+    let expires_at_unix = parse_utc_timestamp(&wire.expires_at)
+        .ok_or_else(|| ScaleSetBridgeError::new("invalid_installation_token_file"))?;
+    if expires_at_unix.saturating_sub(now_unix) < MIN_INSTALLATION_TOKEN_START_SECONDS {
+        return Err(ScaleSetBridgeError::new("installation_token_expiring"));
+    }
+    Ok(InstallationToken {
+        value: wire.token.0,
+        expires_at_unix,
+    })
+}
+
+/// Parse GitHub's `YYYY-MM-DDTHH:MM:SSZ` UTC form, and only that form, into Unix seconds.
+fn parse_utc_timestamp(value: &str) -> Option<i64> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || bytes[19] != b'Z'
+    {
+        return None;
+    }
+    let number = |range: std::ops::Range<usize>| -> Option<i64> {
+        let digits = &value[range];
+        if digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            digits.parse().ok()
+        } else {
+            None
+        }
+    };
+    let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
+    let (hour, minute, second) = (number(11..13)?, number(14..16)?, number(17..19)?);
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let month_days = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    if !(1970..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || day < 1
+        || day > month_days[usize::try_from(month - 1).ok()?]
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return None;
+    }
+    // Days from civil (Howard Hinnant's algorithm), proleptic Gregorian.
+    let shifted_year = if month <= 2 { year - 1 } else { year };
+    let era = shifted_year.div_euclid(400);
+    let year_of_era = shifted_year - era * 400;
+    let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+/// Read the pushed token file per session start: no link is followed, and only a regular,
+/// single-link file this user owns with mode 0600 or 0400 that did not change during the read.
+#[cfg(unix)]
+fn load_installation_token_file(
+    config: &InstallationTokenFileConfig,
+    now_unix: i64,
+) -> Result<InstallationToken, ScaleSetBridgeError> {
+    let unavailable = || ScaleSetBridgeError::new("installation_token_unavailable");
+    let path_before = std::fs::symlink_metadata(&config.path).map_err(|_| unavailable())?;
+    validate_installation_token_metadata(&path_before)?;
+    let descriptor = rustix::fs::open(
+        &config.path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(|_| unavailable())?;
+    let mut file = File::from(descriptor);
+    let before = file.metadata().map_err(|_| unavailable())?;
+    validate_installation_token_metadata(&before)?;
+    if !same_file_metadata(&path_before, &before) {
+        return Err(ScaleSetBridgeError::new("installation_token_changed"));
+    }
+    let mut bytes = Zeroizing::new(Vec::with_capacity(
+        usize::try_from(before.len()).map_err(|_| unavailable())?,
+    ));
+    if (&mut file)
+        .take(MAX_INSTALLATION_TOKEN_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() as u64 != before.len()
+    {
+        return Err(unavailable());
+    }
+    let after = file.metadata().map_err(|_| unavailable())?;
+    let path_after = std::fs::symlink_metadata(&config.path).map_err(|_| unavailable())?;
+    if !same_file_metadata(&before, &after) || !same_file_metadata(&before, &path_after) {
+        return Err(ScaleSetBridgeError::new("installation_token_changed"));
+    }
+    parse_installation_token(&bytes, config.app_id, now_unix)
+}
+
+#[cfg(unix)]
+fn validate_installation_token_metadata(
+    metadata: &std::fs::Metadata,
+) -> Result<(), ScaleSetBridgeError> {
+    if !metadata.file_type().is_file()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.nlink() != 1
+        || metadata.len() == 0
+        || metadata.len() > MAX_INSTALLATION_TOKEN_FILE_BYTES
+        || !matches!(metadata.mode() & 0o7777, 0o400 | 0o600)
+    {
+        return Err(ScaleSetBridgeError::new("unsafe_installation_token_file"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn same_file_metadata(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    left.dev() == right.dev()
+        && left.ino() == right.ino()
+        && left.uid() == right.uid()
+        && left.gid() == right.gid()
+        && left.mode() == right.mode()
+        && left.nlink() == right.nlink()
+        && left.len() == right.len()
+        && left.mtime() == right.mtime()
+        && left.mtime_nsec() == right.mtime_nsec()
+}
+
+fn unix_now() -> Result<i64, ScaleSetBridgeError> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| i64::try_from(elapsed.as_secs()).ok())
+        .ok_or_else(|| ScaleSetBridgeError::new("clock_unavailable"))
+}
+
+/// The one credential a start request carries.
+enum StartCredential {
+    PrivateKey(GitHubAppPrivateKey),
+    InstallationToken(InstallationToken),
 }
 
 #[cfg(target_os = "macos")]
@@ -911,8 +1192,11 @@ impl ScaleSetBridgeClient {
     pub(crate) fn connect_from_keychain(
         config: ScaleSetBridgeConfig,
     ) -> Result<Self, ScaleSetBridgeError> {
+        let ScaleSetBridgeCredential::GitHubAppKeychain(github_app) = &config.credential else {
+            return Err(ScaleSetBridgeError::new("bridge_credential_kind_mismatch"));
+        };
         let verified_program = VerifiedBridgeProgram::open(&config)?;
-        let private_key = load_keychain_private_key(&config.github_app)?;
+        let private_key = load_keychain_private_key(github_app)?;
         verified_program.confirm(&config.program)?;
         let mut transport = ChildBridgeTransport::spawn(&config.program)?;
         if let Err(error) = verified_program.confirm(&config.program) {
@@ -922,12 +1206,61 @@ impl ScaleSetBridgeClient {
         Self::connect_with_transport(config, private_key, Box::new(transport))
     }
 
+    /// Start a session from a freshly read installation token file. The supervisor calls this for
+    /// every session, so each restart (including the bridge's `credential_expiring` session end)
+    /// picks up the latest pushed token.
+    #[cfg(unix)]
+    pub(crate) fn connect_from_installation_token_file(
+        config: ScaleSetBridgeConfig,
+    ) -> Result<Self, ScaleSetBridgeError> {
+        let ScaleSetBridgeCredential::InstallationTokenFile(token_file) = &config.credential else {
+            return Err(ScaleSetBridgeError::new("bridge_credential_kind_mismatch"));
+        };
+        let verified_program = VerifiedBridgeProgram::open(&config)?;
+        let token = load_installation_token_file(token_file, unix_now()?)?;
+        verified_program.confirm(&config.program)?;
+        let mut transport = ChildBridgeTransport::spawn(&config.program)?;
+        if let Err(error) = verified_program.confirm(&config.program) {
+            transport.poison();
+            return Err(error);
+        }
+        Self::connect_with_credential(
+            config,
+            StartCredential::InstallationToken(token),
+            Box::new(transport),
+        )
+    }
+
+    /// Start a session with whichever credential kind the enrollment names.
+    pub(crate) fn connect_enrolled(
+        config: ScaleSetBridgeConfig,
+    ) -> Result<Self, ScaleSetBridgeError> {
+        match &config.credential {
+            #[cfg(unix)]
+            ScaleSetBridgeCredential::InstallationTokenFile(_) => {
+                Self::connect_from_installation_token_file(config)
+            }
+            #[cfg(target_os = "macos")]
+            ScaleSetBridgeCredential::GitHubAppKeychain(_) => Self::connect_from_keychain(config),
+            #[allow(unreachable_patterns)]
+            _ => Err(ScaleSetBridgeError::new("bridge_credential_unsupported")),
+        }
+    }
+
     fn connect_with_transport(
         config: ScaleSetBridgeConfig,
         private_key: GitHubAppPrivateKey,
+        transport: Box<dyn BridgeTransport>,
+    ) -> Result<Self, ScaleSetBridgeError> {
+        Self::connect_with_credential(config, StartCredential::PrivateKey(private_key), transport)
+    }
+
+    fn connect_with_credential(
+        config: ScaleSetBridgeConfig,
+        credential: StartCredential,
         mut transport: Box<dyn BridgeTransport>,
     ) -> Result<Self, ScaleSetBridgeError> {
-        let request = BridgeRequest::start(&config, &private_key);
+        let request = BridgeRequest::start(&config, &credential)?;
         let response = exchange_and_decode(transport.as_mut(), &request)?;
         expect_ready(&response, &config.target)?;
         Ok(Self {
@@ -1329,9 +1662,16 @@ struct BridgeRequest<'a> {
 #[derive(Serialize)]
 struct StartRequest<'a> {
     github_config_url: &'a str,
-    client_id: &'a str,
-    installation_id: u64,
-    private_key: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    installation_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    private_key: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    installation_token: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    installation_token_expires_at: Option<i64>,
     scale_set_id: u32,
     scale_set_name: &'a str,
     runner_group_id: u32,
@@ -1349,15 +1689,44 @@ impl<'a> BridgeRequest<'a> {
         }
     }
 
-    fn start(config: &'a ScaleSetBridgeConfig, key: &'a GitHubAppPrivateKey) -> Self {
-        Self {
+    fn start(
+        config: &'a ScaleSetBridgeConfig,
+        credential: &'a StartCredential,
+    ) -> Result<Self, ScaleSetBridgeError> {
+        let (client_id, installation_id, private_key, installation_token, expires_at) =
+            match (&config.credential, credential) {
+                (
+                    ScaleSetBridgeCredential::GitHubAppKeychain(app),
+                    StartCredential::PrivateKey(key),
+                ) => (
+                    Some(app.client_id.as_str()),
+                    Some(app.installation_id),
+                    Some(key.as_str()),
+                    None,
+                    None,
+                ),
+                (
+                    ScaleSetBridgeCredential::InstallationTokenFile(_),
+                    StartCredential::InstallationToken(token),
+                ) => (
+                    None,
+                    None,
+                    None,
+                    Some(token.value.as_str()),
+                    Some(token.expires_at_unix),
+                ),
+                _ => return Err(ScaleSetBridgeError::new("bridge_credential_kind_mismatch")),
+            };
+        Ok(Self {
             version: PROTOCOL_VERSION,
             operation: "start",
             start: Some(StartRequest {
-                github_config_url: &config.github_app.github_config_url,
-                client_id: &config.github_app.client_id,
-                installation_id: config.github_app.installation_id,
-                private_key: key.as_str(),
+                github_config_url: config.credential.github_config_url(),
+                client_id,
+                installation_id,
+                private_key,
+                installation_token,
+                installation_token_expires_at: expires_at,
                 scale_set_id: config.target.id,
                 scale_set_name: &config.target.name,
                 runner_group_id: config.target.runner_group_id,
@@ -1372,7 +1741,7 @@ impl<'a> BridgeRequest<'a> {
             runner_name: None,
             runner_id: None,
             work_folder: None,
-        }
+        })
     }
 
     const fn poll(max_capacity: u16) -> Self {
@@ -1776,6 +2145,7 @@ fn known_bridge_error(code: &str) -> Option<&'static str> {
         "runner_unavailable" => "runner_unavailable",
         "remove_failed" => "remove_failed",
         "response_too_large" => "response_too_large",
+        "credential_expiring" => "credential_expiring",
         _ => return None,
     })
 }
@@ -1905,10 +2275,10 @@ mod tests {
             .is_err()
         );
         assert!(
-            ScaleSetBridgeConfig::new(
+            ScaleSetBridgeConfig::with_credential(
                 Path::new("/opt/./bridge"),
                 Sha256Digest::parse(&format!("sha256:{}", "ab".repeat(32))).unwrap(),
-                config().github_app,
+                config().credential,
                 config().target
             )
             .is_err()
@@ -1942,9 +2312,9 @@ mod tests {
     #[test]
     fn session_maps_demand_events_and_exact_ack() {
         let transport = ScriptedTransport::new(&[
-            r#"{"version":2,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
-            r#"{"version":2,"type":"message","message_id":7,"statistics":{"available_jobs":1,"acquired_jobs":0,"assigned_jobs":1,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0},"events":[{"kind":"available","runner_request_id":41,"repository":"project","owner":"example","job_id":"job-1","workflow_run_id":99,"request_labels":["smolrunner"]}]}"#,
-            r#"{"version":2,"type":"acked","message_id":7,"acquired_requests":[41]}"#,
+            r#"{"version":3,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
+            r#"{"version":3,"type":"message","message_id":7,"statistics":{"available_jobs":1,"acquired_jobs":0,"assigned_jobs":1,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0},"events":[{"kind":"available","runner_request_id":41,"repository":"project","owner":"example","job_id":"job-1","workflow_run_id":99,"request_labels":["smolrunner"]}]}"#,
+            r#"{"version":3,"type":"acked","message_id":7,"acquired_requests":[41]}"#,
         ]);
         let mut client = ScaleSetBridgeClient::connect_with_transport(
             config(),
@@ -1978,9 +2348,9 @@ mod tests {
     #[test]
     fn fresh_session_restores_cursor_and_polls_lifecycle_at_zero_capacity() {
         let transport = ScriptedTransport::new(&[
-            r#"{"version":2,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
-            r#"{"version":2,"type":"restored","message_id":7}"#,
-            r#"{"version":2,"type":"message","message_id":8,"statistics":{"available_jobs":0,"acquired_jobs":1,"assigned_jobs":1,"running_jobs":1,"registered_runners":1,"busy_runners":1,"idle_runners":0},"events":[{"kind":"started","runner_request_id":41,"repository":"project","owner":"example","job_id":"job-1","workflow_run_id":99,"request_labels":["smolrunner"],"runner_id":81,"runner_name":"smolrunner-job-1"}]}"#,
+            r#"{"version":3,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
+            r#"{"version":3,"type":"restored","message_id":7}"#,
+            r#"{"version":3,"type":"message","message_id":8,"statistics":{"available_jobs":0,"acquired_jobs":1,"assigned_jobs":1,"running_jobs":1,"registered_runners":1,"busy_runners":1,"idle_runners":0},"events":[{"kind":"started","runner_request_id":41,"repository":"project","owner":"example","job_id":"job-1","workflow_run_id":99,"request_labels":["smolrunner"],"runner_id":81,"runner_name":"smolrunner-job-1"}]}"#,
         ]);
         let mut client = ScaleSetBridgeClient::connect_with_transport(
             config(),
@@ -2010,9 +2380,9 @@ mod tests {
     #[test]
     fn runner_observation_distinguishes_strict_absence_and_exact_presence() {
         let transport = ScriptedTransport::new(&[
-            r#"{"version":2,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
-            r#"{"version":2,"type":"runner_absent"}"#,
-            r#"{"version":2,"type":"runner","runner":{"id":81,"name":"smolrunner-job-1","scale_set_id":23}}"#,
+            r#"{"version":3,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
+            r#"{"version":3,"type":"runner_absent"}"#,
+            r#"{"version":3,"type":"runner","runner":{"id":81,"name":"smolrunner-job-1","scale_set_id":23}}"#,
         ]);
         let mut client = ScaleSetBridgeClient::connect_with_transport(
             config(),
@@ -2036,8 +2406,8 @@ mod tests {
     #[test]
     fn malformed_absence_response_poisons_the_bridge() {
         let (transport, poisoned) = ScriptedTransport::with_poison_probe(&[
-            r#"{"version":2,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
-            r#"{"version":2,"type":"runner_absent","runner":{"id":81,"name":"smolrunner-job-1","scale_set_id":23}}"#,
+            r#"{"version":3,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
+            r#"{"version":3,"type":"runner_absent","runner":{"id":81,"name":"smolrunner-job-1","scale_set_id":23}}"#,
         ]);
         let mut client = ScaleSetBridgeClient::connect_with_transport(
             config(),
@@ -2057,8 +2427,8 @@ mod tests {
     #[test]
     fn zero_capacity_poll_rejects_available_work_and_poisons_the_session() {
         let (transport, poisoned) = ScriptedTransport::with_poison_probe(&[
-            r#"{"version":2,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
-            r#"{"version":2,"type":"message","message_id":8,"statistics":{"available_jobs":1,"acquired_jobs":0,"assigned_jobs":1,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0},"events":[{"kind":"available","runner_request_id":41,"repository":"project","owner":"example","job_id":"job-1","workflow_run_id":99,"request_labels":["smolrunner"]}]}"#,
+            r#"{"version":3,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
+            r#"{"version":3,"type":"message","message_id":8,"statistics":{"available_jobs":1,"acquired_jobs":0,"assigned_jobs":1,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0},"events":[{"kind":"available","runner_request_id":41,"repository":"project","owner":"example","job_id":"job-1","workflow_run_id":99,"request_labels":["smolrunner"]}]}"#,
         ]);
         let mut client = ScaleSetBridgeClient::connect_with_transport(
             config(),
@@ -2078,9 +2448,9 @@ mod tests {
     #[test]
     fn replayable_acquire_accepts_exact_subset_and_empty_replay() {
         let transport = ScriptedTransport::new(&[
-            r#"{"version":2,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
-            r#"{"version":2,"type":"acquired","acquired_requests":[41,43]}"#,
-            r#"{"version":2,"type":"acquired","acquired_requests":[]}"#,
+            r#"{"version":3,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
+            r#"{"version":3,"type":"acquired","acquired_requests":[41,43]}"#,
+            r#"{"version":3,"type":"acquired","acquired_requests":[]}"#,
         ]);
         let mut client = ScaleSetBridgeClient::connect_with_transport(
             config(),
@@ -2099,8 +2469,8 @@ mod tests {
     #[test]
     fn replayable_acquire_rejects_invalid_requests_before_exchange() {
         let transport = ScriptedTransport::new(&[
-            r#"{"version":2,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
-            r#"{"version":2,"type":"acquired","acquired_requests":[41]}"#,
+            r#"{"version":3,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
+            r#"{"version":3,"type":"acquired","acquired_requests":[41]}"#,
         ]);
         let mut client = ScaleSetBridgeClient::connect_with_transport(
             config(),
@@ -2134,8 +2504,8 @@ mod tests {
     #[test]
     fn replayable_acquire_poisons_foreign_response() {
         let (transport, poisoned) = ScriptedTransport::with_poison_probe(&[
-            r#"{"version":2,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
-            r#"{"version":2,"type":"acquired","acquired_requests":[99]}"#,
+            r#"{"version":3,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
+            r#"{"version":3,"type":"acquired","acquired_requests":[99]}"#,
         ]);
         let mut client = ScaleSetBridgeClient::connect_with_transport(
             config(),
@@ -2158,8 +2528,8 @@ mod tests {
     #[test]
     fn replayable_acquire_preserves_known_service_refusal() {
         let (transport, poisoned) = ScriptedTransport::with_poison_probe(&[
-            r#"{"version":2,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
-            r#"{"version":2,"type":"error","code":"invalid_acquisition_request"}"#,
+            r#"{"version":3,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
+            r#"{"version":3,"type":"error","code":"invalid_acquisition_request"}"#,
         ]);
         let mut client = ScaleSetBridgeClient::connect_with_transport(
             config(),
@@ -2178,8 +2548,8 @@ mod tests {
     #[test]
     fn jit_secret_is_redacted_and_runner_is_exact() {
         let transport = ScriptedTransport::new(&[
-            r#"{"version":2,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
-            r#"{"version":2,"type":"jit","runner":{"id":81,"name":"smolrunner-job-1","scale_set_id":23},"encoded_jit_config":"one-time-secret"}"#,
+            r#"{"version":3,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
+            r#"{"version":3,"type":"jit","runner":{"id":81,"name":"smolrunner-job-1","scale_set_id":23},"encoded_jit_config":"one-time-secret"}"#,
         ]);
         let mut client = ScaleSetBridgeClient::connect_with_transport(
             config(),
@@ -2195,8 +2565,8 @@ mod tests {
         assert_eq!(receipt.config.expose_to_guest_handoff(), b"one-time-secret");
 
         let (transport, poisoned) = ScriptedTransport::with_poison_probe(&[
-            r#"{"version":2,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
-            r#"{"version":2,"type":"jit","runner":{"id":81,"name":"smolrunner-job-1","scale_set_id":23},"encoded_jit_config":"escaped\u002dsecret"}"#,
+            r#"{"version":3,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
+            r#"{"version":3,"type":"jit","runner":{"id":81,"name":"smolrunner-job-1","scale_set_id":23},"encoded_jit_config":"escaped\u002dsecret"}"#,
         ]);
         let mut client = ScaleSetBridgeClient::connect_with_transport(
             config(),
@@ -2220,7 +2590,7 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(old_version.code(), "invalid_bridge_response");
-        let unknown_error = match decode_response(br#"{"version":2,"type":"idle","unknown":true}"#)
+        let unknown_error = match decode_response(br#"{"version":3,"type":"idle","unknown":true}"#)
         {
             Ok(_) => panic!("unknown response field was accepted"),
             Err(error) => error,
@@ -2228,8 +2598,8 @@ mod tests {
         assert_eq!(unknown_error.code(), "invalid_bridge_response");
 
         let (transport, poisoned) = ScriptedTransport::with_poison_probe(&[
-            r#"{"version":2,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
-            r#"{"version":2,"type":"idle","unknown":true}"#,
+            r#"{"version":3,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
+            r#"{"version":3,"type":"idle","unknown":true}"#,
         ]);
         let mut client = ScaleSetBridgeClient::connect_with_transport(
             config(),
@@ -2244,7 +2614,7 @@ mod tests {
         assert!(poisoned.get());
 
         let mut response = decode_response(
-            br#"{"version":2,"type":"message","message_id":7,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0},"events":[{"kind":"completed","runner_request_id":41,"repository":"project","owner":"example","job_id":"job-1","workflow_run_id":99,"request_labels":["smolrunner"],"result":"failed"}]}"#,
+            br#"{"version":3,"type":"message","message_id":7,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0},"events":[{"kind":"completed","runner_request_id":41,"repository":"project","owner":"example","job_id":"job-1","workflow_run_id":99,"request_labels":["smolrunner"],"result":"failed"}]}"#,
         )
         .unwrap();
         assert_eq!(
@@ -2261,8 +2631,8 @@ mod tests {
         );
 
         let (transport, poisoned) = ScriptedTransport::with_poison_probe(&[
-            r#"{"version":2,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
-            r#"{"version":2,"type":"message","message_id":8,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0},"events":[{"kind":"completed","runner_request_id":41,"repository":"project","owner":"example","job_id":"job-1","workflow_run_id":99,"request_labels":["smolrunner"],"result":"failed"}]}"#,
+            r#"{"version":3,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
+            r#"{"version":3,"type":"message","message_id":8,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0},"events":[{"kind":"completed","runner_request_id":41,"repository":"project","owner":"example","job_id":"job-1","workflow_run_id":99,"request_labels":["smolrunner"],"result":"failed"}]}"#,
         ]);
         let mut client = ScaleSetBridgeClient::connect_with_transport(
             config(),
@@ -2304,5 +2674,293 @@ mod tests {
         let transport = ChildBridgeTransport::spawn(program).unwrap();
         let child = Pid::from_raw(transport.child.id() as _).unwrap();
         assert_eq!(getpgid(Some(child)).unwrap(), getpgrp());
+    }
+
+    const TOKEN_NOW: i64 = 1_800_000_000;
+
+    fn token_config(path: &Path) -> ScaleSetBridgeConfig {
+        ScaleSetBridgeConfig::with_credential(
+            Path::new("/opt/smolrunner/bin/scaleset-bridge"),
+            Sha256Digest::parse(&format!("sha256:{}", "ab".repeat(32))).unwrap(),
+            ScaleSetBridgeCredential::InstallationTokenFile(
+                InstallationTokenFileConfig::new("https://github.com/example", 5_067_688, path)
+                    .unwrap(),
+            ),
+            ScaleSetBridgeTarget::new(
+                23,
+                "smolrunner",
+                1,
+                &["smolrunner".to_owned()],
+                "smolrunner-host",
+                1,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn utc(unix: i64) -> String {
+        let days = unix.div_euclid(86_400);
+        let seconds = unix.rem_euclid(86_400);
+        // Civil from days (Howard Hinnant), the inverse of parse_utc_timestamp.
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let day = doy - (153 * mp + 2) / 5 + 1;
+        let month = if mp < 10 { mp + 3 } else { mp - 9 };
+        let year = yoe + era * 400 + i64::from(month <= 2);
+        format!(
+            "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+            seconds / 3_600,
+            seconds % 3_600 / 60,
+            seconds % 60
+        )
+    }
+
+    fn token_document(expires_at: i64) -> String {
+        format!(
+            r#"{{"app_id": 5067688, "token": "ghs_pushedToken123", "expires_at": "{}", "permissions": {{"organization_self_hosted_runners": "write", "metadata": "read"}}, "minted_at": "{}"}}"#,
+            utc(expires_at),
+            utc(expires_at - 3_600)
+        )
+    }
+
+    #[test]
+    fn utc_timestamps_parse_only_the_github_form() {
+        assert_eq!(parse_utc_timestamp("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            parse_utc_timestamp("2026-11-18T09:49:00Z"),
+            Some(1_794_995_340)
+        );
+        assert_eq!(
+            parse_utc_timestamp("2024-02-29T23:59:59Z"),
+            Some(1_709_251_199)
+        );
+        assert_eq!(utc(TOKEN_NOW), "2027-01-15T08:00:00Z");
+        assert_eq!(parse_utc_timestamp(&utc(TOKEN_NOW)), Some(TOKEN_NOW));
+        for invalid in [
+            "2026-11-18T09:49:00+00:00",
+            "2026-11-18 09:49:00Z",
+            "2026-11-18T09:49:00.000Z",
+            "2025-02-29T00:00:00Z",
+            "2026-13-01T00:00:00Z",
+            "2026-11-18T24:00:00Z",
+            "+026-11-18T09:49:00Z",
+            "",
+        ] {
+            assert_eq!(parse_utc_timestamp(invalid), None, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn installation_token_document_is_strict() {
+        let token = parse_installation_token(
+            token_document(TOKEN_NOW + 3_000).as_bytes(),
+            5_067_688,
+            TOKEN_NOW,
+        )
+        .unwrap();
+        assert_eq!(token.value.as_str(), "ghs_pushedToken123");
+        assert_eq!(token.expires_at_unix, TOKEN_NOW + 3_000);
+        assert_eq!(format!("{token:?}"), "[REDACTED]");
+
+        let valid = token_document(TOKEN_NOW + 3_000);
+        let cases = [
+            (
+                valid.replace("5067688", "1"),
+                "installation_token_wrong_app",
+            ),
+            (
+                valid.replace(
+                    "\"organization_self_hosted_runners\": \"write\"",
+                    "\"organization_self_hosted_runners\": \"read\"",
+                ),
+                "installation_token_lacks_runner_write",
+            ),
+            (
+                valid.replace("\"app_id\"", "\"private_key\": \"x\", \"app_id\""),
+                "invalid_installation_token_file",
+            ),
+            (
+                valid.replace("ghs_pushedToken123", "ghs pushed"),
+                "invalid_installation_token_file",
+            ),
+            (
+                token_document(TOKEN_NOW + MIN_INSTALLATION_TOKEN_START_SECONDS - 1),
+                "installation_token_expiring",
+            ),
+            (
+                token_document(TOKEN_NOW - 60),
+                "installation_token_expiring",
+            ),
+        ];
+        for (document, code) in cases {
+            assert_eq!(
+                parse_installation_token(document.as_bytes(), 5_067_688, TOKEN_NOW)
+                    .unwrap_err()
+                    .code(),
+                code
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    struct TokenDir(PathBuf);
+
+    #[cfg(unix)]
+    impl TokenDir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("glaeda-token-test-{}-{name}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn write(&self, mode: u32, contents: &str) -> PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            let path = self.0.join("token.json");
+            std::fs::write(&path, contents).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            path
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for TokenDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installation_token_file_read_requires_a_private_regular_file() {
+        let now = unix_now().unwrap();
+        let dir = TokenDir::new("read");
+        let path = dir.write(0o600, &token_document(now + 3_000));
+        let config =
+            InstallationTokenFileConfig::new("https://github.com/example", 5_067_688, &path)
+                .unwrap();
+        assert_eq!(
+            load_installation_token_file(&config, now)
+                .unwrap()
+                .value
+                .as_str(),
+            "ghs_pushedToken123"
+        );
+
+        dir.write(0o640, &token_document(now + 3_000));
+        assert_eq!(
+            load_installation_token_file(&config, now)
+                .unwrap_err()
+                .code(),
+            "unsafe_installation_token_file"
+        );
+
+        let link_dir = TokenDir::new("link");
+        let target = link_dir.write(0o600, &token_document(now + 3_000));
+        let link = link_dir.0.join("link.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let linked =
+            InstallationTokenFileConfig::new("https://github.com/example", 5_067_688, &link)
+                .unwrap();
+        assert_eq!(
+            load_installation_token_file(&linked, now)
+                .unwrap_err()
+                .code(),
+            "unsafe_installation_token_file"
+        );
+
+        let missing = InstallationTokenFileConfig::new(
+            "https://github.com/example",
+            5_067_688,
+            &dir.0.join("absent.json"),
+        )
+        .unwrap();
+        assert_eq!(
+            load_installation_token_file(&missing, now)
+                .unwrap_err()
+                .code(),
+            "installation_token_unavailable"
+        );
+    }
+
+    #[test]
+    fn installation_token_file_config_fails_closed() {
+        for path in ["relative.json", "/a/../token.json", "/a/./token.json", "/"] {
+            assert!(
+                InstallationTokenFileConfig::new("https://github.com/example", 1, Path::new(path))
+                    .is_err(),
+                "{path}"
+            );
+        }
+        assert!(
+            InstallationTokenFileConfig::new("https://github.com/example", 0, Path::new("/t.json"))
+                .is_err()
+        );
+        assert!(
+            InstallationTokenFileConfig::new("http://github.com/example", 1, Path::new("/t.json"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn token_start_request_carries_only_the_token_credential() {
+        let token_cfg = token_config(Path::new("/home/runner/.glaeda/scaleset-token.json"));
+        let credential = StartCredential::InstallationToken(
+            parse_installation_token(
+                token_document(TOKEN_NOW + 3_000).as_bytes(),
+                5_067_688,
+                TOKEN_NOW,
+            )
+            .unwrap(),
+        );
+        let encoded =
+            serde_json::to_value(BridgeRequest::start(&token_cfg, &credential).unwrap()).unwrap();
+        assert_eq!(encoded["version"], 3);
+        let start = encoded["start"].as_object().unwrap();
+        assert_eq!(start["installation_token"], "ghs_pushedToken123");
+        assert_eq!(start["installation_token_expires_at"], TOKEN_NOW + 3_000);
+        assert_eq!(start["github_config_url"], "https://github.com/example");
+        for absent in ["client_id", "installation_id", "private_key"] {
+            assert!(!start.contains_key(absent), "{absent}");
+        }
+
+        let key = StartCredential::PrivateKey(GitHubAppPrivateKey::parse(b"key".to_vec()).unwrap());
+        assert_eq!(
+            BridgeRequest::start(&token_cfg, &key).err().unwrap().code(),
+            "bridge_credential_kind_mismatch"
+        );
+        let encoded_key =
+            serde_json::to_value(BridgeRequest::start(&config(), &key).unwrap()).unwrap();
+        let start = encoded_key["start"].as_object().unwrap();
+        assert_eq!(start["private_key"], "key");
+        assert!(!start.contains_key("installation_token"));
+        assert!(!start.contains_key("installation_token_expires_at"));
+    }
+
+    #[test]
+    fn token_session_ready_and_credential_expiring_is_a_known_session_end() {
+        let config = token_config(Path::new("/home/runner/.glaeda/scaleset-token.json"));
+        let credential = StartCredential::InstallationToken(
+            parse_installation_token(
+                token_document(TOKEN_NOW + 3_000).as_bytes(),
+                5_067_688,
+                TOKEN_NOW,
+            )
+            .unwrap(),
+        );
+        let transport = ScriptedTransport::new(&[
+            r#"{"version":3,"type":"ready","scale_set_id":23,"statistics":{"available_jobs":0,"acquired_jobs":0,"assigned_jobs":0,"running_jobs":0,"registered_runners":0,"busy_runners":0,"idle_runners":0}}"#,
+            r#"{"version":3,"type":"error","code":"credential_expiring"}"#,
+        ]);
+        let mut client =
+            ScaleSetBridgeClient::connect_with_credential(config, credential, Box::new(transport))
+                .unwrap();
+        assert_eq!(client.poll(1).unwrap_err().code(), "credential_expiring");
     }
 }

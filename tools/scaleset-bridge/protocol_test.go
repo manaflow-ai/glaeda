@@ -112,15 +112,16 @@ func startedServer(t *testing.T, fake *fakeBackend) *server {
 }
 
 func TestDecodeRequestIsStrictAndVersioned(t *testing.T) {
-	valid := []byte(`{"version":2,"operation":"poll"}`)
+	valid := []byte(`{"version":3,"operation":"poll"}`)
 	request, err := decodeRequest(valid)
 	if err != nil || request.Operation != "poll" {
 		t.Fatalf("valid request: request=%#v err=%v", request, err)
 	}
 	for _, input := range [][]byte{
 		[]byte(`{"version":1,"operation":"poll"}`),
-		[]byte(`{"version":2,"operation":"poll","unknown":true}`),
-		[]byte(`{"version":2,"operation":"poll"} {}`),
+		[]byte(`{"version":2,"operation":"poll"}`),
+		[]byte(`{"version":3,"operation":"poll","unknown":true}`),
+		[]byte(`{"version":3,"operation":"poll"} {}`),
 	} {
 		if _, err := decodeRequest(input); err == nil {
 			t.Fatalf("accepted invalid request %s", input)

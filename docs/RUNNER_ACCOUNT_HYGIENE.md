@@ -32,6 +32,27 @@ cache profile:
 python3 -I <pinned-glaeda-disk> --runner-caches --pressure --idle --apply --top 0
 ```
 
+The same `--apply` also installs the host's one root census job (kept current
+by every enrolled account's `--check`/`--apply`, removed with the last
+account): a pinned copy at
+`/Library/Application Support/glaeda/runner-hygiene/root-census/glaeda-disk`
+and `/Library/LaunchDaemons/com.teamleaderleo.glaeda.runner-hygiene.root-census.plist`
+with no `UserName`, so launchd runs it as root every 30 minutes:
+
+```text
+python3 -I <pinned-glaeda-disk> --root-census
+```
+
+It is read-only (du, directory listings, lstat) and walks every folder of the
+Data volume, other accounts' homes and privacy-guarded folders included: a
+system-domain daemon has no login session, so no privacy prompt can reach a
+screen. It writes one world-readable doc,
+`/Library/Application Support/glaeda/root-census/census.json`, each row with the
+account that owns it. The fleet user's `glaeda-disk` merges it in place of its
+own census, so a CI mini's `accounting_gap` is only what no folder holds (APFS
+snapshots, purgeable and open-deleted blocks) and never "unreadable". The fleet
+user's own walks keep their privacy guards.
+
 The allowlist is five families: Xcode `DerivedData`, cmux job caches,
 GhosttyKit caches, CUA recordings, and CUA frame caches. Each item must be
 idle for at least 168 hours. A pressure wake happens every 15 minutes; when

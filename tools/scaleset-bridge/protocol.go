@@ -21,7 +21,15 @@ import (
 	"github.com/hashicorp/go-retryablehttp"
 )
 
-const protocolVersion = 2
+const protocolVersion = 3
+
+// An installation token is minted by the App key's home host and pushed with roughly an hour of
+// life. A session starts only with comfortable headroom, and a poll (the session's only idle
+// boundary) refuses once the token is near expiry so the Rust supervisor restarts the bridge with a
+// fresh read of the pushed token file. Operations after an outstanding poll still complete.
+const minInstallationTokenStartLife = 15 * time.Minute
+const installationTokenPollMargin = 10 * time.Minute
+const maxInstallationTokenBytes = 1024
 const bridgeVersion = "0.1.0"
 const maxServiceResponseBytes = 2 * 1024 * 1024
 const syntheticRunnerRequestMarker int64 = 1 << 62
@@ -41,16 +49,20 @@ type protocolRequest struct {
 }
 
 type startConfig struct {
-	GitHubConfigURL string   `json:"github_config_url"`
-	ClientID        string   `json:"client_id"`
-	InstallationID  int64    `json:"installation_id"`
-	PrivateKey      string   `json:"private_key"`
-	ScaleSetID      int      `json:"scale_set_id"`
-	ScaleSetName    string   `json:"scale_set_name"`
-	RunnerGroupID   int      `json:"runner_group_id"`
-	Labels          []string `json:"labels"`
-	Owner           string   `json:"owner"`
-	MaxCapacity     int      `json:"max_capacity"`
+	GitHubConfigURL string `json:"github_config_url"`
+	ClientID        string `json:"client_id,omitempty"`
+	InstallationID  int64  `json:"installation_id,omitempty"`
+	PrivateKey      string `json:"private_key,omitempty"`
+	// InstallationToken is the alternative to App key authentication: a GitHub App installation
+	// token that the key's home host minted. InstallationTokenExpiresAt is its Unix expiry second.
+	InstallationToken          string   `json:"installation_token,omitempty"`
+	InstallationTokenExpiresAt int64    `json:"installation_token_expires_at,omitempty"`
+	ScaleSetID                 int      `json:"scale_set_id"`
+	ScaleSetName               string   `json:"scale_set_name"`
+	RunnerGroupID              int      `json:"runner_group_id"`
+	Labels                     []string `json:"labels"`
+	Owner                      string   `json:"owner"`
+	MaxCapacity                int      `json:"max_capacity"`
 }
 
 type protocolResponse struct {
@@ -113,11 +125,21 @@ func (config startConfig) validate() error {
 			return errors.New("invalid GitHub configuration scope")
 		}
 	}
-	if !boundedToken(config.ClientID, 100) || config.InstallationID <= 0 {
-		return errors.New("invalid GitHub App identity")
-	}
-	if len(config.PrivateKey) == 0 || len(config.PrivateKey) > 64*1024 || !utf8.ValidString(config.PrivateKey) {
-		return errors.New("invalid GitHub App private key")
+	if config.usesInstallationToken() {
+		// Exactly one credential kind: a token start carries no App identity or key.
+		if config.ClientID != "" || config.InstallationID != 0 || config.PrivateKey != "" {
+			return errors.New("ambiguous GitHub credential")
+		}
+		if !boundedToken(config.InstallationToken, maxInstallationTokenBytes) || config.InstallationTokenExpiresAt <= 0 {
+			return errors.New("invalid GitHub installation token")
+		}
+	} else {
+		if !boundedToken(config.ClientID, 100) || config.InstallationID <= 0 {
+			return errors.New("invalid GitHub App identity")
+		}
+		if len(config.PrivateKey) == 0 || len(config.PrivateKey) > 64*1024 || !utf8.ValidString(config.PrivateKey) {
+			return errors.New("invalid GitHub App private key")
+		}
 	}
 	if config.ScaleSetID <= 0 || config.RunnerGroupID <= 0 || config.MaxCapacity < 0 || config.MaxCapacity > 64 {
 		return errors.New("invalid scale set bounds")
@@ -139,6 +161,16 @@ func (config startConfig) validate() error {
 		seen[label] = struct{}{}
 	}
 	return nil
+}
+
+func (config startConfig) usesInstallationToken() bool {
+	return config.InstallationToken != "" || config.InstallationTokenExpiresAt != 0
+}
+
+// clearSecrets drops every credential the start request carried.
+func (config *startConfig) clearSecrets() {
+	config.PrivateKey = ""
+	config.InstallationToken = ""
 }
 
 func boundedToken(value string, maximum int) bool {
@@ -187,22 +219,7 @@ func newOfficialBackend(ctx context.Context, config startConfig) (backend, error
 	if err := config.validate(); err != nil {
 		return nil, err
 	}
-	strictHTTP := newStrictHTTPClient()
-	client, err := scaleset.NewClientWithGitHubApp(scaleset.ClientWithGitHubAppConfig{
-		GitHubConfigURL: config.GitHubConfigURL,
-		GitHubAppAuth: scaleset.GitHubAppAuth{
-			ClientID:       config.ClientID,
-			InstallationID: config.InstallationID,
-			PrivateKey:     config.PrivateKey,
-		},
-		SystemInfo: scaleset.SystemInfo{
-			System:     "smolrunner",
-			Version:    bridgeVersion,
-			CommitSHA:  buildCommit(),
-			ScaleSetID: config.ScaleSetID,
-			Subsystem:  "bridge",
-		},
-	}, scaleset.WithRetryableHTTPClint(strictHTTP))
+	client, err := newOfficialClient(config, newStrictHTTPClient())
 	if err != nil {
 		return nil, err
 	}
@@ -218,8 +235,37 @@ func newOfficialBackend(ctx context.Context, config startConfig) (backend, error
 		return nil, err
 	}
 	expected := config
-	expected.PrivateKey = ""
+	expected.clearSecrets()
 	return &officialBackend{client: client, session: session, setID: set.ID, expected: expected}, nil
+}
+
+// newOfficialClient builds the pinned client with exactly the credential kind the start carried. The
+// pinned client sends an installation token exactly as it sends a personal access token: as the
+// bearer for the registration-token exchange that opens the Actions service session.
+func newOfficialClient(config startConfig, strictHTTP *retryablehttp.Client) (*scaleset.Client, error) {
+	systemInfo := scaleset.SystemInfo{
+		System:     "smolrunner",
+		Version:    bridgeVersion,
+		CommitSHA:  buildCommit(),
+		ScaleSetID: config.ScaleSetID,
+		Subsystem:  "bridge",
+	}
+	if config.usesInstallationToken() {
+		return scaleset.NewClientWithPersonalAccessToken(scaleset.NewClientWithPersonalAccessTokenConfig{
+			GitHubConfigURL:     config.GitHubConfigURL,
+			PersonalAccessToken: config.InstallationToken,
+			SystemInfo:          systemInfo,
+		}, scaleset.WithRetryableHTTPClint(strictHTTP))
+	}
+	return scaleset.NewClientWithGitHubApp(scaleset.ClientWithGitHubAppConfig{
+		GitHubConfigURL: config.GitHubConfigURL,
+		GitHubAppAuth: scaleset.GitHubAppAuth{
+			ClientID:       config.ClientID,
+			InstallationID: config.InstallationID,
+			PrivateKey:     config.PrivateKey,
+		},
+		SystemInfo: systemInfo,
+	}, scaleset.WithRetryableHTTPClint(strictHTTP))
 }
 
 func newStrictHTTPClient() *retryablehttp.Client {
@@ -403,16 +449,19 @@ type pendingMessage struct {
 }
 
 type server struct {
-	factory        backendFactory
-	backend        backend
-	config         startConfig
-	lastStatistics statistics
-	lastAckedID    int
-	pending        *pendingMessage
-	cursorSet      bool
+	factory backendFactory
+	now     func() time.Time
+	// credentialExpiresAt is zero for App key sessions, whose client refreshes its own tokens.
+	credentialExpiresAt time.Time
+	backend             backend
+	config              startConfig
+	lastStatistics      statistics
+	lastAckedID         int
+	pending             *pendingMessage
+	cursorSet           bool
 }
 
-func newServer(factory backendFactory) *server { return &server{factory: factory} }
+func newServer(factory backendFactory) *server { return &server{factory: factory, now: time.Now} }
 
 func (server *server) close() {
 	if server.backend != nil {
@@ -465,6 +514,13 @@ func (server *server) start(ctx context.Context, config startConfig) protocolRes
 	if err := config.validate(); err != nil {
 		return errorResponse("invalid_start")
 	}
+	var expiresAt time.Time
+	if config.usesInstallationToken() {
+		expiresAt = time.Unix(config.InstallationTokenExpiresAt, 0)
+		if expiresAt.Sub(server.now()) < minInstallationTokenStartLife {
+			return errorResponse("credential_expiring")
+		}
+	}
 	backend, err := server.factory(ctx, config)
 	if err != nil {
 		return errorResponse("start_failed")
@@ -476,7 +532,8 @@ func (server *server) start(ctx context.Context, config startConfig) protocolRes
 	}
 	server.backend = backend
 	server.config = config
-	server.config.PrivateKey = ""
+	server.config.clearSecrets()
+	server.credentialExpiresAt = expiresAt
 	server.lastStatistics = *initial
 	return protocolResponse{Version: protocolVersion, Type: "ready", ScaleSetID: config.ScaleSetID, Statistics: initial}
 }
@@ -490,6 +547,11 @@ func (server *server) poll(ctx context.Context, maxCapacity int) protocolRespons
 	}
 	if server.pending != nil {
 		return errorResponse("ack_required")
+	}
+	if !server.credentialExpiresAt.IsZero() && server.credentialExpiresAt.Sub(server.now()) < installationTokenPollMargin {
+		// End the session at its idle boundary, before any service call, so the supervisor
+		// restarts the bridge with a freshly pushed token.
+		return errorResponse("credential_expiring")
 	}
 	server.cursorSet = true
 	message, err := server.backend.Poll(ctx, server.lastAckedID, maxCapacity)

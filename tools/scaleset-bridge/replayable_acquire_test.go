@@ -9,7 +9,7 @@ import (
 )
 
 func TestDecodeReplayableAcquireRequest(t *testing.T) {
-	request, err := decodeRequest([]byte(`{"version":2,"operation":"acquire","runner_request_ids":[41,42]}`))
+	request, err := decodeRequest([]byte(`{"version":3,"operation":"acquire","runner_request_ids":[41,42]}`))
 	if err != nil {
 		t.Fatalf("decode acquire request: %v", err)
 	}

@@ -306,7 +306,7 @@ impl DisposableWorkerSupervisorDriver for DisposableWorkerServiceDriver {
     fn connect(&mut self) -> Result<Self::Session, DisposableWorkerSupervisorError> {
         #[cfg(target_os = "macos")]
         {
-            ScaleSetBridgeClient::connect_from_keychain(self.bridge_config.clone())
+            ScaleSetBridgeClient::connect_enrolled(self.bridge_config.clone())
                 .map_err(|error| DisposableWorkerSupervisorError::new(error.code()))
         }
         #[cfg(not(target_os = "macos"))]

@@ -1906,10 +1906,29 @@ def saved_hold(value: Any, now: float) -> float:
     try:
         until = float(value)
     except (ValueError, OverflowError):
-        return 0.0 if isinstance(value, str) else now + PACE_HOLD_MAX  # an int past a float's range: the far future
+        if isinstance(value, str) or value < 0:
+            return 0.0  # an int past a float's range below zero: the far past, no hold
+        return now + PACE_HOLD_MAX  # and above: the far future
     if not math.isfinite(until):
         return 0.0
     return max(0.0, min(until, now + PACE_HOLD_MAX))
+
+
+# What the keeper says when it fails reaches daemon.json (outbox.pause.lastError) and the log: anything shaped like a
+# credential is dropped first, then the text is cut to KEEPER_TEXT_MAX.
+KEEPER_TEXT_MAX = 200
+KEEPER_SECRET_RE = re.compile(
+    r"gh[posur]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,}"  # GitHub's token shapes, even cut short
+    r"|\b(?:bearer|token|basic)\s+\S+"  # an Authorization header's value
+    r"|\b[0-9a-f]{32,}\b"  # a long hex run
+    r"|[A-Za-z0-9+/_-]{32,}={0,2}",  # a long base64 run
+    re.IGNORECASE)
+
+
+def keeper_text(text: str) -> str:
+    """The keeper's own words, safe to store and log: credential-shaped runs redacted, at most KEEPER_TEXT_MAX
+    characters. Redacted before the cut, so a token the cut would split is never half kept."""
+    return KEEPER_SECRET_RE.sub("[redacted]", text)[:KEEPER_TEXT_MAX]
 
 
 _CONTENT_PAUSE_UNREAD: set[str] = set()  # CONTENT_PAUSE_ENV values already logged as unreadable
@@ -3258,6 +3277,7 @@ class Daemon:
         self.pause_report: threading.Thread | None = None  # the --hold report in flight (report_content_pause)
         self.pause_report_want: tuple[float, str] | None = None  # the hold it is to report next
         self.pause_report_lock = threading.Lock()
+        self.pause_reported: tuple[float, float] | None = None  # (clock, until) of the latest report, the max until
         saved = read_json(BASE / CONSUMERS_FILE)
         spends = saved.get("spends") if isinstance(saved, dict) else None
         # consumer -> times of the head reads charged to it in the last hour
@@ -4175,10 +4195,13 @@ class Daemon:
             done = run_bounded([*cmd, "content-pause"], CONTENT_PAUSE_SLOW_DEADLINE)
             doc = json.loads(done.stdout) if done.returncode == 0 else None
             if not isinstance(doc, dict):
-                raise ValueError(f"exit {done.returncode}: {(done.stderr or done.stdout or '').strip()[:200]}")
-            until = doc.get("blocked_until") or 0
+                raise WatchError(f"exit {done.returncode}: {keeper_text((done.stderr or done.stdout or '').strip())}")
+            # The keeper prints a number, 0 for no pause. Anything else ("", [], {}, a bool, null, no key, NaN or
+            # Infinity) is a failed ask and the last answer stands: `or 0` read "", [] and {} as "no pause".
+            until = doc.get("blocked_until")
             if isinstance(until, bool) or not isinstance(until, (int, float)) or not math.isfinite(until):
-                raise ValueError(f"blocked_until {until!r}")  # NaN or Infinity: a failed ask, the last answer stands
+                raise WatchError(keeper_text(f"blocked_until {until!r}" if "blocked_until" in doc
+                                             else "no blocked_until"))
             # blocked_until alone decides; level is the pacer's backoff state, never whether it is paused.
             # float() of an int past a float's range (json reads 1e400 written out as digits) raises OverflowError.
             self.pause_result = ("ok", (asked, float(until)))
@@ -4198,6 +4221,9 @@ class Daemon:
         if kind == "ok":
             asked, until = value
             until = min(until, clock + PACE_HOLD_MAX)  # a corrupt far future holds an hour at most
+            if self.pause_reported is not None and self.pause_reported[0] >= asked:
+                # a 403 reported after this ask began: the answer may predate it, so it never lowers the pause
+                until = max(until, self.pause_reported[1])
             if until > max(self.now, self.pause_until):
                 log({"event": "post-paused", "source": "login", "hold": round(until - self.now)})
             self.pause_until = until
@@ -4240,7 +4266,9 @@ class Daemon:
                 "asking": self.pause_ask is not None, "holding": self.content_pause_unknown()}
 
     def content_pause_settle(self, timeout: float) -> None:
-        """Wait up to `timeout` for the ask and the report in flight, and take the ask's answer (tests; shutdown)."""
+        """Wait up to `timeout` for the ask and the report in flight, and take the ask's answer (tests). Nothing
+        calls it at shutdown or re-exec: the daemon has no exit path (serve loops until killed or re-execs itself),
+        a report's keeper process outlives the exec, and the new daemon asks the pause afresh."""
         deadline = time.monotonic() + timeout
         for thread in (self.pause_ask, self.pause_report):
             if thread is not None:
@@ -4257,6 +4285,7 @@ class Daemon:
         if math.isnan(until):
             return
         self.pause_until = max(self.pause_until, until)
+        self.pause_reported = (self.clock(), max(until, self.pause_reported[1] if self.pause_reported else until))
         cmd = content_pause_cmd()
         if cmd is None:
             return
@@ -13509,19 +13538,21 @@ def broker_words(args: list[str]) -> tuple[list[str], str, set[str], dict[str, s
                     # in for it (`--json state ... --json`), or the broker answers a line gh rejects.
                     values.pop(name, None)
         elif arg.startswith("-") and arg != "-":
-            short, glued = arg[:2], arg[2:]
-            name = BROKER_FLAG_ALIAS.get(short, short)
-            seen.add(name)
-            if glued and short[1] in BROKER_SHORT_VALUE:
-                values[name] = glued
-            elif glued:
-                seen.update(BROKER_FLAG_ALIAS.get(f"-{c}", f"-{c}") for c in glued)  # `-abc`
-            elif short in BROKER_VALUE_FLAGS:
-                if i + 1 < len(args):
+            # A short cluster, read as cobra reads it: its letters are boolean flags until one that takes a value,
+            # which takes the rest of the word (`-Ro/r`, `-iXPOST`) or, at the word's end, the next word (`-iX POST`).
+            for at, letter in enumerate(arg[1:], start=1):
+                name = BROKER_FLAG_ALIAS.get(f"-{letter}", f"-{letter}")
+                seen.add(name)
+                if letter not in BROKER_SHORT_VALUE:
+                    continue
+                if at < len(arg) - 1:
+                    values[name] = arg[at + 1:]
+                elif i + 1 < len(args):
                     values[name] = args[i + 1]
                     i += 1
                 else:
                     values.pop(name, None)  # `-R o/r ... -R`: gh exits 1, so never serve it
+                break
         else:
             words.append(arg)
         i += 1
