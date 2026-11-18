@@ -101,7 +101,8 @@ hook's --toolchain-xcode) and scrubs its own environment the same way; a listene
 was not that (adopted_env_stale) is stopped once idle and started clean.
 A gui runner also stops listening while the console session is locked or nobody is logged in there
 (console_refusal). A gui or session runner is never held for CPU saturation, only memory pressure (Gate.saturated). While
-the gui runner is idle its gate holds the gui runner's reserve (GUI_RESERVE: capacity/<gui token>.reserve): every other job on the
+the gui runner is idle and a job of its label is queued (RESERVE_ON_DEMAND) its gate holds the gui runner's reserve
+(GUI_RESERVE: capacity/<gui token>.reserve): every other job on the
 mini, and every other runner's gate, leaves one unit free for its next job, so the side and root lanes cannot fill
 the mini and keep the gui label queued. A fast runner (--fast-runner) runs cmux-next's fast-tier on the fast tokens
 (FAST_TOKENS) instead of the shared units, and its gate looks at those tokens, never at the units. A gateway runner
@@ -1924,6 +1925,44 @@ def reserve_for(reserved: int, units: int, total: int) -> int:
     """The reserved units a job of `units` must leave free on a mini of `total`: at most what is left beside it, and
     none for a job that takes no unit (the fast runner's fast-tier listens and admits with every unit taken)."""
     return max(0, min(reserved, total - units)) if units > 0 else 0
+
+
+# RESERVE_ON_DEMAND (Leo, 2026-11-18: "there's still a ton of unused stuff rn? what's going on"): a reserve held on
+# presence kept its units from every job on the mini whenever its runner was idle, whether or not a job of its label
+# was coming. On 2026-11-18 05:09-07:01Z, with jobs queued for minis, PR runners held off by "N is kept for an idle
+# reserving runner" left 4.1 unit-hours idle (gui reserves 2.3, freshness slots 1.8; cmux11s 1.7). An idle reserving
+# runner now keeps its reserve only while the controller's feed (the HOST_LOAD_CAP summary) shows a queued job it could
+# take, and for RESERVE_LINGER_S after that or after its own job ended (a feed compile's next compile, a gui job's
+# next shard). With no such job its units take PR jobs; when one queues, the reserve is taken again and the jobs
+# beside it drain to it, as the starved-job reserve does. A feed that cannot be read or is stale keeps the reserve
+# (the rule before). GLAEDA_RUNNER_RESERVE_ON_DEMAND=off turns it off.
+RESERVE_ON_DEMAND_ENV = "GLAEDA_RUNNER_RESERVE_ON_DEMAND"
+RESERVE_LINGER_S = 180.0
+RESERVE_QUEUED = ("queued",)  # "waiting" (an approval) and "pending" (a concurrency group) no runner can take
+RESERVE_QUEUED_MAX_AGE_S = 12 * 3600.0  # a queued job older than this is a lost record, not a waiting job
+
+
+def label_queued(summary: dict[str, Any] | None, labels: frozenset[str] | None, now: float) -> bool | None:
+    """RESERVE_ON_DEMAND: whether the feed summary (load_cap_summary) shows a queued job whose labels are all this
+    runner's, or None when it cannot say (no summary or labels, the summary or its last delivery stale)."""
+    if not isinstance(summary, dict) or not labels:
+        return None
+    at, delivery = summary.get("at"), summary.get("delivery")
+    if not isinstance(at, (int, float)) or not 0 <= now - at <= HOST_LOAD_CAP_FEED_STALE_S:
+        return None
+    if not isinstance(delivery, (int, float)) or now - delivery > HOST_LOAD_CAP_FEED_STALE_S:
+        return None
+    for job in summary.get("jobs") if isinstance(summary.get("jobs"), list) else []:
+        if not isinstance(job, dict) or job.get("status") not in RESERVE_QUEUED:
+            continue
+        wants = job.get("labels")
+        if not isinstance(wants, list) or not wants or not set(wants) <= labels:
+            continue
+        created = job.get("created")
+        if isinstance(created, (int, float)) and now - created > RESERVE_QUEUED_MAX_AGE_S:
+            continue
+        return True
+    return False
 
 
 def claims_note(others: int) -> str:
@@ -9888,6 +9927,7 @@ class Gate:
         self.cap_labels: frozenset[str] | None = None
         self.cap_feed_at = -HOST_LOAD_CAP_FEED_EVERY_S
         self.cap_thread: threading.Thread | None = None
+        self.reserve_demand_at: float | None = None  # RESERVE_ON_DEMAND: when the feed last showed a job for it
         self.ios_sim_own = False  # IOS_SIM_OWN_FIT: the last full() listened at its own fit for a queued ios-sim job
         self.head_fit_seen: tuple[int, str] | None = None  # HEAD_FIT: the last head need full() listened for
         # STARVED_RESERVE: the policy in force (refreshed with the other settings), the capacity/STARVED_RESERVE_FILE
@@ -11128,8 +11168,30 @@ class Gate:
         """Whether an idle gui runner keeps its reserve, given claimed()'s answer: only while nothing holds it or
         only units do (full(), UNITS_FULL), and its console can run a GUI job. Held off for the fleet, heat, memory
         pressure, a locked console, the gui token or the canonical roots, it could take no job, so the unit would
-        only sit idle."""
-        return (why is None or (why == self.full_why and UNITS_FULL in why)) and self.locked() is None
+        only sit idle. It also keeps it only while a job of its label waits for it (reserve_wanted, RESERVE_ON_DEMAND)."""
+        return (why is None or (why == self.full_why and UNITS_FULL in why)) and self.locked() is None \
+            and self.reserve_wanted()
+
+    def reserve_wanted(self) -> bool:
+        """RESERVE_ON_DEMAND: whether an idle reserving runner's reserve is wanted now. True while the controller's
+        feed shows a queued job this runner could take, for RESERVE_LINGER_S after it last did or after the runner's
+        own job ended, and whenever the feed cannot say (a reserve held on presence, the rule before). False only on
+        a fresh feed that shows no such job: its units then go to the jobs waiting beside it. Never raises."""
+        if os.environ.get(RESERVE_ON_DEMAND_ENV, "").strip().lower() in ("off", "0", "false", "no", "disabled"):
+            return True
+        try:
+            self.cap_look()  # the load cap's shared feed: one read a minute serves every gate on the mini
+            queued = label_queued(self.cap_summary, self.cap_labels, time.time())
+        except Exception:  # noqa: BLE001 - a broken look keeps the reserve (the rule before)
+            return True
+        now = time.monotonic()
+        if queued is None:
+            return True
+        if queued:
+            self.reserve_demand_at = now
+            return True
+        recent = [at for at in (self.reserve_demand_at, self.job_done_at) if at is not None]
+        return bool(recent) and now - max(recent) < RESERVE_LINGER_S
 
     def tree(self) -> tuple[list[int], dict[int, tuple[int, str]]]:
         table = processes()

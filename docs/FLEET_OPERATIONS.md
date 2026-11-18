@@ -163,6 +163,27 @@ state. A seed is useful when it reduces measured admission work for the same
 toolchain and source lineage. Its presence alone is not evidence that it should
 be retained.
 
+## Linux VM base on a mini
+
+`glaeda-linux-arm64` jobs run in one fresh Lima clone each (cmuxterm-hq#13261). Step one on a
+std mini is the stopped clone source:
+
+```bash
+python3 scripts/glaeda-linux-vm-base            # plan, no side effects
+python3 scripts/glaeda-linux-vm-base --apply    # idempotent; second run says unchanged
+python3 scripts/glaeda-linux-vm-base --apply --clone-smoke   # one 4 vCPU / 8 GiB clone, verified, deleted
+```
+
+It installs the pinned Lima 2.2.0 release (size and SHA-256 checked) under
+`~/.glaeda/linux-vm/lima-2.2.0`, uses `~/.glaeda/linux-vm/lima-home` as `LIMA_HOME`, and
+creates `glaeda-linux-arm64-base` from the exact bytes of
+`examples/lima/glaeda-prepared-template.yaml`. Readiness checks the guest's architecture, host
+mounts, root-owned marker, runner integrity, non-sudo workload account and masked apt timers, and
+the base is left stopped. An instance without the installer's `base.json` receipt, built from
+another template, or broken is reported (exit 2), never replaced. A clone is
+`limactl --tty=false clone glaeda-linux-arm64-base NAME --cpus 4 --memory 8 --mount-none --start`
+with that `LIMA_HOME`; 3 to 4 fit on a 48 GB mini.
+
 ## Runbook map
 
 - [`FLEET_STATUS.md`](FLEET_STATUS.md) defines the typed status document and finding schema.

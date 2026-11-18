@@ -12989,6 +12989,65 @@ class GateTest(unittest.TestCase):
         self.addCleanup(gate.reserve, False)
         return gate
 
+    def test_label_queued_reads_only_a_fresh_feed_and_this_runners_queued_jobs(self) -> None:
+        now = time.time()
+        labels = frozenset({"glaeda-gui-xcode-26.6", "glaeda-std-xcode-26.6"})
+
+        def feed(*jobs: dict, at: float = now, delivery: float = now) -> dict:
+            return {"at": at, "delivery": delivery, "jobs": list(jobs)}
+
+        def job(status: str = "queued", want: tuple = ("glaeda-gui-xcode-26.6",), age: float = 60.0) -> dict:
+            return {"labels": list(want), "status": status, "created": now - age}
+
+        self.assertIsNone(hook.label_queued(None, labels, now), "no feed: cannot say")
+        self.assertIsNone(hook.label_queued(feed(job()), None, now), "no labels: cannot say")
+        self.assertIsNone(hook.label_queued(feed(job(), at=now - 3600), labels, now), "a stale read: cannot say")
+        self.assertIsNone(hook.label_queued(feed(job(), delivery=now - 3600), labels, now), "deliveries stopped")
+        self.assertTrue(hook.label_queued(feed(job()), labels, now))
+        self.assertFalse(hook.label_queued(feed(), labels, now), "a fresh feed with nothing queued")
+        self.assertFalse(hook.label_queued(feed(job(status="in_progress"), job(status="waiting")), labels, now))
+        self.assertFalse(hook.label_queued(feed(job(want=("glaeda-gui-xcode-26.6", "glaeda-ios-sim"))), labels, now),
+                         "a job needing a label this runner lacks is not its")
+        self.assertFalse(hook.label_queued(feed(job(age=13 * 3600)), labels, now), "a lost record")
+
+    def test_replay_an_idle_reserving_runner_keeps_its_reserve_only_while_its_label_has_a_queued_job(self) -> None:
+        # RESERVE_ON_DEMAND. 2026-11-18 05:09-07:01Z: PR runners held off by "N is kept for an idle reserving runner"
+        # left 4.1 unit-hours idle while jobs queued for minis. The reserve now follows the feed: no queued job of the
+        # runner's label, no reserve; one queues, the reserve is held; it lingers RESERVE_LINGER_S, then goes.
+        capacity = self.units(0)
+        reserve = capacity / f"gui{hook.GUI_RESERVE}"
+        gate = self.gui_gate(capacity)
+        gate.cap_labels = frozenset({"glaeda-gui-xcode-26.6"})
+        queued: list[dict] = []
+        fresh = time.time()  # read as fresh for the whole test (the stale mark is patched to 2 h below)
+        gate.cap_summary = {"at": fresh, "delivery": fresh, "jobs": queued}
+        with mock.patch.object(gate, "start"), mock.patch.object(gate, "stop"), \
+                mock.patch.object(gate, "reload"), mock.patch.object(gate, "saturated", return_value=None), \
+                mock.patch.object(gate, "cap_look"), mock.patch.object(hook, "console_refusal", return_value=None), \
+                mock.patch.object(hook, "HOST_LOAD_CAP_FEED_STALE_S", 7200.0), \
+                mock.patch.object(gate, "busy", return_value=False):
+            gate.step()
+            self.assertTrue(hook.probe(reserve), "idle with nothing of its label queued: its unit takes PR jobs")
+            self.assertEqual(hook.gui_reserved(capacity), 0)
+            queued.append({"labels": ["glaeda-gui-xcode-26.6"], "status": "queued", "created": time.time()})
+            gate.step()
+            self.assertFalse(hook.probe(reserve), "a job of its label queued: the reserve is held")
+            self.assertEqual(hook.gui_reserved(capacity), hook.GUI_RESERVE_UNITS)
+            queued.clear()
+            gate.step()
+            self.assertFalse(hook.probe(reserve), "it lingers after the job left the queue")
+            gate.reserve_demand_at = time.monotonic() - hook.RESERVE_LINGER_S - 1
+            gate.step()
+            self.assertTrue(hook.probe(reserve), "past the linger: let go")
+            gate.cap_summary = None
+            gate.step()
+            self.assertFalse(hook.probe(reserve), "a feed that cannot say keeps the reserve (the rule before)")
+            gate.cap_summary = {"at": fresh, "delivery": fresh, "jobs": []}
+            gate.reserve(False)
+            with mock.patch.dict(os.environ, {hook.RESERVE_ON_DEMAND_ENV: "off"}):
+                gate.step()
+                self.assertFalse(hook.probe(reserve), "switched off: held on presence")
+
     def test_an_idle_gui_runners_gate_holds_its_reserve_and_lets_it_go_with_a_job(self) -> None:
         """The reserve is a flock, so it lives exactly as long as the gate wants it: held while the gui runner has
         no job and nothing but units holds it, and through a new job's admission (else a job waiting here for units

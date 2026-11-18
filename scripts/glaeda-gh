@@ -705,12 +705,23 @@ PACE_HOLD_MAX = 3600
 CONTENT_PAUSE_ENV = "GLAEDA_CONTENT_PAUSE_CMD"
 CONTENT_PAUSE_NAMES = ("gh-quota",)
 CONTENT_PAUSE_TTL = 15  # seconds an answer is reused
-# The ask runs on the daemon's main thread, so its bound is what the reads and waits lose to a hung keeper. A healthy
-# answer read from the host's own file took 0.09-0.10 s (median 0.09 s, ten runs); 2 s is twenty times that, room for
-# a loaded host's interpreter start. A keeper that asks over a socket is bounded by its own longer deadline, and a
-# client of one that answers slower than this waits out CONTENT_PAUSE_RETRY on the last answer instead.
+# The daemon's main thread waits this long for the ask, so it is what the reads and waits lose to a hung keeper. A
+# healthy answer read from the host's own file took 0.09-0.10 s (median 0.09 s, ten runs); 2 s is twenty times that,
+# room for a loaded host's interpreter start. A slower answer is not lost: see CONTENT_PAUSE_SLOW_DEADLINE.
 CONTENT_PAUSE_DEADLINE = 2
 CONTENT_PAUSE_RETRY = 60  # seconds after a failed or timed-out ask before the next; the last answer stands meanwhile
+# The ask runs on its own thread, and the daemon waits CONTENT_PAUSE_DEADLINE for it; a slower one goes on, bounded by
+# this, and its answer is taken on a later pass (a keeper slower than 2 s was otherwise never heard: every ask timed
+# out). The --hold report runs off the post's path on the same kind of thread, bounded by the same: the keeper writes
+# the pause under a file lock that another writer on the host can hold for seconds, and a report killed at 2 s
+# mid-write never told the other writers of the pause it was sent to share.
+CONTENT_PAUSE_SLOW_DEADLINE = 15
+CONTENT_PAUSE_REPORT_DEADLINE = 15
+# While no answer is newer than CONTENT_PAUSE_RETRY and the ask is failing or still running, the pause is unknown:
+# creates wait rather than go out into a pause other writers may have reported. For CONTENT_PAUSE_BLIND_MAX at most
+# past the last answer (or the first ask, with none): a keeper broken for good then stops no create, and the outbox
+# posts as a host with no keeper does, logged once per outage and shown by `post status`.
+CONTENT_PAUSE_BLIND_MAX = 600
 # A private repository on a plan without branch protection or rulesets answers 403 with this: there are
 # no requirements to read, as for a deleted base branch.
 NO_FEATURE = re.compile(r"Upgrade to GitHub Pro|make this repository public to enable this feature", re.I)
@@ -1884,6 +1895,21 @@ def retry_after_seconds(value: Any) -> float | None:
     if seconds is None or math.isnan(seconds) or seconds == -math.inf:
         return None
     return max(0.0, min(seconds, float(PACE_HOLD_MAX)))
+
+
+def saved_hold(value: Any, now: float) -> float:
+    """A hold read back from disk (daemon.json's outbox.holdUntil) as epoch seconds, at most PACE_HOLD_MAX past `now`
+    as every other hold, or 0.0 (none) for anything that is not a finite number: a corrupt far future held the outbox
+    for good, and a string, a list or an int too large for a float raised in Daemon() and stopped the daemon starting."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return 0.0
+    try:
+        until = float(value)
+    except (ValueError, OverflowError):
+        return 0.0 if isinstance(value, str) else now + PACE_HOLD_MAX  # an int past a float's range: the far future
+    if not math.isfinite(until):
+        return 0.0
+    return max(0.0, min(until, now + PACE_HOLD_MAX))
 
 
 _CONTENT_PAUSE_UNREAD: set[str] = set()  # CONTENT_PAUSE_ENV values already logged as unreadable
@@ -3216,10 +3242,22 @@ class Daemon:
         self.post_at = float("-inf")  # the last content write (post_tick)
         self.clock_real = True  # tick(now=...) in tests pins the clock
         held = (read_json(BASE / "daemon.json") or {}).get("outbox") or {}
-        self.post_hold = float(held.get("holdUntil") or 0.0)  # GitHub's secondary limit holds the outbox until then
+        # GitHub's secondary limit holds the outbox until then
+        self.post_hold = saved_hold(held.get("holdUntil"), time.time())
         self.post_backoff = POST_BACKOFF  # the next hold without a Retry-After
         self.pause_until = 0.0  # the login's create pause (content_pause_until), as last read
         self.pause_next = float("-inf")  # when it may next be asked
+        self.pause_ask: threading.Thread | None = None  # the ask in flight (content_pause_until)
+        self.pause_result: tuple[str, Any] | None = None  # its outcome, set by the thread before it ends
+        self.pause_first_ask: float | None = None  # clock of this daemon's first ask
+        self.pause_answered_at: float | None = None  # clock of the last answer
+        self.pause_failures = 0  # asks in a row that failed or timed out
+        self.pause_timeouts = 0  # of those, the ones that timed out
+        self.pause_error: str | None = None  # the last failed ask's error
+        self.pause_blind_logged = False  # past CONTENT_PAUSE_BLIND_MAX this outage, logged once
+        self.pause_report: threading.Thread | None = None  # the --hold report in flight (report_content_pause)
+        self.pause_report_want: tuple[float, str] | None = None  # the hold it is to report next
+        self.pause_report_lock = threading.Lock()
         saved = read_json(BASE / CONSUMERS_FILE)
         spends = saved.get("spends") if isinstance(saved, dict) else None
         # consumer -> times of the head reads charged to it in the last hour
@@ -4080,8 +4118,8 @@ class Daemon:
                 continue  # it goes out in (or went out with) its leader's comment: no request of its own
             if self.backoff["rest"] > self.now and not (item.get("kind") == "comment" and self.post_over_graphql(item)):
                 continue  # REST's hour is spent (rest_out): it waits for the reset; a comment behind it goes over GraphQL
-            if self.now < self.content_pause_until():
-                return  # the login's create pause: every write waits it out, in order, none dropped
+            if self.now < self.content_pause_until() or self.content_pause_unknown():
+                return  # the login's create pause (or no word of it): every write waits, in order, none dropped
             self.writing = True
             try:
                 with self.calling("outbox", str(item.get("repo") or "")):
@@ -4106,19 +4144,35 @@ class Daemon:
             self.now = tick_now
 
     def content_pause_until(self) -> float:
-        """When the login's create pause ends (0: none), asked at most every CONTENT_PAUSE_TTL. A failed or
-        timed-out ask keeps the last answer and is not repeated for CONTENT_PAUSE_RETRY: the ask holds the daemon's
-        main thread, and a hung keeper asked every TTL took most of its time from the reads and waits. The pacer's own
-        hold (adopt_pace_hold) applies either way."""
+        """When the login's create pause ends (0: none), asked at most every CONTENT_PAUSE_TTL. The ask runs on its
+        own thread: the daemon waits CONTENT_PAUSE_DEADLINE for it on its main thread (the reads and waits lose that
+        to a hung keeper), and a slower answer, up to CONTENT_PAUSE_SLOW_DEADLINE, is taken on a later pass. A failed
+        or timed-out ask keeps the last answer and is not repeated for CONTENT_PAUSE_RETRY; content_pause_unknown says
+        whether that answer is too old to post on. The pacer's own hold (adopt_pace_hold) applies either way."""
         cmd = content_pause_cmd()
         if cmd is None:
             return 0.0
         clock = self.clock()
-        if clock < self.pause_next:
-            return self.pause_until
-        self.pause_next = clock + CONTENT_PAUSE_RETRY  # until it answers
+        wait = 0.0
+        if self.pause_ask is None and clock >= self.pause_next:
+            self.pause_next = clock + CONTENT_PAUSE_RETRY  # until it answers
+            self.pause_first_ask = clock if self.pause_first_ask is None else self.pause_first_ask
+            self.pause_result = None
+            self.pause_ask = threading.Thread(target=self.content_pause_ask, args=(cmd, clock), daemon=True,
+                                              name="content-pause-ask")
+            self.pause_ask.start()
+            wait = CONTENT_PAUSE_DEADLINE
+        if self.pause_ask is not None:
+            self.pause_ask.join(wait)
+            if not self.pause_ask.is_alive():
+                self.content_pause_adopt()
+        return self.pause_until
+
+    def content_pause_ask(self, cmd: list[str], asked: float) -> None:
+        """The ask, on its own thread: sets pause_result to ("ok", (asked, blocked_until)), ("timeout", why) or
+        ("error", why), and nothing else."""
         try:
-            done = run_bounded([*cmd, "content-pause"], CONTENT_PAUSE_DEADLINE)
+            done = run_bounded([*cmd, "content-pause"], CONTENT_PAUSE_SLOW_DEADLINE)
             doc = json.loads(done.stdout) if done.returncode == 0 else None
             if not isinstance(doc, dict):
                 raise ValueError(f"exit {done.returncode}: {(done.stderr or done.stdout or '').strip()[:200]}")
@@ -4126,18 +4180,79 @@ class Daemon:
             if isinstance(until, bool) or not isinstance(until, (int, float)) or not math.isfinite(until):
                 raise ValueError(f"blocked_until {until!r}")  # NaN or Infinity: a failed ask, the last answer stands
             # blocked_until alone decides; level is the pacer's backoff state, never whether it is paused.
-            until = min(float(until), clock + PACE_HOLD_MAX)  # a corrupt far future holds an hour at most
+            # float() of an int past a float's range (json reads 1e400 written out as digits) raises OverflowError.
+            self.pause_result = ("ok", (asked, float(until)))
+        except subprocess.TimeoutExpired:
+            self.pause_result = ("timeout", f"no answer within {CONTENT_PAUSE_SLOW_DEADLINE:g}s")
+        except Exception as error:  # noqa: BLE001  OSError, ValueError, OverflowError: a failed ask, as any other
+            self.pause_result = ("error", describe(error))
+
+    def content_pause_adopt(self) -> None:
+        """Take the finished ask's outcome, on the main thread."""
+        self.pause_ask = None
+        outcome, self.pause_result = self.pause_result, None
+        if outcome is None:
+            return
+        kind, value = outcome
+        clock = self.clock()
+        if kind == "ok":
+            asked, until = value
+            until = min(until, clock + PACE_HOLD_MAX)  # a corrupt far future holds an hour at most
             if until > max(self.now, self.pause_until):
                 log({"event": "post-paused", "source": "login", "hold": round(until - self.now)})
             self.pause_until = until
-            self.pause_next = clock + CONTENT_PAUSE_TTL
-        except (OSError, subprocess.SubprocessError, ValueError) as error:
-            self.errors.append(f"content pause: {describe(error)}")
-        return self.pause_until
+            self.pause_next = asked + CONTENT_PAUSE_TTL
+            self.pause_answered_at = clock
+            self.pause_failures = self.pause_timeouts = 0
+            self.pause_error, self.pause_blind_logged = None, False
+            return
+        self.pause_failures += 1
+        self.pause_timeouts += kind == "timeout"
+        self.pause_error = str(value)
+        self.errors.append(f"content pause: {value}")
+
+    def content_pause_unknown(self) -> bool:
+        """Whether creates wait because the pause is not known: no answer within CONTENT_PAUSE_RETRY, and the ask is
+        still running or failing. For CONTENT_PAUSE_BLIND_MAX past the last answer (or the first ask) at most: past
+        it a keeper that never answers stops nothing, and the outbox posts as a host with no keeper (logged once)."""
+        if self.pause_ask is None and self.pause_failures == 0:
+            return False
+        clock = self.clock()
+        known = self.pause_answered_at if self.pause_answered_at is not None else self.pause_first_ask
+        if known is None or clock - known < CONTENT_PAUSE_RETRY and self.pause_answered_at is not None:
+            return False  # a recent answer stands
+        if clock - known < CONTENT_PAUSE_BLIND_MAX:
+            return True
+        if not self.pause_blind_logged:
+            self.pause_blind_logged = True
+            log({"event": "post-pause-unknown", "failures": self.pause_failures, "error": self.pause_error,
+                 "since": round(clock - known)})
+        return False
+
+    def content_pause_status(self) -> dict | None:
+        """daemon.json outbox.pause: the ask's state for `post status`, or None when no ask was made."""
+        if self.pause_first_ask is None:
+            return None
+        clock = self.clock()
+        return {"until": self.pause_until if self.pause_until > clock else None,
+                "answeredAgo": None if self.pause_answered_at is None else round(clock - self.pause_answered_at),
+                "failures": self.pause_failures, "timeouts": self.pause_timeouts, "lastError": self.pause_error,
+                "asking": self.pause_ask is not None, "holding": self.content_pause_unknown()}
+
+    def content_pause_settle(self, timeout: float) -> None:
+        """Wait up to `timeout` for the ask and the report in flight, and take the ask's answer (tests; shutdown)."""
+        deadline = time.monotonic() + timeout
+        for thread in (self.pause_ask, self.pause_report):
+            if thread is not None:
+                thread.join(max(0.0, deadline - time.monotonic()))
+        if self.pause_ask is not None and not self.pause_ask.is_alive():
+            self.content_pause_adopt()
 
     def report_content_pause(self, until: float, kind: str) -> None:
         """Extend the login's create pause to `until` for this throttled write, so every writer waits it out. An hour
-        at most (PACE_HOLD_MAX), as the hold it came from."""
+        at most (PACE_HOLD_MAX), as the hold it came from. The report runs on its own thread, off the post's path,
+        bounded by CONTENT_PAUSE_REPORT_DEADLINE (the keeper's file lock can be held by another writer); a hold asked
+        while one is in flight is sent after it, the later of the two."""
         until = min(until, self.clock() + PACE_HOLD_MAX)
         if math.isnan(until):
             return
@@ -4145,13 +4260,32 @@ class Daemon:
         cmd = content_pause_cmd()
         if cmd is None:
             return
-        try:
-            done = run_bounded([*cmd, "content-pause", "--hold", str(int(math.ceil(until))),
-                                "--what", f"glaeda outbox {kind}"], CONTENT_PAUSE_DEADLINE)
-            if done.returncode != 0:
-                self.errors.append(f"content pause hold: exit {done.returncode}")
-        except (OSError, subprocess.SubprocessError, ValueError, OverflowError) as error:
-            self.errors.append(f"content pause hold: {describe(error)}")
+        with self.pause_report_lock:
+            want = self.pause_report_want
+            self.pause_report_want = (until, kind) if want is None or until > want[0] else want
+            if self.pause_report is None:
+                self.pause_report = threading.Thread(target=self.content_pause_reporter, args=(cmd,), daemon=True,
+                                                     name="content-pause-report")
+                self.pause_report.start()
+
+    def content_pause_reporter(self, cmd: list[str]) -> None:
+        """The report's thread: sends the wanted hold until none is left. Errors go to self.errors (a list append)."""
+        while True:
+            with self.pause_report_lock:
+                want, self.pause_report_want = self.pause_report_want, None
+                if want is None:
+                    self.pause_report = None
+                    return
+            until, kind = want
+            try:
+                done = run_bounded([*cmd, "content-pause", "--hold", str(int(math.ceil(until))),
+                                    "--what", f"glaeda outbox {kind}"], CONTENT_PAUSE_REPORT_DEADLINE)
+                if done.returncode != 0:
+                    self.errors.append(f"content pause hold: exit {done.returncode}")
+            except subprocess.TimeoutExpired:
+                self.errors.append(f"content pause hold: no answer within {CONTENT_PAUSE_REPORT_DEADLINE:g}s")
+            except Exception as error:  # noqa: BLE001  OSError, ValueError, OverflowError
+                self.errors.append(f"content pause hold: {describe(error)}")
 
     def post_hold_for(self, h: dict, path: Path, item: dict) -> None:
         try:
@@ -5381,7 +5515,8 @@ class Daemon:
                   "staleExplainedAt": {k: round(t, 3) for k, t in self.explained_at.items()},
                   "recentErrors": [{"error": m, "at": t} for m, t in self.recent_errors.items()],
                   "outbox": {"queued": len(list(outbox_dir().glob("*.json"))) if outbox_dir().is_dir() else 0,
-                             "holdUntil": self.post_hold if self.post_hold > self.now else None}}
+                             "holdUntil": self.post_hold if self.post_hold > self.now else None,
+                             "pause": self.content_pause_status()}}
         if self.upstream_status is not None:
             status["upstream"] = self.upstream_status
         # the heartbeat lets clients tell a hung daemon (lock held, nothing written) from an idle one
@@ -15922,6 +16057,9 @@ BROKER_CREATE_WORDS: dict[tuple[str, str], tuple[str, ...] | None] = {
     ("issue", "comment"): None, ("release", "create"): None, ("gist", "create"): None,
     ("pr", "close"): ("--comment", "-c"), ("pr", "reopen"): ("--comment", "-c"),
     ("issue", "close"): ("--comment", "-c"), ("issue", "reopen"): ("--comment", "-c")}
+# The value flags of `pr|issue close|reopen` that BROKER_VALUE_FLAGS does not list (broker_flag_given).
+BROKER_CLOSE_VALUE_FLAGS = {"--comment", "--reason", "--duplicate-of"}
+BROKER_CLOSE_SHORT_VALUE = "cr"
 BROKER_CREATE_API = re.compile("|".join((
     r"repos/[^/]+/[^/]+/(?:pulls|issues)(?:/\d+/comments)?",
     r"repos/[^/]+/[^/]+/pulls/\d+/(?:reviews|comments)(?:/\d+/(?:events|replies))?",
@@ -15979,6 +16117,35 @@ def broker_help(args: list[str], seen: set[str]) -> bool:
     return "--help" in seen or "-h" in seen or any(a.lower() in ("--help=true", "--help=1") for a in args)
 
 
+def broker_flag_given(args: list[str], names: tuple[str, ...]) -> bool:
+    """Whether any of `names` (a long flag and its one-letter short) is given, read as cobra reads a close or reopen:
+    a short cluster runs its letters as boolean flags until one that takes a value, which takes the rest of the word
+    (`-dc x` is --delete-branch then --comment x, `-dcx` and `-cx` the same, `-Rc` the repository "c"), and a value
+    flag given apart takes the next word whatever it starts with (`--reason -c` gives no comment)."""
+    takes = BROKER_SHORT_VALUE + BROKER_CLOSE_SHORT_VALUE
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--":
+            return False
+        if arg.startswith("--"):
+            name = arg.split("=", 1)[0]
+            if name in names:
+                return True
+            if "=" not in arg and (arg in BROKER_VALUE_FLAGS or arg in BROKER_CLOSE_VALUE_FLAGS):
+                i += 1  # its value, whatever it looks like
+        elif arg.startswith("-") and arg != "-":
+            for at, letter in enumerate(arg[1:], start=1):
+                if f"-{letter}" in names:
+                    return True
+                if letter in takes:
+                    if at == len(arg) - 1:
+                        i += 1  # the value is the next word
+                    break
+        i += 1
+    return False
+
+
 def broker_create_call(args: list[str]) -> bool:
     """Whether this gh call creates content (BROKER_CREATE_WORDS, a POST to a BROKER_CREATE_API path, or a `gh api
     graphql` mutation naming a BROKER_CREATE_MUTATIONS field inline). A graphql call that reads a file or stdin is
@@ -15990,8 +16157,7 @@ def broker_create_call(args: list[str]) -> bool:
         if tuple(words[:2]) not in BROKER_CREATE_WORDS:
             return False
         need = BROKER_CREATE_WORDS[tuple(words[:2])]
-        return need is None or any(a.split("=", 1)[0] in need or (a[:2] in need and len(a) > 2 and a[1] != "-")
-                                   for a in args if a.startswith("-"))
+        return need is None or broker_flag_given(args, need)
     if len(words) < 2:
         return False
     endpoint = words[1].split("?", 1)[0].split("#", 1)[0]
@@ -16832,8 +16998,35 @@ def post_state(post_id: str) -> dict | None:
     if not isinstance(queued, dict):
         return None
     ahead = sum(1 for p in outbox_dir().glob("*.json") if p.stem < post_id)
-    hold = ((read_json(BASE / "daemon.json") or {}).get("outbox") or {}).get("holdUntil")
-    return {k: v for k, v in queued.items() if k != "body"} | {"state": "queued", "ahead": ahead, "holdUntil": hold}
+    outbox = (read_json(BASE / "daemon.json") or {}).get("outbox") or {}
+    pause = outbox.get("pause") if isinstance(outbox.get("pause"), dict) else None
+    return {k: v for k, v in queued.items() if k != "body"} | {"state": "queued", "ahead": ahead,
+                                                                "holdUntil": outbox.get("holdUntil"), "pause": pause}
+
+
+def span(seconds: float) -> str:
+    """A length of time: 42s, 3m. (age() reads an epoch time; given a length it printed decades.)"""
+    s = int(max(0, seconds))
+    return f"{s}s" if s < 120 else f"{s // 60}m"
+
+
+def pause_line(pause: Any) -> list[str]:
+    """The login's create pause and the outbox's ask of it, as `post status` prints them (daemon.json outbox.pause)."""
+    if not isinstance(pause, dict):
+        return []
+    parts = []
+    until = pause.get("until")
+    if isinstance(until, (int, float)) and not isinstance(until, bool) and until > time.time():
+        parts.append(f"the login's create pause holds creates for {span(until - time.time())}")
+    failures = pause.get("failures")
+    if isinstance(failures, int) and failures > 0:
+        ago = pause.get("answeredAgo")
+        parts.append(f"pause ask failed {failures} in a row ({pause.get('timeouts') or 0} timed out; last: "
+                     f"{pause.get('lastError')}); last answer "
+                     + (f"{span(ago)} ago" if isinstance(ago, (int, float)) else "never"))
+    if pause.get("holding"):
+        parts.append("creates wait until the pause is known")
+    return parts
 
 
 def post_line(state: dict) -> str:
@@ -16843,7 +17036,8 @@ def post_line(state: dict) -> str:
         return f"failed: {state.get('error')}"
     parts = [f"queued as {state['id']}", f"{state.get('ahead', 0)} ahead"]
     if state.get("holdUntil") and state["holdUntil"] > time.time():
-        parts.append(f"GitHub holds writes for {age(state['holdUntil'] - time.time())}")
+        parts.append(f"GitHub holds writes for {span(state['holdUntil'] - time.time())}")
+    parts.extend(pause_line(state.get("pause")))
     if state.get("lastError"):
         parts.append(f"last attempt: {state['lastError']}")
     return "; ".join(parts)

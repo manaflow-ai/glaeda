@@ -1,0 +1,521 @@
+#!/usr/bin/env python3
+"""glaeda-linux-vm-base: install pinned Lima and the stopped glaeda-linux-arm64 base VM on one mini.
+
+    glaeda-linux-vm-base                  plan: what --apply would do (no side effects)
+    glaeda-linux-vm-base --apply          install Lima 2.2.0, create/verify/stop the base VM
+    glaeda-linux-vm-base --apply --reverify   start, re-verify and stop an existing verified base
+    glaeda-linux-vm-base --clone-smoke --apply  also clone it once (4 vCPU / 8 GiB), verify, delete
+
+The base VM is the clone source for `glaeda-linux-arm64` CI jobs (one fresh clone per job). It is
+built from the exact bytes of examples/lima/glaeda-prepared-template.yaml, whose SHA-256 must equal
+the `lima_template_digest` in examples/lima/glaeda-prepared-template.json: plain mode, vz, no mounts,
+no extra networks, no port forwards, the pinned Ubuntu 24.04 arm64 image and the pinned Actions
+runner installed by the template's fixed system provision. This command never edits that template.
+
+Everything lives under ~/.glaeda/linux-vm and is owned by the current user; nothing uses sudo:
+    lima-2.2.0/        the official Lima release tarball, size- and SHA-256-verified, never upgraded
+    lima-home/         LIMA_HOME for the base and its clones, separate from any ~/.lima
+    templates/         the materialized template, named by its digest
+    base.json          the ownership receipt; an instance without it is never started, stopped or deleted
+
+--apply is idempotent: a second run reports `unchanged`. A Lima prefix or instance that does not
+match (wrong version, foreign, template drift, broken) is reported and the run stops; nothing is
+replaced or deleted. Output is one bounded JSON document; exit 0 ok, 2 refused, 1 failed.
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import datetime as _dt
+import fcntl
+import hashlib
+import json
+import os
+import pathlib
+import platform
+import posixpath
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+from typing import Any, Callable, Sequence
+
+SCHEMA = "glaeda-linux-vm-base/v1"
+LIMA_VERSION = "2.2.0"
+LIMA_URL = f"https://github.com/lima-vm/lima/releases/download/v{LIMA_VERSION}/lima-{LIMA_VERSION}-Darwin-arm64.tar.gz"
+LIMA_BYTES = 37586365
+LIMA_SHA256 = "bbdef91774885a0d05f7b048c4eb89ae2bcf3a0c252ae7ca7934e63df76d93c3"
+BASE_INSTANCE = "glaeda-linux-arm64-base"
+SMOKE_PREFIX = "glaeda-linux-arm64-smoke-"
+CLONE_CPUS = 4
+CLONE_MEMORY_GIB = 8
+HOST_RESERVE_GIB = 16
+MAX_CLONES = 4
+MIN_FREE_GIB = 40
+REPO = pathlib.Path(__file__).resolve().parents[1]
+TEMPLATE_YAML = REPO / "examples" / "lima" / "glaeda-prepared-template.yaml"
+TEMPLATE_JSON = REPO / "examples" / "lima" / "glaeda-prepared-template.json"
+CREATE_TIMEOUT = 45 * 60
+START_TIMEOUT = 15 * 60
+STOP_TIMEOUT = 5 * 60
+SHELL_TIMEOUT = 90
+LIST_TIMEOUT = 60
+TAIL = 400
+MASKED_APT_UNITS = ("apt-daily.timer", "apt-daily-upgrade.timer", "apt-daily.service", "apt-daily-upgrade.service")
+
+
+class Refused(Exception):
+    """A state this command must report and not change."""
+
+
+class Failed(Exception):
+    """A step that ran and did not succeed."""
+
+
+def tail(text: str | bytes | None) -> str:
+    if text is None:
+        return ""
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", "replace")
+    text = text.strip()
+    return text if len(text) <= TAIL else "..." + text[-TAIL:]
+
+
+def sha256_file(path: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def now() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+Runner = Callable[..., subprocess.CompletedProcess]
+
+
+def default_runner(argv: Sequence[str], *, env: dict[str, str], timeout: float) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(list(argv), env=env, stdin=subprocess.DEVNULL, capture_output=True,
+                              text=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired as error:
+        return subprocess.CompletedProcess(list(argv), 124, tail(error.stdout), f"timed out after {timeout:.0f}s")
+
+
+def default_download(url: str, dest: pathlib.Path, timeout: float) -> None:
+    argv = ["/usr/bin/curl", "--proto", "=https", "--tlsv1.2", "--fail", "--location", "--silent", "--show-error",
+            "--retry", "4", "--connect-timeout", "30", "--max-time", str(int(timeout)), "--output", str(dest), url]
+    result = default_runner(argv, env={"PATH": "/usr/bin:/bin", "HOME": os.environ.get("HOME", "/")}, timeout=timeout + 30)
+    if result.returncode != 0:
+        raise Failed(f"download of {url} failed: {tail(result.stderr)}")
+
+
+class Installer:
+    def __init__(self, *, root: pathlib.Path, runner: Runner = default_runner,
+                 download: Callable[[str, pathlib.Path, float], None] = default_download,
+                 template_yaml: pathlib.Path = TEMPLATE_YAML, template_json: pathlib.Path = TEMPLATE_JSON,
+                 host: dict[str, Any] | None = None, sleep: Callable[[float], None] = time.sleep):
+        self.root = root
+        self.prefix = root / f"lima-{LIMA_VERSION}"
+        self.limactl = self.prefix / "bin" / "limactl"
+        self.lima_home = root / "lima-home"
+        self.receipt_path = root / "base.json"
+        self.runner = runner
+        self.download = download
+        self.template_yaml = template_yaml
+        self.template_json = template_json
+        self.host = host
+        self.sleep = sleep
+        self.actions: list[dict[str, Any]] = []
+
+    # ---- observations -------------------------------------------------------------------------
+    def env(self) -> dict[str, str]:
+        env = {"HOME": os.environ.get("HOME", str(pathlib.Path.home())), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+               "LIMA_HOME": str(self.lima_home), "LC_ALL": "C"}
+        for key in ("USER", "LOGNAME", "TMPDIR"):
+            if os.environ.get(key):
+                env[key] = os.environ[key]
+        return env
+
+    def run(self, argv: Sequence[str], timeout: float) -> subprocess.CompletedProcess:
+        return self.runner(list(argv), env=self.env(), timeout=timeout)
+
+    def lima(self, *args: str, timeout: float = LIST_TIMEOUT) -> subprocess.CompletedProcess:
+        return self.run([str(self.limactl), "--tty=false", *args], timeout)
+
+    def host_facts(self) -> dict[str, Any]:
+        if self.host is not None:
+            return self.host
+        probe = self.root
+        while not probe.exists() and probe != probe.parent:
+            probe = probe.parent
+        usage = shutil.disk_usage(str(probe))
+        mem = 0
+        with contextlib.suppress(Exception):
+            mem = int(subprocess.run(["/usr/sbin/sysctl", "-n", "hw.memsize"], capture_output=True, text=True,
+                                     timeout=10, check=False).stdout.strip() or 0)
+        return {"system": platform.system(), "machine": platform.machine(), "cpus": os.cpu_count() or 0,
+                "memory_gib": mem // (1 << 30), "free_gib": usage.free // (1 << 30)}
+
+    def template(self) -> dict[str, Any]:
+        data = self.template_yaml.read_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+        identity = json.loads(self.template_json.read_text(encoding="utf-8"))
+        want = identity["provisioning"]["lima_template_digest"]
+        if want != f"sha256:{digest}":
+            raise Refused(f"template bytes sha256:{digest} do not match the checked-in identity {want}")
+        if identity["isolation"]["lima_version"] != LIMA_VERSION:
+            raise Refused(f"template identity wants Lima {identity['isolation']['lima_version']}, installer pins {LIMA_VERSION}")
+        return {"bytes": data, "digest": digest, "identity": identity,
+                "path": self.root / "templates" / f"glaeda-prepared-template-{digest[:16]}.yaml"}
+
+    def lima_state(self) -> dict[str, Any]:
+        if not self.limactl.exists() and not self.prefix.exists():
+            return {"state": "absent"}
+        if not os.access(self.limactl, os.X_OK):
+            return {"state": "mismatch", "detail": f"{self.prefix} exists without an executable limactl"}
+        result = self.run([str(self.limactl), "--version"], 30)
+        version = result.stdout.strip()
+        if result.returncode != 0 or version != f"limactl version {LIMA_VERSION}":
+            return {"state": "mismatch", "detail": tail(version or result.stderr)}
+        return {"state": "ok", "version": version}
+
+    def instances(self) -> dict[str, dict[str, Any]]:
+        if not self.lima_home.exists():
+            return {}
+        result = self.lima("list", "--json")
+        if result.returncode != 0:
+            raise Failed(f"limactl list failed: {tail(result.stderr)}")
+        found: dict[str, dict[str, Any]] = {}
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line:
+                item = json.loads(line)
+                found[item.get("name", "")] = item
+        return found
+
+    def receipt(self) -> dict[str, Any] | None:
+        with contextlib.suppress(FileNotFoundError):
+            return json.loads(self.receipt_path.read_text(encoding="utf-8"))
+        return None
+
+    def write_receipt(self, document: dict[str, Any]) -> None:
+        stage = self.receipt_path.with_suffix(".json.new")
+        stage.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.chmod(stage, 0o600)
+        os.replace(stage, self.receipt_path)
+
+    def instance_yaml_digest(self, name: str) -> str | None:
+        path = self.lima_home / name / "lima.yaml"
+        return sha256_file(path) if path.is_file() else None
+
+    # ---- mutations ----------------------------------------------------------------------------
+    def install_lima(self) -> None:
+        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        stage = pathlib.Path(tempfile.mkdtemp(prefix=".lima-stage-", dir=self.root))
+        try:
+            archive = stage / "lima.tar.gz"
+            self.download(LIMA_URL, archive, 300)
+            size = archive.stat().st_size
+            digest = sha256_file(archive)
+            if size != LIMA_BYTES or digest != LIMA_SHA256:
+                raise Failed(f"Lima archive is {size} bytes sha256:{digest}, want {LIMA_BYTES} sha256:{LIMA_SHA256}")
+            tree = stage / "tree"
+            tree.mkdir()
+            with tarfile.open(archive, "r:gz") as tar:
+                for member in tar.getmembers():
+                    name = pathlib.PurePosixPath(member.name)
+                    if name.is_absolute() or ".." in name.parts or not (member.isfile() or member.isdir() or member.issym()):
+                        raise Failed(f"Lima archive holds an unexpected entry {member.name!r}")
+                    if member.issym() and not link_stays_inside(member.name, member.linkname):
+                        raise Failed(f"Lima archive holds an escaping link {member.name!r}")
+                if hasattr(tarfile, "data_filter"):
+                    tar.extractall(tree, filter="data")
+                else:  # every member was checked above
+                    tar.extractall(tree)  # noqa: S202
+            if not os.access(tree / "bin" / "limactl", os.X_OK):
+                raise Failed("Lima archive has no bin/limactl")
+            os.rename(tree, self.prefix)
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
+        self.actions.append({"action": "install_lima", "version": LIMA_VERSION, "sha256": LIMA_SHA256})
+
+    def materialize_template(self, template: dict[str, Any]) -> None:
+        path: pathlib.Path = template["path"]
+        if path.exists():
+            if path.read_bytes() != template["bytes"]:
+                raise Refused(f"{path} exists with other bytes")
+            return
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        stage = path.with_suffix(".yaml.new")
+        stage.write_bytes(template["bytes"])
+        os.chmod(stage, 0o600)
+        os.replace(stage, path)
+        self.actions.append({"action": "materialize_template", "digest": f"sha256:{template['digest']}"})
+
+    def wait_status(self, name: str, want: str, timeout: float) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout
+        while True:
+            item = self.instances().get(name, {})
+            if item.get("status") == want:
+                return item
+            if time.monotonic() >= deadline:
+                raise Failed(f"{name} is {item.get('status', 'absent')!r}, want {want!r}")
+            self.sleep(2)
+
+    def guest(self, name: str, *argv: str) -> subprocess.CompletedProcess:
+        return self.lima("shell", "--workdir", "/", name, "--", *argv, timeout=SHELL_TIMEOUT)
+
+    def verify(self, name: str, template: dict[str, Any]) -> dict[str, Any]:
+        """Fresh readiness evidence for a running instance; raises Failed on any miss."""
+        identity = template["identity"]
+        prov = identity["provisioning"]
+        item = self.instances().get(name)
+        if not item or item.get("status") != "Running":
+            raise Failed(f"{name} is not running")
+        config = item.get("config") or {}
+        checks: dict[str, Any] = {}
+
+        def need(key: str, ok: bool, value: Any) -> None:
+            checks[key] = value
+            if not ok:
+                raise Failed(f"readiness check {key} failed: {tail(json.dumps(value))}")
+
+        need("vm_type", item.get("vmType") == "vz", item.get("vmType"))
+        need("host_arch", item.get("arch") == "aarch64", item.get("arch"))
+        if config:
+            need("plain", config.get("plain") is True, config.get("plain"))
+            need("lima_mounts", not config.get("mounts"), config.get("mounts") or [])
+            need("port_forwards", not [p for p in (config.get("portForwards") or []) if not p.get("ignore")],
+                 config.get("portForwards") or [])
+            need("networks", not config.get("networks"), config.get("networks") or [])
+        result = self.guest(name, "/usr/bin/uname", "-m")
+        need("guest_arch", result.returncode == 0 and result.stdout.strip() == "aarch64", tail(result.stdout or result.stderr))
+        result = self.guest(name, "/usr/bin/findmnt", "--noheadings", "--output", "TARGET,FSTYPE",
+                            "--types", "virtiofs,9p,fuse.sshfs,nfs,cifs,smb3")
+        need("guest_host_mounts", result.stdout.strip() == "", tail(result.stdout) or "none")
+        result = self.guest(name, "/bin/cat", prov["ready_marker_path"])
+        marker: Any = None
+        with contextlib.suppress(ValueError):
+            marker = json.loads(result.stdout)
+        want_marker = {
+            "schema_version": 2,
+            "actions_runner_version": identity["actions_runner"]["version"],
+            "actions_runner_digest": identity["actions_runner"]["digest"],
+            "workload_user": prov["workload_user"],
+            "runner_listener_protection": "setgid_nondumpable",
+            "runner_install_directory": prov["runner_install_directory"],
+            "runner_work_directory": prov["runner_work_directory"],
+            "jit_launcher_path": prov["jit_launcher_path"],
+            "jit_launcher_digest": prov["jit_launcher_digest"],
+        }
+        need("ready_marker", result.returncode == 0 and marker == want_marker,
+             {"path": prov["ready_marker_path"], "actions_runner_version": (marker or {}).get("actions_runner_version")}
+             if isinstance(marker, dict) else tail(result.stderr))
+        result = self.guest(name, "/usr/bin/stat", "--format=%U:%G:%a", prov["ready_marker_path"])
+        need("ready_marker_owner", result.stdout.strip() == "root:root:444", tail(result.stdout or result.stderr))
+        listener = f"{prov['runner_install_directory']}/bin/Runner.Listener"
+        result = self.guest(name, "/usr/bin/test", "-x", listener)
+        need("runner_installed", result.returncode == 0, listener)
+        integrity = str(pathlib.PurePosixPath(prov["jit_launcher_path"]).parent / "smolrunner-runner-integrity")
+        result = self.guest(name, "/usr/bin/sudo", "--non-interactive", integrity)
+        need("runner_integrity", result.stdout.strip() == "smolrunner-runner-integrity-ok", tail(result.stdout or result.stderr))
+        result = self.guest(name, "/usr/bin/id", "-Gn", prov["workload_user"])
+        need("workload_groups", result.stdout.strip() == prov["workload_user"], tail(result.stdout or result.stderr))
+        result = self.guest(name, "/usr/bin/sudo", "--non-interactive", "--user", prov["workload_user"], "/usr/bin/sudo",
+                            "--non-interactive", "/usr/bin/true")
+        need("workload_no_sudo", result.returncode != 0, result.returncode)
+        masked = []
+        for unit in MASKED_APT_UNITS:
+            result = self.guest(name, "/usr/bin/systemctl", "is-enabled", unit)
+            masked.append(result.stdout.strip())
+        need("apt_auto_updates_masked", masked == ["masked"] * len(MASKED_APT_UNITS), masked)
+        return checks
+
+    def stop(self, name: str) -> None:
+        result = self.lima("stop", name, timeout=STOP_TIMEOUT)
+        if result.returncode != 0:
+            raise Failed(f"limactl stop {name} failed: {tail(result.stderr)}")
+        self.wait_status(name, "Stopped", 60)
+        self.actions.append({"action": "stop", "instance": name})
+
+    def start_existing(self, name: str) -> None:
+        result = self.lima("start", f"--timeout={START_TIMEOUT // 60}m", name, timeout=START_TIMEOUT + 60)
+        if result.returncode != 0:
+            raise Failed(f"limactl start {name} failed: {tail(result.stderr)}")
+        self.actions.append({"action": "start", "instance": name})
+
+    def clone_smoke(self, template: dict[str, Any]) -> dict[str, Any]:
+        name = f"{SMOKE_PREFIX}{os.getpid()}"
+        if name in self.instances():
+            raise Refused(f"{name} already exists")
+        argv = ["clone", BASE_INSTANCE, name, "--cpus", str(CLONE_CPUS), "--memory", str(CLONE_MEMORY_GIB),
+                "--mount-none", "--start"]
+        started = time.monotonic()
+        result = self.lima(*argv, timeout=START_TIMEOUT + 60)
+        report: dict[str, Any] = {"instance": name, "argv": ["limactl", "--tty=false", *argv],
+                                  "returncode": result.returncode}
+        try:
+            if result.returncode != 0:
+                raise Failed(f"limactl clone failed: {tail(result.stderr)}")
+            report["clone_start_s"] = round(time.monotonic() - started, 1)
+            item = self.instances().get(name, {})
+            report["cpus"], report["memory_bytes"] = item.get("cpus"), item.get("memory")
+            report["checks"] = self.verify(name, template)
+        finally:
+            if name in self.instances():
+                deleted = self.lima("delete", "--force", name, timeout=STOP_TIMEOUT)
+                report["deleted"] = deleted.returncode == 0 and name not in self.instances()
+        self.actions.append({"action": "clone_smoke", "instance": name})
+        return report
+
+    # ---- the plan/apply driver ----------------------------------------------------------------
+    def execute(self, *, apply: bool, reverify: bool = False, clone_smoke: bool = False) -> dict[str, Any]:
+        out: dict[str, Any] = {"schema": SCHEMA, "apply": apply, "instance": BASE_INSTANCE,
+                               "lima_home": str(self.lima_home), "limactl": str(self.limactl)}
+        host = self.host_facts()
+        out["host"] = host
+        out["clone_sizing"] = {"cpus": CLONE_CPUS, "memory_gib": CLONE_MEMORY_GIB,
+                               "max_clones": max(0, min(MAX_CLONES, (host["memory_gib"] - HOST_RESERVE_GIB) // CLONE_MEMORY_GIB))}
+        if host["system"] != "Darwin" or host["machine"] != "arm64":
+            raise Refused(f"needs an Apple-silicon Mac, this is {host['system']} {host['machine']}")
+        template = self.template()
+        out["template_digest"] = f"sha256:{template['digest']}"
+        lima = self.lima_state()
+        out["lima"] = lima
+        if lima["state"] == "mismatch":
+            raise Refused(f"{self.prefix} is not Lima {LIMA_VERSION}: {lima['detail']}")
+        receipt = self.receipt()
+        instances = self.instances() if lima["state"] == "ok" else {}
+        item = instances.get(BASE_INSTANCE)
+        ours = bool(receipt and receipt.get("instance") == BASE_INSTANCE and receipt.get("created_by") == SCHEMA)
+        if item is not None and not ours:
+            raise Refused(f"{BASE_INSTANCE} exists in {self.lima_home} without this installer's receipt; not touching it")
+        if item is not None:
+            observed = self.instance_yaml_digest(BASE_INSTANCE)
+            if observed not in (template["digest"], (receipt or {}).get("lima_yaml_digest")) or \
+                    (receipt or {}).get("template_digest") != template["digest"]:
+                raise Refused(f"{BASE_INSTANCE} was built from another template (lima.yaml sha256:{observed}); "
+                              "reported, not replaced")
+            if item.get("status") not in ("Running", "Stopped"):
+                raise Refused(f"{BASE_INSTANCE} is {item.get('status')!r}; reported, not replaced")
+        if item is None and receipt and receipt.get("state") == "create_started":
+            raise Refused(f"a previous create of {BASE_INSTANCE} did not finish and left no instance; "
+                          f"inspect, then remove {self.receipt_path} to retry")
+        verified = bool(item and receipt and receipt.get("state") == "ready_stopped"
+                        and receipt.get("template_digest") == template["digest"])
+
+        plan: list[str] = []
+        if lima["state"] == "absent":
+            plan.append("install_lima")
+        if not template["path"].exists():
+            plan.append("materialize_template")
+        if item is None:
+            plan += ["create_start", "verify", "stop"]
+        elif item.get("status") == "Running":
+            plan += ["verify", "stop"]
+        elif not verified or reverify:
+            plan += ["start", "verify", "stop"]
+        if clone_smoke:
+            plan.append("clone_smoke")
+        out["plan"] = plan
+        if not apply:
+            out["disposition"] = "plan" if plan else "unchanged"
+            return out
+        if host["free_gib"] < MIN_FREE_GIB and item is None:
+            raise Refused(f"{host['free_gib']} GiB free, need {MIN_FREE_GIB}")
+
+        if "install_lima" in plan:
+            self.install_lima()
+            lima = self.lima_state()
+            out["lima"] = lima
+            if lima["state"] != "ok":
+                raise Failed(f"installed Lima does not report {LIMA_VERSION}: {lima.get('detail')}")
+        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.lima_home.mkdir(mode=0o700, exist_ok=True)
+        self.materialize_template(template)
+        if item is None:
+            self.write_receipt({"created_by": SCHEMA, "instance": BASE_INSTANCE, "state": "create_started",
+                                "template_digest": template["digest"], "created_at": now()})
+            started = time.monotonic()
+            result = self.lima("start", "--name", BASE_INSTANCE, f"--timeout={CREATE_TIMEOUT // 60}m",
+                               str(template["path"]), timeout=CREATE_TIMEOUT + 120)
+            out["create_s"] = round(time.monotonic() - started, 1)
+            if result.returncode != 0:
+                raise Failed(f"limactl start --name {BASE_INSTANCE} failed: {tail(result.stderr)}")
+            self.actions.append({"action": "create_start", "instance": BASE_INSTANCE})
+            receipt = {"created_by": SCHEMA, "instance": BASE_INSTANCE, "state": "created",
+                       "template_digest": template["digest"], "created_at": receipt_created(self.receipt()),
+                       "lima_yaml_digest": self.instance_yaml_digest(BASE_INSTANCE)}
+            self.write_receipt(receipt)
+        elif "start" in plan:
+            self.start_existing(BASE_INSTANCE)
+        if "verify" in plan:
+            out["checks"] = self.verify(BASE_INSTANCE, template)
+            self.stop(BASE_INSTANCE)
+            receipt = dict(self.receipt() or {})
+            receipt.update({"state": "ready_stopped", "verified_at": now(),
+                            "lima_yaml_digest": self.instance_yaml_digest(BASE_INSTANCE)})
+            self.write_receipt(receipt)
+        if clone_smoke:
+            out["clone_smoke"] = self.clone_smoke(template)
+        final = self.instances().get(BASE_INSTANCE, {})
+        out["status"] = final.get("status")
+        if out["status"] != "Stopped":
+            raise Failed(f"{BASE_INSTANCE} ended {out['status']!r}, want 'Stopped'")
+        out["receipt"] = {k: (self.receipt() or {}).get(k) for k in ("state", "created_at", "verified_at")}
+        out["actions"] = self.actions
+        out["disposition"] = "changed" if self.actions else "unchanged"
+        return out
+
+
+def link_stays_inside(name: str, target: str) -> bool:
+    """A relative symlink whose target, resolved from its own directory, stays in the archive root."""
+    if target.startswith("/"):
+        return False
+    resolved = posixpath.normpath(posixpath.join(posixpath.dirname(posixpath.normpath(name)), target))
+    return resolved != ".." and not resolved.startswith("../") and not resolved.startswith("/")
+
+
+def receipt_created(receipt: dict[str, Any] | None) -> str:
+    return (receipt or {}).get("created_at") or now()
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="glaeda-linux-vm-base", description=__doc__.split("\n\n")[0])
+    parser.add_argument("--apply", action="store_true", help="make the changes (default: plan only)")
+    parser.add_argument("--reverify", action="store_true", help="start, verify and stop an already verified base")
+    parser.add_argument("--clone-smoke", action="store_true", help="clone the base once, verify the clone, delete it")
+    parser.add_argument("--root", default=str(pathlib.Path.home() / ".glaeda" / "linux-vm"), help=argparse.SUPPRESS)
+    args = parser.parse_args(argv)
+    installer = Installer(root=pathlib.Path(args.root))
+    code = 0
+    lock = None
+    try:
+        if args.apply:
+            installer.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            lock = (installer.root / ".lock").open("w")
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise Refused("another glaeda-linux-vm-base --apply holds the lock") from None
+        document = installer.execute(apply=args.apply, reverify=args.reverify, clone_smoke=args.clone_smoke)
+    except Refused as error:
+        document, code = {"schema": SCHEMA, "disposition": "refused", "reason": tail(str(error))}, 2
+    except Failed as error:
+        document, code = {"schema": SCHEMA, "disposition": "failed", "reason": tail(str(error))}, 1
+    finally:
+        if lock is not None:
+            lock.close()
+    if code:
+        document["actions"] = installer.actions
+    print(json.dumps(document, indent=2, sort_keys=True))
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
