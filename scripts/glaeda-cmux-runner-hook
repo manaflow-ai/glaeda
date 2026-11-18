@@ -489,9 +489,23 @@ SIGNING_JOBS = (("nightly.yml", "promote-nightly-next"), ("nightly.yml", "build-
                 ("release.yml", "build-sign-notarize"),
                 ("repair-v0-64-25-helper-rpaths.yml", "repair"), ("cmux-next-dev-daily.yml", "sign"))
 # The workflows besides cmux-tui.yml that call cmux's reusable cmux-tui-build-package.yml; none has a `build` job of
-# its own (cmux at e46f9264703d).
+# its own (cmux at e46f9264703d; relay-publish-npm.yml's build-package since, cmux feat-cmux-next at 60fefda5f5aa).
 TREE_BUILD_CALLERS = ("cmux-tui-artifacts.yml", "cmux-tui-nightly.yml", "cmux-tui-release.yml",
-                      "macos-cross-parity.yml")
+                      "macos-cross-parity.yml", "relay-publish-npm.yml")
+# HEAVY_RUST (Leo, 2026-11-05: "i meant can you do all of htem"; cmux18, 2026-11-18 08:40Z): that `build` is a fat-LTO
+# release cargo build (cmux-tui with its hook and host, then acpmux-standalone), and three of them ran at once on
+# cmux18, a 16 GiB light mini: six rustc at 12, 9.4, 7.2, 5.9, 4.3 and 2.2 GiB, swap 14.4 of 15.3 GB, and
+# loginwindow's out-of-application-memory panel on the screen. Admission let all three in: the class costs cores
+# only (about 3 of the mini's 12 units each), the RAM ledger is off by default (RAM_LEDGER_ENV, mem_chunks_total),
+# and the listener's memoryCap reads free memory at listen time, before a just-started build has grown. So each
+# such job also holds one HEAVY_RUST_TOKEN copy, and a host has one copy per HEAVY_RUST_PEAK_MIB of its RAM
+# (hw.memsize): one on a 16 or 24 GiB mini, four on a 48 GiB std mini (as many as its cores already admit: 14 / 3),
+# eight on 96 GiB. HEAVY_RUST_PEAK_MIB is the largest single rustc seen there (12 GiB). A build that finds every
+# copy taken waits for one (CAPACITY_WAIT) like any token; its marker names only this token, so no other runner's
+# gate holds for it and every other job keeps the mini's units. A host whose RAM cannot be measured takes no copy.
+HEAVY_RUST_TOKEN = "cargo-release"
+HEAVY_RUST_PEAK_MIB = 12 * 1024
+HEAVY_RUST_JOBS = frozenset((caller, "build") for caller in ("cmux-tui.yml", *TREE_BUILD_CALLERS))
 WORKFLOW_JOB_CLASSES = {# the iOS reliability matrix's phone cells: cargo builds the FFI xcframework, then xcodebuild tests
                         # in one booted simulator, so a simulator step's units and the simulator token. As an unknown
                         # job it was a compile (5 units, persistent-dd and a canonical root, no simulator token).
@@ -1080,6 +1094,18 @@ def mem_chunks_total() -> int:
         return 0
     mib = host_mem_mib()
     return max(0, (mib - mem_floor_mib(mib)) // MEM_CHUNK_MIB) if mib else 0
+
+
+def heavy_rust_copies(mem_mib: int | None = None) -> int:
+    """HEAVY_RUST: the HEAVY_RUST_TOKEN copies this host has, one per HEAVY_RUST_PEAK_MIB of RAM (at least one), or 0
+    when its RAM cannot be measured (no token: today's admission)."""
+    mib = host_mem_mib() if mem_mib is None else mem_mib
+    return max(1, mib // HEAVY_RUST_PEAK_MIB) if mib else 0
+
+
+def heavy_rust_job(job: str, repo: str | None, home_repo: str = DEFAULT_HOME_REPO, workflow: str = "") -> bool:
+    """Whether this job is a HEAVY_RUST_JOBS release cargo build of the home repository."""
+    return not is_guest(repo, home_repo) and (workflow, job) in HEAVY_RUST_JOBS
 
 
 def mem_chunks(mib: int) -> int:
@@ -6581,6 +6607,8 @@ def token_holders(capacity_dir: Path, wants: list[str], compile_slots: int, root
             names.append(kind)
         elif kind == GATEWAY_TOKEN_KIND:
             names += list(GATEWAY_TOKENS)
+        elif kind == HEAVY_RUST_TOKEN:
+            names += [HEAVY_RUST_TOKEN] + [f"{HEAVY_RUST_TOKEN}-{c}" for c in range(1, heavy_rust_copies())]
     notes = []
     deadline = time.monotonic() + HOLDERS_BUDGET_S
     for name in names:
@@ -6642,6 +6670,10 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         klass, pinned = job_class(job, repo, home_repo, workflow)
         need = job_need(klass, job, repo, home_repo, workflow)
     units, tokens = need.cores, CLASS_COST[klass][1]
+    # HEAVY_RUST: a release cargo build also holds one of the host's RAM-sized copies of its token
+    heavy = heavy_rust_copies() if klass != EXCLUSIVE_CLASS and heavy_rust_job(job, repo, home_repo, workflow) else 0
+    if heavy:
+        tokens = (*tokens, HEAVY_RUST_TOKEN)
     uses_gui = "gui" in tokens
     if uses_gui:
         tokens = tuple(gui_token if token == "gui" else token for token in tokens)
@@ -6778,7 +6810,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
             # SIM_DYNAMIC: the simulator token likewise comes in copies up to the runtime ceiling; a copy past the
             # first needs headroom (sim_copy_room) and SIM_GATE shared, so a busy mini still runs one simulator job
             copies = {"persistent-dd": max(1, compile_slots), "root": 1 if pinned else max(1, roots),
-                      GATEWAY_TOKEN_KIND: len(GATEWAY_TOKENS)}.get(token, 1)
+                      GATEWAY_TOKEN_KIND: len(GATEWAY_TOKENS), HEAVY_RUST_TOKEN: heavy}.get(token, 1)
             if token == SIM_TOKEN:
                 if (off := sim_off(capacity_dir)):
                     if taken_out is not None:

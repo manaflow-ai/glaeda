@@ -6196,7 +6196,8 @@ time.sleep(60)
         # TREE_BUILD: the reusable cmux-tui `build` under every workflow that calls it (GITHUB_WORKFLOW_REF names the
         # caller): cargo in the workspace, so units and no token
         self.assertEqual(hook.TREE_BUILD_CALLERS, ("cmux-tui-artifacts.yml", "cmux-tui-nightly.yml",
-                                                   "cmux-tui-release.yml", "macos-cross-parity.yml"))
+                                                   "cmux-tui-release.yml", "macos-cross-parity.yml",
+                                                   "relay-publish-npm.yml"))
         for caller in ("cmux-tui.yml", *hook.TREE_BUILD_CALLERS):
             with self.subTest(caller=caller):
                 self.assertEqual(hook.job_class("build", home, home, caller), ("isolated", False))
@@ -19567,6 +19568,44 @@ class CapacityArithmeticTest(unittest.TestCase):
             self.assertEqual(hook.fit_mem_chunks([20000, 3000], 12), 3, "a job that never fits holds nothing")
             self.assertEqual(hook.fit_mem_chunks([], 12), 1)
             self.assertEqual(hook.fit_mem_chunks([], 0), 0)
+
+    def test_a_16_gib_host_runs_one_release_cargo_build_at_a_time(self) -> None:
+        # HEAVY_RUST (cmux18, 2026-11-18 08:40Z): three cmux-tui-build-package `build` jobs, fat-LTO release cargo
+        # builds, ran at once on a 12-core 16 GiB mini (six rustc at 2.2-12 GiB, swap 14.4 of 15.3 GB) because the
+        # class costs only cores and the RAM ledger is off by default. A second one now waits for the token; other
+        # jobs keep the units, and a 48 GiB host keeps its parallelism.
+        home = hook.DEFAULT_HOME_REPO
+        self.assertEqual([hook.heavy_rust_copies(gib * 1024) for gib in (16, 24, 32, 48, 96)], [1, 2, 2, 4, 8])
+        self.assertEqual(hook.heavy_rust_copies(0), 0, "unmeasured RAM: no token, today's admission")
+        self.assertTrue(hook.heavy_rust_job("build", home, home, "relay-publish-npm.yml"))
+        self.assertFalse(hook.heavy_rust_job("build", self.GUEST, home, "cmux-tui-artifacts.yml"))
+        self.assertFalse(hook.heavy_rust_job("lint", home, home, "cmux-tui.yml"))
+        off = {hook.RAM_LEDGER_ENV: "", hook.JOB_NEEDS_ENV: os.fspath(self.dir / "no-needs.json")}
+        with mock.patch.dict(os.environ, {**off, hook.HOST_CORES_ENV: "12", hook.HOST_MEM_ENV: "16384"}):
+            taken: dict = {}
+            with mock.patch.object(hook, "hold", side_effect=self.keep), \
+                    mock.patch.object(hook, "lock_waiters", return_value=[]), \
+                    mock.patch.object(hook, "bounded_waiters", return_value=[]):
+                ok, why = hook.take_capacity(os.fspath(self.dir / "fleet" / "host.lock"), self.dir / "capacity", 12,
+                                             "build", os.getpid(), self.dir / "state", repo=home,
+                                             workflow="cmux-tui-artifacts.yml", taken_out=taken)
+            self.assertTrue(ok, why)
+            self.assertIn(hook.HEAVY_RUST_TOKEN, taken["tokens"])
+            for caller in ("cmux-tui-artifacts.yml", "cmux-tui.yml", "cmux-tui-nightly.yml"):
+                with self.subTest(caller=caller):
+                    ok, why = self.take("build", caller, repo=home)
+                    self.assertFalse(ok, "a second release cargo build on a 16 GiB host waits")
+                    self.assertIn(f"the {hook.HEAVY_RUST_TOKEN} token is taken", why)
+            self.assertTrue(self.take("lint", "cmux-tui.yml", repo=home)[0], "other jobs keep the units")
+        hook.close_all(self.held)
+        self.held.clear()
+        with mock.patch.dict(os.environ, {**off, hook.HOST_CORES_ENV: "30", hook.HOST_MEM_ENV: str(48 * 1024)}):
+            for n in range(4):
+                ok, why = self.take("build", "cmux-tui-artifacts.yml", repo=home)
+                self.assertTrue(ok, f"build {n + 1} of 4 on a 48 GiB host: {why}")
+            ok, why = self.take("build", "cmux-tui-artifacts.yml", repo=home)
+            self.assertFalse(ok)
+            self.assertIn(f"all 4 {hook.HEAVY_RUST_TOKEN} tokens are taken", why)
 
     def test_needs_prints_what_admission_reads(self) -> None:
         needs = self.needs(classes={"compile": self.row(5.2, 9000)})
