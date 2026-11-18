@@ -17804,14 +17804,31 @@ class LandTest(Base):
         state.start()
         self.addCleanup(state.stop)
         self.t = NOW
+        self.github_head = {}
         self.q = self.queue()
 
     def queue(self) -> Any:
         return gg.LandQueue(run=self.w.run, cache_of=self.w.cache.get, watch=self.w.watched.append,
-                            nudge=self.w.nudged.append, notice=lambda *a: self.w.notices.append(a), inline=True,
+                            nudge=self.nudge_read, notice=lambda *a: self.w.notices.append(a), inline=True,
                             config=self.w.config, reads_upstream=lambda: self.upstream, refresh=self.refresh,
                             behind=lambda *a: self.stale_why, broker_client=lambda: self.broker,
                             snapshot_of=self.snaps.get)
+
+    # GitHub's own head per PR when a test moves it behind the daemon's back (the cache not told); a nudge reads it.
+    github_head: dict[str, str] = {}
+    nudge_reads = True  # a nudge is answered by the daemon's read at once; False: the read never comes
+
+    def nudge_read(self, key: str) -> None:
+        """The daemon's answer to a nudge: a read of KEY that stores GitHub's head, or confirms the cached one."""
+        self.w.nudged.append(key)
+        c = self.w.cache.get(key)
+        if not self.nudge_reads or not c or not isinstance(c.get("data"), dict):
+            return
+        head = self.github_head.get(key)
+        if head and head != str(c["data"].get("headRefOid") or "").lower():
+            self.w.set_pr(key, land_pr(head), self.t)
+        else:
+            c["updatedAtAt"] = self.t
 
     stale_why: str | None = None  # what the checkout-staleness check answers
     broker = False  # this host's gh is lane-gh's broker client (a lane VM)
@@ -18784,6 +18801,64 @@ class LandTest(Base):
         self.assert_merged_at(LA)
         self.assertFalse((gg.land_dir() / gg.LAND_LATCH_FILE).exists())
 
+    def clear_latch(self) -> None:
+        for path in self.latch_dir.glob("*-exhausted*.json"):
+            path.unlink()
+
+    def test_a_head_cached_before_the_latch_is_read_again_before_it_is_pinned(self):
+        """huge-blue, 2026-11-18 09:43Z: parked on the login's latch, the daemon read nothing; on resume glaeda#2140
+        waited on, then judged, its old head 401ccf880760 (snapshot_wait, snapshot_missing) though bc1601b6 had long
+        been its head. After the latch clears, a cached head is pinned only once a read since then shows it."""
+        self.pr(LA)
+        self.land()
+        self.latch("graphql", self.t + 600)
+        self.tick(30)
+        self.assertEqual(self.reads(), (0, 0, 0, 0))
+        self.github_head[self.KEY] = LB  # pushed while the latch held: the cache still says LA
+        self.clear_latch()
+        e = self.tick(1)  # the nudge's read shows LB: nothing is judged at LA, LB is judged on the next pass
+        self.assertEqual(self.w.explains(), [])
+        self.assertIn("head_stale", [h.get("event") for h in e["history"]])
+        self.w.answers.append(ok_answer(LB))
+        self.tick(1)
+        self.assertEqual(self.w.explains()[0][-2:], [LB, "--json"])
+        self.assert_merged_at(LB)
+
+    def test_a_cached_head_no_read_confirms_is_judged_unpinned(self):
+        """No read since the latch cleared (the nudge goes unanswered): after LAND_FRESH_WAIT merge_hold is asked with
+        no --sha and reads the head itself, never the cache's old one."""
+        self.nudge_reads = False
+        self.pr(LA)
+        self.land()
+        self.latch("graphql", self.t + 600)
+        self.tick(30)
+        self.clear_latch()
+        self.tick(1)
+        self.tick(gg.LAND_FRESH_WAIT / 2)
+        self.assertEqual(self.w.explains(), [])
+        self.assertIn(self.KEY, self.w.nudged)
+        self.w.answers.append(ok_answer(LB))
+        e = self.tick(gg.LAND_FRESH_WAIT)
+        self.assertNotIn("--sha", self.w.explains()[0])
+        self.assertIn("head_unpinned", [h.get("event") for h in e["history"]])
+        self.assert_merged_at(LB)
+
+    def test_an_entry_unparked_from_a_quota_park_reads_its_head_again(self):
+        """The same for one entry's own quota park (park_quota): nothing is read for it while parked."""
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("quota", LA, {"kind": "retry", "after_s": 300},
+                                      reason="merge-hold: refused: REST reserve"))
+        e = self.tick(1)
+        self.assertEqual((e["state"], (e["wait"] or {}).get("kind")), ("waiting", "quota"))
+        self.github_head[self.KEY] = LB
+        self.w.answers.append(ok_answer(LB))
+        self.tick(e["wakeAt"] - self.t)
+        self.tick(1)
+        self.assertEqual(self.w.explains()[-1][-2:], [LB, "--json"])
+        self.assertEqual([x[-2] for x in self.w.explains()], [LA, LB])  # LA never judged again after the park
+        self.assert_merged_at(LB)
+
     def test_jitter_is_within_the_spread_and_fixed_per_caller(self):
         keys = [f"pr:o/r#{n}" for n in range(200)]
         offsets = [gg.land_jitter(k) for k in keys]
@@ -19255,6 +19330,9 @@ class LandForwardTest(Base):
 
     queue = LandTest.queue
     refresh = LandTest.refresh
+    nudge_read = LandTest.nudge_read
+    github_head: dict[str, str] = {}
+    nudge_reads = False  # this host forwards: it reads nothing for a judgement
     land = LandTest.land
     tick = LandTest.tick
     pr = LandTest.pr

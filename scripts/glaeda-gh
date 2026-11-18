@@ -8030,6 +8030,11 @@ LAND_SNAPSHOT_SCHEMA = "merge-hold-rollup-snapshot/v1"
 LAND_SNAPSHOT_DIR = "snapshots"
 LAND_SNAPSHOT_MAX_AGE = 300.0
 LAND_SNAPSHOT_WAIT = 120.0
+# The head a judgement pins is the cache's only when the cache read the PR after the entry was unparked or the login's
+# latch last cleared (LandQueue.fresh_head). huge-blue, 2026-11-18 09:43Z: parked on the latch, the daemon read
+# nothing for 37 min; on resume glaeda#2140 waited on, then judged, its old head 401ccf880760 though bc1601b6 had been
+# its head since before 09:00Z. Past this wait for a fresh read (nudged), merge_hold judges unpinned: it reads the head.
+LAND_FRESH_WAIT = 120.0
 # A "command" step that is a wait this queue runs itself. cosmic-gray, 2026-11-17: merge_hold refused cmux#45404 (the
 # base clippy fix) `checks_running` with the step {"kind": "command", "text": "glaeda-gh wait run
 # manaflow-ai/cmux/44061804279 --timeout 3600"}, and land stopped on it twice, each stop also stopping every land queued
@@ -8411,7 +8416,8 @@ class LandQueue:
         self.behind_at = float("-inf")
         self.stale_checkout: str | None = None
         self.latched: tuple[str, int] | None = None
-        refused = read_json(land_dir() / LAND_REFUSED_FILE)
+        self.latch_cleared = float("-inf")  # when the login's latch last cleared: no cached head before it is pinned
+        refused =read_json(land_dir() / LAND_REFUSED_FILE)
         self.refused: dict | None = refused if isinstance(refused, dict) else None
         self.lock = threading.RLock()
         self.local = threading.local()  # .gen: the request generation the worker's job started under
@@ -8738,6 +8744,7 @@ class LandQueue:
             path = land_dir() / LAND_LATCH_FILE
             if held is None:
                 path.unlink(missing_ok=True)
+                self.latch_cleared = self.now  # every cached head is from before or during the park (fresh_head)
                 log({"event": "land-latch-clear"})
             else:
                 write_json(path, {"pool": held[0], "until": held[1], "at": self.now})
@@ -8752,7 +8759,7 @@ class LandQueue:
         wake = e.get("wakeAt")
         if isinstance(wake, (int, float)) and self.now < wake:
             return True
-        e.update(state="queued", wait=None, wakeAt=None)
+        e.update(state="queued", wait=None, wakeAt=None, freshAfter=self.now)  # nothing was read for it while parked
         self.history(e, "unparked")
         self.save(e)
         return False
@@ -8925,7 +8932,7 @@ class LandQueue:
             if running:
                 self.wait_running(e, head, fp)
             else:
-                self.judge(e, e.pop("judgeSha", None) or head, fp)
+                self.judge(e, head, fp)
             return
         if kind == "head_change":
             # After a push-making step: never judge (or pin) a head read before it.
@@ -9067,7 +9074,48 @@ class LandQueue:
         self.history(e, "snapshot_missing", head=sha[:12])
         return False
 
+    def fresh_head(self, e: dict, sha: str) -> str | None:
+        """SHA when a judgement may pin it, "" when merge_hold must read the head itself, None while E waits (nudged)
+        for a read of its PR made after it was unparked or the login's latch last cleared (LAND_FRESH_WAIT): while
+        either held, the daemon read nothing for it. Only a head the cache gave is checked: a pin merge_hold named (a
+        repin) is its own read."""
+        c = self.cache_of(e["key"]) or {}
+        if not sha or str(((c.get("data") or {}).get("headRefOid")) or "").lower() != sha:
+            e.pop("staleHead", None)
+            return sha
+        after = max(float(e.get("freshAfter") or 0), self.latch_cleared)
+
+        def read_since(cache: dict) -> bool:
+            # When GitHub last showed this head: a read that changed it (dataAt) or confirmed it unchanged (updatedAtAt).
+            reads = [t for t in (cache.get("dataAt"), cache.get("updatedAtAt")) if isinstance(t, (int, float))
+                     and not isinstance(t, bool)]
+            return bool(reads) and max(reads) >= after
+
+        if read_since(c):
+            e.pop("staleHead", None)
+            return sha
+        w = e.get("staleHead") or {}
+        if w.get("sha") != sha:
+            w = e["staleHead"] = {"sha": sha, "since": self.now}
+            self.history(e, "head_stale", head=sha[:12])
+            self.nudge(e["key"])
+            self.save(e)
+            c = self.cache_of(e["key"]) or {}  # a read the nudge already answered (the daemon's own, in its pass)
+            head = str(((c.get("data") or {}).get("headRefOid")) or "").lower()
+            if read_since(c):
+                e.pop("staleHead", None)
+                return sha if head == sha else None  # a new head: consider() judges it on its next pass
+        if self.now - float(w.get("since") or 0) < LAND_FRESH_WAIT:
+            return None
+        e.pop("staleHead", None)
+        self.history(e, "head_unpinned", head=sha[:12])
+        return ""
+
     def judge(self, e: dict, sha: str, fp: str, counts: bool = True) -> None:
+        pin = self.fresh_head(e, sha)
+        if pin is None:
+            return  # judged once the daemon has read the PR since it was unparked or the latch cleared
+        sha = pin
         if self.snapshot_wait(e, sha):
             return  # judged on the daemon's next read of this head (one read, shared), not on merge_hold's own
         head = str((((self.cache_of(e["key"]) or {}).get("data")) or {}).get("headRefOid") or "").lower()

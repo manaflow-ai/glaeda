@@ -970,6 +970,113 @@ class TrimTest(Base):
 
 
 class CheckoutTest(unittest.TestCase):
+    def setUp(self) -> None:
+        # Never the host's own git mirror (a mini running this suite has one at FLEET_DIR/git).
+        saved = os.environ.get("GLAEDA_GIT_MIRROR_DIR")
+        self.addCleanup(lambda: os.environ.__setitem__("GLAEDA_GIT_MIRROR_DIR", saved) if saved is not None
+                        else os.environ.pop("GLAEDA_GIT_MIRROR_DIR", None))
+        self.mirror_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.mirror_tmp.cleanup)
+        os.environ["GLAEDA_GIT_MIRROR_DIR"] = os.path.join(self.mirror_tmp.name, "git")
+
+    def source_repo(self, source: Path) -> str:
+        run = lambda *args: subprocess.run(["git", *args], cwd=source, check=True, capture_output=True)
+        source.mkdir()
+        run("init", "-q", "-b", warm.BRANCH)
+        run("config", "uploadpack.allowFilter", "true")
+        for text in ("zero\n", "one\n"):
+            (source / "a.txt").write_text(text * 2000)
+            run("add", "a.txt")
+            run("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", text.strip())
+        return subprocess.run(["git", "rev-parse", "HEAD"], cwd=source, check=True, capture_output=True,
+                              text=True).stdout.strip()
+
+    def make_mirror(self, source: Path) -> Path:
+        mirror = Path(os.environ["GLAEDA_GIT_MIRROR_DIR"]) / "cmux.git"
+        subprocess.run(["git", "clone", "-q", "--mirror", os.fspath(source), os.fspath(mirror)], check=True,
+                       capture_output=True)
+        (mirror / "glaeda-verified").write_text("")
+        return mirror
+
+    def checkout_with(self, source: Path, work: Path, head: str) -> None:
+        saved, saved_depth = warm.REPO_URL, warm.CLONE_DEPTH
+        warm.CLONE_DEPTH, warm.REPO_URL = 1, source.as_uri()
+        try:
+            warm.prepare_checkout(work, head)
+        finally:
+            warm.REPO_URL, warm.CLONE_DEPTH = saved, saved_depth
+
+    @staticmethod
+    def own_blobs(checkout: Path) -> int:
+        """Blobs in the checkout's own object store (packs and loose), not what its alternates serve."""
+        count = 0
+        for idx in sorted((checkout / ".git" / "objects" / "pack").glob("*.idx")):
+            out = subprocess.run(["git", "verify-pack", "-v", os.fspath(idx)], cwd=checkout, capture_output=True,
+                                 text=True).stdout
+            count += sum(1 for line in out.splitlines() if " blob " in line)
+        for sub in (checkout / ".git" / "objects").glob("[0-9a-f][0-9a-f]"):
+            for obj in sub.iterdir():
+                kind = subprocess.run(["git", "cat-file", "-t", sub.name + obj.name], cwd=checkout,
+                                      capture_output=True, text=True).stdout.strip()
+                count += kind == "blob"
+        return count
+
+    def test_the_checkout_borrows_the_minis_git_mirror(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source, work = Path(tmp) / "source", Path(tmp) / "work"
+            head = self.source_repo(source)
+            mirror = self.make_mirror(source)
+            work.mkdir()
+            self.checkout_with(source, work, head)
+            checkout = work / "cmux"
+            git_dir = checkout / ".git"
+            self.assertEqual((checkout / "a.txt").read_text(), "one\n" * 2000)
+            self.assertEqual((git_dir / "objects/info/alternates").read_text().strip(),
+                             os.fspath(mirror / "objects"))
+            self.assertEqual(json.loads((git_dir / warm.BORROW_RECORD).read_text())["objects"],
+                             os.fspath(mirror / "objects"))
+            self.assertEqual(self.own_blobs(checkout), 0, "the checked-out blob is read from the mirror")
+            # A rebuilt mirror (a reseed is a new directory) may lack what the checkout relied on: start over.
+            mirror.rename(mirror.with_name("old.git"))  # held aside, so the new one cannot reuse its inode
+            self.make_mirror(source)
+            (checkout / "marker").write_text("old clone")
+            self.checkout_with(source, work, head)
+            self.assertFalse((checkout / "marker").exists())
+            self.assertEqual((checkout / "a.txt").read_text(), "one\n" * 2000)
+            self.assertEqual(self.own_blobs(checkout), 0)
+            # The mirror gone: the clone that borrowed it starts over from GitHub and borrows nothing.
+            warm.shutil.rmtree(mirror)
+            self.checkout_with(source, work, head)
+            self.assertFalse((git_dir / "objects/info/alternates").exists())
+            self.assertEqual((checkout / "a.txt").read_text(), "one\n" * 2000)
+
+    def test_a_clone_made_before_the_mirror_borrows_it_and_drops_its_copies(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source, work = Path(tmp) / "source", Path(tmp) / "work"
+            head = self.source_repo(source)
+            work.mkdir()
+            self.checkout_with(source, work, head)  # no mirror yet
+            checkout = work / "cmux"
+            self.assertGreater(self.own_blobs(checkout), 0)
+            mirror = self.make_mirror(source)
+            self.checkout_with(source, work, head)
+            self.assertEqual((checkout / ".git/objects/info/alternates").read_text().strip(),
+                             os.fspath(mirror / "objects"))
+            self.assertEqual(self.own_blobs(checkout), 0, "repack -a -d -l dropped what the mirror holds")
+            self.assertEqual((checkout / "a.txt").read_text(), "one\n" * 2000)
+
+    def test_only_a_verified_mirror_is_borrowed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source"
+            self.source_repo(source)
+            mirror = self.make_mirror(source)
+            self.assertIsNotNone(warm.mirror_identity(mirror))
+            (mirror / "glaeda-repair-pending").write_text("")
+            self.assertIsNone(warm.mirror_identity(mirror))
+            (mirror / "glaeda-repair-pending").unlink()
+            (mirror / "glaeda-verified").unlink()
+            self.assertIsNone(warm.mirror_identity(mirror))
+
     def test_first_clone_is_shallow_blobless_and_checks_out_head(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             source, work = Path(tmp) / "source", Path(tmp) / "work"

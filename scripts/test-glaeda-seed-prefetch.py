@@ -55,6 +55,9 @@ class PrefetchBase(unittest.TestCase):
         self.commit()
         self.calls = base / "calls"
         self.saved = (sp.REPO_URL, sp.running_commands, dict(os.environ))
+        saved_mirror_dir = sp.GIT_MIRROR_DIR  # never the host's own git mirror (a mini running this suite has one)
+        self.addCleanup(setattr, sp, "GIT_MIRROR_DIR", saved_mirror_dir)
+        sp.GIT_MIRROR_DIR = os.fspath(base / "git")
         sp.REPO_URL = self.repo.as_uri()
         sp.running_commands = lambda: ["/usr/libexec/something", "zsh"]
         os.environ["FAKE_CALLS"] = os.fspath(self.calls)
@@ -80,6 +83,31 @@ class PrefetchBase(unittest.TestCase):
 
 
 class SeedPrefetchTest(PrefetchBase):
+    def test_the_prefetch_mirror_borrows_the_minis_git_mirror(self):
+        mirror = Path(sp.GIT_MIRROR_DIR) / "cmux.git"
+        subprocess.run(["git", "clone", "-q", "--mirror", os.fspath(self.repo), os.fspath(mirror)], check=True)
+        (mirror / "glaeda-verified").write_text("")
+        work = self.state / ".prefetch"
+        own, head = sp.main_head(work)
+        self.assertEqual(head, subprocess.run([*self.git, "rev-parse", "HEAD"], capture_output=True, text=True,
+                                              check=True).stdout.strip())
+        self.assertEqual((own / "objects/info/alternates").read_text().strip(), os.fspath(mirror / "objects"))
+        self.assertEqual(json.loads((own / sp.BORROW_RECORD).read_text())["objects"], os.fspath(mirror / "objects"))
+        # A rebuilt git mirror may lack what this one relied on: it starts over, borrowing the new one.
+        (own / "marker").write_text("old")
+        mirror.rename(mirror.with_name("old.git"))  # held aside, so the new one cannot reuse its inode
+        subprocess.run(["git", "clone", "-q", "--mirror", os.fspath(self.repo), os.fspath(mirror)], check=True)
+        (mirror / "glaeda-verified").write_text("")
+        own, again = sp.main_head(work)
+        self.assertEqual(again, head)
+        self.assertFalse((own / "marker").exists())
+        self.assertEqual((own / "objects/info/alternates").read_text().strip(), os.fspath(mirror / "objects"))
+        # No usable git mirror: it fetches from GitHub alone, as before.
+        (mirror / "glaeda-repair-pending").write_text("")
+        own, again = sp.main_head(work)
+        self.assertEqual(again, head)
+        self.assertFalse((own / "objects/info/alternates").exists())
+
     def test_a_mini_no_owned_job_has_recorded_is_skipped(self):
         result = sp.run(True, self.state)
         self.assertEqual(result["state"], "skip")

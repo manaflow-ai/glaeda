@@ -251,14 +251,70 @@ def git(mirror: Path, *args: str, timeout: int = FETCH_TIMEOUT) -> str:
                           text=True, timeout=timeout, env=env).stdout
 
 
+# This blobless mirror reads commits and trees through the mini's one full mirror (glaeda-git-mirror) instead of
+# fetching its own copy from GitHub. Leo, 2026-11-18: seeds and shared caches are read through, not copied to the
+# internal disk. glaeda-git-mirror never removes an object, so borrowing it is safe; a rebuilt mirror (a reseed is
+# a new directory) may lack an object this one relied on, so the borrow is recorded (as the runner hook's are) and
+# this mirror starts over when it changes. Without a usable git mirror it fetches from GitHub as before.
+GIT_MIRROR_DIR = os.environ.get("GLAEDA_GIT_MIRROR_DIR") or "/Users/Shared/cmux-build-fleet/git"
+BORROW_RECORD = "glaeda-mirror-borrow.json"
+
+
+def mirror_identity(mirror: Path) -> dict | None:
+    """The git mirror's objects directory when it is usable (glaeda-git-mirror verified it, no repair pending, not
+    shallow), as {"objects", "ino", "birth"}; else None. The runner hook's test, kept in step."""
+    try:
+        objects = mirror / "objects"
+        st = os.stat(objects, follow_symlinks=False)
+        if not os.path.isdir(objects) or objects.is_symlink() or mirror.is_symlink() \
+                or not (mirror / "HEAD").is_file() \
+                or not (mirror / "glaeda-verified").is_file() or (mirror / "glaeda-repair-pending").exists() \
+                or (mirror / "shallow").exists():
+            return None
+    except OSError:
+        return None
+    identity = {"objects": os.fspath(objects), "ino": st.st_ino}
+    if (birth := getattr(st, "st_birthtime", None)) is not None:
+        identity["birth"] = birth
+    return identity
+
+
+def borrow_state(repo: Path) -> tuple[list[str], dict | None]:
+    try:
+        alternates = [line.strip() for line in (repo / "objects/info/alternates").read_text().splitlines()
+                      if line.strip()]
+    except OSError:
+        alternates = []
+    try:
+        recorded = json.loads((repo / BORROW_RECORD).read_text())
+    except (OSError, ValueError):
+        recorded = None
+    return alternates, recorded if isinstance(recorded, dict) else None
+
+
+def borrow(repo: Path, identity: dict) -> None:
+    (repo / "objects" / "info").mkdir(parents=True, exist_ok=True)
+    (repo / "objects" / "info" / "alternates").write_text(identity["objects"] + "\n")
+    incoming = repo / f".{BORROW_RECORD}.{os.getpid()}"
+    incoming.write_text(json.dumps(identity) + "\n")
+    incoming.rename(repo / BORROW_RECORD)
+
+
 def main_head(work: Path) -> tuple[Path, str]:
     """A blobless shallow mirror of main, fetched now; returns (mirror, head sha)."""
     mirror = work / "cmux.git"
+    source = mirror_identity(Path(GIT_MIRROR_DIR) / "cmux.git")
+    alternates, recorded = borrow_state(mirror)
+    if alternates and (source is None or alternates != [source["objects"]] or recorded is None
+                       or recorded.get("ino") != source["ino"] or recorded.get("birth") != source.get("birth")):
+        shutil.rmtree(mirror, ignore_errors=True)  # the git mirror it borrowed went or was rebuilt: start over
     if not (mirror / "HEAD").is_file():
         shutil.rmtree(mirror, ignore_errors=True)
         mirror.mkdir(parents=True)
         git(mirror, "init", "--bare", "-q")
         git(mirror, "remote", "add", "origin", REPO_URL)
+    if source is not None and not borrow_state(mirror)[0]:
+        borrow(mirror, source)  # earlier objects stay until the mirror is next rebuilt; they are small (trees)
     git(mirror, "fetch", "-q", "--filter=blob:none", f"--depth={DEPTH}", "origin",
         "+refs/heads/main:refs/remotes/origin/main")
     return mirror, git(mirror, "rev-parse", "refs/remotes/origin/main").strip()

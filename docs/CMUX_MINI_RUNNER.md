@@ -573,18 +573,23 @@ What `--apply` does:
      gives way and the nightly skips rather than fails. An unreadable state changes nothing;
      `GLAEDA_RUNNER_CONSOLE_GATE=0` in the runner LaunchAgent turns it off.
    - **When free disk is under the housekeeping target** (every runner). The gate reads the runner's
-     `--min-free-gib` and warns, requesting the existing bounded background cleanup at most every 15 minutes.
+     `--min-free-gib` and warns, starting the bounded background cleanup at once (a pass of its own at most
+     every `GATE_DISK_REPASS_S`, 60 s; one already deleting under `evict.lock` is joined, not duplicated).
      It keeps listeners online, never arms the Worker-exit freeze for a disk reading, and has no disk resume
      hysteresis. Unresolved warnings repeat at most every 30 minutes. The builder reserve remains a cleanup
      target. Job admission retains its existing measured job-growth floor (normally 20 GiB), tour and dedicated
-     builder requirements, and single-job disk-low ledger; this change adds no hard-stop threshold.
-     One reading does hold an idle pool runner (`DISK_SHORT_HOLD`), whatever its floor: free disk under one job's
-     measured peak (`GLAEDA_RUNNER_JOB_DISK_GIB`, 20 GiB). A job taken there cannot fit (2026-11-11: a fast tier
-     admitted at 19.8 GiB free failed its link with `ld` errno 28 after 13 minutes), so the listener stops and the
-     job goes to a runner with room or waits, slower but never failed. A running job is never stopped or frozen
-     for it; the nightly's own listeners, dedicated builders, gateway runners and runners with no floor are never
-     held for disk. `RUNNER_JOBS_DISK` also holds it while free disk is under 10 GiB plus one runner job's p95
-     (`glaeda-runner-job-disk.json`) for each job in flight, each idle listener sorted before it, and the next job.
+     builder requirements, and single-job disk-low ledger, all warnings; this change adds no hard-stop threshold.
+     **A disk floor never holds a listener or pauses work for more than seconds (`DISK_RECLAIM_NOW`; Leo,
+     2026-11-18: disk floors trigger reclaim and wait seconds).** Free disk under one job's measured peak
+     (`GLAEDA_RUNNER_JOB_DISK_GIB`, 20 GiB; `DISK_SHORT_RECLAIM`) or under 10 GiB plus one runner job's p95
+     (`glaeda-runner-job-disk.json`) for each job in flight, each idle listener sorted before it, and the next job
+     (`RUNNER_JOBS_DISK`) makes an idle pool runner start reclaim at once aimed at what it lacks, wait at most
+     `DISK_RECLAIM_WAIT_S` (30 s) for that room before its listener starts, and then listen whatever was freed.
+     These readings used to hold the listener (`DISK_SHORT_HOLD`) and space evictions 15 minutes apart, which idled
+     units while jobs queued (ci-dash, 2026-11-18: cmux17 lost 4.2 unit-hours to the disk floor in 30 minutes).
+     job-started's whole disk phase (floor eviction, the disk ledger's turn, the pre-job target) shares the same
+     30 s budget, down from 300 s. A running job is never stopped or frozen for disk; the nightly's own listeners,
+     dedicated builders, gateway runners and runners with no floor never wait.
      Pattern, *reservation counted twice*: a reservation for space a job will write must shrink as the job writes
      it, or the bytes count once as gone from free disk and again as reserved (2026-11-17 12:36Z-12:55Z: cmux17,
      cmux18, cmux19 and cmux21 held side-std listeners at 25-35 GiB free with every idle cache deleted while 160
@@ -603,8 +608,8 @@ What `--apply` does:
      0700, both files are written 0600 without following a symlink, and a gate reads (and cleanup removes) only a
      regular file of its own uid with no group or other access in a directory that is the same; a record in the
      state directory itself is never read. Jobs run as the hook's user, so this keeps out records that are stale,
-     foreign, loose or linked, not a job that sets out to forge one. The detector is the gate's hold line: a
-     `RUNNER_JOBS_DISK` hold whose free disk is well above the floor with no `less ... already wrote` is a
+     foreign, loose or linked, not a job that sets out to forge one. The detector is the gate's reclaim line: a
+     `RUNNER_JOBS_DISK` reclaim whose free disk is well above the floor with no `less ... already wrote` is a
      reservation that is not shrinking.
      `glaeda-disk --pressure` reads the highest floor among the user's runner hooks and starts freeing at floor
      + 4 GiB, up to floor + 20 GiB (never past half the disk). Cleanup can run during CI and protects live work.
@@ -626,11 +631,10 @@ What `--apply` does:
      owns, whatever their age, back down to the cap, keeping every in-use veto ([CMUX_NEXT_CI_RETENTION.md](CMUX_NEXT_CI_RETENTION.md); cmux11s,
      2026-10-21: jobs refused at 21 GiB free with 78 GiB there and nothing reclaimable).
    - **Stopping.** After two idle polls in a row, and one fresh look right before the
-     signal, the gate sends `SIGINT` to the runner's `Runner.Listener`. Under the disk
-     floor the first idle poll is enough, ahead of any other hold, and while a job runs
-     under the floor the gate watches its `Runner.Worker` every 0.1 s and polls every 0.1 s
-     for 5 s after it exits: the listener asks for its next job as soon as the Worker
-     exits and got one 2 s later, inside one 2 s poll, so every job it took was refused
+     signal, the gate sends `SIGINT` to the runner's `Runner.Listener`. Disk never stops a
+     listener (`DISK_RECLAIM_NOW`). For the holds that remain, while a job runs the gate watches
+     its `Runner.Worker` and stops the listener at its exit (`JOB_END_FREEZE`): the listener asks
+     for its next job as soon as the Worker exits and got one 2 s later, inside one 2 s poll
      (cmux9s, 2026-09-30: four in 34 s on one runner).
      - The listener's graceful exit ends its session, and GitHub shows the runner as
        offline.
@@ -2041,7 +2045,10 @@ rebuild-tier from main's head, and each mini had sat fully idle 17 to 33% of the
   the yield below, so a rollout in either order is safe. Under `capacity/admission.lock` it takes the root's
   token, a persistent-dd token and a compile's units, with the host lock shared, writes
   `capacity/idle-warm.json` (its pid and those names), and lets the admission lock go. Then cmux's
-  `scripts/ci/owned_catch_up.sh`, run from a clean checkout of main's head kept under `ci/.catch-up/cmux` (a shallow, blobless clone),
+  `scripts/ci/owned_catch_up.sh`, run from a clean checkout of main's head kept under `ci/.catch-up/cmux` (a shallow, blobless
+  clone that
+  borrows the objects of the mini's git mirror, `git/cmux.git`, so it keeps no copy of them; the seed prefetch's
+  `ci/.prefetch/cmux.git` borrows them the same way),
   runs the steps of a main dispatch's compile admission (check, prefer against kept seeds, adopt, record,
   compile, keep with main's head as `merged_onto`, save). Logs: `ci/.catch-up/logs/`, one line per run in
   `~/Library/Logs/glaeda-idle-warm.jsonl`.

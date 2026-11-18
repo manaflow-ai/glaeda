@@ -109,10 +109,11 @@ the mini and keep the gui label queued. A fast runner (--fast-runner) runs cmux-
 (--gateway-runner) runs only cmux's thin cmux-ci client jobs (GATEWAY_JOBS) on a gateway token (GATEWAY_TOKENS) and no
 shared unit; its gate is never held for CPU saturation or the units (GATEWAY).
 Every runner warns while free disk is under its job-started hook's --min-free-gib and starts the same bounded
-eviction in the background while it keeps listening (Gate.low_disk), except that an idle pool runner stops
-listening while free disk is under one job's measured peak (job_disk_gib, DISK_SHORT_HOLD), where a job it took could
-not fit, or under 10 GiB plus one runner job's measured p95 disk for each job in flight on the host and the next
-(RUNNER_JOBS_DISK). Full means every
+eviction in the background while it keeps listening (Gate.low_disk). A disk floor never holds a listener
+(DISK_RECLAIM_NOW): an idle pool runner short of one job's measured peak (job_disk_gib, DISK_SHORT_RECLAIM) or of
+10 GiB plus one runner job's measured p95 disk for each job in flight on the host and the next (RUNNER_JOBS_DISK)
+starts reclaim at once, waits at most DISK_RECLAIM_WAIT_S for room before it starts its listener, and listens
+whatever that freed. Full means every
 unit this runner's own --capacity-units scans, read from its job-started hook, is taken or kept for an idle gui
 runner's reserve; for a root runner it also means the mini cannot admit a compile or an app-host shard (mini_full).
 """
@@ -212,7 +213,9 @@ DISK_TIMEOUT_S = 120  # a synchronous hook pass
 BACKGROUND_DISK_TIMEOUT_S = 15 * 60
 BACKGROUND_DISK_TIMEOUT_MAX_S = 6 * 3600  # an override above this is cut to it, so the bound's lifetime stays finite
 BACKGROUND_DISK_TIMEOUT_ENV = "GLAEDA_RUNNER_BACKGROUND_DISK_TIMEOUT"  # GLAEDA_RUNNER_DISK_TIMEOUT bounds the others
-# job-started waits at most this long for an eviction under the disk floor. At 60 s it only ever waited out part of
+# evict()'s default budget and the gate's idle-runner reclaim thread's bound. job-started waited this long for an
+# eviction under the disk floor until DISK_RECLAIM_NOW (below) cut its disk phase to seconds: no job is refused for
+# disk any more, so the wait only idled units. At 60 s it only ever waited out part of
 # the queued pass job-completed starts (hook passes took 125-534 s on 2026-10-26, median about 250 s), and its own
 # pass then skipped as busy because the queue's next pass took evict.lock first: on cmuxs-mac-mini-6 at 05:18Z a
 # nightly build-nightly-app was refused at 23.8 GiB ("waited 60 s for a running glaeda-disk pass; glaeda-disk exited 0,
@@ -220,6 +223,18 @@ BACKGROUND_DISK_TIMEOUT_ENV = "GLAEDA_RUNNER_BACKGROUND_DISK_TIMEOUT"  # GLAEDA_
 # retries its own while it skips as busy, within this budget.
 EVICT_TIMEOUT_S = 300
 EVICT_BUSY_PAUSE_S = 2.0  # between a pass of evict()'s own that skipped as busy and its next look
+# DISK_RECLAIM_NOW (Leo, 2026-11-18: when he says be more aggressive about deleting he means it; build caches that are
+# not being used are not useful, so stop holding on to them. Fleet policy: disk floors never refuse or pause work, they
+# trigger reclaim and wait seconds). A disk floor starts reclaim at once and then waits at most this long for room:
+# job-started's whole disk phase (its floor eviction, the disk ledger's turn and the pre-job target share it), and an
+# idle pool listener's start under one job's peak or the jobs in flight's disk (Gate.disk_room_wait). Then the work
+# goes on whatever was freed: the reclaim keeps running out of band (the gate's detached pass, job-completed's queue).
+# 30 s: a floor eviction's first deletions (idle caches, unheld scratch) land within seconds, while a whole pass takes
+# 125-685 s, so waiting for the pass is minutes of idle units (ci-dash, 2026-11-18: cmux17 lost 4.2 unit-hours to the
+# disk floor in 30 minutes under DISK_SHORT_HOLD and the 300 s eviction budget); it is PREJOB_WAIT_S, and the bound
+# floor_disk_env already splits for a floor eviction ("a 30 s gate") so its child keeps half to evict with.
+DISK_RECLAIM_WAIT_S = 30.0
+DISK_RECLAIM_POLL_S = 1.0
 # The free disk under which a job is admitted with a warning, after eviction: the measured disk growth of one CMUX job,
 # rounded up (p99 10.8 GiB, max 18.7 GiB). The runner floor (--min-free-gib, the manifest's disk.min_free_gib, 30 GiB
 # since HQ #967, a judgement rather than a measurement) still decides when to evict, the pre-job target and when the
@@ -1236,7 +1251,7 @@ def disk_shape_main(floor_gib: float) -> int:
 
 
 # SMALL_ONLY: the small runners (--small-runner, glaeda_fleet_labels smallRunners, the label glaeda-small-xcode-<v>
-# only) take only SMALL_JOBS, and their listener's disk hold (DISK_SHORT_HOLD) is those jobs' measured peak plus a
+# only) take only SMALL_JOBS, and their listener's disk peak (DISK_SHORT_RECLAIM) is those jobs' measured peak plus a
 # margin (SMALL_JOB_DISK_GIB), not one heavy job's (job_disk_gib, 20 GiB). One 20 GiB peak for every listener held the
 # light minis' side runners at 17.2 GiB free (cmux18, 2026-11-16: 2 of 14 slots listening) while these jobs grow the
 # disk by 5 GiB at most. A per-label peak could not do it: every side label also brings fast-tier, generated-files,
@@ -1272,7 +1287,8 @@ def small_refusal(job: str, repo: str | None, home_repo: str, workflow: str) -> 
 
 
 def listener_disk_peak(scope: "RunnerScope") -> tuple[float, str]:
-    """The free disk under which this runner's idle listener is held (DISK_SHORT_HOLD), and what it is: a small
+    """The free disk under which this runner's idle listener starts reclaim at once (DISK_SHORT_RECLAIM), and what it
+    is: a small
     runner's is SMALL_JOB_DISK_GIB (at most job_disk_gib()), every other runner's is job_disk_gib()."""
     if scope.small:
         return min(SMALL_JOB_DISK_GIB, job_disk_gib()), "the small jobs' measured peak plus margin (SMALL_ONLY)"
@@ -1291,7 +1307,10 @@ def listener_disk_peak(scope: "RunnerScope") -> tuple[float, str]:
 # The per-job value is RUNNER_JOB_DISK_NAME's disk_gib_p95, a byte copy of cmuxterm-hq build-fleet/runner-job-disk.json
 # (data/job_needs.py writes it from job-needs.json's all.disk_gib_p95; the controller's runner_disk.go reserves the same
 # value per PR job on a lent host, the twin of this rule). Copy hq's file over it to refresh it; a missing, unreadable
-# or malformed file turns this hold off (the one-job hold stays) rather than guessing a number.
+# or malformed file turns this reading off (the one-job peak stays) rather than guessing a number.
+# DISK_RECLAIM_NOW: neither reading holds the listener any more. Held, a listener took nothing while its CPUs idled
+# and the jobs queued (ci-dash, 2026-11-18: cmux17 lost 4.2 unit-hours to the disk floor in 30 minutes); short, the
+# gate now starts reclaim at once, waits at most DISK_RECLAIM_WAIT_S for room and listens whatever that freed.
 RUNNER_JOB_DISK_SCHEMA = "glaeda-runner-job-disk/v1"
 RUNNER_JOB_DISK_NAME = "glaeda-runner-job-disk.json"
 RUNNER_JOB_DISK_ENV = "GLAEDA_RUNNER_JOB_DISK_FILE"  # another file (tests; a host-local trial)
@@ -1367,7 +1386,7 @@ def runner_jobs_in_flight_detail(home: Path, own: Path,
 
 
 def pool_listener(runner_dir: Path) -> bool:
-    """A runner whose idle listener takes PR-pool jobs, as low_disk holds them: not a dedicated builder, the nightly's
+    """A runner whose idle listener takes PR-pool jobs, as low_disk counts them: not a dedicated builder, the nightly's
     own listeners, a gateway runner or one with no disk floor (their jobs never come from the same burst)."""
     scope = runner_scope(runner_dir)
     nightly_own = (scope.nightly or scope.trusted_signing) and not scope.dedicated
@@ -9841,7 +9860,11 @@ def note_registration_deleted(state_dir: Path, runner_dir: Path, evidence: str, 
 
 GATE_DISK_RESUME_GIB = 2.0  # cleanup headroom above the floor; no listener resume hysteresis
 GATE_DISK_NOTE_S = 30 * 60  # repeat an unresolved disk warning at most this often
-GATE_DISK_EVICT_EVERY_S = 15 * 60  # an eviction that left the disk short is retried this often, not every poll
+# DISK_RECLAIM_NOW: while the disk is short the gate's next pass of its own starts as soon as none runs, this long after
+# its last one started at the soonest. It was 15 minutes, so a disk still short after one pass waited a quarter hour for
+# the next while the listener was held; a pass that finds nothing to free ends in seconds, and starting one every 2 s
+# poll would only re-measure the disk without end.
+GATE_DISK_REPASS_S = 60.0
 
 
 class Gate:
@@ -9959,13 +9982,16 @@ class Gate:
         self.mem_unread_noted = False
         self.stale_env: str | None = None  # why an adopted listener's env is not listener_env's (listen())
         self.disk_warned_at: float | None = None  # when the last low-disk warning was logged
-        self.disk_evicted_at = -GATE_DISK_EVICT_EVERY_S  # when the last eviction under the floor started
+        self.disk_evicted_at = -GATE_DISK_REPASS_S  # when the last eviction under the floor started
         self.idle_evict: threading.Thread | None = None  # a dedicated builder's evict_idle_runners, while it runs
-        self.idle_evicted_at = -GATE_DISK_EVICT_EVERY_S
+        self.idle_evicted_at = -GATE_DISK_REPASS_S
         # the eviction under way: the detached glaeda-disk, when it started and the free GiB before it
         self.evicting: tuple[subprocess.Popen[bytes], float, float | None] | None = None
-        # under the floor while another glaeda-disk pass runs: when the gate began waiting for it (monotonic)
-        self.disk_waiting_since: float | None = None
+        # under the floor while another glaeda-disk pass deletes: the gate joined it instead of starting its own
+        self.disk_joined = False
+        # DISK_RECLAIM_NOW: (why, the free GiB wanted) while an idle pool runner is short of one job's peak or of the
+        # jobs in flight's disk at the last look; the listener's next start waits for room at most DISK_RECLAIM_WAIT_S
+        self.disk_short: tuple[str, float] | None = None
         self.watching: tuple[int, ...] = ()
         # JOB_END_FREEZE: armed while a job runs that the gate may stop the listener after; the listener pids and the
         # job's request, read during the job, so the freeze at the Worker's exit needs no ps and the look after it
@@ -10674,14 +10700,16 @@ class Gate:
         running Worker's exit. Job admission keeps its existing measured disk-growth checks and disk-low ledger. Disk
         observations never arm JOB_END_FREEZE.
 
-        One reading does hold an idle pool runner's listener (DISK_SHORT_HOLD): free disk under one job's measured
-        peak (job_disk_gib), whatever the floor, after cleanup was requested. A job taken there cannot fit: job-started admits it with a
-        warning (a disk floor never refuses), and it then fails mid-build (cmux run 43119216549, 2026-11-11: admitted
-        at 19.8 GiB free, its fast tier's link stopped at ld errno=28 after 13 minutes). Held, the listener takes
-        nothing and GitHub hands the job to a runner with room, or the rescue moves it once it waits past its budget:
-        slower, never failed. The nightly's own listeners and a dedicated builder are never held here (their jobs come
-        first and keep their own reserve), nor a gateway runner (its thin cmux-ci clients build elsewhere), nor a runner
-        with no disk floor.
+        No reading holds the listener (DISK_RECLAIM_NOW). An idle pool runner short of one job's measured peak
+        (job_disk_gib, DISK_SHORT_RECLAIM), whatever the floor, or of the jobs in flight's disk (RUNNER_JOBS_DISK)
+        starts reclaim at once aimed at what it lacks, and records it (disk_short), so its listener's next start waits
+        at most DISK_RECLAIM_WAIT_S for room (disk_room_wait) and then listens whatever that freed. These readings used
+        to hold the listener (DISK_SHORT_HOLD) so the job went to a runner with room (cmux run 43119216549,
+        2026-11-11: admitted at 19.8 GiB free, its fast tier's link stopped at ld errno=28 after 13 minutes), but a
+        held listener idled its units while the jobs queued (cmux17, 2026-11-18: 4.2 unit-hours in 30 minutes); the
+        answer to a short disk is deleting more, sooner. The nightly's own listeners and a dedicated builder never
+        wait here (their jobs come first and keep their own reserve), nor a gateway runner (its thin cmux-ci clients
+        build elsewhere), nor a runner with no disk floor.
         """
         scope = runner_scope(self.runner_dir)
         floor, reserve = scope.min_free_gib, ""
@@ -10708,28 +10736,24 @@ class Gate:
         self.reap_eviction(path, floor)
         why = disk_refusal(path, floor)
         # The peak is read on its own, not only under the floor: a floor under one job's peak (--min-free-gib 30 with
-        # GLAEDA_RUNNER_JOB_DISK_GIB=40, at 35 GiB free) must still hold the listener.
-        short = None
-        peak, whose = listener_disk_peak(scope)
+        # GLAEDA_RUNNER_JOB_DISK_GIB=40, at 35 GiB free) must still start reclaim aimed at the peak.
+        short: tuple[str, float] | None = None
         if not scope.dedicated and not nightly_own and not scope.gateway and scope.min_free_gib > 0:
-            short = disk_refusal(path, peak)
+            peak, whose = listener_disk_peak(scope)
+            if under := disk_refusal(path, peak):
+                short = (f"disk: {under} for {whose} (DISK_SHORT_RECLAIM)", max(floor, peak))
+            elif crowded := self.runner_jobs_short(path):
+                short = (f"disk: {crowded[0]} (RUNNER_JOBS_DISK)", max(floor, crowded[1]))
+        self.disk_short = short
         if short:
-            target = max(floor, peak)
-            self.evict_in_background(path, target)
+            self.evict_in_background(path, short[1])
             if reserve:
-                self.evict_idle_in_background(path, target + GATE_DISK_RESUME_GIB)
-            return (f"disk: {short} for {whose}, cleanup requested; holding the listener so the "
-                    "job goes to a runner with room (DISK_SHORT_HOLD)")
-        if not scope.dedicated and not nightly_own and not scope.gateway and scope.min_free_gib > 0:
-            crowded = self.runner_jobs_short(path)
-            if crowded:
-                why_jobs, need = crowded
-                target = max(floor, need)
-                self.evict_in_background(path, target)
-                if reserve:
-                    self.evict_idle_in_background(path, target + GATE_DISK_RESUME_GIB)
-                return (f"disk: {why_jobs}, cleanup requested; holding the listener so the job goes to a runner "
-                        "with room (RUNNER_JOBS_DISK)")
+                self.evict_idle_in_background(path, short[1] + GATE_DISK_RESUME_GIB)
+            now = time.monotonic()
+            if self.disk_warned_at is None or now - self.disk_warned_at >= GATE_DISK_NOTE_S:
+                gate_log(f"{short[0]}{reserve}; reclaiming now and keeping the listener online (DISK_RECLAIM_NOW)")
+                self.disk_warned_at = now
+            return None
         if why:
             self.evict_in_background(path, floor)
             if scope.dedicated or reserve:
@@ -10744,7 +10768,7 @@ class Gate:
         """RUNNER_JOBS_DISK: (why, the free disk wanted) when free disk is under the floor plus one measured job's
         disk for each runner job in flight here and the next, else None. The process table is read only when the
         free disk could be short with every runner install busy; no per-job value, no free-disk reading or no
-        process table: None (the one-job hold still stands)."""
+        process table: None (the one-job peak still stands)."""
         per, source = runner_job_disk()
         free = free_or_none(path)
         if per is None or free is None:
@@ -10766,11 +10790,11 @@ class Gate:
 
     def evict_idle_in_background(self, path: str, target: float) -> None:
         """Below a builder's floor or reserve, reclaim idle PR runners' _work in a bounded thread
-        (evict_idle_runners, NIGHTLY_DISK_RESERVE), at most every GATE_DISK_EVICT_EVERY_S. The listener stays online
-        even when cleanup frees nothing."""
+        (evict_idle_runners, NIGHTLY_DISK_RESERVE): at once unless one runs (that one is joined), at most every
+        GATE_DISK_REPASS_S. The listener stays online even when cleanup frees nothing."""
         now = time.monotonic()
         if (self.idle_evict is not None and self.idle_evict.is_alive()) or \
-                now - self.idle_evicted_at < GATE_DISK_EVICT_EVERY_S:
+                now - self.idle_evicted_at < GATE_DISK_REPASS_S:
             return
         self.idle_evicted_at = now
         home, deadline = self.runner_dir.parent, now + EVICT_TIMEOUT_S
@@ -10779,29 +10803,25 @@ class Gate:
         self.idle_evict.start()
 
     def evict_in_background(self, path: str, floor: float) -> None:
-        """Start a detached glaeda-disk --pressure run for the floor (disk_argv) unless one is under way or one
-        started within GATE_DISK_EVICT_EVERY_S. It stays in the gate's process group, so launchd's cleanup covers
-        it; reap_eviction reads it on later polls, so no poll waits on it.
-        While another pass is freeing space (pass_active: the queued pass, its trigger, or any evict.lock holder) it
-        waits for that one, as evict() does with wait_for_running_pass, instead of starting a run that would only skip
-        as eviction_busy (cmux13s, 2026-10-26..27: 145 of 219 busy skips were the gate's). It leaves one trigger in the
-        queue, so the running pass does a follow-up for this floor, and checks again on every poll; once no pass runs,
-        or after GATE_DISK_EVICT_EVERY_S of waiting (a stale trigger), it runs its own as before."""
+        """Start a detached glaeda-disk --pressure floor eviction (disk_argv, out of band: floor_disk_env) at once,
+        unless the gate's own is under way or started within GATE_DISK_REPASS_S (DISK_RECLAIM_NOW: no quarter-hour
+        spacing while short). It stays in the gate's process group, so launchd's cleanup covers it; reap_eviction
+        reads it on later polls, so no poll waits on it.
+        While another pass is deleting (any evict.lock holder) the gate joins it instead of starting a run that would
+        only skip as eviction_busy (cmux13s, 2026-10-26..27: 145 of 219 busy skips were the gate's), and leaves one
+        trigger in the queue, so that pass's queue does a follow-up for this floor; it looks again on every poll and
+        runs its own once none deletes. A queued trigger or a queue pass between runs is not joined: the queue defers
+        while CI jobs run, and a floor eviction reclaims out of band now."""
         now = time.monotonic()
-        if self.evicting is not None or now - self.disk_evicted_at < GATE_DISK_EVICT_EVERY_S:
+        if self.evicting is not None or now - self.disk_evicted_at < GATE_DISK_REPASS_S:
             return
-        if self.disk_waiting_since is None or now - self.disk_waiting_since < GATE_DISK_EVICT_EVERY_S:
-            try:
-                active = pass_active()
-            except OSError:
-                active = False
-            if active:
-                if self.disk_waiting_since is None:
-                    self.disk_waiting_since = now
-                    gate_log(f"under the {floor:g} GiB disk floor: a glaeda-disk pass is running; waiting for it "
-                             f"({disk_pressure_detached(None)})")
-                return
-        self.disk_waiting_since = None
+        if wait_for_running_pass(now):
+            if not self.disk_joined:
+                self.disk_joined = True
+                gate_log(f"under the {floor:g} GiB disk floor: a glaeda-disk pass is deleting; joining it "
+                         f"({disk_pressure_detached(None)})")
+            return
+        self.disk_joined = False
         self.disk_evicted_at = now
         argv = disk_argv(None, floor)
         if argv is None:
@@ -10839,6 +10859,35 @@ class Gate:
             ran = f"glaeda-disk exited {code}"
         self.evicting = None
         gate_log(evicted(path, floor, ran, before))
+
+    def reclaiming(self) -> bool:
+        """Whether a reclaim runs now: the gate's own pass, its idle-runner thread, or any pass holding evict.lock."""
+        own = self.evicting is not None and self.evicting[0].poll() is None
+        idle = self.idle_evict is not None and self.idle_evict.is_alive()
+        return own or idle or wait_for_running_pass(time.monotonic())
+
+    def disk_room_wait(self) -> None:
+        """DISK_RECLAIM_NOW, right before the listener starts: an idle pool runner found short at the last look
+        (disk_short; low_disk has started reclaim already) waits at most DISK_RECLAIM_WAIT_S for that room, looking
+        every DISK_RECLAIM_POLL_S, ending early once the room is there, no reclaim runs or the agent stops. Then the
+        listener starts whatever was freed: a disk floor never holds it. A listener already online is never stopped
+        for disk, so only a start waits."""
+        if self.disk_short is None:
+            return
+        why, target = self.disk_short
+        self.disk_short = None
+        path = os.path.dirname(self.host_lock)
+        before, start = free_or_none(path), time.monotonic()
+        deadline = start + DISK_RECLAIM_WAIT_S
+        while not self.terminating and disk_refusal(path, target) and time.monotonic() < deadline \
+                and self.reclaiming():
+            time.sleep(min(DISK_RECLAIM_POLL_S, max(0.0, deadline - time.monotonic())))
+            self.reap_eviction(path, target)
+        after = free_or_none(path)
+        freed = f"{after - before:.1f} GiB" if before is not None and after is not None else "an unknown amount"
+        room = "the room is there" if not disk_refusal(path, target) else "still short; listening anyway"
+        gate_log(f"{why}: waited {time.monotonic() - start:.0f} s for reclaim (at most {DISK_RECLAIM_WAIT_S:g} s), "
+                 f"freed {freed}, {room} (DISK_RECLAIM_NOW)")
 
     def locked(self, fresh: bool = False) -> str | None:
         """For the gui and session runners only: why their console session cannot run a GUI job (console_refusal),
@@ -11658,6 +11707,9 @@ class Gate:
             gate_log("the host is free again")
             self.held, self.free_since, self.free_logged = None, None, False
         if self.terminating:  # SIGTERM during the look above
+            return 0
+        self.disk_room_wait()  # DISK_RECLAIM_NOW: seconds for room, never a hold
+        if self.terminating:
             return 0
         self.start()
         return None
@@ -14051,7 +14103,8 @@ def main(argv: list[str] | None = None) -> int:
         why = None if args.dedicated_admit else reservation_refusal(args.reservation, time.time(), taken_job=True,
                                                                     nightly_slot=slot_tier == TIER_NIGHTLY)
         disk_path = os.path.dirname(args.host_lock)
-        disk_deadline = time.monotonic() + EVICT_TIMEOUT_S  # one budget for every eviction of this job-started
+        # one budget for every eviction and disk wait of this job-started: seconds, never minutes (DISK_RECLAIM_NOW)
+        disk_deadline = time.monotonic() + DISK_RECLAIM_WAIT_S
         # a nightly job short of disk goes first here (NIGHTLY_DISK_RESERVE): no new job starts on this mini while it
         # frees space, and it takes what idle PR runners left before glaeda-disk's pass
         nightly_disk = bool(args.dedicated_admit) or job_tier(
@@ -14117,7 +14170,8 @@ def main(argv: list[str] | None = None) -> int:
         if why:
             return refused(why, disk=True)
         prejob = None if args.no_disk else prejob_evict(
-            disk_path, eviction_floor, args.disk, wait_s=0 if nightly_disk else PREJOB_WAIT_S)
+            disk_path, eviction_floor, args.disk,
+            wait_s=0 if nightly_disk else min(PREJOB_WAIT_S, max(0.0, disk_deadline - time.monotonic())))
         if prejob:
             print(f"{PREFIX}: {prejob}", flush=True)
             # the jobs already running may have written the disk below the floor while this one waited

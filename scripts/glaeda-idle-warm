@@ -641,6 +641,65 @@ def git(checkout: Path, *args: str, timeout: int = GIT_TIMEOUT_S) -> None:
                    env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "PATH": PATH})
 
 
+# The catch-up checkout reads cmux's objects through the mini's one full mirror (glaeda-git-mirror) instead of
+# keeping its own copy. Leo, 2026-11-18: seeds and shared caches are read through, not copied to the internal disk.
+# Without it the checkout held every blob of the tip it built (1.21 GB for a feat-cmux-next tip, cmuxterm-hq RFD
+# 0008) and each later head's changed blobs, beside a mirror on the same disk that already had them all. The mirror
+# never removes an object (gc.auto 0, `repack --geometric`), which is what makes borrowing it safe; a rebuilt
+# mirror (a reseed is a new directory) may lack an object the checkout relied on, so the checkout records which
+# mirror it borrowed (as the runner hook's borrowers do) and starts over when that changes. A mini with no usable
+# mirror clones from GitHub as before.
+BORROW_RECORD = "glaeda-mirror-borrow.json"
+BORROW_REPACK_TIMEOUT_S = 300
+
+
+def git_mirror() -> Path:
+    return Path(os.environ.get("GLAEDA_GIT_MIRROR_DIR") or FLEET_DIR / "git") / "cmux.git"
+
+
+def mirror_identity(mirror: Path) -> dict[str, Any] | None:
+    """The mirror's objects directory when it is a usable full mirror (glaeda-git-mirror verified it, no repair
+    pending, not shallow), as {"objects", "ino", "birth"}; else None. The runner hook's test, kept in step."""
+    try:
+        objects = mirror / "objects"
+        st = os.stat(objects, follow_symlinks=False)
+        if not os.path.isdir(objects) or objects.is_symlink() or mirror.is_symlink() \
+                or not (mirror / "HEAD").is_file() \
+                or not (mirror / "glaeda-verified").is_file() or (mirror / "glaeda-repair-pending").exists() \
+                or (mirror / "shallow").exists():
+            return None
+    except OSError:
+        return None
+    identity: dict[str, Any] = {"objects": os.fspath(objects), "ino": st.st_ino}
+    if (birth := getattr(st, "st_birthtime", None)) is not None:
+        identity["birth"] = birth
+    return identity
+
+
+def borrowed(git_dir: Path) -> tuple[list[str], Any]:
+    """The checkout's alternates and its borrow record (None when it has none or it cannot be read)."""
+    try:
+        alternates = [line.strip() for line in (git_dir / "objects/info/alternates").read_text().splitlines()
+                      if line.strip()]
+    except OSError:
+        alternates = []
+    try:
+        recorded = json.loads((git_dir / BORROW_RECORD).read_text())
+    except (OSError, ValueError):
+        recorded = None
+    return alternates, recorded
+
+
+def borrow(git_dir: Path, identity: dict[str, Any]) -> None:
+    """Point GIT_DIR's object store at the mirror's and record which mirror that is."""
+    info = git_dir / "objects" / "info"
+    info.mkdir(parents=True, exist_ok=True)
+    (info / "alternates").write_text(identity["objects"] + "\n")
+    incoming = git_dir / f".{BORROW_RECORD}.{os.getpid()}"
+    incoming.write_text(json.dumps(identity) + "\n")
+    incoming.rename(git_dir / BORROW_RECORD)
+
+
 def prepare_checkout(work: Path, head: str) -> None:
     """A clean checkout of HEAD with submodules at WORK/cmux, cloned once and fetched after.
 
@@ -649,13 +708,31 @@ def prepare_checkout(work: Path, head: str) -> None:
     cmux-austin-mini-0 GitHub sent it at about 0.6 MB/s (0.9 GB in 25 minutes, 2026-09-27), so the
     30-minute timeout ended every first clone and the next run started it over. The build reads only the
     checkout, and the seed lookup only main's first 50 first-parent ancestors (CMUX_SEED_GIT_DIR); git fetches
-    any other blob on demand. Each fetch re-cuts the history at CLONE_DEPTH, so it stays small."""
+    any other blob on demand. Each fetch re-cuts the history at CLONE_DEPTH, so it stays small.
+
+    Where the mini keeps a usable git mirror, the checkout borrows its objects (BORROW_RECORD above): the clone
+    and each fetch take from GitHub only what the mirror lacks, and the checked-out blobs are read from the
+    mirror, not stored again. A checkout cloned before it borrowed drops its own copies once (`repack -a -d -l`)."""
     checkout = work / "cmux"
-    if not (checkout / ".git").is_dir():
+    git_dir = checkout / ".git"
+    mirror = mirror_identity(git_mirror())
+    if git_dir.is_dir():
+        alternates, recorded = borrowed(git_dir)
+        if alternates and (mirror is None or alternates != [mirror["objects"]] or not isinstance(recorded, dict)
+                           or recorded.get("ino") != mirror["ino"] or recorded.get("birth") != mirror.get("birth")):
+            shutil.rmtree(checkout, ignore_errors=True)  # its mirror went or was rebuilt: start over
+    repack = False
+    if not git_dir.is_dir():
         shutil.rmtree(checkout, ignore_errors=True)
+        reference = ["--reference", os.fspath(git_mirror())] if mirror is not None else []
         subprocess.run([GIT, "clone", "-q", f"--depth={CLONE_DEPTH}", "--filter=blob:none", "--no-checkout",
-                        REPO_URL, os.fspath(checkout)], check=True, capture_output=True, timeout=GIT_TIMEOUT_S,
-                       env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "PATH": PATH})
+                        *reference, REPO_URL, os.fspath(checkout)], check=True, capture_output=True,
+                       timeout=GIT_TIMEOUT_S, env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "PATH": PATH})
+        if mirror is not None:
+            borrow(git_dir, mirror)
+    elif mirror is not None and not borrowed(git_dir)[0]:
+        borrow(git_dir, mirror)
+        repack = True
     git(checkout, "fetch", "-q", f"--depth={CLONE_DEPTH}", "origin", BRANCH_REFSPEC)
     git(checkout, "cat-file", "-e", f"{head}^{{commit}}", timeout=60)
     git(checkout, "-c", "advice.detachedHead=false", "checkout", "-q", "--force", "--detach", head)
@@ -663,6 +740,9 @@ def prepare_checkout(work: Path, head: str) -> None:
     git(checkout, "submodule", "sync", "-q", "--recursive")
     git(checkout, "submodule", "update", "-q", "--init", "--recursive", "--force", "--depth=1")
     git(checkout, "submodule", "foreach", "-q", "--recursive", "git clean -ffdxq")
+    if repack:  # drop the local copies of what the mirror now serves; a failed repack leaves the store as it was
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            git(checkout, "repack", "-a", "-d", "-l", "-q", timeout=BORROW_REPACK_TIMEOUT_S)
 
 
 def last_result(log: Path) -> dict[str, Any]:
