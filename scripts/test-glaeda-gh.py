@@ -9594,6 +9594,160 @@ class BrokerFailOpenTest(BrokerBase):
         self.assertIsNotNone(passed)
 
 
+FAKE_GH_INFLIGHT = """#!{python} -I
+# A stand-in gh for GraphqlSlotsTest: counts the calls in flight at once (under a lock), and keeps the highest.
+import fcntl, json, os, sys, time
+state = {state!r}
+def bump(n):
+    with open(state + ".lock", "a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            doc = json.load(open(state))
+        except (OSError, ValueError):
+            doc = {{"now": 0, "max": 0, "calls": 0}}
+        doc["now"] += n
+        doc["max"] = max(doc["max"], doc["now"])
+        doc["calls"] += n > 0
+        json.dump(doc, open(state, "w"))
+bump(1)
+time.sleep({hold})
+bump(-1)
+print(json.dumps({{"data": {{"viewer": {{"login": "x"}}}}}}))
+"""
+
+
+class GraphqlSlotsTest(BrokerBase):
+    """hq#13031: at most graphql_slots() GraphQL requests in flight per login per host, across processes: the daemon's
+    reads (Daemon.request) and every `glaeda-gh gh` GraphQL read share one set of flock'd slot files under BASE."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        os.environ["GLAEDA_GH_QUOTA_POLICY"] = str(self.home / "no-policy.json")
+        for name in ("GLAEDA_GH_GRAPHQL_SLOTS", gg.GRAPHQL_SLOT_ENV):
+            os.environ.pop(name, None)
+        self.addCleanup(os.environ.pop, "GLAEDA_GH_QUOTA_POLICY", None)
+        self.addCleanup(os.environ.pop, gg.GRAPHQL_SLOT_ENV, None)
+
+    def inflight_gh(self, hold: float) -> tuple[Path, Path]:
+        state = self.home / "inflight.json"
+        path = self.home / "bin" / "gh-inflight"
+        path.write_text(FAKE_GH_INFLIGHT.format(python=sys.executable, state=str(state), hold=hold))
+        path.chmod(0o755)
+        return path, state
+
+    def parallel_reads(self, n: int, ttl: str) -> dict:
+        real, state = self.inflight_gh(0.4)
+        env = {**os.environ, "GLAEDA_GH_DIR": os.fspath(gg.BASE), "GLAEDA_GH_REAL": str(real),
+               "GLAEDA_GH_CACHE_TTL": ttl}
+        procs = [subprocess.Popen([sys.executable, os.fspath(ROOT / "scripts" / "glaeda-gh"), "gh", "api", "graphql",
+                                   "-f", "query=query($n:Int!){viewer{login}}", "-F", f"n={i}"],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, env=env)
+                 for i in range(n)]
+        outs = []
+        for proc in procs:
+            out, err = proc.communicate(timeout=120)
+            outs.append((proc.returncode, out, err))
+        for rc, out, err in outs:
+            self.assertEqual(rc, 0, err)
+            self.assertIn(b'"login": "x"', out)
+        return json.loads(state.read_text())
+
+    def test_seven_parallel_cli_reads_never_more_than_two_in_flight(self) -> None:
+        for ttl in ("0", "90"):  # the exec path (no answer cache) and the answer cache's fill
+            with self.subTest(cache_ttl=ttl):
+                (self.home / "inflight.json").unlink(missing_ok=True)
+                doc = self.parallel_reads(7, ttl)
+                self.assertEqual(doc["calls"], 7)
+                self.assertEqual(doc["max"], 2, doc)
+                self.assertEqual(doc["now"], 0)
+
+    def test_the_policy_names_the_slot_count(self) -> None:
+        (self.home / "no-policy.json").write_text(json.dumps({"login_concurrency": 3}))
+        self.assertEqual(gg.graphql_slots(), 3)
+        os.environ["GLAEDA_GH_GRAPHQL_SLOTS"] = "1"
+        self.addCleanup(os.environ.pop, "GLAEDA_GH_GRAPHQL_SLOTS", None)
+        self.assertEqual(gg.graphql_slots(), 1)
+        os.environ["GLAEDA_GH_GRAPHQL_SLOTS"] = "zero"
+        self.assertEqual(gg.graphql_slots(), gg.GRAPHQL_SLOTS_DEFAULT)
+
+    def test_slots_are_per_login(self) -> None:
+        conf = self.home / "gh-config"
+        conf.mkdir(parents=True, exist_ok=True)
+        (conf / "hosts.yml").write_text("github.com:\n    git_protocol: ssh\n    users:\n        alice:\n"
+                                        "    user: alice\n")
+        self.assertEqual(gg.graphql_login(), "alice")
+        held = [gg.graphql_slot_take(None) for _ in range(2)]
+        self.assertIsNone(gg.graphql_slot_take(None))  # alice's two are held
+        (conf / "hosts.yml").write_text("github.com:\n    user: bob\n")
+        other = gg.graphql_slot_take(None)
+        self.assertIsNotNone(other)  # bob's are his own
+        for got in [*held, other]:
+            got[0].close()
+
+    def test_which_gh_calls_take_a_slot(self) -> None:
+        self.assertTrue(gg.gh_graphql_read(["api", "graphql", "-f", "query=query{viewer{login}}"]))
+        self.assertTrue(gg.gh_graphql_read(["pr", "view", "7", "-R", "o/r", "--json", "state"]))
+        self.assertFalse(gg.gh_graphql_read(["pr", "checks", "7", "--watch"]))
+        self.assertFalse(gg.gh_graphql_read(["api", "repos/o/r/pulls/7"]))
+        self.assertFalse(gg.gh_graphql_read(["api", "graphql", "-f", "query=mutation{addComment(input:{}){clientMutationId}}"]))
+
+    def test_a_gh_call_nested_under_a_held_slot_uses_its_parents(self) -> None:
+        held = [gg.graphql_slot_take(None) for _ in range(2)]
+        os.environ[gg.GRAPHQL_SLOT_ENV] = str(os.getpid())  # this process holds one: a nested call never waits
+        start = time.monotonic()
+        self.assertIsNone(gg.gh_graphql_slot_for(["api", "graphql", "-f", "query=query{viewer{login}}"]))
+        self.assertLess(time.monotonic() - start, 1.0)
+        for got in held:
+            got[0].close()
+
+    def test_the_daemon_takes_the_same_slots(self) -> None:
+        self.gh.prs[("o", "r", 7)] = pr_node(7)
+        seen: list[int] = []
+        transport = self.daemon.transport
+
+        def counting(method, url, headers, body):
+            if url.endswith("/graphql"):
+                free = gg.graphql_slot_take(None)  # what another process would find while this one is in flight
+                seen.append(0 if free is None else 1)
+                if free is not None:
+                    free[0].close()
+            return transport(method, url, headers, body)
+
+        self.daemon.transport = counting
+        mine = gg.graphql_slot_take(None)  # a CLI read holds one: the daemon's read takes the other
+        self.daemon.tick_deadline = time.monotonic() + 30
+        doc, error = self.daemon.graphql("query{viewer{login}}", {})
+        self.assertIsNone(error)
+        self.assertEqual(seen, [0])  # while the daemon's read was in flight, both slots were held
+        theirs = gg.graphql_slot_take(None)  # and it gave its slot back
+        self.assertIsNotNone(theirs)
+        theirs[0].close()
+        # both held by CLI reads: the daemon's read is not sent, and says why
+        other = gg.graphql_slot_take(None)
+        self.daemon.tick_deadline = time.monotonic() + 0.2
+        sent = len([c for c in self.gh.calls if c[1].endswith("/graphql")])
+        doc, error = self.daemon.graphql("query{viewer{login}}", {})
+        self.assertIsNone(doc)
+        self.assertIn("GraphQL slots", error)
+        self.assertEqual(len([c for c in self.gh.calls if c[1].endswith("/graphql")]), sent)
+        for got in (mine, other):
+            got[0].close()
+
+    def test_a_daemon_refresh_waits_for_a_slot_and_then_reads(self) -> None:
+        self.gh.prs[("o", "r", 7)] = pr_node(7)
+        gg.register("pr:o/r#7")
+        held = [gg.graphql_slot_take(None) for _ in range(2)]
+        release = threading.Timer(0.3, lambda: [got[0].close() for got in held])
+        release.start()
+        self.addCleanup(release.cancel)
+        start = time.monotonic()
+        self.daemon.now = NOW
+        self.daemon.tick()
+        self.assertGreaterEqual(time.monotonic() - start, 0.25)  # it waited for a CLI read's slot
+        self.assertTrue(any(c[1].endswith("/graphql") for c in self.gh.calls))
+        self.assertIsNotNone(gg.read_cache("pr:o/r#7").get("data"))
+
+
 class BrokerMergeGuardTest(BrokerBase):
     """A merge typed as `glaeda-gh gh ...` is handed to the gh-quota guard, never run on the real gh unjudged."""
 
@@ -16779,6 +16933,23 @@ class StaleDataTest(Base):
         self.assertEqual(gg.direct_parts_load(later), {})
         self.assertEqual(len(gg.direct_parts_load(time.time())), 2)
 
+    def test_land_refreshes_of_one_pr_coalesce_after_the_first_fresh_read(self) -> None:
+        """Two land workers noticing one stale PR share the first answer instead of repeating its pull/head reads."""
+        config = Path(self.tmp.name) / "upstream.json"
+        gg.write_json(config, {"command": ["/home/cmux/.local/bin/lane-gh", "glaeda-read"]})
+        patcher = mock.patch.object(gg, "UPSTREAM_CONFIG", config)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        gg.BASE.mkdir(parents=True, exist_ok=True)
+        self.gh.prs[("o", "r", 9)] = pr_node(9, rollup="SUCCESS", checks=[check_run("a")])
+        served: list[str] = []
+        with mock.patch.object(gg, "run_bounded", side_effect=self.broker_get(served)), \
+                mock.patch.object(gg, "gh_token", side_effect=AssertionError("read a login on an upstream host")):
+            self.assertIsNone(gg.land_direct_read("pr:o/r#9"))
+            self.assertIsNone(gg.land_direct_read("pr:o/r#9"))
+        self.assertEqual(len([p for p in served if p == "pulls/9"]), 1, served)
+        self.assertEqual(len([p for p in served if p.startswith("commits/")]), 3, served)
+
     def test_an_upstream_with_no_broker_get_still_says_why_it_cannot_read(self) -> None:
         """An upstream that is not lane-gh, with no "direct" command: the fallback refuses as before, and the
         "upstream" explanation keeps such a wait on its blocker (its own read could not help)."""
@@ -18598,6 +18769,21 @@ class LandTest(Base):
         self.assert_merged_at(LA)
         self.assertFalse((gg.land_dir() / gg.LAND_LATCH_FILE).exists())
 
+    def test_an_echo_mark_holds_no_land(self):
+        """huge-blue, 2026-11-18 09:05-09:43Z: our own quota refusal read back as GitHub's word held every land 37 min
+        past its wake. An echo (gh_latch.ECHO, lw#5869) is a guess no request made: each entry is judged (and parks on
+        its own refusal), the queue is not stopped; a GitHub-sourced mark still stops it."""
+        self.pr(LA)
+        self.land()
+        self.latch("graphql", self.t + 600)
+        self.tick(30)
+        self.assertEqual(self.reads(), (0, 0, 0, 0))
+        self.latch("graphql", self.t + 600, source=gg.LAND_LATCH_ECHO)
+        self.w.answers.append(ok_answer(LA))
+        self.tick(1)
+        self.assert_merged_at(LA)
+        self.assertFalse((gg.land_dir() / gg.LAND_LATCH_FILE).exists())
+
     def test_jitter_is_within_the_spread_and_fixed_per_caller(self):
         keys = [f"pr:o/r#{n}" for n in range(200)]
         offsets = [gg.land_jitter(k) for k in keys]
@@ -19865,6 +20051,7 @@ class ConfirmedUpdatedAtTest(Base):
                          {"updatedAtAt": 5.0, "data": {"headRefOid": "a", "updatedAt": "y"}})
         for node in ({"headRefOid": "b", "updatedAt": "y"}, {"headRefOid": "a"}, None):
             self.assertEqual(gg.confirmed_updated({"data": data}, node, 5.0), {})
+
 
 
 if __name__ == "__main__":
