@@ -309,6 +309,9 @@ impl fmt::Debug for InstallationToken {
 #[serde(deny_unknown_fields)]
 struct InstallationTokenFileWire {
     app_id: u64,
+    /// The installation's organization, which the org-scoped push (scope org_runners) names.
+    #[serde(default)]
+    org: Option<String>,
     token: ZeroizingTokenWire,
     expires_at: String,
     permissions: std::collections::BTreeMap<String, String>,
@@ -322,6 +325,17 @@ impl<'de> Deserialize<'de> for ZeroizingTokenWire {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         String::deserialize(deserializer).map(|value| Self(Zeroizing::new(value)))
     }
+}
+
+/// A GitHub organization login: 1-39 ASCII letters, digits or inner single hyphens.
+fn github_login(value: &str) -> bool {
+    (1..=39).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+        && !value.contains("--")
 }
 
 /// Decode and check one token document: its App, runner-admin write, a bounded token and at least
@@ -348,6 +362,7 @@ fn parse_installation_token(
     }
     if !bounded_token(&wire.token.0, MAX_INSTALLATION_TOKEN_BYTES)
         || parse_utc_timestamp(&wire.minted_at).is_none()
+        || wire.org.as_deref().is_some_and(|org| !github_login(org))
     {
         return Err(ScaleSetBridgeError::new("invalid_installation_token_file"));
     }
@@ -2722,7 +2737,7 @@ mod tests {
 
     fn token_document(expires_at: i64) -> String {
         format!(
-            r#"{{"app_id": 5067688, "token": "ghs_pushedToken123", "expires_at": "{}", "permissions": {{"organization_self_hosted_runners": "write", "metadata": "read"}}, "minted_at": "{}"}}"#,
+            r#"{{"app_id": 5067688, "org": "manaflow-ai", "token": "ghs_pushedToken123", "expires_at": "{}", "permissions": {{"organization_self_hosted_runners": "write", "metadata": "read"}}, "minted_at": "{}"}}"#,
             utc(expires_at),
             utc(expires_at - 3_600)
         )
@@ -2766,6 +2781,10 @@ mod tests {
         assert_eq!(token.value.as_str(), "ghs_pushedToken123");
         assert_eq!(token.expires_at_unix, TOKEN_NOW + 3_000);
         assert_eq!(format!("{token:?}"), "[REDACTED]");
+        // The repo-scoped push names no org; it still decodes.
+        let without_org =
+            token_document(TOKEN_NOW + 3_000).replace("\"org\": \"manaflow-ai\", ", "");
+        assert!(parse_installation_token(without_org.as_bytes(), 5_067_688, TOKEN_NOW).is_ok());
 
         let valid = token_document(TOKEN_NOW + 3_000);
         let cases = [
@@ -2786,6 +2805,10 @@ mod tests {
             ),
             (
                 valid.replace("ghs_pushedToken123", "ghs pushed"),
+                "invalid_installation_token_file",
+            ),
+            (
+                valid.replace("\"manaflow-ai\"", "\"-not a login\""),
                 "invalid_installation_token_file",
             ),
             (

@@ -6,9 +6,13 @@ import (
 	"errors"
 	"io"
 	"os"
+	"regexp"
 	"syscall"
 	"time"
 )
+
+// githubLoginPattern is a GitHub organization login: 1-39 letters, digits or inner single hyphens.
+var githubLoginPattern = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9]|-[A-Za-z0-9]){0,38}$`)
 
 const maxTokenFileBytes = 16 * 1024
 const minTokenLife = 5 * time.Minute
@@ -17,7 +21,9 @@ const runnerPermission = "organization_self_hosted_runners"
 // tokenFile is the exact document the App key's home host pushes over ssh (hq
 // tools/lane-gh-broker read_token_push): one installation token, never the App key.
 type tokenFile struct {
-	AppID       int64             `json:"app_id"`
+	AppID int64 `json:"app_id"`
+	// Org is the installation's organization; the org-scoped push (scope org_runners) names it.
+	Org         *string           `json:"org"`
 	Token       string            `json:"token"`
 	ExpiresAt   string            `json:"expires_at"`
 	Permissions map[string]string `json:"permissions"`
@@ -69,7 +75,7 @@ func readTokenFile(path string, expectedAppID int64, now time.Time) (installatio
 	if document.AppID != expectedAppID {
 		return installationToken{}, errors.New("token_file_wrong_app")
 	}
-	if !boundedToken(document.Token, 1024) {
+	if !boundedToken(document.Token, 1024) || (document.Org != nil && !githubLoginPattern.MatchString(*document.Org)) {
 		return installationToken{}, errors.New("token_file_invalid")
 	}
 	if document.Permissions[runnerPermission] != "write" {

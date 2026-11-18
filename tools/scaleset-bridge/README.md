@@ -53,6 +53,8 @@ them over ssh as a mode-600 JSON file every 30 minutes:
  "permissions": {"organization_self_hosted_runners": "write", ...}, "minted_at": "..."}
 ```
 
+The org-scoped push also names `"org"` (the installation's organization login); it is optional.
+
 Errors contain fixed codes only. The App private key and installation token never appear in argv,
 the environment, stdout, or an error. The encoded JIT configuration appears only in the successful `jit` response
 and remains secret-bearing data for the future Rust/guest handoff.

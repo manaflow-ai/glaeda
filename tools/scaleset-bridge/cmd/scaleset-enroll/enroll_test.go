@@ -317,6 +317,7 @@ func writeTokenFile(t *testing.T, mode os.FileMode, document map[string]any) str
 func tokenDocument(now time.Time) map[string]any {
 	return map[string]any{
 		"app_id":      defaultAppID,
+		"org":         "manaflow-ai",
 		"token":       "ghs_pushedtoken",
 		"expires_at":  now.Add(50 * time.Minute).UTC().Format(time.RFC3339),
 		"permissions": map[string]string{"organization_self_hosted_runners": "write", "metadata": "read"},
@@ -350,6 +351,10 @@ func TestTokenFileRefusals(t *testing.T) {
 		},
 		"unknown field": func(document map[string]any) (os.FileMode, string) {
 			document["private_key"] = "never"
+			return 0o600, "token_file_invalid"
+		},
+		"malformed org": func(document map[string]any) (os.FileMode, string) {
+			document["org"] = "-not a login"
 			return 0o600, "token_file_invalid"
 		},
 		"multi token shape": func(document map[string]any) (os.FileMode, string) {
