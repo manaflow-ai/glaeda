@@ -1641,7 +1641,8 @@ in at the producer's root. So one root job per root per mini:
   wait with about no CPU on the mini (the hook's `GATEWAY_JOBS`, by workflow file and job id: `cmux-next.yml`'s
   `app-compile-fleet`, `swift-canary-fleet`, `release-compile-fast`, `fast-tier-fleet`, `swift-test-fleet` and
   `daemon-test-fleet`, `fleet-compile-check.yml`'s `compile-check`, `fleet-test-compile.yml`'s `compile` and
-  `cmux-next-tip-test-compile.yml`'s `compile`, and the feat-cmux-next evals on `CI_EVAL_STEP_GATEWAY`:
+  `cmux-next-tip-test-compile.yml`'s `compile`, `fleet-rd-host-macos.yml`'s `check` (the cmux-rd-host
+  macOS clippy and tests, on `CI_TEST_COMPILE_GATEWAY` when `CI_RD_HOST_GATEWAY` is unset), and the feat-cmux-next evals on `CI_EVAL_STEP_GATEWAY`:
   `cmux-next-perf-bench.yml`'s `bench`, `cu-driver-eval.yml`'s `eval` and `screen-stream-eval.yml`'s `eval`, whose
   steps run on the bench mini or a measure worker, and `cmux-next-hot-verify.yml`'s `look`, whose step runs on a
   display worker, and `native-sidebar-gallery.yml`'s `capture`, which submits the native sidebar suite to a

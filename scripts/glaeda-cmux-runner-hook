@@ -723,7 +723,7 @@ GATEWAY_JOBS = frozenset({("cmux-next.yml", "app-compile-fleet"), ("cmux-next.ym
                           ("cmux-next-tip-test-compile.yml", "compile"), ("cmux-next-perf-bench.yml", "bench"),
                           ("cu-driver-eval.yml", "eval"), ("screen-stream-eval.yml", "eval"),
                           ("cmux-next-hot-verify.yml", "look"), ("native-sidebar-gallery.yml", "capture"),
-                          ("cmux-next-tab-switch.yml", "frames")})
+                          ("cmux-next-tab-switch.yml", "frames"), ("fleet-rd-host-macos.yml", "check")})
 GATEWAY_CAPACITY_WAIT_S = 600.0  # SIGNING_DRAIN_WAIT_S: the longest a nightly signing job waits here to drain the mini
 # exclusive (SIGNING_JOBS): more units than any mini has, so admission caps it at the mini's whole count, plus both
 # fast tokens and both gateway tokens, the capacity 0-unit jobs take (no PR client runs beside the key either), and
