@@ -9730,8 +9730,15 @@ LAND_QUOTA_REFUSAL = re.compile(r"quota: not judged|\[quota: not judged")
 # The broker's own words for the same refusal count too: lw#6031 at 803fcf96, gcp-agent-lane-1 2026-11-20 02:02Z, was
 # "unreadable" with "gh api graphql failed: until 02:39Z (reset); not sent, retry after 02:39Z; reason: [RATE_LIMITED]"
 # and took the 120 s retry until the reset.
+# This host's own read guards refuse for the same reason and say so in their own words: the gh-quota shim in
+# cache-only mode ("cache-only: not held in this host's caches") and glaeda-gh's sweep guard ("this caller read the
+# jobs of 30 different runs or jobs in the last 10 minutes"). gcp-agent-lane-5, 2026-11-20: hq#13017, #12590, #12553
+# and #12558 each stopped retry_deadline after about 6 h ("12928 s due and not judged, not counted" beside 21874 s
+# counted); the counted judgments were these words, each taking the 120 s retry and counting toward the PR's deadline.
 LAND_UNREAD_QUOTA = re.compile(r"gh-quota: refused: GitHub(?:'s)? (?:REST |GraphQL )?rate limit is spent"
-                               r"|\[RATE_LIMITED\]|not sent, retry after \d\d:\d\dZ")
+                               r"|\[RATE_LIMITED\]|not sent, retry after \d\d:\d\dZ"
+                               r"|cache-only: not held in this host's caches"
+                               r"|glaeda-gh(?:'s sweep guard refused|: refused: this caller read the jobs of)")
 # A step's own output (update-branch, rerun, merge) that GitHub refused for the login's quota, in the words the broker
 # and the gh-quota shim use, as well as land_judge's. Read on a step's output only, never on land_judge's reason (which
 # can quote a red job's log). Before, only land_judge's words parked a step: cmux#42244's update-branch was refused

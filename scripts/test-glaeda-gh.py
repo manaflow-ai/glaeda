@@ -22750,6 +22750,24 @@ class LandTest(Base):
         p = self.quota_unreadable_profile(5, 20, self.t + 45 * 60, words=words.replace("{n}", "{{n}}"))
         self.assertEqual((p["perEntry"], set(p["waits"].values())), (1, {"quota"}), p)
 
+    def test_an_unreadable_judgment_this_hosts_own_guards_refused_is_parked_not_counted(self):
+        """gcp-agent-lane-5, 2026-11-20: hq#13017, #12590, #12553 and #12558 stopped retry_deadline after about 6 h of
+        "unreadable" judgments in the words of this host's own guards (the gh-quota shim's cache-only miss, glaeda-gh's
+        sweep guard), which LAND_UNREAD_QUOTA did not read: each took the 120 s retry and counted toward the PR's
+        deadline. They name no reset, so the entry parks on LAND_QUOTA_BACKOFF: a few judgments in 20 minutes, never one
+        every 120 s, and the wait is the quota's."""
+        for words in ("merge-hold: refused o/r {n}: its head could not be read: no fresh head-matching PR answer: "
+                      "gh-quota: refused: cache-only: not held in this host's caches within 900 s (GET pr view)",
+                      "merge_hold: refused: base_red_excuse.py exit 1 at {n}: glaeda-gh's sweep guard refused its "
+                      "job-list reads (at most 30 runs or jobs per caller in 10 minutes), so no red was judged: "
+                      "glaeda-gh: refused: this caller read the jobs of 30 different runs or jobs in the last 10 "
+                      "minutes"):
+            with self.subTest(words=words[:60]):
+                p = self.quota_unreadable_profile(5, 20, self.t + 45 * 60, words=words.replace("{n}", "{{n}}"))
+                self.assertLessEqual(p["perEntry"], 3, p)  # LAND_QUOTA_BACKOFF doubling, not the 120 s retry (10)
+                self.assertEqual(set(p["waits"].values()), {"quota"}, p)
+                self.tearDown_entries()
+
     def tearDown_entries(self) -> None:
         """A fresh queue directory for the next profile: no entry, request or latch left from the last."""
         for d in (gg.LandQueue.entries_dir(), gg.LandQueue.requests_dir()):
