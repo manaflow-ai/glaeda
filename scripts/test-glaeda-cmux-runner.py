@@ -7535,6 +7535,7 @@ class LedgerSelfHealTest(unittest.TestCase):
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)  # first, so it runs after the os patches below are stopped
         self.fleet = Path(self.tmp.name).resolve() / "fleet"
         (self.fleet / "capacity").mkdir(parents=True)
         self.host_lock = self.fleet / "host.lock"
@@ -7573,10 +7574,10 @@ class LedgerSelfHealTest(unittest.TestCase):
                       mock.patch.object(hook.os, "lstat", lstat), mock.patch.object(hook.os, "open", fake_open),
                       mock.patch.object(hook, "file_acl", lambda path: list(self.ACL)),
                       mock.patch.object(hook, "set_file_acl", set_acl),
-                      mock.patch.object(hook, "owner_name", lambda uid: "guest")):
+                      mock.patch.object(hook, "owner_name", lambda uid: "guest"),
+                      mock.patch.object(hook, "foreign_fleet_tools", lambda uid: [])):
             patch.start()
             self.addCleanup(patch.stop)
-        self.addCleanup(self.tmp.cleanup)
         self.addCleanup(hook.LEDGER_HEALED.clear)
 
     def asides(self, name: str) -> list[Path]:
@@ -7604,6 +7605,42 @@ class LedgerSelfHealTest(unittest.TestCase):
         self.assertIn("(LEDGER_SELF_HEAL)", line)
         self.assertIn("guest's", line)
         self.assertIn(os.fspath(aside), line)
+
+    def test_without_a_hard_link_the_old_file_is_moved_aside_then_replaced(self) -> None:
+        with mock.patch.object(hook.os, "link", side_effect=PermissionError(errno.EPERM, "protected_hardlinks")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            os.close(hook.open_ledger(self.host_lock, 0o660))
+        [aside] = self.asides("host.lock")
+        self.assertEqual(aside.read_text(), "guest\n")
+        self.assertEqual(self.host_lock.read_text(), "")
+
+    def test_no_heal_while_another_account_runs_a_fleet_tool_that_may_hold_it(self) -> None:
+        """root's glaeda-daemon-heal or glaeda-disk drain holds host.lock exclusively by name: a swap under it would
+        admit a job beside the drain. The heal waits for a later job; a process table it cannot read is the same."""
+        for tools, said in ((["glaeda-disk"], "another account runs glaeda-disk"),
+                            (None, "the process table cannot be read")):
+            with self.subTest(tools=tools), mock.patch.object(hook, "foreign_fleet_tools", lambda uid: tools), \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                hook.LEDGER_HEALED.clear()
+                with self.assertRaises(PermissionError):
+                    hook.open_ledger(self.host_lock, 0o660)
+                self.assertEqual(self.asides("host.lock"), [])
+                self.assertEqual(self.host_lock.read_text(), "guest\n")
+                self.assertIn("not healing the ledger file", out.getvalue())
+                self.assertIn(said, out.getvalue())
+
+    def test_foreign_fleet_tools_names_other_accounts_ledger_tools_only(self) -> None:
+        me = os.geteuid()
+        table = (f"{me} /usr/bin/python3 /Users/cmux/glaeda-runner/scripts/glaeda-cmux-runner-hook job-started\n"
+                 f"0 /usr/bin/python3 -I /Library/Application Support/glaeda/daemon-heal/glaeda-daemon-heal run\n"
+                 f"0 /usr/libexec/logd\n"
+                 f"0 /usr/bin/python3 /usr/local/bin/glaeda-gh serve\n"
+                 f"{me + 7} /bin/sh /Users/Shared/cmux-build-fleet/bin/with-host-lock make\n")
+        done = subprocess.CompletedProcess(["/bin/ps"], 0, stdout=table, stderr="")
+        with mock.patch.object(hook.subprocess, "run", return_value=done):
+            self.assertEqual(FOREIGN_FLEET_TOOLS(me), ["glaeda-daemon-heal", "with-host-lock"])
+        with mock.patch.object(hook.subprocess, "run", side_effect=OSError("no ps")):
+            self.assertIsNone(FOREIGN_FLEET_TOOLS(me))
 
     def test_a_capacity_token_is_healed_through_lock_file(self) -> None:
         token = self.fleet / "capacity" / "gateway-0.token"
@@ -7706,9 +7743,14 @@ class LedgerSelfHealTest(unittest.TestCase):
             self.assertIsNone(FILE_ACL("/fleet/host.lock"))
         with mock.patch.object(hook.sys, "platform", "linux"):
             self.assertEqual(FILE_ACL("/fleet/host.lock"), [])
+        hidden = subprocess.CompletedProcess(["/bin/ls"], 0, stdout=listing.splitlines()[0] + "\n", stderr="")
+        with mock.patch.object(hook.sys, "platform", "darwin"), \
+                mock.patch.object(hook.subprocess, "run", return_value=hidden):
+            self.assertIsNone(FILE_ACL("/fleet/host.lock"), "an ACL it cannot list is never read as none")
 
 
-FILE_ACL = hook.file_acl  # the real one, before LedgerSelfHealTest patches it
+FILE_ACL = hook.file_acl  # the real ones, before LedgerSelfHealTest patches them
+FOREIGN_FLEET_TOOLS = hook.foreign_fleet_tools
 
 
 class MirrorBorrowTest(unittest.TestCase):

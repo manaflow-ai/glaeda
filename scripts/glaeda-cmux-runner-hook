@@ -6596,12 +6596,19 @@ def take_host_lock(path: str, watch_pid: int | JobOwner, state_dir: Path) -> tup
 # keep-published-dsyms (13:43-14:43Z) each held the signer an hour on "cannot take the ledger (PermissionError)";
 # LEDGER_ERROR_IS_FINAL then made it a refusal at once, but every signing job still failed until a human swapped the
 # file. Anything else (a file the runner owns, a directory it does not own, a symlink, another errno) stays the
-# immediate refusal. No runner process can hold a lock on a file the runner cannot open, so the swap splits no lock
-# the runner's own jobs share.
+# immediate refusal. No runner process can hold a lock on a file the runner cannot open, but another account's can
+# (root's daemon heal and disk drain take host.lock exclusively), so a heal waits for the next job while any other
+# account runs a fleet tool (foreign_fleet_tools). The swap links the old file aside and renames the runner's copy
+# over the name, so the name never goes missing for a slot that opens it meanwhile.
 LEDGER_HEAL_ERRNOS = frozenset({errno.EACCES, errno.EPERM})
 LEDGER_HEALED: set[str] = set()  # paths healed by this process: each at most once
 LEDGER_HEAL_LOCK = ".ledger-heal.lock"  # beside the healed file; not a host-lock-holder* name
 LEDGER_HEAL_WAIT_S = 5.0  # a heal takes milliseconds
+# the tools that open FLEET_DIR's ledger by name: one another account (root's daemon heal or disk drain, a guest) runs
+# may hold a lock there. Named one by one, so a long-lived daemon of another account never stops every heal.
+LEDGER_TOOL_MARKS = ("glaeda-cmux-runner-hook", "glaeda-daemon-heal", "glaeda-disk", "glaeda-idle-warm",
+                     "glaeda-fleet-cas-prune", "glaeda-promotion-admit", "glaeda-mini-health", "glaeda-mini-fleet",
+                     "cmux_mini_fix", "cmux_mini_probe", "with-host-lock")
 
 
 def file_acl(path: str) -> list[str] | None:
@@ -6616,10 +6623,16 @@ def file_acl(path: str) -> list[str] | None:
         return None
     if listing.returncode != 0:
         return None
-    entries = []
-    for line in listing.stdout.splitlines()[1:]:
-        if (match := re.match(r"\s*\d+: (.+?)\s*$", line)) and " inherited " not in f" {match.group(1)} ":
-            entries.append(match.group(1))
+    lines = listing.stdout.splitlines()
+    entries, listed = [], 0
+    for line in lines[1:]:
+        if match := re.match(r"\s*\d+: (.+?)\s*$", line):
+            listed += 1
+            if " inherited " not in f" {match.group(1)} ":
+                entries.append(match.group(1))
+    mode = lines[0].split(None, 1)[0] if lines and lines[0].strip() else ""
+    if mode.endswith("+") and not listed:
+        return None  # it has an ACL that could not be read (no readsecurity): never drop a fence unseen
     return entries
 
 
@@ -6644,6 +6657,27 @@ def owner_name(uid: int) -> str:
         return str(uid)
 
 
+def foreign_fleet_tools(uid: int) -> list[str] | None:
+    """The fleet tools other accounts run now (LEDGER_TOOL_MARKS), by executable basename; None when ps cannot say."""
+    try:
+        listing = subprocess.run(["/bin/ps", "-axo", "uid=,command="], stdin=subprocess.DEVNULL, capture_output=True,
+                                 text=True, errors="replace", timeout=5, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if listing.returncode != 0:
+        return None
+    found = []
+    for line in listing.stdout.splitlines():
+        fields = line.split(None, 1)
+        if len(fields) < 2 or not fields[0].isdigit() or int(fields[0]) == uid:
+            continue
+        if any(mark in fields[1] for mark in LEDGER_TOOL_MARKS):
+            words = fields[1].split()
+            script = next((w for w in words[1:] if any(m in w for m in LEDGER_TOOL_MARKS)), words[0])
+            found.append(os.path.basename(script))
+    return found
+
+
 def heal_ledger_file(path: str | os.PathLike[str], error: OSError) -> str | None:
     """LEDGER_SELF_HEAL: swap a ledger file another user owns for the runner's own; the log line, or None when this
     is not that case (or the heal failed, leaving the old file in place)."""
@@ -6658,11 +6692,19 @@ def heal_ledger_file(path: str | os.PathLike[str], error: OSError) -> str | None
     uid = os.geteuid()
     try:
         old = os.lstat(path)
-        if not stat.S_ISREG(old.st_mode) or old.st_uid == uid or os.stat(parent).st_uid != uid:
+        if not stat.S_ISREG(old.st_mode) or os.stat(parent).st_uid != uid:
             return None
     except OSError:
         return None
     LEDGER_HEALED.add(path)
+    if old.st_uid == uid:
+        return ""  # another runner healed it since this open failed: retry the open once, nothing to log
+    tools = foreign_fleet_tools(uid)
+    if tools is None or tools:
+        print(f"{PREFIX}: not healing the ledger file {path} (LEDGER_SELF_HEAL) now: "
+              + (f"another account runs {', '.join(sorted(set(tools))[:4])}, which may hold it"
+                 if tools else "the process table cannot be read") + "; a later job heals it", flush=True)
+        return None
     try:  # one heal at a time per directory: two runners swapping at once could move the other's fresh file aside
         guard = os.open(os.path.join(parent, LEDGER_HEAL_LOCK), os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
     except OSError:
@@ -6699,9 +6741,11 @@ def swap_ledger_file(path: str, old: os.stat_result) -> str | None:
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     aside = f"{path}.{owner}-owned.{stamp}"
     fresh = f"{path}.heal-{os.getpid()}"
-    try:  # the runner's copy first, complete, so the ledger name is never missing or fence-less
+    try:  # the runner's copy first, complete, so the ledger name is never fence-less
         fd = os.open(fresh, os.O_RDONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         try:
+            with contextlib.suppress(OSError):  # the old group, so access through it survives (best effort)
+                os.fchown(fd, -1, old.st_gid)
             os.fchmod(fd, stat.S_IMODE(old.st_mode))
         finally:
             os.close(fd)
@@ -6711,17 +6755,22 @@ def swap_ledger_file(path: str, old: os.stat_result) -> str | None:
         with contextlib.suppress(OSError):
             os.unlink(fresh)
         return None
-    try:
-        os.rename(path, aside)
+    try:  # a second name for the old file, then the runner's copy over the ledger name in one rename
+        os.link(path, aside, follow_symlinks=False)
+        linked = True
     except OSError:
-        with contextlib.suppress(OSError):
-            os.unlink(fresh)
-        return None
+        linked = False  # (Linux's protected_hardlinks refuses another user's file): move it aside, then put ours in
+        try:
+            os.rename(path, aside)
+        except OSError:
+            with contextlib.suppress(OSError):
+                os.unlink(fresh)
+            return None
     try:
         os.rename(fresh, path)
     except OSError:
         with contextlib.suppress(OSError):
-            os.rename(aside, path)
+            os.unlink(aside) if linked else os.rename(aside, path)
         with contextlib.suppress(OSError):
             os.unlink(fresh)
         return None
