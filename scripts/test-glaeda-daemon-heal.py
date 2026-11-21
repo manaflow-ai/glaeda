@@ -1120,7 +1120,7 @@ class FleetOps(unittest.TestCase):
 
     def test_shipped_ops_are_pinned_to_their_source(self) -> None:
         doc = heal.load_fleet_ops(OPS_BYTES)
-        self.assertEqual(sorted(doc["ops"]), ["console-unlock-guard", "symbol-cache-cap"])
+        self.assertEqual(sorted(doc["ops"]), ["console-unlock-guard", "seed-root", "symbol-cache-cap"])
         for name, op in doc["ops"].items():
             self.assertEqual(heal.sha256(op["body"].encode()), op["sha256"])
             self.assertRegex(op["source"]["commit"], r"^[0-9a-f]{40}$")
@@ -1131,7 +1131,7 @@ class FleetOps(unittest.TestCase):
     def test_a_stale_or_missing_body_is_installed_with_its_launchdaemon(self) -> None:
         (self.ops_dir / "console-unlock-guard").write_bytes(b"#!/bin/bash\n# older\n")
         out = self.run_ops()
-        self.assertEqual(out["installed"], ["console-unlock-guard", "symbol-cache-cap"])
+        self.assertEqual(out["installed"], ["console-unlock-guard", "seed-root", "symbol-cache-cap"])
         for name, op in self.doc["ops"].items():
             self.assertEqual((self.ops_dir / name).read_bytes(), op["body"].encode())
             self.assertEqual((self.ops_dir / name).stat().st_mode & 0o777, 0o755)
@@ -1140,7 +1140,8 @@ class FleetOps(unittest.TestCase):
                                      "StartInterval": op["every_s"], "StandardOutPath": f"/var/log/{name}.log",
                                      "StandardErrorPath": f"/var/log/{name}.log"})
             self.assertEqual(out["ops"][name]["state"], "current")
-        self.assertEqual(self.loaded, {"system/ai.manaflow.console-unlock-guard", "system/ai.manaflow.symbol-cache-cap"})
+        self.assertEqual(self.loaded, {"system/ai.manaflow.console-unlock-guard", "system/ai.manaflow.seed-root",
+                                       "system/ai.manaflow.symbol-cache-cap"})
 
     def test_an_op_dropped_from_the_file_is_unloaded_and_removed_but_nothing_else(self) -> None:
         self.run_ops()
@@ -1155,7 +1156,7 @@ class FleetOps(unittest.TestCase):
         self.assertFalse((self.plists / "ai.manaflow.symbol-cache-cap.plist").exists())
         self.assertNotIn("system/ai.manaflow.symbol-cache-cap", self.loaded)
         self.assertTrue((self.ops_dir / "by-hand").exists() and (self.plists / "ai.manaflow.by-hand.plist").exists())
-        self.assertEqual(json.loads(self.ledger.read_text())["ops"], ["console-unlock-guard"])
+        self.assertEqual(json.loads(self.ledger.read_text())["ops"], ["console-unlock-guard", "seed-root"])
         self.assertNotIn("removed", self.run_ops())
 
     def test_a_load_that_fails_is_retried_at_the_next_pass(self) -> None:
@@ -1220,7 +1221,8 @@ class FleetOps(unittest.TestCase):
         self.calls.clear()
         out = self.run_ops()
         self.assertEqual(out["installed"], [])
-        self.assertEqual([c[0] for c in self.calls], ["print", "print"], "no bootout, no rewrite: only is it loaded")
+        self.assertEqual([c[0] for c in self.calls], ["print"] * len(self.doc["ops"]),
+                         "no bootout, no rewrite: only is it loaded")
 
     def test_a_held_or_ineligible_host_installs_nothing_but_reports(self) -> None:
         (self.ops_dir / "console-unlock-guard").write_bytes(b"#!/bin/bash\n# older\n")
@@ -1334,10 +1336,12 @@ class FleetOps(unittest.TestCase):
 
     def test_the_fleet_ops_file_names_no_host_or_login(self) -> None:
         """This file is public: no host, address, account or person in it. The real fleet's names are checked
-        where they live, against this file as published; here, the shapes they take."""
+        where they live, against this file as published; here, the shapes they take. /Users/runner is the
+        CI runner account every Actions mini has (seed-root's /Users/runner/_work/cmux, glaeda-disk CMUX_SEED_ROOT),
+        not a person's login."""
         text = OPS_BYTES.decode()
         for pattern in (r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", r"\.ts\.net\b", r"\b[\w.-]+@[\w-]+\.[\w.]+\b",
-                        r"\b\w+-mac-mini(?:-\d+)?\b", r"\b(?!python\d|sha\d)[a-z]{3,}\d{1,3}s?\b", r"/Users/(?!Shared/)\w+",
+                        r"\b\w+-mac-mini(?:-\d+)?\b", r"\b(?!python\d|sha\d)[a-z]{3,}\d{1,3}s?\b", r"/Users/(?!Shared/|runner/)\w+",
                         r"\b(?:aws|ec2)-[a-z0-9]+-\d+\b", r"\bmsg \d+\b", r"\b[A-Z][a-z]+, 20\d\d-\d\d-\d\d\b"):
             with self.subTest(pattern=pattern):
                 self.assertEqual(re.findall(pattern, text), [], pattern)

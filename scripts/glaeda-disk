@@ -1271,7 +1271,8 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "11be9214d14805b3108b60f92d6c3b38811c6366fc937a13b1723625a29e40ce",
     "58f1fca2d4058e565c216ccce2a9b841776c8559866a82bd5fa05b147eb81d3c",
     "294cc6b9d0d352fd5ff470c8e8bcb28fde12c53838471f63b428d174ef98ab39",
-    "26897fb83c5f73f9a13e32eb1a8a78c794911c9dc478fe7b0fa81ef229b6d2f6",
+    "8bce5d1aa8bdd50fed4beccaec8a0575e009b47401581eec4e881ac84b0e5386",
+    "16b0496b393d291667fc7f7698dc234579241e38e65ab5da185897df3a164150",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -8350,12 +8351,19 @@ NETWORK_URL = re.compile(r"(https?|ssh|git|git\+ssh|ssh\+git)://|[^/.][^/:]*:(?!
 
 
 TRUSTED_LOCAL_REMOTES: tuple[str, ...] = ()  # tests: local repos standing in for a server
+# The fleet git mirror (the cmux-git-mirror family: report only, kept by role, never deleted here) is a server copy:
+# glaeda-git-mirror fetches it from GitHub, and jobs and checkouts clone from it. A checkout whose only remote is
+# that path had no network remote, so nothing counted as pushed and its bundle had to carry the whole history:
+# /Users/cmux/m2l-viewer on a fleet host kept 5.4 GB for "no room: its peak needs 5.4G free" with 13 commits
+# (2.2 MB) unpushed (2026-11-21).
+FLEET_MIRROR_REMOTES: tuple[str, ...] = ("/Users/Shared/cmux-build-fleet/git",)
 
 
 def network_remotes(gitdir: Path) -> list[str] | None:
-    """Remotes on another machine. A local path or file:// remote can be one more scratch repo
-    about to be deleted too (two clones fetching from each other vouch for commits that exist
-    nowhere else), so it never counts as a copy. None when the config cannot be read."""
+    """Remotes on another machine, or the fleet git mirror (FLEET_MIRROR_REMOTES). Any other local path or
+    file:// remote can be one more scratch repo about to be deleted too (two clones fetching from each other
+    vouch for commits that exist nowhere else), so it never counts as a copy. None when the config cannot be
+    read."""
     out = _git_dir_run(gitdir, "config", "--get-regexp", r"^remote\..*\.url$")
     if out is None:
         return [] if _git_dir_run(gitdir, "rev-parse", "--git-dir") is not None else None
@@ -8363,7 +8371,8 @@ def network_remotes(gitdir: Path) -> list[str] | None:
     for line in out.splitlines():
         key, _, url = line.partition(" ")
         name = key[len("remote."):-len(".url")]
-        trusted = any(url == t or url.startswith(t + "/") for t in TRUSTED_LOCAL_REMOTES)
+        trusted = any(url.rstrip("/") == t or url.startswith(t + "/")
+                      for t in (*TRUSTED_LOCAL_REMOTES, *FLEET_MIRROR_REMOTES))
         if trusted or (NETWORK_URL.match(url) and not url.startswith("file:")):
             names.add(name)
         else:
@@ -11304,7 +11313,7 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             references = references_by_root.setdefault(key, live_artifact_references(fam.reference_root))
             if artifact_referenced(path, references):
                 reasons.append("live lease or running job")
-        if LEASE and (why := lease_holds(fam, path, now - idle * 3600)):
+        if LEASE and (why := lease_holds(fam, path)):
             reasons.append(why)
         if fam.id in BUILD_STATE_FAMILY_IDS and not blind and (why := build_state_held(fam, path, cmds)):
             reasons.append(why)
@@ -11777,25 +11786,23 @@ def host_reservation(now: float | None = None, path: Path | None = None, names: 
 # turn the budget off. Only the leased job's own paths are protected"). A lease used to make every pass floor-only
 # with no budget, no idle sweep and 24 h ages: a mini under a two-hour measurement lease kept 145 GiB "blocked" and
 # freed nothing. Now a readable, active lease (RESERVATION_SINCE) leaves every rule as on an unleased host, and holds
-# only what its job owns: an item used since the lease began (its job wrote it, or read it with a tool that moves
-# mtime), a path its lease or job markers name (live_artifact_references, as before) and anything its processes have
-# open or name (every family's own in-use checks). A list that cannot be read still fails closed to floor-only.
+# only what its job owns: a path its lease or job markers name (lease_holds, live_artifact_references) and anything
+# its processes have open or name (every family's own in-use checks). A list that cannot be read still fails closed
+# to floor-only. "Used since the lease began" no longer counts (2026-11-21): a lease drains a host, so runner jobs
+# admitted before it keep writing after it begins, and a drain lease on a mini at 17 GiB free kept the 26.5 GiB of
+# SwiftPM scratch those jobs had left, unheld by any lock, as "the leased job's own" while every pass freed nothing.
 LEASE: dict[str, Any] = {}  # {"why", "since"} when an active lease holds this host; set by main
 
 
-def lease_holds(fam: "Family", path: Path, used: float | None = None) -> str:
-    """Why the lease holding this host keeps PATH ("" when none does or it is no job's): used since it began. USED is
-    its last use when the caller already has it (the survey's), else item_mtime reads it now."""
-    since = LEASE.get("since")
-    if since is None:
+def lease_holds(fam: "Family", path: Path, fresh: bool = False) -> str:
+    """Why the lease holding this host keeps PATH ("" when none does): its reservation or a job marker names it (at,
+    inside or above it; FRESH re-reads them, as apply does). What the leased job has open or names is every family's
+    own in-use check."""
+    if LEASE.get("since") is None:
         return ""
-    if used is None:
-        try:
-            used = item_mtime(fam, path)
-        except OSError:
-            return ""
-    if used >= since:
-        return f"used since the host's lease began ({LEASE.get('why', '?')}): the leased job's own"
+    names = fresh_artifact_references(FLEET_ROOT) if fresh else live_artifact_references(FLEET_ROOT)
+    if artifact_referenced(path, names):
+        return f"named by the host's lease ({LEASE.get('why', '?')}): the leased job's own"
     return ""
 
 
@@ -14106,7 +14113,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                and referenced_main_checkout(p, nested=families[i.family].nested_git))
               or (i.family in HOME_SCRATCH_FAMILIES and home_scratch_referenced(p))):
             outcome = "changed:referenced"
-        elif LEASE and lease_holds(fam, p):
+        elif LEASE and lease_holds(fam, p, fresh=True):
             outcome = "changed:leased"
         elif not item_due(fam, (idle_now := (time.time() - item_mtime(fam, p)) / 3600),
                           item_window(fam, p, idle_hours, archived))[0]:
@@ -16608,6 +16615,61 @@ def disk_off() -> str:
     return ""
 
 
+# A full disk stopped glaeda-disk itself: its first state write (sizes.<pid>.tmp, the evict owner) died with ENOSPC,
+# launchd's stderr log could not take the traceback (exit 120), and every pass ended before it freed a byte. A fleet
+# host sat at 0.1 GiB free with 39 GiB of idle build scratch and a reclaimable 5.4 GB checkout for half an hour
+# (2026-11-21). The reserve is the room those writes need: a run that finds the home volume under
+# FULL_DISK_RELEASE_UNDER deletes it first, and an applying pass that ends with FULL_DISK_REFILL_OVER free writes it
+# again. A host that never had one, or used it, is no worse off than before.
+FULL_DISK_RESERVE_BYTES = 512 * 1024**2
+FULL_DISK_RELEASE_UNDER = 1024**3
+FULL_DISK_REFILL_OVER = 10 * 1024**3
+
+
+def full_disk_reserve_path() -> Path:
+    return HOME / ".cache/glaeda-disk/full-disk-reserve"
+
+
+def release_full_disk_reserve(path: Path | None = None, free: Callable[[], int | None] | None = None) -> int:
+    """Delete the reserve when the volume is nearly full, so this run's own writes have room. Bytes freed, or 0."""
+    path = path or full_disk_reserve_path()
+    left = (free or _home_free)()
+    if left is None or left >= FULL_DISK_RELEASE_UNDER:
+        return 0
+    try:
+        size = path.stat().st_size
+        path.unlink()
+    except OSError:
+        return 0
+    return size
+
+
+def refill_full_disk_reserve(path: Path | None = None, free: Callable[[], int | None] | None = None) -> bool:
+    """Write the reserve again when there is room for it to spare. True when one exists afterwards."""
+    path = path or full_disk_reserve_path()
+    with contextlib.suppress(OSError):
+        if path.stat().st_size >= FULL_DISK_RESERVE_BYTES:
+            return True
+    left = (free or _home_free)()
+    if left is None or left < FULL_DISK_REFILL_OVER:
+        return False
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        chunk = b"\0" * (8 * 1024**2)  # written, not truncated: a sparse file would reserve nothing
+        with open(tmp, "wb") as f:
+            for _ in range(FULL_DISK_RESERVE_BYTES // len(chunk)):
+                f.write(chunk)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        return False
+
+
 def _home_free() -> int | None:
     try:
         return free_bytes(HOME)[0]
@@ -16745,6 +16807,7 @@ def write_run_line(started: float, free_before: int | None) -> None:
            "default_targets": bool(RUN.get("default_targets")), "config_sha256": RUN.get("config_sha256"),
            "floor_gib": RUN.get("floor_gib"),
            "release": glaeda_disk_release(),
+           "full_disk_reserve_released": RUN.get("full_disk_reserve_released", 0),
            "reclaimed_gib": round(RUN.get("released", 0) / GIB, 1),
            "reached": None if target is None or after is None else after >= target,
            "blocked": RUN.get("blocked", {}), "duration_s": round(time.time() - started, 1),
@@ -16771,6 +16834,8 @@ def _logged_main(args: list[str]) -> int:
     RUN.clear()
     OUT_OF_BAND_RUN = ""  # one reset per run, before any early return of _main_impl can leave a stale reason
     RUN["caller"] = run_caller()
+    if released := release_full_disk_reserve():
+        RUN["full_disk_reserve_released"] = released
     started, before = time.time(), _home_free()
     try:
         status = _main_impl(args)
@@ -16786,6 +16851,8 @@ def _logged_main(args: list[str]) -> int:
         # coalesced into a running one, or deferred, does not start it: that one may still be deleting.
         if status == 0 and RUN.get("apply") and not RUN.get("off") and RUN.get("skipped") in CENSUS_AFTER_SKIPS:
             launch_background_census()
+        if RUN.get("apply") and not RUN.get("off"):
+            refill_full_disk_reserve()
         return status
     except BaseException as e:
         RUN.setdefault("skipped", f"error: {type(e).__name__}")

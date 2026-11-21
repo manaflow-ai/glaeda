@@ -1125,7 +1125,8 @@ REST_READ_MAX = {"pr": REST_CHECK_PAGES + REST_STATUS_PAGES + REST_RUN_PAGES + 5
 PR_FIELDS = """number url title state isDraft merged mergedAt mergeCommit { oid } mergeable mergeStateStatus headRefOid
 headRefName baseRefName reviewDecision updatedAt baseRef { branchProtectionRule { requiredStatusCheckContexts }
 rules(first: 50) { nodes { type parameters { ... on RequiredStatusChecksParameters {
-  requiredStatusChecks { context } } } } } } commits(last: 1) { nodes { commit { SUITE_ATTEMPTS statusCheckRollup { state
+  requiredStatusChecks { context } } } } } } commits(last: 1) { nodes { commit { oid
+parents(first: 1) { nodes { oid } } SUITE_ATTEMPTS statusCheckRollup { state
 contexts(first: 100) { totalCount PR_COUNTS pageInfo { hasNextPage endCursor } nodes { __typename
 ... on CheckRun { id name status conclusion detailsUrl databaseId startedAt completedAt
   isRequired(pullRequestNumber: NUM) checkSuite { databaseId conclusion app { slug }
@@ -3794,9 +3795,26 @@ def null_contexts_error(count: int) -> str:
     return f"graphql: {count} check context{'s' if count != 1 else ''} came back null (a partial rollup)"
 
 
+def pr_head_parent(node: dict, commits: list) -> str:
+    """The first parent of the PR's head commit as the read gave it (40 hex, lowercase), or "" when this read does not
+    say. Only the head commit's own parent is taken: commits(last: 1) is the head commit, and its oid is checked
+    against headRefOid, so a read whose commit list lags the head (or a REST read, which carries no parents) says
+    nothing rather than naming another commit's parent. A first parent is what proves a merge commit was made on top
+    of a known head: land's pin follows the merge its own update-branch made (LandQueue.pin_follow)."""
+    commit = ((commits[0] if commits else {}) or {}).get("commit") or {}
+    oid = str(commit.get("oid") or "").lower()
+    head = str(node.get("headRefOid") or "").lower()
+    if not oid or not head or oid != head:
+        return ""
+    parents = ((commit.get("parents") or {}).get("nodes") or [])
+    first = str(((parents[0] if parents else {}) or {}).get("oid") or "").lower()
+    return first if SHA40.fullmatch(first) else ""
+
+
 def parse_pr(node: dict) -> dict:
     commits = ((node.get("commits") or {}).get("nodes") or [{}])
     rollup = ((commits[0] or {}).get("commit") or {}).get("statusCheckRollup") or {}
+    head_parent = pr_head_parent(node, commits)
     contexts = rollup.get("contexts") or {}
     latest: dict[str, tuple[tuple, dict]] = {}
     superseded: list[dict] = []  # replaced by a newer attempt or run; GitHub's rollup still counts them
@@ -3880,6 +3898,7 @@ def parse_pr(node: dict) -> dict:
         "state": node.get("state"), "isDraft": node.get("isDraft"), "merged": node.get("merged"),
         "mergedAt": node.get("mergedAt"), "mergeCommit": node.get("mergeCommit"), "mergeable": node.get("mergeable"),
         "mergeStateStatus": node.get("mergeStateStatus"), "headRefOid": node.get("headRefOid"),
+        **({"headParent": head_parent} if head_parent else {}),
         "headRefName": node.get("headRefName"), "baseRefName": node.get("baseRefName"),
         "reviewDecision": node.get("reviewDecision"), "updatedAt": node.get("updatedAt"),
         "checkState": rollup.get("state"), "checks": checks, "superseded": superseded,
@@ -4066,7 +4085,7 @@ def newest_verdict(found: list[tuple[int, str, str]]) -> tuple[str, str]:
 
 
 HEAD_CONTEXTS = """statusCheckRollup{contexts(first:100%s){pageInfo{hasNextPage endCursor} nodes{__typename
-... on CheckRun{databaseId name status conclusion startedAt completedAt checkSuite{databaseId app{slug}
+... on CheckRun{id databaseId name status conclusion startedAt completedAt checkSuite{databaseId app{slug}
 workflowRun{databaseId event workflow{name databaseId}}}}
 ... on StatusContext{context state description}}}}"""
 
@@ -4136,13 +4155,14 @@ def head_query(owner: str, repo: str, sha: str, cursor: str | None = None,
 
 
 def fold_contexts(nodes: list, runs: dict, statuses: dict, ids: dict, prefix: str = "",
-                  order: dict | None = None) -> None:
+                  order: dict | None = None, failed: dict | None = None) -> None:
     """Add one page of a head's contexts to runs (`workflow / job` -> [(id, status, conclusion)]), statuses
     (`status / context` -> (status, conclusion, state)) and ids (failed Actions jobs). prefix (`OWNER/REPO: `) keys
     another repository's checks apart, so a same-named check there never stands in for one here (CHECKS_OF_RECORD).
     A status's `error` is folded into the conclusion `failure` (every reader of `found` counts it red), and its own
     state is kept beside it (head_data's statusStates): an `error` is a poster that gave no verdict, which a reader
-    such as a fallback dispatcher must tell apart from a red."""
+    such as a fallback dispatcher must tell apart from a red. `failed` (optional) gets each failure's databaseId ->
+    node id, for the step counts head_steps reads."""
     for item in nodes or []:
         if not item:
             continue
@@ -4165,6 +4185,8 @@ def fold_contexts(nodes: list, runs: dict, statuses: dict, ids: dict, prefix: st
                                               run_identity(item, suite)])
         if slug == "github-actions" and conclusion == "failure" and item.get("databaseId"):
             ids.setdefault(key, []).append(item["databaseId"])
+        if failed is not None and conclusion == "failure" and item.get("databaseId") and item.get("id"):
+            failed[item["databaseId"]] = item["id"]  # head_steps reads each one's step count
 
 
 def run_identity(item: dict, suite: dict) -> dict:
@@ -4182,6 +4204,16 @@ def run_identity(item: dict, suite: dict) -> dict:
     if app is None and "app" in suite:
         out["appNull"] = True  # GitHub's documented null app, not an unread one
     return {k: v for k, v in out.items() if v is not None}
+
+
+def attach_steps(data: dict, counts: dict) -> None:
+    """Add `steps` (the job's step count) to the identity of each failed row of data's `runs` that COUNTS (check run
+    databaseId -> count) knows. A failed job with 0 steps never ran: land-judge's runner_refused reads a stored red
+    as it reads a live one. A row without it is unknown, never zero; the key is an addition, older readers skip it."""
+    for rows in (data.get("runs") or {}).values():
+        for row in rows:
+            if len(row) > 5 and isinstance(row[5], dict) and row[2] == "failure" and row[0] in counts:
+                row[5]["steps"] = counts[row[0]]
 
 
 # A head's `runs` (head_data's ORDER): every check run fold_contexts read at the head, by key, as [databaseId, status,
@@ -4495,6 +4527,7 @@ class Daemon:
         self.tick_deadline = float("inf")  # time.monotonic() after which this tick starts no request
         self.deferred: set[str] = set()  # keys a tick ran out of time for: read first on the next tick
         self.post_at = float("-inf")  # the last content write (post_tick)
+        self.post_tried = float("-inf")  # the outbox's own clock when post_tick last ran (post_due)
         self.clock_real = True  # tick(now=...) in tests pins the clock
         held = (read_json(BASE / "daemon.json") or {}).get("outbox") or {}
         # GitHub's secondary limit holds the outbox until then
@@ -4558,6 +4591,7 @@ class Daemon:
         self.jobs_only: list[dict] = []  # failed runs whose job list is read though runs cannot be (due)
         self.heads_direct: list[dict] = []  # asked heads with no answer read over REST past the share (due_heads_direct)
         self.head_direct_at: list[float] = []  # when each such read was admitted, the last hour (HEAD_DIRECT_MAX)
+        self.job_steps: dict[int, int] = {}  # failed check run databaseId -> its step count (final once completed)
         self.steps_failed: dict[Any, float] = {}  # job id -> when GitHub refused its steps for good (STEPS_RETRY)
         self.waived = False  # inside read_waited: the reserve's stop yields down to WAITED_RESERVE_SHARE of it
         self.waited_log: list[tuple[float, int]] = []  # (time, GraphQL points) read_waited spent, last minute
@@ -5650,6 +5684,8 @@ class Daemon:
         bucket = "graphql" if path == "/graphql" else "rest"
         if self.upstream() is not None:
             raise WatchError("this host reads GitHub through its upstream (upstream.json) and has no login")
+        if not content and not free:
+            self.post_due()  # a read phase never holds a queued write past its spacing
         raw_body = json.dumps(body).encode() if body is not None else None
         pool = self.app_pool
         owner = (pool.owner_of(method, path, body) if pool is not None and not free and not content
@@ -5917,6 +5953,7 @@ class Daemon:
         """Send at most one queued write per tick, POST_SPACING after the last one and never while GitHub's
         secondary limit holds the outbox. Land-gating writes first (outbox_gate), then oldest first; a write waiting
         out its own retry is skipped."""
+        self.post_tried = self.now
         self.adopt_pace_hold()
         if self.clock() < self.secondary_until:
             return  # a read met the secondary limit: writes wait it out too, as one account's
@@ -5950,6 +5987,17 @@ class Daemon:
             finally:
                 self.writing = False
             return
+
+    def post_due(self) -> None:
+        """post_between on the outbox's own clock, asked before every read request: once POST_SPACING has passed since
+        post_tick last ran, the outbox gets its turn, under every hold post_tick keeps (the pacer, the secondary limit,
+        the content pause). Between batches alone was not enough: on huge-blue 2026-11-21 15:4xZ a pass took ~95 s,
+        most of it the REST loop, which had no post_between, so posts went out ~95 s apart (0.6-0.7 a minute) while
+        writes came in at 1.15 a minute and review receipts waited up to 173 min."""
+        clock = time.time() if self.clock_real else self.now
+        if self.writing or clock - self.post_tried < POST_SPACING:
+            return
+        self.post_between()
 
     def post_between(self) -> None:
         """post_tick between read batches: a read phase can take TICK_BUDGET, far longer than POST_SPACING."""
@@ -9010,10 +9058,11 @@ class Daemon:
         statuses: dict = {}
         ids: dict = {}
         order: dict = {}  # head_data's `runs`
+        failed: dict = {}  # failed check run databaseId -> node id (head_steps)
         for n, (owner, repo, contexts) in enumerate(sources):
             prefix = f"{owner}/{repo}: " if n else ""  # the head's own checks keep their names
             for _ in range(HEAD_BATCH_MAX_CONTEXTS_PAGES):
-                fold_contexts(contexts.get("nodes"), runs, statuses, ids, prefix, order)
+                fold_contexts(contexts.get("nodes"), runs, statuses, ids, prefix, order, failed)
                 page = contexts.get("pageInfo") or {}
                 if not page.get("hasNextPage"):
                     break
@@ -9031,8 +9080,51 @@ class Daemon:
             else:
                 return f"more than {HEAD_BATCH_MAX_CONTEXTS_PAGES * 100} checks on one commit"
         for prefix, nodes in extra:  # suites whose newest attempt ran nothing (last_real_contexts), per source
-            fold_contexts(nodes, runs, statuses, ids, prefix, order)
-        return head_data(sha, runs, statuses, ids, order)
+            fold_contexts(nodes, runs, statuses, ids, prefix, order, failed)
+        data = head_data(sha, runs, statuses, ids, order)
+        self.head_steps(data, failed)
+        return data
+
+    def head_steps(self, data: dict, failed: dict[int, str], root: str | None = None) -> None:
+        """Store the step count of each failed check run of a head's `data` (attach_steps), so a reader of the store
+        judges a red as a live read does (a failed job that ran no step is the runner's refusal, not a red). A
+        completed job never changes: each is read once (self.job_steps), in GraphQL by node id (STEPS_QUERY) or, with
+        ROOT (`/repos/OWNER/REPO`, a head read over REST), one job at a time within REST_STEPS_MAX. A read that fails
+        or is out of time leaves its rows without `steps` (unknown), and the next read of the head tries again."""
+        if len(self.job_steps) > 20000:
+            self.job_steps.clear()
+        want = [i for i in failed if i not in self.job_steps]
+        if root is None:
+            want = want[:2 * STEPS_BATCH]
+            for n in range(0, len(want), STEPS_BATCH):
+                if self.mode("graphql") == "stop":
+                    break
+                chunk = {failed[i]: i for i in want[n:n + STEPS_BATCH]}
+                reason, self.gql_reason = self.gql_reason, "steps"
+                try:
+                    doc, error = self.graphql(STEPS_QUERY, {"ids": list(chunk)})
+                except OutOfTime:
+                    break
+                finally:
+                    self.gql_reason = reason
+                if doc is None:
+                    self.errors.append(f"head steps: {error}")
+                    break
+                for node in (doc.get("data") or {}).get("nodes") or []:
+                    steps = (node.get("steps") or {}).get("nodes") if isinstance(node, dict) else None
+                    if isinstance(steps, list) and node.get("id") in chunk:  # null is unknown, never "no step ran"
+                        self.job_steps[chunk[node["id"]]] = len(steps)
+        else:
+            for job_id in want[:REST_STEPS_MAX]:
+                if self.mode("rest") == "stop" or not self.rest_room(1):
+                    break
+                try:
+                    state, doc, _ = self.get(f"{root}/actions/jobs/{job_id}", None)
+                except OutOfTime:
+                    break
+                if state == "fresh" and isinstance(doc, dict) and isinstance(doc.get("steps"), list):
+                    self.job_steps[job_id] = len(doc["steps"])
+        attach_steps(data, self.job_steps)
 
     def fill_steps(self, pairs: list[tuple[dict, dict]]) -> None:
         """Name the failed steps of each failed check run. A completed check does not change, so a
@@ -9534,9 +9626,12 @@ class Daemon:
         statuses_by: dict = {}
         ids: dict = {}
         order: dict = {}  # head_data's `runs`
-        fold_contexts(rest_contexts(checks, statuses, runs, set(), workflows), found, statuses_by, ids, order=order)
-        self.store(e["key"], e["cache"], error=None, dataAt=self.now, data=head_data(sha, found, statuses_by, ids, order),
-                   restParts=parts, via="rest")
+        failed: dict = {}
+        fold_contexts(rest_contexts(checks, statuses, runs, set(), workflows), found, statuses_by, ids, order=order,
+                      failed=failed)
+        data = head_data(sha, found, statuses_by, ids, order)
+        self.head_steps(data, failed, f"/repos/{owner}/{repo}")
+        self.store(e["key"], e["cache"], error=None, dataAt=self.now, data=data, restParts=parts, via="rest")
         self.head_answered(e["key"])
 
     def fetch_comment_rest(self, e: dict) -> None:
@@ -10449,6 +10544,9 @@ LAND_MERGE_DEADLINE = 1800.0  # the shim judges the merge again before it sends 
 LAND_GH_DEADLINE = 120.0  # update-branch, rerun, pr edit, pr view
 LAND_NOTIFY_DEADLINE = 30.0
 LAND_HEAD_TIMEOUT = 300.0  # after a push-making step, how long to wait for the cache to show the new head
+# After the queue's own update-branch moved a pinned head, how long a read that does not say the new head's first
+# parent (a REST read, a lagging commit list) is waited for before the pin stops the row as it always did.
+LAND_PIN_PARENT_WAIT = 300.0
 LAND_NO_DATA_AFTER = 120.0  # an entry whose PR the cache has not read yet is judged without a pin after this
 LAND_WAIT_DEFAULT = 3600.0  # a wait whose action named no timeout
 LAND_RETRY_DEFAULT = 120.0
@@ -10698,6 +10796,11 @@ LAND_DRAFT_AGE = 90.0  # == BROKER_MAX_AGE, asserted by a test (the daemon's cyc
 LAND_STEP_CONFLICT = re.compile(r"\bmerge conflict between base and head\b"
                                 r"|\b(?:pull request|PR) has merge conflicts\b"
                                 r"|\bmerge conflicts? must be resolved\b", re.I)
+# A refusal that asks in its own words to be tried again is a queue in front of the step, not an answer about the
+# head: the broker's lane lease is held by another session, or its read Apps are busy. Those are the one family whose
+# refusals still count per class rather than per head (the sig below), so that two of them alternating keep the entry
+# waiting instead of stopping it -- glaeda#2239's router review found exactly that, and it stays true.
+LAND_STEP_RETRYABLE = re.compile(r"\btry again\b|\bis held by another session\b|\b(?:are|is) busy\b", re.I)
 LAND_STEP_CLOSED = re.compile(r"\bPR #?\d+ is closed\b|\bpull request (?:#?\d+ )?(?:is|was) (?:closed|already merged)\b"
                               r"|\bwas already merged\b|\bpull request is not open\b|\bPR is (?:closed|not open)\b",
                               re.I)
@@ -10755,6 +10858,7 @@ LAND_COMMAND_UNTIL = re.compile(r"--until[ =](green|done|required|merged)\b")
 LAND_HISTORY = 60
 LAND_KEEP = 7 * 86400  # finished entries are kept this long for `land status`
 LAND_COUNT_DAYS = 30
+LAND_HEAD_CONSUMER = "land-judge"  # the consumer a queued PR's head is registered for (land-judge's checks read)
 LAND_TOUCH = TOUCH_EVERY  # the daemon re-registers the PRs, runs and comments it waits on this often
 # Only an entry that is due (queued, past its wake, or waiting on its own push's new head) holds a waited watch on its
 # PR (LandQueue.keep_watching). Every other open entry (a wait on its checks, a retry or a park whose wake is ahead,
@@ -11168,6 +11272,72 @@ def land_tail(text: Any, limit: int = LAND_TEXT) -> str:
     return text if len(text) <= limit else "…" + text[-(limit - 1):]
 
 
+# Every read on the land path has more than one route (docs/handbook/read-with-one-quota-route.md), and a refusal
+# reports each route's outcome as its own labelled clause: head_reds tries the store, GraphQL, then REST, and raises
+# "GraphQL: <160 chars>; REST: <160 chars>; the store: <160 chars>" when the live reads both failed (leo-workspace
+# tools/land_judge/engine.py). Which route failed, and whether another could still answer, is the whole difference
+# between a GraphQL-only outage this host can read around and a GitHub-wide one it cannot -- and that verdict sits in
+# the clauses a head-cut drops first. One lane host, 2026-11-21 12:08Z: a queue park's stored reason ended "... GraphQL: gh
+# api graphql failed: ...; REST:" and stopped there, because land_trim(text, 300) landed exactly at the start of the
+# REST clause; /rate_limit read 3873 REST left for the same login at 12:07:37Z, so the park that held 26 of 27 rows
+# (4 repos, 3 lanes) for 49 min may have been a GraphQL-only failure, and no log on the host kept what REST said
+# (50,508 lines of glaeda-gh.jsonl searched, no match). So a trimmed reason spends its budget *within* the clauses:
+# every route's verdict survives, the first route's verbose stack trace is what goes.
+LAND_ROUTE_CLAUSE = re.compile(r"(?:^|(?<=; )|(?<=: )|(?<=, ))((?:the )?"
+                               r"(?:graphql|rest|store|cache|direct|upstream|broker)\s*:\s)", re.I)
+LAND_CLAUSE_MIN = 24  # a clause keeps its label and the first words of its verdict, or the budget is spent flat
+
+
+def land_route_clauses(text: str) -> list[str]:
+    """TEXT as the clauses it reports: what precedes the first route label, then one piece per route label
+    (LAND_ROUTE_CLAUSE), each without the boundary punctuation it ended on (land_reason joins them back with "; ",
+    the separator this same split reads, so trimming an already-trimmed reason keeps finding the clauses). One route
+    named, or none: [TEXT], so land_reason trims exactly as land_trim does."""
+    starts = [m.start(1) for m in LAND_ROUTE_CLAUSE.finditer(text)]
+    if len(starts) < 2:
+        return [text]
+    cuts = ([0] if starts[0] else []) + starts + [len(text)]
+    pieces = [text[a:b].rstrip(" ;,:") for a, b in zip(cuts, cuts[1:])]
+    return [p for p in pieces if p]
+
+
+def land_shares(lengths: list[int], budget: int) -> list[int]:
+    """BUDGET split over LENGTHS so that no piece is dropped whole while another keeps detail: an equal share each,
+    and a piece shorter than its share gives what it does not need back to the longer ones (one word of a route's
+    answer is worth more than another 100 characters of the first route's stack trace)."""
+    shares = [0] * len(lengths)
+    left, pending = budget, list(range(len(lengths)))
+    while pending:
+        share = left // len(pending)
+        fits = [i for i in pending if lengths[i] <= share]
+        if not fits:  # every piece still wants more than its share: split what is left, the remainder to the first
+            for n, i in enumerate(pending):
+                shares[i] = share + (1 if n < left - share * len(pending) else 0)
+            break
+        for i in fits:
+            shares[i], left = lengths[i], left - lengths[i]
+            pending.remove(i)
+    return shares
+
+
+def land_reason(text: Any, limit: int = LAND_TEXT) -> str:
+    """TEXT on one line within LIMIT characters, every route's verdict kept (LAND_ROUTE_CLAUSE's comment).
+
+    A refusal naming two or more routes is trimmed clause by clause, each with its share of the budget
+    (land_shares), so "GraphQL: ...; REST: ...; the store: ..." always shows what all three answered and detail goes
+    before a verdict does. Anything else -- one route, no route, a budget too small for every clause to keep its
+    label -- is land_trim, unchanged."""
+    one = " ".join(str(text or "").split())
+    if len(one) <= limit:
+        return one
+    pieces = land_route_clauses(one)
+    joiners = 2 * (len(pieces) - 1)  # the "; " each clause after the first is joined back on
+    if len(pieces) < 2 or limit - joiners < len(pieces) * LAND_CLAUSE_MIN:
+        return land_trim(one, limit)
+    shares = land_shares([len(p) for p in pieces], limit - joiners)
+    return "; ".join(land_trim(p, s) for p, s in zip(pieces, shares))
+
+
 def land_checks_running(data: dict, head: str) -> bool:
     """Whether the cache shows checks still running at HEAD (a pending status counts, and so does an unfinished context
     a truncated rollup counts past its first page: the wait's own answer, pending_on_every_page)."""
@@ -11294,7 +11464,7 @@ def land_fallback(answer: dict, head: str) -> dict:
     code = str(answer.get("code") or "other")
     kind = LAND_FALLBACK.get(code)
     if code in LAND_STOP_CLASSES:
-        return {"v": 1, "kind": "stop", "stop": LAND_STOP_CLASSES[code], "why": land_trim(answer.get("reason"))}
+        return {"v": 1, "kind": "stop", "stop": LAND_STOP_CLASSES[code], "why": land_reason(answer.get("reason"))}
     if kind == "update_branch":
         return {"v": 1, "kind": kind, "expected_head_sha": head}
     if kind == "wait_pr":
@@ -11564,6 +11734,7 @@ class LandQueue:
                  broker_client: Callable[[], bool] = land_broker_client,
                  snapshot_of: Callable[[str], dict | None] = read_rollup,
                  peek: Callable[[str], None] | None = None,
+                 head_watch: Callable[[str], None] | None = None,
                  reading: Callable[[str], dict | None] | None = land_budget_reading) -> None:
         self.broker_client = broker_client
         self.reading = reading  # the login's reading of a pool, to check a latch mark against (land_latch_judge)
@@ -11581,6 +11752,12 @@ class LandQueue:
         self.peek = peek or ((lambda key: register(key, reader=f"tool:{LAND_TAG}", once=True)) if watch is None
                              else self.watch)
         self.peeked: dict[str, float] = {}
+        # A queued PR's head is registered with the checks store for land-judge (head_key), so the daemon holds its
+        # checks before land-judge's first judgment asks; a test's WATCH alone records neither.
+        self.head_watch = head_watch or ((lambda key: register(key, consumer=LAND_HEAD_CONSUMER,
+                                                                reader=f"tool:{LAND_TAG}"))
+                                         if watch is None else (lambda key: None))
+        self.head_touched: dict[str, float] = {}
         self.changed_entries: set[str] = set()
         self.recovery_at = float("-inf")
         self.latch_started: float | None = None  # when the latch this pass sees began to hold (a window: hold)
@@ -11783,6 +11960,7 @@ class LandQueue:
             e.pop("pinSince", None)
         e.pop("pinWait", None)
         e.pop("pinSeen", None)
+        e.pop("pinFollow", None)  # a re-request decides its own pin: no earlier head's parent wait
         if req.get("lane"):
             e.update(lane=str(req["lane"]), laneHost=str(req.get("laneHost") or ""))
         elif "lane" in req:  # a session-less re-request of an open entry (an --after added) keeps its lane
@@ -12250,7 +12428,7 @@ class LandQueue:
                     self.queue_park_voided = (self.queue_quota_until, why)
                     log({"event": "land-queue-park-overridden", "until": utc_clock(self.queue_quota_until),
                          "why": why, "parkedAt": utc_clock(self.queue_quota_at),
-                         "reason": land_trim(self.queue_quota_reason, 160)})
+                         "reason": land_reason(self.queue_quota_reason, 160)})
                 self.clear_queue_park()
                 return False
             if self.queue_quota_until:
@@ -12268,7 +12446,7 @@ class LandQueue:
             if self.queue_quota_until >= until and self.queue_quota_until > self.now:
                 return  # a later refusal must never shorten the host-wide hold
             self.queue_quota_until = max(self.queue_quota_until, until)
-            self.queue_quota_reason = land_trim(land_redact(text), 300)
+            self.queue_quota_reason = land_reason(land_redact(text), 300)
             self.queue_quota_at = self.now
             self.queue_park_voided = None
             write_json(land_dir() / LAND_QUOTA_FILE,
@@ -12627,7 +12805,7 @@ class LandQueue:
              "latch": None if latch is None else {"pool": latch[0], "until": utc_clock(latch[1])},
              "latched": self.pass_latched, "staggered": self.pass_staggered, "capped": self.pass_capped, "due": len(due), "dueLatchHeld": held,
              "dueLate": late,
-             "queueParked": {"until": utc_clock(self.queue_quota_until), "reason": land_trim(self.queue_quota_reason, 160)}
+             "queueParked": {"until": utc_clock(self.queue_quota_until), "reason": land_reason(self.queue_quota_reason, 160)}
              if self.queue_quota_until > self.now else None,
              "oldestDue": None if oldest is None else {"pr": key_name(oldest[1]),
                                                        "waitingS": int(self.now - oldest[0]) if oldest[0] else None}})
@@ -12785,6 +12963,7 @@ class LandQueue:
         comment a wait is on stays watched and waited: that is what it waits for."""
         w = e.get("wait") or {}
         waited = self.due(e) or w.get("kind") == "head_change" or self.wake_near(e)
+        self.watch_head(e)
         keys = [e["key"]] if waited else []
         if w.get("kind") in ("run", "comment") and w.get("key"):
             keys.append(w["key"])
@@ -12801,6 +12980,22 @@ class LandQueue:
                 self.peeked[k] = self.now
                 with contextlib.suppress(OSError, WatchError):
                     self.peek(k)
+
+    def watch_head(self, e: dict) -> None:
+        """Register the PR's current head (from its cached read) with the checks store as soon as the entry is open or
+        its head moves, then every LAND_TOUCH: HEAD_INTEREST outlasts a queued PR's wait, and a head that moved is a
+        new key, registered the same pass. Land-judge's first read of a head then finds the daemon's entry."""
+        head = str(((self.cache_of(e["key"]) or {}).get("data") or {}).get("headRefOid") or "").lower()
+        if not SHA40.fullmatch(head):
+            return
+        key = f"head:{e['repo'].lower()}@{head}"
+        if self.now - self.head_touched.get(key, float("-inf")) < LAND_TOUCH:
+            return
+        self.head_touched[key] = self.now
+        if len(self.head_touched) > 2000:
+            self.head_touched = {k: t for k, t in self.head_touched.items() if self.now - t < LAND_TOUCH}
+        with contextlib.suppress(OSError, WatchError):
+            self.head_watch(key)
 
     def watch_now(self, key: str) -> None:
         self.touched[key] = self.now
@@ -12884,6 +13079,8 @@ class LandQueue:
             if head and head != w.get("before"):
                 if (e.get("lastAction") or {}).get("kind") == "update_branch":
                     e["updatedHead"] = head  # this queue's own base merge made it (update_again)
+                    if self.pin_follow(e, head, data):
+                        return  # the new head's first parent is not read yet: not judged on it
                 self.wait_running(e, head, fp) if running else self.judge(e, head, fp)
             elif woke:
                 if self.judge(e, "", fp):  # land_judge reads the head itself: the cache never showed the new one
@@ -12937,6 +13134,55 @@ class LandQueue:
             # A change alone (checks finished, mergeability computed) is not the step running its course: the same
             # refusal after it does not count toward the stop; after its timeout it does.
             self.judge(e, head, fp, counts=woke)
+
+    def pin_follow(self, e: dict, head: str, data: dict) -> bool:
+        """E's pin follows HEAD when HEAD is the merge commit this queue's own update-branch just made on top of the
+        pinned head. True while the read does not yet say HEAD's first parent, so nothing is judged on a head whose
+        provenance is unread (LAND_PIN_PARENT_WAIT bounds that wait; past it the pin stops the row as it always did).
+
+        The daemon moved the head itself: judged tip_merge, ran update_branch at the pinned head, and GitHub made a
+        merge commit, so on the next tick the head is not the pin and judge stops the row head_moved -- a refusal built
+        from a state transition the refuser performed. manaflow-ai/cmux#48445, 2026-11-21: `step exit=0 kind=
+        update_branch` at 13:05:45Z, then "the head is 5ac37fd9debf, not the --sha ae9916f4e43f it was queued for";
+        5ac37fd9debf is "Merge branch 'feat-cmux-next' into lane/base-red-16" and its first parent is ae9916f4e43f,
+        the pin. The row sat stopped until a person read the trace, read the new head from GitHub and re-queued it.
+
+        Only that commit is followed, and land_pin_merged is the whole safety argument: the new head's first parent is
+        the pin, and the update-branch was sent pinned (expected_head_sha) to that same commit. Any other head -- a
+        push, a force-push, a merge made on top of something else -- still stops head_moved, unchanged. The pin the
+        merge is made with follows too, so the pinned merge still refuses a head nobody judged."""
+        pin = str(e.get("pinSha") or "")
+        if not pin or not land_head_moved(pin, head):
+            return False  # unpinned, or the head still is the pin: nothing to follow
+        parent = str((data or {}).get("headParent") or "").lower()
+        sent = str(((e.get("updateSent") or {}).get("head")) or "").lower() or str(e.get("preStepHead") or "").lower()
+        if land_pin_merged(pin, parent, sent):
+            e["pinSha"], e["pinSince"], e["pinSeen"] = head, self.now, True
+            e.pop("pinFollow", None)
+            # The trace reads as its own safety argument: the old pin, the new head, and the first parent that matched.
+            self.history(e, "pin_followed", was=pin[:12], head=head[:12], parent=parent[:12], step="update_branch")
+            self.save(e)
+            return False
+        if parent or not SHA40.fullmatch(head):
+            e.pop("pinFollow", None)
+            return False  # a parent that is not the pin: judge's head_moved stops it, as it always did
+        # "the first parent could not be read" is not "the head moved": wait for a read that says it, then decide.
+        w = e.get("pinFollow")
+        if not isinstance(w, dict) or w.get("head") != head:
+            w = e["pinFollow"] = {"head": head, "since": self.now}
+            self.history(e, "pin_parent_wait", pin=pin[:12], head=head[:12])
+            self.nudge(e["key"])
+            self.save(e)
+            return True
+        if self.now - float(w.get("since") or 0) >= LAND_PIN_PARENT_WAIT:
+            e.pop("pinFollow", None)
+            self.history(e, "pin_parent_unread", head=head[:12])
+            return False  # no read said this head's parent in time: the pin stops the row as it always did
+        if self.now - float(w.get("nudgedAt") or 0) >= NUDGE_MIN:
+            w["nudgedAt"] = self.now
+            self.nudge(e["key"])
+            self.save(e)
+        return True
 
     def pin_wait(self, e: dict, c: dict, head: str) -> bool:
         """A land pinned with --sha/--match-head-commit (E's pinSha): True while E waits for a read of its PR made since
@@ -13008,7 +13254,7 @@ class LandQueue:
             return False
         self.stop(e, "after_stopped",
                   f"{key_name(a)}, which it lands after, stayed stopped ({st.get('code') or 'stopped'}: "
-                  f"{land_trim(st.get('reason'), 160)}) for {LAND_AFTER_STOPPED_WAIT:.0f} s",
+                  f"{land_reason(st.get('reason'), 160)}) for {LAND_AFTER_STOPPED_WAIT:.0f} s",
                   f"glaeda-gh land {key_name(a)} && glaeda-gh land {key_name(e['key'])} --after {key_name(a)}")
         return True
 
@@ -13347,7 +13593,7 @@ class LandQueue:
                     answer = doc
                     break
         if answer is None or got.returncode not in (0, 1, 3):
-            why = land_trim(got.stderr or got.stdout or f"exit {got.returncode}")
+            why = land_reason(got.stderr or got.stdout or f"exit {got.returncode}")
             return {"ok": False, "code": "explain_failed", "reason": f"land_judge explain exit {got.returncode}: {why}",
                     "next": "", "head": sha, "action": {"v": 1, "kind": "retry", "after_s": LAND_RETRY_DEFAULT}}
         if got.returncode != 0:
@@ -13364,7 +13610,7 @@ class LandQueue:
                 self.history(e, "window_capped", pool="graphql", cacheOnly="miss", next=utc_clock(nxt))
             return {"ok": False, "code": "host_cap", "head": sha, "cacheMiss": True,
                     "reason": f"not judged this window: host cap (graphql), and this host's caches could not judge it "
-                              f"({land_trim(answer.get('reason'), 200)})",
+                              f"({land_reason(answer.get('reason'), 200)})",
                     "next": f"none (judged again once the next window opens at {utc_clock(nxt)})",
                     "action": {"v": 1, "kind": "retry", "after_s": max(LAND_RETRY_DEFAULT, nxt - self.now)}}
         return answer
@@ -13436,7 +13682,7 @@ class LandQueue:
             if unmoved:
                 self.count("explain_unmoved")
             e["explain"] = {"at": self.now, "ok": bool(answer.get("ok")), "code": str(answer.get("code") or ""),
-                            "reason": land_trim(answer.get("reason")), "next": land_trim(answer.get("next")),
+                            "reason": land_reason(answer.get("reason")), "next": land_trim(answer.get("next")),
                             "head": head, "action": act, "fallback": not isinstance(answer.get("action"), dict),
                             "checks": checks}
             self.history(e, "judged", code=answer.get("code") or ("ok" if answer.get("ok") else ""),
@@ -13472,7 +13718,7 @@ class LandQueue:
                              counts):
                 self.stop(e, str(answer.get("code") or "refused"),
                           f"{LAND_RETRY_STREAK_STOP if act.get('kind') in LAND_RETRY_KINDS else LAND_STREAK_STOP} identical "
-                          f"refusals in a row: {land_trim(answer.get('reason'))}", land_trim(answer.get("next")))
+                          f"refusals in a row: {land_reason(answer.get('reason'))}", land_trim(answer.get("next")))
                 return
             self.save(e)
         self.take(e, act, answer)
@@ -13517,7 +13763,7 @@ class LandQueue:
         self.stop(e, f"{kind}_deadline",
                   f"waited {waited:.0f} s (deadline {b['deadline']:.0f} s, {b['n']} judgments{idle}) at "
                   f"{head[:12] or '?'} "
-                  f"for {LAND_WAIT_WHAT[kind]}, still {b['code'] or 'refused'}: {land_trim(answer.get('reason'))}",
+                  f"for {LAND_WAIT_WHAT[kind]}, still {b['code'] or 'refused'}: {land_reason(answer.get('reason'))}",
                   land_trim(answer.get("next")))
         return True
 
@@ -13544,7 +13790,7 @@ class LandQueue:
         left = land_unfinished(data, self.now) if fp else ""
         self.stop(e, "checks_stuck", f"no check at {head[:12]} moved in {idle / 3600:.1f} h of waits ({code}, "
                   f"{w['count']} refusals naming a wait); still unfinished: {left or 'none the cache shows'}; "
-                  f"{land_trim(reason, 200)}", land_trim(nxt))
+                  f"{land_reason(reason, 200)}", land_trim(nxt))
         return True
 
     def claim(self, e: dict, kind: str, **args: Any) -> None:
@@ -13591,7 +13837,7 @@ class LandQueue:
             if cls in LAND_HOLD_CLAIM_STOPS and self.review_hold_claim(e, head, answer):
                 return
             with self.lock:
-                self.stop(e, cls, land_trim(why), land_trim(nxt or answer.get("next")))
+                self.stop(e, cls, land_reason(why), land_trim(nxt or answer.get("next")))
             return
         if kind == "merge":
             sha = str(act.get("sha") or head).lower()
@@ -13639,7 +13885,7 @@ class LandQueue:
                 if capped:
                     self.stop(e, "rerun_failed_cap",
                               f"run {', '.join(map(str, capped))} was rerun {LAND_RERUN_CAP} times at {head[:12]} and "
-                              f"is still cancelled: {land_trim(answer.get('reason'))}",
+                              f"is still cancelled: {land_reason(answer.get('reason'))}",
                               f"gh run view {capped[0]} -R {repo}")
                     return
                 for r in runs:  # counted before the send: a restart mid-send counts it
@@ -13960,9 +14206,23 @@ class LandQueue:
             self.wait(e, {"kind": "retry", "why": f"{kind} at {head[:12]} transient ({cls}): backoff {after:.0f} s"},
                       after)
             return None
-        # An update-branch's refusals count per head whatever their words: the judgment's streak no longer bounds them
-        # (LAND_UPDATE_ONCE), so a refusal whose text varies must not restart the count.
-        sig = f"{kind}|{head}" if kind == "update_branch" else f"{kind}|{head}|{cls}"
+        # Every kind's refusals count per head whatever their words: the judgment's streak no longer bounds them
+        # (LAND_UPDATE_ONCE), so a refusal whose text varies must not restart the count. The rule was written for
+        # update_branch and is not special to it -- what reaches here is a non-transient refusal at a head that has
+        # not moved (a timeout or 5xx is counted above and never lands here; draft, conflict and closed are answered
+        # above), and no wording of such a refusal is progress. Keying the count on land_step_class as well let two
+        # classes alternating at one head reset each other, so neither ever reached LAND_STEP_STOP.
+        # efficiency-standing-lane, 2026-11-21: teamleaderleo/glaeda#2320 sat at 5f640aea6348 taking 13 merge calls,
+        # each after its own full judgment, over 2h20m -- the designed bound is 6. Its refusals alternated "To have
+        # the pull request merged after all the requirements have been met, add the `--auto` flag." (11 of them) with
+        # "GraphQL: Pull Request has merge conflicts (mergePullRequest)" (2), and each conflict refusal restarted the
+        # --auto count from n=1: the n sequence read 1,2, 1, 1,2,3, 1, 1,2,3,4,5,6. Seven of the thirteen merge calls
+        # and their judgments bought nothing a prior one had not already answered.
+        # The exception is a refusal that asks in its own words to be tried again (LAND_STEP_RETRYABLE): a held lease
+        # or a busy broker App is a queue in front of this step, not an answer about the head, and alternating ones
+        # must keep the entry waiting rather than stop it (glaeda#2239's router review). Those keep a count of their
+        # own class, as every refusal here used to.
+        sig = f"{kind}|{head}|{cls}" if LAND_STEP_RETRYABLE.search(out) else f"{kind}|{head}"
         named = land_step_named(out)
         if named and named["kind"] == "wait_pr":
             # Its next is a wait on the checks: taken, never counted toward LAND_STEP_STOP (LAND_WAIT_STUCK bounds it).
@@ -13978,9 +14238,20 @@ class LandQueue:
         e["stepFail"] = {"sig": sig, "kind": kind, "head": head, "class": cls, "count": n, "at": self.now}
         self.history(e, "step_refused", kind=kind, head=head[:12], why=cls, n=n)
         if n >= LAND_STEP_STOP:
+            # A stop with an empty `next:` ends nobody's hold: the row sits until a person happens to read it. The
+            # refusal's own words are the next step when it names a step this queue runs; when it names none, the
+            # step that can end this hold is still nameable -- read what GitHub still requires at this head, clear
+            # it, and re-land pinned to whatever head that leaves. glaeda#2320's stop carried "" for 95 min.
+            # `--admin` is never the step: routing around a refused merge is forbidden (the rulebook's Safety rule),
+            # and GitHub's own `--auto` hint is not it either -- auto-merge would merge it later unattended, which
+            # is the opposite of handing the row back to its requester.
+            name = key_name(e["key"])
             self.stop(e, f"{kind}_refused", f"the {kind} land_judge named was refused {n} times in a row at "
-                      f"{head[:12]} ({cls}): {land_trim(land_tail(out), 300)}",
-                      land_trim(land_tail(out), 200) if named else "")
+                      f"{head[:12]} (last: {cls}): {land_trim(land_tail(out), 300)}",
+                      land_trim(land_tail(out), 200) if named
+                      else (f"read what GitHub still requires at this head and clear it (a review, a required "
+                            f"check, a branch rule -- never --admin): glaeda-gh status pr {name}; then re-land it "
+                            f"pinned: glaeda-gh land {name} --match-head-commit <its 40-hex head then>"))
             return None
         if named and named["kind"] == "update_branch" and kind != "update_branch":
             self.history(e, "refusal_named", step="update_branch")
@@ -14307,12 +14578,12 @@ class LandQueue:
     def stop(self, e: dict, code: str, reason: str, nxt: str) -> None:
         self.check(e)
         e.update(state="stopped", wait=None, wakeAt=None, action=None,
-                 stop={"code": code, "reason": land_trim(reason), "next": land_trim(nxt), "at": self.now})
+                 stop={"code": code, "reason": land_reason(reason), "next": land_trim(nxt), "at": self.now})
         for held in ("parkedSince", "cappedSince", "heldFor", "latchHeld"):  # a stopped entry is held by nothing
             e.pop(held, None)
-        self.history(e, "stopped", code=code, reason=land_trim(reason, 160))
+        self.history(e, "stopped", code=code, reason=land_reason(reason, 160))
         self.save(e)
-        msg = f"glaeda land: {self.url(e)} stopped: {code}: {land_trim(reason, 300)}"
+        msg = f"glaeda land: {self.url(e)} stopped: {code}: {land_reason(reason, 300)}"
         if nxt:
             msg += f" next: {land_trim(nxt, 300)}"
         self.notify(e, e.get("requester") or "", msg)
@@ -14458,6 +14729,20 @@ def land_head_moved(pin: str, head: str) -> bool:
     return bool(pin and head) and not head.lower().startswith(pin)
 
 
+def land_pin_merged(pin: str, parent: str, sent: str) -> bool:
+    """True when a new head is safe for E's pin to follow: PARENT, the new head's first parent, is the pinned PIN, and
+    SENT, the head the queue's own update-branch was pinned to (expected_head_sha), is that same commit. GitHub makes
+    update-branch a merge commit on the head branch whose first parent is the branch tip it was pinned to, so a first
+    parent that is the pin proves the pinned content is still exactly what is being merged, with only the base added.
+    Anything else -- a push, a force-push, an unrelated commit, a merge made on top of something else -- is False, and
+    the pin stops the row (head_moved) as it always did. An empty PARENT (a read that does not say) is False: a parent
+    that could not be read is not a parent that matched."""
+    # bool(parent) and bool(sent) are load-bearing: land_head_moved("pin", "") is False (an unread head has not
+    # moved), so without them a read that said no parent at all would read as a parent that matched.
+    return (bool(pin) and bool(parent) and not land_head_moved(pin, parent)
+            and bool(sent) and not land_head_moved(pin, sent))
+
+
 def land_request_lane(req: dict) -> tuple[str, str] | None:
     """A request's (lane, laneHost) as land_request takes it, or None when it records none (an older sender's)."""
     if "lane" not in req:
@@ -14547,10 +14832,10 @@ def land_line(e: dict, now: float, latch: Any = LAND_LATCH_READ, queue: dict | N
         bits.append(f"merge {e['mergeSha'][:12]}")
     if e["state"] == "stopped":
         st = e.get("stop") or {}
-        bits.append(f"{st.get('code')}: {land_trim(st.get('reason'), 160)}")
+        bits.append(f"{st.get('code')}: {land_reason(st.get('reason'), 160)}")
     elif (e.get("explain") or {}).get("code") == "explain_failed":
         # land_judge itself failed (a crash, a bad python): its words, or the line reads like a quota wait.
-        bits.append(f"explain_failed: {land_trim(e['explain'].get('reason'), 160)}")
+        bits.append(f"explain_failed: {land_reason(e['explain'].get('reason'), 160)}")
     if e.get("requester"):
         bits.append(f"for {e['requester']}")
     o = e.get("override")
@@ -14677,7 +14962,7 @@ def cmd_land_status(target: str | None, as_json: bool) -> int:
     if queue:
         print(f"glaeda land: the whole queue is parked until {utc_clock(float(queue['until']))} (quota): no entry is "
               f"judged before it; a PR the cache shows merged or closed still leaves. reason: "
-              f"{land_trim(queue.get('reason'), 200)}")
+              f"{land_reason(queue.get('reason'), 200)}")
     for e in entries:
         print(land_line(e, now, latch, queue))
         if target:
@@ -14764,7 +15049,7 @@ def cmd_land_forwarded(executor: list[str], target: str, after: list[str], reque
             if out.get("ok") or out.get("code") in LAND_REQUEST_REFUSED:
                 staged.unlink(missing_ok=True)  # taken (or refused for good, and said so below)
             else:
-                why = f"{name}: {land_trim(out.get('reason') or out.get('code'), 200)}"
+                why = f"{name}: {land_reason(out.get('reason') or out.get('code'), 200)}"
         if not why:
             if out.get("code") in LAND_REQUEST_REFUSED:
                 # A request-time refusal, not a queued land: the human line is the refusal and its step, never
@@ -14801,13 +15086,55 @@ def land_queued_by() -> str:
 # "cannot read OWNER/REPO#N's head to check --match-head-commit" while the PR it pinned was green.
 
 
-def check_land_pin(repo: str, number: int, pin: str | None) -> None:
-    """`land --match-head-commit SHA` (gh pr merge's own pin, which agents type): only its shape is checked here, so a
-    land is queued whatever the quota; a head other than SHA stops it later (head_moved) and the pinned merge refuses
-    it, so a land never takes a push that came after the one the caller judged. REPO and NUMBER are unused: no read."""
-    del repo, number
+def land_pin_is_another_checkouts_head(repo: str, pin: str, git: Callable[[list[str]], str | None] | None = None) -> str:
+    """Why PIN cannot be REPO's head: it is the HEAD of the directory the caller ran in, and that directory is a
+    checkout of another repository. "" when it is not that, which is every other case. No GitHub read, two local git
+    calls, and only when a pin was passed.
+
+    The guidance for pinning is `--match-head-commit $(git rev-parse HEAD)`, and a lane working in one repository's
+    worktree while landing another's PR (a leo-workspace worktree landing a cmux PR) resolves it against the wrong
+    checkout: the land is pinned to a sha the target repository does not have, and stops later reading as head
+    movement. The right source when the cwd is not the target's checkout is a GitHub read, which this names."""
+    def real(args: list[str]) -> str | None:
+        try:
+            got = run_bounded(["git", *args], 5)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return got.stdout.strip() if got.returncode == 0 else None
+    git = git or real
+    here = cwd_repo()
+    if not here or here.lower() == repo.lower():
+        return ""  # not a checkout, or the target's own checkout, where HEAD is a fair source
+    head = str(git(["rev-parse", "HEAD"]) or "").lower()
+    if not SHA40.fullmatch(head) or land_head_moved(pin.lower(), head):
+        return ""
+    return (f"--match-head-commit {pin[:12]} is the HEAD of {os.getcwd()}, a checkout of {here}, not of {repo}: "
+            f"{repo} has no such commit, so the land would stop later for a reason that reads like a push")
+
+
+def check_land_pin_shape(pin: str | None) -> None:
+    """`land --match-head-commit SHA`'s shape alone, which costs nothing: no read of any kind, local or remote. A
+    request this host can answer from its cache (land_draft_refusal) is answered after this and before
+    check_land_pin, so such an answer spends no git call either -- what that test asserts by banning every
+    subprocess."""
     if pin and not re.fullmatch(r"[0-9a-fA-F]{7,40}", pin):
         raise WatchError(f"--match-head-commit takes a commit SHA, not {pin!r}")
+
+
+def check_land_pin(repo: str, number: int, pin: str | None,
+                   git: Callable[[list[str]], str | None] | None = None) -> None:
+    """`land --match-head-commit SHA` (gh pr merge's own pin, which agents type): its shape, and the one wrong source
+    that is free to detect (land_pin_is_another_checkouts_head). No head read, so a land is queued whatever the quota;
+    a head other than SHA stops it later (head_moved) and the pinned merge refuses it, so a land never takes a push
+    that came after the one the caller judged.
+
+    Two local git calls, so a caller that may still refuse from its cache runs check_land_pin_shape first and this
+    only for a request it is about to queue."""
+    check_land_pin_shape(pin)
+    why = land_pin_is_another_checkouts_head(repo, pin, git) if pin else ""
+    if why:
+        raise WatchError(f"{why}\nnext: glaeda-gh gh api repos/{repo}/pulls/{number} --jq .head.sha, "
+                         f"then glaeda-gh land {repo}#{number} --match-head-commit THAT")
 
 
 # The codes a land *request* answers with instead of queuing anything: a forwarded request carries them back from
@@ -14849,7 +15176,7 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
     executor stops (head_moved) if a read shows another head, and the pinned merge refuses one it did not see. OVERRIDE (land_override) rides every merge
     try."""
     key, repo, number = land_key(target)
-    check_land_pin(repo, number, pin)
+    check_land_pin_shape(pin)
     sha = land_pin_sha(pin)
     for a in after:
         land_key(a)
@@ -14864,6 +15191,9 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
         else:
             say_waiting(f"glaeda land: refused: {why}\nnext: {nxt}")
         return EXIT_FAIL
+    # The pin's source is checked here, not above: its two local git calls belong to a request that will be queued,
+    # not to one this host already answered from its cache.
+    check_land_pin(repo, number, pin)
     requester, source = land_requester_from(notify)
     executor = land_executor()
     if executor is not None:
@@ -17592,6 +17922,9 @@ def say_daemon_problem(code: str, message: str, as_json: bool) -> None:
         print_json_error(code, (text or message).removeprefix("glaeda-gh: "), nxt or "glaeda-gh restart")
 
 
+STATUS_DIRECT_MAX = 5  # direct reads one `status` makes for keys the daemon has not read when its wait ends
+
+
 def cmd_status(kind: str, target: str | list[str], jobs: bool, as_json: bool, first_wait: float | None = None,
                fields: list[str] | None = None) -> int:
     """One look at one or more PRs, runs or comment threads. Several targets are registered together
@@ -17623,6 +17956,22 @@ def cmd_status(kind: str, target: str | list[str], jobs: bool, as_json: bool, fi
     while any(unready(e) for e in entries.values()) and time.monotonic() < deadline:
         time.sleep(1)
         entries = {key: entry if not unready(entry) else read_cache(key) for key, entry in entries.items()}
+    # A key the daemon still has not read (an upstream-fed host asks its upstream for a new key only every
+    # UPSTREAM_NEW, and the upstream may take a cycle or more) gets the one direct read `wait` gives a starved
+    # target, under the same refusals (spent bucket, daemon stop, no login): a PR nobody watches yet is
+    # answered, not "no data yet" after a full cycle. Bounded: STATUS_DIRECT_MAX reads, each DIRECT_READ_BUDGET.
+    began = time.time()
+    for key in [k for k in keys if unready(entries[k]) and split_key(k)[0] in ("pr", "run")][:STATUS_DIRECT_MAX]:
+        kind = split_key(key)[0]
+        blocked = blocked_now(kind)
+        if blocked is not None and blocked.get("exhausted") and blocked["routed"] == blocked["bucket"]:
+            say_waiting(f"glaeda-gh: not reading {key_name(key)} directly: {blocked['text']}.")
+            continue
+        say_waiting(f"glaeda-gh: the daemon has not read {key_name(key)} yet; reading GitHub directly once.")
+        error = direct_read({"key": key, "kind": kind, "jobs": jobs, "began": began})
+        if error:
+            say_waiting(f"glaeda-gh: direct read failed: {error}.")
+        entries[key] = read_cache(key)
     outcomes = {key: status_outcome(key, entries[key]) for key in keys}
     if fields is not None:
         sys.stdout.write(render_fields(keys, entries, fields))
@@ -19693,6 +20042,8 @@ def hhmm(epoch: Any) -> str:
 
 
 POOL_NAMES = {"rest": "REST", "graphql": "GraphQL"}
+# Where settle_counters keeps each bucket's live counters; rest_counters(budget, key) reads them.
+COUNTER_KEYS = {"rest": "restCounters", "graphql": "graphqlCounters"}
 
 
 def view_lines(view: dict) -> list[str]:
@@ -19929,9 +20280,17 @@ def cmd_budget(as_json: bool, fleet: bool = False) -> int:
             rate = (status.get("perMinute") or {}).get(bucket)
             spend = f", {rate}/min to spend until then" if isinstance(rate, (int, float)) and rate >= 0 else ""
             print(f"{bucket:<8} {b.get('remaining')}/{b.get('limit')} left, resets {when}{spend}, seen {age(b.get('seenAt'))}")
-            counters = [c for c in rest_counters(budget) if c["reset"] > time.time()] if bucket == "rest" else []
+            # Both buckets answer from two counters with their own windows (settle_counters), and GET /rate_limit
+            # reports only one of them, so a reader who cross-checks this line against /rate_limit can see a rich
+            # counter while the one their reads actually spend is at zero -- 2026-11-21: `budget` said GraphQL 0 left
+            # resetting 11:38Z while /rate_limit said 4751 left resetting 12:02Z, and four parked waits were stopped
+            # as "stale" on the strength of it. Both were true. Name every live counter for GraphQL too, so the split
+            # is visible here instead of looking like a disagreement between two tools.
+            counters = [c for c in rest_counters(budget, COUNTER_KEYS[bucket]) if c["reset"] > time.time()]
             if len(counters) > 1:
-                print("         core counters (the poorest is the one above): " + "; ".join(
+                label = "core" if bucket == "rest" else POOL_NAMES[bucket]
+                print(f"         {label} counters (the poorest is the one above, and the one a read is refused "
+                      f"against): " + "; ".join(
                     f"{c['remaining']}/{c.get('limit')} until "
                     f"{dt.datetime.fromtimestamp(c['reset'], dt.timezone.utc).strftime('%H:%M:%SZ')}" for c in counters))
         paths, reads = status.get("paths"), status.get("reads")
@@ -25207,6 +25566,92 @@ class Parser(argparse.ArgumentParser):
             print_json_error("usage", message + (f" ({spellings})" if spellings else ""), nxt)
         raise SystemExit(64)
 
+    def _get_value(self, action, arg_string):  # type: ignore[override]
+        """Every choice argument here (`--until`, `--event`, `--state`, a kind) takes a synonym or a typo of
+        one choice as that choice, and says on stderr which it ran. Leo, 2026-11-20: "Like we need a bunch of
+        synonyms for code for you guys where it just goes \"eh close enough\" and works" -- `wait --until
+        checks-done` ended two background merge jobs at once. A value as close to two choices is refused."""
+        value = super()._get_value(action, arg_string)
+        choices = action.choices
+        if (not isinstance(value, str) or not isinstance(choices, (tuple, list))
+                or not all(isinstance(c, str) for c in choices) or value in choices):
+            return value
+        meant, near = close_choice(value, choices)
+        if meant:
+            name = action.option_strings[0] if action.option_strings else (action.metavar or action.dest)
+            say_waiting(f"glaeda-gh: {name} `{value}` ran as `{meant}` (choices: {', '.join(choices)})")
+            return meant
+        if len(near) > 1:
+            shown = ", ".join(map(repr, choices))
+            raise argparse.ArgumentError(action, f"invalid choice: {value!r} (choose from {shown}; "
+                                                 f"as close to {' as to '.join(near)}: say which)")
+        return value  # argparse's own refusal follows, with the choices
+
+
+# What agents type for a choice, by the choice it means. One table for every choice argument: a word here is
+# used only where its choice is one of the argument's choices (`merge` is `--until merged` and `--state merged`).
+CHOICE_SYNONYMS = {
+    "done": ("checks-done", "checks", "complete", "completed", "finished", "finish", "all-done", "settled",
+             "terminal", "ended", "end", "over", "checks-finished", "checks-complete", "ci-done"),
+    "green": ("pass", "passed", "passing", "passes", "success", "succeeded", "successful", "ok", "okay",
+              "all-green", "checks-green", "checks-pass", "checks-passed", "ci-green", "good"),
+    "required": ("req", "required-checks", "requires", "require", "must", "needed", "mandatory",
+                 "required-green"),
+    "merged": ("merge", "landed", "land", "merges"),
+    "request-changes": ("request_changes", "changes", "changes-requested", "reject", "rejected", "block"),
+    "approve": ("approved", "approval", "lgtm", "accept"),
+    "all": ("any", "every", "both"),
+    "closed": ("close", "shut"),
+    "open": ("opened", "active"),
+    "prs": ("pr", "pulls", "pull-requests", "pull"),
+    "issues": ("issue",),
+}
+CHOICE_WORD = re.compile(r"[A-Za-z][\w-]*")
+
+
+def typo_distance(a: str, b: str) -> int:
+    """Edits between two words, a swap of two neighbours counting one (optimal string alignment)."""
+    prev2: list[int] = []
+    prev = list(range(len(b) + 1))
+    for i in range(1, len(a) + 1):
+        cur = [i] + [0] * len(b)
+        for j in range(1, len(b) + 1):
+            cost = a[i - 1] != b[j - 1]
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+            if i > 1 and j > 1 and a[i - 1] == b[j - 2] and a[i - 2] == b[j - 1]:
+                cur[j] = min(cur[j], prev2[j - 2] + 1)
+        prev2, prev = prev, cur
+    return prev[len(b)]
+
+
+def close_choice(value: str, choices) -> tuple[str, list[str]]:
+    """(the one choice VALUE means, "") or ("", the choices it is equally close to). In order: the choice in
+    another case or with `_` for `-`; a synonym; the start of one word (3 letters at least); one typo (two in a
+    word of 6 letters or more) away from a choice or a synonym. A value as near to two choices means neither."""
+    word = value.strip().lower().replace("_", "-")
+    if not CHOICE_WORD.fullmatch(word):
+        return "", []  # a target (o/r#5, pr:o/r#5) in a choice's place is another mistake: argparse names it
+    spellings = [(c.lower(), c) for c in choices]
+    spellings += [(s, c) for c in choices for s in CHOICE_SYNONYMS.get(c, ())]
+    for test in (lambda s: s == word,
+                 lambda s: len(word) >= 3 and s.startswith(word)):
+        hit = sorted({c for s, c in spellings if test(s)}, key=list(choices).index)
+        if len(hit) == 1:
+            return hit[0], []
+        if hit:
+            return "", hit
+    allowed = 1 if len(word) <= 5 else 2
+    best: dict[str, int] = {}
+    for s, c in spellings:
+        d = typo_distance(word, s)
+        if d <= allowed:
+            best[c] = min(d, best.get(c, d))
+    if not best:
+        return "", []
+    least = min(best.values())
+    near = [c for c in choices if best.get(c) == least]
+    return (near[0], []) if len(near) == 1 else ("", near)
+
 
 KIND_CHOICE = re.compile(r"argument kind: invalid choice: '([^']*)'")
 EXTRA_ARGS = re.compile(r"unrecognized arguments: (.+)$")
@@ -25242,7 +25687,7 @@ def kind_spellings(message: str) -> str:
     that a separator was the problem. argparse's own line ("invalid choice: 'pr:o/r/7241'") lists the kinds
     and nothing else, which reads as "pr is not a kind" when the kind was there all along."""
     bad = KIND_CHOICE.search(message)
-    if not bad:
+    if not bad or ": say which)" in message:  # a plain word as close to two kinds (close_choice): no target shape
         return ""
     split = split_kind_prefix(bad.group(1))
     if split:  # a kind this *command* does not take (`status file:/x`); the ones it takes already ran
@@ -25489,7 +25934,8 @@ def parser() -> argparse.ArgumentParser:
             until.add_argument("--until", choices=("green", "done", "required", "merged"), default="green",
                            help="PRs: green (every check passes; fail fast), done (every check finished), "
                                 "required (only the checks GitHub requires decide; fail fast) or merged; "
-                                "all but merged exit 4 once the PR conflicts with its base")
+                                "all but merged exit 4 once the PR conflicts with its base. A synonym or a typo "
+                                "of one (checks-done, passed, merge) runs as it, said on stderr")
             for word in ("green", "done", "required", "merged"):
                 until.add_argument(f"--{word}", dest="until", action=ShorthandFlag, nargs=0, const=word,
                                    canonical="`--until {}`", help=f"the same as --until {word}")
@@ -25740,6 +26186,169 @@ def land_notify_synonym(raw: list[str]) -> list[str]:
     return raw
 
 
+# The words every command takes in its first command slot, read off the parser itself so this table cannot
+# drift from the commands that exist. Two spellings of the same thing in argparse: `log` nests real
+# subparsers (`log job`), while `status`, `wait`, `post` and `search` spell their one dispatch word as the
+# `choices` of a first positional (`post comment`). Both are a word the caller must put *after* a command,
+# and getting that nesting wrong is the mistake this routes.
+_NESTING: tuple[frozenset[str], dict[str, list[str]]] | None = None
+
+
+def first_slot_words(p: argparse.ArgumentParser) -> list[str]:
+    """Every word P takes in its first command slot: a nested subparser's names, or the choices of its first
+    positional. The first such slot only -- a later positional (`log search PATTERN`) is data, not a word."""
+    for action in p._actions:  # noqa: SLF001  argparse has no public reader for this
+        if isinstance(action, argparse._SubParsersAction):  # noqa: SLF001
+            return [name for name in action.choices if isinstance(name, str)]
+        if not action.option_strings and action.choices:
+            return [c for c in action.choices if isinstance(c, str)]
+    return []
+
+
+def child_parser(parent: argparse.ArgumentParser, word: str) -> argparse.ArgumentParser:
+    """The parser that owns the options of `PARENT WORD`: the nested subparser when there is one, else PARENT
+    itself (a `choices` word is parsed by its own parent)."""
+    for action in parent._actions:  # noqa: SLF001
+        if isinstance(action, argparse._SubParsersAction) and word in action.choices:  # noqa: SLF001
+            return action.choices[word]
+    return parent
+
+
+def nesting_table() -> tuple[frozenset[str], dict[str, list[str]]]:
+    """(the top-level commands, each deeper word -> the commands that take it), walked off `parser()` once.
+    Built lazily and kept: only a call whose first word is no command pays for it."""
+    global _NESTING
+    if _NESTING is None:
+        top: dict[str, argparse.ArgumentParser] = {}
+        for action in parser()._actions:  # noqa: SLF001
+            if isinstance(action, argparse._SubParsersAction):  # noqa: SLF001
+                top = {name: sub for name, sub in action.choices.items() if isinstance(name, str)}
+                break
+        table: dict[str, list[str]] = {}
+        for name, sub in top.items():
+            for word in first_slot_words(sub):
+                table.setdefault(word, []).append(name)
+        _NESTING = (frozenset(top), table)
+    return _NESTING
+
+
+def normalized_flag(word: str) -> str:
+    """WORD as a spelling-insensitive key: lowercased with every `-` and `_` dropped, so `--body-file`,
+    `--body_file` and `--bodyFile` are one key and `--body` stays a different one."""
+    return word.lower().replace("-", "").replace("_", "")
+
+
+def parser_options(p: argparse.ArgumentParser) -> dict[str, bool]:
+    """P's long options -> whether each takes a value, for reading a flag's spelling and skipping its value."""
+    out: dict[str, bool] = {}
+    for action in p._actions:  # noqa: SLF001
+        for option in action.option_strings:
+            if option.startswith("--"):
+                out[option] = action.nargs != 0
+    return out
+
+
+def flag_options(raw: list[str]) -> dict[str, bool]:
+    """The long options the command in RAW accepts, the top-level ones included."""
+    tops, _ = nesting_table()
+    top = parser()
+    options = parser_options(top)
+    if not raw or raw[0] not in tops:
+        return options
+    node = child_parser(top, raw[0])
+    options.update(parser_options(node))
+    deeper = [w for w in raw[1:] if not w.startswith("-")]
+    if deeper:
+        nested = child_parser(node, deeper[0])
+        if nested is not node:
+            options.update(parser_options(nested))
+    return options
+
+
+def nesting_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
+    """A command word typed at the wrong nesting level, routed to where it lives: (argv, refusal lines).
+
+    `glaeda-gh comment o/r#1` named the right concept and missed only that it lives under `post`; measured
+    2026-11-21 it cost argparse's "invalid choice: 'comment'" and a round trip to --help. A word that exactly
+    one command takes is rewritten to that command's spelling, said on stderr like the other synonyms.
+
+    A word more than one command takes is *refused*, never guessed: `comment`, `pr` and `run` are each a word
+    of `status` (a read), `wait` (a read that blocks) and/or `post` (a write), and picking for the caller
+    would pick between reading and writing. The refusal names every command that takes the word, each as a
+    line that runs. The one narrowing done is the caller's own evidence: when the flags typed fit exactly one
+    of those commands (`comment o/r#1 --body hi` has `--body`, which only `post` has), that is the one."""
+    if not raw or raw[0].startswith("-") or raw[0] in ("gh", "coord-alert", "wait-resume"):
+        return raw, []
+    tops, table = nesting_table()
+    word = raw[0]
+    if word in tops or word not in table:
+        return raw, []  # a real command, or no command's word at all: argparse rules on it as it always has
+    parents = sorted(table[word])
+    typed = {normalized_flag(w.split("=", 1)[0]) for w in raw[1:] if w.startswith("--") and w != "--"}
+    if len(parents) > 1 and typed:
+        fits = [p for p in parents
+                if typed <= {normalized_flag(o) for o in flag_options([p, word])}]
+        if len(fits) == 1:
+            parents = fits
+    if len(parents) > 1:
+        refusal = [f"glaeda-gh: `{word}` is a word of {len(parents)} commands "
+                   f"({', '.join(f'{p} {word}' for p in parents)}), not a command of its own, and which one "
+                   f"you meant decides whether this reads or writes: it is not guessed"]
+        refusal += [f"next: {' '.join(['glaeda-gh', p, word] + raw[1:])}" for p in parents]
+        return raw, refusal
+    fixed = [parents[0], word] + raw[1:]
+    print(f"glaeda-gh: read as `{' '.join(['glaeda-gh'] + fixed)}` "
+          f"(`{word}` is a word of `{parents[0]}`, not a command of its own)", file=sys.stderr)
+    return fixed, []
+
+
+def flag_spelling_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
+    """A long flag typed in another of its own case conventions, as this tool spells it: (argv, refusal lines).
+
+    snake_case, camelCase and kebab-case of one of this command's options all name that option
+    (`--body_file`, `--bodyFile`, `--body-file`), said on stderr so the next call is typed the canonical way.
+    Only an *exact* match after normalising decides: nothing is matched by prefix or by substring, so
+    `--file` is left for argparse, never read as `--body-file`, and `--body` and `--body-file` stay the two
+    separate options they are. A spelling two real options would both answer to is refused, naming both."""
+    if not raw or raw[0] in ("gh", "coord-alert", "wait-resume"):
+        return raw, []
+    options = flag_options(raw)
+    by_key: dict[str, list[str]] = {}
+    for option in options:
+        by_key.setdefault(normalized_flag(option), []).append(option)
+    fixed: list[str] = list(raw)
+    said: list[str] = []
+    i = 0
+    while i < len(fixed):
+        word = fixed[i]
+        if word == "--":
+            break  # nothing past a bare -- is this tool's own flag
+        if not word.startswith("--"):
+            i += 1
+            continue
+        name, joined, value = word.partition("=")
+        if name in options:
+            # Canonical already. A flag that takes its value in the next word consumes it: that word is data
+            # (a body, a regular expression, a path) and no spelling of this tool's flags.
+            i += 2 if options[name] and not joined else 1
+            continue
+        matches = sorted(set(by_key.get(normalized_flag(name), [])))
+        if len(matches) > 1:
+            return raw, [
+                f"glaeda-gh: `{name}` is how {len(matches)} different options of this command are spelled "
+                f"({', '.join(matches)}), and they do not mean the same thing: it is not guessed",
+                *(f"next: {' '.join(['glaeda-gh'] + fixed[:i] + [m + (joined + value)] + fixed[i + 1:])}"
+                  for m in matches)]
+        if len(matches) == 1:
+            fixed[i] = matches[0] + joined + value
+            said.append(f"`{name}` is `{matches[0]}`")
+            i += 2 if options[matches[0]] and not joined else 1
+            continue
+        i += 1  # no option of this command spells that way: argparse refuses it, with its own abbreviations
+    if said:
+        print(f"glaeda-gh: read as `{' '.join(['glaeda-gh'] + fixed)}` ({'; '.join(said)})", file=sys.stderr)
+    return fixed, []
+
 def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     if raw[:1] == ["search"] and len(raw) > 1 and raw[1].lower() in SEARCH_UNSERVED:
@@ -25773,6 +26382,13 @@ def main(argv: list[str] | None = None) -> int:
             return 64
         except KeyboardInterrupt:
             return 130
+    for rewriter in (nesting_synonym, flag_spelling_synonym):
+        # The nesting first, then the flags: which options a command has depends on which command it is.
+        raw, refusal = rewriter(raw)
+        if refusal:
+            for line in refusal:
+                print(line, file=sys.stderr)
+            return 64
     raw, inferred = infer_kind(raw)
     if inferred:
         print(inferred, file=sys.stderr)

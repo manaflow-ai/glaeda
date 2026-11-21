@@ -6,8 +6,18 @@
       "every_s": 600,
       "sha256": "60f6a862595a1189f950dbd0ddfd1938ac5ff1dff049a8f52673bd3c63ee210e",
       "source": {
-        "commit": "1b0be378bf03adb455d38b31bb2b996f1f32093d",
+        "commit": "3c43fd912e9a323f5d926207d205f634b9ac7c4f",
         "path": "build-fleet/mini-ops/ops/console-unlock-guard.sh",
+        "repository": "manaflow-ai/cmuxterm-hq"
+      }
+    },
+    "seed-root": {
+      "body": "#!/bin/bash\n# Installed by build-fleet/mini-ops/ops/seed-root.sh. Keeps the CI seed root in place; see that file.\n# usage: seed-root [--dry-run]    (no argument: apply, as the daemon does)\nset -u\ndry=0\n[ \"${1:-}\" = --dry-run ] && dry=1\nh=$(hostname -s)\nbase=${SEED_ROOT_BASE:-/Users/runner/_work}\nleaf=cm\"\"ux   # spelled apart: a published body names no fleet login (fleet_ops_test)\nseed=$base/$leaf\nmarker=$seed/.cmux-seed-root\nfleet=${SEED_ROOT_FLEET_DIR:-/Users/Shared/cmux-build-fleet}\n\nsay() { echo \"$h: $*\"; }\nfail() { say \"skip ($*)\"; exit 1; }\nowner_of() { ls -ld \"$1\" | awk '{print $3}'; }\nreal_user() { [ -n \"${1:-}\" ] && [ \"$1\" != root ] && id -u \"$1\" >/dev/null 2>&1; }\n\nuser=${SEED_ROOT_USER:-}\nfor src in \"$base\" \"$fleet\"; do\n  real_user \"$user\" && break\n  [ -d \"$src\" ] && user=$(owner_of \"$src\")\ndone\nreal_user \"$user\" || user=$(ls -ld \"${SEED_ROOT_CONSOLE:-/dev/console}\" 2>/dev/null | awk '{print $3}')\nreal_user \"$user\" || { say \"skip (no runner user: $base and $fleet are not owned by one and nobody is on the console)\"; exit 0; }\n\nif [ -L \"$seed\" ] || { [ -e \"$seed\" ] && [ ! -d \"$seed\" ]; }; then\n  say \"skip ($seed is not a real directory)\"; exit 0\nfi\nif [ -d \"$seed\" ] && [ ! -e \"$marker\" ]; then\n  say \"skip ($seed exists without .cmux-seed-root: another runner's tree)\"; exit 0\nfi\nif [ -L \"$base\" ] || { [ -e \"$base\" ] && [ ! -d \"$base\" ]; }; then\n  say \"skip ($base is not a real directory)\"; exit 0\nfi\n\nif [ \"$dry\" = 1 ]; then\n  todo=\"\"\n  [ -d \"$base\" ] || todo=\"$todo create $base;\"\n  [ -d \"$seed\" ] || todo=\"$todo create $seed;\"\n  [ -e \"$marker\" ] || todo=\"$todo write marker;\"\n  if [ -d \"$seed\" ] && [ \"$(owner_of \"$seed\")\" != \"$user\" ]; then todo=\"$todo chown $user $seed;\"; fi\n  todo=${todo# }\n  if [ -z \"$todo\" ]; then say \"ok (already in place)\"; else say \"unprovisioned (would: ${todo%;})\"; fi\n  exit 0\nfi\n\ndid=\"\"\nif [ ! -d \"$base\" ]; then\n  mkdir -p \"$base\" || fail \"cannot create $base: needs root, run via fleet-sudo\"\n  chown \"$user\" \"$base\" || fail \"cannot chown $base to $user\"\n  did=\"$did created $base;\"\nfi\nif [ ! -d \"$seed\" ]; then\n  mkdir \"$seed\" || fail \"cannot create $seed\"\n  did=\"$did created $seed;\"\nfi\nif [ \"$(owner_of \"$seed\")\" != \"$user\" ]; then\n  chown \"$user\" \"$seed\" || fail \"cannot chown $seed to $user\"\n  did=\"$did chowned $seed;\"\nfi\nif [ ! -e \"$marker\" ]; then\n  printf 'CI seed root: provisioned by hq build-fleet/mini-ops/ops/seed-root.sh on %s at %s\\n' \\\n    \"$h\" \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" > \"$marker\" || fail \"cannot write $marker\"\n  chown \"$user\" \"$marker\" || fail \"cannot chown $marker to $user\"\n  did=\"$did wrote marker;\"\nfi\ndid=${did# }\nif [ -z \"$did\" ]; then say \"ok (already in place)\"; else say \"ok (${did%;})\"; fi\n",
+      "every_s": 1800,
+      "sha256": "f866b5e627aa8d629318a149f742e486bd97e2f13f90b76d0c25626e584beacd",
+      "source": {
+        "commit": "3c43fd912e9a323f5d926207d205f634b9ac7c4f",
+        "path": "build-fleet/mini-ops/ops/seed-root.sh",
         "repository": "manaflow-ai/cmuxterm-hq"
       }
     },
@@ -16,7 +26,7 @@
       "every_s": 21600,
       "sha256": "49514fb65e9caee7e307445c4e72c631afdd04bdf4807911c289b1fa9614d5c7",
       "source": {
-        "commit": "1b0be378bf03adb455d38b31bb2b996f1f32093d",
+        "commit": "3c43fd912e9a323f5d926207d205f634b9ac7c4f",
         "path": "build-fleet/mini-ops/ops/symbol-cache-cap.sh",
         "repository": "manaflow-ai/cmuxterm-hq"
       }

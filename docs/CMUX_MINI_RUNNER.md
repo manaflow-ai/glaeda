@@ -713,9 +713,11 @@ What `--apply` does:
      Every held item in the dry run (`--json`) carries `hold`: what holds it (`by`), its last use, its
      window and whether it is `stale`; the top-level `held` sums held bytes by reason and stale bytes apart.
      A fleet lease no longer turns any of this off: with a readable active lease every rule runs as on an
-     unleased host, and only the leased job's own paths stay (used since the lease began, named by its
-     lease or job markers, or open or named by its processes). An unreadable reservation list still
-     fails closed to floor-only eviction.
+     unleased host, and only the leased job's own paths stay (named by its lease or job markers, or open
+     or named by its processes). Use since the lease began no longer counts: runner jobs admitted before
+     a drain lease keep writing after it begins, and what they leave is theirs, not the lease's. To keep
+     a path through a lease, name it in the lease. An unreadable reservation list still fails closed to
+     floor-only eviction.
    - **Stopping.** After two idle polls in a row, and one fresh look right before the
      signal, the gate sends `SIGINT` to the runner's `Runner.Listener`. Disk never stops a
      listener (`DISK_RECLAIM_NOW`). For the holds that remain, while a job runs the gate watches

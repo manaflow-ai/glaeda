@@ -6151,6 +6151,77 @@ time.sleep(60)
             for runner in ("u0", "u1", "u2"):
                 self.finish(runner)
 
+    # JOB_CANCEL: the listener's lines for a job cancelled while its job-started hook waits (actions/runner v2.337.0
+    # JobDispatcher.Dispatch and .Cancel); the Worker lives on until the cancel timeout, and the hook gets no signal.
+    CANCEL_DIAG = ("[2026-11-18 13:05:58Z INFO JobDispatcher] Job request 0 for plan 7d33e0be job "
+                   "930d9f84-513b-5f03-96b5-0138d88db265 received.\n"
+                   "[2026-11-18 13:06:40Z INFO JobDispatcher] Job cancellation request "
+                   "930d9f84-513b-5f03-96b5-0138d88db265 received, cancellation timeout 5 minutes.\n")
+
+    def test_job_cancel_requested_reads_the_cancel_of_the_dispatched_job(self) -> None:
+        runner = self.dir / "runner"
+        self.assertFalse(hook.job_cancel_requested(runner), "no _diag yet")
+        self.assertFalse(hook.job_cancel_requested(None))
+        (runner / "_diag").mkdir(parents=True)
+        log = runner / "_diag/Runner_20261118-120000-utc.log"
+        dispatch = self.CANCEL_DIAG.splitlines(keepends=True)[0]
+        log.write_text(dispatch)
+        self.assertFalse(hook.job_cancel_requested(runner), "dispatched, not cancelled")
+        log.write_text(self.CANCEL_DIAG)
+        self.assertTrue(hook.job_cancel_requested(runner))
+        other = self.CANCEL_DIAG.replace("job 930d9f84", "job 11111111")
+        log.write_text(other)
+        self.assertFalse(hook.job_cancel_requested(runner), "a cancel for another job is not this one's")
+        log.write_text(self.CANCEL_DIAG + dispatch.replace("930d9f84", "22222222"))
+        self.assertFalse(hook.job_cancel_requested(runner), "an earlier job's cancel; a new job runs now")
+        self.assertEqual(hook.job_runner_dir(runner / "_work/cmux/cmux"), runner)
+        self.assertIsNone(hook.job_runner_dir(self.dir))
+
+    def test_capacity_a_job_cancelled_mid_wait_ends_its_wait_while_its_worker_lives(self) -> None:
+        # The Worker stays alive (it waits out the cancel timeout), so owner.gone() never fires; the listener's
+        # cancel line ends the wait within a poll instead of 5 min later.
+        self.fleet()
+        worker = subprocess.Popen(["/bin/sleep", "120"])
+        runner = self.dir / "runner-u2"
+        workspace = runner / "_work/cmux/cmux"
+        workspace.mkdir(parents=True)
+        (runner / "_diag").mkdir()
+        log = runner / "_diag/Runner_20261118-120000-utc.log"
+        log.write_text(self.CANCEL_DIAG.splitlines(keepends=True)[0])
+        try:
+            self.assertEqual(self.job("macos-compile-admission", "u0", 9).returncode, 0)
+            self.assertEqual(self.job("claude-wrapper", "u1", 9).returncode, 0)
+            push = event(self.dir, "push", {"repository": CMUX})
+            hook_run = subprocess.Popen(
+                [sys.executable, os.fspath(HOOK), "job-started", "--allowed-repo", "manaflow-ai/cmux", "--no-disk",
+                 "--state-dir", os.fspath(self.dir / "state"), "--watch-pid", str(worker.pid),
+                 "--capacity-units", "9", "--capacity-dir", os.fspath(self.dir / "capacity"), "--gui-wait", "60"],
+                env={"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0",
+                     "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"),
+                     "GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": os.fspath(push),
+                     "GITHUB_REPOSITORY": "manaflow-ai/cmux", "GITHUB_JOB": "release-build", "RUNNER_NAME": "u2"},
+                cwd=workspace, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            lines, cancelled_at = [], None
+            for line in hook_run.stdout:
+                lines.append(line)
+                if "waiting (" in line and cancelled_at is None:
+                    log.write_text(self.CANCEL_DIAG)
+                    cancelled_at = time.monotonic()
+            hook_run.wait(timeout=60)
+            hook_run.stdout.close()
+            out = "".join(lines)
+            self.assertIsNotNone(cancelled_at, out)
+            self.assertNotEqual(hook_run.returncode, 0, out)
+            self.assertIn(hook.JOB_CANCELLED, out)
+            self.assertLess(time.monotonic() - cancelled_at, 10, "the cancel ends the wait within a poll")
+            self.assertIsNone(worker.poll(), "its Worker still runs: the cancel, not a gone owner, ended it")
+            self.owner_gone_checks(out, 0.0)
+        finally:
+            worker.kill()
+            worker.wait()
+            for runner_name in ("u0", "u1", "u2"):
+                self.finish(runner_name)
+
     def test_capacity_a_reparented_hook_never_watches_launchd(self) -> None:
         # No --watch-pid: the hook pins its real parent at start. The parent exits mid-wait and the hook is
         # reparented (to launchd on a mini); it must not then take os.getppid() as the job.

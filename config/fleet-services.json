@@ -88,6 +88,10 @@
       "owner": "manaflow-ai/cmuxterm-hq build-fleet/autodeploy/host-install.sh",
       "why": "deploys HQ's build-fleet tools on merge"
     },
+    "ai.manaflow.seed-root": {
+      "owner": "glaeda scripts/glaeda-daemon-heal (config/fleet-ops.json)",
+      "why": "a fleet root op glaeda-daemon-heal installs and keeps current"
+    },
     "ai.manaflow.subrouter": {
       "owner": "manaflow-ai/cmuxterm-hq build-fleet/subrouter-dash/install.sh",
       "why": "the local subrouter Claude and Codex route through"

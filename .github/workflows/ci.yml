@@ -312,6 +312,7 @@ jobs:
               Path("scripts/test-glaeda-gh.py"),
               Path("scripts/test-glaeda-gh-edge.py"),
               Path("scripts/benchmark-land-forward.py"),
+              Path("scripts/measure-land-head-moved-after-own-update.py"),
               Path("scripts/glaeda-wallpaper-rotate"),
               Path("scripts/glaeda-sync-main"),
               Path("scripts/glaeda-nightly-only-admit"),

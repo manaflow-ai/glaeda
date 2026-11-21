@@ -810,6 +810,28 @@ def ssh_command(manifest: dict[str, Any], name: str, user: str, command: str) ->
     return [*base, "--", route["jump"], nested]
 
 
+# What a remote step whose status line never came back says, so a caller that keeps only the last stderr line
+# still reads both that the status was lost and the transport's own reason (a refusal, a reset) for it.
+REMOTE_STATUS_LOST = "remote status lost"
+
+
+def status_lost_note(transport_code: int | None, stderr: str | bytes = "") -> str:
+    """One line: the status line is missing, with the transport's exit and its last stderr line (the real reason)."""
+    text = stderr.decode("utf-8", "replace") if isinstance(stderr, bytes) else (stderr or "")
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    reason = f"; it said: {lines[-1][:160]}" if lines else ""
+    return f"glaeda-mini-fleet: {REMOTE_STATUS_LOST} (no status line; ssh exit {transport_code}{reason})"
+
+
+def reach_failure(detail: str) -> str:
+    """A row's result for a host its probe could not read: timed out, status lost, or unreachable."""
+    if "timed out after" in detail:
+        return f"timed out: {detail}"
+    if REMOTE_STATUS_LOST in detail:
+        return f"status lost: {detail}"
+    return f"unreachable: {detail}"
+
+
 def ssh_result(manifest: dict[str, Any], name: str, proc: subprocess.CompletedProcess) -> subprocess.CompletedProcess:
     """Decode a routed command's exit marker and remove it from its output."""
     if _ssh_route(manifest, name) is None:
@@ -820,11 +842,8 @@ def ssh_result(manifest: dict[str, Any], name: str, proc: subprocess.CompletedPr
     tail = text[at + len(marker):] if at >= 0 else ""
     digits = tail.strip()
     if at < 0 or not digits.isdigit() or "\n" in digits or not tail.endswith("\n"):
-        note = "glaeda-mini-fleet: no remote status marker; treating routed SSH as failed\n"
-        if isinstance(proc.stderr, bytes):
-            proc.stderr = proc.stderr.decode("utf-8", "replace") + note
-        else:
-            proc.stderr = (proc.stderr or "") + note
+        err = proc.stderr.decode("utf-8", "replace") if isinstance(proc.stderr, bytes) else (proc.stderr or "")
+        proc.stderr = err + status_lost_note(proc.returncode, err) + "\n"
         proc.returncode = proc.returncode or 255
         return proc
     proc.stdout = text[:at]
@@ -1106,6 +1125,12 @@ def key_line(key: dict[str, Any]) -> str:
     return f"{key['options']} {key['public_key']}" if key.get("options") else key["public_key"]
 
 
+def _tail(data: str | bytes | None, limit: int = 4096) -> str:
+    """The last `limit` characters of a transport's stderr, as text, for a host log."""
+    text = data.decode("utf-8", "replace") if isinstance(data, bytes) else (data or "")
+    return text[-limit:]
+
+
 def observe_host(manifest: dict[str, Any], name: str, script: bytes | None = None,
                  timeout: int = PROBE_TIMEOUT, options: tuple[str, ...] = ()) -> dict[str, Any]:
     started = time.time()
@@ -1123,18 +1148,22 @@ def observe_host(manifest: dict[str, Any], name: str, script: bytes | None = Non
                                                                                        "HOME": os.environ["HOME"],
                                                                                        "SSH_AUTH_SOCK": os.environ.get("SSH_AUTH_SOCK", "")},
         )
-    except subprocess.TimeoutExpired:
-        return {"host": name, "reachable": False, "error": f"probe timed out after {timeout}s"}
+    except subprocess.TimeoutExpired as expired:
+        return {"host": name, "reachable": False, "error": f"probe timed out after {timeout}s",
+                "transport_stderr": _tail(expired.stderr)}
     if routed:
         proc = ssh_result(manifest, name, proc)
         code, output = proc.returncode, proc.stdout
     else:
         code, output = remote_result(proc.stdout, proc.returncode)
+        if REMOTE_STATUS_RE.search(proc.stdout or b"") is None:
+            proc.stderr = _tail(proc.stderr) + status_lost_note(proc.returncode, proc.stderr) + "\n"
     if code != 0:
         raw_err = proc.stderr
         err = (raw_err.decode(errors="replace") if isinstance(raw_err, bytes) else (raw_err or "")) \
             .strip().splitlines()
-        return {"host": name, "reachable": False, "error": (err[-1] if err else f"ssh exit {code}")[:200]}
+        return {"host": name, "reachable": False, "error": (err[-1] if err else f"ssh exit {code}")[:300],
+                "transport_stderr": _tail(raw_err)}
     text = output.decode(errors="replace") if isinstance(output, bytes) else (output or "")
     data = parse_probe(text)
     return {"host": name, "reachable": True, "observed_at": int(started), **data}
@@ -3160,7 +3189,8 @@ def remote_result(output: bytes, transport_code: int) -> tuple[int, bytes]:
     """Recover the remote exit code and remove its receipt from captured stdout."""
     match = REMOTE_STATUS_RE.search(output)
     if not match:
-        return transport_code, output
+        # Tailscale SSH exits 0 whatever ran: without the receipt the status is lost, never a success.
+        return transport_code or 255, output
     return int(match.group(1)), output[:match.start()]
 
 
@@ -3227,8 +3257,8 @@ def run_remote_logged(argv: list[str], log: Any, stdin: bytes = b"", timeout: fl
     match = REMOTE_STATUS_RE.search(bytes(tail))
     if match:
         return int(match.group(1))
-    note(log, f"remote status receipt missing (ssh exit {proc.returncode})")
-    return proc.returncode
+    note(log, status_lost_note(proc.returncode))
+    return proc.returncode or 255
 
 
 def ssh_stream(name: str, user: str, command: str, log: Any, stdin: bytes = b"",
@@ -3776,7 +3806,7 @@ def cmd_fix(manifest: dict[str, Any], hosts: list[str], yes: bool, log_dir: Path
         if name in skipped:
             outcomes.append({"host": name, "skipped": skipped[name]})
         elif name not in done:
-            outcomes.append({"host": name, "skipped": f"unreachable: {results[name]['checks']['reach']['detail']}"})
+            outcomes.append({"host": name, "skipped": reach_failure(results[name]['checks']['reach']['detail'])})
         else:
             outcomes.append(done[name])
     print(render_fix(outcomes, yes))
@@ -3967,7 +3997,7 @@ def cmd_sudo_plan(manifest: dict[str, Any], hosts: list[str], run: bool, sudoers
     for result in results:
         name = result["host"]
         if "reach" in result["checks"]:
-            print(f"# {name}: unreachable ({result['checks']['reach']['detail']})")
+            print(f"# {name}: {reach_failure(result['checks']['reach']['detail'])}")
             continue
         script = sudo_plan_script(manifest, name, result, sudoers, as_root=ask_once)
         if script is None:
@@ -4546,24 +4576,47 @@ def onboard_run(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, s
         raise Failure(f"{mode} --sudo run asks for each host's password; run it from a terminal")
     targets, skipped = onboard_hosts(manifest, wanted)
     rows = {h: new_row(manifest, h, f"skipped: {why}") for h, why in skipped.items()}
+    # The run's directory and each host's log exist from the start, so a run that stops at the gate or the
+    # preflight still leaves the log its table names, with what happened and when.
+    directory = run_log_dir(mode, log_dir) if yes else None
+
+    def record(name: str, text: str) -> None:
+        if directory is None:
+            return
+        with open(directory / f"{name}.log", "ab") as log:
+            note(log, f"== {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {text}")
+
+    for name in targets:
+        record(name, f"{mode}: gate (the fleet host lock and reservation)" + (", waiting" if wait and yes else ""))
     # A held host (another build's fleet host lock, or a reservation) is skipped, and the run exits 1.
     held = gate_hosts(manifest, targets, wait and yes, drains=drains)
     rows.update({h: new_row(manifest, h, f"held: {why}, skipped", step="gate") for h, why in held.items()})
+    for name in targets:
+        record(name, f"gate: held: {held[name]}, skipped" if name in held else "gate: free; preflight")
+        if directory is not None:
+            rows.setdefault(name, new_row(manifest, name))["log"] = os.fspath(directory / f"{name}.log")
     targets = [h for h in targets if h not in held]
     for name in targets:
         rows[name] = new_row(manifest, name, step="preflight")
     if seed:
         select_hosts(manifest, [seed])
-    directory = run_log_dir(mode, log_dir) if yes else None
     live = list(targets)
 
     def settle(name: str, step: str, result: str) -> None:
         rows[name].update(step=step, result=result)
+        record(name, f"{step}: {result}")
         if name in live:
             live.remove(name)
 
     def probe(names: list[str]) -> dict[str, dict[str, Any]]:
-        return {r["host"]: r for r in preflight(manifest, observe(manifest, names, preflight=True), names)} if names else {}
+        if not names:
+            return {}
+        seen = observe(manifest, names, preflight=True)
+        for name, obs in seen["hosts"].items():
+            if not obs.get("reachable"):
+                said = obs.get("transport_stderr") or ""
+                record(name, f"probe: {obs.get('error', 'unreachable')}" + (f"\n{said.rstrip()}" if said.strip() else ""))
+        return {r["host"]: r for r in preflight(manifest, seen, names)}
 
     def blockers(result: dict[str, Any], groups: tuple[str, ...]) -> list[str]:
         return [c for c, v in result["checks"].items()
@@ -4572,7 +4625,7 @@ def onboard_run(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, s
     results = probe(live)
     for name in list(live):
         if "reach" in results[name]["checks"]:
-            settle(name, "preflight", f"unreachable: {results[name]['checks']['reach']['detail']}")
+            settle(name, "preflight", reach_failure(results[name]['checks']['reach']['detail']))
             continue
         rows[name]["generation"] = short_generation(results[name]["enrollment"]["generation"]) \
             if results[name]["enrollment"]["generation"] else ""
@@ -4641,6 +4694,8 @@ def onboard_run(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, s
     assert directory is not None
     for name in targets:
         rows[name]["log"] = os.fspath(directory / f"{name}.log")
+        if name in live:
+            record(name, "preflight: passed")
 
     def fix_round(names: list[str]) -> None:
         # The seed is fixed first and alone: its step lock would refuse share_prepare while it is busy.
@@ -4733,7 +4788,7 @@ def onboard_run(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, s
     for name in list(live):
         result = after[name]
         if "reach" in result["checks"]:
-            settle(name, "runner", f"unreachable after {rows[name]['step']}: {result['checks']['reach']['detail']}")
+            settle(name, "runner", f"after {rows[name]['step']}, " + reach_failure(result['checks']['reach']['detail']))
             continue
         new = result["enrollment"]["generation"]
         if new and short_generation(new) != rows[name]["generation"]:
@@ -4764,6 +4819,8 @@ def onboard_run(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, s
                 rows[name]["result"] += f"; no runner: {RUNNER_HOOK_NOTE}"
     if to_register:
         register_runners(manifest, to_register, rows, directory, heartbeat)
+    for name in targets:
+        record(name, f"done: {rows[name]['step']}: {rows[name]['result']}")
     print()
     print(render_rows(rows))
     return 0 if all(r["result"].startswith(("ok", "eligible", "skipped")) and "failed" not in r["result"]
@@ -5211,7 +5268,7 @@ def cmd_upgrade(manifest: dict[str, Any], manifest_path: Path, wanted: list[str]
         rows[name] = new_row(manifest, name, step="preflight")
         result = results[name]
         if "reach" in result["checks"]:
-            rows[name]["result"] = f"unreachable: {result['checks']['reach']['detail']}"
+            rows[name]["result"] = reach_failure(result['checks']['reach']['detail'])
             continue
         generation = result["enrollment"]["generation"]
         rows[name]["generation"] = short_generation(generation) if generation else ""

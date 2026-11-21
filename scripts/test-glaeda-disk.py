@@ -143,6 +143,13 @@ class GlaedaDiskTest(unittest.TestCase):
         gd._DISCOVERED.clear()
         self.gd_keep = gd.NESTED_KEEP
         gd.NESTED_KEEP = self.root.parent / f"{self.root.name}-keep.json"
+        # an --apply main() refills the full-disk reserve: never 512 MiB in the real home
+        reserve, real_path, real_bytes = (self.root.parent / f"{self.root.name}-reserve",
+                                          gd.full_disk_reserve_path, gd.FULL_DISK_RESERVE_BYTES)
+        gd.full_disk_reserve_path, gd.FULL_DISK_RESERVE_BYTES = (lambda: reserve), 8 * 1024**2
+        self.addCleanup(setattr, gd, "full_disk_reserve_path", real_path)
+        self.addCleanup(setattr, gd, "FULL_DISK_RESERVE_BYTES", real_bytes)
+        self.addCleanup(lambda: reserve.unlink(missing_ok=True))
 
     def tearDown(self) -> None:
         gd.process_evidence = self.gd_evidence
@@ -3660,6 +3667,53 @@ class GlaedaDiskTest(unittest.TestCase):
         self.assertEqual(v, {"a": ("git-checkout", ["commits no remote confirms"]),
                              "b": ("git-checkout", ["commits no remote confirms"])})
         self.assertEqual(gd.network_remotes(a / ".git"), ["origin"])  # not the sibling b
+
+    def test_a_nearly_full_disk_gets_the_reserve_back_before_anything_writes(self) -> None:
+        reserve = self.root / "cache" / "full-disk-reserve"
+        self.addCleanup(setattr, gd, "FULL_DISK_RESERVE_BYTES", gd.FULL_DISK_RESERVE_BYTES)
+        gd.FULL_DISK_RESERVE_BYTES = 16 * 1024**2
+        roomy, tight, full = (lambda: gd.FULL_DISK_REFILL_OVER), (lambda: gd.FULL_DISK_REFILL_OVER - 1), (lambda: 0)
+        self.assertFalse(gd.refill_full_disk_reserve(reserve, tight))  # no spare room: no reserve
+        self.assertFalse(reserve.exists())
+        self.assertTrue(gd.refill_full_disk_reserve(reserve, roomy))
+        self.assertEqual(reserve.stat().st_size, gd.FULL_DISK_RESERVE_BYTES)
+        self.assertGreaterEqual(reserve.stat().st_blocks * 512, gd.FULL_DISK_RESERVE_BYTES)  # not sparse
+        self.assertEqual(gd.release_full_disk_reserve(reserve, tight), 0)  # tight is not full: kept
+        self.assertTrue(reserve.exists())
+        self.assertEqual(gd.release_full_disk_reserve(reserve, full), gd.FULL_DISK_RESERVE_BYTES)
+        self.assertFalse(reserve.exists())
+        self.assertEqual(gd.release_full_disk_reserve(reserve, full), 0)  # already used
+        self.assertEqual(list(reserve.parent.iterdir()), [])  # no tmp left behind
+
+    def test_a_reserve_that_cannot_be_written_leaves_nothing(self) -> None:
+        reserve = self.root / "cache" / "full-disk-reserve"
+        self.addCleanup(setattr, gd, "FULL_DISK_RESERVE_BYTES", gd.FULL_DISK_RESERVE_BYTES)
+        gd.FULL_DISK_RESERVE_BYTES = 16 * 1024**2
+        real_open = open
+
+        def enospc_after_open(path, mode="r", *a, **k):
+            f = real_open(path, mode, *a, **k)
+            if "w" in mode:
+                f.write = lambda b: (_ for _ in ()).throw(OSError(errno.ENOSPC, "No space left on device"))
+            return f
+        with mock.patch("builtins.open", enospc_after_open):
+            self.assertFalse(gd.refill_full_disk_reserve(reserve, lambda: gd.FULL_DISK_REFILL_OVER))
+        self.assertEqual(list(reserve.parent.iterdir()), [])
+
+    def test_the_fleet_git_mirror_vouches_like_a_server(self) -> None:
+        root, origin = self._tmp_repos()
+        a = root / "a"
+        self._git("clone", "-q", str(origin), str(a))
+        gd.TRUSTED_LOCAL_REMOTES = ()
+        self.assertEqual(gd.network_remotes(a / ".git"), [])  # a plain local path is no copy
+        self.addCleanup(setattr, gd, "FLEET_MIRROR_REMOTES", gd.FLEET_MIRROR_REMOTES)
+        gd.FLEET_MIRROR_REMOTES = (str(origin.parent),)  # as cmux.git sits under the fleet's git/
+        self.assertEqual(gd.network_remotes(a / ".git"), ["origin"])
+        self._git("-C", str(a), "commit", "-q", "--allow-empty", "-m", "only here")
+        head = self._git("-C", str(a), "rev-parse", "HEAD").strip()
+        pushed = self._git("-C", str(origin), "rev-parse", "HEAD").strip()
+        why, _, known = gd._server_known(a / ".git", ["origin"], {head, pushed})
+        self.assertEqual((why, known), ("", [pushed]))  # the bundle needs only the commit made here
 
     def test_network_remote_urls(self) -> None:
         for url in ("https://github.com/o/r.git", "ssh://git@h/o/r", "git@github.com:o/r.git",
@@ -14273,7 +14327,7 @@ class HeldReasonTest(unittest.TestCase):
 
 
 class LeaseHoldsOnlyItsJobTest(unittest.TestCase):
-    """A fleet lease no longer turns the budget off: only what its job used since it began stays (Leo, 2026-11-18)."""
+    """A fleet lease no longer turns the budget off: only what its job names or has open stays (Leo, 2026-11-18)."""
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -14295,15 +14349,26 @@ class LeaseHoldsOnlyItsJobTest(unittest.TestCase):
         self.assertIn("unreadable", gd.host_reservation(self.during, self.list, {"mini-a"}, self.root / "none.json"))
         self.assertIsNone(gd.RESERVATION_SINCE, "fails closed: floor-only, as before")
 
-    def test_only_what_was_used_since_the_lease_began_is_held(self) -> None:
-        fam = gd.Family("xcode-derived-data", self.root, True, "")
-        old, new = make(self.root / "old", age_hours=48), make(self.root / "new", age_hours=0)
-        gd.LEASE.update(why="reserved for node:lane", since=time.time() - 3600)
-        self.assertEqual(gd.lease_holds(fam, old), "")
-        self.assertIn("the leased job's own", gd.lease_holds(fam, new))
-        self.assertEqual(gd.lease_holds(fam, new, used=time.time() - 7200), "", "the survey's own last use counts")
-        gd.LEASE.clear()
-        self.assertEqual(gd.lease_holds(fam, new), "", "no lease: nothing held by one")
+    def test_a_lease_holds_what_it_names_never_what_runner_jobs_left_after_it_began(self) -> None:
+        """2026-11-21: a drain lease on a mini at 17 GiB free kept 26.5 GiB of SwiftPM scratch, unheld by any lock,
+        because runner jobs admitted before the lease finished after it began; every pass freed nothing."""
+        fleet = self.root / "fleet"
+        fam = gd.Family(gd.SPM_SCRATCH, fleet / "ci/spm-scratch", True, "")
+        job, left = make(fleet / "cache/job-a", age_hours=0), make(fleet / "ci/spm-scratch/71c65b48", age_hours=0.05)
+        marker = fleet / "reservation.json"
+        marker.write_text(json.dumps({"schema": "glaeda-reservation/v1", "since": int(time.time()) - 3600,
+                                      "until": int(time.time()) + 3600, "owner": "node:lane",
+                                      "paths": [os.fspath(job)]}))
+        with mock.patch.object(gd, "FLEET_ROOT", fleet):
+            gd._LIVE_REFERENCES.clear()
+            self.addCleanup(gd._LIVE_REFERENCES.clear)
+            gd.LEASE.update(why="reserved for node:lane", since=time.time() - 3600)
+            self.assertEqual(gd.lease_holds(fam, left), "", "used since the lease began, named by nothing")
+            self.assertEqual(gd.lease_holds(fam, left, fresh=True), "", "apply's re-check agrees")
+            self.assertIn("the leased job's own", gd.lease_holds(fam, job))
+            self.assertIn("the leased job's own", gd.lease_holds(fam, job, fresh=True))
+            gd.LEASE.clear()
+            self.assertEqual(gd.lease_holds(fam, job), "", "no lease: nothing held by one")
 
     def test_a_host_reservation_references_only_the_paths_it_names_never_the_fleet_root(self) -> None:
         fleet = self.root / "fleet"

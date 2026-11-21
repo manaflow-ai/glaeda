@@ -6291,6 +6291,7 @@ def process_alive(pid: int, identity: str) -> bool:
 
 
 OWNER_GONE = "the job's Runner.Worker is gone"
+JOB_CANCELLED = "the job was cancelled while it waited for capacity (JOB_CANCEL)"
 
 
 class JobOwner(NamedTuple):
@@ -10320,20 +10321,63 @@ def listener_request(runner_dir: Path) -> str | None:
 DIAG_STAMP = re.compile(r"^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)Z ")
 
 
-def listener_request_at(runner_dir: Path) -> tuple[str | None, float | None]:
-    """listener_request, with when the listener took it: the epoch of its acknowledge's _diag line (UTC), or None
-    when that line has no stamp."""
+def runner_diag_tail(runner_dir: Path) -> str | None:
+    """The last RUNNER_DIAG_TAIL bytes of the listener's newest _diag/Runner_*.log, or None with no such file."""
     diag = runner_dir / "_diag"
     try:
         names = sorted(n for n in os.listdir(diag) if n.startswith("Runner_") and n.endswith(".log"))
     except FileNotFoundError:
-        return None, None
+        return None
     if not names:
-        return None, None
+        return None
     with open(diag / names[-1], "rb") as file:
         size = os.fstat(file.fileno()).st_size
         file.seek(max(0, size - RUNNER_DIAG_TAIL))
-        text = file.read().decode("utf-8", "replace")
+        return file.read().decode("utf-8", "replace")
+
+
+# JOB_CANCEL: the runner never cancels the job-started hook. It runs as the "Set up runner" step with condition
+# always() (actions/runner src/Runner.Worker/JobExtension.cs), and on a cancel StepsRunner stops the running step
+# only when its condition re-evaluates false, so the hook gets no signal at all. A cancelled job's hook kept waiting
+# for units until the listener killed its Worker at the cancel timeout: 5 min of a runner per cancelled job, the
+# whole p90 of superseded-run cancel lag on glaeda Mac labels (hq#16989). The listener does log the cancel
+# (JobDispatcher.Cancel), keyed by the JobId its dispatch line names, so the wait reads that and gives up.
+LISTENER_DISPATCH = re.compile(r"JobDispatcher\] Job request \S+ for plan \S+ job (\S+) received\.")
+LISTENER_CANCEL = re.compile(r"JobDispatcher\] Job cancellation request (\S+) received")
+
+
+def job_cancel_requested(runner_dir: Path | None) -> bool:
+    """The listener of runner_dir got a cancellation request for the job it dispatched last (this hook's job: a
+    runner runs one at a time). False when that cannot be read: a live job is never given up on a guess."""
+    if runner_dir is None:
+        return False
+    try:
+        text = runner_diag_tail(runner_dir)
+    except OSError:
+        return False
+    job, cancelled = None, False
+    for line in (text or "").splitlines():
+        if dispatched := LISTENER_DISPATCH.search(line):
+            job, cancelled = dispatched.group(1), False
+        elif job is not None and (cancel := LISTENER_CANCEL.search(line)) and cancel.group(1) == job:
+            cancelled = True
+    return cancelled
+
+
+def job_runner_dir(workspace: Path | None) -> Path | None:
+    """The runner a job's hook runs for, from the directory the runner started it in (<runner>/_work/<repo>/<repo>),
+    or None elsewhere."""
+    if workspace is None or workspace.parent.parent.name != "_work":
+        return None
+    return workspace.parent.parent.parent
+
+
+def listener_request_at(runner_dir: Path) -> tuple[str | None, float | None]:
+    """listener_request, with when the listener took it: the epoch of its acknowledge's _diag line (UTC), or None
+    when that line has no stamp."""
+    text = runner_diag_tail(runner_dir)
+    if text is None:
+        return None, None
     request, at = None, None
     for line in text.splitlines():
         taken = LISTENER_TAKES.search(line)
@@ -15014,9 +15058,10 @@ def main(argv: list[str] | None = None) -> int:
                               units=0, roots=[], gui=False, instance=args.instance)
             return refuse(why)
 
-        def abandoned() -> int:
-            """The owner is gone (a cancelled or crashed job): give up the wait, hold nothing, refuse nobody."""
-            why = f"{OWNER_GONE} (pid {owner.pid if owner else 'unknown'}); nothing admitted, nothing held"
+        def abandoned(cause: str = "") -> int:
+            """The owner is gone (a cancelled or crashed job), or its cancel came (JOB_CANCEL): give up the wait,
+            hold nothing, refuse nobody."""
+            why = f"{cause or OWNER_GONE} (pid {owner.pid if owner else 'unknown'}); nothing admitted, nothing held"
             print(f"{PREFIX}: {why}", flush=True)
             if telemetry:
                 with contextlib.suppress(Exception):
@@ -15276,6 +15321,8 @@ def main(argv: list[str] | None = None) -> int:
                 while True:
                     if owner.gone():  # a cancelled job's hook must not keep queuing for units
                         return abandoned()
+                    if job_cancel_requested(job_runner_dir(JOB_CWD)):  # JOB_CANCEL: no signal ever comes
+                        return abandoned(JOB_CANCELLED)
                     held, note = take_capacity(args.host_lock, args.capacity_dir, args.capacity_units,
                                                os.environ.get("GITHUB_JOB", ""), owner,
                                                args.state_dir, args.compile_slots, args.canonical_roots,

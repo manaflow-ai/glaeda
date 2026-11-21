@@ -235,6 +235,45 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(result.returncode, 7)
         self.assertEqual(result.stdout, "ready\n")
 
+    def test_a_lost_marker_keeps_the_transports_reason_on_the_last_line(self) -> None:
+        # A transport that refuses the hop prints its reason and no marker; the reason must survive, since
+        # observe_host keeps only the last stderr line.
+        manifest = self.route_manifest()
+        refused = "aws-enroll: only aws-m4pro-2..9 are enrollable; refusing cmux-lawrence\n"
+        proc = mf.ssh_result(manifest, "aws-m4pro-7", subprocess.CompletedProcess([], 2, "", refused))
+        last = proc.stderr.strip().splitlines()[-1]
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn(mf.REMOTE_STATUS_LOST, last)
+        self.assertIn("ssh exit 2", last)
+        self.assertIn("refusing cmux-lawrence", last)
+        proc = mf.ssh_result(manifest, "aws-m4pro-7", subprocess.CompletedProcess([], 0, "partial\n", ""))
+        self.assertEqual(proc.returncode, 255)
+        self.assertIn("ssh exit 0)", proc.stderr)
+
+    def test_observe_host_says_timed_out_or_status_lost_never_just_unreachable(self) -> None:
+        manifest = self.route_manifest()
+        refused = subprocess.CompletedProcess([], 2, b"", b"aws-enroll: refusing cmux-lawrence\n")
+        with mock.patch.object(mf.subprocess, "run", return_value=refused):
+            obs = mf.observe_host(manifest, "aws-m4pro-7", b"true\n", 5)
+        self.assertFalse(obs["reachable"])
+        self.assertIn(mf.REMOTE_STATUS_LOST, obs["error"])
+        self.assertIn("refusing cmux-lawrence", obs["error"])
+        self.assertIn("refusing cmux-lawrence", obs["transport_stderr"])
+        self.assertTrue(mf.reach_failure(obs["error"]).startswith("status lost: "))
+        late = subprocess.TimeoutExpired([], 180, output=b"", stderr=b"still connecting\n")
+        with mock.patch.object(mf.subprocess, "run", side_effect=late):
+            obs = mf.observe_host(manifest, "aws-m4pro-7", b"true\n", 180)
+        self.assertEqual(obs["error"], "probe timed out after 180s")
+        self.assertEqual(obs["transport_stderr"], "still connecting\n")
+        self.assertEqual(mf.reach_failure(obs["error"]), "timed out: probe timed out after 180s")
+        self.assertEqual(mf.reach_failure("Connection refused"), "unreachable: Connection refused")
+        # An ordinary host whose receipt is lost reads the same way.
+        plain = {"ssh_user": "cmux", "hosts": {"build-mini-1": {}}}
+        with mock.patch.object(mf.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"user\tcmux\n", b"")):
+            obs = mf.observe_host(plain, "build-mini-1", b"true\n", 5)
+        self.assertFalse(obs["reachable"])
+        self.assertIn(f"{mf.REMOTE_STATUS_LOST} (no status line; ssh exit 0)", obs["error"])
+
     def test_incomplete_route_fails_closed(self) -> None:
         manifest = self.route_manifest()
         del manifest["hosts"]["aws-m4pro-7"]["tailnet_ip"]
@@ -3401,6 +3440,37 @@ class OnboardTests(unittest.TestCase):
     def run_onboard(self, texts: dict[str, str], *extra: str, **kwargs: object) -> tuple[int, str, list]:
         return run_command(texts, *extra, **kwargs)
 
+    def test_a_preflight_failure_leaves_the_log_the_table_names(self) -> None:
+        lost = {"host": "build-mini-1", "reachable": False,
+                "error": "glaeda-mini-fleet: remote status lost (no status line; ssh exit 2; it said: refused)",
+                "transport_stderr": "aws-enroll: refusing the jump\n"}
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()) as out, \
+                mock.patch.object(mf, "observe", return_value={"hosts": {"build-mini-1": lost}}), \
+                mock.patch.object(mf, "host_check", return_value=None), \
+                mock.patch.object(mf, "ssh_stream", side_effect=AssertionError("nothing runs past preflight")):
+            code = mf.main(["onboard", "build-mini-1", "--manifest", os.fspath(EXAMPLE), "--log-dir", tmp, "--yes"])
+            log = Path(tmp) / "build-mini-1.log"
+            self.assertTrue(log.exists(), out.getvalue())
+            text = log.read_text()
+        self.assertEqual(code, 1)
+        row = [line for line in out.getvalue().splitlines() if line.startswith("build-mini-1")][-1]
+        self.assertIn("status lost: glaeda-mini-fleet: remote status lost", row)
+        self.assertTrue(row.endswith(os.fspath(log)), row)
+        self.assertIn("gate: free; preflight", text)
+        self.assertIn("probe: glaeda-mini-fleet: remote status lost", text)
+        self.assertIn("aws-enroll: refusing the jump", text)  # the transport's own words, not just the summary
+        self.assertIn("preflight: status lost:", text)
+        self.assertIn("done: preflight: status lost:", text)
+
+    def test_a_held_host_has_a_log_too(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()) as out, \
+                mock.patch.object(mf, "observe", side_effect=AssertionError("a held host is not probed")), \
+                mock.patch.object(mf, "host_check", return_value="reserved by someone"):
+            code = mf.main(["onboard", "build-mini-1", "--manifest", os.fspath(EXAMPLE), "--log-dir", tmp, "--yes"])
+            text = (Path(tmp) / "build-mini-1.log").read_text()
+        self.assertEqual(code, 1, out.getvalue())
+        self.assertIn("gate: held: reserved by someone, skipped", text)
+
     def test_dry_run_prints_the_plan_and_touches_nothing(self) -> None:
         code, out, calls = self.run_onboard({"build-mini-1": self.fresh(), "build-mini-2": morning_text()})
         self.assertEqual((code, calls), (0, []))
@@ -4760,8 +4830,13 @@ class ReservationScriptShapeTests(unittest.TestCase):
             subprocess.run(["bash", "-n"], input=script, text=True, check=True)
 
     def test_ssh_command_is_batch_mode_and_quoted(self) -> None:
-        with mock.patch.object(mf.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"absent\n", b"")) as run:
+        done = subprocess.CompletedProcess([], 0, b"absent\n\n__GLAEDA_REMOTE_STATUS__:0\n", b"")
+        with mock.patch.object(mf.subprocess, "run", return_value=done) as run:
             self.assertEqual(mf.read_reservation("build-mini-1", "cmux")["state"], "absent")
+        # Tailscale SSH exits 0 whatever ran: an answer without its receipt is never read as one.
+        lost = subprocess.CompletedProcess([], 0, b"absent\n", b"")
+        with mock.patch.object(mf.subprocess, "run", return_value=lost):
+            self.assertEqual(mf.read_reservation("build-mini-1", "cmux")["state"], "error")
         argv = run.call_args.args[0]
         self.assertEqual(argv[:8], [mf.SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-l", "cmux", "build-mini-1"])
         self.assertTrue(argv[8].startswith("( /bin/bash -c "))
@@ -4773,6 +4848,26 @@ class RemoteStatusTests(unittest.TestCase):
     def test_remote_status_overrides_a_transport_zero(self) -> None:
         output = b"remote output\n__GLAEDA_REMOTE_STATUS__:7\n"
         self.assertEqual(mf.remote_result(output, 0), (7, b"remote output"))
+
+    def test_a_missing_receipt_is_never_a_success(self) -> None:
+        self.assertEqual(mf.remote_result(b"half an answer\n", 0), (255, b"half an answer\n"))
+        self.assertEqual(mf.remote_result(b"", 3), (3, b""))
+        with tempfile.TemporaryDirectory() as tmp, open(Path(tmp) / "h.log", "w+b") as log:
+            code = mf.run_remote_logged(["/bin/sh", "-c", "echo partial"], log)
+            log.seek(0)
+            text = log.read().decode()
+        self.assertEqual(code, 255)
+        self.assertIn("partial", text)
+        self.assertIn(f"{mf.REMOTE_STATUS_LOST} (no status line; ssh exit 0)", text)
+
+    def test_a_late_receipt_is_a_timeout_in_the_log(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, open(Path(tmp) / "h.log", "w+b") as log:
+            code = mf.run_remote_logged(["/bin/sh", "-c", "echo started; sleep 30"], log, timeout=0.5)
+            log.seek(0)
+            text = log.read().decode()
+        self.assertEqual(code, 124)
+        self.assertIn("started", text)  # written as it came, before the bound ended the step
+        self.assertIn("timed out after 0.5s", text)
 
     def test_ssh_stream_adds_a_remote_status_receipt(self) -> None:
         with mock.patch.object(mf, "run_remote_logged", return_value=0) as run:
