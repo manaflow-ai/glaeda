@@ -346,6 +346,9 @@ CLAUDE_ROUTES = "claude-routes.json"  # config/, beside this script or as mini-s
 FLEET_SERVICES = "fleet-services.json"  # config/: the owned launchd services that are not glaeda's (unmanaged_service)
 CLAUDE_PROBE_S = 60  # a route that does not answer hangs `claude -p` in its retries until it is killed
 CLAUDE_PROMPT = "Reply with exactly PONG"
+# The probe checks the route, so it asks the cheapest model: with no --model each one was a full Opus turn over
+# Claude Code's whole system prompt (about 1,200 a day on the team gateway, 2026-11-20).
+CLAUDE_PROBE_MODEL = "haiku"
 CLAUDE_PERSONAL = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")  # a person's login: it overrides the route
 CLAUDE_INSTALL_S = 600  # one download (about 250 MB) and `claude install`
 CLAUDE_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?")  # install.sh's shape, prereleases too
@@ -1057,7 +1060,7 @@ class Mini:
             return False, "no ~/.local/bin/claude"
         settings = json.dumps({"env": {"ANTHROPIC_BASE_URL": url, "ANTHROPIC_AUTH_TOKEN": token}})
         env = {k: v for k, v in os.environ.items() if k not in CLAUDE_PERSONAL}
-        code, out = sh([os.fspath(claude), "-p", "--settings", settings, CLAUDE_PROMPT],
+        code, out = sh([os.fspath(claude), "-p", "--model", CLAUDE_PROBE_MODEL, "--settings", settings, CLAUDE_PROMPT],
                        timeout=CLAUDE_PROBE_S, env=env, cwd=tempfile.gettempdir())
         if code == 0 and "PONG" in out:
             return True, "PONG"

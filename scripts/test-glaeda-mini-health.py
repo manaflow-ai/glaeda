@@ -3344,6 +3344,9 @@ class ClaudeRouteOnDisk(unittest.TestCase):
         text = seen.read_text()
         self.assertIn(json.dumps({"env": {"ANTHROPIC_BASE_URL": SR2, "ANTHROPIC_AUTH_TOKEN": "subrouter"}}), text)
         self.assertNotIn("personal", text)
+        # A route check, not work: the cheapest model. With no --model each probe was a full Opus turn
+        # (about 1,200 a day across the fleet on the team gateway, 2026-11-20).
+        self.assertIn("--model\nhaiku\n", text)
 
     def test_a_probe_that_hangs_or_fails_is_a_failure(self) -> None:
         self.fake_claude("sleep 30\n")
