@@ -67,7 +67,7 @@ class FakeMini(health.Mini):
         self.toolchain_installs: list[str] = []
         self.claude: str | None = None  # no Claude Code here: no route to check
         self.claude_env: dict = {}
-        self.answers: dict[str, bool] = {}  # route -> whether `claude -p` through it answers
+        self.answers: dict[str, bool] = {}  # route -> whether its /_subrouter/health answers
         self.daemons_dir = Path("/nonexistent")
         self.global_agents_dir = Path("/nonexistent")
         self.probe_memory: dict = {}
@@ -279,10 +279,10 @@ class FakeMini(health.Mini):
     def claude_settings(self):
         return {"env": dict(self.claude_env)}
 
-    def claude_probe(self, url, token):
+    def route_probe(self, url):
         self.did.append("probe " + url)
         ok = self.answers.get(url, False)
-        return ok, "PONG" if ok else "no answer in 60 s"
+        return ok, "health 200" if ok else "no answer: timed out"
 
     def set_claude_route(self, url, token):
         self.did.append("route " + url)
@@ -2852,7 +2852,7 @@ class ClaudeRoute(Base):
         self.assertEqual(self.mini.claude_env["ANTHROPIC_BASE_URL"], SR2)
 
     def test_a_tunnel_that_is_down_is_never_probed_through(self) -> None:
-        # a `claude -p` through a broken tunnel hangs up to 60 s every 2-minute run and delays the heals after it
+        # a probe through a broken tunnel waits for its timeout every 2-minute run and delays the heals after it
         self.mini.route = "en0"
         self.mini.opt_in = (None, "no ~/.config/glaeda/tailscale-self-heal.json")
         for at in (NOW, NOW + 120):
@@ -3332,35 +3332,57 @@ class ClaudeRouteOnDisk(unittest.TestCase):
         path.chmod(0o755)
         return path
 
-    def test_the_probe_routes_through_settings_and_drops_a_personal_token(self) -> None:
-        seen = self.home / "seen"
-        self.fake_claude(f'printf "%s\\n" "$@" > {seen}; env >> {seen}; echo PONG\n')
-        os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = "personal"
-        try:
-            ok, detail = self.mini.claude_probe(SR2, "subrouter")
-        finally:
-            del os.environ["CLAUDE_CODE_OAUTH_TOKEN"]
-        self.assertEqual((ok, detail), (True, "PONG"))
-        text = seen.read_text()
-        self.assertIn(json.dumps({"env": {"ANTHROPIC_BASE_URL": SR2, "ANTHROPIC_AUTH_TOKEN": "subrouter"}}), text)
-        self.assertNotIn("personal", text)
-        # A route check, not work: the cheapest model. With no --model each probe was a full Opus turn
-        # (about 1,200 a day across the fleet on the team gateway, 2026-11-20).
-        self.assertIn("--model\nhaiku\n", text)
+    @contextlib.contextmanager
+    def gateway(self, status: int):
+        """A local fleet gateway whose /_subrouter/health answers STATUS; yields (url, the requests it saw)."""
+        import http.server
+        import threading
+        seen: list[tuple[str, str, dict[str, str]]] = []
 
-    def test_a_probe_that_hangs_or_fails_is_a_failure(self) -> None:
-        self.fake_claude("sleep 30\n")
-        orig = health.CLAUDE_PROBE_S
-        health.CLAUDE_PROBE_S = 1
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                seen.append(("GET", self.path, dict(self.headers)))
+                self.send_response(status if self.path == "/_subrouter/health" else 404)
+                self.end_headers()
+                self.wfile.write(b'{"ok":true}')
+
+            def do_POST(self):  # noqa: N802
+                seen.append(("POST", self.path, dict(self.headers)))
+                self.send_response(500)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
         try:
-            self.assertEqual(self.mini.claude_probe(SR2, "subrouter"), (False, "no answer in 1 s"))
+            yield f"http://127.0.0.1:{server.server_address[1]}", seen
         finally:
-            health.CLAUDE_PROBE_S = orig
-        (self.home / ".local/bin/claude").write_text("#!/bin/sh\necho 'API Error: 401 OAuth session expired'\nexit 1\n")
-        ok, detail = self.mini.claude_probe(SR2, "subrouter")
+            server.shutdown()
+            server.server_close()
+
+    def test_the_probe_asks_the_gateways_health_and_runs_no_model(self) -> None:
+        # The route check made a real `claude -p` (a model turn) every probe_every_s on every mini: 1,227 Opus
+        # turns a day on the team gateway (2026-11-20). Both fleet gateways answer /_subrouter/health themselves:
+        # no account, no model, no token.
+        ran = self.home / "claude-ran"
+        self.fake_claude(f"touch {ran}; echo PONG\n")
+        with self.gateway(200) as (url, seen):
+            self.assertEqual(self.mini.route_probe(url), (True, "health 200"))
+        self.assertFalse(ran.exists(), "the probe never runs Claude Code")
+        self.assertEqual([(m, p) for m, p, _ in seen], [("GET", "/_subrouter/health")])
+        self.assertFalse({k.lower() for k in seen[0][2]} & {"authorization", "x-api-key"}, "no token goes out")
+
+    def test_a_route_whose_health_fails_or_does_not_answer_is_a_failure(self) -> None:
+        with self.gateway(503) as (url, _):
+            self.assertEqual(self.mini.route_probe(url), (False, "health HTTP 503"))
+        with self.gateway(200) as (url, _):
+            pass  # closed again: nothing listens on that port now
+        ok, detail = self.mini.route_probe(url)
         self.assertFalse(ok)
-        self.assertIn("exit 1", detail)
-        self.assertIn("401", detail)
+        self.assertTrue(detail.startswith("no answer"), detail)
 
     def test_no_claude_binary_means_no_check(self) -> None:
         self.assertIsNone(self.mini.claude_bin())

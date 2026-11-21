@@ -2323,8 +2323,8 @@ all of them failing closed (`heal_tailscale_route` in the script):
    host lock unreadable),
    or a restart state that cannot be read or written (a `last_attempt_at` that is not a finite time from 0 to 6 h
    past now is unreadable).
-7. **Not with claude_route.** While `tailscale_down` or `tailscale_no_route` is seen, `claude_route` runs no
-   `claude -p` (a probe through a broken tunnel hangs up to 60 s every run): a fresh cached answer stands, else
+7. **Not with claude_route.** While `tailscale_down` or `tailscale_no_route` is seen, `claude_route` sends no
+   health probe (a probe through a broken tunnel waits 10 s every run): a fresh cached answer stands, else
    it reports `not probed: the Tailscale tunnel is down`, so capture-host stays closed. It keeps no probe and
    reroutes nothing, so Claude's settings never change in the run that restarts Tailscale; the first run after
    the tunnel is back probes the route in use.
