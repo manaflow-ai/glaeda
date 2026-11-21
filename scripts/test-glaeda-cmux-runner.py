@@ -7522,6 +7522,195 @@ def fake_clt(base: Path, sdk: str = "27.0") -> Path:
     return path
 
 
+class LedgerSelfHealTest(unittest.TestCase):
+    """LEDGER_SELF_HEAL: the main nightly signing Mac, 2026-11-21, host.lock was a guest user's (0660, an ACL denying
+    that guest), so the runner user, owning the fleet directory, got EACCES opening it: run 44898080726's
+    generate-nightly-deltas and
+    run 44907462015's keep-published-dsyms each held the signer an hour, then were refused. A ledger file another
+    user owns, in a directory the runner owns, is swapped for the runner's own once (same mode and ACL) and the open
+    retried once; anything else still raises at once. Ownership and EACCES are faked: a root test run cannot make a
+    permission error, and no test can chown to another user."""
+
+    ACL = ["user:guest deny read,write,append,readattr,writeattr,readextattr,writeextattr,readsecurity"]
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.fleet = Path(self.tmp.name).resolve() / "fleet"
+        (self.fleet / "capacity").mkdir(parents=True)
+        self.host_lock = self.fleet / "host.lock"
+        self.host_lock.write_text("guest\n")
+        self.host_lock.chmod(0o660)
+        # by inode, as the kernel would: the guest owns (and denies the runner) the old file, not the one in its place
+        self.foreign: set[int] = {self.host_lock.stat().st_ino}
+        self.denied: set[int] = {self.host_lock.stat().st_ino}
+        self.acl_set: list[tuple[str, list[str]]] = []
+        real_lstat, real_open = os.lstat, os.open
+        guest = os.geteuid() + 4242
+
+        def lstat(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+            got = real_lstat(path, *args, **kwargs)
+            if got.st_ino not in self.foreign:
+                return got
+            fields = list(got)
+            fields[stat.ST_UID] = guest
+            return os.stat_result(fields)
+
+        def fake_open(path: Any, flags: int, mode: int = 0o777, *args: Any, **kwargs: Any) -> int:
+            try:
+                inode = real_lstat(path).st_ino
+            except OSError:
+                inode = None
+            if inode in self.denied:
+                raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), os.fspath(path))
+            return real_open(path, flags, mode, *args, **kwargs)
+
+        def set_acl(path: str, entries: list[str]) -> bool:
+            self.acl_set.append((path, list(entries)))
+            return True
+
+        hook.LEDGER_HEALED.clear()
+        for patch in (mock.patch.object(hook, "FLEET_DIR", os.fspath(self.fleet)),
+                      mock.patch.object(hook.os, "lstat", lstat), mock.patch.object(hook.os, "open", fake_open),
+                      mock.patch.object(hook, "file_acl", lambda path: list(self.ACL)),
+                      mock.patch.object(hook, "set_file_acl", set_acl),
+                      mock.patch.object(hook, "owner_name", lambda uid: "guest")):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(hook.LEDGER_HEALED.clear)
+
+    def asides(self, name: str) -> list[Path]:
+        return sorted(self.fleet.glob(f"**/{name}.guest-owned.*"))
+
+    def test_a_host_lock_another_user_owns_is_swapped_for_the_runners_and_opened(self) -> None:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            fd = hook.open_ledger(self.host_lock, 0o660)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        finally:
+            os.close(fd)
+        [aside] = self.asides("host.lock")
+        self.assertRegex(aside.name, r"^host\.lock\.guest-owned\.\d{8}T\d{6}Z$")
+        self.assertEqual(aside.read_text(), "guest\n", "the old file is kept aside, untouched")
+        self.assertEqual(self.host_lock.read_text(), "", "a fresh file in its place")
+        self.assertEqual(stat.S_IMODE(self.host_lock.stat().st_mode), 0o660, "the same mode, whatever the umask")
+        self.assertEqual(self.host_lock.stat().st_uid, os.geteuid(), "the runner's own")
+        self.assertEqual(len(self.acl_set), 1)
+        self.assertEqual(self.acl_set[0][1], self.ACL, "the same ACL, copied onto the new file before it is in place")
+        self.assertEqual([p.name for p in self.fleet.iterdir() if ".heal-" in p.name], [], "no temporary left")
+        [line] = out.getvalue().splitlines()
+        self.assertIn(f"{hook.PREFIX}: healed the ledger file {self.host_lock}", line)
+        self.assertIn("(LEDGER_SELF_HEAL)", line)
+        self.assertIn("guest's", line)
+        self.assertIn(os.fspath(aside), line)
+
+    def test_a_capacity_token_is_healed_through_lock_file(self) -> None:
+        token = self.fleet / "capacity" / "gateway-0.token"
+        token.write_text("")
+        token.chmod(0o644)
+        self.foreign.add(token.stat().st_ino)
+        self.denied.add(token.stat().st_ino)
+        with contextlib.redirect_stdout(io.StringIO()):
+            fd = hook.lock_file(token, fcntl.LOCK_EX)
+        self.assertIsNotNone(fd)
+        os.close(fd)
+        self.assertEqual(len(self.asides("gateway-0.token")), 1)
+        self.assertEqual(stat.S_IMODE(token.stat().st_mode), 0o644)
+
+    def test_the_heal_is_once_and_the_retry_is_once(self) -> None:
+        """A file still refused after its heal (or healed already) raises as LEDGER_ERROR_IS_FINAL refuses it."""
+        real_rename = os.rename
+
+        def rename(src: Any, dst: Any) -> None:
+            real_rename(src, dst)
+            if os.fspath(dst) == os.fspath(self.host_lock):
+                self.denied.add(self.host_lock.stat().st_ino)  # still denied after the swap
+
+        with mock.patch.object(hook.os, "rename", rename), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(PermissionError):
+                hook.open_ledger(self.host_lock, 0o660)
+            with self.assertRaises(PermissionError) as raised:
+                hook.open_ledger(self.host_lock, 0o660)
+        self.assertEqual(len(self.asides("host.lock")), 1, "healed once, not on every try")
+        self.assertIn(hook.LEDGER_FINAL_MARK, hook.ledger_error_note(raised.exception))
+
+    def test_anything_else_raises_at_once_and_changes_nothing(self) -> None:
+        cases = [
+            ("the runner owns the file", lambda: mock.patch.object(self, "foreign", set())),
+            ("another errno", lambda: mock.patch.object(hook.os, "open", mock.Mock(
+                side_effect=OSError(errno.EROFS, "read-only", os.fspath(self.host_lock))))),
+            ("outside FLEET_DIR", lambda: mock.patch.object(hook, "FLEET_DIR", os.fspath(self.fleet / "capacity"))),
+            ("the runner does not own the directory", lambda: mock.patch.object(
+                hook.os, "geteuid", lambda: os.stat(self.fleet).st_uid + 1)),
+            ("its ACL cannot be read", lambda: mock.patch.object(hook, "file_acl", lambda path: None)),
+            ("its ACL cannot be copied", lambda: mock.patch.object(hook, "set_file_acl", lambda path, acl: False)),
+        ]
+        for why, patch in cases:
+            with self.subTest(why), patch(), contextlib.redirect_stdout(io.StringIO()) as out:
+                hook.LEDGER_HEALED.clear()
+                with self.assertRaises(OSError):
+                    hook.open_ledger(self.host_lock, 0o660)
+                self.assertEqual(self.asides("host.lock"), [])
+                self.assertEqual(self.host_lock.read_text(), "guest\n", "the old file stays in place")
+                self.assertEqual(sorted(p.name for p in self.fleet.iterdir() if p.name != hook.LEDGER_HEAL_LOCK),
+                                 ["capacity", "host.lock"])
+                self.assertEqual(out.getvalue(), "")
+
+    def test_a_file_another_runner_healed_meanwhile_is_opened_without_a_second_swap(self) -> None:
+        """Two runners refused at once: the second sees, under the heal guard, the runner's own file and just retries;
+        it never moves the first one's fresh file (which that runner may hold a lock on) aside."""
+        real_lstat = os.lstat
+        seen = {"n": 0}
+
+        def lstat(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+            if os.fspath(path) == os.fspath(self.host_lock):
+                seen["n"] += 1
+                if seen["n"] == 2:  # the guarded re-read: the other runner swapped it in between
+                    os.rename(self.host_lock, self.fleet / "theirs-aside")
+                    self.host_lock.write_text("")
+                    self.denied.clear()
+            got = real_lstat(path, *args, **kwargs)
+            if got.st_ino not in self.foreign:
+                return got
+            fields = list(got)
+            fields[stat.ST_UID] = os.geteuid() + 4242
+            return os.stat_result(fields)
+
+        out = io.StringIO()
+        with mock.patch.object(hook.os, "lstat", lstat), contextlib.redirect_stdout(out):
+            os.close(hook.open_ledger(self.host_lock, 0o660))
+        self.assertEqual(self.asides("host.lock"), [], "no second swap")
+        self.assertEqual(self.acl_set, [])
+        self.assertEqual(out.getvalue(), "")
+
+    def test_a_symlink_is_never_healed(self) -> None:
+        self.host_lock.unlink()
+        self.host_lock.symlink_to(self.fleet / "elsewhere")
+        with self.assertRaises(PermissionError):
+            hook.open_ledger(self.host_lock, 0o660)
+        self.assertTrue(self.host_lock.is_symlink())
+
+    def test_file_acl_reads_explicit_entries_from_ls(self) -> None:
+        listing = ("-rw-rw----+ 1 guest  guest  0 Nov  2 10:00 /fleet/host.lock\n"
+                   f" 0: {self.ACL[0]}\n"
+                   " 1: group:everyone inherited deny delete\n")
+        done = subprocess.CompletedProcess(["/bin/ls"], 0, stdout=listing, stderr="")
+        with mock.patch.object(hook.sys, "platform", "darwin"), \
+                mock.patch.object(hook.subprocess, "run", return_value=done) as run:
+            self.assertEqual(FILE_ACL("/fleet/host.lock"), self.ACL, "inherited entries come with the directory")
+        self.assertEqual(run.call_args.args[0], ["/bin/ls", "-led", "/fleet/host.lock"])
+        failed = subprocess.CompletedProcess(["/bin/ls"], 1, stdout="", stderr="")
+        with mock.patch.object(hook.sys, "platform", "darwin"), \
+                mock.patch.object(hook.subprocess, "run", return_value=failed):
+            self.assertIsNone(FILE_ACL("/fleet/host.lock"))
+        with mock.patch.object(hook.sys, "platform", "linux"):
+            self.assertEqual(FILE_ACL("/fleet/host.lock"), [])
+
+
+FILE_ACL = hook.file_acl  # the real one, before LedgerSelfHealTest patches it
+
+
 class MirrorBorrowTest(unittest.TestCase):
     """A cmux runner checkout borrows the mini's git mirror at job-completed and drops its local copies; at
     job-started a borrower whose mirror is gone or was rebuilt loses its .git, so checkout clones it whole."""

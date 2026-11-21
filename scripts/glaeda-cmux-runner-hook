@@ -6588,9 +6588,165 @@ def take_host_lock(path: str, watch_pid: int | JobOwner, state_dir: Path) -> tup
     return held, (f"{HOST_LOCK_HELD} ({note})" if held else note)
 
 
+# LEDGER_SELF_HEAL: a ledger file under FLEET_DIR (host.lock, capacity/*) that another user owns, in a directory the
+# runner user owns, is renamed aside and recreated as the runner's, with the same mode and ACL, once; the open is then
+# retried once. The main nightly signing Mac, 2026-11-21: host.lock was a guest user's (0660, an ACL denying that
+# guest read and write), dating from before the guest's fence, so the runner user (owning the directory) got
+# EACCES opening it. Run 44898080726's generate-nightly-deltas (11:27-12:27Z) and run 44907462015's
+# keep-published-dsyms (13:43-14:43Z) each held the signer an hour on "cannot take the ledger (PermissionError)";
+# LEDGER_ERROR_IS_FINAL then made it a refusal at once, but every signing job still failed until a human swapped the
+# file. Anything else (a file the runner owns, a directory it does not own, a symlink, another errno) stays the
+# immediate refusal. No runner process can hold a lock on a file the runner cannot open, so the swap splits no lock
+# the runner's own jobs share.
+LEDGER_HEAL_ERRNOS = frozenset({errno.EACCES, errno.EPERM})
+LEDGER_HEALED: set[str] = set()  # paths healed by this process: each at most once
+LEDGER_HEAL_LOCK = ".ledger-heal.lock"  # beside the healed file; not a host-lock-holder* name
+LEDGER_HEAL_WAIT_S = 5.0  # a heal takes milliseconds
+
+
+def file_acl(path: str) -> list[str] | None:
+    """path's explicit (non-inherited) ACL entries, in order, as `chmod +a` takes them: [] off macOS or with none,
+    None when they cannot be read (the heal is then refused rather than drop a fence)."""
+    if sys.platform != "darwin":
+        return []
+    try:
+        listing = subprocess.run(["/bin/ls", "-led", path], stdin=subprocess.DEVNULL, capture_output=True,
+                                 text=True, errors="replace", timeout=5, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if listing.returncode != 0:
+        return None
+    entries = []
+    for line in listing.stdout.splitlines()[1:]:
+        if (match := re.match(r"\s*\d+: (.+?)\s*$", line)) and " inherited " not in f" {match.group(1)} ":
+            entries.append(match.group(1))
+    return entries
+
+
+def set_file_acl(path: str, entries: list[str]) -> bool:
+    """Add entries (file_acl's) to path's ACL in order; True when every one took."""
+    for entry in entries:
+        try:
+            done = subprocess.run(["/bin/chmod", "+a", entry, path], stdin=subprocess.DEVNULL, capture_output=True,
+                                  text=True, errors="replace", timeout=5, check=False)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        if done.returncode != 0:
+            return False
+    return True
+
+
+def owner_name(uid: int) -> str:
+    try:
+        import pwd
+        return pwd.getpwuid(uid).pw_name
+    except (ImportError, KeyError):
+        return str(uid)
+
+
+def heal_ledger_file(path: str | os.PathLike[str], error: OSError) -> str | None:
+    """LEDGER_SELF_HEAL: swap a ledger file another user owns for the runner's own; the log line, or None when this
+    is not that case (or the heal failed, leaving the old file in place)."""
+    path = os.fspath(path)
+    if error.errno not in LEDGER_HEAL_ERRNOS or path in LEDGER_HEALED:
+        return None
+    parent = os.path.dirname(os.path.abspath(path))
+    fleet = os.path.realpath(FLEET_DIR)
+    real_parent = os.path.realpath(parent)
+    if real_parent != fleet and not real_parent.startswith(fleet + os.sep):
+        return None
+    uid = os.geteuid()
+    try:
+        old = os.lstat(path)
+        if not stat.S_ISREG(old.st_mode) or old.st_uid == uid or os.stat(parent).st_uid != uid:
+            return None
+    except OSError:
+        return None
+    LEDGER_HEALED.add(path)
+    try:  # one heal at a time per directory: two runners swapping at once could move the other's fresh file aside
+        guard = os.open(os.path.join(parent, LEDGER_HEAL_LOCK), os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+    except OSError:
+        return None
+    try:
+        deadline = time.monotonic() + LEDGER_HEAL_WAIT_S
+        while True:
+            try:
+                fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    return None
+                time.sleep(0.05)
+        try:  # fresh observation under the guard
+            now = os.lstat(path)
+        except OSError:
+            return None
+        if stat.S_ISREG(now.st_mode) and now.st_uid == uid:
+            return ""  # another runner healed it meanwhile: retry the open, nothing to log
+        if (now.st_dev, now.st_ino) != (old.st_dev, old.st_ino):
+            return None
+        return swap_ledger_file(path, old)
+    finally:
+        os.close(guard)
+
+
+def swap_ledger_file(path: str, old: os.stat_result) -> str | None:
+    """heal_ledger_file's swap, under its guard: the runner's copy (old's mode and ACL) in place, old kept aside."""
+    acl = file_acl(path)
+    if acl is None:
+        return None
+    owner = owner_name(old.st_uid)
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    aside = f"{path}.{owner}-owned.{stamp}"
+    fresh = f"{path}.heal-{os.getpid()}"
+    try:  # the runner's copy first, complete, so the ledger name is never missing or fence-less
+        fd = os.open(fresh, os.O_RDONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            os.fchmod(fd, stat.S_IMODE(old.st_mode))
+        finally:
+            os.close(fd)
+        if not set_file_acl(fresh, acl):
+            raise OSError(errno.EPERM, "cannot copy the ACL", fresh)
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.unlink(fresh)
+        return None
+    try:
+        os.rename(path, aside)
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.unlink(fresh)
+        return None
+    try:
+        os.rename(fresh, path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.rename(aside, path)
+        with contextlib.suppress(OSError):
+            os.unlink(fresh)
+        return None
+    return (f"healed the ledger file {path} (LEDGER_SELF_HEAL): it was {owner}'s, not this runner's, so it is now "
+            f"{aside} and {path} is the runner's, mode {stat.S_IMODE(old.st_mode):04o}"
+            + (f", ACL {'; '.join(acl)}" if acl else ""))
+
+
+def open_ledger(path: str | os.PathLike[str], mode: int) -> int:
+    """os.open for a ledger file (read-only, created if missing, no symlinks), healing it once (LEDGER_SELF_HEAL) when
+    another user owns it, and retrying once; any other error raises as before."""
+    flags = os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW
+    try:
+        return os.open(path, flags, mode)
+    except OSError as error:
+        if (note := heal_ledger_file(path, error)) is None:
+            raise
+        if note:
+            print(f"{PREFIX}: {note}", flush=True)
+    return os.open(path, flags, mode)
+
+
 def lock_file(path: Path, mode: int) -> int | None:
     """An fd holding flock `mode` (with LOCK_NB) on path, created if missing, or None when it is taken."""
-    fd = os.open(path, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+    fd = open_ledger(path, 0o644)
     try:
         fcntl.flock(fd, mode | fcntl.LOCK_NB)
     except OSError:
@@ -7047,7 +7203,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
     # pinned: home-repo workflows the hook does not know use /private/tmp/cmux-ci itself
     try:
         capacity_dir.mkdir(parents=True, exist_ok=True)
-        admission = os.open(capacity_dir / "admission.lock", os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+        admission = open_ledger(capacity_dir / "admission.lock", 0o644)
     except OSError as error:
         return False, f"cannot open the capacity ledger ({type(error).__name__})"
     fds: list[int] = []
@@ -7091,7 +7247,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         # its step often needs this very mini (cmuxterm-hq#13078).
         if klass != GATEWAY_CLASS and os.path.isdir(os.path.dirname(host_lock)):
             # created if missing, so a worker that starts later still has to wait for this job
-            fd = os.open(host_lock, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o660)
+            fd = open_ledger(host_lock, 0o660)
             for attempt in range(6):  # a fleet probe takes it exclusively for microseconds; a build keeps it
                 try:
                     fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
