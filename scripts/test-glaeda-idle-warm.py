@@ -947,6 +947,57 @@ class FuzzTest(Base):
         self.assertFalse(hook.pid_alive(app_pid), "the app is gone")
 
 
+class EngineFloorTest(Base):
+    """A build older than cmux#48852 runs the engine at the floor, never its own: its engine opens a world-writable
+    /tmp/cmux-debug-<tag>.sock that the signing-guest check refuses (a guest worker, 2026-11-22)."""
+
+    def git(self, *args: str) -> str:
+        return subprocess.run(["git", "-C", os.fspath(self.repo), *args], check=True, capture_output=True,
+                              text=True).stdout.strip()
+
+    def commit(self, app: str) -> str:
+        (self.repo / "dogfood" / "fuzz" / "cmuxfuzz" / "app.py").write_text(app, encoding="utf-8")
+        self.git("add", "-A")
+        self.git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "c")
+        return self.git("rev-parse", "HEAD")
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.saved["ENGINE_FLOOR"] = warm.ENGINE_FLOOR
+        self.repo = self.state / ".catch-up" / "cmux"
+        (self.repo / "scripts").mkdir(parents=True)
+        (self.repo / "dogfood" / "fuzz" / "cmuxfuzz").mkdir(parents=True)
+        (self.repo / "scripts" / "fuzz").write_text("#!/bin/sh\n", encoding="utf-8")
+        self.git("init", "-q")
+        self.old = self.commit("SOCK = '/tmp/cmux-debug-{tag}.sock'\n")
+        warm.ENGINE_FLOOR = self.commit("path = tempfile.mkdtemp(prefix='cmux-fuzz-')\n")
+        self.new = self.commit("path = tempfile.mkdtemp(prefix='cmux-fuzz-')  # newer\n")
+        os.environ.pop("GLAEDA_IDLE_FUZZ_ENGINE", None)
+
+    def test_an_old_build_runs_the_floor_engine_and_a_new_one_its_own(self) -> None:
+        engines = warm.fuzz_dir() / "engines"
+        self.assertEqual(warm.stage_engine(self.state, self.old), engines / warm.ENGINE_FLOOR)
+        self.assertIn("mkdtemp", (engines / warm.ENGINE_FLOOR / "dogfood/fuzz/cmuxfuzz/app.py").read_text())
+        self.assertFalse((engines / self.old).exists(), "the old engine is never exported")
+        self.assertEqual(warm.stage_engine(self.state, self.new), engines / self.new)
+        self.assertIn("newer", (engines / self.new / "dogfood/fuzz/cmuxfuzz/app.py").read_text())
+
+    def test_an_old_engine_staged_before_the_fix_is_never_run(self) -> None:
+        stale = warm.fuzz_dir() / "engines" / self.old
+        (stale / "dogfood" / "fuzz" / "cmuxfuzz").mkdir(parents=True)
+        (stale / "scripts").mkdir()
+        (stale / "scripts" / "fuzz").write_text("", encoding="utf-8")
+        (stale / "dogfood" / "fuzz" / "cmuxfuzz" / "app.py").write_text("SOCK = '/tmp/x.sock'\n", encoding="utf-8")
+        (stale / ".complete").write_text(self.old + "\n", encoding="utf-8")
+        self.assertEqual(warm.stage_engine(self.state, self.old), warm.fuzz_dir() / "engines" / warm.ENGINE_FLOOR)
+        self.git("checkout", "-q", "--detach", self.old)
+        broken = self.state / ".catch-up" / "cmux" / ".git"
+        broken.rename(broken.with_name("git.off"))  # no repo can export: only a kept engine at the floor may run
+        self.assertEqual(warm.stage_engine(self.state, "f" * 40), warm.fuzz_dir() / "engines" / warm.ENGINE_FLOOR)
+        (warm.fuzz_dir() / "engines" / warm.ENGINE_FLOOR / "dogfood/fuzz/cmuxfuzz/app.py").write_text("old\n")
+        self.assertIsNone(warm.stage_engine(self.state, "f" * 40), "the stale engine is no fallback")
+
+
 class TrimTest(Base):
     def test_runs_a_preemption_cut_short_are_trimmed_once_old(self) -> None:
         runs = self.dir / "runs"

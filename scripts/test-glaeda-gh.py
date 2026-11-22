@@ -24536,6 +24536,107 @@ class LandTest(Base):
         self.assertEqual((e.get("stop") or {}).get("code"), "head_moved")
         self.assertEqual(self.w.gh_calls("pr", "merge"), [])
 
+    # A base merge somebody else made (glaeda#2490, hq#17948, 2026-11-22: cmux-agents-lander[bot]'s "Merge branch
+    # 'main' into ..." on a pinned head stopped the land head_moved, and each owner re-pinned by hand).
+    LD = "d" * 40
+    PIN_DIFF = {"f": "a.py", "s": "modified", "p": None, "d": "@@ -10,3 +10,4 @@ def f():\n x\n+y\n z"}
+
+    def base_merged(self, head: str = LB, parents: list | None = None, now: Any = "same", was: Any = "same",
+                    mb: str = "") -> None:
+        """The cache shows HEAD, a merge whose parents are PARENTS ([pin, base commit]), and the compares answer."""
+        self.pr(head, checks=[("ci", "COMPLETED", "SUCCESS")])
+        self.w.cache[self.KEY]["data"].update(headParents=parents or [LA, self.LD], headParent=(parents or [LA])[0],
+                                              baseRefName="main")
+        moved = {**self.PIN_DIFF, "d": "@@ -14,3 +14,4 @@ def f():\n w\n+y\n z"}  # base lines above it moved it
+        now = {"mb": mb or self.LD, "files": [moved]} if now == "same" else now
+        was = {"mb": "e" * 40, "files": [self.PIN_DIFF]} if was == "same" else was
+        self.w.api[f"repos/o/r/compare/main...{head}"] = None if now is None else json.dumps(now)
+        self.w.api[f"repos/o/r/compare/{self.LD}...{LA}"] = None if was is None else json.dumps(was)
+
+    def pinned_and_waiting(self) -> dict:
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
+        e = self.tick()
+        self.assertEqual((e["state"], e["pinSha"]), ("waiting", LA))
+        return e
+
+    def compares(self) -> list[list[str]]:
+        return [c for c in self.w.gh_calls("api") if "/compare/" in c[1]]
+
+    def test_the_pin_follows_a_base_merge_nobody_in_this_queue_made(self):
+        self.pinned_and_waiting()
+        self.base_merged()
+        self.w.answers.append(ok_answer(LB))
+        e = self.tick(30)
+        self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, LB))
+        self.assertEqual([(h["was"], h["head"], h["base"]) for h in e["history"] if h["event"] == "repin_base_merge"],
+                         [(LA[:12], LB[:12], self.LD[:12])])
+        self.assertEqual(len(self.compares()), 2)  # once per head
+        self.assertIn(["--sha", LB], [c[-3:-1] for c in self.w.explains()])  # land_judge judged the new head in full
+        self.assert_merged_at(LB)
+
+    def test_a_base_merge_the_cache_showed_before_the_pin_is_followed_too(self):
+        # pin_wait's stop (a read since the request shows another head) defers to the same check
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
+        self.base_merged()
+        self.w.answers.append(ok_answer(LB))
+        self.assertNotEqual(self.tick(1)["state"], "stopped")  # a read since the request is nudged for first
+        e = self.tick(30)
+        self.assertEqual((e["state"], e["pinSha"]), ("merged", LB))
+        self.assertIn("repin_base_merge", [h["event"] for h in e["history"]])
+        self.assert_merged_at(LB)
+
+    def test_a_merge_that_changes_the_prs_own_diff_still_stops_head_moved(self):
+        # an evil merge (a conflict resolution, or a change made in the merge commit) is not only a base merge
+        self.pinned_and_waiting()
+        evil = {**self.PIN_DIFF, "d": "@@ -14,3 +14,5 @@ def f():\n w\n+y\n+backdoor()\n z"}
+        self.base_merged(now={"mb": self.LD, "files": [evil]})
+        e = self.tick(30)
+        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
+        self.assertIn("more than a base merge", e["stop"]["reason"])
+        self.assertIn(f"glaeda-gh land o/r#1 --sha {LB}", e["stop"]["next"])
+        self.assertEqual((self.w.explains(), self.w.gh_calls("pr", "merge")), ([], []))
+
+    def test_a_merge_of_a_commit_not_on_the_base_still_stops_head_moved(self):
+        self.pinned_and_waiting()
+        self.base_merged(mb=LC)  # where HEAD meets main is not its second parent: another branch was merged
+        e = self.tick(30)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
+        self.assertIn("not a merge of main", e["stop"]["reason"])
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
+    def test_a_base_merge_whose_compare_cannot_be_read_still_stops_head_moved(self):
+        self.pinned_and_waiting()
+        self.base_merged(was=None)
+        e = self.tick(30)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
+        self.assertIn("failed", e["stop"]["reason"])
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
+    def test_a_head_whose_first_parent_is_not_the_pin_stops_with_no_compare_read(self):
+        self.pinned_and_waiting()
+        self.base_merged(parents=[LC, self.LD])
+        e = self.tick(30)
+        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
+        self.assertEqual(self.compares(), [])
+
+    def test_land_base_merge_why_compares_the_prs_own_lines_not_their_positions(self):
+        same = {"f": "a.py", "s": "modified", "p": None, "d": "@@ -1,2 +1,3 @@\n a\n+b\n c"}
+        moved = {**same, "d": "@@ -9,2 +9,3 @@ ctx\n q\n+b\n r"}
+        why = gg.land_base_merge_why
+        self.assertEqual(why(LA, LB, LC, "main", {"files": [same]}, {"mb": LC, "files": [moved]}), "")
+        self.assertIn("not a merge of main", why(LA, LB, LC, "main", {"files": [same]}, {"mb": LA, "files": [same]}))
+        self.assertIn("in b.py", why(LA, LB, LC, "main", {"files": [same]},
+                                     {"mb": LC, "files": [same, {**same, "f": "b.py"}]}))
+        self.assertIn("no patch", why(LA, LB, LC, "main", {"files": [{**same, "d": None}]},
+                                      {"mb": LC, "files": [same]}))
+        many = [{**same, "f": f"f{i}"} for i in range(gg.LAND_COMPARE_FILES_MAX)]
+        self.assertIn("or more", why(LA, LB, LC, "main", {"files": many}, {"mb": LC, "files": many}))
+        self.assertEqual(gg.land_base_merge_parent(LA[:12], LB, {"headRefOid": LB, "headParents": [LA, LC]}), LC)
+        self.assertEqual(gg.land_base_merge_parent(LA, LB, {"headRefOid": LB, "headParents": [LC, LA]}), "")
+        self.assertEqual(gg.land_base_merge_parent(LA, LB, {"headRefOid": LB, "headParents": [LA]}), "")
+        self.assertEqual(gg.land_base_merge_parent(LA, LB, {"headRefOid": LC, "headParents": [LA, LC]}), "")
+
     def judge_merged_base(self, head: str) -> tuple[int, dict]:
         """land_judge's stale_main_update answer: it sent update_branch pinned to HEAD in the judgment itself."""
         return refusal("checks_running", head, {"kind": "wait_pr", "sha": head, "until": "done", "timeout_s": 600},
@@ -29124,7 +29225,8 @@ class LandTest(Base):
         def serve(cmd: list[str], req: dict, deadline: float) -> dict:
             asked.append((cmd[1], req))
             if req["op"] == "room":
-                return {"ok": True, "room": room[cmd[1]], "host": cmd[1]}
+                return {"ok": True, "room": room[cmd[1]], "host": cmd[1],
+                        "readable": {o: "" for o in req.get("owners") or []}}
             return {"ok": True, "accepted": [r["id"] for r in req["requests"]], "refused": [], "host": cmd[1]}
         self.q.forward = serve
 
@@ -29203,6 +29305,85 @@ class LandTest(Base):
         with mock.patch.object(gg, "daemon_running", lambda grace=0.0: False), contextlib.redirect_stdout(out):
             gg.cmd_land_serve(json.dumps({"op": "room"}))
         self.assertEqual(json.loads(out.getvalue())["room"], 0)
+
+    def test_overflow_goes_only_to_a_peer_that_reads_the_rows_owner_off_the_login(self):
+        """2026-11-22: a peer with no landing-role App credential took overflowed rows and judged them on the shared
+        login (3,480 REST calls/h). The room ask names the rows' owners; a peer that cannot read an owner off the login
+        (or names none, an older glaeda-gh) is offered none of its rows, which go to the next peer that can."""
+        logs: list[dict] = []
+        p = mock.patch.object(gg, "log", logs.append)
+        p.start()
+        self.addCleanup(p.stop)
+        self.w.config["workers"] = 1
+        self.w.config["overflow"] = [["reach", "no-app-peer", "glaeda-gh", "land", "serve"],
+                                     ["reach", "old-peer", "glaeda-gh", "land", "serve"],
+                                     ["reach", "app-peer", "glaeda-gh", "land", "serve"]]
+        asked: list[tuple[str, dict]] = []
+
+        def serve(cmd: list[str], req: dict, deadline: float) -> dict:
+            asked.append((cmd[1], req))
+            if req["op"] == "room":
+                said = {"no-app-peer": {o: "no landing-role App pool has a credential on this host"
+                                        for o in req.get("owners") or []},
+                        "old-peer": None, "app-peer": {o: "" for o in req.get("owners") or []}}[cmd[1]]
+                return {"ok": True, "room": 5, "host": cmd[1], **({} if said is None else {"readable": said})}
+            return {"ok": True, "accepted": [r["id"] for r in req["requests"]], "refused": [], "host": cmd[1]}
+        self.q.forward = serve
+
+        class Busy:
+            def done(self) -> bool:
+                return False
+        self.q.jobs["pr:o/r#99"] = Busy()
+        key = self.stuck(11, 3 * 3600)
+        self.tick(30)
+        rooms = [(h, q.get("owners")) for h, q in asked if q["op"] == "room"]
+        self.assertEqual(rooms, [("no-app-peer", ["o"]), ("old-peer", ["o"]), ("app-peer", ["o"])])
+        sent = [(h, [r["target"] for r in q["requests"]]) for h, q in asked if q["op"] == "batch"]
+        self.assertEqual(sent, [("app-peer", ["o/r#11"])])
+        self.assertTrue(all(r.get("overflow") for h, q in asked if q["op"] == "batch" for r in q["requests"]))
+        self.assertEqual(self.q.entries[key]["forwardedTo"], "app-peer")
+        why = [x for x in logs if x.get("event") == "land-overflow-unreadable"]
+        self.assertEqual([x["peer"] for x in why], ["no-app-peer", "old-peer"])
+        self.assertIn("no landing-role App pool", why[0]["owners"]["o"])
+
+    def test_land_serve_refuses_an_overflowed_row_it_would_judge_on_the_login(self):
+        """The peer's end: its room answer says which owners it reads off the login (the latch-free check), and its
+        batch refuses an overflowed row for any other owner, naming why; an executor handoff (no overflow tag) is
+        taken as before."""
+        self.w.config["latchFreeCommand"] = ["/fake/ready", "--owner", "{owner}"]
+
+        def ready(argv, timeout, env):
+            if argv[0] == "/fake/ready":
+                return subprocess.CompletedProcess(argv, 0 if argv[-1] == "o" else 1, "", "gh-app-token: not ready "
+                                                   f"for {argv[-1]}: no App pool here serves {argv[-1]}\n")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        queue = gg.LandQueue(run=ready, config=self.w.config, inline=True, broker_client=lambda: False)
+        self.assertEqual(gg.land_overflow_readable(["O", "p", "o"], queue), {"o": "", "p": "no App pool here serves p"})
+        self.assertEqual(gg.land_overflow_readable(None, queue), {})
+
+        real = gg.LandQueue.owner_latch_free
+
+        def answer_of(q, owner: str, quiet: bool = False) -> tuple[bool, str]:  # a fresh serve's queue asks as QUEUE
+            return real(queue, owner, quiet)
+        out = io.StringIO()
+        with mock.patch.object(gg, "land_config", return_value={**self.w.config, "landJudge": self.w.mh}), \
+                mock.patch.object(gg.LandQueue, "owner_latch_free", answer_of), \
+                mock.patch.object(gg, "daemon_running", lambda grace=0.0: True), \
+                mock.patch.object(gg, "land_room", lambda doc, now: 2), contextlib.redirect_stdout(out):
+            self.assertEqual(gg.cmd_land_serve(json.dumps({"op": "room", "owners": ["o", "p"]})), 0)
+        self.assertEqual(json.loads(out.getvalue())["readable"], {"o": "", "p": "no App pool here serves p"})
+        out = io.StringIO()
+        reqs = [{"op": "land", "target": "o/r#1", "id": "ovf-1", "overflow": True},
+                {"op": "land", "target": "p/r#2", "id": "ovf-2", "overflow": True},
+                {"op": "land", "target": "p/r#3", "id": "exec-3"}]
+        with mock.patch.object(gg, "land_config", return_value={**self.w.config, "landJudge": self.w.mh}), \
+                mock.patch.object(gg.LandQueue, "owner_latch_free", answer_of), \
+                mock.patch.object(gg, "daemon_running", lambda grace=0.0: True), contextlib.redirect_stdout(out):
+            self.assertEqual(gg.cmd_land_serve(json.dumps({"op": "batch", "requests": reqs})), 0)
+        answer = json.loads(out.getvalue())
+        self.assertEqual(sorted(answer["accepted"]), ["exec-3", "ovf-1"])
+        self.assertEqual([r["id"] for r in answer["refused"]], ["ovf-2"])
+        self.assertIn("on the login: no App pool here serves p", answer["refused"][0]["why"])
 
     def test_rereads_of_unreadable_prs_hold_at_most_their_share_of_the_workers(self):
         """LAND_REREAD_SHARE: with half the workers already judging entries whose last answer was "unreadable" at an
@@ -30943,6 +31124,48 @@ class LandForwardTest(Base):
                 self.assertEqual(gg.cmd_land_serve(line), gg.EXIT_FAIL)
             self.assertEqual(json.loads(out.getvalue())["code"], code)
 
+
+    def test_a_land_behind_an_earlier_request_says_it_is_normal_when_it_goes_and_not_to_reach_the_executor(self):
+        """The bare "an earlier request is still waiting to be forwarded" read as a stall, and callers reached the
+        executor by hand around the queue. The line says this is normal, the backoff left and its UTC send time, and
+        not to reach the executor (its name from land.json's executor, never a fixed host) directly."""
+        now = 1_800_000_000.0
+        gg.land_dir().mkdir(parents=True, exist_ok=True)
+        gg.write_json(gg.land_dir() / gg.LAND_FORWARD_FILE, {"executor": "big-exec", "state": "failing",
+                                                             "error": "fanout-client: refused", "at": now - 60,
+                                                             "retryAt": now + 180})
+        line = gg.land_forward_pending("big-exec", now)
+        for part in ("still waiting to be forwarded", "this is normal", "180 s more", gg.utc_clock(now + 180),
+                     "do not reach big-exec directly", "fanout-client: refused"):
+            self.assertIn(part, line)
+        gg.write_json(gg.land_dir() / gg.LAND_FORWARD_FILE, {"executor": "big-exec", "state": "ok", "at": now})
+        line = gg.land_forward_pending("big-exec", now)
+        self.assertIn("no backoff now", line)
+        self.assertIn(gg.utc_clock(now + gg.LAND_FORWARD_DEADLINE), line)
+        self.assertIn("do not reach big-exec directly", line)
+        # end to end: a request already in requests/ holds the next one there, and the line names the executor
+        gg.LandQueue.requests_dir().mkdir(parents=True, exist_ok=True)
+        (gg.LandQueue.requests_dir() / "older.json").write_text("{}", encoding="utf-8")
+        with mock.patch.object(gg, "land_forward", side_effect=AssertionError("sent around the queue")), \
+                mock.patch.object(gg, "daemon_running", return_value=True), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(gg.cmd_land_forwarded(list(self.EXEC), "o/r#1", [], "cosmic/coord", "", 0, False),
+                             gg.EXIT_OK)
+        self.assertIn(f"forwards it to {gg.land_forward_name(list(self.EXEC))}", out.getvalue())
+        self.assertIn(f"do not reach {gg.land_forward_name(list(self.EXEC))} directly", out.getvalue())
+
+    def test_a_forward_runs_its_executor_with_the_control_slot_marker(self):
+        """A forward is one small control-plane call: the host's fan-out admission once refused it as a background
+        client. The executor command runs with the marker that asks for the reserved control slot."""
+        seen = {}
+
+        def bounded(argv, timeout=None, input_text=None, env=None):
+            seen["env"] = env
+            return subprocess.CompletedProcess(argv, 0, '{"ok": true}\n', "")
+        with mock.patch.object(gg, "run_bounded", bounded), mock.patch.object(gg, "program_path", lambda p: p):
+            self.assertTrue(gg.land_forward(["reach", "h"], {"op": "status"})["ok"])
+        self.assertEqual(seen["env"][gg.LAND_FORWARD_SLOT_ENV], "glaeda-land-forward")
+        self.assertEqual(seen["env"].get("PATH"), os.environ.get("PATH"))
 
     def test_a_remote_wait_that_ends_with_the_land_still_going_is_a_timeout(self):
         """Review F1: `land --wait N` forwarded, the executor answering "requested" with no entry, exited 0."""

@@ -1038,6 +1038,10 @@ def stage_build(state: Path, root: int, sha: str) -> Path | str:
 
 
 ENGINE_PATHS = ("scripts/fuzz", "dogfood/fuzz")
+# cmux#48852: the engine keeps the app's socket and debug log in a private 0700 dir per session. An engine before it
+# opens /tmp/cmux-debug-<tag>.sock, a world-writable path the signing-guest check refuses (a guest worker read
+# "shared_writes: writable: /private/tmp/cmux-debug-fuzz.sock" on 2026-11-22 with a build 257 commits behind main).
+ENGINE_FLOOR = "51e1abc81c8190e26b2e64e4b90270b5552c2baa"
 
 
 def stage_engine(state: Path, sha: str) -> Path | None:
@@ -1047,40 +1051,74 @@ def stage_engine(state: Path, sha: str) -> Path | None:
 
     Exported, not run from the catch-up's checkout: a catch-up now runs beside the fuzzer and checks out a newer
     main under it. git archive reads committed objects only, from the catch-up checkout or the seed prefetch
-    mirror (both blobless clones of cmux; a missing blob is fetched on demand)."""
+    mirror (both blobless clones of cmux; a missing blob is fetched on demand).
+
+    A build older than ENGINE_FLOOR runs the engine at ENGINE_FLOOR instead: the engine only drives the app
+    through its socket, and an older one leaves a world-writable socket in /tmp. A repo that cannot tell
+    (the floor not fetched yet) is skipped, never exported at the old sha."""
     override = os.environ.get("GLAEDA_IDLE_FUZZ_ENGINE")
     if override:
         checkout = Path(override)
         return checkout if (checkout / "scripts" / "fuzz").is_file() and (checkout / "dogfood" / "fuzz").is_dir() else None
     engines = fuzz_dir() / "engines"
     final = engines / sha
-    if (final / ".complete").is_file():
+    if (final / ".complete").is_file() and engine_at_floor(final):
         return final
     engines.mkdir(parents=True, exist_ok=True)
     for stale in engines.glob(".*"):
         shutil.rmtree(stale, ignore_errors=True)
+    git_env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "PATH": PATH}
     for repo in (["-C", os.fspath(state / ".catch-up" / "cmux")], ["--git-dir", os.fspath(state / ".prefetch" / "cmux.git")]):
-        incoming = engines / f".{sha}.{os.getpid()}"
+        at = engine_sha(repo, sha, git_env)
+        if at is None:
+            continue
+        if at != sha and (engines / at / ".complete").is_file():
+            return engines / at
+        incoming = engines / f".{at}.{os.getpid()}"
         incoming.mkdir()
         try:
-            archive = subprocess.run([GIT, *repo, "archive", "--format=tar", sha, "--", *ENGINE_PATHS],
-                                     capture_output=True, timeout=300,
-                                     env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "PATH": PATH})
+            archive = subprocess.run([GIT, *repo, "archive", "--format=tar", at, "--", *ENGINE_PATHS],
+                                     capture_output=True, timeout=300, env=git_env)
             if archive.returncode == 0:
                 subprocess.run(["/usr/bin/tar", "-xf", "-", "-C", os.fspath(incoming)], input=archive.stdout,
                                check=True, capture_output=True, timeout=120)
                 if (incoming / "scripts" / "fuzz").is_file() and (incoming / "dogfood" / "fuzz").is_dir():
-                    (incoming / ".complete").write_text(sha + "\n")
-                    shutil.rmtree(final, ignore_errors=True)
-                    incoming.rename(final)
+                    (incoming / ".complete").write_text(at + "\n")
+                    target = engines / at
+                    shutil.rmtree(target, ignore_errors=True)
+                    incoming.rename(target)
                     for old in staged("engines", ".complete")[FUZZ_KEEP_ENGINES:]:
                         shutil.rmtree(old, ignore_errors=True)
-                    return final
+                    return target
         except (OSError, subprocess.SubprocessError):
             pass
         shutil.rmtree(incoming, ignore_errors=True)
-    kept = staged("engines", ".complete")
+    kept = [path for path in staged("engines", ".complete") if engine_at_floor(path)]
     return kept[0] if kept else None
+
+
+def engine_sha(repo: list[str], sha: str, env: dict) -> str | None:
+    """The commit to export the engine from for build SHA in REPO: SHA when ENGINE_FLOOR is in its history, else
+    ENGINE_FLOOR; None when REPO cannot tell (no such commit, git failed)."""
+    try:
+        done = subprocess.run([GIT, *repo, "merge-base", "--is-ancestor", ENGINE_FLOOR, sha],
+                              capture_output=True, timeout=120, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode == 0:
+        return sha
+    if done.returncode == 1:
+        return ENGINE_FLOOR
+    return None
+
+
+def engine_at_floor(path: Path) -> bool:
+    """A staged engine exported before ENGINE_FLOOR still writes the shared socket: only a fallback at or past
+    it may run. Its own app.py says which: #48852's private dir is a mkdtemp."""
+    try:
+        return "mkdtemp" in (path / "dogfood" / "fuzz" / "cmuxfuzz" / "app.py").read_text(encoding="utf-8")
+    except OSError:
+        return False
 
 
 def pending_replay(now: float | None = None) -> Path | None:
