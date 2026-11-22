@@ -251,7 +251,11 @@ failed, required or not, and succeeds once every check finished with success, ne
 a pending commit status is unfinished like a running check, and so is one of the repo's
 EXPECTED_CONTEXTS (leo-workspace's ws-check) that has not been posted yet;
 done waits for every check to finish; required lets only the checks GitHub requires decide (when
-any are marked); merged waits for the merge.
+any are marked); merged waits for the merge, and only the merge (never checks alone).
+green, done and required on a PR still OPEN print "result: green (checks passed; PR still OPEN, not merged)" (done:
+"result: done (...)"), exit 0, and name `next: glaeda-gh wait pr REF --until merged`; --json keeps "result": "success"
+and adds "merged": false. With no --until, a PR this host's glaeda land holds an unfinished request for is waited on
+until merged (said on stderr); the land's own stop or cancel turns it back into the green wait (manaflow-ai/cmux#50409).
 
 A PR that conflicts with its base (mergeable CONFLICTING, merge state DIRTY), for example after the
 PR it was stacked on was squash-merged, runs no pull_request workflows until the next push. `wait
@@ -21210,6 +21214,8 @@ def render(key: str, entry: dict | None, as_json: bool, extra: dict | None = Non
         if extra.get("reason"):
             lines.append(f"glaeda-gh: {extra['reason']}")
         lines.append(f"next: {extra.get('next') or 'none'}")
+    elif extra and extra.get("ok") is True and extra.get("next"):
+        lines.append(f"next: {extra['next']}")  # a pass that is not the end (wait_step: green on an open PR)
     return "".join(f"{line}\n" for line in lines)
 
 
@@ -22143,14 +22149,14 @@ def say_waiting(line: str) -> None:
 
 def wait_request(kind: str, target: str, until: str, timeout: float, jobs: bool, as_json: bool,
                  sha: str | None, exact: bool, grace: float, settle: float = SETTLE_GRACE,
-                 ceiling: float | None = None) -> dict:
+                 ceiling: float | None = None, chosen: dict | None = None) -> dict:
     """What a `wait pr|run` is ruled on: the same fields whether the client polls (cmd_wait) or the
     daemon rules on it (subscribe_wait). `began` is wall-clock time: only data fetched after it counts.
     TIMEOUT is "no change for this long" and CEILING (--max) the bound from `began` (wait_deadline)."""
     return {"key": parse_key(kind, target), "kind": kind, "target": target, "until": until, "timeout": timeout,
             "max": max(timeout, default_wait_max(timeout) if ceiling is None else ceiling),
             "jobs": jobs, "json": as_json, "sha": sha, "exact": exact, "grace": grace, "settle": settle,
-            "began": time.time(), "verbose": full_output()}
+            "began": time.time(), "verbose": full_output(), **({"chosen": dict(chosen)} if chosen else {})}
 
 
 def rest_run(data: dict | None) -> dict:
@@ -22228,10 +22234,63 @@ def run_unconfirmed(entry: dict | None, since: float, now: float) -> bool:
     return now - since < RUN_CONFIRM_MAX
 
 
+# manaflow-ai/cmux#50409, 2026-11-22: after `glaeda-gh land ... --notify`, `glaeda-gh wait pr manaflow-ai/cmux#50409`
+# with no --until ended at 14:51Z "result: success, ended_by: success" on green checks; the PR was still OPEN (it merged
+# at 15:23:12Z, after the land workers sat 32/32 busy). The agent reported "merged" and its coordinator spent a 90-minute
+# deploy wait on a PR that was not in. Two things follow. A pass on an open PR says what it is, green and not merged,
+# and names the merged wait as its next step (WAIT_OPEN_PASS; exit 0 and --json's "result": "success" stay, with
+# "merged": false). And a wait with no --until on a PR glaeda land holds a request for means the merge: it waits until
+# merged (wait_until_chosen) and says it chose that; the land's own stop turns it back into the green wait it would have
+# been (wait_land_ended), so it never outlives the land.
+WAIT_OPEN_PASS = {"green": ("green", "checks passed"), "required": ("green", "required checks passed"),
+                  "done": ("done", "every check finished and passed")}
+LAND_WAIT_ACTIVE = frozenset(LAND_STATES) - {"merged", "stopped", "cancelled"}  # a forwarded one runs on its executor
+
+
+def land_wait_entry(key: str) -> dict | None:
+    """This host's glaeda land entry for the PR KEY, as the queue last saved it, or None (one small file read)."""
+    entry = read_json(LandQueue.entries_dir() / file_name(key))
+    return entry if isinstance(entry, dict) and entry.get("key") == key else None
+
+
+def wait_until_chosen(kind: str, key: str, until: str | None) -> tuple[str, dict | None]:
+    """What a `wait pr` with UNTIL (None: no --until typed) waits for, and why when it chose: merged while this host's
+    glaeda land holds an unfinished request for the PR, else green. An --until typed is never changed."""
+    if until is not None or kind != "pr":
+        return until or "green", None
+    state = (land_wait_entry(key) or {}).get("state")
+    if state not in LAND_WAIT_ACTIVE:
+        return "green", None
+    return "merged", {"by": "land", "state": state,
+                      "why": f"a land request for {key_name(key)} is {state} in glaeda land: this wait (no --until) "
+                             "waits until merged or the land's own stop, not on green checks alone; pass "
+                             "--until green to wait on checks only"}
+
+
+def wait_land_ended(req: dict) -> None:
+    """A wait whose --until merged was chosen for a land request (wait_until_chosen): once that request stopped, was
+    cancelled or is gone, it goes on as the green wait it would have been, and says what ended the land."""
+    chosen = req.get("chosen")
+    if not isinstance(chosen, dict) or chosen.get("by") != "land" or chosen.get("ended") or req.get("until") != "merged":
+        return
+    entry = land_wait_entry(req["key"])
+    state = (entry or {}).get("state")
+    if state in LAND_WAIT_ACTIVE or state == "merged":
+        return
+    stop = (entry or {}).get("stop") if isinstance((entry or {}).get("stop"), dict) else {}
+    why = ": ".join(str(stop[k]) for k in ("code", "reason") if stop.get(k))
+    chosen["ended"] = ("the land request stopped" + (f" ({why})" if why else "") if state == "stopped"
+                       else "the land request was cancelled" if state == "cancelled"
+                       else "the land request is gone from glaeda land")
+    req["until"] = "green"
+
+
 def wait_step(req: dict, now: float, get: Callable[[str, list[str]], dict] | None = None) -> tuple[int, str] | None:
     """One look at a `wait pr|run` (wait_request): (exit code, what it prints) once it is decided or out
     of time, else None. Rules only on data the daemon fetched after the wait began, never on an older
     cache. A short --sha that GitHub's head resolves is written back into REQ. Raises WatchError."""
+    if req.get("kind") == "pr":
+        wait_land_ended(req)
     key, kind, until, grace, began = req["key"], req["kind"], req["until"], req["grace"], req["began"]
     sha, exact, as_json = req.get("sha"), req.get("exact", True), req.get("json", False)
     entry = read_cache(key)
@@ -22324,6 +22383,20 @@ def wait_step(req: dict, now: float, get: Callable[[str, list[str]], dict] | Non
         if kind == "run" and result == EXIT_FAIL and grace > 0 and run_hold(data, entry.get("jobs"), time.time(), float("inf")):
             extra["note"] = f"a glaeda runner refused this attempt at setup and no rescue attempt followed within {int(grace)}s"
         extra.update(wait_outcome(req, result, entry, waited))
+        chosen = req.get("chosen") if isinstance(req.get("chosen"), dict) else None
+        if chosen:
+            extra["until"] = (f"green (merged was chosen for a land request, then {chosen['ended']})"
+                              if chosen.get("ended") else
+                              f"merged (chosen: a land request is {chosen.get('state')} in glaeda land)")
+            if chosen.get("ended"):
+                extra["land"] = f"{chosen['ended']}; this wait then ruled on its checks (green)"
+        if result == EXIT_OK and kind == "pr" and data.get("state") == "OPEN" and until in WAIT_OPEN_PASS:
+            word, what = WAIT_OPEN_PASS[until]
+            extra["merged"] = False
+            if not as_json:  # --json keeps "result": "success" and "ended_by": "success", the contract callers parse
+                extra["result"] = f"{word} ({what}; PR still OPEN, not merged)"
+                extra["ended_by"] = word
+            extra["next"] = f"glaeda-gh wait pr {key_name(key)} --until merged"
         return result, render(key, entry, as_json, extra, until, grace, bool(req.get("verbose")))
     # Nothing can be read for this kind until a reset that is past this wait's own deadline, so every second left
     # would be spent the way the first ones were: on nothing. Return now and name the wait that ends instead of
@@ -22437,7 +22510,7 @@ def inconclusive_note(data: dict, now: float) -> str:
 
 def cmd_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_json: bool,
              sha: str | None = None, grace: float = RESCUE_GRACE, settle: float = SETTLE_GRACE,
-             ceiling: float | None = None) -> int:
+             ceiling: float | None = None, chosen: dict | None = None) -> int:
     """The polling wait: this process re-reads the cache until wait_step decides. `wait pr|run` uses it
     only when the daemon cannot rule on the wait itself (subscribe_wait). Says the waiting line once,
     before it blocks; poll_wait does not, so a wait handed back to it (resume_wait) is not said twice."""
@@ -22449,7 +22522,8 @@ def cmd_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_
     # matters most. Said now, not at the deadline -- learning it at the deadline is the whole measured loss.
     blocked_note = blocked_start_line(key, kind)
     say_waiting(waiting_line(key, until, sha, exact, timeout, ceiling) + (f"\n{blocked_note}" if blocked_note else ""))
-    return poll_wait(wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace, settle, ceiling))
+    return poll_wait(wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace, settle, ceiling,
+                                  chosen))
 
 
 # A wait whose target was never read once learns why at WAIT_DIAGNOSE_AFTER instead of STALE_DATA_AFTER (600 s, and
@@ -22811,11 +22885,11 @@ def waits_dir() -> Path:
 def write_wait_request(kind: str, target: str, until: str, timeout: float, jobs: bool, as_json: bool,
                        sha: str | None, exact: bool, grace: float, pid: int, began: float | None = None,
                        settle: float = SETTLE_GRACE, ceiling: float | None = None,
-                       moved: dict | None = None) -> str:
+                       moved: dict | None = None, chosen: dict | None = None) -> str:
     """Leave a wait for the daemon: its FIFO first, then the request, so the daemon never sees a request
     without one. Interest is registered at once, as a polling wait does. Returns the request's id. A handoff
     (BEGAN) passes the TIMEOUT left of it, its CEILING from BEGAN, and what it has seen move (MOVED)."""
-    req = wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace, settle, ceiling)
+    req = wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace, settle, ceiling, chosen)
     if began is not None:  # a handoff keeps the wait's start (data read since then still counts), same deadline
         req["timeout"] += max(0.0, req["began"] - began)
         req["began"] = began
@@ -22905,7 +22979,7 @@ def wait_refusal(req: dict, code: str, reason: str, nxt: str) -> tuple[tuple[int
 
 def subscribe_wait(kind: str, target: str, until: str, timeout: float, jobs: bool, as_json: bool,
                    sha: str | None = None, grace: float = RESCUE_GRACE, settle: float = SETTLE_GRACE,
-                   ceiling: float | None = None) -> int:
+                   ceiling: float | None = None, chosen: dict | None = None) -> int:
     """`wait pr|run` as a request the daemon rules on: this process writes it and becomes BLOCKER, a bash
     asleep on a FIFO, instead of a Python interpreter re-reading the cache every WAIT_POLL (89 of those
     held 1.6 GB on cosmic-gray, 2026-10-21). Same arguments, output and exit codes as cmd_wait, which it
@@ -22919,7 +22993,7 @@ def subscribe_wait(kind: str, target: str, until: str, timeout: float, jobs: boo
     not again on the late fallback, which goes straight to poll_wait."""
     if not (0 <= max(timeout, default_wait_max(timeout) if ceiling is None else ceiling) <= WAITS_MAX_TIMEOUT) \
             or not os.access(BASH, os.X_OK) or not serving_waits():
-        return cmd_wait(kind, target, until, timeout, jobs, as_json, sha, grace, settle, ceiling)
+        return cmd_wait(kind, target, until, timeout, jobs, as_json, sha, grace, settle, ceiling, chosen)
     key = parse_key(kind, target)
     exact = True
     if sha:
@@ -22928,7 +23002,7 @@ def subscribe_wait(kind: str, target: str, until: str, timeout: float, jobs: boo
     # matters most. Said now, not at the deadline -- learning it at the deadline is the whole measured loss.
     blocked_note = blocked_start_line(key, kind)
     say_waiting(waiting_line(key, until, sha, exact, timeout, ceiling) + (f"\n{blocked_note}" if blocked_note else ""))
-    req = wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace, settle, ceiling)
+    req = wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace, settle, ceiling, chosen)
     if kind == "run" and not jobs:
         # the daemon keeps reading while this blocks (a lost finish is re-read past STALE_RUN_REREAD)
         register(key, jobs, waited=True, began=req["began"])
@@ -22943,7 +23017,8 @@ def subscribe_wait(kind: str, target: str, until: str, timeout: float, jobs: boo
         timeout = max(0.0, timeout - (time.monotonic() - started))
     try:
         rid = write_wait_request(kind, target, until, timeout, jobs, as_json, sha, exact, grace, os.getpid(),
-                                 began=req["began"], settle=settle, ceiling=req["max"], moved=req.get("moved"))
+                                 began=req["began"], settle=settle, ceiling=req["max"], moved=req.get("moved"),
+                                 chosen=req.get("chosen"))
     except OSError:
         late = dict(req)  # the same start, limits and what it has seen move
         return poll_wait(late)
@@ -30664,9 +30739,11 @@ def parser() -> argparse.ArgumentParser:
                             "by default the summary counts the superseded ones and lists 10 failures")
         if name == "wait":
             until = s.add_mutually_exclusive_group()
-            until.add_argument("--until", choices=("green", "done", "required", "merged"), default="green",
+            until.add_argument("--until", choices=("green", "done", "required", "merged"), default=None,
                            help="PRs: green (every check passes; fail fast), done (every check finished), "
                                 "required (only the checks GitHub requires decide; fail fast) or merged; "
+                                "default green, or merged while glaeda land holds a request for the PR (said on "
+                                "stderr; the land's own stop turns it back to green); "
                                 "all but merged exit 4 once the PR conflicts with its base. A synonym or a typo "
                                 "of one (checks-done, passed, merge) runs as it, said on stderr")
             for word in ("green", "done", "required", "merged"):
@@ -31563,14 +31640,18 @@ def main(argv: list[str] | None = None) -> int:
         if args.exists or args.gone or args.contains:
             raise WatchError("--exists, --gone and --contains are for wait file")
         if args.kind == "comment":
-            if args.sha or args.jobs or args.until != "green":
+            if args.sha or args.jobs or args.until is not None:
                 raise WatchError("wait comment takes --author, --match and --since, not --sha, --jobs or --until")
             return cmd_wait_comment(args.target, args.timeout, args.json, args.author, args.match, args.since,
                                     args.max)
         if args.author or args.match or args.since:
             raise WatchError("--author, --match and --since are for wait comment")
-        return subscribe_wait(args.kind, args.target, args.until, args.timeout, args.jobs, args.json, args.sha,
-                              args.rescue_grace, args.settle, args.max)
+        until, chosen = (wait_until_chosen("pr", parse_key("pr", args.target), None)
+                         if args.kind == "pr" and args.until is None else (args.until or "green", None))
+        if chosen:
+            say_waiting(f"glaeda-gh: {chosen['why']}")
+        return subscribe_wait(args.kind, args.target, until, args.timeout, args.jobs, args.json, args.sha,
+                              args.rescue_grace, args.settle, args.max, chosen)
     except WatchError as error:
         # Through say_waiting for its stdout reason: this handler covers `wait --json`, so with
         # stderr closed `print(file=None)` made a bad-argument message the first line of the
