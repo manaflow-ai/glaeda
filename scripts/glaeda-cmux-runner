@@ -3818,7 +3818,7 @@ def nightly_slot_instance(member: dict[str, Any], instance: int) -> bool:
 def gateway_instance(member: dict[str, Any], instance: int) -> bool:
     """A gateway runner (gatewayRunners): one of the instances after the member's `runners` pool instances. It carries
     only the gateway label and admits only thin cmux-ci client jobs (glaeda-cmux-runner-hook --gateway-runner).
-    The hook's two gateway tokens cap them at MAX_GATEWAY_RUNNERS whatever a receipt says."""
+    The hook's gateway tokens (GATEWAY_TOKENS) cap them at MAX_GATEWAY_RUNNERS whatever a receipt says."""
     runners_n = int(member.get("runners") or 1)
     gateway_n = min(int(member.get("gatewayRunners") or 0), int(getattr(fleet_labels(), "MAX_GATEWAY_RUNNERS", 0)))
     return runners_n <= instance < runners_n + gateway_n

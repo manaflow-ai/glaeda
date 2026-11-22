@@ -2805,10 +2805,12 @@ class HookTest(unittest.TestCase):
             self.assertEqual(fast.returncode, 0, fast.stdout + fast.stderr)
             self.assertIn("holding 0/5 units+fast-0+fast-1 for fast-tier (fast", fast.stdout)
             second = self.job("fast-tier", "f1", 5, None, "--fast-runner", env=self.FAST_TIER)
-            self.assertEqual(second.returncode, 1, second.stdout)
-            self.assertIn("refused: capacity: the fast-0 token is taken", second.stdout)
+            self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+            self.assertIn("(the fast-0 token is taken (fast-tier is fast)); admitted busy", second.stdout,
+                          "FAST_TIER_BUSY: past its wait it runs beside the other, never failed for capacity")
         finally:
             self.finish("f0")
+            self.finish("f1")
         self.assertTrue(hook.probe(capacity / "fast-0.token") and hook.probe(capacity / "fast-1.token"))
 
     def hold_gui_reserve(self, token: str = "gui") -> int:
@@ -3168,7 +3170,7 @@ class HookTest(unittest.TestCase):
         try:
             admitted = self.job("sign-nightly-identity-legacy", "s0", 14, None, "--gui-wait", "0", env=legacy)
             self.assertEqual(admitted.returncode, 0, admitted.stdout + admitted.stderr)
-            self.assertIn("holding 14/14 units+fast-0+fast-1+gui+gateway-0+gateway-1 for sign-nightly-identity-legacy (exclusive",
+            self.assertIn("holding 14/14 units+fast-0+fast-1+gui+gateway-0+gateway-1+gateway-2+gateway-3+gateway-4+gateway-5 for sign-nightly-identity-legacy (exclusive",
                           admitted.stdout)
             self.assertIn("GLAEDA_JOB_CLAIM=exclusive for the job", admitted.stdout)
             self.assertIn("GLAEDA_JOB_CLAIM=exclusive\n", github_env.read_text())
@@ -3216,7 +3218,7 @@ class HookTest(unittest.TestCase):
         try:
             admitted = self.job(job, "p0", 14, None, "--gui-wait", "0", env=env)
             self.assertEqual(admitted.returncode, 0, admitted.stdout + admitted.stderr)
-            self.assertIn("holding 14/14 units+fast-0+fast-1+gui+gateway-0+gateway-1", admitted.stdout)
+            self.assertIn("holding 14/14 units+fast-0+fast-1+gui+gateway-0+gateway-1+gateway-2+gateway-3+gateway-4+gateway-5", admitted.stdout)
             self.assertIn("GLAEDA_JOB_CLAIM=exclusive\n", github_env.read_text())
             for other, runner in (("swift-package-tests", "p1"), ("verify-signed-nightly", "p2")):
                 beside = self.job(other, runner, 14, None, "--gui-wait", "0")
@@ -3284,7 +3286,7 @@ class HookTest(unittest.TestCase):
         try:
             admitted = self.job(job, "p0", 14, None, "--gui-wait", "0", env=env)
             self.assertEqual(admitted.returncode, 0, admitted.stdout + admitted.stderr)
-            self.assertIn("holding 14/14 units+fast-0+fast-1+gui+gateway-0+gateway-1", admitted.stdout)
+            self.assertIn("holding 14/14 units+fast-0+fast-1+gui+gateway-0+gateway-1+gateway-2+gateway-3+gateway-4+gateway-5", admitted.stdout)
             self.assertIn("GLAEDA_JOB_CLAIM=exclusive\n", github_env.read_text())
             beside = self.job("swift-package-tests", "p1", 14, None, "--gui-wait", "0")
             self.assertEqual(beside.returncode, 1, beside.stdout + beside.stderr)
@@ -3481,7 +3483,7 @@ class HookTest(unittest.TestCase):
             self.assertEqual(signer.returncode, 0, out)
             self.assertIn(f"it waits {hook.SIGNING_DRAIN_WAIT_S:g} s at most for the mini to drain, holding every "
                           "other admission here meanwhile", out)
-            self.assertIn("holding 14/14 units+fast-0+fast-1+gui+gateway-0+gateway-1 for sign-nightly-identity-legacy (exclusive", out)
+            self.assertIn("holding 14/14 units+fast-0+fast-1+gui+gateway-0+gateway-1+gateway-2+gateway-3+gateway-4+gateway-5 for sign-nightly-identity-legacy (exclusive", out)
             self.assertIn("GLAEDA_JOB_CLAIM=exclusive\n", (self.dir / "github-env-n0").read_text())
             self.assertFalse(marker.exists(), "admitted: its waiter marker is gone")
             self.assertEqual(hook.admission_waiters(self.dir / "capacity"), [])
@@ -4042,9 +4044,33 @@ class HookTest(unittest.TestCase):
         finally:
             self.finish("s0")
         self.take_units(10)
-        full = self.job("fast-tier", "s1", 14, None, env=self.FAST_TIER)
-        self.assertEqual(full.returncode, 1, full.stdout)
-        self.assertIn("refused: capacity: 4 of 14 units free, fast-tier (isolated) needs 5", full.stdout)
+        try:
+            full = self.job("fast-tier", "s1", 14, None, env=self.FAST_TIER)
+            # FAST_TIER_BUSY (hq#17742): past FAST_TIER_WAIT it runs busy, holding no unit, instead of failing
+            self.assertEqual(full.returncode, 0, full.stdout + full.stderr)
+            self.assertIn("(4 of 14 units free, fast-tier (isolated) needs 5); admitted busy", full.stdout)
+            self.assertIn("holding 0/14 units for fast-tier (isolated", full.stdout)
+            self.assertTrue(hook.probe(self.dir / "capacity/unit-10"), "the busy job took none of the free units")
+        finally:
+            self.finish("s1")
+        # a signing job holding the mini (every gateway token): nothing runs busy beside it
+        capacity = self.dir / "capacity"
+        signing = [hook.lock_file(capacity / f"{name}.token", fcntl.LOCK_EX) for name in hook.GATEWAY_TOKENS]
+        try:
+            beside = self.job("fast-tier", "s2", 14, None, env=self.FAST_TIER)
+            self.assertEqual(beside.returncode, 1, beside.stdout)
+            self.assertIn("refused: capacity: a signing job holds this mini", beside.stdout)
+        finally:
+            for fd in signing:
+                os.close(fd)
+            self.finish("s2")
+        # any other job keeps its refusal
+        more = [hook.lock_file(capacity / f"unit-{slot}", fcntl.LOCK_EX) for slot in range(10, 14)]
+        self.addCleanup(lambda: [os.close(fd) for fd in more if fd is not None])
+        other = self.job("swift-test", "s3", 14, None, env=self.FAST_TIER)
+        self.assertEqual(other.returncode, 1, other.stdout)
+        self.assertNotIn("admitted busy", other.stdout)
+        self.finish("s3")
 
     def test_a_fast_tier_job_on_a_plain_side_runner_of_a_needs_host_takes_the_room_its_listener_had(self) -> None:
         """SIDE_FAST_FIT: a side listener listens with room for the isolated class median (SIDE_LISTEN_MEDIAN), so it
@@ -4202,7 +4228,7 @@ class HookTest(unittest.TestCase):
     def test_a_gateway_job_runs_on_a_gateway_token_with_every_unit_taken(self) -> None:
         """2026-10-30 12:43Z: every std mini at 76-100% CPU and units, so no thin cmux-ci client could start. On a
         gateway runner such a client takes one gateway token and no shared unit, so a full mini still admits it;
-        each mini has two tokens, one per gateway runner, and a third client is refused for want of one."""
+        each mini has six tokens (hq#17742), one per gateway runner, and a client past them is refused for want of one."""
         self.fleet()
         self.take_units(14)
         capacity = self.dir / "capacity"
@@ -4213,9 +4239,14 @@ class HookTest(unittest.TestCase):
             second = self.job("swift-test-fleet", "g1", 14, None, "--gateway-runner", env=self.FAST_TIER)
             self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
             self.assertIn("holding 0/14 units+gateway-1 for swift-test-fleet (gateway", second.stdout)
+            others = [hook.lock_file(capacity / f"{name}.token", fcntl.LOCK_EX) for name in hook.GATEWAY_TOKENS[2:]]
+            self.addCleanup(lambda: [os.close(fd) for fd in others if fd is not None])
             third = self.job("daemon-test-fleet", "g2", 14, None, "--gateway-runner", env=self.FAST_TIER)
             self.assertEqual(third.returncode, 1, third.stdout)
-            self.assertIn("refused: capacity: all 2 gateway tokens are taken", third.stdout)
+            self.assertIn("refused: capacity: all 6 gateway tokens are taken", third.stdout)
+            for fd in others:
+                os.close(fd)
+            others.clear()
         finally:
             for runner in ("g0", "g1", "g2"):
                 self.finish(runner)
@@ -4236,7 +4267,7 @@ class HookTest(unittest.TestCase):
         capacity = self.dir / "capacity"
         waiter = None
         try:
-            for runner in ("g0", "g1"):
+            for runner in self.GATEWAY_HOLDERS:  # every gateway token taken (six since hq#17742)
                 held = self.job("release-compile-fast", runner, 14, None, "--gateway-runner", env=self.FAST_TIER)
                 self.assertEqual(held.returncode, 0, held.stdout + held.stderr)
             push = event(self.dir, "gw-wait", {"repository": CMUX})
@@ -4266,8 +4297,10 @@ class HookTest(unittest.TestCase):
                 if waiter.poll() is None:
                     waiter.kill()
                 waiter.communicate()
-            for runner in ("g0", "g1", "g2"):
+            for runner in (*self.GATEWAY_HOLDERS, "g2"):
                 self.finish(runner)
+
+    GATEWAY_HOLDERS = ("g0", "h1", "h2", "h3", "h4", "h5")
 
     def test_the_gateway_runner_refuses_every_other_job(self) -> None:
         """The gateway runner listens on a saturated, full mini, so a job that builds here would take the mini's
@@ -14416,13 +14449,17 @@ class GateTest(unittest.TestCase):
         first = hook.lock_file(capacity / "gateway-0.token", fcntl.LOCK_EX)
         self.assertIsNone(hook.mini_full(capacity, 5, gateway), "one token is enough")
         second = hook.lock_file(capacity / "gateway-1.token", fcntl.LOCK_EX)
-        self.assertEqual(hook.mini_full(capacity, 5, gateway), "all 2 gateway tokens on this mini are taken")
+        self.assertIsNone(hook.mini_full(capacity, 5, gateway), "six tokens a mini (hq#17742)")
+        rest = [hook.lock_file(capacity / f"{name}.token", fcntl.LOCK_EX) for name in hook.GATEWAY_TOKENS[2:]]
+        self.assertEqual(hook.mini_full(capacity, 5, gateway), "all 6 gateway tokens on this mini are taken")
         # no other runner counts the gateway tokens
         for scope in (hook.RunnerScope(5, 2, 2, True), hook.RunnerScope(5, 2, 2), hook.RunnerScope(5, 2, 2, False, True),
                       hook.RunnerScope(5, 2, 2, fast=True), hook.RunnerScope(5, 2, 2, session=True)):
             self.assertIsNone(hook.mini_full(capacity, 5, scope), scope)
         os.close(first)
         os.close(second)
+        for fd in rest:
+            os.close(fd)
         marker = capacity / f"{hook.ADMIT_WANT}{os.getpid()}"
         marker.write_text(json.dumps({"since": time.time(), "wants": ["units"], "who": "r9 swift-test (run 1)"}) + "\n")
         self.assertIsNone(hook.mini_full(capacity, 5, gateway), "a PR job waiting for units is not its business")
@@ -17401,7 +17438,8 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(cr.member_roles({"runners": 5, "fastRunners": 1, "guiRunners": 1}, 5), (False, False, False))
         self.assertFalse(cr.gateway_instance({"runners": 5, "gatewayRunners": 2}, 4))
         self.assertTrue(cr.gateway_instance({"runners": 5, "gatewayRunners": 2}, 6))
-        self.assertFalse(cr.gateway_instance({"runners": 5, "gatewayRunners": 9}, 7), "never more than two")
+        self.assertTrue(cr.gateway_instance({"runners": 5, "gatewayRunners": 9}, 10))
+        self.assertFalse(cr.gateway_instance({"runners": 5, "gatewayRunners": 9}, 11), "never more than six")
         # an instance past runners + gatewayRunners is refused
         manifest = json.loads(json.dumps(MANIFEST))
         manifest["defaults"]["runner"] = {"classes": {"std": {**base, "gatewayRunners": 2}}}
@@ -20361,9 +20399,9 @@ class FleetLabelsModuleTest(unittest.TestCase):
         self.assertEqual(fleet_labels.gateway_label("26.6"), "glaeda-gateway-xcode-26.6")
         self.assertEqual(fleet_labels.declared_pools(manifest)["glaeda-std-xcode-26.6"], ["mini-std"])
         self.assertNotIn("glaeda-gateway-xcode-26.6", fleet_labels.declared_pools(manifest))
-        for bad in (3, -1, True, "1"):
+        for bad in (7, -1, True, "1"):
             std["gatewayRunners"] = bad
-            self.assertIn("gatewayRunners must be 0 to 2", fleet_labels.member_labels(manifest, "mini-std", lambda a: True)[1])
+            self.assertIn("gatewayRunners must be 0 to 6", fleet_labels.member_labels(manifest, "mini-std", lambda a: True)[1])
         std["gatewayRunners"] = 1
         manifest["hosts"]["mini-std"]["overrides"] = {"runner": {"trustedRef": "refs/heads/main",
                                                                  "trustedRepo": "manaflow-ai/cmux"}}

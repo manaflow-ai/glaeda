@@ -734,7 +734,7 @@ WORKFLOW_JOB_CLASSES = {# the iOS reliability matrix's phone cells: cargo builds
 # runner keeps its WORKFLOW_JOB_CLASSES cost.
 FAST_TOKENS = ("fast-0", "fast-1")
 FAST_JOBS = {("cmux-next.yml", "fast-tier")}
-# GATEWAY: a mini's gateway runners (--gateway-runner, glaeda_fleet_labels gatewayRunners: at most two, the label
+# GATEWAY: a mini's gateway runners (--gateway-runner, glaeda_fleet_labels gatewayRunners: at most six, the label
 # glaeda-gateway-xcode-<version>) take only GATEWAY_JOBS, cmux's thin cmux-ci clients: each submits its build or test
 # to the cmux-ci controller and waits for the verdict, with about no CPU on the mini. On 2026-10-30 at 12:43Z every
 # std mini sat at 76 to 100% CPU, the side label cmux sent these clients to had 1 idle of 51 listeners (46 held off
@@ -775,7 +775,8 @@ FAST_JOBS = {("cmux-next.yml", "fast-tier")}
 # keeps waiting at no cost.
 GATEWAY_CLASS = "gateway"
 GATEWAY_TOKEN_KIND = "gateway"  # CLASS_COST's token kind: any one of GATEWAY_TOKENS
-GATEWAY_TOKENS = ("gateway-0", "gateway-1")
+# six since hq#17742 (MAX_GATEWAY_RUNNERS): the fleet route of the fast tier needs an idle gateway runner
+GATEWAY_TOKENS = tuple(f"gateway-{n}" for n in range(6))
 GATEWAY_JOBS = frozenset({("cmux-next.yml", "app-compile-fleet"), ("cmux-next.yml", "swift-canary-fleet"),
                           ("cmux-next.yml", "release-compile-fast"), ("cmux-next.yml", "fast-tier-fleet"),
                           ("cmux-next.yml", "swift-test-fleet"), ("cmux-next.yml", "daemon-test-fleet"),
@@ -786,7 +787,7 @@ GATEWAY_JOBS = frozenset({("cmux-next.yml", "app-compile-fleet"), ("cmux-next.ym
                           ("fleet-rd-host-macos.yml", "check")})
 GATEWAY_CAPACITY_WAIT_S = 600.0  # SIGNING_DRAIN_WAIT_S: the longest a nightly signing job waits here to drain the mini
 # exclusive (SIGNING_JOBS): more units than any mini has, so admission caps it at the mini's whole count, plus both
-# fast tokens and both gateway tokens, the capacity 0-unit jobs take (no PR client runs beside the key either), and
+# fast tokens and every gateway token, the capacity 0-unit jobs take (no PR client runs beside the key either), and
 # the gui token, which the idle fuzzer (glaeda-idle-warm gui_refusal) checks before it starts and while it runs, so it never starts again beside the job. The gui runner's reserve never applies (reserve_for leaves none
 # beside a job of every unit).
 EXCLUSIVE_UNITS = 1 << 16
@@ -2157,6 +2158,14 @@ def stack_slot_capacity_wait(cap: float | None, tier: str, nightly_runner: bool)
 # a job held in setup only after SETUP_WAIT_SECONDS (15 minutes) and once its siblings end, too late for that cap,
 # and it never re-runs a PR job GitHub timed out. So on any runner the fast tier waits this long at most and is then
 # refused: the rescue reads the refusal by its step (hook_refused()) and re-runs it, placed again.
+# FAST_TIER_BUSY (hq#17742; busy-not-fail, hq#11809): that refusal failed the job, and its re-run went back to the same
+# side label and was refused again: 200 failed fast tiers in 3 h on 2026-11-22, 20 of 32 sampled logs this refusal
+# (job 137248684450 on cmux13, 15:13Z: behind an action-exports waiter, "has waited longer here for units"). GitHub
+# never moves a job off the runner that took it, so the fast tier is no longer refused for capacity: once its
+# FAST_TIER_CAPACITY_WAIT_S has passed it is admitted busy (take_capacity busy): no unit, token or RAM chunk, beside
+# whatever the mini runs. It runs slower and the CPU gate (GATE_CPU_PAUSE) keeps further listeners off the busy mini,
+# while the waiter it would have queued behind keeps its turn for the next units. Leo, 2026-11-22: "you guys cannot
+# afford to wait on improvements right now". Only a waiting nightly job (fair_turn) or a non-capacity hold refuses it.
 FAST_TIER_CAPACITY_WAIT_S = 60.0
 
 
@@ -7130,7 +7139,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
                   gui_runner: bool = False, fresh_runner: bool = False, tier: str = "",
                   new_job: bool = False, nightly_runner: bool = False,
                   keep_while: Path | None = None, signs_first: bool = False,
-                  backfill: bool = False) -> tuple[bool, str]:
+                  backfill: bool = False, busy: bool = False) -> tuple[bool, str]:
     """Weighted admission for one of several runners on this mini, without ever waiting on a job.
     When held, taken_out (if given) receives the units and tokens taken, for the job log; on a capacity refusal it
     receives "wants", the kinds a waiter marker names (CAPACITY_WAIT): the token kind or "units" it lacks, else
@@ -7142,6 +7151,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
     refuses, under admission.lock, when this holder file's holder is still alive (a ci-step key admits once).
     backfill (a ci-step, step_admit) may take units a waiter cannot use now (STEP_BACKFILL) instead of yielding to
     every waiter for units; taken_out's "need" and "mem" are what this job needs, for its waiter marker.
+    busy (FAST_TIER_BUSY) admits the job with no unit, token or RAM chunk: it runs beside what the mini already runs,
+    slower, and no waiter loses a unit to it (a waiting nightly job still goes first, fair_turn).
     Every job but the gui runner's own (gui_runner: job-started --gui-runner) leaves the units idle gui runners
     reserve free (gui_reserved, GUI_RESERVE). The gui runner's job takes them, and one that fits in the reserve its
     gate holds never queues behind another lane's job waiting for units: that job could not have taken the
@@ -7163,6 +7174,10 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         if klass == EXCLUSIVE_CLASS and gui_token != "gui":
             tokens = (*tokens, "gui")  # the idle fuzzer looks at gui.token itself: hold it whatever this runner's is
     units = min(units, total)
+    if busy and klass != EXCLUSIVE_CLASS:  # FAST_TIER_BUSY: nothing shared is taken; a signing job never runs busy
+        if signing := exclusive_claim(capacity_dir):  # and nothing runs busy beside one (SIGNING_DRAIN)
+            return False, f"capacity: {signing}"
+        units, tokens, uses_gui = 0, (), False
     # CAPACITY_ARITHMETIC: the RAM chunks it takes beside its units; the exclusive class takes all of them
     mem_total = mem_chunks_total()
     # A 0-unit token class (fast, gateway: thin clients bounded by their tokens, whose gates never look at the shared
@@ -7367,7 +7382,8 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         # every job but a reserving runner's own leaves the idle reserves free (GUI_RESERVE, FRESH_RESERVE_TOKEN); a
         # nightly job keeps none (FEED_FIRST)
         def kept_now() -> int:
-            return 0 if tier == TIER_NIGHTLY else reserve_for(gui_reserved(capacity_dir, own_reserve), units, total)
+            return 0 if tier == TIER_NIGHTLY or busy else reserve_for(gui_reserved(capacity_dir, own_reserve), units,
+                                                                              total)
 
         kept = kept_now()
         lent: int | None = None
@@ -8040,7 +8056,7 @@ def dedicated_admission(script: Path, min_free_gib: float = 0.0) -> tuple[bool, 
 # a signing job (EXCLUSIVE_CLASS) on its mini could never drain it: the job waits for every process in any runner's
 # _work to end (stray_job_processes), and a busy dedicated builder keeps starting new ones. A runner.dedicated entry
 # with yieldToExclusive (--yield-to-exclusive) therefore starts no job while a signing job on the mini waits for it
-# (its admit.want marker names the exclusive class) or holds it (both gateway tokens are taken, which only the
+# (its admit.want marker names the exclusive class) or holds it (every gateway token is taken, which only the
 # exclusive class takes together: CLASS_COST). Its job waits YIELD_TO_EXCLUSIVE_WAIT_S at most, then is refused. The
 # yielding runner's own hook runs in its job's _work, so a signing job admitted while this check passed still sees it
 # there and waits; nothing starts beside a held claim.
@@ -15279,7 +15295,7 @@ def main(argv: list[str] | None = None) -> int:
             cap = bounded_wait(cap, fast_bound)
             if fast_bound is not None:
                 print(f"{PREFIX}: the fast tier: it waits {fast_bound:g} s at most for capacity (FAST_TIER_WAIT), "
-                      "then is refused so the owned-pool rescue re-runs it inside its 20-minute timeout", flush=True)
+                      "then runs busy beside the mini's other jobs (FAST_TIER_BUSY) instead of failing", flush=True)
             tier = job_tier(os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REF"),
                             os.environ.get("GITHUB_REPOSITORY"), event, os.environ.get("GITHUB_WORKFLOW_REF"),
                             os.environ.get("GITHUB_JOB")) or stack_blocker_tier(
@@ -15360,6 +15376,25 @@ def main(argv: list[str] | None = None) -> int:
                         break
                     waited = time.monotonic() - start
                     left = math.inf if cap is None else cap - waited
+                    if left <= 0 and fast_bound is not None and claim_class != EXCLUSIVE_CLASS:
+                        # FAST_TIER_BUSY: slower beside the mini's other jobs, never failed for capacity
+                        held, busy_note = take_capacity(
+                            args.host_lock, args.capacity_dir, args.capacity_units,
+                            os.environ.get("GITHUB_JOB", ""), owner, args.state_dir, args.compile_slots,
+                            args.canonical_roots, repo, args.home_repo, instance=args.instance,
+                            workflow=job_workflow(), warm_keys=job_warm_keys(event), taken_out=taken,
+                            warm_target=job_warm_target(event), since=since, gui_token=args.gui_token,
+                            klass=admit_class, gui_runner=args.gui_runner, fresh_runner=args.dev_compile_runner,
+                            tier=tier, new_job=True, nightly_runner=args.nightly_runner,
+                            signs_first=args.trusted_next_signing, busy=True)
+                        if held:
+                            print(f"{PREFIX}: the fast tier waited {waited:.0f} s ({note.removeprefix('capacity: ')});"
+                                  " admitted busy, with no unit, beside the mini's other jobs (FAST_TIER_BUSY)",
+                                  flush=True)
+                            note = busy_note
+                        else:
+                            note = busy_note if busy_note.startswith("capacity:") else note
+                        break
                     if left <= 0:
                         break
                     wants = list(taken.get("wants") or [])

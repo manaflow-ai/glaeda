@@ -64,9 +64,10 @@ CLASS_CAPACITY = {"xl": (8, 22), "std": (4, 14), "light": (2, 10)}
 # holds for memory pressure, the disk floor and the fleet's host claim; its job takes one of the GATEWAY_TOKENS and no
 # shared unit (the hook's gateway class). On 2026-10-30 at 12:43Z every std mini sat at 76 to 100% CPU and the side
 # label cmux used for these clients had 1 idle of 51 listeners, so no client could start and the build-fleet compiles
-# they submit did not run. At most MAX_GATEWAY_RUNNERS per mini (the hook's two tokens); never on a trusted member,
+# they submit did not run. At most MAX_GATEWAY_RUNNERS per mini (the hook's GATEWAY_TOKENS; 6 since hq#17742: a
+# fast tier cmux routes to the fleet needs an idle gateway runner, and two per mini left it none); never on a trusted member,
 # which takes no pull request job, and only on a dedicated one (an opportunistic member carries no pool label).
-MAX_GATEWAY_RUNNERS = 2
+MAX_GATEWAY_RUNNERS = 6
 GATEWAY_PREFIX = "gateway"
 # simRunners (0 or 1, default 0) adds a sim-first runner after the gateway runners (instance runners + gatewayRunners;
 # never counted in runners, so no role moves). It carries only the sim label (sim_label: glaeda-sim-xcode-<version>,
