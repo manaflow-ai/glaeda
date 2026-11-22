@@ -19693,6 +19693,65 @@ class PoolNodeViewTest(unittest.TestCase):
             self.assertEqual(hook.node_paths(self.dir),
                              (self.dir / ".config/glaeda/cmux-fleet", self.dir / "Projects/glaeda-generations"))
 
+    PRIVATE_STATUS = (
+        # the generation's own load() (cmux_fleet._read_private_document, 1f42f2e8742d): a regular file this euid owns,
+        # mode 0600 and one link, else {"error": "fleet document ownership or mode is unsafe"}
+        "import json, os, stat, sys\n"
+        "def validate_class_acceptance(doc):\n    return doc\n"
+        "def load(path):\n"
+        "    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)\n"
+        "    st = os.fstat(fd)\n"
+        "    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid() or st.st_nlink != 1 \\\n"
+        "            or stat.S_IMODE(st.st_mode) != 0o600:\n"
+        "        print(json.dumps({'error': 'fleet document ownership or mode is unsafe'})); sys.exit(1)\n"
+        "    return json.loads(os.read(fd, 1 << 20))\n"
+        "if __name__ == '__main__':\n"
+        "    load(sys.argv[2]); load(sys.argv[4])\n"
+        "    print(json.dumps(STATUS))\n")
+
+    def test_the_view_is_judged_from_private_copies_the_generation_accepts(self) -> None:
+        """PRIVATE_VIEW_COPY: the node view is the member user's (0644, here also hard-linked), which the generation's
+        private-document reader refuses; the hook judges this account's own 0600 copies and removes them after."""
+        self.node()
+        view = self.dir / "view"
+        view.mkdir()
+        shutil.move(os.fspath(self.dir / ".config/glaeda/cmux-fleet"), os.fspath(view / "cmux-fleet"))
+        shutil.move(os.fspath(self.dir / "Projects/glaeda-generations"), os.fspath(view / "glaeda-generations"))
+        fleet_py = view / "glaeda-generations" / self.COMMIT[:12] / "scripts" / "cmux_fleet.py"
+        status = {"schema": "glaeda-cmux-fleet-node-status/v1", "state": "eligible", "routingCandidateEligible": True,
+                  "roles": [{"role": "cmux_macos_native_build", "eligible": True, "reason": "ok"}]}
+        fleet_py.write_text(f"STATUS = {status!r}\n" + self.PRIVATE_STATUS)
+        documents = [view / "cmux-fleet" / rel for rel in
+                     ("enrollment.json", "acceptance/cmux_macos_native_build.json", "class-acceptance/m4pro-48.json")]
+        for doc in documents:
+            doc.chmod(0o644)
+        os.link(documents[0], view / "enrollment-second-link.json")  # nlink 2: refused even at 0600
+        tmp = self.dir / "tmp"
+        tmp.mkdir()
+        env = {"HOME": os.fspath(self.dir), "XDG_CONFIG_HOME": "", "TMPDIR": os.fspath(tmp)}
+        # the generation itself refuses the view's own files: this is what a pool runner met on the first EC2 Mac
+        direct = subprocess.run([sys.executable, "-B", os.fspath(fleet_py), "status", os.fspath(documents[0]),
+                                 "--acceptance", os.fspath(documents[1])], capture_output=True, text=True)
+        self.assertIn("ownership or mode is unsafe", direct.stdout)
+        with mock.patch.dict(os.environ, {**env, hook.NODE_VIEW_ENV: os.fspath(view)}), \
+                mock.patch.object(tempfile, "tempdir", None):
+            why, _want, timed_out = hook.node_answer("m4pro-48")
+        self.assertIsNone(why, why)
+        self.assertFalse(timed_out)
+        self.assertEqual(list(tmp.iterdir()), [], "the private copies go with the answer")
+        for doc in documents:
+            self.assertEqual(doc.stat().st_mode & 0o777, 0o644, "the view itself is never changed")
+        copies = hook.private_view_copy(view / "cmux-fleet", tmp, "m4pro-48")
+        for rel in ("enrollment.json", "acceptance/cmux_macos_native_build.json", "class-acceptance/m4pro-48.json"):
+            st = (copies / rel).stat()
+            self.assertEqual((st.st_mode & 0o777, st.st_nlink, st.st_uid), (0o600, 1, os.geteuid()), rel)
+            self.assertEqual((copies / rel).read_bytes(), (view / "cmux-fleet" / rel).read_bytes(), rel)
+        # a document missing from the view is still named as missing
+        (view / "cmux-fleet" / "enrollment.json").unlink()
+        with mock.patch.dict(os.environ, {**env, hook.NODE_VIEW_ENV: os.fspath(view)}):
+            why, _want, _ = hook.node_answer("m4pro-48")
+        self.assertIn("no Glaeda enrollment", why or "")
+
     def other_group(self) -> int:
         """A group of ours other than the one new files get (that one stands in for staff: SHARED_GROUP_EXCLUDED)."""
         probe = self.dir / ".gid-probe"

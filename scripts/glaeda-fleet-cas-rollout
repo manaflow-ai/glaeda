@@ -3,7 +3,7 @@
 #
 #   glaeda-fleet-cas-rollout --store HOST [--trusted-keys HEX] [--writer HOST --sign-key PATH]
 #                            [--store-root PATH] [--store-image PATH] [--allow-coordinator] [--store-lan IP]
-#                            [--prewarm REPO] [--prebuilt-dir DIR] NODE_HOST... [--apply]
+#                            [--prewarm REPO] [--prebuilt-dir DIR] [--nodes-only] NODE_HOST... [--apply]
 #
 # Plans by default; --apply deploys. Planning checks local inputs and discovers tailnet
 # addresses over SSH, then prints staging destinations and installer commands. It never
@@ -34,13 +34,18 @@
 # Local Network privacy lets through). The store's only allowed writer is then the writer's
 # LAN source address toward IP, read from the writer's route table. No tailnet ACL grant is
 # needed; it is the path for a store whose tailnet port no grant opens (cmux-lawrence).
+# With --nodes-only, only the NODE_HOSTs are (re)installed: the store host is read for its
+# address and nothing on it, or on the writer, is redeployed. It is the path for adding a reader or
+# repairing one whose node points at a retired store, without re-running the stateless store install
+# (2026-11-22: cmux17-24 still read the retired cmux7s store weeks after the move to cmux-lawrence,
+# because the only way to repoint a node was a full rollout that also redeploys the store).
 # The store (and its gc) install as system LaunchDaemons on the store host, so the installer there
 # needs passwordless `sudo -n` (or run the root commands it prints with `fleet-sudo HOST ...`);
 # it migrates the old LaunchAgent. Node, writer and relay stay agents on the CI minis.
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 PORT=7450
-store= store_root= store_image= store_lan= apply= allow_coordinator= trusted= writer= sign_key= prewarm= prebuilt_dir= nodes=()
+store= store_root= store_image= store_lan= nodes_only= apply= allow_coordinator= trusted= writer= sign_key= prewarm= prebuilt_dir= nodes=()
 while [ $# -gt 0 ]; do
   case $1 in
     --store) store=${2:?}; shift ;;
@@ -53,6 +58,7 @@ while [ $# -gt 0 ]; do
     --sign-key) sign_key=${2:?}; shift ;;
     --prewarm) prewarm=${2:?}; shift ;;
     --prebuilt-dir) prebuilt_dir=${2:?}; shift ;;
+    --nodes-only) nodes_only=1 ;;
     --apply) apply=--apply ;;
     -*) echo "unknown option: $1" >&2; exit 2 ;;
     *) nodes+=("$1") ;;
@@ -93,7 +99,11 @@ elif [ -n "$sign_key" ]; then
 fi
 # The rollout is stateless: whatever it is given replaces the deployed configuration.
 [ -n "$trusted" ] || echo "warning: no --trusted-keys: the store keeps, and nodes use, unsigned index entries" >&2
-[ -n "$writer" ] || echo "warning: no --writer: the store will accept no writes" >&2
+[ -n "$nodes_only" ] || [ -n "$writer" ] || echo "warning: no --writer: the store will accept no writes" >&2
+if [ -n "$nodes_only" ]; then
+  [ -z "$writer$sign_key$store_root$store_image" ] || { echo "--nodes-only redeploys no store or writer; drop --writer, --sign-key, --store-root and --store-image" >&2; exit 2; }
+  [ ${#nodes[@]} -gt 0 ] || { echo "--nodes-only needs at least one NODE_HOST" >&2; exit 2; }
+fi
 check_host() {  # host, role (store|writer|node)
   local h=$1 role=$2 target coordinator=
   target=$(ssh -G "$h" | awk '/^hostname /{print $2}')
@@ -114,7 +124,8 @@ check_host() {  # host, role (store|writer|node)
     exit 2
   fi
 }
-check_host "$store" store
+# --nodes-only only reads the store's address, so the store-role placement checks do not apply.
+[ -n "$nodes_only" ] || check_host "$store" store
 [ -z "$writer" ] || check_host "$writer" writer
 for n in ${nodes[@]+"${nodes[@]}"}; do
   check_host "$n" node
@@ -187,8 +198,8 @@ else
   writer_ip=
   [ -z "$writer" ] || writer_ip=$(tailnet_ip "$writer")
 fi
-run "$store" store --listen "$ip:$PORT" ${writer_ip:+--writers "$writer_ip"} ${trusted:+--trusted-keys "$trusted"} $apply
-[ -z "$writer" ] || run "$writer" writer "${upstream[@]}" --sign-key "$sign_key" --trusted-keys "$trusted" $apply
+[ -n "$nodes_only" ] || run "$store" store --listen "$ip:$PORT" ${writer_ip:+--writers "$writer_ip"} ${trusted:+--trusted-keys "$trusted"} $apply
+[ -n "$nodes_only" ] || [ -z "$writer" ] || run "$writer" writer "${upstream[@]}" --sign-key "$sign_key" --trusted-keys "$trusted" $apply
 for n in ${nodes[@]+"${nodes[@]}"}; do
   [ "$n" = "$writer" ] && continue
   run "$n" node "${upstream[@]}" ${trusted:+--trusted-keys "$trusted"} ${prewarm:+--prewarm "$prewarm"} $apply

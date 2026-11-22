@@ -366,6 +366,13 @@ write_prewarm() {  # repo, or empty to remove
     rm -f "$agent.tmp"
   else
     mv "$agent.tmp" "$agent"
+    # An operator's `launchctl disable` stays: bootstrap of a disabled label fails (5: Input/output
+    # error) and would abort the node install after the node and relay are already done
+    # (2026-11-22, cmux17/19/21/24, where the prewarm agent had been disabled).
+    if launchctl print-disabled "gui/$(id -u)" 2>/dev/null | grep -q "\"$PREWARM_LABEL\" => disabled"; then
+      echo "prewarm $PREWARM_LABEL is disabled in launchd; plist written, left disabled (launchctl enable gui/$(id -u)/$PREWARM_LABEL to start it)"
+      return 0
+    fi
     bootstrap "gui/$(id -u)" "$PREWARM_LABEL" "$agent"
   fi
 }

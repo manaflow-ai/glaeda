@@ -2981,6 +2981,7 @@ APP_POOL_REST = 300.0  # a failed mint or a refused answer: the pool is not aske
 APP_POOL_ROUTE_REST = 3600.0  # a route the App answered 403 or 404 stays on the login this long
 APP_POOL_PUSHED_MIN_LEFT = 120.0  # a pushed token this close to its end is not asked for (gh_app_token.py's own floor)
 APP_POOL_FLOOR = 500  # an App answer with fewer left: the pool's other users (base_red_watch, cmux-ci) keep the rest
+APP_POOL_BENCH_FILE = "app-pool-benched.json"  # the scopes the App refused, kept across a re-exec (restore_bench)
 APP_POOL_REPO = re.compile(r"/repos/([A-Za-z0-9][A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]+(?:/|\?|$)")
 APP_POOL_GRAPHQL_OWNER = re.compile(r"^o\d+$")
 APP_POOL_GRAPHQL_URL = re.compile(r"^https://github\.com/([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9._-]+)(?:/|$)", re.I)
@@ -3263,6 +3264,44 @@ class AppPool:
         owner, _, repos = scope[len("graphql:"):].partition(":")
         return owner, [r for r in repos.split(",") if r]
 
+    def bench(self, scope: str, until: float) -> None:
+        """Keep SCOPE on the login until UNTIL, and write the bench down.
+
+        The bench used to live only in this process. The daemon re-execs whenever a fix lands (one host, 2026-11-22:
+        54 re-execs in a day), and every refusal went with it, so a scope no retry can win was asked again after each
+        one: graphql:manaflow-ai:cmux, which the `cursor` organization's IP allow list forbids this App's address
+        ("FORBIDDEN ... your IP address is not permitted to access this resource"), cost 23 doomed App queries that
+        day on this host, each one a round trip on ci-watch and then quota-goblin before the same read went on the
+        login anyway. An hour's bench now means an hour.
+        """
+        self.unreadable[scope] = until
+        self.save_bench()
+
+    def bench_file(self) -> Path:
+        return BASE / APP_POOL_BENCH_FILE
+
+    def save_bench(self) -> None:
+        """Write this pool's live benches under its role, keeping the other roles' as they are."""
+        now = self.clock()
+        doc = read_json(self.bench_file())
+        roles = dict(doc["roles"]) if isinstance(doc, dict) and isinstance(doc.get("roles"), dict) else {}
+        roles[self.role] = {scope: round(until, 3) for scope, until in self.unreadable.items() if until > now}
+        with contextlib.suppress(OSError):
+            write_json(self.bench_file(), {"schema": "glaeda-gh-app-bench/v1", "roles": roles})
+
+    def restore_bench(self) -> "AppPool":
+        """Read the benches of this pool and its spares back (save_bench), dropping any whose hour has passed."""
+        now = self.clock()
+        doc = read_json(self.bench_file())
+        roles = doc.get("roles") if isinstance(doc, dict) else None
+        for pool in [self, *self.spares]:
+            kept = roles.get(pool.role) if isinstance(roles, dict) else None
+            for scope, until in (kept if isinstance(kept, dict) else {}).items():
+                if isinstance(scope, str) and isinstance(until, (int, float)) and not isinstance(until, bool) \
+                        and until > now:
+                    pool.unreadable[scope] = float(until)
+        return self
+
     def covers(self, scope: str) -> bool:
         """Whether SCOPE is one the App has not refused lately (a permission or resource it lacks). A GraphQL chunk is
         covered unless one of its own repositories is benched (a set is never benched as a set)."""
@@ -3305,9 +3344,9 @@ class AppPool:
                 # asks the App again). The broker host, 2026-11-22: sets "cmux,cmuxterm-hq" and "cmuxterm-hq,cmux"
                 # were each benched an hour as sets while the App held 12,234 of 12,500 points.
                 for repo in self.named_repos(scope, message):
-                    self.unreadable[f"graphql:{owner_}:{repo}"] = now + APP_POOL_ROUTE_REST
+                    self.bench(f"graphql:{owner_}:{repo}", now + APP_POOL_ROUTE_REST)
             else:
-                self.unreadable[scope] = now + APP_POOL_ROUTE_REST
+                self.bench(scope, now + APP_POOL_ROUTE_REST)
             self.fell_back += 1
             return False
         if remaining is not None and remaining < APP_POOL_FLOOR and reset is not None:
@@ -3321,6 +3360,9 @@ class AppPool:
         resting = {o: round(t) for o, t in self.rest_until.items() if t > now}
         return {"role": self.role, "source": self.source or None, "served": self.served, "fellBack": self.fell_back, "seen": self.seen,
                 "resting": resting or None, "why": self.why or None,
+                # Published so a reader can tell an idle App from a benched one: with this unprinted, an App pool
+                # 97% unspent beside a login at 0 GraphQL points read as a routing bug for hours, 2026-11-22.
+                "unreadable": {scope: round(until) for scope, until in self.unreadable.items() if until > now} or None,
                 "graphqlServed": self.graphql_served, "graphqlPoints": self.graphql_points,
                 "graphqlSeen": self.graphql_seen,
                 **({"spares": [p.status() for p in self.spares]} if self.spares else {})}
@@ -5065,12 +5107,17 @@ def write_failure(item: dict, status: int, doc: dict, known: dict[str, str] | No
 class Daemon:
     def __init__(self, transport: Callable = http, token: Callable[[], str] = gh_token,
                  controller: Any = "env", upstream: Any = "config", app_pool: Any = "auto") -> None:
+        # The clock comes first: the pool built below reads it (restore_bench), and a clock set afterwards
+        # made Daemon() raise AttributeError for every caller that did not pass its own app_pool.
+        self.now = time.time()
+        self.clock_real = True  # tick(now=...) in tests pins the clock
         self.transport = transport
         self.last_request_source = "login"  # credential used by the most recent request (App or login)
         # The ci-watch App's tokens for repo reads (AppPool); "auto" finds them on this host, None keeps every read on
         # the login.
         self.app_pool: AppPool | None = (
-            AppPool(clock=lambda: self.clock()).with_spares(APP_POOL_SPARES) if app_pool == "auto" else app_pool)
+            AppPool(clock=lambda: self.clock()).with_spares(APP_POOL_SPARES).restore_bench()
+            if app_pool == "auto" else app_pool)
         self.last_app_pool: AppPool | None = None  # the pool of the last App request (a spare's answer is its own)
         # False for an upstream host's direct read: the lane-gh broker answers GET branches/B from git (the tip, no
         # protection, and on 2026-11-16 no answer within 60 s), so fetch_pr_rest takes GraphQL's last word instead.
@@ -5158,7 +5205,6 @@ class Daemon:
         self.budget_retry = 0.0  # /rate_limit is left alone until this time after a refusal
         self.rate_limit_at = float("-inf")  # when /rate_limit last answered (refresh_budget)
         self.last_cycle: dict[str, float] = {kind: 0.0 for kind in CYCLES}
-        self.now = time.time()
         self.errors: list[str] = []
         self.attempted: dict[str, float] = {}  # when each key was last fetched: a new one at most once per cycle
         self.consumer_sent: dict[tuple[str, str], float] = {}  # (head, consumer): last sent upstream (upstream_read)
@@ -5221,7 +5267,6 @@ class Daemon:
         self.deferred: set[str] = set()  # keys a tick ran out of time for: read first on the next tick
         self.post_at = float("-inf")  # the last content write (post_tick)
         self.post_tried = float("-inf")  # the outbox's own clock when post_tick last ran (post_due)
-        self.clock_real = True  # tick(now=...) in tests pins the clock
         held = (read_json(BASE / "daemon.json") or {}).get("outbox") or {}
         # GitHub's secondary limit holds the outbox until then
         self.post_hold = saved_hold(held.get("holdUntil"), time.time())
@@ -12117,12 +12162,27 @@ LAND_ENV_TAGS = {"CMUX_AGENT_SESSION": LAND_TAG, "MAY_MERGE_PATH": LAND_TAG, "GL
                  "GH_QUOTA_LANDING_READ": "land-judge"}
 LAND_PATH_EXTRA = ("~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin")
 # The land pool is sized by the host it runs on, read at every pass, never a hand-set count (cmuxterm-hq
-# docs/handbook/hand-set-concurrency-number.md; the lane-gh broker's land slots, hq#17274, use the same rule): a ceiling
-# of one worker per LAND_CORES_EACH cores (land_worker_ceiling). land.json "workers" stays an operator's override of
-# the ceiling. No host-load line admits or holds a judgment: LAND_LOAD_LINE (0.8 per core) is gone (see
-# land_load_per_core's comment for what it measured and why). The 4 this replaced was set by hand; gcp-agent-lane-1,
-# 2026-11-21 20:05Z: 28 lands past due, waiting p50 82 min (max 129), each "every worker busy" (4 of 4) on 32 cores.
-LAND_CORES_EACH = 2  # a judgment is one python land_judge plus its gh children: about two cores at its peak
+# docs/handbook/hand-set-concurrency-number.md; the lane-gh broker's land slots, hq#17274, use the same rule). Two parts:
+# - the count is the adaptive pool (LandQueue.adapt_pool, the comment above LAND_POOL_ADAPT_S): it starts at one
+#   worker per LAND_CORES_EACH cores (land_worker_ceiling) and grows to land_pool_max; land.json "workers" overrides it;
+# - admission is the host's live headroom, re-read each pass: past the first running judgment, a pass starts at most
+#   as many as the CPU free to a judgment (idle, plus niced work it preempts) and MemAvailable hold over the 80% line,
+#   at a judgment's measured cost each (LandQueue.headroom_take). A host that reports neither is held by the count.
+# No load-average line admits or holds a judgment (glaeda#2472: the load is a run-queue length, not CPU use).
+# huge-blue, 2026-11-22 10:10Z: 32 of 32 busy (land.json 32), each judgment at 0.1-0.4% CPU and 18-44 MB, while
+# /proc/stat said idle 18.5% and nice 33.8% of 32 cores.
+# Measured (glaeda#2472, a live `land-judge explain` on a 16-core lane host, 3 runs at each of 3 loads): 3.9-4.6 s
+# CPU (user+sys), peak RSS 128.4 MB, wall 27-434 s, 85-99% of it waiting on GitHub and the quota. So at its densest a
+# judgment holds 4.6 s of CPU over its shortest 27 s wall: LAND_JUDGMENT_CORES, the divisor at admission.
+LAND_CORES_EACH = 2  # where the adaptive pool starts: one worker per this many cores
+LAND_JUDGMENT_CORES = 4.6 / 27  # about 0.17 of a core
+LAND_JUDGMENT_RSS = 128.4e6  # bytes
+LAND_HEADROOM = 0.8  # the handbook's headroom line: lands take at most this share of the host's cores and RAM
+LAND_WORKER_MAX = 1024  # land_seconds' bound on the ceiling and on land.json "workers"
+LAND_HEADROOM_OFF = 'land.json "headroomHold": false'  # the headroom hold's override (LandQueue.headroom_why)
+LAND_CPU_WINDOW_MIN, LAND_CPU_WINDOW_MAX, LAND_CPU_FRESH = 1.0, 60.0, 0.25  # seconds (land_cpu_free)
+_LAND_CPU: list = [None, None, None, None]  # [monotonic at, /proc/stat counters, last free share, its nice part]
+_LAND_CPU_LOCK = threading.Lock()
 
 
 def land_cores() -> int:
@@ -12130,6 +12190,65 @@ def land_cores() -> int:
     with contextlib.suppress(AttributeError, OSError):
         return max(1, len(os.sched_getaffinity(0)))
     return max(1, os.cpu_count() or 1)
+
+
+def land_meminfo(field: str) -> float | None:
+    """FIELD of /proc/meminfo in bytes, or None where the host has none (macOS) or does not say."""
+    with contextlib.suppress(OSError, ValueError, IndexError):
+        with open("/proc/meminfo", encoding="ascii") as f:
+            for line in f:
+                if line.startswith(field + ":"):
+                    return float(line.split()[1]) * 1024
+    return None
+
+
+def land_mem_total() -> float | None:
+    """The host's RAM in bytes (/proc/meminfo, else sysconf, which macOS answers), or None."""
+    total = land_meminfo("MemTotal")
+    if total is None:
+        with contextlib.suppress(AttributeError, OSError, ValueError):
+            total = float(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"))
+    return total if total and total > 0 else None
+
+
+def land_mem_available() -> float | None:
+    """The RAM the host can give a new process without swapping (MemAvailable), or None where it is not reported."""
+    return land_meminfo("MemAvailable")
+
+
+def land_proc_stat() -> tuple[int, ...] | None:
+    """The aggregate cpu line of /proc/stat (user nice system idle iowait irq softirq steal), or None."""
+    with contextlib.suppress(OSError, ValueError):
+        with open("/proc/stat", encoding="ascii") as f:
+            parts = f.readline().split()
+        if len(parts) >= 5 and parts[0] == "cpu":
+            return tuple(int(v) for v in parts[1:9])
+    return None
+
+
+def land_cpu_free(now: float | None = None) -> float | None:
+    """The share of the host's CPU a new judgment can have: idle plus nice (niced work yields to it), over the window
+    since the last read when that is LAND_CPU_WINDOW_MIN to LAND_CPU_WINDOW_MAX old, else over a fresh LAND_CPU_FRESH
+    window; None where /proc/stat cannot be read (macOS). Read under a lock, so two callers never race a sample."""
+    with _LAND_CPU_LOCK:
+        at = time.monotonic() if now is None else now
+        last_at, last, share, _nice = _LAND_CPU
+        if last_at is not None and at - last_at < LAND_CPU_WINDOW_MIN and share is not None:
+            return share
+        if last_at is None or last is None or at - last_at > LAND_CPU_WINDOW_MAX:
+            last = land_proc_stat()
+            if last is None:
+                return None
+            time.sleep(LAND_CPU_FRESH)
+            at = time.monotonic() if now is None else at + LAND_CPU_FRESH
+        cur = land_proc_stat()
+        if cur is None:
+            return None
+        d = [b - a for a, b in zip(last, cur)]
+        total = sum(d)
+        share = None if total <= 0 else max(0.0, min(1.0, (d[1] + d[3]) / total))
+        _LAND_CPU[:] = [at, cur, share, None if total <= 0 else max(0.0, min(1.0, d[1] / total))]
+        return share
 
 
 def land_worker_ceiling(cores: int | None = None) -> int:
@@ -12621,8 +12740,23 @@ LAND_DRAFT_AGE = 90.0  # == BROKER_MAX_AGE, asserted by a test (the daemon's cyc
 # update-branch calls at one head -- 48 of the host's 57 conflict refusals that day were the 2nd through 6th of a
 # streak -- and the stop's `next:` was empty (the refusal names no step of its own), so manaflow-ai/cmuxterm-hq#13750
 # sat parked 3343 min, #13608 1923 min and #13624 836 min with nobody told what to do. Stopping at the first refusal
-# names the one step that clears it: resolve the conflict and re-land pinned. Nothing here rebases or pushes anything:
-# that is a write on someone's branch, so it stays the requester's call, as the draft case stays theirs.
+# names the one step that clears it: resolve the conflict and re-land pinned. Nothing here rebases or force-pushes:
+# that is a write on someone's branch, so it stays the requester's call, as the draft case stays theirs. The one push
+# is LAND_UNION's: the base merge update-branch would have made, when only merge=union paths conflict.
+# A conflict GitHub's update-branch refuses can still be one git settles: GitHub's mergeability, squash and
+# update-branch ignore .gitattributes, even the built-in merge=union, so a PR that only appended lines to an
+# append-only file (goals/*.md, docs/handbook/*.md, REPAIR.md in cmuxterm-hq) stops on update_branch_conflict
+# whenever another PR appended at the same spot. manaflow-ai/cmuxterm-hq#17917's pinned land stopped that way three
+# times in goals/hot-verify-share.md, each hand-resolved by merging main, even after the lane gave goals/*.md
+# merge=union (handoff hq#18211; cmuxterm-hq docs/handbook/shared-append-only-files-conflict.md). Leo, 2026-11-21:
+# "we are NOT in a position to be letting inefficiencies pile up". So on that refusal, once per head, this queue
+# merges the base into the head in a bare mirror of its own (land_dir()/union): the merge with no attributes names
+# the conflicted paths, each must be merge=union in the base's .gitattributes, and the merge honoring them must be
+# clean. Then the merge commit (first parent the head, second the base) is pushed to the PR's branch -- the same
+# commit update-branch would have made, a fast-forward GitHub refuses if the branch moved -- and the land goes on as
+# after an update-branch (pin_follow). Any other conflict stops as below, its reason saying why it was not merged.
+LAND_UNION_URL = "https://github.com/{repo}.git"
+LAND_UNION_DEADLINE = 120.0
 LAND_STEP_CONFLICT = re.compile(r"\bmerge conflict between base and head\b"
                                 r"|\b(?:pull request|PR) has merge conflicts\b"
                                 r"|\bmerge conflicts? must be resolved\b", re.I)
@@ -13759,6 +13893,8 @@ class LandQueue:
         self.live_reads: list[tuple[float, bool]] = []  # this host's last live judgments: (at, read nothing) (early_hand_off)
         self.job_started: dict[str, tuple[float, str]] = {}  # key: (when its job took a worker, the job's name)
         self.slot_held_logged: set[str] = set()  # keys whose job was logged land-slot-held (LAND_SLOT_HELD), once
+        # (pass, starts the CPU allows, starts the RAM allows, what was read): the host's headroom, read once per pass
+        self.headroom: tuple[float, float, float, dict] = (-1.0, math.inf, math.inf, {})
         self.touched: dict[str, float] = {}
         self.pass_gated, self.pass_first_gated = 0, None  # this pass's due judgments that waited for a worker
         # The due rows the last full pass left for a worker, in its order: a worker that frees between two passes
@@ -14966,7 +15102,7 @@ class LandQueue:
         at each call."""
         given = self.config().get("workers")
         if given is not None:
-            return int(land_seconds(given, land_worker_ceiling(), 1, 1024))
+            return int(land_seconds(given, land_worker_ceiling(), 1, LAND_WORKER_MAX))
         return max(1, int(self.pool_size))
 
     def adapt_pool(self) -> None:
@@ -14989,6 +15125,44 @@ class LandQueue:
             log({"event": "land-pool-size", "from": int(self.pool_size), "to": int(size), "why": why,
                  "busy": len(self.jobs), "gated": self.pass_gated, "ceiling": int(ceiling)})
         self.pool_size = size
+
+    def headroom_left(self) -> tuple[float, float]:
+        """How many more judgments this pass may start (CPU, RAM): the host's headroom over the LAND_HEADROOM line,
+        read at the pass's first ask, over a judgment's measured cost (LAND_JUDGMENT_CORES, LAND_JUDGMENT_RSS), less
+        those this pass already started (headroom_take). inf for a resource the host does not report."""
+        if self.headroom[0] != self.now:
+            cores, free = land_cores(), land_cpu_free()
+            avail, total = land_mem_available(), land_mem_total()
+            cpu = math.inf if free is None else (free - (1 - LAND_HEADROOM)) * cores / LAND_JUDGMENT_CORES
+            mem = (math.inf if avail is None or total is None
+                   else (avail - total * (1 - LAND_HEADROOM)) / LAND_JUDGMENT_RSS)
+            nice = _LAND_CPU[3] if free is not None else None
+            read = {"cpuFree": None if free is None else round(free, 3),
+                    "niceShare": None if nice is None else round(nice, 3),
+                    "memAvailableGB": None if avail is None else round(avail / 1e9, 1)}
+            self.headroom = (self.now, cpu, mem, read)
+        return self.headroom[1], self.headroom[2]
+
+    def headroom_why(self) -> str | None:
+        """Why the host's headroom holds one more judgment this pass, or None when it does not. land.json
+        "headroomHold": false turns the hold off (an operator's override, named in the reason); the pool's count
+        still holds."""
+        if self.config().get("headroomHold") is False:
+            return None
+        cpu, mem = self.headroom_left()
+        if cpu < 1:
+            return f"the host's free CPU is at the 80% line (/proc/stat idle+nice; {LAND_HEADROOM_OFF} turns this off)"
+        if mem < 1:
+            return f"the host's free RAM is at the 80% line (MemAvailable; {LAND_HEADROOM_OFF} turns this off)"
+        return None
+
+    def headroom_take(self) -> None:
+        """Charge one judgment started this pass against this pass's headroom, read now if nothing asked yet (the
+        first start, with no job running, skips headroom_why), so every start is charged."""
+        self.headroom_left()
+        at, cpu, mem, read = self.headroom
+        if at == self.now:
+            self.headroom = (at, cpu - 1, mem - 1, read)
 
     def login_workers(self) -> int:
         """land.json "loginWorkers": at most this many judgments at once whose reads spend the login (latch_free says
@@ -15084,6 +15258,9 @@ class LandQueue:
                 "queueParked": self.queue_quota_until > self.now})
         log({"event": "land-pool", "workers": self.workers(), "loginWorkers": self.login_workers(),
              "workersFrom": "land.json" if "workers" in self.config() else f"adaptive:max {land_pool_max()}",
+             "headroom": {**self.headroom[3], **{k: (None if v == math.inf else max(0, int(v)))
+                                                  for k, v in (("cpuStarts", self.headroom[1]),
+                                                               ("memStarts", self.headroom[2]))}},
              "loadPerCore": land_load_per_core(), "busy": len(running),
              "running": [f"{key_name(k)}:{v}" for k, v in running.items()][:16],
              "snapshotWaiting": len(self.snapshot_waiting), "gated": self.pass_gated,
@@ -16047,6 +16224,9 @@ class LandQueue:
         if not free:
             self.gated(e)  # a judgment it could start: ready, waiting for a worker
             return False
+        if self.jobs and (held := self.headroom_why()):
+            self.gated(e, held)  # LAND_HEADROOM, read once a pass; the first judgment always runs
+            return False
         if not self.login_room(e):
             self.gated(e, "the login's share of the workers (loginWorkers) is busy")
             return False
@@ -16086,6 +16266,7 @@ class LandQueue:
         e.pop("dueLate", None)
         e.pop("dueAt", None)
         self.save(e)
+        self.headroom_take()
         self.submit(e["key"], self.job, e["key"], sha, int(e.get("gen") or 0))
         self.changed_entries.discard(e["key"])
         return True
@@ -16285,7 +16466,12 @@ class LandQueue:
             counts = counts and not e.pop("stepQuotaParked", False)
         if not self.state_first(e, None):  # GitHub said it is closed: its state first, no judgment of a finished PR
             return
+        # The judgment's own wall time (land-judged in glaeda-gh.jsonl): the entry pops judging after each judgment,
+        # so without this line no log on the land host says how long a judgment took, and a change meant to make
+        # judgments faster (one mirror fetch per head) has no before or after to read.
+        started = time.monotonic()
         answer = self.explain(e, sha)
+        took = round(time.monotonic() - started, 1)
         answer["pinned"] = bool(sha)  # judged at the cache's head; unpinned, land_judge read the head itself
         head = str(answer.get("head") or sha or "").lower()
         act = land_action(answer, head)
@@ -16320,6 +16506,9 @@ class LandQueue:
             self.history(e, "judged", code=answer.get("code") or ("ok" if answer.get("ok") else ""),
                          head=head[:12], step=act.get("kind"), unmoved=unmoved or None, why=why or None,
                          due=True if unmoved and why in LAND_JUDGE_DUE else None)
+            log({"event": "land-judged", "key": e["key"], "took_s": took, "head": head[:12],
+                 "code": str(answer.get("code") or ("ok" if answer.get("ok") else "")), "step": act.get("kind"),
+                 "why": why or None})
             self.note_feed_verdict(e, answer, act, head, judging.get("at"))
             reason = str(answer.get("reason") or "")
             if str(answer.get("code") or "") == "quota" or LAND_QUOTA_REFUSAL.search(reason) \
@@ -16888,6 +17077,149 @@ class LandQueue:
             self.hand_off(e, head)
         elif named == "update_branch" and kind != "update_branch":
             self.update_branch(e, head)
+        elif named == "union_merge":
+            self.union_merge(e, head)
+
+    def conflict_stop(self, e: dict, kind: str, head: str, said: str, union_why: str = "") -> None:
+        """Under the lock: stop E on a merge conflict at HEAD (LAND_STEP_CONFLICT's comment), naming the one step."""
+        name = key_name(e["key"])
+        repo, _, number = name.partition("#")
+        self.stop(e, f"{kind}_conflict", f"the {kind} at {head[:12]} was refused for a merge conflict between the "
+                  f"base and the head: {said}" + (f"; not merged here: {union_why}" if union_why else ""),
+                  f"resolve the conflict: rebase the PR's branch onto its base (gh pr checkout {number} -R {repo}; "
+                  f"git rebase origin/<its base>; git push --force-with-lease), then re-land it pinned to the new "
+                  f"head: glaeda-gh land {name} --match-head-commit <the new 40-hex head>")
+
+    def union_git(self, gitdir: str, *args: str, attrs: str | None = None, timeout: float = LAND_UNION_DEADLINE,
+                  e: dict | None = None) -> subprocess.CompletedProcess:
+        git = self.path("git", Path(shutil.which("git") or "/usr/bin/git")).as_posix()
+        pre = [f"--attr-source={attrs}"] if attrs else []  # core.attributesFile off: only that tree's attributes
+        return self.call([git, *pre, "-c", "core.attributesFile=/dev/null", "--git-dir", gitdir, *args], timeout, e)
+
+    def union_plan(self, e: dict, head: str) -> tuple[str, str, str, str]:
+        """(merge commit, the PR's branch, base sha, "") when HEAD's conflict with its base is in merge=union paths
+        only and the merge honoring the base's .gitattributes is clean, else ("", "", "", why not). Writes only into
+        this host's own union mirror (LAND_UNION's comment); sends nothing to the PR."""
+        repo = e["repo"]
+        data = (self.cache_of(e["key"]) or {}).get("data") or {}
+        branch, base = str(data.get("headRefName") or ""), str(data.get("baseRefName") or "")
+        if not (BRANCH_SAFE.fullmatch(branch) and BRANCH_SAFE.fullmatch(base)) or ".." in branch + base:
+            return "", "", "", f"the PR's branch {branch!r} or base {base!r} is not read or not a plain branch name"
+        if not SHA40.fullmatch(head or ""):
+            return "", "", "", "no 40-hex head to merge onto"
+        gitdir = os.fspath(land_dir() / "union" / (repo.replace("/", "__") + ".git"))
+        url = LAND_UNION_URL.format(repo=repo)
+        if not os.path.isdir(gitdir):
+            os.makedirs(os.path.dirname(gitdir), exist_ok=True)
+            got = self.union_git(gitdir, "init", "--quiet", "--bare")
+            if got.returncode != 0:
+                return "", "", "", f"git init of {gitdir} failed: {land_trim(got.stderr, 160)}"
+        got = self.union_git(gitdir, "config", "--get", "remote.origin.url")
+        if (got.stdout or "").strip() != url:
+            self.union_git(gitdir, "config", "remote.origin.url", url)
+        refs = [f"+refs/heads/{base}:refs/remotes/origin/{base}", f"+refs/heads/{branch}:refs/remotes/origin/{branch}"]
+        if self.broker_client():  # a lane VM reads github.com through the broker (lane-gh fetch)
+            got = self.call([self.path("laneGh", Path(LANE_GH_CMD)).as_posix(), "fetch", repo, "--dir", gitdir,
+                             "--branch", base, "--branch", branch], LAND_FETCH_DEADLINE, e)
+        else:
+            got = self.union_git(gitdir, "fetch", "--quiet", "--no-tags", "--filter=blob:none", "origin", *refs,
+                                 timeout=LAND_FETCH_DEADLINE)
+        if got.returncode != 0:  # decided nothing about the head: a re-land at it tries again (unionMerge dropped)
+            e["unionMerge"]["retry"] = True
+            return "", "", "", f"the fetch of {base} and {branch} failed: {land_trim(land_tail(got.stderr or ''), 160)}"
+        got = self.union_git(gitdir, "rev-parse", f"refs/remotes/origin/{branch}^{{commit}}",
+                             f"refs/remotes/origin/{base}^{{commit}}")
+        shas = (got.stdout or "").split()
+        if got.returncode != 0 or len(shas) != 2:
+            return "", "", "", f"{branch} or {base} is not on github.com/{repo} (a fork's PR is not merged here)"
+        if shas[0] != head:
+            # A fork's branch of the same name, or a push since: this queue never merges onto a head it did not judge.
+            return "", "", "", f"github.com/{repo}'s {branch} is at {shas[0][:12]}, not the head {head[:12]}"
+        base_sha = shas[1]
+        empty = self.union_git(gitdir, "hash-object", "-t", "tree", "-w", "--stdin")  # stdin is /dev/null: the empty tree
+        if empty.returncode != 0 or not SHA40.fullmatch((empty.stdout or "").strip()):
+            return "", "", "", f"no empty tree in {gitdir}: {land_trim(empty.stderr, 160)}"
+        # What GitHub saw: the merge with no attributes. Its conflicted paths are the ones that must all be union.
+        bare = self.union_git(gitdir, "merge-tree", "--write-tree", "--name-only", "--no-messages", "-z", head,
+                              base_sha, attrs=empty.stdout.strip())
+        if bare.returncode == 0:
+            return "", "", "", "the merge with no attributes is clean here, so the conflict is not one union settles"
+        if bare.returncode != 1:
+            return "", "", "", f"git merge-tree failed: {land_trim(land_tail(bare.stderr or ''), 160)}"
+        paths = [p for p in (bare.stdout or "").split("\0")[1:] if p]  # -z: tree, then NUL-ended paths, unquoted
+        if not paths:
+            return "", "", "", "git merge-tree named no conflicted path"
+        attr = self.union_git(gitdir, "check-attr", "-z", "merge", "--", *paths, attrs=base_sha)
+        words = (attr.stdout or "").split("\0")  # -z: path NUL attribute NUL value NUL, per path
+        union = {words[i] for i in range(0, len(words) - 2, 3) if words[i + 1] == "merge" and words[i + 2] == "union"}
+        other = [p for p in paths if p not in union]
+        if attr.returncode != 0 or other:
+            return "", "", "", (f"{len(other)} conflicted path(s) are not merge=union in {base}'s .gitattributes: "
+                                f"{land_trim(', '.join(other), 160)}")
+        merged = self.union_git(gitdir, "merge-tree", "--write-tree", "--no-messages", head, base_sha, attrs=base_sha)
+        tree = (merged.stdout or "").split("\0", 1)[0].split("\n", 1)[0].strip()
+        if merged.returncode != 0 or not SHA40.fullmatch(tree):
+            return "", "", "", f"the merge honoring {base}'s .gitattributes still conflicts: {land_trim(merged.stdout, 160)}"
+        msg = (f"Merge branch '{base}' into {branch}\n\nglaeda land: GitHub's update-branch refused a conflict in "
+               f"merge=union paths only ({land_trim(', '.join(paths), 300)}); merged here honoring {base}'s "
+               ".gitattributes.")
+        commit = self.union_git(gitdir, "-c", "user.name=glaeda-land", "-c", "user.email=glaeda-land@users.noreply."
+                                "github.com", "commit-tree", tree, "-p", head, "-p", base_sha, "-m", msg)
+        sha = (commit.stdout or "").strip()
+        if commit.returncode != 0 or not SHA40.fullmatch(sha):
+            return "", "", "", f"git commit-tree failed: {land_trim(commit.stderr, 160)}"
+        e["unionMerge"].update(paths=paths[:20], base=base_sha, baseRef=base, gitdir=gitdir)
+        return sha, branch, base_sha, ""
+
+    def union_merge(self, e: dict, head: str) -> None:
+        """GitHub refused the update-branch at HEAD for a conflict (LAND_UNION's comment): when every conflicted path
+        is merge=union, push the local merge to the PR's branch as the update-branch's own result, a fast-forward on
+        top of HEAD, and wait for the new head as after an update-branch (pin_follow follows it: its first parent is
+        HEAD). Otherwise the conflict stop, as before, saying why it was not merged here."""
+        said = str((e.get("unionMerge") or {}).get("out") or "")
+        try:
+            sha, branch, base_sha, why = self.union_plan(e, head)
+        except OSError as error:
+            sha, branch, base_sha, why = "", "", "", describe(error)
+        if why:
+            with self.lock:
+                if (e.get("unionMerge") or {}).get("retry") or why.startswith("git ") or "timed out" in why:
+                    e.pop("unionMerge", None)  # an infra failure decided nothing: a re-land at this head tries again
+                self.history(e, "union_merge_skipped", head=head[:12], why=land_trim(why, 200))
+                self.conflict_stop(e, "update_branch", head, said, why)
+            return
+        gitdir = str(e["unionMerge"]["gitdir"])
+        with self.lock:
+            self.claim(e, "update_branch", before=head, form="union_merge", merge=sha)
+            e["updateSent"] = {"head": head, "at": self.now}
+            self.save(e)
+        if self.broker_client():
+            # The broker pushes only a branch this lane pushed before: another lane's PR is refused, and stops below.
+            argv = [self.path("laneGh", Path(LANE_GH_CMD)).as_posix(), "push", e["repo"], branch, "--base",
+                    str(e["unionMerge"].get("baseRef") or ""), "--rev", sha, "--dir", gitdir]
+            got = self.call(argv, LAND_GH_DEADLINE, e)
+        else:  # a plain push: refused by GitHub unless the branch is still at HEAD (the merge's first parent)
+            got = self.union_git(gitdir, "push", "--quiet", "origin", f"{sha}:refs/heads/{branch}",
+                                 timeout=LAND_GH_DEADLINE)
+        with self.lock:
+            self.finish(e, got)
+            e["preStepHead"] = head if got.returncode == 0 else ""
+            self.nudge(e["key"])
+            if got.returncode == 124:  # sent, unanswered: it may have reached GitHub (push_step keeps it sent too)
+                self.history(e, "union_merge_unknown", head=head[:12], merge=sha[:12])
+                self.wait(e, {"kind": "head_change", "before": head, "since": self.now}, LAND_HEAD_TIMEOUT)
+                return
+            if got.returncode != 0:
+                e.pop("updateSent", None)
+                why = f"the push of the union merge {sha[:12]} failed: {land_trim(land_tail(got.stderr or ''), 160)}"
+                self.history(e, "union_merge_skipped", head=head[:12], why=why)
+                self.conflict_stop(e, "update_branch", head, said, why)
+                return
+            e.pop("stepFail", None)
+            e.pop("stepTransient", None)
+            self.history(e, "union_merged", head=head[:12], merge=sha[:12], base=base_sha[:12],
+                         paths=land_trim(", ".join(e["unionMerge"].get("paths") or []), 200))
+            self.wait(e, {"kind": "head_change", "before": head, "since": self.now}, LAND_HEAD_TIMEOUT)
 
     def do_fetch(self, e: dict, act: dict, answer: dict, head: str) -> None:
         """Fill this host's mirror as land_judge named (LAND_FETCH_DEADLINE's comment), then judge again soon. An argv
@@ -17005,13 +17337,13 @@ class LandQueue:
             # A conflict refusal that names a step this queue runs (an update-branch that could still merge the base
             # in, a wait) keeps its old path: the named step is taken, as before.
             self.history(e, "step_refused", kind=kind, head=head[:12], why="conflict", n=1)
-            name = key_name(e["key"])
-            repo, _, number = name.partition("#")
-            self.stop(e, f"{kind}_conflict", f"the {kind} at {head[:12]} was refused for a merge conflict between the "
-                      f"base and the head: {land_trim(land_tail(out), 200)}",
-                      f"resolve the conflict: rebase the PR's branch onto its base (gh pr checkout {number} -R {repo}; "
-                      f"git rebase origin/<its base>; git push --force-with-lease), then re-land it pinned to the new "
-                      f"head: glaeda-gh land {name} --match-head-commit <the new 40-hex head>")
+            if kind == "update_branch" and (e.get("unionMerge") or {}).get("head") != head:
+                # GitHub's update-branch ignores .gitattributes: a conflict only in merge=union files is merged here
+                # (LAND_UNION's comment), once per head; anything else stops as below.
+                e["unionMerge"] = {"head": head, "at": self.now, "out": land_trim(land_tail(out), 200)}
+                self.save(e)
+                return "union_merge"
+            self.conflict_stop(e, kind, head, land_trim(land_tail(out), 200))
             return None
         if LAND_STEP_CLOSED.search(out) and e.get("stateOpen") != head:
             # GitHub says the PR is closed: no refusal counted, its state read before anything else (state_first).
@@ -17962,7 +18294,7 @@ def land_holders_line(entries: list[dict], now: float) -> str:
     loads = "unknown" if load is None else f"{load:.2f}/core"
     given = land_config().get("workers")
     if given is not None:
-        ceiling, source = int(land_seconds(given, land_worker_ceiling(), 1, 1024)), "land.json"
+        ceiling, source = int(land_seconds(given, land_worker_ceiling(), 1, LAND_WORKER_MAX)), "land.json"
     else:  # the queue's adaptive size, as its last land-pool line said (adapt_pool)
         line = read_json(land_dir() / LAND_POOL_FILE)
         size = line.get("workers") if isinstance(line, dict) else None
@@ -18859,7 +19191,10 @@ REEXEC_DRAIN_MAX = 300.0
 # A release update re-execs a daemon with land work running at most once per this many seconds of its uptime; until
 # then the update waits and the land queue works on ("hold"). huge-blue, 2026-11-18: glaeda main merges re-exec'd the
 # daemon at 14:51, 15:06, 15:09, 15:22 and 15:24Z, each dropping every judgment in flight. Idle, it re-execs at once.
-REEXEC_UPDATE_GAP = 1800.0
+# 300 s, not the 1800 s it was: huge-blue, 2026-11-22, a merged land fix (glaeda#2462, on disk 09:15Z) was held to
+# ~09:43Z while the queue it fixed stayed capped. The drain (REEXEC_DRAIN_MAX) already bounds what a re-exec drops (no
+# new step starts, a claimed step is judged again), so the gap only spaces re-execs: one per 5 min at most.
+REEXEC_UPDATE_GAP = 300.0
 
 
 def reexec_due(changed: bool, busy: bool, waiting_since: float | bool, now: float,

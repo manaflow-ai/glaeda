@@ -55,6 +55,10 @@ gg = importlib.util.module_from_spec(spec)
 sys.modules["glaeda_gh"] = gg
 loader.exec_module(gg)
 LAND_LOAD_PER_CORE = gg.land_load_per_core  # the real one: Base pins gg's to None
+LAND_MEM_AVAILABLE = gg.land_mem_available  # the real one: Base pins it to None (unreported)
+LAND_CPU_FREE = gg.land_cpu_free  # the real one: Base pins it to None (unreported)
+LAND_CPU_HELD = "the host's free CPU is at the 80% line (/proc/stat idle+nice; land.json \"headroomHold\": false turns this off)"
+LAND_RAM_HELD = "the host's free RAM is at the 80% line (MemAvailable; land.json \"headroomHold\": false turns this off)"
 # The host's own create-pause keeper, as the daemon resolves it, before the overrides below hide it: only
 # InstalledKeeperTest asks it, so producer (gh-quota) and consumer (the outbox) cannot disagree silently.
 HOST_PACE_CLI, HOST_CONTENT_PAUSE_NAMES = gg.PACE_CLI, gg.CONTENT_PAUSE_NAMES
@@ -675,8 +679,10 @@ class Base(unittest.TestCase):
         execv.start()
         self.addCleanup(execv.stop)
         # The land pool is sized from the host's cores (land_worker_ceiling): pinned to 8 here, so a suite on any
-        # runner sizes as one 8-core host (4 workers); the load is reported only, pinned unknown.
-        for name, value in (("land_cores", 8), ("land_load_per_core", None)):
+        # runner sizes as one 8-core host (4 workers); the load is reported only, pinned unknown, and the free RAM and
+        # CPU unreported (headroom_left admits; the pool's count holds).
+        for name, value in (("land_cores", 8), ("land_load_per_core", None), ("land_mem_available", None),
+                            ("land_cpu_free", None)):
             pin = mock.patch.object(gg, name, return_value=value)
             pin.start()
             self.addCleanup(pin.stop)
@@ -21031,6 +21037,9 @@ class ReexecDrainTest(Base):
         self.assertEqual(gg.reexec_due(True, False, False, 100.0, up=120.0), "reexec")
         self.assertEqual(gg.reexec_due(True, True, False, 100.0, up=gg.REEXEC_UPDATE_GAP), "defer")
         self.assertEqual(gg.reexec_due(True, True, 50.0, 100.0, up=120.0), "defer", "a drain begun goes on")
+        # huge-blue, 2026-11-22: a merged fix waited 28 min under the 1800 s gap; busy, an update now serves within
+        # one gap and one drain, 10 min at most.
+        self.assertLessEqual(gg.REEXEC_UPDATE_GAP + gg.REEXEC_DRAIN_MAX, 600.0)
 
     def test_a_waiting_reexec_starts_no_land_step(self) -> None:
         queue = mock.Mock()
@@ -22648,6 +22657,8 @@ class LandWorld:
         self.mirror = os.fspath(Path(tmp) / "mirrors" / "r.git")
         Path(self.mirror).mkdir(parents=True, exist_ok=True)
         self.origin = "https://github.com/o/r.git"
+        self.real_git = False  # /fake/git runs the real git (LandTest.union_origin)
+        self.home = tmp
         self.fetch_rc = 0
         self.fetch_err = "fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host"
         self.files: list[str] = []  # the PR's changed files, as `gh api repos/o/r/pulls/1/files` lists them
@@ -22682,6 +22693,11 @@ class LandWorld:
             return subprocess.CompletedProcess(argv, rc, json.dumps(doc) + "\n", "")
         if argv[0] == "/fake/acpmux":
             return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[0] == "/fake/git" and self.real_git:  # a union merge's git, run for real against a local origin
+            return subprocess.run([shutil.which("git") or "/usr/bin/git", *argv[1:]], stdin=subprocess.DEVNULL,
+                                  capture_output=True, text=True, timeout=timeout,
+                                  env={"PATH": os.environ.get("PATH", ""), "HOME": self.home,
+                                       "GIT_CONFIG_NOSYSTEM": "1"})
         if argv[0] == "/fake/git" and argv[3:] == ["config", "--get", "remote.origin.url"]:
             return subprocess.CompletedProcess(argv, 0 if self.origin else 1, self.origin + "\n", "")
         if argv[0] == "/fake/lane-gh" and argv[1:3] == ["call", "land_handoff"]:
@@ -25061,6 +25077,21 @@ class LandTest(Base):
         return refusal("checks_running", head, {"kind": "wait_pr", "sha": head, "until": "done", "timeout_s": timeout},
                        nxt=nxt, reason=f"land-judge: refused: checks still running at {head[:8]}")
 
+    def test_each_judgment_logs_its_wall_time(self):
+        # The entry pops judging after each judgment, so nothing else on the land host says how long one took.
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")])
+        self.w.answers.append(ok_answer(LA))
+        self.land()
+        lines: list[dict] = []
+        with mock.patch.object(gg, "log", lines.append):
+            self.tick()
+        judged = [ln for ln in lines if ln.get("event") == "land-judged"]
+        self.assertEqual(len(judged), 1, lines)
+        self.assertEqual((judged[0]["key"], judged[0]["code"], judged[0]["step"], judged[0]["head"]),
+                         (self.KEY, "ok", "merge", LA[:12]))
+        self.assertIsInstance(judged[0]["took_s"], float)
+        self.assertGreaterEqual(judged[0]["took_s"], 0.0)
+
     def test_checks_running_refusals_at_one_head_never_stop(self):
         # hq#12626 (d5bf1325) and hq#12595 (db2a372b), 2026-11-18 ~15:50Z: hosted Linux runners queued ~50 min, each
         # 1800 s wait timed out with the checks still queued, and the third judgment stopped both: "checks_running: 3
@@ -26177,6 +26208,111 @@ class LandTest(Base):
     CONFLICT_REFUSAL = ('gh: merge conflict between base and head (HTTP 422) {"message":"merge conflict between base '
                         'and head","documentation_url":"https://docs.github.com/rest/pulls/pulls#update-a-pull-'
                         'request-branch","status":"422"}')
+
+    def union_origin(self, attrs: str = "goals/*.md merge=union\n", path: str = "goals/x.md") -> tuple[str, str]:
+        """A real origin for o/r (LAND_UNION_URL pointed at it): main and the PR's branch lane/x each appended one
+        line at the end of PATH, so git's line merge conflicts there; ATTRS is main's .gitattributes. (head, base)."""
+        origin = Path(self.tmp.name) / "origin"
+        env = {"PATH": os.environ.get("PATH", ""), "HOME": self.tmp.name, "GIT_CONFIG_NOSYSTEM": "1",
+               "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+               "GIT_COMMITTER_EMAIL": "t@t"}
+
+        def git(*args: str) -> str:
+            return subprocess.run(["git", "-C", os.fspath(origin), *args], check=True, capture_output=True,
+                                  text=True, env=env).stdout.strip()
+        origin.mkdir()
+        git("init", "-q", "-b", "main")
+        git("config", "uploadpack.allowFilter", "true")
+        git("config", "receive.denyCurrentBranch", "ignore")
+        (origin / ".gitattributes").write_text(attrs)
+        (origin / path).parent.mkdir(parents=True, exist_ok=True)
+        (origin / path).write_text("- 10:00Z goal set\n")
+        git("add", "-A")
+        git("commit", "-qm", "init")
+        git("checkout", "-qb", "lane/x")
+        with open(origin / path, "a") as f:
+            f.write("- 11:00Z the lane's line\n")
+        git("commit", "-qam", "the lane appends")
+        head = git("rev-parse", "HEAD")
+        git("checkout", "-q", "main")
+        with open(origin / path, "a") as f:
+            f.write("- 11:05Z another PR's line, landed first\n")
+        git("commit", "-qam", "main appends")
+        base = git("rev-parse", "HEAD")
+        url = mock.patch.object(gg, "LAND_UNION_URL", f"file://{origin}")
+        url.start()
+        self.addCleanup(url.stop)
+        self.w.real_git = True
+        self.origin_git = git
+        return head, base
+
+    def union_conflict_tick(self, head: str) -> dict:
+        """HEAD landed pinned, judged stale_green (update-branch named), and GitHub's update-branch refused it for the
+        conflict, as it does whatever .gitattributes says."""
+        data = {**land_pr(head), "headRefName": "lane/x", "baseRefName": "main"}
+        self.w.set_pr(self.KEY, data, self.t)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=head)
+        self.w.gh_rc["update"] = 1
+        self.w.gh_err["update"] = self.CONFLICT_REFUSAL
+        self.w.answers.append(refusal("stale_green", head, {"kind": "update_branch", "expected_head_sha": head}))
+        return self.tick()
+
+    def test_a_conflict_only_in_union_files_is_merged_here_and_the_pinned_land_goes_on(self):
+        """manaflow-ai/cmuxterm-hq#17917, 2026-11-21/22: its pinned land stopped update_branch_conflict three times on
+        goals/hot-verify-share.md, which .gitattributes marks merge=union, each hand-resolved by merging main: GitHub's
+        update-branch ignores .gitattributes. The queue now makes that merge itself and the land goes on."""
+        head, base = self.union_origin()
+        e = self.union_conflict_tick(head)
+        self.assertEqual(len([c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]), 1)
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["before"]), ("waiting", "head_change", head),
+                         e.get("stop"))
+        merged = self.origin_git("rev-parse", "refs/heads/lane/x")
+        self.assertNotEqual(merged, head)
+        self.assertEqual(self.origin_git("rev-list", "--parents", "-n1", merged).split()[1:], [head, base])
+        self.assertEqual(self.origin_git("show", f"{merged}:goals/x.md"),
+                         "- 10:00Z goal set\n- 11:00Z the lane's line\n- 11:05Z another PR's line, landed first")
+        self.assertEqual(self.origin_git("diff", "--name-only", base, merged), "goals/x.md")  # the PR's own diff only
+        done = [h for h in e["history"] if h["event"] == "union_merged"]
+        self.assertEqual([(h["head"], h["merge"], h["paths"]) for h in done], [(head[:12], merged[:12], "goals/x.md")])
+        # GitHub shows the merge as the new head: the pin follows it (first parent the pin) and the land merges it.
+        self.w.set_pr(self.KEY, {**land_pr(merged, parent=head), "headRefName": "lane/x", "baseRefName": "main"},
+                      self.t)
+        self.w.answers.append(ok_answer(merged))
+        e = self.tick()
+        self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, merged))
+        self.assert_merged_at(merged)
+
+    def test_a_union_merge_whose_fetch_failed_is_tried_again_by_a_re_land_at_the_same_head(self):
+        """A fetch that fails decided nothing about the head: the stop says why, and a re-land at that head merges."""
+        head, base = self.union_origin()
+        with mock.patch.object(gg, "LAND_UNION_URL", f"file://{self.tmp.name}/no-such-origin"):
+            e = self.union_conflict_tick(head)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "update_branch_conflict"))
+        self.assertIn("the fetch of main and lane/x failed", e["stop"]["reason"])
+        self.assertNotIn("unionMerge", e)
+        e = self.union_conflict_tick(head)
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"), e.get("stop"))
+        self.assertEqual(self.origin_git("rev-list", "--parents", "-n1", "refs/heads/lane/x").split()[1:], [head, base])
+
+    def test_a_conflict_outside_union_files_still_stops_and_pushes_nothing(self):
+        head, _ = self.union_origin(attrs="docs/*.md merge=union\n")
+        e = self.union_conflict_tick(head)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "update_branch_conflict"), e.get("stop"))
+        self.assertIn("not merge=union in main's .gitattributes: goals/x.md", e["stop"]["reason"])
+        self.assertIn("rebase the PR's branch onto its base", e["stop"]["next"])
+        self.assertEqual(self.origin_git("rev-parse", "refs/heads/lane/x"), head)  # nothing pushed
+        # once per head: the same refusal again at this head stops at once, with no second merge attempt
+        self.assertEqual(len([h for h in e["history"] if h["event"] == "union_merge_skipped"]), 1)
+
+    def test_a_union_merge_never_lands_on_a_branch_that_is_not_the_judged_head(self):
+        """A fork's PR whose branch name also exists on the base repository, or a push since the judgment: the branch
+        github.com holds is not the head, so nothing is merged or pushed onto it."""
+        head, base = self.union_origin()
+        self.origin_git("update-ref", "refs/heads/lane/x", base)  # someone else's lane/x
+        e = self.union_conflict_tick(head)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "update_branch_conflict"))
+        self.assertIn(f"is at {base[:12]}, not the head {head[:12]}", e["stop"]["reason"])
+        self.assertEqual(self.origin_git("rev-parse", "refs/heads/lane/x"), base)
 
     def test_a_merge_conflict_stops_at_the_first_refusal_and_names_resolving_it(self):
         """GitHub decides a conflict from the two trees, so the same update-branch at the same head can answer nothing
@@ -29884,6 +30020,100 @@ class LandTest(Base):
         with mock.patch.object(gg, "land_mem_available_mb", return_value=None):
             self.assertEqual(gg.land_pool_max(), 4)
 
+    def test_the_host_ram_is_read_from_meminfo_and_sysconf(self):
+        info = "MemTotal:       16384000 kB\nMemFree:  100 kB\nMemAvailable:    8192000 kB\n"
+        with mock.patch("builtins.open", mock.mock_open(read_data=info)):
+            self.assertEqual(gg.land_mem_total(), 16384000 * 1024)
+            self.assertEqual(LAND_MEM_AVAILABLE(), 8192000 * 1024)
+        with mock.patch("builtins.open", side_effect=OSError("no /proc")), \
+                mock.patch.object(gg.os, "sysconf", side_effect=lambda n: {"SC_PHYS_PAGES": 4, "SC_PAGE_SIZE": 4096}[n]):
+            self.assertEqual(gg.land_mem_total(), 16384)
+            self.assertIsNone(LAND_MEM_AVAILABLE())
+
+    def test_admission_reads_the_hosts_live_headroom_each_pass_and_charges_each_start(self):
+        """ci-217x ruling, 2026-11-22 10:15Z: the land host was 81% busy from other work (idle 18.5%, nice 33.8% of 32
+        cores, MemAvailable 39.0 of 65.8 GB) while its load read 0.3-0.46/core. So past the first running judgment a
+        pass starts only as many as the free CPU (idle+nice, which a judgment preempts) and MemAvailable hold over
+        the 80% line at a judgment's measured cost, re-read the next pass; the review's F1: each start this pass is
+        charged, so one read never admits the whole ceiling."""
+        gib = 1 << 30
+        self.w.config["workers"] = 40  # land.json overrides the count; admission applies under it
+        self.q.jobs["pr:o/r#9"] = mock.Mock(done=lambda: False)  # another land holds a worker
+        # 8 cores, 25% free: (0.25 - 0.2) * 8 / LAND_JUDGMENT_CORES = 2.3 starts; RAM ample
+        with mock.patch.object(gg, "land_cpu_free", return_value=0.25), \
+                mock.patch.object(gg, "land_mem_total", return_value=64 * gib), \
+                mock.patch.object(gg, "land_mem_available", return_value=60 * gib):
+            self.assertEqual(int(self.q.headroom_left()[0]), 2)
+            for _ in range(2):
+                self.assertIsNone(self.q.headroom_why())
+                self.q.headroom_take()
+            self.assertEqual(self.q.headroom_why(), LAND_CPU_HELD)
+            self.q.now += 1  # the next pass reads the host again
+            self.assertIsNone(self.q.headroom_why())
+            self.q.now += 1
+            self.q.headroom_take()  # a pass's first start, nothing asked yet: charged all the same
+            self.assertEqual(int(self.q.headroom_left()[0]), 1)
+        # RAM: 16 GiB, 3.3 GiB free: under 20% after one more judgment
+        with mock.patch.object(gg, "land_cpu_free", return_value=0.9), \
+                mock.patch.object(gg, "land_mem_total", return_value=16 * gib), \
+                mock.patch.object(gg, "land_mem_available", return_value=3.3 * gib):
+            self.q.now += 1
+            self.assertEqual(self.q.headroom_why(), LAND_RAM_HELD)
+        with mock.patch.object(gg, "land_mem_total", return_value=None):  # unreported: the count holds
+            self.q.now += 1
+            self.assertEqual(self.q.headroom_left(), (math.inf, math.inf))
+        self.q.jobs.clear()
+
+    def test_a_held_row_names_the_headroom_and_the_first_judgment_always_runs(self):
+        self.w.set_pr(self.KEY, {**land_pr(LA), "mergeStateStatus": "BLOCKED"}, self.t)
+        self.land()
+        self.q.jobs["pr:o/r#9"] = mock.Mock(done=lambda: False)  # another land holds a worker
+        with mock.patch.object(gg, "land_cpu_free", return_value=0.1):
+            self.tick()
+            e = self.tick(gg.LAND_DUE_LATE + 1)
+        self.assertEqual((e.get("dueLate") or {}).get("why"),
+                         LAND_CPU_HELD)
+        self.q.jobs.clear()
+        self.w.answers.append(ok_answer(LA))
+        with mock.patch.object(gg, "land_cpu_free", return_value=0.1):
+            e = self.tick(1)  # nothing else runs: the first always does
+        self.assertTrue(any(h.get("event") == "judged" for h in e.get("history") or []), e.get("history"))
+
+    def test_an_operator_turns_the_headroom_hold_off_in_land_json(self):
+        """ci-217x review of glaeda#2484: every guard gets an override. land.json "headroomHold": false lets a held
+        row start (the pool's count still holds it), and the hold's reason names that key."""
+        self.w.set_pr(self.KEY, {**land_pr(LA), "mergeStateStatus": "BLOCKED"}, self.t)
+        self.land()
+        self.q.jobs["pr:o/r#9"] = mock.Mock(done=lambda: False)  # another land holds a worker
+        with mock.patch.object(gg, "land_cpu_free", return_value=0.1):
+            self.assertIn('"headroomHold": false', self.q.headroom_why())
+            self.w.config["headroomHold"] = False
+            self.assertIsNone(self.q.headroom_why())
+            self.w.answers.append(ok_answer(LA))
+            self.tick()
+            e = self.tick(gg.LAND_DUE_LATE + 1)
+        self.assertTrue(any(h.get("event") == "judged" for h in e.get("history") or []), e.get("history"))
+        self.q.jobs.clear()
+
+    def test_the_free_cpu_is_idle_plus_nice_over_a_bounded_window(self):
+        stats = iter([(100, 50, 50, 700, 0, 0, 0, 0), (110, 80, 60, 750, 0, 0, 0, 0),  # fresh: nice 30 + idle 50 of 100
+                      (200, 80, 60, 750, 0, 0, 0, 0)])  # 1.5 s later: 90 busy of 90
+        saved = list(gg._LAND_CPU)
+        self.addCleanup(lambda: gg._LAND_CPU.__setitem__(slice(None), saved))
+        gg._LAND_CPU[:] = [None, None, None, None]
+        with mock.patch.object(gg, "land_proc_stat", side_effect=lambda: next(stats)), \
+                mock.patch.object(gg.time, "sleep") as slept:
+            self.assertAlmostEqual(LAND_CPU_FREE(1000.0), 0.8)
+            self.assertAlmostEqual(gg._LAND_CPU[3], 0.3)  # the nice part, for the land-pool line
+            slept.assert_called_once_with(gg.LAND_CPU_FRESH)
+            self.assertAlmostEqual(LAND_CPU_FREE(1000.5), 0.8)  # under LAND_CPU_WINDOW_MIN: the last share
+            self.assertAlmostEqual(LAND_CPU_FREE(1001.75), 0.0)  # the window since the last read
+        with mock.patch.object(gg, "land_proc_stat", return_value=None):
+            gg._LAND_CPU[:] = [None, None, None, None]
+            self.assertIsNone(LAND_CPU_FREE(1000.0))
+        with mock.patch("builtins.open", mock.mock_open(read_data="cpu 1 2\n")):
+            self.assertIsNone(gg.land_proc_stat())  # a short line reads as unknown, not an error
+
     def test_the_hosts_load_holds_no_judgment(self):
         """Leo, 2026-11-22 08:00Z: "actually measured wtf refusing above cores even means". LAND_LOAD_LINE held every
         judgment past the first while the host's load per core was over 0.8: huge-blue 04:13-07:47Z, 12 workers, 1-2
@@ -32541,6 +32771,70 @@ class AppPoolTest(Base):
         self.assertEqual(status["lastHour"]["app"], 1)
         self.assertEqual(status["appPool"]["served"], 1)
         self.assertNotIn(APP_TOKEN, text)
+
+    IP_ALLOW_LIST = (b'{"errors":[{"type":"FORBIDDEN","message":"Although you appear to have the correct '
+                     b'authorization credentials, the `cursor` organization has an IP allow list enabled, and your '
+                     b'IP address is not permitted to access this resource."}]}')
+    CMUX_QUERY = {"query": "query($o0:String!,$r0:String!,$n0:Int!){repository(owner:$o0,name:$r0)"
+                           "{pullRequest(number:$n0){number}}}",
+                  "variables": {"o0": "manaflow-ai", "r0": "cmux", "n0": 1}}
+
+    def refuse_cmux_graphql(self) -> None:
+        """Answer the next App GraphQL read the way this fleet's App is really answered for manaflow-ai/cmux."""
+        self.app_answers.append((200, {"x-ratelimit-remaining": "12000", "x-ratelimit-reset": str(int(NOW + 900))},
+                                 self.IP_ALLOW_LIST))
+        self.daemon.request("POST", "/graphql", self.CMUX_QUERY)
+
+    def test_a_benched_scope_is_published_so_an_idle_app_is_not_read_as_a_routing_bug(self) -> None:
+        self.refuse_cmux_graphql()
+        self.assertEqual(self.pool.status()["unreadable"], {"graphql:manaflow-ai:cmux": round(NOW + gg.APP_POOL_ROUTE_REST)})
+        self.daemon.now = NOW + gg.APP_POOL_ROUTE_REST + 1
+        self.assertIsNone(self.pool.status()["unreadable"], "an hour on, nothing is benched")
+
+    def test_a_benched_scope_survives_the_re_exec_that_used_to_forget_it(self) -> None:
+        """One host, 2026-11-22: 23 doomed App queries for graphql:manaflow-ai:cmux in a day against an hour-long
+        bench, because 54 re-execs each dropped the bench with the process."""
+        self.refuse_cmux_graphql()
+        self.assertEqual(len(self.app_calls), 1)
+        self.assertEqual(len(self.gh.calls), 1, "the read went on the login")
+        fresh = gg.AppPool(mint=lambda owner: APP_TOKEN, owners=lambda: ["manaflow-ai"], ready=lambda: True,
+                           clock=lambda: self.daemon.clock()).restore_bench()
+        self.assertEqual(fresh.unreadable, {"graphql:manaflow-ai:cmux": NOW + gg.APP_POOL_ROUTE_REST})
+        self.daemon.app_pool = fresh
+        self.daemon.request("POST", "/graphql", self.CMUX_QUERY)
+        self.assertEqual(len(self.app_calls), 1, "the re-exec does not re-send the doomed query")
+        self.assertEqual(len(self.gh.calls), 2)
+        self.daemon.now = NOW + gg.APP_POOL_ROUTE_REST + 1
+        self.daemon.request("POST", "/graphql", self.CMUX_QUERY)
+        self.assertEqual(len(self.app_calls), 2, "the hour over, the App is asked again")
+
+    def test_a_bench_whose_hour_has_passed_is_not_restored(self) -> None:
+        self.refuse_cmux_graphql()
+        self.daemon.now = NOW + gg.APP_POOL_ROUTE_REST + 1
+        fresh = gg.AppPool(mint=lambda owner: APP_TOKEN, owners=lambda: ["manaflow-ai"], ready=lambda: True,
+                           clock=lambda: self.daemon.clock()).restore_bench()
+        self.assertEqual(fresh.unreadable, {})
+
+    def test_one_role_s_bench_does_not_bench_another_role_s_app(self) -> None:
+        self.refuse_cmux_graphql()
+        spare = gg.AppPool(role="quota-goblin", mint=lambda owner: APP_TOKEN, owners=lambda: ["manaflow-ai"],
+                           ready=lambda: True, clock=lambda: self.daemon.clock())
+        spare.save_bench()
+        self.assertEqual(spare.restore_bench().unreadable, {})
+        self.assertEqual(gg.AppPool(mint=lambda owner: APP_TOKEN, owners=lambda: ["manaflow-ai"], ready=lambda: True,
+                                    clock=lambda: self.daemon.clock()).restore_bench().unreadable,
+                         {"graphql:manaflow-ai:cmux": NOW + gg.APP_POOL_ROUTE_REST},
+                         "the spare writing its own bench keeps ci-watch's")
+
+    def test_a_missing_or_unreadable_bench_file_restores_nothing(self) -> None:
+        pool = gg.AppPool(mint=lambda owner: APP_TOKEN, owners=lambda: ["manaflow-ai"], ready=lambda: True,
+                          clock=lambda: self.daemon.clock())
+        self.assertEqual(pool.restore_bench().unreadable, {})
+        pool.bench_file().parent.mkdir(parents=True, exist_ok=True)
+        pool.bench_file().write_text("not json at all")
+        self.assertEqual(pool.restore_bench().unreadable, {})
+        pool.bench_file().write_text(json.dumps({"roles": {"ci-watch": {"graphql:x:y": "soon", "ok:z": NOW + 10}}}))
+        self.assertEqual(pool.restore_bench().unreadable, {"ok:z": NOW + 10}, "a bad entry drops, the good one stays")
 
 
 class AppPoolHostTest(unittest.TestCase):

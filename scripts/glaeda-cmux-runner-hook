@@ -3832,6 +3832,44 @@ def node_answer(fleet_class: str | None) -> tuple[str | None, dict[str, Any], bo
     config, generations = node_paths(home)
     if not fleet_class:
         return "node not eligible (no fleet class configured for this runner)", {}, False
+    if not os.environ.get(NODE_VIEW_ENV):
+        return _node_answer(config, generations, fleet_class, deadline)
+    with tempfile.TemporaryDirectory(prefix="glaeda-node-view-") as private:
+        return _node_answer(private_view_copy(config, Path(private), fleet_class), generations, fleet_class,
+                            deadline)
+
+
+# PRIVATE_VIEW_COPY (cmuxterm-hq#18007): a generation's `cmux_fleet.py status` reads the enrollment and the acceptance
+# only as private documents (_read_private_document: a regular file this euid owns, mode 0600, one link), so the node
+# view's copies (the member user's, 0644) answer "fleet document ownership or mode is unsafe" to a pool account, and
+# a pinned generation's validator cannot change. The pool runner's hook copies the three documents it judges into a
+# fresh private directory of its own (mkdtemp, 0700; files 0600, one link) for each answer and asks the generation
+# about those. Nothing is weakened: the copies hold the view's bytes, the view stays the member user's and is read
+# again on every answer, and the directory goes when the answer is given.
+def private_view_copy(config: Path, private: Path, fleet_class: str) -> Path:
+    """private/cmux-fleet holding this account's own 0600 copies of the view's enrollment.json,
+    acceptance/<FLEET_ROLE>.json and class-acceptance/<fleet_class>.json (each only when the view has it)."""
+    root = private / "cmux-fleet"
+    for rel in ("enrollment.json", f"acceptance/{FLEET_ROLE}.json", f"class-acceptance/{fleet_class}.json"):
+        try:
+            data = (config / rel).read_bytes()
+        except OSError:
+            continue  # missing in the view: _node_answer names what is missing
+        target = root / rel
+        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            os.fchmod(fd, 0o600)  # whatever the umask (a pool runner's is 002)
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view):]
+        finally:
+            os.close(fd)
+    return root
+
+
+def _node_answer(config: Path, generations: Path, fleet_class: str,
+                 deadline: float) -> tuple[str | None, dict[str, Any], bool]:
     receipt = _json_file(config / "class-acceptance" / f"{fleet_class}.json")
     enrollment = _json_file(config / "enrollment.json")
     if not isinstance(enrollment, dict):
