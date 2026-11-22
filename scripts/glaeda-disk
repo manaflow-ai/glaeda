@@ -12,7 +12,10 @@
     glaeda-disk --pressure --idle --apply  pressure first; with no pressure, an hourly idle sweep
     On a fleet mini build caches have no age window (BUILD_CACHES_UNWINDOWED): every whole --pressure --apply
     pass sweeps too, every time, and takes each build cache nothing live holds, past the free target; summary.json's
-    outlived_build_caches names what a pass left behind
+    outlived_build_caches names what a pass left behind. Under pressure there it also takes, unless disk-policy.json
+    turns the key off: the live hq worker's Cargo target dirs (pressure_worker_build_output), each seed root's
+    newest seed (pressure_newest_seed) and, where no runner carries glaeda-ios-sim, every simulator runtime no
+    booted simulator uses (pressure_sim_runtimes); every in-use veto still holds
     glaeda-disk --low 15% --target 25%  thresholds as GiB free or as a share of each filesystem
     glaeda-disk --pressure --apply deletes while jobs run; it holds only while the host is CPU-saturated
                                     (host_saturated), and never below --emergency; deletes run at low IO priority
@@ -212,12 +215,15 @@ HEAD on a branch, tag or remote ref of its repository, which survives, and no co
 own reflog holds. Ignored files go with it: in a temp-dir checkout they are
 build output or copies. Nested or unverifiable checkouts stay protected.
 
-On Linux a top-level temp-dir entry no other class owns, untouched (mtime and ctime, anywhere in its tree)
-for stale_tmp_scratch_hours (12 by default), is the tmp-stale-scratch family's instead of "tmp": a
+A top-level temp-dir entry no other class owns, untouched (mtime and ctime, anywhere in its tree) for
+stale_tmp_scratch_hours (12 by default; stale_tmp_scratch_hours_macos, 6, on a Mac), is the tmp-stale-scratch family's
+instead of "tmp": a
 bootstrap test's tree, a mktemp checkout, a clippy repo copy, each left by a process that is gone. Its
 checkouts are each judged (nothing unpushed), and it goes only once no process has its cwd, root or an
-open file inside it, read from every /proc entry (with `sudo -n` for other accounts' processes). A proof
-that cannot read every process keeps it, and the family exists only where the proof can be complete.
+open file inside it, read from every /proc entry (with `sudo -n` for other accounts' processes); on a Mac from one
+bounded lsof listing of every process's cwd and open files, which must cover every live process a login session started
+(darwin_holder_links). A proof that cannot read every process keeps it, and the family exists only where the proof can
+be complete.
 Without it 21 GiB of 18-19 h old unheld /tmp trees sat on a full huge-blue (2026-11-21) while the pass freed
 nothing. Unreadable folders the census meets are measured with `sudo -n du` where sudo needs no password,
 so the accounting gap is only what nothing could measure.
@@ -1072,6 +1078,22 @@ BUILD_CACHES_UNWINDOWED = False  # set by main: a fleet-mini pass, not reserved,
 # the future; with none, or past it, the VM is stale like any other (vm_claim). Off on a reserved host and where
 # disk-policy.json sets "fleet_claims_expire": false.
 FLEET_CLAIMS_EXPIRE = False  # set by main with BUILD_CACHES_UNWINDOWED
+# What a fleet mini under pressure frees that it otherwise holds for good (Leo, 2026-11-22: "it's the fleet. they dont
+# have anything protected"). cmux17 and cmux23 read 0 bytes reclaimable at 1.4 GiB free with about 57 GiB held by these
+# rules alone. Each is set by main only for a pressure pass (ACTIVITY_MODE "pressure") on a fleet mini that is not
+# reserved and not the runner-cache profile, and each has its own disk-policy.json key (false: off on that host).
+# Every in-use veto (an open file or cwd, a command line, a lease, a socket) still holds.
+# - PRESSURE_WORKER_BUILD_OUTPUT ("pressure_worker_build_output"): a Cargo target directory directly in the live hq
+#   worker's cache (cache/cmux-tui-target, 6-12 GiB) is build output (worker_build_output): no retired-owner rule and
+#   no git search keep it.
+# - PRESSURE_NEWEST_SEED ("pressure_newest_seed"): each root's newest seed (seed_verdict, 8.5-9.1 GiB) is not kept by
+#   role; it goes last among the seeds (least recently used first) and comes back from the LAN seeder or the bucket.
+# - PRESSURE_SIM_RUNTIMES ("pressure_sim_runtimes"): on a mini no simulator job can reach (no enrolled runner carries
+#   glaeda-ios-sim, sim_job_host), an installed simulator runtime no booted simulator uses goes with
+#   `xcrun simctl runtime delete` (runtime_items' unrouted rule), even its platform's newest.
+PRESSURE_WORKER_BUILD_OUTPUT = False
+PRESSURE_NEWEST_SEED = False
+PRESSURE_SIM_RUNTIMES = False
 BUILD_CACHE_FAMILY_NAMES = ("cmux-pr-builds", "cmux-seeds", "cmux-kept-build", "ci-derived-data",
                             "ci-ios-derived-data", "cmux-ci-admission", "cmux-ci-runner-admission",
                             "cmux-spm-scratch", "cmux-fast-tier-seed-root", "cmux-next-ci-generated",
@@ -1311,6 +1333,7 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "e2a25313c20b46947efece799601124c12f993712ac96f48d160215c8b4ade8e",
     "5d3ef91a91a33767a02b1ab8a1441bc22d9d0334261f08d023e68889baa421f8",
     "fc721033bb0823960cfebc55bc401ff0ecf6691e535baad0fc571bd4c39fb7d2",
+    "a0839b207ad34939c906c250c8076201ec3a4a81e299c82f3d909247cd2cdca9",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -1884,7 +1907,29 @@ def media_tour_host(state: Path | None = None) -> bool | None:
     global _MEDIA_TOUR_HOST, _MEDIA_TOUR_HOST_SET
     if state is None and _MEDIA_TOUR_HOST_SET:
         return _MEDIA_TOUR_HOST
-    base = CMUX_RUNNER_STATE if state is None else state
+    result = enrolled_labels_carry(CMUX_RUNNER_STATE if state is None else state,
+                                   lambda x: bool(MEDIA_TOUR_LABEL.match(x)))
+    if state is None:
+        _MEDIA_TOUR_HOST, _MEDIA_TOUR_HOST_SET = result, True
+    return result
+
+
+# glaeda_fleet_labels.IOS_SIM_LABEL: the installer gives it to a runner only on an ios-simulators host with every declared
+# runtime verified, so a mini where no enrolled runner carries it takes no simulator job (PRESSURE_SIM_RUNTIMES)
+IOS_SIM_RUNNER_LABEL = "glaeda-ios-sim"
+
+
+def sim_job_host(state: Path | None = None) -> bool | None:
+    """Whether a simulator job can be routed to this host: True when an enrolled runner carries IOS_SIM_RUNNER_LABEL,
+    False when every enrolled runner was read and none does, None when no runner is enrolled or a receipt cannot be
+    read (unknown: its runtimes stay)."""
+    return enrolled_labels_carry(CMUX_RUNNER_STATE if state is None else state, lambda x: x == IOS_SIM_RUNNER_LABEL)
+
+
+def enrolled_labels_carry(base: Path, match) -> bool | None:
+    """True when an enrolled runner's registration (base/receipt.json, base/instance-*/receipt.json) carries a label
+    MATCH accepts, False when every enrolled runner was read and none does, None when no runner is enrolled here or a
+    receipt cannot be read."""
     enrolled, answer = 0, False
     for path in [base / "receipt.json", *sorted(base.glob("instance-*/receipt.json"))]:
         try:
@@ -1904,13 +1949,10 @@ def media_tour_host(state: Path | None = None) -> bool | None:
         if not isinstance(labels, list):
             answer = None
             break
-        if any(isinstance(x, str) and MEDIA_TOUR_LABEL.match(x) for x in labels):
+        if any(isinstance(x, str) and match(x) for x in labels):
             answer = True
             break
-    result = answer if enrolled or answer is None else None
-    if state is None:
-        _MEDIA_TOUR_HOST, _MEDIA_TOUR_HOST_SET = result, True
-    return result
+    return answer if enrolled or answer is None else None
 
 
 def media_tour_dd(fam: Family, path: Path) -> bool:
@@ -2466,12 +2508,21 @@ POLICY_DEFAULTS: dict[str, Any] = {
     "pressure_idle_hours": 0.5,
     # A top-level /tmp entry untouched this long that no live process holds goes (tmp-stale-scratch); 0: off
     "stale_tmp_scratch_hours": 12.0,
+    # The same on a Mac, whose /private/tmp is on the one data volume (cmux16, 2026-11-22: 95% full with ~12 GiB of
+    # finished jobs' scratch in /private/tmp, perf-sentry-scrub 7.2G, typing-bench 3.0G, ra-base-wt 871M)
+    "stale_tmp_scratch_hours_macos": 6.0,
     # Read what this account cannot (other users' /proc entries, root-only folders the census meets) with
     # `sudo -n` where sudo needs no password; false: never
     "sudo_reads": True,
     # false: build caches keep their families' age windows on this host (BUILD_CACHES_UNWINDOWED)
     "build_caches_unwindowed": True,
     "fleet_claims_expire": True,  # a person's VM claim on a fleet mini holds only until its "until" (vm_claim)
+    # false: under pressure the live hq worker's Cargo target directories stay report only (PRESSURE_WORKER_BUILD_OUTPUT)
+    "pressure_worker_build_output": True,
+    # false: under pressure each seed root's newest seed stays (PRESSURE_NEWEST_SEED)
+    "pressure_newest_seed": True,
+    # false: under pressure a mini with no simulator jobs keeps its simulator runtimes (PRESSURE_SIM_RUNTIMES)
+    "pressure_sim_runtimes": True,
     # Every build cache on a volume together (BUDGET_FAMILY_IDS and the fleet compilation cache) stays under this share of
     # it (space()'s syntax; "0" turns it off). Over it, a pressure pass spends warm build state past BUDGET_IDLE_HOURS
     # by value until the caches are back under BUDGET_STOP_SHARE of it.
@@ -3005,10 +3056,17 @@ def _iso_age_hours(text: object, now: float) -> float | None:
     return (now - at) / 3600
 
 
-def runtime_items(runtimes: dict, devices: dict, now: float | None = None) -> list[Item]:
+UNROUTED_RUNTIME_REASON = ("no simulator job is routed to this mini (no enrolled runner carries glaeda-ios-sim), under "
+                           "pressure on a fleet mini: its devices and its platform's newest keep it no longer "
+                           "(pressure_sim_runtimes)")
+
+
+def runtime_items(runtimes: dict, devices: dict, now: float | None = None, unrouted: bool = False) -> list[Item]:
     """Judge simulator runtimes (`simctl runtime list -j`) against devices (`simctl list devices -j`).
     Reclaimable only when deletable, used by no device, not its platform's newest, unused for
-    RUNTIME_IDLE_DAYS, and no simulator is booted. Unknown fields keep it."""
+    RUNTIME_IDLE_DAYS, and no simulator is booted. Unknown fields keep it. With `unrouted` (a pressure pass on a mini
+    no simulator job reaches, PRESSURE_SIM_RUNTIMES) a shutdown device and being its platform's newest keep it no
+    longer; a booted simulator, simctl's deletable flag and its last use still do."""
     now = time.time() if now is None else now
     by_runtime = devices.get("devices") if isinstance(devices, dict) else None
     if not isinstance(runtimes, dict) or not isinstance(by_runtime, dict):
@@ -3028,9 +3086,9 @@ def runtime_items(runtimes: dict, devices: dict, now: float | None = None) -> li
         reasons = [f"{r.get('version', '?')} ({r.get('build', '?')}) {r.get('state', '?')}"]
         keep = []
         devs = by_runtime.get(r.get("runtimeIdentifier"), [])
-        if not r.get("runtimeIdentifier") or devs:
+        if not r.get("runtimeIdentifier") or (devs and not (unrouted and isinstance(devs, list))):
             keep.append(f"{len(devs) if isinstance(devs, list) else '?'} simulator devices use it")
-        if newest.get(str(r.get("platformIdentifier", ""))) == str(r.get("version", "")):
+        if newest.get(str(r.get("platformIdentifier", ""))) == str(r.get("version", "")) and not unrouted:
             keep.append("its platform's newest")
         if r.get("deletable") is not True:
             keep.append("simctl cannot delete it")
@@ -3042,6 +3100,8 @@ def runtime_items(runtimes: dict, devices: dict, now: float | None = None) -> li
         size = r.get("sizeBytes")
         verdict = ("kept" if keep else "recent" if idle is not None and idle < RUNTIME_IDLE_DAYS * 24
                    else "reclaimable")
+        if unrouted and verdict == "reclaimable":
+            reasons.append(UNROUTED_RUNTIME_REASON)
         items.append(Item("simulator-runtimes", str(rid), size if isinstance(size, int) else 0,
                           round(idle or 0.0, 1), verdict, reasons + keep, platform="macos"))
     return items
@@ -3055,11 +3115,11 @@ def simctl_json(*args: str) -> dict | None:
         return None
 
 
-def simulator_runtimes() -> list[Item]:
+def simulator_runtimes(unrouted: bool = False) -> list[Item]:
     if not DARWIN or not shutil.which("xcrun"):
         return []
     runtimes, devices = simctl_json("runtime", "list"), simctl_json("list", "devices")
-    return runtime_items(runtimes, devices) if runtimes is not None and devices is not None else []
+    return runtime_items(runtimes, devices, unrouted=unrouted) if runtimes is not None and devices is not None else []
 
 
 # Simulator devices (macOS, pressure passes and idle sweeps). CI jobs create a device per run and delete it in a
@@ -3350,14 +3410,20 @@ def xcode_items(apps: Path = Path("/Applications"), pins: dict[str, str] | None 
     return items
 
 
-def apply_runtimes(items: list[Item], receipt: Path, halt=None) -> int:
-    """Delete reclaimable runtimes after judging them again from a fresh simctl reading."""
+def apply_runtimes(items: list[Item], receipt: Path, halt=None, unrouted: bool = False, below_target=None) -> int:
+    """Delete reclaimable runtimes after judging them again from a fresh simctl reading. With `unrouted` (a pressure
+    pass, PRESSURE_SIM_RUNTIMES) the judging is runtime_items' unrouted rule, the mini is asked again whether a
+    simulator job can reach it, and the pass stops once below_target() says free space reached the target."""
     released = 0
     for i in items:
         if i.verdict != "reclaimable":
             continue
+        if below_target is not None and not below_target():
+            break
         why = halt() if halt is not None else ""
-        fresh = {x.path: x for x in simulator_runtimes()}.get(i.path)
+        if not why and unrouted and sim_job_host() is not False:
+            why = "a simulator job can be routed here now"
+        fresh = {x.path: x for x in simulator_runtimes(unrouted)}.get(i.path)
         if why:
             outcome = f"stopped:{why[:60]}"
         elif fresh is None or fresh.verdict != "reclaimable":
@@ -3373,7 +3439,7 @@ def apply_runtimes(items: list[Item], receipt: Path, halt=None) -> int:
                 released += i.bytes
         rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(), "outcome": outcome,
                "rebuild": "xcodebuild -downloadPlatform or Xcode's Components settings", **asdict(i),
-               "sweep": "idle"}
+               "sweep": "pressure" if unrouted else "idle"}
         receipt.parent.mkdir(parents=True, exist_ok=True)
         with receipt.open("a") as f:
             f.write(json.dumps(rec) + "\n")
@@ -3404,6 +3470,15 @@ def seed_verdict(path: Path) -> str:
                 continue
     newest = {name for _, name in sorted(current, reverse=True)[:SEED_KEEP]}
     return "its root's newest current seed" if path.name in newest else ""
+
+
+PRESSURE_NEWEST_SEED_REASON = ("its root's newest current seed, under pressure on a fleet mini: nothing holds it, and "
+                               "the LAN seeder or the bucket brings it back (pressure_newest_seed)")
+
+
+def pressure_newest_seed(fam: "Family", path: Path) -> bool:
+    """Whether PATH is a seed root's newest seed that this pressure pass may take (PRESSURE_NEWEST_SEED)."""
+    return PRESSURE_NEWEST_SEED and fam.id == "cmux-seeds" and bool(seed_verdict(path))
 
 
 WORKTREE_DIRS = ("worktrees", "cmux-worktrees", "glaeda-worktrees")
@@ -5369,6 +5444,34 @@ def hq_cache_family(root: Path | None = None) -> Family:
                   reference_root=FLEET_ROOT if root is None else root.parent, platform="macos")
 
 
+# The families over the hq worker's cache directory: a Cargo target directory directly in it is build output there
+# under pressure (PRESSURE_WORKER_BUILD_OUTPUT).
+WORKER_CACHE_FAMILY_IDS = frozenset({HQ_CACHE_FAMILY, "fleet-artifacts"})
+WORKER_BUILD_OUTPUT_REASON = ("a Cargo target directory in the live hq worker's cache, under pressure on a fleet mini: "
+                              "build output the worker rebuilds (pressure_worker_build_output)")
+
+
+def worker_cargo_target(path: Path) -> bool:
+    """Whether PATH is a Cargo target directory: cargo's own CACHEDIR.TAG, or its .rustc_info.json, at the top of a
+    real directory (not a symlink) that holds no version control of its own."""
+    try:
+        if path.is_symlink() or not path.is_dir():
+            return False
+    except OSError:
+        return False
+    if any(os.path.lexists(path / m) for m in VCS_MARKERS):
+        return False
+    return (bool(CARGO_TAG.search(_head(os.fspath(path / "CACHEDIR.TAG"), 256)))
+            or (path / ".rustc_info.json").is_file())
+
+
+def worker_build_output(fam: Family, path: Path) -> bool:
+    """Whether PATH is a Cargo target directory directly in the hq worker's cache on a pressure pass that frees it
+    (PRESSURE_WORKER_BUILD_OUTPUT): neither the worker being loaded (retired_only) nor a git search keeps it."""
+    return (PRESSURE_WORKER_BUILD_OUTPUT and fam.id in WORKER_CACHE_FAMILY_IDS and path.parent == fam.root
+            and worker_cargo_target(path))
+
+
 CMUX_DEBUG_APP_PREFIX = "com.cmuxterm.app.debug."  # a tagged DEV build's bundle id, never a release app's
 
 
@@ -5516,11 +5619,115 @@ def sudo_proc_links(timeout: float = STALE_TMP_PROC_TIMEOUT_S) -> tuple[list[str
     return [x for x in links if isinstance(x, str)], denied
 
 
+# macOS has no /proc: lsof lists every process's cwd and open files (proc_pidinfo, no stat of mounts: -b). Run as
+# this account it reads this account's processes only, so the proof must show that every other live process is a
+# system service: no ancestor of it was started by a login account (uid DARWIN_LOGIN_UID_MIN and up, the first a Mac
+# creates being 501). A root process a user started (sudo, a setuid helper) or another person's session counts as
+# unread and holds every entry, as an unreadable /proc entry does on Linux. launchd's system daemons (root and the _
+# role accounts) never work in a user's top-level /tmp scratch. Zombies hold nothing, and a process that started or
+# exited during the listing is not one lsof missed.
+DARWIN_LOGIN_UID_MIN = 500
+DARWIN_LOGIN_UID_MAX = 2**31 - 1  # nobody is -2, which ps may print as 4294967294
+
+
+def darwin_processes(out: str) -> dict[int, tuple[int, int, int, str]]:
+    """`ps -axo pid=,ppid=,uid=,ruid=,stat=` as pid -> (ppid, uid, ruid, stat)."""
+    procs: dict[int, tuple[int, int, int, str]] = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        try:
+            pid, ppid, uid, ruid = (int(x) for x in parts[:4])
+        except ValueError:
+            continue
+        procs[pid] = (ppid, uid, ruid, parts[4])
+    return procs
+
+
+def darwin_session_pids(procs: dict[int, tuple[int, int, int, str]]) -> set[int]:
+    """The live (not zombie) processes a login account started: its own uid or real uid, or an ancestor's, is a login
+    account's (DARWIN_LOGIN_UID_MIN to DARWIN_LOGIN_UID_MAX)."""
+    def login(uid: int) -> bool:
+        return DARWIN_LOGIN_UID_MIN <= uid <= DARWIN_LOGIN_UID_MAX
+
+    memo: dict[int, bool] = {}
+
+    def started_by_login(pid: int) -> bool:
+        chain: list[int] = []
+        found = False
+        while True:
+            if pid in memo:
+                found = memo[pid]
+                break
+            if pid not in procs or pid in chain:
+                break
+            chain.append(pid)
+            ppid, uid, ruid, _ = procs[pid]
+            if login(uid) or login(ruid):
+                found = True
+                break
+            pid = ppid
+        for p in chain:
+            memo[p] = found
+        return found
+
+    return {pid for pid, (_, _, _, st) in procs.items() if not st.startswith("Z") and started_by_login(pid)}
+
+
+def lsof_pids_and_paths(out: str) -> tuple[set[int], list[str]]:
+    """The pids `lsof -Fpcn` listed and the paths they hold (lsof_open_paths: PASSIVE_HOLDERS left out)."""
+    pids = {int(line[1:]) for line in out.splitlines() if line.startswith("p") and line[1:].isdigit()}
+    return pids, lsof_open_paths(out)
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:  # EPERM: another account's process, alive
+        return True
+    return True
+
+
+def darwin_holder_links(timeout: float = STALE_TMP_PROC_TIMEOUT_S) -> tuple[list[str], int]:
+    """Every path a Mac process has as its cwd or holds open, and how many live processes a login session started
+    lsof did not list (ps before, one bounded lsof, ps after). A failed or empty ps or lsof counts one unread process."""
+    lsof = shutil.which("lsof") or "/usr/sbin/lsof"
+    ps = ["ps", "-axo", "pid=,ppid=,uid=,ruid=,stat="]
+    try:
+        code, before = _owned_query(ps, timeout)
+        if code != 0 or not before.strip():
+            return [], 1
+        code, out, _ = _owned_query_split([lsof, *LSOF_NO_MOUNT_STAT, "-n", "-P", "-Fpcn"], timeout)
+        if code not in (0, 1):  # 1: lsof also exits so when it could not read another account's process
+            return [], 1
+        code, after = _owned_query(ps, timeout)
+        if code != 0 or not after.strip():
+            return [], 1
+    except (OSError, subprocess.SubprocessError):
+        return [], 1
+    pids, paths = lsof_pids_and_paths(out)
+    if not pids or not paths:
+        return [], 1
+    later = darwin_processes(after)
+    must = darwin_session_pids(darwin_processes(before))
+    unread = {pid for pid in must - pids
+              if pid in later and not later[pid][3].startswith("Z") and pid != os.getpid() and pid_alive(pid)}
+    return paths, len(unread)
+
+
 def stale_scratch_holders(fresh: bool = False) -> tuple[frozenset[str], int]:
     """Every path a process has as its cwd or root or holds open (open_index), and how many processes' entries could
-    not be read: this account's /proc read first, and when it misses any, the whole read again as root."""
+    not be read: this account's /proc read first, and when it misses any, the whole read again as root; on a Mac
+    darwin_holder_links."""
     global _STALE_HOLDERS
     if _STALE_HOLDERS is not None and not fresh:
+        return _STALE_HOLDERS
+    if DARWIN:
+        links, unread = darwin_holder_links()
+        _STALE_HOLDERS = (open_index(links), unread)
         return _STALE_HOLDERS
     links, denied = proc_links()
     unread = len(set(denied))
@@ -5542,16 +5749,23 @@ def stale_scratch_held(path: Path, fresh: bool = False) -> str:
 
 
 def stale_tmp_hours() -> float:
+    if DARWIN:
+        return float(POLICY.get("stale_tmp_scratch_hours_macos", 6.0))
     return float(POLICY.get("stale_tmp_scratch_hours", 12.0))
 
 
 def stale_tmp_enabled() -> bool:
-    """The family exists on Linux where its holder proof can be complete: sudo reads every process, or this account
-    already can (it is root, or no other account runs anything). Elsewhere "tmp" keeps every entry as before."""
+    """The family exists where its holder proof can be complete: on Linux sudo reads every process, or this account
+    already can (it is root, or no other account runs anything); on a Mac lsof listed every process a login session
+    started (darwin_holder_links). Elsewhere "tmp" keeps every entry as before."""
     global _STALE_TMP_ENABLED
     if _STALE_TMP_ENABLED is None:
-        _STALE_TMP_ENABLED = (not DARWIN and stale_tmp_hours() > 0
-                              and (sudo_reads() or not proc_links()[1]))
+        if stale_tmp_hours() <= 0:
+            _STALE_TMP_ENABLED = False
+        elif DARWIN:
+            _STALE_TMP_ENABLED = not stale_scratch_holders()[1]
+        else:
+            _STALE_TMP_ENABLED = sudo_reads() or not proc_links()[1]
     return _STALE_TMP_ENABLED
 
 
@@ -5602,7 +5816,7 @@ def default_families(role: str = "fleet-mini") -> list[Family]:
                   skip=(f"claude-{uid}",), skip_prefixes=STALE_TMP_PROTECTED_PREFIXES, files=True,
                   min_bytes=1024**2, git_disposable=True, nested_git=True, deep_mtime=True,
                   min_idle_hours=stale_tmp_hours(), owner="nothing: top-level /tmp scratch no class owns",
-                  rebuild_minutes=0.5, platform="linux")] if stale_tmp_enabled() else []),
+                  rebuild_minutes=0.5, platform=host_cache_platform())] if stale_tmp_enabled() else []),
         # cmux's cloud reload and CI jobs keep warm trees per unit (reload-cloud/{cmux-base,work},
         # reload-cloud-ios/{DerivedData,work}); a build mini grew 36 GiB here within hours. Depth 2
         # so a unit's DerivedData can go while the clones below cmux-base and work stay protected.
@@ -7478,8 +7692,11 @@ _SESSION_ENV: tuple[frozenset[str], frozenset[str]] | None | bool = False
 
 def deep_newest_mtime(path: Path, budget: int = DEEP_MTIME_BUDGET, ctime: bool = False) -> float:
     """The newest mtime of path and everything below it (lstat, never following a link), and with CTIME the newest
-    ctime too. Now, so the item reads as just used, when the walk cannot finish: past BUDGET entries, a directory it
-    cannot list, another filesystem."""
+    ctime too, where an mtime later than its entry's ctime counts as that ctime: every write and every utime sets ctime
+    to the kernel's clock, so an mtime past it is a stamp, not a use (cmux16, 2026-11-22: a built app in
+    /private/tmp/typing-bench stamped 8 h ahead read as used 2 h from now, then as just used for 8 h more).
+    Now, so the item reads as just used, when the walk cannot finish: past BUDGET entries, a directory it cannot list,
+    another filesystem."""
     now = time.time()
     try:
         st = path.lstat()
@@ -7487,7 +7704,9 @@ def deep_newest_mtime(path: Path, budget: int = DEEP_MTIME_BUDGET, ctime: bool =
         return 0.0
     except OSError:
         return now
-    newest, dev = max(st.st_mtime, st.st_ctime) if ctime else st.st_mtime, st.st_dev
+    def used(s: os.stat_result) -> float:
+        return s.st_mtime if not ctime else max(s.st_ctime, min(s.st_mtime, s.st_ctime))
+    newest, dev = used(st), st.st_dev
     if not stat.S_ISDIR(st.st_mode):
         return newest
     stack = [os.fspath(path)]
@@ -7505,7 +7724,7 @@ def deep_newest_mtime(path: Path, budget: int = DEEP_MTIME_BUDGET, ctime: bool =
                         continue
                     except OSError:
                         return now
-                    newest = max(newest, est.st_mtime, est.st_ctime if ctime else 0.0)
+                    newest = max(newest, used(est))
                     if stat.S_ISDIR(est.st_mode):
                         if est.st_dev != dev:
                             return now  # a mount inside: not this tree's to judge
@@ -7847,7 +8066,8 @@ def derived_data(fam: Family, path: Path) -> bool:
     is searched for git. A tool's own cache is searched, but git_state does not enter its sealed parts."""
     return bool(fam.build_output
             or DELETING_RE.fullmatch(path.name)
-            or (fam.id == "cmux-job-cache" and (path.name == "DerivedData" or path.parent.name == "SourcePackages")))
+            or (fam.id == "cmux-job-cache" and (path.name == "DerivedData" or path.parent.name == "SourcePackages"))
+            or worker_build_output(fam, path))
 
 
 def mirror_due(fam: Family, path: Path, idle_hours: float) -> bool:
@@ -8329,7 +8549,7 @@ def rustup_verdict(path: Path) -> str:
 def keep_verdict(fam: "Family", path: Path) -> str:
     """Why a candidate stays whatever its age, or ""."""
     if fam.id == "cmux-seeds":
-        return seed_verdict(path)
+        return "" if pressure_newest_seed(fam, path) else seed_verdict(path)
     if fam.id == INTERRUPTED:
         if os.path.lexists(mirror_keep_marker(path)):
             stale = kept_aside_stale(path)
@@ -10442,7 +10662,7 @@ def mirror_moved(fam: Family, path: Path, recheck: tuple) -> str:
         return f"referenced while its git work was bundled: {ref}"
     if fam.id in HOME_SCRATCH_FAMILIES and (ref := home_scratch_referenced(path)):
         return f"referenced while its git work was bundled: {ref}"
-    if fam.retired_only and not owner_retired(fam):
+    if fam.retired_only and not owner_retired(fam) and not worker_build_output(fam, path):
         return "its owner loaded while its git work was bundled"
     if fam.reference_root is not None and artifact_referenced(path, fresh_artifact_references(fam.reference_root)):
         return "referenced while its git work was bundled"
@@ -11890,7 +12110,7 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             verdict = "report-only"
         elif reasons:
             verdict = "in-use"
-        elif fam.retired_only and not owner_retired(fam):
+        elif fam.retired_only and not owner_retired(fam) and not worker_build_output(fam, path):
             verdict = "report-only"
         elif keep:
             verdict = "kept"
@@ -11920,6 +12140,10 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
                 reasons.append("a warm media tour slot, under the runner floor: last, least recently used first")
             if path.name in archived and fam.id == "cmux-seeds":
                 reasons.append("the seed archive holds it")
+            if pressure_newest_seed(fam, path):
+                reasons.append(PRESSURE_NEWEST_SEED_REASON)
+            if worker_build_output(fam, path):
+                reasons.append(WORKER_BUILD_OUTPUT_REASON)
             if cmux_next_ci_host_root(fam, path):
                 reasons.append("the per-host cmux-next build root, last of everything: "
                                + (f"idle {float(POLICY['cmux_next_ci_host_idle_hours']):g}h+"
@@ -12500,7 +12724,8 @@ def apfs_sibling_volumes(mount: str, now: float | None = None) -> list[dict[str,
 
 SIM_RUNTIME_IMAGES = "/System/Library/AssetsV2/com_apple_MobileAsset_iOSSimulatorRuntime/*/AssetData/Restore/*.dmg"
 SIM_RUNTIME_SCOPE = "kept-system"
-SIM_RUNTIME_OWNER = "Xcode's installed iOS simulator runtime (sim jobs mount it; never reclaimed)"
+SIM_RUNTIME_OWNER = ("Xcode's installed iOS simulator runtime (sim jobs mount it; reclaimed only when unused, by an idle "
+                     "sweep or a pressure pass on a mini no simulator job reaches)")
 
 
 def sim_runtime_row(now: float) -> dict[str, Any] | None:
@@ -12527,7 +12752,8 @@ CENSUS_OWNERS: tuple[tuple[str, str], ...] = (
     ("/System/Volumes/Data/System/Library/AssetsV2", "macOS MobileAssets, the iOS simulator runtime among them "
                                                      "(sim jobs need it; never reclaimed)"),
     ("/System/Volumes/Data/System", "macOS assets, the iOS simulator runtime among them (never reclaimed)"),
-    ("/Library/Developer/CoreSimulator", "the installed iOS simulator runtimes (sim jobs need them; never reclaimed)"),
+    ("/Library/Developer/CoreSimulator", "the installed iOS simulator runtimes (sim jobs need them; reclaimed only when "
+                                         "unused: simctl runtime delete)"),
     ("/Library/Developer", "Xcode command line tools and simulator support (never reclaimed)"),
     ("/Library", "macOS and installed apps' system-wide data (never reclaimed)"),
     ("/Applications", "installed apps (Xcode among them; never reclaimed)"),
@@ -14706,7 +14932,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                     break
         if (fam.boundary_root is not None or fam.id in ROOT_SAFE_FAMILIES) and not tart_root_safe(fam.boundary_root or fam.root):
             outcome = "changed:root-boundary"
-        elif fam.retired_only and not owner_retired(fam):
+        elif fam.retired_only and not owner_retired(fam) and not worker_build_output(fam, p):
             outcome = "changed:owner-loaded"
         elif fam.discover and not fresh_layout:
             outcome = "changed:layout"
@@ -16609,6 +16835,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
     if reserved:
         keep_legacy_ages()
     global RUNNER_CACHE_PROFILE, BUILD_CACHES_UNWINDOWED, FLEET_CLAIMS_EXPIRE
+    global PRESSURE_WORKER_BUILD_OUTPUT, PRESSURE_NEWEST_SEED, PRESSURE_SIM_RUNTIMES
+    PRESSURE_WORKER_BUILD_OUTPUT = PRESSURE_NEWEST_SEED = PRESSURE_SIM_RUNTIMES = False  # set below, once pressure is known
     RUNNER_CACHE_PROFILE = bool(a.runner_caches)
     BUILD_CACHES_UNWINDOWED = (role == "fleet-mini" and not reserved and not RUNNER_CACHE_PROFILE
                                and bool(POLICY["build_caches_unwindowed"]))
@@ -16755,6 +16983,12 @@ def _main_impl(argv: list[str] | None = None) -> int:
         return deferred("pressure_pass_running", "another pressure pass is running on this host; skipped")
     global ACTIVITY_MODE, EMERGENCY_DEVS, FLOOR_HOLD, CMUX_NEXT_HOST_FLOOR, OUT_OF_BAND_RUN
     ACTIVITY_MODE = "sweep" if sweep else "pressure" if a.pressure else None
+    # what a fleet mini under pressure frees that it otherwise holds for good (PRESSURE_WORKER_BUILD_OUTPUT)
+    fleet_pressure = ACTIVITY_MODE == "pressure" and role == "fleet-mini" and not reserved and not RUNNER_CACHE_PROFILE
+    PRESSURE_WORKER_BUILD_OUTPUT = fleet_pressure and bool(POLICY["pressure_worker_build_output"])
+    PRESSURE_NEWEST_SEED = fleet_pressure and bool(POLICY["pressure_newest_seed"])
+    PRESSURE_SIM_RUNTIMES = (fleet_pressure and DARWIN and not a.cmux_next_drain and bool(POLICY["pressure_sim_runtimes"])
+                             and (not a.family or "simulator-runtimes" in a.family))
     # the idle sweep judges by reuse windows alone; a pressure run or a report sees the emergency floor
     EMERGENCY_DEVS = frozenset() if sweep else emergency_devs(fss, a.emergency, floor_gib)
     FLOOR_HOLD = floor_hold(fss, floor_gib) if ACTIVITY_MODE == "pressure" else {}
@@ -17172,18 +17406,24 @@ def _main_impl(argv: list[str] | None = None) -> int:
         # job and its floor eviction run this one (glaeda-fleet-cas-prune keeps its own working-set rule)
         if fleet_cas_due and not RUN.get("fleet_cas_budget_cap"):  # the budget's cap already ran this pass
             logical_released += fleet_cas_node_cap()
+        def short_of_target() -> bool:
+            for fs in shown:
+                with contextlib.suppress(OSError):
+                    if free_bytes(Path(fs.mount))[0] < fs.target:
+                        return True
+            return False
         # idle simulator devices, on every idle sweep and on a pressure pass while free space is still short of the
         # target: each device is judged on its own, so a busy mini (never idle) still gets them back
         if ((sweep or a.pressure) and DARWIN and ROLE == "fleet-mini" and not RUNNER_CACHE_PROFILE
                 and not a.cmux_next_drain and not reserved and (not a.family or SIM_DEVICE_FAMILY in a.family)):
-            def short_of_target() -> bool:
-                for fs in shown:
-                    with contextlib.suppress(OSError):
-                        if free_bytes(Path(fs.mount))[0] < fs.target:
-                            return True
-                return False
             logical_released += erase_idle_sim_devices(a.receipt, halt,
                                                        below_target=None if sweep else short_of_target)
+        # simulator runtimes on a mini no simulator job reaches, under pressure, after its devices (PRESSURE_SIM_RUNTIMES):
+        # the idle sweep's rule keeps every runtime a device names and each platform's newest, and a never-idle mini
+        # never sweeps; cmux17 held two of about 16 GiB each at 1.4 GiB free (2026-11-22)
+        if PRESSURE_SIM_RUNTIMES and sim_job_host() is False:
+            logical_released += apply_runtimes(simulator_runtimes(unrouted=True), a.receipt, halt, unrouted=True,
+                                               below_target=short_of_target)
         remaining = []
         for fs in shown:
             try:

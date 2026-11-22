@@ -23,6 +23,9 @@ glaeda-gh wait pr OWNER/REPO#N --sha "$(git rev-parse HEAD)"   # until green; 1 
 glaeda-gh wait pr OWNER/REPO#N --until done      # until every check finishes (0 green, 1 red, 4 conflict)
 glaeda-gh wait pr OWNER/REPO#N --until required  # only the checks GitHub requires decide (opt-in)
 glaeda-gh wait pr OWNER/REPO#N --until merged    # ignores conflicts; 1 if closed without merging
+# green on an OPEN PR is not merged: it prints `result: green (checks passed; PR still OPEN, not merged)` and
+# `next: glaeda-gh wait pr OWNER/REPO#N --until merged` (exit 0; --json: "merged": false). With no --until, a PR
+# glaeda land holds a request for is waited on until merged (said on stderr); the land's own stop ends it on its checks
 # --until (and every other choice) takes a synonym or one typo of a choice (checks-done, passed, merge) and says on stderr which it ran
 glaeda-gh wait run OWNER/REPO/RUN_ID [--jobs]    # 0 success, 1 failure
 glaeda-gh wait comment OWNER/REPO#N --author 'github-actions[bot]' --match 'REGEX' --since COMMENT_URL

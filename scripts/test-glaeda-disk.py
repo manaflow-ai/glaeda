@@ -128,6 +128,8 @@ def _main_then_reset(*args, **kwargs):
         return _gd_main(*args, **kwargs)
     finally:
         gd.BUILD_CACHES_UNWINDOWED = False
+        # and the pressure rules a fleet-mini pressure pass sets (PRESSURE_WORKER_BUILD_OUTPUT and the rest)
+        gd.PRESSURE_WORKER_BUILD_OUTPUT = gd.PRESSURE_NEWEST_SEED = gd.PRESSURE_SIM_RUNTIMES = False
 
 
 gd.main = _main_then_reset
@@ -164,6 +166,7 @@ class GlaedaDiskTest(unittest.TestCase):
         gd.process_evidence = self.gd_evidence
         gd.FLOOR_HOLD = {}  # a main() pressure run in a test sets it
         gd.BUILD_CACHES_UNWINDOWED = False  # and this, on a fleet-mini run
+        gd.PRESSURE_WORKER_BUILD_OUTPUT = gd.PRESSURE_NEWEST_SEED = gd.PRESSURE_SIM_RUNTIMES = False  # a pressure run
         gd.NESTED_KEEP.unlink(missing_ok=True)
         gd.NESTED_KEEP = self.gd_keep
         self.tmp.cleanup()
@@ -13434,7 +13437,8 @@ class ActivityClockTest(unittest.TestCase):
 MAIN_GLOBALS = ("ROLE", "RUNNER_CACHE_PROFILE", "CMUX_NEXT_CI_DRAIN", "ACTIVITY_MODE", "EMERGENCY_DEVS", "FLOOR_HOLD",
                 "CMUX_NEXT_HOST_FLOOR", "CMUX_NEXT_CI_OVER", "_JOB_STARTS", "_JOB_STARTS_READ", "_RUNNING_JOB_HOURS",
                 "_MEASURE_BUDGET_REACHED", "_EVICT_HANDLE", "_HOOK_PASS_FD", "OUT_OF_BAND_RUN", "CACHE_BUDGET",
-                "BUDGET_WARM_DEVS", "FLEET_CLAIMS_EXPIRE")
+                "BUDGET_WARM_DEVS", "FLEET_CLAIMS_EXPIRE", "PRESSURE_WORKER_BUILD_OUTPUT", "PRESSURE_NEWEST_SEED",
+                "PRESSURE_SIM_RUNTIMES")
 
 
 def keep_main_globals(stack: contextlib.ExitStack) -> None:
@@ -15897,6 +15901,107 @@ class StaleTmpScratchTest(unittest.TestCase):
         self.assertIn(str(d / "deep/er/blob"), links)
         self.assertIn(os.getcwd(), links)
 
+class DarwinStaleTmpScratchTest(unittest.TestCase):
+    """On a Mac the tmp-stale-scratch holder proof is one bounded lsof listing that must cover every live process a
+    login session started (cmux16, 2026-11-22: 95% full with finished jobs' scratch in /private/tmp, which the
+    family never took because its proof read /proc)."""
+
+    # pid ppid uid ruid stat: launchd, a root daemon and its root child, cmux's shell, a sudo it ran and sudo's
+    # root child, a zombie, another person's session
+    PS = """    1     0     0     0 Ss
+  112     1     0     0 Ss
+  375   112     0     0 S
+  500     1   501   501 S
+  501   500     0   501 S
+  502   501     0     0 S
+  503   500   501   501 Z
+  600     1   502   502 S
+"""
+
+    def setUp(self) -> None:
+        saved = (gd.DARWIN, gd._STALE_TMP_ENABLED, gd._STALE_HOLDERS, gd.STALE_TMP_CTIME, dict(gd.POLICY))
+
+        def restore() -> None:
+            gd.DARWIN, gd._STALE_TMP_ENABLED, gd._STALE_HOLDERS, gd.STALE_TMP_CTIME = saved[:4]
+            gd.POLICY.clear()
+            gd.POLICY.update(saved[4])
+        self.addCleanup(restore)
+        gd.DARWIN, gd._STALE_TMP_ENABLED, gd._STALE_HOLDERS = True, None, None
+
+    def lsof(self, pids: list[int], paths: dict[int, list[str]] | None = None) -> str:
+        out = []
+        for pid in pids:
+            out += [f"p{pid}", "cbash", *(f"n{p}" for p in (paths or {}).get(pid, ["/"]))]
+        return "\n".join(out) + "\n"
+
+    def run_proof(self, lsof_out: str, lsof_code: int = 0, after: str | None = None,
+                  alive: bool = True) -> tuple[list[str], int]:
+        ps = [(0, self.PS), (0, self.PS if after is None else after)]  # ps before and after the listing
+        with mock.patch.object(gd, "_owned_query", side_effect=ps), \
+                mock.patch.object(gd, "_owned_query_split", return_value=(lsof_code, lsof_out, "")), \
+                mock.patch.object(gd, "pid_alive", return_value=alive):
+            return gd.darwin_holder_links()
+
+    def test_the_session_processes_are_the_ones_a_login_account_started(self) -> None:
+        pids = gd.darwin_session_pids(gd.darwin_processes(self.PS))
+        self.assertEqual(pids, {500, 501, 502, 600})  # not launchd, its daemons or a zombie; sudo's child is in
+
+    def test_a_listing_that_covers_every_session_process_proves_it(self) -> None:
+        paths, unread = self.run_proof(self.lsof([500, 501, 502, 600], {500: ["/private/tmp/held/x"]}))
+        self.assertEqual(unread, 0)
+        self.assertIn("/private/tmp/held/x", paths)
+
+    def test_a_session_process_lsof_could_not_read_holds_everything(self) -> None:
+        _, unread = self.run_proof(self.lsof([500, 600]), lsof_code=1)  # sudo (501) and its root child unread
+        self.assertEqual(unread, 2)
+
+    def test_a_process_that_exited_or_turned_zombie_during_the_listing_was_not_missed(self) -> None:
+        after = self.PS.replace("  502   501     0     0 S", "  502   501     0     0 Z").replace(
+            "  501   500     0   501 S\n", "")
+        _, unread = self.run_proof(self.lsof([500, 600]), after=after)
+        self.assertEqual(unread, 0)
+        _, unread = self.run_proof(self.lsof([500, 600]), alive=False)
+        self.assertEqual(unread, 0)
+
+    def test_a_failed_or_empty_listing_is_incomplete(self) -> None:
+        self.assertEqual(self.run_proof(self.lsof([500, 501, 502, 600]), lsof_code=2), ([], 1))
+        self.assertEqual(self.run_proof(""), ([], 1))
+
+    def test_the_family_exists_on_a_mac_only_when_the_proof_is_complete(self) -> None:
+        with mock.patch.object(gd, "darwin_holder_links", return_value=(["/"], 0)):
+            self.assertTrue(gd.stale_tmp_enabled())
+        gd._STALE_TMP_ENABLED, gd._STALE_HOLDERS = None, None
+        with mock.patch.object(gd, "darwin_holder_links", return_value=(["/"], 3)):
+            self.assertFalse(gd.stale_tmp_enabled())
+            self.assertEqual(gd.stale_scratch_held(Path("/private/tmp/x")),
+                             "not proven unheld: 3 processes' open files unreadable")
+
+    def test_a_path_lsof_lists_holds_its_top_level_entry(self) -> None:
+        with mock.patch.object(gd, "darwin_holder_links", return_value=(["/private/tmp/held/deep/f"], 0)):
+            self.assertIn("held by a process", gd.stale_scratch_held(Path("/private/tmp/held")))
+            self.assertEqual(gd.stale_scratch_held(Path("/private/tmp/free")), "")
+
+    def test_the_window_is_6_h_on_a_mac_and_12_h_on_linux(self) -> None:
+        self.assertEqual(gd.stale_tmp_hours(), 6.0)
+        gd.DARWIN = False
+        self.assertEqual(gd.stale_tmp_hours(), 12.0)
+        gd.DARWIN = True
+        gd.POLICY["stale_tmp_scratch_hours_macos"] = 0
+        self.assertFalse(gd.stale_tmp_enabled())
+
+    def test_an_mtime_stamped_past_its_ctime_counts_as_its_ctime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp) / "typing-bench"
+            (d / "app").mkdir(parents=True)
+            f = d / "app/cmux DEV"
+            f.write_bytes(b"x")
+            ahead = time.time() + 8 * 3600
+            os.utime(f, (ahead, ahead))
+            newest = gd.deep_newest_mtime(d, ctime=True)
+            self.assertLessEqual(newest, time.time() + 1)  # its ctime (the utime just now), not 8 h from now
+            self.assertGreaterEqual(newest, time.time() - 60)  # and a real change (that utime) still counts
+            self.assertGreaterEqual(gd.deep_newest_mtime(d), ahead - 1)  # mtime alone still counts it
+
 
 class CensusSudoTest(unittest.TestCase):
     """The census measures a directory it cannot read with `sudo -n du` where sudo needs no password, so the
@@ -16118,6 +16223,227 @@ class CargoStaleArtifactsTest(unittest.TestCase):
             res = gd.sweep_cargo_targets(self.receipt, [self.root / ".wt/checkouts"], stale_hours=0)
         self.assertEqual(res["units"], 0)
         self.assertTrue(all(p.exists() for p in f.values()))
+class PressureHeldBytesTest(unittest.TestCase):
+    """Leo, 2026-11-22: "5 Mac minis that stopped taking work because their disks are low. find the useful solutions to
+    prevent these" / "fleet's own cleanup tools, which never delete VMs or protected folders. this is not good enough.
+    it's the fleet. they dont have anything protected." cmux17 and cmux23 read 0 bytes reclaimable at 1.4 GiB free
+    while the live worker's cmux-tui-target, each root's newest seed and two unused simulator runtimes held ~57 GiB."""
+
+    PINNED = ("PRESSURE_WORKER_BUILD_OUTPUT", "PRESSURE_NEWEST_SEED", "PRESSURE_SIM_RUNTIMES")
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(os.path.realpath(self.tmp.name))
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        # a test that ran main() may leave them set: each test here turns on only the rule it reads
+        for name in self.PINNED:
+            stack.enter_context(mock.patch.object(gd, name, False))
+        stack.enter_context(mock.patch.object(gd, "process_evidence", return_value=([], "")))
+        stack.enter_context(mock.patch.object(gd, "command_lines", return_value=""))
+        stack.enter_context(mock.patch.object(gd, "BUILD_CACHES_UNWINDOWED", False))
+        stack.enter_context(mock.patch.object(gd, "FLEET_ROOT", self.root / "shared-fleet"))
+        gd._DISCOVERED.clear()
+        self.addCleanup(gd._DISCOVERED.clear)
+
+    def age(self, path: Path, hours: float) -> Path:
+        t = time.time() - hours * 3600
+        for p in sorted(path.rglob("*"), reverse=True):
+            os.utime(p, (t, t), follow_symlinks=False)
+        os.utime(path, (t, t))
+        return path
+
+    def cargo_target(self, path: Path, hours: float = 2.0) -> Path:
+        (path / "debug/.fingerprint").mkdir(parents=True)
+        (path / "debug/cmux-tui").write_bytes(b"\0" * 1024 * 1024)
+        (path / "CACHEDIR.TAG").write_text("Signature: 8a477f597d28d172789f06886806bc55\n"
+                                           "# This file is a cache directory tag created by cargo.\n")
+        return self.age(path, hours)
+
+    def verdicts(self, fams: list) -> dict[tuple[str, str], gd.Item]:
+        with contextlib.redirect_stdout(io.StringIO()):
+            return {(i.family, Path(i.path).name): i for i in gd.survey(fams, 1.0, 0)}  # a pressure pass's window
+
+    def receipt(self) -> Path:
+        return self.root / "receipt.jsonl"
+
+    def test_the_live_workers_cargo_target_is_build_output_under_pressure(self) -> None:
+        cache = self.root / "cache"
+        target = self.cargo_target(cache / "cmux-tui-target")
+        self.cargo_target(cache / "linked-target")
+        (cache / "workspaces" / "k" / "src" / ".git").mkdir(parents=True)  # the worker's clone: not build output
+        self.age(cache / "workspaces", 2.0)
+        (cache / "tagless").mkdir()  # a directory with no cargo marker
+        (cache / "tagless" / "debug").mkdir()
+        self.age(cache / "tagless", 2.0)
+        (cache / "with-git").mkdir()
+        self.cargo_target(cache / "with-git" / "t")
+        (cache / "with-git" / ".git").mkdir()
+        self.age(cache / "with-git", 2.0)
+        hq = gd.hq_cache_family(cache)
+        artifacts = gd.Family("fleet-artifacts", cache, True, "rebuild", depth=1, files=True,
+                              reference_root=self.root, platform="macos")
+        with mock.patch.object(gd, "owner_retired", return_value=False), \
+                mock.patch.object(gd, "family_git_state", return_value="unchecked"):
+            off = self.verdicts([hq, artifacts])
+            self.assertEqual(off[(hq.id, "cmux-tui-target")].verdict, "report-only", "the worker is loaded")
+            self.assertEqual(off[("fleet-artifacts", "cmux-tui-target")].verdict, "unchecked")
+            with mock.patch.object(gd, "PRESSURE_WORKER_BUILD_OUTPUT", True):
+                on = self.verdicts([hq, artifacts])
+                for fid in (hq.id, "fleet-artifacts"):
+                    item = on[(fid, "cmux-tui-target")]
+                    self.assertEqual(item.verdict, "reclaimable", (fid, item.reasons))
+                    self.assertIn(gd.WORKER_BUILD_OUTPUT_REASON, item.reasons)
+                self.assertEqual(on[(hq.id, "workspaces")].verdict, "report-only", "a clone stays the worker's")
+                self.assertEqual(on[(hq.id, "tagless")].verdict, "report-only", "only cargo's own marker counts")
+                self.assertEqual(on[(hq.id, "with-git")].verdict, "report-only", "version control of its own")
+                # a running cargo names its target dir, an open file holds it: both still keep it
+                with mock.patch.object(gd, "process_evidence",
+                                       return_value=([], f"rustc --out-dir {target}/debug/deps\n")):
+                    self.assertEqual(self.verdicts([hq])[(hq.id, "cmux-tui-target")].verdict, "in-use")
+                with mock.patch.object(gd, "process_evidence",
+                                       return_value=([os.fspath(target / "debug/cmux-tui")], "")):
+                    self.assertEqual(self.verdicts([hq])[(hq.id, "cmux-tui-target")].verdict, "in-use")
+                items = [on[(hq.id, "cmux-tui-target")]]
+                with contextlib.redirect_stdout(io.StringIO()):
+                    gd.apply(items, {hq.id: hq}, self.receipt(), None, 1.0, all_families=[hq])
+            self.assertFalse(target.exists(), "apply's own recheck lets it go too")
+            self.assertTrue((cache / "workspaces" / "k" / "src" / ".git").is_dir())
+            rec = [json.loads(line) for line in self.receipt().read_text().splitlines()]
+            self.assertEqual([r["outcome"] for r in rec], ["reclaimed"])
+            self.assertIn(gd.WORKER_BUILD_OUTPUT_REASON, rec[0]["reasons"])
+
+    def test_the_newest_seed_goes_under_pressure_only_when_nothing_holds_it(self) -> None:
+        seeds = self.root / "ci" / "seeds"
+        old = make(seeds / "seed-old", age_hours=60)
+        newest = make(seeds / "seed-new", age_hours=30)
+        fam = gd.Family("cmux-seeds", seeds, True, "fetch", build_output=True, platform="macos")
+        off = self.verdicts([fam])
+        self.assertEqual(off[(fam.id, "seed-old")].verdict, "reclaimable")
+        self.assertEqual(off[(fam.id, "seed-new")].verdict, "kept")
+        self.assertIn("its root's newest current seed", off[(fam.id, "seed-new")].reasons)
+        with mock.patch.object(gd, "PRESSURE_NEWEST_SEED", True):
+            on = self.verdicts([fam])
+            self.assertEqual(on[(fam.id, "seed-new")].verdict, "reclaimable", on[(fam.id, "seed-new")].reasons)
+            self.assertIn(gd.PRESSURE_NEWEST_SEED_REASON, on[(fam.id, "seed-new")].reasons)
+            self.assertNotIn(gd.PRESSURE_NEWEST_SEED_REASON, on[(fam.id, "seed-old")].reasons)
+            with mock.patch.object(gd, "process_evidence", return_value=([os.fspath(newest / "blob")], "")):
+                self.assertEqual(self.verdicts([fam])[(fam.id, "seed-new")].verdict, "in-use", "a job adopting it")
+            with contextlib.redirect_stdout(io.StringIO()):
+                gd.apply([on[(fam.id, "seed-new")]], {fam.id: fam}, self.receipt(), None, 1.0, all_families=[fam])
+        self.assertFalse(newest.exists())
+        self.assertTrue(old.exists())
+
+    def runner(self, state: Path, n: int, labels: list[str]) -> None:
+        rdir = self.root / "runners" / f"r{n}"
+        rdir.mkdir(parents=True, exist_ok=True)
+        (rdir / ".runner").write_text("{}")
+        receipt = state / f"instance-{n}" / "receipt.json"
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        receipt.write_text(json.dumps({"mode": "install", "runnerDir": str(rdir),
+                                       "registration": {"labels": ["self-hosted", "glaeda-mini", *labels]}}))
+
+    def test_a_simulator_job_host_is_read_from_enrolled_runner_labels(self) -> None:
+        state = self.root / "state"
+        self.assertIsNone(gd.sim_job_host(state), "no runner enrolled: unknown, nothing goes")
+        self.runner(state, 1, ["glaeda-std-xcode-26.6"])
+        self.assertIs(gd.sim_job_host(state), False)
+        self.runner(state, 2, [gd.IOS_SIM_RUNNER_LABEL])
+        self.assertIs(gd.sim_job_host(state), True)
+        shutil.rmtree(state / "instance-2")
+        (state / "instance-0").mkdir()
+        (state / "instance-0" / "receipt.json").write_text("{not json")
+        self.assertIsNone(gd.sim_job_host(state), "an unreadable receipt: unknown")
+
+    def test_the_glaeda_runner_label_for_simulators_is_the_installers(self) -> None:
+        spec = importlib.util.spec_from_file_location("glaeda_fleet_labels", ROOT / "scripts" / "glaeda_fleet_labels.py")
+        labels = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(labels)
+        self.assertEqual(gd.IOS_SIM_RUNNER_LABEL, labels.IOS_SIM_LABEL)
+
+    def test_unrouted_simulator_runtimes_go_even_their_platforms_newest(self) -> None:
+        now = time.time()
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 30 * 86400))
+        new = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 60))
+
+        def rt(version, used, deletable=True):
+            return {"runtimeIdentifier": f"ios-{version}", "platformIdentifier": "iphonesimulator",
+                    "version": version, "deletable": deletable, "lastUsedAt": used, "sizeBytes": 16 * gd.GIB}
+        runtimes = {"A": rt("26.5", old), "B": rt("26.2", old), "C": rt("26.1", new), "E": rt("17.0", old, False)}
+        devices = {"devices": {"ios-26.2": [{"state": "Shutdown"}]}}
+        routed = {i.path: i.verdict for i in gd.runtime_items(runtimes, devices, now)}
+        self.assertEqual(routed, {"A": "kept", "B": "kept", "C": "recent", "E": "kept"})
+        items = {i.path: i for i in gd.runtime_items(runtimes, devices, now, unrouted=True)}
+        self.assertEqual({p: i.verdict for p, i in items.items()},
+                         {"A": "reclaimable", "B": "reclaimable", "C": "recent", "E": "kept"})
+        self.assertIn(gd.UNROUTED_RUNTIME_REASON, items["A"].reasons)
+        devices["devices"]["ios-26.2"][0]["state"] = "Booted"
+        self.assertNotIn("reclaimable", {i.verdict for i in gd.runtime_items(runtimes, devices, now, unrouted=True)})
+
+    def test_apply_runtimes_asks_again_and_stops_at_the_target(self) -> None:
+        item = lambda p: gd.Item("simulator-runtimes", p, 16 * gd.GIB, 700.0, "reclaimable", [], platform="macos")
+        items = [item("A"), item("B")]
+        ran = []
+
+        def run(argv, **kw):
+            ran.append(argv[-1])
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        short = iter([True, False])
+        with mock.patch.object(gd, "simulator_runtimes", side_effect=lambda unrouted=False: items if unrouted else []), \
+                mock.patch.object(gd, "sim_job_host", return_value=False), \
+                mock.patch.object(gd.subprocess, "run", side_effect=run), contextlib.redirect_stdout(io.StringIO()):
+            released = gd.apply_runtimes(items, self.receipt(), unrouted=True, below_target=lambda: next(short))
+        self.assertEqual((ran, released), (["A"], 16 * gd.GIB), "the target was met after the first")
+        self.assertEqual(json.loads(self.receipt().read_text().splitlines()[0])["sweep"], "pressure")
+        ran.clear()
+        with mock.patch.object(gd, "simulator_runtimes", side_effect=lambda unrouted=False: items if unrouted else []), \
+                mock.patch.object(gd, "sim_job_host", return_value=None), \
+                mock.patch.object(gd.subprocess, "run", side_effect=run), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gd.apply_runtimes(items, self.receipt(), unrouted=True), 0)
+        self.assertEqual(ran, [], "a mini that may take a simulator job now keeps them")
+
+    def test_main_turns_each_rule_on_only_for_an_unreserved_fleet_mini_under_pressure(self) -> None:
+        dd = make(self.root / "dd" / "x", age_hours=0.01)
+        fam = gd.Family("xcode-derived-data", dd.parent, True, "rebuild")
+        seen: list[tuple[bool, bool, bool]] = []
+        survey = gd.survey
+
+        def watch(*args, **kwargs):
+            seen.append((gd.PRESSURE_WORKER_BUILD_OUTPUT, gd.PRESSURE_NEWEST_SEED, gd.PRESSURE_SIM_RUNTIMES))
+            return survey(*args, **kwargs)
+
+        def run(args: list[str], free_gib: float, policy: dict) -> tuple[bool, bool, bool] | None:
+            seen.clear()
+            with mock.patch.object(gd, "default_families", return_value=[fam]), \
+                    mock.patch.object(gd, "free_bytes", return_value=(int(free_gib * gd.GIB), 228 * gd.GIB)), \
+                    mock.patch.object(gd, "EVICT_LOCK", self.root / "evict.lock"), \
+                    mock.patch.object(gd, "HEALTH_SUMMARY", self.root / "summary.json"), \
+                    mock.patch.object(gd, "IDLE_STAMP", self.root / "idle.last"), \
+                    mock.patch.object(gd, "simulator_runtimes", return_value=[]), \
+                    mock.patch.object(gd, "survey", side_effect=watch), mock.patch.dict(gd.POLICY, policy), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                gd.main(args)
+            return seen[0] if seen else None
+
+        base = ["--pressure", "--no-snapshot", "--top", "0", "--min-mib", "0", "--low", "10", "--target", "20",
+                "--receipt", os.fspath(self.receipt())]
+        darwin = gd.DARWIN
+        self.assertEqual(run(base, 1.4, {}), (True, True, darwin))
+        self.assertEqual(run(base, 1.4, {"pressure_worker_build_output": False, "pressure_newest_seed": False,
+                                         "pressure_sim_runtimes": False}), (False, False, False))
+        self.assertEqual(run(base, 1.4, {"pressure_newest_seed": False}), (True, False, darwin))
+        self.assertEqual(run([*base, "--role", "devbox"], 1.4, {}), (False, False, False))
+        self.assertIn(run([*base, "--idle"], 100, {}), (None, (False, False, False)), "no pressure: an idle sweep")
+        for name in self.PINNED:
+            self.assertFalse(getattr(gd, name), "main leaves them off after its run")
+
+    def test_policy_keys_default_on_and_a_host_turns_each_off(self) -> None:
+        for key in ("pressure_worker_build_output", "pressure_newest_seed", "pressure_sim_runtimes"):
+            self.assertIs(gd.POLICY_DEFAULTS[key], True)
+            path = self.root / f"{key}.json"
+            path.write_text(json.dumps({key: False}))
+            self.assertIs(gd.disk_policy(path)[key], False)
 
 
 if __name__ == "__main__":

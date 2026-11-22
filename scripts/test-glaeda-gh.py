@@ -10654,6 +10654,125 @@ class RerunWaitTest(Base):
         self.assertEqual(code, gg.EXIT_FAIL)
 
 
+class WaitPrNotMergedTest(Base):
+    """manaflow-ai/cmux#50409, 2026-11-22: after `glaeda-gh land ... --notify`, `glaeda-gh wait pr
+    manaflow-ai/cmux#50409` (no --until) ended at 14:51Z with "result: success, ended_by: success" on green checks;
+    the PR was still OPEN and merged at 15:23:12Z. The agent reported "merged" and its coordinator spent a 90-minute
+    deploy wait on a PR that was not in. A green wait on an open PR now says green and not merged, and names
+    `--until merged`; a wait with no --until on a PR glaeda land has a request for waits for the merge."""
+
+    KEY = "pr:o/r#1"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.get = lambda repo, queries: {q: {"workflow_runs": [], "total_count": 0} for q in queries}
+
+    def put(self, state: str = "OPEN", rollup: str = "SUCCESS", conclusion: str = "SUCCESS") -> None:
+        data = gg.parse_pr(pr_node(1, state=state, rollup=rollup, checks=[check_run("a", conclusion=conclusion)]))
+        if state == "MERGED":
+            data["mergeCommit"] = {"oid": "c8572b091e4b" + "0" * 28}
+        now = time.time()
+        gg.write_json(gg.cache_dir() / gg.file_name(self.KEY),
+                      {"key": self.KEY, "fetchedAt": now, "dataAt": now, "data": data, "error": None})
+
+    def land(self, state: str, **fields: Any) -> None:
+        gg.write_json(gg.LandQueue.entries_dir() / gg.file_name(self.KEY),
+                      {"key": self.KEY, "repo": "o/r", "number": 1, "state": state, **fields})
+
+    def request(self, until: str | None, as_json: bool = False) -> dict:
+        if until is None:
+            until, chosen = gg.wait_until_chosen("pr", self.KEY, None)
+            req = gg.wait_request("pr", "o/r#1", until, 600, False, as_json, None, True, gg.RESCUE_GRACE,
+                                  chosen=chosen)
+        else:  # the same request an explicit --until always made
+            req = gg.wait_request("pr", "o/r#1", until, 600, False, as_json, None, True, gg.RESCUE_GRACE)
+        req["began"] = time.time() - 5
+        return req
+
+    def test_green_on_an_open_pr_says_green_not_merged_and_names_the_merged_wait(self) -> None:
+        self.put()
+        code, text = gg.wait_step(self.request("green"), time.time(), self.get)
+        self.assertEqual(code, gg.EXIT_OK, text)  # exit 0 stays: every existing caller reads green as 0
+        self.assertIn("result: green (checks passed; PR still OPEN, not merged)", text)
+        self.assertNotIn("result: success", text)
+        self.assertNotIn("ended_by: success", text)
+        self.assertEqual(text.rstrip("\n").splitlines()[-1], "next: glaeda-gh wait pr o/r#1 --until merged")
+
+    def test_done_and_required_on_an_open_pr_say_not_merged_too(self) -> None:
+        self.put()
+        for until in ("done", "required"):
+            code, text = gg.wait_step(self.request(until), time.time(), self.get)
+            self.assertEqual(code, gg.EXIT_OK, text)
+            self.assertIn("PR still OPEN, not merged", text, until)
+            self.assertNotIn("result: success", text, until)
+            self.assertIn("next: glaeda-gh wait pr o/r#1 --until merged", text, until)
+
+    def test_json_keeps_its_result_and_says_merged_false(self) -> None:
+        self.put()
+        code, text = gg.wait_step(self.request("green", as_json=True), time.time(), self.get)
+        doc = json.loads(text)
+        self.assertEqual((code, doc["result"]), (gg.EXIT_OK, "success"))  # the --json contract callers parse
+        self.assertIs(doc["merged"], False)
+        self.assertEqual(doc["next"], "glaeda-gh wait pr o/r#1 --until merged")
+
+    def test_until_merged_never_ends_on_checks_alone(self) -> None:
+        req = self.request("merged")
+        self.put()
+        self.assertIsNone(gg.wait_step(req, time.time(), self.get), "a merged wait ended on green checks")
+        self.put(state="MERGED")
+        code, text = gg.wait_step(req, time.time(), self.get)
+        self.assertEqual(code, gg.EXIT_OK, text)
+        self.assertIn("result: merged", text)
+        self.assertIn("c8572b091e", text)
+
+    def test_a_cli_wait_with_no_until_parses_as_unset(self) -> None:
+        self.assertIsNone(gg.parser().parse_args(["wait", "pr", "o/r#1"]).until)
+        self.assertEqual(gg.parser().parse_args(["wait", "pr", "o/r#1", "--green"]).until, "green")
+
+    def test_no_until_and_no_land_request_is_green(self) -> None:
+        self.assertEqual(gg.wait_until_chosen("pr", self.KEY, None), ("green", None))
+        self.land("merged")
+        self.assertEqual(gg.wait_until_chosen("pr", self.KEY, None), ("green", None))
+        self.land("stopped")
+        self.assertEqual(gg.wait_until_chosen("pr", self.KEY, None), ("green", None))
+
+    def test_an_explicit_until_is_never_changed(self) -> None:
+        self.land("waiting")
+        for until in ("green", "done", "required", "merged"):
+            self.assertEqual(gg.wait_until_chosen("pr", self.KEY, until), (until, None))
+
+    def test_no_until_with_a_land_request_waits_for_the_merge_and_says_so(self) -> None:
+        for state in ("queued", "waiting", "judging", "acting", "waiting_after", "forwarded"):
+            self.land(state)
+            until, chosen = gg.wait_until_chosen("pr", self.KEY, None)
+            self.assertEqual(until, "merged", state)
+            self.assertIn("glaeda land", chosen["why"])
+            self.assertIn(state, chosen["why"])
+        self.land("waiting")
+        req = self.request(None)
+        self.put()
+        self.assertIsNone(gg.wait_step(req, time.time(), self.get), "the land's wait ended on green checks")
+        self.put(state="MERGED")
+        code, text = gg.wait_step(req, time.time(), self.get)
+        self.assertEqual(code, gg.EXIT_OK, text)
+        self.assertIn("result: merged", text)
+        self.assertIn("until: merged (chosen: a land request", text)
+
+    def test_the_lands_own_stop_ends_its_merged_wait_on_the_checks(self) -> None:
+        self.land("waiting")
+        req = self.request(None)
+        self.put()
+        self.assertIsNone(gg.wait_step(req, time.time(), self.get))
+        self.land("stopped", stop={"code": "review_required", "reason": "needs an approving review", "next": "x"})
+        code, text = gg.wait_step(req, time.time(), self.get)
+        self.assertEqual(code, gg.EXIT_OK, text)  # what the same wait with no land would have said: green, exit 0
+        self.assertIn("result: green (checks passed; PR still OPEN, not merged)", text)
+        self.assertIn("land: the land request stopped (review_required: needs an approving review)", text)
+        self.put(rollup="FAILURE", conclusion="FAILURE")
+        req = self.request(None)  # no land request any more: green, so a red fails as before
+        self.assertEqual(gg.wait_step(req, time.time(), self.get)[0], gg.EXIT_FAIL)
+
+
 class WaitSubscriptionTest(Base):
     """2026-10-21, app-efficiency: 89 `glaeda-gh wait` processes held 1.6 GB on cosmic-gray, a whole
     interpreter per waiter re-reading the cache every 3 s. A `wait pr|run` is now a request the daemon
@@ -10696,7 +10815,7 @@ class WaitSubscriptionTest(Base):
         self.daemon.serve_waits()
         self.assertEqual(self.woken(reader), "0\n")
         out = (gg.waits_dir() / f"{rid}.out").read_text()
-        self.assertIn("result: success", out)
+        self.assertIn("result: green (checks passed; PR still OPEN, not merged)", out)
         self.assertFalse((gg.waits_dir() / f"{rid}.json").exists(), "a decided request stayed")
 
     def test_a_red_or_a_timeout_says_what_cmd_wait_says(self) -> None:
@@ -10803,7 +10922,7 @@ class WaitSubscriptionTest(Base):
                 child.kill()
                 child.wait()
         self.assertEqual(child.returncode, 0, out + err)
-        self.assertIn("result: success", out)
+        self.assertIn("result: green (checks passed; PR still OPEN, not merged)", out)
         self.assertEqual([p.name for p in gg.waits_dir().iterdir()], [".served"], "the wait left files behind")
 
     def test_an_older_daemon_gets_the_polling_wait(self) -> None:
@@ -28767,6 +28886,54 @@ class LandTest(Base):
         self.tick(1)
         self.assertEqual(self.w.explains()[0][-3:], ["--sha", LB, "--json"])
 
+    def no_data_unreadable(self, n: int) -> None:
+        for _ in range(n):
+            self.w.answers.append((3, {"ok": False, "code": "unreadable", "head": LA,
+                                       "reason": "land-judge: refused: unreadable: GitHub timed out",
+                                       "next": "", "action": {"v": 1, "kind": "retry", "after_s": 120}}))
+
+    def no_data_judgments(self, seconds: float, step: float = 10.0) -> list[float]:
+        """Run the queue SECONDS with no cached copy of the PR; when each live judgment ran (seconds from the start)."""
+        start, at = self.t, []
+        while self.t - start < seconds:
+            before = len(self.w.judgments())
+            self.tick(step)
+            if len(self.w.judgments()) > before:
+                at.append(round(self.t - start))
+        return at
+
+    def test_a_pr_the_daemon_cannot_read_backs_off_between_no_data_judgments(self):
+        """Queue host, 2026-11-22 14:37-15:37Z: 118 unreadable judgments why=no_data, each ~177 s of a worker, because
+        the no-data path judged again LAND_NO_DATA_AFTER after each answer and never read its retry's wake. The
+        judgments now follow the retry's backoff (doubling to LAND_RETRY_MAX), still at least every LAND_RETRY_MAX."""
+        self.nudge_reads = False
+        self.land()
+        self.no_data_unreadable(40)
+        at = self.no_data_judgments(4 * 3600)
+        gaps = [b - a for a, b in zip(at, at[1:])]
+        # before: one every 130 s (40 in the first 87 min); now 130, 260, 500, 980, 1940 s, then every 1800 s: 11
+        self.assertLessEqual(len(at), 12, at)
+        self.assertTrue(all(b >= a for a, b in zip(gaps, gaps[1:])), gaps)  # never faster than the one before
+        self.assertLessEqual(max(gaps), gg.LAND_RETRY_MAX + 20, gaps)  # never stranded: bounded
+        self.assertEqual(self.q.entries[self.KEY]["state"], "waiting")
+
+    def test_the_daemons_first_copy_after_a_no_data_judgment_is_judged_at_once(self):
+        """The backoff waits for nothing but its wake or the PR's first copy: the read the daemon could not do arrives
+        and the land is judged on it that pass, pinned to the head it shows."""
+        self.nudge_reads = False
+        self.land()
+        self.no_data_unreadable(3)
+        at = self.no_data_judgments(600)
+        self.assertEqual(len(at), 3, at)  # LAND_NO_DATA_AFTER, then the retry's 120 s and 240 s; the next 480 s on
+        e = self.q.entries[self.KEY]
+        self.assertGreater(e["wakeAt"], self.t + 60)
+        self.pr(LA)
+        self.w.answers.insert(0, ok_answer(LA))
+        e = self.tick(2)
+        self.assertEqual(self.w.judgments()[-1][-3:], ["--sha", LA, "--json"])
+        self.assertEqual(e["state"], "merged")
+        self.assertIn("data_seen", [h.get("why") for h in e["history"]])
+
     def test_a_full_pin_the_cache_contradicts_still_stops(self):
         """The trust is in the pin, not over a read: a cached head that is not the pin still stops head_moved."""
         self.pr(LA)
@@ -30907,6 +31074,108 @@ class WaitFromBytecodeTest(unittest.TestCase):
                                   timeout=60)
             self.assertEqual(done.returncode, 0, done.stderr)
             self.assertTrue(list(Path(home, ".cache", "gh-quota", "pycache").rglob("*.pyc")))
+
+
+class LandWaitAlarmTest(AlarmBase):
+    """The land queue's wait clock (LAND_GREEN_WAIT_PAGE). huge-blue, 2026-11-22 07:59Z: 887 open entries, queue-to-merge
+    p50 77 min and p90 3.4 h, green PRs such as leo-workspace#7930 waiting since 05:57Z, and no number said so."""
+
+    HEAD = "a" * 40
+
+    def green(self, n: int, waited: float, ok_since: bool = True) -> dict:
+        """An open row judged ok with its merge step next at the head the cache shows, green for WAITED seconds."""
+        at = NOW - waited
+        x = {"at": NOW - 5, "ok": True, "head": self.HEAD, "action": {"kind": "merge"}}
+        if ok_since:
+            x["okSince"] = at
+        return {"key": f"pr:o/r#{n}", "state": "waiting", "explain": x,
+                "history": [{"at": at, "event": "judged", "head": self.HEAD[:12], "step": "merge", "code": "ok"},
+                            {"at": NOW - 5, "event": "judged", "head": self.HEAD[:12], "step": "merge", "code": "ok"}]}
+
+    def cache(self, key: str) -> dict:
+        return {"key": key, "data": {"state": "OPEN", "headRefOid": self.HEAD}}
+
+    def queue_with(self, rows: list[dict]) -> Any:
+        gg.land_dir().mkdir(parents=True, exist_ok=True)
+        q = gg.LandQueue(cache_of=self.cache, inline=True, config={})
+        q.now = NOW
+        q.entries = {e["key"]: e for e in rows}
+        with mock.patch.object(gg, "log") as logged:
+            q.log_pool()
+        self.pool_line = [c.args[0] for c in logged.call_args_list if c.args[0].get("event") == "land-pool"][-1]
+        self.daemon.land_queue = q
+        return q
+
+    def test_the_clock_counts_only_green_rows_at_the_cached_head(self) -> None:
+        rows = [self.green(1, 600), self.green(2, 1200), self.green(3, 3000, ok_since=False)]
+        rows.append({**self.green(4, 9000), "explain": {**self.green(4, 9000)["explain"], "head": "b" * 40}})  # moved
+        rows.append({**self.green(5, 9000), "state": "merged"})
+        rows.append({**self.green(6, 9000), "explain": {"ok": False, "head": self.HEAD, "action": {"kind": "wait"}}})
+        g = gg.land_green_waits(rows, self.cache, NOW)
+        self.assertEqual((g["rows"], g["p50S"], g["p95S"], g["past"]), (3, 1200, 3000, 1))
+        self.assertEqual((g["oldest"], g["oldestS"]), ("o/r#3", 3000))  # no okSince: its first judged line at the head
+        self.assertEqual(gg.land_green_waits([], self.cache, NOW)["p50S"], None)
+
+    def test_a_clean_row_no_judgment_reached_counts_from_when_it_was_queued(self) -> None:
+        """huge-blue, 2026-11-22 08:15Z: 653 rows queued, never judged; only 5 judged ok at their head."""
+        clean = lambda key: {"key": key, "data": {"state": "OPEN", "headRefOid": self.HEAD,  # noqa: E731
+                                                  "mergeStateStatus": "CLEAN", "checks": [{"status": "COMPLETED"}]}}
+        queued = {"key": "pr:o/r#7", "state": "queued", "created": NOW - 7200, "dueAt": NOW - 4000}
+        refused = {"key": "pr:o/r#8", "state": "waiting", "created": NOW - 9000,
+                   "explain": {"at": NOW - 60, "ok": False, "head": self.HEAD, "action": {"kind": "review"}}}
+        g = gg.land_green_waits([queued, refused], clean, NOW)
+        self.assertEqual((g["rows"], g["judged"], g["p50S"], g["oldest"]), (1, 0, 4000, "o/r#7"))
+        running = lambda key: {"key": key, "data": {**clean(key)["data"],  # noqa: E731
+                                                    "checks": [{"status": "IN_PROGRESS"}]}}
+        self.assertEqual(gg.land_green_waits([queued], running, NOW)["rows"], 0)
+
+    def test_a_median_past_30_minutes_pages_and_under_it_stays_quiet(self) -> None:
+        self.policy()
+        self.queue_with([self.green(n, 29 * 60) for n in range(5)])
+        self.daemon.check_alarms()
+        self.assertEqual(self.told_lines(), [])
+        self.assertEqual((self.pool_line["greenWaitP50S"], self.pool_line["greenWaitP95S"]), (1740, 1740))
+        self.queue_with([self.green(n, 31 * 60) for n in range(5)])
+        self.daemon.check_alarms()
+        told = self.told_lines()
+        self.assertEqual(len(told), 1, told)
+        self.assertIn("--severity fire", told[0])
+        self.assertIn("green PRs wait to merge: p50 31m, p95 31m over 5 row(s) one merge away (5 judged ok) of 5 open",
+                      told[0])
+        self.assertEqual(self.notice_lines()[-1]["kind"], "land-wait")
+        self.daemon.check_alarms()  # still past: not sent again within the hour
+        self.assertEqual(len(self.told_lines()), 1)
+
+    def test_a_tail_past_30_minutes_warns_while_the_median_is_under(self) -> None:
+        self.policy()
+        self.queue_with([self.green(n, 60) for n in range(18)] + [self.green(20, 3600)])
+        self.daemon.check_alarms()
+        self.assertEqual(self.told_lines(), [])  # one row past: under LAND_GREEN_WAIT_TAIL
+        self.queue_with([self.green(n, 60) for n in range(18)] + [self.green(20, 3600), self.green(21, 7300)])
+        self.daemon.check_alarms()
+        told = self.told_lines()
+        self.assertEqual(len(told), 1, told)
+        self.assertIn("--severity warn", told[0])
+        self.assertIn("p50 60s, p95 60m", told[0])
+        self.assertIn("oldest o/r#21 (2h01m)", told[0])
+
+    def test_the_alarm_is_off_by_policy_and_on_a_stale_reading(self) -> None:
+        self.policy(landWait=False)
+        self.queue_with([self.green(1, 7200)])
+        self.daemon.check_alarms()
+        self.policy()
+        self.daemon.now = NOW + 3 * gg.LAND_POOL_LOG_EVERY  # no land-pool line since: no reading to page on
+        self.daemon.check_alarms()
+        self.assertEqual(self.told_lines(), [])
+        with mock.patch.object(gg, "policy_doc", return_value={"alarms": {"landWait": False}}):
+            self.assertFalse(gg.daemon_policy()["alarms"]["landWait"])
+        with mock.patch.object(gg, "policy_doc", return_value={}):
+            self.assertTrue(gg.daemon_policy()["alarms"]["landWait"])  # on by default
+
+    def test_land_status_prints_the_clock(self) -> None:
+        line = gg.land_green_line(gg.land_green_waits([self.green(1, 600), self.green(2, 2400)], self.cache, NOW))
+        self.assertEqual(line, "glaeda land: green waits: 2 row(s) one merge away (2 judged ok), p50 10m, p95 40m, 1 past "
+                               "30m; oldest o/r#2 (40m); pages past 30m")
 
 
 class RunFromBytecodeTest(unittest.TestCase):
@@ -33472,7 +33741,8 @@ class ShorthandFlagTest(unittest.TestCase):
 
     def test_wait_until_forms_unchanged(self):
         args, err = self.parse(["wait", "pr", "o/r#1"])
-        self.assertEqual((args.until, err), ("green", ""))
+        # unset, so main can tell "no --until" (green, or merged for a PR glaeda land holds: wait_until_chosen)
+        self.assertEqual((args.until, err), (None, ""))
         for word in ("green", "done", "required", "merged"):
             with self.subTest(word=word):
                 args, err = self.parse(["wait", "pr", "o/r#1", "--until", word])
