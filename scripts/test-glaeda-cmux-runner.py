@@ -779,9 +779,12 @@ class HookTest(unittest.TestCase):
                 "trusted_next_signing": True, "workflow_ref": workflow_ref,
                 "job": "build-sign-notarize-nightly", "run_attempt": "1"}
         signing = [job for workflow, job in hook.SIGNING_JOBS if workflow == "nightly.yml"]
-        self.assertEqual(len(signing), 18)
+        self.assertEqual(len(signing), 19)
         # ONE_JOB_NIGHTLY (cmux#42267): the one job that builds, signs and publishes is one of them
         self.assertIn("nightly-next-one", signing)
+        # LIVE_CODE_VARIANT: the variant's signer is a nightly.yml job too; its secret-free build is not
+        self.assertIn("sign-live-code-variant", signing)
+        self.assertNotIn("build-live-code-variant", signing)
         # ONE_MINI_NIGHTLY: a dispatched nightly-next run (cmux one-mini mode sends its signing jobs here too) signs
         # here like its push; its payload names the same ref
         dispatch = {"ref": ref, "repository": {**CMUX, "default_branch": "main"}, "inputs": {},
@@ -797,7 +800,7 @@ class HookTest(unittest.TestCase):
                           {"event": {k: v for k, v in dispatch.items() if k != "ref"}},
                           {"workflow_ref": "manaflow-ai/cmux/.github/workflows/nightly.yml@refs/heads/main"},
                           {"workflow_ref": f"manaflow-ai/cmux/.github/workflows/release.yml@{ref}"},
-                          {"job": "build-nightly-app"}, {"job": "decide"}, {"job": None},
+                          {"job": "build-nightly-app"}, {"job": "build-live-code-variant"}, {"job": "decide"}, {"job": None},
                           *[{"event": {**dispatch, key: {}}} for key in ("pull_request", "workflow_run",
                                                                           "merge_group")]):
             with self.subTest(dispatch=overrides):
@@ -4042,6 +4045,43 @@ class HookTest(unittest.TestCase):
         full = self.job("fast-tier", "s1", 14, None, env=self.FAST_TIER)
         self.assertEqual(full.returncode, 1, full.stdout)
         self.assertIn("refused: capacity: 4 of 14 units free, fast-tier (isolated) needs 5", full.stdout)
+
+    def test_a_fast_tier_job_on_a_plain_side_runner_of_a_needs_host_takes_the_room_its_listener_had(self) -> None:
+        """SIDE_FAST_FIT: a side listener listens with room for the isolated class median (SIDE_LISTEN_MEDIAN), so it
+        caught the fast tier with 4 of 14 free while its admission asked for its own p90 (8) and was refused after 60
+        s (job 137053521754 on cmux14, 2026-11-22). On a plain side runner of a needs host it is admitted by class."""
+        self.fleet()
+        doc = {"schema": hook.JOB_NEEDS_SCHEMA, "generated_at": datetime.datetime.now(datetime.timezone.utc)
+               .strftime("%Y-%m-%dT%H:%M:%SZ"), "window": {"from": "2026-11-01", "to": "2026-11-14"},
+               "min_samples": 20, "jobs": {"cmux-next.yml/fast-tier": {
+                   "n": 50, "cores_p50": 4.0, "cores_p90": 8.0, "mem_peak_mib_p90": 500, "mem_peak_mib_max": 500,
+                   "wall_s_p50": 60, "wall_s_p90": 120}},
+               "classes": {"isolated": {"n": 50, "cores_p50": 3.0, "cores_p90": 6.0, "mem_peak_mib_p90": 500,
+                                        "mem_peak_mib_max": 500, "wall_s_p50": 60, "wall_s_p90": 120}}}
+        needs = self.dir / "needs.json"
+        needs.write_text(json.dumps(doc))
+        env = {**self.FAST_TIER, hook.HOST_CORES_ENV: "14", hook.HOST_MEM_ENV: str(48 * 1024),
+               hook.JOB_NEEDS_ENV: os.fspath(needs)}
+        self.take_units(10)  # 4 of 14 free, as on cmux14
+        try:
+            side = self.job("fast-tier", "s2", 14, None, "--instance", "2", env=env)
+            self.assertEqual(side.returncode, 0, side.stdout + side.stderr)
+            self.assertIn("admitted at its class's need", side.stdout)
+            self.assertIn("holding 3/14 units for fast-tier (isolated", side.stdout)
+        finally:
+            self.finish("s2")
+
+    def test_only_a_plain_side_runner_admits_the_fast_tier_by_class(self) -> None:
+        base = dict(capacity_units=14, instance=2, canonical_roots=2, fast_runner=False, gui_runner=False,
+                    session_runner=False, dev_compile_runner=False, dedicated_admit=None, nightly_runner=False,
+                    gateway_runner=False, sim_runner=False, small_runner=False)
+        self.assertTrue(hook.plain_side_runner(argparse.Namespace(**base)))
+        for change in ({"capacity_units": 0}, {"instance": 1}, {"fast_runner": True}, {"gui_runner": True},
+                       {"session_runner": True}, {"dev_compile_runner": True}, {"dedicated_admit": Path("x")},
+                       {"nightly_runner": True}, {"gateway_runner": True}, {"sim_runner": True},
+                       {"small_runner": True}):
+            with self.subTest(change=change):
+                self.assertFalse(hook.plain_side_runner(argparse.Namespace(**{**base, **change})))
 
     def test_the_fast_runner_refuses_every_other_job(self) -> None:
         """The fast runner keeps listening on a full mini (it needs no general units), so another job that

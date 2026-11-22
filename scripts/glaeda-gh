@@ -325,6 +325,7 @@ import contextlib
 import datetime as dt
 import faulthandler
 import fcntl
+import fnmatch
 import glob
 import gzip
 import hashlib
@@ -734,6 +735,7 @@ CLIENT_RUN_LONG_POLL = STALE_RUN_REREAD
 WAIT_INTEREST = CLIENT_RUN_LONG_POLL + 2 * TOUCH_EVERY
 CONTROLLER_ABSENT = 900  # a controller without the run-events receiver (404, 503) is asked again this rarely
 FEED_PAGES = 5  # feed pages read per tick at most; a longer backlog continues on the next tick
+FEED_HELD_MAX = 50  # pages feed_between_reads keeps for the next tick at most; past it the feed waits for that tick
 # on-event: a command run once per finished run (or one job of it) the controller's feed shows (`on-event`).
 # Leo, on an hourly Cloud probe: "but what's the point of checking every hour?"
 ON_EVENT_CONFIG = Path(os.environ.get("GLAEDA_GH_ON_EVENT_CONFIG") or Path.home() / ".config/glaeda/on-event.json")
@@ -3789,6 +3791,22 @@ def timed_out(error: BaseException) -> bool:
     return isinstance(error, TimeoutError) or isinstance(getattr(error, "reason", None), TimeoutError)
 
 
+def transport_reason(error: BaseException) -> str:
+    """A transport failure's type and the OS's own words for it, never the URL or a value: "URLError
+    (ConnectionRefusedError: [Errno 111] Connection refused)". The type alone ("controller: URLError", huge-blue 04:26-06:00Z
+    2026-11-22, nine state events) could not tell a refused connection from a DNS miss or a reset (failure-drops-its-reason)."""
+    name = type(error).__name__
+    inner = getattr(error, "reason", None) if isinstance(error, urllib.error.URLError) else error
+    if isinstance(inner, BaseException):
+        words = getattr(inner, "strerror", None)
+        errno_ = getattr(inner, "errno", None)
+        said = (f"[Errno {errno_}] {words}" if isinstance(errno_, int) else str(words)) if isinstance(words, str) else ""
+        if inner is error:
+            return f"{name} ({said})" if said else name
+        return f"{name} ({type(inner).__name__}: {said})" if said else f"{name} ({type(inner).__name__})"
+    return name
+
+
 class Controller:
     """The build controller's GitHub events (cmuxterm-hq#675) over the tailnet: no GitHub quota.
     Without a token it answers for public repositories only."""
@@ -3835,8 +3853,8 @@ class Controller:
             raise WatchError(f"controller HTTP {error.code}") from None
         except (OSError, HTTPException, ValueError) as error:
             if timed_out(error):
-                raise ControllerTimeout(f"controller: {type(error).__name__}") from None
-            raise WatchError(f"controller: {type(error).__name__}") from None
+                raise ControllerTimeout(f"controller: {transport_reason(error)}") from None
+            raise WatchError(f"controller: {transport_reason(error)}") from None
         if not isinstance(doc, dict):
             raise WatchError("controller: not a JSON object")
         return doc
@@ -5022,6 +5040,10 @@ class Daemon:
         self.controller = self.controller_source() if self.controller_source else controller
         self.controller_down_until = 0.0
         self.controller_feed_at = float("-inf")
+        self.feed_held: list[dict] = []  # feed pages read between a tick's reads, for the next read_controller
+        self.feed_between = False  # feed_between_reads is reading (a request it makes must not read again)
+        self.feed_after_controller = False  # this tick is past its controller phase: its reads may read the feed
+        self.tick_thread: int | None = None  # the thread running tick (feed_due reads the feed on it alone)
         self.controller_failures = 0
         self.controller_budget_end = float("inf")  # time.monotonic() past which this tick asks the controller nothing
         self.controller_filled: set[str] = set()  # watched runs the controller tracks, while its feed answers
@@ -6318,6 +6340,7 @@ class Daemon:
             raise WatchError("this host reads GitHub through its upstream (upstream.json) and has no login")
         if not content and not free:
             self.post_due()  # a read phase never holds a queued write past its spacing
+            self.feed_due()  # nor lets the feed view it keeps for downstream hosts age out (feed_between_reads)
         raw_body = json.dumps(body).encode() if body is not None else None
         pool = self.app_pool
         owner = (pool.owner_of(method, path, body) if pool is not None and not free and not content
@@ -7955,6 +7978,7 @@ class Daemon:
         self.now = time.time() if now is None else now
         self.clock_real = now is None
         self.tick_deadline = time.monotonic() + TICK_BUDGET
+        self.feed_after_controller, self.tick_thread = False, threading.get_ident()
         with contextlib.suppress(Exception):  # never stops a tick
             self.free_slots()
         if self.started_tick is None:
@@ -7989,6 +8013,7 @@ class Daemon:
             # there must not stop GitHub polling (it did: glaeda#1305). A WatchError is expected and
             # says what failed; anything else is a bug, so it carries its code site.
             self.controller_down(error, None if isinstance(error, WatchError) else error_site(error))
+        self.feed_after_controller = True  # from here a long tick reads the feed between its reads (feed_due)
         # due() consumes the deferred set; the REST order below still needs it, oldest deferral first
         self.deferred_since = {k: self.deferred_since.get(k, self.now) for k in self.deferred}
         self.deferred_before = dict(self.deferred_since)
@@ -8927,6 +8952,11 @@ class Daemon:
         self.heavy = {k: h for k, h in self.heavy.items() if self.now - h["at"] < IDLE_EXPIRY}
         size = self.batch[kind]
 
+        # A heavy entry GraphQL times out on alone, between its lone retries: REST reads it (the broker host, 2026-11-22:
+        # a PR with 163 checks 504'd on every lone query, nothing read it, and the PR a due land was blocked on kept
+        # data 14,000+ s old while the stale valve restarted the daemon every 30 min).
+        backing_off: list[dict] = []
+
         def chunks(group: list[dict]) -> list[list[dict]]:
             alone, rest = [], []
             for e in group:
@@ -8935,6 +8965,8 @@ class Daemon:
                     rest.append(e)
                 elif h["fails"] < HEAVY_AFTER or self.now - h["at"] >= LEAN_FACTOR * self.policy["cycles"][kind]:
                     alone.append([e])
+                else:
+                    backing_off.append(e)
             # One owner per query. An App installation answers a read only when the whole query names one owner
             # (AppPool.owner_of returns None for a cross-owner body), so a batch that mixes owners has no App and
             # all of it -- the App-servable entries included -- goes on the shared login's 5,000 points an hour
@@ -8951,7 +8983,7 @@ class Daemon:
         # What a wait or a due land is blocked on goes first, heavy or not: the pace reads it before the rest
         queue = chunks([e for e in entries if self.waited(e)]) + chunks([e for e in entries if not self.waited(e)])
         splits, shrunk = 0, False
-        to_rest: list[dict] = []
+        to_rest: list[dict] = list(backing_off)
         while queue:
             chunk = queue.pop(0)
             on_app = bool(self.app_entries_eligible(kind, chunk, "graphql"))
@@ -9045,11 +9077,11 @@ class Daemon:
                         else f"{kind} batch of {len(chunk)} ({', '.join(repos)})")
                 then = ("REST reads it this tick" if down and (len(chunk) < 2 or splits + 2 > GQL_SPLITS)
                         else "split into halves and retried" if len(chunk) >= 2 and splits + 2 <= GQL_SPLITS
-                        else "read alone, next cycle")
+                        else "REST reads it this tick")  # a lone timeout: too heavy for GraphQL even alone
                 self.refresh_note("graphql", error, what, then)
             if len(chunk) == 1 and chunk[0]["key"] in self.heavy or (len(chunk) == 1 and error and SLOW.search(error)):
-                if down:
-                    to_rest += chunk
+                if down or (error and SLOW.search(error)):
+                    to_rest += chunk  # too heavy for GraphQL even alone: REST reads it this tick, page by page
                 # a lone read says nothing about the batch size; it only judges this entry
                 h = self.heavy.setdefault(chunk[0]["key"], {"at": self.now, "fails": 0, "oks": 0})
                 h["at"] = self.now
@@ -10876,7 +10908,7 @@ class Daemon:
         log({"event": "controller", "from": getattr(self.controller, "base", None),
              "to": getattr(current, "base", None)})
         self.controller = current
-        self.controller_cursor, self.controller_seen = None, {}
+        self.controller_cursor, self.controller_seen, self.feed_held = None, {}, []
         # coverage is the old controller's: the new one's feed has to show it again (fed())
         self.fed_repos, self.controller_ok_at = {}, float("-inf")
         self.feed_marks, self.feed_live_since = {}, None
@@ -10912,29 +10944,18 @@ class Daemon:
                 and time.monotonic() + CONTROLLER_READ_TIMEOUT <= self.controller_budget_end)
 
     def read_controller(self, entries: list[dict]) -> None:
-        """from_controller's reads, within the tick's CONTROLLER_TICK_BUDGET."""
-        pages: list[dict] = []
+        """from_controller's reads, within the tick's CONTROLLER_TICK_BUDGET. Pages feed_between_reads read during the
+        last tick's reads (feed_held) are applied here first: their cursor is already past them."""
+        pages, self.feed_held = self.feed_held, []
         if self.now - self.controller_feed_at >= CONTROLLER_FEED_EVERY:
             self.controller_feed_at = self.now
             try:
-                pages = self.read_feed()
+                fresh = self.read_feed()
             except WatchError as error:
+                self.feed_held = pages  # read, cursor past them: the next tick that reads applies them
                 return self.controller_down(error)
-            if getattr(self, "controller_feed_error", None) is None:
-                self.controller_failures = 0
-                self.controller_missed_deadline = False  # it answered: REST reads from here are not its fallback
-            if (self.feed_live_since is None or self.now - self.controller_ok_at > LAND_FEED_GAP
-                    or any(page.get("reset") for page in pages)):
-                self.feed_live_since = self.now  # what came before a gap or reset is not known: quiet starts here
-            self.controller_ok_at = self.now
-            for page in pages:
-                for item in (page.get("runs") or []) + (page.get("suites") or []) + (page.get("comments") or []):
-                    repo = str(item.get("repo") or "").lower()
-                    if "/" in repo:
-                        self.fed_repos[repo] = self.now
-                        self.feed_mark(repo, item)
-            if pages:
-                self.feed_marks = {k: t for k, t in self.feed_marks.items() if self.now - t <= LAND_FEED_KEEP}
+            self.took_feed(fresh)
+            pages += fresh
         if pages or self.on_event_procs:
             # here, before the baseline reads below can return early: the cursor has moved past these pages
             try:
@@ -10975,6 +10996,72 @@ class Daemon:
                                       "token": bool(self.controller.token)}
         if pages:
             self.save_feed_view()
+
+    def took_feed(self, pages: list[dict]) -> None:
+        """The feed answered now with PAGES: when it answered (controller_ok_at), since when without a gap
+        (feed_live_since), and what it delivered per repository and PR (fed_repos, feed_marks)."""
+        if getattr(self, "controller_feed_error", None) is None:
+            self.controller_failures = 0
+            self.controller_missed_deadline = False  # it answered: REST reads from here are not its fallback
+        if (self.feed_live_since is None or self.now - self.controller_ok_at > LAND_FEED_GAP
+                or any(page.get("reset") for page in pages)):
+            self.feed_live_since = self.now  # what came before a gap or reset is not known: quiet starts here
+        self.controller_ok_at = self.now
+        for page in pages:
+            for item in (page.get("runs") or []) + (page.get("suites") or []) + (page.get("comments") or []):
+                repo = str(item.get("repo") or "").lower()
+                if "/" in repo:
+                    self.fed_repos[repo] = self.now
+                    self.feed_mark(repo, item)
+        if pages:
+            self.feed_marks = {k: t for k, t in self.feed_marks.items() if self.now - t <= LAND_FEED_KEEP}
+
+    def feed_due(self) -> None:
+        """feed_between_reads, asked before every read request (as post_due is), on the tick's own thread only: a land
+        worker's request on another thread never touches the feed's cursor or view. A fault takes the controller out,
+        as one in the tick's controller phase does, and never fails the read that asked."""
+        if not self.feed_after_controller or threading.get_ident() != self.tick_thread:
+            return
+        try:
+            self.feed_between_reads()
+        except Exception as error:  # noqa: BLE001
+            self.controller_down(error, None if isinstance(error, WatchError) else error_site(error))
+
+    def feed_between_reads(self) -> None:
+        """Read the change feed between a tick's GitHub reads once CONTROLLER_FEED_EVERY has passed since the last
+        feed read. A tick with a read backlog runs for minutes, and a feed read only at its start lets controller_ok_at
+        age past CONTROLLER_FRESH: then every downstream's read answer drops this host's feed view (feed_view), nothing
+        vouches for any lane VM's copy, and each of them reads its PRs from GitHub itself (hq#17503: 12k GETs an hour
+        with the view never fresh). The pages are kept in feed_held for the next tick's read_controller to apply
+        (on-event hooks, runs, nudges, comments); here only the view's bookkeeping moves, and the view is saved."""
+        if (self.feed_between or self.controller is None or self.controller_cursor is None
+                or len(self.feed_held) >= FEED_HELD_MAX):
+            return  # (no cursor: this daemon follows no feed yet, or reads through an upstream)
+        now = self.clock()
+        if (now <= self.now or now - self.controller_feed_at < CONTROLLER_FEED_EVERY
+                or now < self.controller_down_until):
+            return  # (now <= self.now: no time has passed since the tick's own feed read)
+        tick_now, budget_end = self.now, self.controller_budget_end
+        self.feed_between, self.now, self.controller_feed_at = True, now, now
+        self.controller_budget_end = time.monotonic() + CONTROLLER_TICK_BUDGET
+        with contextlib.suppress(AttributeError):
+            self.controller.budget_end = self.controller_budget_end
+        try:
+            try:
+                pages = self.read_feed()
+            except WatchError as error:
+                self.controller_feed_error = None
+                return self.controller_down(error)
+            self.took_feed(pages)
+            self.feed_held += pages
+            self.save_feed_view()
+            if self.controller_feed_error is not None:  # a later page failed: the pages before it are kept above
+                error, self.controller_feed_error = self.controller_feed_error, None
+                self.controller_down(error)
+        finally:
+            self.feed_between, self.now, self.controller_budget_end = False, tick_now, budget_end
+            with contextlib.suppress(AttributeError):
+                self.controller.budget_end = budget_end
 
     def save_feed_view(self) -> None:
         """Keep this daemon's feed view in UPSTREAM_FEED_FILE for `read` (feed_view): what a downstream host, which
@@ -11590,7 +11677,7 @@ LAND_FORWARD_DEADLINE = 60.0  # one run of the executor command (plus a land's -
 LAND_FORWARD_RETRY = 60.0  # after a failed forward, doubling, at most LAND_FORWARD_RETRY_MAX
 LAND_FORWARD_RETRY_MAX = 600.0
 LAND_FORWARD_BATCH = 50  # requests per forward
-LAND_SERVE_OPS = ("land", "withdraw", "status", "batch")
+LAND_SERVE_OPS = ("land", "withdraw", "status", "batch", "room")
 LAND_FORWARDED = "forwarded"
 LAND_REQUESTER_SHAPE = re.compile(r"[^\s\x00-\x1f]{1,200}")  # acpmux send takes it as one argv word
 LAND_FORWARD_FILE = "forward.json"  # the last forward's outcome, for `land status`
@@ -11603,6 +11690,54 @@ def land_executor(config: dict | None = None) -> list[str] | None:
     if isinstance(command, list) and command and all(isinstance(a, str) and a for a in command):
         return command
     return None
+
+
+# Land overflow: more than one host takes a busy host's lands. huge-blue, 2026-11-22 07:59Z: 888 open, 624 due late (the
+# oldest 8.9 h), 1-3 of 12 workers busy, held by its own load line (1.0/core, mostly the lane-gh broker, acpmux and
+# reviews, not land work), while air-blue's queue (5 workers) and cmux16's (6) had 0 due late. Leo: "if huge-blue is
+# so weak and liable to falling over, then don't put so much reliance on it." land.json's "overflow" names peer land
+# hosts, each as a program like "executor" (`["reach", "air-blue", ".local/bin/glaeda-gh", "land", "serve"]`). A due
+# row this host's own gates (workers, load line) have held LAND_OVERFLOW_AFTER past its due time goes to the first
+# peer whose `land serve` "room" answer has room, at most that many, as an executor handoff does (requester, lane,
+# override and request id kept; the peer's queue judges it with its own reads and login and tells the requester).
+# Here it is left "forwarded", naming the peer. A row held by the login's latch, parked on quota or landing --after
+# another stays here: the peer would read on the same login, and a chain keeps its order on one host. A peer answers
+# room only from its own last land-pool line (LAND_POOL_FILE, at most LAND_ROOM_FRESH old), never more than its idle
+# workers less the rows already due there, and none at its own load line, so two hosts never pass rows back and forth
+# (a host with an executor serves nothing).
+LAND_OVERFLOW_KEY = "overflow"
+LAND_OVERFLOW_AFTER = 600.0
+LAND_OVERFLOW_EVERY = 120.0  # at most one overflow pass this often
+LAND_POOL_FILE = "pool.json"  # the last land-pool line, for `land serve`'s room answer
+LAND_ROOM_FRESH = 2 * 300.0  # 2 x LAND_POOL_LOG_EVERY
+
+
+def land_overflow(config: dict | None = None) -> list[list[str]]:
+    """land.json's "overflow" peers (each a program, as "executor"), in the order they are asked; [] for none."""
+    peers = (land_config() if config is None else config).get(LAND_OVERFLOW_KEY)
+    if not isinstance(peers, list):
+        return []
+    return [p for p in peers if isinstance(p, list) and p and all(isinstance(a, str) and a for a in p)]
+
+
+def land_room(pool: Any, now: float) -> int:
+    """How many more lands this host's queue takes from a peer now, from its last land-pool line POOL: its idle
+    workers less the rows already due here; 0 when the line is older than LAND_ROOM_FRESH, the load is at its line,
+    or the login's latch or a quota park holds the queue."""
+    if not isinstance(pool, dict):
+        return 0
+    at = pool.get("at")
+    if not isinstance(at, (int, float)) or isinstance(at, bool) or now - float(at) > LAND_ROOM_FRESH:
+        return 0
+    load = pool.get("loadPerCore")
+    if isinstance(load, (int, float)) and not isinstance(load, bool) and load >= LAND_LOAD_LINE:
+        return 0
+    if pool.get("latch") or pool.get("queueParked"):
+        return 0
+    try:
+        return max(0, int(pool.get("workers") or 0) - int(pool.get("busy") or 0) - int(pool.get("due") or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def land_forward(command: list[str], request: dict, deadline: float = LAND_FORWARD_DEADLINE,
@@ -11677,8 +11812,63 @@ def land_worker_ceiling(cores: int | None = None) -> int:
     return max(1, (land_cores() if cores is None else int(cores)) // LAND_CORES_EACH)
 
 
+# The line is measured CPU headroom (the handbook's 80% line), so on a host with /proc/stat it reads the share of CPU
+# time that was busy since the last read (LAND_CPU_SAMPLE_S apart at least), not the run queue: Linux's loadavg counts
+# threads blocked on IO (D state) too, so a host waiting on git and disk read over the line while its CPU sat idle.
+# CPU at nice is headroom as well: a judgment runs at nice 0 and niced work (the host's test suites) yields to it.
+# huge-blue, 2026-11-22 07:00Z: 362 lands due late, 2 of 12 workers busy, load 1.11/core over the 0.8 line, its CPU
+# 83% busy of which 34 points were niced. Where /proc/stat is missing (macOS) or before the first two samples, the
+# 1-minute load average per core stands in, as before. The lane-gh broker's land slots read the same way.
+LAND_CPU_SAMPLE_S = 1.0
+_LAND_CPU: dict[str, float] = {}
+
+
+def proc_stat_cpu(path: str = "/proc/stat") -> tuple[int, int] | None:
+    """(busy, total) CPU jiffies from /proc/stat's first line; idle, iowait and nice count as not busy. None if
+    unreadable."""
+    try:
+        with open(path, encoding="ascii") as f:
+            parts = f.readline().split()
+    except OSError:
+        return None
+    if len(parts) < 5 or parts[0] != "cpu":
+        return None
+    try:
+        vals = [int(x) for x in parts[1:9]]
+    except ValueError:
+        return None
+    total = sum(vals)
+    # nice (vals[1]) is not busy either: niced work (the host's test suites run at nice 10) yields to a judgment
+    return total - vals[1] - vals[3] - (vals[4] if len(vals) > 4 else 0), total
+
+
+def land_cpu_busy(read: Callable[[], tuple[int, int] | None] = proc_stat_cpu,
+                  now: Callable[[], float] = time.monotonic) -> float | None:
+    """The busy CPU share (0-1) since the previous sample, reused until LAND_CPU_SAMPLE_S has passed; None until two
+    samples exist or where /proc/stat is unreadable."""
+    t = now()
+    if "share" in _LAND_CPU and t - _LAND_CPU.get("at", 0.0) < LAND_CPU_SAMPLE_S:
+        return _LAND_CPU["share"]
+    cur = read()
+    if cur is None:
+        return None
+    share = None
+    if "busy" in _LAND_CPU and cur[1] > _LAND_CPU["total"]:
+        share = max(0.0, min(1.0, (cur[0] - _LAND_CPU["busy"]) / (cur[1] - _LAND_CPU["total"])))
+    elif "share" in _LAND_CPU:
+        share = _LAND_CPU["share"]
+    _LAND_CPU.update(at=t, busy=float(cur[0]), total=float(cur[1]))
+    if share is not None:
+        _LAND_CPU["share"] = share
+    return share
+
+
 def land_load_per_core(cores: int | None = None) -> float | None:
-    """The 1-minute load average per core, or None where the host does not say (an unknown load admits)."""
+    """The host's measured busy CPU share (land_cpu_busy), else the 1-minute load average per core, or None where the
+    host says neither (an unknown load admits)."""
+    busy = land_cpu_busy()
+    if busy is not None:
+        return busy
     try:
         one = os.getloadavg()[0]
     except (AttributeError, OSError):
@@ -11690,6 +11880,9 @@ LAND_EXPLAIN_DEADLINE = 1500.0  # land_judge's own CHECK_BUDGET_S is 1470 s
 LAND_MERGE_DEADLINE = 1800.0  # the shim judges the merge again before it sends it
 LAND_GH_DEADLINE = 120.0  # update-branch, rerun, pr edit, pr view
 LAND_NOTIFY_DEADLINE = 30.0
+# The acpmux class of every land notice sent (LandQueue.notify): what is sent is something the requester acts on, and
+# an unclassified notice is an FYI that waits up to 15 min for the inbox's flush (acpmux hub/inbox.rs FLUSH_MS).
+LAND_NOTICE_CLASS = "block"
 LAND_HEAD_TIMEOUT = 300.0  # after a push-making step, how long to wait for the cache to show the new head
 # After the queue's own update-branch moved a pinned head, how long a read that does not say the new head's first
 # parent (a REST read, a lagging commit list) is waited for before the pin stops the row as it always did.
@@ -11835,6 +12028,69 @@ LAND_TRAIN_HOLDER = re.compile(r"\b([\w.-]+/[\w.-]+#\d+) \(label [\w.-]+, head (
 # reported as cancelled) be rerun dozens of times (review of glaeda#2174, F2). The next names it and stops
 # "rerun_failed_cap". A new head starts the count again.
 LAND_RERUN_CAP = 3
+# A rerun of a pull_request run (`--failed`, one job, the whole run) keeps the run's merge commit: refs/pull/N/merge as
+# GitHub built it when the run was created, never a fresh one. A red the base fixed after that merge is replayed and
+# fails again (2026-11-22: cmux run 44964926915 attempt 3, 02:42Z, re-tested a 00:05Z merge that lacked base fix
+# 27647ffd3ae, 01:50Z, scripts/ci/api_call_log/env.sh; 4 of 13 react-apps-check reruns since 02:20Z were such replays).
+# So both rerun steps (take's rerun_failed, rerun_unrelated) ask stale_replay_why first, and a stale one takes a pinned
+# base merge (update_branch) instead: only a new head gets a new merge commit. This is a copy of cmuxterm-hq
+# tools/fleet-reconcilers/stale_replay.py why() (cmuxterm-hq#17798): the same rule and constants; change both together.
+# Any read that fails or answers nothing usable gives "": the rerun goes ahead as before.
+STALE_REPLAY_BEHIND = int(os.environ.get("STALE_REPLAY_BEHIND", "50"))  # base commits past the merge: stale either way
+STALE_REPLAY_FIX_PATHS = (".github/*", "scripts/ci/*")  # base changes that can fix a red the PR never touched
+STALE_REPLAY_PR_EVENTS = frozenset({"pull_request", "pull_request_target"})
+
+
+def stale_replay_base_ref(run: dict, default: str = "") -> str:
+    """The base branch the run's merge was built on (its pull_requests' base), else `default`."""
+    for pr in run.get("pull_requests") or []:
+        ref = ((pr or {}).get("base") or {}).get("ref") if isinstance(pr, dict) else None
+        if isinstance(ref, str) and ref:
+            return ref
+    return default
+
+
+def stale_replay_fix_hits(files: Any, patterns: Any = ()) -> list[str]:
+    """The files a STALE_REPLAY_FIX_PATHS or caller pattern matches, sorted."""
+    pats = tuple(STALE_REPLAY_FIX_PATHS) + tuple(p for p in patterns if p)
+    return sorted(f for f in set(files) if isinstance(f, str) and any(fnmatch.fnmatchcase(f, p) for p in pats))
+
+
+def stale_replay_why(run: dict, base_then: Callable[[str, str], str | None], compare: Callable[[str, str], dict],
+                     patterns: Any = (), default_base: str = "", behind: int | None = None) -> str:
+    """"" when a rerun of RUN may go ahead, else why it would replay a merge older than the base's fix (cmuxterm-hq
+    tools/fleet-reconcilers/stale_replay.py why(), copied). `base_then(ref, created_at)` names the base's newest commit
+    at or before the run's creation; `compare(that, ref)` is GitHub's compare of it to the base now."""
+    if not isinstance(run, dict) or run.get("event") not in STALE_REPLAY_PR_EVENTS:
+        return ""
+    created, ref = run.get("created_at"), stale_replay_base_ref(run, default_base)
+    if not isinstance(created, str) or not created or not ref:
+        return ""
+    limit = STALE_REPLAY_BEHIND if behind is None else behind
+    try:
+        then = base_then(ref, created)
+        if not isinstance(then, str) or not then:
+            return ""
+        found = compare(then, ref)
+    except (RuntimeError, ValueError, KeyError, TypeError, OSError):
+        return ""
+    if not isinstance(found, dict) or found.get("status") not in ("ahead",):
+        return ""  # identical: nothing moved; diverged or unread: no proof, so the rerun goes ahead
+    ahead = found.get("ahead_by")
+    if not isinstance(ahead, int) or isinstance(ahead, bool) or ahead <= 0:
+        return ""
+    run_id = run.get("id")
+    what = f"run {run_id}'s merge" if run_id else "the run's merge"
+    if ahead > limit:
+        return (f"{what} was built on {ref} at {then[:12]} ({created}), {ahead} commits behind {ref} now (more than "
+                f"{limit}); a rerun replays that merge")
+    hits = stale_replay_fix_hits([f.get("filename") if isinstance(f, dict) else f for f in found.get("files") or []],
+                                 patterns)
+    if hits:
+        more = f" and {len(hits) - 1} more" if len(hits) > 1 else ""
+        return (f"{what} was built on {ref} at {then[:12]} ({created}); {ref} has changed the CI path {hits[0]}{more} "
+                "since, and a rerun replays the merge without it")
+    return ""
 # A stop whose cause can clear by itself is re-armed (LandQueue.rearm): retry_deadline (land_judge could not judge:
 # an old land_judge checkout, a mirror, a flapping read) and <step>_transient (the step timed out or GitHub answered
 # 5xx, LAND_STEP_TRANSIENT) and review_cannot_start (router-review is not on this host, or would not exec: a link or
@@ -12091,6 +12347,14 @@ LAND_TOUCH = TOUCH_EVERY  # the daemon re-registers the PRs, runs and comments i
 # queue's, every open entry's waited watch renewed every LAND_TOUCH, and pr caches fetched in the last 600 s: 0, so
 # even the PRs a due land needed were never read.
 LAND_PEEK_EVERY = 600.0
+# Of the due entries (queued, or waiting past their wake) only the first this many per worker, in judge_order, hold a
+# waited watch; the rest are read like a parked entry (LAND_PEEK_EVERY), and the tick that brings one inside the window
+# waits on it again, so its judgment is handed a fresh copy (and fresh_head/snapshot_wait nudge a read regardless).
+# The broker host, 2026-11-22 06:00Z: 1,349 pr watches waited on in 600 s, 1,200 of them the land queues'. Its own
+# queue held 304 queued and 65 waiting past their wake for 12 workers, a lane VM's 82 and 90, most "due since" hours
+# ago behind busy workers, and every one was waited: about 8,100 PR reads an hour the read loop cannot make, so even
+# the PRs a worker was about to judge went unread.
+LAND_WATCH_AHEAD = 2
 # A missed event or cache write must eventually be noticed even when a PR is waiting on people. This is a
 # deliberately slow, bounded recovery pass rather than a per-tick judgment sweep.
 LAND_RECOVERY_SWEEP = float(STALE_DATA_AFTER)
@@ -13033,6 +13297,19 @@ def land_seconds(value: Any, default: float, low: float = 1.0, high: float = 864
     return default if not math.isfinite(f) or f <= 0 else min(high, max(low, f))
 
 
+def gh_cache_newest() -> float:
+    """The newest write in the host's shared gh cache (leo-workspace tools/gh_shared_cache.py: entries under
+    $GH_QUOTA_STATE/cache), as a mtime, or 0.0 when there is none to read. A cache-only judgment reads that cache and
+    nothing else live, so this number moving is the only way its answer can change (cache_only_inputs)."""
+    newest = 0.0
+    with contextlib.suppress(OSError):
+        with os.scandir(latch_state_dir() / "cache") as it:
+            for entry in it:
+                with contextlib.suppress(OSError):
+                    newest = max(newest, entry.stat().st_mtime)
+    return newest
+
+
 class LandQueue:
     """The daemon's land queue (see the section comment). RUN runs one argv with a deadline and an environment and
     returns a CompletedProcess; CACHE_OF reads a cache entry by key; WATCH registers interest in a key as waited;
@@ -13066,12 +13343,16 @@ class LandQueue:
         self.forward_thread: threading.Thread | None = None
         self.forward_after = float("-inf")  # no forward before this (a failed one backs off)
         self.forward_fails = 0
+        self.overflowing: set[str] = set()  # keys whose overflow to a peer is in flight (overflow_tick)
+        self.overflow_thread: threading.Thread | None = None
+        self.overflow_after = float("-inf")
         self.cache_of = cache_of
         self.watch = watch or (lambda key: register(key, waited=True, reader=f"tool:{LAND_TAG}"))
         # one unwaited, one-off read of a key (LAND_PEEK_EVERY); a test's WATCH alone records both
         self.peek = peek or ((lambda key: register(key, reader=f"tool:{LAND_TAG}", once=True)) if watch is None
                              else self.watch)
         self.peeked: dict[str, float] = {}
+        self.lean: set[str] = set()  # due entries past the tick's watch window (LAND_WATCH_AHEAD): read unwaited
         # A queued PR's head is registered with the checks store for land-judge (head_key), so the daemon holds its
         # checks before land-judge's first judgment asks; a test's WATCH alone records neither.
         self.head_watch = head_watch or ((lambda key: register(key, consumer=LAND_HEAD_CONSUMER,
@@ -13355,7 +13636,8 @@ class LandQueue:
         # the first lines of the body. gcp-agent-lane-2, 2026-11-21: 243 entries, 142 of them finished, sorted every
         # TICK (2s) -- 72,900 cache file reads per 600s window at 0.30 ms each, and the daemon's own row read "ticks
         # spent 22.2s, most in land (21.9s)". Sorting the 101 open rows is the same order with 2/5 of the reads.
-        live = [k for k, e in self.entries.items() if e["state"] not in LAND_DONE and k not in self.jobs]
+        live = [k for k, e in self.entries.items() if e["state"] not in LAND_DONE and k not in self.jobs
+                and k not in self.overflowing]
         for key in [k for k in self.entries if self.entries[k]["state"] in LAND_DONE]:
             try:
                 e = self.entries[key]
@@ -13382,7 +13664,15 @@ class LandQueue:
                 else:
                     awake.append(key)
             live = awake
-        for key in sorted(live, key=self.judge_order):
+        if latch is None:
+            self.overflow_tick(live)
+            live = [k for k in live if k not in self.overflowing]
+        order = sorted(live, key=self.judge_order)
+        # Only the first LAND_WATCH_AHEAD per worker of the due entries, in the order workers take them, are read at
+        # full pace; the rest are as far from a worker as an entry waiting on its checks (LAND_WATCH_AHEAD).
+        due_keys = [k for k in order if self.due(self.entries[k])]
+        self.lean = set(due_keys[max(1, self.workers() * LAND_WATCH_AHEAD):])
+        for key in order:
             try:
                 if self.queue_quota_parked():
                     break  # a worker parked the host while this pass was submitting judgments
@@ -13474,17 +13764,7 @@ class LandQueue:
             for key, e in sorted(self.entries.items(), key=lambda kv: float(kv[1].get("created") or 0)):
                 if e["state"] in LAND_DONE or key in self.jobs or len(batch) >= LAND_FORWARD_BATCH:
                     continue
-                rid = str(e.get("requestId") or "")
-                batch.append({"id": rid if LAND_REQUEST_ID.fullmatch(rid) else f"handoff-{file_name(key)[:16]}-"
-                              f"{int(e.get('gen') or 0)}", "op": "land", "target": key_name(key),
-                              "after": [key_name(a) for a in e.get("after") or []],
-                              "requester": e.get("requester") or "", "requesterFrom": e.get("requesterFrom") or "",
-                              "queuedBy": e.get("queuedBy") or "", "handoff": True}
-                             # an entry from before the lane was recorded names none there: its requester's
-                             # PARENT/CHILD would read as a session on the executor's host
-                             | {"lane": e.get("lane") or "", "laneHost": e.get("laneHost") or ""}
-                             | ({"override": e["override"]} if e.get("override") else {})
-                             | ({"gateFix": True} if e.get("gateFix") else {}))
+                batch.append(self.handoff_request(key, e))
                 handed.append((key, int(e.get("gen") or 0)))
             d = self.requests_dir()
             blocked = {k for k, e in self.entries.items() if e["state"] not in LAND_DONE}
@@ -13504,6 +13784,104 @@ class LandQueue:
                              | {"id": rid})
                 files.append((rid, path))
         return batch, files, handed
+
+    @staticmethod
+    def handoff_request(key: str, e: dict) -> dict:
+        """E as one `land serve` request that hands it to another host's queue (an executor's, or a peer's overflow):
+        its request id, requester, lane, --after and override kept, so a resend is applied once."""
+        rid = str(e.get("requestId") or "")
+        return ({"id": rid if LAND_REQUEST_ID.fullmatch(rid) else f"handoff-{file_name(key)[:16]}-"
+                 f"{int(e.get('gen') or 0)}", "op": "land", "target": key_name(key),
+                 "after": [key_name(a) for a in e.get("after") or []],
+                 "requester": e.get("requester") or "", "requesterFrom": e.get("requesterFrom") or "",
+                 "queuedBy": e.get("queuedBy") or "", "handoff": True}
+                # an entry from before the lane was recorded names none there: its requester's
+                # PARENT/CHILD would read as a session on the executor's host
+                | {"lane": e.get("lane") or "", "laneHost": e.get("laneHost") or ""}
+                | ({"override": e["override"]} if e.get("override") else {})
+                | ({"gateFix": True} if e.get("gateFix") else {}))
+
+    # -- overflow to peer land hosts (land_overflow): this host judges, and hands its late rows on
+
+    def overflow_due(self, live: list[str]) -> list[str]:
+        """Under the lock. The rows of LIVE a peer may take, oldest due first: due here LAND_OVERFLOW_AFTER past their
+        due time, with no --after, latch hold or quota park (LAND_OVERFLOW_KEY's comment)."""
+        rows = []
+        for key in live:
+            e = self.entries.get(key)
+            if not e or e["state"] in LAND_DONE or key in self.jobs or not self.due(e):
+                continue
+            if e.get("after") or e.get("latchHeld") or (e.get("wait") or {}).get("kind") == "quota":
+                continue
+            since = self.due_since(e)
+            if since and self.now - since >= LAND_OVERFLOW_AFTER:
+                rows.append((since, key))
+        return [k for _, k in sorted(rows)][:LAND_FORWARD_BATCH]
+
+    def overflow_tick(self, live: list[str]) -> None:
+        """At most once per LAND_OVERFLOW_EVERY, off the tick: the rows overflow_due names go to the peers in
+        land.json "overflow" that have room (overflow_send); while they are in flight no worker here takes them."""
+        peers = land_overflow(self.config())
+        if not peers or self.now < self.overflow_after:
+            return
+        if self.overflow_thread is not None and self.overflow_thread.is_alive():
+            return
+        with self.lock:
+            keys = self.overflow_due(live)
+            if not keys:
+                return
+            self.overflow_after = self.now + LAND_OVERFLOW_EVERY
+            self.overflowing = set(keys)
+            rows = [(key, int(self.entries[key].get("gen") or 0), self.handoff_request(key, self.entries[key]))
+                    for key in keys]
+        if self.inline:
+            self.overflow_send(peers, rows)
+        else:
+            self.overflow_thread = threading.Thread(target=self.overflow_send, args=(peers, rows),
+                                                    name="land-overflow", daemon=True)
+            self.overflow_thread.start()
+
+    def overflow_send(self, peers: list[list[str]], rows: list[tuple[str, int, dict]]) -> None:
+        """Ask each peer for its room and send it that many of ROWS; a row a peer accepted is "forwarded" here."""
+        try:
+            for command in peers:
+                if not rows:
+                    break
+                name = land_forward_name(command)
+                try:
+                    answer = self.forward(command, {"op": "room"}, LAND_FORWARD_DEADLINE)
+                    room = answer.get("room") if answer.get("ok") else 0
+                    room = room if isinstance(room, int) and not isinstance(room, bool) else 0
+                    if room <= 0:
+                        log({"event": "land-overflow-full", "peer": name, "pending": len(rows)})
+                        continue
+                    sent, rows = rows[:room], rows[room:]
+                    answer = self.forward(command, {"op": "batch", "requests": [r for _, _, r in sent],
+                                                    "from": policy_host()}, LAND_FORWARD_DEADLINE)
+                    if not answer.get("ok"):
+                        raise WatchError(land_trim(answer.get("reason") or answer.get("code"), 200))
+                    accepted = {str(a) for a in answer.get("accepted") or []}
+                except Exception as error:  # noqa: BLE001  a peer that is down or refuses: the rows stay here
+                    log({"event": "land-overflow-failed", "peer": name, "error": land_trim(
+                        str(error) if isinstance(error, WatchError) else describe(error), 300)})
+                    continue
+                with self.lock:
+                    for key, gen, req in sent:
+                        e = self.entries.get(key)
+                        if req["id"] not in accepted or not e or e["state"] in LAND_DONE or key in self.jobs \
+                                or int(e.get("gen") or 0) != gen:
+                            if req["id"] not in accepted:
+                                rows.append((key, gen, req))  # the next peer may take it
+                            continue
+                        waited = round(self.now - self.due_since(e))
+                        e.update(state=LAND_FORWARDED, wait=None, wakeAt=None, action=None, forwardedTo=name)
+                        e.pop("dueLate", None)
+                        self.history(e, "overflowed", to=name, request=req["id"], waited=waited)
+                        self.save(e)
+                log({"event": "land-overflowed", "peer": name, "sent": len(sent), "accepted": len(accepted)})
+        finally:
+            with self.lock:
+                self.overflowing = set()
 
     def forward_send(self, command: list[str], batch: list[dict], files: list[tuple[str, Path]],
                      handed: list[tuple[str, int]]) -> None:
@@ -13651,7 +14029,7 @@ class LandQueue:
                         f"glaeda land: {self.url(e)} has been due since {utc_clock(mark['dueSince'])} and not judged: "
                         f"the login's {'REST' if latch[0] == 'rest' else 'GraphQL'} latch has held through {n} "
                         f"windows (now until {utc_clock(until)}). It is judged first when the latch clears; nothing "
-                        f"to do. Its reads have no source here but the login: {self.latch_free_why(e)}")
+                        f"to do. Its reads have no source here but the login: {self.latch_free_why(e)}", wake=False)
         self.save(e)
 
     def unhold(self, e: dict) -> None:
@@ -13695,8 +14073,31 @@ class LandQueue:
             at = c.get("dataAt")
             if not isinstance(at, (int, float)) or isinstance(at, bool) or at < float(e.get("created") or 0):
                 return False
-        return self.ended(e, state if state in ("MERGED", "CLOSED") else "", e.get("mergeSha") or "",
-                          "the cache shows it")
+        if self.ended(e, state if state in ("MERGED", "CLOSED") else "", e.get("mergeSha") or "",
+                      "the cache shows it"):
+            return True
+        return self.stop_moved_pin(e, c, data)
+
+    def stop_moved_pin(self, e: dict, c: dict, data: dict) -> bool:
+        """Under the lock. Stop E head_moved when it is pinned and a copy of its PR read since the pin shows another
+        full head that this queue's own update-branch did not make (pin_follow's case: no update was ever sent for
+        E). A cache file read, no GitHub call, so a row gated behind busy workers, the load line or the pace cap stops
+        as soon as the read lands instead of when a worker is free to judge it (judge and pin_wait stop it the same
+        way). A lane host, 2026-11-22: a pinned row waiting on its stack sat 3 h on a head that had moved."""
+        pin = str(e.get("pinSha") or "")
+        head = str(data.get("headRefOid") or "").lower()
+        if not pin or not SHA40.fullmatch(head) or not land_head_moved(pin, head):
+            return False
+        if e.get("updateSent") or e.get("preStepHead") or e.get("pinFollow"):
+            return False  # this queue moved the head itself: pin_follow decides on the first parent
+        since = float(e.get("pinSince") or e.get("created") or 0)
+        at = c.get("dataAt")
+        if not isinstance(at, (int, float)) or isinstance(at, bool) or at < since:
+            return False  # a copy older than the pin may predate the push the pin names
+        e.pop("pinWait", None)
+        self.stop(e, "head_moved", f"the head is {head[:12]}, not the --sha {pin[:12]} it was queued for",
+                  f"glaeda-gh land {e['repo']}#{e['number']} --sha {head}")
+        return True
 
     def retire_ended(self) -> None:
         """Every open entry no worker holds whose cached PR has ended leaves the queue (retire_from_cache)."""
@@ -14247,6 +14648,11 @@ class LandQueue:
                     late += 1 if since and self.now - since >= LAND_DUE_LATE else 0
         oldest = min(due) if due else None
         latch = self.pass_latch
+        with contextlib.suppress(OSError):
+            write_json(land_dir() / LAND_POOL_FILE, {
+                "at": self.now, "workers": self.workers(), "busy": len(running), "due": len(due), "dueLate": late,
+                "loadPerCore": land_load_per_core(), "latch": None if latch is None else latch[0],
+                "queueParked": self.queue_quota_until > self.now})
         log({"event": "land-pool", "workers": self.workers(), "loginWorkers": self.login_workers(),
              "workersFrom": "land.json" if "workers" in self.config() else f"cores:{land_cores()}",
              "loadPerCore": land_load_per_core(), "loadGated": self.pass_load_gated,
@@ -14356,7 +14762,16 @@ class LandQueue:
         rest = nexts.get("rest")
         return rest is not None and rest[0] <= self.now
 
-    def window_room(self, e: dict) -> bool:
+    def cache_only_inputs(self, key: str, sha: str) -> list:
+        """Everything a cache-only judgment of KEY at SHA reads: the head it is pinned to, the daemon's kept PR read,
+        its rollup snapshot, and the newest write in the host's shared gh cache. Nothing else is read live, so an
+        unmoved list means a probe that missed must miss again (window_room)."""
+        c = self.cache_of(key) or {}
+        snap = self.snapshot_of(key) or {}
+        return [sha, c.get("fp"), c.get("fullAt"), c.get("dataAt"),
+                snap.get("fp"), snap.get("readAt"), snap.get("complete"), gh_cache_newest()]
+
+    def window_room(self, e: dict, sha: str = "") -> bool:
         """Whether one more judgment fits the login's live pace in every pool (the comment above LAND_JUDGE_COST). Left
         out: noted once per pace slot in E's history, its status says when the next slot opens and what GitHub's count
         read, counted in the pass's land-pool line ("capped")."""
@@ -14365,6 +14780,7 @@ class LandQueue:
         over = [pool for pool, got in nexts.items() if got is not None and got[0] > self.now]
         e.pop("cacheOnlyJudge", None)
         e.pop("paceNext", None)
+        e.pop("cacheOnlyInputs", None)
         first = e.pop("unreadCacheFirst", None)
         if e.get("gateFix"):
             # `land --gate-fix`: a PR that fixes the quota gate's own path must not wait on the login's pace, which
@@ -14385,12 +14801,19 @@ class LandQueue:
             # REST, charged to REST alone (LAND_REST_ROUTE's comment).
             e["cacheOnlyJudge"] = "rest"
             return True
-        if over == ["graphql"] and not (e.get("cacheOnlyMissed") or {}).get("start") == slot:
+        if over == ["graphql"]:
             # Only GraphQL is paced out: judged from the caches, charged nothing (LAND_CACHE_ONLY_MAX_AGE's comment).
-            # One that missed already in this slot waits for the next, as any capped entry does.
-            e["cacheOnlyJudge"] = slot
-            e["paceNext"] = nxt
-            return True
+            # One that missed already waits, as any capped entry does: in that slot, and past it while nothing a
+            # cache-only judgment reads has moved. The slot alone is no dedupe (it is the host's last charged judgment,
+            # so every other entry's live judgment moves it): 2026-11-22, one host probed cmux#46507 at one unmoved
+            # head 139 times in 24 h, holding a worker each time to read caches that could not answer.
+            missed = e.get("cacheOnlyMissed") or {}
+            inputs = self.cache_only_inputs(e["key"], sha)
+            if missed.get("start") != slot and missed.get("inputs") != inputs:
+                e["cacheOnlyJudge"] = slot
+                e["cacheOnlyInputs"] = inputs
+                e["paceNext"] = nxt
+                return True
         self.pass_capped += 1
         # Held by the cap from here to its judgment: not counted toward its wait's deadline (LAND_WAIT_HELD), as a
         # latch or a quota park is. Router review of glaeda#2244, F1: a 200-entry simulation stopped an "unreadable"
@@ -14490,7 +14913,8 @@ class LandQueue:
         --after PR with its own entry here none (that entry reads it, and its merge shows in its state). The run or
         comment a wait is on stays watched and waited: that is what it waits for."""
         w = e.get("wait") or {}
-        waited = self.due(e) or w.get("kind") == "head_change" or self.wake_near(e)
+        due = self.due(e) and (e["key"] not in self.lean or bool(e.get("snapshotWait")))
+        waited = due or w.get("kind") == "head_change" or self.wake_near(e)
         self.watch_head(e)
         keys = [e["key"]] if waited else []
         if w.get("kind") in ("run", "comment") and w.get("key"):
@@ -14818,7 +15242,7 @@ class LandQueue:
                         f"glaeda land: {self.url(e)} waits: {key_name(a)}, which it lands after, stopped "
                         f"({st.get('code') or 'stopped'}); this land stays queued behind it until "
                         f"{utc_clock(self.now + LAND_AFTER_STOPPED_WAIT)}. next: glaeda-gh land {key_name(a)} once "
-                        "its stop is cleared, or merge it; this one follows")
+                        "its stop is cleared, or merge it; this one follows", wake=False)
             return False
         if self.now - float(mark.get("since") or self.now) < LAND_AFTER_STOPPED_WAIT:
             return False
@@ -15131,7 +15555,7 @@ class LandQueue:
         if not self.load_room(e):
             self.gated(e, "the host's load is over the line")  # measured: started once the load per core drops
             return False
-        if not self.window_room(e):
+        if not self.window_room(e, sha):
             return False  # this window's share is spent: judged in a later one, its place kept
         c = self.cache_of(e["key"]) or {}
         head = str((c.get("data") or {}).get("headRefOid") or "").lower()
@@ -15243,6 +15667,7 @@ class LandQueue:
                 "explain", e["repo"], str(e["number"])] + (["--sha", sha] if sha else []) + ["--json"]
         cache_only = e.pop("cacheOnlyJudge", None)
         pace_next = e.pop("paceNext", None)
+        cache_inputs = e.pop("cacheOnlyInputs", None)
         cached = argv + ["--cache-only", str(LAND_CACHE_ONLY_MAX_AGE)]
         # After an unreadable answer: the caches first, live only on a miss (LAND_UNREAD_SAME_STOP's comment); paced out
         # of GraphQL: the caches alone (the comment above LAND_JUDGE_COST)
@@ -15296,7 +15721,7 @@ class LandQueue:
             # the time it waits there is not counted toward its wait's deadline (cappedSince, LAND_WAIT_HELD).
             nxt = float(pace_next) if isinstance(pace_next, (int, float)) else self.now + LAND_RETRY_DEFAULT
             with self.lock:
-                e["cacheOnlyMissed"] = {"start": cache_only, "at": self.now}
+                e["cacheOnlyMissed"] = {"start": cache_only, "at": self.now, "inputs": cache_inputs}
                 seen = (self.reading("graphql") if self.reading is not None else None) or {}
                 e["windowCapped"] = {"start": cache_only, "at": self.now, "pool": "graphql", "next": nxt,
                                      "remaining": seen.get("remaining"), "reset": seen.get("reset")}
@@ -15652,6 +16077,7 @@ class LandQueue:
                               "no gh-quota shim to rerun through" if runs else "rerun_failed named no run",
                               land_trim(answer.get("next")))
                 return
+            stale = {r: why for r in runs if (why := self.stale_replay(e, gh, r))}  # STALE_REPLAY_BEHIND's comment
             with self.lock:
                 self.check(e)  # a newer land since this judgment: its count is never written onto the new entry
                 sent = {k: v for k, v in (e.get("reruns") or {}).items() if k.startswith(f"{head}|")}
@@ -15665,9 +16091,18 @@ class LandQueue:
                 for r in runs:  # counted before the send: a restart mid-send counts it
                     sent[f"{head}|{r}"] = int(sent.get(f"{head}|{r}") or 0) + 1
                 e["reruns"] = sent
-                self.claim(e, "rerun_failed", runs=runs)
-                checks = ((self.cache_of(e["key"]) or {}).get("data") or {}).get("checks") or []
-                marks = land_rerun_marks(checks if isinstance(checks, list) else [], runs)
+                if stale:  # a rerun replays a merge the base has moved past: a pinned base merge instead
+                    for r, why in stale.items():
+                        self.history(e, "stale_replay", run=r, head=head[:12], why=land_trim(why, 200))
+                    self.count("stale_replay")
+                    self.save(e)
+                else:
+                    self.claim(e, "rerun_failed", runs=runs)
+                    checks = ((self.cache_of(e["key"]) or {}).get("data") or {}).get("checks") or []
+                    marks = land_rerun_marks(checks if isinstance(checks, list) else [], runs)
+            if stale:
+                self.update_branch(e, head)
+                return
             results =[self.call([gh, "run", "rerun", str(r), "--failed", "-R", repo], LAND_GH_DEADLINE, e)
                        for r in runs]
             no_lane = [g for g in results if g.returncode != 0 and LAND_NO_LANE.search(f"{g.stderr} {g.stdout}")]
@@ -15742,6 +16177,34 @@ class LandQueue:
                 self.wait(e, {"kind": "retry"}, min(LAND_RETRY_MAX, after))
             self.count(kind)
 
+    def stale_replay(self, e: dict, gh: str, run: int | str) -> str:
+        """Why a `--failed` rerun of RUN would replay a merge older than the base's fix (stale_replay_why), read through
+        the gh-quota shim: the run, the base's newest commit at the run's creation, and its compare to the base now.
+        "" (rerun as before) for anything else, every failed or unusable read included."""
+        repo = e["repo"]
+
+        def read(path: str, jq: str) -> str:
+            got = self.call([gh, "api", path, "--jq", jq], LAND_GH_DEADLINE)
+            if got.returncode != 0:
+                raise RuntimeError(f"gh api {path}: exit {got.returncode}")
+            return (got.stdout or "").strip()
+
+        def base_then(ref: str, created: str) -> str:
+            q = urllib.parse.urlencode({"sha": ref, "until": created, "per_page": 1})
+            return read(f"repos/{repo}/commits?{q}", '.[0].sha // ""')
+
+        def compare(that: str, ref: str) -> dict:
+            return json.loads(read(f"repos/{repo}/compare/{that}...{urllib.parse.quote(ref, safe='')}",
+                                   "{status, ahead_by, files: [.files[]?.filename]}"))
+
+        try:
+            doc = json.loads(read(f"repos/{repo}/actions/runs/{int(run)}",
+                                  "{id, event, created_at, pull_requests: [.pull_requests[]? | {base: {ref: .base.ref}}]}"))
+        except (RuntimeError, ValueError, TypeError):
+            return ""
+        data = (self.cache_of(e["key"]) or {}).get("data") or {}
+        return stale_replay_why(doc, base_then, compare, default_base=str(data.get("baseRefName") or ""))
+
     def rerun_unrelated(self, e: dict, act: dict, answer: dict, head: str) -> bool:
         """An own_red stop whose red is in a job the PR's changed paths cannot affect (LAND_UNRELATED_REDS): one
         `gh run rerun RUN --failed` per (head, run), kept on the entry before it is sent, then a wait on the PR's
@@ -15780,6 +16243,7 @@ class LandQueue:
                                    f"{len(files)} files)")
             elif touched := [f for f in files if not land_path_inert(f, rule)]:
                 take, why = False, f"it changes {land_trim(touched[0], 160)}, which '{flow}' can read"
+        stale = self.stale_replay(e, gh, run) if take and gh is not None else ""  # STALE_REPLAY_BEHIND's comment
         with self.lock:
             self.check(e)
             if not take:
@@ -15788,7 +16252,15 @@ class LandQueue:
             e["unrelatedReruns"] = [*(e.get("unrelatedReruns") or []), done][-LAND_UNRELATED_KEEP:]
             self.history(e, "unrelated_red", run=run, workflow=flow, files=len(files),
                          **({"why": stopped} if setup else {}))
-            self.claim(e, "rerun_failed", runs=[run], unrelated=True)
+            if stale:  # a rerun replays a merge the base has moved past: a pinned base merge instead
+                self.history(e, "stale_replay", run=run, head=head[:12], why=land_trim(stale, 200))
+                self.count("stale_replay")
+                self.save(e)
+            else:
+                self.claim(e, "rerun_failed", runs=[run], unrelated=True)
+        if stale:
+            self.update_branch(e, head)
+            return True
         got = self.call([gh, "run", "rerun", str(run), "--failed", "-R", repo], LAND_GH_DEADLINE, e)
         with self.lock:
             self.finish(e, got)
@@ -16100,7 +16572,7 @@ class LandQueue:
                 self.history(e, "handed_off", to=host, head=head[:12], why=reason)
                 self.save(e)
                 self.notify(e, requester, f"glaeda land: {self.url(e)} handed to {host}: {what}; {host}'s land queue judges it (land_judge) and merges it, or says why not "
-                            f"(glaeda-gh land status there)")
+                            f"(glaeda-gh land status there)", wake=False)
                 return
             said = land_tail(f"{got.stderr or ''} {got.stdout or ''}", 300) or f"exit {got.returncode}"
             last = e.get("handoffFail") or {}
@@ -16382,10 +16854,21 @@ class LandQueue:
             return
         self.notify(e, e.get("requester") or "", msg)
 
-    def notify(self, e: dict, to: str, message: str) -> None:
+    def notify(self, e: dict, to: str, message: str, wake: bool = True) -> None:
         """`acpmux send --no-wait HOST/SESSION MESSAGE`, off the tick; a failure is logged and a notice line, never
-        a stop."""
+        a stop.
+
+        A land tells its requester only what the requester acts on (LAND_NOTICE_CLASS): it merged, it stopped (a
+        conflict, a red, a refusal naming its step), or a judge's escalation. Those go as class `block`, so an idle
+        lane wakes at once instead of at its inbox's next FYI flush. Every other word (WAKE False: handed to the
+        broker host, still waiting behind a stopped land, held by the login's latch) is a line in the log and the
+        entry's history, read with `land status`, and sends nothing: each was a turn of an idle lane that read it
+        and said "nothing to do". gcp-agent-lane-10, 2026-11-21 11Z-2026-11-22 07Z: 87 idle wakes carried only
+        land notices, 37 of them "handed to huge-blue"; 16 in 06Z alone."""
         to = land_notify_target(e, to)
+        if not wake:
+            log({"event": "land-notice-quiet", "key": e["key"], "to": to, "message": land_trim(message, 300)})
+            return
         if not to:
             # Nobody to tell (no --notify, no session in the queuing environment): still never silent.
             log({"event": "land-unnotified", "key": e["key"], "queuedBy": e.get("queuedBy"), "message": message})
@@ -16400,7 +16883,7 @@ class LandQueue:
         title = land_trim(message, 200)
         severity = "info" if message.startswith(f"glaeda land: {self.url(e)} merged") else "warn"
         argv = [os.fspath(acpmux), "send", "--no-wait", to, "--notice", "--severity", severity, "--sender", LAND_TAG,
-                "--title", title, message]
+                "--class", LAND_NOTICE_CLASS, "--title", title, message]
 
         def send() -> None:
             got = self.call(argv, LAND_NOTIFY_DEADLINE)
@@ -16456,30 +16939,44 @@ LAND_OVERRIDE_REASON_MAX = 200  # lane-gh land's own "override" limits: reason a
 LAND_OVERRIDE_RECEIPT_MAX = 240
 
 
+def fit_one_line(flag: str, text: str, most: int, *, stream=None) -> str:
+    """TEXT as one line of at most MOST characters, said on STREAM when it had to change. A reason and a receipt are
+    prose an agent writes for the record, so a newline or 2 characters too many is not worth a refused land and a
+    second call: both are things this function can do itself (tools/guard_refusal.py fit, the same contract for a
+    guard's own refusal text). What is left is what no guess can fix: an empty one, or only one of the pair."""
+    fitted = " ".join(text.split())
+    if len(fitted) > most:
+        fitted = fitted[:most - 1].rstrip() + "\u2026"  # the head: a reason names its cause first
+    if fitted != text:
+        print(f"glaeda-gh land: {flag} fitted to one line of {most}: {fitted}",
+              file=sys.stderr if stream is None else stream)
+    return fitted
+
+
 def land_override(reason: str | None, receipt: str | None) -> dict | None:
     """`land --override-reason R --override-receipt T` as the entry keeps it ({"reason", "receipt"}), or None with
-    neither. Refused (WatchError) as lane-gh land refuses it: one of the two alone, an empty one, a newline, or past
-    LAND_OVERRIDE_REASON_MAX / LAND_OVERRIDE_RECEIPT_MAX characters. Each merge try then runs with
-    LAND_JUDGE_OVERRIDE and LAND_JUDGE_OVERRIDE_RECEIPT (a lane VM's: the broker land's "override")."""
+    neither. A newline, padding or a text past LAND_OVERRIDE_REASON_MAX / LAND_OVERRIDE_RECEIPT_MAX characters is
+    fitted (fit_one_line), not refused: on 2026-11-21 a 202-character reason cost a refusal and a second land call
+    for 2 characters. Refused (WatchError) only for what no guess fixes: one of the two alone, or an empty one. Each
+    merge try then runs with LAND_JUDGE_OVERRIDE and LAND_JUDGE_OVERRIDE_RECEIPT (a lane VM's: the broker land's
+    "override")."""
     if reason is None and receipt is None:
         return None
     if reason is None or receipt is None:
         raise WatchError("--override-reason and --override-receipt go together: give both (the reason, and the "
                          "receipt naming the base run and job ids), or neither")
-    for flag, text, most in (("--override-reason", reason, LAND_OVERRIDE_REASON_MAX),
-                             ("--override-receipt", receipt, LAND_OVERRIDE_RECEIPT_MAX)):
-        if "\n" in text or "\r" in text:
-            raise WatchError(f"{flag} is one line: it has a newline")
+    out = {}
+    for key, flag, text, most in (("reason", "--override-reason", reason, LAND_OVERRIDE_REASON_MAX),
+                                  ("receipt", "--override-receipt", receipt, LAND_OVERRIDE_RECEIPT_MAX)):
         if not text.strip():
             raise WatchError(f"{flag} is empty")
-        if len(text) > most:
-            raise WatchError(f"{flag} is {len(text)} characters; lane-gh land takes at most {most}")
-    return {"reason": reason, "receipt": receipt}
+        out[key] = fit_one_line(flag, text, most)
+    return out
 
 
 def land_request_override(req: dict) -> dict | None:
-    """A request's override as land_override takes it, or None when it names none or a bad one (an older sender's,
-    or a forwarded one past the limits: never a merge override no queue checked)."""
+    """A request's override as land_override takes it (fitted to the limits, not dropped for them), or None when it
+    names none or one no guess fixes (an older sender's, an empty one): never a merge override no queue checked."""
     o = req.get("override")
     if not isinstance(o, dict) or not isinstance(o.get("reason"), str) or not isinstance(o.get("receipt"), str):
         return None
@@ -17334,6 +17831,13 @@ def cmd_land_serve(text: str) -> int:
                           f"{land_forward_name(executor)} (land.json executor); it serves none"}))
         return EXIT_FAIL
     op = req["op"]
+    if op == "room":
+        # A peer's overflow asks before it sends (land_overflow): never room while the daemon is down
+        running = daemon_running()
+        print(json.dumps({"ok": True, "host": policy_host(), "running": running,
+                          "room": land_room(read_json(land_dir() / LAND_POOL_FILE), time.time()) if running else 0},
+                         sort_keys=True))
+        return EXIT_OK
     if op == "status":
         target = req.get("target")
         try:

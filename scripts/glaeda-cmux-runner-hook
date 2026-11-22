@@ -493,6 +493,12 @@ SIGNING_JOBS = (("nightly.yml", "promote-nightly-next"), ("nightly.yml", "build-
                 # publishes in one job on the trusted signing runner, so the build no longer waits for a second
                 # run and a second drain. It holds the key for its whole run, build included: one claim, one drain.
                 ("nightly.yml", "nightly-next-one"),
+                # LIVE_CODE_VARIANT (Leo's design, docs/cmux-next/live-code.md in cmux): after nightly-next-one
+                # writes the feed, this job signs and notarizes the same commit's -interposable variant with the
+                # nightly's own identity and publishes it beside the DMG. It is a nightly.yml job on nightly-next
+                # like the rest, so the trust rule (only nightly.yml at refs/heads/nightly-next reaches the
+                # signer) is unchanged; it adds no secret and no entitlement. continue-on-error in the workflow.
+                ("nightly.yml", "sign-live-code-variant"),
                 # AUTO_RESUME (below trusted_refusal): the classic continuation's key-holding jobs that do
                 # work. Its three jobs that only wait on Apple's notary queue are not here: they are light
                 # (AUTO_RESUME_POLL_JOBS), because an exclusive class has no bound on how long a job runs and
@@ -538,6 +544,9 @@ WORKFLOW_JOB_CLASSES = {# the iOS reliability matrix's phone cells: cargo builds
                         ("test-e2e.yml", "build"): "compile-gui", ("test-e2e.yml", "test"): "gui-step",
                         ("seed-derived-data.yml", "seed"): "seed",
                         ("nightly.yml", "build-nightly-app"): "isolated",
+                        # The live code variant's secret-free -interposable build (LIVE_CODE_VARIANT above):
+                        # scripts/cmux-next/swap-binary.sh with its root under RUNNER_TEMP, no canonical root.
+                        ("nightly.yml", "build-live-code-variant"): "isolated",
                         # cmux's app FFI release build: cargo tests and scripts/cmux-next/build-app-ffi.sh, which
                         # writes only under its workspace (cmux-tui/target/cmux-app-ffi) and a mktemp dir. As an
                         # unknown job it was a compile and waited for canonical root 1 (cmux run 43952668846).
@@ -7731,6 +7740,21 @@ def listen_fit_units(runner_dir: Path) -> int:
 # gates without an --apply that rewrites every wrapper.
 SIDE_FIT_JOBS = (("cmux-next.yml", "fast-tier"), ("cmux-next.yml", "swift-canary"),
                  ("cmux-next.yml", "release-compile"), ("cmux-next.yml", "cmux-scheme-compile"))
+
+
+# SIDE_FAST_FIT: a plain side runner listens with room for its side jobs' class need (SIDE_LISTEN_MEDIAN: the class
+# median, about 4 units), but the fast tier's admission asked for its own p90 (8 of 14, 9 of 12, 11 of 30) and
+# FAST_TIER_WAIT refuses it after 60 s. On 2026-11-22 00:06-01:36Z, 11 of 16 readable bad cmux-next fast tiers were
+# that refusal on glaeda-side-std runners (job 137053521754 on cmux14: 4 of 14 free at start, needs 8), and the
+# rescue's attempt 2 landed on side-std and was refused again (137057794165), so the refusal never turned green.
+# On a plain side runner the fast tier is admitted by its class (class_need), the room its listener listened with:
+# it runs beside the mini's other jobs instead of failing. Fast, root and every other role keep their admission.
+def plain_side_runner(args: argparse.Namespace) -> bool:
+    """Whether this job-started hook runs for a plain side runner: the roles side_fit_units gives the side fit."""
+    return (args.capacity_units > 0 and args.instance >= args.canonical_roots and not args.fast_runner
+            and not args.gui_runner and not args.session_runner and not args.dev_compile_runner
+            and not args.dedicated_admit and not args.nightly_runner and not args.gateway_runner
+            and not args.sim_runner and not args.small_runner)
 
 
 def side_fit_units(scope: RunnerScope) -> int:
@@ -15065,6 +15089,12 @@ def main(argv: list[str] | None = None) -> int:
         if (admit_class is None and args.fast_runner and not is_guest(repo, args.home_repo)
                 and (job_workflow(), os.environ.get("GITHUB_JOB", "")) in FAST_JOBS):
             admit_class = "fast"  # its own tokens on its own runner; on any other runner it keeps its usual cost
+        if (admit_class is None and plain_side_runner(args) and not is_guest(repo, args.home_repo)
+                and (job_workflow(), os.environ.get("GITHUB_JOB", "")) in FAST_JOBS and load_job_needs()[0]):
+            # SIDE_FAST_FIT: admitted by its class, at the room the side listener listened with (side_fit_units).
+            admit_class = job_class(os.environ.get("GITHUB_JOB", ""), repo, args.home_repo, job_workflow())[0]
+            print(f"{PREFIX}: the fast tier on a side runner: admitted at its class's need, the room this runner "
+                  "listened with (SIDE_FAST_FIT), not its own p90", flush=True)
         if args.fast_runner and admit_class != "fast":
             # It listens on a full mini (it needs no general units), so any other job would wait here for units
             # with no limit and idle the runner; refused, it is rescued onto its own pool.
