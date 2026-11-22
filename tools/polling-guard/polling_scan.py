@@ -40,6 +40,8 @@ DEFAULT_ALLOWLIST = ".github/polling-allowlist.json"
 SHELL_EXT = {".sh", ".bash", ".zsh", ".ksh"}
 SHEBANG = re.compile(r"^#!\s*\S*?(?:/env\s+(?:-\S+\s+)*)?\S*\b(?:ba|z|da|k)?sh\b")
 RUN_KEY = re.compile(r"^(\s*)(?:-\s+)?(run):\s*(.*?)\s*$")
+# A /bin/sh first line that execs python on the second, which Python reads as its docstring's start.
+PYTHON_EXEC = b'"""exec" python'
 SHELL_KEY = re.compile(r"^\s*(?:-\s+)?shell:\s*(\S+)")
 EXPR = re.compile(r"\$\{\{.*?\}\}")
 
@@ -59,9 +61,11 @@ def is_shell(path, rel):
         return False
     try:
         with open(path, "rb") as f:
-            first = f.readline(200)
+            first, second = f.readline(200), f.readline(200)
     except OSError:
         return False
+    if second.startswith(PYTHON_EXEC):
+        return False  # /bin/sh only execs python on line 2 (scripts/glaeda-gh's launcher): a Python file
     return bool(SHEBANG.match(first.decode("utf-8", "replace")))
 
 

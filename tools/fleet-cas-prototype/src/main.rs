@@ -395,6 +395,8 @@ struct Store {
     /// Unix millis until which fleet-store calls are skipped after a failure.
     upstream_down_until: AtomicU64,
     stats: Stats,
+    /// The lookups, puts and errors of each TCP peer, for `/stats`.
+    clients: window::Clients,
     /// The writer's node only: every index key its builds look up or write,
     /// one hex key per line. `fleet-cas-writer-build.sh` turns the lines a
     /// fill added into the marker's manifest, which `fleet-cas warm` reads.
@@ -585,6 +587,30 @@ impl Store {
         }
     }
 
+    /// Count for one client (`peer_of`) in `/stats`.
+    fn count(&self, peer: Option<std::net::IpAddr>, adds: &[(usize, u64)]) {
+        self.clients.add(peer, adds, now_ms());
+    }
+
+    /// Count an object lookup's answer for its client.
+    fn count_cas_get(
+        &self,
+        peer: Option<std::net::IpAddr>,
+        r: &Result<Option<cas::CasObject>, Status>,
+    ) {
+        match r {
+            Ok(Some(obj)) => self.count(
+                peer,
+                &[
+                    (window::CAS_HITS, 1),
+                    (window::BYTES_OUT, blob_data(obj).len() as u64),
+                ],
+            ),
+            Ok(None) => self.count(peer, &[(window::CAS_MISSES, 1)]),
+            Err(_) => self.count(peer, &[(window::ERRORS, 1)]),
+        }
+    }
+
     /// Refuse a write from a TCP peer that is not an allowed writer.
     fn check_writer<T>(&self, r: &Request<T>) -> Result<(), Status> {
         let Some(allowed) = &self.writers else {
@@ -594,6 +620,7 @@ impl Store {
             Some(peer) if allowed.contains(&peer.ip()) => Ok(()),
             _ => {
                 self.stats.write_refused.fetch_add(1, Relaxed);
+                self.count(peer_of(r), &[(window::WRITE_REFUSED, 1)]);
                 Err(Status::permission_denied("not a fleet-cas writer"))
             }
         }
@@ -1014,6 +1041,12 @@ impl Store {
 struct CasSvc(Arc<Store>);
 struct KvSvc(Arc<Store>);
 
+/// The client a request is counted under in `/stats`: its TCP peer's
+/// address, `None` over a unix socket.
+fn peer_of<T>(r: &Request<T>) -> Option<std::net::IpAddr> {
+    r.remote_addr().map(|a| a.ip())
+}
+
 #[tonic::async_trait]
 impl cas::casdb_service_server::CasdbService for CasSvc {
     async fn put(
@@ -1021,10 +1054,13 @@ impl cas::casdb_service_server::CasdbService for CasSvc {
         r: Request<cas::CasPutRequest>,
     ) -> Result<Response<cas::CasPutResponse>, Status> {
         let s = &self.0;
+        let peer = peer_of(&r);
+        let mut bytes_in = 0;
         let resp = async {
             self.0.check_writer(&r)?;
             let obj = r.into_inner().data.unwrap_or_default();
             let data = self.0.bytes_of(obj.blob)?;
+            bytes_in = data.len() as u64;
             let id = self.0.put_through(obj.references, data).await?;
             Ok(Response::new(cas::CasPutResponse {
                 contents: Some(cas::cas_put_response::Contents::CasId(cas::CasDataId {
@@ -1035,6 +1071,9 @@ impl cas::casdb_service_server::CasdbService for CasSvc {
         .await;
         if resp.is_err() {
             s.stats.write_failed.fetch_add(1, Relaxed);
+            s.count(peer, &[(window::ERRORS, 1)]);
+        } else {
+            s.count(peer, &[(window::PUTS, 1), (window::BYTES_IN, bytes_in)]);
         }
         resp
     }
@@ -1043,8 +1082,11 @@ impl cas::casdb_service_server::CasdbService for CasSvc {
         &self,
         r: Request<cas::CasGetRequest>,
     ) -> Result<Response<cas::CasGetResponse>, Status> {
+        let peer = peer_of(&r);
         let id = r.into_inner().cas_id.unwrap_or_default().id;
-        Ok(Response::new(match self.0.counted_read(self.0.get_or_fetch(&id).await)? {
+        let found = self.0.counted_read(self.0.get_or_fetch(&id).await);
+        self.0.count_cas_get(peer, &found);
+        Ok(Response::new(match found? {
             Some(obj) => cas::CasGetResponse {
                 outcome: cas::cas_get_response::Outcome::Success as i32,
                 contents: Some(cas::cas_get_response::Contents::Data(obj)),
@@ -1061,10 +1103,13 @@ impl cas::casdb_service_server::CasdbService for CasSvc {
         r: Request<cas::CasSaveRequest>,
     ) -> Result<Response<cas::CasSaveResponse>, Status> {
         let s = &self.0;
+        let peer = peer_of(&r);
+        let mut bytes_in = 0;
         let resp = async {
             self.0.check_writer(&r)?;
             let blob = r.into_inner().data.unwrap_or_default();
             let data = self.0.bytes_of(blob.blob)?;
+            bytes_in = data.len() as u64;
             let id = self.0.put_through(Vec::new(), data).await?;
             Ok(Response::new(cas::CasSaveResponse {
                 contents: Some(cas::cas_save_response::Contents::CasId(cas::CasDataId {
@@ -1075,6 +1120,9 @@ impl cas::casdb_service_server::CasdbService for CasSvc {
         .await;
         if resp.is_err() {
             s.stats.write_failed.fetch_add(1, Relaxed);
+            s.count(peer, &[(window::ERRORS, 1)]);
+        } else {
+            s.count(peer, &[(window::PUTS, 1), (window::BYTES_IN, bytes_in)]);
         }
         resp
     }
@@ -1083,8 +1131,11 @@ impl cas::casdb_service_server::CasdbService for CasSvc {
         &self,
         r: Request<cas::CasLoadRequest>,
     ) -> Result<Response<cas::CasLoadResponse>, Status> {
+        let peer = peer_of(&r);
         let id = r.into_inner().cas_id.unwrap_or_default().id;
-        Ok(Response::new(match self.0.counted_read(self.0.get_or_fetch(&id).await)? {
+        let found = self.0.counted_read(self.0.get_or_fetch(&id).await);
+        self.0.count_cas_get(peer, &found);
+        Ok(Response::new(match found? {
             Some(obj) => cas::CasLoadResponse {
                 outcome: cas::cas_load_response::Outcome::Success as i32,
                 contents: Some(cas::cas_load_response::Contents::Data(cas::CasBlob {
@@ -1118,8 +1169,37 @@ impl kv::key_value_db_server::KeyValueDb for KvSvc {
         &self,
         r: Request<kv::GetValueRequest>,
     ) -> Result<Response<kv::GetValueResponse>, Status> {
-        let key = r.into_inner().key;
-        let s = &self.0;
+        let peer = peer_of(&r);
+        let resp = self.0.kv_get(r.into_inner().key).await;
+        let counter = match &resp {
+            Ok(v) if v.get_ref().contents.is_some() => window::KV_HITS,
+            Ok(_) => window::KV_MISSES,
+            Err(_) => window::ERRORS,
+        };
+        self.0.count(peer, &[(counter, 1)]);
+        resp
+    }
+
+    async fn put_value(
+        &self,
+        r: Request<kv::PutValueRequest>,
+    ) -> Result<Response<kv::PutValueResponse>, Status> {
+        let peer = peer_of(&r);
+        let resp = self.0.kv_put(r).await;
+        if !matches!(&resp, Ok(r) if r.get_ref().error.is_none()) {
+            self.0.stats.write_failed.fetch_add(1, Relaxed);
+            self.0.count(peer, &[(window::ERRORS, 1)]);
+        } else {
+            self.0.count(peer, &[(window::PUTS, 1)]);
+        }
+        resp
+    }
+}
+
+impl Store {
+    /// An index lookup: the local entry, else the fleet store's (a node).
+    async fn kv_get(&self, key: Vec<u8>) -> Result<Response<kv::GetValueResponse>, Status> {
+        let s = self;
         let answer = |v: kv::Value| {
             kv_response(Some(if s.strip_signatures { sign::strip(v) } else { v }))
         };
@@ -1189,17 +1269,6 @@ impl kv::key_value_db_server::KeyValueDb for KvSvc {
             }
         });
         Ok(answer(value))
-    }
-
-    async fn put_value(
-        &self,
-        r: Request<kv::PutValueRequest>,
-    ) -> Result<Response<kv::PutValueResponse>, Status> {
-        let resp = self.0.kv_put(r).await;
-        if !matches!(&resp, Ok(r) if r.get_ref().error.is_none()) {
-            self.0.stats.write_failed.fetch_add(1, Relaxed);
-        }
-        resp
     }
 }
 
@@ -1308,6 +1377,7 @@ impl fleet::fleet_cas_server::FleetCas for FleetSvc {
         &self,
         r: Request<fleet::ClosureRequest>,
     ) -> Result<Response<Self::GetClosureStream>, Status> {
+        let peer = peer_of(&r);
         let mut queue = r.into_inner().roots;
         queue.sort();
         queue.dedup();
@@ -1328,6 +1398,13 @@ impl fleet::fleet_cas_server::FleetCas for FleetSvc {
                 let Ok(Some(obj)) = store.get(&id) else {
                     continue;
                 };
+                store.count(
+                    peer,
+                    &[
+                        (window::CAS_HITS, 1),
+                        (window::BYTES_OUT, blob_data(&obj).len() as u64),
+                    ],
+                );
                 for r in &obj.references {
                     if seen.insert(r.id.clone()) {
                         queue.push(r.id.clone());
@@ -1616,6 +1693,7 @@ async fn main() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
             instance: AtomicU64::new(now_ms() ^ u64::from(std::process::id()) << 44),
             ..Stats::default()
         },
+        clients: window::Clients::new(window::MAX_CLIENTS),
         key_log,
     });
 
@@ -1756,7 +1834,9 @@ impl Monitor {
 
     fn sample(&self) {
         let current = self.store.stats.window_counts();
-        self.history().sample(&current, now_ms());
+        let now = now_ms();
+        self.history().sample(&current, now);
+        self.store.clients.sample(now);
     }
 
     fn save(&self) {
@@ -1788,7 +1868,7 @@ impl Monitor {
             .as_ref()
             .map_or("null".to_string(), |k| k.len().to_string());
         format!(
-            "{{\"schema\":\"fleet-cas-stats/v1\",\"role\":{},\"listen\":{},\"now_ms\":{now},\"started_ms\":{},\"uptime_s\":{},\"history_started_ms\":{},\"starts\":{},\"writers\":{writers},\"trusted_keys\":{trusted},\"read_only_kv\":{},\"upstream\":{},\"windows\":{},\"lifetime\":{},\"counters\":{}}}",
+            "{{\"schema\":\"fleet-cas-stats/v1\",\"role\":{},\"listen\":{},\"now_ms\":{now},\"started_ms\":{},\"uptime_s\":{},\"history_started_ms\":{},\"starts\":{},\"writers\":{writers},\"trusted_keys\":{trusted},\"read_only_kv\":{},\"upstream\":{},\"windows\":{},\"lifetime\":{},\"counters\":{},\"clients_since_ms\":{},\"clients_max\":{},\"clients_dropped\":{},\"clients\":{}}}",
             window::quote(self.role),
             window::quote(&self.listen),
             self.started_ms,
@@ -1800,6 +1880,10 @@ impl Monitor {
             window::windows_json(&h, &current, now),
             window::counts_json(&h.lifetime_with(&current)),
             self.store.stats.line(),
+            self.started_ms,
+            window::MAX_CLIENTS,
+            self.store.clients.dropped(),
+            self.store.clients.json(now),
         )
     }
 }
@@ -1929,6 +2013,7 @@ mod tests {
             strip_signatures: true,
             upstream_down_until: AtomicU64::new(0),
             stats: Stats::default(),
+            clients: window::Clients::new(window::MAX_CLIENTS),
             key_log: None,
         });
         let response = <KvSvc as kv::key_value_db_server::KeyValueDb>::put_value(

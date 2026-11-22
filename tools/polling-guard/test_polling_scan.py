@@ -86,6 +86,11 @@ class PollingScanTests(unittest.TestCase):
         self.assertEqual(rc, 1, out)
         self.assertIn("tools/waiter:4:", out)
 
+    def test_a_sh_launcher_that_execs_python_on_line_two_is_python_not_shell(self):
+        launcher = '#!/bin/sh\n"""exec" python3 -I -c \'pass\' "$0" "$@"\nusage\n"""\n' + LOOP_SCRIPT.split("\n", 1)[1]
+        rc, out = Repo({"scripts/glaeda-gh": launcher}).scan()
+        self.assertEqual(rc, 0, out)
+
     def test_workflow_run_blocks_are_scanned_with_their_lines(self):
         rc, out = Repo({".github/workflows/x.yml": WORKFLOW}).scan()
         self.assertEqual(rc, 1, out)

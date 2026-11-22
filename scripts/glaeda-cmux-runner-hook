@@ -1390,6 +1390,24 @@ def runner_jobs_need_gib(in_flight: int, per_job_gib: float) -> float:
     return round(RUNNER_JOBS_FLOOR_GIB + per_job_gib * (in_flight + 1), 1)
 
 
+# FLEET_PAUSE_FULL (claude-sr2-coord, 2026-11-22 09:57Z: "fix the class: a runner below the disk reserve takes no
+# jobs, and the paused state reaches the glaeda runners, not only the build fleet"). The build-fleet worker beside the
+# runners pauses its claims for disk (claim_paused disk) while free disk is under one job's growth above the hard
+# floor (hq build-fleet/cmd/worker diskPauseNeedBytes: stepFitBytes, 5 GiB + the 10 GiB hard floor): under it no
+# job fits. The runners' full-disk hold (DISK_FULL_NO_LISTEN) stopped only at the hard floor itself, so between the
+# two the fleet was paused and the runners kept taking jobs. 2026-11-22 09:53Z: one build Mac at 12.3 GiB free held
+# 5 runner jobs and another at 1.3 GiB held 4 while the fleet had paused both; every runner on each lost its connection
+# mid-job and the fast tier went 2 pass / 41 fail. So a full disk is the same test the fleet pauses by, with the
+# runners' own measured job: the hard floor plus one runner job's p95 (RUNNER_JOB_DISK_NAME, 5.3 GiB: 15.3 GiB), no
+# new number. The hold takes no new job and touches no running one (its job's end stops the listener, as before), and
+# it ends as soon as free disk is back over the line. No per-job value: the hard floor alone, as before.
+def full_disk_gib() -> float:
+    """The free disk under which no runner job fits (DISK_FULL_NO_LISTEN, FLEET_PAUSE_FULL): RUNNER_JOBS_FLOOR_GIB
+    plus one runner job's measured p95 (runner_job_disk), or the hard floor alone when that value is unreadable."""
+    per, _source = runner_job_disk()
+    return runner_jobs_need_gib(0, per) if per is not None else RUNNER_JOBS_FLOOR_GIB
+
+
 def runner_jobs_refusal(free: float, in_flight: int, per_job_gib: float, source: str,
                         written_gib: float = 0.0) -> str | None:
     """Why an idle listener takes no job for disk with in_flight jobs running beside it (RUNNER_JOBS_DISK), or None.
@@ -11508,8 +11526,9 @@ class Gate:
         running Worker's exit. Job admission keeps its existing measured disk-growth checks and disk-low ledger. Disk
         observations never arm JOB_END_FREEZE.
 
-        No floor holds the listener (DISK_RECLAIM_NOW); only a full disk does, free under RUNNER_JOBS_FLOOR_GIB where
-        no job fits (DISK_FULL_NO_LISTEN, the one reason this returns). An idle pool runner short of one job's measured peak
+        No floor holds the listener (DISK_RECLAIM_NOW); only a full disk does, free under the hard floor plus one runner
+        job's p95 (full_disk_gib, the build fleet's own disk pause: FLEET_PAUSE_FULL) where no job fits
+        (DISK_FULL_NO_LISTEN, the one reason this returns). An idle pool runner short of one job's measured peak
         (job_disk_gib, DISK_SHORT_RECLAIM), whatever the floor, or of the jobs in flight's disk (RUNNER_JOBS_DISK)
         starts reclaim at once aimed at what it lacks, and records it (disk_short), so its listener's next start waits
         at most DISK_RECLAIM_WAIT_S for room (disk_room_wait) and then listens whatever that freed. These readings used
@@ -11555,9 +11574,10 @@ class Gate:
             # until reclaim or the running jobs' ends free it. Leo: "A busy machine makes things slower, never makes
             # them fail." 2026-11-18 19:46-19:55Z: cmux18's listeners took jobs at 8.5 GiB free beside five running,
             # which wrote it down to 1.8 GiB while the lent fleet worker beside them sat at claim_paused disk.
-            # Full is under the hard floor and under this runner's own job peak (a small runner's 8 GiB: its jobs are
-            # measured to fit under the hard floor). An unreadable reading holds nothing (free_or_none: None).
-            full_gib = min(RUNNER_JOBS_FLOOR_GIB, peak)
+            # Full is under the hard floor plus one runner job's measured p95 (full_disk_gib, FLEET_PAUSE_FULL: the
+            # build fleet's own disk pause beside it) and under this runner's own job peak (a small runner's 8 GiB:
+            # its jobs are measured to fit under the hard floor). An unreadable reading holds nothing (free_or_none).
+            full_gib = min(full_disk_gib(), peak)
             if (free := free_or_none(path)) is not None and free < full_gib:
                 self.disk_short = None
                 self.evict_in_background(path, max(floor, peak, aim))

@@ -1,5 +1,6 @@
-//! End to end: a fleet store counts lookups, serves them on `GET /stats` on
-//! its gRPC port, and keeps its windows across a restart.
+//! End to end: a fleet store counts lookups, in total and per client, serves
+//! them on `GET /stats` on its gRPC port, and keeps its windows across a
+//! restart.
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -157,6 +158,19 @@ async fn store_serves_stats_and_keeps_windows_across_restart() {
         object(&body, "counters").contains("\"kv_get_miss\":3"),
         "{body}"
     );
+    assert!(object(&body, "6h").contains("\"kv_misses\":3"), "{body}");
+
+    // The same counts, per client (TCP peer address).
+    assert!(body.contains("\"clients_since_ms\":"), "{body}");
+    assert!(body.contains("\"clients_max\":256"), "{body}");
+    let me = object(object(&body, "clients"), "127.0.0.1");
+    assert!(me.contains("\"last_seen_ms\":"), "{body}");
+    let me_hour = object(me, "1h");
+    assert!(me_hour.contains("\"kv_misses\":3"), "{body}");
+    assert!(me_hour.contains("\"kv_hit_rate\":0.0000"), "{body}");
+    assert!(me_hour.contains("\"write_refused\":1"), "{body}");
+    assert!(me_hour.contains("\"errors\":1"), "{body}");
+    assert!(object(me, "24h").contains("\"kv_misses\":3"), "{body}");
 
     stop(store);
     assert!(root.join("stats-history.txt").exists());
@@ -170,7 +184,10 @@ async fn store_serves_stats_and_keeps_windows_across_restart() {
         "{body}"
     );
     assert!(object(&body, "1h").contains("\"kv_misses\":3"), "{body}");
+    assert!(object(&body, "6h").contains("\"kv_misses\":3"), "{body}");
     assert!(object(&body, "24h").contains("\"kv_misses\":3"), "{body}");
+    // Per-client counts start with the process.
+    assert!(body.contains("\"clients\":{}"), "{body}");
     assert!(
         object(&body, "lifetime").contains("\"kv_misses\":3"),
         "{body}"

@@ -188,6 +188,7 @@ async fn warm(
         strip_signatures: true,
         upstream_down_until: AtomicU64::new(0),
         stats: Stats::default(),
+        clients: crate::window::Clients::new(crate::window::MAX_CLIENTS),
         key_log: None,
     });
 

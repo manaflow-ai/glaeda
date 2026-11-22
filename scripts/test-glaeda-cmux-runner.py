@@ -12836,7 +12836,8 @@ class GateTest(unittest.TestCase):
 
     def test_a_disk_short_runner_never_stops_or_freezes_its_running_job(self) -> None:
         write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 5\n")
-        with mock.patch.object(hook.shutil, "disk_usage", return_value=mock.Mock(free=10 * 1024**3)), \
+        # 16 GiB: short of one job's 20 GiB peak, over the full-disk line (FLEET_PAUSE_FULL, 15.3 GiB)
+        with mock.patch.object(hook.shutil, "disk_usage", return_value=mock.Mock(free=16 * 1024**3)), \
                 mock.patch.dict(os.environ, {hook.DISK_JOB_PEAK_ENV: "20"}):
             gate, stops = self.gate([None] * 3, busy=[True])
             gate.worker_pids = lambda: [4242]
@@ -13518,11 +13519,11 @@ class GateTest(unittest.TestCase):
 
     def test_a_short_disk_starts_reclaim_at_once_and_starts_the_listener_within_seconds(self) -> None:
         """DISK_RECLAIM_NOW (Leo, 2026-11-18: disk floors never refuse or pause work, they trigger reclaim and wait
-        seconds). An idle pool runner at 15 GiB free (one job's peak is 20) starts a floor eviction on its first look,
+        seconds). An idle pool runner at 16 GiB free (one job's peak is 20; over FLEET_PAUSE_FULL's 15.3) starts a floor eviction on its first look,
         waits at most DISK_RECLAIM_WAIT_S for room while it runs, and starts its listener whether or not room came."""
         write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 14\n")
         gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
-        free, clock, logs, procs, started = {"gib": 15.0}, {"t": 1000.0}, [], [], []
+        free, clock, logs, procs, started = {"gib": 16.0}, {"t": 1000.0}, [], [], []
 
         def popen(argv: list[str], **_: object) -> mock.Mock:
             proc = mock.Mock(argv=argv)
@@ -13559,7 +13560,7 @@ class GateTest(unittest.TestCase):
             self.assertIsNone(gate.disk_short, "the wait is spent once")
             # room arrives during the wait: it starts as soon as it is there
             gate.child, gate.evicting, gate.disk_evicted_at = None, None, -hook.GATE_DISK_REPASS_S
-            free["gib"] = 15.0
+            free["gib"] = 16.0
             started.clear()
 
             def roomy_sleep(seconds: float) -> None:
@@ -13617,14 +13618,57 @@ class GateTest(unittest.TestCase):
             holds = [line for line in logs if "DISK_FULL_NO_LISTEN" in line]
             self.assertEqual(len(holds), 1, f"the hold is logged once, not every poll: {logs}")
             self.assertTrue(holds[0].startswith("holding the listener off: disk full"), holds)
-            # the pass ends having freed room above the hard floor (still under one job's peak): it listens
+            # the pass ends having freed room above the full-disk line (15.3 GiB, FLEET_PAUSE_FULL; still under one
+            # job's peak): it listens
             procs[0].poll.return_value = 0
-            free["gib"] = 15.0
+            free["gib"] = 16.0
             for _ in range(hook.GATE_CONFIRM + 1):
                 self.assertIsNone(gate.poll())
                 clock["t"] += hook.GATE_POLL_S
             self.assertTrue(started, "above the hard floor a short disk only warns: the listener starts")
             self.assertTrue(any("listening anyway" in line for line in logs), logs)
+
+    def test_a_disk_the_build_fleet_pauses_for_takes_no_runner_job_until_one_fits(self) -> None:
+        """FLEET_PAUSE_FULL (2026-11-22 09:53Z: a build Mac at 12.3 GiB free held 5 runner jobs while the fleet worker
+        beside them sat at claim_paused disk; every runner lost its connection mid-job). Full is the hard floor plus one
+        runner job's measured p95 (10 + 5.3 = 15.3 GiB), the line the fleet pauses by: an idle pool listener under it
+        holds with reclaim aimed at its floor, and listens again once free disk is back over it. A job running beside
+        it is never stopped: its look only reports the hold, which stops the listener at that job's end."""
+        write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 14\n")
+        disk = self.tmp / "runner-job-disk.json"
+        disk.write_text(json.dumps({"schema": hook.RUNNER_JOB_DISK_SCHEMA, "disk_gib_p95": 5.3}))
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        free = {"gib": 12.3}
+        usage = lambda _path: mock.Mock(free=int(free["gib"] * 1024**3))  # noqa: E731
+        with mock.patch.object(hook.shutil, "disk_usage", side_effect=usage), \
+                mock.patch.object(hook, "processes", return_value={}), \
+                mock.patch.object(gate, "evict_in_background") as cleanup, \
+                mock.patch.dict(os.environ, {hook.DISK_JOB_PEAK_ENV: "20", hook.RUNNER_JOB_DISK_ENV: os.fspath(disk)}):
+            self.assertEqual(hook.full_disk_gib(), 15.3)
+            full = "disk full: under 15.3 GiB, where no job of this runner fits; reclaiming (DISK_FULL_NO_LISTEN)"
+            self.assertEqual(gate.low_disk(), full, "above the hard floor, under the fleet's pause line: held")
+            self.assertEqual(cleanup.call_args.args[1], 30.0, "reclaim aims at the runner's floor")
+            free["gib"] = 15.2
+            self.assertEqual(gate.low_disk(), full)
+            free["gib"] = 15.4
+            self.assertIsNone(gate.low_disk(), "back over the line: it listens (a short disk only warns)")
+            self.assertIn("DISK_SHORT_RECLAIM", gate.disk_short[0] if gate.disk_short else "")
+            # no readable p95: the hard floor alone, as before
+            disk.write_text("{}")
+            free["gib"] = 12.3
+            self.assertEqual(hook.full_disk_gib(), hook.RUNNER_JOBS_FLOOR_GIB)
+            self.assertIsNone(gate.low_disk(), "with no measured job the line is the hard floor")
+        # a small runner's own 8 GiB peak still caps the line
+        small = self.runner.parent / "actions-runner-glaeda-9"
+        write_hook(small, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 14 --small-runner\n")
+        disk.write_text(json.dumps({"schema": hook.RUNNER_JOB_DISK_SCHEMA, "disk_gib_p95": 5.3}))
+        small_gate = hook.Gate(small, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        free["gib"] = 12.3
+        with mock.patch.object(hook.shutil, "disk_usage", side_effect=usage), \
+                mock.patch.object(hook, "processes", return_value={}), \
+                mock.patch.object(small_gate, "evict_in_background"), \
+                mock.patch.dict(os.environ, {hook.DISK_JOB_PEAK_ENV: "20", hook.RUNNER_JOB_DISK_ENV: os.fspath(disk)}):
+            self.assertIsNone(small_gate.low_disk(), "a small runner's jobs fit at 12.3 GiB")
 
 
     def test_a_root_runner_holds_while_a_token_its_jobs_need_is_taken(self) -> None:
