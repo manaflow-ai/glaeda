@@ -268,6 +268,7 @@ def disk_low_turn(capacity_dir: Path, worker: int, lock_wait_s: float | None = N
     remaining budget). Returns the refusal, or None (admitted, marker written)."""
     try:
         capacity_dir.mkdir(parents=True, exist_ok=True)
+        share_fleet_path(capacity_dir)
         lock = os.open(capacity_dir / f"{DISK_LOW}.lock", os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
     except OSError as error:
         return f"cannot open the disk ledger ({type(error).__name__})"
@@ -361,6 +362,53 @@ PREJOB_POLL_S = 1.0
 # The runner's own environment (its LaunchAgent), never a job's env:, which does not reach hooks.
 FLEET_DIR = os.environ.get("GLAEDA_FLEET_DIR") or "/Users/Shared/cmux-build-fleet"
 HOST_LOCK = f"{FLEET_DIR}/host.lock"
+# SHARED_FLEET (POOL_USER, cmuxterm-hq#18007): on a member whose pool runners run as their own account (runner.poolUser)
+# two accounts share FLEET_DIR's host lock and capacity ledger: the member user's controller worker and the pool
+# account's hooks, through a group the host provisions (cmuxfleet, never staff). Every ledger lock is an O_RDONLY open
+# plus flock, which group read allows; creating, replacing and unlinking markers needs group write on the directory,
+# and job-completed's media cleanup opens host.lock O_RDWR. So what the hook creates there gets group write (never
+# other write) whatever its umask: a directory it made (capacity/) g+rwx, host.lock g+rw. Only a path this account owns,
+# under FLEET_DIR, whose group is neither staff nor everyone (every account is in those: group write there would hand
+# the ledger to any local user).
+SHARED_GROUP_EXCLUDED = frozenset({12, 20})  # everyone, staff
+
+
+def _shareable(st: os.stat_result, path: str) -> bool:
+    fleet = os.path.realpath(FLEET_DIR)
+    real = os.path.realpath(path)
+    return (st.st_uid == os.getuid() and st.st_gid not in SHARED_GROUP_EXCLUDED and not stat.S_ISLNK(st.st_mode)
+            and (real == fleet or real.startswith(fleet + os.sep)))
+
+
+def share_fleet_path(path: Path | str) -> bool:
+    """SHARED_FLEET: add group write (and search, for a directory) to a FLEET_DIR path this account owns. Best
+    effort: True when the mode now has it, False when it was not ours to change or could not be."""
+    try:
+        st = os.lstat(path)
+        if not _shareable(st, os.fspath(path)):
+            return False
+        want = st.st_mode & 0o7777 | (0o070 if stat.S_ISDIR(st.st_mode) else 0o060)
+        if want != st.st_mode & 0o7777:
+            os.chmod(path, want)
+        return True
+    except OSError:
+        return False
+
+
+def share_fleet_fd(fd: int, path: Path | str) -> bool:
+    """share_fleet_path for a file this process holds open (fchmod: no race with a rename of the path)."""
+    try:
+        st = os.fstat(fd)
+        if not _shareable(st, os.fspath(path)):
+            return False
+        want = st.st_mode & 0o7777 | 0o060
+        if want != st.st_mode & 0o7777:
+            os.fchmod(fd, want)
+        return True
+    except OSError:
+        return False
+
+
 RESERVATION = f"{FLEET_DIR}/reservation.json"
 HOLDER_FILE = "host-lock-holder"
 HOLDER_POLL_S = 2.0
@@ -1388,6 +1436,24 @@ def pool_listener(runner_dir: Path) -> bool:
 def runner_jobs_need_gib(in_flight: int, per_job_gib: float) -> float:
     """The free disk one more job needs: RUNNER_JOBS_FLOOR_GIB + per_job_gib for each job in flight and for it."""
     return round(RUNNER_JOBS_FLOOR_GIB + per_job_gib * (in_flight + 1), 1)
+
+
+# FLEET_PAUSE_FULL (claude-sr2-coord, 2026-11-22 09:57Z: "fix the class: a runner below the disk reserve takes no
+# jobs, and the paused state reaches the glaeda runners, not only the build fleet"). The build-fleet worker beside the
+# runners pauses its claims for disk (claim_paused disk) while free disk is under one job's growth above the hard
+# floor (hq build-fleet/cmd/worker diskPauseNeedBytes: stepFitBytes, 5 GiB + the 10 GiB hard floor): under it no
+# job fits. The runners' full-disk hold (DISK_FULL_NO_LISTEN) stopped only at the hard floor itself, so between the
+# two the fleet was paused and the runners kept taking jobs. 2026-11-22 09:53Z: one build Mac at 12.3 GiB free held
+# 5 runner jobs and another at 1.3 GiB held 4 while the fleet had paused both; every runner on each lost its connection
+# mid-job and the fast tier went 2 pass / 41 fail. So a full disk is the same test the fleet pauses by, with the
+# runners' own measured job: the hard floor plus one runner job's p95 (RUNNER_JOB_DISK_NAME, 5.3 GiB: 15.3 GiB), no
+# new number. The hold takes no new job and touches no running one (its job's end stops the listener, as before), and
+# it ends as soon as free disk is back over the line. No per-job value: the hard floor alone, as before.
+def full_disk_gib() -> float:
+    """The free disk under which no runner job fits (DISK_FULL_NO_LISTEN, FLEET_PAUSE_FULL): RUNNER_JOBS_FLOOR_GIB
+    plus one runner job's measured p95 (runner_job_disk), or the hard floor alone when that value is unreadable."""
+    per, _source = runner_job_disk()
+    return runner_jobs_need_gib(0, per) if per is not None else RUNNER_JOBS_FLOOR_GIB
 
 
 def runner_jobs_refusal(free: float, in_flight: int, per_job_gib: float, source: str,
@@ -3730,6 +3796,26 @@ def _probe_answer(argv: list[str], env: dict[str, str], cwd: Path, deadline: flo
     return (out.stdout.strip() if out.returncode == 0 else ""), False
 
 
+# NODE_VIEW (POOL_USER, cmuxterm-hq#18007): a pool runner in its own account (the member's runner.poolUser) cannot read
+# the member user's home, where the node's enrollment, class receipts and Glaeda generations live. glaeda-cmux-runner-fleet
+# --apply publishes a copy as the member user under FLEET_DIR/pool-node (cmux-fleet/ and glaeda-generations/<c12>/,
+# owned by that user, readable and never writable by the pool account), and the runner's LaunchAgent names it in
+# GLAEDA_NODE_VIEW. The checks are the same: the receipt still has to validate under its generation's validator, the
+# enrollment still has to reference it and the toolchain strings are still probed on this account's own job PATH.
+NODE_VIEW_ENV = "GLAEDA_NODE_VIEW"
+
+
+def node_paths(home: Path) -> tuple[Path, Path]:
+    """(the cmux-fleet config directory, the glaeda-generations directory) this runner's eligibility reads: the
+    NODE_VIEW when GLAEDA_NODE_VIEW names one, else this account's own ~/.config/glaeda/cmux-fleet (XDG_CONFIG_HOME)
+    and ~/Projects/glaeda-generations."""
+    view = os.environ.get(NODE_VIEW_ENV)
+    if view:
+        return Path(view) / "cmux-fleet", Path(view) / "glaeda-generations"
+    return (Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config") / "glaeda" / "cmux-fleet",
+            home / "Projects" / "glaeda-generations")
+
+
 def node_refusal(fleet_class: str | None) -> tuple[str | None, dict[str, Any]]:
     """(why this node is not an eligible fleet node, {}) or (None, its class receipt's toolchain). No effects."""
     why, want, _timed_out = node_answer(fleet_class)
@@ -3743,7 +3829,7 @@ def node_answer(fleet_class: str | None) -> tuple[str | None, dict[str, Any], bo
     load ~275 read "does not validate" while the same validator said `valid` in 0.08 s by hand)."""
     home = Path.home()
     deadline = time.monotonic() + ELIGIBILITY_BUDGET_S
-    config = Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config") / "glaeda" / "cmux-fleet"
+    config, generations = node_paths(home)
     if not fleet_class:
         return "node not eligible (no fleet class configured for this runner)", {}, False
     receipt = _json_file(config / "class-acceptance" / f"{fleet_class}.json")
@@ -3760,7 +3846,7 @@ def node_answer(fleet_class: str | None) -> tuple[str | None, dict[str, Any], bo
                  .get("commit") or "")
     if not re.fullmatch(r"[0-9a-f]{12,40}", commit):
         return "node not eligible (the class receipt names no Glaeda candidate)", {}, False
-    generation = home / "Projects" / "glaeda-generations" / commit[:12]
+    generation = generations / commit[:12]
     if not generation.is_dir():
         return f"node not eligible (no node status from generation {commit[:12]})", {}, False
     # The receipt's own sha is a claim; the generation's validator recomputes it from the content.
@@ -4870,6 +4956,7 @@ def nightly_disk_wait(capacity_dir: Path, on: bool):
     since, done, writing = time.time(), threading.Event(), threading.Lock()
     with contextlib.suppress(OSError):
         capacity_dir.mkdir(parents=True, exist_ok=True)
+    share_fleet_path(capacity_dir)
     write_want(marker, since, [NIGHTLY_DISK_WANT, "units"], TIER_NIGHTLY)
 
     def refresh() -> None:
@@ -7072,6 +7159,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
     # pinned: home-repo workflows the hook does not know use /private/tmp/cmux-ci itself
     try:
         capacity_dir.mkdir(parents=True, exist_ok=True)
+        share_fleet_path(capacity_dir)
         admission = os.open(capacity_dir / "admission.lock", os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
     except OSError as error:
         return False, f"cannot open the capacity ledger ({type(error).__name__})"
@@ -7117,6 +7205,7 @@ def take_capacity(host_lock: str, capacity_dir: Path, total: int, job: str, watc
         if klass != GATEWAY_CLASS and os.path.isdir(os.path.dirname(host_lock)):
             # created if missing, so a worker that starts later still has to wait for this job
             fd = os.open(host_lock, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o660)
+            share_fleet_fd(fd, host_lock)  # SHARED_FLEET: the other account's job-completed opens it O_RDWR
             for attempt in range(6):  # a fleet probe takes it exclusively for microseconds; a build keeps it
                 try:
                     fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
@@ -9388,6 +9477,18 @@ def host_saturated(paused: bool, cpu_busy: float | None = None, memory_pressure:
     return f"{SATURATED} ({' and '.join(reasons)}; listening resumes below {GATE_CPU_RESUME:g}% CPU and normal memory pressure)"
 
 
+FLEET_BUILD_HOLDS_HOST = "a fleet build holds the host lock"
+# SIGNER_FIRST, the host lock: a fleet tool takes host.lock exclusively for a few seconds at a time (cmux15's
+# disk-pressure.sh, every 300 s, held it 6 s per pass on 2026-11-22: its cap-only pass). The gate read each one as a
+# fleet build, stopped both idle signing listeners, and kept them off for the 60 s a stop costs, so GitHub and the
+# nightly lane saw the mini offline every 5 minutes from 06:12Z to 07:18Z. The signing listener now stands down only
+# for a hold that lasts SIGNER_LOCK_SETTLE_S (a real build holds it for minutes). A signing job that meets a hold at
+# admission is refused "capacity: ..." and retried every ADMIT_POLL_S by job-started, so the short one passes.
+# SIGNER_LOCK_GAP_S: a settle clock not refreshed for that long (the listener was busy with a job) starts over.
+SIGNER_LOCK_SETTLE_S = 20.0
+SIGNER_LOCK_GAP_S = 10.0
+
+
 def host_held(host_lock: str, reservation: str, now: float, state_dir: Path | None = None,
               nightly_slot: bool = False) -> str | None:
     """Why the fleet, not a PR job, holds this host right now, or None. Our own jobs hold the host lock
@@ -9407,7 +9508,7 @@ def host_held(host_lock: str, reservation: str, now: float, state_dir: Path | No
         # up (a fill on the writer mini), to tell it from another fleet build it is waiting behind.
         if gate_yields(host_lock, holder_pids(state_dir) if state_dir else set()):
             return None
-        return "a fleet build holds the host lock"
+        return FLEET_BUILD_HOLDS_HOST
     finally:
         os.close(fd)  # drops the probe's shared lock too
     return None
@@ -10443,6 +10544,8 @@ class Gate:
         self.pcore_why: str | None = None
         self.pcore_boot: int | None = None
         self.load_since: float | None = None  # when the current CPU/memory hold began (legacy field name)
+        self.lock_held_since: float | None = None  # host_claim: when the host lock was first seen held exclusively
+        self.lock_held_seen = 0.0  # host_claim: when it was last seen held
         self.load_waived = False  # a pressure hold ran past GATE_LOAD_MAX_HOLD_S; ignored until pressure falls
         self.cpu_busy: float | None = None
         self.cpu_at = -GATE_CPU_EVERY_S
@@ -10646,8 +10749,7 @@ class Gate:
             # or keep it waiting in job-started (a signing job's claim on a yieldToExclusive runner)
             return self.low_disk() or self.dedicated_toolchain() or self.exclusive_yield()
         self.cap_sample(time.monotonic())  # HOST_LOAD_CAP reads load whatever holds the gate now
-        why = host_held(self.host_lock, self.reservation, time.time(), self.state_dir,
-                        nightly_slot=runner_scope(self.runner_dir).nightly)
+        why = self.host_claim()
         if why is None and self.waiters and self.waiters_due():
             self.waiting, self.waiting_at = self.blocking_waiters(), time.monotonic()
         if why is None and self.waiting:
@@ -10657,6 +10759,20 @@ class Gate:
             self.yield_to_fleet()
         return (why or self.shed(self.saturated()) or self.load_capped() or self.memory_capped() or self.full() or self.shed(self.hot()) or self.stalled()
                 or self.locked() or self.low_disk() or self.suite_first() or self.ineligible() or self.off_tailnet())
+
+    def host_claim(self) -> str | None:
+        """host_held for this gate. The trusted signing listener (SIGNER_FIRST) ignores an exclusive hold of the host
+        lock until it has lasted SIGNER_LOCK_SETTLE_S: a probe's seconds do not take the signer offline."""
+        scope = runner_scope(self.runner_dir)
+        why = host_held(self.host_lock, self.reservation, time.time(), self.state_dir, nightly_slot=scope.nightly)
+        if why != FLEET_BUILD_HOLDS_HOST or not scope.trusted_signing:
+            self.lock_held_since = None
+            return why
+        now = time.monotonic()
+        if self.lock_held_since is None or now - self.lock_held_seen > SIGNER_LOCK_GAP_S:
+            self.lock_held_since = now
+        self.lock_held_seen = now
+        return why if now - self.lock_held_since >= SIGNER_LOCK_SETTLE_S else None
 
     def exclusive_yield(self) -> str | None:
         """YIELD_TO_EXCLUSIVE at the listener: why a yieldToExclusive dedicated runner takes no job now (a signing
@@ -11233,8 +11349,7 @@ class Gate:
         if runner_scope(self.runner_dir).dedicated:
             return self.claimed()
         self.cap_sample(time.monotonic())  # HOST_LOAD_CAP reads load whatever holds the gate now
-        why = host_held(self.host_lock, self.reservation, time.time(), self.state_dir,
-                        nightly_slot=runner_scope(self.runner_dir).nightly)
+        why = self.host_claim()
         if why is None and self.waiting:
             again = self.waiting & self.blocking_waiters()
             self.waiting, self.waiting_at = again, time.monotonic()
@@ -11277,8 +11392,9 @@ class Gate:
         running Worker's exit. Job admission keeps its existing measured disk-growth checks and disk-low ledger. Disk
         observations never arm JOB_END_FREEZE.
 
-        No floor holds the listener (DISK_RECLAIM_NOW); only a full disk does, free under RUNNER_JOBS_FLOOR_GIB where
-        no job fits (DISK_FULL_NO_LISTEN, the one reason this returns). An idle pool runner short of one job's measured peak
+        No floor holds the listener (DISK_RECLAIM_NOW); only a full disk does, free under the hard floor plus one runner
+        job's p95 (full_disk_gib, the build fleet's own disk pause: FLEET_PAUSE_FULL) where no job fits
+        (DISK_FULL_NO_LISTEN, the one reason this returns). An idle pool runner short of one job's measured peak
         (job_disk_gib, DISK_SHORT_RECLAIM), whatever the floor, or of the jobs in flight's disk (RUNNER_JOBS_DISK)
         starts reclaim at once aimed at what it lacks, and records it (disk_short), so its listener's next start waits
         at most DISK_RECLAIM_WAIT_S for room (disk_room_wait) and then listens whatever that freed. These readings used
@@ -11324,9 +11440,10 @@ class Gate:
             # until reclaim or the running jobs' ends free it. Leo: "A busy machine makes things slower, never makes
             # them fail." 2026-11-18 19:46-19:55Z: cmux18's listeners took jobs at 8.5 GiB free beside five running,
             # which wrote it down to 1.8 GiB while the lent fleet worker beside them sat at claim_paused disk.
-            # Full is under the hard floor and under this runner's own job peak (a small runner's 8 GiB: its jobs are
-            # measured to fit under the hard floor). An unreadable reading holds nothing (free_or_none: None).
-            full_gib = min(RUNNER_JOBS_FLOOR_GIB, peak)
+            # Full is under the hard floor plus one runner job's measured p95 (full_disk_gib, FLEET_PAUSE_FULL: the
+            # build fleet's own disk pause beside it) and under this runner's own job peak (a small runner's 8 GiB:
+            # its jobs are measured to fit under the hard floor). An unreadable reading holds nothing (free_or_none).
+            full_gib = min(full_disk_gib(), peak)
             if (free := free_or_none(path)) is not None and free < full_gib:
                 self.disk_short = None
                 self.evict_in_background(path, max(floor, peak, aim))

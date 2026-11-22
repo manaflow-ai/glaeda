@@ -98,7 +98,10 @@ def scan(root: Path) -> list[str]:
             continue
         if not all(word in text for word in ("gh", "auth", "token")):
             continue
-        is_python = path.suffix == ".py" or text.startswith("#!") and "python" in text.partition("\n")[0]
+        first, _, rest = text.partition("\n")
+        # a /bin/sh first line that execs python on the second (glaeda-gh's launcher) is a Python file too
+        is_python = (path.suffix == ".py" or text.startswith("#!") and "python" in first
+                     or first == "#!/bin/sh" and rest.startswith('"""exec" python'))
         rel = path.relative_to(root)
         hits = python_hits(rel, text) if is_python else shell_hits(rel, text)
         findings.extend(f"{path.relative_to(root)}:{line}: {why}" for line, why in hits)

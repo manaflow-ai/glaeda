@@ -1588,6 +1588,114 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(checks["secrets"], {"state": "ok", "detail": "none readable by builder", "fix": "", "group": ""})
         self.assertEqual(list(checks)[-1], "secrets")
 
+    # POOL_USER (cmuxterm-hq#18007): PR pool runners run as runner.poolUser, so its reads decide the verdict.
+    POOL = "cmux-pr-runner"
+
+    def pool_text(self, *entries: str, done: str | None = POOL, home: str = "/Users/cmux-pr-runner",
+                  **kwargs: object) -> str:
+        lines = [f"pf_pool_user\t{self.POOL}", f"pf_pool_home\t{home}"]
+        lines += [f"pf_pool_secret\t{e}" for e in entries]
+        if done:
+            lines.append(f"pf_pool_secret_done\t{done}")
+        return preflight_text(**kwargs) + "pf_home\t/Users/builder\n" + "\n".join(lines) + "\n"
+
+    def set_pool(self) -> None:
+        self.manifest["hosts"]["build-mini-1"].setdefault("overrides", {})["runner"] = {"poolUser": self.POOL}
+
+    def test_pool_probe_lines_parse(self) -> None:
+        text = self.pool_text("/Users/builder/.ssh/id_ed25519|eacces", "/Users/Shared/a|b.token|readable",
+                              "/Users/builder/.netrc|errno-ENOENT")
+        pf = mf.parse_probe(text)["preflight"]
+        self.assertEqual(pf["pool_user"], self.POOL)
+        self.assertEqual(pf["pool_home"], "/Users/cmux-pr-runner")
+        self.assertEqual(pf["pool_secrets"], [{"path": "/Users/builder/.ssh/id_ed25519", "state": "eacces"},
+                                              {"path": "/Users/Shared/a|b.token", "state": "readable"},
+                                              {"path": "/Users/builder/.netrc", "state": "errno-ENOENT"}])
+        self.assertEqual(pf["pool_secrets_done"], self.POOL)
+        plain = mf.parse_probe(preflight_text())["preflight"]
+        self.assertEqual((plain["pool_user"], plain["pool_secrets"], plain["pool_secrets_done"]), (None, [], None))
+
+    def test_preflight_script_passes_the_pool_user(self) -> None:
+        self.assertIn(b"POOL_USER=''\n", mf.preflight_script(self.manifest, "build-mini-1"))
+        self.set_pool()
+        self.assertIn(b"POOL_USER=cmux-pr-runner\n", mf.preflight_script(self.manifest, "build-mini-1"))
+        for bad in ("root", "Has Space", 3, "x;rm"):
+            self.manifest["hosts"]["build-mini-1"]["overrides"]["runner"]["poolUser"] = bad
+            self.assertIn(b"POOL_USER=''\n", mf.preflight_script(self.manifest, "build-mini-1"))
+
+    def test_pool_user_getting_eacces_everywhere_is_ok(self) -> None:
+        self.set_pool()
+        key = "/Users/builder/.ssh/id_ed25519"
+        # No login runners: the login user's own read is only shown.
+        result = self.result(self.pool_text(f"{key}|eacces", "/Users/Shared/cmux-build-fleet/secrets/r2.token|eacces",
+                                            secrets=(), runners=()))
+        self.assertEqual(result["checks"]["secrets"], {
+            "state": "ok", "detail": f"none readable by {self.POOL}, the user PR jobs run as (2 files give it EACCES)",
+            "fix": "", "group": ""})
+        self.assertTrue(result["ready"], result)
+
+    def test_a_file_the_pool_user_can_open_fails(self) -> None:
+        self.set_pool()
+        key, token = "/Users/builder/.ssh/id_ed25519", "/Users/cmux-pr-runner/.secrets/gh.token"
+        result = self.result(self.pool_text(f"{key}|eacces", f"{token}|readable", runners=()))
+        check = result["checks"]["secrets"]
+        self.assertEqual((check["state"], check["group"]), ("fail", "person"))
+        self.assertEqual(check["detail"], f"readable by {self.POOL}, the user PR jobs run as: {token}")
+        self.assertIn("cmuxterm-hq#18007", check["fix"])
+        self.assertIn("EACCES", check["fix"])
+        self.assertFalse(result["ready"])
+
+    def test_an_errno_other_than_eacces_fails(self) -> None:
+        self.set_pool()
+        key = "/Users/builder/.ssh/id_ed25519"
+        check = self.result(self.pool_text(f"{key}|errno-ENOENT", runners=()))["checks"]["secrets"]
+        self.assertEqual(check["state"], "fail")
+        self.assertEqual(check["detail"], f"readable by {self.POOL}, the user PR jobs run as: {key} (errno-ENOENT)")
+
+    def test_an_incomplete_pool_read_is_unknown_and_blocks(self) -> None:
+        self.set_pool()
+        for text in (self.pool_text("/Users/builder/.netrc|eacces", done=None, runners=()),
+                     self.pool_text(done="builder", runners=()), preflight_text(runners=())):
+            result = self.result(text)
+            check = result["checks"]["secrets"]
+            self.assertEqual((check["state"], check["group"]), ("unknown", "person"))
+            self.assertEqual(check["detail"],
+                             f"could not read the secret files as {self.POOL} (sudo -n -u {self.POOL} failed?)")
+            self.assertIn("cmuxterm-hq#18007", check["fix"])
+            self.assertFalse(result["ready"], result)
+        self.assertIn("secrets", mf.UNKNOWN_BLOCKS)
+
+    def test_accepted_secrets_cover_the_pool_users_home(self) -> None:
+        self.set_pool()
+        own, shared = "/Users/cmux-pr-runner/.config/gh/hosts.yml", "/Users/Shared/x.token"
+        self.manifest["hosts"]["build-mini-1"]["accepted_secrets"] = ["~/.config/gh/hosts.yml", shared]
+        result = self.result(self.pool_text(f"{own}|readable", f"{shared}|readable", runners=()))
+        check = result["checks"]["secrets"]
+        self.assertEqual(check["state"], "info")
+        self.assertEqual(check["detail"], f"none readable by {self.POOL}, the user PR jobs run as (0 files give it "
+                                          f"EACCES); accepted: {own}, {shared}")
+        self.assertTrue(result["ready"], result)
+
+    def test_login_user_secrets_with_a_pool_user(self) -> None:
+        self.set_pool()
+        key = "/Users/builder/.ssh/id_ed25519"
+        # The login user runs no runners: its own reads are information.
+        check = self.result(self.pool_text(f"{key}|eacces", secrets=(key,), runners=()))["checks"]["secrets"]
+        self.assertEqual(check["state"], "info")
+        self.assertEqual(check["detail"], f"none readable by {self.POOL}, the user PR jobs run as (1 files give it "
+                                          f"EACCES); readable by builder, which runs no PR runners (poolUser "
+                                          f"{self.POOL}): {key}")
+        # The login user still has a runner registered: as today, its reads fail.
+        check = self.result(self.pool_text(f"{key}|eacces", secrets=(key,)))["checks"]["secrets"]
+        self.assertEqual((check["state"], check["group"]), ("fail", "person"))
+        self.assertEqual(check["detail"], f"readable by builder, the user PR jobs run as: {key}")
+        self.assertIn("cmuxterm-hq#595", check["fix"])
+
+    def test_without_a_pool_user_the_pool_lines_change_nothing(self) -> None:
+        key = "/Users/builder/.ssh/id_ed25519"
+        check = self.result(self.pool_text(f"{key}|readable", secrets=(key,)))["checks"]["secrets"]
+        self.assertEqual(check["detail"], f"readable by builder, the user PR jobs run as: {key}")
+
     def test_node_id_is_required_before_enrollment(self) -> None:
         checks = self.result(preflight_text(enroll_state=None, acceptance=None, node_id=None), host="small-mini")["checks"]
         self.assertEqual(checks["node"]["state"], "fail")
@@ -2065,6 +2173,12 @@ class PreflightScriptTests(unittest.TestCase):
                 if line.strip() and not line.strip().startswith("#")]
         # The update check reports the softwareupdate command line, not the sudo wrapper around it.
         body = [line.replace("grep -v '^[0-9]* sudo '", "") for line in body if not line.startswith("applying='")]
+        # The poolUser read (cmuxterm-hq#18007) is the one escalation: sudo -n (never a prompt) down to a
+        # non-admin account, running a read-only Python that opens and closes files.
+        pool = [line for line in body if "sudo" in line]
+        self.assertEqual(pool, ["(cd / && printf '%s\\0' \"${login_secrets[@]}\" | sudo -n -u \"$POOL_USER\" -H "
+                                "/usr/bin/python3 -I -c '"])
+        body = [line for line in body if line not in pool]
         for word in ("sudo", "rm ", "mv ", "cp ", "brew ", "install", "downloadComponent", "curl", "> ", ">>"):
             self.assertFalse([line for line in body if word in line.replace("2>", "").replace(">/dev/null", "")],
                              word)
@@ -2176,6 +2290,47 @@ class PreflightSecretsScriptTests(unittest.TestCase):
         self.assertNotIn(f"{tmp}/.config/gh/hosts.yml", later)
         self.assertNotIn(f"{tmp}/.docker/config.json", later)
         self.assertNotIn("sekrit", out + again)
+
+    @unittest.skipIf(os.geteuid() == 0, "root opens a mode-0 file")
+    def test_reads_as_the_pool_user_through_sudo(self) -> None:
+        # cmuxterm-hq#18007. A fake sudo runs the read as this user, with the pool home as HOME (what -H gives).
+        with tempfile.TemporaryDirectory() as tmp:
+            login, pool, bin_dir = Path(tmp) / "login", Path(tmp) / "pool", Path(tmp) / "bin"
+            for rel, text in ((login / ".secrets/open.env", "sekrit-open\n"), (login / ".secrets/locked.env", "sekrit-locked\n"),
+                              (pool / ".secrets/own.token", "sekrit-own\n"), (pool / ".ssh/id_rsa.pub", "ssh-rsa AAAA\n"),
+                              (pool / ".config/glaeda/.hidden.key", "sekrit-key\n"), (pool / ".netrc", "")):
+                rel.parent.mkdir(parents=True, exist_ok=True)
+                rel.write_text(text)
+            bin_dir.mkdir()
+            calls = Path(tmp) / "calls"
+            (bin_dir / "fake-sudo").write_text(
+                f"#!/bin/bash\necho \"$*\" >> {calls}\n[ \"$1 $2 $3 $4\" = '-n -u cmux-pr-runner -H' ] || exit 1\n"
+                f"shift 4\nexec env HOME={pool} \"$@\"\n")
+            (bin_dir / "fake-sudo").chmod(0o755)
+            header = ("CMUX_ROOT='~/cmux'\nXCODE_PIN=''\nWORKLOAD_PATH=/usr/bin\nWORKLOAD_TOOLS=''\nPYTHONS=''\n"
+                      "CANDIDATE_PIN=''\nENROLL_FLAGS=''\nPIN_FORMULAS=''\nPOOL_USER=cmux-pr-runner\n")
+            body = mf.PREFLIGHT_PROBE.read_text()
+            self.assertEqual(body.count("| sudo -n -u"), 1)
+            body = body.replace("| sudo -n -u", f"| {bin_dir}/fake-sudo -n -u")
+            # The login user reads locked.env during its walk; the pool user does not, by the time it looks.
+            body = body.replace('  login_secrets+=("$f")\n',
+                                f'  login_secrets+=("$f")\n  case "$f" in */locked.env) chmod 000 "$f" ;; esac\n')
+            script = mf.PROBE.read_text() + "\n" + header + body
+            run = subprocess.run(["bash", "-s"], input=script, capture_output=True, text=True,
+                                 env={"HOME": os.fspath(login), "PATH": "/usr/bin:/bin"}, timeout=60)
+            (login / ".secrets/locked.env").chmod(0o600)
+            pf = mf.parse_probe(run.stdout)["preflight"]
+            ran = calls.read_text() if calls.exists() else ""
+        if not ran:
+            self.skipTest("no developer directory: the probe skips /usr/bin/python3")
+        self.assertEqual(pf["pool_user"], "cmux-pr-runner")
+        self.assertEqual(pf["pool_home"], os.fspath(pool))
+        import pwd
+        self.assertEqual(pf["pool_secrets_done"], pwd.getpwuid(os.geteuid()).pw_name)
+        self.assertEqual(sorted((e["path"], e["state"]) for e in pf["pool_secrets"] if e["path"].startswith(tmp)), sorted([
+            (f"{login}/.secrets/open.env", "readable"), (f"{login}/.secrets/locked.env", "eacces"),
+            (f"{pool}/.secrets/own.token", "readable"), (f"{pool}/.config/glaeda/.hidden.key", "readable")]))
+        self.assertNotIn("sekrit", run.stdout)
 
 
 def morning_text() -> str:

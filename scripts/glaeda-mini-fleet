@@ -272,6 +272,7 @@ SSH_USER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,31}\Z")
 SSH_IDENTITY_RE = re.compile(r"(?:~|/)[A-Za-z0-9._+/@-]*\Z")
 LIST_KEYS = {"xcode_app", "xcode_ready", "disk", "launchd", "fleet_mtime", "ak_file", "ak_key",
              "pf_tool", "pf_submodule", "pf_pmset", "pf_runner", "pf_brew_formula", "pf_secret",
+             "pf_pool_secret",
              "ios_runtime", "ios_device", "fleet_cas_path", "fleet_cas_stat", "host_lock_owner"}
 # Same rule as scripts/cmux_fleet.py NODE_RE: an opaque cmux-* fleet node id.
 NODE_ID_RE = re.compile(r"cmux-[a-z0-9][a-z0-9-]{2,59}\Z")
@@ -1018,6 +1019,14 @@ def parse_preflight(out: dict[str, Any]) -> dict[str, Any]:
         # Paths of secret files the login user can read (never their contents); an older probe sends none.
         "secrets": out["pf_secret"],
         "home": out.get("pf_home") or None,
+        # POOL_USER (cmuxterm-hq#18007): the same paths opened as the member's poolUser, plus its own home's
+        # secrets it can open; state is eacces, readable or errno-<NAME>. pool_secrets_done is the user the read
+        # completed as (None: sudo refused or an older probe, so nothing is known).
+        "pool_user": out.get("pf_pool_user") or None,
+        "pool_home": out.get("pf_pool_home") or None,
+        "pool_secrets": [{"path": path, "state": state} for path, _, state in
+                         (v.rpartition("|") for v in out["pf_pool_secret"])],
+        "pool_secrets_done": out.get("pf_pool_secret_done") or None,
     }
 
 
@@ -2308,7 +2317,9 @@ PREFLIGHT_CHECKS = ("os", "xcode", "select", "licence", "launch", "metal", "simu
                     "gh", "git", "cmux", "setup", "glaeda", "headless_sudo", "power", "disk", "update", "autoupdate", "candidate", "node", "enroll", "runner",
                     "brew", "pins", "secrets")
 # An unknown here means the bootstrap would refuse or cannot be predicted, so it blocks like a failure.
-UNKNOWN_BLOCKS = frozenset({"xcode", "select", "licence", "launch", "metal", "zig", "headless_sudo", "power", "disk"})
+# secrets is unknown only when a declared poolUser could not be read as (cmuxterm-hq#18007).
+UNKNOWN_BLOCKS = frozenset({"xcode", "select", "licence", "launch", "metal", "zig", "headless_sudo", "power", "disk",
+                            "secrets"})
 # Who can apply a fix: the SSH login user alone, the login user with an admin password, or a person.
 FIX_GROUPS = ("self", "password", "person")
 # Preflight checks `check` reports as toolchain drift; the checkout ones only on hosts with a node id.
@@ -2335,6 +2346,13 @@ def xcode_pin(manifest: dict[str, Any], name: str) -> str | None:
     return apps[0]["path"] if apps else None
 
 
+def pool_user(manifest: dict[str, Any], name: str) -> str:
+    """The member's hosts.<name>.overrides.runner.poolUser, the account its PR pool runners run as, or "" (none, or
+    one glaeda_fleet_labels refuses: then the login user is the one PR jobs run as, and the check reads as it)."""
+    user, why = labels.member_pool_user(manifest, name)
+    return user if user and not why else ""
+
+
 def preflight_script(manifest: dict[str, Any], name: str) -> bytes:
     import shlex
     home = "~/.local/bin/"
@@ -2349,6 +2367,7 @@ def preflight_script(manifest: dict[str, Any], name: str) -> bytes:
         "ENROLL_FLAGS": " ".join(ENROLL_FLAGS),
         "PIN_FORMULAS": " ".join(BREW_FORMULAS),
         "GIT_SOURCE": git_source(manifest, name),
+        "POOL_USER": pool_user(manifest, name),
     }
     header = "".join(f"{k}={shlex.quote(v)}\n" for k, v in inputs.items())
     return PROBE.read_bytes() + b"\n" + header.encode() + PREFLIGHT_PROBE.read_bytes()
@@ -2369,6 +2388,54 @@ def operator_zig_minimum() -> str | None:
 def operator_candidate_source() -> str:
     """The pinned candidate's source commit, which the probe looks for on the host, or empty."""
     return operator_candidate().get("source", "")
+
+
+def pool_secrets_check(put: Any, pf: dict[str, Any], pool: str, user: str, host: dict[str, Any], login_home: str,
+                       login_unaccepted: list[str], login_known: list[str], login_runners: bool) -> None:
+    """The secrets check for a member whose PR pool runners run as runner.poolUser (cmuxterm-hq#18007).
+
+    What a PR job can read is what that account can open: each secret path the login user reads, opened as the
+    pool user, must give EACCES, and its own home must hold none. The login user's own readable secrets fail
+    only while the login user runs runners too."""
+    fix = (f"make them unreadable to {pool} (root-only, or under a home {pool} cannot enter): this passes only when "
+           f"that account gets EACCES (cmuxterm-hq#18007); or accept the risk in the manifest's "
+           "hosts.<host>.accepted_secrets")
+    login_fix = ("make them root-only or move them to a host with no PR runners (cmuxterm-hq#595), or accept the "
+                 "risk in the manifest's hosts.<host>.accepted_secrets")
+    if pf.get("pool_secrets_done") != pool:
+        put("secrets", "unknown", f"could not read the secret files as {pool} (sudo -n -u {pool} failed?)",
+            f"give {user} passwordless sudo to {pool} (sudo -n -u {pool} /usr/bin/python3) and check the account "
+            "exists, then rerun preflight (cmuxterm-hq#18007)", "person")
+        return
+    pool_home = pf.get("pool_home") or f"/Users/{pool}"
+    allowed = set()
+    for p in host.get("accepted_secrets", []):
+        allowed |= {login_home + p[1:], pool_home + p[1:]} if p.startswith("~/") else {p}
+    entries = pf.get("pool_secrets") or []
+    denied = sum(1 for e in entries if e["state"] == "eacces")
+    exposed = [e for e in entries if e["state"] != "eacces" and e["path"] not in allowed]
+    known = list(dict.fromkeys(login_known + [e["path"] for e in entries
+                                              if e["state"] != "eacces" and e["path"] in allowed]))
+    failures = []
+    if exposed:
+        failures.append(f"readable by {pool}, the user PR jobs run as: "
+                        + ", ".join(e["path"] if e["state"] == "readable" else f"{e['path']} ({e['state']})"
+                                    for e in exposed))
+    if login_unaccepted and login_runners:
+        failures.append(f"readable by {user}, the user PR jobs run as: {', '.join(login_unaccepted)}")
+    if failures:
+        put("secrets", "fail", "; ".join(failures), fix if exposed else login_fix, "person")
+        return
+    ok = f"none readable by {pool}, the user PR jobs run as ({denied} files give it EACCES)"
+    notes = []
+    if login_unaccepted:
+        notes.append(f"readable by {user}, which runs no PR runners (poolUser {pool}): {', '.join(login_unaccepted)}")
+    if known:
+        notes.append(f"accepted: {', '.join(known)}")
+    if notes:
+        put("secrets", "info", "; ".join([ok, *notes]))
+    else:
+        put("secrets", "ok", ok)
 
 
 def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
@@ -2826,7 +2893,10 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
     unaccepted = [p for p in secrets if p not in allowed]
     known = [p for p in secrets if p in allowed]
     runner_host = bool(runners) or "ci-runner" in (host.get("roles") or [])
-    if unaccepted and runner_host:
+    pool = pool_user(manifest, name)
+    if pool:
+        pool_secrets_check(put, pf, pool, user, host, login_home, unaccepted, known, bool(runners))
+    elif unaccepted and runner_host:
         put("secrets", "fail", f"readable by {user}, the user PR jobs run as: {', '.join(unaccepted)}",
             "make them root-only or move them to a host with no PR runners (cmuxterm-hq#595), or accept the "
             "risk in the manifest's hosts.<host>.accepted_secrets", "person")

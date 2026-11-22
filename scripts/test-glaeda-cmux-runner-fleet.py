@@ -55,6 +55,10 @@ if host in os.environ.get("FAKE_DOWN", "").split(","):
 if remote.startswith("head -c") and ".glaeda-source.json" in remote:
     stamps = json.loads(os.environ.get("FAKE_STAMPS", "{{}}"))
     print(stamps[host] if host in stamps else "@no-stamp"); sys.exit(0)
+if remote.startswith("/usr/bin/python3 - ") and "pool-node" in remote:  # POOL_USER: publish_node_view
+    if host in os.environ.get("FAKE_PUBLISH_FAILS", "").split(","):
+        sys.stderr.write("refusing: not a link this step made\\n"); sys.exit(1)
+    print("published /Users/Shared/cmux-build-fleet/pool-node.d/1-2 generation abcdef012345"); sys.exit(0)
 if " disk-shape " in remote:
     shapes = json.loads(os.environ.get("FAKE_DISK_SHAPE", "{{}}"))
     if host in shapes:
@@ -64,11 +68,12 @@ if " check " in remote:
     if host in os.environ.get("FAKE_ELIGIBLE", "").split(","):
         print("glaeda-cmux-runner-hook: eligible"); sys.exit(0)
     print("glaeda-cmux-runner-hook: refused: node not eligible (no Glaeda enrollment on this mini)"); sys.exit(1)
-if "actions-runner-glaeda*" in remote:  # POOL_RECEIPTS: FAKE_RECEIPTS seeds host=k:k:..., uninstalls remove
-    path = log + ".receipts." + host
+owner = host if not user else user + "@" + host  # each account's own receipts (POOL_USER)
+if "actions-runner-glaeda*" in remote:  # POOL_RECEIPTS: FAKE_RECEIPTS seeds [user@]host=k:k:..., uninstalls remove
+    path = log + ".receipts." + owner
     if not os.path.exists(path):
         seeds = dict(x.split("=") for x in os.environ.get("FAKE_RECEIPTS", "").split(",") if x)
-        open(path, "w").write(json.dumps([int(k) for k in seeds.get(host, "").split(":") if k]))
+        open(path, "w").write(json.dumps([int(k) for k in seeds.get(owner, "").split(":") if k]))
     for k in json.load(open(path)):
         print("receipt " + ("receipt.json" if k == 0 else "instance-%d/receipt.json" % k))
         print("dir actions-runner-glaeda" + ("" if k == 0 else "-%d" % k))
@@ -79,7 +84,7 @@ if "--uninstall --apply" in remote:
         print(json.dumps({{"actions": [{{"kind": "deregister", "state": "failed",
                                         "note": "the runner has a job (or a listener runs); nothing removed, re-run when idle"}}]}}))
         sys.exit(1)
-    path = log + ".receipts." + host
+    path = log + ".receipts." + owner
     if os.path.exists(path):
         kept = [x for x in json.load(open(path)) if x != k]
         open(path, "w").write(json.dumps(kept))
@@ -495,6 +500,122 @@ class FleetTest(unittest.TestCase):
         self.assertEqual([i for i in row["instances"] if i.get("dedicated") == "nightly-next"][0]["exit"], 0)
         self.assertFalse([c for c in self.calls() if c["tool"] == "ssh" and "--dedicated hq-two-mac-a" in c["remote"]])
         self.assertEqual(row["action"], "failed")
+
+    def pool_user_manifest(self, prefix: str | None = None) -> None:
+        manifest = json.loads(json.dumps(MANIFEST))
+        runner = {"poolUser": "cmux-pr-runner", **({"poolPrefix": prefix} if prefix else {})}
+        manifest["hosts"]["mini-a"].update(ssh_user="ec2-user", gui=False, overrides={"runner": runner})
+        self.manifest.write_text(json.dumps(manifest))
+
+    def test_a_pool_user_member_runs_every_pool_step_as_that_account(self) -> None:
+        """POOL_USER (cmuxterm-hq#18007): a member's runner.poolUser runs its pool runners in that non-admin account.
+        The plan's gate runs as it, reading the node view; the apply publishes that view as the member user first,
+        stages the scripts in both homes, installs every instance over ssh -l poolUser on the workload PATH without
+        --headless (no sudo there), and then retires the pool instance the member user still had, while idle."""
+        self.pool_user_manifest()
+        plan = self.fleet("--hosts", "mini-a")
+        self.assertEqual(plan.returncode, 0, plan.stdout + plan.stderr)
+        row = json.loads(plan.stdout)["members"][0]
+        self.assertEqual(row["poolUser"], "cmux-pr-runner")
+        checks = [c for c in self.calls() if c["tool"] == "ssh" and " check " in c["remote"]]
+        self.assertEqual([c["user"] for c in checks], ["cmux-pr-runner"])
+        self.assertIn("GLAEDA_NODE_VIEW=/Users/Shared/cmux-build-fleet/pool-node ", checks[0]["remote"])
+        self.assertFalse([c for c in self.calls() if "pool-node" in c.get("remote", "") and " check " not in c["remote"]],
+                         "a plan publishes nothing")
+        self.log.unlink()
+        result = self.fleet("--apply", "--hosts", "mini-a", FAKE_RECEIPTS="mini-a=0")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        row = json.loads(result.stdout)["members"][0]
+        calls = [c for c in self.calls() if c["tool"] == "ssh"]
+        publish = [i for i, c in enumerate(calls) if c["remote"].startswith("/usr/bin/python3 - ")]
+        self.assertEqual(len(publish), 1)
+        self.assertIsNone(calls[publish[0]]["user"], "published as the member user")
+        self.assertIn("m4pro-48 cmux-pr-runner /Users/Shared/cmux-build-fleet/pool-node", calls[publish[0]]["remote"])
+        first_check = next(i for i, c in enumerate(calls) if " check " in c["remote"])
+        self.assertLess(publish[0], first_check, "the view exists before its gate is asked")
+        applies = [c for c in calls if "--apply --token-stdin" in c["remote"] and "--uninstall" not in c["remote"]]
+        self.assertEqual(len(applies), row["runners"])
+        for call in applies:
+            self.assertEqual(call["user"], "cmux-pr-runner")
+            self.assertTrue(call["remote"].startswith(
+                "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin ~/glaeda-runner/scripts/"))
+            self.assertNotIn("--headless", call["remote"])
+        self.assertTrue([c for c in calls if c["user"] == "cmux-pr-runner" and "mkdir -p ~/glaeda-runner" in c["remote"]])
+        self.assertTrue([c for c in calls if c["user"] is None and "mkdir -p ~/glaeda-runner" in c["remote"]])
+        scps = [c["argv"][-1] for c in self.calls() if c["tool"] == "scp"]
+        self.assertIn("cmux-pr-runner@mini-a:glaeda-runner/mini-fleet.json", scps)
+        mine = [i for i in row["instances"] if i.get("instance") is not None and not i.get("ownAccount")]
+        self.assertTrue(mine and all(i.get("user") == "cmux-pr-runner" and i["exit"] == 0 for i in mine), mine)
+        own = [i for i in row["instances"] if i.get("ownAccount")]
+        self.assertEqual([(i["instance"], i["exit"], i["state"]) for i in own], [(0, 0, "retired")])
+        uninstalls = [c for c in calls if "--uninstall --apply" in c["remote"]]
+        self.assertEqual([c["user"] for c in uninstalls], [None], "the old instance is the member user's")
+        self.assertEqual(row["action"], "applied")
+
+    def test_a_pool_user_works_with_and_without_a_pool_prefix(self) -> None:
+        """POOL_USER needs no namespace: a default-namespace member (the plain side-std label) and an aws- one both
+        plan and run their gate as the pool account."""
+        for prefix in (None, "aws-"):
+            with self.subTest(prefix=prefix):
+                self.log.unlink(missing_ok=True)
+                self.pool_user_manifest(prefix)
+                plan = self.fleet("--hosts", "mini-a")
+                self.assertEqual(plan.returncode, 0, plan.stdout + plan.stderr)
+                row = json.loads(plan.stdout)["members"][0]
+                self.assertEqual((row["poolUser"], row["action"]), ("cmux-pr-runner", "would apply"))
+                summary, why = load_labels_module().member_labels(json.loads(self.manifest.read_text()), "mini-a",
+                                                                  lambda app: True)
+                self.assertIsNone(why)
+                side = "glaeda-" + (prefix or "") + "side-std-xcode-26.6"
+                self.assertIn(side, summary["sidePools"])
+
+    def test_a_pool_user_without_ssh_access_or_a_view_fails_typed_and_installs_nothing(self) -> None:
+        """POOL_USER: no operator key in the account yet leaves its gate unreachable, so nothing is installed, and a
+        node view that cannot be published fails the member before its gate is asked."""
+        self.pool_user_manifest()
+        denied = self.fleet("--apply", "--hosts", "mini-a", FAKE_USER_DENIED="cmux-pr-runner",
+                            FAKE_ELIGIBLE="mini-a")
+        row = json.loads(denied.stdout)["members"][0]
+        self.assertFalse([c for c in self.calls() if "--apply --token-stdin" in c.get("remote", "")])
+        self.assertNotEqual(row["action"], "applied")
+        self.log.unlink()
+        failed = self.fleet("--apply", "--hosts", "mini-a", FAKE_PUBLISH_FAILS="mini-a")
+        row = json.loads(failed.stdout)["members"][0]
+        self.assertTrue(row["action"].startswith("node view failed:"), row)
+        self.assertFalse([c for c in self.calls() if " check " in c.get("remote", "")])
+
+    def test_pool_user_refusals_in_the_manifest(self) -> None:
+        """POOL_USER: member-level, never root, never the ssh_user or a dedicated entry's user, never dedicatedOnly."""
+        labels = load_labels_module()
+        base = json.loads(json.dumps(MANIFEST))
+        base["hosts"]["mini-a"]["ssh_user"] = "ec2-user"
+        trusted = {"name": "hq-a", "repo": "manaflow-ai/other", "trustedRef": "refs/heads/main",
+                   "trustedRepo": "manaflow-ai/other", "labels": ["glaeda-hq-a"], "admit": ["/usr/bin/true"],
+                   "user": "cmux-pr-runner"}
+        cases = {
+            "root": ({"poolUser": "root"}, "never root"),
+            "upper": ({"poolUser": "Bad User"}, "macOS short name"),
+            "ssh_user": ({"poolUser": "ec2-user"}, "own ssh_user"),
+            "dedicated": ({"poolUser": "cmux-pr-runner", "dedicated": [trusted]}, "trusted code only"),
+            "dedicatedOnly": ({"poolUser": "cmux-pr-runner", "dedicatedOnly": True,
+                               "dedicated": [{**trusted, "user": "other-acct"}]}, "dedicatedOnly"),
+        }
+        for name, (runner, why) in cases.items():
+            with self.subTest(name):
+                manifest = json.loads(json.dumps(base))
+                manifest["hosts"]["mini-a"]["overrides"] = {"runner": runner}
+                summary, got = labels.member_labels(manifest, "mini-a", lambda app: True)
+                self.assertIsNone(summary)
+                self.assertIn(why, got)
+        manifest = json.loads(json.dumps(base))
+        manifest["defaults"]["runner"] = {"poolUser": "cmux-pr-runner"}
+        summary, got = labels.member_labels(manifest, "mini-a", lambda app: True)
+        self.assertIsNone(summary)
+        self.assertIn("member-level", got)
+        manifest = json.loads(json.dumps(base))
+        summary, got = labels.member_labels(manifest, "mini-a", lambda app: True)
+        self.assertIsNone(got)
+        self.assertIsNone(summary["poolUser"], "no poolUser: the pool runs as the member user, as before")
 
     def test_a_repo_dedicated_only_member_needs_no_org_group_but_every_other_member_does(self) -> None:
         """REPO_DEDICATED_ONLY: a dedicatedOnly member whose only runners are repository-scoped dedicated ones

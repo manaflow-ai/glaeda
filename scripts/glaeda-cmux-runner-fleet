@@ -227,8 +227,8 @@ def check(member: str, summary: dict[str, Any]) -> tuple[bool | None, str]:
     argv = ["python3", "-", "check", "--fleet-class", summary["hardware"]]
     if summary.get("xcodeApps"):
         argv += ["--toolchain-xcode", summary["xcodeApps"][0]]
-    remote = f"PATH={WORKLOAD_PATH} /usr/bin/" + " ".join(_quote(a) for a in argv)
-    code, out, err = run(["ssh", *SSH_OPTIONS, member, remote], CHECK_TIMEOUT_S,
+    remote = f"PATH={WORKLOAD_PATH} {node_view_env(summary)}/usr/bin/" + " ".join(_quote(a) for a in argv)
+    code, out, err = run([*pool_ssh(member, summary.get("poolUser") or ""), remote], CHECK_TIMEOUT_S,
                          stdin=(SCRIPT_DIR / "glaeda-cmux-runner-hook").read_text())
     line = (out.strip().splitlines() or [err.strip() or f"ssh exited {code}"])[-1]
     if code not in (0, 1) or not line.startswith("glaeda-cmux-runner-hook: "):
@@ -241,7 +241,7 @@ def disk_shape(member: str, summary: dict[str, Any]) -> tuple[dict[str, Any] | N
     answer, "") or (None, why)."""
     floor = summary.get("minFreeGib") or 0
     remote = f"PATH={WORKLOAD_PATH} /usr/bin/python3 - disk-shape --min-free-gib {_quote(f'{floor:g}')}"
-    code, out, err = run(["ssh", *SSH_OPTIONS, member, remote], CHECK_TIMEOUT_S,
+    code, out, err = run([*pool_ssh(member, summary.get("poolUser") or ""), remote], CHECK_TIMEOUT_S,
                          stdin=(SCRIPT_DIR / "glaeda-cmux-runner-hook").read_text())
     line = (out.strip().splitlines() or [""])[-1]
     try:
@@ -566,6 +566,42 @@ def ssh_argv(member: str, user: str | None = None) -> list[str]:
     return ["ssh", *SSH_OPTIONS, *(["-l", user] if user else []), member]
 
 
+# POOL_USER (glaeda_fleet_labels, cmuxterm-hq#18007): a member's runner.poolUser is the account its pool runners run as,
+# so every pool step (check, disk-shape, stage, apply, uninstall, retire, the receipt listing) runs over ssh as it;
+# the member user still gets its own stage (promotion-admit, its dedicated runners) and the steps only it can do: the
+# headless preparation (sudo), the node view and the canonical-root link (publish_node_view), and retiring any pool
+# instance it still has itself (an admin account's PR runner must not stay beside the non-admin one).
+_POOL_USERS: dict[str, str] = {}
+_POOL_USERS_LOCK = threading.Lock()
+NODE_VIEW_ENV = "GLAEDA_NODE_VIEW"  # glaeda-cmux-runner-hook NODE_VIEW_ENV
+POOL_NODE_VIEW = "/Users/Shared/cmux-build-fleet/pool-node"  # glaeda-cmux-runner POOL_NODE_VIEW
+
+
+def set_pool_user(member: str, user: str | None) -> None:
+    with _POOL_USERS_LOCK:
+        if user:
+            _POOL_USERS[member] = user
+        else:
+            _POOL_USERS.pop(member, None)
+
+
+def pool_login(member: str) -> str | None:
+    """The account the member's pool runners run as over ssh: its runner.poolUser, or None for its own user."""
+    with _POOL_USERS_LOCK:
+        return _POOL_USERS.get(member)
+
+
+def pool_ssh(member: str, user: str | None = None) -> list[str]:
+    """ssh_argv for a pool step: as `user` when given ("" is the member's own user), else as the member's poolUser."""
+    login = pool_login(member) if user is None else user
+    return ssh_argv(member, login or None)
+
+
+def node_view_env(summary: dict[str, Any]) -> str:
+    """'GLAEDA_NODE_VIEW=... ' for a poolUser member's check (the hook's NODE_VIEW), else ''."""
+    return f"{NODE_VIEW_ENV}={POOL_NODE_VIEW} " if summary.get("poolUser") else ""
+
+
 def scp_target(member: str, path: str, user: str | None = None) -> str:
     return f"{user}@{member}:{path}" if user else f"{member}:{path}"
 
@@ -679,10 +715,11 @@ def _failed_note(out: str, err: str, code: int) -> str:
     return "; ".join(notes)[-200:] or f"exit {code}: {(err or out).strip()[-200:]}"
 
 
-def registered_scope(member: str, instance: int, receipt_only: bool = False) -> tuple[str | None, str | None]:
+def registered_scope(member: str, instance: int, receipt_only: bool = False,
+                     user: str | None = None) -> tuple[str | None, str | None]:
     """(scope the instance is registered to, "" when none; or None and why it could not be read). Read-only:
     the single-mini uninstall plan, which follows the instance's receipt."""
-    code, out, err = run(["ssh", *SSH_OPTIONS, member, _uninstall_cmd(member, instance, False, receipt_only)],
+    code, out, err = run([*pool_ssh(member, user), _uninstall_cmd(member, instance, False, receipt_only)],
                          CHECK_TIMEOUT_S)
     try:
         acts = [a for a in json.loads(out).get("actions", []) if isinstance(a, dict) and a.get("kind") == "deregister"]
@@ -707,7 +744,7 @@ def uninstall_instance(member: str, instance: int, repo: str) -> str | None:
     token = mint(scope_api(repo, None), "remove-token")
     if token is None:
         return f"no remove token for {repo} (gh admin on the repo?)"
-    code, out, err = run(["ssh", *SSH_OPTIONS, member, _uninstall_cmd(member, instance, True)], APPLY_TIMEOUT_S,
+    code, out, err = run([*pool_ssh(member), _uninstall_cmd(member, instance, True)], APPLY_TIMEOUT_S,
                          stdin=token + "\n")
     del token
     return None if code == 0 else f"uninstall failed ({_failed_note(out, err, code)})"
@@ -735,12 +772,12 @@ DEDICATED_LISTING_RE = re.compile(r"receipt instance-dedicated-[a-z][a-z0-9-]{0,
                                   r"|dir actions-runner-glaeda-[a-z][a-z0-9-]{0,39}")
 
 
-def installed_pool_instances(member: str) -> tuple[list[int] | None, str | None]:
+def installed_pool_instances(member: str, user: str | None = None) -> tuple[list[int] | None, str | None]:
     """([instance numbers with a pool receipt], None) or (None, why it could not be read or is not safe). Read-only.
     A dedicated runner (instance-dedicated-NAME, actions-runner-glaeda-NAME) is not a pool instance and never listed. A
     pool runner directory with no receipt (an interrupted install) is unknown state: (None, why), which holds the
     dedicated runners off until an operator removes it (fails closed)."""
-    code, out, err = run(["ssh", *SSH_OPTIONS, member, POOL_RECEIPTS], CHECK_TIMEOUT_S)
+    code, out, err = run([*pool_ssh(member, user), POOL_RECEIPTS], CHECK_TIMEOUT_S)
     if code != 0:
         return None, f"cannot list its runner receipts (exit {code}: {(err or out).strip()[-160:]})"
     lines = [line.strip() for line in out.splitlines() if line.strip()]
@@ -773,18 +810,19 @@ def repo_dedicated_only(member: str, summary: dict[str, Any], manifest: dict[str
     return installed == []
 
 
-def retire_instance(member: str, instance: int, held: str = "dedicated runners held") -> dict[str, Any]:
+def retire_instance(member: str, instance: int, held: str = "dedicated runners held",
+                    user: str | None = None) -> dict[str, Any]:
     """Deregister and remove one pool instance, by its receipt: every pool instance of a dedicatedOnly member, and on
     any other member each instance at or past runners + gatewayRunners (SURPLUS). A runner with a job is never
     stopped: glaeda-cmux-runner's uninstall fails ("the runner has a job") and changes nothing; drain the mini
     (cmux-ci drain) and re-run."""
-    scope, why = registered_scope(member, instance, receipt_only=True)
+    scope, why = registered_scope(member, instance, receipt_only=True, user=user)
     if scope is None:
         return {"instance": instance, "exit": None, "state": f"retire: {why}; nothing changed"}
     token = mint(scope_api(None, scope) if "/" not in scope else scope_api(scope, None), "remove-token") if scope else ""
     if token is None:
         return {"instance": instance, "exit": None, "state": f"retire: no remove token for {scope}; nothing changed"}
-    code, out, err = run(["ssh", *SSH_OPTIONS, member,
+    code, out, err = run([*pool_ssh(member, user),
                           _uninstall_cmd(member, instance, True, receipt_only=True, token=bool(scope))],
                          APPLY_TIMEOUT_S, stdin=token + "\n" if scope else None)
     del token
@@ -793,7 +831,7 @@ def retire_instance(member: str, instance: int, held: str = "dedicated runners h
                 "name": None}
     # Exit 0 is no proof: an uninstall that keeps a directory it does not own (a missing or foreign ownership marker)
     # also exits 0. Retired means the mini lists neither its receipt nor a pool directory without one.
-    left, why = installed_pool_instances(member)
+    left, why = installed_pool_instances(member, user)
     if left is None or instance in left:
         return {"instance": instance, "exit": 1, "name": None,
                 "state": f"retire unconfirmed ({why or 'its receipt is still there'}); {held}"}
@@ -878,7 +916,11 @@ def apply_instance(member: str, instance: int, repo: str | None, extra: list[str
               f"--manifest ~/{REMOTE_DIR}/mini-fleet.json --member {_quote(member)} --instance {instance} "
               f"--latest-runner-version {_quote(version)} --latest-runner-sha256 {_quote(sha)} "
               f"{observed}--output json " + " ".join(_quote(a) for a in extra))
-    code, out, err = run(["ssh", *SSH_OPTIONS, member, remote], APPLY_TIMEOUT_S, stdin=token + "\n")
+    if pool_login(member):
+        # POOL_USER: that account's non-login ssh has only the system PATH; the installer gets the workload one, as the
+        # member's check does (never --headless: a system LaunchDaemon needs sudo, which that account must not have)
+        remote = f"PATH={WORKLOAD_PATH} " + remote.replace(" --headless", "")
+    code, out, err = run([*pool_ssh(member), remote], APPLY_TIMEOUT_S, stdin=token + "\n")
     del token
     try:
         doc = json.loads(out)
@@ -891,7 +933,8 @@ def apply_instance(member: str, instance: int, repo: str | None, extra: list[str
         # A failure before register (staging, launchctl) leaves register/verify
         # as "?": name the step that failed so the operator need not ssh in.
         state = f"{state} ({_failed_note(out, err, code)})"
-    result = {"instance": instance, "exit": code, "state": state, "name": name}
+    result = {"instance": instance, "exit": code, "state": state, "name": name,
+              **({"user": pool_login(member)} if pool_login(member) else {})}
     if deregistered:
         result["deregistered"] = deregistered
         if code != 0:  # the old runner is gone and the new one did not come up: say so loudly
@@ -972,6 +1015,104 @@ def member_scope(args: argparse.Namespace, manifest: dict[str, Any], member: str
     return scope.get("repo"), scope.get("org"), scope.get("group")
 
 
+def publish_node_view(member: str, summary: dict[str, Any]) -> str | None:
+    """POOL_USER: as the member user, publish the node view the pool account's hook reads (NODE_VIEW: its enrollment,
+    its hardware's class receipt, its acceptance and the receipt's Glaeda generation, copied, owned by that user, 0755
+    and 0644, so the pool account reads and never writes them), and point FLEET_DIR/bin/glaeda-canonical-root at the
+    pool account's instance-0 hook shim (the link cmux's restore step calls; the pool account cannot write bin/, which
+    holds the member user's tools). Why it failed, or None."""
+    remote = (f"/usr/bin/python3 - {_quote(summary['hardware'])} {_quote(summary['poolUser'])} "
+              f"{_quote(POOL_NODE_VIEW)}")
+    code, out, err = run([*ssh_argv(member), remote], APPLY_TIMEOUT_S, stdin=NODE_VIEW_PUBLISH)
+    line = (out.strip().splitlines() or [""])[-1]
+    if code == 0 and line.startswith("published "):
+        return None
+    return f"exit {code}: {(err.strip() or line)[-240:]}"
+
+
+# Run by the member user's Apple python3 (stdin; argv: hardware class, pool user, view path). Builds the view in a fresh
+# directory beside the link and swaps the link atomically, so a hook reading it never sees half a copy, then removes
+# the views the link no longer names. A missing source file is left out (the hook then refuses, naming it).
+NODE_VIEW_PUBLISH = r"""
+import json, os, pwd, shutil, sys, time
+hardware, pool, view = sys.argv[1:4]
+home = os.path.expanduser("~")
+config = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config"), "glaeda", "cmux-fleet")
+os.umask(0o022)
+store = view + ".d"
+os.makedirs(store, mode=0o755, exist_ok=True)
+fresh = os.path.join(store, "%d-%d" % (time.time(), os.getpid()))
+os.mkdir(fresh, 0o755)
+files = ("enrollment.json", os.path.join("class-acceptance", hardware + ".json"),
+         os.path.join("acceptance", "cmux_macos_native_build.json"))
+for rel in files:
+    src = os.path.join(config, rel)
+    if os.path.isfile(src):
+        dst = os.path.join(fresh, "cmux-fleet", rel)
+        os.makedirs(os.path.dirname(dst), mode=0o755, exist_ok=True)
+        shutil.copyfile(src, dst)
+        os.chmod(dst, 0o644)
+generation = ""
+try:
+    receipt = json.load(open(os.path.join(config, "class-acceptance", hardware + ".json")))
+    generation = str((receipt.get("glaedaCandidate") or {}).get("commit") or "")[:12]
+except (OSError, ValueError, AttributeError):
+    pass
+gens = os.path.join(fresh, "glaeda-generations")
+os.makedirs(gens, mode=0o755, exist_ok=True)
+src = os.path.join(home, "Projects", "glaeda-generations", generation)
+if generation and os.path.isdir(src):
+    shutil.copytree(src, os.path.join(gens, generation), symlinks=True,
+                    ignore=shutil.ignore_patterns("__pycache__", ".git"))
+for root, dirs, names in os.walk(fresh):
+    for d in dirs:
+        p = os.path.join(root, d)
+        if not os.path.islink(p):
+            os.chmod(p, 0o755)
+    for n in names:
+        p = os.path.join(root, n)
+        if not os.path.islink(p):
+            os.chmod(p, 0o755 if os.stat(p).st_mode & 0o100 else 0o644)
+if os.path.lexists(view) and not os.path.islink(view):
+    sys.exit("refusing: " + view + " is not a link this step made")
+tmp = view + ".tmp-%d" % os.getpid()
+os.symlink(fresh, tmp)
+os.replace(tmp, view)
+for old in os.listdir(store):
+    if os.path.join(store, old) != fresh:
+        shutil.rmtree(os.path.join(store, old), ignore_errors=True)
+bin_dir = os.path.join(os.path.dirname(view), "bin")
+shim = os.path.join(pwd.getpwnam(pool).pw_dir, "actions-runner-glaeda", "glaeda-hooks", "glaeda-canonical-root")
+link = os.path.join(bin_dir, "glaeda-canonical-root")
+if os.path.isdir(bin_dir) and not (os.path.islink(link) and os.readlink(link) == shim):
+    tmp = os.path.join(bin_dir, ".glaeda-canonical-root.%d" % os.getpid())
+    if os.path.lexists(tmp):
+        os.unlink(tmp)
+    os.symlink(shim, tmp)
+    os.replace(tmp, link)
+print("published " + fresh + " generation " + (generation or "none"))
+"""
+
+
+def retire_own_pool(member: str, pool_user: str) -> list[dict[str, Any]]:
+    """POOL_USER: retire every pool instance the member user itself still has (an admin account's PR runner), each only
+    while idle, once the pool account's instances applied. A busy one is deferred (retire when idle), and a listing
+    that cannot be read retires nothing and says why; neither fails the apply."""
+    installed, why = installed_pool_instances(member, "")
+    if installed is None:
+        return [{"instance": None, "exit": None, "ownAccount": True, "deferred": True,
+                 "state": f"the member user's own pool instances not checked: {why}"}]
+    results = []
+    for k in installed:
+        result = retire_instance(member, k, held=f"its pool runs as {pool_user} now", user="")
+        result["ownAccount"] = True
+        if result["exit"] != 0 and SURPLUS_BUSY in str(result.get("state")):
+            result["deferred"] = True
+            result["state"] = f"retire when idle (its pool runs as {pool_user} now): {result['state']}"
+        results.append(result)
+    return results
+
+
 def member_instance_count(row: dict[str, Any]) -> int:
     """A member row's instances: its pool runners, then its gateway, sim-first and small runners."""
     return (row["runners"] + row["gatewayRunners"] + row["simRunners"] + int(row.get("smallRunners") or 0))
@@ -980,12 +1121,22 @@ def member_instance_count(row: dict[str, Any]) -> int:
 def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, manifest: dict[str, Any],
                scratch: Path) -> dict[str, Any]:
     started = time.monotonic()
-    eligible, why = check(member, summary)
+    pool_user = summary.get("poolUser") or None
+    set_pool_user(member, pool_user)
+    # POOL_USER: the node view the pool account's gate reads is published before that gate is asked (apply only)
+    unpublished = publish_node_view(member, summary) if pool_user and args.apply else None
+    # a view that failed to publish fails the member before its gate is asked (that gate would read a stale view)
+    eligible, why = (False, "node view not published") if unpublished else check(member, summary)
     row: dict[str, Any] = {"member": member, "class": summary["class"], "runners": summary.get("runners", 1),
                            "gatewayRunners": summary.get("gatewayRunners") or 0,
                            "simRunners": summary.get("simRunners") or 0,
                            "smallRunners": summary.get("smallRunners") or 0,
                            "capacityUnits": summary.get("capacityUnits"), "eligible": eligible, "gate": why}
+    if pool_user:
+        row["poolUser"] = pool_user
+    if unpublished:
+        row["eligible"], row["action"] = False, f"node view failed: {unpublished}"
+        return row
     dedicated, bad = load_labels().dedicated_runners(manifest, member)
     row["dedicated"] = [d["name"] for d in dedicated]
     # DEDICATED_USER: the entries that run as their own macOS account, shown by the plan and applied as that user
@@ -1036,6 +1187,17 @@ def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, m
     if failed:
         row["action"] = f"stage failed: {failed}"
         return row
+    if pool_user:
+        failed = stage(member, manifest, scratch, override, args.guard.get("head"), user=pool_user)
+        if failed and failed.startswith("ssh:"):
+            row["missing"] = USER_SSH_MISSING
+            row["action"] = (f"cannot ssh as {pool_user} ({failed.removeprefix('ssh:').strip()[-160:] or 'no output'}):"
+                             f" {pool_user} needs the operator's key in its ~/.ssh/authorized_keys and Remote Login "
+                             "access (com.apple.access_ssh), a root step on the host outside glaeda; nothing changed")
+            return row
+        if failed:
+            row["action"] = f"stage as {pool_user} failed: {failed}"
+            return row
     prepared = prepare_headless(member, summary, manifest)
     if prepared:
         row["action"] = f"prepare failed: {prepared}"
@@ -1060,6 +1222,8 @@ def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, m
                                                              args.migrate_from_repo), range(instances)))
         if all(r["exit"] == 0 for r in results):
             results += retire_surplus(member, instances)
+            if pool_user:
+                results += retire_own_pool(member, pool_user)
         else:
             # SURPLUS_AFTER_DECLARED: a surplus instance may be the member's only live listener (a light mini, 2026-11-16:
             # 12 and 13 of 0-13); retiring it while a declared instance failed leaves fewer listeners than either

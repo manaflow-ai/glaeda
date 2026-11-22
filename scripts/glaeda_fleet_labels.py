@@ -542,6 +542,11 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
     if nightly_slot and pool_prefix not in ("", DEV_COMPILE_POOL_PREFIX):
         return None, f"{member} runner.nightlySlot needs the default pool namespace (no poolPrefix)"
     normal_pool_prefix = "" if dev_compile and pool_prefix == DEV_COMPILE_POOL_PREFIX else pool_prefix
+    pool_user, why = member_pool_user(manifest, member)
+    if why:
+        return None, why
+    if pool_user is not None and dedicated_only:
+        return None, f"{member} runner.poolUser has no pool runner to run: runner.dedicatedOnly installs none"
     ready = [a for a in apps if re.fullmatch(VERSION_RE, str(a.get("version") or "")) and xcode_ok(a)]
     versions = [str(a["version"]) for a in ready]
     # Opportunistic members never carry a pool label, so they never receive a required job.
@@ -649,7 +654,7 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
     return {"member": member, "class": klass, "availability": availability, "roles": roles,
             "labels": list(dict.fromkeys(labels)), "pools": list(dict.fromkeys(pools)),
             "devPools": list(dict.fromkeys(dev_pools)), "nightlyPools": list(dict.fromkeys(nightly_pools)),
-            "dedicatedOnly": dedicated_only,
+            "dedicatedOnly": dedicated_only, "poolUser": pool_user,
             "nightlySlot": nightly_slot, "nightlyInstance": roots + int(dev_compile) if nightly_slot else None,
             "minFreeGib": floor if isinstance(floor, (int, float)) and floor > 0 else None,
             "hardware": hardware, "xcodeApps": [str(a.get("path")) for a in ready], "iosSim": ios_sim,
@@ -708,6 +713,42 @@ DEFAULT_LABELS = ("self-hosted", "macos", "arm64", MINI_LABEL)
 # A dedicated command's first word may be this: the runner's own hook interpreter (glaeda-cmux-runner hook_python), so
 # a command that loads the hook runs on the Python the hook runs on, never a pinned path.
 PYTHON_WORD = "{python}"
+# POOL_USER (cmuxterm-hq#18007): a member's runner.poolUser is the macOS account its pool runners (the PR runners)
+# install, register and run as, instead of its ssh_user. On an EC2 Mac the ssh_user (ec2-user) is an admin with
+# passwordless sudo and runs the controller worker, whose secrets a PR job must not read; a PR job in its own non-admin
+# account cannot. Member-level only (hosts.<member>.overrides.runner, never defaults.runner: one account name is one
+# host's provisioning), a lowercase short name, never root, never the member's ssh_user and never a runner.dedicated
+# entry's user (that account runs trusted code only). glaeda-cmux-runner refuses to install it as anyone else or as an
+# admin; glaeda-cmux-runner-fleet applies it over ssh as that account.
+def member_pool_user(manifest: Any, member: str) -> tuple[str | None, str | None]:
+    """(the member's runner.poolUser or None, why it is unusable or None)."""
+    hosts = manifest.get("hosts") if isinstance(manifest, dict) else None
+    host = hosts.get(member) if isinstance(hosts, dict) else None
+    if not isinstance(host, dict):
+        return None, None
+    defaults = manifest.get("defaults") if isinstance(manifest.get("defaults"), dict) else {}
+    if isinstance(defaults.get("runner"), dict) and "poolUser" in defaults["runner"]:
+        return None, "runner.poolUser is member-level: set it in hosts.<member>.overrides.runner, not defaults.runner"
+    overrides = host.get("overrides") if isinstance(host.get("overrides"), dict) else {}
+    runner = overrides.get("runner") if isinstance(overrides.get("runner"), dict) else {}
+    if "poolUser" not in runner:
+        return None, None
+    user = runner["poolUser"]
+    if not (isinstance(user, str) and re.fullmatch(DEDICATED_USER_RE, user)) or user == "root":
+        return None, f"{member} runner.poolUser must be a macOS short name ({DEDICATED_USER_RE}), never root"
+    owner = host.get("ssh_user") or manifest.get("ssh_user")
+    if user == owner:
+        return None, (f"{member} runner.poolUser {user} is the member's own ssh_user: leave poolUser out for pool "
+                      "runners of that user")
+    merged = merge(defaults, overrides).get("runner")
+    entries = merged.get("dedicated") if isinstance(merged, dict) else None
+    for entry in entries if isinstance(entries, list) else []:
+        if isinstance(entry, dict) and entry.get("user") == user:
+            return None, (f"{member} runner.poolUser {user} is runner.dedicated {entry.get('name')}'s user: that "
+                          "account runs trusted code only, never a PR job")
+    return user, None
+
+
 # DEDICATED_USER: a trusted runner.dedicated entry's "user" is the macOS account its runner runs as, instead of the
 # member's one user (its ssh_user, which every pool and PR runner runs as). glaeda-cmux-runner-fleet applies it over
 # ssh as that user, so the runner, its _work and its LaunchAgent live in that account's home and its own gui/<uid>

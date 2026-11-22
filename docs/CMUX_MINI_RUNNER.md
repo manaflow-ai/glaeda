@@ -627,7 +627,13 @@ What `--apply` does:
      30 s budget, down from 300 s. A running job is never stopped or frozen for disk; the nightly's own listeners,
      dedicated builders, gateway runners and runners with no floor never wait.
      One reading is no floor but a full disk: free disk under 10 GiB (`RUNNER_JOBS_FLOOR_GIB`, the
-     controller's hard floor), or under the runner's own job peak when that is lower (a small runner's 8 GiB). No job fits there and one taken fails with ENOSPC, so the gate reclaims and holds
+     controller's hard floor) plus one runner job's p95 (`glaeda-runner-job-disk.json`, 5.3 GiB: 15.3 GiB;
+     `full_disk_gib`), or under the runner's own job peak when that is lower (a small runner's 8 GiB). That is the
+     test the build-fleet worker beside the runners pauses its claims by (`claim_paused disk`: one job's growth above
+     the hard floor), so a disk the fleet is paused for takes no runner job either (`FLEET_PAUSE_FULL`, 2026-11-22:
+     two build Macs held 5 and 4 runner jobs at 12.3 and 1.3 GiB free while the fleet had paused both, every runner
+     there lost its connection mid-job, and the fast tier went 2 pass / 41 fail). With no readable p95 the line is the
+     hard floor alone. No job fits there and one taken fails with ENOSPC, so the gate reclaims and holds
      its listener (`holding the listener off: disk full ... (DISK_FULL_NO_LISTEN)`, logged once per hold), and a
      full disk seen during a job stops the listener at that job's end, as a reservation does; the job runs on. It
      listens again once reclaim or the other jobs' ends bring the disk above the hard floor. An unreadable disk

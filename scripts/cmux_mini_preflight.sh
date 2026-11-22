@@ -9,6 +9,8 @@
 #   CANDIDATE_PIN   the Glaeda candidate source commit the fleet manifest (or glaeda-mini-fleet upgrade) pins, or empty
 #   ENROLL_FLAGS    the glaeda-mini-enroll options onboarding passes, space separated
 #   PIN_FORMULAS    the Homebrew formulas class receipts pin, space separated
+#   POOL_USER       the member's overrides.runner.poolUser (the account its PR pool runners run as), or empty;
+#                   when set, the secrets walk is repeated read-only as that user through sudo -n (cmuxterm-hq#18007)
 # Emits "key<TAB>value" lines like the probe. Installs, downloads and writes nothing: rustup runs with
 # RUSTUP_AUTO_INSTALL=0 and git with GIT_OPTIONAL_LOCKS=0. Never prints tokens or runner URLs; for a readable
 # secret it prints the path alone.
@@ -223,6 +225,7 @@ done
 # newline or tab is skipped: it could forge probe lines.
 # The home the paths below expand, for the manifest's ~-prefixed accepted_secrets.
 e pf_home "$HOME"
+login_secrets=()
 shopt -s nullglob dotglob
 while IFS= read -r -d '' f; do
   case "$f" in *$'\n'*|*$'\t'*|*$'\r'*) continue ;; esac
@@ -233,6 +236,7 @@ while IFS= read -r -d '' f; do
     "$HOME/.docker/config.json") grep -Eq '"auth"[[:space:]]*:' "$f" 2>/dev/null || continue ;;
   esac
   e pf_secret "$f"
+  login_secrets+=("$f")
 done < <(
   find -H /Users/Shared/cmux-build-fleet/secrets "$HOME/.secrets" \
     "$HOME/Library/Application Support/cmux-build-fleet/secrets" \
@@ -241,4 +245,69 @@ done < <(
     "$HOME/.git-credentials" "$HOME/.docker/config.json" "$HOME/.aws/credentials" "$HOME/.config/rclone/rclone.conf"
 )
 shopt -u nullglob dotglob
+
+# With a poolUser the PR jobs run as that account, not the login user, so what matters is what it can open
+# (cmuxterm-hq#18007). As that user (sudo -n: never a prompt), open each path above without reading it (EACCES
+# or EPERM is the answer we want), then walk the same locations under its own home. The done marker comes last:
+# without it (sudo refused, no such user, no developer directory for /usr/bin/python3) the answer is unknown.
+if [ -n "$POOL_USER" ] && [ "$shims" = run ]; then
+  e pf_pool_user "$POOL_USER"
+  (cd / && printf '%s\0' "${login_secrets[@]}" | sudo -n -u "$POOL_USER" -H /usr/bin/python3 -I -c '
+import errno, fnmatch, os, pwd, re, sys
+def bad(p):
+    return "\n" in p or "\t" in p or "\r" in p
+def state(p):
+    try:
+        os.close(os.open(p, os.O_RDONLY | os.O_NONBLOCK))
+        return "readable"
+    except OSError as x:
+        if x.errno in (errno.EACCES, errno.EPERM):
+            return "eacces"
+        return "errno-" + errno.errorcode.get(x.errno, str(x.errno))
+def has(p, pattern):
+    try:
+        with open(p, "rb") as f:
+            return re.search(pattern, f.read(1 << 20)) is not None
+    except OSError:
+        return False
+def out(key, value):
+    sys.stdout.write(key + "\t" + value + "\n")
+home = os.path.expanduser("~")
+out("pf_pool_home", home)
+given = [os.fsdecode(p) for p in sys.stdin.buffer.read().split(b"\0") if p]
+for p in given:
+    if not bad(p):
+        out("pf_pool_secret", p + "|" + state(p))
+seen = set(given)
+found = []
+for d in ("/Users/Shared/cmux-build-fleet/secrets", home + "/.secrets",
+          home + "/Library/Application Support/cmux-build-fleet/secrets",
+          "/Library/Application Support/cmux-build-controller/secrets"):
+    for top, dirs, files in os.walk(d):
+        found += [os.path.join(top, n) for n in sorted(files)]
+for d, pattern in ((home + "/.config/glaeda", "*.key"), (home + "/.ssh", "id_*")):
+    try:
+        found += [os.path.join(d, n) for n in sorted(os.listdir(d)) if fnmatch.fnmatchcase(n, pattern)]
+    except OSError:
+        pass
+found += [home + n for n in ("/.config/gh/hosts.yml", "/.netrc", "/.git-credentials", "/.docker/config.json",
+                             "/.aws/credentials", "/.config/rclone/rclone.conf")]
+for p in found:
+    if p in seen or bad(p) or p.endswith(".pub"):
+        continue
+    seen.add(p)
+    try:
+        if not os.path.isfile(p) or not os.stat(p).st_size:
+            continue
+    except OSError:
+        continue
+    if p == home + "/.config/gh/hosts.yml" and not has(p, rb"oauth_token"):
+        continue
+    if p == home + "/.docker/config.json" and not has(p, rb"\"auth\"[ \t\r\n]*:"):
+        continue
+    if state(p) == "readable":
+        out("pf_pool_secret", p + "|readable")
+out("pf_pool_secret_done", pwd.getpwuid(os.geteuid()).pw_name)
+' 2>/dev/null)
+fi
 } </dev/null

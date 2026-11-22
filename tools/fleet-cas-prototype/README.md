@@ -32,7 +32,7 @@ separately identifies the deliberate KV write response from a
 http://<addr>/stats`, or `curl --unix-socket <socket> http://x/stats` on a
 node) serves JSON (`schema: fleet-cas-stats/v1`): `role`, `uptime_s`,
 `starts`, `writers` (a store's `--writers`, null on a node), `windows` (`5m`,
-`1h`, `24h`: `kv_hits`, `kv_misses`, `cas_hits`, `cas_misses`, `puts`,
+`1h`, `6h`, `24h`: `kv_hits`, `kv_misses`, `cas_hits`, `cas_misses`, `puts`,
 `errors`, `write_refused`, bytes, `requests`, `hit_rate`, `kv_hit_rate`;
 rates are null with no lookups), `lifetime` and the raw `counters` of
 `stats.json`. The windows come from per-minute buckets kept for 24 h in
@@ -42,6 +42,14 @@ restart keeps them; the raw counters restart at 0 (`instance` changes). On
 so: no answer from `/stats` is a down store, and a low 1 h `kv_hit_rate`
 over enough `requests` is a cold or broken one (the fleet status scraper reads
 it and pushes an alarm).
+
+`clients` has the same windows (and `lifetime`, `last_seen_ms`) per TCP peer
+address, so a low hit rate names the node that misses; requests without a
+peer address (a unix socket) count under `"unknown"`. They are kept in memory
+only and start at `clients_since_ms` (the process start); at most
+`clients_max` (256) are kept, a new one past that drops the least recently
+seen (`clients_dropped` counts them). A store's clients behind the nc relay
+show as the minis' LAN addresses.
 
 One binary plays two roles:
 
