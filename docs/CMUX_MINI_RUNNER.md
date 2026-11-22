@@ -637,7 +637,12 @@ What `--apply` does:
      its listener (`holding the listener off: disk full ... (DISK_FULL_NO_LISTEN)`, logged once per hold), and a
      full disk seen during a job stops the listener at that job's end, as a reservation does; the job runs on. It
      listens again once reclaim or the other jobs' ends bring the disk above the hard floor. An unreadable disk
-     holds nothing. 2026-11-18 19:46-19:55Z: cmux18's listeners started at 8.5 GiB free beside five jobs, which
+     holds nothing. job-started applies the same line to the job it was handed (`DISK_FULL_REFUSES`, 2026-11-22: a listener
+     already online kept taking jobs on cmux17 at 9 GiB beside 8 more, 160 of 646 jobs in a day saw under 1 GiB, and
+     the runners' `_diag` ENOSPC dropped every runner on the mini): after its disk phase and again once capacity is
+     held, under the line or with free disk unreadable it refuses the job before any step (`disk full: ...
+     (DISK_FULL_REFUSES)`) and lets the host lock go, so the rescue re-runs it on a runner with room. The same runners
+     are exempt as from the hold, and nightly jobs keep their own reserve. 2026-11-18 19:46-19:55Z: cmux18's listeners started at 8.5 GiB free beside five jobs, which
      wrote it down to 1.8 GiB while the lent fleet worker sat at `claim_paused disk` with suites queued 4-5 h.
      **A fleet suite step goes first on a lent mini's disk, for at most 15 minutes per wait (`SUITE_FIRST_HOLD`).**
      The PR jobs on a lent mini took every GiB a job's end freed, so a fleet suite step (20 GiB growth plus the

@@ -21,9 +21,11 @@ job-started refuses (exits 1, so the runner fails the job before any step runs) 
   * GITHUB_EVENT_NAME or GITHUB_EVENT_PATH is missing or unreadable (fail closed)
   * with --trusted-ref REF --trusted-repo OWNER/NAME (a mini that holds a secret): the job is not a push
     or schedule of exactly that repository on REF (GITHUB_REF, the payload's ref and default branch)
-Free disk never refuses a job (a disk floor warns, never refuses): below --min-free-gib the hook runs one bounded
+A disk floor warns, never refuses: below --min-free-gib the hook runs one bounded
 glaeda-disk --pressure pass (evict; skipped with --no-disk) and admits the job with a warning if free disk is still
-short. A nightly job (or a dedicated builder's) first removes idle PR runners' work dirs and holds every new job off
+short. A full disk does refuse (DISK_FULL_REFUSES): under the listener's full line (the hard floor plus one runner
+job's p95, full_disk_line), or with free disk unreadable, after that pass and again once capacity is held, a pool job
+is refused before any step, so it is re-run on a runner with room instead of losing this one to ENOSPC. A nightly job (or a dedicated builder's) first removes idle PR runners' work dirs and holds every new job off
 the mini while it frees space (NIGHTLY_DISK_RESERVE). Above the floor but under the pre-job target (the floor plus
 PREJOB_MARGIN_GIB) it starts the queued pass before the job and waits up to PREJOB_WAIT_S for that target
 (prejob_evict), then admits it: the eviction happens before every job, not after it. Free disk under a 10 GiB margin
@@ -1457,6 +1459,45 @@ def full_disk_gib() -> float:
     plus one runner job's measured p95 (runner_job_disk), or the hard floor alone when that value is unreadable."""
     per, _source = runner_job_disk()
     return runner_jobs_need_gib(0, per) if per is not None else RUNNER_JOBS_FLOOR_GIB
+
+
+def full_disk_line(scope: "RunnerScope") -> float | None:
+    """The free disk under which no job of this runner fits (DISK_FULL_NO_LISTEN, DISK_FULL_REFUSES): full_disk_gib, cut
+    to the runner's own job peak (a small runner's jobs are measured to fit under it). None for a runner the full-disk
+    hold never covers: a dedicated builder, the nightly's own listeners, a gateway runner or one with no disk floor."""
+    nightly_own = (scope.nightly or scope.trusted_signing) and not scope.dedicated
+    if scope.dedicated or nightly_own or scope.gateway or scope.min_free_gib <= 0:
+        return None
+    return min(full_disk_gib(), listener_disk_peak(scope)[0])
+
+
+# DISK_FULL_REFUSES (2026-11-22: "a runner stops taking jobs when the disk is below the floor instead of continuing").
+# FLEET_PAUSE_FULL held only the idle listener; job-started still admitted every job it was handed, "a disk floor warns,
+# never refuses", whatever the disk read after its bounded eviction ("glaeda-disk timed out; continuing"). A listener
+# that was online when the disk fell, or that the gate had not looked at since, took jobs at a disk where none fits:
+# cmux17, 2026-11-21..22, 160 of 646 completed runner jobs saw under 1 GiB free, 17:09Z auth-refresh-tests admitted at
+# 9.0 GiB beside 8 jobs; the runner's own _diag then hit ENOSPC ("No space left on device" from JobDispatcher and
+# StepsRunner), the Worker crashed and every runner on the mini lost its connection mid-job with no verdict (cmux22
+# 08:08Z, cmux17 09:05Z and 17:10Z). Leo: "A busy machine makes things slower, never makes them fail" — a job taken
+# there fails anyway, later, and takes its neighbours with it. So job-started now applies the listener's own full line
+# (full_disk_line, no new number) after its disk phase, and again once its capacity is held (the capacity wait has no
+# limit, and the running jobs write the disk down meanwhile): under it, or with free disk unreadable (fail closed), the
+# job is refused before any step runs, so cmux's rescue re-runs it on a runner with room, and the reclaim it started
+# goes on. The 30 GiB floor itself still only warns; no running job is ever touched.
+def full_disk_refusal(path: str, scope: "RunnerScope") -> str | None:
+    """Why job-started refuses a job for a full disk (DISK_FULL_REFUSES), or None."""
+    full = full_disk_line(scope)
+    if full is None:
+        return None
+    free = free_or_none(path)
+    if free is None:
+        return (f"disk: cannot read free disk at {path}, so this job is not known to fit; refused before any step "
+                "(DISK_FULL_REFUSES)")
+    if free >= full:
+        return None
+    return (f"disk full: {free:.1f} GiB free, under {full:g} GiB, where no job of this runner fits (the hard floor "
+            f"plus one runner job's p95, FLEET_PAUSE_FULL); refused before any step so it runs on a runner with room "
+            "while reclaim goes on here (DISK_FULL_REFUSES)")
 
 
 def runner_jobs_refusal(free: float, in_flight: int, per_job_gib: float, source: str,
@@ -11612,7 +11653,7 @@ class Gate:
             # Full is under the hard floor plus one runner job's measured p95 (full_disk_gib, FLEET_PAUSE_FULL: the
             # build fleet's own disk pause beside it) and under this runner's own job peak (a small runner's 8 GiB:
             # its jobs are measured to fit under the hard floor). An unreadable reading holds nothing (free_or_none).
-            full_gib = min(full_disk_gib(), peak)
+            full_gib = full_disk_line(scope) or min(full_disk_gib(), peak)
             if (free := free_or_none(path)) is not None and free < full_gib:
                 self.disk_short = None
                 self.evict_in_background(path, max(floor, peak, aim))
@@ -14572,7 +14613,8 @@ def disk_pressure_run(explicit: str | None, floor_gib: float = 0.0,
         skipped = any(mark in out for mark in DISK_BUSY)
         return f"glaeda-disk exited {result.returncode}{' (busy)' if skipped else ''}", skipped
     except subprocess.TimeoutExpired:
-        return "glaeda-disk timed out; continuing", False
+        # the free disk is read again after this; under the full line the job is refused (DISK_FULL_REFUSES)
+        return f"glaeda-disk timed out after {timeout:g} s", False
     except Exception as error:  # noqa: BLE001  (never fail the job on housekeeping)
         return f"glaeda-disk skipped: {type(error).__name__}", False
 
@@ -15373,6 +15415,13 @@ def main(argv: list[str] | None = None) -> int:
                                            evicted_to=floor_evicted[0])
             if peak_note:
                 print(f"{PREFIX}: {peak_note}", flush=True)
+        # DISK_FULL_REFUSES: the listener's full line, read after every eviction and wait above; a nightly job keeps its
+        # own reserve (NIGHTLY_DISK_RESERVE) and is never refused for disk
+        full_scope = RunnerScope(min_free_gib=args.min_free_gib, dedicated=bool(args.dedicated_admit),
+                                 nightly=bool(args.nightly_runner), gateway=bool(args.gateway_runner),
+                                 trusted_signing=bool(args.trusted_next_signing), small=bool(args.small_runner))
+        if not nightly_disk and (why := full_disk_refusal(disk_path, full_scope)):
+            return refused(why, disk=True)
         # before any capacity is taken: a job that needs the console session fails on a locked one
         admit_class = None
         if args.gateway_runner:  # its thin client takes a gateway token, never a shared unit (GATEWAY)
@@ -15558,6 +15607,10 @@ def main(argv: list[str] | None = None) -> int:
             held, note = take_host_lock(args.host_lock, owner, args.state_dir)
         if not held:
             return refused(note)
+        if not nightly_disk and (why := full_disk_refusal(disk_path, full_scope)):
+            # DISK_FULL_REFUSES again: the capacity wait has no limit and the running jobs wrote the disk meanwhile
+            release_host_lock(args.state_dir)
+            return refused(why, disk=True)
         if args.require_eligible:
             # Under the lock no fleet build runs here, and every runner here aligns to the same receipt,
             # so the default set now holds for this job.

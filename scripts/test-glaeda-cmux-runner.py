@@ -2340,13 +2340,83 @@ class HookTest(unittest.TestCase):
                                   "--host-lock", os.fspath(self.dir / "fleet" / "host.lock"), *args,
                                   "--state-dir", os.fspath(self.dir / "state"), "--watch-pid", str(job.pid),
                                   "--gui-wait", "0"])
-        # admitted at once under the admission floor, not after the rest of the 30 s wait, with that one warning
+        # the wait ends at once under the admission floor, not after the rest of the 30 s, with that one warning; at
+        # 1 GiB no job fits, so the job is then refused before any step (DISK_FULL_REFUSES), never admitted to ENOSPC
         self.assertLess(time.monotonic() - start, 10.0)
-        self.assertEqual(code, 0, out.getvalue())
+        self.assertEqual(code, 1, out.getvalue())
         self.assertIn("warning: 1.0 GiB free, 20 GiB required: admitted under the admission floor after waiting",
                       out.getvalue())
         self.assertNotIn("admitted without the disk ledger's turn", out.getvalue())
-        self.assertNotIn("refused", out.getvalue())
+        self.assertIn("disk full: 1.0 GiB free, under", out.getvalue())
+        self.assertIn("(DISK_FULL_REFUSES)", out.getvalue())
+        self.assertNotIn("admitted: push", out.getvalue())
+
+    def test_full_disk_refusal_is_the_listeners_full_line(self) -> None:
+        """DISK_FULL_REFUSES (cmux17 and cmux22, 2026-11-22: jobs admitted at 9 GiB beside 8 more, the runners' _diag
+        hit ENOSPC and every runner on the mini lost its connection): job-started refuses under the same line the
+        listener holds at (full_disk_line), fails closed on an unreadable disk, and never covers a runner the hold
+        does not."""
+        pool = hook.RunnerScope(min_free_gib=30.0)
+        with mock.patch.object(hook, "full_disk_gib", return_value=15.3):
+            with mock.patch.object(hook, "free_gib", return_value=9.0):
+                why = hook.full_disk_refusal("/x", pool)
+                self.assertIn("disk full: 9.0 GiB free, under 15.3 GiB", why or "")
+                self.assertIn("(DISK_FULL_REFUSES)", why or "")
+                # a small runner's jobs fit under its own 8 GiB peak (SMALL_ONLY)
+                self.assertIsNone(hook.full_disk_refusal("/x", pool._replace(small=True)))
+                for exempt in (pool._replace(dedicated=True), pool._replace(nightly=True),
+                               pool._replace(trusted_signing=True), pool._replace(gateway=True),
+                               pool._replace(min_free_gib=0.0)):
+                    with self.subTest(exempt=exempt):
+                        self.assertIsNone(hook.full_disk_line(exempt))
+                        self.assertIsNone(hook.full_disk_refusal("/x", exempt))
+            with mock.patch.object(hook, "free_gib", return_value=5.0):
+                self.assertIn("under 8 GiB", hook.full_disk_refusal("/x", pool._replace(small=True)) or "")
+            with mock.patch.object(hook, "free_gib", return_value=15.3):
+                self.assertIsNone(hook.full_disk_refusal("/x", pool))  # at the line it fits, as the listener's hold
+            with mock.patch.object(hook, "free_gib", side_effect=OSError("gone")):
+                self.assertIn("cannot read free disk", hook.full_disk_refusal("/x", pool) or "")
+
+    def test_job_started_refuses_a_disk_the_running_jobs_filled_during_its_capacity_wait(self) -> None:
+        """DISK_FULL_REFUSES once capacity is held: the wait has no limit, so the line is read again there, and a
+        refusal then lets the host lock go."""
+        self.fleet()
+        job = self.worker_stand_in()
+        looks: list[str] = []
+
+        def full(path, scope):  # type: ignore[no-untyped-def]
+            looks.append(path)
+            return None if len(looks) == 1 else "disk full: 3.0 GiB free, under 15.3 GiB (DISK_FULL_REFUSES)"
+
+        push = event(self.dir, "push", {"repository": CMUX})
+        env = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0",
+               "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"),
+               "GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": os.fspath(push), "GITHUB_REPOSITORY": "manaflow-ai/cmux"}
+        released: list[Path] = []
+        original = hook.release_host_lock
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(hook, "full_disk_refusal", side_effect=full), \
+                mock.patch.object(hook, "release_host_lock",
+                                  side_effect=lambda state: released.append(state) or original(state)), \
+                mock.patch.object(hook, "start_runner_parent_watchdog"), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            code = hook.main(["job-started", "--allowed-repo", "manaflow-ai/cmux", "--no-disk",
+                              "--reservation", os.fspath(self.dir / "fleet" / "reservation.json"),
+                              "--host-lock", os.fspath(self.dir / "fleet" / "host.lock"), "--min-free-gib", "30",
+                              "--state-dir", os.fspath(self.dir / "state"), "--watch-pid", str(job.pid),
+                              "--gui-wait", "0"])
+        self.assertEqual(code, 1, out.getvalue())
+        self.assertEqual(len(looks), 2, "read before the capacity wait and again once capacity is held")
+        self.assertIn("(DISK_FULL_REFUSES)", out.getvalue())
+        self.assertNotIn("admitted: push", out.getvalue())
+        self.assertEqual(released, [self.dir / "state"])
+        self.assertTrue(self.lock_free(), "the refused job holds no host lock")
+
+    def test_a_glaeda_disk_timeout_no_longer_says_continuing(self) -> None:
+        with mock.patch.object(hook, "disk_argv", return_value=["/bin/true"]), \
+                mock.patch.object(hook.subprocess, "run", side_effect=subprocess.TimeoutExpired(["x"], 5)):
+            note, busy = hook.disk_pressure_run(None, 30.0, timeout=5.0)
+        self.assertEqual((note, busy), ("glaeda-disk timed out after 5 s", False))
 
     def test_wait_disk_low_turn_takes_the_turn_once_the_other_job_ends(self) -> None:
         capacity = self.dir / "capacity"
@@ -2523,7 +2593,8 @@ class HookTest(unittest.TestCase):
         a warning, as under the floor before the wait."""
         self.fleet()
         job = self.worker_stand_in()
-        frees = iter([35.0, 35.0, 35.0, 15.0])  # the three floor checks, then the one after the wait
+        frees = iter([35.0, 35.0, 35.0, 16.0])  # the three floor checks, then the one after the wait (16 GiB: over
+        # the full line, DISK_FULL_REFUSES)
         last = [35.0]
 
         def free(_path):
@@ -2547,7 +2618,7 @@ class HookTest(unittest.TestCase):
         ev.assert_called_once()
         text = out.getvalue()
         self.assertLess(text.index("pre-job target"), text.index("disk floor"))
-        self.assertIn("warning: 15.0 GiB free, 20 GiB required: admitted under the admission floor", text,
+        self.assertIn("warning: 16.0 GiB free, 20 GiB required: admitted under the admission floor", text,
                       "warned under one job's measured disk growth")
 
     # JOB_DISK_PEAK_LEARNED: each job's disk peak learned from this host's job log, held for at job start
