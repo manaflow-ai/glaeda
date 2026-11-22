@@ -26926,6 +26926,41 @@ class LandTest(Base):
         self.assertTrue(capped)
         self.assertIn("not judged this window: host cap (graphql:", gg.land_line(capped[0], self.t, latch=None))
 
+    def test_a_gate_fix_land_is_judged_while_the_login_pool_is_spent_and_another_entry_is_capped(self):
+        """gate-fix-passes-through-the-gate.md (hq#17575, 2026-11-22): the PR fixing the quota gate sat window_capped
+        for hours behind the login pool it repairs. `land --gate-fix` leaves window_room's pace out; the other
+        entry, under the same spent pool, is still held, and the fix is judged and merged by the same checks."""
+        heads = {n: format(0xD0 + n, "040x") for n in (1, 2)}
+        for n, head in heads.items():
+            self.w.set_pr(f"pr:o/r#{n}", land_pr(head), self.t)
+        self.land("o/r#1")
+        gg.land_request("land", "o/r#2", [], "host/lane", gate_fix=True)
+        self.q.now = self.t
+        self.q.ingest()
+        self.assertFalse(self.q.entries["pr:o/r#1"].get("gateFix"))
+        self.assertIs(self.q.entries["pr:o/r#2"].get("gateFix"), True)
+        self.live_graphql(0, [])  # the login's GraphQL is at its reserve: no judgment fits the pace
+        judged: list[int] = []
+        real = self.w.run
+
+        def run(argv, timeout, env):
+            if argv[1:3] == [self.w.mh, "explain"] and "--cache-only" not in argv:
+                n = int(argv[4])
+                judged.append(n)
+                rc, doc = ok_answer(heads[n])
+                doc["action"]["number"] = n
+                self.w.answers.append((rc, doc))
+            return real(argv, timeout, env)
+        self.q.run = run
+        for _ in range(6):
+            for key in list(self.w.cache):
+                self.w.cache[key]["updatedAtAt"] = self.t
+            self.tick(30)
+        self.assertEqual(judged, [2])
+        self.assertEqual(self.q.entries["pr:o/r#2"]["state"], "merged")
+        self.assertTrue(self.q.entries["pr:o/r#1"].get("windowCapped"))
+        self.assertNotEqual(self.q.entries["pr:o/r#1"]["state"], "merged")
+
     def test_a_capped_line_says_when_the_reserve_is_what_is_left(self):
         """"host cap (graphql: 55 left, resets 00:38Z)" reads as a pool with room and a queue that will not use it.
         The 55 are under hard_reserve_floor's 500, which no agent caller spends, so the pace is right -- only the

@@ -13295,6 +13295,8 @@ class LandQueue:
             e.pop("laneHost", None)
         if fresh or "override" in req:  # a re-request with none keeps an open entry's; a fresh entry has only its own
             e["override"] = land_request_override(req)
+        if fresh or "gateFix" in req:  # --gate-fix: window_room leaves the entry out of the login's pace
+            e["gateFix"] = req.get("gateFix") is True
         if fresh:
             e.update(state="queued", head="", explain=None, action=None, streak=None, wakeAt=None,
                      wait=None, seen=None, seenHead="", mergeSha="", stop=None, preStepHead="",
@@ -13481,7 +13483,8 @@ class LandQueue:
                              # an entry from before the lane was recorded names none there: its requester's
                              # PARENT/CHILD would read as a session on the executor's host
                              | {"lane": e.get("lane") or "", "laneHost": e.get("laneHost") or ""}
-                             | ({"override": e["override"]} if e.get("override") else {}))
+                             | ({"override": e["override"]} if e.get("override") else {})
+                             | ({"gateFix": True} if e.get("gateFix") else {}))
                 handed.append((key, int(e.get("gen") or 0)))
             d = self.requests_dir()
             blocked = {k for k, e in self.entries.items() if e["state"] not in LAND_DONE}
@@ -13497,7 +13500,7 @@ class LandQueue:
                 if not LAND_REQUEST_ID.fullmatch(rid):
                     rid = path.stem
                 batch.append({k: req.get(k) for k in ("op", "target", "after", "requester", "requesterFrom",
-                                                      "queuedBy", "lane", "laneHost", "override") if k in req}
+                                                      "queuedBy", "lane", "laneHost", "override", "gateFix") if k in req}
                              | {"id": rid})
                 files.append((rid, path))
         return batch, files, handed
@@ -14363,6 +14366,11 @@ class LandQueue:
         e.pop("cacheOnlyJudge", None)
         e.pop("paceNext", None)
         first = e.pop("unreadCacheFirst", None)
+        if e.get("gateFix"):
+            # `land --gate-fix`: a PR that fixes the quota gate's own path must not wait on the login's pace, which
+            # is the quota it repairs (gate-fix-passes-through-the-gate.md; its merge starts on an App pool). Charged
+            # as any judgment is; every check, hold and review still judges it.
+            return True
         if first is not None and not over:
             # The last answer was unreadable: the caches first, no read sent (LAND_UNREAD_SAME_STOP's comment)
             e["cacheOnlyJudge"] = "unread"
@@ -16510,7 +16518,7 @@ def land_override_takes(e: dict, act: dict, head: str) -> bool:
 
 def land_request(op: str, target: str, after: list[str], requester: str, source: str = "", rid: str = "",
                  queued_by: str = "", lane: tuple[str, str] | None = None, sha: str = "",
-                 override: dict | None = None) -> str:
+                 override: dict | None = None, gate_fix: bool = False) -> str:
     """Write one request for the daemon's queue (requests/); its id. RID and QUEUED_BY are kept as given (a forwarded
     request's, so the executor applies a resend once): else a new id and this process's reader. LANE is (the lane its
     steps write as, the host that lane is on), the queuing process's (land_queue_lane) or a forwarded request's."""
@@ -16525,7 +16533,8 @@ def land_request(op: str, target: str, after: list[str], requester: str, source:
                {"id": rid, "op": op, "target": target, "key": land_key(target)[0], "after": after,
                 "requester": requester, "requesterFrom": source, "queuedBy": queued_by or reader_name(),
                 "at": time.time()} | ({"lane": lane[0], "laneHost": lane[1]} if lane is not None else {})
-               | ({"sha": sha} if sha else {}) | ({"override": override} if override else {}))
+               | ({"sha": sha} if sha else {}) | ({"override": override} if override else {})
+               | ({"gateFix": True} if gate_fix else {}))
     return rid
 
 
@@ -16919,7 +16928,7 @@ def land_forward_exit(out: dict, wait: float) -> int:
 
 def cmd_land_forwarded(executor: list[str], target: str, after: list[str], requester: str, source: str, wait: float,
                        as_json: bool, sha: str = "", override: dict | None = None,
-                       ceiling: float | None = None) -> int:
+                       ceiling: float | None = None, gate_fix: bool = False) -> int:
     """`land` on a host that forwards its lands (land_executor): to the executor now, else into requests/, which the
     daemon forwards when the executor answers. Either way it is never lost."""
     key, repo, number = land_key(target)
@@ -16931,13 +16940,13 @@ def cmd_land_forwarded(executor: list[str], target: str, after: list[str], reque
            "requesterFrom": source, "queuedBy": land_queued_by(), "id": rid, "wait": wait, "lane": lane,
            "laneHost": policy_host() if lane else ""} | ({"sha": sha} if sha else {}) \
         | ({"max": Leash(wait, ceiling).ceiling} if wait > 0 else {}) \
-        | ({"override": override} if override else {})
+        | ({"override": override} if override else {}) | ({"gateFix": True} if gate_fix else {})
     why = "an earlier request is still waiting to be forwarded" if land_outbox_busy(key) else ""
     # Staged first: a crash (or a kill) during the forward leaves it in requests/, which the daemon forwards. The
     # executor applies the same id once, so the daemon's send and this one never land it twice.
     staged = land_request_path(land_request("land", f"{repo}#{number}", targets, requester, source, rid=rid,
                                             queued_by=req["queuedBy"], lane=(req["lane"], req["laneHost"]), sha=sha,
-                                            override=override))
+                                            override=override, gate_fix=gate_fix))
     if not why:
         try:
             # the executor waits up to --max while the land keeps moving (an older one: --timeout in all)
@@ -17161,8 +17170,9 @@ def land_request_refused(key: str, code: str, why: str, nxt: str, as_json: bool)
 
 
 def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_json: bool,
-             pin: str | None = None, override: dict | None = None, ceiling: float | None = None) -> int:
-    """PIN (--sha or --match-head-commit) is trusted with no head read (check_land_pin) and kept with the request, so the
+             pin: str | None = None, override: dict | None = None, ceiling: float | None = None,
+             gate_fix: bool = False) -> int:
+    """GATE_FIX (--gate-fix) keeps the entry out of window_room's pace. PIN (--sha or --match-head-commit) is trusted with no head read (check_land_pin) and kept with the request, so the
     executor stops (head_moved) if a read shows another head, and the pinned merge refuses one it did not see. OVERRIDE (land_override) rides every merge
     try."""
     key, repo, number = land_key(target)
@@ -17192,7 +17202,7 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
     executor = land_executor()
     if executor is not None:
         return cmd_land_forwarded(executor, target, after, requester, source, wait, as_json, sha, override,
-                                  ceiling)
+                                  ceiling, gate_fix)
     mh, tried = land_judge(land_config())
     if mh is None:
         # The startup check's twin: nothing on this host could judge the merge, so it is not queued.
@@ -17205,7 +17215,8 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
         return EXIT_FAIL
     lane = land_queue_lane()
     rid = land_request("land", f"{repo}#{number}", [land_key(a)[1] + f"#{land_key(a)[2]}" for a in after], requester,
-                       source, lane=(lane, policy_host() if lane else ""), sha=sha, override=override)
+                       source, lane=(lane, policy_host() if lane else ""), sha=sha, override=override,
+                       gate_fix=gate_fix)
     no_lane = (f"no lane here (${LAND_LANE_ENV}, $ACPMUX_SESSION_NAME): an entry queued with one keeps it, else its "
                f"steps write as {LAND_QUEUE_LANE}, which the broker refuses while another lane holds the PR's branch "
                "lease") if not lane and land_broker_client() else ""
@@ -17300,7 +17311,8 @@ def land_serve_one(req: Any) -> tuple[str | None, str]:
     queued_by = queued_by if re.fullmatch(r"[A-Za-z0-9._:/-]{1,200}", queued_by) else "tool:land-forward"
     rid = land_request(str(req["op"]), str(req["target"]), after, requester, str(req.get("requesterFrom") or "")[:80],
                        rid=str(req.get("id") or ""), queued_by=queued_by, lane=land_request_lane(req),
-                       sha=land_pin_sha(req.get("sha")), override=land_request_override(req))
+                       sha=land_pin_sha(req.get("sha")), override=land_request_override(req),
+                       gate_fix=req.get("gateFix") is True)
     return rid, ""
 
 
@@ -28829,6 +28841,10 @@ def parser() -> argparse.ArgumentParser:
                          "override); one line, at most 200 characters; needs --override-receipt")
     ld.add_argument("--override-receipt", dest="override_receipt", metavar="TEXT",
                     help="LAND_JUDGE_OVERRIDE_RECEIPT=TEXT with it: the base run and job ids; one line, at most 240")
+    ld.add_argument("--gate-fix", dest="gate_fix", action="store_true",
+                    help="this PR fixes the merge gate's own quota path (gate-escapes.json): the queue does not hold "
+                         "it to the login's pace (window_room), since its merge starts on an App pool; every check, "
+                         "hold and review still judges it")
     ld.add_argument("--wait", "--timeout", dest="wait", type=seconds, default=0, metavar="S",
                     help="wait for it to merge or stop until its queue entry has not changed for S seconds (exit 0 "
                          "merged, 1 stopped, 2 still going); --timeout is the same")
@@ -29466,7 +29482,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise WatchError("--wait must be 0 or more seconds")
             override = land_override(args.override_reason, args.override_receipt)
             return cmd_land(words[0], args.after, args.notify, args.wait, args.json, args.sha, override,
-                            args.max_wait)
+                            args.max_wait, gate_fix=args.gate_fix)
         if args.command == "on-event":
             if args.action == "replay":
                 if args.run_file is None or args.wait < 0:
