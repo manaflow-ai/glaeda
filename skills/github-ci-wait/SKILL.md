@@ -128,7 +128,7 @@ consumer's spend. Prefer it over `gh pr checks` or `gh api .../check-runs` for m
 
 ## After a push: --sha
 
-Pass the commit you pushed: `--sha "$(git rev-parse HEAD)"`. Checks of an older head then count
+Pass the commit you pushed: `--sha "$(git rev-parse HEAD)"` (`--head` is the same flag). Checks of an older head then count
 as pending until GitHub shows yours. Give the full 40-hex id. A shorter prefix is resolved in the
 current checkout; one that does not resolve must match the head GitHub shows, or `wait` exits 64
 at once rather than waiting for a commit that will never appear. For a run, a `--sha` that is not

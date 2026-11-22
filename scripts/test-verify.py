@@ -590,5 +590,92 @@ class VerifyPlanTests(unittest.TestCase):
             self.assertFalse(receipt_path.exists())
 
 
+class HostPolicyRefusalTests(unittest.TestCase):
+    """A phase the host refused to run is not a verdict on the phases after it.
+
+    2026-11-22, measured on a shared workstation: `./scripts/verify focused` exited 77 at phase 3 of
+    5 because `tools/heavy-guard` refuses cargo there, and the two phases after it -- format and the
+    repo-query integration test, the ones a change under `scripts/` needs -- printed no verdict at
+    all. The refusal is now reported, the rest of the plan still runs, and the run is still not green.
+    """
+
+    def phase(self, module, name: str, script: str):
+        return module["Phase"](name, "capability", "sh", ("-c", script))
+
+    def run_phases(self, module, phases) -> tuple[int, str]:
+        run = module["run"]
+        run.__globals__["phases_for"] = lambda profile: tuple(phases)
+        with tempfile.TemporaryDirectory() as directory:
+            captured = Path(directory) / "stderr.log"
+            with captured.open("w+b") as sink:
+                sys.stderr.flush()
+                saved = os.dup(2)
+                try:
+                    os.dup2(sink.fileno(), 2)
+                    code = run("fast")
+                finally:
+                    sys.stderr.flush()
+                    os.dup2(saved, 2)
+                    os.close(saved)
+            return code, captured.read_text(encoding="utf-8", errors="replace")
+
+    def test_a_refused_phase_reports_itself_and_the_rest_of_the_plan_still_runs(self) -> None:
+        module = runpy.run_path(str(VERIFY), run_name="glaeda_verify_test")
+        refusal = "heavy-guard: refused: [routing-order] 'cargo check' on this host"
+        code, said = self.run_phases(
+            module,
+            [
+                self.phase(module, "compile-all-targets", f"echo \"{refusal}\" >&2; exit 77"),
+                self.phase(module, "format", "exit 0"),
+                self.phase(module, "repo-query-integration", "exit 0"),
+            ],
+        )
+
+        self.assertEqual(code, 77, said)
+        self.assertIn("compile-all-targets: refused by host policy", said)
+        self.assertIn("CI owns its verdict", said)
+        self.assertIn("[2/3] format: exit=0", said)
+        self.assertIn("[3/3] repo-query-integration: exit=0", said)
+        self.assertIn("host policy refused 1 phase(s): compile-all-targets", said)
+
+    def test_a_refusal_never_reports_green(self) -> None:
+        module = runpy.run_path(str(VERIFY), run_name="glaeda_verify_test")
+        code, said = self.run_phases(
+            module,
+            [self.phase(module, "compile-all-targets", "echo refused: policy >&2; exit 77")],
+        )
+
+        self.assertNotEqual(code, 0, said)
+        self.assertIn("exit=77", said)
+
+    def test_a_real_failure_after_a_refusal_still_decides_the_exit_code(self) -> None:
+        module = runpy.run_path(str(VERIFY), run_name="glaeda_verify_test")
+        code, said = self.run_phases(
+            module,
+            [
+                self.phase(module, "compile-all-targets", "echo refused: policy >&2; exit 77"),
+                self.phase(module, "repo-query-integration", "echo boom >&2; exit 3"),
+            ],
+        )
+
+        self.assertEqual(code, 3, said)
+        self.assertIn("host policy refused 1 phase(s)", said)
+
+    def test_our_own_tool_exiting_77_is_a_failure_and_still_breaks_the_run(self) -> None:
+        """77 alone is not a refusal: the captured text has to say so, or a coincidence passes."""
+        module = runpy.run_path(str(VERIFY), run_name="glaeda_verify_test")
+        code, said = self.run_phases(
+            module,
+            [
+                self.phase(module, "repo-query-integration", "echo 77 cases failed >&2; exit 77"),
+                self.phase(module, "format", "exit 0"),
+            ],
+        )
+
+        self.assertEqual(code, 77, said)
+        self.assertNotIn("refused by host policy", said)
+        self.assertNotIn("[2/2] format", said)
+
+
 if __name__ == "__main__":
     unittest.main()

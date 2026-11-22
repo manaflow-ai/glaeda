@@ -490,6 +490,15 @@ What `--apply` does:
        `hostLoadCap` in `config/runner-gate.json` sets the cap (a number, `false` for off) by
        default or per host; `CMUX_CI_HOST_LOAD_CAP` in the runner LaunchAgent's environment wins,
        and `off` or 0 turns it off.
+     - **The signing listener is never held off by load** (`SIGNER_FIRST`; Leo: "Nightlies come
+       first on the fleet."). The `--trusted-next-signing` runner skips the load cap above and the
+       CPU and overload holds of `saturated()`: the load on a signing host is PR work, which yields
+       at its own admission, never the signer. On 2026-11-21 ultra1 (the fastest signer) stopped
+       its idle signing listener again and again at load 45 to 73 on 30 cores while cmux15 alone
+       signed 3 min slower. Memory pressure, disk, reservations and drains still hold it.
+       It also listens on a mini whose capacity units are all taken (as the nightly slot does): its
+       job waits at admission as a nightly waiter (`FEED_FIRST`, `SIGNING_DRAIN`), no new PR job
+       takes a unit from then on, and running jobs finish untouched.
      - **Which labels a gate reasons with** (`cap_labels`; hq#16433, hq#16544). Every feed read
        above filters the queue with `set(job["labels"]) <= cap_labels`, so a gate that understates
        its runner's labels sees none of the work it could take: on 2026-11-21 two austin minis'

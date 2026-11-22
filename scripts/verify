@@ -31,6 +31,17 @@ SUMMARY_FAILURE_VIEW_BYTES = 16 * 1024
 SUMMARY_FAILURE_EDGE_BYTES = SUMMARY_FAILURE_VIEW_BYTES // 2
 CHILD_FILE_CREATION_UMASK = 0o022
 
+# `tools/heavy-guard` on the shared workstations refuses a heavy command (cargo, swift, zig) with
+# this exit code and a message whose first line is `heavy-guard: refused: [routing-order] ...`: the
+# phase ran nowhere, which is not the same as a phase that ran and failed. Before 2026-11-22 `run`
+# broke at the first non-zero exit, so one refused cargo phase hid every later phase's verdict: on a
+# shared workstation `verify focused` exited 77 at phase 3 of 5 and never ran the format or
+# repo-query phases, the two a change under `scripts/` actually needs. A refusal now reports itself,
+# the remaining phases still run, and the run still never reports green -- AGENTS.md: "Never upgrade
+# a failed or blocked result into a pass."
+HOST_POLICY_REFUSAL_EXIT = 77
+HOST_POLICY_REFUSAL_MARKER = b"refused:"
+
 
 @dataclass(frozen=True)
 class Phase:
@@ -141,6 +152,20 @@ def execute_phase(
         if output_path is not None:
             output_path.unlink(missing_ok=True)
         raise
+
+
+def is_host_policy_refusal(returncode: int, summary: PhaseOutputSummary | None) -> bool:
+    """Whether the host's own policy refused to run this phase, rather than the phase failing.
+
+    In summary mode the refusal text is captured, so the exit code and the marker are both read: a
+    tool of our own exiting 77 on its own business keeps breaking the run. In stream mode nothing is
+    captured (`summary is None`) and the exit code is the whole observation.
+    """
+    if returncode != HOST_POLICY_REFUSAL_EXIT:
+        return False
+    if summary is None:
+        return True
+    return HOST_POLICY_REFUSAL_MARKER in summary.head
 
 
 def print_failure_output(summary: PhaseOutputSummary, raw_output: Path) -> None:
@@ -709,6 +734,7 @@ def run(
     started_at_unix_millis = time.time_ns() // 1_000_000
     resources_before = child_resources()
     observations: list[PhaseObservation] = []
+    refused: list[str] = []
     exit_code = 0
 
     print(f"Glaeda local verification: {profile}", file=sys.stderr)
@@ -754,6 +780,15 @@ def run(
             if returncode != 0:
                 if output is not None and raw_output is not None:
                     print_failure_output(output, raw_output)
+                if is_host_policy_refusal(returncode, output):
+                    refused.append(phase.name)
+                    print(
+                        f"[{index}/{len(phases)}] {phase.name}: refused by host policy "
+                        f"(exit {HOST_POLICY_REFUSAL_EXIT}); it ran nowhere here, so CI owns its "
+                        "verdict; continuing with the remaining phases",
+                        file=sys.stderr,
+                    )
+                    continue
                 exit_code = returncode or 1
                 break
     except KeyboardInterrupt:
@@ -761,6 +796,14 @@ def run(
     except (OSError, RuntimeError) as error:
         print(f"verification error: {error}", file=sys.stderr)
         exit_code = 2
+
+    if refused:
+        print(
+            f"host policy refused {len(refused)} phase(s): {', '.join(refused)}; they ran nowhere, "
+            "so this run is not green and CI owns their verdict",
+            file=sys.stderr,
+        )
+        exit_code = exit_code or HOST_POLICY_REFUSAL_EXIT
 
     try:
         after = source_state(root)
