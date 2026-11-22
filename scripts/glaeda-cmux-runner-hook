@@ -1478,7 +1478,7 @@ def full_disk_line(scope: "RunnerScope") -> float | None:
 # cmux17, 2026-11-21..22, 160 of 646 completed runner jobs saw under 1 GiB free, 17:09Z auth-refresh-tests admitted at
 # 9.0 GiB beside 8 jobs; the runner's own _diag then hit ENOSPC ("No space left on device" from JobDispatcher and
 # StepsRunner), the Worker crashed and every runner on the mini lost its connection mid-job with no verdict (cmux22
-# 08:08Z, cmux17 09:05Z and 17:10Z). Leo: "A busy machine makes things slower, never makes them fail" — a job taken
+# 08:08Z, cmux17 09:05Z and 17:10Z). Leo: "A busy machine makes things slower, never makes them fail": a job taken
 # there fails anyway, later, and takes its neighbours with it. So job-started now applies the listener's own full line
 # (full_disk_line, no new number) after its disk phase, and again once its capacity is held (the capacity wait has no
 # limit, and the running jobs write the disk down meanwhile): under it, or with free disk unreadable (fail closed), the
