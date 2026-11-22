@@ -172,8 +172,9 @@ Each run checks, as the runner user and without sudo:
   claude_route                       Claude Code (~/.local/bin/claude, the capture jobs' agent) does not go through a
                                      fleet route from config/claude-routes.json that answers: ~/.claude/settings.json
                                      names no route (a personal login, which expires: cmux-mac-mini, 2026-10-21), a
-                                     route outside the list, or a personal token; or a real `claude -p` through it
-                                     failed (checked once per probe_every_s; a dead route hangs until killed).
+                                     route outside the list, or a personal token; or Claude Code does not run
+                                     (`claude --version`) or the route is not ready (GET /_subrouter/ready, no
+                                     model call and no token; checked once per probe_every_s).
                                      Healed at once by routing to the first listed route that answers (the failed
                                      one last), keeping a backup of settings.json. cmuxterm-hq build-fleet/capture-host
                                      admits no capture lease on a host whose report has it. Also run on a host
@@ -344,8 +345,13 @@ SYSTEM_DAEMONS = Path("/Library/LaunchDaemons")
 OTA_CONVERGE = ".local/state/glaeda/update/converge.json"  # glaeda-update's CONVERGE, under this home
 CLAUDE_ROUTES = "claude-routes.json"  # config/, beside this script or as mini-setup installs it
 FLEET_SERVICES = "fleet-services.json"  # config/: the owned launchd services that are not glaeda's (unmanaged_service)
-CLAUDE_PROBE_S = 60  # a route that does not answer hangs `claude -p` in its retries until it is killed
-CLAUDE_PROMPT = "Reply with exactly PONG"
+CLAUDE_PROBE_S = 60  # a route that does not answer: how long its readiness request waits
+# The route probe asks the fleet gateway whether it is ready (both sr2-gateway and the :31415 subrouter answer it,
+# with no account and no model), never Claude Code for a reply: a `claude -p "Reply with exactly PONG"` was a full
+# Claude Code turn (about 46 KB of prompt on Opus) from every fleet mini every probe_every_s, about 47 an hour
+# through sr2 (sr2 audit, 2026-11-22).
+ROUTE_READY_PATH = "/_subrouter/ready"
+ROUTE_PROBE = "route probe through "  # a claude_route finding's evidence for a route that did not answer
 CLAUDE_PERSONAL = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")  # a person's login: it overrides the route
 CLAUDE_INSTALL_S = 600  # one download (about 250 MB) and `claude install`
 CLAUDE_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?")  # install.sh's shape, prereleases too
@@ -1051,19 +1057,42 @@ class Mini:
         return load_json(self.home / ".claude/settings.json")
 
     def claude_probe(self, url: str, token: str) -> tuple[bool, str]:
-        """One `claude -p` through URL (--settings outranks ~/.claude/settings.json), without a personal token."""
+        """Whether Claude Code runs here (`claude --version`) and the fleet route URL is ready to serve it
+        (GET ROUTE_READY_PATH answers {"ok": true} and is not draining). No model call and no token: the route's
+        readiness needs neither, and `token` (the placeholder the gateway ignores) never leaves settings.json."""
         claude = self.claude_bin()
         if claude is None:
             return False, "no ~/.local/bin/claude"
-        settings = json.dumps({"env": {"ANTHROPIC_BASE_URL": url, "ANTHROPIC_AUTH_TOKEN": token}})
         env = {k: v for k, v in os.environ.items() if k not in CLAUDE_PERSONAL}
-        code, out = sh([os.fspath(claude), "-p", "--settings", settings, CLAUDE_PROMPT],
-                       timeout=CLAUDE_PROBE_S, env=env, cwd=tempfile.gettempdir())
-        if code == 0 and "PONG" in out:
-            return True, "PONG"
-        if code == 127:
+        code, out = sh([os.fspath(claude), "--version"], timeout=CLAUDE_PROBE_S, env=env, cwd=tempfile.gettempdir())
+        if code != 0:
+            return False, f"exit {code}: `claude --version` {' '.join(out.split())[-120:]}".rstrip()
+        version = (out.split() or ["?"])[0]
+        import urllib.error
+        import urllib.request
+        request = urllib.request.Request(url.rstrip("/") + ROUTE_READY_PATH, headers={"user-agent": "glaeda-mini-health"})
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        try:
+            with opener.open(request, timeout=CLAUDE_PROBE_S) as response:
+                status, raw = response.status, response.read(4096)
+        except urllib.error.HTTPError as e:
+            return False, f"HTTP {e.code} from {ROUTE_READY_PATH}"
+        except (TimeoutError, socket.timeout):
             return False, f"no answer in {CLAUDE_PROBE_S} s"
-        return False, f"exit {code}: {' '.join(out.split())[-160:]}"
+        except (urllib.error.URLError, OSError) as e:
+            reason = getattr(e, "reason", e)
+            if isinstance(reason, (TimeoutError, socket.timeout)):
+                return False, f"no answer in {CLAUDE_PROBE_S} s"
+            return False, f"no answer: {type(reason).__name__}"
+        try:
+            doc = json.loads(raw)
+        except ValueError:
+            doc = None
+        if status != 200 or not isinstance(doc, dict) or doc.get("ok") is not True:
+            return False, f"not ready: HTTP {status} from {ROUTE_READY_PATH}"
+        if doc.get("draining"):
+            return False, f"draining: {ROUTE_READY_PATH} says the route takes no new requests"
+        return True, f"ready (Claude Code {version})"
 
     def set_claude_route(self, url: str, token: str) -> str:
         """Point ~/.claude/settings.json at URL, keeping every other setting and a backup of the file."""
@@ -2258,7 +2287,7 @@ def check_claude_missing(mini: Mini) -> list[dict[str, Any]]:
 
 def check_claude_route(mini: Mini, now: float, remember: bool = True,
                        tunnel_down: bool = False) -> list[dict[str, Any]]:
-    """Claude Code goes through a fleet route that answers a real `claude -p`, checked once per probe_every_s
+    """Claude Code goes through a fleet route that is ready (`Mini.claude_probe`), checked once per probe_every_s
     (remember=False, a check-only run: the probe's answer is not kept). tunnel_down (TUNNEL_DOWN seen this run):
     without a fresh cached answer it is not probed (a probe through a broken tunnel hangs up to 60 s every run)."""
     if mini.claude_bin() is None or not mini.fleet_host():  # a personal Mac's Claude login is its owner's
@@ -2294,7 +2323,7 @@ def check_claude_route(mini: Mini, now: float, remember: bool = True,
             mini.save_claude_probe({"at": now, "at_iso": iso(now), "route": url, "ok": ok, "detail": detail})
     if ok:
         return []
-    return [finding("claude_route", "error", f"`claude -p` through {url}: {detail}", "pending", note)]
+    return [finding("claude_route", "error", f"{ROUTE_PROBE}{url}: {detail}", "pending", note)]
 
 
 # ---------------------------------------------------------------- heals
@@ -2309,7 +2338,7 @@ def heal_claude_route(mini: Mini, f: dict[str, Any]) -> tuple[bool, str]:
     token = (env.get("ANTHROPIC_AUTH_TOKEN") if current in routes else None) or mini.claude_routes().get("placeholder")
     if not token:
         return False, "config/claude-routes.json has no placeholder token"
-    failed_route = current if f.get("evidence", "").startswith("`claude -p` through ") else None
+    failed_route = current if f.get("evidence", "").startswith(ROUTE_PROBE) else None
     order = [r for r in routes if r != failed_route] + [r for r in routes if r == failed_route]
     failed = []
     for url in order:
@@ -2941,7 +2970,7 @@ def run(mini: Mini, apply: bool, now: float | None = None, state_path: Path = ST
     carried = tunnel_down = False
     if runner:
         tailnet = check_tailscale(mini)
-        # a tunnel that is down or off its route explains a `claude -p` that does not answer: claude_route neither
+        # a tunnel that is down or off its route explains a route probe that does not answer: claude_route neither
         # keeps that probe nor reroutes on it until the tunnel is back (tailscale_no_route's restart may fix it)
         tunnel_down = any(f["code"] in TUNNEL_DOWN for f in tailnet)
         found = (check_console(mini) + check_power(mini) + check_load_high(mini) + tailnet + check_runners(mini) + check_runner_versions(mini)

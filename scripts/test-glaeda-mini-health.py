@@ -3332,32 +3332,87 @@ class ClaudeRouteOnDisk(unittest.TestCase):
         path.chmod(0o755)
         return path
 
-    def test_the_probe_routes_through_settings_and_drops_a_personal_token(self) -> None:
+    @contextlib.contextmanager
+    def route(self, status: int = 200, body: object = None, hang: float = 0.0):
+        """A stand-in fleet route on 127.0.0.1 that answers GET /_subrouter/ready; yields (url, request log)."""
+        import http.server
+        import threading
+        seen: list[tuple[str, str, dict[str, str]]] = []
+        doc = {"ok": True, "draining": False} if body is None else body
+
+        class Route(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args) -> None:
+                pass
+
+            def answer(self) -> None:
+                seen.append((self.command, self.path, {k.lower(): v for k, v in self.headers.items()}))
+                if hang:
+                    time.sleep(hang)
+                raw = (doc if isinstance(doc, str) else json.dumps(doc)).encode()
+                self.send_response(status)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            do_GET = do_POST = answer
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Route)
+        server.daemon_threads = True
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield f"http://127.0.0.1:{server.server_address[1]}", seen
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_the_probe_makes_no_model_call(self) -> None:
+        """A `claude -p` probe was a full Claude Code turn (about 46 KB of prompt on Opus) from every fleet mini every
+        30 min: about 47 an hour through sr2 (sr2 audit, 2026-11-22). The probe asks the route whether it is ready
+        and Claude Code for its version, never for a reply, and sends the route no token."""
         seen = self.home / "seen"
-        self.fake_claude(f'printf "%s\\n" "$@" > {seen}; env >> {seen}; echo PONG\n')
+        self.fake_claude(f'printf "%s\\n" "$*" >> {seen}; echo "2.1.330 (Claude Code)"\n')
         os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = "personal"
         try:
-            ok, detail = self.mini.claude_probe(SR2, "subrouter")
+            with self.route() as (url, requests):
+                ok, detail = self.mini.claude_probe(url, "subrouter")
         finally:
             del os.environ["CLAUDE_CODE_OAUTH_TOKEN"]
-        self.assertEqual((ok, detail), (True, "PONG"))
-        text = seen.read_text()
-        self.assertIn(json.dumps({"env": {"ANTHROPIC_BASE_URL": SR2, "ANTHROPIC_AUTH_TOKEN": "subrouter"}}), text)
-        self.assertNotIn("personal", text)
+        self.assertEqual((ok, detail), (True, "ready (Claude Code 2.1.330)"))
+        calls = seen.read_text().splitlines()
+        self.assertEqual(calls, ["--version"], "Claude Code was asked for more than its version")
+        self.assertEqual([(m, p) for m, p, _ in requests], [("GET", "/_subrouter/ready")])
+        headers = requests[0][2]
+        self.assertNotIn("authorization", headers)
+        self.assertNotIn("x-api-key", headers)
 
-    def test_a_probe_that_hangs_or_fails_is_a_failure(self) -> None:
-        self.fake_claude("sleep 30\n")
+    def test_a_route_that_is_not_ready_hangs_or_fails_is_a_failure(self) -> None:
+        self.fake_claude('echo "2.1.330 (Claude Code)"\n')
+        for status, body, want in ((200, {"ok": True, "draining": True}, "draining"),
+                                   (200, {"ok": False}, "not ready"),
+                                   (502, "upstream request failed", "HTTP 502"),
+                                   (200, "not json", "not ready")):
+            with self.route(status, body) as (url, _):
+                ok, detail = self.mini.claude_probe(url, "subrouter")
+            self.assertFalse(ok, (status, body))
+            self.assertIn(want, detail, (status, body))
         orig = health.CLAUDE_PROBE_S
         health.CLAUDE_PROBE_S = 1
         try:
-            self.assertEqual(self.mini.claude_probe(SR2, "subrouter"), (False, "no answer in 1 s"))
+            with self.route(hang=3) as (url, _):
+                self.assertEqual(self.mini.claude_probe(url, "subrouter"), (False, "no answer in 1 s"))
         finally:
             health.CLAUDE_PROBE_S = orig
-        (self.home / ".local/bin/claude").write_text("#!/bin/sh\necho 'API Error: 401 OAuth session expired'\nexit 1\n")
-        ok, detail = self.mini.claude_probe(SR2, "subrouter")
+        self.assertEqual(self.mini.claude_probe("http://127.0.0.1:9", "subrouter")[0], False, "a closed port")
+
+    def test_a_claude_that_does_not_run_is_a_failure(self) -> None:
+        self.fake_claude("echo 'dyld: Library not loaded' >&2\nexit 134\n")
+        with self.route() as (url, requests):
+            ok, detail = self.mini.claude_probe(url, "subrouter")
         self.assertFalse(ok)
-        self.assertIn("exit 1", detail)
-        self.assertIn("401", detail)
+        self.assertIn("exit 134", detail)
+        self.assertEqual(requests, [], "the route is asked only after Claude Code runs")
 
     def test_no_claude_binary_means_no_check(self) -> None:
         self.assertIsNone(self.mini.claude_bin())
