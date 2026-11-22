@@ -31,6 +31,8 @@ PREJOB_MARGIN_GIB) it starts the queued pass before the job and waits up to PREJ
 (prejob_evict), then admits it: the eviction happens before every job, not after it. Free disk under a 10 GiB margin
 plus each job in flight's and this job's peak, learned per job from this host's job log (20 GiB with no history),
 starts a pressure pass and holds the start within the same disk budget, never longer (JOB_DISK_PEAK_LEARNED).
+The one disk refusal is a cmux job's own need: free disk still under the margin plus that job's learned peak after
+the pass refuses it at setup, so the owned pool's rescue places it on a mini with room (JOB_DISK_OWN_NEED).
 Any crash also exits non-zero, which refuses the job. An admitted job is then held to the fleet host,
 so a PR job never lands on a mini that is busy with other work. It is refused fast (the pool picker
 re-runs it elsewhere) when:
@@ -10225,6 +10227,32 @@ def job_disk_peak_hold(path: str, state_dir: Path, own_pid: int | None, key: str
         return f"runner jobs' disk check skipped: {type(error).__name__}"
 
 
+def job_disk_own_refusal(path: str, key: str | None, log: Path | None = None) -> str | None:
+    """JOB_DISK_OWN_NEED, after job_disk_peak_hold's pass: the refusal when free disk is under RUNNER_JOBS_FLOOR_GIB +
+    this job's own learned peak (job_peak_gib), else None. Started there, the job runs out of disk mid-build (cmux22,
+    cmux17 and mac-mini-6 failed daemon tests with ENOSPC at 33-38 GiB free after "the disk budget is spent; started
+    without holding"); refused at setup, the owned pool's rescue places it on a mini with room. The in-flight jobs'
+    peaks stay a warning (job_disk_peak_hold): they may finish first, and counting them would refuse every start on a
+    busy mini. A job with no learned peak here (job_disk_gib's flat guess) and an unreadable disk or job log never
+    refuse."""
+    try:
+        free = free_or_none(path)
+        if free is None:
+            return None
+        peaks = learned_job_peaks(job_log_tail(log))
+        if key is None or key not in peaks:
+            return None  # no history here: the flat default is a guess, not this job's need
+        own, source = peaks[key]
+        need = round(RUNNER_JOBS_FLOOR_GIB + own, 1)
+        if free >= need:
+            return None
+        return (f"disk: {free:.1f} GiB free after the reclaim pass, under this job's own need of {need:g} GiB "
+                f"({RUNNER_JOBS_FLOOR_GIB:g} GiB margin + its {own:g} GiB peak, {source}); refused at setup so the "
+                "rescue places it on a mini with room, not started into ENOSPC (JOB_DISK_OWN_NEED)")
+    except Exception:  # noqa: BLE001  housekeeping never fails the job on its own error
+        return None
+
+
 def bounded_waiters(state_dir: Path, waiting: list[int] | set[int], now: float | None = None,
                     log: Callable[[str], None] | None = None,
                     identity: Callable[[int], str | None] | None = None,
@@ -15415,6 +15443,12 @@ def main(argv: list[str] | None = None) -> int:
                                            evicted_to=floor_evicted[0])
             if peak_note:
                 print(f"{PREFIX}: {peak_note}", flush=True)
+            # JOB_DISK_OWN_NEED: a home job whose own learned peak does not fit is refused for the rescue to place
+            # elsewhere; a guest has no rescue, so it starts as before
+            if not is_guest(repo, args.home_repo):
+                why = job_disk_own_refusal(disk_path, peak_key, args.job_log)
+                if why:
+                    return refused(why, disk=True)
         # DISK_FULL_REFUSES: the listener's full line, read after every eviction and wait above; a nightly job keeps its
         # own reserve (NIGHTLY_DISK_RESERVE) and is never refused for disk
         full_scope = RunnerScope(min_free_gib=args.min_free_gib, dedicated=bool(args.dedicated_admit),

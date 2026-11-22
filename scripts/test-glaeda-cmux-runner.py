@@ -2702,6 +2702,55 @@ class HookTest(unittest.TestCase):
                                                           None, deadline, log, self.dir, table))
             ev.assert_not_called()
 
+    def test_a_job_whose_own_learned_peak_does_not_fit_is_refused_for_the_rescue(self) -> None:
+        """JOB_DISK_OWN_NEED: build-app's learned peak is 30 GiB, so under 10 + 30 = 40 GiB free it is refused (cmux22's
+        ENOSPC daemon tests started at 33 GiB free); at 40 it starts; with no history, a guess, it never refuses."""
+        with mock.patch.dict(os.environ):
+            os.environ.pop(hook.DISK_JOB_PEAK_ENV, None)
+            log = self.peak_log([(100.0, 70.0, True)] * 3)
+            with mock.patch.object(hook, "free_gib", return_value=33.2):
+                why = hook.job_disk_own_refusal(os.fspath(self.dir), self.PEAK_KEY, log)
+                self.assertIn("33.2 GiB free after the reclaim pass, under this job's own need of 40 GiB "
+                              "(10 GiB margin + its 30 GiB peak, p90 of 3 runs here alone)", why)
+                self.assertIn("(JOB_DISK_OWN_NEED)", why)
+                self.assertIsNone(hook.job_disk_own_refusal(os.fspath(self.dir), "other/x.yml/lint", log))
+                self.assertIsNone(hook.job_disk_own_refusal(os.fspath(self.dir), None, log))
+            with mock.patch.object(hook, "free_gib", return_value=40.0):
+                self.assertIsNone(hook.job_disk_own_refusal(os.fspath(self.dir), self.PEAK_KEY, log))
+            with mock.patch.object(hook, "free_gib", side_effect=OSError("gone")):
+                self.assertIsNone(hook.job_disk_own_refusal(os.fspath(self.dir), self.PEAK_KEY, log))
+            with mock.patch.object(hook, "free_gib", return_value=5.0), \
+                    mock.patch.object(hook, "job_log_tail", side_effect=RuntimeError("boom")):
+                self.assertIsNone(hook.job_disk_own_refusal(os.fspath(self.dir), self.PEAK_KEY, log))
+
+    def test_job_started_refuses_a_cmux_job_whose_own_need_does_not_fit_and_starts_a_guests(self) -> None:
+        """The whole job-started: a spent disk budget used to start build-app at 33 GiB free against its 30 GiB
+        learned peak; now it is refused with the disk flag (the rescue re-places it), and a guest still starts."""
+        self.fleet()
+        for repo, want in (("manaflow-ai/cmux", 1), ("other/guest", 0)):
+            log = self.peak_log([(100.0, 70.0, True)] * 3, key=f"{repo}/ci.yml/build-app")
+            job = self.worker_stand_in()
+            push = event(self.dir, "push", {"repository": repo})
+            env = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GLAEDA_RUNNER_TELEMETRY": "0",
+                   "GLAEDA_CANONICAL_ROOT_PARENT": NO_ROOTS, "GLAEDA_FLEET_DIR": os.fspath(self.dir / "fleet"),
+                   "GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": os.fspath(push), "GITHUB_REPOSITORY": repo,
+                   "GITHUB_WORKFLOW_REF": f"{repo}/.github/workflows/ci.yml@refs/heads/main",
+                   "GITHUB_JOB": "build-app"}
+            with self.subTest(repo=repo), mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch.object(hook, "free_gib", return_value=33.0), \
+                    mock.patch.object(hook, "prejob_evict", return_value=None), \
+                    mock.patch.object(hook, "processes", return_value={}), \
+                    mock.patch.object(hook, "evict", return_value="the eviction budget is spent"), \
+                    mock.patch.object(hook, "start_runner_parent_watchdog"), \
+                    contextlib.redirect_stdout(io.StringIO()) as out:
+                code = hook.main(["job-started", "--allowed-repo", "manaflow-ai/cmux", "--allowed-repo", "other/guest",
+                                  "--reservation", os.fspath(self.dir / "fleet" / "reservation.json"),
+                                  "--host-lock", os.fspath(self.dir / "fleet" / "host.lock"), "--min-free-gib", "30",
+                                  "--state-dir", os.fspath(self.dir / "state"), "--watch-pid", str(job.pid),
+                                  "--job-log", os.fspath(log), "--gui-wait", "0", "--guest-wait", "0"])
+                self.assertEqual(code, want, out.getvalue())
+                self.assertEqual("JOB_DISK_OWN_NEED" in out.getvalue(), want == 1, out.getvalue())
+
     def test_the_peak_hold_never_refuses_or_waits_past_the_disk_budget(self) -> None:
         """A spent budget starts the job at once; job-started admits a job held for disk and passes the hold only
         its own DISK_RECLAIM_WAIT_S deadline."""

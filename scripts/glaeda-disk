@@ -1334,7 +1334,8 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "5d3ef91a91a33767a02b1ab8a1441bc22d9d0334261f08d023e68889baa421f8",
     "fc721033bb0823960cfebc55bc401ff0ecf6691e535baad0fc571bd4c39fb7d2",
     "a0839b207ad34939c906c250c8076201ec3a4a81e299c82f3d909247cd2cdca9",
-    "65c4033d6f03a23e4c3d23fb0bcbb03564312fe4486e9b8f2cc24b2ee05b115b",
+    "b956998b301fbfc71dc40700e0ac0ec60179d8cda36fd5f96bf30e06b9b19ce8",
+    "c4b256b1f02efe9dd1a2c43815936ef83ba57ef6fc84f15a6a27f4677e2a2a53",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -7678,7 +7679,16 @@ LANE_HOME_TREES: tuple[tuple[str, str, str, str, dict[str, Any]], ...] = (
      {"skip": (".work",)}),
 )
 LANE_HOME_FAMILY_IDS = frozenset(t[0] for t in LANE_HOME_TREES)
-SESSION_HOLD_FAMILY_IDS = LANE_TMP_FAMILY_IDS | LANE_HOME_FAMILY_IDS | {"claude-scratchpad"}
+# Cargo targets inside tools/wt's worktrees on a lane VM (~/.wt/checkouts/<repo>/<name>/target and one level down,
+# cmux-tui/target). Before this no family's root reached ~/.wt (worktree_roots looks under ~/Projects only), so
+# fs-agent-lane-2 (2026-11-22, 87% of 252G) counted 178G of ~/.wt as "unwalked": 108 cmux worktrees, ten with a
+# cmux-tui/target of 1-23G each (87G), and a pressure pass that found 0 B to reclaim. A target goes whole, as build
+# output (cargo builds it again), once nothing below it changed for LANE_SESSION_IDLE_HOURS and its worktree is
+# provably idle (wt_checkout_hold: no process cwd, open file or TMPDIR in the worktree, no command naming it, no open
+# acpmux session working in it). The worktree itself, its sources and git state stay: worktree_reclaim's.
+WT_CARGO_TARGET = "wt-cargo-target"
+WT_CHECKOUTS = ".wt/checkouts"  # tools/wt's host_worktrees, below HOME
+SESSION_HOLD_FAMILY_IDS = LANE_TMP_FAMILY_IDS | LANE_HOME_FAMILY_IDS | {"claude-scratchpad", WT_CARGO_TARGET}
 ACPMUX_DEAD_STATUSES = frozenset({"closed"})  # acpmux's own: a closed session's folder goes at its purge
 SESSION_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 SESSION_ENV_KEYS = ("ACPMUX_SESSION_ID",)
@@ -7847,6 +7857,8 @@ def session_hold(fam: Family, path: Path, cmds: str, fresh: bool = False) -> str
     Unknown liveness is a hold: an unreadable acpmux list or process table, a session acpmux does not list."""
     if fam.id not in SESSION_HOLD_FAMILY_IDS:
         return ""
+    if fam.id == WT_CARGO_TARGET:
+        path = wt_checkout_of(path)  # a lane works in its worktree, not in the target below it
     name = path.name
     real = os.path.realpath(path)
     mine = {os.fspath(path), real}
@@ -8024,6 +8036,46 @@ def acpmux_daemon_roots(base: Path) -> list[Path]:
     return out
 
 
+def wt_checkout_of(target: Path) -> Path:
+    """The tools/wt worktree a wt-cargo-target item sits in: <root>/<repo>/<name> above <name>[/<crate>]/target."""
+    root = HOME / WT_CHECKOUTS
+    rel = target.relative_to(root) if target.is_relative_to(root) else None
+    if rel is not None and len(rel.parts) >= 3:
+        return root / rel.parts[0] / rel.parts[1]
+    return target.parent
+
+
+def wt_checkout_hold(target: Path, opened: frozenset[str] | list[str], cmds: str) -> str:
+    """Why the worktree around a wt-cargo-target item is in use by a process, or "" (session_hold covers acpmux)."""
+    checkout = os.fspath(wt_checkout_of(target))
+    if in_cwd(checkout, opened):
+        return "its worktree is open by a process (cwd or open file)"
+    if named_by(checkout, cmds):
+        return "its worktree is named by a running command"
+    return ""
+
+
+def wt_cargo_targets(root: Path) -> list[Path]:
+    """Cargo's target directories (tagged by cargo) at the top of each tools/wt worktree (<root>/<repo>/<name>) or one
+    level down (cmux-tui/target). Fixed places, so no source tree is walked; dot entries (wt's spares and bases) are
+    not lane worktrees."""
+    found: list[Path] = []
+    for repo in _children(root):
+        if repo.name.startswith(".") or repo.is_symlink() or not repo.is_dir():
+            continue
+        for checkout in _children(repo):
+            if checkout.name.startswith(".") or checkout.is_symlink() or not checkout.is_dir() \
+                    or not (checkout / ".git").exists():
+                continue
+            for parent in [checkout, *(c for c in _children(checkout)
+                                       if not c.name.startswith(".") and not c.is_symlink() and c.is_dir())]:
+                target = parent / "target"
+                if target.is_dir() and not target.is_symlink() \
+                        and CARGO_TAG.search(_head(os.fspath(target / "CACHEDIR.TAG"), 256)):
+                    found.append(target)
+    return sorted({p for p in found if contained_directory(p, root)})
+
+
 def lane_vm_families(tmp: Path, uid: int) -> list[Family]:
     """A Linux host's agent scratch, one item per session or tree (see LANE_SESSION_IDLE_HOURS)."""
     window = LANE_SESSION_IDLE_HOURS
@@ -8054,6 +8106,11 @@ def lane_vm_families(tmp: Path, uid: int) -> list[Family]:
         fams.append(Family(fam_id, root, True, rebuild, files=True, git_disposable=True, nested_git=True,
                            min_idle_hours=window, mirror_idle_hours=LANE_GIT_WORK_IDLE_HOURS, deep_mtime=True,
                            owner=owner, rebuild_minutes=2, platform="linux", **extra))
+    wt_root = HOME / WT_CHECKOUTS
+    if wt_root.is_dir() and not wt_root.is_symlink():
+        fams.append(Family(WT_CARGO_TARGET, wt_root, True, "cargo builds it again in its worktree",
+                           checkout_builds=True, build_output=True, min_idle_hours=window, deep_mtime=True,
+                           owner="cargo, in a tools/wt lane worktree", rebuild_minutes=10, platform="linux"))
     return fams
 
 
@@ -11571,6 +11628,7 @@ def candidates(fam: Family) -> list[Path]:
                                 else cmux_next_ci_generated_paths(fam.root) if fam.id == CMUX_NEXT_CI_FAMILY
                                 else runner_checkout_builds(fam.root) if fam.id == RUNNER_BUILD_FAMILY
                                 else runner_git_garbage(fam.root) if fam.id == RUNNER_GIT_GARBAGE_FAMILY
+                                else wt_cargo_targets(fam.root) if fam.id == WT_CARGO_TARGET
                                 else checkout_builds(fam.root))
         level = list(_DISCOVERED[key])
     elif fam.match:
@@ -12050,6 +12108,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
         if fam.id == "claude-scratchpad" and claude_session_active(path.name, idle_window(fam, idle_hours) * 3600):
             reasons.append("claude session active")
         if fam.id in SESSION_HOLD_FAMILY_IDS and not blind and (why := session_hold(fam, path, cmds)):
+            reasons.append(why)
+        if fam.id == WT_CARGO_TARGET and not blind and (why := wt_checkout_hold(path, opened, cmds)):
             reasons.append(why)
         if git_holder_family(fam) and (why := git_used_from_outside(path)):
             reasons.append(why)
@@ -13405,6 +13465,31 @@ def _background_argv(argv: list[str]) -> list[str]:
     return argv
 
 
+CENSUS_SCOPE_CHECK_S = 1.0  # how long a scoped launch may take to fail before the plain launch is used instead
+# A slice stops starting walks at CENSUS_BUDGET_S, and its last du is cut at CENSUS_DU_TIMEOUT_S; the scope's own
+# RuntimeMaxSec is the hard bound past both, so a slice stuck outside those checks (a hung stat, a sudo prompt)
+# is killed by systemd instead of holding the census lock forever. Progress is saved every CENSUS_SAVE_EVERY_S.
+CENSUS_SCOPE_MAX_S = CENSUS_BUDGET_S + CENSUS_DU_TIMEOUT_S + 60
+
+
+def census_scope_argv(argv: list[str]) -> list[str] | None:
+    """ARGV in its own transient systemd scope when this run is a systemd unit's (INVOCATION_ID), else None.
+
+    A Type=oneshot unit's KillMode=control-group kills every process left in the unit's cgroup when its main process
+    exits, and start_new_session leaves the child in that cgroup: the census slice died seconds after the
+    glaeda-disk-pressure.service pass that started it, before its first save. fs-agent-lane-2, 2026-11-22: census.json
+    started 2026-11-21 16:12Z still had pending ["/"] and no rows after a day of hourly slices, so 204G of the 224G
+    used read "unwalked (no volume census yet)". A scope is its own cgroup, so the slice outlives the unit, and its
+    RuntimeMaxSec (CENSUS_SCOPE_MAX_S) bounds it once it no longer dies with the unit."""
+    if DARWIN or not os.environ.get("INVOCATION_ID"):
+        return None
+    run = shutil.which("systemd-run")
+    if not run:
+        return None
+    return [run, *(["--user"] if os.getuid() else []), "--scope", "--quiet", "--collect",
+            f"--property=RuntimeMaxSec={int(CENSUS_SCOPE_MAX_S)}", "--", *argv]
+
+
 def launch_background_census() -> bool:
     """Start one detached, throttled census slice when one is due, handing it the lock this process took."""
     if not CENSUS_AUTOLAUNCH or not census_roots():
@@ -13419,11 +13504,23 @@ def launch_background_census() -> bool:
     if handle is None:
         return False  # a slice is running
     fd = handle.fileno()
+    argv = _background_argv([sys.executable, os.path.abspath(__file__), "--census", "--census-lock-fd", str(fd)])
+
+    def spawn(cmd: list[str]) -> subprocess.Popen:
+        return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                                start_new_session=True, pass_fds=(fd,))
+
     try:
-        subprocess.Popen(_background_argv([sys.executable, os.path.abspath(__file__), "--census",
-                                           "--census-lock-fd", str(fd)]),
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         stdin=subprocess.DEVNULL, start_new_session=True, pass_fds=(fd,))
+        scoped = census_scope_argv(argv)
+        started = False
+        if scoped is not None:
+            proc = spawn(scoped)
+            try:
+                started = proc.wait(timeout=CENSUS_SCOPE_CHECK_S) == 0  # a slice that ended at once (nothing due)
+            except subprocess.TimeoutExpired:
+                started = True  # the slice runs in its own scope
+        if not started:
+            spawn(argv)  # no systemd unit, or systemd-run could not make the scope (no user bus)
     except (OSError, subprocess.SubprocessError):
         handle.close()
         return False
@@ -14958,6 +15055,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                     and artifact_referenced(p, fresh_artifact_references(fam.reference_root)))
                 or (i.family == "claude-scratchpad" and claude_session_active(p.name, idle_window(fam, idle_hours) * 3600))
                 or (fam.id in SESSION_HOLD_FAMILY_IDS and session_hold(fam, p, cmds, fresh=True))
+                or (fam.id == WT_CARGO_TARGET and wt_checkout_hold(p, cwds, cmds))
                 or (git_holder_family(fam) and git_used_from_outside(p, fresh=True))
                 or (i.family == SPM_SCRATCH and spm_scratch_held(p))
                 or (i.family == SEED_ROOT_FAMILY and seed_root_held(fam, p))

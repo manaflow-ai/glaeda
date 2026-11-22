@@ -12149,6 +12149,14 @@ LAND_FORWARD_RETRY_MAX = 600.0
 LAND_FORWARD_BATCH = 50  # requests per forward
 LAND_SERVE_OPS = ("land", "withdraw", "status", "batch", "room")
 LAND_FORWARDED = "forwarded"
+# A request `land serve` gets on a host that forwards its own lands is handed on to that host's executor, once
+# (the request then carries LAND_SERVE_RELAY_KEY, and a host that gets one relayed never relays it again, so two hosts
+# still never pass a PR back and forth). It was refused not_executor: 2026-11-22, after huge-blue's lands moved to
+# cmux-cp-1, every lane VM's hand-off of a PR it could not judge (the broker asks the broker host's `land serve`) was
+# refused, and leo-workspace#8504 sat 100 min with nothing able to take it. "room" and "batch" (a peer's overflow)
+# stay refused: a host with an executor takes no overflow.
+LAND_SERVE_RELAYED = frozenset({"land", "withdraw", "status"})
+LAND_SERVE_RELAY_KEY = "relayedBy"
 LAND_REQUESTER_SHAPE = re.compile(r"[^\s\x00-\x1f]{1,200}")  # acpmux send takes it as one argv word
 LAND_FORWARD_FILE = "forward.json"  # the last forward's outcome, for `land status`
 LAND_REQUEST_ID = re.compile(r"[A-Za-z0-9._:-]{1,160}")
@@ -12721,6 +12729,13 @@ LAND_VERDICT_KEEP = 600.0
 # base moving under a green head, mergeability, a PR merged or closed) is judged at most this late. A feed that is
 # down, reset, switched or not covering the repository holds nothing: every path reads as before.
 LAND_FEED_QUIET_MAX = 1800.0
+# The wait verdicts whose own timeout does not re-run land_judge either while the feed is quiet since them: what they
+# wait for (checks finishing at the head) reaches the feed as a run or suite event, which is judged at once. Queue
+# host, 2026-11-22 17:35-18:25Z: 42 of 141 checks_running judgments were a wait_pr's timer (why=woke) answering
+# checks_running again, a share of the 13,770 worker-seconds that code held. Still bounded by LAND_FEED_QUIET_MAX from
+# the verdict, and the judgment past it counts toward the stop as the timeout always did. Other waits (a check that
+# never appeared, a hold) keep their timeout: what ends them may be nothing the feed carries.
+LAND_TIMER_HELD = frozenset({"checks_running"})
 LAND_FEED_GAP = 4 * CONTROLLER_FEED_EVERY  # a longer gap between feed answers starts its quiet over
 LAND_FEED_KEEP = 2 * LAND_FEED_QUIET_MAX  # how long one PR's, head's or branch's last event is remembered
 # An upstream host (a lane VM) follows no feed of its own: it holds no controller token, and its daemon reads through
@@ -12751,6 +12766,19 @@ LAND_RETRY_KINDS = frozenset({"retry", "fetch"})
 # unfinished. A new head or a requeue starts it again (an "ok" whose merge is refused for running checks does not).
 # Past STRAGGLER_AFTER a check queued with no runner is a straggler to `wait`; four hours of nothing moving at all is
 # a check that will never start.
+# That bound keys progress on what the wait waits for -- the checks the cache shows unfinished at the head, and how
+# many checks its read held (land_wait_shape) -- not on every check's conclusion (land_check_fingerprint). Queue host,
+# 2026-11-22: cmux#49430 took 51 waits in 9.8 h at one head on a "webview" refusal that named the PR's own reds, every
+# one of them logged idle 0, while no check at that head was unfinished at all. Its check fingerprint flipped between
+# two values in reads 60 s apart (0d357b46 -> 7b1e99e0 -> 0d357b46) and its check page read 175 of 208 checks under
+# "API rate limit already exceeded"; cmux#48267's reads 500 s apart changed 50 of their 223 checks, every one a
+# completed check whose workflow was read as its run's name one time ("cmux-next · d1498b49d07a") and as its
+# workflow's the next ("cmux-next"). Each flip reset movedAt, so the 4 h bound could never fire: 5 rows were judged
+# 52 times in 24 h past the bound they should have stopped at (cmux#49430 23 of those, and still waiting), 4 of
+# them with no stop at all, each paying one land_judge every LAND_VERDICT_KEEP for as long as the row lived, and no
+# requester was ever told its reds. A completed check read differently and a check page a read could not finish are
+# not a wait making progress; a check finishing, starting, or appearing where the reads had held none (the count
+# rising) still is.
 LAND_WAIT_KINDS = frozenset({"wait_pr", "wait_run"})
 # What made a judgment run (judge's WHY, kept on the entry and counted with explain_unmoved_<why>): a bound of the
 # queue's own ran out (LAND_JUDGE_DUE) or some evidence changed. An "unmoved" judgment -- same head, same check
@@ -12984,6 +13012,13 @@ LAND_READING_MAX_AGE = 300.0
 LAND_LATCH_OVERRIDES = ("reading_above_reserve", "ends_at_reading_reset", "window_reset", "graphql_rest_judges")
 LAND_LATCH_SECONDARY = "secondary"  # GitHub's secondary limit: /rate_limit cannot see it; it holds to its own until
 LAND_QUOTA_REFUSAL = re.compile(r"quota: not judged|\[quota: not judged")
+# land_judge's "quota" answer for one CI job that spent the repo installation's API limit ("base_red_excuse.py job
+# rate-limited at HEAD ...: run R; job J; no attempt before HH:MMZ. Rerun run R ... the repo installation's API limit
+# refused only that hand-off job"). The time it names is when that job may be rerun, and the limit is the
+# installation's, not this login's: every other row's reads still answer. So it parks its own entry until then and
+# never the host (park_quota's HOST). One origin host, 2026-11-22 20:21Z: one such answer at 908aa008 parked the whole
+# queue until 20:40:59Z, and eleven pinned lands queued 17:55-20:15Z sat unjudged behind it.
+LAND_JOB_QUOTA = re.compile(r"\bbase_red_excuse\.py job rate-limited at ")
 # An "unreadable" judgment (LAND_UNREAD_CODES) whose read the gh-quota shim refused, in the shim's own words. Read on
 # that code's reason only: it names the read that failed, never a red job's log. Such a judgment is the login's state,
 # not the PR's, so it parks until the reset it names (park_quota) as a "quota" answer does. The broker client
@@ -13115,7 +13150,7 @@ LAND_DRAFT_AGE = 90.0  # == BROKER_MAX_AGE, asserted by a test (the daemon's cyc
 # sat parked 3343 min, #13608 1923 min and #13624 836 min with nobody told what to do. Stopping at the first refusal
 # names the one step that clears it: resolve the conflict and re-land pinned. Nothing here rebases or force-pushes:
 # that is a write on someone's branch, so it stays the requester's call, as the draft case stays theirs. The one push
-# is LAND_UNION's: the base merge update-branch would have made, when only merge=union paths conflict.
+# is LAND_UNION's: the base merge update-branch would have made, when git merges the base into the head cleanly.
 # A conflict GitHub's update-branch refuses can still be one git settles: GitHub's mergeability, squash and
 # update-branch ignore .gitattributes, even the built-in merge=union, so a PR that only appended lines to an
 # append-only file (goals/*.md, docs/handbook/*.md, REPAIR.md in cmuxterm-hq) stops on update_branch_conflict
@@ -13128,7 +13163,18 @@ LAND_DRAFT_AGE = 90.0  # == BROKER_MAX_AGE, asserted by a test (the daemon's cyc
 # clean. Then the merge commit (first parent the head, second the base) is pushed to the PR's branch -- the same
 # commit update-branch would have made, a fast-forward GitHub refuses if the branch moved -- and the land goes on as
 # after an update-branch (pin_follow). Any other conflict stops as below, its reason saying why it was not merged.
+# GitHub's 422 is often wrong outright, union or not: 2026-11-22, within 90 minutes the queue stopped manaflow-ai/cmux
+# #50065, #50046, #50102, #44645, #50128, #50387 and cmuxterm-hq#18393 on update_branch_conflict, and #50046 and
+# hq#18393 then merged cleanly with a plain local `git merge origin/<base>`. Leo's ask: "on `update_branch_conflict`,
+# have land try a local merge of origin/<base> into the head in a scratch worktree from its mirror". So the merge is
+# no longer limited to merge=union paths: whenever the merge honoring the base's .gitattributes is clean (whether or
+# not the attribute-free one conflicts), it is pushed as above; only a true conflict stops, and the stop names the
+# conflicting files. The merge runs in this queue's own bare mirror with `git merge-tree --write-tree` (a worktree-free
+# scratch merge: nothing checked out, nothing to clean up). Only a PR whose branch lives on the base repository
+# (forks never: union_plan reads the branch from github.com/<base repo> and requires it at the judged head) of an
+# owner in LAND_MERGE_OWNERS is pushed to; a plain merge commit, fast-forward only, never a force-push.
 LAND_UNION_URL = "https://github.com/{repo}.git"
+LAND_MERGE_OWNERS = frozenset({"manaflow-ai", "teamleaderleo"})
 LAND_UNION_DEADLINE = 120.0
 LAND_STEP_CONFLICT = re.compile(r"\bmerge conflict between base and head\b"
                                 r"|\b(?:pull request|PR) has merge conflicts\b"
@@ -13488,16 +13534,33 @@ BRANCH_SAFE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,250}")
 # A "fetch" step fills this host's mirror of the PR's repository. huge-blue, 2026-11-17 ~14:01Z: land_judge could not
 # read its mirror (ls-remote failed) and refused leo-workspace#5653 and #5614 "unreadable", naming a fetch of that
 # mirror as a "command" step; the queue stops on a command, no lane can run one on huge-blue, and a coordinator ran
-# the fetch by hand. land_judge (mirror_fetch_argv) now names it {"kind": "fetch", "argv": [...]}, one of two shapes,
-# which this queue checks again on its own (land_fetch_shape, then the mirror itself) before it runs it, bounded:
+# the fetch by hand. A fetch step is {"kind": "fetch", "argv": [...]}, one of two shapes, which this queue checks
+# again on its own (land_fetch_shape, then the mirror itself) before it runs it, bounded:
 # - git --git-dir MIRROR.git fetch [LAND_FETCH_OPTIONS] origin REFSPEC..., MIRROR's origin being the PR's repository
 #   on github.com (LAND_FETCH_ORIGIN), run with the bare env (this host's own git login);
 # - lane-gh fetch OWNER/REPO --dir MIRROR.git [--branch B]..., OWNER/REPO the PR's (a broker read: land_lane).
 # Any other argv stops the entry as policy and runs nothing. A fetch that fails is a refused step (step_refused): it
 # backs off, and the LAND_STEP_STOP-th identical failure stops the entry and tells the requester.
+# The git form runs through git-fetch-once (LAND_FETCH_ONCE: one fetch per repository at a time, the guarded path of
+# hq docs/handbook/retry-repeats-a-deterministic-failure.md), its own bounds inside LAND_FETCH_DEADLINE.
+# land_judge's mirror fill (HeadNotInMirror, gh_mirror_reads.Unreadable: "...; fill it: git --git-dir M.git fetch
+# origin +refs/pull/N/head:..." or "lane-gh fetch R --dir M.git --branch pull/N/head") comes as a "command" step, so
+# the queue stopped on it. manaflow-ai/cmuxterm-hq#19115, 2026-11-22: a land stopped on that command on the executor
+# host and a person ran the printed fetch and queued it again ("The lander should run the fill it names itself (one
+# bounded fetch through git-fetch-once) and retry once, stopping only if the fetch fails."). land_command_fetch reads
+# such a command as this fetch step (from "command"): one fill per head (LAND_FILL_ONCE), then one judgment again; a
+# fill that fails, or a second fill asked at a head already filled, stops naming the fetch's error or the refusal.
 LAND_FETCH_DEADLINE = 300.0
 LAND_FETCH_CONFIG_DEADLINE = 10.0  # git config --get remote.origin.url
-LAND_FETCH_OPTIONS = frozenset({"--quiet", "--no-tags", "--no-write-fetch-head"})
+# gh_mirror_reads.MIRROR_FETCH_FLAGS (the flags its fill names) and this queue's own: none reads or runs anything else
+LAND_FETCH_OPTIONS = frozenset({"--quiet", "--no-tags", "--no-write-fetch-head", "--no-show-forced-updates",
+                                "--no-write-commit-graph", "--no-auto-gc"})
+LAND_FETCH_ONCE = Path.home() / ".local/bin/git-fetch-once"  # land.json "gitFetchOnce"; else PATH's; else plain git
+# git-fetch-once's own bounds (its waiting for another fetch of the mirror, the fetch, the refetch that heals a store),
+# summing under LAND_FETCH_DEADLINE so it ends its own git child before the queue's timeout would orphan it
+LAND_FETCH_ONCE_ENV = {"GIT_FETCH_ONCE_WAIT_S": "45", "GIT_FETCH_ONCE_TIMEOUT_S": "120",
+                       "GIT_FETCH_ONCE_REFETCH_TIMEOUT_S": "120"}
+LAND_FILL_ONCE = "fillAt"  # the entry's {"head", "at"} of the last fill land_command_fetch ran
 LAND_FETCH_REFSPEC = re.compile(r"\+?refs/(?:heads|pull)/[\w./-]+:refs/remotes/origin/[\w./-]+|[0-9a-f]{40}|\w[\w./-]*")
 LAND_FETCH_BRANCH = re.compile(r"\w[\w./-]*")
 LAND_FETCH_REPO = re.compile(r"[\w.-]+/[\w.-]+")
@@ -13858,6 +13921,21 @@ def land_check_fingerprint(cache: dict | None) -> str:
     return land_fingerprint(cache, conflict_only=True)
 
 
+def land_wait_shape(cache: dict | None, head: str) -> tuple[str, int]:
+    """What a wait on the checks at HEAD waits for, as its stuck bound keys progress (LAND_WAIT_STUCK's comment): a
+    fingerprint of the checks CACHE shows unfinished at HEAD, by name and status, and how many checks its read held.
+    ("", 0) when the cache is not at HEAD, which says nothing about the wait either way. Not the workflow name: a
+    check read over REST carries its run's name where a GraphQL read carries its workflow's (rest_contexts), so the
+    same check names two workflows depending on the route the read took."""
+    data = (cache or {}).get("data") or {}
+    if not head or str(data.get("headRefOid") or "").lower() != head:
+        return "", 0
+    checks = data.get("checks") or []
+    unfinished = sorted((str(c.get("name") or ""), str(c.get("status") or ""))
+                        for c in checks if str(c.get("status") or "").upper() not in ("COMPLETED", ""))
+    return hashlib.sha256(json.dumps([head, unfinished], sort_keys=True).encode()).hexdigest()[:16], len(checks)
+
+
 def land_fetch_mirror_ok(mirror: str) -> bool:
     return os.path.isabs(mirror) and mirror.endswith(".git") and ".." not in mirror.split("/")
 
@@ -13955,7 +14033,26 @@ def land_action(answer: dict, head: str) -> dict:
     act = answer.get("action")
     if not (isinstance(act, dict) and act.get("kind") in LAND_KINDS):
         act = land_fallback(answer, head)
-    return land_command_wait(act, answer, head) if act.get("kind") == "command" else act
+    if act.get("kind") != "command":
+        return act
+    return land_command_fetch(act, answer) or land_command_wait(act, answer, head)
+
+
+def land_command_fetch(act: dict, answer: dict) -> dict | None:
+    """A "command" step that is land_judge's mirror fill (LAND_FETCH_DEADLINE's comment): one of the fetch step's two
+    shapes for the answer's repository, as that fetch step (from "command"); else None."""
+    repo = str(act.get("repo") or answer.get("repo") or "")
+    text = str(act.get("text") or "").strip() or str(answer.get("next") or "").strip()
+    if not repo or not text.startswith(("git --git-dir ", "lane-gh fetch ")):
+        return None
+    try:
+        argv = shlex.split(text)
+    except ValueError:
+        return None
+    if land_fetch_shape(argv, repo)[2]:
+        return None
+    return {"v": 1, **{k: act[k] for k in ("repo", "number", "head") if k in act}, "kind": "fetch", "argv": argv,
+            "from": "command"}
 
 
 def land_command_wait(act: dict, answer: dict, head: str) -> dict:
@@ -15059,7 +15156,7 @@ class LandQueue:
         if not isinstance(at, (int, float)) or isinstance(at, bool) or at < since:
             return False  # a copy older than the pin may predate the push the pin names
         e.pop("pinWait", None)
-        self.stop(e, "head_moved", f"the head is {head[:12]}, not the --sha {pin[:12]} it was queued for",
+        self.stop(e, "head_moved", land_moved_clause(head, pin),
                   f"glaeda-gh land {e['repo']}#{e['number']} --sha {head}")
         return True
 
@@ -15153,9 +15250,10 @@ class LandQueue:
             write_json(land_dir() / LAND_QUOTA_FILE,
                        {"until": self.queue_quota_until, "at": self.now, "reason": self.queue_quota_reason})
 
-    def park_quota(self, e: dict, text: str) -> None:
+    def park_quota(self, e: dict, text: str, host: bool = True) -> None:
         """Park E on a quota refusal whose words are TEXT: until the reset it names plus this caller's jitter, else
-        LAND_QUOTA_BACKOFF doubled per quota refusal in a row (at most LAND_QUOTA_BACKOFF_MAX). No step is taken."""
+        LAND_QUOTA_BACKOFF doubled per quota refusal in a row (at most LAND_QUOTA_BACKOFF_MAX). No step is taken. HOST False parks
+        only E, whatever reset TEXT names: the limit is not this login's (LAND_JOB_QUOTA)."""
         n = int(e.get("quotaRefusals") or 0) + 1
         e["quotaRefusals"] = n
         self.quota_refused = self.now  # the adaptive pool halves (adapt_pool)
@@ -15167,7 +15265,7 @@ class LandQueue:
         else:
             wake = self.now + min(LAND_QUOTA_BACKOFF_MAX, LAND_QUOTA_BACKOFF * (2 ** (n - 1)))
             w = {"kind": "quota", "until": wake, "said": False}
-        if said is not None:
+        if said is not None and host:
             # A reset GitHub named holds every land on this login: park the host until it. An entry's own doubling
             # backoff (no reset named: an unreadable read, a truncated secondary-limit text) parks only that entry.
             # gcp lane, 2026-11-21 07:44Z: one entry's 9th unnamed refusal (its 3600 s cap) parked the whole queue
@@ -16156,6 +16254,9 @@ class LandQueue:
         if woke or fp != e.get("seen") or reran:
             if not woke and not reran and (self.verdict_holds(e, c, head, fp) or self.feed_holds(e, head)):
                 return  # land_judge would answer the same wait (LAND_VERDICT_KEEP, LAND_FEED_QUIET_MAX)
+            if woke and not reran and (e.get("feedVerdict") or {}).get("code") in LAND_TIMER_HELD \
+                    and self.feed_holds(e, head):
+                return  # the wait's timer, with no check event since the verdict: the same answer (LAND_TIMER_HELD)
             # A change alone (checks finished, mergeability computed) is not the step running its course: the same
             # refusal after it does not count toward the stop; after its timeout it does.
             self.judge(e, head, fp, counts=woke, why="woke" if woke else ("reran" if reran else "fp_moved"))
@@ -16238,7 +16339,7 @@ class LandQueue:
             e.pop("pinWait", None)
             if land_base_merge_parent(pin, head, c.get("data") or {}):
                 return False  # maybe only a base merge on the pin: judge's worker reads whether it is
-            self.stop(e, "head_moved", f"the head is {head[:12]}, not the --sha {pin[:12]} it was queued for",
+            self.stop(e, "head_moved", land_moved_clause(head, pin),
                       f"glaeda-gh land {e['repo']}#{e['number']} --sha {head}")
             return True
         w = e.get("pinWait")
@@ -16617,8 +16718,8 @@ class LandQueue:
         with self.lock:
             self.check(e)
             if why:
-                self.stop(e, "head_moved", f"the head is {head[:12]}, not the --sha {pin[:12]} it was queued for "
-                          f"(no update_branch of this queue's made it, and {why})",
+                self.stop(e, "head_moved", land_moved_clause(head, pin)
+                          + f" (no update_branch of this queue's made it, and {why})",
                           f"glaeda-gh land {e['repo']}#{e['number']} --sha {head}")
                 return False
             e["pinSha"], e["pinSince"], e["pinSeen"] = head, self.now, True
@@ -16709,8 +16810,8 @@ class LandQueue:
         sha = pin
         if land_head_moved(str(e.get("pinSha") or ""), sha) and (own := self.follow_own_update(e, sha)) \
                 and not self.base_merge_due(e, sha):
-            self.stop(e, "head_moved", f"the head is {sha[:12]}, not the --sha {e['pinSha'][:12]} it was queued for "
-                      f"({own})", f"glaeda-gh land {e['repo']}#{e['number']} --sha {sha}")
+            self.stop(e, "head_moved", land_moved_clause(sha, str(e.get("pinSha") or "")) + f" ({own})",
+                      f"glaeda-gh land {e['repo']}#{e['number']} --sha {sha}")
             return False
         mine = (e.get("snapshotWait") or {}).get("sha") == sha
         if not mine and not room:
@@ -16762,7 +16863,11 @@ class LandQueue:
             held += max(0.0, self.now - min(since))
         e.update(state="judging", seen=fp, seenHead=head, seenChecks=land_check_fingerprint(c), keptFp=None,
                  judging={"sha": sha, "at": self.now, "counts": counts, "held": held,
-                          "why": why if why in LAND_JUDGE_WHY else "fp_moved"})
+                          "why": why if why in LAND_JUDGE_WHY else "fp_moved",
+                          # the wait this judgment ended (its kind, and the verdict that set it): "woke" alone does
+                          # not say which wait's timer ran
+                          "from": land_trim(":".join(x for x in (str((e.get("wait") or {}).get("kind") or ""),
+                                                               str((e.get("explain") or {}).get("code") or "")) if x))})
         e.pop("dueLate", None)
         e.pop("dueAt", None)
         self.save(e)
@@ -17016,13 +17121,14 @@ class LandQueue:
                          due=True if unmoved and why in LAND_JUDGE_DUE else None)
             log({"event": "land-judged", "key": e["key"], "took_s": took, "head": head[:12],
                  "code": str(answer.get("code") or ("ok" if answer.get("ok") else "")), "step": act.get("kind"),
-                 "why": why or None})
+                 "why": why or None, "from": judging.get("from") or None})
             self.note_feed_verdict(e, answer, act, head, judging.get("at"))
             self.note_judge_update(e, answer, head)
             reason = str(answer.get("reason") or "")
             if str(answer.get("code") or "") == "quota" or LAND_QUOTA_REFUSAL.search(reason) \
                     or str(answer.get("code") or "") in LAND_UNREAD_CODES and LAND_UNREAD_QUOTA.search(reason):
-                self.park_quota(e, f"{answer.get('reason') or ''} {answer.get('next') or ''}")
+                self.park_quota(e, f"{answer.get('reason') or ''} {answer.get('next') or ''}",
+                                host=not LAND_JOB_QUOTA.search(reason))
                 return  # the login's state, not the PR's: no step, no streak
             e.pop("quotaRefusals", None)
             if not answer.get("cacheOnly") and not answer.get("cacheMiss"):
@@ -17249,12 +17355,13 @@ class LandQueue:
         LAND_WAIT_STUCK, and E is stopped naming the checks still unfinished."""
         c = self.cache_of(e["key"]) or {}
         data = c.get("data") or {}
-        fp = land_check_fingerprint(c) if str(data.get("headRefOid") or "").lower() == head else ""
+        fp, seen = land_wait_shape(c, head)
         w = e.get("waitRefused") or {}
         if w.get("head") != head:
-            w = {"head": head, "since": self.now, "movedAt": self.now, "fp": fp, "count": 0}
-        elif fp and fp != w.get("fp"):
-            w.update(fp=fp, movedAt=self.now)
+            w = {"head": head, "since": self.now, "movedAt": self.now, "fp": fp, "checks": seen, "count": 0}
+        elif fp and (fp != w.get("fp") or seen > int(w.get("checks") or 0)):
+            # the unfinished checks changed, or a check appeared the reads at this head had not held yet
+            w.update(fp=fp, checks=max(seen, int(w.get("checks") or 0)), movedAt=self.now)
         w["count"] = int(w.get("count") or 0) + 1
         w["code"] = code
         e["waitRefused"] = w
@@ -17619,10 +17726,13 @@ class LandQueue:
         return self.call([git, *pre, "-c", "core.attributesFile=/dev/null", "--git-dir", gitdir, *args], timeout, e)
 
     def union_plan(self, e: dict, head: str) -> tuple[str, str, str, str]:
-        """(merge commit, the PR's branch, base sha, "") when HEAD's conflict with its base is in merge=union paths
-        only and the merge honoring the base's .gitattributes is clean, else ("", "", "", why not). Writes only into
-        this host's own union mirror (LAND_UNION's comment); sends nothing to the PR."""
+        """(merge commit, the PR's branch, base sha, "") when git's merge of the base into HEAD, honoring the base's
+        .gitattributes, is clean, else ("", "", "", why not; a true conflict names its files). Writes only into this
+        host's own union mirror (LAND_UNION's comment); sends nothing to the PR."""
         repo = e["repo"]
+        if repo.partition("/")[0].lower() not in LAND_MERGE_OWNERS:
+            return "", "", "", (f"{repo} is not a repository of {', '.join(sorted(LAND_MERGE_OWNERS))}: this queue "
+                                "pushes a base merge only to their own branches")
         data = (self.cache_of(e["key"]) or {}).get("data") or {}
         branch, base = str(data.get("headRefName") or ""), str(data.get("baseRefName") or "")
         if not (BRANCH_SAFE.fullmatch(branch) and BRANCH_SAFE.fullmatch(base)) or ".." in branch + base:
@@ -17661,30 +17771,28 @@ class LandQueue:
         empty = self.union_git(gitdir, "hash-object", "-t", "tree", "-w", "--stdin")  # stdin is /dev/null: the empty tree
         if empty.returncode != 0 or not SHA40.fullmatch((empty.stdout or "").strip()):
             return "", "", "", f"no empty tree in {gitdir}: {land_trim(empty.stderr, 160)}"
-        # What GitHub saw: the merge with no attributes. Its conflicted paths are the ones that must all be union.
+        # What GitHub saw: the merge with no attributes. Its conflicted paths (none when GitHub's 422 was simply wrong)
+        # go into the commit message and the history; they no longer decide anything (LAND_UNION's comment).
         bare = self.union_git(gitdir, "merge-tree", "--write-tree", "--name-only", "--no-messages", "-z", head,
                               base_sha, attrs=empty.stdout.strip())
-        if bare.returncode == 0:
-            return "", "", "", "the merge with no attributes is clean here, so the conflict is not one union settles"
-        if bare.returncode != 1:
+        if bare.returncode not in (0, 1):
             return "", "", "", f"git merge-tree failed: {land_trim(land_tail(bare.stderr or ''), 160)}"
-        paths = [p for p in (bare.stdout or "").split("\0")[1:] if p]  # -z: tree, then NUL-ended paths, unquoted
-        if not paths:
-            return "", "", "", "git merge-tree named no conflicted path"
-        attr = self.union_git(gitdir, "check-attr", "-z", "merge", "--", *paths, attrs=base_sha)
-        words = (attr.stdout or "").split("\0")  # -z: path NUL attribute NUL value NUL, per path
-        union = {words[i] for i in range(0, len(words) - 2, 3) if words[i + 1] == "merge" and words[i + 2] == "union"}
-        other = [p for p in paths if p not in union]
-        if attr.returncode != 0 or other:
-            return "", "", "", (f"{len(other)} conflicted path(s) are not merge=union in {base}'s .gitattributes: "
-                                f"{land_trim(', '.join(other), 160)}")
-        merged = self.union_git(gitdir, "merge-tree", "--write-tree", "--no-messages", head, base_sha, attrs=base_sha)
-        tree = (merged.stdout or "").split("\0", 1)[0].split("\n", 1)[0].strip()
+        paths = [p for p in (bare.stdout or "").split("\0")[1:] if p] if bare.returncode == 1 else []
+        merged = self.union_git(gitdir, "merge-tree", "--write-tree", "--name-only", "--no-messages", "-z", head,
+                                base_sha, attrs=base_sha)
+        words = (merged.stdout or "").split("\0")  # -z: tree, then NUL-ended conflicted paths, unquoted
+        tree = words[0].strip()
+        if merged.returncode == 1:
+            files = [p for p in words[1:] if p]
+            e["unionMerge"].update(conflicts=files[:20])
+            return "", "", "", (f"a true conflict in {len(files)} file(s): {land_trim(', '.join(files), 200)} "
+                                f"(git's merge of {base} {base_sha[:12]} honoring its .gitattributes)")
         if merged.returncode != 0 or not SHA40.fullmatch(tree):
-            return "", "", "", f"the merge honoring {base}'s .gitattributes still conflicts: {land_trim(merged.stdout, 160)}"
-        msg = (f"Merge branch '{base}' into {branch}\n\nglaeda land: GitHub's update-branch refused a conflict in "
-               f"merge=union paths only ({land_trim(', '.join(paths), 300)}); merged here honoring {base}'s "
-               ".gitattributes.")
+            return "", "", "", f"git merge-tree failed: {land_trim(land_tail(merged.stderr or ''), 160)}"
+        msg = (f"Merge branch '{base}' into {branch}\n\nglaeda land: GitHub's update-branch refused a merge conflict; "
+               + (f"git's merge conflicted only in paths {base}'s .gitattributes settles "
+                  f"({land_trim(', '.join(paths), 300)}), merged here honoring them."
+                  if paths else "git merges the two cleanly, so it was merged here."))
         commit = self.union_git(gitdir, "-c", "user.name=glaeda-land", "-c", "user.email=glaeda-land@users.noreply."
                                 "github.com", "commit-tree", tree, "-p", head, "-p", base_sha, "-m", msg)
         sha = (commit.stdout or "").strip()
@@ -17694,8 +17802,8 @@ class LandQueue:
         return sha, branch, base_sha, ""
 
     def union_merge(self, e: dict, head: str) -> None:
-        """GitHub refused the update-branch at HEAD for a conflict (LAND_UNION's comment): when every conflicted path
-        is merge=union, push the local merge to the PR's branch as the update-branch's own result, a fast-forward on
+        """GitHub refused the update-branch at HEAD for a conflict (LAND_UNION's comment): when git merges the base
+        into HEAD cleanly, push the local merge to the PR's branch as the update-branch's own result, a fast-forward on
         top of HEAD, and wait for the new head as after an update-branch (pin_follow follows it: its first parent is
         HEAD). Otherwise the conflict stop, as before, saying why it was not merged here."""
         said = str((e.get("unionMerge") or {}).get("out") or "")
@@ -17733,7 +17841,7 @@ class LandQueue:
                 return
             if got.returncode != 0:
                 e.pop("updateSent", None)
-                why = f"the push of the union merge {sha[:12]} failed: {land_trim(land_tail(got.stderr or ''), 160)}"
+                why = f"the push of the base merge {sha[:12]} failed: {land_trim(land_tail(got.stderr or ''), 160)}"
                 self.history(e, "union_merge_skipped", head=head[:12], why=why)
                 self.conflict_stop(e, "update_branch", head, said, why)
                 return
@@ -17747,6 +17855,15 @@ class LandQueue:
         """Fill this host's mirror as land_judge named (LAND_FETCH_DEADLINE's comment), then judge again soon. An argv
         that is not one of the two shapes, for this PR's repository and an existing mirror, stops as policy."""
         repo, argv = e["repo"], act.get("argv")
+        fill = act.get("from") == "command"  # land_judge's mirror fill, named as a command (land_command_fetch)
+        filled = e.get(LAND_FILL_ONCE) or {}
+        if fill and head and filled.get("head") == head:
+            # One fill per head, then one judgment: a mirror still unread after its fill is not a fill to repeat
+            with self.lock:
+                self.stop(e, "fill_unread", f"filled the mirror once at {head[:12]} ({land_trim(argv, 200)}) and "
+                          f"land_judge still could not read it: {land_reason(answer.get('reason'))}",
+                          land_trim(answer.get("next")))
+            return
         form, mirror, why = land_fetch_shape(argv, repo)
         if not why and not os.path.isdir(mirror):
             why = f"the fetch step's mirror {mirror} is not a directory on this host"
@@ -17762,13 +17879,18 @@ class LandQueue:
             with self.lock:
                 self.stop(e, "policy", land_trim(why), land_trim(answer.get("next")))
             return
+        extra = None
         if form == "git":  # this host's own git login reads github.com: the bare env
-            run, step_env = [git, *argv[1:]], None
+            once = self.fetch_once()
+            if once:  # git --git-dir M fetch ARGS as git-fetch-once -C M ARGS: the guarded fetch, bounded
+                run, step_env, extra = [once, "-C", argv[2], *argv[4:]], None, LAND_FETCH_ONCE_ENV
+            else:
+                run, step_env = [git, *argv[1:]], None
         else:  # a broker read: the requester's lane only names it in the broker's audit log (land_lane)
             run, step_env = [self.path("laneGh", Path(LANE_GH_CMD)).as_posix(), *argv[1:]], e
         with self.lock:
-            self.claim(e, "fetch", argv=list(argv), form=form)
-        got = self.call(run, LAND_FETCH_DEADLINE, step_env)
+            self.claim(e, "fetch", argv=list(argv), form=form, **({"fill": True} if fill else {}))
+        got = self.call(run, LAND_FETCH_DEADLINE, step_env, extra)
         named = None
         with self.lock:
             self.finish(e, got)
@@ -17776,11 +17898,27 @@ class LandQueue:
             if got.returncode == 0:
                 e.pop("stepFail", None)
                 e.pop("stepTransient", None)
+                if fill:
+                    e[LAND_FILL_ONCE] = {"head": head, "at": self.now}
                 self.wait(e, {"kind": "retry", "why": "filled the mirror land_judge could not read"}, NUDGE_MIN * 3)
+            elif fill and not LAND_STEP_QUOTA.search(said := f"{got.stderr or ''}\n{got.stdout or ''}"):
+                # the fill land_judge named failed: stopped at once, the fetch's own error named (a spent quota parks)
+                self.stop(e, "fill_failed", f"the mirror fill land_judge named failed (exit {got.returncode}): "
+                          f"{land_trim(land_tail(said), 300)}", shlex.join(argv))
             else:
                 named = self.step_refused(e, "fetch", head, got)
         if named == "update_branch":
             self.update_branch(e, head)
+
+    def fetch_once(self) -> str:
+        """git-fetch-once to run a git-form fetch step through: land.json's gitFetchOnce, LAND_FETCH_ONCE, PATH's; ""
+        when this host has none (the step runs plain git, as before)."""
+        given = self.config().get("gitFetchOnce")
+        if isinstance(given, str):  # "" turns it off
+            return os.path.expanduser(given)
+        if os.access(LAND_FETCH_ONCE, os.X_OK):
+            return LAND_FETCH_ONCE.as_posix()
+        return shutil.which("git-fetch-once") or ""
 
     def update_branch(self, e: dict, head: str, needs: list[str] | None = None) -> None:
         """The pinned base merge land_judge (or a refused step) named, unless the head's checks still run: an update
@@ -17866,8 +18004,8 @@ class LandQueue:
             # in, a wait) keeps its old path: the named step is taken, as before.
             self.history(e, "step_refused", kind=kind, head=head[:12], why="conflict", n=1)
             if kind == "update_branch" and (e.get("unionMerge") or {}).get("head") != head:
-                # GitHub's update-branch ignores .gitattributes: a conflict only in merge=union files is merged here
-                # (LAND_UNION's comment), once per head; anything else stops as below.
+                # GitHub's update-branch ignores .gitattributes and its 422 is often stale: a base merge git makes
+                # cleanly is made here (LAND_UNION's comment), once per head; a true conflict stops as below.
                 e["unionMerge"] = {"head": head, "at": self.now, "out": land_trim(land_tail(out), 200)}
                 self.save(e)
                 return "union_merge"
@@ -18043,8 +18181,8 @@ class LandQueue:
         pin = str(e.get("pinSha") or "")
         if land_head_moved(pin, live):
             name = key_name(e["key"])
-            self.stop(e, "head_moved", f"the head is {live[:12]} (the broker read it from GitHub), not the --sha "
-                      f"{pin[:12]} it was queued for; nothing was handed off",
+            self.stop(e, "head_moved", land_moved_clause(live, pin, " (the broker read it from GitHub)")
+                      + "; nothing was handed off",
                       f"glaeda-gh land {name} --match-head-commit {live}")
             return None
         self.history(e, "handoff_repinned", head=live[:12], was=head[:12])
@@ -18599,6 +18737,24 @@ def land_full_pin(e: dict) -> str:
 def land_head_moved(pin: str, head: str) -> bool:
     """A head HEAD that is not the pinned PIN (a prefix pin matches a full head)."""
     return bool(pin and head) and not head.lower().startswith(pin)
+
+
+# A sha is abbreviated to 12 hex everywhere in this script, which is a name. In the one message whose whole subject
+# is that two shas differ, a name is not enough: a pin written out by hand from an abbreviated head
+# (land_pin_extends_head_refusal's shape) shares its first 12 hex with the head, so the refusal read "the head is
+# f40f866c791c, not the --sha f40f866c791c it was queued for" -- two identical strings, naming a difference it does
+# not show, and leaving its reader nothing to compare. Measured on this host 2026-11-22 landing
+# teamleaderleo/glaeda#2558, whose pin was the head's own first 12 hex with a typed tail.
+def land_moved_clause(head: str, pin: str, note: str = "") -> str:
+    """"the head is X, not the --sha Y it was queued for", with both shas abbreviated to the first width at which they
+    differ: 12 hex as everywhere else when that already differs, more when it does not, never past the whole sha. The
+    callers all reach this only through land_head_moved, which is false when the head starts with the pin, so the two
+    do differ inside the shorter of them and the width is always found. NOTE rides the head, for a caller that read it
+    somewhere the others do not."""
+    width, limit = 12, min(len(head), len(pin))
+    while width < limit and head[:width].lower() == pin[:width].lower():
+        width += 1
+    return f"the head is {head[:width]}{note}, not the --sha {pin[:width]} it was queued for"
 
 
 def land_pin_merged(pin: str, parent: str, sent: str) -> bool:
@@ -19235,6 +19391,29 @@ def land_pin_is_another_checkouts_head(repo: str, pin: str, git: Callable[[list[
             f"{repo} has no such commit, so the land would stop later for a reason that reads like a push")
 
 
+def land_pin_local_head(repo: str, git: Callable[[list[str]], str | None] | None = None) -> str:
+    """REPO's head as the directory the caller ran in holds it, when that directory is a checkout of REPO, else "".
+    One local git call, no GitHub read.
+
+    Only the invented-pin check takes this (land_pin_extends_head_refusal, whose judgement a wrong head cannot turn
+    into a false refusal: two commits sharing twelve hex is one chance in 2^48). The ancestor check must not: a
+    checkout routinely holds commits the PR's head does not have yet, so a pin that is an ancestor of this head is
+    ordinary and proves nothing. The cache is still preferred -- this answers the case the cache cannot, a PR opened
+    minutes ago and never read, which is exactly when a pin is written out by hand."""
+    def real(args: list[str]) -> str | None:
+        try:
+            got = run_bounded(["git", *args], 5)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return got.stdout.strip() if got.returncode == 0 else None
+    git = git or real
+    here = cwd_repo()
+    if not here or here.lower() != repo.lower():
+        return ""
+    head = str(git(["rev-parse", "HEAD"]) or "").lower()
+    return head if SHA40.fullmatch(head) else ""
+
+
 def check_land_pin_shape(pin: str | None) -> None:
     """`land --match-head-commit SHA`'s shape alone, which costs nothing: no read of any kind, local or remote. A
     request this host can answer from its cache (land_draft_refusal) is answered after this and before
@@ -19307,9 +19486,11 @@ def land_pin_behind_refusal(repo: str, number: int, pin: str, head: str,
 LAND_PIN_PREFIX = 12  # hex a pin must share with the cached head before a differing tail reads as hand-written
 
 
-def land_pin_extends_head_refusal(repo: str, number: int, pin: str, head: str) -> tuple[str, str] | None:
-    """(why, the step that clears it) when PIN is a 40-hex sha that starts with this host's cached head and then
-    differs from it, else None. No read of any kind, local or remote: two strings.
+def land_pin_extends_head_refusal(repo: str, number: int, pin: str, head: str,
+                                  source: str = "as this host last read it") -> tuple[str, str] | None:
+    """(why, the step that clears it) when PIN is a 40-hex sha that starts with HEAD, this host's cached head of the
+    PR (or SOURCE's, when the cache has none), and then differs from it, else None. No read of any kind, local or
+    remote: two strings.
 
     A pin is otherwise trusted as given (the comment above check_land_pin), and must be, because the cache's head is
     routinely older than the head an agent just pushed. This is the one shape that cannot be a real newer commit: a
@@ -19325,8 +19506,40 @@ def land_pin_extends_head_refusal(repo: str, number: int, pin: str, head: str) -
     name = f"{repo}#{number}"
     return (f"--match-head-commit {pin[:12]} starts with {name}'s head {head[:12]} and then differs from it: that is "
             f"an abbreviated head written out by hand, not another commit, and {repo} has no such sha, so the land "
-            f"would wait out a head that cannot come. The whole head, as this host last read it, is {head}",
+            f"would wait out a head that cannot come. The whole head, {source}, is {head}",
             f"glaeda-gh land {name} --match-head-commit {head}")
+
+
+# The queue follows a pinned head forward by itself when the new head is only a base merge on the pin (the
+# pin_followed, repin_own_update and repin_base_merge events), and each of those records the pin it moved away from.
+# An agent watching from outside sees a head that is not its pin and re-pins by hand, and by then the hand-written
+# pin is the stale one. 2026-11-22: glaeda#2542 was queued pinned 27b86dab, followed to 3ec2af7c by
+# repin_own_update at 20:00Z, and the head was ed96f931 when a re-pin at 3ec2af7c reached the queue at 20:06Z, which
+# parked the row in pin_wait for a head that was already gone. NOW counts the class land-re-pin-loop (14 that day).
+# A pin this queue has already followed away from moves nothing: the row is live and pinned ahead of the request, so
+# the request is answered with the pin the row holds instead of replacing it with an older one.
+LAND_PIN_FOLLOW_EVENTS = ("pin_followed", "repin_own_update", "repin_base_merge")
+
+
+def land_pin_already_followed(entry: dict | None, pin: str, requester: str) -> str:
+    """The pin a live ENTRY holds, when PIN is a sha its own queue already followed away from (its history records a
+    follow whose old pin PIN starts with, since the history keeps 12 hex) and REQUESTER is who that entry was queued
+    for, else "". A finished entry (LAND_DONE), an unpinned one, one still pinned at PIN, one whose history records
+    no follow from PIN, and another requester's row all say nothing: those requests are queued as they always were."""
+    if not isinstance(entry, dict) or not pin or entry.get("state") in LAND_DONE:
+        return ""
+    held, pin = str(entry.get("pinSha") or "").lower(), pin.lower()
+    if not SHA40.fullmatch(held) or not land_head_moved(pin, held):
+        return ""
+    if str(entry.get("requester") or "") != requester:
+        return ""  # another session's row: its pin is not this requester's to read as a follow of their own
+    for h in entry.get("history") or []:
+        if not isinstance(h, dict) or h.get("event") not in LAND_PIN_FOLLOW_EVENTS:
+            continue
+        was = str(h.get("was") or h.get("pin") or "").lower()
+        if was and pin.startswith(was):
+            return held
+    return ""
 
 
 def land_cached_head(key: str, max_age: float) -> str:
@@ -19403,7 +19616,12 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
     # not to one this host already answered from its cache.
     check_land_pin(repo, number, pin)
     cached = land_cached_head(key, LAND_PIN_BEHIND_AGE) if sha else ""
-    invented = land_pin_extends_head_refusal(repo, number, sha, cached) if sha else None
+    # The cache first; failing that, the caller's own checkout of this repository, which is the head the guidance
+    # tells them to pin and the only one a PR opened minutes ago has (land_pin_local_head).
+    local = "" if not sha or cached else land_pin_local_head(repo)
+    invented = land_pin_extends_head_refusal(repo, number, sha, cached or local,
+                                             "as this host last read it" if cached
+                                             else f"the HEAD of this checkout of {repo}") if sha else None
     if invented is not None:
         # Before the ancestor check, which would say nothing here: no checkout holds a commit that does not exist.
         return land_request_refused(key, "land_pin_invented", *invented, as_json=as_json)
@@ -19416,6 +19634,20 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
     if executor is not None:
         return cmd_land_forwarded(executor, target, after, requester, source, wait, as_json, sha, override,
                                   ceiling)
+    followed = land_pin_already_followed(read_json(LandQueue.entries_dir() / file_name(key)), sha, requester) \
+        if sha else ""
+    if followed:
+        # Not a refusal: the row is live, pinned ahead of this request, and keeps its place in the queue.
+        why = (f"{repo}#{number} is already queued and its pin followed {sha[:12]} forward here: the row holds "
+               f"{followed[:12]}, which is {sha[:12]} plus the base. Re-pinning {sha[:12]} would move it back to a "
+               f"head that is already gone and park it (pin_wait), so nothing was changed")
+        nxt = f"glaeda-gh wait pr {repo}#{number} --until merged --sha {followed} --timeout 1800"
+        if as_json:
+            print(json.dumps({"ok": True, "key": key, "code": "land_pin_followed", "reason": why, "next": nxt,
+                              "pin": followed, "was": sha}, sort_keys=True))
+        else:
+            say_waiting(f"glaeda-gh land: {why}\nnext: {nxt}")
+        return EXIT_OK
     mh, tried = land_judge(land_config())
     if mh is None:
         # The startup check's twin: nothing on this host could judge the merge, so it is not queued.
@@ -19540,6 +19772,16 @@ def cmd_land_serve(text: str) -> int:
                                                                         f"of {', '.join(LAND_SERVE_OPS)}"}))
         return EXIT_FAIL
     executor = land_executor()
+    if executor is not None and req["op"] in LAND_SERVE_RELAYED and not req.get(LAND_SERVE_RELAY_KEY):
+        # LAND_SERVE_RELAYED's comment: handed on to this host's executor, once
+        try:
+            answer = land_forward(executor, {**req, LAND_SERVE_RELAY_KEY: policy_host()})
+        except WatchError as error:
+            print(json.dumps({"ok": False, "code": "not_executor", "reason": f"{policy_host()} forwards its own lands "
+                              f"to {land_forward_name(executor)}, which did not take this one: {error}"}))
+            return EXIT_FAIL
+        print(json.dumps(answer, sort_keys=True))
+        return EXIT_OK if answer.get("ok") else EXIT_FAIL
     if executor is not None:
         print(json.dumps({"ok": False, "code": "not_executor", "reason": f"{policy_host()} forwards its own lands to "
                           f"{land_forward_name(executor)} (land.json executor); it serves none"}))
@@ -27526,13 +27768,18 @@ def gh_cache_writes() -> dict[str, float]:
 GH_RERUN_API_RE = re.compile(r"^/?repos/[^/]+/[^/]+/actions/runs/\d+/rerun(?:-failed-jobs)?/?$")
 
 
+def is_run_rerun(words: list[str]) -> bool:
+    """Either spelling of a rerun: `gh run rerun N` or a POST to its API path."""
+    return (words[:2] == ["run", "rerun"]
+            or (words[:1] == ["api"] and len(words) > 1 and bool(GH_RERUN_API_RE.match(words[1]))))
+
+
 def note_run_rerun(repo: str | None, scopes: list[str] | None, words: list[str], now: float) -> None:
     """A brokered `gh run rerun N` (or its API POST) on a run this host caches: stamp the entry rerunAt, so a wait
     and `Daemon.due` treat its cached finish as attempt-unknown until GitHub is read again (run_unconfirmed).
     Stamped when the write starts and again when it ends (gh_cache_write), so a read while it was in flight does not
     count; a rerun that fails costs one more read, never a wrong answer."""
-    rerun = (words[:2] == ["run", "rerun"]
-             or (words[:1] == ["api"] and len(words) > 1 and bool(GH_RERUN_API_RE.match(words[1]))))
+    rerun = is_run_rerun(words)
     run_id = next((x.split(" ", 1)[1] for x in scopes or [] if x.startswith("run ")), None)
     if not rerun or not repo or not run_id:
         return
@@ -27857,6 +28104,25 @@ def gh_cache_fill(real: str, args: list[str], key: str, repo: str | None, ran: l
     return gh_cache_emit({"rc": rc, "out": out, "err": err})
 
 
+def rerun_next_step(repo: str | None, scopes: list[str] | None, words: list[str], rc: int) -> str | None:
+    """What to say when a brokered `gh run rerun` exits non-zero, else None.
+
+    GitHub refuses a rerun outright for a run it will not retry ("run N cannot be rerun; This workflow run cannot be
+    retried": the run is too old, its workflow file moved, or its attempts are used up), and gh names nothing that
+    does work. 2026-11-22 an hq run was refused that way after a cancelled job, and the refusal read as "the rerun
+    did nothing": the caller waited again on a red that a newer run had already replaced. Name the two steps that
+    move it -- read the head's checks (a newer run may already stand in), and push the head again when none does."""
+    if rc == 0 or not is_run_rerun(words):
+        return None
+    run_id = next((x.split(" ", 1)[1] for x in scopes or [] if x.startswith("run ")), None)
+    named = f"{repo}/{run_id}" if repo and run_id else (repo or "that run")
+    where = f" -R {repo}" if repo else ""
+    return (f"glaeda-gh: that rerun did not take (gh exited {rc}): a run GitHub will not retry (too old, its "
+            f"workflow file moved, every attempt used) needs a new run, not a rerun. "
+            f"next: glaeda-gh status run {named} --jobs # a newer run may already stand in for it; else push the "
+            f"head again, or `gh workflow run WORKFLOW --ref BRANCH{where}`")
+
+
 def gh_cache_write(real: str, args: list[str], repo: str | None, ran: list[int],
                    scopes: list[str] | None = None, words: list[str] | None = None) -> int:
     """Run a write as a child and stamp it again once it finished, so nothing read while it was in
@@ -27864,6 +28130,9 @@ def gh_cache_write(real: str, args: list[str], repo: str | None, ran: list[int],
     try:
         rc, _out, _err = gh_cache_child(real, args, False, None)
         ran.append(rc)
+        said = rerun_next_step(repo, scopes, words or [], rc)
+        if said:
+            print(said, file=sys.stderr)
     finally:
         if ran:
             with contextlib.suppress(Exception):
@@ -29866,6 +30135,22 @@ def broker_post(item: dict) -> int:
     return 0
 
 
+def post_issue_names_an_existing_issue(target: str) -> str:
+    """The issue number a `post issue` target names, or "" where it names a repository to file a new issue in.
+
+    No issue is created at a number, so `post issue OWNER/REPO#15832 --body-file -` can only mean a comment on
+    that issue: the caller had the number from a wait or land line, not from this parser's help. Until
+    2026-11-22 it was refused ("post issue takes OWNER/REPO (with --title T and --body-file F)"), and the write
+    cost the refusal plus the same call typed again under another kind.
+    """
+    text = drop_kind_prefix(target or "", "comment", also=("pr", "comment"))
+    found = KEY_RES["comment"].fullmatch(text)
+    if found:
+        return found.group(3)
+    bare = BARE_NUMBER.fullmatch(text)
+    return bare.group(1) if bare else ""
+
+
 def post_one_call_kind(kind: str) -> str | None:
     """The canonical kind of a write `post` makes in one call, or None for one it queues."""
     word = (kind or "").strip().lower().replace("_", "-")
@@ -31319,13 +31604,22 @@ LOG_JOB_ONE_WORD = re.compile(r"(?:https://github\.com/)?([\w.-]+/[\w.-]+)/(?:ac
 def log_job_synonym(raw: list[str]) -> list[str]:
     """`log OWNER/REPO --job ID` is `log job OWNER/REPO ID` (agents type it): say so on stderr and run that. So is
     `log job|errors OWNER/REPO/ID` or a job's URL in one word (the shape `status run` and a failed check print;
-    2026-11-21 it cost a usage error)."""
+    2026-11-21 it cost a usage error). A target word carrying a run id alongside an id given positionally or with
+    `--job` keeps the given id and drops the run from the word, instead of being refused on the repository."""
     given = [w for w in raw[3:4] if w.isdigit()] + [w for w in raw[3:] if w.startswith("--job")]  # an id already
     one = LOG_JOB_ONE_WORD.fullmatch(raw[2]) if len(raw) >= 3 and raw[:2] in (["log", "job"], ["log", "errors"]) \
-        and not given else None
-    if one:
+        else None
+    if one and not given:
         fixed = raw[:2] + [one.group(1), one.group(2)] + raw[3:]
         print(f"glaeda-gh: read as `{typed_line(fixed)}` (the job id goes in its own word)", file=sys.stderr)
+        return fixed
+    if one:
+        # Both at once: the run in the target word (the shape `status run` prints) and the id of the job inside it
+        # (`log errors OWNER/REPO/RUN_ID --job JOB_ID`, called so 2026-11-22 and refused on the repository word).
+        # The explicitly given id is the one asked for; the number in the target word only named where it came from.
+        fixed = raw[:2] + [one.group(1)] + raw[3:]
+        print(f"glaeda-gh: read as `{typed_line(fixed)}` (the id given is the one read; {one.group(2)} in "
+              f"{raw[2]} only says which run it is in)", file=sys.stderr)
         return fixed
     if len(raw) < 3 or raw[0] != "log" or not re.fullmatch(r"[\w.-]+/[\w.-]+", raw[1]):
         return raw
@@ -31578,6 +31872,32 @@ def flag_elsewhere(message: str, argv: list[str] | None = None) -> tuple[str, st
     return hint, " ".join(["glaeda-gh"] + kept)
 
 
+NESTING_WRITE_INPUT = {("post", "comment"): ("--body", "--body-file"),
+                       ("post", "review"): ("--body", "--body-file"),
+                       ("post", "pr"): ("--head", "--base", "--title")}
+
+# Every command here only reads, in the order a caller who named no command would want them: the ones that
+# answer at once before `wait`, which blocks. A word whose commands are all in here can be routed without
+# choosing between reading and writing, because there is no write among them to choose.
+NESTING_READ_FIRST = ("status", "log", "search", "checks", "budget", "audit", "read", "wait")
+
+
+def nesting_parent_fits(parent: str, word: str, target: str, typed: set[str]) -> bool:
+    """Whether `PARENT WORD TARGET` with the long flags TYPED is a call PARENT could carry out at all.
+
+    The caller's own evidence, not a guess about intent: `post pr` takes OWNER/REPO and refuses without
+    --head, --base and --title, so `glaeda-gh pr o/r#5` is no `post pr` on either count; `post comment`
+    refuses without a body, so a flagless `comment o/r#5` is no write either. Dropping a parent that could
+    only refuse is what leaves `nesting_synonym` with reads alone, and a word it may then route.
+    """
+    if parent != "post":
+        return True
+    if word == "pr" and target and not re.fullmatch(rf"{NAME}/{NAME}", target):
+        return False
+    needs = NESTING_WRITE_INPUT.get((parent, word))
+    return not needs or bool({normalized_flag(f) for f in needs} & typed)
+
+
 def nesting_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
     """A command word typed at the wrong nesting level, routed to where it lives: (argv, refusal lines).
 
@@ -31585,11 +31905,17 @@ def nesting_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
     2026-11-21 it cost argparse's "invalid choice: 'comment'" and a round trip to --help. A word that exactly
     one command takes is rewritten to that command's spelling, said on stderr like the other synonyms.
 
-    A word more than one command takes is *refused*, never guessed: `comment`, `pr` and `run` are each a word
+    A word more than one command takes, where one of them writes, is *refused*, never guessed: `comment`, `pr` and `run` are each a word
     of `status` (a read), `wait` (a read that blocks) and/or `post` (a write), and picking for the caller
     would pick between reading and writing. The refusal names every command that takes the word, each as a
     line that runs. The one narrowing done is the caller's own evidence: when the flags typed fit exactly one
-    of those commands (`comment o/r#1 --body hi` has `--body`, which only `post` has), that is the one."""
+    of those commands (`comment o/r#1 --body hi` has `--body`, which only `post` has), that is the one.
+
+    Two narrowings keep that refusal for the calls it is really about. A parent that could only refuse the
+    call as typed is dropped (`nesting_parent_fits`), and when every parent left only reads there is no
+    read-or-write choice to protect, so the word is routed to the read that answers at once and the blocking
+    sibling is named: `glaeda-gh run o/r/123` and `glaeda-gh pr o/r#5` were each refused with three lines to
+    choose from until 2026-11-22, and each cost the refusal plus the same call typed again under `status`."""
     if not raw or raw[0].startswith("-") or raw[0] in ("gh", "coord-alert", "wait-resume"):
         return raw, []
     tops, table = nesting_table()
@@ -31603,6 +31929,18 @@ def nesting_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
                 if typed <= {normalized_flag(o) for o in flag_options([p, word])}]
         if len(fits) == 1:
             parents = fits
+    if len(parents) > 1:
+        target = next((w for w in raw[1:] if not w.startswith("-")), "")
+        could = [p for p in parents if nesting_parent_fits(p, word, target, typed)]
+        if could:
+            parents = could
+    if len(parents) > 1 and set(parents) <= set(NESTING_READ_FIRST):
+        first = min(parents, key=NESTING_READ_FIRST.index)
+        rest = [p for p in parents if p != first]
+        print(f"glaeda-gh: read as `{typed_line(['glaeda-gh', first, word] + raw[1:])}` (`{word}` is a word of "
+              f"{len(parents)} commands and every one of them only reads, so this is the one that answers at "
+              f"once; {', '.join(f'`glaeda-gh {p} {word}`' for p in rest)} also reads it)", file=sys.stderr)
+        return [first, word] + raw[1:], []  # said once, here: the single-parent line below would repeat it
     if len(parents) > 1:
         refusal = [f"glaeda-gh: `{word}` is a word of {len(parents)} commands "
                    f"({', '.join(f'{p} {word}' for p in parents)}), not a command of its own, and which one "
@@ -31872,6 +32210,66 @@ def flag_spelling_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
         print(f"glaeda-gh: read as `{typed_line(['glaeda-gh'] + fixed)}` ({'; '.join(said)})", file=sys.stderr)
     return fixed, []
 
+# A wait flag given with no value. `--wait` reads as a switch ("wait for it"), and this tool's own
+# `--notify` already takes its default from a bare flag, so `glaeda-gh land o/r#N --match-head-commit SHA
+# --wait --timeout 3600` -- the same flag typed twice under both its spellings, the second read as the
+# first one's value -- exited 2 with argparse's "expected one argument" and nothing queued. Measured on this host 2026-11-22 landing teamleaderleo/glaeda#2559: the land was queued on
+# the retype, 67 s later. The value here is each flag's own documented default, so a bare flag means "wait,
+# the usual amount", which is what it reads as. "" drops the flag: its default is computed (--max is
+# WAIT_MAX_TIMES x the timeout), and absent is exactly that default.
+BARE_WAIT_VALUE: dict[tuple[str, str], str] = {
+    ("land", "--wait"): "3600",      # the flag's default is 0 (do not wait), which a typed --wait cannot mean
+    ("wait", "--timeout"): "3600",   # the parser's own default
+    ("checks", "--wait"): "30",      # the parser's own default
+    ("on-event", "--wait"): "30",    # its default is 0 (do not wait), same reading as land's
+    ("land", "--max"): "",
+    ("wait", "--max"): "",
+}
+
+
+def bare_wait_synonym(raw: list[str]) -> tuple[list[str], list[str]]:
+    """A wait or ceiling flag typed with no number takes its own default: (argv, refusal lines, never any).
+
+    Only the flags in BARE_WAIT_VALUE, only when the next word is not a count of seconds this flag could
+    take (`seconds` decides, so 20m and 1800 are still values), and only in canonical spelling, which
+    `flag_spelling_synonym` has already made of every flag it recognises. Said on stderr with the whole
+    call, so the next one is typed with the number."""
+    if not raw or raw[0] in ("gh", "coord-alert", "wait-resume"):
+        return raw, []
+    fixed: list[str] = []
+    said: list[str] = []
+    i = 0
+    while i < len(raw):
+        word = raw[i]
+        if word == "--":
+            fixed.extend(raw[i:])
+            break
+        value = BARE_WAIT_VALUE.get((raw[0], word))
+        nxt = raw[i + 1] if i + 1 < len(raw) else None
+        has_value = nxt is not None and not nxt.startswith("-") and bare_wait_count(nxt)
+        if value is None or has_value:
+            fixed.append(word)
+            i += 1
+            continue
+        said.append(f"`{word}` with no number is its default"
+                    + (f", {value} seconds" if value else " (the ceiling it computes from the timeout)"))
+        fixed.extend([word, value] if value else [])
+        i += 1
+    if said:
+        print(f"glaeda-gh: read as `{typed_line(['glaeda-gh'] + fixed)}` ({'; '.join(said)})", file=sys.stderr)
+    return fixed, []
+
+
+def bare_wait_count(word: str) -> bool:
+    """Whether WORD is a count of seconds a wait flag could take (1800, 20m), rather than the next thing
+    typed (a target, another flag's name): `seconds` is the same reader the parser uses for these flags."""
+    try:
+        seconds(word)
+    except argparse.ArgumentTypeError:
+        return False
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
     if raw[:1] == ["search"] and len(raw) > 1 and raw[1].lower() in SEARCH_UNSERVED:
@@ -31905,11 +32303,13 @@ def main(argv: list[str] | None = None) -> int:
             return 64
         except KeyboardInterrupt:
             return 130
-    for rewriter in (nesting_synonym, command_spelling_synonym, doubled_kind_synonym, flag_spelling_synonym):
+    for rewriter in (nesting_synonym, command_spelling_synonym, doubled_kind_synonym,
+                     flag_spelling_synonym, bare_wait_synonym):
         # The nesting first (a word a command owns is that command's), then the spelling of the command itself,
         # then the flags: which options a command has depends on which command it is. `doubled_kind_synonym`
         # sits between them: it only looks at a call that already leads with a real command, which is what the
-        # two before it have just made sure of, and it reads flags only by name.
+        # two before it have just made sure of, and it reads flags only by name. `bare_wait_synonym` last: it
+        # reads flags in canonical spelling, which the one before it has just produced.
         raw, refusal = rewriter(raw)
         if refusal:
             for line in refusal:
@@ -31987,6 +32387,15 @@ def main(argv: list[str] | None = None) -> int:
             if not args.target:
                 raise WatchError(f"post {args.kind} needs a target"
                                  + (" (OWNER/REPO)" if one == "issue" else " (OWNER/REPO#N)"))
+            if one == "issue":
+                numbered = post_issue_names_an_existing_issue(args.target)
+                if numbered and args.title:
+                    raise WatchError(f"post issue {args.target} names issue {numbered}, which exists: drop --title "
+                                     f"to comment on it, or pass OWNER/REPO to file a new issue")
+                if numbered:
+                    print(f"glaeda-gh: post issue {args.target} names issue {numbered}, which exists: this is a "
+                          f"comment on it (a new issue takes OWNER/REPO and --title)", file=sys.stderr)
+                    args.kind, one = "comment", "comment"
             if one == "comment":
                 args.kind = "comment"  # `post issue-comment` and `post pr-comment` are this one write
             elif one:

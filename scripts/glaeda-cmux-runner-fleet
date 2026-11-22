@@ -107,6 +107,8 @@ TOKEN_RE = re.compile(r"[A-Za-z0-9_.\-]+")
 SHA_RE = re.compile(r"[0-9a-f]{7,40}")
 STAMP_READ = f"head -c 4096 ~/{REMOTE_DIR}/scripts/{SOURCE_STAMP} 2>/dev/null || echo @no-stamp"  # read-only
 MAX_REASON = 200
+# MAIN_MOVED: how long after origin's main moves past HEAD an apply from HEAD is still accepted (see main_moved)
+MAIN_GRACE_S = 2 * 3600
 HOST_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
@@ -168,12 +170,71 @@ def set_max_procs(limit: int) -> None:
     _PROCS = threading.BoundedSemaphore(max(1, limit))
 
 
+# The runner reads and mints go out as the fleet's runner App (manaflow-glaeda-route, minted by cmuxterm-hq's
+# build-fleet/mini-ops/fleet_app_token.py), not the operator's gh login. runner-apply.sh already does this, but a
+# direct `--apply` fell back to the login: on the operator's Mac they were the login's largest caller and it hit
+# GitHub's rate limit. Only the runner paths on the App's installation take the token: anything else, a GH_TOKEN
+# the caller set, or a host with no App (exit 3) keeps gh's own login as before. Tokens live an hour.
+APP_TOKEN_REUSE_S = 50 * 60
+APP_SCOPES = (("orgs/manaflow-ai/actions/runner", "org"), ("repos/manaflow-ai/cmux/actions/runners", "repo"))
+_APP_TOKENS: dict[str, tuple[str | None, float]] = {}
+_APP_LOCK = threading.Lock()
+_APP_SAID: list[str] = []
+
+
+def app_token_tool() -> Path | None:
+    candidates = [os.environ.get("FLEET_APP_TOKEN_TOOL", "")]
+    if os.environ.get("MINI_OPS_DIR"):
+        candidates.append(os.path.join(os.environ["MINI_OPS_DIR"], "fleet_app_token.py"))
+    candidates += [os.path.expanduser(f"~/{root}/build-fleet/mini-ops/fleet_app_token.py")
+                   for root in ("Projects/cmuxterm-hq", "src/cmuxterm-hq", "cmuxterm-hq")]
+    return next((Path(c) for c in candidates if c and Path(c).is_file()), None)
+
+
+def app_scope(argv: list[str]) -> str | None:
+    """The fleet_app_token scope a gh call takes, or None to keep gh's own login."""
+    if not argv or argv[0] != "gh" or os.environ.get("GH_TOKEN"):
+        return None
+    path = next((a for a in argv[2:] if "/" in a and not a.startswith("-")), "")
+    return next((scope for prefix, scope in APP_SCOPES if path.startswith(prefix)), None)
+
+
+def app_token(scope: str) -> str | None:
+    with _APP_LOCK:  # one mint per scope in flight; a host with no App is learned once per run
+        cached = _APP_TOKENS.get(scope)
+        if cached and (cached[0] is None or time.monotonic() - cached[1] < APP_TOKEN_REUSE_S):
+            return cached[0]
+        tool = app_token_tool()
+        if tool is None:
+            _APP_TOKENS[scope] = (None, time.monotonic())
+            return None
+        try:
+            out = subprocess.run(["/usr/bin/env", "python3", os.fspath(tool), "token", scope], capture_output=True,
+                                 text=True, timeout=60, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            return None  # not cached: the next call asks again, this one keeps the login
+        token = out.stdout.strip()
+        if out.returncode == 3:
+            _APP_TOKENS[scope] = (None, time.monotonic())
+            return None
+        if out.returncode != 0 or not TOKEN_RE.fullmatch(token):
+            return None
+        _APP_TOKENS[scope] = (token, time.monotonic())
+        if scope not in _APP_SAID:
+            _APP_SAID.append(scope)
+            print(f"github: the fleet's runner App ({scope} scope) for runner calls", file=sys.stderr)
+        return token
+
+
 def _launch(argv: list[str], timeout: float, stdin: str | None) -> subprocess.CompletedProcess:
     if _PROCS is None:
         set_max_procs(max_procs(raise_nofile()))
+    scope = app_scope(argv)
+    token = app_token(scope) if scope else None
+    env = {**os.environ, "GH_TOKEN": token} if token else None
     with _PROCS:  # type: ignore[union-attr]
         return subprocess.run(argv, input=stdin if stdin is not None else "", capture_output=True, text=True,
-                              timeout=timeout, check=False)
+                              timeout=timeout, check=False, env=env)
 
 
 def run(argv: list[str], timeout: float, stdin: str | None = None) -> tuple[int, str, str]:
@@ -330,15 +391,52 @@ def mint(scope: str, kind: str = "registration-token") -> str | None:
         return token
 
 
+# A run reads every runner's labels from one list of its scope, not one `?name=` read per instance: the operator's
+# gh holds the only credential that may read runners (no role App may hold the runner permission), and on
+# cosmic-gray one apply's per-instance reads were ~550 of the login's calls in 4.6 h. The list is kept for the run
+# (LABELS_REUSE_S bounds a long one); a failed read is not cached, so the next instance asks again.
+LABELS_REUSE_S = 5 * 60
+_LISTED: dict[str, tuple[dict[str, str], float]] = {}
+_LIST_LOCKS: dict[str, threading.Lock] = {}
+_LIST_LOCKS_GUARD = threading.Lock()
+
+
+def scope_runner_labels(scope: str) -> dict[str, str] | None:
+    """Runner name -> its labels, sorted and comma-separated, for every runner GitHub lists in `scope`; None when
+    the read fails."""
+    with _LIST_LOCKS_GUARD:
+        lock = _LIST_LOCKS.setdefault(scope, threading.Lock())
+    with lock:  # instances run at once: one list per scope in flight, the rest wait for its answer
+        cached = _LISTED.get(scope)
+        if cached and time.monotonic() - cached[1] < LABELS_REUSE_S:
+            return cached[0]
+        code, out, _ = run(["gh", "api", "--paginate", f"{scope}/actions/runners?per_page=100",
+                            "--jq", ".runners[] | [.name, [.labels[]?.name]] | tojson"], 60)
+        if code != 0:
+            _LISTED.pop(scope, None)
+            return None
+        listed: dict[str, str] = {}
+        try:
+            for line in out.splitlines():
+                if not line.strip():
+                    continue
+                name, labels = json.loads(line)
+                if isinstance(name, str) and isinstance(labels, list):
+                    found = sorted(str(label) for label in labels if label)
+                    listed[name] = ",".join(label for label in found if "," not in label)
+        except (ValueError, TypeError):
+            _LISTED.pop(scope, None)
+            return None
+        _LISTED[scope] = (listed, time.monotonic())
+        return listed
+
+
 def github_labels(scope: str, name: str) -> str | None:
     """The labels GitHub lists for runner `name` now, comma-separated, read with this operator's gh; None when the
     read fails or GitHub lists no such runner (the mini then decides as before). The minis hold no gh login, so
     without this each apply re-registered every idle runner whatever its labels were."""
-    code, out, _ = run(["gh", "api", f"{scope}/actions/runners?name={urllib.parse.quote(name)}&per_page=100"], 60)
-    try:
-        runners = json.loads(out).get("runners") if code == 0 else None
-    except (ValueError, AttributeError):
-        return None
+    listed = scope_runner_labels(scope)
+    return listed.get(name) if listed is not None else None
     for found in runners if isinstance(runners, list) else []:
         if isinstance(found, dict) and found.get("name") == name:
             labels = sorted(str(label.get("name")) for label in found.get("labels") or [] if isinstance(label, dict))
@@ -405,9 +503,10 @@ def git(*args: str, timeout: float = 30) -> tuple[int, str, str]:
 
 
 def checkout_source() -> dict[str, Any]:
-    """{head, originMain, refusal}: this checkout's HEAD and origin's main as origin reports it now. ls-remote
-    fetches nothing and writes nothing here, and a stale local origin/main ref cannot vouch for a stale checkout.
-    refusal is why --apply must not deploy from here, or None."""
+    """{head, originMain, refusal}: this checkout's HEAD and origin's main as origin reports it now (ls-remote: a
+    stale local origin/main ref cannot vouch for a stale checkout). refusal is why --apply must not deploy from
+    here, or None. MAIN_MOVED: a HEAD origin's main has moved past within MAIN_GRACE_S is accepted (behindMain
+    says by how much), so a run that started at origin/main survives main moving under it; see main_moved."""
     code, out, _ = git("rev-parse", "--verify", "HEAD^{commit}")
     head = out.strip() if code == 0 and re.fullmatch(r"[0-9a-f]{40}", out.strip()) else None
     if head is None:
@@ -419,10 +518,34 @@ def checkout_source() -> dict[str, Any]:
     if main is None:  # git's stderr may name the remote URL: keep it out
         refusal = f"cannot read origin's main (git ls-remote exit {code}), so HEAD {head} cannot be checked"
     elif main != head:
+        moved = main_moved(head, main)
+        if moved is not None:
+            return {"head": head, "originMain": main, "refusal": None, "behindMain": moved}
         refusal = f"HEAD {head} is not origin/main {main}; roll out from a worktree at origin/main"
     else:
         refusal = None
     return {"head": head, "originMain": main, "refusal": refusal}
+
+
+def main_moved(head: str, main: str) -> dict[str, Any] | None:
+    """{commits, seconds}: how far origin's main has moved past HEAD, when HEAD is an ancestor of main and main first
+    moved off it at most MAIN_GRACE_S ago; else None (refused). glaeda's main moves every 10-20 min and a rollout
+    with busy-runner retries runs ~20 min, so a run that checked HEAD == origin/main at its start was refused at
+    its end (2026-11-22, five runs of cmux11s-13s). Not a downgrade: HEAD is on main, and every member's stamp is
+    still checked against HEAD. A HEAD with local commits is not an ancestor of main, and an old checkout's main
+    moved on long ago: both still refused. Fetches main's objects only (--refmap= and --no-write-fetch-head: no ref,
+    no FETCH_HEAD) when this checkout lacks them."""
+    if git("cat-file", "-e", f"{main}^{{commit}}")[0] != 0:
+        git("fetch", "-q", "--no-tags", "--no-write-fetch-head", "--refmap=", "origin", "refs/heads/main",
+            timeout=120)
+    if git("merge-base", "--is-ancestor", head, main)[0] != 0:  # not an ancestor, or main still unknown here
+        return None
+    code, out, _ = git("log", "--first-parent", "--reverse", "--format=%ct", f"{head}..{main}")
+    stamps = [int(x) for x in out.split() if x.isdigit()] if code == 0 else []
+    if not stamps:
+        return None
+    seconds = max(0, int(time.time()) - stamps[0])  # when main's first commit after HEAD landed
+    return {"commits": len(stamps), "seconds": seconds} if seconds <= MAIN_GRACE_S else None
 
 
 def clean_reason(text: object) -> str:
@@ -536,6 +659,10 @@ def source_guard(chosen: list[str], jobs: int) -> dict[str, Any]:
 def guard_lines(guard: dict[str, Any], applied: bool) -> list[str]:
     head, main = (guard.get("head") or "unknown")[:12], (guard.get("originMain") or "unknown")[:12]
     lines = [f"source: HEAD {head}, origin/main {main}"]
+    moved = guard.get("behindMain")
+    if moved:  # MAIN_MOVED
+        lines[0] += (f" ({moved['commits']} commit(s) ahead, landed {moved['seconds'] // 60} min ago; HEAD is on main,"
+                     " accepted)")
     for member, row in sorted(guard["hosts"].items()):
         if row["state"] in ("none", "unreadable"):
             what = "no stamp" if row["state"] == "none" else f"unreadable stamp ({row['note']})"

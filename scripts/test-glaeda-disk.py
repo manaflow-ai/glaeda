@@ -9293,6 +9293,51 @@ class VolumeCensusTest(unittest.TestCase):
             self.assertTrue(gd.launch_background_census())
         self.assertIn("--census-lock-fd", popen.call_args.args[0])
 
+    def scoped_launch(self, env: dict[str, str], wait) -> list[list[str]]:
+        saved = (gd.CENSUS_LOCK, gd.CENSUS_AUTOLAUNCH, gd.census_roots, gd.DARWIN)
+        gd.CENSUS_LOCK, gd.CENSUS_AUTOLAUNCH, gd.DARWIN = Path(self.tmp.name) / "census.lock", True, False
+        gd.census_roots = lambda: [self.root]
+        self.addCleanup(lambda: (setattr(gd, "CENSUS_LOCK", saved[0]), setattr(gd, "CENSUS_AUTOLAUNCH", saved[1]),
+                                  setattr(gd, "census_roots", saved[2]), setattr(gd, "DARWIN", saved[3])))
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(gd.shutil, "which", side_effect=lambda n: f"/usr/bin/{n}"), \
+                mock.patch.object(gd.subprocess, "Popen") as popen:
+            if "INVOCATION_ID" not in env:
+                os.environ.pop("INVOCATION_ID", None)
+            popen.return_value.wait.side_effect = wait
+            self.assertTrue(gd.launch_background_census())
+        return [c.args[0] for c in popen.call_args_list]
+
+    def test_a_census_started_by_a_systemd_unit_runs_in_its_own_scope(self) -> None:
+        # a oneshot unit's KillMode=control-group killed the slice with the pass that started it (fs-agent-lane-2)
+        calls = self.scoped_launch({"INVOCATION_ID": "abc"}, subprocess.TimeoutExpired("systemd-run", 1))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "/usr/bin/systemd-run")
+        self.assertIn("--scope", calls[0])
+        self.assertIn("--census-lock-fd", calls[0])
+        if os.getuid():
+            self.assertIn("--user", calls[0])
+
+    def test_a_scoped_census_has_a_hard_runtime_bound(self) -> None:
+        # outliving the unit must not mean running forever: systemd kills a slice past its budget and last du
+        calls = self.scoped_launch({"INVOCATION_ID": "abc"}, subprocess.TimeoutExpired("systemd-run", 1))
+        bound = [a for a in calls[0][:calls[0].index("--")] if a.startswith("--property=RuntimeMaxSec=")]
+        self.assertEqual(len(bound), 1, calls[0])
+        seconds = int(bound[0].rsplit("=", 1)[1])
+        self.assertGreater(seconds, gd.CENSUS_BUDGET_S + gd.CENSUS_DU_TIMEOUT_S)
+        self.assertLessEqual(seconds, 2 * (gd.CENSUS_BUDGET_S + gd.CENSUS_DU_TIMEOUT_S))
+
+    def test_a_scope_that_cannot_start_falls_back_to_the_plain_launch(self) -> None:
+        calls = self.scoped_launch({"INVOCATION_ID": "abc"}, lambda timeout=None: 1)
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("/usr/bin/systemd-run", calls[1])
+        self.assertIn("--census-lock-fd", calls[1])
+
+    def test_a_census_outside_systemd_is_launched_plainly(self) -> None:
+        calls = self.scoped_launch({}, AssertionError("waited"))
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("/usr/bin/systemd-run", calls[0])
+
     def test_a_large_opened_dir_resumes_at_its_cursor(self) -> None:
         for n in range(30):
             self.write(f"held/f{n:02d}", 4096)
@@ -15173,6 +15218,54 @@ class LaneVmFamiliesTest(unittest.TestCase):
         self.assertTrue(dead.exists())
         self.assertTrue(wt.exists())
         self.assertFalse((self.home / ".receipt.jsonl").exists())
+
+    def wt_checkout(self, name: str, hours: float, tagged: bool = True, repo: str = "cmux") -> Path:
+        checkout = self.home / ".wt/checkouts" / repo / name
+        (checkout / "src").mkdir(parents=True)
+        (checkout / ".git").write_text("gitdir: /nowhere\n")
+        (checkout / "src/main.rs").write_text("fn main() {}\n")
+        target = checkout / "cmux-tui/target"
+        (target / "debug/deps").mkdir(parents=True)
+        (target / "debug/deps/libbig.rlib").write_bytes(b"x" * 8192)
+        if tagged:
+            (target / "CACHEDIR.TAG").write_bytes(
+                gd.CACHEDIR_TAG + b"\n# This file is a cache directory tag created by cargo.\n")
+        self.age(checkout, hours)
+        return checkout
+
+    def test_an_idle_wt_worktrees_cargo_target_goes_and_a_live_worktrees_stays(self) -> None:
+        # fs-agent-lane-2, 2026-11-22: 178G under ~/.wt that no family reached ("unwalked"), 0 B reclaimable
+        idle = self.wt_checkout("lane--idle", 8)
+        opened = self.wt_checkout("lane--open", 8)
+        session = self.wt_checkout("lane--session", 8)
+        named = self.wt_checkout("lane--named", 8)
+        recent = self.wt_checkout("lane--recent", 1)
+        untagged = self.wt_checkout("lane--untagged", 8, tagged=False)
+        spare = self.wt_checkout(".wt-spare-abc", 8)
+        self.rows = [{"sessionId": "s1", "status": "idle", "name": "lane-session", "cwd": str(session / "src")}]
+        fams = self.lane(gd.WT_CARGO_TARGET)
+        self.assertEqual(len(fams), 1)
+        targets = gd.wt_cargo_targets(fams[0].root)
+        self.assertEqual(sorted(targets), sorted(c / "cmux-tui/target" for c in (idle, opened, session, named, recent)))
+        self.assertNotIn(untagged / "cmux-tui/target", targets)
+        self.assertNotIn(spare / "cmux-tui/target", targets)
+        cmds = f"cargo test --manifest-path {named}/cmux-tui/Cargo.toml"
+        with mock.patch.object(gd, "process_evidence", return_value=([str(opened / "src")], cmds)):
+            items = {Path(i.path).parent.parent.name: i for i in gd.survey(fams, 0.5, 0)}
+        self.assertEqual(items["lane--idle"].verdict, "reclaimable", items["lane--idle"].reasons)
+        self.assertEqual(items["lane--open"].verdict, "in-use")
+        self.assertIn("its worktree is open by a process (cwd or open file)", items["lane--open"].reasons)
+        self.assertEqual(items["lane--session"].verdict, "in-use")
+        self.assertIn("the cwd of open acpmux session lane-session", items["lane--session"].reasons)
+        self.assertEqual(items["lane--named"].verdict, "in-use")
+        self.assertIn("its worktree is named by a running command", items["lane--named"].reasons)
+        self.assertEqual(items["lane--recent"].verdict, "recent")
+        self.apply(fams, list(items.values()), [str(opened / "src")], cmds)
+        self.assertFalse((idle / "cmux-tui/target").exists())
+        self.assertTrue((idle / "src/main.rs").exists())  # the worktree, its sources and git stay
+        self.assertTrue((idle / ".git").exists())
+        for kept in (opened, session, named, recent):
+            self.assertTrue((kept / "cmux-tui/target").exists(), kept)
 
     def test_an_unreadable_session_list_or_process_table_keeps_every_session(self) -> None:
         dead = self.session("01a1d212-4250-7272-94b4-33a324d4aed3")
