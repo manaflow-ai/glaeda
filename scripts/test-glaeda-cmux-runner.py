@@ -21495,10 +21495,13 @@ class CapacityArithmeticTest(unittest.TestCase):
                     self.assertEqual(hook.root_fit_units(), hook.ROOT_FIT_UNITS)
         # the shipped file is a valid needs file (read as a host it names, when it names any)
         shipped = ROOT / "scripts" / hook.JOB_NEEDS_NAME
-        listed = json.loads(shipped.read_text()).get("hosts") or [hook.gate_host()]
+        shipped_doc = json.loads(shipped.read_text())
+        listed = shipped_doc.get("hosts") or [hook.gate_host()]
+        # read a day after the file's own generated_at, so every refresh of the copy passes (a fixed date failed
+        # the 2026-11-22 refresh with "generated_at is in the future")
+        generated = datetime.datetime.fromisoformat(shipped_doc["generated_at"].replace("Z", "+00:00"))
         with mock.patch.object(hook, "gate_host", return_value=listed[0]):
-            self.assertEqual(hook.load_job_needs(shipped, now=datetime.datetime(
-                2026, 11, 16, tzinfo=datetime.timezone.utc).timestamp())[1], "")
+            self.assertEqual(hook.load_job_needs(shipped, now=(generated + datetime.timedelta(days=1)).timestamp())[1], "")
 
     def test_one_rule_on_a_12_core_16_gib_host_and_a_30_core_96_gib_host(self) -> None:
         needs = self.needs({f"{self.GUEST}/build-fleet-go.yml/test": self.row(3.4, 3000)})  # 4 cores, 3 GiB
