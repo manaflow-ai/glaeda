@@ -12412,6 +12412,7 @@ LAND_WINDOW_S = 3600.0
 # A due entry left unjudged this long past its wake with no latch (every worker busy: gated) is noted once in its
 # history and counted in the land-pool line (dueLate), so a wait past its wake always has a logged reason.
 LAND_DUE_LATE = 1800.0
+LAND_LATE_WHY_EVERY = 60.0  # a due-late row's reason is rewritten at most this often (note_late)
 # A job (a judgment, a merge or other step, a PR read) that has held its worker this long is logged once
 # ("land-slot-held"), named in the land-pool line ("slotHeld": the one holding longest) and in its status line, so a
 # slot held past it is seen where it is held, not only as a due count growing behind it. A lane VM,
@@ -14603,6 +14604,14 @@ class LandQueue:
         self.pass_gated += 1
         if self.pass_first_gated is None:
             self.pass_first_gated = e["key"]
+        self.note_late(e, why)
+
+    def note_late(self, e: dict, why: str) -> None:
+        """E, due and not started this pass, has WHY on record as what holds it (dueLate) once it is LAND_DUE_LATE past
+        its wake, and its record says the gate holding it now. Every gate in judge() that leaves a due row out calls
+        this, not only the worker count: huge-blue, 2026-11-22 07:23Z, load 0.48/core under the line, 1 of 12 workers
+        busy, 449 due late, and the rows still read "the host's load is over the line" from 05:41-06:46Z, because the
+        gates holding them since (the quota pace, the reset stagger, a head read) left the old reason on the row."""
         if self.due(e) and self.now - self.due_since(e) >= LAND_DUE_LATE and not e.get("dueLate"):
             # A wait past its wake always has a reason on record: here, every worker was busy (LAND_DUE_LATE)
             load = land_load_per_core()
@@ -14612,8 +14621,11 @@ class LandQueue:
                          workers=self.workers(), busy=len(self.jobs), loadPerCore=load,
                          holders=",".join(key_name(k) for k in list(self.jobs)[:8]))
             self.save(e)
-        elif (dl := e.get("dueLate")) and dl.get("why") != why:
-            dl.update(why=why, workers=self.workers(), busy=len(self.jobs))  # the reason it waits now, not its first
+        elif (dl := e.get("dueLate")) and dl.get("why") != why \
+                and self.now - float(dl.get("whyAt") or dl.get("at") or 0) >= LAND_LATE_WHY_EVERY:
+            # at most once per LAND_LATE_WHY_EVERY: a row whose gate flips each 2 s pass (a worker frees, a head read
+            # is asked) would rewrite its file every pass, ~450 rows at once in the 07:25Z queue
+            dl.update(why=why, whyAt=self.now, workers=self.workers(), busy=len(self.jobs))  # the reason it waits now, not its first
             load = land_load_per_core()
             dl["loadPerCore"] = None if load is None else round(load, 2)
             self.save(e)
@@ -14787,6 +14799,16 @@ class LandQueue:
             # is the quota it repairs (gate-fix-passes-through-the-gate.md; its merge starts on an App pool). Charged
             # as any judgment is; every check, hold and review still judges it.
             return True
+        if self.latch_free(e) and not self.broker_client():
+            # (A broker client's latch-free owner has its REST reads answered by the broker's read App, its GraphQL by
+            # the login: paced as before.) Its reads go to the lander App pools (LAND_ENV_TAGS: every lander read routes to the lander App), not the
+            # login this pace spreads: neither paced nor charged here, as the login's latch already does not hold it
+            # (latch_free). huge-blue, 2026-11-22 07:12-07:25Z: load 0.56-0.65/core, 12 workers, busy 1-2, capped
+            # 243-268 rows a pass, dueLate 425 -> 520 in 13 min: manaflow-ai rows waited on slots of the login's
+            # GraphQL they never spend. The App's own refusals are what is measured for them (spent_until, the park).
+            if first is not None:
+                e["cacheOnlyJudge"] = "unread"
+            return True
         if first is not None and not over:
             # The last answer was unreadable: the caches first, no read sent (LAND_UNREAD_SAME_STOP's comment)
             e["cacheOnlyJudge"] = "unread"
@@ -14832,6 +14854,9 @@ class LandQueue:
         """A judgment of E starts: this window is charged its LAND_JUDGE_COST, kept on disk; a cache-only judgment
         (window_room's cacheOnlyJudge) sends nothing and is charged nothing."""
         w = self.window_now()
+        if self.latch_free(e) and not self.broker_client():  # read on the lander App pools: the login's window is not charged (window_room)
+            e.pop("windowCapped", None)
+            return
         if not isinstance(e.get("cacheOnlyJudge"), float):  # a pace slot's cache-only judgment sends nothing
             # a REST-route judgment (LAND_REST_ROUTE) sends no GraphQL the pace could give: charged to REST alone
             pools = ("rest",) if e.get("cacheOnlyJudge") == "rest" else LAND_JUDGE_COST
@@ -15518,6 +15543,7 @@ class LandQueue:
         # recover before either another event arrives or the recovery sweep runs.
         self.changed_entries.add(e["key"])
         if self.reset_staggered(e):
+            self.note_late(e, "the login's reset stagger")
             return False  # its place in the stagger after the latch lifted is ahead: no read nudged, no wait begun
         workers = self.workers()
         free = len(self.jobs) < workers
@@ -15527,6 +15553,7 @@ class LandQueue:
             return False  # nothing it could start now: no head read nudged, no wait begun, ahead of its turn
         pin = self.fresh_head(e, sha, free)
         if pin is None:
+            self.note_late(e, "waiting for the daemon's read of its head")
             return False  # judged once the daemon has read the PR since it was unparked or the latch cleared
         sha = pin
         if land_head_moved(str(e.get("pinSha") or ""), sha) and (own := self.follow_own_update(e, sha)):
@@ -15539,6 +15566,7 @@ class LandQueue:
                 self.gated(e)
                 return False
         elif self.snapshot_wait(e, sha, free):
+            self.note_late(e, "waiting for the daemon's snapshot of its head")
             return False  # judged on the daemon's next read of this head (one read, shared), not on land_judge's own
         if not free:
             self.gated(e)  # a judgment it could start: ready, waiting for a worker
@@ -15556,6 +15584,7 @@ class LandQueue:
             self.gated(e, "the host's load is over the line")  # measured: started once the load per core drops
             return False
         if not self.window_room(e, sha):
+            self.note_late(e, f"the login's quota pace ({(e.get('windowCapped') or {}).get('pool') or '?'})")
             return False  # this window's share is spent: judged in a later one, its place kept
         c = self.cache_of(e["key"]) or {}
         head = str((c.get("data") or {}).get("headRefOid") or "").lower()
@@ -29063,13 +29092,18 @@ REPO_ONLY_RE = re.compile(rf"({NAME})/({NAME})")
 
 
 def join_repo_and_number(raw: list[str]) -> list[str] | None:
-    """`wait run OWNER/REPO RUN_ID`, `wait pr OWNER/REPO N` (also status, and `land OWNER/REPO N`): the repository and
-    the number as two words, joined into the one target the command takes (coordinator, 2026-11-21: `glaeda-gh wait run
-    manaflow-ai/cmuxterm-hq 44884634507` failed "unrecognized arguments"). None when the words are not that shape."""
+    """`wait run OWNER/REPO RUN_ID`, `wait pr OWNER/REPO N` (also status, `land OWNER/REPO N` and `post
+    comment|review OWNER/REPO N`): the repository and the number as two words, joined into the one target the command
+    takes (coordinator, 2026-11-21: `glaeda-gh wait run manaflow-ai/cmuxterm-hq 44884634507` failed "unrecognized
+    arguments"; measured 2026-11-22, `glaeda-gh comment manaflow-ai/cmuxterm-hq 15832 --body-file -` was routed to
+    `post comment` by nesting_synonym and then failed "unrecognized arguments: 15832", while `land` and `status pr`
+    took that exact pair). None when the words are not that shape."""
     cmd, rest = raw[0], raw[1:]
     kind = ""
     if cmd != "land":
-        if len(rest) < 3 or rest[0] not in ("pr", "run"):
+        # `post pr OWNER/REPO` names a repository with no number, and `post status` an id: neither joins.
+        kinds = ("comment", "review") if cmd == "post" else ("pr", "run")
+        if len(rest) < 3 or rest[0] not in kinds:
             return None
         kind, rest = rest[0], rest[1:]
     if len(rest) < 2 or not REPO_ONLY_RE.fullmatch(rest[0]) or not re.fullmatch(r"#?\d+", rest[1]):
@@ -29084,7 +29118,15 @@ def infer_kind(raw: list[str]) -> tuple[list[str], str]:
 
     Agents write `wait OWNER/REPO#N --until done` and argparse refused it (11 tool results in 24 h on 2026-11-21). A first word that is not a kind but is a pull-request target (OWNER/REPO#N,
     .../pull/N) means `pr`; OWNER/REPO/RUNID or .../actions/runs/ID means `run`. `land pr X` drops the `pr`. Returns the argv to parse and the note for stderr ("" when unchanged)."""
-    if len(raw) < 2 or raw[0] not in ("wait", "status", "land"):
+    if len(raw) < 2 or raw[0] not in ("wait", "status", "land", "post"):
+        return raw, ""
+    if raw[0] == "post":
+        # A post call infers only its target's shape: `post comment o/r 5` is `o/r#5`, the pair `status pr` and
+        # `land` already take. The kind stays argparse's own choice list (and nesting_synonym's), because which
+        # kind a write is cannot be guessed from a target.
+        joined = join_repo_and_number(raw)
+        if joined:
+            return joined, f"glaeda-gh: ran as `{typed_line(['glaeda-gh'] + joined)}`"
         return raw, ""
     wait_joined = False
     if raw[0] == "wait":
