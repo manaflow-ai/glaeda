@@ -358,11 +358,28 @@ jobs:
           # tests never ran while test-glaeda-disk was red). Each failure is an annotation and a summary row.
           # Add a new test suite as `suite python3 scripts/test-x.py`: a bare line stops the step at its failure.
           failed=()
+          timings=()
+          # A suite with no bound spends the job's whole remaining ceiling, and the suites behind it never run.
+          # In run 45089631085 scripts/test-glaeda-gh.py went quiet after 275 s and hung until the 15 min job
+          # ceiling killed the job 729 s later: no verdict about the code, and 48 of the 97 suites never ran,
+          # while every `glaeda-gh wait` watching it read "pending" for the whole 15 minutes. Each suite is now
+          # bounded and timed: a hang is killed, named as a timeout, and the suites behind it still run, so the
+          # step ends red with a verdict. The bound is about 3x the slowest healthy suite
+          # (test-glaeda-promotion-admit, 98 s of the step's 499 s).
+          suite_seconds=${GLAEDA_SUITE_TIMEOUT_SECONDS:-300}
           suite() {
             echo "::group::$*"
-            if "$@"; then echo "::endgroup::"; else
-              rc=$?
-              echo "::endgroup::"
+            local start=$SECONDS rc=0
+            timeout --kill-after=10s "$suite_seconds" "$@" || rc=$?
+            local took=$((SECONDS - start))
+            echo "suite took ${took}s of its ${suite_seconds}s bound: $*"
+            echo "::endgroup::"
+            timings+=("$took $*")
+            if [ "$rc" -eq 0 ]; then return 0; fi
+            if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+              echo "::error title=Suite hit its ${suite_seconds}s bound::$* -- killed after ${took}s so the step still reports"
+              failed+=("$* (hit its ${suite_seconds}s bound)")
+            else
               echo "::error title=Suite failed (exit $rc)::$*"
               failed+=("$*")
             fi
@@ -405,6 +422,7 @@ jobs:
           suite python3 scripts/test-glaeda-sync-main.py
           suite python3 scripts/test-delivery-concurrency.py
           suite python3 scripts/test-workflow-job-bounds.py
+          suite python3 scripts/test-ci-suite-bound.py
           suite python3 scripts/test-hot-pressure-shadow.py
           suite python3 scripts/test-hot-run.py
           suite python3 scripts/test-verify-focused.py
@@ -451,6 +469,10 @@ jobs:
           {
             echo "### Script suites: ${#failed[@]} failed"
             for f in "${failed[@]}"; do echo "- \`$f\`"; done
+            # Which suites own the step's wall clock, so the next read of a slow step needs no log archaeology.
+            echo "### Slowest suites of ${#timings[@]}, each bounded at ${suite_seconds}s"
+            printf '%s\n' "${timings[@]}" | sort -rn | head -10 |
+              while read -r took name; do echo "- ${took}s \`$name\`"; done
           } >> "$GITHUB_STEP_SUMMARY"
           [ "${#failed[@]}" -eq 0 ]
 

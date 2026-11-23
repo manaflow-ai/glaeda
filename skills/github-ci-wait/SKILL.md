@@ -41,7 +41,9 @@ glaeda-gh runners OWNER[/REPO] [--label L] [--json]  # online, busy and idle sel
 - `wait` exits 0 on success (or a matching comment), 1 on failure (including a PR closed without
   being merged), 2 on timeout (`--timeout S`, default 3600), 3 when the daemon is down, 4 when the
   PR conflicts with its base, 6 when no CI ever reported on the head, 7 (inconclusive) when `--until done`
-  is left with only checks queued with no runner past 30 min or the deadline passes on a partial read,
+  is left with only checks queued with no runner past 30 min, an expected context that nothing requires was
+  never posted 30 min after the push (code `expected-unposted`: no check carries it, so the wait ends saying
+  so rather than spending its timeout; land-judge still counts it), or the deadline passes on a partial read,
   64 on bad arguments. Done and green never exit 0 while any check is queued, running or pending.
 - Every non-zero exit of `status` and `wait pr|run` ends with a line saying what is wrong and a last line
   `next: <command>` (or `next: none (why)`), and with `--json` its one object carries `ok`, `code`, `reason`

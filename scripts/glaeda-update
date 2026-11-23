@@ -505,10 +505,34 @@ def gh_kind(text: str) -> str | None:
     return None
 
 
+# GitHub quotes the token's numeric account id in its own quota refusal ("API rate limit already exceeded for user
+# ID NNNN") and gh passes that sentence on. The id is personal data, and this updater's status lines are pasted into
+# PR bodies, ledger rows and handoff issues by the agents that read them, so it must not carry one -- the same defect
+# glaeda-gh's gh_said fixed (glaeda#2582). This file runs with no sibling imports on purpose: it replaces glaeda-gh
+# and must keep working while that file is half-written, so it cannot import gh_said and says the substitution again
+# here. test-glaeda-update pins this function's answer to glaeda-gh's own for the measured refusal, so the two cannot
+# drift apart. No login is readable here without an API call, so the holder is named the way glaeda-gh names it when
+# its host has no login to read. What the refusal says -- which limit, and any reset it names -- is kept word for word.
+GH_USER_ID = re.compile(r"\b(users?)(?:\s+id)?\s+\d{3,}\b", re.I)
+GH_INSTALL_ID = re.compile(r"\b(installations?)(?:\s+id)?\s+\d{3,}\b", re.I)
+GH_CALLER_IP = re.compile(r"\bfor (?:IP\s+)?(?:(?:\d{1,3}\.){3}\d{1,3}|[0-9a-f:]*::[0-9a-f:]*[0-9a-f])\b", re.I)
+GH_NO_HOLDER = "(this host's gh login)"  # glaeda-gh's own phrase for a host with no login to name
+
+
+def gh_said(text: str) -> str:
+    """TEXT with GitHub's personal identifiers replaced by the holder they stand for (GH_USER_ID's comment).
+
+    Idempotent, so text with no identifier in it comes back byte for byte and gh's words stay gh's own."""
+    out = GH_USER_ID.sub(rf"\1 {GH_NO_HOLDER}", str(text or ""))
+    out = GH_INSTALL_ID.sub(r"\1 (an App of this repository's owner)", out)
+    return GH_CALLER_IP.sub("for an unauthenticated caller", out)
+
+
 def gh_output(result: "subprocess.CompletedProcess[str]") -> str:
-    """Both of gh's streams. gh writes its own errors to stderr, but the quota shim in front of it may
-    answer on either, and one stream holding a warning must not hide the other's refusal."""
-    return "\n".join(part for part in (result.stderr, result.stdout) if part).strip()
+    """Both of gh's streams, with GitHub's account id out of them (gh_said). gh writes its own errors to stderr,
+    but the quota shim in front of it may answer on either, and one stream holding a warning must not hide the
+    other's refusal."""
+    return gh_said("\n".join(part for part in (result.stderr, result.stdout) if part).strip())
 
 
 def gh_call(gh: str, args: list[str], timeout: int,
@@ -556,7 +580,7 @@ def attestation(path: Path) -> tuple[bool | None, str]:
     except (OSError, subprocess.TimeoutExpired) as e:
         return None, f"gh not signed in ({type(e).__name__})"
     if token.returncode != 0:
-        return None, f"gh not signed in: {token.stderr.strip()}"[:200]
+        return None, f"gh not signed in: {gh_said(token.stderr.strip())}"[:200]
     result, why = gh_call(gh, ["attestation", "verify", str(path), "--repo", REPOSITORY,
                                "--signer-workflow", SIGNER_WORKFLOW, "--source-ref", "refs/heads/main"], 120)
     if result is None:
@@ -594,7 +618,7 @@ def run_setup(gen: Path, args: list[str]) -> tuple[bool, str]:
                                 env={**os.environ, "GLAEDA_UPDATE_RUNNING": "1"})
     except (OSError, subprocess.TimeoutExpired) as e:
         return False, str(e)
-    return result.returncode == 0, (result.stdout + result.stderr)[-2000:]
+    return result.returncode == 0, gh_said((result.stdout + result.stderr)[-2000:])
 
 
 def gh_only(config: dict) -> bool:
@@ -756,7 +780,7 @@ def report(config: dict, entry: dict, ok: bool | None, detail: str) -> str:
     if result is None:
         return f"not reported ({why})"
     if result.returncode != 0:
-        return f"not reported (gh exited {result.returncode}: {(result.stderr or result.stdout).strip()[:160]})"
+        return f"not reported (gh exited {result.returncode}: {gh_said((result.stderr or result.stdout).strip())[:160]})"
     return "reported"
 
 

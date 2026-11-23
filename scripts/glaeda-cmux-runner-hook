@@ -1355,9 +1355,29 @@ def listener_disk_peak(scope: "RunnerScope") -> tuple[float, str]:
 # (data/job_needs.py writes it from job-needs.json's all.disk_gib_p95; the controller's runner_disk.go reserves the same
 # value per PR job on a lent host, the twin of this rule). Copy hq's file over it to refresh it; a missing, unreadable
 # or malformed file turns this reading off (the one-job peak stays) rather than guessing a number.
-# DISK_RECLAIM_NOW: neither reading holds the listener any more. Held, a listener took nothing while its CPUs idled
+# DISK_RECLAIM_NOW: the one-job peak no longer holds the listener. Held, a listener took nothing while its CPUs idled
 # and the jobs queued (ci-dash, 2026-11-18: cmux17 lost 4.2 unit-hours to the disk floor in 30 minutes); short, the
 # gate now starts reclaim at once, waits at most DISK_RECLAIM_WAIT_S for room and listens whatever that freed.
+# RUNNER_JOBS_HOLD (hq#19208, 2026-11-22): this reading holds again. Listening through it, the minis wrote themselves
+# down to 1.3 GiB with 7 jobs running (cmux22, 19:16Z) and jobs failed with ENOSPC: failed, not slower. The line is the
+# measured p95 per job above, less what the running jobs already wrote (RUNNER_JOB_WRITTEN), no hand-set number.
+# Off switch (the default change's): RUNNER_JOBS_HOLD_OFF_ENV=1 in the runner's environment, or a RUNNER_JOBS_HOLD_OFF_FILE
+# in the capacity ledger (touch it on the mini, live), turns the hold back into reclaim-and-listen (RUNNER_JOBS_DISK)
+# without removing the measurement file. Each hold logs one countable line when it starts and one when it ends:
+# "RUNNER_JOBS_HOLD start free_gib=F need_gib=N reserve_gib=10 jobs_in_flight=J" and "RUNNER_JOBS_HOLD end ...".
+RUNNER_JOBS_HOLD_OFF_ENV = "GLAEDA_RUNNER_JOBS_HOLD_OFF"
+RUNNER_JOBS_HOLD_OFF_FILE = "runner-jobs-hold.off"
+# OWN_NEED_HOLD (2026-11-23): JOB_DISK_OWN_NEED refuses a job at setup, but the listener that took it went straight
+# back to listening on the same short disk, so the next job of the same kind landed on it and was refused again: in
+# 21:12-23:23Z 11-22, 141 of 186 bad cmux-next fast tier PR jobs were such setup refusals, from five minis (cmux23 57,
+# mac-mini-6 29, cmux22 21, cmux19 14, cmux18 13) that ran none of them. A refusal now leaves its need here (in this
+# account's state dir, which every runner of the account reads), and each pool listener of the account takes no job
+# while free disk is under it, reclaiming meanwhile, at most OWN_NEED_HOLD_S from the refusal; room or the bound ends
+# it. A small runner, a gateway runner, the nightly's own and a dedicated builder never hold for it. Off switch: the
+# RUNNER_JOBS_HOLD one. Its start and end each log one countable line ("OWN_NEED_HOLD start|end ...").
+OWN_NEED_FILE = "own-need-refused.json"
+OWN_NEED_HOLD_S = 15 * 60.0
+OWN_NEED = "OWN_NEED_HOLD"
 RUNNER_JOB_DISK_SCHEMA = "glaeda-runner-job-disk/v1"
 RUNNER_JOB_DISK_NAME = "glaeda-runner-job-disk.json"
 RUNNER_JOB_DISK_ENV = "GLAEDA_RUNNER_JOB_DISK_FILE"  # another file (tests; a host-local trial)
@@ -2695,6 +2715,60 @@ SIM_SLOT_ENV = "GLAEDA_SIM_SLOT"
 SIM_SLOT_FILE = "glaeda-sim-slot"  # $RUNNER_TEMP/glaeda-sim-slot: the copy index alone
 MEMORY_FREE_KEY = "kern.memorystatus_level"  # Darwin: the percentage of RAM free (memory_pressure's last line)
 HOST_MEM_FREE_ENV = "GLAEDA_HOST_MEM_FREE_PCT"  # tests: the free percentage instead of kern.memorystatus_level
+
+
+def runner_jobs_hold_off(capacity_dir: Path | None = None) -> str | None:
+    """Why RUNNER_JOBS_HOLD is off on this mini (its off switch), or None."""
+    if (os.environ.get(RUNNER_JOBS_HOLD_OFF_ENV) or "").strip() == "1":
+        return f"{RUNNER_JOBS_HOLD_OFF_ENV}=1"
+    if capacity_dir is not None and (capacity_dir / RUNNER_JOBS_HOLD_OFF_FILE).exists():
+        return f"{capacity_dir / RUNNER_JOBS_HOLD_OFF_FILE} exists"
+    return None
+
+
+def own_need_record(state_dir: Path | None, need_gib: float, key: str, now: float | None = None) -> None:
+    """OWN_NEED_HOLD: leave a JOB_DISK_OWN_NEED refusal's need for this account's listeners; the larger of a live
+    record's need and this one is kept, with this refusal's time. Never fails the hook."""
+    if state_dir is None:
+        return
+    now = time.time() if now is None else now
+    with contextlib.suppress(Exception):
+        held = own_need_held(state_dir, None, now)
+        if held is not None and held["need_gib"] > need_gib:
+            need_gib, key = held["need_gib"], held["key"]
+        path = state_dir / OWN_NEED_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.{os.getpid()}")
+        tmp.write_text(json.dumps({"need_gib": round(float(need_gib), 1), "key": str(key), "at": now}),
+                       encoding="utf-8")
+        os.replace(tmp, path)
+
+
+def own_need_held(state_dir: Path | None, free: float | None, now: float | None = None) -> dict[str, Any] | None:
+    """OWN_NEED_HOLD: the live refusal record ({need_gib, key, at}) while free disk is under its need, else None. A
+    record past OWN_NEED_HOLD_S, unreadable, or met by free disk is removed; free None (unread) only reads it."""
+    if state_dir is None:
+        return None
+    path = state_dir / OWN_NEED_FILE
+    now = time.time() if now is None else now
+    try:
+        data = json.loads(read_bounded(path) or b"")
+        need, at = data["need_gib"], data["at"]
+        if isinstance(need, bool) or isinstance(at, bool) or not isinstance(need, (int, float)) \
+                or not isinstance(at, (int, float)):
+            raise ValueError("bad record")
+        record = {"need_gib": float(need), "key": str(data.get("key") or ""), "at": float(at)}
+    except FileNotFoundError:
+        return None
+    except Exception:  # noqa: BLE001  an unreadable record holds nothing
+        with contextlib.suppress(OSError):
+            path.unlink()
+        return None
+    if now - record["at"] >= OWN_NEED_HOLD_S or now < record["at"] - 60 or (free is not None and free >= record["need_gib"]):
+        with contextlib.suppress(OSError):
+            path.unlink()
+        return None
+    return record
 
 
 def sim_off(capacity_dir: Path | None = None) -> str | None:
@@ -9070,6 +9144,13 @@ def ios_sim_queued(summary: dict[str, Any] | None, labels: frozenset[str] | None
 # own tables know (JOB_CORES, WORKFLOW_JOB_CLASSES) of a cmux-next workflow is read from its display name, so a
 # renamed or newly measured job ("macOS fast tier", cmux#44472, run 44024082059, cancelled by its timeout while
 # waiting for units) is covered without a name edit.
+# The premise above does not hold: GitHub does not hand an idle runner its label's oldest queued job. On 2026-11-22
+# (controller timing feed, Mac PR jobs of the side classes, 6 h to 01:30Z) 133 of 145 were picked while an older one
+# of their class still waited, and "Set up runner" holds took 6,860 of the pool's 28,584 job minutes (24%), with
+# 9,275 more in jobs cancelled near their 60-min timeout after a median 34-40 min there ("N of 14 units free,
+# generated-files (isolated) needs 8", "daemon-test needs 6"): a listener sized for the oldest job took a larger one.
+# So it listens with room for the largest need among every queued job it could take (queue_jobs), not only the
+# oldest's; each name is read the same way and one the hook does not know is skipped.
 HEAD_FIT_ALIASES = {  # display names that do not slug to their job id
     "cmux app scheme compile (debug)": ("cmux-next.yml", "cmux-scheme-compile"),
     "cmux next dev release compile": ("cmux-next.yml", "cmux-scheme-compile"),
@@ -9105,35 +9186,40 @@ def head_job_key(name: str) -> tuple[str, str] | None:
     return None
 
 
-def queue_head(summary: dict[str, Any] | None, labels: frozenset[str] | None, now: float,
-               max_age: float | None = HOST_LOAD_CAP_JOB_MAX_AGE_S) -> dict[str, Any] | None:
-    """HEAD_FIT: the oldest queued job in a fresh feed whose labels are all this runner's, or None."""
+def queue_jobs(summary: dict[str, Any] | None, labels: frozenset[str] | None, now: float,
+               max_age: float | None = HOST_LOAD_CAP_JOB_MAX_AGE_S) -> list[dict[str, Any]]:
+    """HEAD_FIT: every queued job in a fresh feed whose labels are all this runner's, oldest first ([] when the feed
+    is missing or stale)."""
     if not isinstance(summary, dict) or not labels:
-        return None
+        return []
     delivery = summary.get("delivery")
     if not isinstance(delivery, (int, float)) or now - delivery > HOST_LOAD_CAP_FEED_STALE_S:
-        return None
+        return []
     queued = [job for job in (summary.get("jobs") if isinstance(summary.get("jobs"), list) else [])
               if isinstance(job, dict) and isinstance(job.get("labels"), list) and job["labels"]
               and set(job["labels"]) <= labels and job.get("status") in IOS_SIM_QUEUED
               and isinstance(job.get("created"), (int, float))
               and (max_age is None or now - job["created"] <= max_age)]
-    return min(queued, key=lambda job: job["created"]) if queued else None
+    return sorted(queued, key=lambda job: job["created"])
 
 
 def head_fit_units(summary: dict[str, Any] | None, labels: frozenset[str] | None, now: float,
                    need: Callable[[str, str], int] | None = None) -> tuple[int, str] | None:
-    """HEAD_FIT: (units, job name) the head of this runner's queue needs, or None when it cannot say."""
-    head = queue_head(summary, labels, now)
-    known = head_job_key(str((head or {}).get("name") or ""))
-    if known is None:
-        return None
-    workflow, job = known
+    """HEAD_FIT: (units, job name) of the largest need among the queued jobs this runner could take (GitHub may hand
+    it any of them), or None when it cannot say for any. On a tie the oldest names it."""
     if need is None:
         def need(workflow: str, job: str) -> int:
             return job_need(job_class(job, DEFAULT_HOME_REPO, workflow=workflow)[0], job, DEFAULT_HOME_REPO,
                             workflow=workflow).cores
-    return max(1, int(need(workflow, job))), str(head["name"])
+    best: tuple[int, str] | None = None
+    for queued in queue_jobs(summary, labels, now):
+        known = head_job_key(str(queued.get("name") or ""))
+        if known is None:
+            continue
+        units = max(1, int(need(*known)))
+        if best is None or units > best[0]:
+            best = (units, str(queued["name"]))
+    return best
 
 
 def load_cap_verdict(summary: dict[str, Any] | None, labels: frozenset[str] | None, host: str,
@@ -10227,14 +10313,15 @@ def job_disk_peak_hold(path: str, state_dir: Path, own_pid: int | None, key: str
         return f"runner jobs' disk check skipped: {type(error).__name__}"
 
 
-def job_disk_own_refusal(path: str, key: str | None, log: Path | None = None) -> str | None:
+def job_disk_own_refusal(path: str, key: str | None, log: Path | None = None,
+                         state_dir: Path | None = None) -> str | None:
     """JOB_DISK_OWN_NEED, after job_disk_peak_hold's pass: the refusal when free disk is under RUNNER_JOBS_FLOOR_GIB +
     this job's own learned peak (job_peak_gib), else None. Started there, the job runs out of disk mid-build (cmux22,
     cmux17 and mac-mini-6 failed daemon tests with ENOSPC at 33-38 GiB free after "the disk budget is spent; started
     without holding"); refused at setup, the owned pool's rescue places it on a mini with room. The in-flight jobs'
     peaks stay a warning (job_disk_peak_hold): they may finish first, and counting them would refuse every start on a
-    busy mini. A job with no learned peak here (job_disk_gib's flat guess) and an unreadable disk or job log never
-    refuse."""
+    busy mini. A job with no learned peak here (job_disk_gib's flat guess), a peak learned only beside other jobs
+    (JOB_OWN_NEED_ALONE) and an unreadable disk or job log never refuse."""
     try:
         free = free_or_none(path)
         if free is None:
@@ -10243,9 +10330,17 @@ def job_disk_own_refusal(path: str, key: str | None, log: Path | None = None) ->
         if key is None or key not in peaks:
             return None  # no history here: the flat default is a guess, not this job's need
         own, source = peaks[key]
+        # JOB_OWN_NEED_ALONE: only a peak this job wrote by itself (learned_job_peaks' "alone") is its own need. The
+        # fallback p90 over every run measures free_start - free_min, which counts the jobs writing beside it: a fast
+        # tier learned 54.7 GiB ("p90 of 20 runs here", 2026-11-22 22:02Z, refused at 17.2 GiB free on cmux23 against a
+        # fleet-measured 5.3 GiB p95 per job), a need no carrier of its label had, so the rescue's re-runs never
+        # found a runner. Such a peak stays the in-flight warning (job_disk_peak_hold) and never refuses.
+        if not source.endswith(" alone"):
+            return None
         need = round(RUNNER_JOBS_FLOOR_GIB + own, 1)
         if free >= need:
             return None
+        own_need_record(state_dir, need, key)  # OWN_NEED_HOLD: this account's listeners wait for this much
         return (f"disk: {free:.1f} GiB free after the reclaim pass, under this job's own need of {need:g} GiB "
                 f"({RUNNER_JOBS_FLOOR_GIB:g} GiB margin + its {own:g} GiB peak, {source}); refused at setup so the "
                 "rescue places it on a mini with room, not started into ENOSPC (JOB_DISK_OWN_NEED)")
@@ -10745,6 +10840,7 @@ class Gate:
         self.nightly_slot = runner_scope(runner_dir).nightly
         self.capacity_dir = capacity_dir
         self.fit_units = fit_units
+        self.own_need_started: float | None = None  # OWN_NEED_HOLD: monotonic start of the hold in force
         self.full_why: str | None = None  # the last known mini_full answer, kept across UNKNOWN looks
         self.claim_fd: int | None = None  # this gate's listen claim (LISTEN_CLAIM) while it listens
         self.first_fd: int | None = None  # SESSION_FIRST_LOCK while this session runner listens without room
@@ -10865,6 +10961,9 @@ class Gate:
         # DISK_RECLAIM_NOW: (why, the free GiB wanted) while an idle pool runner is short of one job's peak or of the
         # jobs in flight's disk at the last look; the listener's next start waits for room at most DISK_RECLAIM_WAIT_S
         self.disk_short: tuple[str, float] | None = None
+        self.disk_held: str | None = None  # RUNNER_JOBS_HOLD: the numbers behind the last look's hold, or None
+        self.disk_jobs_in_flight: int | None = None  # RUNNER_JOBS_DISK: the last process-table count, for the log
+        self.disk_hold_started: float | None = None  # RUNNER_JOBS_HOLD: monotonic start of the hold in force
         # SUITE_FIRST_HOLD: the fleet disk wait last seen (its id), when this gate's hold for it began (wall clock;
         # None while not holding) and the free GiB the wait wants while held, which low_disk's reclaim aims at too
         self.suite_wait: str | None = None
@@ -11310,7 +11409,7 @@ class Gate:
             found = None
             gate_log(f"the queue-head look failed ({type(error).__name__}); listening at the side fit")
         if found != self.head_fit_seen and found is not None:
-            gate_log(f"the oldest queued job it could take, {found[1]}, needs {found[0]} units: listening only "
+            gate_log(f"the largest queued job it could take, {found[1]}, needs {found[0]} units: listening only "
                      "with room for it, so it never waits here for units against its timeout")
         self.head_fit_seen = found
         return found[0] if found else 1
@@ -11632,9 +11731,9 @@ class Gate:
 
         No floor holds the listener (DISK_RECLAIM_NOW); only a full disk does, free under the hard floor plus one runner
         job's p95 (full_disk_gib, the build fleet's own disk pause: FLEET_PAUSE_FULL) where no job fits
-        (DISK_FULL_NO_LISTEN, the one reason this returns). An idle pool runner short of one job's measured peak
-        (job_disk_gib, DISK_SHORT_RECLAIM), whatever the floor, or of the jobs in flight's disk (RUNNER_JOBS_DISK)
-        starts reclaim at once aimed at what it lacks, and records it (disk_short), so its listener's next start waits
+        (DISK_FULL_NO_LISTEN), and one short of the jobs in flight's measured disk plus its own (RUNNER_JOBS_HOLD,
+        hq#19208) hold it. An idle pool runner short of one job's measured peak
+        (job_disk_gib, DISK_SHORT_RECLAIM), whatever the floor, starts reclaim at once aimed at what it lacks, and records it (disk_short), so its listener's next start waits
         at most DISK_RECLAIM_WAIT_S for room (disk_room_wait) and then listens whatever that freed. These readings used
         to hold the listener (DISK_SHORT_HOLD) so the job went to a runner with room (cmux run 43119216549,
         2026-11-11: admitted at 19.8 GiB free, its fast tier's link stopped at ld errno=28 after 13 minutes), but a
@@ -11688,9 +11787,45 @@ class Gate:
                 # the same words every poll: the gate logs a hold again only when its reason changes
                 return (f"disk full: under {full_gib:g} GiB, where no job of this runner fits; "
                         "reclaiming (DISK_FULL_NO_LISTEN)")
+            # RUNNER_JOBS_HOLD: the jobs in flight here still have their measured disk to write, so a listener that
+            # takes one more job where their writes and its own do not fit sends every job on the mini into ENOSPC
+            # (cmux22, 2026-11-22 19:16Z: 1.3 GiB free with 7 runner jobs; daemon tests failed out of disk on cmux17
+            # and cmux22). Held, it takes nothing and the job goes to a runner with room; it listens again as soon as
+            # reclaim or a job's end frees the line. The reason is the same words every poll; the numbers log at
+            # most every GATE_DISK_NOTE_S. A small runner's jobs are measured under the per-job p95 (its own peak
+            # caps DISK_FULL_NO_LISTEN too), so it keeps reclaiming and listening (below).
+            if (held := self.own_need_hold(path, scope)) is not None:
+                self.disk_short = None
+                self.evict_in_background(path, max(floor, held, aim))
+                # the same words every poll while the record stands: the gate logs the hold once
+                return (f"disk: a job refused here (JOB_DISK_OWN_NEED) needs {held:g} GiB free; reclaiming, taking no "
+                        f"job until it fits, at most {OWN_NEED_HOLD_S / 60:g} min from the refusal ({OWN_NEED})")
+            crowded = self.runner_jobs_short(path)
+            self.disk_held = None
+            hold = bool(crowded) and not scope.small and runner_jobs_hold_off(self.capacity_dir) is None
+            now = time.monotonic()
+            if hold != (self.disk_hold_started is not None):
+                free = free_or_none(path)
+                numbers = (f"free_gib={free if free is None else round(free, 1)} "
+                           f"need_gib={crowded[1] if crowded else 'none'} reserve_gib={RUNNER_JOBS_FLOOR_GIB:g} "
+                           f"jobs_in_flight={self.disk_jobs_in_flight}")
+                if hold:
+                    gate_log(f"RUNNER_JOBS_HOLD start {numbers}")
+                    self.disk_hold_started = now
+                else:
+                    gate_log(f"RUNNER_JOBS_HOLD end {numbers} held_s={round(now - (self.disk_hold_started or now))}")
+                    self.disk_hold_started = None
+            if hold and crowded:
+                self.disk_short, self.disk_held = None, crowded[0]
+                self.evict_in_background(path, max(floor, crowded[1], aim))
+                if self.disk_warned_at is None or now - self.disk_warned_at >= GATE_DISK_NOTE_S:
+                    gate_log(f"disk: {crowded[0]} (RUNNER_JOBS_HOLD)")
+                    self.disk_warned_at = now
+                return ("disk: under the margin plus the runner jobs in flight's measured disk and this one's; "
+                        "reclaiming, taking no job until it fits (RUNNER_JOBS_HOLD)")
             if under := disk_refusal(path, peak):
                 short = (f"disk: {under} for {whose} (DISK_SHORT_RECLAIM)", max(floor, peak))
-            elif crowded := self.runner_jobs_short(path):
+            elif crowded:
                 short = (f"disk: {crowded[0]} (RUNNER_JOBS_DISK)", max(floor, crowded[1]))
         self.disk_short = short
         if short:
@@ -11711,6 +11846,27 @@ class Gate:
                 gate_log(f"disk warning: {why}{reserve}; keeping the listener online and requesting cleanup")
                 self.disk_warned_at = now
         return None
+
+    def own_need_hold(self, path: str, scope: Any) -> float | None:
+        """OWN_NEED_HOLD: the need (GiB) this pool listener holds for after a JOB_DISK_OWN_NEED refusal here, or None.
+        A small runner and the off switch never hold; the caller already leaves out the nightly's own listeners, a
+        dedicated builder, a gateway runner and a runner with no disk floor. Logs one line at a hold's start and one
+        at its end."""
+        record = None
+        if not scope.small and runner_jobs_hold_off(self.capacity_dir) is None:
+            record = own_need_held(self.state_dir, free_or_none(path))
+        started = getattr(self, "own_need_started", None)
+        now = time.monotonic()
+        if record is not None and started is None:
+            free = free_or_none(path)
+            gate_log(f"{OWN_NEED} start free_gib={free if free is None else round(free, 1)} "
+                     f"need_gib={record['need_gib']:g} key={record['key']}")
+            self.own_need_started = now
+        elif record is None and started is not None:
+            free = free_or_none(path)
+            gate_log(f"{OWN_NEED} end free_gib={free if free is None else round(free, 1)} held_s={round(now - started)}")
+            self.own_need_started = None
+        return None if record is None else record["need_gib"]
 
     def suite_first(self, busy: bool = False) -> str | None:
         """SUITE_FIRST_HOLD: why this pool listener stays off for a fleet suite step that waits for disk on this mini
@@ -11782,6 +11938,7 @@ class Gate:
         written = round(sum(min(per, job_written_gib(self.state_dir, name, pid, now) or 0.0)
                             for name, pid in running), 1)
         in_flight = len(running) + listening
+        self.disk_jobs_in_flight = in_flight
         why = runner_jobs_refusal(free, in_flight, per, source, written)
         return (why, round(runner_jobs_need_gib(in_flight, per) - written, 1)) if why else None
 
@@ -15446,7 +15603,7 @@ def main(argv: list[str] | None = None) -> int:
             # JOB_DISK_OWN_NEED: a home job whose own learned peak does not fit is refused for the rescue to place
             # elsewhere; a guest has no rescue, so it starts as before
             if not is_guest(repo, args.home_repo):
-                why = job_disk_own_refusal(disk_path, peak_key, args.job_log)
+                why = job_disk_own_refusal(disk_path, peak_key, args.job_log, args.state_dir)
                 if why:
                     return refused(why, disk=True)
         # DISK_FULL_REFUSES: the listener's full line, read after every eviction and wait above; a nightly job keeps its

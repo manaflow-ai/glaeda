@@ -1854,5 +1854,51 @@ class ReleaseTest(unittest.TestCase):
             self.assertTrue((Path(tmp) / "out/glaeda/scripts/glaeda_release.py").is_file())
 
 
+# The refusal gh passes on from GitHub, with the id replaced by a fake. glaeda-update renders gh's streams into its
+# own status lines, which agents paste into PR bodies and ledger rows, so the id must not survive the render.
+UPDATE_ID = "4242424242"  # a fake account id
+UPDATE_RAW = f"API rate limit already exceeded for user ID {UPDATE_ID}."
+
+
+class GhSaidTest(unittest.TestCase):
+    """gh's streams become this updater's status text, and GitHub's quota refusal quotes the token's numeric
+    account id, which is personal data and must never be in a line an agent pastes into a PR body.
+
+    Detector for the whole class: test-glaeda-gh's test_every_github_message_is_read_through_the_chokepoint,
+    which refuses a site in glaeda-gh that formats GitHub's message without a sanitizing sink. This file carries
+    the drift check for the copy below, because an updater cannot import the tool it replaces."""
+
+    def test_a_quota_refusal_in_a_status_line_names_no_account_id(self) -> None:
+        """The id goes; which limit was hit stays, because that is what the reader acts on."""
+        said = gu.gh_said(f"gh: {UPDATE_RAW} (HTTP 403)")
+        self.assertNotIn(UPDATE_ID, said)
+        self.assertEqual(said, f"gh: API rate limit already exceeded for user {gu.GH_NO_HOLDER}. (HTTP 403)")
+        self.assertIn("rate limit", said)  # the operational meaning, not swallowed
+        # gh_output is the sink every gh call in this file goes through
+        result = subprocess.CompletedProcess([], 1, "", f"gh: {UPDATE_RAW} (HTTP 403)")
+        self.assertNotIn(UPDATE_ID, gu.gh_output(result))
+        self.assertEqual(gu.gh_kind(gu.gh_output(result)), "rate-limited")  # still classified as a spent quota
+
+    def test_a_message_with_no_identifier_is_passed_through_unchanged(self) -> None:
+        """The other direction: gh's words stay gh's own, byte for byte, and the function is idempotent."""
+        for clean in ("HTTP 502: Bad Gateway", "HTTP 403: Resource not accessible by integration",
+                      "release 1.2.3 is not current", "read at 12:08:00 for 2 checks"):
+            with self.subTest(clean=clean):
+                self.assertEqual(gu.gh_said(clean), clean)
+        once = gu.gh_said(UPDATE_RAW)
+        self.assertEqual(gu.gh_said(once), once)
+
+    def test_this_copy_of_the_substitution_cannot_drift_from_glaeda_ghs(self) -> None:
+        """glaeda-update replaces glaeda-gh, so it cannot import gh_said and says the substitution again. The two
+        are the same text or this fails: a shape added to one must be added to the other."""
+        source = (ROOT / "scripts" / "glaeda-gh").read_text()
+        for name in ("GH_USER_ID", "GH_INSTALL_ID", "GH_CALLER_IP"):
+            with self.subTest(name=name):
+                mine = next(line for line in (ROOT / "scripts" / "glaeda-update").read_text().splitlines()
+                            if line.startswith(f"{name} = "))
+                self.assertIn(mine, source, f"{name} differs from glaeda-gh's")
+        self.assertIn(f'GH_NO_HOLDER = "{gu.GH_NO_HOLDER}"', source)
+
+
 if __name__ == "__main__":
     unittest.main()
