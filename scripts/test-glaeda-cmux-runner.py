@@ -12268,9 +12268,13 @@ class GateTest(unittest.TestCase):
         self.assertIsNone(gate.ineligible())
 
     def short(self, gate: hook.Gate) -> str | None:
-        """DISK_RECLAIM_NOW: low_disk never holds the listener; what it found short (and started reclaim for) is
-        disk_short's reason, or None."""
-        self.assertIsNone(gate.low_disk(), "a disk reading never holds the listener (DISK_RECLAIM_NOW)")
+        """DISK_RECLAIM_NOW: a one-job peak never holds the listener; what low_disk found short (and started reclaim
+        for) is disk_short's reason, or None. RUNNER_JOBS_HOLD: the jobs in flight's disk does hold it; then the
+        reason is its numbers, prefixed "held: "."""
+        held = gate.low_disk()
+        if held is not None:
+            self.assertIn("RUNNER_JOBS_HOLD", held, "only the jobs in flight's disk or a full disk holds")
+            return f"held: {gate.disk_held} (RUNNER_JOBS_DISK)"
         return gate.disk_short[0] if gate.disk_short else None
 
     def test_every_runner_warns_while_free_disk_is_under_its_floor(self) -> None:
@@ -12575,8 +12579,8 @@ class GateTest(unittest.TestCase):
     def test_an_idle_runner_counts_the_jobs_in_flight_before_it_takes_one(self) -> None:
         """RUNNER_JOBS_DISK (coordinator, 2026-11-17: "Admit a runner job only if 10 GiB + 5.3 GiB per job in flight
         (from hq build-fleet/runner-job-disk.json) stays free"). Over one job's peak, an idle pool runner beside two
-        running jobs reclaims until 10 + 5.3 x 3 = 25.9 GiB is free, and keeps listening (DISK_RECLAIM_NOW); the value
-        per job is the file's."""
+        running jobs reclaims until 10 + 5.3 x 3 = 25.9 GiB is free and takes no job until it fits (RUNNER_JOBS_HOLD,
+        hq#19208: 1.3 GiB free beside 7 runner jobs); the value per job is the file's."""
         write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 14\n")
         for name in ("actions-runner-glaeda-2", "actions-runner-glaeda-3", "actions-runner-glaeda-4"):
             (self.tmp / name).mkdir()
@@ -12595,7 +12599,10 @@ class GateTest(unittest.TestCase):
                           "(or listening first) and this one", why or "")
             self.assertIn("the p95 of 11438 jobs, 2026-11-02..2026-11-15", why or "")
             self.assertEqual(cleanup.call_args.args[1], 30.0, "cleanup aims at the floor, over the need")
-            self.assertIsNone(gate.claimed(), "an idle look keeps the listener")
+            self.assertIn("taking no job until it fits (RUNNER_JOBS_HOLD)", gate.low_disk() or "",
+                          "the jobs in flight's disk holds the listener")
+            self.assertIn("25.9 GiB required", gate.disk_held or "", "the hold keeps its numbers")
+            self.assertIn("RUNNER_JOBS_HOLD", gate.claimed() or "", "the held look is what claimed() reports")
             free["gib"] = 26.0
             self.assertIsNone(self.short(gate), "room for both jobs in flight and the next one: listening")
             free["gib"] = 21.0
@@ -12618,6 +12625,45 @@ class GateTest(unittest.TestCase):
             disk = self.runner_job_disk_file(5.3)
             ps.side_effect = subprocess.TimeoutExpired("ps", 30)
             self.assertIsNone(self.short(gate), "no process table: the one-job peak alone")
+
+    def test_the_runner_jobs_hold_logs_its_start_and_end_and_has_an_off_switch(self) -> None:
+        """RUNNER_JOBS_HOLD: one countable line when a hold starts (free, need, reserve, jobs in flight) and one when it
+        ends; GLAEDA_RUNNER_JOBS_HOLD_OFF=1 or capacity/runner-jobs-hold.off turns it back into reclaim-and-listen."""
+        write_hook(self.runner, "exec python3 /hook job-started --min-free-gib 30 --capacity-units 14\n")
+        for name in ("actions-runner-glaeda-2", "actions-runner-glaeda-3", "actions-runner-glaeda-4"):
+            (self.tmp / name).mkdir()
+        disk = self.runner_job_disk_file(5.3)
+        capacity = self.tmp / "capacity"
+        capacity.mkdir()
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state,
+                         capacity_dir=capacity)
+        free = {"gib": 25.0}
+        table = self.workers("actions-runner-glaeda-2", "actions-runner-glaeda-3", self.runner.name)
+        usage = lambda _path: mock.Mock(free=int(free["gib"] * 1024**3))  # noqa: E731
+        notes: list[str] = []
+        with mock.patch.object(hook.shutil, "disk_usage", side_effect=usage), \
+                mock.patch.object(hook, "processes", return_value=table), \
+                mock.patch.object(hook, "gate_log", side_effect=notes.append), \
+                mock.patch.object(gate, "evict_in_background"), \
+                mock.patch.dict(os.environ, {hook.DISK_JOB_PEAK_ENV: "20", hook.RUNNER_JOB_DISK_ENV: os.fspath(disk)}):
+            self.assertIn("RUNNER_JOBS_HOLD", gate.low_disk() or "")
+            self.assertIn("RUNNER_JOBS_HOLD", gate.low_disk() or "", "still held")
+            starts = [n for n in notes if n.startswith("RUNNER_JOBS_HOLD start")]
+            self.assertEqual(starts, ["RUNNER_JOBS_HOLD start free_gib=25.0 need_gib=25.9 reserve_gib=10 "
+                                      "jobs_in_flight=2"], "one start line per hold, not one per look")
+            free["gib"] = 26.0
+            self.assertIsNone(gate.low_disk())
+            ends = [n for n in notes if n.startswith("RUNNER_JOBS_HOLD end")]
+            self.assertEqual(len(ends), 1, notes)
+            self.assertIn("free_gib=26.0", ends[0])
+            free["gib"] = 25.0
+            (capacity / hook.RUNNER_JOBS_HOLD_OFF_FILE).touch()
+            self.assertIsNone(gate.low_disk(), "the live off switch: reclaim and listen")
+            self.assertIn("RUNNER_JOBS_DISK", gate.disk_short[0] if gate.disk_short else "")
+            (capacity / hook.RUNNER_JOBS_HOLD_OFF_FILE).unlink()
+            with mock.patch.dict(os.environ, {hook.RUNNER_JOBS_HOLD_OFF_ENV: "1"}):
+                self.assertIsNone(gate.low_disk(), "the environment off switch")
+            self.assertIn("RUNNER_JOBS_HOLD", gate.low_disk() or "", "switch gone: held again")
 
     def test_a_burst_at_several_idle_listeners_is_admitted_only_while_it_fits(self) -> None:
         """Every idle listener counts the idle listeners that sort before it, so three idle runners at 26 GiB with

@@ -1188,6 +1188,11 @@ mod tests {
             );
         }
 
+        // A concurrent fork in another test thread can briefly inherit these open-file
+        // descriptions before its exec, and a plain close then leaves the flock held (glaeda#2557
+        // run 45067760742: still InUse). An explicit unlock releases it for every copy.
+        rustix_fs::flock(&runtime_lock, FlockOperation::Unlock).expect("release runtime lock");
+        rustix_fs::flock(&direct_lock, FlockOperation::Unlock).expect("release direct lock");
         drop(runtime_lock);
         drop(direct_lock);
         let observation = observe_hot_run_cache(root.path()).expect("observe unlocked files");

@@ -1354,9 +1354,18 @@ def listener_disk_peak(scope: "RunnerScope") -> tuple[float, str]:
 # (data/job_needs.py writes it from job-needs.json's all.disk_gib_p95; the controller's runner_disk.go reserves the same
 # value per PR job on a lent host, the twin of this rule). Copy hq's file over it to refresh it; a missing, unreadable
 # or malformed file turns this reading off (the one-job peak stays) rather than guessing a number.
-# DISK_RECLAIM_NOW: neither reading holds the listener any more. Held, a listener took nothing while its CPUs idled
+# DISK_RECLAIM_NOW: the one-job peak no longer holds the listener. Held, a listener took nothing while its CPUs idled
 # and the jobs queued (ci-dash, 2026-11-18: cmux17 lost 4.2 unit-hours to the disk floor in 30 minutes); short, the
 # gate now starts reclaim at once, waits at most DISK_RECLAIM_WAIT_S for room and listens whatever that freed.
+# RUNNER_JOBS_HOLD (hq#19208, 2026-11-22): this reading holds again. Listening through it, the minis wrote themselves
+# down to 1.3 GiB with 7 jobs running (cmux22, 19:16Z) and jobs failed with ENOSPC: failed, not slower. The line is the
+# measured p95 per job above, less what the running jobs already wrote (RUNNER_JOB_WRITTEN), no hand-set number.
+# Off switch (the default change's): RUNNER_JOBS_HOLD_OFF_ENV=1 in the runner's environment, or a RUNNER_JOBS_HOLD_OFF_FILE
+# in the capacity ledger (touch it on the mini, live), turns the hold back into reclaim-and-listen (RUNNER_JOBS_DISK)
+# without removing the measurement file. Each hold logs one countable line when it starts and one when it ends:
+# "RUNNER_JOBS_HOLD start free_gib=F need_gib=N reserve_gib=10 jobs_in_flight=J" and "RUNNER_JOBS_HOLD end ...".
+RUNNER_JOBS_HOLD_OFF_ENV = "GLAEDA_RUNNER_JOBS_HOLD_OFF"
+RUNNER_JOBS_HOLD_OFF_FILE = "runner-jobs-hold.off"
 RUNNER_JOB_DISK_SCHEMA = "glaeda-runner-job-disk/v1"
 RUNNER_JOB_DISK_NAME = "glaeda-runner-job-disk.json"
 RUNNER_JOB_DISK_ENV = "GLAEDA_RUNNER_JOB_DISK_FILE"  # another file (tests; a host-local trial)
@@ -2655,6 +2664,15 @@ SIM_SLOT_ENV = "GLAEDA_SIM_SLOT"
 SIM_SLOT_FILE = "glaeda-sim-slot"  # $RUNNER_TEMP/glaeda-sim-slot: the copy index alone
 MEMORY_FREE_KEY = "kern.memorystatus_level"  # Darwin: the percentage of RAM free (memory_pressure's last line)
 HOST_MEM_FREE_ENV = "GLAEDA_HOST_MEM_FREE_PCT"  # tests: the free percentage instead of kern.memorystatus_level
+
+
+def runner_jobs_hold_off(capacity_dir: Path | None = None) -> str | None:
+    """Why RUNNER_JOBS_HOLD is off on this mini (its off switch), or None."""
+    if (os.environ.get(RUNNER_JOBS_HOLD_OFF_ENV) or "").strip() == "1":
+        return f"{RUNNER_JOBS_HOLD_OFF_ENV}=1"
+    if capacity_dir is not None and (capacity_dir / RUNNER_JOBS_HOLD_OFF_FILE).exists():
+        return f"{capacity_dir / RUNNER_JOBS_HOLD_OFF_FILE} exists"
+    return None
 
 
 def sim_off(capacity_dir: Path | None = None) -> str | None:
@@ -10843,6 +10861,9 @@ class Gate:
         # DISK_RECLAIM_NOW: (why, the free GiB wanted) while an idle pool runner is short of one job's peak or of the
         # jobs in flight's disk at the last look; the listener's next start waits for room at most DISK_RECLAIM_WAIT_S
         self.disk_short: tuple[str, float] | None = None
+        self.disk_held: str | None = None  # RUNNER_JOBS_HOLD: the numbers behind the last look's hold, or None
+        self.disk_jobs_in_flight: int | None = None  # RUNNER_JOBS_DISK: the last process-table count, for the log
+        self.disk_hold_started: float | None = None  # RUNNER_JOBS_HOLD: monotonic start of the hold in force
         # SUITE_FIRST_HOLD: the fleet disk wait last seen (its id), when this gate's hold for it began (wall clock;
         # None while not holding) and the free GiB the wait wants while held, which low_disk's reclaim aims at too
         self.suite_wait: str | None = None
@@ -11610,9 +11631,9 @@ class Gate:
 
         No floor holds the listener (DISK_RECLAIM_NOW); only a full disk does, free under the hard floor plus one runner
         job's p95 (full_disk_gib, the build fleet's own disk pause: FLEET_PAUSE_FULL) where no job fits
-        (DISK_FULL_NO_LISTEN, the one reason this returns). An idle pool runner short of one job's measured peak
-        (job_disk_gib, DISK_SHORT_RECLAIM), whatever the floor, or of the jobs in flight's disk (RUNNER_JOBS_DISK)
-        starts reclaim at once aimed at what it lacks, and records it (disk_short), so its listener's next start waits
+        (DISK_FULL_NO_LISTEN), and one short of the jobs in flight's measured disk plus its own (RUNNER_JOBS_HOLD,
+        hq#19208) hold it. An idle pool runner short of one job's measured peak
+        (job_disk_gib, DISK_SHORT_RECLAIM), whatever the floor, starts reclaim at once aimed at what it lacks, and records it (disk_short), so its listener's next start waits
         at most DISK_RECLAIM_WAIT_S for room (disk_room_wait) and then listens whatever that freed. These readings used
         to hold the listener (DISK_SHORT_HOLD) so the job went to a runner with room (cmux run 43119216549,
         2026-11-11: admitted at 19.8 GiB free, its fast tier's link stopped at ld errno=28 after 13 minutes), but a
@@ -11666,9 +11687,39 @@ class Gate:
                 # the same words every poll: the gate logs a hold again only when its reason changes
                 return (f"disk full: under {full_gib:g} GiB, where no job of this runner fits; "
                         "reclaiming (DISK_FULL_NO_LISTEN)")
+            # RUNNER_JOBS_HOLD: the jobs in flight here still have their measured disk to write, so a listener that
+            # takes one more job where their writes and its own do not fit sends every job on the mini into ENOSPC
+            # (cmux22, 2026-11-22 19:16Z: 1.3 GiB free with 7 runner jobs; daemon tests failed out of disk on cmux17
+            # and cmux22). Held, it takes nothing and the job goes to a runner with room; it listens again as soon as
+            # reclaim or a job's end frees the line. The reason is the same words every poll; the numbers log at
+            # most every GATE_DISK_NOTE_S. A small runner's jobs are measured under the per-job p95 (its own peak
+            # caps DISK_FULL_NO_LISTEN too), so it keeps reclaiming and listening (below).
+            crowded = self.runner_jobs_short(path)
+            self.disk_held = None
+            hold = bool(crowded) and not scope.small and runner_jobs_hold_off(self.capacity_dir) is None
+            now = time.monotonic()
+            if hold != (self.disk_hold_started is not None):
+                free = free_or_none(path)
+                numbers = (f"free_gib={free if free is None else round(free, 1)} "
+                           f"need_gib={crowded[1] if crowded else 'none'} reserve_gib={RUNNER_JOBS_FLOOR_GIB:g} "
+                           f"jobs_in_flight={self.disk_jobs_in_flight}")
+                if hold:
+                    gate_log(f"RUNNER_JOBS_HOLD start {numbers}")
+                    self.disk_hold_started = now
+                else:
+                    gate_log(f"RUNNER_JOBS_HOLD end {numbers} held_s={round(now - (self.disk_hold_started or now))}")
+                    self.disk_hold_started = None
+            if hold and crowded:
+                self.disk_short, self.disk_held = None, crowded[0]
+                self.evict_in_background(path, max(floor, crowded[1], aim))
+                if self.disk_warned_at is None or now - self.disk_warned_at >= GATE_DISK_NOTE_S:
+                    gate_log(f"disk: {crowded[0]} (RUNNER_JOBS_HOLD)")
+                    self.disk_warned_at = now
+                return ("disk: under the margin plus the runner jobs in flight's measured disk and this one's; "
+                        "reclaiming, taking no job until it fits (RUNNER_JOBS_HOLD)")
             if under := disk_refusal(path, peak):
                 short = (f"disk: {under} for {whose} (DISK_SHORT_RECLAIM)", max(floor, peak))
-            elif crowded := self.runner_jobs_short(path):
+            elif crowded:
                 short = (f"disk: {crowded[0]} (RUNNER_JOBS_DISK)", max(floor, crowded[1]))
         self.disk_short = short
         if short:
@@ -11760,6 +11811,7 @@ class Gate:
         written = round(sum(min(per, job_written_gib(self.state_dir, name, pid, now) or 0.0)
                             for name, pid in running), 1)
         in_flight = len(running) + listening
+        self.disk_jobs_in_flight = in_flight
         why = runner_jobs_refusal(free, in_flight, per, source, written)
         return (why, round(runner_jobs_need_gib(in_flight, per) - written, 1)) if why else None
 
