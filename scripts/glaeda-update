@@ -82,6 +82,13 @@ What one run does, and what it refuses:
    downgraded. A runner with a job is watched up to 4 minutes for a gap between jobs; after that the new hook
    is staged for that job's job-completed to install. Each listener gate sees its hook change and
    re-execs it, keeping its runner.
+   7b. The same refresh runs as every other account this member's runners run as (RUNNER_ACCOUNTS): the staged
+   member manifest's runner.poolUser (an AWS Mac's PR runners, in the non-admin cmux-pr-runner account since
+   glaeda#2460) and each runner.dedicated entry's user. Their receipts and runner directories are in that account's
+   home, which step 7 never reads, so before this their hooks stayed at whatever the last fleet --apply installed
+   (2026-11-25: aws-m4pro-7-glaeda-15 refused cmux-next-ios-kit.yml link-ffi-fleet a day after #2732 went
+   stable, and converge.json said converged). It runs through `sudo -n -u ACCOUNT` from a copy of the release's
+   runner files that account can read; a refusal is a blocked hook in step 8, never silence.
 
 8. Convergence (converge.json beside state.json, glaeda-ota-converge/v1): after every --apply run
    the host records what it actually runs, not just the tag in state.json: the SHA-256 of each
@@ -116,11 +123,13 @@ import json
 import os
 import platform
 import plistlib
+import pwd
 import re
 import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -186,6 +195,12 @@ LAUNCHCTL = "/bin/launchctl"
 ALERT_AFTER_S = 2 * BACKOFF_MAX_S
 STALE_AFTER_S = 3 * BACKOFF_MAX_S
 HOOK_RELEASE_FILES = ("glaeda-cmux-runner-hook", "glaeda_reservation.py")  # what --refresh-hooks installs
+# Step 7b. The member manifest glaeda-cmux-runner-fleet stages beside RUNNER_SCRIPTS (trimmed to this member) names the
+# other accounts runners run as here (glaeda_fleet_labels POOL_USER, DEDICATED_USER); this updater refreshes theirs too.
+RUNNER_MANIFEST = "glaeda-runner/mini-fleet.json"  # under home
+ACCOUNT_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")  # glaeda_fleet_labels DEDICATED_USER_RE
+SUDO = "/usr/bin/sudo"
+ACCOUNT_TMP = "/tmp"
 # Step 6b. HQ's nightly promotion lease runs ~/.local/bin/glaeda-promotion-admit over ssh. glaeda-cmux-runner-fleet
 # --apply installs it on every member it stages (PROMOTION_ADMIT); OTA brings it to the release's bytes on the same
 # hosts (those with RUNNER_SCRIPTS), so a merged fix reaches the minis without a fleet --apply (2026-11-01: #1780 and
@@ -1109,6 +1124,110 @@ def refresh_runner_hooks(state_dir: Path = STATE_DIR, home: Path = HOME, detail:
         ("" if not held else "; sign hold: " + " | ".join(held)[:800])
 
 
+def runner_accounts(home: Path = HOME) -> list[str]:
+    """Step 7b: the other macOS accounts this member's runners run as, from the staged member manifest: each host's
+    runner.poolUser and the user of each runner.dedicated entry (overrides, then defaults). Never root, never this
+    user; an unreadable manifest names none."""
+    try:
+        manifest = json.loads((home / RUNNER_MANIFEST).read_text())
+    except (OSError, ValueError):
+        return []
+    if not isinstance(manifest, dict):
+        return []
+    runners = []
+    defaults = manifest.get("defaults")
+    if isinstance(defaults, dict) and isinstance(defaults.get("runner"), dict):
+        runners.append(defaults["runner"])
+    for host in (manifest.get("hosts") or {}).values() if isinstance(manifest.get("hosts"), dict) else []:
+        overrides = host.get("overrides") if isinstance(host, dict) else None
+        if isinstance(overrides, dict) and isinstance(overrides.get("runner"), dict):
+            runners.append(overrides["runner"])
+    names = []
+    for runner in runners:
+        names.append(runner.get("poolUser"))
+        dedicated = runner.get("dedicated")
+        names += [entry.get("user") for entry in dedicated if isinstance(entry, dict)] if isinstance(dedicated, list) else []
+    try:
+        me = pwd.getpwuid(os.getuid()).pw_name
+    except KeyError:
+        me = None
+    out = []
+    for name in names:
+        if isinstance(name, str) and ACCOUNT_RE.fullmatch(name) and name not in ("root", me) and name not in out:
+            out.append(name)
+    return out
+
+
+def refresh_account_hooks(user: str, state_dir: Path = STATE_DIR, detail: list | None = None) -> str:
+    """Step 7b for one account: the installed release's glaeda-cmux-runner --refresh-hooks --apply, run as `user`
+    (sudo -n) from a copy of the release's runner files and hook-history.json that account can read. Rows go to
+    `detail` with "account", so step 8 counts that account's runners; one that cannot be reached is a blocked row."""
+    tag = load_state(state_dir)["current"]
+    if tag is None:
+        return "no installed release"
+    gen = generation(state_dir, tag)
+    src = gen / "glaeda/scripts"
+    if not (src / "glaeda-cmux-runner").is_file():
+        return f"{tag} has no runner script"
+    where = f"~{user}"
+
+    def blocked(note: str) -> str:
+        if detail is not None:
+            detail.append({"runnerDir": where, "account": user, "state": "blocked", "note": note[:200]})
+        return f"not refreshed ({note})"[:300]
+
+    try:
+        home = pwd.getpwnam(user).pw_dir
+    except KeyError:
+        return blocked(f"no account {user} on this host")
+    # /tmp, never $TMPDIR: a macOS user's /var/folders/.../T is 0700, so the account could not reach the copy
+    with tempfile.TemporaryDirectory(prefix="glaeda-update-hooks-", dir=ACCOUNT_TMP) as tmp:
+        # the release lives under this user's home, which the account cannot read: a world-readable copy keeps the
+        # layout glaeda-cmux-runner reads its HOOK_HISTORY by (two levels above its scripts)
+        root = Path(tmp)
+        scripts = root / "glaeda/scripts"
+        scripts.mkdir(parents=True)
+        for name in RUNNER_FILES:
+            if (src / name).is_file():
+                shutil.copyfile(src / name, scripts / name)
+                (scripts / name).chmod(0o755 if os.access(src / name, os.X_OK) else 0o644)
+        if (gen / "hook-history.json").is_file():
+            shutil.copyfile(gen / "hook-history.json", root / "hook-history.json")
+            (root / "hook-history.json").chmod(0o644)
+        for d in (root, root / "glaeda", scripts):
+            d.chmod(0o755)
+        argv = [SUDO, "-n", "-u", user, "--", "/usr/bin/env", f"HOME={home}", f"PATH={CHILD_PATH}",
+                sys.executable, os.fspath(scripts / "glaeda-cmux-runner"), "--refresh-hooks", "--apply", "--output", "json"]
+        try:
+            result = subprocess.run(argv, capture_output=True, text=True, timeout=HOOKS_TIMEOUT, stdin=subprocess.DEVNULL,
+                                    cwd="/")
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return blocked(f"as {user}: {type(e).__name__}")
+    try:
+        doc = json.loads(result.stdout.strip().splitlines()[-1])
+        runners = doc["runners"]
+    except (ValueError, KeyError, IndexError, TypeError):
+        why = (result.stderr or "").strip().splitlines()[-1:] or [f"exit {result.returncode}"]
+        return blocked(f"as {user}: no refresh report ({why[0][:160]})")
+    counts: dict[str, int] = {}
+    for runner in runners:
+        counts[str(runner.get("state"))] = counts.get(str(runner.get("state")), 0) + 1
+        if detail is not None and isinstance(runner, dict):
+            detail.append({"runnerDir": str(runner.get("runnerDir") or runner.get("receipt") or "?")[:300],
+                           "account": user, "state": str(runner.get("state")), "note": str(runner.get("note") or "")[:200],
+                           "hookSha256": str(doc.get("hookSha256") or "").removeprefix("sha256:") or None})
+    held = [str(line)[:400] for line in doc.get("signHold") or [] if isinstance(line, str)][:8] \
+        if isinstance(doc.get("signHold"), list) else []
+    if detail is not None:
+        detail.extend({"signHold": line} for line in held)
+    if doc.get("error"):
+        return blocked(f"as {user}: {str(doc['error'])[:200]}")
+    if not counts:
+        return f"{user}: no runners"
+    return f"{user} {tag}: " + ", ".join(f"{n} {state}" for state, n in sorted(counts.items())) + \
+        ("" if not held else "; sign hold: " + " | ".join(held)[:800])
+
+
 def release_history(gen: Path, name: str) -> set[str] | None:
     """SHA-256s of every version of `name` the release descends from (its hook-history.json), or None."""
     try:
@@ -1208,6 +1327,14 @@ def runner_steps(state_dir: Path = STATE_DIR, target: Path = RUNNER_SCRIPTS, hom
             out[key] = step()
         except (OSError, ValueError, UpdateError) as e:
             out[key] = f"not refreshed ({type(e).__name__}: {e})"[:300]
+    accounts = []
+    for user in runner_accounts(home):  # step 7b
+        try:
+            accounts.append(refresh_account_hooks(user, state_dir, detail))
+        except (OSError, ValueError, UpdateError) as e:
+            accounts.append(f"{user}: not refreshed ({type(e).__name__}: {e})"[:300])
+    if accounts:
+        out["accountHooks"] = "; ".join(accounts)[:1200]
     return out
 
 
@@ -1317,9 +1444,10 @@ def live_summary(running: dict) -> dict:
 
 
 def observe(state_dir: Path = STATE_DIR, bin_dir: Path = BIN, home: Path = HOME,
-            staged: Path = RUNNER_SCRIPTS, gh_only: bool = False) -> dict:
+            staged: Path = RUNNER_SCRIPTS, gh_only: bool = False, hook_states: list | None = None) -> dict:
     """Step 8: what this host actually runs, by content: the installed release, its tools and each runner's
-    installed hook files, each compared with the release's bytes. Reads local files only."""
+    installed hook files, each compared with the release's bytes. Reads local files only; another account's runners
+    (step 7b) are this run's refresh rows from `hook_states`, which read them as that account."""
     state = load_state(state_dir)
     tag = state["current"]
     out: dict = {"tag": tag, "source": installed_source(state_dir, tag), "tools": {"checked": 0, "drift": []},
@@ -1355,6 +1483,16 @@ def observe(state_dir: Path = STATE_DIR, bin_dir: Path = BIN, home: Path = HOME,
         if row["current"]:
             row["installedAt"] = hook_installed_at(hook_dir)
         out["hooks"].append(row)
+    for state in hook_states or []:
+        if isinstance(state, dict) and state.get("account") and "runnerDir" in state:
+            # unchanged or updated: the account's hook files are the release's bytes now (the refresh compared them)
+            current = state.get("state") in ("unchanged", "updated") and state.get("hookSha256") == want["glaeda-cmux-runner-hook"]
+            row = {"runnerDir": state["runnerDir"], "account": state["account"], "current": current,
+                   "glaeda-cmux-runner-hook": state.get("hookSha256") if current else None}
+            if current:  # this run put it in, or it already was (then no later than the release's install: a bound)
+                row["installedAt"] = (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                                      if state.get("state") == "updated" else out.get("installedAt"))
+            out["hooks"].append(row)
     if staged.is_dir():
         out["runnerScripts"] = "current" if all(
             file_sha256(staged / name) == file_sha256(scripts / name) for name in RUNNER_FILES) else "differs"
@@ -1736,10 +1874,10 @@ def apply_once(config: dict, state_dir: Path = STATE_DIR, bin_dir: Path = BIN, h
             result.update(runner_steps(state_dir, staged, home, hook_states, bin_dir))
     except Exception as e:  # noqa: BLE001  (recorded below, then re-raised for the one JSON line)
         result = {"result": "error", "why": f"{type(e).__name__}: {e}"[:500]}
-        record_convergence(config, result, wants, previous, now, observe(state_dir, bin_dir, home, staged, gh_only(config)),
+        record_convergence(config, result, wants, previous, now, observe(state_dir, bin_dir, home, staged, gh_only(config), hook_states),
                            hook_states, converge_path)
         raise
-    doc = record_convergence(config, result, wants, previous, now, observe(state_dir, bin_dir, home, staged, gh_only(config)),
+    doc = record_convergence(config, result, wants, previous, now, observe(state_dir, bin_dir, home, staged, gh_only(config), hook_states),
                              hook_states, converge_path)
     result["converge"] = {k: doc[k] for k in ("converged", "why", "blocking", "since", "attempts")}
     return result

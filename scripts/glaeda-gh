@@ -185,10 +185,16 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   ci-watch-token.json the key home pushes, while unexpired): `gh_app_token.py token ci-watch`, also
   kept only in memory. Without it, or when the App refuses, the read is the login's, as
   before (AppPool). daemon.json appPool and `budget` say what the App served.
+- A host that follows the controller's change feed also holds one long-poll open on it (FeedStream, a thread):
+  an event after the daemon's cursor wakes the tick, which reads the feed at once, and a run or suite event on the
+  head or branch of an open land entry nudges that PR so its land is judged in seconds, not at the next poll. The
+  feed poll drops to a FEED_STREAM_BACKSTOP while the stream answers; daemon.json controller.stream says whether it
+  does. GLAEDA_GH_FEED_STREAM=off turns it off (the poll alone serves).
 - A host with no GitHub login of its own (a VM that may hold no token) can read through an upstream
   instead: ~/.config/glaeda/upstream.json, {"command": ["PROGRAM", "ARG", ...]}, names a program that
   carries `read` requests to another host's glaeda-gh (a broker that daemon's host serves, say). The
-  daemon then makes no GitHub request at all: every UPSTREAM_EVERY seconds, and UPSTREAM_NEW after a
+  daemon then makes no GitHub request at all: every UPSTREAM_EVERY seconds (UPSTREAM_LAND_EVERY for a PR
+  in an open land entry), and UPSTREAM_NEW after a
   key appears with no data yet, it runs that program once with every watched key as one JSON line on
   stdin, {"keys": [{"key": "pr:o/r#1", "jobs": false}, ...]}, and caches what it prints,
   {"entries": {KEY: {"data", "dataAt", "error", "jobs"?} or null}}, keeping the upstream's dataAt. That
@@ -199,8 +205,10 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   check_suite and issue_comment webhooks. Each tick the daemon reads its change feed once: free,
   so a finished run shows up within about TICK seconds and costs no quota, a check event on a
   watched PR's head commit or branch re-reads that PR at once (at most every NUDGE_MIN seconds),
-  and a new comment reaches comment waits. While the controller tracks a run, REST reads it only
-  as a safety net every 15 minutes; when the controller is unreachable or has never seen the run,
+  and a new comment reaches comment waits. A completed run or suite on the head of a land waiting on
+  its checks judges that land at once when the controller's rollup shows every check run there done,
+  without waiting for the re-read or the wait's timer (LAND_EVENT_JUDGE). While the controller
+  tracks a run, REST reads it only as a safety net every 15 minutes; when the controller is unreachable or has never seen the run,
   the REST path above applies unchanged. Public repositories need no token; private ones need the
   controller token. Controller: $CMUX_CI_CONTROLLER, else the cmux-ci client config, else the
   fleet default; token: $CMUX_CI_TOKEN_FILE, else ~/.config/cmux/build-fleet/controller.token.
@@ -573,6 +581,12 @@ SLOW = re.compile(r"HTTP 504|[Tt]imeout|timed out|[Rr]esource limits")  # the qu
 # next cycle. batched() halves the batch (down to 1, not GQL_BATCH_MIN: a PR this heavy is the point of reading it
 # alone) and re-reads only the partial entries at the smaller size; GQL_GROW_AFTER clean queries grow it back by one.
 RESOURCE_LIMITS = "RESOURCE_LIMITS_EXCEEDED"
+def heavy_pause(fails: int) -> float:
+    """Seconds a heavy entry waits between lone GraphQL reads while REST cannot take it: 30 s, doubling per failure past
+    HEAVY_AFTER, at most 10 minutes. Per entry: one slow PR never slows the batches or the other heavy entries."""
+    return float(min(600, 30 * 2 ** max(0, fails - HEAVY_AFTER)))
+
+
 HEAVY_AFTER = 3  # lone timeouts in a row after which a heavy entry is read only every LEAN_FACTOR cycles
 # GraphQL down, REST up. huge-blue 2026-11-17: GitHub's GraphQL answered 502 for long stretches (and the controller
 # URLError) and waited PR data reached 3585 s, then 1392 s old, with the heartbeat fresh, both times until a session
@@ -702,6 +716,7 @@ EXPECTED_CONTEXTS: dict[str, tuple[str, ...]] = {"teamleaderleo/leo-workspace": 
 EXPECTED_CONFIG = Path.home() / ".config/glaeda/expected-contexts.json"
 UPSTREAM_CONFIG = Path.home() / ".config/glaeda/upstream.json"  # {"command": [...]}: read through it, no token
 UPSTREAM_EVERY = 20  # seconds between upstream reads of every watched key (the upstream polls each PR every 60)
+UPSTREAM_LAND_EVERY = 5  # an open land entry's PR is asked this often: the broker host's stream has its last check in seconds
 UPSTREAM_NEW = 3  # a key with no data yet is asked for again this soon: the upstream fills it within a tick or two
 STATUS_UPSTREAM_WAIT = 8.0  # status on an upstream-fed host: a tick plus two UPSTREAM_NEW asks, then read directly
 UPSTREAM_DEADLINE = 60  # one run of the upstream command
@@ -793,6 +808,10 @@ ON_EVENT_RUNS_MAX = 1000
 ON_EVENT_FIELDS = ("head_sha", "run_id", "attempt", "repo", "run_url", "job_url", "hook")  # {name} in a command
 ON_EVENT_PLACEHOLDER = r"\{([a-z_]+)\}"
 ON_EVENT_ENV = ("HOME", "PATH", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR", "SHELL")  # all a command inherits
+LAND_NUDGE_MIN = 3  # a land-queue PR a check event nudged: its read is what the land waits on (Leo, 2026-11-25: "stop polling")
+FEED_STREAM_WAIT = 25  # seconds one FeedStream long-poll of the controller's change feed holds open (its max is 300)
+FEED_STREAM_BACKSTOP = 40  # the feed poll's gap while a FeedStream answers (under CONTROLLER_FRESH: downstream views stay fresh)
+FEED_STREAM_RETRY = 10  # seconds a FeedStream waits after a failed long-poll; the CONTROLLER_FEED_EVERY poll serves meanwhile
 NUDGE_MIN = 20  # a PR a check event nudged is re-read at most this often (GraphQL points)
 # GraphQL diet (2026-11-01: the daemons on huge-blue and cosmic-gray spent 938 and 833 GraphQL queries an hour, the
 # account's biggest spenders, while their clients read about two dozen PRs). A watch nobody has read lately is
@@ -881,6 +900,11 @@ STALE_PACED_ADVICE = ("A restart would not read any sooner: the pace above is to
 STALE_HELD_MAX = 3600
 STALE_HELD_ADVICE = ("A restart would not read any sooner, but data this old is starvation, not pacing: the reads "
                      "above need a quota or a pace change (`glaeda-gh budget` names who spends the login).")
+# A valve restart that did not help is not repeated: STALE_VALVE_FUTILE. The land host, 2026-11-22 23:49Z to 11-25: the
+# valve re-executed the daemon every STALE_VALVE_COOLDOWN (restart.json "valve": true, ok: true) for 50 h on "backlog: 192 pr
+# reads stored in the last 600s" and the oldest waited PR stayed 4,607 s to 20,000 s old; each restart also wiped the heavy
+# table and batch sizes the last ticks had learned. A restart whose own record shows data no older than now is futile.
+STALE_VALVE_FUTILE = 6 * 3600
 STALE_ADVICE = {"deferred": STALE_DEFERRED_ADVICE, "paced": STALE_PACED_ADVICE,  # verdicts a restart cannot fix
                 "held": STALE_HELD_ADVICE}
 STALE_NO_RESTART = tuple(STALE_ADVICE)  # stall_cause verdicts a restart cannot fix: the alarm, the valve and `restart` agree
@@ -4758,9 +4782,14 @@ class Controller:
         run = doc.get("run")
         return run if doc.get("known") and isinstance(run, dict) else None
 
-    def events(self, since: int | None) -> dict:
-        """The change feed after cursor `since`, or only the current cursor when since is None."""
-        doc = self.get("/v1/github/events?since=" + ("latest" if since is None else str(int(since))))
+    def events(self, since: int | None, wait: int = 0) -> dict:
+        """The change feed after cursor `since`, or only the current cursor when since is None. WAIT > 0 long-polls:
+        the controller answers as soon as an event lands after `since`, or empty after WAIT seconds (FeedStream)."""
+        path = "/v1/github/events?since=" + ("latest" if since is None else str(int(since)))
+        if wait > 0 and since is not None:
+            doc = self.get(f"{path}&wait={int(wait)}", timeout=int(wait) + CONTROLLER_READ_TIMEOUT)
+        else:
+            doc = self.get(path)
         if not isinstance(doc.get("cursor"), int) or doc["cursor"] < 0:
             raise WatchError("controller: feed without a cursor")
         return doc
@@ -6059,6 +6088,8 @@ class Daemon:
         # "pr:owner/repo#N", "sha:owner/repo@SHA", "branch:owner/repo@B" -> when the feed last delivered an event
         # for it (LAND_FEED_QUIET_MAX's comment), and since when the feed has answered without a gap (None: down)
         self.feed_marks: dict[str, float] = {}
+        # "owner/repo@SHA" -> when the feed last delivered a *completed* run or suite for that commit (LAND_EVENT_JUDGE)
+        self.feed_done: dict[str, float] = {}
         self.feed_live_since: float | None = None
         self.feed_unstarved = 0  # PR waits not handed back as starved: the feed showed their copy current
         # On an upstream host: PR key -> the upstream's feed view of it (feed_view) and when it was given (answeredAt)
@@ -6807,7 +6838,10 @@ class Daemon:
             return level, text, {**data, "valve": "young", "up": int(up)}
         record = restart_record() or {}
         ago = self.clock() - record["at"] if record.get("valve") else None
-        if ago is not None and 0 <= ago < STALE_VALVE_COOLDOWN:
+        was, now_age = record.get("age"), data.get("age")
+        futile = (ago is not None and isinstance(was, (int, float)) and isinstance(now_age, (int, float))
+                  and now_age >= 0.5 * was)  # it started from this much age and the data is no fresher: it did not help
+        if ago is not None and 0 <= ago < (STALE_VALVE_FUTILE if futile else STALE_VALVE_COOLDOWN):
             said = (f"The daemon already restarted itself for this {int(ago)}s ago (stale valve) and that did not "
                     "help, so another restart will not either: tell the owner.")
             return level, text.replace(STALE_RESTART_ADVICE, said), {**data, "valve": "spent", "valveAgo": int(ago)}
@@ -9109,7 +9143,7 @@ class Daemon:
                 out.append(e)  # a wait (or a rerun) since GitHub last showed this finish: read it once now
                 continue
             if (kind == "pr" and c is not None and e["key"] in self.nudged
-                    and self.now - self.attempted.get(e["key"], float("-inf")) >= NUDGE_MIN):
+                    and self.now - self.attempted.get(e["key"], float("-inf")) >= self.nudge_min(e["key"])):
                 self.nudged.discard(e["key"])  # a check event on its head: re-read now, not at the cycle
                 # (an idle one keeps its slower cycle, except a PR in the land queue: its nudge is a wait. huge-blue,
                 # 2026-11-21 20:15Z: pinned lands sat 1.5-2 h in pin_wait while the idle backoff dropped each nudge)
@@ -9798,7 +9832,8 @@ class Daemon:
                   # run's finish still arrives over the feed when its read bucket has stopped (feed_covers).
                   "controller": {**self.controller_status, "runs": len(self.controller_filled),
                                  "fedRepos": {r: round(t, 3) for r, t in self.fed_repos.items()},
-                                 "okAt": round(self.controller_ok_at, 3) if self.controller_ok_at > 0 else None},
+                                 "okAt": round(self.controller_ok_at, 3) if self.controller_ok_at > 0 else None,
+                                 "stream": self.feed_stream_status()},
                   "modes": {b: self.mode(b) for b in ("rest", "graphql")}, "errors": self.errors[:10],
                   "secondaryHold": {"until": self.secondary_until, "strikes": self.secondary_strikes}
                   if self.secondary_until > self.now else None, "forceLow": list(self.policy.get("forceLow", ())),
@@ -9834,7 +9869,13 @@ class Daemon:
         # A fresh heartbeat over a refresh loop that reads nothing is not health: say so in the heartbeat itself, so
         # `budget`, `restart` and a wait's daemon_starved see it (stall_alarm; "held" when the quota explains it).
         stall = self.stall_alarm()
-        status["healthy"] = stall is None
+        # Health is the age of what waits read, not that the loop came round. the land host, 2026-11-22 23:49Z to 11-25:
+        # waited PR data 4,607 s old (20,000 s at the oldest), a FIRE open 50 h, and daemon.json said "healthy": true all
+        # the while, because only the FRESHEST waited PR was judged. Now a stale or held (explained, still old) verdict
+        # is not healthy either, and the ages themselves (data_age: max, p95, p50 of every waited open PR) are in the file.
+        status["dataAge"] = self.data_age()
+        verdict = (status.get("stale") or {}).get("state")
+        status["healthy"] = stall is None and verdict not in ("stale", "held")
         if stall is not None:
             status["stalled"] = {"kind": "pr", "age": int(self.newest_data["pr"] or 0), "explained": stall == "held"}
         if self.app_pool is not None and (self.app_pool.served or self.app_pool.fell_back or self.app_pool.why):
@@ -9846,6 +9887,18 @@ class Daemon:
             self.beat = self.now
         self.status = status
         return status
+
+    def data_age(self) -> dict[str, dict[str, int]]:
+        """Per kind, the age of the data every waited open watch holds: {"max", "p95", "p50", "n"} in seconds (a kind
+        with no waited watch is absent). What health means: how old what waits read is, not whether the loop beat."""
+        out: dict[str, dict[str, int]] = {}
+        for kind, ages in (getattr(self, "waited_ages", None) or {}).items():
+            if not ages:
+                continue
+            ordered = sorted(ages)
+            pick = lambda q: int(ordered[min(len(ordered) - 1, int(len(ordered) * q))])  # noqa: E731
+            out[kind] = {"max": int(ordered[-1]), "p95": pick(0.95), "p50": pick(0.5), "n": len(ordered)}
+        return out
 
     def land_busy(self) -> bool:
         """A land step (a claimed action: a merge, an update_branch, a rerun...) is running. An update waits for it
@@ -9866,6 +9919,12 @@ class Daemon:
         none: a drain at REEXEC_DRAIN_MAX lets them finish instead of judging them again (reexec_due)."""
         q = self.land_queue
         return 0.0 if q is None else q.finishing(time.monotonic())
+
+    def nudge_min(self, key: str) -> float:
+        """How soon a nudged PR is read again: LAND_NUDGE_MIN for one in the land queue (its read is what the land
+        waits on: a check event must merge it in seconds, not at the next NUDGE_MIN), NUDGE_MIN for the rest."""
+        q = self.land_queue
+        return LAND_NUDGE_MIN if q is not None and key in q.entries else NUDGE_MIN
 
     def land_nudge(self, key: str) -> None:
         """Keep an event or queue-triggered nudge visible to LandQueue after the read scheduler consumes it."""
@@ -9932,7 +9991,8 @@ class Daemon:
             if not land_dir().is_dir():
                 return
             self.land_queue = LandQueue(nudge=self.land_nudge, notice=self.write_notice, reading=self.land_reading,
-                                        feed_quiet=self.land_feed_quiet, read_room=self.land_read_room)
+                                        feed_quiet=self.land_feed_quiet, read_room=self.land_read_room,
+                                        feed_done=self.land_feed_done, checks_done=self.land_checks_done)
         if executor is not None:
             self.land_queue.dispatch_forwards(executor)
             return
@@ -10042,6 +10102,8 @@ class Daemon:
         self.phase_now = "reads"  # until finish_tick: reads into the cache only (ScriptWake may re-exec here)
         due = []
         full = self.now - self.upstream_at >= UPSTREAM_EVERY
+        q = self.land_queue
+        landing = set() if q is None else {k for k, x in q.entries.items() if x.get("state") not in LAND_DONE}
         for e in entries:
             kind = split_key(e["key"])[0]
             if kind == "head" and not self.head_askers(e):
@@ -10052,7 +10114,10 @@ class Daemon:
                                                      "its upstream")
                 continue
             fresh = e["cache"] is None  # the upstream has answered nothing for it yet, not even an error
-            if full or (fresh and self.now - self.attempted.get(e["key"], float("-inf")) >= UPSTREAM_NEW):
+            since = self.now - self.attempted.get(e["key"], float("-inf"))
+            # a landing PR every UPSTREAM_LAND_EVERY, not UPSTREAM_EVERY: a lane VM's land heard of its last check up
+            # to 20 s late (teamleaderleo/glaeda#2740: judged 18 s after it; Leo, 2026-11-25: "stop polling")
+            if full or (fresh and since >= UPSTREAM_NEW) or (e["key"] in landing and since >= UPSTREAM_LAND_EVERY):
                 due.append(e)
         # The least recently asked first (a key never asked is -inf): past UPSTREAM_MAX_KEYS they rotate, none starves.
         due = sorted(due, key=lambda e: (self.attempted.get(e["key"], float("-inf")), e["key"]))[:UPSTREAM_MAX_KEYS]
@@ -10424,6 +10489,25 @@ class Daemon:
             return None
         return "POST", "/graphql", {"query": query, "variables": variables}
 
+    def graphql_stopped_for(self, route: list[str], query: str, variables: dict) -> bool:
+        """The login's GraphQL is stopped (under the reserve kept for lands) AND no App answers a query by node id over
+        ROUTE's repositories: the one case a read of that query has nowhere to go. A stop of the login alone is not one: an
+        App has its own 12,500 points an hour, and self.graphql() sends the query there (graphql_named_repos).
+        the land host, 2026-11-25: the login sat at 0-985 of 5,000 (spent by sessions' own `gh`) every hour, so fill_steps
+        returned at once and never read a failed check's steps; 182 of 823 open PRs kept a failed check without
+        failedSteps, and probe_ok sends such a PR to a FULL read every cycle (3.5 s of GitHub's time, a probe is 0.5 s):
+        a fifth of the waited set cost seven times what it should, for the whole incident."""
+        if self.mode("graphql") != "stop":
+            return False
+        pool = self.app_pool
+        if pool is None or not route:
+            return True
+        body = {"query": query, "variables": variables, APP_POOL_ROUTE_FIELD: sorted(set(route))}
+        owner = pool.owner_of("POST", "/graphql", body)
+        if owner is None:
+            return True
+        return pool.pick(owner, pool.scope(owner, "POST", "/graphql", body), body) is None
+
     def app_entries_eligible(self, kind: str, entries: list[dict], bucket: str) -> list[dict]:
         """Entries that can be served by the held App without touching the login quota."""
         pool = self.app_pool
@@ -10498,6 +10582,11 @@ class Daemon:
         # a PR with 163 checks 504'd on every lone query, nothing read it, and the PR a due land was blocked on kept
         # data 14,000+ s old while the stale valve restarted the daemon every 30 min).
         backing_off: list[dict] = []
+        # REST is where a heavy entry goes while it backs off. With REST stopped or its share spent that is nowhere: the
+        # entry was handed to a loop that read nothing, with no error stored, and its data aged for as long as that held
+        # (the land host, 2026-11-25: manaflow-ai/cmux#54269, 166 checks, no read stored for 5,800 s with "error": null).
+        # Then it is read alone over GraphQL on its own back-off (heavy_pause), and only it: the batches are not slowed.
+        rest_reads = self.mode("rest") != "stop" and not self.rest_capped()
 
         def chunks(group: list[dict]) -> list[list[dict]]:
             alone, rest = [], []
@@ -10506,6 +10595,8 @@ class Daemon:
                 if h is None:
                     rest.append(e)
                 elif h["fails"] < HEAVY_AFTER or self.now - h["at"] >= LEAN_FACTOR * self.policy["cycles"][kind]:
+                    alone.append([e])
+                elif not rest_reads and self.now - h["at"] >= heavy_pause(h["fails"]):
                     alone.append([e])
                 else:
                     backing_off.append(e)
@@ -10527,9 +10618,15 @@ class Daemon:
                 groups.setdefault("/".join(split_key(e["key"])[1:3]).lower() + (" benched" if benched else ""),
                                   []).append(e)
             return alone + [g[i:i + size] for g in groups.values() for i in range(0, len(g), size)]
+
+        def oldest_first(queue: list[list[dict]]) -> list[list[dict]]:
+            """Chunks by the oldest data in each (never read first). The chunks above run one repository at a time, then
+            heavy entries ahead of all, so the order the entries came in (oldest data first) was kept only inside a chunk:
+            a tick that ran out of time read the first repository's newest data before another's oldest."""
+            return sorted(queue, key=lambda c: min(float((e.get("cache") or {}).get("dataAt") or 0) for e in c))
         # What a wait or a due land is blocked on goes first, heavy or not: the pace reads it before the rest
-        queue = deque(chunks([e for e in entries if self.waited(e)]))
-        queue.extend(chunks([e for e in entries if not self.waited(e)]))
+        queue = deque(oldest_first(chunks([e for e in entries if self.waited(e)]))
+                      + oldest_first(chunks([e for e in entries if not self.waited(e)])))
         shrunk = False
         to_rest: list[dict] = list(backing_off)
         asked = False  # a query was sent: UNTIL may cut the rest
@@ -10642,6 +10739,10 @@ class Daemon:
                 # a lone read says nothing about the batch size; it only judges this entry
                 h = self.heavy.setdefault(chunk[0]["key"], {"at": self.now, "fails": 0, "oks": 0})
                 h["at"] = self.now
+                if error is not None and not rest_reads:
+                    # nothing else will read it: say so on the entry (data kept), so `status` and `wait` name what holds it
+                    with contextlib.suppress(Exception):  # noqa: BLE001  a note must not stop the rest
+                        self.store(chunk[0]["key"], chunk[0]["cache"], error=f"{error[:200]} (read alone; REST cannot take it)")
                 if error is None:
                     h["fails"], h["oks"] = 0, h["oks"] + 1
                     if h["oks"] >= 2:
@@ -10691,6 +10792,7 @@ class Daemon:
         self.fresh_waited: dict[str, float | None] = {kind: None for kind in CYCLES}  # the newest waited data's age
         self.stale_waited_key: dict[str, str] = {}
         self.stale_count = {kind: 0 for kind in CYCLES}  # waited keys blocked past STALE_DATA_AFTER (STALE_ONE_KEY_COUNT)
+        self.waited_ages: dict[str, list[float]] = {kind: [] for kind in CYCLES}  # every waited open key's data age (data_age)
         # A waited key this daemon has not seen yet is watched since its wait began (waitBegan) at the latest: after a
         # restart, a target never read successfully (504s since it was registered) keeps its age instead of starting
         # at zero, which capped its blocked time at zero and silenced the alarm (review of glaeda#1970, F1).
@@ -10718,6 +10820,8 @@ class Daemon:
                 self.newest_data[kind] = age_s if newest is None else min(newest, age_s)
             blocked = min(age_s, observed_at - self.waited_since[e["key"]]) if self.waited(e) else 0.0
             self.blocked[kind] += self.waited(e)
+            if self.waited(e):
+                self.waited_ages[kind].append(age_s)
             if self.waited(e) and (self.fresh_waited[kind] is None or age_s < self.fresh_waited[kind]):
                 self.fresh_waited[kind] = age_s
             if self.waited(e) and blocked > STALE_DATA_AFTER:
@@ -11639,9 +11743,9 @@ class Daemon:
         if root is None:
             want = want[:2 * STEPS_BATCH]
             for n in range(0, len(want), STEPS_BATCH):
-                if self.mode("graphql") == "stop":
-                    break
                 chunk = {failed[i]: i for i in want[n:n + STEPS_BATCH]}
+                if self.graphql_stopped_for(route, STEPS_QUERY, {"ids": list(chunk)}):
+                    break
                 reason, self.gql_reason = self.gql_reason, "steps"
                 try:
                     doc, error = self.graphql(STEPS_QUERY, {"ids": list(chunk)}, route)
@@ -11686,13 +11790,13 @@ class Daemon:
                     owners.setdefault(c["id"], set()).add(e["key"])
         ids = list(want)[:2 * STEPS_BATCH]  # the rest wait a cycle (failed and cancelled checks; each is read once)
         for i in range(0, len(ids), STEPS_BATCH):
-            if self.mode("graphql") == "stop":
+            # the repositories of the PRs that show these checks: one owner's App answers it (owner_of)
+            route = sorted({"/".join(split_key(k)[1:3]) for c in ids[i:i + STEPS_BATCH] for k in owners[c]})
+            if self.graphql_stopped_for(route, STEPS_QUERY, {"ids": ids[i:i + STEPS_BATCH]}):
                 return
             try:
                 reason, self.gql_reason = self.gql_reason, "steps"
                 try:
-                    # the repositories of the PRs that show these checks: one owner's App answers it (owner_of)
-                    route = sorted({"/".join(split_key(k)[1:3]) for c in ids[i:i + STEPS_BATCH] for k in owners[c]})
                     doc, error = self.graphql(STEPS_QUERY, {"ids": ids[i:i + STEPS_BATCH]}, route)
                 finally:
                     self.gql_reason = reason
@@ -12619,8 +12723,11 @@ class Daemon:
         if (self.controller is None or self.now < self.streams_retry_at or self.now - self.streams_at < STREAMS_EVERY
                 or not self.controller_room()):
             return
-        waited = sorted((e for e in entries if e["key"].startswith("pr:") and self.waited(e)
-                         and not terminal("pr", (e.get("cache") or {}).get("data"))), key=self.wait_start)
+        landing = set() if self.land_queue is None else {
+            k for k, x in self.land_queue.entries.items() if x.get("state") not in LAND_DONE}
+        waited = sorted((e for e in entries if e["key"].startswith("pr:") and (self.waited(e) or e["key"] in landing)
+                         and not terminal("pr", (e.get("cache") or {}).get("data"))),
+                        key=lambda e: (e["key"] not in landing, self.wait_start(e)))  # lands first in STREAMS_WANT
         self.streams_at = self.now
         if not waited:
             self.streams_prs = {}
@@ -12653,7 +12760,7 @@ class Daemon:
             was = self.streams_prs.get(e["key"])
             if was is not None and int(st.get("events") or 0) > int(was.get("events") or 0):
                 self.streams_event_at[e["key"]] = self.now
-                self.nudged.add(e["key"])  # read it now (due(): NUDGE_MIN), not at the backstop
+                self.land_nudge(e["key"])  # read it now (due(): nudge_min), not at the backstop; a land judges it
                 self.streams_nudges += 1
             fresh[e["key"]] = st
         self.streams_prs, self.streams_ok_at = fresh, self.now
@@ -12767,6 +12874,7 @@ class Daemon:
         # coverage is the old controller's: the new one's feed has to show it again (fed())
         self.fed_repos, self.controller_ok_at = {}, float("-inf")
         self.feed_marks, self.feed_live_since = {}, None
+        self.feed_done = {}
         self.controller_down_until, self.controller_failures = 0.0, 0
         self.controller_missed_deadline = False
         self.controller_status = {"state": "off" if current is None else "starting"}
@@ -12787,6 +12895,27 @@ class Daemon:
             with contextlib.suppress(AttributeError):
                 self.controller.budget_end = float("inf")
 
+    def feed_stream_status(self) -> dict | None:
+        """The FeedStream for daemon.json: whether it answers, how many events it named and the tick read at once, and
+        its last error, so a host's stream can be seen working (or not) without a debugger."""
+        stream = getattr(self, "feed_stream", None)
+        if stream is None:
+            return None
+        return {"live": stream.live(time.time()), "okAt": round(stream.ok_at, 3) if stream.ok_at > 0 else None,
+                "signals": stream.signals, "reads": getattr(self, "feed_stream_reads", 0),
+                "landEventNudges": getattr(self, "land_event_nudges", 0), "error": stream.error}
+
+    def feed_stream_due(self, now: float) -> bool:
+        """Whether the feed is read now: the FeedStream named an event after the cursor (read at once, and its flag is
+        taken), or the poll's gap passed: CONTROLLER_FEED_EVERY, or FEED_STREAM_BACKSTOP while the stream answers."""
+        stream = getattr(self, "feed_stream", None)
+        if stream is not None and stream.ready.is_set() and self.controller_cursor is not None:
+            stream.ready.clear()
+            self.feed_stream_reads = getattr(self, "feed_stream_reads", 0) + 1
+            return True
+        gap = FEED_STREAM_BACKSTOP if stream is not None and stream.live(time.time()) else CONTROLLER_FEED_EVERY
+        return now - self.controller_feed_at >= gap
+
     def controller_room(self, timeout: float | None = None) -> bool:
         """Start a read only if its socket timeout fits. Give the transport the same absolute deadline
         for the whole response, including rollups and feed refreshes made inside a PR read."""
@@ -12802,7 +12931,7 @@ class Daemon:
         """from_controller's reads, within the tick's CONTROLLER_TICK_BUDGET. Pages feed_between_reads read during the
         last tick's reads (feed_held) are applied here first: their cursor is already past them."""
         pages, self.feed_held = self.feed_held, []
-        if self.now - self.controller_feed_at >= CONTROLLER_FEED_EVERY:
+        if self.feed_stream_due(self.now):
             self.controller_feed_at = self.now
             try:
                 fresh = self.read_feed()
@@ -12877,6 +13006,7 @@ class Daemon:
                     self.feed_mark(repo, item)
         if pages:
             self.feed_marks = {k: t for k, t in self.feed_marks.items() if self.now - t <= LAND_FEED_KEEP}
+            self.feed_done = {k: t for k, t in self.feed_done.items() if self.now - t <= LAND_FEED_KEEP}
 
     def feed_due(self) -> None:
         """feed_between_reads, asked before every read request (as post_due is), on the tick's own thread only: a land
@@ -12900,8 +13030,7 @@ class Daemon:
                 or len(self.feed_held) >= FEED_HELD_MAX):
             return  # (no cursor: this daemon follows no feed yet, or reads through an upstream)
         now = self.clock()
-        if (now <= self.now or now - self.controller_feed_at < CONTROLLER_FEED_EVERY
-                or now < self.controller_down_until):
+        if now <= self.now or not self.feed_stream_due(now) or now < self.controller_down_until:
             return  # (now <= self.now: no time has passed since the tick's own feed read)
         tick_now, budget_end = self.now, self.controller_budget_end
         self.feed_between, self.now = True, now
@@ -12961,6 +13090,30 @@ class Daemon:
             marks.add(f"branch:{repo}@{item['head_branch']}")
         for mark in marks:
             self.feed_marks[mark] = self.now
+        if item.get("number") is None and item.get("head_sha") and str(item.get("status") or "").lower() == "completed":
+            self.feed_done[f"{repo}@{str(item['head_sha']).lower()}"] = self.now  # a check finished (LAND_EVENT_JUDGE)
+
+    def land_feed_done(self, key: str, sha: str) -> float | None:
+        """When the feed last delivered a completed run or check suite for SHA, the head of KEY's PR, else None (no
+        feed here, or none within LAND_FEED_KEEP): the land queue's check-completed event (LAND_EVENT_JUDGE)."""
+        try:
+            _, owner, repo, _ = split_key(key)
+        except ValueError:
+            return None
+        return self.feed_done.get(f"{owner}/{repo}".lower() + "@" + str(sha or "").lower())
+
+    def land_checks_done(self, key: str, sha: str) -> bool | None:
+        """Whether the controller's rollup of SHA (over the tailnet, no GitHub request) says every check run at it has
+        completed: True, False (one still queued or running), or None when the rollup cannot say (off, slow, incomplete,
+        unreachable). Commit statuses are not in it; land_judge reads those itself (LAND_EVENT_JUDGE)."""
+        try:
+            _, owner, repo, _ = split_key(key)
+        except ValueError:
+            return None
+        doc = self.controller_suites(f"/repos/{owner}/{repo}", str(sha or "").lower())
+        if not isinstance(doc, dict) or not doc.get("suites"):
+            return None
+        return all(s[1] == "completed" for s in doc["suites"])
 
     def wait_feed_quiet(self, req: dict, cached: dict | None, now: float) -> bool:
         """A PR wait's copy that only looks starved: the feed shows nothing reached the PR, its head or its branch since
@@ -13223,6 +13376,25 @@ class Daemon:
                 marks.add("branch:" + str(data["headRefName"]))  # a push: runs for a head GitHub has not shown yet
             if any((f"{owner}/{repo}", m) in touched for m in marks):
                 self.land_nudge(e["key"])
+        self.nudge_lands(touched)
+
+    def nudge_lands(self, touched: set[tuple[str, str]]) -> None:
+        """A run or suite event on the head (or branch) of an open land entry: nudge its PR and watch it now, so the
+        next tick reads it and the queue judges the fresh copy. Without this a land parked in a long wait (its PR
+        unwatched, peeked every LAND_PEEK_EVERY) heard of its last check only at the peek or a timeout (Leo,
+        2026-11-25: "merge timed out ... because we poll. stop polling")."""
+        q = self.land_queue
+        heads = getattr(q, "heads", None)
+        if not heads or not touched:
+            return
+        for key, (repo, sha, branch) in list(heads.items()):
+            e = q.entries.get(key)
+            if e is None or e.get("state") in LAND_DONE:
+                continue
+            if (repo, "sha:" + sha) in touched or (branch and (repo, "branch:" + branch) in touched):
+                self.land_nudge(key)
+                q.watch_now(key)
+                self.land_event_nudges = getattr(self, "land_event_nudges", 0) + 1
 
     def merge_comments(self, entries: list[dict], page: dict) -> None:
         """Add new, edited and deleted comments on watched issues to their cached comment list. The
@@ -14297,6 +14469,15 @@ LAND_FEED_QUIET_MAX = 1800.0
 # the verdict, and the judgment past it counts toward the stop as the timeout always did. Other waits (a check that
 # never appeared, a hold) keep their timeout: what ends them may be nothing the feed carries.
 LAND_TIMER_HELD = frozenset({"checks_running"})
+# The check-completed event judges a wait on the PR's checks at once (LandQueue.checks_done_event, why=checks_done):
+# when the feed delivers a completed run or check suite for the head after the wait's verdict and the controller's
+# rollup of the head (no GitHub request) shows every check run there completed, land_judge is asked now, on its own
+# live read, instead of when the daemon's copy catches up or the wait's timer fires. Leo, 2026-11-25 ~02:10Z: "wall time
+# > runner hour time"; the decision: event streams are the transport, merge on the check-completed event, the timer is
+# the slow sweep. cmux-cp-1, 2026-11-25 02:55Z: 60 of the 103 rows waiting on their checks with the copy showing a
+# check running had every check done on GitHub, a median 59 min before, each asleep until its timer (median ~20 min
+# more); over 72 h the queue's merges came a median 31 min (p90 190 min) after the head's last check finished. One
+# judgment per event (doneEventSeen); a rollup that cannot say judges nothing, and the timer and copy paths stand.
 LAND_FEED_GAP = 4 * CONTROLLER_FEED_EVERY  # a longer gap between feed answers starts its quiet over
 LAND_FEED_KEEP = 2 * LAND_FEED_QUIET_MAX  # how long one PR's, head's or branch's last event is remembered
 # An upstream host (a lane VM) follows no feed of its own: it holds no controller token, and its daemon reads through
@@ -14347,7 +14528,8 @@ LAND_WAIT_KINDS = frozenset({"wait_pr", "wait_run"})
 # verdict provably does not depend on. Counting the two together read as waste and invited a hold that would have
 # delayed every recovery (hq#15832 Fix 120: 171 unmoved judgments, 161 of them a bound running out).
 LAND_JUDGE_WHY = frozenset({"queued", "woke", "no_data", "repin", "head_moved", "head_timeout", "checks_woke",
-                            "run_done", "comment_seen", "reran", "fp_moved", "data_seen", "stuck_carry", ""})
+                            "run_done", "comment_seen", "reran", "fp_moved", "data_seen", "stuck_carry", "checks_done",
+                            ""})
 LAND_JUDGE_DUE = frozenset({"queued", "woke", "no_data", "repin", "head_timeout", "checks_woke", "stuck_carry"})
 LAND_WAIT_STUCK = 4 * 3600.0
 # The rest of the waits land_judge names never count toward LAND_STREAK_STOP either: a review still running
@@ -14923,6 +15105,19 @@ LAND_COMMAND_UNTIL = re.compile(r"--until[ =](green|done|required|merged)\b")
 # (head, run), the stale_replay guard, and a 2 h budget -- and then judges again. It decides nothing itself: the
 # rerun posts a real verdict or the cap stops the entry. A check that will never post has not passed.
 LAND_COMMAND_RERUN = re.compile(r"\s*gh run rerun (\d+)(\s+--failed)? -R ([\w.-]+/[\w.-]+)\s*")
+# The third "command" this queue runs itself: the label land_judge's land_tier rule asks for. cmuxterm-hq#24362 at
+# a1d33b52ffc3, 2026-11-24: handed to cmux-cp-1's land queue (LAND_HANDOFF_BROKER_ONLY holds land_tier_pending), which
+# stopped it "land_tier_pending: ... hq/land-tier is pending and the PR needs ready-to-land ...; next: gh pr edit 24362
+# -R manaflow-ai/cmuxterm-hq --add-label ready-to-land". The rule (land_judge/rules/land_tier.py) refuses before the
+# engine's own label write (land_tier_refusal) is reached, and names the label as a "command" step this queue stopped
+# on, so the land tier -- the cut Leo named for ci-runner-min-per-day-50k ("whatever we need to cut, we cut") -- only
+# ran when a person added the label by hand. A command that is exactly `gh pr edit N -R OWNER/REPO --add-label L`
+# (L ready-to-land or full-ci; land_tier.label_command's shape) for this entry's own PR, under the land_tier_pending
+# code, is the label step: run through the gh-quota shim (land_judge judges the write), once per head (e["labelSent"],
+# written before the send), on a host with its own GitHub login only. On a broker client, or at a head already sent,
+# it stays the command it was and stops as before. It decides nothing: the label starts the tier, and the next
+# judgment waits on the tier's own status.
+LAND_COMMAND_LABEL = re.compile(r"\s*gh pr edit (\d+) -R ([\w.-]+/[\w.-]+) --add-label (ready-to-land|full-ci)\s*")
 LAND_HISTORY = 60
 LAND_KEEP = 7 * 86400  # finished entries are kept this long for `land status`
 LAND_COUNT_DAYS = 30
@@ -14935,6 +15130,13 @@ LAND_TOUCH = TOUCH_EVERY  # the daemon re-registers the PRs, runs and comments i
 # queue's, every open entry's waited watch renewed every LAND_TOUCH, and pr caches fetched in the last 600 s: 0, so
 # even the PRs a due land needed were never read.
 LAND_PEEK_EVERY = 600.0
+# An --after PR with no copy here, or a copy older than this, after that long of unwaited reads (keep_watching) is
+# read once directly (land_direct_read, as a pinned land's head is: pin_wait), at most once per this bound, so its
+# merge or close ends the wait (after_wait). cmux-cp-1, 2026-11-25 01:40Z: 30 rows waiting_after; the p95 green wait
+# (41h49m) was manaflow-ai/cmux-extensions#15 behind manaflow-ai/cmux#46686, closed unmerged 11 min after it queued,
+# with no copy of #46686 in the daemon's cache 41 h on: the unwaited read sat below every wait while pr data ran
+# 3,000-5,000 s stale. Of the 31 predecessors, 3 were closed and 6 merged on GitHub, their rows still waiting.
+LAND_AFTER_BLIND = 1800.0
 # Of the due entries (queued, or waiting past their wake) only the first this many per worker, in judge_order, hold a
 # waited watch; the rest are read like a parked entry (LAND_PEEK_EVERY), and the tick that brings one inside the window
 # waits on it again, so its judgment is handed a fresh copy (and fresh_head/snapshot_wait nudge a read regardless).
@@ -15892,7 +16094,25 @@ def land_action(answer: dict, head: str) -> dict:
     if act.get("kind") != "command":
         return act
     return land_command_fetch(act, answer) or land_command_rerun(act, answer) \
-        or land_command_wait(act, answer, head)
+        or land_command_label(act, answer) or land_command_wait(act, answer, head)
+
+
+def land_command_label(act: dict, answer: dict) -> dict | None:
+    """A "command" step that is the label land_judge's land_tier rule names (LAND_COMMAND_LABEL's comment) as that
+    label step, else None. Only a land_tier_pending refusal's own command, for the PR it judged: any other text, code,
+    repository or number stays a command. The step keeps its text, so a host that must not run it stops as before."""
+    if str(answer.get("code") or "") != "land_tier_pending":
+        return None
+    text = " ".join(map(str, act["argv"])) if isinstance(act.get("argv"), list) else str(act.get("text") or "")
+    if not text.strip():
+        text = str(answer.get("next") or "")
+    named = LAND_COMMAND_LABEL.fullmatch(text)
+    repo = str(act.get("repo") or answer.get("repo") or "")
+    number = str(act.get("number") if act.get("number") not in (None, "") else answer.get("number") or "")
+    if not named or not repo or named.group(2).lower() != repo.lower() or named.group(1) != number:
+        return None
+    return {"v": 1, **{k: act[k] for k in ("number", "head") if k in act}, "kind": "label", "repo": repo,
+            "label": named.group(3), "text": text.strip(), "from": "command"}
 
 
 def land_command_rerun(act: dict, answer: dict) -> dict | None:
@@ -16226,7 +16446,13 @@ class LandQueue:
                  head_watch: Callable[[str], None] | None = None,
                  reading: Callable[[str], dict | None] | None = land_budget_reading,
                  feed_quiet: Callable[[str, str, float], bool] | None = None,
-                 read_room: Callable[[], int | None] | None = None) -> None:
+                 read_room: Callable[[], int | None] | None = None,
+                 feed_done: Callable[[str, str], float | None] | None = None,
+                 checks_done: Callable[[str, str], bool | None] | None = None) -> None:
+        # (key, head) -> when the feed last said a check finished at the head, and whether the controller's rollup
+        # shows every check run there completed (LAND_EVENT_JUDGE). None: no feed here, so no event judges.
+        self.feed_done = feed_done or (lambda key, sha: None)
+        self.checks_done = checks_done or (lambda key, sha: None)
         # how many due lands may hold a waited PR watch, by the daemon's own read rate (LAND_WATCH_SHARE); None: no cap
         self.read_room = read_room or (lambda: None)
         # (key, head, since) -> the webhook feed delivered nothing for that PR or head since (LAND_FEED_QUIET_MAX)
@@ -16263,6 +16489,8 @@ class LandQueue:
         self.peek = peek or ((lambda key: register(key, reader=f"tool:{LAND_TAG}", once=True)) if watch is None
                              else self.watch)
         self.peeked: dict[str, float] = {}
+        self.after_blind_since: dict[str, float] = {}  # an --after PR with no copy: since when (after_blind_read)
+        self.after_read_at: dict[str, float] = {}  # an --after PR's last direct read (LAND_AFTER_BLIND)
         self.forward_reads = 0  # forwards_unjudged's one-off reads this pass
         self.lean: set[str] = set()  # due entries past the tick's watch window (LAND_WATCH_AHEAD): read unwaited
         # A queued PR's head is registered with the checks store for land-judge (head_key), so the daemon holds its
@@ -16271,6 +16499,7 @@ class LandQueue:
                                                                 reader=f"tool:{LAND_TAG}"))
                                          if watch is None else (lambda key: None))
         self.head_touched: dict[str, float] = {}
+        self.heads: dict[str, tuple[str, str, str]] = {}  # PR key -> (repo, head sha, head branch): watch_head's
         self.changed_entries: set[str] = set()
         self.recovery_at = float("-inf")
         self.latch_started: float | None = None  # when the latch this pass sees began to hold (a window: hold)
@@ -16572,7 +16801,7 @@ class LandQueue:
         if fresh:
             e.update(state="queued", head="", explain=None, action=None, streak=None, wakeAt=None,
                      wait=None, seen=None, seenHead="", mergeSha="", stop=None, preStepHead="",
-                     lastAction=None, reviewed=[], updateSent=None, updateDeferred=None, waitRefused=None,
+                     lastAction=None, reviewed=[], updateSent=None, labelSent=None, updateDeferred=None, waitRefused=None,
                      waitBudget=None, afterStopped=None, reruns=None, latchHeld=None, dueLate=None, dueAt=self.now,
                      stepTransient=None, lastStop=None,  # a land by hand is told its stop again (LAND_STOP_REPEAT)
                      forwardFirst=None, forwardStateFails=None, forwardStateAt=None)
@@ -18720,14 +18949,41 @@ class LandQueue:
                 self.peeked[k] = self.now
                 with contextlib.suppress(OSError, WatchError):
                     self.peek(k)
+        for a in peeks:
+            if a != e["key"] and (self.entries.get(a) or {}).get("state") != LAND_FORWARDED:
+                self.after_blind_read(a)  # a forwarded one is read live by forward_state_reads
+
+    def after_blind_read(self, a: str) -> None:
+        """Under the lock. --after PR A, read only unwaited (keep_watching), whose copy here is missing or older than
+        LAND_AFTER_BLIND and has stayed so that long: one direct read of it (refresh_job, land_direct_read), at most
+        once per LAND_AFTER_BLIND, when no hold, park or busy pool stops it. after_wait then ends the wait on the copy it
+        stored (merged: queued; closed: after_closed) instead of the row waiting forever on a read that never comes."""
+        c = self.cache_of(a) or {}
+        reads = [t for t in (c.get("dataAt"), c.get("updatedAtAt")) if isinstance(t, (int, float))
+                 and not isinstance(t, bool)]
+        if reads:
+            self.after_blind_since.pop(a, None)
+        since = max(reads) if reads else self.after_blind_since.setdefault(a, self.now)
+        if self.now - since < LAND_AFTER_BLIND or self.now - self.after_read_at.get(a, float("-inf")) < LAND_AFTER_BLIND:
+            return
+        if a in self.jobs or self.refresh_held() or self.queue_quota_parked() or self.busy() >= self.workers():
+            return  # read on a later pass
+        self.after_read_at[a] = self.now
+        log({"event": "land-after-read", "key": a, "age": round(self.now - max(reads)) if reads else None})
+        self.submit(a, self.refresh_job, a)
 
     def watch_head(self, e: dict) -> None:
         """Register the PR's current head (from its cached read) with the checks store as soon as the entry is open or
         its head moves, then every LAND_TOUCH: HEAD_INTEREST outlasts a queued PR's wait, and a head that moved is a
         new key, registered the same pass. Land-judge's first read of a head then finds the daemon's entry."""
-        head = str(((self.cache_of(e["key"]) or {}).get("data") or {}).get("headRefOid") or "").lower()
+        data = (self.cache_of(e["key"]) or {}).get("data") or {}
+        head = str(data.get("headRefOid") or "").lower()
         if not SHA40.fullmatch(head):
             return
+        # what the daemon's feed matches a run or suite event against (Daemon.nudge_lands), watched or not
+        self.heads[e["key"]] = (e["repo"].lower(), head, str(data.get("headRefName") or ""))
+        if len(self.heads) > 2000:
+            self.heads = {k: v for k, v in self.heads.items() if k in self.entries}
         key = f"head:{e['repo'].lower()}@{head}"
         if self.now - self.head_touched.get(key, float("-inf")) < LAND_TOUCH:
             return
@@ -18858,6 +19114,9 @@ class LandQueue:
         if running:
             if woke:  # a check that never finishes (a status never posted, no runner): land_judge says what now
                 self.judge(e, head, fp, why="checks_woke")
+            elif kind == "pr" and self.checks_done_event(e, head):
+                # the copy still shows a check running; the feed and the rollup say they all finished (LAND_EVENT_JUDGE)
+                self.judge(e, head, fp, counts=False, why="checks_done")
             elif kind != "pr" or w.get("sha") != head:
                 self.wait_running(e, head, fp)
             elif w.get("rerun"):
@@ -19140,6 +19399,29 @@ class LandQueue:
         wake = e.get("wakeAt")
         return isinstance(wake, (int, float)) and not isinstance(wake, bool) and wake - self.now <= LAND_RETRY_MAX
 
+    def checks_done_event(self, e: dict, head: str) -> bool:
+        """True when E, waiting on its checks at HEAD with the copy still showing one running, has had a check-completed
+        event since its last judgment and the controller's rollup shows every check run at HEAD completed
+        (LAND_EVENT_JUDGE). Each event is looked at once (doneEventSeen), so an event the rollup says is not the last
+        check, or one it cannot judge, asks nothing again; the next event, the copy or the timer does."""
+        at = self.feed_done(e["key"], head)
+        if not head or not isinstance(at, (int, float)) or isinstance(at, bool):
+            return False
+        v = e.get("feedVerdict") or {}
+        # since the last judgment began (feedVerdict's at), else ended: an event while land_judge read is still news
+        since = v.get("at") if v.get("head") == head else (e.get("explain") or {}).get("at")
+        seen = e.get("doneEventSeen")
+        if any(isinstance(t, (int, float)) and not isinstance(t, bool) and at <= t for t in (since, seen)):
+            return False
+        e["doneEventSeen"] = at
+        done = self.checks_done(e["key"], head)
+        self.save(e)
+        if done is not True:
+            return False
+        self.count("checks_done_event")
+        self.history(e, "checks_done_event", head=head[:12], lag=round(max(0.0, self.now - at), 1))
+        return True
+
     def feed_holds(self, e: dict, head: str) -> bool:
         """True while E's last wait verdict at HEAD (feedVerdict) still stands because the webhook feed delivered nothing
         for the PR, its head or its branch since that judgment started (feed_quiet), within LAND_FEED_QUIET_MAX of it:
@@ -19290,7 +19572,9 @@ class LandQueue:
         with self.lock:
             hold = self.refresh_outcome(key, error)
             e = self.entries.get(key)
-            if e is None:
+            if e is None:  # an --after PR with no row here (after_blind_read)
+                if error:
+                    log({"event": "land-refresh", "key": key, "error": error, **({"hold": hold} if hold else {})})
                 return
             probe = bool((e.get("refresh") or {}).get("probe"))
             e["refresh"] = {**(e.get("refresh") or {}), "error": land_trim(error, 160) if error else None}
@@ -20177,6 +20461,7 @@ class LandQueue:
         with self.lock:
             self.count("snapshot" if extra else "live")
         extra.update(land_nominated_env(e))  # judged under the nominating path, as the merge is (LAND_NOMINATED_ENV)
+        extra[LAND_QUEUE_ENV] = "1"  # the queue's judgment adds ready-to-land (land_tier_pending); ad-hoc explains do not
         for n, run_argv in enumerate(tries):
             bound = LAND_EXPLAIN_DEADLINE_CLIENT if self.broker_client() else LAND_EXPLAIN_DEADLINE
             with self.lock:
@@ -20748,6 +21033,16 @@ class LandQueue:
                 return
             self.retarget(e, head, base, answer)
             return
+        if kind == "label":
+            sent = e.get("labelSent") or {}
+            if self.broker_client() or not head or sent.get("head") == head:
+                # LAND_COMMAND_LABEL's comment: a broker client hands the label to the broker host's queue, and a head
+                # already labelled is not labelled again; either stops as the command it was
+                act = {"v": 1, "kind": "command", "text": act.get("text")}
+                kind = "command"
+            else:
+                self.do_label(e, act, answer, head)
+                return
         if kind == "fetch":
             self.do_fetch(e, act, answer, head)
             return
@@ -21326,6 +21621,38 @@ class LandQueue:
             self.history(e, "union_merged", head=head[:12], merge=sha[:12], base=base_sha[:12],
                          paths=land_trim(", ".join(e["unionMerge"].get("paths") or []), 200))
             self.wait(e, {"kind": "head_change", "before": head, "since": self.now}, LAND_HEAD_TIMEOUT)
+
+    def do_label(self, e: dict, act: dict, answer: dict, head: str) -> None:
+        """Add the label land_judge's land_tier rule names (LAND_COMMAND_LABEL's comment), once per head, then judge
+        again soon. e["labelSent"] is written before the send, so a restart mid-send counts it as sent."""
+        gh = self.gh()
+        if gh is None:
+            with self.lock:
+                self.stop(e, "no_shim", f"no gh-quota shim at {self.path('gh', LAND_GH)}; the label is not sent around it",
+                          "install the gh-quota shim (tools/host-baseline) or set gh in ~/.config/glaeda/land.json")
+            return
+        label, repo, number = str(act["label"]), e["repo"], str(e["number"])
+        with self.lock:
+            self.claim(e, "label", label=label)
+            e["labelSent"] = {"head": head, "at": self.now}
+            self.history(e, "label_sent", head=head[:12], label=label)
+            self.save(e)
+        got = self.call([gh, "pr", "edit", number, "-R", repo, "--add-label", label], LAND_GH_DEADLINE, e)
+        named = None
+        with self.lock:
+            if got.returncode not in (0, 124):
+                e.pop("labelSent", None)  # refused: not sent (a timeout may have reached GitHub: it stays sent)
+            self.finish(e, got)
+            if got.returncode == 0:
+                e.pop("stepFail", None)
+                e.pop("stepTransient", None)
+                self.nudge(e["key"])
+                self.wait(e, {"kind": "retry", "why": f"added {label}: the tier's status is judged next"},
+                          NUDGE_MIN * 3)
+            else:
+                named = self.step_refused(e, "label", head, got)
+        if named == "update_branch":
+            self.update_branch(e, head)
 
     def do_fetch(self, e: dict, act: dict, answer: dict, head: str) -> None:
         """Fill this host's mirror as land_judge named (LAND_FETCH_DEADLINE's comment), then judge again soon. An argv
@@ -22253,6 +22580,7 @@ def land_override_env(e: dict) -> dict[str, str]:
 # to the executor (land.json "executor"), to an overflow peer ("overflow") and in a lane VM's land_handoff. A request
 # whose "nominated" is not that shape keeps {"unreadable": WHY}, which land_judge refuses: never a plain land.
 LAND_NOMINATED_ENV = "LAND_JUDGE_NOMINATED"
+LAND_QUEUE_ENV = "LAND_JUDGE_LAND_QUEUE"  # leo-workspace land_judge: an explain under it adds the land-tier label
 LAND_NOMINATED_MAX = 4000  # the evidence as JSON, at most: two gate results of a 40-hex head and a one-line why each
 LAND_NOMINATED_PATH = re.compile(r"[a-z][a-z0-9-]{0,39}")
 
@@ -24056,6 +24384,73 @@ SCRIPT_WAKE_EVERY = 0.5  # seconds between two stats of the script by ScriptWake
 JUMP_PHASES = frozenset({"watches", "controller", "due", "reads", "read upstream", "read direct"})
 
 
+class FeedStream:
+    """The thread that holds one long-poll open on the controller's change feed (events?since=CURSOR&wait=...), so a
+    check event wakes the daemon the moment the controller has it instead of at the next CONTROLLER_FEED_EVERY poll.
+    Leo, 2026-11-25: "merge timed out and the glaeda#2734 wait ran out because we poll. stop polling".
+    It never moves the daemon's cursor or touches its state: an answer that holds something after the daemon's cursor
+    sets READY and wakes serve's sleep (WAKE, ScriptWake's event); the tick then reads the feed at once (feed_stream_due)
+    through its own path, as every poll did. The poll stays as the backstop at FEED_STREAM_BACKSTOP while this answers.
+    GLAEDA_GH_FEED_STREAM=off turns it off (the poll alone serves, as before)."""
+
+    def __init__(self, daemon: Any, wake: threading.Event | None, wait: int = FEED_STREAM_WAIT):
+        self.daemon, self.wake, self.wait = daemon, wake, wait
+        self.ready = threading.Event()
+        self.client: Controller | None = None  # its own: Controller.get reads budget_end, which the tick sets on its copy
+        self.ok_at = float("-inf")  # time.time() of its last answer
+        self.error: str | None = None
+        self.signals = 0
+
+    @staticmethod
+    def enabled() -> bool:
+        return os.environ.get("GLAEDA_GH_FEED_STREAM", "").strip().lower() != "off"
+
+    def live(self, now: float) -> bool:
+        """Whether it answered recently enough that the poll can be the backstop only."""
+        return self.enabled() and now - self.ok_at <= self.wait + 2 * CONTROLLER_READ_TIMEOUT
+
+    def step(self) -> float:
+        """One long-poll; the seconds to pause before the next."""
+        d = self.daemon
+        ctl, cursor = getattr(d, "controller", None), getattr(d, "controller_cursor", None)
+        if (not self.enabled() or ctl is None or cursor is None
+                or time.time() < float(getattr(d, "controller_down_until", 0.0) or 0.0)):
+            return 2.0  # no feed followed yet (or it is out): the tick's own read starts it
+        if self.ready.is_set():
+            return 0.2  # the tick has not read what the last answer named yet
+        base = getattr(ctl, "base", None)
+        if self.client is None or getattr(self.client, "base", None) != base:
+            self.client = Controller(base, ctl.token)
+        self.client.token = ctl.token
+        began = time.monotonic()
+        try:
+            doc = self.client.events(cursor, wait=self.wait)
+        except Exception as error:  # noqa: BLE001  the poll serves while it is out
+            self.error = describe(error)
+            return FEED_STREAM_RETRY
+        self.ok_at, self.error = time.time(), None
+        if getattr(d, "controller_cursor", None) != cursor:
+            return 0.0  # the tick read the feed meanwhile: wait from its cursor
+        if (doc.get("reset") or doc.get("cursor") != cursor or doc.get("runs") or doc.get("suites")
+                or doc.get("comments")):
+            self.signals += 1
+            self.ready.set()
+            if self.wake is not None:
+                self.wake.set()
+            return 0.0
+        # an empty answer well before WAIT: a controller that does not hold the request open must not be asked in a loop
+        return 0.0 if time.monotonic() - began >= self.wait / 2 else FEED_STREAM_RETRY
+
+    def run(self) -> None:
+        while True:
+            try:
+                pause = self.step()
+            except Exception:  # noqa: BLE001  never ends the thread
+                pause = FEED_STREAM_RETRY
+            if pause:
+                time.sleep(pause)
+
+
 class ScriptWake:
     """The thread that ends a tick when a new glaeda-gh lands. serve noticed a swapped script only after the tick it was
     in (up to TICK_BUDGET) and its TICK sleep: a lane VM, 2026-11-24, merge a8f8c140 went live 15 s after it merged, 7 s
@@ -24398,6 +24793,8 @@ def serve_daemon(foreground_ok: bool, cleanup: contextlib.ExitStack) -> int:
 
     wake = ScriptWake(me, seen["sha"], daemon, jump=lambda: reexec(where=f"script-wake in {daemon.phase_now}"))
     threading.Thread(target=wake.run, name="glaeda-gh-script-wake", daemon=True).start()
+    daemon.feed_stream = FeedStream(daemon, wake.event)
+    threading.Thread(target=daemon.feed_stream.run, name="glaeda-gh-feed-stream", daemon=True).start()
     last = None
     while True:
         try:
@@ -29972,7 +30369,9 @@ def cmd_budget(as_json: bool, fleet: bool = False) -> int:
         doc = {"daemon": running, "stale": lag is not None, "failing": broken is not None,
                "budget": budget, "watching": watching, "last": status,
                "controllerFallback": read_json(BASE / CONTROLLER_FALLBACK_FILE) or {},
-               "healthy": running and lag is None and broken is None and not isinstance(status.get("stalled"), dict),
+               "healthy": running and lag is None and broken is None and not isinstance(status.get("stalled"), dict)
+                          and status.get("healthy") is not False,
+               "dataAge": status.get("dataAge") or {},
                # buckets whose reading's reset has passed: their "remaining" is unknown now, not what it says
                "resetPassed": [b for b in ("rest", "graphql") if isinstance(budget.get(b), dict)
                                and isinstance(budget[b].get("reset"), (int, float))
@@ -29993,6 +30392,13 @@ def cmd_budget(as_json: bool, fleet: bool = False) -> int:
                    else "nothing explains it: the daemon restarts itself (stale valve)")
             print(f"NOT HEALTHY: no PR refreshed for {stalled.get('age', '?')}s (over {STALE_DATA_AFTER}s) though the "
                   f"heartbeat is fresh; {why}")
+        ages = (status.get("dataAge") or {}).get("pr")
+        if running and isinstance(ages, dict):
+            print(f"waited PR data age: max {ages.get('max')}s, p95 {ages.get('p95')}s, p50 {ages.get('p50')}s over "
+                  f"{ages.get('n')} PRs (stale over {STALE_DATA_AFTER}s)")
+            if status.get("healthy") is False and not isinstance(stalled, dict):
+                print(f"NOT HEALTHY: waited PR data is {ages.get('max')}s old at the oldest though the heartbeat is "
+                      f"fresh (daemon.json stale: {(status.get('stale') or {}).get('reason') or 'see alarms'})")
         down = status.get("graphqlDown")
         if running and isinstance(down, dict) and isinstance(down.get("until"), (int, float)):
             until = dt.datetime.fromtimestamp(down["until"], dt.timezone.utc)
@@ -34994,9 +35400,39 @@ def post_lane_env(item: dict) -> dict[str, str] | None:
     return {**os.environ, LAND_LANE_ENV: lane} if lane else None
 
 
-def broker_write(item: dict, chosen: tuple[str, dict], timeout: float) -> tuple[str, Any]:
+# The broker's update_branch tool takes only a pinned call ("expected_head_sha must be the PR's full 40-character
+# head"), and a queued update-branch with no --sha (gh-quota queues a bare `gh pr update-branch N` that the login's
+# create pause held) was sent unpinned: every one failed in the daemon, "the lane-gh broker did not make it: refused:
+# expected_head_sha must be ..." (glaeda-lane, 2026-11-25), so each update-branch made during a pause never happened.
+# An unpinned update-branch means "whatever the head is now", so the daemon reads the PR's head through the broker's
+# own get and pins the call to it. Detector: test_an_unpinned_queued_update_branch_reads_the_prs_full_head_before_the_
+# broker_call.
+def broker_pin_update_branch(item: dict, chosen: tuple[str, dict], timeout: float) -> tuple[str, Any]:
+    """CHOSEN with update_branch's expected_head_sha read from the PR when it has none: ("pinned", chosen), or the
+    read's outcome as broker_write gives it ("limited", seconds; "refused", why: nothing was written either way)."""
+    tool, call_args = chosen
+    if tool != "update_branch" or call_args.get("expected_head_sha"):
+        return "pinned", chosen
+    outcome, data = broker_write(item, ("get", {"path": f"pulls/{call_args['number']}"}), timeout, pin=False)
+    if outcome == "limited":
+        return outcome, data
+    head = str(((data.get("head") if isinstance(data, dict) else None) or {}).get("sha") or "").lower() \
+        if outcome == "made" and isinstance(data, dict) else ""
+    if not SHA40.fullmatch(head):
+        why = data if outcome != "made" else "its answer named no 40-character head"
+        return "refused", f"could not read {item['repo']}#{call_args['number']}'s head to pin the update-branch: {why}"
+    return "pinned", (tool, {**call_args, "expected_head_sha": head})
+
+
+def broker_write(item: dict, chosen: tuple[str, dict], timeout: float, pin: bool = True) -> tuple[str, Any]:
     """One `lane-gh call` for a queued write: ("made", data), ("limited", seconds) when a limit refused it and
-    nothing was made, ("refused", why), or ("lost", why) when no answer came and it may have been made."""
+    nothing was made, ("refused", why), or ("lost", why) when no answer came and it may have been made. An unpinned
+    update_branch is pinned to the PR's head first (broker_pin_update_branch)."""
+    if pin:
+        outcome, value = broker_pin_update_branch(item, chosen, timeout)
+        if outcome != "pinned":
+            return outcome, value
+        chosen = value
     tool, call_args = chosen
     argv = [LANE_GH_CMD, "call", tool, item["repo"], json.dumps(call_args)]
     try:
