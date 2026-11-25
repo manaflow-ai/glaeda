@@ -1750,7 +1750,8 @@ class ReleaseTest(unittest.TestCase):
             out = Path(tmp)
             files = {f"glaeda/scripts/{name}": ((ROOT / "scripts" / name).read_bytes(), 0o755)
                      for name in ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-gh", "glaeda-mini-health",
-                                 "glaeda-update")}
+                                 "glaeda-update", "glaeda-procs", "glaeda-disk-registry", "cmux-disk", "cmux-procs",
+                                 "cmux-disk-registry")}
             files["bin/glaeda-worktree-reclaim"] = (b"#!/bin/sh\nexit 0\n", 0o755)
             (out / gr.hygiene_asset(TARGET)).write_bytes(tar_gz(files))
             self.assertEqual(gr.main(["smoke", "--source", "a" * 40, "--target", TARGET, "--output", str(out)]), 0)

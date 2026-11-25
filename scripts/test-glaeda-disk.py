@@ -7346,6 +7346,16 @@ class GlaedaDiskTest(unittest.TestCase):
         with mock.patch.object(gd, "emergency_devs", return_value=frozenset()):
             self.assertIs(gd.saturation_halt({}, "10%"), gd.host_saturated)
 
+    def test_saturation_never_holds_a_filesystem_past_the_saturated_free_share(self) -> None:
+        total = 100 * gd.GIB
+        full = gd.Fs(1, "/", 10 * gd.GIB, total, 30 * gd.GIB, 40 * gd.GIB)
+        roomy = gd.Fs(1, "/", 40 * gd.GIB, total, 30 * gd.GIB, 40 * gd.GIB)
+        with mock.patch.object(gd, "emergency_devs", return_value=frozenset()):
+            self.assertIsNone(gd.saturation_halt({1: full}, "5%"))
+            self.assertIs(gd.saturation_halt({1: roomy}, "5%"), gd.host_saturated)
+            with mock.patch.dict(gd.POLICY, {"saturated_delete_below_free": "0"}):
+                self.assertIs(gd.saturation_halt({1: full}, "5%"), gd.host_saturated)
+
     def test_a_saturated_host_skips_the_apply_before_its_walks(self) -> None:
         """An agent host at load 21-29 (2026-11-23): the 15-minute `--pressure --idle --apply` pass ran at 74-86% CPU
         sizing trees its saturation halt then kept it from deleting. The halt is asked before the survey now."""

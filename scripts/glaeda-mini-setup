@@ -26,18 +26,18 @@ as operator steps instead. The one exception is the explicit --runner mode, whic
 GitHub Actions runner and is documented in docs/CMUX_MINI_RUNNER.md.
 
 What --apply installs (templated for the current user):
-    ~/.local/bin/glaeda-disk                   from scripts/glaeda-disk
+    ~/.local/bin/glaeda-disk, cmux-disk        from scripts/glaeda-disk, scripts/cmux-disk (cmux-disk is the primary name)
     ~/.local/bin/glaeda-worktree               canonical Projects/worktrees creator
     ~/.local/bin/glaeda-projects               dry-run/apply Projects tidy pass
     ~/.local/bin/disk-pressure.sh              one-shot launcher used by every mini's LaunchAgent
-    ~/.local/bin/glaeda-procs                  from scripts/glaeda-procs (why the Mac lags; --apply ends leaked fixtures)
+    ~/.local/bin/glaeda-procs, cmux-procs      from scripts/glaeda-procs and its primary name cmux-procs (why the Mac lags; --apply ends leaked fixtures)
     ~/.local/bin/glaeda-local-guard            from scripts/glaeda-local-guard (stops test and build runs orphaned by an
                                                agent session on a hygiene-only Mac, and on every Mac shell -c trees
                                                left under launchd that stopped using CPU)
     ~/.local/bin/glaeda-worktree-reclaim       built from src/bin/glaeda-worktree-reclaim.rs
     ~/.local/bin/glaeda-worktree-reclaim-all   from scripts/glaeda-worktree-reclaim-all
     ~/.local/bin/glaeda-fleet-cas-prune        from scripts/glaeda-fleet-cas-prune (a no-op without fleet-cas)
-    ~/.local/bin/glaeda-disk-registry          from scripts/glaeda-disk-registry (LRU eviction to config/disk-registry.toml's
+    ~/.local/bin/glaeda-disk-registry          and cmux-disk-registry, its primary name (LRU eviction to config/disk-registry.toml's
                                                budgets; a dry run without GLAEDA_DISK_REGISTRY=1)
     ~/.local/bin/glaeda-seed-prefetch          from scripts/glaeda-seed-prefetch (a no-op off an owned cmux runner)
     ~/.local/bin/glaeda-git-mirror             from scripts/glaeda-git-mirror (the runner mini's full cmux git mirror,
@@ -60,10 +60,10 @@ What --apply installs (templated for the current user):
     ~/.local/bin/glaeda-idle-repair            durable repair queue: records busy hosts and runs disk/health repairs on
                                                the first idle LaunchAgent tick
     ~/.local/bin/glaeda-update                 from scripts/glaeda-update (over-the-air updates every 10 min)
-    ~/.local/bin/glaeda-gh                     from scripts/glaeda-gh (shared GitHub CI watcher, the one poller)
+    ~/.local/bin/glaeda-gh, cmux-gh            from scripts/glaeda-gh, scripts/cmux-gh (shared GitHub CI watcher, the one poller; cmux-gh is the primary name)
     ~/.local/bin/glaeda-wallpaper-rotate       from scripts/glaeda-wallpaper-rotate (operator-supplied stills, every 30 minutes)
     ~/.local/bin/glaeda-runner-hygiene         from scripts/glaeda-runner-hygiene (root-installed per-account cache policy)
-    ~/.claude/skills/github-ci-wait/SKILL.md    from skills/github-ci-wait: tells agent sessions to wait with glaeda-gh
+    ~/.claude/skills/github-ci-wait/SKILL.md    from skills/github-ci-wait: tells agent sessions to wait with cmux-gh
     ~/.config/glaeda/lan-cache/config.json     on a macOS host with a GitHub Actions runner: glaeda-git-mirror's
                                                source {"schema": 1, "source": "direct"}, written once when absent
     ~/.config/glaeda/update.json               its release ring and source, written once (--ota-ring canary|stable,
@@ -199,6 +199,13 @@ DEVBOX_LINUX_UNITS = frozenset({"glaeda-projects-tidy.service", "glaeda-projects
 # pass, which acts only below the free-space floor (Leo, 2026-11-08: cleanup "on every machine ... this is what
 # glaeda is for"). For a host that runs agent lanes whose worktree reclaim is its own.
 GH_ONLY_TOOLS = ("glaeda-update", "glaeda-gh", "glaeda-disk", "disk-pressure.sh")
+# cmux-gh is glaeda-gh's primary name (Leo, 2026-11-25: "what if we start calling these cmux-gh?"). Installed beside
+# the tool it renames (scripts/cmux-gh, a shim that runs glaeda-gh beside it), so the old name keeps working for every caller, timer and skill. The service
+# labels, the LaunchAgent and the daemon's own command stay glaeda-gh: hosts have them loaded. cmux-disk, cmux-procs
+# and cmux-disk-registry are the same for their glaeda-* programs (Leo, 2026-11-25: "start migrating off glaeda and
+# into cmux-prefixed naming tooling"); the old names count their uses in ~/.local/state/cmux-names for retirement.
+TOOL_ALIASES = {"glaeda-gh": "cmux-gh", "glaeda-disk": "cmux-disk", "glaeda-procs": "cmux-procs",
+                "glaeda-disk-registry": "cmux-disk-registry"}
 PROFILE_FLAGS = ("--gh-only", "--hygiene-only")
 GH_ONLY_LINUX_UNITS = frozenset({"glaeda-update.service", "glaeda-update.timer", "glaeda-gh.service",
                                  "glaeda-disk-pressure.service", "glaeda-disk-pressure.timer"})
@@ -1582,6 +1589,10 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
         act = file_action(ctx, "tool", ctx.bin / name, (SCRIPT_DIR / name).read_bytes(), 0o755)
         act["source"] = os.fspath(SCRIPT_DIR / name)
         actions.append(act)
+        if name in TOOL_ALIASES and (SCRIPT_DIR / TOOL_ALIASES[name]).is_file():
+            alias = file_action(ctx, "tool", ctx.bin / TOOL_ALIASES[name], (SCRIPT_DIR / TOOL_ALIASES[name]).read_bytes(), 0o755)
+            alias["source"] = os.fspath(SCRIPT_DIR / TOOL_ALIASES[name])
+            actions.append(alias)
     # a copy, not a link: the release tree it came from is replaced by the next update
     for dest, source in ((skill_path(ctx), SKILL_SOURCE), (gh_policy_path(ctx), GH_POLICY_SOURCE),
                          *((intent_dir(ctx) / src.name, src) for src in INTENT_SOURCES)):
@@ -1810,6 +1821,8 @@ def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
                  "glaeda-seed-prefetch", "glaeda-git-mirror", "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health", "glaeda-idle-repair",
                  "glaeda-update", "glaeda-gh", "glaeda-wallpaper-rotate", "glaeda-daemon-heal", "glaeda-disk-registry"):
         actions.append({"kind": "tool", "path": os.fspath(ctx.bin / name)})
+        if name in TOOL_ALIASES:
+            actions.append({"kind": "tool", "path": os.fspath(ctx.bin / TOOL_ALIASES[name])})
     actions.append({"kind": "tool", "path": os.fspath(skill_path(ctx))})
     actions.append({"kind": "tool", "path": os.fspath(gh_policy_path(ctx))})
     actions.append({"kind": "tool", "path": os.fspath(daemon_policy_path(ctx))})

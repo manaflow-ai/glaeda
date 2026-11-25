@@ -1,5 +1,5 @@
 [Unit]
-Description=Shared GitHub CI watcher: the one process that polls GitHub for this user (glaeda-gh)
+Description=Shared GitHub CI watcher: the one process that polls GitHub for this user (cmux-gh, formerly glaeda-gh; the unit keeps its name)
 Wants=network-online.target
 After=network-online.target
 

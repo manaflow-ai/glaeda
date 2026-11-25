@@ -147,9 +147,10 @@ HEX64 = re.compile(r"[0-9a-f]{64}")
 MAX_EXTRACTED = 1024 * 1024 * 1024
 # what setup installs and a first update snapshots, so it can roll back without a previous release
 TOOLS = ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-runner-hygiene", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all",
-         "glaeda-fleet-cas-prune", "glaeda-seed-prefetch", "glaeda-git-mirror", "glaeda-idle-warm", "glaeda-mini-health", "glaeda-update", "glaeda-gh")
+         "glaeda-fleet-cas-prune", "glaeda-seed-prefetch", "glaeda-git-mirror", "glaeda-idle-warm", "glaeda-mini-health", "glaeda-update", "glaeda-gh",
+         "cmux-gh", "cmux-disk", "cmux-procs", "cmux-disk-registry")  # the cmux-* primary names (glaeda-mini-setup TOOL_ALIASES)
 # what a --gh-only host installs (glaeda-mini-setup GH_ONLY_TOOLS): its health and drift checks cover only these
-GH_ONLY_TOOLS = ("glaeda-update", "glaeda-gh", "glaeda-disk")
+GH_ONLY_TOOLS = ("glaeda-update", "glaeda-gh", "glaeda-disk", "cmux-gh", "cmux-disk")
 RELEASE_SCHEMA = "glaeda-release/v1"
 STATUS_PREFIX = "glaeda-ota/"
 MAX_ASSET = 200 * 1024 * 1024
@@ -721,8 +722,11 @@ def health(bin_dir: Path, channel_dir: Path, gh_only: bool = False) -> tuple[boo
     host installs only glaeda-gh, glaeda-update and glaeda-disk, so only those are checked there. (None, why) when a
     check timed out: a host too busy to start Python in 120 s says nothing about the release (cosmic-gray
     at load 200 quarantined r-20261022-e5ce794d9efd on `glaeda-disk --help`, 2026-10-22)."""
-    hygiene = [[sys.executable, str(bin_dir / "glaeda-disk"), "--help"]] if gh_only else [
-        [sys.executable, str(bin_dir / "glaeda-disk"), "--help"],
+    # cmux-disk is glaeda-disk's primary name (Leo, 2026-11-25): checking it runs both the shim and the program, and
+    # keeps this check off glaeda-disk's old-name use counter. A setup that installed no cmux-disk checks the old name.
+    disk = bin_dir / "cmux-disk" if (bin_dir / "cmux-disk").is_file() else bin_dir / "glaeda-disk"
+    hygiene = [[sys.executable, str(disk), "--help"]] if gh_only else [
+        [sys.executable, str(disk), "--help"],
         [sys.executable, str(bin_dir / "glaeda-worktree"), "--help"],
         [sys.executable, str(bin_dir / "glaeda-projects"), "--help"],
         [str(bin_dir / "glaeda-worktree-reclaim"), "--help"],
