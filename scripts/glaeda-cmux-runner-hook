@@ -789,6 +789,11 @@ FAST_JOBS = {("cmux-next.yml", "fast-tier")}
 # cmux-next-ios-kit.yml's link-ffi-fleet submits the CmuxMobileLinkFFI xcframework build (cmux-ci ios-build --what ffi)
 # for kit-tests, reads the FFI key from a blobless sparse checkout of scripts/ci and moves the result into the Actions
 # cache and an artifact; it waits at most 40 min. Its first run, 45528332604 on cmux#55285, was refused here.
+# cmux-next-iphone-clips.yml's record (the What's New clips, on each nightly-next push), cmux-next-ios-energy-nightly.yml's
+# bench (the nightly iPhone energy bench), cmux-next-stress-bench.yml's measure and chief-evals.yml's fleet-ab each
+# submit fleet steps with cmux-ci and wait, with no build here, on the same vars.CI_EVAL_STEP_GATEWAY label. The first
+# two were refused here and sat red on base: runs 45640200901 (job 139296705888) and 45640201089 (job 139296423266).
+# The other two run on that label and were missing as well.
 # GATEWAY_FLEET_SUFFIX: that was the fourth client refused on its first run (gallery, try-ahead, gestures, this), each
 # fixed by one more pair here after a red. A home-repository job id that ends in -fleet is the client contract
 # cmux already names its thin clients by (app-compile-fleet, fast-tier-fleet, swift-test-fleet ...; the bare job that
@@ -815,7 +820,9 @@ GATEWAY_JOBS = frozenset({("cmux-next.yml", "app-compile-fleet"), ("cmux-next.ym
                           ("cu-driver-eval.yml", "eval"), ("screen-stream-eval.yml", "eval"),
                           ("native-sidebar-gallery.yml", "capture"), ("cmux-next-tab-switch.yml", "frames"),
                           ("fleet-rd-host-macos.yml", "check"), ("cmux-next-ios-try-ahead.yml", "build-ahead"),
-                          ("cmux-next-ios-gestures.yml", "gestures"), ("cmux-next-ios-keyboard-motion.yml", "bench")})
+                          ("cmux-next-ios-gestures.yml", "gestures"), ("cmux-next-ios-keyboard-motion.yml", "bench"),
+                          ("cmux-next-iphone-clips.yml", "record"), ("cmux-next-ios-energy-nightly.yml", "bench"),
+                          ("cmux-next-stress-bench.yml", "measure"), ("chief-evals.yml", "fleet-ab")})
 GATEWAY_FLEET_SUFFIX = "-fleet"
 
 
@@ -8443,6 +8450,195 @@ LISTEN_CLAIM_HANDOFF_S = 30.0
 # side fit in #1715: a fast tier cancelled at 05:38:29Z, the next one taken at 05:38:31Z waited 23 minutes).
 JOB_ENDING = ".job-ending"
 
+# DRAIN_FREEZE_AT_END (2026-11-25): under RUNNER_DRAIN, job-completed itself freezes (SIGSTOP) the listener, while the
+# job's Runner.Worker still runs, so the listener cannot take the next job in the moment its Worker exits. The gate's
+# JOB_END_FREEZE wakes at that exit and freezes the listener then, which is a race with the listener's own reaction to
+# the same exit: glaeda#2809 moved the freeze ahead of the gate's /bin/ps look, but on a lent mini at load 100+ the
+# gate process can still be scheduled after the listener (a lent mini, 2026-11-25 19:59-20:03Z: runners took new
+# PR jobs 1-3 s after the last one ended under cmux-ci's RUNNER_DRAIN marker; 36 holds in 24 h started 0 steps).
+# job-completed runs inside the job, before the Worker's exit, so its freeze comes first by construction. Only the
+# Worker's own parent is frozen, and only when its command is this runner's Runner.Listener. The hook leaves
+# JOB_END_FROZEN (the listener, the Worker and its request) for the gate, which takes the frozen listener over once the
+# Worker has exited (Gate.adopt_job_end_freeze: the same state its own JOB_END_FREEZE leaves, so it stops the listener
+# or thaws it on that poll). A detached backstop (JOB_END_THAW) thaws a listener no gate took over within
+# JOB_END_THAW_ADOPT_S of the Worker's exit, and any listener still frozen JOB_END_THAW_WAIT_S after the hook, so the
+# listener never stays frozen past the job lock's renewal (a frozen listener renews nothing).
+JOB_END_FROZEN = ".job-end-frozen"
+JOB_END_THAW_WAIT_S = 240.0
+JOB_END_THAW_ADOPT_S = 30.0
+JOB_END_FROZEN_MAX_BYTES = 4096
+# The backstop, run detached with RUNNER_TRACKING_ID dropped (the runner's orphan cleanup must not end it): argv is
+# marker, listener pid, Worker pid, the wait for the Worker, the wait for the gate. It thaws only a listener the marker
+# still names, so it never signals a listener the gate took over (the gate removes the marker as it does).
+JOB_END_THAW = r"""
+import json, os, select, signal, subprocess, sys, time
+marker, listener, worker = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+wait_s, adopt_s = float(sys.argv[4]), float(sys.argv[5])
+def ours():
+    try:
+        with open(marker) as file:
+            return json.loads(file.read(4096)).get("listener") == listener
+    except Exception:
+        return False
+def ended():
+    try:
+        os.kill(worker, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    try:
+        stat = subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(worker)], stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=5, check=False).stdout.strip()
+    except Exception:
+        return False
+    return stat == "" or stat.startswith("Z")
+deadline = time.monotonic() + wait_s
+kq = None
+try:
+    kq = select.kqueue()
+    kq.control([select.kevent(worker, filter=select.KQ_FILTER_PROC, flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                              fflags=select.KQ_NOTE_EXIT)], 0, 0)
+except Exception:
+    kq = None
+while ours() and not ended() and time.monotonic() < deadline:
+    if kq is not None:
+        try:
+            kq.control(None, 1, min(5.0, max(0.0, deadline - time.monotonic())))
+        except Exception:
+            time.sleep(2)
+    else:
+        time.sleep(2)
+deadline = time.monotonic() + adopt_s
+while ours() and time.monotonic() < deadline:
+    time.sleep(0.5)
+if ours():
+    try:
+        os.unlink(marker)
+    except OSError:
+        pass
+    try:
+        os.kill(listener, signal.SIGCONT)
+    except OSError:
+        pass
+"""
+
+
+def job_end_frozen_doc(marker: Path) -> dict[str, Any] | None:
+    """JOB_END_FROZEN's record ({listener, worker, request, at}), or None: none, unreadable, or not that shape. A
+    job runs as this user, so the read is bounded the way runner_drain_doc's is. Never raises."""
+    try:
+        fd = os.open(marker, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        data = os.read(fd, JOB_END_FROZEN_MAX_BYTES + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    try:
+        doc = json.loads(data) if len(data) <= JOB_END_FROZEN_MAX_BYTES else None
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    listener, worker = doc.get("listener"), doc.get("worker")
+    if not (type(listener) is int and type(worker) is int and listener > 1 and worker > 1):
+        return None
+    return doc
+
+
+def runner_listener_of(runner_dir: Path, worker: int) -> int | None:
+    """The Runner.Listener of runner_dir that is the Worker's parent, or None. Two /bin/ps reads, never the job's
+    PATH; a failed read is None (nothing is frozen)."""
+    try:
+        ppid = int(subprocess.run(["/bin/ps", "-o", "ppid=", "-p", str(worker)], stdin=subprocess.DEVNULL,
+                                  capture_output=True, text=True, timeout=5, check=False).stdout.strip())
+        command = subprocess.run(["/bin/ps", "-o", "command=", "-p", str(ppid)], stdin=subprocess.DEVNULL,
+                                 capture_output=True, text=True, timeout=5, check=False).stdout.strip()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return ppid if ppid > 1 and runner_worker(runner_dir, command, "Listener") else None
+
+
+def freeze_listener_at_job_end(hook_dir: Path, worker: int | None, now: float | None = None) -> str | None:
+    """job-completed, last (DRAIN_FREEZE_AT_END): when this runner carries a live RUNNER_DRAIN, freeze its listener
+    before the Worker exits, record it for the gate (JOB_END_FROZEN) and start the backstop thaw. A note, or None
+    when nothing was frozen. Never raises: a freeze that cannot be made leaves the gate's own JOB_END_FREEZE."""
+    try:
+        runner_dir = hook_dir.parent
+        if worker is None or runner_drain(runner_dir, time.time() if now is None else now) is None:
+            return None
+        listener = runner_listener_of(runner_dir, worker)
+        if listener is None:
+            return None
+        request = None
+        with contextlib.suppress(OSError, ValueError):
+            request = listener_request(runner_dir)
+        marker = hook_dir / JOB_END_FROZEN
+        tmp = hook_dir / f"{JOB_END_FROZEN}.{os.getpid()}.tmp"
+        tmp.write_text(json.dumps({"listener": listener, "worker": worker, "request": request,
+                                   "at": round(time.time(), 3)}, separators=(",", ":")))
+        os.replace(tmp, marker)  # the record first: a gate never meets a frozen listener it has no record of
+        try:
+            os.kill(listener, signal.SIGSTOP)
+        except OSError as error:
+            with contextlib.suppress(OSError):
+                marker.unlink()
+            return f"could not freeze the listener (pid {listener}) at the job's end: {type(error).__name__}"
+        backstop = job_end_thaw_detached(marker, listener, worker)
+        return (f"froze the listener (pid {listener}) before its Worker exits: the runner is draining, so it takes "
+                f"no next job; the listener gate stops it ({backstop})")
+    except Exception as error:  # noqa: BLE001  (never fail the job on the drain's freeze)
+        return f"no freeze at the job's end: {type(error).__name__}"
+
+
+def job_end_thaw_detached(marker: Path, listener: int, worker: int) -> str:
+    """Start JOB_END_THAW detached (out of the runner's session, RUNNER_TRACKING_ID dropped, every inherited fd
+    closed), as disk_pressure_detached starts its pass. On a failed start, thaws the listener at once and removes the
+    marker: a frozen listener with no backstop would rely on the gate alone. Returns a note."""
+    env = {key: value for key, value in os.environ.items() if key != "RUNNER_TRACKING_ID"}
+    argv = [sys.executable, "-c", JOB_END_THAW, os.fspath(marker), str(listener), str(worker),
+            f"{JOB_END_THAW_WAIT_S:g}", f"{JOB_END_THAW_ADOPT_S:g}"]
+    try:
+        child = os.fork()
+    except OSError:
+        with contextlib.suppress(OSError):
+            marker.unlink()
+        with contextlib.suppress(OSError):
+            os.kill(listener, signal.SIGCONT)
+        return "no backstop could start, so the listener was thawed at once"
+    if child == 0:
+        try:
+            os.setsid()
+            with contextlib.suppress(OSError):
+                os.chdir("/")
+            # the middle process exits only once the backstop has exec'd (the close-on-exec end reads EOF), so no
+            # process with this job's RUNNER_TRACKING_ID is left for the runner's orphan cleanup
+            execd, execing = os.pipe()  # both close-on-exec
+            if os.fork():
+                os.close(execing)
+                with contextlib.suppress(OSError):
+                    select.select([execd], [], [], 10)
+                os._exit(0)
+            os.close(execd)
+            null = os.open(os.devnull, os.O_RDWR)
+            for std in (0, 1, 2):  # the runner reads the hook's output until EOF
+                os.dup2(null, std)
+            limit = os.sysconf("SC_OPEN_MAX")
+            limit = limit if limit > 0 else 65536
+            os.closerange(3, execing)
+            os.closerange(execing + 1, limit)
+            os.execve(sys.executable, argv, env)
+        finally:
+            os._exit(0)
+    with contextlib.suppress(OSError):
+        os.waitpid(child, 0)
+    return f"a backstop thaws it if no gate does within {JOB_END_THAW_ADOPT_S:g} s of the Worker's exit"
+
 
 def claims_room(scope: RunnerScope) -> bool:
     """Whether this runner's gate claims its room while listening and counts the others' claims (LISTEN_CLAIM): root,
@@ -13076,10 +13272,40 @@ class Gate:
         """One poll. Returns an exit code when the gate itself should exit. A listener frozen at its Worker's exit
         (JOB_END_FREEZE) is thawed when the poll returns, whatever it decided, a failed poll too."""
         try:
+            self.adopt_job_end_freeze()
             return self.poll()
         finally:
             self.thaw()
             self.publish()
+
+    def adopt_job_end_freeze(self) -> None:
+        """DRAIN_FREEZE_AT_END: take over the listener job-completed froze (JOB_END_FROZEN) once its Worker has
+        exited, as if nap() had frozen it at that exit (JOB_END_FREEZE): poll() then stops it if the runner still
+        drains, and step() thaws it either way. While the Worker still runs, the listener stays frozen and the record
+        stays. A record naming no listener of this gate's own tree and process group is left to its backstop. Never
+        raises."""
+        marker = self.runner_dir / "glaeda-hooks" / JOB_END_FROZEN
+        doc = job_end_frozen_doc(marker)
+        if doc is None:
+            return
+        listener, worker = doc["listener"], doc["worker"]
+        try:
+            if pid_alive(worker) and not self._zombie(worker):
+                return
+            if os.getpgid(listener) != os.getpgrp() or listener not in self.listener_list():
+                return
+        except Exception:  # noqa: BLE001
+            return
+        with contextlib.suppress(OSError):
+            marker.unlink()
+        self.frozen = self.frozen if listener in self.frozen else (*self.frozen, listener)
+        self.done = self.done if worker in self.done else (*self.done, worker)
+        self.listener_pids = self.listener_pids if listener in self.listener_pids else (*self.listener_pids, listener)
+        self.freeze_at_exit = True
+        request = doc.get("request")
+        if self.job_request is None and isinstance(request, str):
+            self.job_request = request
+        gate_log(f"the job's end froze the listener (pid {listener}) before its Worker exited: looking now")
 
     def live_line(self) -> str | None:
         """The gate line for what the gate does right now (gate_state_file), or None when it is between states (no
@@ -13317,9 +13543,16 @@ class Gate:
                     break
                 time.sleep(GATE_WATCH_S)
         if exited:
+            # Freeze first, then look (2026-11-25). The look below runs /bin/ps for each Worker still a zombie, which
+            # is every one its listener has not reaped yet; on a lent mini at load 100+ that spawn took longer than
+            # the listener's own reaction to the same exit, so the listener went Online and its poll took the next
+            # job before the freeze (cmuxs-mac-mini-6, 19:59-20:03Z: runners 1, 7, 10 and 13 each took a new PR
+            # job 1-3 s after the last one ended while every runner carried cmux-ci's RUNNER_DRAIN marker for an
+            # urgent simulator hold; no drain finished, so 36 holds in 24 h started 0 steps). Frozen, the listener
+            # cannot reap its Worker either, so the look still finds the zombie.
+            self.freeze()
             # the exited ones, so the next poll neither counts their zombies as a job nor waits on them again
             self.done = tuple(pid for pid in self.watching if not pid_alive(pid) or self._zombie(pid)) or self.watching
-            self.freeze()
 
     @staticmethod
     def _zombie(pid: int) -> bool:
@@ -16386,6 +16619,10 @@ def main(argv: list[str] | None = None) -> int:
         note = install_staged_hook(Path(__file__).resolve().parent)
         if note:
             print(f"{PREFIX}: {note}", flush=True)
+        hook_dir = Path(__file__).resolve().parent
+        if hook_dir.name == "glaeda-hooks" and args.capture_lease is None:  # DRAIN_FREEZE_AT_END, a runner's install
+            if note := freeze_listener_at_job_end(hook_dir, args.watch_pid or runner_worker_pid()):
+                print(f"{PREFIX}: {note}", flush=True)
     return 0
 
 

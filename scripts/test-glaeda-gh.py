@@ -9368,6 +9368,51 @@ class TickBudgetTest(Base):
         self.assertEqual(queries[1], ("head", [head]), queries)
         self.assertEqual([k for k, _ in queries].count("pr"), 3, queries)
 
+    def test_heads_asked_between_batches_wait_once_the_heads_share_is_spent_and_a_waited_pr_is_due(self) -> None:
+        """The land host, 2026-11-25: land-judge asked ~380 unanswered heads in 2 min, the look between every read batch
+        (post_between, batched) read one more head batch each time with no time bound, half the tick's stacks sat there,
+        and waited PRs went 77 min unread. Past the heads' share (REST_HEAD_BUDGET) with a waited PR due, once the tick
+        read a head, a look reads none: the heads asked meanwhile are deferred to the next tick and every PR is read."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800}}
+        self.daemon.batch = {**self.daemon.batch, "pr": 1, "head": 1}
+        for n in (1, 2, 3):
+            gg.register(f"pr:o/r#{n}", waited=True)
+        first = f"head:o/r@{'c' * 40}"
+        gg.register(first, consumer="land-judge")  # asked before the tick: the due phase reads it
+        self.daemon.paths = {**self.daemon.paths, "pr": "graphql", "head": "graphql"}
+        later = [f"head:o/r@{c * 40}" for c in "def"]
+        queries: list[tuple[str, list[str]]] = []
+
+        def fetch(kind):
+            def read(chunk):
+                if kind == "pr" and not any(k == "pr" for k, _ in queries):
+                    for key in later:  # asked while the tick reads its first PR
+                        gg.register(key, consumer="land-judge")
+                queries.append((kind, [e["key"] for e in chunk]))
+            return read
+
+        with mock.patch.object(gg, "HEADS_BETWEEN_EVERY", 0), mock.patch.object(gg, "REST_HEAD_BUDGET", -1), \
+                mock.patch.object(gg.Daemon, "graphql_fetch", new_callable=mock.PropertyMock,
+                                  return_value={k: fetch(k) for k in ("pr", "run", "comment", "head")}):
+            self.daemon.tick(NOW)
+        heads = [keys for kind, keys in queries if kind == "head"]
+        self.assertEqual(heads, [[first]], queries)
+        self.assertEqual([k for k, _ in queries].count("pr"), 3, queries)
+        for key in later:
+            self.assertNotIn(key, [k for _, keys in queries for k in keys], queries)
+
+    def test_past_the_heads_share_a_rest_look_stops_between_its_heads(self) -> None:
+        """The same bound over REST: a look that crosses the heads' share mid-look defers its other heads."""
+        self.daemon.head_until = 0.0  # spent (time.monotonic() is past it)
+        self.daemon.heads_between_read = 1
+        self.assertTrue(self.daemon.past_heads_share())
+        self.daemon.head_until = None  # no waited PR or run due: the looks keep only their own caps
+        self.assertFalse(self.daemon.past_heads_share())
+        self.daemon.head_until, self.daemon.heads_between_read = 0.0, 0
+        self.daemon.tick_asked = {}
+        self.assertFalse(self.daemon.past_heads_share(), "the tick's first head read is never held back")
+
     def test_a_head_whose_mtime_lags_the_ticks_wall_time_is_still_read_between_batches(self) -> None:
         """A lane VM, 2026-11-25: the test above failed one run in two on a loaded VM. Linux stamps a file's
         mtime from its coarse clock, up to a jiffy (measured 5.5 ms) behind time.time(), so a head asked just after
@@ -26129,6 +26174,7 @@ class LandWorld:
         self.envs: list[dict] = []
         self.gh_rc: dict[str, int] = {}
         self.gh_err: dict[str, str] = {}  # a refused step's stderr, by kind (default "<kind> refused")
+        self.gh_out: dict[str, str] = {}  # an answered step's stdout, by kind (default none)
         self.merged_on_merge = True
         self.view_state: str | None = None  # what a `pr view --json state,...` answers (None: OPEN, or MERGED after a merge)
         self.view_err: str | None = None  # a state read that fails, with these words
@@ -26247,7 +26293,8 @@ class LandWorld:
                                                                and words[3].endswith("/merge")) else "update" if "update-branch" in " ".join(words) \
                 else "rerun" if words[:2] == ["run", "rerun"] else "edit" if words[:2] == ["pr", "edit"] else "other"
             rc = self.gh_rc.get(kind, 0)
-            return subprocess.CompletedProcess(argv, rc, "", "" if rc == 0 else self.gh_err.get(kind, f"{kind} refused"))
+            return subprocess.CompletedProcess(argv, rc, self.gh_out.get(kind, "") if rc == 0 else "",
+                                               "" if rc == 0 else self.gh_err.get(kind, f"{kind} refused"))
         return subprocess.CompletedProcess(argv, 127, "", "unknown program")
 
     def explains(self) -> list[list[str]]:
@@ -28197,10 +28244,10 @@ class LandTest(Base):
         self.assertEqual(self.w.gh_calls("pr", "merge"), [])
 
     def test_a_pin_never_follows_a_push_land_judge_names_while_the_cache_has_no_read(self):
-        # The same, but LB's parents are not the pin: someone's push. It still stops on the pin refusal.
+        # The same, but LB's parents are not the pin: someone's push. It stops, head_moved at the first refusal now
+        # (repin_foreign_base_merge reads it is no base merge) and not "pin" after three.
         e = self.own_update_then_no_data([LC])
-        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "pin", LA))
-        self.assertIn("identical refusals in a row", e["stop"]["reason"])
+        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
         self.assertNotIn("repin_own_update", [h["event"] for h in e["history"]])
 
     def test_sha_pin_follows_an_update_that_timed_out_but_made_its_merge(self):
@@ -28355,6 +28402,50 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["pinSha"]), ("merged", LB))
         self.assertIn("repin_base_merge", [h["event"] for h in e["history"]])
         self.assert_merged_at(LB)
+
+    def foreign_merge_land_judge_names(self, parents: list, now: Any = "same") -> dict:
+        """Pinned at LA with the cache still showing LA (nothing read the new head), and land_judge, which reads the PR
+        live, names a repin to LB, a merge of the base nobody in this queue made (no update_branch was sent). LB's
+        commit read answers PARENTS. Judged until it stops or LB is judged; the entry. lw#8928, 2026-11-25."""
+        self.nudge_reads = False
+        self.pr(LA)
+        self.w.cache[self.KEY]["data"].update(baseRefName="main")
+        moved = {**self.PIN_DIFF, "d": "@@ -14,3 +14,4 @@ def f():\n w\n+y\n z"}
+        now = {"mb": self.LD, "files": [moved]} if now == "same" else now
+        self.w.api[f"repos/o/r/commits/{LB}"] = json.dumps(parents)
+        self.w.api[f"repos/o/r/compare/main...{LB}"] = json.dumps(now)
+        self.w.api[f"repos/o/r/compare/{self.LD}...{LA}"] = json.dumps({"mb": "e" * 40, "files": [self.PIN_DIFF]})
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
+        pin = refusal("pin", LA, {"kind": "repin", "sha": LB}, reason=f"land-judge: refused o/r 1: PR read head '{LB}' "
+                      f"does not match pinned head {LA}")
+        e = {}
+        for _ in range(gg.LAND_STREAK_STOP + 2):
+            self.w.answers.append(pin if e.get("pinSha", LA) == LA else ok_answer(LB))
+            e = self.tick(max(gg.LAND_NO_DATA_AFTER, gg.LAND_RETRY_MAX) + 1)
+            if e["state"] in ("stopped", "merged"):
+                break
+        return e
+
+    def test_a_pin_follows_a_base_merge_land_judge_names_while_the_cache_still_shows_the_pin(self):
+        # lw#8928 (cmux-cp-1) and cmux#53077: somebody merged main into the branch; land_judge read the new head, the
+        # cache still showed the pin, so the cached head never reached base_merge_check and the third identical "pin"
+        # refusal stopped the land for a person to re-request. The repin's head is read to be only a base merge.
+        e = self.foreign_merge_land_judge_names([LA, self.LD])
+        self.assertEqual((e.get("stop"), e["pinSha"]), (None, LB))
+        self.assertEqual([(h["was"], h["head"]) for h in e["history"] if h["event"] == "repin_base_merge"],
+                         [(LA[:12], LB[:12])])
+
+    def test_a_pin_stops_head_moved_at_once_on_a_push_land_judge_names_while_the_cache_still_shows_the_pin(self):
+        e = self.foreign_merge_land_judge_names([LC])
+        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
+        self.assertNotIn("identical refusals", e["stop"]["reason"])
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
+    def test_a_pin_never_follows_a_merge_that_changes_the_prs_diff_land_judge_names(self):
+        evil = {**self.PIN_DIFF, "d": "@@ -14,3 +14,5 @@ def f():\n w\n+y\n+backdoor()\n z"}
+        e = self.foreign_merge_land_judge_names([LA, self.LD], now={"mb": self.LD, "files": [evil]})
+        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
+        self.assertIn("more than a base merge", e["stop"]["reason"])
 
     def test_a_merge_that_changes_the_prs_own_diff_still_stops_head_moved(self):
         # an evil merge (a conflict resolution, or a change made in the merge commit) is not only a base merge
@@ -30161,6 +30252,52 @@ class LandTest(Base):
         self.assertIn("3 commit(s) behind main", e["stop"]["reason"])
         self.assertIn(f"gh pr update-branch 1 -R o/r --match-head-commit {LA}", e["stop"]["next"])
 
+    def queued_update_origin(self, main_path: str, attrs: str = "goals/*.md merge=union\n") -> tuple[str, str]:
+        """A real origin (union_origin, MAIN_PATH as there), the PR pinned at its head with base main, and the
+        update-branch answered the way the gh-quota shim answers a write it holds on the login's pace: exit 0 and
+        {"queued": true, ...}. GitHub's compare and the branch ref both still read the head, 3 behind."""
+        head, base = self.union_origin(attrs=attrs, main_path=main_path)
+        patch = mock.patch.object(gg, "LAND_MERGE_OWNERS", frozenset({"o"}))
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.w.set_pr(self.KEY, {**land_pr(head), "headRefName": "lane/x", "baseRefName": "main"}, self.t)
+        self.w.api["repos/o/r/compare/main..."] = json.dumps({"s": "diverged", "b": 3})
+        self.w.api["repos/o/r/git/ref/heads/lane/x"] = head
+        self.w.gh_out["update"] = json.dumps({"queued": True, "queue_id": "q1", "html_url": "",
+                                              "status_command": "glaeda-gh post status q1"})
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=head)
+        return head, base
+
+    def test_an_update_that_made_no_new_head_is_merged_here_and_the_land_goes_on(self):
+        # manaflow-ai/cmux#56724 and #56454, 2026-11-25 (LAND_UPDATE_LOCAL's comment): the shim queued the update-branch
+        # and answered exit 0; the head never moved within the wait and both stopped update_branch_no_new_head. The
+        # queue now makes the base merge itself, pushes it, and goes on at the new head.
+        head, base = self.queued_update_origin("goals/y.md")
+        e = self.run_hour(lambda: refusal("tip_merge", head, {"kind": "update_branch", "expected_head_sha": head}),
+                          seconds=gg.LAND_HEAD_TIMEOUT + 120, step=30.0)
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["before"]), ("waiting", "head_change", head),
+                         e.get("stop"))
+        updates = [c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
+        self.assertEqual(len(updates), 1)
+        merged = self.origin_git("rev-parse", "refs/heads/lane/x")
+        self.assertEqual(self.origin_git("rev-list", "--parents", "-n1", merged).split()[1:], [head, base])
+        self.assertIn("made no new head", self.origin_git("log", "-1", "--format=%B", merged))
+        self.assertEqual([h["event"] for h in e["history"] if h["event"] in ("base_merge_try", "union_merged")],
+                         ["base_merge_try", "union_merged"])
+        self.w.set_pr(self.KEY, {**land_pr(merged, parent=head), "headRefName": "lane/x", "baseRefName": "main"},
+                      self.t)
+        self.w.answers[:] = [ok_answer(merged)]
+        e = self.tick()
+        self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, merged))
+
+    def test_an_update_with_no_new_head_and_a_true_conflict_stops_conflict_with_its_hunks(self):
+        head, _ = self.queued_update_origin("", attrs="docs/*.md merge=union\n")  # same file, no union: a conflict
+        e = self.run_hour(lambda: refusal("tip_merge", head, {"kind": "update_branch", "expected_head_sha": head}),
+                          seconds=gg.LAND_HEAD_TIMEOUT + 120, step=30.0)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "conflict"), e.get("stop"))
+        self.assertIn("goals/x.md", e["stop"]["reason"])
+        self.assertEqual(self.origin_git("rev-parse", "refs/heads/lane/x"), head)  # nothing pushed
+
     def test_an_update_whose_new_head_the_reads_miss_waits_for_it_instead_of_stopping(self):
         # hq#26227, lw#11062, hq#26324, 2026-11-25: GitHub made the update's merge within seconds; the cache still read
         # the old head past LAND_HEAD_TIMEOUT and the land stopped "the update changed nothing". The branch ref says
@@ -30182,6 +30319,68 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "update_head_unread"))
         self.assertIn(f"made {LB[:12]}", e["stop"]["reason"])
         self.assertIn(f"--sha {LB}", e["stop"]["next"])
+
+    def update_tip_pr(self, parents: list[str], base_side: str = '{"s": "behind", "b": 0}') -> None:
+        """LA pinned, base main, the update-branch answered and GitHub's lane/x ref at LB, whose parents are PARENTS;
+        BASE_SIDE is the compare main...LC (LC: the base commit the update merged in). The PR reads stay at LA."""
+        self.pr(LA)
+        data = self.w.cache[self.KEY]["data"]
+        data["baseRefName"], data["headRefName"] = "main", "lane/x"
+        self.w.api[f"repos/o/r/compare/main...{LC}"] = base_side  # first: the fake answers the first prefix that fits
+        self.w.api["repos/o/r/compare/main..."] = json.dumps({"s": "diverged", "b": 3})
+        self.w.api["repos/o/r/git/ref/heads/lane/x"] = LB
+        self.w.api[f"repos/o/r/commits/{LB}"] = json.dumps(parents)
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
+
+    def test_an_update_tip_that_is_the_pin_merged_with_base_waits_and_the_pin_carries_to_it(self):
+        # manaflow-ai/cmux#53399, #55811, #53921, #53968, 2026-11-25 17:12Z-19:59Z: the queue's update-branch made a
+        # merge commit (first parent the pin, second on the base), GitHub's PR kept the old head, and the land stopped
+        # update_head_unread asking for `land --sha TIP` by hand; each hand re-pin stopped head_moved 300 s later. The
+        # tip is read now: its own clean base merge waits for the PR, with no stop and no hand step, and lands there.
+        self.update_tip_pr([LA, LC])
+        e = self.run_hour(lambda: refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}),
+                          seconds=gg.LAND_HEAD_TIMEOUT * 4, step=30.0)
+        self.assertEqual((e["state"], e["wait"]["kind"], e.get("stop")), ("waiting", "head_change", None))
+        clean = [h for h in e["history"] if h["event"] == "update_tip_clean"]
+        self.assertEqual([(h["head"], h["tip"]) for h in clean], [(LA[:12], LB[:12])])  # once, not every look
+        self.assertEqual((e["pinSha"], self.w.gh_calls("pr", "merge")), (LA, []))
+        # GitHub's PR shows the update's commit: pin_follow carries the pin by its first parent and it merges there.
+        self.pr(LB, parent=LA)
+        self.w.answers[:] = [ok_answer(LB)]
+        e = self.run_hour(lambda: ok_answer(LB), seconds=gg.LAND_HEAD_TIMEOUT, step=30.0)
+        self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, LB))
+        self.assert_merged_at(LB)
+
+    def test_an_update_tip_that_is_not_only_the_pin_merged_with_base_still_stops(self):
+        # The safety property: only the update's own clean base merge is carried. A commit pushed on the pin (one
+        # parent), a merge whose first parent is not the pin, or one whose second parent is not on the base all stop
+        # as before, naming the tip for a person to read; the pin stays and nothing merges.
+        for parents, base_side in (([LA], '{"s": "behind", "b": 0}'),
+                                   ([LC, LA], '{"s": "behind", "b": 0}'),
+                                   ([LA, LC], '{"s": "diverged", "b": 1}'),
+                                   ([LA, LC, LB], '{"s": "behind", "b": 0}')):
+            with self.subTest(parents=[p[:1] for p in parents], base=base_side):
+                self.w.api.clear()
+                self.update_tip_pr(parents, base_side)
+                e = self.run_hour(lambda: refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}),
+                                  seconds=gg.LAND_UPDATE_ONCE, step=30.0)
+                self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "update_head_unread", LA))
+                self.assertNotIn("update_tip_clean", [h["event"] for h in e["history"]])
+                self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+
+    def test_a_clean_update_tip_the_pr_never_shows_stops_naming_what_syncs_it(self):
+        # GitHub's PR for cmux#53921 still said 52aafe8c 2 h after its ref went to the update's ccc62452: a re-pin
+        # cannot help there. Past LAND_PR_SYNC_MAX the stop says so, and names what makes GitHub sync the PR.
+        self.update_tip_pr([LA, LC])
+        start = self.t
+        e = self.run_hour(lambda: refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}),
+                          seconds=gg.LAND_PR_SYNC_MAX * 2, step=30.0)
+        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "pr_head_unsynced", LA))
+        self.assertGreaterEqual(self.t - start, gg.LAND_PR_SYNC_MAX)
+        self.assertLess(self.t - start, gg.LAND_PR_SYNC_MAX + 2 * gg.LAND_HEAD_TIMEOUT)
+        self.assertIn("gh pr reopen 1 -R o/r", e["stop"]["next"])
+        self.assertIn(f"--sha {LB}", e["stop"]["next"])
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
 
     def test_an_update_the_head_already_holds_is_judged_again_at_once(self):
         # The head already holds its base (behind by 0): the update had nothing to merge, so the PR is judged again
@@ -32068,17 +32267,141 @@ class LandTest(Base):
         self.assertEqual(gg.land_retarget_args("o/r", "3", "main", True), ["pr", "edit", "3", "-R", "o/r", "--base",
                                                                            "main"])
 
-    def test_a_union_merge_whose_fetch_failed_is_tried_again_by_a_re_land_at_the_same_head(self):
-        """A fetch that fails decided nothing about the head: the stop says why, and a re-land at that head merges."""
+    def test_a_union_merge_whose_fetch_failed_is_tried_again_after_a_backoff_at_the_same_head(self):
+        """A fetch that fails decided nothing about the head: no stop, a backoff, and the retry at that head merges."""
         head, base = self.union_origin()
         with mock.patch.object(gg, "LAND_UNION_URL", f"file://{self.tmp.name}/no-such-origin"):
             e = self.union_conflict_tick(head)
-        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "update_branch_conflict"))
-        self.assertIn("the fetch of main and lane/x failed", e["stop"]["reason"])
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "retry"), e.get("stop"))
+        self.assertIsNone(e.get("stop"))
+        self.assertIn("the fetch of main and lane/x failed", e["wait"]["why"])
         self.assertNotIn("unionMerge", e)
-        e = self.union_conflict_tick(head)
+        self.w.answers.append(refusal("stale_green", head, {"kind": "update_branch", "expected_head_sha": head}))
+        e = self.tick(gg.LAND_STEP_BACKOFF + 1)
         self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"), e.get("stop"))
         self.assertEqual(self.origin_git("rev-list", "--parents", "-n1", "refs/heads/lane/x").split()[1:], [head, base])
+
+    def union_unread_tick(self, head: str, refresh: Any) -> dict:
+        """As union_conflict_tick, except this host has never read the PR's branch or base (its first full read still
+        in flight, as it was for leo-workspace#10571): REFRESH is the read the step makes of its own."""
+        patch = mock.patch.object(gg, "LAND_MERGE_OWNERS", frozenset({"o"}))
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.w.set_pr(self.KEY, land_pr(head), self.t)  # no headRefName/baseRefName: nothing has read them here
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=head)
+        self.w.gh_rc["update"] = 1
+        self.w.gh_err["update"] = self.CONFLICT_REFUSAL
+        self.w.answers.append(refusal("stale_green", head, {"kind": "update_branch", "expected_head_sha": head}))
+        self.q.refresh = refresh
+        return self.tick()
+
+    def test_a_union_merge_reads_the_prs_branch_itself_when_this_host_never_read_the_pr(self):
+        """One land queue, 2026-11-25: 46 of 127 stopped land rows were conflict stops and 41 named no file, because the base
+        merge read the PR's branch and base only from this host's cache. leo-workspace#10571 stopped in the same
+        second its first full read landed, #10649 and #10864 minutes before theirs. The step reads the PR itself."""
+        head, base = self.union_origin()
+
+        def refresh(key: str) -> None:
+            self.w.refreshed.append(key)
+            self.w.set_pr(key, {**land_pr(head), "headRefName": "lane/x", "baseRefName": "main"}, self.t)
+            return None
+        e = self.union_unread_tick(head, refresh)
+        self.assertEqual(self.w.refreshed, [self.KEY])
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["before"]), ("waiting", "head_change", head),
+                         e.get("stop"))
+        merged = self.origin_git("rev-parse", "refs/heads/lane/x")
+        self.assertEqual(self.origin_git("rev-list", "--parents", "-n1", merged).split()[1:], [head, base])
+
+    def test_a_union_merge_whose_own_read_names_no_branch_says_so_and_is_tried_again(self):
+        """An unread PR decided nothing about the head: the step waits and names this host's missing read and the
+        read's own reason (before: "the PR's branch '' or base '' is not read or not a plain branch name", a
+        terminal stop naming no file), and a re-land once the read landed merges."""
+        head, base = self.union_origin()
+        reads: list[str] = []
+
+        def refresh(key: str) -> str:
+            reads.append(key)
+            return "a read gh refused"
+        e = self.union_unread_tick(head, refresh)
+        # the merged transient path (main, base_merge): no verdict at all, a backoff, and the reason names the read
+        self.assertIsNone(e.get("stop"))
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "retry"))
+        self.assertEqual((e["stepTransient"]["kind"], e["stepTransient"]["count"]), ("base_merge", 1))
+        again = self.q.branch_base(e, head)  # the bound: one read of its own per head, never a read a judgment
+        self.assertEqual((again[0], again[1], again[3]), ("", "", True))
+        self.assertIn("the one read this step makes per head named no branch", again[2])
+        self.assertEqual(reads, [self.KEY])
+        self.assertIn("o/r#1's branch and base could not be read from this host", e["wait"]["why"])
+        self.assertIn("a read gh refused", e["wait"]["why"])
+        self.assertNotIn("unionMerge", e)
+        # the read lands, the backoff ends, and the same head's merge goes through: nothing was decided against it
+        self.w.set_pr(self.KEY, {**land_pr(head), "headRefName": "lane/x", "baseRefName": "main"}, self.t)
+        self.w.answers.append(refusal("stale_green", head, {"kind": "update_branch", "expected_head_sha": head}))
+        e = self.tick(gg.LAND_STEP_BACKOFF + 1)
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"), e.get("stop"))
+        self.assertEqual(self.origin_git("rev-list", "--parents", "-n1", "refs/heads/lane/x").split()[1:],
+                         [head, base])
+
+    def test_a_stacked_rebase_of_a_pr_this_host_never_read_refuses_the_step_not_the_branch_name(self):
+        """The same unread cache in the sibling step: a refused step (the base unchanged, named again next judgment),
+        never a refusal blaming the PR's own branch name."""
+        sha = self.stacked_origin()
+        owners = mock.patch.object(gg, "LAND_MERGE_OWNERS", frozenset({"o"}))
+        owners.start()
+        self.addCleanup(owners.stop)
+        self.w.set_pr(self.KEY, land_pr(sha["b"]), self.t)  # no headRefName/baseRefName here either
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=sha["b"])
+        self.w.answers.append(refusal("stacked_base", sha["b"], {"kind": "retarget", "base": "main"}))
+        self.q.refresh = lambda key: "a read gh refused"
+        e = self.tick()
+        self.assertEqual(self.retargets(), [])
+        failed = [h for h in e["history"] if h["event"] == "stacked_rebase_failed"]
+        self.assertEqual(len(failed), 1, e.get("history"))
+        self.assertIn("o/r#1's branch and base could not be read from this host", failed[0]["why"])
+        self.assertEqual(self.origin_git("rev-parse", "refs/heads/stack/b"), sha["b"])  # nothing pushed
+
+    def judge_conflict_refusal(self, head: str) -> None:
+        self.w.answers.append(refusal("conflicts_base", head, {"kind": "stop", "stop": "conflict",
+                                                               "why": self.JUDGE_CONFLICT_NEXT},
+                                      nxt=self.JUDGE_CONFLICT_NEXT))
+
+    def test_a_judge_conflict_whose_fetch_failed_backs_off_and_merges_on_the_retry(self):
+        """cmux#50870 (three times), #49337, #49338, 2026-11-25: land_judge read conflicts_base, the base merge's fetch
+        timed out (~300 s), and the land stopped "conflict" with next: none, never retried, with no conflict at all.
+        A fetch that fails is transient: the entry waits a backoff, and the next judgment tries the merge again."""
+        head, base = self.union_origin()
+        with mock.patch.object(gg, "LAND_UNION_URL", f"file://{self.tmp.name}/no-such-origin"):
+            e = self.judge_conflict_tick(head)
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "retry"), e.get("stop"))
+        self.assertIsNone(e.get("stop"))
+        self.assertIn("the fetch of main and lane/x failed", e["wait"]["why"])
+        self.assertEqual(e["wakeAt"] - self.t, gg.LAND_STEP_BACKOFF)
+        self.assertEqual((e["stepTransient"]["kind"], e["stepTransient"]["count"]), ("base_merge", 1))
+        self.assertFalse([c for c in self.w.sent() if "stopped" in c[-1]], self.w.sent())
+        self.assertEqual(self.origin_git("rev-parse", "refs/heads/lane/x"), head)  # nothing pushed
+        # the backoff ends, the judgment is the same, and now the fetch works: merged here, the land goes on
+        self.judge_conflict_refusal(head)
+        e = self.tick(gg.LAND_STEP_BACKOFF + 1)
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"), e.get("stop"))
+        self.assertEqual(self.origin_git("rev-list", "--parents", "-n1", "refs/heads/lane/x").split()[1:], [head, base])
+        self.assertEqual(len([h for h in e["history"] if h["event"] == "base_merge_try"]), 2)
+
+    def test_a_base_merge_that_keeps_failing_doubles_its_backoff_and_stops_transient_never_conflict(self):
+        head, _ = self.union_origin()
+        with mock.patch.object(gg, "LAND_UNION_URL", f"file://{self.tmp.name}/no-such-origin"), \
+                mock.patch.object(gg, "LAND_RETRY_STREAK_STOP", 3):
+            e = self.judge_conflict_tick(head)
+            self.assertEqual(e["wakeAt"] - self.t, gg.LAND_STEP_BACKOFF)
+            self.judge_conflict_refusal(head)
+            e = self.tick(gg.LAND_STEP_BACKOFF + 1)
+            self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "retry"), e.get("stop"))
+            self.assertEqual(e["wakeAt"] - self.t, 2 * gg.LAND_STEP_BACKOFF)
+            self.judge_conflict_refusal(head)
+            e = self.tick(2 * gg.LAND_STEP_BACKOFF + 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "base_merge_transient"))
+        self.assertTrue(gg.LAND_REARM_CODES.match("base_merge_transient"))  # re-armed by itself
+        self.assertIn("never for a conflict", e["stop"]["reason"])
+        self.assertEqual(self.origin_git("rev-parse", "refs/heads/lane/x"), head)
 
     def test_a_union_merge_a_restart_dropped_before_it_ran_is_tried_at_the_next_refusal(self):
         """cmux#51491, 2026-11-23: GitHub refused its update-branch at 99deda46, the queue planned the base merge, and
@@ -32197,7 +32520,7 @@ class LandTest(Base):
         self.assertEqual(self.origin_git("rev-list", "--parents", "-n1", merged).split()[1:], [head, base])
         self.assertEqual(len(self.w.gh_calls("pr", "view", "1", "-R", "o/r", "--json", "headRefName,baseRefName")), 1)
 
-    def test_a_judge_conflict_whose_ref_names_cannot_be_read_stops_saying_so_and_retries(self):
+    def test_a_judge_conflict_whose_ref_names_cannot_be_read_backs_off_and_retries(self):
         head, _ = self.union_origin(main_path="goals/y.md")
         patch = mock.patch.object(gg, "LAND_MERGE_OWNERS", frozenset({"o"}))
         patch.start()
@@ -32208,7 +32531,7 @@ class LandTest(Base):
                                                                "why": self.JUDGE_CONFLICT_NEXT},
                                       nxt=self.JUDGE_CONFLICT_NEXT))
         e = self.tick()
-        self.assertEqual(e["state"], "stopped")
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "retry"), e.get("stop"))
         self.assertIn("could not be read", " ".join(h.get("why", "") for h in e["history"]))
         self.assertNotIn("unionMerge", e)  # decided nothing: a re-land at this head tries the merge again
         self.assertEqual(self.origin_git("rev-parse", "refs/heads/lane/x"), head)
