@@ -1757,8 +1757,23 @@ class ControllerTest(Base):
             self.daemon.tick(NOW + 2 * gg.CONTROLLER_RETRY)
             self.assertEqual(len(run_timeouts), 2, "the intermediate tick reads from the fallback")
             self.assertTrue(self.gh.rest_calls())
-            with mock.patch.object(self.daemon, "controller_room", side_effect=[True, False]):
+            # The feed (every page of it, the status feed included) answers; the tick's budget then has no room
+            # left for the run baseline. Keyed off the feed read, not a call count: a new controller_room caller
+            # inside the feed must not shift the answer onto the run probe.
+            feed_read = False
+            real_read_feed = self.daemon.read_feed
+
+            def read_feed():
+                nonlocal feed_read
+                try:
+                    return real_read_feed()
+                finally:
+                    feed_read = True
+
+            with mock.patch.object(self.daemon, "read_feed", side_effect=read_feed), \
+                    mock.patch.object(self.daemon, "controller_room", side_effect=lambda *_a, **_k: not feed_read):
                 self.daemon.tick(NOW + 3 * gg.CONTROLLER_RETRY)
+            self.assertTrue(feed_read)
             self.assertEqual(self.daemon.controller_failures, 2, "no room left to probe the run endpoint")
             healthy = True
             self.daemon.tick(NOW + 3 * gg.CONTROLLER_RETRY + 1)

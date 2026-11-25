@@ -6682,7 +6682,9 @@ class GlaedaDiskTest(unittest.TestCase):
                          [idle + "killed-job-scratch", idle + "leftover.tar"])
         with mock.patch.object(gd, "command_lines",
                                lambda: f"{home}/actions-runner-glaeda/bin/Runner.Worker spawnclient 1 2\n"):
-            self.assertTrue(gd.runner_job_live(gd.runner_temp_runner(fams[0]), gd.command_lines()))
+            # by name: default_families lists runners in HOME.glob's directory order, which the filesystem picks
+            glaeda = next(f for f in fams if gd.runner_temp_runner(f).name == "actions-runner-glaeda")
+            self.assertTrue(gd.runner_job_live(gd.runner_temp_runner(glaeda), gd.command_lines()))
 
     @twelve_hour_ages
     def test_stale_runner_checkouts_go_above_the_floor_and_without_one(self) -> None:
