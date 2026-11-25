@@ -119,6 +119,57 @@ class RefusalTest(unittest.TestCase):
                 self.assertIsNotNone(why)
                 self.assertIn("signing job", why)
 
+    def test_rc_branch_nightly_jobs_are_admitted(self):
+        # RC_NIGHTLY: rc/* is admin-only on manaflow-ai/cmux (cmux run 45582463917 was refused before this).
+        for ref in ("refs/heads/rc/cmux-next-dry-1", "refs/heads/rc/v1.0.0", "refs/heads/rc/cnx-ios-builder"):
+            for name in ("runner-preflight", "decide", "build-nightly-app", "pick-nightly-sign-runner"):
+                with self.subTest(ref=ref, job=name):
+                    self.assertIsNone(self.why(**job(name, ref=ref)))
+
+    def test_rc_branch_refuses_what_main_refuses(self):
+        rc = "refs/heads/rc/cmux-next-dry-1"
+        cases = {
+            "nightly.yml from another ref": job("decide", ref=rc, workflow_ref_branch="refs/heads/feature"),
+            "another workflow": job("swift-tests", workflow="ci.yml", ref=rc),
+            "a dispatch": job("decide", ref=rc, event_name="workflow_dispatch"),
+            "a payload with a pull request": job("decide", ref=rc, pull_request={"number": 1}),
+            "another repository": job("decide", ref=rc, repository="manaflow-ai/other"),
+            "a payload ref that differs": dict(job("decide", ref=rc), event={"repository": {"full_name": REPO},
+                                                                              "ref": "refs/heads/feature"}),
+            "rc without a name": job("decide", ref="refs/heads/rc/", workflow_ref_branch="refs/heads/rc/"),
+            "a lookalike prefix": job("decide", ref="refs/heads/rcx/a", workflow_ref_branch="refs/heads/rcx/a"),
+            "a dot-dot name": job("decide", ref="refs/heads/rc/a..b", workflow_ref_branch="refs/heads/rc/a..b"),
+        }
+        for name, case in cases.items():
+            with self.subTest(name):
+                self.assertIsNotNone(self.why(**case))
+
+    def test_rc_signing_jobs_keep_their_exclusive_route_here_and_take_the_trusted_signer(self):
+        rc = "refs/heads/rc/cmux-next-dry-1"
+        for workflow, name in hook.SIGNING_JOBS:
+            if workflow != "nightly.yml":
+                continue
+            with self.subTest(job=name):
+                case = job(name, ref=rc)
+                why = self.why(**case)
+                self.assertIsNotNone(why)
+                self.assertIn("signing job", why)
+                self.assertIsNone(hook.trusted_refusal(case["event_name"], rc, REPO, case["event"], "refs/heads/main",
+                                                       REPO, trusted_next_signing=True,
+                                                       workflow_ref=case["workflow_ref"], job=name, run_attempt="1"))
+        light = job("decide", ref=rc)
+        self.assertIsNotNone(hook.trusted_refusal("push", rc, REPO, light["event"], "refs/heads/main", REPO,
+                                                  trusted_next_signing=True, workflow_ref=light["workflow_ref"],
+                                                  job="decide", run_attempt="1"))
+        sign = job("build-sign-notarize-nightly", ref=rc)
+        # a trusted main runner that is not the NEXT signer still refuses rc/*
+        self.assertIsNotNone(hook.trusted_refusal("push", rc, REPO, sign["event"], "refs/heads/main", REPO,
+                                                  workflow_ref=sign["workflow_ref"], job=sign["job"], run_attempt="1"))
+        # and a pull request payload never passes as rc
+        self.assertIsNotNone(hook.trusted_refusal("push", rc, REPO, dict(sign["event"], pull_request={"number": 1}),
+                                                  "refs/heads/main", REPO, trusted_next_signing=True,
+                                                  workflow_ref=sign["workflow_ref"], job=sign["job"], run_attempt="1"))
+
     def test_classic_auto_resume_key_free_jobs_are_admitted(self):
         # ONE_MINI_NIGHTLY, AUTO_RESUME: main's auto-resume-nightly-notarization.yml after main's nightly.yml run on
         # main (workflow_run), or its dispatch from main: the two jobs that hold no key (preflight, verify-stapled)

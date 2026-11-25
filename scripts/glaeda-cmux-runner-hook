@@ -3459,6 +3459,14 @@ def trusted_refusal(event_name: str | None, ref: str | None, repository: str | N
         return ("untrusted: NEXT nightly needs its exact nightly.yml "
                 + " or ".join(filter(None, ("build-nightly-app push on attempt 1" if trusted_next_nightly else "",
                                             "signing job push or dispatch" if trusted_next_signing else ""))))
+    if trusted_next_signing and rc_nightly_push(event_name, ref, repository, event, workflow_ref):
+        # RC_NIGHTLY: an rc/* push of cmux's nightly.yml (Classic RC and the cmux-next RC). rc/* branches are
+        # admin-only on manaflow-ai/cmux (ruleset "rc branches: admin only"), so their nightly.yml is reviewed code
+        # like main's; the signing runner takes only nightly.yml's own signing jobs from it. Without this every rc/*
+        # run stopped at runner-preflight once the nightly left Blacksmith (cmux run 45582463917, 2026-11-25).
+        if ("nightly.yml", job) in SIGNING_JOBS:
+            return None
+        return "untrusted: an rc/* run takes this runner only for nightly.yml's signing jobs"
     if hq_dispatch:
         workflow_path, _, workflow_at = (workflow_ref or "").partition("@")
         if not (ref == trusted_ref and event.get("ref") == trusted_ref and workflow_at == trusted_ref
@@ -3561,6 +3569,21 @@ def dev_compile_refusal(event_name: str | None, ref: str | None, repository: str
 # admitted on a mini ahead of every PR, DEV and side job and may use any reserve, and no new PR job starts on a mini
 # where a nightly job waits."
 NIGHTLY_REFS = ("refs/heads/nightly-next", "refs/heads/main")
+# RC_NIGHTLY: cmux's release-candidate branches (rc/<name>), admin-only on manaflow-ai/cmux.
+RC_NIGHTLY_REF = re.compile(r"refs/heads/rc/[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*")
+
+
+def rc_nightly_push(event_name: str | None, ref: str | None, repository: str | None, event: Any,
+                    workflow_ref: str | None) -> bool:
+    """Whether this is a push to an rc/* branch of manaflow-ai/cmux running that same ref's own nightly.yml. Pure."""
+    if event_name != "push" or not isinstance(ref, str) or not RC_NIGHTLY_REF.fullmatch(ref) or ".." in ref:
+        return False
+    if not isinstance(event, dict) or any(key in event for key in UNTRUSTED_PAYLOAD_KEYS):
+        return False
+    repos = {(repository or "").lower(), (_repo_name(event.get("repository")) or "").lower()}
+    return repos == {"manaflow-ai/cmux"} and event.get("ref") == ref and workflow_ref == f"{NIGHTLY_WORKFLOW}@{ref}"
+
+
 NIGHTLY_EVENTS = ("push", "schedule", "workflow_dispatch")
 NIGHTLY_WORKFLOW = "manaflow-ai/cmux/.github/workflows/nightly.yml"
 DEV_DAILY_WORKFLOW_PATH = f"manaflow-ai/cmux/.github/workflows/{DEV_DAILY_WORKFLOW}"
