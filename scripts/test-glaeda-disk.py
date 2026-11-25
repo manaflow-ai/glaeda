@@ -6650,7 +6650,10 @@ class GlaedaDiskTest(unittest.TestCase):
                          [idle + "killed-job-scratch", idle + "leftover.tar"])
         with mock.patch.object(gd, "command_lines",
                                lambda: f"{home}/actions-runner-glaeda/bin/Runner.Worker spawnclient 1 2\n"):
-            self.assertTrue(gd.runner_job_live(gd.runner_temp_runner(fams[0]), gd.command_lines()))
+            for fam in fams:
+                runner = gd.runner_temp_runner(fam)
+                self.assertEqual(bool(gd.runner_job_live(runner, gd.command_lines())),
+                                 runner == home / "actions-runner-glaeda")
 
     @twelve_hour_ages
     def test_stale_runner_checkouts_go_above_the_floor_and_without_one(self) -> None:
