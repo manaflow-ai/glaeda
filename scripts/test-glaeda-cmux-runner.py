@@ -6260,13 +6260,15 @@ time.sleep(60)
         for busy in ("/Applications/Xcode_26.6.app/Contents/Developer/usr/bin/xctest /x/a.xctest",
                      "/usr/bin/xcodebuild test-without-building -xctestrun a", "xcodebuild -scheme cmux test"):
             self.assertIsNotNone(hook.XCTEST_RUNNING.search(busy), busy)
-        daemon, root = (4242, os.getuid(), "Ss", hook.TESTMANAGERD), (4243, 0, "Ss", hook.TESTMANAGERD)
+        uid = 501
+        daemon, root = (4242, uid, "Ss", hook.TESTMANAGERD), (4243, 0, "Ss", hook.TESTMANAGERD)
 
         def recycle(*tables, error=None):
             """recycle_testmanagerd against ps tables in turn (the last repeats), with os.kill recorded."""
             seq = list(tables)
             ps = mock.Mock(side_effect=error or (lambda: seq.pop(0) if len(seq) > 1 else seq[0]))
             with mock.patch.object(hook, "_ps_table", ps), mock.patch.object(hook.os, "kill") as kill, \
+                    mock.patch.object(hook.os, "getpid", return_value=4241), mock.patch.object(hook.os, "getuid", return_value=uid), \
                     mock.patch.object(hook, "TESTMANAGERD_TERM_S", 0.3), mock.patch.object(hook, "TESTMANAGERD_KILL_S", 0.3):
                 return hook.recycle_testmanagerd(), [c.args for c in kill.call_args_list]
 
@@ -6275,12 +6277,12 @@ time.sleep(60)
         self.assertEqual(note, f"{hook.TESTMANAGERD_STUCK}: pid 4242 outlived SIGKILL")
         self.assertEqual(kills, [(4242, term), (4242, kill)], "only this user's daemon")
         # a zombie is gone: an impostor whose parent never reaps it cannot make the mini refuse every job
-        self.assertEqual(recycle([daemon], [(4242, os.getuid(), "Z", hook.TESTMANAGERD)])[0],
+        self.assertEqual(recycle([daemon], [(4242, uid, "Z", hook.TESTMANAGERD)])[0],
                          "testmanagerd: stopped pid 4242")
-        self.assertEqual(recycle([daemon], [(4242, os.getuid(), "SE", hook.TESTMANAGERD)])[0],
+        self.assertEqual(recycle([daemon], [(4242, uid, "SE", hook.TESTMANAGERD)])[0],
                          "testmanagerd: stopped pid 4242", "exiting (macOS ps E) counts as gone")
         # a test that starts while it ignores SIGTERM keeps it: no SIGKILL under a live run
-        note, kills = recycle([daemon], [daemon, (7, os.getuid(), "S", "/x/usr/bin/xctest /x/a.xctest")])
+        note, kills = recycle([daemon], [daemon, (7, uid, "S", "/x/usr/bin/xctest /x/a.xctest")])
         self.assertEqual(note, "testmanagerd: kept pid 4242 (ignored SIGTERM; a test started)")
         self.assertEqual(kills, [(4242, term)])
         self.assertEqual(recycle([], error=ValueError("bad bytes"))[0], "testmanagerd: not checked (ValueError)")
