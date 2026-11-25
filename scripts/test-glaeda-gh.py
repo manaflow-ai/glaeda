@@ -7294,6 +7294,80 @@ class OverloadTest(Base):
         self.assertFalse(self.daemon.gql_down())
         self.assertTrue(all(gg.read_cache(k)["data"] for k in keys))
 
+    def check_waited_pr_timeout_tick(self, status: int) -> None:
+        keys = self.watch(40)
+        waited = keys[:10]
+        self.daemon.now = NOW - 86 * 60
+        for key in waited:
+            gg.register(key, waited=True, reader=f"tool:{gg.LAND_TAG}")
+            n = int(key.split("#")[1])
+            self.daemon.store(key, None, data=gg.parse_pr(pr_node(n)), dataAt=self.daemon.now)
+            self.gh.prs[("o", "r", n)]["title"] = f"new title {n}"
+
+        elapsed = 0.0
+        failed = []
+        remaining = self.gh.graphql_remaining
+
+        def transport(method, url, headers, body):
+            nonlocal elapsed
+            doc = json.loads(body) if url.endswith("/graphql") else {}
+            if "pullRequest(number:" in doc.get("query", ""):
+                failed.append([v for k, v in doc["variables"].items() if k.startswith("n")])
+                elapsed += 10.5
+                self.gh.graphql_remaining -= 1  # the simulated provider bills one point per failed request
+                return status, self.gh.rate("graphql", self.gh.graphql_remaining), b"{}"
+            elapsed += 0.05
+            return self.gh(method, url, headers, body)
+
+        self.daemon.transport = transport
+        with mock.patch.object(gg.time, "monotonic", lambda: elapsed):
+            self.daemon.tick(NOW)
+        cached = [gg.read_cache(k) for k in waited]
+        points = remaining - self.gh.graphql_remaining
+        age = NOW + elapsed - min(c["dataAt"] for c in cached)
+        self.assertEqual((len(failed), points), (1, 1), f"{failed=}, oldest waited PR {age:.1f}s")
+        self.assertEqual(self.daemon.gql_minute_points(), points)
+        self.assertLess(age, gg.TICK_BUDGET)
+        self.assertEqual([c["data"]["title"] for c in cached], [f"new title {n}" for n in range(1, 11)])
+
+    def test_land_waited_prs_reach_rest_on_a_slow_502(self) -> None:
+        self.check_waited_pr_timeout_tick(502)
+
+    def test_land_waited_prs_reach_rest_on_a_504(self) -> None:
+        self.check_waited_pr_timeout_tick(504)
+
+    def test_waited_timeout_rest_fallback_is_only_for_its_repo_and_tick(self) -> None:
+        keys = self.watch(3)
+        gg.register(keys[0], waited=True)
+        gg.register("pr:o/healthy#99")
+        self.gh.prs[("o", "healthy", 99)] = pr_node(99)
+
+        queried = []
+        def answer(prs):
+            queried.append(prs)
+            return (504, b"{}") if 1 in prs else None
+
+        self.transport(answer)
+        self.daemon.tick(NOW)
+        self.assertEqual(queried, [[1], [99]])
+        self.assertTrue(all(gg.read_cache(k)["dataAt"] == NOW for k in [*keys, "pr:o/healthy#99"]))
+
+        queried.clear()
+        self.transport(lambda prs: queried.extend(prs))
+        self.daemon.tick(NOW + gg.CYCLE)
+        self.assertCountEqual(queried, [1, 2, 3, 99])
+
+    def test_a_waited_pr_batch_can_still_split_when_rest_has_no_room(self) -> None:
+        keys = self.watch(10)
+        for key in keys:
+            gg.register(key, waited=True)
+        self.daemon.budget["rest"] = {"limit": 5000, "remaining": 0, "reset": NOW + 1800}
+        sizes = self.overloaded(limit=5)
+        self.daemon.tick(NOW)
+        self.assertEqual(sizes, [10, 5, 5])
+        self.assertTrue(all(gg.read_cache(k)["dataAt"] == NOW for k in keys))
+        self.assertFalse(self.gh.rest_calls())
+
     def test_a_heavy_pr_backs_off_and_rejoins_once_it_answers(self) -> None:
         self.watch(6)
         poison = [3]
@@ -9147,7 +9221,7 @@ class TickBudgetTest(Base):
         self.daemon.paths = {**self.daemon.paths, "pr": "graphql", "head": "graphql"}
         calls: list[tuple[str, list[str]]] = []
 
-        def batched(kind, entries, fetch, until=None):
+        def batched(kind, entries, fetch, until=None, pr_timeout_rest=None):
             if entries:
                 calls.append((kind, [e["key"] for e in entries]))
             return []
