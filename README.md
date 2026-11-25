@@ -44,7 +44,7 @@ The optimization order is intentionally boring: avoid destroying valuable valid 
 
 Glaeda is pre-alpha. What runs every day is the fleet track, almost all of it in `scripts/`:
 
-- **`glaeda-gh`**: a local daemon that is the only process polling GitHub for a host's agent
+- **`cmux-gh`**: a local daemon that is the only process polling GitHub for a host's agent
   sessions. Agents wait on PRs, runs and comments through it instead of polling
   ([`skills/github-ci-wait`](skills/github-ci-wait/SKILL.md)).
 - **The cmux Mac mini runner fleet**: `glaeda-cmux-runner` and its job hook (admission, the
@@ -125,9 +125,9 @@ The fleet and host tools install into `~/.local/bin` with `scripts/glaeda-mini-s
 (`--hygiene-only` on a developer machine; plan is the default and changes nothing):
 
 ```bash
-glaeda-gh wait pr OWNER/REPO#N --sha FULL_SHA   # wait for CI without polling (skills/github-ci-wait)
-glaeda-gh status pr OWNER/REPO#N
-glaeda-gh runners OWNER[/REPO]                   # busy and idle self-hosted runners per label
+cmux-gh wait pr OWNER/REPO#N --sha FULL_SHA   # wait for CI without polling (skills/github-ci-wait)
+cmux-gh status pr OWNER/REPO#N
+cmux-gh runners OWNER[/REPO]                   # busy and idle self-hosted runners per label
                                                  # (org pools this token cannot list come from CI_RUNNER_STATE, else "unknown", never 0)
 glaeda-disk report                               # where the disk went; --apply reclaims
 glaeda-projects tidy                             # report; --apply moves idle checkouts
@@ -185,7 +185,7 @@ Live:
 
 - [`AGENTS.md`](AGENTS.md): repository instructions and task routing for agents (`CLAUDE.md`
   imports it).
-- [`skills/github-ci-wait/SKILL.md`](skills/github-ci-wait/SKILL.md): waiting on GitHub with `glaeda-gh`.
+- [`skills/github-ci-wait/SKILL.md`](skills/github-ci-wait/SKILL.md): waiting on GitHub with `cmux-gh`.
 - [`docs/CMUX_MINI_RUNNER.md`](docs/CMUX_MINI_RUNNER.md): the cmux mini runner, hook, capacity and rollout.
 - [`docs/GLAEDA_OTA.md`](docs/GLAEDA_OTA.md): releases, canary and stable, how hosts update.
 - [`docs/GLAEDA_ROUTE.md`](docs/GLAEDA_ROUTE.md): where cmux CI jobs run.

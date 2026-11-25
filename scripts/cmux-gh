@@ -1,0 +1,11 @@
+#!/bin/sh
+# cmux-gh: the primary name of glaeda-gh (Leo, 2026-11-25: "what if we start calling these cmux-gh?").
+# It runs glaeda-gh beside it, the one program, and only says its own name in help and next-step hints. The code
+# stays in one file so every updater (OTA, fast-patch) reaches both names at once. glaeda-gh keeps working.
+case $0 in
+  */*) here=${0%/*} ;;
+  *) here=$(dirname "$(command -v "$0")") ;;
+esac
+GLAEDA_GH_AS=cmux-gh
+export GLAEDA_GH_AS
+exec "$here/glaeda-gh" "$@"

@@ -393,7 +393,7 @@ def plan_json(p: Plan) -> dict[str, Any]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="glaeda-disk-registry", description=__doc__.split("\n\n")[0])
+    parser = argparse.ArgumentParser(prog="cmux-disk-registry" if os.path.basename(sys.argv[0]) == "cmux-disk-registry" else "glaeda-disk-registry", description=__doc__.split("\n\n")[0])
     parser.add_argument("--registry", help="registry file (default: the installed release's, else this checkout's)")
     parser.add_argument("--host", help="host key for [hosts.<name>] overrides (default: this host)")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -476,5 +476,47 @@ def main(argv: list[str] | None = None) -> int:
     return 1 if any(p.alarm for p in plans) else 0
 
 
+def count_old_name(old: str, new: str) -> None:
+    """The rename to cmux-* names (Leo, 2026-11-25: "start migrating off glaeda and into cmux-prefixed naming
+    tooling"): run as NEW (scripts/NEW sets CMUX_NAME_AS), nothing happens; run under the OLD name, this use is
+    counted, silently, in ~/.local/state/cmux-names/OLD.json (uses per UTC day for 14 days, the last use, the last
+    few callers), so the old name can be removed once the fleet shows it unused (cmuxterm-hq
+    docs/design/glaeda-into-cmux.md, Rename map). Never prints, never raises: a caller parsing output sees nothing."""
+    as_new = os.environ.get("CMUX_NAME_AS") == new
+    # kept for this program's own children (glaeda-disk's background --refresh and --census run __file__): one call,
+    # one count. Another tool it runs compares this to its own new name, so it still counts its own old name.
+    os.environ["CMUX_NAME_AS"] = new
+    if as_new:
+        return
+    try:
+        import json as _json
+        import time as _time
+        base = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "cmux-names"
+        base.mkdir(parents=True, exist_ok=True)
+        path = base / f"{old}.json"
+        try:
+            data = _json.loads(path.read_text())
+        except (OSError, ValueError):
+            data = {}
+        data = data if isinstance(data, dict) else {}
+        days = {k: v for k, v in (data.get("days") or {}).items() if isinstance(v, int)}
+        today = _time.strftime("%Y-%m-%d", _time.gmtime())
+        days[today] = days.get(today, 0) + 1
+        try:
+            raw = Path(f"/proc/{os.getppid()}/cmdline").read_bytes()
+            parent = raw.replace(b"\0", b" ").decode(errors="replace").strip()
+        except OSError:  # macOS has no /proc; the parent's name is enough to find a caller
+            parent = f"pid {os.getppid()}"
+        callers = [c for c in (data.get("callers") or []) if isinstance(c, str) and c != parent[:200]]
+        data = {"schema": 1, "old": old, "new": new, "last": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
+                "days": dict(sorted(days.items())[-14:]), "callers": ([parent[:200]] + callers)[:5]}
+        tmp = path.with_name(f".{path.name}.{os.getpid()}")
+        tmp.write_text(_json.dumps(data, sort_keys=True) + "\n")
+        os.replace(tmp, path)
+    except Exception:  # noqa: BLE001  counting never costs the call
+        pass
+
+
 if __name__ == "__main__":
+    count_old_name("glaeda-disk-registry", "cmux-disk-registry")
     sys.exit(main())

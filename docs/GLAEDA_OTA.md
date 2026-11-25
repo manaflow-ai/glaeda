@@ -83,6 +83,11 @@ but still installs through `glaeda-mini-fleet upgrade` (below).
    refreshed, a newer one kept) and `hook-history.json` (the SHA-256 of every version of those two
    files, so a newer hook is never downgraded). The canary hosts run no runners, so a hook change is
    gated by CI, the signed policy soak and these checks, not by a canary status.
+   Runners in another account get the same refresh (glaeda-update step 7b): each `runner.poolUser` (an AWS Mac's
+   PR runners, in `cmux-pr-runner`) and `runner.dedicated` user the staged `~/glaeda-runner/mini-fleet.json`
+   names is refreshed through `sudo -n -u ACCOUNT` from a copy of the release's runner files under /tmp. Before
+   it, those hooks only changed on a fleet `--apply`, and converge.json never listed them; a refusal is now a
+   blocked runner `~ACCOUNT` in converge.json.
    The same run brings `~/.local/bin/glaeda-promotion-admit` (HQ's nightly promotion lease runs it
    over ssh; `glaeda-cmux-runner-fleet --apply` installs it on every member it stages) to the
    release's bytes on those runner minis: installed when missing, replaced when `hook-history.json`
