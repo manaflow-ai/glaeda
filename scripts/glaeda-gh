@@ -8987,14 +8987,16 @@ class Daemon:
                 touched = path.stat().st_mtime
             except OSError:
                 continue
-            if touched < since:
+            # The kernel may round a new watch's mtime below the tick's wall-clock start.
+            # Within that boundary second, the consumer's recorded ask disambiguates it.
+            if touched < since - 1:
                 continue
             doc = read_json(path)
             key = doc.get("key") if isinstance(doc, dict) else None
             if not isinstance(key, str) or not key.startswith("head:") or doc.get("dormant"):
                 continue
             e = watch_entry(key, doc, read_cache(key), touched)
-            if self.head_unanswered(e):
+            if self.head_unanswered(e) and (touched >= since or any(t >= since for t in e["consumers"].values())):
                 asked.append(e)
         if not asked:
             return

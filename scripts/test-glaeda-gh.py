@@ -8996,6 +8996,9 @@ class TickBudgetTest(Base):
             if not read:
                 for key in heads:
                     gg.register(key, consumer="land-judge")  # asked while the tick reads its first PR
+                    # Reproduce a filesystem mtime rounded below the tick start even though the ask came later.
+                    coarse = self.daemon.heads_between_since - 0.25
+                    os.utime(gg.watch_dir() / gg.file_name(key), (coarse, coarse))
             read.append(e["key"])
 
         with mock.patch.object(gg, "HEADS_BETWEEN_EVERY", 0), \
