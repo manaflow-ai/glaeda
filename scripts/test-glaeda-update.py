@@ -1343,6 +1343,67 @@ class UpdateTest(unittest.TestCase):
         self.assertNotEqual(result["result"], "backoff")
         self.assertTrue(self.converge()["converged"], self.converge()["why"])
 
+    # ---- step 7b: another account's runners (2026-11-25: aws-m4pro-7-glaeda-15, a PR runner in the cmux-pr-runner
+    # account, refused cmux-next-ios-kit.yml link-ffi-fleet a day after #2732 went stable; converge.json said converged)
+
+    def pool_member(self, sudo_body: str = 'shift 4; exec "$@"\n') -> tuple[Path, Path, Path]:
+        """An AWS Mac: the member user (ec2-user) has no runner of its own; its manifest names runner.poolUser, and that
+        account's home holds the PR runner. sudo here drops `-n -u USER --` and runs the rest as this test's user."""
+        pool_home, _, hook = self.runner_mini()
+        member = self.root / "member"
+        staged = member / "glaeda-runner/scripts"
+        staged.mkdir(parents=True)
+        (member / gu.RUNNER_MANIFEST).write_text(json.dumps({"hosts": {"aws-m4pro-7": {
+            "ssh_user": "ec2-user", "overrides": {"runner": {"poolUser": "cmux-pr-runner"}}}}}))
+        sudo = self.root / "sudo"
+        sudo.write_text("#!/bin/sh\n" + sudo_body)
+        sudo.chmod(0o755)
+        account = mock.MagicMock(pw_dir=os.fspath(pool_home))
+        for patch in (mock.patch.object(gu, "SUDO", os.fspath(sudo)),
+                      mock.patch.object(gu.pwd, "getpwnam", side_effect=lambda name: account
+                                        if name == "cmux-pr-runner" else (_ for _ in ()).throw(KeyError(name)))):
+            patch.start()
+            self.addCleanup(patch.stop)
+        return member, staged, hook
+
+    def test_the_pool_accounts_runner_hook_is_refreshed_and_counted(self) -> None:
+        member, staged, hook = self.pool_member()
+        entry = self.server.publish(SOURCES[0], runner_files=self.runner_files("the fixed release"),
+                                    hook_history=self.older())
+        result = self.apply(1_800_000_000.0, member, staged)
+        self.assertEqual(result["runnerHooks"], "no runners", "the member user has none of its own")
+        self.assertEqual(result["accountHooks"], f"cmux-pr-runner {entry['tag']}: 1 updated")
+        self.assertEqual(hook.read_bytes(), self.runner_files("the fixed release")["glaeda-cmux-runner-hook"])
+        doc = self.converge()
+        self.assertTrue(doc["converged"], doc["why"])
+        [row] = doc["running"]["hooks"]
+        self.assertEqual((row["account"], row["current"]), ("cmux-pr-runner", True))
+        self.assertIsNotNone(doc["live"]["hooksLiveAt"])
+
+    def test_a_pool_account_sudo_refuses_is_a_blocking_unconverged_host(self) -> None:
+        member, staged, hook = self.pool_member('echo "sudo: a password is required" >&2; exit 1\n')
+        stale = hook.read_bytes()
+        self.server.publish(SOURCES[0], runner_files=self.runner_files("the fixed release"), hook_history=self.older())
+        result = self.apply(1_800_000_000.0, member, staged)
+        self.assertIn("a password is required", result["accountHooks"])
+        self.assertEqual(hook.read_bytes(), stale)
+        doc = self.converge()
+        self.assertFalse(doc["converged"])
+        self.assertTrue(doc["blocking"])
+        self.assertIn("runner ~cmux-pr-runner", doc["why"][0])
+
+    def test_runner_accounts_reads_pool_and_dedicated_users_never_root_or_self(self) -> None:
+        home = self.root / "accounts"
+        (home / "glaeda-runner").mkdir(parents=True)
+        self.assertEqual(gu.runner_accounts(home), [])
+        me = gu.pwd.getpwuid(os.getuid()).pw_name
+        (home / gu.RUNNER_MANIFEST).write_text(json.dumps({
+            "defaults": {"runner": {"dedicated": [{"name": "n", "user": "cmux-nightly"}]}},
+            "hosts": {"m": {"overrides": {"runner": {"poolUser": "cmux-pr-runner",
+                                                     "dedicated": [{"user": "root"}, {"user": me}, {"user": "Bad Name"},
+                                                                   {"user": "cmux-nightly"}]}}}}}))
+        self.assertEqual(gu.runner_accounts(home), ["cmux-nightly", "cmux-pr-runner"])
+
     def test_an_unconverged_host_backs_off_and_a_new_release_is_tried_at_once(self) -> None:
         first = self.server.publish(SOURCES[0])
         now = 1_800_000_000.0

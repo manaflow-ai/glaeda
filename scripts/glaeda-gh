@@ -185,10 +185,16 @@ the daemon is the only process that talks to GitHub, and clients only read its c
   ci-watch-token.json the key home pushes, while unexpired): `gh_app_token.py token ci-watch`, also
   kept only in memory. Without it, or when the App refuses, the read is the login's, as
   before (AppPool). daemon.json appPool and `budget` say what the App served.
+- A host that follows the controller's change feed also holds one long-poll open on it (FeedStream, a thread):
+  an event after the daemon's cursor wakes the tick, which reads the feed at once, and a run or suite event on the
+  head or branch of an open land entry nudges that PR so its land is judged in seconds, not at the next poll. The
+  feed poll drops to a FEED_STREAM_BACKSTOP while the stream answers; daemon.json controller.stream says whether it
+  does. GLAEDA_GH_FEED_STREAM=off turns it off (the poll alone serves).
 - A host with no GitHub login of its own (a VM that may hold no token) can read through an upstream
   instead: ~/.config/glaeda/upstream.json, {"command": ["PROGRAM", "ARG", ...]}, names a program that
   carries `read` requests to another host's glaeda-gh (a broker that daemon's host serves, say). The
-  daemon then makes no GitHub request at all: every UPSTREAM_EVERY seconds, and UPSTREAM_NEW after a
+  daemon then makes no GitHub request at all: every UPSTREAM_EVERY seconds (UPSTREAM_LAND_EVERY for a PR
+  in an open land entry), and UPSTREAM_NEW after a
   key appears with no data yet, it runs that program once with every watched key as one JSON line on
   stdin, {"keys": [{"key": "pr:o/r#1", "jobs": false}, ...]}, and caches what it prints,
   {"entries": {KEY: {"data", "dataAt", "error", "jobs"?} or null}}, keeping the upstream's dataAt. That
@@ -709,6 +715,7 @@ EXPECTED_CONTEXTS: dict[str, tuple[str, ...]] = {"teamleaderleo/leo-workspace": 
 EXPECTED_CONFIG = Path.home() / ".config/glaeda/expected-contexts.json"
 UPSTREAM_CONFIG = Path.home() / ".config/glaeda/upstream.json"  # {"command": [...]}: read through it, no token
 UPSTREAM_EVERY = 20  # seconds between upstream reads of every watched key (the upstream polls each PR every 60)
+UPSTREAM_LAND_EVERY = 5  # an open land entry's PR is asked this often: the broker host's stream has its last check in seconds
 UPSTREAM_NEW = 3  # a key with no data yet is asked for again this soon: the upstream fills it within a tick or two
 STATUS_UPSTREAM_WAIT = 8.0  # status on an upstream-fed host: a tick plus two UPSTREAM_NEW asks, then read directly
 UPSTREAM_DEADLINE = 60  # one run of the upstream command
@@ -742,11 +749,18 @@ CONTROLLER_TOKEN = Path.home() / ".config/cmux/build-fleet/controller.token"
 #   first byte                                 0.13-0.28 s, flat in body size
 #   whole answer, /v1/github/events            0.13-1.47 s (p50 0.44, p90 0.53), throughput-bound: the tunnel
 #                                              carries ~400 KB/s and the largest feed page seen was 321 KB
-# CONTROLLER_CONNECT_TIMEOUT is ~200x the worst connect seen, and fails faster than the old 3 s did.
 # CONTROLLER_READ_TIMEOUT is ~4x the worst whole answer seen, and still an order of magnitude under what losing
 # the race costs (CONTROLLER_RETRY's 60 s of REST): waiting can never cost more than falling back.
-CONTROLLER_CONNECT_TIMEOUT = 1.0  # a tick must not stall on an unreachable controller
-CONTROLLER_READ_TIMEOUT = 6.0  # an alive controller is worth waiting for: the fallback spends REST
+# CONTROLLER_CONNECT_TIMEOUT outlasts two lost SYNs. A connect over the WAN loses one now and then, and TCP sends the
+# SYN again only after 1 s (Linux, macOS), then 2 s more: a 1.0 s deadline turned every lost SYN into the controller
+# taken out for CONTROLLER_RETRY and more. The queue host (GCP) to the controller (cmux-lawrence, a home line),
+# 2026-11-25 04:53Z: 4% ping loss, 3 of 300 connects past 1 s (all others 0.03-0.09 s), and its daemon logged 55
+# connect timeouts ("URLError (TimeoutError)") in 03-04Z, each a minute or more with no feed, no rollup and every
+# run read on REST; the same ping from the controller's own LAN lost nothing. 3.5 s covers the SYN sent at 0, 1
+# and 3 s; an unreachable controller still costs one tick 3.5 s, then CONTROLLER_RETRY of quiet.
+CONTROLLER_CONNECT_TIMEOUT = 3.5  # two SYN retransmits (1 s, then 3 s); a tick stalls at most this long
+CONTROLLER_READ_TIMEOUT = 5.5  # an alive controller is worth waiting for: the fallback spends REST; 5.5 keeps
+# one whole request (CONTROLLER_DEADLINE) inside 5 ticks with the 3.5 s connect above
 # Every controller request a tick makes (the feed, run baselines, on-event job lookups) together, at most: air-blue
 # 2026-11-18 22:4xZ, 17.1 of a 19.1 s tick went to a controller answering TimeoutError, one on-event lookup after
 # another (a failed lookup did not take the controller out), and no PR was refreshed for 2196 s. A request is cut at
@@ -953,6 +967,8 @@ HEAD_DIRECT_MAX = 60
 # HEADS_BETWEEN_REST REST heads a look and HEADS_BETWEEN_TICK_MAX a tick, newest ask first, so a flood of asks (the
 # land queue's, glaeda#2489) keeps its turn at the tick's due phase and never takes the tick from the waited PRs.
 HEADS_BETWEEN_EVERY = 5.0
+# How far a new file's mtime may lag time.time() (Linux's coarse clock: a jiffy, 4 ms at HZ=250; measured 5.5 ms).
+WATCH_MTIME_SLACK = 0.25
 HEADS_BETWEEN_REST = 2
 HEADS_BETWEEN_TICK_MAX = 21
 CONSUMER_DEFAULTS = {"reserved": {"autoland": 1500}, "limit": 240, "pool": 600}  # head reads an hour
@@ -6248,6 +6264,7 @@ class Daemon:
         self.writing = False  # inside the outbox: its requests are sessions' writes, not the daemon's polling
         self.jobs_only: list[dict] = []  # failed runs whose job list is read though runs cannot be (due)
         self.heads_direct: list[dict] = []  # asked heads with no answer read over REST past the share (due_heads_direct)
+        self.heads_between_seen: frozenset = frozenset()  # keys the tick's watch read listed
         self.heads_between_since = float("inf")  # wall time of this tick's watch read: later asks are read between
         self.heads_between_at = float("-inf")  # time.monotonic() of the last look (HEADS_BETWEEN_EVERY)
         self.heads_between_busy = False  # a look is reading: the batches it runs do not look again
@@ -9002,14 +9019,14 @@ class Daemon:
                 touched = path.stat().st_mtime
             except OSError:
                 continue
-            # The kernel may round a new watch's mtime below the tick's wall-clock start.
-            # Within that boundary second, the consumer's recorded ask disambiguates it.
-            if touched < since - 1:
+            if touched < since - WATCH_MTIME_SLACK:
                 continue
             doc = read_json(path)
             key = doc.get("key") if isinstance(doc, dict) else None
             if not isinstance(key, str) or not key.startswith("head:") or doc.get("dormant"):
                 continue
+            if touched < since and key in self.heads_between_seen:
+                continue  # in the slack, but the watch read already had it
             e = watch_entry(key, doc, read_cache(key), touched)
             if self.head_unanswered(e) and (touched >= since or any(t >= since for t in e["consumers"].values())):
                 asked.append(e)
@@ -9414,10 +9431,16 @@ class Daemon:
                 self.post_tick()  # first, so a long read phase never delays a write
         except Exception as error:  # noqa: BLE001  a bad queue entry must not stop the reads
             self.errors.append(f"outbox: {describe(error)} at {error_site(error)}")
-        self.heads_between_since = time.time()  # (wall time: a watch file's mtime is when it was asked)
+        # Wall time, as a watch file's mtime is when it was asked. Linux stamps mtimes from its coarse clock, up to a
+        # jiffy behind time.time(), so a head asked just after this read could carry an earlier mtime and was skipped
+        # until the next tick (2026-11-25): read_heads_between also takes a file up to WATCH_MTIME_SLACK older, unless
+        # the watch read below already listed its key (that one is the due phase's: read, or deferred on purpose).
+        self.heads_between_since = time.time()
+        self.heads_between_seen = frozenset()
         self.heads_between_read = 0
         with self.phase("watches"):
             entries = self.watches()
+        self.heads_between_seen = frozenset(e.get("key") for e in entries)
         self.adopt_pace_hold()
         try:
             with self.phase("controller"):
@@ -10110,6 +10133,8 @@ class Daemon:
         self.phase_now = "reads"  # until finish_tick: reads into the cache only (ScriptWake may re-exec here)
         due = []
         full = self.now - self.upstream_at >= UPSTREAM_EVERY
+        q = self.land_queue
+        landing = set() if q is None else {k for k, x in q.entries.items() if x.get("state") not in LAND_DONE}
         for e in entries:
             kind = split_key(e["key"])[0]
             if kind == "head" and not self.head_askers(e):
@@ -10120,7 +10145,10 @@ class Daemon:
                                                      "its upstream")
                 continue
             fresh = e["cache"] is None  # the upstream has answered nothing for it yet, not even an error
-            if full or (fresh and self.now - self.attempted.get(e["key"], float("-inf")) >= UPSTREAM_NEW):
+            since = self.now - self.attempted.get(e["key"], float("-inf"))
+            # a landing PR every UPSTREAM_LAND_EVERY, not UPSTREAM_EVERY: a lane VM's land heard of its last check up
+            # to 20 s late (teamleaderleo/glaeda#2740: judged 18 s after it; Leo, 2026-11-25: "stop polling")
+            if full or (fresh and since >= UPSTREAM_NEW) or (e["key"] in landing and since >= UPSTREAM_LAND_EVERY):
                 due.append(e)
         # The least recently asked first (a key never asked is -inf): past UPSTREAM_MAX_KEYS they rotate, none starves.
         due = sorted(due, key=lambda e: (self.attempted.get(e["key"], float("-inf")), e["key"]))[:UPSTREAM_MAX_KEYS]
@@ -19001,6 +19029,13 @@ class LandQueue:
                 return
         running = land_checks_running(data, head)
         kind = w.get("kind")
+        if running and kind not in ("head_change", "repin") and land_override_pinned(e, head) \
+                and e.get("overridePinJudged") != f"{e.get('requestId') or ''}|{head}":
+            # LAND_OVERRIDE_PIN_KINDS' comment: a pinned override row is judged now, not after its checks finish;
+            # take() merges it at the pin if the judgment is a wait on those checks
+            e["overridePinJudged"] = f"{e.get('requestId') or ''}|{head}"
+            self.judge(e, head, fp, why="override_pin")
+            return
         if running and kind not in ("head_change", "repin") and self.stuck_carry_due(e, head, data):
             # an override given after this head's checks_stuck verdict: judged now, not after another wait on the same
             # pending check (land_override_carries); take() merges it if the judgment is still only that wait
@@ -20419,6 +20454,7 @@ class LandQueue:
         with self.lock:
             self.count("snapshot" if extra else "live")
         extra.update(land_nominated_env(e))  # judged under the nominating path, as the merge is (LAND_NOMINATED_ENV)
+        extra[LAND_QUEUE_ENV] = "1"  # the queue's judgment adds ready-to-land (land_tier_pending); ad-hoc explains do not
         for n, run_argv in enumerate(tries):
             bound = LAND_EXPLAIN_DEADLINE_CLIENT if self.broker_client() else LAND_EXPLAIN_DEADLINE
             with self.lock:
@@ -20938,6 +20974,24 @@ class LandQueue:
                 self.history(e, "override_merge", code=str(answer.get("code") or kind), head=head[:12],
                              waited=round(self.now - float(e["overrideWait"]["since"])), **land_override_history(e))
                 e.pop("overrideWait", None)
+            self.do_merge(e, head, {**answer, "ok": True, "action": {"v": 1, "kind": "merge", "sha": head}})
+            return
+        if kind in LAND_OVERRIDE_PIN_KINDS and land_override_pinned(e, head):
+            # LAND_OVERRIDE_PIN_KINDS' comment: the pinned merge carrying the override, once per head
+            if (e.get("overridePinMerge") or {}).get("head") == head:
+                with self.lock:
+                    self.stop(e, "pinned_override_refused",
+                              f"the pinned merge carrying the override was already tried at {head[:12]} and refused "
+                              f"(the merge step's refusal is in this entry's history); land_judge now says "
+                              f"{answer.get('code') or kind}: {land_reason(answer.get('reason'))}",
+                              f"read the refusal, then gh pr merge {number} -R {repo} --squash "
+                              f"--match-head-commit {head} with LAND_JUDGE_OVERRIDE set")
+                return
+            with self.lock:
+                e["overridePinMerge"] = {"head": head, "at": self.now}
+                self.history(e, "override_merge", code=str(answer.get("code") or kind), head=head[:12],
+                             carried="pinned", **land_override_history(e))
+                self.save(e)
             self.do_merge(e, head, {**answer, "ok": True, "action": {"v": 1, "kind": "merge", "sha": head}})
             return
         if kind in ("stop", "command"):
@@ -22537,6 +22591,7 @@ def land_override_env(e: dict) -> dict[str, str]:
 # to the executor (land.json "executor"), to an overflow peer ("overflow") and in a lane VM's land_handoff. A request
 # whose "nominated" is not that shape keeps {"unreadable": WHY}, which land_judge refuses: never a plain land.
 LAND_NOMINATED_ENV = "LAND_JUDGE_NOMINATED"
+LAND_QUEUE_ENV = "LAND_JUDGE_LAND_QUEUE"  # leo-workspace land_judge: an explain under it adds the land-tier label
 LAND_NOMINATED_MAX = 4000  # the evidence as JSON, at most: two gate results of a 40-hex head and a one-line why each
 LAND_NOMINATED_PATH = re.compile(r"[a-z][a-z0-9-]{0,39}")
 
@@ -22615,6 +22670,29 @@ def land_override_takes(e: dict, act: dict, head: str) -> bool:
     if act.get("kind") == "command":
         return True
     return act.get("kind") == "stop" and str(act.get("stop") or "") not in set(LAND_STOP_CLASSES.values())
+
+
+# A row queued with a pin and an override (`land --sha SHA --override-reason R --override-receipt T`) is the
+# requester's say-so to merge that exact head now (Leo, 2026-11-25 01:03Z: "stop waiting on ci to get these
+# [expletive] things in. if checks fail, fix the checks or ignore and just merge"). The queue still waited on its checks:
+# a running check kept it in wait_running, never judged, and a judgment that came back checks_running or a red check's
+# rerun_failed was taken as a wait, so the override reached no merge step. 2026-11-25: cmux#52546 parked until
+# 04:30Z; cmux#53958 recorded its override at 03:30:35Z and was judged checks_running 24 s later; a direct pinned
+# merge with the same override went in at once both times. Now such a row at its pin is judged at once even while
+# checks run, and a wait on its checks (wait_pr, wait_run) or a rerun of its red ones is the pinned merge carrying the
+# override, once per head. A merge refused there stops the row by name (pinned_override_refused), never another wait.
+# A hold, BLOCK, conflict or other LAND_STOP_CLASSES stop still stops; an unpinned override still waits on a running
+# check (land_override_carries), and a head off the pin is judged as before.
+LAND_OVERRIDE_PIN_KINDS = LAND_WAIT_KINDS | {"rerun_failed"}
+
+
+def land_override_pinned(e: dict, head: str) -> bool:
+    """True when E carries an override and a pin that HEAD is (the comment above). Not at a head this land already
+    sent a base update for (updateSent, land_judge's own included): that head is being replaced, the pin follows the
+    merge (follow_own_update), and the new head is the one merged."""
+    pin = str(e.get("pinSha") or "").lower()
+    return bool(land_override_env(e)) and bool(pin) and bool(SHA40.fullmatch(head or "")) \
+        and not land_head_moved(pin, head) and str((e.get("updateSent") or {}).get("head") or "").lower() != head
 
 
 # An override given after the queue already judged a check stuck covers that check at once. The queue stops an entry
