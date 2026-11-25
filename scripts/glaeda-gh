@@ -611,6 +611,7 @@ GQL_DOWN = re.compile(r"HTTP 5(?!04)\d\d|request failed: (?!TimeoutError)")
 # pr_query: 1 PR 4.0 and 5.8 s, 2 PRs 3.1 and 2.4 s, 4 PRs HTTP 502 after 14.1 and 10.9 s, 8 PRs HTTP 502 after 12.2
 # and 15.7 s. The batch sat at 8, every query 502'd, the 502s took GraphQL "down" and every PR went to REST one at a
 # time: 143 PR reads stored in 600 s against ~1,000 waited PRs, waited data 17,794 s old.
+GQL_GATEWAY_TIMEOUT = re.compile(r"HTTP 504|timed out \(GitHub answered 50[23]")
 GQL_SLOW_5XX_AFTER = 8.0
 GQL_NO_ANSWER = re.compile(r"request failed: (?!TimeoutError)")  # GQL_DOWN with no answer: REST reads it, unsplit
 MAX_BODY = 8 * 1024 * 1024
@@ -9001,14 +9002,16 @@ class Daemon:
                 touched = path.stat().st_mtime
             except OSError:
                 continue
-            if touched < since:
+            # The kernel may round a new watch's mtime below the tick's wall-clock start.
+            # Within that boundary second, the consumer's recorded ask disambiguates it.
+            if touched < since - 1:
                 continue
             doc = read_json(path)
             key = doc.get("key") if isinstance(doc, dict) else None
             if not isinstance(key, str) or not key.startswith("head:") or doc.get("dormant"):
                 continue
             e = watch_entry(key, doc, read_cache(key), touched)
-            if self.head_unanswered(e):
+            if self.head_unanswered(e) and (touched >= since or any(t >= since for t in e["consumers"].values())):
                 asked.append(e)
         if not asked:
             return
@@ -9460,21 +9463,34 @@ class Daemon:
         def read_batches(kind: str, group: list[dict], until: float | None = None) -> None:
             with self.phase(f"read {kind}"):
                 left = self.batched(kind, group, self.graphql_fetch[kind], until=until, pr_timeout_rest=pr_timeout_rest)
-            # Give the waited spills the same REST reader now. Leaving them behind ordinary GraphQL
-            # queries made even a successful split down to one useless once the tick ran out of time.
-            urgent_rest = []
-            for e in left:
-                if kind == "pr" and self.waited(e) and pr_timeout_rest.get(caller_of(e["key"])[1].lower()):
-                    urgent_rest.append(e)
-                else:
-                    spilled.append(e)
+            # Read one batch of waited spills before ordinary queries can spend the deadline. Other
+            # kinds retain their turn when many PRs are waited. The rest rejoin the usual REST order.
+            limit = 1 if blocked["run"] or blocked["head"] else self.batch["pr"]
+            urgent_rest = [e for e in left if kind == "pr" and self.waited(e)
+                           and pr_timeout_rest.get(caller_of(e["key"])[1].lower())][:limit]
             if urgent_rest:
                 self.read_rest(urgent_rest, urgent_rest)
+            early_keys = {e["key"] for e in urgent_rest}
+            spilled.extend(e for e in left if e["key"] not in early_keys)
+
+        def read_stale_pr(lead: dict, path: str) -> None:
+            # A stale land can survive a restart with every in-memory heavy mark lost. Give the
+            # oldest such PR a read before the batches, including when REST has no share left.
+            # A slot wait is local contention. Stay on GraphQL unless GitHub actually timed out
+            # or the scheduler already chose REST while the login was low.
+            error = (lead.get("cache") or {}).get("error") or ""
+            if (path == "rest" or GQL_GATEWAY_TIMEOUT.search(error)) and self.rest_admits("pr", lead):
+                self.read_rest([lead], [lead])
+            else:
+                read_batches("pr", [lead])
 
         floor: set[str] = set()
         for kind in sorted(kinds[first:] + kinds[:first], key=lambda k: k != "head"):
             if over[kind] != "graphql":
                 continue
+            if kind == "pr" and (lead := self.starved_lead(blocked[kind])) is not None:
+                read_stale_pr(lead, over[kind])
+                blocked[kind] = [e for e in blocked[kind] if e["key"] != lead["key"]]
             plain = [e for e in due[kind] if not urgent(e)]
             # (a minute with none read since it was first due: a fresh daemon's first tick is no starvation)
             if plain and blocked[kind] and self.now - self.plain_at.setdefault(kind, self.now) >= PLAIN_FLOOR_EVERY:
@@ -9510,6 +9526,14 @@ class Daemon:
             self.gql_first = (kinds.index(self.gql_paced) + (1 if paced_sent else 0)) % len(kinds)
         for kind, picked in self.app_graphql_share(due, over).items():
             keys = {e["key"] for e in picked}
+            if kind == "pr":
+                lead = self.starved_lead(due[kind])
+                if lead is not None:
+                    read_stale_pr(lead, over[kind])
+                    keys.add(lead["key"])
+                    picked = [e for e in picked if e["key"] != lead["key"]]
+                read_batches(kind, [e for e in picked if self.waited(e)])
+                picked = [e for e in picked if not self.waited(e)]
             due[kind] = [e for e in due[kind] if e["key"] not in keys]
             read_batches(kind, picked)
             self.post_between()
@@ -9667,6 +9691,16 @@ class Daemon:
             stale.sort(key=lambda e: (data_at(e), e["key"]))
             prs = [e for e in stale if e["key"].startswith("pr:")]
             runs = [e for e in stale if e["key"].startswith("run:")]
+            # This pass has its own point allowance. A stale PR must get its lone attempt here
+            # too, before failed multi-PR queries can spend the allowance or the tick.
+            lead = self.starved_lead(prs)
+            if lead is not None:
+                self.waited_tried[lead["key"]] = self.now
+                with self.waited_spend():
+                    left = self.batched("pr", [lead], lambda chunk: self.fetch_aliased(chunk, "pr"))
+                if left and self.rest_admits("pr", lead):
+                    self.read_rest(left, left)
+                prs = [e for e in prs if e["key"] != lead["key"]]
             probe = [e for e in prs if self.probe_ok(e)]
             full = [e for e in prs if not self.probe_ok(e)]
             for i in range(0, len(probe), WAITED_PROBE_BATCH):
@@ -10605,7 +10639,7 @@ class Daemon:
                 return to_rest
             repos = sorted({caller_of(e["key"])[1] for e in chunk})
             repo = repos[0].lower() if kind == "pr" and len(repos) == 1 else ""
-            if pr_timeout_rest and pr_timeout_rest.get(repo):
+            if pr_timeout_rest and pr_timeout_rest.get(repo) and self.rest_admits(kind, chunk[0]):
                 to_rest += chunk
                 continue
             on_app = bool(self.app_entries_eligible(kind, chunk, "graphql"))
@@ -10659,6 +10693,19 @@ class Daemon:
                     for e in chunk:
                         self.store(e["key"], e["cache"], error=message[:300])
                 continue
+            timed_out = error and GQL_GATEWAY_TIMEOUT.search(error)
+            if timed_out and pr_timeout_rest and repo in pr_timeout_rest and self.rest_admits(kind, chunk[0]):
+                pr_timeout_rest[repo] = True
+                if len(chunk) > 1:
+                    self.refresh_note("graphql", error, f"pr batch of {len(chunk)} ({repo})",
+                                      "REST reads the waited PRs before ordinary GraphQL reads")
+                    # A cheap probe may already have confirmed some of the batch before the full query failed.
+                    for e in chunk:
+                        cached = read_cache(e["key"]) if self.probe_ok(e) else None
+                        if not (cached and cached.get("via") == "graphql-probe" and cached.get("dataAt") == self.now
+                                and not cached.get("error")):
+                            to_rest.append(e)
+                    continue
             if (error or self.gql_limited) and self.mode("graphql") == "stop":
                 # this query hit the limit (a RATE_LIMITED answer can still carry data.rateLimit and null aliases):
                 # whatever it stored for them, REST reads them this tick and replaces it
@@ -10682,9 +10729,8 @@ class Daemon:
                 if splits + len(redo) > GQL_SPLITS:
                     redo = []  # this tick's re-reads are spent: they wait for the next cycle, at the smaller size
                 splits += len(redo)
-                left = [e for c in queue for e in c]
                 size = self.batch[kind]
-                queue = redo + [left[i:i + size] for i in range(0, len(left), size)]
+                queue = redo + [c[i:i + size] for c in queue for i in range(0, len(c), size)]
                 continue
             down = bool(error and GQL_DOWN.search(error))  # a 5xx or no answer: not the entries' doing
             if down and GQL_NO_ANSWER.search(error):
@@ -10692,13 +10738,6 @@ class Daemon:
                 # only asks again. REST reads it this tick when it has room (the REST loop defers it otherwise).
                 self.refresh_note("graphql", error, f"{kind} batch of {len(chunk)} ({', '.join(repos)})",
                                   "REST reads it this tick")
-                to_rest += chunk
-                continue
-            if (error and pr_timeout_rest and repo in pr_timeout_rest and (SLOW.search(error) or down)
-                    and self.rest_admits(kind, chunk[0])):
-                pr_timeout_rest[repo] = True
-                self.refresh_note("graphql", error, f"pr batch of {len(chunk)} ({repo})",
-                                  "REST reads the waited PRs before ordinary GraphQL reads")
                 to_rest += chunk
                 continue
             if error and (down or SLOW.search(error)):
@@ -10745,9 +10784,9 @@ class Daemon:
             if splits + 2 <= GQL_SPLITS:
                 splits += 2
                 half = (len(chunk) + 1) // 2
-                left = [e for c in queue for e in c]
                 size = self.batch[kind]
-                queue = [chunk[:half], chunk[half:]] + [left[i:i + size] for i in range(0, len(left), size)]
+                # Keep repository and App boundaries when resizing the chunks still to come.
+                queue = [chunk[:half], chunk[half:]] + [c[i:i + size] for c in queue for i in range(0, len(c), size)]
         return to_rest
 
     def oldest_data(self, entries: list[dict], fetched: set[str]) -> dict[str, float | None]:
@@ -10961,7 +11000,7 @@ class Daemon:
             self.note_gql_health(message)
             return None, message
         took = time.monotonic() - began
-        rate =((doc.get("data") or {}).get("rateLimit") or {}) if isinstance(doc, dict) else {}
+        rate = ((doc.get("data") or {}).get("rateLimit") or {}) if isinstance(doc, dict) else {}
         cost = rate.get("cost") if isinstance(rate, dict) else None
         points = cost if isinstance(cost, int) and not isinstance(cost, bool) and cost > 0 else 1
         if self.last_request_source == "app":
@@ -15073,6 +15112,13 @@ LAND_TOUCH = TOUCH_EVERY  # the daemon re-registers the PRs, runs and comments i
 # queue's, every open entry's waited watch renewed every LAND_TOUCH, and pr caches fetched in the last 600 s: 0, so
 # even the PRs a due land needed were never read.
 LAND_PEEK_EVERY = 600.0
+# An --after PR with no copy here, or a copy older than this, after that long of unwaited reads (keep_watching) is
+# read once directly (land_direct_read, as a pinned land's head is: pin_wait), at most once per this bound, so its
+# merge or close ends the wait (after_wait). cmux-cp-1, 2026-11-25 01:40Z: 30 rows waiting_after; the p95 green wait
+# (41h49m) was manaflow-ai/cmux-extensions#15 behind manaflow-ai/cmux#46686, closed unmerged 11 min after it queued,
+# with no copy of #46686 in the daemon's cache 41 h on: the unwaited read sat below every wait while pr data ran
+# 3,000-5,000 s stale. Of the 31 predecessors, 3 were closed and 6 merged on GitHub, their rows still waiting.
+LAND_AFTER_BLIND = 1800.0
 # Of the due entries (queued, or waiting past their wake) only the first this many per worker, in judge_order, hold a
 # waited watch; the rest are read like a parked entry (LAND_PEEK_EVERY), and the tick that brings one inside the window
 # waits on it again, so its judgment is handed a fresh copy (and fresh_head/snapshot_wait nudge a read regardless).
@@ -16424,6 +16470,8 @@ class LandQueue:
         self.peek = peek or ((lambda key: register(key, reader=f"tool:{LAND_TAG}", once=True)) if watch is None
                              else self.watch)
         self.peeked: dict[str, float] = {}
+        self.after_blind_since: dict[str, float] = {}  # an --after PR with no copy: since when (after_blind_read)
+        self.after_read_at: dict[str, float] = {}  # an --after PR's last direct read (LAND_AFTER_BLIND)
         self.forward_reads = 0  # forwards_unjudged's one-off reads this pass
         self.lean: set[str] = set()  # due entries past the tick's watch window (LAND_WATCH_AHEAD): read unwaited
         # A queued PR's head is registered with the checks store for land-judge (head_key), so the daemon holds its
@@ -18859,6 +18907,28 @@ class LandQueue:
                 self.peeked[k] = self.now
                 with contextlib.suppress(OSError, WatchError):
                     self.peek(k)
+        for a in peeks:
+            if a != e["key"] and (self.entries.get(a) or {}).get("state") != LAND_FORWARDED:
+                self.after_blind_read(a)  # a forwarded one is read live by forward_state_reads
+
+    def after_blind_read(self, a: str) -> None:
+        """Under the lock. --after PR A, read only unwaited (keep_watching), whose copy here is missing or older than
+        LAND_AFTER_BLIND and has stayed so that long: one direct read of it (refresh_job, land_direct_read), at most
+        once per LAND_AFTER_BLIND, when no hold, park or busy pool stops it. after_wait then ends the wait on the copy it
+        stored (merged: queued; closed: after_closed) instead of the row waiting forever on a read that never comes."""
+        c = self.cache_of(a) or {}
+        reads = [t for t in (c.get("dataAt"), c.get("updatedAtAt")) if isinstance(t, (int, float))
+                 and not isinstance(t, bool)]
+        if reads:
+            self.after_blind_since.pop(a, None)
+        since = max(reads) if reads else self.after_blind_since.setdefault(a, self.now)
+        if self.now - since < LAND_AFTER_BLIND or self.now - self.after_read_at.get(a, float("-inf")) < LAND_AFTER_BLIND:
+            return
+        if a in self.jobs or self.refresh_held() or self.queue_quota_parked() or self.busy() >= self.workers():
+            return  # read on a later pass
+        self.after_read_at[a] = self.now
+        log({"event": "land-after-read", "key": a, "age": round(self.now - max(reads)) if reads else None})
+        self.submit(a, self.refresh_job, a)
 
     def watch_head(self, e: dict) -> None:
         """Register the PR's current head (from its cached read) with the checks store as soon as the entry is open or
@@ -19460,7 +19530,9 @@ class LandQueue:
         with self.lock:
             hold = self.refresh_outcome(key, error)
             e = self.entries.get(key)
-            if e is None:
+            if e is None:  # an --after PR with no row here (after_blind_read)
+                if error:
+                    log({"event": "land-refresh", "key": key, "error": error, **({"hold": hold} if hold else {})})
                 return
             probe = bool((e.get("refresh") or {}).get("probe"))
             e["refresh"] = {**(e.get("refresh") or {}), "error": land_trim(error, 160) if error else None}
