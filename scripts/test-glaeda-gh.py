@@ -22541,7 +22541,8 @@ class LandSnapshotTest(Base):
                                                                                                   "databaseId": 77}}}),
                 {"__typename": "StatusContext", "context": "ws-check", "state": "PENDING", "description": "queued"}])
             gg.register(gg.parse_key("pr", f"o/r#{n}"), waited=True)
-        self.land = types.SimpleNamespace(lock=threading.RLock(), jobs={}, tick=lambda now=None, *, dirty=None: None,
+        self.land = types.SimpleNamespace(lock=threading.RLock(), jobs={}, next_up=[],
+                                          tick=lambda now=None, *, dirty=None, local_only=False: None,
                                           reap=lambda: None, refill=lambda now=None: None,
                                           entries={f"pr:o/r#{n}": {"state": "queued"} for n in range(1, self.N + 1)})
         self.daemon.land_queue = self.land
