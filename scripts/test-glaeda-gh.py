@@ -9190,6 +9190,35 @@ class TickBudgetTest(Base):
         self.assertEqual(queries[1], ("head", [head]), queries)
         self.assertEqual([k for k, _ in queries].count("pr"), 3, queries)
 
+    def test_a_head_whose_mtime_lags_the_ticks_wall_time_is_still_read_between_batches(self) -> None:
+        """fs-agent-lane-27, 2026-11-25: the test above failed one run in two on a loaded VM. Linux stamps a file's
+        mtime from its coarse clock, up to a jiffy (measured 5.5 ms) behind time.time(), so a head asked just after
+        the tick's watch read could carry an mtime before heads_between_since and was skipped until the next tick.
+        Here the head's mtime is set 3 ms behind the tick's own wall time, every run."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800}}
+        self.daemon.batch = {**self.daemon.batch, "pr": 1}
+        for n in (1, 2, 3):
+            gg.register(f"pr:o/r#{n}", waited=True)
+        self.daemon.paths = {**self.daemon.paths, "pr": "graphql", "head": "graphql"}
+        head = f"head:o/r@{'b' * 40}"
+        queries: list[tuple[str, list[str]]] = []
+
+        def fetch(kind):
+            def read(chunk):
+                if kind == "pr" and not queries:
+                    gg.register(head, consumer="owner-merge")
+                    lag = self.daemon.heads_between_since - 0.003  # the watch read's wall time, less a jiffy
+                    os.utime(gg.watch_dir() / gg.file_name(head), (lag, lag))
+                queries.append((kind, [e["key"] for e in chunk]))
+            return read
+
+        with mock.patch.object(gg, "HEADS_BETWEEN_EVERY", 0), \
+                mock.patch.object(gg.Daemon, "graphql_fetch", new_callable=mock.PropertyMock,
+                                  return_value={k: fetch(k) for k in ("pr", "run", "comment", "head")}):
+            self.daemon.tick(NOW)
+        self.assertEqual(queries[1], ("head", [head]), queries)
+
     def test_a_head_asked_during_a_rest_tick_is_read_before_the_next_pr_and_a_flood_is_bounded(self) -> None:
         """The same over REST (GraphQL stopped, as on cosmic-gray 23:17-23:42Z that night): a head asked while the tick
         reads its PRs is read before the next PR, at most HEADS_BETWEEN_REST a look; the rest are not charged and
@@ -23057,9 +23086,17 @@ class RestPrefetchTest(Base):
         self.daemon.tick(NOW)  # every PR's first read: nothing kept to send early
         gh, lock = self.gh, threading.Lock()
         threads: set[str] = set()
+        flight = {"now": 0, "most": 0}  # requests in flight at once: overlap, read without the wall clock
 
         def slow(method: str, url: str, headers: dict, body: bytes | None) -> tuple[int, dict, bytes]:
-            time.sleep(self.DELAY)
+            with lock:
+                flight["now"] += 1
+                flight["most"] = max(flight["most"], flight["now"])
+            try:
+                time.sleep(self.DELAY)
+            finally:
+                with lock:
+                    flight["now"] -= 1
             threads.add(threading.current_thread().name)
             with lock:  # the fake's own state is not thread-safe; the delay is outside it
                 return gh(method, url, headers, body)
@@ -23086,6 +23123,7 @@ class RestPrefetchTest(Base):
                            for n in range(1, self.N + 1))
         out["threads"] = len(threads - {threading.current_thread().name})
         out["spent"] = self.daemon.rest_spent()
+        out["overlap"] = flight["most"]
         return out
 
     def test_prefetched_reads_send_the_same_requests_in_a_fraction_of_the_time(self) -> None:
@@ -23100,11 +23138,14 @@ class RestPrefetchTest(Base):
                   f"{early[name]['requests']} requests / {early[name]['counted']} counted", file=sys.stderr)
             self.assertEqual(early[name]["counted"], serial[name]["counted"], name)
             self.assertLessEqual(early[name]["requests"], serial[name]["requests"] + gg.REST_PREFETCH_HELD, name)
-            self.assertLess(early[name]["seconds"], serial[name]["seconds"] * 0.6, name)
+            # Not a wall-clock ratio: on a loaded VM (load 40, fs-agent-lane-27, 2026-11-25) the threads were starved and
+            # "prefetched under 0.6x serial" failed at random. Overlap is what makes it faster, and is read exactly.
         self.assertEqual(early["data"], serial["data"])
         self.assertTrue(serial["fresh"] and early["fresh"], "a PR was left unread")
         self.assertEqual(early["spent"], serial["spent"], "the REST share was charged differently")
         self.assertEqual(serial["threads"], 0)
+        self.assertEqual(serial["overlap"], 1, "serial reads overlapped")
+        self.assertGreater(early["overlap"], 1, "no prefetched request was in flight alongside another")
         self.assertLessEqual(early["threads"], gg.REST_PREFETCH_WORKERS)
         self.assertFalse(self.daemon.prefetched, "an early request was left unsettled")
 
@@ -30063,6 +30104,39 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "pinned_override_update"))
         self.assertIn(f"--match-head-commit {LA}", e["stop"]["next"])
 
+    def test_land_override_pinned_row_merges_at_its_pin_past_running_or_red_checks(self):
+        # cmux#52546 parked until 04:30Z and cmux#53958 (override recorded 03:30:35Z, judged checks_running 24 s later),
+        # 2026-11-25: queued pinned with an override, they waited on their checks and never merged; a direct pinned
+        # merge with the same override went in at once. A pinned override row merges at its pin, checks running or red.
+        cases = (("running", [("ci", "IN_PROGRESS", None)], "checks_running", {"kind": "wait_pr", "sha": LA}),
+                 ("red", [("ci", "COMPLETED", "FAILURE")], "own_red", {"kind": "rerun_failed", "runs": [7]}))
+        for name, checks, code, act in cases:
+            with self.subTest(name):
+                shutil.rmtree(gg.land_dir(), ignore_errors=True)
+                self.w = LandWorld(self.tmp.name)
+                self.q = self.queue()
+                self.pr(LA, checks=checks)
+                gg.land_request("land", "o/r#1", [], "host/lane", sha=LA, override=dict(self.OVERRIDE))
+                self.w.answers.append(refusal(code, LA, act))
+                e = self.tick()
+                self.assertEqual(e["state"], "merged")
+                self.assertEqual(self.w.gh_calls("run", "rerun"), [])
+                [env] = self.merge_envs()
+                self.assertEqual(env.get("LAND_JUDGE_OVERRIDE_RECEIPT"), self.OVERRIDE["receipt"])
+                took = [h for h in e["history"] if h["event"] == "override_merge"]
+                self.assertEqual((took[-1]["code"], took[-1]["carried"], took[-1]["head"]), (code, "pinned", LA[:12]))
+
+    def test_land_override_pinned_row_whose_merge_is_refused_stops_by_name_not_a_wait(self):
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA, override=dict(self.OVERRIDE))
+        self.w.gh_rc["merge"] = 1
+        self.w.gh_err["merge"] = "land-judge: refused [hold]: a hold at the head"
+        wait = lambda: refusal("checks_running", LA, {"kind": "wait_pr", "sha": LA, "timeout_s": 1800})  # noqa: E731
+        e = self.run_hour(wait, seconds=2 * gg.LAND_WAIT_DEFAULT, step=60.0)
+        self.assertEqual(len(self.w.gh_calls("pr", "merge")), 1)
+        self.assertEqual(e["state"], "stopped")
+        self.assertIn(e["stop"]["code"], ("pinned_override_refused", "hold"))
+
     def test_land_override_wakes_capped_retry_only_for_a_changed_receipt(self):
         self.pr(LA, checks=[("Skills", "COMPLETED", "FAILURE")])
         gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
@@ -30079,20 +30153,15 @@ class LandTest(Base):
         self.assert_merged_at(LA)
 
     def test_land_override_new_receipt_rejudges_unchanged_red_pr_after_checks_running(self):
+        # A pinned override row judged checks_running no longer waits for a new receipt to be judged again: the wait is
+        # the pinned merge carrying the override it has (LAND_OVERRIDE_PIN_KINDS; cmux#52546, cmux#53958).
         self.pr(LA, checks=[("Skills", "COMPLETED", "FAILURE")])
         gg.land_request("land", "o/r#1", [], "host/lane", sha=LA, override=dict(self.OVERRIDE))
         self.w.answers.append(refusal("checks_running", LA, {"kind": "wait_pr", "sha": LA, "timeout_s": 3600}))
-        e = self.tick()
-        self.assertEqual((e["wait"]["kind"], len(self.w.explains())), ("pr", 1))
-        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA, override=dict(self.OVERRIDE))
-        self.tick()
-        self.assertEqual((len(self.w.explains()), self.merge_envs()), (1, []))
-        updated = {**self.OVERRIDE, "receipt": "base run 11 job 1001"}
-        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA, override=updated)
-        self.w.answers.append(refusal("unreadable", LA, {"kind": "retry", "override_if_checks_finished": True}))
         self.tick()
         self.assert_merged_at(LA)
-        self.assertEqual(self.merge_envs()[0]["LAND_JUDGE_OVERRIDE_RECEIPT"], updated["receipt"])
+        self.assertEqual(len(self.w.explains()), 1)
+        self.assertEqual(self.merge_envs()[0]["LAND_JUDGE_OVERRIDE_RECEIPT"], self.OVERRIDE["receipt"])
 
     def test_land_override_capped_retry_requires_finished_checks_and_a_real_receipt(self):
         def eligible(data, pin=LA, receipt=self.OVERRIDE["receipt"], seen=None):
@@ -35551,9 +35620,11 @@ class LandTest(Base):
         self.assertEqual(self.w.refreshed, [self.KEY])
 
     def test_land_recovers_stale_checks_after_pin_seen(self):
+        # No override: a pinned override row is judged at once while its checks run (LAND_OVERRIDE_PIN_KINDS),
+        # so the stale-read recovery this covers is a plain pinned row's.
         # The first cache read already saw the pin and running jobs. No webhook or other waited-pass read
         # arrives. The recovery sweep reads that same head after the copy ages, before the one-hour wait.
-        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA, override=dict(self.OVERRIDE))
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
         self.pr(LA, checks=[("Skills", "IN_PROGRESS", None)])
         e = self.tick()
         self.assertEqual((e["pinSeen"], e["wait"]["why"]), (True, "checks running"))
@@ -35563,7 +35634,7 @@ class LandTest(Base):
 
         def finish(key):
             self.w.refreshed.append(key)
-            self.pr(LA, checks=[("Skills", "COMPLETED", "FAILURE")])
+            self.pr(LA, checks=[("Skills", "COMPLETED", "SUCCESS")])
 
         self.q.refresh = finish
         self.t += gg.LAND_OWN_REFRESH_AFTER - 1
@@ -35573,14 +35644,16 @@ class LandTest(Base):
         self.assertLess(self.t, original_wake)
         self.q.tick(self.t, dirty=set())
         self.assertEqual(self.w.refreshed, [self.KEY])
-        self.w.answers.append(refusal("unreadable", LA, {"kind": "retry", "override_if_checks_finished": True}))
+        self.w.answers.append(ok_answer(LA))
         self.q.tick(self.t + 1, dirty=set())
         self.assert_merged_at(LA)
         self.assertEqual((len(self.w.explains()), self.w.refreshed), (1, [self.KEY]))
 
     def test_land_check_event_on_a_stale_running_pin_shares_the_host_read_budget(self):
+        # No override: a pinned override row is judged at once while its checks run (LAND_OVERRIDE_PIN_KINDS),
+        # so the stale-read recovery this covers is a plain pinned row's.
         self.pr(LA, checks=[("Skills", "IN_PROGRESS", None)])
-        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA, override=dict(self.OVERRIDE))
+        gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
         self.tick()
         self.t += gg.LAND_OWN_REFRESH_AFTER + 1
         self.q.recovery_at = self.t + gg.LAND_RECOVERY_SWEEP  # a head event between sweeps
@@ -35597,8 +35670,8 @@ class LandTest(Base):
         self.q.tick(self.t + 1, dirty={self.KEY})
         self.q.tick(self.t + 2, dirty={self.KEY})
         self.assertEqual((self.w.refreshed, self.w.explains(), self.merge_envs()), ([self.KEY], [], []))
-        self.pr(LA, checks=[("Skills", "COMPLETED", "FAILURE")])
-        self.w.answers.append(refusal("unreadable", LA, {"kind": "retry", "override_if_checks_finished": True}))
+        self.pr(LA, checks=[("Skills", "COMPLETED", "SUCCESS")])
+        self.w.answers.append(ok_answer(LA))
         self.q.tick(self.t + 3, dirty={self.KEY})  # fresh terminal evidence still judges at a full read budget
         self.assert_merged_at(LA)
 
