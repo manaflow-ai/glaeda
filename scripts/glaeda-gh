@@ -611,6 +611,7 @@ GQL_DOWN = re.compile(r"HTTP 5(?!04)\d\d|request failed: (?!TimeoutError)")
 # pr_query: 1 PR 4.0 and 5.8 s, 2 PRs 3.1 and 2.4 s, 4 PRs HTTP 502 after 14.1 and 10.9 s, 8 PRs HTTP 502 after 12.2
 # and 15.7 s. The batch sat at 8, every query 502'd, the 502s took GraphQL "down" and every PR went to REST one at a
 # time: 143 PR reads stored in 600 s against ~1,000 waited PRs, waited data 17,794 s old.
+GQL_GATEWAY_TIMEOUT = re.compile(r"HTTP 504|timed out \(GitHub answered 50[23]")
 GQL_SLOW_5XX_AFTER = 8.0
 GQL_NO_ANSWER = re.compile(r"request failed: (?!TimeoutError)")  # GQL_DOWN with no answer: REST reads it, unsplit
 MAX_BODY = 8 * 1024 * 1024
@@ -9472,10 +9473,13 @@ class Daemon:
             early_keys = {e["key"] for e in urgent_rest}
             spilled.extend(e for e in left if e["key"] not in early_keys)
 
-        def read_stale_pr(lead: dict) -> None:
+        def read_stale_pr(lead: dict, path: str) -> None:
             # A stale land can survive a restart with every in-memory heavy mark lost. Give the
             # oldest such PR a read before the batches, including when REST has no share left.
-            if self.rest_admits("pr", lead):
+            # A slot wait is local contention. Stay on GraphQL unless GitHub actually timed out
+            # or the scheduler already chose REST while the login was low.
+            error = (lead.get("cache") or {}).get("error") or ""
+            if (path == "rest" or GQL_GATEWAY_TIMEOUT.search(error)) and self.rest_admits("pr", lead):
                 self.read_rest([lead], [lead])
             else:
                 read_batches("pr", [lead])
@@ -9485,7 +9489,7 @@ class Daemon:
             if over[kind] != "graphql":
                 continue
             if kind == "pr" and (lead := self.starved_lead(blocked[kind])) is not None:
-                read_stale_pr(lead)
+                read_stale_pr(lead, over[kind])
                 blocked[kind] = [e for e in blocked[kind] if e["key"] != lead["key"]]
             plain = [e for e in due[kind] if not urgent(e)]
             # (a minute with none read since it was first due: a fresh daemon's first tick is no starvation)
@@ -9525,7 +9529,7 @@ class Daemon:
             if kind == "pr":
                 lead = self.starved_lead(due[kind])
                 if lead is not None:
-                    read_stale_pr(lead)
+                    read_stale_pr(lead, over[kind])
                     keys.add(lead["key"])
                     picked = [e for e in picked if e["key"] != lead["key"]]
                 read_batches(kind, [e for e in picked if self.waited(e)])
@@ -10689,7 +10693,7 @@ class Daemon:
                     for e in chunk:
                         self.store(e["key"], e["cache"], error=message[:300])
                 continue
-            timed_out = error and (SLOW.search(error) or re.search(r"HTTP 50[23]", error))
+            timed_out = error and GQL_GATEWAY_TIMEOUT.search(error)
             if timed_out and pr_timeout_rest and repo in pr_timeout_rest and self.rest_admits(kind, chunk[0]):
                 pr_timeout_rest[repo] = True
                 if len(chunk) > 1:
