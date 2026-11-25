@@ -9241,6 +9241,16 @@ def nested_checkouts(path: Path) -> list[Path] | None:
 
 OLD_TREE_BUDGET = 400_000  # entries git_state may read in a tree untouched for OLD_TREE_IDLE_S
 OLD_TREE_IDLE_S = 7 * 86400
+# Levels git_state searches in an item of a git_disposable family (tmp, scratch): the entry budget bounds the cost,
+# not the depth. At the default 5, any tree deeper than that read "unchecked" however few entries it held, the old-tree
+# retry raised only the budget, and the item stayed forever: a lane VM, 2026-11-25, /tmp at 30.2 GiB against
+# its 20 GiB cap, /tmp/swtc (an agent's toolchain download and extract, 4.1 GiB, 2190 entries, 11 levels)
+# "unchecked: too deep or large to rule out a git checkout" while idle past its window.
+DISPOSABLE_GIT_DEPTH = 64
+# The larger-budget retry for a git_disposable family's item starts after its usual 12 h tmp window, not
+# OLD_TREE_IDLE_S: the same VM's /tmp/probe (an agent's cmux-next-ios copy, 20k entries outside .build) sat just past
+# the 20k budget, so the item would have stayed "unchecked" for a week past its window.
+DISPOSABLE_OLD_TREE_IDLE_S = 12 * 3600
 
 
 def family_git_state(fam: "Family", path: Path) -> str:
@@ -9248,17 +9258,19 @@ def family_git_state(fam: "Family", path: Path) -> str:
     if not fam.nested_git:
         # a family whose items are caches by where they sit may skip their sealed parts; one that deletes
         # disposable checkouts (tmp, scratch) searches everything
-        state = git_state(path, sealed=not fam.git_disposable)
+        depth = DISPOSABLE_GIT_DEPTH if fam.git_disposable else 5
+        state = git_state(path, depth=depth, sealed=not fam.git_disposable)
         if state == "unchecked":
             # A tree past the default entry budget stayed "unchecked" forever (cmux17's 6 GiB cmux-focus-bench,
             # 28010 files, untouched 414 h, 2026-11-15). One untouched for OLD_TREE_IDLE_S gets one full search on a
             # larger budget; anything still ambiguous (budget, mount, read error) stays "unchecked": fail closed.
             try:
-                idle = time.time() - item_mtime(fam, path) >= OLD_TREE_IDLE_S
+                idle = time.time() - item_mtime(fam, path) >= (DISPOSABLE_OLD_TREE_IDLE_S if fam.git_disposable
+                                                                else OLD_TREE_IDLE_S)
             except OSError:
                 idle = False
             if idle:
-                state = git_state(path, budget=OLD_TREE_BUDGET, sealed=not fam.git_disposable)
+                state = git_state(path, depth=depth, budget=OLD_TREE_BUDGET, sealed=not fam.git_disposable)
         return state
     roots = nested_checkouts(path)
     return "unchecked" if roots is None else "git" if roots else "none"

@@ -1286,14 +1286,20 @@ def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, m
         row["runners"], row["gatewayRunners"], row["simRunners"], row["smallRunners"] = 0, 0, 0, 0
         installed, why = installed_pool_instances(member)
         row["retire"] = installed if installed is not None else why
+    # GATE_IS_THE_POOLS: check() is the pool's job-started gate (toolchain, Xcode, enrollment); a dedicatedOnly member
+    # runs no pool job, and each dedicated runner admits by its own `admit`, so a refusal there holds back nothing it
+    # serves. Until 2026-11-25 a gate refusal (cmux24: diffRustcVersion '' after a toolchain drift) skipped the whole
+    # member, so hq-fleet-route-lan and hq-ci-overflow were never installed while HQ's runners.json sent jobs to them:
+    # ws-check and the other fleet_route_lan jobs queued 5 h on a label no runner carried.
+    gate_ok = bool(eligible or args.include_ineligible or summary.get("dedicatedOnly"))
     if not args.apply:
-        row["action"] = "would apply" if eligible or args.include_ineligible else "skip (not eligible)"
+        row["action"] = "would apply" if gate_ok else "skip (not eligible)"
         if not summary.get("dedicatedOnly"):
             disk_listener_row(row, member, summary, manifest)
         if summary.get("dedicatedOnly"):
             row["action"] += (f"; dedicated only, retire pool instances {row['retire'] or 'none'}"
                               if isinstance(row["retire"], list) else f"; dedicated only, {row['retire']}")
-        elif eligible or args.include_ineligible:
+        elif gate_ok:
             # SURPLUS: the plan names the instances an apply would retire (read-only listing)
             installed, _ = installed_pool_instances(member)
             surplus = surplus_instances(installed or [], member_instance_count(row))
@@ -1303,7 +1309,7 @@ def one_member(member: str, summary: dict[str, Any], args: argparse.Namespace, m
                 row["action"] += (f"; retire surplus instances {surplus} when idle, once instances "
                                   f"{_instance_span(count)} apply")
         return row
-    if not (eligible or args.include_ineligible):
+    if not gate_ok:
         row["action"] = "skipped (not eligible)"
         return row
     override = None
