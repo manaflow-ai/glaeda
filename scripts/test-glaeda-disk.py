@@ -774,6 +774,38 @@ class GlaedaDiskTest(unittest.TestCase):
         (self.root / "repo/sub/.git").mkdir(parents=True)
         self.assertEqual(gd.git_state(self.root / "repo"), "git")
 
+    def test_disposable_family_searches_deep_trees_to_the_bottom(self) -> None:
+        # a lane VM, 2026-11-25: an extracted toolchain under /tmp (11 levels, 2190 entries) read "unchecked"
+        # at the default depth 5 forever; a git_disposable family is bounded by the entry budget, not the depth
+        tmp = gd.Family("tmp", self.root, True, "scratch", git_disposable=True)
+        deep = self.root / "toolchain"
+        (deep / "x/usr/lib/swift/linux/x86_64/a/b/c").mkdir(parents=True)
+        (deep / "x/usr/lib/swift/linux/x86_64/a/b/c/lib.so").write_text("x")
+        self.assertEqual(gd.git_state(deep), "unchecked")  # the plain default depth still fails closed
+        self.assertEqual(gd.family_git_state(self.fam, deep), "unchecked")  # so does a non-disposable family
+        self.assertEqual(gd.family_git_state(tmp, deep), "none")
+        (deep / "x/usr/lib/swift/linux/x86_64/a/b/c/repo/.git").mkdir(parents=True)
+        self.assertEqual(gd.family_git_state(tmp, deep), "git")  # a clone at the bottom is still found
+
+    def test_disposable_item_past_its_window_gets_the_larger_budget_within_a_day(self) -> None:
+        tmp = gd.Family("tmp", self.root, True, "scratch", git_disposable=True)
+        big = self.root / "copy"
+        for i in range(30):
+            (big / f"d{i}").mkdir(parents=True)
+            for j in range(10):
+                (big / f"d{i}" / f"f{j}").write_text("x")
+        real = gd.git_state
+
+        def small(path, depth=5, budget=20000, sealed=False):
+            return real(path, depth, 50 if budget == 20000 else budget, sealed)
+
+        with mock.patch.object(gd, "git_state", small):
+            self.age(big, *big.iterdir(), hours=13)
+            self.assertEqual(gd.family_git_state(tmp, big), "none")  # disposable, past 12 h: larger budget now
+            self.assertEqual(gd.family_git_state(self.fam, big), "unchecked")  # a cache family still waits 7 days
+            self.age(big, *big.iterdir(), hours=2)
+            self.assertEqual(gd.family_git_state(tmp, big), "unchecked")  # recent: fails closed
+
     def test_old_tree_past_default_budget_is_searched_on_a_larger_budget(self) -> None:
         big = self.root / "big"
         for i in range(30):
@@ -7316,6 +7348,16 @@ class GlaedaDiskTest(unittest.TestCase):
             self.assertIsNone(gd.saturation_halt({}, "10%"))
         with mock.patch.object(gd, "emergency_devs", return_value=frozenset()):
             self.assertIs(gd.saturation_halt({}, "10%"), gd.host_saturated)
+
+    def test_saturation_never_holds_a_filesystem_past_the_saturated_free_share(self) -> None:
+        total = 100 * gd.GIB
+        full = gd.Fs(1, "/", 10 * gd.GIB, total, 30 * gd.GIB, 40 * gd.GIB)
+        roomy = gd.Fs(1, "/", 40 * gd.GIB, total, 30 * gd.GIB, 40 * gd.GIB)
+        with mock.patch.object(gd, "emergency_devs", return_value=frozenset()):
+            self.assertIsNone(gd.saturation_halt({1: full}, "5%"))
+            self.assertIs(gd.saturation_halt({1: roomy}, "5%"), gd.host_saturated)
+            with mock.patch.dict(gd.POLICY, {"saturated_delete_below_free": "0"}):
+                self.assertIs(gd.saturation_halt({1: full}, "5%"), gd.host_saturated)
 
     def test_a_saturated_host_skips_the_apply_before_its_walks(self) -> None:
         """An agent host at load 21-29 (2026-11-23): the 15-minute `--pressure --idle --apply` pass ran at 74-86% CPU

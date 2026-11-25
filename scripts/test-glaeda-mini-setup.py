@@ -331,6 +331,7 @@ class MiniSetupTest(unittest.TestCase):
         self.assertTrue(gh["KeepAlive"])
         self.assertIn("/opt/homebrew/bin", gh["EnvironmentVariables"]["PATH"])  # gh supplies the token
         self.assertTrue(os.access(bin_dir / "glaeda-gh", os.X_OK))
+        self.assertTrue(os.access(bin_dir / "cmux-gh", os.X_OK))  # the primary name, beside the old one
         skill = self.home / ".claude/skills/github-ci-wait/SKILL.md"
         self.assertEqual(skill.read_bytes(), (ROOT / "skills/github-ci-wait/SKILL.md").read_bytes())
         self.assertEqual(skill.stat().st_mode & 0o777, 0o644)
@@ -444,7 +445,7 @@ class MiniSetupTest(unittest.TestCase):
         gen = update / "generations" / tag
         scripts = gen / "glaeda/scripts"
         scripts.mkdir(parents=True)
-        for name in ms.GH_ONLY_TOOLS:
+        for name in (*ms.GH_ONLY_TOOLS, "cmux-gh", "cmux-disk"):
             shutil.copy2(ms.SCRIPT_DIR / name, scripts / name)
         old = b"#!/bin/sh\necho previous release\n"
         for name in ("glaeda-gh", "glaeda-disk", "disk-pressure.sh"):
@@ -1068,7 +1069,7 @@ class MiniSetupTest(unittest.TestCase):
                           "glaeda-update.service", "glaeda-update.timer"])
         self.assertNotIn("--idle", (units / "glaeda-disk-pressure.service").read_text())
         self.assertEqual(sorted(p.name for p in (self.home / ".local/bin").iterdir()),
-                         ["disk-pressure.sh", "glaeda-disk", "glaeda-gh", "glaeda-update"])
+                         ["cmux-disk", "cmux-gh", "disk-pressure.sh", "glaeda-disk", "glaeda-gh", "glaeda-update"])
         config = json.loads((self.home / ".config/glaeda/update.json").read_text())
         self.assertEqual((config["ring"], config["setupArgs"]), ("stable", ["--gh-only"]))
         self.assertTrue((self.home / ".claude/skills/github-ci-wait/SKILL.md").is_file())

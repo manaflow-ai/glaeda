@@ -524,13 +524,13 @@ class DedicatedOnlyApplyTest(unittest.TestCase):
         self.assertIsNone(got["exit"])
         self.assertIn("no deregistration plan", got["state"])
 
-    def one_member(self, retired_exit, relisted=([], None)):
+    def one_member(self, retired_exit, relisted=([], None), gate=(True, "ok")):
         summary = {"class": "std", "runners": 4, "gatewayRunners": 0, "capacityUnits": 14, "dedicatedOnly": True}
         args = SimpleNamespace(scope_flags=False, apply=True, include_ineligible=False, allow_downgrade=None,
                                guard={"head": "h", "refusals": []}, skip_launchctl=False, org=None,
                                migrate_from_repo=None)
         man = manifest({"dedicatedOnly": True, "dedicated": [NIGHTLY_ONLY]})
-        with mock.patch.object(fleet, "check", return_value=(True, "ok")), \
+        with mock.patch.object(fleet, "check", return_value=gate), \
                 mock.patch.object(fleet, "stage", return_value=None), \
                 mock.patch.object(fleet, "prepare_headless", return_value=None), \
                 mock.patch.object(fleet, "installed_pool_instances", side_effect=[([0, 1], None), relisted]), \
@@ -547,6 +547,13 @@ class DedicatedOnlyApplyTest(unittest.TestCase):
         self.assertEqual(row["action"], "failed")
         self.assertIn("held", row["instances"][-1]["state"])
         row, dedicated = self.one_member(0)
+        dedicated.assert_called_once()
+        self.assertEqual(row["action"], "applied")
+
+    def test_a_pool_gate_refusal_does_not_hold_back_a_dedicated_only_members_runners(self):
+        # GATE_IS_THE_POOLS (2026-11-25, cmux24): the pool toolchain gate refused, and the member's dedicated runners
+        # were never installed; an unreachable member still fails
+        row, dedicated = self.one_member(0, gate=(False, "refused: node not eligible (toolchain drifted)"))
         dedicated.assert_called_once()
         self.assertEqual(row["action"], "applied")
 

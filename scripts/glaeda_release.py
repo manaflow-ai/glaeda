@@ -164,7 +164,8 @@ def smoke(archive: Path, target: str, source: str, python: str = sys.executable)
         (channel / "stable.json").write_bytes(b"")
         env = {"HOME": str(home), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"}
         runs = [[python, str(scripts / name), "--help"]
-                for name in ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-gh", "glaeda-mini-health")]
+                for name in ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-gh", "glaeda-mini-health",
+                             "cmux-disk", "cmux-procs", "cmux-disk-registry")]
         runs += [[str(root / "gen/bin/glaeda-worktree-reclaim"), "--help"],
                  [python, str(scripts / "glaeda-update"), "--channel-dir", str(channel)]]
         for argv in runs:

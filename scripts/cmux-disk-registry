@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+"""cmux-disk-registry: the primary name of glaeda-disk-registry (Leo, 2026-11-25: "start migrating off glaeda and into
+cmux-prefixed naming tooling"). It runs glaeda-disk-registry beside it in this same process (no second interpreter)
+with sys.argv[0] left as cmux-disk-registry, so help and usage say cmux-disk-registry. The code stays in one file so
+every updater (OTA, fast-patch) and the open PRs on it reach both names at once. Python, not sh, because launchd
+agents and glaeda-update's health check run these tools as `python3 PATH`. glaeda-disk-registry keeps working and
+prints nothing about the rename; it counts its own uses in ~/.local/state/cmux-names/glaeda-disk-registry.json so the
+old name can be retired once nothing calls it (cmuxterm-hq docs/design/glaeda-into-cmux.md, Rename map)."""
+import __main__
+import os
+import sys
+
+os.environ["CMUX_NAME_AS"] = "cmux-disk-registry"
+_target = os.path.join(os.path.dirname(os.path.abspath(__file__)), "glaeda-disk-registry")
+sys.path[0] = os.path.dirname(_target)
+__main__.__file__ = _target  # the program finds its siblings (intent.py, glaeda-disk-registry) beside its own file
+with open(_target, "rb") as _source:
+    _code = compile(_source.read(), _target, "exec")
+exec(_code, __main__.__dict__)  # noqa: S102  runpy.run_path would reset sys.argv[0] to the old name

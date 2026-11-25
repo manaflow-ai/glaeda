@@ -1,12 +1,15 @@
 ---
 name: github-ci-wait
-description: "Wait for GitHub CI, watch a workflow run, poll PR checks, wait for a reply comment (a bot's receipt), or answer 'is CI green' without burning the shared GitHub quota. Use glaeda-gh (a local daemon that is the only poller) instead of gh run watch, gh run view loops, sleep-and-read loops, or per-PR REST scans. Use whenever you would wait for CI, watch the run, poll checks, wait for a comment, check whether CI is green or a PR merged, or sweep many PRs."
+description: "Wait for GitHub CI, watch a workflow run, poll PR checks, wait for a reply comment (a bot's receipt), or answer 'is CI green' without burning the shared GitHub quota. Use cmux-gh (a local daemon that is the only poller) instead of gh run watch, gh run view loops, sleep-and-read loops, or per-PR REST scans. Use whenever you would wait for CI, watch the run, poll checks, wait for a comment, check whether CI is green or a PR merged, or sweep many PRs."
 ---
 
-# Wait on GitHub with glaeda-gh
+# Wait on GitHub with cmux-gh
+
+`cmux-gh` is the name of what was `glaeda-gh`. The old name still runs the same program, so nothing that
+calls `glaeda-gh` breaks; say `cmux-gh` in new notes and commands.
 
 Every session on this machine shares one GitHub account, so one REST quota of 5000 requests an
-hour. Sessions polling on their own used it all up. `glaeda-gh` is a local daemon that is the
+hour. Sessions polling on their own used it all up. `cmux-gh` is a local daemon that is the
 only process polling: one batched GraphQL query for every watched PR, ETag requests for runs
 (an unchanged run costs nothing), and one batched query every 15 s for comment waits. Its
 commands read the daemon's cache and make no API calls.
@@ -14,28 +17,28 @@ On the tailnet the daemon also follows the cmux build controller, which receives
 check and comment webhooks (cmuxterm-hq#675). A finished run, a PR check change or a bot's
 reply then reaches `wait` within a few seconds at no quota cost. Public repos need no token;
 private ones (cmuxterm-hq) need `~/.config/cmux/build-fleet/controller.token`. Without the
-controller everything still works by polling, only slower; `glaeda-gh budget` says which.
+controller everything still works by polling, only slower; `cmux-gh budget` says which.
 
 ## Wait and check
 
 ```bash
-glaeda-gh wait pr OWNER/REPO#N --sha "$(git rev-parse HEAD)"   # until green; 1 at the first failed check
-glaeda-gh wait pr OWNER/REPO#N --until done      # until every check finishes (0 green, 1 red, 4 conflict)
-glaeda-gh wait pr OWNER/REPO#N --until required  # only the checks GitHub requires decide (opt-in)
-glaeda-gh wait pr OWNER/REPO#N --until merged    # ignores conflicts; 1 if closed without merging
+cmux-gh wait pr OWNER/REPO#N --sha "$(git rev-parse HEAD)"   # until green; 1 at the first failed check
+cmux-gh wait pr OWNER/REPO#N --until done      # until every check finishes (0 green, 1 red, 4 conflict)
+cmux-gh wait pr OWNER/REPO#N --until required  # only the checks GitHub requires decide (opt-in)
+cmux-gh wait pr OWNER/REPO#N --until merged    # ignores conflicts; 1 if closed without merging
 # green on an OPEN PR is not merged: it prints `result: green (checks passed; PR still OPEN, not merged)` and
-# `next: glaeda-gh wait pr OWNER/REPO#N --until merged` (exit 0; --json: "merged": false). With no --until, a PR
+# `next: cmux-gh wait pr OWNER/REPO#N --until merged` (exit 0; --json: "merged": false). With no --until, a PR
 # glaeda land holds a request for is waited on until merged (said on stderr); the land's own stop ends it on its checks
 # --until (and every other choice) takes a synonym or one typo of a choice (checks-done, passed, merge) and says on stderr which it ran
-glaeda-gh wait run OWNER/REPO/RUN_ID [--jobs]    # 0 success, 1 failure
-glaeda-gh wait comment OWNER/REPO#N --author 'github-actions[bot]' --match 'REGEX' --since COMMENT_URL
-glaeda-gh status pr OWNER/REPO#N                 # one look: state, mergeable, checks, review
-glaeda-gh status pr OWNER/REPO#12 13 14 o/x#7    # several PRs, one gather (bare N reuses the repo before it)
-glaeda-gh status pr OWNER/REPO#12 13 --field head,checks.state,checks.failed   # just those, tab-separated
-glaeda-gh status run OWNER/REPO/RUN_ID --jobs
-glaeda-gh status comment OWNER/REPO#N            # the latest comments
-glaeda-gh budget                                 # REST and GraphQL left, the daemon's own use, its heartbeat
-glaeda-gh runners OWNER[/REPO] [--label L] [--json]  # online, busy and idle self-hosted runners per label
+cmux-gh wait run OWNER/REPO/RUN_ID [--jobs]    # 0 success, 1 failure
+cmux-gh wait comment OWNER/REPO#N --author 'github-actions[bot]' --match 'REGEX' --since COMMENT_URL
+cmux-gh status pr OWNER/REPO#N                 # one look: state, mergeable, checks, review
+cmux-gh status pr OWNER/REPO#12 13 14 o/x#7    # several PRs, one gather (bare N reuses the repo before it)
+cmux-gh status pr OWNER/REPO#12 13 --field head,checks.state,checks.failed   # just those, tab-separated
+cmux-gh status run OWNER/REPO/RUN_ID --jobs
+cmux-gh status comment OWNER/REPO#N            # the latest comments
+cmux-gh budget                                 # REST and GraphQL left, the daemon's own use, its heartbeat
+cmux-gh runners OWNER[/REPO] [--label L] [--json]  # online, busy and idle self-hosted runners per label
 ```
 
 - `wait` exits 0 on success (or a matching comment), 1 on failure (including a PR closed without
@@ -51,7 +54,7 @@ glaeda-gh runners OWNER[/REPO] [--label L] [--json]  # online, busy and idle sel
   `nothing-reported`, `inconclusive`, `no-data-yet`, `usage`, `refused`, `daemon-down`). A PR or run GitHub does not know is
   `not-found` (exit 1) on the daemon's first read of it, not a wait to the timeout. `status` exits 3 when
   the daemon has not read a target yet. Deadlines are UTC with a Z (`17:55:00Z`).
-- While it blocks, a `wait pr|run` prints `glaeda-gh: still waiting on KEY: 240s of 1800s, deadline
+- While it blocks, a `wait pr|run` prints `cmux-gh: still waiting on KEY: 240s of 1800s, deadline
   17:55:00Z; <state>` every 120 s on stderr, the stream of its waiting line; a timeout's last lines say
   `waited N s for ... (deadline ...Z); last seen: ...` and `next:` the same wait again.
 - Run one background `wait` per PR, run or comment (Bash `run_in_background`), not one wait
@@ -61,7 +64,7 @@ glaeda-gh runners OWNER[/REPO] [--label L] [--json]  # online, busy and idle sel
   only: the line in your capture says that wait reached the point of blocking. Its absence says
   nothing — the wait may have been reaped, or stderr may have been a stream the line was dropped
   on rather than becoming the wait's own failure (a closed fd, a pipe with no reader, a full pipe).
-  To tell a live wait from a gone one, look for the process: `pgrep -af "glaeda-gh wait"`.
+  To tell a live wait from a gone one, look for the process: `pgrep -af "cmux-gh wait"`.
   A `wait` launched from a session's foreground shell is reaped with that shell, silently; a bare
   `&` from inside a tool call is what gets reaped — use the harness's background mode, or
   `setsid nohup … </dev/null &`.
@@ -90,8 +93,8 @@ glaeda-gh runners OWNER[/REPO] [--label L] [--json]  # online, busy and idle sel
   client makes one bounded long-poll request to the existing run endpoint (up to 300 seconds), then
   uses the normal cache verdict path; unknown or unavailable controllers fall back to the daemon's
   ordinary wait cadence. This is a one-shot request, not a client-side polling loop.
-- Add `--json` for machine-readable output. URLs work too: `glaeda-gh wait pr https://github.com/o/r/pull/12`.
-- Looking at several PRs: one `status pr` with all of them, never a `for n in ...; do glaeda-gh status pr`
+- Add `--json` for machine-readable output. URLs work too: `cmux-gh wait pr https://github.com/o/r/pull/12`.
+- Looking at several PRs: one `status pr` with all of them, never a `for n in ...; do cmux-gh status pr`
   loop. The daemon reads them together (one batched GraphQL query per 15 PRs when PRs read over GraphQL);
   a loop lands each in its own tick. `--json` then prints a list (one target still prints one object).
   `--field a,b.c` prints just those values of the `--json` object, tab-separated, one line per PR
@@ -107,20 +110,20 @@ glaeda-gh runners OWNER[/REPO] [--label L] [--json]  # online, busy and idle sel
 ## Waiting on a file or a process: no sleep loops
 
 ```bash
-glaeda-gh wait file PATH --timeout 600           # exists and not empty ([ -s PATH ]); PATH may be a glob
-glaeda-gh wait file PATH --exists | --gone | --contains 'REGEX'
-glaeda-gh wait until quota --timeout 4000       # until this host's GitHub quota reset; or 14:40Z, an ISO time, 45m
-glaeda-gh wait pid 12345                         # until the process exits
+cmux-gh wait file PATH --timeout 600           # exists and not empty ([ -s PATH ]); PATH may be a glob
+cmux-gh wait file PATH --exists | --gone | --contains 'REGEX'
+cmux-gh wait until quota --timeout 4000       # until this host's GitHub quota reset; or 14:40Z, an ISO time, 45m
+cmux-gh wait pid 12345                         # until the process exits
 ```
 
 Exit 0 when ready, 2 on timeout. Run it with `run_in_background`. The polling hook refuses
 `until [ -s FILE ]; do sleep N; done`-style loops (on 2026-10-20 Huge Blue had nine of them keeping
 sessions alive); these commands replace them.
 
-## Reading many heads' checks: glaeda-gh checks
+## Reading many heads' checks: cmux-gh checks
 
 ```bash
-glaeda-gh checks OWNER/REPO SHA [SHA ...] --consumer NAME --json
+cmux-gh checks OWNER/REPO SHA [SHA ...] --consumer NAME --json
 ```
 
 The daemon reads each commit's checks once for every session and keeps them (a finished head 10
@@ -128,7 +131,7 @@ minutes, a running one 90 s), so ten sessions asking about one head cost one rea
 who you are (`autoland` for next-autoland, otherwise your session's name): each consumer has an
 hourly budget of head reads. `autoland` is reserved, so its reads are served whatever the others
 use; other consumers share a pool and, once it is spent or the quota is lean, get the cached answer
-(`stale: true`) or `unread`. Exit 0 all fresh, 5 some stale or unread. `glaeda-gh budget` shows each
+(`stale: true`) or `unread`. Exit 0 all fresh, 5 some stale or unread. `cmux-gh budget` shows each
 consumer's spend. Prefer it over `gh pr checks` or `gh api .../check-runs` for more than a look.
 
 ## After a push: --sha
@@ -140,7 +143,7 @@ at once rather than waiting for a commit that will never appear. For a run, a `-
 the run's commit is also an error: a run's commit never changes. A workflow_dispatch run's commit is
 the dispatch ref's tip (main), not the commit it tested, so a dispatch that names the commit in its
 run-name as `OWNER/REPO@<full sha>` (manaflow-ai/cmux fast-checks: `cmux-ci test` prints
-`glaeda-gh wait run manaflow-ai/cmux/RUN --sha HEAD`) counts as that commit's. It must be the full
+`cmux-gh wait run manaflow-ai/cmux/RUN --sha HEAD`) counts as that commit's. It must be the full
 id and this run's repo. A prefix, another commit or another repo's commit is still an error.
 
 ## Merge conflicts: exit 4
@@ -171,8 +174,8 @@ the same way: `held: ... cancelled before any step ran`.
 For a bot's reply, such as the callsign receipt on teamleaderleo/stensibly#454:
 
 ```bash
-url=$(glaeda-gh post comment teamleaderleo/stensibly#454 --body "/callsign reserve ..." --wait 300)
-glaeda-gh wait comment teamleaderleo/stensibly#454 --author 'github-actions[bot]' \
+url=$(cmux-gh post comment teamleaderleo/stensibly#454 --body "/callsign reserve ..." --wait 300)
+cmux-gh wait comment teamleaderleo/stensibly#454 --author 'github-actions[bot]' \
   --match "${url##*#}\b" --since "$url" --timeout 300
 ```
 
@@ -185,18 +188,18 @@ glaeda-gh wait comment teamleaderleo/stensibly#454 --author 'github-actions[bot]
   controller receives webhooks for (teamleaderleo/stensibly among them) arrives within seconds;
   otherwise the daemon reads the latest 50 comments every 15 s while someone waits.
 
-## Posting comments, PRs and reviews: glaeda-gh post
+## Posting comments, PRs and reviews: cmux-gh post
 
 GitHub limits content creation account-wide ("was submitted too quickly"). When every session
 posts and retries on its own, they keep tripping the limit for each other. Queue the write instead:
 
 ```bash
-glaeda-gh post comment OWNER/REPO#N --body-file - <<'EOF'      # prints "queued as ID; ..." and returns
+cmux-gh post comment OWNER/REPO#N --body-file - <<'EOF'      # prints "queued as ID; ..." and returns
 ...
 EOF
-glaeda-gh post pr OWNER/REPO --head BRANCH --base main --title "..." --body-file body.md [--reviewer LOGIN]
-glaeda-gh post review OWNER/REPO#N --event approve|comment|request-changes --body-file -
-glaeda-gh post status ID [--wait 300]        # the URL once posted (0), failed (1), still queued (2)
+cmux-gh post pr OWNER/REPO --head BRANCH --base main --title "..." --body-file body.md [--reviewer LOGIN]
+cmux-gh post review OWNER/REPO#N --event approve|comment|request-changes --body-file -
+cmux-gh post status ID [--wait 300]        # the URL once posted (0), failed (1), still queued (2)
 ```
 
 The daemon sends one write every few seconds, oldest first. When GitHub says to slow down, it
@@ -226,21 +229,21 @@ With `job`, that job must have finished with `conclusion` (default success):
   plus the hook's own literal `env` map: no token. Output goes to `~/.cache/glaeda/gh/on-event/`.
 - Only the repositories the controller's webhooks cover (not manaflow-ai/cmux-platform), and only
   while the daemon runs and reads the controller itself (not through an upstream, as lane VMs do).
-- `glaeda-gh on-event` shows the hooks, refused config and the last outcomes (`ran` with its exit
-  code, `no-match`, `unresolved`). `glaeda-gh on-event replay --run-file F --jobs-file F --wait 60`
+- `cmux-gh on-event` shows the hooks, refused config and the last outcomes (`ran` with its exit
+  code, `no-match`, `unresolved`). `cmux-gh on-event replay --run-file F --jobs-file F --wait 60`
   feeds one run record through the same path to prove a hook.
 
-## Landing a PR: glaeda-gh land
+## Landing a PR: cmux-gh land
 
 Say it once; the daemon lands it. No update-branch / wait / read-the-head / merge-again loops by hand.
 
 ```bash
-glaeda-gh land OWNER/REPO#N                         # queue it; returns at once
-glaeda-gh land OWNER/REPO#N --after OWNER/REPO#M    # only after #M merged (a chain: one land per PR)
-glaeda-gh land OWNER/REPO#N --notify HOST/SESSION   # who hears of the merge or the stop
-glaeda-gh land OWNER/REPO#N --wait 3600             # also wait: 0 merged, 1 stopped, 2 still going
-glaeda-gh land status [OWNER/REPO#N] [--json]       # state, last step, refusals, history; steps per day
-glaeda-gh land cancel OWNER/REPO#N
+cmux-gh land OWNER/REPO#N                         # queue it; returns at once
+cmux-gh land OWNER/REPO#N --after OWNER/REPO#M    # only after #M merged (a chain: one land per PR)
+cmux-gh land OWNER/REPO#N --notify HOST/SESSION   # who hears of the merge or the stop
+cmux-gh land OWNER/REPO#N --wait 3600             # also wait: 0 merged, 1 stopped, 2 still going
+cmux-gh land status [OWNER/REPO#N] [--json]       # state, last step, refusals, history; steps per day
+cmux-gh land cancel OWNER/REPO#N
 ```
 
 - The daemon asks `land-judge explain R N --sha HEAD --json` at the head its cache shows, and takes
@@ -264,13 +267,13 @@ glaeda-gh land cancel OWNER/REPO#N
 
 ## When the daemon is down or hung
 
-`glaeda-gh` exits 3 when the daemon is down or hung. Run `glaeda-gh restart` once, then wait
+`cmux-gh` exits 3 when the daemon is down or hung. Run `cmux-gh restart` once, then wait
 again. Do not fall back to polling GitHub yourself, and do not run `launchctl kickstart`,
 `bootout`/`bootstrap` or `systemctl` yourself: on 10-20 about ten sessions kickstarted it at once,
 each kickstart killed the daemon the previous one had just started, and launchd throttled the
 respawns ("spawn scheduled", "spawn failed") for most of an hour.
 
-`glaeda-gh restart` is safe from many sessions at the same time. One of them restarts the daemon;
+`cmux-gh restart` is safe from many sessions at the same time. One of them restarts the daemon;
 the others are told that a restart is under way or happened in the last 3 minutes, and should just
 re-run their wait. It does nothing when the daemon is healthy, and refuses when every cycle fails
 (a restart cannot fix a bug). It stops a hung lock holder, kickstarts the LaunchAgent (or restarts
@@ -283,10 +286,10 @@ If it was never installed: `glaeda-mini-setup --hygiene-only --apply` from the g
 On a lane VM (a host whose `~/.config/glaeda/upstream.json` names an upstream), the daemon reads through the
 broker host's cache. The broker host reads a key a wait is blocked on within about a minute, even while the
 shared GraphQL quota sits under the fleet's reserve (down to half of it). A wait whose data is older than 120 s reads its
-one target itself through `lane-gh call get` (or the file's `"direct"` program) and says `direct read answered`, without a `glaeda-gh restart` hint.
+one target itself through `lane-gh call get` (or the file's `"direct"` program) and says `direct read answered`, without a `cmux-gh restart` hint.
 A restart there never helps: the data is the upstream's (glaeda#2029).
 
-Never run `glaeda-gh serve` yourself, not even under `timeout`: it refuses while the service is
+Never run `cmux-gh serve` yourself, not even under `timeout`: it refuses while the service is
 loaded, and a hand-started serve that took the lock froze every session's waits on 10-20.
 
 If it prints `every cycle since ... has failed with ERROR at SITE`, the daemon runs but a bug makes
@@ -299,13 +302,13 @@ Leo, 2026-10-29: "dont we already have apps that tell us about stuff and we can 
 instead of directly callign either hte rest or graphql apis?" Read what our own systems already hold,
 never a raw API loop:
 
-- `gh` on an agent host is a chain that ends in glaeda's broker (`glaeda-gh gh`): the gh-quota shim and
+- `gh` on an agent host is a chain that ends in glaeda's broker (`cmux-gh gh`): the gh-quota shim and
   the PATH guard keep their rules, then the broker answers. A `pr view N --json` of fields the daemon
   holds costs nothing, and every other read it keeps (`pr view`, `pr list`, `pr checks N`, `pr diff N`,
   `issue view N`, `issue list`, `run view`, `run list`, `search ...`, `gh api` GET and GraphQL queries)
   is one request for every session on the host within 60 s; a finished job's log is kept 10 minutes.
   Prefer `--json` (or `--jq`): data output is shared across terminals, a rendered table is not.
-- Status: `glaeda-gh status pr|run`, `glaeda-gh wait ...` and `glaeda-gh checks` (above) read the daemon's
+- Status: `cmux-gh status pr|run`, `cmux-gh wait ...` and `cmux-gh checks` (above) read the daemon's
   cache; `now` (or `now json`) is the NOW page, cmuxterm-hq `reconciler-state/now`, for what is in flight
   fleet-wide; `pr-overlap` (or `pr-overlap N`) for which open PRs touch the same files; the fleet
   dashboard (`data.json` on cmux-lawrence:8444) for runners, the queue and alerts.
@@ -325,13 +328,13 @@ never a raw API loop:
 
 ## Fine to do directly
 
-- Single reads, merges, labels, and dispatches with `gh`. Comments, PRs and reviews: `glaeda-gh post`.
-- Logs: ask a question instead of reading a whole log. `glaeda-gh log errors OWNER/REPO JOB_ID` prints one
-  job's error-level lines by step. `glaeda-gh log search OWNER/REPO 'PATTERN' --since 24h` names the recent
-  jobs that printed it. `glaeda-gh log flaky OWNER/REPO [TEST]` lists failing tests by name and marks the ones
+- Single reads, merges, labels, and dispatches with `gh`. Comments, PRs and reviews: `cmux-gh post`.
+- Logs: ask a question instead of reading a whole log. `cmux-gh log errors OWNER/REPO JOB_ID` prints one
+  job's error-level lines by step. `cmux-gh log search OWNER/REPO 'PATTERN' --since 24h` names the recent
+  jobs that printed it. `cmux-gh log flaky OWNER/REPO [TEST]` lists failing tests by name and marks the ones
   whose job passed on re-run. Both scans read the build controller's job history and kept logs, never REST.
-  `glaeda-gh log job` prints the whole log when you need it.
+  `cmux-gh log job` prints the whole log when you need it.
 - One-off reads across many PRs: a single batched GraphQL query with aliases
   (`p0: repository(owner:, name:) { pullRequest(number:) { ... } } p1: ...`) through `gh api graphql`.
   GraphQL has its own 5000-point quota, and one aliased query costs about 1 point.
-- Before a sweep that needs many REST calls, run `glaeda-gh budget` first and keep well above 500 left.
+- Before a sweep that needs many REST calls, run `cmux-gh budget` first and keep well above 500 left.
