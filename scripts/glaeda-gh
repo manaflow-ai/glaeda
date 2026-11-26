@@ -1485,6 +1485,10 @@ PR_FULL_EVERY = 600  # a probed PR is still read in full this often (a renamed c
 # whose expected time, by the seconds per full PR measured for that repository (full_pr_secs), stays under this.
 PR_FULL_QUERY_SECONDS = 6.0
 PR_FULL_SLOW_AT = 8.0  # a failed full-read query this slow taught that its PRs cost at least this much between them
+# The measure lives in this file under BASE, so a reexec starts from it. Kept in memory only, every restart (the land
+# host restarts on each deploy, 2026-11-26 03:03-03:11Z) began with no measure: one cmux query of all 10 full reads,
+# then 4, 3 and 1, each cut by GitHub at 10.5-11 s, about 43 s of failed reads and their GraphQL cost before it read.
+FULL_PR_SECS_FILE = "full-pr-secs.json"
 # ... unless PR reads are behind (pr_behind): then a probe stands in for a full read up to PR_FULL_BEHIND_EVERY. A full
 # cmux PR costs GitHub about 3.5 s to answer and a probe about 0.5 s (one host, 2026-11-22: 13-16 s for a batch of 8,
 # 4-6 s for a probe of 10, the same PRs). With PR_FULL_EVERY as short as the stale bound, every PR in a backlog was past
@@ -2293,6 +2297,13 @@ def read_json(path: Path) -> Any:
         return json.loads(path.read_text())
     except (OSError, ValueError):
         return None
+
+
+def load_full_pr_secs(path: Path) -> dict[str, float]:
+    """The seconds per full PR read a daemon measured before its reexec (FULL_PR_SECS_FILE); {} when none is readable."""
+    saved = read_json(path)
+    return {str(k): float(v) for k, v in (saved.items() if isinstance(saved, dict) else ())
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and 0 < v < 3600}
 
 
 def read_cache(key: str) -> dict | None:
@@ -6427,7 +6438,9 @@ class Daemon:
         self.reads: list[tuple[float, str, str]] = []  # (time, kind, bucket) per entry read, for the last hour
         self.read_secs: list[tuple[float, str, str, float, int]] = []  # (time, kind, bucket, seconds, entries) read_seconds
         self.batch: dict[str, int] = {kind: GQL_BATCH_START for kind in CYCLES}  # entries per GraphQL query
-        self.full_pr_secs: dict[str, float] = {}  # owner/repo -> seconds per PR of a full GraphQL read (fetch_prs)
+        # owner/repo -> seconds per PR of a full GraphQL read (fetch_prs), carried across a reexec (FULL_PR_SECS_FILE)
+        self.full_pr_secs_path: Path | None = BASE / FULL_PR_SECS_FILE
+        self.full_pr_secs: dict[str, float] = load_full_pr_secs(self.full_pr_secs_path)
         self.clean: dict[str, int] = {kind: 0 for kind in CYCLES}  # clean GraphQL queries in a row
         # key -> {"at": last lone read, "fails": lone timeouts in a row, "oks": lone answers in a row}
         self.heavy: dict[str, dict] = {}
@@ -11923,6 +11936,10 @@ class Daemon:
                 measured[repo] = floor
                 log({"event": "pr-full-seconds", "repo": repo, "seconds": round(floor, 2),
                      "size": self.full_pr_size(entries), "after": round(seconds, 1), "of": len(entries)})
+        path = getattr(self, "full_pr_secs_path", None)
+        if path is not None and measured.get(repo) != known:
+            with contextlib.suppress(OSError):  # a lost write costs one relearned measure after a restart, no more
+                write_json(path, {k: round(v, 3) for k, v in measured.items()})
 
     def probe_ok(self, e: dict) -> bool:
         """Whether this PR's cached answer may be confirmed by a probe instead of read in full: a whole GraphQL read
@@ -21459,11 +21476,15 @@ class LandQueue:
         (it is no ancestor of the pin, its reads never answered, or this host has no gh-quota shim to read it with)."""
         pin = str(e.get("pinSha") or "")
         head = str(head or "").lower()
-        if not pin or not SHA40.fullmatch(head) or not land_head_moved(pin, head) \
-                or self.head_ancestry(e, head, pin, data) is not None or self.gh() is None:
-            return False  # known (an ancestor's wait is old_pin_wait's, which the caller asked first), or no shim
-        if (e.get("oldPinWait") or {}).get("head") == head:
-            return False  # a pin it followed away from, whose wait ran out: an older commit already, no read
+        if not pin or not SHA40.fullmatch(head) or not land_head_moved(pin, head) or self.gh() is None:
+            return False  # no shim to read it with
+        known = self.head_ancestry(e, head, pin, data)
+        if known is True or (known is None and (e.get("oldPinWait") or {}).get("head") == head):
+            # an older commit of the pin, or a pin it followed away from, whose wait (old_pin_wait, which the caller
+            # asked first) ran out: GitHub's branch ref decides on a worker (stale_live_job), never a stop naming it
+            return self.stale_live_wait(e, head, pin)
+        if known is not None:
+            return False  # a commit made on the pin, or read to be no ancestor of it: the caller stops it
         if (e.get("baseMergeUnread") or {}).get("head") == head and e["state"] == "waiting" \
                 and float(e.get("wakeAt") or 0) > self.now:
             return True  # its read failed: read again on that wait's wake
@@ -21543,6 +21564,87 @@ class LandQueue:
         keep[f"{head}...{pin}"] = {**({"ancestor": ancestor} if ancestor is not None else {}), "at": self.now,
                                    **({"why": why} if why else {})}
         e["headAncestry"] = keep
+
+    def stale_live_wait(self, e: dict, head: str, pin: str) -> bool:
+        """Under the lock, from ancestry_wait: HEAD, which the copy shows, is an older commit of the pin (or a pin E
+        followed away from) and old_pin_wait's LAND_HEAD_TIMEOUT ran out. One read of GitHub's branch ref decides, on a
+        worker (stale_live_job) and no sooner than the wait a failed read set (base_merge_unread). Always True: the
+        caller does not stop E; the job keeps the pin, stops naming the branch's head, or waits (stale_live)."""
+        if (e.get("baseMergeUnread") or {}).get("head") == head and e["state"] == "waiting" \
+                and float(e.get("wakeAt") or 0) > self.now:
+            return True  # its read failed: read again on that wait's wake
+        if e["key"] in self.jobs:
+            return True
+        if self.busy() >= self.workers():
+            self.gated(e, ready=True)  # waits for a free worker like every other read (ancestry_wait's comment)
+            return True
+        self.submit(e["key"], self.stale_live_job, e["key"], head, pin, int(e.get("gen") or 0))
+        return True
+
+    def stale_live_job(self, key: str, head: str, pin: str, gen: int = 0) -> None:
+        """On a worker, from stale_live_wait: read GitHub's branch ref (update_live_tip) and let stale_live decide; at
+        HEAD itself the branch really is there, so E stops head_moved naming it as before. A `land cancel` or a newer
+        `land` meanwhile wins (check)."""
+        was, self.local.gen = getattr(self.local, "gen", None), gen
+        try:
+            e = self.entries.get(key)
+            if e is None:
+                return
+            live = self.update_live_tip(e, (self.cache_of(key) or {}).get("data") or {})[0]
+            with self.lock:
+                self.check(e)
+                if str(e.get("pinSha") or "") != pin or e.get("state") == "stopped":
+                    return
+                if not self.stale_live(e, head, pin, live):
+                    e.pop("pinWait", None)
+                    self.stop(e, "head_moved", land_moved_clause(head, pin) + " (GitHub's branch ref is at it too)",
+                              f"glaeda-gh land {e['repo']}#{e['number']} --sha {head}")
+                self.save(e)
+        except LandCancelled:
+            pass
+        finally:
+            self.local.gen = was
+
+    def stale_live(self, e: dict, head: str, pin: str, live: str) -> bool:
+        """Under the lock (LAND_STALE_LIVE's comment): HEAD, the copy's head, is an older commit of PIN and its wait
+        ran out; LIVE is GitHub's branch ref read just now ("" when the read failed). True when this decided E: at the
+        pin it is kept and the wait starts again; at another head the stop names that head; a failed read waits and is
+        read again (base_merge_unread), and past LAND_BASE_MERGE_UNREAD_MAX failed reads it stops naming the pin, which
+        is newer than HEAD, never HEAD. False when the branch ref is at HEAD too: the caller stops it as before."""
+        repo_n = f"{e['repo']}#{e['number']}"
+        if live == pin:
+            e.pop("baseMergeUnread", None)
+            e["oldPinWait"] = {"head": head, "since": self.now, "nudgedAt": self.now}
+            self.history(e, LAND_STALE_LIVE, head=head[:12], pin=pin[:12],
+                         why="an older commit of the pin; GitHub's branch is at the pin")
+            self.nudge(e["key"])
+            self.requeue(e)
+            return True
+        if SHA40.fullmatch(live or ""):
+            e.pop("baseMergeUnread", None)
+            if live == head:
+                return False
+            # the branch moved past the pin to LIVE: the stop names that head, not the stale older one
+            self.stop(e, "head_moved", land_moved_clause(live, pin)
+                      + f" (GitHub's branch ref; the copy here still showed {head[:12]}, an older commit of the pin)",
+                      f"glaeda-gh land {repo_n} --sha {live}")
+            return True
+        why = (f"GitHub's branch ref could not be read, and the copy here shows {head[:12]}, an older commit of the "
+               "pin")
+        if e["state"] == LAND_FORWARDED:  # a forwarded row keeps its state: read again on its next look
+            was = e.get("baseMergeUnread") if isinstance(e.get("baseMergeUnread"), dict) else {}
+            n = (int(was.get("n") or 0) if was.get("head") == head else 0) + 1
+            if n <= LAND_BASE_MERGE_UNREAD_MAX:
+                e["baseMergeUnread"] = {"head": head, "n": n}
+                self.history(e, "base_merge_unread", head=head[:12], n=n, why=land_trim(why, 200))
+                return True
+        elif self.base_merge_unread(e, head, why, ""):
+            return True
+        e.pop("baseMergeUnread", None)
+        self.stop(e, "head_moved", f"the copy here shows {head[:12]}, an older commit of the --sha {pin[:12]} it was "
+                  f"queued for, and GitHub's branch ref could not be read in {LAND_BASE_MERGE_UNREAD_MAX} tries, so "
+                  "the land is not judged on it", f"glaeda-gh land {repo_n} --sha {pin}")
+        return True
 
     def requeue(self, e: dict) -> None:
         """Under the lock: E, whose worker judged nothing, is looked at again on the next pass (its head checks first)."""
@@ -21650,7 +21752,7 @@ class LandQueue:
         older: Any = False
         if why and not unread and ancestor is None and gh:
             older = self.ancestry_read(e, head, pin)
-        live = ""
+        live: str | None = None  # None: not read (no older commit, or its wait has not run out)
         if why and (ancestor or (older is not False and older[0] is True)):
             w = e.get("oldPinWait") or {}
             if w.get("head") == head and self.now - float(w.get("since") or 0) >= LAND_HEAD_TIMEOUT:
@@ -21665,21 +21767,8 @@ class LandQueue:
                 # a stale copy: E waits for a read that shows the pin (old_pin_wait, bounded by LAND_HEAD_TIMEOUT)
                 self.requeue(e)
                 return False
-            if ancestor and live == pin:
-                # LAND_STALE_LIVE: GitHub's branch is still at the pin; the copy showing HEAD is stale. The pin is kept
-                # and the wait starts again (one branch read per LAND_HEAD_TIMEOUT), never a stop naming HEAD.
-                e["oldPinWait"] = {"head": head, "since": self.now, "nudgedAt": self.now}
-                self.history(e, "stale_head_kept", head=head[:12], pin=pin[:12],
-                             why="an older commit of the pin; GitHub's branch is at the pin")
-                self.nudge(e["key"])
-                self.requeue(e)
-                return False
-            if ancestor and SHA40.fullmatch(live) and live != head:
-                # the branch moved past the pin to LIVE: the stop names that head, not the stale older one
-                self.stop(e, "head_moved", land_moved_clause(live, pin)
-                          + f" (GitHub's branch ref; the copy here still showed {head[:12]}, an older commit of the pin)",
-                          f"glaeda-gh land {e['repo']}#{e['number']} --sha {live}")
-                return False
+            if ancestor and live is not None and self.stale_live(e, head, pin, live):
+                return False  # LAND_STALE_LIVE: GitHub's branch ref decided (kept, moved on, or read again)
             if why and unread and self.base_merge_unread(e, head, why, said):
                 return False
             e.pop("baseMergeUnread", None)
@@ -25041,6 +25130,12 @@ LAND_ANCESTRY_JQ = "{s: .status, b: .behind_by}"
 # f1da65f70f9a", each an older merge of the branch while GitHub's head was still the pin; both were re-queued by hand
 # at the pin they already had. Past that wait, one read of GitHub's branch ref decides: at the pin, the pin is kept
 # and the wait starts again; at another head, the stop names that head.
+# cmux#55778 (pin bf57a2e2, stopped "the head is c8b20b4c7ea3") and cmux#54158 (pin b22889fc, stopped "the head is
+# a2eca4801414"), 2026-11-25 22:09Z and 22:27Z on cmux-cp-1: each pin a base merge whose first parent the stale copy
+# showed, while GitHub's branch ref and pulls/N were at the pin; the stop's next: line asked for the parent, which
+# parks the land. The decision is stale_live's for every path that held such a head (base_merge_check, and
+# ancestry_wait for stop_moved_pin, pin_wait and judge, through stale_live_job): a branch ref read that fails waits
+# and is read again (base_merge_unread), and at its bound the stop names the pin, never the older head.
 LAND_STALE_LIVE = "stale_head_kept"
 LAND_PIN_READ_HEAD = re.compile(r"PR read head '([0-9a-fA-F]{40})' does not match pinned head")
 
@@ -25096,6 +25191,10 @@ def land_base_merge_chain(pin: str, head: str, doc: dict,
     parents are on the base is for the caller's reads."""
     head = str(head or "").lower()
     commits = (doc or {}).get("c")
+    if (doc or {}).get("s") in ("behind", "identical"):
+        # cmux#55778, #54158 (LAND_STALE_LIVE's comment): a copy showing an older commit of the pin is no base merge
+        # on it, and its stop said "its commits since the pin were not all listed", which hid that
+        return [], f"it is {(doc or {}).get('s')} the pin: an older commit of it, not a base merge on it"
     if not isinstance(commits, list) or (doc or {}).get("s") != "ahead":
         return [], "its commits since the pin were not all listed, so it is not shown to be only base merges"
     complete = (doc or {}).get("n") == len(commits)

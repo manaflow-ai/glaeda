@@ -3923,6 +3923,32 @@ def host_drain(home: Path, now: float) -> str | None:
     return f"host draining: all {len(runners)} runners are draining for {first}" if first else None
 
 
+# MEASURE_DRAIN_SLOT: cmux-ci's lend drain empties a lent mini for an exclusive measurement. Its worker writes this
+# RUNNER_DRAIN marker (by CMUX_CI_DRAIN_BY) in every runner directory but the nightly slot, so nightly, DEV and
+# promote jobs still start there. The slot also admits a stack-blocker PR job (STACK_SLOT), and that one started on
+# the drained mini as on any undrained one: on 2026-11-26 new PR jobs started through the nightly slot on 5 drained
+# minis while their measurements waited (cmuxterm-hq forum 250). While another runner on the mini carries a live
+# cmux-ci drain marker, the slot refuses a stack-tier job at once, as it does past STACK_SLOT_WAIT, and cmux's
+# owned-pool rescue places it again as an ordinary PR job. Nightly-tier jobs are untouched: the slot's own listener
+# carries no marker and keeps listening, and nothing here cancels or delays a nightly, DEV or promote build.
+CMUX_CI_DRAIN_BY = "cmux-ci lend drain"
+
+
+def measurement_drain(home: Path, now: float) -> str | None:
+    """Why the mini drains for a cmux-ci measurement (MEASURE_DRAIN_SLOT), or None: no runner under home carries a
+    live RUNNER_DRAIN marker written by CMUX_CI_DRAIN_BY. A directory that cannot be listed drains nothing."""
+    try:
+        runners = sorted(p for p in home.glob("actions-runner-glaeda*")
+                         if HOST_DRAIN_RUNNER_DIR.fullmatch(p.name) and p.is_dir() and not p.is_symlink())
+    except OSError:
+        return None
+    for runner in runners:
+        doc = runner_drain_doc(runner, now)
+        if doc is not None and doc.get("by") == CMUX_CI_DRAIN_BY:
+            return f"{runner.name} is draining for {str(doc.get('reason') or 'a cmux-ci measurement')[:200]}"
+    return None
+
+
 # glaeda-mini-health's drain for a Tailscale restart (glaeda#1627): it wants the host idle, not jobs refused. The gate
 # stops idle listeners while the marker stands, so no new job comes; a job a listener already took before the gate
 # saw the marker is admitted and finishes (mini-health waits for it). Refusing it only failed that job: one
@@ -16203,6 +16229,10 @@ def main(argv: list[str] | None = None) -> int:
                                  os.environ.get("GITHUB_JOB")) or stack_blocker_tier(
                 os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REPOSITORY"), event)
             why = nightly_slot_refusal(slot_tier)
+            if not why and slot_tier == TIER_STACK and (drain := measurement_drain(Path.home(), time.time())):
+                # MEASURE_DRAIN_SLOT: a stack-blocker PR job is the slot's only PR work; a drained mini takes none
+                why = (f"the mini drains for a measurement ({drain}): the nightly slot takes no stack-blocker PR job "
+                       "until it ends, and cmux's owned-pool rescue places this one again")
             if why:
                 return refused(why)
         if args.dev_compile_runner:

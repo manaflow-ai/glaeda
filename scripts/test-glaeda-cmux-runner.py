@@ -1613,6 +1613,58 @@ class HookTest(unittest.TestCase):
             (fleet / "reservation.json").unlink(missing_ok=True)
             self.finish("")
 
+    def test_the_nightly_slot_takes_no_stack_job_while_the_mini_drains_for_a_measurement(self) -> None:
+        """MEASURE_DRAIN_SLOT: 2026-11-26, new PR jobs started through the nightly slot on 5 minis cmux-ci drained for a
+        measurement (its marker skips the slot so nightlies run). While another runner carries cmux-ci's live drain
+        marker, the slot refuses a stack-blocker PR job at once; a nightly job is still admitted, and another
+        writer's marker or an expired one changes nothing. Before: the stack job was admitted under the drain."""
+        drained = self.dir / "actions-runner-glaeda-3"
+        drained.mkdir()
+        marker = drained / hook.RUNNER_DRAIN_FILE
+
+        def mark(by: str, until: float) -> None:
+            marker.write_text(json.dumps({"until": until, "by": by,
+                                          "reason": "cmux-ci lend drain: a measurement waits for this mini"}))
+
+        now = time.time()
+        self.assertIsNone(hook.measurement_drain(self.dir, now), "no marker")
+        mark(hook.CMUX_CI_DRAIN_BY, now + 600)
+        self.assertIn("actions-runner-glaeda-3 is draining for cmux-ci lend drain",
+                      hook.measurement_drain(self.dir, now))
+        mark(hook.APPLY_DRAIN_BY, now + 600)
+        self.assertIsNone(hook.measurement_drain(self.dir, now), "an apply's relabel drain is no measurement")
+        mark(hook.CMUX_CI_DRAIN_BY, now - 1)
+        self.assertIsNone(hook.measurement_drain(self.dir, now), "an expired marker")
+
+        self.fleet()
+        pull = event(self.dir, "stack-pr-drained", {
+            "repository": CMUX,
+            "pull_request": {"number": 45498, "labels": [{"name": hook.STACK_BLOCKER_LABEL}],
+                             "head": {"repo": {"full_name": "manaflow-ai/cmux"}}, "base": {"repo": CMUX}}})
+        pr_env = {"GITHUB_REF": "refs/pull/45498/merge", "GITHUB_JOB": "daemon-test",
+                  "GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/cmux-next.yml@refs/pull/45498/merge"}
+        push = event(self.dir, "nightly-push-drained", {"repository": CMUX, "ref": "refs/heads/nightly-next"})
+        nightly_env = {"GITHUB_REF": "refs/heads/nightly-next", "GITHUB_JOB": "build-nightly-app",
+                       "GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/nightly.yml@refs/heads/nightly-next"}
+        args = ("--allowed-repo", "manaflow-ai/cmux", "--no-disk", "--watch-pid", str(os.getpid()),
+                "--state-dir", os.fspath(self.dir / "state"), "--gui-wait", "0", "--nightly-runner")
+        try:
+            mark(hook.CMUX_CI_DRAIN_BY, time.time() + 600)
+            refused = self.run_hook("job-started", "pull_request", pull, *args, repo="manaflow-ai/cmux", env=pr_env)
+            self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+            self.assertIn("drains for a measurement", refused.stdout)
+            self.assertIn("owned-pool rescue", refused.stdout)
+            nightly = self.run_hook("job-started", "push", push, *args, repo="manaflow-ai/cmux", env=nightly_env)
+            self.assertEqual(nightly.returncode, 0, "a nightly job on the slot is admitted under the drain: "
+                             + nightly.stdout + nightly.stderr)
+            self.finish("")
+            marker.unlink()
+            admitted = self.run_hook("job-started", "pull_request", pull, *args, repo="manaflow-ai/cmux", env=pr_env)
+            self.assertEqual(admitted.returncode, 0, admitted.stdout + admitted.stderr)
+            self.finish("")
+        finally:
+            self.finish("")
+
     def test_disk_pressure_never_fails_and_is_bounded(self) -> None:
         marker = self.dir / "disk-ran"
         slow = make_executable(self.dir / "glaeda-disk-slow", "import time, sys\n"

@@ -28863,10 +28863,13 @@ class LandTest(Base):
                                                               "timeout_s": 600}))
         self.tick(30)
         self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")])
+        self.w.cache[self.KEY]["data"]["headRefName"] = "lane/x"
+        self.w.api["repos/o/r/git/ref/heads/lane/x"] = LA  # GitHub's branch ref agrees: it was pushed back
         e = self.tick(700)
         self.assertIsNone(e.get("stop"))
         e = self.tick(gg.LAND_HEAD_TIMEOUT + 1)
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
+        self.assertIn(f"--sha {LA}", e["stop"]["next"])
         self.assertEqual(self.w.gh_calls("pr", "merge"), [])
 
     def test_a_base_merge_the_cache_showed_before_the_pin_is_followed_too(self):
@@ -29181,6 +29184,8 @@ class LandTest(Base):
         path = self.older_copy()
         self.w.cache[self.KEY]["data"]["baseRefName"] = "main"
         self.w.api[f"repos/o/r/commits/{self.LE}"] = json.dumps([self.LD])
+        self.w.cache[self.KEY]["data"]["headRefName"] = "lane/x"
+        self.w.api["repos/o/r/git/ref/heads/lane/x"] = self.LE  # the branch really is at it (LAND_STALE_LIVE)
         e = self.tick(30)
         self.assertEqual((e.get("stop"), e["pinSha"]), (None, LA))
         self.assertEqual((self.ancestry_reads(path), self.compares()), (1, []))  # no base merge compare
@@ -29189,7 +29194,8 @@ class LandTest(Base):
         self.assertEqual(e["stop"]["reason"], gg.land_moved_clause(self.LE, LA) + " (no update_branch of this queue's "
                          f"made it, and its parents ({self.LD[:12]}) are not the pinned head and then one more "
                          "commit: a push, not a base merge on it)")
-        self.assertEqual((len(self.w.gh_calls("api")), self.w.gh_calls("pr", "merge")), (2, []))  # nothing read again
+        # nothing read again but the branch ref, once
+        self.assertEqual((len(self.w.gh_calls("api")), self.w.gh_calls("pr", "merge")), (3, []))
 
     def test_a_pin_wait_on_an_older_commit_of_the_pin_waits_for_the_pin(self):
         gg.land_request("land", "o/r#1", [], "host/lane", sha=LA)
@@ -29223,13 +29229,15 @@ class LandTest(Base):
     def test_an_older_commit_of_the_pin_still_shown_stops_after_the_wait(self):
         self.pinned_and_waiting()
         path = self.older_copy(parents=[self.LD])
+        self.w.cache[self.KEY]["data"]["headRefName"] = "lane/x"
+        self.w.api["repos/o/r/git/ref/heads/lane/x"] = self.LE  # the branch really is at it (LAND_STALE_LIVE)
         e = self.tick(30)
         self.assertIsNone(e.get("stop"))
         e = self.tick(gg.LAND_HEAD_TIMEOUT - 30)
         self.assertIsNone(e.get("stop"))
         e = self.tick(31)
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
-        self.assertEqual(e["stop"]["reason"], gg.land_moved_clause(self.LE, LA))
+        self.assertEqual(e["stop"]["reason"], gg.land_moved_clause(self.LE, LA) + " (GitHub's branch ref is at it too)")
         self.assertEqual((self.ancestry_reads(path), self.w.gh_calls("pr", "merge")), (1, []))
 
     def test_an_ancestry_read_that_never_answers_stops_head_moved_after_its_reads(self):
@@ -29246,6 +29254,76 @@ class LandTest(Base):
         self.assertEqual(self.unread_events(e), list(range(1, gg.LAND_BASE_MERGE_UNREAD_MAX + 1)))
         self.assertEqual(self.ancestry_reads(path), gg.LAND_BASE_MERGE_UNREAD_MAX + 1)
         self.assertEqual((self.w.explains(), self.w.gh_calls("pr", "merge")), ([], []))
+
+    def stale_parent_copy(self, live: str | None) -> None:
+        """manaflow-ai/cmux#55778 and #54158, 2026-11-25: the pin LA is a base merge made on LE, and the copy here still
+        shows LE, itself a merge (parents LD, LF), read since the pin. compare LA...LE says behind (base_merge_chain),
+        compare LE...LA says LE is an older commit of LA, and GitHub's branch ref answers LIVE (None: the read fails)."""
+        self.pr(self.LE, checks=[("ci", "COMPLETED", "SUCCESS")])
+        self.w.cache[self.KEY]["data"].update(headParents=[self.LD, self.LF], headParent=self.LD, baseRefName="main",
+                                              headRefName="lane/x")
+        self.w.api[f"repos/o/r/compare/{LA}...{self.LE}"] = json.dumps({"s": "behind", "n": 0, "c": []})
+        self.w.api[f"repos/o/r/compare/{self.LE}...{LA}"] = json.dumps({"s": "ahead", "b": 0})
+        self.w.api["repos/o/r/git/ref/heads/lane/x"] = live
+
+    def test_a_stale_copy_showing_the_first_parent_of_a_base_merge_pin_keeps_the_pin_and_lands_there(self):
+        # cmux#55778 (pin bf57a2e2, stopped "the head is c8b20b4c7ea3") and cmux#54158 (pin b22889fc, stopped "the head
+        # is a2eca4801414"): each pin a base merge whose first parent the stop named, while GitHub's branch ref and
+        # pulls/N were at the pin; the stop's next: line asked for the parent, which parks the land.
+        self.pinned_and_waiting()
+        self.stale_parent_copy(LA)
+        e = self.tick(30)
+        self.assertEqual((e.get("stop"), e["pinSha"]), (None, LA))
+        for _ in range(3):
+            e = self.tick(gg.LAND_HEAD_TIMEOUT + 1)
+            self.assertEqual((e.get("stop"), e["pinSha"]), (None, LA))
+        self.assertIn(gg.LAND_STALE_LIVE, [h["event"] for h in e["history"]])
+        self.assertEqual(self.w.gh_calls("pr", "merge"), [])
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")])  # the read that caught up
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick(30)
+        self.assertEqual((e["state"], e.get("stop")), ("merged", None))
+        self.assert_merged_at(LA)
+
+    def test_a_stale_copy_of_a_base_merge_pin_whose_branch_ref_read_fails_never_names_the_older_head(self):
+        self.pinned_and_waiting()
+        self.stale_parent_copy(None)
+        e = self.tick(30)
+        for _ in range(gg.LAND_BASE_MERGE_UNREAD_MAX + 3):
+            if e["state"] == "stopped":
+                break
+            self.assertNotEqual((e.get("stop") or {}).get("code"), "head_moved")
+            e = self.tick(max(gg.LAND_HEAD_TIMEOUT, gg.LAND_RETRY_MAX) + 1)
+        self.assertEqual((e["state"], e["stop"]["code"], e["pinSha"]), ("stopped", "head_moved", LA))
+        self.assertIn("branch ref could not be read", e["stop"]["reason"])
+        self.assertIn(f"--sha {LA}", e["stop"]["next"])  # the pin, newer than the copy's head, never the older head
+        self.assertNotIn(self.LE, e["stop"]["next"])
+        self.assertIn("base_merge_unread", [h["event"] for h in e["history"]])
+
+    def test_a_stale_copy_of_a_base_merge_pin_with_the_branch_really_at_the_older_head_stops_naming_it(self):
+        self.pinned_and_waiting()
+        self.stale_parent_copy(self.LE)  # somebody pushed the branch back: GitHub's ref agrees with the copy
+        e = self.tick(30)
+        e = self.tick(gg.LAND_HEAD_TIMEOUT + 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"))
+        self.assertIn(f"--sha {self.LE}", e["stop"]["next"])
+
+    def test_an_older_commit_of_the_pin_still_shown_with_the_branch_at_the_pin_keeps_the_pin(self):
+        # the same stale copy on the cache-only path (stop_moved_pin, pin_wait): one parent, so no base merge check
+        self.pinned_and_waiting()
+        self.older_copy(parents=[self.LD])
+        self.w.cache[self.KEY]["data"]["headRefName"] = "lane/x"
+        self.w.api["repos/o/r/git/ref/heads/lane/x"] = LA
+        e = self.tick(30)
+        for _ in range(3):
+            e = self.tick(gg.LAND_HEAD_TIMEOUT + 1)
+            self.assertEqual((e.get("stop"), e["pinSha"]), (None, LA))
+        self.assertIn(gg.LAND_STALE_LIVE, [h["event"] for h in e["history"]])
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")])
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick(30)
+        self.assertEqual((e["state"], e.get("stop")), ("merged", None))
+        self.assert_merged_at(LA)
 
     def test_land_base_merge_why_compares_the_prs_own_lines_not_their_positions(self):
         same = {"f": "a.py", "s": "modified", "p": None, "d": "@@ -1,2 +1,3 @@\n a\n+b\n c"}
@@ -46309,6 +46387,28 @@ class FullPrReadsSizedByMeasuredCost(unittest.TestCase):
             self.assertIsNone(d.fetch_prs(self.entries(10)))
             self.assertIsNone(d.fetch_prs(self.entries(10)))
         self.assertEqual(d.sent, [10, 10])
+
+    def test_a_restarted_daemon_starts_from_the_measure_it_left(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / gg.FULL_PR_SECS_FILE
+            d, clock = self.daemon(5.0)
+            d.full_pr_secs_path = path
+            with mock.patch.object(gg.time, "monotonic", lambda: clock[0]), mock.patch.object(gg, "log", lambda e: None):
+                d.fetch_prs(self.entries(3))  # learns cmux's cost from one 10.5 s cut
+            self.assertIn("manaflow-ai/cmux", gg.load_full_pr_secs(path))
+            fresh, clock2 = self.daemon(5.0)
+            fresh.full_pr_secs = gg.load_full_pr_secs(path)  # what __init__ reads after a reexec
+            with mock.patch.object(gg.time, "monotonic", lambda: clock2[0]):
+                self.assertIsNone(fresh.fetch_prs(self.entries(3)))
+            self.assertEqual(fresh.sent, [1, 1, 1])  # no 10.5 s cut first
+
+    def test_an_unreadable_measure_file_is_no_measure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / gg.FULL_PR_SECS_FILE
+            path.write_text('{"manaflow-ai/cmux": "x", "a/b": -1, "c/d": true, "e/f": 2.5}')
+            self.assertEqual(gg.load_full_pr_secs(path), {"e/f": 2.5})
+            path.write_text("not json")
+            self.assertEqual(gg.load_full_pr_secs(path), {})
 
 
 class FullPrReadFoldsItsHead(unittest.TestCase):
