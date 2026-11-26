@@ -290,8 +290,9 @@ systemd unit is loaded, unless given --foreground-ok: sessions never run their o
 code site under "failing"; once cycles have failed for FAILING_AFTER seconds, clients exit 3 and
 name the error instead of waiting on a daemon that refreshes nothing. A heartbeat over a loop that reads nothing is
 not health: when even the freshest live PR watch's data passes STALE_DATA_AFTER and the quota does not explain it,
-daemon.json says "healthy": false and "stalled", `budget` prints NOT HEALTHY, and two such ticks re-execute the daemon
-(the stale valve). GraphQL answering 5xx (or not at all) sends its reads to REST: at once for an entry that cannot be
+daemon.json says "healthy": false and "stalled", and `budget` prints NOT HEALTHY. The stale valve re-executes the
+daemon after two such ticks, or on the first if PR data has reached the FIRE threshold (three times STALE_DATA_AFTER).
+GraphQL answering 5xx (or not at all) sends its reads to REST: at once for an entry that cannot be
 split further, and for every entry while GraphQL is out (GQL_DOWN_AFTER, "graphqlDown"). The daemon re-executes itself
 when this file changes, so an update takes effect without a restart.
 
@@ -339,6 +340,7 @@ from __future__ import annotations
 import argparse
 import base64
 import calendar
+from collections import deque
 import contextlib
 import datetime as dt
 import errno
@@ -661,7 +663,7 @@ RUNNING_SCRIPT: dict = {}
 SOCKET_TIMEOUT = 20  # each connect, TLS handshake and read
 HTTP_DEADLINE = 45  # one whole GitHub request, from connect to the last body byte
 SUBPROCESS_DEADLINE = 20  # gh auth token, launchctl, ps: killed with their whole process group after
-TICK_BUDGET = 90  # seconds a tick may spend starting requests
+TICK_BUDGET = 90  # shared wall-clock budget for the tick's GitHub reads, including the last response
 # A REST read the tick's budget cut off partway resumes on its next try within this long: the shared answers its cut
 # attempts got (repo_part, head_part) stand for it past their TTL, and its data is dated from the first attempt. Before,
 # each try asked everything again (head parts keep REST_HEAD_PART_TTL, 15 s, and ticks are ~90 s apart), so a read
@@ -773,6 +775,8 @@ CONTROLLER_TOKEN = Path.home() / ".config/cmux/build-fleet/controller.token"
 CONTROLLER_CONNECT_TIMEOUT = 3.5  # two SYN retransmits (1 s, then 3 s); a tick stalls at most this long
 CONTROLLER_READ_TIMEOUT = 5.5  # an alive controller is worth waiting for: the fallback spends REST; 5.5 keeps
 # one whole request (CONTROLLER_DEADLINE) inside 5 ticks with the 3.5 s connect above
+# A recovery probe's read stops above the measured 1.47 s for a full feed page; its connect keeps the 3.5 s above.
+CONTROLLER_PROBE_TIMEOUT = 2.0
 # Every controller request a tick makes (the feed, run baselines, on-event job lookups) together, at most: air-blue
 # 2026-11-18 22:4xZ, 17.1 of a 19.1 s tick went to a controller answering TimeoutError, one on-event lookup after
 # another (a failed lookup did not take the controller out), and no PR was refreshed for 2196 s. A request is cut at
@@ -867,7 +871,7 @@ DIRECT_QUIET_MAX = 600.0
 # :36 or :37, the stale alarm fired on data the stop had aged ("1044s old"); a session ran `glaeda-gh restart` 4 to 9
 # s later every time, and the restart looked like the fix. The backlog was being read either way.
 STALE_CATCH_UP = STALE_DATA_AFTER
-# The release valve: waited data starved past STALE_DATA_AFTER with nothing explaining it, on this many ticks in a row,
+# The release valve: unexplained starvation on this many ticks in a row, or a PR alarm at its FIRE age on one tick,
 # restarts the daemon itself (a re-exec, like an update's) instead of waiting for a session to run `glaeda-gh
 # restart`. Not before the daemon has run STALE_DATA_AFTER itself (a new one has not had its chance), and at most
 # once per STALE_VALVE_COOLDOWN (restart.json "valve"): a second starvation that soon is not one a restart fixes.
@@ -2897,7 +2901,8 @@ def keepalive_ok(method: str, url: str, body: bytes | None) -> bool:
     return method == "POST" and url == API + "/graphql" and not GRAPHQL_MUTATION.search(body or b"")
 
 
-def http(method: str, url: str, headers: dict[str, str], body: bytes | None = None) -> tuple[int, dict, bytes]:
+def http(method: str, url: str, headers: dict[str, str], body: bytes | None = None,
+         *, deadline: float = float("inf")) -> tuple[int, dict, bytes]:
     if not url.startswith(API + "/"):
         raise WatchError("refusing a request outside api.github.com")
     request = urllib.request.Request(url, data=body, method=method, headers=headers)
@@ -2913,7 +2918,10 @@ def http(method: str, url: str, headers: dict[str, str], body: bytes | None = No
             return error.code, {k.lower(): v for k, v in (error.headers or {}).items()}, error.read(MAX_BODY)
 
     try:
-        with hard_deadline(HTTP_DEADLINE):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise OutOfTime
+        with hard_deadline(min(remaining, HTTP_DEADLINE), OutOfTime if remaining < HTTP_DEADLINE else DeadlineTimeout):
             EDGE.local.ip = None
             answer = once()
             edge = EDGE.last_ip()
@@ -4874,6 +4882,7 @@ class Controller:
 
     def __init__(self, base: str, token: str | None) -> None:
         self.base, self.token = base.rstrip("/"), token
+        self.probing = False
 
     @classmethod
     def from_env(cls) -> "Controller | None":
@@ -4897,12 +4906,15 @@ class Controller:
         try:
             read = CONTROLLER_READ_TIMEOUT if timeout is None else timeout
             deadline = CONTROLLER_DEADLINE if timeout is None else timeout + CONTROLLER_DEADLINE
-            # The daemon's tick gives its controller requests one budget together (CONTROLLER_TICK_BUDGET), and
-            # cuts each at what is left of it. controller_room starts none that the budget would cut short, so in
-            # the daemon this only ever shortens a request a caller made outside a tick (#2201 review).
+            # Cap the entire request, including a trickling body, at the tick's remaining wall time.
             left = getattr(self, "budget_end", float("inf")) - time.monotonic()
-            read, deadline = min(read, max(0.1, left)), min(deadline, max(0.2, left) + deadline - read)
-            CONTROLLER_CONNECT_DEADLINE.seconds = min(CONTROLLER_CONNECT_TIMEOUT, max(0.1, left))
+            if left <= 0:
+                raise ControllerTimeout("controller: request budget expired")
+            read, deadline = min(read, left), min(deadline, left)
+            if self.probing:
+                read = min(read, CONTROLLER_PROBE_TIMEOUT)
+                deadline = min(deadline, CONTROLLER_CONNECT_TIMEOUT + CONTROLLER_PROBE_TIMEOUT)
+            CONTROLLER_CONNECT_DEADLINE.seconds = min(CONTROLLER_CONNECT_TIMEOUT, left)
             try:
                 with hard_deadline(deadline), CONTROLLER_OPENER.open(request, timeout=read) as response:
                     doc = json.loads(response.read(MAX_BODY))
@@ -6342,6 +6354,8 @@ class Daemon:
         # Until when (time.monotonic) a drain past REEXEC_DRAIN_MAX lets the judgments past half their bound finish:
         # read once, when the drain limit is first reached (LandQueue.finishing; reexec_due's finish_until)
         self.reexec_finish_until: float | None = None
+        self.land_forward_ident: int | None = None
+        self.land_pass_lock = threading.Lock()  # one scheduler owns a pass, including an executor-role change
         self.land_queue: LandQueue | None = None  # `glaeda-gh land` (made when BASE/land first exists)
         self.rollups: dict[str, tuple[Any, Any]] = {}  # key -> (head, fp) of its ROLLUP_DIR snapshot, as last written
         self.rollup_keys: tuple[float, frozenset[str]] = (float("nan"), frozenset())  # (self.now, rollup_wanted)
@@ -7062,18 +7076,18 @@ class Daemon:
         return since if since < STALE_CATCH_UP else None
 
     def stale_valve(self, stale: tuple[str, str, dict] | str | None, policy: dict) -> tuple[str, str, dict] | str | None:
-        """The release valve over the stale alarm's verdict: starvation nothing explains on STALE_VALVE_TICKS ticks in a
-        row sets valve_due, and serve() restarts the daemon (restart_self) once the tick has sent the alarm, whose
-        text then says so (sent again for that, ALARM_EVERY notwithstanding: the first tick's WARN went out as before).
+        """Unexplained starvation on consecutive ticks or PR data at the alarm's FIRE age sets valve_due. serve()
+        restarts the daemon (restart_self) once the tick has sent the alarm.
         Past the valve's bounds (policy alarms.staleRestart off, a daemon younger than STALE_DATA_AFTER, a valve
         restart within STALE_VALVE_COOLDOWN) the alarm stands as it was, saying why the valve did not act."""
         if not isinstance(stale, tuple):
             self.stale_streak = 0
             return stale
         self.stale_streak += 1
-        if self.stale_streak < STALE_VALVE_TICKS:
-            return stale
         level, text, data = stale
+        # Both PR alarms derive FIRE from data age. A single slow read tick can already span the warning period.
+        if self.stale_streak < STALE_VALVE_TICKS and not (data.get("kind") == "pr" and level == "fire"):
+            return stale
         if not policy.get("staleRestart", True):
             return stale
         fresh = (getattr(self, "fresh_waited", None) or {}).get(data.get("kind"))
@@ -7112,7 +7126,9 @@ class Daemon:
                           "ticks": self.stale_streak}
         if data.get("kind") in CYCLES:
             self.valve_due["cause"] = self.stall_cause(str(data["kind"]))["text"]
-        said = (f"The daemon is restarting itself now (stale valve: {self.stale_streak} ticks in a row); nobody needs "
+        trigger = (f"PR data {age}s old" if self.stale_streak < STALE_VALVE_TICKS
+                   else f"{self.stale_streak} ticks in a row")
+        said = (f"The daemon is restarting itself now (stale valve: {trigger}); nobody needs "
                 "to run `glaeda-gh restart`.")
         return level, text.replace(STALE_RESTART_ADVICE, said), {**data, "valve": "restarting"}
 
@@ -7128,7 +7144,7 @@ class Daemon:
         write_json(BASE / "restart.json", record)
         why = "stale valve: no PR refreshed (stall_alarm)" if due.get("key") == "newest" else "stale valve"
         refresh_log_write(f"{utc_stamp(self.clock())} glaeda-gh refresh: {due.get('kind')} data {due.get('age')}s old "
-                          f"({why}, {due.get('ticks')} ticks); next: the daemon re-executes itself now")
+                          f"({why}, ticks: {due.get('ticks')}); next: the daemon re-executes itself now")
         log({"event": "restart", "why": why, **{k: due.get(k) for k in ("kind", "age", "key", "ticks")},
              **({"cause": due["cause"]} if "cause" in due else {})})
         return record
@@ -7698,13 +7714,11 @@ class Daemon:
         limit) held ~40 lands 30-50 min while /rate_limit said REST 1947/5000 and GraphQL 4323/5000 left."""
         if self.upstream() is not None or land_broker_client():
             return None
+        if threading.get_ident() == self.land_forward_ident:
+            return land_budget_reading(pool)  # the read scheduler alone refreshes /rate_limit and its deadline
         if self.now - self.rate_limit_at >= LAND_READING_REFRESH and self.now >= self.budget_retry \
                 and self.clock() >= self.secondary_until:
-            deadline, self.tick_deadline = self.tick_deadline, max(self.tick_deadline, time.monotonic() + 30.0)
-            try:
-                self.read_rate_limit()
-            finally:
-                self.tick_deadline = min(deadline, self.tick_deadline)  # a ScriptWake cut in the window stands
+            self.read_rate_limit()  # a refill shares the read tick's deadline and keeps the last count on timeout
         seen = self.budget.get(pool)
         return dict(seen) if isinstance(seen, dict) else None
 
@@ -9382,7 +9396,7 @@ class Daemon:
             if touched < since and key in self.heads_between_seen:
                 continue  # in the slack, but the watch read already had it
             e = watch_entry(key, doc, read_cache(key), touched)
-            if self.head_unanswered(e):
+            if self.head_unanswered(e) and (touched >= since or any(t >= since for t in e["consumers"].values())):
                 asked.append(e)
         if not asked:
             return
@@ -9915,6 +9929,9 @@ class Daemon:
         asked_read = False  # an asked head with no answer was read this tick: the rest of them keep the heads' share
         try:
             for i, e in enumerate(over_rest):
+                if time.monotonic() >= self.tick_deadline:
+                    self.defer(over_rest[i:])
+                    break
                 if not e["key"].startswith("head:"):
                     self.heads_between()  # a head asked meanwhile is read before this one, not next tick
                 if e["key"].startswith("head:") and time.monotonic() >= head_until and i < last_waited \
@@ -10188,7 +10205,10 @@ class Daemon:
         self.rest_tried = {k: t for k, t in self.rest_tried.items() if self.now - t < 2 * IDLE_EXPIRY}
         self.cut_reads = {k: t for k, t in self.cut_reads.items() if self.now - t <= RESUME_MAX}
         self.confirm_tried = {k: t for k, t in self.confirm_tried.items() if self.now - t[0] < 2 * IDLE_EXPIRY}
-        oldest = self.oldest_data(entries, {e["key"] for e in prs + runs + comments + heads})
+        # Evaluate the watches selected at tick start, but include the time spent waiting for their reads.
+        observed_at = self.clock()
+        oldest = self.oldest_data(entries, {e["key"] for e in prs + runs + comments + heads}, observed_at)
+        self.now = observed_at  # the valve's startup grace and the heartbeat use the same observation
         if self.waited_since != self.waited_since_saved:
             with contextlib.suppress(OSError):
                 write_json(BASE / WAITED_SINCE_FILE, {"at": self.clock(), "since": self.waited_since})
@@ -10363,19 +10383,28 @@ class Daemon:
         at = time.monotonic()
         if at - getattr(self, "land_refilled", float("-inf")) < LAND_REFILL_EVERY:
             return
+        if not self.land_pass_lock.acquire(blocking=False):
+            return
         self.land_refilled = at
         self.in_land = True
         try:
+            ingest = getattr(q, "ingest_between", None)
+            if not q.next_up and not q.jobs and ingest is None:
+                return
+            if land_executor(q.config()) is not None or q.forward_thread and q.forward_thread.is_alive():
+                return  # a forwarding host's requests are the forward scheduler's (forward_tick), not the read tick's
             with self.phase("land refill"), self.land_controller_budget():
-                ingest = getattr(q, "ingest_between", None)
                 if ingest is not None:  # a forwarded land is a row within LAND_REFILL_EVERY, not at the next pass
                     q.now = time.time() if getattr(self, "clock_real", True) else self.now
                     ingest()
+                if not q.next_up and not q.jobs:
+                    return
                 q.refill(None if getattr(self, "clock_real", True) else self.now)
         except Exception as error:  # noqa: BLE001  the land queue must never stop the reads
             self.errors.append(f"land refill: {describe(error)} at {error_site(error)}")
         finally:
             self.in_land = False
+            self.land_pass_lock.release()
 
     def land_read_room(self) -> int:
         """How many due lands may hold a waited watch on their PR (LAND_WATCH_SHARE): a share of the PR reads this
@@ -10388,12 +10417,22 @@ class Daemon:
             reads = reads * READ_PROGRESS_WINDOW / max(up, 60.0)
         return max(LAND_WATCH_FLOOR, int(reads * LAND_WATCH_SHARE))
 
-    def land_tick(self) -> None:
-        """The land queue's pass: cheap (its entries are in memory; judgments and steps run on its workers). None while
-        an update waits to re-execute (reexec_waiting): the steps running end, no new one starts, and the new daemon
-        takes the queue from there."""
-        if self.reexec_waiting:
+    def land_tick(self, forward_only: bool = False) -> None:
+        """The forward scheduler and read tick share one queue, including when its executor changes at runtime."""
+        if not self.land_pass_lock.acquire(blocking=False):
             return
+        try:
+            if not self.reexec_waiting:
+                self.land_pass(forward_only)
+        finally:
+            self.land_pass_lock.release()
+
+    def land_pass(self, forward_only: bool) -> None:
+        executor = None
+        if forward_only:
+            executor = land_executor(None if self.land_queue is None else self.land_queue.config())
+            if executor is None:
+                return
         if self.land_queue is None:
             if not land_dir().is_dir():
                 return
@@ -10401,6 +10440,9 @@ class Daemon:
                                         feed_quiet=self.land_feed_quiet, read_room=self.land_read_room,
                                         feed_done=self.land_feed_done, checks_done=self.land_checks_done,
                                         rollup_nodes=self.land_rollup_nodes)
+        if executor is not None:
+            self.land_queue.dispatch_forwards(executor)
+            return
         dirty, self.land_dirty = self.land_dirty, set()
         # A direct reader can update the shared cache in another process. Consume its key before reading
         # the cache, so a concurrent update is either visible this pass or leaves its own wake for the next.
@@ -10412,7 +10454,8 @@ class Daemon:
         self.in_land = True  # a request the pass makes (a /rate_limit reading) starts no refill inside it
         try:
             with self.land_controller_budget():
-                self.land_queue.tick(None if getattr(self, "clock_real", True) else self.now, dirty=dirty)
+                self.land_queue.tick(None if getattr(self, "clock_real", True) else self.now, dirty=dirty,
+                                     local_only=True)
         finally:
             self.in_land = False
         self.land_refilled = time.monotonic()
@@ -10984,6 +11027,9 @@ class Daemon:
         included, for the caller to read over REST, and the entries GraphQL failed with a 5xx or no answer that could
         not be split further, or every entry while GraphQL is out (gql_down): REST reads them this tick (GQL_DOWN).
         UNTIL (a time.monotonic() deadline): past it, once a query was sent, what is left is deferred (first next tick)."""
+        if time.monotonic() >= self.tick_deadline:
+            self.defer(entries)
+            return []
         self.heavy = {k: h for k, h in self.heavy.items() if self.now - h["at"] < IDLE_EXPIRY}
         size = self.batch[kind]
 
@@ -11046,8 +11092,8 @@ class Daemon:
             return sorted(queue, key=lambda c: (not (len(c) == 1 and c[0]["key"] in lone_unread),
                                                 min(float((e.get("cache") or {}).get("dataAt") or 0) for e in c)))
         # What a wait or a due land is blocked on goes first, heavy or not: the pace reads it before the rest
-        queue = (oldest_first(chunks([e for e in entries if self.waited(e)]))
-                 + oldest_first(chunks([e for e in entries if not self.waited(e)])))
+        queue = deque(oldest_first(chunks([e for e in entries if self.waited(e)]))
+                      + oldest_first(chunks([e for e in entries if not self.waited(e)])))
         # GQL_SPLITS is the tick's, per kind, not each call's: a tick calls batched() for a kind up to four times (the
         # plain floor, the blocked batches, the round robin's turn, the App share), and each call split afresh. The land
         # host, 2026-11-25 13:0xZ to 15:1xZ: head batches GitHub answered 502 after 10.5 s split into more 10 s queries
@@ -11059,9 +11105,12 @@ class Daemon:
         to_rest: list[dict] = list(backing_off)
         asked = bool(self.tick_asked.get(kind))  # a query of this kind was sent this tick: UNTIL may cut the rest
         while queue:
+            if time.monotonic() >= self.tick_deadline:
+                self.defer([e for chunk in queue for e in chunk])
+                return to_rest
             if kind != "head":
                 self.heads_between()  # a head asked meanwhile is read before the next chunk, not next tick
-            chunk = queue.pop(0)
+            chunk = queue.popleft()
             if until is not None and asked and time.monotonic() >= until:
                 self.defer(chunk + [e for c in queue for e in c], f"the {kind}s' share of the tick, waited reads due")
                 return to_rest
@@ -11117,7 +11166,7 @@ class Daemon:
                 if len(chunk) >= 2 and splits[kind] + 2 <= GQL_SPLITS:
                     splits[kind] += 2
                     half = (len(chunk) + 1) // 2
-                    queue = [chunk[:half], chunk[half:]] + queue
+                    queue.extendleft((chunk[half:], chunk[:half]))
                     continue
                 with contextlib.suppress(Exception):  # noqa: BLE001  storing the error must not stop the rest
                     for e in chunk:
@@ -11149,9 +11198,9 @@ class Daemon:
                 if splits[kind] + len(redo) > GQL_SPLITS:
                     redo = []  # this tick's re-reads are spent: they wait for the next cycle, at the smaller size
                 splits[kind] += len(redo)
-                left = [e for c in queue for e in c]
                 size = self.batch[kind]
-                queue = redo + [left[i:i + size] for i in range(0, len(left), size)]
+                queue = deque(c[i:i + size] for c in queue for i in range(0, len(c), size))
+                queue.extendleft(reversed(redo))
                 continue
             down = bool(error and GQL_DOWN.search(error))  # a 5xx or no answer: not the entries' doing
             if down and GQL_NO_ANSWER.search(error):
@@ -11164,8 +11213,7 @@ class Daemon:
             if error and (down or SLOW.search(error)):
                 what = (f"{kind} {key_name(chunk[0]['key'])}" if len(chunk) == 1
                         else f"{kind} batch of {len(chunk)} ({', '.join(repos)})")
-                then = ("REST reads it this tick" if down and (len(chunk) < 2 or splits[kind] + 2 > GQL_SPLITS)
-                        else "split into halves and retried" if len(chunk) >= 2 and splits[kind] + 2 <= GQL_SPLITS
+                then = ("split into halves and retried" if len(chunk) >= 2 and splits[kind] + 2 <= GQL_SPLITS
                         else "REST reads it this tick")  # a lone timeout: too heavy for GraphQL even alone
                 self.refresh_note("graphql", error, what, then)
             if len(chunk) == 1 and chunk[0]["key"] in self.heavy or (len(chunk) == 1 and error and SLOW.search(error)):
@@ -11192,7 +11240,7 @@ class Daemon:
                     self.clean[kind] = 0
                 continue
             slow = bool(SLOW.search(error))
-            if down and (len(chunk) < 2 or splits[kind] + 2 > GQL_SPLITS):
+            if (down or slow) and (len(chunk) < 2 or splits[kind] + 2 > GQL_SPLITS):
                 to_rest += chunk  # GitHub failed it and splitting cannot help any more: REST reads it this tick
                 continue
             if not slow and not down or len(chunk) < 2:
@@ -11205,16 +11253,19 @@ class Daemon:
             if splits[kind] + 2 <= GQL_SPLITS:
                 splits[kind] += 2
                 half = (len(chunk) + 1) // 2
-                left = [e for c in queue for e in c]
                 size = self.batch[kind]
-                queue = [chunk[:half], chunk[half:]] + [left[i:i + size] for i in range(0, len(left), size)]
+                queue = deque(c[i:i + size] for c in queue for i in range(0, len(c), size))
+                queue.extendleft((chunk[half:], chunk[:half]))
         return to_rest
 
-    def oldest_data(self, entries: list[dict], fetched: set[str]) -> dict[str, float | None]:
+    def oldest_data(self, entries: list[dict], fetched: set[str],
+                    observed_at: float | None = None) -> dict[str, float | None]:
         """Per kind, how old the oldest data of an open (not finished) watch is. A finished one is
         re-read only every TERMINAL_REFRESH by design, so it does not count. self.stale_waited gets the same
         for the watches a wait is blocked on only: those are read every cycle, so an old one there is starved
         (STALE_DATA_AFTER), where an idle PR's old data is only its backoff."""
+        if observed_at is None:
+            observed_at = self.now
         oldest: dict[str, float | None] = {kind: None for kind in CYCLES}
         # And per kind the freshest data of a live watch, one a wait is on or someone read lately (polled every cycle,
         # not on an idle back-off): the refresh loop's own pulse, which stall_alarm reads.
@@ -11244,13 +11295,13 @@ class Daemon:
             if cached and terminal(kind, cached.get("data")):
                 continue
             # never read yet (a heavy PR timing out since it was registered): as old as its watch here
-            seen = (cached or {}).get("dataAt") or self.since[e["key"]]
-            age_s = max(0.0, self.now - seen)
+            seen = (cached or {}).get("dataStoredAt") or (cached or {}).get("dataAt") or self.since[e["key"]]
+            age_s = max(0.0, observed_at - seen)
             oldest[kind] = max(oldest[kind] or 0.0, age_s)
             if self.waited(e) or self.now - e["touched"] < IDLE_BACKOFF_AFTER:
                 newest = self.newest_data[kind]
                 self.newest_data[kind] = age_s if newest is None else min(newest, age_s)
-            blocked = min(age_s, self.now - self.waited_since[e["key"]]) if self.waited(e) else 0.0
+            blocked = min(age_s, observed_at - self.waited_since[e["key"]]) if self.waited(e) else 0.0
             self.blocked[kind] += self.waited(e)
             if self.waited(e):
                 self.waited_ages[kind].append(age_s)
@@ -11312,6 +11363,16 @@ class Daemon:
                 fields = {**fields, "dataAt": self.resume_from}  # its oldest part's tick: no newer than that
             elif fields.get("dataAt") is not None:
                 self.cut_reads.pop(key, None)  # read since (GraphQL, a wait's read): nothing older may replace it
+            if key.startswith("pr:"):
+                # The alarm measures when a local read last delivered data. dataAt remains the conservative
+                # read-start stamp a wait can confirm against. Copied and resumed answers keep their source age.
+                if "dataAt" not in fields and base and "dataStoredAt" in base:
+                    entry["dataStoredAt"] = base["dataStoredAt"]
+                elif (fields.get("dataAt") == self.now and not fields.get("error")
+                      and fields.get("source") != "upstream" and key != self.resume_key):
+                    stored = self.clock()
+                    if stored > self.now:
+                        entry["dataStoredAt"] = stored
             entry.update(fields)
             if "data" in fields and "updatedAtAt" not in fields:
                 # updatedAtAt says when `data`'s head and updatedAt were last read from GitHub together (a whole
@@ -12672,7 +12733,8 @@ class Daemon:
         """The controller's rollup of SHA in ROOT's repository as it answered, else None (off, out, slow, failed)."""
         own = self.controller is not None
         get = getattr(self.controller if own else self.rollup_controller, "get", None)
-        if (not callable(get) or (own and not self.controller_room()) or self.now < self.rollup_down_until
+        if (not callable(get) or (own and not self.controller_room(CONTROLLER_ROLLUP_TIMEOUT))
+                or self.now < self.rollup_down_until
                 or self.now < self.rollup_slow.get(sha, 0.0) or not re.fullmatch(r"[0-9A-Za-z]{40}", sha)):
             return None
         repo = root.removeprefix("/repos/")
@@ -12698,7 +12760,9 @@ class Daemon:
         except ValueError:
             return None
         sha = str(sha or "").lower()
-        if getattr(self, "controller", None) is not None and not self.controller_room():
+        if getattr(self, "controller", None) is not None and not self.controller_room(CONTROLLER_ROLLUP_TIMEOUT):
+            # the room controller_rollup_doc asks for: a pass left too little for one rollup ask defers the row (asked
+            # next pass, not cached), never caches the None the doc read would return
             raise LandRollupDeferred(sha)  # this pass's LAND_ROLLUP_BUDGET is spent: asked next pass, not cached
         return controller_green_rollup(self.controller_rollup_doc(f"/repos/{owner}/{repo}", sha), sha)
 
@@ -12873,14 +12937,18 @@ class Daemon:
             self.settle_one(held)  # another credential (a token minted or a pool refused since): not this request's
             held = None
         if held is None:
+            if self.transport is http and not self.writing and (method == "GET" or
+                    (path == "/graphql" and not GRAPHQL_MUTATION.search(raw_body or b""))):
+                return http(method, API + path, headers, raw_body, deadline=self.tick_deadline)
             return self.transport(method, API + path, headers, raw_body)
         import concurrent.futures
         self.prefetch_stats["taken"] += 1
         try:
-            return held["future"].result(timeout=max(0.1, min(HTTP_DEADLINE, self.tick_deadline - time.monotonic()
-                                                              + SOCKET_TIMEOUT)))
+            return held["future"].result(timeout=max(0.0, min(HTTP_DEADLINE, self.tick_deadline - time.monotonic())))
         except concurrent.futures.TimeoutError:
             # charged as sent (request() charged it before): GitHub may count it whenever it ends
+            if time.monotonic() >= self.tick_deadline:
+                raise OutOfTime from None
             raise WatchError("request failed: no answer from the prefetch in time") from None
 
     def settle_prefetch(self) -> None:
@@ -12893,7 +12961,10 @@ class Daemon:
         import concurrent.futures
         self.prefetch_stats["unasked"] += 1
         try:
-            status, h, raw = held["future"].result(timeout=SOCKET_TIMEOUT)
+            remaining = max(0.0, self.tick_deadline - time.monotonic())
+            if remaining == 0 and held["future"].cancel():
+                return  # still queued: nothing sent or charged
+            status, h, raw = held["future"].result(timeout=min(SOCKET_TIMEOUT, remaining))
         except concurrent.futures.TimeoutError:
             status, h, raw = 0, {}, b""
         except Exception:  # noqa: BLE001  (never answered: GitHub may still have counted it)
@@ -13330,7 +13401,11 @@ class Daemon:
             self.controller_failures += 1
             wait, state = min(CONTROLLER_ABSENT, CONTROLLER_RETRY * 2 ** (self.controller_failures - 1)), "down"
             self.errors.append(what)
-        self.controller_down_until = self.now + wait
+        # A long tick can already be older than the entire retry interval when this request fails.
+        self.controller_down_until = self.clock() + wait
+        if isinstance(self.controller, Controller):
+            # At the longest interval allow a full read again: a slow but functioning endpoint can recover.
+            self.controller.probing = self.controller_missed_deadline and wait < CONTROLLER_ABSENT
         self.feed_live_since = None  # what the feed misses while out is not known: no PR is quiet until it is back
         self.save_feed_view()  # nor on a downstream host that rules with this view
         if not isinstance(error, NoReceiver):
@@ -13341,8 +13416,8 @@ class Daemon:
             cost = ("REST serves runs, and each one spends the shared REST quota the controller served free"
                     if self.controller_missed_deadline else "REST serves runs")
             self.refresh_note("controller", what, getattr(self.controller, "base", None) or "controller",
-                              f"{cost}; the controller is asked again at {utc_clock(self.now + wait)}")
-        self.controller_status = {"state": state, "error": what, "retryAt": self.now + wait,
+                              f"{cost}; the controller is asked again at {utc_clock(self.controller_down_until)}")
+        self.controller_status = {"state": state, "error": what, "retryAt": self.controller_down_until,
                                   "token": bool(getattr(self.controller, "token", None))}
 
     def read_feed(self) -> list[dict]:
@@ -13439,10 +13514,9 @@ class Daemon:
         if self.controller is None or self.now < self.controller_down_until:
             return
         self.controller_budget_end = time.monotonic() + CONTROLLER_TICK_BUDGET
-        with contextlib.suppress(AttributeError):  # (a controller object without the attribute just is not cut)
-            self.controller.budget_end = self.controller_budget_end
         try:
-            self.read_controller(entries)
+            if self.controller_room():
+                self.read_controller(entries)
         finally:
             self.controller_budget_end = float("inf")
             with contextlib.suppress(AttributeError):
@@ -13473,15 +13547,16 @@ class Daemon:
         gap = FEED_STREAM_BACKSTOP if stream is not None and stream.live(time.time()) else CONTROLLER_FEED_EVERY
         return now - self.controller_feed_at >= gap
 
-    def controller_room(self) -> bool:
-        """Whether this tick may ask the controller one more thing: it is not out (controller_down) and a whole
-        CONTROLLER_READ_TIMEOUT fits in what is left of the tick's CONTROLLER_TICK_BUDGET. A request is never
-        started to be cut short by the budget: that cut would read as the controller failing, and take it out
-        (#2201 review). The allowance is the read deadline, not the connect one, because the read is the part a
-        slow answer spends: a request allowed to start can always wait out an answer that is on its way, which is
-        what keeps the run it carries off the shared REST quota."""
-        return (self.controller is not None and self.now >= self.controller_down_until
-                and time.monotonic() + CONTROLLER_READ_TIMEOUT <= self.controller_budget_end)
+    def controller_room(self, timeout: float | None = None) -> bool:
+        """Start a read only if its socket timeout fits. Give the transport the same absolute deadline
+        for the whole response, including rollups and feed refreshes made inside a PR read."""
+        end = min(self.controller_budget_end, self.tick_deadline)
+        read = CONTROLLER_READ_TIMEOUT if timeout is None else timeout
+        if self.controller is None or self.now < self.controller_down_until or time.monotonic() + read > end:
+            return False
+        if isinstance(self.controller, Controller):
+            self.controller.budget_end = end
+        return True
 
     def read_controller(self, entries: list[dict]) -> None:
         """from_controller's reads, within the tick's CONTROLLER_TICK_BUDGET. Pages feed_between_reads read during the
@@ -13504,6 +13579,7 @@ class Daemon:
                 self.errors.append(f"on-event: {describe(error)} at {error_site(error)}")
         runs = {e["key"]: e for e in entries if e["key"].startswith("run:") and not e["jobs"]}
         self.controller_seen = {k: v for k, v in self.controller_seen.items() if k in runs}
+        checked_baselines = False
         for key, e in runs.items():
             if key in self.controller_seen:
                 continue
@@ -13515,10 +13591,13 @@ class Daemon:
             except WatchError as error:
                 self.controller_feed_error = None
                 return self.controller_down(error)
+            checked_baselines = True
             known = run is not None and (run.get("repo") or "").lower() == f"{owner}/{repo}"
             self.controller_seen[key] = known
             if known:
                 self.apply_run(e, run)
+        else:
+            checked_baselines = True  # includes the case where no run needed a baseline
         for page in pages:
             for run in page.get("runs") or []:
                 key = f"run:{str(run.get('repo') or '').lower()}/{run.get('id')}"
@@ -13531,7 +13610,13 @@ class Daemon:
         if pages and getattr(self, "controller_feed_error", None) is not None:
             error, self.controller_feed_error = self.controller_feed_error, None
             return self.controller_down(error)
-        if pages and self.now >= self.controller_down_until:  # an on-event lookup above may have taken it out
+        if pages and self.now >= self.controller_down_until and (checked_baselines or not self.controller_failures):
+            # The feed can answer while every run baseline times out. Clear the failure streak only
+            # after the refresh, including the run reads, succeeds.
+            self.controller_failures = 0
+            self.controller_missed_deadline = False
+            if isinstance(self.controller, Controller):
+                self.controller.probing = False
             self.controller_status = {"state": "ok", "lastDelivery": pages[-1].get("receiver_last_delivery"),
                                       "token": bool(self.controller.token)}
         if pages:
@@ -13540,9 +13625,6 @@ class Daemon:
     def took_feed(self, pages: list[dict]) -> None:
         """The feed answered now with PAGES: when it answered (controller_ok_at), since when without a gap
         (feed_live_since), and what it delivered per repository and PR (fed_repos, feed_marks)."""
-        if getattr(self, "controller_feed_error", None) is None:
-            self.controller_failures = 0
-            self.controller_missed_deadline = False  # it answered: REST reads from here are not its fallback
         if (self.feed_live_since is None or self.now - self.controller_ok_at > LAND_FEED_GAP
                 or any(page.get("reset") for page in pages)):
             self.feed_live_since = self.now  # what came before a gap or reset is not known: quiet starts here
@@ -13583,11 +13665,12 @@ class Daemon:
         if now <= self.now or not self.feed_stream_due(now) or now < self.controller_down_until:
             return  # (now <= self.now: no time has passed since the tick's own feed read)
         tick_now, budget_end = self.now, self.controller_budget_end
-        self.feed_between, self.now, self.controller_feed_at = True, now, now
+        self.feed_between, self.now = True, now
         self.controller_budget_end = time.monotonic() + CONTROLLER_TICK_BUDGET
-        with contextlib.suppress(AttributeError):
-            self.controller.budget_end = self.controller_budget_end
         try:
+            if not self.controller_room():
+                return
+            self.controller_feed_at = now
             try:
                 pages = self.read_feed()
             except WatchError as error:
@@ -17322,6 +17405,7 @@ class LandQueue:
         self.forward_fails = 0
         self.forward_misrouted = False  # a not_executor refusal was said ("fire"), until a forward goes through
         self.forward_redirects: set[tuple[str, str]] = set()  # (executor, redirected-to) pairs already said
+        self.forward_requests_stamp: tuple[int, int, int] | None = None
         self.forward_look_at = float("-inf")  # the next pass over the forwarded rows (forwards_follow)
         self.forward_asked: dict[str, float] = {}  # key -> when its far host was last asked (forward_ask_tick)
         self.forward_answers: dict[str, dict] = {}  # key -> the far host's last answer, until forward_follow reads it
@@ -17751,13 +17835,15 @@ class LandQueue:
 
     # -- the tick
 
-    def tick(self, now: float | None = None, dirty: set[str] | None = None) -> None:
+    def tick(self, now: float | None = None, dirty: set[str] | None = None, local_only: bool = False) -> None:
+        executor = land_executor(self.config())
+        self.executes = executor is None  # ingest_between: a forwarding host's requests are forward_tick's
+        if local_only and (executor is not None or self.forward_thread is not None and self.forward_thread.is_alive()):
+            return
         self.now = time.time() if now is None else now
         recovery = self.now >= self.recovery_at
         if recovery:
             self.recovery_at = self.now + LAND_RECOVERY_SWEEP
-        executor = land_executor(self.config())
-        self.executes = executor is None  # ingest_between: a forwarding host's requests are forward_tick's
         if executor is not None:
             if not self.queue_quota_parked():
                 self.forwards_unjudged()  # its one-off reads need the login a quota park says is spent
@@ -17934,6 +18020,27 @@ class LandQueue:
         return tried
 
     # -- forwarding to the land executor (land_executor): this host judges nothing
+
+    def dispatch_forwards(self, command: list[str]) -> None:
+        """New requests, a completed batch, and a due retry wake the sender independently of PR reads.
+        On an idle queue each check is one directory stat; existing rows are revisited on their normal cadence."""
+        self.now = time.time()
+        if self.forward_thread is not None and self.forward_thread.is_alive():
+            return
+        if self.now < self.forward_after:
+            return
+        try:
+            stamp = script_stat(self.requests_dir())
+        except FileNotFoundError:
+            stamp = None
+        if self.forward_thread is None and stamp == self.forward_requests_stamp and self.now < self.forward_look_at:
+            return
+        self.forward_thread = None
+        self.forward_requests_stamp = stamp
+        maintenance_due = self.now >= self.forward_look_at
+        self.forward_tick(command)
+        if maintenance_due and not self.queue_quota_parked():
+            self.forwards_unjudged()
 
     def forward_tick(self, command: list[str]) -> None:
         """One pass on a host that forwards its lands: apply here the requests for entries still open here, hand those
@@ -27015,13 +27122,28 @@ def start_main_watch() -> MainWatch | None:
     return watch
 
 
+def land_forward_loop(daemon: Daemon, stop: threading.Event) -> None:
+    daemon.land_forward_ident = threading.get_ident()
+    while not stop.is_set():
+        try:
+            daemon.land_tick(forward_only=True)
+        except Exception as error:  # noqa: BLE001  retry on the next pass; requests remain on disk
+            log({"event": "land-error", "error": describe(error), "site": error_site(error)})
+        stop.wait(TICK)
+
+
 def serve(foreground_ok: bool = False) -> int:
+    with contextlib.ExitStack() as cleanup:
+        return serve_daemon(foreground_ok, cleanup)
+
+
+def serve_daemon(foreground_ok: bool, cleanup: contextlib.ExitStack) -> int:
     global LOG_STDOUT
     LOG_STDOUT = True  # the daemon's stdout is its log
     inherited = adopt_inherited()  # before this image starts a child of its own: these are the last image's
     for name in (DEADLINE_ENV, DEADLINE_OWNER_ENV):  # a daemon started under a bounded call is not bounded by it
         os.environ.pop(name, None)
-    lock = hold_daemon_lock()
+    lock = cleanup.enter_context(hold_daemon_lock())
     me = Path(__file__).resolve()
     seen = {"stat": script_stat(me), "sha": hashlib.sha256(me.read_bytes()).hexdigest()}  # script_changed
     RUNNING_SCRIPT.update(scriptSha256=seen["sha"], scriptSince=time.time())
@@ -27052,6 +27174,13 @@ def serve(foreground_ok: bool = False) -> int:
              **({"handedJudgments": handed} if handed else {}),
              **({"sinceWakeS": round(time.monotonic() - woke, 2)} if woke is not None else {})})
         os.execv(sys.executable, [sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
+
+    stop_forwards = threading.Event()
+    forwarder = threading.Thread(target=land_forward_loop, args=(daemon, stop_forwards),
+                                 name="land-forward-scheduler", daemon=True)
+    forwarder.start()
+    cleanup.callback(forwarder.join)
+    cleanup.callback(stop_forwards.set)  # wake and join before releasing this daemon's lock
 
     wake = ScriptWake(me, seen["sha"], daemon, jump=lambda: reexec(where=f"script-wake in {daemon.phase_now}"))
     threading.Thread(target=wake.run, name="glaeda-gh-script-wake", daemon=True).start()
