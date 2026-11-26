@@ -677,5 +677,98 @@ class HostPolicyRefusalTests(unittest.TestCase):
         self.assertNotIn("[2/2] format", said)
 
 
+class FocusedPhaseSelectionFollowsTheDiffTests(unittest.TestCase):
+    """A cargo phase the diff cannot affect is skipped with a reason naming what was read.
+
+    2026-11-23: `focused` ran its three cargo phases unconditionally. On a shared workstation
+    `tools/heavy-guard` then refuses two of them, so every Python-only change paid for phases whose
+    verdict was never obtainable here and was never needed: 91.6% of the 812 commits on
+    origin/main in the 30 days from 2026-10-23 change only `docs/`, `scripts/`, `skills/`,
+    `.claude/` or a top-level `*.md`. Measured on one Python-only diff: 6.42 s and exit 77 before,
+    4.75 s and exit 0 after.
+    """
+
+    def fixture(self, directory: str, paths: list[str]) -> Path:
+        root = Path(directory)
+        author = ["-c", "user.name=Glaeda test", "-c", "user.email=glaeda-test@example.invalid"]
+
+        def git(*arguments: str) -> None:
+            subprocess.run(["git", *author, *arguments], cwd=root, check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        git("init", "--quiet", "-b", "main")
+        (root / "base.txt").write_text("base\n", encoding="utf-8")
+        git("add", "base.txt")
+        git("commit", "--quiet", "-m", "base")
+        git("checkout", "--quiet", "-b", "work")
+        for name in paths:
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("changed\n", encoding="utf-8")
+            git("add", name)
+        git("commit", "--quiet", "-m", "change")
+        return root
+
+    def focused_run(self, root: Path) -> tuple[int, str]:
+        module = runpy.run_path(str(VERIFY), run_name="glaeda_verify_test")
+        cargo = [
+            module["Phase"]("compile-all-targets", "capability", "cargo",
+                            ("check", "--locked", "--all-targets", "--all-features")),
+            module["Phase"]("format", "capability", "cargo", ("fmt", "--all", "--", "--check")),
+            module["Phase"]("repo-query-integration", "capability", "cargo",
+                            ("test", "--locked", "--test", "repo_query_cli")),
+        ]
+        run = module["run"]
+        run.__globals__["phases_for"] = lambda profile: tuple(cargo)
+        run.__globals__["repository_root"] = lambda: root
+        with tempfile.TemporaryDirectory() as sink_directory:
+            captured = Path(sink_directory) / "stderr.log"
+            with captured.open("w+b") as sink:
+                sys.stderr.flush()
+                saved = os.dup(2)
+                try:
+                    os.dup2(sink.fileno(), 2)
+                    code = run("focused")
+                finally:
+                    sys.stderr.flush()
+                    os.dup2(saved, 2)
+                    os.close(saved)
+            return code, captured.read_text(encoding="utf-8", errors="replace")
+
+    def test_a_scripts_only_diff_skips_every_cargo_phase_and_says_what_it_read(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.fixture(directory, ["scripts/apple_queue.py", "docs/NOTE.md"])
+            code, said = self.focused_run(root)
+
+        for name in ("compile-all-targets", "format", "repo-query-integration"):
+            self.assertIn(f"{name}: skipped:", said)
+        self.assertIn("no *.rs, Cargo.toml or Cargo.lock in the diff vs origin/main", said)
+        self.assertIn("read 2 changed path(s) from `git diff --name-only", said)
+        self.assertIn("scripts/apple_queue.py", said)
+        self.assertEqual(code, 0, said)
+
+    def test_a_diff_touching_rust_or_an_unreadable_diff_still_runs_every_cargo_phase(self) -> None:
+        """A wrong skip is far worse than a wasted phase, so anything unproven runs everything."""
+        module = runpy.run_path(str(VERIFY), run_name="glaeda_verify_test")
+        reason = module["rust_phase_skip_reason"]
+        for paths in (
+            ["src/lib.rs"],
+            ["Cargo.toml"],
+            ["Cargo.lock"],
+            ["rustfmt.toml"],
+            ["scripts/apple_queue.py", "src/host.rs"],
+            ["tests/repo_query_cli.rs"],
+            ["ops/whatever.yml"],
+        ):
+            with tempfile.TemporaryDirectory() as directory:
+                root = self.fixture(directory, paths)
+                self.assertIsNone(reason(root), paths)
+
+        with tempfile.TemporaryDirectory() as directory:
+            no_git_history = Path(directory)
+            (no_git_history / "file.txt").write_text("x\n", encoding="utf-8")
+            self.assertIsNone(reason(no_git_history))
+
+
 if __name__ == "__main__":
     unittest.main()

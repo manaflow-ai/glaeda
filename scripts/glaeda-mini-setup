@@ -26,17 +26,19 @@ as operator steps instead. The one exception is the explicit --runner mode, whic
 GitHub Actions runner and is documented in docs/CMUX_MINI_RUNNER.md.
 
 What --apply installs (templated for the current user):
-    ~/.local/bin/glaeda-disk                   from scripts/glaeda-disk
+    ~/.local/bin/glaeda-disk, cmux-disk        from scripts/glaeda-disk, scripts/cmux-disk (cmux-disk is the primary name)
     ~/.local/bin/glaeda-worktree               canonical Projects/worktrees creator
     ~/.local/bin/glaeda-projects               dry-run/apply Projects tidy pass
     ~/.local/bin/disk-pressure.sh              one-shot launcher used by every mini's LaunchAgent
-    ~/.local/bin/glaeda-procs                  from scripts/glaeda-procs (why the Mac lags; --apply ends leaked fixtures)
+    ~/.local/bin/glaeda-procs, cmux-procs      from scripts/glaeda-procs and its primary name cmux-procs (why the Mac lags; --apply ends leaked fixtures)
     ~/.local/bin/glaeda-local-guard            from scripts/glaeda-local-guard (stops test and build runs orphaned by an
                                                agent session on a hygiene-only Mac, and on every Mac shell -c trees
                                                left under launchd that stopped using CPU)
     ~/.local/bin/glaeda-worktree-reclaim       built from src/bin/glaeda-worktree-reclaim.rs
     ~/.local/bin/glaeda-worktree-reclaim-all   from scripts/glaeda-worktree-reclaim-all
     ~/.local/bin/glaeda-fleet-cas-prune        from scripts/glaeda-fleet-cas-prune (a no-op without fleet-cas)
+    ~/.local/bin/glaeda-disk-registry          and cmux-disk-registry, its primary name (LRU eviction to config/disk-registry.toml's
+                                               budgets; a dry run without GLAEDA_DISK_REGISTRY=1)
     ~/.local/bin/glaeda-seed-prefetch          from scripts/glaeda-seed-prefetch (a no-op off an owned cmux runner)
     ~/.local/bin/glaeda-git-mirror             from scripts/glaeda-git-mirror (the runner mini's full cmux git mirror,
                                                /Users/Shared/cmux-build-fleet/git/cmux.git; a no-op without a runner)
@@ -58,10 +60,10 @@ What --apply installs (templated for the current user):
     ~/.local/bin/glaeda-idle-repair            durable repair queue: records busy hosts and runs disk/health repairs on
                                                the first idle LaunchAgent tick
     ~/.local/bin/glaeda-update                 from scripts/glaeda-update (over-the-air updates every 10 min)
-    ~/.local/bin/glaeda-gh                     from scripts/glaeda-gh (shared GitHub CI watcher, the one poller)
+    ~/.local/bin/glaeda-gh, cmux-gh            from scripts/glaeda-gh, scripts/cmux-gh (shared GitHub CI watcher, the one poller; cmux-gh is the primary name)
     ~/.local/bin/glaeda-wallpaper-rotate       from scripts/glaeda-wallpaper-rotate (operator-supplied stills, every 30 minutes)
     ~/.local/bin/glaeda-runner-hygiene         from scripts/glaeda-runner-hygiene (root-installed per-account cache policy)
-    ~/.claude/skills/github-ci-wait/SKILL.md    from skills/github-ci-wait: tells agent sessions to wait with glaeda-gh
+    ~/.claude/skills/github-ci-wait/SKILL.md    from skills/github-ci-wait: tells agent sessions to wait with cmux-gh
     ~/.config/glaeda/lan-cache/config.json     on a macOS host with a GitHub Actions runner: glaeda-git-mirror's
                                                source {"schema": 1, "source": "direct"}, written once when absent
     ~/.config/glaeda/update.json               its release ring and source, written once (--ota-ring canary|stable,
@@ -197,6 +199,13 @@ DEVBOX_LINUX_UNITS = frozenset({"glaeda-projects-tidy.service", "glaeda-projects
 # pass, which acts only below the free-space floor (Leo, 2026-11-08: cleanup "on every machine ... this is what
 # glaeda is for"). For a host that runs agent lanes whose worktree reclaim is its own.
 GH_ONLY_TOOLS = ("glaeda-update", "glaeda-gh", "glaeda-disk", "disk-pressure.sh")
+# cmux-gh is glaeda-gh's primary name (Leo, 2026-11-25: "what if we start calling these cmux-gh?"). Installed beside
+# the tool it renames (scripts/cmux-gh, a shim that runs glaeda-gh beside it), so the old name keeps working for every caller, timer and skill. The service
+# labels, the LaunchAgent and the daemon's own command stay glaeda-gh: hosts have them loaded. cmux-disk, cmux-procs
+# and cmux-disk-registry are the same for their glaeda-* programs (Leo, 2026-11-25: "start migrating off glaeda and
+# into cmux-prefixed naming tooling"); the old names count their uses in ~/.local/state/cmux-names for retirement.
+TOOL_ALIASES = {"glaeda-gh": "cmux-gh", "glaeda-disk": "cmux-disk", "glaeda-procs": "cmux-procs",
+                "glaeda-disk-registry": "cmux-disk-registry"}
 PROFILE_FLAGS = ("--gh-only", "--hygiene-only")
 GH_ONLY_LINUX_UNITS = frozenset({"glaeda-update.service", "glaeda-update.timer", "glaeda-gh.service",
                                  "glaeda-disk-pressure.service", "glaeda-disk-pressure.timer"})
@@ -208,6 +217,9 @@ DAEMON_POLICY_SOURCE = REPO / "config/macos-daemons.json"  # desired state of ma
 CLAUDE_ROUTES_SOURCE = REPO / "config/claude-routes.json"  # the fleet routes glaeda-mini-health keeps Claude on
 FLEET_SERVICES_SOURCE = REPO / "config/fleet-services.json"  # the owned non-glaeda launchd services (unmanaged_service)
 GH_POLICY_SOURCE = REPO / "config/gh-daemon.json"  # the fleet's glaeda-gh pacing: per-host REST shares
+# The shared intent layer every glaeda CLI loads (leo-workspace tools/intent.py, vendored by scripts/intent-sync): the
+# copies in ~/.local/bin have no scripts/ beside them, so they read it from ~/.local/share/glaeda/intent/ (every profile)
+INTENT_SOURCES = (REPO / "scripts/intent.py", REPO / "scripts/intent_aliases.json")
 # glaeda-update runs this command from a release; it sets this so setup never unloads the job running it
 UPDATE_ENV = "GLAEDA_UPDATE_RUNNING"
 OTA_RINGS = ("canary", "stable")
@@ -937,14 +949,17 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
         # records a durable queued receipt; the next minute retries automatically.
         LABEL_PREFIX + "idle-repair": {
             "Label": LABEL_PREFIX + "idle-repair",
-            "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-idle-repair"), "--apply"],
+            "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-idle-repair"), "--apply", "--scheduled-log"],
             "StartInterval": 60,
             "RunAtLoad": True,
             "ProcessType": "Background",
             "LowPriorityIO": True,
             "Nice": 10,
-            "EnvironmentVariables": {"GLAEDA_PYTHON": python, "GLAEDA_DISK": disk, "GLAEDA_ROLE": ctx.role},
-            "StandardOutPath": os.fspath(ctx.logs / "glaeda-idle-repair.jsonl"),
+            # BOOT_SPREAD_S: its first pass after a boot or wake waits 0-300 s (glaeda-idle-repair boot_hold).
+            "EnvironmentVariables": {"GLAEDA_PYTHON": python, "GLAEDA_DISK": disk, "GLAEDA_ROLE": ctx.role,
+                                     "BOOT_SPREAD_S": "300"},
+            # idle-repair opens its log under run.lock. A descriptor launchd opens first would race rotation.
+            "StandardOutPath": "/dev/null",
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-idle-repair.err"),
         },
         LABEL_PREFIX + "disk-dedupe": {
@@ -1011,6 +1026,20 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             "Nice": 10,
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-fleet-cas-prune.jsonl"),
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-fleet-cas-prune.err"),
+        },
+        # The declared caches (config/disk-registry.toml, scripts/glaeda-disk-registry): every hour, holds each
+        # regenerating cache to its budget, least recently used unit first, at most 8 units a pass. Without
+        # GLAEDA_DISK_REGISTRY=1 in its environment, which this plist does not set, it logs its plan and deletes
+        # nothing (cmuxterm-hq docs/design/declared-disk-persistence.md, PR 2; the per-host rollout sets the flag).
+        LABEL_PREFIX + "disk-registry-evict": {
+            "Label": LABEL_PREFIX + "disk-registry-evict",
+            "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-disk-registry"), "evict", "--json", "--apply"],
+            "StartInterval": 3600,
+            "ProcessType": "Background",
+            "LowPriorityIO": True,
+            "Nice": 10,
+            "StandardOutPath": os.fspath(ctx.logs / "glaeda-disk-registry.jsonl"),
+            "StandardErrorPath": os.fspath(ctx.logs / "glaeda-disk-registry.err"),
         },
         # Fetches main's newest DerivedData seed into each canonical root's local seed cache while an owned
         # cmux runner is idle (cmuxterm-hq#658); it exits at once where no owned job has run. Apple's python3
@@ -1087,6 +1116,9 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-local-guard"), "--apply"],
             "StartInterval": 30,
             "RunAtLoad": True,
+            # Its first pass after a boot or wake waits 0-120 s (glaeda-local-guard boot_hold): a boot has no orphans
+            # yet, and every RunAtLoad job starting at once is what loaded cosmic-gray to 214 after its 11-24 panic.
+            "EnvironmentVariables": {"BOOT_SPREAD_S": "120"},
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-local-guard.log"),
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-local-guard.err"),
         },
@@ -1146,7 +1178,7 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
 # "It's just, like, random garbage that was accumulated").
 RUNNER_ONLY_AGENTS = frozenset(LABEL_PREFIX + name for name in (
     "idle-warm", "idle-fuzz", "mini-health", "git-mirror", "seed-prefetch", "lan-fetch", "fleet-cas-prune",
-    "wallpaper"))
+    "wallpaper", "disk-registry-evict"))
 
 
 def has_glaeda_runner(ctx: Context) -> bool:
@@ -1170,12 +1202,12 @@ def agent_names(ctx: Context) -> list[str]:
                 if (not ctx.gh_only or is_update_agent(label) or is_gh_agent(label)
                     or label == LABEL_PREFIX + "disk-pressure")
                 and (runner_only_ok or label not in RUNNER_ONLY_AGENTS)
-                and not (is_reclaim_agent(label) and reclaim_owned_elsewhere(ctx))]
+                and not (owned_by_reconciler(ctx, label) and reclaim_owned_elsewhere(ctx))]
     if ctx.gh_only:
         return [name for name in LINUX_UNITS if name in GH_ONLY_LINUX_UNITS]
     return [name for name in LINUX_UNITS
             if ((ctx.role == "devbox" and ctx.projects_tidy) or name not in DEVBOX_LINUX_UNITS)
-            and not (is_reclaim_agent(name) and reclaim_owned_elsewhere(ctx))]
+            and not (owned_by_reconciler(ctx, name) and reclaim_owned_elsewhere(ctx))]
 
 
 # leo-workspace's hygiene reconciler (tools/host-baseline) runs worktree reclaim where it is installed and retires
@@ -1183,7 +1215,20 @@ def agent_names(ctx: Context) -> list[str]:
 # each hourly OTA rerun reinstalled glaeda-worktree-reclaim, each ws-sync deleted it, and a run whose unit file
 # vanished mid-sweep was killed at systemd's default 90 s start timeout and left `not-found failed`. One owner:
 # where the reconciler is installed, setup leaves its reclaim agent out (and removes the one it owns).
+#
+# The same holds for the macOS disk-pressure agent: on a glaeda_pressure host (every glaeda hygiene host) the
+# reconciler's pressure pass runs `glaeda-disk --pressure --idle --apply --top 0` itself, and host-baseline retires
+# com.teamleaderleo.glaeda.disk-pressure as a legacy scheduler (leo-workspace machines/worktree-reclaim.json
+# glaeda.legacy_schedulers.Darwin). Leo's Mac, 2026-11-22/23: setup reinstalled it, the next ws-sync removed it,
+# launchd-loaded reloaded it in between and paged NOW 5 times in 19 h. Linux keeps glaeda-disk-pressure.timer: nothing
+# retires it there, and leo-workspace host-baseline.json glaeda_ota.timers requires it active.
 RECONCILER_LABEL = "ai.leo-workspace.hygiene-reconciler"
+RECONCILER_OWNED_MACOS = (LABEL_PREFIX + "disk-pressure",)
+
+
+def owned_by_reconciler(ctx: Context, label: str) -> bool:
+    """An agent the hygiene reconciler takes over where it is installed (reclaim_owned_elsewhere)."""
+    return is_reclaim_agent(label) or (ctx.platform != "linux" and label in RECONCILER_OWNED_MACOS)
 
 
 def reclaim_owned_elsewhere(ctx: Context) -> bool:
@@ -1252,6 +1297,11 @@ def fleet_services_path(ctx: Context) -> Path:
 def gh_policy_path(ctx: Context) -> Path:
     """config/gh-daemon.json, where glaeda-gh reads it (every profile: every host may run the daemon)."""
     return ctx.home / ".local/share/glaeda/gh-daemon.json"
+
+
+def intent_dir(ctx: Context) -> Path:
+    """Where the glaeda CLIs in ~/.local/bin load the shared intent layer from (their INTENT_DIRS)."""
+    return ctx.home / ".local/share/glaeda/intent"
 
 
 def is_update_agent(label: str) -> bool:
@@ -1539,13 +1589,18 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
         "glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-runner-hygiene", "disk-pressure.sh", "glaeda-procs",
         "glaeda-local-guard", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune", "glaeda-seed-prefetch",
         "glaeda-git-mirror", "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health", "glaeda-idle-repair",
-        "glaeda-update", "glaeda-gh", "glaeda-wallpaper-rotate", "glaeda-daemon-heal")
+        "glaeda-update", "glaeda-gh", "glaeda-wallpaper-rotate", "glaeda-daemon-heal", "glaeda-disk-registry")
     for name in tools:
         act = file_action(ctx, "tool", ctx.bin / name, (SCRIPT_DIR / name).read_bytes(), 0o755)
         act["source"] = os.fspath(SCRIPT_DIR / name)
         actions.append(act)
+        if name in TOOL_ALIASES and (SCRIPT_DIR / TOOL_ALIASES[name]).is_file():
+            alias = file_action(ctx, "tool", ctx.bin / TOOL_ALIASES[name], (SCRIPT_DIR / TOOL_ALIASES[name]).read_bytes(), 0o755)
+            alias["source"] = os.fspath(SCRIPT_DIR / TOOL_ALIASES[name])
+            actions.append(alias)
     # a copy, not a link: the release tree it came from is replaced by the next update
-    for dest, source in ((skill_path(ctx), SKILL_SOURCE), (gh_policy_path(ctx), GH_POLICY_SOURCE)):
+    for dest, source in ((skill_path(ctx), SKILL_SOURCE), (gh_policy_path(ctx), GH_POLICY_SOURCE),
+                         *((intent_dir(ctx) / src.name, src) for src in INTENT_SOURCES)):
         act = file_action(ctx, "tool", dest, source.read_bytes(), 0o644)
         act["source"] = os.fspath(source)
         actions.append(act)
@@ -1769,8 +1824,10 @@ def plan_uninstall(ctx: Context) -> list[dict[str, Any]]:
                         "loaded": agent_loaded(ctx, label)})
     for name in ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-runner-hygiene", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune",
                  "glaeda-seed-prefetch", "glaeda-git-mirror", "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health", "glaeda-idle-repair",
-                 "glaeda-update", "glaeda-gh", "glaeda-wallpaper-rotate", "glaeda-daemon-heal"):
+                 "glaeda-update", "glaeda-gh", "glaeda-wallpaper-rotate", "glaeda-daemon-heal", "glaeda-disk-registry"):
         actions.append({"kind": "tool", "path": os.fspath(ctx.bin / name)})
+        if name in TOOL_ALIASES:
+            actions.append({"kind": "tool", "path": os.fspath(ctx.bin / TOOL_ALIASES[name])})
     actions.append({"kind": "tool", "path": os.fspath(skill_path(ctx))})
     actions.append({"kind": "tool", "path": os.fspath(gh_policy_path(ctx))})
     actions.append({"kind": "tool", "path": os.fspath(daemon_policy_path(ctx))})
@@ -1829,10 +1886,54 @@ def write_atomic(path: Path, data: bytes, mode: int) -> None:
     os.replace(stage, path)
 
 
+def ota_rollback_generation(ctx: Context) -> Path | None:
+    """The complete generation that glaeda-update restores on failure and keeps on success."""
+    if ctx.platform != "macos" or not os.environ.get(UPDATE_ENV):
+        return None
+    update = ctx.state.parent / "update"
+    try:
+        state = json.loads((update / "state.json").read_text())
+        tag = state.get("current") if isinstance(state, dict) else None
+        if not isinstance(tag, str) or not re.fullmatch(r"r-\d{8}-[0-9a-f]{12}", tag):
+            return None
+        gen = update / "generations" / tag
+        marker = gen / ".complete"
+        if marker_root_is_owned(ctx, marker) and marker.read_bytes() == (tag + "\n").encode():
+            return gen
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def rollback_tool(ctx: Context, gen: Path | None, act: dict[str, Any], dest: Path) -> Path | None:
+    """A receipt-owned tool whose exact prior bytes are already in OTA's rollback generation."""
+    if gen is None or act["kind"] != "tool" or not act.get("owned"):
+        return None
+    if dest == ctx.bin / "glaeda-worktree-reclaim":
+        source = gen / "bin" / dest.name
+    else:
+        try:
+            source = gen / "glaeda" / Path(act["source"]).relative_to(REPO)
+        except ValueError:
+            return None
+    digest = act.get("ownedSha256")
+    if (digest and marker_root_is_owned(ctx, source) and sha256_file(source) == digest
+            and sha256_file(dest) == digest and stat.S_IMODE(dest.stat().st_mode) == int(act["mode"], 8)):
+        return source
+    return None
+
+
 def backup(ctx: Context, path: Path) -> str:
     stamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
-    dest = ctx.state / "backup" / f"{path.name}.{stamp}"
-    dest.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    root = ctx.state / "backup"
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Two installs within a second must keep both originals, including a local edit between them.
+    dest = root / f"{path.name}.{stamp}"
+    try:
+        dest.touch(mode=0o600, exist_ok=False)
+    except FileExistsError:
+        with tempfile.NamedTemporaryFile(dir=root, prefix=dest.name + ".", delete=False) as created:
+            dest = Path(created.name)
     shutil.copy2(path, dest)
     return os.fspath(dest)
 
@@ -1888,6 +1989,7 @@ def install_service_file(ctx: Context, path: Path, data: bytes, mode: int) -> No
 
 def apply_install(ctx: Context, actions: list[dict[str, Any]]) -> None:
     reclaim_failed = False
+    rollback = ota_rollback_generation(ctx)
     for act in actions:
         kind, state = act["kind"], act["state"]
         act["applied"] = False
@@ -1933,7 +2035,11 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]]) -> None:
             else:
                 data = b""
             if state == "update":
-                act["backup"] = backup(ctx, dest)
+                saved = rollback_tool(ctx, rollback, act, dest)
+                if saved is None:
+                    act["backup"] = backup(ctx, dest)
+                else:
+                    act["rollbackSource"] = os.fspath(saved)
             if not dest.parent.exists():
                 dest.parent.mkdir(parents=True, exist_ok=True)  # the skill's directory may not exist yet
             if kind == "agent" and act.get("loaded") and ctx.platform != "linux":

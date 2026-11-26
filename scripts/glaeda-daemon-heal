@@ -1280,8 +1280,8 @@ def names_list(value: Any, what: str) -> set[str]:
 
 def fleet_ops_hold(now: float, fleet_root: Path = FLEET_ROOT, node: str | None = None) -> str:
     """Why the ops stay as they are on this host ("" when they may be installed). Fails closed: a reservation list that
-    is missing, unreadable, or past its own "expires" holds, as an active entry naming this host or an active
-    host-local reservation does.
+    is missing or unreadable holds, as an active entry naming this host or an active host-local reservation does. A
+    list past its own "expires" is released: only an entry in it still live by its own from/until holds.
     The list is the fleet user's ~/.local/share/glaeda/fleet-reservations.json (glaeda-fleet-reservations/v1), the
     user being the owner of the fleet root. Root reads it, and the update config's host name, only to decide whether
     to hold: whatever they say, the bytes it installs are the pinned ones."""
@@ -1301,8 +1301,9 @@ def fleet_ops_hold(now: float, fleet_root: Path = FLEET_ROOT, node: str | None =
         doc = strict_json(read_small(home / ".local/share/glaeda/fleet-reservations.json"))
         if not isinstance(doc, dict) or doc.get("schema") != RESERVATIONS_SCHEMA:
             raise ValueError("schema")
-        if reservation_time(doc.get("expires")) <= now:  # its writer refreshes it; an old list is no answer
-            return f"fleet reservations expired at {doc.get('expires')}; held as reserved"
+        # an expired list is released (glaeda-disk's host_reservation reads it the same way): its writer stopped
+        # refreshing it, so only an entry in it still live by its own from/until holds this host
+        stale = reservation_time(doc.get("expires")) <= now
         entries, aliases = doc["reservations"], doc.get("aliases", {})
         if not isinstance(entries, list) or not isinstance(aliases, dict):
             raise ValueError("malformed")
@@ -1317,7 +1318,7 @@ def fleet_ops_hold(now: float, fleet_root: Path = FLEET_ROOT, node: str | None =
             if start > until:
                 raise ValueError("an entry ends before it starts")
             if names & hosts and start <= now <= until and not reserved:
-                reserved = f"reserved until {e['until']}"
+                reserved = f"reserved until {e['until']}" + (f" (list expired at {doc['expires']})" if stale else "")
         if reserved:
             return reserved
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:

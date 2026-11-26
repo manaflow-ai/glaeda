@@ -1080,7 +1080,7 @@ class SelfUpdate(unittest.TestCase):
 
 class FleetOps(unittest.TestCase):
     """The fleet's root ops scripts (config/fleet-ops.json): pinned bodies, installed only on an eligible host that
-    is not reserved, and a reservation list that cannot be read, or has expired, holds."""
+    is not reserved, and a reservation list that cannot be read holds; an expired one holds only by a live entry."""
 
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
@@ -1290,9 +1290,14 @@ class FleetOps(unittest.TestCase):
         self.assertIn("unreadable", self.reservations(self.lst(schema="other/v1")))
         self.assertIn("unreadable", self.reservations(self.lst(expires=None)), "no expires: held")
         self.assertIn("unreadable", self.reservations(self.lst(expires="soon")))
-        self.assertIn("expired", self.reservations(self.lst(expires=heal.iso(T0 - 1))), "an old list: held")
+        self.assertEqual(self.reservations(self.lst(expires=heal.iso(T0 - 1))), "", "an old, empty list: released")
         entry = {"id": "r1", "owner": "someone", "hosts": ["build-mini-7"], "from": heal.iso(T0 - 60),
                  "until": heal.iso(T0 + 60)}
+        old = heal.iso(T0 - 1)
+        self.assertIn("list expired at", self.reservations(self.lst(expires=old, reservations=[entry])),
+                      "an old list's entry still live by its own until: held")
+        self.assertEqual(self.reservations(self.lst(expires=old, reservations=[{**entry, "until": old}])), "",
+                         "an old list whose entry lapsed: released")
         self.assertIn("reserved until", self.reservations(self.lst(reservations=[entry])))
         self.assertEqual(self.reservations(self.lst(reservations=[{**entry, "until": heal.iso(T0 - 1)}])), "", "lapsed")
         other = {**entry, "hosts": ["build-mini-8"]}
@@ -1306,6 +1311,9 @@ class FleetOps(unittest.TestCase):
             "schema": "glaeda-reservation/v1", "since": int(T0) - 60, "until": int(T0) + 60}))
         self.assertEqual(self.reservations(self.lst(), local={
             "schema": "glaeda-reservation/v1", "since": int(T0) - 60, "until": int(T0) - 1}), "", "lapsed")
+        self.assertIn("host reservation", self.reservations(self.lst(expires=old), local={
+            "schema": "glaeda-reservation/v1", "since": int(T0) - 60, "until": int(T0) + 60}),
+            "an old list still reads the host-local marker")
 
     def test_a_malformed_reservation_anywhere_holds(self) -> None:
         entry = {"id": "r1", "owner": "someone", "hosts": ["build-mini-8"], "from": heal.iso(T0 - 60),
