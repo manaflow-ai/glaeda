@@ -30371,6 +30371,27 @@ class LandTest(Base):
         e = self.tick(gg.LAND_OWNER_REMIND_EVERY)  # 19:00Z, still the same UTC day: the cap
         self.assertEqual((e["reminds"]["n"], len(self.w.sent())), (2, sent + 2))
 
+    def test_a_stop_unmoved_past_a_day_wakes_its_owner_once(self):
+        # LAND_OWNER_REMIND_STALE: cmux-cp-1, 2026-11-26: ~45 rows sat stopped 29-65 h, reminded only as fyi.
+        self.conflict_stop()
+        classes = lambda: [c[c.index("--class") + 1] for c in self.w.sent()]  # noqa: E731
+        sent = len(self.w.sent())
+        self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        self.assertEqual(classes()[sent:], ["fyi", "fyi"])  # the first day: fyi, as before
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)  # 19:00Z: the day's cap
+        self.assertEqual(len(self.w.sent()), sent + 2)
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)  # 01:00Z the next day: 24 h at the same head
+        self.assertEqual(classes()[-1], gg.LAND_NOTICE_CLASS)  # the one wake
+        said = self.w.sent()[-1][-1]
+        self.assertIn("unmoved 24 h", said)
+        self.assertIn("close the PR naming what superseded it", said)
+        self.assertEqual((e["state"], e["reminds"]["staleHead"]), ("stopped", LA))
+        self.assertTrue([h for h in e["history"] if h.get("event") == "reminded" and h.get("stale")])
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        self.assertEqual(classes()[-1], "fyi")  # once per stop head, never again for it
+        self.assertEqual(e["reminds"]["staleHead"], LA)
+
     def test_a_stopped_row_whose_pr_is_over_is_not_reminded(self):
         self.conflict_stop()
         sent = len(self.w.sent())

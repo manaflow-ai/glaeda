@@ -15740,6 +15740,16 @@ LAND_OWNER_REMIND_CAP = 2
 # is, as before. Cost: at most one read per due reminder, LAND_OWNER_REMIND_CAP a row a day. Detector:
 # test-glaeda-gh.py test_a_stopped_row_merged_behind_a_stale_copy_is_read_before_it_is_reminded.
 LAND_OWNER_REMIND_READ_WAIT = 1800.0
+# LAND_OWNER_REMIND_STALE: a reminder is an inbox fyi (LAND_OWNER_REMIND_ENDS), and an fyi wakes nobody, so a stop its
+# requester did not act on in the first day was never heard again: cmux-cp-1, 2026-11-26, ~45 rows "still stopped
+# after 29-65 h" (lw#8652 ... lw#10988, cmux#53146, hq#26188), each reminded twice a day as fyi to a coordinator
+# that had queued them for helpers long gone. Of 25 open leo-workspace ones, 17 were base-red fixes main had fixed
+# another way (close), 4 merged main cleanly (re-queue) and 4 needed a hand merge: all one decision away. The first
+# reminder past LAND_OWNER_REMIND_STALE_AFTER at a head unmoved since the stop goes as a blocker (it wakes), names that
+# decision, and is also a coordinator notice (land-stopped-stale); once per stop head (reminds.staleHead), every later
+# reminder of that stop is an fyi again. Detector: test-glaeda-gh.py
+# test_a_stop_unmoved_past_a_day_wakes_its_owner_once.
+LAND_OWNER_REMIND_STALE_AFTER = 86400.0
 
 # LAND_OWNER_REMIND_MOVED: the reminder's words are the stop's own, written at the head the stop was read at, so a
 # reminder sent hours later names a sha the PR may have moved past and a one step that judges the wrong commit --
@@ -19909,8 +19919,13 @@ class LandQueue:
         head = str(data.get("headRefOid") or "").lower() if read_at and max(read_at) > last else ""
         was = str(st.get("head") or "").lower()
         moved = bool(head) and bool(was) and head != was  # LAND_OWNER_REMIND_MOVED
+        # LAND_OWNER_REMIND_STALE: past a day at the stop's own head, once per stop head, a blocker
+        stale = (not moved and bool(was) and self.now - at >= LAND_OWNER_REMIND_STALE_AFTER
+                 and str(r.get("staleHead") or "") != was)
+        stale_head = was if stale else str(r.get("staleHead") or "")
         e["reminds"] = {"day": day, "n": n + 1, "at": self.now, "code": code,
-                        **({"head": head} if head else {})}  # attributable to the stop it answered, at the head read
+                        **({"head": head} if head else {}),  # attributable to the stop it answered, at the head read
+                        **({"staleHead": stale_head} if stale_head else {})}
         hours = (self.now - at) / 3600.0
         msg = (f"glaeda land: {self.url(e)} still stopped after {hours:.0f} h: {code}: "
                f"{land_reason(st.get('reason') or '', 300)}")
@@ -19923,14 +19938,21 @@ class LandQueue:
                     f"`glaeda-gh land {e['repo']}#{e['number']} --pin {head}` judges it there")
         elif not head and was:
             msg += f"\nthat stop is evidence at {was[:12]}, {hours:.0f} h old, and the PR could not be read just now"
+        if stale:
+            msg += (f"\nunmoved {hours:.0f} h at {was[:12]}: take the step above and re-queue at the new head, or close "
+                    f"the PR naming what superseded it, or hand it to a live owner; this wakes you once for this head")
         if st.get("detail"):
             msg += "\n" + str(st["detail"])[:LAND_HUNK_CHARS + 20]
         self.history(e, "reminded", code=code, n=n + 1, hours=round(hours, 1),
-                     **({"moved": head[:12]} if moved else {}))
+                     **({"moved": head[:12]} if moved else {}), **({"stale": True} if stale else {}))
         log({"event": "land-owner-reminded", "key": e["key"], "code": code, "to": to, "n": n + 1,
-             "hours": round(hours, 1), "moved": moved})
+             "hours": round(hours, 1), "moved": moved, "stale": stale})
         self.save(e)
-        self.notify(e, to, msg, cls=LAND_FORWARD_FYI_CLASS)  # told at the stop; a repeat is an inbox fyi
+        if stale:
+            with contextlib.suppress(Exception):
+                self.notice("land-stopped-stale", "warn", f"{msg} (requester {to})", {"pr": self.url(e), "to": to})
+        # told at the stop; a repeat is an inbox fyi, except the one LAND_OWNER_REMIND_STALE wake
+        self.notify(e, to, msg, cls=LAND_NOTICE_CLASS if stale else LAND_FORWARD_FYI_CLASS)
         return True
 
     def remind_ended(self, e: dict) -> bool:
