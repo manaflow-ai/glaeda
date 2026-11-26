@@ -476,6 +476,10 @@ def validate_ios_simulator(path: Path, where: str, ios: Any) -> None:
 
 
 # What one iOS simulator runtime download needs on the Data volume, above the host's disk floor. Measured
+# An Xcode copied over the LAN lands at its apparent size: tar does not keep the HFS compression an App Store
+# install has. Measured on a fleet mini 2026-11-26: Xcode_27.0.app (27A266a) 9.6 GiB apparent (3.5 GiB
+# allocated, compressed), Xcode_26.6.app 8.3 GiB apparent; one GiB of headroom over the larger.
+XCODE_COPY_GIB = 11
 # 2026-10-29: the arm64 iOS 26.5 (23F77) image Xcode 26.6 installs is 7.9 GiB (simctl runtime list -v); the
 # download is staged beside it before the install, so twice that plus headroom.
 IOS_RUNTIME_DOWNLOAD_GIB = 20
@@ -688,6 +692,21 @@ def toolchain(manifest: dict[str, Any], name: str) -> dict[str, Any]:
     if not entry or not all(isinstance(entry.get(k), str) for k in ("path", "version", "build")):
         return {}
     return {"xcode": {"app": entry["path"], "version": entry["version"], "build": entry["build"]}}
+
+
+def extra_xcode_apps(manifest: dict[str, Any], name: str, pin: str | None) -> list[dict[str, str]]:
+    """The Xcode apps the manifest declares for one host (xcode.apps) other than the pin, each with a safe path,
+    version and build: the ones preflight provisions beside the pinned Xcode."""
+    legacy = host_policy(manifest, name).get("xcode") or {}
+    apps = legacy.get("apps") if isinstance(legacy, dict) else None
+    out = []
+    for app in apps if isinstance(apps, list) else []:
+        if not isinstance(app, dict) or app.get("path") == pin or app.get("clone_from"):
+            continue
+        if all(isinstance(app.get(k), str) and app[k] for k in ("path", "version", "build")) \
+                and SAFE_PATH_RE.fullmatch(app["path"]) and app["path"].endswith(".app"):
+            out.append({"path": app["path"], "version": app["version"], "build": app["build"]})
+    return out
 
 
 def git_source(manifest: dict[str, Any], name: str) -> str:
@@ -1266,7 +1285,8 @@ def check_host(manifest: dict[str, Any], name: str, obs: dict[str, Any]) -> list
                       {"kind": "clone_xcode", "path": want["path"], "source": want["clone_from"],
                        "version": want["version"], "build": want["build"]})
             else:
-                drift("xcode", f"{want['path']} missing", "install it")
+                drift("xcode", f"{want['path']} missing",
+                      "LAN copy from a host that has it: glaeda-mini-fleet fix --from <host> HOST --yes")
         elif got["kind"] != "dir":
             drift("xcode", f"{want['path']} is a {got['kind']}, want a real directory (symlinked paths break cache replay)")
         elif (got["version"], got["build"]) != (want["version"], want["build"]):
@@ -2557,6 +2577,47 @@ def preflight_host(manifest: dict[str, Any], name: str, obs: dict[str, Any],
                 f"sudo env DEVELOPER_DIR={developer} xcodebuild -runFirstLaunch", "password", first_launch)
         else:
             put("launch", "ok")
+    # Every other Xcode the manifest declares beside the pin (xcode.apps): glaeda_fleet_labels gives a runner
+    # xcode-<v> and its pool labels for each declared Xcode the host really has, so a workflow that asks for
+    # xcode-27.0 waits forever when no host carries it (cmux run 45717448413 on 2026-11-25). Leo, 2026-11-26: "and
+    # also just have more xcode versions installed". Each declared app is provisioned like the pin: the same LAN
+    # copy from a host that has it (fix --from HOST), then sudo-plan accepts its licence and runs its first launch.
+    # todo, not fail, like a missing simulator runtime: a host without the extra Xcode is still a build host for the
+    # pin, it just carries no xcode-<v> label until fix copies it, and a host short of disk waits for a person.
+    disk_floor = policy.get("disk", {}).get("min_free_gib") or bootstrap.default_min_free_gib("macos")
+    disk_data = obs.get("disk", {}).get("/System/Volumes/Data") or obs.get("disk", {}).get("/")
+    for extra in extra_xcode_apps(manifest, name, pin):
+        path, version, build = extra["path"], extra["version"], extra["build"]
+        check, have = f"xcode {version}", apps.get(path)
+        extra_developer = f"{path}/Contents/Developer"
+        extra_ready = obs.get("xcode_ready", {}).get(path) if have else None
+        need = XCODE_COPY_GIB + disk_floor
+        if not have and disk_data and disk_data["free_gib"] < need:
+            put(check, "todo", f"{path} missing; {disk_data['free_gib']} GiB free, the copy needs {need} "
+                f"({XCODE_COPY_GIB} above the {disk_floor} GiB floor)",
+                "free disk first (glaeda-disk on the host shows where it went)", "person")
+        elif not have:
+            put(check, "todo", f"{path} missing",
+                f"LAN copy from a host that has it: glaeda-mini-fleet fix --from <host> {name} --yes", "self",
+                {"kind": "xcode_share", "path": path, "version": version, "build": build})
+        elif have["kind"] != "dir":
+            put(check, "fail", f"{path} is a {have['kind']}; symlinked Xcode paths break cache replay",
+                f"replace the symlink with a real copy of {path}", "person")
+        elif (have["version"], have["build"]) != (version, build):
+            put(check, "fail", f"{path} is {have['version']} ({have['build']}), want {version} ({build})",
+                f"install Xcode {version} ({build}) at {path}", "person")
+        elif extra_ready is None:
+            put(check, "unknown", f"no runnable xcodebuild in {path}")
+        elif extra_ready["licence"] != "accepted":
+            put(check, "todo", f"{path} licence not accepted",
+                f"sudo env DEVELOPER_DIR={extra_developer} xcodebuild -license accept", "password",
+                {"kind": "licence", "developer": extra_developer})
+        elif extra_ready["first_launch"] != "done":
+            put(check, "todo", f"{path} first launch not run",
+                f"sudo env DEVELOPER_DIR={extra_developer} xcodebuild -runFirstLaunch", "password",
+                {"kind": "first_launch", "developer": extra_developer})
+        else:
+            put(check, "ok", f"{version} ({build})")
     metal = pf.get("metal")
     if declared.get("metal") is False:
         put("metal", "info", "not required by the manifest")
@@ -3680,9 +3741,11 @@ def run_repair(manifest: dict[str, Any], name: str, action: dict[str, Any], log:
     kind = action["kind"]
     if seed and kind in SEEDABLE:
         thing = SEEDABLE[kind]
-        problem = prepare_seed(manifest, seed, thing, log)
+        # An Xcode share copies the app its check names (the pin, or another declared Xcode beside it).
+        args = [action["path"], action["version"], action["build"]] if kind == "xcode_share" else None
+        problem = prepare_seed(manifest, seed, thing, log, args=args)
         if not problem:
-            return share_one(manifest, thing, seed, name, share_args(manifest, name, thing), log, True)
+            return share_one(manifest, thing, seed, name, args or share_args(manifest, name, thing), log, True)
         if kind == "xcode_share":
             return False, f"{seed} cannot seed {thing} ({problem})"
         # Python, the candidate and Metal also have a path without a seed: this Mac, or the internet.
@@ -4238,19 +4301,22 @@ def cmd_share(manifest: dict[str, Any], thing: str, source: str | None, hosts: l
 
 
 SEED_LOCK = threading.Lock()
-SEEDS_READY: dict[tuple[str, str, bool], str | None] = {}
+SEEDS_READY: dict[tuple[str, str, bool, tuple[str, ...]], str | None] = {}
 
 
-def prepare_seed(manifest: dict[str, Any], source: str, thing: str, log: Any, yes: bool = True) -> str | None:
+def prepare_seed(manifest: dict[str, Any], source: str, thing: str, log: Any, yes: bool = True,
+                 args: list[str] | None = None) -> str | None:
     """Ready THING on the source once per run (a Metal export downloads there); None when it can seed.
 
+    args: THING's share arguments when they are not the manifest's (an Xcode beside the pin).
     A dry run only checks: for metal, that the source has a working Metal toolchain to export."""
+    args = args if args is not None else share_args(manifest, source, thing)
     with SEED_LOCK:
-        key = (source, thing, yes)
+        key = (source, thing, yes, tuple(args))
         if key not in SEEDS_READY:
             func = "share_prepare" if yes else ("share_have" if thing == "metal" else "share_source")
             code = routed_ssh_stream(source, host_ssh_user(manifest, source),
-                                     library_command(func, [thing, *share_args(manifest, source, thing)]), log,
+                                     library_command(func, [thing, *args]), log,
                                      timeout=SHARE_TIMEOUT, options=host_ssh_options(manifest, source))
             if code:
                 return f"{func} {thing} exit {code}"  # not cached: a later round may succeed

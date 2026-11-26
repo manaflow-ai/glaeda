@@ -614,5 +614,28 @@ class StaleCommandTest(unittest.TestCase):
                          {"0xaaaa": {80}, "0xbbbb": {90}})
 
 
+class BootHold(unittest.TestCase):
+    """cosmic-gray, 2026-11-24: after a panic every RunAtLoad job started in the same second (load 214). The
+    LaunchAgent's BOOT_SPREAD_S holds the first --apply pass after boot or wake a fixed 0..S s."""
+
+    def test_the_wait_is_fixed_per_label_and_boot(self):
+        up = 1_800_000_000.0
+        env = {"BOOT_SPREAD_S": "120", "XPC_SERVICE_NAME": "com.teamleaderleo.glaeda.local-guard"}
+        first = lg.boot_hold(env, now=up, up=up)
+        self.assertGreaterEqual(first, 0)
+        self.assertLessEqual(first, 120)
+        self.assertEqual(lg.boot_hold(env, now=up + 121, up=up), 0.0)
+        self.assertEqual(lg.boot_hold({}, now=up, up=up), 0.0, "no BOOT_SPREAD_S (a manual run): no wait")
+        self.assertEqual(lg.boot_hold({"BOOT_SPREAD_S": "60"}, now=up, up=None), 0.0)
+
+    def test_a_held_apply_takes_no_process_snapshot(self):
+        from unittest import mock
+        with mock.patch.object(lg, "boot_hold", return_value=12.0), \
+                mock.patch.object(lg.gp, "snapshot", side_effect=AssertionError("observed")), \
+                mock.patch.object(lg, "allowed_until", return_value=None), \
+                mock.patch.object(lg, "laptop", return_value=False):
+            self.assertEqual(lg.main(["--apply"]), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

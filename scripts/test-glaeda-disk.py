@@ -9592,6 +9592,33 @@ class VolumeCensusTest(unittest.TestCase):
         self.assertEqual(got["accounting_gap"], 0)
         self.assertEqual(got["residual"]["category"], gd.OPEN_DELETED)  # a Linux volume: no purgeable space
 
+    def test_a_linux_gap_is_measured_not_named_open_deleted(self) -> None:
+        # a lane VM said 55.9G open-deleted while /proc held 2 KB: the bytes sat under overlay mounts
+        info = self.root / "mountinfo"
+        info.write_text(
+            "20 1 259:1 / / rw - ext4 /dev/root rw\n"
+            "31 20 0:40 / /home/u/.wt/checkouts/a rw - overlay overlay rw\n"
+            "32 20 0:41 / /home/u/.wt/checkouts/b rw - overlay overlay rw\n"
+            "33 20 0:42 / /home/u/mnt rw - fuse.cmux-projection p rw\n"
+            "34 31 0:43 / /home/u/.wt/checkouts/a/x rw - tmpfs t rw\n")
+        fs = gd.Fs(1, "/", 0, 100 * gd.GIB, 0, 0)
+        real = gd.mounts_over
+        with mock.patch.object(gd, "open_deleted_held", return_value=({"7": 2 * gd.GIB, "9": 2048}, 0)), \
+                mock.patch.object(gd, "mounts_over", lambda m: real(m, str(info))):
+            label = gd.linux_gap_residual(fs, 50 * gd.GIB)
+        self.assertTrue(label.startswith("open-deleted 2.0G measured in /proc (top holders: pid 7 2.0G)"), label)
+        self.assertIn("48.0G under mount points or unmeasured (3 mounts on this fs: 2 overlay, 1 fuse.cmux-projection)",
+                      label)
+        self.assertNotIn("pid 9", label)  # a few KB is no holder worth naming
+        self.assertEqual(gd.linux_gap_residual(fs, 0), gd.OPEN_DELETED)
+
+    def test_open_deleted_counts_a_held_file_once(self) -> None:
+        held = self.write("held", 4096 * 8)
+        with open(held, "rb") as one, open(held, "rb") as two:
+            held.unlink()
+            got, _ = gd.open_deleted_local(self.root.stat().st_dev)
+        self.assertEqual(got.get(str(os.getpid())), 4096 * 8)
+
     def test_a_complete_walk_leaves_no_gap(self) -> None:
         sized = self.write("sized/a").parent
         self.write("sized/b", 16384)

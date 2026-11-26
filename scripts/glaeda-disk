@@ -1381,6 +1381,12 @@ CMUX_NEXT_DRAIN_HOOK_SHA256 = frozenset({
     "e8b2987ea107362e8a33992f81f8f42819b50ac8cb691fbd0e49f9437877fa77",
     "41ee6fae299b956a84f680209f2e1856dcd7b68820f456a26f702b5d797ab443",
     "90f8b203cffeeb07ac7fcd34f7a71f3041b97dd16ca7cb9397ed77fd6f857188",
+    "0ca58b7e1b774f308f303a7f17e5540df906e7ed32f0414a21e5836ee568ab0f",
+    "7e33ef00ca1f811fb1414eb6bc55ea9ab1186bc643568b19dc06cdcd55759478",
+    "4e82031cbbd048f8de1de7dd6168a5075f6533b166cedaaf508bb2d2bd12f3b3",
+    "5cb62fe6c6a63a88a2ffcefa0875073925f55a989e484bbcb094700851b14d95",
+    "69875b280c4b02c56ae0f71dfd5fd91b5ffc2cbf3fc9f01a1b7e92d0d57d5180",
+    "16b54de696ace2e9396c3ac8ddb093559a73763942a5c26460667a04d977f212",
 })
 CMUX_NEXT_CI_PRESERVED_NAMES = frozenset({
     "SourcePackages", "ModuleCache.noindex", "SDKStatCaches.noindex",
@@ -13528,6 +13534,95 @@ DATA_VOLUME = Path("/System/Volumes/Data")
 APFS_INVISIBLE = "apfs-invisible (open-deleted/purgeable)"
 OPEN_DELETED = "open-deleted (files a process still holds; lsof +L1 names them)"  # Linux has no purgeable space
 
+# A Linux gap used to be named open-deleted whole, unmeasured; on a lane VM it said 55.9G while the deleted
+# files processes held came to 2 KB and the bytes sat under overlay and FUSE mount points, where du -x never
+# looks. So a gap is split: what /proc says is held open (measured), the rest named as shadowed by mounts.
+_OPEN_DELETED_SRC = r"""
+import os
+def open_deleted(dev, proc="/proc"):
+    seen, held, denied = set(), {}, 0
+    for pid in os.listdir(proc):
+        if not pid.isdigit():
+            continue
+        try:
+            fds = os.listdir(proc + "/" + pid + "/fd")
+        except FileNotFoundError:
+            continue
+        except OSError:
+            denied += 1
+            continue
+        for fd in fds:
+            link = proc + "/" + pid + "/fd/" + fd
+            try:
+                if not os.readlink(link).endswith(" (deleted)"):
+                    continue
+                st = os.stat(link)
+            except OSError:
+                continue
+            if st.st_dev != dev or (st.st_mode & 0o170000) != 0o100000 or (st.st_dev, st.st_ino) in seen:
+                continue
+            seen.add((st.st_dev, st.st_ino))
+            held[pid] = held.get(pid, 0) + st.st_blocks * 512
+    return held, denied
+"""
+_open_deleted_ns: dict[str, Any] = {}
+exec(_OPEN_DELETED_SRC, _open_deleted_ns)
+open_deleted_local = _open_deleted_ns["open_deleted"]
+
+
+def open_deleted_held(dev: int, timeout: float = STALE_TMP_PROC_TIMEOUT_S) -> tuple[dict[str, int], int]:
+    """Bytes of deleted regular files on dev that processes still hold, by pid, and how many pids stayed
+    unreadable; read as root (`sudo -n`, bounded) when some pids are not ours to read."""
+    held, denied = open_deleted_local(dev)
+    if denied and sudo_reads():
+        code = _OPEN_DELETED_SRC + f"\nimport json, sys\nsys.stdout.write(json.dumps(open_deleted({int(dev)})))\n"
+        try:
+            out = subprocess.run(["sudo", "-n", "timeout", "-k", "5", str(int(timeout)),
+                                  sys.executable or "/usr/bin/python3", "-I", "-c", code],
+                                 capture_output=True, text=True, timeout=timeout + 15)
+            got = json.loads(out.stdout) if out.returncode == 0 else None
+            if isinstance(got, list) and isinstance(got[0], dict) and isinstance(got[1], int):
+                held, denied = {str(k): int(v) for k, v in got[0].items()}, got[1]
+        except (OSError, subprocess.SubprocessError, ValueError, TypeError, IndexError):
+            pass
+    return held, denied
+
+
+def mounts_over(mount: str, mountinfo: str = "/proc/self/mountinfo") -> collections.Counter:
+    """Mount points sitting on the filesystem mounted at mount, by type: du -x stops at each and never
+    sees the bytes left on this filesystem underneath it."""
+    rows = []
+    try:
+        for line in Path(mountinfo).read_text().splitlines():
+            head, _, tail = line.partition(" - ")
+            f = head.split()
+            if len(f) >= 5 and tail:
+                rows.append((f[0], f[1], f[4].replace("\\040", " "), tail.split()[0]))
+    except OSError:
+        return collections.Counter()
+    ids = {mid for mid, _, point, _ in rows if point == mount}
+    return collections.Counter(kind for _, parent, point, kind in rows if parent in ids and point != mount)
+
+
+def linux_gap_residual(fs: "Fs", gap: int, shown: int = 3) -> str:
+    """Name a Linux volume's gap by measuring it: open-deleted bytes from /proc with their top holders,
+    and the rest as bytes under this filesystem's mount points or unmeasured."""
+    if gap <= 0:
+        return OPEN_DELETED
+    held, denied = open_deleted_held(fs.dev)
+    total = sum(held.values())
+    top = [kv for kv in sorted(held.items(), key=lambda kv: -kv[1])[:shown] if kv[1] >= 64 * 2**20]
+    parts = [f"open-deleted {gib(total).strip()} measured in /proc"
+             + (f" (top holders: {', '.join(f'pid {p} {gib(b).strip()}' for p, b in top)})" if top else "")
+             + (f", {denied} pids unreadable" if denied else "")]
+    rest = max(0, gap - total)
+    if rest:
+        over = mounts_over(fs.mount)
+        kinds = ", ".join(f"{n} {k}" for k, n in over.most_common(4))
+        parts.append(f"{gib(rest).strip()} under mount points or unmeasured"
+                     + (f" ({sum(over.values())} mounts on this fs: {kinds})" if over else ""))
+    return "; ".join(parts)
+
 
 _CENSUS_FIRMLINK_MEM: dict[str, bool] = {}
 _PRIVATE_LINKS = ("var", "tmp", "etc")
@@ -14512,7 +14607,7 @@ def filesystem_accounting(fss: list[Fs], items: list[Item],
             unreadable = sum(1 for row in census["rows"].values() if row[1] in ("unreadable", "skipped"))
             sudo_measured = len(census.get("sudo_measured") or [])
             # an APFS volume (macOS, or its sibling volumes read) hides purgeable space; a Linux one only open-deleted files
-            residual = (APFS_INVISIBLE if DARWIN or volumes else OPEN_DELETED) + (
+            residual = (APFS_INVISIBLE if DARWIN or volumes else linux_gap_residual(fs, gap)) + (
                 f" and {unreadable} unreadable or skipped dirs (lower bounds)" if unreadable else "") \
                 + (f"; {sudo_measured} measured with sudo" if sudo_measured else "") \
                 + census_unreadable_named(census)
@@ -14923,7 +15018,9 @@ def _take_over_stale_evict_owner() -> bool:
 
 
 def _write_evict_owner() -> None:
-    EVICT_OWNER.parent.mkdir(parents=True, exist_ok=True)
+    """The evict lock holder's record. On a full disk (ENOSPC, EDQUOT) it is skipped, not raised: the flock already
+    makes this run the one evictor, the record only names it, and an OSError here used to end the pass before it
+    freed a byte (take_evict_lock catches only BlockingIOError)."""
     try:
         owner = pwd.getpwuid(os.getuid()).pw_name
     except (KeyError, OSError):
@@ -14931,8 +15028,17 @@ def _write_evict_owner() -> None:
     payload = {"schema": "glaeda-disk/evict-owner/v1", "pid": os.getpid(),
                "started_at": time.time(), "owner": owner, "command": " ".join(sys.argv)}
     tmp = EVICT_OWNER.with_suffix(f".{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(payload, separators=(",", ":")))
-    os.replace(tmp, EVICT_OWNER)
+    try:
+        EVICT_OWNER.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(payload, separators=(",", ":")))
+        os.replace(tmp, EVICT_OWNER)
+    except OSError as e:
+        if e.errno not in (errno.ENOSPC, errno.EDQUOT):
+            raise
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        with contextlib.suppress(OSError):
+            print(f"glaeda-disk: evict owner record not written ({e}); the pass goes on", file=sys.stderr)
 
 
 def caller_floor_wait_s(now: float | None = None) -> float | None:
@@ -18402,7 +18508,39 @@ FULL_DISK_REFILL_OVER = 10 * 1024**3
 
 
 def full_disk_reserve_path() -> Path:
+    """The one reserve on a host: leo-workspace tools/full_disk.py (wt reclaim, disk_hygiene, worktree_reclaim)
+    releases and refills this same file, so a host never holds two."""
     return HOME / ".cache/glaeda-disk/full-disk-reserve"
+
+
+FULL_DISK_SCRATCH_UNDER = 64 * 1024**2  # still this tight after the reserve: scratch goes to memory
+
+
+def full_disk_scratch() -> str:
+    """Under FULL_DISK_SCRATCH_UNDER free on HOME's volume (no reserve, or not enough), point TMPDIR (this run's
+    tempfile and its children's mktemp) at a private dir in memory: /run/user/UID/full-disk/tmp-glaeda-disk, else
+    /dev/shm/full-disk-UID/tmp-glaeda-disk, 0700 and this user's only. The dir, or "" when it did nothing (fs-agent-
+    lane-22, 2026-11-25: 0 bytes free, and the cleaners' first mktemp failed with ENOSPC)."""
+    left = _home_free()
+    if left is None or left >= FULL_DISK_SCRATCH_UNDER:
+        return ""
+    uid = os.getuid()
+    for root in (Path(f"/run/user/{uid}/full-disk"), Path(f"/dev/shm/full-disk-{uid}")):
+        if not root.parent.is_dir():
+            continue
+        target = root / "tmp-glaeda-disk"
+        try:
+            root.mkdir(mode=0o700, exist_ok=True)
+            target.mkdir(mode=0o700, exist_ok=True)
+            ok = all(not stat.S_ISLNK(os.lstat(d).st_mode) and os.lstat(d).st_uid == uid
+                     and not os.lstat(d).st_mode & 0o022 for d in (root, target))
+        except OSError:
+            continue
+        if ok:
+            os.environ["TMPDIR"] = str(target)
+            tempfile.tempdir = None
+            return str(target)
+    return ""
 
 
 def release_full_disk_reserve(path: Path | None = None, free: Callable[[], int | None] | None = None) -> int:
@@ -18834,6 +18972,9 @@ def _logged_main(args: list[str]) -> int:
     RUN["caller"] = run_caller()
     if released := release_full_disk_reserve():
         RUN["full_disk_reserve_released"] = released
+    with contextlib.suppress(Exception):  # never the reason a pass does not run
+        if scratch := full_disk_scratch():
+            RUN["full_disk_scratch"] = scratch
     started, before = time.time(), _home_free()
     try:
         status = _main_impl(args)

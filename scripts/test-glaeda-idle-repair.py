@@ -367,5 +367,45 @@ class LoadDiskModuleTest(unittest.TestCase):
                          + "\n".join(missing))
 
 
+class BootHoldTest(unittest.TestCase):
+    """cosmic-gray, 2026-11-24: after a panic every RunAtLoad job started in the same second (load 214). With
+    BOOT_SPREAD_S the first pass after boot or wake waits a fixed 0..S s, seeded by the launchd label and boot."""
+
+    def test_the_wait_is_fixed_per_label_and_boot_and_spreads_labels(self) -> None:
+        up = 1_800_000_000.0
+        env = {"BOOT_SPREAD_S": "300", "XPC_SERVICE_NAME": "com.teamleaderleo.glaeda.idle-repair"}
+        first = idle.boot_hold(env, now=up + 1, up=up)
+        self.assertGreater(first, 0)
+        self.assertLessEqual(first, 300)
+        self.assertAlmostEqual(idle.boot_hold(env, now=up + 11, up=up), max(0.0, first - 10), places=6)
+        self.assertEqual(idle.boot_hold(env, now=up + 301, up=up), 0.0, "past the spread it runs")
+        waits = {round(idle.boot_hold({**env, "XPC_SERVICE_NAME": f"l{i}"}, now=up, up=up)) for i in range(20)}
+        self.assertGreater(len(waits), 10, "labels land apart, not together")
+
+    def test_no_spread_an_unknown_boot_or_a_bad_value_waits_nothing(self) -> None:
+        up = 1_800_000_000.0
+        self.assertEqual(idle.boot_hold({}, now=up + 1, up=up), 0.0)
+        self.assertEqual(idle.boot_hold({"BOOT_SPREAD_S": "x"}, now=up + 1, up=up), 0.0)
+        self.assertEqual(idle.boot_hold({"BOOT_SPREAD_S": "300"}, now=up + 1, up=None), 0.0)
+        self.assertEqual(idle.boot_hold({"BOOT_SPREAD_S": "300"}, now=up - 5, up=up), 0.0)
+
+    def test_boot_and_wake_are_read_from_one_sysctl(self) -> None:
+        out = "{ sec = 1000, usec = 999999 } Tue\n{ sec = 5000, usec = 1 } Tue\n"
+        run = mock.Mock(return_value=mock.Mock(stdout=out))
+        with mock.patch.object(idle.sys, "platform", "darwin"):
+            self.assertEqual(idle.came_up_at(now=6000, run=run), 5000.0)
+            run.return_value = mock.Mock(stdout="{ sec = 1000, usec = 5 }\n{ sec = 0, usec = 0 }\n")
+            self.assertEqual(idle.came_up_at(now=6000, run=run), 1000.0, "a Mac that never slept: its boot")
+        self.assertEqual(run.call_count, 2)
+
+    def test_a_held_tick_exits_before_the_lock_or_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(idle, "STATE_DIR", Path(tmp) / "state"), \
+                mock.patch.object(idle, "boot_hold", return_value=42.0), \
+                mock.patch.object(idle, "load_disk_module", side_effect=AssertionError("loaded")):
+            self.assertEqual(idle.main(["--apply", "--scheduled-log"]), 0)
+            self.assertFalse((Path(tmp) / "state").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

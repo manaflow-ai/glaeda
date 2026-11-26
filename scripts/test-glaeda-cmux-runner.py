@@ -4652,6 +4652,12 @@ class HookTest(unittest.TestCase):
                          ("simulator-step", False))
         self.assertEqual(hook.job_class("walk", "manaflow-ai/cmux", workflow="ios-review-gate.yml"),
                          ("simulator-step", False))
+        # cmux's step table (pr-pipeline.yml) runs under its caller pr-router.yml: its Mac jobs never wait for
+        # persistent-dd or a canonical root (cmux18, 2026-11-25: six runners busy 58 min on that wait).
+        for job, klass in (("mac", "isolated"), ("mac-fallback", "isolated"), ("ios", "simulator-step")):
+            with self.subTest(pr_router=job):
+                self.assertEqual(hook.job_class(job, "manaflow-ai/cmux", workflow="pr-router.yml"), (klass, False))
+                self.assertNotIn("persistent-dd", hook.CLASS_COST[klass][1])
         for job, env in (("ios-simulator-build", test_ios), ("mobile-core-package", test_ios),
                          ("release-compile", self.FAST_TIER), ("ios", self.FAST_TIER)):
             with self.subTest(job=job):
@@ -4852,6 +4858,8 @@ class HookTest(unittest.TestCase):
                               ("native-sidebar-gallery.yml", "capture"), ("cmux-next-tab-switch.yml", "frames"),
                               ("fleet-rd-host-macos.yml", "check"), ("cmux-next-ios-try-ahead.yml", "build-ahead"),
                               ("cmux-next-ios-gestures.yml", "gestures"), ("cmux-next-ios-keyboard-motion.yml", "bench"),
+                              ("cmux-next-iphone-clips.yml", "record"), ("cmux-next-ios-energy-nightly.yml", "bench"),
+                              ("cmux-next-stress-bench.yml", "measure"), ("chief-evals.yml", "fleet-ab"),
                               # GATEWAY_FLEET_SUFFIX: a -fleet job id from any home-repository workflow
                               ("cmux-next-ios-kit.yml", "link-ffi-fleet"), ("other.yml", "new-client-fleet")):
             with self.subTest(workflow=workflow, job=job):
@@ -13813,6 +13821,129 @@ class GateTest(unittest.TestCase):
         self.assertFalse(self.stat(listener.pid).startswith("T"), "thawed")
         self.assertEqual(gate.frozen, ())
 
+    def test_the_listener_is_frozen_before_the_gate_looks_at_the_exited_worker(self) -> None:
+        """cmuxs-mac-mini-6, 2026-11-25 20:03:21Z: runner glaeda-7's Worker exited, its listener went Online and
+        acknowledged the next PR job at 20:03:22 while the runner carried cmux-ci's RUNNER_DRAIN marker. nap() ran
+        /bin/ps on the unreaped Worker (load 108 on 14 cores) before it froze the listener. The freeze comes first."""
+        import threading
+        gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+        gate.child = mock.Mock(pid=1)
+        worker, listener = self.sleeper(), self.sleeper()
+        gate.watching, gate.freeze_at_exit = (worker.pid,), True
+        gate.listener_pids = (listener.pid,)
+        seen: list[str] = []
+
+        def zombie(pid: int) -> bool:
+            seen.append(self.stat(listener.pid))
+            return True
+
+        killer = threading.Timer(0.3, worker.kill)  # not reaped: a zombie, as under the listener before it reaps
+        killer.start()
+        self.addCleanup(killer.cancel)
+        with mock.patch.object(hook, "GATE_POLL_S", 30.0), mock.patch.object(gate, "_zombie", side_effect=zombie):
+            gate.nap()
+        self.assertTrue(seen, "the gate looked at the exited Worker")
+        self.assertTrue(all(stat.startswith("T") for stat in seen), f"listener not frozen before the look: {seen}")
+        self.assertEqual((gate.done, gate.frozen), ((worker.pid,), (listener.pid,)))
+        gate.thaw()
+
+    def drained_listener_with_worker(self) -> tuple[subprocess.Popen, int, Path]:
+        """A process whose command is this runner's Runner.Listener, with one child (its Worker); the runner carries
+        a live RUNNER_DRAIN marker. Returns the listener, the Worker's pid and the runner's glaeda-hooks/."""
+        hooks = self.runner / "glaeda-hooks"
+        hooks.mkdir(exist_ok=True)
+        (self.runner / hook.RUNNER_DRAIN_FILE).write_text(json.dumps({"until": time.time() + 600, "reason": "a hold"}))
+        listener = subprocess.Popen(
+            [sys.executable, "-c", "import subprocess, sys, time\n"
+             "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+             "print(c.pid, flush=True)\ntime.sleep(60)\n", os.fspath(self.runner / "bin/Runner.Listener")],
+            stdout=subprocess.PIPE)
+        self.addCleanup(listener.wait)
+        self.addCleanup(listener.kill)
+        self.addCleanup(lambda: os.kill(listener.pid, signal.SIGCONT) if listener.poll() is None else None)
+        worker = int(listener.stdout.readline())
+
+        def end_worker() -> None:
+            with contextlib.suppress(OSError):
+                os.kill(worker, signal.SIGKILL)
+        self.addCleanup(end_worker)
+        return listener, worker, hooks
+
+    def test_job_completed_freezes_a_draining_runners_listener_before_its_worker_exits(self) -> None:
+        """A lent mini, 2026-11-25 19:59-20:03Z: under cmux-ci's RUNNER_DRAIN marker, runners took new PR jobs
+        1-3 s after the last ended, before the gate's freeze at the Worker's exit (glaeda#2809 narrowed that race,
+        it did not close it). job-completed runs while the Worker still runs, so it freezes the listener first; with
+        no gate to take it over, the backstop thaws it soon after the Worker's exit."""
+        listener, worker, hooks = self.drained_listener_with_worker()
+        with mock.patch.object(hook, "JOB_END_THAW_ADOPT_S", 1.0), mock.patch.object(hook, "JOB_END_THAW_WAIT_S", 30.0):
+            note = hook.freeze_listener_at_job_end(hooks, worker)
+        self.assertIn(f"froze the listener (pid {listener.pid})", note or "")
+        self.assertTrue(self.stat(listener.pid).startswith("T"), "the listener is frozen while its Worker runs")
+        doc = hook.job_end_frozen_doc(hooks / hook.JOB_END_FROZEN)
+        self.assertEqual((doc["listener"], doc["worker"]), (listener.pid, worker))
+        time.sleep(1.5)
+        self.assertTrue(self.stat(listener.pid).startswith("T"), "still frozen: its Worker has not exited")
+        os.kill(worker, signal.SIGKILL)  # a zombie: the frozen listener cannot reap it
+        deadline = time.monotonic() + 15
+        while self.stat(listener.pid).startswith("T") and time.monotonic() < deadline:
+            time.sleep(0.2)
+        self.assertFalse(self.stat(listener.pid).startswith("T"), "the backstop thawed a listener no gate took")
+        self.assertFalse((hooks / hook.JOB_END_FROZEN).exists())
+
+    def test_job_completed_freezes_nothing_without_a_drain(self) -> None:
+        listener, worker, hooks = self.drained_listener_with_worker()
+        (self.runner / hook.RUNNER_DRAIN_FILE).unlink()
+        self.assertIsNone(hook.freeze_listener_at_job_end(hooks, worker))
+        self.assertFalse(self.stat(listener.pid).startswith("T"))
+        self.assertFalse((hooks / hook.JOB_END_FROZEN).exists())
+
+    def test_job_completed_freezes_only_this_runners_listener(self) -> None:
+        """The Worker's parent must be this runner's own Runner.Listener: another parent is never signalled."""
+        _, _, hooks = self.drained_listener_with_worker()
+        other = self.sleeper()
+        self.assertIsNone(hook.freeze_listener_at_job_end(hooks, other.pid))  # its parent is this test process
+        self.assertFalse((hooks / hook.JOB_END_FROZEN).exists())
+
+    def test_the_gate_takes_over_the_listener_job_completed_froze_and_stops_it_under_the_drain(self) -> None:
+        """The gate takes the hook's frozen listener over only once the Worker has exited, in the state its own
+        JOB_END_FREEZE leaves (frozen, the Worker done, armed), so the poll after it stops the listener under the
+        drain and step() thaws it whatever it decided."""
+        listener, worker, hooks = self.drained_listener_with_worker()
+        gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+        gate.child = mock.Mock(pid=1)
+        with mock.patch.object(hook, "JOB_END_THAW_ADOPT_S", 60.0):
+            hook.freeze_listener_at_job_end(hooks, worker)
+        marker = hooks / hook.JOB_END_FROZEN
+        with mock.patch.object(gate, "listener_list", return_value=(listener.pid,)):
+            gate.adopt_job_end_freeze()  # the Worker still runs: nothing taken over, the listener stays frozen
+            self.assertEqual(gate.frozen, ())
+            self.assertTrue(marker.exists())
+            self.assertTrue(self.stat(listener.pid).startswith("T"))
+            os.kill(worker, signal.SIGKILL)
+            deadline = time.monotonic() + 5
+            while not self.stat(worker).startswith("Z") and time.monotonic() < deadline:
+                time.sleep(0.05)
+            gate.adopt_job_end_freeze()
+        self.assertEqual(gate.frozen, (listener.pid,))
+        self.assertIn(worker, gate.done)
+        self.assertTrue(gate.freeze_at_exit)
+        self.assertFalse(marker.exists(), "taken over: the backstop leaves it to the gate")
+        self.assertTrue(self.stat(listener.pid).startswith("T"))
+        gate.thaw()
+        self.assertFalse(self.stat(listener.pid).startswith("T"))
+
+    def test_the_gate_leaves_a_frozen_listener_of_another_tree_to_its_backstop(self) -> None:
+        listener, worker, hooks = self.drained_listener_with_worker()
+        gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+        gate.child = mock.Mock(pid=1)
+        with mock.patch.object(hook, "JOB_END_THAW_ADOPT_S", 60.0):
+            hook.freeze_listener_at_job_end(hooks, worker)
+        os.kill(worker, signal.SIGKILL)
+        with mock.patch.object(gate, "listener_list", return_value=()):
+            gate.adopt_job_end_freeze()
+        self.assertEqual(gate.frozen, ())
+        self.assertTrue((hooks / hook.JOB_END_FROZEN).exists())
+
     def test_an_unreaped_worker_under_the_frozen_listener_is_not_waited_on_again(self) -> None:
         """Frozen, the listener cannot reap its exited Worker, so the zombie stays in ps. The next poll must not take
         it for a running job and re-arm the freeze on it, or nap() would wake and freeze again at once."""
@@ -14945,6 +15076,43 @@ class GateTest(unittest.TestCase):
         self.assertTrue(hook.runner_scope(self.runner).trusted_signing)
         self.assertIsNone(self.full_gate(capacity).full(), "the signing listener listens on a full mini")
         self.assertIsNone(self.full_gate(capacity).full(fresh=True))
+
+    def test_a_signing_listener_stands_down_while_a_signing_job_holds_or_drains_its_mac(self) -> None:
+        """SIGNER_SIBLING_YIELD, replaying cmux nightly-next 2026-11-25: keep-published-dsyms was handed this Mac's
+        other signing listener while nightly-next-one held the Mac and waited 37.8 min in "Set up runner" with the
+        other signer idle. While a signing job holds the Mac or waits for its drain, the signing listener takes no
+        job, so GitHub hands it to the other signer; an ordinary runner, and an unreadable ledger, change nothing."""
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(parents=True, exist_ok=True)
+        base = "#!/bin/bash\nexec /usr/bin/python3 /hook job-started --allowed-repo manaflow-ai/cmux --capacity-units 30"
+        capacity = self.units(0)
+        script.write_text(base + " --instance 1 --trusted-next-signing\n")
+        self.assertTrue(hook.runner_scope(self.runner).trusted_signing)
+        with mock.patch.object(hook.Gate, "low_disk", return_value=None), \
+                mock.patch.object(hook, "host_waiters", return_value=set()):
+            self.assertIsNone(self.full_gate(capacity).claimed(), "no signing job: it listens")
+            marker = capacity / f"{hook.ADMIT_WANT}{os.getpid()}"
+            hook.write_want(marker, time.time(), ["units"], hook.TIER_NIGHTLY, klass=hook.EXCLUSIVE_CLASS)
+            gate = self.full_gate(capacity)
+            self.assertIn("waits for this mini to drain", gate.claimed() or "")
+            self.assertIn("the other signing Mac", gate.confirmed() or "")
+            hook.write_want(marker, time.time(), ["units"], hook.TIER_NIGHTLY)  # any other waiter holds nothing
+            self.assertIsNone(self.full_gate(capacity).claimed())
+            marker.unlink()
+            fds = [hook.lock_file(capacity / f"{token}.token", fcntl.LOCK_EX)
+                   for token in hook.CLASS_COST[hook.EXCLUSIVE_CLASS][1]]
+            try:
+                self.assertIn("holds this mini", self.full_gate(capacity).claimed() or "")
+                with mock.patch.object(hook, "exclusive_claim", side_effect=RuntimeError("ledger")):
+                    self.assertIsNone(self.full_gate(capacity).claimed(), "an unreadable ledger holds nothing")
+                script.write_text(base + " --instance 1\n")
+                self.assertNotIn("other signing Mac", self.full_gate(capacity).claimed() or "",
+                                 "an ordinary runner is not held by it")
+            finally:
+                for fd in fds:
+                    os.close(fd)
+            script.write_text(base + " --instance 1 --trusted-next-signing\n")
+            self.assertIsNone(self.full_gate(capacity).claimed(), "listens again once the signing job lets go")
 
     def test_the_signing_listener_stays_up_through_a_short_exclusive_host_lock_hold(self) -> None:
         """SIGNER_FIRST, replaying cmux15's 2026-11-22 06:12-07:18Z gate log: "stopping the idle listener: a fleet
@@ -19575,6 +19743,9 @@ class DedicatedRunnerTest(unittest.TestCase):
         agent = plistlib.loads((self.home / "Library/LaunchAgents" / f"{label}.plist").read_bytes())
         self.assertEqual(agent["EnvironmentVariables"]["PATH"], cr.PROTECTED_PATH)
         self.assertEqual(agent["EnvironmentVariables"]["DEVELOPER_DIR"], cr.PROTECTED_DEVELOPER_DIR)
+        # NO_RUST_GATE: the protected PATH has no Rust, so the hook's toolchain gate is off for the agent and listen.sh
+        self.assertEqual(agent["EnvironmentVariables"]["GLAEDA_RUNNER_TOOLCHAIN_GATE"], "0")
+        self.assertIn("export GLAEDA_RUNNER_TOOLCHAIN_GATE=0\n", listen)
         watch = plistlib.loads((self.home / "Library/LaunchAgents" / f"{label}.watch.plist").read_bytes())
         self.assertEqual(watch["EnvironmentVariables"]["PATH"], f"{self.home}/.local/bin:{cr.PROTECTED_PATH}")
         dot_path = (runner / ".path").read_text().strip().split(":")

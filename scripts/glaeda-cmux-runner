@@ -865,6 +865,7 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
     xcode_apps = (ctx.member or {}).get("xcodeApps") or []
     toolchain_env = "unset SDKROOT TOOLCHAINS\n" + (
         f"export DEVELOPER_DIR={PROTECTED_DEVELOPER_DIR}\nexport PATH={PROTECTED_PATH}\n"
+        f"export {NO_RUST_GATE_ENV}=0\n"
         if user_entry(ctx) else "") + (
         f"export DEVELOPER_DIR={shlex.quote(os.fspath(Path(xcode_apps[0]) / 'Contents/Developer'))}\n"
         if xcode_apps else "")
@@ -1001,7 +1002,7 @@ def agent_plist(ctx: Context) -> dict[str, Any]:
             "PATH": path,
             # PROTECTED_TOOLCHAIN: /usr/bin/python3 and the other xcrun shims resolve to the root-owned Command Line
             # Tools, never an Xcode another admin account can write
-            **({"DEVELOPER_DIR": PROTECTED_DEVELOPER_DIR} if user_entry(ctx) else {}),
+            **({"DEVELOPER_DIR": PROTECTED_DEVELOPER_DIR, NO_RUST_GATE_ENV: "0"} if user_entry(ctx) else {}),
             # POOL_USER: the node's enrollment and class receipt as the member user published them (the hook's
             # NODE_VIEW), since this account cannot read that user's home
             **({NODE_VIEW_ENV: POOL_NODE_VIEW} if pool_user_of(ctx) else {}),
@@ -3663,6 +3664,11 @@ def pool_user_refusal(ctx: Context, manifest: Any, member: str, uninstall: bool,
 PROTECTED_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 PROTECTED_PYTHON = "/usr/bin/python3"
 PROTECTED_DEVELOPER_DIR = "/Library/Developer/CommandLineTools"
+# NO_RUST_GATE: the hook's toolchain gate (GLAEDA_RUNNER_TOOLCHAIN_GATE) holds a dedicated listener off while rustup,
+# rustc or cargo is missing from its PATH. A user entry's PATH is PROTECTED_PATH, which holds none of them by design, so
+# that gate could never pass and the runner never listened (an hq-app-probe entry, 2026-11-25: its jobs queued 4 h+).
+# A user entry's jobs bring their own toolchain if they need one, as they already choose their own Xcode.
+NO_RUST_GATE_ENV = "GLAEDA_RUNNER_TOOLCHAIN_GATE"
 TOOLCHAIN_MISSING = "protected-toolchain"
 
 

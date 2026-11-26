@@ -802,9 +802,9 @@ class UpdateTest(unittest.TestCase):
         real_setup = gu.run_setup
         calls = []
 
-        def setup(gen, args):
+        def setup(gen, args, bin_dir=None):
             calls.append(gen.name)
-            return real_setup(gen, args) if len(calls) == 1 else (False, "timed out")
+            return real_setup(gen, args, bin_dir) if len(calls) == 1 else (False, "timed out")
 
         with mock.patch.object(gu, "health", return_value=(None, "glaeda-disk: timed out")), \
                 mock.patch.object(gu, "run_setup", setup):
@@ -1464,6 +1464,32 @@ class UpdateTest(unittest.TestCase):
             # bytes fast-patch did not name are drift as before
             reclaim.write_text("#!/bin/sh\n# a hand install\nexit 0\n")
             self.assertEqual(self.apply(now + 3)["repair"], "reinstalled glaeda-worktree-reclaim")
+
+    def test_a_repair_for_another_tool_keeps_the_fast_patched_bytes(self) -> None:
+        """A lane VM, 2026-11-25: setup reinstalls every tool, so a repair for another tool's drift (or a release
+        cut before main's commit) put the ring's older glaeda-gh over fast-patch's, and the daemon re-exec'd onto
+        it. The fast-patched bytes stay until a release includes their commit."""
+        self.server.publish(SOURCES[0])
+        now = 1_800_000_000.0
+        self.assertEqual(self.apply(now)["result"], "updated")
+        reclaim = self.bin / "glaeda-worktree-reclaim"
+        patched = b"#!/bin/sh\n# main's newer commit, put live by fast-patch\nexit 0\n"
+        reclaim.write_bytes(patched)
+        os.chmod(reclaim, 0o755)
+        marker = self.root / "fast-patch-live.json"
+        marker.write_text(json.dumps({"commit": "f" * 40, "tools": {"glaeda-worktree-reclaim": gu.sha256(patched)}}))
+        policy = self.bin.parent / "share/glaeda/gh-daemon.json"
+        policy.write_text('{"default": {"restShare": 1}}')
+        with mock.patch.object(gu, "FAST_PATCH_LIVE", marker):
+            result = self.apply(now + 1)
+            self.assertEqual(result["repair"], "reinstalled gh-daemon.json")
+            self.assertEqual(reclaim.read_bytes(), patched, "setup's older bytes did not stay")
+            self.assertTrue(os.access(reclaim, os.X_OK))
+            self.assertEqual(list(self.bin.glob(".*.fast-patch")), [])
+        # with no fast-patch named, setup's bytes win as before
+        policy.write_text('{"default": {"restShare": 1}}')
+        self.assertEqual(self.apply(now + 2)["repair"], "reinstalled glaeda-worktree-reclaim, gh-daemon.json")
+        self.assertNotEqual(reclaim.read_bytes(), patched)
 
     def test_a_missing_or_edited_fleet_gh_policy_is_reinstalled(self) -> None:
         self.server.publish(SOURCES[0])
