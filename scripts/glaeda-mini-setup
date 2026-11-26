@@ -955,7 +955,9 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             "ProcessType": "Background",
             "LowPriorityIO": True,
             "Nice": 10,
-            "EnvironmentVariables": {"GLAEDA_PYTHON": python, "GLAEDA_DISK": disk, "GLAEDA_ROLE": ctx.role},
+            # BOOT_SPREAD_S: its first pass after a boot or wake waits 0-300 s (glaeda-idle-repair boot_hold).
+            "EnvironmentVariables": {"GLAEDA_PYTHON": python, "GLAEDA_DISK": disk, "GLAEDA_ROLE": ctx.role,
+                                     "BOOT_SPREAD_S": "300"},
             # idle-repair opens its log under run.lock. A descriptor launchd opens first would race rotation.
             "StandardOutPath": "/dev/null",
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-idle-repair.err"),
@@ -1114,6 +1116,9 @@ def agent_plists(ctx: Context) -> dict[str, dict[str, Any]]:
             "ProgramArguments": [python, os.fspath(ctx.bin / "glaeda-local-guard"), "--apply"],
             "StartInterval": 30,
             "RunAtLoad": True,
+            # Its first pass after a boot or wake waits 0-120 s (glaeda-local-guard boot_hold): a boot has no orphans
+            # yet, and every RunAtLoad job starting at once is what loaded cosmic-gray to 214 after its 11-24 panic.
+            "EnvironmentVariables": {"BOOT_SPREAD_S": "120"},
             "StandardOutPath": os.fspath(ctx.logs / "glaeda-local-guard.log"),
             "StandardErrorPath": os.fspath(ctx.logs / "glaeda-local-guard.err"),
         },

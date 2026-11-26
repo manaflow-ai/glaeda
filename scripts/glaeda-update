@@ -117,6 +117,7 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -631,14 +632,58 @@ def setup_command(gen: Path, args: list[str]) -> list[str]:
             "--reclaim-binary", str(gen / "bin/glaeda-worktree-reclaim")]
 
 
-def run_setup(gen: Path, args: list[str]) -> tuple[bool, str]:
+def run_setup(gen: Path, args: list[str], bin_dir: Path | None = None) -> tuple[bool, str]:
+    """GEN's setup. With BIN_DIR, a tool fast-patch put live from a main commit GEN does not include (fast_patched)
+    keeps those bytes: setup installs every tool, so a repair for any other tool's drift, or a release cut before
+    that commit, put the older glaeda-gh back and the daemon re-exec'd onto it (a lane VM, 2026-11-25: three
+    flips to the ring's release in 11 min, each undone by fast-patch a second later, every one a restart of the
+    daemon's land work). The newest bytes win; once a release includes the commit, setup's are as new."""
+    kept = fast_patch_kept(gen, bin_dir) if bin_dir is not None else {}
     try:
         result = subprocess.run(setup_command(gen, args), capture_output=True, text=True,
                                 timeout=SETUP_TIMEOUT, stdin=subprocess.DEVNULL,
                                 env={**os.environ, "GLAEDA_UPDATE_RUNNING": "1"})
     except (OSError, subprocess.TimeoutExpired) as e:
+        put_back(kept)
         return False, str(e)
+    put_back(kept)
     return result.returncode == 0, gh_said((result.stdout + result.stderr)[-2000:])
+
+
+def fast_patch_kept(gen: Path, bin_dir: Path) -> dict[Path, bytes]:
+    """{path: bytes} of each tool in BIN_DIR that is fast-patch's install of a commit GEN does not include."""
+    try:
+        doc = json.loads(FAST_PATCH_LIVE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    tools = doc.get("tools") if isinstance(doc, dict) else None
+    kept: dict[Path, bytes] = {}
+    for name in tools if isinstance(tools, dict) else {}:
+        path = bin_dir / str(name)
+        if "/" in str(name) or not path.is_file():
+            continue
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        if fast_patched(gen, str(name), sha256(data)):
+            kept[path] = data
+    return kept
+
+
+def put_back(kept: dict[Path, bytes]) -> None:
+    """Each kept tool's bytes, where setup replaced them: one atomic rename, executable as setup leaves it."""
+    for path, data in kept.items():
+        if file_sha256(path) == sha256(data):
+            continue
+        tmp = path.with_name(f".{path.name}.fast-patch")
+        try:
+            tmp.write_bytes(data)
+            os.chmod(tmp, 0o755)
+            os.replace(tmp, path)
+        except OSError:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
 
 
 def gh_only(config: dict) -> bool:
@@ -1665,7 +1710,7 @@ def update(apply: bool, config: dict, state_dir: Path = STATE_DIR,
             if drift:
                 # Step 8: the installed tools are not this release's bytes (a partial or hand install):
                 # its own idempotent setup puts them back. Never a quarantine: the release was healthy here.
-                ok, log = run_setup(gen, config["setupArgs"])
+                ok, log = run_setup(gen, config["setupArgs"], bin_dir)
                 _, left = tool_drift(gen, bin_dir, gh_only(config))
                 out["repair"] = (f"reinstalled {', '.join(drift)}" if ok and not left
                                  else f"failed: setup {'exited' if not ok else 'left ' + ', '.join(left)}: {log[-200:]}")[:400]
@@ -1706,7 +1751,7 @@ def update(apply: bool, config: dict, state_dir: Path = STATE_DIR,
         return {**out, "result": "refused", "detail": detail, "status": post(None, detail)}
     if state["current"] is None:
         snapshot(state_dir, bin_dir)
-    ok, log = run_setup(gen, config["setupArgs"])
+    ok, log = run_setup(gen, config["setupArgs"], bin_dir)
     detail = "installed" if ok else "setup failed"
     if ok:
         channel_dir = state_dir / "health-channel"
@@ -1732,7 +1777,7 @@ def update(apply: bool, config: dict, state_dir: Path = STATE_DIR,
         state["quarantined"] = sorted(set(state["quarantined"]) | {entry["tag"]})[-20:]
     previous = state["current"]
     if previous and (generation(state_dir, previous) / ".complete").is_file():
-        back, _ = run_setup(generation(state_dir, previous), config["setupArgs"])
+        back, _ = run_setup(generation(state_dir, previous), config["setupArgs"], bin_dir)
         rolled = f"restored {previous}" if back else f"restoring {previous} failed too"
     elif restore(state_dir, bin_dir):
         back, rolled = True, "restored the tools installed before the first update"

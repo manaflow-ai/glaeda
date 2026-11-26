@@ -213,6 +213,8 @@ repository.
 **The fork's `main` takes no merges.** Its ruleset 26619652 ("main: deploy keys only") blocks
 every update to `main` except a push made with a deploy key. A pull request opened in the fork
 still runs Verify but cannot merge ("Cannot update this protected ref."): merge it here instead.
+`glaeda-gh land manaflow-ai/glaeda#N` does that: it carries the head to `carry/manaflow-ai-glaeda-N` here, opens one
+PR naming the original and lands it pinned (CONTRIBUTING.md, "How to land a glaeda PR").
 On 11-04 two pull requests merged straight into the fork's `main` and stalled the sync for about
 20 hours on a conflict. A ruleset cannot name one deploy key, so the bypass covers both of the
 fork's write keys: the sync's (`SYNC_MIRROR_DEPLOY_KEY`, kept here) and `mirror.yml`'s tag key

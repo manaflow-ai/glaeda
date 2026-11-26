@@ -3506,6 +3506,45 @@ class ShareTests(unittest.TestCase):
         planned = mf.fix_host(self.manifest, "build-mini-1", result, False, None, seed="build-mini-2")["planned"]
         self.assertTrue(planned[0].startswith("xcode: copy /Applications/Xcode_26.6.app"))
 
+    def test_every_declared_xcode_is_provisioned_beside_the_pin(self) -> None:
+        # Leo, 2026-11-26: "and also just have more xcode versions installed". A workflow asking for xcode-27.0
+        # waited with no carrier (cmux run 45717448413): an Xcode declared beside the pin is copied like the pin.
+        extra = {"path": "/Applications/Xcode_27.0.app", "version": "27.0", "build": "27A266a"}
+        self.manifest["defaults"]["xcode"]["apps"].append(dict(extra))
+        obs = observed(**{"build-mini-1": preflight_text()})["hosts"]["build-mini-1"]
+        result = mf.preflight_host(self.manifest, "build-mini-1", obs)
+        check = result["checks"]["xcode 27.0"]
+        self.assertEqual((check["state"], check["group"]), ("todo", "self"))
+        self.assertEqual(check["action"], {"kind": "xcode_share", **extra})
+        self.assertEqual(result["checks"]["xcode"]["state"], "ok")  # the pin is unchanged
+        self.assertTrue(result["ready"])  # a missing extra Xcode never blocks the host's pin work
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(mf, "prepare_seed", side_effect=lambda m, src, thing, log, yes=True, args=None:
+                                  (calls.append(("seed", thing, args)), None)[1]), \
+                mock.patch.object(mf, "share_one", side_effect=lambda m, thing, src, dst, a, log, yes:
+                                  (calls.append(("share", thing, a)), (True, ""))[1]), \
+                mock.patch.object(mf, "fix_call", return_value=0), \
+                mock.patch.object(mf, "operator_candidate", return_value=self.candidate):
+            mf.fix_host(self.manifest, "build-mini-1", result, True, Path(tmp), seed="build-mini-2")
+        args = ["/Applications/Xcode_27.0.app", "27.0", "27A266a"]
+        self.assertIn(("seed", "xcode", args), calls)
+        self.assertIn(("share", "xcode", args), calls)
+        # Short of disk: a person frees it first, and fix copies nothing.
+        low = preflight_text().replace("disk\t/System/Volumes/Data|460|220", "disk\t/System/Volumes/Data|460|35")
+        tight = mf.preflight_host(self.manifest, "build-mini-1",
+                                  observed(**{"build-mini-1": low})["hosts"]["build-mini-1"])["checks"]["xcode 27.0"]
+        self.assertEqual((tight["state"], tight["group"]), ("todo", "person"))
+        self.assertNotIn("action", tight)
+        self.assertIn(f"needs {mf.XCODE_COPY_GIB + 30}", tight["detail"])
+        # Installed but unlicensed: sudo-plan accepts its licence with its own developer directory.
+        have = preflight_text() + "xcode_app\t/Applications/Xcode_27.0.app|dir|27.0|27A266a\n" \
+            "xcode_ready\t/Applications/Xcode_27.0.app|needed|done\n"
+        checks = mf.preflight_host(self.manifest, "build-mini-1",
+                                   observed(**{"build-mini-1": have})["hosts"]["build-mini-1"])["checks"]
+        self.assertEqual(checks["xcode 27.0"]["action"],
+                         {"kind": "licence", "developer": "/Applications/Xcode_27.0.app/Contents/Developer"})
+
 
 def run_command(texts: dict[str, str], *extra: str, tokens: list[str] | None = None,
                 manifest: Path = EXAMPLE, command: str = "onboard", after: dict[str, str] | None = None,
