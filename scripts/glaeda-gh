@@ -14821,6 +14821,11 @@ def land_retarget_args(repo: str, number: str, base: str, broker: bool) -> list[
 
 
 LAND_PIN_READ_FAILS = 3  # failed direct reads in a row before a pinned land waiting for its head stops (pin_unread)
+# A pinned land waiting for a read that shows its pin (pin_wait, refresh_due) needs one PR read, not a judgment, yet its
+# read took a worker of the pool a judgment takes, and a pool held by 170-300 s judgments left it waiting: cmux-cp-1,
+# 2026-11-26 11:01-11:29Z, cmux#58041 (pinned at 1db9c73ca9d0 after its own update_branch) sat 28 min on a cached 4b0b90460518
+# with 10 of 8-12 workers busy judging, until a person merged it. Up to this many such reads run past the worker count.
+LAND_PIN_READ_SLOTS = 4
 # A head_moved stop names the live head it read (its next step is `--sha LIVE`), so it also says the pin it stopped was
 # replaced. A row then re-pinned at LIVE whose copy still shows that replaced head is reading something older than the
 # stop's own read, not a new push: a lane host, 2026-11-22 23:10Z, hq#18191 pinned at 5bd7077339bc stopped
@@ -21505,6 +21510,15 @@ class LandQueue:
             self.save(e)
         return True
 
+    def pin_read_slot(self, e: dict) -> bool:
+        """True while E, a pinned land still waiting for a read that shows its pin, may start its read past the worker
+        count (LAND_PIN_READ_SLOTS): at most that many of those reads run at once."""
+        if not e.get("pinSha") or e.get("pinSeen"):
+            return False
+        return sum(1 for k, (_, job) in self.job_started.items() if k in self.jobs and job == "refresh_job"
+                   and not (self.entries.get(k) or {}).get("pinSeen")
+                   and (self.entries.get(k) or {}).get("pinSha")) < LAND_PIN_READ_SLOTS
+
     def pin_wait(self, e: dict, c: dict, head: str) -> bool:
         """A land pinned with --sha/--match-head-commit (E's pinSha): True while E waits for a read of its PR made since
         the request, or when it stopped because that read shows another head. huge-blue, 2026-11-21 10:56Z:
@@ -21594,7 +21608,7 @@ class LandQueue:
                     return True
             elif self.refresh_held():
                 pass  # held (LAND_REFRESH_BROKER_HOLD): it waits for the hold's end, no failure counted
-            elif self.busy() >= self.workers():
+            elif self.busy() >= self.workers() and not self.pin_read_slot(e):
                 # no free worker: the next one that frees reads it (refill), not only a pass that finds one free.
                 # cmuxterm-hq#20976, 2026-11-23 11:41Z: every pass found 24 of 24 busy, the workers freed between
                 # passes went to the rows those passes listed (gated), and the pin wait sat on a 40-min-old head
@@ -21833,7 +21847,7 @@ class LandQueue:
         repo = str(e.get("repo") or "").lower()
         queued = self.refresh_queued.get(repo) or []
         joins = self.refresh_many is not None and bool(queued) and len(queued) % LAND_REFRESH_BATCH != 0
-        if not joins and self.busy() + self.refresh_batches() >= self.workers():
+        if not joins and self.busy() + self.refresh_batches() >= self.workers() and not self.pin_read_slot(e):
             self.gated(e, ready=True)  # read on the next worker that frees (refill), judged after it
             return True
         e["refresh"] = {"at": self.now, "age": round(self.now - at), **self.refresh_starting(e["key"]),

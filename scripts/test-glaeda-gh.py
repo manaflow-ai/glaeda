@@ -37085,12 +37085,32 @@ class LandTest(Base):
         self.land_pinned(LB)
         e = self.tick(1)  # pin_wait: the nudge goes out, and nothing answers it
         self.assertIn("pin_wait", [h.get("event") for h in e["history"]])
-        e = self.tick(gg.NUDGE_MIN + 1)  # the direct read is due, every worker busy
-        self.assertEqual((pool.keys(), e["state"]), ([], "queued"))
-        self.assertIn(self.KEY, self.q.next_up, "a pin wait's direct read waits for a worker like a judgment")
-        del self.q.jobs["pr:o/r#99"]  # the worker frees between two passes
-        self.q.refill(self.t + 1)
-        self.assertEqual(pool.keys(), [self.KEY])
+        with mock.patch.object(gg, "LAND_PIN_READ_SLOTS", 0):  # no read slot past the workers: as before
+            e = self.tick(gg.NUDGE_MIN + 1)  # the direct read is due, every worker busy
+            self.assertEqual((pool.keys(), e["state"]), ([], "queued"))
+            self.assertIn(self.KEY, self.q.next_up, "with no read slot, the direct read waits for a worker")
+            del self.q.jobs["pr:o/r#99"]  # the worker frees between two passes
+            self.q.refill(self.t + 1)
+            self.assertEqual(pool.keys(), [self.KEY])
+            self.assertIsNotNone((self.q.entries[self.KEY].get("pinWait") or {}).get("directAt"))
+
+    def test_a_pinned_lands_direct_read_does_not_wait_for_a_worker(self):
+        """cmux-cp-1, 2026-11-26 11:01-11:29Z: cmux#58041, pinned at 1db9c73ca9d0 after its own update_branch, sat 28 min
+        on a cached 4b0b90460518 with 10 of 8-12 workers busy on 170-300 s judgments: its one PR read took a worker of
+        the judgments' pool. It now runs past the worker count, in one of LAND_PIN_READ_SLOTS."""
+        self.nudge_reads = False
+        pool = self.pooled(1)
+        self.pr(LA)
+
+        class Busy:
+            def done(self) -> bool:
+                return False
+        self.q.jobs["pr:o/r#99"] = Busy()  # every worker busy
+        self.land_pinned(LB)
+        e = self.tick(1)
+        self.assertIn("pin_wait", [h.get("event") for h in e["history"]])
+        self.tick(gg.NUDGE_MIN + 1)
+        self.assertEqual(pool.keys(), [self.KEY], "the read starts with every worker busy")
         self.assertIsNotNone((self.q.entries[self.KEY].get("pinWait") or {}).get("directAt"))
 
     def test_a_pinned_land_whose_reads_all_fail_stops_naming_the_pin_and_the_error(self):
