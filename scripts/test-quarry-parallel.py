@@ -12,9 +12,11 @@ import json
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import owned_linux_task  # noqa: E402
 from owned_linux_task import Refusal, execute, execute_capturing, execute_capturing_split  # noqa: E402
 from quarry_parallel_impl import (  # noqa: E402
     MAX_RECEIPT_BYTES,
@@ -68,6 +70,15 @@ def sample_raw(commit="a" * 40):
 
 
 class CaptureTests(unittest.TestCase):
+    # The unit these tests name never exists, so its settle check is modelled, not asked of the host's
+    # `systemctl --user`: a hosted runner whose user manager did not answer turned every "succeeded" into
+    # "cleanup_incomplete" (glaeda#2765, Verify run 45580340254).
+    def setUp(self):
+        for name, value in (("unit_absent", lambda unit: True), ("stop_unit", lambda unit: None)):
+            patcher = mock.patch.object(owned_linux_task, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def test_execute_still_returns_its_exact_tuple(self):
         terminal, code, elapsed, settled, out_bytes, digest = execute(
             ["/bin/echo", "hello"],

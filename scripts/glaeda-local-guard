@@ -84,6 +84,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import random
 import re
 import signal
 import subprocess
@@ -94,6 +95,46 @@ from typing import Callable
 
 SCHEMA = "glaeda-local-guard/v1"
 HOME = Path.home()
+DEFAULT_LABEL = "com.teamleaderleo.glaeda.local-guard"
+
+
+# Boot spread, as glaeda-idle-repair's boot_hold (cosmic-gray, 2026-11-24: after a memory-exhaustion panic every
+# RunAtLoad job started in the same second, load 214). The LaunchAgent sets BOOT_SPREAD_S (120): while the host came up
+# (boot or wake) less than a fixed 0..BOOT_SPREAD_S seconds ago, seeded by the launchd label and the boot second, an
+# --apply tick exits at once. A fresh boot has no orphans to stop yet; the 30 s ticks after the wait run as before.
+def came_up_at(now: float | None = None, run=subprocess.run, uptime: Path = Path("/proc/uptime")) -> float | None:
+    """Epoch seconds the host last booted or (macOS) woke, or None when it cannot tell."""
+    now = time.time() if now is None else now
+    if sys.platform == "darwin":
+        try:
+            out = run(["/usr/sbin/sysctl", "-n", "kern.boottime", "kern.waketime"], capture_output=True, text=True,
+                      timeout=5).stdout
+        except (OSError, subprocess.SubprocessError):
+            return None
+        marks = [int(s) for s in re.findall(r"\bsec\s*=\s*(\d+)", out or "") if int(s)]
+        return float(max(marks)) if marks else None
+    try:
+        return now - float(uptime.read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def boot_hold(env=None, now: float | None = None, up=came_up_at) -> float:
+    """Seconds this job's first pass after boot or wake still waits (0: run now)."""
+    env = os.environ if env is None else env
+    try:
+        spread = float(env.get("BOOT_SPREAD_S") or 0)
+    except ValueError:
+        return 0.0
+    if not spread > 0:
+        return 0.0
+    now = time.time() if now is None else now
+    came = up(now) if callable(up) else up
+    if came is None or came > now:
+        return 0.0
+    label = env.get("XPC_SERVICE_NAME") or DEFAULT_LABEL
+    wait = random.Random(f"{label}:{int(came)}").uniform(0.0, spread)
+    return max(0.0, came + wait - now)
 
 
 def _load_procs():
@@ -850,6 +891,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(render_status(lines, records))
         return 0
+    if a.apply and boot_hold() > 0:
+        return 0  # the host just came up: the first pass waits its boot spread (a later tick runs it)
 
     try:
         procs = gp.snapshot()

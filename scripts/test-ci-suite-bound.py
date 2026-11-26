@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import tempfile
 import textwrap
 import unittest
 from pathlib import Path
@@ -78,6 +79,45 @@ class SuiteBound(unittest.TestCase):
         done = run_suites("suite true", bound="60")
         self.assertIn("suite took 0s of its 60s bound: true", done.stdout, done.stdout)
         self.assertIn("FAILED=0", done.stdout, done.stdout)
+
+    def unittest_suite(self, body: str) -> str:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "test-x.py"
+        path.write_text(textwrap.dedent(body), encoding="utf-8")
+        return str(path)
+
+    def test_a_unittest_suite_that_exits_0_without_its_verdict_is_red(self) -> None:
+        """glaeda#2376: a real os.execve replaced test-glaeda-gh.py's process at about test 298 of 2261 with a
+        stand-in that exits 0, and the step read green with no verdict."""
+        quit_early = self.unittest_suite("""
+            import os, unittest
+            print("Ran 3 tests in 0.1s")  # a test's own output, not the final verdict
+            print("FAILED (failures=1)")
+            os._exit(0)
+        """)
+        done = run_suites(f"suite python3 {quit_early}\nsuite env X=1 python3 {quit_early}", bound="60")
+        self.assertIn("FAILED=2", done.stdout, done.stdout)
+        self.assertIn("::error title=Suite ended without its unittest verdict::", done.stdout, done.stdout)
+
+    def test_a_unittest_suite_that_ends_ok_is_green_and_one_that_ran_nothing_is_red(self) -> None:
+        ok = self.unittest_suite("""
+            import unittest
+            class T(unittest.TestCase):
+                def test_a(self): pass
+                @unittest.skip("x")
+                def test_b(self): pass
+            unittest.main()
+        """)
+        done = run_suites(f"suite python3 {ok}", bound="60")
+        self.assertIn("FAILED=0", done.stdout, done.stdout)
+        self.assertIn("OK (skipped=1)", done.stdout, done.stdout)  # the suite's output still shows
+        none = self.unittest_suite("""
+            import sys, unittest
+            print("Ran 0 tests in 0.000s")
+            print("OK")
+        """)
+        self.assertIn("FAILED=1", run_suites(f"suite python3 {none}", bound="60").stdout)
 
     def test_the_workflow_still_bounds_every_suite_through_one_helper(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")

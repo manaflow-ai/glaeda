@@ -802,9 +802,9 @@ class UpdateTest(unittest.TestCase):
         real_setup = gu.run_setup
         calls = []
 
-        def setup(gen, args):
+        def setup(gen, args, bin_dir=None):
             calls.append(gen.name)
-            return real_setup(gen, args) if len(calls) == 1 else (False, "timed out")
+            return real_setup(gen, args, bin_dir) if len(calls) == 1 else (False, "timed out")
 
         with mock.patch.object(gu, "health", return_value=(None, "glaeda-disk: timed out")), \
                 mock.patch.object(gu, "run_setup", setup):
@@ -1113,6 +1113,47 @@ class UpdateTest(unittest.TestCase):
         with mock.patch.object(gu, "channel_fingerprint", return_value=seen):
             self.assertTrue(gu.probe_gate(self.config, now, self.state)[0])
 
+    def test_the_minute_probe_starts_a_full_run_when_a_canary_soak_ends(self) -> None:
+        now = 1_800_000_000.0
+        seen = {"repo": gu.REPOSITORY, "control.json": "c1", "canary.json": "k1"}
+        with mock.patch.object(gu, "channel_fingerprint", return_value=seen):
+            gu.save_probe({"channel": seen, "fullRunAt": now, "soakEndsAt": now + 300}, self.state)
+            self.assertEqual(gu.probe_gate(self.config, now + 299, self.state)[0::2], (False, "unchanged"))
+            self.assertEqual(gu.probe_gate(self.config, now + 300, self.state)[0::2], (True, "soak ended"))
+            gu.save_probe({"channel": seen, "fullRunAt": now, "soakEndsAt": True}, self.state)  # malformed: ignored
+            self.assertEqual(gu.probe_gate(self.config, now + 300, self.state)[0::2], (False, "unchanged"))
+
+    def test_a_reporting_canary_records_when_its_post_soak_nudge_falls_due(self) -> None:
+        entry = {"tag": "r-20260925-" + "a" * 12, "published": "2026-09-25T00:00:00Z", "policy": {"soakHours": 0.25}}
+        soaked = gu.parse_utc("2026-09-25T00:15:00Z")
+        canary = {"ring": "canary", "reportStatus": True}
+        self.assertEqual(gu.nudge_pending_at(canary, {"result": "updated"}, entry, None, soaked - 600), soaked)
+        self.assertEqual(gu.nudge_pending_at(canary, {"result": "current"}, entry, None, soaked - 1), soaked)
+        self.assertIsNone(gu.nudge_pending_at(canary, {"result": "current"}, entry, None, soaked))  # nudged this run
+        self.assertIsNone(gu.nudge_pending_at(canary, {"result": "current"}, entry, entry["tag"], soaked - 1))
+        self.assertIsNone(gu.nudge_pending_at(canary, {"result": "backoff"}, entry, None, soaked - 1))
+        self.assertIsNone(gu.nudge_pending_at({**canary, "reportStatus": False}, {"result": "current"}, entry, None, 0))
+        self.assertIsNone(gu.nudge_pending_at({**canary, "ring": "stable"}, {"result": "current"}, entry, None, 0))
+        self.assertIsNone(gu.nudge_pending_at(canary, {"result": "current"}, {**entry, "published": "x"}, None, 0))
+
+    def test_main_keeps_the_soak_end_in_the_probe_after_a_full_run(self) -> None:
+        seen = {"repo": gu.REPOSITORY, "control.json": "c1", "canary.json": "k1"}
+        with mock.patch.object(gu, "STATE_DIR", self.state), mock.patch.object(gu, "load_config", return_value=self.config), \
+                mock.patch.object(gu, "channel_fingerprint", return_value=seen), \
+                mock.patch.object(gu, "schedule_reload", return_value=None), \
+                mock.patch.object(gu, "apply_once", return_value={"result": "updated", "soakEndsAt": 123.0}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gu.main(["--apply"]), 0)
+        self.assertEqual(gu.load_probe(self.state)["soakEndsAt"], 123.0)
+        with mock.patch.object(gu, "STATE_DIR", self.state), mock.patch.object(gu, "load_config", return_value=self.config), \
+                mock.patch.object(gu, "channel_fingerprint", return_value=seen), \
+                mock.patch.object(gu, "schedule_reload", return_value=None), \
+                mock.patch.object(gu, "apply_once", return_value={"result": "current"}), \
+                contextlib.redirect_stdout(io.StringIO()) as printed:
+            self.assertEqual(gu.main(["--apply"]), 0)  # soak ended: a full run, which clears it
+        self.assertEqual(json.loads(printed.getvalue())["trigger"], "soak ended")
+        self.assertNotIn("soakEndsAt", gu.load_probe(self.state))
+
     def test_main_probes_silently_and_records_the_probe_after_a_full_run_even_one_that_fails(self) -> None:
         seen = {"repo": gu.REPOSITORY, "control.json": "c1", "canary.json": "k1"}
         now = time.time()
@@ -1302,6 +1343,67 @@ class UpdateTest(unittest.TestCase):
         self.assertNotEqual(result["result"], "backoff")
         self.assertTrue(self.converge()["converged"], self.converge()["why"])
 
+    # ---- step 7b: another account's runners (2026-11-25: aws-m4pro-7-glaeda-15, a PR runner in the cmux-pr-runner
+    # account, refused cmux-next-ios-kit.yml link-ffi-fleet a day after #2732 went stable; converge.json said converged)
+
+    def pool_member(self, sudo_body: str = 'shift 4; exec "$@"\n') -> tuple[Path, Path, Path]:
+        """An AWS Mac: the member user (ec2-user) has no runner of its own; its manifest names runner.poolUser, and that
+        account's home holds the PR runner. sudo here drops `-n -u USER --` and runs the rest as this test's user."""
+        pool_home, _, hook = self.runner_mini()
+        member = self.root / "member"
+        staged = member / "glaeda-runner/scripts"
+        staged.mkdir(parents=True)
+        (member / gu.RUNNER_MANIFEST).write_text(json.dumps({"hosts": {"aws-m4pro-7": {
+            "ssh_user": "ec2-user", "overrides": {"runner": {"poolUser": "cmux-pr-runner"}}}}}))
+        sudo = self.root / "sudo"
+        sudo.write_text("#!/bin/sh\n" + sudo_body)
+        sudo.chmod(0o755)
+        account = mock.MagicMock(pw_dir=os.fspath(pool_home))
+        for patch in (mock.patch.object(gu, "SUDO", os.fspath(sudo)),
+                      mock.patch.object(gu.pwd, "getpwnam", side_effect=lambda name: account
+                                        if name == "cmux-pr-runner" else (_ for _ in ()).throw(KeyError(name)))):
+            patch.start()
+            self.addCleanup(patch.stop)
+        return member, staged, hook
+
+    def test_the_pool_accounts_runner_hook_is_refreshed_and_counted(self) -> None:
+        member, staged, hook = self.pool_member()
+        entry = self.server.publish(SOURCES[0], runner_files=self.runner_files("the fixed release"),
+                                    hook_history=self.older())
+        result = self.apply(1_800_000_000.0, member, staged)
+        self.assertEqual(result["runnerHooks"], "no runners", "the member user has none of its own")
+        self.assertEqual(result["accountHooks"], f"cmux-pr-runner {entry['tag']}: 1 updated")
+        self.assertEqual(hook.read_bytes(), self.runner_files("the fixed release")["glaeda-cmux-runner-hook"])
+        doc = self.converge()
+        self.assertTrue(doc["converged"], doc["why"])
+        [row] = doc["running"]["hooks"]
+        self.assertEqual((row["account"], row["current"]), ("cmux-pr-runner", True))
+        self.assertIsNotNone(doc["live"]["hooksLiveAt"])
+
+    def test_a_pool_account_sudo_refuses_is_a_blocking_unconverged_host(self) -> None:
+        member, staged, hook = self.pool_member('echo "sudo: a password is required" >&2; exit 1\n')
+        stale = hook.read_bytes()
+        self.server.publish(SOURCES[0], runner_files=self.runner_files("the fixed release"), hook_history=self.older())
+        result = self.apply(1_800_000_000.0, member, staged)
+        self.assertIn("a password is required", result["accountHooks"])
+        self.assertEqual(hook.read_bytes(), stale)
+        doc = self.converge()
+        self.assertFalse(doc["converged"])
+        self.assertTrue(doc["blocking"])
+        self.assertIn("runner ~cmux-pr-runner", doc["why"][0])
+
+    def test_runner_accounts_reads_pool_and_dedicated_users_never_root_or_self(self) -> None:
+        home = self.root / "accounts"
+        (home / "glaeda-runner").mkdir(parents=True)
+        self.assertEqual(gu.runner_accounts(home), [])
+        me = gu.pwd.getpwuid(os.getuid()).pw_name
+        (home / gu.RUNNER_MANIFEST).write_text(json.dumps({
+            "defaults": {"runner": {"dedicated": [{"name": "n", "user": "cmux-nightly"}]}},
+            "hosts": {"m": {"overrides": {"runner": {"poolUser": "cmux-pr-runner",
+                                                     "dedicated": [{"user": "root"}, {"user": me}, {"user": "Bad Name"},
+                                                                   {"user": "cmux-nightly"}]}}}}}))
+        self.assertEqual(gu.runner_accounts(home), ["cmux-nightly", "cmux-pr-runner"])
+
     def test_an_unconverged_host_backs_off_and_a_new_release_is_tried_at_once(self) -> None:
         first = self.server.publish(SOURCES[0])
         now = 1_800_000_000.0
@@ -1339,6 +1441,55 @@ class UpdateTest(unittest.TestCase):
         self.assertEqual((result["result"], result["repair"]), ("current", "reinstalled glaeda-worktree-reclaim"))
         self.assertTrue(self.converge()["converged"])
         self.assertEqual(self.converge()["running"]["tools"]["drift"], [])
+
+    def test_a_fast_patch_ahead_of_the_release_is_not_drift_until_the_release_includes_it(self) -> None:
+        self.server.publish(SOURCES[0])
+        now = 1_800_000_000.0
+        self.assertEqual(self.apply(now)["result"], "updated")
+        reclaim = self.bin / "glaeda-worktree-reclaim"
+        reclaim.write_text("#!/bin/sh\n# main's newer commit, put live by fast-patch\nexit 0\n")
+        marker = self.root / "fast-patch-live.json"
+        newer = "f" * 40
+        marker.write_text(json.dumps({"commit": newer, "tools": {"glaeda-worktree-reclaim": gu.file_sha256(reclaim)}}))
+        with mock.patch.object(gu, "FAST_PATCH_LIVE", marker):
+            self.assertEqual(gu.observe(self.state, self.bin, self.root, self.root / "x")["tools"]["drift"], [])
+            self.assertNotIn("repair", self.apply(now + 1))
+            self.assertIn(b"fast-patch", reclaim.read_bytes())
+            # once the installed release includes the commit, the release's bytes are as new: drift again
+            gen = gu.generation(self.state, gu.load_state(self.state)["current"])
+            with open(gen / gu.ANCESTRY, "a", encoding="ascii") as file:
+                file.write(newer + "\n")
+            result = self.apply(now + 2)
+            self.assertEqual(result["repair"], "reinstalled glaeda-worktree-reclaim")
+            # bytes fast-patch did not name are drift as before
+            reclaim.write_text("#!/bin/sh\n# a hand install\nexit 0\n")
+            self.assertEqual(self.apply(now + 3)["repair"], "reinstalled glaeda-worktree-reclaim")
+
+    def test_a_repair_for_another_tool_keeps_the_fast_patched_bytes(self) -> None:
+        """A lane VM, 2026-11-25: setup reinstalls every tool, so a repair for another tool's drift (or a release
+        cut before main's commit) put the ring's older glaeda-gh over fast-patch's, and the daemon re-exec'd onto
+        it. The fast-patched bytes stay until a release includes their commit."""
+        self.server.publish(SOURCES[0])
+        now = 1_800_000_000.0
+        self.assertEqual(self.apply(now)["result"], "updated")
+        reclaim = self.bin / "glaeda-worktree-reclaim"
+        patched = b"#!/bin/sh\n# main's newer commit, put live by fast-patch\nexit 0\n"
+        reclaim.write_bytes(patched)
+        os.chmod(reclaim, 0o755)
+        marker = self.root / "fast-patch-live.json"
+        marker.write_text(json.dumps({"commit": "f" * 40, "tools": {"glaeda-worktree-reclaim": gu.sha256(patched)}}))
+        policy = self.bin.parent / "share/glaeda/gh-daemon.json"
+        policy.write_text('{"default": {"restShare": 1}}')
+        with mock.patch.object(gu, "FAST_PATCH_LIVE", marker):
+            result = self.apply(now + 1)
+            self.assertEqual(result["repair"], "reinstalled gh-daemon.json")
+            self.assertEqual(reclaim.read_bytes(), patched, "setup's older bytes did not stay")
+            self.assertTrue(os.access(reclaim, os.X_OK))
+            self.assertEqual(list(self.bin.glob(".*.fast-patch")), [])
+        # with no fast-patch named, setup's bytes win as before
+        policy.write_text('{"default": {"restShare": 1}}')
+        self.assertEqual(self.apply(now + 2)["repair"], "reinstalled glaeda-worktree-reclaim, gh-daemon.json")
+        self.assertNotEqual(reclaim.read_bytes(), patched)
 
     def test_a_missing_or_edited_fleet_gh_policy_is_reinstalled(self) -> None:
         self.server.publish(SOURCES[0])
@@ -1388,9 +1539,14 @@ class UpdateTest(unittest.TestCase):
         soak = float(entry["policy"]["soakHours"]) * 3600
         self.assertGreater(soak, 120)
         with mock.patch.object(gu, "nudge_promotion", return_value="dispatched") as nudge:
-            self.assertEqual(self.apply(published + 60)["promotion"], "dispatched")  # the install's nudge
+            installed = self.apply(published + 60)
+            self.assertEqual(installed["promotion"], "dispatched")  # the install's nudge
             self.assertNotIn("nudged", self.converge())
-            self.assertNotIn("promotion", self.apply(published + 120))  # current, still soaking
+            current = self.apply(published + 120)
+            self.assertNotIn("promotion", current)  # current, still soaking
+            # a canary that posts no status holds no quorum, so its probe waits for nothing
+            self.assertFalse(self.config["reportStatus"])
+            self.assertNotIn("soakEndsAt", current)
             self.assertEqual(self.apply(published + soak + 3600)["promotion"], "dispatched")  # after the soak
             self.assertEqual(self.converge()["nudged"], entry["tag"])
             self.assertNotIn("promotion", self.apply(published + soak + 7200))  # once per release
@@ -1620,7 +1776,8 @@ class ReleaseTest(unittest.TestCase):
             out = Path(tmp)
             files = {f"glaeda/scripts/{name}": ((ROOT / "scripts" / name).read_bytes(), 0o755)
                      for name in ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-gh", "glaeda-mini-health",
-                                 "glaeda-update")}
+                                 "glaeda-update", "glaeda-procs", "glaeda-disk-registry", "cmux-disk", "cmux-procs",
+                                 "cmux-disk-registry")}
             files["bin/glaeda-worktree-reclaim"] = (b"#!/bin/sh\nexit 0\n", 0o755)
             (out / gr.hygiene_asset(TARGET)).write_bytes(tar_gz(files))
             self.assertEqual(gr.main(["smoke", "--source", "a" * 40, "--target", TARGET, "--output", str(out)]), 0)

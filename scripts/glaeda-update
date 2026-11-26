@@ -8,7 +8,8 @@
 A LaunchAgent (macOS), headless LaunchDaemon (GUI-less macOS), or systemd user timer (Linux)
 runs `--apply` every minute (PROBE_EVERY_S); glaeda-mini-setup installs it. A run does the full
 update every ten minutes (APPLY_EVERY_S) and, between those, only when a probe finds the channel
-files changed since the last full run: two anonymous HEADs of github.com/<repo>/releases/download,
+files changed since the last full run (or, on a reporting canary, when the release's soak ends, to ask
+promote.yml at once): two anonymous HEADs of github.com/<repo>/releases/download,
 whose redirect names the uploaded asset (a new upload, a new asset). An unchanged probe prints
 nothing. A full run whose host already holds its ring's release costs two anonymous downloads of
 small channel files, never the GitHub API, so neither spends the shared quota. Configuration is ~/.config/glaeda/update.json,
@@ -81,6 +82,13 @@ What one run does, and what it refuses:
    downgraded. A runner with a job is watched up to 4 minutes for a gap between jobs; after that the new hook
    is staged for that job's job-completed to install. Each listener gate sees its hook change and
    re-execs it, keeping its runner.
+   7b. The same refresh runs as every other account this member's runners run as (RUNNER_ACCOUNTS): the staged
+   member manifest's runner.poolUser (an AWS Mac's PR runners, in the non-admin cmux-pr-runner account since
+   glaeda#2460) and each runner.dedicated entry's user. Their receipts and runner directories are in that account's
+   home, which step 7 never reads, so before this their hooks stayed at whatever the last fleet --apply installed
+   (2026-11-25: aws-m4pro-7-glaeda-15 refused cmux-next-ios-kit.yml link-ffi-fleet a day after #2732 went
+   stable, and converge.json said converged). It runs through `sudo -n -u ACCOUNT` from a copy of the release's
+   runner files that account can read; a refusal is a blocked hook in step 8, never silence.
 
 8. Convergence (converge.json beside state.json, glaeda-ota-converge/v1): after every --apply run
    the host records what it actually runs, not just the tag in state.json: the SHA-256 of each
@@ -109,17 +117,20 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import contextlib
 import fcntl
 import hashlib
 import json
 import os
 import platform
 import plistlib
+import pwd
 import re
 import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -137,9 +148,10 @@ HEX64 = re.compile(r"[0-9a-f]{64}")
 MAX_EXTRACTED = 1024 * 1024 * 1024
 # what setup installs and a first update snapshots, so it can roll back without a previous release
 TOOLS = ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-runner-hygiene", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all",
-         "glaeda-fleet-cas-prune", "glaeda-seed-prefetch", "glaeda-git-mirror", "glaeda-idle-warm", "glaeda-mini-health", "glaeda-update", "glaeda-gh")
+         "glaeda-fleet-cas-prune", "glaeda-seed-prefetch", "glaeda-git-mirror", "glaeda-idle-warm", "glaeda-mini-health", "glaeda-update", "glaeda-gh",
+         "cmux-gh", "cmux-disk", "cmux-procs", "cmux-disk-registry")  # the cmux-* primary names (glaeda-mini-setup TOOL_ALIASES)
 # what a --gh-only host installs (glaeda-mini-setup GH_ONLY_TOOLS): its health and drift checks cover only these
-GH_ONLY_TOOLS = ("glaeda-update", "glaeda-gh", "glaeda-disk")
+GH_ONLY_TOOLS = ("glaeda-update", "glaeda-gh", "glaeda-disk", "cmux-gh", "cmux-disk")
 RELEASE_SCHEMA = "glaeda-release/v1"
 STATUS_PREFIX = "glaeda-ota/"
 MAX_ASSET = 200 * 1024 * 1024
@@ -185,6 +197,12 @@ LAUNCHCTL = "/bin/launchctl"
 ALERT_AFTER_S = 2 * BACKOFF_MAX_S
 STALE_AFTER_S = 3 * BACKOFF_MAX_S
 HOOK_RELEASE_FILES = ("glaeda-cmux-runner-hook", "glaeda_reservation.py")  # what --refresh-hooks installs
+# Step 7b. The member manifest glaeda-cmux-runner-fleet stages beside RUNNER_SCRIPTS (trimmed to this member) names the
+# other accounts runners run as here (glaeda_fleet_labels POOL_USER, DEDICATED_USER); this updater refreshes theirs too.
+RUNNER_MANIFEST = "glaeda-runner/mini-fleet.json"  # under home
+ACCOUNT_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")  # glaeda_fleet_labels DEDICATED_USER_RE
+SUDO = "/usr/bin/sudo"
+ACCOUNT_TMP = "/tmp"
 # Step 6b. HQ's nightly promotion lease runs ~/.local/bin/glaeda-promotion-admit over ssh. glaeda-cmux-runner-fleet
 # --apply installs it on every member it stages (PROMOTION_ADMIT); OTA brings it to the release's bytes on the same
 # hosts (those with RUNNER_SCRIPTS), so a merged fix reaches the minis without a fleet --apply (2026-11-01: #1780 and
@@ -429,6 +447,9 @@ def probe_gate(config: dict, now: float, state_dir: Path = STATE_DIR) -> tuple[b
         return True, seen, "due"
     if seen is not None and seen != doc.get("channel"):
         return True, seen, "channel changed"
+    soak = doc.get("soakEndsAt")
+    if isinstance(soak, (int, float)) and not isinstance(soak, bool) and now >= soak:
+        return True, seen, "soak ended"  # this canary's post-soak promote nudge (nudge_pending_at)
     return False, seen, "unchanged"
 
 
@@ -611,14 +632,58 @@ def setup_command(gen: Path, args: list[str]) -> list[str]:
             "--reclaim-binary", str(gen / "bin/glaeda-worktree-reclaim")]
 
 
-def run_setup(gen: Path, args: list[str]) -> tuple[bool, str]:
+def run_setup(gen: Path, args: list[str], bin_dir: Path | None = None) -> tuple[bool, str]:
+    """GEN's setup. With BIN_DIR, a tool fast-patch put live from a main commit GEN does not include (fast_patched)
+    keeps those bytes: setup installs every tool, so a repair for any other tool's drift, or a release cut before
+    that commit, put the older glaeda-gh back and the daemon re-exec'd onto it (a lane VM, 2026-11-25: three
+    flips to the ring's release in 11 min, each undone by fast-patch a second later, every one a restart of the
+    daemon's land work). The newest bytes win; once a release includes the commit, setup's are as new."""
+    kept = fast_patch_kept(gen, bin_dir) if bin_dir is not None else {}
     try:
         result = subprocess.run(setup_command(gen, args), capture_output=True, text=True,
                                 timeout=SETUP_TIMEOUT, stdin=subprocess.DEVNULL,
                                 env={**os.environ, "GLAEDA_UPDATE_RUNNING": "1"})
     except (OSError, subprocess.TimeoutExpired) as e:
+        put_back(kept)
         return False, str(e)
+    put_back(kept)
     return result.returncode == 0, gh_said((result.stdout + result.stderr)[-2000:])
+
+
+def fast_patch_kept(gen: Path, bin_dir: Path) -> dict[Path, bytes]:
+    """{path: bytes} of each tool in BIN_DIR that is fast-patch's install of a commit GEN does not include."""
+    try:
+        doc = json.loads(FAST_PATCH_LIVE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    tools = doc.get("tools") if isinstance(doc, dict) else None
+    kept: dict[Path, bytes] = {}
+    for name in tools if isinstance(tools, dict) else {}:
+        path = bin_dir / str(name)
+        if "/" in str(name) or not path.is_file():
+            continue
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        if fast_patched(gen, str(name), sha256(data)):
+            kept[path] = data
+    return kept
+
+
+def put_back(kept: dict[Path, bytes]) -> None:
+    """Each kept tool's bytes, where setup replaced them: one atomic rename, executable as setup leaves it."""
+    for path, data in kept.items():
+        if file_sha256(path) == sha256(data):
+            continue
+        tmp = path.with_name(f".{path.name}.fast-patch")
+        try:
+            tmp.write_bytes(data)
+            os.chmod(tmp, 0o755)
+            os.replace(tmp, path)
+        except OSError:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
 
 
 def gh_only(config: dict) -> bool:
@@ -702,8 +767,11 @@ def health(bin_dir: Path, channel_dir: Path, gh_only: bool = False) -> tuple[boo
     host installs only glaeda-gh, glaeda-update and glaeda-disk, so only those are checked there. (None, why) when a
     check timed out: a host too busy to start Python in 120 s says nothing about the release (cosmic-gray
     at load 200 quarantined r-20261022-e5ce794d9efd on `glaeda-disk --help`, 2026-10-22)."""
-    hygiene = [[sys.executable, str(bin_dir / "glaeda-disk"), "--help"]] if gh_only else [
-        [sys.executable, str(bin_dir / "glaeda-disk"), "--help"],
+    # cmux-disk is glaeda-disk's primary name (Leo, 2026-11-25): checking it runs both the shim and the program, and
+    # keeps this check off glaeda-disk's old-name use counter. A setup that installed no cmux-disk checks the old name.
+    disk = bin_dir / "cmux-disk" if (bin_dir / "cmux-disk").is_file() else bin_dir / "glaeda-disk"
+    hygiene = [[sys.executable, str(disk), "--help"]] if gh_only else [
+        [sys.executable, str(disk), "--help"],
         [sys.executable, str(bin_dir / "glaeda-worktree"), "--help"],
         [sys.executable, str(bin_dir / "glaeda-projects"), "--help"],
         [str(bin_dir / "glaeda-worktree-reclaim"), "--help"],
@@ -825,11 +893,32 @@ def nudge_due(result: dict, entry: dict | None, nudged: str | None, now: float) 
         return True
     if result.get("result") != "current" or entry is None or nudged == entry.get("tag"):
         return False
+    end = soak_ends_at(entry)
+    return end is not None and now >= end
+
+
+def soak_ends_at(entry: dict) -> float | None:
+    """When the release's signed soak floor passes (its publication plus policy soakHours), or None if unreadable."""
     try:
         soak = float((entry.get("policy") or {}).get("soakHours") or 0)
-        return now >= parse_utc(str(entry.get("published"))) + soak * 3600
+        return parse_utc(str(entry.get("published"))) + soak * 3600
     except (TypeError, ValueError):
-        return False
+        return None
+
+
+def nudge_pending_at(config: dict, result: dict, entry: dict | None, nudged: str | None, now: float) -> float | None:
+    """When this reporting canary's post-soak nudge falls due, if that is still ahead. main keeps it in probe.json and
+    the minute probe starts a full run then (probe_gate "soak ended"), so promote.yml is asked within a minute of the
+    soak's end. Waiting for the next APPLY_EVERY_S run instead held stable up to ten more minutes on every release
+    the second canary reported late on. air-blue and cosmic-gray are the only canaries, so the quorum of two needs
+    both; cosmic-gray reported 16-34 min after publication or stayed pending on 5 of 8 releases (2026-11-24), and
+    each of those waited the 900 s soak plus up to 600 s for a canary's next full run (docs/GLAEDA_OTA.md step 5)."""
+    if config.get("ring") != "canary" or not config.get("reportStatus"):
+        return None
+    if result.get("result") not in ("updated", "current") or entry is None or nudged == entry.get("tag"):
+        return None
+    end = soak_ends_at(entry)
+    return end if end is not None and end > now else None
 
 
 def nudge_promotion(config: dict) -> str:
@@ -1084,6 +1173,110 @@ def refresh_runner_hooks(state_dir: Path = STATE_DIR, home: Path = HOME, detail:
         ("" if not held else "; sign hold: " + " | ".join(held)[:800])
 
 
+def runner_accounts(home: Path = HOME) -> list[str]:
+    """Step 7b: the other macOS accounts this member's runners run as, from the staged member manifest: each host's
+    runner.poolUser and the user of each runner.dedicated entry (overrides, then defaults). Never root, never this
+    user; an unreadable manifest names none."""
+    try:
+        manifest = json.loads((home / RUNNER_MANIFEST).read_text())
+    except (OSError, ValueError):
+        return []
+    if not isinstance(manifest, dict):
+        return []
+    runners = []
+    defaults = manifest.get("defaults")
+    if isinstance(defaults, dict) and isinstance(defaults.get("runner"), dict):
+        runners.append(defaults["runner"])
+    for host in (manifest.get("hosts") or {}).values() if isinstance(manifest.get("hosts"), dict) else []:
+        overrides = host.get("overrides") if isinstance(host, dict) else None
+        if isinstance(overrides, dict) and isinstance(overrides.get("runner"), dict):
+            runners.append(overrides["runner"])
+    names = []
+    for runner in runners:
+        names.append(runner.get("poolUser"))
+        dedicated = runner.get("dedicated")
+        names += [entry.get("user") for entry in dedicated if isinstance(entry, dict)] if isinstance(dedicated, list) else []
+    try:
+        me = pwd.getpwuid(os.getuid()).pw_name
+    except KeyError:
+        me = None
+    out = []
+    for name in names:
+        if isinstance(name, str) and ACCOUNT_RE.fullmatch(name) and name not in ("root", me) and name not in out:
+            out.append(name)
+    return out
+
+
+def refresh_account_hooks(user: str, state_dir: Path = STATE_DIR, detail: list | None = None) -> str:
+    """Step 7b for one account: the installed release's glaeda-cmux-runner --refresh-hooks --apply, run as `user`
+    (sudo -n) from a copy of the release's runner files and hook-history.json that account can read. Rows go to
+    `detail` with "account", so step 8 counts that account's runners; one that cannot be reached is a blocked row."""
+    tag = load_state(state_dir)["current"]
+    if tag is None:
+        return "no installed release"
+    gen = generation(state_dir, tag)
+    src = gen / "glaeda/scripts"
+    if not (src / "glaeda-cmux-runner").is_file():
+        return f"{tag} has no runner script"
+    where = f"~{user}"
+
+    def blocked(note: str) -> str:
+        if detail is not None:
+            detail.append({"runnerDir": where, "account": user, "state": "blocked", "note": note[:200]})
+        return f"not refreshed ({note})"[:300]
+
+    try:
+        home = pwd.getpwnam(user).pw_dir
+    except KeyError:
+        return blocked(f"no account {user} on this host")
+    # /tmp, never $TMPDIR: a macOS user's /var/folders/.../T is 0700, so the account could not reach the copy
+    with tempfile.TemporaryDirectory(prefix="glaeda-update-hooks-", dir=ACCOUNT_TMP) as tmp:
+        # the release lives under this user's home, which the account cannot read: a world-readable copy keeps the
+        # layout glaeda-cmux-runner reads its HOOK_HISTORY by (two levels above its scripts)
+        root = Path(tmp)
+        scripts = root / "glaeda/scripts"
+        scripts.mkdir(parents=True)
+        for name in RUNNER_FILES:
+            if (src / name).is_file():
+                shutil.copyfile(src / name, scripts / name)
+                (scripts / name).chmod(0o755 if os.access(src / name, os.X_OK) else 0o644)
+        if (gen / "hook-history.json").is_file():
+            shutil.copyfile(gen / "hook-history.json", root / "hook-history.json")
+            (root / "hook-history.json").chmod(0o644)
+        for d in (root, root / "glaeda", scripts):
+            d.chmod(0o755)
+        argv = [SUDO, "-n", "-u", user, "--", "/usr/bin/env", f"HOME={home}", f"PATH={CHILD_PATH}",
+                sys.executable, os.fspath(scripts / "glaeda-cmux-runner"), "--refresh-hooks", "--apply", "--output", "json"]
+        try:
+            result = subprocess.run(argv, capture_output=True, text=True, timeout=HOOKS_TIMEOUT, stdin=subprocess.DEVNULL,
+                                    cwd="/")
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return blocked(f"as {user}: {type(e).__name__}")
+    try:
+        doc = json.loads(result.stdout.strip().splitlines()[-1])
+        runners = doc["runners"]
+    except (ValueError, KeyError, IndexError, TypeError):
+        why = (result.stderr or "").strip().splitlines()[-1:] or [f"exit {result.returncode}"]
+        return blocked(f"as {user}: no refresh report ({why[0][:160]})")
+    counts: dict[str, int] = {}
+    for runner in runners:
+        counts[str(runner.get("state"))] = counts.get(str(runner.get("state")), 0) + 1
+        if detail is not None and isinstance(runner, dict):
+            detail.append({"runnerDir": str(runner.get("runnerDir") or runner.get("receipt") or "?")[:300],
+                           "account": user, "state": str(runner.get("state")), "note": str(runner.get("note") or "")[:200],
+                           "hookSha256": str(doc.get("hookSha256") or "").removeprefix("sha256:") or None})
+    held = [str(line)[:400] for line in doc.get("signHold") or [] if isinstance(line, str)][:8] \
+        if isinstance(doc.get("signHold"), list) else []
+    if detail is not None:
+        detail.extend({"signHold": line} for line in held)
+    if doc.get("error"):
+        return blocked(f"as {user}: {str(doc['error'])[:200]}")
+    if not counts:
+        return f"{user}: no runners"
+    return f"{user} {tag}: " + ", ".join(f"{n} {state}" for state, n in sorted(counts.items())) + \
+        ("" if not held else "; sign hold: " + " | ".join(held)[:800])
+
+
 def release_history(gen: Path, name: str) -> set[str] | None:
     """SHA-256s of every version of `name` the release descends from (its hook-history.json), or None."""
     try:
@@ -1183,6 +1376,14 @@ def runner_steps(state_dir: Path = STATE_DIR, target: Path = RUNNER_SCRIPTS, hom
             out[key] = step()
         except (OSError, ValueError, UpdateError) as e:
             out[key] = f"not refreshed ({type(e).__name__}: {e})"[:300]
+    accounts = []
+    for user in runner_accounts(home):  # step 7b
+        try:
+            accounts.append(refresh_account_hooks(user, state_dir, detail))
+        except (OSError, ValueError, UpdateError) as e:
+            accounts.append(f"{user}: not refreshed ({type(e).__name__}: {e})"[:300])
+    if accounts:
+        out["accountHooks"] = "; ".join(accounts)[:1200]
     return out
 
 
@@ -1191,6 +1392,26 @@ def file_sha256(path: Path) -> str | None:
         return sha256(path.read_bytes()) if path.is_file() else None
     except OSError:
         return None
+
+
+# leo-workspace tools/fast-patch puts a commit already on main live ahead of the ring (glaeda-gh re-execs onto it in
+# seconds) and names what it installed here: {"commit": SHA, "tools": {NAME: SHA256}}. Without this, the next full run
+# saw that install as drift and put the ring's older bytes back (a lane VM, 2026-11-23: fast-patch put
+# 4bcb452c live at 03:22:02Z, this updater reinstalled a02f5478 at 03:23:22Z). A tool whose installed bytes are the
+# ones named there is not drift until the installed release includes that commit (its ancestry.txt); then the
+# release is as new or newer and is put back as before.
+FAST_PATCH_LIVE = Path(os.environ.get("GLAEDA_FAST_PATCH_LIVE") or HOME / ".local/state/fast-patch/glaeda/live.json")
+
+
+def fast_patched(gen: Path, name: str, have_sha: str, path: Path | None = None) -> bool:
+    """NAME's installed bytes (HAVE_SHA) are fast-patch's install of a main commit the release GEN does not include."""
+    try:
+        doc = json.loads((path or FAST_PATCH_LIVE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    tools = doc.get("tools") if isinstance(doc, dict) else None
+    return (isinstance(tools, dict) and tools.get(name) == have_sha
+            and SHA_RE.fullmatch(str(doc.get("commit"))) is not None and not release_descends_from(gen, doc["commit"]))
 
 
 def tool_drift(gen: Path, bin_dir: Path, gh_only: bool = False) -> tuple[int, list[str]]:
@@ -1206,7 +1427,7 @@ def tool_drift(gen: Path, bin_dir: Path, gh_only: bool = False) -> tuple[int, li
         if want_sha is None or have_sha is None:
             continue
         checked += 1
-        if want_sha != have_sha:
+        if want_sha != have_sha and not fast_patched(gen, name, have_sha):
             drift.append(name)
     # The fleet's glaeda-gh pacing (every profile installs it). Missing counts as drift too: without it the
     # daemon falls back to its own default REST share, which the fleet's shares are split to stay under.
@@ -1272,9 +1493,10 @@ def live_summary(running: dict) -> dict:
 
 
 def observe(state_dir: Path = STATE_DIR, bin_dir: Path = BIN, home: Path = HOME,
-            staged: Path = RUNNER_SCRIPTS, gh_only: bool = False) -> dict:
+            staged: Path = RUNNER_SCRIPTS, gh_only: bool = False, hook_states: list | None = None) -> dict:
     """Step 8: what this host actually runs, by content: the installed release, its tools and each runner's
-    installed hook files, each compared with the release's bytes. Reads local files only."""
+    installed hook files, each compared with the release's bytes. Reads local files only; another account's runners
+    (step 7b) are this run's refresh rows from `hook_states`, which read them as that account."""
     state = load_state(state_dir)
     tag = state["current"]
     out: dict = {"tag": tag, "source": installed_source(state_dir, tag), "tools": {"checked": 0, "drift": []},
@@ -1310,6 +1532,16 @@ def observe(state_dir: Path = STATE_DIR, bin_dir: Path = BIN, home: Path = HOME,
         if row["current"]:
             row["installedAt"] = hook_installed_at(hook_dir)
         out["hooks"].append(row)
+    for state in hook_states or []:
+        if isinstance(state, dict) and state.get("account") and "runnerDir" in state:
+            # unchanged or updated: the account's hook files are the release's bytes now (the refresh compared them)
+            current = state.get("state") in ("unchanged", "updated") and state.get("hookSha256") == want["glaeda-cmux-runner-hook"]
+            row = {"runnerDir": state["runnerDir"], "account": state["account"], "current": current,
+                   "glaeda-cmux-runner-hook": state.get("hookSha256") if current else None}
+            if current:  # this run put it in, or it already was (then no later than the release's install: a bound)
+                row["installedAt"] = (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                                      if state.get("state") == "updated" else out.get("installedAt"))
+            out["hooks"].append(row)
     if staged.is_dir():
         out["runnerScripts"] = "current" if all(
             file_sha256(staged / name) == file_sha256(scripts / name) for name in RUNNER_FILES) else "differs"
@@ -1478,7 +1710,7 @@ def update(apply: bool, config: dict, state_dir: Path = STATE_DIR,
             if drift:
                 # Step 8: the installed tools are not this release's bytes (a partial or hand install):
                 # its own idempotent setup puts them back. Never a quarantine: the release was healthy here.
-                ok, log = run_setup(gen, config["setupArgs"])
+                ok, log = run_setup(gen, config["setupArgs"], bin_dir)
                 _, left = tool_drift(gen, bin_dir, gh_only(config))
                 out["repair"] = (f"reinstalled {', '.join(drift)}" if ok and not left
                                  else f"failed: setup {'exited' if not ok else 'left ' + ', '.join(left)}: {log[-200:]}")[:400]
@@ -1519,7 +1751,7 @@ def update(apply: bool, config: dict, state_dir: Path = STATE_DIR,
         return {**out, "result": "refused", "detail": detail, "status": post(None, detail)}
     if state["current"] is None:
         snapshot(state_dir, bin_dir)
-    ok, log = run_setup(gen, config["setupArgs"])
+    ok, log = run_setup(gen, config["setupArgs"], bin_dir)
     detail = "installed" if ok else "setup failed"
     if ok:
         channel_dir = state_dir / "health-channel"
@@ -1545,7 +1777,7 @@ def update(apply: bool, config: dict, state_dir: Path = STATE_DIR,
         state["quarantined"] = sorted(set(state["quarantined"]) | {entry["tag"]})[-20:]
     previous = state["current"]
     if previous and (generation(state_dir, previous) / ".complete").is_file():
-        back, _ = run_setup(generation(state_dir, previous), config["setupArgs"])
+        back, _ = run_setup(generation(state_dir, previous), config["setupArgs"], bin_dir)
         rolled = f"restored {previous}" if back else f"restoring {previous} failed too"
     elif restore(state_dir, bin_dir):
         back, rolled = True, "restored the tools installed before the first update"
@@ -1684,14 +1916,17 @@ def apply_once(config: dict, state_dir: Path = STATE_DIR, bin_dir: Path = BIN, h
             result["promotion"] = nudge_promotion(config)
             if entry is not None and result.get("result") == "current":
                 previous["nudged"] = entry["tag"]  # the post-soak nudge; the install's own does not count
+        pending = nudge_pending_at(config, result, entry, previous.get("nudged"), now)
+        if pending is not None:
+            result["soakEndsAt"] = pending
         if result["result"] in ("updated", "current"):
             result.update(runner_steps(state_dir, staged, home, hook_states, bin_dir))
     except Exception as e:  # noqa: BLE001  (recorded below, then re-raised for the one JSON line)
         result = {"result": "error", "why": f"{type(e).__name__}: {e}"[:500]}
-        record_convergence(config, result, wants, previous, now, observe(state_dir, bin_dir, home, staged, gh_only(config)),
+        record_convergence(config, result, wants, previous, now, observe(state_dir, bin_dir, home, staged, gh_only(config), hook_states),
                            hook_states, converge_path)
         raise
-    doc = record_convergence(config, result, wants, previous, now, observe(state_dir, bin_dir, home, staged, gh_only(config)),
+    doc = record_convergence(config, result, wants, previous, now, observe(state_dir, bin_dir, home, staged, gh_only(config), hook_states),
                              hook_states, converge_path)
     result["converge"] = {k: doc[k] for k in ("converged", "why", "blocking", "since", "attempts")}
     return result
@@ -1750,11 +1985,15 @@ def main(argv: list[str] | None = None) -> int:
                 except BlockingIOError:
                     print(json.dumps({"result": "busy", "why": "another glaeda-update is running"}))
                     return 0
+                result = None
                 try:
                     result = apply_once(config)
                 finally:
                     # recorded whatever the run did: a failing run waits for the next change or APPLY_EVERY_S
-                    save_probe({"channel": seen, "fullRunAt": now}, STATE_DIR)
+                    probe = {"channel": seen, "fullRunAt": now}
+                    if isinstance(result, dict) and isinstance(result.get("soakEndsAt"), (int, float)):
+                        probe["soakEndsAt"] = result["soakEndsAt"]
+                    save_probe(probe, STATE_DIR)
                 result["trigger"] = why
                 schedule = schedule_reload(config)
                 if schedule:

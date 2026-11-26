@@ -60,7 +60,7 @@ from typing import Any
 
 PREFIX = "glaeda-nightly-only-admit"
 NIGHTLY_ONLY_LABEL = "glaeda-nightly-only-m4pro"
-WHAT = ("NEXT nightly work only: nightly.yml of manaflow-ai/cmux on nightly-next or main (and the workflows it "
+WHAT = ("NEXT nightly work only: nightly.yml of manaflow-ai/cmux on nightly-next, main or an rc/* branch (and the workflows it "
         "calls), cmux-next.yml's release-compile on a feat-cmux-next push, and the key-free jobs of main's "
         "auto-resume-nightly-notarization.yml")
 
@@ -77,6 +77,13 @@ def load_hook(path: Path) -> Any:
 def refusal(hook: Any, event_name: str | None, ref: str | None, repository: str | None, event: Any,
             workflow_ref: str | None, job: str | None) -> str | None:
     """Why the nightly-only runner refuses this job, or None to admit it. Pure (given the hook module)."""
+    if hook.rc_nightly_push(event_name, ref, repository, event, workflow_ref):
+        # RC_NIGHTLY: an rc/* push of cmux's own nightly.yml (Classic RC, the cmux-next RC). rc/* is admin-only on
+        # manaflow-ai/cmux; its signing jobs still keep their own route (below).
+        if hook.job_class(job or "", repository, hook.DEFAULT_HOME_REPO, "nightly.yml")[0] == hook.EXCLUSIVE_CLASS:
+            return (f"nightly.yml {job} is a signing job: it takes the whole mini through the capacity ledger "
+                    "(GLAEDA_JOB_CLAIM=exclusive), which a dedicated runner never holds; it keeps its own route")
+        return None
     tier = hook.job_tier(event_name, ref, repository, event, workflow_ref, job)
     if tier != hook.TIER_NIGHTLY:
         return f"this runner takes {WHAT}; this job is not nightly work"

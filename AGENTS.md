@@ -122,6 +122,10 @@ Locally, run only what the change touches:
 python3 scripts/test-<file>.py -k <name>  # only the cases you changed or added
 ```
 
+`focused` runs the two script lints always and its three cargo phases only when the diff against
+`origin/main` can affect them; a skipped phase prints the paths it read. When the diff cannot be
+read at all, every phase runs.
+
 Run one test file or `-k` selection at a time, in the foreground, with a
 timeout, and never leave a test process behind when the session ends. Then push
 the branch and let the Verify workflow run the full suites; its result is the

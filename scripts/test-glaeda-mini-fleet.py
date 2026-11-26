@@ -3490,7 +3490,8 @@ class ShareTests(unittest.TestCase):
             self.assertEqual((ok, detail), (True, "Homebrew in /opt/homebrew (from build-mini-2)"))
             mf.fetch_homebrew(self.manifest, "build-mini-1", None, None)
         (host, command, options), (_, plain, plain_options) = calls
-        self.assertEqual((host, options, plain_options), ("build-mini-1", ("-A",), ()))
+        # ControlPath=none: a multiplexed master opened without -A forwards no agent.
+        self.assertEqual((host, options, plain_options), ("build-mini-1", ("-A", "-o", "ControlPath=none"), ()))
         self.assertTrue(remote_call(command).endswith(
             f"homebrew_fetch {mf.HOMEBREW_REPO} ssh://builder@10.0.8.5/opt/homebrew"), remote_call(command))
         self.assertTrue(remote_call(plain).endswith(f"homebrew_fetch {mf.HOMEBREW_REPO}"))
@@ -3505,6 +3506,76 @@ class ShareTests(unittest.TestCase):
         self.assertIn("waits for --from HOST, a host that has it", waiting[0])
         planned = mf.fix_host(self.manifest, "build-mini-1", result, False, None, seed="build-mini-2")["planned"]
         self.assertTrue(planned[0].startswith("xcode: copy /Applications/Xcode_26.6.app"))
+
+    def test_every_declared_xcode_is_provisioned_beside_the_pin(self) -> None:
+        # Leo, 2026-11-26: "and also just have more xcode versions installed". A workflow asking for xcode-27.0
+        # waited with no carrier (cmux run 45717448413): an Xcode declared beside the pin is copied like the pin.
+        extra = {"path": "/Applications/Xcode_27.0.app", "version": "27.0", "build": "27A266a"}
+        self.manifest["defaults"]["xcode"]["apps"].append(dict(extra))
+        obs = observed(**{"build-mini-1": preflight_text()})["hosts"]["build-mini-1"]
+        result = mf.preflight_host(self.manifest, "build-mini-1", obs)
+        check = result["checks"]["xcode 27.0"]
+        self.assertEqual((check["state"], check["group"]), ("todo", "self"))
+        self.assertEqual(check["action"], {"kind": "xcode_share", **extra})
+        self.assertEqual(result["checks"]["xcode"]["state"], "ok")  # the pin is unchanged
+        self.assertTrue(result["ready"])  # a missing extra Xcode never blocks the host's pin work
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(mf, "prepare_seed", side_effect=lambda m, src, thing, log, yes=True, args=None:
+                                  (calls.append(("seed", thing, args)), None)[1]), \
+                mock.patch.object(mf, "share_one", side_effect=lambda m, thing, src, dst, a, log, yes:
+                                  (calls.append(("share", thing, a)), (True, ""))[1]), \
+                mock.patch.object(mf, "fix_call", return_value=0), \
+                mock.patch.object(mf, "operator_candidate", return_value=self.candidate):
+            mf.fix_host(self.manifest, "build-mini-1", result, True, Path(tmp), seed="build-mini-2")
+        args = ["/Applications/Xcode_27.0.app", "27.0", "27A266a"]
+        self.assertIn(("seed", "xcode", args), calls)
+        self.assertIn(("share", "xcode", args), calls)
+        # Short of disk: a person frees it first, and fix copies nothing.
+        low = preflight_text().replace("disk\t/System/Volumes/Data|460|220", "disk\t/System/Volumes/Data|460|35")
+        tight = mf.preflight_host(self.manifest, "build-mini-1",
+                                  observed(**{"build-mini-1": low})["hosts"]["build-mini-1"])["checks"]["xcode 27.0"]
+        self.assertEqual((tight["state"], tight["group"]), ("todo", "person"))
+        self.assertNotIn("action", tight)
+        self.assertIn(f"needs {mf.XCODE_COPY_GIB + 30}", tight["detail"])
+        # Installed but unlicensed: sudo-plan accepts its licence with its own developer directory.
+        have = preflight_text() + "xcode_app\t/Applications/Xcode_27.0.app|dir|27.0|27A266a\n" \
+            "xcode_ready\t/Applications/Xcode_27.0.app|needed|done\n"
+        checks = mf.preflight_host(self.manifest, "build-mini-1",
+                                   observed(**{"build-mini-1": have})["hosts"]["build-mini-1"])["checks"]
+        self.assertEqual(checks["xcode 27.0"]["action"],
+                         {"kind": "licence", "developer": "/Applications/Xcode_27.0.app/Contents/Developer"})
+
+    def test_an_xcode_copy_runs_beside_a_build_and_a_busy_seed_still_seeds(self) -> None:
+        # 2026-11-26: fix --wait for Xcode 27.0 on four busy fleet minis copied nothing for an hour: the targets'
+        # build workers free the host lock only between jobs, and every seed that had 27.0 was busy too
+        # (share_prepare exit 20). An Xcode lands on its own path, staged and moved in whole, which no job reads.
+        self.assertIn("xcode_share", mf.BUSY_HOST_REPAIRS)
+        self.assertNotIn("metal", mf.BUSY_HOST_REPAIRS)
+        args = ["/Applications/Xcode_27.0.app", "27.0", "27A266a"]
+        for thing, gate in (("xcode", "lock reservation; "), ("candidate", "lock; ")):
+            commands, options_seen = [], []
+            with mock.patch.object(mf, "lan_address", return_value=("10.0.8.7", "10.0.8.7")), \
+                    mock.patch.object(mf, "ssh_stream", side_effect=lambda n, u, c, log, stdin=b"", timeout=None, options=():
+                                      (commands.append(c), options_seen.extend(options),
+                                       1 if remote_call(c).startswith("share_have ") else 0)[2]):
+                ok, _ = mf.share_one(self.manifest, thing, "build-mini-1", "build-mini-2", args, None, True)
+            self.assertTrue(ok, thing)
+            # Every command carries the whole library; the call line is what names the step and its gate.
+            have, pipeline, finish = commands
+            self.assertTrue(remote_call(have).startswith("share_have " + thing), remote_call(have))
+            self.assertIn(gate + "share_recv " + thing, pipeline, thing)
+            self.assertTrue(remote_call(finish).startswith(gate + "share_finish " + thing), (thing, remote_call(finish)))
+            self.assertIn("ControlPath=none", " ".join(map(str, options_seen)), thing)
+        # The seed's check is read-only for an Xcode (no step lock, no host gate); a Metal export keeps both.
+        for thing, func in (("xcode", "share_source"), ("metal", "share_prepare")):
+            seen = []
+            mf.SEEDS_READY.clear()
+            with mock.patch.object(mf, "ssh_stream", side_effect=lambda n, u, c, log, stdin=b"", timeout=None, options=():
+                                   (seen.append(remote_call(c)), 0)[1]):
+                self.assertIsNone(mf.prepare_seed(self.manifest, "build-mini-1", thing, None, True, args=args))
+            self.assertTrue(seen[0].startswith(func if thing == "xcode" else "lock; " + func), seen)
+        mf.SEEDS_READY.clear()
 
 
 def run_command(texts: dict[str, str], *extra: str, tokens: list[str] | None = None,

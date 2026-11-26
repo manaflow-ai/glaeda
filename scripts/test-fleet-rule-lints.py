@@ -5,6 +5,8 @@
   tool, which pipes it to `sudo -S` alone and redacts it. glaeda has no reader, so its allowlist is empty.
 - pkill: kill only processes you started, by the PID or process group you recorded; never by name or pattern
   (`pkill`, `killall`). The few name-based kills glaeda keeps are listed with why each is scoped and safe.
+  A restart of a macOS system process in SYSTEM_RESTARTS (`killall NAME` or `pkill -x NAME`, that one exact name
+  and nothing after it) is not a match: launchd owns and relaunches it, and macOS offers no other reset.
 - big-red: the personal Linux workstation is not infrastructure; nothing (a workflow, runner label, script,
   service or install path) may depend on it. Prose under docs/ and *.md is exempt (history and "never" notes).
 
@@ -34,6 +36,17 @@ KEYCHAIN_READ = re.compile(r"find-(generic|internet)-password|SecItemCopyMatchin
 # A line that names the service through a variable or a looser spelling; each read on it counts.
 KEYCHAIN_NAMED = re.compile(r"fleet[-_ ]sudo|KEYCHAIN_SERVICE")
 PKILL = re.compile(r"\b(pkill|killall)\b")
+# macOS system processes a fleet script may restart by exact name. None is a process anyone started, so there is no
+# recorded PID to signal: launchd owns each one and relaunches it at once, and macOS has no other way to reset it.
+# - loginwindow: a login window stuck at the console (a mini that logged out) never runs auto-login again until it
+#   is restarted; `killall loginwindow` is the reset (the fleet console-unlock-guard, config/fleet-ops.json).
+# This is a reviewed constant, not an allowlist entry: adding a name is a change to this lint, with its reason here.
+SYSTEM_RESTARTS = ("loginwindow",)
+# `killall NAME` or `pkill -x NAME` with nothing after the name but the end of the command (end of line, ; & | ),
+# a quote, or a JSON-escaped newline or quote; not a shell line continuation), so `killall loginwindow Dock` or
+# `killall loginwindowd` still counts.
+SYSTEM_RESTART = re.compile(r"\b(?:killall|pkill[ \t]+-x)[ \t]+(?:" + "|".join(map(re.escape, SYSTEM_RESTARTS)) +
+                            r")(?=[ \t]*(?:$|[;&|)\"']|\\[n\"]))", re.MULTILINE)
 BIG_RED = re.compile(r"big[-_ ]?red", re.IGNORECASE)
 
 FIX = {
@@ -60,6 +73,11 @@ def line_matches(pattern: re.Pattern[str], text: str) -> int:
     return len(pattern.findall(text))
 
 
+def pkill_matches(text: str) -> int:
+    """Every by-name kill but an exact restart of a SYSTEM_RESTARTS process."""
+    return line_matches(PKILL, text) - line_matches(SYSTEM_RESTART, text)
+
+
 def big_red_scanned(rel: str) -> bool:
     return not (rel.endswith(".md") or rel.startswith("docs/"))
 
@@ -78,7 +96,7 @@ def scan(root: Path) -> dict[str, dict[str, int]]:
         if b"\0" in raw:  # binary (images, archives), as git grep -I skips them; any text encoding is scanned
             continue
         text = raw.decode("utf-8", errors="replace")
-        counts = {"keychain": keychain_matches(text), "pkill": line_matches(PKILL, text),
+        counts = {"keychain": keychain_matches(text), "pkill": pkill_matches(text),
                   "big-red": line_matches(BIG_RED, text) if big_red_scanned(rel) else 0}
         for rule, n in counts.items():
             if n:
@@ -194,6 +212,24 @@ class FleetRuleLints(unittest.TestCase):
             self.assertEqual(line_matches(BIG_RED, line), 1, line)
         self.assertFalse(big_red_scanned("docs/history.md"))
         self.assertTrue(big_red_scanned(".github/workflows/x.yml"))
+
+    def test_only_an_exact_system_restart_is_exempt(self):
+        for text in ("killall loginwindow\n", "  sudo /usr/bin/killall loginwindow || say failed\n",
+                     "pkill -x loginwindow; echo done\n", "\"killall loginwindow || say \\\"x\\\"\\n  waited=0\"",
+                     "(killall loginwindow)\n"):
+            self.assertEqual(pkill_matches(text), 0, text)
+        for text in ("killall Dock\n", "killall loginwindowd\n", "killall loginwindow Dock\n",
+                     "pkill loginwindow\n", "pkill -f loginwindow\n", "killall -9 loginwindow\n",
+                     "killall SystemUIServer\n", "pkill -x WindowServer\n", "killall loginwindow \\\n  Dock\n"):
+            self.assertEqual(pkill_matches(text), 1, text)
+        self.assertEqual(pkill_matches("killall loginwindow; killall Finder\n"), 1)
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            subprocess.run(["git", "init", "-q", d], check=True)
+            Path(d, "guard.sh").write_text("killall loginwindow || say failed\n")
+            Path(d, "other.sh").write_text("killall cfprefsd\n")
+            subprocess.run(["git", "-C", d, "add", "."], check=True)
+            self.assertEqual(scan(Path(d))["pkill"], {"other.sh": 1})
 
     def test_the_allowlist_only_shrinks(self):
         allow = {"pkill": {"a.sh": {"count": 2, "reason": "scoped"}, "gone.sh": {"count": 1, "reason": "x"}},

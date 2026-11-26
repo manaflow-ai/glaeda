@@ -149,7 +149,8 @@ jobs:
           go build -trimpath -o /tmp/glaeda-scaleset-bridge .
 
 
-  # Script syntax and every script test file but the runner's, which runner-tests shards.
+  # Script syntax and every script test file but the runner's and glaeda-gh's, which runner-tests and
+  # glaeda-gh-tests shard.
   scripts:
     needs: changes
     if: ${{ needs.changes.outputs.code == 'true' }}
@@ -274,10 +275,16 @@ jobs:
               Path("scripts/test-hot-observe.py"),
               Path("scripts/glaeda-disk"),
               Path("scripts/test-glaeda-disk.py"),
+              Path("scripts/glaeda-disk-registry"),
+              Path("scripts/test-glaeda-disk-registry.py"),
               Path("scripts/glaeda-runner-hygiene"),
               Path("scripts/test-glaeda-runner-hygiene.py"),
               Path("scripts/glaeda-procs"),
               Path("scripts/test-glaeda-procs.py"),
+              Path("scripts/cmux-disk"),
+              Path("scripts/cmux-procs"),
+              Path("scripts/cmux-disk-registry"),
+              Path("scripts/test-cmux-names.py"),
               Path("scripts/glaeda-local-guard"),
               Path("scripts/test-glaeda-local-guard.py"),
               Path("scripts/glaeda-update"),
@@ -311,6 +318,7 @@ jobs:
               Path("scripts/glaeda-gh"),
               Path("scripts/test-glaeda-gh.py"),
               Path("scripts/test-glaeda-gh-edge.py"),
+              Path("scripts/test-cmux-gh-alias.py"),
               Path("scripts/benchmark-land-forward.py"),
               Path("scripts/measure-land-head-moved-after-own-update.py"),
               Path("scripts/glaeda-wallpaper-rotate"),
@@ -339,6 +347,7 @@ jobs:
           PY
           test -x ./smolrunner
           sh -n scripts/hot-run
+          sh -n scripts/cmux-gh
           bash -n scripts/benchmark-developer-loop
           bash -n scripts/test-bootstrap.sh
           bash -n scripts/cmux-fleet
@@ -367,14 +376,37 @@ jobs:
           # step ends red with a verdict. The bound is about 3x the slowest healthy suite
           # (test-glaeda-promotion-admit, 98 s of the step's 499 s).
           suite_seconds=${GLAEDA_SUITE_TIMEOUT_SECONDS:-300}
+          # A python unittest suite is green only when its output ends with its own verdict: the last `Ran N tests`
+          # line (N > 0) followed by OK. Since glaeda#2376 a real os.execve in scripts/test-glaeda-gh.py replaced the
+          # test process with a stand-in that exits 0 at about test 298 of 2261: no verdict, and the step read green.
           suite() {
             echo "::group::$*"
-            local start=$SECONDS rc=0
-            timeout --kill-after=10s "$suite_seconds" "$@" || rc=$?
+            local start=$SECONDS rc=0 out rcf
+            out=$(mktemp) rcf=$(mktemp)
+            { timeout --kill-after=10s "$suite_seconds" "$@" 2>&1 || echo "$?" > "$rcf"; } | tee "$out"
+            rc=$(cat "$rcf"); rc=${rc:-0}
             local took=$((SECONDS - start))
             echo "suite took ${took}s of its ${suite_seconds}s bound: $*"
             echo "::endgroup::"
             timings+=("$took $*")
+            local verdict="" i=1 j
+            if [ "${1:-}" = env ]; then  # (`suite env NAME=VALUE python3 X`)
+              i=2
+              while [[ "${!i:-}" == *=* ]]; do i=$((i + 1)); done
+            fi
+            j=$((i + 1))
+            if [ "$rc" -eq 0 ] && [ "${!i:-}" = python3 ] && [ -f "${!j:-}" ] \
+                && grep -qE '^[[:space:]]*(import .*\<unittest\>|from unittest[ .])' "${!j}"; then
+              verdict=$(awk '/^Ran [0-9]+ tests? in / { n = $2; seen = 1; ok = ""; next }
+                             seen && ok == "" && NF { ok = $1 }
+                             END { print (seen && n > 0 && ok == "OK") ? "ok" : "none" }' "$out")
+            fi
+            rm -f "$out" "$rcf"
+            if [ "$verdict" = none ]; then
+              echo "::error title=Suite ended without its unittest verdict::$* -- exit 0, but no final \`Ran N tests\` and OK"
+              failed+=("$* (exit 0 without a final \`Ran N tests\` and OK)")
+              return 0
+            fi
             if [ "$rc" -eq 0 ]; then return 0; fi
             if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
               echo "::error title=Suite hit its ${suite_seconds}s bound::$* -- killed after ${took}s so the step still reports"
@@ -391,6 +423,8 @@ jobs:
           suite python3 scripts/test-benchmark-linker-throughput.py
           suite python3 scripts/test-hot-observe.py
           suite python3 scripts/test-glaeda-disk.py
+          suite python3 scripts/test-intent-glaeda.py
+          suite python3 scripts/test-glaeda-disk-registry.py
           suite python3 scripts/test-glaeda-hook-pin.py
           suite python3 scripts/test-glaeda-cmux-tour-floor-check.py
           suite python3 scripts/test-glaeda-devbox.py
@@ -399,6 +433,7 @@ jobs:
           suite python3 scripts/test-glaeda-worktree-reclaim-all.py
           suite python3 scripts/test-glaeda-runner-hygiene.py
           suite python3 scripts/test-glaeda-procs.py
+          suite python3 scripts/test-cmux-names.py
           suite python3 scripts/test-glaeda-local-guard.py
           suite python3 scripts/test-glaeda-update.py
           suite python3 scripts/test-glaeda-fleet-cas-prune.py
@@ -416,8 +451,8 @@ jobs:
           suite python3 scripts/test-glaeda-daemon-heal.py
           suite python3 scripts/test-glaeda-seed-lan.py
           suite python3 scripts/test-glaeda-lan-fetch.py
-          suite python3 scripts/test-glaeda-gh.py
           suite python3 scripts/test-glaeda-gh-edge.py
+          suite python3 scripts/test-cmux-gh-alias.py
           suite python3 scripts/test-glaeda-wallpaper-rotate.py
           suite python3 scripts/test-glaeda-sync-main.py
           suite python3 scripts/test-delivery-concurrency.py
@@ -577,6 +612,43 @@ jobs:
       - name: Run runner and hook tests (shard ${{ matrix.shard }} of 4)
         run: |
           python3 scripts/unittest-shard scripts/test-glaeda-cmux-runner.py ${{ matrix.shard }} 4
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+
+  # scripts/test-glaeda-gh.py runs whole again since glaeda#2691 (2263 tests, not the ~298 it stopped at): run whole,
+  # it hit the scripts job's 300 s suite bound while still passing (run 45410861432). Its shards run side by side.
+  # A shard must end with its own `Ran N tests` and OK, as `suite` asks in the scripts job: an exec that replaces
+  # the process exits 0 with no verdict.
+  glaeda-gh-tests:
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
+    runs-on: ${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          show-progress: false
+
+      - name: Run glaeda-gh tests (shard ${{ matrix.shard }} of 4)
+        run: |
+          out="$RUNNER_TEMP/glaeda-gh-shard.out"
+          set +e
+          timeout --kill-after=10s 600 python3 scripts/unittest-shard scripts/test-glaeda-gh.py ${{ matrix.shard }} 4 2>&1 | tee "$out"
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [ "$rc" -ne 0 ]; then echo "::error title=glaeda-gh shard failed (exit $rc)::shard ${{ matrix.shard }}"; exit "$rc"; fi
+          verdict=$(awk '/^Ran [0-9]+ tests? in / { n = $2; seen = 1; ok = ""; next }
+                         seen && ok == "" && NF { ok = $1 }
+                         END { print (seen && n > 0 && ok == "OK") ? "ok" : "none" }' "$out")
+          if [ "$verdict" != ok ]; then
+            echo "::error title=Shard ended without its unittest verdict::exit 0, but no final \`Ran N tests\` and OK"
+            exit 1
+          fi
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
 
   # rust was one serial job of about 4.4 min (cache restore 69 s, check and two clippy runs 70 s, tests 100 s);
@@ -930,7 +1002,7 @@ jobs:
     # Skipped for a title or body edit with every other job: a run that verified nothing claims no green.
     if: ${{ always() && (github.event_name == 'pull_request' || github.repository == 'manaflow-ai/glaeda')
             && (github.event.action != 'edited' || github.event.changes.base.ref.from != '') }}
-    needs: [changes, go, scripts, mini-python-tests, runner-tests, lint, lint-macos, test, cli, fleet-cas-build, polling-guard]
+    needs: [changes, go, scripts, mini-python-tests, runner-tests, glaeda-gh-tests, lint, lint-macos, test, cli, fleet-cas-build, polling-guard]
     runs-on: ${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 5
     steps:

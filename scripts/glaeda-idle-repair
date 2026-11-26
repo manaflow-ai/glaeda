@@ -19,9 +19,13 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import random
+import re
 import signal
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any
 
@@ -38,6 +42,51 @@ DUE_SLACK_S = 5
 TIMED_OUT = 124
 REPAIR_EVERY_S = 900
 RETRY_AFTER_S = 60
+LOG_MAX_BYTES = 8 * 1024 * 1024
+LOG_KEEP_BYTES = LOG_MAX_BYTES // 2
+LOG_ROW_BYTES = 128 * 1024  # two bounded child output tails, even when JSON-escaped
+DEFAULT_LABEL = "com.teamleaderleo.glaeda.idle-repair"
+
+
+# Boot spread. cosmic-gray (a personal Mac) panicked from memory exhaustion on 2026-11-24 and, after the reboot, every
+# RunAtLoad job started in the same second (load 214; 148 ssh and 71 python in the jetsam report). The LaunchAgent sets
+# BOOT_SPREAD_S: while the host came up (boot or wake) less than a fixed 0..BOOT_SPREAD_S seconds ago, seeded by the
+# launchd label (XPC_SERVICE_NAME) and the boot second, a tick exits at once, before any lock, read or import. Without
+# BOOT_SPREAD_S (a manual run, systemd) nothing waits. The same formula as leo-workspace timer_run.boot_delay, so its
+# boot_burst count sees the job where it really starts.
+def came_up_at(now: float | None = None, run=subprocess.run, uptime: Path = Path("/proc/uptime")) -> float | None:
+    """Epoch seconds the host last booted or (macOS) woke, or None when it cannot tell."""
+    now = time.time() if now is None else now
+    if sys.platform == "darwin":
+        try:
+            out = run(["/usr/sbin/sysctl", "-n", "kern.boottime", "kern.waketime"], capture_output=True, text=True,
+                      timeout=5).stdout
+        except (OSError, subprocess.SubprocessError):
+            return None
+        marks = [int(s) for s in re.findall(r"\bsec\s*=\s*(\d+)", out or "") if int(s)]
+        return float(max(marks)) if marks else None
+    try:
+        return now - float(uptime.read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def boot_hold(env=None, now: float | None = None, up=came_up_at) -> float:
+    """Seconds this job's first pass after boot or wake still waits (0: run now)."""
+    env = os.environ if env is None else env
+    try:
+        spread = float(env.get("BOOT_SPREAD_S") or 0)
+    except ValueError:
+        return 0.0
+    if not spread > 0:
+        return 0.0
+    now = time.time() if now is None else now
+    came = up(now) if callable(up) else up
+    if came is None or came > now:
+        return 0.0
+    label = env.get("XPC_SERVICE_NAME") or DEFAULT_LABEL
+    wait = random.Random(f"{label}:{int(came)}").uniform(0.0, spread)
+    return max(0.0, came + wait - now)
 
 
 def load_disk_module() -> Any:
@@ -69,6 +118,102 @@ def append_receipt(value: dict[str, Any]) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     with RECEIPT.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps({"schema": SCHEMA, **value}, separators=(",", ":")) + "\n")
+
+
+def log_record(line: bytes) -> bool:
+    """The queue snapshots this LaunchAgent writes. A mixed or partial file stays whole."""
+    if len(line) > LOG_ROW_BYTES or not line.endswith(b"\n"):
+        return False
+    try:
+        row = json.loads(line)
+    except (UnicodeError, ValueError, RecursionError):
+        return False
+    times = {"lastAttemptAt", "nextAttemptAt"}
+    if (not isinstance(row, dict) or row.get("schema") != SCHEMA
+            or not all(isinstance(row.get(key), (int, float)) for key in times)):
+        return False
+    if row.get("state") == "queued":
+        return (row.keys() == times | {"schema", "state", "reason", "queuedAt"}
+                and isinstance(row["reason"], str) and isinstance(row["queuedAt"], (int, float)))
+    return (row.get("state") in ("idle", "retry") and row.keys() == times | {"schema", "state", "actions"}
+            and isinstance(row["actions"], list))
+
+
+def log_identity(st: os.stat_result) -> tuple[int, ...]:
+    return st.st_dev, st.st_ino, st.st_nlink, st.st_size, st.st_mtime_ns, st.st_ctime_ns
+
+
+def write_scheduled_log(value: dict[str, Any], disk: Any) -> None:
+    """Called under run.lock. launchd sends stdout to /dev/null, so only the writer opens the log.
+    On rollout the first oversized old launchd log goes through the same closed-file retention."""
+    path = HOME / "Library/Logs/glaeda-idle-repair.jsonl"
+    line = (json.dumps({"schema": SCHEMA, **value}, separators=(",", ":")) + "\n").encode()
+    if not log_record(line) or path.parent.is_symlink() or path.parent.parent.is_symlink():
+        return
+    flags = os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        reader = os.open(path, os.O_RDONLY | flags)
+    except FileNotFoundError:
+        with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | flags, 0o600), "wb") as new:
+            new.write(line)
+        return
+    with os.fdopen(reader, "rb") as source:
+        original = os.fstat(source.fileno())
+        if not stat.S_ISREG(original.st_mode) or original.st_uid != os.getuid() or original.st_nlink != 1:
+            return
+        if original.st_size + len(line) <= LOG_MAX_BYTES:
+            if original.st_size and not log_record(source.readline(LOG_ROW_BYTES + 1)):
+                return
+            with os.fdopen(os.open(path, os.O_WRONLY | os.O_APPEND | flags), "wb") as target:
+                if log_identity(os.fstat(target.fileno())) == log_identity(original):
+                    target.write(line)
+            return
+        # Inspect every discarded record. Keep the newest whole records, even on the first pass
+        # over a much larger legacy log. The bounded tail also avoids a full-size temporary copy.
+        tail = bytearray()
+        offset = 0
+        while row := source.readline(LOG_ROW_BYTES + 1):
+            if not log_record(row):
+                return
+            if offset >= original.st_size - LOG_KEEP_BYTES:
+                tail.extend(row)
+            offset += len(row)
+            if offset > original.st_size:
+                return
+        if offset != original.st_size:
+            return
+        free_before = disk.free_bytes(path.parent)[0]
+        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".glaeda-idle-repair-", delete=False) as new:
+            temporary = Path(new.name)
+            try:
+                new.write(tail)
+                new.write(line)
+                new.flush()
+                os.fchmod(new.fileno(), stat.S_IMODE(original.st_mode) & 0o777)
+                os.fsync(new.fileno())
+                # The previous plist may already have opened the log before this job took run.lock.
+                if (disk.descriptor_holder_status(source.fileno()) != "clear"
+                        or log_identity(path.lstat()) != log_identity(original)):
+                    return
+                os.replace(temporary, path)
+                after = os.fstat(new.fileno())
+            finally:
+                temporary.unlink(missing_ok=True)
+    # Closing the unlinked source lets the filesystem release its blocks before observing free space.
+    append_receipt({"at": int(time.time()), "outcome": "log-compacted", "path": os.fspath(path),
+                    "logicalReleasedBytes": original.st_size - after.st_size,
+                    "allocatedReleasedBytes": (original.st_blocks - after.st_blocks) * 512,
+                    "physicalFreeDeltaBytes": disk.free_bytes(path.parent)[0] - free_before})
+
+
+def emit_state(value: dict[str, Any], scheduled: bool, disk: Any) -> None:
+    if not scheduled:
+        print(json.dumps({"schema": SCHEMA, **value}, separators=(",", ":")))
+        return
+    try:
+        write_scheduled_log(value, disk)
+    except (OSError, disk.NoEvidence) as error:
+        print(f"idle-repair log kept: {error}", file=sys.stderr)
 
 
 def run(argv: list[str], timeout: int) -> tuple[int, str, str]:
@@ -106,9 +251,13 @@ def main(argv: list[str] | None = None) -> int:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--apply", action="store_true", help="run queued repairs when the host is idle")
     mode.add_argument("--status", action="store_true", help="print the durable queue receipt")
+    parser.add_argument("--scheduled-log", action="store_true",
+                        help="write due queue changes to the bounded LaunchAgent log")
     args = parser.parse_args(argv)
     if args.status or not args.apply:
         return status()
+    if boot_hold() > 0:
+        return 0  # the host just came up: this job's first pass waits its boot spread (a later tick runs it)
 
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     with LOCK.open("a+") as handle:
@@ -124,7 +273,8 @@ def main(argv: list[str] | None = None) -> int:
         # loaded host repaired at its first idle minute instead of every 15 minutes.
         next_attempt = previous.get("nextAttemptAt")
         if isinstance(next_attempt, (int, float)) and next_attempt > now + DUE_SLACK_S:
-            print(json.dumps({"schema": SCHEMA, **previous}, separators=(",", ":")))
+            if not args.scheduled_log:
+                print(json.dumps({"schema": SCHEMA, **previous}, separators=(",", ":")))
             return 0
 
         disk = load_disk_module()
@@ -134,7 +284,7 @@ def main(argv: list[str] | None = None) -> int:
                      "lastAttemptAt": now, "nextAttemptAt": now + RETRY_AFTER_S}
             write_state(value)
             append_receipt({"at": now, "outcome": "queued", "reason": busy})
-            print(json.dumps({"schema": SCHEMA, **value}, separators=(",", ":")))
+            emit_state(value, args.scheduled_log, disk)
             return QUEUED_EXIT
 
         python = os.environ.get("GLAEDA_PYTHON", sys.executable)
@@ -166,7 +316,7 @@ def main(argv: list[str] | None = None) -> int:
                  "nextAttemptAt": now + wait, "actions": actions}
         write_state(value)
         append_receipt({"at": now, "outcome": "retry" if failed else "repaired", "actions": actions})
-        print(json.dumps({"schema": SCHEMA, **value}, separators=(",", ":")))
+        emit_state(value, args.scheduled_log, disk)
         return 1 if failed else 0
 
 

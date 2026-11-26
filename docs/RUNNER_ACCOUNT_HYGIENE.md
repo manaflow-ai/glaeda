@@ -111,3 +111,26 @@ recorded) is replaced; a plist edited by hand is still refused.
 Before removing a runner account or running `glaeda-mini-setup --uninstall`,
 uninstall its root job first with `--uninstall --apply`; the normal setup
 uninstall does not own or remove this separate LaunchDaemon.
+
+## Pool and dedicated runner accounts (no job of their own)
+
+A PR runner pool account (`runner.poolUser`) or a dedicated runner account has
+no `glaeda-disk` of its own and a 0700 home, so the fleet account's passes can
+neither size nor reclaim it, and its bytes showed as "accounting gap". Every
+`glaeda-disk --apply` pass that is not a runner hook's own pass (`--need`, or
+`GLAEDA_DISK_HOOK_PASS=1`) now also runs one pass in each such account, as that
+account (`sudo -n -u NAME -H`, never root): it copies its own bytes to
+`~NAME/.cache/glaeda-disk/runner-account/glaeda-disk` and runs it there with the
+same mode flags plus `--runner-account`. That pass acts only when the home has an
+enrolled glaeda runner (`actions-runner*/.runner` and `glaeda-hooks`); it takes
+that account's own evict lock and applies every normal veto, then reports the
+home's size, which the fleet account's accounting counts as measured (scope
+`runner-accounts`). A candidate is a non-admin account with uid >= 500 and a home
+directly in `/Users`, other than the caller, with no runner-hygiene job here (that
+account keeps the narrow profile above). Without passwordless sudo the account is
+listed as `not reached`. A host turns this off with `"runner_accounts": false` in
+its disk policy.
+
+```sh
+glaeda-disk --dead --apply    # then: runner account NAME: ran: reclaimed N, home M
+```

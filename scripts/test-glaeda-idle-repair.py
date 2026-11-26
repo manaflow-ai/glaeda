@@ -6,7 +6,9 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import json
+import os
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -126,6 +128,139 @@ class IdleRepairTest(unittest.TestCase):
             self.assertEqual(idle.main(["--status"]), 0)
         load.assert_not_called()
 
+    def test_scheduled_log_keeps_the_newest_whole_records_and_receipts_the_released_bytes(self) -> None:
+        path = idle.HOME / "Library/Logs/glaeda-idle-repair.jsonl"
+        path.parent.mkdir(parents=True)
+        rows = [json.dumps({"schema": idle.SCHEMA, "state": "idle", "actions": [], "lastAttemptAt": n,
+                            "nextAttemptAt": n + 900}).encode() + b"\n" for n in range(200)]
+        path.write_bytes(b"".join(rows))
+        prior = path.stat()
+        disk = mock.Mock()
+        disk.host_busy.return_value = "test build running"
+        source_descriptors = []
+
+        def witness(fd):
+            self.assertEqual(idle.log_identity(os.fstat(fd)), idle.log_identity(prior))
+            source_descriptors.append(fd)
+            return "clear"
+
+        def free_bytes(_parent):
+            if not source_descriptors:
+                return (1024, 8192)
+            with self.assertRaises(OSError):
+                os.fstat(source_descriptors[0])
+            return (5120, 8192)
+
+        disk.free_bytes.side_effect = free_bytes
+        with mock.patch.object(idle, "LOG_MAX_BYTES", 4096), mock.patch.object(idle, "LOG_KEEP_BYTES", 1024), \
+                mock.patch.object(disk, "descriptor_holder_status", side_effect=witness), \
+                mock.patch.object(idle, "load_disk_module", return_value=disk):
+            self.assertEqual(idle.main(["--apply", "--scheduled-log"]), idle.QUEUED_EXIT)
+            kept = path.read_bytes()
+            self.assertEqual(idle.main(["--apply", "--scheduled-log"]), 0)
+            self.assertEqual(path.read_bytes(), kept, "a not-due tick must not replay the last state")
+        lines = kept.splitlines(keepends=True)
+        self.assertLess(len(kept), 4096)
+        self.assertEqual(lines[:-1], rows[-len(lines) + 1:])
+        self.assertEqual(json.loads(lines[-1])["state"], "queued")
+        record = json.loads(idle.RECEIPT.read_bytes().splitlines()[-1])
+        after = path.stat()
+        self.assertEqual(record["outcome"], "log-compacted")
+        self.assertEqual(record["logicalReleasedBytes"], prior.st_size - after.st_size)
+        self.assertEqual(record["allocatedReleasedBytes"], (prior.st_blocks - after.st_blocks) * 512)
+        self.assertEqual(record["physicalFreeDeltaBytes"], 4096)
+
+    def test_only_log_reader_requires_complete_own_descriptor_witness(self) -> None:
+        path = idle.HOME / "log"
+        with mock.patch.dict(os.environ, {"GLAEDA_DISK": str(ROOT / "scripts/glaeda-disk")}):
+            disk = idle.load_disk_module()
+        with path.open("wb") as source, mock.patch.object(disk, "_owned_query_split") as probe:
+            fd = source.fileno()
+            st = os.fstat(fd)
+            node = f"tREG\nD{st.st_dev:#x}\ni{st.st_ino}\n"
+            own = f"p{os.getpid()}\nf{fd}\n{node}"
+            probe.return_value = 0, own + "p999999\nf1\nD0x0\ni1\n", ""
+            self.assertEqual(disk.descriptor_holder_status(fd), "clear")
+            self.assertEqual(probe.call_args.args[0][1:], ["-b", "-w", "-nP", "-FpfDit"])
+            for code, output, error, outcome in [(0, "", "", "blocked:lsof-incomplete"),
+                    (0, f"p{os.getpid()}\nf{fd}\n", "", "blocked:lsof-incomplete"),
+                    (0, own + f"f{fd + 1}\n{node}", "", "changed:in-use"),
+                    (0, own + f"f{fd + 1}\ntREG\nD{st.st_dev:#x}\n", "", "blocked:lsof-incomplete"),
+                    (0, own + f"p999999\nf1\n{node}", "", "changed:in-use"),
+                    (0, own, "lsof: partial listing\n", "blocked:lsof-incomplete"),
+                    (1, own, "", "blocked:lsof-incomplete")]:
+                with self.subTest(code=code, output=output, error=error):
+                    probe.return_value = code, output, error
+                    self.assertEqual(disk.descriptor_holder_status(fd), outcome)
+            for partial in [f"tREG\nD{st.st_dev:#x}\n", f"tREG\ni{st.st_ino}\n", "tREG\n", "",
+                            f"D{st.st_dev:#x}\n", f"i{st.st_ino}\n", f"D{st.st_dev:#x}\ni{st.st_ino}\n"]:
+                probe.return_value = 0, own + "p999999\nf1\n" + partial, ""
+                for native in ["blocked:lsof-incomplete", "changed:in-use", "clear"]:
+                    with self.subTest(partial=partial, native=native), \
+                            mock.patch.object(disk, "corroborate_descriptor_holders", return_value=native) as check:
+                        self.assertEqual(disk.descriptor_holder_status(fd), native)
+                        check.assert_called_once_with(fd)
+            # A different known inode or device rules out a match even when another field is missing.
+            probe.return_value = 0, own + f"p999999\nf1\ntREG\ni{st.st_ino + 1}\nf2\nD{st.st_dev + 1:#x}\n", ""
+            with mock.patch.object(disk, "corroborate_descriptor_holders") as check:
+                self.assertEqual(disk.descriptor_holder_status(fd), "clear")
+                check.assert_not_called()
+            own_pid = str(os.getpid())
+            with mock.patch.object(disk, "DARWIN", True), \
+                    mock.patch.object(disk.fcntl, "fcntl", return_value=os.fsencode(path) + b"\0"):
+                for result, outcome in [((0, own_pid, ""), "clear"),
+                        ((0, own_pid + " 999999", ""), "changed:in-use"),
+                        ((1, own_pid, ""), "blocked:lsof-incomplete"),
+                        ((0, "999999", ""), "blocked:lsof-incomplete"),
+                        ((0, "", ""), "blocked:lsof-incomplete"),
+                        ((0, own_pid, "warning"), "blocked:lsof-incomplete")]:
+                    with self.subTest(native_result=result):
+                        probe.return_value = result
+                        self.assertEqual(disk.corroborate_descriptor_holders(fd), outcome)
+            for failure, outcome in [(OSError(), "blocked:lsof-incomplete"),
+                                     (subprocess.TimeoutExpired("lsof", 10), "blocked:query-timeout")]:
+                probe.side_effect = failure
+                self.assertEqual(disk.descriptor_holder_status(fd), outcome)
+
+    def test_scheduled_log_keeps_foreign_mixed_linked_open_and_changing_legacy_files(self) -> None:
+        path = idle.HOME / "Library/Logs/glaeda-idle-repair.jsonl"
+        path.parent.mkdir(parents=True)
+        value = {"state": "idle", "actions": [], "lastAttemptAt": 1, "nextAttemptAt": 901}
+        row = (json.dumps({"schema": idle.SCHEMA, **value}) + "\n").encode()
+        disk = mock.Mock()
+        disk.free_bytes.return_value = (8192, 8192)
+        with mock.patch.object(idle, "LOG_MAX_BYTES", 1), mock.patch.object(idle, "LOG_KEEP_BYTES", 1), \
+                mock.patch.object(disk, "descriptor_holder_status", return_value="changed:in-use") as witness:
+            for raw in (b"someone else's log\n", row + b"someone else's log\n" + row, row.rstrip()):
+                path.write_bytes(raw)
+                idle.write_scheduled_log(value, disk)
+                self.assertEqual(path.read_bytes(), raw)
+            path.write_bytes(row)
+            other = path.parent / "existing-log"
+            os.link(path, other)
+            idle.write_scheduled_log(value, disk)
+            self.assertEqual(path.read_bytes(), row)
+            path.unlink()
+            path.symlink_to(other)
+            with self.assertRaises(OSError):
+                idle.write_scheduled_log(value, disk)
+            self.assertEqual(other.read_bytes(), row)
+            path.unlink()
+            path.write_bytes(row)
+            idle.write_scheduled_log(value, disk)
+            self.assertEqual(path.read_bytes(), row)
+
+            def late_write(_path):
+                with path.open("ab") as appender:
+                    appender.write(row)
+                return (8192, 8192)
+
+            witness.return_value = "clear"
+            disk.free_bytes.side_effect = late_write
+            idle.write_scheduled_log(value, disk)
+            self.assertEqual(path.read_bytes(), row * 2)
+        self.assertFalse(idle.RECEIPT.exists())
+
 
 class RunTest(unittest.TestCase):
     def test_timeout_stops_the_whole_process_group(self) -> None:
@@ -230,6 +365,46 @@ class LoadDiskModuleTest(unittest.TestCase):
                         missing.append(f"{name}:{i + 1}: sets sys.modules[...] with no `import sys` in scope")
         self.assertEqual(missing, [], "set sys.modules[loader.name] = module before loader.exec_module(module):\n"
                          + "\n".join(missing))
+
+
+class BootHoldTest(unittest.TestCase):
+    """cosmic-gray, 2026-11-24: after a panic every RunAtLoad job started in the same second (load 214). With
+    BOOT_SPREAD_S the first pass after boot or wake waits a fixed 0..S s, seeded by the launchd label and boot."""
+
+    def test_the_wait_is_fixed_per_label_and_boot_and_spreads_labels(self) -> None:
+        up = 1_800_000_000.0
+        env = {"BOOT_SPREAD_S": "300", "XPC_SERVICE_NAME": "com.teamleaderleo.glaeda.idle-repair"}
+        first = idle.boot_hold(env, now=up + 1, up=up)
+        self.assertGreater(first, 0)
+        self.assertLessEqual(first, 300)
+        self.assertAlmostEqual(idle.boot_hold(env, now=up + 11, up=up), max(0.0, first - 10), places=6)
+        self.assertEqual(idle.boot_hold(env, now=up + 301, up=up), 0.0, "past the spread it runs")
+        waits = {round(idle.boot_hold({**env, "XPC_SERVICE_NAME": f"l{i}"}, now=up, up=up)) for i in range(20)}
+        self.assertGreater(len(waits), 10, "labels land apart, not together")
+
+    def test_no_spread_an_unknown_boot_or_a_bad_value_waits_nothing(self) -> None:
+        up = 1_800_000_000.0
+        self.assertEqual(idle.boot_hold({}, now=up + 1, up=up), 0.0)
+        self.assertEqual(idle.boot_hold({"BOOT_SPREAD_S": "x"}, now=up + 1, up=up), 0.0)
+        self.assertEqual(idle.boot_hold({"BOOT_SPREAD_S": "300"}, now=up + 1, up=None), 0.0)
+        self.assertEqual(idle.boot_hold({"BOOT_SPREAD_S": "300"}, now=up - 5, up=up), 0.0)
+
+    def test_boot_and_wake_are_read_from_one_sysctl(self) -> None:
+        out = "{ sec = 1000, usec = 999999 } Tue\n{ sec = 5000, usec = 1 } Tue\n"
+        run = mock.Mock(return_value=mock.Mock(stdout=out))
+        with mock.patch.object(idle.sys, "platform", "darwin"):
+            self.assertEqual(idle.came_up_at(now=6000, run=run), 5000.0)
+            run.return_value = mock.Mock(stdout="{ sec = 1000, usec = 5 }\n{ sec = 0, usec = 0 }\n")
+            self.assertEqual(idle.came_up_at(now=6000, run=run), 1000.0, "a Mac that never slept: its boot")
+        self.assertEqual(run.call_count, 2)
+
+    def test_a_held_tick_exits_before_the_lock_or_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(idle, "STATE_DIR", Path(tmp) / "state"), \
+                mock.patch.object(idle, "boot_hold", return_value=42.0), \
+                mock.patch.object(idle, "load_disk_module", side_effect=AssertionError("loaded")):
+            self.assertEqual(idle.main(["--apply", "--scheduled-log"]), 0)
+            self.assertFalse((Path(tmp) / "state").exists())
 
 
 if __name__ == "__main__":

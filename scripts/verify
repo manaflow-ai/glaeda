@@ -310,6 +310,10 @@ def focused_phases() -> tuple[Phase, ...]:
     CI cycle. Measured twice on 2026-11-21, in two separate lanes, each for one word in a new
     comment: 13 minutes from job start to verdict, against 0.54 s here.
 
+    The three cargo phases are declared here but are skipped at run time when the diff against
+    origin/main cannot affect them -- see RUST_INERT_PREFIXES and skipped_phase_names. The plan
+    stays fixed; only the run follows the diff, and a skip always prints its basis.
+
     `scripts/test-fleet-rule-lints.py` compares the allowlist against a base only when
     FLEET_RULE_BASE is set (CI sets HEAD^1). Unset, as here, it checks the tree alone, which is the
     half that catches a new violation; the ratchet against the base stays CI's.
@@ -389,6 +393,122 @@ def phases_for(profile: str) -> tuple[Phase, ...]:
     if profile == "full-tests":
         return full_test_phases()
     return required_phases()
+
+
+# A changed path under one of these prefixes cannot affect any cargo phase of the `focused`
+# profile. That profile compiles (`cargo check --all-targets --all-features`), formats
+# (`cargo fmt --check`) and runs exactly one integration test (`--test repo_query_cli`). The
+# compile reads `*.rs` plus the files `include_str!`/`include_bytes!` names -- all of which live
+# under `src/`, `examples/` and `tests/fixtures/` -- the format reads `*.rs` and `rustfmt.toml`,
+# and `tests/repo_query_cli.rs` builds its own git fixtures in a temporary directory and reads no
+# repository file. Several *other* Rust tests do read `scripts/` and `docs/` at run time
+# (`tests/fleet_bundle_contract.rs`, `tests/module_inventory.rs`); `cargo check` only compiles
+# them, and `focused` never runs them, so they do not widen this list. The list is an allowlist,
+# not a denylist: anything not named here -- `src/`, `tests/`, `examples/`, `tools/`,
+# `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `rustfmt.toml`, `config/`, `ops/`,
+# `.github/`, `Makefile`, an unknown new top-level directory -- counts as Rust-affecting and runs
+# the cargo phases, because a wrong skip is far worse than a wasted phase.
+RUST_INERT_PREFIXES = ("docs/", "scripts/", "skills/", ".claude/")
+
+
+def rust_inert_path(path: str) -> bool:
+    if path.startswith(RUST_INERT_PREFIXES):
+        return True
+    return "/" not in path and path.endswith(".md")
+
+
+def diff_base(root: Path, git: str) -> str | None:
+    """The merge base of HEAD and the integration branch, or None when it cannot be read."""
+    for ref in ("origin/main", "main"):
+        merge_base = subprocess.run(
+            [git, "merge-base", "HEAD", ref],
+            cwd=root,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+        if merge_base.returncode == 0 and merge_base.stdout.strip():
+            return merge_base.stdout.strip()
+    return None
+
+
+def changed_paths(root: Path) -> tuple[list[str], str] | None:
+    """Every path this checkout changes against the integration branch, and what was read.
+
+    Returns None whenever the answer cannot be established -- no git, no `origin/main` or `main`,
+    a detached or unborn HEAD, an unreadable worktree. The caller then runs every phase, which is
+    what this script did unconditionally before 2026-11-23.
+    """
+    git = shutil.which("git")
+    if git is None:
+        return None
+    git = os.path.abspath(git)
+    base = diff_base(root, git)
+    if base is None:
+        return None
+    tracked = subprocess.run(
+        [git, "diff", "--no-ext-diff", "--name-only", base, "--"],
+        cwd=root,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    untracked = subprocess.run(
+        [git, "ls-files", "--others", "--exclude-standard"],
+        cwd=root,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    if tracked.returncode != 0 or untracked.returncode != 0:
+        return None
+    paths = sorted(
+        {line for line in tracked.stdout.splitlines() + untracked.stdout.splitlines() if line}
+    )
+    if not paths:
+        # An empty answer is indistinguishable here from "verifying the integration branch
+        # itself", where a reader expects the whole profile to run. Treat it as undetermined.
+        return None
+    return paths, f"`git diff --name-only {base[:12]}` plus untracked files"
+
+
+def rust_phase_skip_reason(root: Path) -> str | None:
+    """One line naming what was read, or None when the cargo phases must run."""
+    answer = changed_paths(root)
+    if answer is None:
+        return None
+    paths, basis = answer
+    if any(not rust_inert_path(path) for path in paths):
+        return None
+    shown = ", ".join(paths[:3]) + (f", +{len(paths) - 3} more" if len(paths) > 3 else "")
+    return (
+        "no *.rs, Cargo.toml or Cargo.lock in the diff vs origin/main, and nothing outside "
+        "docs/, scripts/, skills/, .claude/ or a top-level *.md: read "
+        f"{len(paths)} changed path(s) from {basis} ({shown})"
+    )
+
+
+def skipped_phase_names(profile: str, phases: tuple[Phase, ...], root: Path) -> dict[str, str]:
+    """Which phases the diff cannot affect, each mapped to the reason, naming what was read.
+
+    Only `focused` selects from the diff. `required` is the exact repository-required sequence and
+    must stay exact; `fast` and `full-tests` run on a workstation only when the owner asks for
+    them, and they are not where the loss was.
+    """
+    if profile != "focused":
+        return {}
+    if not any(phase.program == "cargo" for phase in phases):
+        return {}
+    reason = rust_phase_skip_reason(root)
+    if reason is None:
+        return {}
+    return {phase.name: reason for phase in phases if phase.program == "cargo"}
 
 
 def plan(profile: str) -> dict[str, object]:
@@ -620,6 +740,7 @@ def receipt_document(
     started_at_unix_millis: int,
     completed_at_unix_millis: int,
     resources: ChildResources,
+    skips: dict[str, str] | None = None,
 ) -> dict[str, object]:
     planned = plan(profile)
     plan_bytes = json.dumps(
@@ -644,6 +765,10 @@ def receipt_document(
             "digest": f"sha256:{hashlib.sha256(plan_bytes).hexdigest()}",
             "declared_phase_count": len(planned["phases"]),
             "executed_phase_count": len(observations),
+            "skipped_phases": [
+                {"name": name, "reason": reason}
+                for name, reason in sorted((skips or {}).items())
+            ],
         },
         "phases": [
             {
@@ -735,6 +860,7 @@ def run(
     resources_before = child_resources()
     observations: list[PhaseObservation] = []
     refused: list[str] = []
+    skips = skipped_phase_names(profile, phases, root)
     exit_code = 0
 
     print(f"Glaeda local verification: {profile}", file=sys.stderr)
@@ -748,6 +874,12 @@ def run(
 
     try:
         for index, phase in enumerate(phases, start=1):
+            if phase.name in skips:
+                print(
+                    f"[{index}/{len(phases)}] {phase.name}: skipped: {skips[phase.name]}",
+                    file=sys.stderr,
+                )
+                continue
             program = resolve_program(phase, root)
             phase_started = time.monotonic()
             phase_resources_before = child_resources()
@@ -797,6 +929,13 @@ def run(
         print(f"verification error: {error}", file=sys.stderr)
         exit_code = 2
 
+    if skips:
+        print(
+            f"skipped {len(skips)} phase(s) the diff cannot affect: {', '.join(sorted(skips))}; "
+            f"{next(iter(skips.values()))}",
+            file=sys.stderr,
+        )
+
     if refused:
         print(
             f"host policy refused {len(refused)} phase(s): {', '.join(refused)}; they ran nowhere, "
@@ -841,6 +980,7 @@ def run(
                     started_at_unix_millis=started_at_unix_millis,
                     completed_at_unix_millis=completed_at_unix_millis,
                     resources=resources,
+                    skips=skips,
                 ),
             )
         except RuntimeError as error:

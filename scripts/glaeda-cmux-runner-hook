@@ -579,6 +579,16 @@ WORKFLOW_JOB_CLASSES = {# the iOS reliability matrix's phone cells: cargo builds
                         # cmux-next-ios kit tests: swift test on the Mac, then xcodebuild test in one booted
                         # simulator; the picker sends it to the sim-first runner too.
                         ("cmux-next-ios-kit.yml", "kit-tests"): "simulator-step",
+                        # cmux's step table (pr-pipeline.yml, run by `ci/run`) is a reusable workflow, so its jobs
+                        # are keyed by the caller, pr-router.yml. `mac` (the fast tier's Swift suites in an
+                        # owned_spm_scratch lease) and `mac-fallback` (swift build of the canary targets in the
+                        # workspace) build only in their workspace: no canonical root, no kept DerivedData. `ios`
+                        # builds the FFI in its workspace and tests in one booted simulator. As unknown jobs they
+                        # were compiles and waited with no bound for persistent-dd: on 2026-11-25 every runner of
+                        # cmux18 sat busy 58 min ("waiting (3291 s so far) ... for persistent-dd; held by
+                        # persistent-dd: cmux18-glaeda-3") with the host's CPU idle.
+                        ("pr-router.yml", "mac"): "isolated", ("pr-router.yml", "mac-fallback"): "isolated",
+                        ("pr-router.yml", "ios"): "simulator-step",
                         # `cmux-ci test --setup kernel-free` on cmux: a checkout and a Python, git or shell command,
                         # no build in a canonical root; isolated, as hq's kernel-free fast checks are as a guest.
                         ("fast-checks.yml", "checks-mac"): "isolated",
@@ -770,6 +780,27 @@ FAST_JOBS = {("cmux-next.yml", "fast-tier")}
 # fleet-rd-host-macos.yml's check (advisory, cmux#43689) submits scripts/ci/cmux-tui-rust-check.sh rd-host
 # (cmux-ci run --class isolated --os macos) for a pull request that changes cmux-rd-host, and only greps the
 # client's log; it waits at most 80 min (20 min queue, 1 h run). Without it every run was refused here.
+# cmux-next-ios-try-ahead.yml's build-ahead (advisory) submits the cmux Dev device-app step try.sh asks for
+# (cmux-ci run --class simulator, lowest priority, the try.sh key) for each same-repository iPhone pull request head,
+# so a later try.sh N only downloads; it waits at most 300 min. Its first run, 45124160918 on cmux#51721, was refused here.
+# cmux-next-ios-gestures.yml's gestures (the gesture-conflict UI suite, cmux#52373; Leo, 2026-11-23: "there are no doubt
+# dozens of ... interactions like this which should've just very easily been caught") and
+# cmux-next-ios-keyboard-motion.yml's bench each submit one simulator step (cmux-ci run --class simulator
+# scripts/ci/cmux-next-ios-sim.sh) and wait for it. The gestures job's first run, 45314398918 on cmux#52373, was refused
+# here; keyboard-motion, on the same runner label and continue-on-error, was missing from this list as well.
+# cmux-next-ios-kit.yml's link-ffi-fleet submits the CmuxMobileLinkFFI xcframework build (cmux-ci ios-build --what ffi)
+# for kit-tests, reads the FFI key from a blobless sparse checkout of scripts/ci and moves the result into the Actions
+# cache and an artifact; it waits at most 40 min. Its first run, 45528332604 on cmux#55285, was refused here.
+# cmux-next-iphone-clips.yml's record (the What's New clips, on each nightly-next push), cmux-next-ios-energy-nightly.yml's
+# bench (the nightly iPhone energy bench), cmux-next-stress-bench.yml's measure and chief-evals.yml's fleet-ab each
+# submit fleet steps with cmux-ci and wait, with no build here, on the same vars.CI_EVAL_STEP_GATEWAY label. The first
+# two were refused here and sat red on base: runs 45640200901 (job 139296705888) and 45640201089 (job 139296423266).
+# The other two run on that label and were missing as well.
+# GATEWAY_FLEET_SUFFIX: that was the fourth client refused on its first run (gallery, try-ahead, gestures, this), each
+# fixed by one more pair here after a red. A home-repository job id that ends in -fleet is the client contract
+# cmux already names its thin clients by (app-compile-fleet, fast-tier-fleet, swift-test-fleet ...; the bare job that
+# builds on a Mac keeps the bare id and is refused), so such a job is admitted from any of its workflows with no
+# change here. GATEWAY_JOBS keeps the clients named before the contract.
 # GATEWAY_NO_HOST_LOCK: a gateway job takes no shared host.lock (take_capacity), so a fleet worker may claim the mini
 # while the client waits. Leo, 2026-11-17: "also fix the measurement queue so this never stalls again". At 23:52Z
 # cmux22, cmux23 and cmux17 were claim-paused runner_job at 1-8% CPU: their gateway jobs (hot-verify look) held
@@ -790,7 +821,20 @@ GATEWAY_JOBS = frozenset({("cmux-next.yml", "app-compile-fleet"), ("cmux-next.ym
                           ("cmux-next-tip-test-compile.yml", "compile"), ("cmux-next-perf-bench.yml", "bench"),
                           ("cu-driver-eval.yml", "eval"), ("screen-stream-eval.yml", "eval"),
                           ("native-sidebar-gallery.yml", "capture"), ("cmux-next-tab-switch.yml", "frames"),
-                          ("fleet-rd-host-macos.yml", "check")})
+                          ("fleet-rd-host-macos.yml", "check"), ("cmux-next-ios-try-ahead.yml", "build-ahead"),
+                          ("cmux-next-ios-gestures.yml", "gestures"), ("cmux-next-ios-keyboard-motion.yml", "bench"),
+                          ("cmux-next-iphone-clips.yml", "record"), ("cmux-next-ios-energy-nightly.yml", "bench"),
+                          ("cmux-next-stress-bench.yml", "measure"), ("chief-evals.yml", "fleet-ab")})
+GATEWAY_FLEET_SUFFIX = "-fleet"
+
+
+def gateway_job(workflow: str, job: str) -> bool:
+    """A thin cmux-ci client job: a GATEWAY_JOBS pair, or a job id ending in GATEWAY_FLEET_SUFFIX (the caller has
+    already refused a guest repository)."""
+    return (workflow, job) in GATEWAY_JOBS or (bool(workflow) and job.endswith(GATEWAY_FLEET_SUFFIX)
+                                               and len(job) > len(GATEWAY_FLEET_SUFFIX))
+
+
 GATEWAY_CAPACITY_WAIT_S = 600.0  # SIGNING_DRAIN_WAIT_S: the longest a nightly signing job waits here to drain the mini
 # exclusive (SIGNING_JOBS): more units than any mini has, so admission caps it at the mini's whole count, plus both
 # fast tokens and every gateway token, the capacity 0-unit jobs take (no PR client runs beside the key either), and
@@ -1523,18 +1567,58 @@ def full_disk_refusal(path: str, scope: "RunnerScope") -> str | None:
 
 
 def runner_jobs_refusal(free: float, in_flight: int, per_job_gib: float, source: str,
-                        written_gib: float = 0.0) -> str | None:
+                        written_gib: float = 0.0, extra_gib: float = 0.0) -> str | None:
     """Why an idle listener takes no job for disk with in_flight jobs running beside it (RUNNER_JOBS_DISK), or None.
-    written_gib is what the running jobs have already written of their p95 (RUNNER_JOB_WRITTEN): it is gone from free
-    disk already, so it is not reserved a second time."""
-    need = round(runner_jobs_need_gib(in_flight, per_job_gib) - written_gib, 1)
+    written_gib is what the running jobs have already written of their charge (RUNNER_JOB_WRITTEN): it is gone from
+    free disk already, so it is not reserved a second time. extra_gib is what the running jobs' own learned peaks add
+    over per_job_gib (RUNNER_JOBS_OWN_PEAK)."""
+    need = round(runner_jobs_need_gib(in_flight, per_job_gib) + extra_gib - written_gib, 1)
     if free >= need:
         return None
+    more = (f", plus {extra_gib:g} GiB more the running jobs' own learned peaks here want (RUNNER_JOBS_OWN_PEAK)"
+            if extra_gib > 0 else "")
     less = (f", less {written_gib:g} GiB the running jobs already wrote (RUNNER_JOB_WRITTEN)"
             if written_gib > 0 else "")
     return (f"{free:.1f} GiB free, {need:g} GiB required: {RUNNER_JOBS_FLOOR_GIB:g} GiB + {per_job_gib:g} GiB "
             f"for each of {in_flight} runner job{'s' if in_flight != 1 else ''} in flight (or listening first) and this one"
-            f"{less} ({RUNNER_JOB_DISK_NAME}: {source})")
+            f"{more}{less} ({RUNNER_JOB_DISK_NAME}: {source})")
+
+
+# RUNNER_JOBS_OWN_PEAK (ci-min-per-pr-140, 2026-11-24; Leo, 2026-11-21: "de facto, im asking for 99% fewer minutes of
+# ci time, period."). RUNNER_JOBS_HOLD charged every running job the fleet's flat p95 (5.3 GiB, every job of
+# 11-02..11-15, mostly light ones) and nothing once it had written that much, while cmux-next's fast tier, daemon tests
+# and Release compile each build a cold CmuxNext .build of tens of GiB. So a 228 GiB M6 mini kept listening with ten
+# such jobs in flight: cmux17 at 17:19Z 11-24 had 50.9 GiB free under 10 running jobs whose learned peaks summed to
+# ~300 GiB, took two more, and both failed "No space left on device" 46 minutes later (jobs 138467343240 and
+# 138473064477); cmux22, cmux17 and aws-m4pro-7 lost 9 of 1,635 sampled mini failures the same way in the 24 h
+# before. A running job is now charged the larger of that p95 and its own peak on this host (learned_job_peaks with
+# own_writes: runs alone, else what its runs wrote themselves, JOB_OWN_WRITTEN; never a free-disk drop beside other
+# jobs, which counts their writes too), still less what it already wrote. The hold stays what it was: the listener
+# takes no job until the disk fits, so the job goes to a runner with room; nothing is refused, and its off switch
+# (RUNNER_JOBS_HOLD_OFF_ENV, RUNNER_JOBS_HOLD_OFF_FILE) turns this off with it.
+def running_job_charges(home: Path, running: list[tuple[str, int]], per_job_gib: float,
+                        log: Path | None = None) -> dict[int, float]:
+    """{Runner.Worker pid: the disk that running job is charged}: the larger of per_job_gib and its job's own learned
+    peak here (RUNNER_JOBS_OWN_PEAK), its job being its runner's newest started line in the job log; per_job_gib for
+    a job with no such peak or on any error (the hold as before)."""
+    try:
+        records = job_log_tail(log)
+        peaks = learned_job_peaks(records, own_writes=True)
+        if not peaks:
+            return {}
+        latest: dict[str, dict[str, Any]] = {}
+        for record in records:
+            if record.get("event") == "started" and isinstance(runner := record.get("runner"), str) and runner:
+                latest[runner] = record
+        out: dict[int, float] = {}
+        for install, pid in running:
+            record = latest.get(runner_config(home / install)[0] or install)
+            key = _job_key(record) if record else None
+            if key is not None and key in peaks:
+                out[pid] = max(per_job_gib, peaks[key][0])
+        return out
+    except Exception:  # noqa: BLE001  a reading that fails charges the flat p95, as before
+        return {}
 
 
 # RUNNER_JOB_WRITTEN ("reservation counted twice"; Leo: "disk floors and probes warn, never refuse"). RUNNER_JOBS_DISK
@@ -2232,13 +2316,21 @@ def stack_slot_capacity_wait(cap: float | None, tier: str, nightly_runner: bool)
 # while the waiter it would have queued behind keeps its turn for the next units. Leo, 2026-11-22: "you guys cannot
 # afford to wait on improvements right now". Only a waiting nightly job (fair_turn) or a non-capacity hold refuses it.
 FAST_TIER_CAPACITY_WAIT_S = 60.0
+# GENERATED_FILES_WAIT: cmux-next.yml's generated files job has a 70-minute timeout-minutes that also counts its wait
+# in "Set up runner". On 2026-11-22 03-05Z eight of them ran out the 70 minutes, and the wait was most of each
+# (wait/build minutes: 69.9/0, 69.9/0, 57.7/11.4, 59.5/7.0, 53.5/15.5, 41.6/27.6, 39.2/25.4, 29.1/29.9), and 29% of
+# all generated-files minutes in 26 logged jobs (1185 min) were that wait. So it too waits this long at most and is
+# then admitted busy like the fast tier (FAST_TIER_BUSY): a refusal would only send its re-run back to the same label.
+GENERATED_FILES_CAPACITY_WAIT_S = 240.0
+BOUNDED_WAIT_JOBS = {("cmux-next.yml", "fast-tier"): FAST_TIER_CAPACITY_WAIT_S,
+                     ("cmux-next.yml", "generated-files"): GENERATED_FILES_CAPACITY_WAIT_S}
 
 
 def fast_tier_capacity_wait(repo: str | None, home_repo: str, workflow: str, job: str) -> float | None:
-    """FAST_TIER_CAPACITY_WAIT_S for the home repository's FAST_JOBS, else None (FAST_TIER_WAIT)."""
-    if repo is None or repo.lower() != home_repo.lower() or (workflow, job) not in FAST_JOBS:
+    """The home repository's BOUNDED_WAIT_JOBS bound, else None (FAST_TIER_WAIT, GENERATED_FILES_WAIT)."""
+    if repo is None or repo.lower() != home_repo.lower():
         return None
-    return FAST_TIER_CAPACITY_WAIT_S
+    return BOUNDED_WAIT_JOBS.get((workflow, job))
 
 
 def slot_capacity_wait(cap: float | None, dev_compile_runner: bool) -> float | None:
@@ -3253,8 +3345,11 @@ TRUSTED_EVENTS = ("push", "schedule")
 # let a dispatcher put main's code with their own inputs here; a new workflow for these runners is added here.
 HQ_DISPATCH_REPO = "manaflow-ai/cmuxterm-hq"
 HQ_DISPATCH_REF = "refs/heads/main"
+# The two probes take no inputs, and their dispatch on main routes here (runs-on: fleet_route_lan / hq-fleet-route when
+# vars.HQ_OWNED_DISPATCH is 'live'); left out, every dispatch was refused at setup (hq run 45270411254, 2026-11-23).
 HQ_DISPATCH_WORKFLOWS = ("fleet-reconciler-*", "fleet-selfheal.yml", "freestyle-runners.yml", "next-dogfood.yml",
-                         "synthetic-probes.yml", "synthetic-probes-environments-production.yml")
+                         "synthetic-probes.yml", "synthetic-probes-environments-production.yml",
+                         "screen-share-zero-touch-probe.yml", "new-tab-startup-probe.yml")
 
 
 def hq_dispatch_workflow(workflow_path: str) -> bool:
@@ -3412,6 +3507,14 @@ def trusted_refusal(event_name: str | None, ref: str | None, repository: str | N
         return ("untrusted: NEXT nightly needs its exact nightly.yml "
                 + " or ".join(filter(None, ("build-nightly-app push on attempt 1" if trusted_next_nightly else "",
                                             "signing job push or dispatch" if trusted_next_signing else ""))))
+    if trusted_next_signing and rc_nightly_push(event_name, ref, repository, event, workflow_ref):
+        # RC_NIGHTLY: an rc/* push of cmux's nightly.yml (Classic RC and the cmux-next RC). rc/* branches are
+        # admin-only on manaflow-ai/cmux (ruleset "rc branches: admin only"), so their nightly.yml is reviewed code
+        # like main's; the signing runner takes only nightly.yml's own signing jobs from it. Without this every rc/*
+        # run stopped at runner-preflight once the nightly left Blacksmith (cmux run 45582463917, 2026-11-25).
+        if ("nightly.yml", job) in SIGNING_JOBS:
+            return None
+        return "untrusted: an rc/* run takes this runner only for nightly.yml's signing jobs"
     if hq_dispatch:
         workflow_path, _, workflow_at = (workflow_ref or "").partition("@")
         if not (ref == trusted_ref and event.get("ref") == trusted_ref and workflow_at == trusted_ref
@@ -3514,6 +3617,21 @@ def dev_compile_refusal(event_name: str | None, ref: str | None, repository: str
 # admitted on a mini ahead of every PR, DEV and side job and may use any reserve, and no new PR job starts on a mini
 # where a nightly job waits."
 NIGHTLY_REFS = ("refs/heads/nightly-next", "refs/heads/main")
+# RC_NIGHTLY: cmux's release-candidate branches (rc/<name>), admin-only on manaflow-ai/cmux.
+RC_NIGHTLY_REF = re.compile(r"refs/heads/rc/[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*")
+
+
+def rc_nightly_push(event_name: str | None, ref: str | None, repository: str | None, event: Any,
+                    workflow_ref: str | None) -> bool:
+    """Whether this is a push to an rc/* branch of manaflow-ai/cmux running that same ref's own nightly.yml. Pure."""
+    if event_name != "push" or not isinstance(ref, str) or not RC_NIGHTLY_REF.fullmatch(ref) or ".." in ref:
+        return False
+    if not isinstance(event, dict) or any(key in event for key in UNTRUSTED_PAYLOAD_KEYS):
+        return False
+    repos = {(repository or "").lower(), (_repo_name(event.get("repository")) or "").lower()}
+    return repos == {"manaflow-ai/cmux"} and event.get("ref") == ref and workflow_ref == f"{NIGHTLY_WORKFLOW}@{ref}"
+
+
 NIGHTLY_EVENTS = ("push", "schedule", "workflow_dispatch")
 NIGHTLY_WORKFLOW = "manaflow-ai/cmux/.github/workflows/nightly.yml"
 DEV_DAILY_WORKFLOW_PATH = f"manaflow-ai/cmux/.github/workflows/{DEV_DAILY_WORKFLOW}"
@@ -3575,7 +3693,8 @@ def stack_blocker_tier(event_name: str | None, repository: str | None, event: An
 
 def gateway_jobs_note() -> str:
     """GATEWAY_JOBS for a refusal: "workflow job" pairs, sorted."""
-    return ", ".join(f"{workflow} {job}" for workflow, job in sorted(GATEWAY_JOBS))
+    return ", ".join([f"{workflow} {job}" for workflow, job in sorted(GATEWAY_JOBS)]
+                     + [f"any job id ending in {GATEWAY_FLEET_SUFFIX}"])
 
 
 # STACK_SLOT: the nightly slot also admits a stack-blocker PR job (TIER_STACK, stack_blocker_tier). FEED_FIRST ranks
@@ -6163,6 +6282,13 @@ def take_root(spec: str, wait_s: float, capacity_dir: Path, state_dir: Path, roo
         print(f"{PREFIX}: take-root: not inside a runner job (no Runner.Worker above this step)", file=sys.stderr)
         return 2
     deadline = time.monotonic() + max(0.0, wait_s)
+    try:  # a dedicated-only mini may have no ledger yet: its admission never took one
+        capacity_dir.mkdir(parents=True, exist_ok=True)
+        share_fleet_path(capacity_dir)
+    except OSError as error:
+        print(f"{PREFIX}: take-root: cannot open the capacity dir {capacity_dir} ({type(error).__name__})",
+              file=sys.stderr)
+        return 1
     want = capacity_dir / f"{name}.want-{os.getpid()}"
     try:
         while True:
@@ -8019,6 +8145,268 @@ def plain_side_runner(args: argparse.Namespace) -> bool:
             and not args.sim_runner and not args.small_runner)
 
 
+# SIDE_SEED_FREE: after SIDE_FAST_FIT the side minis admitted the fast tier, and it ran out its limit cold: 2026-11-22
+# 07:15-09:15Z against 03-05Z, cuts at >=19.5 min 17 -> 45, greens 17 -> 3. Its cut logs (cmux18-2 and cmux18-5, one
+# mini, 07:02-07:25Z) read "the seed root is busy ... taking a shared root" and built from scratch to the 20 minutes.
+# cmux's owned_spm_scratch.py seed_lease holds <root>/.cmux-seed-root.lock exclusive for the job; the second root
+# (cmux-2, glaeda-disk CMUX_SECOND_SEED_ROOT) is taken when the first is held. So on a plain side runner the fast tier
+# is refused, before it takes anything, when no seed root is free: the first held, and the second absent, not a seed
+# root (no .cmux-seed-root) or held. The refusal is not for capacity, so FAST_TIER_BUSY does not admit it; it costs
+# under a minute where the cold build cost the whole limit, and the rescue places the re-run again. The probe is
+# glaeda-disk's seed_root_held: exclusive, non-blocking, released at once; an unreadable lock counts as held.
+# Off switch: SIDE_SEED_FREE_OFF_ENV=1 in the runner's environment, or a SIDE_SEED_FREE_OFF_FILE in the capacity
+# ledger (touch it on the mini, live), admits the fast tier as before (SIDE_FAST_FIT, FAST_TIER_BUSY). Each refusal
+# logs "refused: seed root:", which the cut read counts.
+SIDE_SEED_FREE_OFF_ENV = "GLAEDA_SIDE_SEED_FREE_OFF"
+SIDE_SEED_FREE_OFF_FILE = "side-seed-free.off"
+CMUX_SEED_ROOTS = (Path("/Users/runner/_work/cmux"), Path("/Users/runner/_work/cmux-2"))
+SEED_ROOTS_ENV = "GLAEDA_CMUX_SEED_ROOTS"  # tests: os.pathsep-joined roots instead of CMUX_SEED_ROOTS
+SEED_ROOT_LOCK = ".cmux-seed-root.lock"  # owned_spm_scratch.SEED_LOCK
+SEED_ROOT_MARKER = ".cmux-seed-root"
+
+
+def seed_roots() -> tuple[Path, ...]:
+    raw = os.environ.get(SEED_ROOTS_ENV)
+    return tuple(Path(r) for r in raw.split(os.pathsep) if r) if raw else CMUX_SEED_ROOTS
+
+
+def seed_root_held(root: Path) -> bool:
+    """Whether a job holds this seed root's lock. No lock file: no job ever took it."""
+    try:
+        fd = os.open(root / SEED_ROOT_LOCK, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+    return False
+
+
+def seed_root_refusal(roots: tuple[Path, ...] | None = None, capacity_dir: Path | None = None) -> str | None:
+    """Why the fast tier would build cold on this mini (SIDE_SEED_FREE), or None when a seed root is free: the first
+    unheld, or a later one that is a seed root (its marker) and unheld. None too when its off switch is set."""
+    if (os.environ.get(SIDE_SEED_FREE_OFF_ENV) or "").strip() == "1":
+        return None
+    if capacity_dir is not None and (capacity_dir / SIDE_SEED_FREE_OFF_FILE).exists():
+        return None
+    roots = seed_roots() if roots is None else roots
+    if not roots:
+        return None
+    first, *rest = roots
+    if not seed_root_held(first):
+        return None
+    if any(r.is_dir() and not r.is_symlink() and (r / SEED_ROOT_MARKER).is_file() and not seed_root_held(r)
+           for r in rest):
+        return None
+    return (f"seed root: every fast-tier seed root here is held by another job ({', '.join(map(str, roots))}), so "
+            "this one would build cold past its limit (SIDE_SEED_FREE)")
+
+
+# SIDE_SEED_WAIT (2026-11-23): SIDE_SEED_FREE's refusal fails the job, and its re-run waits out the Mac queue (about
+# 40 min) again: after #2665 (11:25Z) 57-69% of the PR "cmux-next fast tier" jobs an hour were refused at setup, 12-18Z
+# 11-23 (controller timing feed; 26 of 30 sampled logs read SIDE_SEED_FREE), from 0-7% an hour 03-11Z. A seed root
+# frees when its job ends; a fast tier that runs takes 21 min p50 (1250 jobs, 11-22 12Z to 11-23 18Z), so with two
+# held, the first frees in about a third of that (7 min) on average, well inside the 40 min the re-run's queue costs.
+# So the side runner now waits for a free seed root, before it takes anything, at most SIDE_SEED_WAIT_S, and
+# is refused as before only past it. At most one waiter per seed root on a mini (SIDE_SEED_WAITER marker files in the
+# capacity ledger, each a live hook's pid): another waiter is refused at once, as before. A cancelled or gone job
+# gives the wait up. Each wait logs "SIDE_SEED_WAIT start" and one end line with its seconds and outcome.
+SIDE_SEED_WAIT = "SIDE_SEED_WAIT"
+SIDE_SEED_WAIT_S = 15 * 60.0
+SIDE_SEED_WAIT_ENV = "GLAEDA_SIDE_SEED_WAIT_S"  # another bound (tests; 0 refuses at once, as before)
+SIDE_SEED_POLL_S = 5.0
+SIDE_SEED_WAITER = "side-seed-waiter-"
+
+
+def side_seed_wait_bound() -> float:
+    raw = (os.environ.get(SIDE_SEED_WAIT_ENV) or "").strip()
+    try:
+        return max(0.0, float(raw)) if raw else SIDE_SEED_WAIT_S
+    except ValueError:
+        return SIDE_SEED_WAIT_S
+
+
+def side_seed_waiters(capacity_dir: Path) -> int:
+    """The live SIDE_SEED_WAIT waiters on this mini; a dead hook's marker is removed."""
+    n = 0
+    with contextlib.suppress(OSError):
+        for marker in capacity_dir.glob(SIDE_SEED_WAITER + "*"):
+            try:
+                pid = int(marker.name[len(SIDE_SEED_WAITER):])
+                os.kill(pid, 0)
+            except (ValueError, ProcessLookupError):
+                with contextlib.suppress(OSError):
+                    marker.unlink()
+                continue
+            except PermissionError:
+                pass
+            n += 1
+    return n
+
+
+def side_seed_wait(why: str, capacity_dir: Path | None, gone: Callable[[], str | None],
+                   roots: tuple[Path, ...] | None = None, bound: float | None = None,
+                   poll: float = SIDE_SEED_POLL_S, cold_room: float | None = None) -> tuple[str | None, str | None]:
+    """SIDE_SEED_WAIT: wait for a free seed root. Returns (refusal, None) past the bound or with every waiter slot
+    taken, (None, cause) when gone() names a cause to give up, and (None, None) once a seed root is free. With
+    cold_room (SIDE_SEED_LIMIT: the seconds the job may still wait and then build cold inside its limit) it waits
+    at most that long too, and past it, or with every slot taken, is admitted to build cold, not refused."""
+    bound = side_seed_wait_bound() if bound is None else bound
+    slots = len(seed_roots() if roots is None else roots)
+    past = (why, None) if cold_room is None else (None, None)
+    if cold_room is not None:
+        bound = min(bound, max(0.0, cold_room))
+    if bound <= 0 or capacity_dir is None:
+        if cold_room is not None:
+            print(f"{PREFIX}: {SIDE_SEED_WAIT} skip: a cold build fits this job's limit; admitted cold", flush=True)
+        return past
+    if side_seed_waiters(capacity_dir) >= slots:
+        print(f"{PREFIX}: {SIDE_SEED_WAIT} skip: {slots} waiter(s) already wait for a seed root here"
+              + ("; a cold build fits this job's limit, admitted cold" if cold_room is not None else ""), flush=True)
+        return past
+    marker = capacity_dir / f"{SIDE_SEED_WAITER}{os.getpid()}"
+    start = time.monotonic()
+    print(f"{PREFIX}: {SIDE_SEED_WAIT} start: every seed root is held; waiting at most {bound:g} s for one to free "
+          + ("before it builds cold inside its limit" if cold_room is not None else
+             "instead of refusing (a re-run waits out the Mac queue again)"), flush=True)
+    outcome, result = ("refused", past) if cold_room is None else ("cold", past)
+    try:
+        with contextlib.suppress(OSError):
+            capacity_dir.mkdir(parents=True, exist_ok=True)
+            marker.touch()
+        while True:
+            cause = gone()
+            if cause:
+                outcome, result = "abandoned", (None, cause)
+                break
+            if seed_root_refusal(roots, capacity_dir) is None:
+                outcome, result = "free", (None, None)
+                break
+            left = bound - (time.monotonic() - start)
+            if left <= 0:
+                break
+            time.sleep(min(poll, left))
+    finally:
+        with contextlib.suppress(OSError):
+            marker.unlink()
+        print(f"{PREFIX}: {SIDE_SEED_WAIT} end: {outcome} after {time.monotonic() - start:.0f} s", flush=True)
+    return result
+
+
+# SIDE_SEED_LIMIT (2026-11-23): SIDE_SEED_FREE assumed the fast tier's ~20 min limit, which a cold build always ran
+# out. cmux#50862 raised it: cmux-next.yml's fast-tier timeout-minutes is 5 when the build fleet already gave a verdict
+# (the job only reports it and builds nothing), 35 when that verdict is "queued", 50 for an ffi_repin route, else 120.
+# Measured 18:14-22:06Z 11-23 (cmuxterm-hq docs/findings/2026-11-23-fast-tier-build-spread.md): 7 of the 12 PR fast
+# tiers that ran were refused at "Set up runner" by SIDE_SEED_FREE, while the 3 admitted cold (4 cores, a shared root)
+# built in 37-53 min and finished their jobs in 41-57 min, inside 120; a refusal costs a ~40 min re-queue plus up to
+# 15 min of SIDE_SEED_WAIT. So the refusal now holds only when a cold build cannot fit this job's own limit.
+# The runner gives a job's hooks no job env and no timeout (the server enforces it; the job message carries none), but
+# the Worker logs the job message, with its evaluated needs context, to _diag/Worker_*.log before any step: the hook
+# reads needs.fast-tier-fleet and needs.path_route there and applies cmux's timeout-minutes rule (FAST_TIER_LIMIT_RULE
+# names it; it must change with cmux-next.yml's). A job that builds nothing is admitted at once. With room for
+# SIDE_SEED_COLD_S after the time it has run, it waits for a seed root (SIDE_SEED_WAIT) only within that room and then
+# builds cold. Anything it cannot read (no log, another job's log, no needs) keeps SIDE_SEED_FREE's refusal as before.
+# Off switch: SIDE_SEED_LIMIT_OFF_ENV=1, or a SIDE_SEED_LIMIT_OFF_FILE in the capacity ledger, refuses as before.
+SIDE_SEED_LIMIT = "SIDE_SEED_LIMIT"
+SIDE_SEED_COLD_S = 60 * 60.0  # the slowest cold fast-tier job measured, 57.4 min, and a margin
+SIDE_SEED_LIMIT_OFF_ENV = "GLAEDA_SIDE_SEED_LIMIT_OFF"
+SIDE_SEED_LIMIT_OFF_FILE = "side-seed-limit.off"
+JOB_DIAG_ENV = "GLAEDA_JOB_DIAG_DIR"  # tests: the _diag directory instead of the job's runner's
+WORKER_JOB_MESSAGE = "Job message:"
+WORKER_LOG_HEAD = 16 * 1024 * 1024  # the job message is logged first; a large workflow's is a few MiB at most
+FAST_TIER_LIMIT_RULE = ("cmux-next.yml", "fast-tier")
+FLEET_DONE = ("success", "failure", "cancelled")
+
+
+def worker_job_message(diag: Path) -> tuple[dict[str, Any], float] | None:
+    """The job message the newest _diag/Worker_*.log starts with, and the epoch of that log's first line, or None."""
+    try:
+        names = sorted(n for n in os.listdir(diag) if n.startswith("Worker_") and n.endswith(".log"))
+        if not names:
+            return None
+        with open(diag / names[-1], "rb") as file:
+            head = file.read(WORKER_LOG_HEAD).decode("utf-8", "replace")
+    except OSError:
+        return None
+    stamp = DIAG_STAMP.match(head)
+    at = head.find(WORKER_JOB_MESSAGE)
+    start = head.find("{", at) if at >= 0 else -1
+    if stamp is None or start < 0:
+        return None
+    try:
+        message, _ = json.JSONDecoder().raw_decode(head, start)
+        started = datetime.datetime.strptime(stamp.group(1), "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=datetime.timezone.utc).timestamp()
+    except ValueError:
+        return None
+    return (message, started) if isinstance(message, dict) else None
+
+
+def context_get(data: Any, key: str) -> Any:
+    """One key of a serialized PipelineContextData dictionary ({"t": 2 or 5, "d": [{"k", "v"}]}), or None."""
+    if isinstance(data, dict) and data.get("t") in (2, 5):
+        for pair in data.get("d") or ():
+            if isinstance(pair, dict) and pair.get("k") == key:
+                return pair.get("v")
+    return None
+
+
+def fast_tier_limit(message: Mapping[str, Any]) -> tuple[int, bool] | None:
+    """(timeout-minutes, whether it builds) of cmux-next.yml's fast tier from its job message's needs context, or
+    None when this is not that job or its needs do not read as expected. cmux-next.yml's rule, verbatim:
+    fleet done and verdict != queued: 5 (report only); verdict == queued: 35; ffi_repin: 50; else 120."""
+    context = next((v for k, v in message.items() if k.lower() == "contextdata"), None)
+    if not isinstance(context, dict):
+        return None
+    github = context.get("github")
+    for key, env in (("job", "GITHUB_JOB"), ("run_id", "GITHUB_RUN_ID")):
+        want = os.environ.get(env)
+        if want and context_get(github, key) != want:
+            return None  # another job's log
+    needs = context.get("needs")
+    fleet, route = context_get(needs, "fast-tier-fleet"), context_get(needs, "path_route")
+    if not isinstance(fleet, dict) or not isinstance(route, dict):
+        return None
+    verdict = context_get(context_get(fleet, "outputs"), "verdict") or ""
+    if context_get(fleet, "result") in FLEET_DONE and verdict != "queued":
+        return 5, False
+    if verdict == "queued":
+        return 35, True
+    return (50 if context_get(context_get(route, "outputs"), "ffi_repin") == "true" else 120), True
+
+
+def side_seed_cold_room(workflow: str, job: str, runner_dir: Path | None, capacity_dir: Path | None,
+                        now: float | None = None) -> tuple[float | None, str]:
+    """SIDE_SEED_LIMIT: (the seconds this fast tier may still wait for a seed root and then build cold inside its
+    limit, or None when it cannot or that is unknown; a note for the log). inf: it builds nothing."""
+    if (os.environ.get(SIDE_SEED_LIMIT_OFF_ENV) or "").strip() == "1" or (
+            capacity_dir is not None and (capacity_dir / SIDE_SEED_LIMIT_OFF_FILE).exists()):
+        return None, f"{SIDE_SEED_LIMIT} off: refused as before"
+    if (workflow, job) != FAST_TIER_LIMIT_RULE:
+        return None, f"{SIDE_SEED_LIMIT}: no limit rule for this job"
+    raw = os.environ.get(JOB_DIAG_ENV)
+    diag = Path(raw) if raw else runner_dir / "_diag" if runner_dir is not None else None
+    read = worker_job_message(diag) if diag is not None else None
+    limit = fast_tier_limit(read[0]) if read is not None else None
+    if read is None or limit is None:
+        return None, f"{SIDE_SEED_LIMIT}: this job's limit is unreadable (no job message with its needs)"
+    minutes, builds = limit
+    if not builds:
+        return math.inf, f"{SIDE_SEED_LIMIT}: its {minutes} min limit only reports the build fleet's verdict"
+    ran = max(0.0, (time.time() if now is None else now) - read[1])
+    room = minutes * 60 - ran - SIDE_SEED_COLD_S
+    if room < 0:
+        return None, (f"{SIDE_SEED_LIMIT}: a cold build ({SIDE_SEED_COLD_S / 60:g} min) does not fit its {minutes} min "
+                      f"limit after {ran / 60:.0f} min")
+    return room, (f"{SIDE_SEED_LIMIT}: a cold build ({SIDE_SEED_COLD_S / 60:g} min) fits its {minutes} min limit "
+                  f"after {ran / 60:.0f} min; {room:.0f} s to wait for a seed root first")
+
+
 def side_fit_units(scope: RunnerScope) -> int:
     """The units a plain side runner (no root, gui, session, fast, freshness, nightly or dedicated role) listens
     with room for: the costliest of SIDE_FIT_JOBS. On a host that reads measured needs (CAPACITY_ARITHMETIC) it is
@@ -8102,6 +8490,195 @@ LISTEN_CLAIM_HANDOFF_S = 30.0
 # next job about 2 s after the last ended, before the gate's next look (24% of 10-27's admission wait, 39% after the
 # side fit in #1715: a fast tier cancelled at 05:38:29Z, the next one taken at 05:38:31Z waited 23 minutes).
 JOB_ENDING = ".job-ending"
+
+# DRAIN_FREEZE_AT_END (2026-11-25): under RUNNER_DRAIN, job-completed itself freezes (SIGSTOP) the listener, while the
+# job's Runner.Worker still runs, so the listener cannot take the next job in the moment its Worker exits. The gate's
+# JOB_END_FREEZE wakes at that exit and freezes the listener then, which is a race with the listener's own reaction to
+# the same exit: glaeda#2809 moved the freeze ahead of the gate's /bin/ps look, but on a lent mini at load 100+ the
+# gate process can still be scheduled after the listener (a lent mini, 2026-11-25 19:59-20:03Z: runners took new
+# PR jobs 1-3 s after the last one ended under cmux-ci's RUNNER_DRAIN marker; 36 holds in 24 h started 0 steps).
+# job-completed runs inside the job, before the Worker's exit, so its freeze comes first by construction. Only the
+# Worker's own parent is frozen, and only when its command is this runner's Runner.Listener. The hook leaves
+# JOB_END_FROZEN (the listener, the Worker and its request) for the gate, which takes the frozen listener over once the
+# Worker has exited (Gate.adopt_job_end_freeze: the same state its own JOB_END_FREEZE leaves, so it stops the listener
+# or thaws it on that poll). A detached backstop (JOB_END_THAW) thaws a listener no gate took over within
+# JOB_END_THAW_ADOPT_S of the Worker's exit, and any listener still frozen JOB_END_THAW_WAIT_S after the hook, so the
+# listener never stays frozen past the job lock's renewal (a frozen listener renews nothing).
+JOB_END_FROZEN = ".job-end-frozen"
+JOB_END_THAW_WAIT_S = 240.0
+JOB_END_THAW_ADOPT_S = 30.0
+JOB_END_FROZEN_MAX_BYTES = 4096
+# The backstop, run detached with RUNNER_TRACKING_ID dropped (the runner's orphan cleanup must not end it): argv is
+# marker, listener pid, Worker pid, the wait for the Worker, the wait for the gate. It thaws only a listener the marker
+# still names, so it never signals a listener the gate took over (the gate removes the marker as it does).
+JOB_END_THAW = r"""
+import json, os, select, signal, subprocess, sys, time
+marker, listener, worker = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+wait_s, adopt_s = float(sys.argv[4]), float(sys.argv[5])
+def ours():
+    try:
+        with open(marker) as file:
+            return json.loads(file.read(4096)).get("listener") == listener
+    except Exception:
+        return False
+def ended():
+    try:
+        os.kill(worker, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    try:
+        stat = subprocess.run(["/bin/ps", "-o", "stat=", "-p", str(worker)], stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=5, check=False).stdout.strip()
+    except Exception:
+        return False
+    return stat == "" or stat.startswith("Z")
+deadline = time.monotonic() + wait_s
+kq = None
+try:
+    kq = select.kqueue()
+    kq.control([select.kevent(worker, filter=select.KQ_FILTER_PROC, flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                              fflags=select.KQ_NOTE_EXIT)], 0, 0)
+except Exception:
+    kq = None
+while ours() and not ended() and time.monotonic() < deadline:
+    if kq is not None:
+        try:
+            kq.control(None, 1, min(5.0, max(0.0, deadline - time.monotonic())))
+        except Exception:
+            time.sleep(2)
+    else:
+        time.sleep(2)
+deadline = time.monotonic() + adopt_s
+while ours() and time.monotonic() < deadline:
+    time.sleep(0.5)
+if ours():
+    try:
+        os.unlink(marker)
+    except OSError:
+        pass
+    try:
+        os.kill(listener, signal.SIGCONT)
+    except OSError:
+        pass
+"""
+
+
+def job_end_frozen_doc(marker: Path) -> dict[str, Any] | None:
+    """JOB_END_FROZEN's record ({listener, worker, request, at}), or None: none, unreadable, or not that shape. A
+    job runs as this user, so the read is bounded the way runner_drain_doc's is. Never raises."""
+    try:
+        fd = os.open(marker, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        data = os.read(fd, JOB_END_FROZEN_MAX_BYTES + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    try:
+        doc = json.loads(data) if len(data) <= JOB_END_FROZEN_MAX_BYTES else None
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    listener, worker = doc.get("listener"), doc.get("worker")
+    if not (type(listener) is int and type(worker) is int and listener > 1 and worker > 1):
+        return None
+    return doc
+
+
+def runner_listener_of(runner_dir: Path, worker: int) -> int | None:
+    """The Runner.Listener of runner_dir that is the Worker's parent, or None. Two /bin/ps reads, never the job's
+    PATH; a failed read is None (nothing is frozen)."""
+    try:
+        ppid = int(subprocess.run(["/bin/ps", "-o", "ppid=", "-p", str(worker)], stdin=subprocess.DEVNULL,
+                                  capture_output=True, text=True, timeout=5, check=False).stdout.strip())
+        command = subprocess.run(["/bin/ps", "-o", "command=", "-p", str(ppid)], stdin=subprocess.DEVNULL,
+                                 capture_output=True, text=True, timeout=5, check=False).stdout.strip()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return ppid if ppid > 1 and runner_worker(runner_dir, command, "Listener") else None
+
+
+def freeze_listener_at_job_end(hook_dir: Path, worker: int | None, now: float | None = None) -> str | None:
+    """job-completed, last (DRAIN_FREEZE_AT_END): when this runner carries a live RUNNER_DRAIN, freeze its listener
+    before the Worker exits, record it for the gate (JOB_END_FROZEN) and start the backstop thaw. A note, or None
+    when nothing was frozen. Never raises: a freeze that cannot be made leaves the gate's own JOB_END_FREEZE."""
+    try:
+        runner_dir = hook_dir.parent
+        if worker is None or runner_drain(runner_dir, time.time() if now is None else now) is None:
+            return None
+        listener = runner_listener_of(runner_dir, worker)
+        if listener is None:
+            return None
+        request = None
+        with contextlib.suppress(OSError, ValueError):
+            request = listener_request(runner_dir)
+        marker = hook_dir / JOB_END_FROZEN
+        tmp = hook_dir / f"{JOB_END_FROZEN}.{os.getpid()}.tmp"
+        tmp.write_text(json.dumps({"listener": listener, "worker": worker, "request": request,
+                                   "at": round(time.time(), 3)}, separators=(",", ":")))
+        os.replace(tmp, marker)  # the record first: a gate never meets a frozen listener it has no record of
+        try:
+            os.kill(listener, signal.SIGSTOP)
+        except OSError as error:
+            with contextlib.suppress(OSError):
+                marker.unlink()
+            return f"could not freeze the listener (pid {listener}) at the job's end: {type(error).__name__}"
+        backstop = job_end_thaw_detached(marker, listener, worker)
+        return (f"froze the listener (pid {listener}) before its Worker exits: the runner is draining, so it takes "
+                f"no next job; the listener gate stops it ({backstop})")
+    except Exception as error:  # noqa: BLE001  (never fail the job on the drain's freeze)
+        return f"no freeze at the job's end: {type(error).__name__}"
+
+
+def job_end_thaw_detached(marker: Path, listener: int, worker: int) -> str:
+    """Start JOB_END_THAW detached (out of the runner's session, RUNNER_TRACKING_ID dropped, every inherited fd
+    closed), as disk_pressure_detached starts its pass. On a failed start, thaws the listener at once and removes the
+    marker: a frozen listener with no backstop would rely on the gate alone. Returns a note."""
+    env = {key: value for key, value in os.environ.items() if key != "RUNNER_TRACKING_ID"}
+    argv = [sys.executable, "-c", JOB_END_THAW, os.fspath(marker), str(listener), str(worker),
+            f"{JOB_END_THAW_WAIT_S:g}", f"{JOB_END_THAW_ADOPT_S:g}"]
+    try:
+        child = os.fork()
+    except OSError:
+        with contextlib.suppress(OSError):
+            marker.unlink()
+        with contextlib.suppress(OSError):
+            os.kill(listener, signal.SIGCONT)
+        return "no backstop could start, so the listener was thawed at once"
+    if child == 0:
+        try:
+            os.setsid()
+            with contextlib.suppress(OSError):
+                os.chdir("/")
+            # the middle process exits only once the backstop has exec'd (the close-on-exec end reads EOF), so no
+            # process with this job's RUNNER_TRACKING_ID is left for the runner's orphan cleanup
+            execd, execing = os.pipe()  # both close-on-exec
+            if os.fork():
+                os.close(execing)
+                with contextlib.suppress(OSError):
+                    select.select([execd], [], [], 10)
+                os._exit(0)
+            os.close(execd)
+            null = os.open(os.devnull, os.O_RDWR)
+            for std in (0, 1, 2):  # the runner reads the hook's output until EOF
+                os.dup2(null, std)
+            limit = os.sysconf("SC_OPEN_MAX")
+            limit = limit if limit > 0 else 65536
+            os.closerange(3, execing)
+            os.closerange(execing + 1, limit)
+            os.execve(sys.executable, argv, env)
+        finally:
+            os._exit(0)
+    with contextlib.suppress(OSError):
+        os.waitpid(child, 0)
+    return f"a backstop thaws it if no gate does within {JOB_END_THAW_ADOPT_S:g} s of the Worker's exit"
 
 
 def claims_room(scope: RunnerScope) -> bool:
@@ -8197,8 +8774,10 @@ def exclusive_claim(capacity_dir: Path) -> str | None:
         for waiter in admission_waiters(capacity_dir):
             if waiter.get("class") == EXCLUSIVE_CLASS:
                 return f"a signing job waits for this mini to drain ({waiter.get('who') or 'pid ' + str(waiter['pid'])})"
+    # every token the exclusive class takes (CLASS_COST), not the gateway tokens alone: six ordinary gateway jobs on
+    # six gateway runners hold all of those at once (glaeda#1974 review F1), and they are no signing job
     if all((capacity_dir / f"{token}.token").exists() and not probe(capacity_dir / f"{token}.token")
-           for token in GATEWAY_TOKENS):
+           for token in CLASS_COST[EXCLUSIVE_CLASS][1]):
         return "a signing job holds this mini (every unit and token)"
     return None
 
@@ -10215,31 +10794,52 @@ def drain_backfill(state_dir: Path, runner: str | None, since: float | None, now
 # while it runs, only within job-started's one disk budget (DISK_RECLAIM_WAIT_S, disk_deadline); then the job starts
 # whatever was freed. It never refuses and never fails a job (DISK_RECLAIM_NOW, 2026-11-18: disk floors never refuse
 # or pause work), and a nightly job, which goes first on disk (NIGHTLY_DISK_RESERVE), is not held.
+# JOB_OWN_WRITTEN (ci-min-per-pr-140, 2026-11-24): a completed line also carries disk_written_gib, the most its sampler
+# measured the job itself write (RUNNER_JOB_WRITTEN: its runner's _work and owned SwiftPM scratch, capped by its own
+# free-disk drop). Unlike start minus min free disk it counts no neighbour's bytes, so on a busy mini, where a job
+# never runs alone, it is still that job's own need. learned_job_peaks(own_writes=True) takes it (kind "own") where a
+# job has too few solo runs; job-started's warning and JOB_DISK_OWN_NEED's refusal read peaks as before.
+JOB_OWN_WRITTEN_FIELD = "disk_written_gib"
 JOB_PEAK_MIN_SAMPLES = 3
 JOB_PEAK_RECENT = 20
 JOB_PEAK_MAX_GIB = RUNNER_JOB_DISK_MAX_GIB
 
 
-def learned_job_peaks(records: list[dict[str, Any]]) -> dict[str, tuple[float, str]]:
+def learned_job_peaks(records: list[dict[str, Any]], alone_only: bool = False,
+                      own_writes: bool = False) -> dict[str, tuple[float, str]]:
     """{job key: (its learned peak in GiB, where it came from)} from job-log records (job_log_tail), for each job with
-    at least JOB_PEAK_MIN_SAMPLES completed runs that read free disk at start and at its lowest."""
+    at least JOB_PEAK_MIN_SAMPLES completed runs that read free disk at start and at its lowest. alone_only keeps only
+    the peaks learned from runs with no other runner job beside them (JOB_OWN_NEED_ALONE), never the fallback over
+    every run, whose free-disk drop counts the neighbours' writes too. own_writes (JOB_OWN_WRITTEN, the listener's
+    RUNNER_JOBS_HOLD) keeps those and, for a job with too few solo runs, the p90 of what its runs wrote themselves."""
     runs: dict[str, list[tuple[float, bool]]] = {}
+    own: dict[str, list[float]] = {}  # JOB_OWN_WRITTEN: what each run wrote itself, beside other jobs or not
     for record in records:
         if record.get("event") != "completed" or not (key := _job_key(record)):
             continue
+        wrote = record.get(JOB_OWN_WRITTEN_FIELD)
+        if isinstance(wrote, (int, float)) and not isinstance(wrote, bool) and math.isfinite(wrote) and wrote >= 0:
+            own.setdefault(key, []).append(float(wrote))
         start, low = record.get("disk_free_start_gib"), record.get("disk_free_min_gib")
         if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in (start, low)):
             continue
         runs.setdefault(key, []).append((max(0.0, float(start) - float(low)), record.get("other_runner_jobs") == []))
     peaks: dict[str, tuple[float, str]] = {}
-    for key, rows in runs.items():
-        rows = rows[-JOB_PEAK_RECENT:]
+    for key in {*runs, *own}:
+        rows = runs.get(key, [])[-JOB_PEAK_RECENT:]
+        written = own.get(key, [])[-JOB_PEAK_RECENT:]
         alone = [growth for growth, solo in rows if solo]
-        values, kind = (alone, "alone") if len(alone) >= JOB_PEAK_MIN_SAMPLES else ([g for g, _ in rows], "any")
-        if len(values) < JOB_PEAK_MIN_SAMPLES:
+        if len(alone) >= JOB_PEAK_MIN_SAMPLES:
+            values, kind = alone, "alone"
+        elif own_writes and len(written) >= JOB_PEAK_MIN_SAMPLES:
+            values, kind = written, "own"  # its own writes: no neighbour's bytes in it, so a need like a solo run's
+        else:
+            values, kind = [g for g, _ in rows], "any"
+        if len(values) < JOB_PEAK_MIN_SAMPLES or ((alone_only or own_writes) and kind == "any"):
             continue
         peak = min(JOB_PEAK_MAX_GIB, math.ceil(round(_p90(values) * 10, 6)) / 10)
-        peaks[key] = (peak, f"p90 of {len(values)} runs here{' alone' if kind == 'alone' else ''}")
+        peaks[key] = (peak, f"p90 of {len(values)} runs here"
+                            + {"alone": " alone", "own": ", its own writes", "any": ""}[kind])
     return peaks
 
 
@@ -10326,17 +10926,16 @@ def job_disk_own_refusal(path: str, key: str | None, log: Path | None = None,
         free = free_or_none(path)
         if free is None:
             return None
-        peaks = learned_job_peaks(job_log_tail(log))
+        peaks = learned_job_peaks(job_log_tail(log), alone_only=True)
         if key is None or key not in peaks:
-            return None  # no history here: the flat default is a guess, not this job's need
+            # no history here (the flat default is a guess), or a peak learned only beside other jobs: not its need
+            return None
         own, source = peaks[key]
-        # JOB_OWN_NEED_ALONE: only a peak this job wrote by itself (learned_job_peaks' "alone") is its own need. The
+        # JOB_OWN_NEED_ALONE: only a peak this job wrote by itself (learned_job_peaks alone_only) is its own need. The
         # fallback p90 over every run measures free_start - free_min, which counts the jobs writing beside it: a fast
         # tier learned 54.7 GiB ("p90 of 20 runs here", 2026-11-22 22:02Z, refused at 17.2 GiB free on cmux23 against a
         # fleet-measured 5.3 GiB p95 per job), a need no carrier of its label had, so the rescue's re-runs never
         # found a runner. Such a peak stays the in-flight warning (job_disk_peak_hold) and never refuses.
-        if not source.endswith(" alone"):
-            return None
         need = round(RUNNER_JOBS_FLOOR_GIB + own, 1)
         if free >= need:
             return None
@@ -11094,7 +11693,7 @@ class Gate:
         if why:
             self.load_since = None  # the fleet's claim, not load, is holding this gate
             self.yield_to_fleet()
-        return (why or self.shed(self.saturated()) or self.load_capped() or self.memory_capped() or self.full() or self.shed(self.hot()) or self.stalled()
+        return (why or self.signer_yield() or self.shed(self.saturated()) or self.load_capped() or self.memory_capped() or self.full() or self.shed(self.hot()) or self.stalled()
                 or self.locked() or self.low_disk() or self.suite_first() or self.ineligible() or self.off_tailnet())
 
     def host_claim(self) -> str | None:
@@ -11123,6 +11722,21 @@ class Gate:
             return exclusive_claim(self.capacity_dir)
         except Exception:  # noqa: BLE001
             return None
+
+    def signer_yield(self) -> str | None:
+        """SIGNER_SIBLING_YIELD: why an idle trusted signing listener takes no job now, or None. While a signing job
+        (the exclusive class) holds this Mac or waits for it to drain, a job handed to this Mac's other signing
+        listener waits in job-started for the whole signing; held off, GitHub hands it to the other signing Mac's
+        idle listener instead. cmux nightly-next, 2026-11-25: keep-published-dsyms waited 37.8 min in "Set up runner"
+        behind nightly-next-one on the same Mac while the other signer sat idle from the start (run 45567575338),
+        sign-live-code-variant 16.7 min (run 45562645699). A ledger that cannot be read holds nothing."""
+        if self.capacity_dir is None or not runner_scope(self.runner_dir).trusted_signing:
+            return None
+        try:
+            why = exclusive_claim(self.capacity_dir)
+        except Exception:  # noqa: BLE001
+            return None
+        return f"{why}; the next signing job goes to the other signing Mac" if why else None
 
     def blocking_waiters(self) -> set[int]:
         """The fleet builds waiting for the host that this gate yields to. On the nightly slot, a waiter its jobs may
@@ -11695,7 +12309,7 @@ class Gate:
         if why:
             self.load_since = None
             self.yield_to_fleet()
-        return (why or self.shed(self.saturated()) or self.load_capped() or self.memory_capped() or self.full(fresh=True) or self.shed(self.hot(fresh=True))
+        return (why or self.signer_yield() or self.shed(self.saturated()) or self.load_capped() or self.memory_capped() or self.full(fresh=True) or self.shed(self.hot(fresh=True))
                 or self.stalled() or self.locked(fresh=True) or self.low_disk() or self.suite_first() or self.ineligible() or self.off_tailnet())
 
     def still_waiting(self) -> str | None:
@@ -11723,6 +12337,26 @@ class Gate:
             return None
         return reservation_refusal(self.reservation, time.time(), nightly_slot=scope.nightly) if self.reservation else None
 
+    def runner_jobs_hold_edge(self, path: str, hold: bool, crowded: tuple[str, float] | None) -> None:
+        """RUNNER_JOBS_HOLD's countable log: one "RUNNER_JOBS_HOLD start" line when a hold begins and one
+        "RUNNER_JOBS_HOLD end ... held_s=S" when it clears, whichever way low_disk() leaves it (the jobs fit again,
+        the off switch, or a full disk's DISK_FULL_NO_LISTEN taking over). Clears disk_held when not holding."""
+        if not hold:
+            self.disk_held = None
+        if hold == (self.disk_hold_started is not None):
+            return
+        now = time.monotonic()
+        free = free_or_none(path)
+        numbers = (f"free_gib={free if free is None else round(free, 1)} "
+                   f"need_gib={crowded[1] if crowded else 'none'} reserve_gib={RUNNER_JOBS_FLOOR_GIB:g} "
+                   f"jobs_in_flight={self.disk_jobs_in_flight}")
+        if hold:
+            gate_log(f"RUNNER_JOBS_HOLD start {numbers}")
+            self.disk_hold_started = now
+        else:
+            gate_log(f"RUNNER_JOBS_HOLD end {numbers} held_s={round(now - (self.disk_hold_started or now))}")
+            self.disk_hold_started = None
+
     def low_disk(self) -> str | None:
         """Warn and request bounded cleanup below this runner's disk target. The housekeeping floor is advisory:
         stopping the listener at 30 GiB (and resuming at 32) left usable minis idle and froze listeners at their
@@ -11732,7 +12366,10 @@ class Gate:
         No floor holds the listener (DISK_RECLAIM_NOW); only a full disk does, free under the hard floor plus one runner
         job's p95 (full_disk_gib, the build fleet's own disk pause: FLEET_PAUSE_FULL) where no job fits
         (DISK_FULL_NO_LISTEN), and one short of the jobs in flight's measured disk plus its own (RUNNER_JOBS_HOLD,
-        hq#19208) hold it. An idle pool runner short of one job's measured peak
+        hq#19208) hold it. RUNNER_JOBS_HOLD's off switch is GLAEDA_RUNNER_JOBS_HOLD_OFF=1 in the runner's environment or
+        a runner-jobs-hold.off file in the capacity ledger (runner_jobs_hold_off), which return it to reclaim-and-listen
+        (RUNNER_JOBS_DISK); each hold logs one "RUNNER_JOBS_HOLD start free_gib= need_gib= reserve_gib=
+        jobs_in_flight=" line and one "RUNNER_JOBS_HOLD end ... held_s=" line (runner_jobs_hold_edge). An idle pool runner short of one job's measured peak
         (job_disk_gib, DISK_SHORT_RECLAIM), whatever the floor, starts reclaim at once aimed at what it lacks, and records it (disk_short), so its listener's next start waits
         at most DISK_RECLAIM_WAIT_S for room (disk_room_wait) and then listens whatever that freed. These readings used
         to hold the listener (DISK_SHORT_HOLD) so the job went to a runner with room (cmux run 43119216549,
@@ -11783,6 +12420,8 @@ class Gate:
             full_gib = full_disk_line(scope) or min(full_disk_gib(), peak)
             if (free := free_or_none(path)) is not None and free < full_gib:
                 self.disk_short = None
+                self.runner_jobs_hold_edge(path, False, None)  # a hold in force ends here, logged, not left stale
+                self.own_need_edge(path, None)
                 self.evict_in_background(path, max(floor, peak, aim))
                 # the same words every poll: the gate logs a hold again only when its reason changes
                 return (f"disk full: under {full_gib:g} GiB, where no job of this runner fits; "
@@ -11796,25 +12435,15 @@ class Gate:
             # caps DISK_FULL_NO_LISTEN too), so it keeps reclaiming and listening (below).
             if (held := self.own_need_hold(path, scope)) is not None:
                 self.disk_short = None
+                self.runner_jobs_hold_edge(path, False, None)  # one hold at a time: OWN_NEED_HOLD's need covers it
                 self.evict_in_background(path, max(floor, held, aim))
                 # the same words every poll while the record stands: the gate logs the hold once
                 return (f"disk: a job refused here (JOB_DISK_OWN_NEED) needs {held:g} GiB free; reclaiming, taking no "
                         f"job until it fits, at most {OWN_NEED_HOLD_S / 60:g} min from the refusal ({OWN_NEED})")
             crowded = self.runner_jobs_short(path)
-            self.disk_held = None
             hold = bool(crowded) and not scope.small and runner_jobs_hold_off(self.capacity_dir) is None
             now = time.monotonic()
-            if hold != (self.disk_hold_started is not None):
-                free = free_or_none(path)
-                numbers = (f"free_gib={free if free is None else round(free, 1)} "
-                           f"need_gib={crowded[1] if crowded else 'none'} reserve_gib={RUNNER_JOBS_FLOOR_GIB:g} "
-                           f"jobs_in_flight={self.disk_jobs_in_flight}")
-                if hold:
-                    gate_log(f"RUNNER_JOBS_HOLD start {numbers}")
-                    self.disk_hold_started = now
-                else:
-                    gate_log(f"RUNNER_JOBS_HOLD end {numbers} held_s={round(now - (self.disk_hold_started or now))}")
-                    self.disk_hold_started = None
+            self.runner_jobs_hold_edge(path, hold, crowded)
             if hold and crowded:
                 self.disk_short, self.disk_held = None, crowded[0]
                 self.evict_in_background(path, max(floor, crowded[1], aim))
@@ -11827,6 +12456,9 @@ class Gate:
                 short = (f"disk: {under} for {whose} (DISK_SHORT_RECLAIM)", max(floor, peak))
             elif crowded:
                 short = (f"disk: {crowded[0]} (RUNNER_JOBS_DISK)", max(floor, crowded[1]))
+        else:
+            self.runner_jobs_hold_edge(path, False, None)
+            self.own_need_edge(path, None)
         self.disk_short = short
         if short:
             self.evict_in_background(path, max(short[1], aim))
@@ -11855,18 +12487,26 @@ class Gate:
         record = None
         if not scope.small and runner_jobs_hold_off(self.capacity_dir) is None:
             record = own_need_held(self.state_dir, free_or_none(path))
+        self.own_need_edge(path, record)
+        return None if record is None else record["need_gib"]
+
+    def own_need_edge(self, path: str, record: dict[str, Any] | None) -> None:
+        """OWN_NEED_HOLD's countable log: one "OWN_NEED_HOLD start" line when a hold begins and one "OWN_NEED_HOLD end
+        ... held_s=S" when it clears, whichever way low_disk() leaves it (room, the bound, the off switch, or a full
+        disk's DISK_FULL_NO_LISTEN taking over), so a start line always gets its end."""
         started = getattr(self, "own_need_started", None)
+        if (record is not None) == (started is not None):
+            return
         now = time.monotonic()
-        if record is not None and started is None:
-            free = free_or_none(path)
+        free = free_or_none(path)
+        if record is not None:
             gate_log(f"{OWN_NEED} start free_gib={free if free is None else round(free, 1)} "
                      f"need_gib={record['need_gib']:g} key={record['key']}")
             self.own_need_started = now
-        elif record is None and started is not None:
-            free = free_or_none(path)
-            gate_log(f"{OWN_NEED} end free_gib={free if free is None else round(free, 1)} held_s={round(now - started)}")
+        else:
+            gate_log(f"{OWN_NEED} end free_gib={free if free is None else round(free, 1)} "
+                     f"held_s={round(now - (started or now))}")
             self.own_need_started = None
-        return None if record is None else record["need_gib"]
 
     def suite_first(self, busy: bool = False) -> str | None:
         """SUITE_FIRST_HOLD: why this pool listener stays off for a fleet suite step that waits for disk on this mini
@@ -11927,20 +12567,26 @@ class Gate:
         if per is None or free is None:
             return None
         home = self.runner_dir.parent
-        if free >= runner_jobs_need_gib(max(0, len(runner_dirs(home)) - 1), per):
+        bound = per  # RUNNER_JOBS_OWN_PEAK: no install's job is charged more than the largest own peak here
+        with contextlib.suppress(Exception):
+            bound = max([per, *(gib for gib, _source in learned_job_peaks(job_log_tail(), own_writes=True).values())])
+        if free >= runner_jobs_need_gib(max(0, len(runner_dirs(home)) - 1), bound):
             return None
         try:
             running, listening = runner_jobs_in_flight_detail(home, self.runner_dir, processes())
         except Exception:  # noqa: BLE001
             return None
-        # RUNNER_JOB_WRITTEN: a running job is charged only what it has still to write of its p95
+        # RUNNER_JOB_WRITTEN: a running job is charged only what it has still to write of its charge
+        # RUNNER_JOBS_OWN_PEAK: a running job's charge is the larger of the fleet p95 and its own learned peak here
         now = time.time()
-        written = round(sum(min(per, job_written_gib(self.state_dir, name, pid, now) or 0.0)
+        charges = running_job_charges(home, running, per)
+        written = round(sum(min(charges.get(pid, per), job_written_gib(self.state_dir, name, pid, now) or 0.0)
                             for name, pid in running), 1)
+        extra = round(sum(max(0.0, charges.get(pid, per) - per) for _name, pid in running), 1)
         in_flight = len(running) + listening
         self.disk_jobs_in_flight = in_flight
-        why = runner_jobs_refusal(free, in_flight, per, source, written)
-        return (why, round(runner_jobs_need_gib(in_flight, per) - written, 1)) if why else None
+        why = runner_jobs_refusal(free, in_flight, per, source, written, extra)
+        return (why, round(runner_jobs_need_gib(in_flight, per) + extra - written, 1)) if why else None
 
     def evict_idle_in_background(self, path: str, target: float) -> None:
         """Below a builder's floor or reserve, reclaim idle PR runners' _work in a bounded thread
@@ -12667,10 +13313,40 @@ class Gate:
         """One poll. Returns an exit code when the gate itself should exit. A listener frozen at its Worker's exit
         (JOB_END_FREEZE) is thawed when the poll returns, whatever it decided, a failed poll too."""
         try:
+            self.adopt_job_end_freeze()
             return self.poll()
         finally:
             self.thaw()
             self.publish()
+
+    def adopt_job_end_freeze(self) -> None:
+        """DRAIN_FREEZE_AT_END: take over the listener job-completed froze (JOB_END_FROZEN) once its Worker has
+        exited, as if nap() had frozen it at that exit (JOB_END_FREEZE): poll() then stops it if the runner still
+        drains, and step() thaws it either way. While the Worker still runs, the listener stays frozen and the record
+        stays. A record naming no listener of this gate's own tree and process group is left to its backstop. Never
+        raises."""
+        marker = self.runner_dir / "glaeda-hooks" / JOB_END_FROZEN
+        doc = job_end_frozen_doc(marker)
+        if doc is None:
+            return
+        listener, worker = doc["listener"], doc["worker"]
+        try:
+            if pid_alive(worker) and not self._zombie(worker):
+                return
+            if os.getpgid(listener) != os.getpgrp() or listener not in self.listener_list():
+                return
+        except Exception:  # noqa: BLE001
+            return
+        with contextlib.suppress(OSError):
+            marker.unlink()
+        self.frozen = self.frozen if listener in self.frozen else (*self.frozen, listener)
+        self.done = self.done if worker in self.done else (*self.done, worker)
+        self.listener_pids = self.listener_pids if listener in self.listener_pids else (*self.listener_pids, listener)
+        self.freeze_at_exit = True
+        request = doc.get("request")
+        if self.job_request is None and isinstance(request, str):
+            self.job_request = request
+        gate_log(f"the job's end froze the listener (pid {listener}) before its Worker exited: looking now")
 
     def live_line(self) -> str | None:
         """The gate line for what the gate does right now (gate_state_file), or None when it is between states (no
@@ -12908,9 +13584,16 @@ class Gate:
                     break
                 time.sleep(GATE_WATCH_S)
         if exited:
+            # Freeze first, then look (2026-11-25). The look below runs /bin/ps for each Worker still a zombie, which
+            # is every one its listener has not reaped yet; on a lent mini at load 100+ that spawn took longer than
+            # the listener's own reaction to the same exit, so the listener went Online and its poll took the next
+            # job before the freeze (cmuxs-mac-mini-6, 19:59-20:03Z: runners 1, 7, 10 and 13 each took a new PR
+            # job 1-3 s after the last one ended while every runner carried cmux-ci's RUNNER_DRAIN marker for an
+            # urgent simulator hold; no drain finished, so 36 holds in 24 h started 0 steps). Frozen, the listener
+            # cannot reap its Worker either, so the look still finds the zombie.
+            self.freeze()
             # the exited ones, so the next poll neither counts their zombies as a job nor waits on them again
             self.done = tuple(pid for pid in self.watching if not pid_alive(pid) or self._zombie(pid)) or self.watching
-            self.freeze()
 
     @staticmethod
     def _zombie(pid: int) -> bool:
@@ -13973,6 +14656,7 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
             if nonce is not None and ws is not None:
                 written = (ws.parent.parent.parent.name, JobWritten(ws.parent.parent, ws), nonce)
         written_at = time.monotonic()
+        written_max: float | None = None  # JOB_OWN_WRITTEN
         deadline = time.monotonic() + HOLDER_MAX_S
         tick = 0
         dynamic_units = admitted_units = int(meta.get("units") or 0)
@@ -14027,8 +14711,10 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
                         samples.thermal = bool(samples.thermal) or limited
                 if written is not None and time.monotonic() - written_at >= JOB_WRITTEN_EVERY_S:
                     written_at = time.monotonic()
-                    report_job_written(written[1], state_dir, written[0], watch_pid, written[2], disk_path,
-                                       samples.disk_free_start)
+                    wrote = report_job_written(written[1], state_dir, written[0], watch_pid, written[2], disk_path,
+                                               samples.disk_free_start)
+                    if wrote is not None:  # JOB_OWN_WRITTEN: the most this job wrote itself
+                        written_max = wrote if written_max is None else max(written_max, wrote)
             except Exception:  # noqa: BLE001  (a bad sample is skipped, not fatal)
                 pass
             tick += 1
@@ -14065,6 +14751,8 @@ def start_sampler(watch_pid: int, state_dir: Path, meta: dict[str, Any], log: Pa
         if disk_path:
             samples.disk_free_end = free_or_none(disk_path)
         record = samples.summary(time.time())
+        if written_max is not None:
+            record[JOB_OWN_WRITTEN_FIELD] = round(written_max, 1)
         final, gui = holdings
         if final != record.get("roots", []):
             record["roots_admitted"] = record.get("roots", [])
@@ -14649,6 +15337,44 @@ def job_scratch_end(env: Mapping[str, str] | None = None, base: Path | None = No
     dropped, left = job_scratch_reap(runner_dir)
     note = job_scratch_reap_note(runner_dir, dropped, left)
     return [note] if note else []
+
+
+# DERIVED_DATA_SLOT (cmuxterm-hq docs/design/declared-disk-persistence.md, PR 2): Xcode DerivedData must not live on
+# the per-job scratch (a cold DerivedData costs minutes per build), so it lives in a registered cache, one slot per
+# stream: config/disk-registry.toml's derived-data, DERIVED_DATA_SLOT_DIR/<stream>, held to its budget LRU by
+# scripts/glaeda-disk-registry. job-started tells the job its slot as CMUX_DERIVED_DATA_SLOT (for xcodebuild
+# -derivedDataPath); the stream is the PR's base branch, else the pushed branch, '/' as '-'. Opt-in with the
+# registry's own flag, GLAEDA_DISK_REGISTRY=1; unset or anything else exports nothing.
+DISK_REGISTRY_ENV = "GLAEDA_DISK_REGISTRY"
+DERIVED_DATA_SLOT_DIR = Path(FLEET_DIR) / "dd"
+DERIVED_DATA_SLOT_EXPORT = "CMUX_DERIVED_DATA_SLOT"
+DERIVED_DATA_STREAM = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
+
+
+def derived_data_stream(env: Mapping[str, str] | None = None) -> str | None:
+    env = os.environ if env is None else env
+    ref = env.get("GITHUB_BASE_REF") or env.get("GITHUB_REF_NAME") or ""
+    stream = ref.replace("/", "-")
+    return stream if DERIVED_DATA_STREAM.fullmatch(stream) and ".." not in stream else None
+
+
+def derived_data_slot_start(env: Mapping[str, str] | None = None, base: Path | None = None) -> list[str]:
+    """job-started: create this job's stream slot and export CMUX_DERIVED_DATA_SLOT. Off (no flag): nothing."""
+    env = os.environ if env is None else env
+    if env.get(DISK_REGISTRY_ENV, "") != "1":
+        return []
+    stream = derived_data_stream(env)
+    if stream is None:
+        return ["derived data slot: skipped: no plain GITHUB_BASE_REF or GITHUB_REF_NAME"]
+    slot = (DERIVED_DATA_SLOT_DIR if base is None else base) / stream
+    try:
+        slot.mkdir(parents=True, exist_ok=True, mode=0o755)
+        if slot.is_symlink() or not slot.is_dir():
+            return [f"derived data slot: skipped: {slot} is not a plain directory"]
+    except OSError as error:
+        return [f"derived data slot: none for this job: {error.strerror or error}"]
+    return [f"derived data slot: {slot}; "
+            f"{export_job_env(DERIVED_DATA_SLOT_EXPORT, os.fspath(slot), 'glaeda-derived-data-slot')}"]
 
 
 def cleanup_job_leftovers(work: str | None = None) -> list[str]:
@@ -15457,7 +16183,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{PREFIX}: admitted: {reason}; {note}", flush=True)
             return 0
         if args.gateway_runner and (is_guest(repo, args.home_repo)
-                                    or (job_workflow(), os.environ.get("GITHUB_JOB", "")) not in GATEWAY_JOBS):
+                                    or not gateway_job(job_workflow(), os.environ.get("GITHUB_JOB", ""))):
             # GATEWAY: thin cmux-ci clients only. It listens through CPU saturation and a full mini, so any other job
             # would run its build here outside the units; refused at once, before any disk or capacity work, it is
             # rescued elsewhere.
@@ -15630,6 +16356,23 @@ def main(argv: list[str] | None = None) -> int:
                 and (job_workflow(), os.environ.get("GITHUB_JOB", "")) in FAST_JOBS):
             admit_class = "fast"  # its own tokens on its own runner; on any other runner it keeps its usual cost
         if (admit_class is None and plain_side_runner(args) and not is_guest(repo, args.home_repo)
+                and (job_workflow(), os.environ.get("GITHUB_JOB", "")) in FAST_JOBS
+                and (why := seed_root_refusal(capacity_dir=args.capacity_dir))):
+            # SIDE_SEED_WAIT: wait for a seed root first; SIDE_SEED_FREE refuses before it takes anything, never busy
+            def seed_wait_gone() -> str | None:
+                if owner is not None and owner.gone():
+                    return OWNER_GONE
+                return JOB_CANCELLED if job_cancel_requested(job_runner_dir(JOB_CWD)) else None
+            cold_room, cold_note = side_seed_cold_room(job_workflow(), os.environ.get("GITHUB_JOB", ""),
+                                                       job_runner_dir(JOB_CWD), args.capacity_dir)
+            print(f"{PREFIX}: {cold_note}", flush=True)
+            why, cause = (None, None) if cold_room == math.inf else side_seed_wait(
+                why, args.capacity_dir, seed_wait_gone, cold_room=cold_room)
+            if cause:
+                return abandoned("" if cause == OWNER_GONE else cause)
+            if why:
+                return refused(why)
+        if (admit_class is None and plain_side_runner(args) and not is_guest(repo, args.home_repo)
                 and (job_workflow(), os.environ.get("GITHUB_JOB", "")) in FAST_JOBS and load_job_needs()[0]):
             # SIDE_FAST_FIT: admitted by its class, at the room the side listener listened with (side_fit_units).
             admit_class = job_class(os.environ.get("GITHUB_JOB", ""), repo, args.home_repo, job_workflow())[0]
@@ -15663,8 +16406,9 @@ def main(argv: list[str] | None = None) -> int:
             fast_bound = fast_tier_capacity_wait(repo, args.home_repo, job_workflow(), os.environ.get("GITHUB_JOB", ""))
             cap = bounded_wait(cap, fast_bound)
             if fast_bound is not None:
-                print(f"{PREFIX}: the fast tier: it waits {fast_bound:g} s at most for capacity (FAST_TIER_WAIT), "
-                      "then runs busy beside the mini's other jobs (FAST_TIER_BUSY) instead of failing", flush=True)
+                print(f"{PREFIX}: {os.environ.get('GITHUB_JOB', '')}: it waits {fast_bound:g} s at most for capacity "
+                      "(FAST_TIER_WAIT, GENERATED_FILES_WAIT), then runs busy beside the mini's other jobs "
+                      "(FAST_TIER_BUSY) instead of failing", flush=True)
             tier = job_tier(os.environ.get("GITHUB_EVENT_NAME"), os.environ.get("GITHUB_REF"),
                             os.environ.get("GITHUB_REPOSITORY"), event, os.environ.get("GITHUB_WORKFLOW_REF"),
                             os.environ.get("GITHUB_JOB")) or stack_blocker_tier(
@@ -15784,6 +16528,19 @@ def main(argv: list[str] | None = None) -> int:
                 with contextlib.suppress(OSError):
                     marker.unlink()
         elif args.dedicated_admit:
+            # A dedicated runner's job may take a root too (cmux's DerivedData seed on a trusted-main runner runs
+            # `glaeda-canonical-root take`), so it links the shim and drops a crashed job's records as a ledger
+            # runner does. Without it a dedicated-only mini (cmux7s) never had the helper, and its two seed roots
+            # were held by nothing. Only the account that owns the fleet bin links it: a dedicated runner under
+            # its own user (runner.dedicated `user`) has a 0700 home and its own state dir, so its shim would
+            # break every member job's take on that mini.
+            with contextlib.suppress(OSError):
+                roots_file(args.state_dir).unlink(missing_ok=True)
+                gui_file(args.state_dir).unlink(missing_ok=True)
+            bin_dir = Path(FLEET_DIR) / "bin"
+            with contextlib.suppress(OSError):
+                if bin_dir.stat().st_uid == os.getuid():
+                    ensure_root_shim(bin_dir)
             held, note = True, ""
             if args.yield_to_exclusive:
                 held, note = yield_to_exclusive(args.capacity_dir, owner, args.exclusive_yield_wait)
@@ -15834,6 +16591,9 @@ def main(argv: list[str] | None = None) -> int:
         with contextlib.suppress(Exception):  # JOB_SCRATCH: best effort, never fails an admitted job
             for scratch in job_scratch_start():
                 print(f"{PREFIX}: {scratch}", flush=True)
+        with contextlib.suppress(Exception):  # DERIVED_DATA_SLOT: best effort, never fails an admitted job
+            for slot_note in derived_data_slot_start():
+                print(f"{PREFIX}: {slot_note}", flush=True)
         if not args.no_disk and (own := evict_own_checkout(os.environ.get("GITHUB_WORKSPACE"), args.disk)):
             print(f"{PREFIX}: {own}", flush=True)
         if guarded := guard_borrowed_checkout(os.environ.get("GITHUB_WORKSPACE")):
@@ -15912,6 +16672,10 @@ def main(argv: list[str] | None = None) -> int:
         note = install_staged_hook(Path(__file__).resolve().parent)
         if note:
             print(f"{PREFIX}: {note}", flush=True)
+        hook_dir = Path(__file__).resolve().parent
+        if hook_dir.name == "glaeda-hooks" and args.capture_lease is None:  # DRAIN_FREEZE_AT_END, a runner's install
+            if note := freeze_listener_at_job_end(hook_dir, args.watch_pid or runner_worker_pid()):
+                print(f"{PREFIX}: {note}", flush=True)
     return 0
 
 

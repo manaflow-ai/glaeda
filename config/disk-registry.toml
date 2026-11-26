@@ -1,0 +1,69 @@
+# What may persist on a fleet host across jobs (cmuxterm-hq docs/design/declared-disk-persistence.md, section 2).
+# Everything not declared here, and not in [base], is garbage by definition: per-job scratch (glaeda#2297) keeps a
+# job's own writes off the host disk, and this list says what is allowed to outlive a job.
+#
+# Read by scripts/glaeda-disk-registry. Each cache names its owner, whether it regenerates, and a size budget.
+# `evict` holds each regenerating cache to its budget, least recently used slot first; a cache that does not
+# regenerate (regenerates = false) is never evicted, only reported over its budget. Eviction is off unless the
+# host sets GLAEDA_DISK_REGISTRY=1; without it `evict` prints its plan and deletes nothing.
+#
+# Paths: `~` is the runner user's home. `{stream}` marks a per-stream slot (one directory per stream: main,
+# feat-cmux-next, ...); each slot is one eviction unit. Without `{stream}`, each direct child of the path is a unit.
+# A glob (`*`) in a path is expanded; each match is a root. Per-host overrides go under [hosts.<name>] (the short,
+# lowercased hostname, as config/runner-gate.json keys it), e.g.
+#
+#   [hosts.mini-a.cache.derived-data]
+#   budget_gib = 200
+
+schema = "glaeda-disk-registry/v1"
+
+[defaults]
+evict = "lru"            # by last use, oldest first, until under budget
+idle_shrink_days = 3     # untouched this long: shrink to min_gib even under budget
+in_use_hours = 6         # a unit used this recently is never evicted (a running job may hold it)
+
+[checker]
+# glaeda-disk's checker (design section 3): df used - [base] - these caches - live cmux-job-* volumes is undeclared
+# growth; past this on a volume it is an alarm (summary.json finding undeclared_growth) naming the top paths. The fix is
+# a cache entry here or a scratch redirect, never a new deletion rule.
+undeclared_alarm_gib = 5
+
+[base]
+# macOS, the Xcode install, Homebrew and the runner itself: measured, never evicted.
+expected_gib = 120
+
+[[cache]]
+name = "derived-data"
+path = "/Users/Shared/cmux-build-fleet/dd/{stream}"   # one slot per stream (main, feat-cmux-next, ...)
+owner = "glaeda-cmux-runner-hook"
+regenerates = true       # a cold build rebuilds it
+budget_gib = 120
+min_gib = 0
+
+[[cache]]
+name = "compile-cache"
+path = "~/Library/Caches/glaeda-cas"
+owner = "glaeda-fleet-cas"
+regenerates = true       # refetched from fleet-cas on cmux-lawrence
+budget_gib = 60
+
+[[cache]]
+name = "simulator-runtimes"
+path = "/Library/Developer/CoreSimulator/Volumes"
+owner = "glaeda-sim"
+regenerates = false      # download is slow and manual: never auto-evicted, alarm only
+budget_gib = 40
+
+[[cache]]
+name = "toolchains"
+path = ["/Applications/Xcode-*.app", "~/.rustup/toolchains"]
+owner = "glaeda-runner-toolchain"
+regenerates = false
+budget_gib = 80
+
+[[cache]]
+name = "git-mirror"
+path = "~/.glaeda/mirrors"
+owner = "borrow_mirror"
+regenerates = true
+budget_gib = 30

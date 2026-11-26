@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""intent-sync: refresh the vendored intent layer from a leo-workspace checkout, and record its sha256.
+
+    scripts/intent-sync LEO_WORKSPACE_CHECKOUT      copy tools/intent.py, intent_aliases.json, intent_vectors.json here
+    scripts/intent-sync --check                     exit 1 when the vendored files differ from intent.sha256
+
+The source of truth is leo-workspace tools/intent.py, tools/intent_aliases.json and tools/intent_vectors.json (its
+test vectors; the shared layer every CLI of
+ours takes: a mistyped or wishful form runs as the one form it meant, and says so). The copies here are byte-identical
+to it; scripts/test-intent-glaeda.py fails when they drift from intent.sha256, and this is the one command that
+refreshes both. Every glaeda-* CLI loads scripts/intent.py beside itself, or the copy glaeda-mini-setup installs in
+~/.local/share/glaeda/intent/ for the copies in ~/.local/bin.
+"""
+from __future__ import annotations
+
+import hashlib
+import shutil
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+FILES = ("intent.py", "intent_aliases.json", "intent_vectors.json")
+RECORD = HERE / "intent.sha256"
+
+
+def digests(root: Path) -> dict[str, str]:
+    return {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in FILES}
+
+
+def recorded() -> dict[str, str]:
+    out = {}
+    for line in RECORD.read_text().splitlines():
+        if line.strip():
+            digest, name = line.split()
+            out[name] = digest
+    return out
+
+
+def main(argv: list[str]) -> int:
+    if argv == ["--check"]:
+        have, want = digests(HERE), recorded()
+        bad = [n for n in FILES if have[n] != want.get(n)]
+        for name in bad:
+            print(f"intent-sync: scripts/{name} is {have[name]}, intent.sha256 records {want.get(name)}: "
+                  f"run scripts/intent-sync LEO_WORKSPACE_CHECKOUT", file=sys.stderr)
+        return 1 if bad else 0
+    if len(argv) != 1 or argv[0].startswith("-"):
+        print(__doc__, file=sys.stderr)
+        return 64
+    tools = Path(argv[0]).expanduser() / "tools"
+    missing = [n for n in FILES if not (tools / n).is_file()]
+    if missing:
+        print(f"intent-sync: {tools} has no {', '.join(missing)}", file=sys.stderr)
+        return 1
+    for name in FILES:
+        shutil.copyfile(tools / name, HERE / name)
+    RECORD.write_text("".join(f"{d}  {n}\n" for n, d in digests(HERE).items()))
+    for name, digest in digests(HERE).items():
+        print(f"{digest}  scripts/{name}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

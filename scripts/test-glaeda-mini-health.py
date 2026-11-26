@@ -431,10 +431,40 @@ class NodeEligibility(unittest.TestCase):
             (agents / f"{label}.plist").write_text("")
         answers = {"com.teamleaderleo.glaeda.cmux-runner": (127, ""),  # timed out at load 275
                    "com.teamleaderleo.glaeda.cmux-runner.9": (113, "Could not find service")}
-        with mock.patch.object(health, "AGENTS", agents), \
+        with mock.patch.object(health, "AGENTS", agents), mock.patch.object(health, "DAEMONS", self.home / "none"), \
                 mock.patch.object(health, "sh", lambda argv, **_: answers[argv[-1].rsplit("/", 1)[1]]):
             got = health.Mini(self.home).runner_agents()
         self.assertEqual(got, [("com.teamleaderleo.glaeda.cmux-runner.9", False, False, "?")])
+
+    def test_a_runner_launchdaemon_of_this_user_is_read_in_the_system_domain_and_kickstarted_with_sudo_n(self) -> None:
+        """ROLE_DAEMON (glaeda-cmux-runner): a gateway or small runner is system/<label>. Its LaunchAgent plist, left
+        until the runner is idle, is not reported; another user's daemon is not this user's runner."""
+        agents, daemons = self.home / "Library/LaunchAgents", self.home / "LaunchDaemons"
+        agents.mkdir(parents=True)
+        daemons.mkdir()
+        base = "com.teamleaderleo.glaeda.cmux-runner"
+        for label in (base, f"{base}.7"):
+            (agents / f"{label}.plist").write_text("")
+        me = health.pwd.getpwuid(os.getuid()).pw_name
+        for label, user in ((f"{base}.7", me), (f"{base}.8", "someone-else")):
+            (daemons / f"{label}.plist").write_bytes(plistlib.dumps({"Label": label, "UserName": user}))
+        asked = []
+
+        def sh(argv, **_):
+            asked.append(argv)
+            return 0, "\tstate = running\n\tpid = 42\n"
+        with mock.patch.object(health, "AGENTS", agents), mock.patch.object(health, "DAEMONS", daemons), \
+                mock.patch.object(health, "sh", sh):
+            mini = health.Mini(self.home)
+            got = mini.runner_agents()
+            mini.kickstart(f"{base}.7")
+            mini.kickstart(base)
+        self.assertEqual([g[0] for g in got], [base, f"{base}.7"])
+        self.assertIn(["/bin/launchctl", "print", f"system/{base}.7"], asked)
+        self.assertIn(["/bin/launchctl", "print", f"gui/{os.getuid()}/{base}"], asked)
+        self.assertNotIn(["/bin/launchctl", "print", f"gui/{os.getuid()}/{base}.7"], asked)
+        self.assertIn(["/usr/bin/sudo", "-n", "/bin/launchctl", "kickstart", f"system/{base}.7"], asked)
+        self.assertIn(["/bin/launchctl", "kickstart", f"gui/{os.getuid()}/{base}"], asked)
 
     def test_a_runner_that_does_not_require_eligibility_is_not_checked(self) -> None:
         mini, asked = self.mini("exec /usr/bin/python3 hook job-started --allowed-owner manaflow-ai")

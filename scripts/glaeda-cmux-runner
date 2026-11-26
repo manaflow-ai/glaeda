@@ -79,6 +79,7 @@ import argparse
 import importlib.machinery
 import importlib.util
 import contextlib
+import copy
 import datetime
 import fcntl
 import functools
@@ -150,6 +151,29 @@ LAUNCHCTL = "/bin/launchctl"
 SUDO = "/usr/bin/sudo"
 SYSTEM_DAEMON_DIR = Path("/Library/LaunchDaemons")
 SYSTEM_HELPER = Path("/usr/local/sbin/glaeda-headless-supervise")
+# ROLE_DAEMON (Leo, 2026-11-23, after cmuxs-mac-mini-5 lost its login session at 15:40Z and all 17 of its runners
+# went down: "prevent these in the future across all"): a gateway or small runner is a system LaunchDaemon (the
+# --headless service) on every host, gui ones included, so a logout or a lost Aqua session leaves it running. Its jobs
+# need no Aqua session: the gateway ones are thin cmux-ci clients and the small ones (size, web-validation, comment,
+# guard-status, synthetic probes, codesign --verify) never launch an app or a simulator. Every other role stays a
+# gui/<uid> LaunchAgent: pool and root jobs drive the console session (`launchctl asuser`, simctl, XCUITest), and simctl
+# from a system daemon finds no CoreSimulatorService. A fleet mini's sudo asks for a password, so the root part (the
+# daemon plist, the helper, and a sudoers drop-in with this runner's exact launchctl commands) is one root step,
+# DAEMON_ROOT_SCRIPT through fleet-sudo; after it this installer loads, reloads, relabels and moves the runner itself.
+DAEMON_ROOT_SCRIPT = "scripts/glaeda-runner-daemon-root"
+DAEMON_STAGE = "daemon.plist"  # under the instance's state dir: what the root step validates and installs
+RUNNER_SUDOERS = "/etc/sudoers.d/glaeda-runner-daemons"
+ROLE_DAEMON_OFF_ENV = "GLAEDA_RUNNER_ROLE_DAEMON"  # "0": a gateway or small runner stays a LaunchAgent (a rollback)
+# The --headless supervisor: it waits while a listener of this runner (a LaunchAgent's, or one an apply left) runs,
+# then hands the registration to listen.sh. It opens the runner's logs itself, as the runner's user: a daemon plist
+# names no StandardOutPath, which launchd would open as root in a directory that user can put a symlink in (the
+# seed-archive daemons log to /dev/null for the same reason). DAEMON_ROOT_SCRIPT installs the same bytes (a test
+# keeps them equal).
+HEADLESS_HELPER = (b"#!/bin/sh\nset -eu\nrunner=\"$1\"\n"
+                   b"if [ $# -ge 3 ]; then exec >>\"$2\" 2>>\"$3\"; fi\n"
+                   b"while /usr/bin/pgrep -f \"$runner/bin/Runner.Listener\" >/dev/null 2>&1 "
+                   b"|| /usr/bin/pgrep -f \"$runner/glaeda-hooks/listen.sh\" >/dev/null 2>&1; do\n  /bin/sleep 15\ndone\n"
+                   b"exec \"$runner/glaeda-hooks/listen.sh\"\n")
 ONLINE_WAIT_S = 90
 WORKLOAD_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 PUBLIC_API = "https://api.github.com/"
@@ -841,6 +865,7 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
     xcode_apps = (ctx.member or {}).get("xcodeApps") or []
     toolchain_env = "unset SDKROOT TOOLCHAINS\n" + (
         f"export DEVELOPER_DIR={PROTECTED_DEVELOPER_DIR}\nexport PATH={PROTECTED_PATH}\n"
+        f"export {NO_RUST_GATE_ENV}=0\n"
         if user_entry(ctx) else "") + (
         f"export DEVELOPER_DIR={shlex.quote(os.fspath(Path(xcode_apps[0]) / 'Contents/Developer'))}\n"
         if xcode_apps else "")
@@ -955,7 +980,7 @@ def agent_plist(ctx: Context) -> dict[str, Any]:
     if ctx.headless:
         # A system daemon survives a reboot without a GUI login. The helper waits for a
         # listener left by an in-flight apply, then hands the registration to listen.sh.
-        program = [os.fspath(SYSTEM_HELPER), os.fspath(ctx.runner_dir)]
+        program = [os.fspath(SYSTEM_HELPER), os.fspath(ctx.runner_dir), os.fspath(ctx.log_path), os.fspath(err_path(ctx))]
     else:
         program = [os.fspath(ctx.hook_dir / "listen.sh")]
     plist = {
@@ -977,14 +1002,16 @@ def agent_plist(ctx: Context) -> dict[str, Any]:
             "PATH": path,
             # PROTECTED_TOOLCHAIN: /usr/bin/python3 and the other xcrun shims resolve to the root-owned Command Line
             # Tools, never an Xcode another admin account can write
-            **({"DEVELOPER_DIR": PROTECTED_DEVELOPER_DIR} if user_entry(ctx) else {}),
+            **({"DEVELOPER_DIR": PROTECTED_DEVELOPER_DIR, NO_RUST_GATE_ENV: "0"} if user_entry(ctx) else {}),
             # POOL_USER: the node's enrollment and class receipt as the member user published them (the hook's
             # NODE_VIEW), since this account cannot read that user's home
             **({NODE_VIEW_ENV: POOL_NODE_VIEW} if pool_user_of(ctx) else {}),
         },
         "StandardOutPath": os.fspath(ctx.log_path),
-        "StandardErrorPath": os.fspath(ctx.logs / f"glaeda-cmux-runner{ctx.suffix}.err"),
+        "StandardErrorPath": os.fspath(err_path(ctx)),
     }
+    if ctx.headless:
+        del plist["StandardOutPath"], plist["StandardErrorPath"]  # HEADLESS_HELPER opens them as the user
     if not console_session_runner(ctx):
         plist["SessionCreate"] = True
     if pool_user_of(ctx):
@@ -998,6 +1025,10 @@ def agent_plist(ctx: Context) -> dict[str, Any]:
     return plist
 
 
+def err_path(ctx: Context) -> Path:
+    return ctx.logs / f"glaeda-cmux-runner{ctx.suffix}.err"
+
+
 def console_session_runner(ctx: Context) -> bool:
     """The gui and session runners run in the console user's security session, every other runner in one of its own
     (SessionCreate). Their jobs launch and drive apps there (XCUITest, captures), and on macOS 27 LaunchServices can stop
@@ -1006,6 +1037,75 @@ def console_session_runner(ctx: Context) -> bool:
     and cmux8s, 2026-10-30; a fresh SessionCreate agent there could not see Finder, one without it could). It isolates
     nothing from such a job: any job can bootstrap a LaunchAgent into gui/<uid> and run in the console session anyway."""
     return not ctx.headless and bool(getattr(ctx, "gui_runner", False) or getattr(ctx, "session_runner", False))
+
+
+def role_daemon(ctx: Any) -> bool:
+    """ROLE_DAEMON: this runner is a gateway or small one, which runs as a system LaunchDaemon on every host. Not for a
+    sandbox HOME, --skip-launchctl, a poolUser or dedicated runner, or with GLAEDA_RUNNER_ROLE_DAEMON=0."""
+    return (bool(getattr(ctx, "gateway_runner", False) or getattr(ctx, "small_runner", False))
+            and not getattr(ctx, "sandbox", False) and not getattr(ctx, "skip_launchctl", False)
+            and pool_user_of(ctx) is None and dedicated_of(ctx) is None
+            and os.environ.get(ROLE_DAEMON_OFF_ENV, "").strip() != "0")
+
+
+def daemon_path(ctx: Any) -> Path:
+    return SYSTEM_DAEMON_DIR / f"{ctx.label}.plist"
+
+
+def sudo_allows(ctx: Any, argv: list[str]) -> bool:
+    """sudo would run argv here without a password (`sudo -n -l`, which runs nothing). Cached per run."""
+    cache = getattr(ctx, "sudo_cache", None)
+    if not isinstance(cache, dict):
+        cache = ctx.sudo_cache = {}
+    key = tuple(argv)
+    if key not in cache:
+        cache[key] = run([SUDO, "-n", "-l", *argv], timeout=20)[0] == 0
+    return cache[key]
+
+
+def root_writes(ctx: Any) -> bool:
+    """This user may write a system plist without a password (NOPASSWD sudo: an AWS host, cmux-mac-mini)."""
+    return sudo_allows(ctx, ["/usr/bin/install", "-o", "root", "-g", "wheel", "-m", "644", "/dev/null",
+                             os.fspath(daemon_path(ctx))])
+
+
+def root_launchctl(ctx: Any) -> bool:
+    """This user may load the runner's LaunchDaemon without a password: NOPASSWD sudo, or the root step's sudoers
+    drop-in (RUNNER_SUDOERS), which allows exactly this runner's bootstrap, bootout, enable, print and plist removal."""
+    return sudo_allows(ctx, [LAUNCHCTL, "bootstrap", "system", os.fspath(daemon_path(ctx))])
+
+
+def promote_role_daemon(ctx: Context) -> None:
+    """ROLE_DAEMON: run a gateway or small runner as the --headless system service, gui hosts included. A runner whose
+    daemon is not installed yet stays the LaunchAgent it is until the root step installs it (root_step_note), unless
+    this user can write the plist itself: a host where it cannot is never left with neither."""
+    if not role_daemon(ctx):
+        return
+    ctx.role_daemon = True
+    if ctx.headless:
+        return  # --headless (a host with gui false), or a receipt that says so
+    if daemon_path(ctx).exists() or root_writes(ctx):
+        ctx.headless = True
+        ctx.service_plist_path = daemon_path(ctx)
+    else:
+        ctx.root_step = "its LaunchDaemon is not installed yet; it runs as a LaunchAgent until then"
+
+
+def daemon_plist_bytes(ctx: Context) -> bytes:
+    """The LaunchDaemon plist this runner runs as (ROLE_DAEMON), whatever it runs as now: what the root step installs."""
+    as_daemon = copy.copy(ctx)
+    as_daemon.headless = True
+    return plistlib.dumps(agent_plist(as_daemon), sort_keys=True)
+
+
+def root_step_note(ctx: Context, why: str) -> str:
+    """ROLE_DAEMON: the one root step a host whose sudo asks for a password needs, and how to run it with no tty."""
+    user = pwd.getpwuid(ctx.uid).pw_name
+    host = getattr(ctx, "host_name", None) or socket.gethostname().split(".")[0]
+    return (f"ROOT STEP NEEDED: {why}. sudo here asks for a password and an apply has no tty; this apply staged the "
+            f"plist at {ctx.show(ctx.state / DAEMON_STAGE)}. From an origin's glaeda checkout on main run this, then "
+            f"re-run the apply (it moves the runner off its LaunchAgent when idle): "
+            f"{{ echo 'set -- {user} {ctx.instance}'; cat {DAEMON_ROOT_SCRIPT}; }} | fleet-sudo {host} -f -")
 
 
 def hook_sources() -> dict[str, tuple[bytes, int]]:
@@ -1368,17 +1468,21 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
     for path, (data, mode) in desired_files(ctx).items():
         kind = "agent" if path == ctx.service_plist_path else companions[path][0] if path in companions else "hook"
         current, want = sha256_file(path), sha256_bytes(data)
+        # ROLE_DAEMON: the root step (DAEMON_ROOT_SCRIPT) writes this runner's LaunchDaemon plist, not this command,
+        # and it writes only a plist this command staged: a root-owned plist of this label is this runner's own
+        role_service = kind == "agent" and getattr(ctx, "role_daemon", False) and ctx.headless
         if current is None:
             state = "create"
         elif current == want and (path.stat().st_mode & 0o777) == mode:
             state = "unchanged"
-        elif prior.get(os.fspath(path)) == current or (kind == "hook" and ours):
+        elif prior.get(os.fspath(path)) == current or (kind == "hook" and ours) or role_service:
             state = "update"
         else:
             state = "blocked"
         if kind == "hook" and blocked_dir:
             state = "blocked"
-        owned = prior.get(os.fspath(path)) is not None and prior.get(os.fspath(path)) == current
+        owned = (prior.get(os.fspath(path)) is not None and prior.get(os.fspath(path)) == current) or \
+            (role_service and current is not None and current == want)
         act = {"kind": kind, "path": os.fspath(path), "state": state, "sha256": want, "previousSha256": current,
                "mode": oct(mode), "owned": owned, "ownedSha256": current if owned else None}
         if state == "blocked" and not blocked_dir:
@@ -1397,7 +1501,11 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
             act["disabled"] = launchctl_disabled(ctx)
             if act["disabled"] and not act["held"] and not act.get("note"):
                 act["note"] = "launchd has this label disabled with no hold mark; --apply enables it before bootstrap"
+            if role_service and state != "blocked":
+                plan_role_service(ctx, act)
         actions.append(act)
+    if getattr(ctx, "role_daemon", False) and ctx.headless:
+        plan_agent_move(ctx, actions)
     declared = {kind for kind, _ in companions.values()}
     if dedicated_of(ctx) is not None:
         # the manifest dropped its watch loop or its relay: stop and remove the agent this install wrote, if unchanged
@@ -1415,7 +1523,63 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
                                 "ownedSha256": current if ours else None,
                                 "note": "" if ours else "changed since this command wrote it"})
     actions.append({"kind": "verify", "state": "pending", "note": f"GET {ctx.scope_api}/actions/runners, name {ctx.name}"})
+    if getattr(ctx, "root_step", None):
+        # last, so that nothing above waits for it: the runner keeps running as it does, and the apply fails on it
+        actions.append({"kind": "root-step", "path": os.fspath(ctx.state / DAEMON_STAGE), "label": ctx.label,
+                        "state": "needed", "note": root_step_note(ctx, ctx.root_step)})
     return actions
+
+
+def plan_role_service(ctx: Context, act: dict[str, Any]) -> None:
+    """ROLE_DAEMON: a LaunchDaemon step this user cannot take without a password (writing the plist or the
+    supervisor, or loading the daemon without the root step's sudoers rule) is kept for the root step instead of
+    failing under sudo: the running service stays as it is."""
+    write = act["state"] in {"create", "update"} or helper_stale()
+    load = act.get("loaded") is False and not act.get("held")
+    if write and not root_writes(ctx):
+        ctx.root_step = ("its LaunchDaemon plist changed" if act["state"] in {"create", "update"}
+                         else "the headless supervisor changed")
+    elif load and not root_launchctl(ctx):
+        ctx.root_step = "its LaunchDaemon is not loaded, and this user has no sudoers rule to load it"
+    else:
+        return
+    if act["state"] in {"create", "update", "unchanged"}:
+        act["state"] = "kept"
+        act["note"] = "; ".join(filter(None, [act.get("note"), "kept for the root step below"]))
+
+
+def helper_stale() -> bool:
+    """The headless supervisor is missing, not root's, or not HEADLESS_HELPER."""
+    try:
+        return SYSTEM_HELPER.read_bytes() != HEADLESS_HELPER or SYSTEM_HELPER.stat().st_uid != 0
+    except OSError:
+        return True
+
+
+def plan_agent_move(ctx: Context, actions: list[dict[str, Any]]) -> None:
+    """ROLE_DAEMON: the LaunchAgent a gateway or small runner ran as before. The apply boots it out while the runner
+    is idle and removes its plist; the daemon's supervisor waits while its listener runs, then takes the runner. With
+    the daemon loaded already (the root step loaded it) the move goes first, so a relabel in the same apply re-
+    registers under the daemon; otherwise it follows the step that loads the daemon, and a relabel waits for it."""
+    if ctx.skip_launchctl:
+        return
+    loaded = run([LAUNCHCTL, "print", f"{agent_domain(ctx)}/{ctx.label}"])[0] == 0
+    if not loaded and not ctx.plist_path.exists():
+        return
+    move = {"kind": "agent-move", "path": os.fspath(ctx.plist_path), "label": ctx.label, "state": "move",
+            "loaded": loaded, "note": "the LaunchAgent this runner ran as: booted out when the runner is idle, its "
+                                      "plist removed, once the LaunchDaemon is loaded"}
+    agent = next((a for a in actions if a["kind"] == "agent"), None)
+    register = next((a for a in actions if a["kind"] == "register"), None)
+    if agent is not None and agent.get("loaded") and register is not None:
+        actions.insert(actions.index(register), move)
+        return
+    if register is not None and register["state"] == "relabel" and loaded:
+        # a relabel now would stop the daemon (not loaded yet) while the agent's listener runs under the old
+        # registration; it follows the move, on the next apply
+        register.update(state="unchanged", deferred="relabel",
+                        note="the relabel waits for the move to the LaunchDaemon; the next apply re-registers it")
+    actions.insert(actions.index(agent) + 1 if agent is not None else len(actions), move)
 
 
 def plan_uninstall(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -1850,7 +2014,12 @@ def install_service_file(ctx: Context, path: Path, data: bytes, mode: int) -> No
 def ensure_headless_helper(ctx: Context) -> None:
     if not ctx.headless:
         return
-    helper = b"#!/bin/sh\nset -eu\nrunner=\"$1\"\nwhile /usr/bin/pgrep -f \"$runner/bin/Runner.Listener\" >/dev/null 2>&1 || /usr/bin/pgrep -f \"$runner/glaeda-hooks/listen.sh\" >/dev/null 2>&1; do\n  /bin/sleep 15\ndone\nexec \"$runner/glaeda-hooks/listen.sh\"\n"
+    helper = HEADLESS_HELPER
+    try:
+        if SYSTEM_HELPER.read_bytes() == helper and SYSTEM_HELPER.stat().st_uid == 0:
+            return  # ROLE_DAEMON: the root step installed it; a host whose sudo asks for a password needs no write
+    except OSError:
+        pass
     with tempfile.NamedTemporaryFile(prefix="glaeda-supervise-", delete=False) as tmp:
         tmp.write(helper)
         tmp.flush()
@@ -1883,7 +2052,8 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
         # its labels already match (another apply re-registered it): a drain left behind would keep it off
         for act in [a for a in actions if a["kind"] == "register"]:
             note_drain_end(act, end_drain(ctx))
-    if ctx.headless and not failed and not ctx.skip_launchctl:
+    if ctx.headless and not failed and not ctx.skip_launchctl and \
+            not (getattr(ctx, "role_daemon", False) and getattr(ctx, "root_step", None)):
         try:
             ensure_headless_helper(ctx)
         except OSError as error:
@@ -1912,6 +2082,9 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
         act["receiptLabels"] = observed
     for act in actions:
         act.setdefault("applied", False)
+        if act["kind"] == "root-step" and act["state"] == "needed":
+            stage_root_step(ctx, act)  # whatever failed before it: the root step needs the plist either way
+            continue
         if failed:
             if act["state"] in {"create", "update", "pending"}:
                 act["state"], act["note"] = "skipped", "an earlier step was blocked or failed"
@@ -1989,6 +2162,8 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
                 if kind == "relay":
                     remove_relay_socket(ctx, act)
                 act["applied"], act["owned"], act["ownedSha256"] = True, False, None
+        elif kind == "agent-move" and state == "move":
+            move_agent(ctx, act)
         elif kind == "agent" and state in {"create", "update"} and not ctx.skip_launchctl \
                 and (act.get("loaded") or getattr(ctx, "agent_started", False)) and not stop_if_idle(ctx):
             # loaded at plan time, or started since by a relabel: a bootout now would cancel its job
@@ -2042,6 +2217,39 @@ def apply_install(ctx: Context, actions: list[dict[str, Any]], receipt_doc: dict
             registration = receipt_doc.get("registration")
             if registration and registration.get("runnerId") is None:  # receipts from before .runner ids
                 registration["runnerId"] = (local_runner(ctx) or {}).get("agentId")
+
+
+def stage_root_step(ctx: Context, act: dict[str, Any]) -> None:
+    """ROLE_DAEMON: write the LaunchDaemon plist the root step installs (it validates it first), and fail the apply
+    with the note that names the root step: until it runs, this runner is not the daemon it should be."""
+    path = Path(act["path"])
+    try:
+        ctx.state.mkdir(parents=True, exist_ok=True, mode=0o700)
+        write_atomic(path, daemon_plist_bytes(ctx), 0o644)
+        act["staged"] = True
+    except OSError as error:
+        act["note"] = f"staging the plist failed: {error}; {act['note']}"[-900:]  # the command last: the fleet shows the tail
+    act["state"] = "failed"
+
+
+def move_agent(ctx: Context, act: dict[str, Any]) -> None:
+    """ROLE_DAEMON: retire the runner's old LaunchAgent once its LaunchDaemon is loaded, booted out only while the
+    runner has no job (stop_if_idle: its listeners frozen for the look). Busy: it drains (RUNNER_DRAIN), so the
+    next apply finds it idle; the job is never cancelled. The daemon's supervisor takes the runner within 15 s."""
+    if not launchctl_loaded(ctx):
+        act["state"], act["note"] = "failed", ("its LaunchDaemon is not loaded; the LaunchAgent keeps running the "
+                                               "runner. Re-run after the root step")
+        return
+    if act.get("loaded") and not stop_if_idle(ctx, lambda: bootout_watch(ctx, ctx.label)):
+        act["state"], act["note"] = "failed", ("the runner has a job (or its LaunchAgent did not unload); nothing "
+                                               "changed, re-run when idle")
+        if start_drain(ctx, "its move to a LaunchDaemon"):
+            act["note"] += f"; {DRAINING}"
+            act["draining"] = True
+        return
+    Path(act["path"]).unlink(missing_ok=True)
+    act["state"], act["applied"], act["loaded"] = "moved", True, False
+    note_drain_end(act, end_drain(ctx))
 
 
 def local_runner(ctx: Context) -> dict[str, Any] | None:
@@ -3456,6 +3664,11 @@ def pool_user_refusal(ctx: Context, manifest: Any, member: str, uninstall: bool,
 PROTECTED_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 PROTECTED_PYTHON = "/usr/bin/python3"
 PROTECTED_DEVELOPER_DIR = "/Library/Developer/CommandLineTools"
+# NO_RUST_GATE: the hook's toolchain gate (GLAEDA_RUNNER_TOOLCHAIN_GATE) holds a dedicated listener off while rustup,
+# rustc or cargo is missing from its PATH. A user entry's PATH is PROTECTED_PATH, which holds none of them by design, so
+# that gate could never pass and the runner never listened (an hq-app-probe entry, 2026-11-25: its jobs queued 4 h+).
+# A user entry's jobs bring their own toolchain if they need one, as they already choose their own Xcode.
+NO_RUST_GATE_ENV = "GLAEDA_RUNNER_TOOLCHAIN_GATE"
 TOOLCHAIN_MISSING = "protected-toolchain"
 
 
@@ -3920,6 +4133,9 @@ def install_or_uninstall(ctx: Context, args: argparse.Namespace, raw_argv: list[
             ctx.labels = registered["labels"]
         if not args.name and not args.member and registered.get("name"):
             ctx.name = registered["name"]
+    if not args.uninstall:
+        ctx.host_name = args.member
+        promote_role_daemon(ctx)  # ROLE_DAEMON: once the role is known, from the manifest or the kept member
     ctx.allow_stale = args.allow_stale
     ctx.copy = None if args.uninstall else copy_check(ctx)
     if ctx.copy is not None and ctx.copy["state"] == "stale":

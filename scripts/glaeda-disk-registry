@@ -1,0 +1,522 @@
+#!/usr/bin/env python3
+"""glaeda-disk-registry: the declared list of what may persist on a fleet host, and LRU eviction to its budgets.
+
+cmuxterm-hq docs/design/declared-disk-persistence.md, section 2 (PR 2 of 3). Leo, the ask: "man glaeda needs to be more
+aggressive... again!"; approving the design: "oh yeah that makes sense. i guess it's aboute seeing if we can detect
+deletable before vs deciding after. this seems good."
+
+config/disk-registry.toml declares each cache that may outlive a job: its path, owner, whether it regenerates and its
+size budget. This tool reads it and:
+
+  status [--json]          each cache's size against its budget (read only)
+  evict [--json] [--apply] [--max-units N]
+                           the LRU plan: for each regenerating cache, least recently used units first until under
+                           budget, plus units idle past idle_shrink_days down to min_gib. Without --apply, or without
+                           GLAEDA_DISK_REGISTRY=1 in the environment, it prints the plan and deletes nothing.
+                           A cache with regenerates = false is never evicted; over budget it is an alarm line.
+                           One pass deletes at most --max-units units (default 8); the rest wait for the next pass.
+  slot NAME --stream S     the per-stream slot path of a {stream} cache (derived-data), created with --create
+
+Off by default: a host opts into deletion with GLAEDA_DISK_REGISTRY=1. A unit used within in_use_hours is never
+evicted (a running job may hold it). Deletion never follows a symlink, never crosses into another filesystem, never
+removes a cache root itself, and re-reads a unit's last use right before deleting it.
+
+Python 3.11+ (tomllib).
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import glob
+import json
+import os
+import re
+import shutil
+import socket
+import stat
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Iterator
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
+    tomllib = None  # type: ignore[assignment]
+
+SCHEMA = "glaeda-disk-registry/v1"
+FLAG_ENV = "GLAEDA_DISK_REGISTRY"
+REGISTRY_ENV = "GLAEDA_DISK_REGISTRY_FILE"
+UPDATE_DIR = os.path.expanduser("~/.local/state/glaeda/update")
+LOCK_PATH = os.environ.get("GLAEDA_DISK_REGISTRY_LOCK") or os.path.expanduser(
+    "~/.local/state/glaeda/disk-registry.lock")
+GIB = 1024 ** 3
+STREAM = "{stream}"
+STREAM_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}")
+CACHE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
+MAX_UNITS_PER_PASS = 8  # one pass deletes at most this many units; the next pass, an hour on, takes the rest
+DEFAULTS = {"evict": "lru", "idle_shrink_days": 3.0, "in_use_hours": 6.0}
+# [checker] (design section 3, read by glaeda-disk): undeclared growth past this many GiB on a volume is an alarm
+CHECKER_DEFAULTS = {"undeclared_alarm_gib": 5.0}
+
+
+class RegistryError(ValueError):
+    pass
+
+
+@dataclass
+class Cache:
+    name: str
+    paths: list[str]
+    owner: str
+    regenerates: bool
+    budget_gib: float
+    min_gib: float = 0.0
+    evict: str = "lru"
+    idle_shrink_days: float = 3.0
+    in_use_hours: float = 6.0
+
+    @property
+    def per_stream(self) -> bool:
+        return any(STREAM in p for p in self.paths)
+
+
+@dataclass
+class Registry:
+    caches: list[Cache]
+    base_gib: float | None
+    source: str
+    host: str
+    undeclared_alarm_gib: float = CHECKER_DEFAULTS["undeclared_alarm_gib"]
+
+
+@dataclass
+class Unit:
+    path: Path
+    root: Path
+    bytes: int
+    last_use: float
+
+
+@dataclass
+class Plan:
+    cache: Cache
+    total: int
+    units: list[Unit]
+    evict: list[tuple[Unit, str]] = field(default_factory=list)
+    alarm: str | None = None
+    notes: list[str] = field(default_factory=list)
+
+
+def host_key() -> str:
+    """The short, lowercased hostname, as config/runner-gate.json keys a host."""
+    host = socket.gethostname().split(".")[0].lower()
+    return re.sub(r"[^a-z0-9-]+", "-", host).strip("-")
+
+
+def _number(value: Any, where: str, minimum: float = 0.0) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < minimum:
+        raise RegistryError(f"{where}: expected a number >= {minimum:g}, got {value!r}")
+    return float(value)
+
+
+def parse(doc: dict[str, Any], host: str, source: str = "<doc>") -> Registry:
+    """Validate a registry document and apply [hosts.<host>] overrides. Raises RegistryError on anything unknown or
+    malformed: a registry we cannot read exactly evicts nothing."""
+    if doc.get("schema") != SCHEMA:
+        raise RegistryError(f"schema is {doc.get('schema')!r}, not {SCHEMA}")
+    defaults = dict(DEFAULTS)
+    for key, value in (doc.get("defaults") or {}).items():
+        if key not in DEFAULTS:
+            raise RegistryError(f"defaults.{key}: unknown key")
+        defaults[key] = value
+    if defaults["evict"] != "lru":
+        raise RegistryError(f"defaults.evict: only 'lru' is supported, got {defaults['evict']!r}")
+    overrides = ((doc.get("hosts") or {}).get(host) or {}).get("cache") or {}
+    base = doc.get("base")
+    base_gib = _number(base["expected_gib"], "base.expected_gib") if isinstance(base, dict) and "expected_gib" in base \
+        else None
+    caches: list[Cache] = []
+    seen: set[str] = set()
+    for i, raw in enumerate(doc.get("cache") or []):
+        where = f"cache[{i}]"
+        if not isinstance(raw, dict):
+            raise RegistryError(f"{where}: not a table")
+        name = raw.get("name")
+        if not isinstance(name, str) or not CACHE_NAME.fullmatch(name) or name in seen:
+            raise RegistryError(f"{where}: name {name!r} is missing, not a plain name, or repeated")
+        seen.add(name)
+        entry = {**raw, **(overrides.get(name) or {})}
+        known = {"name", "path", "owner", "regenerates", "budget_gib", "min_gib", "evict", "idle_shrink_days",
+                 "in_use_hours"}
+        if unknown := set(entry) - known:
+            raise RegistryError(f"{name}: unknown key(s) {sorted(unknown)}")
+        paths = entry.get("path")
+        paths = [paths] if isinstance(paths, str) else paths
+        if not isinstance(paths, list) or not paths or not all(isinstance(p, str) and p for p in paths):
+            raise RegistryError(f"{name}: path must be a string or a list of strings")
+        for p in paths:
+            expanded = os.path.expanduser(p)
+            if not os.path.isabs(expanded) or ".." in Path(expanded).parts:
+                raise RegistryError(f"{name}: path {p!r} must be absolute (or ~/...) with no '..'")
+            if p.count(STREAM) > 1 or (STREAM in p and not p.endswith("/" + STREAM)):
+                raise RegistryError(f"{name}: {STREAM} may only be the last path component ({p!r})")
+            probe = Path(expanded.replace(STREAM, "x"))
+            if len(probe.parts) < 3:
+                raise RegistryError(f"{name}: path {p!r} is too close to /")
+        if not isinstance(entry.get("owner"), str) or not entry["owner"]:
+            raise RegistryError(f"{name}: owner is required")
+        if not isinstance(entry.get("regenerates"), bool):
+            raise RegistryError(f"{name}: regenerates must be true or false")
+        evict = entry.get("evict", defaults["evict"])
+        if evict != "lru":
+            raise RegistryError(f"{name}: evict {evict!r} is not supported")
+        budget = _number(entry.get("budget_gib"), f"{name}.budget_gib")
+        min_gib = _number(entry.get("min_gib", 0), f"{name}.min_gib")
+        if min_gib > budget:
+            raise RegistryError(f"{name}: min_gib {min_gib:g} is over budget_gib {budget:g}")
+        caches.append(Cache(
+            name=name, paths=paths, owner=entry["owner"], regenerates=entry["regenerates"], budget_gib=budget,
+            min_gib=min_gib, evict=evict,
+            idle_shrink_days=_number(entry.get("idle_shrink_days", defaults["idle_shrink_days"]),
+                                     f"{name}.idle_shrink_days"),
+            in_use_hours=_number(entry.get("in_use_hours", defaults["in_use_hours"]), f"{name}.in_use_hours")))
+    if not caches:
+        raise RegistryError("no [[cache]] entries")
+    checker = dict(CHECKER_DEFAULTS)
+    raw_checker = doc.get("checker") or {}
+    if not isinstance(raw_checker, dict):
+        raise RegistryError("checker: not a table")
+    host_checker = ((doc.get("hosts") or {}).get(host) or {}).get("checker") or {}
+    for key, value in {**raw_checker, **host_checker}.items():
+        if key not in CHECKER_DEFAULTS:
+            raise RegistryError(f"checker.{key}: unknown key")
+        checker[key] = _number(value, f"checker.{key}")
+    return Registry(caches=caches, base_gib=base_gib, source=source, host=host,
+                    undeclared_alarm_gib=checker["undeclared_alarm_gib"])
+
+
+def registry_file(explicit: str | None = None) -> Path:
+    """--registry, else $GLAEDA_DISK_REGISTRY_FILE, else the release glaeda-update installed, else this checkout's."""
+    if explicit or os.environ.get(REGISTRY_ENV):
+        return Path(explicit or os.environ[REGISTRY_ENV])
+    with contextlib.suppress(OSError, ValueError, AttributeError, TypeError):
+        tag = json.loads((Path(UPDATE_DIR) / "state.json").read_text()).get("current")
+        if isinstance(tag, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,80}", tag):
+            installed = Path(UPDATE_DIR) / "generations" / tag / "glaeda" / "config" / "disk-registry.toml"
+            if installed.is_file():
+                return installed
+    return Path(__file__).resolve().parent.parent / "config" / "disk-registry.toml"
+
+
+def load(path: Path, host: str | None = None) -> Registry:
+    if tomllib is None:
+        raise RegistryError("needs Python 3.11+ (tomllib)")
+    try:
+        doc = tomllib.loads(path.read_text())
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise RegistryError(f"{path}: {error}") from error
+    return parse(doc, host or host_key(), os.fspath(path))
+
+
+def roots(cache: Cache) -> list[Path]:
+    """The existing directories a cache's paths name (globs expanded, {stream} stripped to its parent). Symlinked
+    roots are skipped: a registered path must be the directory itself."""
+    out: list[Path] = []
+    for p in cache.paths:
+        expanded = os.path.expanduser(p)
+        if expanded.endswith("/" + STREAM):
+            expanded = expanded[: -len("/" + STREAM)]
+        matches = sorted(glob.glob(expanded)) if glob.has_magic(expanded) else [expanded]
+        for m in matches:
+            with contextlib.suppress(OSError):
+                if stat.S_ISDIR(os.lstat(m).st_mode) and Path(m) not in out:
+                    out.append(Path(m))
+    return out
+
+
+def tree_bytes(path: Path) -> int:
+    """Allocated bytes under path: no symlink followed, no other filesystem entered, unreadable parts skipped."""
+    try:
+        top = os.lstat(path)
+    except OSError:
+        return 0
+    total = top.st_blocks * 512
+    if not stat.S_ISDIR(top.st_mode):
+        return total
+    stack = [path]
+    while stack:
+        current = stack.pop()
+        with contextlib.suppress(OSError), os.scandir(current) as entries:
+            for entry in entries:
+                with contextlib.suppress(OSError):
+                    st = entry.stat(follow_symlinks=False)
+                    total += st.st_blocks * 512
+                    if stat.S_ISDIR(st.st_mode) and st.st_dev == top.st_dev:
+                        stack.append(Path(entry.path))
+    return total
+
+
+def _use_time(st: os.stat_result) -> float:
+    """A directory's modification time; a file's newer of access and modification. A directory's access time is not
+    used: listing it (this tool's own scan) moves it under relatime and would make every unit look fresh."""
+    return st.st_mtime if stat.S_ISDIR(st.st_mode) else max(st.st_atime, st.st_mtime)
+
+
+def last_use(path: Path) -> float:
+    """The newest use of path and its direct children (bounded: one directory read)."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return 0.0
+    newest = _use_time(st)
+    if stat.S_ISDIR(st.st_mode):
+        with contextlib.suppress(OSError), os.scandir(path) as entries:
+            for entry in entries:
+                with contextlib.suppress(OSError):
+                    newest = max(newest, _use_time(entry.stat(follow_symlinks=False)))
+    return newest
+
+
+def units(cache: Cache) -> list[Unit]:
+    """A cache's eviction units: for a {stream} cache each slot, else each direct child of each root."""
+    out = []
+    for root in roots(cache):
+        with contextlib.suppress(OSError), os.scandir(root) as entries:
+            for entry in sorted(entries, key=lambda e: e.name):
+                path = Path(entry.path)
+                out.append(Unit(path=path, root=root, bytes=tree_bytes(path), last_use=last_use(path)))
+    return out
+
+
+def plan(cache: Cache, now: float | None = None, found: list[Unit] | None = None) -> Plan:
+    """What `evict` would do for one cache. No side effects."""
+    now = time.time() if now is None else now
+    found = units(cache) if found is None else found
+    total = sum(u.bytes for u in found)
+    result = Plan(cache=cache, total=total, units=found)
+    budget, floor = cache.budget_gib * GIB, cache.min_gib * GIB
+    if not cache.regenerates:
+        if total > budget:
+            result.alarm = (f"{cache.name}: {total / GIB:.1f} GiB over its {cache.budget_gib:g} GiB budget; "
+                            f"regenerates = false, so it is held, not evicted (owner {cache.owner})")
+        return result
+    in_use = now - cache.in_use_hours * 3600
+    idle = now - cache.idle_shrink_days * 86400
+    left = total
+    for unit in sorted(found, key=lambda u: (u.last_use, os.fspath(u.path))):
+        if unit.last_use >= in_use:
+            if left > budget:
+                result.notes.append(f"{unit.path.name}: used within {cache.in_use_hours:g} h, kept although over "
+                                    "budget")
+            continue
+        if left > budget:
+            why = f"over budget ({left / GIB:.1f} > {cache.budget_gib:g} GiB), least recently used"
+        elif unit.last_use < idle and left > floor:
+            why = f"idle over {cache.idle_shrink_days:g} days, shrinking toward {cache.min_gib:g} GiB"
+        else:
+            continue
+        result.evict.append((unit, why))
+        left -= unit.bytes
+    return result
+
+
+def remove_unit(unit: Unit, cache: Cache, now: float | None = None) -> str | None:
+    """Delete one planned unit after a fresh look; None when it is gone, else why it was kept."""
+    now = time.time() if now is None else now
+    try:
+        st = os.lstat(unit.path)
+        root_st = os.lstat(unit.root)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        return f"{unit.path}: {error.strerror or error}"
+    if unit.path.parent != unit.root or unit.path == unit.root:
+        return f"{unit.path}: not a direct child of {unit.root}, kept"
+    if stat.S_ISLNK(st.st_mode) or stat.S_ISLNK(root_st.st_mode):
+        return f"{unit.path}: a symlink, kept"
+    if st.st_dev != root_st.st_dev:
+        return f"{unit.path}: another filesystem, kept"
+    if last_use(unit.path) >= now - cache.in_use_hours * 3600:
+        return f"{unit.path}: used since the plan, kept"
+    try:
+        if stat.S_ISDIR(st.st_mode):
+            shutil.rmtree(unit.path)
+        else:
+            os.unlink(unit.path)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        return f"{unit.path}: not removed: {error.strerror or error}"
+    return None if not os.path.lexists(unit.path) else f"{unit.path}: still there after removal"
+
+
+@contextlib.contextmanager
+def held_lock(path: str) -> Iterator[bool]:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def slot_path(cache: Cache, stream: str) -> Path:
+    if not STREAM_NAME.fullmatch(stream) or stream in (".", ".."):
+        raise RegistryError(f"stream {stream!r} is not a plain name")
+    templated = [p for p in cache.paths if STREAM in p]
+    if len(templated) != 1:
+        raise RegistryError(f"{cache.name} has no single {STREAM} path")
+    return Path(os.path.expanduser(templated[0]).replace(STREAM, stream))
+
+
+def cache_by_name(registry: Registry, name: str) -> Cache:
+    for cache in registry.caches:
+        if cache.name == name:
+            return cache
+    raise RegistryError(f"no cache named {name!r} in {registry.source}")
+
+
+def plan_json(p: Plan) -> dict[str, Any]:
+    return {"cache": p.cache.name, "owner": p.cache.owner, "regenerates": p.cache.regenerates,
+            "budget_gib": p.cache.budget_gib, "used_gib": round(p.total / GIB, 2), "units": len(p.units),
+            "evict": [{"path": os.fspath(u.path), "gib": round(u.bytes / GIB, 2), "why": why} for u, why in p.evict],
+            "alarm": p.alarm, "notes": p.notes}
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="cmux-disk-registry" if os.path.basename(sys.argv[0]) == "cmux-disk-registry" else "glaeda-disk-registry", description=__doc__.split("\n\n")[0])
+    parser.add_argument("--registry", help="registry file (default: the installed release's, else this checkout's)")
+    parser.add_argument("--host", help="host key for [hosts.<name>] overrides (default: this host)")
+    sub = parser.add_subparsers(dest="command", required=True)
+    s = sub.add_parser("status", help="each cache's size against its budget (read only)")
+    s.add_argument("--json", action="store_true")
+    e = sub.add_parser("evict", help="the LRU plan; deletes only with --apply and GLAEDA_DISK_REGISTRY=1")
+    e.add_argument("--json", action="store_true")
+    e.add_argument("--apply", action="store_true")
+    e.add_argument("--max-units", type=int, default=MAX_UNITS_PER_PASS,
+                   help=f"delete at most this many units per pass (default {MAX_UNITS_PER_PASS}); the rest wait")
+    sl = sub.add_parser("slot", help="the per-stream slot path of a {stream} cache")
+    sl.add_argument("name")
+    sl.add_argument("--stream", required=True)
+    sl.add_argument("--create", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        registry = load(registry_file(args.registry), args.host)
+        if args.command == "slot":
+            path = slot_path(cache_by_name(registry, args.name), args.stream)
+            if args.create:
+                path.mkdir(parents=True, exist_ok=True, mode=0o755)
+            print(path)
+            return 0
+    except RegistryError as error:
+        print(f"glaeda-disk-registry: {error}", file=sys.stderr)
+        return 2
+    if args.command == "status":
+        plans = [plan(c) for c in registry.caches]
+        if args.json:
+            print(json.dumps({"schema": SCHEMA, "host": registry.host, "registry": registry.source,
+                              "base_gib": registry.base_gib, "caches": [plan_json(p) for p in plans]}))
+        else:
+            for p in plans:
+                mark = "ALARM " if p.alarm else ("over " if p.total > p.cache.budget_gib * GIB else "")
+                print(f"{p.cache.name}: {p.total / GIB:.1f} / {p.cache.budget_gib:g} GiB, {len(p.units)} unit(s), "
+                      f"{'regenerates' if p.cache.regenerates else 'held'}, owner {p.cache.owner} {mark}".rstrip())
+        return 1 if any(p.alarm for p in plans) else 0
+    enabled = os.environ.get(FLAG_ENV, "") == "1"
+    apply = args.apply and enabled
+    with held_lock(LOCK_PATH) as locked:
+        if not locked:
+            print("glaeda-disk-registry: another evict pass holds the lock; skipped", file=sys.stderr)
+            return 0
+        plans = [plan(c) for c in registry.caches]
+        kept: list[str] = []
+        freed = 0
+        deferred = 0
+        budget_units = max(0, args.max_units)
+        if apply:
+            for p in plans:
+                for unit, _why in p.evict:
+                    if budget_units <= 0:
+                        deferred += 1
+                        continue
+                    budget_units -= 1
+                    why = remove_unit(unit, p.cache)
+                    if why:
+                        kept.append(why)
+                    else:
+                        freed += unit.bytes
+        mode = "applied" if apply else ("dry run (--apply not given)" if enabled else
+                                         f"dry run ({FLAG_ENV}=1 not set; off by default)")
+        if args.json:
+            print(json.dumps({"schema": SCHEMA, "host": registry.host, "mode": mode, "freed_gib": round(freed / GIB, 2),
+                              "deferred": deferred, "kept": kept, "caches": [plan_json(p) for p in plans]}))
+        else:
+            print(f"glaeda-disk-registry evict: {mode}")
+            for p in plans:
+                for unit, why in p.evict:
+                    print(f"  {p.cache.name}: {unit.path} ({unit.bytes / GIB:.1f} GiB): {why}")
+                for note in p.notes:
+                    print(f"  {p.cache.name}: {note}")
+                if p.alarm:
+                    print(f"  ALARM {p.alarm}")
+            for why in kept:
+                print(f"  kept: {why}")
+            if apply:
+                print(f"  freed {freed / GIB:.1f} GiB" + (f"; {deferred} unit(s) past --max-units wait for the next pass"
+                                                         if deferred else ""))
+    return 1 if any(p.alarm for p in plans) else 0
+
+
+def count_old_name(old: str, new: str) -> None:
+    """The rename to cmux-* names (Leo, 2026-11-25: "start migrating off glaeda and into cmux-prefixed naming
+    tooling"): run as NEW (scripts/NEW sets CMUX_NAME_AS), nothing happens; run under the OLD name, this use is
+    counted, silently, in ~/.local/state/cmux-names/OLD.json (uses per UTC day for 14 days, the last use, the last
+    few callers), so the old name can be removed once the fleet shows it unused (cmuxterm-hq
+    docs/design/glaeda-into-cmux.md, Rename map). Never prints, never raises: a caller parsing output sees nothing."""
+    as_new = os.environ.get("CMUX_NAME_AS") == new
+    # kept for this program's own children (glaeda-disk's background --refresh and --census run __file__): one call,
+    # one count. Another tool it runs compares this to its own new name, so it still counts its own old name.
+    os.environ["CMUX_NAME_AS"] = new
+    if as_new:
+        return
+    try:
+        import json as _json
+        import time as _time
+        base = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state") / "cmux-names"
+        base.mkdir(parents=True, exist_ok=True)
+        path = base / f"{old}.json"
+        try:
+            data = _json.loads(path.read_text())
+        except (OSError, ValueError):
+            data = {}
+        data = data if isinstance(data, dict) else {}
+        days = {k: v for k, v in (data.get("days") or {}).items() if isinstance(v, int)}
+        today = _time.strftime("%Y-%m-%d", _time.gmtime())
+        days[today] = days.get(today, 0) + 1
+        try:
+            raw = Path(f"/proc/{os.getppid()}/cmdline").read_bytes()
+            parent = raw.replace(b"\0", b" ").decode(errors="replace").strip()
+        except OSError:  # macOS has no /proc; the parent's name is enough to find a caller
+            parent = f"pid {os.getppid()}"
+        callers = [c for c in (data.get("callers") or []) if isinstance(c, str) and c != parent[:200]]
+        data = {"schema": 1, "old": old, "new": new, "last": _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime()),
+                "days": dict(sorted(days.items())[-14:]), "callers": ([parent[:200]] + callers)[:5]}
+        tmp = path.with_name(f".{path.name}.{os.getpid()}")
+        tmp.write_text(_json.dumps(data, sort_keys=True) + "\n")
+        os.replace(tmp, path)
+    except Exception:  # noqa: BLE001  counting never costs the call
+        pass
+
+
+if __name__ == "__main__":
+    count_old_name("glaeda-disk-registry", "cmux-disk-registry")
+    sys.exit(main())

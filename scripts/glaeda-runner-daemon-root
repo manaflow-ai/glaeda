@@ -1,0 +1,322 @@
+#!/bin/bash
+# glaeda-runner-daemon-root USER K [K ...]: the one root step of ROLE_DAEMON (glaeda-cmux-runner), as root.
+#
+# Leo, 2026-11-23, after cmuxs-mac-mini-5 lost its login session and all 17 of its runners went down: "prevent these
+# in the future across all". A gateway or small runner runs as a system LaunchDaemon, which a logout leaves running.
+# A fleet mini's sudo asks for a password and an apply has no tty, so glaeda-cmux-runner --apply stages each such
+# runner's daemon plist (~USER/.local/state/glaeda/cmux-runner/instance-K/daemon.plist), fails with a ROOT STEP note,
+# and this script, run from an origin's glaeda checkout on main, does the rest:
+#
+#   { echo 'set -- cmux 14 15'; cat scripts/glaeda-runner-daemon-root; } | fleet-sudo HOST -f -
+#
+# For each instance K it
+#   - reads the staged plist (a regular file USER owns, no symlink, at most 64 KiB) and accepts it only if it is the
+#     daemon glaeda-cmux-runner writes for that instance: Label com.teamleaderleo.glaeda.cmux-runner.K, UserName
+#     USER, the root-owned supervisor with this runner's directory and logs, no key outside the list below (no
+#     GroupName, no StandardOutPath, nothing that runs as root). PR jobs run as USER and can write that file, so
+#     nothing in it is trusted further than that; the plist is re-serialized from the checked keys;
+#   - installs the supervisor (/usr/local/sbin/glaeda-headless-supervise, root:wheel 755) and the plist
+#     (/Library/LaunchDaemons/<label>.plist, root:wheel 644);
+#   - writes /etc/sudoers.d/glaeda-runner-daemons (checked with visudo -c first) with exactly the commands
+#     glaeda-cmux-runner and glaeda-mini-health then run for that label without a password: launchctl bootstrap,
+#     bootout, enable, print and kickstart of system/<label>, and rm -f of its plist. None of them writes a plist;
+#   - loads the daemon (launchctl enable, bootstrap). Its supervisor waits while the runner's LaunchAgent listener
+#     runs, so nothing starts twice; the next glaeda-cmux-runner --apply boots that agent out once the runner is
+#     idle and removes its plist. A daemon already loaded with a different plist is reloaded only while the runner
+#     has no job (its listeners frozen for the look); with a job it is left as it is and said so.
+#   - prints `launchctl print system/<label>`'s state, program and pid as the readback.
+# It never touches the drain marker, the gate or any other runner, and changes nothing for an instance it refuses.
+set -euo pipefail
+if [ "$(/usr/bin/id -u)" != 0 ]; then
+    echo "glaeda-runner-daemon-root: run as root: { echo 'set -- USER K'; cat scripts/glaeda-runner-daemon-root; } | fleet-sudo HOST -f -" >&2
+    exit 2
+fi
+if [ "$#" -lt 2 ]; then
+    echo "usage: glaeda-runner-daemon-root USER K [K ...] (as root; the instance numbers the apply's ROOT STEP named)" >&2
+    exit 2
+fi
+exec </dev/null 3<<'PY' /usr/bin/python3 -I /dev/fd/3 "$@"
+import os
+import plistlib
+import pwd
+import re
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+LABEL = "com.teamleaderleo.glaeda.cmux-runner"
+DAEMONS = "/Library/LaunchDaemons"
+HELPER = "/usr/local/sbin/glaeda-headless-supervise"
+SUDOERS = "/etc/sudoers.d/glaeda-runner-daemons"
+LAUNCHCTL = "/bin/launchctl"
+STAGE_MAX = 65536
+# glaeda-cmux-runner HEADLESS_HELPER, byte for byte (test-glaeda-cmux-runner.py keeps them equal)
+HELPER_BYTES = (b"#!/bin/sh\nset -eu\nrunner=\"$1\"\n"
+                b"if [ $# -ge 3 ]; then exec >>\"$2\" 2>>\"$3\"; fi\n"
+                b"while /usr/bin/pgrep -f \"$runner/bin/Runner.Listener\" >/dev/null 2>&1 "
+                b"|| /usr/bin/pgrep -f \"$runner/glaeda-hooks/listen.sh\" >/dev/null 2>&1; do\n  /bin/sleep 15\ndone\n"
+                b"exec \"$runner/glaeda-hooks/listen.sh\"\n")
+REQUIRED = {"Label", "ProgramArguments", "WorkingDirectory", "RunAtLoad", "KeepAlive", "UserName",
+            "EnvironmentVariables"}
+OPTIONAL = {"ThrottleInterval", "ProcessType", "SessionCreate"}
+PROCESS_TYPES = {"Interactive", "Standard", "Background", "Adaptive"}
+ENV_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+USER_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
+RULE_RE = re.compile(r"^# glaeda-runner-daemon-root: (\S+) (" + re.escape(LABEL) + r"\.[1-9][0-9]{0,2})$")
+WORKER_RE = r"/bin(?:\.[0-9.]+)?/Runner\.(Worker|Listener)(?:\s|$)"
+
+
+def say(text):
+    print(f"glaeda-runner-daemon-root: {text}", flush=True)
+
+
+def run(argv, timeout=60):
+    try:
+        done = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              text=True, timeout=timeout, check=False)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return 127, str(error)
+    return done.returncode, done.stdout.strip()
+
+
+def read_stage(path, uid):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != uid or st.st_size > STAGE_MAX:
+            raise ValueError("not a regular file of that user's, or larger than 64 KiB")
+        data = os.read(fd, STAGE_MAX + 1)
+    finally:
+        os.close(fd)
+    if len(data) > STAGE_MAX:
+        raise ValueError("larger than 64 KiB")
+    return data
+
+
+def checked(doc, user, home, k):
+    """The daemon plist for instance k, rebuilt from doc's checked keys, or ValueError naming the first mismatch."""
+    if not isinstance(doc, dict):
+        raise ValueError("not a dictionary")
+    keys = set(doc)
+    if not REQUIRED <= keys or not keys <= REQUIRED | OPTIONAL:
+        raise ValueError(f"keys {sorted(keys)}: needs {sorted(REQUIRED)}, may add {sorted(OPTIONAL)}")
+    runner = f"{home}/actions-runner-glaeda-{k}"
+    logs = f"{home}/Library/Logs/glaeda-cmux-runner-{k}"
+    want = {"Label": f"{LABEL}.{k}", "UserName": user, "WorkingDirectory": runner,
+            "ProgramArguments": [HELPER, runner, logs + ".log", logs + ".err"], "RunAtLoad": True, "KeepAlive": True}
+    for key, value in want.items():
+        if doc[key] != value or type(doc[key]) is not type(value):
+            raise ValueError(f"{key} is {doc[key]!r}, not {value!r}")
+    env = doc["EnvironmentVariables"]
+    if not isinstance(env, dict) or not all(isinstance(a, str) and ENV_KEY.fullmatch(a) and isinstance(b, str)
+                                            and "\0" not in b for a, b in env.items()):
+        raise ValueError("EnvironmentVariables is not names to strings")
+    if "ThrottleInterval" in doc and (type(doc["ThrottleInterval"]) is not int
+                                      or not 1 <= doc["ThrottleInterval"] <= 3600):
+        raise ValueError("ThrottleInterval is not 1..3600")
+    if "ProcessType" in doc and doc["ProcessType"] not in PROCESS_TYPES:
+        raise ValueError(f"ProcessType {doc['ProcessType']!r}")
+    if "SessionCreate" in doc and doc["SessionCreate"] is not True:
+        raise ValueError("SessionCreate is not true")
+    return plistlib.dumps({key: doc[key] for key in sorted(doc)}, sort_keys=True)
+
+
+def install(path, data, mode):
+    """Write data to path, root:wheel, atomically (a stage beside it, renamed over it)."""
+    directory = os.path.dirname(path)
+    fd, stage = tempfile.mkstemp(prefix=".glaeda-", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            os.fchown(f.fileno(), 0, 0)
+            os.fchmod(f.fileno(), mode)
+            f.flush()
+            os.fsync(f.fileno())
+        os.rename(stage, path)
+    except BaseException:
+        if os.path.lexists(stage):
+            os.unlink(stage)
+        raise
+
+
+def current(path):
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def loaded(label):
+    return run([LAUNCHCTL, "print", f"system/{label}"])[0] == 0
+
+
+def runner_processes(runner):
+    """(pid, kind) for this runner's Runner.Worker and Runner.Listener processes."""
+    code, out = run(["/bin/ps", "-axww", "-o", "pid=,command="])
+    if code != 0:
+        raise OSError("ps failed")
+    pattern = re.compile(re.escape(runner) + WORKER_RE)
+    found = []
+    for line in out.splitlines():
+        pid, _, command = line.strip().partition(" ")
+        match = pattern.search(command)
+        if pid.isdigit() and match:
+            found.append((int(pid), match.group(1)))
+    return found
+
+
+def reload_if_idle(label, runner, plist_path, data):
+    """Replace a loaded daemon's plist and reload it, only while the runner has no job: its listeners are frozen
+    (SIGSTOP) for the look and the bootout, so none takes a job in between. False: it has a job; nothing changed."""
+    frozen = []
+    try:
+        for pid, kind in runner_processes(runner):
+            if kind == "Worker":
+                return False
+            os.kill(pid, signal.SIGSTOP)
+            frozen.append(pid)
+        if any(kind == "Worker" for _, kind in runner_processes(runner)):
+            return False
+        run([LAUNCHCTL, "bootout", f"system/{label}"])
+        deadline = time.monotonic() + 20
+        while loaded(label) and time.monotonic() < deadline:
+            time.sleep(0.25)
+        if loaded(label):
+            raise OSError("launchd still has it after bootout")
+        install(plist_path, data, 0o644)
+        return True
+    finally:
+        for pid in frozen:
+            try:
+                os.kill(pid, signal.SIGCONT)
+            except OSError:
+                pass
+
+
+def sudoers_rules(entries):
+    lines = ["# glaeda-runner-daemons: written by glaeda-runner-daemon-root (glaeda ROLE_DAEMON); one block per runner.",
+             "# Exactly the launchctl commands glaeda-cmux-runner and glaeda-mini-health run for a runner LaunchDaemon",
+             "# of that user's; none writes a plist (the root step does that)."]
+    for user, label in sorted(entries):
+        plist = f"{DAEMONS}/{label}.plist"
+        commands = [f"{LAUNCHCTL} bootstrap system {plist}", f"{LAUNCHCTL} bootout system/{label}",
+                    f"{LAUNCHCTL} enable system/{label}", f"{LAUNCHCTL} print system/{label}",
+                    f"{LAUNCHCTL} kickstart system/{label}", f"/bin/rm -f {plist}"]
+        lines += [f"# glaeda-runner-daemon-root: {user} {label}", f"{user} ALL=(root) NOPASSWD: " + ", ".join(commands)]
+    return ("\n".join(lines) + "\n").encode()
+
+
+def write_sudoers(entries):
+    data = sudoers_rules(entries)
+    if current(SUDOERS) == data:
+        return "unchanged"
+    os.makedirs(os.path.dirname(SUDOERS), exist_ok=True)
+    fd, stage = tempfile.mkstemp(prefix=".glaeda-", dir=os.path.dirname(SUDOERS))
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            os.fchown(f.fileno(), 0, 0)
+            os.fchmod(f.fileno(), 0o440)
+        code, out = run(["/usr/sbin/visudo", "-c", "-f", stage])
+        if code != 0:
+            raise OSError(f"visudo -c refused it: {out[-300:]}")
+        os.rename(stage, SUDOERS)
+    except BaseException:
+        if os.path.exists(stage):
+            os.unlink(stage)
+        raise
+    included = any(re.match(r"\s*[#@]includedir\s+/(private/)?etc/sudoers\.d\s*$", line)
+                   for line in (current("/etc/sudoers") or b"").decode(errors="replace").splitlines())
+    return "written" + ("" if included else " (but /etc/sudoers has no includedir /private/etc/sudoers.d: it is not read)")
+
+
+def readback(label):
+    code, out = run([LAUNCHCTL, "print", f"system/{label}"])
+    if code != 0:
+        return f"launchctl print system/{label}: exit {code}: {out[-200:]}"
+    keep = [line.strip() for line in out.splitlines()
+            if re.match(r"\s*(state|pid|program|username|last exit code) = ", line)]
+    return f"launchctl print system/{label}: " + "; ".join(keep[:6])
+
+
+def main(argv):
+    user, instances = argv[0], argv[1:]
+    if not USER_RE.fullmatch(user):
+        say(f"refusing user {user!r}")
+        return 2
+    try:
+        pw = pwd.getpwnam(user)
+    except KeyError:
+        say(f"no user {user}")
+        return 2
+    if pw.pw_uid < 501:
+        say(f"refusing {user} (uid {pw.pw_uid}): a runner user is a login user")
+        return 2
+    home = pw.pw_dir.rstrip("/")
+    if any(not re.fullmatch(r"[1-9][0-9]{0,2}", k) for k in instances):
+        say(f"instance numbers are 1..999: {' '.join(instances)}")
+        return 2
+    helper_ok = current(HELPER) == HELPER_BYTES and os.lstat(HELPER).st_uid == 0 and not os.path.islink(HELPER)
+    if not helper_ok:
+        os.makedirs(os.path.dirname(HELPER), exist_ok=True)
+        install(HELPER, HELPER_BYTES, 0o755)
+        say(f"installed {HELPER}")
+    entries = set()
+    for line in (current(SUDOERS) or b"").decode(errors="replace").splitlines():
+        match = RULE_RE.match(line)
+        if match and USER_RE.fullmatch(match.group(1)):
+            entries.add((match.group(1), match.group(2)))
+    plan = []
+    failed = False
+    for k in instances:
+        label = f"{LABEL}.{k}"
+        stage = f"{home}/.local/state/glaeda/cmux-runner/instance-{k}/daemon.plist"
+        try:
+            data = checked(plistlib.loads(read_stage(stage, pw.pw_uid)), user, home, k)
+        except FileNotFoundError:
+            say(f"{label}: no staged plist at {stage}: run glaeda-cmux-runner --apply for instance {k} first "
+                "(glaeda-cmux-runner-fleet --apply --hosts HOST); it stages it; nothing changed for it")
+            failed = True
+            continue
+        except Exception as error:  # noqa: BLE001 - any refusal is this instance's, and changes nothing
+            say(f"{label}: refusing the staged plist {stage}: {error}; nothing changed for it")
+            failed = True
+            continue
+        plan.append((k, label, data))
+        entries.add((user, label))
+    if plan:
+        say(f"sudoers {SUDOERS}: {write_sudoers(entries)}")
+    for k, label, data in plan:
+        path = f"{DAEMONS}/{label}.plist"
+        runner = f"{home}/actions-runner-glaeda-{k}"
+        if current(path) == data and os.stat(path).st_uid == 0:
+            what = "plist unchanged"
+        elif loaded(label):
+            if not reload_if_idle(label, runner, path, data):
+                say(f"{label}: loaded with another plist and the runner has a job; left as it is, re-run when idle")
+                failed = True
+                continue
+            what = "plist replaced, reloaded while idle"
+        else:
+            install(path, data, 0o644)
+            what = "plist installed"
+        if not loaded(label):
+            run([LAUNCHCTL, "enable", f"system/{label}"])
+            code, out = run([LAUNCHCTL, "bootstrap", "system", path])
+            if code != 0 and not loaded(label):
+                say(f"{label}: {what}; launchctl bootstrap failed: {out[-300:]}")
+                failed = True
+                continue
+            what += ", loaded"
+        say(f"{label}: {what}. {readback(label)}")
+    if plan and not failed:
+        say("done. Next: glaeda-cmux-runner-fleet --apply --hosts HOST moves each runner off its LaunchAgent when idle")
+    return 1 if failed else 0
+
+
+sys.exit(main(sys.argv[1:]))
+PY
