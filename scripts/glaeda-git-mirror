@@ -32,6 +32,12 @@ fetch from GitHub never happens during a build.
   may borrow its objects through objects/info/alternates. A reseed replaces a broken mirror; a
   borrower that then misses an object is reset by the runner hook.
 
+- Submodules: after the fetch, each pass reads the gitlink pins and the URLs (.gitmodules) on the three
+  branch tips and keeps one bare mirror per submodule at SUBMODULES/<name>.git (ghostty, ghostty-next,
+  homebrew-cmux), holding every pin it has seen as refs/pins/<sha>, depth 1. It asks GitHub only for a pin
+  it lacks (SUBMODULE_TRIES tries with backoff), so a pass with no new pin sends GitHub nothing. The
+  runner hook's git shim serves a cmux job's `git submodule update` from these (url.file://...insteadOf).
+
 It runs only where a GitHub Actions runner is installed (~/actions-runner*/.runner) and a mirror
 source is configured (SOURCE_CONFIG), and is a no-op anywhere else. One pass at a time (flock on GIT_DIR/.lock). It needs no credential: the repository and
 the bucket are public. Prints one JSON line; the last pass's record is GIT_DIR/cmux.json.
@@ -67,6 +73,19 @@ BUNDLE_PREFIX = "git-mirror-cmux-"
 BUNDLE_KEY = re.compile(r"git-mirror-cmux-[0-9]{10}\.[0-9a-f]{12}")
 BUNDLE_FILE = "cmux.bundle"
 BRANCHES = ("main", "feat-cmux-next", "nightly-next")
+SUBMODULES = GIT_DIR / "submodules"
+SUBMODULE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+SUBMODULE_TIMEOUT = 600
+SUBMODULE_TRIES = 3
+SUBMODULE_CONFIG = {
+    "core.bare": "true",
+    "gc.auto": "0",
+    "maintenance.auto": "false",
+    "fetch.recurseSubmodules": "false",
+    "uploadpack.allowAnySHA1InWant": "true",
+    "uploadpack.allowReachableSHA1InWant": "true",
+    "protocol.version": "2",
+}
 TOOL_PATH = "/opt/homebrew/bin:/usr/local/bin"
 GIT = "/usr/bin/git" if Path("/usr/bin/git").exists() else "git"
 CURL = "/usr/bin/curl" if Path("/usr/bin/curl").exists() else "curl"
@@ -349,6 +368,90 @@ def fetch(mirror: Path, url: str, *, tries: int = FETCH_TRIES, timeout: float = 
         if attempt < tries:
             sleep(BACKOFF[min(attempt - 1, len(BACKOFF) - 1)])
     return {"ok": False, "tries": tries, "errors": errors}
+
+
+def submodule_pins(mirror: Path) -> dict[str, dict]:
+    """{name: {"url", "pins"}} for each GitHub submodule pinned on a BRANCHES tip of `mirror`, main's pin first."""
+    found: dict[str, dict] = {}
+    for branch in BRANCHES:
+        ref = f"refs/heads/{branch}"
+        try:
+            listed = git(mirror, "config", "--blob", f"{ref}:.gitmodules", "--get-regexp",
+                         r"^submodule\..*\.(path|url)$", timeout=60)
+        except subprocess.CalledProcessError:
+            continue  # no .gitmodules on this tip
+        paths: dict[str, str] = {}
+        urls: dict[str, str] = {}
+        for line in listed.splitlines():
+            key, _, value = line.partition(" ")
+            name, _, field = key[len("submodule."):].rpartition(".")
+            (paths if field == "path" else urls)[name] = value.strip()
+        if not paths:
+            continue
+        pinned: dict[str, str] = {}
+        for line in git(mirror, "ls-tree", ref, "--", *paths.values(), timeout=60).splitlines():
+            meta, _, path = line.partition("\t")
+            fields = meta.split()
+            if len(fields) == 3 and fields[1] == "commit":
+                pinned[path] = fields[2]
+        for name, path in paths.items():
+            url, pin = urls.get(name, ""), pinned.get(path)
+            if not pin or not url.startswith("https://github.com/") or not SUBMODULE_NAME.fullmatch(name):
+                continue
+            entry = found.setdefault(name, {"url": url, "pins": []})
+            if pin not in entry["pins"]:
+                entry["pins"].append(pin)
+    return found
+
+
+def has_commit(repo: Path, sha: str) -> bool:
+    try:
+        git(repo, "cat-file", "-e", f"{sha}^{{commit}}", timeout=30)
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def submodule_pass(mirror: Path, *, root: Path | None = None,
+                   runner: Callable[[Sequence[str], float], tuple[int, str]] = run_group,
+                   sleep: Callable[[float], None] = time.sleep) -> dict:
+    """Keep root/<name>.git holding every submodule pin on the mirror's tips; GitHub only for a missing pin."""
+    root = SUBMODULES if root is None else root
+    report: dict = {}
+    for name, entry in submodule_pins(mirror).items():
+        repo = root / f"{name}.git"
+        if not (repo / "HEAD").is_file():
+            repo.mkdir(parents=True, exist_ok=True)
+            git(repo, "init", "--quiet", "--bare", timeout=60)
+        for key, value in SUBMODULE_CONFIG.items():
+            git(repo, "config", key, value, timeout=30)
+        git(repo, "config", "glaeda.url", entry["url"], timeout=30)  # the runner hook's shim matches on it
+        fetched, errors = [], []
+        for pin in entry["pins"]:
+            if has_commit(repo, pin):
+                continue
+            command = [GIT, *LOW_SPEED, "-C", os.fspath(repo), "fetch", "--quiet", "--no-tags", "--depth=1",
+                       entry["url"], f"+{pin}:refs/pins/{pin}"]
+            for attempt in range(1, SUBMODULE_TRIES + 1):
+                status, err = runner(command, SUBMODULE_TIMEOUT)
+                if status == 0:
+                    fetched.append(pin)
+                    break
+                drop_leftovers(repo)
+                if attempt == SUBMODULE_TRIES:
+                    errors.append(f"{pin[:12]}: exit {status}: {err.strip()[-200:]}")
+                else:
+                    sleep(BACKOFF[min(attempt - 1, len(BACKOFF) - 1)])
+        held_pins = [pin for pin in entry["pins"] if has_commit(repo, pin)]
+        for pin in held_pins:
+            git(repo, "update-ref", f"refs/pins/{pin}", pin, timeout=30)
+        if held_pins:
+            # a branch for HEAD, so a plain clone of the mirror has a commit to check out
+            git(repo, "update-ref", "refs/heads/main", held_pins[0], timeout=30)
+            git(repo, "symbolic-ref", "HEAD", "refs/heads/main", timeout=30)
+        report[name] = {"pins": len(entry["pins"]), "held": len(held_pins), "fetched": len(fetched),
+                        **({"errors": errors} if errors else {})}
+    return report
 
 
 def drop_leftovers(mirror: Path) -> None:
@@ -777,6 +880,10 @@ def run(apply: bool, *, wait: bool = False, from_github: bool = False, home: Pat
                         except (OSError, subprocess.SubprocessError):
                             pass  # the next pass fetches the tips again
         record["fetch"] = result
+        try:
+            record["submodules"] = submodule_pass(MIRROR)
+        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+            record["submodules"] = {"error": f"{type(error).__name__}: {str(error)[:300]}"}
         folded = fold_packs(MIRROR)
         if folded:
             record["repack"] = folded

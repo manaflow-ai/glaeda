@@ -6172,6 +6172,263 @@ def borrow_mirror(workspace: str | None, mirror: Path = MIRROR_DIR, timeout: flo
         return f"mirror borrow: {type(error).__name__}"
 
 
+# GIT_SHIM: every git fetch of cmux on a mini reads the mini's mirror first. Run 45744507889 (the NEXT nightly,
+# 2026-11-26) failed at checkout: github.com answered the shared App token's git fetches with 429 four times, then
+# 403. glaeda-git-mirror is the one GitHub reader on a mini (a fetch a minute) and is forced to match GitHub, so a
+# commit it holds is the commit GitHub has. At job-started of a cmux job, the hook puts a `git` shim first on the
+# job's PATH ($GITHUB_PATH), so every actions/checkout and every `git fetch` in every step goes through it with no
+# workflow change. A fetch of https://github.com/manaflow-ai/cmux whose refspecs are all object ids the mirror holds
+# is served from the mirror (url.<mirror>.insteadOf for that one command). Anything else (a pull request's merge
+# commit, a branch or tag pattern, --all, --tags, a shallow-history change) goes to github.com as before, with bounded
+# backoff on a refusal (429, 403, 5xx) during which the mirror is asked again. A fetch of a run on a branch the mirror
+# keeps waits up to GIT_SHIM_WAIT_S for the mirror's next pass before asking github.com. Each github.com fetch or
+# ls-remote of cmux is a line in $RUNNER_TEMP/glaeda-git-fetches.log; job-completed prints the count. Opt-in by
+# repository: only manaflow-ai/cmux jobs get the shim. Kill switch: GLAEDA_GIT_SHIM=0 in the runner's environment
+# (no shim) or in a step's env (that step's git is the real one).
+GIT_SHIM_REPO = "manaflow-ai/cmux"
+GIT_SHIM_DIR = "glaeda-git-shim"
+GIT_SHIM_LOG = "glaeda-git-fetches.log"
+GIT_SHIM_WAIT_S = 90
+GIT_SHIM_TRIES = 3
+GIT_SHIM_BODY = r'''
+say() { echo "glaeda git shim: $*" >&2; }
+[ "${GLAEDA_GIT_SHIM:-1}" = 0 ] && exec "$real" "$@"
+orig=("$@")
+globals=()
+while [ $# -gt 0 ]; do
+  case $1 in
+    -C|-c|--git-dir|--work-tree|--namespace|--config-env) [ $# -ge 2 ] || break; globals+=("$1" "$2"); shift 2 ;;
+    -*) globals+=("$1"); shift ;;
+    *) break ;;
+  esac
+done
+sub=$1
+normurl() { printf '%s' "$1" | sed -E 's#^https://[^@/]*@#https://#; s#/+$##; s#\.git$##' | tr '[:upper:]' '[:lower:]'; }
+sm_for() {  # the submodule mirror (glaeda-git-mirror SUBMODULES) whose glaeda.url is the normalized URL $1
+  for d in "$submodules"/*.git; do
+    [ -f "$d/HEAD" ] || continue
+    u=$("$real" --git-dir="$d" config --get glaeda.url 2>/dev/null) || continue
+    [ "$(normurl "$u")" = "$1" ] && { printf '%s' "$d"; return 0; }
+  done
+  return 1
+}
+case $sub in fetch|ls-remote|submodule) ;; *) exec "$real" "${orig[@]}" ;; esac
+shift
+args=("$@")
+kind=cmux
+if [ "$sub" = submodule ]; then
+  # `git submodule update` (actions/checkout's submodules: true, scripts/ci/init-submodule.sh): every submodule
+  # whose pin the mirror pass holds is cloned from file://<its mirror> (-c reaches git's own submodule clone and
+  # fetch, which never run this shim); a pin it lacks goes to github.com and is counted.
+  case " $* " in *" update "*) ;; *) exec "$real" "${orig[@]}" ;; esac
+  top=$("$real" "${globals[@]}" rev-parse --show-toplevel 2>/dev/null) || exec "$real" "${orig[@]}"
+  gd=$("$real" "${globals[@]}" rev-parse --absolute-git-dir 2>/dev/null) || exec "$real" "${orig[@]}"
+  targets=(); dd=; skip=; seen=
+  for a in "$@"; do
+    if [ -n "$skip" ]; then skip=; continue; fi
+    if [ -z "$seen" ]; then [ "$a" = update ] && seen=1; continue; fi
+    if [ -n "$dd" ] || [ "${a#-}" = "$a" ]; then targets+=("${a%/}"); continue; fi
+    case $a in --) dd=1 ;; --reference|--depth|--jobs|-j|--filter) skip=1 ;; esac
+  done
+  rules=(); served=(); misses=()
+  while read -r key path; do
+    [ -n "$path" ] || continue
+    name=${key#submodule.}; name=${name%.path}
+    if [ ${#targets[@]} -gt 0 ]; then
+      want=; for t in "${targets[@]}"; do [ "$t" = "$path" ] && want=1; done
+      [ -n "$want" ] || continue
+    fi
+    pin=$("$real" -C "$top" ls-tree HEAD -- "$path" 2>/dev/null | awk '$2 == "commit" { print $3 }')
+    [ -n "$pin" ] || continue
+    "$real" --git-dir="$gd/modules/$name" cat-file -e "$pin^{commit}" 2>/dev/null && continue  # here already
+    url=$("$real" -C "$top" config -f .gitmodules --get "submodule.$name.url" 2>/dev/null)
+    case $url in https://github.com/*) ;; *) continue ;; esac
+    d=$(sm_for "$(normurl "$url")")
+    if [ -n "$d" ] && "$real" --git-dir="$d" cat-file -e "$pin^{commit}" 2>/dev/null; then
+      for u in "$url" "$("$real" "${globals[@]}" config --get "submodule.$name.url" 2>/dev/null)"; do
+        [ -n "$u" ] && rules+=(-c "url.file://$d.insteadOf=$u")
+      done
+      served+=("$name")
+    else
+      misses+=("$name")
+    fi
+  done < <("$real" -C "$top" config -f .gitmodules --get-regexp '^submodule\..*\.path$' 2>/dev/null)
+  [ ${#served[@]} -gt 0 ] || [ ${#misses[@]} -gt 0 ] || exec "$real" "${orig[@]}"
+  log_line() { echo "$1 $(date -u +%Y-%m-%dT%H:%M:%SZ) git submodule $2" >> "$log" 2>/dev/null; }
+  count() { grep -c '^github ' "$log" 2>/dev/null || echo 0; }
+  if [ ${#served[@]} -gt 0 ]; then
+    if "$real" "${globals[@]}" -c protocol.file.allow=always "${rules[@]}" "${orig[@]:${#globals[@]}}"; then
+      for n in "${served[@]}"; do log_line mirror "$n"; done
+      for n in ${misses[@]+"${misses[@]}"}; do log_line github "$n"; done
+      say "submodules ${served[*]} from the mirror${misses[*]:+, ${misses[*]} from github.com}; github.com git fetches this job: $(count)"
+      exit 0
+    fi
+    say "the mirror submodule update failed; asking github.com"
+    misses=("${served[@]}" ${misses[@]+"${misses[@]}"})
+  fi
+  kind=submodule; remote=submodule; refspecs=("${misses[@]}")
+fi
+[ "$kind" = submodule ] || { remote=; have_remote=; dd=; plain=1; refspecs=(); }
+n=$#
+i=0
+[ "$kind" = submodule ] && n=0
+while [ $i -lt $n ]; do
+  a=${args[$i]}
+  if [ -n "$dd" ] || [ "${a#-}" = "$a" ]; then
+    if [ -z "$have_remote" ]; then remote=$a; have_remote=1; else refspecs+=("$a"); fi
+  else
+    case $a in
+      --) dd=1 ;;
+      --all|--multiple|--stdin|--tags|-t|--unshallow|--refetch|--update-shallow|--negotiate-only|--dry-run) plain= ;;
+      --deepen|--shallow-since|--shallow-exclude) plain=; i=$((i + 1)) ;;
+      --deepen=*|--shallow-since=*|--shallow-exclude=*) plain= ;;
+      --depth|--negotiation-tip|--server-option|-o|--upload-pack|--recurse-submodules-default|--refmap|--filter|-j|--jobs|--submodule-prefix) i=$((i + 1)) ;;
+    esac
+  fi
+  i=$((i + 1))
+done
+if [ "$kind" != submodule ]; then
+  [ -n "$have_remote" ] || remote=origin
+  case $remote in
+    */*|*:*) url=$remote ;;
+    *) url=$("$real" "${globals[@]}" config --get "remote.$remote.url" 2>/dev/null) ;;
+  esac
+  norm=$(normurl "$url")
+  if [ "$norm" != "https://github.com/manaflow-ai/cmux" ]; then
+    # a fetch inside a submodule (a retry, or a pin the clone did not bring) reads that submodule's mirror
+    case $norm in https://github.com/*) ;; *) exec "$real" "${orig[@]}" ;; esac
+    mirror=$(sm_for "$norm") || exec "$real" "${orig[@]}"
+    kind=pins
+  fi
+fi
+note() { echo "$1 $(date -u +%Y-%m-%dT%H:%M:%SZ) git $sub ${remote} ${refspecs[*]}" >> "$log" 2>/dev/null; }
+count() { grep -c '^github ' "$log" 2>/dev/null || echo 0; }
+mirror_ok() {
+  if [ "$kind" = pins ]; then [ -f "$mirror/HEAD" ]; return; fi
+  [ -f "$mirror/glaeda-verified" ] && [ ! -e "$mirror/glaeda-repair-pending" ] && [ ! -e "$mirror/shallow" ]
+}
+ids_only=
+if [ "$kind" != submodule ] && [ "$sub" = fetch ] && [ -n "$plain" ] && [ ${#refspecs[@]} -gt 0 ]; then
+  ids_only=1
+  for r in "${refspecs[@]}"; do
+    printf '%s\n' "$r" | grep -Eq '^\+?([0-9a-f]{40}|[0-9a-f]{64})(:refs/[^:*]+)?$' || { ids_only=; break; }
+  done
+fi
+has_all() {
+  mirror_ok || return 1
+  for r in "${refspecs[@]}"; do
+    id=${r#+}; id=${id%%:*}
+    "$real" --git-dir="$mirror" cat-file -e "$id" 2>/dev/null || return 1
+  done
+}
+from_mirror() {
+  if "$real" "${globals[@]}" -c protocol.file.allow=always -c "url.file://$mirror.insteadOf=$url" fetch "${args[@]}"; then
+    note mirror
+    say "served from the mirror ($mirror); github.com git fetches this job: $(count)"
+    exit 0
+  fi
+  say "the mirror fetch failed; asking github.com"
+}
+if [ -n "$ids_only" ]; then
+  if has_all; then from_mirror; fi
+  case "$kind:${GITHUB_EVENT_NAME:-}:${GITHUB_REF:-}" in
+    pins:*|*:pull_request*|*:merge_group*) ;;
+    *:refs/heads/main|*:refs/heads/feat-cmux-next|*:refs/heads/nightly-next)
+      if mirror_ok; then
+        until=$((SECONDS + ${GLAEDA_GIT_SHIM_WAIT_S:-$wait_s}))
+        say "waiting up to ${GLAEDA_GIT_SHIM_WAIT_S:-$wait_s} s for the mirror's next pass to bring ${refspecs[*]}"
+        while [ "$SECONDS" -lt "$until" ]; do
+          sleep "${GLAEDA_GIT_SHIM_POLL_S:-5}"
+          if has_all; then from_mirror; break; fi
+        done
+      fi ;;
+  esac
+fi
+try=1
+while :; do
+  note github
+  errf=$(mktemp "${TMPDIR:-/tmp}/glaeda-git-shim.XXXXXX") || exec "$real" "${orig[@]}"
+  "$real" "${orig[@]}" 2>"$errf"
+  rc=$?
+  cat "$errf" >&2
+  if [ $rc -eq 0 ]; then
+    rm -f "$errf"
+    say "github.com git fetches this job: $(count)"
+    exit 0
+  fi
+  refused=
+  grep -Eqi '429|403|rate limit|too many requests|error: 5[0-9][0-9]|RPC failed|early EOF|unexpected disconnect' "$errf" && refused=1
+  rm -f "$errf"
+  if [ -z "$refused" ] || [ "$try" -ge "${GLAEDA_GIT_SHIM_TRIES:-$tries}" ]; then
+    say "github.com git fetches this job: $(count); this one failed (exit $rc)"
+    exit $rc
+  fi
+  delay=$((${GLAEDA_GIT_SHIM_BACKOFF_S:-15} * try * try))
+  say "github.com refused (exit $rc); again in $delay s (try $try of ${GLAEDA_GIT_SHIM_TRIES:-$tries}), asking the mirror meanwhile"
+  until=$((SECONDS + delay))
+  while [ "$SECONDS" -lt "$until" ]; do
+    sleep "${GLAEDA_GIT_SHIM_POLL_S:-5}"
+    if [ -n "$ids_only" ] && has_all; then from_mirror; break; fi
+  done
+  try=$((try + 1))
+done
+'''
+
+
+def git_shim_script(real_git: str, mirror: Path, log: Path) -> str:
+    """The shim's text: the values the hook resolved, then GIT_SHIM_BODY. /bin/bash, so 3.2 on a mini."""
+    head = (f"#!/bin/bash\n# glaeda-cmux-runner-hook GIT_SHIM: written at job-started; see the hook.\n"
+            f"real={shlex.quote(real_git)}\nmirror={shlex.quote(os.fspath(mirror))}\nlog={shlex.quote(os.fspath(log))}\n"
+            f"submodules={shlex.quote(os.fspath(mirror.parent / 'submodules'))}\n"
+            f"wait_s={GIT_SHIM_WAIT_S}\ntries={GIT_SHIM_TRIES}\n")
+    return head + GIT_SHIM_BODY
+
+
+def install_git_shim(repo: str | None, mirror: Path = MIRROR_DIR, environ: Mapping[str, str] | None = None) -> str:
+    """job-started: put the git shim first on a cmux job's PATH when the mirror is usable. Returns a note, or "".
+    Never raises."""
+    env = os.environ if environ is None else environ
+    try:
+        if (repo or "").lower() != GIT_SHIM_REPO or env.get("GLAEDA_GIT_SHIM") == "0":
+            return ""
+        temp, path_file = env.get("RUNNER_TEMP"), env.get("GITHUB_PATH")
+        if not temp or not path_file:
+            return ""
+        if mirror_identity(mirror) is None:
+            return f"git shim: off, the mirror at {mirror} is not verified or has a repair pending"
+        shim_dir = Path(temp) / GIT_SHIM_DIR
+        search = os.pathsep.join(p for p in env.get("PATH", "").split(os.pathsep) if p and Path(p) != shim_dir)
+        real = shutil.which("git", path=search)
+        if not real:
+            return "git shim: off, no git on PATH"
+        shim_dir.mkdir(parents=True, exist_ok=True)
+        log = Path(temp) / GIT_SHIM_LOG
+        tmp = shim_dir / f".git.{os.getpid()}"
+        tmp.write_text(git_shim_script(os.path.realpath(real), mirror, log), encoding="utf-8")
+        tmp.chmod(0o755)
+        os.replace(tmp, shim_dir / "git")
+        with open(path_file, "a", encoding="utf-8") as fh:
+            fh.write(f"{shim_dir}\n")
+        return f"git shim: cmux fetches read {mirror} first (github.com fetches are counted in {log.name})"
+    except Exception as error:  # noqa: BLE001  (never fail the job on housekeeping)
+        return f"git shim: {type(error).__name__}"
+
+
+def git_fetch_summary(environ: Mapping[str, str] | None = None) -> str:
+    """job-completed: how many cmux git fetches this job sent to github.com and how many the mirror served, or ""."""
+    env = os.environ if environ is None else environ
+    temp = env.get("RUNNER_TEMP")
+    if not temp or not (Path(temp) / GIT_SHIM_DIR / "git").exists():
+        return ""
+    try:
+        lines = (Path(temp) / GIT_SHIM_LOG).read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        lines = []
+    github = sum(1 for line in lines if line.startswith("github "))
+    mirror = sum(1 for line in lines if line.startswith("mirror "))
+    return f"github.com git fetches: {github} (the mirror served {mirror})"
+
+
 def workspace_damage(ws: Path) -> str:
     """Why the reused workspace cannot take a plain checkout, or "". A failed checkout (glaeda-2, three
     cmux-tui runs on 2026-10-12) leaves skip-worktree entries with no sparse setting, or tracked files that
@@ -16628,6 +16885,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{PREFIX}: {own}", flush=True)
         if guarded := guard_borrowed_checkout(os.environ.get("GITHUB_WORKSPACE")):
             print(f"{PREFIX}: {guarded}", flush=True)
+        if shim := install_git_shim(repo):
+            print(f"{PREFIX}: {shim}", flush=True)
         unsparsed = ""
         with contextlib.suppress(Exception):  # must not fail an admitted job
             unsparsed = unsparse_workspace(os.environ.get("GITHUB_WORKSPACE"))
@@ -16683,6 +16942,8 @@ def main(argv: list[str] | None = None) -> int:
         with contextlib.suppress(Exception):  # JOB_SCRATCH: its processes are ended; drop its volume
             for note in job_scratch_end():
                 print(f"{PREFIX}: {note}", flush=True)
+        if fetches := git_fetch_summary():
+            print(f"{PREFIX}: {fetches}", flush=True)
         if not args.no_disk and (borrowed := borrow_mirror(os.environ.get("GITHUB_WORKSPACE"))):
             print(f"{PREFIX}: {borrowed}", flush=True)
         worker = args.watch_pid or current_worker

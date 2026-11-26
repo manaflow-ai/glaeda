@@ -717,5 +717,69 @@ class Fetch(unittest.TestCase):
         self.assertIn("timed out", why)
 
 
+class SubmodulePass(unittest.TestCase):
+    """The mirror pass keeps each cmux submodule's pins in SUBMODULES/<name>.git and asks GitHub only for a new one."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name).resolve()
+        gitconfig = root / "gitconfig"
+        gitconfig.write_text(f'[url "file://{root}/github/"]\n\tinsteadOf = https://github.com/\n')
+        patch = mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": os.fspath(gitconfig), "GIT_CONFIG_NOSYSTEM": "1"})
+        patch.start()
+        self.addCleanup(patch.stop)
+        src = root / "ghostty-src"
+        src.mkdir()
+        sh("git", "init", "-q", "-b", "main", cwd=src)
+        (src / "build.zig").write_text("zig\n")
+        sh("git", "add", "-A", cwd=src)
+        sh("git", "commit", "-qm", "ghostty", cwd=src)
+        self.pin = sh("git", "rev-parse", "HEAD", cwd=src)
+        github = root / "github" / "manaflow-ai" / "ghostty.git"
+        github.parent.mkdir(parents=True)
+        sh("git", "clone", "-q", "--bare", os.fspath(src), os.fspath(github))
+        sh("git", "config", "uploadpack.allowAnySHA1InWant", "true", cwd=github)
+        cmux = root / "cmux"
+        cmux.mkdir()
+        sh("git", "init", "-q", "-b", "main", cwd=cmux)
+        (cmux / ".gitmodules").write_text('[submodule "ghostty"]\n\tpath = ghostty\n'
+                                          '\turl = https://github.com/manaflow-ai/ghostty.git\n')
+        sh("git", "update-index", "--add", "--cacheinfo", f"160000,{self.pin},ghostty", cwd=cmux)
+        sh("git", "add", ".gitmodules", cwd=cmux)
+        sh("git", "commit", "-qm", "cmux", cwd=cmux)
+        for branch in ("feat-cmux-next", "nightly-next"):
+            sh("git", "branch", branch, cwd=cmux)
+        self.mirror = root / "cmux.git"
+        sh("git", "clone", "-q", "--bare", os.fspath(cmux), os.fspath(self.mirror))
+        self.root = root / "submodules"
+
+    def test_a_new_pin_is_fetched_once_and_kept(self) -> None:
+        report = gm.submodule_pass(self.mirror, root=self.root)
+        self.assertEqual(report, {"ghostty": {"pins": 1, "held": 1, "fetched": 1}})
+        repo = self.root / "ghostty.git"
+        self.assertEqual(sh("git", "rev-parse", "refs/heads/main", cwd=repo), self.pin)
+        self.assertEqual(sh("git", "rev-parse", f"refs/pins/{self.pin}", cwd=repo), self.pin)
+        self.assertEqual(sh("git", "config", "glaeda.url", cwd=repo), "https://github.com/manaflow-ai/ghostty.git")
+        self.assertEqual(sh("git", "config", "uploadpack.allowAnySHA1InWant", cwd=repo), "true")
+
+        def no_github(command, timeout):
+            raise AssertionError(f"asked GitHub again: {command}")
+        self.assertEqual(gm.submodule_pass(self.mirror, root=self.root, runner=no_github),
+                         {"ghostty": {"pins": 1, "held": 1, "fetched": 0}})
+
+    def test_a_refused_fetch_backs_off_and_is_reported(self) -> None:
+        calls, sleeps = [], []
+
+        def refused(command, timeout):
+            calls.append(command)
+            return 128, "error: RPC failed; HTTP 429"
+        report = gm.submodule_pass(self.mirror, root=self.root, runner=refused, sleep=sleeps.append)
+        self.assertEqual(len(calls), gm.SUBMODULE_TRIES)
+        self.assertEqual(sleeps, list(gm.BACKOFF[:gm.SUBMODULE_TRIES - 1]))
+        self.assertEqual(report["ghostty"]["held"], 0)
+        self.assertIn("429", report["ghostty"]["errors"][0])
+
+
 if __name__ == "__main__":
     unittest.main()

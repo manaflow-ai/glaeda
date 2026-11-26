@@ -30139,6 +30139,62 @@ class LandTest(Base):
         e = self.tick(gg.LAND_REARM_AFTER * 2)
         self.assertEqual((e["state"], e["stop"]["code"], e.get("rearms")), ("stopped", "block", None))
 
+    def conflict_stop(self) -> dict:
+        """A row stopped on a conflict with its base: the stop no re-arm can clear (LAND_OWNER_REMIND)."""
+        self.t = (NOW // 86400 + 1) * 86400 + 3600  # 01:00Z: the reminders below stay inside one UTC day
+        self.assertFalse(gg.LAND_REARM_CODES.match("conflict"))  # the row's code for land_judge's conflicts_base
+        self.pr(LA, mergeable="CONFLICTING")
+        self.land()
+        self.w.answers.append(refusal("conflicts_base", LA, {"kind": "stop", "stop": "conflicts_base"},
+                                      nxt="merge main into o/r#1, resolve the conflicts and push",
+                                      reason="o/r#1 conflicts with main in tools/a.py"))
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "conflict"))
+        return e
+
+    def test_a_stop_that_never_rearms_still_reaches_its_owner(self):
+        # LAND_OWNER_REMIND: conflicts_base is 104 judged and 0 re-armed in the daemon's own log, so its owner was
+        # told once, at the stop, and then nothing asked again: one lane's 89 stopped rows had a median age of 31.8 h
+        # and a p90 of 108.1 h, 42 of 43 measured conflict heads carrying work that is not in the base.
+        e = self.conflict_stop()
+        sent, judged = len(self.w.sent()), len(self.w.explains())
+        gen = e.get("gen")
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY - 10)
+        self.assertEqual((e["state"], len(self.w.sent())), ("stopped", sent))  # not before the cadence
+        e = self.tick(20)
+        self.assertEqual((e["state"], e["reminds"]["n"], e.get("rearms")), ("stopped", 1, None))
+        self.assertEqual((len(self.w.explains()), e.get("gen")), (judged, gen))  # reminded, never re-judged
+        said = self.w.sent()[-1][-1]
+        self.assertIn("resolve the conflicts and push", said)  # the stop's own one step, again
+        self.assertIn("still stopped after 6 h", said)  # and how long it has sat there
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        self.assertEqual((e["reminds"]["n"], len(self.w.sent()), e.get("gen")), (2, sent + 2, gen))
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)  # 19:00Z, still the same UTC day: the cap
+        self.assertEqual((e["reminds"]["n"], len(self.w.sent())), (2, sent + 2))
+
+    def test_a_stopped_row_whose_pr_is_over_is_not_reminded(self):
+        self.conflict_stop()
+        sent = len(self.w.sent())
+        self.pr(LA, state="MERGED", mergeable="CONFLICTING")  # merged by hand, or by another queue
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY)
+        self.assertEqual((e["state"], e.get("reminds"), len(self.w.sent())), ("stopped", None, sent))
+
+    def test_a_rearmable_stop_is_not_also_reminded(self):
+        # rearm owns a code it can clear: its probe says whatever changed, LAND_STOP_REPEAT keeps the repeats quiet,
+        # and a reminder beside it would be the same words twice.
+        self.t = (NOW // 86400 + 1) * 86400 + 3600
+        self.pr(LA, checks=[("ci", "COMPLETED", "FAILURE")])
+        self.land()
+        for _ in range(gg.LAND_REARM_CAP + 1):
+            self.w.answers.append(self.own_red())
+            self.tick(gg.LAND_REARM_AFTER)
+            e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"], e["rearms"]["n"]),
+                         ("stopped", "own_red", gg.LAND_REARM_CAP))
+        sent = len(self.w.sent())
+        e = self.tick(gg.LAND_OWNER_REMIND_EVERY * 2)  # the cap is spent and the row still sits
+        self.assertEqual((e.get("reminds"), len(self.w.sent())), (None, sent))
+
     def unlabels(self) -> list[list[str]]:
         return [c for c in self.w.gh_calls("api", "-X", "DELETE") if "/labels/" in c[3]]
 

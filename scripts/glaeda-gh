@@ -15597,6 +15597,25 @@ LAND_REARM_CODES = re.compile(r"^(?:retry_deadline|review_cannot_start|own_red|r
                               r"|[a-z_]+_transient)$")
 LAND_REARM_AFTER = 3600.0
 LAND_REARM_CAP = 3
+# LAND_OWNER_REMIND: re-judging a stopped row and reaching its owner again are the same switch (rearm), so a code
+# correctly left out of LAND_REARM_CODES loses its follow-up along with its re-judging: its requester is told once, at
+# the stop, and then nothing ever asks again. A conflict with the base (the row's `conflict`, land_judge's
+# conflicts_base) is the whole of that loss. One lane's queue, 2026-11-25:
+# 89 of its rows stopped, median age 31.8 h, p90 108.1 h, max 110.7 h, 34 over a day old and 14 over two; 62 of the
+# 116 stopped rows on the host were `conflict`. The daemon's own log over two months: red_not_excused 599 judged and
+# 300 re-armed, checks_stuck 92 re-armed, own_red 78 -- and conflicts_base 104 judged, 0 re-armed, 0 repeat-quiet.
+# `git cherry origin/main HEAD` over 43 of those conflict heads found 1 already in main and 42 carrying real unlanded
+# work, so the drain is work, not garbage. Re-judging them would be wrong (land_judge's conflicts_base: "no retry or
+# fetch clears a conflict, only a merge of the base into the head", guarded by its test_land_judge_no_spiral), so the
+# reminder judges nothing: the row stays stopped at the same gen and its requester gets the stop's own one step again,
+# with its age, every LAND_OWNER_REMIND_EVERY, at most LAND_OWNER_REMIND_CAP a UTC day. The precedent is in this file:
+# a *forwarded* stopped row's far host is re-asked every LAND_FORWARD_STOPPED_ASK_EVERY; the local owner had no
+# equivalent. Skipped where nothing is owed: a PR whose cached state is MERGED or CLOSED, and the codes that are not
+# the requester's to act on. Detector: test-glaeda-gh.py
+# test_a_stop_that_never_rearms_still_reaches_its_owner.
+LAND_OWNER_REMIND_SKIP = re.compile(r"^(?:closed|cancelled|merged|teammate)$")
+LAND_OWNER_REMIND_EVERY = 21600.0
+LAND_OWNER_REMIND_CAP = 2
 # LAND_UNLABEL: a land that ends without a merge takes off the ready-to-land label the land put on. cmux
 # scripts/ci/head_tier.py runs the full tier (pr-router's linux, web-browser, mac, ios) on every head of a non-draft PR
 # that carries ready-to-land, and nothing took the label off when a land stopped, was cancelled or its PR closed: on
@@ -17991,7 +18010,8 @@ class LandQueue:
                     self.changed_entries.discard(key)
                 elif e["state"] == "stopped" and key not in self.jobs:
                     with self.lock:
-                        self.rearm(e)  # judged from the next pass
+                        if not self.rearm(e):  # judged from the next pass
+                            self.remind(e)  # a stop that never re-arms still reaches its owner
                 if key in self.entries and key not in self.jobs and self.unlabel_owed(self.entries[key]):
                     unlabel.append(key)
             except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
@@ -19633,6 +19653,45 @@ class LandQueue:
         self.history(e, "rearmed", code=code, why=why, n=n + 1)
         log({"event": "land-rearmed", "key": e["key"], "code": code, "why": why, "n": n + 1})
         self.save(e)
+        return True
+
+    def remind(self, e: dict) -> bool:
+        """Tell a stopped E's requester its one step again, for a stop nothing clears by itself
+        (LAND_OWNER_REMIND's comment). Under the lock. Judges nothing: the row stays stopped, at the same gen."""
+        if e.get("state") != "stopped":
+            return False
+        st = e.get("stop") or {}
+        code = str(st.get("code") or "")
+        if not code or LAND_REARM_CODES.match(code) or LAND_OWNER_REMIND_SKIP.match(code):
+            return False  # a re-armable code is rearm's: its probe tells the requester whatever changed
+        to = str(e.get("requester") or "")
+        if not to:
+            return False  # notify's land-unnotified already said it at the stop
+        data = (self.cache_of(e["key"]) or {}).get("data") or {}
+        if str(data.get("state") or "").upper() in ("MERGED", "CLOSED"):
+            return False  # a PR that is over owes its requester nothing; `land status` still shows the row
+        day = land_day(self.now)
+        r = e.get("reminds") or {}
+        n = int(r.get("n") or 0) if r.get("day") == day else 0
+        if n >= LAND_OWNER_REMIND_CAP:
+            return False
+        at = float(st.get("at") or 0)
+        last = float(r.get("at") or 0) or at
+        if self.now - last < LAND_OWNER_REMIND_EVERY:
+            return False
+        e["reminds"] = {"day": day, "n": n + 1, "at": self.now}
+        hours = (self.now - at) / 3600.0
+        msg = (f"glaeda land: {self.url(e)} still stopped after {hours:.0f} h: {code}: "
+               f"{land_reason(st.get('reason') or '', 300)}")
+        if st.get("next"):
+            msg += f" next: {land_trim(str(st['next']), 300)}"
+        if st.get("detail"):
+            msg += "\n" + str(st["detail"])[:LAND_HUNK_CHARS + 20]
+        self.history(e, "reminded", code=code, n=n + 1, hours=round(hours, 1))
+        log({"event": "land-owner-reminded", "key": e["key"], "code": code, "to": to, "n": n + 1,
+             "hours": round(hours, 1)})
+        self.save(e)
+        self.notify(e, to, msg)
         return True
 
     def unlabel_owed(self, e: dict) -> bool:
