@@ -67,6 +67,12 @@ GIT_DIR = Path(os.environ.get("GLAEDA_GIT_MIRROR_DIR") or FLEET_DIR / "git")
 MIRROR = GIT_DIR / "cmux.git"
 RECORD = GIT_DIR / "cmux.json"
 REPO_URL = os.environ.get("GLAEDA_GIT_MIRROR_REPO", "https://github.com/manaflow-ai/cmux.git")
+# The fleet origin: a read-only full mirror of the same repository that the fleet serves to its hosts. A pass
+# fetches from it first and falls back to REPO_URL. The URL comes from GLAEDA_GIT_MIRROR_ORIGIN or from
+# ORIGIN_CONFIG's `origin` (written per host by the fleet's rollout), never from this file. GitHub can refuse
+# anonymous git from a site's shared IP (403 or a stalled transfer), and these hosts hold no GitHub credential.
+ORIGIN_CONFIG = ".config/glaeda/git-mirror.json"
+ORIGIN_TIMEOUT = 300
 # cmux's NEXT cache bucket (public reads; cmux git-mirror-bundle.yml writes it).
 BUCKET_URL = os.environ.get("GLAEDA_GIT_MIRROR_BUCKET_URL", "https://ci-cache-next.cmux.com")
 BUNDLE_PREFIX = "git-mirror-cmux-"
@@ -784,6 +790,31 @@ def source(home: Path | None = None) -> str:
     return raw["source"]
 
 
+def origin(home: Path | None = None) -> str:
+    """The fleet origin's URL (GLAEDA_GIT_MIRROR_ORIGIN, else ORIGIN_CONFIG `origin`), or '' when none is set."""
+    url = os.environ.get("GLAEDA_GIT_MIRROR_ORIGIN", "").strip()
+    if not url:
+        home = Path.home() if home is None else home
+        try:
+            raw = json.loads((home / ORIGIN_CONFIG).read_text())
+        except (OSError, ValueError):
+            return ""
+        url = str(raw.get("origin") or "").strip() if isinstance(raw, dict) else ""
+    return url if re.fullmatch(r"(https?|git|file)://\S+", url) else ""
+
+
+def fetch_any(mirror: Path, home: Path | None = None) -> dict:
+    """Fetch BRANCHES from the fleet origin (one try) and, when it has none or fails, from REPO_URL."""
+    first = origin(home)
+    if first:
+        result = fetch(mirror, first, tries=1, timeout=ORIGIN_TIMEOUT)
+        if result["ok"]:
+            return {**result, "from": "fleet-origin"}
+        fallback = fetch(mirror, REPO_URL)
+        return {**fallback, "from": "github", "origin_errors": result.get("errors", [])}
+    return {**fetch(mirror, REPO_URL), "from": "github"}
+
+
 SEED_AFTER = ".first-seed-after"
 
 
@@ -859,7 +890,8 @@ def run(apply: bool, *, wait: bool = False, from_github: bool = False, home: Pat
             # A repair in place runs for up to DOWNLOAD_TIMEOUT under the flock, so no later pass fetches until it
             # ends: fetch the new commits first (a fetch only adds objects) and record them, so the mirror's tips
             # stay current while it repairs. Jobs still wait for the repair (the runner hook reads REPAIR_PENDING).
-            early = fetch(MIRROR, REPO_URL, tries=1)
+            first = origin(home)
+            early = fetch(MIRROR, first or REPO_URL, tries=1, timeout=ORIGIN_TIMEOUT if first else FETCH_TIMEOUT)
             if early["ok"]:
                 early_heads = heads(MIRROR)
             previous = write_record({**record, "fetch": early, "state": "repairing"}, previous)
@@ -868,7 +900,7 @@ def run(apply: bool, *, wait: bool = False, from_github: bool = False, home: Pat
             if problem:
                 record["seeded"] = {"because": problem, **seed(MIRROR, from_github)}
             configure(MIRROR)
-            result = fetch(MIRROR, REPO_URL)
+            result = fetch_any(MIRROR, home)
         finally:
             if not result["ok"]:
                 # The bundle set the branches to its own (older) tips, and nothing fetched since: put back what the

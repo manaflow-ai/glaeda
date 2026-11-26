@@ -140,6 +140,42 @@ class Mirror(unittest.TestCase):
         self.assertEqual(self.downloads, [])
         self.assertEqual(result["heads"]["main"], head)
 
+    def write_origin(self, url: str) -> None:
+        (self.home / gm.ORIGIN_CONFIG).parent.mkdir(parents=True, exist_ok=True)
+        (self.home / gm.ORIGIN_CONFIG).write_text(json.dumps({"origin": url}))
+
+    def test_a_pass_fetches_from_the_fleet_origin_first(self) -> None:
+        gm.run(True, home=self.home)
+        fleet = Path(self.temp.name) / "fleet-origin.git"
+        sh("git", "clone", "-q", "--bare", os.fspath(self.upstream), os.fspath(fleet))
+        head = self.commit("only the fleet origin has this yet")
+        sh("git", "-C", os.fspath(fleet), "fetch", "-q", os.fspath(self.upstream), "+main:main")
+        gm.REPO_URL = (Path(self.temp.name) / "gone").as_uri()  # GitHub refuses: restored by setUp's cleanup
+        self.write_origin(fleet.as_uri())
+        result = gm.run(True, home=self.home)
+        self.assertEqual(result["state"], "applied", result)
+        self.assertEqual(result["fetch"]["from"], "fleet-origin")
+        self.assertEqual(result["heads"]["main"], head)
+
+    def test_a_failing_fleet_origin_falls_back_to_github(self) -> None:
+        gm.run(True, home=self.home)
+        head = self.commit("two")
+        self.write_origin((Path(self.temp.name) / "no-such-origin.git").as_uri())
+        result = gm.run(True, home=self.home)
+        self.assertEqual(result["state"], "applied", result)
+        self.assertEqual(result["fetch"]["from"], "github")
+        self.assertTrue(result["fetch"]["origin_errors"])
+        self.assertEqual(result["heads"]["main"], head)
+
+    def test_origin_reads_env_then_config_and_ignores_junk(self) -> None:
+        self.assertEqual(gm.origin(self.home), "")
+        self.write_origin("not a url")
+        self.assertEqual(gm.origin(self.home), "")
+        self.write_origin("http://127.0.0.1:1/x.git")
+        self.assertEqual(gm.origin(self.home), "http://127.0.0.1:1/x.git")
+        with mock.patch.dict(os.environ, {"GLAEDA_GIT_MIRROR_ORIGIN": "http://127.0.0.1:2/y.git"}):
+            self.assertEqual(gm.origin(self.home), "http://127.0.0.1:2/y.git")
+
     def test_a_broken_mirror_is_repaired_in_place_and_keeps_every_object(self) -> None:
         sh("git", "checkout", "-q", "-b", "scratch", cwd=self.upstream)
         forced_away = self.commit("only the old mirror has this")
