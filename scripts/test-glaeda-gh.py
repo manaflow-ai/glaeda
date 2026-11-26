@@ -40680,6 +40680,21 @@ class LandForwardTest(Base):
         [said] = [c for c in self.w.sent() if "forward_lost" in c[-1]]
         self.assertEqual(said[3], "cosmic/coord")
 
+    def test_a_lost_forward_whose_far_row_stopped_earlier_ends_with_that_stop(self):
+        """cmux#55252, 2026-11-26: the land host held the row stopped (own_red) from before the requester's last
+        hand-off; the requester said "the hand-off was lost". It now ends with the far stop's own code and words."""
+        self.forwarded_to_executor()
+        self.pr(LA)
+        with self.q.lock:
+            e = self.q.entries[self.KEY]
+            e["forwardMissing"] = {"n": gg.LAND_FORWARD_LOST_ASKS, "gen": int(e.get("gen") or 0), "at": self.t,
+                                   "far": "stopped", "stop": {"code": "own_red", "reason": "red at its head", "next": "fix it"}}
+            with mock.patch.object(self.q, "outcome_read", return_value=True):
+                self.assertTrue(self.q.forward_lost(e, "big-exec", {}, self.t - 5))
+        e = self.q.entries[self.KEY]
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "forward_stopped"))
+        self.assertIn("own_red", e["stop"]["reason"])
+
     def test_a_lost_forward_that_github_shows_merged_ends_merged_not_lost(self):
         self.forwarded_to_executor()
         serve = self.q.forward

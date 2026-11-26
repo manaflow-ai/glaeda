@@ -19833,6 +19833,11 @@ class LandQueue:
         gen = int(e.get("gen") or 0)
         n = int(gone.get("n") or 0) + 1 if int(gone.get("gen") or 0) == gen else 1
         e["forwardMissing"] = {"n": n, "gen": gen, "at": self.now, "far": st or None}
+        far_stop = (row or {}).get("stop")
+        if st in ("stopped", "cancelled") and isinstance(far_stop, dict) and far_stop.get("code"):
+            # the row there ended before this hand-off and no re-send revived it: its stop is the outcome (cmux#55252,
+            # 2026-11-26: own_red, told to its requester as "the hand-off was lost")
+            e["forwardMissing"]["stop"] = {k: land_trim(str(far_stop.get(k) or ""), 400) for k in ("code", "reason", "next")}
         self.history(e, "forward_missing", to=host, n=n, far=st or None)
         log({"event": "land-forward-missing", "key": e["key"], "to": host, "n": n, "far": st or None})
         self.save(e)
@@ -19857,6 +19862,12 @@ class LandQueue:
         if not self.outcome_read(e, c, since):
             return False
         st = str(gone.get("far") or "")
+        far = gone.get("stop")
+        if isinstance(far, dict) and far.get("code"):
+            self.stop(e, "forward_stopped", f"{host}'s land queue holds it {st} ({far['code']}), from before this "
+                      f"hand-off, and handing it off again did not revive it: {far.get('reason') or 'it gave no reason'}",
+                      far.get("next") or f"glaeda-gh land {key_name(e['key'])} on {host}", tell="quiet")
+            return True
         resent = int((e.get("forwardResent") or {}).get("n") or 0)
         then = f" (its row there {st} before this hand-off)" if st else ""
         self.stop(e, "forward_lost", f"{host}'s land queue holds no row of it{then}: asked {n} times, "
