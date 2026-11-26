@@ -1613,6 +1613,58 @@ class HookTest(unittest.TestCase):
             (fleet / "reservation.json").unlink(missing_ok=True)
             self.finish("")
 
+    def test_the_nightly_slot_takes_no_stack_job_while_the_mini_drains_for_a_measurement(self) -> None:
+        """MEASURE_DRAIN_SLOT: 2026-11-26, new PR jobs started through the nightly slot on 5 minis cmux-ci drained for a
+        measurement (its marker skips the slot so nightlies run). While another runner carries cmux-ci's live drain
+        marker, the slot refuses a stack-blocker PR job at once; a nightly job is still admitted, and another
+        writer's marker or an expired one changes nothing. Before: the stack job was admitted under the drain."""
+        drained = self.dir / "actions-runner-glaeda-3"
+        drained.mkdir()
+        marker = drained / hook.RUNNER_DRAIN_FILE
+
+        def mark(by: str, until: float) -> None:
+            marker.write_text(json.dumps({"until": until, "by": by,
+                                          "reason": "cmux-ci lend drain: a measurement waits for this mini"}))
+
+        now = time.time()
+        self.assertIsNone(hook.measurement_drain(self.dir, now), "no marker")
+        mark(hook.CMUX_CI_DRAIN_BY, now + 600)
+        self.assertIn("actions-runner-glaeda-3 is draining for cmux-ci lend drain",
+                      hook.measurement_drain(self.dir, now))
+        mark(hook.APPLY_DRAIN_BY, now + 600)
+        self.assertIsNone(hook.measurement_drain(self.dir, now), "an apply's relabel drain is no measurement")
+        mark(hook.CMUX_CI_DRAIN_BY, now - 1)
+        self.assertIsNone(hook.measurement_drain(self.dir, now), "an expired marker")
+
+        self.fleet()
+        pull = event(self.dir, "stack-pr-drained", {
+            "repository": CMUX,
+            "pull_request": {"number": 45498, "labels": [{"name": hook.STACK_BLOCKER_LABEL}],
+                             "head": {"repo": {"full_name": "manaflow-ai/cmux"}}, "base": {"repo": CMUX}}})
+        pr_env = {"GITHUB_REF": "refs/pull/45498/merge", "GITHUB_JOB": "daemon-test",
+                  "GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/cmux-next.yml@refs/pull/45498/merge"}
+        push = event(self.dir, "nightly-push-drained", {"repository": CMUX, "ref": "refs/heads/nightly-next"})
+        nightly_env = {"GITHUB_REF": "refs/heads/nightly-next", "GITHUB_JOB": "build-nightly-app",
+                       "GITHUB_WORKFLOW_REF": "manaflow-ai/cmux/.github/workflows/nightly.yml@refs/heads/nightly-next"}
+        args = ("--allowed-repo", "manaflow-ai/cmux", "--no-disk", "--watch-pid", str(os.getpid()),
+                "--state-dir", os.fspath(self.dir / "state"), "--gui-wait", "0", "--nightly-runner")
+        try:
+            mark(hook.CMUX_CI_DRAIN_BY, time.time() + 600)
+            refused = self.run_hook("job-started", "pull_request", pull, *args, repo="manaflow-ai/cmux", env=pr_env)
+            self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+            self.assertIn("drains for a measurement", refused.stdout)
+            self.assertIn("owned-pool rescue", refused.stdout)
+            nightly = self.run_hook("job-started", "push", push, *args, repo="manaflow-ai/cmux", env=nightly_env)
+            self.assertEqual(nightly.returncode, 0, "a nightly job on the slot is admitted under the drain: "
+                             + nightly.stdout + nightly.stderr)
+            self.finish("")
+            marker.unlink()
+            admitted = self.run_hook("job-started", "pull_request", pull, *args, repo="manaflow-ai/cmux", env=pr_env)
+            self.assertEqual(admitted.returncode, 0, admitted.stdout + admitted.stderr)
+            self.finish("")
+        finally:
+            self.finish("")
+
     def test_disk_pressure_never_fails_and_is_bounded(self) -> None:
         marker = self.dir / "disk-ran"
         slow = make_executable(self.dir / "glaeda-disk-slow", "import time, sys\n"
@@ -23484,6 +23536,269 @@ class JobScratchTest(unittest.TestCase):
         self.assertEqual(seen["argv"], ["/usr/bin/hdiutil", "detach", "-force", "/x"])
         self.assertEqual(seen["env"], {"LC_ALL": "C", "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"})
         self.assertEqual(seen["timeout"], hook.HDIUTIL_TIMEOUT_S)
+
+
+class GitShimTest(unittest.TestCase):
+    """GIT_SHIM: a cmux job's git fetches read the mini's mirror first and count what still goes to github.com
+    (run 45744507889: the NEXT nightly's checkout got 429 four times, then 403, from github.com)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name).resolve()
+        self.gitconfig = self.dir / "gitconfig"
+        # github.com is a local repository here: a fetch the shim sends "to github.com" lands in self.github
+        self.github = self.dir / "github" / "manaflow-ai" / "cmux.git"
+        self.gitconfig.write_text(f'[url "file://{self.dir}/github/"]\n\tinsteadOf = https://github.com/\n'
+                                  "[protocol \"file\"]\n\tallow = always\n")
+        self.env = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GIT_CONFIG_NOSYSTEM": "1",
+                    "GIT_CONFIG_GLOBAL": os.fspath(self.gitconfig), "TMPDIR": os.fspath(self.dir),
+                    "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_COMMITTER_NAME": "t",
+                    "GIT_COMMITTER_EMAIL": "t@example.com", "GLAEDA_GIT_SHIM_POLL_S": "1",
+                    "GLAEDA_GIT_SHIM_BACKOFF_S": "1", "GLAEDA_GIT_SHIM_WAIT_S": "0"}
+        src = self.dir / "src"
+        src.mkdir()
+        self.git(src, "init", "-q", "-b", "main")
+        (src / "a.txt").write_text("a\n")
+        self.git(src, "add", "-A")
+        self.git(src, "commit", "-qm", "on main")
+        self.main_sha = self.git(src, "rev-parse", "HEAD")
+        self.mirror = self.dir / "fleet" / "git" / "cmux.git"
+        self.mirror.parent.mkdir(parents=True)
+        self.git(self.dir, "clone", "-q", "--bare", os.fspath(src), os.fspath(self.mirror))
+        (self.mirror / "glaeda-verified").write_text("now\n")
+        (src / "b.txt").write_text("b\n")
+        self.git(src, "add", "-A")
+        self.git(src, "commit", "-qm", "a pull request's merge commit")  # only github.com has it
+        self.pr_sha = self.git(src, "rev-parse", "HEAD")
+        self.github.parent.mkdir(parents=True)
+        self.git(self.dir, "clone", "-q", "--bare", os.fspath(src), os.fspath(self.github))
+        self.git(self.github, "config", "uploadpack.allowAnySHA1InWant", "true")
+        self.ws = self.dir / "work" / "cmux"
+        self.ws.mkdir(parents=True)
+        self.git(self.ws, "init", "-q")
+        self.git(self.ws, "remote", "add", "origin", "https://github.com/manaflow-ai/cmux")
+        self.temp = self.dir / "runner-temp"
+        self.temp.mkdir()
+        self.path_file = self.dir / "github_path"
+        self.path_file.write_text("")
+        self.job_env = {**self.env, "RUNNER_TEMP": os.fspath(self.temp), "GITHUB_PATH": os.fspath(self.path_file)}
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def git(self, cwd: Path, *args: str) -> str:
+        return subprocess.run(["git", "-C", os.fspath(cwd), *args], env=self.env, capture_output=True, text=True,
+                              check=True).stdout.strip()
+
+    def install(self, repo: str = "manaflow-ai/cmux") -> str:
+        return hook.install_git_shim(repo, self.mirror, self.job_env)
+
+    def shim(self, *args: str, env: dict | None = None) -> subprocess.CompletedProcess:
+        return subprocess.run([os.fspath(self.temp / hook.GIT_SHIM_DIR / "git"), *args], cwd=self.ws,
+                              env={**self.job_env, **(env or {})}, capture_output=True, text=True, timeout=60)
+
+    def log(self) -> list[str]:
+        path = self.temp / hook.GIT_SHIM_LOG
+        return [line.split()[0] for line in path.read_text().splitlines()] if path.exists() else []
+
+    def checkout_fetch(self, sha: str, env: dict | None = None) -> subprocess.CompletedProcess:
+        """actions/checkout v6's fetch of one commit."""
+        return self.shim("-c", "protocol.version=2", "fetch", "--no-tags", "--prune", "--no-recurse-submodules",
+                         "--depth=1", "origin", f"+{sha}:refs/remotes/origin/main", env=env)
+
+    def test_install_puts_the_shim_first_on_a_cmux_jobs_path(self) -> None:
+        self.assertIn("read", self.install())
+        self.assertEqual(self.path_file.read_text(), f"{self.temp / hook.GIT_SHIM_DIR}\n")
+        text = (self.temp / hook.GIT_SHIM_DIR / "git").read_text()
+        self.assertIn(f"mirror={self.mirror}", text)
+        self.assertNotIn(hook.GIT_SHIM_DIR, text.splitlines()[2])  # real git is never the shim itself
+        self.assertEqual(hook.git_fetch_summary(self.job_env), "github.com git fetches: 0 (the mirror served 0)")
+
+    def test_no_shim_for_another_repository_an_unverified_mirror_or_the_kill_switch(self) -> None:
+        self.assertEqual(self.install("manaflow-ai/cmux-platform"), "")
+        self.assertEqual(hook.install_git_shim("manaflow-ai/cmux", self.mirror,
+                                               {**self.job_env, "GLAEDA_GIT_SHIM": "0"}), "")
+        (self.mirror / "glaeda-repair-pending").write_text("")
+        self.assertIn("off", self.install())
+        self.assertEqual(self.path_file.read_text(), "")
+        self.assertEqual(hook.git_fetch_summary(self.job_env), "")
+
+    def test_a_commit_the_mirror_holds_comes_from_the_mirror_with_no_github_fetch(self) -> None:
+        self.install()
+        shutil.rmtree(self.github)  # github.com is unreachable: only the mirror can serve it
+        result = self.checkout_fetch(self.main_sha)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("served from the mirror", result.stderr)
+        self.assertEqual(self.git(self.ws, "rev-parse", "refs/remotes/origin/main"), self.main_sha)
+        self.assertEqual(self.git(self.ws, "config", "remote.origin.url"), "https://github.com/manaflow-ai/cmux")
+        self.assertEqual(self.log(), ["mirror"])
+        self.assertEqual(hook.git_fetch_summary(self.job_env), "github.com git fetches: 0 (the mirror served 1)")
+
+    def test_a_commit_only_github_has_is_fetched_from_github_and_counted(self) -> None:
+        self.install()
+        result = self.checkout_fetch(self.pr_sha)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.git(self.ws, "rev-parse", "refs/remotes/origin/main"), self.pr_sha)
+        self.assertEqual(self.log(), ["github"])
+        self.assertIn("github.com git fetches this job: 1", result.stderr)
+
+    def test_a_pattern_fetch_or_another_remote_is_never_redirected(self) -> None:
+        self.install()
+        result = self.shim("fetch", "--no-tags", "origin", "+refs/heads/*:refs/remotes/origin/*")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.git(self.ws, "rev-parse", "refs/remotes/origin/main"), self.pr_sha)  # github's tip
+        self.assertEqual(self.log(), ["github"])
+        self.git(self.ws, "remote", "add", "other", "https://github.com/manaflow-ai/cmux-platform")
+        self.shim("fetch", "other", self.main_sha)
+        self.assertEqual(self.log(), ["github"])  # not cmux: passed through, not counted
+        self.assertEqual(self.shim("--version").returncode, 0)
+
+    def test_a_refusal_backs_off_and_the_mirror_serves_once_it_has_the_commit(self) -> None:
+        self.install()
+        # a git that github.com refuses: the first call fails with a 429, then the mirror gains the commit
+        fake = self.dir / "fake-git"
+        fake.write_text("#!/bin/bash\n"
+                        f"if [[ \" $* \" == *' fetch '* && ! -e {self.dir}/refused ]]; then touch {self.dir}/refused;"
+                        f" /usr/bin/git -C {self.mirror} fetch -q {self.github} {self.pr_sha} 2>/dev/null;"
+                        " echo 'fatal: unable to access: The requested URL returned error: 429' >&2; exit 128; fi\n"
+                        'exec /usr/bin/git "$@"\n')
+        fake.chmod(0o755)
+        shim = self.temp / hook.GIT_SHIM_DIR / "git"
+        shim.write_text(shim.read_text().replace("real=/usr/bin/git", f"real={fake}", 1))
+        result = self.checkout_fetch(self.pr_sha)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("github.com refused", result.stderr)
+        self.assertEqual(self.log(), ["github", "mirror"])
+        self.assertEqual(self.git(self.ws, "rev-parse", "refs/remotes/origin/main"), self.pr_sha)
+
+    def test_a_failure_that_is_no_refusal_is_not_retried(self) -> None:
+        self.install()
+        shutil.rmtree(self.github)
+        result = self.checkout_fetch(self.pr_sha)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.log(), ["github"])
+
+    def test_a_run_on_a_mirrored_branch_waits_for_the_mirror_before_asking_github(self) -> None:
+        self.install()
+        fill = subprocess.Popen(["/bin/bash", "-c", f"sleep 2; git -C {self.mirror} fetch -q {self.github} {self.pr_sha}"],
+                                env=self.env)
+        try:
+            result = self.checkout_fetch(self.pr_sha, env={"GITHUB_EVENT_NAME": "push",
+                                                          "GITHUB_REF": "refs/heads/nightly-next",
+                                                          "GLAEDA_GIT_SHIM_WAIT_S": "30"})
+        finally:
+            fill.wait(timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.log(), ["mirror"])
+
+
+class SubmoduleShimTest(unittest.TestCase):
+    """GIT_SHIM for submodules: a cold cmux checkout's `git submodule update` clones each submodule from the
+    mirror pass's submodule mirror (glaeda-git-mirror SUBMODULES), so it sends github.com no git fetch."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name).resolve()
+        self.gitconfig = self.dir / "gitconfig"
+        # no protocol.file.allow here: git refuses file:// inside a submodule unless the shim allows it
+        self.gitconfig.write_text(f'[url "file://{self.dir}/github/"]\n\tinsteadOf = https://github.com/\n')
+        self.env = {"PATH": "/usr/bin:/bin", "HOME": os.fspath(self.dir), "GIT_CONFIG_NOSYSTEM": "1",
+                    "GIT_CONFIG_GLOBAL": os.fspath(self.gitconfig), "TMPDIR": os.fspath(self.dir),
+                    "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com", "GIT_COMMITTER_NAME": "t",
+                    "GIT_COMMITTER_EMAIL": "t@example.com", "GLAEDA_GIT_SHIM_POLL_S": "1",
+                    "GLAEDA_GIT_SHIM_BACKOFF_S": "1", "GLAEDA_GIT_SHIM_WAIT_S": "0"}
+        self.url = "https://github.com/manaflow-ai/ghostty.git"
+        src = self.dir / "ghostty-src"
+        src.mkdir()
+        self.git(src, "init", "-q", "-b", "main")
+        (src / "build.zig").write_text("zig\n")
+        self.git(src, "add", "-A")
+        self.git(src, "commit", "-qm", "ghostty")
+        self.pin = self.git(src, "rev-parse", "HEAD")
+        self.github = self.dir / "github" / "manaflow-ai" / "ghostty.git"
+        self.github.parent.mkdir(parents=True)
+        self.git(self.dir, "clone", "-q", "--bare", os.fspath(src), os.fspath(self.github))
+        self.git(self.github, "config", "uploadpack.allowAnySHA1InWant", "true")
+        fleet = self.dir / "fleet" / "git"
+        self.mirror = fleet / "cmux.git"
+        self.mirror.mkdir(parents=True)
+        self.git(self.mirror, "init", "-q", "--bare")
+        (self.mirror / "glaeda-verified").write_text("now\n")
+        self.sm = fleet / "submodules" / "ghostty.git"
+        self.sm.mkdir(parents=True)
+        self.git(self.sm, "init", "-q", "--bare")
+        self.git(self.sm, "config", "glaeda.url", self.url)
+        self.git(self.sm, "config", "uploadpack.allowAnySHA1InWant", "true")
+        self.ws = self.dir / "work" / "cmux"
+        self.ws.mkdir(parents=True)
+        self.git(self.ws, "init", "-q", "-b", "main")
+        (self.ws / ".gitmodules").write_text(f'[submodule "ghostty"]\n\tpath = ghostty\n\turl = {self.url}\n')
+        self.git(self.ws, "update-index", "--add", "--cacheinfo", f"160000,{self.pin},ghostty")
+        self.git(self.ws, "add", ".gitmodules")
+        self.git(self.ws, "commit", "-qm", "cmux")
+        self.git(self.ws, "remote", "add", "origin", "https://github.com/manaflow-ai/cmux")
+        self.temp = self.dir / "runner-temp"
+        self.temp.mkdir()
+        self.path_file = self.dir / "github_path"
+        self.path_file.write_text("")
+        self.job_env = {**self.env, "RUNNER_TEMP": os.fspath(self.temp), "GITHUB_PATH": os.fspath(self.path_file)}
+        self.assertIn("read", hook.install_git_shim("manaflow-ai/cmux", self.mirror, self.job_env))
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def git(self, cwd: Path, *args: str) -> str:
+        return subprocess.run(["git", "-C", os.fspath(cwd), *args], env=self.env, capture_output=True, text=True,
+                              check=True).stdout.strip()
+
+    def shim(self, *args: str, env: dict | None = None) -> subprocess.CompletedProcess:
+        return subprocess.run([os.fspath(self.temp / hook.GIT_SHIM_DIR / "git"), *args], cwd=self.ws,
+                              env={**self.job_env, **(env or {})}, capture_output=True, text=True, timeout=60)
+
+    def log(self) -> list[str]:
+        path = self.temp / hook.GIT_SHIM_LOG
+        return [line.split()[0] for line in path.read_text().splitlines()] if path.exists() else []
+
+    def warm_mirror(self) -> None:
+        self.git(self.sm, "fetch", "-q", "--depth=1", self.url, f"+{self.pin}:refs/heads/main")
+
+    def test_a_cold_checkout_s_submodules_come_from_the_mirror(self) -> None:
+        self.warm_mirror()
+        shutil.rmtree(self.github)  # github.com is gone: only the mirror can serve it
+        self.shim("submodule", "sync", "--recursive")
+        done = self.shim("-c", "protocol.version=2", "submodule", "update", "--init", "--force", "--depth=1",
+                         "--recursive")  # actions/checkout v6, submodules: true
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue((self.ws / "ghostty" / "build.zig").exists())
+        self.assertEqual(self.log(), ["mirror"])
+        self.assertIn("github.com git fetches: 0 (the mirror served 1)", hook.git_fetch_summary(self.job_env))
+        again = self.shim("-C", "ghostty", "fetch", "--depth=1", "origin", self.pin)  # a fetch inside it
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(self.log(), ["mirror", "mirror"])
+
+    def test_init_submodule_s_named_path_comes_from_the_mirror(self) -> None:
+        self.warm_mirror()
+        shutil.rmtree(self.github)
+        done = self.shim("-c", "http.lowSpeedLimit=1000", "submodule", "update", "--init", "--depth", "1", "--",
+                         "ghostty")  # scripts/ci/init-submodule.sh
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.log(), ["mirror"])
+
+    def test_a_pin_the_mirror_lacks_goes_to_github_and_is_counted(self) -> None:
+        allow = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "protocol.file.allow", "GIT_CONFIG_VALUE_0": "always"}
+        done = self.shim("submodule", "update", "--init", "--depth=1", env=allow)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue((self.ws / "ghostty" / "build.zig").exists())
+        self.assertEqual(self.log(), ["github"])
+
+    def test_a_submodule_already_here_sends_nothing_anywhere(self) -> None:
+        self.warm_mirror()
+        self.assertEqual(self.shim("submodule", "update", "--init", "--depth=1").returncode, 0)
+        shutil.rmtree(self.github)
+        shutil.rmtree(self.sm)
+        done = self.shim("submodule", "update", "--init", "--force", "--depth=1")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.log(), ["mirror"])
 
 
 if __name__ == "__main__":

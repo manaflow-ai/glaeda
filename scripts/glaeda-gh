@@ -1485,6 +1485,10 @@ PR_FULL_EVERY = 600  # a probed PR is still read in full this often (a renamed c
 # whose expected time, by the seconds per full PR measured for that repository (full_pr_secs), stays under this.
 PR_FULL_QUERY_SECONDS = 6.0
 PR_FULL_SLOW_AT = 8.0  # a failed full-read query this slow taught that its PRs cost at least this much between them
+# The measure lives in this file under BASE, so a reexec starts from it. Kept in memory only, every restart (the land
+# host restarts on each deploy, 2026-11-26 03:03-03:11Z) began with no measure: one cmux query of all 10 full reads,
+# then 4, 3 and 1, each cut by GitHub at 10.5-11 s, about 43 s of failed reads and their GraphQL cost before it read.
+FULL_PR_SECS_FILE = "full-pr-secs.json"
 # ... unless PR reads are behind (pr_behind): then a probe stands in for a full read up to PR_FULL_BEHIND_EVERY. A full
 # cmux PR costs GitHub about 3.5 s to answer and a probe about 0.5 s (one host, 2026-11-22: 13-16 s for a batch of 8,
 # 4-6 s for a probe of 10, the same PRs). With PR_FULL_EVERY as short as the stale bound, every PR in a backlog was past
@@ -2293,6 +2297,13 @@ def read_json(path: Path) -> Any:
         return json.loads(path.read_text())
     except (OSError, ValueError):
         return None
+
+
+def load_full_pr_secs(path: Path) -> dict[str, float]:
+    """The seconds per full PR read a daemon measured before its reexec (FULL_PR_SECS_FILE); {} when none is readable."""
+    saved = read_json(path)
+    return {str(k): float(v) for k, v in (saved.items() if isinstance(saved, dict) else ())
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and 0 < v < 3600}
 
 
 def read_cache(key: str) -> dict | None:
@@ -6427,7 +6438,9 @@ class Daemon:
         self.reads: list[tuple[float, str, str]] = []  # (time, kind, bucket) per entry read, for the last hour
         self.read_secs: list[tuple[float, str, str, float, int]] = []  # (time, kind, bucket, seconds, entries) read_seconds
         self.batch: dict[str, int] = {kind: GQL_BATCH_START for kind in CYCLES}  # entries per GraphQL query
-        self.full_pr_secs: dict[str, float] = {}  # owner/repo -> seconds per PR of a full GraphQL read (fetch_prs)
+        # owner/repo -> seconds per PR of a full GraphQL read (fetch_prs), carried across a reexec (FULL_PR_SECS_FILE)
+        self.full_pr_secs_path: Path | None = BASE / FULL_PR_SECS_FILE
+        self.full_pr_secs: dict[str, float] = load_full_pr_secs(self.full_pr_secs_path)
         self.clean: dict[str, int] = {kind: 0 for kind in CYCLES}  # clean GraphQL queries in a row
         # key -> {"at": last lone read, "fails": lone timeouts in a row, "oks": lone answers in a row}
         self.heavy: dict[str, dict] = {}
@@ -11923,6 +11936,10 @@ class Daemon:
                 measured[repo] = floor
                 log({"event": "pr-full-seconds", "repo": repo, "seconds": round(floor, 2),
                      "size": self.full_pr_size(entries), "after": round(seconds, 1), "of": len(entries)})
+        path = getattr(self, "full_pr_secs_path", None)
+        if path is not None and measured.get(repo) != known:
+            with contextlib.suppress(OSError):  # a lost write costs one relearned measure after a restart, no more
+                write_json(path, {k: round(v, 3) for k, v in measured.items()})
 
     def probe_ok(self, e: dict) -> bool:
         """Whether this PR's cached answer may be confirmed by a probe instead of read in full: a whole GraphQL read
@@ -15580,6 +15597,25 @@ LAND_REARM_CODES = re.compile(r"^(?:retry_deadline|review_cannot_start|own_red|r
                               r"|[a-z_]+_transient)$")
 LAND_REARM_AFTER = 3600.0
 LAND_REARM_CAP = 3
+# LAND_OWNER_REMIND: re-judging a stopped row and reaching its owner again are the same switch (rearm), so a code
+# correctly left out of LAND_REARM_CODES loses its follow-up along with its re-judging: its requester is told once, at
+# the stop, and then nothing ever asks again. A conflict with the base (the row's `conflict`, land_judge's
+# conflicts_base) is the whole of that loss. One lane's queue, 2026-11-25:
+# 89 of its rows stopped, median age 31.8 h, p90 108.1 h, max 110.7 h, 34 over a day old and 14 over two; 62 of the
+# 116 stopped rows on the host were `conflict`. The daemon's own log over two months: red_not_excused 599 judged and
+# 300 re-armed, checks_stuck 92 re-armed, own_red 78 -- and conflicts_base 104 judged, 0 re-armed, 0 repeat-quiet.
+# `git cherry origin/main HEAD` over 43 of those conflict heads found 1 already in main and 42 carrying real unlanded
+# work, so the drain is work, not garbage. Re-judging them would be wrong (land_judge's conflicts_base: "no retry or
+# fetch clears a conflict, only a merge of the base into the head", guarded by its test_land_judge_no_spiral), so the
+# reminder judges nothing: the row stays stopped at the same gen and its requester gets the stop's own one step again,
+# with its age, every LAND_OWNER_REMIND_EVERY, at most LAND_OWNER_REMIND_CAP a UTC day. The precedent is in this file:
+# a *forwarded* stopped row's far host is re-asked every LAND_FORWARD_STOPPED_ASK_EVERY; the local owner had no
+# equivalent. Skipped where nothing is owed: a PR whose cached state is MERGED or CLOSED, and the codes that are not
+# the requester's to act on. Detector: test-glaeda-gh.py
+# test_a_stop_that_never_rearms_still_reaches_its_owner.
+LAND_OWNER_REMIND_SKIP = re.compile(r"^(?:closed|cancelled|merged|teammate)$")
+LAND_OWNER_REMIND_EVERY = 21600.0
+LAND_OWNER_REMIND_CAP = 2
 # LAND_UNLABEL: a land that ends without a merge takes off the ready-to-land label the land put on. cmux
 # scripts/ci/head_tier.py runs the full tier (pr-router's linux, web-browser, mac, ios) on every head of a non-draft PR
 # that carries ready-to-land, and nothing took the label off when a land stopped, was cancelled or its PR closed: on
@@ -17974,7 +18010,8 @@ class LandQueue:
                     self.changed_entries.discard(key)
                 elif e["state"] == "stopped" and key not in self.jobs:
                     with self.lock:
-                        self.rearm(e)  # judged from the next pass
+                        if not self.rearm(e):  # judged from the next pass
+                            self.remind(e)  # a stop that never re-arms still reaches its owner
                 if key in self.entries and key not in self.jobs and self.unlabel_owed(self.entries[key]):
                     unlabel.append(key)
             except Exception as error:  # noqa: BLE001  one bad entry must not stop the others
@@ -19616,6 +19653,45 @@ class LandQueue:
         self.history(e, "rearmed", code=code, why=why, n=n + 1)
         log({"event": "land-rearmed", "key": e["key"], "code": code, "why": why, "n": n + 1})
         self.save(e)
+        return True
+
+    def remind(self, e: dict) -> bool:
+        """Tell a stopped E's requester its one step again, for a stop nothing clears by itself
+        (LAND_OWNER_REMIND's comment). Under the lock. Judges nothing: the row stays stopped, at the same gen."""
+        if e.get("state") != "stopped":
+            return False
+        st = e.get("stop") or {}
+        code = str(st.get("code") or "")
+        if not code or LAND_REARM_CODES.match(code) or LAND_OWNER_REMIND_SKIP.match(code):
+            return False  # a re-armable code is rearm's: its probe tells the requester whatever changed
+        to = str(e.get("requester") or "")
+        if not to:
+            return False  # notify's land-unnotified already said it at the stop
+        data = (self.cache_of(e["key"]) or {}).get("data") or {}
+        if str(data.get("state") or "").upper() in ("MERGED", "CLOSED"):
+            return False  # a PR that is over owes its requester nothing; `land status` still shows the row
+        day = land_day(self.now)
+        r = e.get("reminds") or {}
+        n = int(r.get("n") or 0) if r.get("day") == day else 0
+        if n >= LAND_OWNER_REMIND_CAP:
+            return False
+        at = float(st.get("at") or 0)
+        last = float(r.get("at") or 0) or at
+        if self.now - last < LAND_OWNER_REMIND_EVERY:
+            return False
+        e["reminds"] = {"day": day, "n": n + 1, "at": self.now}
+        hours = (self.now - at) / 3600.0
+        msg = (f"glaeda land: {self.url(e)} still stopped after {hours:.0f} h: {code}: "
+               f"{land_reason(st.get('reason') or '', 300)}")
+        if st.get("next"):
+            msg += f" next: {land_trim(str(st['next']), 300)}"
+        if st.get("detail"):
+            msg += "\n" + str(st["detail"])[:LAND_HUNK_CHARS + 20]
+        self.history(e, "reminded", code=code, n=n + 1, hours=round(hours, 1))
+        log({"event": "land-owner-reminded", "key": e["key"], "code": code, "to": to, "n": n + 1,
+             "hours": round(hours, 1)})
+        self.save(e)
+        self.notify(e, to, msg)
         return True
 
     def unlabel_owed(self, e: dict) -> bool:
