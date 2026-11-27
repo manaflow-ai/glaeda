@@ -17940,6 +17940,15 @@ LAND_UNION_DEADLINE = 120.0
 # test_a_base_merge_push_that_timed_out_is_pushed_again_within_minutes.
 LAND_UNION_PUSH_DEADLINE = 240.0
 LAND_UNION_PUSH_TRIES = 2
+# Each fetch into a union mirror (the broker's lane-gh fetch, or git fetch) leaves one more pack, and nothing ever
+# repacked one: no git here runs gc. gcp-codex-lane-5, 2026-11-27: the cmuxterm-hq union mirror held 454 packs,
+# 2.0 GiB, and every one of its 101,273 objects was in the wt mirror it borrows (union_seed's alternate); "glaeda
+# caches" were 70 GiB over 40 lane VMs, 3 to 5 GiB each. Leo: "why are these disks getting so full man they all have
+# 256". After a fetch, a union mirror over LAND_UNION_PACKS packs is repacked into one, local objects only (-l: what
+# the alternate holds is dropped, it stays readable through it), so a union mirror costs about one fetch's increment.
+# Detector: test-glaeda-gh.py test_a_union_mirror_over_its_pack_bound_repacks_to_what_its_alternate_lacks.
+LAND_UNION_PACKS = 16
+LAND_UNION_REPACK_DEADLINE = 300.0
 
 # LAND_UNION_ONE_KEY: a union merge of two sides that each rewrote one frontmatter line keeps both lines. goals/*.md
 # merge by union for their dated notes (cmuxterm-hq .gitattributes), and on 2026-11-27 goals/ci-min-per-pr-140.md
@@ -27235,6 +27244,21 @@ class LandQueue:
         got = self.union_git(gitdir, "update-ref", f"refs/remotes/origin/{base}", tip, e=e)
         return tip if got.returncode == 0 else f"update-ref failed: {land_trim(got.stderr or '', 160)}"
 
+    def union_compact(self, gitdir: str, e: dict | None = None) -> str:
+        """Repack union mirror GITDIR into one pack of what its alternate lacks once a fetch left it over
+        LAND_UNION_PACKS packs (LAND_UNION_PACKS's comment). What it did, for the log."""
+        try:
+            packs = sum(1 for p in (Path(gitdir) / "objects" / "pack").iterdir() if p.suffix == ".pack")
+        except OSError:
+            return "no pack folder"
+        if packs <= LAND_UNION_PACKS:
+            return f"{packs} packs, under {LAND_UNION_PACKS}"
+        got = self.union_git(gitdir, "-c", "pack.threads=2", "repack", "-a", "-d", "-l", "-q",
+                             timeout=LAND_UNION_REPACK_DEADLINE, e=e)
+        if got.returncode != 0:
+            return f"repack of {packs} packs failed: {land_trim(got.stderr or '', 160)}"
+        return f"repacked {packs} packs"
+
     def union_git(self, gitdir: str, *args: str, attrs: str | None = None, timeout: float = LAND_UNION_DEADLINE,
                   e: dict | None = None, extra: dict[str, str] | None = None) -> subprocess.CompletedProcess:
         git = self.path("git", Path(shutil.which("git") or "/usr/bin/git")).as_posix()
@@ -27291,6 +27315,7 @@ class LandQueue:
         if got.returncode != 0:  # decided nothing about the head: a re-land at it tries again (unionMerge dropped)
             e["unionMerge"]["retry"] = True
             return "", "", "", f"the fetch of {base} and {branch} failed: {land_trim(land_tail(got.stderr or ''), 160)}"
+        self.union_compact(gitdir, e)
         got = self.union_git(gitdir, "rev-parse", f"refs/remotes/origin/{branch}^{{commit}}",
                              f"refs/remotes/origin/{base}^{{commit}}")
         shas = (got.stdout or "").split()

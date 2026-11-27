@@ -36569,6 +36569,34 @@ class LandTest(Base):
         self.assertIn("is not under", self.q.union_seed(os.fspath(union), "o/r", "main"))
         self.assertNotEqual(old, base)
 
+    def test_a_union_mirror_over_its_pack_bound_repacks_to_what_its_alternate_lacks(self):
+        """gcp-codex-lane-5, 2026-11-27: a union mirror at 454 packs, 2.0 GiB, every object also in the wt mirror it
+        borrows. Over LAND_UNION_PACKS packs, union_compact repacks it into what the alternate lacks; its refs still
+        read through the alternate. At or under the bound it is left alone."""
+        head, base = self.union_origin()
+        origin = Path(self.tmp.name) / "origin"
+        mirror = Path(self.tmp.name) / "wt-mirrors" / "o" / "r.git"
+        subprocess.run(["git", "clone", "-q", "--bare", os.fspath(origin), os.fspath(mirror)], check=True,
+                       capture_output=True)
+        union = Path(self.tmp.name) / "union.git"
+        subprocess.run(["git", "init", "-q", "--bare", os.fspath(union)], check=True)
+        for ref in ("main", "lane/x"):  # one pack per fetch, as each broker fetch leaves
+            subprocess.run(["git", "--git-dir", os.fspath(union), "-c", "fetch.unpackLimit=1", "fetch", "-q",
+                            "--no-tags", os.fspath(origin),
+                            f"+refs/heads/{ref}:refs/remotes/origin/{ref}"], check=True, capture_output=True)
+        packs = lambda: sorted(p.name for p in (union / "objects/pack").iterdir() if p.suffix == ".pack")
+        before = packs()
+        with mock.patch.object(gg, "LAND_UNION_PACKS", len(before)):
+            self.assertIn("under", self.q.union_compact(os.fspath(union)))
+        self.assertEqual(packs(), before)
+        (union / "objects/info/alternates").write_text(f"{mirror / 'objects'}\n")
+        with mock.patch.object(gg, "LAND_UNION_PACKS", 1):
+            said = self.q.union_compact(os.fspath(union))
+            self.assertTrue(said.startswith("repacked"), said)
+        self.assertEqual(packs(), [])  # the alternate holds every object
+        for sha in (head, base):
+            subprocess.run(["git", "--git-dir", os.fspath(union), "cat-file", "-e", f"{sha}^{{tree}}"], check=True)
+
     def union_conflict_tick(self, head: str, owners: frozenset = frozenset({"o"})) -> dict:
         """HEAD landed pinned, judged stale_green (update-branch named), and GitHub's update-branch refused it for the
         conflict, as it does whatever .gitattributes says. OWNERS stands in for LAND_MERGE_OWNERS (the test repo is
