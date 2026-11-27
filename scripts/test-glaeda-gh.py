@@ -26940,13 +26940,20 @@ class DirectReadAppPoolTest(unittest.TestCase):
                 return "sent"
         return Fake()
 
+    def made(self, fake):
+        """Daemon(...) answering FAKE, which keeps the token it was given (no_login_reader reads it)."""
+        def make(**kw):
+            fake.token_source = kw.get("token")
+            return fake
+        return make
+
     def pool(self, owners, token="ghs_" + "a" * 36):
         return gg.AppPool(role="quota-goblin", mint=lambda owner: token, owners=lambda: owners, ready=lambda: True)
 
     def read(self, pool, key="pr:manaflow-ai/cmuxterm-hq#25577"):
         sent = []
         fake = self.fake_daemon(pool, sent)
-        with mock.patch.object(gg, "Daemon", return_value=fake):
+        with mock.patch.object(gg, "Daemon", side_effect=self.made(fake)):
             got = gg._read_one({"key": key, "kind": "pr", "began": time.time()}, None)
         return got, sent
 
@@ -26955,21 +26962,169 @@ class DirectReadAppPoolTest(unittest.TestCase):
         self.assertEqual(sent, ["pr:manaflow-ai/cmuxterm-hq#25577"], "the read was refused before the App was asked")
         self.assertEqual(got, "sent")
 
-    def test_the_login_stop_still_holds_a_read_no_app_answers(self) -> None:
+    def test_a_read_no_app_answers_never_goes_on_the_login(self) -> None:
+        # Spent or not, the login is not asked: the wait waits for the daemon (interim-coord-2, cosmic-gray 2026-11-27).
         for pool in (None, self.pool(["teamleaderleo"]), self.pool(["manaflow-ai"], token=None)):
             got, sent = self.read(pool)
-            self.assertEqual((got, sent), (gg.DIRECT_QUOTA, []), pool and pool.owners_fn())
+            self.assertEqual((got, sent), (gg.DIRECT_NO_LOGIN, []), pool and pool.owners_fn())
 
     def test_a_straggler_read_with_the_login_rest_spent_goes_to_the_app_pool(self) -> None:
         fake = self.fake_daemon(self.pool(["manaflow-ai"]), [])
         fake.get = lambda path, etag: ("fresh", {"path": path}, {})
-        with mock.patch.object(gg, "Daemon", return_value=fake):
+        with mock.patch.object(gg, "Daemon", side_effect=self.made(fake)):
             got = gg.straggler_get("manaflow-ai/cmux", ["actions/jobs/1"])
         self.assertEqual(got, {"actions/jobs/1": {"path": "/repos/manaflow-ai/cmux/actions/jobs/1"}})
         fake.app_pool = None
-        with mock.patch.object(gg, "Daemon", return_value=fake):
+        with mock.patch.object(gg, "Daemon", side_effect=self.made(fake)):
             self.assertEqual(gg.straggler_get("manaflow-ai/cmux", ["actions/jobs/1"]),
-                             {"actions/jobs/1": gg.DIRECT_QUOTA})
+                             {"actions/jobs/1": gg.DIRECT_NO_LOGIN})
+
+
+class FallbackNeverOnLoginTest(Base):
+    """interim-coord-2 (cosmic-gray, 2026-11-27): "glaeda-gh falls back to reading GitHub with Leo's login whenever the
+    build controller answers 429, about 60 times in the past hour; those calls go through a forwarder that skips the
+    spend logs." A fallback waits (bounded by the caller's deadline) or uses an App token, never the login, and every
+    path logs its spend in the daemon's spend log."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        for name in ("upstream_command", "direct_command"):
+            pin = mock.patch.object(gg, name, return_value=None)  # a host with a login, as cosmic-gray
+            pin.start()
+            self.addCleanup(pin.stop)
+        gg.BASE.mkdir(parents=True, exist_ok=True)
+
+    def no_app_daemon(self, sent: list):
+        real = gg.Daemon
+
+        def make(*args, **kw):
+            kw.update(app_pool=None, transport=lambda *a, **k: sent.append(a) or (200, {}, b"{}"))
+            return real(*args, **kw)
+        return make
+
+    def test_a_direct_read_no_app_answers_never_asks_for_the_login_token(self) -> None:
+        sent: list = []
+        login = mock.Mock(side_effect=AssertionError("the login token was read"))
+        with mock.patch.object(gg, "gh_token", login), mock.patch.object(gg, "Daemon", self.no_app_daemon(sent)):
+            for kind, key in (("pr", "pr:o/r#7"), ("run", "run:o/r#9"), ("comment", "comment:o/r#7")):
+                with self.subTest(kind=kind):
+                    got = gg._read_one({"key": key, "kind": kind, "began": time.time()}, None)
+                    self.assertEqual(got, gg.DIRECT_NO_LOGIN)
+            self.assertEqual(gg.straggler_get("o/r", ["actions/jobs/1"]), {"actions/jobs/1": gg.DIRECT_NO_LOGIN})
+        login.assert_not_called()
+        self.assertEqual(sent, [], "a fallback read went to GitHub with no App to send it on")
+
+    def test_detector_no_daemon_outside_the_serving_one_reaches_the_login(self) -> None:
+        # Static: every Daemon built outside the serving daemon on a host with a login (controller=None,
+        # upstream=None) names its token; only free_account_reading's free GET /rate_limit keeps the login's.
+        source = (ROOT / "scripts" / "glaeda-gh").read_text()
+        tree = __import__("ast").parse(source)
+        ast = __import__("ast")
+        offenders = []
+        for fn in ast.walk(tree):
+            if not isinstance(fn, ast.FunctionDef):
+                continue
+            for call in ast.walk(fn):
+                if isinstance(call, ast.Call) and getattr(call.func, "id", None) == "Daemon":
+                    words = {k.arg: k.value for k in call.keywords}
+                    outside = all(isinstance(words.get(w), ast.Constant) and words[w].value is None
+                                  for w in ("controller", "upstream"))
+                    if outside and "token" not in words and fn.name != "free_account_reading":
+                        offenders.append(f"{fn.name}:{call.lineno}")
+        self.assertEqual(offenders, [], "a Daemon outside the serving daemon reads with the login token")
+        # Runtime: the token every such Daemon is given refuses before a request is sent.
+        sent: list = []
+        daemon = gg.Daemon(transport=lambda *a, **k: sent.append(a) or (200, {}, b"{}"), token=gg.fallback_no_login,
+                           controller=None, upstream=None, app_pool=None)
+        for method, path, body in (("GET", "/repos/o/r/pulls/1", None), ("POST", "/graphql", {"query": "{x}"})):
+            with self.subTest(path=path), self.assertRaisesRegex(gg.WatchError, "never goes on this host's login"):
+                daemon.request(method, path, body)
+        self.assertEqual(sent, [])
+        # And job logs: on a controller 429 no path reads the log with the login (job_log_read's REST, the shim's gh).
+        with mock.patch.object(gg, "controller_job_log", lambda *a, **k: (429, b"")), \
+                mock.patch.object(gg, "gh_cache_child", side_effect=AssertionError("gh ran on the login")):
+            ctl = gg.Controller("http://127.0.0.1:9", "tok")
+            text, _, why = gg.job_log_read("o/r", 5, ctl, rest=mock.Mock(side_effect=AssertionError("REST read")),
+                                           deadline=time.monotonic() + 0.5)
+            self.assertEqual((text, why), (None, gg.JOB_LOG_429_WHY))
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(gg.gh_job_log_answer("/bin/false", ["api", "repos/o/r/actions/jobs/5/logs"],
+                                                      "o/r", 5, {}, ctl), gg.BROKER_EXIT_REFUSED)
+
+    def test_a_controller_429_waits_its_retry_after_and_asks_once_more(self) -> None:
+        answers = [(429, b"", 2.0), (200, b"the log\n", None)]
+        asked, slept = [], []
+
+        def controller_job_log(ctl, repo, job, deadline=None, said=None):
+            status, body, wait = answers[len(asked)]
+            asked.append(job)
+            if said is not None and wait is not None:
+                said["retryAfter"] = wait
+            return status, body
+        rest = mock.Mock(side_effect=AssertionError("REST read on the login"))
+        with mock.patch.object(gg, "controller_job_log", controller_job_log), \
+                mock.patch.object(gg.time, "sleep", slept.append):
+            text, source, why = gg.job_log_read("o/r", 6, gg.Controller("http://127.0.0.1:9", "tok"), rest=rest,
+                                                deadline=time.monotonic() + 60)
+        self.assertEqual((text, source, why, slept, len(asked)), (b"the log\n", "controller", "", [2.0], 2))
+        # a Retry-After past the caller's deadline is not waited for: the read says why, with no REST
+        asked.clear()
+        answers[:] = [(429, b"", 30.0)]
+        with mock.patch.object(gg, "controller_job_log", controller_job_log):
+            got = gg.job_log_read("o/r", 7, gg.Controller("http://127.0.0.1:9", "tok"), rest=rest,
+                                  deadline=time.monotonic() + 5)
+        self.assertEqual((got, len(asked)), ((None, "", gg.JOB_LOG_429_WHY), 1))
+        rest.assert_not_called()
+
+    def test_a_lane_vm_still_reads_through_its_broker_on_a_controller_429(self) -> None:
+        rest = mock.Mock(return_value=(True, b"x\n", ""))
+        with mock.patch.object(gg, "controller_job_log", lambda *a, **k: (429, b"")), \
+                mock.patch.object(gg, "upstream_command", return_value=["lane-gh"]):
+            got = gg.job_log_read("o/r", 8, gg.Controller("http://127.0.0.1:9", "tok"), rest=rest,
+                                  deadline=time.monotonic() + 0.5)
+        self.assertEqual(got, (b"x\n", "rest", ""))
+
+    def test_every_fallback_path_logs_its_spend_in_the_daemons_spend_log(self) -> None:
+        # a direct read's rows, and the shim's job-log read, reach spend.json through the serving daemon
+        gg.spend_side_add({int(time.time() // 60): {"graphql\tpr-direct\tpr\to/r": [1, 0, 3]}})
+        with mock.patch.object(gg, "controller_job_log", lambda *a, **k: (404, b"")), \
+                mock.patch.object(gg, "gh_cache_child", return_value=(0, b"log\n", b"")), \
+                contextlib.redirect_stdout(io.StringIO()):
+            gg.gh_job_log_answer("/bin/false", ["api", "repos/o/r/actions/jobs/5/logs"], "o/r", 5, {},
+                                 gg.Controller("http://127.0.0.1:9", "tok"))
+        self.assertTrue((gg.BASE / gg.SPEND_SIDE_FILE).exists())
+        self.daemon.save_spend(force=True)
+        self.assertFalse((gg.BASE / gg.SPEND_SIDE_FILE).exists(), "the daemon took the side rows")
+        rows = {(r["bucket"], r["name"], r.get("why", "")): (r["requests"], r["counted"], r["points"])
+                for r in gg.Daemon.spend_rows(self.daemon)}
+        self.assertEqual(rows.get(("graphql", "pr-direct", "")), (1, 0, 3))
+        self.assertEqual(rows.get(("rest", gg.route_of("GET", "/repos/o/r/actions/jobs/5/logs"), "gh-shim")),
+                         (1, 1, 0))
+        saved = gg.load_spend(gg.read_json(gg.BASE / gg.SPEND_FILE))
+        self.assertTrue(any("gh-shim" in k for rows in saved.values() for k in rows), saved)
+
+    def test_a_direct_read_on_an_app_books_its_spend(self) -> None:
+        class Fake:
+            app_pool = object()
+            now = 0.0
+            tick_deadline = 0.0
+            spend = {123: {"rest\tGET /repos/{owner}/{repo}/actions/jobs/{id}\tpr\to/r": [1, 0, 0]}}
+
+            def mode(self, bucket):
+                return "normal"
+
+            def charge_rest(self, minute, n):
+                pass
+
+            def calling(self, *args):
+                return contextlib.nullcontext()
+
+            def get(self, path, etag):
+                return "fresh", {}, {}
+        with mock.patch.object(gg, "Daemon", return_value=Fake()), \
+                mock.patch.object(gg, "app_reads_key", return_value=True):
+            gg.straggler_get("o/r", ["actions/jobs/1"])
+        self.assertEqual(gg.load_spend(gg.read_json(gg.BASE / gg.SPEND_SIDE_FILE)), Fake.spend)
 
 
 class TempFileTest(unittest.TestCase):
@@ -27572,9 +27727,18 @@ class LogJobTest(Base):
 
     def test_rest_only_where_the_controller_cannot_serve(self) -> None:
         ctl = self.controller()
-        self.controller_logs[14] = (429, b"log reads spent")
+        self.controller_logs[14] = (404, b"not kept")
         self.gh.job_logs[14] = self.DONE
         self.assertEqual(self.log(14, ctl)[:2], (0, self.DONE))
+        self.assertEqual(self.rest_reads(), 1)
+        # spent (429): asked once more after its wait, then no REST read on the login (FallbackNeverOnLoginTest)
+        self.controller_logs[16] = (429, b"log reads spent")
+        self.gh.job_logs[16] = self.DONE
+        with mock.patch.object(gg, "upstream_command", return_value=None), \
+                mock.patch.object(gg.time, "sleep", lambda s: None):
+            code, out, err = self.log(16, ctl)
+        self.assertEqual((code, out), (gg.EXIT_FAIL, b""))
+        self.assertIn("429", err)
         self.assertEqual(self.rest_reads(), 1)
         self.controller_logs[15] = (410, b"gone")  # GitHub expired it: REST would 410 too
         code, out, err = self.log(15, ctl)
@@ -27671,7 +27835,8 @@ class LogScanTest(Base):
                 since = int(urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)["since"][0])
                 return {"records": [r for r in test.records if gg.iso_epoch(r["at"]) >= since], "more": False}
 
-        def controller_job_log(ctl: Any, repo: str, job: int, deadline: float | None = None) -> tuple[int, bytes]:
+        def controller_job_log(ctl: Any, repo: str, job: int, deadline: float | None = None,
+                               said: dict | None = None) -> tuple[int, bytes]:
             test.ctl_reads.append(job)
             return test.ctl_logs.get(job, (404, b""))
 
@@ -45884,7 +46049,8 @@ class BrokerJobLogTest(BrokerBase):
     def test_the_controller_answers_with_no_gh_and_a_down_one_is_skipped(self) -> None:
         asked: list[int] = []
 
-        def controller_job_log(ctl: Any, repo: str, job: int, deadline: float | None = None) -> tuple[int, bytes]:
+        def controller_job_log(ctl: Any, repo: str, job: int, deadline: float | None = None,
+                               said: dict | None = None) -> tuple[int, bytes]:
             asked.append(job)
             return (200, self.DONE.encode()) if job == 80 else (0, b"")
         with mock.patch.object(gg, "controller_job_log", controller_job_log):
