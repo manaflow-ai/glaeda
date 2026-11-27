@@ -37308,6 +37308,38 @@ class LandTest(Base):
         self.assertEqual(e["state"], "forwarded")
         self.broker = False
 
+    BROKER_REFUSED = ("land-judge: refused: tool error: base_red_excuse.py at " + LA + " (exit 3) sent a query the "
+                      "lane-gh broker refuses on every call, so no red was judged: lane-gh call get manaflow-ai/glaeda: "
+                      "refused: manaflow-ai/glaeda is not a repo gcp-agent-lane-15 may use; did you mean "
+                      "teamleaderleo/glaeda. No wait or retry clears it: read that repo under one this VM's broker "
+                      "grant names")
+
+    def test_a_tool_error_the_broker_refused_on_a_lane_vm_hands_the_land_to_the_broker_host(self):
+        # teamleaderleo/glaeda#3133, 2026-11-27: on gcp-agent-lane-15 land_judge stopped tool_error because the
+        # classifier's read of a repo outside the VM's broker grant was refused ("next: none"); the broker host reads it
+        # with its own login and was handed the land by hand.
+        self.broker = True
+        self.pr(LA)
+        with mock.patch.object(gg, "policy_host", lambda: "host"):
+            self.land(requester="host/lane")
+            self.w.answers.append(refusal("tool_error", LA, {"kind": "stop"}, reason=self.BROKER_REFUSED))
+            e = self.tick()
+        [call] = self.handoffs()
+        self.assertEqual(json.loads(call[4]), {"number": 1, "sha": LA, "requester": "host/lane"})
+        self.assertEqual(e["state"], "forwarded")
+        self.broker = False
+
+    def test_a_tool_error_naming_no_broker_refusal_or_off_a_lane_vm_stays_a_stop_here(self):
+        self.broker = True
+        e = {"state": "waiting"}
+        with mock.patch.object(gg, "policy_host", lambda: "host"):
+            self.assertTrue(self.q.unjudgeable_here(e, {"code": "tool_error", "reason": self.BROKER_REFUSED}, {}, LA))
+            self.assertEqual(self.q.unjudgeable_here(
+                e, {"code": "tool_error", "reason": "land-judge: refused: tool error: something else"}, {}, LA), "")
+            self.assertEqual(self.q.unjudgeable_here(e, {"code": "ci", "reason": self.BROKER_REFUSED}, {}, LA), "")
+        self.broker = False
+        self.assertEqual(self.q.unjudgeable_here(e, {"code": "tool_error", "reason": self.BROKER_REFUSED}, {}, LA), "")
+
     def test_a_land_tier_stop_stays_local_on_a_host_with_its_own_login(self):
         for code in ("land_tier_pending", "full_tier_label"):
             self.assertEqual(self.q.unjudgeable_here({"state": "waiting"}, {"code": code, "reason": "x"}, {}, LA), "")

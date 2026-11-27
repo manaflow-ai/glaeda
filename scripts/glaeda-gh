@@ -17178,6 +17178,15 @@ LAND_HANDOFF_UNREAD = frozenset({"unreadable", "explain_failed", "webview_unread
 # land adds land-ci): its add went through the broker as pr_edit, which a glaeda job with no lane session cannot
 # lease and whose pr_labels never list land-ci (hq#23688, 2026-11-24, "lease acquisition requires a lane session").
 LAND_HANDOFF_BROKER_ONLY = frozenset({"land_tier_pending", "full_tier_label"})
+# And land_judge's tool_error whose read the lane-gh broker refused (leo-workspace tools/land_judge/engine.py
+# TOOL_ERROR_LEAD: "... sent a query the lane-gh broker refuses on every call"): the VM's broker grant (a repo it may not
+# read, "REPO is not a repo VM may use") or the broker's query allowlist refused one of the judgment's reads, the same
+# on every call, so no retry here helps and the grant is never widened for it. The broker host's land queue reads with
+# its own login, through no broker, so it judges the same rules in full. teamleaderleo/glaeda#3133, 2026-11-27: the
+# classifier's base-verdict read of the base repo was refused on gcp-agent-lane-15 and the land stopped tool_error
+# ("next: none") on a PR the broker host merges; handed off by hand. A refusal that names no broker stays a stop.
+LAND_HANDOFF_BROKER_REFUSED_CODES = frozenset({"tool_error"})
+LAND_HANDOFF_BROKER_REFUSED = re.compile(r"\blane-gh broker refuse[sd]\b|\blane-gh call \S+ \S+: refused: ")
 # And while this host cannot read GitHub at all, a broker client hands a due PR off before it judges it, and before it
 # waits for a worker or a pace slot (early_hand_off): at least LAND_EARLY_HANDOFF_BAD of its last LAND_EARLY_HANDOFF_OF
 # live judgments within LAND_EARLY_HANDOFF_WINDOW read nothing for a transient reason (LAND_HANDOFF_UNREAD,
@@ -25996,10 +26005,13 @@ class LandQueue:
         worker for minutes and reads nothing again. gcp-agent-lane-10, 2026-11-22: manaflow-ai/cmux#48064 at
         1ebd272819aa answered "unreadable" after 5m9s (store 22 s, GraphQL and REST timed out), about 25 green lands
         sat behind such answers, all 8 workers busy, none ever handed off. The broker host judges it with its own
-        fresh reads (the same land_judge, nothing skipped) and merges it, or says why not. A host with its own login,
-        a cache-only answer, a partial head and quota (park_quota, before this) stay as they were."""
+        fresh reads (the same land_judge, nothing skipped) and merges it, or says why not. So is a tool_error whose
+        read the lane-gh broker refused (LAND_HANDOFF_BROKER_REFUSED): the broker host reads with its own login. A host
+        with its own login, a cache-only answer, a partial head and quota (park_quota, before this) stay as they were."""
         code = str(answer.get("code") or "")
-        if code not in LAND_HANDOFF_UNREAD | LAND_HANDOFF_BROKER_ONLY or answer.get("cacheOnly") \
+        refused = code in LAND_HANDOFF_BROKER_REFUSED_CODES \
+            and bool(LAND_HANDOFF_BROKER_REFUSED.search(str(answer.get("reason") or "")))
+        if (code not in LAND_HANDOFF_UNREAD | LAND_HANDOFF_BROKER_ONLY and not refused) or answer.get("cacheOnly") \
                 or not SHA40.fullmatch(head):
             return ""
         if not self.broker_client() or e.get("state") == LAND_FORWARDED:
