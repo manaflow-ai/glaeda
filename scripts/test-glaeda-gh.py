@@ -26283,6 +26283,13 @@ class StaleDataTest(Base):
         ctl.bodies = {}
         self.assertTrue(served_by(row(30, mergeable=None)))  # mergeability not computed yet: GitHub
         self.assertTrue(served_by(None))  # no row: GitHub
+        # no PR row at all, but the hub's kept pull body proven current (a separate store the broker serves from):
+        # it answers, with no pulls/N; proven not current, or on no head, GitHub does
+        ctl.bodies = {("o/r", 9): {"current": True, "pull": body}}
+        self.assertEqual(served_by(None), [])
+        ctl.bodies = {("o/r", 9): {"current": False, "pull": body}}
+        self.assertTrue(served_by(None))
+        ctl.bodies = {}
         merged = row(90000, state="closed", merged=True, merged_at="2026-11-25T01:00:00Z", mergeable=None)
         self.assertEqual(served_by(merged), [])
         self.assertEqual(gg.read_cache("pr:o/r#9")["data"]["state"], "MERGED")

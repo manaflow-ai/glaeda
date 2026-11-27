@@ -14131,8 +14131,10 @@ class Daemon:
         try:
             body = get(f"/v1/github/prs/{int(number)}/verdict?repo=" + urllib.parse.quote(repo, safe="/"),
                        timeout=CONTROLLER_ROLLUP_TIMEOUT)
-        except (ControllerTimeout, NoReceiver):  # slow, or no such route or row: GitHub answers
+        except ControllerTimeout:  # slow: GitHub answers
             return None
+        except NoReceiver:  # no verdict row (or route): the kept pull body may still be proven current
+            return self.controller_pull_current(get, repo, int(number), None)
         except WatchError:
             self.rollup_down_until = self.now + CONTROLLER_ROLLUP_DOWN
             return None
@@ -14142,7 +14144,9 @@ class Daemon:
                 or str(row.get("repo") or "").lower() != repo.lower()
                 or not re.fullmatch(r"[0-9a-fA-F]{40}", str(row.get("head_sha") or ""))
                 or row.get("state") not in ("open", "closed") or not row.get("updated_at")):
-            return None
+            # No usable PR row (not found, not seeded, unfit): the hub's kept pull body (pull-rest) is a separate
+            # store the broker already serves from; one proven current answers here too, not GitHub.
+            return self.controller_pull_current(get, repo, int(number), None)
         stored = iso_epoch(stream_time(row.get("received_at")))
         if row["state"] == "open" and (not isinstance(row.get("mergeable"), bool) or stored is None
                                        or self.now - stored >= PULL_REUSE_MAX):
@@ -14157,7 +14161,7 @@ class Daemon:
                          "base": {"ref": row.get("base_ref")}})
         return {"doc": doc, "at": min(self.now, stored or self.now), "via": "controller"}
 
-    def controller_pull_current(self, get: Any, repo: str, number: int, head: str) -> dict | None:
+    def controller_pull_current(self, get: Any, repo: str, number: int, head: str | None) -> dict | None:
         """GET pulls/N's part from the controller's kept pull body (/v1/github/pull-rest) when the controller proves
         it current (PULL_CURRENT, cmuxterm-hq#29955: received since the controller started and since any lost pull,
         review, comment, check run or status delivery, no check run or status on its head since, mergeability
@@ -14175,7 +14179,8 @@ class Daemon:
         pull = body.get("pull") if isinstance(body, dict) and body.get("found") is True \
             and body.get("current") is True else None
         if (not isinstance(pull, dict) or pull.get("number") != number or pull.get("state") != "open"
-                or str((pull.get("head") or {}).get("sha") or "").lower() != head.lower()
+                or not re.fullmatch(r"[0-9a-f]{40}", str((pull.get("head") or {}).get("sha") or "").lower())
+                or (head is not None and str((pull.get("head") or {}).get("sha") or "").lower() != head.lower())
                 or not isinstance(pull.get("mergeable"), bool) or not pull.get("mergeable_state")
                 or pull.get("mergeable_state") == "unknown" or not pull.get("updated_at")):
             return None
