@@ -1236,15 +1236,17 @@ def refresh_libexec_scripts(state_dir: Path = STATE_DIR, target: Path | None = N
     live on the next run with nothing to restart. An operator copy staged no earlier than the release and not an
     ancestor of it is kept, exactly as the staged runner copy is (SOURCE_STAMP)."""
     target = (HOME / LIBEXEC_RELATIVE) if target is None else target
-    linked = [path.name for path in (target, target / SOURCE_STAMP, *(target / name for name in names))
+    linked = [path.name for path in (target, target / SOURCE_STAMP)
               if path.is_symlink()]
     if linked:
         return "kept (operator symlink: " + ", ".join(linked) + ")"
     if not target.is_dir():
         return "absent"
-    present = [name for name in names if (target / name).is_file()]
+    linked = [name for name in names if (target / name).is_symlink()]
+    kept = "kept (operator symlink: " + ", ".join(linked) + ")" if linked else ""
+    present = [name for name in names if name not in linked and (target / name).is_file()]
     if not present:
-        return "no seed scripts"
+        return kept or "no seed scripts"
     tag = load_state(state_dir)["current"]
     gen = generation(state_dir, tag) if tag else None
     if gen is None or not (gen / ".complete").is_file():
@@ -1255,7 +1257,7 @@ def refresh_libexec_scripts(state_dir: Path = STATE_DIR, target: Path | None = N
         return f"{tag} has no " + ", ".join(absent)
     stale = [name for name in present if (target / name).read_bytes() != (src / name).read_bytes()]
     if not stale:
-        return "current"
+        return kept or "current"
     try:
         stamp = json.loads((target / SOURCE_STAMP).read_text())
     except (OSError, ValueError):
@@ -1282,7 +1284,7 @@ def refresh_libexec_scripts(state_dir: Path = STATE_DIR, target: Path | None = N
         os.replace(tmp, target / SOURCE_STAMP)
     finally:
         tmp.unlink(missing_ok=True)
-    return f"refreshed {', '.join(stale)} to {tag}"
+    return f"refreshed {', '.join(stale)} to {tag}" + (f"; {kept}" if kept else "")
 
 
 def refresh_runner_hooks(state_dir: Path = STATE_DIR, home: Path = HOME, detail: list | None = None) -> str:

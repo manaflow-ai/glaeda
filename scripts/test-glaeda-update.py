@@ -646,6 +646,36 @@ class UpdateTest(unittest.TestCase):
                 self.assertEqual((moved / name).read_text(), "old installed bytes")
                 self.assertFalse(gu.observe(self.state, self.bin, home, staged)[key][name]["current"])
 
+    def test_linked_seed_does_not_prevent_regular_sibling_refresh(self) -> None:
+        home, staged, _ = self.runner_mini()
+        entry = self.server.publish(SOURCES[0])
+        self.assertEqual(self.run_update()["result"], "updated")
+        target = home / gu.LIBEXEC_RELATIVE
+        target.mkdir(parents=True)
+        operator = self.root / "operator-seed-serve"
+        operator.write_text("operator bytes")
+        linked = target / "glaeda-seed-serve"
+        linked.symlink_to(operator)
+        archive = target / "glaeda-seed-archive"
+        for dangling in (False, True):
+            with self.subTest(dangling=dangling):
+                if dangling:
+                    operator.unlink()
+                archive.write_text("stale archive")
+                # runner_steps uses the whole default LIBEXEC_FILES tuple, as real OTA does.
+                result = gu.runner_steps(self.state, staged, home, bin_dir=self.bin)["libexecScripts"]
+                self.assertIn(f"refreshed glaeda-seed-archive to {entry['tag']}", result)
+                self.assertIn("kept (operator symlink: glaeda-seed-serve)", result)
+                self.assertEqual(archive.read_text(), f"glaeda-seed-archive at {SOURCES[0]}")
+                self.assertTrue(linked.is_symlink())
+                if not dangling:
+                    self.assertEqual(operator.read_text(), "operator bytes")
+                self.assertFalse((target / "glaeda-seed-prefetch").exists())
+                rows = gu.observe(self.state, self.bin, home, staged)["libexecScripts"]
+                self.assertTrue(rows["glaeda-seed-archive"]["current"])
+                self.assertFalse(rows["glaeda-seed-serve"]["current"])
+                self.assertIn("kept (operator symlink", gu.refresh_libexec_scripts(self.state, target))
+
     def test_a_hand_installed_seed_script_is_refreshed_and_a_role_is_never_added(self) -> None:
         libexec = self.root / "home/.local/libexec"
         self.assertEqual(gu.refresh_libexec_scripts(self.state, libexec), "absent")  # no seed role: nothing made
