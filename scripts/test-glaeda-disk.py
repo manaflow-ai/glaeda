@@ -17483,7 +17483,8 @@ class RunnerAccountsTest(unittest.TestCase):
     def test_sudo_refused_is_named_not_reached(self) -> None:
         pool = self.entry("cmux-pr-runner", 502)
         run = mock.Mock(return_value=subprocess.CompletedProcess([], 1, b"", b"sudo: a password is required\n"))
-        row = gd.run_runner_account(pool, ["--pressure", "--apply"], run=run)
+        with mock.patch.object(gd, "runner_account_root_copy", return_value=None):
+            row = gd.run_runner_account(pool, ["--pressure", "--apply"], run=run)
         self.assertEqual(row["state"], "not reached")
         self.assertIn("password", row["why"])
         self.assertEqual(run.call_count, 1)
@@ -17502,6 +17503,7 @@ class RunnerAccountsTest(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 0, b"", b"")
             return subprocess.CompletedProcess(argv, 0, f"progress\n{line}\n".encode(), b"")
         with mock.patch.object(gd, "runner_account_candidates", return_value=[pool]), \
+                mock.patch.object(gd, "runner_account_root_copy", return_value=None), \
                 contextlib.redirect_stdout(io.StringIO()) as out:
             rows = gd.delegate_runner_accounts(["--dead", "--apply"], run=run)
         self.assertEqual(rows[0]["state"], "ran")
@@ -17516,6 +17518,26 @@ class RunnerAccountsTest(unittest.TestCase):
         state = json.loads(gd.RUNNER_ACCOUNTS_STATE.read_text())
         self.assertEqual(state[pool.pw_dir]["bytes"], 150 * gd.GIB)
 
+    def test_a_root_owned_copy_runs_as_exactly_the_sudoers_command_with_no_install(self) -> None:
+        # /etc/sudoers.d/glaeda-runner-account-disk names only this argv (glaeda-runner-account-disk-root)
+        pool = self.entry("cmuxci-gui-01", 5101)
+        line = gd.RUNNER_ACCOUNT_LINE + json.dumps({"state": "ran", "reclaimed_bytes": 3 * gd.GIB})
+        run = mock.Mock(return_value=subprocess.CompletedProcess([], 0, f"{line}\n".encode(), b""))
+        copy = Path("/usr/local/libexec/glaeda/glaeda-disk")
+        row = gd.run_runner_account(pool, ["--pressure", "--apply"], run=run, root_copy=copy)
+        self.assertEqual(row["state"], "ran")
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0], [gd.SUDO, "-n", "-u", "cmuxci-gui-01", "-H", "/usr/bin/python3",
+                                                 "-I", os.fspath(copy), "--runner-account", "--pressure", "--apply"])
+
+    def test_only_a_root_owned_unwritable_copy_counts(self) -> None:
+        mine = self.root / "glaeda-disk"
+        mine.write_text("")
+        self.assertIsNone(gd.runner_account_root_copy(mine), "this account owns it: not the root step's copy")
+        self.assertIsNone(gd.runner_account_root_copy(self.root / "absent"))
+        if os.path.exists("/usr/bin/true"):  # a root-owned, 755 file on any Mac or Linux host
+            self.assertEqual(gd.runner_account_root_copy(Path("/usr/bin/true")), Path("/usr/bin/true"))
+
     def test_a_pass_past_its_bound_is_a_timeout_row(self) -> None:
         pool = self.entry("cmux-pr-runner", 502)
 
@@ -17523,7 +17545,8 @@ class RunnerAccountsTest(unittest.TestCase):
             if argv[5] == "/bin/sh":
                 return subprocess.CompletedProcess(argv, 0, b"", b"")
             raise subprocess.TimeoutExpired(argv, kw["timeout"])
-        row = gd.run_runner_account(pool, ["--apply"], run=run)
+        with mock.patch.object(gd, "runner_account_root_copy", return_value=None):
+            row = gd.run_runner_account(pool, ["--apply"], run=run)
         self.assertEqual(row["state"], "timeout")
 
     def test_a_home_without_enrolled_runners_deletes_nothing(self) -> None:

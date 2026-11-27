@@ -19494,6 +19494,14 @@ USERS_ROOT = Path("/Users")
 RUNNER_HYGIENE_DAEMONS = Path("/Library/LaunchDaemons")
 RUNNER_HYGIENE_LABEL = "com.teamleaderleo.glaeda.runner-hygiene"
 SUDO = "/usr/bin/sudo"
+# The root-owned copy glaeda-runner-account-disk-root installs beside its sudoers rule (/etc/sudoers.d/
+# glaeda-runner-account-disk), which lets the fleet user run exactly
+# `/usr/bin/python3 -I RUNNER_ACCOUNT_ROOT_COPY --runner-account ...` as each runner account, with no password and no
+# shell. A fleet mini's sudo asks for a password, so without it every pass read "not reached" and the gui pool
+# accounts' homes (cmuxci-gui-01, 30-55 GiB per mini) were never cleaned (2026-11-27). Present and root-owned, the
+# pass runs it instead of copying this script in through /bin/sh (which would need a shell rule as that account).
+RUNNER_ACCOUNT_ROOT_COPY = Path("/usr/local/libexec/glaeda/glaeda-disk")
+RUNNER_ACCOUNT_ROOT_PYTHON = "/usr/bin/python3"
 RUNNER_ACCOUNT_ADMIN_GROUPS = ("admin", "wheel", "sudo")
 RUNNER_ACCOUNT_MODE = False  # set in the pass run inside another account: it never delegates again
 _RUNNER_ACCOUNTS_ENABLED = True  # the test suite turns it off, so no test ever reaches sudo
@@ -19574,12 +19582,28 @@ def _runner_account_python() -> str:
     return "/usr/bin/python3" if exe == own or exe.startswith(own.rstrip("/") + "/") else exe
 
 
-def run_runner_account(entry: Any, args: list[str], run: Callable[..., Any] = subprocess.run) -> dict[str, Any]:
-    """One pass in ENTRY's account (RUNNER_ACCOUNTS): copy this script into its home as it, run it there as it with
-    ARGS, and return its summary row. Never raises."""
+def runner_account_root_copy(path: Path | None = None) -> Path | None:
+    """RUNNER_ACCOUNT_ROOT_COPY when it is a regular file root owns that no group or other may write, else None."""
+    path = RUNNER_ACCOUNT_ROOT_COPY if path is None else path
+    try:
+        st = path.lstat()
+    except OSError:
+        return None
+    return path if stat.S_ISREG(st.st_mode) and st.st_uid == 0 and not st.st_mode & 0o022 else None
+
+
+def run_runner_account(entry: Any, args: list[str], run: Callable[..., Any] = subprocess.run,
+                       root_copy: Path | None = None) -> dict[str, Any]:
+    """One pass in ENTRY's account (RUNNER_ACCOUNTS): run the root-owned copy as it when one is installed
+    (runner_account_root_copy; ROOT_COPY in tests), else copy this script into its home as it and run that, with
+    ARGS; return its summary row. Never raises."""
     row: dict[str, Any] = {"account": entry.pw_name, "home": entry.pw_dir}
     dest = Path(entry.pw_dir) / RUNNER_ACCOUNT_COPY_DIR
     sudo = [SUDO, "-n", "-u", entry.pw_name, "-H"]
+    root_copy = runner_account_root_copy() if root_copy is None else root_copy
+    if root_copy is not None:  # exactly the command the sudoers rule names: no env, no shell
+        return _runner_account_pass(row, [*sudo, RUNNER_ACCOUNT_ROOT_PYTHON, "-I", os.fspath(root_copy),
+                                          *runner_account_argv(args)], run)
     try:
         source = Path(os.path.abspath(__file__)).read_bytes()
         put = run([*sudo, "/bin/sh", "-c", _RUNNER_ACCOUNT_INSTALL, "sh", os.fspath(dest)], input=source,
@@ -19593,6 +19617,11 @@ def run_runner_account(entry: Any, args: list[str], run: Callable[..., Any] = su
     argv = [*sudo, "/usr/bin/env", f"{CALLER_ENV}=runner-account pass from {pwd.getpwuid(os.getuid()).pw_name}",
             "CMUX_NAME_AS=cmux-disk",
             _runner_account_python(), "-I", os.fspath(dest / "glaeda-disk"), *runner_account_argv(args)]
+    return _runner_account_pass(row, argv, run)
+
+
+def _runner_account_pass(row: dict[str, Any], argv: list[str], run: Callable[..., Any]) -> dict[str, Any]:
+    """Run one runner-account pass ARGV and fold its summary line into ROW. Never raises."""
     try:
         done = run(argv, capture_output=True, timeout=RUNNER_ACCOUNT_TIMEOUT_S, check=False)
     except subprocess.TimeoutExpired:
