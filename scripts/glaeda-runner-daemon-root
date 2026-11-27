@@ -35,7 +35,10 @@ if [ "$#" -lt 2 ]; then
     echo "usage: glaeda-runner-daemon-root USER K [K ...] (as root; the instance numbers the apply's ROOT STEP named)" >&2
     exit 2
 fi
-exec </dev/null 3<<'PY' /usr/bin/python3 -I /dev/fd/3 "$@"
+# The program is python3's stdin (`-`), not a heredoc on fd 3 read as /dev/fd/3: under macOS /bin/bash 3.2, the
+# shell fleet-sudo runs a root step in, python3 read /dev/fd/3 as empty and exited 0 having done nothing (cmux23,
+# 2026-11-27: no drop-in was ever written). python3 reads the whole program before it runs, so a child sees EOF.
+exec /usr/bin/python3 -I - "$@" <<'PY'
 import os
 import plistlib
 import pwd

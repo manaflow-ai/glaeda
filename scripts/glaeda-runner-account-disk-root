@@ -14,8 +14,8 @@
 #   - copies OWNER's installed glaeda-disk (~OWNER/.local/bin/glaeda-disk: a regular file OWNER owns, no symlink, at
 #     most 8 MiB, that python3 compiles) to /usr/local/libexec/glaeda/glaeda-disk, root:wheel 755, so no account but
 #     root can change what the rule runs;
-#   - finds the runner accounts glaeda-disk would delegate to: a non-admin login account (uid >= 500, home directly in
-#     /Users, not OWNER) whose home holds an actions-runner*/.runner;
+#   - finds the accounts glaeda-disk delegates to (its runner_account_candidates): a non-admin login account (uid >=
+#     500, a real home directly in /Users, not Shared or Guest, not OWNER) with no glaeda-runner-hygiene daemon;
 #   - writes /etc/sudoers.d/glaeda-runner-account-disk (checked with visudo -c first) letting OWNER run, as exactly
 #     those accounts and with no password, only
 #       /usr/bin/python3 -I /usr/local/libexec/glaeda/glaeda-disk --runner-account *
@@ -33,8 +33,10 @@ if [ "$#" -ne 1 ]; then
     echo "usage: glaeda-runner-account-disk-root OWNER (as root; OWNER is the fleet user that runs glaeda-disk)" >&2
     exit 2
 fi
-exec </dev/null 3<<'PY' /usr/bin/python3 -I /dev/fd/3 "$@"
-import glob
+# The program is python3's stdin (`-`), not a heredoc on fd 3 read as /dev/fd/3: under macOS /bin/bash 3.2, the
+# shell fleet-sudo runs a root step in, python3 read /dev/fd/3 as empty and exited 0 having done nothing (cmux23,
+# 2026-11-27: no drop-in was ever written). python3 reads the whole program before it runs, so a child sees EOF.
+exec /usr/bin/python3 -I - "$@" <<'PY'
 import grp
 import hashlib
 import os
@@ -51,6 +53,8 @@ PYTHON = "/usr/bin/python3"
 SOURCE_MAX = 8 * 1024 * 1024
 USER_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
 ADMIN_GROUPS = ("admin", "wheel", "sudo")
+HYGIENE_DAEMONS = "/Library/LaunchDaemons"  # glaeda-disk RUNNER_HYGIENE_DAEMONS, RUNNER_HYGIENE_LABEL
+HYGIENE_LABEL = "com.teamleaderleo.glaeda.runner-hygiene"
 
 
 def say(text):
@@ -110,10 +114,15 @@ def runner_accounts(owner):
     out = []
     for entry in pwd.getpwall():
         home = entry.pw_dir.rstrip("/")
+        # glaeda-disk's runner_account_candidates, the accounts its pass delegates to: a login account (uid >= 500)
+        # with a real home directly in /Users (not Shared or Guest), not OWNER, not an admin, and with no
+        # glaeda-runner-hygiene daemon of its own. The gui pool accounts hold no actions-runner directory of their
+        # own (2026-11-27: cmuxci-gui-01's home had none), so a runner directory is not asked for.
         if (entry.pw_uid < 500 or entry.pw_name == owner or os.path.dirname(home) != "/Users"
-                or not USER_RE.fullmatch(entry.pw_name) or is_admin(entry)):
+                or os.path.basename(home) in ("Shared", "Guest") or not USER_RE.fullmatch(entry.pw_name)
+                or is_admin(entry) or os.path.exists(f"{HYGIENE_DAEMONS}/{HYGIENE_LABEL}.{entry.pw_uid}.plist")):
             continue
-        if any(os.path.isfile(p) for p in glob.glob(os.path.join(glob.escape(home), "actions-runner*", ".runner"))):
+        if not os.path.islink(home) and os.path.isdir(home):
             out.append(entry.pw_name)
     return sorted(set(out))
 
