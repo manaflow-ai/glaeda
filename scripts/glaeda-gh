@@ -17205,7 +17205,11 @@ LAND_UNREAD_QUOTA = re.compile(r"gh-quota: refused: GitHub(?:'s)? (?:REST |Graph
 # was refused that way and stopped merge_draft instead of parking.
 LAND_STEP_QUOTA = re.compile(LAND_QUOTA_REFUSAL.pattern + r"|GitHub(?:'s)? (?:REST |GraphQL )?rate limit"
                              r"|rate limit is spent|secondary rate limit|content-creation cooldown"
-                             r"|content writes are paced|\bAPI rate limit (?:already )?exceeded\b", re.I)
+                             r"|content writes are paced|\bAPI rate limit (?:already )?exceeded\b"
+                             # the shim's low-water guard: "gh-quota: refused: the shared GraphQL quota is under its
+                             # low-water floor (floor 500 of 50..; next: retry after 11:42Z ...". hq#33030, #31068 and
+                             # cmux#59603 stopped merge_draft on it instead of parking until the reset.
+                             r"|\bshared (?:REST |GraphQL )?quota is under its\b", re.I)
 # The gh-quota pacer's own refusal of a content write ("gh-quota: refused: content writes are paced until reset (60s;
 # next: ...)" or "content writes are paced for 33s more (the login's ..."). It names SECONDS, not a clock time, and
 # paces this login's writes only (reads still answer), so it parks its own row for those seconds (park_quota) and
