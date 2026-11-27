@@ -3271,6 +3271,16 @@ SIM_DEVICE_MIN_BYTES = 512 * 1024 ** 2  # dataPathSize under this: a fresh or er
 SIM_DEVICE_BUDGET_S = 300.0  # one pass erases for at most this long; the next pass continues
 
 
+def _device_plist_age_hours(home: str, now: float) -> float | None:
+    """Hours since CoreSimulator last rewrote HOME/device.plist, which it does on every state change (boot, shutdown,
+    erase). simctl on Xcode 26.6 and 27.2 (macOS 27) lists no lastBootedAt for any device: cmux21 2026-11-27, 0 of 32
+    devices, 16 GB held by 6 shutdown ones, so every device read "no last-boot time" and none was ever erased."""
+    try:
+        return (now - os.stat(os.path.join(home, "device.plist")).st_mtime) / 3600
+    except OSError:
+        return None
+
+
 def sim_device_items(devices: object, cmds: str, opened: frozenset[str], now: float | None = None,
                      leases: str | None = None) -> list[Item]:
     """Judge simulator devices (`simctl list devices -j`) for erasing. Reclaimable only when shutdown, available,
@@ -3291,6 +3301,10 @@ def sim_device_items(devices: object, cmds: str, opened: frozenset[str], now: fl
             sized = isinstance(size, int) and not isinstance(size, bool)
             size = size if sized else 0
             idle = _iso_age_hours(d.get("lastBootedAt"), now)
+            data = d.get("dataPath")
+            home = os.path.dirname(data) if isinstance(data, str) and data.endswith("/data") else None
+            if idle is None and home is not None:
+                idle = _device_plist_age_hours(home, now)  # simctl lists no lastBootedAt: its last state change
             reasons = [f"{d.get('name', '?')} ({str(runtime).rsplit('.', 1)[-1]}) {d.get('state', '?')}"]
             keep = []
             if d.get("state") != "Shutdown":
@@ -3303,8 +3317,6 @@ def sim_device_items(devices: object, cmds: str, opened: frozenset[str], now: fl
                 keep.append("its data is already small")
             if idle is None:
                 keep.append("no last-boot time")
-            data = d.get("dataPath")
-            home = os.path.dirname(data) if isinstance(data, str) and data.endswith("/data") else None
             if home is None:
                 keep.append("no data path")
             elif in_cwd(home, opened):

@@ -9419,6 +9419,28 @@ class SimDeviceTest(unittest.TestCase):
         self.assertEqual(v["iPhone 17"], ("kept", ["no last-boot time"]))
         self.assertEqual(v["pushopen-kit"], ("kept", ["simctl lists it unavailable"]))
 
+    @twelve_hour_ages
+    def test_no_last_boot_time_falls_back_to_the_device_plist(self) -> None:
+        """cmux21 2026-11-27 (Xcode 26.6, macOS 27): simctl listed no lastBootedAt for any of 32 devices, so 16 GB of
+        shutdown devices were never erased. The device.plist's mtime (rewritten on every boot, shutdown and erase)
+        stands in; no plist still keeps it."""
+        home = "/Users/cmux/Library/Developer/CoreSimulator/Devices/7C4FBE1E-CEF0-4C7D-B4AC-A7A06F3E58F5"
+        ages = {home: 30.0}
+        with mock.patch.object(gd, "_device_plist_age_hours", side_effect=lambda h, now: ages.get(h)) as age:
+            self.assertEqual(self.verdicts()["iPhone 17"], ("reclaimable", []))
+            ages[home] = 0.5
+            self.assertEqual(self.verdicts()["iPhone 17"], ("recent", []))
+            ages.clear()
+            self.assertEqual(self.verdicts()["iPhone 17"], ("kept", ["no last-boot time"]))
+        self.assertNotIn("/Users/cmux/Library/Developer/CoreSimulator/Devices/11592F6E-1A41-4215-BF7D-8BE182D2922E",
+                         [c.args[0] for c in age.call_args_list], "a listed lastBootedAt wins")
+        plist = Path(self.tmp.name) / "dev" / "device.plist"
+        plist.parent.mkdir()
+        plist.write_text("x")
+        os.utime(plist, (SIM_NOW - 7200, SIM_NOW - 7200))
+        self.assertAlmostEqual(gd._device_plist_age_hours(str(plist.parent), SIM_NOW), 2.0)
+        self.assertIsNone(gd._device_plist_age_hours(str(plist.parent / "gone"), SIM_NOW))
+
     def test_a_job_or_lease_that_names_a_device_keeps_it(self) -> None:
         udid = "11592F6E-1A41-4215-BF7D-8BE182D2922E"
         home = f"/Users/cmux/Library/Developer/CoreSimulator/Devices/{udid}"
