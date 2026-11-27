@@ -10420,6 +10420,27 @@ class TickBudgetTest(Base):
         self.assertLessEqual(pr_until - start, gg.WAITED_TICK_SHARE + 1, "waited reads leave the heads their minimum")
         self.assertGreaterEqual(head_until - time.monotonic(), gg.HEADS_MIN_SHARE - 5, "the heads have their minimum share")
 
+    def test_waited_prs_a_probe_confirms_are_read_before_the_ones_that_need_a_full_read(self) -> None:
+        """The land host, 2026-11-27: waited PRs needing full reads (1.5-4 s each) went in deferral order ahead of the
+        probe-eligible ones (~0.5 s), so a window stored ~30 of ~330. The cheap ones lead, order kept within a group."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800}}
+        for n in range(1, 5):
+            gg.register(f"pr:o/r#{n}", waited=True)
+        self.daemon.paths = {**self.daemon.paths, "pr": "graphql"}
+        cheap = {"pr:o/r#3", "pr:o/r#4"}
+        seen: list[list[str]] = []
+
+        def batched(kind, entries, fetch, until=None, pr_timeout_rest=None):
+            if entries:
+                seen.append([e["key"] for e in entries])
+            return []
+        with mock.patch.object(self.daemon, "probe_ok", side_effect=lambda e: e["key"] in cheap), \
+                mock.patch.object(self.daemon, "batched", side_effect=batched):
+            self.daemon.tick(NOW)
+        order = next(keys for keys in seen if keys and keys[0].startswith("pr:"))
+        self.assertEqual(set(order[:2]), cheap, order)
+
     def test_an_asked_head_with_no_answer_is_read_past_a_spent_share_while_graphql_is_stopped(self) -> None:
         """huge-blue 2026-11-20 14:2xZ: the daemon's REST share spent (137 of 150), GraphQL at 0, the login 2129 REST
         left, and `checks --consumer merge-hold` said "unread (not read yet)" until the hour turned. A head with no

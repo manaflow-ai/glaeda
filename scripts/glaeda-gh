@@ -10424,6 +10424,11 @@ class Daemon:
         urgent = lambda e: self.waited(e) or self.head_unanswered(e)  # noqa: E731
         blocked = {kind: [e for e in due[kind] if urgent(e)] for kind in kinds}
         blocked["head"].sort(key=self.head_rank)  # the newest ask of a head never tried first (rest_order)
+        # The waited PRs a probe confirms (probe_ok: ~0.5 s each) go ahead of the ones that need a full read (1.5-4 s
+        # each, or a heavy partial read every cycle). The land host, 2026-11-27: ~330 waited PRs, ~22-50 stored a window
+        # at ~3 s each, staleWaited.pr 4,889 s, 142 probe-eligible ones unreached behind the full reads. The sort is
+        # stable, so the oldest deferral still leads within each group, and starved_lead still goes first below.
+        blocked["pr"].sort(key=lambda e: not self.probe_ok(e))
         # Only repos with a due waited PR get this fallback. A timeout switches their remaining PRs for
         # this tick; the next tick tries GraphQL again, even after a daemon restart.
         pr_timeout_rest = {caller_of(e["key"])[1].lower(): False for e in blocked["pr"]}
