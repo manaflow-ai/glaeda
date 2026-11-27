@@ -410,10 +410,11 @@ def scope_runner_labels(scope: str) -> dict[str, str] | None:
         cached = _LISTED.get(scope)
         if cached and time.monotonic() - cached[1] < LABELS_REUSE_S:
             return cached[0]
-        code, out, _ = run(["gh", "api", "--paginate", f"{scope}/actions/runners?per_page=100",
+        code, out, err = run(["gh", "api", "--paginate", f"{scope}/actions/runners?per_page=100",
                             "--jq", ".runners[] | [.name, [.labels[]?.name]] | tojson"], 60)
         if code != 0:
             _LISTED.pop(scope, None)
+            _LIST_ERRORS[scope] = list_error(code, err)
             return None
         listed: dict[str, str] = {}
         try:
@@ -426,22 +427,51 @@ def scope_runner_labels(scope: str) -> dict[str, str] | None:
                     listed[name] = ",".join(label for label in found if "," not in label)
         except (ValueError, TypeError):
             _LISTED.pop(scope, None)
+            _LIST_ERRORS[scope] = "gh answered a runner list it could not parse"
             return None
         _LISTED[scope] = (listed, time.monotonic())
+        _LIST_ERRORS.pop(scope, None)
         return listed
+
+
+def list_error(code: int, err: str) -> str:
+    """Why a runner list failed, in one short line with no secret: GitHub's own words (a rate limit, a 403) when gh
+    printed them."""
+    last = next((line.strip() for line in reversed((err or "").splitlines()) if line.strip()), "")
+    last = re.sub(r"(gh[opsu]_|github_pat_)[A-Za-z0-9_]+", "[token]", last)
+    if re.search(r"rate limit|secondary rate|API rate", last, re.I):
+        return "GitHub rate limit: " + last[:140]
+    return f"gh exit {code}" + (f": {last[:140]}" if last else "")
+
+
+# LABELS_UNREAD_SKIPS (glaeda-cmux-runner): why the last list of each scope failed. 2026-11-27 13:37Z: a one-shot
+# --apply's list of repos/manaflow-ai/cmuxterm-hq/actions/runners failed for every dedicated runner of cmux24 (each
+# receipt: githubLabels null). The scope is not one the runner App covers (APP_SCOPES), so the read went out on the
+# operator's gh login, and a failure there was indistinguishable from "GitHub lists no such runner": the mini got no
+# --github-labels and re-registered blind, draining six busy runners for a no-op relabel. A failed read now reaches
+# the mini as --github-labels-unread WHY, and it skips the relabel.
+_LIST_ERRORS: dict[str, str] = {}
 
 
 def github_labels(scope: str, name: str) -> str | None:
     """The labels GitHub lists for runner `name` now, comma-separated, read with this operator's gh; None when the
-    read fails or GitHub lists no such runner (the mini then decides as before). The minis hold no gh login, so
+    read fails or GitHub lists no such runner (labels_arg tells the two apart). The minis hold no gh login, so
     without this each apply re-registered every idle runner whatever its labels were."""
     listed = scope_runner_labels(scope)
     return listed.get(name) if listed is not None else None
-    for found in runners if isinstance(runners, list) else []:
-        if isinstance(found, dict) and found.get("name") == name:
-            labels = sorted(str(label.get("name")) for label in found.get("labels") or [] if isinstance(label, dict))
-            return ",".join(label for label in labels if label and "," not in label)
-    return None
+
+
+def labels_arg(scope: str, name: str) -> str:
+    """The installer's flag for what GitHub holds for runner `name`: --github-labels=LABELS when the list was read and
+    names it, --github-labels-unread=WHY when the read failed (the installer then skips the relabel,
+    LABELS_UNREAD_SKIPS), and nothing when GitHub lists no such runner (the installer decides as before). Each ends in
+    a space."""
+    listed = scope_runner_labels(scope)
+    if listed is None:
+        why = _LIST_ERRORS.get(scope) or "the runner list could not be read"
+        return f"--github-labels-unread={_quote(f'{scope}: {why}')} "
+    labels = listed.get(name)
+    return f"--github-labels={_quote(labels)} " if labels is not None else ""  # = : a label may start with -
 
 
 def group_refusal(org: str, group: str, repo: str | None) -> str | None:
@@ -1036,9 +1066,8 @@ def apply_instance(member: str, instance: int, repo: str | None, extra: list[str
                     "state": f"registered to {scope}, not {migrate_from} or {org}; nothing changed"}
     scope = f"--org {_quote(org)}" + (f" --group {_quote(group)}" if group else "") if org else f"--repo {_quote(repo)}"
     version, sha, _ = latest_release()
-    labels = None if deregistered else github_labels(scope_api(repo, org),
-                                                     f"{member}-glaeda" + (f"-{instance}" if instance else ""))
-    observed = f"--github-labels={_quote(labels)} " if labels is not None else ""  # = : a label may start with -
+    observed = "" if deregistered else labels_arg(scope_api(repo, org),
+                                                  f"{member}-glaeda" + (f"-{instance}" if instance else ""))
     remote = (f"~/{REMOTE_DIR}/scripts/glaeda-cmux-runner --apply --token-stdin {scope} "
               f"--manifest ~/{REMOTE_DIR}/mini-fleet.json --member {_quote(member)} --instance {instance} "
               f"--latest-runner-version {_quote(version)} --latest-runner-sha256 {_quote(sha)} "
@@ -1082,8 +1111,7 @@ def apply_dedicated(member: str, entry: dict[str, Any], extra: list[str]) -> dic
              if entry["org"] else f"--repo {_quote(entry['repo'])}")
     version, sha, _ = latest_release()
     # GitHub's labels for it, so a mini without gh sees a match and never re-registers it (#1645)
-    labels = github_labels(scope_api(entry["repo"], entry["org"]), f"{member}-glaeda-{entry['name']}")
-    observed = f"--github-labels={_quote(labels)} " if labels is not None else ""
+    observed = labels_arg(scope_api(entry["repo"], entry["org"]), f"{member}-glaeda-{entry['name']}")
     remote = (f"~/{REMOTE_DIR}/scripts/glaeda-cmux-runner --apply --token-stdin {scope} "
               f"--manifest ~/{REMOTE_DIR}/mini-fleet.json --member {_quote(member)} --dedicated {_quote(entry['name'])} "
               f"--latest-runner-version {_quote(version)} --latest-runner-sha256 {_quote(sha)} {observed}--output json "

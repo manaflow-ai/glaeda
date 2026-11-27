@@ -403,6 +403,7 @@ class Context:
         self.log_path = self.logs / f"glaeda-cmux-runner{self.suffix}.log"
         self.token_stdin = args.token_stdin
         self.github_labels = getattr(args, "github_labels", None)
+        self.github_labels_unread = getattr(args, "github_labels_unread", None)  # why the fleet's read failed
         self.stdin_token: str | None = None  # set by main() from stdin; used once, never stored
 
     def take_token(self, endpoint: str) -> str | None:
@@ -1414,14 +1415,19 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
                 reg.update(state="unchanged")
         elif github_listed and github_found is None:
             reg.update(state="blocked", note=f"GitHub does not list runner {ctx.name}; refusing to replace an unknown registration")
-        elif ctx.apply and ctx.token_stdin:
-            # An operator supplied a fresh registration token for apply.  If the read-only
-            # lookup is unavailable, let the same-name --replace repair proceed, but never
-            # claim the receipt proves the current server-side labels.
-            reg.update(state="relabel", previousLabels=had or [],
-                       note="GitHub labels could not be read; re-registering with the supplied token")
-            if runner_busy(ctx):
-                reg.update(state="blocked", busy=True, note="the runner is running a job; re-run when it is idle")
+        elif ctx.token_stdin:
+            # LABELS_UNREAD_SKIPS: GitHub's labels could not be read here and the fleet passed none (its own read
+            # failed: glaeda-cmux-runner-fleet --github-labels-unread names why). This used to re-register in place
+            # with the supplied token, a relabel planned on no reading: on 2026-11-27 a fleet apply's runner list
+            # failed for one repository, the plan re-registered three idle dedicated runners of cmux24 and drained six
+            # busy ones for a relabel to the labels GitHub already held (labels == previousLabels in every receipt),
+            # and the drains held those runners off for up to an hour beside their own queue. With no reading there is
+            # nothing to compare, so the relabel is skipped and nothing drains: the next apply that reads the labels
+            # relabels if they differ. An operator without gh can pass --github-labels themselves.
+            why = getattr(ctx, "github_labels_unread", None)
+            reg.update(state="unchanged", labelsUnread=True,
+                       note="GitHub's labels could not be read" + (f" ({why})" if isinstance(why, str) and why else "")
+                            + "; skipped the relabel: the next apply that reads them relabels if they differ")
         else:
             reg.update(state="blocked", note="could not read GitHub labels; receipt labels are not authoritative; "
                        "re-run with GitHub access or --apply --token-stdin")
@@ -3253,6 +3259,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--github-labels", metavar="LABELS",
                    help="the labels GitHub lists for this runner now (comma-separated), as glaeda-cmux-runner-fleet "
                         "read them with its admin gh; used when this machine's gh cannot read them itself")
+    p.add_argument("--github-labels-unread", metavar="WHY",
+                   help="glaeda-cmux-runner-fleet could not read this runner's GitHub labels (WHY); the relabel is "
+                        "skipped (LABELS_UNREAD_SKIPS)")
     p.add_argument("--token-stdin", action="store_true",
                    help="with --apply, read the registration (or, with --uninstall, removal) token from stdin; "
                         "without --apply, plan that path")

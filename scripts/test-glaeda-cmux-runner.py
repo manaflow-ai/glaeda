@@ -19439,17 +19439,40 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(self.by_kind(same)["register"]["state"], "unchanged", self.by_kind(same)["register"])
         self.assertEqual(len(self.config_argvs()), 1, "no re-registration")
 
-    def test_manifest_apply_with_token_relabels_when_github_lookup_is_unavailable(self) -> None:
+    def test_an_unreadable_label_set_skips_the_relabel_and_drains_nothing(self) -> None:
+        # LABELS_UNREAD_SKIPS, 2026-11-27 13:37Z cmux24: a fleet apply's runner list failed, so no --github-labels
+        # came, and every dedicated runner was re-registered blind with the supplied token: three idle ones in place,
+        # six busy ones drained for "a relabel" to the labels GitHub already held (labels == previousLabels in each
+        # receipt). The drains held them off beside their own queue for up to an hour. No reading: skip the relabel.
         with mock.patch.object(cr, "xcode_present", return_value=True):
-            self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std")
+            first = self.invoke("--apply", "--manifest", self.manifest(), "--member", "mini-std")
             (self.state / "fail-list").touch()
+            configs = len(self.config_argvs())
             receipt = self.invoke("--apply", "--token-stdin", "--manifest", self.manifest(),
-                                 "--member", "mini-std", stdin=REG_TOKEN, expect=1)
-        register = self.by_kind(receipt)["register"]
-        self.assertEqual(register["state"], "updated", register)
-        self.assertIn("--replace", self.config_argvs()[-1])
-        self.assertEqual(self.by_kind(receipt)["verify"]["state"], "failed")
-        self.assertFalse(receipt["ready"])
+                                  "--member", "mini-std", stdin=REG_TOKEN, expect=1)  # verify reads the broken list
+            register = self.by_kind(receipt)["register"]
+            self.assertEqual(register["state"], "unchanged", register)
+            self.assertTrue(register.get("labelsUnread"), register)
+            self.assertIn("skipped the relabel", register["note"])
+            self.assertEqual(len(self.config_argvs()), configs, "no re-registration")
+            self.assertFalse((Path(first["runnerDir"]) / cr.RUNNER_DRAIN_FILE).exists())
+            # the fleet's own read failed: it says why, and a busy runner is not drained either
+            worker = f"{first['runnerDir']}/bin.2.338.0/Runner.Worker spawnclient 148 151"
+            real_run = subprocess.run
+            def ps(argv, *args, **kwargs):
+                if list(argv[:2]) == ["/bin/ps", "-axww"]:
+                    return subprocess.CompletedProcess(argv, 0, f"/sbin/launchd\n{worker}\n", "")
+                return real_run(argv, *args, **kwargs)
+            with mock.patch.object(cr.subprocess, "run", side_effect=ps):
+                busy = self.invoke("--apply", "--token-stdin", "--manifest", self.manifest(), "--member", "mini-std",
+                                   "--github-labels-unread=repos/o/r/actions/runners: GitHub rate limit: HTTP 403",
+                                   stdin=REG_TOKEN, expect=1)
+        register = self.by_kind(busy)["register"]
+        self.assertEqual(register["state"], "unchanged", register)
+        self.assertIn("GitHub rate limit", register["note"])
+        self.assertFalse(register.get("draining"), register)
+        self.assertFalse((Path(first["runnerDir"]) / cr.RUNNER_DRAIN_FILE).exists(), "nothing drains on no reading")
+        self.assertEqual(len(self.config_argvs()), configs)
 
     def test_apply_never_re_registers_a_self_updated_runner_with_a_job(self) -> None:
         # 2026-10-27 02:09:59Z: a runner that updated itself runs bin.2.338.0/Runner.Worker; a pgrep for
@@ -19463,9 +19486,9 @@ class RunnerTest(unittest.TestCase):
                 if list(argv[:2]) == ["/bin/ps", "-axww"]:
                     return subprocess.CompletedProcess(argv, 0, f"/sbin/launchd\n{worker}\n", "")
                 return real_run(argv, *args, **kwargs)
-            with mock.patch.object(cr.subprocess, "run", side_effect=ps):
-                receipt = self.invoke("--apply", "--token-stdin", "--manifest", self.manifest(),
-                                      "--member", "mini-std", stdin=REG_TOKEN, expect=1)
+            with mock.patch.object(cr.subprocess, "run", side_effect=ps):  # GitHub holds an older set: a relabel
+                receipt = self.invoke("--apply", "--token-stdin", "--manifest", self.manifest(), "--member", "mini-std",
+                                      "--github-labels=self-hosted,glaeda-mini", stdin=REG_TOKEN, expect=1)
         register = self.by_kind(receipt)["register"]
         self.assertEqual(register["state"], "blocked", register)
         self.assertIn("running a job", register["note"])
@@ -19480,8 +19503,8 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(hook.runner_drain(Path(first["runnerDir"]), time.time()), f"draining for {drain['reason']}")
         self.assertEqual((cr.RUNNER_DRAIN_FILE, cr.DRAIN_TTL_S), (hook.RUNNER_DRAIN_FILE, hook.DRAIN_TTL_S))
         with mock.patch.object(cr, "xcode_present", return_value=True):
-            idle = self.invoke("--apply", "--token-stdin", "--manifest", self.manifest(),
-                               "--member", "mini-std", stdin=REG_TOKEN, expect=1)
+            idle = self.invoke("--apply", "--token-stdin", "--manifest", self.manifest(), "--member", "mini-std",
+                               "--github-labels=self-hosted,glaeda-mini", stdin=REG_TOKEN, expect=1)
         self.assertEqual(self.by_kind(idle)["register"]["state"], "updated", self.by_kind(idle)["register"])
         self.assertTrue(self.by_kind(idle)["register"].get("drainEnded"))
         self.assertFalse(marker.exists(), "re-registered idle: the runner takes jobs again")
