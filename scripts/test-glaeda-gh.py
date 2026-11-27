@@ -37509,6 +37509,39 @@ class LandTest(Base):
         on_disk = gg.read_json(gg.LandQueue.entries_dir() / gg.file_name(self.KEY))
         self.assertEqual(on_disk["forwardQuietTold"]["to"], e["forwardQuietTold"]["to"])  # kept across restarts
 
+    def test_a_forward_the_far_queue_holds_open_tells_no_verdict_only_once_the_hold_lapses(self):
+        # LAND_FORWARD_QUIET_HELD: gcp-agent-lane-19, 30 h to 2026-11-27 20:15Z: 42 no-verdict fyis, each about a row
+        # cmux-cp-1 answered it held open (land_tier_pending); each woke its idle requester to re-queue what the far
+        # queue then merged and told itself. Before: told at LAND_FORWARD_QUIET. After: no word while it is held.
+        e = self.handed_off()
+        at = float(e["handedOff"]["at"])
+        self.w.outcomes = {"o/r#1": {"state": "waiting", "updated": self.t, "stop": None}}  # the far queue holds it
+        while self.t - at < gg.LAND_FORWARD_QUIET + gg.LAND_FORWARD_READ_WAIT + 600:
+            self.pr(LA)  # every read shows it still open at the handed head
+            e = self.tick(120)
+        self.assertEqual(e["forwardHeld"]["state"], "waiting")
+        self.assertEqual(self.quiet_notices(), [], "held open there: its queue tells the outcome")
+        self.assertTrue(any(h.get("event") == "forward_quiet_held" for h in e["history"]), e["history"][-4:])
+        self.assertNotIn("forwardQuietTold", e)
+        # the far host stops answering: once its last hold is past the ask bound the requester is told, once
+        self.w.outcomes = {}
+        for _ in range(20):
+            self.pr(LA)
+            self.tick(120)
+        self.assertEqual(len(self.quiet_notices()), 1, self.q.entries[self.KEY]["history"][-4:])
+
+    def test_a_held_forward_whose_head_someone_else_moved_still_tells_with_the_live_sha(self):
+        # the land pinned at the old head cannot merge, held or not: the requester re-pins (LAND_FORWARD_QUIET_HELD)
+        self.fresh_head = LB
+        self.w.api[f"repos/o/r/commits/{LB}"] = json.dumps({"p": [LA], "a": "someone", "c": "someone"})
+        e = self.handed_off()
+        at = float(e["handedOff"]["at"])
+        self.w.outcomes = {"o/r#1": {"state": "waiting", "updated": self.t, "stop": None}}
+        while self.t - at < gg.LAND_FORWARD_QUIET + gg.LAND_FORWARD_READ_WAIT + 600 and not self.quiet_notices():
+            self.tick(120)
+        [sent] = self.quiet_notices()
+        self.assertIn(f"glaeda-gh land o/r#1 --sha {LB}", sent[-1])
+
     def test_a_forward_stop_told_as_fyi_is_superseded_by_its_merge_and_told_once_per_take_back(self):
         # LAND_NOTICE_SUPERSEDE: huge-blue, cmux#45156, 2026-11-27: ~20 forward_no_outcome fyis (one per re-arm of a
         # bound take-back) sat in the requester's inbox after cmux-cp-1 merged it, and were relayed 8 h later as a stall

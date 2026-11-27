@@ -18119,6 +18119,15 @@ LAND_LATE_WHY_EVERY = 60.0
 # it ended. Now a row is told only on a read that shows its PR still open, once per PR ever (forwardQuietTold, kept on
 # the row), as an inbox fyi; a read that never lands tells nobody: forward_follow's give-up reads it live and settles it.
 LAND_FORWARD_QUIET = LAND_DUE_LATE
+# LAND_FORWARD_QUIET_HELD: the told-once "no verdict has come back" fyi is not sent while the far host's last answer
+# (forward_ask, every LAND_FORWARD_ASK_EVERY) holds the row open in its queue (forwardHeld): that queue judges it on its
+# own bounds and tells the requester its outcome, and forward_follow already trusts the same hold. A pin the PR has
+# moved off still tells at once (the land pinned there cannot merge: the requester re-pins), and a hold that lapses (no
+# fresh answer, or past LAND_FORWARD_HELD_BOUND) tells as before. gcp-agent-lane-19, 30 h to 2026-11-27 20:15Z: 42
+# no-verdict tells, every one to a row cmux-cp-1 held (1,029 of 1,029 far rows asked answered held); 37 named an
+# unmoved pin, and each woke its idle requester within the fyi's 60 min bound, mostly alone, to re-queue a row the far
+# queue then merged and told again. Goal wakes-per-landed-pr; Leo: "not getting swamped by our own wake-ups, our own
+# tool calls". Detector: test-glaeda-gh.py test_a_forward_the_far_queue_holds_open_tells_no_verdict_only_once_the_hold_lapses.
 # LAND_FORWARD_READ_WAIT: how long the told-once waits on that one read before giving up on it, telling nobody, and
 # how fresh a cached read must be, or how long an asked one may take, before a no-outcome stop (outcome_read).
 # One value, set once: it was set here to 300.0 and again below to 900.0, so 900.0 ruled both uses and this line's
@@ -21066,6 +21075,14 @@ class LandQueue:
             return
         self.forward_quiet_tell(e, since, data, True)
 
+    def forward_held_now(self, e: dict) -> bool:
+        """Under the lock. Whether the far host's last answer holds forwarded E open (forwardHeld, one of
+        LAND_FORWARD_OPEN) since its newest hand-off, fresh within the ask bound forward_follow trusts, and E is not
+        past its own bound (forward_over): that queue's bounds end it and it tells the requester (LAND_FORWARD_QUIET_HELD)."""
+        held = float((e.get("forwardHeld") or {}).get("at") or 0)
+        return held > 0 and held >= self.forwarded_since(e) and not self.forward_over(e) \
+            and self.now - held <= 2 * LAND_FORWARD_ASK_EVERY + LAND_FORWARD_LOOK_EVERY
+
     def forward_pin(self, e: dict) -> str:
         """The head E was handed off at (its pin), lowercased."""
         return str((e.get("handedOff") or {}).get("head") or e.get("pinSha") or e.get("head") or "").lower()
@@ -21210,6 +21227,15 @@ class LandQueue:
         live = str(data.get("headRefOid") or "").lower()
         mins = round((self.now - since) / 60)
         moved = bool(SHA40.fullmatch(live) and SHA40.fullmatch(head) and land_head_moved(head, live))
+        if not moved and self.forward_held_now(e):
+            # LAND_FORWARD_QUIET_HELD's comment: the far queue holds it open and tells its outcome itself
+            if not e.get("forwardQuietHeld"):
+                e["forwardQuietHeld"] = {"at": self.now, "since": since, "to": to}
+                self.history(e, "forward_quiet_held", to=to, waited=round(self.now - since))
+                self.save(e)
+                log({"event": "land-forward-quiet-held", "key": key, "to": to, "waited": round(self.now - since),
+                     "held": (e.get("forwardHeld") or {}).get("state")})
+            return
         seen = f"the PR still reads open at {live[:12]}" if live else "the PR still reads open"
         nxt = f"glaeda-gh land {e['repo']}#{e['number']}" + (f" --sha {live}" if SHA40.fullmatch(live) else "")
         e["forwardQuiet"] = {"since": since, "at": self.now, "to": to, "head": head, "read": bool(read),
