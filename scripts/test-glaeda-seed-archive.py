@@ -181,7 +181,7 @@ class ArchiveTest(unittest.TestCase):
         real = archive.os.scandir
 
         class Entry:
-            def __init__(self, entry): self.entry, self.name = entry, entry.name
+            def __init__(self, entry): self.entry, self.name, self.path = entry, entry.name, entry.path
             def is_file(self, follow_symlinks=True):
                 if self.name == bad.name:
                     raise OSError(5, "Input/output error")
@@ -309,6 +309,94 @@ class ArchiveTest(unittest.TestCase):
         self.assertFalse(item["quarantined"])
         self.assertIn("quarantine_error", item)
 
+    def test_an_entry_that_stays_unreadable_is_not_read_again(self):
+        # 2026-11-27, cmux-lawrence: the X10 Pro under the archive image failed reads; several seeds read EIO and
+        # their quarantine rename read EIO too. Every 15 s run read each bad entry three times (the fill's listing,
+        # prune's and the count's), each read 20 kernel retries: about 5,000 kernel I/O error lines a minute.
+        # An entry that stays unreadable is recorded and never read again.
+        self.keep(KEYS[0], 100)
+        self.keep(KEYS[1], 101)
+        self.run_archive()
+        bad = KEYS[0] + archive.SUFFIX
+        real_scandir, real_rename = archive.os.scandir, archive.os.rename
+        reads = []
+
+        class Entry:
+            def __init__(self, entry): self.entry, self.name, self.path = entry, entry.name, entry.path
+            def is_file(self, follow_symlinks=True):
+                if self.name == bad:
+                    reads.append(self.name)
+                    raise OSError(5, "Input/output error")
+                return self.entry.is_file(follow_symlinks=follow_symlinks)
+            def stat(self, follow_symlinks=True): return self.entry.stat(follow_symlinks=follow_symlinks)
+
+        class Listing(list):
+            def __enter__(self): return self
+            def __exit__(self, *exc): return False
+
+        def rename(src, dst):
+            if Path(src).name == bad:
+                reads.append("rename")
+                raise OSError(5, "Input/output error")
+            return real_rename(src, dst)
+
+        archive.os.scandir = lambda path: Listing(Entry(e) for e in real_scandir(path))
+        archive.os.rename = rename
+        try:
+            first = self.run_archive()
+            after_first = len(reads)
+            second = self.run_archive()
+        finally:
+            archive.os.scandir, archive.os.rename = real_scandir, real_rename
+        self.assertEqual(first["state"], "applied", first)
+        self.assertGreater(after_first, 0)
+        self.assertEqual(reads[after_first:], [], "the second run read the known-bad entry again")
+        self.assertEqual(second["state"], "applied", second)
+        self.assertEqual(second.get("known_unreadable"), [KEYS[0]])
+        self.assertEqual(second["fetched"], [])  # never fetched over it
+
+    def test_the_server_skips_known_unreadable_seeds_and_lists_the_rest(self):
+        # 2026-11-27: one seed that read EIO emptied the archive's whole seed-list-v1 answer (the listing's
+        # comprehension raised), and every mini's ask re-read the bad entry: 20 kernel retries each. The server
+        # leaves the archive's known-unreadable keys alone and lists every other seed.
+        serve = load("glaeda_seed_serve_for_test", SERVE)
+        self.keep(KEYS[0], 100)
+        self.keep(KEYS[1], 101)
+        self.keep(KEYS[2], 102)
+        self.run_archive()
+        known, odd = KEYS[0] + archive.SUFFIX, KEYS[2] + archive.SUFFIX
+        archive.remember_unreadable({KEYS[0]})
+        serve.KNOWN_UNREADABLE = archive.STATE / "unreadable.json"
+        touched = []
+        real_scandir, real_open = serve.os.scandir, serve.os.open
+
+        class Entry:
+            def __init__(self, entry): self.entry, self.name, self.path = entry, entry.name, entry.path
+            def is_file(self, follow_symlinks=True):
+                touched.append(self.name)
+                if self.name in (known, odd):
+                    raise OSError(5, "Input/output error")
+                return self.entry.is_file(follow_symlinks=follow_symlinks)
+            def stat(self, follow_symlinks=True): return self.entry.stat(follow_symlinks=follow_symlinks)
+
+        def opener(path, flags, mode=0o777, *, dir_fd=None):
+            touched.append(os.fspath(path))
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        serve.os.scandir = lambda path: [Entry(e) for e in real_scandir(path)]
+        serve.os.open = opener
+        try:
+            listed = [key for key, _ in serve.listing("archive", Path("/nonexistent"), self.archive)]
+            found = serve.archive_find(self.archive, [KEYS[0], KEYS[1]])
+        finally:
+            serve.os.scandir, serve.os.open = real_scandir, real_open
+        self.assertEqual(listed, [KEYS[1]])  # the odd EIO one is left out too, not the whole answer
+        self.assertNotIn(known, touched)
+        self.assertIsNotNone(found)
+        fd, key = found
+        os.close(fd)
+        self.assertEqual(key, KEYS[1])
+
     def test_an_eio_anywhere_in_a_run_is_an_error_record(self):
         real = archive.run
         archive.run = lambda apply: (_ for _ in ()).throw(OSError(5, "Input/output error", "/Volumes/x"))
@@ -363,6 +451,15 @@ class ArchiveTest(unittest.TestCase):
             self.assertFalse(agent.exists())
         finally:
             archive.HOME, archive.DAEMON_DIR, archive.SUDO_PREFIX, archive.LAUNCHCTL, archive.STATE = saved
+
+    def test_the_archive_image_lives_on_the_t5_not_the_failing_x10(self):
+        # 2026-11-27, cmux-lawrence: the X10 Pro failed reads at more LBAs each hour (1,877 final errors in
+        # ten minutes at the worst), several under this image. The archive moved to the T5 EVO; the X10 is
+        # only the first version's old folder, which install still empties.
+        self.assertEqual(archive.HOST_VOLUME, Path("/Volumes/T5 EVO"))
+        self.assertEqual(archive.IMAGE, Path("/Volumes/T5 EVO/glaeda-seed-archive.sparsebundle"))
+        self.assertEqual(archive.MOUNT, Path("/Volumes/glaeda-seed-archive"))
+        self.assertEqual(archive.OLD_ARCHIVE, Path("/Volumes/X10 Pro/glaeda-seed-archive"))
 
     def test_the_launch_agent_runs_apples_python(self):
         plist = archive.plist(Path("/Users/x/.local/libexec/glaeda-seed-archive"))

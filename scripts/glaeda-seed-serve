@@ -126,6 +126,16 @@ ROLES = ("seed", "product", "archive", "cache")
 # The seed archive on cmux-lawrence (cmuxterm-hq#821): an APFS disk image glaeda-seed-archive attaches.
 ARCHIVE = "/Volumes/glaeda-seed-archive/seeds"
 ARCHIVE_SUFFIX = ".tar.zst"
+# glaeda-seed-archive's record of seeds that read EIO and could not be moved aside (a failing disk under the
+# archive image, cmux-lawrence 2026-11-27): never read again, so a mini's ask costs the disk no retries.
+KNOWN_UNREADABLE = Path.home() / ".local/state/glaeda/seed-archive/unreadable.json"
+
+
+def known_unreadable() -> set[str]:
+    try:
+        return set(json.loads(KNOWN_UNREADABLE.read_text()))
+    except (OSError, ValueError, TypeError):
+        return set()
 MAX_LIST = 512
 # Kept compile-admission state (cmux owned_build_state.py): root 1's store is STATE, root k's STATE/cmux-ci-k;
 # a parked pull-request build (cmux PR slots) sits at <store>/pr-builds/pr-<n>.
@@ -279,8 +289,11 @@ def archive_find(archive: Path, keys: list[str]) -> tuple[int, str] | None:
     root = open_dir_path(archive)
     if root is None:
         return None
+    skip = known_unreadable()
     try:
         for key in keys:
+            if key in skip:
+                continue
             try:
                 # O_NONBLOCK: a FIFO in the archive must not hang the open; cleared once it is a regular file.
                 fd = os.open(key + ARCHIVE_SUFFIX, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=root)
@@ -299,14 +312,20 @@ def listing(role: str, state: Path, archive: Path) -> list[tuple[str, int]]:
     """(key, mtime) of every kept seed, newest first, at most MAX_LIST; a key kept in several roots once."""
     found: dict[str, int] = {}
     if role == "archive":
+        skip = known_unreadable()
         try:
-            entries = [(e.name[:-len(ARCHIVE_SUFFIX)], e) for e in os.scandir(archive)
-                       if e.name.endswith(ARCHIVE_SUFFIX) and e.is_file(follow_symlinks=False)]
+            entries = list(os.scandir(archive))
         except OSError:
             entries = []
-        for key, entry in entries:
-            if KEY_RE.fullmatch(key):
-                found[key] = int(entry.stat(follow_symlinks=False).st_mtime)
+        for entry in entries:
+            key = entry.name[:-len(ARCHIVE_SUFFIX)]
+            if not entry.name.endswith(ARCHIVE_SUFFIX) or not KEY_RE.fullmatch(key) or key in skip:
+                continue
+            try:  # one entry that reads EIO is left out, not the whole answer
+                if entry.is_file(follow_symlinks=False):
+                    found[key] = int(entry.stat(follow_symlinks=False).st_mtime)
+            except OSError:
+                continue
     else:
         for seeds in seed_dirs(state):
             try:

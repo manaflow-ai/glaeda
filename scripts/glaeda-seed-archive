@@ -8,7 +8,7 @@
 
 cmuxterm-hq#821. The owned minis' j14 DerivedData seeds are built by one trusted-only seeder (cmux15), which
 keeps only its recent ones on a 460 GB disk. The archive keeps them all, up to BUDGET, on cmux-lawrence's
-X10 Pro SSD, and the PR minis read seeds from it (glaeda-seed-lan install --seeder cmux-lawrence --role archive,
+T5 EVO SSD (the X10 Pro until 2026-11-27), and the PR minis read seeds from it (glaeda-seed-lan install --seeder cmux-lawrence --role archive,
 then glaeda-seed-serve --role archive answers glaeda-seed-prefetch). A seed lands here within about a minute of
 the seeder keeping it, over the LAN, instead of every mini downloading it from R2.
 
@@ -28,7 +28,7 @@ as it was: the archive asks the trusted seeder, which never connects to the arch
 
 Each seed is kept as ARCHIVE/<KEY>.tar.zst: exactly the zstd stream the seeder's glaeda-seed-serve sends (a
 tar of one top-level directory named KEY), so serving it is a plain read. ARCHIVE is inside IMAGE, an APFS
-sparse bundle on the (ExFAT) X10 Pro, mounted at MOUNT: macOS privacy (TCC) lets a launchd job running
+sparse bundle on the (ExFAT) T5 EVO, mounted at MOUNT: macOS privacy (TCC) lets a launchd job running
 /usr/bin/python3 write into an attached disk image but not onto the external volume itself (measured on
 cmux-lawrence 2026-09-28, "Operation not permitted"; Lawrence's siso cache uses a sparse bundle on T5 EVO the
 same way). Each run attaches the image if it is not mounted; `install --apply`, run over SSH, creates it. The
@@ -77,13 +77,14 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 HOME = Path(os.path.expanduser("~"))
-HOST_VOLUME = Path("/Volumes/X10 Pro")
+# On the T5 EVO since 2026-11-27: the X10 Pro under the first image failed reads at more LBAs each hour.
+HOST_VOLUME = Path("/Volumes/T5 EVO")
 IMAGE = HOST_VOLUME / "glaeda-seed-archive.sparsebundle"
 IMAGE_SIZE = "1t"  # the most it can grow to; BUDGET keeps it below
 MOUNT = Path("/Volumes/glaeda-seed-archive")
 ARCHIVE = MOUNT / "seeds"  # glaeda-seed-serve ARCHIVE
 # The first version kept the files directly on the X10 Pro, where launchd jobs cannot write; install moves them.
-OLD_ARCHIVE = HOST_VOLUME / "glaeda-seed-archive"
+OLD_ARCHIVE = Path("/Volumes/X10 Pro/glaeda-seed-archive")
 HDIUTIL = "/usr/bin/hdiutil"
 SUFFIX = ".tar.zst"
 CORRUPT = ".corrupt-"  # quarantine()'s prefix for a seed whose entry read an OSError
@@ -122,6 +123,25 @@ def prefetch_module():
 pm = prefetch_module()
 
 
+def known_unreadable() -> set[str]:
+    """The seeds whose entry read EIO and could not be moved aside: never read again (STATE/unreadable.json).
+
+    2026-11-27, cmux-lawrence: the X10 Pro under the archive image failed reads. Each 15 s run read every bad entry
+    three times, each read 20 kernel retries: about 5,000 kernel I/O error lines a minute on a failing disk.
+    """
+    try:
+        return set(json.loads((STATE / "unreadable.json").read_text()))
+    except (OSError, ValueError, TypeError):
+        return set()
+
+
+def remember_unreadable(keys: set[str]) -> None:
+    STATE.mkdir(parents=True, exist_ok=True)
+    staged = STATE / f"unreadable.json.{os.getpid()}"
+    staged.write_text(json.dumps(sorted(keys)))
+    staged.replace(STATE / "unreadable.json")
+
+
 def archived(archive: Path, unreadable: dict[str, str] | None = None,
              aside: list[str] | None = None) -> dict[str, os.stat_result]:
     """KEY -> stat of every archived seed (regular files named <KEY>.tar.zst).
@@ -129,8 +149,10 @@ def archived(archive: Path, unreadable: dict[str, str] | None = None,
     A seed whose entry cannot be read (EIO from a bad disk image or volume) is left out and, when UNREADABLE is
     given, recorded there as KEY -> error: one bad seed must not crash the run (the daemon did, 2026-11-21).
     ASIDE, when given, gets the name of every seed quarantine() moved aside (.corrupt-*), read from the same listing.
+    A seed in known_unreadable() is left out unread.
     """
     found = {}
+    skip = known_unreadable()
     try:
         entries = list(os.scandir(archive))
     except OSError as error:
@@ -141,7 +163,7 @@ def archived(archive: Path, unreadable: dict[str, str] | None = None,
         key = entry.name[:-len(SUFFIX)]
         if aside is not None and entry.name.startswith(CORRUPT):
             aside.append(entry.name)
-        if entry.name.endswith(SUFFIX) and pm.KEY_RE.fullmatch(key):
+        if entry.name.endswith(SUFFIX) and pm.KEY_RE.fullmatch(key) and key not in skip:
             try:
                 if entry.is_file(follow_symlinks=False):
                     found[key] = entry.stat(follow_symlinks=False)
@@ -309,7 +331,7 @@ def prune(archive: Path, budget: int, min_free: int, apply: bool, spare: set[str
 
 
 def free_bytes(archive: Path) -> int:
-    """Free space for the archive: the image's own, and the X10 Pro's under it."""
+    """Free space for the archive: the image's own, and the T5 EVO's under it."""
     free = shutil.disk_usage(archive).free
     if archive.is_relative_to(MOUNT) and os.path.ismount(HOST_VOLUME):
         free = min(free, shutil.disk_usage(HOST_VOLUME).free)
@@ -356,6 +378,7 @@ def run(apply: bool, archive: Path = ARCHIVE, budget: int = BUDGET, min_free: in
         if why:
             return {**record, "state": "error", "reason": why}
         unreadable: dict[str, str] = {}
+        known = known_unreadable()
         aside: list[str] = []
         have = archived(archive, unreadable, aside)
         record["quarantined_aside"] = len(aside)
@@ -364,6 +387,13 @@ def run(apply: bool, archive: Path = ARCHIVE, budget: int = BUDGET, min_free: in
             for item in record["unreadable"]:
                 if item.get("quarantined"):
                     unreadable.pop(item["key"])
+            if apply and set(unreadable) - known - {""}:
+                known |= set(unreadable) - {""}
+                remember_unreadable(known)
+        if known:
+            record["known_unreadable"] = sorted(known)
+        for key in known:
+            unreadable.setdefault(key, "known unreadable")
         # A seed still sitting unreadable is not fetched over (the rename would hit the same bad entry).
         missing = list(dict.fromkeys(key for key, _ in kept if key not in have and key not in unreadable))
         record["seeder_kept"] = len(kept)
