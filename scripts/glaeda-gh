@@ -697,6 +697,12 @@ EXIT_WATCHDOG = 75  # EX_TEMPFAIL: the service manager restarts the daemon
 # (a full pipe, a hung disk) holds the stream lock it needs. faulthandler's own C thread needs neither
 # the GIL nor that lock: it ends the process (status 1) this long after the watchdog should have.
 WATCHDOG_BACKSTOP = 60
+# How long the watchdog waits for each of its own writes (the row on stdout, the stack dump on stderr) before it exits
+# EXIT_WATCHDOG anyway. Well under WATCHDOG_BACKSTOP: with the writes inline, a hung disk under the log (a lane VM,
+# 2026-11-27: the main thread in mkdir, the watchdog thread in log()'s print) held the watchdog itself until the
+# backstop ended the process with status 1 and no row; 10 of the unit's 21 deaths in three days were that.
+WATCHDOG_WRITE_WAIT = 10.0
+WATCHDOG_STACK_FRAMES = 8  # innermost frames of the main thread the watchdog row names (file:line function, no values)
 STALE_HEARTBEAT = 2 * WATCHDOG_AFTER  # a lock holder silent this long is hung; a waiting daemon takes over
 LOCK_RETRY = 15  # a daemon waiting for the lock looks at its holder this often
 TAKEOVER_GRACE = 10  # after SIGTERM, how long a hung holder has before SIGKILL
@@ -3006,6 +3012,26 @@ def hard_deadline(seconds: float, error: type[BaseException] = DeadlineTimeout):
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous)
+
+
+# execve keeps the caller's ITIMER_REAL and resets SIGALRM's handler to the default action, which ends the process.
+# ScriptWake re-execs serve from its own thread while the main thread is in a read phase, often inside hard_deadline's
+# armed alarm, so the new image died of SIGALRM when that alarm came due before its own first hard_deadline re-armed
+# it: on one lane VM, 2026-11-25..26, all 6 SIGALRM deaths of the unit came 30-75 s after a re-exec "from script-wake
+# in read direct" or "in reads", and no row named them. Every serve re-exec goes through exec_serve, which disarms the
+# alarm first; serve_daemon disarms one an older image still hands over (inherited_alarm).
+def disarm_alarm() -> float:
+    """Cancel this process's ITIMER_REAL (from any thread: it is per process). The seconds it had left, 0 if none."""
+    if not hasattr(signal, "setitimer"):
+        return 0.0
+    left, _ = signal.setitimer(signal.ITIMER_REAL, 0)
+    return left
+
+
+def exec_serve(argv: list[str]) -> None:
+    """os.execv for a re-exec of the daemon: no armed alarm is handed to the new image (disarm_alarm)."""
+    disarm_alarm()
+    os.execv(argv[0], argv)
 
 
 # Kept-alive connections. Every request used to open its own TCP and TLS connection (urllib's opener closes it after
@@ -30722,6 +30748,28 @@ def first_heartbeat(now: float | None = None) -> None:
                                       "heartbeat": HEARTBEAT_EVERY})
 
 
+def main_stack(limit: int | None = None) -> list[str]:
+    """The main thread's innermost frames, innermost last, as "file:line function" (no values): what the serve loop is
+    stuck in when no request is (the watchdog row's inCall is null for a hung disk write)."""
+    frame = sys._current_frames().get(threading.main_thread().ident or -1)
+    if frame is None:
+        return []
+    return [f"{Path(f.filename).name}:{f.lineno} {f.name}"
+            for f in traceback.extract_stack(frame)[-(limit or WATCHDOG_STACK_FRAMES):]]
+
+
+def within(run: Callable[[], Any], seconds: float) -> bool:
+    """Run RUN on its own thread and wait at most SECONDS: whether it ended. A write stuck on a hung disk or behind a
+    stream lock another thread holds is left behind, so the caller (the watchdog) still exits on time."""
+    def body() -> None:
+        with contextlib.suppress(Exception):  # stderr may not be a real file (tests)
+            run()
+    worker = threading.Thread(target=body, name="glaeda-gh-watchdog-write", daemon=True)
+    worker.start()
+    worker.join(seconds)
+    return not worker.is_alive()
+
+
 class Watchdog:
     """Exits the process (EXIT_WATCHDOG) once the serve loop has not come round for `limit` seconds,
     so launchd (KeepAlive) or systemd (Restart=always) starts a fresh daemon. A thread, so it fires
@@ -30753,14 +30801,21 @@ class Watchdog:
         doing = None
         with contextlib.suppress(Exception):  # read from another thread: a best-effort snapshot
             doing = self.where() if self.where is not None else None
-        log({"event": "watchdog", "silentFor": int(lag), "limit": int(self.limit), "pid": os.getpid(),
-             **({"thread": "main", "inCall": doing.get("inCall"), "lastCall": doing.get("lastCall")}
-                if isinstance(doing, dict) else {})})
-        with contextlib.suppress(Exception):  # stderr may not be a real file (tests)
+        row = {"event": "watchdog", "silentFor": int(lag), "limit": int(self.limit), "pid": os.getpid(),
+               **({"thread": "main", "inCall": doing.get("inCall"), "lastCall": doing.get("lastCall"),
+                   **({"phase": doing["phase"]} if doing.get("phase") else {})}
+                  if isinstance(doing, dict) else {}),
+               "main": main_stack()}
+        logged = within(lambda: log(row), WATCHDOG_WRITE_WAIT)
+
+        def dump() -> None:
             print(f"glaeda-gh: watchdog: the serve loop has not come round for {int(lag)}s (limit {int(self.limit)}s); "
-                  f"exiting {EXIT_WATCHDOG} so the service manager restarts the daemon. Where each thread was:",
+                  f"exiting {EXIT_WATCHDOG} so the service manager restarts the daemon."
+                  + ("" if logged else f" The watchdog row was not written within {WATCHDOG_WRITE_WAIT:g}s: "
+                                       f"{json.dumps(row)}.") + " Where each thread was:",
                   file=sys.stderr, flush=True)
             faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+        within(dump, WATCHDOG_WRITE_WAIT)
         self.exit(EXIT_WATCHDOG)
         return True
 
@@ -31369,6 +31424,7 @@ def serve(foreground_ok: bool = False) -> int:
 def serve_daemon(foreground_ok: bool, cleanup: contextlib.ExitStack) -> int:
     global LOG_STDOUT
     LOG_STDOUT = True  # the daemon's stdout is its log
+    alarm_left = disarm_alarm()  # an alarm an older image's re-exec handed over would end this one (exec_serve)
     inherited = adopt_inherited()  # before this image starts a child of its own: these are the last image's
     for name in (DEADLINE_ENV, DEADLINE_OWNER_ENV):  # a daemon started under a bounded call is not bounded by it
         os.environ.pop(name, None)
@@ -31385,11 +31441,13 @@ def serve_daemon(foreground_ok: bool, cleanup: contextlib.ExitStack) -> int:
             log({"event": "swept", "tempFiles": swept})
     started, held = time.monotonic(), False  # (REEXEC_UPDATE_GAP; "reexec-held" logged once)
     daemon = Daemon()
-    log({"event": "start", "pid": os.getpid(), "scriptSha256": seen["sha"], **({"inheritedChildren": inherited} if inherited else {})})
+    log({"event": "start", "pid": os.getpid(), "scriptSha256": seen["sha"], **({"inheritedChildren": inherited} if inherited else {}),
+         **({"inheritedAlarmS": round(alarm_left, 2)} if alarm_left else {})})
     with contextlib.suppress(AttributeError, ValueError, RuntimeError, OSError):  # (no SIGUSR1: Windows)
         faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)  # STALE_DUMP_ADVICE
     watchdog = Watchdog(WATCHDOG_AFTER, backstop=WATCHDOG_BACKSTOP,
-                        where=lambda: {"inCall": daemon.progress_call(), "lastCall": daemon.last_call},
+                        where=lambda: {"inCall": daemon.progress_call(), "lastCall": daemon.last_call,
+                                       "phase": getattr(daemon, "phase_now", None)},
                         reap=lambda: daemon.free_slots())  # (late-bound: a check's error is suppressed)
     watchdog.start()
     with contextlib.suppress(Exception):  # noqa: BLE001  no watch: the ring still installs
@@ -31402,7 +31460,7 @@ def serve_daemon(foreground_ok: bool, cleanup: contextlib.ExitStack) -> int:
              **({"from": where} if where else {}),
              **({"handedJudgments": handed} if handed else {}),
              **({"sinceWakeS": round(time.monotonic() - woke, 2)} if woke is not None else {})})
-        os.execv(sys.executable, [sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
+        exec_serve([sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
 
     stop_forwards = threading.Event()
     forwarder = threading.Thread(target=land_forward_loop, args=(daemon, stop_forwards),
@@ -31440,7 +31498,7 @@ def serve_daemon(foreground_ok: bool, cleanup: contextlib.ExitStack) -> int:
             if daemon.valve_due is not None:
                 # the stale valve (Daemon.stale_valve): a fresh daemon, the way an update starts one
                 daemon.restart_self()
-                os.execv(sys.executable, [sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
+                exec_serve([sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
             changed = script_changed(me, seen)
             if changed:
                 daemon.script_cut = False  # serve has seen it: the ticks a held or deferred re-exec runs are whole
@@ -31475,7 +31533,7 @@ def serve_daemon(foreground_ok: bool, cleanup: contextlib.ExitStack) -> int:
                 # this daemon still polls, but its lock is on a file nobody can see, so every client reads
                 # "not running" and restart's start is a no-op on the active unit. Start over on the new path.
                 log({"event": "reexec", "why": "daemon.lock was removed or replaced"})
-                os.execv(sys.executable, [sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
+                exec_serve([sys.executable, os.fspath(me), "serve"] + (["--foreground-ok"] if foreground_ok else []))
         except OSError:
             pass
 
