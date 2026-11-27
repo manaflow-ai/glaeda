@@ -44966,10 +44966,10 @@ def parser() -> argparse.ArgumentParser:
                          "host/$ACPMUX_SESSION_NAME)")
     # --pin: what the rulebook and every agent here call this ("land pinned <sha>", "glaeda-gh land --pin"), asked
     # for so on gcp-agent-lane-2, 2026-11-22, and refused as an unrecognized argument with the land unqueued.
-    ld.add_argument("--sha", "--match-head-commit", "--pin", "--pinned", dest="sha", metavar="SHA",
+    ld.add_argument("--sha", "--match-head-commit", "--pin", "--pinned", "--head", dest="sha", metavar="SHA",
                     help="land only this head (7 to 40 hex): refused now if the PR's head is another, and the land "
-                         "stops (head_moved) if a later push moves it; --match-head-commit (gh pr merge's own flag) "
-                         "and --pin (what the rulebook calls it) are the same")
+                         "stops (head_moved) if a later push moves it; --match-head-commit (gh pr merge's own flag), "
+                         "--pin (what the rulebook calls it) and --head (wait's word for it) are the same")
     ld.add_argument("--override-reason", dest="override_reason", metavar="TEXT",
                     help="every merge try runs with LAND_JUDGE_OVERRIDE=TEXT (a lane VM's: the broker land's override); one "
                          "line, at most 4000 characters, never cut; needs --override-receipt. Neither flag: the caller's own "

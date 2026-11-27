@@ -6863,7 +6863,9 @@ class ClientTest(Base):
         here call it. The word they type is the flag: --pin and --pinned are --sha, on land and on a wait."""
         sha = "a" * 40
         by_sha = gg.parser().parse_args(["land", "o/r#1", "--sha", sha])
-        for word in ("--pin", "--pinned", "--match-head-commit"):
+        # A lane, 2026-11-27: `cmux-gh land teamleaderleo/leo-workspace#13147 --head SHA` came back
+        # "unrecognized arguments: --head" with the land unqueued; wait already takes --head for the same SHA.
+        for word in ("--pin", "--pinned", "--match-head-commit", "--head"):
             args = gg.parser().parse_args(["land", "o/r#1", word, sha])
             self.assertEqual(args.sha, sha, word)
             self.assertEqual(vars(args), vars(by_sha), word)
