@@ -7387,6 +7387,21 @@ class GlaedaDiskTest(unittest.TestCase):
             with mock.patch.dict(gd.POLICY, {"saturated_delete_below_free": "0"}):
                 self.assertIs(gd.saturation_halt({1: full}, "5%"), gd.host_saturated)
 
+    def test_a_lane_vm_under_pressure_deletes_while_saturated(self) -> None:
+        """A lane VM, 2026-11-27: 77% used under --low 30%, load 7.5 on 4 cores, every pass skipped."""
+        total = 63 * gd.GIB
+        under = gd.Fs(1, "/", 15 * gd.GIB, total, 19 * gd.GIB, 25 * gd.GIB)
+        over = gd.Fs(1, "/", 30 * gd.GIB, total, 19 * gd.GIB, 25 * gd.GIB)
+        with mock.patch.object(gd, "emergency_devs", return_value=frozenset()), \
+                mock.patch.dict(gd.POLICY, {"saturated_delete_below_free": "20%"}):
+            with mock.patch.object(gd, "ROLE", "devbox"), mock.patch.object(gd, "DARWIN", False):
+                self.assertIsNone(gd.saturation_halt({1: under}, "5%"))
+                self.assertIs(gd.saturation_halt({1: over}, "5%"), gd.host_saturated)
+            with mock.patch.object(gd, "ROLE", "devbox"), mock.patch.object(gd, "DARWIN", True):
+                self.assertIs(gd.saturation_halt({1: under}, "5%"), gd.host_saturated)
+            with mock.patch.object(gd, "ROLE", "fleet-mini"), mock.patch.object(gd, "DARWIN", False):
+                self.assertIs(gd.saturation_halt({1: under}, "5%"), gd.host_saturated)
+
     def test_a_saturated_host_skips_the_apply_before_its_walks(self) -> None:
         """An agent host at load 21-29 (2026-11-23): the 15-minute `--pressure --idle --apply` pass ran at 74-86% CPU
         sizing trees its saturation halt then kept it from deleting. The halt is asked before the survey now."""

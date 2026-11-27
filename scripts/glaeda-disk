@@ -2872,9 +2872,20 @@ def host_saturated() -> str:
     return ""
 
 
+# A Linux lane VM (role devbox, not DARWIN) holds no pressure delete for load: it runs at load 2-3x its 4 cores all day,
+# so the saturated_delete_below_free share (20%) was its real trigger and every 15-minute pass from 70% to 80% used
+# skipped (two lane VMs at 77-78% used, +12 and +31 GB/day, load 7-63 on 4 cores,
+# 2026-11-27: "host CPU saturated ... skipped before measuring" at the timer's own --low 30%). Its sessions are the
+# load, not a CI job a delete would slow; deletes still run at background IO priority and keep every in-use veto.
+def lane_vm_pressure(fss: "dict[int, Fs]") -> bool:
+    """A Linux devbox with a filesystem under its pressure line (Fs.low)."""
+    return ROLE == "devbox" and not DARWIN and any(not fs.tmpfs and fs.under for fs in fss.values())
+
+
 def saturation_halt(fss: "dict[int, Fs]", emergency: str, floor_gib: float = 0.0):
-    """host_saturated as an apply halt, except while a filesystem is below its emergency floor: then nothing holds."""
-    if emergency_devs(fss, emergency, floor_gib):
+    """host_saturated as an apply halt, except while a filesystem is below its emergency floor or a lane VM is under
+    pressure (lane_vm_pressure): then nothing holds."""
+    if emergency_devs(fss, emergency, floor_gib) or lane_vm_pressure(fss):
         return None
     spec = str(POLICY.get("saturated_delete_below_free", "0")).strip()
     if spec not in ("", "0") and any(
