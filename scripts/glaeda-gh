@@ -16870,6 +16870,16 @@ def land_last_turn_began(out: str) -> float | None:
 # Goal wakes-per-landed-pr; Leo: "not getting swamped by our own wake-ups, our own tool calls". A requester that
 # has run no turn since (the fyi may still be queued) still gets the superseding fyi. Detector:
 # test-glaeda-gh.py test_a_forward_merge_after_a_read_no_verdict_fyi_sends_no_second_merged_word.
+# LAND_MERGED_ELSEWHERE_SEEN: a merge this queue did not make (a hand merge, or another host's queue that held a row
+# for the same PR) goes to its requester as an inbox fyi (LAND_MERGED_ELSEWHERE_FYI), and an idle inbox's fyi wakes
+# its session within 60 min. When the PR was queued on several hosts, the merging queue's "merged at SHA" woke the
+# requester within a minute and every other host's bare "merged" woke it again up to an hour later; a hand merge is
+# the requester's own act. gcp-agent-lane-19, 11-26 20:50Z..11-27 20:50Z: 18 wakes carried a bare "merged", 9 of them
+# turns that made no call ("already merged", "repeat notices"): cmux#60681 told by three hosts, cmux#60691 and
+# hq#31849 by two, cmux#59062 an hour after its session merged it. So a not-own merge's fyi is sent only to a
+# requester that has started no turn since the PR's mergedAt (LAND_MERGED_FYI_READ's session read); one idle since
+# before the merge still hears of it. Goal wakes-per-landed-pr; Leo: "not getting swamped by our own wake-ups, our
+# own tool calls". Detector: test-glaeda-gh.py test_a_merge_made_elsewhere_is_not_told_to_a_requester_awake_since.
 # The acpmux class of every land notice sent (LandQueue.notify): what is sent is something the requester acts on, and
 # an unclassified notice is an FYI that waits up to 15 min for the inbox's flush (acpmux hub/inbox.rs FLUSH_MS).
 LAND_NOTICE_CLASS = "block"
@@ -28797,6 +28807,10 @@ class LandQueue:
             wake = True  # LAND_NOTICE_SUPERSEDE's comment: an fyi, it wakes nobody and replaces the queued stop
             if e.get("forwardedTo") and told_at > 0:
                 read_since = told_at  # LAND_MERGED_FYI_READ's comment: the far queue tells this merge itself
+        if wake and not own and read_since is None:
+            # LAND_MERGED_ELSEWHERE_SEEN's comment: a requester that ran a turn after the merge has heard of it
+            data = (self.cache_of(e["key"]) or {}).get("data") or {}
+            read_since = iso_epoch(str(data.get("mergedAt") or "")) or None
         self.notify(e, e.get("requester") or "",
                     f"glaeda land: {self.url(e)} merged" + (f" at {merge_sha}" if merge_sha else "")
                     + (f" (before it: {e['stackedRebase']})" if e.get("stackedRebase") else ""), wake=wake,

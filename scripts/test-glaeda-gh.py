@@ -37772,6 +37772,48 @@ class LandTest(Base):
         self.assertEqual(gg.land_last_turn_began(json.dumps(turn_at(1795808408.355))), 1795808408.355)
         self.assertIsNone(gg.land_last_turn_began('{"lastTurn": {"turnId": "not-a-uuid"}}'))
 
+    def test_a_merge_made_elsewhere_is_not_told_to_a_requester_awake_since(self):
+        # LAND_MERGED_ELSEWHERE_SEEN: gcp-agent-lane-19, 2026-11-27 16:07Z, cmux#60681: cmux-cp-1's "merged at 773efd14"
+        # and two other hosts' bare "merged" fyis; the lane: "These merge notices ... just confirm what was already done"
+        def turn_at(t: float) -> dict:
+            ms = int(t * 1000)
+            tid = f"{ms:012x}7" + "0" * 19
+            tid = f"{tid[:8]}-{tid[8:12]}-{tid[12:16]}-{tid[16:20]}-{tid[20:]}"
+            return {"status": "ready", "inputSince": None, "pendingPermissions": 0, "queued": 0,
+                    "lastTurn": {"turnId": tid, "endedAt": (t + 30) * 1000}}
+
+        merged_at = dt.datetime.fromtimestamp(self.t - 900, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        replay = {"before": 0, "after": 0}
+        for case, turn, at in (("turn since the merge", self.t - 300, merged_at),
+                               ("idle since before the merge", self.t - 3600, merged_at),
+                               ("a copy with no mergedAt", self.t - 300, None)):
+            self.setUp()
+            self.pr(LA, state="MERGED")
+            if at:
+                self.w.cache[self.KEY]["data"]["mergedAt"] = at
+            self.land()
+            self.w.session_info = turn_at(turn)
+            sent = len(self.w.sent())
+            self.tick()  # a hand merge, read from the cache: retire_from_cache
+            bare = [c for c in self.w.sent()[sent:] if c[-1].endswith(" merged")]
+            replay["before"] += 1  # before: every not-own merge sent its fyi
+            replay["after"] += len(bare)
+            self.assertEqual(self.q.entries[self.KEY]["state"], "merged", case)
+            if case == "turn since the merge":
+                self.assertEqual(bare, [], f"{case}: the requester has heard of it")
+            else:
+                self.assertEqual(len(bare), 1, case)
+                self.assertEqual(bare[0][bare[0].index("--class") + 1], "fyi", case)
+        self.assertEqual(replay, {"before": 3, "after": 2})
+        # this queue's own merge still wakes its requester at once, whatever it did since
+        self.setUp()
+        self.pr(LA)
+        self.land()
+        self.w.session_info = turn_at(self.t)
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.assert_merged_at(LA)
+
     def test_a_land_fyi_to_an_acpmux_without_supersede_is_sent_again_without_it(self):
         e = self.handed_off()
         refused = subprocess.CompletedProcess([], 2, "", "error: unexpected argument '--supersede' found\n")

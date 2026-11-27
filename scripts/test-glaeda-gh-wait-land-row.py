@@ -293,6 +293,7 @@ class MergedNoticeSkipsTheRequestersOwnWaiter(unittest.TestCase):
     def merge(self, key: str, requester: str, how: str = "merged pinned", **extra: object) -> list[dict]:
         """LandQueue.merged on a row requested by REQUESTER; the notify calls it made, with their wake."""
         q = gg.LandQueue.__new__(gg.LandQueue)
+        q.cache_of = lambda key: None  # no copy of the PR (LAND_MERGED_ELSEWHERE_SEEN reads its mergedAt)
         calls: list[dict] = []
         e = {"key": key, "repo": REPO, "number": 42, "state": "waiting", "requester": requester, "history": [], **extra}
         with mock.patch.object(gg.LandQueue, "save", lambda self, e: None), \
