@@ -12180,10 +12180,17 @@ class Daemon:
                     self.clean[kind] = 0
                 continue
             slow = bool(SLOW.search(error))
-            if (down or slow) and (len(chunk) < 2 or splits[kind] + 2 > GQL_SPLITS):
+            # GitHub's own "Something went wrong" (a 200 with data null, or an INTERNAL error) is neither a timeout nor a
+            # 5xx, yet it is one entry's doing as often as not: a PR it cannot render fails every batch it sits in. It
+            # used to fall through to `continue` here, so the same batch failed the same way every cycle and every PR in
+            # it kept its old data while the heartbeat stayed fresh (cmux16: no PR refreshed for 2763 s, errors
+            # "graphql ... EdgeFailed" and "Something went wrong"). It splits like a timeout, without shrinking the batch
+            # size, until the entry alone is found; that one is then read by REST.
+            transient = bool(GQL_TRANSIENT.search(error)) and not slow and not down
+            if (down or slow or transient) and (len(chunk) < 2 or splits[kind] + 2 > GQL_SPLITS):
                 to_rest += chunk  # GitHub failed it and splitting cannot help any more: REST reads it this tick
                 continue
-            if not slow and not down or len(chunk) < 2:
+            if not slow and not down and not transient or len(chunk) < 2:
                 continue
             self.clean[kind] = 0
             if slow and not shrunk and self.batch[kind] > GQL_BATCH_MIN:

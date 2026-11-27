@@ -8030,6 +8030,20 @@ class OverloadTest(Base):
         self.assertLessEqual(self.daemon.batch["pr"], 5)
         self.assertTrue(all(gg.read_cache(k)["data"] for k in keys))
 
+    def test_a_something_went_wrong_batch_is_split_until_the_entry_it_cannot_render_is_alone(self) -> None:
+        # GitHub's own "Something went wrong" names neither a timeout nor a 5xx. It used to fall through unsplit, so the
+        # one PR it cannot render failed every batch it sat in, every cycle: every PR in them kept its old data.
+        keys = self.watch(10)
+        poisoned = int(keys[3].split("#")[1])
+        sizes = self.transport(lambda prs: (200, json.dumps({"data": None, "errors": [
+            {"message": "Something went wrong while executing your query."}]}).encode())
+            if poisoned in [int(p) for p in prs] else None)
+        self.daemon.tick(NOW)
+        self.assertTrue(any(size < 10 for size in sizes), sizes)  # it was split
+        self.assertEqual(self.daemon.batch["pr"], gg.GQL_BATCH_START)  # and the batch size did not shrink
+        others = [k for k in keys if k != keys[3]]
+        self.assertTrue(all(gg.read_cache(k)["data"] for k in others))
+
     def test_a_timeout_on_a_short_tail_batch_halves_the_batch_not_the_tail(self) -> None:
         self.watch(23)  # batches of 10, 10, 3
         failed = []
