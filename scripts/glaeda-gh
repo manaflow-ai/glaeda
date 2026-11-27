@@ -5479,6 +5479,44 @@ def rollup_suites(doc: object, sha: str) -> dict | None:
     return {"total": len(suites), "suites": sorted(suites, key=lambda s: str(s[0])), "via": "controller"}
 
 
+# The REST head read's check runs and first status page from the controller's check rollup, when it says both parts are
+# complete (rollup_head_parts): the hub keeps them from the webhook feed, so a gate's status read and a full read's
+# check-run pages ask GitHub nothing. Why (rest_breakdown of lane-gh, 2026-11-27 11:22-12:22Z): glaeda-upstream's
+# broker reads an hour were commits/{sha}/check-runs 747 and /status 376, beside check-suites 432 (already the rollup's,
+# PR_REST_SUITES_FROM_CONTROLLER): the rollup answered the suites and the same answer was thrown away for the other two.
+PR_REST_HEAD_FROM_CONTROLLER = True
+
+
+def rollup_head_parts(doc: object, sha: str, root: str) -> dict[str, dict] | None:
+    """The controller rollup DOC of SHA as the parts rest_head keeps, by path under ROOT (check_runs_path and its pages,
+    the first status page), each in slim_check_runs' or slim_status_page's terms with an ETag of its own, else None:
+    an incomplete (either part) or other commit's rollup, a run without its id, a count that disagrees with its list,
+    more runs or statuses than rest_head reads pages of. The hub keeps no check run's node_id: a run gets
+    `controller:run:ID`, which only names it (the key the steps read maps back to its database id)."""
+    digest = rollup_digest(doc, sha)
+    if digest is None or not isinstance(doc, dict) or doc.get("check_runs_complete") is not True \
+            or doc.get("status_complete") is not True:
+        return None
+    runs = doc["check_runs"].get("check_runs")
+    listed = doc["status"].get("statuses")
+    if doc["check_runs"].get("total_count") != len(runs) or doc["status"].get("total_count") != len(listed) \
+            or len(runs) > REST_CHECK_PAGES * 100 or len(listed) > 100:
+        return None
+    if any(not isinstance(r, dict) or not isinstance(r.get("id"), int) or isinstance(r.get("id"), bool) for r in runs):
+        return None
+    path = check_runs_path(root, sha)
+    out: dict[str, dict] = {}
+    for page in range(1, max(1, -(-len(runs) // 100)) + 1):
+        chunk = [{**r, "node_id": r.get("node_id") or f"controller:run:{r['id']}"}
+                 for r in runs[(page - 1) * 100:page * 100]]
+        out[path if page == 1 else f"{path}&page={page}"] = {
+            "doc": slim_check_runs({"total_count": len(runs), "check_runs": chunk}),
+            "etag": f"controller:{digest}:{page}", "via": "controller"}
+    out[status_path(root, sha)] = {"doc": slim_status_page(doc["status"]), "etag": f"controller:{digest}:status",
+                                   "via": "controller"}
+    return out
+
+
 CONTROLLER_GREEN = {"success", "skipped", "neutral"}
 
 
@@ -5563,6 +5601,11 @@ def check_runs_path(root: str, sha: str) -> str:
     """A head's first check-run page (filter=all: every attempt, as GraphQL's rollup lists them, so parse_pr dedupes
     both alike); page N is this with &page=N."""
     return f"{root}/commits/{sha}/check-runs?filter=all&per_page=100"
+
+
+def status_path(root: str, sha: str) -> str:
+    """A head's first combined-status page; page N is this with page=N."""
+    return f"{root}/commits/{sha}/status?per_page=100&page=1"
 
 
 def head_pending(checks: dict, statuses: list[dict]) -> bool:
@@ -6655,6 +6698,7 @@ class Daemon:
         self.controller_budget_end = float("inf")  # time.monotonic() past which this tick asks the controller nothing
         self.rollup_slow: dict[str, float] = {}  # head sha -> self.now before which its rollup is not asked
         self.rollup_down_until = 0.0
+        self.rollup_memo: tuple | None = None  # (root, sha, self.now, doc): the rollup this read already asked
         # The controller a daemon with none (a direct read's: controller=None) asks for check rollups only
         # (direct_rollup_controller); every other controller path stays off for it.
         self.rollup_controller: Any = None
@@ -13675,7 +13719,7 @@ class Daemon:
             return False
         sha = str(prior["data"]["headRefOid"])
         issue_path, pull_path = f"{root}/issues/{number}", f"{root}/pulls/{number}"
-        gate_paths = (suites_path(root, sha), f"{root}/commits/{sha}/status?per_page=100&page=1")
+        gate_paths = (suites_path(root, sha), status_path(root, sha))
         kept = {p: old.get(p) for p in (issue_path, pull_path) + gate_paths}
         if any(not isinstance(k, dict) or "doc" not in k for k in kept.values()):
             return False
@@ -13696,7 +13740,7 @@ class Daemon:
                 probe[issue_path] = kept[issue_path]
             if self.suites_part(old, probe, root, sha) != kept[gate_paths[0]]["doc"]:
                 return False
-            if self.head_part(old, probe, gate_paths[1], slim_status_page) != kept[gate_paths[1]]["doc"]:
+            if self.status_part(old, probe, root, sha) != kept[gate_paths[1]]["doc"]:
                 return False
         except WatchError:
             return False  # the full read says what failed
@@ -13720,11 +13764,39 @@ class Daemon:
         incomplete). No GitHub request."""
         if not PR_REST_SUITES_FROM_CONTROLLER:
             return None
-        doc = self.controller_rollup_doc(root, sha)
+        doc = self.rollup_doc_once(root, sha)
         return None if doc is None else rollup_suites(doc, sha)
+
+    def controller_head_parts(self, root: str, sha: str) -> dict[str, dict] | None:
+        """rollup_head_parts of the controller's rollup of SHA in ROOT's repository, else None (off, out, slow, failed,
+        incomplete). No GitHub request."""
+        if not PR_REST_HEAD_FROM_CONTROLLER:
+            return None
+        doc = self.rollup_doc_once(root, sha)
+        return None if doc is None else rollup_head_parts(doc, sha, root)
+
+    def rollup_doc_once(self, root: str, sha: str) -> dict | None:
+        """controller_rollup_doc, asked once a read (self.now) per head: the REST gate's suites and status and the full
+        read's check runs are one answer."""
+        if self.rollup_memo is None or self.rollup_memo[:3] != (root, sha, self.now):
+            self.rollup_memo = (root, sha, self.now, self.controller_rollup_doc(root, sha))
+        return self.rollup_memo[3]
+
+    def status_part(self, old: dict, parts: dict, root: str, sha: str) -> Any:
+        """The head's first status page in slim_status_page's terms, kept in PARTS: the controller's rollup when it can
+        say (controller_head_parts), else GitHub's (head_part). Raises WatchError, OutOfTime."""
+        path = status_path(root, sha)
+        rolled = self.controller_head_parts(root, sha)
+        if rolled is None:
+            return self.head_part(old, parts, path, slim_status_page)
+        parts[path] = rolled[path]
+        return rolled[path]["doc"]
 
     def controller_rollup_doc(self, root: str, sha: str) -> dict | None:
         """The controller's rollup of SHA in ROOT's repository as it answered, else None (off, out, slow, failed)."""
+        return self.controller_rollup_ask(root, sha)
+
+    def controller_rollup_ask(self, root: str, sha: str) -> dict | None:
         own = self.controller is not None
         get = getattr(self.controller if own else self.rollup_controller, "get", None)
         if (not callable(get) or (own and not self.controller_room(CONTROLLER_ROLLUP_TIMEOUT))
@@ -14151,6 +14223,14 @@ class Daemon:
         repository's workflow names, each a conditional read kept in `parts`. RUNS_KEPT (runs_unchanged): the check
         runs are the pages OLD keeps, not asked. Raises WatchError."""
         path = check_runs_path(root, sha)
+        rolled = None if runs_kept else self.controller_head_parts(root, sha)
+        if rolled is not None:
+            parts.update(rolled)
+            checks = {"total_count": rolled[path]["doc"]["total_count"], "check_runs": [
+                c for p, part in rolled.items() if p.startswith(path) for c in part["doc"]["check_runs"]]}
+            statuses = list(rolled[status_path(root, sha)]["doc"]["statuses"])
+            parts[path] = {**parts[path], "at": min(self.now, self.resume_from)}
+            return self.rest_head_rest(old, parts, root, sha, checks, statuses, len(statuses))
         if runs_kept:
             def run_page(page_path: str) -> dict:
                 parts[page_path] = old[page_path]
@@ -14173,6 +14253,12 @@ class Daemon:
             total = int(got.get("total") or 0)
             if len(statuses) >= total or not got.get("statuses"):
                 break
+        return self.rest_head_rest(old, parts, root, sha, checks, statuses, total)
+
+    def rest_head_rest(self, old: dict, parts: dict, root: str, sha: str, checks: dict, statuses: list,
+                       total: int) -> tuple[dict, list, list, dict]:
+        """rest_head from its check runs and statuses on (TOTAL: the statuses the commit says it has): the head's
+        workflow runs and the repository's workflow names, read from GitHub."""
         runs: list[dict] = []
         runs_total = 0
         for page in range(1, REST_RUN_PAGES + 1):
