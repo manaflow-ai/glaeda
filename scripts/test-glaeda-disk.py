@@ -17777,11 +17777,27 @@ class GhrunIdleRunnerTest(unittest.TestCase):
         self.realpaths: dict[str, str] = {}
         self.sudo_ok = True
         self.cmds = "/home/ghrun/r2/bin/Runner.Listener run --startuptype service\n"
+        # the root proof: what processes hold, each runner's .service and systemd's answer for it
+        self.holders = ["/", "/home/ghrun/r2/bin/Runner.Listener", "/home/ghrun/r2", "/dev/null"]
+        self.denied = 0
+        self.services = {"/home/ghrun/r1": "actions.runner.org.lane-r1.service",
+                         "/home/ghrun/r2": "actions.runner.org.lane-r2.service"}
+        self.states = {"actions.runner.org.lane-r1.service": "inactive",
+                       "actions.runner.org.lane-r2.service": "active"}
+
+    def fake_units(self, units: list[str]) -> dict[str, str]:
+        self.calls.append(["systemctl", "is-active", "--", *units])
+        return {u: self.states[u] for u in units if u in self.states}
 
     def fake_sudo(self, args: list[str], timeout: float = 0) -> tuple[int, str]:
         self.calls.append(list(args))
         if not self.sudo_ok:
             return -1, "sudo -n is not available here"
+        if args[:3] == ["python3", "-I", "-c"]:
+            self.assertEqual(args[3], gd.GHRUN_PROOF_SRC)
+            runners = json.loads(args[4])
+            return 0, json.dumps({"paths": self.holders, "denied": self.denied,
+                                  "units": {r: self.services.get(r, "") for r in runners}}) + "\n"
         if args[0] == "find" and "-prune" in args:
             return 0, "\n".join(self.listing + ["/home/ghrun/r1/_work/../../x", "/home/ghrun/r1/_diag/y"]) + "\n"
         if args[0] == "find":
@@ -17796,6 +17812,7 @@ class GhrunIdleRunnerTest(unittest.TestCase):
 
     def run_in(self, fn, *args, **kw):
         with mock.patch.object(gd, "ghrun_sudo", self.fake_sudo), \
+                mock.patch.object(gd, "ghrun_unit_states", self.fake_units), \
                 mock.patch.object(gd, "process_evidence", lambda: ([], self.cmds)):
             return fn(*args, **kw)
 
@@ -17871,6 +17888,61 @@ class GhrunIdleRunnerTest(unittest.TestCase):
         self.cmds += "/home/ghrun/r1/bin/Runner.Worker spawnclient 1 2\n"  # ... then a job starts
         self.assertEqual(self.run_in(gd.ghrun_remove, "/home/ghrun/r1/_work/cmux", self.ROOT), "a runner is live now")
         self.assertEqual(self.removed(), [])
+
+    def test_an_open_file_below_an_item_keeps_it(self) -> None:
+        # a process of the runner account with a file open in r1's checkout: no Runner.* command line names it
+        self.holders.append("/home/ghrun/r1/_work/cmux/target/debug/.cargo-lock")
+        items = self.items()
+        self.assertEqual(items["/home/ghrun/r1/_work/cmux"].verdict, "in-use")
+        self.assertIn("holds", items["/home/ghrun/r1/_work/cmux"].reasons[0])
+        self.assertEqual(items["/home/ghrun/r1/_work/_tool"].verdict, "reclaimable", "a sibling item is not held")
+        self.holders.append("/home/ghrun/.cache/go-build/ab/abcd-d (deleted)")
+        self.assertEqual(self.items()["/home/ghrun/.cache/go-build"].verdict, "in-use")
+        self.holders.append("/home/ghrun/r1/_work/cmuxterm-hq")  # a prefix of another name is not below it
+        self.assertEqual(self.items()["/home/ghrun/r1/_work/_tool"].verdict, "reclaimable")
+
+    def test_a_runner_whose_service_is_not_stopped_keeps_its_items(self) -> None:
+        for state in ("active", "activating", "reloading", "deactivating"):
+            self.states["actions.runner.org.lane-r1.service"] = state
+            item = self.items()["/home/ghrun/r1/_work/cmux"]
+            self.assertEqual(item.verdict, "in-use", state)
+            self.assertIn(f"is {state}", item.reasons[0])
+        self.states["actions.runner.org.lane-r1.service"] = "failed"
+        self.assertEqual(self.items()["/home/ghrun/r1/_work/cmux"].verdict, "reclaimable")
+        del self.states["actions.runner.org.lane-r1.service"]  # systemd did not answer for it
+        self.assertEqual(self.items()["/home/ghrun/r1/_work/cmux"].verdict, "in-use")
+        self.services["/home/ghrun/r1"] = "../../etc/passwd"  # not a unit name: never handed to systemctl
+        self.assertEqual(self.items()["/home/ghrun/r1/_work/cmux"].verdict, "in-use")
+        self.assertFalse(any("../../etc/passwd" in c for c in self.calls if c[0] == "systemctl"))
+        del self.services["/home/ghrun/r1"]  # no unit installed: the process check alone decides
+        self.assertEqual(self.items()["/home/ghrun/r1/_work/cmux"].verdict, "reclaimable")
+
+    def test_an_unreadable_proc_entry_keeps_everything(self) -> None:
+        self.denied = 1
+        self.assertTrue(all(i.verdict == "unchecked" for i in self.items().values()))
+        self.assertEqual(self.run_in(gd.apply_ghrun, self.receipt, root=self.ROOT), 0)
+        self.assertEqual(self.removed(), [])
+
+    def test_the_root_proof_is_taken_again_just_before_deleting(self) -> None:
+        self.run_in(gd.ghrun_items, self.ROOT)  # judged reclaimable ...
+        self.holders.append("/home/ghrun/r1/_work/cmux")  # ... then a job's shell cds into it
+        self.assertIn("holds", self.run_in(gd.ghrun_remove, "/home/ghrun/r1/_work/cmux", self.ROOT))
+        self.holders.pop()
+        self.states["actions.runner.org.lane-r1.service"] = "activating"  # ... or the gate starts r1
+        self.assertIn("activating", self.run_in(gd.ghrun_remove, "/home/ghrun/r1/_work/cmux", self.ROOT))
+        self.assertEqual(self.removed(), [])
+
+    @unittest.skipUnless(Path("/proc/self/fd").is_dir(), "the proof reads Linux /proc")
+    def test_the_proof_reads_proc_and_service_files(self) -> None:
+        base = self.base / "runner"
+        base.mkdir()
+        (base / ".service").write_text("x.service\n")
+        out = subprocess.run([sys.executable, "-I", "-c", gd.GHRUN_PROOF_SRC,
+                              json.dumps([os.fspath(base), os.fspath(self.base / "none")])],
+                             capture_output=True, text=True, timeout=60, cwd=base)
+        got = json.loads(out.stdout)
+        self.assertEqual(got["units"], {os.fspath(base): "x.service", os.fspath(self.base / "none"): ""})
+        self.assertIn(os.path.realpath(base), got["paths"], "its own cwd")
 
     def test_no_process_evidence_keeps_everything(self) -> None:
         def none() -> tuple[list[str], str]:

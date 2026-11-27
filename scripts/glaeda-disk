@@ -8879,12 +8879,53 @@ def apply_docker_store(receipt: Path, halt=None, below_target=None, families: fr
 #   window (go rebuilds it).
 # Never: a runner's config (.runner, .credentials*, .path, .env), bin, externals, svc.sh, _diag, _actions, _temp,
 # _PipelineMapping. Without `sudo -n` the family reports one blocked item and deletes nothing. Deletion needs sudo.
+# Each item is also proved as root (GHRUN_PROOF_SRC), once when listed and again right before its `rm`: no process
+# holds a file, cwd, root or executable at or below it (every /proc entry read; one unreadable keeps everything), and
+# its runner's systemd unit (<runner>/.service) is inactive or failed (one that is active, starting, or did not answer
+# keeps the runner's items). A command line alone names no open file, and the gate starts a stopped runner at any time.
 GHRUN_FAMILY = "ghrun-idle-runner"
 GHRUN_ROOT = Path("/home/ghrun")
 GHRUN_IDLE_HOURS = BUILD_STATE_STALE_HOURS
 GHRUN_TIMEOUT_S = 300
 GHRUN_RUNNER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 GHRUN_WORKER_RE = re.compile(r"(/[^\s]*?)/bin/Runner\.(Listener|Worker)(?:\s|$)")
+GHRUN_UNIT_RE = re.compile(r"^[A-Za-z0-9@._:\\-]+\.service$")
+GHRUN_STOPPED_STATES = frozenset({"inactive", "failed"})
+# Read as root (`sudo -n python3 -I -c`): every process's cwd, root, executable and open files, since this account
+# cannot read another account's /proc/PID/fd and a command line names no open file; and each runner's `.service` (the
+# systemd unit svc.sh installed, which the gate stops and starts). Prints {paths, denied, units}; read only.
+GHRUN_PROOF_SRC = r'''
+import json, os, sys
+runners = json.loads(sys.argv[1])
+paths, denied = [], 0
+for pid in os.listdir("/proc"):
+    if not pid.isdigit():
+        continue
+    base = "/proc/" + pid
+    try:
+        fds = [base + "/fd/" + fd for fd in os.listdir(base + "/fd")]
+    except FileNotFoundError:
+        continue
+    except OSError:
+        denied, fds = denied + 1, []
+    for link in [base + "/cwd", base + "/root", base + "/exe", *fds]:
+        try:
+            paths.append(os.readlink(link))
+        except FileNotFoundError:
+            pass
+        except OSError:
+            denied += 1
+units = {}
+for r in runners:
+    try:
+        with open(os.path.join(r, ".service"), "rb") as f:
+            units[r] = f.read(512).decode("utf-8", "replace").strip()
+    except FileNotFoundError:
+        units[r] = ""
+    except OSError:
+        units[r] = None
+print(json.dumps({"paths": paths, "denied": denied, "units": units}))
+'''
 
 
 def ghrun_present() -> bool:
@@ -8937,6 +8978,63 @@ def ghrun_live() -> tuple[set[str], bool]:
     return dirs, worker
 
 
+def ghrun_unit_states(units: list[str]) -> dict[str, str]:
+    """systemd's word for each unit ("active", "inactive", ...); a unit it did not answer for is absent."""
+    if not units:
+        return {}
+    try:
+        r = subprocess.run(["systemctl", "is-active", "--", *units], capture_output=True, text=True, timeout=60,
+                           stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    lines = r.stdout.split()
+    return dict(zip(units, lines)) if len(lines) == len(units) else {}
+
+
+def ghrun_proofs(runners: list[str]) -> tuple[list[str], dict[str, str]]:
+    """(every path a process on the host holds, read as root; RUNNER -> why its service keeps it, or "" when it has
+    no unit or its unit is stopped). Raises NoEvidence when /proc cannot be read whole: that keeps everything."""
+    code, out = ghrun_sudo(["python3", "-I", "-c", GHRUN_PROOF_SRC, json.dumps(sorted(set(runners)))], timeout=300)
+    if code != 0:
+        raise NoEvidence(f"cannot read /proc as root: {out[:120]}")
+    try:
+        got = json.loads(out)
+        paths, denied, units = list(got["paths"]), int(got["denied"]), dict(got["units"])
+    except (ValueError, KeyError, TypeError) as e:
+        raise NoEvidence(f"the /proc proof did not parse: {e.__class__.__name__}") from e
+    if denied or not paths:
+        raise NoEvidence(f"/proc as root: {denied} entries unreadable, {len(paths)} read")
+    named = {r: u for r, u in units.items() if isinstance(u, str) and GHRUN_UNIT_RE.match(u)}
+    states = ghrun_unit_states(sorted(set(named.values())))
+    held = {}
+    for r in set(runners):
+        u = units.get(r)
+        if u == "":
+            held[r] = ""  # no unit installed: the process check alone decides
+        elif r not in named:
+            held[r] = "its runner service could not be read"
+        elif states.get(named[r]) is None:
+            held[r] = f"its runner service {named[r]} did not report its state"
+        elif states[named[r]] not in GHRUN_STOPPED_STATES:
+            held[r] = f"its runner service {named[r]} is {states[named[r]]}"
+        else:
+            held[r] = ""
+    return [h.removesuffix(" (deleted)") for h in paths], held
+
+
+def ghrun_holder(path: str, holders: list[str]) -> str:
+    """The first held path at or below PATH; "" when no process holds anything there."""
+    return next((h for h in holders if h == path or h.startswith(path + "/")), "")
+
+
+def ghrun_held(path: str, runner: str, holders: list[str], units: dict[str, str]) -> str:
+    """Why the root proof keeps PATH (a process holds a file below it, or its runner's service is not stopped)."""
+    h = ghrun_holder(path, holders)
+    if h:
+        return f"a process holds {h[len(path):][:60] or 'it'} below it"
+    return units.get(runner, "its runner service was not read") if runner else ""
+
+
 def ghrun_changed_since(path: str, hours: float) -> str:
     """"" when nothing below PATH changed in the last HOURS, else why not (a changed file, or why it could not be read)."""
     cutoff = int(time.time() - hours * 3600)
@@ -8980,16 +9078,20 @@ def ghrun_items(root: Path | None = None, live: tuple[set[str], bool] | None = N
                      platform="linux")]
     try:
         dirs, worker = ghrun_live() if live is None else live
+        holders, units = ghrun_proofs([r for r in map(ghrun_runner_of, cands) if r])
     except NoEvidence as e:
         return [Item(GHRUN_FAMILY, p, ghrun_size(p), 0.0, "unchecked", [f"no process evidence: {e}"],
                      platform="linux") for p in cands]
     items = []
     for p in cands:
         runner = ghrun_runner_of(p)
+        held = ghrun_held(p, runner, holders, units)
         if runner and runner in dirs:
             verdict, why = "in-use", "a Runner.Listener or Runner.Worker runs from this runner directory"
         elif not runner and worker:
             verdict, why = "in-use", "a Runner.Worker is running on this host"
+        elif held:
+            verdict, why = "in-use", held
         else:
             why = ghrun_changed_since(p, GHRUN_IDLE_HOURS)
             verdict = "recent" if why.startswith("changed") else "unchecked" if why else "reclaimable"
@@ -9015,6 +9117,13 @@ def ghrun_remove(path: str, root: Path | None = None) -> str:
     runner = ghrun_runner_of(real)
     if (runner and runner in dirs) or (not runner and worker):
         return "a runner is live now"
+    try:
+        holders, units = ghrun_proofs([runner] if runner else [])
+    except NoEvidence as e:
+        return f"no process evidence: {e}"
+    held = ghrun_held(real, runner, holders, units)
+    if held:
+        return held
     changed = ghrun_changed_since(real, GHRUN_IDLE_HOURS)
     if changed:
         return changed
