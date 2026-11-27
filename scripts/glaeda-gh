@@ -1633,6 +1633,18 @@ SUITE_COUNTS = """query($suites: [ID!]!) { rateLimit { limit remaining resetAt c
 ... on CheckSuite { id checkRuns(first: 1, filterBy: { checkType: ALL }) { totalCount } } } }"""
 
 
+# A head with more check suites than one page shows (a cmux head has 100+): its last-real-attempt read stops there, so
+# every full read of such a PR is partial, the same way, until its suites change. A partial read stored no fingerprint,
+# and probe_ok refuses a PR with none, so each was read in full every cycle and never probed. The control-plane host,
+# 2026-11-27 20:2xZ: 153 of 683 open PRs held this error and no fingerprint, land refreshes refused 20-23 of each 30
+# rows a probe as "no-fp", a full cmux read cost 2.6-7 s of GitHub's time, and ticks spent 410-484 s of each 600 s in
+# "read pr" while waited PR data reached 2,489 s. This partial is the head's shape, not a failed read: a full read of
+# the same fingerprint (which counts the suites, so one more or fewer is a change) comes back partial the same way. So
+# it keeps its fingerprint, and a probe that matches confirms it (still partial, never greener: checksPageError stays).
+SUITES_PAST_ONE_PAGE = "graphql: last real attempt: more than 100 check suites on one commit"
+STABLE_PARTIAL = frozenset({SUITES_PAST_ONE_PAGE})
+
+
 def ran_nothing_suites(commit: dict | None) -> list[str] | str:
     """The ids of COMMIT's check suites whose newest attempt ran no check run (an older attempt may have run some:
     last_real_contexts reads them); an error message when COMMIT has more suites than one page shows (one past it
@@ -1644,7 +1656,7 @@ def ran_nothing_suites(commit: dict | None) -> list[str] | str:
         # GitHub answers a field it failed to read as null beside an error: an unread field is never "none ran nothing"
         return "graphql: last real attempt: the commit's check suites could not be read"
     if (suites.get("pageInfo") or {}).get("hasNextPage"):
-        return "graphql: last real attempt: more than 100 check suites on one commit"
+        return SUITES_PAST_ONE_PAGE
     nodes = suites.get("nodes")
     if not isinstance(nodes, list):
         return "graphql: last real attempt: malformed check suites (no node list)"
@@ -12654,11 +12666,15 @@ class Daemon:
                 if kind == "pr" and snap is None and self.pr_head_key(e, node) is not None \
                         and not first_page_more(node):
                     snap = self.capture_rollup(e["key"], node, nulls.get(i, 0) + (f"{alias}{i}" in limits))
+                stable = False  # partial only by the head's shape (STABLE_PARTIAL): it keeps its fingerprint
                 if kind == "pr":
-                    page_error = self.extend_pr_contexts(e, node)
-                    page_error = self.add_last_real_contexts(node, attempts[i], suite_runs, suites_error) or page_error
+                    pages_error = self.extend_pr_contexts(e, node)
+                    suites_partial = self.add_last_real_contexts(node, attempts[i], suite_runs, suites_error)
+                    page_error = suites_partial or pages_error
                     # a context GitHub could not read may be a red one: partial, never greener
                     page_error = page_error or (null_contexts_error(nulls[i]) if nulls.get(i) else None)
+                    stable = (suites_partial in STABLE_PARTIAL and pages_error is None and not nulls.get(i)
+                              and f"{alias}{i}" not in limits)
                 parsed[i] = parse_pr(node) if kind == "pr" else parse_comments(node)
                 if kind == "pr" and f"{alias}{i}" in limits:
                     # a field GitHub gave up on is null here, wherever it sits: the PR reads pending, never green
@@ -12667,7 +12683,7 @@ class Daemon:
                     parsed[i]["checksPageError"] = page_error
                     split_unread(parsed[i])  # a required name past the pages read is unread, not missing
                 if kind == "pr":
-                    fps[i] = None if page_error else pr_fingerprint(node)
+                    fps[i] = None if page_error and not stable else pr_fingerprint(node)
                 if i in captured:
                     self.save_rollup(e["key"], node, captured[i], fps[i])
                 if snap is not None and not page_error:
@@ -13031,7 +13047,8 @@ class Daemon:
         # (an answer from an upstream keeps this host's old fp: never confirmed against it)
         if c.get("source") == "upstream":
             return "upstream"
-        if not isinstance(data, dict) or data.get("checksPageError") or data.get("state") != "OPEN":
+        if not isinstance(data, dict) or data.get("checksPageError") not in (None, *STABLE_PARTIAL) \
+                or data.get("state") != "OPEN":
             return "not-open-whole"
         if not isinstance(c.get("fullAt"), (int, float)):
             return "no-full"

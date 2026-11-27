@@ -24927,6 +24927,38 @@ class PrProbeTest(Base):
         self.daemon.tick(NOW + gg.CYCLE)
         self.assertEqual(gg.read_cache("pr:o/r#7")["via"], "graphql", "a partial PR is read in full again")
 
+    def test_a_head_past_one_page_of_suites_is_probed_partial_not_read_in_full_each_cycle(self) -> None:
+        """The control-plane host, 2026-11-27: 153 of 683 open PRs held "more than 100 check suites" and no fingerprint,
+        so each was read in full every cycle (2.6-7 s of GitHub's time a cmux PR) and waited PR data reached 2,489 s.
+        That partial is the head's shape: it keeps its fingerprint, a matching probe confirms it, and it stays partial."""
+        node = self.gh.prs[("o", "r", 7)]
+        sha = node["headRefOid"]
+        self.gh.suites[sha] = [{"id": "S1", "latest": 1, "more": True}]
+        self.daemon.tick(NOW)
+        first = gg.read_cache("pr:o/r#7")
+        self.assertEqual(first["data"]["checksPageError"], gg.SUITES_PAST_ONE_PAGE)
+        self.assertIsInstance(first["fp"], str)
+        self.assertNotEqual(gg.check_verdict(first["data"], "green"), gg.EXIT_OK, "partial: never green")
+        full = self.gh.full_reads
+        later = NOW + gg.CYCLE
+        self.daemon.tick(later)
+        after = gg.read_cache("pr:o/r#7")
+        self.assertEqual(self.gh.full_reads, full, "an unchanged partial head costs a probe, not a full read")
+        self.assertEqual((after["via"], after["dataAt"]), ("graphql-probe", later))
+        self.assertEqual(after["data"]["checksPageError"], gg.SUITES_PAST_ONE_PAGE, "confirmed partial, never greener")
+        self.gh.suites[sha].append({"id": "S2", "latest": 1, "more": True})  # one more suite: a change
+        self.daemon.tick(later + gg.CYCLE)
+        self.assertEqual(gg.read_cache("pr:o/r#7")["via"], "graphql", "a changed suite count is read in full")
+
+    def test_a_partial_read_past_a_suite_page_and_a_null_context_is_never_probed(self) -> None:
+        node = self.gh.prs[("o", "r", 7)]
+        self.gh.suites[node["headRefOid"]] = [{"id": "S1", "latest": 1, "more": True}]
+        node["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"]["nodes"].append(None)
+        self.daemon.tick(NOW)
+        self.assertIsNone(gg.read_cache("pr:o/r#7")["fp"])
+        self.daemon.tick(NOW + gg.CYCLE)
+        self.assertEqual(gg.read_cache("pr:o/r#7")["via"], "graphql", "a transient partial is read in full again")
+
     def test_an_upstream_answer_is_never_confirmed_against_this_hosts_fingerprint(self) -> None:
         """Review of glaeda#1950 (F2): an upstream's answer kept this host's fp, fullAt and via."""
         self.daemon.tick(NOW)
