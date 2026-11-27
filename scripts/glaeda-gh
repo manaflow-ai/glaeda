@@ -1963,8 +1963,16 @@ def route_of(method: str, path: str) -> str:
     return f"{method} {'/'.join(out)}" + ("?" + "&".join(names) if names else "")
 
 
+# No one minute's row of one key sends this many requests (the whole REST pool is 5000 an hour). A row past it is a
+# miscount, not spend: 2026-11-27 21:28Z cmux-cp-1's rest_breakdown summed glaeda:outbox rows of 892775259368767916,
+# a row a fallback reader had folded back into spend.json each time it ran (spend_new), doubling every key (about 55x
+# in 9 min by 21:37Z: glaeda:run 612 -> 33684). load_spend drops
+# such a row, so a spend.json that holds one heals on the daemon's next save.
+SPEND_ROW_MAX = 5_000  # the whole pool's hour, in one minute of one key
+
+
 def load_spend(doc: Any) -> dict[int, dict[str, list[int]]]:
-    """SPEND_FILE's minutes, the well-formed rows only."""
+    """SPEND_FILE's minutes, the well-formed rows only (none past SPEND_ROW_MAX)."""
     minutes = doc.get("minutes") if isinstance(doc, dict) else None
     out: dict[int, dict[str, list[int]]] = {}
     for minute, rows in (minutes if isinstance(minutes, dict) else {}).items():
@@ -1972,7 +1980,8 @@ def load_spend(doc: Any) -> dict[int, dict[str, list[int]]]:
             continue
         for key, row in rows.items():
             if (isinstance(key, str) and isinstance(row, list) and len(row) == 3
-                    and all(isinstance(n, int) and not isinstance(n, bool) and n >= 0 for n in row)):
+                    and all(isinstance(n, int) and not isinstance(n, bool) and 0 <= n <= SPEND_ROW_MAX
+                            for n in row)):
                 out.setdefault(int(minute), {})[key] = list(row)
     return out
 
@@ -1994,6 +2003,24 @@ def no_login_reader(daemon: "Daemon") -> bool:
     """Whether DAEMON is a fallback reader with no login (fallback_no_login), so a read its App chain does not take
     returns DIRECT_NO_LOGIN before it is tried rather than failing inside the transport."""
     return getattr(daemon, "token_source", None) is fallback_no_login
+
+
+def spend_new(daemon: Any) -> dict[int, dict[str, list[int]]] | None:
+    """DAEMON's spend rows less those it read from SPEND_FILE when it was built (Daemon.spend_base): what this process
+    sent. A Daemon built outside the serving one starts from the whole of spend.json, so handing its whole spend to
+    spend_side_add folded the hour back in and doubled every row each run (SPEND_ROW_MAX)."""
+    spend = getattr(daemon, "spend", None)
+    if not spend:
+        return spend
+    base = getattr(daemon, "spend_base", None) or {}
+    out: dict[int, dict[str, list[int]]] = {}
+    for minute, rows in spend.items():
+        for key, row in rows.items():
+            was = (base.get(minute) or {}).get(key) or [0, 0, 0]
+            sent = [max(0, int(row[i]) - int(was[i])) for i in range(3)]
+            if any(sent):
+                out.setdefault(minute, {})[key] = sent
+    return out
 
 
 def spend_side_add(spend: dict[int, dict[str, list[int]]] | None) -> None:
@@ -7096,6 +7123,7 @@ class Daemon:
             if str(k).isdigit() and isinstance(v, int) and not isinstance(v, bool) and v > 0}
         # the spend log (SPEND_FILE): minute -> "bucket\troute\tkind\trepo" -> [requests, counted, points]
         self.spend: dict[int, dict[str, list[int]]] = load_spend(read_json(BASE / SPEND_FILE))
+        self.spend_base = {m: {k: list(r) for k, r in rows.items()} for m, rows in self.spend.items()}  # spend_new
         self.spend_saved_at = float("-inf")
         self.spend_dirty = False
         self.caller: tuple[str, ...] = ("other", "", "")  # what the request being sent is for (calling)
@@ -16105,7 +16133,7 @@ def land_direct_read_many(keys: list[str], budget: float = LAND_REFRESH_BATCH_BU
             why = f"{describe(failure)} at {error_site(failure)}"
             errors.update({k: why for k in todo if k not in errors})
         finally:
-            spend_side_add(getattr(daemon, "spend", None))
+            spend_side_add(spend_new(daemon))
     for k in todo:
         cached = read_cache(k) or {}
         if (cached.get("dataAt") or 0) >= daemon.now:
@@ -33056,7 +33084,7 @@ def straggler_get(repo: str, paths: list[str], budget: float = STRAGGLER_READ_BU
                     state, doc = "error", "out of time"
                 out[path] = doc if state == "fresh" else str(doc)
     finally:
-        spend_side_add(getattr(daemon, "spend", None))
+        spend_side_add(spend_new(daemon))
     return out
 
 
@@ -36021,7 +36049,7 @@ def _read_one(req: dict, used: list[bool] | None) -> str | None:
     finally:
         if broker is not None:
             direct_parts_save(daemon.repo_parts, daemon.now)
-        spend_side_add(getattr(daemon, "spend", None))
+        spend_side_add(spend_new(daemon))
     if error:
         return error
     cached = read_cache(key) or {}

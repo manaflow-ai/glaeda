@@ -27136,6 +27136,31 @@ class FallbackNeverOnLoginTest(Base):
         saved = gg.load_spend(gg.read_json(gg.BASE / gg.SPEND_FILE))
         self.assertTrue(any("gh-shim" in k for rows in saved.values() for k in rows), saved)
 
+    def test_a_fallback_reader_hands_back_only_what_it_sent_not_the_hour_it_read(self) -> None:
+        # 2026-11-27 21:28Z: rest_breakdown summed glaeda:outbox rows of 892775259368767916. Each Daemon built outside
+        # the serving one loaded spend.json, and the whole of it went back through spend-side.json: every row doubled
+        # each run. Now only the rows it sent go back; the serving daemon's counts rise by exactly those.
+        key = "rest\tPOST /repos/{owner}/{repo}/issues/{id}/comments\toutbox\to/r"
+        minute = int(self.daemon.clock() // 60)
+        self.daemon.spend = {minute: {key: [7, 7, 0]}}
+        self.daemon.spend_dirty = True
+        self.daemon.save_spend(force=True)
+        for _ in range(3):
+            reader = gg.Daemon(transport=self.gh, token=lambda: TOKEN, controller=None)
+            row = reader.spend.setdefault(minute, {}).setdefault(key, [0, 0, 0])
+            row[0] += 1
+            row[1] += 1
+            gg.spend_side_add(gg.spend_new(reader))
+            self.daemon.save_spend(force=True)
+        self.assertEqual(self.daemon.spend[minute][key], [10, 10, 0])
+        self.assertEqual(gg.load_spend(gg.read_json(gg.BASE / gg.SPEND_FILE))[minute][key], [10, 10, 0])
+
+    def test_a_spend_row_past_any_real_count_is_dropped_on_load(self) -> None:
+        doc = {"minutes": {"100": {"rest\tGET /x\toutbox\to/r": [892775259368767916, 892775259368767916, 0],
+                                   "rest\tGET /z\trun\to/r": [33684, 33684, 0],
+                                   "rest\tGET /y\trun\to/r": [4, 3, 0]}}}
+        self.assertEqual(gg.load_spend(doc), {100: {"rest\tGET /y\trun\to/r": [4, 3, 0]}})
+
     def test_a_direct_read_on_an_app_books_its_spend(self) -> None:
         class Fake:
             app_pool = object()
