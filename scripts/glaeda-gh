@@ -18227,6 +18227,10 @@ LAND_FORWARD_OPEN = frozenset({"queued", "waiting_after", "judging", "acting", "
 # 8.8 h, p90 15.5 h, p95 15.7 h, max 18.5 h; 45 of those 193 rows were still open. A shorter bound takes back rows
 # the far queue merges later (2 h would have taken back 87 % of those merges).
 LAND_FORWARD_HELD_BOUND = 16 * 3600.0
+# A far row "queued" (taken, never judged) that long is a full worker pool, not a judgment in progress: forward_stalled
+# takes it back, or hands it off again, at most this many times a PR, then the far host's own answer stands.
+LAND_FORWARD_STALLED = 900.0
+LAND_FORWARD_STALL_TAKES = 2
 
 
 # The give-up was the first time most old forwarded rows were looked at, and it read only the daemon's cache, which
@@ -19826,7 +19830,7 @@ class LandQueue:
                      stepTransient=None, handoffTransient=None, handoffFail=None,  # a land by hand counts afresh
                      lastStop=None,  # a land by hand is told its stop again (LAND_STOP_REPEAT)
                      unlabeled=None, unlabelFail=None,  # this land's own end takes the label off again (LAND_UNLABEL)
-                     forwardFirst=None, forwardStateFails=None, forwardStateAt=None)
+                     forwardFirst=None, forwardStateFails=None, forwardStateAt=None, forwardStalled=None)
             # its give-up clock (LAND_FORWARD_GIVE_UP) starts at its next forward; a land by hand may be re-landed again
             if not str(rid or "").startswith("forward-reland-"):
                 e.pop("forwardRelanded", None)
@@ -21417,6 +21421,8 @@ class LandQueue:
                       f"{far.get('reason') or 'it gave no reason'}",
                       str(far.get("next") or f"glaeda-gh land status {key_name(e['key'])} on {host}"), tell="quiet")
             return True
+        if st == "queued" and self.forward_stalled(e, row or {}, host, since, executor):
+            return True
         if st in LAND_FORWARD_OPEN:
             e["forwardHeld"] = {"at": float(answer.get("at") or self.now), "state": st}
             e.pop("forwardMissing", None)
@@ -21444,6 +21450,43 @@ class LandQueue:
                                 f"{self.now - since:.0f} s after its hand-off: handed off again")
             return True
         self.forward_lost(e, host, c, since)
+        return True
+
+    def forward_stalled(self, e: dict, row: dict, host: str, since: float, executor: bool) -> bool:
+        """Under the lock. A lane VM's row HOST's queue took ("queued") and has not judged for LAND_FORWARD_STALLED:
+        its worker pool is full, and the answer "held" ended nothing for hours (a held row has a 16 h bound,
+        LAND_FORWARD_HELD_BOUND). Taken back to be judged here (forward_reclaim), or, on a VM with no token pool of
+        its own, handed to the broker again (it may name the other peer), at most LAND_FORWARD_STALL_TAKES times a PR;
+        the requester is told as an fyi. True when it did either. cmuxterm-hq#32917, 2026-11-27: handed to
+        cmux-cp-2 at 12:16Z (no row there 17 min on), re-sent to cmux-cp-1, which held it "queued" and unjudged
+        (ten land-judge runs, load 23) from 12:33Z, and this side answered only forward_quiet: a notice, no action."""
+        if executor or not (e.get("handedOff") and self.broker_client() and self.handed_for_judgment(e)):
+            return False
+        stuck = max(float(row.get("updated") or 0), since)
+        if self.now - stuck < LAND_FORWARD_STALLED:
+            return False
+        stalls = e.get("forwardStalled") if isinstance(e.get("forwardStalled"), dict) else {}
+        n = int(stalls.get("n") or 0)
+        if n >= LAND_FORWARD_STALL_TAKES:
+            return False  # its far queue is the row's last word now: held, bounded by LAND_FORWARD_HELD_BOUND
+        head = str(e.get("pinSha") or (e.get("handedOff") or {}).get("head") or "").lower()
+        tokenless = self.tokenless()
+        if tokenless and not SHA40.fullmatch(head):
+            return False
+        mins = round((self.now - stuck) / 60)
+        why = f"{host}'s land queue has held it queued and unjudged for {mins} min"
+        e["forwardStalled"] = {"n": n + 1, "at": self.now, "host": host, "mins": mins}
+        log({"event": "land-forward-stalled", "key": e["key"], "to": host, "n": n + 1, "mins": mins})
+        if tokenless:
+            self.history(e, "forward_stalled", to=host, n=n + 1, mins=mins, how="handed off again")
+            self.hand_off_now(e, head, f"{why}: handed off again", "forward_resent")
+            how = "handed to the broker host's land queue again"
+        else:
+            self.history(e, "forward_stalled", to=host, n=n + 1, mins=mins, how="taken back")
+            self.forward_reclaim(e, host, why)
+            how = "taken back to be judged here"
+        self.notify(e, e.get("requester") or "", f"glaeda land: {self.url(e)} sat queued at {host} for {mins} min "
+                    f"without a judgment; {how}", cls=LAND_FORWARD_FYI_CLASS)
         return True
 
     def forward_lost(self, e: dict, host: str, c: dict, since: float) -> bool:

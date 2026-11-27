@@ -37055,6 +37055,41 @@ class LandTest(Base):
         self.assertEqual([c for c in self.w.sent()[sent:] if "--class" in c and c[c.index("--class") + 1] == "block"],
                          [], "no blocker for a PR the far queue merged")
 
+    def test_a_row_the_far_queue_holds_queued_and_unjudged_is_taken_back_and_its_requester_told(self):
+        # cmuxterm-hq#32917, 2026-11-27: cmux-cp-1 held it "queued" for 19 min under a full worker pool; the lane VM
+        # said only forward_quiet. Queued past LAND_FORWARD_STALLED it comes back, once told, at most twice a PR.
+        self.forwarded_row()
+        self.w.outcomes = {"o/r#1": {"state": "queued", "updated": self.t, "stop": None}}
+        sent = len(self.w.sent())
+        self.tick(gg.LAND_FORWARD_ASK_FIRST + 10)
+        self.tick(1)
+        e = self.q.entries[self.KEY]
+        self.assertEqual(e["state"], "forwarded", "inside the bound: the far queue may judge it yet")
+        self.w.outcomes = {"o/r#1": {"state": "queued", "updated": self.t - gg.LAND_FORWARD_STALLED - 1, "stop": None}}
+        for _ in range(3):
+            self.tick(gg.LAND_FORWARD_ASK_EVERY + 1)
+        e = self.q.entries[self.KEY]
+        self.assertEqual(e["forwardStalled"]["n"], 1, e["history"][-4:])
+        self.assertNotEqual(e["state"], "forwarded")
+        self.assertEqual(e["forwardReclaimed"]["from"], "huge-blue")
+        self.assertTrue([h for h in e["history"] if h.get("event") == "forward_stalled"])
+        told = [c for c in self.w.sent()[sent:] if "without a judgment" in c[-1]]
+        self.assertEqual(len(told), 1)
+        self.assertIn("taken back to be judged here", told[0][-1])
+
+    def test_a_queued_and_unjudged_row_of_a_tokenless_vm_is_handed_off_again_twice_then_held(self):
+        self.own_pool = False
+        self.forwarded_row()
+        self.w.outcomes = {"o/r#1": {"state": "queued", "updated": self.t - gg.LAND_FORWARD_STALLED - 1, "stop": None}}
+        for _ in range(8):
+            self.tick(gg.LAND_FORWARD_ASK_EVERY + 1)
+            self.w.outcomes = {"o/r#1": {"state": "queued", "updated": self.t - gg.LAND_FORWARD_STALLED - 1,
+                                         "stop": None}}
+        e = self.q.entries[self.KEY]
+        self.assertEqual((e["state"], e["forwardStalled"]["n"], len(self.handoffs())), ("forwarded",
+                         gg.LAND_FORWARD_STALL_TAKES, 1 + gg.LAND_FORWARD_STALL_TAKES), e["history"][-5:])
+        self.assertEqual(e["forwardHeld"]["state"], "queued")
+
     def test_a_broker_that_does_not_know_outcomes_leaves_the_row_forwarded(self):
         self.handed_off()
         self.w.outcomes = None
