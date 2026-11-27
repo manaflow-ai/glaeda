@@ -8689,7 +8689,8 @@ class Daemon:
             return False
         saved = item.get("appWriter")
         if saved is None:
-            return not (item.get("uncertain") or item.get("attempts"))  # a first send the login attempted stays its own
+            # A first send the login attempted stays its own until handoff_check looked and found it not there.
+            return not (item.get("uncertain") or item.get("attempts")) or bool(item.get("handoffChecked"))
         return saved not in APP_NON_POSTER_ROLES
 
     def poster_actor(self, item: dict) -> dict | None:
@@ -8854,6 +8855,15 @@ class Daemon:
                 continue
             if item.get("joinedInto") and self.post_member(path, item):
                 continue  # it goes out in (or went out with) its leader's comment: no request of its own
+            # A comment the login attempted (a throttle, a lost answer) moves to the poster pool once a look on an
+            # App finds it not there. cmux-cp-2, 2026-11-27 21:18Z: a router-review verdict on cmux#52386 the login
+            # sent into its secondary limit sat at the head of the outbox 25+ min, throttled twice, then held by the
+            # login's create pause, its lost-answer look refused on the login, while the poster Apps sat free.
+            if item.get("kind") == "comment" and not item.get("appWriter") and not item.get("handoffChecked") \
+                    and (item.get("uncertain") or item.get("attempts")) \
+                    and self.poster_due({**item, "uncertain": False, "attempts": 0}) \
+                    and self.handoff_check(path, item) == "done":
+                continue  # it had already landed: finished, never made twice
             actor = self.poster_actor(item)
             if actor:
                 pass  # a poster App: no pause, hold or spacing of the login's applies
@@ -8897,11 +8907,18 @@ class Daemon:
         """A create the login already tried (attempts, uncertain: a throttle, a 5xx) and that its pause now holds may
         move to the App of its purpose, but never blind: look first for the PR (open, for its head) or the issue (same
         title and body since queued) it would make. Found: finish it with that URL ("done"). The look got no answer:
-        keep the login ("wait"). Not there: mark handoffChecked so outbox_actor lets the App make it ("ok")."""
-        if item.get("kind") not in ("pr", "issue") or item.get("appWriter") or item.get("handoffChecked") \
+        keep the login ("wait"). Not there: mark handoffChecked so outbox_actor lets the App make it ("ok"). A comment
+        the login tried moves to the poster pool the same way (poster_due). The look goes on a poster App's token when
+        one is free (the login is paused or throttled, which is why the write is moving), else on the login."""
+        if item.get("kind") not in ("pr", "issue", "comment") or item.get("appWriter") or item.get("handoffChecked") \
                 or not (item.get("uncertain") or item.get("attempts")):
             return "ok"
-        found, answered = self.post_find(item, None)
+        looker = self.poster_for_repo(str(item["repo"])) if self.upstream() is None else None
+        if item["kind"] == "comment" and looker is None:
+            return "ok"  # no poster App free to make it: it stays the login's, looked up by post_one as before
+        found, answered = self.post_find(item, looker)
+        if not answered and looker is not None:
+            found, answered = self.post_find(item, None)
         if found:
             self.post_finish(path, item, url=found.get("html_url"), number=found.get("number"),
                              note="already made by the login's earlier send; found before moving it to its App")
@@ -8909,6 +8926,7 @@ class Daemon:
         if not answered:
             return "wait"
         item["handoffChecked"] = True
+        item["uncertain"] = False  # the look just answered "not there": post_one need not look again
         write_json(path, item)
         log({"event": "post-handoff-checked", "id": item["id"], "kind": item["kind"], "attempts": item.get("attempts")})
         return "ok"
