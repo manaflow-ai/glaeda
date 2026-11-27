@@ -214,6 +214,7 @@ class ArchiveTest(unittest.TestCase):
 
         class Entry:
             def __init__(self, entry): self.entry, self.name, self.path = entry, entry.name, entry.path
+            def __getattr__(self, attr): return getattr(self.entry, attr)  # is_dir, inode, ... as the real one
             def is_file(self, follow_symlinks=True): return self.entry.is_file(follow_symlinks=follow_symlinks)
             def stat(self, follow_symlinks=True):
                 if self.name in bad:
@@ -232,7 +233,14 @@ class ArchiveTest(unittest.TestCase):
         def restore():
             archive.os.scandir, archive.os.rename = real_scandir, real_rename
 
-        archive.os.scandir = lambda path: Listing(Entry(e) for e in real_scandir(path))
+        def scandir(path="."):
+            # archive.os is the os module itself: every other caller (tearDown's rmtree, which passes an fd) gets
+            # the real listing, and the cleanup that restores it runs only after tearDown
+            if not isinstance(path, (str, os.PathLike)) or Path(path) != self.archive:
+                return real_scandir(path)
+            return Listing(Entry(e) for e in real_scandir(path))
+
+        archive.os.scandir = scandir
         archive.os.rename = rename
         self.addCleanup(restore)
         return restore
