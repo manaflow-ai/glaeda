@@ -33224,6 +33224,66 @@ class LandTest(Base):
         e = self.tick()
         self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, merged))
 
+    def test_a_base_merge_push_that_timed_out_is_pushed_again_within_minutes(self):
+        # manaflow-ai/cmux#60119 and #60384, 2026-11-27 (LAND_UNION_PUSH_DEADLINE's comment): gh-quota held the
+        # update-branch ("queued", exit 0), the queue made the clean base merge itself, and its push timed out (124:
+        # the pre-push hook's pr-owner read ran past 120 s) with nothing sent. Both rows then waited out
+        # LAND_UPDATE_ONCE and stopped "update_branch_no_new_head: the update-branch sent at a35cc7bc612f 3778 s ago
+        # made no new head the queue could read; it is sent once per head". Now the same merge is pushed again once
+        # the head wait passes, and the land goes on at the new head, minutes after the send, not an hour.
+        head, base = self.queued_update_origin("goals/y.md")
+        real, pushes = self.w.run, []
+
+        def run(argv: list[str], timeout: float, env: dict) -> subprocess.CompletedProcess:
+            if argv[0] == "/fake/git" and "push" in argv:
+                pushes.append(timeout)
+                if len(pushes) == 1:  # the first push is killed at its deadline before anything reached origin
+                    return subprocess.CompletedProcess(argv, 124, "", "timed out")
+            return real(argv, timeout, env)
+        self.w.run = run
+        self.q = self.queue()
+        start = self.t
+        e = self.run_hour(lambda: refusal("tip_merge", head, {"kind": "update_branch", "expected_head_sha": head}),
+                          seconds=gg.LAND_HEAD_TIMEOUT + 120, step=30.0)
+        self.assertEqual(self.origin_git("rev-parse", "refs/heads/lane/x"), head)  # the timed-out push sent nothing
+        self.assertIn("union_merge_unknown", [h["event"] for h in e["history"]])
+        e = self.run_hour(lambda: refusal("tip_merge", head, {"kind": "update_branch", "expected_head_sha": head}),
+                          seconds=gg.LAND_HEAD_TIMEOUT + 120, step=30.0)
+        self.assertEqual((e["state"], e.get("stop")), ("waiting", None))
+        self.assertEqual(pushes, [gg.LAND_UNION_PUSH_DEADLINE] * 2)  # past the pre-push hook's 150 s cap
+        self.assertGreater(gg.LAND_UNION_PUSH_DEADLINE, 150)
+        merged = self.origin_git("rev-parse", "refs/heads/lane/x")
+        self.assertEqual(self.origin_git("rev-list", "--parents", "-n1", merged).split()[1:], [head, base])
+        self.assertIn("union_push_retry", [h["event"] for h in e["history"]])
+        self.assertLess(self.t - start, 3 * (gg.LAND_HEAD_TIMEOUT + 120))  # minutes, not LAND_UPDATE_ONCE
+        updates = [c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
+        self.assertEqual(len(updates), 1)
+        self.w.set_pr(self.KEY, {**land_pr(merged, parent=head), "headRefName": "lane/x", "baseRefName": "main"},
+                      self.t)
+        self.w.answers[:] = [ok_answer(merged)]
+        e = self.tick()
+        self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, merged))
+
+    def test_a_base_merge_push_that_never_answers_stops_naming_the_push_not_after_an_hour(self):
+        head, _ = self.queued_update_origin("goals/y.md")
+        real, pushes = self.w.run, []
+
+        def run(argv: list[str], timeout: float, env: dict) -> subprocess.CompletedProcess:
+            if argv[0] == "/fake/git" and "push" in argv:
+                pushes.append(timeout)
+                return subprocess.CompletedProcess(argv, 124, "", "timed out")
+            return real(argv, timeout, env)
+        self.w.run = run
+        self.q = self.queue()
+        start = self.t
+        e = self.run_hour(lambda: refusal("tip_merge", head, {"kind": "update_branch", "expected_head_sha": head}),
+                          seconds=gg.LAND_UPDATE_ONCE, step=30.0)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "update_branch_no_new_head"), e.get("stop"))
+        self.assertEqual(len(pushes), gg.LAND_UNION_PUSH_TRIES)
+        self.assertIn("each push timed out", e["stop"]["reason"])
+        self.assertIn("git merge origin/main", e["stop"]["next"])
+        self.assertLess(self.t - start, gg.LAND_UPDATE_ONCE / 2)
+
     def test_an_update_with_no_new_head_and_a_true_conflict_stops_conflict_with_its_hunks(self):
         head, _ = self.queued_update_origin("", attrs="docs/*.md merge=union\n")  # same file, no union: a conflict
         e = self.run_hour(lambda: refusal("tip_merge", head, {"kind": "update_branch", "expected_head_sha": head}),

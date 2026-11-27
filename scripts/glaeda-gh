@@ -17344,6 +17344,21 @@ LAND_READY_ONCE = "readySent"
 LAND_UNION_URL = "https://github.com/{repo}.git"
 LAND_MERGE_OWNERS = frozenset({"manaflow-ai", "teamleaderleo"})
 LAND_UNION_DEADLINE = 120.0
+# The push of a base merge this queue made (union_push) runs the host's pre-push hook, and leo-workspace
+# tools/git-hooks/pre-push gives pr-owner's GitHub read up to PR_OWNER_CAP (150 s) before it lets the push through: a
+# 120 s deadline (LAND_GH_DEADLINE) killed that push at 120 s whenever GitHub reads were slow. manaflow-ai/cmux#60119
+# and #60384 on air-blue, 2026-11-27: the update-branch was held by gh-quota (its content-pause authority on cmux-cp-1
+# did not answer) and answered exit 0 "queued", the queue made the clean base merge itself after LAND_HEAD_TIMEOUT, and
+# its push exited 124 at 120 s with nothing sent (union_merge_unknown); the row then waited out LAND_UPDATE_ONCE and
+# stopped "update_branch_no_new_head ... 3778 s ago" (4715 s for #60384), the base merge it had already tried counted
+# as done. A person pushed the same clean merge by hand and #60119 merged at once. Now the push has the hook's cap and
+# a margin, and a push that timed out is pushed again (the same commit: a fast-forward of the head, or nothing when it
+# did reach GitHub) once the head wait after it (LAND_HEAD_TIMEOUT) passes with no new head, LAND_UNION_PUSH_TRIES in
+# all; only then does it stop, naming the push. Detector: test-glaeda-gh.py
+# test_a_base_merge_push_that_timed_out_is_pushed_again_within_minutes.
+LAND_UNION_PUSH_DEADLINE = 240.0
+LAND_UNION_PUSH_TRIES = 2
+
 # LAND_UNION_ONE_KEY: a union merge of two sides that each rewrote one frontmatter line keeps both lines. goals/*.md
 # merge by union for their dated notes (cmuxterm-hq .gitattributes), and on 2026-11-27 goals/ci-min-per-pr-140.md
 # reached cmuxterm-hq main with three `next_step:` lines, so test_now_goals.test_repo_records_parse went red (hq#32408
@@ -26552,7 +26567,7 @@ class LandQueue:
         sha = (commit.stdout or "").strip()
         if commit.returncode != 0 or not SHA40.fullmatch(sha):
             return "", "", "", f"git commit-tree failed: {land_trim(commit.stderr, 160)}"
-        e["unionMerge"].update(paths=paths[:20], base=base_sha, baseRef=base, gitdir=gitdir)
+        e["unionMerge"].update(paths=paths[:20], base=base_sha, baseRef=base, gitdir=gitdir, branch=branch)
         return sha, branch, base_sha, ""
 
     def union_one_key(self, gitdir: str, tree: str, paths: list[str], head: str, base: str) -> tuple[str, str]:
@@ -26636,8 +26651,16 @@ class LandQueue:
                 self.history(e, "union_merge_skipped", head=head[:12], why=land_trim(why, 200))
                 self.conflict_stop(e, kind, head, said, why, tried)
             return
+        self.union_push(e, head, sha, branch, base_sha, kind, said)
+
+    def union_push(self, e: dict, head: str, sha: str, branch: str, base_sha: str, kind: str, said: str) -> None:
+        """Push SHA, the base merge union_plan made on top of HEAD, to the PR's BRANCH and wait for the new head
+        (LAND_UNION_PUSH_DEADLINE's comment). A push that timed out is recorded in e["updateSent"]["union"], so
+        update_branch pushes it again after the head wait instead of waiting out LAND_UPDATE_ONCE."""
         gitdir = str(e["unionMerge"]["gitdir"])
         with self.lock:
+            tries = int((e.get("unionMerge") or {}).get("pushTries") or 0) + 1
+            e["unionMerge"].update(merge=sha, branch=branch, pushTries=tries)
             self.claim(e, "update_branch", before=head, form="union_merge", merge=sha)
             e["updateSent"] = {"head": head, "at": self.now}
             self.save(e)
@@ -26645,16 +26668,17 @@ class LandQueue:
             # The broker pushes only a branch this lane pushed before: another lane's PR is refused, and stops below.
             argv = [self.path("laneGh", Path(LANE_GH_CMD)).as_posix(), "push", e["repo"], branch, "--base",
                     str(e["unionMerge"].get("baseRef") or ""), "--rev", sha, "--dir", gitdir]
-            got = self.call(argv, LAND_GH_DEADLINE, e)
+            got = self.call(argv, LAND_UNION_PUSH_DEADLINE, e)
         else:  # a plain push: refused by GitHub unless the branch is still at HEAD (the merge's first parent)
             got = self.union_git(gitdir, "push", "--quiet", "origin", f"{sha}:refs/heads/{branch}",
-                                 timeout=LAND_GH_DEADLINE)
+                                 timeout=LAND_UNION_PUSH_DEADLINE)
         with self.lock:
             self.finish(e, got)
             e["preStepHead"] = head if got.returncode == 0 else ""
             self.nudge(e["key"])
             if got.returncode == 124:  # sent, unanswered: it may have reached GitHub (push_step keeps it sent too)
-                self.history(e, "union_merge_unknown", head=head[:12], merge=sha[:12])
+                e["updateSent"].update(union=sha, branch=branch, base=base_sha, tries=tries)
+                self.history(e, "union_merge_unknown", head=head[:12], merge=sha[:12], tries=tries)
                 self.wait(e, {"kind": "head_change", "before": head, "since": self.now}, LAND_HEAD_TIMEOUT)
                 return
             if got.returncode != 0:
@@ -27289,6 +27313,33 @@ class LandQueue:
             return ""
         return f"its override names {', '.join(sorted(named)[:6])}, none of the PR's {len(files)} changed files"
 
+    def union_push_again(self, e: dict, head: str, sent: dict, waited: float) -> None:
+        """LAND_UNION_PUSH_DEADLINE's comment: this queue's push of its base merge at HEAD timed out and the head wait
+        after it passed with no new head. Push the same merge again, LAND_UNION_PUSH_TRIES in all; then stop, naming
+        the push and the hand command, never waiting out LAND_UPDATE_ONCE on it."""
+        repo, number = e["repo"], str(e["number"])
+        sha, branch = str(sent.get("union") or ""), str(sent.get("branch") or "")
+        tries = int(sent.get("tries") or 1)
+        tried = e.get("unionMerge") or {}
+        gitdir = str(tried.get("gitdir") or "")
+        kind = str(tried.get("kind") or "update_branch")
+        have = bool(gitdir) and self.union_git(gitdir, "cat-file", "-e", f"{sha}^{{commit}}").returncode == 0
+        if tries < LAND_UNION_PUSH_TRIES and have and branch:
+            with self.lock:
+                self.history(e, "union_push_retry", head=head[:12], merge=sha[:12], waited=round(waited),
+                             why="the push of the base merge timed out and no new head showed: pushed again")
+                self.save(e)
+            self.union_push(e, head, sha, branch, str(sent.get("base") or ""), kind, str(tried.get("out") or ""))
+            return
+        with self.lock:
+            self.stop(e, "update_branch_no_new_head",
+                      f"the base merge {sha[:12]} this queue made on {head[:12]} (git merges the base cleanly) was "
+                      f"pushed {tries} time(s) and each push timed out after {LAND_UNION_PUSH_DEADLINE:.0f} s; "
+                      f"{waited:.0f} s after the last one the head is still {head[:12]}"
+                      + ("" if have else f" (the merge commit is gone from {gitdir or 'the union mirror'})"),
+                      f"gh pr checkout {number} -R {repo}; git merge origin/{tried.get('baseRef') or '<its base>'}; "
+                      f"git push; then glaeda-gh land {repo}#{number} --sha <the new head>")
+
     def update_local_due(self, e: dict, head: str) -> bool:
         """LAND_UPDATE_LOCAL's comment: whether the local base merge is still to be tried at HEAD (once per head)."""
         tried = e.get("unionMerge") or {}
@@ -27344,6 +27395,9 @@ class LandQueue:
             # it makes; with none by the bound, stop and say so.
             waited = self.now - float(sent.get("at") or 0)
             if sent.get("answered") and self.update_noop(e, head, sent, waited):
+                return
+            if sent.get("union") and waited >= LAND_HEAD_TIMEOUT:
+                self.union_push_again(e, head, sent, waited)
                 return
             with self.lock:
                 if waited >= LAND_UPDATE_ONCE:
