@@ -39099,6 +39099,24 @@ class LandTest(Base):
         self.assertIsNone(gg.LAND_STEP_QUOTA.search("To have the pull request merged after all the requirements "
                                                     "have been met, add the --auto flag"))
 
+    def test_a_lane_vm_update_branch_is_not_held_by_the_logins_create_pause(self):
+        # On a lane VM the update-branch goes to the broker's land tool, which no create pause holds (the shim admits
+        # it: gh_quota.py broker_lands). The queue's own read of the pause held it anyway: 39 of 85 base_update
+        # update-branches in a day on one lane VM were step_held. Sent now; a retarget is still held.
+        self.broker = True
+        self.q = self.queue()
+        self.latch_dir.mkdir(parents=True, exist_ok=True)
+        (self.latch_dir / "content-gate.json").write_text(json.dumps({"blocked_until": self.t + 45, "level": 1}))
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("tip_merge", LA, {"kind": "update_branch", "expected_head_sha": LA}))
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("pr", "update-branch"),
+                         [["pr", "update-branch", "1", "-R", "o/r", "--land", "--match-head-commit", LA]])
+        self.assertNotIn("step_held", [h["event"] for h in e["history"]])
+        self.assertFalse(e.get("stepQuotaParked"))
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"))
+
     def test_the_login_create_pause_holds_a_step_unsent_and_it_goes_after(self):
         # one lane VM, 2026-11-25 17:11Z: five `gh pr update-branch N --land ...` from this executor were refused
         # "content writes are paced until reset (60s ...)", each a refusal row on the fleet's paced count (goal

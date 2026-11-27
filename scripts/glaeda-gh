@@ -26453,7 +26453,12 @@ class LandQueue:
                 self.stop(e, "no_shim", f"no gh-quota shim at {self.path('gh', LAND_GH)}; {kind} is not sent around it",
                           "install the gh-quota shim (tools/host-baseline) or set gh in ~/.config/glaeda/land.json")
             return
-        if self.held_by_create_pause(e, kind, head):
+        if not (kind == "update_branch" and self.broker_client()) and self.held_by_create_pause(e, kind, head):
+            # A lane VM's update-branch is the broker's pinned land tool (land_update_branch_args' --land form): the
+            # shim never pauses it there (gh_quota.py broker_lands), as the merge below is never held on a broker
+            # client. Read against the login's pause here, it held the update the shim would have sent: one lane VM,
+            # 2026-11-26 13:35Z to 2026-11-27 13:35Z, 39 of 85 base_update update-branches step_held, each parked for
+            # the pause's length. A retarget (`pr edit`) is still paced by the shim, so it is still held.
             return
         with self.lock:
             self.claim(e, kind, before=head, **extra)  # may raise LandCancelled (draining, a newer land): nothing sent
