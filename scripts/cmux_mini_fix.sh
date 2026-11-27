@@ -70,9 +70,9 @@ host_held() {
 
 held_refuse() { say "held: $*, skipped" >&2; exit 20; }
 
-host_check() {  # exit 0 when the host is free, 20 (and why on stdout) when it is held
+host_check() {  # [reservation]: exit 0 when the host is free, 20 (and why on stdout) when it is held
   local why
-  if why=$(host_held); then say "held: $why"; exit 20; fi
+  if why=$(host_held "${1:-all}"); then say "held: $why"; exit 20; fi
   say "free"
 }
 

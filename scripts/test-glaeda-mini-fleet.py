@@ -4187,7 +4187,7 @@ class RepairTests(unittest.TestCase):
         code, out, calls = run_command({"build-mini-1": on_candidate()}, "--yes", command="repair",
                                        manifest=self.manifest, after=after)
         self.assertEqual(code, 0, out)
-        order = ("lock; glaeda_sync " + "d" * 40, "candidate_check", "lock reservation; runner_hold 2400", "host_check",
+        order = ("lock reservation; glaeda_sync " + "d" * 40, "candidate_check", "lock reservation; runner_hold 2400", "host_check",
                  ENROLL, "lock none; runner_release")
         self.assertEqual([next(k for k in order if k in remote_call(c[1])) for c in calls], list(order))
         enroll = calls_to(calls, ENROLL)[0]
@@ -4346,7 +4346,7 @@ class UpgradeTests(unittest.TestCase):
         code, out, calls, _ = self.upgrade(fleet, "--yes", "--glaeda-ref", "e" * 40, after=after)
         self.assertEqual(code, 0, out)
         syncs = [remote_call(c[1]) for c in calls_to(calls, "glaeda_sync")]
-        self.assertEqual(syncs, ["lock; glaeda_sync " + " ".join(["e" * 40, *mf.ENROLL_FLAGS])] * 2)
+        self.assertEqual(syncs, ["lock reservation; glaeda_sync " + " ".join(["e" * 40, *mf.ENROLL_FLAGS])] * 2)
         # A blocking unknown still blocks when the old checkout is the only failure.
         unknown = {h: re.sub(r"pf_pmset\t.*\n", "", text) for h, text in fleet.items()}
         code, out, calls, _ = self.upgrade(unknown)

@@ -3153,7 +3153,10 @@ FIX_NEEDS = {"metal": ("licence", "launch"), "ios_runtime": ("licence", "launch"
 READ_ONLY_FUNCTIONS = {"candidate_check", "share_have", "share_source", "share_send", "host_check", "host_drain"}
 # Steps that honor less of the host gate than the default (both the fleet host lock and reservations):
 # a drain waits out the job holding the lock, and restoring runners never builds anything.
-LOCK_GATE = {"runner_hold": "reservation", "ios_runtime": "reservation", "runner_release": "none", "runner_kick": "none"}
+# glaeda_sync and candidate_place write files no running job reads (~/glaeda, the staged candidate archive): a class
+# receipt adoption runs them beside the lent worker's host.lock (it never frees on a busy lent mini), reservations hold.
+LOCK_GATE = {"runner_hold": "reservation", "ios_runtime": "reservation", "runner_release": "none", "runner_kick": "none",
+             "glaeda_sync": "reservation", "candidate_place": "reservation"}
 SUDO_ORDER = ("select", "licence", "first_launch", "power", "autoupdate", "homebrew", "brew", "python_link")
 # Homebrew itself comes from a git fetch, never the brew.sh installer: that stalls on the Command Line Tools
 # softwareupdate the fleet does not need (the pinned Xcode is selected) and leaves an empty /opt/homebrew.
@@ -4721,7 +4724,7 @@ def held_or(code: int, log_path: Path | None, what: str) -> str:
 
 def renew_one(manifest: dict[str, Any], name: str, result: dict[str, Any], candidate: dict[str, str], glaeda_ref: str,
               receipt: tuple[str, str, bytes] | None, log_path: Path, seed: str | None = None,
-              force_class_relink: bool = False) -> tuple[bool, str, str]:
+              force_class_relink: bool = False, beside_lock: bool = False) -> tuple[bool, str, str]:
     """Move one enrolled host onto the pinned candidate; (ok, step reached, detail).
 
     sync: ~/glaeda to glaeda_ref (glaeda-mini-enroll --renew and the staging verifier come from it).
@@ -4751,14 +4754,16 @@ def renew_one(manifest: dict[str, Any], name: str, result: dict[str, Any], candi
             step("relink: quarantine the current enrollment before class adoption")
             enrollment = "~/.config/glaeda/cmux-fleet/enrollment.json"
             transition = " ".join(remote_word(value) for value in (
-                "~/glaeda/scripts/cmux_fleet.py", "transition-apply", enrollment,
+                host_python(result), "~/glaeda/scripts/cmux_fleet.py", "transition-apply", enrollment,
                 "--to", "quarantined", "--reason", "stale_glaeda_generation"))
             code = routed_ssh_stream(name, user, transition, log, timeout=120, options=route)
             if code:
                 routed_fix_call(name, user, "runner_release", ["if-eligible"], log, 300, route)
                 return False, "relink", f"could not quarantine the current enrollment: {last_line(log_path)}"
         command = enroll_command(manifest, name, result, candidate, False, receipt[:2] if receipt else None, renew=True)
-        code = routed_fix_call(name, user, "host_check", [], log, 120, route)  # the drain may have waited long; ask again
+        # The drain may have waited long; ask again. A class receipt adoption beside the lent worker asks for
+        # reservations only: the host.lock it never frees is not what this file write needs.
+        code = routed_fix_call(name, user, "host_check", ["reservation"] if beside_lock else [], log, 120, route)
         if code:
             routed_fix_call(name, user, "runner_release", ["if-eligible"], log, 300, route)
             return False, "renew", held_or(code, log_path, "could not check the host lock and reservation")
@@ -4842,6 +4847,10 @@ def onboard_run(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, s
         record(name, f"{mode}: gate (the fleet host lock and reservation)" + (", waiting" if wait and yes else ""))
     # A held host (another build's fleet host lock, or a reservation) is skipped, and the run exits 1.
     held = gate_hosts(manifest, targets, wait and yes, drains=drains)
+    # Class mode: a host only the fleet host lock holds (a lent worker never frees it) stays through preflight; it
+    # continues only when its one need is adopting the class receipt (a file write), else it is skipped as held below.
+    beside = {h: why for h, why in held.items() if acceptance == "class" and why.startswith(BUSY_HOST_LOCK)}
+    held = {h: why for h, why in held.items() if h not in beside}
     rows.update({h: new_row(manifest, h, f"held: {why}, skipped", step="gate") for h, why in held.items()})
     for name in targets:
         record(name, f"gate: held: {held[name]}, skipped" if name in held else "gate: free; preflight")
@@ -4893,6 +4902,9 @@ def onboard_run(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, s
             if needs[name] == "ok" and missing_class_acceptance(manifest, name, results[name]):
                 needs[name] = "renew"
                 class_relinks.add(name)
+    for name in list(live):
+        if name in beside and name not in class_relinks:
+            settle(name, "gate", f"held: {beside[name]}, skipped")
     for name in list(live):
         if needs[name] == "enroll" and mode == "repair":
             settle(name, "enroll", f"not enrolled: glaeda-mini-fleet onboard {name} --yes")
@@ -5012,7 +5024,7 @@ def onboard_run(manifest: dict[str, Any], wanted: list[str] | None, yes: bool, s
             return lambda: _enroll_one(manifest, name, results[name], candidate, acceptance == "class", logs[name],
                                        receipts.get(name))
         return lambda: renew_one(manifest, name, results[name], candidate, glaeda_ref, receipts.get(name),
-                                 logs[name], seed, name in class_relinks)
+                                 logs[name], seed, name in class_relinks, name in beside)
 
     outcomes = run_with_heartbeat({h: enroll_task(h) for h in fresh + stale}, logs, "enroll", heartbeat) \
         if fresh or stale else {}
