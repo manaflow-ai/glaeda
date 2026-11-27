@@ -717,6 +717,11 @@ class Base(unittest.TestCase):
         # The land pool is sized from the host's cores (land_worker_ceiling): pinned to 8 here, so a suite on any
         # runner sizes as one 8-core host (4 workers); the load is reported only, pinned unknown, and the free RAM and
         # CPU unreported (headroom_left admits; the pool's count holds).
+        # The waited-PR pool reads through its own Daemon (land_direct_read_many), past these tests' fakes of
+        # batched and fetch: off here, and the pool's own tests turn it back on.
+        pool_off = mock.patch.object(gg, "WAITED_POOL_WORKERS", 0)
+        pool_off.start()
+        self.addCleanup(pool_off.stop)
         for name, value in (("land_cores", 8), ("land_load_per_core", None), ("land_mem_available", None),
                             ("land_cpu_free", None)):
             pin = mock.patch.object(gg, name, return_value=value)
@@ -10440,6 +10445,68 @@ class TickBudgetTest(Base):
             self.daemon.tick(NOW)
         order = next(keys for keys in seen if keys and keys[0].startswith("pr:"))
         self.assertEqual(set(order[:2]), cheap, order)
+
+    def test_many_waited_prs_are_read_by_a_bounded_pool_beside_the_serial_reads(self) -> None:
+        """The land host, 2026-11-27: ~330 waited PRs read one query at a time stored 22-50 a window. From WAITED_POOL_MIN
+        due, workers read up to WAITED_POOL_WORKERS chunks of WAITED_POOL_CHUNK beside the tick; the serial read gets the
+        rest and a key a worker could not read is deferred, not lost."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800}}
+        total = gg.WAITED_POOL_MIN + 4
+        for n in range(1, total + 1):
+            gg.register(f"pr:o/r#{n}", waited=True)
+        self.daemon.paths = {**self.daemon.paths, "pr": "graphql"}
+        pooled: list[list[str]] = []
+        serial: list[str] = []
+
+        def many(keys, budget=gg.LAND_REFRESH_BATCH_BUDGET):
+            pooled.append(list(keys))
+            return {k: (None if k.endswith("#1") else "no data stored") for k in keys}
+
+        def batched(kind, entries, fetch, until=None, pr_timeout_rest=None):
+            serial.extend(e["key"] for e in entries)
+            return []
+        with mock.patch.object(gg, "land_direct_read_many", side_effect=many), \
+                mock.patch.object(gg, "WAITED_POOL_WORKERS", 3), \
+                mock.patch.object(self.daemon, "oldest_waited_age", return_value=gg.WAITED_POOL_STALE_S + 1), \
+                mock.patch.object(self.daemon, "batched", side_effect=batched):
+            self.daemon.tick(NOW)
+        self.assertEqual(len(pooled), 1, pooled)
+        self.assertLessEqual(len(pooled[0]), gg.WAITED_POOL_CHUNK)
+        self.assertEqual(len(pooled[0]), total, "all of them fit one worker's chunk")
+        self.assertEqual(serial, [], "what a worker took is not read twice")
+        self.assertNotIn("pr:o/r#1", self.daemon.deferred)
+        self.assertIn("pr:o/r#2", self.daemon.deferred)
+
+    def test_the_waited_pool_waits_until_the_serial_reads_fall_behind(self) -> None:
+        """cmux-cp-2, 2026-11-27: the pool is the heal for stale waited PR data, so it starts only once the oldest waited
+        PR's data is WAITED_POOL_STALE_S old; while the serial reads keep up (fresh watches here) they read them all."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800}}
+        total = gg.WAITED_POOL_MIN + 4
+        for n in range(1, total + 1):
+            gg.register(f"pr:o/r#{n}", waited=True)
+        self.daemon.paths = {**self.daemon.paths, "pr": "graphql"}
+        pooled: list[list[str]] = []
+        serial: list[str] = []
+
+        def many(keys, budget=gg.LAND_REFRESH_BATCH_BUDGET):
+            pooled.append(list(keys))
+            return {k: None for k in keys}
+
+        def batched(kind, entries, fetch, until=None, pr_timeout_rest=None):
+            serial.extend(e["key"] for e in entries)
+            return []
+        with mock.patch.object(gg, "land_direct_read_many", side_effect=many), \
+                mock.patch.object(gg, "WAITED_POOL_WORKERS", 3), \
+                mock.patch.object(self.daemon, "batched", side_effect=batched):
+            self.daemon.tick(NOW)
+        self.assertEqual(pooled, [], "fresh data: no pool")
+        self.assertEqual(len([k for k in serial if k.startswith("pr:")]), total, serial)
+        old = {"key": "pr:o/r#1", "cache": {"dataAt": NOW - 900}}
+        with mock.patch.object(self.daemon, "waited", return_value=True):
+            self.daemon.now = NOW
+            self.assertGreaterEqual(self.daemon.oldest_waited_age([old]), 900)
 
     def test_an_asked_head_with_no_answer_is_read_past_a_spent_share_while_graphql_is_stopped(self) -> None:
         """huge-blue 2026-11-20 14:2xZ: the daemon's REST share spent (137 of 150), GraphQL at 0, the login 2129 REST

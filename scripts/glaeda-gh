@@ -340,6 +340,7 @@ from __future__ import annotations
 import argparse
 import base64
 import calendar
+import concurrent.futures
 from collections import Counter, deque
 import contextlib
 import datetime as dt
@@ -676,6 +677,21 @@ RESUME_MAX = 300.0
 # follow have at least HEADS_MIN_SHARE s, so neither kind starves the other. A head's own read stays bounded by
 # REST_HEAD_BUDGET from the tick's start.
 HEADS_MIN_SHARE = 20
+# The waited PR reads run beside the tick's own serial ones. The land host, 2026-11-27: ~330 waited PRs at 1.5-4 s a full
+# read, read one query at a time, stored 22-50 a 600 s window and staleWaited.pr was 4,889 s: no order fits them in
+# the window. Past WAITED_POOL_MIN due waited PRs, up to WAITED_POOL_WORKERS workers each read WAITED_POOL_CHUNK of
+# one repository's (land_direct_read_many: probes first, a full read only where the fingerprint moved; its own Daemon,
+# the GraphQL routing and App chunks of batched()), for at most WAITED_POOL_BUDGET seconds, while the tick reads the rest.
+WAITED_POOL_MIN = 12
+WAITED_POOL_WORKERS = 3
+WAITED_POOL_CHUNK = 30
+WAITED_POOL_BUDGET = 50.0
+# ... and only once the serial reads fall behind: the oldest waited PR's data past WAITED_POOL_STALE_S (half the stale
+# bound, so the pool starts before NOW's red at STALE_DATA_AFTER and stops once the serial reads keep up again). cmux-cp-2,
+# 2026-11-27: 85-117 waited PRs, 54 stored a 600 s window (read pr 377.6 s of 531.6 s, ~7 s a PR), staleWaited.pr
+# 2,740-4,746 s all day from 06:30Z while the land-judge App pool had 9,303 of 12,500 left: not quota, the one serial
+# read loop. The staleness the stale alarm reports is what starts the pool: the alarm's cause is healed, not only said.
+WAITED_POOL_STALE_S = 300.0  # STALE_DATA_AFTER (600, defined below) / 2
 WAITED_TICK_SHARE = TICK_BUDGET - HEADS_MIN_SHARE
 REST_HEAD_BUDGET = 40  # seconds of a tick's REST phase the waited heads may take while a waited PR or run is still to read:
 # past it those heads are deferred (first next tick), so the PRs a wait is blocked on get the rest of the tick
@@ -9882,6 +9898,60 @@ class Daemon:
                     best, best_age = e, age
         return best
 
+    def start_waited_pool(self, waited: list[dict]) -> tuple[list[concurrent.futures.Future], list[dict]]:
+        """(futures, the entries handed to them): the oldest-first WAITED of one repository each worker, started now.
+        Nothing while fewer than WAITED_POOL_MIN are due, while the oldest one's data is under WAITED_POOL_STALE_S (the
+        serial reads keep up), or when this host reads through an upstream."""
+        if len(waited) < WAITED_POOL_MIN or WAITED_POOL_WORKERS < 1 or upstream_command() is not None:
+            return [], []
+        age = self.oldest_waited_age(waited)
+        if age < WAITED_POOL_STALE_S:
+            return [], []
+        self.waited_pool_why = f"oldest waited PR data {int(age)}s old (pool from {int(WAITED_POOL_STALE_S)}s)"
+        by_repo: dict[str, list[dict]] = {}
+        for e in waited:
+            by_repo.setdefault("/".join(split_key(e["key"])[1:3]).lower(), []).append(e)
+        chunks: list[list[dict]] = []
+        for group in sorted(by_repo.values(), key=len, reverse=True):
+            for i in range(0, len(group), WAITED_POOL_CHUNK):
+                chunks.append(group[i:i + WAITED_POOL_CHUNK])
+        chunks.sort(key=lambda g: min(self.deferred_since.get(e["key"], self.now) for e in g))
+        chunks = chunks[:WAITED_POOL_WORKERS]
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(chunks), thread_name_prefix="waited-pr")
+        futures = [pool.submit(land_direct_read_many, [e["key"] for e in g], WAITED_POOL_BUDGET) for g in chunks]
+        pool.shutdown(wait=False)
+        return futures, [e for g in chunks for e in g]
+
+    def finish_waited_pool(self, futures: list[concurrent.futures.Future], handed: list[dict]) -> None:
+        """Wait for the workers (their own budget bounds them), then put back for the serial read any entry one could not
+        read, so a refusal or a fault costs nothing the tick would have read."""
+        done: dict[str, str | None] = {}
+        for f in futures:
+            try:
+                done.update(f.result(timeout=WAITED_POOL_BUDGET + 15))
+            except Exception as error:  # noqa: BLE001  a worker's fault is the serial path's to cover
+                self.errors.append(f"waited pool: {describe(error)} at {error_site(error)}")
+        failed = [e for e in handed if done.get(e["key"], "unread") is not None]
+        log({"event": "waited-pool", "why": getattr(self, "waited_pool_why", None), "handed": len(handed),
+             "read": len(handed) - len(failed),
+             "failed": Counter(str(done.get(e["key"], "unread"))[:80] for e in failed).most_common(3)})
+        self.defer(failed)  # first next tick, oldest deferral first
+
+    def oldest_waited_age(self, entries: list[dict]) -> float:
+        """Seconds the oldest data of a waited, unfinished PR among ENTRIES is old (starved_lead's measure, no floor):
+        0.0 when none. Data never stored counts from the watch's start."""
+        since = getattr(self, "since", {}) or {}
+        oldest = 0.0
+        for e in entries:
+            if not e["key"].startswith("pr:") or not self.waited(e):
+                continue
+            c = e.get("cache") or {}
+            if terminal("pr", c.get("data")):
+                continue
+            seen = c.get("dataAt") if isinstance(c.get("dataAt"), (int, float)) else since.get(e["key"], self.now)
+            oldest = max(oldest, self.now - seen)
+        return oldest
+
     def starved_lead(self, entries: list[dict]) -> dict | None:
         """The waited, unfinished PR or run among ENTRIES with the oldest data, when that is past STALE_DATA_AFTER
         (rest_order's floor), else None. Data never stored counts from the watch's start (self.since)."""
@@ -10512,6 +10582,12 @@ class Daemon:
         if waited_due:  # the waited share: no new waited or plain batch starts past it, the heads keep their minimum
             until_of.update({k: tick_start + WAITED_TICK_SHARE for k in ("pr", "run", "comment")})
         self.head_until = until_of["head"]  # and the looks between the batches (heads_between) keep it too
+        pool_futures: list[concurrent.futures.Future] = []
+        pool_handed: list[dict] = []
+        if over["pr"] == "graphql" and self.mode("graphql") != "stop":
+            pool_futures, pool_handed = self.start_waited_pool(blocked["pr"])
+            handed_keys = {e["key"] for e in pool_handed}
+            blocked["pr"] = [e for e in blocked["pr"] if e["key"] not in handed_keys]
         # waited PRs, runs and comments first, the heads after (they went first and took 44 of 85 s)
         for kind in sorted(kinds[first:] + kinds[:first], key=lambda k: k == "head"):
             if over[kind] != "graphql":
@@ -10535,6 +10611,8 @@ class Daemon:
                 # the blocked heads go first, within the heads' share while a waited PR or run is due (REST_HEAD_BUDGET)
                 read_batches(kind, blocked[kind], until_of.get(kind))
                 self.post_between()
+        if pool_futures:
+            self.finish_waited_pool(pool_futures, pool_handed)
         self.gql_paced = None
         sent = len(self.gql_log)
         paced_sent = False  # whether the kind the ceiling held had sent a query of its own first, this tick
@@ -15740,7 +15818,7 @@ def land_read_keeps_rollups(daemon: "Daemon", keys: list[str]) -> None:
     daemon.rollup_wanted = lambda: wanted  # type: ignore[method-assign]
 
 
-def land_direct_read_many(keys: list[str]) -> dict[str, str | None]:
+def land_direct_read_many(keys: list[str], budget: float = LAND_REFRESH_BATCH_BUDGET) -> dict[str, str | None]:
     """Read KEYS (PRs of one repository) from GitHub in batches, stored in the cache as land_direct_read stores one:
     {key: None, or why it could not}. A host with no login of its own (an upstream or broker host) reads each alone,
     as before: its reads go through the broker's REST GETs, which take one PR each."""
@@ -15757,7 +15835,7 @@ def land_direct_read_many(keys: list[str]) -> dict[str, str | None]:
         return {k: DIRECT_QUOTA for k in keys}
     daemon.charge_rest = lambda minute, n: None  # type: ignore[method-assign]  (as _read_one: never write rest-spend)
     daemon.now = time.time()
-    daemon.tick_deadline = time.monotonic() + LAND_REFRESH_BATCH_BUDGET
+    daemon.tick_deadline = time.monotonic() + budget
     out: dict[str, str | None] = {}
     todo = []
     for k in keys:
