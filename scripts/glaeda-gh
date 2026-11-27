@@ -17518,7 +17518,7 @@ LAND_REARM_CAP = 3
 # equivalent. Skipped where nothing is owed: a PR whose cached state is MERGED or CLOSED, and the codes that are not
 # the requester's to act on. Detector: test-glaeda-gh.py
 # test_a_stop_that_never_rearms_still_reaches_its_owner.
-LAND_OWNER_REMIND_SKIP = re.compile(r"^(?:closed|cancelled|merged|teammate|machine_hold)$")
+LAND_OWNER_REMIND_SKIP = re.compile(r"^(?:closed|cancelled|merged|teammate|machine_hold|review_required)$")
 LAND_OWNER_REMIND_EVERY = 21600.0
 # LAND_OWNER_REMIND_BACKOFF: "2 a UTC day" never ended, so a row nobody acts on was reminded for as long as LAND_KEEP
 # kept it. gcp-codex-lane-11, 2026-11-26 04:43Z, its first night: four rows that could never land were reminded, among
@@ -17553,6 +17553,26 @@ LAND_OWNER_REMIND_READ_WAIT = 1800.0
 # test_a_stopped_row_whose_pr_merged_or_closed_elsewhere_is_read_and_ends.
 LAND_STOPPED_OVER_CODES = frozenset({"closed", "cancelled", "merged"})
 LAND_STOPPED_READ_EVERY = LAND_OWNER_REMIND_EVERY
+# LAND_REVIEW_REQUIRED: a merge GitHub refuses because the base's ruleset wants an approving review the PR lacks is not
+# a refusal a retry can answer, and not the requester's to clear: a person with write access approves the head. Under
+# the release-candidate freeze (feat-cmux-next ruleset, one approving review) that person is Leo, who reads and stamps
+# each PR himself (Leo, 2026-11-27: "we just need some way to ack that at least ive seen what's happened"; "am
+# personally stamping thru the approval"). Before this the refusal counted toward LAND_STEP_STOP like any other: six
+# merge calls and five judgments over ~31 min per PR, then a merge_refused stop no approval ever re-armed, so every
+# approved PR waited for its lane to requeue it by hand. 2026-11-27 ~22Z: 27 cmux rows stopped merge_refused this way,
+# about 233 open PRs into feat-cmux-next waiting on a review. Now the first such refusal (or land_judge's own
+# review_required refusal) stops the row `review_required` with no backoff spent; the stopped-row read takes it every
+# LAND_REVIEW_READ_EVERY in the same batched GraphQL refresh (LAND_REFRESH_BATCH a query); and a copy read after the
+# stop showing reviewDecision APPROVED at the stopped head re-queues it at once, so it lands with nobody asking. A new
+# head needs its own approval: the row stays stopped (its owner lands the new head). Its requester is not reminded
+# (LAND_OWNER_REMIND_SKIP): there is nothing for them to do. Detector: test-glaeda-gh.py
+# test_a_review_required_stop_spends_no_refusals_and_lands_once_approved.
+LAND_REVIEW_REQUIRED = "review_required"
+LAND_REVIEW_READ_EVERY = 300.0
+LAND_REVIEW_REARM_CAP = 24  # re-queues a UTC day per row: an approval GitHub then refuses again cannot spin it
+LAND_REVIEW_REFUSAL = re.compile(r"for its base-branch policy|base branch policy prohibits the merge|approving reviews? "
+                                 r"(?:is|are) required|review is required|\bREVIEW_REQUIRED\b", re.I)
+LAND_REVIEW_MISSING = frozenset({"REVIEW_REQUIRED", "CHANGES_REQUESTED"})
 # LAND_OWNER_REMIND_UNREAD: a reminder told on the copy there is (no read came within LAND_OWNER_REMIND_READ_WAIT)
 # repeats a copy from before the stop. cmux16, 2026-11-26 09:30Z: one requester got 20 "still stopped after 46-88 h"
 # reminders in an hour; 16 of those 20 PRs had merged or closed days before, but cmux16's reads of them never landed, so
@@ -22543,6 +22563,18 @@ class LandQueue:
         """Queue a stopped E again when its stop can clear by itself (LAND_REARM_CODES' comment). Under the lock."""
         st = e.get("stop") or {}
         code = str(st.get("code") or "")
+        if code == "merge_refused" and LAND_REVIEW_REFUSAL.search(str(st.get("reason") or "")) \
+                and str(((self.cache_of(e["key"]) or {}).get("data") or {}).get("reviewDecision") or "").upper() \
+                in LAND_REVIEW_MISSING | {"APPROVED"}:
+            # A merge_refused stop from before LAND_REVIEW_REQUIRED, for the same refusal: it becomes that stop (same
+            # head, same time), so its reads come at that cadence and an approval re-queues it.
+            st = {**st, "code": LAND_REVIEW_REQUIRED, "was": code}
+            e["stop"] = st
+            code = LAND_REVIEW_REQUIRED
+            self.history(e, "stop_recoded", code=code, was="merge_refused")
+            self.save(e)
+        if code == LAND_REVIEW_REQUIRED:
+            return self.review_rearm(e, st)
         if not LAND_REARM_CODES.match(code) and not self.handoff_stop_transient(e):
             return False
         # A PR that merged or closed since the stop is over: it ends its entry (merged, or stopped "closed"), never a
@@ -22575,6 +22607,36 @@ class LandQueue:
             if latched else f"{self.now - at:.0f} s after the stop"
         self.history(e, "rearmed", code=code, why=why, n=n + 1)
         log({"event": "land-rearmed", "key": e["key"], "code": code, "why": why, "n": n + 1})
+        self.save(e)
+        return True
+
+    def review_rearm(self, e: dict, st: dict) -> bool:
+        """Under the lock. Queue E, stopped review_required (LAND_REVIEW_REQUIRED), again when a copy of its PR read
+        after the stop shows reviewDecision APPROVED at the stopped head. A copy of another head, an older copy, or
+        any other decision leaves it stopped: stopped_over reads it again every LAND_REVIEW_READ_EVERY."""
+        c = self.cache_of(e["key"]) or {}
+        data = c.get("data") or {}
+        if str(data.get("state") or "").upper() not in ("", "OPEN"):
+            return False  # stopped_over ends a merged or closed one
+        at = float(st.get("at") or 0)
+        reads = [float(t) for t in (c.get("dataAt"), c.get("fetchedAt")) if _finite(t)]
+        if not reads or max(reads) <= at:
+            return False
+        head = str(st.get("head") or e.get("pinSha") or "").lower()
+        if str(data.get("reviewDecision") or "").upper() != "APPROVED" \
+                or not head or str(data.get("headRefOid") or "").lower() != head:
+            return False
+        day = land_day(self.now)
+        r = e.get("reviewRearms") or {}
+        n = int(r.get("n") or 0) if r.get("day") == day else 0
+        if n >= LAND_REVIEW_REARM_CAP:
+            return False
+        e["reviewRearms"] = {"day": day, "n": n + 1, "at": self.now, "head": head}
+        e.update(state="queued", stop=None, wait=None, wakeAt=None, action=None, streak=None, updateSent=None,
+                 lastStop=st, dueAt=self.now, stepFail=None, gen=int(e.get("gen") or 0) + 1)
+        why = f"approved at {head[:12]}"
+        self.history(e, "rearmed", code=LAND_REVIEW_REQUIRED, why=why, n=n + 1)
+        log({"event": "land-rearmed", "key": e["key"], "code": LAND_REVIEW_REQUIRED, "why": why, "n": n + 1})
         self.save(e)
         return True
 
@@ -22694,7 +22756,8 @@ class LandQueue:
             return False
         reads = [float(t) for t in (c.get("dataAt"), c.get("updatedAtAt"), c.get("fetchedAt"),
                                     st.get("at"), e.get("stoppedReadAt")) if _finite(t)]
-        if reads and self.now - max(reads) < LAND_STOPPED_READ_EVERY:
+        every = LAND_REVIEW_READ_EVERY if st.get("code") == LAND_REVIEW_REQUIRED else LAND_STOPPED_READ_EVERY
+        if reads and self.now - max(reads) < every:
             return False
         if key in self.jobs or self.refresh_held() or self.queue_quota_parked():
             return False
@@ -28378,6 +28441,15 @@ class LandQueue:
             self.branch_ahead(e, str(head or "").lower(), branch_ref, out)
             return None
         cls = land_step_class(out)
+        if kind == "merge" and self.review_missing(e, head, out):
+            # LAND_REVIEW_REQUIRED: no backoff, no refusal counted; re-queued once the head is approved
+            self.history(e, "step_refused", kind=kind, head=head[:12], why=LAND_REVIEW_REQUIRED, n=0)
+            e.pop("stepFail", None)
+            self.stop(e, LAND_REVIEW_REQUIRED, f"GitHub refused the merge at {head[:12]}: the base's rules require an "
+                      f"approving review and the PR has none at this head ({land_trim(land_tail(out), 200)})",
+                      f"none: a person with write access approves it at {head[:12]}; the queue lands it by itself "
+                      f"within {LAND_REVIEW_READ_EVERY / 60:.0f} min of that approval")
+            return None
         if got.returncode == 124 or LAND_STEP_TRANSIENT.search(out):
             # A timeout or a 5xx: never counted toward LAND_STEP_STOP (LAND_STEP_TRANSIENT's comment)
             last = e.get("stepTransient") or {}
@@ -28447,6 +28519,18 @@ class LandQueue:
         after = min(LAND_STEP_BACKOFF_MAX, LAND_STEP_BACKOFF * (2 ** (n - 1)))
         self.wait(e, {"kind": "retry", "why": f"{kind} refused at the same head ({cls}): backoff {after:.0f} s"}, after)
         return None
+
+    def review_missing(self, e: dict, head: str, out: str) -> bool:
+        """Under the lock. Whether a merge of E refused at HEAD with OUT was refused for a missing approving review
+        (LAND_REVIEW_REQUIRED): the refusal is GitHub's branch-policy one, and the copy of the PR at HEAD shows a
+        review decision that is not an approval. A copy of another head, or no decision at all (a base that
+        requires no review), keeps the refusal counted as before."""
+        if not LAND_REVIEW_REFUSAL.search(out or ""):
+            return False
+        data = (self.cache_of(e["key"]) or {}).get("data") or {}
+        if str(data.get("headRefOid") or "").lower() != str(head or "").lower():
+            return False
+        return str(data.get("reviewDecision") or "").upper() in LAND_REVIEW_MISSING
 
     def owner_refused(self, e: dict, kind: str, head: str, out: str) -> str | None:
         """KIND at HEAD was refused by the broker's owner check (LAND_NOT_OWNER). Under the lock. "hand_off" when the
