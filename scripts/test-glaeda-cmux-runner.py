@@ -10184,6 +10184,52 @@ class HostLoadCapTest(unittest.TestCase):
         self.assertEqual(hook.head_fit_units(None, frozenset(side), time.time()), None)
 
 
+    def slot_gate(self, held: int) -> hook.Gate:
+        """The nightly slot (--nightly-runner) on a 7-unit mini (cmux13s) with `held` units taken."""
+        (self.state / "instance-2" / "receipt.json").write_text(json.dumps({"registration": {
+            "name": "cmux21-glaeda-2", "labels": ["glaeda-mini", self.NIGHTLY]}}))
+        (self.runner / hook.RUNNER_HOOK_SCRIPT).parent.mkdir(exist_ok=True)
+        (self.runner / hook.RUNNER_HOOK_SCRIPT).write_text(
+            "exec python3 /hook job-started --capacity-units 7 --instance 2 --nightly-runner\n")
+        (self.runner / hook.LISTEN_SCRIPT).write_text(f"listen --runner-dir {self.runner} &\n")
+        capacity = Path(tempfile.mkdtemp(dir=self.tmp))
+        (capacity / "admission.lock").touch()
+        for slot in range(held):
+            fd = os.open(capacity / f"unit-{slot}", os.O_RDONLY | os.O_CREAT, 0o644)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.addCleanup(os.close, fd)
+        self.join()
+        self.gate = hook.Gate(self.runner, os.fspath(self.tmp / "host.lock"), os.fspath(self.tmp / "none.json"),
+                              self.state, capacity_dir=capacity)
+        return self.gate
+
+    NIGHTLY = "glaeda-nightly-std-xcode-26.6"
+
+    def test_the_nightly_slot_never_takes_a_bounded_dev_compile_it_cannot_start(self) -> None:
+        # SLOT_BOUNDED_FIT, 2026-11-27: cmux run 45981963973's "cmux NEXT DEV Release compile" (a dev_daily dispatch,
+        # glaeda-nightly-std-xcode-26.6) reached cmux13s-mac-mini-glaeda-2, the nightly slot, which listens on a full
+        # mini; it was refused after DEV_COMPILE_CAPACITY_WAIT_S with "1 of 7 units free, cmux-scheme-compile
+        # (isolated) needs 3" on attempts 1 and 2, and passed on attempt 3 on another mini: false reds.
+        dev = dict(self.job("queued", ago=120, labels=[self.NIGHTLY]), name="cmux NEXT DEV Release compile")
+        need = hook.job_need(hook.job_class("cmux-scheme-compile", hook.DEFAULT_HOME_REPO,
+                                            workflow="cmux-next.yml")[0], "cmux-scheme-compile",
+                             hook.DEFAULT_HOME_REPO, workflow="cmux-next.yml").cores
+        self.assertGreater(need, 1, "the replay needs a DEV compile that needs more than the 1 free unit")
+        self.jobs = [self.job("in_progress", "cmux20-glaeda-1"), dev]
+        self.assertEqual(self.full(self.slot_gate(6)),
+                         f"only 1 of 7 capacity units on this mini are free; its next job needs {need}",
+                         "1 free, the DEV compile needs more: held, so the job stays queued in GitHub")
+        self.assertIsNone(self.full(self.slot_gate(7 - need)), "room for the DEV compile: it listens")
+        build = dict(self.job("queued", ago=60, labels=[self.NIGHTLY]), name="Build nightly app")
+        self.jobs = [dev, build]
+        self.assertIsNone(self.full(self.slot_gate(7)), "a nightly build queued too: listens on a full mini "
+                          "(NIGHTLY_SLOT), so it waits here first in line")
+        self.jobs = []
+        self.assertIsNone(self.full(self.slot_gate(7)), "nothing queued: today's rule, listen on a full mini")
+        self.jobs = [dev]
+        with mock.patch.object(hook, "load_cap_fetch", return_value=None):
+            self.assertIsNone(self.full(self.slot_gate(7)), "an unreadable feed keeps today's rule")
+
     def test_head_fit_reads_every_known_cmux_next_job_from_its_display_name(self) -> None:
         # cmux#44472's "macOS fast tier" (run 44024082059, glaeda-side-std-xcode-26.6) was cancelled by its timeout
         # while waiting for units: HEAD_FIT knew six names and not this one.

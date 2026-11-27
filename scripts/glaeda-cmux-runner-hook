@@ -10426,6 +10426,40 @@ def head_fit_units(summary: dict[str, Any] | None, labels: frozenset[str] | None
     return best
 
 
+# SLOT_BOUNDED_FIT: the nightly slot listens however full the mini is (NIGHTLY_SLOT), because its nightly job then waits
+# here first in line. A DEV Release compile (cmux-next.yml cmux-scheme-compile, a dev_daily dispatch or a feat-cmux-next
+# push, nightly tier) is the slot job that does not: dev_compile_capacity_wait gives it DEV_COMPILE_CAPACITY_WAIT_S and
+# then refuses it. So the slot took it on a full mini and failed it red, and the rescue's re-run often reached the same
+# full slot again. 2026-11-27 (cmux run 45981963973, label glaeda-nightly-std-xcode-26.6): attempts 1 and 2 on
+# cmux13s-mac-mini-glaeda-2 were each refused after 60 s with "1 of 7 units free, cmux-scheme-compile (isolated) needs
+# 3", attempt 3 passed on cmuxs-mac-mini-3-glaeda-2; run 45973996719 the same on cmux11s-mac-mini-glaeda-3. Those were 4
+# of the day's false reds (ci-false-reds-under-half-pct). So while every queued job this slot could take is such a
+# bounded job, the slot listens only with room for the largest need among them: the job stays queued in GitHub, where
+# nothing fails, until a slot with room listens. A queued job of any other shape (the nightly app build, a signing job,
+# a name the hook does not know) keeps today's rule: listen on a full mini, so that job still reaches a mini at once and
+# waits here first in line. A feed that cannot be read or is stale keeps today's rule too.
+SLOT_BOUNDED_JOBS = frozenset({("cmux-next.yml", "cmux-scheme-compile")})
+
+
+def slot_bounded_fit(summary: dict[str, Any] | None, labels: frozenset[str] | None, now: float,
+                     need: Callable[[str, str], int] | None = None) -> tuple[int, str] | None:
+    """SLOT_BOUNDED_FIT: (units, job name) of the largest need among the queued jobs the nightly slot could take, when
+    every one of them is a SLOT_BOUNDED_JOBS job, or None (no such job, another shape queued too, or no fresh feed)."""
+    if need is None:
+        def need(workflow: str, job: str) -> int:
+            return job_need(job_class(job, DEFAULT_HOME_REPO, workflow=workflow)[0], job, DEFAULT_HOME_REPO,
+                            workflow=workflow).cores
+    best: tuple[int, str] | None = None
+    for queued in queue_jobs(summary, labels, now):
+        known = head_job_key(str(queued.get("name") or ""))
+        if known not in SLOT_BOUNDED_JOBS:
+            return None  # a job that waits here first in line may be handed over next: listen on a full mini
+        units = max(1, int(need(*known)))
+        if best is None or units > best[0]:
+            best = (units, str(queued["name"]))
+    return best
+
+
 def load_cap_verdict(summary: dict[str, Any] | None, labels: frozenset[str] | None, host: str,
                      now: float, grace: float | None = None) -> str | None:
     """Why another host's listener keeps up with this runner's label (so an over-cap mini may hold its listener off),
@@ -12151,6 +12185,7 @@ class Gate:
         self.reserve_demand_at: float | None = None  # RESERVE_ON_DEMAND: when the feed last showed a job for it
         self.ios_sim_own = False  # IOS_SIM_OWN_FIT: the last full() listened at its own fit for a queued ios-sim job
         self.head_fit_seen: tuple[int, str] | None = None  # HEAD_FIT: the last head need full() listened for
+        self.slot_bounded_seen: tuple[int, str] | None = None  # SLOT_BOUNDED_FIT: the last bounded need it held for
         # STARVED_RESERVE: the policy in force (refreshed with the other settings), the capacity/STARVED_RESERVE_FILE
         # flock while held, since when (monotonic), the job it is held for, and the jobs whose hold ran out
         self.starved: StarvedReserve | None = gate_starved_reserve(None, "", 0.0)
@@ -12705,6 +12740,23 @@ class Gate:
                      "with room for it, so it never waits here for units against its timeout")
         self.head_fit_seen = found
         return found[0] if found else 1
+
+    def slot_bounded_look(self, scope: RunnerScope) -> str | Unknown | None:
+        """SLOT_BOUNDED_FIT: why the nightly slot holds while only a bounded DEV compile it has no room for queues for
+        it, else None (today's rule: listen on a full mini). Never raises: a broken look listens."""
+        try:
+            self.cap_look()
+            found = slot_bounded_fit(self.cap_summary, self.cap_labels, time.time())
+        except Exception as error:  # noqa: BLE001 - a broken look must never stop the gate
+            found = None
+            gate_log(f"the nightly slot's queue look failed ({type(error).__name__}); listening on a full mini")
+        if found != self.slot_bounded_seen and found is not None:
+            gate_log(f"only {found[1]} queues for the nightly slot, which waits {DEV_COMPILE_CAPACITY_WAIT_S:g} s "
+                     f"here and is then refused: listening only with room for its {found[0]} units (SLOT_BOUNDED_FIT)")
+        self.slot_bounded_seen = found
+        if found is None:
+            return None
+        return mini_full(self.capacity_dir, scope.units, scope, found[0])
 
     def starved_step(self, why: str | None, stop: str | None = None) -> None:
         """STARVED_RESERVE: hold or let go of capacity/STARVED_RESERVE_FILE for a starved job this root runner could
@@ -13474,8 +13526,13 @@ class Gate:
             # new PR or side job takes a unit (SIGNING_DRAIN): the units are reserved at admission, the running jobs
             # finish, none is killed. ultra1, 2026-11-22 00:01-00:45Z: "all 30 capacity units on this mini are taken"
             # stopped the idle signing listener five times while PR jobs filled the units.
-            self.full_why = None
-            return None
+            # SLOT_BOUNDED_FIT: except while only a bounded DEV compile queues for the nightly slot: it would be refused
+            # here after DEV_COMPILE_CAPACITY_WAIT_S, so the slot listens only with room for it.
+            why = self.slot_bounded_look(scope) if scope.nightly else None
+            if isinstance(why, Unknown):
+                return None if fresh else self.full_why
+            self.full_why = why
+            return why
         own = max(self.fit_units, listen_fit_units(self.runner_dir))
         side = side_fit_units(scope)
         fit = max(own, side)
