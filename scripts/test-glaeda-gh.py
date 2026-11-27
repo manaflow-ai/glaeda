@@ -33713,6 +33713,7 @@ class LandTest(Base):
         self.assertEqual(updates, [f"expected_head_sha={LA}"])
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "update_again_unnamed"))
         self.assertIn(LB[:12], e["stop"]["reason"])
+        self.assertIn("refusal code stale_green", e["stop"]["reason"])  # it names the land-judge code that sent it
         self.assertIn(f"--sha {LB}", e["stop"]["next"])
         self.assertEqual(self.w.gh_calls("pr", "merge"), [])
 

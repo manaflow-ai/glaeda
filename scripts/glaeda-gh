@@ -27539,7 +27539,11 @@ class LandQueue:
                     self.count("update_again_unnamed")
                     self.stop(e, "update_again_unnamed",
                               f"land_judge named a second base merge at {head[:12]}, the head this land's own update "
-                              "made, and named no check that needs a newer base; one base merge per land",
+                              f"made, for its refusal code {code or '?'}"
+                              + (" (a forced base_update: its need is the stock 'land-judge base update', and its reason "
+                                 "names no changed file the PR also changes)" if force or stock else "")
+                              + ", and named no check that needs a newer base; one base merge per land ("
+                              f"`land-judge explain {repo} {number} --json` shows the refusal and the check it waits on)",
                               f"glaeda-gh status pr {repo}#{number} (a check still to report: glaeda-gh land "
                               f"{key_name(e['key'])} --sha {head} once it has; a base fix it needs: gh pr "
                               f"update-branch {number} -R {repo}, then land the new head)")
