@@ -4023,6 +4023,19 @@ APP_CREATES_ENV = "GLAEDA_APP_CREATES"
 APP_CREATE_OP = {"pr": "create", "issue": "issue"}  # the queued kind -> gh_app_token.py broker-actor's operation
 APP_CREATE_ROLE = {"create": "lander", "issue": "issues"}  # by purpose, one App each
 APP_CREATE_NEVER = frozenset({"manaflow-ai/cmux"})  # the CLA counts the PR opener as a signer
+# ... but only for a PR into main: cla.yml runs on `pull_request_target branches: [main]`, so a PR into feat-cmux-next has
+# no CLA check and an App opener signs nothing (app/cmux-agent's #61277 and 20+ more merged that way). A PR whose base is
+# not main asks broker-actor with --base; machines/gh-app-roles.json bot_authored_write_bases decides (Leo, 2026-11-27
+# 08:12Z: "aren't we using mosly the quota goblin pool intead of my persoal login?"; 9 cmux creates held 14+ min).
+# Detector: test_a_cmux_pr_into_feat_cmux_next_goes_on_the_lander_app_in_a_pause.
+APP_CREATE_MAIN_BASES = frozenset({"", "main"})
+
+
+def app_create_never(item: dict) -> bool:
+    """Whether ITEM's create must stay on the login: a repo in APP_CREATE_NEVER, unless its base is not main."""
+    if str(item.get("repo") or "").lower() not in APP_CREATE_NEVER:
+        return False
+    return str(item.get("base") or "").strip().lower() in APP_CREATE_MAIN_BASES
 APP_ACTOR_TTL = 60.0  # seconds an App writer's answer (or its absence) is reused across outbox turns
 
 # Comments on a POOL of poster Apps (Leo, 2026-11-24: "but i already have github apps made. quota-goblin... etc. well,
@@ -8356,7 +8369,7 @@ class Daemon:
         op = APP_CREATE_OP.get(str(item.get("kind")))
         if not op or not app_creates_on() or item.get("appCreates") is False:
             return False
-        if str(item.get("repo") or "").lower() in APP_CREATE_NEVER or item.get("appRefused"):
+        if app_create_never(item) or item.get("appRefused"):
             return False
         return self.app_create_hold.get(APP_CREATE_ROLE[op], 0.0) <= self.clock()
 
@@ -8450,7 +8463,7 @@ class Daemon:
         if op == "comment" and (RISK_RECEIPT.search(item["body"]) or
                 re.search(r"<!--|^\s*(?:/|owner:)", item["body"], re.M | re.I)):
             return None
-        if str(item.get("repo") or "").lower() in APP_CREATE_NEVER and op != "comment":
+        if op != "comment" and app_create_never(item):
             return None
         role = APP_CREATE_ROLE.get(op, "review")
         saved = item.get("appWriter")
@@ -8476,13 +8489,17 @@ class Daemon:
         tool = app_pool_tool()
         if not tool:
             return None
-        key = (op, str(item["repo"]).lower())
+        base = str(item.get("base") or "").strip() if str(item.get("repo") or "").lower() in APP_CREATE_NEVER else ""
+        key = (op, str(item["repo"]).lower(), base)
         cached = self.app_actors.get(key)
         if cached is not None and self.clock() - cached[0] < APP_ACTOR_TTL:
             return cached[1]
         actor = None
         try:
-            result = run_bounded([sys.executable, "-I", str(tool), "broker-actor", op, item["repo"]], timeout=12)
+            argv = [sys.executable, "-I", str(tool), "broker-actor", op, item["repo"]]
+            if base:
+                argv += ["--base", base]
+            result = run_bounded(argv, timeout=12)
             found = json.loads(result.stdout) if not result.returncode else None
             if isinstance(found, dict) and found.get("role") == role and isinstance(found.get("note"), str) and \
                     re.fullmatch(r"ghs_[A-Za-z0-9._-]{20,2048}", str(found.get("token", ""))):
@@ -26011,12 +26028,30 @@ class LandQueue:
                                                          else "a red the change cannot affect")}, LAND_WAIT_DEFAULT)
         return True
 
+    def merge_on_app(self, e: dict) -> bool:
+        """Whether `gh pr merge` of E goes out on the lander App (gh_app_token.py route says so): the App's token has its
+        own quota and no login's content-creation pause, so the pause never holds it. cmux#61194 and hq#32880 sat held
+        on the login's pause for over 30 min, 2026-11-27 (Leo: "aren't we using mosly the quota goblin pool intead of
+        my persoal login?"). A refusal of the App falls back to the login's shim, which parks it as before.
+        GLAEDA_APP_CREATES=0 turns it off. Detector: test_a_merge_the_lander_app_makes_is_not_held_by_the_logins_pause."""
+        tool = app_pool_tool()
+        if not tool or not app_creates_on():
+            return False
+        try:
+            got = run_bounded([sys.executable, "-I", str(tool), "route", "pr", "merge", str(e["number"]), "-R",
+                               str(e["repo"])], timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return got.returncode == 0 and got.stdout.split("\t", 1)[0].strip() == "lander"
+
     def held_by_create_pause(self, e: dict, kind: str, head: str) -> bool:
         """Whether the login's create pause holds KIND at HEAD now (create_pause): then E is parked until it ends, as
         the shim's own refusal would park it (park_quota on its words), and nothing is sent. Never counted toward a
         stop, nor is the judgment after it (stepQuotaParked)."""
         until = self.create_pause(self.now)
         if until <= self.now:
+            return False
+        if kind == "merge" and self.merge_on_app(e):
             return False
         with self.lock:
             self.history(e, "step_held", kind=kind, head=head[:12], why="the login's create pause")

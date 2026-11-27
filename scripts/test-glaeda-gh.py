@@ -18773,6 +18773,23 @@ class PostTest(unittest.TestCase):
         self.assertEqual((t.calls, asked), ([], []))
         self.assertEqual(gg.post_state(pr["id"])["state"], "queued")
 
+    def test_a_cmux_pr_into_feat_cmux_next_goes_on_the_lander_app_in_a_pause(self) -> None:
+        """Before: every cmux PR waited the login's create pause (9 queued, head held 14+ min, 2026-11-27 11:0xZ). After:
+        a PR whose base is not main (no CLA check there) is made by the lander App; a main-base one still waits."""
+        self.no_env_token()
+        asked = self.app_writer("lander")
+        self.pause_cmd(NOW + 900)
+        pr = self.queue("pr", "manaflow-ai/cmux", "--head", "lane/x", "--base", "feat-cmux-next", "--title", "t",
+                        "--body", "b")
+        d, t = self.daemon((201, {}, {"number": 8, "html_url": "https://github.com/manaflow-ai/cmux/pull/8"}))
+        d.transport, seen = self.authed(t)
+        d.clock_real = False
+        self.step(d, NOW)
+        self.assertEqual([c[:2] for c in t.calls], [("POST", "/repos/manaflow-ai/cmux/pulls")])
+        self.assertEqual(seen, ["Bearer " + self.APP_TOKEN])
+        self.assertEqual(asked, [["broker-actor", "create", "manaflow-ai/cmux", "--base", "feat-cmux-next"]])
+        self.assertEqual(gg.post_state(pr["id"])["state"], "posted")
+
     def test_app_creates_off_keeps_prs_and_issues_on_the_login(self) -> None:
         self.no_env_token()
         asked = self.app_writer("lander")
@@ -28987,6 +29004,30 @@ class LandTest(Base):
             self.assertIn("content-pause", (root / "calls").read_text())
             self.w.answers.append(ok_answer(LA))
             self.tick(e["wakeAt"] - self.t + 1)
+            self.assert_merged_at(LA)
+
+    def test_a_merge_the_lander_app_makes_is_not_held_by_the_logins_pause(self):
+        # Before: green cmux#61194 and hq#32880 were held 30+ min by the login's create pause although `pr merge` is a
+        # lander write. After: gh_app_token.py route says lander, so the merge goes out at once.
+        root = Path(self.tmp.name) / "pause"
+        root.mkdir()
+        cmd = root / "content-pause-cmd"
+        cmd.write_text(f'#!/bin/sh\necho \'{{"blocked_until": {NOW + 3000}, "level": 3}}\'\n')
+        cmd.chmod(0o755)
+        tool = Path(self.tmp.name) / "gh_app_token.py"
+        tool.write_text("")
+        real = gg.run_bounded
+        def run(argv, timeout=None, **kw):
+            if "route" not in argv:
+                return real(argv, timeout, **kw)
+            return subprocess.CompletedProcess(argv, 0, "lander\tpr merge is a lander write\thold\n", "")
+        with mock.patch.dict(os.environ, {gg.CONTENT_PAUSE_ENV: shlex.quote(os.fspath(cmd))}), \
+                mock.patch.object(gg, "app_pool_tool", return_value=tool), \
+                mock.patch.object(gg, "run_bounded", side_effect=run):
+            self.pr(LA)
+            self.land()
+            self.w.answers.append(ok_answer(LA))
+            self.tick()
             self.assert_merged_at(LA)
 
     def test_wait_pr_then_merge(self):
