@@ -37650,7 +37650,7 @@ class LandTest(Base):
         self.assertEqual((e["state"], e.get("forwardedTo"), len(self.handoffs())), ("forwarded", "huge-blue", 1))
         return e
 
-    def test_a_forwarded_land_the_cache_shows_merged_ends_merged_and_tells_its_requester(self):
+    def test_a_forwarded_land_the_cache_shows_merged_ends_merged_with_no_second_notice(self):
         # hq#19725: 9 rows MERGED on GitHub stayed "forwarded" on the lane VM for hours.
         self.forwarded_row()
         self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
@@ -37659,12 +37659,10 @@ class LandTest(Base):
         self.w.cache[self.KEY]["data"]["mergeCommit"] = {"oid": "f" * 40}
         e = self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
         self.assertEqual((e["state"], e.get("mergeSha")), ("merged", "f" * 40))
-        [said] = [c for c in self.w.sent() if "merged" in c[-1]]
-        self.assertEqual(said[3], "host/lane")
         self.assertIn("forwarded to huge-blue", e["history"][-1]["how"])
         self.assertEqual((len(self.handoffs()), len(self.w.explains())), (1, 1))
-        # LAND_MERGED_ELSEWHERE_FYI: a merge this queue did not make reaches its requester as an inbox fyi
-        self.assertEqual(said[said.index("--class") + 1], gg.LAND_FORWARD_FYI_CLASS)
+        # LAND_MERGED_FORWARDED_ONCE: huge-blue's queue merged it and told host/lane; this host sends no second notice
+        self.assertEqual([c for c in self.w.sent() if "merged" in c[-1]], [])
 
     def test_only_this_queues_own_merge_wakes_its_requester(self):
         # LAND_MERGED_ELSEWHERE_FYI: gcp-agent-lane-12, 2026-11-23..25, 30 of 86 cache-read merged notices woke a lane
@@ -37679,6 +37677,11 @@ class LandTest(Base):
 
         self.assertEqual(told("merged pinned"), gg.LAND_MERGED_CLASS)
         self.assertEqual(told("the read after its merge shows it merged"), gg.LAND_MERGED_CLASS)
+        # LAND_MERGED_FORWARDED_ONCE: a forwarded row's merge read from the cache is the controller's, already told
+        self.w.calls.clear()
+        self.q.merged(e, "f" * 40, "the cache shows it merged")
+        self.assertEqual([c for c in self.w.sent() if "merged" in c[-1]], [])
+        e.pop("forwardedTo")  # a hand merge of a row never forwarded still reaches its requester, as an fyi
         self.assertEqual(told("the cache shows it merged"), gg.LAND_FORWARD_FYI_CLASS)
         self.assertEqual(told("a state read shows it merged"), gg.LAND_FORWARD_FYI_CLASS)
 

@@ -290,11 +290,11 @@ class MergedNoticeSkipsTheRequestersOwnWaiter(unittest.TestCase):
                 for p in d.glob("*.json"):
                     p.unlink()
 
-    def merge(self, key: str, requester: str) -> list[dict]:
+    def merge(self, key: str, requester: str, how: str = "merged pinned", **extra: object) -> list[dict]:
         """LandQueue.merged on a row requested by REQUESTER; the notify calls it made, with their wake."""
         q = gg.LandQueue.__new__(gg.LandQueue)
         calls: list[dict] = []
-        e = {"key": key, "repo": REPO, "number": 42, "state": "waiting", "requester": requester, "history": []}
+        e = {"key": key, "repo": REPO, "number": 42, "state": "waiting", "requester": requester, "history": [], **extra}
         with mock.patch.object(gg.LandQueue, "save", lambda self, e: None), \
                 mock.patch.object(gg.LandQueue, "history", lambda self, e, *a, **k: None), \
                 mock.patch.object(gg.LandQueue, "url", lambda self, e: f"https://github.com/{REPO}/pull/42"), \
@@ -302,7 +302,7 @@ class MergedNoticeSkipsTheRequestersOwnWaiter(unittest.TestCase):
                                   lambda self, e, to, msg, wake=True, cls=None, within=None, **k:
                                   calls.append({"to": to, "wake": wake, "msg": msg})), \
                 mock.patch.object(gg, "log", lambda *_: None):
-            q.merged(e, "f" * 40, "merged pinned")
+            q.merged(e, "f" * 40, how)
         return calls
 
     def test_a_merge_the_requesters_own_waiter_reports_sends_no_second_wake(self) -> None:
@@ -323,6 +323,14 @@ class MergedNoticeSkipsTheRequestersOwnWaiter(unittest.TestCase):
         self.assertEqual([c["wake"] for c in self.merge(key, "host/me")], [False])
         # ... another session's requester still is
         self.assertEqual([c["wake"] for c in self.merge(key, "host/other")], [True])
+
+    def test_a_forwarded_rows_cache_read_merge_is_not_a_second_notice(self) -> None:
+        key = f"pr:{REPO}#42"
+        how = "forwarded to far-host: the cache shows it merged"
+        self.assertEqual([c["wake"] for c in self.merge(key, "host/me", how, forwardedTo="far-host")], [False])
+        # a hand merge of a row never forwarded, and the queue's own merge, still tell the requester
+        self.assertEqual([c["wake"] for c in self.merge(key, "host/me", how)], [True])
+        self.assertEqual([c["wake"] for c in self.merge(key, "host/me", forwardedTo="far-host")], [True])
 
     def test_no_waiter_or_a_waiter_that_did_not_end_merged_still_wakes(self) -> None:
         key = f"pr:{REPO}#42"

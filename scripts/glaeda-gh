@@ -28496,6 +28496,10 @@ class LandQueue:
             # LAND_MERGED_WAITER_QUIET's comment: the requester's own `wait pr` on this row wakes it with this merge
             log({"event": "land-merged-waiter-quiet", "key": e["key"], "to": to, "waiterPid": waiter.get("pid")})
             wake = False
+        if wake and not own and e.get("forwardedTo"):
+            # LAND_MERGED_FORWARDED_ONCE's comment: the host this row was forwarded to merged it and told the requester
+            log({"event": "land-merged-forwarded-quiet", "key": e["key"], "to": to, "forwardedTo": e.get("forwardedTo")})
+            wake = False
         self.notify(e, e.get("requester") or "",
                     f"glaeda land: {self.url(e)} merged" + (f" at {merge_sha}" if merge_sha else "")
                     + (f" (before it: {e['stackedRebase']})" if e.get("stackedRebase") else ""), wake=wake,
@@ -36049,6 +36053,14 @@ LAND_ROW_WAIT_POLL = 1.0  # a local file read, as cmd_land's own wait
 # merge line. Stops, a judge's escalation, a waiter of another session, or no waiter: unchanged. Detector:
 # test-glaeda-gh-wait-land-row.py test_a_merge_the_requesters_own_waiter_reports_sends_no_second_wake.
 LAND_WAITER_GRACE = 120.0
+
+# LAND_MERGED_FORWARDED_ONCE: a row forwarded to the controller is merged there, and that queue's own "merged at SHA"
+# notice reaches the requester. The forwarding lane host's follower then read the merge from its cache and sent a
+# second, bare "merged" (class fyi) that the requester's inbox flush woke again ~10 min later: 112 of 733 (session, PR)
+# merged notices in 24 h on one lane host (goal wakes-per-landed-pr; Leo: "us not getting fucking swamped by our own
+# fucking wake-ups, our own tool calls"). A merge read from the cache of a row with forwardedTo is now a log line;
+# a hand merge of a row never forwarded still reaches its requester. Detector:
+# test-glaeda-gh-wait-land-row.py test_a_forwarded_rows_cache_read_merge_is_not_a_second_notice.
 
 
 def land_waiters_dir() -> Path:
