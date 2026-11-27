@@ -24526,12 +24526,12 @@ class GitShimTest(unittest.TestCase):
         self.assertIn("-c http.lowSpeedLimit=1 -c http.lowSpeedTime=60", argv.read_text())
         self.assertEqual(self.log(), ["github"])
 
-    def proxied(self, curl_exit: int, first_fetch_error: str = "") -> tuple[Path, Path, dict]:
+    def proxied(self, curl_exit: int, first_fetch_error: str = "", port: int = 18434) -> tuple[Path, Path, dict]:
         """A mini's setup: github.com through a loopback CONNECT proxy (mini-rollout.sh's http.<url>.proxy), a curl
         whose CONNECT probe exits curl_exit, and a git that logs its argv (and fails its first fetch with
         first_fetch_error when given). Returns the git argv log, the curl argv log and the env."""
         with self.gitconfig.open("a") as f:
-            f.write('[http "https://github.com/"]\n\tproxy = http://127.0.0.1:18434\n')
+            f.write(f'[http "https://github.com/"]\n\tproxy = http://127.0.0.1:{port}\n')
         self.install()
         argv, curl_argv = self.dir / "argv", self.dir / "curl-argv"
         bindir = self.dir / "bin"
@@ -24596,6 +24596,18 @@ class GitShimTest(unittest.TestCase):
         self.assertFalse((self.temp / f"{hook.GIT_SHIM_LOG}.direct").exists())  # no failure mark for later calls
         self.assertEqual(self.git(self.ws, "rev-parse", "refs/remotes/origin/main"), self.pr_sha)
         # a lazy blob fetch from any other command in the same repository skips it too
+        other = self.shim("config", "--get-urlmatch", "http.proxy", "https://github.com/", env=env)
+        self.assertEqual(other.stdout.strip(), "", other.stderr)
+
+    def test_a_token_fetch_skips_any_loopback_tunnel_not_only_18434(self) -> None:
+        # mini-rollout.sh writes 18435 or 18436 when the cp forward is down; the shim matched 18434 alone, so a token
+        # fetch rode a dead 18435 tunnel (cmuxterm-hq onboarding-new-person-production job 140667177526, 2026-11-27)
+        argv, curl_argv, env = self.proxied(curl_exit=0, port=18435)
+        self.git(self.ws, "config", "http.https://github.com/.extraheader", "AUTHORIZATION: basic dG9rZW4=")
+        result = self.checkout_fetch(self.pr_sha, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("this fetch carries the job's token, so it goes direct to github.com", result.stderr)
+        self.assertFalse(curl_argv.exists())
         other = self.shim("config", "--get-urlmatch", "http.proxy", "https://github.com/", env=env)
         self.assertEqual(other.stdout.strip(), "", other.stderr)
 

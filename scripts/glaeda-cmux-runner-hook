@@ -6307,7 +6307,12 @@ def borrow_mirror(workspace: str | None, mirror: Path = MIRROR_DIR, timeout: flo
 # Measured 2026-11-26 22:5xZ on six minis: github.com 200 direct in 0.19-0.22 s against 0.7-4.2 s through
 # the tunnel; cmux info/refs (7.2 MB) 0.36-0.66 s direct against 2.4-10.4 s, and a 30 s timeout on a relayed mini;
 # a depth-1 clone 1.4-1.6 s direct against 8.2-19.9 s; twenty direct info/refs in a row, all 200 (cmuxterm-hq#27837).
-GIT_SHIM_TUNNEL = "http://127.0.0.1:18434"
+# Any loopback proxy is one of those tunnels: github-egress/mini-rollout.sh now writes the first of 18434 (the cp
+# forward), 18435 or 18436 (mini-hetzner-tunnel.sh's ssh -L to hetzner-1/-2) that answers. The shims matched 18434
+# alone, so on a mini set to 18435 they skipped the probe and the token's direct route, and a dead tunnel failed
+# actions/checkout at once ("Failed to connect to 127.0.0.1 port 18435 after 0 ms" three times, cmuxterm-hq
+# onboarding-new-person-production job 140667177526, 2026-11-27 20:09Z). So the shims match this prefix.
+GIT_SHIM_TUNNEL = "http://127.0.0.1:"
 GIT_SHIM_REPO = "manaflow-ai/cmux"
 GIT_SHIM_DIR = "glaeda-git-shim"
 GIT_SHIM_LOG = "glaeda-git-fetches.log"
@@ -6352,7 +6357,7 @@ case $sub in fetch|ls-remote|submodule) ;; *)
   [ -s "$log.direct" ] && exec "$real" -c "http.proxy=" -c "http.https://github.com/.proxy=" "${orig[@]}"
   # one config read on this hot path: a token's call skips the tunnel (GIT_SHIM_TUNNEL), anything else keeps it
   http=$("$real" "${globals[@]}" config --get-urlmatch http https://github.com/ 2>/dev/null) &&
-    printf '%s\n' "$http" | grep -qxF "http.proxy $tunnel" && printf '%s\n' "$http" | grep -qi '^http.extraheader authorization:' &&
+    printf '%s\n' "$http" | grep -q "^http.proxy $tunnel[0-9]*\$" && printf '%s\n' "$http" | grep -qi '^http.extraheader authorization:' &&
     exec "$real" -c "http.proxy=" -c "http.https://github.com/.proxy=" "${orig[@]}"
   exec "$real" "${orig[@]}" ;; esac
 shift
@@ -6513,7 +6518,7 @@ go_direct() {  # $1: why. This attempt, the rest and the job's later git calls s
 if [ -n "$proxy" ] && [ -s "$log.direct" ]; then
   route=(-c "http.proxy=" -c "http.https://github.com/.proxy=")
   say "the github.com proxy $proxy failed earlier in this job ($(tail -1 "$log.direct")); going direct to github.com"
-elif [ "$proxy" = "$tunnel" ] && [ "$kind" != submodule ] && authed; then
+elif [[ $proxy == "$tunnel"* ]] && [ "$kind" != submodule ] && authed; then
   # not a submodule update: its clones are other repositories, with no token, and -c reaches them
   route=(-c "http.proxy=" -c "http.https://github.com/.proxy=")
   say "this fetch carries the job's token, so it goes direct to github.com (the tunnel $proxy is for anonymous fetches)"
