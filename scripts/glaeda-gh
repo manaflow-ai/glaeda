@@ -10804,7 +10804,10 @@ class Daemon:
         # blocked batches, so the floor batch and the round robin's turn read heads for as long as the splits ran (the
         # land host, 2026-11-25, as at GQL_SPLITS). The first head query of the tick still goes (batched's UNTIL).
         tick_start = time.monotonic()
-        waited_due = bool(blocked["pr"] or blocked["run"])
+        # A waited comment counts as a waited PR or run does: cmux-cp-2, 2026-11-27 11:13Z, "no comment read stored in
+        # the last 600s; ticks spent 509.7s, most in read head (217.1s)": with only `wait comment`s blocked, the heads had
+        # no share at all and read for as long as the tick lasted.
+        waited_due = bool(blocked["pr"] or blocked["run"] or blocked["comment"])
         until_of = {"head": tick_start + REST_HEAD_BUDGET if waited_due else None}
         if waited_due:  # the waited share: no new waited or plain batch starts past it, the heads keep their minimum
             until_of.update({k: tick_start + WAITED_TICK_SHARE for k in ("pr", "run", "comment")})
@@ -10932,7 +10935,8 @@ class Daemon:
         plain_until = time.monotonic() + REST_PLAIN_BUDGET
         head_until = time.monotonic() + REST_HEAD_BUDGET
         # the last waited PR or run in the order: a head past the heads' share ahead of it is deferred (REST_HEAD_BUDGET)
-        last_waited = max((i for i, x in enumerate(over_rest) if x["key"].startswith(("pr:", "run:")) and self.waited(x)),
+        last_waited = max((i for i, x in enumerate(over_rest)
+                           if x["key"].startswith(("pr:", "run:", "comment:")) and self.waited(x)),  # waited_due's kinds
                           default=-1)
         self.head_until = head_until if last_waited >= 0 else None  # the looks between these reads keep it too
         asked_read = False  # an asked head with no answer was read this tick: the rest of them keep the heads' share

@@ -10558,6 +10558,49 @@ class TickBudgetTest(Base):
         self.assertLessEqual(pr_until - start, gg.WAITED_TICK_SHARE + 1, "waited reads leave the heads their minimum")
         self.assertGreaterEqual(head_until - time.monotonic(), gg.HEADS_MIN_SHARE - 5, "the heads have their minimum share")
 
+    def test_waited_comments_alone_bound_the_heads_like_a_waited_pr(self) -> None:
+        """cmux-cp-2, 2026-11-27 11:13Z: "no comment read stored in the last 600s; ticks spent 509.7s, most in read head
+        (217.1s)". The heads' share held only while a waited PR or run was due, so with only `wait comment`s blocked the
+        heads read unbounded. A waited comment now sets the share as they do, on GraphQL and on REST."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800}}
+        gg.register("comment:o/r#900", waited=True)
+        for n in range(4):
+            gg.register(f"head:o/r@{n:040x}", consumer="merge-hold")
+        self.daemon.paths = {**self.daemon.paths, "comment": "graphql", "head": "graphql"}
+        calls: list[tuple[str, float | None]] = []
+
+        def batched(kind, entries, fetch, until=None, pr_timeout_rest=None):
+            if entries:
+                calls.append((kind, until))
+            return []
+        with mock.patch.object(self.daemon, "batched", side_effect=batched):
+            self.daemon.tick(NOW)
+        kinds = [k for k, _ in calls]
+        self.assertLess(kinds.index("comment"), kinds.index("head"), calls)
+        self.assertIsNotNone(next(u for k, u in calls if k == "head"), "the heads have a share while a comment waits")
+        self.assertIsNotNone(next(u for k, u in calls if k == "comment"), "the waited comment keeps the waited share")
+
+    def test_waited_comment_over_rest_defers_waited_heads_past_their_share(self) -> None:
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 0, "reset": NOW + 1800}}
+        shas = [f"{n:040x}" for n in range(1, 5)]
+        for sha in shas:  # answered once, long ago: due again and waited, ranked ahead of the comment
+            key = f"head:o/r@{sha}"
+            gg.register(key, consumer="merge-hold", waited=True)
+            gg.write_json(gg.cache_dir() / gg.file_name(key), {"key": key, "fetchedAt": NOW - 9500, "dataAt": NOW - 9500,
+                                                               "error": None, "data": {"checks": []}})
+        gg.register("comment:o/r#900", waited=True)  # read more lately than the heads: ranked behind them
+        gg.write_json(gg.cache_dir() / gg.file_name("comment:o/r#900"), {
+            "key": "comment:o/r#900", "fetchedAt": NOW - 5000, "dataAt": NOW - 5000, "error": None, "data": {"comments": []}})
+        read: list[str] = []
+        with mock.patch.object(gg, "REST_HEAD_BUDGET", -1), mock.patch.object(gg, "HEADS_MIN_SHARE", 0), \
+                mock.patch.object(self.daemon, "fetch_comment_rest", side_effect=lambda e: read.append(e["key"])), \
+                mock.patch.object(self.daemon, "fetch_head_rest", side_effect=lambda e: read.append(e["key"])):
+            self.daemon.tick(NOW)
+        self.assertIn("comment:o/r#900", read)
+        self.assertLess(len([k for k in read if k.startswith("head:")]), len(shas), read)
+
     def test_a_slow_waited_kind_leaves_the_waited_kinds_after_it_their_own_share(self) -> None:
         """cmux-cp-1, 2026-11-27 12:3xZ to 16:1xZ: PR batches GitHub answered 502/504 after ~10.9 s took the whole waited
         share (pr, run and comment shared one deadline), every waited run batch after the first was deferred as "the runs'
