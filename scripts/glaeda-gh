@@ -16634,6 +16634,14 @@ LAND_PR_REOPEN_LAG = 120.0
 LAND_PR_REOPEN_TRIES = 3  # a closed PR left closed by one failed reopen is worse than two more calls
 LAND_NO_DATA_AFTER = 120.0  # an entry whose PR the cache has not read yet is judged without a pin after this
 LAND_WAIT_DEFAULT = 3600.0  # a wait whose action named no timeout
+# The controller's feed carries workflow runs, check suites and comments, no `status` and no check run of its own, so a
+# wait on a head with a commit status pending (cmux/land-tier: land_pending_status) gets no event when that head's
+# other checks finish, and slept its whole LAND_WAIT_DEFAULT. cmux#61127, 2026-11-27: `risk evidence` finished
+# 12:11:43Z, leaving only cmux/land-tier ("Cheap tier: ... runs when ready-to-land ... is added"), and the row, waiting
+# since 12:05:16Z, was not judged (so land_judge's label pulse never ran) until a person relabelled at 12:19Z. Such a
+# wait wakes this often instead; a wake judges (checks_woke) and a checks_running answer waits again, uncounted.
+# Detector: test-glaeda-gh.py test_a_wait_on_a_head_with_a_pending_status_wakes_within_the_status_bound.
+LAND_WAIT_STATUS = 300.0
 LAND_RETRY_DEFAULT = 120.0
 LAND_RETRY_MAX = 1800.0
 LAND_REVIEW_WAIT = 3600.0
@@ -24177,9 +24185,12 @@ class LandQueue:
         return e.get("stuckCarryJudged") != f"{e.get('requestId') or ''}|{head}"
 
     def wait_running(self, e: dict, head: str, fp: str) -> None:
-        """Checks still run at the head: land_judge is not asked until they finish (the cache says when)."""
+        """Checks still run at the head: land_judge is not asked until they finish (the cache says when). A head with
+        a commit status pending wakes within LAND_WAIT_STATUS (LAND_WAIT_STATUS's comment)."""
+        wake = LAND_WAIT_STATUS if land_pending_status((self.cache_of(e["key"]) or {}).get("data") or {}) \
+            else LAND_WAIT_DEFAULT
         e.update(state="waiting", wait={"kind": "pr", "sha": head, "why": "checks running"}, seen=fp, head=head,
-                 wakeAt=self.now + LAND_WAIT_DEFAULT)
+                 wakeAt=self.now + wake)
         e.pop("seenChecks", None)  # checks ran since the last verdict: the next is judged, even if they end the same
         self.unhold(e)  # not due now: its wake is ahead (hold, LAND_DUE_LATE)
         e.pop("dueLate", None)

@@ -33083,6 +33083,30 @@ class LandTest(Base):
         self.assertNotEqual((e.get("wait") or {}).get("why"), "checks running")
         self.assertFalse(any(h.get("event") == "checks_running" for h in e["history"]))
 
+    def test_a_wait_on_a_head_with_a_pending_status_wakes_within_the_status_bound(self):
+        # cmux#61127, 2026-11-27: waiting from 12:05:16Z on `risk evidence` and the cheap-tier cmux/land-tier status;
+        # the run finished 12:11:43Z and the feed carries no event for it, so the row slept to the 1 h wake and was
+        # judged only when a person relabelled at 12:19Z. With a status pending it wakes within LAND_WAIT_STATUS.
+        said = "Cheap tier: the full tier runs when ready-to-land or full-ci is added"
+        self.assertLessEqual(gg.LAND_WAIT_STATUS, 600.0)
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("risk evidence", "PENDING", None),
+                            ("cmux/land-tier", "PENDING", None, said)])
+        self.land()
+        e = self.tick()
+        self.assertEqual((e.get("wait") or {}).get("why"), "checks running")
+        self.assertLessEqual(e["wakeAt"] - self.q.now, gg.LAND_WAIT_STATUS)
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("risk evidence", "COMPLETED", "SUCCESS"),
+                            ("cmux/land-tier", "PENDING", None, said)])
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick(gg.LAND_WAIT_STATUS + 1)
+        self.assertEqual(self.w.answers, [], "judged at the wake, not left to the 1 h one")
+
+    def test_a_wait_with_no_pending_status_keeps_the_default_wake(self):
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("risk evidence", "PENDING", None)])
+        self.land()
+        e = self.tick()
+        self.assertGreaterEqual(e["wakeAt"] - self.q.now, gg.LAND_WAIT_DEFAULT - 5)
+
     def test_a_waiting_row_whose_checks_finish_but_the_label_gated_one_is_judged_at_the_next_read(self):
         # cmux#61127, 2026-11-27: waiting on `risk evidence` (12:05Z); it finished 12:11Z, leaving only
         # cmux/land-tier ("Cheap tier: ... runs when ready-to-land ... is added"). No feed event follows a status or
