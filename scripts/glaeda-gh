@@ -15704,6 +15704,18 @@ def land_direct_read(key: str) -> str | None:
 # that follows reads the daemon's copy instead of GitHub.
 LAND_REFRESH_BATCH = 50  # PRs per batched refresh (one probe query of ~3 requests a PR: 50 is about 2 points)
 LAND_REFRESH_BATCH_BUDGET = 180.0  # seconds one batch's reads may take (a single read's is DIRECT_READ_BUDGET)
+# A refresh that ended "not read: deferred" (the batch's time ran out before its turn) was owed a read, and got the same
+# wait as one that was read: LAND_REFRESH_EVERY (600 s) or the own-login cap, in the order the pass met the rows, not
+# the order of their copies' age. cmux-cp-1, 2026-11-27 12:57-13:23Z: 147 of 524 land refreshes (28 %) came back
+# deferred, 126 of them "the tick's time (TICK_BUDGET) ran out before it was read", their copies' median age 3,497 s
+# against 1,711 s for the refreshes that were read, the oldest 33,869 s: three 50-row batches of one repository ran at
+# once, each throwaway Daemon met 30 full reads of PRs with 3 to 14 s a read (and 10.5 s on every 502), and the rows
+# at the tail of each batch never had their turn, then waited LAND_REFRESH_EVERY for the next one.
+# Now a deferred row is owed (refreshDeferred, since when): it is read again after LAND_REFRESH_DEFERRED_RETRY, past the
+# own-login cap, and the pass hands the workers the owed rows first, then the oldest copies first (flush_refreshes);
+# a batch's full reads go oldest copy first, so the tail its budget cuts is the newest.
+LAND_REFRESH_DEFERRED_RETRY = 60.0
+LAND_REFRESH_DEFERRED_PREFIX = "not read: deferred, "
 
 
 def land_queue_keys_on_disk() -> frozenset[str]:
@@ -15776,6 +15788,7 @@ def land_direct_read_many(keys: list[str]) -> dict[str, str | None]:
                         continue
                     full += part if error else changed
                     confirmed += 0 if error else len(part) - len(changed)
+                full.sort(key=daemon.read_turn)  # the oldest copies' full reads first: the tail the budget cuts is the newest
                 # why each row was or was not read in full: the land host's cache is not readable from elsewhere, and
                 # #2853 and its follow-up confirmed no row there for an hour with nothing to say which check refused it
                 log({"event": "land-probe-split", "n": len(entries), "probed": len(probe), "confirmed": confirmed,
@@ -15796,7 +15809,7 @@ def land_direct_read_many(keys: list[str]) -> dict[str, str | None]:
                 # 08:41-09:03Z: 69 batched rows ended "no data stored", about half of each 50-row batch, with no reason.
                 miss = getattr(daemon, "miss_why", None) or {}
                 for k in daemon.deferred:
-                    errors.setdefault(k, "not read: deferred, " + (miss.get(k) or "no reason kept"))
+                    errors.setdefault(k, LAND_REFRESH_DEFERRED_PREFIX + (miss.get(k) or "no reason kept"))
         except OutOfTime as stop:
             why = f"no answer within {LAND_REFRESH_BATCH_BUDGET:g}s" + (f" ({stop})" if str(stop) else "")
             errors.update({k: why for k in todo if k not in errors})
@@ -23942,6 +23955,9 @@ class LandQueue:
         urgent = e["state"] == "queued" or (e.get("wait") or {}).get("kind") == "head_change"
         own = not self.reads_upstream()
         every = LAND_OWN_REFRESH_AFTER if own else LAND_REFRESH_AFTER if urgent else LAND_REFRESH_EVERY
+        owed = isinstance(e.get("refreshDeferred"), (int, float)) and not isinstance(e.get("refreshDeferred"), bool)
+        if owed:
+            every = min(every, LAND_REFRESH_DEFERRED_RETRY)  # a read it was owed, not one it had
         if not before and isinstance(last, (int, float)) and self.now - last < every:
             return False
         checks_wait = False
@@ -23960,8 +23976,8 @@ class LandQueue:
             self.own_refreshed = [t for t in self.own_refreshed if self.now - t < LAND_WINDOW_S]
             stale_request = before or (isinstance(asked, (int, float)) and not isinstance(asked, bool)
                                        and asked - at >= LAND_OWN_REFRESH_AFTER)
-            if (not stale_request and not checks_wait) or (len(self.own_refreshed) >= LAND_OWN_REFRESH_MAX
-                                                            and not before):
+            if (not stale_request and not checks_wait and not owed) \
+                    or (len(self.own_refreshed) >= LAND_OWN_REFRESH_MAX and not before and not owed):
                 return False  # a held conflict stop's one read is the request's own, past the host cap
         if not before and not checks_wait and self.now - at < LAND_FEED_QUIET_MAX and self.feed_quiet(e["key"], "", at):
             if e.get("feedNoRefresh") != at:  # counted once per copy not re-read, not per pass
@@ -23998,11 +24014,21 @@ class LandQueue:
         with self.lock:
             queued, self.refresh_queued = self.refresh_queued, {}
             for keys in queued.values():
+                keys.sort(key=self.refresh_turn)  # owed rows first, then the oldest copies: the first batch is theirs
                 for i in range(0, len(keys), LAND_REFRESH_BATCH):
                     batch = keys[i:i + LAND_REFRESH_BATCH]
                     for k in batch:
                         self.refresh_batched[k] = batch[0]
                     self.submit(batch[0], self.refresh_batch_job, batch)
+
+    def refresh_turn(self, key: str) -> tuple[int, float]:
+        """The order refreshes are handed to workers in: a row owed a read (refreshDeferred, since when) first, the
+        longest owed first, then the oldest copy first (never read: first)."""
+        owed = (self.entries.get(key) or {}).get("refreshDeferred")
+        if isinstance(owed, (int, float)) and not isinstance(owed, bool):
+            return (0, float(owed))
+        at = (self.cache_of(key) or {}).get("dataAt")
+        return (1, float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else 0.0)
 
     def refresh_batch_job(self, keys: list[str]) -> None:
         """One batched read of KEYS (refresh_many), then each key's outcome as refresh_job records it."""
@@ -24105,6 +24131,13 @@ class LandQueue:
                 return
             probe = bool((e.get("refresh") or {}).get("probe"))
             e["refresh"] = {**(e.get("refresh") or {}), "error": land_trim(error, 160) if error else None}
+            if error and error.startswith(LAND_REFRESH_DEFERRED_PREFIX):
+                # no time was left for it, nothing was asked of GitHub: owed a read, not a row that was read
+                e["refresh"]["deferred"] = True
+                if not isinstance(e.get("refreshDeferred"), (int, float)):
+                    e["refreshDeferred"] = self.now
+            else:
+                e.pop("refreshDeferred", None)
             if error:  # in a row with no answer (LAND_REFRESH_UNANSWERED); ever answered, for `land status`
                 e["refreshUnanswered"] = int(e.get("refreshUnanswered") or 0) + 1
             else:

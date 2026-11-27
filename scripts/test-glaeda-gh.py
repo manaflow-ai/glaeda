@@ -42073,6 +42073,39 @@ class LandTest(Base):
         for key in keys:
             self.assertFalse(self.due(key), "read: fresh")
 
+    def test_a_deferred_refresh_is_owed_and_read_first_oldest_copy_first(self):
+        """cmux-cp-1, 2026-11-27 12:57-13:23Z: 147 of 524 land refreshes (28 %) came back "not read: deferred, the tick's
+        time ran out", their copies' median age 3,497 s (the read ones' 1,711 s), the oldest 33,869 s: the pass handed
+        the rows out in its own order, a deferred row then waited as long as one that was read, and went again at the
+        tail. A deferred row is owed (refreshDeferred): read again after LAND_REFRESH_DEFERRED_RETRY, and the pass hands
+        the owed rows first, then the oldest copies."""
+        deferred = gg.LAND_REFRESH_DEFERRED_PREFIX + "the tick's time (TICK_BUDGET) ran out before it was read"
+        batches, rows = self.batched_refresh_queue(answer=deferred)
+        keys = [self.KEY, "pr:o/r#2"] + self.stale_rows("o/r", range(3, 61))
+        for n, key in enumerate(keys):  # the pass meets them newest copy last, oldest copy first on the highest number
+            self.w.cache[key]["dataAt"] = self.t - 3600 - n
+        for key in keys:
+            self.assertTrue(self.due(key))
+        self.q.flush_refreshes()
+        oldest = sorted(keys, key=lambda k: self.w.cache[k]["dataAt"])
+        self.assertEqual(batches[0], oldest[:gg.LAND_REFRESH_BATCH], "the oldest copies take the first batch")
+        for key in keys:
+            self.assertIsInstance(self.q.entries[key].get("refreshDeferred"), float, key)
+            self.assertFalse(self.due(key), "not at once")
+        self.q.now = self.t + gg.LAND_REFRESH_DEFERRED_RETRY + 1  # sooner than LAND_REFRESH_AFTER's 120 s
+        self.assertLess(gg.LAND_REFRESH_DEFERRED_RETRY, gg.LAND_REFRESH_AFTER)
+        for key in keys:
+            self.assertTrue(self.due(key), key)
+        # the rows the pass queues now: the longest owed first, whatever the age of the copy
+        self.q.refresh_queued.clear()
+        self.q.entries["pr:o/r#3"]["refreshDeferred"] = self.t - 500
+        self.q.refresh_queued["o/r"] = [k for k in keys]
+        batches.clear()
+        self.q.refresh_many = lambda ks: (batches.append(list(ks)), {k: None for k in ks})[1]
+        self.q.flush_refreshes()
+        self.assertEqual(batches[0][0], "pr:o/r#3")
+        self.assertNotIn("refreshDeferred", self.q.entries["pr:o/r#3"], "read: no longer owed")
+
     def test_a_batch_refused_for_quota_holds_refreshes_once(self):
         """A batch whose every read comes back DIRECT_QUOTA sets one hold (as one refused read does), not one a row."""
         batches, rows = self.batched_refresh_queue(gg.DIRECT_QUOTA)
