@@ -3880,6 +3880,20 @@ RUNNER_DRAIN_FILE = ".glaeda-drain"
 DRAIN_TTL_S = 3600.0
 DRAIN_MAX_BYTES = 4096
 
+# APPLY_DRAIN_IDLE_BOUND: the apply's marker (APPLY_DRAIN_BY) asks the runner to empty so the apply's next look can
+# re-register it; nothing on the mini runs that look. On cmux24 (2026-11-27) a glaeda-cmux-runner-fleet pass at
+# 13:37Z could not read GitHub's labels, planned a blind re-register while six dedicated runners had jobs, and marked
+# them draining. Their jobs ended by 14:11Z, no apply came back (GitHub's labels already matched), and the gates held
+# the idle listeners off until the marker's 1 h expiry: hq-fleet-route, -lan and -lan-2 served nothing for up to an
+# hour with 3 and 6 jobs queued. Now a gate whose listener has stood stopped under an apply's marker for
+# APPLY_DRAIN_IDLE_MAX_S (no job can run then, so the apply had its idle window) moves the marker aside
+# (RUNNER_DRAIN_FILE + ".waived"), logs APPLY_DRAIN_STALE (the alert: grep it, ci-dash reads the gate state line)
+# and listens again under the registration it has. A later apply that still needs the relabel drains again. The
+# clock is kept in the state dir (apply_drain_idle_file) so a reload or a restart of the gate does not restart it.
+# Hand drains and cmux-ci's are untouched: their writers end them. Off: GLAEDA_APPLY_DRAIN_IDLE_MAX_S=0.
+APPLY_DRAIN_IDLE_MAX_S = float(os.environ.get("GLAEDA_APPLY_DRAIN_IDLE_MAX_S") or 600.0)
+APPLY_DRAIN_STALE = "APPLY_DRAIN_STALE"
+
 
 def runner_drain(runner_dir: Path, now: float, fleet_dir: str | None = None) -> str | None:
     """Why this runner is draining (RUNNER_DRAIN, or HOST_RUNNER_PAUSE on any runner but the nightly slot), or None:
@@ -12017,6 +12031,28 @@ def gate_state_file(state_dir: Path, runner_dir: Path) -> Path:
     return state_dir / f"gate-{runner_dir.name}.json"
 
 
+def apply_drain_idle_file(state_dir: Path, runner_dir: Path) -> Path:
+    return state_dir / f"apply-drain-idle-{runner_dir.name}.json"
+
+
+def apply_drain_idle_since(state_dir: Path, runner_dir: Path, key: str, now: float) -> float:
+    """When the gate first saw this runner's listener stopped under the apply marker `key` (APPLY_DRAIN_IDLE_BOUND),
+    kept on disk across reloads and restarts; a new marker starts a new clock. A clock that cannot be kept starts
+    now each time, which only keeps the old behaviour (the marker's expiry)."""
+    path = apply_drain_idle_file(state_dir, runner_dir)
+    with contextlib.suppress(OSError, ValueError, TypeError, AttributeError, UnicodeDecodeError):
+        doc = json.loads(path.read_text(encoding="utf-8")[:DRAIN_MAX_BYTES])
+        since = float(doc["since"])
+        if doc.get("key") == key and math.isfinite(since) and since <= now:
+            return since
+    with contextlib.suppress(OSError):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + f".{os.getpid()}")
+        tmp.write_text(json.dumps({"key": key, "since": now}) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    return now
+
+
 def gate_stamp(at: float) -> str:
     return time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(at))
 
@@ -12107,6 +12143,7 @@ class Gate:
         self.job_done_at: float | None = None  # when the runner's last job ended (claim_stamp), monotonic
         self.job_ending = False  # job-completed left JOB_ENDING: look again the moment the Worker exits
         self.child: subprocess.Popen[bytes] | None = None
+        self.apply_drain_alerted: str | None = None  # the apply marker whose APPLY_DRAIN_STALE move failed, logged once
         self.stop_deadline: float | None = None  # set while a stop the gate asked for is under way
         self.streak = 0
         self.held: str | None = None
@@ -13056,8 +13093,35 @@ class Gate:
 
     def draining(self) -> str | None:
         """RUNNER_DRAIN: an apply waits to re-register or retire this runner. One small file, read every poll; a
-        dedicated runner drains too."""
-        return runner_drain(self.runner_dir, time.time())
+        dedicated runner drains too. An apply's marker held past APPLY_DRAIN_IDLE_MAX_S with the listener
+        stopped ends here (APPLY_DRAIN_IDLE_BOUND)."""
+        now = time.time()
+        why = runner_drain(self.runner_dir, now)
+        if why is None or self.child is not None:
+            return why  # no drain, or a listener still runs (a job, or one the gate is about to stop)
+        doc = runner_drain_doc(self.runner_dir, now)
+        if doc is None or doc.get("by") != APPLY_DRAIN_BY or APPLY_DRAIN_IDLE_MAX_S <= 0:
+            return why
+        key = f"{doc.get('until')}|{doc.get('reason')}"
+        since = apply_drain_idle_since(self.state_dir, self.runner_dir, key, now)
+        if now - since < APPLY_DRAIN_IDLE_MAX_S:
+            return why
+        marker = self.runner_dir / RUNNER_DRAIN_FILE
+        try:
+            os.replace(marker, marker.with_name(RUNNER_DRAIN_FILE + ".waived"))
+        except OSError as error:  # the marker's expiry still ends it; say so once
+            if self.apply_drain_alerted != key:
+                gate_log(f"{APPLY_DRAIN_STALE}: {why} has held the idle listener off for {(now - since) / 60:.0f} "
+                         f"min with no apply; its marker could not be moved aside ({type(error).__name__}), so it "
+                         "holds until it expires")
+                self.apply_drain_alerted = key
+            return why
+        gate_log(f"{APPLY_DRAIN_STALE}: {why} held the idle listener off for {(now - since) / 60:.0f} min and no "
+                 "apply came to re-register it: the marker is moved aside and the listener serves under its current "
+                 "registration; re-run glaeda-cmux-runner-fleet --apply if the relabel is still due")
+        with contextlib.suppress(OSError):
+            apply_drain_idle_file(self.state_dir, self.runner_dir).unlink()
+        return runner_drain(self.runner_dir, now)
 
     def still_reserved(self) -> str | None:
         """The host's reservation, read afresh (one small file): why it holds the host, or None. A dedicated runner

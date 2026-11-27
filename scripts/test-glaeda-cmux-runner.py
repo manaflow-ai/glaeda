@@ -14080,6 +14080,52 @@ class GateTest(unittest.TestCase):
         marker.unlink()
         self.assertIsNone(gate.draining())
 
+    def test_an_apply_drain_with_no_job_ends_within_its_bound_and_alerts(self) -> None:
+        """APPLY_DRAIN_IDLE_BOUND (cmux24, 2026-11-27): an apply marked six dedicated runners draining for a relabel,
+        their jobs ended, no apply came back, and the gates held the idle listeners off for up to an hour. A stopped
+        listener under an apply's marker listens again APPLY_DRAIN_IDLE_MAX_S later, and the gate says so."""
+        gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+        marker = self.runner / hook.RUNNER_DRAIN_FILE
+        reason = "a relabel to glaeda-hq-fleet-route,glaeda-runner-cmux24-hq-fleet-route"
+        marker.write_text(json.dumps({"by": hook.APPLY_DRAIN_BY, "reason": reason, "until": time.time() + 3000}))
+        held = f"draining for {reason}"
+        logs: list[str] = []
+        start = time.time()
+        with mock.patch.object(hook, "gate_log", side_effect=logs.append):
+            gate.child = mock.Mock()  # a listener still runs (its job, or one about to stop): the drain holds
+            self.assertEqual(gate.draining(), held)
+            self.assertFalse(hook.apply_drain_idle_file(self.state, self.runner).exists(), "no clock under a job")
+            gate.child = None
+            self.assertEqual(gate.draining(), held)
+            with mock.patch.object(hook.time, "time", return_value=start + hook.APPLY_DRAIN_IDLE_MAX_S - 30):
+                self.assertEqual(gate.draining(), held, "inside the bound the apply's look may still come")
+                # a reload or restart of the gate keeps the clock
+                again = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+                self.assertEqual(again.draining(), held)
+            self.assertEqual(logs, [])
+            with mock.patch.object(hook.time, "time", return_value=start + hook.APPLY_DRAIN_IDLE_MAX_S + 1):
+                self.assertIsNone(again.draining(), "past the bound with no job: the listener serves again")
+        self.assertFalse(marker.exists())
+        self.assertTrue((self.runner / (hook.RUNNER_DRAIN_FILE + ".waived")).exists(), "kept as evidence")
+        self.assertEqual(len(logs), 1, logs)
+        self.assertTrue(logs[0].startswith(hook.APPLY_DRAIN_STALE), logs)
+        self.assertIn("glaeda-cmux-runner-fleet --apply", logs[0])
+        # a new marker (the apply came back and still needs the runner idle) starts a new clock
+        marker.write_text(json.dumps({"by": hook.APPLY_DRAIN_BY, "reason": reason, "until": time.time() + 3500}))
+        self.assertEqual(gate.draining(), held)
+        # a hand drain and cmux-ci's are their writers' to end: no bound here
+        for by in ("a hand drain", hook.CMUX_CI_DRAIN_BY):
+            marker.write_text(json.dumps({"by": by, "reason": "r", "until": time.time() + 3000}))
+            self.assertEqual(gate.draining(), "draining for r")
+            with mock.patch.object(hook.time, "time", return_value=time.time() + hook.APPLY_DRAIN_IDLE_MAX_S * 2):
+                self.assertEqual(gate.draining(), "draining for r", by)
+        self.assertTrue(marker.exists())
+        # the off switch keeps the marker's expiry as the only end
+        marker.write_text(json.dumps({"by": hook.APPLY_DRAIN_BY, "reason": reason, "until": time.time() + 3000}))
+        with mock.patch.object(hook, "APPLY_DRAIN_IDLE_MAX_S", 0.0), \
+                mock.patch.object(hook.time, "time", return_value=time.time() + 2000):
+            self.assertEqual(gate.draining(), held)
+
     def test_a_reservation_released_before_the_job_ends_keeps_the_listener(self) -> None:
         gate, stops = self.gate([None] * 3, busy=[True])
         self.reserve(gate)

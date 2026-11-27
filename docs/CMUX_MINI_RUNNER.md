@@ -838,7 +838,14 @@ What `--apply` does:
      re-registers or retires it and removes the marker. A runner on a busy label used
      to take its next job seconds after each one ended, so the retries never saw it
      idle (glaeda#1825). Before a drain, a non-dedicated runner's planned hook writes
-     land, so an older gate reloads one that reads the marker.
+     land, so an older gate reloads one that reads the marker. Nothing on the mini runs
+     that next `--apply`, so an apply's marker is bounded on the idle side too
+     (`APPLY_DRAIN_IDLE_BOUND`): once the listener has stood stopped under it for
+     `APPLY_DRAIN_IDLE_MAX_S` (10 min; `GLAEDA_APPLY_DRAIN_IDLE_MAX_S=0` turns it off),
+     the gate moves it aside to `.glaeda-drain.waived`, logs `APPLY_DRAIN_STALE` and
+     listens under the registration it has (cmux24, 2026-11-27: six dedicated runners
+     held idle up to an hour behind a blind re-register no apply came back for). Hand
+     drains and cmux-ci's lend drain are left to their writers.
    - job-started still refuses a job handed over in the moment before a stop.
    - **A drained host.** Every listener role honours `.glaeda-drain` (gui, session,
      nightly, fast and dedicated runners included). When every runner on a mini has a live
