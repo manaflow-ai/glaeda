@@ -2400,8 +2400,13 @@ def cache_budget_state(fams: list[Family], fss: "dict[int, Fs]", sizes: dict[str
         except ValueError:
             free_need = 0
         row["free_short"] = max(0, free_need - fs.free)
+        # the fleet compilation cache above its budget cap closes a shortfall too: fleet_cas_budget_cap takes it back
+        # with a fetch, never a rebuild. No survey item counts it, so a mini whose only slack was its CAS (cmux17,
+        # 2026-11-27: 16 GiB of CAS, 36 GiB free under the runner gate's 41.8 GiB floor) read over 0 and every
+        # floor eviction freed 0.0 GiB while its gui-light runner stayed held.
+        cas_excess = max(0, row["families"].get("fleet-cas", 0) - fleet_cas_cap_bytes(fs.total))
         closable = (max(0, row["free_short"] - (unclosable or {}).get(dev, 0)) if reclaimable is None
-                    else min(row["free_short"], reclaimable.get(dev, 0)))
+                    else min(row["free_short"], reclaimable.get(dev, 0) + cas_excess))
         row["free_short_left"] = row["free_short"] - closable
         row["over"] = min(row["used"], max(over_share, closable))
     return out
@@ -2673,9 +2678,15 @@ POLICY_DEFAULTS: dict[str, Any] = {
     # cargo-stale-artifacts (sweep_cargo_targets): inside every Cargo target under these roots, live worktree or not,
     # a <profile>/deps unit or <profile>/incremental crate dir whose files' mtime and atime are all older than
     # cargo_stale_hours goes, the newest per crate stem always stays. [] or 0 turns it off.
+    # /Users/Shared/cmux-build-fleet/cache: the hq lent and dev-build workers' shared cmux-tui-target/src-<hash>, which
+    # grew 13 -> 32 GiB in a night (release/incremental 26 GiB) on gui-light carriers whose runner gate then held the
+    # listener off for disk (2026-11-27); its family keeps the whole target while a build names it
     "cargo_stale_roots": ["~/Projects", "~/.wt/checkouts", "~/.cache/cargo-target", "~/lanes", "~/lane-scratch",
-                          "~/lab-target"],
+                          "~/lab-target", "/Users/Shared/cmux-build-fleet/cache"],
     "cargo_stale_hours": 6.0,
+    # a pressure pass (under the floor) trims units unused this long instead: least recently used first by age, the
+    # newest unit of every crate stem and anything open still stay. 0: the pressure pass uses cargo_stale_hours too
+    "pressure_cargo_stale_hours": 1.0,
     # The fleet controller's base URL (http://host:port, over the tailnet). Set, shared-mirror-compact asks its
     # POST /v1/seeds/release before a fold deletes a mirror's packs and folds only on "ok" (seed_release_veto).
     # "" (the default): no call; the seed heartbeat that fills the controller's holder index is not built yet, so
@@ -5090,12 +5101,29 @@ CARGO_STALE_SEARCH_SKIP = frozenset({".git", "node_modules", ".build", "DerivedD
                                      ".gradle", "Pods", "src", "tests", "docs"})
 
 
+CARGO_PROFILE_NAMES = frozenset({"debug", "release"})
+
+
+def cargo_untagged_target(path: Path, names: set[str]) -> bool:
+    """PATH is a Cargo target directory with no CACHEDIR.TAG: cargo writes the tag only when it creates the directory,
+    so a CARGO_TARGET_DIR a tool made first (the hq worker's cmux-tui-target/src-<hash>) has none. A debug or release
+    child holding cargo's build lock (.cargo-lock) beside deps or incremental proves it."""
+    for name in CARGO_PROFILE_NAMES & names:
+        prof = path / name
+        if (not prof.is_symlink() and os.path.lexists(prof / ".cargo-lock")
+                and any((prof / p).is_dir() and not (prof / p).is_symlink() for p in CARGO_PART_DIRS)):
+            return True
+    return False
+
+
 def cargo_target_dir(path: Path, names: set[str] | None = None) -> bool:
-    """PATH is a Cargo target directory: a real directory holding cargo's CACHEDIR.TAG."""
-    if names is not None and "CACHEDIR.TAG" not in names:
+    """PATH is a Cargo target directory: a real directory holding cargo's CACHEDIR.TAG, or an untagged one
+    (cargo_untagged_target) when NAMES, its entries, are given."""
+    if path.is_symlink() or not path.is_dir():
         return False
-    return (not path.is_symlink() and path.is_dir()
-            and bool(CARGO_TAG.search(_head(os.fspath(path / "CACHEDIR.TAG"), 256))))
+    if names is not None and "CACHEDIR.TAG" not in names:
+        return cargo_untagged_target(path, names)
+    return bool(CARGO_TAG.search(_head(os.fspath(path / "CACHEDIR.TAG"), 256)))
 
 
 def cargo_stale_roots(home: Path | None = None) -> list[Path]:
@@ -19121,7 +19149,11 @@ def _main_impl(argv: list[str] | None = None) -> int:
         cargo_stale_freed = 0
         if ((a.pressure or sweep) and not RUNNER_CACHE_PROFILE and not a.cmux_next_drain and not reserved
                 and not out_of_band and not DEAD_MODE and (not a.family or CARGO_STALE_FAMILY in a.family)):
-            cargo_stale = sweep_cargo_targets(a.receipt, halt=halt)
+            pressure_hours = float(POLICY.get("pressure_cargo_stale_hours") or 0)
+            base_hours = float(POLICY.get("cargo_stale_hours") or 0)  # 0: the pass is off, pressure or not
+            stale_hours = (min(base_hours, pressure_hours) if a.pressure and pressure_hours > 0 and base_hours > 0
+                           else None)
+            cargo_stale = sweep_cargo_targets(a.receipt, halt=halt, stale_hours=stale_hours)
             cargo_stale_freed = cargo_stale["bytes"]
             RUN["cargo_stale_gib"] = round(cargo_stale_freed / GIB, 1)
             if cargo_stale["units"] or cargo_stale["stopped"]:
@@ -19370,6 +19402,16 @@ FLEET_CAS_PRUNE_TIMEOUT_S = 300.0
 FLEET_CAS_BUDGET_SHARE = 0.025
 
 
+def fleet_cas_cap_gib(total: int) -> float:
+    """The cap each fleet-cas store gets over the cache budget on a volume of TOTAL bytes, in GiB."""
+    return max(2.0, round(total * FLEET_CAS_BUDGET_SHARE / GIB, 1))
+
+
+def fleet_cas_cap_bytes(total: int) -> int:
+    """What both fleet-cas stores may hold together under their budget cap (node store and local CAS each)."""
+    return int(2 * fleet_cas_cap_gib(total) * GIB)
+
+
 def _fleet_cas_prune(root: Path, prune: Path, args: list[str]) -> dict[str, Any] | None:
     """One glaeda-fleet-cas-prune run (ARGS) bounded by FLEET_CAS_PRUNE_TIMEOUT_S: its JSON line, None when the prune or
     fleet-cas is absent, or the run failed."""
@@ -19457,7 +19499,7 @@ def fleet_cas_budget_cap(fss: "dict[int, Fs]", root: Path | None = None) -> int:
     RUN["fleet_cas_budget_cap"] = True
     counted = CACHE_BUDGET[dev].get("families", {}).get("fleet-cas", 0)
     before = read_fleet_cas_record()
-    freed = fleet_cas_node_cap(root, cap_gib=max(2.0, round(fss[dev].total * FLEET_CAS_BUDGET_SHARE / GIB, 1)))
+    freed = fleet_cas_node_cap(root, cap_gib=fleet_cas_cap_gib(fss[dev].total))
     after = read_fleet_cas_record()
     if after and after.get("dev") == dev and after["at"] > (before.get("at", 0.0) if before else 0.0):
         shrank = max(0, counted - after["bytes"])

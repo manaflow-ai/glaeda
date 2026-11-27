@@ -15053,6 +15053,26 @@ class CacheBudgetTest(unittest.TestCase):
         gd.POLICY["cache_budget_free"] = "0"  # the share alone: under it, nothing to give back
         self.assertEqual(gd.cache_budget_state([fam], {self.dev: fs}, sizes, {})[self.dev]["over"], 0)
 
+    def test_a_fleet_cas_over_its_cap_closes_a_free_shortfall_no_survey_item_can(self) -> None:
+        # cmux17, 2026-11-27: 36 GiB free on a 228 GB mini, 16 GiB of fleet CAS, nothing else reclaimable; the
+        # volume read over 0, so fleet_cas_budget_cap never ran and every floor eviction freed 0.0 GiB
+        fs = gd.Fs(self.dev, "/", 36 * gd.GIB, 228 * 10**9, 100 * gd.GIB, 150 * gd.GIB)
+        fam = gd.Family("cmux-seeds", self.root, True, "")
+        cas = {"at": 1000.0, "dev": self.dev, "bytes": 16 * gd.GIB}
+        row = gd.cache_budget_state([fam], {self.dev: fs}, {}, cas, now=1000.0, reclaimable={})[self.dev]
+        excess = 16 * gd.GIB - gd.fleet_cas_cap_bytes(fs.total)
+        self.assertGreater(excess, 0)
+        self.assertEqual(row["over"], excess)
+        self.assertEqual(row["free_short_left"], row["free_short"] - excess)
+        # a CAS under its cap closes nothing: the volume stays not over, as before
+        small = {**cas, "bytes": gd.fleet_cas_cap_bytes(fs.total)}
+        row = gd.cache_budget_state([fam], {self.dev: fs}, {}, small, now=1000.0, reclaimable={})[self.dev]
+        self.assertEqual(row["over"], 0)
+        # no free shortfall: the share alone decides, the CAS excess adds nothing
+        roomy = gd.Fs(self.dev, "/", 150 * gd.GIB, 228 * 10**9, 100 * gd.GIB, 150 * gd.GIB)
+        row = gd.cache_budget_state([fam], {self.dev: roomy}, {}, cas, now=1000.0, reclaimable={})[self.dev]
+        self.assertEqual(row["over"], 0)
+
     def test_reclaimable_counts_only_reclaimable_budget_family_items_once(self) -> None:
         dd = gd.Family("xcode-derived-data", self.root, True, "")
         r = os.fspath(self.root)
@@ -17189,6 +17209,33 @@ class CargoStaleArtifactsTest(unittest.TestCase):
         (self.root / ".wt/checkouts/cmux/lane--live/link").symlink_to(elsewhere.parent)
         found = gd.find_cargo_targets([self.root / ".wt/checkouts"])
         self.assertEqual(found, [self.target])
+
+    def test_the_hq_workers_untagged_shared_target_is_found_and_trimmed(self) -> None:
+        # the hq worker's CARGO_TARGET_DIR, cache/cmux-tui-target/src-<hash>, is made before cargo runs, so it has no
+        # CACHEDIR.TAG; 2026-11-27 its release/incremental held 26 GiB on a gui-light carrier under its disk floor
+        cache = self.root / "fleet-cache"
+        rel = cache / "cmux-tui-target/src-681de312a68b64a3/release"
+        for d in ("deps", "incremental"):
+            (rel / d).mkdir(parents=True)
+        (rel / ".cargo-lock").write_text("")
+        old, new = rel / "incremental/acpmux-0fjl8gce3js7d", rel / "incremental/acpmux-24cir4ig20wvn"
+        for unit, hours in ((old, 3), (new, 0.1)):
+            unit.mkdir()
+            (unit / "query-cache.bin").write_bytes(b"x" * 8192)
+            when = time.time() - hours * 3600
+            os.utime(unit / "query-cache.bin", (when, when))
+            os.utime(unit, (when, when))
+        no_lock = cache / "not-a-target/release/deps"  # a release/deps with no cargo lock is no target
+        no_lock.mkdir(parents=True)
+        self.assertEqual(gd.find_cargo_targets([cache]), [rel.parent])
+        self.assertIn("/Users/Shared/cmux-build-fleet/cache", gd.POLICY_DEFAULTS["cargo_stale_roots"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            gd.sweep_cargo_targets(self.receipt, [cache], stale_hours=6.0)
+        self.assertTrue(old.exists(), "3 h unused is inside cargo_stale_hours")
+        with contextlib.redirect_stdout(io.StringIO()):
+            gd.sweep_cargo_targets(self.receipt, [cache], stale_hours=gd.POLICY_DEFAULTS["pressure_cargo_stale_hours"])
+        self.assertFalse(old.exists(), "a pressure pass trims what sat unused past its shorter window")
+        self.assertTrue(new.exists(), "the newest unit of the crate stem stays")
 
     def test_policy_roots_reach_lane_worktrees(self) -> None:
         self.assertIn("~/.wt/checkouts", gd.POLICY_DEFAULTS["cargo_stale_roots"])
