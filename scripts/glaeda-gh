@@ -19973,7 +19973,12 @@ class LandQueue:
     def apply(self, req: dict, key: str, repo: str, number: int) -> None:
         e = self.entries.get(key)
         rid = req.get("id")
-        if e and rid and rid in (e.get("requestId"), e.get("cancelId")):
+        # A hand-off of a row this host forwarded is that row coming back (a peer's overflow, or the executor's take
+        # back), not a resend: it keeps the request id it left with, so it is applied, not skipped. hq#32407,
+        # 2026-11-27: cmux-cp-1 overflowed it to cmux-cp-2 at 14:12Z; cp-2 overflowed it back at 14:30Z, cp-1 answered
+        # "accepted" and dropped it here as already applied, and both rows sat "forwarded" to each other for 16 h.
+        returning = bool(e and e.get("state") == LAND_FORWARDED and req.get("handoff"))
+        if e and rid and rid in (e.get("requestId"), e.get("cancelId")) and not returning:
             return  # applied before a crash took the request's deletion with it
         if req.get("op") == LAND_WITHDRAW:
             # A stopped entry is cancelled too: a stop that can clear by itself is re-armed (rearm), so leaving it
