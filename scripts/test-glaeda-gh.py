@@ -10427,6 +10427,38 @@ class TickBudgetTest(Base):
         self.assertLessEqual(pr_until - start, gg.WAITED_TICK_SHARE + 1, "waited reads leave the heads their minimum")
         self.assertGreaterEqual(head_until - time.monotonic(), gg.HEADS_MIN_SHARE - 5, "the heads have their minimum share")
 
+    def test_a_slow_waited_kind_leaves_the_waited_kinds_after_it_their_own_share(self) -> None:
+        """cmux-cp-1, 2026-11-27 12:3xZ to 16:1xZ: PR batches GitHub answered 502/504 after ~10.9 s took the whole waited
+        share (pr, run and comment shared one deadline), every waited run batch after the first was deferred as "the runs'
+        share of the tick", and a waited run's data reached 13,419 s. A kind that goes first now ends early enough to leave
+        each waited kind after it WAITED_KIND_MIN_SHARE, and one that starts late still has that minimum."""
+        self.daemon.budget = {"rest": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800},
+                              "graphql": {"limit": 5000, "remaining": 4500, "reset": NOW + 1800}}
+        for n in range(1, 4):
+            gg.register(f"pr:o/r#{n}", waited=True)
+        gg.register("run:o/r/77", waited=True)
+        self.daemon.paths = {**self.daemon.paths, "pr": "graphql", "run": "graphql"}
+        self.daemon.gql_first = 0  # pr goes first, as on cmux-cp-1
+        calls: list[tuple[str, float | None, float]] = []
+
+        def batched(kind, entries, fetch, until=None, pr_timeout_rest=None):
+            if entries:
+                calls.append((kind, until, time.monotonic()))
+                if kind == "pr" and until is not None:  # the 502ing PR batches: they take all the time they are given
+                    time.sleep(max(0.0, until - time.monotonic()))
+            return []
+        start = time.monotonic()
+        with mock.patch.object(gg, "WAITED_TICK_SHARE", 2.0), mock.patch.object(gg, "WAITED_KIND_MIN_SHARE", 0.6), \
+                mock.patch.object(self.daemon, "batched", side_effect=batched):
+            self.daemon.tick(NOW)
+        kinds = [k for k, _, _ in calls]
+        self.assertIn("run", kinds, calls)
+        self.assertLess(kinds.index("pr"), kinds.index("run"), calls)
+        pr_until = next(u for k, u, _ in calls if k == "pr")
+        run_until, run_at = next((u, at) for k, u, at in calls if k == "run")
+        self.assertLessEqual(pr_until - start, 2.0 - 0.6 + 0.1, "the PRs stop short of the share, leaving the runs theirs")
+        self.assertGreater(run_until - run_at, 0.4, "the waited runs have their own share left when their turn comes")
+
     def test_waited_prs_a_probe_confirms_are_read_before_the_ones_that_need_a_full_read(self) -> None:
         """The land host, 2026-11-27: waited PRs needing full reads (1.5-4 s each) went in deferral order ahead of the
         probe-eligible ones (~0.5 s), so a window stored ~30 of ~330. The cheap ones lead, order kept within a group."""

@@ -693,6 +693,14 @@ WAITED_POOL_BUDGET = 50.0
 # read loop. The staleness the stale alarm reports is what starts the pool: the alarm's cause is healed, not only said.
 WAITED_POOL_STALE_S = 300.0  # STALE_DATA_AFTER (600, defined below) / 2
 WAITED_TICK_SHARE = TICK_BUDGET - HEADS_MIN_SHARE
+# ... and inside that share each waited kind (pr, run, comment) keeps WAITED_KIND_MIN_SHARE s for itself: the share was one
+# deadline for all three, so the kind that went first took it. cmux-cp-1, 2026-11-27 12:3xZ to 16:1xZ: manaflow-ai/cmux
+# PR batches GitHub answered 502/504 after ~10.9 s, split and retried, took the whole waited share (read pr 480.2 s of
+# 552.1 s a 600 s window), every run batch after the first was deferred ("the runs' share of the tick, waited reads due"),
+# 373 run reads sat deferred, 10 stored a window, and a waited run's data reached 13,419 s while the stale valve's re-exec
+# changed nothing. A kind going earlier now ends WAITED_KIND_MIN_SHARE s before the share for each waited kind still to
+# go, and a kind starting late still has its minimum, so a slow kind cannot starve the others.
+WAITED_KIND_MIN_SHARE = 15
 REST_HEAD_BUDGET = 40  # seconds of a tick's REST phase the waited heads may take while a waited PR or run is still to read:
 # past it those heads are deferred (first next tick), so the PRs a wait is blocked on get the rest of the tick
 # (huge-blue 2026-11-21, 00:58Z to 23:xxZ: 99 due heads, a dozen waited, each ~5 requests at ~3 s, filled every tick and
@@ -10621,12 +10629,20 @@ class Daemon:
             handed_keys = {e["key"] for e in pool_handed}
             blocked["pr"] = [e for e in blocked["pr"] if e["key"] not in handed_keys]
         # waited PRs, runs and comments first, the heads after (they went first and took 44 of 85 s)
-        for kind in sorted(kinds[first:] + kinds[:first], key=lambda k: k == "head"):
+        order = sorted(kinds[first:] + kinds[:first], key=lambda k: k == "head")
+        waited_share = tick_start + WAITED_TICK_SHARE
+        # the waited kinds of this tick, in order: each keeps its own minimum of the share (WAITED_KIND_MIN_SHARE)
+        waited_kinds = [k for k in order if k != "head" and over[k] == "graphql" and blocked[k]]
+        for kind in order:
             if over[kind] != "graphql":
                 continue
             if kind == "head" and waited_due:  # the heads' minimum share, whatever the waited reads took
                 until_of["head"] = max(until_of["head"], time.monotonic() + HEADS_MIN_SHARE)
                 self.head_until = until_of["head"]
+            if kind in waited_kinds:
+                later = len(waited_kinds) - 1 - waited_kinds.index(kind)
+                until_of[kind] = max(time.monotonic() + WAITED_KIND_MIN_SHARE,
+                                     waited_share - later * WAITED_KIND_MIN_SHARE)
             if kind == "pr" and (lead := self.starved_lead(blocked[kind])) is not None:
                 read_stale_pr(lead, over[kind])
                 blocked[kind] = [e for e in blocked[kind] if e["key"] != lead["key"]]
@@ -10645,6 +10661,9 @@ class Daemon:
                 self.post_between()
         if pool_futures:
             self.finish_waited_pool(pool_futures, pool_handed)
+        if waited_due:  # the round robin's turns below keep the whole waited share, as before
+            for k in waited_kinds:
+                until_of[k] = max(until_of[k], waited_share)
         self.gql_paced = None
         sent = len(self.gql_log)
         paced_sent = False  # whether the kind the ceiling held had sent a query of its own first, this tick
