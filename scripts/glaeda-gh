@@ -39579,7 +39579,28 @@ def broker_caller() -> str:
     named = os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("CODEX_THREAD_ID") or ""
     if re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", named):
         return named
-    return f"ppid-{os.getppid()}"
+    return broker_parent_tool(os.getppid()) or f"ppid-{os.getppid()}"
+
+
+# The words of a command line that say how a tool was started, not which tool it is (the gh-quota shim's own list).
+BROKER_WRAPPER_RE = re.compile(r"(?i)(?:ba|z|da|)sh|python3?(?:\.\d+)?|env|xargs|parallel|timeout|nice|gh|glaeda-gh|-.*|\d+")
+
+
+def broker_parent_tool(ppid: int) -> str:
+    """`tool:NAME` for the program the parent process PPID runs (its first argv word no wrapper is), else the launchd job
+    this runs in, else "". A /proc read, no fork, so a Mac with no /proc names only its launchd jobs. Before this a gh
+    that skipped the gh-quota shim logged `ppid-N`, a pid gone before anyone reads the log: a control-plane host's
+    calls.log, 2026-11-27, 92,569 of 92,569 calls `unnamed (ppid)` in `audit --by caller`."""
+    with contextlib.suppress(OSError, ValueError):
+        for word in Path(f"/proc/{int(ppid)}/cmdline").read_bytes().decode(errors="replace").split("\0"):
+            base = word.rsplit("/", 1)[-1]
+            if base and not BROKER_WRAPPER_RE.fullmatch(base):
+                name = re.sub(r"[^A-Za-z0-9_.@-]", "-", base)[:64]
+                return f"tool:{name}"
+    job = os.environ.get("XPC_SERVICE_NAME") or ""
+    if job and job != "0":
+        return f"tool:{re.sub(r'[^A-Za-z0-9_.@-]', '-', job)[:64]}"
+    return ""
 
 
 # A read worth holding when the same caller repeats it: the ones a polling loop is written out of,
@@ -42552,16 +42573,58 @@ def audit_by_caller(lines: list[str], top: int = 3) -> list[dict]:
     return rows
 
 
-def cmd_audit_by_caller(lines: list[str], as_json: bool, top: int = 20) -> int:
+def gh_quota_calls_log() -> Path:
+    """The gh-quota shim's own call log (leo-workspace tools/gh_quota.py append_call): one JSON line per gh call the shim
+    let through or refused, its `caller` the `session:NAME` or `tool:NAME` it charged."""
+    return Path(os.environ.get("GH_QUOTA_STATE") or Path.home() / ".local/state/gh-quota") / "calls.jsonl"
+
+
+def audit_quota_lines(path: Path, last: int) -> list[str]:
+    """gh-quota's calls.jsonl as AUDIT_LINE lines (`STAMP CALLER CALL`), the last LAST (0: all); a line with no call
+    word (an audit record) is skipped. Read by line, so a 40 MB log is never held whole."""
+    keep: deque[str] = deque(maxlen=last or None)
+    try:
+        with path.open("rb") as fh:
+            for raw in fh:
+                with contextlib.suppress(ValueError, TypeError, AttributeError):
+                    row = json.loads(raw)
+                    call, caller = str(row.get("call") or "").strip(), str(row.get("caller") or "")
+                    if not call:
+                        continue
+                    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(row.get("at") or 0)))
+                    caller = caller if re.fullmatch(r"(?:session|tool):[A-Za-z0-9_.@/-]{1,96}", caller) else "unknown"
+                    keep.append(f"{stamp} {'unknown' if caller == 'tool:unknown' else caller} {' '.join(call.split())}")
+    except OSError as error:
+        raise WatchError(f"cannot read {path}: {describe(error)}") from error
+    return list(keep)
+
+
+def audit_caller_source(log: Path | None, last: int) -> tuple[Path, list[str]]:
+    """(the log read, its lines as AUDIT_LINE) for `audit --by caller`: --log as given (a .jsonl one read as gh-quota's),
+    else gh-quota's calls.jsonl when this host has one, else the PATH guard's calls.log. The shim names every caller
+    in calls.jsonl (session:X, tool:X); calls.log is written only by a gh that bypassed the shim, so on a host with the
+    shim it holds the few calls nobody named (a control-plane host, 2026-11-27: 92,569 lines, every one `ppid-N`, its
+    newest five hours old, while calls.jsonl named 30 callers for the same traffic)."""
+    if log is not None:
+        return log, (audit_quota_lines(log, last) if log.suffix == ".jsonl" else audit_lines(log, last))
+    quota = gh_quota_calls_log()
+    if quota.is_file():
+        return quota, audit_quota_lines(quota, last)
+    path = guard_log()
+    return path, audit_lines(path, last)
+
+
+def cmd_audit_by_caller(lines: list[str], as_json: bool, top: int = 20, source: Path | None = None) -> int:
     """`audit --by caller`: who on this host makes its gh calls, and what each mostly reads."""
     rows = audit_by_caller(lines)
     total = sum(r["calls"] for r in rows)
     if not total:
-        raise WatchError("no gh calls logged")
+        raise WatchError("no gh calls logged" + (f" in {source}" if source else ""))
     if as_json:
-        print(json.dumps({"calls": total, "byCaller": rows}, sort_keys=True))
+        print(json.dumps({"calls": total, "byCaller": rows, "log": os.fspath(source) if source else None},
+                         sort_keys=True))
         return EXIT_OK
-    print(f"gh calls by caller: {total}")
+    print(f"gh calls by caller: {total}" + (f" (from {source})" if source else ""))
     for r in rows[:top]:
         cats = "; ".join(f"{c['category']} {c['calls']}" for c in r["top"])
         print(f"  {r['calls']:>7}  {100 * r['calls'] / total:5.1f}%  {r['caller']}  ({cats})")
@@ -42569,8 +42632,9 @@ def cmd_audit_by_caller(lines: list[str], as_json: bool, top: int = 20) -> int:
         print(f"  ... {len(rows) - top} more callers: {sum(r['calls'] for r in rows[top:])} calls")
     unnamed = next((r["calls"] for r in rows if r["caller"] == "unnamed (ppid)"), 0)
     if unnamed:
-        print(f"{unnamed} calls name only a parent pid: logged before the gh-quota shim exported GH_QUOTA_CALLER, or "
-              "by a gh that skipped the shim")
+        print(f"{unnamed} calls name no session or tool: a parent pid (logged before the gh-quota shim exported "
+              "GH_QUOTA_CALLER, or by a gh that skipped the shim and whose parent was gone or not readable) or "
+              "tool:unknown (the shim found no tool in its parent's command line)")
     return EXIT_OK
 
 
@@ -45329,7 +45393,9 @@ def parser() -> argparse.ArgumentParser:
     b.add_argument("--json", action="store_true")
     b.add_argument("--local", action="store_true", help="this host's daemon only: no read of the other hosts")
     a = sub.add_parser("audit", help="what this host's gh traffic is, and how much of it a cache would answer")
-    a.add_argument("--log", type=Path, default=None, help="the call log to read (default the PATH guard's)")
+    a.add_argument("--log", type=Path, default=None,
+                   help="the call log to read (default the PATH guard's; with --by caller, the gh-quota shim's "
+                        "calls.jsonl when this host has one, which names every caller; a .jsonl --log is read as that)")
     a.add_argument("--last", type=int, default=200000, metavar="N",
                    help="only the last N lines (default 200000; 0 reads all of it)")
     a.add_argument("--json", action="store_true")
@@ -46412,7 +46478,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.last < 0:
                 raise WatchError("--last must be 0 (all of it) or more lines")
             if args.by == "caller":
-                return cmd_audit_by_caller(audit_lines(args.log or guard_log(), args.last), args.json)
+                source, lines = audit_caller_source(args.log, args.last)
+                return cmd_audit_by_caller(lines, args.json, source=source)
             return cmd_audit(args.log or guard_log(), args.last, args.json)
         if args.command == "log":
             if args.kind == "errors":

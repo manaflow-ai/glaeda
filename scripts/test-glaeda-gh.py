@@ -16820,7 +16820,8 @@ class BrokerLogTest(BrokerBase):
                 self.run_gh(["pr", "view", "7", "-R", "o/r", "--json", "state"])
             written = log.read_text()
             self.assertEqual(len(written.splitlines()), 1, repr(bad))
-            self.assertRegex(written, r"^\S+ ppid-\d+ pr view pr:o/r#7\n$", repr(bad))
+            # a bad session id is never written: the parent's tool (broker_parent_tool), else its pid
+            self.assertRegex(written, r"^\S+ (?:ppid-\d+|tool:[A-Za-z0-9_.@-]{1,64}) pr view pr:o/r#7\n$", repr(bad))
         log.unlink(missing_ok=True)
         with mock.patch.dict(os.environ, {"CLAUDE_SESSION_ID": "session-1.2:3"}):
             self.run_gh(["pr", "view", "7", "-R", "o/r", "--json", "state"])
@@ -46217,6 +46218,48 @@ class AuditByCallerTest(Base):
             self.assertEqual(gg.broker_caller(), "tool:base_red_watch.py")
         with mock.patch.dict(os.environ, {"GH_QUOTA_CALLER": "tool:a b\nforged", "CLAUDE_SESSION_ID": "abc"}):
             self.assertEqual(gg.broker_caller(), "abc")
+
+    def test_a_call_with_no_session_names_its_parents_tool_not_a_pid(self) -> None:
+        cmdline = b"/usr/bin/python3\0-I\0/home/u/tools/delivery_cancel_guard.py\0--once\0"
+        real_read = Path.read_bytes
+
+        def read_bytes(path: Path) -> bytes:
+            return cmdline if os.fspath(path) == "/proc/4242/cmdline" else real_read(path)
+
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("GH_QUOTA_CALLER", "CLAUDE_SESSION_ID", "CODEX_THREAD_ID", "XPC_SERVICE_NAME")}
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(gg.os, "getppid", return_value=4242), \
+                mock.patch.object(Path, "read_bytes", read_bytes):
+            self.assertEqual(gg.broker_caller(), "tool:delivery_cancel_guard.py")
+        with mock.patch.dict(os.environ, {**env, "XPC_SERVICE_NAME": "ai.leo-workspace.now-live"}, clear=True), \
+                mock.patch.object(gg.os, "getppid", return_value=999999999):
+            self.assertEqual(gg.broker_caller(), "tool:ai.leo-workspace.now-live")  # no /proc entry: the launchd job
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(gg.os, "getppid", return_value=999999999):
+            self.assertEqual(gg.broker_caller(), "ppid-999999999")  # nothing to name it by: the pid, as before
+
+    def test_by_caller_reads_the_gh_quota_log_that_names_callers(self) -> None:
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        (tmp / "calls.jsonl").write_text("\n".join([
+            json.dumps({"at": 1795812512.9, "caller": "session:glaeda-land", "call": "api repos/o/r/actions/runs/4/jobs"}),
+            json.dumps({"at": 1795812513.0, "caller": "session:glaeda-land", "call": "pr view 7"}),
+            json.dumps({"at": 1795812513.1, "caller": "tool:now_live.py", "call": "api graphql"}),
+            json.dumps({"at": 1795812513.2, "caller": "tool:unknown", "call": "api graphql"}),
+            json.dumps({"at": 1795812513.3, "event": "move"}),  # an audit record, no call: not counted
+            "not json"]) + "\n")
+        (tmp / "guard.log").write_text("2026-11-22T17:43:18Z ppid-47147 api repos/o/r/actions/runs/4/jobs\n")
+        with mock.patch.dict(os.environ, {"GH_QUOTA_STATE": os.fspath(tmp), "CMUX_GH_LOG": os.fspath(tmp / "guard.log")}):
+            source, lines = gg.audit_caller_source(None, 0)
+            self.assertEqual(source, tmp / "calls.jsonl")
+            rows = gg.audit_by_caller(lines)
+            self.assertEqual([(r["caller"], r["calls"]) for r in rows],
+                             [("session:glaeda-land", 2), ("tool:now_live.py", 1), ("unnamed (ppid)", 1)])
+            self.assertEqual(len(gg.audit_caller_source(None, 2)[1]), 2)  # --last keeps the newest
+            # --log names the log; the guard's calls.log is still read as before
+            source, lines = gg.audit_caller_source(tmp / "guard.log", 0)
+            self.assertEqual([r["caller"] for r in gg.audit_by_caller(lines)], ["unnamed (ppid)"])
+            (tmp / "calls.jsonl").unlink()
+            self.assertEqual(gg.audit_caller_source(None, 0)[0], tmp / "guard.log")  # no shim log: the guard's
 
 
 class StragglerTest(unittest.TestCase):
