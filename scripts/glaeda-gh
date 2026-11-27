@@ -35193,15 +35193,22 @@ def direct_parts_load(now: float) -> dict[str, dict]:
 
 
 def direct_parts_save(repo_parts: dict[str, dict], now: float) -> None:
-    """Keep REPO_PARTS' repository-level answers for the next direct read (best effort: a lost write costs a read)."""
+    """Keep REPO_PARTS' repository-level answers for the next direct read (best effort: a lost write costs a read).
+    The load, merge and write are one step under a lock: several waits and land workers on a host end within seconds
+    of each other, and unlocked each wrote back the file it had read before the others' answers, so a base's rulesets
+    one of them had just read was dropped and the next direct read asked GitHub for it again."""
     try:
-        kept = direct_parts_load(now)
-        for path, v in repo_parts.items():
-            if DIRECT_PARTS_RE.match(path) and isinstance(v, dict) and isinstance(v.get("at"), (int, float)) \
-                    and "doc" in (v.get("part") or {}) and v["at"] >= (kept.get(path) or {}).get("at", float("-inf")):
-                kept[path] = v
-        newest = sorted(kept, key=lambda p: kept[p]["at"], reverse=True)[:DIRECT_PARTS_MAX]
-        write_json(BASE / DIRECT_PARTS, {"parts": {p: kept[p] for p in newest}})
+        BASE.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with bounded_lock(BASE / (DIRECT_PARTS + ".lock"), 2.0) as held:
+            if not held:
+                return  # a sibling is writing: its merge keeps the older answers; ours are read again at worst
+            kept = direct_parts_load(now)
+            for path, v in repo_parts.items():
+                if DIRECT_PARTS_RE.match(path) and isinstance(v, dict) and isinstance(v.get("at"), (int, float)) \
+                        and "doc" in (v.get("part") or {}) and v["at"] >= (kept.get(path) or {}).get("at", float("-inf")):
+                    kept[path] = v
+            newest = sorted(kept, key=lambda p: kept[p]["at"], reverse=True)[:DIRECT_PARTS_MAX]
+            write_json(BASE / DIRECT_PARTS, {"parts": {p: kept[p] for p in newest}})
     except (OSError, ValueError, TypeError):
         pass
 

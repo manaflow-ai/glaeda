@@ -26032,6 +26032,21 @@ class StaleDataTest(Base):
         self.assertEqual([p for p in served if p.startswith("rules/branches/")], [], served)
         self.assertEqual(len([p for p in served if p.startswith("actions/workflows")]), 1, served)
 
+    def test_concurrent_direct_part_saves_keep_every_answer(self) -> None:
+        """Waits and land workers on one host end together; each saved by writing back the file it had read before the
+        others' answers, so a base's rulesets one just read was lost and read again. Saves from many threads keep all."""
+        import threading
+        gg.BASE.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        paths = [f"/repos/o/r{i}/rules/branches/main?per_page=100" for i in range(12)]
+        threads = [threading.Thread(target=gg.direct_parts_save,
+                                    args=({p: {"at": now, "part": {"doc": [], "etag": "x"}}}, now)) for p in paths]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(sorted(gg.direct_parts_load(now)), sorted(paths))
+
     def test_a_direct_read_through_the_broker_gates_on_the_controllers_rollup(self) -> None:
         """rest_breakdown of manaflow-ai/cmuxterm-hq, 2026-11-25 09:43-11:43Z: glaeda-upstream (every lane VM's direct
         reads) asked commits/{sha}/check-suites 3,401 times in 2 h after #2730, because a direct read's Daemon has
