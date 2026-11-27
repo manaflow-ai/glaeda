@@ -18478,7 +18478,8 @@ class RunnerTest(unittest.TestCase):
         self.assertIn("glaeda-ios-sim", labels[0])
         self.assertNotIn("glaeda-ios-sim", labels[2], "no iOS job ever takes the gui runner")
         self.assertEqual([l.count("glaeda-macos-27") for l in labels], [1, 1, 1], "every runner, gui included, names its OS")
-        self.assertFalse([x for x in labels[2] if x.startswith("glaeda-runner-")])
+        self.assertEqual([x for x in labels[2] if x.startswith("glaeda-runner-")], [cr.runner_label("mini-std-glaeda-4")],
+                         "its own handle, so HQ's paired probes can place a pair on two idle gui runners")
         started = (self.home / "actions-runner-glaeda-4/glaeda-hooks/job-started.sh").read_text()
         self.assertIn("--canonical-roots 2 --instance 4 --gui-runner --gui-token gui\n", started)
         self.assertNotIn("--gui-runner", (self.home / "actions-runner-glaeda-2/glaeda-hooks/job-started.sh").read_text())
@@ -18633,13 +18634,14 @@ class RunnerTest(unittest.TestCase):
             alone, _ = self.fast_labels(shape, "nightly-alone", ios_sim=True, nightly_slot=True)
         self.assertEqual(["glaeda-nightly-std-xcode-26.6" in labels for labels in alone],
                          [False, False, True, False, False, False], "without a freshness slot: the first side instance")
-        # Every nightly slot carries its own glaeda-runner-<name> label, and no side, gui or fast runner gains one.
+        # Every nightly slot and gui runner carries its own glaeda-runner-<name> label, and no side or fast runner
+        # gains one (a gui runner's for HQ's paired probes, which place a pair on two idle gui runners).
         for labels in (*both, *alone):
             pins = [label for label in labels if label.startswith("glaeda-runner-")]
-            if "glaeda-nightly-std-xcode-26.6" in labels:
-                self.assertEqual(len(pins), 1, f"a nightly slot without its pin label: {labels}")
+            if "glaeda-nightly-std-xcode-26.6" in labels or any("-gui-" in label for label in labels):
+                self.assertEqual(len(pins), 1, f"a nightly slot or gui runner without its pin label: {labels}")
             elif not any(label.startswith("glaeda-root-") for label in labels):
-                self.assertEqual(pins, [], f"only roots and the nightly slot are pinned: {labels}")
+                self.assertEqual(pins, [], f"only roots, gui runners and the nightly slot are pinned: {labels}")
         self.assertTrue(hook.runner_scope(self.fast_home / "actions-runner-glaeda-2").nightly)
         self.assertFalse(hook.runner_scope(self.fast_home / "actions-runner-glaeda-3").nightly)
 

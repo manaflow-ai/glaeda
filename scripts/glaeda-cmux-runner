@@ -3418,11 +3418,15 @@ def main(argv: list[str] | None = None) -> int:
         ctx.labels_requested = True
         if not args.name:
             ctx.name = f"{args.member}-glaeda{ctx.suffix}"
-        if is_root or nightly:
+        if is_root or nightly or ctx.gui_runner:
             # A static handle on this one runner, so no job ever writes a runner label: a root runner for cmux's
             # warm affinity (the picker reads which runner kept a warm build and names it in runs-on), and the
             # nightly slot for cmux's owned signing pick (scripts/ci/signing_runner.py), which offers only a runner
             # it can pin. Without it no slot was ever offered, and nightly signing always went to Blacksmith.
+            # A gui runner for HQ's paired probes (paired-probes.yml): a pair of jobs needs two Macs at once, and
+            # on the shared gui label the second side queues behind every older job while the first holds its Mac
+            # for up to an hour (2026-11-27: the host ran on one Mac while the viewer sat
+            # queued 2 h 45 min). With a handle per runner the pair is placed on two idle gui runners at once.
             ctx.labels.append(runner_label(ctx.name))
     if args.token_stdin and args.apply:  # a plan previews the stdin path but never reads a token
         token = sys.stdin.readline(4096).strip()
