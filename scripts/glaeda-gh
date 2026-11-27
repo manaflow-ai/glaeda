@@ -3971,6 +3971,49 @@ APP_POOL_ROLE = "ci-watch"
 # (graphqlLoginWhy "pool-resting") while both yaps, pushed to every host, sat at 9,431 and 12,488 of 12,500.
 APP_POOL_CHAIN = "land-judge,glaeda,ci-watch,quota-goblin,yap-goblin-9000,yap-goblin-9001"
 APP_POOL_SPARES = tuple(r for r in (os.environ.get("GLAEDA_GH_APP_SPARES", APP_POOL_CHAIN) or "").replace(" ", "").split(",") if r)
+# Then every other read pool this host holds (Leo, 2026-11-27: "use the apps we have"): NOW 22:31Z had this daemon the
+# login's top GraphQL spender, 3852 points on the controller host and 928 on another, while quota-goblin-9002, -9005, -9014 and
+# -9016 (lw#13144), read pools of machines/gh-app-roles.json pushed to the hosts, were on no chain here. A role marked
+# `pool` and not `read_pool: false` or `actions_only` (runner-pool-1's bucket is the workflows') whose key or pushed
+# token is on this host goes after the listed chain, in the file's order. GLAEDA_GH_APP_SPARES set (even "") is the
+# whole list, as before, with nothing added.
+APP_POOL_DISCOVER = "GLAEDA_GH_APP_SPARES" not in os.environ
+
+
+def app_pool_read_roles(doc: Any) -> list[str]:
+    """The read-pool roles of a gh-app-roles.json DOC, in its order: `pool`, not `read_pool: false`, not
+    `actions_only`."""
+    roles = doc.get("roles") if isinstance(doc, dict) else None
+    if not isinstance(roles, dict):
+        return []
+    return [name for name, spec in roles.items() if isinstance(spec, dict) and spec.get("pool")
+            and spec.get("read_pool", True) is not False and not spec.get("actions_only")]
+
+
+def app_pool_held_read_roles(now: float | None = None, doc: Any = "config") -> list[str]:
+    """app_pool_read_roles of this host's gh-app-roles.json whose key files or a usable pushed token are here (file
+    reads, no request; AppPool.held_here's test). [] with no config beside the tool or APP_POOL_DIR unreadable."""
+    tool = app_pool_tool()
+    if doc == "config":
+        doc = read_json(tool.parent.parent / "machines" / "gh-app-roles.json") if tool else None
+    held = []
+    for role in app_pool_read_roles(doc):
+        keyed = tool is not None and (APP_POOL_DIR / f"{role}.json").is_file() and (APP_POOL_DIR / f"{role}.pem").is_file()
+        if keyed or app_pool_pushed_owners(role, now):
+            held.append(role)
+    return held
+
+
+def app_pool_roles(now: float | None = None) -> list[str]:
+    """APP_POOL_SPARES, then (APP_POOL_DISCOVER) every other read pool held here: the roles app_pool_chain orders."""
+    listed = list(APP_POOL_SPARES)
+    if not APP_POOL_DISCOVER:
+        return listed
+    try:
+        extra = app_pool_held_read_roles(now)
+    except (OSError, ValueError, TypeError):
+        extra = []
+    return listed + [r for r in extra if r not in listed]
 
 
 def app_pool_chain(roles: "tuple[str, ...] | list[str]", primary: str = APP_POOL_ROLE) -> list[str]:
@@ -6874,7 +6917,7 @@ class Daemon:
         self.login_cause = ""  # why the most recent request went on the login (note_login_fallback's cause), or ""
         # The App chain's tokens for repo reads (AppPool, app_pool_chain); "auto" finds them on this host, None keeps
         # every read on the login.
-        chain = app_pool_chain(APP_POOL_SPARES)
+        chain = app_pool_chain(app_pool_roles())
         self.app_pool: AppPool | None = (
             AppPool(role=chain[0], clock=lambda: self.clock()).with_spares(chain[1:]).restore_bench()
             if app_pool == "auto" else app_pool)
@@ -15919,7 +15962,7 @@ def land_own_token_pool(now: float | None = None) -> bool:
     as its key files or a pushed token (AppPool.held_here's test; file reads, no request). A lane VM whose gh goes
     through the broker and holds none reads GitHub only through the broker (LAND_PEER_SILENT's comment)."""
     tool = app_pool_tool()
-    for role in app_pool_chain(APP_POOL_SPARES):
+    for role in app_pool_chain(app_pool_roles(now)):
         if tool is not None and (APP_POOL_DIR / f"{role}.json").is_file() and (APP_POOL_DIR / f"{role}.pem").is_file():
             return True
         if app_pool_pushed_owners(role, now):

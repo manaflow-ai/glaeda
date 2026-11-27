@@ -48730,10 +48730,11 @@ class AppPoolChainTest(unittest.TestCase):
         self.assertEqual(gg.app_pool_chain(("glaeda", "ci-watch", "glaeda")), ["glaeda", "ci-watch"])
 
     def test_the_daemon_builds_its_pool_in_the_chain_s_order(self) -> None:
-        saved = (gg.APP_POOL_SPARES, gg.BASE)
+        saved = (gg.APP_POOL_SPARES, gg.BASE, gg.APP_POOL_DISCOVER)
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         gg.BASE = Path(tmp.name)
+        gg.APP_POOL_DISCOVER = False  # this host's own pushed tokens are not the test's
         try:
             for spares, want in (((tuple(gg.APP_POOL_CHAIN.split(","))), CHAIN),
                                  (("quota-goblin",), ["ci-watch", "quota-goblin"])):
@@ -48741,7 +48742,37 @@ class AppPoolChainTest(unittest.TestCase):
                 daemon = gg.Daemon(transport=lambda *a: (200, {}, b"{}"), token=lambda: TOKEN, controller=None)
                 self.assertEqual([p.role for p in [daemon.app_pool, *daemon.app_pool.spares]], want)
         finally:
-            gg.APP_POOL_SPARES, gg.BASE = saved
+            gg.APP_POOL_SPARES, gg.BASE, gg.APP_POOL_DISCOVER = saved
+
+    def test_every_held_read_pool_follows_the_listed_chain(self) -> None:
+        """NOW 2026-11-27 22:31Z: this daemon was the login's top GraphQL spender (3852 on the controller host) while
+        quota-goblin-9016 and the other read pools pushed to the host were on no chain. Leo: "use the apps we have"."""
+        doc = {"roles": {
+            "ci-watch": {"writes": []},
+            "quota-goblin-9002": {"pool": True, "writes": []},
+            "yap-goblin-9000": {"pool": True, "read_pool": False},
+            "quota-goblin-9004": {"pool": True, "read_pool": False, "actions_only": True},
+            "runner-pool-1": {"pool": True, "actions_only": True},
+            "ws-status": {"pool": True, "read_pool": False},
+            "quota-goblin-9016": {"pool": True, "writes": []},
+            "quota-goblin-9014": {"pool": True, "writes": []}}}
+        self.assertEqual(gg.app_pool_read_roles(doc), ["quota-goblin-9002", "quota-goblin-9016", "quota-goblin-9014"])
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        saved = (gg.APP_POOL_DIR, gg.APP_POOL_SPARES, gg.APP_POOL_DISCOVER)
+        try:
+            gg.APP_POOL_DIR = Path(tmp.name)
+            held = {"quota-goblin-9016", "runner-pool-1"}
+            with mock.patch.object(gg, "app_pool_pushed_owners", lambda role, now=None: ["manaflow-ai"] if role in held else []), \
+                    mock.patch.object(gg, "app_pool_tool", lambda: None):
+                self.assertEqual(gg.app_pool_held_read_roles(doc=doc), ["quota-goblin-9016"], "held, read pool only")
+                with mock.patch.object(gg, "app_pool_held_read_roles", lambda now=None: ["quota-goblin-9016", "glaeda"]):
+                    gg.APP_POOL_SPARES, gg.APP_POOL_DISCOVER = tuple(CHAIN), True
+                    self.assertEqual(gg.app_pool_chain(gg.app_pool_roles()), [*CHAIN, "quota-goblin-9016"])
+                    gg.APP_POOL_DISCOVER = False  # GLAEDA_GH_APP_SPARES set: its list alone, as before
+                    self.assertEqual(gg.app_pool_chain(gg.app_pool_roles()), CHAIN)
+        finally:
+            gg.APP_POOL_DIR, gg.APP_POOL_SPARES, gg.APP_POOL_DISCOVER = saved
 
 
 class ShorthandFlagTest(unittest.TestCase):
