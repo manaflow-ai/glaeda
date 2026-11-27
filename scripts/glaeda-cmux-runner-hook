@@ -10127,6 +10127,41 @@ def runner_labels(state_dir: Path, name: str | None) -> frozenset[str] | None:
     return None
 
 
+# ROLE_LABEL_MISMATCH: a gateway, sim-first or small runner takes only its own role's jobs and refuses any other at
+# job-started. cmux's owned-pool rescue re-places a refused job only for the workflows it watches; a workflow_dispatch
+# run such as screen-stream-eval (runs-on mac-gateway, run 46077298852, 2026-11-27) is not one, so it ended red on the
+# sim-first runner after 25 minutes queued. GitHub fixes labels at registration, and a role shift (the gateway count
+# or the simulator role changed) re-labels a runner only when the fleet apply finds it idle, so until then the hook's
+# role and GitHub's labels disagree. A refused job cannot be re-queued, so the runner must never take it: its gate
+# holds the listener while the labels it is known to carry (receipt, plus what GitHub dispatched to it) include another
+# role's label. Idle, it is then relabelled by the next apply.
+ROLE_LABEL_PREFIXES = {"gateway": ("glaeda-gateway-xcode-", "mac-gateway"), "sim": ("glaeda-sim-xcode-", "mac-sim"),
+                       "small": ("glaeda-small-xcode-",)}
+
+
+def label_role(label: str) -> str | None:
+    """The single-role runner (gateway, sim, small) a label belongs to, or None for any other label."""
+    for role, prefixes in ROLE_LABEL_PREFIXES.items():
+        if any(label == p or (p.endswith("-") and label.startswith(p)) for p in prefixes):
+            return role
+    return None
+
+
+def role_label_mismatch(scope: "RunnerScope | None", labels: frozenset[str] | None) -> str | None:
+    """Why a gateway, sim-first or small runner must not listen: the labels it carries include another role's, so
+    GitHub can hand it a job its job-started refuses (ROLE_LABEL_MISMATCH). None otherwise."""
+    if scope is None or not labels:
+        return None
+    mine = "gateway" if scope.gateway else "sim" if scope.sim else "small" if scope.small else None
+    if mine is None:
+        return None
+    foreign = sorted(label for label in labels if label_role(label) not in (None, mine))
+    if not foreign:
+        return None
+    return (f"this {mine} runner carries another role's label ({', '.join(foreign)[:120]}): it waits to be relabelled "
+            "rather than take a job it would refuse")
+
+
 def observed_labels(summary: dict[str, Any] | None, name: str | None) -> frozenset[str]:
     """The labels of jobs the feed (load_cap_summary) shows GitHub dispatched to this runner. GitHub hands a job only
     to a runner whose labels cover all of its runs-on, so every one of these is a label GitHub holds for it: a lower
@@ -12408,7 +12443,7 @@ class Gate:
         if why:
             self.load_since = None  # the fleet's claim, not load, is holding this gate
             self.yield_to_fleet()
-        return (why or self.signer_yield() or self.shed(self.saturated()) or self.load_capped() or self.memory_capped() or self.full() or self.shed(self.hot()) or self.stalled()
+        return (why or self.role_mismatch() or self.signer_yield() or self.shed(self.saturated()) or self.load_capped() or self.memory_capped() or self.full() or self.shed(self.hot()) or self.stalled()
                 or self.locked() or self.low_disk() or self.suite_first() or self.ineligible() or self.off_tailnet())
 
     def host_claim(self) -> str | None:
@@ -12676,6 +12711,10 @@ class Gate:
             gate_log(f"{why}; measured {per:.1f} per core on {os.cpu_count()} cores")
         self.cap_why = why
         return why
+
+    def role_mismatch(self) -> str | None:
+        """ROLE_LABEL_MISMATCH: see role_label_mismatch; holds the listener, so no job is taken to be refused."""
+        return role_label_mismatch(runner_scope(self.runner_dir), self.cap_labels)
 
     def memory_capped(self) -> str | None:
         """MEMORY_CAP: why this listener takes no new job because one will not fit in the mini's memory, or None. Only
@@ -13090,7 +13129,7 @@ class Gate:
         if why:
             self.load_since = None
             self.yield_to_fleet()
-        return (why or self.signer_yield() or self.shed(self.saturated()) or self.load_capped() or self.memory_capped() or self.full(fresh=True) or self.shed(self.hot(fresh=True))
+        return (why or self.role_mismatch() or self.signer_yield() or self.shed(self.saturated()) or self.load_capped() or self.memory_capped() or self.full(fresh=True) or self.shed(self.hot(fresh=True))
                 or self.stalled() or self.locked(fresh=True) or self.low_disk() or self.suite_first() or self.ineligible() or self.off_tailnet())
 
     def still_waiting(self) -> str | None:
@@ -17311,7 +17350,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.sim_runner and (admit_class or job_class(os.environ.get("GITHUB_JOB", ""), repo, args.home_repo,
                                                           job_workflow())[0]) not in SIM_FIRST_CLASSES:
             # SIM_FIRST: it listens on a full mini and its job's wait holds the mini's other runners, so any other job
-            # here would jump the side lanes; refused, it is rescued onto its own pool.
+            # here would jump the side lanes. The rescue covers only the workflows cmux watches (not a dispatch run),
+            # so the gate never lets a runner carrying another role's label listen (ROLE_LABEL_MISMATCH).
             return refused("the sim-first runner takes only simulator jobs")
         if owner is None:  # fail closed: with no pinned owner no holder could watch the job
             return refused(f"cannot pin this job's Runner.Worker (pid {args.watch_pid or os.getppid()})")

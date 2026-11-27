@@ -10313,6 +10313,33 @@ class HostLoadCapTest(unittest.TestCase):
         self.assertIn(self.SIDE_LIGHT, self.gate.cap_labels, "a union never drops a receipt label")
         self.assertEqual(self.gate.cap_label_drift, [self.LABEL], "the disagreement is published, not swallowed")
 
+    def test_a_role_runner_carrying_another_roles_label_never_listens(self) -> None:
+        """ROLE_LABEL_MISMATCH (cmux run 46077298852, 2026-11-27): a workflow_dispatch job with runs-on mac-gateway sat
+        queued 25 min, then went to the sim-first runner, whose job-started refused it; the rescue does not watch a
+        dispatch run, so it ended red. A refused job cannot be re-queued, so the gate holds a gateway, sim-first or
+        small runner whose labels (receipt or dispatched) include another role's label."""
+        sim = hook.RunnerScope(sim=True)
+        gateway = hook.RunnerScope(gateway=True)
+        small = hook.RunnerScope(small=True)
+        stale = frozenset({"glaeda-mini", "glaeda-sim-xcode-26.6", "mac-sim", "mac-gateway"})
+        self.assertIn("mac-gateway", hook.role_label_mismatch(sim, stale) or "")
+        self.assertIn("glaeda-gateway-xcode-26.6",
+                      hook.role_label_mismatch(small, frozenset({"glaeda-small-xcode-26.6",
+                                                                 "glaeda-gateway-xcode-26.6"})) or "")
+        self.assertIsNone(hook.role_label_mismatch(sim, frozenset({"glaeda-mini", "glaeda-sim-xcode-26.6", "mac-sim"})))
+        self.assertIsNone(hook.role_label_mismatch(gateway, frozenset({"glaeda-gateway-xcode-26.6", "mac-gateway"})))
+        self.assertIsNone(hook.role_label_mismatch(hook.RunnerScope(), stale), "a pool runner is not a role runner")
+        self.assertIsNone(hook.role_label_mismatch(sim, None))
+        # at the gate: GitHub dispatched a gateway job to this sim-first runner, so it stops listening
+        self.receipt(["glaeda-mini", "glaeda-sim-xcode-26.6", "mac-sim"])
+        self.jobs = [self.job("completed", runner="cmux21-glaeda-2", labels=["glaeda-gateway-xcode-26.6"]),
+                     self.job("queued")]  # the feed keeps only jobs with a glaeda- label
+        self.poll()
+        with mock.patch.object(hook, "runner_scope", return_value=sim):
+            self.assertIn("glaeda-gateway-xcode-26.6", self.gate.role_mismatch() or "")
+        with mock.patch.object(hook, "runner_scope", return_value=hook.RunnerScope()):
+            self.assertIsNone(self.gate.role_mismatch(), "a pool runner is not held for it")
+
     def test_with_no_job_of_its_own_the_label_set_stays_the_receipts(self) -> None:
         # The other half of the rule: no observed dispatch changes nothing, so a runner the feed says nothing about
         # keeps exactly today's behaviour. A job on a sibling runner of the same host is not this runner's evidence.
