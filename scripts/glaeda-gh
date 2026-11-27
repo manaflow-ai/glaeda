@@ -18595,6 +18595,39 @@ def land_pending_status(data: dict) -> bool:
                 and sum(n for state, n in (counts.get("statuses") or {}).items() if state in COUNT_PENDING) > 0)
 
 
+# Another lander's verdict on this head is never a check an update could cancel, for any base merge, not only a
+# startup_failure's (LAND_NEW_HEAD_ONLY). manaflow-ai/cmux#61375 at b62e921d, 2026-11-27: land_judge named the
+# base_update merge at 11:59Z; every check run at the head had finished by 11:38Z, and the one unfinished context was
+# the status "next-autoland / verdict" ("did not judge this head within 60m; queued for next pass"), posted 11:53Z.
+# land_checks_running read it as running, so the update was deferred "checks still running at the head" and the row
+# slept the whole LAND_WAIT_DEFAULT on it (the feed carries no status delivery to wake it: land_pending_status) until a
+# person updated the branch at 12:43Z. Such a status is a queue's own pending answer about this head, the same answer
+# this land is about to make: it waits on the land, never the reverse. Every other pending status still defers the
+# update (a pool job's status, e.g. "ws-check: cmux-ci run ... running", is a job a new head would restart), and so
+# does any queued or in-progress run. Detector: test-glaeda-gh.py
+# test_a_base_update_is_not_deferred_on_another_landers_pending_verdict.
+LAND_LANDER_VERDICT = re.compile(r"autoland\s*/\s*verdict$", re.IGNORECASE)
+
+
+def land_update_held(data: dict, head: str) -> bool:
+    """Whether a base merge at HEAD waits for checks still running there: land_checks_running less another lander's
+    pending verdict (LAND_LANDER_VERDICT's comment). A truncated rollup's pending statuses past page one have no
+    names here, so they still hold it."""
+    if not land_checks_running(data, head):
+        return False
+    if land_runs_running(data, head):
+        return True
+    counts = data.get("checkCounts")
+    if data.get("checksTruncated") and isinstance(counts, dict) \
+            and sum(n for state, n in (counts.get("statuses") or {}).items() if state in COUNT_PENDING) > 0:
+        return True
+    return any(not c.get("workflow") and "id" not in c
+               and str(c.get("status") or "").upper() not in ("COMPLETED", "")
+               and not (isinstance(c.get("description"), str) and LAND_GATE_SAID.search(c["description"]))
+               and not LAND_LANDER_VERDICT.search(str(c.get("name") or "").strip())
+               for c in data.get("checks") or [])
+
+
 # A deferred check says in its own description which label starts it: "Cheap tier: this check runs when ready-to-land
 # (or full-ci) is added to the pull request". cmux#55176 (2026-11-25) carried no cmux/land-tier status at all, only one
 # such status per deferred check, so every judgment read ordinary running checks and the land waited 4.1 h over 9 wait
@@ -25349,12 +25382,16 @@ class LandQueue:
                 green = prior.get("ok") and (prior.get("action") or {}).get("kind") == "merge" \
                     and prior.get("head") == head and isinstance(prior.get("okSince"), (int, float))
                 e["explain"]["okSince"] = float(prior["okSince"]) if green else self.now
+            # A base merge the merge train holds is a retry carrying "train" (its status at the head) or "board_train"
+            # (the label to add): said in the row, so "judged base_update, step retry, no update" reads as the train's
+            # wait, not a lost update (manaflow-ai/cmux#61375, 2026-11-27: four such rows read as the daemon's miss).
+            train = (str(act.get("train") or "") or ("board" if act.get("board_train") else "")) or None
             self.history(e, "judged", code=answer.get("code") or ("ok" if answer.get("ok") else ""),
                          head=head[:12], step=act.get("kind"), unmoved=unmoved or None, why=why or None,
-                         due=True if unmoved and why in LAND_JUDGE_DUE else None)
+                         due=True if unmoved and why in LAND_JUDGE_DUE else None, train=train)
             log({"event": "land-judged", "key": e["key"], "took_s": took, "head": head[:12],
                  "code": str(answer.get("code") or ("ok" if answer.get("ok") else "")), "step": act.get("kind"),
-                 "why": why or None, "from": judging.get("from") or None})
+                 "why": why or None, "from": judging.get("from") or None, **({"train": train} if train else {})})
             self.note_feed_verdict(e, answer, act, head, judging.get("at"))
             self.note_judge_update(e, answer, head)
             reason = str(answer.get("reason") or "")
@@ -27575,7 +27612,7 @@ class LandQueue:
         data = (self.cache_of(e["key"]) or {}).get("data") or {}
         held = e.get("updateDeferred") or {}
         stuck = held.get("head") == head and self.now - float(held.get("at") or 0) >= LAND_WAIT_DEFAULT
-        running = land_runs_running if code in LAND_NEW_HEAD_ONLY else land_checks_running
+        running = land_runs_running if code in LAND_NEW_HEAD_ONLY else land_update_held
         if running(data, head) and not stuck:
             # Deferred once per head; a refusal whose only step is a new head only on a run (LAND_NEW_HEAD_ONLY). A
             # check still running after the whole wait never finishes (stuck, no runner):

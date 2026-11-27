@@ -34156,6 +34156,64 @@ class LandTest(Base):
         self.assertEqual([c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)], [])
         self.assertIn("update_deferred", [h["event"] for h in e["history"]])
 
+    def test_a_base_update_is_not_deferred_on_another_landers_pending_verdict(self):
+        # LAND_LANDER_VERDICT: manaflow-ai/cmux#61375 at b62e921d (2026-11-27). land_judge named the base_update merge at
+        # 11:59Z; every check run at the head had finished, and the one unfinished context was next-autoland's verdict
+        # status, so the update was deferred for the whole wait until a person ran it at 12:43Z.
+        real = {"headRefOid": LA, "state": "OPEN", "mergeable": "MERGEABLE", "mergeStateStatus": "BLOCKED",
+                "isDraft": False, "checksTruncated": False, "checkCounts": None,
+                "checks": [{"name": "CI fast guards", "workflow": "CI", "id": "CR_a", "runId": 1,
+                            "status": "COMPLETED", "conclusion": "SUCCESS"},
+                           {"name": "cmux/land-tier", "workflow": None, "status": "COMPLETED", "conclusion": "SUCCESS",
+                            "description": "Land tier runs here: full"},
+                           {"name": "next-autoland / verdict", "workflow": None, "status": "PENDING",
+                            "conclusion": None, "url": None,
+                            "description": "next-autoland did not judge this head within 60m; queued for next pass"}]}
+        self.assertTrue(gg.land_checks_running(real, LA))  # a merge still waits on the status, as before
+        base = refusal("base_update", LA, {"kind": "update_branch", "expected_head_sha": LA,
+                                           "needs_newer_base": ["land-judge base update"]},
+                       reason="land-judge: refused: base update needed")
+
+        def judged(data):
+            shutil.rmtree(gg.land_dir(), ignore_errors=True)
+            self.w = LandWorld(self.tmp.name)
+            self.q = self.queue()
+            self.w.set_pr(self.KEY, data, self.t)
+            self.land()
+            self.tick()
+            e = self.q.entries[self.KEY]
+            self.w.answers.append(base)
+            self.q.judge(e, LA, gg.land_fingerprint(self.w.cache[self.KEY]))
+            sent = [c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
+            return len(sent), "update_deferred" in [h["event"] for h in e["history"]]
+
+        self.assertEqual(judged(real), (1, False), "the named base merge is sent at once")
+        self.assertFalse(gg.land_update_held(real, LA))  # a base merge does not wait on it
+        # a pool job's pending status still defers it: a new head would restart that job
+        job = {**real, "checks": [*real["checks"], {"name": "ws-check", "workflow": None, "status": "PENDING",
+                                                    "conclusion": None, "description": "cmux-ci run 1 running"}]}
+        self.assertTrue(gg.land_update_held(job, LA))
+        self.assertEqual(judged(job), (0, True))
+        # and so does a run in progress
+        run = {**real, "checks": [*real["checks"], {"name": "build", "workflow": "CI", "id": "CR_x",
+                                                    "status": "IN_PROGRESS", "conclusion": None}]}
+        self.assertEqual(judged(run), (0, True))
+
+    def test_a_base_update_the_merge_train_holds_says_so_in_its_judged_row(self):
+        # manaflow-ai/cmux#61375, 2026-11-27: four "judged base_update step=retry" rows with no update read as the
+        # daemon's miss; each was land_judge's merge-train wait (its action carried "train"/"board_train").
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS")])
+        self.land()
+        self.tick()
+        e = self.q.entries[self.KEY]
+        for act, said in (({"kind": "retry", "after_s": 300, "train": "boarded"}, "boarded"),
+                          ({"kind": "retry", "after_s": 300, "board_train": {"label": "merge-train"}}, "board")):
+            self.w.answers.append(refusal("base_update", LA, act, reason="land-judge: refused: base update needed"))
+            self.q.judge(e, LA, gg.land_fingerprint(self.w.cache[self.KEY]))
+            row = [h for h in e["history"] if h["event"] == "judged"][-1]
+            self.assertEqual((row["code"], row["step"], row.get("train")), ("base_update", "retry", said))
+        self.assertEqual([c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)], [])
+
     def test_a_check_that_never_finishes_never_holds_the_named_update_past_one_wait(self):
         # cmux#44800 (stale_green) and cmux#45380 (tip_merge), 2026-11-17: each refusal named update-branch, a check
         # at the head never finished, and every timed-out wait judged again and deferred again: "3 identical refusals
