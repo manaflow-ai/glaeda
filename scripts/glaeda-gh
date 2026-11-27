@@ -16768,6 +16768,31 @@ def land_requester_idle_s(out: str, now: float) -> float | None:
     if not _finite(ended):
         return None
     return max(0.0, now - float(ended) / 1000.0)
+def land_last_turn_began(out: str) -> float | None:
+    """When (epoch seconds) the last turn of the session `acpmux session info --json` printed in OUT began, read from
+    its turnId (a UUIDv7: its first 48 bits are the start in ms), or None when OUT names none (LAND_MERGED_FYI_READ)."""
+    try:
+        doc = json.loads(out or "")
+    except ValueError:
+        return None
+    last = doc.get("lastTurn") if isinstance(doc, dict) else None
+    tid = str(last.get("turnId") or "") if isinstance(last, dict) else ""
+    hexed = tid.replace("-", "")
+    if len(hexed) != 32 or hexed[12] != "7" or not re.fullmatch(r"[0-9a-fA-F]{32}", hexed):
+        return None
+    return int(hexed[:12], 16) / 1000.0
+
+
+# LAND_MERGED_FYI_READ: a row handed to another host's queue whose requester holds a no-verdict fyi from here
+# (forwardQuietTold) used to get a second, bare "merged" fyi when the far queue merged it (LAND_NOTICE_SUPERSEDE: it
+# replaces that fyi if still unread). The far queue tells the merge itself ("merged at SHA"), so when the requester has
+# started a turn since the fyi was sent, that fyi was delivered there, nothing is left to replace, and the bare
+# "merged" only woke it again within the FYI bound (acpmux wakes an idle inbox's fyi within 60 min).
+# gcp-agent-lane-19, 2026-11-27: cmux#60756 told "merged at 0a416a3b" by cmux-cp-1 09:57Z and bare "merged" 11:01Z;
+# cmux#62376 18:29Z and 18:33Z; hq#32431 10:43Z and 11:28Z: 3 of the 7 second merged wakes that day (85 merged turns).
+# Goal wakes-per-landed-pr; Leo: "not getting swamped by our own wake-ups, our own tool calls". A requester that
+# has run no turn since (the fyi may still be queued) still gets the superseding fyi. Detector:
+# test-glaeda-gh.py test_a_forward_merge_after_a_read_no_verdict_fyi_sends_no_second_merged_word.
 # The acpmux class of every land notice sent (LandQueue.notify): what is sent is something the requester acts on, and
 # an unclassified notice is an FYI that waits up to 15 min for the inbox's flush (acpmux hub/inbox.rs FLUSH_MS).
 LAND_NOTICE_CLASS = "block"
@@ -28662,13 +28687,17 @@ class LandQueue:
             # LAND_MERGED_FORWARDED_ONCE's comment: the host this row was forwarded to merged it and told the requester
             log({"event": "land-merged-forwarded-quiet", "key": e["key"], "to": to, "forwardedTo": e.get("forwardedTo")})
             wake = False
+        read_since = None
+        told_at = float((e.get("forwardQuietTold") or {}).get("at") or 0) if isinstance(e.get("forwardQuietTold"), dict) else 0.0
         if not wake and not own and self.outcome_over_fyi(e):
             wake = True  # LAND_NOTICE_SUPERSEDE's comment: an fyi, it wakes nobody and replaces the queued stop
+            if e.get("forwardedTo") and told_at > 0:
+                read_since = told_at  # LAND_MERGED_FYI_READ's comment: the far queue tells this merge itself
         self.notify(e, e.get("requester") or "",
                     f"glaeda land: {self.url(e)} merged" + (f" at {merge_sha}" if merge_sha else "")
                     + (f" (before it: {e['stackedRebase']})" if e.get("stackedRebase") else ""), wake=wake,
                     cls=LAND_MERGED_CLASS if own else LAND_FORWARD_FYI_CLASS,
-                    within=LAND_MERGED_WITHIN if own else None)
+                    within=LAND_MERGED_WITHIN if own else None, unless_read_since=read_since)
 
     @staticmethod
     def outcome_over_fyi(e: dict) -> bool:
@@ -28827,7 +28856,8 @@ class LandQueue:
         self.notify(e, e.get("requester") or "", msg, wake=wake, cls=cls)
 
     def notify(self, e: dict, to: str, message: str, wake: bool = True, cls: str | None = None,
-               unless_idle: float | None = None, within: str | None = None) -> None:
+               unless_idle: float | None = None, within: str | None = None,
+               unless_read_since: float | None = None) -> None:
         """`acpmux send --no-wait HOST/SESSION MESSAGE`, off the tick; a failure is logged and a notice line, never
         a stop.
 
@@ -28841,7 +28871,8 @@ class LandQueue:
 
         UNLESS_IDLE: send nothing when the receiver has sat between turns that many seconds or longer, read once
         before the send (LAND_OWNER_REMIND_IDLE). WITHIN: acpmux's --within, the latest the receiver is woken
-        (LAND_MERGED_WITHIN)."""
+        (LAND_MERGED_WITHIN). UNLESS_READ_SINCE: send nothing when the receiver has started a turn since that time,
+        read once before the send: the fyi this one would supersede was delivered at that turn (LAND_MERGED_FYI_READ)."""
         to = land_notify_target(e, to)
         if not wake:
             log({"event": "land-notice-quiet", "key": e["key"], "to": to, "message": land_trim(message, 300)})
@@ -28886,6 +28917,14 @@ class LandQueue:
                 if idle is not None and idle >= unless_idle:
                     log({"event": "land-remind-lane-idle", "key": e["key"], "to": to, "idleHours": round(idle / 3600, 1),
                          "message": land_trim(message, 160)})
+                    return
+            if unless_read_since is not None:
+                info = self.call([os.fspath(acpmux), "session", "info", to, "--json", "--fields",
+                                  LAND_OWNER_REMIND_IDLE_FIELDS], LAND_NOTIFY_DEADLINE)
+                began = land_last_turn_began(info.stdout) if info.returncode == 0 else None
+                if began is not None and began > unless_read_since:
+                    log({"event": "land-merged-fyi-read", "key": e["key"], "to": to, "toldAt": unless_read_since,
+                         "turnBegan": began, "message": land_trim(message, 160)})
                     return
             with LAND_NOTIFY_SLOTS:  # LAND_NOTIFY_PARALLEL's comment: a burst waits its turn, it does not fail
                 deliver()

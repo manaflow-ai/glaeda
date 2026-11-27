@@ -37542,6 +37542,38 @@ class LandTest(Base):
         self.assertEqual(merged[0][merged[0].index("--class") + 1], "fyi")
         self.assertEqual(merged[0][merged[0].index("--supersede") + 1], key)
 
+    def test_a_forward_merge_after_a_read_no_verdict_fyi_sends_no_second_merged_word(self):
+        # LAND_MERGED_FYI_READ: gcp-agent-lane-19, 2026-11-27, cmux#60756: cmux-cp-1 told "merged at 0a416a3b" 09:57Z,
+        # this host's bare "merged" fyi (superseding a no-verdict fyi read long before) woke the lane again 11:01Z
+        def turn_at(t: float) -> dict:
+            ms = int(t * 1000)
+            tid = f"{ms:012x}7" + "0" * 19
+            tid = f"{tid[:8]}-{tid[8:12]}-{tid[12:16]}-{tid[16:20]}-{tid[20:]}"
+            return {"status": "ready", "inputSince": None, "pendingPermissions": 0, "queued": 0,
+                    "lastTurn": {"turnId": tid, "endedAt": (t + 30) * 1000}}
+
+        replay = {"before": 0, "after": 0}
+        for read, label in ((True, "turn since"), (False, "no turn since")):
+            e = self.handed_off()
+            e.update(forwardQuietTold={"at": self.t - 600, "since": self.t - 2400, "to": "huge-blue"},
+                     forwardOutcomeTold=None, state=gg.LAND_FORWARDED, stop=None)
+            self.w.session_info = turn_at(self.t - 60 if read else self.t - 1200)
+            sent = len(self.w.sent())
+            with self.q.lock:
+                self.q.merged(e, "", "forwarded to huge-blue: the cache shows it merged")
+            bare = [c for c in self.w.sent()[sent:] if c[-1].endswith(" merged")]
+            replay["after"] += len(bare)
+            replay["before"] += 1  # before: outcome_over_fyi sent it either way
+            if read:
+                self.assertEqual(bare, [], f"{label}: the no-verdict fyi was delivered; the far queue tells the merge")
+            else:
+                self.assertEqual(len(bare), 1, f"{label}: the fyi may still be queued, so the merge supersedes it")
+                self.assertEqual(bare[0][bare[0].index("--supersede") + 1], f"{gg.LAND_NOTICE_SUPERSEDE}:{self.KEY}")
+            self.assertEqual(self.q.entries[self.KEY]["state"], "merged")
+        self.assertEqual(replay, {"before": 2, "after": 1})
+        self.assertEqual(gg.land_last_turn_began(json.dumps(turn_at(1795808408.355))), 1795808408.355)
+        self.assertIsNone(gg.land_last_turn_began('{"lastTurn": {"turnId": "not-a-uuid"}}'))
+
     def test_a_land_fyi_to_an_acpmux_without_supersede_is_sent_again_without_it(self):
         e = self.handed_off()
         refused = subprocess.CompletedProcess([], 2, "", "error: unexpected argument '--supersede' found\n")
