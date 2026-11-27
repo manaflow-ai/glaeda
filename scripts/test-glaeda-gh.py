@@ -37378,6 +37378,52 @@ class LandTest(Base):
         on_disk = gg.read_json(gg.LandQueue.entries_dir() / gg.file_name(self.KEY))
         self.assertEqual(on_disk["forwardQuietTold"]["to"], e["forwardQuietTold"]["to"])  # kept across restarts
 
+    def test_a_forward_stop_told_as_fyi_is_superseded_by_its_merge_and_told_once_per_take_back(self):
+        # LAND_NOTICE_SUPERSEDE: huge-blue, cmux#45156, 2026-11-27: ~20 forward_no_outcome fyis (one per re-arm of a
+        # bound take-back) sat in the requester's inbox after cmux-cp-1 merged it, and were relayed 8 h later as a stall
+        e = self.handed_off()
+        key = f"{gg.LAND_NOTICE_SUPERSEDE}:{self.KEY}"
+        e["forwardBound"] = {"at": self.t - 10, "head": LA}
+        e["forwardTakenBack"] = {"at": self.t - 5, "head": LA, "from": "huge-blue", "far": "waiting_after", "held": 1}
+        sent = len(self.w.sent())
+        with self.q.lock:
+            self.q.forward_give_up(e, "OPEN", "huge-blue", False, "no outcome either")
+        stops = [c for c in self.w.sent()[sent:] if "forward_no_outcome" in c[-1]]
+        self.assertEqual(len(stops), 1)
+        self.assertEqual(stops[0][stops[0].index("--class") + 1], "fyi")
+        self.assertEqual(stops[0][stops[0].index("--supersede") + 1], key)
+        self.assertEqual(stops[0][stops[0].index("--pr") + 1], "1")
+        for _ in range(3):  # the far host's "waiting_after" re-arms it and it gives up again on the same take-back
+            e = self.q.entries[self.KEY]
+            e.update(state=gg.LAND_FORWARDED, stop=None)
+            with self.q.lock:
+                self.q.forward_give_up(e, "OPEN", "huge-blue", False, "no outcome either")
+        self.assertEqual(len([c for c in self.w.sent()[sent:] if "forward_no_outcome" in c[-1]]), 1,
+                         "told once per take-back, not once per re-arm")
+        # the far queue merges it: the requester holds the stop fyi, so the merge goes as an fyi that supersedes it
+        e = self.q.entries[self.KEY]
+        e.update(state=gg.LAND_FORWARDED, stop=None)
+        with self.q.lock:
+            self.q.merged(e, "c" * 40, "forwarded to huge-blue: its land queue merged it after its stop", wake=False)
+            self.q.merged(e, "c" * 40, "forwarded to huge-blue: its land queue merged it after its stop", wake=False)
+        merged = [c for c in self.w.sent()[sent:] if " merged at " in c[-1]]
+        self.assertEqual(len(merged), 1, "once: a second word on the same stop is no news")
+        self.assertEqual(merged[0][merged[0].index("--class") + 1], "fyi")
+        self.assertEqual(merged[0][merged[0].index("--supersede") + 1], key)
+
+    def test_a_land_fyi_to_an_acpmux_without_supersede_is_sent_again_without_it(self):
+        e = self.handed_off()
+        refused = subprocess.CompletedProcess([], 2, "", "error: unexpected argument '--supersede' found\n")
+        real = self.q.call
+        self.q.call = lambda argv, *a, **k: (refused if "--supersede" in argv else real(argv, *a, **k))  # type: ignore
+        sent = len(self.w.sent())
+        self.q.notify(e, e.get("requester") or "host/lane", "glaeda land: an fyi", cls=gg.LAND_FORWARD_FYI_CLASS)
+        [got] = self.w.sent()[sent:]
+        self.assertNotIn("--supersede", got)
+        self.assertNotIn("--pr", got)
+        self.assertEqual(got[got.index("--class") + 1], "fyi")
+        self.assertEqual(got[-1], "glaeda land: an fyi")
+
     def test_a_forward_told_it_had_no_verdict_gives_up_with_no_second_notice(self):
         e = self.handed_off()
         e["forwardQuietTold"] = {"at": self.t, "since": self.t, "to": "huge-blue"}
@@ -44307,7 +44353,15 @@ class LandForwardTest(Base):
         self.assertTrue(e["forwardAskRepair"])
         e = self.tick(gg.LAND_FORWARD_ASK_FIRST + 1)
         self.assertEqual((e["state"], e["mergeSha"]), ("merged", "f" * 40))
-        self.assertEqual(len(self.w.sent()), told)
+        # quiet but for one fyi that wakes nobody and supersedes the stop fyi it was told (LAND_NOTICE_SUPERSEDE):
+        # the executor's own merge word cannot replace this host's queued stop in the requester's inbox
+        after = self.w.sent()[told:]
+        self.assertEqual(len(after), 1, after)
+        self.assertEqual(after[0][after[0].index("--class") + 1], "fyi")
+        self.assertEqual(after[0][after[0].index("--supersede") + 1], f"{gg.LAND_NOTICE_SUPERSEDE}:{self.KEY}")
+        self.assertIn(" merged", after[0][-1])
+        self.tick(gg.LAND_FORWARD_ASK_FIRST + 1)
+        self.assertEqual(len(self.w.sent()), told + 1, "once")
         self.assertEqual(len(self.sent_batches), 1)
 
     def test_a_row_stopped_no_outcome_before_the_ask_still_open_at_its_pin_is_landed_again_pinned(self):

@@ -16720,6 +16720,18 @@ LAND_NOTICE_CLASS = "block"
 LAND_MERGED_CLASS = "result"
 LAND_MERGED_WITHIN = "60s"
 LAND_NOTIFY_NO_WITHIN = re.compile(r"unexpected argument '--within'")
+# LAND_NOTICE_SUPERSEDE: every land fyi (LAND_FORWARD_FYI_CLASS, held unread in the receiver's inbox) goes as
+# `--supersede glaeda-land:KEY` and `--pr N`, so the inbox holds at most one fyi from this host about a PR, its newest:
+# a stop still queued is replaced by the merge that ended it. huge-blue, cmux#45156, 2026-11-26 21:10Z to 11-27 07:12Z: forward_give_up stopped the row forward_no_outcome
+# about 20 times (each a bound take-back fyi, rearmed by cmux-cp-1's "waiting_after" answer), cmux-cp-1 merged it at
+# 07:40Z (85e97931800f), and this host's merge word was quiet (LAND_MERGED_FORWARDED_ONCE). The fyis sat in the
+# requester's inbox; read at 15:5xZ they were relayed as "stalled 16h+ ... re-land at 16220935fae6", a PR merged
+# 8 h before. So: a merge (or close) of a row whose requester holds a queued fyi from here (LAND_FORWARD_OUTCOME_FYI)
+# is sent as an fyi too, superseding the stale stop; a bound give-up tells once per take-back, not on every re-arm.
+# An acpmux older than --supersede or --pr (it refuses the flag) gets the same send once without both.
+# Detector: test-glaeda-gh.py test_a_forward_stop_told_as_fyi_is_superseded_by_its_merge_and_told_once_per_take_back.
+LAND_NOTICE_SUPERSEDE = "glaeda-land"
+LAND_NOTIFY_NO_SUPERSEDE = re.compile(r"unexpected argument '--(supersede|pr)'")
 LAND_HEAD_TIMEOUT = 300.0  # after a push-making step, how long to wait for the cache to show the new head
 # An update-branch GitHub refused "expected head sha didn't match current head ref" while the PR's head read still
 # shows the pinned head: the branch ref is read once (git/ref/heads/BRANCH, update_live_tip). When the branch is at
@@ -21861,6 +21873,10 @@ class LandQueue:
             e.update(state="merged", mergeSha=sha, wait=None, wakeAt=None, action=None)
             self.history(e, "merged", sha=sha, how=f"forwarded to {host}: {how} merged", quiet="forward_give_up")
             self.save(e)
+            if self.outcome_over_fyi(e):  # LAND_NOTICE_SUPERSEDE's comment: replaces the stop it was told
+                self.save(e)
+                self.notify(e, e.get("requester") or "", f"glaeda land: {self.url(e)} merged"
+                            + (f" at {sha}" if sha else "") + f" (forwarded to {host})", cls=LAND_FORWARD_FYI_CLASS)
             log({"event": "land-forward-settled", "key": e["key"], "state": "merged", "how": how})
             return
         if state == "CLOSED":
@@ -21974,7 +21990,12 @@ class LandQueue:
             cause += (f"; {host} held it open ({far}) past its {LAND_FORWARD_HELD_BOUND / 3600:.0f} h bound "
                       f"(LAND_FORWARD_HELD_BOUND), it was taken back at {utc_clock(float(back['at']))} and that "
                       f"got no verdict in {LAND_FORWARD_GIVE_UP / 3600:.0f} h either")
-            told = False
+            # once per take-back (LAND_NOTICE_SUPERSEDE's comment): a re-arm by the far host's answer and the next
+            # give-up on the same take-back is no new word
+            told = float(back.get("toldAt") or 0) >= float(back["at"])
+            if not told:
+                back["toldAt"] = self.now
+                e["forwardQuietTold"] = {"at": self.now, "since": first, "to": host, "by": "forward_give_up"}
         self.stop(e, "forward_no_outcome",
                   f"handed to {host}'s land queue {self.now - first:.0f} s ago with no outcome: {cause}. {host} may "
                   f"still merge it; nothing here does",
@@ -28580,11 +28601,23 @@ class LandQueue:
             # LAND_MERGED_FORWARDED_ONCE's comment: the host this row was forwarded to merged it and told the requester
             log({"event": "land-merged-forwarded-quiet", "key": e["key"], "to": to, "forwardedTo": e.get("forwardedTo")})
             wake = False
+        if not wake and not own and self.outcome_over_fyi(e):
+            wake = True  # LAND_NOTICE_SUPERSEDE's comment: an fyi, it wakes nobody and replaces the queued stop
         self.notify(e, e.get("requester") or "",
                     f"glaeda land: {self.url(e)} merged" + (f" at {merge_sha}" if merge_sha else "")
                     + (f" (before it: {e['stackedRebase']})" if e.get("stackedRebase") else ""), wake=wake,
                     cls=LAND_MERGED_CLASS if own else LAND_FORWARD_FYI_CLASS,
                     within=LAND_MERGED_WITHIN if own else None)
+
+    @staticmethod
+    def outcome_over_fyi(e: dict) -> bool:
+        """True once per row when E's requester holds an fyi from here about it (a forward stop, a no-verdict word:
+        forwardQuietTold) that its outcome has not yet replaced; marks it told (LAND_NOTICE_SUPERSEDE's comment)."""
+        told = e.get("forwardQuietTold") if isinstance(e.get("forwardQuietTold"), dict) else None
+        if told is None or float(e.get("forwardOutcomeTold") or 0) >= float(told.get("at") or 0) > 0:
+            return False
+        e["forwardOutcomeTold"] = float(told.get("at") or 0)  # this word is answered; a later fyi is told again
+        return True
 
     def ended(self, e: dict, state: str, merge_sha: str, how: str) -> bool:
         """Under the lock. A PR that reads MERGED or CLOSED ends its entry (LAND_STEP_CLOSED's comment): merged with
@@ -28776,6 +28809,11 @@ class LandQueue:
         argv = [os.fspath(acpmux), "send", "--no-wait", to, "--notice", "--severity", severity, "--sender", LAND_TAG,
                 "--class", cls or LAND_NOTICE_CLASS, *(["--within", within] if within else []), "--title", title,
                 message]
+        if cls == LAND_FORWARD_FYI_CLASS:
+            # LAND_NOTICE_SUPERSEDE's comment: an fyi waits unread in the inbox, so the newest one replaces it
+            at = argv.index("--title")
+            argv[at:at] = ["--supersede", f"{LAND_NOTICE_SUPERSEDE}:{e['key']}",
+                           *(["--pr", str(e["number"])] if e.get("number") else [])]
 
         now = self.now
 
@@ -28804,6 +28842,19 @@ class LandQueue:
                          "severity": severity, "message": land_trim(message, 160)})
                     return
                 whys.append(land_trim(got.stderr or got.stdout or f"exit {got.returncode}", 200))
+                if "--supersede" in argv and LAND_NOTIFY_NO_SUPERSEDE.search(whys[-1]):
+                    # LAND_NOTICE_SUPERSEDE's comment: an older acpmux; the same send without --supersede and --pr
+                    for flag in ("--supersede", "--pr"):
+                        if flag in argv:
+                            i = argv.index(flag)
+                            del argv[i:i + 2]
+                    got = self.call(argv, LAND_NOTIFY_DEADLINE)
+                    if got.returncode == 0:
+                        gone.pop(to, None)
+                        log({"event": "land-notified", "key": e["key"], "to": to, "class": cls or LAND_NOTICE_CLASS,
+                             "severity": severity, "message": land_trim(message, 160), "supersede": "unsupported"})
+                        return
+                    whys[-1] = land_trim(got.stderr or got.stdout or f"exit {got.returncode}", 200)
                 if "--within" in argv and LAND_NOTIFY_NO_WITHIN.search(whys[-1]):
                     # LAND_MERGED_WITHIN's comment: an acpmux older than --within; the same send without it
                     i = argv.index("--within")
