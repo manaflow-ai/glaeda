@@ -19328,6 +19328,7 @@ class LandQueue:
                  behind: Callable[[Path, int, float, float], str | None] = land_checkout_behind,
                  forward: Callable[[list[str], dict, float], dict] = land_forward,
                  broker_client: Callable[[], bool] = land_broker_client,
+                 held: Callable[[], bool] | None = None,
                  own_pool: Callable[[], bool] = land_own_token_pool,
                  snapshot_of: Callable[[str], dict | None] = read_rollup,
                  peek: Callable[[str], None] | None = None,
@@ -19353,6 +19354,7 @@ class LandQueue:
         # (key, head, since) -> the webhook feed delivered nothing for that PR or head since (LAND_FEED_QUIET_MAX)
         self.feed_quiet = feed_quiet or (lambda key, sha, since: False)
         self.broker_client = broker_client
+        self.held = held or (lambda: land_host_held())  # this host is held for draining (land_host_held): its open entries go to the broker host
         self.own_pool = own_pool  # this host holds a token pool of its own (land_own_token_pool, LAND_PEER_SILENT)
         self.own_pool_seen = (float("-inf"), False)  # (until, held): own_pool's file reads once per APP_POOL_TTL
         self.reading = reading  # the login's reading of a pool, to check a latch mark against (land_latch_judge)
@@ -23127,6 +23129,8 @@ class LandQueue:
             if SHA40.fullmatch(head) and (e.get("pinSha") or not SHA40.fullmatch(cached) or cached == head):
                 self.hand_off_now(e, head, str(infra.get("why") or "GitHub could not be read here"), "handoff_infra")
                 return
+        if self.held_handoff(e, data):
+            return
         if self.after_wait(e):
             return
         head = str(data.get("headRefOid") or "").lower()
@@ -25372,6 +25376,21 @@ class LandQueue:
                 self.history(e, "local_git_retry", head=head[:12], n=n)
                 return ""  # judged here again (LAND_LOCAL_GIT_TIMEOUT's comment)
         return land_trim(f"{code}: {land_reason(answer.get('reason'), 160)}", 200)
+
+    def held_handoff(self, e: dict, data: dict) -> bool:
+        """Under the lock, from consider: on a broker client this host's registry row holds for draining
+        (land_host_held, HELD_PREFIXES' comment), hand E at its pin, else the cached head, to the broker host's land
+        queue now, once per head; True when that job was started. The VM is going away, and its queue with it."""
+        if e.get("state") == LAND_FORWARDED or not self.broker_client() or self.broker_peer_silent() \
+                or not self.held():
+            return False
+        head = (str(e.get("pinSha") or "") or str(data.get("headRefOid") or "")).lower()
+        if not SHA40.fullmatch(head) or e.get("heldHandoff") == head:
+            return False
+        e["heldHandoff"] = head
+        self.hand_off_now(e, head, "this host is held for draining and deletion: its land goes to the broker host",
+                          "handoff_held")
+        return True
 
     def early_hand_off(self, e: dict, sha: str, fp: str) -> bool:
         """E is due a judgment: on a broker client that could not read GitHub in most of its last live judgments
@@ -36736,6 +36755,44 @@ def fleet_registries() -> list[dict]:
     docs = [read_json(path) for path in (Path(SPENDERS_CMD).resolve().parent.parent / "machines/fleet-registry.json",
                                          Path.home() / ".ssh/config.d/fleet-registry.json")]
     return [doc for doc in docs if isinstance(doc, dict)]
+
+
+
+# A GCP lane VM the fleet registry holds (a "hold", or lanes.accept_new false) is drained and then deleted by
+# cmuxterm-hq fleet_gce.held_reapable_from_machines; leo-workspace tools/lane_cap_watch.held_vms names the same set,
+# and lane_cap_rebalance moves its idle sessions off. Its land queue went nowhere: an entry still open here died with
+# the VM, so the drain kept every lane with an open land on it ("landing"), and on 2026-11-27 10:45Z that held ~38 idle
+# sessions on 10 held VMs (every-machine-in-table). A held host hands each open entry to the broker host's land queue
+# (land_handoff, as an owner refusal does) instead: LandQueue.held_handoff.
+HELD_PREFIXES = ("gcp-codex-lane-", "gcp-agent-lane-", "gcp-codex-swarm-")
+HELD_ELASTIC_PREFIX = "gcp-agent-lane-e"
+HELD_TTL = 300.0
+_host_held: tuple[float, bool] | None = None
+
+
+def registry_held(doc: dict, host: str) -> bool:
+    """Whether registry DOC holds HOST for draining: lane_cap_watch.held_vms's rule for one host."""
+    row = ((doc or {}).get("machines") or {}).get(host)
+    if not isinstance(row, dict) or row.get("retired") is True or not isinstance(row.get("lanes"), dict):
+        return False
+    if not row.get("hold") and row["lanes"].get("accept_new") is not False:
+        return False
+    if not host.startswith(HELD_PREFIXES) or host.startswith(HELD_ELASTIC_PREFIX) or row.get("elastic"):
+        return False
+    roles = row.get("roles") if isinstance(row.get("roles"), list) else []
+    return not (row.get("control_plane") or any("control" in str(r).replace("_", "-") for r in roles))
+
+
+def land_host_held() -> bool:
+    """Whether this host is held for draining (registry_held), read at most once per HELD_TTL; unreadable: not."""
+    global _host_held
+    now = time.time()
+    if _host_held is not None and now - _host_held[0] < HELD_TTL:
+        return _host_held[1]
+    docs = fleet_registries()
+    held = bool(docs) and registry_held(docs[0], policy_host())
+    _host_held = (now, held)
+    return held
 
 
 FLEET_MACHINES_TTL = 300.0

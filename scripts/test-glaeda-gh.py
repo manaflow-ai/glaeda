@@ -28177,7 +28177,9 @@ class LandTest(Base):
                             nudge=self.nudge_read, notice=lambda *a: self.w.notices.append(a), inline=True,
                             config=self.w.config, reads_upstream=lambda: self.upstream, refresh=self.refresh,
                             behind=lambda *a: self.stale_why, broker_client=lambda: self.broker,
-                            own_pool=lambda: self.own_pool, snapshot_of=self.snaps.get)
+                            own_pool=lambda: self.own_pool, snapshot_of=self.snaps.get, held=lambda: self.held)
+
+    held = False  # this host is held for draining (land_host_held)
 
     # GitHub's own head per PR when a test moves it behind the daemon's back (the cache not told); a nudge reads it.
     github_head: dict[str, str] = {}
@@ -36758,6 +36760,40 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "handoff_refused"))
         self.assertIn("unknown tool", e["stop"]["reason"])
 
+    def test_a_held_host_hands_each_open_land_to_the_broker_host_once_per_head(self):
+        # every-machine-in-table, 2026-11-27 10:45Z: ~38 idle sessions on 10 held GCP lane VMs sat out the drain as
+        # "landing", their land queue on a VM held_reap deletes. A held broker client hands an open entry off at once.
+        self.broker = True
+        self.held = True
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        self.land()
+        e = self.tick()
+        for _ in range(3):
+            if e["state"] == "forwarded":
+                break
+            e = self.tick(gg.LAND_STEP_BACKOFF_MAX + 1)
+        self.assertEqual(e["state"], "forwarded")
+        self.assertIn("handoff_held", [h.get("event") for h in e["history"]])
+        self.assertEqual(len(self.handoffs()), 1)
+
+    def test_a_host_not_held_keeps_its_land_and_the_registry_rule_matches_held_vms(self):
+        self.broker = True
+        self.pr(LA, checks=[("ci", "IN_PROGRESS", None)])
+        self.land()
+        e = self.tick()
+        self.assertNotIn("handoff_held", [h.get("event") for h in e["history"]])
+        self.assertEqual(self.handoffs(), [])
+        reg = {"machines": {
+            "gcp-agent-lane-8": {"hold": {"owner": "x"}, "lanes": {"accept_new": False}},
+            "gcp-agent-lane-9": {"lanes": {"accept_new": False}},
+            "gcp-agent-lane-2": {"lanes": {"accept_new": False}, "roles": ["lane-vm-controller"]},
+            "gcp-agent-lane-e1": {"lanes": {"accept_new": False}},
+            "gcp-agent-lane-5": {"lanes": {"accept_new": True}},
+            "fs-agent-lane-1": {"lanes": {"accept_new": False}},
+            "gcp-agent-lane-7": {"retired": True, "lanes": {"accept_new": False}}}}
+        got = {h for h in reg["machines"] if gg.registry_held(reg, h)}
+        self.assertEqual(got, {"gcp-agent-lane-8", "gcp-agent-lane-9"})
+
     def test_a_hand_off_the_broker_could_not_answer_backs_off_and_is_rearmed_not_stopped(self):
         # gcp-agent-lane-2, 2026-11-22: with the broker CPU-bound, 336 of 411 hand-off refusals were "timed out after
         # 60s", and 59 rows stopped handoff_refused (a code nothing re-arms) for 75-123 h. A refusal the broker gave
@@ -43198,6 +43234,8 @@ class LandForwardTest(Base):
     stale_why = None
     upstream = False
     fresh_head = None
+    broker = False  # LandTest.queue reads these: not a broker client, not held for draining (LandQueue.held_handoff)
+    held = False
 
     EXEC = ["reach", "big-exec", ".local/bin/glaeda-gh", "land", "serve"]
 
