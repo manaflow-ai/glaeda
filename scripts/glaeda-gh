@@ -29723,7 +29723,8 @@ def land_progress(entry: Any) -> Any:
     def strip(v: Any) -> Any:
         if isinstance(v, dict):
             return {k: strip(x) for k, x in v.items()
-                    if not (k.endswith("At") or k in ("at", "checked", "until", "now", "seen", "touched"))}
+                    if not (k.endswith("At") or k in ("at", "checked", "until", "now", "seen", "touched")
+                            or (v is entry and k == "updated"))}
         if isinstance(v, list):
             return [strip(x) for x in v]
         return v
@@ -33508,7 +33509,7 @@ def cache_warm_cap(kind: str, target: str, timeout: float, ceiling: float | None
         return timeout, ceiling, ""
     horizon = cache_warm_horizon(warm)
     life = "1 h" if warm == CACHE_WARM_WAIT else "5 min" if warm <= 300 else f"{warm:g}s-wait"
-    whole = max(float(timeout), default_wait_max(timeout) if ceiling is None else float(ceiling))
+    whole = wait_ceiling(timeout, ceiling)
     try:
         key = parse_key(kind, target) if kind in ("pr", "run", "comment") else f"{kind}:{target}"
     except Exception:  # noqa: BLE001 -- a bad target is the wait's own error to report, not this cap's
@@ -33562,7 +33563,7 @@ def land_agent_wait_cap(target: str, wait: float, ceiling: float | None) -> tupl
         return wait, ceiling, ""
     if os.environ.get("CLAUDECODE") != "1" and not any(os.environ.get(k) for k in READER_KEYS):
         return wait, ceiling, ""
-    whole = max(float(wait), default_wait_max(wait) if ceiling is None else float(ceiling))
+    whole = wait_ceiling(wait, ceiling)
     if wait <= 0 or whole <= LAND_AGENT_WAIT_CAP:
         return wait, ceiling, ""
     words = (f"glaeda-gh land: an agent's foreground wait ends by {LAND_AGENT_WAIT_CAP:g}s (asked {whole:g}s); the land "
@@ -33575,12 +33576,17 @@ def default_wait_max(timeout: float) -> float:
     return WAIT_MAX_TIMES * float(timeout)
 
 
+def wait_ceiling(timeout: float, ceiling: float | None) -> float:
+    """An explicit --max bounds the whole wait, even when shorter than its no-progress window."""
+    return default_wait_max(timeout) if ceiling is None else float(ceiling)
+
+
 def wait_max(req: dict) -> float:
-    """The wait's hard ceiling, seconds from its start: never under its --timeout."""
+    """The hard ceiling in a saved wait request, in seconds from its start."""
     ceiling = req.get("max")
-    ceiling = default_wait_max(float(req["timeout"])) if not isinstance(ceiling, (int, float)) or \
-        isinstance(ceiling, bool) else float(ceiling)
-    return max(float(req["timeout"]), ceiling)
+    if not isinstance(ceiling, (int, float)) or isinstance(ceiling, bool):
+        ceiling = None
+    return wait_ceiling(float(req["timeout"]), ceiling)
 
 
 def wait_moved_at(req: dict) -> float:
@@ -34593,7 +34599,7 @@ def waiting_line(key: str, until: str, sha: str | None, exact: bool, timeout: fl
             + (f" at {sha}{'' if exact else '... (a prefix: it must match the head GitHub shows)'}"
                if sha else "")
             + (f", giving up after {timeout:g}s with no change (at {deadline_clock(timeout)} unless it changes; "
-               f"ceiling {deadline_clock(max(timeout, default_wait_max(timeout) if ceiling is None else ceiling))})"
+               f"ceiling {deadline_clock(wait_ceiling(timeout, ceiling))})"
                if leash else f", giving up after {timeout:g}s (at {deadline_clock(timeout)})"))
 
 
@@ -34697,7 +34703,7 @@ def wait_request(kind: str, target: str, until: str, timeout: float, jobs: bool,
     daemon rules on it (subscribe_wait). `began` is wall-clock time: only data fetched after it counts.
     TIMEOUT is "no change for this long" and CEILING (--max) the bound from `began` (wait_deadline)."""
     return {"key": parse_key(kind, target), "kind": kind, "target": target, "until": until, "timeout": timeout,
-            "max": max(timeout, default_wait_max(timeout) if ceiling is None else ceiling),
+            "max": wait_ceiling(timeout, ceiling),
             "jobs": jobs, "json": as_json, "sha": sha, "exact": exact, "grace": grace, "settle": settle,
             "began": time.time(), "verbose": full_output(), **({"chosen": dict(chosen)} if chosen else {})}
 
@@ -35412,7 +35418,7 @@ def direct_parts_save(repo_parts: dict[str, dict], now: float) -> None:
 def poll_wait(req: dict) -> int:
     """Re-read the cache until wait_step decides REQ, saying what a down, failing or stale daemon means.
     A wait the daemon stopped ruling on (resume_wait) carries on here, from when it began."""
-    timeout, jobs = req["timeout"], req["jobs"]
+    timeout, jobs = min(req["timeout"], wait_max(req)), req["jobs"]
     start = time.monotonic() - max(0.0, time.time() - req["began"])
     touched = -TOUCH_EVERY
     said = time.monotonic()
@@ -35427,7 +35433,7 @@ def poll_wait(req: dict) -> int:
                     print_json_error("daemon-down", "the daemon is not running, so nothing is polling GitHub",
                                      down_message().rpartition("\nnext: ")[2])
                 return EXIT_DOWN
-            time.sleep(WAIT_POLL)
+            time.sleep(min(WAIT_POLL, max(0.0, start + timeout - time.monotonic())))
             continue
         down_since = None
         broken = daemon_failing()
@@ -35480,7 +35486,7 @@ def poll_wait(req: dict) -> int:
                 state = progress_update(seen, req, read_cache(req["key"]), time.time())
                 if state is not None:
                     say_waiting(progress_line(req, state))
-        time.sleep(min(WAIT_POLL, max(0.1, wait_deadline(req) - time.time())))
+        time.sleep(min(WAIT_POLL, max(0.0, wait_deadline(req) - time.time())))
 
 
 WAITS_CONTRACT = 1  # daemon.json "waits": this daemon rules on `wait pr|run` requests (Daemon.serve_waits)
@@ -35581,7 +35587,7 @@ def write_wait_request(kind: str, target: str, until: str, timeout: float, jobs:
     if began is not None:  # a handoff keeps the wait's start (data read since then still counts), same deadline
         req["timeout"] += max(0.0, req["began"] - began)
         req["began"] = began
-        req["max"] = max(req["timeout"], default_wait_max(req["timeout"]) if ceiling is None else ceiling)
+        req["max"] = wait_ceiling(req["timeout"], ceiling)
     if isinstance(moved, dict):
         req["moved"] = moved
     rid = f"{pid}-{os.urandom(4).hex()}"
@@ -35800,9 +35806,9 @@ def land_row_now(key: str) -> dict | None:
     return next((r for r in land_entries() if r.get("key") == key), None)
 
 
-def land_row_wait(key: str, row: dict, timeout: float, ceiling: float | None, as_json: bool,
+def land_row_wait(key: str, row: dict, leash: Leash, as_json: bool,
                   sleep: Callable[[float], None] = time.sleep) -> int | None:
-    """Wait on ROW, this host's active land row for KEY, until it ends or TIMEOUT passes with no change in it
+    """Wait on ROW, this host's active land row for KEY, until it ends or its wait deadline passes
     (LAND_ROW_WAIT's comment). None: the row went where this wait cannot follow (forwarded, gone) or no daemon
     works it, so the caller takes the ordinary wait."""
     name = key_name(key)
@@ -35810,7 +35816,6 @@ def land_row_wait(key: str, row: dict, timeout: float, ceiling: float | None, as
         return None
     say_waiting(f"glaeda-gh: {name} is an active row in this host's land queue ({row.get('state')}): waiting on that "
                 f"row until it merges or stops (a local read; no GitHub watcher)")
-    leash = Leash(timeout, ceiling)
     entry: dict | None = row
     marker = land_waiter_mark(key)  # LAND_MERGED_WAITER_QUIET
     while True:
@@ -35822,9 +35827,10 @@ def land_row_wait(key: str, row: dict, timeout: float, ceiling: float | None, as
             land_waiter_end(marker, "")
             return None
         leash.see(land_progress(entry))
-        if state in LAND_DONE or leash.left() <= 0:
+        left = leash.left()
+        if state in LAND_DONE or left <= 0:
             break
-        sleep(min(LAND_ROW_WAIT_POLL, max(0.05, leash.left())))
+        sleep(min(LAND_ROW_WAIT_POLL, left))
     state = str(entry.get("state") or "")
     land_waiter_end(marker, state)
     code = EXIT_OK if state == "merged" else EXIT_FAIL if state in LAND_DONE else EXIT_TIMEOUT
@@ -35866,7 +35872,7 @@ def subscribe_wait(kind: str, target: str, until: str, timeout: float, jobs: boo
     The waiting line is said exactly once: by cmd_wait on the first fallback, here before BLOCKER
     otherwise -- say_waiting writes fd 2 directly, so nothing is left buffered across the exec -- and
     not again on the late fallback, which goes straight to poll_wait."""
-    if not (0 <= max(timeout, default_wait_max(timeout) if ceiling is None else ceiling) <= WAITS_MAX_TIMEOUT) \
+    if not (0 <= max(timeout, wait_ceiling(timeout, ceiling)) <= WAITS_MAX_TIMEOUT) \
             or not os.access(BASH, os.X_OK) or not serving_waits():
         return cmd_wait(kind, target, until, timeout, jobs, as_json, sha, grace, settle, ceiling, chosen)
     key = parse_key(kind, target)
@@ -35882,7 +35888,7 @@ def subscribe_wait(kind: str, target: str, until: str, timeout: float, jobs: boo
         # the daemon keeps reading while this blocks (a lost finish is re-read past STALE_RUN_REREAD)
         register(key, jobs, waited=True, began=req["began"])
         started = time.monotonic()
-        controller_wait_run(key, timeout)
+        controller_wait_run(key, min(timeout, req["max"]))
         done = wait_step(req, time.time())
         if done is not None:
             sys.stdout.write(done[1])
@@ -36018,7 +36024,7 @@ class Leash:
 
     def __init__(self, timeout: float, ceiling: float | None = None) -> None:
         self.timeout = float(timeout)
-        self.ceiling = max(self.timeout, default_wait_max(self.timeout) if ceiling is None else float(ceiling))
+        self.ceiling = wait_ceiling(self.timeout, ceiling)
         self.start = self.moved = time.monotonic()
         self.mark: Any = None
         self.changes = 0
@@ -45792,12 +45798,15 @@ def main(argv: list[str] | None = None) -> int:
             # running (resume_wait, poll_wait) never comes back through here, so a row queued mid-wait never cuts one
             # off -- the wait it is already in goes on to its own verdict.
             pr_key = parse_key("pr", args.target)
+            leash = Leash(args.timeout, args.max)
             row = land_row_watched_here(pr_key, args.sha)
             if row is not None and args.until in (None, "merged"):
-                code = land_row_wait(pr_key, row, args.timeout, args.max, args.json)
+                code = land_row_wait(pr_key, row, leash, args.json)
                 if code is not None:
                     return code
-                row = None  # forwarded, gone or no daemon: the ordinary wait below
+                # Forwarding or losing the row switches the source of the verdict within the same wait.
+                args.max = max(0.0, leash.start + leash.ceiling - time.monotonic())
+                row = None
             if row is not None:
                 code, out, lines = land_row_wait_refusal(pr_key, row, args.timeout, args.json)
                 say_waiting(lines.rstrip("\n"))

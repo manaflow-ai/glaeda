@@ -54,6 +54,9 @@ cmux-gh runners OWNER[/REPO] [--label L] [--json]  # online, busy and idle self-
   `nothing-reported`, `inconclusive`, `no-data-yet`, `usage`, `refused`, `daemon-down`). A PR or run GitHub does not know is
   `not-found` (exit 1) on the daemon's first read of it, not a wait to the timeout. `status` exits 3 when
   the daemon has not read a target yet. Deadlines are UTC with a Z (`17:55:00Z`).
+- For `wait pr`, `--timeout S` is the no-progress window. A queue save that only rewrites its timestamp
+  leaves that window running. `--max S` is the total budget, including when the land row forwards to
+  another host. It can be shorter than `--timeout` and defaults to four times that window.
 - While it blocks, a `wait pr|run` prints `cmux-gh: still waiting on KEY: 240s of 1800s, deadline
   17:55:00Z; <state>` every 120 s on stderr, the stream of its waiting line; a timeout's last lines say
   `waited N s for ... (deadline ...Z); last seen: ...` and `next:` the same wait again.

@@ -19,6 +19,7 @@ starting the real wait they are entitled to, which would be the network read thi
 """
 from __future__ import annotations
 
+import functools
 import importlib.machinery
 import importlib.util
 import json
@@ -129,6 +130,69 @@ class WaitPrSkipsOwnLandRow(unittest.TestCase):
                 self.assertEqual((doc["code"], doc["state"], doc["result"]), ("land_row", "waiting", "timeout"))
                 self.assertLess(time.monotonic() - began, 30)
 
+    def test_queued_row_deadlines(self) -> None:
+        # Read through the CLI and save through LandQueue: its per-save timestamp is not progress.
+        cases = [
+            # timeout, max, seconds when the row changes step, elapsed, ending
+            (3, 8, (), 3, "no-progress"),
+            (3, 8, (2,), 5, "no-progress"),
+            (3, 8, (2, 4, 6, 7), 8, "ceiling"),
+            (3, None, (2, 4, 6, 8, 10), 12, "ceiling"),
+            (5, 2, (), 2, "ceiling"),
+            (1, 0.01, (), 0.01, "ceiling"),
+        ]
+        for timeout, maximum, steps, expected, ending in cases:
+            with self.subTest(timeout=timeout, maximum=maximum, steps=steps):
+                row = write_row(65, "queued")
+                queue = gg.LandQueue()
+                queue.now = 0.0
+                queue.save(row)
+
+                def tick(seconds: float) -> None:
+                    self.assertGreater(seconds, 0)
+                    queue.now += seconds
+                    self.assertLessEqual(queue.now, 20)
+                    if queue.now in steps:
+                        row["step"] = f"step-{queue.now}"
+                    queue.save(row)
+
+                wait = functools.partial(gg.land_row_wait, sleep=tick)
+                flags = [] if maximum is None else ["--max", str(maximum)]
+                with mock.patch.object(gg.time, "monotonic", lambda: queue.now), \
+                        mock.patch.object(gg, "land_row_wait", wait):
+                    code, out = self.wait_cli(65, "--sha", HEAD, "--until", "merged", "--timeout", str(timeout), *flags)
+                self.assertEqual(code, gg.EXIT_TIMEOUT, out)
+                doc = json.loads(out)
+                self.assertEqual((doc["state"], doc["result"], doc["ended_by"]), ("queued", "timeout", ending))
+                self.assertEqual(doc["progress_changes"], len(steps))
+                self.assertAlmostEqual(queue.now, expected)
+
+    def test_forwarded_row_keeps_the_remaining_ceiling(self) -> None:
+        row = write_row(66, "queued")
+        queue = gg.LandQueue()
+        queue.now = 0.0
+        queue.save(row)
+
+        def tick(seconds: float) -> None:
+            queue.now += seconds
+            row["state"] = gg.LAND_FORWARDED if queue.now == 3 else "acting"
+            queue.save(row)
+
+        wait = functools.partial(gg.land_row_wait, sleep=tick)
+        # The local daemon forwards at t=3, then the ordinary waiter takes its daemon-down fallback.
+        # Its normal poll interval (3 s) is longer than the remaining 2 s.
+        out = io.StringIO()
+        with mock.patch.object(gg.time, "monotonic", lambda: queue.now), \
+                mock.patch.object(gg.time, "time", lambda: queue.now), \
+                mock.patch.object(gg.time, "sleep", tick), mock.patch.object(gg, "land_row_wait", wait), \
+                mock.patch.object(gg, "serving_waits", return_value=False), \
+                mock.patch.object(gg, "daemon_running", side_effect=lambda **kw: queue.now < 3), \
+                mock.patch.object(gg, "say_waiting"), contextlib.redirect_stdout(out):
+            code = gg.main(["wait", "pr", f"{REPO}#66", "--until", "merged", "--timeout", "4", "--max", "5", "--json"])
+        self.assertEqual(code, gg.EXIT_DOWN, out.getvalue())
+        self.assertEqual(json.loads(out.getvalue())["code"], "daemon-down")
+        self.assertEqual(queue.now, 5)
+
     def test_the_row_wait_ends_with_the_row_merged_or_stopped(self) -> None:
         for end, want in (("merged", gg.EXIT_OK), ("stopped", gg.EXIT_FAIL), ("cancelled", gg.EXIT_FAIL)):
             with self.subTest(end=end):
@@ -143,7 +207,7 @@ class WaitPrSkipsOwnLandRow(unittest.TestCase):
                 out = io.StringIO()
                 with mock.patch.object(gg, "daemon_running", return_value=True), contextlib.redirect_stdout(out), \
                         contextlib.redirect_stderr(io.StringIO()):
-                    code = gg.land_row_wait(f"pr:{REPO}#42", row, 60, None, True, sleep=tick)
+                    code = gg.land_row_wait(f"pr:{REPO}#42", row, gg.Leash(60), True, sleep=tick)
                 self.assertEqual(code, want)
                 self.assertEqual(len(ticks), 1)
                 self.assertEqual(json.loads(out.getvalue())["state"], end)
@@ -152,9 +216,9 @@ class WaitPrSkipsOwnLandRow(unittest.TestCase):
         row = write_row(43, "waiting")
         write_row(43, gg.LAND_FORWARDED)
         with mock.patch.object(gg, "daemon_running", return_value=True), contextlib.redirect_stderr(io.StringIO()):
-            self.assertIsNone(gg.land_row_wait(f"pr:{REPO}#43", row, 60, None, True, sleep=lambda _: None))
+            self.assertIsNone(gg.land_row_wait(f"pr:{REPO}#43", row, gg.Leash(60), True, sleep=lambda _: None))
         with mock.patch.object(gg, "daemon_running", return_value=False):
-            self.assertIsNone(gg.land_row_wait(f"pr:{REPO}#43", row, 60, None, True))
+            self.assertIsNone(gg.land_row_wait(f"pr:{REPO}#43", row, gg.Leash(60), True))
 
     def test_refusal_names_the_row_the_caller_can_look_up(self) -> None:
         """The row's own words, as `land status` prints them, so the caller can match the two."""
@@ -253,7 +317,7 @@ class MergedNoticeSkipsTheRequestersOwnWaiter(unittest.TestCase):
         with mock.patch.object(gg, "daemon_running", return_value=True), \
                 mock.patch.object(gg, "land_requester", return_value="host/me"), \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(gg.land_row_wait(key, row, 60, None, True, sleep=tick), gg.EXIT_OK)
+            self.assertEqual(gg.land_row_wait(key, row, gg.Leash(60), True, sleep=tick), gg.EXIT_OK)
         self.assertIsNotNone(seen[0])
         # the daemon's merge a moment after the waiter saw it: the same session is not woken twice ...
         self.assertEqual([c["wake"] for c in self.merge(key, "host/me")], [False])
@@ -267,7 +331,7 @@ class MergedNoticeSkipsTheRequestersOwnWaiter(unittest.TestCase):
         with mock.patch.object(gg, "daemon_running", return_value=True), \
                 mock.patch.object(gg, "land_requester", return_value="host/me"), \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            gg.land_row_wait(key, row, 60, None, True,
+            gg.land_row_wait(key, row, gg.Leash(60), True,
                              sleep=lambda _: write_row(42, "stopped", stop={"code": "c", "reason": "r", "next": "n"}))
         self.assertEqual([c["wake"] for c in self.merge(key, "host/me")], [True])
         self.assertEqual(list((Path(HOME) / "land" / "waiters").glob("*.json")), [])
