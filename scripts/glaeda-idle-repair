@@ -99,6 +99,39 @@ def load_disk_module() -> Any:
     return module
 
 
+# Someone at the keyboard. On a personal desktop Mac this job ran the full disk pass,
+# `cmux-disk --refresh --pressure --idle --apply`, every 15-26 min while it was in use: 2026-11-27 13:5xZ-15:1xZ the
+# last three passes each hit their 660 s bound (exit 124) at load 60-250, with git cat-file over a mirror on top of
+# an agent-daemon delivery wedge, while the keyboard read active (HID idle 0 s). host_busy asks only about CI
+# jobs and builds, so an attended desktop always read idle. The idle sweep and the --refresh survey are named for an
+# idle host; under a person they wait. Disk pressure does not: an attended Mac still gets `--pressure --apply`,
+# which acts only below its free target. The same reading and threshold as the desktop presence check
+# (HID idle under 600 s is a person there; a locked screen or no reading changes nothing here). A fleet mini nobody
+# touches reads days of HID idle and keeps the whole pass.
+ATTENDED_IDLE_S = 600
+IOREG = os.environ.get("GLAEDA_IDLE_REPAIR_IOREG") or "/usr/sbin/ioreg"
+
+
+def hid_idle_s(run=subprocess.run) -> float | None:
+    """Seconds since this Mac's last keyboard or mouse input (IOHIDSystem HIDIdleTime), or None off macOS or when
+    it cannot be read."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        out = run([IOREG, "-c", "IOHIDSystem", "-d", "4", "-k", "HIDIdleTime"], capture_output=True, text=True,
+                  timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    found = re.search(r'"HIDIdleTime" = (\d+)', out or "")
+    return int(found.group(1)) / 1e9 if found else None
+
+
+def attended(idle_s=hid_idle_s) -> bool:
+    """Someone used this Mac's keyboard or mouse in the last ATTENDED_IDLE_S seconds. No reading is not attended."""
+    seconds = idle_s() if callable(idle_s) else idle_s
+    return seconds is not None and seconds < ATTENDED_IDLE_S
+
+
 def read_state() -> dict[str, Any]:
     try:
         value = json.loads(STATE.read_text())
@@ -300,7 +333,10 @@ def main(argv: list[str] | None = None) -> int:
         disk_command = [python, disk_path]
         if role := os.environ.get("GLAEDA_ROLE"):
             disk_command.extend(["--role", role])
-        disk_command.extend(["--refresh", "--pressure", "--idle", "--apply", "--top", "0"])
+        if attended():  # a person at this Mac: the pressure pass alone (ATTENDED_IDLE_S)
+            disk_command.extend(["--pressure", "--apply", "--top", "0"])
+        else:
+            disk_command.extend(["--refresh", "--pressure", "--idle", "--apply", "--top", "0"])
         commands = [
             (disk_command, 660),
             ([python, health_path, "--apply"], 180),

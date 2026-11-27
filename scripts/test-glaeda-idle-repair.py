@@ -30,6 +30,7 @@ class IdleRepairTest(unittest.TestCase):
         idle.STATE = idle.STATE_DIR / "queue.json"
         idle.RECEIPT = idle.STATE_DIR / "receipts.jsonl"
         idle.LOCK = idle.STATE_DIR / "run.lock"
+        idle.IOREG = "/nonexistent/ioreg"  # no reading: the test host's own keyboard never picks the pass
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -65,6 +66,44 @@ class IdleRepairTest(unittest.TestCase):
         self.assertEqual(state["state"], "idle")
         self.assertEqual([a["exit"] for a in state["actions"]], [0, 0])
         self.assertEqual([call.args[1] for call in run.call_args_list], [660, 180])
+
+    def test_attended_mac_runs_the_pressure_pass_alone(self) -> None:
+        # 2026-11-27: the --refresh --idle pass ran every 15-26 min on a desktop Mac in use, at load 60-250.
+        disk = mock.Mock()
+        disk.host_busy.return_value = ""
+        with mock.patch.object(idle, "attended", return_value=True), \
+             mock.patch.object(idle, "load_disk_module", return_value=disk), \
+             mock.patch.object(idle, "run", side_effect=[(0, "disk ok", ""), (0, "health ok", "")]) as run:
+            self.assertEqual(idle.main(["--apply"]), 0)
+        argv = run.call_args_list[0].args[0]
+        self.assertIn("--pressure", argv)
+        self.assertIn("--apply", argv)
+        self.assertNotIn("--idle", argv)
+        self.assertNotIn("--refresh", argv)
+
+    def test_unattended_host_keeps_the_whole_pass(self) -> None:
+        disk = mock.Mock()
+        disk.host_busy.return_value = ""
+        with mock.patch.object(idle, "attended", return_value=False), \
+             mock.patch.object(idle, "load_disk_module", return_value=disk), \
+             mock.patch.object(idle, "run", side_effect=[(0, "disk ok", ""), (0, "health ok", "")]) as run:
+            self.assertEqual(idle.main(["--apply"]), 0)
+        argv = run.call_args_list[0].args[0]
+        self.assertIn("--idle", argv)
+        self.assertIn("--refresh", argv)
+
+    def test_attended_reads_hid_idle_and_no_reading_is_not_attended(self) -> None:
+        self.assertTrue(idle.attended(0.0))
+        self.assertTrue(idle.attended(599.0))
+        self.assertFalse(idle.attended(600.0))
+        self.assertFalse(idle.attended(None))
+        fake = mock.Mock(return_value=mock.Mock(stdout='    | |     "HIDIdleTime" = 304466625\n'))
+        with mock.patch.object(idle.sys, "platform", "darwin"):
+            self.assertAlmostEqual(idle.hid_idle_s(run=fake), 0.304466625)
+            self.assertIsNone(idle.hid_idle_s(run=mock.Mock(return_value=mock.Mock(stdout=""))))
+            self.assertIsNone(idle.hid_idle_s(run=mock.Mock(side_effect=OSError)))
+        with mock.patch.object(idle.sys, "platform", "linux"):
+            self.assertIsNone(idle.hid_idle_s(run=fake))
 
     def test_successful_repair_waits_until_next_attempt(self) -> None:
         disk = mock.Mock()
