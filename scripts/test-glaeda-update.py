@@ -90,7 +90,7 @@ class Server:
         tag = gr.release_tag(source, dt.datetime(2026, 9, 25))
         runner = {f"glaeda/scripts/{name}": ((runner_files or {}).get(name, f"{name} at {source}".encode()),
                                              0o755 if "." not in name else 0o644)
-                  for name in gu.RUNNER_FILES}
+                  for name in (*gu.RUNNER_FILES, *gu.LIBEXEC_FILES)}  # step 6c's seed scripts ship in every release
         if ancestry is None:
             ancestry = [source, *reversed(self.sources)]
         extra = {"ancestry.txt": ("".join(c + "\n" for c in ancestry).encode(), 0o644)}
@@ -554,6 +554,55 @@ class UpdateTest(unittest.TestCase):
         newer = self.server.publish(SOURCES[1])
         self.assertEqual(self.run_update()["result"], "updated")
         self.assertEqual(gu.refresh_runner_scripts(self.state, copy), f"refreshed to {newer['tag']}")
+
+    def test_a_hand_installed_seed_script_is_refreshed_and_a_role_is_never_added(self) -> None:
+        libexec = self.root / "home/.local/libexec"
+        self.assertEqual(gu.refresh_libexec_scripts(self.state, libexec), "absent")  # no seed role: nothing made
+        self.assertFalse(libexec.exists())
+        libexec.mkdir(parents=True)
+        self.assertEqual(gu.refresh_libexec_scripts(self.state, libexec), "no seed scripts")
+        entry = self.server.publish(SOURCES[0])
+        self.assertEqual(self.run_update()["result"], "updated")
+        # cmux-lawrence: the archive and prefetch copied in by hand over SSH months ago, no stamp, no serve role
+        for name in ("glaeda-seed-archive", "glaeda-seed-prefetch"):
+            (libexec / name).write_text("the Sep 28 copy of " + name)
+        self.assertEqual(gu.refresh_libexec_scripts(self.state, libexec),
+                         f"refreshed glaeda-seed-archive, glaeda-seed-prefetch to {entry['tag']}")
+        for name in ("glaeda-seed-archive", "glaeda-seed-prefetch"):
+            self.assertEqual((libexec / name).read_text(), f"{name} at {SOURCES[0]}")
+            self.assertTrue(os.access(libexec / name, os.X_OK))
+        self.assertFalse((libexec / "glaeda-seed-serve").exists(), "a host is never given a seed role it lacks")
+        stamp = json.loads((libexec / gu.SOURCE_STAMP).read_text())
+        self.assertEqual((stamp["by"], stamp["tag"], stamp["source"]), ("glaeda-update", entry["tag"], SOURCES[0]))
+        self.assertEqual(gu.refresh_libexec_scripts(self.state, libexec), "current")
+        # an operator staged main the same day: kept, never downgraded
+        (libexec / "glaeda-seed-archive").write_text("operator main")
+        (libexec / gu.SOURCE_STAMP).write_text(json.dumps({"by": "ssh", "date": "2026-09-25", "source": "d" * 40}))
+        self.assertIn("kept", gu.refresh_libexec_scripts(self.state, libexec))
+        self.assertEqual((libexec / "glaeda-seed-archive").read_text(), "operator main")
+        # the same copy, older than the release: refreshed
+        (libexec / gu.SOURCE_STAMP).write_text(json.dumps({"by": "ssh", "date": "2026-09-24", "source": "d" * 40}))
+        self.assertEqual(gu.refresh_libexec_scripts(self.state, libexec),
+                         f"refreshed glaeda-seed-archive to {entry['tag']}")
+
+    def test_the_seed_scripts_are_a_step_and_a_status_row_only_where_they_are_installed(self) -> None:
+        home, staged, _ = self.runner_mini()
+        entry = self.server.publish(SOURCES[0], runner_files=self.runner_files("the release"),
+                                    hook_history=self.older())
+        self.assertEqual(self.run_update()["result"], "updated")
+        self.assertNotIn("libexecScripts", gu.runner_steps(self.state, staged, home, bin_dir=self.bin),
+                         "a host with no seed script says nothing about one")
+        self.assertNotIn("libexecScripts", gu.observe(self.state, self.bin, home, staged))
+        libexec = home / gu.LIBEXEC_RELATIVE
+        libexec.mkdir(parents=True)
+        (libexec / "glaeda-seed-serve").write_text("a stale serve")
+        self.assertEqual(gu.runner_steps(self.state, staged, home, bin_dir=self.bin)["libexecScripts"],
+                         f"refreshed glaeda-seed-serve to {entry['tag']}")
+        row = gu.observe(self.state, self.bin, home, staged)["libexecScripts"]
+        self.assertEqual(list(row), ["glaeda-seed-serve"])
+        self.assertTrue(row["glaeda-seed-serve"]["current"])
+        self.assertEqual(row["glaeda-seed-serve"]["installedSha256"],
+                         gr.sha256(f"glaeda-seed-serve at {SOURCES[0]}".encode()))
 
     def runner_mini(self) -> tuple[Path, Path, Path]:
         """A mini as glaeda-cmux-runner --apply left it: an owned runner whose hooks came from the staged copy."""

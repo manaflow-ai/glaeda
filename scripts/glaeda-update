@@ -73,6 +73,13 @@ What one run does, and what it refuses:
    brought to the release's bytes: installed when missing, replaced when it is a version the release descends from
    (hook-history.json), kept when newer. Under the helper's admit.lock and never while a lease's supervisor runs (a
    later run swaps it); the copy and the installed file are each checked against the release's SHA-256.
+   6c. A host with a LAN seed role keeps its seed scripts in ~/.local/libexec, installed by hand over SSH
+   (glaeda-seed-lan, glaeda-seed-archive install): those are brought to the release's bytes the same way
+   (LIBEXEC_FILES), and only the names already there, so no host is given a seed role it does not have. Each job
+   runs its script fresh (the archive daemon's plist names the path, StartInterval 15; a serve runs per
+   forced-command SSH), so there is nothing to restart. Without this, a merged fix never reached the host: on
+   2026-11-27 cmux-lawrence's seed archive crash-looped on an unreadable entry the 2026-11-21 fix already skips,
+   because the installed copy was a standalone Sep 28 one (cmuxterm-hq forum/903).
 
 7. Then the runners' installed hook files: the release's own glaeda-cmux-runner --refresh-hooks --apply
    brings each owned runner's glaeda-hooks/glaeda-cmux-runner-hook and glaeda_reservation.py to the
@@ -172,6 +179,14 @@ RUNNER_FILES = ("glaeda-cmux-runner", "glaeda-cmux-runner-hook", "glaeda_fleet_l
                 "glaeda-nightly-only-admit", "glaeda-promotion-admit", "glaeda-capture-admit",
                 "glaeda-job-needs.json",  # the hook reads its measured job needs from this copy (CAPACITY_ARITHMETIC)
                 "glaeda-runner-job-disk.json")  # and one runner job's measured disk (RUNNER_JOBS_DISK)
+# The seed scripts an operator installs by hand over SSH into ~/.local/libexec (docs/CMUX_MINI_RUNNER.md; the LAN
+# seed install "is not an OTA", glaeda-seed-lan): glaeda-seed-lan puts glaeda-seed-serve there on a seeder and on
+# each client, and cmux-lawrence's archive LaunchDaemon runs ~/.local/libexec/glaeda-seed-archive from its plist.
+# Nothing brought those copies to the release, so a merged fix never reached the host: on 2026-11-27 the archive
+# crash-looped on an unreadable entry its 2026-11-21 fix already skips, because the installed copy was from Sep 28
+# (cmuxterm-hq forum/903, "nothing on the host pulls it toward main"). Step 6c refreshes the ones already there.
+LIBEXEC_RELATIVE = ".local/libexec"
+LIBEXEC_FILES = ("glaeda-seed-archive", "glaeda-seed-prefetch", "glaeda-seed-serve")
 SOURCE_STAMP = ".glaeda-source.json"
 STAMP_BY = "glaeda-update"
 ANCESTRY = "ancestry.txt"  # glaeda_release.ANCESTRY: the release's commit and its ancestors
@@ -1209,6 +1224,51 @@ def refresh_runner_scripts(state_dir: Path = STATE_DIR, target: Path = RUNNER_SC
     return f"refreshed to {tag}"
 
 
+def refresh_libexec_scripts(state_dir: Path = STATE_DIR, target: Path | None = None) -> str:
+    """Step 6c: bring the seed scripts installed in ~/.local/libexec to the installed release. Returns what it did.
+
+    Only names already there are refreshed: a host with no seed role never gets one installed, and a role is still
+    glaeda-seed-lan's (or glaeda-seed-archive install's) to give. Each job runs its script fresh (the archive
+    daemon's plist names the path and starts every 15 s; a serve runs per forced-command SSH), so new bytes are
+    live on the next run with nothing to restart. An operator copy staged no earlier than the release and not an
+    ancestor of it is kept, exactly as the staged runner copy is (SOURCE_STAMP)."""
+    target = (HOME / LIBEXEC_RELATIVE) if target is None else target
+    if not target.is_dir():
+        return "absent"
+    present = [name for name in LIBEXEC_FILES if (target / name).is_file()]
+    if not present:
+        return "no seed scripts"
+    tag = load_state(state_dir)["current"]
+    gen = generation(state_dir, tag) if tag else None
+    if gen is None or not (gen / ".complete").is_file():
+        return "no installed release"
+    src = gen / "glaeda/scripts"
+    absent = [name for name in present if not (src / name).is_file()]
+    if absent:
+        return f"{tag} has no " + ", ".join(absent)
+    stale = [name for name in present if (target / name).read_bytes() != (src / name).read_bytes()]
+    if not stale:
+        return "current"
+    try:
+        stamp = json.loads((target / SOURCE_STAMP).read_text())
+    except (OSError, ValueError):
+        stamp = None
+    if (isinstance(stamp, dict) and stamp.get("by") != STAMP_BY
+            and str(stamp.get("date") or "")[:10] >= tag_date(tag) and not release_descends_from(gen, stamp.get("source"))):
+        return f"kept (staged {str(stamp.get('source') or '?')[:12]} on {str(stamp['date'])[:10]}, not older than {tag})"
+    for name in stale:
+        data, dest = (src / name).read_bytes(), target / name
+        tmp = target / f".{name}.glaeda-update"
+        tmp.write_bytes(data)
+        tmp.chmod(0o755 if os.access(src / name, os.X_OK) else 0o644)
+        os.replace(tmp, dest)
+    source = json.loads((gen / "release.json").read_text()).get("source")
+    tmp = target / f".{SOURCE_STAMP}.glaeda-update"
+    tmp.write_text(json.dumps({"by": STAMP_BY, "date": tag_date(tag), "source": source, "tag": tag}, sort_keys=True) + "\n")
+    os.replace(tmp, target / SOURCE_STAMP)
+    return f"refreshed {', '.join(stale)} to {tag}"
+
+
 def refresh_runner_hooks(state_dir: Path = STATE_DIR, home: Path = HOME, detail: list | None = None) -> str:
     """Step 7: the runners' installed hook files, from the installed release by its own glaeda-cmux-runner.
     With `detail`, each runner's {runnerDir, state, note} is appended to it (step 8 names the blocked ones)."""
@@ -1444,15 +1504,18 @@ def refresh_promotion_admit(state_dir: Path = STATE_DIR, target: Path = RUNNER_S
 
 def runner_steps(state_dir: Path = STATE_DIR, target: Path = RUNNER_SCRIPTS, home: Path = HOME,
                  detail: list | None = None, bin_dir: Path = BIN) -> dict:
-    """Steps 6, 6b and 7, after a run that installed a release or found it current. None fails the update."""
+    """Steps 6, 6b, 6c and 7, after a run that installed a release or found it current. None fails the update."""
     out = {}
     for key, step in (("runnerScripts", lambda: refresh_runner_scripts(state_dir, target)),
                       ("promotionAdmit", lambda: refresh_promotion_admit(state_dir, target, bin_dir, home)),
+                      ("libexecScripts", lambda: refresh_libexec_scripts(state_dir, home / LIBEXEC_RELATIVE)),
                       ("runnerHooks", lambda: refresh_runner_hooks(state_dir, home, detail))):
         try:
             out[key] = step()
         except (OSError, ValueError, UpdateError) as e:
             out[key] = f"not refreshed ({type(e).__name__}: {e})"[:300]
+    if out.get("libexecScripts") in ("absent", "no seed scripts"):
+        del out["libexecScripts"]  # no seed role on this host: nothing to say
     accounts = []
     for user in runner_accounts(home):  # step 7b
         try:
@@ -1627,6 +1690,12 @@ def observe(state_dir: Path = STATE_DIR, bin_dir: Path = BIN, home: Path = HOME,
             installed = file_sha256(bin_dir / PROMOTION_ADMIT)
             out["promotionAdmit"] = {"installedSha256": installed, "releaseSha256": release,
                                      "current": installed == release}
+    libexec = home / LIBEXEC_RELATIVE  # step 6c: the seed scripts this host has, by content against the release
+    seeds = {name: file_sha256(libexec / name) for name in LIBEXEC_FILES if (libexec / name).is_file()}
+    if seeds:
+        out["libexecScripts"] = {name: {"installedSha256": have, "releaseSha256": file_sha256(scripts / name),
+                                        "current": have is not None and have == file_sha256(scripts / name)}
+                                 for name, have in seeds.items()}
     return out
 
 
