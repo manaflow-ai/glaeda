@@ -24307,9 +24307,7 @@ class GitShimTest(unittest.TestCase):
         self.assertIn("HQ checkout", self.install(hook.HQ_DISPATCH_REPO))
         shim_dir = Path(self.path_file.read_text().strip())
         shim = shim_dir / "git"
-        if refused_socket:
-            shim.write_text(shim.read_text().replace("http://127.0.0.1:18434", proxy))
-        else:
+        if not refused_socket:  # a refused socket on any loopback port is a fleet tunnel (job 140669807034: 18435)
             curl = self.dir / "curl"
             curl.write_text('#!/bin/sh\nprintf "%s" "$TEST_CONNECT"\nexit "$TEST_CURL_EXIT"\n')
             curl.chmod(0o755)

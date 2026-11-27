@@ -6626,6 +6626,9 @@ def git_shim_script(real_git: str, mirror: Path, log: Path) -> str:
 # 127.0.0.1 port 18434" three times, cmuxterm-hq job 140064510755, 2026-11-26 17:30Z). So any
 # github.com origin an actions/checkout step fetches in an HQ job takes the same probe and mark.
 # A checkout whose git carries the job's token (its extraheader) goes direct with no probe, as the cmux shim's does.
+# Any loopback proxy is a fleet tunnel, not only 18434: a fleet Mac's git config names 127.0.0.1:18435, and with
+# the exact-port test the shim passed that dead tunnel through ("Failed to connect to 127.0.0.1 port 18435"
+# three times, cmuxterm-hq job 140669807034, 2026-11-27 20:14Z, the feature-flows walk).
 HQ_GIT_SHIM_DEAD = "glaeda-hq-proxy-dead"
 HQ_GIT_SHIM_BODY = r'''
 [ "${GITHUB_ACTION_REPOSITORY:-}" = actions/checkout ] && [ "${GLAEDA_GIT_SHIM:-1}" != 0 ] || exec "$real" "$@"
@@ -6640,7 +6643,7 @@ case "$url" in
 esac
 "$real" "${globals[@]}" config --get remote.origin.proxy >/dev/null 2>&1 && passthrough
 proxy=$("$real" "${globals[@]}" config --get-urlmatch http.proxy "$url" 2>/dev/null) || passthrough
-[ "$proxy" = http://127.0.0.1:18434 ] || passthrough
+case "$proxy" in http://127.0.0.1:[0-9]*|http://localhost:[0-9]*) ;; *) passthrough ;; esac  # any fleet tunnel port
 case "$sub" in fetch|checkout) ;; *) exec "$real" "${globals[@]}" -c "http.$url.proxy=" "$@" ;; esac
 if authed; then  # checkout's fetch carries the job's token: the tunnel is only for anonymous fetches (GIT_SHIM_TUNNEL)
   echo "glaeda git shim: this checkout carries the job's token; using direct HTTPS for ${url#https://github.com/}" >&2
