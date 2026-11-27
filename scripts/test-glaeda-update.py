@@ -555,6 +555,97 @@ class UpdateTest(unittest.TestCase):
         self.assertEqual(self.run_update()["result"], "updated")
         self.assertEqual(gu.refresh_runner_scripts(self.state, copy), f"refreshed to {newer['tag']}")
 
+    def test_update_only_health_does_not_require_hygiene_or_watcher(self) -> None:
+        self.bin.mkdir()
+        updater = self.bin / "glaeda-update"
+        updater.write_text("import json; print(json.dumps({'result': 'plan'}))\n")
+        self.assertEqual(gu.health(self.bin, self.root, update_only=True), (True, "tools run"))
+        gen = self.root / "generation"
+        (gen / "glaeda/scripts").mkdir(parents=True)
+        (gen / "glaeda/scripts/glaeda-update").write_bytes(updater.read_bytes())
+        (gen / "glaeda/config").mkdir()
+        (gen / "glaeda/config/gh-daemon.json").write_text("{}")
+        self.assertEqual(gu.tool_drift(gen, self.bin, update_only=True), (1, []))
+        updater.write_text("stale updater")
+        self.assertEqual(gu.tool_drift(gen, self.bin, update_only=True), (1, ["glaeda-update"]))
+
+    def test_cas_launch_copy_refreshes_recursively_without_creating_a_role(self) -> None:
+        home, staged, _ = self.runner_mini()
+        entry = self.server.publish(SOURCES[0])
+        self.assertEqual(self.run_update()["result"], "updated")
+        name = "glaeda-fleet-cas-prune"
+        src = gu.generation(self.state, entry["tag"]) / "glaeda/scripts" / name
+        src.write_text("the release prune")
+        launch = home / ".cache/glaeda-fleet-cas/launch"
+        self.assertNotIn("casScripts", gu.runner_steps(self.state, staged, home, bin_dir=self.bin))
+        self.assertFalse(launch.exists())
+        launch.mkdir(parents=True)
+        dest = launch / name
+        dest.write_text("old prune")
+        wrapper = launch / "fleet-cas-run"
+        wrapper.write_text("installer-owned wrapper")
+        before = gu.observe(self.state, self.bin, home, staged)
+        self.assertFalse(before["casScripts"][name]["current"])
+        converged, why, _ = gu.convergence({"result": "current"},
+            {"tag": entry["tag"], "casScripts": before["casScripts"]}, {"tag": entry["tag"]}, [])
+        self.assertFalse(converged)
+        self.assertTrue(any(name in reason for reason in why))
+        gu.runner_steps(self.state, staged, home, bin_dir=self.bin)
+        self.assertEqual(dest.read_bytes(), src.read_bytes())
+        self.assertEqual(wrapper.read_text(), "installer-owned wrapper")
+        self.assertTrue(gu.observe(self.state, self.bin, home, staged)["casScripts"][name]["current"])
+        self.assertEqual(gu.runner_steps(self.state, staged, home, bin_dir=self.bin)["casScripts"], "current")
+        stamp = json.loads((launch / gu.SOURCE_STAMP).read_text())
+        self.assertEqual(stamp["source"], SOURCES[0])
+        # An operator's newer copy stays visible as drift, never silently downgraded.
+        dest.write_text("operator newer prune")
+        (launch / gu.SOURCE_STAMP).write_text(json.dumps({"by": "rollout", "date": "2026-09-25", "source": "d" * 40}))
+        self.assertIn("kept", gu.runner_steps(self.state, staged, home, bin_dir=self.bin)["casScripts"])
+        self.assertFalse(gu.observe(self.state, self.bin, home, staged)["casScripts"][name]["current"])
+
+    def test_service_script_refresh_preserves_operator_symlinks(self) -> None:
+        home, staged, _ = self.runner_mini()
+        entry = self.server.publish(SOURCES[0])
+        self.assertEqual(self.run_update()["result"], "updated")
+        scripts = gu.generation(self.state, entry["tag"]) / "glaeda/scripts"
+        for key, relative, name in (
+            ("casScripts", ".cache/glaeda-fleet-cas/launch", "glaeda-fleet-cas-prune"),
+            ("libexecScripts", str(gu.LIBEXEC_RELATIVE), "glaeda-seed-archive"),
+        ):
+            with self.subTest(family=key):
+                target = home / relative
+                target.mkdir(parents=True)
+                (scripts / name).write_text("release bytes")
+                operator = self.root / (name + "-operator")
+                operator.write_text("operator bytes")
+                dest = target / name
+                dest.symlink_to(operator)
+                self.assertIn("kept (operator symlink", gu.refresh_libexec_scripts(self.state, target, (name,)))
+                self.assertTrue(dest.is_symlink())
+                self.assertEqual(operator.read_text(), "operator bytes")
+                row = gu.observe(self.state, self.bin, home, staged)[key][name]
+                self.assertIsNone(row["installedSha256"])
+                self.assertFalse(row["current"])
+                operator.unlink()  # dangling links remain operator-owned and visible
+                self.assertIn("kept (operator symlink", gu.refresh_libexec_scripts(self.state, target, (name,)))
+                self.assertTrue(dest.is_symlink())
+                self.assertFalse(gu.observe(self.state, self.bin, home, staged)[key][name]["current"])
+                dest.unlink()
+                dest.write_text("old installed bytes")
+                stamp = target / gu.SOURCE_STAMP
+                stamp.symlink_to(operator)
+                self.assertIn("kept (operator symlink", gu.refresh_libexec_scripts(self.state, target, (name,)))
+                self.assertTrue(stamp.is_symlink())
+                self.assertEqual(dest.read_text(), "old installed bytes")
+                stamp.unlink()
+                moved = target.with_name(target.name + "-operator")
+                target.rename(moved)
+                target.symlink_to(moved, target_is_directory=True)
+                self.assertIn("kept (operator symlink", gu.refresh_libexec_scripts(self.state, target, (name,)))
+                self.assertTrue(target.is_symlink())
+                self.assertEqual((moved / name).read_text(), "old installed bytes")
+                self.assertFalse(gu.observe(self.state, self.bin, home, staged)[key][name]["current"])
+
     def test_a_hand_installed_seed_script_is_refreshed_and_a_role_is_never_added(self) -> None:
         libexec = self.root / "home/.local/libexec"
         self.assertEqual(gu.refresh_libexec_scripts(self.state, libexec), "absent")  # no seed role: nothing made

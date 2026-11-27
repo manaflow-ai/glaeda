@@ -853,7 +853,7 @@ def clear_stall() -> None:
         pass
 
 
-def health(bin_dir: Path, channel_dir: Path, gh_only: bool = False) -> tuple[bool | None, str]:
+def health(bin_dir: Path, channel_dir: Path, gh_only: bool = False, update_only: bool = False) -> tuple[bool | None, str]:
     """The installed tools run, and the installed glaeda-update plans from the channel files this
     run already fetched, so a network blip cannot fail (and quarantine) a good release. A --gh-only
     host installs only glaeda-gh, glaeda-update and glaeda-disk, so only those are checked there. (None, why) when a
@@ -872,6 +872,8 @@ def health(bin_dir: Path, channel_dir: Path, gh_only: bool = False) -> tuple[boo
         [sys.executable, str(bin_dir / "glaeda-gh"), "--help"],
         [sys.executable, str(bin_dir / "glaeda-update"), "--channel-dir", str(channel_dir)],
     ]
+    if update_only:
+        checks = checks[-1:]  # no hygiene or watcher tools are installed by this profile
     for argv in checks:
         name = Path(argv[1] if argv[0] == sys.executable else argv[0]).name
         try:
@@ -1224,7 +1226,8 @@ def refresh_runner_scripts(state_dir: Path = STATE_DIR, target: Path = RUNNER_SC
     return f"refreshed to {tag}"
 
 
-def refresh_libexec_scripts(state_dir: Path = STATE_DIR, target: Path | None = None) -> str:
+def refresh_libexec_scripts(state_dir: Path = STATE_DIR, target: Path | None = None,
+                            names: tuple[str, ...] = LIBEXEC_FILES) -> str:
     """Step 6c: bring the seed scripts installed in ~/.local/libexec to the installed release. Returns what it did.
 
     Only names already there are refreshed: a host with no seed role never gets one installed, and a role is still
@@ -1233,9 +1236,13 @@ def refresh_libexec_scripts(state_dir: Path = STATE_DIR, target: Path | None = N
     live on the next run with nothing to restart. An operator copy staged no earlier than the release and not an
     ancestor of it is kept, exactly as the staged runner copy is (SOURCE_STAMP)."""
     target = (HOME / LIBEXEC_RELATIVE) if target is None else target
+    linked = [path.name for path in (target, target / SOURCE_STAMP, *(target / name for name in names))
+              if path.is_symlink()]
+    if linked:
+        return "kept (operator symlink: " + ", ".join(linked) + ")"
     if not target.is_dir():
         return "absent"
-    present = [name for name in LIBEXEC_FILES if (target / name).is_file()]
+    present = [name for name in names if (target / name).is_file()]
     if not present:
         return "no seed scripts"
     tag = load_state(state_dir)["current"]
@@ -1258,14 +1265,23 @@ def refresh_libexec_scripts(state_dir: Path = STATE_DIR, target: Path | None = N
         return f"kept (staged {str(stamp.get('source') or '?')[:12]} on {str(stamp['date'])[:10]}, not older than {tag})"
     for name in stale:
         data, dest = (src / name).read_bytes(), target / name
-        tmp = target / f".{name}.glaeda-update"
-        tmp.write_bytes(data)
-        tmp.chmod(0o755 if os.access(src / name, os.X_OK) else 0o644)
-        os.replace(tmp, dest)
+        with tempfile.NamedTemporaryFile(dir=target, prefix=f".{name}.glaeda-update-", delete=False) as staged:
+            tmp = Path(staged.name)
+            staged.write(data)
+        try:
+            tmp.chmod(0o755 if os.access(src / name, os.X_OK) else 0o644)
+            os.replace(tmp, dest)
+        finally:
+            tmp.unlink(missing_ok=True)
     source = json.loads((gen / "release.json").read_text()).get("source")
-    tmp = target / f".{SOURCE_STAMP}.glaeda-update"
-    tmp.write_text(json.dumps({"by": STAMP_BY, "date": tag_date(tag), "source": source, "tag": tag}, sort_keys=True) + "\n")
-    os.replace(tmp, target / SOURCE_STAMP)
+    with tempfile.NamedTemporaryFile(dir=target, prefix=f".{SOURCE_STAMP}.glaeda-update-", mode="w", delete=False) as staged:
+        tmp = Path(staged.name)
+        staged.write(json.dumps({"by": STAMP_BY, "date": tag_date(tag), "source": source, "tag": tag}, sort_keys=True) + "\n")
+    try:
+        tmp.chmod(0o644)
+        os.replace(tmp, target / SOURCE_STAMP)
+    finally:
+        tmp.unlink(missing_ok=True)
     return f"refreshed {', '.join(stale)} to {tag}"
 
 
@@ -1509,6 +1525,8 @@ def runner_steps(state_dir: Path = STATE_DIR, target: Path = RUNNER_SCRIPTS, hom
     for key, step in (("runnerScripts", lambda: refresh_runner_scripts(state_dir, target)),
                       ("promotionAdmit", lambda: refresh_promotion_admit(state_dir, target, bin_dir, home)),
                       ("libexecScripts", lambda: refresh_libexec_scripts(state_dir, home / LIBEXEC_RELATIVE)),
+                      ("casScripts", lambda: refresh_libexec_scripts(
+                          state_dir, home / ".cache/glaeda-fleet-cas/launch", ("glaeda-fleet-cas-prune",))),
                       ("runnerHooks", lambda: refresh_runner_hooks(state_dir, home, detail))):
         try:
             out[key] = step()
@@ -1516,6 +1534,8 @@ def runner_steps(state_dir: Path = STATE_DIR, target: Path = RUNNER_SCRIPTS, hom
             out[key] = f"not refreshed ({type(e).__name__}: {e})"[:300]
     if out.get("libexecScripts") in ("absent", "no seed scripts"):
         del out["libexecScripts"]  # no seed role on this host: nothing to say
+    if out.get("casScripts") in ("absent", "no seed scripts"):
+        del out["casScripts"]
     accounts = []
     for user in runner_accounts(home):  # step 7b
         try:
@@ -1554,13 +1574,13 @@ def fast_patched(gen: Path, name: str, have_sha: str, path: Path | None = None) 
             and SHA_RE.fullmatch(str(doc.get("commit"))) is not None and not release_descends_from(gen, doc["commit"]))
 
 
-def tool_drift(gen: Path, bin_dir: Path, gh_only: bool = False) -> tuple[int, list[str]]:
+def tool_drift(gen: Path, bin_dir: Path, gh_only: bool = False, update_only: bool = False) -> tuple[int, list[str]]:
     """(tools compared, tools whose installed bytes are not the release's). Only a tool both installed and
     in the release is compared: a host profile need not install every tool, and setup owns which. A
     --gh-only host compares only its own: hygiene tools left from an earlier profile are no longer setup's,
     and a "repair" that reran setup for them would fail on every run."""
     checked, drift = 0, []
-    for name in GH_ONLY_TOOLS if gh_only else TOOLS:
+    for name in ("glaeda-update",) if update_only else GH_ONLY_TOOLS if gh_only else TOOLS:
         want = gen / "bin" / name if name == "glaeda-worktree-reclaim" else gen / "glaeda/scripts" / name
         have = bin_dir / name
         want_sha, have_sha = file_sha256(want), file_sha256(have)
@@ -1572,7 +1592,7 @@ def tool_drift(gen: Path, bin_dir: Path, gh_only: bool = False) -> tuple[int, li
     # The fleet's glaeda-gh pacing (every profile installs it). Missing counts as drift too: without it the
     # daemon falls back to its own default REST share, which the fleet's shares are split to stay under.
     want_sha = file_sha256(gen / "glaeda" / GH_POLICY)
-    if want_sha is not None:
+    if want_sha is not None and not update_only:
         checked += 1
         if file_sha256(bin_dir.parent / "share/glaeda" / Path(GH_POLICY).name) != want_sha:
             drift.append(Path(GH_POLICY).name)
@@ -1633,7 +1653,8 @@ def live_summary(running: dict) -> dict:
 
 
 def observe(state_dir: Path = STATE_DIR, bin_dir: Path = BIN, home: Path = HOME,
-            staged: Path = RUNNER_SCRIPTS, gh_only: bool = False, hook_states: list | None = None) -> dict:
+            staged: Path = RUNNER_SCRIPTS, gh_only: bool = False, hook_states: list | None = None,
+            update_only: bool = False) -> dict:
     """Step 8: what this host actually runs, by content: the installed release, its tools and each runner's
     installed hook files, each compared with the release's bytes. Reads local files only; another account's runners
     (step 7b) are this run's refresh rows from `hook_states`, which read them as that account."""
@@ -1644,7 +1665,7 @@ def observe(state_dir: Path = STATE_DIR, bin_dir: Path = BIN, home: Path = HOME,
     gen = generation(state_dir, tag) if tag else None
     if gen is None or not (gen / ".complete").is_file():
         return out
-    checked, drift = tool_drift(gen, bin_dir, gh_only)
+    checked, drift = tool_drift(gen, bin_dir, gh_only, update_only)
     out["tools"] = {"checked": checked, "drift": drift}
     # merge-to-live: when the release's commit landed on main (release.json `committed`, glaeda_release.py) and when
     # this host installed it
@@ -1691,11 +1712,18 @@ def observe(state_dir: Path = STATE_DIR, bin_dir: Path = BIN, home: Path = HOME,
             out["promotionAdmit"] = {"installedSha256": installed, "releaseSha256": release,
                                      "current": installed == release}
     libexec = home / LIBEXEC_RELATIVE  # step 6c: the seed scripts this host has, by content against the release
-    seeds = {name: file_sha256(libexec / name) for name in LIBEXEC_FILES if (libexec / name).is_file()}
+    seeds = {name: None if libexec.is_symlink() or (libexec / name).is_symlink() else file_sha256(libexec / name)
+             for name in LIBEXEC_FILES if (libexec / name).is_file() or (libexec / name).is_symlink()}
     if seeds:
         out["libexecScripts"] = {name: {"installedSha256": have, "releaseSha256": file_sha256(scripts / name),
                                         "current": have is not None and have == file_sha256(scripts / name)}
                                  for name, have in seeds.items()}
+    cas = home / ".cache/glaeda-fleet-cas/launch/glaeda-fleet-cas-prune"
+    if cas.exists() or cas.is_symlink():
+        have = None if cas.is_symlink() or cas.parent.is_symlink() else file_sha256(cas)
+        want = file_sha256(scripts / cas.name)
+        out["casScripts"] = {cas.name: {"installedSha256": have, "releaseSha256": want,
+                                       "current": have is not None and have == want}}
     return out
 
 
@@ -1736,6 +1764,10 @@ def convergence(result: dict, running: dict, wants: dict | None, hook_states: li
                    f"{running.get('tag')}'s {str(helper.get('releaseSha256') or '?')[:12]}"
                    + (f" ({step[:200]})" if step else ""))
         blocking = blocking or step.startswith(("kept", "failed"))
+    for key in ("libexecScripts", "casScripts"):
+        for name, script in (running.get(key) or {}).items():
+            if not script.get("current"):
+                why.append(f"{name}: installed service script differs from {running.get('tag')}")
     return not why, why, blocking
 
 
@@ -1883,12 +1915,12 @@ def update(apply: bool, config: dict, state_dir: Path = STATE_DIR,
     if entry["tag"] == state["current"]:
         gen = generation(state_dir, entry["tag"])
         if apply and (gen / ".complete").is_file():
-            _, drift = tool_drift(gen, bin_dir, gh_only(config))
+            _, drift = tool_drift(gen, bin_dir, gh_only(config), "--update-only" in config["setupArgs"])
             if drift:
                 # Step 8: the installed tools are not this release's bytes (a partial or hand install):
                 # its own idempotent setup puts them back. Never a quarantine: the release was healthy here.
                 ok, log = run_setup(gen, config["setupArgs"], bin_dir)
-                _, left = tool_drift(gen, bin_dir, gh_only(config))
+                _, left = tool_drift(gen, bin_dir, gh_only(config), "--update-only" in config["setupArgs"])
                 out["repair"] = (f"reinstalled {', '.join(drift)}" if ok and not left
                                  else f"failed: setup {'exited' if not ok else 'left ' + ', '.join(left)}: {log[-200:]}")[:400]
         return {**out, "result": "current"}
@@ -1935,7 +1967,7 @@ def update(apply: bool, config: dict, state_dir: Path = STATE_DIR,
         channel_dir.mkdir(parents=True, exist_ok=True)
         (channel_dir / "control.json").write_bytes(control_raw)
         (channel_dir / f"{config['ring']}.json").write_bytes(ring_raw or b"")
-        ok, detail = health(bin_dir, channel_dir, gh_only=gh_only(config))
+        ok, detail = health(bin_dir, channel_dir, gh_only=gh_only(config), update_only="--update-only" in config["setupArgs"])
     timeouts = state.pop("healthTimeouts", None)
     if ok is None:
         n = (timeouts or {}).get("n", 0) + 1 if (timeouts or {}).get("tag") == entry["tag"] else 1
@@ -2100,10 +2132,10 @@ def apply_once(config: dict, state_dir: Path = STATE_DIR, bin_dir: Path = BIN, h
             result.update(runner_steps(state_dir, staged, home, hook_states, bin_dir))
     except Exception as e:  # noqa: BLE001  (recorded below, then re-raised for the one JSON line)
         result = {"result": "error", "why": f"{type(e).__name__}: {e}"[:500]}
-        record_convergence(config, result, wants, previous, now, observe(state_dir, bin_dir, home, staged, gh_only(config), hook_states),
+        record_convergence(config, result, wants, previous, now, observe(state_dir, bin_dir, home, staged, gh_only(config), hook_states, "--update-only" in config["setupArgs"]),
                            hook_states, converge_path)
         raise
-    doc = record_convergence(config, result, wants, previous, now, observe(state_dir, bin_dir, home, staged, gh_only(config), hook_states),
+    doc = record_convergence(config, result, wants, previous, now, observe(state_dir, bin_dir, home, staged, gh_only(config), hook_states, "--update-only" in config["setupArgs"]),
                              hook_states, converge_path)
     result["converge"] = {k: doc[k] for k in ("converged", "why", "blocking", "since", "attempts")}
     return result
@@ -2126,7 +2158,7 @@ def main(argv: list[str] | None = None) -> int:
                  "release": {"tag": state["current"],
                              "source": installed_source(STATE_DIR, state["current"])},
                  # what the last run recorded (wants, why), and what the host runs now, by content
-                 "converge": load_converge(), "running": observe(gh_only=gh_only(config))},
+                 "converge": load_converge(), "running": observe(gh_only=gh_only(config), update_only="--update-only" in config["setupArgs"])},
                 indent=1, sort_keys=True))
             return 0
         if not a.apply:  # planning reads only, so it needs no lock (health checks plan mid-update)

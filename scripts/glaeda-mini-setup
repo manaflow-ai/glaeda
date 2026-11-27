@@ -207,7 +207,7 @@ GH_ONLY_TOOLS = ("glaeda-update", "glaeda-gh", "glaeda-disk", "disk-pressure.sh"
 TOOL_ALIASES = {"glaeda-gh": "cmux-gh", "glaeda-disk": "cmux-disk", "glaeda-procs": "cmux-procs",
                 "glaeda-disk-registry": "cmux-disk-registry",
                 "glaeda-idle-repair": "cmux-idle-repair", "glaeda-mini-health": "cmux-mini-health"}
-PROFILE_FLAGS = ("--gh-only", "--hygiene-only")
+PROFILE_FLAGS = ("--update-only", "--gh-only", "--hygiene-only")
 
 
 def primary_name(name: str) -> str:
@@ -296,14 +296,15 @@ class Context:
                  platform_name: str | None = None, ota_ring: str | None = None,
                  ota_source: str | None = None, role: str = "devbox",
                  role_explicit: bool = False, headless: bool = False, gh_only: bool = False,
-                 profile_flag: str | None = None, projects_tidy: bool = True) -> None:
+                 profile_flag: str | None = None, projects_tidy: bool = True, update_only: bool = False) -> None:
         self.home = home
         self.platform = platform_name or HOST_PLATFORM
         self.gh_only = gh_only
+        self.update_only = update_only
         # --gh-only or --hygiene-only as given on the command line: it replaces the profile in update.json
         self.profile_flag = profile_flag
         # gh-only is a narrower hygiene profile: build-host checks and defaults never apply
-        self.hygiene_only = hygiene_only or gh_only
+        self.hygiene_only = hygiene_only or gh_only or update_only
         self.apply = apply
         self.uid = os.getuid()
         self.real_home = Path(pwd.getpwuid(self.uid).pw_dir)
@@ -1205,6 +1206,9 @@ def glaeda_runner_present(home: Path) -> bool:
 
 def agent_names(ctx: Context) -> list[str]:
     """LaunchAgent labels on macOS; systemd unit file names on Linux."""
+    if ctx.update_only:
+        return (["glaeda-update.service", "glaeda-update.timer"] if ctx.platform == "linux"
+                else [LABEL_PREFIX + "update"])
     if ctx.platform != "linux":
         runner_only_ok = not ctx.hygiene_only or has_glaeda_runner(ctx)
         return [label for label in agent_plists(ctx)
@@ -1319,7 +1323,7 @@ def is_update_agent(label: str) -> bool:
 
 def update_config(ctx: Context) -> dict[str, Any]:
     """What glaeda-update reads: this host's ring and the setup flags it re-runs releases with."""
-    setup_args = ["--gh-only"] if ctx.gh_only else ["--hygiene-only"] if ctx.hygiene_only else []
+    setup_args = ["--update-only"] if ctx.update_only else ["--gh-only"] if ctx.gh_only else ["--hygiene-only"] if ctx.hygiene_only else []
     if ctx.role_explicit or ctx.role != "devbox":
         setup_args.append(f"--role={ctx.role}")
     config = {
@@ -1339,7 +1343,7 @@ GIT_MIRROR_SOURCE = {"schema": 1, "source": "direct"}
 
 def git_mirror_source_action(ctx: Context) -> dict[str, Any] | None:
     """A create action for the mirror's source config on a macOS runner host without one, else None."""
-    if ctx.gh_only or ctx.platform == "linux" or not any(
+    if ctx.update_only or ctx.gh_only or ctx.platform == "linux" or not any(
             (runner / ".runner").is_file() for runner in ctx.home.glob("actions-runner*")):
         return None
     path = ctx.home / ".config/glaeda/lan-cache/config.json"
@@ -1356,11 +1360,11 @@ def update_config_action(ctx: Context) -> dict[str, Any]:
     try:
         current = json.loads(path.read_text())
     except FileNotFoundError:
-        current = None
+        return {**act, "state": "create", "value": update_config(ctx)}
     except (OSError, ValueError):
         return {**act, "state": "blocked", "note": "unreadable; fix or remove it"}
-    if current is None:
-        return {**act, "state": "create", "value": update_config(ctx)}
+    if not isinstance(current, dict):
+        return {**act, "state": "blocked", "note": "update config must be an object"}
     value = dict(current)
     # A headless migration must persist the service domain for the OTA updater.
     # Without this, the first successful update silently reinstalls GUI agents
@@ -1410,7 +1414,7 @@ def is_reclaim_agent(label: str) -> bool:
 
 
 def directories(ctx: Context) -> list[tuple[Path, int]]:
-    if ctx.gh_only:
+    if ctx.gh_only or ctx.update_only:
         return [(ctx.bin, 0o755), (ctx.agents, 0o755), (ctx.logs, 0o755), (ctx.state, 0o700)]
     if ctx.platform == "linux":
         return [
@@ -1594,7 +1598,7 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
     for path, mode in directories(ctx):
         actions.append({"kind": "dir", "path": os.fspath(path),
                         "state": "unchanged" if path.is_dir() else "create", "mode": oct(mode)})
-    tools = GH_ONLY_TOOLS if ctx.gh_only else (
+    tools = ("glaeda-update",) if ctx.update_only else GH_ONLY_TOOLS if ctx.gh_only else (
         "glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-runner-hygiene", "disk-pressure.sh", "glaeda-procs",
         "glaeda-local-guard", "glaeda-worktree-reclaim-all", "glaeda-fleet-cas-prune", "glaeda-seed-prefetch",
         "glaeda-git-mirror", "glaeda-lan-fetch", "glaeda-idle-warm", "glaeda-mini-health", "glaeda-idle-repair",
@@ -1608,19 +1612,20 @@ def plan_install(ctx: Context) -> list[dict[str, Any]]:
             alias["source"] = os.fspath(SCRIPT_DIR / TOOL_ALIASES[name])
             actions.append(alias)
     # a copy, not a link: the release tree it came from is replaced by the next update
-    for dest, source in ((skill_path(ctx), SKILL_SOURCE), (gh_policy_path(ctx), GH_POLICY_SOURCE),
-                         *((intent_dir(ctx) / src.name, src) for src in INTENT_SOURCES)):
+    for dest, source in (() if ctx.update_only else ((skill_path(ctx), SKILL_SOURCE), (gh_policy_path(ctx), GH_POLICY_SOURCE),
+                         *((intent_dir(ctx) / src.name, src) for src in INTENT_SOURCES))):
         act = file_action(ctx, "tool", dest, source.read_bytes(), 0o644)
         act["source"] = os.fspath(source)
         actions.append(act)
-    if not ctx.gh_only:
+    if not ctx.gh_only and not ctx.update_only:
         actions += plan_hygiene_tools(ctx)
-    plan_agents(ctx, actions)
+    # RunAtLoad can start the updater immediately: its persisted profile must exist first.
     actions.append(update_config_action(ctx))
+    plan_agents(ctx, actions)
     if (mirror_source := git_mirror_source_action(ctx)) is not None:
         actions.append(mirror_source)
     mark_owned(ctx, actions)
-    if not ctx.gh_only:
+    if not ctx.gh_only and not ctx.update_only:
         plan_host_defaults(ctx, actions)
     return actions
 
@@ -1686,10 +1691,11 @@ def plan_agents(ctx: Context, actions: list[dict[str, Any]]) -> None:
     previous_agents = {a.get("label"): a.get("ownedSha256") or a.get("sha256")
                        for a in prior_receipt.get("actions", [])
                        if a.get("kind") == "agent" and a.get("owned")}
-    actions.extend(stale_agent_actions(ctx, set(agent_names(ctx)), previous_agents))
+    if not ctx.update_only:  # enrollment never retires a service installed by another profile
+        actions.extend(stale_agent_actions(ctx, set(agent_names(ctx)), previous_agents))
     # Keep Spotlight off the two canonical build roots. Markers are ordinary user-owned
     # files, so this remains idempotent and never changes the host-wide indexing policy.
-    for marker in [] if ctx.gh_only else scan_exclusion_markers(ctx):
+    for marker in [] if ctx.gh_only or ctx.update_only else scan_exclusion_markers(ctx):
         act = file_action(ctx, "marker", marker, b"", 0o644,
                           "Spotlight exclusion for CI build output")
         # Any existing marker already excludes the tree. Preserve its bytes (and any
@@ -2411,6 +2417,8 @@ def parser() -> argparse.ArgumentParser:
                         "minis use the mirror manaflow-ai/glaeda)")
     p.add_argument("--hygiene-only", action="store_true",
                    help="only the disk and worktree hygiene tools and agents, for any Mac or Linux host")
+    p.add_argument("--update-only", action="store_true",
+                   help="only the recurring updater; preserve existing service roles on unit-only hosts")
     p.add_argument("--gh-only", action="store_true",
                    help="only glaeda-gh (the shared GitHub watcher) and glaeda-update, for a lane host with no glaeda "
                         "hygiene; the updater keeps both on the host's release ring")
@@ -2484,7 +2492,7 @@ def main(argv: list[str] | None = None) -> int:
         prior = json.loads((home / ".local/state/glaeda/mini-setup/receipt.json").read_text())
     except (OSError, ValueError, TypeError):
         prior = None
-    role, projects_tidy = resolve_role(args.role, args.hygiene_only or args.gh_only or HOST_PLATFORM == "linux",
+    role, projects_tidy = resolve_role(args.role, args.hygiene_only or args.gh_only or args.update_only or HOST_PLATFORM == "linux",
                                        prior if isinstance(prior, dict) else None, glaeda_runner_present(home))
     ctx = Context(home, args.apply, args.python,
                   args.skip_launchctl, args.reclaim_binary,
@@ -2493,9 +2501,25 @@ def main(argv: list[str] | None = None) -> int:
                   args.hygiene_only or HOST_PLATFORM == "linux", ota_ring=args.ota_ring,
                   ota_source=args.ota_source, role=role,
                   role_explicit=args.role is not None,
-                  headless=args.headless, gh_only=args.gh_only,
-                  profile_flag="--gh-only" if args.gh_only else "--hygiene-only" if args.hygiene_only else None,
+                  headless=args.headless, gh_only=args.gh_only, update_only=args.update_only,
+                  profile_flag="--update-only" if args.update_only else "--gh-only" if args.gh_only else "--hygiene-only" if args.hygiene_only else None,
                   projects_tidy=projects_tidy)
+    if args.update_only:
+        if args.uninstall or args.gh_only or args.hygiene_only:
+            print("glaeda-mini-setup: --update-only cannot combine with uninstall or another profile", file=sys.stderr)
+            return 2
+        if isinstance(prior, dict) and prior.get("profile") != "update":
+            print("glaeda-mini-setup: preserve the recorded setup profile; restore its updater config", file=sys.stderr)
+            return 2
+        existing = update_config_action(ctx)
+        if existing.get("state") == "blocked":
+            print("glaeda-mini-setup: " + existing["note"], file=sys.stderr)
+            return 2
+        if ctx.update_config.exists():
+            old = json.loads(ctx.update_config.read_text())
+            if "--update-only" not in old.get("setupArgs", []):
+                print("glaeda-mini-setup: preserve the existing updater profile; rerun its setupArgs", file=sys.stderr)
+                return 2
     pre = preflight(ctx)
     if ctx.hygiene_only:  # build-host checks are reported, not enforced
         blocking_checks = HYGIENE_BLOCKING | ({"headlessSudo"} if args.headless else set())
@@ -2518,7 +2542,7 @@ def main(argv: list[str] | None = None) -> int:
     receipt = {
         "schema": SCHEMA,
         "mode": "uninstall" if args.uninstall else "install",
-        "profile": "gh" if ctx.gh_only else "hygiene" if ctx.hygiene_only else "build-host",
+        "profile": "update" if ctx.update_only else "gh" if ctx.gh_only else "hygiene" if ctx.hygiene_only else "build-host",
         "role": ctx.role,
         "projectsTidy": ctx.role == "devbox" and ctx.projects_tidy,
         "platform": ctx.platform,

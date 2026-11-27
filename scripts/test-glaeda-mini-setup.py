@@ -458,10 +458,16 @@ class MiniSetupTest(unittest.TestCase):
         installed = self.home / ".local/bin"
         installed.mkdir(parents=True)
         shutil.copy2(scripts / "disk-pressure.sh", installed / "disk-pressure.sh")
+        # Identical pre-existing tools are unowned only when their mode also matches.
+        # Carrier checkouts may materialize source scripts without executable bits.
+        (installed / "disk-pressure.sh").chmod(0o755)
         (gen / ".complete").write_text(tag + "\n")
         (update / "state.json").write_text(json.dumps({"current": tag, "previous": None}))
         with mock.patch.object(ms, "SCRIPT_DIR", scripts), mock.patch.object(ms, "REPO", scripts.parent):
-            self.invoke("--gh-only", "--apply")
+            first = self.invoke("--gh-only", "--apply")
+        preexisting = next(a for a in first["actions"] if a.get("path") == str(installed / "disk-pressure.sh"))
+        self.assertEqual(preexisting["state"], "unchanged")
+        self.assertFalse(preexisting["owned"])
         (installed / "glaeda-disk").write_bytes(b"local edit")
         (scripts / "glaeda-update").write_bytes(b"different release bytes")
         with mock.patch.dict(os.environ, {ms.UPDATE_ENV: "1"}):
@@ -1079,6 +1085,81 @@ class MiniSetupTest(unittest.TestCase):
         again = self.invoke("--apply")
         self.assertEqual(self.states(again), {"unchanged"})
         self.assertFalse(any("systemctl" in os.path.basename(c[0]) for c in self.calls))
+
+    def test_update_only_installs_a_recurring_updater_on_linux(self) -> None:
+        self.linux()
+        unrelated = self.home / ".config/systemd/user/glaeda-custom.service"
+        unrelated.parent.mkdir(parents=True)
+        unrelated.write_text("[Service]\nExecStart=/opt/glaeda-custom\n")
+        before = unrelated.read_bytes()
+        receipt = self.invoke("--update-only", "--apply")
+        self.assertTrue(receipt["ready"], receipt["blocking"])
+        self.assertEqual(receipt["profile"], "update")
+        self.assertEqual(sorted(p.name for p in unrelated.parent.iterdir()),
+                         ["glaeda-custom.service", "glaeda-update.service", "glaeda-update.timer"])
+        self.assertEqual(unrelated.read_bytes(), before)
+        self.assertEqual(sorted(p.name for p in (self.home / ".local/bin").iterdir()), ["glaeda-update"])
+        config = json.loads((self.home / ".config/glaeda/update.json").read_text())
+        self.assertEqual(config["setupArgs"], ["--update-only"])
+        self.assertFalse((self.home / "Projects").exists())
+        self.assertFalse((self.home / ".local/share/glaeda/gh-daemon.json").exists())
+        self.assertEqual(self.states(self.invoke("--update-only", "--apply")), {"unchanged"})
+
+    def test_update_only_installs_only_the_launchd_updater(self) -> None:
+        before = self.tree()
+        planned = self.invoke("--update-only")
+        self.assertEqual(self.tree(), before, "planning must not enroll a host")
+        receipt = self.invoke("--update-only", "--apply")
+        labels = [a["label"] for a in receipt["actions"] if a["kind"] == "agent"]
+        self.assertEqual(labels, [ms.LABEL_PREFIX + "update"])
+        plist = plistlib.loads((self.home / "Library/LaunchAgents" / (labels[0] + ".plist")).read_bytes())
+        self.assertGreater(plist["StartInterval"], 0)
+        self.assertIn("--apply", plist["ProgramArguments"])
+        self.assertEqual({a["kind"] for a in planned["actions"]}, {"dir", "tool", "agent", "config"})
+
+    def test_update_only_profile_exists_before_launchd_starts_it(self) -> None:
+        ctx = self.ctx_for_steps()
+        ctx.update_only = True
+        ctx.hygiene_only = True
+        ctx.profile_flag = "--update-only"
+        ctx.skip_launchctl = False
+        with mock.patch.object(ms, "agent_loaded", return_value=False):
+            actions = ms.plan_install(ctx)
+
+        def start(context, path):
+            config = json.loads(context.update_config.read_text())
+            self.assertEqual(config["setupArgs"], ["--update-only"])
+            return 0, "loaded"
+
+        with mock.patch.object(ms, "bootstrap", side_effect=start) as bootstrap:
+            ms.apply_install(ctx, actions)
+        bootstrap.assert_called_once()
+
+    def test_update_only_does_not_narrow_an_existing_profile(self) -> None:
+        self.invoke("--gh-only", "--apply")
+        before = self.tree()
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(ms.main(["--update-only", "--apply"]), 2)
+        self.assertEqual(self.tree(), before)
+
+    def test_update_only_preserves_prior_ownership_when_config_is_missing(self) -> None:
+        self.invoke("--gh-only", "--apply")
+        (self.home / ".config/glaeda/update.json").unlink()
+        before = self.tree()
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(ms.main(["--update-only", "--apply"]), 2)
+        self.assertEqual(self.tree(), before)
+
+    def test_update_only_refuses_non_object_config_without_mutation(self) -> None:
+        path = self.home / ".config/glaeda/update.json"
+        path.parent.mkdir(parents=True)
+        for value in ([], None, "invalid", 7):
+            with self.subTest(value=value):
+                path.write_text(json.dumps(value))
+                before = self.tree()
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(ms.main(["--update-only", "--apply"]), 2)
+                self.assertEqual(self.tree(), before)
 
     def test_gh_only_installs_the_watcher_its_updater_and_the_floor_pass(self) -> None:
         """A lane host whose worktree reclaim is not glaeda's (huge-blue): glaeda-gh on the release ring, and

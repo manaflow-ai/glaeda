@@ -349,3 +349,36 @@ The fleet runtime on the minis (`glaeda` binary, enrollment, class acceptance) s
 cmux build on a seed per hardware class) before other hosts can adopt it. Automating that means a
 canary mini that runs `accept-local` on each stable candidate and publishes the class receipt as
 a release asset for the others to adopt. That work is tracked in #149.
+
+### Enrollment for hosts discovered through service units
+
+The deploy reconciler must include every host with an installed glaeda launchd or
+systemd unit, including units installed by hand, rather than only declared runner
+roles. For an un-enrolled host use `glaeda-mini-setup --update-only --apply` from
+the released tree. This installs only `glaeda-update` and its recurring launchd
+agent or systemd user timer. Use `--headless` for the existing supported system
+LaunchDaemon domain. Plan without `--apply` first. A host with no glaeda units is
+not a candidate; the caller owns this inventory decision.
+
+`--update-only` preserves service roles and installs no hygiene, runner or GitHub
+watcher services. It refuses an existing different updater or setup receipt profile:
+continue that host's recorded `setupArgs` instead, restoring a missing config first.
+Setup writes the profile before starting the recurring updater. The profile persists across releases and
+checks only the updater's health and bytes. Older releases that lack the flag
+are refused before setup, as with other unsupported persisted flags.
+
+Each successful recurring update also refreshes the already-installed direct
+script `~/.cache/glaeda-fleet-cas/launch/glaeda-fleet-cas-prune`, using the same
+atomic replacement and newer-operator-copy protection as the seed scripts.
+It creates no CAS role, storage, binary, wrapper or unit and restarts no CAS
+service. The installer remains responsible for those surfaces through its
+registry deploy runner. Operator symlinks at the script, install directory, or
+source stamp are preserved; linked scripts remain unknown in convergence.
+`converge.json` exposes `running.casScripts` and
+`running.libexecScripts` with installed/release SHA-256 identities; a differing
+service script makes convergence false, including a protected operator copy.
+The launch directory's `.glaeda-source.json` records the source release identity.
+
+Enrollment availability is not a deployment receipt. A restricted host remains
+read-only until its authorized owner applies enrollment; an unknown wrapper or
+unreadable unit remains unknown in the fleet detector, never current.
