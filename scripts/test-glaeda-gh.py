@@ -73,6 +73,8 @@ os.environ["GLAEDA_LAND_AGENT_WAIT_CAP"] = "0"  # likewise for an agent shell's 
 gg.UPSTREAM_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-upstream-{os.getpid()}.json"
 # Nor may a host's own gh-daemon.json change the pacing the tests expect.
 gg.DAEMON_CONFIG = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-daemon-config-{os.getpid()}.json"
+# Nor the wt checkouts the session running the suite owns: a bare number with no origin would name their repository.
+gg.WT_CHECKOUTS = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-wt-checkouts-{os.getpid()}"
 gg.FLEET_POLICY = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-fleet-policy-{os.getpid()}.json"
 # Nor may a lane VM's own broker name (its lane-gh client mark) rename the host every test reads update.json for.
 gg.LANE_VM_NAME_FILE = Path(tempfile.gettempdir()) / f"glaeda-gh-test-no-lane-vm-name-{os.getpid()}"
@@ -4170,6 +4172,121 @@ class DaemonTest(Base):
             with self.assertRaises(gg.WatchError) as refused:
                 gg.parse_key("pr", "7051")
         self.assertIn("OWNER/REPO#7051", str(refused.exception))
+
+    # Every subcommand form that takes a PR (or its thread) as its target, as an agent types it with a bare number.
+    # A new one goes here; the test below holds it to the same resolution as the rest.
+    BARE_PR_CALLS = (
+        (("wait", "34241"), "pr"), (("wait", "#34241"), "pr"), (("wait", "pr", "34241"), "pr"),
+        (("wait", "comment", "34241"), "comment"),
+        (("status", "34241"), "pr"), (("status", "#34241"), "pr"), (("status", "pr", "34241"), "pr"),
+        (("status", "comment", "34241"), "comment"),
+        (("land", "34241"), "pr"), (("land", "pr", "34241"), "pr"),
+        (("land", "status", "34241"), "pr"), (("land", "cancel", "34241"), "pr"),
+        (("post", "comment", "34241", "--body", "x"), "comment"), (("post", "review", "34241", "--body", "x"), "comment"),
+    )
+
+    def run_bare(self, call: tuple[str, ...]) -> tuple[int, list[str], str]:
+        """main(CALL) with every command's work stubbed to the key its target resolves to (parse_key, land_key, as
+        the real ones read it first); nothing reaches the daemon, a queue or GitHub."""
+        keys: list[str] = []
+
+        def pr(target, *a, **k):
+            keys.append(gg.land_key(target)[0])
+            return 0
+
+        def by_kind(kind, target, *a, **k):
+            keys.extend(gg.status_keys(kind, target if isinstance(target, list) else [target]))
+            return 0
+
+        def comment(target, *a, **k):
+            keys.append(gg.parse_key("comment", target))
+            return 0
+
+        def post(args):
+            keys.append(gg.parse_key("comment", args.target))
+            return 0
+
+        err = io.StringIO()
+        with mock.patch.multiple(gg, cmd_land=mock.DEFAULT, cmd_land_status=mock.DEFAULT, cmd_land_cancel=mock.DEFAULT,
+                                 cmd_status=mock.DEFAULT, subscribe_wait=mock.DEFAULT, cmd_wait_comment=mock.DEFAULT,
+                                 cmd_post=mock.DEFAULT, land_row_watched_here=mock.DEFAULT,
+                                 cache_warm_cap=mock.DEFAULT, land_agent_wait_cap=mock.DEFAULT,
+                                 say_waiting=mock.DEFAULT) as m, \
+                contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            m["say_waiting"].side_effect = lambda line: print(line, file=err)
+            m["cmd_land"].side_effect = pr
+            m["cmd_land_status"].side_effect = pr
+            m["cmd_land_cancel"].side_effect = pr
+            m["cmd_status"].side_effect = by_kind
+            m["subscribe_wait"].side_effect = by_kind
+            m["cmd_wait_comment"].side_effect = comment
+            m["cmd_post"].side_effect = post
+            m["land_row_watched_here"].return_value = None
+            m["cache_warm_cap"].side_effect = lambda kind, target, timeout, mx: (timeout, mx, "")
+            m["land_agent_wait_cap"].side_effect = lambda target, wait, mx: (wait, mx, "")
+            try:
+                code = gg.main(list(call))
+            except SystemExit as exit_:
+                code = exit_.code
+        return code, keys, err.getvalue()
+
+    def test_every_pr_target_takes_a_bare_number(self) -> None:
+        """2026-11-27: `cmux-gh wait 34241` on gcp-agent-lane-2 refused with a usage block ("argument kind: invalid
+        choice: '34241'") and cost the caller a turn, though `wait pr 34241` already read it. Every form in
+        BARE_PR_CALLS resolves through one rule (bare_number_repo): the origin of the checkout, else the one
+        repository of this session's wt checkouts (a lane VM's agent standing in its home)."""
+        for where in ("checkout", "lane"):
+            origin = "manaflow-ai/cmuxterm-hq" if where == "checkout" else None
+            owned = [] if where == "checkout" else ["manaflow-ai/cmuxterm-hq"]
+            with mock.patch.object(gg, "cwd_repo", lambda *a: origin), \
+                    mock.patch.object(gg, "session_checkout_repos", lambda *a: owned):
+                for call, kind in self.BARE_PR_CALLS:
+                    code, keys, err = self.run_bare(call)
+                    self.assertEqual((code, keys), (0, [f"{kind}:manaflow-ai/cmuxterm-hq#34241"]), (where, call, err))
+                    self.assertNotIn("usage:", err, (where, call))
+
+    def test_an_ambiguous_bare_number_names_each_long_form(self) -> None:
+        """No origin and several repositories in this session's checkouts: a refusal naming each candidate's
+        whole target, never a usage dump; and none at all names the one long form."""
+        with mock.patch.object(gg, "cwd_repo", lambda *a: None), \
+                mock.patch.object(gg, "session_checkout_repos", lambda *a: ["manaflow-ai/cmux", "manaflow-ai/cmuxterm-hq"]):
+            for call, kind in self.BARE_PR_CALLS:
+                code, keys, err = self.run_bare(call)
+                self.assertEqual((code, keys), (64, []), call)
+                self.assertNotIn("usage:", err, call)
+                for repo in ("manaflow-ai/cmux", "manaflow-ai/cmuxterm-hq"):
+                    self.assertIn(f"`{kind} {repo}#34241`", err, call)
+        with mock.patch.object(gg, "cwd_repo", lambda *a: None), \
+                mock.patch.object(gg, "session_checkout_repos", lambda *a: []):
+            code, keys, err = self.run_bare(("wait", "34241"))
+        self.assertEqual((code, keys), (64, []))
+        self.assertIn("`pr OWNER/REPO#34241`", err)
+        self.assertNotIn("usage:", err)
+
+    def test_a_kindless_bare_number_is_a_pr_or_a_run_by_its_width(self) -> None:
+        self.assertEqual(gg.infer_kind(["wait", "34241", "--timeout", "9"])[0], ["wait", "pr", "34241", "--timeout", "9"])
+        self.assertEqual(gg.infer_kind(["status", "#5", "6"])[0], ["status", "pr", "#5", "6"])
+        self.assertEqual(gg.infer_kind(["wait", "44884634507"])[0], ["wait", "run", "44884634507"])
+        for same in (["wait", "123456789"], ["wait", "pid", "4242"], ["land", "34241"]):
+            self.assertEqual(gg.infer_kind(list(same))[0], same)  # 8-9 digits is not guessed; land needs no kind
+
+    def test_session_checkout_repos_reads_this_sessions_wt_owners(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for repo, sid, name in (("o/mine", "S1", "x"), ("o/theirs", "S2", "y"), ("o/named", "", "me")):
+                admin = root / "admin" / repo.replace("/", "-")
+                admin.mkdir(parents=True)
+                (admin / "wt-owner.json").write_text(json.dumps(
+                    {"repo": repo, "owner": {"ids": [sid] if sid else [], "session_id": sid, "name": name}}))
+                tree = root / repo.split("/")[1] / "lane--x"
+                tree.mkdir(parents=True)
+                (tree / ".git").write_text(f"gitdir: {admin}\n")
+            plain = root / "plain" / "clone" / ".git"
+            plain.mkdir(parents=True)  # a clone's .git directory: not a wt worktree, skipped
+            with mock.patch.dict(os.environ, {"ACPMUX_SESSION_ID": "S1", "ACPMUX_SESSION_NAME": "host/me"}):
+                self.assertEqual(gg.session_checkout_repos(root), ["o/mine", "o/named"])
+            with mock.patch.dict(os.environ, {"ACPMUX_SESSION_ID": "", "ACPMUX_SESSION_NAME": ""}):
+                self.assertEqual(gg.session_checkout_repos(root), [])
 
     def test_kindless_inference_keeps_the_strict_forms(self) -> None:
         """`o/r/12345678901` with no kind is a run, as it was before the loose key forms: infer_kind reads

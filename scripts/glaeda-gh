@@ -7,8 +7,9 @@ glaeda-gh: one shared GitHub CI watcher for every agent session on this machine.
     glaeda-gh status pr OWNER/REPO#A OWNER/REPO#B C ...  several PRs in one gather (a bare N, or a quoted '#N',
                                                         reuses the repository before it); --json gives a list
     A target takes whichever form you typed, in every subcommand that takes one (status, wait, post, land):
-    OWNER/REPO#N, OWNER/REPO/N, pr:OWNER/REPO#N as this tool prints it, a GitHub URL, or a bare N in the
-    repository of the directory you are in (it says which repository it read).
+    OWNER/REPO#N, OWNER/REPO/N, pr:OWNER/REPO#N as this tool prints it, a GitHub URL, or a bare N (`wait 5`,
+    `land 5`, no kind needed) in the repository of the directory you are in, else of the one repository this
+    session's wt checkouts are of (it says which repository it read; several name each long form).
     glaeda-gh status pr ... --field head,checks.failed  just those values, tab-separated, one line per PR
     glaeda-gh status run OWNER/REPO/RUN_ID [--jobs] [--json]
     glaeda-gh wait pr OWNER/REPO#N [--until green|done|required|merged] [--timeout S] [--json]
@@ -1752,6 +1753,62 @@ def cwd_repo(cwd: str | None = None) -> str | None:
     return None
 
 
+WT_CHECKOUTS = Path.home() / ".wt" / "checkouts"
+
+
+def session_checkout_repos(root: Path | None = None) -> list[str]:
+    """OWNER/REPO of every `wt` checkout this session owns (its wt-owner.json names this ACPMUX_SESSION_ID or
+    session name), sorted, each once. What a bare number names when the caller stands outside any checkout: a
+    lane VM's agent runs from its home or an /tmp scratch dir while its work sits in `wt new`'s checkouts. Read
+    only on that path, a few small JSON files, no git and no network."""
+    sid = os.environ.get("ACPMUX_SESSION_ID") or ""
+    name = (os.environ.get("ACPMUX_SESSION_NAME") or "").rstrip("/").split("/")[-1]
+    if not sid and not name:
+        return []
+    found: set[str] = set()
+    for dot_git in sorted((root or WT_CHECKOUTS).glob("*/*/.git")):
+        try:
+            gitdir = dot_git.read_text(encoding="utf-8").strip().removeprefix("gitdir:").strip()
+            record = json.loads((Path(gitdir) / "wt-owner.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue  # a plain clone (a .git directory), or no owner record: not one wt made for anyone
+        owner = record.get("owner") if isinstance(record, dict) else None
+        repo = record.get("repo") if isinstance(record, dict) else None
+        if not isinstance(owner, dict) or not isinstance(repo, str) or not re.fullmatch(rf"{NAME}/{NAME}", repo):
+            continue
+        if (sid and sid in (owner.get("ids") or [])) or (sid and owner.get("session_id") == sid) \
+                or (name and owner.get("name") == name):
+            found.add(repo.lower())
+    return sorted(found)
+
+
+def bare_number_repo(kind: str, typed: str) -> tuple[str, str]:
+    """(OWNER/REPO, where it came from) for a bare N or #N, the one rule every subcommand's target goes by
+    (parse_key: status, wait, land, land status|cancel, post comment|review). The origin of the directory the
+    caller stands in first; else the one repository of the `wt` checkouts this session owns. Several of those,
+    or none, refuses naming each candidate's long form, never a usage dump.
+
+    2026-11-27: `cmux-gh wait 34241` run on a lane VM cost the caller a turn before it retyped `wait pr
+    manaflow-ai/cmuxterm-hq#34241`. This only names a repository; what a caller may then do to that PR (the
+    broker's `lane/` and claimed-head fences) is decided where it always was."""
+    number = int(typed.lstrip("#"))
+    sep = "/" if kind == "run" else "#"
+    repo = cwd_repo()
+    if repo:
+        return repo, f"the origin of {os.getcwd()}"
+    owned = session_checkout_repos()
+    if len(owned) == 1:
+        return owned[0], "the one repository of this session's wt checkouts"
+    long = f"{kind} OWNER/REPO{sep}{number}"
+    if owned:
+        raise WatchError(f"{typed!r} is a number with no repository: {os.getcwd()} has no origin and this session's "
+                         f"wt checkouts are of {len(owned)} repositories; name one: "
+                         + ", ".join(f"`{kind} {r}{sep}{number}`" for r in owned))
+    raise WatchError(f"{typed!r} is a number with no repository: name it as `{long}` (OWNER/REPO#{number}), or run "
+                     f"this where the repository's origin is ({os.getcwd()} has none, and this session owns no wt "
+                     f"checkout)")
+
+
 def target_readable(kind: str, text: str) -> bool:
     """Whether KIND would read TEXT as a target at all, for a refusal deciding what to suggest. No side
     effects and no `cwd_repo` read: a bare number is a target's shape whether or not an origin answers."""
@@ -1838,13 +1895,10 @@ def parse_key(kind: str, text: str) -> str:
     text = drop_kind_prefix(text, kind)
     bare = BARE_NUMBER.fullmatch(text) if kind in ("pr", "run", "comment") else None
     if bare:
-        repo = cwd_repo()
-        if not repo:
-            raise WatchError(f"{text!r} is a number with no repository: name it as OWNER/REPO#{bare.group(1)}, "
-                             f"or run this where the repository's origin is ({os.getcwd()} has none)")
+        repo, source = bare_number_repo(kind, bare.group(0))
         # said, not silent: a number resolved against the wrong checkout would read as the right PR
         text = f"{repo}{'/' if kind == 'run' else '#'}{int(bare.group(1))}"
-        say_waiting(f"glaeda-gh: {bare.group(0)} is {text} (the origin of {os.getcwd()})")
+        say_waiting(f"glaeda-gh: {bare.group(0)} is {text} ({source})")
     match = KEY_RES[kind].fullmatch(text) if kind in KEY_RES else None
     if not match:
         form = {"pr": "OWNER/REPO#N or a pull request URL", "run": "OWNER/REPO/RUN_ID or a run URL",
@@ -44808,6 +44862,18 @@ def join_repo_and_number(raw: list[str]) -> list[str] | None:
     return [cmd] + ([kind] if kind else []) + [target] + rest[2:]
 
 
+def bare_number_kind(word: str) -> str:
+    """`pr` or `run` for a kindless bare N or #N (`wait 34241`, `status #5 6`), else "". A pull request number is
+    small (cmuxterm-hq's were 5 digits in 2026-11) and an Actions run id is 10 or more digits, so the width says
+    which; a width between them, or a pid (always typed `wait pid N`), is not guessed. The repository is then
+    parse_key's (bare_number_repo), the same for every subcommand."""
+    bare = BARE_NUMBER.fullmatch(word.strip())
+    if not bare:
+        return ""
+    digits = len(str(int(bare.group(1))))
+    return "pr" if digits <= 7 else "run" if digits >= 10 else ""
+
+
 def infer_kind(raw: list[str]) -> tuple[list[str], str]:
     """`wait|status|land` called without the kind run as the call meant (fewer-tool-calls).
 
@@ -44837,7 +44903,8 @@ def infer_kind(raw: list[str]) -> tuple[list[str], str]:
     if joined:
         return joined, f"glaeda-gh: ran as `{typed_line(['glaeda-gh'] + joined)}`"
     if cmd == "land":
-        if first in ("pr", "PR") and len(raw) >= 3 and PR_RE.fullmatch(raw[2].strip()):
+        if first in ("pr", "PR") and len(raw) >= 3 and (PR_RE.fullmatch(raw[2].strip())
+                                                         or BARE_NUMBER.fullmatch(raw[2].strip())):
             return [cmd] + raw[2:], f"glaeda-gh: ran as `{typed_line(['glaeda-gh', cmd] + raw[2:])}`"
         return raw, ""
     ran_as = f"glaeda-gh: ran as `{typed_line(['glaeda-gh'] + raw)}`" if wait_joined else ""
@@ -44851,6 +44918,8 @@ def infer_kind(raw: list[str]) -> tuple[list[str], str]:
         fixed = [cmd, kind, rest] + raw[2:]
         return fixed, f"glaeda-gh: ran as `{typed_line(['glaeda-gh'] + fixed)}`"
     kind = "pr" if PR_RE.fullmatch(first.strip()) else "run" if RUN_RE.fullmatch(first.strip()) else ""
+    if not kind:
+        kind = bare_number_kind(first)
     if not kind:
         return raw, ran_as
     fixed = [cmd, kind] + raw[1:]
