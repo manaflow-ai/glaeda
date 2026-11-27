@@ -34,8 +34,9 @@ class PruneTest(unittest.TestCase):
         self.lock = Path(self.tmp.name) / "host.lock"
         self.lock.write_text("")
         self.saved = (fp.ROOT, fp.HOST_LOCK, fp.running_commands, fp.reserved_above_floor, fp.toolchain_overlap,
-                      fp.free_fraction, getattr(fp, "build_starts", None))
+                      fp.free_fraction, getattr(fp, "build_starts", None), fp.DISK_ERRORS_DIR)
         fp.ROOT, fp.HOST_LOCK = self.root, self.lock
+        fp.DISK_ERRORS_DIR = Path(self.tmp.name) / "disk-errors"  # never the test host's own state
         fp.build_starts = lambda: []  # never the test host's own processes
         fp.free_fraction = lambda path: 0.5  # the test host's own free disk must not decide the gc schedule
         fp.running_commands = lambda: ["/usr/libexec/something", "zsh"]
@@ -44,7 +45,7 @@ class PruneTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         (fp.ROOT, fp.HOST_LOCK, fp.running_commands, fp.reserved_above_floor, fp.toolchain_overlap,
-         fp.free_fraction, fp.build_starts) = self.saved
+         fp.free_fraction, fp.build_starts, fp.DISK_ERRORS_DIR) = self.saved
         self.tmp.cleanup()
 
     def env(self, sign_key: str = "") -> None:
@@ -220,6 +221,89 @@ class PruneTest(unittest.TestCase):
             self.assertEqual(self.run_main("--apply", "--node-gib", "1")["result"], "ok")
         finally:
             os.close(held)
+
+    def eio_on_lstat(self, bad: set[str], unlink_too: bool = False):
+        """Patch the module's os.lstat (and optionally os.unlink) so each path in BAD raises EIO, as a failing drive
+        does (cmux-lawrence's X10 Pro, 2026-11-27)."""
+        real_lstat, real_unlink = fp.os.lstat, fp.os.unlink
+
+        def lstat(path, *a, **k):
+            if os.fspath(path) in bad:
+                raise OSError(5, "Input/output error", os.fspath(path))
+            return real_lstat(path, *a, **k)
+
+        def unlink(path, *a, **k):
+            if unlink_too and os.fspath(path) in bad:
+                raise OSError(5, "Input/output error", os.fspath(path))
+            return real_unlink(path, *a, **k)
+
+        fp.os.lstat, fp.os.unlink = lstat, unlink
+        self.addCleanup(setattr, fp.os, "lstat", real_lstat)
+        self.addCleanup(setattr, fp.os, "unlink", real_unlink)
+
+    def disk_errors(self, service: str = "fleet-cas-prune") -> dict:
+        return json.loads((fp.DISK_ERRORS_DIR / f"{service}.json").read_text())
+
+    def test_a_node_file_whose_stat_reads_eio_is_skipped_counted_and_reported(self) -> None:
+        self.env()
+        paths = self.node(10)
+        per = paths[0].stat().st_blocks * 512
+        self.eio_on_lstat({os.fspath(paths[0]), os.fspath(paths[7])})
+        rec = self.run_main("--apply", "--node-gib", str(6 * per / fp.GIB))
+        self.assertEqual(rec["result"], "ok")
+        self.assertEqual(rec["unreadable_entries"], 2)
+        self.assertTrue(paths[0].exists(), "an entry that could not be read is never judged, so never removed")
+        self.assertFalse(paths[1].exists(), "the readable oldest still go")
+        report = self.disk_errors()
+        self.assertEqual((report["schema"], report["service"], report["unreadable"]),
+                         ("glaeda-disk-errors/v1", "fleet-cas-prune", 2))
+        self.assertIn("errno 5", report["examples"][0])
+
+    def test_an_unlink_that_reads_eio_does_not_end_the_cap(self) -> None:
+        self.env()
+        paths = self.node(10)
+        per = paths[0].stat().st_blocks * 512
+        real_unlink = fp.os.unlink
+
+        def unlink(path, *a, **k):
+            if os.fspath(path) == os.fspath(paths[0]):
+                raise OSError(5, "Input/output error", os.fspath(path))
+            return real_unlink(path, *a, **k)
+
+        fp.os.unlink = unlink
+        self.addCleanup(setattr, fp.os, "unlink", real_unlink)
+        rec = self.run_main("--apply", "--node-gib", str(6 * per / fp.GIB))
+        self.assertEqual((rec["result"], rec["unreadable_entries"]), ("ok", 1))
+        self.assertEqual([p for p in paths[:5] if p.exists()], [paths[0]])  # the other four oldest went
+
+    def test_a_clean_run_reports_zero_and_a_deferred_run_keeps_the_last_count(self) -> None:
+        self.env()
+        self.node(3)
+        self.run_main("--apply")
+        self.assertEqual(self.disk_errors()["unreadable"], 0)
+        (fp.DISK_ERRORS_DIR / "fleet-cas-prune.json").write_text(json.dumps({"unreadable": 4}))
+        fp.reserved_above_floor = lambda: "reserved"  # deferred before any walk
+        self.assertTrue(self.run_main("--apply")["result"].startswith("deferred"))
+        self.assertEqual(self.disk_errors()["unreadable"], 4)
+
+    def test_a_vanished_file_is_a_race_not_a_disk_error(self) -> None:
+        fp.DISK_ERRORS.update(count=0, examples=[], walked=False)
+        fp.disk_error(FileNotFoundError(2, "No such file or directory", "x"))
+        self.assertEqual(fp.DISK_ERRORS["count"], 0)
+        fp.disk_error(OSError(5, "Input/output error", "x"))
+        self.assertEqual(fp.DISK_ERRORS["count"], 1)
+
+    def test_store_gc_counts_the_entries_gc_skipped_as_unreadable(self) -> None:
+        log = self.fake_store(0)
+        binary = self.root / "bin/fleet-cas"
+        binary.write_text(binary.read_text().replace(
+            'object: 0\"', 'object: 0; unreadable entries skipped: 3\"'))
+        fp.DISK_ERRORS.update(count=0, examples=[], walked=False)
+        rec = fp.store_gc(self.root, 14)
+        self.assertEqual(rec["gc"], "ran")
+        self.assertEqual(fp.DISK_ERRORS["count"], 3)
+        self.assertTrue(fp.DISK_ERRORS["walked"])
+        self.assertEqual(len(log.read_text().splitlines()), 2)
 
     def fake_store(self, no_roots: int) -> Path:
         for sub in ("kv", "cas"):

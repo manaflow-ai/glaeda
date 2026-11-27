@@ -1577,9 +1577,10 @@ async fn main() -> Result<std::process::ExitCode, Box<dyn std::error::Error>> {
             let r = gc::run(&root, std::time::Duration::from_secs(secs), dry_run)?;
             println!(
                 "{}kv kept {} deleted {}; cas kept {} deleted {} ({} bytes); \
-                 kept entries naming no stored object: {}",
+                 kept entries naming no stored object: {}; unreadable entries skipped: {}",
                 if dry_run { "dry run: " } else { "" },
-                r.kv_kept, r.kv_deleted, r.cas_kept, r.cas_deleted, r.bytes_deleted, r.kv_no_roots
+                r.kv_kept, r.kv_deleted, r.cas_kept, r.cas_deleted, r.bytes_deleted, r.kv_no_roots,
+                r.unreadable
             );
             return Ok(std::process::ExitCode::SUCCESS);
         }

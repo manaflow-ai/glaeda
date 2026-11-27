@@ -50,6 +50,13 @@ process) running /usr/bin/python3, whose children are /usr/bin/ssh and Homebrew 
 pipe), so the LAN connection is allowed. On macOS 27 a /usr/bin/python3 program alone is refused: it runs
 Xcode's python3 (glaeda-mini-setup LAN_PARENT).
 Prints one JSON line, also appended to LOG.
+
+Disk errors: every run also writes DISK_ERRORS_NAME under STATE's parent (~/.local/state/glaeda/disk-errors/
+seed-archive.json, schema glaeda-disk-errors/v1): how many archive entries read an OSError this run (EIO from a failing
+drive under the image), how many sit quarantined as .corrupt-*, and a few examples. A dying drive then reads as a
+disk-error row where NOW reads this service's health (leo-workspace tools/now_host_services.py, the registry's
+`disk_errors`), not as a crash loop (cmux-lawrence 2026-11-27: 19 of 341 entries read EIO and a copy without the
+per-entry guard restarted every 15 s; cmuxterm-hq docs/handbook/one-read-takes-down-the-pass.md).
 """
 
 from __future__ import annotations
@@ -79,6 +86,10 @@ ARCHIVE = MOUNT / "seeds"  # glaeda-seed-serve ARCHIVE
 OLD_ARCHIVE = HOST_VOLUME / "glaeda-seed-archive"
 HDIUTIL = "/usr/bin/hdiutil"
 SUFFIX = ".tar.zst"
+CORRUPT = ".corrupt-"  # quarantine()'s prefix for a seed whose entry read an OSError
+DISK_ERRORS_SCHEMA = "glaeda-disk-errors/v1"
+DISK_ERRORS_NAME = "seed-archive.json"  # in STATE.parent / "disk-errors"
+DISK_ERRORS_EXAMPLES = 5
 STATE = HOME / ".local/state/glaeda/seed-archive"
 LOG = HOME / "Library/Logs/glaeda-seed-archive.jsonl"
 LOG_BYTES = 4 << 20
@@ -111,11 +122,13 @@ def prefetch_module():
 pm = prefetch_module()
 
 
-def archived(archive: Path, unreadable: dict[str, str] | None = None) -> dict[str, os.stat_result]:
+def archived(archive: Path, unreadable: dict[str, str] | None = None,
+             aside: list[str] | None = None) -> dict[str, os.stat_result]:
     """KEY -> stat of every archived seed (regular files named <KEY>.tar.zst).
 
     A seed whose entry cannot be read (EIO from a bad disk image or volume) is left out and, when UNREADABLE is
     given, recorded there as KEY -> error: one bad seed must not crash the run (the daemon did, 2026-11-21).
+    ASIDE, when given, gets the name of every seed quarantine() moved aside (.corrupt-*), read from the same listing.
     """
     found = {}
     try:
@@ -126,6 +139,8 @@ def archived(archive: Path, unreadable: dict[str, str] | None = None) -> dict[st
         return found
     for entry in entries:
         key = entry.name[:-len(SUFFIX)]
+        if aside is not None and entry.name.startswith(CORRUPT):
+            aside.append(entry.name)
         if entry.name.endswith(SUFFIX) and pm.KEY_RE.fullmatch(key):
             try:
                 if entry.is_file(follow_symlinks=False):
@@ -149,7 +164,7 @@ def quarantine(archive: Path, unreadable: dict[str, str], apply: bool) -> list[d
         item = {"key": key, "error": why, "quarantined": False}
         if apply:
             try:
-                os.rename(archive / name, archive / f".corrupt-{name}")
+                os.rename(archive / name, archive / f"{CORRUPT}{name}")
                 item["quarantined"] = True
             except OSError as error:
                 item["quarantine_error"] = f"errno {error.errno}: {error.strerror}"
@@ -341,7 +356,9 @@ def run(apply: bool, archive: Path = ARCHIVE, budget: int = BUDGET, min_free: in
         if why:
             return {**record, "state": "error", "reason": why}
         unreadable: dict[str, str] = {}
-        have = archived(archive, unreadable)
+        aside: list[str] = []
+        have = archived(archive, unreadable, aside)
+        record["quarantined_aside"] = len(aside)
         if unreadable:
             record["unreadable"] = quarantine(archive, unreadable, apply)
             for item in record["unreadable"]:
@@ -374,6 +391,46 @@ def run(apply: bool, archive: Path = ARCHIVE, budget: int = BUDGET, min_free: in
         return record
     finally:
         os.close(lock)
+
+
+def disk_errors(record: dict) -> dict:
+    """The run's disk errors (glaeda-disk-errors/v1): entries that read an OSError this run, still unreadable or
+    quarantined by it, plus the seeds already sitting aside as .corrupt-* (quarantined_aside, counted from this run's
+    listing, so a seed moved aside earlier still says the drive failed). A run that failed whole on an OSError (main)
+    counts as one unreadable entry: its reason names the path."""
+    unreadable = record.get("unreadable") or []
+    keys = {i["key"] for i in unreadable if i.get("key")} | set(record.get("known_unreadable") or [])
+    listing = [i["error"] for i in unreadable if not i.get("key") and i.get("error")]
+    failed = record.get("state") == "error" and "errno" in str(record.get("reason", ""))
+    examples = [f"{i['key']}{SUFFIX}: {i.get('error')}" for i in unreadable if i.get("key")]
+    examples += listing + ([record["reason"]] if failed else [])
+    return {"schema": DISK_ERRORS_SCHEMA, "service": "seed-archive", "at": int(record.get("time") or time.time()),
+            "root": record.get("archive") or os.fspath(ARCHIVE),
+            "unreadable": len(keys) + len(listing) + int(failed),
+            "still_unreadable": len([i for i in unreadable if i.get("key") and not i.get("quarantined")]),
+            "quarantined": int(record.get("quarantined_aside") or 0)
+                           + len([i for i in unreadable if i.get("quarantined")]),
+            "examples": examples[:DISK_ERRORS_EXAMPLES]}
+
+
+def write_disk_errors(report: dict) -> None:
+    """Replace the disk-errors file with REPORT (atomic). Rewritten when its counts change or every 10 min, so a
+    reader can tell a live zero from a stopped job by `at`; a file that cannot be written never fails the run."""
+    path = STATE.parent / "disk-errors" / DISK_ERRORS_NAME
+    try:
+        old = json.loads(path.read_text())
+        same = {k: v for k, v in old.items() if k != "at"} == {k: v for k, v in report.items() if k != "at"}
+        if same and report["at"] - int(old.get("at") or 0) < 600:
+            return
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        staged = path.with_name(f".{path.name}.{os.getpid()}")
+        staged.write_text(json.dumps(report, sort_keys=True) + "\n")
+        staged.replace(path)
+    except OSError:
+        pass
 
 
 def quiet(record: dict) -> bool:
@@ -558,6 +615,10 @@ def main(argv: list[str]) -> int:
                   "reason": f"{type(error).__name__} errno {error.errno}: {error.strerror} ({error.filename})"}
     if args.apply and not quiet(record):
         append_log(record)
+    # Only a run that listed the archive (or failed on an OSError) says anything about the disk: a skipped run (no
+    # image, the lock) or a seeder error before the listing must not clear a count with a zero.
+    if args.apply and ("quarantined_aside" in record or "errno" in str(record.get("reason", ""))):
+        write_disk_errors(disk_errors(record))
     print(json.dumps(record))
     return 1 if record["state"] == "error" else 0
 

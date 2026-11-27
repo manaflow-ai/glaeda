@@ -17840,6 +17840,31 @@ class DeadMountTests(unittest.TestCase):
                 self.assertEqual(gd.wt_cargo_targets(root), [])
             self.assertTrue(any(p.endswith("dead") or "/dead/" in p for p in gd.DEAD_MOUNTS))
 
+    def test_an_eio_on_stat_is_skipped_and_counted_in_the_run_line(self):
+        """A failing drive (EIO from stat, cmux-lawrence's X10 Pro 2026-11-27) is skipped like a dead mount, and the
+        run line counts it, so a dying disk is a number a reader sees, not a crash or a line on stderr."""
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = os.fspath(Path(tmp) / "bad")
+            real = os.stat
+
+            def fake(path, *a, **k):
+                if os.fspath(path).startswith(bad):
+                    raise OSError(errno.EIO, "Input/output error", os.fspath(path))
+                return real(path, *a, **k)
+
+            self.addCleanup(gd.DEAD_MOUNTS.clear)
+            gd.DEAD_MOUNTS.clear()
+            with mock.patch("os.stat", fake):
+                self.assertFalse(Path(bad).is_dir())
+                self.assertFalse(Path(bad, "x").exists())
+            self.assertEqual(len(gd.DEAD_MOUNTS), 2)
+            log = Path(tmp) / "runs.jsonl"
+            with mock.patch.object(gd, "RUN_LOG", log), mock.patch.object(gd, "_home_free", return_value=None):
+                gd.write_run_line(time.time(), None)
+            row = json.loads(log.read_text().splitlines()[-1])
+            self.assertEqual(row["unreadable_entries"], 2)
+            self.assertIn(bad, row["unreadable_examples"])
+
     def test_other_errors_still_raise(self):
         with mock.patch("os.stat", side_effect=OSError(errno.EACCES, "denied")):
             with self.assertRaises(OSError):

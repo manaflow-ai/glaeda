@@ -63,6 +63,14 @@ otherwise the numbers are logged and nothing is deleted. gc takes no lock: a rac
 store only turns into a cache miss, never a wrong answer (gc.rs), so it is not gated on builds. While the store's volume has under 15% free, gc keeps entries
 used within half of --gc-keep-days (at least 3) and may run every 6 hours instead of daily.
 Prints one JSON line per run.
+
+Disk errors: a walk (sizes, the node cap, last-use times, gc's own) that meets an entry it cannot stat, list or
+unlink (EIO from a failing drive, ESTALE, EACCES) skips it, counts it and reports it, never ends the pass: the line
+gains `unreadable_entries`, and every run that walked a store replaces DISK_ERRORS_DIR/<mode>.json
+(glaeda-disk-errors/v1: fleet-cas-store-gc.json for --store-gc-only, else fleet-cas-prune.json), which NOW reads as a
+disk-error row (leo-workspace tools/now_host_services.py, the registry's `disk_errors`). A file that vanished
+mid-walk (ENOENT) is a race with the store, not a disk error, and is not counted. cmuxterm-hq
+docs/handbook/one-read-takes-down-the-pass.md.
 """
 
 from __future__ import annotations
@@ -104,6 +112,51 @@ CRASH_REPORTS = Path(os.environ.get("GLAEDA_FLEET_CAS_CRASH_REPORTS",
 CAS_CLIENTS = ("SWBBuildService", "XCBBuildService", "swift-frontend", "clang")
 CAS_PLUGIN = "libToolchainCASPlugin.dylib"
 CRASH_LOOKBACK = 7 * 86400  # crash reports older than this are not read
+DISK_ERRORS_DIR = Path(os.environ.get("GLAEDA_DISK_ERRORS_DIR")
+                       or os.path.expanduser("~/.local/state/glaeda/disk-errors"))
+DISK_ERRORS_SCHEMA = "glaeda-disk-errors/v1"
+DISK_ERRORS_EXAMPLES = 5
+GC_UNREADABLE = re.compile(r"unreadable entries skipped: (\d+)")  # fleet-cas gc's report (gc.rs), when it has one
+# This run's disk errors: entries a walk could not read (count, a few examples), and whether any store was walked
+# (a deferred run read nothing, so it must not clear a count with a zero).
+DISK_ERRORS: dict = {"count": 0, "examples": [], "walked": False}
+
+
+def disk_error(error: OSError, path: str | os.PathLike | None = None) -> None:
+    """Count one entry a walk could not read (os.walk's onerror, and each per-entry stat or unlink). ENOENT is the
+    store racing the walk (a file removed between listing and stat), not a disk error."""
+    if isinstance(error, FileNotFoundError):
+        return
+    DISK_ERRORS["count"] += 1
+    if len(DISK_ERRORS["examples"]) < DISK_ERRORS_EXAMPLES:
+        where = os.fspath(path) if path is not None else (error.filename or "?")
+        DISK_ERRORS["examples"].append(f"{where}: {type(error).__name__} errno {error.errno}: {error.strerror}")
+
+
+def walked(root: Path) -> None:
+    DISK_ERRORS["walked"] = True
+
+
+def emit(rec: dict, service: str) -> None:
+    """Print the run's line, with its disk errors, and replace DISK_ERRORS_DIR/SERVICE.json when a store was walked."""
+    if DISK_ERRORS["count"]:
+        rec["unreadable_entries"] = DISK_ERRORS["count"]
+        rec["unreadable_examples"] = DISK_ERRORS["examples"]
+    print(json.dumps(rec))
+    if not (rec.get("apply") and DISK_ERRORS["walked"]):
+        return
+    report = {"schema": DISK_ERRORS_SCHEMA, "service": service, "at": int(time.time()),
+              "root": os.fspath(ROOT / "fleet-store" if service == "fleet-cas-store-gc" else ROOT),
+              "unreadable": DISK_ERRORS["count"],
+              "examples": DISK_ERRORS["examples"]}
+    path = DISK_ERRORS_DIR / f"{service}.json"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        staged = path.with_name(f".{path.name}.{os.getpid()}")
+        staged.write_text(json.dumps(report, sort_keys=True) + "\n")
+        staged.replace(path)
+    except OSError:
+        pass  # a report that cannot be written never fails the run
 
 
 def load_glaeda_disk(path: Path | None = None):
@@ -193,17 +246,18 @@ def last_touch(path: Path, quick: bool = False) -> float:
     """The newest file mtime or atime, or directory mtime, under path (a directory's atime moves when this very walk
     lists it, so it is not counted; a new object changes its directory's mtime). quick skips standalone objects."""
     newest = 0.0
-    for dirpath, _, files in os.walk(path):
+    for dirpath, _, files in os.walk(path, onerror=disk_error):
         try:
             newest = max(newest, os.lstat(dirpath).st_mtime)
-        except OSError:
-            pass
+        except OSError as e:
+            disk_error(e, dirpath)
         for name in files:
             if quick and CAS_STANDALONE.search(name):
                 continue
             try:
                 st = os.lstat(os.path.join(dirpath, name))
-            except OSError:
+            except OSError as e:
+                disk_error(e, os.path.join(dirpath, name))
                 continue
             newest = max(newest, st.st_mtime, st.st_atime)
     return newest
@@ -213,7 +267,7 @@ def cas_locks(local: Path) -> list[int] | None:
     """Every `lock` file of the local CAS (cas/lock, cas/<name>/lock) taken exclusive without waiting, or None, with
     none kept, when one is held: LLVM's on-disk CAS holds its lock shared while a process has it open."""
     held: list[int] = []
-    for dirpath, dirs, files in os.walk(local):
+    for dirpath, dirs, files in os.walk(local, onerror=disk_error):
         if dirpath != os.fspath(local):
             dirs[:] = []  # never down into the object directories
         if "lock" not in files:
@@ -361,12 +415,13 @@ def is_writer(root: Path) -> bool:
 
 def tree_bytes(path: Path) -> int:
     total = 0
-    for dirpath, _, files in os.walk(path):
+    walked(path)
+    for dirpath, _, files in os.walk(path, onerror=disk_error):
         for f in files:
             try:
                 total += os.lstat(os.path.join(dirpath, f)).st_blocks * 512
-            except OSError:
-                pass
+            except OSError as e:
+                disk_error(e, os.path.join(dirpath, f))
     return total
 
 
@@ -381,13 +436,15 @@ def node_files(store: Path, subs: tuple[str, ...] = ("cas", "kv")) -> list[tuple
     first."""
     out = []
     stale_before = time.time() - TMP_STALE_S
+    walked(store)
     for sub in subs:
-        for dirpath, _, files in os.walk(store / sub):
+        for dirpath, _, files in os.walk(store / sub, onerror=disk_error):
             for f in files:
                 p = os.path.join(dirpath, f)
                 try:
                     st = os.lstat(p)
-                except OSError:
+                except OSError as e:
+                    disk_error(e, p)
                     continue
                 if "." in f:
                     if st.st_mtime >= stale_before:
@@ -460,8 +517,8 @@ def store_gc(root: Path, keep_days: int, now: float | None = None, free: float |
     try:
         if now - stamp.stat().st_mtime < every:
             return {"gc": "not due"}
-    except FileNotFoundError:
-        pass
+    except OSError as e:  # absent: due; unreadable (EIO on the store volume): counted, and gc reports the rest
+        disk_error(e, stamp)
 
     def gc(*extra: str) -> tuple[int, str]:
         try:
@@ -473,9 +530,17 @@ def store_gc(root: Path, keep_days: int, now: float | None = None, free: float |
         return out.returncode, (out.stdout.strip()[-400:] + (f" | stderr: {out.stderr.strip()[-200:]}"
                                                             if out.returncode else ""))
 
-    stamp.parent.mkdir(parents=True, exist_ok=True)
-    stamp.touch()  # one attempt a day, whatever the outcome
+    try:
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.touch()  # one attempt a day, whatever the outcome
+    except OSError as e:
+        disk_error(e, stamp)
+    walked(store)
     code, dry = gc("--dry-run")
+    if u := GC_UNREADABLE.search(dry):  # entries gc itself skipped as unreadable (gc.rs): the same disk errors
+        DISK_ERRORS["count"] += int(u.group(1))
+        if int(u.group(1)) and len(DISK_ERRORS["examples"]) < DISK_ERRORS_EXAMPLES:
+            DISK_ERRORS["examples"].append(f"{store}: fleet-cas gc skipped {u.group(1)} unreadable entries")
     m = GC_REPORT.search(dry)
     if code != 0 or not m:
         return {"gc": "skipped: the dry run failed or fleet-cas predates gc", "gc_dry_run": dry}
@@ -507,38 +572,40 @@ def main(argv: list[str] | None = None) -> int:
     if a.cap_only and (a.node_only or a.store_gc_only):
         ap.error("--cap-only excludes --node-only and --store-gc-only")
     caps = a.node_only or a.cap_only  # the caps alone: no sweep, no gc, and the node cap needs no build check
+    service = "fleet-cas-store-gc" if a.store_gc_only else "fleet-cas-prune"
+    DISK_ERRORS.update(count=0, examples=[], walked=False)
     rec: dict = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "apply": a.apply}
     if a.store_gc_only:
         # A dedicated store volume (glaeda-fleet-cas checks it is its own APFS volume under /Volumes) holds no mini
         # cache and no toolchain, and the host need not run glaeda-disk, so the mini guards below do not apply.
         if not os.fspath(ROOT).startswith("/Volumes/"):
             rec["result"] = f"refused: --store-gc-only needs a store root under /Volumes, not {ROOT}"
-            print(json.dumps(rec))
+            emit(rec, service)
             return 2
         rec.update(store_gc(ROOT, a.gc_keep_days) if a.apply else {"gc": "plan only"})
         rec["result"] = "ok"
-        print(json.dumps(rec))
+        emit(rec, service)
         return 0
     if a.apply and (held := reserved_above_floor()):  # a reserved host's caches are its holder's until the floor
         rec["result"] = f"deferred: {held}"
-        print(json.dumps(rec))
+        emit(rec, service)
         return 0
     if a.apply and (held := toolchain_overlap([ROOT, ROOT / "cas", ROOT / "node-store" / "cas", ROOT / "node-store" / "kv"])):
         rec["result"] = f"deferred: {held}"
-        print(json.dumps(rec))
+        emit(rec, service)
         return 0
     if a.apply and not caps:
         rec.update(store_gc(ROOT, a.gc_keep_days))
     if not (ROOT / "fleet-cas.env").exists():
         rec["result"] = "no fleet-cas on this host"
-        print(json.dumps(rec))
+        emit(rec, service)
         return 0
     writer = is_writer(ROOT)
     rec["role"] = "writer" if writer else "reader"
     commands = running_commands()
     if commands is None and not caps:
         rec["result"] = "deferred: ps failed, cannot rule out a running build"
-        print(json.dumps(rec))
+        emit(rec, service)
         return 0
     building = busy(commands) if commands is not None else "ps failed"  # the caps: the node cap needs no build check
     if a.apply and not caps:
@@ -565,7 +632,7 @@ def main(argv: list[str] | None = None) -> int:
     rec["node_store"] = f"would remove {len(doomed)} oldest files, {sum(b for _, b, _ in doomed) / GIB:.1f} GiB"
     if not a.apply:
         rec["result"] = "ok"
-        print(json.dumps(rec))
+        emit(rec, service)
         return 0
     freed = 0
     if doomed:  # the hard cap: no lock and no build check; a file a running build still wants is fetched again
@@ -573,8 +640,8 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 os.unlink(p)
                 freed += b
-            except FileNotFoundError:
-                pass
+            except OSError as e:  # gone already, or unreadable: counted, and the rest of the cap still goes
+                disk_error(e, p)
         rec["node_store"] = f"removed {len(doomed)} oldest files, {freed / GIB:.1f} GiB"
     rec["node_store_freed_bytes"] = freed
     renamed, rec["result"] = None, "ok"
@@ -588,7 +655,7 @@ def main(argv: list[str] | None = None) -> int:
             rec["local_cas"] = f"removed ({corrupt})"
     if renamed is not None:  # the slow part, with the locks released: nothing reads this path
         shutil.rmtree(renamed, ignore_errors=True)
-    print(json.dumps(rec))
+    emit(rec, service)
     return 0
 
 

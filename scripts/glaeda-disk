@@ -19788,6 +19788,10 @@ def write_run_line(started: float, free_before: int | None) -> None:
            "evict_yielded": RUN.get("evict_yielded"),
            "measure_budget_reached": bool(RUN.get("measure_budget_reached")),
            "run_deadline_reached": bool(RUN.get("run_deadline_reached"))}
+    if DEAD_MOUNTS:  # paths a walk skipped on ENOTCONN/ESTALE/EIO: a dying drive or a dead mount, as a count and names
+        # (cmuxterm-hq docs/handbook/one-read-takes-down-the-pass.md), not only a line on stderr
+        row["unreadable_entries"] = len(DEAD_MOUNTS)
+        row["unreadable_examples"] = sorted(DEAD_MOUNTS)[:5]
     if RUN.get("pressure_pass_holder"):  # a pass skipped for the lock: who held it, and the last pass's result
         row["pressure_pass_holder"] = RUN["pressure_pass_holder"]
     if RUN.get("runner_accounts"):  # RUNNER_ACCOUNTS: each other runner account's pass

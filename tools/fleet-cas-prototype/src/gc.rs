@@ -16,6 +16,14 @@
 //! name no stored object: check that with `--dry-run` on a real store first.
 //! Races with a running store (an entry read while gc deletes it) degrade to
 //! misses, never wrong answers.
+//!
+//! An entry gc cannot read at all (an I/O error listing a shard, reading an
+//! entry's metadata or its bytes: EIO from a failing drive) is skipped, never
+//! deleted, and counted in `unreadable`, so one bad sector does not stop every
+//! daily gc (cmuxterm-hq docs/handbook/one-read-takes-down-the-pass.md).
+//! Skipping an unreadable kept entry loses nothing gc would otherwise keep: its
+//! value cannot be served, and an object it alone named was unreachable to every
+//! reader already. Only an entry that reads but does not decode still aborts.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -51,6 +59,17 @@ pub struct Report {
     pub bytes_deleted: u64,
     /// Kept entries none of whose embedded IDs is a stored object.
     pub kv_no_roots: u64,
+    /// Entries skipped because listing, stat or reading them failed with an
+    /// I/O error other than not-found (a failing drive); none is deleted.
+    pub unreadable: u64,
+}
+
+/// Count `e` as an unreadable entry unless it is a race with the store
+/// (a file removed between listing and reading it).
+fn unreadable(r: &mut Report, e: &std::io::Error) {
+    if e.kind() != std::io::ErrorKind::NotFound {
+        r.unreadable += 1;
+    }
 }
 
 fn remove(p: &Path) -> std::io::Result<()> {
@@ -60,29 +79,65 @@ fn remove(p: &Path) -> std::io::Result<()> {
     }
 }
 
-fn files(dir: &Path) -> Vec<PathBuf> {
+fn files(dir: &Path, r: &mut Report) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    let Ok(shards) = std::fs::read_dir(dir) else {
-        return out;
+    let shards = match std::fs::read_dir(dir) {
+        Ok(shards) => shards,
+        Err(e) => {
+            unreadable(r, &e);
+            return out;
+        }
     };
-    for shard in shards.flatten() {
-        if let Ok(entries) = std::fs::read_dir(shard.path()) {
-            for e in entries.flatten() {
-                let p = e.path();
-                // Skip temporaries of in-flight writes (name.tmp<pid>.<seq>).
-                if p.extension().is_none() && p.is_file() {
-                    out.push(p);
+    for shard in shards {
+        let shard = match shard {
+            Ok(shard) => shard,
+            Err(e) => {
+                unreadable(r, &e);
+                continue;
+            }
+        };
+        let entries = match std::fs::read_dir(shard.path()) {
+            Ok(entries) => entries,
+            Err(e) => {
+                // a stray file beside the shards is not a disk error
+                if e.raw_os_error() != Some(20) {
+                    unreadable(r, &e);
                 }
+                continue;
+            }
+        };
+        for e in entries {
+            let e = match e {
+                Ok(e) => e,
+                Err(err) => {
+                    unreadable(r, &err);
+                    continue;
+                }
+            };
+            let p = e.path();
+            // Skip temporaries of in-flight writes (name.tmp<pid>.<seq>).
+            if p.extension().is_some() {
+                continue;
+            }
+            match e.file_type() {
+                Ok(t) if t.is_file() => out.push(p),
+                Ok(t) if t.is_symlink() => match std::fs::metadata(&p) {
+                    Ok(m) if m.is_file() => out.push(p),
+                    Ok(_) => {}
+                    Err(err) => unreadable(r, &err),
+                },
+                Ok(_) => {}
+                Err(err) => unreadable(r, &err),
             }
         }
     }
     out
 }
 
-fn age(path: &Path, now: SystemTime) -> Duration {
+fn age(path: &Path, now: SystemTime) -> std::io::Result<Duration> {
     std::fs::metadata(path)
         .and_then(|m| m.modified())
-        .map_or(Duration::ZERO, |t| now.duration_since(t).unwrap_or_default())
+        .map(|t| now.duration_since(t).unwrap_or_default())
 }
 
 pub fn run(root: &Path, keep: Duration, dry_run: bool) -> std::io::Result<Report> {
@@ -98,10 +153,23 @@ pub fn run(root: &Path, keep: Duration, dry_run: bool) -> std::io::Result<Report
     // whose objects gc cannot see would lose them.
     let mut roots: Vec<Vec<u8>> = Vec::new();
     let mut stale = Vec::new();
-    for p in files(&root.join("kv")) {
-        if age(&p, now) <= keep {
+    for p in files(&root.join("kv"), &mut r) {
+        let age = match age(&p, now) {
+            Ok(age) => age,
+            Err(e) => {
+                unreadable(&mut r, &e);
+                continue;
+            }
+        };
+        if age <= keep {
+            let bytes = match std::fs::read(&p) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    unreadable(&mut r, &e);
+                    continue;
+                }
+            };
             r.kv_kept += 1;
-            let bytes = std::fs::read(&p)?;
             let v = kv::Value::decode(bytes.as_slice()).map_err(|e| {
                 std::io::Error::other(format!("{}: undecodable entry ({e}); nothing deleted", p.display()))
             })?;
@@ -117,10 +185,13 @@ pub fn run(root: &Path, keep: Duration, dry_run: bool) -> std::io::Result<Report
         }
     }
     for p in stale {
-        r.kv_deleted += 1;
         if !dry_run {
-            remove(&p)?;
+            if let Err(e) = remove(&p) {
+                unreadable(&mut r, &e);
+                continue;
+            }
         }
+        r.kv_deleted += 1;
     }
     // 2. Objects: everything reachable from kept entries is live.
     let mut live: HashSet<Vec<u8>> = HashSet::new();
@@ -137,20 +208,31 @@ pub fn run(root: &Path, keep: Duration, dry_run: bool) -> std::io::Result<Report
         }
     }
     // 3. Delete unreachable objects older than the grace period.
-    for p in files(&cas_dir) {
+    for p in files(&cas_dir, &mut r) {
         let id = p
             .file_name()
             .and_then(|n| n.to_str())
             .and_then(|n| hex::decode(n).ok());
-        let keep_it = id.is_some_and(|id| live.contains(&id)) || age(&p, now) <= NEW_OBJECT_GRACE;
+        let keep_it = id.is_some_and(|id| live.contains(&id))
+            || match age(&p, now) {
+                Ok(age) => age <= NEW_OBJECT_GRACE,
+                Err(e) => {
+                    unreadable(&mut r, &e);
+                    true // never delete what cannot be read
+                }
+            };
         if keep_it {
             r.cas_kept += 1;
         } else {
-            r.cas_deleted += 1;
-            r.bytes_deleted += std::fs::metadata(&p).map_or(0, |m| m.len());
+            let bytes = std::fs::metadata(&p).map_or(0, |m| m.len());
             if !dry_run {
-                remove(&p)?;
+                if let Err(e) = remove(&p) {
+                    unreadable(&mut r, &e);
+                    continue;
+                }
             }
+            r.cas_deleted += 1;
+            r.bytes_deleted += bytes;
         }
     }
     Ok(r)
@@ -207,5 +289,58 @@ mod tests {
         assert!(!old_p.exists(), "object only a stale entry named goes");
         assert!(fresh_p.exists(), "new objects stay through the grace period");
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// An entry that cannot be read is skipped and counted, never fatal and
+    /// never deleted. A test cannot make EIO on demand, so EACCES stands in for
+    /// it: a kv entry whose metadata cannot be read (a link into a directory no
+    /// one may search) and a cas shard no one may list.
+    #[test]
+    fn unreadable_entries_are_skipped_counted_and_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("fleet-cas-gc-unreadable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let day = 24 * 3600;
+        let (top, top_b) = obj(vec![], b"top");
+        let top_p = put(&root, "cas", &hex::encode(&top), &top_b, 30 * day);
+        let mut v = kv::Value::default();
+        v.entries.insert("out".into(), top.clone());
+        let good = put(&root, "kv", &"a".repeat(64), &v.encode_to_vec(), 60);
+        let hidden = root.join("hidden");
+        std::fs::create_dir_all(&hidden).unwrap();
+        std::fs::write(hidden.join("entry"), v.encode_to_vec()).unwrap();
+        let bad = root.join("kv").join("dd").join("d".repeat(64));
+        std::fs::create_dir_all(bad.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(hidden.join("entry"), &bad).unwrap();
+        let locked = root.join("cas").join("ee");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(locked.join("e".repeat(64)), b"e").unwrap();
+        for d in [&hidden, &locked] {
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        let as_root = std::fs::read_dir(&locked).is_ok(); // root reads anything: the count is then not judged
+
+        let r = run(&root, Duration::from_secs(7 * day), false);
+        for d in [&hidden, &locked] {
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let r = r.expect("an unreadable entry must not abort gc");
+        assert_eq!(r.kv_kept, 1 + u64::from(as_root), "the readable entry is kept: {r:?}");
+        assert!(good.exists() && top_p.exists(), "the readable entry and its closure stay");
+        assert!(bad.symlink_metadata().is_ok(), "an unreadable entry is never deleted");
+        assert!(locked.join("e".repeat(64)).exists(), "nothing in an unlistable shard is deleted");
+        if !as_root {
+            assert_eq!(r.unreadable, 2, "the entry and the shard are counted: {r:?}");
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_vanished_entry_is_a_race_not_a_disk_error() {
+        let mut r = Report::default();
+        unreadable(&mut r, &std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert_eq!(r.unreadable, 0);
+        unreadable(&mut r, &std::io::Error::from_raw_os_error(5));
+        assert_eq!(r.unreadable, 1);
     }
 }

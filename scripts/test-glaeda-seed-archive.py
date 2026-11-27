@@ -207,6 +207,93 @@ class ArchiveTest(unittest.TestCase):
         self.assertTrue((self.archive / (KEYS[1] + archive.SUFFIX)).exists())
         self.assertEqual([f["outcome"] for f in record["fetched"]], ["fetched"])
 
+    def eio_on_stat(self, bad: set[str], rename_fails: bool = False):
+        """Patch the module's scandir so each entry named in BAD raises EIO from stat() (the 2026-11-27 traceback:
+        entry.stat(follow_symlinks=False) on a failing X10 Pro), and optionally its quarantine rename too."""
+        real_scandir, real_rename = archive.os.scandir, archive.os.rename
+
+        class Entry:
+            def __init__(self, entry): self.entry, self.name, self.path = entry, entry.name, entry.path
+            def is_file(self, follow_symlinks=True): return self.entry.is_file(follow_symlinks=follow_symlinks)
+            def stat(self, follow_symlinks=True):
+                if self.name in bad:
+                    raise OSError(5, "Input/output error", self.path)
+                return self.entry.stat(follow_symlinks=follow_symlinks)
+
+        class Listing(list):
+            def __enter__(self): return self
+            def __exit__(self, *exc): return False
+
+        def rename(src, dst):
+            if rename_fails and Path(src).name in bad:
+                raise OSError(5, "Input/output error", src)
+            return real_rename(src, dst)
+
+        def restore():
+            archive.os.scandir, archive.os.rename = real_scandir, real_rename
+
+        archive.os.scandir = lambda path: Listing(Entry(e) for e in real_scandir(path))
+        archive.os.rename = rename
+        self.addCleanup(restore)
+        return restore
+
+    def main_once(self) -> dict:
+        """main(["--apply"]) against the test archive, its log and state kept in the test's tree."""
+        real_run, real_log = archive.run, archive.LOG
+        archive.run = lambda apply: real_run(apply, self.archive, mounted=True, min_free=0)
+        archive.LOG = Path(self.tmp.name) / "log.jsonl"
+        out = io.StringIO()
+        real_stdout, sys.stdout = sys.stdout, out
+        try:
+            archive.main(["--apply"])
+        finally:
+            sys.stdout, archive.run, archive.LOG = real_stdout, real_run, real_log
+        return json.loads(out.getvalue())
+
+    def disk_errors_file(self) -> dict:
+        return json.loads((archive.STATE.parent / "disk-errors" / archive.DISK_ERRORS_NAME).read_text())
+
+    def test_a_stat_that_reads_eio_is_skipped_counted_and_reported(self):
+        # cmux-lawrence 2026-11-27: entry.stat() raised EIO on 19 of 341 seeds and the job restarted every 15 s.
+        for i, key in enumerate(KEYS[:3]):
+            self.keep(key, 100 + i)
+        self.main_once()
+        self.assertEqual(self.disk_errors_file()["unreadable"], 0)
+        bad = {KEYS[0] + archive.SUFFIX, KEYS[1] + archive.SUFFIX}
+        self.eio_on_stat(bad, rename_fails=True)
+        record = self.main_once()
+        self.assertEqual(record["state"], "applied", record)
+        self.assertEqual(sorted(i["key"] for i in record["unreadable"]), sorted(KEYS[:2]))
+        self.assertEqual(record["archive_seeds"], 1)  # the readable seed is still counted and served
+        report = self.disk_errors_file()
+        self.assertEqual(report["schema"], "glaeda-disk-errors/v1")
+        self.assertEqual((report["unreadable"], report["still_unreadable"], report["quarantined"]), (2, 2, 0))
+        self.assertIn("errno 5", report["examples"][0])
+        self.assertEqual(report["root"], os.fspath(self.archive))
+
+    def test_a_quarantined_seed_still_counts_as_a_disk_error_on_later_runs(self):
+        self.keep(KEYS[0], 100)
+        self.keep(KEYS[1], 101)
+        self.main_once()
+        restore = self.eio_on_stat({KEYS[0] + archive.SUFFIX})
+        first = self.main_once()
+        restore()  # the seed fetched again in place of the quarantined one reads fine
+        self.assertTrue(first["unreadable"][0]["quarantined"], first)
+        self.assertEqual(self.disk_errors_file()["quarantined"], 1)
+        again = self.main_once()  # the bad seed now sits aside as .corrupt-*: not re-read, still reported
+        self.assertNotIn("unreadable", again)
+        report = self.disk_errors_file()
+        self.assertEqual((report["unreadable"], report["quarantined"]), (0, 1))
+
+    def test_a_run_that_did_not_list_the_archive_keeps_the_last_count(self):
+        self.keep(KEYS[0], 100)
+        self.main_once()
+        path = archive.STATE.parent / "disk-errors" / archive.DISK_ERRORS_NAME
+        path.write_text(json.dumps({"schema": "glaeda-disk-errors/v1", "unreadable": 7, "at": 1}))
+        archive.pm.lan_config = lambda path=None: None  # an error record before any listing
+        self.main_once()
+        self.assertEqual(json.loads(path.read_text())["unreadable"], 7)
+
     def test_a_quarantine_that_fails_too_is_reported_and_not_fetched_over(self):
         self.keep(KEYS[0], 100)
         unreadable = {KEYS[0]: "OSError errno 5: Input/output error"}
