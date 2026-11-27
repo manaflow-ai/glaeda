@@ -8430,8 +8430,15 @@ class Daemon:
         turn. No token goes in the outbox."""
         if not self.poster_due(item):
             return None
+        return self.poster_for_repo(str(item["repo"]))
+
+    def poster_for_repo(self, repo: str) -> dict | None:
+        """The first free poster App for a write of REPO (broker-actor post), or None. poster_actor's lookup, for
+        writes that are no comment: the ready mark of a filled auto-draft (post_fill_auto_draft) was the login's
+        GraphQL ("API rate limit already exceeded for user", cmux#61434, 2026-11-27) while the posters sat idle."""
+        item = {"repo": repo}
         tool = app_pool_tool()
-        if not tool:
+        if not tool or not app_posts_on():
             return None
         skip = tuple(sorted(r for r, t in self.app_create_hold.items() if t > self.clock()))
         key = ("post", str(item["repo"]).lower(), skip)
@@ -9074,8 +9081,12 @@ class Daemon:
         try:
             if not node:
                 raise WatchError("the PR read has no node_id")
-            if actor:
-                status, h, doc = self.outbox_request("POST", "/graphql", query, actor)
+            # The App that made the create, else a free poster App (token +post makes markPullRequestReadyForReview,
+            # gh_app_token.py GRAPHQL_POOL_WRITES): the login's GraphQL hour only when no App is free. Detector:
+            # test_a_filled_auto_drafts_ready_mark_goes_on_a_poster_app_when_the_login_made_the_create.
+            ready_actor = actor or self.poster_for_repo(str(item["repo"]))
+            if ready_actor:
+                status, h, doc = self.outbox_request("POST", "/graphql", query, ready_actor)
             else:
                 status, h, doc = self.post_gql(READY_PR, {"id": node}, "outbox-ready")
         except (WatchError, OutOfTime) as error:

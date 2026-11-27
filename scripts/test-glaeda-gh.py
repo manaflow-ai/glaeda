@@ -19678,6 +19678,25 @@ class PostTest(unittest.TestCase):
         state = gg.post_state(item["id"])
         self.assertEqual((state["state"], state["url"]), ("posted", "https://github.com/o/r/pull/3"))
 
+    def test_a_filled_auto_drafts_ready_mark_goes_on_a_poster_app_when_the_login_made_the_create(self) -> None:
+        """Before: the ready mark of a filled auto-draft was the login's GraphQL whenever no App made the create
+        (cmux#61434, 2026-11-27: "API rate limit already exceeded for user"). After: a free poster App makes it."""
+        self.no_env_token()
+        asked = self.app_writer("quota-goblin")
+        item = self.queue("pr", "o/r", "--head", "lane/x", "--base", "main", "--title", "T", "--body", "mine")
+        exists = (422, {}, {"message": "Validation Failed",
+                            "errors": [{"message": "A pull request already exists for o:lane/x."}]})
+        draft = {"html_url": "https://github.com/o/r/pull/3", "number": 3, "node_id": "PR_3", "draft": True,
+                 "body": gg.AUTO_DRAFT_MARK + "\nDraft opened automatically"}
+        ready = (200, {}, {"data": {"markPullRequestReadyForReview": {"pullRequest": {"number": 3, "isDraft": False}}}})
+        d, t = self.daemon(exists, (200, {}, [draft]), (200, {}, {"number": 3}), ready)
+        d.transport, seen = self.authed(t)
+        self.step(d, NOW)
+        self.assertEqual(t.calls[3][1], "/graphql")
+        self.assertEqual(seen[3], "Bearer " + self.APP_TOKEN)
+        self.assertIn(["broker-actor", "post", "o/r"], asked)
+        self.assertIn("marked ready", gg.post_state(item["id"])["note"])
+
     def test_an_open_auto_draft_for_the_head_is_filled_in_and_marked_ready(self) -> None:
         """2026-11-26: cmux#59774 and cmuxterm-hq#30522 were opened by `cmux-gh post pr ... --body-file` (wt push's
         suggested command) after the branch's first push had opened its auto-draft. The create's 422 "already exists"
