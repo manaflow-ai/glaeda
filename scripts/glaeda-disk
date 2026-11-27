@@ -2597,6 +2597,7 @@ POLICY_DEFAULTS: dict[str, Any] = {
     "low_margin_gib": 4.0,
     "target_margin_gib": 20.0,
     "pressure_idle_hours": 0.5,
+    "tmp_transcript_hold_hours": 6.0,  # tmp_transcript_hold: a temp entry a recent agent transcript names stays
     # A top-level /tmp entry untouched this long that no live process holds goes (tmp-stale-scratch); 0: off
     "stale_tmp_scratch_hours": 12.0,
     # The same on a Mac, whose /private/tmp is on the one data volume (cmux16, 2026-11-22: 95% full with ~12 GiB of
@@ -8221,6 +8222,104 @@ def claude_session_active(session_id: str, idle_s: float) -> bool:
     return False
 
 
+# An agent session's own notes in the temp dir. A live Claude session kept a folder of 40 notes at /tmp/<name>, wrote
+# it last at 18:35Z, then waited on a model gateway outage for two hours; at 19:33Z the "tmp" family (one hour window)
+# found it idle, unheld (no process has a file open there between tool calls) and named by no running command, and
+# took it while the session was alive (2026-11-27). On that host the same pass took 64 top-level /tmp entries in 24 h,
+# and most of them are named in a transcript that went on being written after the delete. The session that writes a
+# path names it in its transcript, so a top-level temp entry a transcript names is held while that transcript was
+# written within the policy's tmp_transcript_hold_hours (6 by default): it goes once no session that named
+# it has written for that long. The index reads each transcript once and then only what was appended
+# (TRANSCRIPT_TMP_INDEX), so a pass costs the bytes written since the last one, not the transcripts' size.
+TMP_NAME_RE = re.compile(rb"/(?:private/)?tmp/([A-Za-z0-9._@+=-]{1,200})")
+_TRANSCRIPT_TMP_NAMES: dict[str, str] | None = None
+_TRANSCRIPT_TMP_AT = 0.0
+_TRANSCRIPT_TMP_HOME: Path | None = None
+TRANSCRIPT_TMP_FRESH_S = 30.0  # apply's fresh re-check rereads appended bytes at most this often, not once per item
+
+
+def transcript_tmp_index_path() -> Path:
+    return HOME / ".cache/glaeda-disk/transcript-tmp-names.json"
+
+
+def recent_transcripts(window_s: float, now: float | None = None) -> list[tuple[Path, os.stat_result]]:
+    """Claude (every config dir, subagents too) and Codex transcripts written within window_s."""
+    cutoff = (time.time() if now is None else now) - window_s
+    roots = [c / "projects" for c in claude_config_dirs()] + [HOME / ".codex/sessions"]
+    out = []
+    for root in roots:
+        for dirpath, _dirs, files in os.walk(root):
+            for name in files:
+                if not name.endswith(".jsonl"):
+                    continue
+                path = Path(dirpath) / name
+                try:
+                    st = path.stat()
+                except OSError:
+                    continue
+                if st.st_mtime >= cutoff:
+                    out.append((path, st))
+    return out
+
+
+def transcript_tmp_names(fresh: bool = False) -> dict[str, str]:
+    """Top-level temp entry name -> the newest recent transcript that names it, read incrementally (see above)."""
+    global _TRANSCRIPT_TMP_NAMES, _TRANSCRIPT_TMP_AT, _TRANSCRIPT_TMP_HOME
+    if (_TRANSCRIPT_TMP_NAMES is not None and _TRANSCRIPT_TMP_HOME == HOME
+            and (not fresh or time.monotonic() - _TRANSCRIPT_TMP_AT < TRANSCRIPT_TMP_FRESH_S)):
+        return _TRANSCRIPT_TMP_NAMES
+    window_s = float(POLICY["tmp_transcript_hold_hours"]) * 3600
+    index_path = transcript_tmp_index_path()
+    try:
+        old = json.loads(index_path.read_text())
+        old = old if isinstance(old, dict) else {}
+    except (OSError, ValueError):
+        old = {}
+    index: dict[str, dict] = {}
+    names: dict[str, tuple[float, str]] = {}
+    for path, st in recent_transcripts(window_s):
+        key = os.fspath(path)
+        prev = old.get(key) if isinstance(old.get(key), dict) else {}
+        same = prev.get("ino") == st.st_ino and isinstance(prev.get("offset"), int) and prev["offset"] <= st.st_size
+        offset = prev["offset"] if same else 0
+        found = set(prev.get("names", [])) if same else set()
+        if offset < st.st_size:
+            try:
+                with open(path, "rb") as f:
+                    f.seek(offset)
+                    chunk = f.read(st.st_size - offset)
+            except OSError:
+                chunk = b""
+            end = chunk.rfind(b"\n") + 1  # a line still being written is read whole next pass
+            found.update(m.decode("ascii", "replace") for m in TMP_NAME_RE.findall(chunk[:end]))
+            offset += end
+        index[key] = {"ino": st.st_ino, "offset": offset, "names": sorted(found)}
+        for n in found:
+            if n not in names or names[n][0] < st.st_mtime:
+                names[n] = (st.st_mtime, key)
+    try:
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = index_path.with_name(f"{index_path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(index))
+        os.replace(tmp, index_path)
+    except OSError:
+        pass  # an unwritten index only costs the next pass a full read
+    _TRANSCRIPT_TMP_NAMES = {n: k for n, (_m, k) in names.items()}
+    _TRANSCRIPT_TMP_AT, _TRANSCRIPT_TMP_HOME = time.monotonic(), HOME
+    return _TRANSCRIPT_TMP_NAMES
+
+
+def tmp_transcript_hold(fam: "Family", path: Path, fresh: bool = False) -> str:
+    """Why a top-level temp entry is held by an agent session that names it ("" when none does)."""
+    if fam.id not in ("tmp", STALE_TMP_SCRATCH) or path.parent != fam.root:
+        return ""
+    transcript = transcript_tmp_names(fresh).get(path.name)
+    if not transcript:
+        return ""
+    hours = float(POLICY["tmp_transcript_hold_hours"])
+    return f"named by an agent session written in the last {hours:g}h ({Path(transcript).name})"
+
+
 # A Linux lane VM's own families (lane_vm_families). One reached 100% (4.2 GB free of 495 GB) and its tests failed
 # with ENOSPC while this script found 0.0G reclaimable in 141 GiB: /tmp/wt-rd 23G, /tmp/claude-<uid> 17G, /tmp/bsz 13G
 # and /tmp/acpmux-<uid> 11G were each one "tmp" item, in use or unchecked as a whole, because a live session's
@@ -13340,6 +13439,8 @@ def _survey(families, idle_hours, min_bytes, known, evidence, defer_bulk=False,
             reasons.append("named by a running command")
         if fam.id == "claude-scratchpad" and claude_session_active(path.name, idle_window(fam, idle_hours) * 3600):
             reasons.append("claude session active")
+        if (why := tmp_transcript_hold(fam, path)):
+            reasons.append(why)
         if fam.id in SESSION_HOLD_FAMILY_IDS and not blind and (why := session_hold(fam, path, cmds)):
             reasons.append(why)
         if fam.id == WT_CARGO_TARGET and not blind and (why := wt_checkout_hold(path, opened, cmds)):
@@ -16726,6 +16827,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                 or (fam.reference_root is not None
                     and artifact_referenced(p, fresh_artifact_references(fam.reference_root)))
                 or (i.family == "claude-scratchpad" and claude_session_active(p.name, idle_window(fam, idle_hours) * 3600))
+                or tmp_transcript_hold(fam, p, fresh=True)
                 or (fam.id in SESSION_HOLD_FAMILY_IDS and session_hold(fam, p, cmds, fresh=True))
                 or (fam.id == WT_CARGO_TARGET and wt_checkout_hold(p, cwds, cmds))
                 or (git_holder_family(fam) and git_used_from_outside(p, fresh=True))

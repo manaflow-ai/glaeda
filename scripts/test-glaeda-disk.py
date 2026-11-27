@@ -15947,6 +15947,94 @@ class EvictLockQueueTest(unittest.TestCase):
         self.assertIn(f"> {gd.EVICT_TICKET_STALE_S:g}:", text, "the same stale age for a ticket")
 
 
+class TmpTranscriptHoldTest(unittest.TestCase):
+    """A live agent session's notes folder in the temp dir stays while a transcript that names it is being written: the
+    "tmp" family took /tmp/<notes> (40 files, an hour untouched) under a live session that waited on a model gateway
+    outage, because nothing held a file open there between tool calls (2026-11-27)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(os.path.realpath(self.tmp.name))
+        self.home = self.base / "home"
+        self.fake_tmp = self.base / "tmp"
+        self.fake_tmp.mkdir()
+        self.transcripts = self.home / ".claude/projects/-home-x"
+        self.transcripts.mkdir(parents=True)
+        self.saved = (gd.HOME, gd.DARWIN, gd.ROLE)
+        gd.HOME, gd.DARWIN, gd.ROLE = self.home, False, "devbox"
+        gd._TRANSCRIPT_TMP_NAMES = None
+        gd._DISCOVERED.clear()
+        for name, value in (("stale_tmp_enabled", lambda: False), ("TRANSCRIPT_TMP_FRESH_S", 0.0)):
+            patcher = mock.patch.object(gd, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.fam = gd.Family("tmp", self.fake_tmp, True, "agent scratch under the temp dir", files=True,
+                             max_idle_hours=1.0, git_disposable=True, owner="agents and tools", rebuild_minutes=0.5)
+
+    def tearDown(self) -> None:
+        gd.HOME, gd.DARWIN, gd.ROLE = self.saved
+        gd._TRANSCRIPT_TMP_NAMES = None
+        gd._DISCOVERED.clear()
+        self.tmp.cleanup()
+
+    def entry(self, name: str, hours: float = 2.0) -> Path:
+        d = self.fake_tmp / name
+        d.mkdir()
+        (d / "notes.md").write_bytes(b"n" * 4096)
+        t = time.time() - hours * 3600
+        os.utime(d / "notes.md", (t, t))
+        os.utime(d, (t, t))
+        return d
+
+    def transcript(self, name: str, text: str, hours: float = 0.0) -> Path:
+        t = self.transcripts / f"{name}.jsonl"
+        t.write_text(text)
+        os.utime(t, (time.time() - hours * 3600,) * 2)
+        return t
+
+    def survey(self) -> dict[str, gd.Item]:
+        with mock.patch.object(gd, "process_evidence", return_value=([], "")):
+            return {Path(i.path).name: i for i in gd.survey([self.fam], 0.5, 0)}
+
+    def test_a_folder_a_live_session_names_stays_and_an_unnamed_one_goes(self) -> None:
+        self.entry("notes-10919")
+        self.entry("left-behind")
+        self.transcript("live", json.dumps({"cmd": f"cat > {self.fake_tmp}/x; ls /tmp/notes-10919/a.md"}) + "\n")
+        items = self.survey()
+        self.assertEqual(items["notes-10919"].verdict, "in-use")
+        self.assertIn("named by an agent session written in the last 6h (live.jsonl)", items["notes-10919"].reasons)
+        self.assertEqual(items["left-behind"].verdict, "reclaimable", items["left-behind"].reasons)
+
+    def test_a_session_silent_past_the_hold_no_longer_holds_it(self) -> None:
+        self.entry("notes-old", hours=9.0)
+        self.transcript("gone", '{"cmd": "ls /tmp/notes-old"}\n', hours=7.0)
+        self.assertEqual(self.survey()["notes-old"].verdict, "reclaimable")
+
+    def test_the_index_reads_only_appended_whole_lines(self) -> None:
+        t = self.transcript("live", '{"cmd": "ls /tmp/first"}\n{"cmd": "ls /tmp/half')
+        self.assertEqual(set(gd.transcript_tmp_names(fresh=True)), {"first"})
+        index = json.loads(gd.transcript_tmp_index_path().read_text())
+        self.assertEqual(index[os.fspath(t)]["offset"], len('{"cmd": "ls /tmp/first"}\n'))
+        with open(t, "a") as f:
+            f.write('-done"}\n')
+        self.assertEqual(set(gd.transcript_tmp_names(fresh=True)), {"first", "half-done"})
+        t.write_text('{"cmd": "ls /tmp/other"}\n')  # rewritten smaller: read again from the start
+        self.assertEqual(set(gd.transcript_tmp_names(fresh=True)), {"other"})
+
+    def test_apply_rechecks_a_name_written_after_the_survey(self) -> None:
+        notes = self.entry("notes-late")
+        items = self.survey()
+        self.assertEqual(items["notes-late"].verdict, "reclaimable")
+        self.transcript("live", '{"cmd": "mkdir -p /tmp/notes-late"}\n')
+        receipt = self.home / ".receipt.jsonl"
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
+                mock.patch.object(gd, "process_evidence", return_value=([], "")), \
+                mock.patch.object(gd, "command_lines", return_value="ps"):
+            gd.apply(list(items.values()), {self.fam.id: self.fam}, receipt, None, 0.5)
+        self.assertTrue(notes.exists())
+        self.assertFalse(receipt.exists() and "reclaimed" in receipt.read_text())
+
+
 class LaneVmFamiliesTest(unittest.TestCase):
     """A Linux lane VM's own scratch, one item per session or tree: a dead acpmux session's TMPDIR, an abandoned
     /tmp/wt-* worktree and /tmp/bsz go once nothing holds them and nothing below changed for 6 h; a live, unknown,
