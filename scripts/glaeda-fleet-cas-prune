@@ -111,6 +111,11 @@ CRASH_REPORTS = Path(os.environ.get("GLAEDA_FLEET_CAS_CRASH_REPORTS",
                                     os.path.expanduser("~/Library/Logs/DiagnosticReports")))
 CAS_CLIENTS = ("SWBBuildService", "XCBBuildService", "swift-frontend", "clang")
 CAS_PLUGIN = "libToolchainCASPlugin.dylib"
+# A crash while the build service replays a cached compile is the CAS too, though its faulting frames sit in the
+# Swift scanner, not the plugin (ultra1, 2026-11-27: three nightly builds in 40 min "The Xcode build system has
+# crashed", SWBBuildService SIGABRT in swiftscan_cache_replay_compilation > replayCachedDiagnostics >
+# bad_optional_access; dropping the local CAS cleared it).
+CAS_REPLAY = re.compile(r"swiftscan_cache_replay|replayCachedCompilerOutputs|replayCachedDiagnostics")
 CRASH_LOOKBACK = 7 * 86400  # crash reports older than this are not read
 DISK_ERRORS_DIR = Path(os.environ.get("GLAEDA_DISK_ERRORS_DIR")
                        or os.path.expanduser("~/.local/state/glaeda/disk-errors"))
@@ -303,8 +308,10 @@ def crash_time(report: Path) -> tuple[float, bool] | None:
         when = datetime.datetime.strptime(head["timestamp"], "%Y-%m-%d %H:%M:%S.%f %z").timestamp()
         thread = data["threads"][data.get("faultingThread", 0)]
         images = data["usedImages"]
+        frames = thread.get("frames", [])
         in_plugin = any((images[f["imageIndex"]].get("name") or "") == CAS_PLUGIN
-                        for f in thread.get("frames", []) if 0 <= f.get("imageIndex", -1) < len(images))
+                        for f in frames if 0 <= f.get("imageIndex", -1) < len(images)) \
+            or any(CAS_REPLAY.search(f.get("symbol") or "") for f in frames)
     except (OSError, ValueError, KeyError, IndexError, TypeError, AttributeError):  # a partly written report
         return None
     return when, in_plugin

@@ -163,6 +163,21 @@ class PruneTest(unittest.TestCase):
         self.assertEqual(rec["result"], "ok")
         self.assertFalse((self.root / "cas").exists())
 
+    def test_crash_replaying_a_cached_compile_counts_as_corrupt(self) -> None:
+        """ultra1, 2026-11-27: SWBBuildService aborted in the Swift scanner while replaying cached diagnostics; no
+        frame of the faulting thread was in the CAS plugin, so the CAS was kept and three nightly builds crashed."""
+        self.corrupt_cas()
+        reports = self.crash_report("SWBBuildService-2026-11-27-074246.ips", time.time() + 5, in_plugin=False)
+        path = reports / "SWBBuildService-2026-11-27-074246.ips"
+        head, _, body = path.read_text().partition("\n")
+        data = json.loads(body)
+        data["threads"][1]["frames"].append({"imageIndex": 1, "symbol": "swiftscan_cache_replay_compilation"})
+        path.write_text(head + "\n" + json.dumps(data))
+        with mock.patch.object(fp, "CRASH_REPORTS", reports):
+            rec = self.run_main("--apply")
+        self.assertTrue(rec["local_cas"].startswith("removed (corrupt: SWBBuildService-2026-11-27"), rec)
+        self.assertFalse((self.root / "cas").exists())
+
     def test_corrupt_local_cas_waits_for_its_lock(self) -> None:
         self.corrupt_cas()
         reports = self.crash_report("SWBBuildService-2026-11-17-010834.ips", time.time() + 5)
