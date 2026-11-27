@@ -11157,9 +11157,15 @@ class Daemon:
 
     def land_finishing(self) -> float:
         """When the land judgments running past half their own bound end at the latest (time.monotonic), or 0.0 for
-        none: a drain at REEXEC_DRAIN_MAX lets them finish instead of judging them again (reexec_due)."""
+        none: a drain at REEXEC_DRAIN_MAX lets them finish instead of judging them again (reexec_due);
+        0.0 with handover on: a handed judgment outlives the re-exec (REEXEC_HANDED)."""
         q = self.land_queue
-        return 0.0 if q is None else q.finishing(time.monotonic())
+        return 0.0 if q is None or self.land_handover() else q.finishing(time.monotonic())
+
+    def land_handover(self) -> bool:
+        """Whether the land queue hands its running judgments and claimed steps to the next daemon (REEXEC_HANDED)."""
+        q = self.land_queue
+        return bool(q is not None and getattr(q, "handover", False))
 
     def nudge_min(self, key: str) -> float:
         """How soon a nudged PR is read again: LAND_NUDGE_MIN for one in the land queue (its read is what the land
@@ -31273,20 +31279,27 @@ REEXEC_UPDATE_GAP = 300.0
 # half its own timeout when the drain limit is reached finishes first ("finish"), bounded by that timeout
 # (LandQueue.finishing): the end is read once, at the limit, so a judgment that starts or crosses half later extends
 # nothing.
+# REEXEC_HANDED: both waits above predate the handover (LAND_JUDGING_DIR, judge_handed, adopt_step): a re-exec no longer
+# drops a judgment (the next daemon adopts its child and reads its answer) nor cuts a claimed step's write (adopted the
+# same way), so with handover on neither the hold nor the finish saves any work, and an update only drains the claimed
+# steps not yet inside a handed child (land_busy). a controller, 2026-11-27 13:10-14:10Z: every glaeda merge waited out
+# hold, drain and finish behind 20-27 busy land workers (fast-patch lockWaitS 670-998 s, merge to live 675-1043 s, the
+# swap itself 0.75 s), and a daemon re-exec'd every few minutes is always under REEXEC_UPDATE_GAP of uptime.
 
 
 def reexec_due(changed: bool, busy: bool, waiting_since: float | bool, now: float,
-               up: float = REEXEC_UPDATE_GAP, finish_until: float | None = None) -> str | None:
+               up: float = REEXEC_UPDATE_GAP, finish_until: float | None = None, handover: bool = False) -> str | None:
     """What serve does about an update: None (nothing changed), "hold" (land work runs and the daemon is up under
     REEXEC_UPDATE_GAP: it goes on, the update waits), "defer" (draining: the running land jobs end, no new one starts),
     "finish" (past REEXEC_DRAIN_MAX, still draining until FINISH_UNTIL: a judgment past half its timeout ends),
-    "reexec", or a reason string for a re-exec past REEXEC_DRAIN_MAX with a job still running."""
+    "reexec", or a reason string for a re-exec past REEXEC_DRAIN_MAX with a job still running. HANDOVER (the land
+    queue hands its judgments and claimed steps to the next daemon, LAND_JUDGING_DIR): no hold, see REEXEC_HANDED."""
     if not changed:
         return None
     if not busy:
         return "reexec"
     since = waiting_since if isinstance(waiting_since, (int, float)) and not isinstance(waiting_since, bool) else None
-    if since is None and up < REEXEC_UPDATE_GAP:
+    if since is None and up < REEXEC_UPDATE_GAP and not handover:
         return "hold"
     if since is not None and now - since >= REEXEC_DRAIN_MAX:
         if finish_until is not None and now < finish_until:
@@ -31832,7 +31845,8 @@ def serve_daemon(foreground_ok: bool, cleanup: contextlib.ExitStack) -> int:
                 if daemon.reexec_finish_until > at:
                     log({"event": "reexec-finishing", "why": f"a land judgment past half its bound finishes first, "
                                                              f"at most {int(daemon.reexec_finish_until - at)} s more"})
-            due = reexec_due(changed, busy, daemon.reexec_waiting, at, at - started, daemon.reexec_finish_until)
+            due = reexec_due(changed, busy, daemon.reexec_waiting, at, at - started, daemon.reexec_finish_until,
+                             handover=daemon.land_handover())
             if due == "hold":
                 if not held:
                     held = True

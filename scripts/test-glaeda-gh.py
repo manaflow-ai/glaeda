@@ -25707,6 +25707,29 @@ class ReexecDrainTest(Base):
         self.assertEqual(gg.reexec_due(True, False, 100.0, limit, finish_until=limit + 60), "reexec", "it ended")
         self.assertEqual(gg.reexec_due(True, True, 100.0, limit - 1, finish_until=limit + 60), "defer")
 
+    def test_with_handover_an_update_neither_holds_nor_finishes(self) -> None:
+        # a controller, 2026-11-27 13:10-14:10Z: each glaeda merge waited out hold, drain and finish behind 20-27 busy land
+        # workers (fast-patch lockWaitS 670-998 s, merge to live 675-1043 s, the swap 0.75 s). With handover on, a
+        # re-exec drops no judgment and cuts no claimed step (REEXEC_HANDED): only the drain of claimed steps not yet
+        # handed is left, REEXEC_DRAIN_MAX at most.
+        self.assertEqual(gg.reexec_due(True, True, False, 100.0, up=120.0, handover=True), "defer")
+        self.assertEqual(gg.reexec_due(True, True, False, 100.0, up=120.0), "hold", "no handover: the hold stands")
+        self.assertEqual(gg.reexec_due(True, False, False, 100.0, up=120.0, handover=True), "reexec")
+        late = gg.reexec_due(True, True, 100.0, 100.0 + gg.REEXEC_DRAIN_MAX, up=120.0, handover=True)
+        self.assertNotIn(late, (None, "hold", "defer", "finish", "reexec"))
+        d = gg.Daemon.__new__(gg.Daemon)
+        q = mock.Mock(handover=True)
+        q.finishing.return_value = time.monotonic() + 200
+        d.land_queue = q
+        self.assertTrue(d.land_handover())
+        self.assertEqual(d.land_finishing(), 0.0, "a handed judgment outlives the re-exec: nothing to finish")
+        q.handover = False
+        self.assertFalse(d.land_handover())
+        self.assertGreater(d.land_finishing(), 0.0, "no handover: a judgment past half its bound still finishes")
+        d.land_queue = None
+        self.assertFalse(d.land_handover())
+        self.assertEqual(d.land_finishing(), 0.0)
+
     def test_same_bytes_reinstalled_do_not_reexec(self) -> None:
         """A lane VM, 2026-11-21..22: 40 of 175 release installs left glaeda-gh byte-identical, and each re-exec'd the
         daemon on its mtime. Only a change of content does now; the file is hashed only when its stat moved."""
@@ -25933,6 +25956,9 @@ class ReexecDrainTest(Base):
                 return {"modes": {}, "paths": {}, "errors": []}
 
             def land_busy(self) -> bool:
+                return False
+
+            def land_handover(self) -> bool:
                 return False
 
         execs: list = []
