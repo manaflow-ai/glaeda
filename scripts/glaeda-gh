@@ -23402,6 +23402,13 @@ class LandQueue:
         data = (self.cache_of(e["key"]) or {}).get("data") or {}
         head = str(data.get("headRefOid") or "").lower()
         if not SHA40.fullmatch(head):
+            # LAND_WAKE_NO_COPY: a row the cache holds no copy of (its first judgment was why=no_data) is still waiting
+            # on the head that judgment named; the feed's check events are matched against that head, so the row wakes
+            # on them as a row with a copy does. Before, it had no entry in heads and slept to its timer.
+            known = str((e.get("explain") or {}).get("head") or (e.get("wait") or {}).get("sha")
+                        or e.get("pinSha") or "").lower()
+            if SHA40.fullmatch(known) and e.get("repo"):
+                self.heads[e["key"]] = (e["repo"].lower(), known, "")
             return
         # what the daemon's feed matches a run or suite event against (Daemon.nudge_lands), watched or not
         self.heads[e["key"]] = (e["repo"].lower(), head, str(data.get("headRefName") or ""))
@@ -23461,6 +23468,18 @@ class LandQueue:
             self.nudge(e["key"])
             if self.no_data_backoff(e, woke):
                 return  # the last no-data judgment judged nothing: its retry's backoff, not LAND_NO_DATA_AFTER again
+            nd_head = str((e.get("explain") or {}).get("head") or "").lower()
+            if (not woke and e["state"] == "waiting" and w.get("kind") == "pr"
+                    and (e.get("explain") or {}).get("code") == "checks_running" and SHA40.fullmatch(nd_head)
+                    and self.checks_done_event(e, nd_head)):
+                # LAND_WAKE_NO_COPY: no copy to fingerprint, but the feed and the rollup say every check at the head
+                # finished since the verdict: judged now, not held to the wait's wake (no_data_wait_holds)
+                if self.judge(e, "", fp, counts=False, why="checks_done"):
+                    e.pop("noDataSince", None)
+                else:
+                    e.pop("doneEventSeen", None)
+                    self.save(e)
+                return
             if self.no_data_wait_holds(e, woke):
                 return  # LAND_NO_DATA_WAIT: the wait its last judgment named, not LAND_NO_DATA_AFTER again
             # land_judge reads the head; a full pin (land_full_pin) is judged at once on the caller's own read

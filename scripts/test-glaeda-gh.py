@@ -40829,6 +40829,30 @@ class LandTest(Base):
         self.assertEqual(len(self.w.judgments()), 2)
         self.assertEqual(len([h for h in e["history"] if h.get("event") == "checks_done_event"]), 1)
 
+    def test_a_check_completed_event_judges_a_wait_whose_pr_the_cache_holds_no_copy_of(self):
+        """LAND_WAKE_NO_COPY. manaflow-ai/cmux#61813, 2026-11-27: first judged why=no_data (checks_running, 30 min
+        wait), green and CLEAN by 13:55Z, judged only at 14:09Z; leo-workspace#13493 and glaeda#3083 the same. With no
+        copy the row had no head in the queue's heads (so the feed's event matched nothing) and no_data_wait_holds
+        held it to its wake. Now the verdict's head is what the event is matched to, and the event judges it."""
+        self.feed()
+        done, _, asked = self.event_feed()
+        wait = {"kind": "wait_pr", "sha": LA, "until": "done", "timeout_s": 1800}
+        self.land()  # no self.pr(): the cache holds no copy of the PR
+        self.w.answers.append(refusal("checks_running", LA, wait))
+        for _ in range(4):
+            self.tick(60)
+        self.assertEqual(len(self.w.judgments()), 1)
+        self.assertEqual(self.q.heads[self.KEY][1], LA)  # what Daemon.nudge_lands matches the event against
+        for _ in range(5):
+            self.tick(60)
+        self.assertEqual(len(self.w.judgments()), 1)  # no event: the wait stands
+        done.append(self.t)
+        self.w.answers.append(ok_answer(LA))
+        e = self.tick(1)
+        self.assertEqual(len(self.w.judgments()), 2)
+        self.assertEqual([h.get("why") for h in e["history"] if h.get("event") == "judged"][-1], "checks_done")
+        self.assertEqual(asked, [LA])
+
     def test_a_green_rollup_judges_a_checks_wait_whose_copy_still_shows_a_check_running(self):
         """LAND_ROLLUP_READY. manaflow-ai/cmuxterm-hq#28474, 2026-11-26: judged checks_running at 09:49Z, every check
         green by 10:06Z (the last a commit status), the copy starved of reads still showing one running, merged by
