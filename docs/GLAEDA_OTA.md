@@ -116,6 +116,20 @@ but still installs through `glaeda-mini-fleet upgrade` (below).
    them: a runner left on one hook through several releases pages two hours after it fell behind,
    not two hours after the latest release (before, a ring that released every half hour never let
    a stuck runner reach `alertAfter`).
+
+   **Unit deploy ownership.** Every host unit has one deploy path; the path that installs the unit
+   also owns refreshing its executable and arguments:
+
+   | Unit family | Unit installer / deploy path |
+   | --- | --- |
+   | `glaeda-update` LaunchAgent or `glaeda-update.timer`/`.service` | `glaeda-update` (the host's OTA timer and service) |
+   | Seed archive LaunchDaemon and seed scripts | `glaeda-seed-archive install --apply`; later bytes for already-installed seed scripts are refreshed by `glaeda-update` |
+   | Fleet-CAS store and store-GC LaunchDaemons | The registry's `glaeda-fleet-cas-rollout ... --apply`, which stages the installer and runs `glaeda-fleet-cas` on the store host |
+
+   `glaeda-update` never creates a missing seed role, fleet-CAS bundle, or fleet-CAS unit. A host
+   that runs one of those units must therefore have its registry installer row (or the seed
+   installer) as the deploy source. This keeps a unit's installed bytes, arguments, and service
+   manager state on the same path that can make them current.
 4. **Canary health.** A canary host with an authenticated `gh` posts the commit status
    `glaeda-ota/<host>` (success or failure) on the release commit. Its gh calls ride out a spent
    REST quota: a reset within five minutes is waited for, rate limits and transient errors are

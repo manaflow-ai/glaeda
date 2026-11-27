@@ -6,6 +6,12 @@ script=$repo_root/scripts/glaeda-fleet-cas-rollout
 temporary_root=$(mktemp -d)
 trap 'rm -rf "$temporary_root"' EXIT
 
+# The registry row invokes this script for both store units. Keep the ownership contract visible
+# at the deploy boundary so a future standalone installer cannot silently lose OTA coverage.
+grep -q 'registry deploy runner for fleet-CAS units' "$script"
+grep -q 'fleet-cas-store' "$repo_root/scripts/glaeda-fleet-cas"
+grep -q 'fleet-cas-store-gc' "$repo_root/scripts/glaeda-fleet-cas"
+
 cat >"$temporary_root/ssh" <<'EOF'
 #!/usr/bin/env bash
 if [ "${1:-}" = "-G" ]; then

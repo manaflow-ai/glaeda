@@ -1,5 +1,8 @@
 #!/bin/bash
-# glaeda-fleet-cas-rollout: deploy the fleet compilation cache from an operator Mac.
+# glaeda-fleet-cas-rollout: the registry deploy runner for fleet-CAS units, from an operator Mac.
+# Every --apply owns both store LaunchDaemons (`fleet-cas-store` and `fleet-cas-store-gc`) on
+# the store host, plus the node/writer roles named by the registry row; keep this as their only
+# deploy path so unit bytes and launchd state converge together.
 #
 #   glaeda-fleet-cas-rollout --store HOST [--trusted-keys HEX] [--writer HOST --sign-key PATH]
 #                            [--store-root PATH] [--store-image PATH] [--allow-coordinator] [--store-lan IP]
