@@ -12961,6 +12961,30 @@ class HeadChecksTest(Base):
                     self.controller_rollup(SHA_A, runs=[], statuses=[]), None):
             self.assertIsNone(gg.controller_green_checks(bad, SHA_A), bad)
 
+    def test_cmux_61962_a_draft_suite_cancelled_by_the_ready_run_at_the_same_head_is_not_a_red(self) -> None:
+        """cmux#61962 at 47b31bb6: the draft's suite (90), cancelled when the ready_for_review run took its concurrency
+        group, beside that run's suite (91) reporting every one of those checks again: the head is green."""
+        def run(rid: int, name: str, suite: int, conclusion: str, app: str = "github-actions") -> dict:
+            return {"id": rid, "name": name, "status": "completed", "conclusion": conclusion,
+                    "app": {"slug": app}, "check_suite": {"id": suite}}
+        draft = [run(5, "cmux-next path routing", 90, "cancelled"), run(6, "cmux-next swift test", 90, "cancelled")]
+        ready = [run(15, "cmux-next path routing", 91, "success"), run(16, "cmux-next swift test", 91, "skipped")]
+        checks = gg.controller_green_checks(self.controller_rollup(SHA_A, runs=draft + ready), SHA_A)
+        self.assertIsNotNone(checks)
+        self.assertEqual(sorted(c["name"] for c in checks if not c["statusContext"]),
+                         ["cmux-next path routing", "cmux-next swift test"])
+        self.assertTrue(all(c["suite"] == 91 for c in checks if not c["statusContext"]))
+        for bad in (draft,  # nothing replaced it
+                    draft + ready[:1],  # the newer suite does not report every cancelled check
+                    draft + [run(15, "cmux-next path routing", 91, "success"),
+                             run(16, "cmux-next swift test", 91, "failure")],  # the newer run is red
+                    draft + [run(3, "cmux-next path routing", 89, "success"),
+                             run(4, "cmux-next swift test", 89, "success")],  # an older suite settles nothing
+                    draft + [{**r, "app": {"slug": "other-app"}} for r in ready],  # another app's
+                    draft + [run(15, "cmux-next path routing", 91, "success"),
+                             run(17, "cmux-next swift test", 92, "success")]):  # split over two suites
+            self.assertIsNone(gg.controller_green_checks(self.controller_rollup(SHA_A, runs=bad), SHA_A), bad)
+
     def test_a_stale_or_unread_head_is_served_from_the_controllers_green_rollup(self) -> None:
         """LAND_ROLLUP_JUDGE: the store's head copy is stale (or missing) and the PR's copy a head behind, but the
         controller's rollup says every check is done and green: `checks --pr` answers it in the pr-rollup shape

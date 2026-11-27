@@ -5552,10 +5552,40 @@ def rollup_digest(doc: object, sha: str) -> str | None:
     return hashlib.sha1(json.dumps(shape, sort_keys=True).encode()).hexdigest()
 
 
+def superseded_suite_cancels(newest: dict[tuple, dict]) -> list[tuple]:
+    """Keys (app, suite, name) of NEWEST, the newest attempt of each check run per app, suite and name, whose run was
+    cancelled when a newer run of the same workflow at the same head took its concurrency group: every cancelled run of
+    that suite has a run of the same name in ONE later suite of the same app (a higher suite id), each newer than it.
+    That later suite then holds the verdict of each of those checks (and is judged green or not on its own).
+    cmux#61962 at 47b31bb6 (2026-11-27): the draft's runs (cmux-next 46014928072, pr router 46014928322, CI) were
+    cancelled by the ready_for_review runs 15 s later, which reported every one of those checks again, skipped or
+    green; this rollup kept the 49 cancels as reds, so the land's green fast paths (LAND_ROLLUP_JUDGE) never fired and
+    the land sat on its 30 min wait timer. The controller names no workflow, so one later suite must carry every
+    cancelled name: a same-named check of another workflow alone settles nothing (land_judge's F2 at 3585ba41)."""
+    cancelled: dict[tuple, dict[str, int]] = {}
+    names: dict[tuple, dict[str, int]] = {}
+    for (app, suite, name), run in newest.items():
+        names.setdefault((app, suite), {})[name] = run["id"]
+        if run.get("status") == "completed" and str(run.get("conclusion") or "").lower() == "cancelled":
+            cancelled.setdefault((app, suite), {})[name] = run["id"]
+    out: list[tuple] = []
+    for (app, suite), runs in cancelled.items():
+        if not isinstance(suite, int) or isinstance(suite, bool):
+            continue
+        for (other_app, other), other_names in names.items():
+            if other_app != app or not isinstance(other, int) or isinstance(other, bool) or other <= suite:
+                continue
+            if all(name in other_names and other_names[name] > run_id for name, run_id in runs.items()):
+                out.extend((app, suite, name) for name in runs)
+                break
+    return out
+
+
 def controller_green_checks(doc: object, sha: str) -> list[dict] | None:
     """The controller rollup DOC of SHA as its checks, when it says the head is done and green (LAND_ROLLUP_JUDGE),
     else None: incomplete (either part), another commit's, nothing in it, a check run whose newest attempt (per app,
-    suite and name) is not finished or not success, skipped or neutral, or a commit status that is not success. Each
+    suite and name) is not finished or not success, skipped or neutral (a suite cancelled for a newer run of its workflow
+    at the head is that run's: superseded_suite_cancels), or a commit status that is not success. Each
     check: name, conclusion (lower case), statusContext, and for a check run its id, app, suite and times."""
     if not isinstance(doc, dict) or doc.get("complete") is not True or str(doc.get("sha") or sha).lower() != sha:
         return None
@@ -5572,6 +5602,8 @@ def controller_green_checks(doc: object, sha: str) -> list[dict] | None:
         key = (app.get("slug"), suite.get("id"), run["name"])
         if key not in newest or run["id"] > newest[key]["id"]:
             newest[key] = run
+    for key in superseded_suite_cancels(newest):
+        del newest[key]
     checks: list[dict] = []
     for (app, suite, name), run in sorted(newest.items(), key=lambda kv: kv[1]["id"]):
         conclusion = str(run.get("conclusion") or "").lower()
