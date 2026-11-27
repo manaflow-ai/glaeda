@@ -18,7 +18,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
-NAMES = {"glaeda-disk": "cmux-disk", "glaeda-procs": "cmux-procs", "glaeda-disk-registry": "cmux-disk-registry"}
+NAMES = {"glaeda-disk": "cmux-disk", "glaeda-procs": "cmux-procs", "glaeda-disk-registry": "cmux-disk-registry",
+         "glaeda-idle-repair": "cmux-idle-repair", "glaeda-mini-health": "cmux-mini-health"}
 
 
 class CmuxNamesTest(unittest.TestCase):

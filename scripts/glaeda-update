@@ -156,7 +156,7 @@ MAX_EXTRACTED = 1024 * 1024 * 1024
 # what setup installs and a first update snapshots, so it can roll back without a previous release
 TOOLS = ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-runner-hygiene", "glaeda-procs", "glaeda-local-guard", "glaeda-worktree-reclaim", "glaeda-worktree-reclaim-all",
          "glaeda-fleet-cas-prune", "glaeda-seed-prefetch", "glaeda-git-mirror", "glaeda-idle-warm", "glaeda-mini-health", "glaeda-update", "glaeda-gh",
-         "cmux-gh", "cmux-disk", "cmux-procs", "cmux-disk-registry")  # the cmux-* primary names (glaeda-mini-setup TOOL_ALIASES)
+         "cmux-gh", "cmux-disk", "cmux-procs", "cmux-disk-registry", "cmux-idle-repair", "cmux-mini-health")  # the cmux-* primary names (glaeda-mini-setup TOOL_ALIASES)
 # what a --gh-only host installs (glaeda-mini-setup GH_ONLY_TOOLS): its health and drift checks cover only these
 GH_ONLY_TOOLS = ("glaeda-update", "glaeda-gh", "glaeda-disk", "cmux-gh", "cmux-disk")
 RELEASE_SCHEMA = "glaeda-release/v1"

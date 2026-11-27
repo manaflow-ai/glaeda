@@ -205,7 +205,8 @@ GH_ONLY_TOOLS = ("glaeda-update", "glaeda-gh", "glaeda-disk", "disk-pressure.sh"
 # and cmux-disk-registry are the same for their glaeda-* programs (Leo, 2026-11-25: "start migrating off glaeda and
 # into cmux-prefixed naming tooling"); the old names count their uses in ~/.local/state/cmux-names for retirement.
 TOOL_ALIASES = {"glaeda-gh": "cmux-gh", "glaeda-disk": "cmux-disk", "glaeda-procs": "cmux-procs",
-                "glaeda-disk-registry": "cmux-disk-registry"}
+                "glaeda-disk-registry": "cmux-disk-registry",
+                "glaeda-idle-repair": "cmux-idle-repair", "glaeda-mini-health": "cmux-mini-health"}
 PROFILE_FLAGS = ("--gh-only", "--hygiene-only")
 
 

@@ -1971,7 +1971,7 @@ class ReleaseTest(unittest.TestCase):
             files = {f"glaeda/scripts/{name}": ((ROOT / "scripts" / name).read_bytes(), 0o755)
                      for name in ("glaeda-disk", "glaeda-worktree", "glaeda-projects", "glaeda-gh", "glaeda-mini-health",
                                  "glaeda-update", "glaeda-procs", "glaeda-disk-registry", "cmux-disk", "cmux-procs",
-                                 "cmux-disk-registry")}
+                                 "cmux-disk-registry", "glaeda-idle-repair", "cmux-idle-repair", "cmux-mini-health")}
             files["bin/glaeda-worktree-reclaim"] = (b"#!/bin/sh\nexit 0\n", 0o755)
             (out / gr.hygiene_asset(TARGET)).write_bytes(tar_gz(files))
             self.assertEqual(gr.main(["smoke", "--source", "a" * 40, "--target", TARGET, "--output", str(out)]), 0)
