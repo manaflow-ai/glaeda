@@ -5770,9 +5770,15 @@ WORKER_BUILD_OUTPUT_REASON = ("a Cargo target directory in the live hq worker's 
                               "build output the worker rebuilds (pressure_worker_build_output)")
 
 
-def worker_cargo_target(path: Path) -> bool:
+def worker_cargo_target(path: Path, _nested: bool = False) -> bool:
     """Whether PATH is a Cargo target directory: cargo's own CACHEDIR.TAG, or its .rustc_info.json, at the top of a
-    real directory (not a symlink) that holds no version control of its own."""
+    real directory (not a symlink) that holds no version control of its own; or a directory of nothing but such
+    targets, one per source tree.
+
+    The hq worker's CARGO_TARGET_DIR is cache/cmux-tui-target/src-<hash> (one target per source tree), so the family
+    item cache/cmux-tui-target holds targets and is none itself: it read "report-only" and "unchecked" under pressure
+    while cmux21 (24 GiB free) and cmux17 (21 GiB) sat under their gui-light disk floor with 8.5 GiB there and 0.0G
+    reclaimable (2026-11-27). Every in-use veto still holds the whole item while a cargo or rustc names it."""
     try:
         if path.is_symlink() or not path.is_dir():
             return False
@@ -5780,8 +5786,16 @@ def worker_cargo_target(path: Path) -> bool:
         return False
     if any(os.path.lexists(path / m) for m in VCS_MARKERS):
         return False
-    return (bool(CARGO_TAG.search(_head(os.fspath(path / "CACHEDIR.TAG"), 256)))
-            or (path / ".rustc_info.json").is_file())
+    if (bool(CARGO_TAG.search(_head(os.fspath(path / "CACHEDIR.TAG"), 256)))
+            or (path / ".rustc_info.json").is_file()):
+        return True
+    if _nested:
+        return False
+    try:
+        entries = [e for e in os.scandir(path) if not e.name.startswith(".")]
+    except OSError:
+        return False
+    return bool(entries) and all(worker_cargo_target(Path(e.path), _nested=True) for e in entries)
 
 
 def worker_build_output(fam: Family, path: Path) -> bool:

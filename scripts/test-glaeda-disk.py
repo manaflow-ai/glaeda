@@ -17339,6 +17339,44 @@ class PressureHeldBytesTest(unittest.TestCase):
             self.assertEqual([r["outcome"] for r in rec], ["reclaimed"])
             self.assertIn(gd.WORKER_BUILD_OUTPUT_REASON, rec[0]["reasons"])
 
+    def test_the_workers_per_source_targets_dir_is_build_output_under_pressure(self) -> None:
+        # the hq worker's layout: cache/cmux-tui-target/src-<hash> is the CARGO_TARGET_DIR, with .rustc_info.json and
+        # no CACHEDIR.TAG; cmux21 and cmux17 (2026-11-27) read 0.0G reclaimable under their disk floor with 8.5 GiB there
+        cache = self.root / "cache"
+        per_source = cache / "cmux-tui-target"
+        src = per_source / "src-681de312a68b64a3"
+        (src / "release/deps").mkdir(parents=True)
+        (src / "release/deps/libx.rlib").write_bytes(b"\0" * 1024 * 1024)
+        (src / ".rustc_info.json").write_text("{}")
+        (src / ".source").write_text("x")
+        self.age(per_source, 2.0)
+        mixed = cache / "mixed"  # a target beside something that is none: not build output
+        (mixed / "src-a").mkdir(parents=True)
+        (mixed / "src-a" / ".rustc_info.json").write_text("{}")
+        (mixed / "notes").mkdir()
+        self.age(mixed, 2.0)
+        (cache / "empty").mkdir()
+        self.age(cache / "empty", 2.0)
+        hq = gd.hq_cache_family(cache)
+        artifacts = gd.Family("fleet-artifacts", cache, True, "rebuild", depth=1, files=True,
+                              reference_root=self.root, platform="macos")
+        self.assertTrue(gd.worker_cargo_target(per_source))
+        self.assertFalse(gd.worker_cargo_target(mixed))
+        self.assertFalse(gd.worker_cargo_target(cache / "empty"))
+        self.assertFalse(gd.worker_cargo_target(cache), "one level of nesting only")
+        with mock.patch.object(gd, "owner_retired", return_value=False), \
+                mock.patch.object(gd, "family_git_state", return_value="unchecked"):
+            self.assertEqual(self.verdicts([hq])[(hq.id, "cmux-tui-target")].verdict, "report-only")
+            with mock.patch.object(gd, "PRESSURE_WORKER_BUILD_OUTPUT", True):
+                on = self.verdicts([hq, artifacts])
+                for fid in (hq.id, "fleet-artifacts"):
+                    self.assertEqual(on[(fid, "cmux-tui-target")].verdict, "reclaimable", fid)
+                self.assertEqual(on[(hq.id, "mixed")].verdict, "report-only")
+                with mock.patch.object(gd, "process_evidence",
+                                       return_value=([], f"cargo build --target-dir {src}\n")):
+                    self.assertEqual(self.verdicts([hq])[(hq.id, "cmux-tui-target")].verdict, "in-use",
+                                     "a live build in one source's target keeps the whole item")
+
     def test_the_newest_seed_goes_under_pressure_only_when_nothing_holds_it(self) -> None:
         seeds = self.root / "ci" / "seeds"
         old = make(seeds / "seed-old", age_hours=60)
