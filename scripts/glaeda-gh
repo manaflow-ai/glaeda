@@ -670,6 +670,13 @@ TICK_BUDGET = 90  # shared wall-clock budget for the tick's GitHub reads, includ
 # each try asked everything again (head parts keep REST_HEAD_PART_TTL, 15 s, and ticks are ~90 s apart), so a read
 # longer than what a tick had left after the reads ahead of it never stored anything, try after try.
 RESUME_MAX = 300.0
+# The tick's split while a waited PR or run is due (2026-11-27, the land host: ticks spent 85 s, 44 s of them in read head,
+# which went first in the batches; TICK_BUDGET ran out before the waited PRs were read and waited PR data was 3,677 s old):
+# the waited PRs, runs and comments are read first and may take the tick up to WAITED_TICK_SHARE s, and the heads that
+# follow have at least HEADS_MIN_SHARE s, so neither kind starves the other. A head's own read stays bounded by
+# REST_HEAD_BUDGET from the tick's start.
+HEADS_MIN_SHARE = 20
+WAITED_TICK_SHARE = TICK_BUDGET - HEADS_MIN_SHARE
 REST_HEAD_BUDGET = 40  # seconds of a tick's REST phase the waited heads may take while a waited PR or run is still to read:
 # past it those heads are deferred (first next tick), so the PRs a wait is blocked on get the rest of the tick
 # (huge-blue 2026-11-21, 00:58Z to 23:xxZ: 99 due heads, a dozen waited, each ~5 requests at ~3 s, filled every tick and
@@ -10396,11 +10403,19 @@ class Daemon:
         # due: the plain floor batch, the blocked batches, the round robin's turn and the App share. It bounded only the
         # blocked batches, so the floor batch and the round robin's turn read heads for as long as the splits ran (the
         # land host, 2026-11-25, as at GQL_SPLITS). The first head query of the tick still goes (batched's UNTIL).
-        until_of = {"head": time.monotonic() + REST_HEAD_BUDGET if blocked["pr"] or blocked["run"] else None}
+        tick_start = time.monotonic()
+        waited_due = bool(blocked["pr"] or blocked["run"])
+        until_of = {"head": tick_start + REST_HEAD_BUDGET if waited_due else None}
+        if waited_due:  # the waited share: no new waited or plain batch starts past it, the heads keep their minimum
+            until_of.update({k: tick_start + WAITED_TICK_SHARE for k in ("pr", "run", "comment")})
         self.head_until = until_of["head"]  # and the looks between the batches (heads_between) keep it too
-        for kind in sorted(kinds[first:] + kinds[:first], key=lambda k: k != "head"):
+        # waited PRs, runs and comments first, the heads after (they went first and took 44 of 85 s)
+        for kind in sorted(kinds[first:] + kinds[:first], key=lambda k: k == "head"):
             if over[kind] != "graphql":
                 continue
+            if kind == "head" and waited_due:  # the heads' minimum share, whatever the waited reads took
+                until_of["head"] = max(until_of["head"], time.monotonic() + HEADS_MIN_SHARE)
+                self.head_until = until_of["head"]
             if kind == "pr" and (lead := self.starved_lead(blocked[kind])) is not None:
                 read_stale_pr(lead, over[kind])
                 blocked[kind] = [e for e in blocked[kind] if e["key"] != lead["key"]]
