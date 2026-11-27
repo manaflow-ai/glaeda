@@ -593,6 +593,12 @@ WORKFLOW_JOB_CLASSES = {# the iOS reliability matrix's phone cells: cargo builds
                         # persistent-dd: cmux18-glaeda-3") with the host's CPU idle.
                         ("pr-router.yml", "mac"): "isolated", ("pr-router.yml", "mac-fallback"): "isolated",
                         ("pr-router.yml", "ios"): "simulator-step",
+                        # `ios-fast` (the iOS fast verdict: xcodebuild build-for-testing of the changed kit and app
+                        # targets, then their tests in one booted simulator) under both its callers. As an unknown
+                        # job it was a compile (5 units, persistent-dd and a canonical root), so a busy mini turned
+                        # it away and it queued on Blacksmith: cmux#61812 waited 6 min there, then built cold.
+                        ("pr-router.yml", "ios-fast"): "simulator-step",
+                        ("ios-fast-verdict-dispatch.yml", "ios-fast"): "simulator-step",
                         # `cmux-ci test --setup kernel-free` on cmux: a checkout and a Python, git or shell command,
                         # no build in a canonical root; isolated, as hq's kernel-free fast checks are as a guest.
                         ("fast-checks.yml", "checks-mac"): "isolated",

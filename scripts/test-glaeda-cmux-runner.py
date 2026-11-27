@@ -4876,10 +4876,14 @@ class HookTest(unittest.TestCase):
                          ("simulator-step", False))
         # cmux's step table (pr-pipeline.yml) runs under its caller pr-router.yml: its Mac jobs never wait for
         # persistent-dd or a canonical root (cmux18, 2026-11-25: six runners busy 58 min on that wait).
-        for job, klass in (("mac", "isolated"), ("mac-fallback", "isolated"), ("ios", "simulator-step")):
+        for job, klass in (("mac", "isolated"), ("mac-fallback", "isolated"), ("ios", "simulator-step"),
+                           ("ios-fast", "simulator-step")):
             with self.subTest(pr_router=job):
                 self.assertEqual(hook.job_class(job, "manaflow-ai/cmux", workflow="pr-router.yml"), (klass, False))
                 self.assertNotIn("persistent-dd", hook.CLASS_COST[klass][1])
+        # The iOS fast verdict (cmux pr-pipeline.yml `ios-fast`) under its dispatch caller too.
+        self.assertEqual(hook.job_class("ios-fast", "manaflow-ai/cmux", workflow="ios-fast-verdict-dispatch.yml"),
+                         ("simulator-step", False))
         for job, env in (("ios-simulator-build", test_ios), ("mobile-core-package", test_ios),
                          ("release-compile", self.FAST_TIER), ("ios", self.FAST_TIER)):
             with self.subTest(job=job):
