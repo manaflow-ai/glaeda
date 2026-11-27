@@ -26966,7 +26966,8 @@ class LandQueue:
         with self.lock:
             self.claim(e, "retarget", before=head, base=base, form="stacked_rebase", rebased=tip)
         got = self.union_git(gitdir, "push", "--quiet", "--porcelain", f"--force-with-lease=refs/heads/{branch}:{head}",
-                             "origin", f"{tip}:refs/heads/{branch}", timeout=LAND_GH_DEADLINE)
+                             "origin", f"{tip}:refs/heads/{branch}", timeout=LAND_GH_DEADLINE,
+                             e=e)  # a claimed step: handed (call), so a re-exec goes on without waiting for it
         with self.lock:
             self.finish(e, got)
             if got.returncode != 0:
@@ -27375,7 +27376,7 @@ class LandQueue:
             got = self.call(argv, LAND_UNION_PUSH_DEADLINE, e)
         else:  # a plain push: refused by GitHub unless the branch is still at HEAD (the merge's first parent)
             got = self.union_git(gitdir, "push", "--quiet", "origin", f"{sha}:refs/heads/{branch}",
-                                 timeout=LAND_UNION_PUSH_DEADLINE)
+                                 timeout=LAND_UNION_PUSH_DEADLINE, e=e)  # handed, as the broker push above
         with self.lock:
             self.finish(e, got)
             e["preStepHead"] = head if got.returncode == 0 else ""

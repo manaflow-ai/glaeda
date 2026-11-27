@@ -43514,6 +43514,28 @@ class LandTest(Base):
         self.assertTrue(self.daemon.land_busy(), "back in this image's own code: waited for again")
         self.assertEqual(list(meta.parent.iterdir()), [], "its files go with its answer")
 
+    def test_a_claimed_git_push_is_handed_so_no_reexec_waits_for_it(self):
+        # cmux-cp-1, after glaeda#3085 (2026-11-27): swapS 545-553 s on the run holding run.lock, the controller's
+        # union_push and retarget pushes ran with no entry, so outside judge_handed and kept claimed_running true
+        gg.land_dir().mkdir(parents=True)
+        self.daemon.land_tick()
+        q = self.daemon.land_queue
+        self.assertTrue(q.handover)
+        e = {"key": "pr:o/r#9", "repo": "o/r", "number": 9, "state": "acting",
+             "action": {"kind": "update_branch", "sha": "c" * 40}, "unionMerge": {"gitdir": "/nonexistent"}}
+        handed = mock.Mock(return_value=subprocess.CompletedProcess([], 0, "", ""))
+        with mock.patch.object(q, "judge_handed", handed):
+            q.union_git("/nonexistent", "push", "--quiet", "origin", "x:refs/heads/b", timeout=5.0, e=e)
+        self.assertEqual((handed.call_count, handed.call_args.kwargs.get("step")), (1, True))
+        pushes: list[dict] = []
+        with mock.patch.object(q, "broker_client", return_value=False), \
+                mock.patch.object(q, "union_git", side_effect=lambda *a, **k: (
+                    pushes.append(k), subprocess.CompletedProcess(list(a), 0, "", ""))[1]), \
+                mock.patch.object(q, "claim"), mock.patch.object(q, "save"), mock.patch.object(q, "finish"), \
+                mock.patch.object(q, "nudge"), mock.patch.object(q, "history"), mock.patch.object(q, "wait"):
+            q.union_push(e, "a" * 40, "b" * 40, "b", "d" * 40, "behind", "")
+        self.assertIs(pushes[0].get("e"), e, "the plain push names its entry, so call hands it")
+
     def test_the_next_daemon_reads_a_handed_steps_answer_before_judging_again(self):
         gg.land_dir().mkdir(parents=True)
         self.daemon.land_tick()
