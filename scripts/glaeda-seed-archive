@@ -143,13 +143,14 @@ def remember_unreadable(keys: set[str]) -> None:
 
 
 def archived(archive: Path, unreadable: dict[str, str] | None = None,
-             aside: list[str] | None = None) -> dict[str, os.stat_result]:
+             aside: list[str] | None = None, listed: set[str] | None = None) -> dict[str, os.stat_result]:
     """KEY -> stat of every archived seed (regular files named <KEY>.tar.zst).
 
     A seed whose entry cannot be read (EIO from a bad disk image or volume) is left out and, when UNREADABLE is
     given, recorded there as KEY -> error: one bad seed must not crash the run (the daemon did, 2026-11-21).
     ASIDE, when given, gets the name of every seed quarantine() moved aside (.corrupt-*), read from the same listing.
     A seed in known_unreadable() is left out unread.
+    LISTED, when given, gets every seed KEY the listing named, read or not (names only: no entry is stat'ed for it).
     """
     found = {}
     skip = known_unreadable()
@@ -163,6 +164,8 @@ def archived(archive: Path, unreadable: dict[str, str] | None = None,
         key = entry.name[:-len(SUFFIX)]
         if aside is not None and entry.name.startswith(CORRUPT):
             aside.append(entry.name)
+        if listed is not None and entry.name.endswith(SUFFIX) and pm.KEY_RE.fullmatch(key):
+            listed.add(key)
         if entry.name.endswith(SUFFIX) and pm.KEY_RE.fullmatch(key) and key not in skip:
             try:
                 if entry.is_file(follow_symlinks=False):
@@ -380,8 +383,20 @@ def run(apply: bool, archive: Path = ARCHIVE, budget: int = BUDGET, min_free: in
         unreadable: dict[str, str] = {}
         known = known_unreadable()
         aside: list[str] = []
-        have = archived(archive, unreadable, aside)
+        listed: set[str] = set()
+        have = archived(archive, unreadable, aside, listed)
         record["quarantined_aside"] = len(aside)
+        # A known-unreadable key the archive no longer lists is gone from this disk (the archive moved to another
+        # image, or someone removed the entry), so nothing is left to re-read: drop it, and the fill fetches it again.
+        # cmux-lawrence 2026-11-27: after the archive moved from the failing X10 Pro to a copy on the T5 EVO, 20 keys
+        # the X10 copy had read EIO stayed listed though none existed on the T5, so they were never fetched again.
+        # Only a listing that worked says what is gone: a failed one ("" in unreadable) drops nothing.
+        gone = known - listed if "" not in unreadable else set()
+        if gone:
+            record["unreadable_dropped"] = sorted(gone)
+            known -= gone
+            if apply:
+                remember_unreadable(known)
         if unreadable:
             record["unreadable"] = quarantine(archive, unreadable, apply)
             for item in record["unreadable"]:

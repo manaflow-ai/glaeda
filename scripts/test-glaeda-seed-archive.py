@@ -355,6 +355,42 @@ class ArchiveTest(unittest.TestCase):
         self.assertEqual(second.get("known_unreadable"), [KEYS[0]])
         self.assertEqual(second["fetched"], [])  # never fetched over it
 
+    def test_a_known_unreadable_key_the_archive_no_longer_lists_is_dropped_and_fetched_again(self):
+        # cmux-lawrence 2026-11-27: the archive moved from the failing X10 Pro to a copy on the T5 EVO without the
+        # keys the X10 copy had read EIO, and unreadable.json kept all 20, so the fill never fetched them again.
+        # A known key the listing does not name is gone from this disk: it is dropped and fetched like any other.
+        self.keep(KEYS[0], 100)
+        self.keep(KEYS[1], 101)
+        self.run_archive()
+        (self.archive / (KEYS[0] + archive.SUFFIX)).unlink()  # the new disk never had it
+        archive.remember_unreadable({KEYS[0], KEYS[1]})  # KEYS[1] is still on this disk: stays known
+        plan = self.run_archive(apply=False)
+        self.assertEqual(plan.get("unreadable_dropped"), [KEYS[0]], plan)
+        self.assertEqual(archive.known_unreadable(), {KEYS[0], KEYS[1]})  # a plan writes nothing
+        record = self.run_archive()
+        self.assertEqual(record["state"], "applied", record)
+        self.assertEqual(record.get("unreadable_dropped"), [KEYS[0]])
+        self.assertEqual(record.get("known_unreadable"), [KEYS[1]])
+        self.assertEqual([f["key"] for f in record["fetched"]], [KEYS[0]])
+        self.assertEqual(archive.known_unreadable(), {KEYS[1]})
+
+    def test_a_failed_listing_drops_no_known_unreadable_key(self):
+        self.keep(KEYS[0], 100)
+        self.run_archive()
+        archive.remember_unreadable({KEYS[0]})
+        real_scandir = archive.os.scandir
+
+        def scandir(path):
+            raise OSError(5, "Input/output error")
+
+        archive.os.scandir = scandir
+        try:
+            record = self.run_archive()
+        finally:
+            archive.os.scandir = real_scandir
+        self.assertNotIn("unreadable_dropped", record)
+        self.assertEqual(archive.known_unreadable(), {KEYS[0]})
+
     def test_the_server_skips_known_unreadable_seeds_and_lists_the_rest(self):
         # 2026-11-27: one seed that read EIO emptied the archive's whole seed-list-v1 answer (the listing's
         # comprehension raised), and every mini's ask re-read the bad entry: 20 kernel retries each. The server
