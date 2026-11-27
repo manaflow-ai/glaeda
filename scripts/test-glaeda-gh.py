@@ -27942,7 +27942,8 @@ class LandWorld:
                                   capture_output=True, text=True, timeout=timeout,
                                   env={"PATH": os.environ.get("PATH", ""), "HOME": self.home,
                                        "GIT_CONFIG_NOSYSTEM": "1",
-                                       **{k: v for k, v in env.items() if k.startswith("GIT_AUTHOR_")}})
+                                       **{k: v for k, v in env.items()
+                                          if k.startswith("GIT_AUTHOR_") or k == "GIT_INDEX_FILE"}})
         if argv[0] == "/fake/git" and argv[3:] == ["config", "--get", "remote.origin.url"]:
             return subprocess.CompletedProcess(argv, 0 if self.origin else 1, self.origin + "\n", "")
         if argv[0] == "/fake/lane-gh" and argv[1:3] == ["call", "land_handoff"] and "outcomes" in json.loads(argv[4]):
@@ -35573,7 +35574,8 @@ class LandTest(Base):
                         'request-branch","status":"422"}')
 
     def union_origin(self, attrs: str = "goals/*.md merge=union\n", path: str = "goals/x.md",
-                     main_path: str = "", same: bool = False) -> tuple[str, str]:
+                     main_path: str = "", same: bool = False,
+                     texts: tuple[str, str, str] | None = None) -> tuple[str, str]:
         """A real origin for o/r (LAND_UNION_URL pointed at it): main and the PR's branch lane/x each appended one
         line at the end of PATH, so git's line merge conflicts there; ATTRS is main's .gitattributes. With MAIN_PATH,
         main appends to that file instead, so git merges the two cleanly. With SAME, main appends the lane's own
@@ -35593,18 +35595,24 @@ class LandTest(Base):
         git("config", "receive.denyCurrentBranch", "ignore")
         (origin / ".gitattributes").write_text(attrs)
         (origin / path).parent.mkdir(parents=True, exist_ok=True)
-        (origin / path).write_text("- 10:00Z goal set\n")
+        (origin / path).write_text(texts[0] if texts else "- 10:00Z goal set\n")
         git("add", "-A")
         git("commit", "-qm", "init")
         git("checkout", "-qb", "lane/x")
-        with open(origin / path, "a") as f:
-            f.write("- 11:00Z the lane's line\n")
+        if texts:  # TEXTS: PATH's whole text at the fork, on the lane, on main
+            (origin / path).write_text(texts[1])
+        else:
+            with open(origin / path, "a") as f:
+                f.write("- 11:00Z the lane's line\n")
         git("commit", "-qam", "the lane appends")
         head = git("rev-parse", "HEAD")
         git("checkout", "-q", "main")
         (origin / (main_path or path)).parent.mkdir(parents=True, exist_ok=True)
-        with open(origin / (main_path or path), "a") as f:
-            f.write("- 11:00Z the lane's line\n" if same else "- 11:05Z another PR's line, landed first\n")
+        if texts:
+            (origin / path).write_text(texts[2])
+        else:
+            with open(origin / (main_path or path), "a") as f:
+                f.write("- 11:00Z the lane's line\n" if same else "- 11:05Z another PR's line, landed first\n")
         git("add", "-A")
         git("commit", "-qam", "main appends")
         base = git("rev-parse", "HEAD")
@@ -35686,6 +35694,33 @@ class LandTest(Base):
         e = self.tick()
         self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, merged))
         self.assert_merged_at(merged)
+
+    def test_a_union_merge_names_each_goal_frontmatter_key_once(self):
+        """LAND_UNION_ONE_KEY, cmuxterm-hq 2026-11-27: two handoff PRs each rewrote goals/ci-min-per-pr-140.md's
+        `next_step:` line, the union merge kept both, and main read three (test_repo_records_parse red). Before: both
+        lines; after: one per key, the head's where both sides changed it, main's where only main did, notes kept."""
+        fork = '---\ngoal: g\nblocked_by: "none"\nnext_step: "start"\nowner: a/b\n---\n\n- 10:00Z goal set\n'
+        lane = fork.replace('"start"', '"the lane\'s step"') + "- 11:00Z the lane's line\n"
+        main = (fork.replace('"start"', '"main\'s step"').replace('"none"', '"main\'s blocker"')
+                + "- 11:05Z another PR's line, landed first\n")
+        head, base = self.union_origin(texts=(fork, lane, main))
+        e = self.union_conflict_tick(head)
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"), e.get("stop"))
+        merged = self.origin_git("rev-parse", "refs/heads/lane/x")
+        self.assertEqual(self.origin_git("rev-list", "--parents", "-n1", merged).split()[1:], [head, base])
+        text = self.origin_git("show", f"{merged}:goals/x.md")
+        self.assertEqual(text.splitlines()[:6], ["---", "goal: g", 'blocked_by: "main\'s blocker"',
+                                                 'next_step: "the lane\'s step"', "owner: a/b", "---"])
+        self.assertIn("- 11:00Z the lane's line", text)
+        self.assertIn("- 11:05Z another PR's line, landed first", text)
+
+    def test_land_one_line_per_key_keeps_list_lines_and_leaves_single_keys(self):
+        merged = "---\npre:\n  - a\nk: 1\npre:\n  - b\n---\nbody\n"
+        self.assertEqual(gg.land_one_line_per_key(merged, "---\npre:\n  - a\nk: 1\n---\n",
+                                                  "---\npre:\n  - a\nk: 1\n---\n", "---\npre:\n  - b\nk: 1\n---\n"),
+                         "---\npre:\n  - b\nk: 1\n---\nbody\n")
+        same = "---\nk: 1\n---\nk: 2\n"
+        self.assertEqual(gg.land_one_line_per_key(same, None, None, None), same)
 
     def test_a_pr_that_changes_no_file_is_reported_superseded_instead_of_merged(self):
         # LAND_ZERO_DIFF: teamleaderleo/glaeda#2447's 5 conflicting hunks all resolved to main's side, because main

@@ -17344,6 +17344,68 @@ LAND_READY_ONCE = "readySent"
 LAND_UNION_URL = "https://github.com/{repo}.git"
 LAND_MERGE_OWNERS = frozenset({"manaflow-ai", "teamleaderleo"})
 LAND_UNION_DEADLINE = 120.0
+# LAND_UNION_ONE_KEY: a union merge of two sides that each rewrote one frontmatter line keeps both lines. goals/*.md
+# merge by union for their dated notes (cmuxterm-hq .gitattributes), and on 2026-11-27 goals/ci-min-per-pr-140.md
+# reached cmuxterm-hq main with three `next_step:` lines, so test_now_goals.test_repo_records_parse went red (hq#32408
+# fixed the record; hq#32592 the broker's own union merge). Union is right for a record's body, never for its keys:
+# union_plan keeps one entry per frontmatter key in each path git's plain merge conflicts on, the side's that changed
+# it from the merge base, the head's when both did (it lands after the base).
+LAND_FRONT_KEY = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*:(?:\s|$)")
+
+
+def land_front_entries(text: str | None) -> tuple[list[tuple[str | None, list[str]]], int] | None:
+    """TEXT's frontmatter as (key, its lines) entries, a key's indented or list lines with it, and the index of the
+    closing --- line among TEXT's lines; None when TEXT has no frontmatter."""
+    lines = text.split("\n") if isinstance(text, str) else []
+    if not lines or lines[0].rstrip() != "---":
+        return None
+    entries: list[tuple[str | None, list[str]]] = []
+    for i, line in enumerate(lines[1:], 1):
+        if line.rstrip() == "---":
+            return entries, i
+        if LAND_FRONT_KEY.match(line):
+            entries.append((line.split(":", 1)[0], [line]))
+        elif entries:
+            entries[-1][1].append(line)
+        else:
+            entries.append((None, [line]))
+    return None
+
+
+def land_front_entry(text: str | None, key: str) -> list[str] | None:
+    """The lines of TEXT's first frontmatter entry for KEY, or None when it has none."""
+    got = land_front_entries(text)
+    return next((lines for k, lines in (got[0] if got else []) if k == key), None)
+
+
+def land_one_line_per_key(merged: str, base: str | None, head: str | None, other: str | None) -> str:
+    """MERGED (the union merge of HEAD and OTHER, forked at BASE) with each frontmatter key it names twice or more
+    named once, where its first entry was: HEAD's entry when HEAD changed it from BASE, else OTHER's, else (neither
+    side's entry is among MERGED's) the first (LAND_UNION_ONE_KEY)."""
+    got = land_front_entries(merged)
+    if not got:
+        return merged
+    entries, close = got
+    seen: dict[str, int] = {}
+    for k, _ in entries:
+        if k:
+            seen[k] = seen.get(k, 0) + 1
+    doubled = {k for k, n in seen.items() if n > 1}
+    if not doubled:
+        return merged
+    out: list[str] = []
+    done: set[str] = set()
+    for k, lines in entries:
+        if k not in doubled:
+            out.extend(lines)
+        elif k not in done:
+            done.add(k)
+            mine, was, theirs = land_front_entry(head, k), land_front_entry(base, k), land_front_entry(other, k)
+            pick = mine if mine is not None and mine != was else theirs
+            have = [ls for kk, ls in entries if kk == k]
+            out.extend(pick if pick in have else have[0])
+    return "\n".join(["---", *out, *merged.split("\n")[close:]])
+
 # A lane VM's union mirror is filled only by the broker's fetch (lane-gh fetch), which names the mirror's own tips as
 # had. A lane VM, 2026-11-26: its cmux union mirror last fetched feat-cmux-next at an Oct-20 tip (34,373
 # commits back), so every base merge's fetch asked for five weeks of history and the broker refused it in 13 s ("HTTP
@@ -26456,6 +26518,9 @@ class LandQueue:
                                 f"(git's merge of {base} {base_sha[:12]} honoring its .gitattributes)")
         if merged.returncode != 0 or not SHA40.fullmatch(tree):
             return "", "", "", f"git merge-tree failed: {land_trim(land_tail(merged.stderr or ''), 160)}"
+        tree, why = self.union_one_key(gitdir, tree, paths, head, base_sha)
+        if why:
+            return "", "", "", why
         base_tree = (self.union_git(gitdir, "rev-parse", f"{base_sha}^{{tree}}").stdout or "").strip()
         if SHA40.fullmatch(base_tree) and base_tree == tree:
             # LAND_ZERO_DIFF: the merge resolves to the base's own tree, so the merge commit (and the land after it)
@@ -26489,6 +26554,51 @@ class LandQueue:
             return "", "", "", f"git commit-tree failed: {land_trim(commit.stderr, 160)}"
         e["unionMerge"].update(paths=paths[:20], base=base_sha, baseRef=base, gitdir=gitdir)
         return sha, branch, base_sha, ""
+
+    def union_one_key(self, gitdir: str, tree: str, paths: list[str], head: str, base: str) -> tuple[str, str]:
+        """(TREE with each of PATHS naming each frontmatter key once (land_one_line_per_key), "") or ("", why not)
+        (LAND_UNION_ONE_KEY). Writes only objects into this host's union mirror, through a scratch index."""
+        fork = self.union_git(gitdir, "merge-base", head, base)
+        fork_sha = (fork.stdout or "").split()[0] if fork.returncode == 0 and (fork.stdout or "").split() else ""
+
+        def read(commit: str, path: str) -> str | None:
+            if not commit:
+                return None
+            got = self.union_git(gitdir, "cat-file", "blob", f"{commit}:{path}")
+            return got.stdout if got.returncode == 0 and isinstance(got.stdout, str) else None
+
+        fixed: dict[str, str] = {}
+        for path in paths:
+            text = read(tree, path)
+            if text is None or "\r" in text:
+                continue
+            one = land_one_line_per_key(text, read(fork_sha, path), read(head, path), read(base, path))
+            if one != text:
+                fixed[path] = one
+        if not fixed:
+            return tree, ""
+        with tempfile.TemporaryDirectory(prefix="glaeda-union-key-") as tmp:
+            index = {"GIT_INDEX_FILE": os.path.join(tmp, "index")}
+            got = self.union_git(gitdir, "read-tree", tree, extra=index)
+            if got.returncode != 0:
+                return "", f"git read-tree {tree[:12]} failed: {land_trim(got.stderr or '', 160)}"
+            for n, (path, text) in enumerate(sorted(fixed.items())):
+                blob_file = os.path.join(tmp, f"blob-{n}")
+                with open(blob_file, "w", encoding="utf-8") as f:
+                    f.write(text)
+                blob = self.union_git(gitdir, "hash-object", "-w", blob_file)
+                listed = self.union_git(gitdir, "ls-tree", tree, "--", path)
+                oid, mode = (blob.stdout or "").strip(), ((listed.stdout or "").split() or ["100644"])[0]
+                if blob.returncode != 0 or not SHA40.fullmatch(oid):
+                    return "", f"git hash-object of {path} failed: {land_trim(blob.stderr or '', 160)}"
+                got = self.union_git(gitdir, "update-index", "--cacheinfo", f"{mode},{oid},{path}", extra=index)
+                if got.returncode != 0:
+                    return "", f"git update-index of {path} failed: {land_trim(got.stderr or '', 160)}"
+            wrote = self.union_git(gitdir, "write-tree", extra=index)
+            out = (wrote.stdout or "").strip()
+            if wrote.returncode != 0 or not SHA40.fullmatch(out):
+                return "", f"git write-tree failed: {land_trim(wrote.stderr or '', 160)}"
+        return out, ""
 
     def union_merge(self, e: dict, head: str) -> None:
         """GitHub refused the update-branch at HEAD for a conflict (LAND_UNION's comment): when git merges the base
