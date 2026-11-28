@@ -18841,7 +18841,7 @@ LAND_KINDS = frozenset({"merge", "update_branch", "wait_pr", "wait_run", "wait_c
 LAND_COMMAND_COMPILE = re.compile(r"\s*cmux-ci compile-check --ref ([0-9a-f]{40}) --app --release\s*")
 LAND_COMPILE_WAIT = 600.0
 LAND_COMPILE_SENDS = 2
-LAND_COMPILE_DEADLINE = 120.0  # the client's own submit, --background
+LAND_COMPILE_DEADLINE = 120.0  # the client's submit and its wait on the verdict; a timeout waits (do_compile_check)
 # A "dispatch" step: land_judge names a workflow_dispatch of a gate workflow as the one step that posts a status
 # nothing else will: `gh workflow run cmux-next-fast-gates.yml -R REPO --ref REF -f pr=N`, alone or followed by
 # `&& glaeda-gh wait pr REPO#N ...` (leo-workspace engine.fast_gates_dispatch for a clean base merge whose
@@ -28126,6 +28126,16 @@ class LandQueue:
                 e.pop("stepTransient", None)
                 self.wait(e, {"kind": "retry", "why": f"compile check sent at {head[:12]}: judged once it has a "
                                                       "receipt"}, LAND_COMPILE_WAIT)
+            elif got.returncode == 124:
+                # Sent, unanswered: cmux-ci compile-check waits on the verdict, not only its submit, so a compile that
+                # is not cached outlives LAND_COMPILE_DEADLINE with its job queued on the fleet. cmux#64303,
+                # 2026-11-28: stopped compile_missing at 10:17Z "timed out after 120s" while its job ran; the same
+                # check passed in 251 s, and the app FFI pin sat 140 min behind (goal fix-running-ffi-pin). Its
+                # receipt is judged after the wait; the send count (LAND_COMPILE_SENDS) still bounds the resends.
+                self.history(e, "compile_unanswered", head=head[:12], n=n + 1)
+                self.wait(e, {"kind": "retry", "why": f"compile check sent at {head[:12]}, its client timed out "
+                                                      "waiting on the verdict: judged once it has a receipt"},
+                          LAND_COMPILE_WAIT)
             else:
                 self.stop(e, "compile_missing", f"the compile check at {head[:12]} could not be sent (exit "
                           f"{got.returncode}: {land_trim(got.stderr or got.stdout, 200)}): "

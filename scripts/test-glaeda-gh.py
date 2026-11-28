@@ -30172,6 +30172,38 @@ class LandTest(Base):
         self.assertEqual(len(self.compiles()), 2)
         self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "compile_missing"))
 
+    def test_a_compile_check_whose_client_times_out_waits_for_its_receipt(self):
+        # cmux#64303, 2026-11-28: the client waits on the verdict, so an uncached compile outlived the 120 s deadline
+        # (exit 124) with its job queued, and the row stopped compile_missing; the check passed in 251 s.
+        self.w.gh_rc["compile"] = 124
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(self.compile_refusal(LA))
+        e = self.tick()
+        self.assertEqual(len(self.compiles()), 1)
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "retry"))
+        self.assertIn("compile_unanswered", [h["event"] for h in e["history"]])
+        # its receipt is in by the next judge: nothing is sent again
+        self.w.gh_rc["compile"] = 0
+        for _ in range(4):
+            e = self.tick(gg.LAND_COMPILE_WAIT / 4 + 1)
+        self.assertEqual(len(self.compiles()), 1)
+        self.assertNotEqual(e["state"], "stopped")
+
+    def test_compile_checks_that_keep_timing_out_stop_after_the_send_bound(self):
+        self.w.gh_rc["compile"] = 124
+        self.pr(LA)
+        self.land()
+        for _ in range(gg.LAND_COMPILE_SENDS + 1):
+            self.w.answers.append(self.compile_refusal(LA))
+        e = self.tick()
+        for _ in range(12):
+            if e["state"] == "stopped":
+                break
+            e = self.tick(gg.LAND_COMPILE_WAIT / 4 + 1)
+        self.assertEqual(len(self.compiles()), gg.LAND_COMPILE_SENDS)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "compile_missing"))
+
     def test_a_compile_check_the_controller_will_not_take_stops_as_before(self):
         self.w.gh_rc["compile"] = 1
         self.pr(LA)
