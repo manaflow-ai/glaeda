@@ -53353,30 +53353,30 @@ class WatchFeedTest(Base):
 
     def test_a_store_that_moves_appends_versioned_events_by_kind(self) -> None:
         self.daemon.store(self.KEY, None, data=self.data(), dataAt=NOW)
-        first = gg.feed_version()
+        first = gg.change_feed_version()
         self.assertEqual(first, 3)  # first sighting: every kind, versions 1..3
         self.daemon.store(self.KEY, None, data=self.data(), dataAt=NOW)
-        self.assertEqual(gg.feed_version(), first, "an unchanged read writes nothing")
+        self.assertEqual(gg.change_feed_version(), first, "an unchanged read writes nothing")
         red = [{"name": "ws-check", "status": "COMPLETED", "conclusion": "FAILURE"}]
         self.daemon.store(self.KEY, None, data=self.data(checks=red), dataAt=NOW)
-        events, newest, gap = gg.feed_read(first, {self.KEY})
+        events, newest, gap = gg.change_feed_read(first, {self.KEY})
         self.assertEqual([e["kind"] for e in events], ["ci_status"])
         self.assertEqual(events[0]["now"]["red"], ["ws-check"])
         self.assertFalse(gap)
         self.daemon.store(self.KEY, None, data=self.data("MERGED", red, "APPROVED", merge="c" * 40), dataAt=NOW)
-        events, newest, _ = gg.feed_read(first + 1, None)
+        events, newest, _ = gg.change_feed_read(first + 1, None)
         self.assertEqual(sorted(e["kind"] for e in events), ["pr_state", "review"])
         self.assertEqual(newest, first + 3)
         merged = next(e for e in events if e["kind"] == "pr_state")
         self.assertEqual((merged["was"]["state"], merged["now"]["state"], merged["now"]["mergeCommit"]),
                          ("OPEN", "MERGED", "c" * 40))
-        self.assertIn("state 'OPEN'->'MERGED'", gg.feed_line(merged))
+        self.assertIn("state 'OPEN'->'MERGED'", gg.change_feed_line(merged))
 
     def test_an_error_only_store_writes_no_event(self) -> None:
         self.daemon.store(self.KEY, None, data=self.data(), dataAt=NOW)
-        version = gg.feed_version()
+        version = gg.change_feed_version()
         self.daemon.store(self.KEY, gg.read_cache(self.KEY), error="HTTP 502")
-        self.assertEqual(gg.feed_version(), version)
+        self.assertEqual(gg.change_feed_version(), version)
 
     def test_watch_since_answers_at_once_then_blocks_until_the_next_event(self) -> None:
         self.daemon.store(self.KEY, None, data=self.data(), dataAt=NOW)
@@ -53397,7 +53397,7 @@ class WatchFeedTest(Base):
         timer.start()
         self.addCleanup(timer.cancel)
         out = io.StringIO()
-        with mock.patch.object(gg, "FEED_POLL", 0.05), contextlib.redirect_stdout(out):
+        with mock.patch.object(gg, "CHANGE_FEED_POLL", 0.05), contextlib.redirect_stdout(out):
             self.assertEqual(gg.cmd_watch(["o/r#41"], listed["version"], 10, True), gg.EXIT_OK)
         answered = json.loads(out.getvalue())
         self.assertEqual([e["kind"] for e in answered["events"]], ["pr_state"])
@@ -53407,17 +53407,32 @@ class WatchFeedTest(Base):
     def test_watch_names_only_the_prs_asked_for(self) -> None:
         self.daemon.store(self.KEY, None, data=self.data(), dataAt=NOW)
         self.daemon.store("pr:o/r#42", None, data=self.data(), dataAt=NOW)
-        events, _, _ = gg.feed_read(0, {"pr:o/r#42"})
+        events, _, _ = gg.change_feed_read(0, {"pr:o/r#42"})
         self.assertEqual({e["key"] for e in events}, {"pr:o/r#42"})
 
     def test_a_since_older_than_the_kept_feed_says_so(self) -> None:
-        with mock.patch.object(gg, "FEED_KEEP", 2):
+        with mock.patch.object(gg, "CHANGE_FEED_KEEP", 2):
             for n in range(12):
                 self.daemon.store(self.KEY, None, data=self.data(head=f"{n:040x}"), dataAt=NOW)
-            self.assertLessEqual(len(gg.feed_path().read_text().splitlines()), 4, "trimmed past twice FEED_KEEP")
-        events, newest, gap = gg.feed_read(1, None)
+            self.assertLessEqual(len(gg.change_feed_path().read_text().splitlines()), 4, "trimmed past twice FEED_KEEP")
+        events, newest, gap = gg.change_feed_read(1, None)
         self.assertTrue(gap)
-        self.assertEqual(newest, gg.feed_version())
+        self.assertEqual(newest, gg.change_feed_version())
+
+
+class NoTopLevelNameDefinedTwiceTest(unittest.TestCase):
+    """glaeda#3193 added a second top-level `def feed_view`, about 14k lines below the first. Python kept
+    the later one, and every `glaeda-gh read` raised TypeError on main until glaeda#3196 renamed it. The
+    full suite caught it after the merge, but not CI's changed-scope run. This test is the detector for
+    that class: in a single-file tool this size, nothing else stops the next one."""
+
+    def test_each_top_level_def_and_class_is_defined_once(self) -> None:
+        import ast
+        import collections
+        tree = ast.parse(Path(gg.__file__).read_text())
+        seen = collections.Counter(node.name for node in tree.body
+                                   if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)))
+        self.assertEqual(sorted(name for name, n in seen.items() if n > 1), [])
 
 
 if __name__ == "__main__":

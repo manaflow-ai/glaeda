@@ -12655,7 +12655,7 @@ class Daemon:
                     entry["churn"] = churn
             write_json(cache, entry)
             if key.startswith("pr:") and "data" in fields:
-                feed_note(key, (base or {}).get("data"), entry.get("data"), self.now)  # glaeda-gh watch
+                change_feed_note(key, (base or {}).get("data"), entry.get("data"), self.now)  # glaeda-gh watch
         if key.startswith("pr:") and "data" in fields:
             if self.land_queue is not None:
                 if key in self.land_queue.entries and land_fingerprint(base) != land_fingerprint(entry):
@@ -19625,17 +19625,17 @@ def land_check_fingerprint(cache: dict | None) -> str:
 # (the Kubernetes resourceVersion shape): `watch --since V` answers the lines after V for the PRs named, and blocks
 # on the local file (no GitHub read) until there is one. Three kinds: pr_state (state, merge commit, head, draft, a
 # conflict), ci_status (the rollup, the red checks by name, how many are still running), review (reviewDecision).
-FEED_FILE = "events.jsonl"
-FEED_KEEP = 4000  # lines kept; past twice this the oldest are dropped (a --since older than the first kept says so)
-FEED_POLL = 1.0  # seconds between stats of the file while a watch blocks
-FEED_RENEW = 60.0  # a blocked watch renews its interest this often, so the daemon keeps reading what it watches
+CHANGE_FEED_FILE = "events.jsonl"
+CHANGE_FEED_KEEP = 4000  # lines kept; past twice this the oldest are dropped (a --since older than the first kept says so)
+CHANGE_FEED_POLL = 1.0  # seconds between stats of the file while a watch blocks
+CHANGE_FEED_RENEW = 60.0  # a blocked watch renews its interest this often, so the daemon keeps reading what it watches
 
 
-def feed_path() -> Path:
-    return BASE / FEED_FILE
+def change_feed_path() -> Path:
+    return BASE / CHANGE_FEED_FILE
 
 
-def feed_view(data: Any) -> dict:
+def change_feed_view(data: Any) -> dict:
     """What a waiter acts on in one PR entry's data, by kind; {} for no data."""
     if not isinstance(data, dict) or not data:
         return {}
@@ -19651,17 +19651,17 @@ def feed_view(data: Any) -> dict:
             "review": {"decision": data.get("reviewDecision")}}
 
 
-def feed_changes(old: Any, new: Any) -> list:
+def change_feed_changes(old: Any, new: Any) -> list:
     """(kind, was, now) for each kind whose view moved between two entries' data; nothing when NEW has no data."""
-    was, now = feed_view(old), feed_view(new)
+    was, now = change_feed_view(old), change_feed_view(new)
     if not now:
         return []
     return [(kind, was.get(kind) or {}, view) for kind, view in now.items() if was.get(kind) != view]
 
 
-def feed_version(path: Path | None = None) -> int:
+def change_feed_version(path: Path | None = None) -> int:
     """The newest version written (0 for none): the last line's v."""
-    path = path or feed_path()
+    path = path or change_feed_path()
     try:
         with path.open("rb") as handle:
             handle.seek(0, os.SEEK_END)
@@ -19680,19 +19680,19 @@ def feed_version(path: Path | None = None) -> int:
     return 0
 
 
-def feed_note(key: str, old: Any, new: Any, at: float) -> int:
+def change_feed_note(key: str, old: Any, new: Any, at: float) -> int:
     """Append one line per moved kind for KEY's store; the version of the last line written, else 0. Never raises:
     the feed is a view of the store, and a full disk under it must not fail the store."""
-    changes = feed_changes(old, new)
+    changes = change_feed_changes(old, new)
     if not changes:
         return 0
-    path = feed_path()
+    path = change_feed_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with bounded_lock(path.with_name(FEED_FILE + ".lock")) as held:
+        with bounded_lock(path.with_name(CHANGE_FEED_FILE + ".lock")) as held:
             if not held:
                 return 0
-            v = feed_version(path)
+            v = change_feed_version(path)
             lines = []
             for kind, was, now in changes:
                 v += 1
@@ -19700,18 +19700,18 @@ def feed_note(key: str, old: Any, new: Any, at: float) -> int:
                                         sort_keys=True))
             with path.open("a") as handle:
                 handle.write("\n".join(lines) + "\n")
-            if path.stat().st_size > FEED_KEEP * 2 * 300:
+            if path.stat().st_size > CHANGE_FEED_KEEP * 2 * 300:
                 kept = path.read_text().splitlines()
-                if len(kept) > FEED_KEEP * 2:
-                    stable_replace(path, ("\n".join(kept[-FEED_KEEP:]) + "\n").encode())
+                if len(kept) > CHANGE_FEED_KEEP * 2:
+                    stable_replace(path, ("\n".join(kept[-CHANGE_FEED_KEEP:]) + "\n").encode())
             return v
     except OSError:
         return 0
 
 
-def feed_read(since: int, keys: set | None, path: Path | None = None) -> tuple:
+def change_feed_read(since: int, keys: set | None, path: Path | None = None) -> tuple:
     """(events after SINCE for KEYS (all when None), the newest version, whether SINCE predates the kept lines)."""
-    path = path or feed_path()
+    path = path or change_feed_path()
     try:
         text = path.read_text()
     except OSError:
@@ -19732,7 +19732,7 @@ def feed_read(since: int, keys: set | None, path: Path | None = None) -> tuple:
     return out, newest, first is not None and since > 0 and since + 1 < first
 
 
-def feed_line(doc: dict) -> str:
+def change_feed_line(doc: dict) -> str:
     was = doc.get("was") or {}
     moved = [f"{k} {was.get(k)!r}->{v!r}" for k, v in sorted((doc.get("now") or {}).items()) if was.get(k) != v]
     return f"v={doc['v']} {doc['key']} {doc['kind']}: " + ", ".join(moved)
@@ -19746,8 +19746,8 @@ def cmd_watch(targets: list, since: int | None, timeout: float, as_json: bool) -
     for key in sorted(keys or ()):
         register(key)
     if since is None:
-        version = feed_version()
-        views = {key: feed_view((read_cache(key) or {}).get("data")) for key in sorted(keys or ())}
+        version = change_feed_version()
+        views = {key: change_feed_view((read_cache(key) or {}).get("data")) for key in sorted(keys or ())}
         if as_json:
             print(json.dumps({"version": version, "prs": views}, sort_keys=True))
         else:
@@ -19759,13 +19759,13 @@ def cmd_watch(targets: list, since: int | None, timeout: float, as_json: bool) -
     stamp: Any = ()
     while True:
         try:
-            st = feed_path().stat()
+            st = change_feed_path().stat()
             seen = (st.st_ino, st.st_size, st.st_mtime_ns)
         except OSError:
             seen = None
         if seen != stamp:
             stamp = seen
-            events, _newest, gap = feed_read(since, keys)
+            events, _newest, gap = change_feed_read(since, keys)
             if events or gap:
                 version = max([since] + [e["v"] for e in events])
                 if as_json:
@@ -19774,7 +19774,7 @@ def cmd_watch(targets: list, since: int | None, timeout: float, as_json: bool) -
                     if gap:
                         print(f"glaeda-gh: --since {since} is older than the kept feed: list again with no --since")
                     for doc in events:
-                        print(feed_line(doc))
+                        print(change_feed_line(doc))
                     print(f"version {version}")
                 return EXIT_OK
         left = timeout - (time.monotonic() - began)
@@ -19784,11 +19784,11 @@ def cmd_watch(targets: list, since: int | None, timeout: float, as_json: bool) -
             else:
                 print(f"no change in {timeout:g} s; version {since}")
             return EXIT_TIMEOUT
-        if time.monotonic() - renewed >= FEED_RENEW:
+        if time.monotonic() - renewed >= CHANGE_FEED_RENEW:
             for key in sorted(keys or ()):
                 register(key)
             renewed = time.monotonic()
-        time.sleep(min(FEED_POLL, left))
+        time.sleep(min(CHANGE_FEED_POLL, left))
 
 
 def land_wait_shape(cache: dict | None, head: str) -> tuple[str, int]:
@@ -46358,7 +46358,7 @@ def parser() -> argparse.ArgumentParser:
     wa.add_argument("targets", nargs="*", metavar="TARGET", help="PRs (OWNER/REPO#N, a URL, a bare N); none: all")
     wa.add_argument("--since", type=int, default=None, metavar="V",
                     help="the events after version V (block until one); omitted: the current version and views")
-    wa.add_argument("--timeout", type=seconds, default=1800.0, help="with --since: give up after S with no event")
+    wa.add_argument("--timeout", "--wait", dest="timeout", type=seconds, default=1800.0, help="with --since: give up after S with no event")
     wa.add_argument("--json", action="store_true")
     r = sub.add_parser("restart", help="restart a down or hung daemon once, however many sessions ask at the same time")
     r.add_argument("--force", action="store_true", help="restart even if it looks healthy or was just restarted")
