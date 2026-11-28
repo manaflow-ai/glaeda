@@ -31297,6 +31297,52 @@ class LandTest(Base):
                 self.assertEqual(self.w.gh_calls("run", "rerun"), [])
                 self.assertEqual((e["state"], (e.get("stop") or {}).get("code")), ("stopped", "own_red"))
 
+    # manaflow-ai/cmux#65070 (2026-11-28, runs 46169461335 and 46175191011): an advisory job's red that printed only
+    # GitHub's API rate-limit ref, read "infra, not a verdict", stopped own_red ("the refusal names no unexcused job")
+    # three times. It takes the same one rerun as a setup refusal.
+    INFRA = ("land-judge: refused: base_red_excuse.py exit 1 at {head}: not excused: infra, not a verdict: "
+             "'Native/OptChat/optchat-chief' is infra, not a verdict (job 141072176076: its failed steps printed only "
+             "GitHub's API rate-limit ref); it is never this PR's own red and needs a re-run, like a cancelled job")
+
+    def test_an_infra_red_is_rerun_once_with_no_path_rule_then_merged(self):
+        self.w.files = ["Native/OptChat/optchat-chief/src/hub.rs"]
+        self.pr_red(True)
+        self.land()
+        self.w.answers.append(self.sigterm(self.INFRA))
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("run", "rerun"), [["run", "rerun", str(self.RUN), "--failed", "-R", "o/r"]])
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "pr"), e.get("history"))
+        self.assertIn("infra, not a verdict", json.dumps(e["history"]))
+        self.pr_red(False)
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.assert_merged_at(LA)
+
+    def test_an_infra_red_again_after_its_rerun_stops_own_red(self):
+        self.pr_red(True)
+        self.land()
+        self.w.answers.append(self.sigterm(self.INFRA))
+        self.tick()
+        self.pr_red(True, running=True)
+        self.tick()
+        self.pr_red(True)
+        self.w.answers.append(self.sigterm(self.INFRA))
+        e = self.tick()
+        self.assertEqual(len(self.w.gh_calls("run", "rerun")), 1)
+        self.assertEqual((e["state"], (e.get("stop") or {}).get("code")), ("stopped", "own_red"), e.get("history"))
+        self.assertIn("already rerun once", json.dumps(e["history"]))
+
+    def test_a_deadline_infra_with_no_job_name_is_no_rerun(self):
+        text = ("land-judge: refused: base_red_excuse.py exit 1 at {head}: not excused: infra, not a verdict: "
+                "ran past its 600 s deadline")
+        self.w.files = ["Native/OptChat/optchat-chief/src/hub.rs"]
+        self.pr_red(True)
+        self.land()
+        self.w.answers.append(self.sigterm(text))
+        e = self.tick()
+        self.assertEqual(self.w.gh_calls("run", "rerun"), [])
+        self.assertEqual((e["state"], (e.get("stop") or {}).get("code")), ("stopped", "own_red"))
+
     def test_a_refused_rerun_stops_own_red_and_is_never_sent_again(self):
         self.unrelated_world(["webviews/src/a.ts"])
         self.w.gh_rc["rerun"] = 1

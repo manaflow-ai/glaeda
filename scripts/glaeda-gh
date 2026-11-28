@@ -18757,7 +18757,7 @@ LAND_UNRELATED_REDS: dict[str, dict[str, dict[str, list[str]]]] = {
         },
     },
 }
-LAND_OWN_RED_JOB = re.compile(r"\bnot excused: '([^'\n]{1,200})'")
+LAND_OWN_RED_JOB = re.compile(r"\bnot excused: (?:infra, not a verdict: )?'([^'\n]{1,200})'")
 # What `gh run rerun --failed` reruns: every failed conclusion GitHub's "re-run failed jobs" takes (#2132 review F1: a
 # job that never started, STARTUP_FAILURE, is one)
 LAND_RED_CONCLUSIONS = frozenset({"FAILURE", "TIMED_OUT", "CANCELLED", "STARTUP_FAILURE"})
@@ -18770,6 +18770,13 @@ LAND_SETUP_REFUSED = "was refused at setup by its runner"
 # touch; land stopped it own_red. It takes the setup refusal's one rerun per (head, run); a test that hangs until a
 # SIGTERM ends it is red again on that rerun and stops own_red then.
 LAND_SIGTERM_RED = ": the test process crashed (signal 15)"  # right after the unexcused job's name
+# base_red_excuse.py's Infra words for a red that is no verdict on the code ("not excused: infra, not a verdict: 'NAME'
+# is infra, not a verdict (job N: its failed steps printed only GitHub's API rate-limit ref); it is never this PR's own
+# red and needs a re-run"). manaflow-ai/cmux#65070 (2026-11-28, runs 46169461335 and 46175191011): its advisory
+# 'mark-stale' job hit GitHub's API rate limit three times and the queue stopped it own_red each time ("the refusal
+# names no unexcused job"); an agent reran the job by hand and re-landed. It takes the setup refusal's one rerun per
+# (head, run); an infra red again on that rerun stops own_red as before.
+LAND_INFRA_RED = " is infra, not a verdict"  # right after the unexcused job's quoted name
 LAND_UNRELATED_KEEP = 20  # (head, run) reruns an entry remembers
 
 
@@ -27468,9 +27475,11 @@ class LandQueue:
         head_ok = bool(SHA40.fullmatch(head)) and str(data.get("headRefOid") or "").lower() == head
         flow, run, why = land_own_red(answer, act, checks, head_ok)
         said = f"{answer.get('reason') or ''} {act.get('why') or ''}"
+        first = LAND_OWN_RED_JOB.search(said)
+        rest = said[first.end():] if first else ""
         stopped = "refused at setup by its runner" if LAND_SETUP_REFUSED in said else (
-            "stopped by SIGTERM with no failing test" if (first := LAND_OWN_RED_JOB.search(said))
-            and said[first.end():].startswith(LAND_SIGTERM_RED) else "")
+            "stopped by SIGTERM with no failing test" if rest.startswith(LAND_SIGTERM_RED) else
+            "infra, not a verdict (base_red_excuse.py: it needs a re-run)" if rest.startswith(LAND_INFRA_RED) else "")
         setup = bool(run) and bool(stopped)
         rule = land_unrelated_rule(repo, flow, self.config()) if run and not setup else None
         if run and rule is None and not setup:
