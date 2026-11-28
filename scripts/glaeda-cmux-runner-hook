@@ -3327,6 +3327,17 @@ GATE_INELIGIBLE_ENV = "GLAEDA_RUNNER_GATE_INELIGIBLE"
 # finds the node eligible; that look also removes the note. A refusal that names a probe timeout is no evidence (a
 # busy mini) and writes no note: the gate's own recheck decides those.
 ELIGIBILITY_REFUSED_FILE = "eligibility-refused.json"
+# INELIGIBLE_STOPS_NOW: an eligibility hold ("ineligible: ...") stops the listener as its job ends and at a new
+# listener's first poll, with no POST_JOB_POLL / first_poll wait. That wait keeps a poll that may carry the next job,
+# so the stop does not lose it (hq#12960); on an ineligible node the job it keeps is one job-started refuses at once,
+# and the wait is where more of them come from. cmux31, 2026-11-28: the gate held at 01:21:28Z yet logged "keeping
+# the listener through its first poll after its job (60 s): ineligible: ..." six times through 01:45Z, and the
+# 01:38:58Z poll took synthetic-probes' notify-banner-click, which job-started refused (42 refusals in all). A job a
+# stop cancels in flight fails "not acquired" as it would have failed refused; one not yet handed goes elsewhere.
+# RECEIPT_CHANGE_LOOKS: the class receipt (class-acceptance/<class>.json) and enrollment pin the toolchain the node
+# must have. Their mtimes are read every poll; a change starts an eligibility look at once, and that first look after
+# it holds on its own refusal, with no recheck: a new pin is a real cause, not a flaky probe. cmux31's m5pro-24 receipt
+# pinning rustc 1.100.0 landed at 2026-11-27 23:38Z; the gate's first hold came 1 h 43 min later.
 # Across a reload: "clean" when this gate started its listener with listener_env, else why its env is stale.
 GATE_LISTENER_ENV = "GLAEDA_RUNNER_GATE_LISTENER_ENV"
 GATE_RESERVE_FD_ENV = "GLAEDA_RUNNER_GATE_RESERVE_FD"  # a reload hands its reserve flock's fd to the new gate
@@ -12380,6 +12391,9 @@ class Gate:
         self.refused_why: str | None = None
         self.refused_stamp = 0
         self.refused_seen_at = 0.0
+        # RECEIPT_CHANGE_LOOKS: the receipt and enrollment mtimes last seen, and when they last changed (monotonic)
+        self.receipt_seen: tuple[int, int] | None = None
+        self.receipt_changed_at: float | None = None
         self.missing_why: str | None = None  # the last toolchain_missing answer, read every poll
         self.eligible_at = -GATE_ELIGIBLE_EVERY_S
         self.eligible_look: threading.Thread | None = None
@@ -13738,6 +13752,14 @@ class Gate:
                      "next job, until a fresh look finds the node eligible (INELIGIBLE_AT_ONCE)")
             if not running:
                 self.eligible_at = -GATE_ELIGIBLE_EVERY_S  # the look that may release it starts now
+        stamp = receipt_stamp(scope[0])  # RECEIPT_CHANGE_LOOKS
+        if stamp != self.receipt_seen:
+            if self.receipt_seen is not None:
+                gate_log("the class receipt or enrollment changed; looking at eligibility now (RECEIPT_CHANGE_LOOKS)")
+                self.receipt_changed_at = now
+                if not running:
+                    self.eligible_at = -GATE_ELIGIBLE_EVERY_S
+            self.receipt_seen = stamp
         if not running and now - self.eligible_at >= GATE_ELIGIBLE_EVERY_S:
             self.eligible_at = started = now
             self.eligible_gen += 1
@@ -13762,10 +13784,16 @@ class Gate:
                         self.refused_why = None
                     elif why is None:  # a look that began before the refusal says nothing about it: look again
                         self.eligible_at = time.monotonic() - GATE_ELIGIBLE_EVERY_S + GATE_ELIGIBLE_RECHECK_S
+                changed = self.receipt_changed_at
+                if changed is not None and started < changed:  # began before the change: look again at once
+                    self.eligible_at = time.monotonic() - GATE_ELIGIBLE_EVERY_S
+                    changed = None
+                elif changed is not None:
+                    self.receipt_changed_at = None  # this is the first look after the change
                 if why and TOOLCHAIN_MISSING in why:
                     return  # the per-poll toolchain_missing owns that answer; the held one, if any, stands
-                if why and self.refused_why is not None:
-                    self.eligible_new = None  # job-started already refused: no recheck needed to hold
+                if why and (self.refused_why is not None or (changed is not None and "timed out" not in why)):
+                    self.eligible_new = None  # job-started already refused, or a new pin: no recheck needed
                     if why != self.eligible_why:
                         gate_log(f"eligibility: {why}; held off so another runner takes the job")
                     self.eligible_why = why
@@ -14256,6 +14284,8 @@ class Gate:
         first poll after the job, POST_JOB_POLL) may already carry a job, so a hold waits (keeping its streak)
         instead of stopping it. The poll after a job counts only once the listener's diag shows it went Online
         (listener_went_online): before that it has no poll open, and stop() freezes it for the last look."""
+        if eligibility_hold(why):
+            return False  # INELIGIBLE_STOPS_NOW: the job that poll may carry would be refused anyway
         now = time.monotonic()
         started = self.listening_since is not None and now - self.listening_since < GATE_FIRST_POLL_S
         after_job = (not started and self.job_done_at is not None and now - self.job_done_at < GATE_FIRST_POLL_S
@@ -14485,7 +14515,7 @@ class Gate:
                 ending = self.job_end() if self.job_ending else None
                 if (why := self.draining() or self.low_disk() or self.suite_first() or self.still_waiting() or self.still_reserved()
                         or self.exclusive_yield() or self.fleet_build_yield() or ending):
-                    if not listener_went_online(self.runner_dir):
+                    if not listener_went_online(self.runner_dir) or eligibility_hold(ending):  # INELIGIBLE_STOPS_NOW
                         self.unclaim()
                         self.stop(why, finished)
                         return None
@@ -14554,7 +14584,8 @@ class Gate:
                 # listener not frozen at its Worker's exit has usually opened its Online message poll by now, which
                 # may already carry the next job (POST_JOB_POLL, hq#12960): then the hold below waits that poll out
                 # (first_poll, from job_end's job_done_at) instead of cancelling it now
-                if (ending := self.job_end()) and not listener_went_online(self.runner_dir):
+                if (ending := self.job_end()) and (not listener_went_online(self.runner_dir)
+                                                   or eligibility_hold(ending)):  # INELIGIBLE_STOPS_NOW
                     self.unclaim()
                     self.stop(ending)
                     return None
@@ -14764,6 +14795,23 @@ def note_eligibility_refusal(state_dir: Path, why: str) -> None:
         tmp = state_dir / f".{ELIGIBILITY_REFUSED_FILE}.{os.getpid()}"
         tmp.write_text(json.dumps({"why": why, "at": time.time()}) + "\n")
         os.replace(tmp, state_dir / ELIGIBILITY_REFUSED_FILE)
+
+
+def eligibility_hold(why: str | None) -> bool:
+    """INELIGIBLE_STOPS_NOW: WHY is the gate's eligibility hold (Gate.ineligible's "ineligible: ..." answer)."""
+    return bool(why) and why.startswith("ineligible: ")
+
+
+def receipt_stamp(fleet_class: str) -> tuple[int, int]:
+    """RECEIPT_CHANGE_LOOKS: the mtimes (ns, 0 when absent) of this node's class receipt and enrollment. Two stats."""
+    config, _ = node_paths(Path.home())
+    stamps = []
+    for path in (config / "class-acceptance" / f"{fleet_class}.json", config / "enrollment.json"):
+        try:
+            stamps.append(path.stat().st_mtime_ns)
+        except OSError:
+            stamps.append(0)
+    return stamps[0], stamps[1]
 
 
 def eligibility_refused(state_dir: Path) -> tuple[str, int] | None:

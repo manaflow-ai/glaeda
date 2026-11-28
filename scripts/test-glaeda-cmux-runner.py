@@ -11949,6 +11949,30 @@ class GateTest(unittest.TestCase):
                 gate.step()
                 self.assertEqual(stops[:1], ["held"], "once that poll has had time to deliver, the hold stops it")
 
+    def test_an_ineligible_node_stops_the_listener_without_the_post_job_poll(self) -> None:
+        # INELIGIBLE_STOPS_NOW: cmux31, 2026-11-28: the gate held for a missing pinned rustc at 01:21:28Z but kept
+        # the listener through its post-job poll ("keeping the listener through its first poll after its job (60 s):
+        # ineligible: ..."), and the 01:38:58Z poll took notify-banner-click, which job-started refused.
+        why = "ineligible: node not eligible (rust toolchain 1.100.0-aarch64-apple-darwin is not installed)"
+        self.post_job_diag("Online")
+        gate, stops = self.gate([why] * 8, busy=[True, True])
+        gate.worker_pids = lambda: ()
+        gate.listening_since = time.monotonic() - 3600.0
+        gate.step()
+        gate.step()  # the job runs
+        for _ in range(3):
+            gate.step()  # the job has ended; the hold is confirmed
+        self.assertEqual(stops[:1], ["held"], "an ineligible node's next job would be refused: no poll is kept")
+        gate, stops = self.gate([why] * 4)
+        with mock.patch.object(hook.subprocess, "Popen", return_value=gate.child):
+            gate.start()
+        for _ in range(3):
+            gate.step()
+        self.assertEqual(stops, ["held"], "nor a new listener's first poll")
+        self.assertTrue(hook.eligibility_hold(why))
+        self.assertFalse(hook.eligibility_hold("all 5 capacity units on this mini are taken"))
+        self.assertFalse(hook.eligibility_hold(None))
+
     def test_a_job_end_marker_seen_after_the_worker_exited_keeps_the_listeners_poll(self) -> None:
         # hq#12960: job-completed installs a staged hook, so the gate re-executes 2 to 8 s before its job's Worker
         # exits (13:27:36 on a std mini; the job ended 13:27:38). The new gate first saw the job-end marker with the
@@ -12889,6 +12913,60 @@ class GateTest(unittest.TestCase):
             settle()
             self.assertIsNone(gate.claimed(), "a look after the refusal finds it eligible: listening again")
         self.assertIsNone(hook.eligibility_refused(self.state), "and the note is gone")
+
+    def test_a_class_receipt_change_looks_at_once_and_holds_on_its_first_refusal(self) -> None:
+        # RECEIPT_CHANGE_LOOKS: cmux31's m5pro-24 receipt pinning rustc 1.100.0 landed 2026-11-27 23:38Z and the
+        # gate's first hold came 01:21:28Z. A receipt change now starts a look at once, and its refusal holds.
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("exec /usr/bin/python3 /hook job-started --allowed-owner manaflow-ai --require-eligible "
+                          "--fleet-class m5pro-24 --toolchain-xcode /Applications/Xcode_26.6.app --instance 1\n")
+        config = self.tmp / "xdg" / "glaeda" / "cmux-fleet"
+        (config / "class-acceptance").mkdir(parents=True)
+        receipt = config / "class-acceptance" / "m5pro-24.json"
+        receipt.write_text("{}")
+        env = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": os.fspath(self.tmp / "xdg")})
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop(hook.NODE_VIEW_ENV, None)
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        for name in ("saturated", "hot"):
+            patch = mock.patch.object(gate, name, return_value=None)
+            patch.start()
+            self.addCleanup(patch.stop)
+        patch = mock.patch.object(hook, "toolchain_missing", return_value=None)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+        def settle() -> None:
+            if gate.eligible_look is not None:
+                gate.eligible_look.join(120)
+
+        with mock.patch.object(hook, "eligibility_refusal", return_value=None):
+            gate.claimed()
+            settle()
+            self.assertIsNone(gate.claimed(), "eligible under the old receipt")
+        why = "node not eligible (rust toolchain 1.100.0-aarch64-apple-darwin is not installed)"
+        os.utime(receipt, ns=(receipt.stat().st_atime_ns, receipt.stat().st_mtime_ns + 10**9))
+        with mock.patch.object(hook, "eligibility_refusal", return_value=why) as look:
+            gate.claimed()
+            settle()
+            self.assertEqual(look.call_count, 1, "the change starts a look at once, not GATE_ELIGIBLE_EVERY_S later")
+            self.assertEqual(gate.claimed(), f"ineligible: {why}", "its first refusal holds: no recheck")
+        gate.eligible_at -= hook.GATE_ELIGIBLE_EVERY_S
+        with mock.patch.object(hook, "eligibility_refusal", return_value=None):
+            gate.claimed()
+            settle()
+            self.assertIsNone(gate.claimed(), "installed: listening again")
+        os.utime(receipt, ns=(receipt.stat().st_atime_ns, receipt.stat().st_mtime_ns + 10**9))
+        busy = "node not eligible (the toolchain probes timed out after 20 s; no answer)"
+        with mock.patch.object(hook, "eligibility_refusal", return_value=busy):
+            gate.claimed()
+            settle()
+            # a timed-out probe after a change is no evidence: no hold, the recheck decides (with no listener up,
+            # FIRST_LOOK_FIRST waits for that recheck before starting one)
+            self.assertIsNone(gate.eligible_why, "a timed-out probe after a change is no evidence: the recheck decides")
+            self.assertEqual(gate.claimed(), f"ineligible: {busy} (rechecking before the listener starts)")
 
     def test_a_require_eligible_runner_holds_while_its_node_would_be_refused(self) -> None:
         script = self.runner / hook.RUNNER_HOOK_SCRIPT
