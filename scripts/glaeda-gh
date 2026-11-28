@@ -13629,6 +13629,7 @@ class Daemon:
                 page = (((doc or {}).get("data") or {}).get("repository") or {}).get("object") or {}
                 page = page.get("checkSuites") if isinstance(page, dict) else None
                 if error or doc.get("errors") or not isinstance(page, dict) or not isinstance(page.get("nodes"), list):
+                    self.page_suites_rest(repo_key, oid, suites)  # GraphQL stopped or refused: REST pages carry the same
                     return
                 nodes += page["nodes"]
                 info = page.get("pageInfo") or {}
@@ -13639,6 +13640,29 @@ class Daemon:
                 cursor = info.get("endCursor")
         finally:
             self.gql_reason = reason
+
+    def page_suites_rest(self, repo_key: str, oid: str, suites: dict) -> None:
+        """page_more_suites over REST, for when GraphQL is stopped (rate limited) or refuses a page: GET
+        commits/SHA/check-suites pages carry each suite's node id and its latest run count, the two fields the
+        last-real-attempt read uses. Replaces SUITES' nodes only with every suite read (as many as total_count says);
+        any error or short count leaves the head partial, never greener."""
+        if not (repo_key and oid):
+            return
+        nodes: list[dict] = []
+        total = None
+        for page in range(1, SUITES_MORE_PAGES + 2):
+            state, doc, _ = self.get(f"/repos/{repo_key}/commits/{oid}/check-suites?per_page=100&page={page}", None)
+            listed = doc.get("check_suites") if state != "error" and isinstance(doc, dict) else None
+            if not isinstance(listed, list) or not all(isinstance(c, dict) and c.get("node_id") for c in listed):
+                return
+            total = doc.get("total_count")
+            nodes += [{"id": c["node_id"], "latest": {"totalCount": c.get("latest_check_runs_count")}} for c in listed]
+            if not isinstance(total, int) or len(nodes) >= total or not listed:
+                break
+        if isinstance(total, int) and len(nodes) == total and all(
+                isinstance((n["latest"] or {}).get("totalCount"), int) for n in nodes):
+            suites["nodes"] = nodes
+            suites["pageInfo"] = {"hasNextPage": False, "endCursor": None}
 
     def suite_runs(self, suites: list[str], paced: bool = True,
                    route: "list[str] | None" = None) -> tuple[dict[str, list[dict] | str], str | None]:

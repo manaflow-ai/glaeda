@@ -52372,6 +52372,28 @@ class SuitesPastOnePagePaged(unittest.TestCase):
 
     def test_a_page_that_cannot_be_read_leaves_the_head_partial(self):
         d, commit = self.daemon([{"data": None, "errors": [{"message": "boom"}]}]), self.commit()
+        d.get = lambda path, etag: ("error", "HTTP 403", None)
+        d.page_more_suites("o/r", commit)
+        self.assertEqual(gg.ran_nothing_suites(commit), gg.SUITES_PAST_ONE_PAGE)
+
+    def test_rest_pages_complete_the_head_when_graphql_refuses(self):
+        d, commit = self.daemon([{"data": None, "errors": [{"message": "rate limited"}]}]), self.commit()
+        got = []
+
+        def get(path, etag):
+            got.append(path)
+            n = 100 if path.endswith("page=1") else 30
+            return "fresh", {"total_count": 130, "check_suites": [
+                {"node_id": f"R{len(got)}_{i}", "latest_check_runs_count": 1} for i in range(n)]}, None
+        d.get = get
+        d.page_more_suites("o/r", commit)
+        self.assertEqual(len(got), 2)
+        self.assertEqual(len(commit["checkSuites"]["nodes"]), 130)
+        self.assertEqual(gg.ran_nothing_suites(commit), [])
+
+    def test_a_short_rest_read_leaves_the_head_partial(self):
+        d, commit = self.daemon([{"data": None, "errors": [{"message": "x"}]}]), self.commit()
+        d.get = lambda path, etag: ("error", "HTTP 403", None)
         d.page_more_suites("o/r", commit)
         self.assertEqual(gg.ran_nothing_suites(commit), gg.SUITES_PAST_ONE_PAGE)
 
