@@ -37802,6 +37802,77 @@ class LandTest(Base):
         e = self.tick()
         self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, merged))
 
+    def test_a_conflict_only_in_rebuilt_files_waits_for_the_catch_up_and_follows_it(self):
+        """manaflow-ai/cmux#63286, #63680, #64485, #64459, 2026-11-28: conflicts only in SDK manifests and generated
+        bindings (merge=cmux-generated-v1) stopped as a person's conflict while the base's generated catch-up pushed
+        the base merge and regenerated files. Such a conflict now waits for that push (LAND_REBUILT_WAIT), pushes
+        nothing itself, and lands the catch-up's head."""
+        head, base = self.union_origin(attrs="goals/*.md merge=cmux-generated-v1\n")
+        e = self.judge_conflict_tick(head)
+        self.assertEqual((e["state"], e["wait"]["kind"], e["wait"]["before"]), ("waiting", "head_change", head),
+                         e.get("stop"))
+        self.assertEqual(self.origin_git("rev-parse", "refs/heads/lane/x"), head)  # nothing pushed here
+        self.assertEqual([h["event"] for h in e["history"] if h["event"] in ("rebuilt_wait", "union_merge_skipped")],
+                         ["rebuilt_wait"])
+        e = self.tick(gg.LAND_HEAD_TIMEOUT + 1)  # past the plain head wait: still waiting for the catch-up
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"), e.get("stop"))
+        # the catch-up's base merge, the rebuilt files taken as the base's
+        caught = self.origin_git("commit-tree", f"{base}^{{tree}}", "-p", head, "-p", base, "-m", "catch-up")
+        self.origin_git("update-ref", "refs/heads/lane/x", caught)
+        self.w.set_pr(self.KEY, {**land_pr(caught, parent=head), "headRefName": "lane/x", "baseRefName": "main"},
+                      self.t)
+        self.w.answers.append(ok_answer(caught))
+        self.w.api[f"repos/o/r/commits/{caught}"] = json.dumps([head, base])  # the parents its read gives
+        fork = self.origin_git("merge-base", head, base)
+        # the rebuilt file's diff differs from the pin's (the catch-up regenerated it): still only a base merge
+        self.w.api[f"repos/o/r/compare/main...{caught}"] = json.dumps(
+            {"mb": base, "files": [{"f": "goals/x.md", "s": "modified", "p": None, "d": "@@ -1,2 +1,3 @@\n+new"}]})
+        self.w.api[f"repos/o/r/compare/{base}...{head}"] = json.dumps(
+            {"mb": fork, "files": [{"f": "goals/x.md", "s": "modified", "p": None, "d": "@@ -1,1 +1,2 @@\n+old"}]})
+        e = self.tick()
+        self.assertIn("repin_base_merge", [h["event"] for h in e["history"]])
+        self.assertEqual((e["state"], e.get("stop"), e["pinSha"]), ("merged", None, caught))
+
+    def test_a_catch_up_head_that_also_changes_a_file_the_base_does_not_rebuild_stops_head_moved(self):
+        """The pin follows the catch-up only where the diff differs in rebuilt files alone: a push that changes any
+        other file in the same merge is more than a base merge, as before."""
+        head, base = self.union_origin(attrs="goals/*.md merge=cmux-generated-v1\n")
+        e = self.judge_conflict_tick(head)
+        self.assertEqual(e["state"], "waiting", e.get("stop"))
+        caught = self.origin_git("commit-tree", f"{base}^{{tree}}", "-p", head, "-p", base, "-m", "catch-up")
+        self.w.set_pr(self.KEY, {**land_pr(caught, parent=head), "headRefName": "lane/x", "baseRefName": "main"},
+                      self.t)
+        self.w.api[f"repos/o/r/commits/{caught}"] = json.dumps([head, base])
+        same = {"f": "goals/x.md", "s": "modified", "p": None, "d": "@@ -1,1 +1,2 @@\n+old"}
+        self.w.api[f"repos/o/r/compare/main...{caught}"] = json.dumps(
+            {"mb": base, "files": [same, {"f": "src/a.py", "s": "added", "p": None, "d": "@@ -0,0 +1 @@\n+x"}]})
+        self.w.api[f"repos/o/r/compare/{base}...{head}"] = json.dumps({"mb": base, "files": [same]})
+        self.w.answers.append(ok_answer(caught))
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "head_moved"), e.get("wait"))
+        self.assertIn("src/a.py", e["stop"]["reason"])
+
+    def test_a_rebuilt_files_conflict_with_no_catch_up_push_stops_naming_it(self):
+        head, _ = self.union_origin(attrs="goals/*.md merge=cmux-generated-v1\n")
+        e = self.judge_conflict_tick(head)
+        self.assertEqual(e["state"], "waiting", e.get("stop"))
+        self.w.answers.append(refusal("conflicts_base", head, {"kind": "stop", "stop": "conflict",
+                                                               "why": self.JUDGE_CONFLICT_NEXT},
+                                      nxt=self.JUDGE_CONFLICT_NEXT))
+        e = self.tick(gg.LAND_REBUILT_WAIT + 1)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "conflict"), e.get("wait"))
+        self.assertIn("only in files the base rebuilds (cmux-generated-v1", e["stop"]["reason"])
+        self.assertIn("no new head came in 60 min", e["stop"]["reason"])
+        self.assertEqual(self.origin_git("rev-parse", "refs/heads/lane/x"), head)
+
+    def test_a_conflict_mixing_rebuilt_and_other_files_still_stops(self):
+        """Any conflicted path the base does not rebuild is a person's conflict: the stop is as before."""
+        head, _ = self.union_origin(attrs="goals/*.md merge=cmux-generated-v1\n", path="docs/x.md")
+        e = self.judge_conflict_tick(head)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "conflict"), e.get("wait"))
+        self.assertIn("a true conflict in 1 file(s): docs/x.md", e["stop"]["reason"])
+        self.assertNotIn("rebuilt_wait", [h["event"] for h in e["history"]])
+
     def test_a_judge_conflict_whose_cached_row_has_no_ref_names_reads_them_and_merges(self):
         """leo-workspace#10997, #10659, #11038, #11192, 2026-11-25: conflicts_base, and the base merge was skipped as
         "the PR's branch '' or base '' is not read or not a plain branch name": the cached row held no ref names. The

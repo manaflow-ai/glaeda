@@ -18270,6 +18270,20 @@ LAND_READY_ONCE = "readySent"
 # cmuxterm-hq findings and reading PRs that only appended a line to docs/findings/CLAIMED.md stopped again and again
 # (2026-11-23, hq#20862 and hq#20882 three times each; cmuxterm-hq
 # docs/findings/2026-11-23-land-merge-conflict-skips-union.md). Its stop names the merge step, as before.
+# A true conflict only in files the base's .gitattributes marks as rebuilt by the base itself (a merge driver named in
+# LAND_REBUILT_DRIVERS) is not a person's conflict: the base's own catch-up merges the base into the PR and regenerates
+# those files, which this queue's merge-tree cannot (no custom merge driver, no generator). Such a conflict waits up to
+# LAND_REBUILT_WAIT for that push and follows it (base_merge_check takes the new head); only a mix with any other
+# path, or the catch-up not pushing in time, stops as before. manaflow-ai/cmux 2026-11-28: 4 of the 11 true-conflict
+# stops on one host were only SDK manifests and generated bindings (cmux-tui/bindings/cpp/.cmux-sdk-manifest.json,
+# models.hpp, protocol.cpp, go raw/.cmux-sdk-manifest.json, generated_types.go): #63286, #63680, #64485, #64459, each
+# hand-merged or re-landed, while cmux-next-generated-catch-up.yml pushed the same fix (12b543cf to #64459).
+# Detector: test-glaeda-gh.py test_a_conflict_only_in_rebuilt_files_waits_for_the_catch_up_and_follows_it.
+LAND_REBUILT_DRIVERS = {
+    "cmux-generated-v1": "the base's generated catch-up (cmux-next-generated-catch-up.yml) merges the base and "
+                         "rebuilds these files",
+}
+LAND_REBUILT_WAIT = 3600.0  # one 30-min coalesce window of the catch-up, its 20-min job, and slack
 LAND_UNION_URL = "https://github.com/{repo}.git"
 LAND_MERGE_OWNERS = frozenset({"manaflow-ai", "teamleaderleo"})
 LAND_UNION_DEADLINE = 120.0
@@ -26005,7 +26019,13 @@ class LandQueue:
                 break
             docs.append(doc)
         if not why:
-            why = land_base_merge_why(pin, head, parent, base, docs[1], docs[0])
+            with self.lock:
+                tried = dict(e.get("unionMerge") or {})
+            rebuilt = None
+            if tried.get("rebuilt") and tried.get("head") == pin and tried.get("gitdir") and tried.get("base"):
+                def rebuilt(names: list[str]) -> bool:  # LAND_REBUILT_DRIVERS: the catch-up regenerated only these
+                    return bool(self.rebuilt_by_base(str(tried["gitdir"]), str(tried["base"]), names))
+            why = land_base_merge_why(pin, head, parent, base, docs[1], docs[0], rebuilt)
         if isinstance(parents, list) and land_parents_have(pin, parents):
             ancestor = False  # a commit made on the pin is not one of its ancestors: no compare
         # Not only a base merge: before it stops head_moved, whether HEAD is an older commit of the pin, a stale copy
@@ -27910,7 +27930,14 @@ class LandQueue:
         with self.lock:
             tried = e.get("unionMerge") or {}
             if tried.get("head") == head and tried.get("tried"):
-                return False
+                if not tried.get("rebuilt") or kind != "base":
+                    return False
+                # LAND_REBUILT_DRIVERS' comment: waited for the base's catch-up at HEAD and it did not push in time
+                self.conflict_stop(e, kind, head, said, (
+                    f"the conflict is only in files the base rebuilds ({land_trim(str(tried['rebuilt']), 160)}), "
+                    f"but no new head came in {LAND_REBUILT_WAIT / 60:.0f} min: run that catch-up for this PR, or "
+                    f"merge the base and regenerate"), tried)
+                return True
             e["unionMerge"] = {"head": head, "at": self.now, "kind": kind, "out": land_trim(said, 200),
                                "next": land_trim(nxt)}
             self.history(e, "base_merge_try", kind=kind, head=head[:12])
@@ -28072,6 +28099,9 @@ class LandQueue:
             e["unionMerge"].update(conflicts=files[:20])
             if SHA40.fullmatch(tree):
                 e["unionMerge"]["hunks"] = self.conflict_hunks(gitdir, tree, files)
+            rebuilt = self.rebuilt_by_base(gitdir, base_sha, files)
+            if rebuilt:
+                e["unionMerge"].update(rebuilt=rebuilt, base=base_sha, baseRef=base, gitdir=gitdir)
             return "", "", "", (f"a true conflict in {len(files)} file(s): {land_trim(', '.join(files), 200)} "
                                 f"(git's merge of {base} {base_sha[:12]} honoring its .gitattributes)")
         if merged.returncode != 0 or not SHA40.fullmatch(tree):
@@ -28158,6 +28188,23 @@ class LandQueue:
                 return "", f"git write-tree failed: {land_trim(wrote.stderr or '', 160)}"
         return out, ""
 
+    def rebuilt_by_base(self, gitdir: str, base_sha: str, files: list[str]) -> str:
+        """LAND_REBUILT_DRIVERS' comment: what rebuilds FILES when every one of them carries, in BASE_SHA's
+        .gitattributes, the same merge driver named there; "" when any file carries another (or none), or the read
+        fails."""
+        if not files:
+            return ""
+        got = self.union_git(gitdir, "check-attr", "-z", "merge", "--", *files, attrs=base_sha)
+        if got.returncode != 0:
+            return ""
+        words = (got.stdout or "").split("\0")  # -z: path NUL attribute NUL value NUL, per path
+        drivers = {words[i + 2] for i in range(0, len(words) - 2, 3)}
+        seen = {words[i] for i in range(0, len(words) - 2, 3)}
+        if len(drivers) != 1 or seen != set(files):
+            return ""
+        driver = next(iter(drivers))
+        return f"{driver}: {LAND_REBUILT_DRIVERS[driver]}" if driver in LAND_REBUILT_DRIVERS else ""
+
     def union_merge(self, e: dict, head: str) -> None:
         """GitHub refused the update-branch at HEAD for a conflict (LAND_UNION's comment): when git merges the base
         into HEAD cleanly, push the local merge to the PR's branch as the update-branch's own result, a fast-forward on
@@ -28190,6 +28237,12 @@ class LandQueue:
                     e.pop("unionMerge", None)  # an infra failure decided nothing: a re-land at this head tries again
                     self.history(e, "union_merge_skipped", head=head[:12], why=land_trim(why, 200), transient=True)
                     self.union_merge_backoff(e, kind, head, said, why)
+                    return
+                if tried.get("rebuilt") and kind == "base":
+                    # LAND_REBUILT_DRIVERS' comment: the base's own catch-up resolves this; wait for its push
+                    self.history(e, "rebuilt_wait", head=head[:12], why=land_trim(str(tried["rebuilt"]), 200),
+                                 files=len(tried.get("conflicts") or []))
+                    self.wait(e, {"kind": "head_change", "before": head, "since": self.now}, LAND_REBUILT_WAIT)
                     return
                 self.history(e, "union_merge_skipped", head=head[:12], why=land_trim(why, 200))
                 self.conflict_stop(e, kind, head, said, why, tried)
@@ -30653,9 +30706,12 @@ def land_diff_lines(patch: str) -> tuple[str, ...]:
     return tuple(line for line in str(patch or "").split("\n") if line[:1] in ("+", "-"))
 
 
-def land_base_merge_why(pin: str, head: str, parent: str, base: str, was: dict, now: dict) -> str:
+def land_base_merge_why(pin: str, head: str, parent: str, base: str, was: dict, now: dict,
+                        rebuilt: Callable[[list[str]], bool] | None = None) -> str:
     """"" when HEAD is only a base merge on PIN (LAND_BASE_MERGE_JQ's comment), else why not, for head_moved's stop.
-    NOW is the compare BASE...HEAD and WAS the compare PARENT...PIN, each as LAND_BASE_MERGE_JQ shapes it."""
+    NOW is the compare BASE...HEAD and WAS the compare PARENT...PIN, each as LAND_BASE_MERGE_JQ shapes it. REBUILT,
+    given the files whose diffs differ, says whether the base rebuilds every one of them (LAND_REBUILT_DRIVERS'
+    comment: the catch-up's regenerated files differ from the pin's by design)."""
     mb = str((now or {}).get("mb") or "").lower()
     if mb != parent:
         return (f"its second parent {parent[:12]} is not where it meets {base} (merge base {mb[:12] or 'unread'}): "
@@ -30678,7 +30734,10 @@ def land_base_merge_why(pin: str, head: str, parent: str, base: str, was: dict, 
             side[str(f.get("f") or "")] = (str(f.get("s") or ""), str(f.get("p") or ""), lines)
         sides.append(side)
     if sides[0] != sides[1]:
-        name = sorted(n for n in set(sides[0]) | set(sides[1]) if sides[0].get(n) != sides[1].get(n))[0]
+        names = sorted(n for n in set(sides[0]) | set(sides[1]) if sides[0].get(n) != sides[1].get(n))
+        if rebuilt is not None and rebuilt(names):
+            return ""
+        name = names[0]
         return (f"its diff against {base} differs from the pin {pin[:12]}'s in {name}: more than a base merge "
                 f"({parent[:12]})")
     return ""
