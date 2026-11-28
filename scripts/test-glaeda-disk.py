@@ -104,6 +104,11 @@ _sweep_cargo_targets = gd.sweep_cargo_targets
 gd.sweep_cargo_targets = (lambda receipt, roots=None, *args, **kw:
                           {"targets": 0, "units": 0, "bytes": 0, "kept": {}, "by_target": {}, "stopped": ""}
                           if roots is None else _sweep_cargo_targets(receipt, roots, *args, **kw))
+# Nor measure or cap the shared Cargo targets of the host running the suite: only a test's own roots.
+_enforce_cargo_target_cap = gd.enforce_cargo_target_cap
+gd.enforce_cargo_target_cap = (lambda receipt, roots=None, *args, **kw:
+                               {"roots": {}, "bytes": 0, "units": 0}
+                               if roots is None else _enforce_cargo_target_cap(receipt, roots, *args, **kw))
 # Nor repack the shared mirrors of the host running the suite: only a test's own home's.
 _compact_shared_mirrors = gd.compact_shared_mirrors
 gd.compact_shared_mirrors = (lambda receipt, home=None, halt=None:
@@ -17407,6 +17412,49 @@ class CargoStaleArtifactsTest(unittest.TestCase):
             gd.sweep_cargo_targets(self.receipt, [cache], stale_hours=gd.POLICY_DEFAULTS["pressure_cargo_stale_hours"])
         self.assertFalse(old.exists(), "a pressure pass trims what sat unused past its shorter window")
         self.assertTrue(new.exists(), "the newest unit of the crate stem stays")
+
+    def fixture_in(self, cache: Path) -> dict[str, Path]:
+        rel = cache / "cmux/debug"
+        for d in ("deps", "incremental"):
+            (rel / d).mkdir(parents=True)
+        (rel / ".cargo-lock").write_text("")
+        old, new = rel / "incremental/acpmux-0fjl8gce3js7d", rel / "incremental/acpmux-24cir4ig20wvn"
+        for unit, hours in ((old, 2), (new, 0.001)):  # 2 h: inside cargo_stale_hours, past the cap's 1 h step
+            unit.mkdir()
+            (unit / "query-cache.bin").write_bytes(b"x" * 8192)
+            when = time.time() - hours * 3600
+            os.utime(unit / "query-cache.bin", (when, when))
+            os.utime(unit, (when, when))
+        return {"old": old, "new": new}
+
+    def test_cap_trims_a_root_over_its_size_oldest_first_and_stops_under_90_percent(self) -> None:
+        cache = self.root / "cache/cargo-target"
+        f = self.fixture_in(cache)
+        sizes = iter([100 * gd.GIB])  # measured once; later bytes come from what the sweeps removed
+        with contextlib.redirect_stdout(io.StringIO()):
+            res = gd.enforce_cargo_target_cap(self.receipt, [cache], cap_gib=50, size=lambda p: next(sizes))
+        (root, rec), = res["roots"].items()
+        self.assertEqual(root, os.fspath(cache))
+        self.assertEqual(rec["before"], 100 * gd.GIB)
+        self.assertGreater(res["units"], 0, "units older than the shortest window go")
+        self.assertFalse(f["old"].exists())
+        self.assertTrue(f["new"].exists(), "the newest unit of a crate stem stays whatever the cap says")
+        self.assertIn(gd.CARGO_CAP_FAMILY, self.receipt.read_text())
+
+    def test_cap_leaves_a_root_under_it_and_report_mode_removes_nothing(self) -> None:
+        cache = self.root / "cache/cargo-target"
+        f = self.fixture_in(cache)
+        under = gd.enforce_cargo_target_cap(self.receipt, [cache], cap_gib=50, size=lambda p: 10 * gd.GIB)
+        self.assertEqual((under["roots"], under["units"]), ({}, 0))
+        over = gd.enforce_cargo_target_cap(self.receipt, [cache], cap_gib=50, apply=False,
+                                           size=lambda p: 99 * gd.GIB)
+        self.assertEqual(over["units"], 0)
+        self.assertTrue(f["old"].exists())
+        self.assertEqual(gd.enforce_cargo_target_cap(self.receipt, [cache], cap_gib=0, size=lambda p: 10**15)["roots"], {})
+
+    def test_cap_default_names_the_shared_target(self) -> None:
+        self.assertIn("~/.cache/cargo-target", gd.POLICY_DEFAULTS["cargo_cap_roots"])
+        self.assertGreater(gd.POLICY_DEFAULTS["cargo_cap_gib"], 0)
 
     def test_policy_roots_reach_lane_worktrees(self) -> None:
         self.assertIn("~/.wt/checkouts", gd.POLICY_DEFAULTS["cargo_stale_roots"])

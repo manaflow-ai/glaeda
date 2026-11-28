@@ -2700,6 +2700,11 @@ POLICY_DEFAULTS: dict[str, Any] = {
     # a pressure pass (under the floor) trims units unused this long instead: least recently used first by age, the
     # newest unit of every crate stem and anything open still stay. 0: the pressure pass uses cargo_stale_hours too
     "pressure_cargo_stale_hours": 1.0,
+    # a size cap on the shared Cargo targets (enforce_cargo_target_cap): a root in cargo_cap_roots over cargo_cap_gib
+    # is trimmed, oldest units first, until it is under 90% of the cap. gcp-agent-lane-21 (2026-11-27) grew
+    # ~/.cache/cargo-target by 117 GB a day with every unit inside the 6 h window. 0 or [] turns it off.
+    "cargo_cap_roots": ["~/.cache/cargo-target"],
+    "cargo_cap_gib": 48.0,
     # The fleet controller's base URL (http://host:port, over the tailnet). Set, shared-mirror-compact asks its
     # POST /v1/seeds/release before a fold deletes a mirror's packs and folds only on "ok" (seed_release_veto).
     # "" (the default): no call; the seed heartbeat that fills the controller's holder index is not built yet, so
@@ -5403,6 +5408,54 @@ def sweep_cargo_targets(receipt: Path, roots: list[Path] | None = None, apply: b
         with contextlib.suppress(OSError), receipt.open("a") as f:  # a lost receipt line must not stop the pass
             f.write(json.dumps(rec) + "\n")
     return out
+
+
+CARGO_CAP_FAMILY = "cargo-target-cap"
+CARGO_CAP_TARGET_SHARE = 0.9
+CARGO_CAP_STEP_HOURS = (3.0, 1.0, 0.25, 1 / 60)  # least recently used first: ever shorter unused windows
+
+
+def enforce_cargo_target_cap(receipt: Path, roots: list[Path] | None = None, cap_gib: float | None = None,
+                             apply: bool = True, halt=None, size=None) -> dict[str, Any]:
+    """The growth bound the 6 h cargo-stale pass cannot give: a shared Cargo target root (cargo_cap_roots) whose
+    bytes exceed CAP_GIB (cargo_cap_gib) is trimmed with sweep_cargo_targets over ever shorter unused windows
+    (CARGO_CAP_STEP_HOURS: oldest units first) until it is under CARGO_CAP_TARGET_SHARE of the cap. The same
+    protections hold: the newest unit of each crate stem, anything a process has open, a profile a build locks.
+    With APPLY false it only measures. Returns {roots: {path: {before, after, over}}, bytes, units}."""
+    cap_gib = float(POLICY.get("cargo_cap_gib") or 0) if cap_gib is None else cap_gib
+    out: dict[str, Any] = {"roots": {}, "bytes": 0, "units": 0}
+    if cap_gib <= 0:
+        return out
+    roots = capture_dedupe_roots(list(POLICY.get("cargo_cap_roots") or []), None) if roots is None else roots
+    size = du_bytes if size is None else size
+    cap, goal = int(cap_gib * GIB), int(cap_gib * GIB * CARGO_CAP_TARGET_SHARE)
+    for root in roots:
+        used = size(root)
+        if used is None or used <= cap:
+            continue
+        rec = out["roots"][os.fspath(root)] = {"before": used, "after": used, "over": used - cap}
+        if not apply:
+            continue
+        for hours in CARGO_CAP_STEP_HOURS:
+            res = sweep_cargo_targets(receipt, [root], halt=halt, stale_hours=hours)
+            used = max(0, used - res["bytes"])
+            out["bytes"] += res["bytes"]
+            out["units"] += res["units"]
+            rec["after"] = used
+            if used <= goal or res["stopped"]:
+                break
+    if apply and out["roots"]:
+        line = {"at": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "host": platform.node(), "family": CARGO_CAP_FAMILY,
+                "outcome": "reclaimed" if out["bytes"] else "none", "bytes": out["bytes"], "items": out["units"],
+                "cap_gib": cap_gib, "roots": out["roots"]}
+        with contextlib.suppress(OSError), receipt.open("a") as f:
+            f.write(json.dumps(line) + "\n")
+    return out
+
+
+def cargo_cap_text(res: dict[str, Any], applied: bool) -> str:
+    return "; ".join(f"  {'trimmed' if applied else 'over its cap'} {r['before'] / GIB:.1f}G -> {r['after'] / GIB:.1f}G  "
+                     f"{p} ({CARGO_CAP_FAMILY})" for p, r in res["roots"].items())
 
 
 def cargo_stale_text(res: dict[str, Any], applied: bool) -> str:
@@ -19342,6 +19395,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
             RUN["cargo_stale_gib"] = round(cargo_stale_freed / GIB, 1)
             if cargo_stale["units"] or cargo_stale["stopped"]:
                 print(cargo_stale_text(cargo_stale, applied=True))
+            cargo_cap = enforce_cargo_target_cap(a.receipt, halt=halt)
+            cargo_stale_freed += cargo_cap["bytes"]
+            if cargo_cap["roots"]:
+                print(cargo_cap_text(cargo_cap, applied=True))
         logical_released = (stale_marker_released + cas_budget_freed + cargo_stale_freed
                             + apply_pass([i for i in items if id(i) not in last]))
         # A drained runner is explicitly held by cmux_mini_fix; once its listener and worker
