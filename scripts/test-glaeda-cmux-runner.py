@@ -797,7 +797,7 @@ class HookTest(unittest.TestCase):
                 "trusted_next_signing": True, "workflow_ref": workflow_ref,
                 "job": "build-sign-notarize-nightly", "run_attempt": "1"}
         signing = [job for workflow, job in hook.SIGNING_JOBS if workflow == "nightly.yml"]
-        self.assertEqual(len(signing), 20)
+        self.assertEqual(len(signing), 21)
         # ONE_JOB_NIGHTLY (cmux#42267): the one job that builds, signs and publishes is one of them
         self.assertIn("nightly-next-one", signing)
         # LIVE_CODE_VARIANT: the variant's signer is a nightly.yml job too; its secret-free build is not
@@ -3775,6 +3775,29 @@ class HookTest(unittest.TestCase):
                           {"event": {"ref": ref, "repository": repo, "pull_request": {}}}):
             with self.subTest(overrides=overrides):
                 self.assertIn("untrusted:", hook.trusted_refusal(**{**args, **overrides}))
+
+    def test_every_cmux_signing_job_is_admitted(self) -> None:
+        """cmux's own list of the jobs glaeda gives the whole mini (scripts/ci/signing_runner.py SIGNING_JOBS, by job
+        id) is a subset of SIGNING_JOBS. Both repos claimed the same list "word for word" with nothing comparing
+        them; nightly-next-pkg sat in cmux's and not here, so every Finish dispatch was refused (cmux run
+        46100308507). The fixture is cmux's list at a commit; a new cmux signing job updates it here too."""
+        fixture = json.loads((ROOT / "tests" / "fixtures" / "cmux-signing-jobs.json").read_text())
+        missing = [(workflow, job) for workflow, jobs in fixture["jobs"].items() for job in jobs
+                   if (workflow, job) not in hook.SIGNING_JOBS]
+        self.assertEqual(missing, [], "cmux signing jobs glaeda would refuse; add them to SIGNING_JOBS")
+        ref = "refs/heads/nightly-next"
+        dispatch = {"ref": ref, "repository": {**CMUX, "default_branch": "main"}, "inputs": {},
+                    "workflow": ".github/workflows/nightly.yml"}
+        for job in fixture["jobs"]["nightly.yml"]:
+            with self.subTest(job=job):
+                self.assertIsNone(hook.trusted_refusal(
+                    "workflow_dispatch", ref, "manaflow-ai/cmux", dispatch, "refs/heads/main", "manaflow-ai/cmux",
+                    trusted_next_signing=True, job=job, run_attempt="1",
+                    workflow_ref=f"manaflow-ai/cmux/.github/workflows/nightly.yml@{ref}"))
+
+    def test_nightly_next_pkg_holds_the_whole_mini_before_credentials(self) -> None:
+        """The Finish run's pkg job signs with the release-next keychain and must drain the whole Mac."""
+        self._assert_nightly_job_holds_the_whole_mini("nightly-next-pkg")
 
     def test_nightly_next_deltas_holds_the_whole_mini_before_credentials(self) -> None:
         """The post-feed delta job signs with the nightly key and must drain the whole Mac."""

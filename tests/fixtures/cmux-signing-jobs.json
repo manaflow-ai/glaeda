@@ -1,0 +1,11 @@
+{
+  "$comment": "cmux scripts/ci/signing_runner.py SIGNING_JOBS by job id (cmux-next-dev-daily.yml's 'Sign cmux NEXT DEV' is job sign), read at manaflow-ai/cmux nightly-next 4ef8b54a0e28 on 2026-11-28. scripts/test-glaeda-cmux-runner.py test_every_cmux_signing_job_is_admitted requires each in the hook's SIGNING_JOBS; a new cmux signing job is added to both.",
+  "source": "manaflow-ai/cmux@4ef8b54a0e28:scripts/ci/signing_runner.py",
+  "jobs": {
+    "nightly.yml": ["build-sign-notarize-nightly", "recover-nightly-next-notarization", "generate-nightly-deltas",
+                    "publish-nightly", "keep-published-dsyms", "republish-nightly-deltas", "nightly-next-one",
+                    "nightly-next-pkg", "sign-live-code-variant", "nightly-next-deltas"],
+    "release.yml": ["build-sign-notarize"],
+    "cmux-next-dev-daily.yml": ["sign"]
+  }
+}

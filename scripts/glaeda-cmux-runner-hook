@@ -557,6 +557,12 @@ SIGNING_JOBS = (("nightly.yml", "promote-nightly-next"), ("nightly.yml", "build-
                 # like the rest, so the trust rule (only nightly.yml at refs/heads/nightly-next reaches the
                 # signer) is unchanged; it adds no secret and no entitlement. continue-on-error in the workflow.
                 ("nightly.yml", "sign-live-code-variant"),
+                # NIGHTLY_NEXT_PKG (cmux nightly.yml nightly-next-pkg; cmux scripts/ci/signing_runner.py lists it):
+                # "Finish a published nightly-next build" packages, signs and notarizes the published app's .pkg
+                # on glaeda-trusted-next-signing with the release-next keychain. Missing here, every Finish dispatch
+                # was refused ("NEXT nightly needs its exact nightly.yml signing job push or dispatch"; cmux run
+                # 46100308507, 2026-11-28, and each one since 2026-11-25). CMUX_SIGNING_JOBS below is the guard.
+                ("nightly.yml", "nightly-next-pkg"),
                 # AUTO_RESUME (below trusted_refusal): the classic continuation's key-holding jobs that do
                 # work. Its three jobs that only wait on Apple's notary queue are not here: they are light
                 # (AUTO_RESUME_POLL_JOBS), because an exclusive class has no bound on how long a job runs and
