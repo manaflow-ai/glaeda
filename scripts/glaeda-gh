@@ -12049,7 +12049,12 @@ class Daemon:
             line = said.replace("\n  ", " ").replace("\nnext: ", "; next: ").replace("\n", " ") + "\n"
             path = d / f"{rid}.out.state"
             if not path.is_file() or path.read_text() != line:
-                path.write_text(line)
+                # Whole or not at all: the blocker reads this file while the daemon writes it, and a truncate-then-
+                # write let a read land on the empty file between the two (glaeda#3185's shard 2, 2026-11-28: a bare
+                # third "still waiting" line, WaitStateNotMovingTest). A rename is atomic on one filesystem.
+                part = path.with_name(path.name + f".{os.getpid()}.part")
+                part.write_text(line)
+                os.replace(part, path)
         except Exception:  # noqa: BLE001  a progress line never stops a wait from being ruled on
             pass
 
@@ -17724,6 +17729,59 @@ LAND_REARM_CODES = re.compile(r"^(?:retry_deadline|review_cannot_start|own_red|r
                               r"|[a-z_]+_transient)$")
 LAND_REARM_AFTER = 3600.0
 LAND_REARM_CAP = 3
+# LAND_STUCK_MERGE: a stop no wait, rerun or re-judgment at its own head can clear takes one pinned base merge (the
+# queue's own update_branch, named) and goes on at the new head, instead of sitting stopped until a person base-merges
+# it. A re-arm re-judges the same head, and the same head reads the same: a look the fleet lost or never dispatched
+# (cmux/ui-proof pending forever), a verdict job cancelled at every rerun, a red base verdict the base has since fixed.
+# Only a new head gets a new merge commit, new runs and a new look. A lane cannot make that head itself: wt-push holds a
+# push that is only a base merge, and `update-branch --needs-newer-base` refuses a PR that is not next to land
+# (gcp-agent-lane-4/rfd-0083-0089-0125-build, 2026-11-28: manaflow-ai/cmux#54128 stopped rerun_failed_cap, its ios fast
+# verdict cancelled 3 times at c0064150; cmux#54011 stopped checks_stuck, its ui-proof look never dispatched at
+# f9bdfc03, its linux red a base typecheck already fixed on the base by cmux#63496; both landed only on a base merge by
+# hand). The stops it takes:
+#   - checks_stuck (no check moved in LAND_WAIT_STUCK), rerun_failed_cap and rerun_failed_deadline (a cancelled verdict);
+#   - own_red and red_not_excused whose reason says the red is the base's or the look was lost (LAND_STUCK_MERGE_RED):
+#     "its red base verdict's log does not map ... onto its steps", a status that "tested" another sha, "UI proof not
+#     read". A red the PR's own diff made never names these, so it stays stopped as before.
+# Bounds: once per head, at most LAND_STUCK_MERGE_CAP per land, only for a stop younger than LAND_STUCK_MERGE_MAX_AGE,
+# at most LAND_STUCK_MERGE_HOURLY a host per hour, never for an override row (its pin is the override's). The merge gate is
+# unchanged: the new head is judged in full by land_judge. The requester still hears the stop, as an fyi that says the
+# base merge follows. Undo: GLAEDA_LAND_STUCK_MERGE=0 in the daemon's environment. Detectors: test-glaeda-gh.py
+# LandTest.test_a_cancelled_verdict_at_the_rerun_cap_takes_one_base_merge_and_lands_at_the_new_head,
+# test_a_checks_stuck_stop_takes_one_base_merge_and_lands_at_the_new_head,
+# test_a_stuck_base_merge_is_once_per_head_and_capped_per_land, test_an_own_red_of_the_prs_own_never_takes_a_stuck_merge.
+LAND_STUCK_MERGE_CODES = frozenset({"checks_stuck", "rerun_failed_cap", "rerun_failed_deadline"})
+LAND_STUCK_MERGE_RED_CODES = frozenset({"own_red", "red_not_excused"})
+LAND_STUCK_MERGE_RED = re.compile(r"red base verdict|which tested [0-9a-f]{7,40}, not [0-9a-f]{7,40}|UI proof not read")
+LAND_STUCK_MERGE_CAP = 2
+LAND_STUCK_MERGE_MAX_AGE = 72 * 3600.0
+LAND_STUCK_MERGE_HOURLY = 12
+
+
+def land_stuck_merge() -> bool:
+    return os.environ.get("GLAEDA_LAND_STUCK_MERGE", "1").strip() != "0"
+
+
+def land_stuck_merge_why(e: dict, st: Any, now: float) -> str:
+    """Why E's stop ST takes one pinned base merge (LAND_STUCK_MERGE's comment), or "" when it does not."""
+    if not land_stuck_merge() or not isinstance(st, dict) or e.get("override"):
+        return ""
+    code, reason = str(st.get("code") or ""), str(st.get("reason") or "")
+    head = str(st.get("head") or "").lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", head):
+        return ""
+    if code in LAND_STUCK_MERGE_CODES:
+        why = code
+    elif code in LAND_STUCK_MERGE_RED_CODES and (found := LAND_STUCK_MERGE_RED.search(reason)):
+        why = f"{code} ({found.group(0)})"
+    else:
+        return ""
+    if now - float(st.get("at") or 0) > LAND_STUCK_MERGE_MAX_AGE:
+        return ""
+    done = e.get("stuckMerge") or {}
+    if str(done.get("head") or "") == head or int(done.get("n") or 0) >= LAND_STUCK_MERGE_CAP:
+        return ""
+    return why
 # LAND_OWNER_REMIND: re-judging a stopped row and reaching its owner again are the same switch (rearm), so a code
 # correctly left out of LAND_REARM_CODES loses its follow-up along with its re-judging: its requester is told once, at
 # the stop, and then nothing ever asks again. A conflict with the base (the row's `conflict`, land_judge's
@@ -20786,6 +20844,8 @@ class LandQueue:
                     with self.lock:
                         if self.stopped_over(e):  # LAND_STOPPED_OVER: its PR is over, the row ended
                             pass
+                        elif self.stuck_merge_requeue(e):  # LAND_STUCK_MERGE: a base merge from the next pass
+                            pass
                         elif not self.rearm(e):  # judged from the next pass
                             self.remind(e)  # a stop that never re-arms still reaches its owner
                 if key in self.entries and key not in self.jobs and self.unlabel_owed(self.entries[key]):
@@ -22885,6 +22945,38 @@ class LandQueue:
         else:
             threading.Thread(target=go, name="land-checkout-refresh", daemon=True).start()
 
+    def stuck_merge_requeue(self, e: dict) -> bool:
+        """Under the lock. Queue a stopped E again for one pinned base merge at its stopped head (LAND_STUCK_MERGE's
+        comment); judge_and_take sends it. False when its stop does not take one, or this host's hour is spent."""
+        st = e.get("stop") or {}
+        why = land_stuck_merge_why(e, st, self.now)
+        if not why:
+            return False
+        c = self.cache_of(e["key"]) or {}
+        data = c.get("data") or {}
+        if str(data.get("state") or "").upper() in ("MERGED", "CLOSED"):
+            return False  # over: stopped_over and rearm end the row
+        sent = [t for t in getattr(self, "stuck_merge_sent", []) if self.now - t < 3600.0]
+        self.stuck_merge_sent = sent
+        if len(sent) >= LAND_STUCK_MERGE_HOURLY:
+            return False  # the next pass past the hour takes it
+        sent.append(self.now)
+        head = str(st.get("head") or "").lower()
+        n = int((e.get("stuckMerge") or {}).get("n") or 0)
+        e["stuckMerge"] = {"head": head, "n": n, "due": True, "code": str(st.get("code") or ""), "why": why,
+                           "at": self.now}
+        e.update(state="queued", stop=None, wait=None, wakeAt=None, action=None, streak=None, lastStop=st,
+                 dueAt=self.now, gen=int(e.get("gen") or 0) + 1)
+        read_at = c.get("dataAt")
+        if not isinstance(read_at, (int, float)) or isinstance(read_at, bool) or read_at < float(st.get("at") or 0):
+            e["stateFirst"] = "queued for a base merge on a copy read before its stop"
+        self.history(e, "stuck_merge_queued", code=e["stuckMerge"]["code"], head=head[:12], why=why, n=n + 1)
+        log({"event": "land-stuck-merge-queued", "key": e["key"], "code": e["stuckMerge"]["code"], "head": head,
+             "why": why, "n": n + 1})
+        self.count("stuck_merge_queued")
+        self.save(e)
+        return True
+
     def rearm(self, e: dict) -> bool:
         """Queue a stopped E again when its stop can clear by itself (LAND_REARM_CODES' comment). Under the lock."""
         st = e.get("stop") or {}
@@ -24277,10 +24369,10 @@ class LandQueue:
                 self.history(e, "stuck_carry", head=head[:12])
             return
         if e["state"] == "queued":
-            if running:
+            if running and not (e.get("stuckMerge") or {}).get("due"):
                 self.wait_running(e, head, fp)
-            else:
-                self.judge(e, head, fp, why="queued")
+            else:  # LAND_STUCK_MERGE: the base merge is owed because those checks never end; judge_and_take sends it
+                self.judge(e, head, fp, why="stuck_merge" if running else "queued")
             return
         if kind == "head_change":
             # After a push-making step: never judge (or pin) a head read before it.
@@ -26331,6 +26423,22 @@ class LandQueue:
         if isinstance(check, dict) and check.get("head") == sha and check.get("pin") == str(e.get("pinSha") or "") \
                 and not self.base_merge_check(e, check):
             return  # not only a base merge on the pin: stopped head_moved, as before
+        sm = e.get("stuckMerge") or {}
+        if sm.get("due"):
+            # LAND_STUCK_MERGE: queued for one pinned base merge at the stopped head; a head that moved since is judged
+            at = str((((self.cache_of(key) or {}).get("data") or {}).get("headRefOid")) or sha or "").lower()
+            with self.lock:
+                self.check(e)
+                e["stuckMerge"] = {**sm, "due": False}
+                if at == str(sm.get("head") or ""):
+                    e["stuckMerge"].update(n=int(sm.get("n") or 0) + 1, sentAt=self.now)
+                    self.history(e, "stuck_merge", head=at[:12], code=sm.get("code"), why=sm.get("why"))
+                else:
+                    self.history(e, "stuck_merge_moved", head=at[:12], was=str(sm.get("head") or "")[:12])
+                self.save(e)
+            if at == str(sm.get("head") or ""):
+                self.update_branch(e, at, [f"stuck land: {sm.get('why')}"], named=True, past_running=True)
+                return
         # The judgment's own wall time (land-judged in glaeda-gh.jsonl): the entry pops judging after each judgment,
         # so without this line no log on the land host says how long a judgment took, and a change meant to make
         # judgments faster (one mirror fetch per head) has no before or after to read.
@@ -28563,7 +28671,7 @@ class LandQueue:
         return not (tried.get("head") == head and tried.get("tried"))
 
     def update_branch(self, e: dict, head: str, needs: list[str] | None = None, force: str = "",
-                      named: bool = False, code: str = "", stock: bool = False) -> None:
+                      named: bool = False, code: str = "", stock: bool = False, past_running: bool = False) -> None:
         """The pinned base merge land_judge (or a refused step) named, unless the head's checks still run: an update
         while the last one's CI runs only restarts that CI (2026-11-17: 524 update-branch steps in a day). Waits on the
         cache (an event wait, no explain) instead. An update at a head that an update of this queue made, after its
@@ -28635,7 +28743,7 @@ class LandQueue:
         held = e.get("updateDeferred") or {}
         stuck = held.get("head") == head and self.now - float(held.get("at") or 0) >= LAND_WAIT_DEFAULT
         running = land_runs_running if code in LAND_NEW_HEAD_ONLY else land_update_held
-        if running(data, head) and not stuck:
+        if running(data, head) and not stuck and not past_running:  # PAST_RUNNING: LAND_STUCK_MERGE's checks never end
             # Deferred once per head; a refusal whose only step is a new head only on a run (LAND_NEW_HEAD_ONLY). A
             # check still running after the whole wait never finishes (stuck, no runner):
             # deferring again only re-judges it into the identical-refusal stop with the named update never sent
@@ -29462,6 +29570,9 @@ class LandQueue:
         st = {"code": code, "reason": land_reason(reason), "next": land_trim(nxt), "at": self.now,
               "head": e.get("head") or "", **({"detail": detail[:LAND_HUNK_CHARS + 20]} if detail else {})}
         repeat = land_stop_repeats(e.get("lastStop"), st)
+        stuck_merge = land_stuck_merge_why(e, st, self.now)
+        if stuck_merge and not tell:
+            tell = "fyi"  # LAND_STUCK_MERGE: the queue takes the next step itself; nothing is the requester's to do
         live = LAND_MOVED_NEXT.search(nxt or "") if code == "head_moved" else None
         if live and e.get("pinSha"):
             e["movedFrom"] = {"was": str(e["pinSha"]).lower(), "head": live.group(1), "at": self.now}
@@ -29473,6 +29584,9 @@ class LandQueue:
         self.history(e, "stopped", code=code, reason=land_reason(reason, 160), **({"quiet": "repeat"} if repeat else {}))
         self.save(e)
         msg = f"glaeda land: {self.url(e)} stopped: {code}: {land_reason(reason, 300)}"
+        if stuck_merge:
+            nxt = (f"none: this queue base-merges {str(st.get('head') or '')[:12]} once (pinned update_branch) and "
+                   "lands the new head; it stops again by name if that fails")
         if nxt:
             msg += f" next: {land_trim(nxt, 300)}"
         if detail:
@@ -36784,8 +36898,9 @@ while :; do
   if [ "$every" -gt 0 ] && [ $((SECONDS - said)) -ge "$every" ]; then
     said=$SECONDS state=
     [ -f "$out.state" ] && IFS= read -r state < "$out.state"
-    if [ -n "$state" ] && [ "$state" = "$last" ]; then
-      : # the state it printed last time, to the character: say nothing until something changes
+    if [ -n "$last" ] && { [ -z "$state" ] || [ "$state" = "$last" ]; }; then
+      : # the state it printed last time, to the character, or a read that found the file missing or half-written
+      # after a state was said: say nothing until something changes
     elif [ -z "$sayer" ] || ! kill -0 "$sayer" 2>/dev/null; then
       [ -n "$state" ] && last=$state  # an empty read is a read that did not happen, not a new state: keeping the
       # last state it printed is what stops the same paragraph coming back after one poll found the file missing

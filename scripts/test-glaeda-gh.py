@@ -32989,6 +32989,7 @@ class LandTest(Base):
         e = self.tick(gg.LAND_REARM_AFTER * 3)
         self.assertEqual((e["state"], len(self.w.explains())), ("stopped", judged + gg.LAND_REARM_CAP))  # the cap
 
+    @mock.patch.dict(os.environ, {"GLAEDA_LAND_STUCK_MERGE": "0"})  # the re-arm alone, as a spent stuck merge leaves it
     def test_a_checks_stuck_stop_is_rearmed_and_lands_once_the_check_posts(self):
         # 2026-11-24, one lane's queue after 10.5 h idle: 5 of its 5 open PRs stopped, none on a red of its own; one
         # stopped checks_stuck on a status that never posted, and a stopped row reads nothing, so a status posting
@@ -33022,6 +33023,144 @@ class LandTest(Base):
         self.assertEqual((e["state"], e["rearms"]["n"]), ("queued", 2))
         self.tick()
         self.assert_merged_at(LA)
+
+    def stuck_updates(self) -> list:
+        return [c for c in self.w.gh_calls("api") if "update-branch" in " ".join(c)]
+
+    def rerun_cap_stop(self, head: str = LA) -> dict:
+        """A row stopped rerun_failed_cap at HEAD: its verdict job cancelled at every rerun (LAND_RERUN_CAP)."""
+        for _ in range(gg.LAND_RERUN_CAP + 3):
+            self.w.answers.append(refusal("cancelled", head, {"kind": "rerun_failed", "runs": [77]},
+                                          reason="not excused: 'ios fast verdict status' is cancelled"))
+        e = self.tick()
+        for i in range(gg.LAND_RERUN_CAP + 2):
+            if e["state"] == "stopped":
+                break
+            self.pr(head, checks=[("shard", "COMPLETED", "CANCELLED"), (f"other{i}", "COMPLETED", "SUCCESS")])
+            e = self.tick(60)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "rerun_failed_cap"), e.get("stop"))
+        self.w.answers.clear()
+        return e
+
+    def test_a_cancelled_verdict_at_the_rerun_cap_takes_one_base_merge_and_lands_at_the_new_head(self):
+        # LAND_STUCK_MERGE: manaflow-ai/cmux#54128, 2026-11-28: stopped rerun_failed_cap, its ios fast verdict cancelled
+        # three times at c0064150, and its lane barred from making the base merge itself; it sat stopped.
+        self.pr(LA)
+        self.land()
+        e = self.rerun_cap_stop()
+        said = self.w.sent()[-1]
+        self.assertIn("stopped: rerun_failed_cap", said[-1])
+        self.assertIn(f"this queue base-merges {LA[:12]} once", said[-1])
+        self.assertIn("fyi", " ".join(said))  # nothing is the requester's to do: it wakes nobody
+        self.assertEqual(self.stuck_updates(), [])
+        e = self.tick()
+        self.assertEqual((e["state"], e["lastStop"]["code"], e["stuckMerge"]["due"]),
+                         ("queued", "rerun_failed_cap", True))
+        judged = len(self.w.explains())
+        e = self.tick()
+        self.assertEqual(self.stuck_updates(), [["api", "-X", "PUT", "repos/o/r/pulls/1/update-branch", "-f",
+                                                 f"expected_head_sha={LA}"]])
+        self.assertEqual(len(self.w.explains()), judged)  # the base merge is the step: no judgment of the same head
+        self.assertEqual((e["state"], e["wait"]["kind"], e["stuckMerge"]["n"], e["stuckMerge"]["due"]),
+                         ("waiting", "head_change", 1, False))
+        self.pr(LB, parent=LA)
+        self.w.answers.append(ok_answer(LB))
+        for _ in range(4):
+            e = self.tick()
+            if e["state"] in gg.LAND_DONE:
+                break
+        self.assert_merged_at(LB)
+        self.assertEqual(len(self.stuck_updates()), 1)
+
+    def test_a_checks_stuck_stop_takes_one_base_merge_and_lands_at_the_new_head(self):
+        # LAND_STUCK_MERGE: manaflow-ai/cmux#54011, 2026-11-28: stopped checks_stuck, its cmux/ui-proof look never
+        # dispatched at f9bdfc03. The look comes only with a new head; the stuck check is never waited on again.
+        self.pr(LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("cmux/ui-proof", "PENDING", None)])
+        self.land()
+        wait = lambda: refusal("checks_running", LA, {"kind": "wait_pr", "sha": LA, "timeout_s": 1800},  # noqa: E731
+                               nxt=f"glaeda-gh wait pr o/r#1 --until done --sha {LA} --timeout 1800")
+        e = self.run_hour(wait, seconds=gg.LAND_WAIT_STUCK + 2 * gg.LAND_WAIT_DEFAULT, step=60.0)
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "checks_stuck"))
+        self.w.answers.clear()
+        e = self.tick()
+        self.assertEqual((e["state"], e["stuckMerge"]["code"]), ("queued", "checks_stuck"))
+        e = self.tick()
+        # never deferred behind the pending check that is the stop's whole cause (update_branch's PAST_RUNNING)
+        self.assertEqual(len(self.stuck_updates()), 1, e.get("history", [])[-4:])
+        self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "head_change"))
+        self.pr(LB, parent=LA, checks=[("ci", "COMPLETED", "SUCCESS"), ("cmux/ui-proof", "COMPLETED", "SUCCESS")])
+        self.w.answers.append(ok_answer(LB))
+        for _ in range(4):
+            e = self.tick()
+            if e["state"] in gg.LAND_DONE:
+                break
+        self.assert_merged_at(LB)
+
+    def test_a_stuck_base_merge_is_once_per_head_and_capped_per_land(self):
+        self.pr(LA)
+        self.land()
+        self.rerun_cap_stop(LA)
+        self.tick()
+        self.tick()
+        self.assertEqual(len(self.stuck_updates()), 1)
+        # the new head stops the same way: its own one base merge
+        self.pr(LB, parent=LA)
+        e = self.rerun_cap_stop(LB)
+        self.tick()
+        e = self.tick()
+        self.assertEqual((len(self.stuck_updates()), e["stuckMerge"]["n"]), (2, gg.LAND_STUCK_MERGE_CAP))
+        # the cap is spent: the third head stops and stays stopped, told as a stop with its own next step
+        self.pr(LC, parent=LB)
+        e = self.rerun_cap_stop(LC)
+        self.assertNotIn("base-merges", self.w.sent()[-1][-1])
+        for _ in range(3):
+            e = self.tick(60)
+        self.assertEqual((e["state"], len(self.stuck_updates())), ("stopped", 2))
+        # once per head: a stop at a head this land already base-merged from takes none
+        e = {"stuckMerge": {"head": LA, "n": 1}}
+        st = {"code": "checks_stuck", "head": LA, "at": self.t, "reason": "x"}
+        self.assertEqual(gg.land_stuck_merge_why(e, st, self.t), "")
+        self.assertEqual(gg.land_stuck_merge_why({}, st, self.t), "checks_stuck")
+
+    def test_an_own_red_of_the_prs_own_never_takes_a_stuck_merge(self):
+        at = self.t
+        own = {"code": "own_red", "head": LA, "at": at,
+               "reason": "land-judge: refused: base_red_excuse.py exit 1: not excused: 'tests' is not red on main run 9"}
+        base = {**own, "reason": "not excused: 'plan': its red base verdict's log does not map one to one onto its "
+                                 "steps (step_owners), so no base line can"}
+        lost = {**own, "code": "red_not_excused", "reason": "not excused: 'cmux/ui-proof': a status (error: UI proof "
+                                                            "not read (HTTPError): rerun this job)"}
+        self.assertEqual(gg.land_stuck_merge_why({}, own, at), "")
+        self.assertEqual(gg.land_stuck_merge_why({}, base, at), "own_red (red base verdict)")
+        self.assertEqual(gg.land_stuck_merge_why({}, lost, at), "red_not_excused (UI proof not read)")
+        for code in ("block", "conflict", "hold", "head_moved", "update_again_unnamed"):
+            self.assertEqual(gg.land_stuck_merge_why({}, {**base, "code": code}, at), "", code)
+        self.assertEqual(gg.land_stuck_merge_why({"override": "x"}, base, at), "")  # an override's pin is kept
+        self.assertEqual(gg.land_stuck_merge_why({}, base, at + gg.LAND_STUCK_MERGE_MAX_AGE + 1), "")  # too old
+        self.assertEqual(gg.land_stuck_merge_why({}, {**base, "head": ""}, at), "")
+        with mock.patch.dict(os.environ, {"GLAEDA_LAND_STUCK_MERGE": "0"}):
+            self.assertEqual(gg.land_stuck_merge_why({}, base, at), "")  # the undo
+        # and a real own red stays stopped, re-armed as before, with no base merge sent
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(refusal("own_red", LA, {"kind": "stop", "stop": "own_red"}, reason=own["reason"]))
+        e = self.tick()
+        self.assertEqual((e["state"], e["stop"]["code"]), ("stopped", "own_red"))
+        for _ in range(3):
+            e = self.tick(60)
+        self.assertEqual((e["state"], self.stuck_updates(), e.get("stuckMerge")), ("stopped", [], None))
+
+    def test_the_stuck_merge_hour_budget_holds_the_rest_for_the_next_hour(self):
+        self.pr(LA)
+        self.land()
+        self.rerun_cap_stop()
+        self.q.stuck_merge_sent = [self.t] * gg.LAND_STUCK_MERGE_HOURLY
+        e = self.tick()
+        self.assertEqual((e["state"], self.stuck_updates()), ("stopped", []))
+        e = self.tick(3600)
+        self.assertEqual(e["state"], "queued")
+        self.tick()
+        self.assertEqual(len(self.stuck_updates()), 1)
 
     def test_other_stops_are_never_rearmed(self):
         self.pr(LA)
