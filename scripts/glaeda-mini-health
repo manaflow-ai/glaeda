@@ -140,6 +140,9 @@ Each run checks, as the runner user and without sudo:
                                      fetched_at) is over GIT_MIRROR_STALE_S (30 min) old, on a macOS host with a mirror
                                      source configured. Its passes heal it (a repair fetches first); pending while a
                                      pass runs, else impossible. Reported only.
+  git_mirror_dead_redirect           the runner mirror's own url.<base>.insteadOf points at a loopback port nothing
+                                     listens on (a forward that is gone), so a plain `git fetch` there is refused while
+                                     glaeda-git-mirror's passes stay green: cmux21, 2026-11-27. Reported only.
   disk_pass_stale                    glaeda-disk has not finished a pass in DISK_PASS_STALE_S (26 h): sizes.json's newest
                                      per-item measurement or accounting.json's newest record is older, or either is
                                      missing, on a macOS host with glaeda-disk's LaunchAgent or snapshots (its agent
@@ -1215,7 +1218,8 @@ class Mini:
             running = True
         except (OSError, ValueError, KeyError, TypeError):
             pass
-        return {"record": load_json(git_dir / "cmux.json"), "running": running}
+        return {"record": load_json(git_dir / "cmux.json"), "running": running,
+                "dead_redirects": dead_loopback_redirects(git_dir / "cmux.git")}
 
     # ---- tailscale_no_route's restart: its gates' reads and the restart itself
 
@@ -1669,6 +1673,34 @@ def check_disk_pass(mini: Mini, now: float) -> list[dict[str, Any]]:
                     "~/Library/Logs/glaeda-disk.err; glaeda-mini-setup reloads the agent")]
 
 
+def loopback_refuses(host: str, port: int) -> bool:
+    """True when nothing listens on host:port of this machine (the connect is refused or times out)."""
+    try:
+        with socket.create_connection((host, port), timeout=2):
+            return False
+    except OSError:
+        return True
+
+
+def dead_loopback_redirects(git_dir: Path, refuses: Callable[[str, int], bool] = loopback_refuses) -> list[str]:
+    """The runner mirror's own `url.<base>.insteadOf` rules whose base is a loopback port nothing listens on. A plain
+    `git fetch` in the mirror (a person's, an agent's, a capture job's) goes there and fails with "connection
+    refused", though glaeda-git-mirror's own passes, which name their URL, stay green. cmux21, 2026-11-27: a hand-made
+    redirect to cp-1's full mirror through a huge-blue `ssh -R` forward on 127.0.0.1:18433 outlived the forward on
+    cmux14/18/19/21/22/24 (only cmux23 still had it), and fs-agent-lane-38's capture could not fetch."""
+    code, out = sh(["git", "--git-dir", os.fspath(git_dir), "config", "--local", "--get-regexp", r"^url\..*\.insteadof$"])
+    if code != 0:
+        return []
+    dead = []
+    for line in out.splitlines():
+        key = line.split(" ", 1)[0]
+        base = key[len("url."):-len(".insteadof")] if key.lower().endswith(".insteadof") else ""
+        m = re.match(r"^[a-z+]+://(127\.0\.0\.1|localhost|\[::1\]):([0-9]+)(/|$)", base)
+        if m and refuses(m.group(1).strip("[]"), int(m.group(2))):
+            dead.append(base)
+    return dead
+
+
 def check_git_mirror(mini: Mini, now: float) -> list[dict[str, Any]]:
     """git_mirror_stale: glaeda-git-mirror's last good fetch (its record's fetched_at, or the pass time of a record
     whose fetch succeeded) is older than GIT_MIRROR_STALE_S, or there is none. Its passes heal it themselves (a
@@ -1683,8 +1715,14 @@ def check_git_mirror(mini: Mini, now: float) -> list[dict[str, Any]]:
     at = utc(fetched)
     # a repair whose pass is gone (it failed or was killed) left the mirror incomplete, however fresh its tips
     stopped = record.get("state") == "repairing" and not facts.get("running")
+    dead = [finding("git_mirror_dead_redirect", "warn",
+                    f"{FLEET_DIR / 'git' / 'cmux.git'} rewrites fetches to {', '.join(facts['dead_redirects'])}, "
+                    "where nothing listens: a plain `git fetch` there is refused", "impossible",
+                    "drop the rule: git -C <mirror> config --local --unset url.<base>.insteadof (only "
+                    "glaeda-git-mirror's own fetches name their URL); a forward meant to be there is its owner's")
+            ] if facts.get("dead_redirects") else []
     if at is not None and now - at <= GIT_MIRROR_STALE_S and not stopped:
-        return []
+        return dead
     age = "no good fetch on record" if at is None else f"last good fetch {(now - at) / 60:.0f} min ago"
     if stopped:
         age = f"a repair stopped part way, {age}"
@@ -1693,7 +1731,7 @@ def check_git_mirror(mini: Mini, now: float) -> list[dict[str, Any]]:
                     f"{age} (fresh within {GIT_MIRROR_STALE_S // 60}); {state}; "
                     f"{'a pass is running' if facts.get('running') else 'no pass running'}",
                     "pending" if facts.get("running") else "impossible",
-                    "glaeda-git-mirror (plan) says what the next pass does; ~/Library/Logs/glaeda-git-mirror.jsonl")]
+                    "glaeda-git-mirror (plan) says what the next pass does; ~/Library/Logs/glaeda-git-mirror.jsonl")] + dead
 
 
 PRESSURE_BLOCKED_MIN = 20 * 1024**3  # blocked bytes worth a look
