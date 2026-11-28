@@ -3890,7 +3890,7 @@ class HookTest(unittest.TestCase):
         try:
             refused = self.job("sign-nightly-identity-legacy", "s0", 14, None, "--gui-wait", "0", env=legacy)
             self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
-            self.assertIn(f"1 process(es) of an earlier job still run in a runner's _work (pids {leftover})",
+            self.assertIn(f"1 process(es) of an earlier job still run in a runner's _work (pids {leftover} in actions-runner-glaeda-7)",
                           refused.stdout)
             self.assertNotIn("GLAEDA_JOB_CLAIM", github_env.read_text() if github_env.exists() else "")
             self.assertTrue(self.lock_free(), "the refused job let go of everything it took")
@@ -4171,6 +4171,25 @@ class HookTest(unittest.TestCase):
                             ("LSOF", "/usr/bin/true"), ("LSOF", "/nonexistent/lsof")):
             with self.subTest(name=name, value=value), mock.patch.object(hook, name, value):
                 self.assertIsNone(hook.stray_job_processes(self.dir, os.getpid()))
+
+    def test_stray_job_processes_name_each_pids_runner(self) -> None:
+        """STRAY_NAMES_ITS_RUNNER: the drain note names the runner each stray works in, not pids alone."""
+        work = self.dir / "actions-runner-glaeda-trusted-main" / "_work" / "cmux"
+        work.mkdir(parents=True)
+        (self.dir / "actions-runner-glaeda" / "_work").mkdir(parents=True)
+        started = subprocess.run(["/bin/sh", "-c", "/bin/sleep 60 >/dev/null 2>&1 & echo $!"], cwd=work,
+                                 capture_output=True, text=True, check=True)
+        leftover = int(started.stdout.strip())
+        try:
+            where: dict[int, str] = {}
+            stray = hook.stray_job_processes(self.dir, os.getpid(), where)
+            self.assertEqual(stray, [leftover])
+            self.assertEqual(where, {leftover: "actions-runner-glaeda-trusted-main"})
+        finally:
+            with contextlib.suppress(OSError):
+                os.kill(leftover, signal.SIGKILL)
+        self.assertEqual(hook.stray_note([3, 1, 2], {3: "a", 1: "b", 2: "a"}), "pids 3, 2 in a; pids 1 in b")
+        self.assertEqual(hook.stray_note([4], {}), "pids 4 in ?")
 
     def test_job_claim_names_only_a_whole_mini(self) -> None:
         github_env = self.dir / "env"

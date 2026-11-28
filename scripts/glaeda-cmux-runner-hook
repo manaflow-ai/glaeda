@@ -7226,9 +7226,10 @@ RUNNER_WORK_GLOBS = ("actions-runner-glaeda*/_work", "glaeda-runner/_work",
                      ".local/state/glaeda/capture/*/runner/_work")  # exclusive lease runners
 
 
-def stray_job_processes(home: Path, owner_pid: int) -> list[int] | None:
+def stray_job_processes(home: Path, owner_pid: int, where: dict[int, str] | None = None) -> list[int] | None:
     """This user's processes working in or naming a runner's _work under home that are not this job's (under
-    owner_pid) and not the hook's or this process's ancestors. None when ps or lsof cannot tell."""
+    owner_pid) and not the hook's or this process's ancestors. None when ps or lsof cannot tell. where, when given,
+    gets each returned pid's runner (STRAY_NAMES_ITS_RUNNER)."""
     works = sorted({os.path.realpath(w) for pattern in RUNNER_WORK_GLOBS for w in home.glob(pattern) if w.is_dir()})
     if not works:
         return []
@@ -7253,15 +7254,21 @@ def stray_job_processes(home: Path, owner_pid: int) -> list[int] | None:
             parent[int(parts[0])], command[int(parts[0])] = int(parts[1]), parts[2] if len(parts) == 3 else ""
     if os.getpid() not in parent:
         return None
-    users = {pid for pid, argv in command.items() if any(inside in argv for inside in insides)}
+    runner_of: dict[int, str] = {}
+    for pid, argv in command.items():
+        for w, inside in zip(works, insides):
+            if inside in argv:
+                runner_of.setdefault(pid, w)
     pid = 0
     for line in cwds.stdout.splitlines():
         if line[:1] == "p" and line[1:].isdigit():
             pid = int(line[1:])
         elif line[:1] == "n" and pid in command:
             cwd = os.path.realpath(line[1:])
-            if any(cwd == w or cwd.startswith(inside) for w, inside in zip(works, insides)):
-                users.add(pid)
+            for w, inside in zip(works, insides):
+                if cwd == w or cwd.startswith(inside):
+                    runner_of[pid] = w
+    users = set(runner_of)
     mine, walk = set(), os.getpid()
     for _ in range(256):  # this process and its ancestors (the hook wrapper, our own Runner.Worker); never launchd
         if walk <= 1:
@@ -7280,8 +7287,32 @@ def stray_job_processes(home: Path, owner_pid: int) -> list[int] | None:
             pid = parent[pid]
         return True  # a loop in the table: leave it alone
 
-    return sorted(pid for pid in users if not ours(pid)
-                  and not any(name in command[pid] for name in ROOT_SETTLE_SPARED))
+    stray = sorted(pid for pid in users if not ours(pid)
+                   and not any(name in command[pid] for name in ROOT_SETTLE_SPARED))
+    if where is not None:
+        for pid in stray:
+            where[pid] = stray_runner_name(home, runner_of[pid])
+    return stray
+
+
+# STRAY_NAMES_ITS_RUNNER (2026-11-28): the drain note named only pids, which are gone by the time anyone reads the log.
+# nightly-next-one run 46146914237 waited 639 s on cmux15 behind back-to-back short jobs whose pids changed every few
+# seconds, and nothing in its log said which runner started them. The note now names each stray's runner directory
+# (actions-runner-glaeda-trusted-main, a capture lease, ...), so the holder is a grep away.
+def stray_runner_name(home: Path, work: str) -> str:
+    """The runner a _work directory belongs to, relative to home (its _work parent), for the drain note."""
+    runner = os.path.dirname(work.rstrip("/"))
+    with contextlib.suppress(ValueError):
+        return os.path.relpath(runner, os.path.realpath(home))
+    return runner
+
+
+def stray_note(stray: list[int], where: dict[int, str]) -> str:
+    """The drain note's "pids ..." part, grouped by runner: "pids 1, 2 in actions-runner-glaeda-trusted-main"."""
+    by_runner: dict[str, list[int]] = {}
+    for pid in stray[:8]:
+        by_runner.setdefault(where.get(pid, "?"), []).append(pid)
+    return "; ".join(f"pids {', '.join(map(str, pids))} in {runner}" for runner, pids in by_runner.items())
 
 
 def settle_root(k: int) -> str:
@@ -17818,14 +17849,15 @@ def main(argv: list[str] | None = None) -> int:
                                                nightly_runner=args.nightly_runner,
                                                signs_first=args.trusted_next_signing)
                     if held and claim_class == EXCLUSIVE_CLASS:
-                        stray = stray_job_processes(Path.home(), owner.pid if owner else 0)
+                        where: dict[int, str] = {}
+                        stray = stray_job_processes(Path.home(), owner.pid if owner else 0, where)
                         if stray is None or stray:
                             release_host_lock(args.state_dir)
                             held = False
                             note = ("capacity: cannot list the processes in the runners' _work, so the mini is not "
                                     "known to be drained" if stray is None else
                                     f"capacity: {len(stray)} process(es) of an earlier job still run in a runner's "
-                                    f"_work (pids {', '.join(map(str, stray[:8]))}), so the mini is not drained")
+                                    f"_work ({stray_note(stray, where)}), so the mini is not drained")
                     if held or not note.startswith("capacity:"):
                         break
                     waited = time.monotonic() - start
