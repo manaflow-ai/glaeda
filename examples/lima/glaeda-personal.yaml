@@ -1,0 +1,44 @@
+# glaeda-personal: the persistent Linux VM `scripts/glaeda-linux-vm-personal` creates on a Mac for its
+# owner's agents. Same isolation as the CI base: vz, no host mounts, no port forwards, no agent forwarding.
+# CPU, memory and disk are set per host at create time (--cpus/--memory/--disk), not here.
+minimumLimaVersion: "2.2.0"
+
+# Deliberately one dated, digest-pinned image. Unavailability must block instead of widening.
+images:
+  - location: https://cloud-images.ubuntu.com/releases/noble/release-20260705/ubuntu-24.04-server-cloudimg-arm64.img
+    arch: aarch64
+    digest: sha256:7df0201546f75b8bcc1044594c806c35749421ad3c9bc1be2a3ab806cfae39cc
+    variant: server
+
+vmType: vz
+arch: aarch64
+plain: true
+
+user:
+  name: lima
+  home: /home/lima
+  shell: /bin/bash
+
+mounts: []
+portForwards: []
+
+ssh:
+  loadDotSSHPubKeys: false
+  forwardAgent: false
+  forwardX11: false
+  forwardX11Trusted: false
+
+containerd:
+  system: false
+  user: false
+
+vmOpts:
+  vz:
+    rosetta:
+      enabled: false
+      binfmt: false
+
+video:
+  display: none
+
+propagateProxyEnv: false

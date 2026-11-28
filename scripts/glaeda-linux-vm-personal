@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+"""glaeda-linux-vm-personal: one persistent Linux VM on this Mac, running, started at login, for its owner's agents.
+
+    glaeda-linux-vm-personal              plan: what --apply would do (no side effects)
+    glaeda-linux-vm-personal --apply      install pinned Lima, create and start the `linux` VM, start it at login
+    glaeda-linux-vm-personal --status     read-only: is the VM there and running, and how agents reach it
+
+On a Mac with nothing set up, the one command is:
+
+    git clone --depth 1 https://github.com/teamleaderleo/glaeda ~/.glaeda/src && ~/.glaeda/src/scripts/glaeda-linux-vm-personal --apply
+
+The VM is built from examples/lima/glaeda-personal.yaml: the CI base's pinned Ubuntu 24.04 arm64 image, vz, no host
+mounts, no port forwards, no SSH-agent forwarding. Its size follows the host: half the cores up to 8, a quarter of the
+memory up to 16 GiB, a 100 GiB sparse disk. Agents reach it with `~/.local/bin/glaeda-linux [CMD...]` (a shell, or the
+command run in the guest) or `ssh -F <lima-home>/linux/ssh.config lima-linux`.
+
+Everything lives under ~/.glaeda/linux-vm and is owned by the current user; nothing uses sudo:
+    lima-2.2.0/        the same verified Lima release glaeda-linux-vm-base installs, shared with it
+    personal-home/     LIMA_HOME for this VM, apart from the CI base and its clones
+    personal.json      the ownership receipt; an instance without it is never started or changed
+    ~/Library/LaunchAgents/com.glaeda.linux-vm.plist   starts the VM at login (RunAtLoad, no KeepAlive)
+
+--apply is idempotent: a second run on a running VM reports `unchanged`; a stopped one is started. A foreign or broken
+instance is reported and left alone; nothing is ever deleted. Output is one JSON document; exit 0 ok, 2 refused,
+1 failed.
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pathlib
+import plistlib
+import sys
+import time
+from typing import Any, Sequence
+
+SCHEMA = "glaeda-linux-vm-personal/v1"
+INSTANCE = "linux"
+LABEL = "com.glaeda.linux-vm"
+MAX_CPUS = 8
+MAX_MEMORY_GIB = 16
+DISK_GIB = 100
+MIN_FREE_GIB = 30
+CREATE_TIMEOUT = 300
+GUEST_TRIES = 36
+REPO = pathlib.Path(__file__).resolve().parents[1]
+TEMPLATE_YAML = REPO / "examples" / "lima" / "glaeda-personal.yaml"
+
+_LOADER = importlib.machinery.SourceFileLoader("glaeda_linux_vm_base", str(REPO / "scripts" / "glaeda-linux-vm-base"))
+_SPEC = importlib.util.spec_from_loader(_LOADER.name, _LOADER)
+assert _SPEC
+base = importlib.util.module_from_spec(_SPEC)
+sys.modules[_LOADER.name] = base
+_LOADER.exec_module(base)
+Refused, Failed, tail, now = base.Refused, base.Failed, base.tail, base.now
+
+
+def sizing(host: dict[str, Any]) -> dict[str, int]:
+    return {"cpus": max(1, min(MAX_CPUS, host["cpus"] // 2)),
+            "memory_gib": max(2, min(MAX_MEMORY_GIB, host["memory_gib"] // 4)),
+            "disk_gib": DISK_GIB}
+
+
+class Personal(base.Installer):
+    """The base installer's Lima install and limactl plumbing, aimed at one persistent VM in its own LIMA_HOME."""
+
+    def __init__(self, *, root: pathlib.Path, home: pathlib.Path | None = None, launchctl=None, uid: int | None = None,
+                 **kwargs: Any):
+        super().__init__(root=root, **kwargs)
+        self.lima_home = root / "personal-home"
+        self.receipt_path = root / "personal.json"
+        self.home = home or pathlib.Path(os.environ.get("HOME", str(pathlib.Path.home())))
+        self.plist_path = self.home / "Library" / "LaunchAgents" / f"{LABEL}.plist"
+        self.wrapper_path = self.home / ".local" / "bin" / "glaeda-linux"
+        self.uid = os.getuid() if uid is None else uid
+        self.start_timeout: float = base.CREATE_TIMEOUT
+        self.launchctl = launchctl or (lambda argv: self.run(["/bin/launchctl", *argv], 30))
+
+    def personal_template(self) -> dict[str, Any]:
+        data = TEMPLATE_YAML.read_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+        return {"bytes": data, "digest": digest, "path": self.root / "templates" / f"glaeda-personal-{digest[:16]}.yaml"}
+
+    def plist_bytes(self) -> bytes:
+        return plistlib.dumps({
+            "Label": LABEL,
+            "ProgramArguments": [str(self.limactl), "--tty=false", "start", INSTANCE],
+            "EnvironmentVariables": {"LIMA_HOME": str(self.lima_home), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
+            "RunAtLoad": True,
+            "StandardOutPath": str(self.root / "personal-start.log"),
+            "StandardErrorPath": str(self.root / "personal-start.log"),
+        })
+
+    def wrapper_bytes(self) -> bytes:
+        return (f"#!/bin/sh\n# glaeda-linux: a shell in this Mac's `{INSTANCE}` VM, or CMD run there "
+                f"(written by glaeda-linux-vm-personal).\n"
+                f"export LIMA_HOME='{self.lima_home}'\n"
+                f"if [ $# -eq 0 ]; then exec '{self.limactl}' shell {INSTANCE}; fi\n"
+                f"exec '{self.limactl}' --tty=false shell --workdir /home/lima {INSTANCE} -- \"$@\"\n").encode()
+
+    def write_if_changed(self, path: pathlib.Path, data: bytes, mode: int, action: str) -> bool:
+        if path.is_symlink():
+            raise Refused(f"{path} is a symlink; not following it")
+        if path.exists() and path.read_bytes() == data:
+            return False
+        path.parent.mkdir(parents=True, exist_ok=True)
+        stage = path.with_name(path.name + ".new")
+        stage.write_bytes(data)
+        os.chmod(stage, mode)
+        os.replace(stage, path)
+        self.actions.append({"action": action, "path": str(path)})
+        return True
+
+    def reach(self) -> dict[str, str]:
+        return {"shell": str(self.wrapper_path),
+                "ssh": f"ssh -F {self.lima_home / INSTANCE / 'ssh.config'} lima-{INSTANCE}"}
+
+    def execute(self, *, apply: bool, status_only: bool = False) -> dict[str, Any]:  # type: ignore[override]
+        out: dict[str, Any] = {"schema": SCHEMA, "apply": apply, "instance": INSTANCE,
+                               "lima_home": str(self.lima_home), "limactl": str(self.limactl)}
+        host = self.host_facts()
+        out["host"] = host
+        if host["system"] != "Darwin" or host["machine"] != "arm64":
+            raise Refused(f"needs an Apple-silicon Mac, this is {host['system']} {host['machine']}")
+        size = sizing(host)
+        out["sizing"] = size
+        template = self.personal_template()
+        out["template_digest"] = f"sha256:{template['digest']}"
+        lima = self.lima_state()
+        out["lima"] = lima
+        if lima["state"] == "mismatch":
+            raise Refused(f"{self.prefix} is not Lima {base.LIMA_VERSION}: {lima['detail']}")
+        receipt = self.receipt()
+        item = (self.instances() if lima["state"] == "ok" else {}).get(INSTANCE)
+        ours = bool(receipt and receipt.get("instance") == INSTANCE and receipt.get("created_by") == SCHEMA)
+        if item is not None and not ours:
+            raise Refused(f"{INSTANCE} exists in {self.lima_home} without this installer's receipt; not touching it")
+        if item is not None and item.get("status") not in ("Running", "Stopped"):
+            raise Refused(f"{INSTANCE} is {item.get('status')!r}; reported, not replaced")
+        if status_only:
+            out["status"] = (item or {}).get("status") or "absent"
+            out["reach"] = self.reach()
+            out["disposition"] = "status"
+            return out
+
+        plan: list[str] = []
+        if lima["state"] == "absent":
+            plan.append("install_lima")
+        if not template["path"].exists():
+            plan.append("materialize_template")
+        if item is None:
+            plan.append("create")
+        if (item or {}).get("status") != "Running":
+            plan.append("start")
+        if not self.plist_path.exists() or self.plist_path.read_bytes() != self.plist_bytes():
+            plan.append("login_item")
+        if not self.wrapper_path.exists() or self.wrapper_path.read_bytes() != self.wrapper_bytes():
+            plan.append("wrapper")
+        out["plan"] = plan
+        out["reach"] = self.reach()
+        if not apply:
+            out["disposition"] = "plan" if plan else "unchanged"
+            return out
+        if item is None and host["free_gib"] < MIN_FREE_GIB:
+            raise Refused(f"{host['free_gib']} GiB free, need {MIN_FREE_GIB}")
+
+        if "install_lima" in plan:
+            self.install_lima()
+            lima = self.lima_state()
+            out["lima"] = lima
+            if lima["state"] != "ok":
+                raise Failed(f"installed Lima does not report {base.LIMA_VERSION}: {lima.get('detail')}")
+        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.lima_home.mkdir(mode=0o700, exist_ok=True)
+        self.materialize_template(template)
+        if item is None:
+            # `limactl create` only writes the instance; the image download and first boot happen in `start`, which
+            # launchd runs below, so a dropped SSH or relay session (which kills its process group) cannot cut it off.
+            self.write_receipt({"created_by": SCHEMA, "instance": INSTANCE, "state": "create_started",
+                                "template_digest": template["digest"], "sizing": size, "created_at": now()})
+            result = self.lima("create", "--name", INSTANCE, f"--cpus={size['cpus']}", f"--memory={size['memory_gib']}",
+                               f"--disk={size['disk_gib']}", str(template["path"]), timeout=CREATE_TIMEOUT)
+            if result.returncode != 0:
+                raise Failed(f"limactl create --name {INSTANCE} failed: {tail(result.stderr)}")
+            self.actions.append({"action": "create", "instance": INSTANCE})
+            self.write_receipt({"created_by": SCHEMA, "instance": INSTANCE, "state": "created",
+                                "template_digest": template["digest"], "sizing": size,
+                                "created_at": base.receipt_created(self.receipt())})
+        target = f"gui/{self.uid}"
+        if self.write_if_changed(self.plist_path, self.plist_bytes(), 0o644, "login_item"):
+            self.launchctl(["bootout", f"{target}/{LABEL}"])  # absent the first time; its failure is expected
+            result = self.launchctl(["bootstrap", target, str(self.plist_path)])
+            if result.returncode != 0:
+                raise Failed(f"launchctl bootstrap {target} {self.plist_path} failed: {tail(result.stderr)}")
+        self.write_if_changed(self.wrapper_path, self.wrapper_bytes(), 0o755, "wrapper")
+        if "start" in plan:
+            started = time.monotonic()
+            result = self.launchctl(["kickstart", f"{target}/{LABEL}"])  # a no-op when RunAtLoad already started it
+            if result.returncode != 0:
+                raise Failed(f"launchctl kickstart {target}/{LABEL} failed: {tail(result.stderr)}")
+            self.actions.append({"action": "start", "instance": INSTANCE, "by": "launchd"})
+            try:
+                self.wait_status(INSTANCE, "Running", self.start_timeout)
+            except Failed as error:
+                log = self.root / "personal-start.log"
+                raise Failed(f"{error}; launchd's limactl start log: {tail(log.read_text(errors='replace')) if log.exists() else 'none'}") from None
+            out["start_s"] = round(time.monotonic() - started, 1)
+
+        out["status"] = self.instances().get(INSTANCE, {}).get("status")
+        probe = self.guest(INSTANCE, "/usr/bin/uname", "-m")
+        for _ in range(GUEST_TRIES - 1):  # Lima lists Running before the guest's sshd answers
+            if probe.returncode == 0:
+                break
+            self.sleep(5)
+            probe = self.guest(INSTANCE, "/usr/bin/uname", "-m")
+        out["guest_arch"] = probe.stdout.strip()
+        if probe.returncode != 0 or out["guest_arch"] != "aarch64":
+            raise Failed(f"{INSTANCE} does not answer a shell: {tail(probe.stderr or probe.stdout)}")
+        out["actions"] = self.actions
+        out["disposition"] = "changed" if self.actions else "unchanged"
+        return out
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="glaeda-linux-vm-personal", description=__doc__.split("\n\n")[0])
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--apply", action="store_true", help="make the changes (default: plan only)")
+    mode.add_argument("--status", action="store_true", help="read-only: VM state and how agents reach it")
+    parser.add_argument("--root", default=str(pathlib.Path.home() / ".glaeda" / "linux-vm"), help=argparse.SUPPRESS)
+    args = parser.parse_args(argv)
+    personal = Personal(root=pathlib.Path(args.root))
+    code, lock = 0, None
+    try:
+        if args.apply:
+            personal.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            lock = (personal.root / ".personal.lock").open("w")
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise Refused("another glaeda-linux-vm-personal --apply holds the lock") from None
+        document = personal.execute(apply=args.apply, status_only=args.status)
+    except Refused as error:
+        document, code = {"schema": SCHEMA, "disposition": "refused", "reason": tail(str(error))}, 2
+    except Failed as error:
+        document, code = {"schema": SCHEMA, "disposition": "failed", "reason": tail(str(error))}, 1
+    finally:
+        if lock is not None:
+            lock.close()
+    if code:
+        document["actions"] = personal.actions
+    print(json.dumps(document, indent=2, sort_keys=True))
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -3390,7 +3390,9 @@ class ClaudeRouteOnDisk(unittest.TestCase):
     def test_the_probe_routes_through_settings_and_drops_a_personal_token(self) -> None:
         seen = self.home / "seen"
         self.fake_claude(f'printf "%s\\n" "$@" > {seen}; env >> {seen}; echo PONG\n')
-        os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = "personal"
+        # A sentinel no runner env holds (a branch name like lane/...-personal matched the old "personal").
+        token = "personal-oauth-sentinel-7d41c9"
+        os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = token
         try:
             ok, detail = self.mini.claude_probe(SR2, "subrouter")
         finally:
@@ -3398,7 +3400,7 @@ class ClaudeRouteOnDisk(unittest.TestCase):
         self.assertEqual((ok, detail), (True, "PONG"))
         text = seen.read_text()
         self.assertIn(json.dumps({"env": {"ANTHROPIC_BASE_URL": SR2, "ANTHROPIC_AUTH_TOKEN": "subrouter"}}), text)
-        self.assertNotIn("personal", text)
+        self.assertNotIn(token, text)
 
     def test_a_probe_that_hangs_or_fails_is_a_failure(self) -> None:
         self.fake_claude("sleep 30\n")

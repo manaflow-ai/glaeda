@@ -45,6 +45,7 @@ AGENT_WRITERS = {
     "glaeda-gh": "gh-watch daemon: has its own system-daemon / logged-out handling (restart picks the domain)",
     "glaeda-mini-fleet": "reads and plans for minis",
     "glaeda-mini-health": RUNNER,
+    "glaeda-linux-vm-personal": "a person's own Lima VM on their own Mac: starts with their login (RunAtLoad); not a fleet store or server",
     "glaeda-mini-setup": RUNNER + "; --headless installs daemons",
     "glaeda-projects": "per-user workspace agents",
     "glaeda-seed-archive": "only to boot out and remove the old agent (install migrates it to a daemon)",
