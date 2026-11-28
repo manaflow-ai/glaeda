@@ -4414,6 +4414,60 @@ def fleet_toolchain_missing(home: Path | None = None) -> str | None:
     return toolchain_missing(workload_env(), home)
 
 
+# RUST_SELF_INSTALL: a node whose receipt names a rustup toolchain it lacks installs it (bounded, under a per-user
+# lock), instead of refusing the job. 2026-11-27: cmux31's class receipt moved to rustc 1.100.0 while the mini had
+# only 1.95.0, so cmux31-glaeda-13 refused every job at setup with "rust toolchain 1.100.0-aarch64-apple-darwin is
+# not installed" (hq synthetic-probes, run 46094599116), and that workflow_dispatch had no rescue to re-place it.
+# By hand the install took 7 s. Leo: "YOU MUST FIX THESE TYPES OF THINGS ASAP. ALL." The gate's look installs too,
+# so a held listener heals itself instead of waiting for mini-health. GLAEDA_RUNNER_RUST_SELF_INSTALL=0 turns it off.
+RUST_SELF_INSTALL = os.environ.get("GLAEDA_RUNNER_RUST_SELF_INSTALL", "1") != "0"
+RUST_INSTALL_BUDGET_S = float(os.environ.get("GLAEDA_RUNNER_RUST_INSTALL_BUDGET_S") or 300.0)
+RUST_INSTALL_LOCK = ".cache/glaeda/rust-toolchain-install.lock"  # under home: one install per user at a time
+RUST_TOOLCHAIN_NAME = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+-[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def install_receipt_toolchain(toolchain: str, env: dict[str, str], home: Path) -> tuple[bool, str]:
+    """(installed, note): rustup toolchain install TOOLCHAIN --profile minimal, at most RUST_INSTALL_BUDGET_S in
+    all (the lock wait included), under RUST_INSTALL_LOCK so the runners of one user install it once. A toolchain
+    another runner installed while this one waited counts as installed."""
+    if not RUST_SELF_INSTALL:
+        return False, "self-install is off (GLAEDA_RUNNER_RUST_SELF_INSTALL=0)"
+    if not RUST_TOOLCHAIN_NAME.fullmatch(toolchain):
+        return False, f"refused to install an unsafe toolchain name {toolchain!r}"
+    deadline = time.monotonic() + RUST_INSTALL_BUDGET_S
+
+    def listed() -> bool:
+        out = _probe(["rustup", "toolchain", "list"], env, home, max(deadline, time.monotonic() + 10))
+        return any(line.split()[0] == toolchain for line in out.splitlines() if line.strip())
+
+    lock = home / RUST_INSTALL_LOCK
+    try:
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as e:
+        return False, f"cannot open {lock}: {e}"
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    return False, f"another install held {lock} past {RUST_INSTALL_BUDGET_S:.0f} s"
+                time.sleep(1.0)
+        if listed():
+            return True, f"rust toolchain {toolchain} was installed by another runner here"
+        started = time.monotonic()
+        out, timed_out = _probe_answer(["rustup", "toolchain", "install", toolchain, "--profile", "minimal",
+                                        "--no-self-update"], env, home, deadline)
+        if not listed():
+            why = "timed out" if timed_out else "failed"
+            return False, f"rustup toolchain install {toolchain} {why} after {time.monotonic() - started:.0f} s"
+        return True, f"installed rust toolchain {toolchain} in {time.monotonic() - started:.0f} s (RUST_SELF_INSTALL)"
+    finally:
+        os.close(fd)
+
+
 def receipt_toolchain_name(want: dict[str, Any], env: dict[str, str], home: Path, deadline: float) -> str | None:
     """'1.98.1-<host triple>' for the receipt's rustc, the triple taken from rustup itself."""
     match = re.fullmatch(r"rustc (\d+\.\d+\.\d+)(?: .*)?", str(want.get("rustcVersion") or ""))
@@ -4465,7 +4519,13 @@ def toolchain_refusal(fleet_class: str | None, want: dict[str, Any], xcode_app: 
                                                  str(want.get("rustcVersion") or "")))), note
         names = [line.split()[0] for line in _probe(["rustup", "toolchain", "list"], env, home, deadline).splitlines()
                  if line.strip()]
-        if toolchain not in names:
+        if toolchain not in names and names:
+            installed, why = install_receipt_toolchain(toolchain, env, home)
+            if not installed:
+                return f"node not eligible (rust toolchain {toolchain} is not installed; {why})", note
+            note = why
+            deadline = time.monotonic() + ELIGIBILITY_BUDGET_S  # the install spent the probes' budget
+        elif toolchain not in names:
             return out_of_time(f"node not eligible (rust toolchain {toolchain} is not installed)", not names), note
         if align:
             current = _probe(["rustup", "default"], env, home, deadline).split()[:1]
@@ -4474,7 +4534,8 @@ def toolchain_refusal(fleet_class: str | None, want: dict[str, Any], xcode_app: 
             if now != [toolchain]:
                 return out_of_time(f"node not eligible (could not set the rustup default to {toolchain})",
                                    not now), note
-            note = f"set the rustup default to {toolchain} (was {current[0] if current else 'none'})"
+            note = "; ".join(x for x in (note, f"set the rustup default to {toolchain} "
+                                               f"(was {current[0] if current else 'none'})") if x)
             # ALIGNED_PROBE: probe the toolchain just aligned, by name, as the read-only check (the gate) does. The
             # default is one file every job on the mini shares: cmux8s-mac-mini-glaeda-1 set it to 1.98.1, then read
             # rustc 1.95.0 two seconds later with four other jobs on the host, and refused "macOS compile admission"
@@ -4482,7 +4543,7 @@ def toolchain_refusal(fleet_class: str | None, want: dict[str, Any], xcode_app: 
             env["RUSTUP_TOOLCHAIN"] = toolchain
         else:
             env["RUSTUP_TOOLCHAIN"] = toolchain  # probe only: what the job would see once aligned
-            note = f"would set the rustup default to {toolchain}"
+            note = "; ".join(x for x in (note, f"would set the rustup default to {toolchain}") if x)
     python = _probe(["python3", "-c", "import sys; print('%d.%d' % sys.version_info[:2])"], env, home, deadline)
     if not re.fullmatch(r"\d+\.\d+", python) or tuple(map(int, python.split("."))) < MIN_WORKLOAD_PYTHON:
         return out_of_time(f"node not eligible (python3 on the job PATH is {python or 'missing'}; cmux's profile "

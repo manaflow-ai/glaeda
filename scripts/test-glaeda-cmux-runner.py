@@ -9435,6 +9435,51 @@ class XcodeToolchainTest(unittest.TestCase):
                     why, _ = hook.toolchain_refusal("m4pro-48", want, self.XCODE, align=False)
                     self.assertEqual(why, "toolchain: xcrun resolves /x", "the Xcode refusal keeps its own words")
 
+    def test_a_missing_receipt_toolchain_is_installed_not_refused(self) -> None:
+        """RUST_SELF_INSTALL: cmux31-glaeda-13 refused hq's synthetic probes (run 46094599116) with "rust toolchain
+        1.100.0-aarch64-apple-darwin is not installed", and nothing re-placed them; installing it took 7 s. The hook
+        installs the receipt's toolchain itself, bounded and under a lock, and refuses only when that fails."""
+        want = {"rustcVersion": "rustc 1.100.0 (0ef1bc386 2026-11-09)", "cargoVersion": "cargo 1.100.0",
+                "zigVersion": "0.16.0", "xcodeVersion": "26.6", "xcodeBuild": "17F113", "macosSdkVersion": "26.5"}
+        installed = ["1.95.0-aarch64-apple-darwin (default)"]
+        calls: list[list[str]] = []
+        fail = {"install": False}
+
+        def answer(argv, env, cwd, deadline):
+            calls.append(argv)
+            if argv[:3] == ["rustup", "toolchain", "install"]:
+                if not fail["install"]:
+                    installed.append(argv[3])
+                return ("", False)
+            if argv[:3] == ["rustup", "toolchain", "list"]:
+                return ("\n".join(installed), False)
+            return ({"rustc": "rustc 1.95.0", "cargo": "cargo 1.100.0", "zig": "0.16.0", "python3": "3.13",
+                     "gh": "gh version 2", "xcodebuild": "Xcode 26.6\nBuild version 17F113", "xcrun": "26.5",
+                     "rustup": "Default host: aarch64-apple-darwin"}.get(argv[0], ""), False)
+
+        self.enterContext(mock.patch.object(hook.Path, "home", return_value=self.tmp))
+        self.enterContext(mock.patch.object(hook, "_probe_answer", side_effect=answer))
+        self.enterContext(mock.patch.object(hook, "toolchain_missing", return_value=None))
+        why, note = hook.toolchain_refusal("m5pro-24", want, None, align=False)
+        self.assertNotIn("is not installed", why or "", "the missing toolchain is installed, not refused")
+        self.assertIn("installed rust toolchain 1.100.0-aarch64-apple-darwin", note)
+        self.assertIn(["rustup", "toolchain", "install", "1.100.0-aarch64-apple-darwin", "--profile", "minimal",
+                       "--no-self-update"], calls)
+        self.assertTrue((self.tmp / hook.RUST_INSTALL_LOCK).exists(), "the install ran under the lock")
+        calls.clear()
+        hook.toolchain_refusal("m5pro-24", want, None, align=False)
+        self.assertFalse(any(c[:3] == ["rustup", "toolchain", "install"] for c in calls), "installed once")
+        installed[:] = ["1.95.0-aarch64-apple-darwin (default)"]
+        fail["install"] = True
+        why, _ = hook.toolchain_refusal("m5pro-24", want, None, align=False)
+        self.assertIn("rust toolchain 1.100.0-aarch64-apple-darwin is not installed; rustup toolchain install", why)
+        with mock.patch.object(hook, "RUST_SELF_INSTALL", False):
+            calls.clear()
+            why, _ = hook.toolchain_refusal("m5pro-24", want, None, align=False)
+            self.assertIn("self-install is off", why)
+            self.assertFalse(any(c[:3] == ["rustup", "toolchain", "install"] for c in calls))
+        self.assertEqual(hook.install_receipt_toolchain("1.1.1-x; rm -rf ~", {}, self.tmp)[0], False)
+
     def test_a_busy_node_whose_probes_run_out_of_time_is_admitted_not_refused(self) -> None:
         """A busy machine makes a job slower, never makes it fail. cmux8s-mac-mini-glaeda-13 at load ~200 failed the
         cmux app compile at "Set up runner" (manaflow-ai/cmux run 43683149857) because its probes ran out of time,
