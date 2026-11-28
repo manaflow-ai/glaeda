@@ -37741,6 +37741,36 @@ class LandTest(Base):
         self.assertEqual(e["state"], "forwarded")
         self.broker = False
 
+    LABEL_REFUSED = ("land-judge: refused: compile_missing: manaflow-ai/cmux#1 at " + LA + " has no compile receipt: "
+                     "awaiting_land. Add ready-to-land (its full tier compiles the head), then merge again. Could not "
+                     "add ready-to-land: lane-gh call pr_edit manaflow-ai/cmux: refused: PR 1's branch 'feat' was not "
+                     "pushed by vm-1")
+
+    def test_a_compile_stop_whose_label_add_the_broker_refused_hands_the_land_to_the_broker_host(self):
+        # cmux#63635, #57830, #57226, 2026-11-28: green, idle teammate PRs stopped compile_missing on a lane VM because
+        # land_judge's ready-to-land add went through the broker, which refuses pr_edit on a PR the VM did not push.
+        # The broker host's queue adds it with its own login; its land_judge still applies the teammate rule.
+        self.broker = True
+        self.pr(LA)
+        with mock.patch.object(gg, "policy_host", lambda: "host"):
+            self.land(requester="host/lane")
+            self.w.answers.append(refusal("compile_missing", LA, {"kind": "stop"}, reason=self.LABEL_REFUSED))
+            e = self.tick()
+        [call] = self.handoffs()
+        self.assertEqual(json.loads(call[4]), {"number": 1, "sha": LA, "requester": "host/lane"})
+        self.assertEqual(e["state"], "forwarded")
+        self.broker = False
+
+    def test_a_compile_stop_naming_no_broker_refusal_or_off_a_lane_vm_stays_here(self):
+        self.broker = True
+        e = {"state": "waiting"}
+        with mock.patch.object(gg, "policy_host", lambda: "host"):
+            self.assertTrue(self.q.unjudgeable_here(e, {"code": "compile_missing", "reason": self.LABEL_REFUSED}, {}, LA))
+            self.assertEqual(self.q.unjudgeable_here(e, {"code": "compile_missing", "reason": (
+                "land-judge: refused: compile_missing: no compile receipt: awaiting_land")}, {}, LA), "")
+        self.broker = False
+        self.assertEqual(self.q.unjudgeable_here(e, {"code": "compile_missing", "reason": self.LABEL_REFUSED}, {}, LA), "")
+
     def test_a_tool_error_naming_no_broker_refusal_or_off_a_lane_vm_stays_a_stop_here(self):
         self.broker = True
         e = {"state": "waiting"}

@@ -17468,7 +17468,13 @@ LAND_HANDOFF_BROKER_ONLY = frozenset({"land_tier_pending", "full_tier_label"})
 # its own login, through no broker, so it judges the same rules in full. teamleaderleo/glaeda#3133, 2026-11-27: the
 # classifier's base-verdict read of the base repo was refused on gcp-agent-lane-15 and the land stopped tool_error
 # ("next: none") on a PR the broker host merges; handed off by hand. A refusal that names no broker stays a stop.
-LAND_HANDOFF_BROKER_REFUSED_CODES = frozenset({"tool_error"})
+# compile_missing is the same refusal for land_judge's compile gate (engine.py awaiting_land_refusal): the head's compile
+# receipt is awaiting_land, so land_judge adds ready-to-land itself, and on a lane VM that add goes through the broker's
+# pr_edit, which refuses it on a teammate's PR ("branch X was not pushed by VM"). The land stopped on a `gh pr edit` no
+# lane may run, green and idle (cmux#63635, #57830, #57226, 2026-11-28). The broker host's land_judge adds the label
+# with its own login and still decides the merge under the teammate rule (opt-in or idle_pass); a compile_missing
+# whose reason names no broker refusal stays a step here.
+LAND_HANDOFF_BROKER_REFUSED_CODES = frozenset({"tool_error", "compile_missing"})
 LAND_HANDOFF_BROKER_REFUSED = re.compile(r"\blane-gh broker refuse[sd]\b|\blane-gh call \S+ \S+: refused: ")
 # And while this host cannot read GitHub at all, a broker client hands a due PR off before it judges it, and before it
 # waits for a worker or a pace slot (early_hand_off): at least LAND_EARLY_HANDOFF_BAD of its last LAND_EARLY_HANDOFF_OF
