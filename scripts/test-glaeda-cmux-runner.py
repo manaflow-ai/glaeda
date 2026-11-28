@@ -7805,6 +7805,44 @@ time.sleep(60)
         finally:
             self.ci_step("release", "--job-key", "drain-2-1")
 
+    def test_cmux_cis_own_runner_pause_never_drains_the_host(self) -> None:
+        """HOST_DRAIN_OWN_PAUSE: a simulator or look hold's worker marks every runner but the nightly slot with the
+        lend drain (CMUX_CI_DRAIN_BY), and a blind CuaDriver marks the gui runner (CMUX_CI_GUI_PAUSE_BY). On a mini
+        with no nightly slot those cover every runner, and the host read as hand-drained: fits [] and admit refused
+        the held step itself (2026-11-28 14:01Z cmux22 1/1, cmux23 21/21, cmux33 6/6, cmux26-32 23/24 + 1 blind,
+        while 114-123 simulator steps queued). Before: fits [] and "host draining: all 2 runners are draining for
+        cmux-ci lend drain: ...". A hand drain of every runner still drains the host."""
+        self.fleet()
+        worker = self.ci_worker()
+        watch = ("--watch-pid", str(worker.pid))
+        runners = [self.dir / "actions-runner-glaeda", self.dir / "actions-runner-glaeda-1"]
+        for runner in runners:
+            runner.mkdir()
+
+        def mark(runner: Path, by: str | None, reason: str) -> None:
+            doc = {"reason": reason, "until": time.time() + 600, "since": time.time() - 60}
+            if by is not None:
+                doc["by"] = by
+            (runner / hook.RUNNER_DRAIN_FILE).write_text(json.dumps(doc))
+
+        lend = "cmux-ci lend drain: a measurement waits for this mini"
+        for runner in runners:
+            mark(runner, hook.CMUX_CI_DRAIN_BY, lend)
+        self.assertIsNone(hook.host_drain(self.dir, time.time()), "the lend drain on every runner is no host drain")
+        self.assertEqual(self.fits(), ["light", "isolated"], "the held step's mini still offers its room")
+        mark(runners[1], hook.CMUX_CI_GUI_PAUSE_BY, "cmux-ci cua-driver blind")
+        self.assertEqual(self.fits(), ["light", "isolated"], "lend drain + a blind gui pause is no host drain")
+        try:
+            status, admitted = self.ci_step("admit", "--class", "light", "--job-key", "own-1-1", *watch)
+            self.assertEqual(status, 0, admitted)
+        finally:
+            self.ci_step("release", "--job-key", "own-1-1")
+        for runner in runners:
+            mark(runner, None, "a sandboxd restore")
+        status, result = self.ci_step("fits")
+        self.assertEqual((status, result["fits"]), (0, []), "a hand drain of every runner still drains the host")
+        self.assertEqual(result["refusal"], "host draining: all 2 runners are draining for a sandboxd restore")
+
     def test_ci_step_fits_is_unknown_while_an_admission_runs(self) -> None:
         self.fleet()
         capacity = self.dir / "capacity"

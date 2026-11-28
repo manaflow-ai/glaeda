@@ -4032,6 +4032,20 @@ def measure_drain_overdue(doc: dict[str, Any], now: float) -> bool:
 APPLY_DRAIN_BY = "glaeda-cmux-runner --apply"
 HOST_DRAIN_RUNNER_DIR = re.compile(r"actions-runner-glaeda(?:-(\d+|[a-z][a-z0-9-]*))?")
 
+# HOST_DRAIN_OWN_PAUSE (2026-11-28, Leo: "Why are these iPhone builds still so slow and unverified? Don't we have
+# freed up Mac capacity?"): cmux-ci's own runner pauses are no hand drain either. A simulator or look hold drains a
+# lent mini for one queued ci-step, and its worker writes the measurement marker (CMUX_CI_DRAIN_BY) in every runner but
+# the nightly slot; a blind CuaDriver writes CMUX_CI_GUI_PAUSE_BY on the gui runner. On a mini with no nightly slot
+# those cover every runner, and HOST_DRAIN read the mini as hand-drained: `fits` advertised nothing and `admit`
+# refused every ci-step, the held one the pause was for included, until the worker's 60 min pause bound lifted the
+# markers. 14:01Z: cmux22 (1 of 1 runners), cmux23 (21 of 21) and cmux33 (6 of 6) marked by the lend drain, cmux26-32
+# 23 of 24 plus the 24th by the blind pause, each offering only `exclusive` while 114-123 simulator steps queued and
+# 4 ran; at 14:09:38-14:10:10 the bound lifted and eight of them started sim steps together. The worker decides what
+# runs beside its own drain (the controller's hold leases a held mini only its held step), so neither marker counts
+# here; per runner both still stop the listener (runner_drain). Detector:
+# test_cmux_cis_own_runner_pause_never_drains_the_host.
+CMUX_CI_GUI_PAUSE_BY = "cmux-ci cua-driver blind"  # cmuxterm-hq build-fleet/cmd/worker/gui_runner_pause.go
+
 
 def host_drain(home: Path, now: float) -> str | None:
     """Why this mini is drained (HOST_DRAIN), or None: some runner under home has no live hand-written RUNNER_DRAIN,
@@ -4044,7 +4058,7 @@ def host_drain(home: Path, now: float) -> str | None:
     first = None
     for runner in runners:
         doc = runner_drain_doc(runner, now)
-        if doc is None or doc.get("by") == APPLY_DRAIN_BY:
+        if doc is None or doc.get("by") in (APPLY_DRAIN_BY, CMUX_CI_DRAIN_BY, CMUX_CI_GUI_PAUSE_BY):
             return None
         first = first or str(doc.get("reason") or "a hand drain")[:200]
     return f"host draining: all {len(runners)} runners are draining for {first}" if first else None
