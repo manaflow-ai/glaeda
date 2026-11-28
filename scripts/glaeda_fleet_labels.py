@@ -709,10 +709,12 @@ def member_labels(manifest: Any, member: str, xcode_ok: Callable[[dict[str, Any]
     # placement check: simRunners is a class default, so every member of the class reads it, and a member with no
     # simulator (a trustedRef nightly host) is not misconfigured by it. On 2026-11-14 the check ran first and held
     # cmux15, the nightly host, out of every runner-heal pass ("simRunners needs a dedicated runner").
+    # A sim-first runner takes pull request jobs, so a trustedRef, non-dedicated or poolPrefix member gets none
+    # rather than a refusal, as smallRunners below. 2026-11-28: the refusal held cmux22 (a trusted-only promote
+    # host whose class default carries simRunners) out of every relabel, and its 19 runners stayed offline.
     sim = sim if ios_sim else 0
-    if sim and (trusted_ref is not None or availability != "dedicated" or normal_pool_prefix):
-        return None, (f"{member} runner.classes.{klass}.simRunners needs a dedicated runner without trustedRef "
-                      "(a sim-first runner takes pull request jobs) in the default pool namespace (no poolPrefix)")
+    if trusted_ref is not None or availability != "dedicated" or normal_pool_prefix:
+        sim = 0
     if not (isinstance(small, int) and not isinstance(small, bool) and 0 <= small <= MAX_SMALL_RUNNERS):
         return None, f"runner.classes.{klass}.smallRunners must be 0 to {MAX_SMALL_RUNNERS}"
     # A small runner takes pull request jobs, so only a dedicated member without trustedRef, in the default pool

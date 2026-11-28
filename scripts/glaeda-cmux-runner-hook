@@ -3306,6 +3306,14 @@ TAILSCALE_CLI_ENV = {"TAILSCALE_BE_CLI": "1"}  # the app's binary is its CLI onl
 # A new refusal is looked at once more this soon, and holds only when that look agrees: a probe that timed out on a
 # busy mini reads as a refusal (an empty xcodebuild or node status) and must not hold a good runner for 300 s.
 GATE_ELIGIBLE_RECHECK_S = 30.0
+# FIRST_LOOK_FIRST: a gate with no listener up holds it off until its first eligibility look answers (and while a
+# first refusal is rechecked), for at most GATE_FIRST_LOOK_MAX_S, so a new or restarted gate never starts a listener
+# that takes a job job-started refuses. 2026-11-28: cmux14's restarted gates started their listeners at once, the
+# look answered "node not eligible" after the first poll, and the jobs taken meanwhile failed in "Set up job".
+# ELIGIBLE_LOOK_BOUND: a look still running GATE_ELIGIBLE_LOOK_MAX_S after it started is replaced by a new one and
+# its answer dropped: a hung look kept the last held refusal for good, so the runner never listened again.
+GATE_FIRST_LOOK_MAX_S = float(os.environ.get("GLAEDA_RUNNER_GATE_FIRST_LOOK_MAX_S") or 90.0)
+GATE_ELIGIBLE_LOOK_MAX_S = float(os.environ.get("GLAEDA_RUNNER_GATE_ELIGIBLE_LOOK_MAX_S") or 120.0)
 # The held answer across a reload's exec (as GATE_LISTENING_SINCE_ENV), so a hook --apply does not start every
 # held runner listening while the new gate's first look runs.
 GATE_INELIGIBLE_ENV = "GLAEDA_RUNNER_GATE_INELIGIBLE"
@@ -3933,8 +3941,11 @@ APPLY_DRAIN_STALE = "APPLY_DRAIN_STALE"
 
 def runner_drain(runner_dir: Path, now: float, fleet_dir: str | None = None) -> str | None:
     """Why this runner is draining (RUNNER_DRAIN, or HOST_RUNNER_PAUSE on any runner but the nightly slot), or None:
-    no marker, an expired one, or one that cannot be read."""
+    no marker, an expired one, or one that cannot be read. A gateway runner never drains for cmux-ci's measurement
+    pause (GATEWAY_NO_MEASURE_DRAIN)."""
     doc = runner_drain_doc(runner_dir, now) or host_runner_pause_for(runner_dir, now, fleet_dir)
+    if doc is not None and doc.get("by") == CMUX_CI_DRAIN_BY and gateway_runner_dir(os.fspath(runner_dir)):
+        doc = None
     return None if doc is None else f"draining for {str(doc.get('reason') or 'glaeda-cmux-runner --apply')[:200]}"
 
 
@@ -3970,7 +3981,33 @@ def drain_doc_at(path: Path, now: float, owner_uid: int | None = None) -> dict[s
         return None
     if not math.isfinite(until) or until <= now or until > now + DRAIN_TTL_S + 60:
         return None
+    if measure_drain_overdue(doc, now):
+        return None
     return doc
+
+
+# MEASURE_DRAIN_BOUND: cmux-ci's lend drain rewrites its marker (RUNNER_DRAIN by CMUX_CI_DRAIN_BY, and the host's
+# runner-pause.json) every few minutes with a fresh `until`, so the expiry above never ends a drain the worker keeps
+# asking for. 2026-11-28 02:17-03:20Z: cmux14, cmux22, cmux23, cmux28, cmux29, cmuxs-mac-mini-3 and ultra2 held every
+# runner but the nightly slot off for "cmux-ci lend drain: a measurement waits for this mini", the markers rewritten
+# with until 10 min ahead each pass, and the gateway label read 33 of 113 runners online. The worker now writes the
+# drain's start (`since`) into the marker and ends its own pause after its hard bound (cmuxterm-hq runner_pause.go
+# runnerPauseMaxHold); a marker whose `since` is older than MEASURE_DRAIN_MAX_S is ignored here as well, so a worker
+# that keeps rewriting past its bound (an old release, a bug) still frees the runners. A marker with no `since` (a
+# worker from before it) keeps the expiry alone. Other writers' markers (an apply, a hand drain) are untouched.
+# GLAEDA_MEASURE_DRAIN_MAX_S sets the bound; 0 turns it off.
+MEASURE_DRAIN_MAX_S = float(os.environ.get("GLAEDA_MEASURE_DRAIN_MAX_S") or 60 * 60)
+
+
+def measure_drain_overdue(doc: dict[str, Any], now: float) -> bool:
+    """Whether doc is cmux-ci's measurement drain and has stood past MEASURE_DRAIN_MAX_S since its `since`."""
+    if MEASURE_DRAIN_MAX_S <= 0 or doc.get("by") != CMUX_CI_DRAIN_BY:
+        return False
+    try:
+        since = float(doc.get("since") or 0)
+    except (ValueError, TypeError, OverflowError):
+        return False
+    return math.isfinite(since) and 0 < since <= now and now - since > MEASURE_DRAIN_MAX_S
 
 
 # HOST_DRAIN: a hand drain that empties a mini for a repair marks every runner on it (RUNNER_DRAIN), and every listener
@@ -12346,6 +12383,9 @@ class Gate:
         self.missing_why: str | None = None  # the last toolchain_missing answer, read every poll
         self.eligible_at = -GATE_ELIGIBLE_EVERY_S
         self.eligible_look: threading.Thread | None = None
+        self.eligible_looked = self.eligible_why is not None  # a look has answered (a reload carries a held answer)
+        self.eligible_gen = 0  # the look whose answer counts (ELIGIBLE_LOOK_BOUND)
+        self.eligible_first_at: float | None = None  # when the first look started (FIRST_LOOK_FIRST)
         self.tailnet_why: str | None = None  # the held off-the-tailnet answer (off_tailnet)
         self.tailnet_seen = 0  # looks in a row that found this mini off the tailnet
         self.tailnet_at = -GATE_TAILNET_EVERY_S
@@ -12536,7 +12576,7 @@ class Gate:
                     or self.fleet_build_yield() or self.waiter_yield())
         self.cap_sample(time.monotonic())  # HOST_LOAD_CAP reads load whatever holds the gate now
         why = self.host_claim()
-        if why is None and self.waiters and self.waiters_due():
+        if why is None and self.yields_to_waiters() and self.waiters_due():
             self.waiting, self.waiting_at = self.blocking_waiters(), time.monotonic()
         if why is None and self.waiting:
             why = waiter_why(self.host_lock, min(self.waiting))
@@ -12551,7 +12591,12 @@ class Gate:
         lock until it has lasted SIGNER_LOCK_SETTLE_S: a probe's seconds do not take the signer offline."""
         scope = runner_scope(self.runner_dir)
         why = host_held(self.host_lock, self.reservation, time.time(), self.state_dir, nightly_slot=scope.nightly)
-        if why != FLEET_BUILD_HOLDS_HOST or not scope.trusted_signing:
+        if why == FLEET_BUILD_HOLDS_HOST and scope.gateway:
+            return None  # GATEWAY_NO_MEASURE_DRAIN: its client takes no host.lock and about no CPU
+        # SETTLE_DEDICATED: a dedicated runner (cmux15's trusted-main, the only glaeda-trusted-std-xcode-26.6 runner)
+        # settles too. 2026-11-28 03:49-03:55Z its idle listener stopped three times for host.lock holds of 6-80 s
+        # and each stop cost the 60 s restart, so the census read seed signing at 0 online runners.
+        if why != FLEET_BUILD_HOLDS_HOST or not (scope.trusted_signing or scope.dedicated):
             self.lock_held_since = None
             return why
         now = time.monotonic()
@@ -12587,6 +12632,8 @@ class Gate:
         runner only with yieldToWaiters (YIELD_TO_WAITERS), read from its job-started hook on every look so a hook
         refresh counts without restarting the gate's listen.sh argv."""
         scope = runner_scope(self.runner_dir)
+        if scope.gateway:
+            return False  # GATEWAY_NO_MEASURE_DRAIN: a waiting build waits for no gateway client (GATEWAY_NO_HOST_LOCK)
         return scope.waiter_yields if scope.dedicated else self.waiters
 
     def waiter_yield(self) -> str | None:
@@ -13676,16 +13723,27 @@ class Gate:
             self.missing_why = missing
         if missing:
             return f"ineligible: {missing}"
+        now = time.monotonic()
         running = self.eligible_look is not None and self.eligible_look.is_alive()
+        if running and now - self.eligible_at >= GATE_ELIGIBLE_LOOK_MAX_S:
+            # ELIGIBLE_LOOK_BOUND: a look past its bound (its probes hung past ELIGIBILITY_BUDGET_S) no longer keeps
+            # the held answer: the next look replaces it, and the hung one's answer, if it ever comes, is dropped
+            gate_log(f"the eligibility look has not answered in {now - self.eligible_at:.0f} s; starting a new one")
+            self.eligible_gen += 1
+            running = False
         note = eligibility_refused(self.state_dir)  # INELIGIBLE_AT_ONCE: one stat and a small read per poll
         if note is not None and note[1] != self.refused_stamp:
-            self.refused_why, self.refused_stamp, self.refused_seen_at = note[0], note[1], time.monotonic()
+            self.refused_why, self.refused_stamp, self.refused_seen_at = note[0], note[1], now
             gate_log(f"job-started refused a job here: {note[0]}; held off at once so another runner takes the "
                      "next job, until a fresh look finds the node eligible (INELIGIBLE_AT_ONCE)")
             if not running:
                 self.eligible_at = -GATE_ELIGIBLE_EVERY_S  # the look that may release it starts now
-        if not running and time.monotonic() - self.eligible_at >= GATE_ELIGIBLE_EVERY_S:
-            self.eligible_at = started = time.monotonic()
+        if not running and now - self.eligible_at >= GATE_ELIGIBLE_EVERY_S:
+            self.eligible_at = started = now
+            self.eligible_gen += 1
+            gen = self.eligible_gen
+            if self.eligible_first_at is None:
+                self.eligible_first_at = now
 
             def look() -> None:
                 try:
@@ -13693,6 +13751,9 @@ class Gate:
                 except Exception as error:  # noqa: BLE001 - a broken look must never stop the gate
                     why = None
                     gate_log(f"the eligibility look failed ({type(error).__name__}); not holding for it")
+                if gen != self.eligible_gen:
+                    return  # replaced (ELIGIBLE_LOOK_BOUND): a newer look owns the answer, and a refusal's release
+                self.eligible_looked = True
                 if self.refused_why is not None:
                     if why is None and started >= self.refused_seen_at:
                         gate_log(f"a look after job-started's refusal finds the node eligible; listening again "
@@ -13721,6 +13782,14 @@ class Gate:
 
             self.eligible_look = threading.Thread(target=look, name="eligibility", daemon=True)
             self.eligible_look.start()
+        if self.child is None and not self.eligible_why and not self.refused_why:
+            # FIRST_LOOK_FIRST: with no listener up, nothing is lost by waiting for the look, and a listener started
+            # first took jobs that job-started then refused for the very eligibility the look was reading
+            if self.eligible_new:
+                return f"ineligible: {self.eligible_new} (rechecking before the listener starts)"
+            if not self.eligible_looked and self.eligible_first_at is not None \
+                    and now - self.eligible_first_at < GATE_FIRST_LOOK_MAX_S:
+                return "ineligible: waiting for the first eligibility look before the listener starts"
         held = self.eligible_why or self.refused_why
         return f"ineligible: {held}" if held else None
 

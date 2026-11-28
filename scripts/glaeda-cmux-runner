@@ -505,7 +505,11 @@ def member_labels(manifest: Any, member: str, prior_labels: list[str] | None = N
         hosts = manifest.get("hosts") if isinstance(manifest, dict) else None
         host = hosts.get(member) if isinstance(hosts, dict) else None
         hardware = host.get("hardware") if isinstance(host, dict) else None
-        extra["accepted_build"] = rule.accepted_xcode_build(manifest, hardware) or host_class_xcode_build(hardware)
+        # TOOLCHAIN_PIN_ORDER: the host's own class receipt first, the manifest's acceptance only where the host has
+        # none. The receipt is what the hook's gate judges on this Mac; the manifest's acceptance names the class's
+        # build, which a host whose receipt was re-run on another Xcode does not have, and labels from it put the
+        # runner on a pool whose jobs its gate then refuses.
+        extra["accepted_build"] = host_class_xcode_build(hardware) or rule.accepted_xcode_build(manifest, hardware)
     return rule.member_labels(manifest, member, lambda app: xcode_present(app), ios_sim_ok, macos_major=major,
                               **extra)
 

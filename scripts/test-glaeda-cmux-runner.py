@@ -12908,9 +12908,11 @@ class GateTest(unittest.TestCase):
                 gate.eligible_look.join(120)
 
         with mock.patch.object(hook, "eligibility_refusal", return_value=why) as look:
-            self.assertIsNone(gate.claimed(), "the first poll starts the look")
+            # FIRST_LOOK_FIRST: no listener is up, so the gate holds while the first look and its recheck run
+            self.assertTrue((gate.claimed() or "").startswith("ineligible: "), "the first poll starts the look")
             settle()
-            self.assertIsNone(gate.claimed(), "a first refusal holds only once a recheck agrees")
+            self.assertEqual(gate.claimed(), f"ineligible: {why} (rechecking before the listener starts)",
+                             "a first refusal is held, as not yet confirmed, only while no listener runs")
             settle()
             self.assertEqual(look.call_count, 1, "the recheck waits GATE_ELIGIBLE_RECHECK_S")
             gate.eligible_at -= hook.GATE_ELIGIBLE_RECHECK_S
@@ -13057,6 +13059,7 @@ class GateTest(unittest.TestCase):
         with mock.patch.object(hook, "eligibility_refusal", side_effect=slow_look):
             self.assertIn(hook.TOOLCHAIN_MISSING, gate.claimed() or "")
             gate.eligible_at -= hook.GATE_ELIGIBLE_EVERY_S
+            gate.eligible_looked = True  # a look answered before rustup went missing, so FIRST_LOOK_FIRST has no wait
             make_executable(bin_dir / "rustup", "#!/bin/sh\nexit 0\n")
             self.assertIsNone(gate.claimed(), "listening again on the first poll after it is back")
             self.assertTrue(gate.eligible_look.is_alive())
@@ -14068,6 +14071,101 @@ class GateTest(unittest.TestCase):
         marker = self.runner / hook.RUNNER_DRAIN_FILE
         marker.write_text(json.dumps({"reason": reason, "until": until if until is not None else time.time() + 600}))
         return marker
+
+    def test_a_measurement_drain_past_its_bound_holds_nothing(self) -> None:
+        """MEASURE_DRAIN_BOUND: cmux-ci rewrote its lend-drain marker with a fresh `until` for hours (2026-11-28, 7 minis'
+        runners off, 33 of 113 gateway runners online). A marker whose `since` is past MEASURE_DRAIN_MAX_S holds nothing;
+        one with no `since` (an older worker) and another writer's marker keep the expiry alone."""
+        gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+        marker = self.runner / hook.RUNNER_DRAIN_FILE
+        now = time.time()
+
+        def write(**doc: object) -> None:
+            marker.write_text(json.dumps({"reason": "a measurement waits for this mini", "until": now + 600, **doc}))
+
+        write(by=hook.CMUX_CI_DRAIN_BY, since=now - 60)
+        self.assertEqual(gate.draining(), "draining for a measurement waits for this mini")
+        write(by=hook.CMUX_CI_DRAIN_BY, since=now - hook.MEASURE_DRAIN_MAX_S - 60)
+        self.assertIsNone(gate.draining(), "past the bound: the runner listens again")
+        write(by=hook.CMUX_CI_DRAIN_BY)
+        self.assertIsNotNone(gate.draining(), "no since: the expiry alone")
+        write(by="glaeda-cmux-runner --apply", since=now - hook.MEASURE_DRAIN_MAX_S - 60)
+        self.assertIsNotNone(gate.draining(), "another writer's drain is not bounded here")
+        for bad in ("x", float("inf"), now + 3600, -5):
+            write(by=hook.CMUX_CI_DRAIN_BY, since=bad) if bad != float("inf") else \
+                marker.write_text('{"reason": "r", "until": %f, "by": "%s", "since": Infinity}' % (now + 600, hook.CMUX_CI_DRAIN_BY))
+            self.assertIsNotNone(gate.draining(), f"a since of {bad!r} is no evidence of age")
+        with mock.patch.object(hook, "MEASURE_DRAIN_MAX_S", 0):
+            write(by=hook.CMUX_CI_DRAIN_BY, since=now - 10 * 3600)
+            self.assertIsNotNone(gate.draining(), "0 turns the bound off")
+
+    def test_a_gateway_runner_ignores_the_measurement_drain_and_fleet_builds(self) -> None:
+        """GATEWAY_NO_MEASURE_DRAIN: a gateway runner's client takes no host.lock (GATEWAY_NO_HOST_LOCK), so a
+        measurement's drain, a fleet build's host.lock and its waiters held it off for nothing (2026-11-28)."""
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("exec /usr/bin/python3 /hook job-started --allowed-owner manaflow-ai --gateway-runner\n")
+        gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+        marker = self.runner / hook.RUNNER_DRAIN_FILE
+        marker.write_text(json.dumps({"reason": "a measurement waits", "until": time.time() + 600,
+                                      "by": hook.CMUX_CI_DRAIN_BY, "since": time.time()}))
+        self.assertIsNone(gate.draining(), "a gateway runner takes no lend drain")
+        self.drain()
+        self.assertEqual(gate.draining(), "draining for a relabel to a,b", "a hand or apply drain still holds it")
+        marker.unlink()
+        with mock.patch.object(hook, "host_held", return_value=hook.FLEET_BUILD_HOLDS_HOST):
+            self.assertIsNone(gate.host_claim(), "a fleet build's host.lock holds no gateway runner")
+        self.assertFalse(gate.yields_to_waiters())
+        script.write_text("exec /usr/bin/python3 /hook job-started --allowed-owner manaflow-ai\n")
+        with mock.patch.object(hook, "host_held", return_value=hook.FLEET_BUILD_HOLDS_HOST):
+            self.assertEqual(gate.host_claim(), hook.FLEET_BUILD_HOLDS_HOST, "a PR runner still yields")
+
+    def test_a_gate_with_no_listener_waits_for_its_first_eligibility_look(self) -> None:
+        """FIRST_LOOK_FIRST: cmux14's restarted gates started their listeners before the first look answered, and the
+        jobs taken meanwhile were refused in "Set up job". With no listener up the gate holds until the first look
+        answers (at most GATE_FIRST_LOOK_MAX_S). ELIGIBLE_LOOK_BOUND: a look that hangs past GATE_ELIGIBLE_LOOK_MAX_S
+        is replaced, so a held refusal is looked at again instead of holding for good."""
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("exec /usr/bin/python3 /hook job-started --allowed-owner manaflow-ai --require-eligible "
+                          "--fleet-class m6-16 --toolchain-xcode /Applications/Xcode_26.6.app --instance 1\n")
+        release = threading.Event()
+
+        def slow(*_: object) -> None:
+            release.wait(30)
+            return None
+
+        gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+        with mock.patch.object(hook, "eligibility_refusal", side_effect=slow):
+            self.assertEqual(gate.ineligible(), "ineligible: waiting for the first eligibility look before the listener starts")
+            self.assertEqual(gate.ineligible(), "ineligible: waiting for the first eligibility look before the listener starts")
+            release.set()
+            gate.eligible_look.join(30)
+            self.assertIsNone(gate.ineligible(), "an eligible first look lets the listener start")
+        late = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+        release.clear()
+        with mock.patch.object(hook, "eligibility_refusal", side_effect=slow):
+            late.ineligible()
+            late.eligible_first_at -= hook.GATE_FIRST_LOOK_MAX_S
+            self.assertIsNone(late.ineligible(), "a first look past its bound holds no longer")
+        release.set()
+        late.eligible_look.join(30)
+        hung = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+        hung.eligible_why = "node not eligible (held)"
+        stuck = threading.Event()
+        with mock.patch.object(hook, "eligibility_refusal", side_effect=lambda *_: stuck.wait(30) and None):
+            hung.ineligible()
+            first = hung.eligible_look
+            self.assertTrue(first.is_alive())
+            hung.eligible_at -= hook.GATE_ELIGIBLE_EVERY_S  # the look has hung past both bounds
+        with mock.patch.object(hook, "eligibility_refusal", return_value=None):
+            hung.ineligible()
+            self.assertIsNot(hung.eligible_look, first, "a hung look is replaced")
+            hung.eligible_look.join(30)
+            self.assertIsNone(hung.ineligible(), "the new look's answer lifts the held refusal")
+        stuck.set()
+        first.join(30)
+        self.assertIsNone(hung.eligible_why, "the replaced look's late answer is dropped")
 
     def test_a_drain_marked_during_a_job_stops_the_listener_as_the_job_ends(self) -> None:
         """glaeda#1825: ultra2-glaeda-7 took its next job seconds after each one ended, so an apply's retries never
@@ -15747,6 +15845,29 @@ class GateTest(unittest.TestCase):
             gate.lock_held_since, gate.lock_held_seen = 3000.0, 3005.0
             clock[0] = 3600.0
             self.assertIsNone(gate.claimed(), "the next short hold starts its own clock")
+
+    def test_a_dedicated_listener_stays_up_through_a_short_exclusive_host_lock_hold(self) -> None:
+        """SETTLE_DEDICATED, replaying cmux15's trusted-main gate log of 2026-11-28 03:49-03:55Z: three "stopping the
+        idle listener: a fleet build holds the host lock" for holds of seconds, each 60 s offline, and the census read
+        glaeda-trusted-std-xcode-26.6 at 0 online. A dedicated runner (its job takes no host lock) settles as the
+        signer does: it stands down only for a hold that lasts SIGNER_LOCK_SETTLE_S."""
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("#!/bin/bash\nexec /usr/bin/python3 /hook job-started --allowed-repo manaflow-ai/cmux "
+                          "--capacity-units 30 --instance 0 --dedicated-admit /tmp/x \n")
+        self.assertTrue(hook.runner_scope(self.runner).dedicated)
+        capacity = self.units(0)
+        held = "a fleet build holds the host lock"
+        fd = self.hold(fcntl.LOCK_EX)
+        gate = self.full_gate(capacity)
+        clock = [1000.0]
+        with mock.patch.object(hook.time, "monotonic", side_effect=lambda: clock[0]):
+            for step in (0.0, 5.0, 10.0, 15.0, hook.SIGNER_LOCK_SETTLE_S - 1):  # polled every few s
+                clock[0] = 1000.0 + step
+                self.assertIsNone(gate.host_claim(), f"{step} s into a short hold")
+            clock[0] = 1000.0 + hook.SIGNER_LOCK_SETTLE_S
+            self.assertEqual(gate.host_claim(), held, "a hold that lasts does stop it")
+        fcntl.flock(fd, fcntl.LOCK_UN)
 
     def test_runner_scope_reads_the_sim_runner_flag(self) -> None:
         scope = hook.runner_scope(self.sim_gate(self.units(0)).runner_dir)
@@ -22507,8 +22628,11 @@ class FleetLabelsModuleTest(unittest.TestCase):
         std["simRunners"] = 1
         manifest["hosts"]["mini-std"]["overrides"] = {"runner": {"trustedRef": "refs/heads/main",
                                                                  "trustedRepo": "manaflow-ai/cmux"}}
-        self.assertIn("simRunners needs a dedicated runner without trustedRef",
-                      fleet_labels.member_labels(manifest, "mini-std", lambda a: True)[1])
+        # A trustedRef member that can boot simulators gets none, not a refusal: before, the refusal held cmux22
+        # (a trusted-only promote host) out of every relabel and its 19 runners stayed offline (2026-11-28).
+        trusted_sim, why = fleet_labels.member_labels(manifest, "mini-std", lambda a: True)
+        self.assertIsNotNone(trusted_sim, why)
+        self.assertEqual((trusted_sim["simRunners"], trusted_sim["simPools"]), (0, []))
         manifest["hosts"]["mini-std"]["overrides"] = {"runner": {"poolPrefix": "sim-"}}
         self.assertIn("poolPrefix", fleet_labels.member_labels(manifest, "mini-std", lambda a: True)[1])
 
