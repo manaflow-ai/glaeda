@@ -7743,9 +7743,9 @@ class ClientTest(Base):
         # a red past the first 100 besides the superseded one: still a failure
         more = {"runs": {"SUCCESS": 188, "CANCELLED": 1, "FAILURE": 1}, "statuses": {}}
         self.assertEqual(gg.verdict("pr", {**base, "checkCounts": more}, "green"), 1)
-        # something still running past the first 100: not decided by the counts
+        # something still running past the first 100: not green yet, and not red either: it decides (cmux#64213)
         running = {"runs": {"SUCCESS": 188, "CANCELLED": 1, "IN_PROGRESS": 1}, "statuses": {}}
-        self.assertEqual(gg.verdict("pr", {**base, "checkCounts": running}, "green"), 1)
+        self.assertIsNone(gg.verdict("pr", {**base, "checkCounts": running}, "green"))
         # no counts (an older read): the rollup decides, as before
         self.assertEqual(gg.verdict("pr", base, "green"), 1)
         # a superseded red read by suite id (lastRealAttempt) is in no count: it never cancels a red past page 1
@@ -7764,6 +7764,26 @@ class ClientTest(Base):
         node["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["contexts"].update(
             checkRunCountsByState=[{"state": "SUCCESS", "count": 1}], statusContextCountsByState=[])
         self.assertEqual(gg.parse_pr(node)["checkCounts"], {"runs": {"SUCCESS": 1}, "statuses": {}})
+
+    def test_over_100_checks_a_superseded_red_waits_for_what_still_runs_past_the_first_100(self) -> None:
+        """manaflow-ai/cmux#64213 at 59ba9a22, 2026-11-28: 2 superseded cancelled private-names twins, 0 failed, 1 context
+        past page 1 still running; `wait` (until green) exited 1 in 163 s naming "a context past the 33 checks read"."""
+        cancelled = [{"name": "check", "workflow": "private-names", "conclusion": "CANCELLED"}] * 2
+        done = gg.parse_pr(pr_node(8, rollup="FAILURE", checks=[check_run("build")]))
+        base = {**done, "checksTruncated": True, "checkState": "FAILURE", "superseded": cancelled}
+        running = {"runs": {"SUCCESS": 29, "CANCELLED": 2, "IN_PROGRESS": 1}, "statuses": {"SUCCESS": 6}}
+        for until in ("green", "done", "required"):
+            self.assertIsNone(gg.verdict("pr", {**base, "checkCounts": running}, until), until)
+        finished = {"runs": {"SUCCESS": 30, "CANCELLED": 2}, "statuses": {"SUCCESS": 6}}
+        self.assertEqual(gg.verdict("pr", {**base, "checkCounts": finished}, "green"), 0)
+        # one more red than the superseded ones shown, past page 1: a failure, named by its count
+        red = {"runs": {"SUCCESS": 29, "CANCELLED": 2, "FAILURE": 1, "IN_PROGRESS": 1}, "statuses": {}}
+        self.assertEqual(gg.verdict("pr", {**base, "checkCounts": red}, "green"), 1)
+        note = gg.rollup_red_note({**base, "checkCounts": red})
+        self.assertIn("2 cancelled, 1 failure", note)
+        self.assertIn("private-names / check cancelled", note)
+        self.assertIn("1 still running", note)
+        self.assertEqual(gg.rollup_red_note(base), "")
 
     def test_until_done_waits_for_checks_still_running_past_the_first_100(self) -> None:
         """manaflow-ai/cmux#43515 at f35486bc, 2026-11-15: 247 contexts; an excused "cmux-next CI guard group" red at

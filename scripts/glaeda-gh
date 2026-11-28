@@ -33321,6 +33321,18 @@ def rollup_red_is_superseded(data: dict) -> bool:
     rows = [*(counts.get("runs") or {}).items(), *(counts.get("statuses") or {}).items()]
     if any(state in COUNT_PENDING and n for state, n in rows):
         return False
+    return rollup_red_counts_are_superseded(data)
+
+
+def rollup_red_counts_are_superseded(data: dict) -> bool:
+    """Whether every red context the truncated rollup counts, over every page, is a superseded attempt shown, whatever
+    is still running. manaflow-ai/cmux#64213 at 59ba9a22, 2026-11-28: 2 cancelled private-names twins (superseded),
+    nothing failed, 1 context past page 1 still running, and `wait` (until green) exited 1 in 163 s, "GitHub's rollup
+    is FAILURE from a context past the 33 checks read": the red was the twins, and the head went green minutes later."""
+    counts = data.get("checkCounts")
+    if not isinstance(counts, dict):
+        return False
+    rows = [*(counts.get("runs") or {}).items(), *(counts.get("statuses") or {}).items()]
     red = sum(n for state, n in rows if state in COUNT_BAD)
     # only attempts the rollup itself listed: one add_last_real_contexts read by suite id is in no count (review of
     # #1958: an uncounted superseded red cancelled a real red past page 1)
@@ -34067,6 +34079,8 @@ def check_verdict(data: dict, until: str = "green", now: float | None = None,
             return None
         if not groups["failed"] and not groups["pending"] and not groups["held"] and rollup_red_is_superseded(data):
             return EXIT_OK  # every red context on every page is a superseded attempt
+        if not groups["failed"] and pending_on_every_page(data) and rollup_red_counts_are_superseded(data):
+            return None  # the red is only superseded attempts and contexts past page 1 still run: they decide
         return None if groups["held"] else EXIT_FAIL
     if not checks:
         # nothing has reported yet: not started while the head settles (or its push time is unknown), then said so
@@ -35495,11 +35509,33 @@ def wait_outcome(req: dict, result: int, entry: dict | None, waited: int) -> dic
     if not failed and kind == "pr" and data.get("checksTruncated"):
         # the red is GitHub's rollup's, from a context past the checks this read holds: there is no list above
         return fail_fields("checks-failed", f"{name}: GitHub's rollup is {data.get('checkState') or 'red'} from a "
-                           f"context past the {len(data.get('checks') or [])} checks read (none of those failed)",
-                           f"glaeda-gh status pr {name}")
+                           f"context past the {len(data.get('checks') or [])} checks read (none of those failed)"
+                           f"{rollup_red_note(data)}", f"glaeda-gh status pr {name}")
     return fail_fields("checks-failed", f"{name}: {len(failed)} check(s) failed",
                        f"glaeda-gh status run {owner}/{repo}/{run_id} --jobs" if run_id
                        else "none (fix the failed checks listed above, push, and wait again)")
+
+
+def rollup_red_note(data: dict) -> str:
+    """What the truncated rollup's own counts say is red over every page, and the superseded reds shown, so a failure
+    past page 1 is named by state rather than left at "a context past the checks read" (cmux#64213, 2026-11-28)."""
+    counts = data.get("checkCounts")
+    if not isinstance(counts, dict):
+        return ""
+    rows = [*(counts.get("runs") or {}).items(), *(counts.get("statuses") or {}).items()]
+    red = {}
+    for state, n in rows:
+        if state in COUNT_BAD and n:
+            red[state] = red.get(state, 0) + n
+    if not red:
+        return ""
+    shown = [c for c in data.get("superseded") or [] if str(c.get("conclusion") or "").upper() in COUNT_BAD]
+    names = ", ".join(f"{c.get('workflow') + ' / ' if c.get('workflow') else ''}{c.get('name')} "
+                      f"{str(c.get('conclusion')).lower()} {c.get('url') or ''}".strip() for c in shown[:3])
+    text = "; the rollup counts " + ", ".join(f"{n} {state.lower()}" for state, n in sorted(red.items()))
+    pending = pending_on_every_page(data)
+    return text + (f", {len(shown)} of them superseded attempts shown ({names})" if shown else "") + (
+        f", {pending} still running" if pending else "")
 
 
 def emit(key: str, entry: dict | None, as_json: bool, extra: dict | None = None, until: str = "done",
