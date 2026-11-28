@@ -35290,6 +35290,50 @@ class LandTest(Base):
             e = self.tick()
         self.assertEqual((len(self.handoffs()), e["state"]), (1, "forwarded"))
 
+    UNLISTED = ("gh: lane-gh call dispatch o/r: refused: dispatch starts only the reviewed workflows the broker lists "
+                "(manaflow-ai/cmux cmux-next-cef-publish.yml, manaflow-ai/cmux cmux-next-remote-browser-host-publish.yml)")
+
+    def test_a_dispatch_the_broker_does_not_list_hands_the_land_to_the_broker_host_once(self):
+        # cmux#46130 at bd06fcd6, fs-agent-lane-12, 2026-11-28 04:09Z..05:09Z: land_judge named the fast-gates dispatch,
+        # the broker refused the workflow 7 times over two lands, and the row stopped dispatch_refused with no red. The
+        # first refusal hands the land to the broker host's queue, which dispatches with its own login.
+        self.gates_allowed()
+        self.broker = True
+        self.w.gh_rc["dispatch"] = 1
+        self.w.gh_err["dispatch"] = self.UNLISTED
+        self.pr(LA)
+        with mock.patch.object(gg, "policy_host", lambda: "host"):
+            self.land(requester="host/lane")
+            self.w.answers.append(self.gates_refusal(LA))
+            e = self.tick()
+        self.assertEqual(len(self.dispatches()), 1)
+        [call] = self.handoffs()
+        self.assertEqual(json.loads(call[4]), {"number": 1, "sha": LA, "requester": "host/lane"})
+        self.assertEqual((e["state"], e.get("forwardedTo"), e["handedOff"]["head"]), ("forwarded", "huge-blue", LA))
+        self.assertFalse(e.get("dispatchSent"))
+        self.assertIn("dispatch_unlisted", [h["event"] for h in e["history"]])
+        self.assertFalse(e.get("stop"))
+
+    def dispatch_refused_here(self, broker: bool, err: str) -> dict:
+        self.gates_allowed()
+        self.broker = broker
+        self.w.gh_rc["dispatch"] = 1
+        self.w.gh_err["dispatch"] = err
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(self.gates_refusal(LA))
+        e = self.tick()
+        self.assertEqual(self.handoffs(), [])
+        self.assertNotEqual(e["state"], "forwarded")
+        self.assertIn("step_refused", [h["event"] for h in e["history"]])
+        return e
+
+    def test_a_lane_vms_dispatch_refused_for_another_reason_is_never_handed_off(self):
+        self.dispatch_refused_here(True, "HTTP 403: Resource not accessible by integration")
+
+    def test_a_dispatch_refused_on_a_host_with_its_own_login_is_never_handed_off(self):
+        self.dispatch_refused_here(False, self.UNLISTED)
+
     def broker_lands(self) -> list[list[str]]:
         return [c for c in self.w.calls if c[0] == "/fake/lane-gh" and c[1:3] == ["call", "land"]]
 

@@ -18901,6 +18901,17 @@ LAND_NOT_OWNER = re.compile(r"branch \S+ was not pushed by \S+")
 # LAND_STEP_STOP. hand_off takes LIVE instead (handoff_head_moved).
 LAND_HANDOFF_HEAD = re.compile(r"PR \d+'s head is ([0-9a-f]{40}), not ([0-9a-f]{40})")
 LAND_HANDOFF_KINDS = frozenset({"merge", "update_branch", "retarget"})  # the write steps own_pr refuses
+# The broker's dispatch tool refused a workflow it does not list (cmuxterm-hq tools/lane-gh-broker
+# parts/43-calls-dispatch.py: "dispatch starts only the reviewed workflows the broker lists"). land_judge names the
+# fast-gates dispatch (LAND_DISPATCH_WORKFLOWS) for a clean base merge its router started no gates for, which the merge
+# train had turned away. On a lane VM this queue sent it through the broker, which refuses that workflow every time, so
+# the row stopped dispatch_refused at LAND_STEP_STOP: cmux#46130 at bd06fcd6, fs-agent-lane-12, 2026-11-28 04:09Z to
+# 05:09Z, 7 refusals over two lands, with 206 of 208 checks passed and no red. No retry changes the broker's list, and
+# widening the list is a trust change. The broker host's own land queue sends the same dispatch with its own login
+# (do_dispatch there; cmux-cp-1 sent 27 of 27 that day). So the first such refusal hands the entry off, as an ownership
+# refusal does (owner_refused), once per head. On a host with its own login nothing changes.
+# Detector: test-glaeda-gh.py test_a_dispatch_the_broker_does_not_list_hands_the_land_to_the_broker_host_once.
+LAND_DISPATCH_UNLISTED = re.compile(r"dispatch starts only the reviewed workflows the broker lists")
 LAND_HANDOFF_TOOL = "land_handoff"
 # A judgment that read nothing because a git read of this host's own mirror timed out (land_judge's classifier
 # archive, "git archive ... tried twice: Command '[...git...]' timed out after 24 seconds") is no GitHub read the
@@ -28116,7 +28127,9 @@ class LandQueue:
                               "next"}, LAND_DISPATCH_SETTLE)
             else:
                 named = self.step_refused(e, "dispatch", head, got)
-        if named == "update_branch":
+        if named == "hand_off":
+            self.hand_off(e, head)  # the broker host's queue sends it with its own login (LAND_DISPATCH_UNLISTED)
+        elif named == "update_branch":
             self.update_branch(e, head, named=True)
 
     def do_fetch(self, e: dict, act: dict, answer: dict, head: str) -> None:
@@ -28718,6 +28731,8 @@ class LandQueue:
             return None
         if kind in LAND_HANDOFF_KINDS and LAND_NOT_OWNER.search(out) and self.broker_client():
             return self.owner_refused(e, kind, head, out)
+        if kind == "dispatch" and LAND_DISPATCH_UNLISTED.search(out) and self.broker_client():
+            return self.owner_refused(e, kind, head, out, LAND_DISPATCH_UNLISTED)
         if LAND_STEP_QUOTA.search(out):
             self.park_quota(e, out)  # the login's state, not the PR's: parked, never counted toward a stop
             e["stepQuotaParked"] = True  # so the judgment after the reset does not count toward a stop either
@@ -28854,12 +28869,15 @@ class LandQueue:
             return False
         return str(data.get("reviewDecision") or "").upper() in LAND_REVIEW_MISSING
 
-    def owner_refused(self, e: dict, kind: str, head: str, out: str) -> str | None:
-        """KIND at HEAD was refused by the broker's owner check (LAND_NOT_OWNER). Under the lock. "hand_off" when the
-        caller should hand the entry to the broker host's land queue now (hand_off, off the lock); None when this head
-        was handed off before (the entry is left forwarded again, with no second call)."""
-        why = land_trim(LAND_NOT_OWNER.search(out).group(0), 200)
-        self.history(e, "owner_refused", kind=kind, head=head[:12], why=why)
+    def owner_refused(self, e: dict, kind: str, head: str, out: str,
+                      refusal: re.Pattern = LAND_NOT_OWNER) -> str | None:
+        """KIND at HEAD was refused by the broker's owner check (LAND_NOT_OWNER), or a dispatch by its workflow list
+        (REFUSAL LAND_DISPATCH_UNLISTED). Under the lock. "hand_off" when the caller should hand the entry to the broker
+        host's land queue now (hand_off, off the lock); None when this head was handed off before (the entry is left
+        forwarded again, with no second call)."""
+        why = land_trim(refusal.search(out).group(0), 200)
+        self.history(e, "owner_refused" if refusal is LAND_NOT_OWNER else "dispatch_unlisted", kind=kind,
+                     head=head[:12], why=why)
         done = e.get("handedOff") or {}
         if done.get("head") == head and done.get("key") == e["key"]:
             e.update(state=LAND_FORWARDED, wait=None, wakeAt=None, action=None, forwardedTo=done.get("host") or "")
