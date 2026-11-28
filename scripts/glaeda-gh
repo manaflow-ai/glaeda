@@ -1557,8 +1557,12 @@ contexts(first: 100) { totalCount PR_COUNTS pageInfo { hasNextPage endCursor } n
 # requests in each PR of the batched read, 20 points for a batch of ten. The suites whose newest attempt ran nothing
 # (on a cmux head about 15 of 55, mostly apps' suites that never run anything) are read by id instead, where each
 # suite is one request: a suite that never ran anything comes back with no runs and adds nothing.
-SUITE_ATTEMPTS = ("checkSuites(first: 100) { totalCount pageInfo { hasNextPage } nodes { id "
+SUITE_ATTEMPTS = ("checkSuites(first: 100) { totalCount pageInfo { hasNextPage endCursor } nodes { id "
                   "latest: checkRuns(first: 1) { totalCount } } }")
+SUITES_MORE = """query($owner: String!, $name: String!, $oid: GitObjectID!, $after: String) {
+rateLimit { limit remaining resetAt cost } repository(owner: $owner, name: $name) { object(oid: $oid) { ... on Commit {
+checkSuites(first: 100, after: $after) { pageInfo { hasNextPage endCursor } nodes { id latest: checkRuns(first: 1) { totalCount } } } } } } }"""
+SUITES_MORE_PAGES = 10  # pages of 100 suites past the first one a head is followed through (1,100 suites in all)
 SUITE_RUNS_BATCH = 100  # suite ids per SUITE_RUNS query: GitHub's nodes(ids:) takes at most 100
 PR_FIELDS = PR_FIELDS.replace("SUITE_ATTEMPTS", SUITE_ATTEMPTS)
 # A PR's fingerprint (pr_fingerprint): what a verdict or a wait reads from a PR, as counts. The full read above costs
@@ -12750,6 +12754,7 @@ class Daemon:
                         kept.add(i)
                         continue
                     commit = (((node.get("commits") or {}).get("nodes") or [{}])[0] or {}).get("commit") or {}
+                    self.page_more_suites("/".join(split_key(entries[i]["key"])[1:3]), commit)
                     attempts[i] = ran_nothing_suites(commit)
         # one read for the whole batch's suites, not one per PR: most cmux heads have a few such suites
         suite_runs, suites_error = self.suite_runs(
@@ -13502,8 +13507,15 @@ class Daemon:
                 self.refund(e["key"])
             return message
         # Suites whose newest attempt ran nothing, in each head and its check-of-record commit: one read for the batch.
-        attempts = {alias: ran_nothing_suites((data.get(alias) or {}).get("object"))
-                    for i in range(len(entries)) for alias in (f"h{i}", f"m{i}")}
+        attempts = {}
+        for i in range(len(entries)):
+            for alias in (f"h{i}", f"m{i}"):
+                obj = (data.get(alias) or {}).get("object")
+                _, owner, repo, sha = split_key(entries[i]["key"])
+                if alias[0] == "m":  # the check-of-record commit lives in another repository
+                    owner, repo = CHECKS_OF_RECORD.get((owner, repo), (owner, repo))
+                self.page_more_suites(f"{owner}/{repo}", obj, str(sha))
+                attempts[alias] = ran_nothing_suites(obj)
         suite_runs, suites_error = self.suite_runs(
             [s for found in attempts.values() if isinstance(found, list) for s in found], paced=False,
             route=heads_repos([e["key"] for e in entries]))
@@ -13569,6 +13581,38 @@ class Daemon:
             return [], suites
         runs, error = self.suite_runs(suites)
         return suites_contexts(suites, runs, error)
+
+    def page_more_suites(self, repo_key: str, commit: dict | None, oid: str = "") -> None:
+        """Fill COMMIT's checkSuites past its first page (more than 100 suites: a cmux head has up to a few hundred):
+        read the next pages by cursor and append them, so ran_nothing_suites sees every suite and the head's verdict
+        reads whole instead of "more than 100 check suites" (cmux#62623, 2026-11-28: a land verdict that ran out its 229 s
+        merge-check deadline on that partial, 68 cached heads with the same error). Any page that cannot be read leaves
+        the commit as it was: still partial, never greener."""
+        suites = (commit or {}).get("checkSuites")
+        if not isinstance(suites, dict) or not (suites.get("pageInfo") or {}).get("hasNextPage"):
+            return
+        owner, _, name = repo_key.partition("/")
+        oid, cursor = oid or str((commit or {}).get("oid") or ""), (suites.get("pageInfo") or {}).get("endCursor")
+        nodes = list(suites.get("nodes") or [])
+        reason, self.gql_reason = self.gql_reason, "suites-more"
+        try:
+            for _ in range(SUITES_MORE_PAGES):
+                if not (owner and name and oid and cursor):
+                    return
+                doc, error = self.graphql(SUITES_MORE, {"owner": owner, "name": name, "oid": oid, "after": cursor})
+                page = (((doc or {}).get("data") or {}).get("repository") or {}).get("object") or {}
+                page = page.get("checkSuites") if isinstance(page, dict) else None
+                if error or doc.get("errors") or not isinstance(page, dict) or not isinstance(page.get("nodes"), list):
+                    return
+                nodes += page["nodes"]
+                info = page.get("pageInfo") or {}
+                if not info.get("hasNextPage"):
+                    suites["nodes"] = nodes
+                    suites["pageInfo"] = {"hasNextPage": False, "endCursor": info.get("endCursor")}
+                    return
+                cursor = info.get("endCursor")
+        finally:
+            self.gql_reason = reason
 
     def suite_runs(self, suites: list[str], paced: bool = True,
                    route: "list[str] | None" = None) -> tuple[dict[str, list[dict] | str], str | None]:

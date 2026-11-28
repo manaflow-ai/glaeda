@@ -52223,6 +52223,46 @@ class WaitedPoolReadsOldestFirst(unittest.TestCase):
         self.assertIn(oldest, asked)  # the 30 oldest went together, first
 
 
+class SuitesPastOnePagePaged(unittest.TestCase):
+    """cmux#62623, 2026-11-28: a head with more than 100 check suites stayed partial ("more than 100 check suites"),
+    so its land verdict ran out its merge-check deadline. The later pages are read by cursor and appended."""
+
+    def commit(self, more=True):
+        return {"oid": "a" * 40, "checkSuites": {"totalCount": 130, "pageInfo": {"hasNextPage": more, "endCursor": "C1"},
+                                                  "nodes": [{"id": f"S{i}", "latest": {"totalCount": 1}} for i in range(100)]}}
+
+    def daemon(self, pages):
+        d = gg.Daemon.__new__(gg.Daemon)
+        d.gql_reason, d.asked = "x", []
+
+        def graphql(query, variables):
+            d.asked.append(variables.get("after"))
+            return pages.pop(0), None
+        d.graphql = graphql
+        return d
+
+    def page(self, ids, more=False, end="C2"):
+        return {"data": {"repository": {"object": {"checkSuites": {"pageInfo": {"hasNextPage": more, "endCursor": end},
+                "nodes": [{"id": i, "latest": {"totalCount": 1}} for i in ids]}}}}}
+
+    def test_the_later_pages_complete_the_head(self):
+        d, commit = self.daemon([self.page([f"T{i}" for i in range(30)])]), self.commit()
+        d.page_more_suites("o/r", commit)
+        self.assertEqual(d.asked, ["C1"])
+        self.assertEqual(len(commit["checkSuites"]["nodes"]), 130)
+        self.assertEqual(gg.ran_nothing_suites(commit), [])  # no partial error: every suite counted
+
+    def test_a_page_that_cannot_be_read_leaves_the_head_partial(self):
+        d, commit = self.daemon([{"data": None, "errors": [{"message": "boom"}]}]), self.commit()
+        d.page_more_suites("o/r", commit)
+        self.assertEqual(gg.ran_nothing_suites(commit), gg.SUITES_PAST_ONE_PAGE)
+
+    def test_a_head_within_one_page_asks_nothing(self):
+        d, commit = self.daemon([]), self.commit(more=False)
+        d.page_more_suites("o/r", commit)
+        self.assertEqual(d.asked, [])
+
+
 class HeadReadsSizedByMeasuredCost(unittest.TestCase):
     """The land host, 2026-11-26 02:47-07:02Z: head batches of 6 to 13 cmux heads were cut by GitHub at 10.6-32.4 s
     tick after tick (the head batch restarts at 10 on every reexec and grows back between halvings), and ticks spent
