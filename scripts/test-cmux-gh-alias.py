@@ -64,6 +64,15 @@ class CmuxGhAliasTest(unittest.TestCase):
                                 env=self.env, timeout=60)
         self.assertNotEqual(result.returncode, 0)  # no glaeda-gh beside this copy: it never falls back to a stray one
 
+    def test_the_shim_installed_as_glaeda_gh_fails_fast_instead_of_exec_looping(self) -> None:
+        # the shim copied over the program's name: it would exec itself forever (a hung `gh --probe`, then a hung git push)
+        shutil.copy2(SCRIPTS / "cmux-gh", self.bin / "glaeda-gh")
+        for args in (("gh", "--probe"), ("--help",)):
+            result = subprocess.run([os.fspath(self.bin / "glaeda-gh"), *args], capture_output=True, text=True,
+                                    env=self.env, timeout=10)  # a loop times out here
+            self.assertEqual(result.returncode, 127)
+            self.assertIn("the shim itself", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

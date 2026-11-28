@@ -6,6 +6,13 @@ case $0 in
   */*) here=${0%/*} ;;
   *) here=$(dirname "$(command -v "$0")") ;;
 esac
+# This file installed under the name glaeda-gh (fs-agent-lane-57, 2026-11-28: ~/.local/bin/glaeda-gh was this shim, 487
+# bytes) would exec itself forever, same pid, a core spinning, and every `glaeda-gh gh --probe` from a wrapper and every
+# git credential helper behind it hung for hours. Never exec a program that is this file; say so and fail.
+if [ "$here/glaeda-gh" -ef "$0" ]; then
+  echo "cmux-gh: $0 is the shim itself, not glaeda-gh (the program); reinstall glaeda-gh (glaeda-update, or host-baseline install_glaeda_gh)" >&2
+  exit 127
+fi
 GLAEDA_GH_AS=cmux-gh
 export GLAEDA_GH_AS
 exec "$here/glaeda-gh" "$@"
