@@ -53338,6 +53338,36 @@ class RollupHeadPartsTest(unittest.TestCase):
                     self.doc(sha="b" * 40), self.doc(5, check_runs={"total_count": 9, "check_runs": []})):
             self.assertIsNone(gg.rollup_head_parts(doc, self.SHA, "/repos/o/r"))
 
+    def test_a_head_past_rest_check_pages_is_served_whole(self) -> None:
+        # manaflow-ai/cmux heads carry ~689 check runs: past REST_CHECK_PAGES * 100 the rollup was refused, and every
+        # lane VM's PR read paged 5 check-run pages and the status from GitHub for a list that came out truncated
+        parts = gg.rollup_head_parts(self.doc(689), self.SHA, "/repos/o/r")
+        path = gg.check_runs_path("/repos/o/r", self.SHA)
+        self.assertEqual(sorted(p for p in parts if p.startswith(path)),
+                         sorted([path] + [f"{path}&page={n}" for n in range(2, 8)]))
+        self.assertEqual(sum(len(parts[p]["doc"]["check_runs"]) for p in parts if p.startswith(path)), 689)
+        self.assertIsNone(gg.rollup_head_parts(self.doc(gg.ROLLUP_CHECK_PAGES * 100 + 1), self.SHA, "/repos/o/r"))
+
+    def test_rest_head_serves_the_whole_rollup_and_takes_its_kept_pages_back(self) -> None:
+        root, path = "/repos/o/r", gg.check_runs_path("/repos/o/r", self.SHA)
+        rolled = gg.rollup_head_parts(self.doc(689), self.SHA, root)
+        asked: list = []
+        fake = types.SimpleNamespace(
+            now=NOW, resume_from=NOW, controller_head_parts=lambda r, s: rolled,
+            head_part=lambda old, parts, p, slim: asked.append(p) or {"statuses": [], "total": 0},
+            rest_head_rest=lambda old, parts, r, s, checks, statuses, total: (checks, statuses, [], {}))
+        parts: dict = {}
+        checks, statuses, _, _ = gg.Daemon.rest_head(fake, {}, parts, root, self.SHA)
+        self.assertEqual((checks["total_count"], len(checks["check_runs"]), asked), (689, 689, []))
+        kept: dict = {}
+        checks, _, _, _ = gg.Daemon.rest_head(fake, parts, kept, root, self.SHA, runs_kept=True)
+        self.assertEqual((checks["total_count"], len(checks["check_runs"])), (689, 689))
+        self.assertEqual(asked, [f"{root}/commits/{self.SHA}/status?per_page=100&page=1"])  # (as before: no rollup ask)
+        # a GitHub read kept 5 pages of a bigger head: the kept read stops there, as it did
+        github = {p: v for p, v in parts.items() if p == path or any(p == f"{path}&page={n}" for n in range(2, 6))}
+        checks, _, _, _ = gg.Daemon.rest_head(fake, github, {}, root, self.SHA, runs_kept=True)
+        self.assertEqual(len(checks["check_runs"]), 500)
+
 
 class WatchFeedTest(Base):
     """`glaeda-gh watch`: a store that moves a PR's state, CI or review appends one versioned line; a watch --since V

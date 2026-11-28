@@ -1430,6 +1430,12 @@ READ_SECONDS_MIN_READS = 10
 READ_SECONDS_WINDOW = 900.0
 REST_CHECK_PAGES = 5  # check-run pages (100 each) one PR read over REST takes at most
 REST_STATUS_PAGES = 2  # commit-status pages (100 each) likewise
+# The check-run pages (100 each) a complete controller rollup serves a REST head read (rollup_head_parts): none is a
+# GitHub request, so REST_CHECK_PAGES does not bound them. 2026-11-28 10:29-12:29Z: manaflow-ai/cmux heads carry ~689
+# check runs, past REST_CHECK_PAGES * 100, so every lane VM's PR read refused the rollup that held all of them and
+# paged 5 check-run pages and the status from GitHub (glaeda-upstream: check-runs 401, status 144 broker reads in 2 h)
+# for a list that still came out truncated.
+ROLLUP_CHECK_PAGES = 30
 REST_RUN_PAGES = 2  # a commit's workflow-run pages (100 each) likewise: without its run a check has no workflow
 REST_STEPS_MAX = 10  # step reads (a run's job-list page or one job) one PR read over REST makes at most
 REST_JOB_PAGES = 3  # pages (100 jobs each) of one run's job list a step lookup reads before it reads the job alone
@@ -5752,7 +5758,7 @@ def rollup_head_parts(doc: object, sha: str, root: str) -> dict[str, dict] | Non
     runs = doc["check_runs"].get("check_runs")
     listed = doc["status"].get("statuses")
     if doc["check_runs"].get("total_count") != len(runs) or doc["status"].get("total_count") != len(listed) \
-            or len(runs) > REST_CHECK_PAGES * 100 or len(listed) > 100:
+            or len(runs) > ROLLUP_CHECK_PAGES * 100 or len(listed) > 100:
         return None
     if any(not isinstance(r, dict) or not isinstance(r.get("id"), int) or isinstance(r.get("id"), bool) for r in runs):
         return None
@@ -14422,7 +14428,7 @@ class Daemon:
             return {}
         path = check_runs_path(root, sha)
         listed: list = []
-        for page in range(1, REST_CHECK_PAGES + 1):
+        for page in range(1, ROLLUP_CHECK_PAGES + 1):  # (the kept pages: a controller rollup's can pass REST_CHECK_PAGES)
             kept = old.get(path if page == 1 else f"{path}&page={page}")
             if not isinstance(kept, dict) or not isinstance(kept.get("doc"), dict):
                 break
@@ -14811,8 +14817,13 @@ class Daemon:
         if not runs_kept:  # read (or confirmed by a 304) now: runs_unchanged's bound counts from here
             parts[path] = {**parts[path], "at": min(self.now, self.resume_from)}
         listed = list(checks.get("check_runs") or [])
-        for page in range(2, min(REST_CHECK_PAGES, -(-(checks.get("total_count") or 0) // 100)) + 1):
-            listed += run_page(f"{path}&page={page}").get("check_runs") or []
+        pages = -(-(checks.get("total_count") or 0) // 100)
+        # kept pages past REST_CHECK_PAGES are a controller rollup's (ROLLUP_CHECK_PAGES); a GitHub read kept none
+        for page in range(2, min(ROLLUP_CHECK_PAGES if runs_kept else REST_CHECK_PAGES, pages) + 1):
+            page_path = f"{path}&page={page}"
+            if runs_kept and page > REST_CHECK_PAGES and page_path not in old:
+                break
+            listed += run_page(page_path).get("check_runs") or []
         checks = {"total_count": checks.get("total_count"), "check_runs": listed}
         statuses: list[dict] = []
         total = 0
