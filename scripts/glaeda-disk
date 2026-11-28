@@ -7789,7 +7789,11 @@ SHARED_MIRROR_DOMINANT_SHARE = 0.8
 # folds read as a 22.8 GiB an hour fetch storm (2026-11-09). Lines older than REPACKED_KEEP_S go at the next write.
 SHARED_MIRROR_REPACKED_FILE = "clone-care-repacked"
 SHARED_MIRROR_REPACKED_KEEP_S = 2 * 3600
-SHARED_MIRROR_GLOBS = (".wt-mirrors/*/*.git", "*/.wt-mirrors/*/*.git")  # wt's root is home or a folder in it
+# wt's root is home or a folder in it. tools/spotlight_noindex moved ~/Projects/.wt-mirrors to .wt-mirrors.noindex and left
+# a symlink at the old name, which shared_mirrors never follows: cmux16 (2026-11-27) held 15 GiB of mirrors, 130 packs in
+# one, and no fold ran on any host that had the rename.
+WT_MIRROR_DIRS = (".wt-mirrors", ".wt-mirrors.noindex")
+SHARED_MIRROR_GLOBS = tuple(g for d in WT_MIRROR_DIRS for g in (f"{d}/*/*.git", f"*/{d}/*/*.git"))
 # The full repack's memory: unbounded, the cmuxterm-hq mirror's took 9.6 GB resident; two threads with a
 # bounded delta window took 5.3 GB and 209 s for the same 3.5 GiB pack, a background job beside builds.
 SHARED_MIRROR_REPACK_ARGS = ("repack", "-a", "-d", "-k", "-l", "-q", "--threads=2", "--window-memory=256m")
@@ -7881,7 +7885,7 @@ SEED_PACK_NAME = re.compile(r"pack-(?:[0-9a-f]{40}|[0-9a-f]{64})")
 
 def mirror_repo(gitdir: Path) -> str:
     """owner/name of a tools/wt mirror (<root>/.wt-mirrors/<owner>/<name>.git), or ""."""
-    if gitdir.suffix != ".git" or gitdir.parent.parent.name != ".wt-mirrors":
+    if gitdir.suffix != ".git" or gitdir.parent.parent.name not in WT_MIRROR_DIRS:
         return ""
     return f"{gitdir.parent.name}/{gitdir.stem}"
 
@@ -8650,11 +8654,13 @@ def git_outside_index(fresh: bool = False) -> list[tuple[str, str, str]]:
                 out.append((co, target, "a checkout's .git file points into it"))
         elif dotgit.is_dir():
             out += [(co, alt, "a checkout borrows its objects (alternates)") for alt in _alternates(dotgit)]
-    mirrors = HOME / "Projects/.wt-mirrors"
-    for depth in ("*", "*/*", "*/*/*"):
-        for g in glob.glob(os.fspath(mirrors / depth)):
-            if g.endswith(".git") and os.path.isdir(g):
-                out += [(g, alt, "a wt mirror borrows its objects (alternates)") for alt in _alternates(Path(g))]
+    for mirrors in (HOME / "Projects" / d for d in WT_MIRROR_DIRS):
+        if mirrors.is_symlink():
+            continue  # .wt-mirrors points at .wt-mirrors.noindex: read once, through the real folder
+        for depth in ("*", "*/*", "*/*/*"):
+            for g in glob.glob(os.fspath(mirrors / depth)):
+                if g.endswith(".git") and os.path.isdir(g):
+                    out += [(g, alt, "a wt mirror borrows its objects (alternates)") for alt in _alternates(Path(g))]
     _GIT_OUTSIDE_INDEX = out
     return out
 
@@ -10229,7 +10235,7 @@ def git_loss(path: Path) -> str:
         common = git("rev-parse", "--path-format=absolute", "--git-common-dir")
         if common is None or os.path.realpath(common.strip()).startswith(os.path.realpath(path) + "/"):
             return "repository inside the worktree"
-        if os.path.lexists(os.path.join(own.strip(), "locked")):
+        if worktree_locked(own.strip()):
             return "locked worktree"
         # refs/bisect and refs/worktree belong to the worktree and go with it
         refs = git("for-each-ref", "--count=1", "--contains", "HEAD", "--format=%(refname)",
@@ -11591,7 +11597,7 @@ def _gone_record_is_empty(gitdir: Path, tree: Path) -> bool:
             return False
         if named != tree:
             continue
-        if os.path.lexists(rec / "locked"):
+        if worktree_locked(rec):
             return False
         tips = local_tips(rec, worktree_only=True)
         if tips is None:
@@ -11646,11 +11652,13 @@ def mirror_repos(path: Path, external: dict[str, tuple[Path, list[str]]] | None 
         common = git_common_dir(root)
         if not common:
             return f"{where}: unreadable worktree", {}, []
-        if os.path.lexists(os.path.join(own.strip(), "locked")):  # as git_loss: wherever its repository is
+        if worktree_locked(own.strip()):  # as git_loss: wherever its repository is
             return f"{where}: locked worktree", {}, []
         if (os.path.realpath(common) + "/").startswith(inside):
             gitdirs[os.path.realpath(common)] = Path(common)
             continue
+        if os.path.lexists(os.path.join(own.strip(), "locked")):
+            continue  # a seed's lock (worktree_locked let it through): its owner re-creates it, so its reflog keeps nothing
         tips = local_tips(Path(own.strip()), worktree_only=True)
         if tips and external is not None:
             tips = _present_commits(Path(common), tips)  # a reflog entry gc already took is lost already
@@ -11730,6 +11738,43 @@ def mount_below(path: Path, budget: int = MOUNT_WALK_BUDGET) -> str:
         except OSError as e:
             return f"unreadable below it: {e.__class__.__name__}"
     return ""
+
+
+# The reasons a seed tree's worktree is git-locked with, so git never prunes it: tools/wt's BASE_REASON ("wt base: the
+# tree new checkouts clone copy-on-write; nobody works here") and cmux's worktree seed ("cmux-worktree seed: clean
+# checkout new worktrees clone; never edit it"). Both say nobody works there and both are rebuilt by their owner.
+WT_SEED_LOCK_PREFIXES = ("wt base:", "cmux-worktree seed:")
+
+
+def worktree_locked(gitdir) -> bool:
+    """Whether a linked worktree's git dir holds a lock that means someone works there. A wt base's own lock
+    (wt registers each copy-on-write seed tree under it so git does not prune it, and says nobody works there) is
+    no hold: cmux16's ~/Library/Caches/cmux-worktree-seed/<key> was blocked:bundle-failed on it every pass, 63 h
+    idle (2026-11-27), because a wt-locked worktree read as unbundleable. A `wt new` still checking out holds
+    "wt new: checking out" and a person's own lock keeps whatever reason it has: both still hold."""
+    lock = Path(gitdir) / "locked"
+    try:
+        return not lock.read_text(errors="replace").strip().startswith(WT_SEED_LOCK_PREFIXES)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+
+def prune_removed_seed_records(common: str) -> None:
+    """git worktree prune, after dropping the lock of each record whose tree is gone and whose lock is a seed's
+    (worktree_locked): prune never drops a locked record, and the owner's next `git worktree add` of the seed's
+    path then refuses on the missing-but-locked one."""
+    with contextlib.suppress(OSError):
+        for rec in Path(common, "worktrees").iterdir():
+            try:
+                tree = Path((rec / "gitdir").read_text().strip()).parent
+            except (OSError, ValueError):
+                continue
+            if not os.path.lexists(tree) and (rec / "locked").is_file() and not worktree_locked(rec):
+                with contextlib.suppress(OSError):
+                    (rec / "locked").unlink()
+    subprocess.run(["git", "--git-dir", common, "worktree", "prune"], capture_output=True, timeout=60)
 
 
 def mount_below_why(why: str) -> str:
@@ -16962,8 +17007,7 @@ def apply(items: list[Item], families: dict[str, Family], receipt: Path,
                             if bdev in budget_left:
                                 budget_left[bdev] -= took  # anything a budget family gives back counts toward it
                 if common:  # drop the deleted worktree's record from its repository
-                    subprocess.run(["git", "--git-dir", common, "worktree", "prune"],
-                                   capture_output=True, timeout=60)
+                    prune_removed_seed_records(common)
             except SlotTaken as e:
                 outcome = "changed:in-use"
                 if str(e):

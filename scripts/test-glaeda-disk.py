@@ -8356,6 +8356,67 @@ class GlaedaDiskTest(unittest.TestCase):
                          ("failed:exit-128", "failed", "gc failed:exit-128"))
         self.assertIn("its last gc failed within 24h", second["reasons"][0])
 
+    def test_a_noindex_mirror_is_found_once_and_named(self) -> None:
+        # cmux16, 2026-11-27: spotlight_noindex moved ~/Projects/.wt-mirrors to .wt-mirrors.noindex and left a symlink;
+        # shared_mirrors skipped the symlink and never saw the real folder, so no mirror was ever folded
+        home = self.root / "home"
+        mirror = home / "Projects/.wt-mirrors.noindex/o/r.git"
+        mirror.parent.mkdir(parents=True)
+        self._git("init", "-q", "--bare", os.fspath(mirror))
+        (home / "Projects/.wt-mirrors").symlink_to(".wt-mirrors.noindex")
+        self.assertEqual(gd.shared_mirrors(home), [mirror])
+        self.assertEqual(gd.mirror_repo(mirror), "o/r")
+
+    def test_a_seed_lock_is_no_hold_but_any_other_lock_is(self) -> None:
+        # cmux16: ~/Library/Caches/cmux-worktree-seed/<key> read blocked:bundle-failed on every pass ("locked worktree")
+        rec = self.root / "rec"
+        rec.mkdir()
+        self.assertFalse(gd.worktree_locked(rec))  # no lock file
+        for reason, held in (("cmux-worktree seed: clean checkout new worktrees clone; never edit it", False),
+                             ("wt base: the tree new checkouts clone copy-on-write; nobody works here", False),
+                             ("wt new: checking out (pid 1 on h)", True), ("", True), ("a person's", True)):
+            (rec / "locked").write_text(reason + "\n")
+            self.assertEqual(gd.worktree_locked(rec), held, reason)
+
+    def test_removing_a_seed_drops_its_locked_record_but_not_a_persons(self) -> None:
+        root, origin = self.root / "trees", self.root / "origin"
+        root.mkdir()
+        self._git("init", "-q", "-b", "main", str(origin))
+        (origin / "f").write_text("x")
+        self._git("-C", str(origin), "add", "f")
+        self._git("-C", str(origin), "commit", "-qm", "c")
+        for name, reason in (("seed", "cmux-worktree seed: clean checkout new worktrees clone; never edit it"),
+                             ("mine", "kept by hand")):
+            self._git("-C", str(origin), "worktree", "add", "-q", "--detach", str(root / name))
+            self._git("-C", str(origin), "worktree", "lock", "--reason", reason, str(root / name))
+            shutil.rmtree(root / name)
+        gd.prune_removed_seed_records(str(origin / ".git"))
+        listed = self._git("-C", str(origin), "worktree", "list", "--porcelain")
+        self.assertNotIn(str(root / "seed"), listed)
+        self.assertIn(str(root / "mine"), listed)
+
+    def test_a_seed_keeps_no_reflog_bundle_but_a_persons_locked_worktree_keeps_the_item(self) -> None:
+        # cmux16: the seed's bundle asked for room for the whole 11.4 GiB mirror ("no room") for a clean seed tree
+        root, origin = self.root / "trees", self.root / "origin"
+        root.mkdir()
+        self._git("init", "-q", "-b", "main", str(origin))
+        (origin / "f").write_text("x")
+        self._git("-C", str(origin), "add", "f")
+        self._git("-C", str(origin), "commit", "-qm", "c")
+        for name, reason in (("seed", "cmux-worktree seed: clean checkout new worktrees clone; never edit it"),
+                             ("mine", "kept by hand")):
+            item = root / name
+            item.mkdir()
+            self._git("-C", str(origin), "worktree", "add", "-q", "--detach", str(item / "wt"))
+            self._git("-C", str(origin), "worktree", "lock", "--reason", reason, str(item / "wt"))
+            self._git("-C", str(item / "wt"), "commit", "-q", "--allow-empty", "-m", "reflog only")
+            self._git("-C", str(item / "wt"), "checkout", "-q", "--detach", "main")
+        external: dict = {}
+        why, gitdirs, trees = gd.mirror_repos(root / "seed", external)
+        self.assertEqual((why, external), ("", {}))
+        why, *_ = gd.mirror_repos(root / "mine", {})
+        self.assertIn("locked worktree", why)
+
     def _shared_mirror(self, packs: int = 4) -> tuple[Path, Path, str]:
         """A home whose tools/wt mirror ~/Projects/.wt-mirrors/o/r.git holds packs packs, one of them an object
         no ref names (a worktree's commit before its ref moves); returns home, the mirror and that object."""
