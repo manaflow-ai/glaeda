@@ -21999,7 +21999,8 @@ class LandQueue:
             # LAND_FORWARD_QUIET_HELD's comment: the far queue holds it open and tells its outcome itself
             if not e.get("forwardQuietHeld"):
                 e["forwardQuietHeld"] = {"at": self.now, "since": since, "to": to}
-                self.history(e, "forward_quiet_held", to=to, waited=round(self.now - since))
+                self.history(e, "forward_quiet_held", to=to, waited=round(self.now - since),
+                             held=land_far_hold_words(e.get("forwardHeld") or {}, to))
                 self.save(e)
                 log({"event": "land-forward-quiet-held", "key": key, "to": to, "waited": round(self.now - since),
                      "held": (e.get("forwardHeld") or {}).get("state")})
@@ -22116,7 +22117,7 @@ class LandQueue:
             return
         if st in LAND_FORWARD_OPEN and st != "requested":
             e.update(state=LAND_FORWARDED, stop=None, forwardFirst=self.now,
-                     forwardHeld={"at": float(answer.get("at") or self.now), "state": st})
+                     forwardHeld=land_far_hold(answer, row, st, self.now))
             self.history(e, "forward_far_rearmed", to=host, far=st)
             log({"event": "land-forward-far-rearmed", "key": e["key"], "to": host, "far": st})
             self.save(e)
@@ -22601,7 +22602,7 @@ class LandQueue:
         if st == "queued" and self.forward_stalled(e, row or {}, host, since, executor):
             return True
         if st in LAND_FORWARD_OPEN:
-            e["forwardHeld"] = {"at": float(answer.get("at") or self.now), "state": st}
+            e["forwardHeld"] = land_far_hold(answer, row, st, self.now)
             e.pop("forwardMissing", None)
             self.save(e)
             return True
@@ -30788,6 +30789,11 @@ def land_line(e: dict, now: float, latch: Any = LAND_LATCH_READ, queue: dict | N
         bits.append(f"handed to {e.get('forwardedTo') or 'another host'} {max(0.0, now - float(fb['at'])) / 3600:.1f} h ago"
                     + (f", held {far} there" if far else "")
                     + (f"; {'stops' if taken else 'taken back'} {utc_when(due, now)}"))
+    if e["state"] == LAND_FORWARDED and isinstance(e.get("forwardHeld"), dict):
+        # why the far queue holds it (land_far_hold): its refusal code, or mergeable and not yet taken. Before, only
+        # "waiting": lw#14525 sat 31 min forwarded while already mergeable, then passed land-judge here and merged by
+        # hand (2026-11-28), and nothing on either host said what cmux-cp-1 was waiting on.
+        bits.append(land_far_hold_words(e["forwardHeld"], str(e.get("forwardedTo") or "the far host")))
     if _finite(back.get("at")) and e["state"] != "stopped":
         bits.append(f"taken back from {back.get('from')} {utc_when(float(back['at']), now)} after "
                     f"{float(back.get('held') or 0) / 3600:.1f} h held {back.get('far') or 'open'} there")
@@ -31997,6 +32003,41 @@ def land_serve_one(req: Any) -> tuple[str | None, str]:
 LAND_OUTCOMES_MAX = 500  # keys per `land serve` outcomes request (forward_ask sends one per far host per pass)
 
 
+def land_outcome_judged(e: dict) -> dict | None:
+    """An open row's last land_judge verdict, the reason a forwarding host's hold reads (land_far_hold): its refusal
+    code, the step it named, whether it named a merge (mergeable, not yet taken), the merge train's status, when."""
+    x = e.get("explain") if isinstance(e.get("explain"), dict) else None
+    if not x or e.get("state") in ("merged", "stopped", "cancelled"):
+        return None
+    act = x.get("action") if isinstance(x.get("action"), dict) else {}
+    train = str(act.get("train") or "") or ("board" if act.get("board_train") else "")
+    return {"code": str(x.get("code") or ""), "step": str(act.get("kind") or ""), "ok": bool(x.get("ok")),
+            "head": str(x.get("head") or "")[:12], "train": train, "at": float(x.get("at") or 0)}
+
+
+def land_far_hold(answer: dict, row: dict | None, st: str, now: float) -> dict:
+    """A forwardHeld record: the far host's answer holding a forwarded row open, with that row's last verdict
+    (land_outcome_judged) as its reason. An older far host sends none: code "" and said so (land_far_hold_words)."""
+    j = (row or {}).get("judged") if isinstance((row or {}).get("judged"), dict) else {}
+    return {"at": float(answer.get("at") or now), "state": st, "code": str(j.get("code") or ""),
+            "step": str(j.get("step") or ""), "mergeable": bool(j.get("ok")) and j.get("step") == "merge",
+            "train": str(j.get("train") or ""), "judged": bool(j)}
+
+
+def land_far_hold_words(held: dict, host: str) -> str:
+    """What a forwarded row's far hold says in `land status`: "held at HOST: CODE" (its step, and the merge train's
+    status when one holds it), "mergeable at HOST, not yet taken", or why there is no reason to say."""
+    if held.get("mergeable"):
+        return f"mergeable at {host}, not yet taken"
+    if held.get("code"):
+        step = f" (step {held['step']}" + (f", merge train {held['train']}" if held.get("train") else "") + ")" \
+            if held.get("step") else ""
+        return f"held at {host}: {held['code']}{step}"
+    if held.get("judged") is False and "judged" in held:
+        return f"held at {host}: {held.get('state') or 'open'}, not yet judged there"
+    return f"held at {host}: {held.get('state') or 'open'} (its release sends no verdict)"
+
+
 def land_outcome_row(e: Any) -> dict | None:
     """The part of a land row a forwarding host needs to end its own: state, stop, merge commit, when."""
     if not isinstance(e, dict) or e.get("state") not in LAND_STATES:
@@ -32004,7 +32045,7 @@ def land_outcome_row(e: Any) -> dict | None:
     stop = e.get("stop") if isinstance(e.get("stop"), dict) else {}
     return {"state": e["state"], "updated": float(e.get("updated") or 0), "created": float(e.get("created") or 0),
             "mergeSha": str(e.get("mergeSha") or ""), "requestId": str(e.get("requestId") or ""),
-            "forwardedTo": str(e.get("forwardedTo") or ""),
+            "forwardedTo": str(e.get("forwardedTo") or ""), "judged": land_outcome_judged(e),
             "stop": {"code": str(stop.get("code") or ""), "reason": land_trim(str(stop.get("reason") or ""), 300),
                      "next": land_trim(str(stop.get("next") or ""), 200)} if stop else None}
 

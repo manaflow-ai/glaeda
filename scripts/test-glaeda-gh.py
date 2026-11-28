@@ -45291,6 +45291,47 @@ class LandForwardTest(Base):
         self.assertEqual(e["stop"]["next"], "fix ci")
         self.assertEqual(len(self.w.sent()), told)
 
+    def far_judged(self, x, code: str, ok: bool, act: dict) -> None:
+        """Set the executor's row's last land_judge verdict, as its daemon stores it, and save it where `land serve`
+        outcomes reads it."""
+        with x.lock, mock.patch.object(gg, "BASE", self.exec_base):
+            fe = x.entries[self.KEY]
+            fe["explain"] = {"at": self.t, "ok": ok, "code": code, "head": LA, "action": act}
+            x.save(fe)
+
+    def test_a_forward_hold_carries_the_far_rows_refusal_code_and_status_says_it(self):
+        # 2026-11-28: lw#14525 sat 31 min forwarded to the broker host, `land status` saying only that the far queue
+        # held it ("waiting"), while it was already mergeable: it passed land-judge on the requesting host and merged
+        # by hand. The far answer carried the row's state and no reason. Now it carries the row's last verdict.
+        # Detector for "a forward hold recorded with no reason" (with the source check below).
+        self.forwarded_to_executor()
+        x = self.executor_queue()
+        self.exec_tick(x)
+        self.far_judged(x, "base_update", False, {"v": 1, "kind": "retry", "train": "boarded"})
+        e = self.tick(gg.LAND_FORWARD_ASK_FIRST + 1)
+        held = e["forwardHeld"]
+        self.assertEqual((e["state"], held["code"], held["step"], held["train"], held["mergeable"]),
+                         ("forwarded", "base_update", "retry", "boarded", False), held)
+        self.assertIn("held at big-exec: base_update (step retry, merge train boarded)", gg.land_line(e, self.t))
+        self.far_judged(x, "", True, {"v": 1, "kind": "merge", "head": LA})
+        e = self.hold_forwarded_for(gg.LAND_FORWARD_ASK_EVERY + 2)
+        self.assertTrue(e["forwardHeld"]["mergeable"], e["forwardHeld"])
+        self.assertIn("mergeable at big-exec, not yet taken", gg.land_line(e, self.t))
+
+    def test_a_forward_hold_from_a_far_release_with_no_verdict_says_so_not_a_bare_state(self):
+        self.assertEqual(gg.land_far_hold_words({"at": 1.0, "state": "waiting"}, "far"),
+                         "held at far: waiting (its release sends no verdict)")
+        held = gg.land_far_hold({"at": 1.0}, {"state": "queued", "judged": None}, "queued", 2.0)
+        self.assertEqual(gg.land_far_hold_words(held, "far"), "held at far: queued, not yet judged there")
+
+    def test_every_forward_hold_is_recorded_through_land_far_hold(self):
+        # the source check: a forwardHeld written by hand would drop the far row's reason again
+        src = Path(gg.__file__).read_text() if hasattr(gg, "__file__") else ""
+        src = src or (Path(__file__).resolve().parent / "glaeda-gh").read_text()
+        bare = [ln.strip() for ln in src.splitlines()
+                if re.search(r'forwardHeld"\]\s*=\s*\{|forwardHeld=\{', ln)]
+        self.assertEqual(bare, [], "record a forward hold with land_far_hold(answer, row, state, now)")
+
     def test_a_forwarding_host_leaves_its_requests_to_forward_tick_between_passes(self):
         self.q = self.forwarding()
         self.tick()
