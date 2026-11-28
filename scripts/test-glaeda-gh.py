@@ -38411,6 +38411,52 @@ class LandTest(Base):
         self.tick(gg.LAND_FORWARD_QUIET - 120)
         self.assertEqual(self.quiet_notices(), [], "the new hand-off's quiet clock starts at the re-pin")
 
+    def test_a_forward_whose_pin_a_person_merged_the_base_into_is_landed_again_at_once(self):
+        # LAND_FORWARD_MOVED: the far queue merged the base into the pin through GitHub's update-branch under a
+        # person's login; the copy here shows it a minute after the hand-off. Before: picked up only past
+        # LAND_FORWARD_QUIET, and told "re-pin it" since own_base_update knows only the queue's bot. Now: landed again
+        # here at the pin on the next pass, so its judgment's base_merge_check follows the merge or stops on it.
+        e = self.handed_off()
+        at = float(e.get("forwardFirst") or e["handedOff"]["at"])
+        self.w.api[f"repos/o/r/commits/{LB}"] = json.dumps({"p": [LA, LC], "a": "someone", "c": "web-flow"})
+        relanded = []
+        reland = self.q.forward_reland
+        self.q.forward_reland = lambda e, head, *a, **k: (relanded.append((head, self.t)), reland(e, head, *a, **k))[1]
+        self.tick(30)
+        self.pr(LB)
+        for _ in range(4):
+            self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+            if relanded:
+                break
+        self.assertEqual([h for h, _ in relanded], [LA], "landed again at the pin, not at the live head")
+        self.assertLess(relanded[0][1] - at, gg.LAND_FORWARD_QUIET / 4, "on the next pass, not past the quiet bound")
+        self.assertEqual(self.quiet_notices(), [], "a merge on the pin tells nobody")
+        self.assertEqual(self.w.refreshed, [], "the copy already showed the moved head: no extra read of the PR")
+        e = self.q.entries[self.KEY]
+        self.assertTrue(any(h.get("event") == "forward_quiet" and h.get("merge") == LB[:12] for h in e["history"]))
+        self.assertTrue(any(h.get("event") == "forward_relanded" for h in e["history"]))
+        print(f"forward moved pin (a person's base merge, re-landed): {round(relanded[0][1] - at)} s", file=sys.stderr)
+
+    def test_a_forward_whose_head_was_pushed_early_tells_once_and_is_not_followed(self):
+        # LAND_FORWARD_MOVED: a push (no merge on the pin) seen before the quiet bound tells at once, once per PR
+        e = self.handed_off()
+        self.w.api[f"repos/o/r/commits/{LB}"] = json.dumps({"p": [LA], "a": "someone", "c": "someone"})
+        relanded = []
+        self.q.forward_reland = lambda *a, **k: relanded.append(a)
+        self.tick(30)
+        self.pr(LB)
+        for _ in range(3):
+            self.tick(gg.LAND_FORWARD_LOOK_EVERY + 1)
+        self.assertEqual(relanded, [])
+        [sent] = self.quiet_notices()
+        self.assertIn(f"glaeda-gh land o/r#1 --sha {LB}", sent[-1])
+        for _ in range(3):
+            self.tick(gg.LAND_FORWARD_QUIET)
+        self.assertEqual(len(self.quiet_notices()), 1, "once per PR")
+        self.assertFalse(self.q.merge_on_pin(LA, {"p": [LA]}))
+        self.assertFalse(self.q.merge_on_pin(LA, {"p": [LC, LA]}))
+        self.assertTrue(self.q.merge_on_pin(LA, {"p": [LA, LC]}))
+
     def test_a_forward_whose_head_someone_else_moved_tells_once_with_the_live_sha(self):
         self.fresh_head = LB
         self.w.api[f"repos/o/r/commits/{LB}"] = json.dumps({"p": [LA], "a": "someone", "c": "someone"})

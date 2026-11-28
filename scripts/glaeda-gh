@@ -18561,6 +18561,16 @@ LAND_FORWARD_READS = 8  # one-off reads a pass asks for these rows at most (a de
 # apart, before the old unread record (the give-up still reads it live). Still one fyi per PR (forwardQuietTold).
 LAND_FORWARD_DIRECT_TRIES = 3
 LAND_FORWARD_DIRECT_EVERY = 120.0
+# LAND_FORWARD_MOVED: a forwarded row whose copy here shows its PR open at a head that is not its pin is looked at on
+# the next forward pass, not LAND_FORWARD_QUIET after its hand-off; a land pinned at the old head cannot merge, so a
+# wait there holds it for nothing. And a merge on the pin made by any login (first parent the pin) is landed here again
+# at the pin, so the judgment's own base_merge_check reads its parents and diffs and follows it when it is only a base
+# merge (repin_base_merge), or stops head_moved naming it; only a head that is no merge on the pin tells the requester
+# with `--sha LIVE`. 2026-11-27 23:00Z to 11-28 05:10Z, one lane VM: 8 hand-offs whose far queue merged the base into
+# the branch while it held the row pinned, every one picked up only past the 30 min bound (30-92 min, median 32); 5 of
+# the merges were made through the API under a person's login and 1 under a second bot (both through GitHub's
+# update-branch), so own_base_update (LAND_QUEUE_BOTS) missed them, and each was told "re-pin it" instead of re-pinned.
+# Detector: test-glaeda-gh.py test_a_forward_whose_pin_a_person_merged_the_base_into_is_landed_again_at_once.
 # The logins whose base merge on a pinned head is this queue's own update (author or committer of the head commit);
 # land.json "queueBots" (a list of logins) adds more.
 LAND_QUEUE_BOTS = frozenset({"cmux-agents-lander[bot]"})
@@ -21465,14 +21475,17 @@ class LandQueue:
         """Under the lock. forwards_unjudged for one row: an ended PR says nothing, an open one at its pin tells, and a
         missed cached read or a live head that is not the pin goes to forward_direct_reads."""
         since = self.forwarded_at(e)
-        if not since or self.now - since < LAND_FORWARD_QUIET:
+        if not since:
             return
+        early = self.now - since < LAND_FORWARD_QUIET
+        if early and not self.forward_moved_cached(e, since):
+            return  # LAND_FORWARD_MOVED: only a pin the PR has moved off is looked at before the quiet bound
         if self.now - (float(e.get("forwardFirst") or 0) or self.forwarded_since(e)) > LAND_FORWARD_GIVE_UP:
             return  # past the give-up its PR is read and settled, telling nobody when it ended (forward_settle)
         quiet = e.get("forwardQuiet") or {}
         if float(quiet.get("since") or 0) == since:
             return  # this forward was told (or seen ended, re-pinned, or its read given up on) once
-        if e.get("forwardQuietTold") or quiet.get("to"):
+        if (e.get("forwardQuietTold") or quiet.get("to")) and not self.forward_moved_cached(e, since):
             return  # this PR's requester was told once (a "to" is a tell from before forwardQuietTold): never again
         key = e["key"]
         if key in self.forward_direct:
@@ -21485,6 +21498,12 @@ class LandQueue:
         if state == "MERGED" or (state == "CLOSED" and read):
             e["forwardQuiet"] = {"since": since, "at": self.now, "ended": state}
             self.save(e)
+            return
+        if early:
+            d = e.get("forwardQuietDirect") or {}
+            if float(d.get("since") or 0) == since and self.now - float(d.get("at") or 0) < LAND_FORWARD_DIRECT_EVERY:
+                return  # its head's commit read failed a moment ago: the next try waits
+            self.forward_direct_due.append(key)  # whose head it is: a read of its commit says (forward_quiet_settle)
             return
         if not read or float(at) < since + LAND_FORWARD_QUIET:
             peeked = self.peeked.get(key)
@@ -21510,6 +21529,17 @@ class LandQueue:
             self.forward_direct_due.append(key)  # whose head it is: a read of its commit says (forward_quiet_settle)
             return
         self.forward_quiet_tell(e, since, data, True)
+
+    def forward_moved_cached(self, e: dict, since: float) -> bool:
+        """Under the lock. Whether this host's copy of forwarded E's PR, read since its forward at SINCE, shows it open
+        at a head that is not its pin (LAND_FORWARD_MOVED)."""
+        c = self.cache_of(e["key"]) or {}
+        at, data = c.get("dataAt"), c.get("data") or {}
+        if not (isinstance(at, (int, float)) and not isinstance(at, bool) and float(at) >= since):
+            return False
+        pin, live = self.forward_pin(e), str(data.get("headRefOid") or "").lower()
+        return data.get("state") == "OPEN" and bool(SHA40.fullmatch(live) and SHA40.fullmatch(pin)) \
+            and land_head_moved(pin, live)
 
     def forward_held_now(self, e: dict) -> bool:
         """Under the lock. Whether the far host's last answer holds forwarded E open (forwardHeld, one of
@@ -21544,8 +21574,11 @@ class LandQueue:
                         c = self.cache_of(key) or {}
                         at = c.get("dataAt")
                         why, direct = None, False
-                        if not (isinstance(at, (int, float)) and not isinstance(at, bool)) \
-                                or float(at) < since + LAND_FORWARD_QUIET:
+                        with self.lock:
+                            e = self.entries.get(key)
+                            moved = e is not None and self.forward_moved_cached(e, since)
+                        if not moved and (not (isinstance(at, (int, float)) and not isinstance(at, bool))
+                                          or float(at) < since + LAND_FORWARD_QUIET):
                             direct = True
                             why = self.refresh(key)
                             c = self.cache_of(key) or {}
@@ -21604,15 +21637,26 @@ class LandQueue:
         bots = {b.lower() for b in self.queue_bots()}
         return str(who.get("a") or "").lower() in bots or str(who.get("c") or "").lower() in bots
 
+    @staticmethod
+    def merge_on_pin(pin: str, who: dict | None) -> bool:
+        """Whether WHO (commit_who of a head) is a two-parent merge whose first parent is PIN, whoever made it: a
+        head that may be only a base merge on the pin, which base_merge_check reads and decides (LAND_FORWARD_MOVED)."""
+        ps = (who or {}).get("p") or []
+        return len(ps) == 2 and SHA40.fullmatch(str(ps[0])) is not None and not land_head_moved(pin, str(ps[0]))
+
     def forward_quiet_settle(self, e: dict, since: float, data: dict | None, why: str, who: dict | None,
                              direct: bool) -> None:
         """Under the lock. forward_direct_reads' answer for forwarded E (DATA: the PR as read, None: unread, WHY why).
         Merged or closed: nothing said. Open at the pin: told once (forward_quiet_tell). Open at another head: this
-        queue's own base update of the pin re-pins and lands it again (forward_reland), any other head tells once
+        queue's own base update of the pin re-pins and lands it again (forward_reland); any other merge on the pin
+        lands it again at the pin, for its judgment's base_merge_check (LAND_FORWARD_MOVED); any other head tells once
         with `--sha LIVE`. Unread LAND_FORWARD_DIRECT_TRIES times: the unread record, as before."""
-        if e["state"] != LAND_FORWARDED or float((e.get("forwardQuiet") or {}).get("since") or 0) == since \
-                or e.get("forwardQuietTold") or (e.get("forwardQuiet") or {}).get("to"):
+        told = bool(e.get("forwardQuietTold") or (e.get("forwardQuiet") or {}).get("to"))
+        if e["state"] != LAND_FORWARDED or float((e.get("forwardQuiet") or {}).get("since") or 0) == since:
             return
+        if told and not (data and data.get("state") == "OPEN" and SHA40.fullmatch(self.forward_pin(e))
+                         and land_head_moved(self.forward_pin(e), str(data.get("headRefOid") or "").lower())):
+            return  # told once per PR; only a pin it has moved off is still followed (LAND_FORWARD_MOVED), never told
         key = e["key"]
         if data is None:
             d = e.get("forwardQuietDirect") or {}
@@ -21650,6 +21694,33 @@ class LandQueue:
             self.forward_reland(e, live, host, land_executor(self.config()) is not None,
                                 why=f"{host} held it pinned at {pin[:12]}, and the queue's own base update made "
                                     f"{live[:12]} on it: re-pinned there and landed here again")
+            return
+        moved = bool(SHA40.fullmatch(live) and SHA40.fullmatch(pin) and land_head_moved(pin, live))
+        if moved and who is None and self.now - since < LAND_FORWARD_QUIET:
+            # LAND_FORWARD_MOVED: an unread commit is no answer; tried again, and past the quiet bound as before
+            d = e.get("forwardQuietDirect") or {}
+            n = (int(d.get("n") or 0) if float(d.get("since") or 0) == since else 0) + 1
+            e["forwardQuietDirect"] = {"since": since, "at": self.now, "n": n, "why": "its head's commit was unread"}
+            self.save(e)
+            return
+        if moved and self.merge_on_pin(pin, who):
+            host = str(e.get("forwardedTo") or (e.get("handedOff") or {}).get("host") or "the far host")
+            waited = round(self.now - since)
+            by = str((who or {}).get("a") or (who or {}).get("c") or "")
+            e["forwardQuiet"] = {"since": since, "at": self.now, "merge": live, "pin": pin, "direct": direct}
+            self.history(e, "forward_quiet", merge=live[:12], pin=pin[:12], waited=waited, read=True, told=False,
+                         direct=direct)
+            log({"event": "land-forward-quiet", "key": key, "merge": live, "pin": pin, "waited": waited,
+                 "direct": direct, "by": by})
+            self.forward_reland(e, pin, host, land_executor(self.config()) is not None,
+                                why=f"{host} held it pinned at {pin[:12]}, and {live[:12]} merged a commit into the "
+                                    f"pin ({by or 'an unnamed login'}): landed here again at the pin, where its "
+                                    "judgment follows a base merge (repin_base_merge) and stops on anything else")
+            return
+        if told:
+            # told once per PR already: no second word; mark this forward looked at
+            e["forwardQuiet"] = {**(e.get("forwardQuiet") or {}), "since": since, "at": self.now}
+            self.save(e)
             return
         self.forward_quiet_tell(e, since, data, True, who=who, direct=direct)
 
