@@ -43731,6 +43731,48 @@ class LandTest(Base):
         self.assertEqual(self.w.sent()[-1][3], "hostx/sid-1")
         self.assertEqual(e["history"][0]["via"], "$ACPMUX_SESSION_ID")
 
+    def test_a_land_over_ssh_records_the_callers_session_as_its_notify_target(self):
+        # 2026-11-28: `ssh cmux-cp-1 'cmux-gh land R#N --sha S --notify'` recorded no requester (no session crosses a
+        # plain ssh hop), and over reach the session's ACPMUX_FROM was recorded as cmux-cp-1/NAME, a session that does
+        # not exist there. Either way the caller heard no merge and no stop.
+        keys = {k: "" for k in gg.LAND_REQUESTER_KEYS}
+        ssh = {**keys, "CMUX_AGENT_HOST": "", "SSH_CONNECTION": "100.64.0.9 50000 100.64.0.1 22"}
+        reach = {**ssh, "ACPMUX_FROM": "claude-sr2-coord-old", "CMUX_AGENT_SESSION_ID": "fbe26a19-ee72",
+                 "CMUX_AGENT_HOST": "cosmic-gray"}
+        with mock.patch.object(gg, "policy_host", return_value="cmux-cp-1"):
+            with mock.patch.dict(os.environ, reach):
+                self.assertEqual(gg.land_requester_from(None), ("cosmic-gray/claude-sr2-coord-old", "$ACPMUX_FROM"))
+                self.assertEqual(gg.land_requester_from(""), ("cosmic-gray/claude-sr2-coord-old", "$ACPMUX_FROM"))
+                self.assertEqual(gg.land_requester_from("coord"), ("cosmic-gray/coord", "--notify"))
+                self.assertEqual(gg.land_requester_from("air-blue/x"), ("air-blue/x", "--notify"))
+            with mock.patch.dict(os.environ, {**reach, "ACPMUX_FROM": "cmux-cp-1/own"}):
+                self.assertEqual(gg.land_requester_from(None), ("cmux-cp-1/own", "$ACPMUX_FROM"))
+            with mock.patch.dict(os.environ, {**reach, "CMUX_AGENT_HOST": "cmux-cp-1"}):
+                # a caller on this host: its own host, as before
+                self.assertEqual(gg.land_requester_from(None), ("cmux-cp-1/claude-sr2-coord-old", "$ACPMUX_FROM"))
+            with mock.patch.dict(os.environ, ssh):
+                self.assertEqual(gg.land_requester_from(""), ("", ""))
+                note = gg.land_no_requester_note()
+                self.assertIn("no --notify and no session", note)
+                self.assertIn("--notify-to YOURHOST/SESSION", note)
+                self.assertIn("reach HOST", note)
+            with mock.patch.dict(os.environ, {**ssh, "SSH_CONNECTION": ""}):
+                self.assertNotIn("--notify-to", gg.land_no_requester_note())
+            for argv, env, want, via in (
+                    (["land", "o/r#1", "--notify", "--json"], reach, "cosmic-gray/claude-sr2-coord-old", "$ACPMUX_FROM"),
+                    (["land", "o/r#1", "--notify-to", "cosmic-gray/claude-sr2-coord-old", "--json"], ssh,
+                     "cosmic-gray/claude-sr2-coord-old", "--notify")):
+                for f in gg.LandQueue.entries_dir().glob("*.json"):
+                    f.unlink()
+                with mock.patch.dict(os.environ, env), mock.patch.object(gg, "daemon_running", return_value=True), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(gg.main(argv), 0, argv)
+                self.pr(LA)
+                self.w.answers.append(refusal("block", LA, {"kind": "stop", "stop": "block"}))
+                e = self.tick()
+                self.assertEqual((e["requester"], e["requesterFrom"], e["state"]), (want, via, "stopped"), argv)
+                self.assertEqual(self.w.sent()[-1][3], want, argv)
+
     def test_nobody_to_tell_is_a_notice_not_silence(self):
         self.pr(LA)
         self.land(requester="")

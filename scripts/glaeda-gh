@@ -305,7 +305,8 @@ when this file changes, so an update takes effect without a restart.
   the PR, a run or a review comment. After a push-making step it judges nothing until the cache shows the new head
   (a head read before the step is never pinned). It is judged only when its PR's cache entry, a wait, a wake-at or a
   dependency (--after: that PR merged) changed, never while its head's checks run. It stops and tells the requester
-  (`acpmux send --no-wait HOST/SESSION`, default this host/$ACPMUX_SESSION_NAME) on a merge, a stop land_judge names
+  (`acpmux send --no-wait HOST/SESSION`, default this host/$ACPMUX_SESSION_NAME, over `reach` the caller's
+  CMUX_AGENT_HOST/ACPMUX_FROM, over a plain ssh hop only --notify-to HOST/SESSION) on a merge, a stop land_judge names
   (a BLOCK, a hold, a conflict...), a step only a person can take, the PR or a dependency closed, 3 identical
   refusals in a row of a step that is not a wait (a named update-branch never counts: it is sent once per head), or a
   wait past its bound (checks: 4 h with none moving, checks_stuck, re-armed hourly as a red is; a review, a retry or a cancelled job's
@@ -19143,12 +19144,33 @@ def land_requester_from(given: str | None) -> tuple[str, str]:
                              and os.environ[k].strip().lower() not in LAND_NO_REQUESTER), ("", ""))
     if not name:
         return "", ""
+    # A caller over `reach HOST 'glaeda-gh land ...'` exports its session as ACPMUX_FROM and its own host as
+    # CMUX_AGENT_HOST: that session lives on CMUX_AGENT_HOST, never here. Before, the far side recorded
+    # THIS-HOST/SESSION (cmux-cp-1/claude-sr2-coord-old), and the merge or stop went to a session that does not exist.
+    far = reader_host()
     if source != "--notify":
         host, local = land_session_host(name)
+        if far and host == policy_host() and name.partition("/")[0] != host:
+            return f"{far}/{name}", source
         if host:
             return f"{host}/{local}", source
         # no registry to tell a peer's HOST/NAME from PARENT/CHILD: kept as it is (acpmux send resolves both)
+    elif far and "/" not in name:
+        return f"{far}/{name}", source  # a bare --notify NAME over reach: the caller's host
     return (name if "/" in name else f"{policy_host()}/{name}"), source
+
+
+def land_no_requester_note() -> str:
+    """The line a land with nobody to tell prints. Over a plain ssh hop (SSH_CONNECTION, no reach variables) the
+    caller's session never crosses, so a bare --notify has nothing to name: the line says the two forms that carry it.
+    2026-11-28: helpers queued `ssh cmux-cp-1 'cmux-gh land R#N --sha S --notify'`, heard no merge and no stop, and
+    ended their turns with the PRs unmerged."""
+    line = ("glaeda-gh land: no --notify and no session in the environment ($ACPMUX_SESSION_NAME, ...): "
+            "a stop or a merge is only a notice line (glaeda-gh land status shows it)")
+    if os.environ.get("SSH_CONNECTION", "").strip():
+        line += ("; over ssh your session does not cross: run it as `reach HOST 'cmux-gh land ...'` (reach carries "
+                 "your session and host) or pass --notify-to YOURHOST/SESSION (idempotent: run it again now)")
+    return line
 
 
 def land_requester(given: str | None) -> str:
@@ -30781,8 +30803,7 @@ def land_print_answer(out: dict, as_json: bool, key: str, where: str) -> None:
     print((land_line(entry, time.time()) if entry else f"{key_name(key)} requested; the daemon takes it next tick")
           + f"  (on {where})")
     if not out.get("requester"):
-        say_waiting("glaeda-gh land: no --notify and no session in the environment ($ACPMUX_SESSION_NAME, ...): "
-                    "a stop or a merge is only a notice line (glaeda-gh land status shows it)")
+        say_waiting(land_no_requester_note())
 
 
 def land_progress(entry: Any) -> Any:
@@ -31475,8 +31496,7 @@ def cmd_land(target: str, after: list[str], notify: str | None, wait: float, as_
             say_waiting(f"glaeda-gh: {down_message()} The request stays queued for it.")
             say_waiting("next: glaeda-gh restart")
         elif not requester:
-            say_waiting("glaeda-gh land: no --notify and no session in the environment ($ACPMUX_SESSION_NAME, ...): "
-                        "a stop or a merge is only a notice line (glaeda-gh land status shows it)")
+            say_waiting(land_no_requester_note())
     if not running:
         return EXIT_DOWN
     if state == "merged":
@@ -45849,9 +45869,10 @@ def parser() -> argparse.ArgumentParser:
     ld.add_argument("--after", action="append", default=[], metavar="OWNER/REPO#M",
                     help="land only after this PR merged (repeatable); it closing unmerged or its own land stopping "
                          "stops this one")
-    ld.add_argument("--notify", nargs="?", const="", metavar="HOST/SESSION",
+    ld.add_argument("--notify", "--notify-to", dest="notify", nargs="?", const="", metavar="HOST/SESSION",
                     help="who is told on a merge or a stop (with no value, and by default, this "
-                         "host/$ACPMUX_SESSION_NAME)")
+                         "host/$ACPMUX_SESSION_NAME; over reach, the caller's host/session); --notify-to is the same, "
+                         "the explicit form for a plain ssh hop, where no session crosses")
     # --pin: what the rulebook and every agent here call this ("land pinned <sha>", "glaeda-gh land --pin"), asked
     # for so on gcp-agent-lane-2, 2026-11-22, and refused as an unrecognized argument with the land unqueued.
     ld.add_argument("--sha", "--match-head-commit", "--pin", "--pinned", "--head", dest="sha", metavar="SHA",
