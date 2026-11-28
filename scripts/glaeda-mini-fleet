@@ -3567,7 +3567,7 @@ def start_drain(manifest: dict[str, Any], name: str) -> Any:
     try:
         return subprocess.Popen([*ssh_argv(), "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=30",
                                  *host_ssh_options(manifest, name), "-l", host_ssh_user(manifest, name), name,
-                                 remote_command(library_command("host_drain", []))],
+                                 remote_command(library_command("host_drain", [], keep_stdin=True))],
                                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError:
         return None

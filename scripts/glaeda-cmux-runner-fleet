@@ -829,7 +829,7 @@ def prepare_headless(member: str, summary: dict[str, Any], manifest: dict[str, A
     ]
     if pinned:
         q = _quote(str(pinned))
-        lines.append(
+        select = (
             # xcode-select is process-global. Refuse to change it while a
             # runner job is active; the next apply can retry after the job
             # drains, so an in-flight build never sees a moving toolchain.
@@ -837,16 +837,21 @@ def prepare_headless(member: str, summary: dict[str, Any], manifest: dict[str, A
             "if /usr/bin/pgrep -f '/actions-runner[^ ]*/bin/Runner.Listener' >/dev/null 2>&1 || "
             "/usr/bin/pgrep -f '/actions-runner[^ ]*/bin[^/ ]*/Runner.Worker' >/dev/null 2>&1; then "
             "echo 'refusing Xcode selection change while a runner is active' >&2; exit 1; fi; "
-            "fi; "
+            f"sudo -n /usr/bin/xcode-select -s {q}/Contents/Developer; fi"
+        )
+        lines.append(
             f"if [ -d {q} ]; then "
             f"if [ -L /Applications/Xcode.app ]; then "
             f"[ \"$(/usr/bin/readlink /Applications/Xcode.app)\" = {q} ] || "
             "{ echo 'refusing conflicting /Applications/Xcode.app' >&2; exit 1; }; "
+            f"{select}; "
             "elif [ -e /Applications/Xcode.app ]; then "
-            "echo 'refusing non-symlink /Applications/Xcode.app' >&2; exit 1; "
-            f"else sudo -n /bin/ln -s {q} /Applications/Xcode.app; fi; "
-            f"if [ \"$(/usr/bin/xcode-select -p 2>/dev/null || true)\" != {q}/Contents/Developer ]; then "
-            f"sudo -n /usr/bin/xcode-select -s {q}/Contents/Developer; fi; fi"
+            # A real Xcode.app is the host owner's own layout (aws-m4pro-2..4: their controller workers build with
+            # it and the Xcode it selects). Runner jobs never need the link or the selection: the hook exports
+            # DEVELOPER_DIR=<pool Xcode>/Contents/Developer for every job (--toolchain-xcode). So keep both.
+            "echo 'keeping the real /Applications/Xcode.app and the host Xcode selection; "
+            "jobs take DEVELOPER_DIR from the runner hook' >&2; "
+            f"else sudo -n /bin/ln -s {q} /Applications/Xcode.app; {select}; fi; fi"
         )
     lines.append(f"chmod +x ~/{REMOTE_DIR}/scripts/* 2>/dev/null || true")
     code, _, err = run(["ssh", *SSH_OPTIONS, member, "; ".join(lines)], 90)
