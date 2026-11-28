@@ -7,7 +7,7 @@ on:
     # commit to start CI. `edited` also fires for a title or body edit, which no job below reads: the
     # github.event.changes.base gate on `changes` and `ci-status` skips every job for those, and the
     # concurrency rule keeps such a run from cancelling a real one.
-    types: [opened, synchronize, reopened, edited]
+    types: [opened, synchronize, reopened, edited, labeled]
   push:
     branches: [main]
     paths-ignore:
@@ -34,7 +34,9 @@ permissions:
 
 concurrency:
   # A hand-run Verify never cancels the push Verify of the same ref, nor the other way round.
-  group: verify-${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && 'dispatch-' || '' }}${{ github.ref }}
+  # A label other than ready-to-land/full-ci starts a run that does nothing; its own group keeps it from cancelling
+  # the full tier running on the same ref.
+  group: verify-${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && 'dispatch-' || '' }}${{ github.ref }}${{ (github.event.action == 'labeled' && github.event.label.name != 'ready-to-land' && github.event.label.name != 'full-ci') && format('-label-{0}', github.run_id) || '' }}
   # A title or body edit (every job skipped) never cancels the real Verify of the same ref.
   cancel-in-progress: ${{ github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base.ref.from != '' }}
 
@@ -47,7 +49,8 @@ jobs:
   # script tests drive cargo and some read docs (docs/CMUX_MINI_RUNNER.md, for one).
   changes:
     if: ${{ (github.event_name == 'pull_request' || github.repository == 'manaflow-ai/glaeda')
-            && (github.event.action != 'edited' || github.event.changes.base.ref.from != '') }}
+            && (github.event.action != 'edited' || github.event.changes.base.ref.from != '')
+            && !(github.event.action == 'labeled' && github.event.label.name != 'ready-to-land' && github.event.label.name != 'full-ci') }}
     runs-on: ${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 5
     outputs:
@@ -57,6 +60,7 @@ jobs:
       code: ${{ steps.scope.outputs.code }}
       runner: ${{ steps.scope.outputs.runner }}
       gh: ${{ steps.scope.outputs.gh }}
+      full: ${{ steps.scope.outputs.full }}
 
     steps:
       - name: Check out repository
@@ -71,9 +75,16 @@ jobs:
         id: scope
         env:
           EVENT: ${{ github.event_name }}
+          FULL: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || ((contains(github.event.pull_request.labels.*.name, 'ready-to-land') || contains(github.event.pull_request.labels.*.name, 'full-ci')) && ((github.event.action == 'labeled' && (github.event.label.name == 'ready-to-land' || github.event.label.name == 'full-ci')) || (github.event.action != 'labeled' && format('{0}', vars.CI_LAND_TIER_AT_ASK) == '0')))) }}
         run: |
           if test "$EVENT" != pull_request; then
-            printf 'rust=true\ngo=true\nfleet_cas=false\ncode=true\nrunner=true\ngh=true\n' >> "$GITHUB_OUTPUT"
+            printf 'rust=true\ngo=true\nfleet_cas=false\ncode=true\nrunner=true\ngh=true\nfull=true\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Cheap tier (see the land-tier job): a pull request head the full tier does not run on needs no suite.
+          if test "$FULL" != true; then
+            echo "Cheap tier: the full tier runs when ready-to-land is added"
+            printf 'rust=false\ngo=false\nfleet_cas=false\ncode=false\nrunner=false\ngh=false\nfull=false\n' | tee -a "$GITHUB_OUTPUT"
             exit 0
           fi
           rust=false
@@ -141,8 +152,53 @@ jobs:
               esac
             done < "$RUNNER_TEMP/changed"
           fi
-          printf 'rust=%s\ngo=%s\nfleet_cas=%s\ncode=%s\nrunner=%s\ngh=%s\n' \
+          printf 'rust=%s\ngo=%s\nfleet_cas=%s\ncode=%s\nrunner=%s\ngh=%s\nfull=true\n' \
             "$rust" "$go" "$fleet_cas" "$code" "$runner" "$gh" | tee -a "$GITHUB_OUTPUT"
+
+  # Land-ask rule, the pattern of manaflow-ai/cmuxterm-hq's hq-land-tier.yml (on unless the repository variable
+  # CI_LAND_TIER_AT_ASK is 0; Leo, 2026-11-28: "de facto, im asking for 99% fewer minutes of ci time, period."): the
+  # full tier runs only on the `labeled` event that adds `ready-to-land` or `full-ci`, at that head. Every other pull
+  # request head gets the cheap tier (changes, polling-guard, ci-status) and glaeda/land-tier pending; land-judge pulses
+  # `ready-to-land` at the head it lands (leo-workspace tools/land_judge/rules/land_tier.py), so the full tier runs once,
+  # on the head that merges. On 11-28 00Z..05Z Verify spent about 8.4k runner-min/day on pull request heads.
+  # A fork head gets no status (no write token) and so always runs the full tier.
+  land-tier:
+    name: land-tier
+    if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+            && (github.event.action != 'edited' || github.event.changes.base.ref.from != '')
+            && !(github.event.action == 'labeled' && github.event.label.name != 'ready-to-land' && github.event.label.name != 'full-ci') }}
+    runs-on: ${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
+    timeout-minutes: 14
+    permissions:
+      statuses: write
+    steps:
+      - name: Post glaeda/land-tier
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          FULL: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository || ((contains(github.event.pull_request.labels.*.name, 'ready-to-land') || contains(github.event.pull_request.labels.*.name, 'full-ci')) && ((github.event.action == 'labeled' && (github.event.label.name == 'ready-to-land' || github.event.label.name == 'full-ci')) || (github.event.action != 'labeled' && format('{0}', vars.CI_LAND_TIER_AT_ASK) == '0')))) }}
+        run: |
+          set -euo pipefail
+          if [ "$FULL" = "true" ]; then
+            state=success; desc="The full tier runs on this head"
+          else
+            state=pending; desc="Cheap tier: the full tier runs when ready-to-land is added"
+          fi
+          # A rate limit (403 "rate limit", 429) waits once for the reset GET /rate_limit reports (that read spends no
+          # quota), up to 12 min, then posts again; anything else fails (land-judge fails closed when this job ran and
+          # posted nothing, so a lost post holds the land, never passes it).
+          post() { gh api "repos/$REPO/statuses/$SHA" -f state="$state" -f context=glaeda/land-tier -f description="$desc" 2>&1; }
+          if out=$(post); then exit 0; fi
+          echo "$out"
+          case "$out" in *"rate limit"*|*"HTTP 429"*) ;; *) exit 1 ;; esac
+          now=$(date +%s)
+          reset=$(gh api rate_limit --jq '.resources.core.reset' 2>/dev/null || echo 0)
+          wait=$(( reset > now ? reset - now + 3 : 15 ))
+          if [ "$wait" -gt 720 ]; then echo "glaeda/land-tier: rate limited past the 12 min bound (reset $reset)"; exit 1; fi
+          echo "glaeda/land-tier: rate limited, reset at $reset, posting again in ${wait}s"
+          sleep "$wait"
+          post
 
   go:
     needs: changes
@@ -1054,7 +1110,8 @@ jobs:
     name: ci-status
     # Skipped for a title or body edit with every other job: a run that verified nothing claims no green.
     if: ${{ always() && (github.event_name == 'pull_request' || github.repository == 'manaflow-ai/glaeda')
-            && (github.event.action != 'edited' || github.event.changes.base.ref.from != '') }}
+            && (github.event.action != 'edited' || github.event.changes.base.ref.from != '')
+            && !(github.event.action == 'labeled' && github.event.label.name != 'ready-to-land' && github.event.label.name != 'full-ci') }}
     needs: [changes, go, scripts, mini-python-tests, runner-tests, glaeda-gh-tests, lint, lint-macos, test, cli, fleet-cas-build, polling-guard]
     runs-on: ${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 5
