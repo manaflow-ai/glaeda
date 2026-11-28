@@ -52158,6 +52158,21 @@ class FullPrReadsSizedByMeasuredCost(unittest.TestCase):
                 self.assertIsNone(fresh.fetch_prs(self.entries(3)))
             self.assertEqual(fresh.sent, [1, 1, 1])  # no 10.5 s cut first
 
+    def test_a_cut_measure_is_held_against_cheap_answers(self):
+        """The sawtooth: a cut query taught 2.6 s a PR, fast answers pulled it to 1.2, the next query of 5 was cut."""
+        d, clock = self.daemon(0.5)
+        d.full_pr_secs = {}
+        with mock.patch.object(gg, "log", lambda e: None):
+            d.note_full_pr_secs(self.entries(5), 10.5, False)
+            for _ in range(10):
+                d.note_full_pr_secs(self.entries(2), 1.0, True)
+            self.assertGreaterEqual(d.full_pr_secs["manaflow-ai/cmux"], 2.6)
+            self.assertEqual(d.full_pr_size(self.entries(5)), 2)
+            d.now += gg.MEASURE_HOLD_S + 1
+            for _ in range(10):
+                d.note_full_pr_secs(self.entries(2), 1.0, True)
+            self.assertLess(d.full_pr_secs["manaflow-ai/cmux"], 1.2)
+
     def test_an_unreadable_measure_file_is_no_measure(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / gg.FULL_PR_SECS_FILE

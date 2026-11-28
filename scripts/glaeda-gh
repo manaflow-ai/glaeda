@@ -1586,6 +1586,7 @@ PR_FULL_EVERY = 600  # a probed PR is still read in full this often (a renamed c
 # its time in them while the land queue's PR data aged past 7,000 s. So fetch_prs splits its full reads into queries
 # whose expected time, by the seconds per full PR measured for that repository (full_pr_secs), stays under this.
 PR_FULL_QUERY_SECONDS = 6.0
+MEASURE_HOLD_S = 1800.0  # a cut query's measure is not lowered by answers for this long (note_query_secs)
 PR_FULL_SLOW_AT = 8.0  # a failed full-read query this slow taught that its PRs cost at least this much between them
 # The measure lives in this file under BASE, so a reexec starts from it. Kept in memory only, every restart (the land
 # host restarts on each deploy, 2026-11-26 03:03-03:11Z) began with no measure: one cmux query of all 10 full reads,
@@ -10492,7 +10493,10 @@ class Daemon:
                            # a reader came after the last fetch: a rerun or reopen may have changed it
                            or e["touched"] > c.get("fetchedAt", 0)):
                 since = self.now - c.get("fetchedAt", 0)
-                if kind == "run" and c.get("missing") and not c.get("data") and since < RUN_MISSING_RETRY \
+                if kind == "run" and since < RUN_MISSING_RETRY and (
+                        (c.get("missing") and not c.get("data"))
+                        # a run GraphQL no longer finds (deleted) keeps its old data and was read every cycle for ever
+                        or str(c.get("error") or "").startswith("graphql: no workflow run at this URL")) \
                         and not (self.waited(e) and self.wait_start(e) > c.get("fetchedAt", 0)):  # a new wait is read once
                     continue  # not found: settled, asked again only now and then (it was read every cycle)
                 if kind == "comment" and self.fed(e["key"]) and since < COMMENT_FED_CYCLE - TICK:
@@ -13109,10 +13113,18 @@ class Daemon:
         per = seconds / len(entries)
         measured = self.__dict__.setdefault(attr, {})
         known = measured.get(repo)
+        held = self.__dict__.setdefault(attr + "_held", {})
         if answered:
             measured[repo] = per if known is None else known + (per - known) / 3
+            # A cut query's measure is held for MEASURE_HOLD_S: queries of cache-warm PRs answer in 0.5 s a PR and pulled
+            # the measure back down a third a time, so the next query carried 5 again and GitHub cut it at 10.5 s (the
+            # sawtooth: cmux-cp-1, 2026-11-27, 156 cut queries in 80 min, 27 min of ticks).
+            hold = held.get(repo)
+            if hold is not None and self.now - hold[1] < MEASURE_HOLD_S:
+                measured[repo] = max(measured[repo], hold[0])
         elif seconds >= PR_FULL_SLOW_AT:
             floor = seconds * 1.25 / len(entries)
+            held[repo] = (floor, self.now)
             if known is None or known < floor:
                 measured[repo] = floor
                 log({"event": event, "repo": repo, "seconds": round(floor, 2),
