@@ -11544,6 +11544,17 @@ class Daemon:
         q = self.land_queue
         return LAND_NUDGE_MIN if q is not None and key in q.entries else NUDGE_MIN
 
+    def land_settle(self, key: str, merge_sha: str, at: float) -> None:
+        """LAND_MERGE_SETTLES_CACHE: the land queue merged KEY at MERGE_SHA; its cache entry says so, with no read."""
+        prior = read_cache(key)
+        data = (prior or {}).get("data")
+        if not isinstance(data, dict) or data.get("state") == "MERGED":
+            return
+        merged_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(at))
+        self.store(key, prior, data={**data, "state": "MERGED", "mergeCommit": {"oid": merge_sha},
+                                     "mergedAt": data.get("mergedAt") or merged_at},
+                   dataAt=at, via="land-merge")
+
     def land_nudge(self, key: str) -> None:
         """Keep an event or queue-triggered nudge visible to LandQueue after the read scheduler consumes it."""
         self.nudged.add(key)
@@ -11637,6 +11648,7 @@ class Daemon:
             if not land_dir().is_dir():
                 return
             self.land_queue = LandQueue(nudge=self.land_nudge, notice=self.write_notice, reading=self.land_reading,
+                                        settle=self.land_settle,
                                         feed_quiet=self.land_feed_quiet, read_room=self.land_read_room,
                                         feed_done=self.land_feed_done, checks_done=self.land_checks_done,
                                         rollup_nodes=self.land_rollup_nodes)
@@ -20524,7 +20536,10 @@ class LandQueue:
                  feed_done: Callable[[str, str], float | None] | None = None,
                  checks_done: Callable[[str, str], bool | None] | None = None,
                  rollup_nodes: Callable[[str, str], list[dict] | None] | None = None,
-                 create_pause: Callable[[float], float] = land_create_pause_until) -> None:
+                 create_pause: Callable[[float], float] = land_create_pause_until,
+                 settle: Callable[[str, str, float], None] | None = None) -> None:
+        # (key, merge sha, when) -> write MERGED into the PR's cache entry at this queue's own merge (LAND_MERGE_SETTLES_CACHE)
+        self.settle = settle or (lambda key, sha, at: None)
         # NOW -> when the login's create pause the shim holds ends (0: none): a content step waits it out unsent
         self.create_pause = create_pause
         # (key, head) -> the controller's green rollup of the head as land_judge's nodes, else None (LAND_ROLLUP_JUDGE)
@@ -29710,6 +29725,17 @@ class LandQueue:
         # gcp-agent-lane-12, 2026-11-23..25: 30 of 86 "the cache shows it merged" notices woke a lane that said only
         # "nothing to do"; 8 of 90 after "merged pinned". Leo, 2026-11-24: "are there any like process level fixes?"
         own = how in LAND_OWN_MERGE_HOWS
+        if own and merge_sha:
+            # LAND_MERGE_SETTLES_CACHE: this queue's own merge is the news, so the PR's cache entry says MERGED at once
+            # instead of the OPEN copy read before the merge. hq#37725, 2026-11-28: merged pinned 16:21:20Z, its entry
+            # (read 16:19:47Z) still OPEN at 17:11Z, as no watch held it to be read again; every `status`, wait and
+            # brokered `gh pr view` after the merge notice got OPEN, and lanes re-polled GitHub (256 state/mergeCommit
+            # `gh pr view` calls in 24 h of one host's transcripts, 158 of them right after a wake). No GitHub read.
+            # Detector: test-glaeda-gh.py test_an_own_merge_writes_merged_into_the_pr_cache_entry.
+            try:
+                self.settle(e["key"], merge_sha, self.now)
+            except Exception as error:  # noqa: BLE001  a cache write never stops the notice
+                log({"event": "land-merge-settle-failed", "key": e["key"], "error": describe(error)})
         to = land_notify_target(e, e.get("requester") or "")
         waiter = land_row_waiter_for(e["key"], to) if wake and own and to else None
         if waiter is not None:

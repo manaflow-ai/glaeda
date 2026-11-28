@@ -29247,6 +29247,27 @@ class LandTest(Base):
         message = f"glaeda land: {self.q.url(self.q.entries[self.KEY])} merged at {'f' * 40}"
         self.assertEqual(sent[-2:], [message, message])
 
+    def test_an_own_merge_writes_merged_into_the_pr_cache_entry(self):
+        # LAND_MERGE_SETTLES_CACHE (hq#37725, 2026-11-28): the queue's own merge tells the cache, so the entry read
+        # before the merge does not keep saying OPEN to every status, wait and brokered `gh pr view` after the notice.
+        settled: list[tuple] = []
+        self.q.settle = lambda key, sha, at: settled.append((key, sha, at))
+        self.pr(LA)
+        self.land()
+        self.w.answers.append(ok_answer(LA))
+        self.tick()
+        self.assertEqual(settled, [(self.KEY, "f" * 40, self.t)])
+        # The daemon's side writes it over the on-disk entry, with no GitHub read; one already MERGED stays as read.
+        self.store_pr({"state": "OPEN", "headRefOid": LA, "mergeCommit": None, "mergedAt": None}, at=self.t - 90)
+        self.daemon.now = self.t
+        self.daemon.land_settle(self.KEY, "f" * 40, self.t)
+        c = gg.read_cache(self.KEY)
+        self.assertEqual((c["data"]["state"], c["data"]["mergeCommit"], c["dataAt"], c["via"]),
+                         ("MERGED", {"oid": "f" * 40}, self.t, "land-merge"))
+        self.assertTrue(c["data"]["mergedAt"].endswith("Z"))
+        self.daemon.land_settle(self.KEY, "e" * 40, self.t + 5)
+        self.assertEqual(gg.read_cache(self.KEY)["data"]["mergeCommit"], {"oid": "f" * 40})
+
     def test_a_land_merged_notice_is_a_result_that_wakes_within_a_minute(self):
         # LAND_MERGED_CLASS: its own merge asks nothing of the requester, so it is a result, never a [blocker]
         # (lw#11661 and #11593, 2026-11-26), and --within still wakes an idle lane within a minute.
