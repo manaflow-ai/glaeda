@@ -11167,7 +11167,7 @@ class Daemon:
             if lead is not None:
                 self.waited_tried[lead["key"]] = self.now
                 with self.waited_spend():
-                    left = self.batched("pr", [lead], lambda chunk: self.fetch_aliased(chunk, "pr"))
+                    left = self.batched("pr", [lead], self.fetch_full_sized)
                 if left and self.rest_admits("pr", lead):
                     self.read_rest(left, left)
                 prs = [e for e in prs if e["key"] != lead["key"]]
@@ -11194,7 +11194,10 @@ class Daemon:
                     self.errors.append(f"waited: {error}")
                     return
                 full += changed
-            for kind, todo, fetch in (("pr", full, lambda chunk: self.fetch_aliased(chunk, "pr")),
+            # Full reads sized by the measure (fetch_full_sized), as every other path: this pass sent whole chunks of
+            # the batch size, 5 or 10 cmux PRs a query that GitHub cut at 10.5 s, tick after tick (cmux-cp-2,
+            # 2026-11-28 02-03Z: 127 PR reads stored in 600 s, 475 of the tick's 536 s in read pr, data 38+ min old).
+            for kind, todo, fetch in (("pr", full, self.fetch_full_sized),
                                       ("run", runs, self.graphql_fetch["run"])):
                 size = max(1, self.batch[kind])
                 for i in range(0, len(todo), size):
@@ -13100,9 +13103,16 @@ class Daemon:
             full += changed
         # The full reads in queries sized by their measured cost (PR_FULL_QUERY_SECONDS), not the batch's size. One that
         # fails stops the rest: batched() splits the chunk, and the PRs read here are probed then, which is cheap.
-        size = self.full_pr_size(full)
-        for i in range(0, len(full), size):
-            error = self.fetch_aliased(full[i:i + size], "pr")
+        return self.fetch_full_sized(full) if full else None
+
+    def fetch_full_sized(self, chunk: list[dict]) -> str | None:
+        """Full reads of CHUNK (one repository's) in queries sized by the measured cost (full_pr_size), as fetch_prs
+        sends them. A batched refresh and the waited pool's workers sent the whole chunk (batch 10, halved to 5 after a
+        cut and back up in each throwaway Daemon): 5 cmux PRs a query, cut by GitHub at 10.5 s, 10 of them in 15 minutes
+        on cmux-cp-1 (2026-11-28 02:03Z) after the measure was held, because this path never read it."""
+        size = self.full_pr_size(chunk)
+        for i in range(0, len(chunk), size):
+            error = self.fetch_aliased(chunk[i:i + size], "pr")
             if error is not None or getattr(self, "spill", None) or getattr(self, "gql_limited", False):
                 return error
         return None
@@ -16284,7 +16294,7 @@ def land_direct_read_many(keys: list[str], budget: float = LAND_REFRESH_BATCH_BU
                      "moved": dict(daemon.probe_moved)})
                 # then the full reads, as the serving daemon sends them (batched: its batch size, halved on a timeout,
                 # one owner and repository a query, an App's chunk on the App, the login's per-minute pace)
-                left = daemon.batched("pr", full, lambda chunk: daemon.fetch_aliased(chunk, "pr")) if full else []
+                left = daemon.batched("pr", full, daemon.fetch_full_sized) if full else []
                 for e in left:
                     errors.setdefault(e["key"], DIRECT_QUOTA if daemon.mode("graphql") == "stop"
                                       else "not read: GraphQL could not take it this time (batched: spilled)")

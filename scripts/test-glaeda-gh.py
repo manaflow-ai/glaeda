@@ -52227,6 +52227,39 @@ class FullPrReadsSizedByMeasuredCost(unittest.TestCase):
             self.assertIsNone(d.fetch_prs(self.entries(4)))
             self.assertEqual(d.sent, [1, 1, 1, 1])
 
+    def test_the_waited_pass_reads_full_prs_by_measure_not_by_batch_before_and_after(self):
+        """cmux-cp-2, 2026-11-28 02-03Z: read_waited sent its full reads as whole chunks of the batch size (5, or 10 grown
+        back), 2.7 s a cmux PR, so GitHub cut each at 10.5 s with nothing stored; the tick spent 475 of 536 s in read pr
+        and stored 127 PR reads in 600 s. Before: the pass's old fetch, one query of 10 PRs. After: fetch_full_sized."""
+        before, clock_b = self.daemon(2.7)
+        before.full_pr_secs = {"manaflow-ai/cmux": 2.7}
+        with mock.patch.object(gg.time, "monotonic", lambda: clock_b[0]), mock.patch.object(gg, "log", lambda e: None):
+            error = before.fetch_aliased(self.entries(10), "pr")  # the old lambda chunk: fetch_aliased(chunk, "pr")
+        self.assertIsNotNone(error)
+        self.assertEqual((before.sent, clock_b[0]), ([10], 10.5))  # 10.5 s of the tick, 0 PRs stored
+        after, clock_a = self.daemon(2.7)
+        after.full_pr_secs = {"manaflow-ai/cmux": 2.7}
+        with mock.patch.object(gg.time, "monotonic", lambda: clock_a[0]), mock.patch.object(gg, "log", lambda e: None):
+            self.assertIsNone(after.fetch_full_sized(self.entries(10)))
+        self.assertEqual(after.sent, [2, 2, 2, 2, 2])  # 27 s of the tick, 10 PRs stored: 2.7 s a stored PR
+        self.assertAlmostEqual(clock_a[0], 27.0)
+
+    def test_every_full_pr_read_goes_through_the_measured_size(self):
+        """The class: a path handing batched() fetch_aliased(chunk, "pr") skips the measure (#3157's sawtooth went on
+        through land_direct_read_many, then read_waited). Only fetch_full_sized may send a full PR query."""
+        source = Path(gg.__file__).read_text(encoding="utf-8")
+        sites = [i for i, line in enumerate(source.splitlines(), 1)
+                 if re.search(r"fetch_aliased\([^)]*\"pr\"\)", line)]
+        self.assertEqual(len(sites), 1, f"full PR reads that skip fetch_full_sized at lines {sites}")
+
+    def test_a_batched_refresh_sends_full_reads_by_measured_cost(self):
+        """land_direct_read_many's batched() sent whole chunks of 5: the measure was only read by fetch_prs."""
+        d, clock = self.daemon(5.0)
+        d.full_pr_secs = {"manaflow-ai/cmux": 5.0}
+        with mock.patch.object(gg.time, "monotonic", lambda: clock[0]):
+            self.assertIsNone(d.fetch_full_sized(self.entries(4)))
+        self.assertEqual(d.sent, [1, 1, 1, 1])
+
     def test_a_fast_repo_keeps_its_batch(self):
         d, clock = self.daemon(0.5)
         with mock.patch.object(gg.time, "monotonic", lambda: clock[0]):
