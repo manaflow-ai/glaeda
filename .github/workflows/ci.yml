@@ -55,6 +55,8 @@ jobs:
       go: ${{ steps.scope.outputs.go }}
       fleet_cas: ${{ steps.scope.outputs.fleet_cas }}
       code: ${{ steps.scope.outputs.code }}
+      runner: ${{ steps.scope.outputs.runner }}
+      gh: ${{ steps.scope.outputs.gh }}
 
     steps:
       - name: Check out repository
@@ -71,7 +73,7 @@ jobs:
           EVENT: ${{ github.event_name }}
         run: |
           if test "$EVENT" != pull_request; then
-            printf 'rust=true\ngo=true\nfleet_cas=false\ncode=true\n' >> "$GITHUB_OUTPUT"
+            printf 'rust=true\ngo=true\nfleet_cas=false\ncode=true\nrunner=true\ngh=true\n' >> "$GITHUB_OUTPUT"
             exit 0
           fi
           rust=false
@@ -117,7 +119,30 @@ jobs:
             esac
           done < "$RUNNER_TEMP/changed"
           if test "$rust" = true; then code=true; fi
-          printf 'rust=%s\ngo=%s\nfleet_cas=%s\ncode=%s\n' "$rust" "$go" "$fleet_cas" "$code" | tee -a "$GITHUB_OUTPUT"
+          # runner-tests and glaeda-gh-tests (about 7.2k of glaeda's 11.3k runner-minutes a day) read a few files
+          # each, listed in scripts/ci-job-inputs.json: of 241 commits to main over two days, 65 changed one that
+          # runner-tests reads and 161 one that glaeda-gh-tests reads. A suite runs when the change touches one of its
+          # files, or anything outside scripts/ and config/ but Markdown no script names and the other workflows.
+          runner=false
+          gh=false
+          if test "$code" = true; then
+            jq -r '."runner-tests".inputs[]' scripts/ci-job-inputs.json > "$RUNNER_TEMP/runner-inputs"
+            jq -r '."glaeda-gh-tests".inputs[]' scripts/ci-job-inputs.json > "$RUNNER_TEMP/gh-inputs"
+            while IFS= read -r path; do
+              case "$path" in
+                .github/workflows/ci.yml|scripts/ci-job-inputs.json) runner=true; gh=true ;;
+                scripts/*|config/*)
+                  if grep -qxF -- "$path" "$RUNNER_TEMP/runner-inputs"; then echo "runner-tests reads $path"; runner=true; fi
+                  if grep -qxF -- "$path" "$RUNNER_TEMP/gh-inputs"; then echo "glaeda-gh-tests reads $path"; gh=true; fi
+                  ;;
+                *.md) if grep -rqF -- "$path" scripts; then runner=true; gh=true; fi ;;
+                .github/*|.claude/*|skills/*) ;;
+                *) echo "$path is outside scripts/ and config/"; runner=true; gh=true ;;
+              esac
+            done < "$RUNNER_TEMP/changed"
+          fi
+          printf 'rust=%s\ngo=%s\nfleet_cas=%s\ncode=%s\nrunner=%s\ngh=%s\n' \
+            "$rust" "$go" "$fleet_cas" "$code" "$runner" "$gh" | tee -a "$GITHUB_OUTPUT"
 
   go:
     needs: changes
@@ -425,6 +450,7 @@ jobs:
           suite python3 scripts/test-hot-observe.py
           suite python3 scripts/test-glaeda-disk.py
           suite python3 scripts/test-scripts-no-shadow.py
+          suite python3 scripts/test-ci-job-inputs.py
           suite python3 scripts/test-intent-glaeda.py
           suite python3 scripts/test-glaeda-disk-registry.py
           suite python3 scripts/test-glaeda-hook-pin.py
@@ -590,7 +616,7 @@ jobs:
   # scripts/test-glaeda-cmux-runner.py took about 300 s of the old single job; its shards run side by side.
   runner-tests:
     needs: changes
-    if: ${{ needs.changes.outputs.code == 'true' }}
+    if: ${{ needs.changes.outputs.runner == 'true' }}
     runs-on: ${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 15
     strategy:
@@ -622,7 +648,7 @@ jobs:
   # the process exits 0 with no verdict.
   glaeda-gh-tests:
     needs: changes
-    if: ${{ needs.changes.outputs.code == 'true' }}
+    if: ${{ needs.changes.outputs.gh == 'true' }}
     runs-on: ${{ github.repository_owner == 'manaflow-ai' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 15
     strategy:

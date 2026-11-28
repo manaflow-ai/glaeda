@@ -1,0 +1,38 @@
+{
+  "_about": "The repository files each sharded suite reads. A pull request runs runner-tests or glaeda-gh-tests only when it changes one of that suite's files, or a path outside scripts/ and config/ that is not Markdown or another workflow. Read from strace -f of every shard (the files they open, exec or stat), plus what scripts/test-ci-job-inputs.py asks: each listed module's imports and the test file's own scripts/ and config/ paths. Pushes to main run both suites whole.",
+  "runner-tests": {
+    "test": "scripts/test-glaeda-cmux-runner.py",
+    "inputs": [
+      "config/disk-registry.toml",
+      "config/runner-gate.json",
+      "scripts/cmux_fleet.py",
+      "scripts/cmux_fleet_bootstrap.py",
+      "scripts/glaeda-cmux-runner",
+      "scripts/glaeda-cmux-runner-fleet",
+      "scripts/glaeda-cmux-runner-hook",
+      "scripts/glaeda-disk",
+      "scripts/glaeda-job-needs.json",
+      "scripts/glaeda-mini-setup",
+      "scripts/glaeda-runner-daemon-root",
+      "scripts/glaeda-runner-job-disk.json",
+      "scripts/glaeda-update",
+      "scripts/glaeda_fleet_labels.py",
+      "scripts/glaeda_hook_pin.py",
+      "scripts/glaeda_reservation.py",
+      "scripts/test-glaeda-cmux-runner.py",
+      "scripts/unittest-shard"
+    ]
+  },
+  "glaeda-gh-tests": {
+    "test": "scripts/test-glaeda-gh.py",
+    "inputs": [
+      "config/gh-daemon.json",
+      "scripts/benchmark-land-forward.py",
+      "scripts/glaeda-gh",
+      "scripts/intent.py",
+      "scripts/intent_aliases.json",
+      "scripts/test-glaeda-gh.py",
+      "scripts/unittest-shard"
+    ]
+  }
+}
