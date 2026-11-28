@@ -57,6 +57,14 @@ drive under the image), how many sit quarantined as .corrupt-*, and a few exampl
 disk-error row where NOW reads this service's health (leo-workspace tools/now_host_services.py, the registry's
 `disk_errors`), not as a crash loop (cmux-lawrence 2026-11-27: 19 of 341 entries read EIO and a copy without the
 per-entry guard restarted every 15 s; cmuxterm-hq docs/handbook/one-read-takes-down-the-pass.md).
+
+Unmounted: a run whose MOUNT is not a mount point (the attach failed, or the image went away mid-run) stops with
+state "unmounted", naming MOUNT and hdiutil's exit code and stderr. It reads, writes, prunes and fetches nothing
+under the bare mountpoint (checked again before each of those steps), and the disk-errors file says
+state "unmounted" with null counts: unknown, not zero and not a count of the bare directory. The archive host
+2026-11-27: a run walked the bare /Volumes/glaeda-seed-archive (0 seeds, the boot disk's 206 MB free, "full"),
+the next logged only "hdiutil attach: " (empty stderr, no exit code), and NOW kept reading a stale 20-unreadable
+count as a failing drive.
 """
 
 from __future__ import annotations
@@ -352,7 +360,22 @@ def attach() -> str:
                                os.fspath(IMAGE)], capture_output=True, text=True, timeout=120)
     except subprocess.TimeoutExpired:
         return "hdiutil attach timed out"
-    return "" if os.path.ismount(MOUNT) else f"hdiutil attach: {proc.stderr.strip()[-160:]}"
+    except OSError as error:
+        return f"hdiutil attach could not run: {type(error).__name__} errno {error.errno}: {error.strerror}"
+    if os.path.ismount(MOUNT):
+        return ""
+    # -quiet often leaves stderr empty: the exit code is then the only reason there is (2026-11-27 "hdiutil attach: ")
+    detail = (proc.stderr.strip() or proc.stdout.strip() or "no output")[-160:]
+    return f"hdiutil attach exit {proc.returncode}, {MOUNT} still not a mount point: {detail}"
+
+
+def mount_lost() -> str:
+    """"" while MOUNT is a mount point, else why not: checked before each step that reads or writes under it."""
+    return "" if os.path.ismount(MOUNT) else f"{MOUNT} is not a mount point"
+
+
+class Unmounted(Exception):
+    """MOUNT stopped being a mount point before STEP: the run stops and touches nothing more under it."""
 
 
 def run(apply: bool, archive: Path = ARCHIVE, budget: int = BUDGET, min_free: int = MIN_FREE,
@@ -361,7 +384,23 @@ def run(apply: bool, archive: Path = ARCHIVE, budget: int = BUDGET, min_free: in
     record: dict = {"tool": "glaeda-seed-archive", "time": int(time.time()), "apply": apply,
                     "archive": os.fspath(archive)}
     if not mounted and (why := attach()):
-        return {**record, "state": "skipped", "reason": why}
+        return {**record, "state": "unmounted", "mount": os.fspath(MOUNT), "reason": why}
+    try:
+        return fill(record, apply, archive, budget, min_free, (lambda step: None) if mounted else need_mount)
+    except Unmounted as lost:
+        # Whatever this run read before the mount went is the bare directory's, not the archive's: none of it is kept.
+        return {k: v for k, v in record.items() if k in ("tool", "time", "apply", "archive")} | {
+            "state": "unmounted", "mount": os.fspath(MOUNT), "reason": f"{mount_lost()} before {lost}"}
+
+
+def need_mount(step: str) -> None:
+    if mount_lost():
+        raise Unmounted(step)
+
+
+def fill(record: dict, apply: bool, archive: Path, budget: int, min_free: int, need) -> dict:
+    """run() once MOUNT holds the image; NEED(step) raises Unmounted when it no longer does."""
+    need("creating the archive directory" if apply else "reading the archive directory")
     if apply:
         archive.mkdir(exist_ok=True)
     elif not archive.is_dir():
@@ -384,7 +423,10 @@ def run(apply: bool, archive: Path = ARCHIVE, budget: int = BUDGET, min_free: in
         known = known_unreadable()
         aside: list[str] = []
         listed: set[str] = set()
+        need("listing the archive")
         have = archived(archive, unreadable, aside, listed)
+        # A listing of the bare mountpoint (the image went during it) is empty: it must not drop known keys or count.
+        need("using the archive listing")
         record["quarantined_aside"] = len(aside)
         # A known-unreadable key the archive no longer lists is gone from this disk (the archive moved to another
         # image, or someone removed the entry), so nothing is left to re-read: drop it, and the fill fetches it again.
@@ -420,6 +462,7 @@ def run(apply: bool, archive: Path = ARCHIVE, budget: int = BUDGET, min_free: in
             missing = []
         if apply:
             for key in missing[:MAX_PER_RUN]:
+                need(f"fetching {key}")
                 result = fetch(config, key, archive)
                 fetched.append(result)
                 if result["outcome"] in ("busy", "unreachable", "refused"):
@@ -427,11 +470,14 @@ def run(apply: bool, archive: Path = ARCHIVE, budget: int = BUDGET, min_free: in
         else:
             record["would_fetch"] = missing[:MAX_PER_RUN]
         record["fetched"] = fetched
+        need("pruning")
         record["pruned"] = prune(archive, budget, min_free, apply, {key for key, _ in kept})
+        need("counting the archive")
         seeds = archived(archive)
         record["archive_seeds"] = len(seeds)
         record["archive_bytes"] = sum(st.st_size for st in seeds.values())
         record["disk_free_bytes"] = free_bytes(archive)
+        need("reporting")  # a count of the bare mountpoint's disk is not the archive's
         record["state"] = "applied" if apply else "planned"
         return record
     finally:
@@ -442,7 +488,13 @@ def disk_errors(record: dict) -> dict:
     """The run's disk errors (glaeda-disk-errors/v1): entries that read an OSError this run, still unreadable or
     quarantined by it, plus the seeds already sitting aside as .corrupt-* (quarantined_aside, counted from this run's
     listing, so a seed moved aside earlier still says the drive failed). A run that failed whole on an OSError (main)
-    counts as one unreadable entry: its reason names the path."""
+    counts as one unreadable entry: its reason names the path. An unmounted run's counts are unknown (null), with
+    state "unmounted" and its reason: nothing under the bare mountpoint says anything about the drive."""
+    if record.get("state") == "unmounted":
+        return {"schema": DISK_ERRORS_SCHEMA, "service": "seed-archive", "at": int(record.get("time") or time.time()),
+                "root": record.get("archive") or os.fspath(ARCHIVE), "state": "unmounted",
+                "mount": record.get("mount") or os.fspath(MOUNT), "reason": str(record.get("reason") or "")[:300],
+                "unreadable": None, "still_unreadable": None, "quarantined": None, "examples": []}
     unreadable = record.get("unreadable") or []
     keys = {i["key"] for i in unreadable if i.get("key")} | set(record.get("known_unreadable") or [])
     listing = [i["error"] for i in unreadable if not i.get("key") and i.get("error")]
@@ -450,7 +502,7 @@ def disk_errors(record: dict) -> dict:
     examples = [f"{i['key']}{SUFFIX}: {i.get('error')}" for i in unreadable if i.get("key")]
     examples += listing + ([record["reason"]] if failed else [])
     return {"schema": DISK_ERRORS_SCHEMA, "service": "seed-archive", "at": int(record.get("time") or time.time()),
-            "root": record.get("archive") or os.fspath(ARCHIVE),
+            "root": record.get("archive") or os.fspath(ARCHIVE), "state": "counted",
             "unreadable": len(keys) + len(listing) + int(failed),
             "still_unreadable": len([i for i in unreadable if i.get("key") and not i.get("quarantined")]),
             "quarantined": int(record.get("quarantined_aside") or 0)
@@ -660,12 +712,14 @@ def main(argv: list[str]) -> int:
                   "reason": f"{type(error).__name__} errno {error.errno}: {error.strerror} ({error.filename})"}
     if args.apply and not quiet(record):
         append_log(record)
-    # Only a run that listed the archive (or failed on an OSError) says anything about the disk: a skipped run (no
-    # image, the lock) or a seeder error before the listing must not clear a count with a zero.
-    if args.apply and ("quarantined_aside" in record or "errno" in str(record.get("reason", ""))):
+    # Only a run that listed the archive (or failed on an OSError) says anything about the disk: a skipped run (the
+    # lock) or a seeder error before the listing must not clear a count with a zero. An unmounted run replaces it with
+    # unknown: the count was of an archive that is not there now.
+    if args.apply and (record["state"] == "unmounted" or "quarantined_aside" in record
+                       or "errno" in str(record.get("reason", ""))):
         write_disk_errors(disk_errors(record))
     print(json.dumps(record))
-    return 1 if record["state"] == "error" else 0
+    return 1 if record["state"] in ("error", "unmounted") else 0
 
 
 if __name__ == "__main__":

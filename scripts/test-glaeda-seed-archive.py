@@ -518,5 +518,87 @@ class ArchiveTest(unittest.TestCase):
         self.assertFalse(archive.quiet({"state": "skipped", "reason": "hdiutil attach timed out"}))
 
 
+    # The archive host, 2026-11-27: a run walked the bare /Volumes/glaeda-seed-archive (0 seeds, the boot disk's free
+    # space, "full"), the next logged "hdiutil attach: " with no exit code, and NOW read a stale count as a dying drive.
+    def unmounted_main(self, attach: str = "", lose_at: str = "") -> tuple[dict, int]:
+        """main(["--apply"]) with MOUNT faked: ATTACH is attach()'s answer; LOSE_AT, a step at which the mount goes."""
+        real = (archive.run, archive.LOG, archive.attach, archive.mount_lost, archive.need_mount)
+        gone = [False]
+
+        def need(step: str) -> None:
+            if lose_at and step.startswith(lose_at):
+                gone[0] = True
+            real[4](step)
+
+        archive.attach = lambda: attach
+        archive.mount_lost = lambda: "/Volumes/glaeda-seed-archive is not a mount point" if gone[0] else ""
+        archive.need_mount = need
+        archive.run = lambda apply: real[0](apply, self.archive, min_free=0)
+        archive.LOG = Path(self.tmp.name) / "log.jsonl"
+        out = io.StringIO()
+        real_stdout, sys.stdout = sys.stdout, out
+        try:
+            code = archive.main(["--apply"])
+        finally:
+            sys.stdout = real_stdout
+            archive.run, archive.LOG, archive.attach, archive.mount_lost, archive.need_mount = real
+        return json.loads(out.getvalue()), code
+
+    def test_a_failed_attach_is_unmounted_writes_nothing_and_reports_unknown(self):
+        self.keep(KEYS[0], 100)
+        self.main_once()
+        path = archive.STATE.parent / "disk-errors" / archive.DISK_ERRORS_NAME
+        path.write_text(json.dumps({"schema": "glaeda-disk-errors/v1", "unreadable": 20, "at": 1}))
+        shutil.rmtree(self.archive)
+        record, code = self.unmounted_main(attach="hdiutil attach exit 1, /Volumes/glaeda-seed-archive still not "
+                                                  "a mount point: no output")
+        self.assertEqual((record["state"], code), ("unmounted", 1), record)
+        self.assertEqual(record["mount"], "/Volumes/glaeda-seed-archive")
+        self.assertIn("exit 1", record["reason"])
+        self.assertFalse(self.archive.exists())  # not even the archive directory under the bare mountpoint
+        report = json.loads(path.read_text())
+        self.assertEqual(report["state"], "unmounted")
+        self.assertIsNone(report["unreadable"])  # unknown: not zero, not the stale 20
+        self.assertIsNone(report["quarantined"])
+        self.assertIn("exit 1", report["reason"])
+
+    def test_a_mount_lost_mid_run_keeps_nothing_it_read_and_fetches_nothing(self):
+        for i, key in enumerate(KEYS[:3]):
+            self.keep(key, 100 + i)
+        self.main_once()  # fills KEYS[:3]
+        archive.remember_unreadable({KEYS[4]})  # a key a mounted listing would drop as gone (not listed)
+        for key in KEYS[3:4]:
+            self.keep(key, 200)
+        record, code = self.unmounted_main(lose_at="using the archive listing")
+        self.assertEqual((record["state"], code), ("unmounted", 1), record)
+        self.assertIn("before using the archive listing", record["reason"])
+        for k in ("fetched", "pruned", "archive_seeds", "disk_free_bytes", "full", "quarantined_aside"):
+            self.assertNotIn(k, record)
+        self.assertFalse((self.archive / (KEYS[3] + archive.SUFFIX)).exists())
+        self.assertEqual(archive.known_unreadable(), {KEYS[4]})  # an empty bare listing drops no known key
+        self.assertIsNone(self.disk_errors_file()["unreadable"])
+
+    def test_a_mount_lost_before_a_fetch_stops_the_fill(self):
+        self.keep(KEYS[0], 100)
+        record, code = self.unmounted_main(lose_at="fetching")
+        self.assertEqual(record["state"], "unmounted", record)
+        self.assertEqual(list(self.archive.iterdir()), [])
+
+    def test_attach_names_hdiutils_exit_code_when_stderr_is_empty(self):
+        tmp = Path(self.tmp.name)
+        fake = tmp / "hdiutil"
+        fake.write_text("#!/bin/sh\nexit 1\n")
+        fake.chmod(0o755)
+        (tmp / "image").mkdir()
+        saved = (archive.HDIUTIL, archive.IMAGE, archive.MOUNT)
+        archive.HDIUTIL, archive.IMAGE, archive.MOUNT = os.fspath(fake), tmp / "image", tmp / "mnt"
+        try:
+            why = archive.attach()
+        finally:
+            archive.HDIUTIL, archive.IMAGE, archive.MOUNT = saved
+        self.assertIn("hdiutil attach exit 1", why)
+        self.assertIn("no output", why)
+        self.assertEqual(archive.disk_errors({"state": "applied", "time": 1})["state"], "counted")
+
 if __name__ == "__main__":
     unittest.main()
