@@ -2368,6 +2368,16 @@ def slot_capacity_wait(cap: float | None, dev_compile_runner: bool) -> float | N
 SIM_SLOT_JOBS = frozenset({"ios-simulator-build"})
 
 
+# STEP_TABLE_UNLISTED: cmux's step table (pr-pipeline.yml, keyed by its caller pr-router.yml) never touches a canonical
+# root or the kept DerivedData (no CMUX_CI_CANONICAL_ROOT or owned-state step in it, cmux feat-cmux-next f65bb4fb71c0),
+# yet each job it added was a compile here until someone listed it: `mac`, `mac-fallback` and `ios` waited 58 min for
+# persistent-dd on cmux18 (2026-11-25), then `ios-fast` up to its 40-min timeout for root 1 (2026-11-27). So a job of
+# it that no table names is isolated (its own units, no shared token). GLAEDA_STEP_TABLE_UNLISTED_ISOLATED=0 costs it
+# as a compile again.
+STEP_TABLE_CALLER = "pr-router.yml"
+STEP_TABLE_UNLISTED_ENV = "GLAEDA_STEP_TABLE_UNLISTED_ISOLATED"
+
+
 def job_class(job: str, repo: str | None, home_repo: str = DEFAULT_HOME_REPO,
               workflow: str = "") -> tuple[str, bool]:
     """The job's class and whether it is pinned to /private/tmp/cmux-ci (an unknown job of the home repo). A
@@ -2386,6 +2396,9 @@ def job_class(job: str, repo: str | None, home_repo: str = DEFAULT_HOME_REPO,
         # most, so a job they add costed as a compile (5 units and a root) is refused on a busy mini and cancels
         # every scheduled run (the canary's pick, 2026-11-17). Unlisted, such a job is light.
         return "light", False
+    if workflow == STEP_TABLE_CALLER and job not in JOB_CLASSES and os.environ.get(STEP_TABLE_UNLISTED_ENV, "1") != "0":
+        # STEP_TABLE_UNLISTED: a job cmux's step table adds builds in its workspace, so it is isolated, not a compile
+        return "isolated", False
     return JOB_CLASSES.get(job, "compile"), job not in JOB_CLASSES
 
 

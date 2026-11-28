@@ -4877,7 +4877,7 @@ class HookTest(unittest.TestCase):
         # cmux's step table (pr-pipeline.yml) runs under its caller pr-router.yml: its Mac jobs never wait for
         # persistent-dd or a canonical root (cmux18, 2026-11-25: six runners busy 58 min on that wait).
         for job, klass in (("mac", "isolated"), ("mac-fallback", "isolated"), ("ios", "simulator-step"),
-                           ("ios-fast", "simulator-step")):
+                           ("ios-fast", "simulator-step"), ("a-step-added-later", "isolated")):
             with self.subTest(pr_router=job):
                 self.assertEqual(hook.job_class(job, "manaflow-ai/cmux", workflow="pr-router.yml"), (klass, False))
                 self.assertNotIn("persistent-dd", hook.CLASS_COST[klass][1])
@@ -5737,6 +5737,10 @@ class HookTest(unittest.TestCase):
         # any other workflow's unlisted job stays the compile it was
         self.assertEqual(hook.job_class("a-job-added-later", "manaflow-ai/cmux", workflow="ci.yml"),
                          ("compile", True))
+        # STEP_TABLE_UNLISTED: off, a step-table job no table names is the compile it was
+        with mock.patch.dict(os.environ, {hook.STEP_TABLE_UNLISTED_ENV: "0"}):
+            self.assertEqual(hook.job_class("a-step-added-later", "manaflow-ai/cmux", workflow="pr-router.yml"),
+                             ("compile", True))
 
     def test_capacity_a_job_cost_override_keeps_its_class_tokens(self) -> None:
         """cli-regressions is an unknown job (a compile, pinned to root 1) that measures 0.16 cores: it costs 1 core
