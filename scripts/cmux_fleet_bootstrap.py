@@ -386,7 +386,9 @@ def xcode_pin_ready(pin: str, xcode_version: str | None, sdk_version: str) -> bo
     CMUX pins a major version there: "26" since cmux#14050, "26.0" before it.
     The exact app and build are the CI Xcode variables' job, which the hosted
     adopter revalidates; this check keeps a node on the reviewed major or newer
-    while requiring the selected Xcode and SDK to share the pinned major.
+    while requiring the selected Xcode and SDK to share one major that is the
+    pinned one or newer. Fleet-wide Xcode 27.2 (2026-11-27) on cmux's "26" pin: an
+    exact-major match refused every 27.2 node, so no class could be accepted on it.
     """
     def major(version: str | None) -> int | None:
         match = re.fullmatch(r"(\d+)(?:\.\d+)*", version or "")
@@ -396,8 +398,9 @@ def xcode_pin_ready(pin: str, xcode_version: str | None, sdk_version: str) -> bo
     return (
         wanted is not None
         and wanted >= REVIEWED_XCODE_MAJOR
-        and major(xcode_version) == wanted
-        and major(sdk_version) == wanted
+        and (xcode_major := major(xcode_version)) is not None
+        and xcode_major >= wanted
+        and major(sdk_version) == xcode_major
     )
 
 

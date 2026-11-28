@@ -389,6 +389,9 @@ class Tests(unittest.TestCase):
             self.assertTrue(b.xcode_pin_ready(pin, "26.6", "26.5"), pin)
         self.assertTrue(b.xcode_pin_ready("27", "27.0", "27.0"))
         self.assertTrue(b.xcode_pin_ready("27", "27.1", "27.1"))
+        self.assertTrue(b.xcode_pin_ready("26", "27.2", "27.2"))  # newer than the pin: the fleet's Xcode 27.2
+        self.assertFalse(b.xcode_pin_ready("27", "26.6", "26.5"))  # older than the pin
+        self.assertFalse(b.xcode_pin_ready("26", "27.2", "26.5"))  # Xcode and SDK of different majors
         self.assertFalse(b.xcode_pin_ready("25", "25.4", "25.4"))
         self.assertFalse(b.xcode_pin_ready("26", "25.4", "26.5"))
         self.assertFalse(b.xcode_pin_ready("26", "260.1", "26.5"))
