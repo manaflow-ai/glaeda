@@ -12015,15 +12015,20 @@ class Daemon:
         now = time.time()  # requests carry wall-clock times, whatever clock a tick was given
         pending, touch = 0, {}
         for path in sorted(d.glob("*.json")):
-            rid = path.stem
+            rid, req = path.stem, None
             try:
                 req = read_json(path)
                 decided = self.serve_wait(d, rid, req, now, touch)
             except OSError:  # a full disk, say: the request stays, and the next tick tries again
                 pending += 1
                 continue
-            except Exception:  # noqa: BLE001  a request that cannot be ruled on must not stop the others
-                drop_wait(rid)  # its blocker sees the FIFO gone and hands the wait back (BLOCKER)
+            except Exception as error:  # noqa: BLE001  a request that cannot be ruled on must not stop the others
+                # Handed back, not dropped: its blocker sees the FIFO gone and execs resume_wait, which finds the
+                # request and its reason and rules on the rest of the wait itself (poll_wait). Dropped here before,
+                # silently: gcp-agent-lane-2, 2026-11-28 12:16-12:29Z, glaeda#3193's shadowed feed_view raised in
+                # wait_starved's own_feed_quiet for every upstream wait 120 s old, and each one's blocker exited 3
+                # "this wait's request is gone; run the wait again" at its next look, with no row saying why.
+                hand_back_wait(d, rid, req, f"the daemon could not rule on this wait: {describe_at(error)}")
                 continue
             if decided is None:
                 pending += 1
@@ -12084,11 +12089,15 @@ class Daemon:
 
     def serve_wait(self, d: Path, rid: str, req: Any, now: float, touch: dict[str, bool]) -> bool | None:
         """One request: None while pending, else whether its blocker was woken. Raises on a bad one."""
-        if (isinstance(req, dict) and req.get("stale") is not None and waiter_alive(req.get("pid"))
-                and now <= wait_deadline(req) + WAITS_LEFTOVER):
-            return None  # handed back (below): its blocker takes it to resume_wait within WAITS_CHECK
+        if (isinstance(req, dict) and (req.get("stale") is not None or req.get("handedBack") is not None)
+                and waiter_alive(req.get("pid")) and now <= wait_deadline(req) + WAITS_LEFTOVER):
+            return None  # handed back (below, hand_back_wait): its blocker takes it to resume_wait within WAITS_CHECK
         if (not isinstance(req, dict) or not waiter_alive(req.get("pid")) or not (d / f"{rid}.fifo").exists()
                 or now > wait_deadline(req) + WAITS_LEFTOVER):
+            if isinstance(req, dict) and waiter_alive(req.get("pid")):
+                # a live blocker's request is never removed without a row saying why (WaitDropReasonTest)
+                log({"event": "wait-dropped", "rid": rid, "key": req.get("key"), "pid": req.get("pid"),
+                     "why": "no FIFO" if not (d / f"{rid}.fifo").exists() else "past its deadline"})
             drop_wait(rid)
             return False
         if req.get("code") is None:
@@ -37535,6 +37544,10 @@ def block(rid: str, left: float, req: dict | None = None) -> None:
     sys.stderr.flush()
     # BLOCKER reads these from its environment: os.environ, which execv hands on (the process is replaced)
     os.environ.pop("GLAEDA_WAIT_PROGRESS", None)
+    os.environ.pop(WAIT_CARRIED_ENV, None)
+    carried = carried_wait_text(req)
+    if carried is not None:
+        os.environ[WAIT_CARRIED_ENV] = carried  # what resume_wait rules on if the request file is gone
     if req is not None:
         began, timeout = float(req["began"]), float(req["timeout"])
         # LEFT runs to the no-change deadline as it stands now (wait_deadline); a change the daemon sees moves it,
@@ -37547,6 +37560,33 @@ def block(rid: str, left: float, req: dict | None = None) -> None:
     os.execv(BASH, [BASH, "-c", BLOCKER, "glaeda-gh-wait", os.fspath(d / f"{rid}.fifo"), os.fspath(d / f"{rid}.out"),
                     str(max(1, int(left + 0.999))), os.fspath(d / ".served"), str(WAITS_CHECK),
                     *self_argv(), "wait-resume", rid])
+
+
+# The blocker's own copy of its request, in its environment (block): bash's exec hands it to wait-resume. A request
+# file removed under a live blocker -- by a daemon that raised on it, a sweep, a person -- left resume_wait nothing
+# to rule on, so a wait with most of its time left exited 3 "run the wait again" (gcp-agent-lane-2, 2026-11-28).
+WAIT_CARRIED_ENV = "GLAEDA_WAIT_REQUEST"
+WAIT_CARRIED_MAX = 64 * 1024  # under Linux's MAX_ARG_STRLEN (128 KiB) for one environment string
+
+
+def carried_wait_text(req: dict | None) -> str | None:
+    """REQ as the blocker carries it: whole, without the daemon's bookkeeping, and short enough for one environment
+    string (the changes it saw are left out first; its deadline then counts from the last one it kept)."""
+    if not wait_request_whole(req):
+        return None
+    keep = {k: v for k, v in req.items() if k not in ("progress", "stale", "handedBack", "code", "touched")}
+    text = json.dumps(keep, sort_keys=True)
+    if len(text) > WAIT_CARRIED_MAX and isinstance(keep.get("moved"), dict):
+        keep["moved"] = {k: v for k, v in keep["moved"].items() if k != "facts"}
+        text = json.dumps(keep, sort_keys=True)
+    return text if len(text) <= WAIT_CARRIED_MAX else None
+
+
+def carried_wait() -> dict | None:
+    with contextlib.suppress(ValueError, TypeError):
+        req = json.loads(os.environ.get(WAIT_CARRIED_ENV) or "null")
+        return req if wait_request_whole(req) else None
+    return None
 
 
 def resume_wait(rid: str) -> int:
@@ -37564,16 +37604,31 @@ def resume_wait(rid: str) -> int:
         drop_wait(rid)
         return code
     req = read_json(d / f"{rid}.json")
-    if not isinstance(req, dict) or not all(k in req for k in ("key", "kind", "began", "timeout", "until", "grace")):
+    if not wait_request_whole(req):
         drop_wait(rid)
-        say_waiting("glaeda-gh: this wait's request is gone; run the wait again")
-        say_waiting("next: glaeda-gh wait --help")
-        return EXIT_DOWN
+        req = carried_wait()
+        if req is None:  # a blocker from before WAIT_CARRIED_ENV, or a request too large to carry
+            say_waiting("glaeda-gh: this wait's request is gone; run the wait again")
+            say_waiting("next: glaeda-gh wait --help")
+            return EXIT_DOWN
+        # Not blocked on the daemon again: whatever removed the request may remove the next one. This process rules
+        # on the rest of the wait itself, from when it began; the daemon's log says why (a wait-dropped row).
+        say_waiting(f"glaeda-gh: the daemon no longer holds this wait's request; ruling on {key_name(req['key'])} "
+                    "here for the rest of the wait (if the daemon removed it, its log's wait-dropped row says why)")
+        return poll_wait_said(req)
+    if req.get("handedBack") is not None:
+        say_waiting(f"glaeda-gh: {req['handedBack']}; ruling on {key_name(req['key'])} here for the rest of the wait")
     left = wait_deadline(req) - time.time()  # moved by every change the daemon saw (wait_progress_mark)
-    if left > 0 and serving_waits() and req.get("stale") is None:  # (a stale one was handed back on purpose)
+    if left > 0 and serving_waits() and req.get("stale") is None and req.get("handedBack") is None:
+        # (a stale or handed-back one was handed back on purpose)
         register(req["key"], bool(req.get("jobs")), waited=True, began=float(req["began"]))
         block(rid, left, req)
     drop_wait(rid)
+    return poll_wait_said(req)
+
+
+def poll_wait_said(req: dict) -> int:
+    """poll_wait for a wait handed back to Python, saying a refusal in --json's form when the request asked for it."""
     try:
         return poll_wait(req)
     except WatchError as error:
@@ -37609,6 +37664,37 @@ def wake_waiter(fifo: Path, code: int) -> bool:
         return False
     finally:
         os.close(fd)
+
+
+WAIT_REQUEST_KEYS = ("key", "kind", "began", "timeout", "until", "grace")  # what resume_wait needs to rule on a wait
+
+
+def wait_request_whole(req: Any) -> bool:
+    return isinstance(req, dict) and all(k in req for k in WAIT_REQUEST_KEYS)
+
+
+def hand_back_wait(d: Path, rid: str, req: Any, why: str) -> None:
+    """The daemon will not rule on request RID (it raised on it): hand it back to its blocker, with WHY, instead of
+    dropping it. The request stays with "handedBack" set and the FIFO goes, so the blocker execs resume_wait within
+    WAITS_CHECK, which says WHY and rules on the rest of the wait itself (poll_wait). A request nobody can rule on (not
+    whole, or its blocker gone) is dropped -- and every live blocker's request removed here leaves a log row."""
+    try:
+        alive = isinstance(req, dict) and waiter_alive(req.get("pid"))
+    except Exception:  # noqa: BLE001  what raised may be this check itself: the request is kept for its blocker
+        alive = isinstance(req, dict)
+    row = {"rid": rid, "key": req.get("key") if isinstance(req, dict) else None, "why": why}
+    if alive and wait_request_whole(req):
+        try:
+            write_json(d / f"{rid}.json", {**req, "handedBack": why})
+        except Exception as error:  # noqa: BLE001  the blocker still carries its request (GLAEDA_WAIT_REQUEST)
+            row["why"] = f"{why}; and the hand-back could not be written: {describe(error)}"
+        else:
+            with contextlib.suppress(OSError):
+                (d / f"{rid}.fifo").unlink()
+            log({"event": "wait-handed-back", **row})
+            return
+    log({"event": "wait-dropped", **row, "whole": wait_request_whole(req), "alive": alive})
+    drop_wait(rid)
 
 
 def drop_wait(rid: str) -> None:

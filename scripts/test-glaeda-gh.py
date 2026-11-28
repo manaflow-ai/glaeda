@@ -12,6 +12,7 @@ import errno
 import fcntl
 import importlib.machinery
 import importlib.util
+import inspect
 import io
 import json
 import math
@@ -13913,6 +13914,116 @@ class WaitLandEndedTest(WaitPrNotMergedTest):
             code, text = gg.wait_step(self.request(until), time.time(), self.get)
             self.assertEqual(code, gg.EXIT_OK, (until, text))
             self.assertIn("PR still OPEN, not merged", text, until)
+
+
+class WaitRequestKeptTest(Base):
+    """gcp-agent-lane-2, 2026-11-28 12:18Z and 12:23Z: `glaeda-gh wait pr manaflow-ai/cmux#64582 --sha SHA --until done`
+    said one "still waiting ... 120s" line, then "this wait's request is gone; run the wait again" and exited 3, an
+    hour's wait with 57 minutes left. The daemon (glaeda#3193) raised in serve_wait on every upstream wait 120 s old --
+    a second `def feed_view` shadowed the one wait_starved's own_feed_quiet called -- and serve_waits' except arm
+    dropped the request with no row saying why. Class detectors, not that case: whatever removes a live waiter's
+    request, the wait carries on while time remains (test_a_wait_whose_request_is_removed_carries_on); and whatever
+    serve_wait calls that raises, the daemon keeps the request or records why it removed it
+    (test_no_callee_of_serve_wait_drops_a_live_request_silently)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        gg.BASE.mkdir(parents=True)
+        self.lock = open(gg.BASE / "daemon.lock", "a+")
+        fcntl.flock(self.lock, fcntl.LOCK_EX)  # stands in for a running daemon
+        self.addCleanup(self.lock.close)
+        gg.write_json(gg.BASE / "daemon.json", {"at": time.time(), "heartbeat": 30, "waits": gg.WAITS_CONTRACT})
+
+    def put(self, key: str, data: dict | None, at: float | None = None) -> None:
+        at = time.time() if at is None else at
+        gg.write_json(gg.cache_dir() / gg.file_name(key), {"key": key, "fetchedAt": at, "dataAt": at if data else None,
+                                                          "data": data, "error": None})
+
+    def live_request(self, number: int, began: float) -> tuple[str, int]:
+        rid = gg.write_wait_request("pr", f"o/r#{number}", "merged", 3600, False, False, None, True, gg.RESCUE_GRACE,
+                                    os.getpid(), began=began)
+        reader = os.open(gg.waits_dir() / f"{rid}.fifo", os.O_RDONLY | os.O_NONBLOCK)
+        self.addCleanup(os.close, reader)
+        return rid, reader
+
+    def test_a_wait_whose_request_is_removed_carries_on(self) -> None:
+        rid, _ = self.live_request(11, began=time.time() - 180)
+        req = gg.read_json(gg.waits_dir() / f"{rid}.json")
+        handed: dict[str, str] = {}
+
+        class Execed(Exception):
+            pass
+
+        def execv(path: str, argv: list[str]) -> None:  # the blocker: what bash's exec hands wait-resume
+            handed.update(os.environ)
+            raise Execed
+
+        with mock.patch.object(gg.os, "execv", side_effect=execv), mock.patch.dict(os.environ), \
+                contextlib.suppress(Execed), contextlib.redirect_stderr(io.StringIO()):
+            gg.block(rid, gg.wait_deadline(req) - time.time(), req)
+        self.assertTrue(handed, "block did not exec the blocker")
+        gg.drop_wait(rid)  # removed under the live blocker: a daemon that raised on it, a sweep, a person
+
+        self.gh.prs[("o", "r", 11)] = pr_node(11, state="MERGED", rollup="SUCCESS", checks=[check_run("a")])
+        real = gg.Daemon
+        direct = lambda **kw: real(transport=self.gh, token=lambda: TOKEN, controller=None, upstream=None)  # noqa: E731
+        said, out = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, handed, clear=True), mock.patch.object(gg, "Daemon", side_effect=direct), \
+                mock.patch.object(gg, "block") as block, self.diagnostics_in(said), contextlib.redirect_stdout(out):
+            code = gg.resume_wait(rid)
+        block.assert_not_called()
+        self.assertNotIn("request is gone", said.getvalue())
+        self.assertEqual(code, gg.EXIT_OK, "a wait with 57 minutes left exited on its request being removed:\n"
+                         + said.getvalue() + out.getvalue())
+        self.assertIn("MERGED", out.getvalue())
+
+    # serve_wait's callees that are not how a drop is reported: log and drop_wait are the report; get is dict.get
+    NOT_RAISED = {"log", "drop_wait", "get"}
+
+    def test_no_callee_of_serve_wait_drops_a_live_request_silently(self) -> None:
+        code = gg.Daemon.serve_wait.__code__
+        module = sorted(n for n in code.co_names if n not in self.NOT_RAISED
+                        and inspect.isfunction(getattr(gg, n, None)) and getattr(gg, n).__module__ == gg.__name__)
+        methods = sorted(n for n in code.co_names if n not in self.NOT_RAISED
+                         and inspect.isfunction(getattr(gg.Daemon, n, None)))
+        self.assertIn("wait_starved", module)  # glaeda#3193's raise came from under it
+        reached = []
+        for owner, name in [(gg, n) for n in module] + [(gg.Daemon, n) for n in methods]:
+            with self.subTest(callee=name):
+                number = 100 + len(reached) + len(module) + len(methods)
+                for stray in gg.waits_dir().glob("*"):
+                    stray.unlink()
+                rid, _ = self.live_request(number, began=time.time() - 200)
+                # pending, and past UPSTREAM_DIRECT_AFTER: the path the 12:18Z wait took
+                self.put(f"pr:o/r#{number}", gg.parse_pr(pr_node(number, checks=[check_run("a", status="IN_PROGRESS",
+                                                                                           conclusion=None)])))
+                rows: list[dict] = []
+                raised: list[str] = []
+                real = getattr(owner, name)
+
+                def from_serve_wait(*args, real=real, name=name, **kwargs):  # raises where serve_wait calls it only
+                    if sys._getframe(1).f_code is code:
+                        raised.append(name)
+                        raise RuntimeError(f"{name} raised (WaitRequestKeptTest)")
+                    return real(*args, **kwargs)
+
+                with mock.patch.object(owner, name, from_serve_wait), \
+                        mock.patch.object(gg, "log", side_effect=rows.append):
+                    self.daemon.serve_waits()
+                if not raised:
+                    continue
+                reached.append(name)
+                kept = gg.read_json(gg.waits_dir() / f"{rid}.json")
+                why = [r for r in rows if r.get("rid") == rid and r.get("event") == "wait-dropped" and r.get("why")]
+                woken = (gg.waits_dir() / f"{rid}.out").exists()
+                self.assertTrue(isinstance(kept, dict) or why or woken,
+                                f"the daemon removed a live waiter's request when {name} raised, with no row saying "
+                                f"why: log rows {rows}")
+                if isinstance(kept, dict) and not woken:
+                    self.assertTrue(kept.get("handedBack") or kept.get("stale") or
+                                    (gg.waits_dir() / f"{rid}.fifo").exists(),
+                                    f"{name} raised: the request stayed with neither its FIFO nor a hand-back")
+        self.assertIn("wait_starved", reached, f"the pending path was not reached; reached {reached}")
 
 
 class WaitSubscriptionTest(Base):
