@@ -6867,6 +6867,84 @@ def install_git_shim(repo: str | None, mirror: Path = MIRROR_DIR, environ: Mappi
         return f"git shim: {type(error).__name__}"
 
 
+# MIRROR_KICK: a cmux push or schedule job on a kept branch whose own commit ($GITHUB_SHA) the mirror lacks at
+# job-started starts one mirror pass now and says, in the job's log, what the mirror's last pass recorded. The shim
+# waits GIT_SHIM_WAIT_S for "the mirror's next pass" and only polled, so a mini whose passes were not landing waited
+# for nothing: on the NEXT nightly, every job on the nightly-only Studio waited its 90-180 s and then fetched from
+# github.com (run 46142021653: runner-preflight 11:54Z, report-nightly-failure and retry-nightly-next 12:39Z, all for
+# nightly-next 435816af pushed at 11:53Z; the same in every nightly-next run that day back to 05:10Z), while the
+# nightly-only minis' mirrors served the same commits. The pass takes the mirror's own flock (a running one makes it
+# a no-op) and its own bounds; the hook neither waits for it nor fails the job on it. The record line names the pass
+# state, its last good fetch and its fetch error, so a mirror that never catches up says why in the job that missed.
+MIRROR_KICK_BRANCHES = ("refs/heads/main", "refs/heads/feat-cmux-next", "refs/heads/nightly-next")
+MIRROR_KICK_ENV = "GLAEDA_GIT_MIRROR_BIN"
+
+
+def mirror_record_note(record: Mapping[str, Any] | None, now: float | None = None) -> str:
+    """One line from glaeda-git-mirror's record (GIT_DIR/cmux.json): its last pass's state and time, its last good
+    fetch's age and route, and its fetch error, if any."""
+    if not isinstance(record, Mapping):
+        return "no mirror record"
+    now = time.time() if now is None else now
+
+    def age(stamp: object) -> str:
+        try:
+            then = datetime.datetime.strptime(str(stamp), "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=datetime.timezone.utc).timestamp()
+        except ValueError:
+            return "?"
+        return f"{max(0, now - then) / 60:.0f} min ago"
+    fetch = record.get("fetch") if isinstance(record.get("fetch"), Mapping) else {}
+    parts = [f"last pass {record.get('state') or '?'} {age(record.get('time'))}"]
+    good = record.get("fetched_at") or (record.get("time") if fetch.get("ok") is True else None)
+    parts.append(f"last good fetch {age(good)}" if good else "no good fetch on record")
+    if fetch.get("via"):
+        parts.append(f"via {fetch['via']}")
+    if fetch.get("held"):
+        parts.append(str(fetch["held"])[:160])
+    errors = list(fetch.get("errors") or []) + list(fetch.get("proxy_errors") or [])
+    if errors:
+        parts.append(f"error: {str(errors[-1])[:200]}")
+    if record.get("reason"):
+        parts.append(f"reason: {str(record['reason'])[:160]}")
+    return "; ".join(parts)
+
+
+def mirror_miss_kick(repo: str | None, mirror: Path = MIRROR_DIR, environ: Mapping[str, str] | None = None,
+                     start: Callable[[list[str]], None] | None = None) -> str:
+    """MIRROR_KICK: one note when the mirror lacks this push job's own commit (and a pass was started), else ""."""
+    env = os.environ if environ is None else environ
+    try:
+        sha, ref, event = env.get("GITHUB_SHA", ""), env.get("GITHUB_REF", ""), env.get("GITHUB_EVENT_NAME", "")
+        if (repo or "").lower() != GIT_SHIM_REPO or env.get("GLAEDA_GIT_SHIM") == "0" or ref not in MIRROR_KICK_BRANCHES \
+                or event.startswith(("pull_request", "merge_group")) or not re.fullmatch(r"[0-9a-f]{40}", sha) \
+                or mirror_identity(mirror) is None:
+            return ""
+        git = shutil.which("git", path="/usr/bin:/opt/homebrew/bin:/usr/local/bin") or "git"
+        if subprocess.run([git, "--git-dir", os.fspath(mirror), "cat-file", "-e", f"{sha}^{{commit}}"],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20).returncode == 0:
+            return ""
+        try:
+            record = json.loads((mirror.parent / "cmux.json").read_text())
+        except (OSError, ValueError):
+            record = None
+        note = f"the mirror lacks this run's {ref[len('refs/heads/'):]} {sha[:12]}: {mirror_record_note(record)}"
+        tool = Path(env[MIRROR_KICK_ENV]) if env.get(MIRROR_KICK_ENV) else staged_data_path("glaeda-git-mirror",
+                                                                                          MIRROR_KICK_ENV)
+        if not tool.is_file():
+            return f"{note}; no glaeda-git-mirror at {tool} to start a pass"
+        argv = [sys.executable, os.fspath(tool), "--apply"]
+        if start is None:
+            subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True, close_fds=True, env={**env, "GLAEDA_GIT_MIRROR_DIR":
+                                                                          os.fspath(mirror.parent)})
+        else:
+            start(argv)
+        return f"{note}; started a mirror pass now (the shim's wait reads it)"
+    except Exception as error:  # noqa: BLE001  (never fail the job on housekeeping)
+        return f"mirror kick: {type(error).__name__}"
+
+
 def git_fetch_summary(environ: Mapping[str, str] | None = None) -> str:
     """job-completed: how many cmux git fetches this job sent to github.com and how many the mirror served, or ""."""
     env = os.environ if environ is None else environ
@@ -17871,6 +17949,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{PREFIX}: {guarded}", flush=True)
         if shim := install_git_shim(repo):
             print(f"{PREFIX}: {shim}", flush=True)
+            if kick := mirror_miss_kick(repo):
+                print(f"{PREFIX}: {kick}", flush=True)
         unsparsed = ""
         with contextlib.suppress(Exception):  # must not fail an admitted job
             unsparsed = unsparse_workspace(os.environ.get("GITHUB_WORKSPACE"))

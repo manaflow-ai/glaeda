@@ -25224,6 +25224,52 @@ class GitShimTest(unittest.TestCase):
         self.assertNotIn("going direct", result.stderr)
 
 
+class MirrorKickTest(unittest.TestCase):
+    """MIRROR_KICK: a push job on a kept branch whose commit the mirror lacks starts a mirror pass at job-started and
+    logs the mirror record (run 46142021653: three jobs waited 90-180 s for a pass that never brought 435816af)."""
+
+    setUp, tearDown, git = GitShimTest.setUp, GitShimTest.tearDown, GitShimTest.git
+
+    def kick(self, sha: str, ref: str = "refs/heads/nightly-next", event: str = "push", **env: str) -> tuple[str, list]:
+        started: list = []
+        tool = self.dir / "glaeda-git-mirror"
+        tool.write_text("")
+        note = hook.mirror_miss_kick("manaflow-ai/cmux", self.mirror,
+                                     {**self.job_env, "GITHUB_SHA": sha, "GITHUB_REF": ref, "GITHUB_EVENT_NAME": event,
+                                      hook.MIRROR_KICK_ENV: os.fspath(tool), **env}, start=started.append)
+        return note, started
+
+    def test_a_miss_on_a_kept_branch_starts_one_pass_and_logs_the_record(self) -> None:
+        (self.mirror.parent / "cmux.json").write_text(json.dumps({
+            "time": "2026-11-28T12:38:00Z", "state": "fetch-failed", "fetched_at": "2026-11-28T11:50:00Z",
+            "fetch": {"ok": False, "via": "github", "errors": ["try 3: exit 128: The requested URL returned error: 403"],
+                      "proxy_errors": ["try 1: exit 128: Failed to connect to the proxy"]}}))
+        note, started = self.kick(self.pr_sha)
+        self.assertEqual(len(started), 1)
+        self.assertEqual(started[0][-2:], [os.fspath(self.dir / "glaeda-git-mirror"), "--apply"])
+        self.assertIn(f"lacks this run's nightly-next {self.pr_sha[:12]}", note)
+        self.assertIn("last pass fetch-failed", note)
+        self.assertIn("via github", note)
+        self.assertIn("Failed to connect to the proxy", note)
+        self.assertIn("started a mirror pass now", note)
+
+    def test_no_kick_when_the_mirror_has_it_or_the_job_is_not_a_kept_branch_push(self) -> None:
+        for sha, ref, event in ((self.main_sha, "refs/heads/nightly-next", "push"),
+                                (self.pr_sha, "refs/pull/1/merge", "pull_request"),
+                                (self.pr_sha, "refs/heads/nightly-next", "pull_request_target"),
+                                (self.pr_sha, "refs/heads/some-lane", "push")):
+            self.assertEqual(self.kick(sha, ref, event), ("", []), (sha, ref, event))
+        self.assertEqual(self.kick(self.pr_sha, GLAEDA_GIT_SHIM="0"), ("", []))
+        (self.mirror / "glaeda-repair-pending").write_text("")
+        self.assertEqual(self.kick(self.pr_sha), ("", []))
+
+    def test_no_record_and_no_tool_still_say_so(self) -> None:
+        note, started = self.kick(self.pr_sha, **{hook.MIRROR_KICK_ENV: os.fspath(self.dir / "absent")})
+        self.assertEqual(started, [])
+        self.assertIn("no mirror record", note)
+        self.assertIn("no glaeda-git-mirror at", note)
+
+
 class SubmoduleShimTest(unittest.TestCase):
     """GIT_SHIM for submodules: a cold cmux checkout's `git submodule update` clones each submodule from the
     mirror pass's submodule mirror (glaeda-git-mirror SUBMODULES), so it sends github.com no git fetch."""
