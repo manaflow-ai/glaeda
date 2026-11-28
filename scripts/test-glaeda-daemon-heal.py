@@ -1144,7 +1144,9 @@ class FleetOps(unittest.TestCase):
 
     def test_shipped_ops_are_pinned_to_their_source(self) -> None:
         doc = heal.load_fleet_ops(OPS_BYTES)
-        self.assertEqual(sorted(doc["ops"]), ["console-unlock-guard", "seed-root", "symbol-cache-cap"])
+        # HQ's fleet-ops-export adds ops over time (leo-workspace tools/fleet_ops_pin.py opens each re-export PR),
+        # so pin the ops these tests lean on, not the whole set: an added op must not turn its own PR red.
+        self.assertLessEqual({"console-unlock-guard", "seed-root", "symbol-cache-cap"}, set(doc["ops"]))
         for name, op in doc["ops"].items():
             self.assertEqual(heal.sha256(op["body"].encode()), op["sha256"])
             self.assertRegex(op["source"]["commit"], r"^[0-9a-f]{40}$")
@@ -1155,7 +1157,7 @@ class FleetOps(unittest.TestCase):
     def test_a_stale_or_missing_body_is_installed_with_its_launchdaemon(self) -> None:
         (self.ops_dir / "console-unlock-guard").write_bytes(b"#!/bin/bash\n# older\n")
         out = self.run_ops()
-        self.assertEqual(out["installed"], ["console-unlock-guard", "seed-root", "symbol-cache-cap"])
+        self.assertEqual(out["installed"], sorted(self.doc["ops"]))
         for name, op in self.doc["ops"].items():
             self.assertEqual((self.ops_dir / name).read_bytes(), op["body"].encode())
             self.assertEqual((self.ops_dir / name).stat().st_mode & 0o777, 0o755)
@@ -1164,8 +1166,7 @@ class FleetOps(unittest.TestCase):
                                      "StartInterval": op["every_s"], "StandardOutPath": f"/var/log/{name}.log",
                                      "StandardErrorPath": f"/var/log/{name}.log"})
             self.assertEqual(out["ops"][name]["state"], "current")
-        self.assertEqual(self.loaded, {"system/ai.manaflow.console-unlock-guard", "system/ai.manaflow.seed-root",
-                                       "system/ai.manaflow.symbol-cache-cap"})
+        self.assertEqual(self.loaded, {f"system/ai.manaflow.{name}" for name in self.doc["ops"]})
 
     def test_an_op_dropped_from_the_file_is_unloaded_and_removed_but_nothing_else(self) -> None:
         self.run_ops()
@@ -1180,7 +1181,7 @@ class FleetOps(unittest.TestCase):
         self.assertFalse((self.plists / "ai.manaflow.symbol-cache-cap.plist").exists())
         self.assertNotIn("system/ai.manaflow.symbol-cache-cap", self.loaded)
         self.assertTrue((self.ops_dir / "by-hand").exists() and (self.plists / "ai.manaflow.by-hand.plist").exists())
-        self.assertEqual(json.loads(self.ledger.read_text())["ops"], ["console-unlock-guard", "seed-root"])
+        self.assertEqual(json.loads(self.ledger.read_text())["ops"], sorted(doc["ops"]))
         self.assertNotIn("removed", self.run_ops())
 
     def test_a_load_that_fails_is_retried_at_the_next_pass(self) -> None:
