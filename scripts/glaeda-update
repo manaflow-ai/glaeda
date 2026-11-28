@@ -233,6 +233,12 @@ ACCOUNT_TMP = "/tmp"
 PROMOTION_ADMIT = "glaeda-promotion-admit"
 PROMOTION_ROOT = ".local/state/glaeda/promotion"  # under home: the helper's promotion_root()
 # Results that retrying the same release cannot change: the host needs a new release or an operator.
+# The fleet compilation-cache node (scripts/glaeda-fleet-cas): its binary is built from the release's
+# tools/fleet-cas-prototype, and bin/fleet-cas.source records the source digest it was built from.
+CAS_ROOT = Path("/Users/Shared/cmux-build-fleet/xcode")
+CAS_NODE_LABEL = "com.teamleaderleo.glaeda.fleet-cas-node"
+CAS_PROTO = "glaeda/tools/fleet-cas-prototype"  # in the release tree
+CAS_REFRESH_TIMEOUT = 1800  # a cold cargo build of the node, at nice 15 beside the host's builds
 BLOCKING_RESULTS = ("quarantined", "refused", "rolled-back")
 # Hook refresh states that wait for an operator (--apply), not for a job to finish.
 BLOCKING_HOOK_STATES = ("blocked", "kept", "skipped")
@@ -1521,6 +1527,61 @@ def refresh_promotion_admit(state_dir: Path = STATE_DIR, target: Path = RUNNER_S
     return f"{'replaced' if have else 'installed'} {tag}'s {want[:12]}"
 
 
+def cas_source_digest(proto: Path) -> str | None:
+    """glaeda-fleet-cas source_digest, in Python: SHA-256 over `shasum -a 256` lines ("HEX  ./PATH") of every
+    regular file under the node's source but its top-level target/, in byte order of path. None without a tree."""
+    if not proto.is_dir() or proto.is_symlink():
+        return None
+    rows = []
+    for top, dirs, files in os.walk(proto):
+        if Path(top) == proto and "target" in dirs:
+            dirs.remove("target")
+        for name in files:
+            path = Path(top) / name
+            if path.is_symlink() or not path.is_file():
+                continue
+            rows.append((b"./" + os.fsencode(path.relative_to(proto)), path))
+    rows.sort(key=lambda row: row[0])
+    lines = b"".join(hashlib.sha256(path.read_bytes()).hexdigest().encode() + b"  " + rel + b"\n" for rel, path in rows)
+    return hashlib.sha256(lines).hexdigest()
+
+
+def cas_node_installed(home: Path = HOME) -> bool:
+    """A fleet-cas node or writer is installed here: its recorded arguments, or a service for it (an older layout)."""
+    root = CAS_ROOT
+    return ((root / "run/node.args").is_file() or (home / f"Library/LaunchAgents/{CAS_NODE_LABEL}.plist").exists()
+            or Path(f"/Library/LaunchDaemons/{CAS_NODE_LABEL}.plist").exists())
+
+
+def refresh_cas_node(state_dir: Path = STATE_DIR, home: Path = HOME) -> str:
+    """Step 6d: rebuild and restart an installed fleet-cas node whose binary is not the installed release's source,
+    by the release's own `glaeda-fleet-cas refresh --apply` (it defers while a build uses the node). Before this, only
+    a hand-run install rebuilt it, and a node ran a binary five merged fixes old for weeks (forum/1123)."""
+    if not cas_node_installed(home):
+        return "absent"
+    tag = load_state(state_dir)["current"]
+    gen = generation(state_dir, tag) if tag else None
+    if gen is None or not (gen / ".complete").is_file():
+        return "no installed release"
+    script = gen / "glaeda/scripts/glaeda-fleet-cas"
+    if not script.is_file():
+        return f"{tag} has no fleet-cas installer"
+    env = {"HOME": str(home), "PATH": CHILD_PATH, "FLEET_CAS_ROOT": str(CAS_ROOT)}
+    for key in ("FLEET_HOST_LOCK", "FLEET_CAS_BUILD_PROCS", "USER", "LOGNAME"):
+        if key in os.environ:
+            env[key] = os.environ[key]
+    try:
+        result = subprocess.run(["/bin/bash", str(script), "refresh", "--apply"], capture_output=True, text=True,
+                                timeout=CAS_REFRESH_TIMEOUT, stdin=subprocess.DEVNULL, env=env)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"failed ({type(e).__name__})"
+    lines = [line for line in result.stdout.splitlines() if line.startswith("fleet-cas refresh: ")]
+    if lines:
+        return lines[-1].removeprefix("fleet-cas refresh: ")[:300]
+    tail = (result.stderr or result.stdout).strip().splitlines()[-1:] or [""]
+    return f"failed ({tag}'s glaeda-fleet-cas exited {result.returncode}: {tail[0]})"[:300]
+
+
 def runner_steps(state_dir: Path = STATE_DIR, target: Path = RUNNER_SCRIPTS, home: Path = HOME,
                  detail: list | None = None, bin_dir: Path = BIN) -> dict:
     """Steps 6, 6b, 6c and 7, after a run that installed a release or found it current. None fails the update."""
@@ -1530,6 +1591,7 @@ def runner_steps(state_dir: Path = STATE_DIR, target: Path = RUNNER_SCRIPTS, hom
                       ("libexecScripts", lambda: refresh_libexec_scripts(state_dir, home / LIBEXEC_RELATIVE)),
                       ("casScripts", lambda: refresh_libexec_scripts(
                           state_dir, home / ".cache/glaeda-fleet-cas/launch", ("glaeda-fleet-cas-prune",))),
+                      ("casNode", lambda: refresh_cas_node(state_dir, home)),
                       ("runnerHooks", lambda: refresh_runner_hooks(state_dir, home, detail))):
         try:
             out[key] = step()
@@ -1539,6 +1601,8 @@ def runner_steps(state_dir: Path = STATE_DIR, target: Path = RUNNER_SCRIPTS, hom
         del out["libexecScripts"]  # no seed role on this host: nothing to say
     if out.get("casScripts") in ("absent", "no seed scripts"):
         del out["casScripts"]
+    if out.get("casNode") == "absent":
+        del out["casNode"]  # no fleet-cas node on this host
     accounts = []
     for user in runner_accounts(home):  # step 7b
         try:
@@ -1727,7 +1791,30 @@ def observe(state_dir: Path = STATE_DIR, bin_dir: Path = BIN, home: Path = HOME,
         want = file_sha256(scripts / cas.name)
         out["casScripts"] = {cas.name: {"installedSha256": have, "releaseSha256": want,
                                        "current": have is not None and have == want}}
+    if cas_node_installed(home):  # step 6d: the node's binary against the release's node source
+        out["casNode"] = cas_node_row(gen)
     return out
+
+
+def cas_node_row(gen: Path) -> dict:
+    """The fleet-cas node by source: what bin/fleet-cas was built from (its fleet-cas.source receipt), the release's
+    node source, and whether the running process is bin/fleet-cas (fleet-cas-run's run/node.bin)."""
+    root = CAS_ROOT
+    try:
+        installed = (root / "bin/fleet-cas.source").read_text().strip() or None
+    except OSError:
+        installed = None
+    try:
+        started = (root / "run/node.bin").read_text().strip() or None
+    except OSError:
+        started = None
+    release = cas_source_digest(gen / CAS_PROTO)
+    row = {"installedSource": installed, "releaseSource": release,
+           "runningCurrent": started is not None and started == file_sha256(root / "bin/fleet-cas"),
+           "legacy": not (root / "run/node.args").is_file()}
+    row["current"] = (not row["legacy"] and row["runningCurrent"] and installed is not None
+                      and (release is None or installed == release))
+    return row
 
 
 def convergence(result: dict, running: dict, wants: dict | None, hook_states: list[dict]) -> tuple[bool, list[str], bool]:
@@ -1771,6 +1858,18 @@ def convergence(result: dict, running: dict, wants: dict | None, hook_states: li
         for name, script in (running.get(key) or {}).items():
             if not script.get("current"):
                 why.append(f"{name}: installed service script differs from {running.get('tag')}")
+    node = running.get("casNode") or {}
+    if node and not node.get("current"):
+        step = str(result.get("casNode") or "")
+        if node.get("legacy"):
+            what = "an older layout without run/node.args (reinstall it: glaeda-fleet-cas-rollout --nodes-only)"
+        elif node.get("installedSource") != node.get("releaseSource"):
+            what = (f"built from {str(node.get('installedSource'))[:12] if node.get('installedSource') else 'an unrecorded source'}, "
+                    f"{running.get('tag')} has {str(node.get('releaseSource') or '?')[:12]}")
+        else:
+            what = "the running process is not bin/fleet-cas"
+        why.append(f"fleet-cas node: {what}" + (f" ({step[:200]})" if step else ""))
+        blocking = blocking or bool(node.get("legacy")) or step.startswith(("failed", "legacy"))
     return not why, why, blocking
 
 

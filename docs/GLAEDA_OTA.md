@@ -370,9 +370,29 @@ are refused before setup, as with other unsupported persisted flags.
 Each successful recurring update also refreshes the already-installed direct
 script `~/.cache/glaeda-fleet-cas/launch/glaeda-fleet-cas-prune`, using the same
 atomic replacement and newer-operator-copy protection as the seed scripts.
-It creates no CAS role, storage, binary, wrapper or unit and restarts no CAS
-service. The installer remains responsible for those surfaces through its
-registry deploy runner. Operator symlinks at the script, install directory, or
+It creates no CAS role, storage, wrapper or unit. The installer remains
+responsible for those surfaces through its registry deploy runner.
+
+The node's binary does roll (`casNode`, step 6d): on a host with an installed
+fleet-cas node or writer (`/Users/Shared/cmux-build-fleet/xcode/run/node.args`),
+each successful update runs the release's `glaeda-fleet-cas refresh --apply`.
+The installer records what `bin/fleet-cas` was built from in
+`bin/fleet-cas.source` (`source_digest`: SHA-256 over the `shasum -a 256` lines
+of every file in `tools/fleet-cas-prototype` but `target/`). When that differs
+from the release's source, or the running process is not `bin/fleet-cas`,
+refresh builds into `xcode/build-target` (never the release tree), then, holding
+the host lock, installs the binaries and restarts the node on its recorded
+arguments through its launchd service (the KeepAlive restart). A running build
+(`xcodebuild`, `swift-build`, the writer build) or a held host lock defers it to
+the next update. It never touches a store. A node service without
+`run/node.args` (the older layout, before `bin/fleet-cas-run`) is reported as
+`legacy` and left for `glaeda-fleet-cas-rollout --nodes-only`.
+`converge.json` exposes `running.casNode` (`installedSource`, `releaseSource`,
+`runningCurrent`, `legacy`, `current`); a stale node makes convergence false
+(`fleet-cas node: built from X, TAG has Y`), blocking for a legacy layout or a
+failed rebuild, so glaeda-mini-health reports it as `ota_not_converging`. That
+is the detector for a node older than the newest released node change
+(forum/1123: a node ran a weeks-old binary through five merged node fixes). Operator symlinks at the script, install directory, or
 source stamp are preserved; linked scripts remain unknown in convergence.
 A linked script is skipped individually so regular sibling scripts still update.
 `converge.json` exposes `running.casScripts` and

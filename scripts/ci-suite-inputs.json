@@ -122,6 +122,7 @@
         "scripts/glaeda-cmux-runner-fleet",
         "scripts/glaeda-cmux-runner-hook",
         "scripts/glaeda-disk",
+        "scripts/glaeda-fleet-cas",
         "scripts/glaeda-gh",
         "scripts/glaeda-job-needs.json",
         "scripts/glaeda-mini-health",

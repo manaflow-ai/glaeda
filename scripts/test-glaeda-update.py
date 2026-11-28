@@ -603,6 +603,79 @@ class UpdateTest(unittest.TestCase):
         self.assertIn("kept", gu.runner_steps(self.state, staged, home, bin_dir=self.bin)["casScripts"])
         self.assertFalse(gu.observe(self.state, self.bin, home, staged)["casScripts"][name]["current"])
 
+    def test_the_cas_node_is_rebuilt_from_the_release_and_a_stale_one_is_unconverged(self) -> None:
+        """forum/1123: a node kept a weeks-old binary because only a hand-run install rebuilt it."""
+        home, staged, _ = self.runner_mini()
+        entry = self.server.publish(SOURCES[0])
+        self.assertEqual(self.run_update()["result"], "updated")
+        cas = self.root / "xcode"
+        patch = mock.patch.object(gu, "CAS_ROOT", cas)
+        patch.start()
+        self.addCleanup(patch.stop)
+        gen = gu.generation(self.state, entry["tag"])
+        # No node on this host: no step, no row.
+        self.assertNotIn("casNode", gu.runner_steps(self.state, staged, home, bin_dir=self.bin))
+        self.assertNotIn("casNode", gu.observe(self.state, self.bin, home, staged))
+        proto = gen / gu.CAS_PROTO
+        (proto / "src").mkdir(parents=True)
+        (proto / "src/main.rs").write_text("fn main() {}\n")
+        (proto / "target/release").mkdir(parents=True)
+        (proto / "target/release/fleet-cas").write_text("build output, not source")
+        installer = gen / "glaeda/scripts/glaeda-fleet-cas"
+        calls = self.root / "installer-calls"
+        installer.write_text(f"#!/bin/bash\necho \"$* $FLEET_CAS_ROOT\" >>{calls}\n"
+                             "echo building\necho 'fleet-cas refresh: deferred (xcodebuild is running)'\n")
+        (cas / "run").mkdir(parents=True)
+        (cas / "run/node.args").write_text("sock\nstore\n")
+        self.assertEqual(gu.runner_steps(self.state, staged, home, bin_dir=self.bin)["casNode"],
+                         "deferred (xcodebuild is running)")
+        self.assertEqual(calls.read_text(), f"refresh --apply {cas}\n")
+        row = gu.observe(self.state, self.bin, home, staged)["casNode"]
+        self.assertEqual(row, {"installedSource": None, "releaseSource": gu.cas_source_digest(proto),
+                               "runningCurrent": False, "legacy": False, "current": False})
+        converged, why, blocking = gu.convergence({"result": "current", "casNode": "deferred (xcodebuild is running)"},
+                                                  {"tag": entry["tag"], "casNode": row}, {"tag": entry["tag"]}, [])
+        self.assertFalse(converged)
+        self.assertFalse(blocking)  # a deferral clears at the next update
+        self.assertTrue(any(line.startswith("fleet-cas node: built from an unrecorded source") and "deferred" in line
+                            for line in why), why)
+        # target/ is not source: the digest is the same without it.
+        before = gu.cas_source_digest(proto)
+        (proto / "target/release/fleet-cas").write_text("another build")
+        self.assertEqual(gu.cas_source_digest(proto), before)
+        # Built from the release's source and running that binary: current.
+        (cas / "bin").mkdir()
+        (cas / "bin/fleet-cas").write_text("node binary")
+        (cas / "bin/fleet-cas.source").write_text(before + "\n")
+        (cas / "run/node.bin").write_text(gu.file_sha256(cas / "bin/fleet-cas") + "\n")
+        row = gu.observe(self.state, self.bin, home, staged)["casNode"]
+        self.assertTrue(row["current"], row)
+        self.assertEqual(gu.convergence({"result": "current"}, {"tag": entry["tag"], "casNode": row},
+                                        {"tag": entry["tag"]}, []), (True, [], False))
+        # A merged node change in the next release: stale again, named by both digests.
+        (proto / "src/main.rs").write_text("fn main() { fix(); }\n")
+        row = gu.observe(self.state, self.bin, home, staged)["casNode"]
+        self.assertFalse(row["current"])
+        _, why, _ = gu.convergence({"result": "current"}, {"tag": entry["tag"], "casNode": row}, {"tag": entry["tag"]}, [])
+        self.assertIn(f"fleet-cas node: built from {before[:12]}, {entry['tag']} has {gu.cas_source_digest(proto)[:12]}",
+                      why)
+        # An installer that fails without its state line is a failure, with its words.
+        installer.write_text("#!/bin/bash\necho 'cargo: error' >&2\nexit 1\n")
+        self.assertEqual(gu.runner_steps(self.state, staged, home, bin_dir=self.bin)["casNode"],
+                         f"failed ({entry['tag']}'s glaeda-fleet-cas exited 1: cargo: error)")
+        # An older layout (a node service, no recorded arguments): blocking, and named.
+        (cas / "run/node.args").unlink()
+        agents = home / "Library/LaunchAgents"
+        agents.mkdir(parents=True)
+        (agents / f"{gu.CAS_NODE_LABEL}.plist").write_text("old plist")
+        row = gu.observe(self.state, self.bin, home, staged)["casNode"]
+        self.assertTrue(row["legacy"])
+        converged, why, blocking = gu.convergence({"result": "current"}, {"tag": entry["tag"], "casNode": row},
+                                                  {"tag": entry["tag"]}, [])
+        self.assertFalse(converged)
+        self.assertTrue(blocking)
+        self.assertIn("older layout", why[0])
+
     def test_service_script_refresh_preserves_operator_symlinks(self) -> None:
         home, staged, _ = self.runner_mini()
         entry = self.server.publish(SOURCES[0])

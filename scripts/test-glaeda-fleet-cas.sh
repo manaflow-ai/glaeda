@@ -425,4 +425,120 @@ test "$DAEMON_STATE" = adopted
 grep -q 'adopting it as is' "$relay_root/adopt.err"
 test "$(cat "$LAUNCH_DAEMONS/$store.plist")" = hand
 
+# refresh, glaeda-update's node rollout: an installed node whose bin/fleet-cas.source is not this
+# checkout's source is rebuilt and restarted on its recorded arguments, only while no build uses it.
+rf=$temporary_root/refresh
+checkout=$rf/checkout
+mkdir -p "$checkout/scripts" "$checkout/tools" "$rf/stubs" "$rf/home/Library/LaunchAgents"
+cp "$script" "$checkout/scripts/glaeda-fleet-cas"
+cp -R "$repo_root/tools/fleet-cas-prototype" "$checkout/tools/"
+rm -rf "$checkout/tools/fleet-cas-prototype/target"
+proto=$checkout/tools/fleet-cas-prototype
+printf '#!/usr/bin/env bash\nexit 0\n' >"$proto/scripts/fleet-cas-settings.sh"
+# The bash and Python digests (glaeda-update cas_source_digest) agree, and ignore target/.
+eval "$(sed -n '/^source_digest()/,/^}/p' "$script")"
+bash_digest=$(source_digest)
+py_digest=$(python3 -c '
+import importlib.machinery, importlib.util, sys
+from pathlib import Path
+loader = importlib.machinery.SourceFileLoader("gu", sys.argv[1])
+gu = importlib.util.module_from_spec(importlib.util.spec_from_loader("gu", loader)); loader.exec_module(gu)
+print(gu.cas_source_digest(Path(sys.argv[2])))' "$repo_root/scripts/glaeda-update" "$proto")
+test "$bash_digest" = "$py_digest"
+mkdir -p "$proto/target/release"; printf 'build output\n' >"$proto/target/release/x"
+test "$(source_digest)" = "$bash_digest"
+rm -rf "$proto/target"
+printf '%s\n' '#!/usr/bin/env bash' \
+  'printf "cargo %s\n" "$*" >>"${FLEET_CAS_TEST_CARGO_LOG:?}"' \
+  'mkdir -p "$CARGO_TARGET_DIR/release"' \
+  'printf "#!/usr/bin/env bash\necho fleet-cas %s\n" "$(cat "${FLEET_CAS_TEST_BUILD_ID:?}")" >"$CARGO_TARGET_DIR/release/fleet-cas"' \
+  'chmod +x "$CARGO_TARGET_DIR/release/fleet-cas"' >"$rf/stubs/cargo"
+printf '%s\n' '#!/usr/bin/env bash' \
+  '[ -e "${FLEET_CAS_TEST_BUSY:?}" ] && [ "${*: -1}" = "$(cat "$FLEET_CAS_TEST_BUSY")" ]' >"$rf/stubs/pgrep"
+printf '%s\n' '#!/usr/bin/env bash' \
+  'if [ "$1" = -f ] && [ "$2" = %u ]; then id -u; exit 0; fi' \
+  'exec /usr/bin/stat "$@"' >"$rf/stubs/stat"
+# launchd: no system daemon here; the user agent is loaded once bootstrapped.
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\n" "$*" >>"${FLEET_CAS_TEST_LAUNCHCTL_LOG:?}"' \
+  '[ "$1" = print ] && case $2 in system/*) exit 113 ;; esac' 'exit 0' >"$rf/stubs/launchctl"
+cp "$stub_bin/plutil" "$rf/stubs/"
+chmod +x "$rf/stubs/"*
+rroot=$rf/xcode
+mkdir -p "$rroot/run" "$rroot/bin"
+recorded() { printf '%s\n' "$rroot/fleet-cas.sock" "$rroot/node-store" --read-only-kv --upstream http://127.0.0.1:7451; }
+recorded >"$rroot/run/node.args"
+printf 'old\n' >"$rf/build-id"
+refresh_env=(
+  FLEET_CAS_ROOT="$rroot" HOME="$rf/home" PATH="$rf/stubs:$PATH" FLEET_CAS_LAUNCH_DAEMONS_DIR="$rf/daemons"
+  FLEET_HOST_LOCK="$rf/host.lock" FLEET_CAS_BUILD_PROCS="xcodebuild swift-build"
+  FLEET_CAS_TEST_BUSY="$rf/busy" FLEET_CAS_TEST_CARGO_LOG="$rf/cargo.log"
+  FLEET_CAS_TEST_BUILD_ID="$rf/build-id" FLEET_CAS_TEST_LAUNCHCTL_LOG="$rf/launchctl.log"
+)
+refresh() { env "${refresh_env[@]}" "$checkout/scripts/glaeda-fleet-cas" "$@"; }
+: >"$rf/host.lock"; : >"$rf/cargo.log"; : >"$rf/launchctl.log"
+# No receipt (a node built before it existed): stale. The plan builds nothing.
+refresh refresh >"$rf/out"
+test "$(tail -1 "$rf/out")" = "fleet-cas refresh: would rebuild -> ${bash_digest:0:12}"
+test ! -s "$rf/cargo.log"
+# A build is running: deferred, nothing built or restarted.
+printf 'xcodebuild\n' >"$rf/busy"
+refresh refresh --apply >"$rf/out"
+test "$(tail -1 "$rf/out")" = "fleet-cas refresh: deferred (xcodebuild is running)"
+test ! -s "$rf/cargo.log"
+rm -f "$rf/busy"
+# A fleet job holds the host lock: deferred too.
+perl -e 'use Fcntl qw(:flock); open(my $l, "+<", $ARGV[0]) or die; flock($l, LOCK_EX) or die; $| = 1; print "held\n"; sleep 30' \
+  "$rf/host.lock" >"$rf/held" &
+holder=$!
+for _ in $(seq 1 50); do grep -q held "$rf/held" 2>/dev/null && break; sleep 0.1; done
+refresh refresh --apply >"$rf/out"
+test "$(tail -1 "$rf/out")" = "fleet-cas refresh: deferred (a fleet job holds $rf/host.lock)"
+kill "$holder"; wait "$holder" 2>/dev/null || true
+test ! -s "$rf/cargo.log"
+# Idle: builds outside the release tree, installs, records the receipt and writes the service on
+# the recorded arguments.
+refresh refresh --apply >"$rf/out"
+test "$(tail -1 "$rf/out")" = "fleet-cas refresh: refreshed -> ${bash_digest:0:12}"
+grep -q '^cargo build --release --locked -q$' "$rf/cargo.log"
+test ! -e "$proto/target"
+test -x "$rroot/build-target/release/fleet-cas"
+test "$("$rroot/bin/fleet-cas")" = "fleet-cas old"
+test "$(cat "$rroot/bin/fleet-cas.source")" = "$bash_digest"
+cmp "$proto/scripts/fleet-cas-run" "$rroot/bin/fleet-cas-run"
+recorded | cmp - "$rroot/run/node.args"
+grep -q 'bootstrap gui/.*com.teamleaderleo.glaeda.fleet-cas-node.plist' "$rf/launchctl.log"
+# The supervisor's wrapper records the binary it started; with that, the node is current.
+shasum -a 256 "$rroot/bin/fleet-cas" | cut -c1-64 >"$rroot/run/node.bin"
+: >"$rf/cargo.log"
+refresh refresh --apply >"$rf/out"
+test "$(tail -1 "$rf/out")" = "fleet-cas refresh: current ${bash_digest:0:12}"
+test ! -s "$rf/cargo.log"
+# A new node change: rebuilt, and the running node (started by bin/fleet-cas-run) is stopped for
+# launchd's KeepAlive to restart on the new binary.
+printf '// a merged fix\n' >>"$proto/src/main.rs"
+new_digest=$(source_digest)
+printf 'new\n' >"$rf/build-id"
+bash -c 'exec -a "$0 node" sleep 30' "$rroot/bin/fleet-cas-run" &
+node_pid=$!
+echo "$node_pid" >"$rroot/run/node.pid"
+for _ in $(seq 1 50); do ps -o command= -p "$node_pid" | grep -q "fleet-cas-run node" && break; sleep 0.1; done
+refresh refresh --apply >"$rf/out"
+test "$(tail -1 "$rf/out")" = "fleet-cas refresh: refreshed ${bash_digest:0:12} -> ${new_digest:0:12}"
+case $(ps -o stat= -p "$node_pid" || true) in Z* | "") ;; *) echo "the running node was not stopped" >&2; exit 1 ;; esac
+wait "$node_pid" 2>/dev/null || true
+test "$("$rroot/bin/fleet-cas")" = "fleet-cas new"
+test "$(cat "$rroot/bin/fleet-cas.source")" = "$new_digest"
+# A build that starts during the rebuild: the swap under the lock defers it.
+printf 'swift-build\n' >"$rf/busy"
+rc=0; refresh refresh-swap --apply || rc=$?
+test "$rc" = 75
+rm -f "$rf/busy"
+# An older layout (a service, no recorded arguments) is named, never rebuilt here.
+mv "$rroot/run/node.args" "$rf/node.args.kept"
+rc=0; refresh refresh --apply >"$rf/out" || rc=$?
+test "$rc" = 3
+grep -q '^fleet-cas refresh: legacy ' "$rf/out"
+rm -f "$rf/home/Library/LaunchAgents/com.teamleaderleo.glaeda.fleet-cas-node.plist"
+test "$(refresh refresh --apply)" = "fleet-cas refresh: none (no node on this host)"
+
 echo "glaeda-fleet-cas role-scoped uninstall and bind-wait tests passed"

@@ -4,6 +4,8 @@
 #   glaeda-fleet-cas node (--store HOST:PORT | --relay LAN_IP:PORT) [--trusted-keys HEX] [--prewarm REPO] [--apply]
 #   glaeda-fleet-cas writer (--store HOST:PORT | --relay LAN_IP:PORT) --sign-key PATH --trusted-keys HEX [--apply]
 #   glaeda-fleet-cas store --listen IP:PORT [--writers IP,IP] [--trusted-keys HEX] [--apply]
+#   glaeda-fleet-cas refresh [--apply]                  rebuild and restart an installed node whose
+#                                                       binary is not this checkout's source (glaeda-update)
 #   glaeda-fleet-cas uninstall [node|store|all] [--apply]
 #                                                       remove selected services, keep stores
 #
@@ -556,6 +558,44 @@ write_service() {  # role, args...
   echo "agent $label"
 }
 
+# What bin/fleet-cas was built from: the node's source tree by content (every regular file under
+# tools/fleet-cas-prototype but target/), one SHA-256 over its `shasum -a 256` lines in byte order
+# of path. glaeda-update computes the same digest of its installed release (cas_source_digest) and
+# runs `refresh` when bin/fleet-cas.source differs. A node built before the receipt existed has
+# none, which counts as stale: 2026-11-28 a writer still ran a 2026-10-30 binary, five merged
+# fixes later, because nothing but a hand-run install ever rebuilt it (forum/1123).
+source_digest() {
+  (cd "$proto" && find . -path ./target -prune -o -type f -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256) \
+    | shasum -a 256 | cut -c1-64
+}
+
+# A build is using the node: one of these processes runs (a PR runner's xcodebuild takes no host
+# lock), or a fleet job holds the host lock. Prints what it found.
+HOST_LOCK=${FLEET_HOST_LOCK:-/Users/Shared/cmux-build-fleet/host.lock}
+BUILD_PROCS=${FLEET_CAS_BUILD_PROCS:-xcodebuild swift-build fleet-cas-writer-build.sh xcode-cache-build.sh}
+build_running() {
+  local p
+  for p in $BUILD_PROCS; do
+    if pgrep -f -- "$p" >/dev/null 2>&1; then echo "$p is running"; return 0; fi
+  done
+  return 1
+}
+lock_held() {
+  [ -e "$HOST_LOCK" ] || return 1
+  perl -e 'use Fcntl qw(:flock); open(my $l, "+<", $ARGV[0]) or exit 1; exit(flock($l, LOCK_EX | LOCK_NB) ? 1 : 0)' "$HOST_LOCK" \
+    || return 1
+  echo "a fleet job holds $HOST_LOCK"
+}
+node_busy() { build_running || lock_held; }
+# Run COMMAND holding the host lock, so the fleet worker starts no job during the swap; exit 75
+# when a job holds it. A host without the lock file runs it as is.
+with_lock_nb() {
+  [ -e "$HOST_LOCK" ] || { "$@"; return; }
+  perl -e 'use Fcntl qw(:flock); my $p = shift; open(my $l, "+<", $p) or die "open $p: $!\n";
+    flock($l, LOCK_EX | LOCK_NB) or exit 75; system { $ARGV[0] } @ARGV;
+    exit($? == -1 ? 127 : ($? & 127) ? 128 + ($? & 127) : $? >> 8)' "$HOST_LOCK" "$@"
+}
+
 install_binaries() {
   local prebuilt=${GLAEDA_FLEET_CAS_PREBUILT:-} f src
   if [ -n "$prebuilt" ]; then
@@ -568,7 +608,7 @@ install_binaries() {
     done
   else
     say "build $proto (cargo build --release --locked)"
-    if [ -n "$apply" ]; then
+    if [ -n "$apply" ] && [ -z "${skip_build:-}" ]; then
       check_owner
       # No host lock: queuing for it exclusively takes a runner host's PR runners offline while
       # it waits (glaeda#1206's gate), and an up-to-date build is a no-op anyway. A real rebuild
@@ -583,13 +623,22 @@ install_binaries() {
       if [ -n "$prebuilt" ]; then
         src=$prebuilt/$f
       else
-        src=$proto/target/release/$f; [ "$f" = fleet-cas ] || src=$proto/scripts/$f
+        src=${CARGO_TARGET_DIR:-$proto/target}/release/$f; [ "$f" = fleet-cas ] || src=$proto/scripts/$f
       fi
       if ! cmp -s "$src" "$BIN/$f"; then
         install -m 0755 "$src" "$BIN/$f.new" && mv "$BIN/$f.new" "$BIN/$f"
         [ "$f" = fleet-cas ] && bin_changed=1
       fi
     done
+    # The receipt of what bin/fleet-cas was built from (source_digest), which glaeda-update's
+    # node rollout compares with its release. A prebuilt bundle carries its own, or none (unknown).
+    if [ -z "$prebuilt" ]; then
+      source_digest >"$BIN/fleet-cas.source.tmp" && mv "$BIN/fleet-cas.source.tmp" "$BIN/fleet-cas.source"
+    elif [ -f "$prebuilt/fleet-cas.source" ] && [ ! -L "$prebuilt/fleet-cas.source" ]; then
+      install -m 0644 "$prebuilt/fleet-cas.source" "$BIN/fleet-cas.source"
+    else
+      rm -f "$BIN/fleet-cas.source"
+    fi
     if [ -n "$custom_store_image" ]; then
       mkdir -p "$launch_root"
       launch_runner=$proto/scripts/fleet-cas-run
@@ -689,6 +738,50 @@ case $role in
       echo "ok store listening on $listen (writers: ${writers:-none}, signed entries only: $([ -n "$trusted" ] && echo yes || echo no))"
     fi
     write_store_prune
+    ;;
+  refresh)
+    # glaeda-update's node rollout (its casNode step): bring the installed node (or writer) to this
+    # checkout's source. When bin/fleet-cas.source differs from source_digest, or the running
+    # process is not bin/fleet-cas, it builds, then installs and restarts through write_service with
+    # the recorded run/node.args, holding the host lock and only while no build uses the node; a
+    # busy host is deferred to the next update. Never touches a store. The last line is
+    # `fleet-cas refresh: STATE ...` (none, current, deferred, would rebuild, refreshed, legacy, failed).
+    label=$(label_for node)
+    if [ ! -r "$ROOT/run/node.args" ]; then
+      if [ -e "$AGENTS/$label.plist" ] || [ -e "$LAUNCH_DAEMONS/$label.plist" ]; then
+        echo "fleet-cas refresh: legacy (a node service without $ROOT/run/node.args; reinstall it with glaeda-fleet-cas-rollout --nodes-only)"
+        exit 3
+      fi
+      echo "fleet-cas refresh: none (no node on this host)"; exit 0
+    fi
+    want=$(source_digest)
+    have=$(cat "$BIN/fleet-cas.source" 2>/dev/null || true)
+    if [ "$have" = "$want" ] && ! stale_binary node; then echo "fleet-cas refresh: current ${want:0:12}"; exit 0; fi
+    if why=$(node_busy); then echo "fleet-cas refresh: deferred ($why)"; exit 0; fi
+    if [ -z "$apply" ]; then echo "fleet-cas refresh: would rebuild ${have:0:12}${have:+ }-> ${want:0:12}"; exit 0; fi
+    check_owner
+    # One target dir for every release: incremental, and never inside the release generation.
+    export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$ROOT/build-target}
+    PATH=$PATH:$HOME/.cargo/bin
+    (cd "$proto" && nice -n 15 cargo build --release --locked -q) || { echo "fleet-cas refresh: failed (cargo build)"; exit 1; }
+    rc=0
+    with_lock_nb /bin/bash "$0" refresh-swap --apply || rc=$?
+    case $rc in
+      0) echo "fleet-cas refresh: refreshed ${have:0:12}${have:+ }-> ${want:0:12}" ;;
+      75) echo "fleet-cas refresh: deferred (a build started during the rebuild)" ;;
+      *) echo "fleet-cas refresh: failed (swap exit $rc)"; exit 1 ;;
+    esac
+    ;;
+  refresh-swap)
+    # refresh's swap, under the host lock: re-check that no build started, then install the built
+    # binaries and restart the node on its recorded arguments.
+    if build_running >/dev/null; then exit 75; fi
+    skip_build=1 install_binaries
+    node_args=()
+    while IFS= read -r a; do node_args+=("$a"); done <"$ROOT/run/node.args"
+    write_service node "${node_args[@]}"
+    for _ in $(seq 1 40); do "$BIN/fleet-cas-settings.sh" "$SOCK" >/dev/null 2>&1 && break; sleep 0.5; done
+    "$BIN/fleet-cas-settings.sh" "$SOCK" >/dev/null 2>&1 || health_failed node
     ;;
   uninstall)
     case $uninstall_scope in
