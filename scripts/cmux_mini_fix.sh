@@ -631,7 +631,25 @@ share_recv() {  # THING ARGS...: unpack the stream on stdin into the staging dir
   # A staging directory named *.glaeda-share.partial is only ever this file's; start it fresh.
   case "$stage" in */.glaeda-share.partial) rm -rf "$stage" ;; esac
   mkdir -p "$stage"
-  tar -C "$stage" -xf -
+  # Progress bound: a copy gaining under SHARE_MIN_MB_PER_MIN over SHARE_WINDOW_S is stopped (exit 75), so the
+  # caller fails over instead of waiting out its multi-hour timeout. 2026-11-27 an Xcode copy crawled at about
+  # 0.4 MB/s for 70 min with nothing noticing. A copy that finishes inside its first window is never judged.
+  local window=${SHARE_WINDOW_S:-600} min_mb=${SHARE_MIN_MB_PER_MIN:-100} pid last now size
+  tar -C "$stage" -xf - <&0 &
+  pid=$!
+  last=$(du -sk "$stage" 2>/dev/null | cut -f1); now=0
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 1; now=$((now + 1))
+    [ "$now" -ge "$window" ] || continue
+    size=$(du -sk "$stage" 2>/dev/null | cut -f1)
+    if [ $(( (${size:-0} - ${last:-0}) * 60 / window )) -lt $((min_mb * 1024)) ] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true
+      say "share too slow: $(( (${size:-0} - ${last:-0}) / 1024 )) MB in ${window}s, under ${min_mb} MB/min; stopped (staged part kept)"
+      return 75
+    fi
+    last=$size; now=0
+  done
+  wait "$pid"
 }
 
 share_finish() {  # THING ARGS...: move what share_recv staged into place, never over something already there

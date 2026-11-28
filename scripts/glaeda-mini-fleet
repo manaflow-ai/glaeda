@@ -4281,6 +4281,7 @@ def cmd_sudo_plan(manifest: dict[str, Any], hosts: list[str], run: bool, sudoers
 
 SHARE_THINGS = ("xcode", "metal", "brew", "rustup", "candidate", "python")
 SHARE_TIMEOUT = 3 * 3600
+SHARE_TOO_SLOW = 75  # cmux_mini_fix.sh share_recv: the copy gained under SHARE_MIN_MB_PER_MIN over SHARE_WINDOW_S
 SEED_STREAMS_PER_SOURCE = 2
 SEED_STREAMS: dict[str, threading.Semaphore] = {}
 SEED_STREAMS_LOCK = threading.Lock()
@@ -4371,6 +4372,9 @@ def share_one(manifest: dict[str, Any], thing: str, source: str, name: str, args
     with streams:  # fix and onboard run many peers at once; one source serves a few at a time
         code = routed_ssh_stream(source, user, "/bin/bash -c " + shlex.quote(pipeline), log, timeout=SHARE_TIMEOUT,
                                  options=(*source_route, *(AGENT_FORWARD if lan["agent"] else ())))
+    if code == SHARE_TOO_SLOW:
+        return False, (f"too slow: {source} -> {name} gained under the minimum rate (share_recv's progress bound); "
+                       f"the next pass picks another seed, or xcode_clone, instead of waiting out {SHARE_TIMEOUT // 3600} h")
     if code:
         return False, f"copy failed (exit {code}); rerun to resume, the staged part stays on the peer"
     if routed_ssh_stream(name, user, library_command("share_finish", [thing, *args], gate=gate), log, timeout=3600,

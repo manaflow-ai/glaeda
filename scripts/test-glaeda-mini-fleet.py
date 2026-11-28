@@ -3577,6 +3577,16 @@ class ShareTests(unittest.TestCase):
                 self.assertFalse(ok)
                 self.assertEqual(placed.read_bytes(), b"something else")
 
+    def test_a_copy_below_the_minimum_rate_fails_fast_not_after_the_timeout(self) -> None:
+        """share_recv exits 75 when the copy gains too little; share_one says so instead of "rerun to resume"."""
+        self.manifest["hosts"]["build-mini-2"]["lan_ip"] = "10.0.8.7"
+        codes = iter([1, mf.SHARE_TOO_SLOW])  # share_have: absent; the copy pipeline: too slow
+        with mock.patch.object(mf, "routed_ssh_stream", side_effect=lambda *a, **k: next(codes)):
+            ok, detail = mf.share_one(self.manifest, "xcode", "build-mini-1", "build-mini-2",
+                                      ["/Applications/Xcode.app", "1", "1"], None, True)
+        self.assertFalse(ok)
+        self.assertTrue(detail.startswith("too slow:"), detail)
+
     def test_share_command_needs_a_source_and_refuses_never_touch(self) -> None:
         for argv, error in ((["share", "xcode", "build-mini-2"], "--from HOST"),
                             (["share", "xcode", "build-mini-2", "--from", "coordinator-mini"], "never_touch"),
