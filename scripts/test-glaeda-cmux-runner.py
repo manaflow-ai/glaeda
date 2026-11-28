@@ -22081,6 +22081,37 @@ fleet_labels = load("glaeda_fleet_labels_under_test", ROOT / "scripts" / "glaeda
 class FleetLabelsModuleTest(unittest.TestCase):
     """The shared rule glaeda-mini-fleet imports: pin its strings and its declared/conforming views."""
 
+    def test_pool_xcode_is_the_class_accepted_build_not_the_newest(self) -> None:
+        # POOL_XCODE (2026-11-27): the manifest listed Xcode_27.2 first while the class receipt was on 26.6
+        # (17F113); the gated runners' hook named 27.2 as --toolchain-xcode and the gate refused every job.
+        manifest = copy.deepcopy(MANIFEST)
+        manifest["defaults"]["xcode"]["apps"].insert(
+            0, {"path": "/Applications/Xcode_27.2.app", "version": "27.2", "build": "27B52"})
+        newest, _ = fleet_labels.member_labels(manifest, "mini-std", lambda app: True)
+        self.assertEqual(newest["xcodeApps"][0], "/Applications/Xcode_27.2.app", "no accepted build: manifest order")
+        manifest["hardware"] = {"m4pro-48": {"acceptance": {"xcode_build": "17F113"}}}
+        member, _ = fleet_labels.member_labels(manifest, "mini-std", lambda app: True)
+        self.assertEqual(member["xcodeApps"], ["/Applications/Xcode_26.6.app", "/Applications/Xcode_27.2.app"])
+        self.assertEqual(member["labels"], newest["labels"], "only the pool Xcode moves; labels keep manifest order")
+        ctx = mock.Mock(python=sys.executable, hook_dir=HOOK.parent, runner_dir=Path("/tmp/r"), org="manaflow-ai",
+                        repo=None, min_free_gib=0, capacity_units=4, labels=["glaeda-mini"], session_runner=False,
+                        member=member)
+        hooks = cr.hook_wrappers(ctx)
+        self.assertIn("--toolchain-xcode /Applications/Xcode_26.6.app", hooks["job-started.sh"].decode())
+        self.assertIn("export DEVELOPER_DIR=/Applications/Xcode_26.6.app/Contents/Developer\n",
+                      hooks["listen.sh"].decode())
+        # A trimmed manifest (no hardware table): the host's own class receipt names the build.
+        del manifest["hardware"]
+        with tempfile.TemporaryDirectory() as tmp:
+            receipts = Path(tmp) / "glaeda" / "cmux-fleet" / "class-acceptance"
+            receipts.mkdir(parents=True)
+            (receipts / "m4pro-48.json").write_text(json.dumps({"toolchain": {"xcodeBuild": "17F113"}}))
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": tmp}), \
+                    mock.patch.object(cr, "xcode_present", return_value=True), \
+                    mock.patch.object(cr, "macos_major", return_value=None):
+                onhost, _ = cr.member_labels(manifest, "mini-std")
+        self.assertEqual(onhost["xcodeApps"][0], "/Applications/Xcode_26.6.app")
+
     def test_dev_compile_declares_a_separate_pool_without_adding_capacity(self) -> None:
         manifest = copy.deepcopy(MANIFEST)
         before = fleet_labels.member_labels(manifest, "mini-std", lambda app: True)[0]

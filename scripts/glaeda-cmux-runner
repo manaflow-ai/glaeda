@@ -499,7 +499,30 @@ def member_labels(manifest: Any, member: str, prior_labels: list[str] | None = N
     if major is None:
         prefix = rule.MACOS_LABEL_PREFIX
         major = next((label[len(prefix):] for label in prior_labels or [] if label.startswith(prefix)), None)
-    return rule.member_labels(manifest, member, lambda app: xcode_present(app), ios_sim_ok, macos_major=major)
+    extra: dict[str, Any] = {}
+    if hasattr(rule, "pool_xcode_first"):  # POOL_XCODE: the pool Xcode is the one the class receipt accepted
+        hosts = manifest.get("hosts") if isinstance(manifest, dict) else None
+        host = hosts.get(member) if isinstance(hosts, dict) else None
+        hardware = host.get("hardware") if isinstance(host, dict) else None
+        extra["accepted_build"] = rule.accepted_xcode_build(manifest, hardware) or host_class_xcode_build(hardware)
+    return rule.member_labels(manifest, member, lambda app: xcode_present(app), ios_sim_ok, macos_major=major,
+                              **extra)
+
+
+def host_class_xcode_build(hardware: Any, home: Path | None = None) -> str | None:
+    """The xcodeBuild this host's class receipt (~/.config/glaeda/cmux-fleet/class-acceptance/<hardware>.json, the
+    file the hook's gate judges) records, or None. The trimmed manifest a mini installs from carries no hardware
+    table, so the receipt on the host names the build the gate will hold the runner to (POOL_XCODE)."""
+    if not isinstance(hardware, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]*", hardware):
+        return None
+    base = Path(os.environ.get("XDG_CONFIG_HOME") or (home or Path.home()) / ".config")
+    try:
+        receipt = json.loads((base / "glaeda" / "cmux-fleet" / "class-acceptance" / f"{hardware}.json").read_text())
+    except (OSError, ValueError):
+        return None
+    toolchain = receipt.get("toolchain") if isinstance(receipt, dict) else None
+    build = toolchain.get("xcodeBuild") if isinstance(toolchain, dict) else None
+    return build if isinstance(build, str) and build.strip() and build != "unknown" else None
 
 
 def load_receipt(ctx: Context) -> dict[str, Any] | None:
