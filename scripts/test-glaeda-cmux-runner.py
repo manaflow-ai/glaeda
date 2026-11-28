@@ -8047,7 +8047,7 @@ time.sleep(60)
              installed: tuple = ("1.88.0-aarch64-apple-darwin", "1.98.1-aarch64-apple-darwin"),
              python: str = "3.13", gh: bool = True, sdk_path: str | None = None,
              swiftc: str | None = None, python_runs: bool = True, unfound: tuple = (),
-             slow: str | None = None) -> None:
+             slow: str | None = None, flip_after_align: str | None = None) -> None:
         """A fake Glaeda node under HOME (self.dir): enrollment, class receipt, staged CLI, toolchain. xcrun answers
         --show-sdk-path with sdk_path and `swiftc --version` with swiftc, and fails both when they are None."""
         config = self.dir / ".config/glaeda/cmux-fleet"
@@ -8092,6 +8092,9 @@ if args[:2] == ["toolchain", "list"]:
         print(name + (" (active, default)" if name == default else ""))
 elif args == ["default"]:
     print(default + " (default)")
+    flip = {flip_after_align!r}  # another job on the mini sets the shared default just after this read
+    if flip and default != flip:
+        open(state + "/rustup-default", "w").write(flip)
 elif args == ["show"]:
     print("Default host: aarch64-apple-darwin")
 elif args[:1] == ["default"] and args[1] in installed:
@@ -8233,6 +8236,18 @@ else:
                       result.stdout)
         self.assertEqual((self.dir / "rustup-default").read_text(), "1.98.1-aarch64-apple-darwin")
         self.assertFalse(self.lock_free())
+        self.done()
+
+    def test_a_default_flipped_by_another_job_mid_admit_is_not_drift(self) -> None:
+        """ALIGNED_PROBE: job-started sets the shared rustup default, and another job on the mini sets it back before
+        the version probes run (cmux8s-mac-mini-glaeda-1, cmux run 45932403699: "rustcVersion 'rustc 1.95.0' !=
+        'rustc 1.98.1'" while its gate listened). The probes read the aligned toolchain by name, as the gate does."""
+        self.fleet()
+        self.node(default="1.88.0-aarch64-apple-darwin", flip_after_align="1.88.0-aarch64-apple-darwin")
+        result = self.eligible_start()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("toolchain drifted", result.stdout + result.stderr)
+        self.assertIn("set the rustup default to 1.98.1-aarch64-apple-darwin", result.stdout)
         self.done()
 
     def test_check_is_read_only_and_predicts_the_alignment(self) -> None:
@@ -16248,6 +16263,27 @@ class GateTest(unittest.TestCase):
         with mock.patch.object(hook.Gate, "step", step_once), mock.patch.object(hook, "GATE_POLL_S", 0):
             self.assertEqual(hook.listen(self.runner, os.fspath(self.lock), "", self.state, True), 7)
 
+    def test_a_broken_gate_stops_its_idle_runner_at_the_gate_retry(self) -> None:
+        # GATE_RETRY: a gate bug with its runner up waited for that runner to exit, which a healthy one never does, so
+        # it ran ungated for good. Past GLAEDA_GATE_RETRY_S an idle runner is stopped (a fresh gate follows); a busy
+        # one, or a look that fails, keeps it.
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        self.addCleanup(child.kill)
+        gate = hook.Gate(self.runner, os.fspath(self.lock), "", self.state)
+        gate.child = child
+        stops: list[str] = []
+        def stop(why: str, finished: str | None = None) -> bool:
+            stops.append(why)
+            child.terminate()
+            return True
+        busy = iter([True, False])
+        with mock.patch.dict(os.environ, {"GLAEDA_GATE_RETRY_S": "0.2"}), \
+                mock.patch.object(gate, "busy", side_effect=lambda *a: next(busy)), \
+                mock.patch.object(gate, "stop", side_effect=stop):
+            self.assertIsNotNone(gate.unexpected(RuntimeError("boom")))
+        self.assertEqual(len(stops), 1, "the busy look kept it; the idle one stopped it")
+        self.assertIn("GATE_RETRY", stops[0])
+
     def test_a_broken_gate_still_ends_its_runner_when_the_agent_stops(self) -> None:
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
         self.addCleanup(child.kill)
@@ -16421,7 +16457,8 @@ class GateTest(unittest.TestCase):
         # No first-poll hold (GATE_FIRST_POLL_S) and no free span after a stop (GATE_RESTART_FREE_S): these tests
         # stop a listener the moment a claim confirms and restart it once two polls are free.
         env = {**os.environ, "GLAEDA_RUNNER_GATE_POLL_S": "0.1", "GLAEDA_RUNNER_THERMAL_HOLD": "0",
-               "GLAEDA_RUNNER_GATE_FIRST_POLL_S": "0", "GLAEDA_RUNNER_GATE_RESTART_FREE_S": "0"}
+               "GLAEDA_RUNNER_GATE_FIRST_POLL_S": "0", "GLAEDA_RUNNER_GATE_RESTART_FREE_S": "0",
+               "GLAEDA_GATE_RETRY_S": "2"}  # GATE_RETRY: an ungated runner retries its gate in 2 s
         log = self.tmp / "runner.log"
         with log.open("wb") as out:
             proc = subprocess.Popen([*extra] if extra else
@@ -16718,7 +16755,7 @@ class GateTest(unittest.TestCase):
         text = cr.hook_wrappers(ctx)["listen.sh"].decode()
         self.assertIn("export DEVELOPER_DIR=/Applications/Xcode_26.6.app/Contents/Developer\n", text)
         self.assertLess(text.index("unset SDKROOT"), text.index("listen --runner-dir"))
-        self.assertLess(text.index("unset SDKROOT"), text.index("exec ./run.sh"), "the fallback run.sh is clean too")
+        self.assertLess(text.index("unset SDKROOT"), text.index("./run.sh &\n"), "the fallback run.sh is clean too")
 
     def test_hooks_prefer_a_python_that_is_not_the_xcrun_shim(self) -> None:
         # a stand-in shim, so the test means the same on a Mac (where /usr/bin/python3 is the shim) and on Linux CI
@@ -16742,6 +16779,23 @@ class GateTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("running the runner without it", result.stdout)
         self.assertEqual((self.tmp / "ran").read_text(), "plain run.sh\n")
+
+    def test_listen_sh_never_runs_the_runner_ungated_past_a_gate_retry(self) -> None:
+        # GATE_RETRY, 2026-11-26 22:48Z: cmux22-glaeda-13's gate died on a full disk (exit 120) with no runner up, so
+        # listen.sh ran run.sh without it, for good: 14 h later the ungated listener still took jobs during a fleet
+        # lease and job-started refused each one (cmux run 45970667586 "frames", green on re-run elsewhere). Now the
+        # ungated runner is stopped once idle at the next retry, and the wrapper exits 1 so launchd starts a fresh
+        # gate.
+        python = self.tmp / "gate-dies-python3"
+        make_executable(python, f"#!/bin/sh\ncase \"$2\" in listen) exit 120;; esac\nexec {sys.executable} \"$@\"\n")
+        script = self.listen_sh(os.fspath(python))
+        proc, log = self.run_listen(os.fspath(script))
+        self.addCleanup(lambda: proc.poll() is None and (proc.kill(), proc.wait()))
+        self.wait_for(log, "Listening for Jobs")
+        self.assertIn("running the runner without it until a fresh gate can run", log.read_text())
+        self.assertEqual(proc.wait(timeout=30), 1, log.read_text())  # launchd restarts the wrapper: a fresh gate
+        self.assertIn("stopping it so a fresh gate starts", log.read_text())
+        self.assertEqual(self.listeners(), [])
 
     def test_listen_sh_leaves_a_deleted_registration_to_the_gate(self) -> None:
         (self.runner / "run.sh").write_text(f"#!/bin/bash\necho plain run.sh > {self.tmp / 'ran'}\nexit 0\n")
@@ -17977,7 +18031,7 @@ class RunnerTest(unittest.TestCase):
         listen = runner / "glaeda-hooks/listen.sh"
         self.assertTrue(os.access(listen, os.X_OK))
         self.assertIn(f"listen --runner-dir {runner} --no-waiters &", listen.read_text())  # no capacity units
-        self.assertIn("exec ./run.sh", listen.read_text())
+        self.assertIn("./run.sh &\nrunner=$!", listen.read_text())  # ungated fallback, stopped when idle so a fresh gate starts
         env = plist["EnvironmentVariables"]
         started = Path(env["ACTIONS_RUNNER_HOOK_JOB_STARTED"])
         self.assertTrue(os.access(started, os.X_OK))
@@ -19444,6 +19498,29 @@ class RunnerTest(unittest.TestCase):
                                     "--github-labels", "self-hosted,glaeda-mini", gh=False)
         self.assertEqual(self.by_kind(stale)["register"]["state"], "relabel")
         self.assertEqual(self.by_kind(stale)["register"]["previousLabels"], ["glaeda-mini", "self-hosted"])
+
+    def test_refresh_hooks_heals_a_runner_already_listening_with_no_gate(self) -> None:
+        """GATE_RETRY for runners ungated before it shipped: an old listen.sh exec'd run.sh when its gate died, so
+        cmux22-glaeda-13 listened 14 h with no gate and refused every job under a later fleet lease. A wrapper is not
+        rewritten by --refresh-hooks, so the refresh stops such a runner while idle and launchd starts a gate."""
+        runner = Path("/Users/cmux/actions-runner-glaeda-13")
+        listener = f"{runner}/bin.2.338.2/Runner.Listener run --startuptype service"
+        gate = f"/usr/bin/python3 {runner}/glaeda-hooks/glaeda-cmux-runner-hook listen --runner-dir {runner}"
+        ungated = f" 101 /bin/bash {runner}/run.sh\n 102 {listener}\n"
+        self.assertEqual(cr.ungated_listeners(runner, ungated), [102])
+        self.assertEqual(cr.ungated_listeners(runner, ungated + f" 100 {gate}\n"), [], "a gated runner is left alone")
+        self.assertEqual(cr.ungated_listeners(Path(f"{runner}0"), ungated), [], "another runner's listener")
+        done = subprocess.CompletedProcess([], 0, stdout=ungated, stderr="")
+        for busy, want in ((True, None), (False, cr.UNGATED_STOPPED)):
+            with mock.patch.object(cr.subprocess, "run", return_value=done), \
+                    mock.patch.object(cr, "listeners_frozen", return_value=contextlib.nullcontext(2)), \
+                    mock.patch.object(cr, "worker_running", return_value=busy), \
+                    mock.patch.object(cr.os, "kill") as kill:
+                self.assertEqual(cr.heal_ungated(runner), want)
+            if busy:
+                kill.assert_not_called()  # a job runs: never stopped under it; the next refresh looks again
+            else:
+                kill.assert_called_once_with(102, signal.SIGINT)
 
     def test_an_uninstall_never_stops_or_deregisters_a_runner_with_a_job(self) -> None:
         runner_dir = Path(tempfile.mkdtemp())

@@ -141,6 +141,7 @@ RUNNER_CACHE_KEEP = 2  # versions kept after a download; older ones are removed 
 API_TOKEN_ENV = ("GH_TOKEN", "GITHUB_TOKEN")  # the gh-free path's optional API auth, sent on curl's stdin
 MARKER = ".glaeda-cmux-runner"
 HOOK_DIR = "glaeda-hooks"
+GATE_RETRY_S = 300  # GATE_RETRY: how long a runner runs without its dead gate before a fresh gate is tried
 DEDICATED_ADMIT = "dedicated-admit.sh"  # a --dedicated runner's own admission, which job-started runs
 DEDICATED_ENV_KEYS = ".glaeda-dedicated-env.json"  # the .env keys keep_runner_env wrote, so a removed key goes too
 HELD_DIR = ".local/state/glaeda/mini-fleet/runner-held"  # cmux_mini_fix.sh held_dir
@@ -943,6 +944,9 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         "    done\n"
         "    return 1\n"
         "}\n"
+        "# the frozen, idle listener stops (its run.sh when no listener matched); thaw lets the frozen tree go on\n"
+        "stop_listener() { /usr/bin/pkill -INT -f \"$re/bin[^/ ]*/Runner\\.Listener\" || /usr/bin/pkill -TERM -f \"$re/run\"; }\n"
+        "thaw() { /usr/bin/pkill -CONT -f \"$sup\"; }\n"
         "if /usr/bin/pgrep -f \"$tree\" >/dev/null; then\n"
         "    echo \"$(date -u '+%Y-%m-%d %H:%M:%SZ'): glaeda-cmux-runner-gate: the gate exited $code with its runner running; stopping the runner once it has no job\"\n"
         "    # idle only by the hook's own test (no Worker, no request its listener took: exit 3), decided with the\n"
@@ -952,10 +956,9 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         "        freeze; frozen=$?\n"
         f"        {python} {hook} busy --runner-dir \"$dir\" >/dev/null 2>&1; busy=$?\n"
         "        if [ \"$frozen\" -eq 0 ] && [ \"$busy\" -eq 3 ]; then\n"
-        "            /usr/bin/pkill -INT -f \"$re/bin[^/ ]*/Runner\\.Listener\" ||\n"
-        "                /usr/bin/pkill -TERM -f \"$re/run\"\n"
+        "            stop_listener\n"
         "        fi\n"
-        "        /usr/bin/pkill -CONT -f \"$sup\"\n"
+        "        thaw\n"
         "        sleep 5\n"
         "    done\n"
         "    exit 1\n"
@@ -967,8 +970,41 @@ def hook_wrappers(ctx: Context) -> dict[str, bytes]:
         " this runner's registration; leaving the retry to a fresh gate\"\n"
         "    exit 1\n"
         "fi\n"
-        "echo \"$(date -u '+%Y-%m-%d %H:%M:%SZ'): glaeda-cmux-runner-gate: the gate exited $code; running the runner without it\"\n"
-        "exec ./run.sh\n"
+        # GATE_RETRY: the runner without its gate was meant for a gate that cannot run, but it ran until run.sh
+        # exited, which a healthy runner never does: cmux22-glaeda-13's gate died on a full disk (exit 120,
+        # 2026-11-26 22:48Z) and the runner then listened ungated for 14 h, taking jobs during a fleet lease (and
+        # past capacity) only for job-started to refuse each one (cmux run 45970667586 "frames": refused, green on
+        # re-run elsewhere). So the ungated runner is bounded: every GATE_RETRY_S, once the hook answers and the
+        # runner is idle (the same frozen busy look as above), its listener stops and this wrapper exits 1, so
+        # launchd starts a fresh gate. A hook that still cannot answer keeps the runner as before.
+        "echo \"$(date -u '+%Y-%m-%d %H:%M:%SZ'): glaeda-cmux-runner-gate: the gate exited $code; running the runner without it"
+        f" until a fresh gate can run (a retry every {GATE_RETRY_S} s)\"\n"
+        "./run.sh &\n"
+        "runner=$!\n"
+        "trap 'stopping=1; kill -TERM \"$runner\" 2>/dev/null' TERM INT\n"
+        f"retry_s=${{GLAEDA_GATE_RETRY_S:-{GATE_RETRY_S}}}\n"
+        "retry_at=$((SECONDS + retry_s))\n"
+        "retried=\n"
+        "while kill -0 \"$runner\" 2>/dev/null; do\n"
+        "    if [ -z \"$stopping\" ] && [ \"$SECONDS\" -ge \"$retry_at\" ]; then\n"
+        "        freeze; frozen=$?\n"
+        f"        {python} {hook} busy --runner-dir \"$dir\" >/dev/null 2>&1; busy=$?\n"
+        "        if [ \"$frozen\" -eq 0 ] && [ \"$busy\" -eq 3 ]; then\n"
+        "            echo \"$(date -u '+%Y-%m-%d %H:%M:%SZ'): glaeda-cmux-runner-gate: the hook answers and the ungated runner is"
+        " idle; stopping it so a fresh gate starts\"\n"
+        "            retried=1\n"
+        "            stop_listener\n"
+        "        else\n"
+        "            retry_at=$((SECONDS + retry_s))\n"
+        "        fi\n"
+        "        thaw\n"
+        "    fi\n"
+        "    sleep 1 & wait $!\n"
+        "done\n"
+        "wait \"$runner\"\n"
+        "rc=$?\n"
+        "[ -n \"$retried\" ] && [ -z \"$stopping\" ] && exit 1  # launchd restarts this wrapper: a fresh gate\n"
+        "exit \"$rc\"\n"
     )
     # Explicit dirs, so a restore step that changes HOME or FLEET_DIR still finds this runner's roots record.
     roots_n = int((ctx.member or {}).get("canonicalRoots") or 1)
@@ -1994,6 +2030,53 @@ def note_drain_end(act: dict[str, Any], ended: bool | None) -> None:
     if ended is None:
         act["note"] = "; ".join(filter(None, [act.get("note"), "its drain marker could not be removed; the runner "
                                               f"stays held until it expires (at most {DRAIN_TTL_S / 60:g} min)"]))
+
+
+# GATE_RETRY for a runner already ungated: a listen.sh from before it exec'd run.sh when its gate died, so the runner
+# listened on with no gate to stop it for a lease, a drain or a toolchain refusal, and no gate came back until the
+# runner exited (cmux22-glaeda-13: ungated 14 h after a gate ENOSPC, refusing jobs under a fleet lease). A wrapper is
+# not rewritten by --refresh-hooks, so the refresh heals it: an idle runner with a listener and no gate is stopped
+# (SIGINT to its listener, as the gate's own stop), and launchd starts its wrapper again, which starts a gate first.
+UNGATED_STOPPED = "listening with no gate; stopped while idle so its wrapper starts a fresh gate (GATE_RETRY)"
+
+
+def ungated_listeners(runner_dir: Path, ps_text: str) -> list[int]:
+    """This runner's Runner.Listener pids when no gate (`listen --runner-dir DIR`) of it runs, else []."""
+    listeners, gated = [], False
+    root = re.escape(os.fspath(runner_dir))
+    for line in ps_text.splitlines():
+        pid, _, command = line.strip().partition(" ")
+        if not pid.isdigit():
+            continue
+        if re.search(r"(?:^|\s)listen\s+--runner-dir[ =]" + root + r"(?:\s|$)", command):
+            gated = True
+        elif supervisor_role(runner_dir, command.strip()) == "listener":
+            listeners.append(int(pid))
+    return [] if gated else listeners
+
+
+def heal_ungated(runner_dir: Path) -> str | None:
+    """Stop an idle runner that listens with no gate (UNGATED_STOPPED); None when there is nothing to heal."""
+    try:
+        ps = subprocess.run(["/bin/ps", "-axww", "-o", "pid=,command="], stdin=subprocess.DEVNULL,
+                            capture_output=True, text=True, timeout=RUN_TIMEOUT, check=True).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if not ungated_listeners(runner_dir, ps):
+        return None
+    with listeners_frozen(runner_dir) as frozen:
+        if not frozen or worker_running(runner_dir):
+            return None  # a job runs (or this cannot tell): the next refresh looks again
+        try:
+            ps = subprocess.run(["/bin/ps", "-axww", "-o", "pid=,command="], stdin=subprocess.DEVNULL,
+                                capture_output=True, text=True, timeout=RUN_TIMEOUT, check=True).stdout
+        except (OSError, subprocess.SubprocessError):
+            return None
+        pids = ungated_listeners(runner_dir, ps)
+        for pid in pids:
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGINT)  # delivered on the thaw below
+    return UNGATED_STOPPED if pids else None
 
 
 def stop_if_idle(ctx: Context, stop: Callable[[], bool] | None = None, listener_ok: bool = True) -> bool:
@@ -3159,6 +3242,8 @@ def refresh_hooks(home: Path, apply: bool) -> dict[str, Any]:
             runner_dir = Path(str(receipt.get("runnerDir") or "")) if isinstance(receipt, dict) else Path()
             doc["runners"].append({"receipt": os.fspath(path),
                                    **refresh_hook_dir(runner_dir, receipt, apply, sources, history, hold)})
+            if apply and runner_dir.is_dir() and (healed := heal_ungated(runner_dir)):
+                doc["runners"][-1]["ungated"] = healed
             if apply and doc["runners"][-1].get("note") == JOB_RUNNING:
                 waiting.append((len(doc["runners"]) - 1, receipt, runner_dir))
         # a busy runner is swapped in the gap between its jobs, not only if a run happens to land in one

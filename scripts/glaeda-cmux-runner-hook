@@ -3207,6 +3207,7 @@ CAPTURE_LEASE_REFUSAL = "a capture lease is waiting for the host"  # a capture_l
 WAITER_REFUSALS = (WAITER_REFUSAL, CAPTURE_LEASE_REFUSAL)
 WAITER_SPANS_LOCK_S = 2.0  # waiting for another reader's update; past it every waiter is honoured
 GATE_MAX_FAILURES = 5  # consecutive failed polls before the gate hands the runner back
+GATE_RETRY_S = 300  # GATE_RETRY: how long a runner runs without its broken gate before a fresh one is tried
 GATE_FALLBACK = 70  # listen.sh runs run.sh itself: the gate broke before any runner started
 # A throttled mini (macOS thermal pressure, notifyutil's com.apple.system.thermalpressurelevel: 0 nominal,
 # 1 moderate, 2 heavy, 3 trapping, 4 sleeping) compiles 3 to 14x slower per task (cmuxterm-hq#663), which
@@ -4464,6 +4465,11 @@ def toolchain_refusal(fleet_class: str | None, want: dict[str, Any], xcode_app: 
                 return out_of_time(f"node not eligible (could not set the rustup default to {toolchain})",
                                    not now), note
             note = f"set the rustup default to {toolchain} (was {current[0] if current else 'none'})"
+            # ALIGNED_PROBE: probe the toolchain just aligned, by name, as the read-only check (the gate) does. The
+            # default is one file every job on the mini shares: cmux8s-mac-mini-glaeda-1 set it to 1.98.1, then read
+            # rustc 1.95.0 two seconds later with four other jobs on the host, and refused "macOS compile admission"
+            # as drifted (cmux run 45932403699, 2026-11-27 03:11Z) while its gate, probing by name, listened on.
+            env["RUSTUP_TOOLCHAIN"] = toolchain
         else:
             env["RUSTUP_TOOLCHAIN"] = toolchain  # probe only: what the job would see once aligned
             note = f"would set the rustup default to {toolchain}"
@@ -14464,7 +14470,19 @@ class Gate:
         if self.child is None or self.child.poll() is not None:
             return GATE_FALLBACK
         signalled = False
+        # GATE_RETRY: never ungated for good (cmux22-glaeda-13 listened 14 h without its gate, taking jobs
+        # job-started refused). Every GATE_RETRY_S the idle runner is stopped, so the wrapper tries a fresh gate.
+        retry_s = float(os.environ.get("GLAEDA_GATE_RETRY_S") or GATE_RETRY_S)
+        retry_at = time.monotonic() + retry_s
         while (code := self.child.poll()) is None:
+            if not self.terminating and not signalled and time.monotonic() >= retry_at:
+                retry_at = time.monotonic() + retry_s
+                try:
+                    if not self.busy() and self.stop("GATE_RETRY: the gate failed; stopping the idle runner so a "
+                                                     "fresh gate starts"):
+                        signalled = True
+                except Exception:  # noqa: BLE001 - a gate that cannot look keeps the runner, as before
+                    pass
             if self.terminating and not signalled:  # launchd is stopping the agent: end the runner's session
                 try:
                     signalled = self.stop("the runner agent is stopping")  # False: retried on the next look

@@ -7463,6 +7463,7 @@ class ClientTest(Base):
         timer = threading.Timer(0.4, lambda: (order.append("ready"),
                                               self.put("pr:o/r#1", green)))
         timer.start()
+        self.addCleanup(timer.join, 10)  # the wait can return mid-write: the temp dir outlives the action
         self.addCleanup(timer.cancel)
         with mock.patch.object(gg, "say_waiting", lambda line: order.append("line")), \
                 contextlib.redirect_stdout(io.StringIO()):
@@ -14237,6 +14238,7 @@ class FileAndPidWaitTest(unittest.TestCase):
     def later(self, delay: float, action) -> threading.Timer:
         timer = threading.Timer(delay, action)
         timer.start()
+        self.addCleanup(timer.join, 10)  # the wait can return mid-write: the temp dir outlives the action
         self.addCleanup(timer.cancel)
         return timer
 
@@ -20220,6 +20222,9 @@ class PostTest(unittest.TestCase):
         self.addCleanup(quiet.stop)
         timer = threading.Timer(0.1, lambda: self.step(d, NOW))
         timer.start()
+        # The status wait returns once the URL file lands, while the step may still be writing answers/: join it
+        # before the temp dir goes (run 46082798520: rmtree 'answers' Directory not empty).
+        self.addCleanup(timer.join, 10)
         self.addCleanup(timer.cancel)
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
