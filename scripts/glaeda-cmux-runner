@@ -1315,6 +1315,31 @@ def release_plan_labels(script: str, argv: list[str]) -> list[str] | None:
     return labels if isinstance(labels, list) else None
 
 
+def role_from_labels(ctx: Context, labels: list[str] | None) -> str | None:
+    """LIVE_ROLE: when a runner keeps the labels it registered with (no relabel this apply: unchanged, skipped on an
+    unread label set, or blocked by a busy runner), its hook takes the role those labels route jobs to, not the one
+    the manifest now computes. On 2026-11-27 12:26-13:14Z cmux14-glaeda-16 was registered with the gateway label while
+    its hook ran --sim-runner, so every gateway job GitHub handed it was refused ("the sim-first runner takes only
+    simulator jobs"): 27 of 47 fast Mac PR failures that hour. Returns a note when it changed the role, else None.
+    No role label in `labels` (or none read): the computed role stands."""
+    if not isinstance(labels, list):
+        return None
+    rule = fleet_labels()
+    prefixes = {"gateway": getattr(rule, "GATEWAY_PREFIX", "gateway"), "sim": getattr(rule, "SIM_PREFIX", "sim"),
+                "small": getattr(rule, "SMALL_PREFIX", "small")}
+    found = [role for role, prefix in prefixes.items()
+             if any(str(label).startswith(f"glaeda-{prefix}-xcode-") for label in labels)]
+    if len(found) != 1:
+        return None
+    computed = [role for role in prefixes if getattr(ctx, f"{role}_runner", False) is True]
+    if computed == found:
+        return None
+    for role in prefixes:
+        setattr(ctx, f"{role}_runner", role == found[0])
+    return (f"its registered labels route {found[0]} jobs, so its hook is the {found[0]} runner's "
+            f"(the manifest computes {computed[0] if computed else 'a pool runner'}); a relabel changes both")
+
+
 def label_drift(against: str, registered: list[str], wanted: list[str]) -> dict[str, Any] | None:
     """How `wanted` (this version's labels) differs from `registered`; None when they match."""
     added = sorted(set(wanted) - set(registered))
@@ -1470,6 +1495,11 @@ def plan_install(ctx: Context, receipt: dict[str, Any] | None) -> list[dict[str,
         drifts.append(label_drift("receipt", had, ctx.labels))
         if github_listed and github_found is not None:  # what GitHub holds, which a hand edit or a lost receipt can make differ
             drifts.append(label_drift("github", github_found.get("labels") or [], ctx.labels))
+    if reg["state"] in {"unchanged", "blocked"}:
+        # LIVE_ROLE: the labels stay what GitHub (else the receipt) holds, so the hook takes the role they route to
+        live = reg.get("githubLabels") or (had if isinstance(had, list) else None)
+        if (why := role_from_labels(ctx, live)):
+            reg["liveRole"] = why
     if any(drifts):
         reg["drift"] = [d for d in drifts if d]
         if reg["state"] == "unchanged":
