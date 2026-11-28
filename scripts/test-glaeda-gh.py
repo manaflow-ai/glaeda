@@ -13824,12 +13824,75 @@ class WaitPrNotMergedTest(Base):
         self.assertIsNone(gg.wait_step(req, time.time(), self.get))
         self.land("stopped", stop={"code": "review_required", "reason": "needs an approving review", "next": "x"})
         code, text = gg.wait_step(req, time.time(), self.get)
-        self.assertEqual(code, gg.EXIT_OK, text)  # what the same wait with no land would have said: green, exit 0
-        self.assertIn("result: green (checks passed; PR still OPEN, not merged)", text)
+        # before 2026-11-28 this was exit 0 ("green ... not merged") and a caller read the 0 as merged: the merge
+        # this wait was chosen for is not coming, so it is never 0 (EXIT_LAND_ENDED), and it says why
+        self.assertEqual(code, gg.EXIT_LAND_ENDED, text)
+        self.assertNotEqual(code, gg.EXIT_OK)
+        self.assertIn("result: land-ended", text)
         self.assertIn("land: the land request stopped (review_required: needs an approving review)", text)
+        self.assertIn("still OPEN and not merged", text)
         self.put(rollup="FAILURE", conclusion="FAILURE")
         req = self.request(None)  # no land request any more: green, so a red fails as before
         self.assertEqual(gg.wait_step(req, time.time(), self.get)[0], gg.EXIT_FAIL)
+
+
+class WaitLandEndedTest(WaitPrNotMergedTest):
+    """2026-11-28: a `wait pr` with no --until on a PR glaeda land held a request for exited 0 on green checks after
+    that request stopped; the PR was still OPEN and its caller read the 0 as merged. Exit codes before -> after, for
+    the same open green PR: chosen merged then land ended 0 -> 8 (EXIT_LAND_ENDED); --until green|done|required
+    0 -> 0; merged 0 -> 0; a red head after the land ended 1 -> 1."""
+
+    STOP = {"code": "wait_refused", "reason": "ws-check has no data at the head", "next": "glaeda-gh land status o/r#1"}
+
+    def ended_wait(self, state: str = "stopped", as_json: bool = False, **fields: Any) -> dict:
+        self.land("waiting")
+        req = self.request(None, as_json=as_json)
+        self.put()
+        self.assertIsNone(gg.wait_step(req, time.time(), self.get))
+        self.land(state, **fields)
+        return req
+
+    def test_each_way_a_land_request_ends_exits_land_ended_with_its_reason(self) -> None:
+        for state, said in (("stopped", "the land request stopped (wait_refused: ws-check has no data at the head)"),
+                            ("cancelled", "the land request was cancelled")):
+            req = self.ended_wait(state, stop=self.STOP)
+            code, text = gg.wait_step(req, time.time(), self.get)
+            self.assertEqual(code, gg.EXIT_LAND_ENDED, (state, text))
+            self.assertIn(said, text, state)
+        req = self.ended_wait("waiting")
+        (gg.LandQueue.entries_dir() / gg.file_name(self.KEY)).unlink()
+        code, text = gg.wait_step(req, time.time(), self.get)
+        self.assertEqual(code, gg.EXIT_LAND_ENDED, text)
+        self.assertIn("the land request is gone from glaeda land", text)
+
+    def test_json_names_the_code_reason_and_the_lands_next_step(self) -> None:
+        req = self.ended_wait(stop=self.STOP, as_json=True)
+        code, text = gg.wait_step(req, time.time(), self.get)
+        doc = json.loads(text)
+        self.assertEqual((code, doc["result"], doc["ok"], doc["code"]),
+                         (gg.EXIT_LAND_ENDED, "land-ended", False, "land-ended"))
+        self.assertIn("wait_refused", doc["reason"])
+        self.assertEqual(doc["next"], "glaeda-gh land status o/r#1")
+
+    def test_a_red_head_after_the_land_ended_still_fails(self) -> None:
+        req = self.ended_wait(stop=self.STOP)
+        self.put(rollup="FAILURE", conclusion="FAILURE")
+        self.assertEqual(gg.wait_step(req, time.time(), self.get)[0], gg.EXIT_FAIL)
+
+    def test_a_merge_after_the_land_ended_is_still_merged(self) -> None:
+        req = self.ended_wait(stop=self.STOP)
+        self.put(state="MERGED")
+        code, text = gg.wait_step(req, time.time(), self.get)
+        self.assertEqual(code, gg.EXIT_OK, text)
+        self.assertIn("result: merged", text)
+
+    def test_a_green_wait_the_caller_asked_for_still_exits_0_on_an_open_pr(self) -> None:
+        self.land("stopped", stop=self.STOP)
+        self.put()
+        for until in ("green", "done", "required"):
+            code, text = gg.wait_step(self.request(until), time.time(), self.get)
+            self.assertEqual(code, gg.EXIT_OK, (until, text))
+            self.assertIn("PR still OPEN, not merged", text, until)
 
 
 class WaitSubscriptionTest(Base):

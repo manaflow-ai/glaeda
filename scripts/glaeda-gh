@@ -255,7 +255,8 @@ check, a failed run, a PR closed without being merged, an issue that does not ex
 whatever --until says or head --sha names (a closed unmerged PR exits 1 at once), 6 when no check or status ever reported on the PR's head
 (--settle seconds after its push, default SETTLE_GRACE: its CI has not started, which is not a pass),
 7 (inconclusive) when --until done is left with only checks queued with no runner past 30 min, or the
-deadline passes on a read that never came back whole. Done and green never exit 0 while any check
+deadline passes on a read that never came back whole, 8 (land-ended) when a wait with no --until waited for the
+merge of a PR glaeda land held and that land request stopped, was cancelled or went away with the PR still OPEN. Done and green never exit 0 while any check
 is queued, in progress, waiting, requested or pending, or an expected status is not posted.
 --until green (default) fails as soon as any completed check
 failed, required or not, and succeeds once every check finished with success, neutral or skipped;
@@ -764,6 +765,12 @@ EXIT_NOTHING = 6  # `wait pr`: the head's settle window passed and no check or s
 # 2026-11-18: hq#13438 at 10b0ae08 and hq#13202 at 0a581929 ended `wait --until done` with "result: success" while 7
 # and 8 of 13 checks were queued on a busy pool (queued 34 min, then they ran); land_judge refused both checks_running.
 EXIT_INCONCLUSIVE = 7
+# `wait pr` with no --until on a PR glaeda land held a request for waits for the merge (wait_until_chosen). When that
+# request then stopped, was cancelled or went away and the PR is still OPEN, the merge this wait was for is not coming,
+# so it never exits 0 there: it ends EXIT_LAND_ENDED and prints the land's stop reason. 2026-11-28: such a wait exited 0
+# on green checks while the PR sat open (its land request had stopped), and its caller read the 0 as merged. A green
+# wait the caller asked for (--until green|done|required) still exits 0 on an open PR.
+EXIT_LAND_ENDED = 8
 # A green head is green only once nothing more is coming. teamleaderleo/leo-workspace#3538 (2026-11-05): a `wait pr
 # --sha f40f2a3d` returned success on GitGuardian's pass alone, before the fleet-reconciler (cmuxterm-hq
 # fleet-reconciler-ws-check.yml) got round to posting the `ws-check` status its merges wait on: the head was pushed
@@ -35350,6 +35357,11 @@ def wait_outcome(req: dict, result: int, entry: dict | None, waited: int) -> dic
         return fail_fields("timeout", f"waited {waited} s for {name}: no change for {float(req['timeout']):g} s "
                            f"(deadline {deadline}; {last}); last seen: {state}",
                            blocked_next(req, blocked) if blocked else timeout_next(req, entry, now))
+    if result == EXIT_LAND_ENDED:
+        chosen = req.get("chosen") if isinstance(req.get("chosen"), dict) else {}
+        return fail_fields("land-ended", f"{name} is still OPEN and not merged: "
+                           f"{chosen.get('ended') or 'the land request ended'}",
+                           chosen.get("next") or f"glaeda-gh land status {name}")
     if result == EXIT_CONFLICT:
         return fail_fields("conflict", f"{name} conflicts with its base (mergeable CONFLICTING)",
                            "none (merge or rebase onto the base and push; checks run after that push)")
@@ -35932,6 +35944,8 @@ def wait_land_ended(req: dict) -> None:
     chosen["ended"] = ("the land request stopped" + (f" ({why})" if why else "") if state == "stopped"
                        else "the land request was cancelled" if state == "cancelled"
                        else "the land request is gone from glaeda land")
+    if stop.get("next"):
+        chosen["next"] = str(stop["next"])
     req["until"] = "green"
 
 
@@ -36023,16 +36037,23 @@ def wait_step(req: dict, now: float, get: Callable[[str, list[str]], dict] | Non
         else:
             req.pop("runsUnread", None)
             req.pop("runsUnfinished", None)
+    land_chosen = req.get("chosen") if isinstance(req.get("chosen"), dict) else None
+    if (result == EXIT_OK and kind == "pr" and data.get("state") == "OPEN" and land_chosen
+            and land_chosen.get("ended")):
+        result = EXIT_LAND_ENDED  # the merge this wait was chosen for is not coming: never 0 (EXIT_LAND_ENDED)
     if result is not None:
         merged = kind == "pr" and data.get("state") == "MERGED" and result == EXIT_OK
         outcome_name = {EXIT_OK: "merged" if merged else "success", EXIT_CONFLICT: "conflict", EXIT_NOTHING: "nothing-reported",
-                        EXIT_INCONCLUSIVE: "inconclusive"}.get(result, "failure")
+                        EXIT_INCONCLUSIVE: "inconclusive", EXIT_LAND_ENDED: "land-ended"}.get(result, "failure")
         extra: dict[str, Any] = {"result": outcome_name, "waited_s": waited, "ended_by": outcome_name}
         if kind == "pr" and result == EXIT_NOTHING:
             extra["note"] = (f"no check or status reported on this head within {int(settle)}s of its push: "
                              "its CI has not started (not a pass)")
         elif kind == "pr" and result == EXIT_INCONCLUSIVE:
             extra["note"] = inconclusive_note(data, time.time())
+        elif kind == "pr" and result == EXIT_LAND_ENDED:
+            extra["note"] = (f"checks passed, but the PR is still OPEN and not merged: {land_chosen['ended']}; "
+                             "the merge this wait was waiting for is not coming from glaeda land")
         elif kind == "pr" and result == EXIT_CONFLICT:
             extra["note"] = ("PR conflicts with its base (mergeable CONFLICTING): no checks run until you "
                              "merge or rebase onto the base and push")
