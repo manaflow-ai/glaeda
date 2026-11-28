@@ -1457,6 +1457,13 @@ STEPS_GONE = re.compile(r"HTTP (?:404|410|422)\b")
 # every base move. A required check added or dropped on the base shows within this time.
 REST_REPO_PART_TTL = 600
 REST_REPO_PART_KEEP = 3600  # an answer past its TTL still lends its ETag to the refresh this long
+# A repository's workflow list (actions/workflows, id -> name) changes only when a workflow file is added, renamed or
+# removed, yet every daemon refreshed it each REST_REPO_PART_TTL: rest_breakdown manaflow-ai/cmuxterm-hq 2026-11-28
+# 11:59-12:59Z, glaeda-upstream sent 77 App requests of actions/workflows (about 6 an hour per daemon and repository,
+# nearly every one the same answer). It is kept this long instead (under REST_REPO_PART_KEEP, so its refresh still
+# lends the ETag); a head run whose workflow_id the kept list does not name (a workflow added since) refreshes it at
+# REST_REPO_PART_TTL, as before (workflows_part).
+REST_WORKFLOWS_TTL = 3000
 # A commit's check runs, statuses and workflow runs, a pull and a run's job list are read the same way for every
 # watch that needs them (a PR and a head watch on one commit, PRs whose failed jobs share a run): one answer serves
 # them all for REST_HEAD_PART_TTL, and past it the newest ETag known makes the refresh conditional, so a commit
@@ -14506,7 +14513,9 @@ class Daemon:
                 continue  # (a controller part: its next answer is the controller's too, with no GitHub request)
             shared = self.repo_parts.get(path)
             repo_level = path.startswith((f"{root}/actions/workflows", f"{root}/rules/branches/", f"{root}/branches/"))
-            if shared is not None and self.now - shared["at"] < (REST_REPO_PART_TTL if repo_level else REST_HEAD_PART_TTL):
+            ttl = (REST_WORKFLOWS_TTL if path.startswith(f"{root}/actions/workflows?") else REST_REPO_PART_TTL) \
+                if repo_level else REST_HEAD_PART_TTL
+            if shared is not None and self.now - shared["at"] < ttl:
                 continue
             lent = (shared or {}).get("part") or {}
             seed = lent if lent.get("etag") and "doc" in lent else kept
@@ -14860,8 +14869,17 @@ class Daemon:
         if total > len(statuses) or runs_total > len(runs):
             # a partial list would read as a smaller, greener head (a check without its run loses its workflow)
             checks = {**checks, "total_count": max(int(checks.get("total_count") or 0), len(checks["check_runs"]) + 1)}
-        workflows = self.repo_part(old, parts, f"{root}/actions/workflows?per_page=100", slim_workflows)
-        return checks, statuses, runs, workflows
+        return checks, statuses, runs, self.workflows_part(old, parts, root, runs)
+
+    def workflows_part(self, old: dict, parts: dict, root: str, runs: list[dict]) -> dict:
+        """ROOT's workflow names (repo_part), kept REST_WORKFLOWS_TTL; when a run of RUNS names a workflow_id the kept
+        list lacks (a workflow added since), refreshed at REST_REPO_PART_TTL as before."""
+        path = f"{root}/actions/workflows?per_page=100"
+        workflows = self.repo_part(old, parts, path, slim_workflows, ttl=REST_WORKFLOWS_TTL)
+        if isinstance(workflows, dict) and any(
+                r.get("workflow_id") is not None and str(r.get("workflow_id")) not in workflows for r in runs):
+            workflows = self.repo_part(old, parts, path, slim_workflows)
+        return workflows
 
     def fetch_head_rest(self, e: dict) -> None:
         """One head over REST, for when GraphQL is low or throttled: the same contexts fetch_heads folds."""
@@ -36999,7 +37017,9 @@ DIRECT_RULES_RE = re.compile(r"^/repos/[^/]+/[^/]+/rules/branches/")
 
 
 def direct_part_ttl(path: str) -> float:
-    return DIRECT_RULES_TTL if DIRECT_RULES_RE.match(path) else REST_REPO_PART_TTL
+    if DIRECT_RULES_RE.match(path):
+        return DIRECT_RULES_TTL
+    return REST_WORKFLOWS_TTL if "/actions/workflows?" in path else REST_REPO_PART_TTL
 
 
 def direct_parts_load(now: float) -> dict[str, dict]:

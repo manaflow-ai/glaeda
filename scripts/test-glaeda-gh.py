@@ -5833,8 +5833,8 @@ class BalanceTest(Base):
         self.gh.protected = ["ci-status", "lint"]
         before = self.gh.rest_remaining
         self.daemon.tick(NOW + gg.CYCLE + gg.IDLE_BACKOFF_MAX)  # the PRs' next read (idle backoff), past the TTL
-        for path in shared:
-            self.assertEqual(asked().count(path), 2, path)
+        for path in shared:  # the workflow list is kept REST_WORKFLOWS_TTL: every run's workflow_id is in it
+            self.assertEqual(asked().count(path), 1 if path.startswith("actions/workflows") else 2, path)
         self.assertEqual(before - self.gh.rest_remaining, 1)  # the branch's 200; the rest answered 304
         for n in range(1, 6):
             self.assertEqual(gg.read_cache(f"pr:o/r#{n}")["data"]["requiredMissing"], ["ci-status", "lint"], n)
@@ -26846,8 +26846,9 @@ class StaleDataTest(Base):
         print(f"\ntwo direct reads of one PR through the broker: {len(served)} GETs ({served})")
         # past the TTL the next read asks them again
         later = time.time() + gg.REST_REPO_PART_TTL + 1
-        self.assertEqual([p for p in gg.direct_parts_load(later) if "/rules/branches/" not in p], [])
-        self.assertEqual(len(gg.direct_parts_load(later)), 1, "the base's rulesets are kept DIRECT_RULES_TTL")
+        self.assertEqual(sorted(p.split("/o/r/", 1)[1].split("/", 1)[0] for p in gg.direct_parts_load(later)),
+                         ["actions", "rules"], "the rulesets (DIRECT_RULES_TTL) and workflows (REST_WORKFLOWS_TTL) stay")
+        self.assertEqual(len(gg.direct_parts_load(time.time() + gg.REST_WORKFLOWS_TTL + 1)), 1)
         self.assertEqual(gg.direct_parts_load(time.time() + gg.DIRECT_RULES_TTL + 1), {})
         self.assertEqual(len(gg.direct_parts_load(time.time())), 2)
         # a read ten minutes later (a lane VM's next) sends no rules request
@@ -26858,7 +26859,7 @@ class StaleDataTest(Base):
             self.assertIsNone(gg.direct_read({"key": "pr:o/r#9", "kind": "pr", "jobs": False,
                                               "began": time.time() - 700}))
         self.assertEqual([p for p in served if p.startswith("rules/branches/")], [], served)
-        self.assertEqual(len([p for p in served if p.startswith("actions/workflows")]), 1, served)
+        self.assertEqual([p for p in served if p.startswith("actions/workflows")], [], served)
 
     def test_concurrent_direct_part_saves_keep_every_answer(self) -> None:
         """Waits and land workers on one host end together; each saved by writing back the file it had read before the
@@ -53456,6 +53457,37 @@ class MergeTrainTurnAway(unittest.TestCase):
         data = self.data()
         data["checks"][1]["workflow"] = "CI"
         self.assertEqual([c["name"] for c in gg.classify(data, NOW, gg.RESCUE_GRACE)["failed"]], ["merge-train"])
+
+
+class WorkflowsPartTest(unittest.TestCase):
+    """workflows_part: the repository's workflow list is kept REST_WORKFLOWS_TTL (glaeda-upstream sent actions/workflows
+    77 times an hour, nearly every one the same answer), and refreshed at REST_REPO_PART_TTL once a head run names a
+    workflow it does not list (a workflow added since)."""
+
+    def asked(self, runs: list[dict]) -> list[float]:
+        ttls: list[float] = []
+
+        class Fake:
+            def repo_part(self, old, parts, path, slim, absent=None, ttl=gg.REST_REPO_PART_TTL):
+                ttls.append(ttl)
+                return {"77": "CI", "78": "Lint"}
+
+        got = gg.Daemon.workflows_part(Fake(), {}, {}, "/repos/o/r", runs)
+        self.assertEqual(got, {"77": "CI", "78": "Lint"})
+        return ttls
+
+    def test_a_listed_workflow_keeps_the_long_ttl(self) -> None:
+        self.assertEqual(self.asked([{"id": 1, "workflow_id": 77}, {"id": 2, "workflow_id": 78}, {"id": 3}]),
+                         [gg.REST_WORKFLOWS_TTL])
+        self.assertLess(gg.REST_WORKFLOWS_TTL, gg.REST_REPO_PART_KEEP)  # its refresh still lends the ETag
+
+    def test_an_unlisted_workflow_refreshes_at_the_repo_part_ttl(self) -> None:
+        self.assertEqual(self.asked([{"id": 1, "workflow_id": 77}, {"id": 2, "workflow_id": 91}]),
+                         [gg.REST_WORKFLOWS_TTL, gg.REST_REPO_PART_TTL])
+
+    def test_the_direct_reads_keep_it_as_long(self) -> None:
+        self.assertEqual(gg.direct_part_ttl("/repos/o/r/actions/workflows?per_page=100"), gg.REST_WORKFLOWS_TTL)
+        self.assertEqual(gg.direct_part_ttl("/repos/o/r/rules/branches/main?per_page=100"), gg.DIRECT_RULES_TTL)
 
 
 class RollupHeadPartsTest(unittest.TestCase):
