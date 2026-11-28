@@ -14005,7 +14005,15 @@ class Daemon:
         # is also why it is the one read the REST share does not hold back: a wait cannot rule on a
         # failed run without it, and one request per failed attempt is what keeps every waiter off gh.
         attempt = run.get("run_attempt") or 1
-        failed_attempt = (run.get("status") == "completed" and run.get("conclusion") not in RUN_OK
+        # A completed re-run that passed, holding the failed list of an attempt before it (cmux#63263, 2026-11-28:
+        # run 46098181805's attempt 2 passed, yet its kept list stayed attempt 1's two failed jobs, "attempt 2 not
+        # read yet", in every `status --jobs` and land-judge read, so the land refused it on reds gone for good): a
+        # list that names a failure the run no longer has is read once for the new attempt, like a failed one.
+        superseded_red = (0 < jobs_attempt(prior.get("jobs")) < attempt
+                          and any(isinstance(j, dict) and j.get("conclusion") not in (None, *RUN_OK)
+                                  for j in prior.get("jobs") or []))
+        failed_attempt = (run.get("status") == "completed"
+                          and (run.get("conclusion") not in RUN_OK or superseded_red)
                           and self.mode("rest") != "stop"
                           and (fresh or jobs_attempt(prior.get("jobs")) < attempt)
                           # past the REST share, once per attempt, answered or not: an error or an empty

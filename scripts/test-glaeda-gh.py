@@ -4416,6 +4416,30 @@ class DaemonTest(Base):
         self.assertEqual(len(self.gh.job_calls()), 2)
         self.assertEqual(gg.jobs_attempt(gg.read_cache(key)["jobs"]), 2)
 
+    def test_passed_rerun_replaces_its_failed_attempts_jobs(self) -> None:
+        """cmux#63263 (2026-11-28): attempt 1 failed and its jobs were read; `gh run rerun --failed` passed as
+        attempt 2. The kept list stayed attempt 1's failures ("attempt 2 not read yet") and land-judge refused."""
+        key = "run:o/r/5"
+        self.gh.runs[5] = {"id": 5, "status": "completed", "conclusion": "failure", "run_attempt": 1,
+                           "updated_at": iso(NOW)}
+        self.gh.jobs[5] = [job("build", end=NOW), job("lint", "success", end=NOW)]
+        gg.register(key)  # no --jobs: only a failed attempt reads its list
+        self.daemon.tick(NOW)
+        self.assertEqual(gg.jobs_attempt(gg.read_cache(key)["jobs"]), 1)
+        self.gh.runs[5] = {**self.gh.runs[5], "conclusion": "success", "run_attempt": 2, "updated_at": iso(NOW + 9)}
+        self.gh.jobs[5] = [job("build", "success", run_attempt=2, end=NOW), job("lint", "success", end=NOW)]
+        path = gg.watch_dir() / gg.file_name(key)
+        os.utime(path, (NOW + gg.CYCLE - 1,) * 2)
+        self.daemon.tick(NOW + gg.CYCLE)
+        entry = gg.read_cache(key)
+        self.assertEqual(gg.jobs_attempt(entry["jobs"]), 2)
+        self.assertNotIn("failed: build", gg.summary(key, entry))
+        self.assertNotIn("not read yet", gg.summary(key, entry))
+        calls = len(self.gh.job_calls())
+        os.utime(path, (NOW + 2 * gg.CYCLE - 1,) * 2)
+        self.daemon.tick(NOW + 2 * gg.CYCLE)
+        self.assertEqual(len(self.gh.job_calls()), calls)  # read once for the attempt, then kept
+
     def replay_one_runs_life(self, waiters: int, done_cycles: int) -> dict:
         """One run's life as the pool host's daemon sees it through the broker relay (2026-11-17: GET
         .../actions/runs/{id}/jobs, 56 an hour, waiter VM/tool:lane-gh-broker): WAITERS lane sessions
