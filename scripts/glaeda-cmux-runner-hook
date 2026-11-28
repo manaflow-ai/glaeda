@@ -3290,6 +3290,16 @@ GATE_ELIGIBLE_RECHECK_S = 30.0
 # The held answer across a reload's exec (as GATE_LISTENING_SINCE_ENV), so a hook --apply does not start every
 # held runner listening while the new gate's first look runs.
 GATE_INELIGIBLE_ENV = "GLAEDA_RUNNER_GATE_INELIGIBLE"
+# INELIGIBLE_AT_ONCE: job-started's own eligibility refusal (node_refusal or toolchain_refusal under
+# --require-eligible), written to the mini's state dir, so every gate on the mini holds its listener off at its next
+# poll instead of waiting for its own look (GATE_ELIGIBLE_EVERY_S, then a recheck). The admit is the authority: a job
+# it refused is a job the gate let through, and every further job the listener takes fails the same way in "Set up
+# runner". cmux31's runners (m5pro-24 receipt pinning rustc 1.100.0, not installed) refused jobs from 2026-11-27
+# 23:38Z to a hand install at 01:54Z, one of them synthetic-probes' notify-banner-click (cmuxterm-hq run
+# 46092564119), which read as a probe red. Held, a gate listens again only once a look it started after the refusal
+# finds the node eligible; that look also removes the note. A refusal that names a probe timeout is no evidence (a
+# busy mini) and writes no note: the gate's own recheck decides those.
+ELIGIBILITY_REFUSED_FILE = "eligibility-refused.json"
 # Across a reload: "clean" when this gate started its listener with listener_env, else why its env is stale.
 GATE_LISTENER_ENV = "GLAEDA_RUNNER_GATE_LISTENER_ENV"
 GATE_RESERVE_FD_ENV = "GLAEDA_RUNNER_GATE_RESERVE_FD"  # a reload hands its reserve flock's fd to the new gate
@@ -12249,6 +12259,10 @@ class Gate:
         if self.eligible_why and TOOLCHAIN_MISSING in self.eligible_why:
             self.eligible_why = None  # never carried across a reload: the per-poll check reads it afresh
         self.eligible_new: str | None = None  # a first refusal, held only once a recheck agrees
+        # INELIGIBLE_AT_ONCE: job-started's refusal note this gate holds for, its mtime, and when the gate saw it
+        self.refused_why: str | None = None
+        self.refused_stamp = 0
+        self.refused_seen_at = 0.0
         self.missing_why: str | None = None  # the last toolchain_missing answer, read every poll
         self.eligible_at = -GATE_ELIGIBLE_EVERY_S
         self.eligible_look: threading.Thread | None = None
@@ -13582,9 +13596,16 @@ class Gate:
             self.missing_why = missing
         if missing:
             return f"ineligible: {missing}"
-        running =self.eligible_look is not None and self.eligible_look.is_alive()
+        running = self.eligible_look is not None and self.eligible_look.is_alive()
+        note = eligibility_refused(self.state_dir)  # INELIGIBLE_AT_ONCE: one stat and a small read per poll
+        if note is not None and note[1] != self.refused_stamp:
+            self.refused_why, self.refused_stamp, self.refused_seen_at = note[0], note[1], time.monotonic()
+            gate_log(f"job-started refused a job here: {note[0]}; held off at once so another runner takes the "
+                     "next job, until a fresh look finds the node eligible (INELIGIBLE_AT_ONCE)")
+            if not running:
+                self.eligible_at = -GATE_ELIGIBLE_EVERY_S  # the look that may release it starts now
         if not running and time.monotonic() - self.eligible_at >= GATE_ELIGIBLE_EVERY_S:
-            self.eligible_at = time.monotonic()
+            self.eligible_at = started = time.monotonic()
 
             def look() -> None:
                 try:
@@ -13592,8 +13613,22 @@ class Gate:
                 except Exception as error:  # noqa: BLE001 - a broken look must never stop the gate
                     why = None
                     gate_log(f"the eligibility look failed ({type(error).__name__}); not holding for it")
+                if self.refused_why is not None:
+                    if why is None and started >= self.refused_seen_at:
+                        gate_log(f"a look after job-started's refusal finds the node eligible; listening again "
+                                 f"(was: {self.refused_why})")
+                        clear_eligibility_refusal(self.state_dir, self.refused_stamp)
+                        self.refused_why = None
+                    elif why is None:  # a look that began before the refusal says nothing about it: look again
+                        self.eligible_at = time.monotonic() - GATE_ELIGIBLE_EVERY_S + GATE_ELIGIBLE_RECHECK_S
                 if why and TOOLCHAIN_MISSING in why:
                     return  # the per-poll toolchain_missing owns that answer; the held one, if any, stands
+                if why and self.refused_why is not None:
+                    self.eligible_new = None  # job-started already refused: no recheck needed to hold
+                    if why != self.eligible_why:
+                        gate_log(f"eligibility: {why}; held off so another runner takes the job")
+                    self.eligible_why = why
+                    return
                 if why and not self.eligible_why and not self.eligible_new:
                     self.eligible_new = why  # look again soon; hold only if that look refuses too
                     self.eligible_at = time.monotonic() - GATE_ELIGIBLE_EVERY_S + GATE_ELIGIBLE_RECHECK_S
@@ -13606,7 +13641,8 @@ class Gate:
 
             self.eligible_look = threading.Thread(target=look, name="eligibility", daemon=True)
             self.eligible_look.start()
-        return f"ineligible: {self.eligible_why}" if self.eligible_why else None
+        held = self.eligible_why or self.refused_why
+        return f"ineligible: {held}" if held else None
 
     def off_tailnet(self) -> str | None:
         """Why this mini is off the tailnet, from the last looks (GATE_TAILNET_EVERY_S, in a thread so no poll waits on
@@ -13794,7 +13830,8 @@ class Gate:
         with contextlib.suppress(OSError):
             self.job_end_marker().unlink()
         try:
-            return self.full(fresh=True)
+            # INELIGIBLE_AT_ONCE: a job job-started refused for eligibility stops the listener before its next job
+            return self.full(fresh=True) or self.ineligible()
         except Exception:  # noqa: BLE001  (the regular poll looks again)
             return None
 
@@ -14567,6 +14604,36 @@ def note_waiter_refusal(state_dir: Path, why: str) -> None:
         # runners), so a plain utime could repeat the last stamp and the gates would miss the new refusal.
         stamp = max(time.time_ns(), last + 1_000)
         os.utime(path, ns=(stamp, stamp))
+
+
+def note_eligibility_refusal(state_dir: Path, why: str) -> None:
+    """INELIGIBLE_AT_ONCE: record job-started's eligibility refusal for every gate on this mini. Never raises."""
+    if "timed out" in why:
+        return
+    with contextlib.suppress(OSError):
+        state_dir.mkdir(parents=True, exist_ok=True)
+        tmp = state_dir / f".{ELIGIBILITY_REFUSED_FILE}.{os.getpid()}"
+        tmp.write_text(json.dumps({"why": why, "at": time.time()}) + "\n")
+        os.replace(tmp, state_dir / ELIGIBILITY_REFUSED_FILE)
+
+
+def eligibility_refused(state_dir: Path) -> tuple[str, int] | None:
+    """(why, the note's mtime in ns) for job-started's last eligibility refusal on this mini, or None."""
+    path = state_dir / ELIGIBILITY_REFUSED_FILE
+    try:
+        stamp = path.stat().st_mtime_ns
+        why = json.loads(path.read_text()).get("why")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return (why, stamp) if isinstance(why, str) and why else None
+
+
+def clear_eligibility_refusal(state_dir: Path, stamp: int) -> None:
+    """Remove the note when it is still the one with this mtime (a newer refusal stands). Never raises."""
+    path = state_dir / ELIGIBILITY_REFUSED_FILE
+    with contextlib.suppress(OSError):
+        if path.stat().st_mtime_ns == stamp:
+            path.unlink()
 
 
 def refused_note(state_dir: Path, worker: int) -> Path:
@@ -17207,6 +17274,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.require_eligible:
             why, want = node_refusal(args.fleet_class)
             if why:
+                note_eligibility_refusal(args.state_dir, why)  # INELIGIBLE_AT_ONCE
                 return refused(why)
         if args.toolchain_xcode:  # the listener's env, which every step inherits (listener_env)
             given = {k: v for k, v in os.environ.items() if k != "SDKROOT" or not under_xcrun_shim(sys.executable)}
@@ -17556,6 +17624,7 @@ def main(argv: list[str] | None = None) -> int:
             why, aligned = toolchain_refusal(args.fleet_class, want, args.toolchain_xcode)
             if why:
                 release_host_lock(args.state_dir)
+                note_eligibility_refusal(args.state_dir, why)  # INELIGIBLE_AT_ONCE
                 return refused(why)
             if aligned:
                 note += f"; {aligned}"

@@ -12770,6 +12770,54 @@ class GateTest(unittest.TestCase):
                                         self.state).confirmed(), "a root runner's compiles need no console")
             read.assert_not_called()
 
+    def test_job_started_eligibility_refusal_holds_every_gate_at_once(self) -> None:
+        # INELIGIBLE_AT_ONCE: cmux31, 2026-11-28: job-started refused synthetic-probes' notify-banner-click for a
+        # missing pinned rustc while the gate kept listening; the refusal itself now holds every gate on the mini.
+        script = self.runner / hook.RUNNER_HOOK_SCRIPT
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("exec /usr/bin/python3 /hook job-started --allowed-owner manaflow-ai --require-eligible "
+                          "--fleet-class m5pro-24 --toolchain-xcode /Applications/Xcode_26.6.app --instance 1\n")
+        why = "node not eligible (rust toolchain 1.100.0-aarch64-apple-darwin is not installed)"
+        hook.note_eligibility_refusal(self.state, "node not eligible (the state probe timed out after 20s)")
+        self.assertIsNone(hook.eligibility_refused(self.state), "a probe timeout is a busy mini, no evidence")
+        gate = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        for name in ("saturated", "hot"):
+            patch = mock.patch.object(gate, name, return_value=None)
+            patch.start()
+            self.addCleanup(patch.stop)
+        patch = mock.patch.object(hook, "toolchain_missing", return_value=None)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+        def settle() -> None:
+            if gate.eligible_look is not None:
+                gate.eligible_look.join(120)
+
+        with mock.patch.object(hook, "eligibility_refusal", return_value=None):
+            self.assertIsNone(gate.claimed())
+            settle()
+            self.assertIsNone(gate.claimed(), "eligible by the gate's own look")
+        hook.note_eligibility_refusal(self.state, why)
+        self.assertEqual(hook.eligibility_refused(self.state)[0], why)
+        with mock.patch.object(hook, "eligibility_refusal", return_value=why) as look:
+            self.assertEqual(gate.claimed(), f"ineligible: {why}", "held at the next poll, no recheck")
+            self.assertEqual(gate.job_end(), f"ineligible: {why}", "the listener stops before its next job")
+            settle()
+            self.assertEqual(look.call_count, 1, "the refusal starts a fresh look at once")
+            self.assertEqual(gate.claimed(), f"ineligible: {why}", "the look agrees: still held")
+        other = hook.Gate(self.runner, os.fspath(self.lock), os.fspath(self.tmp / "none.json"), self.state)
+        with mock.patch.object(other, "saturated", return_value=None), \
+                mock.patch.object(other, "hot", return_value=None), \
+                mock.patch.object(hook, "eligibility_refusal", return_value=why):
+            self.assertEqual(other.claimed(), f"ineligible: {why}", "every gate on the mini, a new one too")
+            other.eligible_look.join(120)
+        gate.eligible_at -= hook.GATE_ELIGIBLE_EVERY_S
+        with mock.patch.object(hook, "eligibility_refusal", return_value=None):
+            gate.claimed()
+            settle()
+            self.assertIsNone(gate.claimed(), "a look after the refusal finds it eligible: listening again")
+        self.assertIsNone(hook.eligibility_refused(self.state), "and the note is gone")
+
     def test_a_require_eligible_runner_holds_while_its_node_would_be_refused(self) -> None:
         script = self.runner / hook.RUNNER_HOOK_SCRIPT
         script.parent.mkdir(parents=True, exist_ok=True)
