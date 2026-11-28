@@ -6,8 +6,38 @@
       "every_s": 600,
       "sha256": "291cf0aa5f0a1495362e369d082f21d9820776266a310a1ac357d3d674495460",
       "source": {
-        "commit": "a83f657437d221b91fa3927fe939cf9ee85d0bdd",
+        "commit": "e5e4f808e77e14d1c3cfb8b0cc8d3c34b42fb52b",
         "path": "build-fleet/mini-ops/ops/console-unlock-guard.sh",
+        "repository": "manaflow-ai/cmuxterm-hq"
+      }
+    },
+    "holder-orphan-reap": {
+      "body": "#!/bin/bash\n# Installed by build-fleet/mini-ops/ops/holder-orphan-reap.sh.\nmin_age=${HOLDER_REAP_MIN_AGE_S:-120}\ngrace=${HOLDER_REAP_GRACE_S:-5}\nsecs() {  # ps etime ([[dd-]hh:]mm:ss) in seconds\n  local t=$1 d=0 h=0 m=0 s=0\n  case $t in *-*) d=${t%%-*}; t=${t#*-} ;; esac\n  IFS=: read -r a b c <<<\"$t\"\n  if [ -n \"$c\" ]; then h=$a; m=$b; s=$c; else m=$a; s=$b; fi\n  echo $(( 10#$d * 86400 + 10#$h * 3600 + 10#$m * 60 + 10#$s ))\n}\nopen_ptys() { echo \"$(lsof -n /dev/ptmx 2>/dev/null | awk 'NR > 1' | wc -l | tr -d ' ')/$(sysctl -n kern.tty.ptmx_max 2>/dev/null)\"; }\norphans=()\nwhile read -r pid ppid etime cmd; do\n  case $cmd in *cmux-holder*--socket*--owner*) ;; *) continue ;; esac\n  [ \"$ppid\" = 1 ] || continue\n  owner=${cmd##*@}; owner=${owner%% *}\n  case $owner in ''|*[!0-9]*) continue ;; esac  # no owner pid to check: leave it\n  kill -0 \"$owner\" 2>/dev/null && continue  # the owner runs: its holder is live\n  [ \"$(secs \"$etime\")\" -ge \"$min_age\" ] || continue\n  orphans+=(\"$pid:$owner\")\ndone < <(ps -axo pid=,ppid=,etime=,command=)\n[ \"${#orphans[@]}\" -gt 0 ] || exit 0\nnow=$(date -u +%FT%TZ)\necho \"$now ptys before $(open_ptys); ${#orphans[@]} orphan holder(s)\"\nfor o in \"${orphans[@]}\"; do kill -TERM \"${o%%:*}\" 2>/dev/null || true; done\nsleep \"$grace\"\nfor o in \"${orphans[@]}\"; do\n  pid=${o%%:*}\n  if kill -0 \"$pid\" 2>/dev/null; then\n    kill -KILL \"$pid\" 2>/dev/null || true\n    echo \"$now holder $pid (owner ${o#*:} dead) ignored TERM: KILL\"\n  else\n    echo \"$now holder $pid (owner ${o#*:} dead) ended on TERM\"\n  fi\ndone\nsleep 1\necho \"$now ptys after $(open_ptys)\"\n",
+      "every_s": 120,
+      "sha256": "8186b05d1132c4cf6ee6e4349f73152b7989b37fb152c01e131ce651e2c6570a",
+      "source": {
+        "commit": "e5e4f808e77e14d1c3cfb8b0cc8d3c34b42fb52b",
+        "path": "build-fleet/mini-ops/ops/holder-orphan-reap.sh",
+        "repository": "manaflow-ai/cmuxterm-hq"
+      }
+    },
+    "indexers-off": {
+      "body": "#!/bin/bash\n# Installed by build-fleet/mini-ops/ops/indexers-off.sh: Spotlight indexing off, mediaanalysisd and\n# photoanalysisd disabled and stopped for every local account. Idempotent.\ndid=()\n# mdutil waits on mds without a bound, and a wedged mds holds it for hours (a runner mini, 2026-11-17): every mdutil\n# call gets 60 s, and a Spotlight that does not answer is a logged line, not a stuck check.\nbound=${INDEXERS_OFF_MDUTIL_BOUND:-60}\nmd() { perl -e 'alarm shift; exec @ARGV' \"$bound\" mdutil \"$@\"; }\nif ! state=$(md -a -s 2>/dev/null); then\n  did+=(\"Spotlight status did not answer in $bound s\")\nelif grep -q \"Indexing enabled\" <<<\"$state\"; then\n  md -a -i off >/dev/null 2>&1 || true\n  if md -a -s 2>/dev/null | grep -q \"Indexing enabled\"; then\n    did+=(\"Spotlight off refused\")\n  else\n    did+=(\"Spotlight off\")\n  fi\nfi\nfor uid in $(dscl . -list /Users UniqueID 2>/dev/null | awk '$2 >= 501 {print $2}'); do\n  for label in com.apple.mediaanalysisd com.apple.photoanalysisd; do\n    for domain in \"gui/$uid\" \"user/$uid\"; do\n      launchctl print \"$domain\" >/dev/null 2>&1 || continue\n      if ! launchctl print-disabled \"$domain\" 2>/dev/null | grep -Eq \"\\\"$label\\\" => (disabled|true)\"; then\n        launchctl disable \"$domain/$label\" 2>/dev/null && did+=(\"$domain/$label disabled\")\n      fi\n      pid=$(launchctl print \"$domain/$label\" 2>/dev/null | awk '$1 == \"pid\" && $2 == \"=\" {print $3; exit}')\n      [[ $pid =~ ^[0-9]+$ ]] && [ \"$pid\" -gt 1 ] || continue\n      # A loaded job is relaunched on demand until its domain is bootstrapped again (the next login or\n      # reboot, when the disable keeps it unloaded): a copy that exits (it ignored SIGTERM; SIGKILL brought\n      # it back within a minute at the same 120%) is replaced at once. So a busy copy is frozen (SIGSTOP):\n      # launchd still sees it running and starts no other, and the reboot ends it. Its clients' calls wait\n      # instead; nothing on a CI mini uses media analysis.\n      cpu=$(ps -o %cpu= -p \"$pid\" 2>/dev/null | awk '{printf \"%d\", $1}')\n      [ \"${cpu:-0}\" -ge \"${INDEXERS_OFF_MIN_CPU:-10}\" ] || continue\n      kill -STOP \"$pid\" 2>/dev/null && did+=(\"$domain/$label pid $pid at ${cpu}% CPU frozen\")\n    done\n  done\ndone\nif [ ${#did[@]} -gt 0 ]; then\n  echo \"$(date -u +%FT%TZ) $(IFS=,; echo \"${did[*]}\" | sed 's/,/; /g')\"\nfi\nexit 0\n",
+      "every_s": 1800,
+      "sha256": "ed0203ef7276dc722922ac226769f7899a974e947e7e5381886b908c90fb78cc",
+      "source": {
+        "commit": "e5e4f808e77e14d1c3cfb8b0cc8d3c34b42fb52b",
+        "path": "build-fleet/mini-ops/ops/indexers-off.sh",
+        "repository": "manaflow-ai/cmuxterm-hq"
+      }
+    },
+    "mem-pressure-sampler": {
+      "body": "#!/bin/bash\n# Installed by build-fleet/mini-ops/ops/mem-pressure-sampler.sh.\nlog=/var/log/mem-pressure-sampler.log\nstate=\"/Library/Application Support/cmux-fleet-ops/mem-pressure-sampler.state\"\nfor i in 1 2 3 4 5 6; do\n  [ \"$i\" = 1 ] || sleep 10\n  level=$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null) || exit 0  # unreadable: never sample blind\n  now=$(date -u +%FT%TZ)\n  if [ \"$level\" -le 1 ] 2>/dev/null; then\n    if [ -f \"$state\" ]; then\n      echo \"$now level $level (normal again; elevated since $(cat \"$state\"))\"\n      rm -f \"$state\"\n    fi\n    continue\n  fi\n  [ -f \"$state\" ] || echo \"$now\" >\"$state\"\n  size=$(stat -f %z \"$log\" 2>/dev/null || echo 0)\n  if [ \"$size\" -gt 4000000 ]; then\n    mv -f \"$log\" \"$log.1\"\n  fi\n  free=$(memory_pressure -Q 2>/dev/null | awk -F': ' '/free percentage/ {print $2}')\n  echo \"$now level $level free ${free:-?} swap $(sysctl -n vm.swapusage 2>/dev/null | awk '{print $6}')\"\n  top -l 1 -o mem -n 15 -stats pid,mem,cmprs,command 2>/dev/null | awk 'f {print \"  \" $0} /^PID/ {f = 1}'\ndone\n",
+      "every_s": 60,
+      "sha256": "a9cd621dc23c6092e23d01b5531494c4ef0e0ddd2d1c4385628e8c3c7e4a2430",
+      "source": {
+        "commit": "e5e4f808e77e14d1c3cfb8b0cc8d3c34b42fb52b",
+        "path": "build-fleet/mini-ops/ops/mem-pressure-sampler.sh",
         "repository": "manaflow-ai/cmuxterm-hq"
       }
     },
@@ -16,7 +46,7 @@
       "every_s": 1800,
       "sha256": "604e5ba31bb063c9cd147e5928bbfab126022811d65b5dbf80be68a6e006dbdd",
       "source": {
-        "commit": "a83f657437d221b91fa3927fe939cf9ee85d0bdd",
+        "commit": "e5e4f808e77e14d1c3cfb8b0cc8d3c34b42fb52b",
         "path": "build-fleet/mini-ops/ops/seed-root.sh",
         "repository": "manaflow-ai/cmuxterm-hq"
       }
@@ -26,7 +56,7 @@
       "every_s": 21600,
       "sha256": "49514fb65e9caee7e307445c4e72c631afdd04bdf4807911c289b1fa9614d5c7",
       "source": {
-        "commit": "a83f657437d221b91fa3927fe939cf9ee85d0bdd",
+        "commit": "e5e4f808e77e14d1c3cfb8b0cc8d3c34b42fb52b",
         "path": "build-fleet/mini-ops/ops/symbol-cache-cap.sh",
         "repository": "manaflow-ai/cmuxterm-hq"
       }
