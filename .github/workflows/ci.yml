@@ -314,6 +314,7 @@ jobs:
               Path("scripts/cmux-disk-registry"),
               Path("scripts/test-cmux-names.py"),
               Path("scripts/glaeda-local-guard"),
+              Path("scripts/cmux-local-guard"),
               Path("scripts/test-glaeda-local-guard.py"),
               Path("scripts/glaeda-update"),
               Path("scripts/glaeda_release.py"),

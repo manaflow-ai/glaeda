@@ -31,7 +31,7 @@ What --apply installs (templated for the current user):
     ~/.local/bin/glaeda-projects               dry-run/apply Projects tidy pass
     ~/.local/bin/disk-pressure.sh              one-shot launcher used by every mini's LaunchAgent
     ~/.local/bin/glaeda-procs, cmux-procs      from scripts/glaeda-procs and its primary name cmux-procs (why the Mac lags; --apply ends leaked fixtures)
-    ~/.local/bin/glaeda-local-guard            from scripts/glaeda-local-guard (stops test and build runs orphaned by an
+    ~/.local/bin/glaeda-local-guard            and cmux-local-guard, its primary name, from scripts/glaeda-local-guard (stops test and build runs orphaned by an
                                                agent session on a hygiene-only Mac, and on every Mac shell -c trees
                                                left under launchd that stopped using CPU)
     ~/.local/bin/glaeda-worktree-reclaim       built from src/bin/glaeda-worktree-reclaim.rs
@@ -206,7 +206,8 @@ GH_ONLY_TOOLS = ("glaeda-update", "glaeda-gh", "glaeda-disk", "disk-pressure.sh"
 # into cmux-prefixed naming tooling"); the old names count their uses in ~/.local/state/cmux-names for retirement.
 TOOL_ALIASES = {"glaeda-gh": "cmux-gh", "glaeda-disk": "cmux-disk", "glaeda-procs": "cmux-procs",
                 "glaeda-disk-registry": "cmux-disk-registry",
-                "glaeda-idle-repair": "cmux-idle-repair", "glaeda-mini-health": "cmux-mini-health"}
+                "glaeda-idle-repair": "cmux-idle-repair", "glaeda-mini-health": "cmux-mini-health",
+                "glaeda-local-guard": "cmux-local-guard"}
 PROFILE_FLAGS = ("--update-only", "--gh-only", "--hygiene-only")
 
 
