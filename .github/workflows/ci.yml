@@ -388,6 +388,7 @@ jobs:
           bash -n tools/fleet-cas-prototype/scripts/fleet-cas-mount
           bash -n scripts/test-glaeda-fleet-cas.sh
           bash -n scripts/test-glaeda-fleet-cas-mount.sh
+          bash -n scripts/test-fleet-cas-writer-build.sh
           bash -n scripts/cmux_mini_probe.sh
           bash -n scripts/cmux_mini_preflight.sh
           bash -n scripts/cmux_mini_fix.sh
@@ -488,6 +489,7 @@ jobs:
           suite bash scripts/test-glaeda-fleet-cas.sh
           suite python3 scripts/test-glaeda-headless-services.py
           suite bash scripts/test-glaeda-fleet-cas-mount.sh
+          suite bash scripts/test-fleet-cas-writer-build.sh
           suite python3 scripts/test-glaeda-seed-prefetch.py
           suite python3 scripts/test-glaeda-git-mirror.py
           suite python3 scripts/test-glaeda-idle-warm.py

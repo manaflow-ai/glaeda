@@ -12,7 +12,12 @@
 # Settings come from /Users/Shared/cmux-build-fleet/xcode/fleet-cas.env, which
 # `glaeda-fleet-cas writer` installs. The build command must add the plugin
 # settings from `fleet-cas-settings.sh`. Exit: the build's code; 3 if the node
-# is down (nothing is built); 4 if the build passed but no marker was written.
+# is down (nothing is built); 4 if the build passed but no marker was written;
+# 5 if the build failed while the node failed or skipped fleet-store calls, or
+# restarted or went down: a write Xcode got an error for leaves its compile
+# without its output ("cache poisoned", "makeBlob: missing object"), so that
+# red is the store's, not the commit's (2026-11-28: a feat-cmux-next head that
+# compiles green elsewhere failed exit 65 this way and paused the writer 6 h).
 # The writer node keeps its own copy of what it wrote, so a fleet store that is
 # emptied needs the writer's node store emptied too, or later markers can
 # claim entries the store lost. The build must use the fixed local CAS
@@ -59,7 +64,20 @@ i0=$(instance) f0=$(failures) a0=$(activity)
 [ -n "$i0" ] && [ -n "$f0" ] && [ -n "$a0" ] || { echo "cannot read $stats" >&2; exit 3; }
 "$@"
 rc=$?
-[ "$rc" -eq 0 ] || exit "$rc"
+if [ "$rc" -ne 0 ]; then
+  # A failed build: the commit's code, unless the node failed it (exit 5).
+  if ! "$ROOT/bin/fleet-cas-settings.sh" "$ROOT/fleet-cas.sock" >/dev/null; then
+    echo "fleet-cas: the build failed (exit $rc) and the node is down after it; a store fault, not $commit's" >&2
+    exit 5
+  fi
+  sleep 1  # the node rewrites stats.json every 500 ms
+  i1=$(instance) f1=$(failures)
+  if [ "$i1" != "$i0" ] || [ -z "$f1" ] || [ "$f1" != "$f0" ]; then
+    echo "fleet-cas: the build failed (exit $rc) while the node failed, skipped or restarted ($f0 -> ${f1:-?} failed or skipped calls); a store fault, not $commit's" >&2
+    exit 5
+  fi
+  exit "$rc"
+fi
 # A node that died late in the build and is not back yet left its last stats
 # behind: calls to the dead socket fail without being counted anywhere.
 "$ROOT/bin/fleet-cas-settings.sh" "$ROOT/fleet-cas.sock" >/dev/null || {
