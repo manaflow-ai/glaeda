@@ -52173,6 +52173,21 @@ class FullPrReadsSizedByMeasuredCost(unittest.TestCase):
                 d.note_full_pr_secs(self.entries(2), 1.0, True)
             self.assertLess(d.full_pr_secs["manaflow-ai/cmux"], 1.2)
 
+    def test_a_hold_outlives_the_daemon_instance_that_made_it(self):
+        """The waited pool's workers are Daemons of their own: a cut one worker saw holds for the next one too."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / gg.FULL_PR_SECS_FILE
+            a, _ = self.daemon(0.5)
+            a.full_pr_secs, a.full_pr_secs_path = {}, path
+            with mock.patch.object(gg, "log", lambda e: None):
+                a.note_full_pr_secs(self.entries(5), 10.5, False)
+                b, _ = self.daemon(0.5)
+                b.full_pr_secs, b.full_pr_secs_path = gg.load_full_pr_secs(path), path
+                for _ in range(10):
+                    b.note_full_pr_secs(self.entries(2), 1.0, True)
+            self.assertGreaterEqual(b.full_pr_secs["manaflow-ai/cmux"], 2.6)
+            self.assertEqual(b.full_pr_size(self.entries(5)), 2)
+
     def test_an_unreadable_measure_file_is_no_measure(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / gg.FULL_PR_SECS_FILE
@@ -52180,6 +52195,27 @@ class FullPrReadsSizedByMeasuredCost(unittest.TestCase):
             self.assertEqual(gg.load_full_pr_secs(path), {"e/f": 2.5})
             path.write_text("not json")
             self.assertEqual(gg.load_full_pr_secs(path), {})
+
+
+class WaitedPoolReadsOldestFirst(unittest.TestCase):
+    def test_the_first_chunk_holds_the_oldest_data(self):
+        d = gg.Daemon.__new__(gg.Daemon)
+        d.now, d.deferred_since = 10000.0, {}
+        d.oldest_waited_age = lambda waited: 9999.0
+        waited = [{"key": f"pr:o/r#{i}", "cache": {"dataAt": 9000.0 - i}} for i in range(1, 70)]
+        asked = []
+
+        def read_many(keys, budget):
+            asked.append(list(keys))
+            return {k: None for k in keys}
+        with mock.patch.object(gg, "land_direct_read_many", read_many), \
+                mock.patch.object(gg, "upstream_command", lambda: None):
+            futures, handed = d.start_waited_pool(waited)
+            for f in futures:
+                f.result(timeout=5)
+        self.assertEqual(len(handed), 69)
+        oldest = [f"pr:o/r#{i}" for i in range(69, 39, -1)]
+        self.assertIn(oldest, asked)  # the 30 oldest went together, first
 
 
 class HeadReadsSizedByMeasuredCost(unittest.TestCase):
