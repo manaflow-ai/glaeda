@@ -74,16 +74,25 @@ pub async fn run(args: &[String]) -> Result<std::process::ExitCode, Box<dyn std:
     let mut dir = None;
     let mut jobs = 32usize;
     let mut timeout = 150u64;
+    let mut mirror = Mirror::default();
     let mut rest = args[2..].iter();
     while let Some(a) = rest.next() {
+        if a == "--mirror" {
+            mirror.on = true;
+            continue;
+        }
         let v = rest.next().ok_or(USAGE)?;
         match a.as_str() {
             "--trusted-keys" => trusted = Some(sign::parse_trusted(v)?),
             "--store" => dir = Some(PathBuf::from(v)),
             "--jobs" => jobs = v.parse::<usize>()?.clamp(1, 256),
             "--timeout" => timeout = v.parse::<u64>()?.max(1),
+            "--also-marker" => mirror.also.push(v.clone()),
             _ => return Err(USAGE.into()),
         }
+    }
+    if !mirror.also.is_empty() && !mirror.on {
+        return Err("--also-marker needs --mirror".into());
     }
     let keys = trusted.ok_or("warm needs --trusted-keys")?;
     let dir = dir.ok_or("warm needs --store DIR (the node's store)")?;
@@ -91,7 +100,7 @@ pub async fn run(args: &[String]) -> Result<std::process::ExitCode, Box<dyn std:
     // One deadline for the whole warm: a stalled stream or a store that
     // accepts connections and never answers must not hold the build up.
     let limit = std::time::Duration::from_secs(timeout);
-    let result = match tokio::time::timeout(limit, warm(url, name, keys, dir, jobs)).await {
+    let result = match tokio::time::timeout(limit, warm(url, name, keys, dir, jobs, &mirror)).await {
         Ok(r) => r,
         Err(_) => Err(Failure::Incomplete(format!("not done after {timeout} s"))),
     };
@@ -112,6 +121,38 @@ pub async fn run(args: &[String]) -> Result<std::process::ExitCode, Box<dyn std:
     }
 }
 
+/// `--mirror`: warm a read-replica fleet store (a `fleet-cas tcp:` store
+/// directory) instead of a node store. Besides the entries and the objects
+/// they reach, the replica keeps the manifest object and the marker itself,
+/// so it answers `marker get` and `warm` for NAME the way the primary does;
+/// `--also-marker NAME` copies more markers (the writer's `REPO/latest/XCODE`)
+/// after everything else. Each is checked against the trusted keys first, and
+/// a reader checks it again, so a replica can serve only what the writer signed.
+#[derive(Default)]
+pub struct Mirror {
+    on: bool,
+    also: Vec<String>,
+}
+
+/// Write a verified marker into the replica, unless the same bytes are there
+/// already (an unchanged marker keeps its mtime, so gc still expires it N
+/// days after its fill, as on the primary).
+fn put_marker(store: &Store, key: &[u8], value: &kv::Value) -> std::io::Result<bool> {
+    let path = store.kv_path(key);
+    // Compare decoded: `entries` is a map, and its encoded order differs between processes.
+    let same = std::fs::read(&path)
+        .ok()
+        .and_then(|b| <kv::Value as prost::Message>::decode(b.as_slice()).ok())
+        .is_some_and(|old| old == *value);
+    if same {
+        return Ok(false);
+    }
+    let bytes = value.encode_to_vec();
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    write_atomic(&path, &bytes)?;
+    Ok(true)
+}
+
 /// Upper bound on what one warm writes: a full cmux fill is about 1.2 GB, and
 /// a store (or anyone on the plain-HTTP path) could stream objects nobody asked for.
 const MAX_WARM_BYTES: u64 = 16 << 30;
@@ -127,6 +168,7 @@ async fn warm(
     keys: Vec<ed25519_dalek::VerifyingKey>,
     dir: PathBuf,
     jobs: usize,
+    mirror: &Mirror,
 ) -> Result<Option<String>, Failure> {
     let ch = tonic::transport::Endpoint::from_shared(url.to_string())?
         .tcp_nodelay(true)
@@ -184,7 +226,7 @@ async fn warm(
         allow_file_paths: false,
         upstream: None,
         sign_key: None,
-        trusted: Some(keys),
+        trusted: Some(keys.clone()),
         strip_signatures: true,
         upstream_down_until: AtomicU64::new(0),
         reads_down_until: AtomicU64::new(0),
@@ -328,12 +370,34 @@ async fn warm(
             publish_new(&path, &value)?;
         }
     }
-    Ok(Some(format!(
+    let mut line = format!(
         "{} keys ({local} local, {written} fetched, {missing} missing), {} objects ({} bytes)",
         wanted.len(),
         objects.load(Relaxed),
         bytes.load(Relaxed)
-    )))
+    );
+    if !mirror.on {
+        return Ok(Some(line));
+    }
+
+    // 5. A replica: the manifest, then the marker that names it, then the
+    // extra markers. A marker reaches the replica only after everything it
+    // vouches for, the order the writer publishes in.
+    store.put(obj.references.clone(), blob_data(&obj).to_vec()).map_err(|e| e.message().to_string())?;
+    let mut copied = usize::from(put_marker(&store, &mkey, &marker)?);
+    for extra in &mirror.also {
+        let key = sign::marker_key(extra);
+        let resp = kv_client.clone().get_value(kv::GetValueRequest { key: key.clone() }).await?;
+        let Some(kv::get_value_response::Contents::Value(v)) = resp.into_inner().contents else {
+            continue;
+        };
+        if !sign::verify(&keys, &key, &v) {
+            return Err(Failure::Untrusted(format!("marker {extra} is not signed by a trusted key")));
+        }
+        copied += usize::from(put_marker(&store, &key, &v)?);
+    }
+    line.push_str(&format!(", mirror: {copied} markers written"));
+    Ok(Some(line))
 }
 
 #[cfg(test)]

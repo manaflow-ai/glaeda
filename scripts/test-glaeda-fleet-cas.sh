@@ -365,6 +365,55 @@ grep -q -- '--upstream http://127.0.0.1:7451' "$relay_root/node-plan"
 if env "${common_env[@]}" "$script" node --relay 172.20.21.158:7450 --store 100.89.140.13:7450 \
   >/dev/null 2>"$relay_root/both.err"; then exit 1; fi
 grep -q 'drop --store' "$relay_root/both.err"
+# --relay-fallback: each relay connection tries the primary, then the read standby.
+PATH="$stub_bin:$PATH" write_relay 172.20.21.158:7450 172.20.21.246:7450
+tr -d '\n' <"$plist" >"$relay_root/fallback.flat"
+grep -q '<string>/bin/sh</string> *<string>-c</string> *<string>/usr/bin/nc -z -G 1 172.20.21.158 7450 2&gt;/dev/null &amp;&amp; exec /usr/bin/nc -G 2 172.20.21.158 7450; exec /usr/bin/nc -G 2 172.20.21.246 7450</string> *</array>' "$relay_root/fallback.flat"
+# The command launchd runs (XML-decoded) is valid sh and reaches the standby when the primary is down.
+cmd=$(sed -n 's|.*<string>-c</string> *<string>\(.*\)</string> *</array>.*|\1|p' "$relay_root/fallback.flat" | sed -e 's/&gt;/>/g' -e 's/&amp;/\&/g')
+mkdir -p "$relay_root/ncbin"
+printf '#!/usr/bin/env bash\necho "nc $*" >>%q\n[ "$1" = -z ] && exit 1\nexit 0\n' "$relay_root/nc.calls" >"$relay_root/ncbin/nc"
+chmod +x "$relay_root/ncbin/nc"
+sh -c "${cmd//\/usr\/bin\/nc/$relay_root/ncbin/nc}"
+test "$(tail -1 "$relay_root/nc.calls")" = 'nc -G 2 172.20.21.246 7450'
+rm -f "$plist"
+env "${common_env[@]}" "$script" node --relay 172.20.21.158:7450 --relay-fallback 172.20.21.246:7450 --trusted-keys ab >"$relay_root/fb-plan"
+grep -q 'to /usr/bin/nc 172.20.21.158:7450, falling back to 172.20.21.246:7450' "$relay_root/fb-plan"
+grep -q -- '--upstream http://127.0.0.1:7451' "$relay_root/fb-plan"
+for bad in '--relay-fallback 172.20.21.246:7450' '--relay 172.20.21.158:7450 --relay-fallback 172.20.21.158:7450' \
+  '--relay 172.20.21.158:7450 --relay-fallback evil;rm:7450' '--relay 172.20.21.158:7450 --relay-fallback 172.20.21.246'; do
+  # shellcheck disable=SC2086
+  if env "${common_env[@]}" "$script" node $bad --trusted-keys ab >/dev/null 2>"$relay_root/fb-bad.err"; then exit 1; fi
+done
+
+# store --mirror: a read standby that takes no writes and pulls with the prewarm script's --mirror.
+eval "$(sed -n '/^PREWARM_LABEL=/,/^# The LAN relay/p' "$script" | sed '$d')"
+FLEET_STORE=$relay_root/fleet-store PATH="$stub_bin:$PATH" write_mirror cmux@catchup-v1
+mplist=$AGENTS/com.teamleaderleo.glaeda.fleet-cas-mirror.plist
+tr -d ' \n' <"$mplist" >"$relay_root/mirror.flat"
+grep -q "<string>com.teamleaderleo.glaeda.fleet-cas-mirror</string>" "$relay_root/mirror.flat"
+grep -q "<string>$BIN/fleet-cas-prewarm.sh</string><string>cmux@catchup-v1</string><string>--mirror</string></array>" "$relay_root/mirror.flat"
+grep -q "glaeda-fleet-cas-mirror.log" "$relay_root/mirror.flat"
+grep -q 'bootstrap com.teamleaderleo.glaeda.fleet-cas-mirror' "$temporary_root/launchctl.log"
+# The prewarm agent itself is unchanged: no --mirror, its own label.
+prewarm_plist cmux@catchup-v1 | tr -d ' \n' >"$relay_root/prewarm.flat"
+grep -q "<string>$PREWARM_LABEL</string>" "$relay_root/prewarm.flat"
+grep -q "<string>cmux@catchup-v1</string></array>" "$relay_root/prewarm.flat"
+FLEET_CAS_TEST_LAUNCHCTL_LOG="$temporary_root/launchctl.log" PATH="$stub_bin:$PATH" write_mirror ""
+test ! -e "$mplist"
+grep -q 'bootout gui/.*/com.teamleaderleo.glaeda.fleet-cas-mirror' "$temporary_root/launchctl.log"
+env "${common_env[@]}" FLEET_CAS_ROOT="$root" "$script" store --listen 172.20.21.246:7450 --mirror cmux@catchup-v1 --trusted-keys ab >"$relay_root/mirror-plan"
+grep -q 'mirror com.teamleaderleo.glaeda.fleet-cas-mirror: every 5 min' "$relay_root/mirror-plan"
+grep -q 'fleet-store --writers  --trusted-keys ab$' "$relay_root/mirror-plan"
+if env "${common_env[@]}" "$script" store --listen 172.20.21.246:7450 --mirror cmux@catchup-v1 --writers 172.20.21.202 --trusted-keys ab \
+  >/dev/null 2>"$relay_root/mirror-w.err"; then exit 1; fi
+grep -q 'takes no writes' "$relay_root/mirror-w.err"
+if env "${common_env[@]}" "$script" store --listen 172.20.21.246:7450 --mirror cmux@catchup-v1 \
+  >/dev/null 2>"$relay_root/mirror-k.err"; then exit 1; fi
+grep -q -- '--mirror needs --trusted-keys' "$relay_root/mirror-k.err"
+if env "${common_env[@]}" "$script" node --relay 172.20.21.158:7450 --mirror cmux@catchup-v1 \
+  >/dev/null 2>"$relay_root/mirror-n.err"; then exit 1; fi
+grep -q -- '--mirror is for the store role' "$relay_root/mirror-n.err"
 
 # Headless roles are system LaunchDaemons (UserName this user, HOME set), migrated from agents.
 # The store host's own gc: a custom store root only, its own label, the gc-only prune.

@@ -1535,10 +1535,13 @@ const USAGE: &str = "usage: fleet-cas <socket | tcp:ADDR> <store> [--read-only-k
                                     exit 0 and print the entries if the marker exists and verifies,
                                     1 if it is absent, 2 if it does not verify or on error
        fleet-cas warm http://HOST:PORT NAME --trusted-keys HEX,HEX --store DIR [--jobs N] [--timeout S]
+                      [--mirror [--also-marker NAME]...]
                                     copy every index entry the marker's manifest lists, and the
                                     objects they reach, into a node store (DIR) before a build:
                                     exit 0 when warmed, 1 if the marker is absent or has no
-                                    manifest, 2 if something does not verify, 3 if incomplete";
+                                    manifest, 2 if something does not verify, 3 if incomplete;
+                                    --mirror fills a read-replica store instead and also keeps
+                                    the manifest and the markers (NAME, then each --also-marker)";
 
 /// The marker entry naming the fill's manifest (see `warm.rs`).
 const MANIFEST_ENTRY: &str = "manifest";

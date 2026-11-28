@@ -152,6 +152,13 @@ Signed index entries (#1134 M3, `src/sign.rs`):
   host lock is free, so a build's own warm finds nearly everything local. Markers are the
   one kind of entry a newer signed write replaces. Nodes record use on local hits; pruning
   the node store stays with `glaeda-fleet-cas-prune`.
+- A read standby store (`glaeda-fleet-cas store --listen IP:7450 --mirror REPO --trusted-keys HEX`,
+  no writers) keeps a copy of the newest fill: `warm --mirror [--also-marker NAME]` writes into a
+  fleet store the entries with their signatures, the objects, the manifest and the markers, and
+  the 5-minute `fleet-cas-prewarm.sh REPO --mirror` agent runs it against the primary. Nodes reach
+  it through their relay's fallback (`--relay-fallback IP:7450`, rollout `--standby-lan IP`): each
+  relay connection tries the primary first. Readers verify every entry against the writer's key,
+  so a standby serves only what the writer signed.
   `up_prefetch_micros` and `up_slow_calls` (calls over 100 ms) in a node's stats separate
   a slow store from serial round trips.
 

@@ -5,7 +5,7 @@
 # deploy path so unit bytes and launchd state converge together.
 #
 #   glaeda-fleet-cas-rollout --store HOST [--trusted-keys HEX] [--writer HOST --sign-key PATH]
-#                            [--store-root PATH] [--store-image PATH] [--allow-coordinator] [--store-lan IP]
+#                            [--store-root PATH] [--store-image PATH] [--allow-coordinator] [--store-lan IP [--standby-lan IP]]
 #                            [--prewarm REPO] [--prebuilt-dir DIR] [--nodes-only] NODE_HOST... [--apply]
 #
 # Plans by default; --apply deploys. Planning checks local inputs and discovers tailnet
@@ -37,6 +37,9 @@
 # Local Network privacy lets through). The store's only allowed writer is then the writer's
 # LAN source address toward IP, read from the writer's route table. No tailnet ACL grant is
 # needed; it is the path for a store whose tailnet port no grant opens (cmux-lawrence).
+# With --standby-lan IP (a read standby's LAN address: `glaeda-fleet-cas store --mirror REPO` on that
+# host), every node's relay falls back to IP:7450 when the store does not answer
+# (glaeda-fleet-cas --relay-fallback). The standby itself is installed on its host, not here.
 # With --nodes-only, only the NODE_HOSTs are (re)installed: the store host is read for its
 # address and nothing on it, or on the writer, is redeployed. It is the path for adding a reader or
 # repairing one whose node points at a retired store, without re-running the stateless store install
@@ -48,7 +51,7 @@
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
 PORT=7450
-store= store_root= store_image= store_lan= nodes_only= apply= allow_coordinator= trusted= writer= sign_key= prewarm= prebuilt_dir= nodes=()
+store= store_root= store_image= store_lan= standby_lan= nodes_only= apply= allow_coordinator= trusted= writer= sign_key= prewarm= prebuilt_dir= nodes=()
 while [ $# -gt 0 ]; do
   case $1 in
     --store) store=${2:?}; shift ;;
@@ -56,6 +59,7 @@ while [ $# -gt 0 ]; do
     --store-image) store_image=${2:?}; shift ;;
     --allow-coordinator) allow_coordinator=1 ;;
     --store-lan) store_lan=${2:?}; shift ;;
+    --standby-lan) standby_lan=${2:?}; shift ;;
     --trusted-keys) trusted=${2:?}; shift ;;
     --writer) writer=${2:?}; shift ;;
     --sign-key) sign_key=${2:?}; shift ;;
@@ -85,6 +89,15 @@ case $store_lan in
     [[ $store_lan =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "--store-lan must be an IPv4 address" >&2; exit 2; } ;;
   *) echo "--store-lan must be a private (RFC 1918) LAN address, not $store_lan" >&2; exit 2 ;;
 esac
+if [ -n "$standby_lan" ]; then
+  [ -n "$store_lan" ] || { echo "--standby-lan needs --store-lan: the fallback is the relay's" >&2; exit 2; }
+  case $standby_lan in
+    10.*|192.168.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*)
+      [[ $standby_lan =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "--standby-lan must be an IPv4 address" >&2; exit 2; } ;;
+    *) echo "--standby-lan must be a private (RFC 1918) LAN address, not $standby_lan" >&2; exit 2 ;;
+  esac
+  [ "$standby_lan" != "$store_lan" ] || { echo "--standby-lan must differ from --store-lan" >&2; exit 2; }
+fi
 if [ -n "$store_image" ] && [ -z "$store_root" ]; then
   echo "--store-image requires --store-root" >&2; exit 2
 fi
@@ -193,6 +206,7 @@ if [ -n "$store_lan" ]; then
   ssh -o BatchMode=yes "$store" "ifconfig | awk '/inet $store_lan /' | grep -q ." \
     || { echo "$store has no address $store_lan" >&2; exit 1; }
   ip=$store_lan upstream=(--relay "$store_lan:$PORT")
+  [ -z "$standby_lan" ] || upstream+=(--relay-fallback "$standby_lan:$PORT")
   writer_ip=
   [ -z "$writer" ] || writer_ip=$(lan_source_ip "$writer" "$store_lan")
 else

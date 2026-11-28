@@ -132,4 +132,23 @@ if PATH="$temporary_root:$PATH" ROLLOUT_CALLS="$temporary_root/calls" \
 fi
 grep -q -- '--nodes-only needs at least one NODE_HOST' "$temporary_root/nodes-none.err"
 
+# --standby-lan: every relay falls back to the read standby (kernel row compiler-cas-store).
+PATH="$temporary_root:$PATH" ROLLOUT_CALLS="$temporary_root/calls" \
+  "$script" --store cmux-lawrence --store-lan 172.20.21.158 --standby-lan 172.20.21.246 --trusted-keys abc \
+  --nodes-only cmux17 >"$temporary_root/standby.out"
+grep -q 'glaeda-fleet-cas node --relay 172.20.21.158:7450 --relay-fallback 172.20.21.246:7450 --trusted-keys abc' "$temporary_root/standby.out"
+for bad in '--standby-lan 172.20.21.158' '--standby-lan 100.89.140.13'; do
+  # shellcheck disable=SC2086
+  if PATH="$temporary_root:$PATH" ROLLOUT_CALLS="$temporary_root/calls" \
+    "$script" --store cmux-lawrence --store-lan 172.20.21.158 $bad --nodes-only cmux17 \
+    >"$temporary_root/standby-bad.out" 2>"$temporary_root/standby-bad.err"; then
+    exit 1
+  fi
+done
+if PATH="$temporary_root:$PATH" ROLLOUT_CALLS="$temporary_root/calls" \
+  "$script" --store cmux8s --standby-lan 172.20.21.246 cmux9s >"$temporary_root/standby-nolan.out" 2>"$temporary_root/standby-nolan.err"; then
+  exit 1
+fi
+grep -q -- '--standby-lan needs --store-lan' "$temporary_root/standby-nolan.err"
+
 echo "glaeda-fleet-cas rollout guard tests passed"

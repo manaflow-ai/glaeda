@@ -1,9 +1,9 @@
 #!/bin/bash
 # glaeda-fleet-cas: install the fleet compilation-cache services on this cmux mini.
 #
-#   glaeda-fleet-cas node (--store HOST:PORT | --relay LAN_IP:PORT) [--trusted-keys HEX] [--prewarm REPO] [--apply]
+#   glaeda-fleet-cas node (--store HOST:PORT | --relay LAN_IP:PORT [--relay-fallback LAN_IP:PORT]) [--trusted-keys HEX] [--prewarm REPO] [--apply]
 #   glaeda-fleet-cas writer (--store HOST:PORT | --relay LAN_IP:PORT) --sign-key PATH --trusted-keys HEX [--apply]
-#   glaeda-fleet-cas store --listen IP:PORT [--writers IP,IP] [--trusted-keys HEX] [--apply]
+#   glaeda-fleet-cas store --listen IP:PORT [--writers IP,IP | --mirror REPO] [--trusted-keys HEX] [--apply]
 #   glaeda-fleet-cas refresh [--apply]                  rebuild and restart an installed node whose
 #                                                       binary is not this checkout's source (glaeda-update)
 #   glaeda-fleet-cas uninstall [node|store|all] [--apply]
@@ -45,6 +45,14 @@
 #         --trusted-keys only signed index entries are kept; no writers by default, so a new
 #         store is read-only. The listen address should be a DHCP reservation, or the store
 #         stops binding after a lease change.
+# standby: store --mirror REPO, a read standby for the primary store (kernel row compiler-cas-store).
+#         It takes no writes; the com.teamleaderleo.glaeda.fleet-cas-mirror agent runs
+#         `fleet-cas-prewarm.sh REPO --mirror` every 5 minutes, which copies the writer's newest fill,
+#         with its signed entries, manifest and markers, from the primary into this host's
+#         fleet-store. It pulls through this host's own node relay (the node role installed first,
+#         with --relay to the primary), so it needs no LAN path of its own. Readers verify every
+#         entry against the writer's key, so a standby can serve nothing the writer did not sign.
+#         The mini's hourly glaeda-fleet-cas-prune keeps its fleet-store inside the gc window.
 # relay:  --relay LAN_IP:PORT, for a store that only listens on the office LAN (the coordinator's,
 #         whose tailnet port no ACL grants). macOS Local Network privacy keeps launchd-started
 #         third-party binaries such as fleet-cas off the LAN (2026-10-30 on cmux14: fleet-cas and
@@ -59,6 +67,10 @@
 #         privacy is decided per responsible app in the GUI session and /usr/bin/nc passes there
 #         (measured, 2026-10-30 on cmux14). A system daemon is outside that session, and nobody
 #         has measured what the privacy check does to a daemon's nc, so it is not moved blind.
+#         --relay-fallback LAN_IP:PORT (a standby store, see standby:) makes each relay connection
+#         try the primary first (/usr/bin/nc -z -G 1) and, when it does not answer, go to the
+#         standby: /bin/sh -c '... && exec nc PRIMARY || exec nc STANDBY'. The node keeps its one
+#         upstream, 127.0.0.1:7451; a dead primary costs each new connection about a second.
 #         A store with a custom root (--store-root on the rollout) also gets
 #         com.teamleaderleo.glaeda.fleet-cas-store-gc: hourly `glaeda-fleet-cas-prune --apply
 #         --store-gc-only`, the daily fleet-cas gc of that store and nothing else (its own label,
@@ -92,13 +104,15 @@ if [ "$role" = uninstall ] && [ $# -gt 0 ]; then
     node|store|all) uninstall_scope=$1; shift ;;
   esac
 fi
-apply= store= relay= listen= writers= trusted= sign_key= prewarm= custom_store_volume_uuid=
+apply= store= relay= relay_fallback= listen= writers= trusted= sign_key= prewarm= mirror= custom_store_volume_uuid=
 RELAY_LISTEN=127.0.0.1:7451
 while [ $# -gt 0 ]; do
   case $1 in
     --apply) apply=1 ;;
     --store) store=${2:?--store HOST:PORT}; shift ;;
     --relay) relay=${2:?--relay LAN_IP:PORT}; shift ;;
+    --relay-fallback) relay_fallback=${2:?--relay-fallback LAN_IP:PORT}; shift ;;
+    --mirror) mirror=${2:?--mirror REPO}; shift ;;
     --listen) listen=${2:?--listen IP:PORT}; shift ;;
     --writers) writers=${2:?--writers IP,IP}; shift ;;
     --trusted-keys) trusted=${2:?--trusted-keys HEX,HEX}; shift ;;
@@ -336,14 +350,16 @@ plist_for() {  # role, label, daemon (sys: a headless role's, with HOME; 1: a ro
 # copies the writer's newest fill into the node store between builds. An agent is enough: it
 # reaches the store on its tailnet address, and it skips while any job holds the host lock.
 PREWARM_LABEL=com.teamleaderleo.glaeda.fleet-cas-prewarm
-prewarm_plist() {  # repo
-  local log=$LOGS/glaeda-fleet-cas-prewarm.log
+prewarm_plist() {  # repo, [label log extra-arg] (the mirror agent's)
+  local label=${2:-$PREWARM_LABEL} log=$LOGS/${3:-glaeda-fleet-cas-prewarm.log}
   printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
     '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
     '<plist version="1.0">' '<dict>' \
-    '    <key>Label</key>' "    <string>$PREWARM_LABEL</string>" \
+    '    <key>Label</key>' "    <string>$label</string>" \
     '    <key>ProgramArguments</key>' '    <array>' \
-    "        <string>$BIN/fleet-cas-prewarm.sh</string>" "        <string>$(xml "$1")</string>" '    </array>' \
+    "        <string>$BIN/fleet-cas-prewarm.sh</string>" "        <string>$(xml "$1")</string>"
+  [ -z "${4:-}" ] || printf '%s\n' "        <string>$4</string>"
+  printf '%s\n' '    </array>' \
     '    <key>StartInterval</key>' '    <integer>300</integer>' \
     '    <key>RunAtLoad</key>' '    <true/>' \
     '    <key>ProcessType</key>' '    <string>Background</string>' \
@@ -379,20 +395,57 @@ write_prewarm() {  # repo, or empty to remove
   fi
 }
 
+# A standby store's mirror (see standby: above): the prewarm script in --mirror mode, as its own
+# agent so a host can be both a reader node with a prewarm and a standby.
+MIRROR_LABEL=com.teamleaderleo.glaeda.fleet-cas-mirror
+mirror_plist() {  # repo
+  prewarm_plist "$1" "$MIRROR_LABEL" glaeda-fleet-cas-mirror.log --mirror
+}
+write_mirror() {  # repo, or empty to remove
+  local agent=$AGENTS/$MIRROR_LABEL.plist
+  if [ -z "$1" ]; then
+    [ -e "$agent" ] || return 0
+    say "remove $MIRROR_LABEL"
+    [ -z "$apply" ] || { launchctl bootout "gui/$(id -u)/$MIRROR_LABEL" 2>/dev/null || true; rm -f "$agent"; }
+    return 0
+  fi
+  say "mirror $MIRROR_LABEL: every 5 min, $BIN/fleet-cas-prewarm.sh $1 --mirror into $FLEET_STORE"
+  [ -n "$apply" ] || return 0
+  mkdir -p "$AGENTS" "$LOGS"
+  mirror_plist "$1" >"$agent.tmp"
+  plutil -lint -s "$agent.tmp"
+  if cmp -s "$agent.tmp" "$agent" && launchctl print "gui/$(id -u)/$MIRROR_LABEL" >/dev/null 2>&1; then
+    rm -f "$agent.tmp"
+  else
+    mv "$agent.tmp" "$agent"
+    bootstrap "gui/$(id -u)" "$MIRROR_LABEL" "$agent"
+  fi
+}
+check_lan_addr() {  # flag, IPv4:PORT
+  [[ $2 =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$ ]] || { echo "$1 takes IPv4:PORT, not $2" >&2; exit 2; }
+}
+
 # The LAN relay (see relay: above). launchd owns the 127.0.0.1 listener and starts one
 # /usr/bin/nc per connection (inetdCompatibility), so the only process that touches the LAN is
 # Apple's nc, which Local Network privacy lets through. -G 2 bounds a connect to a down store
 # below the node's own 2 s connect timeout plus its 10 s call timeout.
 RELAY_LABEL=com.teamleaderleo.glaeda.fleet-cas-relay
-relay_plist() {  # LAN_IP:PORT
+relay_plist() {  # LAN_IP:PORT, fallback LAN_IP:PORT or empty
   local log=$LOGS/glaeda-fleet-cas-relay.log
   printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
     '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
     '<plist version="1.0">' '<dict>' \
     '    <key>Label</key>' "    <string>$RELAY_LABEL</string>" \
-    '    <key>ProgramArguments</key>' '    <array>' \
-    '        <string>/usr/bin/nc</string>' '        <string>-G</string>' '        <string>2</string>' \
-    "        <string>$(xml "${1%:*}")</string>" "        <string>$(xml "${1##*:}")</string>" '    </array>' \
+    '    <key>ProgramArguments</key>' '    <array>'
+  if [ -n "${2:-}" ]; then
+    # Addresses are checked IPv4:PORT (check_lan_addr), so they are safe inside the sh string.
+    printf '%s\n' '        <string>/bin/sh</string>' '        <string>-c</string>' \
+      "        <string>/usr/bin/nc -z -G 1 ${1%:*} ${1##*:} 2&gt;/dev/null &amp;&amp; exec /usr/bin/nc -G 2 ${1%:*} ${1##*:}; exec /usr/bin/nc -G 2 ${2%:*} ${2##*:}</string>"
+  else
+    printf '%s\n' '        <string>/usr/bin/nc</string>' '        <string>-G</string>' '        <string>2</string>' \
+      "        <string>$(xml "${1%:*}")</string>" "        <string>$(xml "${1##*:}")</string>"
+  fi
+  printf '%s\n' '    </array>' \
     '    <key>inetdCompatibility</key>' '    <dict>' '        <key>Wait</key>' '        <false/>' '    </dict>' \
     '    <key>Sockets</key>' '    <dict>' '        <key>Listener</key>' '        <dict>' \
     '            <key>SockNodeName</key>' "            <string>${RELAY_LISTEN%:*}</string>" \
@@ -403,7 +456,7 @@ relay_plist() {  # LAN_IP:PORT
     '    <key>ProcessType</key>' '    <string>Interactive</string>' \
     '    <key>StandardErrorPath</key>' "    <string>$log</string>" '</dict>' '</plist>'
 }
-write_relay() {  # LAN_IP:PORT, or empty to remove
+write_relay() {  # LAN_IP:PORT, or empty to remove; fallback LAN_IP:PORT or empty
   local agent=$AGENTS/$RELAY_LABEL.plist
   if [ -z "$1" ]; then
     [ -e "$agent" ] || return 0
@@ -411,10 +464,10 @@ write_relay() {  # LAN_IP:PORT, or empty to remove
     [ -z "$apply" ] || { launchctl bootout "gui/$(id -u)/$RELAY_LABEL" 2>/dev/null || true; rm -f "$agent"; }
     return 0
   fi
-  say "relay $RELAY_LABEL: $RELAY_LISTEN to /usr/bin/nc $1"
+  say "relay $RELAY_LABEL: $RELAY_LISTEN to /usr/bin/nc $1${2:+, falling back to $2}"
   [ -n "$apply" ] || return 0
   mkdir -p "$AGENTS" "$LOGS"
-  relay_plist "$1" >"$agent.tmp"
+  relay_plist "$1" "${2:-}" >"$agent.tmp"
   plutil -lint -s "$agent.tmp"
   if cmp -s "$agent.tmp" "$agent" && launchctl print "gui/$(id -u)/$RELAY_LABEL" >/dev/null 2>&1; then
     rm -f "$agent.tmp"
@@ -678,6 +731,12 @@ check_key_args() {  # hex keys only: they end up in a plist and an env file
 
 case $role in
   node | writer)
+    [ -z "$mirror" ] || { echo "--mirror is for the store role" >&2; exit 2; }
+    if [ -n "$relay_fallback" ]; then
+      [ -n "$relay" ] || { echo "--relay-fallback needs --relay" >&2; exit 2; }
+      check_lan_addr --relay "$relay"; check_lan_addr --relay-fallback "$relay_fallback"
+      [ "$relay_fallback" != "$relay" ] || { echo "--relay-fallback must differ from --relay" >&2; exit 2; }
+    fi
     if [ -n "$relay" ]; then
       [ -z "$store" ] || [ "$store" = "$RELAY_LISTEN" ] || { echo "--relay sets the store to $RELAY_LISTEN; drop --store" >&2; exit 2; }
       store=$RELAY_LISTEN
@@ -709,7 +768,7 @@ case $role in
       case ,$trusted, in *,"$pub",*) ;; *) echo "the key at $sign_key ($pub) is not in --trusted-keys" >&2; exit 2 ;; esac
     fi
     do_ mkdir -p "$NODE_STORE"
-    write_relay "$relay"
+    write_relay "$relay" "$relay_fallback"
     if [ -n "$apply" ] && [ -n "$relay" ]; then
       check_relay "$relay" || exit 1
     fi
@@ -728,6 +787,17 @@ case $role in
     case $listen in 0.0.0.0:* | \[::\]:*) echo "refusing a wildcard listen address" >&2; exit 2 ;; esac
     check_key_args
     [ -z "$sign_key" ] || { echo "--sign-key is for the writer role" >&2; exit 2; }
+    [ -z "$relay$relay_fallback$prewarm" ] || { echo "--relay, --relay-fallback and --prewarm are for the node role" >&2; exit 2; }
+    if [ -n "$mirror" ]; then
+      [ -z "$writers" ] || { echo "a --mirror standby takes no writes; drop --writers" >&2; exit 2; }
+      [ -n "$trusted" ] || { echo "--mirror needs --trusted-keys: a standby keeps only the writer's signed entries" >&2; exit 2; }
+      if [ -n "$apply" ]; then
+        # The mirror pulls through this host's node relay, so the node role comes first.
+        mstore=$(sed -n 's/^FLEET_CAS_STORE=//p' "$ROOT/fleet-cas.env" 2>/dev/null | tail -1)
+        [ -n "$mstore" ] || { echo "--mirror needs this host's node role first (glaeda-fleet-cas node --relay PRIMARY:PORT): no $ROOT/fleet-cas.env" >&2; exit 2; }
+        [ "$mstore" != "$listen" ] || { echo "--mirror would pull from itself ($listen)" >&2; exit 2; }
+      fi
+    fi
     check_custom_store_root
     install_binaries
     do_ mkdir -p "$FLEET_STORE"
@@ -738,6 +808,7 @@ case $role in
       echo "ok store listening on $listen (writers: ${writers:-none}, signed entries only: $([ -n "$trusted" ] && echo yes || echo no))"
     fi
     write_store_prune
+    write_mirror "$mirror"
     ;;
   refresh)
     # glaeda-update's node rollout (its casNode step): bring the installed node (or writer) to this
@@ -794,6 +865,7 @@ case $role in
     fi
     ROOT_STEP_NEEDED=
     if [ "$uninstall_scope" = store ] || [ "$uninstall_scope" = all ]; then
+      write_mirror ""
       if [ -e "$AGENTS/$PRUNE_LABEL.plist" ] || [ -e "$LAUNCH_DAEMONS/$PRUNE_LABEL.plist" ]; then
         say "stop and remove $PRUNE_LABEL (the store host's gc: agent and daemon)"
         [ -z "$apply" ] || remove_service "$PRUNE_LABEL"

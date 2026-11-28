@@ -132,6 +132,62 @@ async fn writer_manifest_then_warm() {
     assert_eq!(rc, 0);
     assert!(out.contains("(2 local, 0 fetched") && out.contains(" 0 objects"), "{out}");
 
+    // A read replica (--mirror): a second store fills from the primary, and a
+    // reader that only reaches the replica gets the same signed answers.
+    let latest = "r/latest/x";
+    let (rc, _, err) = run(&["marker", "put", &url, latest, "--sign-key", &p("writer.key"), "--entry", "commit=c"]);
+    assert_eq!(rc, 0, "{err}");
+    let (rc, _, err) = run(&["warm", &url, "r/c/x", "--trusted-keys", &pubkey, "--store", &p("replica"), "--also-marker", latest]);
+    assert_ne!(rc, 0, "--also-marker without --mirror is refused: {err}");
+    let (rc, out, err) = run(&["warm", &url, "r/c/x", "--trusted-keys", &pubkey, "--store", &p("replica"), "--mirror", "--also-marker", latest, "--also-marker", "r/latest/absent"]);
+    assert_eq!(rc, 0, "{out}{err}");
+    assert!(out.contains("2 fetched") && out.contains("mirror: 2 markers written"), "{out}");
+    // Two entries and two markers; two objects and the manifest.
+    assert_eq!(count_files(&root.join("replica/kv")), 4);
+    assert_eq!(count_files(&root.join("replica/cas")), 3);
+    let (rc, out, _) = run(&["warm", &url, "r/c/x", "--trusted-keys", &pubkey, "--store", &p("replica"), "--mirror", "--also-marker", latest]);
+    assert_eq!(rc, 0);
+    assert!(out.contains("(2 local, 0 fetched") && out.contains("mirror: 0 markers written"), "{out}");
+    let rport = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let rurl = format!("http://127.0.0.1:{rport}");
+    // Read-only: no --writers, signed entries only.
+    let replica = Command::new(BIN)
+        .args([&format!("tcp:127.0.0.1:{rport}"), &p("replica"), "--trusted-keys", &pubkey])
+        .spawn()
+        .unwrap();
+    let _replica = Kill(vec![replica]);
+    wait_for("replica", || std::net::TcpStream::connect(("127.0.0.1", rport)).is_ok());
+    let (rc, out, err) = run(&["marker", "get", &rurl, latest, "--trusted-keys", &pubkey]);
+    assert_eq!(rc, 0, "{err}");
+    assert!(out.contains("commit=c"), "{out}");
+    let (rc, out, err) = run(&["warm", &rurl, "r/c/x", "--trusted-keys", &pubkey, "--store", &p("from-replica")]);
+    assert_eq!(rc, 0, "{out}{err}");
+    assert!(out.contains("2 keys (0 local, 2 fetched, 0 missing), 2 objects"), "{out}");
+    // A node whose only store is the replica answers the build's lookups.
+    let rsock = PathBuf::from(p("r.sock"));
+    let rnode = Command::new(BIN)
+        .args([rsock.to_str().unwrap(), &p("rnode"), "--read-only-kv", "--trusted-keys", &pubkey, "--upstream", &rurl])
+        .spawn()
+        .unwrap();
+    let _rnode = Kill(vec![rnode]);
+    wait_for("replica node socket", || rsock.exists());
+    let rch = Endpoint::try_from("http://node")
+        .unwrap()
+        .connect_with_connector(tower::service_fn(move |_| {
+            let sock = rsock.clone();
+            async move { Ok::<_, std::io::Error>(TokioIo::new(tokio::net::UnixStream::connect(sock).await?)) }
+        }))
+        .await
+        .unwrap();
+    let mut rk = kv::key_value_db_client::KeyValueDbClient::new(rch);
+    let got = rk.get_value(kv::GetValueRequest { key: b"key-two".to_vec() }).await.unwrap().into_inner();
+    assert!(matches!(got.contents, Some(kv::get_value_response::Contents::Value(_))), "{got:?}");
+    // The replica refuses writes, from anyone.
+    let mut v = kv::Value::default();
+    v.entries.insert("out".into(), b"poison".to_vec());
+    let mut direct = kv::key_value_db_client::KeyValueDbClient::connect(rurl.clone()).await.unwrap();
+    let r = direct.put_value(kv::PutValueRequest { key: b"key-three".to_vec(), value: Some(v) }).await;
+    assert!(r.is_err() || r.unwrap().into_inner().error.is_some());
     // An untrusted key: nothing is copied from the marker it cannot verify.
     let other = "00".repeat(32);
     let (rc, _, _) = run(&["warm", &url, "r/c/x", "--trusted-keys", &other, "--store", &p("reader2")]);
