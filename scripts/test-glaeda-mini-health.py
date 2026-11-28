@@ -705,6 +705,31 @@ class DiskAndLeaks(Base):
                 config.write_text(json.dumps(doc))
                 self.assertEqual(health.Mini(home).git_mirror() is not None, on, doc)
 
+    def test_a_mirror_redirect_to_a_dead_loopback_port_is_a_finding(self) -> None:
+        # cmux21, 2026-11-27: url.http://127.0.0.1:18433/....insteadOf outlived its ssh -R forward
+        base = "http://127.0.0.1:18433/manaflow-ai/cmux.git"
+        self.mini.mirror_facts = {"record": {"time": self.stamp(NOW - 60), "fetched_at": self.stamp(NOW - 60),
+                                             "fetch": {"ok": True}, "state": "applied"}, "running": False,
+                                  "dead_redirects": [base]}
+        report = self.run_once()
+        self.assertEqual(self.ids(report), ["git_mirror_dead_redirect"])
+        f = report["findings"][0]
+        self.assertIn(base, f["evidence"])
+        self.assertEqual((f["severity"], f["auto_fix"]), ("warn", "impossible"))
+
+    def test_dead_loopback_redirects_reads_only_loopback_rules_nothing_answers(self) -> None:
+        git_dir = self.dir / "cmux.git"
+        subprocess.run(["git", "init", "-q", "--bare", os.fspath(git_dir)], check=True)
+        for base in ("http://127.0.0.1:18433/manaflow-ai/cmux.git", "http://127.0.0.1:18432/manaflow-ai/cmux.git",
+                     "https://mirror.example/manaflow-ai/cmux.git"):
+            subprocess.run(["git", "--git-dir", os.fspath(git_dir), "config", "--local",
+                            f"url.{base}.insteadOf", "https://github.com/manaflow-ai/cmux.git"], check=True)
+        asked: list[tuple[str, int]] = []
+        dead = health.dead_loopback_redirects(git_dir, refuses=lambda h, p: asked.append((h, p)) or p == 18433)
+        self.assertEqual(dead, ["http://127.0.0.1:18433/manaflow-ai/cmux.git"])
+        self.assertEqual(sorted(asked), [("127.0.0.1", 18432), ("127.0.0.1", 18433)])
+        self.assertEqual(health.dead_loopback_redirects(self.dir / "missing.git"), [])
+
     def test_a_runner_mirror_with_no_record_is_a_finding(self) -> None:
         self.mini.mirror_facts = {"record": {}, "running": False}
         f = self.run_once()["findings"][0]
