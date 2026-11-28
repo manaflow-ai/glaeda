@@ -1,0 +1,219 @@
+{
+  "_about": "The files each of the slowest script suites reads. A pull request that changes none of a suite's files, and nothing outside scripts/, config/, docs/, Markdown and the other workflows, skips it in the scripts job (scripts/ci_suite_scope.py). Read from strace -f of each suite (the tracked files it opens, executes or stats), plus the test file's own scripts/, config/ and docs/ paths and every listed module's imports, which scripts/test-ci-suite-inputs.py keeps listed; a suite that loads glaeda-gh or the runner also lists what glaeda-gh-tests or runner-tests read. Unlisted suites and pushes to main always run.",
+  "suites": {
+    "scripts/test-glaeda-promotion-admit.py": {
+      "inputs": [
+        "config/disk-registry.toml",
+        "config/runner-gate.json",
+        "scripts/cmux_fleet.py",
+        "scripts/cmux_fleet_bootstrap.py",
+        "scripts/glaeda-cmux-runner",
+        "scripts/glaeda-cmux-runner-fleet",
+        "scripts/glaeda-cmux-runner-hook",
+        "scripts/glaeda-disk",
+        "scripts/glaeda-job-needs.json",
+        "scripts/glaeda-mini-setup",
+        "scripts/glaeda-promotion-admit",
+        "scripts/glaeda-runner-daemon-root",
+        "scripts/glaeda-runner-job-disk.json",
+        "scripts/glaeda-update",
+        "scripts/glaeda_fleet_labels.py",
+        "scripts/glaeda_hook_pin.py",
+        "scripts/glaeda_reservation.py",
+        "scripts/test-glaeda-promotion-admit.py"
+      ]
+    },
+    "scripts/test-glaeda-mini-fleet.py": {
+      "inputs": [
+        "glaeda",
+        "scripts/cmux_fleet.py",
+        "scripts/cmux_fleet_bootstrap.py",
+        "scripts/cmux_mini_probe.sh",
+        "scripts/glaeda-mini-bringup",
+        "scripts/glaeda-mini-enroll",
+        "scripts/glaeda-mini-fleet",
+        "scripts/glaeda-mini-setup",
+        "scripts/test-glaeda-mini-fleet.py"
+      ]
+    },
+    "scripts/test-glaeda-lan-fetch.py": {
+      "inputs": [
+        "scripts/glaeda-lan-fetch",
+        "scripts/glaeda-seed-serve",
+        "scripts/test-glaeda-lan-fetch.py"
+      ]
+    },
+    "scripts/test-glaeda-capture-admit.py": {
+      "inputs": [
+        "config/disk-registry.toml",
+        "config/runner-gate.json",
+        "scripts/cmux_fleet.py",
+        "scripts/cmux_fleet_bootstrap.py",
+        "scripts/glaeda-capture-admit",
+        "scripts/glaeda-cmux-runner",
+        "scripts/glaeda-cmux-runner-fleet",
+        "scripts/glaeda-cmux-runner-hook",
+        "scripts/glaeda-disk",
+        "scripts/glaeda-job-needs.json",
+        "scripts/glaeda-mini-setup",
+        "scripts/glaeda-runner-daemon-root",
+        "scripts/glaeda-runner-job-disk.json",
+        "scripts/glaeda-update",
+        "scripts/glaeda_fleet_labels.py",
+        "scripts/glaeda_hook_pin.py",
+        "scripts/glaeda_reservation.py",
+        "scripts/test-glaeda-capture-admit.py",
+        "scripts/test-glaeda-promotion-admit.py"
+      ]
+    },
+    "scripts/test-glaeda-disk.py": {
+      "inputs": [
+        "config/disk-registry.toml",
+        "config/runner-gate.json",
+        "scripts/cmux_fleet.py",
+        "scripts/cmux_fleet_bootstrap.py",
+        "scripts/glaeda-cmux-runner",
+        "scripts/glaeda-cmux-runner-fleet",
+        "scripts/glaeda-cmux-runner-hook",
+        "scripts/glaeda-disk",
+        "scripts/glaeda-job-needs.json",
+        "scripts/glaeda-mini-setup",
+        "scripts/glaeda-runner-daemon-root",
+        "scripts/glaeda-runner-job-disk.json",
+        "scripts/glaeda-update",
+        "scripts/glaeda_fleet_labels.py",
+        "scripts/glaeda_hook_pin.py",
+        "scripts/glaeda_reservation.py",
+        "scripts/test-glaeda-disk.py"
+      ]
+    },
+    "scripts/test-glaeda-cmux-runner-fleet.py": {
+      "inputs": [
+        "config/disk-registry.toml",
+        "config/runner-gate.json",
+        "scripts/cmux_fleet.py",
+        "scripts/cmux_fleet_bootstrap.py",
+        "scripts/glaeda-cmux-runner",
+        "scripts/glaeda-cmux-runner-fleet",
+        "scripts/glaeda-cmux-runner-hook",
+        "scripts/glaeda-disk",
+        "scripts/glaeda-job-needs.json",
+        "scripts/glaeda-mini-setup",
+        "scripts/glaeda-promotion-admit",
+        "scripts/glaeda-runner-daemon-root",
+        "scripts/glaeda-runner-job-disk.json",
+        "scripts/glaeda-update",
+        "scripts/glaeda_fleet_labels.py",
+        "scripts/glaeda_hook_pin.py",
+        "scripts/glaeda_reservation.py",
+        "scripts/test-glaeda-cmux-runner-fleet.py"
+      ]
+    },
+    "scripts/test-glaeda-update.py": {
+      "inputs": [
+        "config/disk-registry.toml",
+        "config/gh-daemon.json",
+        "config/runner-gate.json",
+        "docs/GLAEDA_OTA.md",
+        "scripts/benchmark-land-forward.py",
+        "scripts/cmux_fleet.py",
+        "scripts/cmux_fleet_bootstrap.py",
+        "scripts/glaeda-cmux-runner",
+        "scripts/glaeda-cmux-runner-fleet",
+        "scripts/glaeda-cmux-runner-hook",
+        "scripts/glaeda-disk",
+        "scripts/glaeda-gh",
+        "scripts/glaeda-job-needs.json",
+        "scripts/glaeda-mini-health",
+        "scripts/glaeda-mini-setup",
+        "scripts/glaeda-promotion-admit",
+        "scripts/glaeda-runner-daemon-root",
+        "scripts/glaeda-runner-job-disk.json",
+        "scripts/glaeda-update",
+        "scripts/glaeda_fleet_labels.py",
+        "scripts/glaeda_hook_pin.py",
+        "scripts/glaeda_release.py",
+        "scripts/glaeda_reservation.py",
+        "scripts/intent.py",
+        "scripts/intent_aliases.json",
+        "scripts/test-glaeda-update.py"
+      ]
+    },
+    "scripts/test-glaeda-seed-lan.py": {
+      "inputs": [
+        "glaeda",
+        "scripts/glaeda-lan-fetch",
+        "scripts/glaeda-seed-lan",
+        "scripts/glaeda-seed-prefetch",
+        "scripts/glaeda-seed-serve",
+        "scripts/test-glaeda-seed-lan.py"
+      ]
+    },
+    "scripts/test-glaeda-seed-prefetch.py": {
+      "inputs": [
+        "scripts/glaeda-seed-prefetch",
+        "scripts/glaeda-seed-serve",
+        "scripts/test-glaeda-seed-prefetch.py"
+      ]
+    },
+    "scripts/test-glaeda-git-mirror.py": {
+      "inputs": [
+        "scripts/glaeda-git-mirror",
+        "scripts/test-glaeda-git-mirror.py"
+      ]
+    },
+    "scripts/test-glaeda-mini-setup.py": {
+      "inputs": [
+        "config/gh-daemon.json",
+        "scripts/benchmark-land-forward.py",
+        "scripts/cmux_fleet_bootstrap.py",
+        "scripts/disk-pressure.sh",
+        "scripts/glaeda-disk",
+        "scripts/glaeda-disk-registry",
+        "scripts/glaeda-gh",
+        "scripts/glaeda-idle-repair",
+        "scripts/glaeda-idle-warm",
+        "scripts/glaeda-lan-fetch",
+        "scripts/glaeda-mini-health",
+        "scripts/glaeda-mini-setup",
+        "scripts/glaeda-seed-lan",
+        "scripts/intent.py",
+        "scripts/intent_aliases.json",
+        "scripts/test-glaeda-mini-setup.py"
+      ]
+    },
+    "scripts/test-glaeda-runner-hook-lag.py": {
+      "inputs": [
+        "config/disk-registry.toml",
+        "config/runner-gate.json",
+        "scripts/cmux_fleet.py",
+        "scripts/cmux_fleet_bootstrap.py",
+        "scripts/glaeda-cmux-runner",
+        "scripts/glaeda-cmux-runner-fleet",
+        "scripts/glaeda-cmux-runner-hook",
+        "scripts/glaeda-disk",
+        "scripts/glaeda-job-needs.json",
+        "scripts/glaeda-mini-setup",
+        "scripts/glaeda-runner-daemon-root",
+        "scripts/glaeda-runner-hook-lag",
+        "scripts/glaeda-runner-job-disk.json",
+        "scripts/glaeda-update",
+        "scripts/glaeda_fleet_labels.py",
+        "scripts/glaeda_hook_pin.py",
+        "scripts/glaeda_release.py",
+        "scripts/glaeda_reservation.py",
+        "scripts/test-glaeda-runner-hook-lag.py"
+      ]
+    },
+    "scripts/test-glaeda-gh-edge.py": {
+      "inputs": [
+        "config/gh-daemon.json",
+        "scripts/benchmark-land-forward.py",
+        "scripts/glaeda-gh",
+        "scripts/intent.py",
+        "scripts/intent_aliases.json",
+        "scripts/test-glaeda-gh-edge.py"
+      ]
+    }
+  }
+}

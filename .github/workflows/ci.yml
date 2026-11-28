@@ -206,6 +206,8 @@ jobs:
         run: python3 scripts/glaeda-cmux-tour-floor-check
 
       - name: Validate and test scripts
+        env:
+          EVENT: ${{ github.event_name }}
         run: |
           python3 scripts/gh_auth_token_lint.py
           python3 - <<'PY'
@@ -402,10 +404,25 @@ jobs:
           # step ends red with a verdict. The bound is about 3x the slowest healthy suite
           # (test-glaeda-promotion-admit, 98 s of the step's 499 s).
           suite_seconds=${GLAEDA_SUITE_TIMEOUT_SECONDS:-300}
+          # The slowest suites (about 420 s of the step's 490 s) read a few files each, listed in
+          # scripts/ci-suite-inputs.json. A pull request that changes none of a listed suite's files, and nothing a
+          # suite could read without listing it (src/, tools/, ci.yml, the list), skips that suite and says so.
+          # Unlisted suites and pushes to main run everything.
+          scope_skip=""
+          if [ "$EVENT" = pull_request ]; then
+            git diff --no-renames --name-only HEAD^1 HEAD > "$RUNNER_TEMP/suite-scope-changed"
+            scope_skip=$(python3 scripts/ci_suite_scope.py "$RUNNER_TEMP/suite-scope-changed")
+          fi
+          skipped=()
           # A python unittest suite is green only when its output ends with its own verdict: the last `Ran N tests`
           # line (N > 0) followed by OK. Since glaeda#2376 a real os.execve in scripts/test-glaeda-gh.py replaced the
           # test process with a stand-in that exits 0 at about test 298 of 2261: no verdict, and the step read green.
           suite() {
+            if [ -n "$scope_skip" ] && grep -qxF -- "${*: -1}" <<<"$scope_skip"; then
+              echo "suite skipped: this change touches none of its files in scripts/ci-suite-inputs.json: $*"
+              skipped+=("$*")
+              return 0
+            fi
             echo "::group::$*"
             local start=$SECONDS rc=0 out rcf
             out=$(mktemp) rcf=$(mktemp)
@@ -486,6 +503,7 @@ jobs:
           suite python3 scripts/test-delivery-concurrency.py
           suite python3 scripts/test-workflow-job-bounds.py
           suite python3 scripts/test-ci-suite-bound.py
+          suite python3 scripts/test-ci-suite-inputs.py
           suite python3 scripts/test-hot-pressure-shadow.py
           suite python3 scripts/test-hot-run.py
           suite python3 scripts/test-verify-focused.py
@@ -533,6 +551,10 @@ jobs:
             echo "### Script suites: ${#failed[@]} failed"
             for f in "${failed[@]}"; do echo "- \`$f\`"; done
             # Which suites own the step's wall clock, so the next read of a slow step needs no log archaeology.
+            if [ "${#skipped[@]}" -gt 0 ]; then
+              echo "### ${#skipped[@]} suites skipped: the change touches none of their inputs"
+              for s in "${skipped[@]}"; do echo "- \`$s\`"; done
+            fi
             echo "### Slowest suites of ${#timings[@]}, each bounded at ${suite_seconds}s"
             printf '%s\n' "${timings[@]}" | sort -rn | head -10 |
               while read -r took name; do echo "- ${took}s \`$name\`"; done
