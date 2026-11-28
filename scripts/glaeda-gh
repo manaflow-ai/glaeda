@@ -18588,7 +18588,8 @@ LAND_KINDS = frozenset({"merge", "update_branch", "wait_pr", "wait_run", "wait_c
 # on it as a command, and a person or agent ran it and landed again (cmux#57574 and #56907, 2026-11-26). Now the queue
 # sends it itself, in the background (`--background`: the controller queues it and the client returns), for the
 # judged head only, and waits LAND_COMPILE_WAIT before judging again; a head still missing its compile after that is
-# sent once more with `--urgent` (the controller moves a queued check ahead), and past LAND_COMPILE_SENDS sends it
+# sent once more with `--urgent` in place of `--background` (the controller moves a queued check ahead; the client
+# refuses the two together, which stopped cmux#61298 on 2026-11-27), and past LAND_COMPILE_SENDS sends it
 # stops as before, naming the command. Only that exact command, for a compile_missing answer at the judged head.
 LAND_COMMAND_COMPILE = re.compile(r"\s*cmux-ci compile-check --ref ([0-9a-f]{40}) --app --release\s*")
 LAND_COMPILE_WAIT = 600.0
@@ -27712,8 +27713,8 @@ class LandQueue:
                           f"verdict: {land_reason(answer.get('reason'))}", land_trim(answer.get("next")))
             return
         argv = [self.path("cmuxCi", Path(shutil.which("cmux-ci") or "cmux-ci")).as_posix(), "compile-check",
-                "--ref", head, "--app", "--release", "--background",
-                "--reason", f"glaeda land {e['repo']}#{e['number']}"] + (["--urgent"] if n else [])
+                "--ref", head, "--app", "--release", "--urgent" if n else "--background",
+                "--reason", f"glaeda land {e['repo']}#{e['number']}"]
         with self.lock:
             self.claim(e, "compile_check", head=head, n=n + 1)
             e["compileSent"] = {"head": head, "n": n + 1, "at": self.now}

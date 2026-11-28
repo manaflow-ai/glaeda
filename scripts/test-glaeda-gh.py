@@ -29998,7 +29998,10 @@ class LandTest(Base):
             e = self.tick(gg.LAND_COMPILE_WAIT / 4 + 1)
             if len(self.compiles()) > 1:
                 break
-        self.assertEqual(self.compiles()[1][-1], "--urgent")
+        # --urgent replaces --background: the client refuses both (cmux#61298, 2026-11-27: stopped compile_missing, exit 2)
+        self.assertEqual(self.compiles()[1], ["compile-check", "--ref", LA, "--app", "--release", "--urgent",
+                                              "--reason", "glaeda land o/r#1"])
+        self.assertNotIn("--background", self.compiles()[1])
         self.assertEqual((e["state"], e["wait"]["kind"]), ("waiting", "retry"))
         # still missing after both sends: it stops as compile_missing, naming the check
         self.w.answers.append(self.compile_refusal(LA))
