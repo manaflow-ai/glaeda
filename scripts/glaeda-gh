@@ -686,6 +686,14 @@ HEADS_MIN_SHARE = 20
 WAITED_POOL_MIN = 12
 WAITED_POOL_WORKERS = 3
 WAITED_POOL_CHUNK = 30
+# ... and a repository whose full reads are slow gets smaller chunks in more workers, so each worker's chunk fits its
+# WAITED_POOL_BUDGET at the measured seconds a PR (full_pr_secs, WAITED_POOL_FILL of the budget), within the same bound of
+# PRs in flight (WAITED_POOL_WORKERS * WAITED_POOL_CHUNK) and at most WAITED_POOL_WORKERS_MAX workers. cmux-cp-2,
+# 2026-11-28 04:0xZ: ~70 waited cmux PRs at 2.7 s a full read went to 3 workers of 30, 30 and 10; each worker's 50 s held
+# ~18 full reads, so 21 to 26 a pool were read, the rest deferred by "the tick's time (TICK_BUDGET) ran out", and the
+# oldest waited PR's data stayed 3,000 to 4,000 s old.
+WAITED_POOL_WORKERS_MAX = 8
+WAITED_POOL_FILL = 0.7
 WAITED_POOL_BUDGET = 50.0
 # ... and only once the serial reads fall behind: the oldest waited PR's data past WAITED_POOL_STALE_S (half the stale
 # bound, so the pool starts before NOW's red at STALE_DATA_AFTER and stops once the serial reads keep up again). cmux-cp-2,
@@ -10208,17 +10216,37 @@ class Daemon:
             at = (e.get("cache") or {}).get("dataAt")
             return float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else 0.0
 
-        for group in sorted(by_repo.values(), key=len, reverse=True):
+        for repo, group in sorted(by_repo.items(), key=lambda kv: len(kv[1]), reverse=True):
             group.sort(key=data_at)  # the oldest data of a repository in the first chunk, not whichever came first
-            for i in range(0, len(group), WAITED_POOL_CHUNK):
-                chunks.append(group[i:i + WAITED_POOL_CHUNK])
+            size = self.waited_pool_chunk(repo)
+            for i in range(0, len(group), size):
+                chunks.append(group[i:i + size])
         chunks.sort(key=lambda g: (min(data_at(e) for e in g),
                                    min(self.deferred_since.get(e["key"], self.now) for e in g)))
-        chunks = chunks[:WAITED_POOL_WORKERS]
+        # the same PRs in flight as WAITED_POOL_WORKERS full chunks, in as many workers as their cost needs
+        cap, taken, picked = WAITED_POOL_WORKERS * WAITED_POOL_CHUNK, 0, []
+        for g in chunks:
+            if len(picked) >= max(WAITED_POOL_WORKERS, WAITED_POOL_WORKERS_MAX) or (picked and taken + len(g) > cap):
+                break
+            picked.append(g)
+            taken += len(g)
+        chunks = picked
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(chunks), thread_name_prefix="waited-pr")
         futures = [pool.submit(land_direct_read_many, [e["key"] for e in g], WAITED_POOL_BUDGET) for g in chunks]
         pool.shutdown(wait=False)
         return futures, [e for g in chunks for e in g]
+
+    def waited_pool_chunk(self, repo: str) -> int:
+        """How many of REPO's waited PRs one pool worker takes: WAITED_POOL_CHUNK, or fewer when the repository's measured
+        seconds a full read (full_pr_secs, or a cut query's hold while it lasts) would not fit WAITED_POOL_FILL of the
+        worker's WAITED_POOL_BUDGET."""
+        secs = (self.__dict__.get("full_pr_secs") or {}).get(repo)
+        hold = (self.__dict__.get("full_pr_secs_held") or {}).get(repo)
+        if hold is not None and self.now - hold[1] < MEASURE_HOLD_S:
+            secs = max(secs or 0.0, hold[0])
+        if not secs:
+            return WAITED_POOL_CHUNK
+        return max(1, min(WAITED_POOL_CHUNK, int(WAITED_POOL_BUDGET * WAITED_POOL_FILL / secs)))
 
     def finish_waited_pool(self, futures: list[concurrent.futures.Future], handed: list[dict]) -> None:
         """Wait for the workers (their own budget bounds them), then put back for the serial read any entry one could not

@@ -52341,6 +52341,45 @@ class WaitedPoolReadsOldestFirst(unittest.TestCase):
         self.assertIn(oldest, asked)  # the 30 oldest went together, first
 
 
+    def test_slow_full_reads_spread_over_more_workers_before_and_after(self):
+        """cmux-cp-2, 2026-11-28 04:0xZ: 70 waited cmux PRs at 2.7 s a full read. A worker's WAITED_POOL_BUDGET (50 s)
+        holds floor(50 / 5.4) queries of 2, so 18 PRs. Before: 3 workers of 30, 30, 10 read 18 + 18 + 10 = 46 at best (the
+        pool logged 21-26). After: chunks sized to the measure, 6 workers of 12 (or fewer), every one read in budget."""
+        per = 2.7
+        waited = [{"key": f"pr:manaflow-ai/cmux#{i}", "cache": {"dataAt": 9000.0 - i}} for i in range(1, 71)]
+
+        def run(measure):
+            d = gg.Daemon.__new__(gg.Daemon)
+            d.now, d.deferred_since = 10000.0, {}
+            d.oldest_waited_age = lambda waited: 9999.0
+            if measure:
+                d.full_pr_secs = {"manaflow-ai/cmux": per}
+            sizes = []
+
+            def read_many(keys, budget):  # queries of 2 full reads, serial, cut by the worker's budget
+                sizes.append(len(keys))
+                fits = int(budget // (2 * per)) * 2
+                return {k: (None if i < fits else "not read: deferred, the tick's time ran out") for i, k in enumerate(keys)}
+            with mock.patch.object(gg, "land_direct_read_many", read_many), \
+                    mock.patch.object(gg, "upstream_command", lambda: None):
+                futures, handed = d.start_waited_pool(waited)
+                done = {}
+                for f in futures:
+                    done.update(f.result(timeout=5))
+            return sorted(sizes, reverse=True), sum(1 for v in done.values() if v is None)
+        self.assertEqual(run(False), ([30, 30, 10], 46))  # before: no measure, the fixed chunk
+        sizes, read = run(True)
+        self.assertEqual(sizes, [12, 12, 12, 12, 12, 10])  # 50 * 0.7 / 2.7 = 12 a worker, 6 workers
+        self.assertEqual(read, 70)
+
+    def test_a_fast_repo_keeps_the_fixed_chunk_and_the_in_flight_bound(self):
+        d = gg.Daemon.__new__(gg.Daemon)
+        d.now, d.full_pr_secs = 10000.0, {"o/r": 0.5, "o/slow": 10.0}
+        self.assertEqual(d.waited_pool_chunk("o/r"), gg.WAITED_POOL_CHUNK)
+        self.assertEqual(d.waited_pool_chunk("o/slow"), 3)
+        self.assertEqual(d.waited_pool_chunk("o/unmeasured"), gg.WAITED_POOL_CHUNK)
+
+
 class SuitesPastOnePagePaged(unittest.TestCase):
     """cmux#62623, 2026-11-28: a head with more than 100 check suites stayed partial ("more than 100 check suites"),
     so its land verdict ran out its merge-check deadline. The later pages are read by cursor and appended."""
