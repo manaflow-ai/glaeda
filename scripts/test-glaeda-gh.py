@@ -53339,5 +53339,86 @@ class RollupHeadPartsTest(unittest.TestCase):
             self.assertIsNone(gg.rollup_head_parts(doc, self.SHA, "/repos/o/r"))
 
 
+class WatchFeedTest(Base):
+    """`glaeda-gh watch`: a store that moves a PR's state, CI or review appends one versioned line; a watch --since V
+    answers the lines after V, blocks on the local file until there is one, and reads nothing from GitHub."""
+
+    KEY = "pr:o/r#41"
+
+    def data(self, state: str = "OPEN", checks: list | None = None, review: str | None = None,
+             head: str = "a" * 40, merge: str | None = None) -> dict:
+        return {"headRefOid": head, "state": state, "merged": state == "MERGED", "mergeCommit": {"oid": merge},
+                "isDraft": False, "mergeable": "MERGEABLE", "checkState": None, "reviewDecision": review,
+                "checks": checks or []}
+
+    def test_a_store_that_moves_appends_versioned_events_by_kind(self) -> None:
+        self.daemon.store(self.KEY, None, data=self.data(), dataAt=NOW)
+        first = gg.feed_version()
+        self.assertEqual(first, 3)  # first sighting: every kind, versions 1..3
+        self.daemon.store(self.KEY, None, data=self.data(), dataAt=NOW)
+        self.assertEqual(gg.feed_version(), first, "an unchanged read writes nothing")
+        red = [{"name": "ws-check", "status": "COMPLETED", "conclusion": "FAILURE"}]
+        self.daemon.store(self.KEY, None, data=self.data(checks=red), dataAt=NOW)
+        events, newest, gap = gg.feed_read(first, {self.KEY})
+        self.assertEqual([e["kind"] for e in events], ["ci_status"])
+        self.assertEqual(events[0]["now"]["red"], ["ws-check"])
+        self.assertFalse(gap)
+        self.daemon.store(self.KEY, None, data=self.data("MERGED", red, "APPROVED", merge="c" * 40), dataAt=NOW)
+        events, newest, _ = gg.feed_read(first + 1, None)
+        self.assertEqual(sorted(e["kind"] for e in events), ["pr_state", "review"])
+        self.assertEqual(newest, first + 3)
+        merged = next(e for e in events if e["kind"] == "pr_state")
+        self.assertEqual((merged["was"]["state"], merged["now"]["state"], merged["now"]["mergeCommit"]),
+                         ("OPEN", "MERGED", "c" * 40))
+        self.assertIn("state 'OPEN'->'MERGED'", gg.feed_line(merged))
+
+    def test_an_error_only_store_writes_no_event(self) -> None:
+        self.daemon.store(self.KEY, None, data=self.data(), dataAt=NOW)
+        version = gg.feed_version()
+        self.daemon.store(self.KEY, gg.read_cache(self.KEY), error="HTTP 502")
+        self.assertEqual(gg.feed_version(), version)
+
+    def test_watch_since_answers_at_once_then_blocks_until_the_next_event(self) -> None:
+        self.daemon.store(self.KEY, None, data=self.data(), dataAt=NOW)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(gg.cmd_watch(["o/r#41"], None, 5, True), gg.EXIT_OK)
+        listed = json.loads(out.getvalue())
+        self.assertEqual(listed["version"], 3)
+        self.assertEqual(listed["prs"][self.KEY]["pr_state"]["state"], "OPEN")
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(gg.cmd_watch(["o/r#41"], listed["version"], 0.2, True), gg.EXIT_TIMEOUT)
+        self.assertEqual(json.loads(out.getvalue())["ended_by"], "timeout")
+
+        timer = threading.Timer(0.3, lambda: self.daemon.store(
+            self.KEY, None, data=self.data("MERGED", merge="d" * 40), dataAt=NOW))
+        timer.start()
+        self.addCleanup(timer.cancel)
+        out = io.StringIO()
+        with mock.patch.object(gg, "FEED_POLL", 0.05), contextlib.redirect_stdout(out):
+            self.assertEqual(gg.cmd_watch(["o/r#41"], listed["version"], 10, True), gg.EXIT_OK)
+        answered = json.loads(out.getvalue())
+        self.assertEqual([e["kind"] for e in answered["events"]], ["pr_state"])
+        self.assertEqual(answered["version"], 4)
+        self.assertEqual(self.gh.calls, [], "a watch reads the local feed, not GitHub")
+
+    def test_watch_names_only_the_prs_asked_for(self) -> None:
+        self.daemon.store(self.KEY, None, data=self.data(), dataAt=NOW)
+        self.daemon.store("pr:o/r#42", None, data=self.data(), dataAt=NOW)
+        events, _, _ = gg.feed_read(0, {"pr:o/r#42"})
+        self.assertEqual({e["key"] for e in events}, {"pr:o/r#42"})
+
+    def test_a_since_older_than_the_kept_feed_says_so(self) -> None:
+        with mock.patch.object(gg, "FEED_KEEP", 2):
+            for n in range(12):
+                self.daemon.store(self.KEY, None, data=self.data(head=f"{n:040x}"), dataAt=NOW)
+            self.assertLessEqual(len(gg.feed_path().read_text().splitlines()), 4, "trimmed past twice FEED_KEEP")
+        events, newest, gap = gg.feed_read(1, None)
+        self.assertTrue(gap)
+        self.assertEqual(newest, gg.feed_version())
+
+
 if __name__ == "__main__":
     unittest.main()

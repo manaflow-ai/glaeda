@@ -43,6 +43,9 @@ glaeda-gh: one shared GitHub CI watcher for every agent session on this machine.
                                                         account's reading and the hard reserve; then this
                                                         host's daemon: REST and GraphQL quota as last seen
     glaeda-gh read < REQUEST                            cached entries for an upstream client (upstream.json)
+    glaeda-gh watch [TARGET...] [--since V] [--timeout S] [--json]   the change feed: with no --since, the current
+                                                        version and each PR's state/CI/review; with --since V, the
+                                                        events after V (blocks on the local file, no GitHub read)
     glaeda-gh restart [--force]                         restart a down or hung daemon, once for every session
     glaeda-gh gh ARG...                                 one `gh` call, brokered: served from the cache when it
                                                         can be, refused when it reads local source through the
@@ -12651,6 +12654,8 @@ class Daemon:
                 if churn_events(churn, self.now):
                     entry["churn"] = churn
             write_json(cache, entry)
+            if key.startswith("pr:") and "data" in fields:
+                feed_note(key, (base or {}).get("data"), entry.get("data"), self.now)  # glaeda-gh watch
         if key.startswith("pr:") and "data" in fields:
             if self.land_queue is not None:
                 if key in self.land_queue.entries and land_fingerprint(base) != land_fingerprint(entry):
@@ -19610,6 +19615,180 @@ def land_check_fingerprint(cache: dict | None) -> str:
     """What a kept verdict was judged on (LAND_VERDICT_KEEP): the one fingerprint above. The name stays where a call
     site asks that question; the two readings are the same since the wake stopped holding raw `mergeable`."""
     return land_fingerprint(cache)
+
+
+# The change feed (cmuxterm-hq goals/writes-over-reads.md, `glaeda-gh watch`). An agent waiting on a PR polled it:
+# a PR view every two minutes, or `status pr` again after every wake, and each read is a read call whether or not
+# anything moved (2026-11-28 10:48-12:07Z, one agent lane: 39 ticks over two PRs, 78 PR reads, 39 per landed PR,
+# for two merges glaeda-land pushed to the session anyway). The daemon already sees every change when it stores a read, so every
+# store that changes what a waiter acts on appends one line to events.jsonl, numbered by a version that only grows
+# (the Kubernetes resourceVersion shape): `watch --since V` answers the lines after V for the PRs named, and blocks
+# on the local file (no GitHub read) until there is one. Three kinds: pr_state (state, merge commit, head, draft, a
+# conflict), ci_status (the rollup, the red checks by name, how many are still running), review (reviewDecision).
+FEED_FILE = "events.jsonl"
+FEED_KEEP = 4000  # lines kept; past twice this the oldest are dropped (a --since older than the first kept says so)
+FEED_POLL = 1.0  # seconds between stats of the file while a watch blocks
+FEED_RENEW = 60.0  # a blocked watch renews its interest this often, so the daemon keeps reading what it watches
+
+
+def feed_path() -> Path:
+    return BASE / FEED_FILE
+
+
+def feed_view(data: Any) -> dict:
+    """What a waiter acts on in one PR entry's data, by kind; {} for no data."""
+    if not isinstance(data, dict) or not data:
+        return {}
+    checks = [c for c in data.get("checks") or [] if isinstance(c, dict)]
+    red = sorted({str(c.get("name") or "") for c in checks
+                  if str(c.get("conclusion") or "").upper() in LAND_RED_CONCLUSIONS})
+    running = sum(1 for c in checks if str(c.get("status") or "").upper() != "COMPLETED")
+    merge = data.get("mergeCommit") if isinstance(data.get("mergeCommit"), dict) else {}
+    return {"pr_state": {"state": data.get("state"), "merged": bool(data.get("merged")),
+                         "mergeCommit": merge.get("oid"), "head": data.get("headRefOid"),
+                         "draft": bool(data.get("isDraft")), "conflicting": data.get("mergeable") == "CONFLICTING"},
+            "ci_status": {"state": data.get("checkState"), "red": red, "running": running, "total": len(checks)},
+            "review": {"decision": data.get("reviewDecision")}}
+
+
+def feed_changes(old: Any, new: Any) -> list:
+    """(kind, was, now) for each kind whose view moved between two entries' data; nothing when NEW has no data."""
+    was, now = feed_view(old), feed_view(new)
+    if not now:
+        return []
+    return [(kind, was.get(kind) or {}, view) for kind, view in now.items() if was.get(kind) != view]
+
+
+def feed_version(path: Path | None = None) -> int:
+    """The newest version written (0 for none): the last line's v."""
+    path = path or feed_path()
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - 65536))
+            lines = handle.read().splitlines()
+    except OSError:
+        return 0
+    for line in reversed(lines):
+        try:
+            v = json.loads(line).get("v")
+        except (ValueError, AttributeError):
+            continue
+        if isinstance(v, int):
+            return v
+    return 0
+
+
+def feed_note(key: str, old: Any, new: Any, at: float) -> int:
+    """Append one line per moved kind for KEY's store; the version of the last line written, else 0. Never raises:
+    the feed is a view of the store, and a full disk under it must not fail the store."""
+    changes = feed_changes(old, new)
+    if not changes:
+        return 0
+    path = feed_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with bounded_lock(path.with_name(FEED_FILE + ".lock")) as held:
+            if not held:
+                return 0
+            v = feed_version(path)
+            lines = []
+            for kind, was, now in changes:
+                v += 1
+                lines.append(json.dumps({"v": v, "at": at, "key": key, "kind": kind, "was": was, "now": now},
+                                        sort_keys=True))
+            with path.open("a") as handle:
+                handle.write("\n".join(lines) + "\n")
+            if path.stat().st_size > FEED_KEEP * 2 * 300:
+                kept = path.read_text().splitlines()
+                if len(kept) > FEED_KEEP * 2:
+                    stable_replace(path, ("\n".join(kept[-FEED_KEEP:]) + "\n").encode())
+            return v
+    except OSError:
+        return 0
+
+
+def feed_read(since: int, keys: set | None, path: Path | None = None) -> tuple:
+    """(events after SINCE for KEYS (all when None), the newest version, whether SINCE predates the kept lines)."""
+    path = path or feed_path()
+    try:
+        text = path.read_text()
+    except OSError:
+        return [], 0, False
+    out, first, newest = [], None, 0
+    for line in text.splitlines():
+        try:
+            doc = json.loads(line)
+        except ValueError:
+            continue
+        v = doc.get("v") if isinstance(doc, dict) else None
+        if not isinstance(v, int):
+            continue
+        first = v if first is None else first
+        newest = max(newest, v)
+        if v > since and (keys is None or doc.get("key") in keys):
+            out.append(doc)
+    return out, newest, first is not None and since > 0 and since + 1 < first
+
+
+def feed_line(doc: dict) -> str:
+    was = doc.get("was") or {}
+    moved = [f"{k} {was.get(k)!r}->{v!r}" for k, v in sorted((doc.get("now") or {}).items()) if was.get(k) != v]
+    return f"v={doc['v']} {doc['key']} {doc['kind']}: " + ", ".join(moved)
+
+
+def cmd_watch(targets: list, since: int | None, timeout: float, as_json: bool) -> int:
+    """`watch` with no --since lists: the current version and each PR's view from the cache. With --since V it
+    answers the events after V for those PRs, blocking (on the local file, renewing interest) until there is one or
+    TIMEOUT passes with none (EXIT_TIMEOUT). Either way it ends naming the version to pass as the next --since."""
+    keys = {parse_key("pr", t) for t in targets} or None
+    for key in sorted(keys or ()):
+        register(key)
+    if since is None:
+        version = feed_version()
+        views = {key: feed_view((read_cache(key) or {}).get("data")) for key in sorted(keys or ())}
+        if as_json:
+            print(json.dumps({"version": version, "prs": views}, sort_keys=True))
+        else:
+            for key, view in views.items():
+                print(f"{key}: " + ("; ".join(f"{kind} {view[kind]}" for kind in view) if view else "not read yet"))
+            print(f"version {version} (next: glaeda-gh watch {' '.join(targets)} --since {version})")
+        return EXIT_OK
+    began = renewed = time.monotonic()
+    stamp: Any = ()
+    while True:
+        try:
+            st = feed_path().stat()
+            seen = (st.st_ino, st.st_size, st.st_mtime_ns)
+        except OSError:
+            seen = None
+        if seen != stamp:
+            stamp = seen
+            events, _newest, gap = feed_read(since, keys)
+            if events or gap:
+                version = max([since] + [e["v"] for e in events])
+                if as_json:
+                    print(json.dumps({"version": version, "events": events, "gap": gap}, sort_keys=True))
+                else:
+                    if gap:
+                        print(f"glaeda-gh: --since {since} is older than the kept feed: list again with no --since")
+                    for doc in events:
+                        print(feed_line(doc))
+                    print(f"version {version}")
+                return EXIT_OK
+        left = timeout - (time.monotonic() - began)
+        if left <= 0:
+            if as_json:
+                print(json.dumps({"version": since, "events": [], "gap": False, "ended_by": "timeout"}))
+            else:
+                print(f"no change in {timeout:g} s; version {since}")
+            return EXIT_TIMEOUT
+        if time.monotonic() - renewed >= FEED_RENEW:
+            for key in sorted(keys or ()):
+                register(key)
+            renewed = time.monotonic()
+        time.sleep(min(FEED_POLL, left))
 
 
 def land_wait_shape(cache: dict | None, head: str) -> tuple[str, int]:
@@ -46174,6 +46353,13 @@ def parser() -> argparse.ArgumentParser:
     ld.add_argument("--max", dest="max_wait", type=seconds, default=None, metavar="S",
                     help=f"with --wait: the hard ceiling from the start (default {WAIT_MAX_TIMES}x --wait)")
     ld.add_argument("--json", action="store_true")
+    wa = sub.add_parser("watch", help="the change feed: PR state, CI and review changes after a version, written "
+                        "by the daemon's own stores, instead of polling a PR")
+    wa.add_argument("targets", nargs="*", metavar="TARGET", help="PRs (OWNER/REPO#N, a URL, a bare N); none: all")
+    wa.add_argument("--since", type=int, default=None, metavar="V",
+                    help="the events after version V (block until one); omitted: the current version and views")
+    wa.add_argument("--timeout", type=seconds, default=1800.0, help="with --since: give up after S with no event")
+    wa.add_argument("--json", action="store_true")
     r = sub.add_parser("restart", help="restart a down or hung daemon once, however many sessions ask at the same time")
     r.add_argument("--force", action="store_true", help="restart even if it looks healthy or was just restarted")
     return p
@@ -47201,6 +47387,8 @@ def main(argv: list[str] | None = None) -> int:
                               fields=parse_fields(args.field))
         if args.command == "runners":
             return cmd_runners(args.scope, args.label, args.json)
+        if args.command == "watch":
+            return cmd_watch(args.targets, args.since, args.timeout, args.json)
         if args.command == "restart":
             return cmd_restart(args.force)
         if args.command == "land":
